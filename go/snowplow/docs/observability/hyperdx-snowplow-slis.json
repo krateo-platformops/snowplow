@@ -1,0 +1,576 @@
+{
+  "name": "Snowplow / Cache & Prewarm SLIs",
+  "tiles": [
+    {
+      "x": 0,
+      "y": 0,
+      "w": 8,
+      "h": 4,
+      "name": "L1 lookups by outcome (hit / miss / seed_hit)",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_dispatch_l1_lookups_total",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql"
+          }
+        ],
+        "groupBy": "Attributes['outcome']",
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 8,
+      "y": 0,
+      "w": 8,
+      "h": 4,
+      "name": "Resolved cache: entries / bytes",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_resolved_cache",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'entries'",
+            "whereLanguage": "sql",
+            "alias": "entries"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_resolved_cache",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'bytes'",
+            "whereLanguage": "sql",
+            "alias": "bytes"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 16,
+      "y": 0,
+      "w": 8,
+      "h": 4,
+      "name": "Resolved cache evictions (ttl / lru / delete)",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_resolved_cache",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'evict_ttl_total'",
+            "whereLanguage": "sql",
+            "alias": "ttl"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_resolved_cache",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'evict_lru_total'",
+            "whereLanguage": "sql",
+            "alias": "lru"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_resolved_cache",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'evict_delete_total'",
+            "whereLanguage": "sql",
+            "alias": "delete"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 0,
+      "y": 4,
+      "w": 8,
+      "h": 4,
+      "name": "Apiserver fall-through (genuine live reads)",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_apiserver_fallthrough_total",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "fallthrough"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 8,
+      "y": 4,
+      "w": 8,
+      "h": 4,
+      "name": "Cache diagnostic hits (NOT apiserver reads)",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_cache_diagnostic_total",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "diagnostic"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 16,
+      "y": 4,
+      "w": 8,
+      "h": 4,
+      "name": "Fall-through cells by reason",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_apiserver_fallthrough_cells_total",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql"
+          }
+        ],
+        "groupBy": "Attributes['reason']",
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 0,
+      "y": 8,
+      "w": 8,
+      "h": 4,
+      "name": "UAF Put declines (non-zero is correct in 1.12.x; returns to 0 in 1.13.0)",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_restactions_uaf_put_declined_total",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "restactions"
+          },
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_widgets_uaf_put_declined_total",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "widgets"
+          },
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_ra_full_list_uaf_bypass_total",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "raFullList bypass"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 8,
+      "y": 8,
+      "w": 8,
+      "h": 4,
+      "name": "Authz memo hits / misses / deny-uncached",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_authz_memo_hits",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "hits"
+          },
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_authz_memo_misses",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "misses"
+          },
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_authz_memo_deny_uncached_total",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "deny_uncached"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 16,
+      "y": 8,
+      "w": 8,
+      "h": 4,
+      "name": "Refresher outcomes",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "sum",
+            "valueExpression": "Value",
+            "metricName": "snowplow_refresher",
+            "metricType": "sum",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql"
+          }
+        ],
+        "groupBy": "Attributes['stat']",
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 0,
+      "y": 12,
+      "w": 8,
+      "h": 4,
+      "name": "Dep tracker: evictions by route (delete / self-gone / self-notfound)",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_deps",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'evict_delete_total'",
+            "whereLanguage": "sql",
+            "alias": "informer DELETE"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_deps",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'evict_self_gone_total'",
+            "whereLanguage": "sql",
+            "alias": "self gone"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_deps",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'self_notfound_evict_total'",
+            "whereLanguage": "sql",
+            "alias": "self 404 (drop point)"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 8,
+      "y": 12,
+      "w": 8,
+      "h": 4,
+      "name": "Dep tracker health: worker panics / queue full / cap drops (alert on > 0)",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_deps",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'delete_worker_panics_total'",
+            "whereLanguage": "sql",
+            "alias": "worker panics"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_deps",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'delete_queue_full_total'",
+            "whereLanguage": "sql",
+            "alias": "queue full"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_deps",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'dropped_cap'",
+            "whereLanguage": "sql",
+            "alias": "cap drops"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 16,
+      "y": 12,
+      "w": 8,
+      "h": 4,
+      "name": "Dirty-marks / dep records",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_deps",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'dirty_mark_total'",
+            "whereLanguage": "sql",
+            "alias": "dirty marks"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_deps",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'records'",
+            "whereLanguage": "sql",
+            "alias": "dep records"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 0,
+      "y": 16,
+      "w": 8,
+      "h": 4,
+      "name": "Informers: registered / synced / servable / watch_broken",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_informer_servable",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql"
+          }
+        ],
+        "groupBy": "Attributes['state']",
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 8,
+      "y": 16,
+      "w": 8,
+      "h": 4,
+      "name": "Informer freshness: max event age (s) / GVRs stale > 1h",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_informer_freshness",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'max_event_age_seconds'",
+            "whereLanguage": "sql",
+            "alias": "max event age s"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_informer_freshness",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow' AND Attributes['stat'] = 'gvrs_stale_over_hour'",
+            "whereLanguage": "sql",
+            "alias": "gvrs stale >1h"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 16,
+      "y": 16,
+      "w": 8,
+      "h": 4,
+      "name": "Refresher queue depth / prewarm engine pending",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_refresher_queue_depth",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "refresher queue"
+          },
+          {
+            "aggFn": "max",
+            "valueExpression": "Value",
+            "metricName": "snowplow_prewarm_engine_pending_depth",
+            "metricType": "gauge",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "prewarm pending"
+          }
+        ],
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 0,
+      "y": 20,
+      "w": 8,
+      "h": 4,
+      "name": "HTTP server request duration p95 by route (s)",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "quantile",
+            "valueExpression": "Value",
+            "metricName": "http.server.request.duration",
+            "metricType": "histogram",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "p95",
+            "level": 0.95
+          }
+        ],
+        "groupBy": "Attributes['http.route']",
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 8,
+      "y": 20,
+      "w": 8,
+      "h": 4,
+      "name": "HTTP requests by status code",
+      "config": {
+        "displayType": "line",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "count",
+            "valueExpression": "",
+            "metricName": "http.server.request.duration",
+            "metricType": "histogram",
+            "where": "ServiceName = 'snowplow'",
+            "whereLanguage": "sql",
+            "alias": "requests"
+          }
+        ],
+        "groupBy": "Attributes['http.response.status_code']",
+        "sourceId": "6a8c6a42b001b331cb401a72",
+        "whereLanguage": "sql"
+      }
+    },
+    {
+      "x": 16,
+      "y": 20,
+      "w": 8,
+      "h": 4,
+      "name": "snowplow ERROR / WARN log lines (Body match — SeverityText is empty until observability#54)",
+      "config": {
+        "displayType": "line",
+        "sourceId": "6a8c6a42b001b331cb401a6e",
+        "where": "ServiceName = 'snowplow'",
+        "select": [
+          {
+            "aggFn": "count",
+            "valueExpression": "",
+            "where": "ServiceName = 'snowplow' AND positionCaseInsensitive(Body, '\"level\":\"ERROR\"') > 0",
+            "whereLanguage": "sql",
+            "alias": "ERROR"
+          },
+          {
+            "aggFn": "count",
+            "valueExpression": "",
+            "where": "ServiceName = 'snowplow' AND positionCaseInsensitive(Body, '\"level\":\"WARN\"') > 0",
+            "whereLanguage": "sql",
+            "alias": "WARN"
+          }
+        ],
+        "whereLanguage": "sql"
+      }
+    }
+  ],
+  "tags": [
+    "snowplow",
+    "1.12.4",
+    "1.12.5"
+  ]
+}
