@@ -79,7 +79,7 @@ func TestIssue1126_D4_LateDeleteDoesNotEvictTheRecreatedEntry(t *testing.T) {
 	h.DeleteFunc(obj)
 	h.AddFunc(obj)
 	h.DeleteFunc(obj)
-	waitQueueIdle(t, 5*time.Second)
+	waitQueueIdle(t, harnessWaitBound)
 
 	if got := served(t, store, key); got != newBody {
 		t.Fatalf("1.12.6 D4 RED: a late/duplicate DELETE evicted the CORRECT recreated entry "+
@@ -123,7 +123,7 @@ func TestIssue1126_D4b_StateAbsentStillEvictsAcrossDuplicates(t *testing.T) {
 	obj := unstructuredObj(gvr, ns, name)
 	h.DeleteFunc(obj)
 	h.DeleteFunc(obj) // duplicate — dedup'd or harmless, never wrong
-	waitQueueIdle(t, 5*time.Second)
+	waitQueueIdle(t, harnessWaitBound)
 
 	if _, ok := store.Get(key); ok {
 		t.Fatalf("D4b RED: the object is ABSENT from the informer but its self entry survived")
@@ -186,7 +186,7 @@ func TestIssue1126_E2_TeardownWindowEvictsNothing(t *testing.T) {
 	// the live objects. Whatever is still pending resolves against REAL state:
 	// alive objects → dirty-mark, nothing evicted.
 	_, syncCh := rw.EnsureResourceType(gvr)
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(harnessWaitBound)
 	select {
 	case <-syncCh:
 	case <-time.After(time.Until(deadline)):
@@ -207,7 +207,7 @@ func TestIssue1126_E2_TeardownWindowEvictsNothing(t *testing.T) {
 		}
 	}
 	got := map[string]bool{}
-	deadline = time.Now().Add(10 * time.Second)
+	deadline = time.Now().Add(harnessWaitBound)
 	for len(got) < 2 && time.Now().Before(deadline) {
 		select {
 		case k := <-marked:
@@ -261,11 +261,11 @@ func TestIssue1126_C2_UnknownDegradesToDirtyMarkAfterTheBudget(t *testing.T) {
 		if k != key {
 			t.Fatalf("C2: degraded dirty-mark hit %q, want %q", k, key)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(harnessWaitBound):
 		t.Fatalf("C2 RED: a permanently-UNKNOWN coordinate never degraded to a dirty-mark — it sits in " +
 			"the queue (or was dropped) and the entry is kept with no apiserver decision ever taken")
 	}
-	waitQueueIdle(t, 5*time.Second)
+	waitQueueIdle(t, harnessWaitBound)
 
 	s := DepWatchStatsSnapshot()
 	if s.ProbeUnknownDegraded != 1 {
