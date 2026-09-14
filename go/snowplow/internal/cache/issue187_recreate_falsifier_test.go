@@ -198,8 +198,8 @@ func TestIssue187_A3_DeletedListMemberDirtyMarksListWidget(t *testing.T) {
 	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { marked <- k })
 
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"items":["a","b"]}`), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name)      // self edge
-	d.RecordList(key, member, ns)     // list-scope edge on the member kind
+	d.Record(key, gvr, ns, name)  // self edge
+	d.RecordList(key, member, ns) // list-scope edge on the member kind
 
 	h := syncedWatcher(member).depEventHandlers(member)
 	h.DeleteFunc(unstructuredObj(member, ns, "b"))
@@ -250,14 +250,86 @@ func TestIssue187_B1_PlainDeleteEvictsSelfEntry(t *testing.T) {
 	}
 }
 
-// --- B2 — the refresher's own-object NotFound must not leave a stale entry ---
+// --- B2 — the eviction primitive the self-NotFound fix stands on ------------
 //
-// Drives the REAL refresher loop (real workqueue, real requeue budget, real
-// poison-pill drop at maxRefreshRequeues=5) with a resolve that fails NotFound
-// on the entry's OWN object — the exact shape of the 264 WARN
-// refresher.refresh_failed lines on krateo-057.
+// SCOPE NOTE (1.12.5). The architect filed B2 as "drive the real refresher
+// with a NotFound resolve and assert the entry is gone". It was RED on main
+// and it proved the defect: the refresher requeues five times and then
+// refresh_drops the key with the stale body resident. But its RefreshFunc
+// stub sits ABOVE resolveAndPopulateL1 — the frame the #187 (i) fix lives in
+// — so no fix could ever turn THIS arm green; the stub replaces the code
+// under test (feedback_seamed_dispatch_cannot_falsify_a_deep_frame).
+//
+// The end-to-end GREEN driver therefore lives one package down, where it can
+// reach the real frame and a real HTTP 404:
+//
+//	internal/handlers/dispatchers/issue187_self_notfound_evict_test.go
+//	  TestIssue187_B2E2E_RefresherSelfNotFoundEvictsThroughTheRealLoop
+//
+// That arm drives cache.EnqueueRefresh -> the real refresher pool -> the
+// production refresh closure -> resolveAndPopulateL1 -> resolveOnceProd ->
+// objects.Get -> client-go -> an httptest apiserver returning 404, and its
+// fix-absent probe reproduces the krateo-057 transcript exactly (6
+// refresh_failed, then refresh_dropped requeues=5, body resident).
+//
+// What stays HERE is the half this package owns: the eviction primitive the
+// fix calls into, driven against a real store and real dep records, plus the
+// refresher contract the fix depends on (a handler that resolves the
+// situation and returns nil is invoked ONCE and never dropped).
 
-func TestIssue187_B2_RefresherNotFoundOnOwnObjectEvicts(t *testing.T) {
+func TestIssue187_B2_EvictSelfGoneRemovesEntryAndItsDepEdges(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	defer withCleanDepWatch(t)()
+
+	gvr := gvrFlexes()
+	const ns, name, key = "krateo-system", "alerts-new-cta", "L1_alerts_new_cta"
+
+	store := newResolvedCache(100, 1<<20, time.Hour)
+	d := Deps()
+	d.SetStore(store)
+
+	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: widgetInputs(gvr, ns, name)})
+	d.Record(key, gvr, ns, name)                    // self edge
+	d.RecordList(key, gvr, ns)                      // a second edge, so the
+	d.Record(key, gvr, ns, "some-other-dependency") // cleanup is non-trivial
+
+	before := d.Stats().EvictDeleteTotal
+	if n := len(d.CollectMatchesForTest(gvr, ns, name)); n == 0 {
+		t.Fatalf("#187 B2 precondition: the self edge was not recorded")
+	}
+
+	if !d.EvictSelfGone(key) {
+		t.Fatalf("#187 B2: EvictSelfGone reported no eviction for a resident entry")
+	}
+	if _, ok := store.Get(key); ok {
+		t.Fatalf("#187 B2 RED: the entry survived EvictSelfGone — a self object confirmed gone " +
+			"must leave no resolved body behind")
+	}
+	if n := len(d.CollectMatchesForTest(gvr, ns, name)); n != 0 {
+		t.Fatalf("#187 B2: %d dep record(s) outlived the entry. The eviction must route through "+
+			"the tracker so RemoveL1Key clears the forward/reverse edges alongside the store "+
+			"delete (resolved.go DELETE-eviction invariant)", n)
+	}
+	if got := d.Stats().EvictDeleteTotal; got != before+1 {
+		t.Fatalf("#187 B2: evict_delete_total = %d, want %d — a confirmed self-object deletion "+
+			"must land on the same counter an informer DELETE moves", got, before+1)
+	}
+	// Idempotent: a second call must not double-count or panic.
+	if d.EvictSelfGone(key) {
+		t.Fatalf("#187 B2: EvictSelfGone reported a second eviction for an already-evicted key")
+	}
+	if got := d.Stats().EvictDeleteTotal; got != before+1 {
+		t.Fatalf("#187 B2: evict_delete_total double-counted a repeat eviction: %d", got)
+	}
+}
+
+// TestIssue187_B2_ResolvedOutcomeIsNotRequeued pins the refresher contract the
+// fix leans on: a handler that returns nil (the self-gone branch evicts and
+// returns nil, because a confirmed deletion is a resolved outcome, not a
+// failure) is invoked exactly ONCE and never reaches the poison-pill drop.
+// Without this, the fix could evict and still burn five requeues emitting
+// refresh_failed for a deletion it had already handled.
+func TestIssue187_B2_ResolvedOutcomeIsNotRequeued(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
@@ -280,14 +352,14 @@ func TestIssue187_B2_RefresherNotFoundOnOwnObjectEvicts(t *testing.T) {
 	inputs := widgetInputs(gvr, ns, name)
 	key := ComputeKey(*inputs)
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: inputs})
+	d.Record(key, gvr, ns, name)
 
 	var attempts atomic.Int64
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, in ResolvedKeyInputs) error {
 		attempts.Add(1)
-		// The production error shape: resolveOnceProd's objects.Get NotFound
-		// (resolve_populate.go:445-448).
-		return fmt.Errorf("resolveAndPopulateL1 %s/%s: re-fetch %s/%s: %s.%s %q not found",
-			in.CacheEntryClass, in.Name, in.Resource, in.Name, in.Resource, in.Group, in.Name)
+		// What resolveAndPopulateL1 now does on a confirmed self-object 404.
+		Deps().EvictSelfGone(ComputeKey(in))
+		return nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -297,17 +369,21 @@ func TestIssue187_B2_RefresherNotFoundOnOwnObjectEvicts(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if attempts.Load() > maxRefreshRequeues {
+		if _, ok := store.Get(key); !ok && attempts.Load() > 0 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	time.Sleep(300 * time.Millisecond)
+	// Give a requeue, if one were scheduled, ample time to land.
+	time.Sleep(500 * time.Millisecond)
 
 	if _, ok := store.Get(key); ok {
-		t.Fatalf("#187 B2 RED: after %d NotFound re-resolves of the entry's OWN object the "+
-			"refresher dropped the key (refresh_dropped) and LEFT the stale body resident. "+
-			"A NotFound on the self object means the object is gone — it must EVICT.", attempts.Load())
+		t.Fatalf("#187 B2: the entry survived the refresh cycle after %d attempts", attempts.Load())
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("#187 B2 RED: the handler ran %d times for one enqueue. A resolved outcome must "+
+			"not be requeued — re-confirming a deletion five times is what produced the 264 "+
+			"refresh_failed + 44 refresh_dropped lines on krateo-057.", got)
 	}
 }
 

@@ -298,6 +298,16 @@ type refresher struct {
 	// net is obsolete. Layer (b) stays as the general backstop.)
 	refresherSkippedStageError atomic.Uint64
 
+	// 1.12.5 / #187 (i) — selfNotFoundEvict counts entries EVICTED because
+	// the refresh re-fetch of the entry's OWN object came back with a
+	// definite apiserver 404. Pre-1.12.5 that 404 was flattened to a
+	// string, requeued five times and then dropped (refresh_dropped) with
+	// the stale body still resident until the 1h TTL — the mechanism the
+	// portal actually felt in #187. Non-zero here is NORMAL on a cluster
+	// that deletes CRs; it is the healthy counterpart of the
+	// refresh_dropped lines it replaces.
+	selfNotFoundEvict atomic.Uint64
+
 	// External-no-cache (proposal 2026-06-22) — external-touched Put-gate
 	// counter. externalSkippedPut counts L1 Puts declined because the
 	// resolve reached the live external fetch (httpFetchAllowingNonJSON),
@@ -893,6 +903,7 @@ type refresherStats struct {
 	skippedNoEntry    uint64
 	skippedNoHandler  uint64
 	skippedStageError uint64 // Ship 0.30.120 layer (b)
+	selfNotFoundEvict uint64 // 1.12.5 / #187 (i)
 	yielded           uint64 // Ship #98 — customer-priority yields
 	capped            uint64 // Ship #98 — max-parked cap hits
 	floored           uint64 // Task #321 (#318-R1a) — rate-floor deferrals
@@ -917,12 +928,28 @@ func refresherStatsSnapshot() refresherStats {
 		skippedNoEntry:       r.skippedNoEntryTotal.Load(),
 		skippedNoHandler:     r.skippedNoHandler.Load(),
 		skippedStageError:    r.refresherSkippedStageError.Load(),
+		selfNotFoundEvict:    r.selfNotFoundEvict.Load(),
 		yielded:              r.yieldedTotal.Load(),
 		capped:               r.cappedTotal.Load(),
 		floored:              r.flooredTotal.Load(),
 		clusterListEnqueued:  r.clusterListEnqueueTotal.Load(),
 		clusterListCompleted: r.clusterListCompletedTotal.Load(),
 	}
+}
+
+// RefresherSelfNotFoundEvictTotal returns the process-wide count of L1
+// entries evicted because the refresh re-fetch of the entry's OWN object
+// returned a definite apiserver 404 (1.12.5 / #187 (i)). Read by the
+// expvar + OTLP surfaces.
+func RefresherSelfNotFoundEvictTotal() uint64 {
+	return refresherSingleton().selfNotFoundEvict.Load()
+}
+
+// BumpRefresherSelfNotFoundEvict increments that counter. Called by
+// resolveAndPopulateL1 (dispatchers package) when it routes a self-object
+// NotFound to an eviction instead of a requeue.
+func BumpRefresherSelfNotFoundEvict() {
+	refresherSingleton().selfNotFoundEvict.Add(1)
 }
 
 // ClusterListRefresherStats exposes the Path 3.2 two-tier counters for

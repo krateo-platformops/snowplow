@@ -40,8 +40,10 @@ package dispatchers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
@@ -68,6 +70,19 @@ import (
 // signature (cache.RefreshFunc) is untouched. Swapped only by the
 // _test.go shim; production never reassigns it.
 var resolveOnceFn = resolveOnceProd
+
+// errSelfObjectGone is the 1.12.5 / #187 (i) sentinel: the refresh
+// re-fetch of the entry's OWN object came back with a definite apiserver
+// 404. It is wrapped (%w) into the re-fetch error so the existing error
+// text — the exact string the 264 refresher.refresh_failed lines on
+// krateo-057 carried — is unchanged for anyone grepping logs, while
+// resolveAndPopulateL1 can discriminate it with errors.Is.
+//
+// It says SELF by construction: the only site that wraps it is the
+// re-fetch of the CR named by the entry's own Inputs, which runs BEFORE
+// the resolver and therefore before any inner call can fail. An inner
+// call's NotFound is the dirty-mark class and never produces this.
+var errSelfObjectGone = errors.New("self object gone (apiserver 404 on the entry's own object)")
 
 // resolveAndPopulateL1 is the single resolve-and-store path. It:
 //
@@ -223,6 +238,59 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
+		// 1.12.5 / #187 (i) — the entry's OWN object is gone from the
+		// cluster (definite apiserver 404 on the re-fetch). The entry is
+		// the resolved representation of an object that no longer exists,
+		// so there is nothing to refresh INTO: EVICT it.
+		//
+		// Pre-1.12.5 this returned the error, the refresher requeued with
+		// backoff five times and then Forgot the key (refresh_dropped),
+		// leaving the stale body resident for the rest of the 1h TTL. That
+		// is the survival path #187 measured on krateo-057: 264
+		// refresh_failed lines resolving to six self entries, then 44
+		// refresh_dropped, with the portal still serving the pre-delete
+		// child list ~90 minutes later across a hard reload.
+		//
+		// Eviction goes through the dep tracker, not the store directly, so
+		// RemoveL1Key clears the entry's dep edges alongside it and the
+		// eviction lands on the same evict_delete_total an informer DELETE
+		// would have moved. A subsequent cold dispatch re-resolves from
+		// scratch; if the object is genuinely gone the dispatch 404s
+		// honestly instead of serving a body for a dead object.
+		//
+		// Returns nil, NOT an error: this is a resolved outcome, not a
+		// failure. An error would burn the retry budget re-confirming a
+		// deletion, and the four no-Put success-returns below already
+		// establish "handled, nothing stored" as a nil return on this path.
+		//
+		// Per feedback_l1_invalidation_delete_only.md eviction is authorised
+		// on a DELETE observation. A confirmed 404 on the entry's own object
+		// IS a deletion observation — the same fact the informer event
+		// carries, arriving by a different route — so this widens the
+		// authorised trigger set within the rule's intent. Flagged to the
+		// architect and PM as a rule change rather than an implementation
+		// detail.
+		if errors.Is(err, errSelfObjectGone) {
+			evicted := cache.Deps().EvictSelfGone(key)
+			cache.BumpRefresherSelfNotFoundEvict()
+			// WARN, at the chart's LOG_LEVEL: this is the line that
+			// REPLACES the refresh_failed/refresh_dropped pair an operator
+			// used to see, and it is how they confirm the delete-driven
+			// invalidation actually happened.
+			log.Warn("resolveAndPopulateL1: own object is gone; evicting the entry",
+				slog.String("subsystem", "cache"),
+				slog.String("key_hash", key),
+				slog.String("handler", inputs.CacheEntryClass),
+				slog.String("gvr", inputs.Group+"/"+inputs.Version+", Resource="+inputs.Resource),
+				slog.String("ns", inputs.Namespace),
+				slog.String("name", inputs.Name),
+				slog.String("user", refreshUser),
+				slog.Bool("evicted", evicted),
+				slog.String("effect", "the entry's own object returned a definite apiserver 404 — "+
+					"evicted instead of requeued-then-dropped-stale (#187)"),
+			)
+			return nil
+		}
 		return fmt.Errorf("resolveAndPopulateL1 %s/%s: %w",
 			inputs.CacheEntryClass, inputs.Name, err)
 	}
@@ -443,6 +511,31 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 	}
 	got := objects.Get(ctx, ref)
 	if got.Err != nil {
+		// 1.12.5 / #187 (i) — PRESERVE the 404. Pre-1.12.5 every re-fetch
+		// error was flattened to a string here, so resolveAndPopulateL1
+		// could not tell "this CR was deleted" from "the apiserver hiccuped"
+		// and treated both as retryable: five requeues, then refresh_dropped
+		// with the stale body still resident until the 1h TTL. Wrapping the
+		// definite 404 in errSelfObjectGone lets the caller EVICT instead.
+		//
+		// TWO BOUNDS, both load-bearing:
+		//
+		//  - ONLY a definite 404. A 403 (RBAC blip), a 500, a timeout and a
+		//    parse failure all keep today's requeue — an apiserver hiccup
+		//    must never evict a slice of L1 at once.
+		//  - NEVER the informer-only miss. Under cache.WithInformerOnlyReads
+		//    objects.Get SYNTHESISES a NotFound rather than reaching the
+		//    apiserver (objects/get.go informerOnlyMiss), so its 404 means
+		//    "not in the indexer", not "deleted from the cluster". That is
+		//    precisely the transient a CRD re-registration produces, and it
+		//    must stay retryable.
+		//
+		// Every other 404 here HAS been confirmed by the apiserver: the
+		// informer branch falls through to a live GET on a miss.
+		if got.Err.Code == http.StatusNotFound && !cache.InformerOnlyReadsFromContext(ctx) {
+			return nil, fmt.Errorf("re-fetch %s/%s: %s: %w",
+				inputs.Resource, inputs.Name, got.Err.Message, errSelfObjectGone)
+		}
 		return nil, fmt.Errorf("re-fetch %s/%s: %s",
 			inputs.Resource, inputs.Name, got.Err.Message)
 	}

@@ -1014,6 +1014,47 @@ func (d *DepTracker) runEvictionBatch(keys []string) {
 	}
 }
 
+// EvictSelfGone evicts ONE L1 key whose own object has been observed
+// gone by a path other than an informer DELETE event — today the sole
+// caller is the refresher, whose re-fetch of the entry's OWN object came
+// back with a definite apiserver 404 (1.12.5 / #187 (i)).
+//
+// WHY IT ROUTES THROUGH THE TRACKER. resolved.go states the invariant
+// that DELETE-driven eviction flows through the DepTracker so
+// RemoveL1Key runs alongside the store delete and the entry's dep
+// records do not outlive it. A direct store.deleteForDep here would
+// leave orphaned forward/reverse edges behind. This is runEvictionBatch
+// for a single key, and it counts on the SAME evictDeleteTotal — a
+// confirmed 404 on the entry's own object is a deletion observation, so
+// operators reading evict_delete_total see one number for "entries that
+// left because their object went away", not two.
+//
+// SCOPE. This is the SELF object only. A NotFound on an INNER call is
+// the bucket-2/3 dirty-mark class (a child vanishing must never evict
+// the parent) and never reaches here: the caller gates on the re-fetch
+// of the entry's own CR, which happens before the resolve runs.
+//
+// Returns true iff an entry was actually removed from the store, so the
+// caller can log exactly once per genuine eviction.
+func (d *DepTracker) EvictSelfGone(l1Key string) bool {
+	if d == nil || l1Key == "" {
+		return false
+	}
+	d.storeMu.RLock()
+	store := d.store
+	d.storeMu.RUnlock()
+
+	evicted := false
+	if store != nil {
+		evicted = store.deleteForDep(l1Key)
+	}
+	d.RemoveL1Key(l1Key)
+	if evicted {
+		d.evictDeleteTotal.Add(1)
+	}
+	return evicted
+}
+
 // RemoveL1Key drops every dep record associated with l1Key. Invoked by
 // the L1 store's LRU eviction (and TTL eviction, and DELETE-driven
 // eviction inside OnDelete) so dep records don't outlive their L1
