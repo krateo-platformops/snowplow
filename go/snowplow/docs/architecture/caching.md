@@ -343,13 +343,23 @@ the 500 ms/60 s defaults, so any window that clears inside it — a CRD re-regis
 apiserver blip that happens to answer 404 — never reaches the eviction. Evicting on the *first*
 404 would have no such bound.
 
-A type-exists conjunct (`cache.Global().IsRegistered(gvr)`) is also applied when the 404 is
-classified, but only as defence-in-depth for the case where an entire API **group** is gone. It
-cannot be the primary bound: `objects.Get`'s own not-servable branch calls
+**The type-absent case is not separately bound, and that is deliberate.** When a CRD itself is
+gone the apiserver answers a genuine 404 for every object of that GVR, and all of them classify
+as self-gone. A type-exists conjunct (`cache.Global().IsRegistered(gvr)`) was tried and
+**removed**. It was inert where it mattered: `objects.Get`'s own not-servable branch calls
 `EnsureResourceType(gvr)` **before** falling through to the apiserver, so the GVR is registered
-again by the time anything downstream consults it, and `EnsureResourceType` refuses only at
-group granularity. A single deleted CRD whose group survives therefore passes the conjunct. The
-`BCRD` arm pins that, with the `cache.lazy_register` line as the evidence.
+again by the time the error is classified, and `EnsureResourceType` refuses only at **group**
+granularity — a single deleted CRD whose group survives passes it. Where it was inert it was
+worse than absent, because the next reader would trust it as a bound; and where it would have
+bound (an entire group gone) the objects genuinely are gone, so it would have blocked a correct
+eviction and stranded those entries to TTL. Do not re-add it. The `BCRD` arm pins the real
+behaviour, with the `cache.lazy_register` line as the evidence.
+
+The budget still covers the case that matters: a CRD re-registration that clears inside ~15.5 s
+never evicts, and a type absent for longer than that has taken its objects with it. The cost is
+bounded and worth stating — a deleted object is re-fetched up to six times over about 15 s
+before its entry goes, so a 102-CR deletion batch costs on the order of 600 apiserver GETs,
+spread by the refresher rate floor.
 
 Two further bounds, each with its own arm
 (`dispatchers/issue187_self_notfound_evict_test.go`, `cache/issue187_recreate_falsifier_test.go`):
