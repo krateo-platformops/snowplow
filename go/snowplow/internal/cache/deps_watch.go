@@ -113,7 +113,15 @@ type depWatch struct {
 	// rate-limiting: fresh events use Add (immediate), objUnknown requeues
 	// use AddRateLimited (exponential backoff, base/max from the refresher's
 	// knobs so the subsystem has ONE backoff shape).
-	queue workqueue.TypedRateLimitingInterface[depEventKey]
+	//
+	// Built LAZILY by startWorker, not by the singleton (1.12.6 C1 follow-up,
+	// architect N1): a client-go workqueue spawns goroutines at construction
+	// (the delaying queue's waitingLoop + a heartbeat ticker), so building it
+	// in depWatchSingleton made a mere telemetry read (DepsStatsByStat under
+	// CACHE_ENABLED=false, reached via the OTLP metrics mirror) spawn
+	// goroutines — a violation of the byte-identical off-path. Nil until the
+	// first submitDepEvent; readers use q() and nil-check.
+	queue atomic.Pointer[depQueue]
 
 	// watcher is the ResourceWatcher the worker probes. Bound at handler
 	// construction (rw.depEventHandlers); production has exactly one.
@@ -135,24 +143,51 @@ var (
 // Always non-nil.
 func depWatchSingleton() *depWatch {
 	depWatchOnce.Do(func() {
-		baseMS := positiveIntFromEnv(envRefresherBaseDelayMS, defaultRefresherBaseDelayMS)
-		maxMS := positiveIntFromEnv(envRefresherMaxDelayMS, defaultRefresherMaxDelayMS)
-		rl := workqueue.NewTypedItemExponentialFailureRateLimiter[depEventKey](
-			time.Duration(baseMS)*time.Millisecond,
-			time.Duration(maxMS)*time.Millisecond,
-		)
-		depWatchInstance = &depWatch{
-			queue: workqueue.NewTypedRateLimitingQueue[depEventKey](rl),
-		}
+		// Plain allocation only — no queue, no goroutine (architect N1).
+		depWatchInstance = &depWatch{}
 	})
 	return depWatchInstance
 }
 
-// startWorker spawns the single dep-event worker goroutine exactly once
-// (sync.Once-bounded). Production never stops it — its lifetime is the
-// process lifetime.
+// depQueue boxes the typed workqueue so it can sit behind an atomic pointer
+// (written once by startWorker, read by the worker, the stats snapshot and
+// the test shim's stopWorker without a lock).
+type depQueue struct {
+	workqueue.TypedRateLimitingInterface[depEventKey]
+}
+
+// newDepQueue builds the dep-event queue. The backoff knobs are the
+// REFRESHER's (design §3.3: one backoff shape in the subsystem). This is the
+// ONLY site that spawns the workqueue's goroutines, and it runs from
+// startWorker only.
+func newDepQueue() *depQueue {
+	baseMS := positiveIntFromEnv(envRefresherBaseDelayMS, defaultRefresherBaseDelayMS)
+	maxMS := positiveIntFromEnv(envRefresherMaxDelayMS, defaultRefresherMaxDelayMS)
+	rl := workqueue.NewTypedItemExponentialFailureRateLimiter[depEventKey](
+		time.Duration(baseMS)*time.Millisecond,
+		time.Duration(maxMS)*time.Millisecond,
+	)
+	return &depQueue{workqueue.NewTypedRateLimitingQueue[depEventKey](rl)}
+}
+
+// q returns the dep-event queue, or a nil interface before startWorker has
+// run. Every worker-path caller runs after startWorker; the two callers that
+// can run before it (DepWatchStatsSnapshot, stopWorker) nil-check.
+func (w *depWatch) q() workqueue.TypedRateLimitingInterface[depEventKey] {
+	if p := w.queue.Load(); p != nil {
+		return p.TypedRateLimitingInterface
+	}
+	return nil
+}
+
+// startWorker builds the queue and spawns the single dep-event worker
+// goroutine exactly once (sync.Once-bounded). Production never stops it —
+// its lifetime is the process lifetime. The queue is built HERE, on the
+// first real event, so that reading the bridge (stats, expvar, the OTLP
+// mirror) never creates the thing it measures.
 func (w *depWatch) startWorker() {
 	w.startOnce.Do(func() {
+		w.queue.Store(newDepQueue())
 		w.workerWG.Add(1)
 		go w.runDepEventWorker(0)
 	})
@@ -202,12 +237,12 @@ func (w *depWatch) runDepEventWorker(respawns int) {
 		go w.runDepEventWorker(respawns + 1)
 	}()
 	for {
-		item, shutdown := w.queue.Get()
+		item, shutdown := w.q().Get()
 		if shutdown {
 			return
 		}
 		func() {
-			defer w.queue.Done(item)
+			defer w.q().Done(item)
 			w.handleDepEvent(item)
 		}()
 	}
@@ -227,7 +262,7 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 			return
 		}
 		w.counters.workerPanics.Add(1)
-		w.queue.Forget(k)
+		w.q().Forget(k)
 		slog.Warn("deps.delete_worker.panic",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", k.gvr.String()),
@@ -251,12 +286,12 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 		// on the shared budget; on exhaustion degrade to a dirty-mark so the
 		// refresher's re-fetch takes the decision against the apiserver.
 		w.counters.probeUnknown.Add(1)
-		if w.queue.NumRequeues(k) < maxRefreshRequeues {
-			w.queue.AddRateLimited(k)
+		if w.q().NumRequeues(k) < maxRefreshRequeues {
+			w.q().AddRateLimited(k)
 			return
 		}
 		w.counters.probeUnknownDegraded.Add(1)
-		w.queue.Forget(k)
+		w.q().Forget(k)
 		slog.Warn("deps.probe_unknown_degraded",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", k.gvr.String()),
@@ -266,11 +301,14 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 			slog.String("effect", "informer not authoritative for this GVR for the whole requeue budget — "+
 				"dirty-marking dependents so the refresher decides against the apiserver "+
 				"(404 ⇒ evict at the drop point). Non-zero here means an informer is not recovering."),
+			slog.String("hint", "the 404 leg of that refresh resolves in seconds; a 403/500/timeout on it stays "+
+				"bounded by RESOLVED_CACHE_TTL_SECONDS (3600 s) until 1.12.6 C4 extends drop-point eviction "+
+				"to non-404 deterministic failures"),
 		)
 		Deps().OnObjectEvent(k.gvr, k.namespace, k.name, objUnknownDegraded)
 		return
 	}
-	w.queue.Forget(k)
+	w.q().Forget(k)
 	Deps().OnObjectEvent(k.gvr, k.namespace, k.name, state)
 }
 
@@ -281,7 +319,7 @@ func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey) {
 	w.watcher.Store(rw)
 	w.startWorker()
 	w.counters.eventsSubmitted.Add(1)
-	w.queue.Add(k)
+	w.q().Add(k)
 }
 
 // stopWorker shuts the queue down, lets the worker drain what is already
@@ -289,7 +327,9 @@ func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey) {
 // waiting in the rate limiter's delay are dropped. Used by the _test.go
 // shim; production code MUST NOT call it.
 func (w *depWatch) stopWorker() {
-	w.queue.ShutDownWithDrain()
+	if q := w.q(); q != nil {
+		q.ShutDownWithDrain()
+	}
 	w.workerWG.Wait()
 }
 
@@ -456,16 +496,23 @@ type DepWatchStats struct {
 }
 
 // DepWatchStatsSnapshot returns the current bridge counters. Reading it never
-// starts the worker (only submitDepEvent does).
+// starts the worker and never builds the queue (only submitDepEvent does):
+// before the first event the depth reads 0, which is the truthful answer for
+// a bridge that exists and is idle. Under CACHE_ENABLED=false nothing ever
+// submits, so a scrape stays goroutine-free (architect N1; arm OFF).
 func DepWatchStatsSnapshot() DepWatchStats {
 	w := depWatchSingleton()
+	depth := 0
+	if q := w.q(); q != nil {
+		depth = q.Len()
+	}
 	return DepWatchStats{
 		AddDroppedPreSync:    w.counters.addDroppedPreSync.Load(),
 		AddPropagated:        w.counters.addPropagated.Load(),
 		AddNilSyncCh:         w.counters.addNilSyncCh.Load(),
 		EventsSubmitted:      w.counters.eventsSubmitted.Load(),
 		DeleteWorkerPanics:   w.counters.workerPanics.Load(),
-		DeleteQueueDepth:     w.queue.Len(),
+		DeleteQueueDepth:     depth,
 		ProbeExists:          w.counters.probeExists.Load(),
 		ProbeAbsent:          w.counters.probeAbsent.Load(),
 		ProbeUnknown:         w.counters.probeUnknown.Load(),

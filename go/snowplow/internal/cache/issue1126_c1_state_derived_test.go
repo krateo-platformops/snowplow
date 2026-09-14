@@ -26,6 +26,8 @@ package cache
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -319,6 +321,41 @@ func TestIssue1126_OffPath_PassthroughProbeIsUnknownWithoutAClientCall(t *testin
 	if !Disabled() {
 		t.Fatalf("Disabled() false with CACHE_ENABLED=false")
 	}
+
+	// Architect N1 (C1 follow-up): a telemetry read under cache-off must not
+	// spawn goroutines. On a66b08d, DepsStatsByStat → DepWatchStatsSnapshot →
+	// depWatchSingleton built the typed workqueue, whose delaying layer
+	// spawns client-go's waitingLoop (+ a heartbeat ticker): RED there,
+	// GREEN once the queue is built by startWorker only. The check counts
+	// workqueue goroutines (stacks mentioning waitingLoop) across the call
+	// rather than requiring zero of them: the refresher and the prewarm
+	// engine own workqueues of their own, so an absolute check would read
+	// sibling state, while a delta reads only what THIS call spawned.
+	//
+	// Scope: the delta is measured across the BRIDGE read (DepWatchStatsSnapshot),
+	// which is the accessor C1 changed. The full DepsStatsByStat() also reads
+	// RefresherSelfNotFoundEvictTotal(), whose refresherSingleton() builds the
+	// refresher's two workqueues on first touch — a pre-existing (1.12.4/1.12.5)
+	// off-path spawn in a file this commit does not own; flagged to the TL,
+	// not fixed here.
+	resetDepWatchForTest() // a fresh singleton, exactly as a cache-off process has
+	before := stackCount("waitingLoop")
+	_ = DepWatchStatsSnapshot()
+	time.Sleep(50 * time.Millisecond) // let a freshly spawned goroutine reach its stack
+	if after := stackCount("waitingLoop"); after > before {
+		t.Fatalf("N1 RED: DepWatchStatsSnapshot() under CACHE_ENABLED=false spawned %d workqueue goroutine(s) (waitingLoop %d → %d) — a scrape created the thing it measures", after-before, before, after)
+	}
+	_ = DepsStatsByStat()
+	if depWatchSingleton().q() != nil {
+		t.Fatalf("N1 RED: a stats read built the dep-event queue")
+	}
+}
+
+// stackCount returns how many goroutine stacks mention needle.
+func stackCount(needle string) int {
+	buf := make([]byte, 1<<22)
+	n := runtime.Stack(buf, true)
+	return strings.Count(string(buf[:n]), needle)
 }
 
 // countingDynamic counts Resource() calls — the only way anything in the

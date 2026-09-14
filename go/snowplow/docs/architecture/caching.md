@@ -309,7 +309,9 @@ is safe, and a lost event is recoverable by the next enqueue for the same coordi
 (informer torn down, not synced, watch broken, type unconfirmed, passthrough) means the indexer
 is not authoritative: the coordinate is requeued with backoff on the refresher's
 `maxRefreshRequeues` budget and, on exhaustion, degraded to a dirty-mark so the refresher's
-re-fetch decides against the apiserver (a definite 404 evicts at the drop point). It never means
+re-fetch decides against the apiserver (a definite 404 evicts at the drop point — seconds; a
+403, a 500 or a timeout on that leg stays bounded by `RESOLVED_CACHE_TTL_SECONDS`, 3600 s,
+until 1.12.6 C4 extends drop-point eviction to non-404 deterministic failures). It never means
 "keep forever", and it never evicts by itself — that is what keeps a schema-relist teardown window
 from evicting a whole GVR. The probe reads the watcher directly and never calls
 `EnsureResourceType`, so it is not the inert `IsRegistered` conjunct 1.12.5 removed (different

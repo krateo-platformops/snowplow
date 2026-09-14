@@ -20,9 +20,10 @@
 //	                            Pre-1.12.5 the first panic killed the worker
 //	                            process-wide; now each one costs one event,
 //	                            and this is how many.
-//	delete_queue_depth          pinned near delete_queue_cap = the drain is
-//	                            behind (and, on a pre-1.12.5 image, the
-//	                            signature of a dead worker).
+//	dep_event_queue_depth       growing without bound = the single dep-event
+//	                            worker's drain is behind (1.12.6 C1: one
+//	                            typed, dedup'd, unbounded queue; the 1.12.5
+//	                            delete_queue_cap / _full surface is retired).
 //
 // SHAPE. One expvar key, `snowplow_deps`, returning map[string]int64 keyed
 // by stat — the same "one gauge keyed by stat" idiom snowplow_resolved_cache
@@ -30,11 +31,14 @@
 // with no per-stat key sprawl.
 //
 // NON-STARTING. The closure reads the Deps() and depWatch singletons, both of
-// which are plain allocations — no goroutine, no informer, no store. Reading
-// them cannot start the DELETE worker (only submitDeleteEvent does that), so
-// a telemetry scrape never creates the thing it measures. Before anything has
-// been recorded the map reads as zeros, which is the truthful answer for a
-// tracker that exists and is idle.
+// which are plain allocations — no goroutine, no informer, no store. The
+// dep-event queue (which DOES spawn client-go goroutines at construction) is
+// built by startWorker on the first submitDepEvent, never by a read, so a
+// telemetry scrape never creates the thing it measures — the OFF arm in
+// issue1126_c1_state_derived_test.go pins this by counting goroutines across
+// a DepsStatsByStat() call under CACHE_ENABLED=false (1.12.6 C1 follow-up,
+// architect N1). Before anything has been recorded the map reads as zeros,
+// which is the truthful answer for a tracker that exists and is idle.
 //
 // CFG-1 (cache-off compliance, project_cache_off_is_transparent_fallback).
 // Under CACHE_ENABLED=false there is no dep tracking, so the key MUST NOT be
