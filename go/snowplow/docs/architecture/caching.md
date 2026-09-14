@@ -247,6 +247,20 @@ TTL is always `min(override, store TTL)`:
 - **Partial-result TTL** — `partial_result_ttl.go`, a short TTL for deliberately-partial
   bodies.
 
+**Bounded lifetime (1.12.6, `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS`, default `"86400"`).** The
+TTL above is measured from `CreatedAt`, which *every* `Put` resets — a refresher re-Put or a
+keep-warm sweep included — so an entry the event pipeline keeps re-Putting never expires, and a
+wrong refresh (a stale body, a missed dep edge) is served for the life of the pod. Nothing in
+the pipeline can catch a mistake the pipeline itself made; a lifetime bound measured from the
+**first** `Put` can. `ResolvedEntry.BornAt` is set on the first `Put` under a key and
+**inherited** by every replace-in-place `Put`; `Get` evicts an entry older than the max age
+(`evict_max_age_total`, distinct from `evict_ttl_total`) and the request that hit it re-resolves
+from scratch. It is a backstop, not a refresh cadence: at the default every L1 cell is
+guaranteed one from-scratch resolve per day, and the eviction lands on a customer request path
+only when that cell was not otherwise re-resolved in 24 h. `"0"` disables. Arms:
+`resolved_max_entry_age_test.go` (G1 is RED on 1.12.5: a key re-Put every 400 ms under a 1 s
+bound is still evicted).
+
 ---
 
 ## 4. The dispatcher seam (`handlers/dispatchers/`)

@@ -73,6 +73,7 @@ func TestResolvedCacheStatsByStat_ReportsLiveStore(t *testing.T) {
 		"entries", "bytes", "max_entries", "max_bytes",
 		"hit_total", "miss_total", "store_total",
 		"evict_lru_total", "evict_ttl_total", "evict_delete_total",
+		"evict_max_age_total", // 1.12.6 C5 bounded lifetime
 		"resident_entries", "resident_bytes", "max_resident_bytes",
 		"resident_pin_total", "resident_demote_total",
 		"apistage_store_total", "apistage_evict_total",
