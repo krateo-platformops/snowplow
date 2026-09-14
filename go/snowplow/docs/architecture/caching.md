@@ -330,37 +330,80 @@ records silently and relies on TTL for correctness.
 An informer DELETE is not the only way snowplow learns an object is gone. A background refresh
 re-fetches the entry's own CR before re-resolving it; when that re-fetch returns a **definite
 apiserver 404**, the object is gone and the entry is the resolved representation of something
-that no longer exists. Since 1.12.5 that case **EVICTS**, through
-`DepTracker.EvictSelfGone` — the same tracker route `OnDelete` uses, so `RemoveL1Key` clears
-the dep edges alongside the store delete and the eviction lands on the same
-`evict_delete_total`.
+that no longer exists.
 
-Before 1.12.5 the 404's status code was discarded, the error was treated as retryable, and
-after `maxRefreshRequeues = 5` the key was dropped (`refresher.refresh_dropped`) with the stale
-body resident for the rest of the 1 h TTL.
+Since 1.12.5 the refresher **EVICTS at the DROP POINT**. `resolveOnceProd` wraps the 404 in the
+`cache.ErrSelfObjectGone` sentinel (preserving the error text, so log greps are unchanged);
+`resolveAndPopulateL1` returns it; `processNext` requeues as before, and only when the key
+exhausts `maxRefreshRequeues` does it test the sentinel and call
+`DepTracker.EvictSelfGone(key)` instead of dropping to TTL.
 
-Three bounds keep this narrow, and each has its own falsifier arm
-(`dispatchers/issue187_self_notfound_evict_test.go`):
+**The requeue budget is the bound, deliberately.** Five requeues is about 15.5 s of backoff at
+the 500 ms/60 s defaults, so any window that clears inside it — a CRD re-registration, an
+apiserver blip that happens to answer 404 — never reaches the eviction. Evicting on the *first*
+404 would have no such bound.
 
-- **Only a definite 404.** A 403, a 500, a timeout or a parse failure keeps the requeue. An
-  apiserver hiccup or an RBAC blip must never evict a slice of L1 at once.
+A type-exists conjunct (`cache.Global().IsRegistered(gvr)`) is also applied when the 404 is
+classified, but only as defence-in-depth for the case where an entire API **group** is gone. It
+cannot be the primary bound: `objects.Get`'s own not-servable branch calls
+`EnsureResourceType(gvr)` **before** falling through to the apiserver, so the GVR is registered
+again by the time anything downstream consults it, and `EnsureResourceType` refuses only at
+group granularity. A single deleted CRD whose group survives therefore passes the conjunct. The
+`BCRD` arm pins that, with the `cache.lazy_register` line as the evidence.
+
+Two further bounds, each with its own arm
+(`dispatchers/issue187_self_notfound_evict_test.go`, `cache/issue187_recreate_falsifier_test.go`):
+
+- **Only a definite 404.** A 403, a 500, a timeout or a parse failure never carries the
+  sentinel, so the key drops to TTL exactly as before. An apiserver hiccup or an RBAC blip
+  cannot evict a slice of L1.
 - **Never a synthesised 404.** Under `cache.WithInformerOnlyReads`, `objects.Get` fabricates a
-  NotFound without asking the apiserver; that means "absent from the indexer", which is the
-  CRD-re-registration transient, not a deletion.
+  NotFound without asking the apiserver; that means "absent from the indexer", not "deleted".
 - **Only the self object, structurally.** The sentinel is wrapped at exactly one site — the
-  re-fetch of the CR named by the entry's own `Inputs`, which runs before the resolver, so no
-  inner call can reach it. The gate is `errors.Is`, never string matching. An inner call's
-  NotFound stays bucket 2/3: a child vanishing dirty-marks the parent, it never evicts it.
+  re-fetch of the CR named by the entry's own `Inputs`, which runs before the resolver — and the
+  gate is `errors.Is`, never string matching. An inner call's NotFound stays bucket 2/3: a child
+  vanishing dirty-marks the parent, it never evicts it.
 
-This widens the set of authorised eviction *triggers* without widening the rule: a confirmed
-404 on the entry's own object is a deletion observation, the same fact the informer event
-carries, arriving by a different route.
+The eviction routes through the tracker, never `store.deleteForDep`, so `RemoveL1Key` clears
+the dep edges alongside the store delete. It counts on **`evict_self_gone_total`, not
+`evict_delete_total`**: the latter stays informer-DELETE-driven because it is the live
+discriminator for a dead DELETE bridge (delete a throwaway CR and watch it move), and a folded
+counter would move for two unrelated reasons.
+
+This widens the set of authorised eviction *triggers* without widening the rule: a repeatedly
+confirmed 404 on the entry's own object is a deletion observation, the same fact the informer
+event carries, arriving by a different route.
 
 Two operational notes from #187: the DELETE hand-off worker recovers **per event**, so one
 panicking `OnDelete` costs exactly one eviction rather than killing DELETE handling
 process-wide; and the tracker's counters are published at `/debug/vars` under `snowplow_deps`
 (see `docs/architecture/observability.md`), because at `LOG_LEVEL=warn` the old INFO-only
 summary made "did invalidation stop?" unanswerable from a live pod.
+
+### 5.2 The CRD schema-relist teardown window (1.12.5, #187)
+
+`triggerCRDSchemaRelist` tears the per-GVR informer down (`RemoveResourceType` closes its stop
+channel and purges its state, so anything in its DeltaFIFO or in flight is dropped with no
+handler run) and builds a **fresh** informer. A fresh informer has an empty `knownObjects`, so
+`DeltaFIFO.Replace()` has nothing to diff against and **synthesises no `Deleted` delta** for an
+object that vanished before the new LIST. An object deleted inside that window therefore leaves
+its self entry stranded with no future informer trigger.
+
+`OnResourceTypeSchemaRelisted` dirty-marks every dependent entry from the **forward dep index**,
+not from the indexer, so it covers entries whose objects are absent. But it ran **once**, at the
+start of the window: an entry dirty-marked at that instant re-resolves successfully while its
+object still exists, and is then stranded when the delete lands a moment later. That is the
+#187 burst shape — relist at ~09:21, deletes 09:21–09:24.
+
+Since 1.12.5 the relist **re-fires the same dirty-mark after the new informer has synced**,
+in the goroutine that already waits on the sync channel. Every stranded entry is then handed to
+the self-404 eviction above. The pre-sync fire is kept as well; both run. Counted as
+`relist_dirtymark_postsync_total` under `snowplow_deps`.
+
+This is containment, not the precise form: it evicts by re-resolving and observing a 404, so it
+costs the requeue budget and depends on the refresh path being healthy. The precise
+evict-by-absence reconcile (walk the store's metadata for the GVR, probe the new indexer, evict
+the misses) is tracked separately.
 
 ---
 

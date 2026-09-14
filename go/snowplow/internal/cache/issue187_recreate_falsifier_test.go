@@ -293,7 +293,8 @@ func TestIssue187_B2_EvictSelfGoneRemovesEntryAndItsDepEdges(t *testing.T) {
 	d.RecordList(key, gvr, ns)                      // a second edge, so the
 	d.Record(key, gvr, ns, "some-other-dependency") // cleanup is non-trivial
 
-	before := d.Stats().EvictDeleteTotal
+	before := d.Stats().EvictSelfGoneTotal
+	beforeDelete := d.Stats().EvictDeleteTotal
 	if n := len(d.CollectMatchesForTest(gvr, ns, name)); n == 0 {
 		t.Fatalf("#187 B2 precondition: the self edge was not recorded")
 	}
@@ -310,16 +311,21 @@ func TestIssue187_B2_EvictSelfGoneRemovesEntryAndItsDepEdges(t *testing.T) {
 			"the tracker so RemoveL1Key clears the forward/reverse edges alongside the store "+
 			"delete (resolved.go DELETE-eviction invariant)", n)
 	}
-	if got := d.Stats().EvictDeleteTotal; got != before+1 {
-		t.Fatalf("#187 B2: evict_delete_total = %d, want %d — a confirmed self-object deletion "+
-			"must land on the same counter an informer DELETE moves", got, before+1)
+	if got := d.Stats().EvictSelfGoneTotal; got != before+1 {
+		t.Fatalf("#187 B2: evict_self_gone_total = %d, want %d", got, before+1)
+	}
+	// Architect Finding 2: the H1 live discriminator must NOT move here.
+	if got := d.Stats().EvictDeleteTotal; got != beforeDelete {
+		t.Fatalf("#187 B2: evict_delete_total moved (%d -> %d) for a self-gone eviction; it "+
+			"must stay informer-DELETE-driven or the documented H1 live procedure breaks",
+			beforeDelete, got)
 	}
 	// Idempotent: a second call must not double-count or panic.
 	if d.EvictSelfGone(key) {
 		t.Fatalf("#187 B2: EvictSelfGone reported a second eviction for an already-evicted key")
 	}
-	if got := d.Stats().EvictDeleteTotal; got != before+1 {
-		t.Fatalf("#187 B2: evict_delete_total double-counted a repeat eviction: %d", got)
+	if got := d.Stats().EvictSelfGoneTotal; got != before+1 {
+		t.Fatalf("#187 B2: evict_self_gone_total double-counted a repeat eviction: %d", got)
 	}
 }
 
@@ -384,6 +390,203 @@ func TestIssue187_B2_ResolvedOutcomeIsNotRequeued(t *testing.T) {
 		t.Fatalf("#187 B2 RED: the handler ran %d times for one enqueue. A resolved outcome must "+
 			"not be requeued — re-confirming a deletion five times is what produced the 264 "+
 			"refresh_failed + 44 refresh_dropped lines on krateo-057.", got)
+	}
+}
+
+// --- B3 — a TRANSIENT self-NotFound must NOT evict (the budget is the bound) -
+//
+// The architect's over-eviction guard, restored as written and strengthened.
+// It is what discriminates the guarded design from a naive evict-on-first-404:
+// two 404s inside the requeue budget, then a success, must leave the entry
+// alive AND refreshed.
+//
+// STRENGTHENED: the handler returns a real %w-wrapped cache.ErrSelfObjectGone,
+// not merely a 404-WORDED error. The original arm's plain fmt.Errorf would
+// pass without ever entering the new drop-point branch — green for the wrong
+// reason. With the sentinel it genuinely drives the branch and proves the
+// budget, not the classification, is what saves the entry.
+
+func TestIssue187_B3_TransientNotFoundMustNotEvict(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
+	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
+	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
+	resetRefresherForTest()
+	defer resetRefresherForTest()
+	defer withCleanDepWatch(t)()
+
+	gvr := gvrFlexes()
+	const ns, name = "krateo-system", "transient-widget"
+
+	store := ResolvedCache()
+	if store == nil {
+		t.Skip("resolved cache disabled in this environment")
+	}
+	Deps().SetStore(store)
+
+	inputs := widgetInputs(gvr, ns, name)
+	key := ComputeKey(*inputs)
+	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"prior"}`), Inputs: inputs})
+	Deps().Record(key, gvr, ns, name)
+
+	before := RefresherSelfNotFoundEvictTotal()
+
+	var attempts atomic.Int64
+	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, in ResolvedKeyInputs) error {
+		// 404 twice — a CRD re-registration window — then succeed. Well
+		// inside maxRefreshRequeues, so the drop point is never reached.
+		if attempts.Add(1) <= 2 {
+			return fmt.Errorf("resolveAndPopulateL1 %s/%s: re-fetch %s/%s: %s.%s %q not found: %w",
+				in.CacheEntryClass, in.Name, in.Resource, in.Name, in.Resource, in.Group, in.Name,
+				ErrSelfObjectGone)
+		}
+		store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"refreshed"}`), Inputs: inputs})
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartRefresher(ctx)
+	EnqueueRefresh(key)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && attempts.Load() < 3 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	e, ok := store.Get(key)
+	if !ok {
+		t.Fatalf("#187 B3 RED: a TRANSIENT self-NotFound (2 failures then success) EVICTED the "+
+			"entry after %d attempts. Eviction must require the deterministic budget "+
+			"(maxRefreshRequeues = %d, about 15.5s of backoff at the defaults), not one 404 — "+
+			"otherwise a CRD re-registration window empties L1 of the whole type.",
+			attempts.Load(), maxRefreshRequeues)
+	}
+	if got := string(e.RawJSON); got != `{"v":"refreshed"}` {
+		t.Fatalf("#187 B3: entry survived but was not refreshed after the transient window: %s", got)
+	}
+	if got := RefresherSelfNotFoundEvictTotal(); got != before {
+		t.Fatalf("#187 B3: self-gone evictions moved (%d -> %d) for a transient window", before, got)
+	}
+}
+
+// --- B3b — the DROP POINT is the eviction point -----------------------------
+//
+// B3's complement, and the arm that owns the eviction decision at the layer it
+// actually lives in. The same sentinel, but returned on EVERY attempt: once
+// the full requeue budget has re-confirmed the deletion, the entry must be
+// GONE rather than dropped-to-TTL with its stale body resident.
+
+func TestIssue187_B3b_SelfGoneEvictsAtTheDropPoint(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
+	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
+	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
+	resetRefresherForTest()
+	defer resetRefresherForTest()
+	defer withCleanDepWatch(t)()
+
+	gvr := gvrFlexes()
+	const ns, name = "krateo-system", "gone-widget"
+
+	store := ResolvedCache()
+	if store == nil {
+		t.Skip("resolved cache disabled in this environment")
+	}
+	Deps().SetStore(store)
+
+	inputs := widgetInputs(gvr, ns, name)
+	key := ComputeKey(*inputs)
+	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: inputs})
+	Deps().Record(key, gvr, ns, name)
+
+	beforeSelfGone := Deps().Stats().EvictSelfGoneTotal
+	beforeDelete := Deps().Stats().EvictDeleteTotal
+
+	var attempts atomic.Int64
+	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, in ResolvedKeyInputs) error {
+		attempts.Add(1)
+		return fmt.Errorf("resolveAndPopulateL1 %s/%s: re-fetch %s/%s: %s.%s %q not found: %w",
+			in.CacheEntryClass, in.Name, in.Resource, in.Name, in.Resource, in.Group, in.Name,
+			ErrSelfObjectGone)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartRefresher(ctx)
+	EnqueueRefresh(key)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := store.Get(key); !ok && attempts.Load() > maxRefreshRequeues {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if _, ok := store.Get(key); ok {
+		t.Fatalf("#187 B3b RED: after %d self-object 404s — the full requeue budget — the "+
+			"refresher dropped the key and LEFT the stale body resident. The drop point is "+
+			"where the deletion is finally confirmed; it must evict.", attempts.Load())
+	}
+	if got := attempts.Load(); got != maxRefreshRequeues+1 {
+		t.Fatalf("#187 B3b: handler ran %d times, want %d (the full budget, then evict) — "+
+			"eviction must not fire early and must not spin past the cap",
+			got, maxRefreshRequeues+1)
+	}
+	if got := Deps().Stats().EvictSelfGoneTotal; got != beforeSelfGone+1 {
+		t.Fatalf("#187 B3b: evict_self_gone_total = %d, want %d", got, beforeSelfGone+1)
+	}
+	// Architect Finding 2: the H1 live discriminator must NOT move here.
+	if got := Deps().Stats().EvictDeleteTotal; got != beforeDelete {
+		t.Fatalf("#187 B3b: evict_delete_total moved (%d -> %d) for a refresher-driven "+
+			"eviction. It must stay informer-DELETE-driven — it is the H1 live discriminator "+
+			"(delete a throwaway CR and watch it move); folding this path in breaks that "+
+			"procedure on any cluster that deletes CRs.", beforeDelete, got)
+	}
+	if n := len(Deps().CollectMatchesForTest(gvr, ns, name)); n != 0 {
+		t.Fatalf("#187 B3b: %d dep record(s) outlived the evicted entry", n)
+	}
+}
+
+// --- B4 — TTL honesty: repeated DECLINES must not keep an entry alive -------
+//
+// The team lead's TTL-honesty arm, restored (architect Finding 3 — it was
+// deleted without replacement, and commit 2 inserts a new branch immediately
+// above the decline gates it guards). A refresh that declines (stage error /
+// external / UAF) returns BEFORE c.Put, so it must not slide CreatedAt. An
+// entry declined repeatedly across more than its TTL must be GONE on the next
+// Get. GREEN on main — which is the finding: the decline path is NOT the
+// CreatedAt slider.
+
+func TestIssue187_B4_DeclinesDoNotExtendTTL(t *testing.T) {
+	defer withCleanDepWatch(t)()
+
+	gvr := gvrFlexes()
+	store := newResolvedCache(100, 1<<20, 200*time.Millisecond) // tiny TTL
+	Deps().SetStore(store)
+
+	const key = "L1_declined"
+	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: widgetInputs(gvr, "ns", "declining")})
+
+	// Simulate the decline path: dequeue (TTL-enforcing Get) + no Put,
+	// repeatedly, across more than one TTL window.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	gets := 0
+	for time.Now().Before(deadline) {
+		if _, ok := store.Get(key); ok {
+			gets++
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if _, ok := store.Get(key); ok {
+		t.Fatalf("#187 B4 RED: an entry Get-but-never-Put survived past its TTL (%d successful "+
+			"Gets); a decline path is sliding CreatedAt", gets)
 	}
 }
 

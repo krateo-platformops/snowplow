@@ -40,7 +40,6 @@ package dispatchers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -57,6 +56,7 @@ import (
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
 
@@ -82,7 +82,29 @@ var resolveOnceFn = resolveOnceProd
 // re-fetch of the CR named by the entry's own Inputs, which runs BEFORE
 // the resolver and therefore before any inner call can fail. An inner
 // call's NotFound is the dirty-mark class and never produces this.
-var errSelfObjectGone = errors.New("self object gone (apiserver 404 on the entry's own object)")
+var errSelfObjectGone = cache.ErrSelfObjectGone
+
+// selfObjectTypeStillRegistered reports whether an informer is registered for
+// the entry's own GVR — i.e. whether the TYPE still exists as far as this
+// process knows. It is the third bound on the #187 (i) eviction (architect
+// Finding 1): a 404 only means "this OBJECT is gone" while its type is still
+// there. When the CRD itself has been removed the apiserver 404s every object
+// of that GVR, and evicting on that would empty L1 of the whole type in one
+// refresh sweep.
+//
+// Fails CLOSED (no eviction) on a nil watcher: unable to confirm the type is
+// not the same as confirming it is gone.
+func selfObjectTypeStillRegistered(inputs cache.ResolvedKeyInputs) bool {
+	rw := cache.Global()
+	if rw == nil {
+		return false
+	}
+	return rw.IsRegistered(schema.GroupVersionResource{
+		Group:    inputs.Group,
+		Version:  inputs.Version,
+		Resource: inputs.Resource,
+	})
+}
 
 // resolveAndPopulateL1 is the single resolve-and-store path. It:
 //
@@ -238,59 +260,22 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
-		// 1.12.5 / #187 (i) — the entry's OWN object is gone from the
-		// cluster (definite apiserver 404 on the re-fetch). The entry is
-		// the resolved representation of an object that no longer exists,
-		// so there is nothing to refresh INTO: EVICT it.
+		// 1.12.5 / #187 (i) — a self-object 404 is NOT evicted here. It is
+		// wrapped as cache.ErrSelfObjectGone and RETURNED, so the refresher
+		// requeues it; the eviction happens at the DROP point, once the full
+		// maxRefreshRequeues budget has re-confirmed the deletion (see
+		// refresher.go processNext). The budget is the determinism proof —
+		// about 15.5s of backoff at the defaults — so a CRD re-registration
+		// window that clears inside it never evicts.
 		//
-		// Pre-1.12.5 this returned the error, the refresher requeued with
-		// backoff five times and then Forgot the key (refresh_dropped),
-		// leaving the stale body resident for the rest of the 1h TTL. That
-		// is the survival path #187 measured on krateo-057: 264
-		// refresh_failed lines resolving to six self entries, then 44
-		// refresh_dropped, with the portal still serving the pre-delete
-		// child list ~90 minutes later across a hard reload.
-		//
-		// Eviction goes through the dep tracker, not the store directly, so
-		// RemoveL1Key clears the entry's dep edges alongside it and the
-		// eviction lands on the same evict_delete_total an informer DELETE
-		// would have moved. A subsequent cold dispatch re-resolves from
-		// scratch; if the object is genuinely gone the dispatch 404s
-		// honestly instead of serving a body for a dead object.
-		//
-		// Returns nil, NOT an error: this is a resolved outcome, not a
-		// failure. An error would burn the retry budget re-confirming a
-		// deletion, and the four no-Put success-returns below already
-		// establish "handled, nothing stored" as a nil return on this path.
-		//
-		// Per feedback_l1_invalidation_delete_only.md eviction is authorised
-		// on a DELETE observation. A confirmed 404 on the entry's own object
-		// IS a deletion observation — the same fact the informer event
-		// carries, arriving by a different route — so this widens the
-		// authorised trigger set within the rule's intent. Flagged to the
-		// architect and PM as a rule change rather than an implementation
-		// detail.
-		if errors.Is(err, errSelfObjectGone) {
-			evicted := cache.Deps().EvictSelfGone(key)
-			cache.BumpRefresherSelfNotFoundEvict()
-			// WARN, at the chart's LOG_LEVEL: this is the line that
-			// REPLACES the refresh_failed/refresh_dropped pair an operator
-			// used to see, and it is how they confirm the delete-driven
-			// invalidation actually happened.
-			log.Warn("resolveAndPopulateL1: own object is gone; evicting the entry",
-				slog.String("subsystem", "cache"),
-				slog.String("key_hash", key),
-				slog.String("handler", inputs.CacheEntryClass),
-				slog.String("gvr", inputs.Group+"/"+inputs.Version+", Resource="+inputs.Resource),
-				slog.String("ns", inputs.Namespace),
-				slog.String("name", inputs.Name),
-				slog.String("user", refreshUser),
-				slog.Bool("evicted", evicted),
-				slog.String("effect", "the entry's own object returned a definite apiserver 404 — "+
-					"evicted instead of requeued-then-dropped-stale (#187)"),
-			)
-			return nil
-		}
+		// An earlier revision evicted on the FIRST definite 404 with a
+		// type-exists conjunct as the bound. That conjunct cannot hold:
+		// objects.Get lazy-registers the GVR on its own not-servable path
+		// BEFORE the error is classified, so IsRegistered is true again by the
+		// time anything downstream consults it. The BCRD arm proves it. The
+		// conjunct is kept in resolveOnceProd as defence-in-depth for the case
+		// it does bind — an entire GROUP gone, where EnsureResourceType
+		// refuses to register — but the requeue budget is the real bound.
 		return fmt.Errorf("resolveAndPopulateL1 %s/%s: %w",
 			inputs.CacheEntryClass, inputs.Name, err)
 	}
@@ -532,7 +517,33 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 		//
 		// Every other 404 here HAS been confirmed by the apiserver: the
 		// informer branch falls through to a live GET on a miss.
-		if got.Err.Code == http.StatusNotFound && !cache.InformerOnlyReadsFromContext(ctx) {
+		//
+		//  - ONLY while the TYPE still exists. Architect Finding 1: the two
+		//    bounds above are not enough. When a CRD is absent — deleted and
+		//    recreated, which is exactly what a portal release does — the
+		//    apiserver returns a GENUINE 404 for EVERY object of that GVR.
+		//    apierrors.IsNotFound is true and the context is not informer-only,
+		//    so without this conjunct every refresh of every entry of that GVR
+		//    would evict on first touch: a cold-cache storm at 50K, and
+		//    precisely the transient the bound exists to prevent. It is not a
+		//    correctness bug — the entries re-resolve on the next dispatch —
+		//    but it is the wrong shape at production scale.
+		//
+		//    IsRegistered, deliberately, NOT IsServable/confirmed: those ride
+		//    the 30s discovery tick (servable.go RefreshDiscovery) and would
+		//    mis-time the window. IsRegistered is structurally tied to the CRD
+		//    lifecycle — triggerCRDDelete → RemoveResourceType → not registered
+		//    → no eviction. During a SCHEMA RELIST the GVR is re-registered
+		//    immediately (crd_discovery_side_effect.go), so an object genuinely
+		//    deleted inside that window still evicts, which is what the
+		//    post-sync re-fire depends on.
+		//
+		//    A nil global watcher means the type cannot be confirmed at all, so
+		//    it reads as "do not evict" — the same conservative direction
+		//    isSelfRepresentation takes when it cannot classify.
+		if got.Err.Code == http.StatusNotFound &&
+			!cache.InformerOnlyReadsFromContext(ctx) &&
+			selfObjectTypeStillRegistered(inputs) {
 			return nil, fmt.Errorf("re-fetch %s/%s: %s: %w",
 				inputs.Resource, inputs.Name, got.Err.Message, errSelfObjectGone)
 		}

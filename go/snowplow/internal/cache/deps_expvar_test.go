@@ -72,7 +72,7 @@ func TestDepsExpvar_PublishesEveryDocumentedStat(t *testing.T) {
 		"dropped_cap", "dropped_no_key", "remove_l1_total",
 		// what the tracker does with events
 		"evict_delete_total", "dirty_mark_total", "enqueue_update_total",
-		"self_notfound_evict_total",
+		"evict_self_gone_total", "self_notfound_evict_total",
 		// informer bridge: ADD gate
 		"add_propagated", "add_dropped_pre_sync", "add_nil_syncch",
 		// informer bridge: DELETE worker — the #187 H1 surface

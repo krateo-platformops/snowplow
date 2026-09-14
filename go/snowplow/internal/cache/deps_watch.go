@@ -104,9 +104,20 @@ func depWatchSingleton() *depWatch {
 func (w *depWatch) startDeleteWorker() {
 	w.startOnce.Do(func() {
 		w.workerWG.Add(1)
-		go w.runDeleteWorker()
+		go w.runDeleteWorker(0)
 	})
 }
+
+// maxDeleteWorkerRespawns bounds the supervisor re-spawn chain
+// (architect Finding 4). The re-spawn path is unreachable today — every
+// event runs under handleDeleteEvent's recover — but if a future edit
+// put a DETERMINISTIC panic in the loop body outside that recover, an
+// uncapped supervisor would turn one silent death into a hot
+// spawn-and-log loop that burns a core and floods the log. After this
+// many consecutive re-spawns the worker stays down and says so once,
+// loudly: degraded DELETE handling is bad, a spinning core is worse, and
+// a log line naming the cap is diagnosable.
+const maxDeleteWorkerRespawns = 5
 
 // runDeleteWorker is the worker body. Split out of startDeleteWorker at
 // 1.12.5 (#187 H1) so the supervisor defer can re-spawn it.
@@ -134,7 +145,7 @@ func (w *depWatch) startDeleteWorker() {
 // registered FIRST so it runs LAST, which means the re-spawn's Add(1)
 // happens while the WaitGroup counter is still ≥1 (no zero-transition
 // race against stopDeleteWorker's Wait).
-func (w *depWatch) runDeleteWorker() {
+func (w *depWatch) runDeleteWorker(respawns int) {
 	defer w.workerWG.Done()
 	defer func() {
 		rec := recover()
@@ -142,14 +153,28 @@ func (w *depWatch) runDeleteWorker() {
 			return
 		}
 		w.counters.deleteWorkerPanics.Add(1)
+		if respawns >= maxDeleteWorkerRespawns {
+			slog.Error("deps.delete_worker.panic",
+				slog.String("subsystem", "cache"),
+				slog.Any("panic", rec),
+				slog.String("site", "worker_loop"),
+				slog.Int("respawns", respawns),
+				slog.String("effect", "worker loop unwound OUTSIDE the per-event recover "+
+					"more than the re-spawn cap allows — STAYING DOWN. DELETE-driven L1 "+
+					"invalidation is degraded to TTL until restart; a deterministic panic "+
+					"in the loop body is the only way to reach this."),
+			)
+			return
+		}
 		slog.Error("deps.delete_worker.panic",
 			slog.String("subsystem", "cache"),
 			slog.Any("panic", rec),
 			slog.String("site", "worker_loop"),
+			slog.Int("respawns", respawns),
 			slog.String("effect", "worker loop unwound OUTSIDE the per-event recover; re-spawning"),
 		)
 		w.workerWG.Add(1)
-		go w.runDeleteWorker()
+		go w.runDeleteWorker(respawns + 1)
 	}()
 	for {
 		select {

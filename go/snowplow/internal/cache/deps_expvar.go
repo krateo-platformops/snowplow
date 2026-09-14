@@ -106,13 +106,23 @@ func DepsStatsByStat() map[string]int64 {
 		"remove_l1_total": int64(d.RemoveL1Total),
 
 		// --- what the tracker DOES with events ---
-		// evict_delete_total covers both routes an object-gone observation
-		// can arrive by: an informer DELETE (OnDelete bucket 1) and the
-		// refresher's confirmed self-object 404 (1.12.5 #187 (i)).
+		// evict_delete_total is INFORMER-DELETE-DRIVEN ONLY. It is the H1
+		// live discriminator: delete a throwaway CR with a live L1 entry and
+		// watch it move; frozen means the DELETE bridge is dead. The
+		// refresher's self-404 evictions deliberately do NOT fold in here
+		// (architect Finding 2) — they have their own counter below, because
+		// a folded number moves for two unrelated reasons and the procedure
+		// stops working on any cluster that deletes CRs.
 		"evict_delete_total":   int64(d.EvictDeleteTotal),
 		"dirty_mark_total":     int64(d.DirtyMarkTotal),
 		"enqueue_update_total": int64(d.EnqueueUpdateTotal),
-		// ...of which, the refresher leg.
+		// The refresher leg: entries evicted because the re-fetch of their
+		// OWN object returned a confirmed apiserver 404. evict_self_gone_total
+		// is the tracker-side count (evictions that actually removed an
+		// entry); self_notfound_evict_total is the refresher-side count of
+		// times the branch fired. They differ only when the entry had already
+		// gone by some other route.
+		"evict_self_gone_total":     int64(d.EvictSelfGoneTotal),
 		"self_notfound_evict_total": int64(RefresherSelfNotFoundEvictTotal()),
 
 		// --- the informer bridge: ADD gate ---
