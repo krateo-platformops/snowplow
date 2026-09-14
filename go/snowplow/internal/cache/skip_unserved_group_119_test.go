@@ -123,9 +123,20 @@ func (d *skip119Disco) ServerGroups() (*metav1.APIGroupList, error) {
 }
 
 func (d *skip119Disco) ServerResourcesForGroupVersion(gv string) (*metav1.APIResourceList, error) {
+	// COPY the inner map under the lock. Releasing d.mu while still holding a
+	// reference to d.servedResources[gv] let the range below run concurrently
+	// with setServed's write INTO that same inner map: the lock guarded the
+	// outer-map lookup, but the inner map escaped it. The confirm path calls
+	// this from primeConfirmAsyncLocked's goroutine, so a test that flips a
+	// resource served while a confirm is in flight raced — which is exactly
+	// what this test does. -race caught it once the package's scheduling
+	// shifted; the bug was always here.
 	d.mu.Lock()
 	d.resourcesCalls++
-	res := d.servedResources[gv]
+	res := make(map[string]bool, len(d.servedResources[gv]))
+	for name, served := range d.servedResources[gv] {
+		res[name] = served
+	}
 	d.mu.Unlock()
 
 	// The confirm path (resourceTypeServed) reads this: a resource name present

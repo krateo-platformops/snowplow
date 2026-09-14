@@ -60,9 +60,32 @@ type debugApistageBody struct {
 // @Success 200 {object} debugApistageBody
 // @Router /debug/apistage [get]
 func DebugApistage() http.HandlerFunc {
-	return func(wri http.ResponseWriter, _ *http.Request) {
+	return func(wri http.ResponseWriter, req *http.Request) {
 		store := cache.ResolvedCache() // nil when the resolved cache is off
 		var rows []cache.ResolvedEntryMeta
+
+		// 1.12.5 / #187 — single-entry lookup. The whole #187 inference chain
+		// had to be built from the client's subsequent child fetches because
+		// nobody could look at ONE resident entry and say how old it was or
+		// whether its body had changed. `?key_hash=<hex>` answers that in one
+		// request; the body sha256 is populated only on this path (hashing
+		// every body under the store mutex would stall serving), and it is a
+		// HASH rather than the body because L1 cells are per-identity and a
+		// body dump would be a cross-identity read.
+		if kh := req.URL.Query().Get("key_hash"); kh != "" {
+			body := debugApistageBody{CacheEnabled: store != nil}
+			if store != nil {
+				if meta, ok := store.MetadataForKey(kh); ok {
+					body.Entries = []cache.ResolvedEntryMeta{meta}
+					body.Count = 1
+				}
+			}
+			wri.Header().Set("Content-Type", "application/json")
+			wri.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(wri).Encode(body)
+			return
+		}
+
 		// RangeMetadata is nil-receiver safe; guard anyway for clarity.
 		if store != nil {
 			store.RangeMetadata(func(m cache.ResolvedEntryMeta) bool {

@@ -490,6 +490,29 @@ type ServableGVRStatus struct {
 	WatchBroken bool   `json:"watchBroken"` // conjunct 3 (true ⇒ not servable)
 	Confirmed   bool   `json:"confirmed"`   // conjunct 4
 	Servable    bool   `json:"servable"`    // all four conjuncts
+
+	// 1.12.5 / #187 — FRESHNESS. The four conjuncts above say whether an
+	// informer is ALLOWED to serve; none of them says whether what it holds
+	// is current. During #187 the question that could not be answered from a
+	// live pod was "does this indexer still hold the deleted object?", and
+	// there was no field for it anywhere.
+	//
+	// IndexerCount is how many objects the informer's store holds right now —
+	// compare it against `kubectl get <resource> -A | wc -l` and a divergence
+	// IS the staleness, no inference needed.
+	//
+	// LastSyncResourceVersion is the RV the most recent discovery refresh
+	// observed. It was tracked internally (to clear watchBroken on a
+	// successful relist) and never published.
+	//
+	// LastEventAgeSeconds is the time since the bridge last delivered ANY
+	// event for this GVR; -1 means never. A GVR whose objects churn but whose
+	// age keeps climbing has a dead watch that watchBroken did not catch —
+	// HasSynced stays true forever once the initial LIST completes, so it
+	// cannot express this.
+	IndexerCount            int     `json:"indexerCount"`
+	LastSyncResourceVersion string  `json:"lastSyncResourceVersion,omitempty"`
+	LastEventAgeSeconds     float64 `json:"lastEventAgeSeconds"`
 }
 
 // ServableSnapshot returns a read-only per-GVR servability snapshot over
@@ -514,12 +537,31 @@ func (rw *ResourceWatcher) ServableSnapshot() []ServableGVRStatus {
 		// reuse it rather than re-deriving the conjunction here, so a future
 		// conjunct change cannot make the diagnostic disagree with the gate.
 		_, servable := rw.servableLocked(gvr)
+		// Freshness (1.12.5 / #187). ListKeys allocates a []string of the
+		// indexer's keys; at the ~169 registered informers of a production
+		// cluster that is a handful of microseconds per row on a JWT-gated
+		// diagnostic route, and the aggregate OTel path uses
+		// InformerFreshnessSnapshot, which sums the same numbers once per
+		// collection interval rather than per GVR series.
+		indexerCount := 0
+		if inf := gi.Informer(); inf != nil {
+			if st := inf.GetStore(); st != nil {
+				indexerCount = len(st.ListKeys())
+			}
+		}
+		ageSeconds := float64(-1)
+		if ns := rw.lastEventUnixNano(gvr); ns > 0 {
+			ageSeconds = time.Since(time.Unix(0, ns)).Seconds()
+		}
 		out = append(out, ServableGVRStatus{
-			GVR:         gvr.String(),
-			HasSynced:   gi.Informer().HasSynced(),
-			WatchBroken: broken,
-			Confirmed:   confirmed,
-			Servable:    servable,
+			GVR:                     gvr.String(),
+			HasSynced:               gi.Informer().HasSynced(),
+			WatchBroken:             broken,
+			Confirmed:               confirmed,
+			Servable:                servable,
+			IndexerCount:            indexerCount,
+			LastSyncResourceVersion: rw.lastSyncRV[gvr],
+			LastEventAgeSeconds:     ageSeconds,
 		})
 	}
 	return out
@@ -589,6 +631,65 @@ func ServableCountsSnapshot() (registered, synced, servable, watchBroken, confir
 		return 0, 0, 0, 0, 0
 	}
 	return Global().ServableCounts()
+}
+
+// InformerFreshness is the BOUNDED aggregate of the per-GVR freshness fields
+// (1.12.5 / #187), for the OTLP mirror.
+//
+// Aggregate, not per-GVR series, and that is a deliberate cardinality choice:
+// a production cluster carries ~169 registered informers, so three per-GVR
+// gauges would add ~500 series to every collection interval — the exact
+// cardinality class 1.12.4 already had to cap with snowplow_metrics_series
+// _truncated_total. The per-GVR truth stays on /debug/servable, where an
+// operator asks about one GVR; the dashboard gets the numbers that say
+// "something is stale" and the route says which.
+type InformerFreshness struct {
+	IndexerObjects    int64 // total objects across every registered indexer
+	GVRsNeverEvent    int64 // registered GVRs the bridge has never delivered an event for
+	MaxEventAgeSecs   int64 // oldest last-event age across GVRs that HAVE had one; 0 if none
+	GVRsStaleOverHour int64 // GVRs whose last event is older than an hour
+}
+
+// InformerFreshnessSnapshot computes the aggregate under a single read lock.
+// Allocates one []string per informer (ListKeys); called on the OTLP
+// collection interval, not on any request path.
+func (rw *ResourceWatcher) InformerFreshnessSnapshot() InformerFreshness {
+	var out InformerFreshness
+	if rw == nil || rw.mode == modePassthrough {
+		return out
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	now := time.Now()
+	for gvr, gi := range rw.informers {
+		if inf := gi.Informer(); inf != nil {
+			if st := inf.GetStore(); st != nil {
+				out.IndexerObjects += int64(len(st.ListKeys()))
+			}
+		}
+		ns := rw.lastEventUnixNano(gvr)
+		if ns == 0 {
+			out.GVRsNeverEvent++
+			continue
+		}
+		age := int64(now.Sub(time.Unix(0, ns)).Seconds())
+		if age > out.MaxEventAgeSecs {
+			out.MaxEventAgeSecs = age
+		}
+		if age > 3600 {
+			out.GVRsStaleOverHour++
+		}
+	}
+	return out
+}
+
+// InformerFreshnessSnapshotGlobal is the package-level accessor the metrics
+// package calls. Returns a zero value when the cache is off or unwired.
+func InformerFreshnessSnapshotGlobal() InformerFreshness {
+	if Disabled() {
+		return InformerFreshness{}
+	}
+	return Global().InformerFreshnessSnapshot()
 }
 
 // resourceTypeServed reports whether the apiserver currently serves

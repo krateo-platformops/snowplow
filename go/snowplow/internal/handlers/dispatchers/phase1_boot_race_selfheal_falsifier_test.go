@@ -107,7 +107,7 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 	// real config-vars presence gate: absent → error (roots_list_failed);
 	// present → roots discovered.
 	var (
-		configPresent atomic.Bool // flips true when the ConfigMap is "created"
+		configPresent atomic.Bool  // flips true when the ConfigMap is "created"
 		rootsSeen     atomic.Int64 // roots discovered by the last boot-scope run
 		bootRuns      atomic.Int64 // rePrewarmBoot-equivalent invocations
 		lastListErr   atomic.Bool  // last run hit the roots_list_failed path
@@ -214,13 +214,30 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if ConfigVarsEnqueuedTotal() == 0 {
-		t.Fatalf("SELF-HEAL FAIL: the config-vars ConfigMap AddFunc did NOT drive a scopeKindBoot "+
+		t.Fatalf("SELF-HEAL FAIL: the config-vars ConfigMap AddFunc did NOT drive a scopeKindBoot " +
 			"re-enqueue — the informer trigger is not wired (RED = HEAD 49a3b8e behavior)")
 	}
 	// The singleton must have a pending boot scope (coalesced on the boot key).
+	//
+	// POLL, do not read once. enqueueBootReDrive bumps configVarsEnqueuedTotal
+	// as its FIRST statement and only then does the work that inserts the
+	// pending scope (clearDeclinedExternalSet, the convergence reset, and
+	// finally enqueueScope). The wait loop above exits the instant the counter
+	// moves, so a single read here can land inside that window — the assertion
+	// was racing the code it asserts on. Reading it once passed for as long as
+	// the informer path stayed fast enough; it is not a guarantee.
 	e := prewarmEngineSingleton()
-	hasBoot := e.pendingHasBootForTest()
-	pendingLen := e.pendingLenForTest()
+	var hasBoot bool
+	var pendingLen int
+	pendDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(pendDeadline) {
+		hasBoot = e.pendingHasBootForTest()
+		pendingLen = e.pendingLenForTest()
+		if hasBoot {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if !hasBoot {
 		t.Fatalf("SELF-HEAL FAIL: no scopeKindBoot pending on the engine after the ConfigMap AddFunc")
 	}
@@ -259,7 +276,7 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 		t.Fatalf("token self-heal: installSeedLoopbackToken returned nil ctx")
 	}
 	if tok, _ := xcontext.AccessToken(healed); tok == "" {
-		t.Fatalf("token self-heal FAIL: no access token installed on ctx after authn became reachable — "+
+		t.Fatalf("token self-heal FAIL: no access token installed on ctx after authn became reachable — " +
 			"the #57 nested loopback would stay cold")
 	}
 	if SeedLoopbackTokenErrTotal() != errBeforeHeal {

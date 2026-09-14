@@ -38,6 +38,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -297,6 +298,16 @@ type refresher struct {
 	// an exportJwt loopback stage correctly, so the layer-(a) skip-to-TTL
 	// net is obsolete. Layer (b) stays as the general backstop.)
 	refresherSkippedStageError atomic.Uint64
+
+	// 1.12.5 / #187 (i) — selfNotFoundEvict counts entries EVICTED because
+	// the refresh re-fetch of the entry's OWN object came back with a
+	// definite apiserver 404. Pre-1.12.5 that 404 was flattened to a
+	// string, requeued five times and then dropped (refresh_dropped) with
+	// the stale body still resident until the 1h TTL — the mechanism the
+	// portal actually felt in #187. Non-zero here is NORMAL on a cluster
+	// that deletes CRs; it is the healthy counterpart of the
+	// refresh_dropped lines it replaces.
+	selfNotFoundEvict atomic.Uint64
 
 	// External-no-cache (proposal 2026-06-22) — external-touched Put-gate
 	// counter. externalSkippedPut counts L1 Puts declined because the
@@ -810,6 +821,47 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		if q.NumRequeues(key) >= maxRefreshRequeues {
 			q.Forget(key)
 			r.droppedTotal.Add(1)
+			// 1.12.5 / #187 (i) — THE DROP POINT IS THE EVICTION POINT for a
+			// self-object 404.
+			//
+			// The entry is the resolved output of an object the apiserver has
+			// now said is gone maxRefreshRequeues+1 times in a row. Dropping it
+			// to the TTL outer-net is what left the stale body resident for the
+			// rest of the hour on krateo-057 (264 refresh_failed over six self
+			// entries, then 44 refresh_dropped, with the portal still walking a
+			// child list that no longer existed 90 minutes later).
+			//
+			// WHY HERE AND NOT ON THE FIRST 404. The five-requeue budget IS the
+			// determinism proof: ~15.5s of backoff at the 500ms/60s defaults,
+			// so any window that clears inside it — a CRD re-registration, an
+			// apiserver blip that happens to 404 — never reaches this line. A
+			// first-404 eviction has no such bound, and the type-exists
+			// conjunct alone cannot supply one: objects.Get LAZY-REGISTERS the
+			// GVR on its own not-servable path before the error is ever
+			// classified, so IsRegistered is true again by the time anything
+			// downstream could consult it (proven by the BCRD arm).
+			//
+			// Eviction routes through the dep tracker, never store.deleteForDep,
+			// so RemoveL1Key clears the entry's dep edges alongside it
+			// (the resolved.go DELETE-eviction invariant), and it counts on its
+			// OWN counter — evict_delete_total stays informer-DELETE-driven so
+			// the H1 live discriminator keeps working.
+			if errors.Is(err, ErrSelfObjectGone) {
+				evicted := Deps().EvictSelfGone(key)
+				r.selfNotFoundEvict.Add(1)
+				slog.Warn("refresher.self_object_gone_evicted",
+					slog.String("subsystem", "cache"),
+					slog.String("key_hash", key),
+					slog.Int("requeues", maxRefreshRequeues),
+					slog.Bool("cluster_list_tier", fromCL),
+					slog.Bool("evicted", evicted),
+					slog.String("err", err.Error()),
+					slog.String("effect", "the entry's own object returned a confirmed apiserver 404 "+
+						"on every attempt across the full requeue budget — evicted instead of left "+
+						"resident until TTL (#187)"),
+				)
+				return true
+			}
 			slog.Warn("refresher.refresh_dropped",
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
@@ -893,6 +945,7 @@ type refresherStats struct {
 	skippedNoEntry    uint64
 	skippedNoHandler  uint64
 	skippedStageError uint64 // Ship 0.30.120 layer (b)
+	selfNotFoundEvict uint64 // 1.12.5 / #187 (i)
 	yielded           uint64 // Ship #98 — customer-priority yields
 	capped            uint64 // Ship #98 — max-parked cap hits
 	floored           uint64 // Task #321 (#318-R1a) — rate-floor deferrals
@@ -917,12 +970,38 @@ func refresherStatsSnapshot() refresherStats {
 		skippedNoEntry:       r.skippedNoEntryTotal.Load(),
 		skippedNoHandler:     r.skippedNoHandler.Load(),
 		skippedStageError:    r.refresherSkippedStageError.Load(),
+		selfNotFoundEvict:    r.selfNotFoundEvict.Load(),
 		yielded:              r.yieldedTotal.Load(),
 		capped:               r.cappedTotal.Load(),
 		floored:              r.flooredTotal.Load(),
 		clusterListEnqueued:  r.clusterListEnqueueTotal.Load(),
 		clusterListCompleted: r.clusterListCompletedTotal.Load(),
 	}
+}
+
+// ErrSelfObjectGone is the 1.12.5 / #187 (i) sentinel: a refresh's re-fetch of
+// the entry's OWN object came back with a confirmed apiserver 404. The
+// dispatchers package wraps it (%w) into the re-fetch error, preserving the
+// existing error TEXT for anyone grepping logs, and processNext tests it with
+// errors.Is AT THE DROP POINT — after the full requeue budget has been spent
+// re-confirming the deletion.
+//
+// It lives here, not in dispatchers, because the refresher is the consumer:
+// the eviction decision belongs where the deterministic-failure budget is
+// enforced, not where the single 404 is observed.
+//
+// It says SELF by construction. The only site that wraps it is the re-fetch of
+// the CR named by the entry's own Inputs, which runs BEFORE the resolver and
+// therefore before any inner call can fail. An inner call's NotFound is the
+// dirty-mark class (OnDelete bucket 2/3) and never produces this.
+var ErrSelfObjectGone = errors.New("self object gone (apiserver 404 on the entry's own object)")
+
+// RefresherSelfNotFoundEvictTotal returns the process-wide count of L1
+// entries evicted because the refresh re-fetch of the entry's OWN object
+// returned a definite apiserver 404 (1.12.5 / #187 (i)). Read by the
+// expvar + OTLP surfaces.
+func RefresherSelfNotFoundEvictTotal() uint64 {
+	return refresherSingleton().selfNotFoundEvict.Load()
 }
 
 // ClusterListRefresherStats exposes the Path 3.2 two-tier counters for

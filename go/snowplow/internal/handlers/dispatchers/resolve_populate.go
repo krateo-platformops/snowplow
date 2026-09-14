@@ -42,6 +42,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
@@ -68,6 +69,19 @@ import (
 // signature (cache.RefreshFunc) is untouched. Swapped only by the
 // _test.go shim; production never reassigns it.
 var resolveOnceFn = resolveOnceProd
+
+// errSelfObjectGone is the 1.12.5 / #187 (i) sentinel: the refresh
+// re-fetch of the entry's OWN object came back with a definite apiserver
+// 404. It is wrapped (%w) into the re-fetch error so the existing error
+// text — the exact string the 264 refresher.refresh_failed lines on
+// krateo-057 carried — is unchanged for anyone grepping logs, while
+// resolveAndPopulateL1 can discriminate it with errors.Is.
+//
+// It says SELF by construction: the only site that wraps it is the
+// re-fetch of the CR named by the entry's own Inputs, which runs BEFORE
+// the resolver and therefore before any inner call can fail. An inner
+// call's NotFound is the dirty-mark class and never produces this.
+var errSelfObjectGone = cache.ErrSelfObjectGone
 
 // resolveAndPopulateL1 is the single resolve-and-store path. It:
 //
@@ -223,6 +237,18 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
+		// 1.12.5 / #187 (i) — a self-object 404 is NOT evicted here. It is
+		// wrapped as cache.ErrSelfObjectGone and RETURNED, so the refresher
+		// requeues it; the eviction happens at the DROP point, once the full
+		// maxRefreshRequeues budget has re-confirmed the deletion (see
+		// refresher.go processNext). The budget is the determinism proof —
+		// about 15.5s of backoff at the defaults — so a CRD re-registration
+		// window that clears inside it never evicts.
+		//
+		// An earlier revision evicted on the FIRST definite 404 with a
+		// type-exists conjunct as the bound. That conjunct could not hold and
+		// was removed — see the comment at the wrap site in resolveOnceProd.
+		// The requeue budget is the only bound, and it is sufficient.
 		return fmt.Errorf("resolveAndPopulateL1 %s/%s: %w",
 			inputs.CacheEntryClass, inputs.Name, err)
 	}
@@ -443,6 +469,52 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 	}
 	got := objects.Get(ctx, ref)
 	if got.Err != nil {
+		// 1.12.5 / #187 (i) — PRESERVE the 404. Pre-1.12.5 every re-fetch
+		// error was flattened to a string here, so resolveAndPopulateL1
+		// could not tell "this CR was deleted" from "the apiserver hiccuped"
+		// and treated both as retryable: five requeues, then refresh_dropped
+		// with the stale body still resident until the 1h TTL. Wrapping the
+		// definite 404 in errSelfObjectGone lets the caller EVICT instead.
+		//
+		// TWO BOUNDS, both load-bearing:
+		//
+		//  - ONLY a definite 404. A 403 (RBAC blip), a 500, a timeout and a
+		//    parse failure all keep today's requeue — an apiserver hiccup
+		//    must never evict a slice of L1 at once.
+		//  - NEVER the informer-only miss. Under cache.WithInformerOnlyReads
+		//    objects.Get SYNTHESISES a NotFound rather than reaching the
+		//    apiserver (objects/get.go informerOnlyMiss), so its 404 means
+		//    "not in the indexer", not "deleted from the cluster". That is
+		//    precisely the transient a CRD re-registration produces, and it
+		//    must stay retryable.
+		//
+		// Every other 404 here HAS been confirmed by the apiserver: the
+		// informer branch falls through to a live GET on a miss.
+		//
+		// THE TYPE-ABSENT CASE IS NOT BOUND HERE, DELIBERATELY. When a CRD is
+		// absent — deleted and recreated, which is what a portal release does —
+		// the apiserver returns a GENUINE 404 for every object of that GVR, and
+		// this classifies them all as self-gone. A type-exists conjunct
+		// (cache.Global().IsRegistered) was tried and REMOVED: objects.Get's own
+		// not-servable branch calls EnsureResourceType BEFORE falling through to
+		// the apiserver, so the GVR is registered again by the time this line
+		// runs, and EnsureResourceType refuses only at GROUP granularity — a
+		// single deleted CRD whose group survives passes it. Where it was inert
+		// it was worse than absent, because the next reader would trust it as a
+		// bound; where it would bind (a whole group gone) the objects really are
+		// gone, so it would have blocked a CORRECT eviction and stranded those
+		// entries to TTL. See the BCRD arm.
+		//
+		// The REQUEUE BUDGET is the bound for every case: nothing is evicted
+		// until the 404 has repeated across maxRefreshRequeues (~15.5s of backoff
+		// at the defaults), so a CRD re-registration that clears inside it is
+		// safe, and a type absent for longer than that has genuinely taken its
+		// objects with it.
+		if got.Err.Code == http.StatusNotFound &&
+			!cache.InformerOnlyReadsFromContext(ctx) {
+			return nil, fmt.Errorf("re-fetch %s/%s: %s: %w",
+				inputs.Resource, inputs.Name, got.Err.Message, errSelfObjectGone)
+		}
 		return nil, fmt.Errorf("re-fetch %s/%s: %s",
 			inputs.Resource, inputs.Name, got.Err.Message)
 	}

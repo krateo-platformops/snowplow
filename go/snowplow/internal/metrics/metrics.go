@@ -512,11 +512,37 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- 1.12.5 / #187: the dependency tracker + informer->DepTracker
+	// bridge. DELETE-driven invalidation lives here, and until 1.12.5 its
+	// counters went only into an INFO line the production LOG_LEVEL=warn
+	// discards — which is why #187 could not be answered from the live pod.
+	// Alert on stat=delete_worker_panics_total > 0 (an eviction was LOST)
+	// and on stat=dropped_cap > 0 (dep edges are being silently dropped).
+	depsStats, err := m.Int64ObservableGauge(
+		"snowplow_deps",
+		metric.WithDescription("Dependency-tracker and informer-bridge counters, labelled by stat: dep-record occupancy, evict/dirty-mark totals, and the DELETE eviction worker's queue depth, inline-fallback and panic counts."))
+	if err != nil {
+		return err
+	}
+
 	// --- informer servability, the leading indicator for the
 	// informer-fallthrough-not-synced cell.
 	informerServable, err := m.Int64ObservableGauge(
 		"snowplow_informer_servable",
 		metric.WithDescription("Informer counts by state (registered/synced/servable/watch_broken/confirmed). watch_broken > 0 is the stale-delete latch."))
+	if err != nil {
+		return err
+	}
+
+	// --- 1.12.5 / #187: informer FRESHNESS, the half servability does not
+	// express. HasSynced says an informer finished its initial LIST once and
+	// stays true forever; it cannot say whether the indexer still matches the
+	// cluster. Aggregate, not per-GVR: ~169 informers x 3 gauges would be a
+	// ~500-series cardinality regression of exactly the class 1.12.4 had to
+	// cap. The per-GVR rows stay on /debug/servable.
+	informerFreshness, err := m.Int64ObservableGauge(
+		"snowplow_informer_freshness",
+		metric.WithDescription("Informer freshness aggregates, labelled by stat: total indexed objects, GVRs that have never received an event, the oldest last-event age, and GVRs stale over an hour."))
 	if err != nil {
 		return err
 	}
@@ -723,6 +749,12 @@ func registerInstruments(m metric.Meter, build string) error {
 				metric.WithAttributes(attribute.String("stat", stat)))
 		}
 
+		// --- 1.12.5: dep tracker + informer bridge ---
+		for stat, v := range cache.DepsStatsByStat() {
+			o.ObserveInt64(depsStats, v,
+				metric.WithAttributes(attribute.String("stat", stat)))
+		}
+
 		// --- 1.12.4: informer servability ---
 		reg, syncedN, servableN, brokenN, confirmedN := cache.ServableCountsSnapshot()
 		for state, v := range map[string]int{
@@ -734,6 +766,18 @@ func registerInstruments(m metric.Meter, build string) error {
 		} {
 			o.ObserveInt64(informerServable, int64(v),
 				metric.WithAttributes(attribute.String("state", state)))
+		}
+
+		// --- 1.12.5: informer freshness aggregates ---
+		fr := cache.InformerFreshnessSnapshotGlobal()
+		for stat, v := range map[string]int64{
+			"indexer_objects":       fr.IndexerObjects,
+			"gvrs_never_event":      fr.GVRsNeverEvent,
+			"max_event_age_seconds": fr.MaxEventAgeSecs,
+			"gvrs_stale_over_hour":  fr.GVRsStaleOverHour,
+		} {
+			o.ObserveInt64(informerFreshness, v,
+				metric.WithAttributes(attribute.String("stat", stat)))
 		}
 
 		// --- 1.12.4: build identity, constant 1 ---
@@ -771,6 +815,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		dispatchL1Cells, seedAttributableHits,
 		fallthroughCells, diagnosticTotal, diagnosticCells, seriesTruncated,
 		readyzBackstop, resolvedCache, informerServable, buildInfo,
+		// --- 1.12.5 ---
+		depsStats, informerFreshness,
 	)
 	return err
 }

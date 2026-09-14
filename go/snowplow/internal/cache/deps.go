@@ -455,7 +455,8 @@ type DepTracker struct {
 	recordTotal        atomic.Uint64
 	recordDroppedCap   atomic.Uint64
 	recordDroppedNoKey atomic.Uint64 // O15: Record*/WithL1KeyContext with empty l1Key
-	evictDeleteTotal   atomic.Uint64 // L1 self-representation evictions (OnDelete)
+	evictDeleteTotal   atomic.Uint64 // L1 self-representation evictions (OnDelete ONLY — the H1 live discriminator)
+	evictSelfGoneTotal atomic.Uint64 // 1.12.5 #187: evictions from a confirmed self-object 404 (EvictSelfGone)
 	dirtyMarkTotal     atomic.Uint64 // dirty-marks (OnAdd/OnUpdate + OnDelete non-self)
 	enqueueUpdateTotal atomic.Uint64 // refresh enqueues triggered by OnUpdate
 	removeL1Total      atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
@@ -695,18 +696,18 @@ func (d *DepTracker) onChange(eventType string, gvr schema.GroupVersionResource,
 // R2/R7 (0.30.110) — three-way classification. Every matched L1 entry
 // falls into exactly one of three buckets:
 //
-//   1. self-representation — the entry's OWN dispatched object is the
-//      deleted object. The cached output is the resolution of an object
-//      that no longer exists → EVICT (the only authorised eviction
-//      trigger, per feedback_l1_invalidation_delete_only.md).
+//  1. self-representation — the entry's OWN dispatched object is the
+//     deleted object. The cached output is the resolution of an object
+//     that no longer exists → EVICT (the only authorised eviction
+//     trigger, per feedback_l1_invalidation_delete_only.md).
 //
-//   2. LIST-dep — the entry matched via the (gvr, ns, "*") wildcard
-//      bucket. The entry's own object still exists; one member of a list
-//      it depends on went away → DIRTY-MARK (stale-while-revalidate).
+//  2. LIST-dep — the entry matched via the (gvr, ns, "*") wildcard
+//     bucket. The entry's own object still exists; one member of a list
+//     it depends on went away → DIRTY-MARK (stale-while-revalidate).
 //
-//   3. dependent-GET-dep — the entry matched via an exact (gvr, ns,
-//      name) bucket but its own object is a DIFFERENT object (e.g. a
-//      widget that GET-depends on a deleted RESTAction) → DIRTY-MARK.
+//  3. dependent-GET-dep — the entry matched via an exact (gvr, ns,
+//     name) bucket but its own object is a DIFFERENT object (e.g. a
+//     widget that GET-depends on a deleted RESTAction) → DIRTY-MARK.
 //
 // Returns the number of L1 keys EVICTED (self-representations only).
 // dirtyMarkTotal counts buckets 2 + 3.
@@ -1014,6 +1015,56 @@ func (d *DepTracker) runEvictionBatch(keys []string) {
 	}
 }
 
+// EvictSelfGone evicts ONE L1 key whose own object has been observed
+// gone by a path other than an informer DELETE event — today the sole
+// caller is the refresher, whose re-fetch of the entry's OWN object came
+// back with a definite apiserver 404 (1.12.5 / #187 (i)).
+//
+// WHY IT ROUTES THROUGH THE TRACKER. resolved.go states the invariant
+// that DELETE-driven eviction flows through the DepTracker so
+// RemoveL1Key runs alongside the store delete and the entry's dep
+// records do not outlive it. A direct store.deleteForDep here would
+// leave orphaned forward/reverse edges behind. This is runEvictionBatch
+// for a single key.
+//
+// IT COUNTS ON ITS OWN COUNTER, NOT evictDeleteTotal (architect
+// Finding 2). The first implementation folded it in, reasoning that an
+// operator wants one number for "entries that left because their object
+// went away". That breaks the H1 live discriminator: the documented
+// procedure is to delete a throwaway CR with a live L1 entry and watch
+// evict_delete_total — frozen means the DELETE bridge is dead. On a
+// cluster that deletes CRs the self-404 path fires constantly (that is
+// the point of the fix), so a folded counter moves for two unrelated
+// reasons and the procedure stops working. One counter, one meaning:
+// evict_delete_total stays informer-DELETE-driven, evictSelfGoneTotal
+// carries this path.
+//
+// SCOPE. This is the SELF object only. A NotFound on an INNER call is
+// the bucket-2/3 dirty-mark class (a child vanishing must never evict
+// the parent) and never reaches here: the caller gates on the re-fetch
+// of the entry's own CR, which happens before the resolve runs.
+//
+// Returns true iff an entry was actually removed from the store, so the
+// caller can log exactly once per genuine eviction.
+func (d *DepTracker) EvictSelfGone(l1Key string) bool {
+	if d == nil || l1Key == "" {
+		return false
+	}
+	d.storeMu.RLock()
+	store := d.store
+	d.storeMu.RUnlock()
+
+	evicted := false
+	if store != nil {
+		evicted = store.deleteForDep(l1Key)
+	}
+	d.RemoveL1Key(l1Key)
+	if evicted {
+		d.evictSelfGoneTotal.Add(1)
+	}
+	return evicted
+}
+
 // RemoveL1Key drops every dep record associated with l1Key. Invoked by
 // the L1 store's LRU eviction (and TTL eviction, and DELETE-driven
 // eviction inside OnDelete) so dep records don't outlive their L1
@@ -1060,7 +1111,8 @@ type DepStats struct {
 	RecordTotal        uint64
 	RecordDroppedCap   uint64
 	RecordDroppedNoKey uint64 // O15: empty-l1Key Record*/WithL1KeyContext
-	EvictDeleteTotal   uint64 // self-representation evictions only
+	EvictDeleteTotal   uint64 // self-representation evictions from an informer DELETE only
+	EvictSelfGoneTotal uint64 // 1.12.5 #187: evictions from a confirmed self-object 404
 	DirtyMarkTotal     uint64 // dirty-marks (ADD/UPDATE + DELETE non-self)
 	EnqueueUpdateTotal uint64
 	RemoveL1Total      uint64
@@ -1077,6 +1129,7 @@ func (d *DepTracker) Stats() DepStats {
 		RecordDroppedCap:   d.recordDroppedCap.Load(),
 		RecordDroppedNoKey: d.recordDroppedNoKey.Load(),
 		EvictDeleteTotal:   d.evictDeleteTotal.Load(),
+		EvictSelfGoneTotal: d.evictSelfGoneTotal.Load(),
 		DirtyMarkTotal:     d.dirtyMarkTotal.Load(),
 		EnqueueUpdateTotal: d.enqueueUpdateTotal.Load(),
 		RemoveL1Total:      d.removeL1Total.Load(),

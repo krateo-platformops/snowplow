@@ -46,6 +46,14 @@ type depWatchCounters struct {
 	addPropagated     atomic.Uint64 // ADD events propagated post-sync
 	addNilSyncCh      atomic.Uint64 // ADD events seen with a nil syncCh (O14)
 	deleteQueueFull   atomic.Uint64 // DELETE events run inline on a full queue
+
+	// 1.12.5 / #187 H1 — DELETE events whose OnDelete panicked. Each one
+	// is a SINGLE lost eviction (the worker survives and processes the
+	// next event); pre-1.12.5 the first one killed DELETE handling
+	// process-wide until restart. Non-zero is always a defect worth a
+	// stack-trace hunt: the WARN deps.delete_worker.panic names the
+	// offending (gvr, ns, name) and the panic value.
+	deleteWorkerPanics atomic.Uint64
 }
 
 // depWatch is the process-scoped informer→DepTracker bridge state: the
@@ -96,35 +104,125 @@ func depWatchSingleton() *depWatch {
 func (w *depWatch) startDeleteWorker() {
 	w.startOnce.Do(func() {
 		w.workerWG.Add(1)
-		go func() {
-			defer w.workerWG.Done()
-			defer func() {
-				if rec := recover(); rec != nil {
-					slog.Error("deps.delete_worker.panic",
-						slog.String("subsystem", "cache"),
-						slog.Any("panic", rec),
-					)
-				}
-			}()
+		go w.runDeleteWorker(0)
+	})
+}
+
+// maxDeleteWorkerRespawns bounds the supervisor re-spawn chain
+// (architect Finding 4). The re-spawn path is unreachable today — every
+// event runs under handleDeleteEvent's recover — but if a future edit
+// put a DETERMINISTIC panic in the loop body outside that recover, an
+// uncapped supervisor would turn one silent death into a hot
+// spawn-and-log loop that burns a core and floods the log. After this
+// many consecutive re-spawns the worker stays down and says so once,
+// loudly: degraded DELETE handling is bad, a spinning core is worse, and
+// a log line naming the cap is diagnosable.
+const maxDeleteWorkerRespawns = 5
+
+// runDeleteWorker is the worker body. Split out of startDeleteWorker at
+// 1.12.5 (#187 H1) so the supervisor defer can re-spawn it.
+//
+// #187 H1 — THE FIX. Pre-1.12.5 the recover sat OUTSIDE the drain loop,
+// so ONE panic anywhere under Deps().OnDelete unwound the whole
+// goroutine. startOnce had already fired, so nothing re-spawned it: from
+// that instant every DELETE in the process was enqueued to deleteEvictCh
+// and never processed — no counter, no repeat log — until the 1024-slot
+// buffer filled and submitDeleteEvent started falling back to inline
+// OnDelete. DELETE-driven L1 invalidation was dead process-wide while
+// ADD/UPDATE (which run inline on the processor goroutine) kept working:
+// exactly the discriminator #187 reports.
+//
+// The recover now sits INSIDE the per-event call (handleDeleteEvent), so
+// a panicking event costs exactly one lost eviction — logged at WARN with
+// its (gvr, ns, name), counted on deleteWorkerPanics — and the drain
+// continues with the next event.
+//
+// The defer below is a supervisor, not the primary guarantee: with every
+// event handled under handleDeleteEvent's recover, nothing in the loop
+// body can panic out. It exists so that a future edit which adds work to
+// the loop OUTSIDE handleDeleteEvent cannot silently re-introduce the
+// process-wide death. Ordering is load-bearing: workerWG.Done is
+// registered FIRST so it runs LAST, which means the re-spawn's Add(1)
+// happens while the WaitGroup counter is still ≥1 (no zero-transition
+// race against stopDeleteWorker's Wait).
+func (w *depWatch) runDeleteWorker(respawns int) {
+	defer w.workerWG.Done()
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		w.counters.deleteWorkerPanics.Add(1)
+		if respawns >= maxDeleteWorkerRespawns {
+			slog.Error("deps.delete_worker.panic",
+				slog.String("subsystem", "cache"),
+				slog.Any("panic", rec),
+				slog.String("site", "worker_loop"),
+				slog.Int("respawns", respawns),
+				slog.String("effect", "worker loop unwound OUTSIDE the per-event recover "+
+					"more than the re-spawn cap allows — STAYING DOWN. DELETE-driven L1 "+
+					"invalidation is degraded to TTL until restart; a deterministic panic "+
+					"in the loop body is the only way to reach this."),
+			)
+			return
+		}
+		slog.Error("deps.delete_worker.panic",
+			slog.String("subsystem", "cache"),
+			slog.Any("panic", rec),
+			slog.String("site", "worker_loop"),
+			slog.Int("respawns", respawns),
+			slog.String("effect", "worker loop unwound OUTSIDE the per-event recover; re-spawning"),
+		)
+		w.workerWG.Add(1)
+		go w.runDeleteWorker(respawns + 1)
+	}()
+	for {
+		select {
+		case <-w.stopCh:
+			// Drain queued events before exit so test teardown
+			// is deterministic.
 			for {
 				select {
-				case <-w.stopCh:
-					// Drain queued events before exit so test teardown
-					// is deterministic.
-					for {
-						select {
-						case ev := <-w.deleteEvictCh:
-							Deps().OnDelete(ev.gvr, ev.namespace, ev.name)
-						default:
-							return
-						}
-					}
 				case ev := <-w.deleteEvictCh:
-					Deps().OnDelete(ev.gvr, ev.namespace, ev.name)
+					w.handleDeleteEvent(ev)
+				default:
+					return
 				}
 			}
-		}()
-	})
+		case ev := <-w.deleteEvictCh:
+			w.handleDeleteEvent(ev)
+		}
+	}
+}
+
+// handleDeleteEvent runs Deps().OnDelete for one queued DELETE under its
+// OWN recover (#187 H1). A panic is confined to this event: it is
+// counted, WARN-logged with the offending coordinates, and the caller's
+// drain loop proceeds to the next event.
+//
+// WARN, not ERROR: the chart ships LOG_LEVEL=warn, and this line is the
+// one an operator greps for after a missed invalidation. It names the
+// object whose eviction was lost, which the pre-1.12.5 ERROR line did
+// not.
+func (w *depWatch) handleDeleteEvent(ev depDeleteEvent) {
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		w.counters.deleteWorkerPanics.Add(1)
+		slog.Warn("deps.delete_worker.panic",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", ev.gvr.String()),
+			slog.String("ns", ev.namespace),
+			slog.String("name", ev.name),
+			slog.Any("panic", rec),
+			slog.String("site", "on_delete"),
+			slog.String("effect", "this object's L1 eviction was LOST (stale until TTL); "+
+				"the worker survived and continues draining subsequent DELETEs"),
+		)
+	}()
+	Deps().OnDelete(ev.gvr, ev.namespace, ev.name)
 }
 
 // submitDeleteEvent hands a DELETE event to the worker goroutine (R3).
@@ -141,7 +239,12 @@ func (w *depWatch) submitDeleteEvent(ev depDeleteEvent) {
 			slog.String("gvr", ev.gvr.String()),
 			slog.String("hint", "DELETE storm outran the eviction worker — running OnDelete inline"),
 		)
-		Deps().OnDelete(ev.gvr, ev.namespace, ev.name)
+		// 1.12.5 / #187 H1 — the inline fallback runs on the INFORMER
+		// PROCESSOR goroutine. Route it through the same per-event recover:
+		// an unguarded panic here would kill event delivery for the whole
+		// informer, a strictly worse failure than the worker death H1
+		// describes. Same counter, same WARN line (site=on_delete).
+		w.handleDeleteEvent(ev)
 	}
 }
 
@@ -205,6 +308,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 			}
 			ns, name := metaNSName(obj)
 			w.counters.addPropagated.Add(1)
+			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
 			Deps().OnAdd(gvr, ns, name)
 			// Ship 0.30.233 — CRD-ADD discovery side-effect.
 			// Dispatches to the bounded worker channel so the
@@ -220,6 +324,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 		},
 		UpdateFunc: func(_, newObj interface{}) {
 			ns, name := metaNSName(newObj)
+			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
 			Deps().OnUpdate(gvr, ns, name)
 			// Ship L / 0.30.246 — CRD UPDATE lifecycle hook. A CRD
 			// UPDATE may add a new served version, retire one, or
@@ -243,6 +348,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 				obj = tomb.Obj
 			}
 			ns, name := metaNSName(obj)
+			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
 			// R3: hand off to the worker — never run the eviction burst
 			// inline on this informer processor goroutine.
 			w.submitDeleteEvent(depDeleteEvent{gvr: gvr, namespace: ns, name: name})
@@ -303,16 +409,28 @@ type DepWatchStats struct {
 	AddPropagated     uint64
 	AddNilSyncCh      uint64
 	DeleteQueueFull   uint64
+
+	// 1.12.5 / #187. DeleteWorkerPanics is the H1 signature — non-zero
+	// means at least one DELETE eviction was LOST. DeleteQueueDepth is
+	// the live occupancy of deleteEvictCh, sampled at snapshot time: a
+	// depth pinned near deleteEvictQueueDepth is the pre-1.12.5 dead-
+	// worker shape, and on 1.12.5 it means the drain is genuinely behind.
+	DeleteWorkerPanics uint64
+	DeleteQueueDepth   int
+	DeleteQueueCap     int
 }
 
 // DepWatchStatsSnapshot returns the current bridge counters.
 func DepWatchStatsSnapshot() DepWatchStats {
 	w := depWatchSingleton()
 	return DepWatchStats{
-		AddDroppedPreSync: w.counters.addDroppedPreSync.Load(),
-		AddPropagated:     w.counters.addPropagated.Load(),
-		AddNilSyncCh:      w.counters.addNilSyncCh.Load(),
-		DeleteQueueFull:   w.counters.deleteQueueFull.Load(),
+		AddDroppedPreSync:  w.counters.addDroppedPreSync.Load(),
+		AddPropagated:      w.counters.addPropagated.Load(),
+		AddNilSyncCh:       w.counters.addNilSyncCh.Load(),
+		DeleteQueueFull:    w.counters.deleteQueueFull.Load(),
+		DeleteWorkerPanics: w.counters.deleteWorkerPanics.Load(),
+		DeleteQueueDepth:   len(w.deleteEvictCh),
+		DeleteQueueCap:     cap(w.deleteEvictCh),
 	}
 }
 

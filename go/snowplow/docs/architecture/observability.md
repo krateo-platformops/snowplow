@@ -206,9 +206,80 @@ Defined in `internal/cache/refresh_broadcaster_expvar.go`.
 | expvar | meaning | healthy range |
 |---|---|---|
 | `snowplow_plurals_registered_gvrs` (`internal/cache/registered_gvrs_expvar.go`) | `{count, gvrs:[…], last_register_unix_ns}` — live set of GVRs with a registered informer | `count` tracks the cluster's served GVR set; two scrapes with identical `last_register_unix_ns` = informer set quiesced |
-| `snowplow_crd_discovery` (`internal/cache/crd_discovery_expvar.go`) | `map{events_enqueued, events_dropped, events_processed, discovery_invoked, discovery_skipped_ng, deletes_processed, delete_skipped_ng, panics_recovered}` | `events_dropped`/`*_skipped_ng`/`panics_recovered` should be **0** — a non-zero `discovery_skipped_ng` is a flashing red flag (silent-skip defect class) |
+| `snowplow_crd_discovery` (`internal/cache/crd_discovery_expvar.go`) | `map{events_enqueued, events_dropped, events_parked, events_processed, discovery_invoked, discovery_skipped_ng, deletes_processed, delete_skipped_ng, panics_recovered, relist_dirtymark_postsync_total, relist_postsync_timeout_total}`. **1.12.5**: `events_parked` counts submits that had to wait on a full queue; `events_dropped` is now a LAST RESORT after a 30s park, and a dropped DELETE means an informer is never torn down and its dependent L1 entries stay resident until TTL | `events_dropped`/`*_skipped_ng`/`panics_recovered` should be **0** — a non-zero `discovery_skipped_ng` is a flashing red flag (silent-skip defect class) |
 | `snowplow_crd_schema_memo_hits_total` / `_misses_total` / `_stale_dropped_total` / `_invalidations_total` (`internal/resolvers/crds/schema/schema_cache_metrics.go`) | compiled-CRD-schema memo counters | high hit ratio warm; stale-drops expected under concurrent CRD install |
 | `snowplow_sa_discovery_builds_total` / `_invalidations_total` / `_fallbacks_total` (`internal/dynamic/cached_client_metrics.go`) | SA-discovery client lifecycle | fallbacks low; climb = discovery degrading |
+
+### Dependency tracker + DELETE eviction bridge — "is invalidation actually happening?" (1.12.5)
+Defined in `internal/cache/deps_expvar.go`; counters in `deps.go` (`DepStats`) and
+`deps_watch.go` (`DepWatchStats`).
+
+Before 1.12.5 every number below was computed and then emitted **only** into the periodic
+`resolved_cache.summary` INFO line, which the chart's `LOG_LEVEL=warn` discards. That is why
+issue #187 — a CR deleted and recreated under the same name kept serving its pre-delete
+resolved body — could not be diagnosed from the live pod: the eviction counter, the
+dirty-mark counter and the DELETE queue depth all existed and none of them were readable.
+
+| expvar | meaning | healthy range |
+|---|---|---|
+| `snowplow_deps` | `map{stat → value}`; one gauge keyed by stat, same idiom as `snowplow_resolved_cache` | see the three rows below |
+
+The stats that answer an invalidation question:
+
+| stat | meaning | healthy range |
+|---|---|---|
+| `evict_delete_total` | L1 entries evicted by an **informer DELETE** (`OnDelete` bucket 1). Deliberately does NOT include the refresher's self-404 evictions — one counter, one meaning | moves whenever a CR with a live L1 entry is deleted. **Frozen across a known deletion = DELETE handling is not reaching the store** — the strongest single test, and it only works because this counter is not folded |
+| `evict_self_gone_total` | L1 entries evicted because the refresher's re-fetch of their own object returned a confirmed 404 across the **whole** requeue budget | non-zero is **normal** on a cluster that deletes CRs |
+| `relist_dirtymark_postsync_total` | CRD schema relists that re-fired the dependent dirty-mark after the new informer synced | tracks CRD schema churn; 0 on a stable cluster |
+| `delete_worker_panics_total` | DELETE events whose `OnDelete` panicked. Each one is exactly one LOST eviction; the worker survives and drains the next event | **0**. Non-zero means at least one object's L1 entry is stale until TTL, and the `deps.delete_worker.panic` WARN names which |
+| `delete_queue_depth` / `delete_queue_cap` | live occupancy of the DELETE hand-off channel | depth near 0. Pinned near cap = the drain is behind; on a **pre-1.12.5** image it is the signature of the worker having died |
+| `delete_queue_full_total` | DELETE events that ran `OnDelete` inline because the queue was full | 0 under normal churn; non-zero during a large delete storm is expected and is not data loss |
+| `self_notfound_evict_total` | refresher-side count of times the drop-point eviction branch fired. Differs from `evict_self_gone_total` only when the entry had already gone by another route | non-zero is **normal**. It is the healthy replacement for the `refresher.refresh_failed` ×5 + `refresher.refresh_dropped` pair that used to leave the body resident |
+| `dropped_cap` | dep edges dropped because `DEPS_MAX_RECORDS` was reached | **0**. Non-zero means new edges are being dropped silently, leaving entries dirty-markable but not evictable |
+| `records` / `max_records` | dep-record occupancy vs its ceiling | `records` well under `max_records` |
+| `dirty_mark_total` / `enqueue_update_total` | stale-while-revalidate marks from ADD/UPDATE and from DELETE buckets 2/3 | tracks cluster churn |
+| `add_propagated` / `add_dropped_pre_sync` / `add_nil_syncch` | the ADD initial-replay gate | `add_nil_syncch` should be **0** (a registration path skipped the syncCh allocation; dep marks for that GVR degrade to TTL) |
+
+All of it is mirrored to OTLP as the `snowplow_deps` observable gauge, labelled by `stat`
+(`internal/metrics/metrics.go`).
+
+### Inspecting ONE resolved entry (1.12.5)
+`GET /debug/apistage?key_hash=<hex>` returns the metadata row for a single resident entry
+instead of the full walk, with two fields populated only on that path: `bodySha256` and the
+opaque `bindingUID`. It is how you answer "how old is this entry, and is its body the same one
+as before?" in one request — the question #187 had to infer from the client's subsequent child
+fetches because no surface could answer it directly.
+
+**It returns a hash, never the body, and that is a security boundary rather than a size
+choice.** L1 cells are per-identity: the key folds `BindingUID`, so on krateo-057 one widget
+was resident under `admin`, `system:gke-common-webhooks` and `system:kubestore-collector`.
+Returning a body to whoever holds the debug JWT would be a cross-identity read of rows that
+requester's own RBAC would have filtered. The hash still discriminates "re-resolved" from
+"unchanged".
+
+The lookup does NOT route through `Get`: that would enforce TTL, bump the hit counters and move
+the entry to the LRU front, so inspecting an entry would change it.
+
+### Informer freshness — "is this indexer still current?" (1.12.5)
+Per-GVR on `/debug/servable` (`ServableGVRStatus`); aggregated to OTLP as
+`snowplow_informer_freshness`, labelled by stat.
+
+The four servability conjuncts say whether an informer is ALLOWED to serve. None of them says
+whether what it holds is CURRENT — `hasSynced` latches true the moment the initial LIST
+completes and never goes back. During #187 the central question, "does this indexer still hold
+the object the apiserver says is deleted?", had no field on any surface.
+
+| field (per GVR) | meaning | healthy range |
+|---|---|---|
+| `indexerCount` | objects the informer's store holds right now | compare against `kubectl get <resource> -A`; a divergence **is** the staleness, no inference needed |
+| `lastSyncResourceVersion` | RV the most recent discovery refresh observed. Tracked internally since 0.30.x to clear `watchBroken` on a successful relist; never published until 1.12.5 | advances across relists |
+| `lastEventAgeSeconds` | seconds since the bridge last delivered ANY event for this GVR; **-1 means never** | a GVR whose objects churn but whose age keeps climbing has a dead watch `watchBroken` did not catch |
+
+The OTLP mirror is **aggregate, not per-GVR** — a production cluster carries ~169 registered
+informers, so three per-GVR gauges would add ~500 series per collection interval, the same
+cardinality class 1.12.4 had to cap. Stats: `indexer_objects`, `gvrs_never_event`,
+`max_event_age_seconds`, `gvrs_stale_over_hour`. The dashboard says *something* is stale; the
+JWT-gated `/debug/servable` route says which.
 
 ### Upstream controller health — "is snowplow broken, or is an upstream controller crash-looping?"
 Defined in `internal/cache/controller_health_expvar.go` / `controller_health.go`.
@@ -237,6 +308,9 @@ operator-notable ones:
 | `apiserver_fallthrough` | Debug | `internal/cache/fallthrough_meter.go` | a read punted to the apiserver — the log companion to `snowplow_apiserver_fallthrough_total`; includes path/gvr/reason. **Demoted Warn→Debug in 1.12.2** (commit `52eb46d`): a warm pod still punts routinely, so at Warn it drowned the log. Track the counter, not the line; raise `LOG_LEVEL=debug` to see it. |
 | `cache.read_paths_scoped.violation` | Error | `internal/cache/fallthrough_assert.go` | architectural invariant breach — a `/call` route is not scope-wrapped |
 | `cache.serve_requires_servable.violation` | Error | `internal/cache/serve_assert.go` | **P1** invariant breach — a cache HIT was about to be served from a not-servable informer (names the gvr + serve_path) |
+| `deps.delete_worker.panic` | Warn | `internal/cache/deps_watch.go` | **1.12.5** — an `OnDelete` panicked; names the `gvr`/`ns`/`name` whose L1 eviction was LOST (stale until TTL) and the panic value. The worker survives and drains the next event. Pairs with `snowplow_deps` stat `delete_worker_panics_total`. Before 1.12.5 this was an Error with no coordinates, and the first occurrence killed DELETE handling process-wide until restart (#187 H1) |
+| `deps.delete_queue_full` | Warn | `internal/cache/deps_watch.go` | a DELETE storm outran the eviction worker; `OnDelete` ran inline. Not data loss |
+| `refresher.self_object_gone_evicted` | Warn | `internal/cache/refresher.go` | **1.12.5** — a background refresh re-fetched the entry's own object and got a confirmed apiserver 404 on every attempt across the full requeue budget, so the entry was evicted rather than dropped-to-TTL with its stale body resident. REPLACES `refresher.refresh_dropped` for that key (#187) |
 | `cache.bindings_by_gvr.delta_skipped_non_typed` | Warn | `internal/cache/bindings_by_gvr_delta.go` | an index delta event was dropped — index is drifting; pairs with the same-named expvar |
 | `cache.crd_discovery.event_dropped` | Warn | `internal/cache/crd_discovery_side_effect.go` | a CRD-discovery event was dropped (queue full / shutdown) |
 | `cache.controller_health.watch.broken` | Warn | `internal/cache/controller_health.go` | an upstream controller-health watch broke — the health gauge may go stale |
