@@ -576,6 +576,11 @@
           "description": "Staleness bound (seconds) for restactions-class entries whose RESTAction declares a userAccessFilter stage (#118 (d)). When > 0, such an entry gets this short per-entry TTL instead of the standard resolved-cache TTL, capping how long an authorization change can be served stale; 0 disables. Scope limits: it bounds staleness over time, NOT identity, so it is not a mitigation for a cross-tenant key collision; and it stamps only the restactions class, not widgets or widgetContent. Inert only while the A-1 mitigation declines every userAccessFilter-bearing cache write; without that mitigation this value is live and shortens UAF-bearing restactions cells from the standard TTL to this one. Load-bearing again in 1.13.0.",
           "title": "UAF Resolved TTL Seconds"
         },
+        "DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS": {
+          "type": "string",
+          "description": "1.12.6 C2 relist delta bridge: seconds the bridge waits for a schema-relisted informer to sync before giving up (it then enqueues nothing; relist_bridge_timeout_total counts it and the 1.12.5 post-sync re-fire keeps covering the teardown window). Unset/unparseable falls back to 120.",
+          "title": "Deps Relist Bridge Timeout Seconds"
+        },
         "OTEL_ENABLED": {
           "type": "string",
           "description": "Master switch for OpenTelemetry export to ClickStack (traces + metrics over OTLP/HTTP). \"false\" restores a byte-identical pre-1.12.4 process. Per-signal overrides: OTEL_TRACING_ENABLED, OTEL_METRICS_ENABLED, OTEL_LOGS_ENABLED.",

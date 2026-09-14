@@ -364,6 +364,12 @@ env:
   #
   # Set to "0" to disable (UAF cells then use the standard TTL).
   UAF_RESOLVED_TTL_SECONDS: "300"
+  # 1.12.6 C2 — relist delta bridge: how long the bridge waits for a
+  # schema-relisted informer to sync before giving up (it then enqueues
+  # nothing; relist_bridge_timeout_total counts it and the 1.12.5 post-sync
+  # re-fire keeps covering the window). Matches the re-fire's own 2-minute
+  # wait. String (installer plumbing is string-only); unset/unparseable → 120.
+  DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS: "120"
   # #57 — prewarm seed loopback auth. The seed exchanges its projected
   # (audience=authn) ServiceAccount token at URL_AUTHN for an authn-issued JWT
   # and appends it on a /call api-step whose resolved endpoint host EXACTLY

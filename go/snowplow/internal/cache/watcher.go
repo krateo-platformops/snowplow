@@ -1893,6 +1893,33 @@ func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace,
 	return uns, true
 }
 
+// IndexerKeys returns the informer indexer's key set for gvr ("ns/name", or
+// "name" for cluster-scoped objects) and whether gvr is registered at all
+// (1.12.6 C2, design §4.2).
+//
+// Deliberately NOT gated on servableLocked: the relist bridge snapshots the
+// OLD informer's keys immediately before RemoveResourceType tears it down,
+// and at that instant the GVR is registered and its indexer is exactly the
+// truth we want to diff the fresh LIST against. A not-yet-synced fresh
+// informer returns whatever it has so far — callers that need the synced
+// set wait on the EnsureResourceType sync channel first.
+//
+// Read-only: one rw.mu.RLock, one ListKeys (allocates a []string of the
+// indexer size — hundreds of entries for a widget GVR, transient). Never a
+// client call, never a side effect.
+func (rw *ResourceWatcher) IndexerKeys(gvr schema.GroupVersionResource) ([]string, bool) {
+	if rw == nil || rw.mode == modePassthrough {
+		return nil, false
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	gi, ok := rw.informers[gvr]
+	if !ok || gi == nil {
+		return nil, false
+	}
+	return gi.Informer().GetIndexer().ListKeys(), true
+}
+
 // ListObjects returns every object for gvr scoped to namespace.
 // Pass empty string for cluster-wide listing.
 //
