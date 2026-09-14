@@ -49,6 +49,7 @@ package cache_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -72,12 +73,33 @@ var s4TestGVR = servableTestGVR
 // group/version strings the fake apiserver currently serves a non-empty
 // APIResourceList for; toggling it simulates a CRD being installed
 // post-startup.
+//
+// 1.12.6: guarded by a mutex. The map is read by the watcher's async confirm
+// prime (primeConfirmAsyncLocked → ConfirmResourceType → resourceTypeServed)
+// on its own goroutine while tests toggle it from the test goroutine; the
+// unguarded version was a latent fixture data race that -race surfaced once
+// the C1 dep-event worker shifted scheduling (same class as the fixture
+// races fixed in 1.12.5). Toggle through setServed.
 type fakeDiscovery struct {
+	mu     sync.RWMutex
 	served map[string]bool // groupVersion -> served
 }
 
+// setServed flips whether the fake apiserver serves groupVersion.
+func (f *fakeDiscovery) setServed(groupVersion string, served bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.served == nil {
+		f.served = map[string]bool{}
+	}
+	f.served[groupVersion] = served
+}
+
 func (f *fakeDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
-	if f.served[groupVersion] {
+	f.mu.RLock()
+	served := f.served[groupVersion]
+	f.mu.RUnlock()
+	if served {
 		return &metav1.APIResourceList{
 			GroupVersion: groupVersion,
 			APIResources: []metav1.APIResource{{Name: "secrets", Namespaced: true, Kind: "Secret"}},
@@ -248,7 +270,7 @@ func TestF1_PostStartupCRD_UnconfirmedUntilDiscovered(t *testing.T) {
 	}
 
 	// Now the CRD is installed: the apiserver starts serving the type.
-	disco.served[gvString(s4TestGVR)] = true
+	disco.setServed(gvString(s4TestGVR), true)
 	rw.RefreshDiscovery(context.Background())
 
 	// FIX ASSERTION: confirmed + synced + watch-healthy → servable=true.

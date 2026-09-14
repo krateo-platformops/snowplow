@@ -49,15 +49,10 @@ func widgetInputs(gvr schema.GroupVersionResource, ns, name string) *ResolvedKey
 	}
 }
 
-// syncedWatcher returns a bare watcher whose syncCh for gvr is CLOSED
-// (informer post-sync) so ADDs propagate exactly as in production.
-func syncedWatcher(gvr schema.GroupVersionResource) *ResourceWatcher {
-	rw := &ResourceWatcher{syncCh: map[schema.GroupVersionResource]chan struct{}{}}
-	ch := make(chan struct{})
-	close(ch)
-	rw.syncCh[gvr] = ch
-	return rw
-}
+// syncedWatcher lives in depwatch_harness_test.go since 1.12.6 C1: it is a
+// REAL synced informer over a fake dynamic client, so the worker's state
+// probe reads genuine indexer state (an object never created on the fake
+// cluster is genuinely absent).
 
 // refresherStub stands in for the real refresher: on a dirty-mark it
 // re-resolves the key from the live "cluster" map and re-Puts, exactly
@@ -131,18 +126,37 @@ func TestIssue187_A1_DeleteThenRecreateDoesNotServePreDeleteBody(t *testing.T) {
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(oldBody), Inputs: widgetInputs(gvr, ns, name)})
 	d.Record(key, gvr, ns, name)
 
-	h := syncedWatcher(gvr).depEventHandlers(gvr)
+	rw, dyn := realWatcher(t, gvr)
+	h := rw.depEventHandlers(gvr)
 
-	// DELETE, then recreate with DIFFERENT content.
-	h.DeleteFunc(unstructuredObj(gvr, ns, name))
+	// Recreate with DIFFERENT content on the fake cluster FIRST (1.12.6 C1
+	// follow-up, architect N3a). Under state-derived actions the worker
+	// probes the indexer, so this arm must put the object THERE: with it
+	// present, DELETE and ADD both read EXISTS and dirty-mark, and the
+	// refresher stub re-Puts the recreated body — the leg this arm exists
+	// to exercise. Before this fix the object was never created, the ADD
+	// probed ABSENT and evicted, and `got != oldBody` passed vacuously on a
+	// miss. The ABSENT → evict leg is D4b's and B1's.
 	rs.mu.Lock()
 	rs.cluster[ns+"/"+name] = newBody
 	rs.mu.Unlock()
+	createObj(t, rw, dyn, gvr, ns, name, newBody)
+	waitQuiet() // the real informer's own ADD may already have marked
+	before := d.Stats()
+
+	h.DeleteFunc(unstructuredObj(gvr, ns, name))
 	h.AddFunc(unstructuredObj(gvr, ns, name))
 	waitQuiet()
 
-	if got := served(t, store, key); got == oldBody {
-		t.Fatalf("#187 A1 RED: L1 still serves the PRE-DELETE body after delete+recreate: %s", got)
+	if got := served(t, store, key); got != newBody {
+		t.Fatalf("#187 A1 RED: L1 serves %q after delete+recreate, want the recreated body %q", got, newBody)
+	}
+	after := d.Stats()
+	if after.DirtyMarkTotal <= before.DirtyMarkTotal {
+		t.Fatalf("#187 A1: the recreate events did not dirty-mark the entry (dirty_mark_total %d → %d)", before.DirtyMarkTotal, after.DirtyMarkTotal)
+	}
+	if after.EvictDeleteTotal != before.EvictDeleteTotal {
+		t.Fatalf("#187 A1: an EXISTS-probed event evicted (evict_delete_total %d → %d); a recreate must dirty-mark, never evict", before.EvictDeleteTotal, after.EvictDeleteTotal)
 	}
 }
 
@@ -166,18 +180,35 @@ func TestIssue187_A2_LateDeleteDoesNotRestoreOrPinPreDeleteBody(t *testing.T) {
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(oldBody), Inputs: widgetInputs(gvr, ns, name)})
 	d.Record(key, gvr, ns, name)
 
-	h := syncedWatcher(gvr).depEventHandlers(gvr)
+	rw, dyn := realWatcher(t, gvr)
+	h := rw.depEventHandlers(gvr)
 
-	// Deliver DELETE (async, may land late) and ADD (inline) back to back.
-	h.DeleteFunc(unstructuredObj(gvr, ns, name))
+	// The recreated object is on the fake cluster BEFORE the events are
+	// processed (architect N3a — see A1): the late DELETE and the ADD both
+	// probe EXISTS, so neither may evict and the stub must re-Put the
+	// recreated body. (A late DELETE arriving after the recreate is exactly
+	// what 1.12.6 C1 makes harmless; D4 pins it on the full harness.)
 	rs.mu.Lock()
 	rs.cluster[ns+"/"+name] = newBody
 	rs.mu.Unlock()
+	createObj(t, rw, dyn, gvr, ns, name, newBody)
+	waitQuiet()
+	before := d.Stats()
+
+	// Deliver DELETE (async, may land late) and ADD (inline) back to back.
+	h.DeleteFunc(unstructuredObj(gvr, ns, name))
 	h.AddFunc(unstructuredObj(gvr, ns, name))
 	waitQuiet()
 
-	if got := served(t, store, key); got == oldBody {
-		t.Fatalf("#187 A2 RED: pre-delete body survived the delete/recreate interleaving: %s", got)
+	if got := served(t, store, key); got != newBody {
+		t.Fatalf("#187 A2 RED: L1 serves %q after the delete/recreate interleaving, want the recreated body %q", got, newBody)
+	}
+	after := d.Stats()
+	if after.DirtyMarkTotal <= before.DirtyMarkTotal {
+		t.Fatalf("#187 A2: the events did not dirty-mark the entry (dirty_mark_total %d → %d)", before.DirtyMarkTotal, after.DirtyMarkTotal)
+	}
+	if after.EvictDeleteTotal != before.EvictDeleteTotal {
+		t.Fatalf("#187 A2: the late DELETE evicted the recreated entry (evict_delete_total %d → %d)", before.EvictDeleteTotal, after.EvictDeleteTotal)
 	}
 }
 
@@ -201,7 +232,7 @@ func TestIssue187_A3_DeletedListMemberDirtyMarksListWidget(t *testing.T) {
 	d.Record(key, gvr, ns, name)  // self edge
 	d.RecordList(key, member, ns) // list-scope edge on the member kind
 
-	h := syncedWatcher(member).depEventHandlers(member)
+	h := syncedWatcher(t, member).depEventHandlers(member)
 	h.DeleteFunc(unstructuredObj(member, ns, "b"))
 	waitQuiet()
 
@@ -237,7 +268,7 @@ func TestIssue187_B1_PlainDeleteEvictsSelfEntry(t *testing.T) {
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"resident"}`), Inputs: widgetInputs(gvr, ns, name)})
 	d.Record(key, gvr, ns, name) // deps_extract.go:113 self edge
 
-	h := syncedWatcher(gvr).depEventHandlers(gvr)
+	h := syncedWatcher(t, gvr).depEventHandlers(gvr)
 	h.DeleteFunc(unstructuredObj(gvr, ns, name))
 	waitQuiet()
 
@@ -621,7 +652,7 @@ func TestIssue187_A5_InFlightColdDispatchCannotResurrectPreDeleteBody(t *testing
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(oldBody), Inputs: widgetInputs(gvr, ns, name)})
 	d.Record(key, gvr, ns, name)
 
-	h := syncedWatcher(gvr).depEventHandlers(gvr)
+	h := syncedWatcher(t, gvr).depEventHandlers(gvr)
 
 	// A /call is IN FLIGHT: it already fetched the OLD CR and is resolving.
 	// Meanwhile the CR is deleted and recreated with different content.
@@ -672,7 +703,7 @@ func TestIssue187_A4_DeleteWorkerSurvivesAPanic(t *testing.T) {
 	store.Put("L1_v2", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: widgetInputs(gvr, "ns", "victim2")})
 	d.Record("L1_v2", gvr, "ns", "victim2")
 
-	h := syncedWatcher(gvr).depEventHandlers(gvr)
+	h := syncedWatcher(t, gvr).depEventHandlers(gvr)
 	h.DeleteFunc(unstructuredObj(gvr, "ns", "victim1")) // panics inside the worker
 	waitQuiet()
 	h.DeleteFunc(unstructuredObj(gvr, "ns", "victim2")) // must still be processed
@@ -755,7 +786,7 @@ func TestIssue187_A4b_DeleteWorkerSurvivesAConcurrentPanicStorm(t *testing.T) {
 		}
 	})
 
-	h := syncedWatcher(gvr).depEventHandlers(gvr)
+	h := syncedWatcher(t, gvr).depEventHandlers(gvr)
 
 	var wg sync.WaitGroup
 	for s := 0; s < submitters; s++ {
@@ -780,19 +811,33 @@ func TestIssue187_A4b_DeleteWorkerSurvivesAConcurrentPanicStorm(t *testing.T) {
 	}
 	waitQuiet()
 
-	var resident []string
+	// 1.12.6 C1 / D1 (design §10): after the burst EVERY served body must
+	// match cluster state — every victim is deleted, so every self entry must
+	// be GONE, including the ones whose event panicked. Evictions are applied
+	// BEFORE dirty-marks (OnObjectEvent), so a panic raised by the refresh
+	// hook for a "bad" victim's sibling can no longer take that victim's own
+	// eviction with it. Pre-1.12.6 A4b asserted worker survival and a panic
+	// count and skipped the bad victims ("expected loss"): a worker that
+	// survived panics but mis-derived actions passed it.
+	var resident, residentBad []string
 	for _, v := range victims {
-		if v.bad {
-			continue // its OnDelete panicked before the eviction batch — expected loss
-		}
 		if _, ok := store.Get(v.key); ok {
-			resident = append(resident, v.key)
+			if v.bad {
+				residentBad = append(residentBad, v.key)
+			} else {
+				resident = append(resident, v.key)
+			}
 		}
 	}
 	if len(resident) != 0 {
 		t.Fatalf("#187 A4b RED: %d/%d clean DELETEs left their self entry resident after a "+
 			"concurrent panic storm — the eviction worker died mid-drain (first few: %v)",
 			len(resident), len(victims), resident[:min(5, len(resident))])
+	}
+	if len(residentBad) != 0 {
+		t.Fatalf("1.12.6 D1 RED: %d self entries whose event panicked are still resident — the "+
+			"served body no longer matches cluster state. Evictions must be applied before the "+
+			"dirty-mark hook that panicked (first few: %v)", len(residentBad), residentBad[:min(5, len(residentBad))])
 	}
 	if panicked.Load() == 0 {
 		t.Fatalf("#187 A4b: the arm never panicked — it is not exercising the recover path")

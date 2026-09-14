@@ -82,9 +82,11 @@ straight to the apiserver — same data, same UI, same RBAC, just slower (see *I
                        (Put gated — see §4 step 4)
 
   ── invalidation (async, informer event → DepTracker) ────────────────────────
-     L3 informer event ──▶ depEventHandlers ──▶ Deps().OnAdd / OnUpdate / OnDelete
-       ADD/UPDATE → dirty-mark (refresher re-resolve), never evict
-       DELETE     → evict self-entry, dirty-mark deps
+     L3 informer event ──▶ depEventHandlers ──▶ enqueue (gvr, ns, name)   [1.12.6 C1]
+       dep-event worker ──▶ probeObjectState (informer indexer, tri-state)
+         EXISTS  → dirty-mark deps (refresher re-resolve), never evict
+         ABSENT  → evict self-entry, dirty-mark deps
+         UNKNOWN → requeue ×maxRefreshRequeues, then degrade to a dirty-mark
      L1 commit    ──▶ cache.PublishRefresh(key) → /refreshes SSE subscribers
 ```
 
@@ -296,13 +298,34 @@ DepKeys). Dependencies are recorded at resolve time:
 - `RecordList(l1Key, gvr, ns)` — list-scope edge encoded as the `(gvr, ns, "*")` wildcard
   bucket.
 
-The three event handlers enforce the **invalidation rules**:
+**Since 1.12.6 C1 the action is derived from STATE, not from the event type.** All three
+informer handlers enqueue the coordinate `(gvr, ns, name)` on one typed, deduplicating,
+rate-limiting workqueue; a single worker probes the informer (`probeObjectState`, tri-state:
+`EXISTS` / `ABSENT` / `UNKNOWN`) and calls `OnObjectEvent(gvr, ns, name, state)`, the one
+decision site. `OnAdd`/`OnUpdate`/`OnDelete` survive only as shims over it for the test surface.
+Duplicates are idempotent, reordering is harmless (a late DELETE after a same-name recreate finds
+the object `EXISTS` and dirty-marks the correct fresh entry instead of evicting it), coalescing
+is safe, and a lost event is recoverable by the next enqueue for the same coordinate. `UNKNOWN`
+(informer torn down, not synced, watch broken, type unconfirmed, passthrough) means the indexer
+is not authoritative: the coordinate is requeued with backoff on the refresher's
+`maxRefreshRequeues` budget and, on exhaustion, degraded to a dirty-mark so the refresher's
+re-fetch decides against the apiserver (a definite 404 evicts at the drop point — seconds; a
+403, a 500 or a timeout on that leg stays bounded by `RESOLVED_CACHE_TTL_SECONDS`, 3600 s,
+until 1.12.6 C4 extends drop-point eviction to non-404 deterministic failures). It never means
+"keep forever", and it never evicts by itself — that is what keeps a schema-relist teardown window
+from evicting a whole GVR. The probe reads the watcher directly and never calls
+`EnsureResourceType`, so it is not the inert `IsRegistered` conjunct 1.12.5 removed (different
+predicate — `IsServable` is four conjuncts — different call site, deferral instead of verdict).
+Evictions are applied before dirty-marks, so a panic in the refresh hook cannot lose a due
+eviction. The ADD pre-sync gate stays ADD-only at the handler.
 
-- **ADD / UPDATE → dirty-mark only, never evict.** `OnAdd` and `OnUpdate` both call `onChange`,
-  which enqueues every dependent L1 key into the refresher for stale-while-revalidate. ADD is
-  treated identically to UPDATE because a freshly-created object can satisfy a LIST-dep that
+The **invalidation rules**, stated by state:
+
+- **`EXISTS` (ADD / UPDATE / a stale DELETE for an object that is back) → dirty-mark only,
+  never evict.** Every dependent L1 key is enqueued into the refresher for stale-while-revalidate.
+  ADD is treated identically to UPDATE because a freshly-created object can satisfy a LIST-dep that
   previously resolved empty.
-- **DELETE → three-way classification** (`OnDelete`):
+- **`ABSENT` (DELETE) → three-way classification** (the `OnDelete` shim maps to it):
   1. *self-representation* — the entry's own dispatched object is the deleted object →
      **EVICT** (the only authorised eviction trigger). Classified by `isSelfRepresentation`,
      which reads the entry's `Inputs` and compares GVR/ns/name.
@@ -384,9 +407,9 @@ This widens the set of authorised eviction *triggers* without widening the rule:
 confirmed 404 on the entry's own object is a deletion observation, the same fact the informer
 event carries, arriving by a different route.
 
-Two operational notes from #187: the DELETE hand-off worker recovers **per event**, so one
-panicking `OnDelete` costs exactly one eviction rather than killing DELETE handling
-process-wide; and the tracker's counters are published at `/debug/vars` under `snowplow_deps`
+Two operational notes from #187: the dep-event worker (1.12.5: the DELETE hand-off worker)
+recovers **per event**, so one panicking event costs exactly one action rather than killing
+invalidation process-wide; and the tracker's counters are published at `/debug/vars` under `snowplow_deps`
 (see `docs/architecture/observability.md`), because at `LOG_LEVEL=warn` the old INFO-only
 summary made "did invalidation stop?" unanswerable from a live pod.
 
@@ -493,7 +516,7 @@ the misses) is tracked separately.
 | Retired-flag audit | `internal/cache/retired_flags.go` | `AuditRetiredFlags` |
 | L1 store, keys, dedup, TTL overrides | `internal/cache/resolved.go` | `ComputeKey`, `canonicaliseExtras`, `ResolvedKeyInputs` (`BindingUID`, `RBACSubGen`, `HasUAF`), `resolvedKeyVersion="v6"`, entry classes, `Get`, `Put` |
 | RBAC sub-generation | `internal/cache/rbac_subgen.go`, `rbac_subgen_pending.go` | `RBACSubGenForSubject`, publish-deferred bumps |
-| Invalidation | `internal/cache/deps.go` | `Record`, `RecordList`, `OnAdd`/`OnUpdate` → `onChange`, `OnDelete`, `isSelfRepresentation` |
+| Invalidation | `internal/cache/deps.go`, `deps_watch.go` | `Record`, `RecordList`, `OnObjectEvent` (state-derived; `OnAdd`/`OnUpdate`/`OnDelete` are shims), `isSelfRepresentation`; bridge: `depEventHandlers` → `submitDepEvent` → `probeObjectState` |
 | External Put-gate | `internal/cache/external_touched_sink.go` | `WithExternalTouchedSink` |
 | L3 informer | `internal/cache/watcher.go` | `NewResourceWatcher`, `GetObject`, `ListObjects`, `depEventHandlers` |
 | Servability tripwire | `internal/cache/serve_assert.go` | `serve_requires_servable` |

@@ -1,25 +1,64 @@
-// deps_watch.go — Ship A (0.30.110): the informer→DepTracker event
-// bridge.
+// deps_watch.go — the informer→DepTracker event bridge.
 //
-// Pre-0.30.110 every registration path (addResourceTypeLocked and
-// addResourceTypeMetadataOnlyLocked) inlined a near-identical
-// ResourceEventHandlerFuncs literal that wired UpdateFunc + DeleteFunc
-// and deliberately LEFT AddFunc unwired. Ship A:
+// 1.12.6 C1 (design-1.12.6-event-hardening §3): ACTIONS DERIVE FROM STATE,
+// NOT FROM THE MESSAGE.
 //
-//   R1 — wires AddFunc on BOTH paths via the single shared builder
-//        depEventHandlers. ADD is gated by the initial-replay gate:
-//        propagate only once the GVR's syncCh is closed (post-sync);
-//        drop (counter addDroppedPreSync) during the informer's initial
-//        LIST replay, where every existing object arrives as an ADD and
-//        re-dirty-marking the whole world would be pointless churn.
+// Pre-1.12.6 the three informer handlers chose the ACTION at the moment the
+// event arrived: AddFunc/UpdateFunc → dirty-mark inline, DeleteFunc → evict via
+// a bounded channel + one worker. The action was the only carrier of the
+// information, so a message that was lost (dead worker, relist teardown
+// window), duplicated, reordered (a late DELETE after a same-name recreate
+// evicted the CORRECT fresh entry) or coalesced produced a wrong action and
+// nothing could notice.
 //
-//   R3 — the DELETE self-eviction burst must not run inline on the
-//        informer processor goroutine. DeleteFunc hands DepTracker.
-//        OnDelete to a single bounded worker goroutine draining
-//        deleteEvictCh; the processor goroutine returns immediately.
+// Now all three handlers do the same thing: ENQUEUE THE COORDINATE
+// (gvr, namespace, name) on one typed, deduplicating, rate-limiting workqueue.
+// One worker dequeues, PROBES the informer for the object's current state and
+// derives the action from that state at the moment it runs:
 //
-//   O14 — a nil syncCh at AddFunc time is a fail-safe "drop": one-shot
-//        WARN, treat as pre-sync (never propagate, never block).
+//	objExists  → dirty-mark every dependent (ADD/UPDATE-equivalent)
+//	objAbsent  → evict the self-representation, dirty-mark the rest (DELETE-equivalent)
+//	objUnknown → the indexer is NOT authoritative for this GVR right now
+//	             (informer torn down / not synced / watch broken / type
+//	             unconfirmed, or passthrough mode): requeue with backoff on
+//	             the SAME budget the refresher uses (maxRefreshRequeues), and
+//	             on exhaustion DEGRADE to a dirty-mark — whose refresher
+//	             re-fetch reaches the apiserver. Never "keep forever".
+//
+// This is the client-go sample-controller idiom (handlers queue.Add(key);
+// the worker reads the lister; NotFound is the deletion branch) that snowplow
+// had diverged from. Duplicates are idempotent, reordering is harmless,
+// coalescing is safe (the typed workqueue dedups pending keys) and a lost
+// event is recoverable by the next enqueue for the same coordinate — from the
+// informer, the relist bridge (C2) or the sampled reconcile (C3).
+//
+// WHAT STAYS SPECIAL (design §3.4):
+//   - The ADD pre-sync gate (addEventPostSync) stays AT THE HANDLER, ADD-only.
+//     Every existing object arrives as an ADD during the initial LIST replay;
+//     dirty-marking the world would storm the refresher. Applying the gate to
+//     DELETEs would reintroduce loss, so it is not hoisted into the worker.
+//   - LIST-scope deps (bucket 2, the June deleted-list-member class) and
+//     dependent-GET deps (bucket 3) are state-independent: they dirty-mark
+//     whatever the object's state. Only the SELF representation (bucket 1)
+//     consults the state, and only objAbsent evicts it.
+//
+// WHY probeObjectState IS NOT THE INERT IsRegistered CONJUNCT (design §0/§3.3):
+// different predicate (IsServable = registered AND synced AND watch not
+// broken AND type confirmed — lazy registration satisfies only the first),
+// different call site (the worker reads the watcher and never calls
+// EnsureResourceType, so asking cannot change the answer), different failure
+// direction (objUnknown DEFERS an indexer-derived eviction and hands the
+// coordinate to a path that reaches the apiserver; it never suppresses one).
+//
+// SUPERVISION (1.12.5 #187 H1, kept): every event runs under its own recover;
+// a panic costs exactly that one event (counted, WARN-logged with its
+// coordinates) and the drain continues. The worker loop itself has a bounded
+// re-spawn supervisor for a deterministic panic outside the per-event recover.
+//
+// QUEUE (design §3.5): the typed workqueue is unbounded and never drops, so
+// the pre-1.12.6 overflow machinery (1024-slot channel, inline fallback,
+// delete_queue_full) is RETIRED, not redefined. Memory bound: ~200 B per
+// pending coordinate, deduplicated — a 50K-object churn storm is ≈10 MB.
 
 package cache
 
@@ -27,56 +66,72 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientcache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
-// deleteEvictQueueDepth bounds the R3 DELETE-event handoff channel. Each
-// buffered slot is one DELETE event; 1024 is ample headroom for a
-// DELETE storm without unbounded memory. A full channel falls back to
-// inline OnDelete (correctness over the R3 off-processor guarantee).
-const deleteEvictQueueDepth = 1024
+// depEventKey is the coordinate an informer event announces. It carries NO
+// event type: the worker derives the action from the object's current state.
+type depEventKey struct {
+	gvr       schema.GroupVersionResource
+	namespace string
+	name      string
+}
 
-// depWatchCounters holds the Ship A informer-bridge falsifier counters.
-// Process-scoped (the bridge wires one DepTracker singleton); atomic so
-// they are readable without a lock.
+// depWatchCounters holds the bridge's falsifier counters. Process-scoped
+// (the bridge wires one DepTracker singleton); atomic so they are readable
+// without a lock.
 type depWatchCounters struct {
-	addDroppedPreSync atomic.Uint64 // ADD events dropped during initial replay
-	addPropagated     atomic.Uint64 // ADD events propagated post-sync
+	addDroppedPreSync atomic.Uint64 // ADD events dropped during initial replay (gate at the handler)
+	addPropagated     atomic.Uint64 // ADD events that passed the gate and were enqueued
 	addNilSyncCh      atomic.Uint64 // ADD events seen with a nil syncCh (O14)
-	deleteQueueFull   atomic.Uint64 // DELETE events run inline on a full queue
+	eventsSubmitted   atomic.Uint64 // coordinates enqueued (all three handlers)
 
-	// 1.12.5 / #187 H1 — DELETE events whose OnDelete panicked. Each one
-	// is a SINGLE lost eviction (the worker survives and processes the
-	// next event); pre-1.12.5 the first one killed DELETE handling
-	// process-wide until restart. Non-zero is always a defect worth a
-	// stack-trace hunt: the WARN deps.delete_worker.panic names the
-	// offending (gvr, ns, name) and the panic value.
-	deleteWorkerPanics atomic.Uint64
+	// workerPanics — events whose processing panicked. Each one is a
+	// SINGLE lost action (the worker survives and processes the next
+	// event); pre-1.12.5 the first one killed DELETE handling process-wide
+	// until restart. Published as delete_worker_panics_total for continuity
+	// with the 1.12.5 operator procedure (the H1 signature).
+	workerPanics atomic.Uint64
+
+	// probe outcomes — what the worker derived the action from.
+	probeExists          atomic.Uint64
+	probeAbsent          atomic.Uint64
+	probeUnknown         atomic.Uint64 // indexer not authoritative → requeued with backoff
+	probeUnknownDegraded atomic.Uint64 // budget exhausted → degraded to a dirty-mark (apiserver decides)
 }
 
 // depWatch is the process-scoped informer→DepTracker bridge state: the
-// counters plus the R3 DELETE-eviction worker.
+// counters plus the unified dep-event worker and its queue.
 type depWatch struct {
 	counters depWatchCounters
 
-	// deleteEvictCh carries DELETE events to the worker goroutine.
-	deleteEvictCh chan depDeleteEvent
+	// queue carries coordinates to the worker. Typed, deduplicating,
+	// rate-limiting: fresh events use Add (immediate), objUnknown requeues
+	// use AddRateLimited (exponential backoff, base/max from the refresher's
+	// knobs so the subsystem has ONE backoff shape).
+	//
+	// Built LAZILY by startWorker, not by the singleton (1.12.6 C1 follow-up,
+	// architect N1): a client-go workqueue spawns goroutines at construction
+	// (the delaying queue's waitingLoop + a heartbeat ticker), so building it
+	// in depWatchSingleton made a mere telemetry read (DepsStatsByStat under
+	// CACHE_ENABLED=false, reached via the OTLP metrics mirror) spawn
+	// goroutines — a violation of the byte-identical off-path. Nil until the
+	// first submitDepEvent; readers use q() and nil-check.
+	queue atomic.Pointer[depQueue]
+
+	// watcher is the ResourceWatcher the worker probes. Bound at handler
+	// construction (rw.depEventHandlers); production has exactly one.
+	watcher atomic.Pointer[ResourceWatcher]
 
 	startOnce sync.Once
-	stopCh    chan struct{}
 	workerWG  sync.WaitGroup
 
 	// nilSyncWarned ensures the O14 nil-syncCh WARN fires at most once.
 	nilSyncWarned atomic.Bool
-}
-
-// depDeleteEvent is one queued DELETE handed to the eviction worker.
-type depDeleteEvent struct {
-	gvr       schema.GroupVersionResource
-	namespace string
-	name      string
 }
 
 var (
@@ -84,85 +139,90 @@ var (
 	depWatchOnce     sync.Once
 )
 
-// depWatchSingleton returns the process-scoped bridge, lazily building
-// it. Always non-nil.
+// depWatchSingleton returns the process-scoped bridge, lazily building it.
+// Always non-nil.
 func depWatchSingleton() *depWatch {
 	depWatchOnce.Do(func() {
-		depWatchInstance = &depWatch{
-			deleteEvictCh: make(chan depDeleteEvent, deleteEvictQueueDepth),
-			stopCh:        make(chan struct{}),
-		}
+		// Plain allocation only — no queue, no goroutine (architect N1).
+		depWatchInstance = &depWatch{}
 	})
 	return depWatchInstance
 }
 
-// startDeleteWorker spawns the single DELETE-eviction worker goroutine
-// exactly once (sync.Once-bounded). The worker drains deleteEvictCh and
-// runs Deps().OnDelete OFF the informer processor goroutine. It exits on
-// stopCh close (test cleanup); production never stops it — its lifetime
-// is the process lifetime.
-func (w *depWatch) startDeleteWorker() {
+// depQueue boxes the typed workqueue so it can sit behind an atomic pointer
+// (written once by startWorker, read by the worker, the stats snapshot and
+// the test shim's stopWorker without a lock).
+type depQueue struct {
+	workqueue.TypedRateLimitingInterface[depEventKey]
+}
+
+// newDepQueue builds the dep-event queue. The backoff knobs are the
+// REFRESHER's (design §3.3: one backoff shape in the subsystem). This is the
+// ONLY site that spawns the workqueue's goroutines, and it runs from
+// startWorker only.
+func newDepQueue() *depQueue {
+	baseMS := positiveIntFromEnv(envRefresherBaseDelayMS, defaultRefresherBaseDelayMS)
+	maxMS := positiveIntFromEnv(envRefresherMaxDelayMS, defaultRefresherMaxDelayMS)
+	rl := workqueue.NewTypedItemExponentialFailureRateLimiter[depEventKey](
+		time.Duration(baseMS)*time.Millisecond,
+		time.Duration(maxMS)*time.Millisecond,
+	)
+	return &depQueue{workqueue.NewTypedRateLimitingQueue[depEventKey](rl)}
+}
+
+// q returns the dep-event queue, or a nil interface before startWorker has
+// run. Every worker-path caller runs after startWorker; the two callers that
+// can run before it (DepWatchStatsSnapshot, stopWorker) nil-check.
+func (w *depWatch) q() workqueue.TypedRateLimitingInterface[depEventKey] {
+	if p := w.queue.Load(); p != nil {
+		return p.TypedRateLimitingInterface
+	}
+	return nil
+}
+
+// startWorker builds the queue and spawns the single dep-event worker
+// goroutine exactly once (sync.Once-bounded). Production never stops it —
+// its lifetime is the process lifetime. The queue is built HERE, on the
+// first real event, so that reading the bridge (stats, expvar, the OTLP
+// mirror) never creates the thing it measures.
+func (w *depWatch) startWorker() {
 	w.startOnce.Do(func() {
+		w.queue.Store(newDepQueue())
 		w.workerWG.Add(1)
-		go w.runDeleteWorker(0)
+		go w.runDepEventWorker(0)
 	})
 }
 
-// maxDeleteWorkerRespawns bounds the supervisor re-spawn chain
-// (architect Finding 4). The re-spawn path is unreachable today — every
-// event runs under handleDeleteEvent's recover — but if a future edit
-// put a DETERMINISTIC panic in the loop body outside that recover, an
-// uncapped supervisor would turn one silent death into a hot
-// spawn-and-log loop that burns a core and floods the log. After this
-// many consecutive re-spawns the worker stays down and says so once,
-// loudly: degraded DELETE handling is bad, a spinning core is worse, and
-// a log line naming the cap is diagnosable.
-const maxDeleteWorkerRespawns = 5
+// maxDepWorkerRespawns bounds the supervisor re-spawn chain (1.12.5
+// architect Finding 4). The re-spawn path is unreachable today — every event
+// runs under handleDepEvent's recover — but if a future edit put a
+// DETERMINISTIC panic in the loop body outside that recover, an uncapped
+// supervisor would turn one silent death into a hot spawn-and-log loop.
+const maxDepWorkerRespawns = 5
 
-// runDeleteWorker is the worker body. Split out of startDeleteWorker at
-// 1.12.5 (#187 H1) so the supervisor defer can re-spawn it.
-//
-// #187 H1 — THE FIX. Pre-1.12.5 the recover sat OUTSIDE the drain loop,
-// so ONE panic anywhere under Deps().OnDelete unwound the whole
-// goroutine. startOnce had already fired, so nothing re-spawned it: from
-// that instant every DELETE in the process was enqueued to deleteEvictCh
-// and never processed — no counter, no repeat log — until the 1024-slot
-// buffer filled and submitDeleteEvent started falling back to inline
-// OnDelete. DELETE-driven L1 invalidation was dead process-wide while
-// ADD/UPDATE (which run inline on the processor goroutine) kept working:
-// exactly the discriminator #187 reports.
-//
-// The recover now sits INSIDE the per-event call (handleDeleteEvent), so
-// a panicking event costs exactly one lost eviction — logged at WARN with
-// its (gvr, ns, name), counted on deleteWorkerPanics — and the drain
-// continues with the next event.
-//
-// The defer below is a supervisor, not the primary guarantee: with every
-// event handled under handleDeleteEvent's recover, nothing in the loop
-// body can panic out. It exists so that a future edit which adds work to
-// the loop OUTSIDE handleDeleteEvent cannot silently re-introduce the
-// process-wide death. Ordering is load-bearing: workerWG.Done is
-// registered FIRST so it runs LAST, which means the re-spawn's Add(1)
-// happens while the WaitGroup counter is still ≥1 (no zero-transition
-// race against stopDeleteWorker's Wait).
-func (w *depWatch) runDeleteWorker(respawns int) {
+// runDepEventWorker is the worker body. Every dequeued coordinate is handled
+// under handleDepEvent's own recover, so nothing in this loop can panic out;
+// the deferred supervisor exists for a future edit that adds work OUTSIDE
+// handleDepEvent. Ordering is load-bearing: workerWG.Done is registered
+// FIRST so it runs LAST, so the re-spawn's Add(1) lands while the counter is
+// still ≥1 (no zero-transition race against stopWorker's Wait).
+func (w *depWatch) runDepEventWorker(respawns int) {
 	defer w.workerWG.Done()
 	defer func() {
 		rec := recover()
 		if rec == nil {
 			return
 		}
-		w.counters.deleteWorkerPanics.Add(1)
-		if respawns >= maxDeleteWorkerRespawns {
+		w.counters.workerPanics.Add(1)
+		if respawns >= maxDepWorkerRespawns {
 			slog.Error("deps.delete_worker.panic",
 				slog.String("subsystem", "cache"),
 				slog.Any("panic", rec),
 				slog.String("site", "worker_loop"),
 				slog.Int("respawns", respawns),
-				slog.String("effect", "worker loop unwound OUTSIDE the per-event recover "+
-					"more than the re-spawn cap allows — STAYING DOWN. DELETE-driven L1 "+
-					"invalidation is degraded to TTL until restart; a deterministic panic "+
-					"in the loop body is the only way to reach this."),
+				slog.String("effect", "dep-event worker loop unwound OUTSIDE the per-event recover "+
+					"more than the re-spawn cap allows — STAYING DOWN. Event-driven L1 "+
+					"invalidation is degraded to TTL until restart."),
 			)
 			return
 		}
@@ -171,92 +231,104 @@ func (w *depWatch) runDeleteWorker(respawns int) {
 			slog.Any("panic", rec),
 			slog.String("site", "worker_loop"),
 			slog.Int("respawns", respawns),
-			slog.String("effect", "worker loop unwound OUTSIDE the per-event recover; re-spawning"),
+			slog.String("effect", "dep-event worker loop unwound OUTSIDE the per-event recover; re-spawning"),
 		)
 		w.workerWG.Add(1)
-		go w.runDeleteWorker(respawns + 1)
+		go w.runDepEventWorker(respawns + 1)
 	}()
 	for {
-		select {
-		case <-w.stopCh:
-			// Drain queued events before exit so test teardown
-			// is deterministic.
-			for {
-				select {
-				case ev := <-w.deleteEvictCh:
-					w.handleDeleteEvent(ev)
-				default:
-					return
-				}
-			}
-		case ev := <-w.deleteEvictCh:
-			w.handleDeleteEvent(ev)
+		item, shutdown := w.q().Get()
+		if shutdown {
+			return
 		}
+		func() {
+			defer w.q().Done(item)
+			w.handleDepEvent(item)
+		}()
 	}
 }
 
-// handleDeleteEvent runs Deps().OnDelete for one queued DELETE under its
-// OWN recover (#187 H1). A panic is confined to this event: it is
-// counted, WARN-logged with the offending coordinates, and the caller's
+// handleDepEvent processes ONE coordinate under its OWN recover: probe the
+// informer, derive the action, hand it to the tracker. A panic is confined
+// to this event: counted, WARN-logged with the coordinates, and the caller's
 // drain loop proceeds to the next event.
 //
-// WARN, not ERROR: the chart ships LOG_LEVEL=warn, and this line is the
-// one an operator greps for after a missed invalidation. It names the
-// object whose eviction was lost, which the pre-1.12.5 ERROR line did
-// not.
-func (w *depWatch) handleDeleteEvent(ev depDeleteEvent) {
+// WARN, not ERROR: the chart ships LOG_LEVEL=warn, and this line is the one
+// an operator greps for after a missed invalidation.
+func (w *depWatch) handleDepEvent(k depEventKey) {
 	defer func() {
 		rec := recover()
 		if rec == nil {
 			return
 		}
-		w.counters.deleteWorkerPanics.Add(1)
+		w.counters.workerPanics.Add(1)
+		w.q().Forget(k)
 		slog.Warn("deps.delete_worker.panic",
 			slog.String("subsystem", "cache"),
-			slog.String("gvr", ev.gvr.String()),
-			slog.String("ns", ev.namespace),
-			slog.String("name", ev.name),
+			slog.String("gvr", k.gvr.String()),
+			slog.String("ns", k.namespace),
+			slog.String("name", k.name),
 			slog.Any("panic", rec),
-			slog.String("site", "on_delete"),
-			slog.String("effect", "this object's L1 eviction was LOST (stale until TTL); "+
-				"the worker survived and continues draining subsequent DELETEs"),
+			slog.String("site", "on_object_event"),
+			slog.String("effect", "this coordinate's L1 action was LOST (stale until TTL, or until the "+
+				"next event / reconcile enqueues it again); the worker survived and continues"),
 		)
 	}()
-	Deps().OnDelete(ev.gvr, ev.namespace, ev.name)
-}
 
-// submitDeleteEvent hands a DELETE event to the worker goroutine (R3).
-// On a full queue it falls back to running OnDelete inline — correctness
-// over the off-processor guarantee — and counts deleteQueueFull.
-func (w *depWatch) submitDeleteEvent(ev depDeleteEvent) {
-	w.startDeleteWorker()
-	select {
-	case w.deleteEvictCh <- ev:
+	state := w.watcher.Load().probeObjectState(k.gvr, k.namespace, k.name)
+	switch state {
+	case objExists:
+		w.counters.probeExists.Add(1)
+	case objAbsent:
+		w.counters.probeAbsent.Add(1)
 	default:
-		w.counters.deleteQueueFull.Add(1)
-		slog.Warn("deps.delete_queue_full",
+		// objUnknown — the indexer is not authoritative. Requeue with backoff
+		// on the shared budget; on exhaustion degrade to a dirty-mark so the
+		// refresher's re-fetch takes the decision against the apiserver.
+		w.counters.probeUnknown.Add(1)
+		if w.q().NumRequeues(k) < maxRefreshRequeues {
+			w.q().AddRateLimited(k)
+			return
+		}
+		w.counters.probeUnknownDegraded.Add(1)
+		w.q().Forget(k)
+		slog.Warn("deps.probe_unknown_degraded",
 			slog.String("subsystem", "cache"),
-			slog.String("gvr", ev.gvr.String()),
-			slog.String("hint", "DELETE storm outran the eviction worker — running OnDelete inline"),
+			slog.String("gvr", k.gvr.String()),
+			slog.String("ns", k.namespace),
+			slog.String("name", k.name),
+			slog.Int("requeues", maxRefreshRequeues),
+			slog.String("effect", "informer not authoritative for this GVR for the whole requeue budget — "+
+				"dirty-marking dependents so the refresher decides against the apiserver "+
+				"(404 ⇒ evict at the drop point). Non-zero here means an informer is not recovering."),
+			slog.String("hint", "the 404 leg of that refresh resolves in seconds; a 403/500/timeout on it stays "+
+				"bounded by RESOLVED_CACHE_TTL_SECONDS (3600 s) until 1.12.6 C4 extends drop-point eviction "+
+				"to non-404 deterministic failures"),
 		)
-		// 1.12.5 / #187 H1 — the inline fallback runs on the INFORMER
-		// PROCESSOR goroutine. Route it through the same per-event recover:
-		// an unguarded panic here would kill event delivery for the whole
-		// informer, a strictly worse failure than the worker death H1
-		// describes. Same counter, same WARN line (site=on_delete).
-		w.handleDeleteEvent(ev)
+		Deps().OnObjectEvent(k.gvr, k.namespace, k.name, objUnknownDegraded)
+		return
 	}
+	w.q().Forget(k)
+	Deps().OnObjectEvent(k.gvr, k.namespace, k.name, state)
 }
 
-// stopDeleteWorker closes the worker stop channel and blocks until the
-// worker goroutine has exited (and drained pending events). Used by the
-// _test.go shim; production code MUST NOT call it.
-func (w *depWatch) stopDeleteWorker() {
-	select {
-	case <-w.stopCh:
-		// already stopped
-	default:
-		close(w.stopCh)
+// submitDepEvent binds the watcher, starts the worker on first use and
+// enqueues the coordinate. Never blocks, never drops: the typed workqueue is
+// unbounded and deduplicates pending keys.
+func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey) {
+	w.watcher.Store(rw)
+	w.startWorker()
+	w.counters.eventsSubmitted.Add(1)
+	w.q().Add(k)
+}
+
+// stopWorker shuts the queue down, lets the worker drain what is already
+// queued, and blocks until the goroutine has exited. Coordinates still
+// waiting in the rate limiter's delay are dropped. Used by the _test.go
+// shim; production code MUST NOT call it.
+func (w *depWatch) stopWorker() {
+	if q := w.q(); q != nil {
+		q.ShutDownWithDrain()
 	}
 	w.workerWG.Wait()
 }
@@ -264,41 +336,19 @@ func (w *depWatch) stopDeleteWorker() {
 // depEventHandlers builds the shared informer event-handler set wired by
 // BOTH addResourceTypeLocked (dynamic full-Unstructured) and
 // addResourceTypeMetadataOnlyLocked (PartialObjectMetadata). The handler
-// bodies are byte-identical across the two paths — metaNSName extracts
-// (ns, name) via the nsNameAccessor interface that both shapes satisfy.
+// bodies read ONLY (namespace, name) via metaNSName, so they are
+// *bytesObject-safe by construction (Ship H5): every streamed object shape
+// embeds ObjectMeta. WARNING for a future editor: a content read added here
+// would NOT be *bytesObject-safe — decode via decodeBytesObject first.
 //
-// Ship H5 — *bytesObject-SAFE BY CONSTRUCTION. Post the H5 routing
-// inversion the streaming informers deliver *bytesObject to these
-// handlers. That is safe WITHOUT change here: every handler reads ONLY
-// (namespace, name) via metaNSName, and *bytesObject embeds ObjectMeta
-// so it satisfies metaNSName's nsNameAccessor interface exactly as
-// *unstructured.Unstructured and *PartialObjectMetadata do. The
-// dep-tracker never reads object CONTENT — so it needs no decode-on-
-// access. WARNING for a future editor: a content-assert added here
-// (obj.(*unstructured.Unstructured), reading spec/status, etc.) would
-// NOT be *bytesObject-safe and would silently drop every streamed
-// object — it must decode via decodeBytesObject first.
-//
-// R1 — AddFunc IS wired here (pre-0.30.110 it was deliberately omitted).
-// The initial-replay gate consults rw.syncCh[gvr]:
-//
-//   - syncCh closed (informer post-sync) → propagate the ADD to
-//     Deps().OnAdd (dirty-mark LIST-scope dependents of the new object).
-//   - syncCh open (initial LIST replay in flight) → DROP. Every existing
-//     object arrives as an ADD during the initial replay; dirty-marking
-//     each one is pointless churn and would storm the refresher at
-//     startup. addDroppedPreSync counts the drops.
-//   - syncCh nil (O14) → fail-safe DROP + one-shot WARN. A nil channel
-//     means a registration path bypassed the syncCh allocation; we never
-//     propagate (could storm) and never block (could deadlock).
+// All three handlers ENQUEUE THE COORDINATE and return. The only per-type
+// difference left is the ADD pre-sync gate (design §3.4 point 1), which must
+// stay ADD-only and at the handler.
 func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) clientcache.ResourceEventHandlerFuncs {
 	w := depWatchSingleton()
-	// Ship 0.30.233 — pre-compute the CRD-meta-GVR predicate once
-	// per handler-set construction, NOT per-event. The predicate is
-	// a structural equality check (IsCRDGVR — see crd_gvr.go);
-	// hoisting it here keeps the AddFunc hot path free of any
-	// GVR-comparison cost for the 99% case where gvr is NOT the
-	// CRD meta-GVR.
+	w.watcher.Store(rw)
+	// Ship 0.30.233 — pre-compute the CRD-meta-GVR predicate once per
+	// handler-set construction, NOT per-event.
 	crdSideEffect := IsCRDGVR(gvr)
 	return clientcache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -309,15 +359,9 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 			ns, name := metaNSName(obj)
 			w.counters.addPropagated.Add(1)
 			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			Deps().OnAdd(gvr, ns, name)
-			// Ship 0.30.233 — CRD-ADD discovery side-effect.
-			// Dispatches to the bounded worker channel so the
-			// network-bound DiscoverGroupResources hop runs OFF
-			// the informer processor goroutine (PM tightening
-			// #1). triggerCRDDiscovery has its own defer recover
-			// (PM tightening #2) so a malformed CRD object cannot
-			// panic-kill the worker or this processor goroutine.
-			// See crd_discovery_side_effect.go.
+			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name})
+			// Ship 0.30.233 — CRD-ADD discovery side-effect, off the informer
+			// processor goroutine. See crd_discovery_side_effect.go.
 			if crdSideEffect {
 				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleAdd)
 			}
@@ -325,39 +369,24 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 		UpdateFunc: func(_, newObj interface{}) {
 			ns, name := metaNSName(newObj)
 			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			Deps().OnUpdate(gvr, ns, name)
-			// Ship L / 0.30.246 — CRD UPDATE lifecycle hook. A CRD
-			// UPDATE may add a new served version, retire one, or
-			// change spec.group. Re-firing discovery on the NEW spec
-			// is cheap (DiscoverGroupResources is per-group
-			// singleflighted at discovery_lookup.go:228+) and
-			// idempotent (AddNavigationDiscoveredGroup at
-			// discovery_lookup.go:87-102 is a no-op for an already-
-			// known group). The worker queue serialises ADD/UPDATE/
-			// DELETE so order is deterministic.
+			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name})
+			// Ship L / 0.30.246 — CRD UPDATE lifecycle hook.
 			if crdSideEffect {
 				crdDiscoverySingleton().submitCRDLifecycleEvent(newObj, crdLifecycleUpdate)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			// DeletedFinalStateUnknown wraps the last-known object when
-			// the watcher missed the explicit DELETE. Unwrap so we still
-			// get the (ns, name) tuple AND the underlying CRD spec for
-			// Ship L's CRD-DELETE teardown branch below.
+			// DeletedFinalStateUnknown wraps the last-known object when the
+			// watcher missed the explicit DELETE. Unwrap so we still get the
+			// (ns, name) tuple AND the underlying CRD spec for the CRD-DELETE
+			// teardown branch below.
 			if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
 				obj = tomb.Obj
 			}
 			ns, name := metaNSName(obj)
 			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			// R3: hand off to the worker — never run the eviction burst
-			// inline on this informer processor goroutine.
-			w.submitDeleteEvent(depDeleteEvent{gvr: gvr, namespace: ns, name: name})
-			// Ship L / 0.30.246 — CRD DELETE lifecycle hook. Tears down
-			// the per-resource informer for every served version of the
-			// deleted CRD via RemoveResourceType + dirty-marks dependent
-			// L1 via OnResourceTypeRemoved. See triggerCRDDelete in
-			// crd_discovery_side_effect.go for the teardown contract +
-			// failure modes (spec §3b + §10.4).
+			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name})
+			// Ship L / 0.30.246 — CRD DELETE lifecycle hook (triggerCRDDelete).
 			if crdSideEffect {
 				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleDelete)
 			}
@@ -365,9 +394,51 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 	}
 }
 
+// probeObjectState is the tri-state probe the dep-event worker derives its
+// action from (design §3.3). It reads the watcher directly and has NO side
+// effect — in particular it never calls EnsureResourceType, so asking about
+// a GVR cannot register it.
+//
+//	objExists  — the informer for gvr is servable (registered AND synced AND
+//	             watch not broken AND type confirmed) and its indexer holds
+//	             the object.
+//	objAbsent  — the informer is servable and its indexer does NOT hold the
+//	             object ⇒ deleted.
+//	objUnknown — nil watcher, passthrough mode (no informers; GetObject would
+//	             do a LIVE apiserver GET, which this probe must never add),
+//	             or the GVR is not servable: torn down (relist window), not
+//	             yet synced, watch broken, type unconfirmed. The indexer is
+//	             not authoritative either way.
+//
+// One lock acquisition covers the servability check and the indexer read
+// off the same informer handle (the GetObject check-then-act discipline).
+func (rw *ResourceWatcher) probeObjectState(gvr schema.GroupVersionResource, namespace, name string) objectState {
+	if rw == nil || rw.mode == modePassthrough {
+		return objUnknown
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	gi, ok := rw.servableLocked(gvr)
+	if !ok {
+		return objUnknown
+	}
+	key := name
+	if namespace != "" {
+		key = namespace + "/" + name
+	}
+	_, exists, err := gi.Informer().GetIndexer().GetByKey(key)
+	if err != nil {
+		return objUnknown
+	}
+	if exists {
+		return objExists
+	}
+	return objAbsent
+}
+
 // addEventPostSync implements the R1 initial-replay gate + the O14 nil-
-// syncCh fail-safe. Returns true iff an ADD for gvr should propagate to
-// the DepTracker.
+// syncCh fail-safe. Returns true iff an ADD for gvr should propagate to the
+// DepTracker.
 //
 // The syncCh read is the lock-free
 //
@@ -402,44 +473,59 @@ func (rw *ResourceWatcher) addEventPostSync(gvr schema.GroupVersionResource, w *
 	}
 }
 
-// DepWatchStats is a read-only snapshot of the Ship A informer-bridge
-// counters. Consumed by the resolved_cache.summary log + the AC tests.
+// DepWatchStats is a read-only snapshot of the bridge counters. Consumed by
+// the resolved_cache.summary log, snowplow_deps (expvar + OTLP) and the
+// falsifier arms.
 type DepWatchStats struct {
 	AddDroppedPreSync uint64
 	AddPropagated     uint64
 	AddNilSyncCh      uint64
-	DeleteQueueFull   uint64
+	EventsSubmitted   uint64
 
-	// 1.12.5 / #187. DeleteWorkerPanics is the H1 signature — non-zero
-	// means at least one DELETE eviction was LOST. DeleteQueueDepth is
-	// the live occupancy of deleteEvictCh, sampled at snapshot time: a
-	// depth pinned near deleteEvictQueueDepth is the pre-1.12.5 dead-
-	// worker shape, and on 1.12.5 it means the drain is genuinely behind.
+	// DeleteWorkerPanics is the 1.12.5 H1 signature (kept under its 1.12.5
+	// name — the worker is now the unified dep-event worker): non-zero means
+	// at least one event's action was LOST. DeleteQueueDepth is the live
+	// number of coordinates pending on the dep-event queue.
 	DeleteWorkerPanics uint64
 	DeleteQueueDepth   int
-	DeleteQueueCap     int
+
+	ProbeExists          uint64
+	ProbeAbsent          uint64
+	ProbeUnknown         uint64
+	ProbeUnknownDegraded uint64
 }
 
-// DepWatchStatsSnapshot returns the current bridge counters.
+// DepWatchStatsSnapshot returns the current bridge counters. Reading it never
+// starts the worker and never builds the queue (only submitDepEvent does):
+// before the first event the depth reads 0, which is the truthful answer for
+// a bridge that exists and is idle. Under CACHE_ENABLED=false nothing ever
+// submits, so a scrape stays goroutine-free (architect N1; arm OFF).
 func DepWatchStatsSnapshot() DepWatchStats {
 	w := depWatchSingleton()
+	depth := 0
+	if q := w.q(); q != nil {
+		depth = q.Len()
+	}
 	return DepWatchStats{
-		AddDroppedPreSync:  w.counters.addDroppedPreSync.Load(),
-		AddPropagated:      w.counters.addPropagated.Load(),
-		AddNilSyncCh:       w.counters.addNilSyncCh.Load(),
-		DeleteQueueFull:    w.counters.deleteQueueFull.Load(),
-		DeleteWorkerPanics: w.counters.deleteWorkerPanics.Load(),
-		DeleteQueueDepth:   len(w.deleteEvictCh),
-		DeleteQueueCap:     cap(w.deleteEvictCh),
+		AddDroppedPreSync:    w.counters.addDroppedPreSync.Load(),
+		AddPropagated:        w.counters.addPropagated.Load(),
+		AddNilSyncCh:         w.counters.addNilSyncCh.Load(),
+		EventsSubmitted:      w.counters.eventsSubmitted.Load(),
+		DeleteWorkerPanics:   w.counters.workerPanics.Load(),
+		DeleteQueueDepth:     depth,
+		ProbeExists:          w.counters.probeExists.Load(),
+		ProbeAbsent:          w.counters.probeAbsent.Load(),
+		ProbeUnknown:         w.counters.probeUnknown.Load(),
+		ProbeUnknownDegraded: w.counters.probeUnknownDegraded.Load(),
 	}
 }
 
-// resetDepWatchForTest tears the bridge singleton down so each test sees
-// a clean bridge (counters zeroed, worker stopped). Exported via the
-// _test.go shim; production code MUST NOT call it.
+// resetDepWatchForTest tears the bridge singleton down so each test sees a
+// clean bridge (counters zeroed, worker stopped). Exported via the _test.go
+// shim; production code MUST NOT call it.
 func resetDepWatchForTest() {
 	if depWatchInstance != nil {
-		depWatchInstance.stopDeleteWorker()
+		depWatchInstance.stopWorker()
 	}
 	depWatchInstance = nil
 	depWatchOnce = sync.Once{}
