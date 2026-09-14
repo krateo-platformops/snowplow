@@ -787,6 +787,14 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	if _, suppressed := refreshSuppressed.Load(key); suppressed && ok {
 		q.Forget(key)
 		refreshSuppressedSkipsTotal.Add(1)
+		// Consume (and discard) the trigger GVR recorded at enqueue. The
+		// R1 stamp below is skipped on this path, so without this the GVR
+		// would sit in the map for as long as the key stays suppressed and
+		// be applied — as a force-miss — to whatever dequeue first runs
+		// after a real Put clears the marker, arbitrarily later (architect
+		// N3). The rate-floor branch deliberately keeps its GVR because it
+		// re-dispatches the same mark; a suppressed skip does not.
+		r.triggerGVRByKey.LoadAndDelete(key)
 		return true
 	}
 	if floor := r.rateFloor(); floor > 0 && ok && entry != nil {
@@ -897,12 +905,18 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// ticks and one WARN per suspension window names the suspected
 			// outage. Budget "0" disables this branch entirely (byte-for-byte
 			// 1.12.5 for non-404 failures). Eviction routes through the dep
-			// tracker (RemoveL1Key clears the edges), never store.deleteForDep,
-			// and counts on its OWN counter so evict_delete_total stays the
-			// informer-DELETE-only H1 discriminator.
+			// tracker's EvictDropPoint — the same store.deleteForDep + RemoveL1Key
+			// pair the 404 route uses (deleteForDep is what bumps the STORE's
+			// evict_delete_total under snowplow_resolved_cache and clears the
+			// suppression marker; RemoveL1Key drops the dep edges) — counted on
+			// evict_drop_point_total so NEITHER evict_delete_total (the
+			// informer-DELETE-only H1 discriminator) NOR evict_self_gone_total
+			// (the confirmed-404 signal) moves for a non-404 eviction. During an
+			// apiserver outage this is the counter that climbs, alongside
+			// snowplow_refresher_drop_evict_suspended_total.
 			if r.dropEvict != nil {
 				if allowed, firstSuspend := r.dropEvict.allow(); allowed {
-					evicted := Deps().EvictSelfGone(key)
+					evicted := Deps().EvictDropPoint(key)
 					slog.Warn("refresher.refresh_dropped",
 						slog.String("subsystem", "cache"),
 						slog.String("key_hash", key),

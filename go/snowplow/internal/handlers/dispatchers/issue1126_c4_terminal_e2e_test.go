@@ -20,6 +20,11 @@
 //	     REAL loop → the key is suppressed; the 4th dequeue does not resolve;
 //	     one real Put clears it and the 5th dequeue resolves again.
 //	     RED on main: the 4th dequeue resolves (the WARN storm).
+//	F6n  row 6, the empty-full site (architect N6) — the seam returns
+//	     (nil, nil) three times → suppressed with reason "empty_full"; the
+//	     4th dequeue does not resolve; ONE decline does NOT suppress (a
+//	     transient pre-sync window clears inside K). RED on main: the 4th
+//	     dequeue resolves (the site was "skip-to-TTL forever").
 //	F6u  row 4 — the seam reports ErrRefreshUnsupported → suppressed on the
 //	     FIRST occurrence, not requeued (1 invocation, no refresh_dropped).
 //	F7   row 9 — an apistage CONTENT entry whose call is not pivot-servable
@@ -99,8 +104,17 @@ func TestIssue1126_C4_F4_DeterministicNon404IsEvictedAtTheDropPoint(t *testing.T
 	if got := cache.RefresherSelfNotFoundEvictTotal(); got != 0 {
 		t.Fatalf("F4: self_notfound_evict_total = %d, want 0 — a 500 must never be counted as a deletion", got)
 	}
-	if got := cache.Deps().Stats().EvictSelfGoneTotal; got != 1 {
-		t.Fatalf("F4: evict_self_gone_total = %d, want 1 — the drop-point eviction must clear the dep edges too", got)
+	// PM condition 1: the drop-point eviction has its OWN tracker counter.
+	// evict_self_gone_total keeps meaning "confirmed 404" so an apiserver
+	// outage (drop-point evictions climbing) cannot read as mass deletion.
+	// Map lookup rather than a typed field so the arm compiles — and reads
+	// zero — against a tree without the counter.
+	if got := cache.DepsStatsByStat()["evict_drop_point_total"]; got != 1 {
+		t.Fatalf("F4: evict_drop_point_total = %d, want 1 — the drop-point eviction must go through the "+
+			"tracker (dep edges cleared) and be counted on its own stat", got)
+	}
+	if got := cache.Deps().Stats().EvictSelfGoneTotal; got != 0 {
+		t.Fatalf("F4: evict_self_gone_total = %d, want 0 — a 500 is not a confirmed 404", got)
 	}
 	if srv.objectGets.Load() != int64(i187MaxRequeues+1) {
 		t.Fatalf("F4: apiserver object GETs = %d, want %d", srv.objectGets.Load(), i187MaxRequeues+1)
@@ -134,20 +148,23 @@ func TestIssue1126_C4_F6_StageErrorDeclinesSuppressThenPutResumes(t *testing.T) 
 			t.Fatalf("F6: decline %d must keep the prior good body resident (ok=%v)", i, ok)
 		}
 	}
-	if reason, ok := cache.RefreshSuppressedReason(key); !ok || reason != "stage_error" {
-		t.Fatalf("F6 RED: key not suppressed after 3 consecutive stage-error declines (reason=%q ok=%v) — "+
-			"pre-1.12.6 this key re-resolved every dirty-mark forever (#191)", reason, ok)
-	}
 
-	// 4th dequeue: skipped without a resolve.
+	// 4th dequeue: skipped without a resolve. BEHAVIOUR FIRST — wait for
+	// either outcome, then assert the count, so the RED transcript on a tree
+	// without the mechanism is the #191 symptom (a 4th resolve), not a
+	// marker-API answer.
 	before := cache.RefreshTerminalStatsSnapshot().SuppressedSkipsTotal
 	cache.EnqueueRefresh(key)
-	i1126WaitFor(t, 5*time.Second, "suppressed skip", func() bool {
-		return cache.RefreshTerminalStatsSnapshot().SuppressedSkipsTotal > before
+	i1126WaitFor(t, 5*time.Second, "4th dequeue settled (skipped or resolved)", func() bool {
+		return cache.RefreshTerminalStatsSnapshot().SuppressedSkipsTotal > before || resolves.Load() >= 4
 	})
 	time.Sleep(50 * time.Millisecond)
 	if resolves.Load() != 3 || invocations.Load() != 3 {
-		t.Fatalf("F6 RED: a suppressed key was resolved again (resolves=%d handler=%d, want 3/3)", resolves.Load(), invocations.Load())
+		t.Fatalf("F6 RED: a suppressed key was resolved again (resolves=%d handler=%d, want 3/3) — "+
+			"pre-1.12.6 this key re-resolved every dirty-mark forever (#191)", resolves.Load(), invocations.Load())
+	}
+	if reason, ok := cache.RefreshSuppressedReason(key); !ok || reason != "stage_error" {
+		t.Fatalf("F6: key not marked suppressed after 3 consecutive stage-error declines (reason=%q ok=%v)", reason, ok)
 	}
 
 	// One real Put (a user /call storing fresh bytes) clears the marker → the
@@ -156,6 +173,72 @@ func TestIssue1126_C4_F6_StageErrorDeclinesSuppressThenPutResumes(t *testing.T) 
 	if _, still := cache.RefreshSuppressedReason(key); still {
 		t.Fatalf("F6 RED: the marker survived a real Put — suppress-and-never-recover")
 	}
+	cache.EnqueueRefresh(key)
+	i1126WaitFor(t, 5*time.Second, "resolve after Put", func() bool { return resolves.Load() >= 4 })
+}
+
+// F6n — architect N6: the (nil, nil) "empty full" decline site in
+// resolveAndPopulateL1 joins the suppression mechanism. One decline must NOT
+// suppress (a pre-sync window is transient); K=3 consecutive ones must.
+func TestIssue1126_C4_F6n_EmptyFullDeclinesSuppressAfterKNotAfterOne(t *testing.T) {
+	i187RefresherEnv(t)
+	t.Setenv("REFRESH_SUPPRESS_AFTER_DECLINES", "3")
+	srv := newI187APIServer(t, http.StatusOK) // never reached: the seam replaces resolveOnceProd
+	store, inputs, key, saEP, saRC := i187Fixture(t, srv, true)
+
+	var resolves atomic.Int64
+	restore := setResolveOnceForTest(func(_ context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
+		resolves.Add(1)
+		return nil, nil // the RAFullList "no full produced" sentinel
+	})
+	t.Cleanup(restore)
+
+	orig, ok := store.Get(key)
+	if !ok {
+		t.Fatal("F6n: fixture entry missing")
+	}
+	origBody := string(orig.RawJSON)
+
+	invocations, stop := i1126Loop(t, "widgets", saEP, saRC)
+	defer stop()
+
+	// ONE decline: resident, NOT suppressed, and the next dequeue resolves.
+	cache.EnqueueRefresh(key)
+	i1126WaitFor(t, 5*time.Second, "decline 1", func() bool { return resolves.Load() >= 1 })
+	time.Sleep(50 * time.Millisecond)
+	if _, ok := store.Get(key); !ok {
+		t.Fatal("F6n: one empty-full decline must keep the prior good body resident")
+	}
+	if reason, ok := cache.RefreshSuppressedReason(key); ok {
+		t.Fatalf("F6n: ONE empty-full decline suppressed the key (reason=%q) — a transient pre-sync window must clear inside K", reason)
+	}
+	cache.EnqueueRefresh(key)
+	i1126WaitFor(t, 5*time.Second, "decline 2 (not suppressed after one)", func() bool { return resolves.Load() >= 2 })
+
+	// Third decline reaches K=3.
+	cache.EnqueueRefresh(key)
+	i1126WaitFor(t, 5*time.Second, "decline 3", func() bool { return resolves.Load() >= 3 })
+	if e, ok := store.Get(key); !ok || string(e.RawJSON) != origBody {
+		t.Fatalf("F6n: after 3 declines the prior good body must still be resident (ok=%v)", ok)
+	}
+
+	// 4th dequeue: BEHAVIOUR FIRST — skipped without a resolve.
+	before := cache.RefreshTerminalStatsSnapshot().SuppressedSkipsTotal
+	cache.EnqueueRefresh(key)
+	i1126WaitFor(t, 5*time.Second, "4th dequeue settled (skipped or resolved)", func() bool {
+		return cache.RefreshTerminalStatsSnapshot().SuppressedSkipsTotal > before || resolves.Load() >= 4
+	})
+	time.Sleep(50 * time.Millisecond)
+	if resolves.Load() != 3 || invocations.Load() != 3 {
+		t.Fatalf("F6n RED: an empty-full key was resolved again after K declines (resolves=%d handler=%d, want 3/3) — "+
+			"the (nil, nil) site was skip-to-TTL forever (#191 shape)", resolves.Load(), invocations.Load())
+	}
+	if reason, ok := cache.RefreshSuppressedReason(key); !ok || reason != "empty_full" {
+		t.Fatalf("F6n: suppression reason = (%q, %v), want (\"empty_full\", true)", reason, ok)
+	}
+
+	// A real Put clears it and the next dequeue resolves again.
+	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"children":["fresh"]}`), Inputs: &inputs})
 	cache.EnqueueRefresh(key)
 	i1126WaitFor(t, 5*time.Second, "resolve after Put", func() bool { return resolves.Load() >= 4 })
 }

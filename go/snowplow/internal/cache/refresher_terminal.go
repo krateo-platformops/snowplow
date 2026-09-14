@@ -103,16 +103,28 @@ func RefreshSuppressAfterDeclines() int {
 // dropEvictBreaker is a token bucket: capacity == refill-per-minute == the
 // knob. One token per drop-point eviction; refill is continuous.
 type dropEvictBreaker struct {
-	mu         sync.Mutex
-	tokens     float64
-	last       time.Time
-	perMinute  int
-	suspended  bool // inside a suspension window (one WARN per window)
-	nowFn      func() time.Time
-	warnTotal  atomic.Uint64 // suspension-window WARNs emitted (one per window)
-	suspTotal  atomic.Uint64 // refresh_drop_evict_suspended_total
-	evictTotal atomic.Uint64 // refresh_drop_evict_total (non-404 drop-point evictions)
+	mu        sync.Mutex
+	tokens    float64
+	last      time.Time
+	perMinute int
+	suspended bool // inside a suspension window (one WARN per window)
+	nowFn     func() time.Time
 }
+
+// The breaker's three counters are PACKAGE-level atomics, not fields of the
+// breaker, so RefreshTerminalStatsSnapshot can read them without touching
+// refresherInstance. Reading the singleton pointer from a telemetry scrape
+// was a data race (architect B1: the pointer is published inside
+// refresherInit.Do on the first enqueue, and nothing ordered a concurrent
+// /debug/vars or OTLP read against that write — three races under
+// -race -count=20). The breaker is a process singleton, so process-scoped
+// counters are semantically identical, and the snapshot still constructs
+// nothing (the C1 N1 lesson: a stats read must never build the singleton).
+var (
+	dropEvictTotal          atomic.Uint64 // refresh_drop_evict_total (non-404 drop-point evictions)
+	dropEvictSuspendedTotal atomic.Uint64 // refresh_drop_evict_suspended_total
+	dropEvictWarnTotal      atomic.Uint64 // suspension-window WARNs emitted (one per window)
+)
 
 func newDropEvictBreaker(perMinute int) *dropEvictBreaker {
 	b := &dropEvictBreaker{perMinute: perMinute, nowFn: time.Now}
@@ -142,13 +154,13 @@ func (b *dropEvictBreaker) allow() (allowed bool, firstSuspend bool) {
 	if b.tokens >= 1 {
 		b.tokens--
 		b.suspended = false
-		b.evictTotal.Add(1)
+		dropEvictTotal.Add(1)
 		return true, false
 	}
-	b.suspTotal.Add(1)
+	dropEvictSuspendedTotal.Add(1)
 	if !b.suspended {
 		b.suspended = true
-		b.warnTotal.Add(1)
+		dropEvictWarnTotal.Add(1)
 		return false, true
 	}
 	return false, false
@@ -228,6 +240,9 @@ func resetRefreshTerminalForTest() {
 	refreshSuppressedSetTotal.Store(0)
 	refreshSuppressedSkipsTotal.Store(0)
 	refreshDeclineNotedTotal.Store(0)
+	dropEvictTotal.Store(0)
+	dropEvictSuspendedTotal.Store(0)
+	dropEvictWarnTotal.Store(0)
 }
 
 // RefreshTerminalStats is the read-only snapshot of the C4 counters (expvar
@@ -245,22 +260,23 @@ type RefreshTerminalStats struct {
 }
 
 // RefreshTerminalStatsSnapshot reads the counters. It does NOT construct the
-// refresher singleton: with no refresher (cache-off, or before the first
-// enqueue) the breaker counters read zero.
+// refresher singleton and it does NOT read refresherInstance at all (B1):
+// every counter it reports is a package-level atomic, so a /debug/vars
+// scrape or an OTLP collection racing the singleton's first construction is
+// an ordinary atomic load. With no refresher yet (cache-off, or before the
+// first enqueue) the breaker counters read zero.
 func RefreshTerminalStatsSnapshot() RefreshTerminalStats {
 	s := RefreshTerminalStats{
-		DropEvictMaxPerMinute: RefreshDropEvictMaxPerMinute(),
-		SuppressedSetTotal:    refreshSuppressedSetTotal.Load(),
-		SuppressedSkipsTotal:  refreshSuppressedSkipsTotal.Load(),
-		DeclineNotedTotal:     refreshDeclineNotedTotal.Load(),
-		SuppressAfterDeclines: RefreshSuppressAfterDeclines(),
+		DropEvictTotal:          dropEvictTotal.Load(),
+		DropEvictSuspendedTotal: dropEvictSuspendedTotal.Load(),
+		DropEvictSuspendWarns:   dropEvictWarnTotal.Load(),
+		DropEvictMaxPerMinute:   RefreshDropEvictMaxPerMinute(),
+		SuppressedSetTotal:      refreshSuppressedSetTotal.Load(),
+		SuppressedSkipsTotal:    refreshSuppressedSkipsTotal.Load(),
+		DeclineNotedTotal:       refreshDeclineNotedTotal.Load(),
+		SuppressAfterDeclines:   RefreshSuppressAfterDeclines(),
 	}
 	refreshSuppressed.Range(func(_, _ any) bool { s.SuppressedKeys++; return true })
-	if r := refresherInstance; r != nil && r.dropEvict != nil {
-		s.DropEvictTotal = r.dropEvict.evictTotal.Load()
-		s.DropEvictSuspendedTotal = r.dropEvict.suspTotal.Load()
-		s.DropEvictSuspendWarns = r.dropEvict.warnTotal.Load()
-	}
 	return s
 }
 

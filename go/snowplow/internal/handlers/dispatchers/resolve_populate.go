@@ -268,10 +268,20 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			inputs.CacheEntryClass, inputs.Name, err)
 	}
 	if encoded == nil {
-		// The seam declined to resolve for a TRANSIENT reason (e.g. the
-		// RAFullList empty-full guard while its informer is still syncing) —
-		// skip-to-TTL, not an error; the next dirty-mark re-resolves it. The
-		// permanent "unknown kind" case is the typed ErrRefreshUnsupported above.
+		// The seam declined to resolve without an error — today the two
+		// RAFullList sentinels (no status produced; the empty-full guard while
+		// its informer is still syncing). Skip-to-TTL for THIS dequeue, not an
+		// error; the next dirty-mark re-resolves it. The permanent "unknown
+		// kind" case is the typed ErrRefreshUnsupported above.
+		//
+		// 1.12.6 C4 (§6.1, architect N6): this must not be a "forget the key
+		// and keep the entry" outcome. A genuinely transient pre-sync window
+		// clears well inside K=REFRESH_SUPPRESS_AFTER_DECLINES dequeues and is
+		// unaffected; an RA whose full is PERMANENTLY empty would otherwise
+		// re-resolve on every dirty-mark forever — the #191 shape — so after K
+		// consecutive declines the key becomes refresh-by-traffic-only until
+		// the next real Put, like every other decline site.
+		cache.NoteRefreshDecline(key, "empty_full", false)
 		return nil
 	}
 

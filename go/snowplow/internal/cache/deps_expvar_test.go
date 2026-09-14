@@ -73,6 +73,8 @@ func TestDepsExpvar_PublishesEveryDocumentedStat(t *testing.T) {
 		// what the tracker does with events
 		"evict_delete_total", "dirty_mark_total", "enqueue_update_total",
 		"evict_self_gone_total", "self_notfound_evict_total",
+		// 1.12.6 C4: the non-404 drop-point route on its own counter
+		"evict_drop_point_total",
 		// informer bridge: ADD gate
 		"add_propagated", "add_dropped_pre_sync", "add_nil_syncch",
 		// informer bridge: the unified dep-event worker (1.12.6 C1) — the

@@ -68,8 +68,10 @@ func TestRefreshTerminal_PanicProbe_NoRefresherAndDegenerateInputs(t *testing.T)
 	if a, first := b.allow(); a || !first {
 		t.Fatalf("after refill the next refusal must open a NEW window: (%v,%v)", a, first)
 	}
-	if b.warnTotal.Load() != 2 || b.evictTotal.Load() != 2 || b.suspTotal.Load() != 3 {
-		t.Fatalf("counters warn=%d evict=%d susp=%d, want 2/2/3", b.warnTotal.Load(), b.evictTotal.Load(), b.suspTotal.Load())
+	// B1: the counters live on package atomics (not on the breaker) so a
+	// stats read never has to construct the refresher singleton.
+	if dropEvictWarnTotal.Load() != 2 || dropEvictTotal.Load() != 2 || dropEvictSuspendedTotal.Load() != 3 {
+		t.Fatalf("counters warn=%d evict=%d susp=%d, want 2/2/3", dropEvictWarnTotal.Load(), dropEvictTotal.Load(), dropEvictSuspendedTotal.Load())
 	}
 	warnDropEvictSuspended("k", 1, false) // the WARN itself must not panic on a bare key
 

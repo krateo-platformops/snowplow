@@ -457,9 +457,17 @@ type DepTracker struct {
 	recordDroppedNoKey atomic.Uint64 // O15: Record*/WithL1KeyContext with empty l1Key
 	evictDeleteTotal   atomic.Uint64 // L1 self-representation evictions (OnDelete ONLY — the H1 live discriminator)
 	evictSelfGoneTotal atomic.Uint64 // 1.12.5 #187: evictions from a confirmed self-object 404 (EvictSelfGone)
-	dirtyMarkTotal     atomic.Uint64 // dirty-marks (OnAdd/OnUpdate + OnDelete non-self)
-	enqueueUpdateTotal atomic.Uint64 // refresh enqueues triggered by OnUpdate
-	removeL1Total      atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
+	// 1.12.6 C4: evictions at the refresher drop point after a deterministic
+	// NON-404 failure (403/500/timeout/parse/not-servable) exhausted the
+	// requeue budget under the breaker (EvictDropPoint). Kept apart from
+	// evictSelfGoneTotal on purpose: that counter's documented meaning is
+	// "the object is confirmed gone", and during an apiserver outage — the
+	// incident the breaker exists for — a folded number would read as "CRs
+	// are being deleted". One counter, one meaning (PM verify, Track B).
+	evictDropPointTotal atomic.Uint64
+	dirtyMarkTotal      atomic.Uint64 // dirty-marks (OnAdd/OnUpdate + OnDelete non-self)
+	enqueueUpdateTotal  atomic.Uint64 // refresh enqueues triggered by OnUpdate
+	removeL1Total       atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
 
 	// One-shot WARN flag for cap reached. We only want to log once
 	// (process lifetime) so the log file doesn't fill with the same
@@ -1060,7 +1068,33 @@ func (d *DepTracker) runEvictionBatch(keys []string) {
 //
 // Returns true iff an entry was actually removed from the store, so the
 // caller can log exactly once per genuine eviction.
+//
+// 404 ONLY. The 1.12.6 C4 drop point — a deterministic NON-404 failure that
+// exhausted the same budget under the breaker — takes EvictDropPoint, the
+// same mechanism on its own counter, so evict_self_gone_total keeps meaning
+// "the object is confirmed gone" even during an apiserver outage.
 func (d *DepTracker) EvictSelfGone(l1Key string) bool {
+	return d.evictSelfEntry(l1Key, &d.evictSelfGoneTotal)
+}
+
+// EvictDropPoint is EvictSelfGone for the 1.12.6 C4 drop point: the entry's
+// refresh failed deterministically for a NON-404 reason (403 / 500 / timeout
+// / parse / not-servable) across the whole requeue budget and the breaker
+// granted a token. Same store delete, same dep-edge cleanup, same "true iff
+// an entry was removed" contract — counted on evict_drop_point_total so
+// neither evict_delete_total (the H1 discriminator) nor
+// evict_self_gone_total (the confirmed-404 signal) moves for it.
+func (d *DepTracker) EvictDropPoint(l1Key string) bool {
+	return d.evictSelfEntry(l1Key, &d.evictDropPointTotal)
+}
+
+// evictSelfEntry is the shared body of EvictSelfGone / EvictDropPoint. It
+// deletes the entry through store.deleteForDep (which also bumps the STORE's
+// evict_delete_total under snowplow_resolved_cache and clears the C4
+// suppression marker) and then drops the key's dep records, bumping counter
+// only when an entry was actually removed. It never touches the tracker's
+// evictDeleteTotal.
+func (d *DepTracker) evictSelfEntry(l1Key string, counter *atomic.Uint64) bool {
 	if d == nil || l1Key == "" {
 		return false
 	}
@@ -1074,7 +1108,7 @@ func (d *DepTracker) EvictSelfGone(l1Key string) bool {
 	}
 	d.RemoveL1Key(l1Key)
 	if evicted {
-		d.evictSelfGoneTotal.Add(1)
+		counter.Add(1)
 	}
 	return evicted
 }
@@ -1120,16 +1154,17 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 // DepStats is a snapshot of the falsifier counters. All numbers are
 // atomic and may drift by a single call between fields.
 type DepStats struct {
-	TotalRecords       int64
-	MaxRecords         int64
-	RecordTotal        uint64
-	RecordDroppedCap   uint64
-	RecordDroppedNoKey uint64 // O15: empty-l1Key Record*/WithL1KeyContext
-	EvictDeleteTotal   uint64 // self-representation evictions from an informer DELETE only
-	EvictSelfGoneTotal uint64 // 1.12.5 #187: evictions from a confirmed self-object 404
-	DirtyMarkTotal     uint64 // dirty-marks (ADD/UPDATE + DELETE non-self)
-	EnqueueUpdateTotal uint64
-	RemoveL1Total      uint64
+	TotalRecords        int64
+	MaxRecords          int64
+	RecordTotal         uint64
+	RecordDroppedCap    uint64
+	RecordDroppedNoKey  uint64 // O15: empty-l1Key Record*/WithL1KeyContext
+	EvictDeleteTotal    uint64 // self-representation evictions from an informer DELETE only
+	EvictSelfGoneTotal  uint64 // 1.12.5 #187: evictions from a confirmed self-object 404
+	EvictDropPointTotal uint64 // 1.12.6 C4: evictions at the drop point after a NON-404 deterministic failure (breaker-granted)
+	DirtyMarkTotal      uint64 // dirty-marks (ADD/UPDATE + DELETE non-self)
+	EnqueueUpdateTotal  uint64
+	RemoveL1Total       uint64
 }
 
 func (d *DepTracker) Stats() DepStats {
@@ -1137,16 +1172,17 @@ func (d *DepTracker) Stats() DepStats {
 		return DepStats{}
 	}
 	return DepStats{
-		TotalRecords:       d.totalRecords.Load(),
-		MaxRecords:         d.maxRecords,
-		RecordTotal:        d.recordTotal.Load(),
-		RecordDroppedCap:   d.recordDroppedCap.Load(),
-		RecordDroppedNoKey: d.recordDroppedNoKey.Load(),
-		EvictDeleteTotal:   d.evictDeleteTotal.Load(),
-		EvictSelfGoneTotal: d.evictSelfGoneTotal.Load(),
-		DirtyMarkTotal:     d.dirtyMarkTotal.Load(),
-		EnqueueUpdateTotal: d.enqueueUpdateTotal.Load(),
-		RemoveL1Total:      d.removeL1Total.Load(),
+		TotalRecords:        d.totalRecords.Load(),
+		MaxRecords:          d.maxRecords,
+		RecordTotal:         d.recordTotal.Load(),
+		RecordDroppedCap:    d.recordDroppedCap.Load(),
+		RecordDroppedNoKey:  d.recordDroppedNoKey.Load(),
+		EvictDeleteTotal:    d.evictDeleteTotal.Load(),
+		EvictSelfGoneTotal:  d.evictSelfGoneTotal.Load(),
+		EvictDropPointTotal: d.evictDropPointTotal.Load(),
+		DirtyMarkTotal:      d.dirtyMarkTotal.Load(),
+		EnqueueUpdateTotal:  d.enqueueUpdateTotal.Load(),
+		RemoveL1Total:       d.removeL1Total.Load(),
 	}
 }
 

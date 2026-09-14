@@ -27,15 +27,29 @@
 //	F6p   permanent declines (external / UAF / unsupported) suppress on the
 //	      FIRST occurrence.
 //	F6e   an eviction clears the marker (it cannot outlive its key).
+//	B1    a stats read (the expvar / OTLP scrape) racing the FIRST
+//	      construction of the refresher singleton is race-free and never
+//	      constructs the singleton itself. RED on 6ee779d under -race: the
+//	      snapshot read refresherInstance unsynchronised against
+//	      refresherInit.Do's store.
+//
+// ORDER OF ASSERTIONS. Every arm asserts the BEHAVIOUR first (was the
+// handler invoked? is the entry resident?) and consults the marker /
+// counter API only afterwards, so the RED transcript against a tree without
+// the mechanism reads as the symptom (#191: the 4th dequeue resolved), not
+// as "the marker API returned false".
 package cache
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func terminalEnv(t *testing.T) {
@@ -226,19 +240,26 @@ func TestRefreshTerminal_F6m_SuppressAfterKDeclinesAndClearOnPut(t *testing.T) {
 	defer cancel()
 	StartRefresher(ctx)
 
-	// K=3 declines → suppressed.
+	// K=3 declines.
 	for i := 1; i <= 3; i++ {
 		enqueueRefreshForTest(key)
 		want := int32(i)
 		waitFor(t, 5*time.Second, "handler invoked", func() bool { return invocations.Load() >= want })
 	}
-	if _, ok := RefreshSuppressedReason(key); !ok {
-		t.Fatalf("F6m RED: key not suppressed after %d consecutive declines (K=3)", invocations.Load())
-	}
-	// The (K+1)th dequeue must NOT invoke the handler.
+	// Architect N3: a dirty-mark GVR recorded at enqueue must be CONSUMED by
+	// a suppressed skip, not left to force-miss an arbitrarily later dequeue.
+	// Stored before the enqueue so the worker cannot outrun the store.
+	n3GVR := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "flexes"}
+	refresherInstance.triggerGVRByKey.Store(key, n3GVR)
+
+	// The (K+1)th dequeue must NOT invoke the handler. BEHAVIOUR FIRST: wait
+	// for either outcome (the skip was counted, or the handler ran a 4th
+	// time) and then assert on the invocation count — on a tree without the
+	// mechanism this reads "handler invoked 4 times" (#191), not "marker API
+	// returned false".
 	enqueueRefreshForTest(key)
-	waitFor(t, 5*time.Second, "suppressed skip counted", func() bool {
-		return RefreshTerminalStatsSnapshot().SuppressedSkipsTotal >= 1
+	waitFor(t, 5*time.Second, "4th dequeue settled (skipped or resolved)", func() bool {
+		return RefreshTerminalStatsSnapshot().SuppressedSkipsTotal >= 1 || invocations.Load() >= 4
 	})
 	time.Sleep(50 * time.Millisecond)
 	if invocations.Load() != 3 {
@@ -246,6 +267,13 @@ func TestRefreshTerminal_F6m_SuppressAfterKDeclinesAndClearOnPut(t *testing.T) {
 	}
 	if _, ok := c.Get(key); !ok {
 		t.Fatalf("F6m: suppression must keep the entry resident (refresh-by-traffic-only), it was evicted")
+	}
+	if reason, ok := RefreshSuppressedReason(key); !ok || reason != "stage_error" {
+		t.Fatalf("F6m: key not marked suppressed after 3 consecutive declines (reason=%q ok=%v)", reason, ok)
+	}
+	if v, present := refresherInstance.triggerGVRByKey.Load(key); present {
+		t.Fatalf("F6m RED (N3): the suppressed skip left the trigger GVR %v in triggerGVRByKey — "+
+			"it would force-miss whatever dequeue first runs after the next real Put", v)
 	}
 
 	// One real Put clears the marker → the next dequeue resolves again.
@@ -258,6 +286,48 @@ func TestRefreshTerminal_F6m_SuppressAfterKDeclinesAndClearOnPut(t *testing.T) {
 	waitFor(t, 5*time.Second, "handler resumes after Put", func() bool { return invocations.Load() >= 4 })
 	cancel()
 	resetRefresherForTestKeepTerminalCounters()
+}
+
+// B1 — the expvar / OTLP scrape (RefreshTerminalStatsSnapshot) racing the
+// FIRST construction of the refresher singleton. Two invariants: no data race
+// under -race, and the read never constructs the singleton. RED on 6ee779d:
+// the snapshot read refresherInstance directly while refresherInit.Do stored
+// it (architect B1, blocking).
+func TestRefreshTerminal_B1_SnapshotRacesFirstConstructionWithoutConstructing(t *testing.T) {
+	terminalEnv(t)
+	cleanup := withCleanRefresher(t, 1, 0)
+	t.Cleanup(cleanup)
+	resetRefresherForTest()
+	if refresherInstance != nil {
+		t.Fatal("precondition: singleton must not exist")
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		refresherSingleton()
+	}()
+	var st RefreshTerminalStats
+	go func() {
+		defer wg.Done()
+		<-start
+		st = RefreshTerminalStatsSnapshot()
+	}()
+	close(start)
+	wg.Wait()
+	if st.SuppressAfterDeclines != RefreshSuppressAfterDeclines() {
+		t.Fatalf("snapshot = %+v, knob = %d", st, RefreshSuppressAfterDeclines())
+	}
+
+	// And in isolation: a read on a clean process must not construct.
+	resetRefresherForTest()
+	_ = RefreshTerminalStatsSnapshot()
+	if refresherInstance != nil {
+		t.Fatal("B1: RefreshTerminalStatsSnapshot constructed the refresher singleton")
+	}
 }
 
 // F6p — structurally permanent declines suppress on the FIRST occurrence.
