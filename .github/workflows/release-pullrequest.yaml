@@ -22,6 +22,9 @@ jobs:
       packages: write
     with:
       modules: '[{"mod":"snowplow","context":"go/snowplow"}]'
+      # Stamp the git SHA into the binary (Dockerfile: -X main.build=${COMMIT_HASH}); without it every
+      # published image reports snowplow_build_info version="unknown" and the OTel service.version is empty.
+      build_args: COMMIT_HASH=${{ github.sha }}
       push: false
   # Krateo Documentation Standard conformance (shared org workflow): the invariant
   # docs/ file set, frontmatter, link integrity, banned dead-org strings, examples
