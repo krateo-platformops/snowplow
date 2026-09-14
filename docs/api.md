@@ -74,7 +74,7 @@ authoritative machine-readable spec is
 | `POST /jq` | Evaluate a JQ expression against a JSON input. |
 | `GET /health`, `GET /readyz` | Liveness (always 200 once serving) / readiness (200 on prewarm-complete). |
 | `GET /swagger/` | The OpenAPI UI + spec. |
-| `GET /debug/vars`, `/debug/pprof/*`, `/debug/servable`, `/debug/apistage`, `/debug/refreshes` | Operator diagnostics ([observability](../go/snowplow/docs/architecture/observability.md)); `/debug/refreshes` is JWT-gated. |
+| `GET /debug/vars`, `/debug/pprof/*`, `/debug/servable`, `/debug/apistage`, `/debug/refreshes`, `/debug/reconcile` | Operator diagnostics ([observability](../go/snowplow/docs/architecture/observability.md)); `/debug/refreshes` is JWT-gated. |
 
 Note: the spec also describes `POST /convert` (YAML↔JSON), but that route is currently
 not wired in `main.go` — the spec is a superset on this one endpoint.

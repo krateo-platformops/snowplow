@@ -1280,38 +1280,77 @@ func (c *ResolvedCacheStore) RangeMetadata(fn func(ResolvedEntryMeta) bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for el := c.order.Front(); el != nil; el = el.Next() {
-		item := el.Value.(*lruItem)
-		entry := item.entry
-		meta := ResolvedEntryMeta{
-			KeyHash:      item.key,
-			AgeSeconds:   int64(now.Sub(entry.CreatedAt).Seconds()),
-			Pinned:       entry.Pinned,
-			ItemsCount:   len(entry.Items),
-			RawJSONBytes: len(entry.RawJSON),
-		}
-		if eff := c.effectiveTTLLocked(entry); eff > 0 {
-			rem := eff - now.Sub(entry.CreatedAt)
-			if rem < 0 {
-				rem = 0
-			}
-			meta.TTLRemainingSeconds = int64(rem.Seconds())
-		}
-		meta.TTLOverrideSeconds = int64(entry.TTLOverride.Seconds())
-		if in := entry.Inputs; in != nil {
-			meta.BindingUID = in.BindingUID
-			meta.CacheEntryClass = in.CacheEntryClass
-			meta.Group = in.Group
-			meta.Version = in.Version
-			meta.Resource = in.Resource
-			meta.Namespace = in.Namespace
-			meta.Name = in.Name
-			meta.Stage = in.Stage
-			meta.Path = metaPathFromCoords(in.Group, in.Version, in.Resource, in.Namespace, in.Name)
-		}
-		if !fn(meta) {
+		if !fn(c.metaForItemLocked(el.Value.(*lruItem), now)) {
 			return
 		}
 	}
+}
+
+// RangeMetadataSample invokes fn with the metadata projection of UP TO n
+// live entries (1.12.6 C3, design §5 — the sampled reconcile audit). Same
+// structural leak guard as RangeMetadata: fn receives ResolvedEntryMeta only.
+//
+// Cost is O(n) under c.mu regardless of the store size — that is the point:
+// the periodic reconcile tick must never hold the store mutex for a walk
+// proportional to residency (100K entries in production). RangeMetadata's
+// full walk stays for the operator-triggered /debug surfaces.
+//
+// Sampling rides Go's map iteration, which starts at a random bucket and
+// offset on every range statement: successive calls see different windows
+// of c.index, so over many ticks the whole residency is covered
+// probabilistically rather than in LRU order (which would re-sample the same
+// hot head every tick). n <= 0 invokes fn for nothing.
+func (c *ResolvedCacheStore) RangeMetadataSample(n int, fn func(ResolvedEntryMeta) bool) {
+	if c == nil || n <= 0 {
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seen := 0
+	for _, el := range c.index {
+		if seen >= n {
+			return
+		}
+		seen++
+		if !fn(c.metaForItemLocked(el.Value.(*lruItem), now)) {
+			return
+		}
+	}
+}
+
+// metaForItemLocked builds the metadata projection of one LRU item. Caller
+// holds c.mu. Reads RawJSON / Items / Inputs ONLY for scalar projections —
+// never copies a body, an item, or the extras map into the value.
+func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) ResolvedEntryMeta {
+	entry := item.entry
+	meta := ResolvedEntryMeta{
+		KeyHash:      item.key,
+		AgeSeconds:   int64(now.Sub(entry.CreatedAt).Seconds()),
+		Pinned:       entry.Pinned,
+		ItemsCount:   len(entry.Items),
+		RawJSONBytes: len(entry.RawJSON),
+	}
+	if eff := c.effectiveTTLLocked(entry); eff > 0 {
+		rem := eff - now.Sub(entry.CreatedAt)
+		if rem < 0 {
+			rem = 0
+		}
+		meta.TTLRemainingSeconds = int64(rem.Seconds())
+	}
+	meta.TTLOverrideSeconds = int64(entry.TTLOverride.Seconds())
+	if in := entry.Inputs; in != nil {
+		meta.BindingUID = in.BindingUID
+		meta.CacheEntryClass = in.CacheEntryClass
+		meta.Group = in.Group
+		meta.Version = in.Version
+		meta.Resource = in.Resource
+		meta.Namespace = in.Namespace
+		meta.Name = in.Name
+		meta.Stage = in.Stage
+		meta.Path = metaPathFromCoords(in.Group, in.Version, in.Resource, in.Namespace, in.Name)
+	}
+	return meta
 }
 
 // MetadataForKey returns the metadata projection for ONE entry, plus the
@@ -1341,34 +1380,8 @@ func (c *ResolvedCacheStore) MetadataForKey(key string) (ResolvedEntryMeta, bool
 		if item.key != key {
 			continue
 		}
-		entry := item.entry
-		out = ResolvedEntryMeta{
-			KeyHash:            item.key,
-			AgeSeconds:         int64(now.Sub(entry.CreatedAt).Seconds()),
-			Pinned:             entry.Pinned,
-			ItemsCount:         len(entry.Items),
-			RawJSONBytes:       len(entry.RawJSON),
-			TTLOverrideSeconds: int64(entry.TTLOverride.Seconds()),
-			BodySHA256:         fmt.Sprintf("%x", sha256.Sum256(entry.RawJSON)),
-		}
-		if eff := c.effectiveTTLLocked(entry); eff > 0 {
-			rem := eff - now.Sub(entry.CreatedAt)
-			if rem < 0 {
-				rem = 0
-			}
-			out.TTLRemainingSeconds = int64(rem.Seconds())
-		}
-		if in := entry.Inputs; in != nil {
-			out.BindingUID = in.BindingUID
-			out.CacheEntryClass = in.CacheEntryClass
-			out.Group = in.Group
-			out.Version = in.Version
-			out.Resource = in.Resource
-			out.Namespace = in.Namespace
-			out.Name = in.Name
-			out.Stage = in.Stage
-			out.Path = metaPathFromCoords(in.Group, in.Version, in.Resource, in.Namespace, in.Name)
-		}
+		out = c.metaForItemLocked(item, now)
+		out.BodySHA256 = fmt.Sprintf("%x", sha256.Sum256(item.entry.RawJSON))
 		return out, true
 	}
 	return out, false

@@ -581,6 +581,16 @@
           "description": "1.12.6 C2 relist delta bridge: seconds the bridge waits for a schema-relisted informer to sync before giving up (it then enqueues nothing; relist_bridge_timeout_total counts it and the 1.12.5 post-sync re-fire keeps covering the teardown window). Unset/unparseable falls back to 120.",
           "title": "Deps Relist Bridge Timeout Seconds"
         },
+        "DEPS_RECONCILE_SAMPLE": {
+          "type": "string",
+          "description": "1.12.6 C3 sampled reconcile audit: resident L1 entries sampled per tick and probed against the informer indexer (ABSENT → handed to the dep-event worker). Bounded O(sample) under the store mutex. Unset/unparseable/non-positive falls back to 512.",
+          "title": "Deps Reconcile Sample"
+        },
+        "DEPS_RECONCILE_PERIOD_SECONDS": {
+          "type": "string",
+          "description": "1.12.6 C3 sampled reconcile audit: seconds between ticks. \"0\" disables the periodic audit (GET /debug/reconcile stays available). Unset/unparseable falls back to 30.",
+          "title": "Deps Reconcile Period Seconds"
+        },
         "OTEL_ENABLED": {
           "type": "string",
           "description": "Master switch for OpenTelemetry export to ClickStack (traces + metrics over OTLP/HTTP). \"false\" restores a byte-identical pre-1.12.4 process. Per-signal overrides: OTEL_TRACING_ENABLED, OTEL_METRICS_ENABLED, OTEL_LOGS_ENABLED.",

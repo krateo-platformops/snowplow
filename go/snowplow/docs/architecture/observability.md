@@ -18,9 +18,10 @@ port the server listens on (`main.go` `server.Addr = :<port>`):
 4. **OTel export** — traces, metrics and logs to an OTLP collector,
    **default-off** behind the `OTEL_ENABLED` master switch (see below).
 
-Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage` and
-`GET /debug/refreshes` (the live-refresh subscription registry), and two probe
-endpoints used by the chart.
+Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage`,
+`GET /debug/refreshes` (the live-refresh subscription registry) and
+`GET /debug/reconcile` (1.12.6 C3 — the on-demand full reconcile audit, see the
+dependency-tracker section), and two probe endpoints used by the chart.
 
 > **Every `/debug/*` route needs a JWT (since 1.12.3).** The whole surface —
 > pprof, vars, servable, apistage, refreshes — is registered by
@@ -242,6 +243,22 @@ The stats that answer an invalidation question:
 | `records` / `max_records` | dep-record occupancy vs its ceiling | `records` well under `max_records` |
 | `dirty_mark_total` / `enqueue_update_total` | stale-while-revalidate marks from ADD/UPDATE and from DELETE buckets 2/3 | tracks cluster churn |
 | `add_propagated` / `add_dropped_pre_sync` / `add_nil_syncch` | the ADD initial-replay gate | `add_nil_syncch` should be **0** (a registration path skipped the syncCh allocation; dep marks for that GVR degrade to TTL) |
+| `reconcile_divergence_total` | **1.12.6 C3** — resident entries the sampled reconcile audit found whose own object is ABSENT from a synced indexer and that no event had evicted: each one is a DELETE the pipeline lost, re-derived from the indexer and handed to the dep-event worker (`internal/cache/deps_reconcile.go`) | **0** on a healthy cluster. A rate that does not fall back to zero between ticks means a handler, the queue or the relist bridge is dropping events — alert on it. The per-tick `cache.deps_reconcile.divergence` WARN names up to three coordinates |
+| `reconcile_sampled_total` / `reconcile_ticks_total` | coordinates probed by the audit (the denominator) / ticks run. Defaults `DEPS_RECONCILE_SAMPLE=512` every `DEPS_RECONCILE_PERIOD_SECONDS=30` (`"0"` disables the ticker) | `sampled` grows by ≤ 512 per tick; `ticks` grows by 2/min |
+| `reconcile_unknown_total` | coordinates the audit SKIPPED because the indexer was not authoritative for their GVR (unregistered, unsynced, watch broken, relist window). Never guessed | small; persistently large means entries are resident for GVRs that are not watched |
+| `reconcile_panics_total` | audit ticks that panicked (recovered; the ticker survives) | **0** |
+
+The audit is the safety net UNDER the event pipeline, not a replacement for it: it runs
+O(sample) under the store mutex per tick (`RangeMetadataSample`, a random window of the index —
+never the LRU head), probes OUTSIDE that lock (the store and watcher locks are never nested),
+and evicts only through the worker's own ABSENT verdict, so `evict_delete_total` moves for its
+evictions too.
+
+`GET /debug/reconcile` (JWT-gated like its siblings) runs ONE full walk on demand and returns
+the divergent set as metadata only (key hash / class / gvr / namespace / name — never a body).
+It is a reconcile, not a dry run: the entries it lists are evicted by the worker right after.
+Unlike the ticker, the full walk holds the store mutex for its whole duration (`RangeMetadata`),
+so it is something to call when a stranded entry is suspected, not something to poll.
 
 All of it is mirrored to OTLP as the `snowplow_deps` observable gauge, labelled by `stat`
 (`internal/metrics/metrics.go`).

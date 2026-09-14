@@ -610,6 +610,15 @@ func main() {
 					// its predicate via cache.SetCustomerInflightHook.
 					cache.SetCustomerInflightHook(dispatchers.CustomerInFlight)
 					cache.StartRefresher(cacheCtx)
+					// 1.12.6 C3 — the sampled reconcile audit: every
+					// DEPS_RECONCILE_PERIOD_SECONDS it samples
+					// DEPS_RECONCILE_SAMPLE resident L1 entries, probes each
+					// self coordinate against the informer indexer and hands
+					// every ABSENT one to the dep-event worker — the safety
+					// net under the event pipeline (a lost DELETE is caught
+					// within ~TTL/2 instead of TTL). Cache-off / period 0 is
+					// a no-op inside the Start fn. Process-lifetime cacheCtx.
+					cache.StartDepsReconcile(cacheCtx)
 					// Ship #91 / 0.30.211 — Lever C async invalidator worker.
 					// Bounded queue, drop-on-full. Receives raKey enqueues
 					// from the deps refresh hook for stuck-false memo

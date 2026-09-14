@@ -80,6 +80,10 @@ func TestDepsExpvar_PublishesEveryDocumentedStat(t *testing.T) {
 		"events_submitted_total", "dep_event_queue_depth", "delete_worker_panics_total",
 		"probe_exists_total", "probe_absent_total",
 		"probe_unknown_total", "probe_unknown_degraded_total",
+		// the sampled reconcile audit (1.12.6 C3) — reconcile_divergence_total
+		// is the pipeline-health number
+		"reconcile_ticks_total", "reconcile_sampled_total",
+		"reconcile_divergence_total", "reconcile_unknown_total", "reconcile_panics_total",
 	}
 	for _, k := range want {
 		if _, ok := stats[k]; !ok {
