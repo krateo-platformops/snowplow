@@ -591,6 +591,16 @@
           "description": "1.12.6 C3 sampled reconcile audit: seconds between ticks. \"0\" disables the periodic audit (GET /debug/reconcile stays available). Unset/unparseable falls back to 30.",
           "title": "Deps Reconcile Period Seconds"
         },
+        "REFRESH_DROP_EVICT_MAX_PER_MINUTE": {
+          "type": "string",
+          "description": "1.12.6 breaker on refresher drop-point evictions. A background refresh that fails deterministically across the whole requeue budget (403/500/timeout/parse failure/not-servable content call) evicts the stale entry instead of leaving it resident until TTL, up to this many evictions per minute; over budget the key keeps the pre-1.12.6 drop-to-TTL and one WARN per window flags a suspected mass failure. 0 disables drop-point eviction for non-404 failures (1.12.5 behaviour). The self-object 404 route is not subject to it.",
+          "title": "Refresh Drop-Evict Max Per Minute"
+        },
+        "REFRESH_SUPPRESS_AFTER_DECLINES": {
+          "type": "string",
+          "description": "1.12.6: consecutive stage-error refresh declines of one L1 key before the key is marked refresh-by-traffic-only (no further background re-resolves or WARNs until a real Put or an eviction clears the marker). Structurally permanent declines (external endpoint, userAccessFilter cell, unsupported kind) suppress on the first occurrence. Minimum 1.",
+          "title": "Refresh Suppress After Declines"
+        },
         "OTEL_ENABLED": {
           "type": "string",
           "description": "Master switch for OpenTelemetry export to ClickStack (traces + metrics over OTLP/HTTP). \"false\" restores a byte-identical pre-1.12.4 process. Per-signal overrides: OTEL_TRACING_ENABLED, OTEL_METRICS_ENABLED, OTEL_LOGS_ENABLED.",

@@ -959,6 +959,11 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 		entry.CreatedAt = time.Now()
 	}
 	bytes := entryBytes(entry)
+	// 1.12.6 C4 (§6.4) — a real Put is by definition the "next real Put" a
+	// refresh suppression waits for: clear the marker (and the consecutive-
+	// decline counter) BEFORE taking the store lock. Two sync.Map deletes,
+	// no allocation, no refresher construction.
+	clearRefreshSuppression(key)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1568,6 +1573,9 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	item := el.Value.(*lruItem)
 	delete(c.index, item.key)
 	c.order.Remove(el)
+	// 1.12.6 C4 (§6.4) — a refresh-suppression marker must not outlive its
+	// key (every eviction path but deleteForDep funnels through here).
+	clearRefreshSuppression(item.key)
 	// Ship 4a (0.30.198) — debit the correct budget. A pinned entry's bytes
 	// live in the resident region; a transient entry's in curBytes.
 	if item.entry != nil && item.entry.Pinned {
@@ -1638,6 +1646,10 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	item := el.Value.(*lruItem)
 	delete(c.index, item.key)
 	c.order.Remove(el)
+	// 1.12.6 C4 (§6.4) — this is the one eviction body that does NOT go
+	// through removeElementLocked; the marker must not outlive its key here
+	// either (TestRefreshTerminal_F6e).
+	clearRefreshSuppression(item.key)
 	// Ship 4a (0.30.198) — debit the correct budget (a DELETE can evict a
 	// pinned cell; the resident region is TTL/DELETE-evictable, only LRU-
 	// pressure spares it).

@@ -348,6 +348,12 @@ type refresher struct {
 	// workersWG lets test cleanup block until every worker goroutine
 	// has actually exited (Get returned shutdown).
 	workersWG sync.WaitGroup
+
+	// 1.12.6 C4 (§6.3) — the drop-point eviction breaker. See
+	// refresher_terminal.go. Constructed with the singleton from
+	// REFRESH_DROP_EVICT_MAX_PER_MINUTE; perMinute 0 means "never evict a
+	// non-404 deterministic failure" (today's drop-to-TTL, byte-for-byte).
+	dropEvict *dropEvictBreaker
 }
 
 var (
@@ -379,6 +385,7 @@ func refresherSingleton() *refresher {
 			queue:            workqueue.NewTypedRateLimitingQueue[string](rl),
 			clusterListQueue: workqueue.NewTypedRateLimitingQueue[string](clRL),
 			handlers:         map[string]RefreshFunc{},
+			dropEvict:        newDropEvictBreaker(RefreshDropEvictMaxPerMinute()),
 		}
 	})
 	return refresherInstance
@@ -769,6 +776,19 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	if c != nil {
 		entry, ok = c.Get(key)
 	}
+	// 1.12.6 C4 (§6.4) — SUPPRESSION consult, before the rate floor and
+	// before any resolve. A key marked refresh-by-traffic-only (K
+	// consecutive stage-error declines, or a structurally permanent decline)
+	// is Forgotten and skipped: no resolve, no WARN, the counter carries the
+	// rate. The marker is cleared by the next real Put of this key (a
+	// customer /call or the seed writes it), and by any eviction of it, so
+	// a suppressed key never outlives its entry. #191: 23 keys re-resolved
+	// every ~3 min forever because nothing ever stopped asking.
+	if _, suppressed := refreshSuppressed.Load(key); suppressed && ok {
+		q.Forget(key)
+		refreshSuppressedSkipsTotal.Add(1)
+		return true
+	}
 	if floor := r.rateFloor(); floor > 0 && ok && entry != nil {
 		if elapsed := time.Since(entry.CreatedAt); elapsed < floor {
 			// Floored: the entry's content is younger than the floor, so a
@@ -862,12 +882,49 @@ func (r *refresher) processNext(ctx context.Context) bool {
 				)
 				return true
 			}
+			// 1.12.6 C4 (§6.2 row 3, §6.3) — EVERY OTHER deterministic failure
+			// (403 / 500 / timeout / parse failure / apistage not-servable) that
+			// exhausts the same budget is now EVICTED at the same drop point,
+			// behind the breaker. A body whose basis cannot be re-resolved
+			// cannot be vouched for; "forget the key and keep the entry" is the
+			// one outcome the rule forbids. The bound is the SAME budget (~15.5 s
+			// of backoff at the defaults), so an apiserver blip that clears
+			// inside it never reaches this line.
+			//
+			// THE BREAKER is what makes this safe under an outage: over
+			// REFRESH_DROP_EVICT_MAX_PER_MINUTE the key keeps today's
+			// drop-to-TTL (entry resident and SERVED), the suspended counter
+			// ticks and one WARN per suspension window names the suspected
+			// outage. Budget "0" disables this branch entirely (byte-for-byte
+			// 1.12.5 for non-404 failures). Eviction routes through the dep
+			// tracker (RemoveL1Key clears the edges), never store.deleteForDep,
+			// and counts on its OWN counter so evict_delete_total stays the
+			// informer-DELETE-only H1 discriminator.
+			if r.dropEvict != nil {
+				if allowed, firstSuspend := r.dropEvict.allow(); allowed {
+					evicted := Deps().EvictSelfGone(key)
+					slog.Warn("refresher.refresh_dropped",
+						slog.String("subsystem", "cache"),
+						slog.String("key_hash", key),
+						slog.Int("requeues", maxRefreshRequeues),
+						slog.Bool("cluster_list_tier", fromCL),
+						slog.Bool("evicted", evicted),
+						slog.String("err", err.Error()),
+						slog.String("effect", "deterministic refresh failure — entry EVICTED (was: dropped to TTL outer-net); "+
+							"a body whose basis cannot be re-resolved cannot be vouched for (1.12.6 C4)"),
+					)
+					return true
+				} else if firstSuspend {
+					warnDropEvictSuspended(key, r.dropEvict.perMinute, fromCL)
+				}
+			}
 			slog.Warn("refresher.refresh_dropped",
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.Int("requeues", maxRefreshRequeues),
 				slog.Bool("cluster_list_tier", fromCL),
-				slog.String("effect", "deterministic refresh failure — key dropped to TTL outer-net, not retried"),
+				slog.String("effect", "deterministic refresh failure — key dropped to TTL outer-net, not retried "+
+					"(drop-point eviction disabled or suspended by the breaker)"),
 			)
 			return true
 		}
@@ -1049,6 +1106,8 @@ func resetRefresherForTest() {
 	}
 	refresherInstance = nil
 	refresherInit = sync.Once{}
+	// 1.12.6 C4 — suppression markers + counters are package state.
+	resetRefreshTerminalForTest()
 	// Ship #98 — also reset the customer-inflight hook so a previous
 	// test's hook does not leak into the next refresher singleton's
 	// yield decisions.
