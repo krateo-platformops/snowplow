@@ -1225,16 +1225,39 @@ type ResolvedEntryMeta struct {
 	Name      string `json:"name"`
 	// Stage is the apistage per-stage discriminator (itself a hash of the
 	// stage id + filter + dependsOn-output) — opaque, not content.
-	Stage       string `json:"stage,omitempty"`
-	AgeSeconds  int64  `json:"ageSeconds"`
-	TTLRemainingSeconds int64 `json:"ttlRemainingSeconds"`
-	Pinned      bool   `json:"pinned"`
+	Stage               string `json:"stage,omitempty"`
+	AgeSeconds          int64  `json:"ageSeconds"`
+	TTLRemainingSeconds int64  `json:"ttlRemainingSeconds"`
+	Pinned              bool   `json:"pinned"`
 	// ItemsCount is the LENGTH of the pre-parsed LIST envelope (0 when not a
 	// parsed-list apistage entry). A count only — never the items themselves.
 	ItemsCount int `json:"itemsCount"`
 	// RawJSONBytes is the LENGTH of the encoded body (for size diagnostics) —
 	// never the body.
 	RawJSONBytes int `json:"rawJSONBytes"`
+
+	// 1.12.5 / #187. BindingUID is the opaque cohort discriminator already
+	// folded into the key — a UID string, not a name, not a body. It answers
+	// "how many identity-scoped copies of this widget are resident", which
+	// #187 needed (the same widget was held under admin,
+	// system:gke-common-webhooks and system:kubestore-collector).
+	BindingUID string `json:"bindingUID,omitempty"`
+	// TTLOverrideSeconds is the per-entry override when one is stamped (UAF
+	// cells), 0 otherwise. It can only ever SHORTEN the effective TTL.
+	TTLOverrideSeconds int64 `json:"ttlOverrideSeconds,omitempty"`
+	// BodySHA256 is the hex SHA-256 of the encoded body. Populated ONLY for a
+	// single-key lookup (/debug/apistage?key_hash=...), never for the full
+	// walk — hashing every body under the store mutex would stall serving at
+	// 100K entries.
+	//
+	// A HASH, DELIBERATELY, NOT THE BODY. L1 cells are per-identity: the key
+	// folds BindingUID, so one widget is held once per cohort. Dumping a body
+	// to whoever holds the debug JWT would be a cross-identity read of rows
+	// that requester's own RBAC would have filtered — the /call path enforces
+	// that boundary and the debug path must not bypass it. The hash still
+	// answers the question that matters after an invalidation bug: "is this
+	// the SAME body as before, or was it re-resolved?"
+	BodySHA256 string `json:"bodySha256,omitempty"`
 }
 
 // RangeMetadata walks every live cached entry under c.mu (read-consistent
@@ -1273,7 +1296,9 @@ func (c *ResolvedCacheStore) RangeMetadata(fn func(ResolvedEntryMeta) bool) {
 			}
 			meta.TTLRemainingSeconds = int64(rem.Seconds())
 		}
+		meta.TTLOverrideSeconds = int64(entry.TTLOverride.Seconds())
 		if in := entry.Inputs; in != nil {
+			meta.BindingUID = in.BindingUID
 			meta.CacheEntryClass = in.CacheEntryClass
 			meta.Group = in.Group
 			meta.Version = in.Version
@@ -1287,6 +1312,66 @@ func (c *ResolvedCacheStore) RangeMetadata(fn func(ResolvedEntryMeta) bool) {
 			return
 		}
 	}
+}
+
+// MetadataForKey returns the metadata projection for ONE entry, plus the
+// hex SHA-256 of its body (1.12.5 / #187).
+//
+// Separate from RangeMetadata because of the hash: SHA-256 over every resident
+// body while holding the store mutex would stall serving at production entry
+// counts. Here the lock covers one entry.
+//
+// READ-ONLY, and deliberately NOT via Get: Get enforces TTL, bumps hit/miss
+// counters and moves the entry to the LRU front. A diagnostic must not make
+// the thing it measures look hotter than it is, nor evict it as a side effect
+// of being inspected. This walks the LRU list without touching order or
+// counters, exactly as RangeMetadata does.
+//
+// Returns ok=false when the key is not resident.
+func (c *ResolvedCacheStore) MetadataForKey(key string) (ResolvedEntryMeta, bool) {
+	var out ResolvedEntryMeta
+	if c == nil || key == "" {
+		return out, false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for el := c.order.Front(); el != nil; el = el.Next() {
+		item := el.Value.(*lruItem)
+		if item.key != key {
+			continue
+		}
+		entry := item.entry
+		out = ResolvedEntryMeta{
+			KeyHash:            item.key,
+			AgeSeconds:         int64(now.Sub(entry.CreatedAt).Seconds()),
+			Pinned:             entry.Pinned,
+			ItemsCount:         len(entry.Items),
+			RawJSONBytes:       len(entry.RawJSON),
+			TTLOverrideSeconds: int64(entry.TTLOverride.Seconds()),
+			BodySHA256:         fmt.Sprintf("%x", sha256.Sum256(entry.RawJSON)),
+		}
+		if eff := c.effectiveTTLLocked(entry); eff > 0 {
+			rem := eff - now.Sub(entry.CreatedAt)
+			if rem < 0 {
+				rem = 0
+			}
+			out.TTLRemainingSeconds = int64(rem.Seconds())
+		}
+		if in := entry.Inputs; in != nil {
+			out.BindingUID = in.BindingUID
+			out.CacheEntryClass = in.CacheEntryClass
+			out.Group = in.Group
+			out.Version = in.Version
+			out.Resource = in.Resource
+			out.Namespace = in.Namespace
+			out.Name = in.Name
+			out.Stage = in.Stage
+			out.Path = metaPathFromCoords(in.Group, in.Version, in.Resource, in.Namespace, in.Name)
+		}
+		return out, true
+	}
+	return out, false
 }
 
 // metaPathFromCoords builds an apiserver-style path string from GVR

@@ -243,6 +243,23 @@ The stats that answer an invalidation question:
 All of it is mirrored to OTLP as the `snowplow_deps` observable gauge, labelled by `stat`
 (`internal/metrics/metrics.go`).
 
+### Inspecting ONE resolved entry (1.12.5)
+`GET /debug/apistage?key_hash=<hex>` returns the metadata row for a single resident entry
+instead of the full walk, with two fields populated only on that path: `bodySha256` and the
+opaque `bindingUID`. It is how you answer "how old is this entry, and is its body the same one
+as before?" in one request — the question #187 had to infer from the client's subsequent child
+fetches because no surface could answer it directly.
+
+**It returns a hash, never the body, and that is a security boundary rather than a size
+choice.** L1 cells are per-identity: the key folds `BindingUID`, so on krateo-057 one widget
+was resident under `admin`, `system:gke-common-webhooks` and `system:kubestore-collector`.
+Returning a body to whoever holds the debug JWT would be a cross-identity read of rows that
+requester's own RBAC would have filtered. The hash still discriminates "re-resolved" from
+"unchanged".
+
+The lookup does NOT route through `Get`: that would enforce TTL, bump the hit counters and move
+the entry to the LRU front, so inspecting an entry would change it.
+
 ### Informer freshness — "is this indexer still current?" (1.12.5)
 Per-GVR on `/debug/servable` (`ServableGVRStatus`); aggregated to OTLP as
 `snowplow_informer_freshness`, labelled by stat.
