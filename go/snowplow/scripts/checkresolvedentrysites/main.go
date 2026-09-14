@@ -25,7 +25,7 @@
 //     "stamp all sites of a class or carry an explicit inline waiver": the
 //     out-of-scope sites (widgets / widgetContent / raFullList / seedOneWidget
 //     — reasoned out in the R-d-4 SITE MAP) carry the waiver; the in-scope
-//     restactions sites set the field. A future 11th Put site fails the gate
+//     restactions sites set the field. A future Put site fails the gate
 //     until its author consciously sets the field or writes the waiver.
 //
 //  2. Boot-scope STAMP sites — the readiness-critical boot-prewarm context

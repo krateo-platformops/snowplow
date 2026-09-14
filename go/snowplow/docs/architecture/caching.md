@@ -244,8 +244,11 @@ TTL is always `min(override, store TTL)`:
   RBAC-staleness window the per-object refilter can otherwise accumulate. Default 0 =
   disabled — the durable fix is the `RBACSubGen` key fold (§3.1).
 - **External-widget bounded-TTL (opt-in)** — see §4 step 4 and `external_ttl.go`.
-- **Partial-result TTL** — `partial_result_ttl.go`, a short TTL for deliberately-partial
-  bodies.
+
+(A third mechanism, the `PARTIAL_RESULT_TTL_SECONDS` bounded Put of a partial-with-errors
+body, was retired in 1.12.6 C9. It was default-off and never enabled on any deployment; a
+partial body is exactly the content §5.3 and the lifetime bound below exist to keep out of L1.
+The env var is now a retired flag: setting it to anything but `0` logs a startup WARN.)
 
 **Bounded lifetime (1.12.6, `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS`, default `"86400"`).** The
 TTL above is measured from `CreatedAt`, which *every* `Put` resets — a refresher re-Put or a

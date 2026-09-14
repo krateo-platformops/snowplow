@@ -102,6 +102,6 @@ lookup fires.
 - The companion correctness fix shipped alongside (snowplow 1.2.0): a per-item **feed/decode error
   on any served dispatch branch records into `errorKey` and does *not* truncate the resolve** (the
   #313 Option C-A contract). Its cache-side halves are live in the dispatcher: a stage-error
-  resolve serves 200 but declines the full-TTL Put (with the optional `PARTIAL_RESULT_TTL_SECONDS`
-  bounded-stale backstop, default off) — see
+  resolve serves 200 but declines the Put (the optional `PARTIAL_RESULT_TTL_SECONDS`
+  bounded-stale backstop that once accompanied the decline was retired in 1.12.6 C9) — see
   [`request-lifecycle.md`](../architecture/request-lifecycle.md) §3.

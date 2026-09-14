@@ -38,15 +38,5 @@ func BumpHTTPEdgeDepthStop() { httpEdgeDepthStopTotal.Add(1) }
 // HTTPEdgeDepthStop returns the process-wide depth-8 HTTP-edge backstop count.
 func HTTPEdgeDepthStop() uint64 { return httpEdgeDepthStopTotal.Load() }
 
-// partialServedStaleTotal — D (bounded partial-cache backstop) falsifier. Ticks
-// each time putPartialWithTTL Puts a declined partial-with-errors body under the
-// bounded PARTIAL_RESULT_TTL_SECONDS window (default-off ⇒ stays 0). The C6
-// falsifier reads this to prove D does NOT fire on the composition-resources path
-// once R converges it (Count()==0 → clean Put, not a D-Put).
-var partialServedStaleTotal atomic.Uint64
-
-// BumpPartialServedStale increments the D bounded-serve-stale counter.
-func BumpPartialServedStale() { partialServedStaleTotal.Add(1) }
-
-// PartialServedStale returns the process-wide D bounded-serve-stale Put count.
-func PartialServedStale() uint64 { return partialServedStaleTotal.Load() }
+// (1.12.6 C9: the D bounded-partial counter BumpPartialServedStale /
+// PartialServedStale that lived here was retired with partial_result_ttl.go.)

@@ -379,13 +379,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		cacheInputs.HasUAF = restactionHasUAFStage(&cr)
 	}
 	// THE UAF DECLINE IS FIRST IN THE CHAIN, and the position is load-bearing.
-	// TWO branches below this point also WRITE: the stage-error branch Puts a
-	// bounded partial via putPartialWithTTL (when PARTIAL_RESULT_TTL_SECONDS is
-	// set), and — in the widgets twin of this chain — the external-TTL branch
-	// Puts under an opt-in annotation. Placing the UAF gate only in front of the
-	// "genuine Put" branch would leave a UAF body reachable through either of
-	// those, under the same shared per-binding key. A per-requester-narrowed body
-	// must not be persisted by ANY branch, so the gate sits ahead of all of them.
+	// In the widgets twin of this chain the external-TTL branch below also
+	// WRITES (under an opt-in annotation); placing the UAF gate only in front
+	// of the "genuine Put" branch would leave a UAF body reachable through it,
+	// under the same shared per-binding key. A per-requester-narrowed body must
+	// not be persisted by ANY branch, so the gate sits ahead of all of them.
+	// (1.12.6 C9 retired the other writer this comment used to name — the
+	// PARTIAL_RESULT_TTL_SECONDS bounded-partial Put on the stage-error branch;
+	// that branch is now a bare decline.)
 	//
 	// The key this body would be stored under folds only BindingUID + RBACSubGen,
 	// so a co-bound user with a DIFFERENT per-object narrowing derives the SAME
@@ -408,23 +409,19 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.String("effect", "body served (200) narrowed for THIS requester; not persisted — a co-bound user would key onto the same cell and be served these rows (1.12.3 A-1; 1.13.0 folds the UAF scope into the key)"),
 		)
 	} else if stageErrSink.Count() > 0 {
-		// D (bounded partial-cache backstop, default-off) — instead of a bare
-		// decline, Put the partial under the SAME per-user cacheKey with a
-		// bounded PARTIAL_RESULT_TTL_SECONDS window so a residual un-cacheable RA
-		// does not re-storm cold every /call. No-op when PARTIAL_RESULT_TTL_SECONDS
-		// is 0 (default) → byte-identical to the pre-D bare decline. With R landed
-		// composition-resources resolves clean (Count()==0) so this branch is not
-		// even reached for it (C6). Post-serve: the body is written below either
-		// way; D only decides whether it is ALSO cached for the bounded window.
-		staleCached := putPartialWithTTL(cacheHandle, cacheKey, encoded, cacheInputs,
-			got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
+		// A bare decline: the partial body is SERVED (written below) and not
+		// persisted, so a transient item failure self-heals on the next
+		// resolve. 1.12.6 C9 retired the D bounded-partial Put that used to
+		// sit here (PARTIAL_RESULT_TTL_SECONDS, default-off, never enabled on
+		// any deployment): a partial-with-errors body is exactly the kind of
+		// wrong content the C4 terminal semantics and the C5 lifetime bound
+		// exist to keep OUT of L1, and a second, parallel TTL layer for it was
+		// one more mechanism to reason about for no measured gain.
 		log.Warn("RESTAction served with per-item stage error(s); declining to cache the partial result",
 			slog.String("name", cr.Name),
 			slog.String("namespace", cr.Namespace),
 			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.Bool("partial_bounded_stale_cached", staleCached),
-			slog.String("partial_ttl_s", partialResultTTL().String()),
-			slog.String("effect", "partial body served (200); not persisted under the full TTL — transient item failures self-heal on next resolve (D bounded-stale window if enabled)"),
+			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
 		)
 	} else if extTouchedSink.Count() > 0 {
 		// External-no-cache (proposal 2026-06-22) — the resolve touched a

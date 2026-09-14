@@ -52,6 +52,10 @@ import (
 type retiredFlag struct {
 	name     string
 	behavior string
+	// warnWhen, when non-nil, replaces the default "value == false" Warn
+	// trigger: it returns true for the values that mean the operator relied
+	// on behaviour that no longer exists (a silent change worth a WARN).
+	warnWhen func(val string) bool
 }
 
 // retiredFlags is the closed list of env keys folded into CACHE_ENABLED by
@@ -98,6 +102,19 @@ var retiredFlags = []retiredFlag{
 		name:     "PROACTIVE_RA_SEED_ENABLED",
 		behavior: "the proactive RESTAction seed is now implicit-on-cache; set CACHE_ENABLED=false to disable",
 	},
+	// RETIRED 1.12.6 C9 (design-1.12.6-event-hardening §10): the D bounded-
+	// partial Put layer (partial_result_ttl.go) is gone. The flag was default
+	// "0" (off) and never enabled on a deployment; a NON-zero value is the
+	// silent change — the operator asked for a bounded-stale partial cache and
+	// now gets a bare decline — so that is the Warn trigger, not "false".
+	{
+		name:     "PARTIAL_RESULT_TTL_SECONDS",
+		behavior: "the bounded partial-result cache layer was removed; a stage-error resolve is served and never cached (no replacement knob)",
+		warnWhen: func(val string) bool {
+			v := strings.TrimSpace(val)
+			return v != "" && v != "0"
+		},
+	},
 }
 
 // retiredFlagAuditedOnce guards warn-once-per-flag-per-process. Keyed by
@@ -128,7 +145,11 @@ func AuditRetiredFlags(log *slog.Logger) {
 		}
 		once := retiredFlagOnce(rf.name)
 		once.Do(func() {
-			if strings.EqualFold(strings.TrimSpace(val), "false") {
+			warn := strings.EqualFold(strings.TrimSpace(val), "false")
+			if rf.warnWhen != nil {
+				warn = rf.warnWhen(val)
+			}
+			if warn {
 				// Silent behavior change — the operator asked for OFF and
 				// now gets ON. Loud by design.
 				log.Warn("config.retired_flag_ignored",
