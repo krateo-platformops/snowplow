@@ -51,8 +51,14 @@ func registerCRDDiscoveryExpvar() {
 		expvar.Publish("snowplow_crd_discovery", expvar.Func(func() any {
 			s := CRDDiscoveryStatsSnapshot()
 			return map[string]uint64{
-				"events_enqueued":  s.EventsEnqueued,
-				"events_dropped":   s.EventsDropped,
+				"events_enqueued": s.EventsEnqueued,
+				"events_dropped":  s.EventsDropped,
+				// 1.12.5 / #187 — parked > 0 means the worker fell 256 events
+				// behind and the informer processor goroutine had to wait. A
+				// DROPPED lifecycle event is now a last resort after the park
+				// deadline; for a DELETE it means an informer is never torn
+				// down and its dependent L1 entries stay resident until TTL.
+				"events_parked":    s.EventsParked,
 				"events_processed": s.EventsProcessed,
 				// ADD + UPDATE path
 				"discovery_invoked":    s.DiscoveryInvoked,

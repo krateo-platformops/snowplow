@@ -116,7 +116,8 @@ type crdDiscovery struct {
 	// Counters — observability for the falsifier + ops dashboards.
 	// All atomic for lock-free reads.
 	eventsEnqueued     atomic.Uint64 // lifecycle events accepted into the queue (ADD + UPDATE + DELETE)
-	eventsDropped      atomic.Uint64 // lifecycle events dropped (queue full)
+	eventsDropped      atomic.Uint64 // lifecycle events dropped (park deadline exceeded, or shutdown)
+	eventsParked       atomic.Uint64 // 1.12.5 #187: submits that had to park on a full queue
 	eventsProcessed    atomic.Uint64 // lifecycle events drained by the worker
 	discoveryInvoked   atomic.Uint64 // ADD+UPDATE calls that reached DiscoverGroupResources
 	discoverySkippedNG atomic.Uint64 // ADD+UPDATE calls skipped (no group / decode-fail / no SA rc)
@@ -272,21 +273,82 @@ func (c *crdDiscovery) processEvent(ev crdDiscoveryEvent) {
 // parameter lets the worker dispatch to ADD/UPDATE/DELETE paths.
 func (c *crdDiscovery) submitCRDLifecycleEvent(obj interface{}, kind crdLifecycleKind) {
 	c.startCRDDiscoveryWorker()
+	ev := crdDiscoveryEvent{obj: obj, kind: kind}
+
+	// Fast path: room in the queue, no parking, byte-identical to before.
 	select {
-	case c.queue <- crdDiscoveryEvent{obj: obj, kind: kind}:
+	case c.queue <- ev:
 		c.eventsEnqueued.Add(1)
+		return
 	default:
+	}
+
+	// 1.12.5 / #187 — PARK, DO NOT DROP.
+	//
+	// The pre-1.12.5 behaviour dropped the event here. The rationale on the
+	// books was about ADD/UPDATE: DiscoverGroupResources is singleflighted
+	// per-group, so a duplicate for an in-flight group is harmless. That
+	// reasoning does not extend to DELETE, and DELETE is the event class #187
+	// is about. A dropped CRD DELETE means triggerCRDDelete never runs: the
+	// per-resource informer is never torn down and dependent L1 entries are
+	// never dirty-marked, so every entry of that type is stale until TTL with
+	// no further trigger. That is a live carrier for the #187 class, and it is
+	// silent apart from one WARN.
+	//
+	// So a full queue now PARKS the caller until the worker makes room,
+	// bounded by crdLifecycleParkMax. Parking blocks the informer processor
+	// goroutine, which is a real cost — but the alternative is losing an
+	// invalidation, and the queue only fills when the worker is already behind
+	// by 256 events.
+	//
+	// NOT INLINE. Running processEvent here instead would put the
+	// network-bound DiscoverGroupResources hop on the informer processor
+	// goroutine, which is the exact thing the bounded-worker design exists to
+	// prevent (PM tightening #1). Park against the worker seam; never bypass
+	// it.
+	//
+	// The drop remains only as a last resort after the park deadline, so a
+	// wedged worker cannot stall event delivery for the whole process
+	// indefinitely. Reaching it means something is badly wrong and the WARN
+	// says so.
+	c.eventsParked.Add(1)
+	slog.Warn("cache.crd_discovery.queue_parked",
+		slog.String("subsystem", "cache"),
+		slog.String("kind", crdLifecycleKindString(kind)),
+		slog.Duration("park_max", crdLifecycleParkMax),
+		slog.String("hint", "CRD lifecycle burst outran the discovery worker — parking the "+
+			"informer processor goroutine rather than dropping the event; a dropped DELETE "+
+			"would leave an informer un-torn-down and its dependent L1 entries stale to TTL."),
+	)
+
+	timer := time.NewTimer(crdLifecycleParkMax)
+	defer timer.Stop()
+	select {
+	case c.queue <- ev:
+		c.eventsEnqueued.Add(1)
+	case <-c.stopCh:
+		// Shutting down: the worker is going away, nothing will process this.
 		c.eventsDropped.Add(1)
-		slog.Warn("cache.crd_discovery.event_dropped",
+	case <-timer.C:
+		c.eventsDropped.Add(1)
+		slog.Error("cache.crd_discovery.event_dropped",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", crdLifecycleKindString(kind)),
-			slog.String("hint", "CRD lifecycle burst outran the discovery worker — "+
-				"DiscoverGroupResources is singleflighted per-group so a duplicate "+
-				"for an in-flight group is harmless; a new group will be retried "+
-				"on the next CRD event or walker pass."),
+			slog.Duration("parked", crdLifecycleParkMax),
+			slog.String("effect", "the discovery worker did not drain a single slot within the "+
+				"park deadline — event DROPPED. For a DELETE this means the per-resource "+
+				"informer is not torn down and its dependent L1 entries stay resident until "+
+				"TTL (#187). Investigate the worker."),
 		)
 	}
 }
+
+// crdLifecycleParkMax bounds how long submitCRDLifecycleEvent will park the
+// informer processor goroutine on a full queue before giving up and dropping
+// the event (1.12.5 / #187). Long enough that any realistic burst drains —
+// the worker's per-event work is a singleflighted discovery hop — and short
+// enough that a wedged worker cannot stall event delivery forever.
+const crdLifecycleParkMax = 30 * time.Second
 
 // crdLifecycleKindString renders the enum as a human-readable label for
 // log lines + WARNs. Closed-set; default falls back to "unknown" rather
@@ -932,6 +994,7 @@ func warnOnceCRDDecodeSkip(obj interface{}, kind crdLifecycleKind) {
 type CRDDiscoveryStats struct {
 	EventsEnqueued     uint64
 	EventsDropped      uint64
+	EventsParked       uint64 // 1.12.5 #187: submits that parked on a full queue
 	EventsProcessed    uint64
 	DiscoveryInvoked   uint64 // ADD + UPDATE (DiscoverGroupResources calls)
 	DiscoverySkippedNG uint64 // ADD + UPDATE decode-skip / no-group / no-SA-rc
@@ -953,6 +1016,7 @@ func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
 	return CRDDiscoveryStats{
 		EventsEnqueued:     c.eventsEnqueued.Load(),
 		EventsDropped:      c.eventsDropped.Load(),
+		EventsParked:       c.eventsParked.Load(),
 		EventsProcessed:    c.eventsProcessed.Load(),
 		DiscoveryInvoked:   c.discoveryInvoked.Load(),
 		DiscoverySkippedNG: c.discoverySkippedNG.Load(),
