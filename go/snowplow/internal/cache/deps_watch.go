@@ -308,6 +308,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 			}
 			ns, name := metaNSName(obj)
 			w.counters.addPropagated.Add(1)
+			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
 			Deps().OnAdd(gvr, ns, name)
 			// Ship 0.30.233 — CRD-ADD discovery side-effect.
 			// Dispatches to the bounded worker channel so the
@@ -323,6 +324,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 		},
 		UpdateFunc: func(_, newObj interface{}) {
 			ns, name := metaNSName(newObj)
+			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
 			Deps().OnUpdate(gvr, ns, name)
 			// Ship L / 0.30.246 — CRD UPDATE lifecycle hook. A CRD
 			// UPDATE may add a new served version, retire one, or
@@ -346,6 +348,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 				obj = tomb.Obj
 			}
 			ns, name := metaNSName(obj)
+			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
 			// R3: hand off to the worker — never run the eviction burst
 			// inline on this informer processor goroutine.
 			w.submitDeleteEvent(depDeleteEvent{gvr: gvr, namespace: ns, name: name})

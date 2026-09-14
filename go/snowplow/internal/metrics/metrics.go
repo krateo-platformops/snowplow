@@ -534,6 +534,19 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- 1.12.5 / #187: informer FRESHNESS, the half servability does not
+	// express. HasSynced says an informer finished its initial LIST once and
+	// stays true forever; it cannot say whether the indexer still matches the
+	// cluster. Aggregate, not per-GVR: ~169 informers x 3 gauges would be a
+	// ~500-series cardinality regression of exactly the class 1.12.4 had to
+	// cap. The per-GVR rows stay on /debug/servable.
+	informerFreshness, err := m.Int64ObservableGauge(
+		"snowplow_informer_freshness",
+		metric.WithDescription("Informer freshness aggregates, labelled by stat: total indexed objects, GVRs that have never received an event, the oldest last-event age, and GVRs stale over an hour."))
+	if err != nil {
+		return err
+	}
+
 	// --- build identity, so every other panel can be pinned to a commit.
 	buildInfo, err := m.Int64ObservableGauge(
 		"snowplow_build_info",
@@ -755,6 +768,18 @@ func registerInstruments(m metric.Meter, build string) error {
 				metric.WithAttributes(attribute.String("state", state)))
 		}
 
+		// --- 1.12.5: informer freshness aggregates ---
+		fr := cache.InformerFreshnessSnapshotGlobal()
+		for stat, v := range map[string]int64{
+			"indexer_objects":       fr.IndexerObjects,
+			"gvrs_never_event":      fr.GVRsNeverEvent,
+			"max_event_age_seconds": fr.MaxEventAgeSecs,
+			"gvrs_stale_over_hour":  fr.GVRsStaleOverHour,
+		} {
+			o.ObserveInt64(informerFreshness, v,
+				metric.WithAttributes(attribute.String("stat", stat)))
+		}
+
 		// --- 1.12.4: build identity, constant 1 ---
 		o.ObserveInt64(buildInfo, 1,
 			metric.WithAttributes(attribute.String("version", buildLabel(build))))
@@ -791,7 +816,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		fallthroughCells, diagnosticTotal, diagnosticCells, seriesTruncated,
 		readyzBackstop, resolvedCache, informerServable, buildInfo,
 		// --- 1.12.5 ---
-		depsStats,
+		depsStats, informerFreshness,
 	)
 	return err
 }

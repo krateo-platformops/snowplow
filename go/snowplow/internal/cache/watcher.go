@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -147,6 +148,20 @@ type ResourceWatcher struct {
 	// HasSynced=true over an empty result; without this conjunct the
 	// pivot would serve [] as servable=true (the S4 regression).
 	confirmed map[schema.GroupVersionResource]struct{}
+
+	// lastEventAt records, per GVR, the wall-clock nanosecond of the most
+	// recent ADD/UPDATE/DELETE the informer bridge delivered for it
+	// (1.12.5 / #187). It is the freshness half of the servability picture:
+	// HasSynced says an informer finished its initial LIST once, and says
+	// nothing about whether it has heard anything since. A GVR whose objects
+	// churn but whose lastEventAt is hours old has a dead watch that
+	// watchBroken did not catch.
+	//
+	// sync.Map of *atomic.Int64, NOT a plain map under rw.mu: this is written
+	// on the informer processor goroutine for EVERY event, and taking the
+	// watcher's write mutex there would serialise all event delivery behind
+	// the same lock the registration paths hold.
+	lastEventAt sync.Map // map[schema.GroupVersionResource]*atomic.Int64
 
 	// lastSyncRV tracks the per-GVR LastSyncResourceVersion observed by
 	// the most recent discovery refresh. Used to detect a successful
@@ -1568,6 +1583,7 @@ func (rw *ResourceWatcher) closePerGVRStopLocked(gvr schema.GroupVersionResource
 //     standalone informer that re-LISTs under the now-current CRD schema
 //     (the relist fires only AFTER AddNavigationDiscoveredGroup, so the
 //     re-add takes the standalone path, never a frozen shared-factory one).
+//
 // Lazy registrations run their (standalone) informer on the per-GVR
 // channel, so closing it genuinely stops the Run goroutine. The four RBAC
 // bootstrap GVRs are factory-driven on rw.stopCh and are structurally never
@@ -2015,6 +2031,7 @@ func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, 
 //     list-level RV). Leaving it empty is the honest, drift-free choice.
 //   - metadata.continue is empty and remainingItemCount is nil — identical
 //     to the live path, which clears both on the accumulated list.
+//
 // The dev's byte-parity golden asserts items-equality + envelope-shape-
 // equality against a live LIST modulo these two fields (see the 1a
 // falsifier). No per-GVR carve-out — uniform over every servable GVR
@@ -2499,6 +2516,39 @@ var (
 	globalMu      sync.RWMutex
 	globalWatcher *ResourceWatcher
 )
+
+// noteInformerEvent stamps the per-GVR last-event clock (1.12.5 / #187).
+// Called from the informer bridge's Add/Update/Delete handlers, i.e. on the
+// informer processor goroutine, so it must stay allocation-free on the repeat
+// path: after the first event for a GVR this is one sync.Map load plus one
+// atomic store.
+func (rw *ResourceWatcher) noteInformerEvent(gvr schema.GroupVersionResource) {
+	if rw == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	if v, ok := rw.lastEventAt.Load(gvr); ok {
+		v.(*atomic.Int64).Store(now)
+		return
+	}
+	stamp := &atomic.Int64{}
+	stamp.Store(now)
+	actual, _ := rw.lastEventAt.LoadOrStore(gvr, stamp)
+	actual.(*atomic.Int64).Store(now)
+}
+
+// lastEventUnixNano returns the last-event stamp for gvr, or 0 if the bridge
+// has never delivered an event for it.
+func (rw *ResourceWatcher) lastEventUnixNano(gvr schema.GroupVersionResource) int64 {
+	if rw == nil {
+		return 0
+	}
+	v, ok := rw.lastEventAt.Load(gvr)
+	if !ok {
+		return 0
+	}
+	return v.(*atomic.Int64).Load()
+}
 
 // SetGlobal wires rw as the process-scoped ResourceWatcher. Called once
 // from main.go after NewResourceWatcher succeeds. Passing nil clears

@@ -243,6 +243,27 @@ The stats that answer an invalidation question:
 All of it is mirrored to OTLP as the `snowplow_deps` observable gauge, labelled by `stat`
 (`internal/metrics/metrics.go`).
 
+### Informer freshness — "is this indexer still current?" (1.12.5)
+Per-GVR on `/debug/servable` (`ServableGVRStatus`); aggregated to OTLP as
+`snowplow_informer_freshness`, labelled by stat.
+
+The four servability conjuncts say whether an informer is ALLOWED to serve. None of them says
+whether what it holds is CURRENT — `hasSynced` latches true the moment the initial LIST
+completes and never goes back. During #187 the central question, "does this indexer still hold
+the object the apiserver says is deleted?", had no field on any surface.
+
+| field (per GVR) | meaning | healthy range |
+|---|---|---|
+| `indexerCount` | objects the informer's store holds right now | compare against `kubectl get <resource> -A`; a divergence **is** the staleness, no inference needed |
+| `lastSyncResourceVersion` | RV the most recent discovery refresh observed. Tracked internally since 0.30.x to clear `watchBroken` on a successful relist; never published until 1.12.5 | advances across relists |
+| `lastEventAgeSeconds` | seconds since the bridge last delivered ANY event for this GVR; **-1 means never** | a GVR whose objects churn but whose age keeps climbing has a dead watch `watchBroken` did not catch |
+
+The OTLP mirror is **aggregate, not per-GVR** — a production cluster carries ~169 registered
+informers, so three per-GVR gauges would add ~500 series per collection interval, the same
+cardinality class 1.12.4 had to cap. Stats: `indexer_objects`, `gvrs_never_event`,
+`max_event_age_seconds`, `gvrs_stale_over_hour`. The dashboard says *something* is stale; the
+JWT-gated `/debug/servable` route says which.
+
 ### Upstream controller health — "is snowplow broken, or is an upstream controller crash-looping?"
 Defined in `internal/cache/controller_health_expvar.go` / `controller_health.go`.
 
