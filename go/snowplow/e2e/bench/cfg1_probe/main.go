@@ -23,8 +23,17 @@ import (
 	"net/http"
 	"os"
 
-	// Side-effect import: trigger cache package init().
+	// Side-effect imports: trigger the init() of EVERY package that owns a
+	// CFG-1-gated expvar publisher, so the falsifier's derived key set is
+	// observable from one process. #192 (1.12.6 C0): the structural test
+	// (cfg1_structural_test.go) asserts via `go list -deps` that every
+	// gated package is in this binary's import graph — adding a gated
+	// publisher in a package not listed here fails that test, which is the
+	// point: the hand-maintained list below is checked, not trusted.
 	_ "github.com/krateo-platformops/snowplow/internal/cache"
+	_ "github.com/krateo-platformops/snowplow/internal/dynamic"
+	_ "github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
+	_ "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 )
 
 func main() {
