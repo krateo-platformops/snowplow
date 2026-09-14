@@ -325,6 +325,43 @@ every L1 eviction path (LRU/TTL/DELETE) calls `Deps().RemoveL1Key` so dep record
 their entry. The dep-record forward map is bounded (`DEPS_MAX_RECORDS`); on cap it drops new
 records silently and relies on TTL for correctness.
 
+### 5.1 The refresher's self-object 404 (1.12.5, #187)
+
+An informer DELETE is not the only way snowplow learns an object is gone. A background refresh
+re-fetches the entry's own CR before re-resolving it; when that re-fetch returns a **definite
+apiserver 404**, the object is gone and the entry is the resolved representation of something
+that no longer exists. Since 1.12.5 that case **EVICTS**, through
+`DepTracker.EvictSelfGone` — the same tracker route `OnDelete` uses, so `RemoveL1Key` clears
+the dep edges alongside the store delete and the eviction lands on the same
+`evict_delete_total`.
+
+Before 1.12.5 the 404's status code was discarded, the error was treated as retryable, and
+after `maxRefreshRequeues = 5` the key was dropped (`refresher.refresh_dropped`) with the stale
+body resident for the rest of the 1 h TTL.
+
+Three bounds keep this narrow, and each has its own falsifier arm
+(`dispatchers/issue187_self_notfound_evict_test.go`):
+
+- **Only a definite 404.** A 403, a 500, a timeout or a parse failure keeps the requeue. An
+  apiserver hiccup or an RBAC blip must never evict a slice of L1 at once.
+- **Never a synthesised 404.** Under `cache.WithInformerOnlyReads`, `objects.Get` fabricates a
+  NotFound without asking the apiserver; that means "absent from the indexer", which is the
+  CRD-re-registration transient, not a deletion.
+- **Only the self object, structurally.** The sentinel is wrapped at exactly one site — the
+  re-fetch of the CR named by the entry's own `Inputs`, which runs before the resolver, so no
+  inner call can reach it. The gate is `errors.Is`, never string matching. An inner call's
+  NotFound stays bucket 2/3: a child vanishing dirty-marks the parent, it never evicts it.
+
+This widens the set of authorised eviction *triggers* without widening the rule: a confirmed
+404 on the entry's own object is a deletion observation, the same fact the informer event
+carries, arriving by a different route.
+
+Two operational notes from #187: the DELETE hand-off worker recovers **per event**, so one
+panicking `OnDelete` costs exactly one eviction rather than killing DELETE handling
+process-wide; and the tracker's counters are published at `/debug/vars` under `snowplow_deps`
+(see `docs/architecture/observability.md`), because at `LOG_LEVEL=warn` the old INFO-only
+summary made "did invalidation stop?" unanswerable from a live pod.
+
 ---
 
 ## 6. Invariants
