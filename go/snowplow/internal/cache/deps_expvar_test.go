@@ -75,9 +75,11 @@ func TestDepsExpvar_PublishesEveryDocumentedStat(t *testing.T) {
 		"evict_self_gone_total", "self_notfound_evict_total",
 		// informer bridge: ADD gate
 		"add_propagated", "add_dropped_pre_sync", "add_nil_syncch",
-		// informer bridge: DELETE worker — the #187 H1 surface
-		"delete_queue_depth", "delete_queue_cap",
-		"delete_queue_full_total", "delete_worker_panics_total",
+		// informer bridge: the unified dep-event worker (1.12.6 C1) — the
+		// #187 H1 surface plus the probe outcomes
+		"events_submitted_total", "dep_event_queue_depth", "delete_worker_panics_total",
+		"probe_exists_total", "probe_absent_total",
+		"probe_unknown_total", "probe_unknown_degraded_total",
 	}
 	for _, k := range want {
 		if _, ok := stats[k]; !ok {
@@ -85,10 +87,13 @@ func TestDepsExpvar_PublishesEveryDocumentedStat(t *testing.T) {
 				"on a dashboard rather than as an alert (got %v)", k, stats)
 		}
 	}
-	// The queue capacity is a constant of the build; a zero here means the
-	// bridge singleton was not read at all and every other number is suspect.
-	if stats["delete_queue_cap"] != int64(deleteEvictQueueDepth) {
-		t.Errorf("delete_queue_cap = %d, want %d", stats["delete_queue_cap"], deleteEvictQueueDepth)
+	// 1.12.6 C1 retired the bounded-channel surface: the typed workqueue has no
+	// capacity and no overflow case, so these keys must be GONE, not zero — a
+	// dashboard still reading them would show a healthy "0" forever.
+	for _, retired := range []string{"delete_queue_depth", "delete_queue_cap", "delete_queue_full_total"} {
+		if _, ok := stats[retired]; ok {
+			t.Errorf("snowplow_deps still publishes retired stat %q (1.12.6 C1 §3.5)", retired)
+		}
 	}
 }
 
@@ -134,7 +139,7 @@ func TestDepsExpvar_TracksRealEvictionAndPanic(t *testing.T) {
 	})
 	d.Record("L1_other", gvr, "ns", "panicky")
 
-	h := syncedWatcher(gvr).depEventHandlers(gvr)
+	h := syncedWatcher(t, gvr).depEventHandlers(gvr)
 	h.DeleteFunc(unstructuredObj(gvr, "ns", "panicky"))
 	h.DeleteFunc(unstructuredObj(gvr, "ns", "evictme"))
 	waitQuiet()

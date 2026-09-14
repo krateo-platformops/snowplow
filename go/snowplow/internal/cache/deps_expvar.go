@@ -130,10 +130,25 @@ func DepsStatsByStat() map[string]int64 {
 		"add_dropped_pre_sync": int64(w.AddDroppedPreSync),
 		"add_nil_syncch":       int64(w.AddNilSyncCh),
 
-		// --- the informer bridge: DELETE worker (the #187 H1 surface) ---
-		"delete_queue_depth":         int64(w.DeleteQueueDepth),
-		"delete_queue_cap":           int64(w.DeleteQueueCap),
-		"delete_queue_full_total":    int64(w.DeleteQueueFull),
+		// --- the informer bridge: the unified dep-event worker (1.12.6 C1) ---
+		// events_submitted_total counts coordinates enqueued by all three
+		// handlers. dep_event_queue_depth is the live pending count on the
+		// typed workqueue (unbounded, dedup'd — the 1.12.5 delete_queue_cap /
+		// delete_queue_full_total surface is RETIRED: there is no overflow
+		// case any more). delete_worker_panics_total keeps its 1.12.5 name —
+		// it is still the "an action was LOST" signature the H1 procedure
+		// reads; the worker it names is now the dep-event worker.
+		"events_submitted_total":     int64(w.EventsSubmitted),
+		"dep_event_queue_depth":      int64(w.DeleteQueueDepth),
 		"delete_worker_panics_total": int64(w.DeleteWorkerPanics),
+		// probe outcomes: what the worker derived each action from.
+		// probe_unknown_total is the rate at which the indexer was not
+		// authoritative (relist windows, unsynced informers);
+		// probe_unknown_degraded_total counts budget exhaustions — NON-ZERO
+		// MEANS AN INFORMER IS NOT RECOVERING. Alert on it.
+		"probe_exists_total":           int64(w.ProbeExists),
+		"probe_absent_total":           int64(w.ProbeAbsent),
+		"probe_unknown_total":          int64(w.ProbeUnknown),
+		"probe_unknown_degraded_total": int64(w.ProbeUnknownDegraded),
 	}
 }

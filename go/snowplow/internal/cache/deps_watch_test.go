@@ -25,8 +25,10 @@ import (
 // bridge test starts clean. Returns the cleanup func.
 func withCleanDepWatch(t *testing.T) func() {
 	t.Helper()
-	resetDepsForTest()
+	// Worker first, tracker second — the worker reads Deps() on its own
+	// goroutine (1.12.6 C1), so the tracker must not be reset under it.
 	resetDepWatchForTest()
+	resetDepsForTest()
 	return func() {
 		resetDepWatchForTest()
 		resetDepsForTest()
@@ -86,30 +88,42 @@ func TestACR1a_AddPostSyncDirtyMarksListDep(t *testing.T) {
 	defer cleanup()
 
 	gvr := gvrCompositions()
-	rw := newGateWatcher()
-	// syncCh CLOSED ⇒ informer is post-sync.
-	ch := make(chan struct{})
-	close(ch)
-	rw.syncCh[gvr] = ch
-
-	handlers := rw.depEventHandlers(gvr)
+	// 1.12.6 C1: a REAL synced informer (post-sync ⇒ the gate passes) whose
+	// indexer holds the object, so the worker's probe reads objExists and
+	// dirty-marks — exactly the production ADD path.
+	rw, dyn := realWatcher(t, gvr)
 
 	const adminL1 = "L1_admin_list"
 	d := Deps()
 	d.RecordList(adminL1, gvr, "bench-ns-07")
-	var marked []string
-	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { marked = append(marked, k) })
+	marked := make(chan string, 8)
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { marked <- k })
 
-	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-07", "fresh-obj"))
+	// The ADD is delivered by the REAL informer (its handler set is the same
+	// depEventHandlers closure production wires): creating the object on the
+	// fake cluster after sync fires a post-sync AddFunc.
+	before := DepWatchStatsSnapshot()
+	createObj(t, rw, dyn, gvr, "bench-ns-07", "fresh-obj", "x")
 
-	if got := DepWatchStatsSnapshot().AddPropagated; got != 1 {
-		t.Fatalf("AC-R1a: addPropagated=%d want 1", got)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && DepWatchStatsSnapshot().AddPropagated == before.AddPropagated {
+		time.Sleep(5 * time.Millisecond)
 	}
-	if got := DepWatchStatsSnapshot().AddDroppedPreSync; got != 0 {
-		t.Fatalf("AC-R1a: addDroppedPreSync=%d want 0 (post-sync ADD must propagate)", got)
+	if got := DepWatchStatsSnapshot().AddPropagated - before.AddPropagated; got != 1 {
+		t.Fatalf("AC-R1a: addPropagated delta=%d want 1", got)
 	}
-	if len(marked) != 1 || marked[0] != adminL1 {
-		t.Fatalf("AC-R1a: post-sync ADD did not dirty-mark the LIST-scope dep; got %v", marked)
+	if got := DepWatchStatsSnapshot().AddDroppedPreSync - before.AddDroppedPreSync; got != 0 {
+		t.Fatalf("AC-R1a: addDroppedPreSync delta=%d want 0 (post-sync ADD must propagate)", got)
+	}
+	// The dirty-mark now happens on the dep-event worker (off the informer
+	// processor goroutine), so wait for it rather than read it inline.
+	select {
+	case k := <-marked:
+		if k != adminL1 {
+			t.Fatalf("AC-R1a: post-sync ADD dirty-marked %q, want %q", k, adminL1)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("AC-R1a: post-sync ADD did not dirty-mark the LIST-scope dep within 3s")
 	}
 }
 
@@ -168,7 +182,9 @@ func TestR3_DeleteFuncDispatchesViaWorker(t *testing.T) {
 	})
 	d.Record(l1Key, gvr, "ns", "victim")
 
-	rw := newGateWatcher()
+	// 1.12.6 C1: a REAL synced informer that never held "victim", so the
+	// worker's probe reads objAbsent and evicts the self-representation.
+	rw, _ := realWatcher(t, gvr)
 	handlers := rw.depEventHandlers(gvr)
 
 	// Fire DELETE through the handler — it hands off to the worker.

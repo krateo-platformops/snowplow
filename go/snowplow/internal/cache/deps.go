@@ -622,110 +622,75 @@ func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
 	}
 }
 
-// OnAdd is invoked by the watcher when an informer ADD event arrives
-// for (gvr, namespace, name) — gated post-sync by the watcher's
-// AddFunc (initial-replay ADDs are dropped before they reach here).
-//
-// R1 (0.30.110): ADD == UPDATE. A freshly-created object can satisfy a
-// LIST-scope dependency that resolved to an empty/partial result before
-// the object existed; the dependent L1 entry is now stale and must be
-// dirty-marked (enqueued into the refresher). ADD NEVER evicts —
-// per feedback_l1_invalidation_delete_only.md eviction is DELETE-only.
-//
-// Returns the number of dependent L1 keys dirty-marked.
-func (d *DepTracker) OnAdd(gvr schema.GroupVersionResource, namespace, name string) int {
-	return d.onChange("ADD", gvr, namespace, name)
+// objectState is what the dep-event worker derived about an object at the
+// moment it processed the coordinate (1.12.6 C1, design §3.3). It is the
+// ONLY input OnObjectEvent uses to choose between evict and dirty-mark.
+type objectState uint8
+
+const (
+	// objUnknown — the informer indexer is not authoritative for the GVR
+	// (torn down, not synced, watch broken, type unconfirmed, passthrough).
+	// The worker requeues on the shared budget; OnObjectEvent never sees it.
+	objUnknown objectState = iota
+	// objExists — the informer is servable and its indexer holds the object.
+	objExists
+	// objAbsent — the informer is servable and its indexer does NOT hold the
+	// object: deleted. The only state that evicts a self-representation.
+	objAbsent
+	// objUnknownDegraded — objUnknown for the whole requeue budget; the
+	// worker degrades to a dirty-mark so the refresher's re-fetch decides
+	// against the apiserver (a definite 404 evicts at the drop point).
+	objUnknownDegraded
+)
+
+func (s objectState) String() string {
+	switch s {
+	case objExists:
+		return "EXISTS"
+	case objAbsent:
+		return "ABSENT"
+	case objUnknownDegraded:
+		return "UNKNOWN_DEGRADED"
+	default:
+		return "UNKNOWN"
+	}
 }
 
-// OnUpdate is invoked by the watcher when an informer UPDATE/PATCH
-// event arrives for (gvr, namespace, name). It dirty-marks every
-// dependent L1 key into the refresher (stale-while-revalidate). Returns
-// the number of L1 keys dirty-marked. NEVER evicts.
+// OnObjectEvent is the single decision site of the event-driven L1
+// invalidation (1.12.6 C1). The dep-event worker calls it with the
+// coordinate an informer event announced and the object's CURRENT state,
+// probed from the informer at processing time — never with the event type.
 //
-// Per feedback_l1_invalidation_delete_only.md, UPDATE/PATCH use
-// stale-while-revalidate via the refresher; eviction would violate the
-// rule.
-func (d *DepTracker) OnUpdate(gvr schema.GroupVersionResource, namespace, name string) int {
-	return d.onChange("UPDATE", gvr, namespace, name)
-}
-
-// onChange is the shared body of OnAdd + OnUpdate (R1: ADD == UPDATE).
-// It dirty-marks every dependent L1 key — both exact-object deps and
-// LIST-scope deps — by enqueuing them into the refresher. It NEVER
-// evicts.
-func (d *DepTracker) onChange(eventType string, gvr schema.GroupVersionResource, namespace, name string) int {
+// Every matched L1 entry falls into exactly one bucket (R2/R7 contract,
+// unchanged since 0.30.110):
+//
+//  1. self-representation — the entry's OWN dispatched object is this
+//     object. EVICT iff state == objAbsent (the object is gone). When the
+//     object exists — a same-name recreate, a late duplicate DELETE, an
+//     UPDATE — the entry is DIRTY-MARKED (stale-while-revalidate), never
+//     evicted: this is what makes duplicates idempotent and a late DELETE
+//     harmless to a correct fresh entry.
+//  2. LIST-dep — matched via the (gvr, ns, "*") wildcard bucket. The
+//     entry's own object is a DIFFERENT object; one member of a list it
+//     depends on arrived, changed or left → DIRTY-MARK, whatever the state.
+//  3. dependent-GET-dep — matched via an exact bucket but its own object is
+//     a different object (a widget GET-depending on a RESTAction) →
+//     DIRTY-MARK, whatever the state.
+//
+// Evictions are applied BEFORE dirty-marks, so a panic raised by the
+// refresh hook (the one seam this function calls out through) cannot lose
+// an eviction that was already due.
+//
+// Eviction stays DELETE-only in MEANING (feedback_l1_invalidation_delete_only):
+// objAbsent IS the informer's DELETE fact, derived from state instead of
+// carried by the message. Returns (evicted, dirtyMarked).
+func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, name string, state objectState) (int, int) {
 	if d == nil {
-		return 0
-	}
-	matched := d.collectMatches(gvr, namespace, name)
-	if len(matched) == 0 {
-		return 0
-	}
-	d.enqueueMu.RLock()
-	enqueue := d.enqueueFn
-	d.enqueueMu.RUnlock()
-
-	marked := 0
-	for l1Key := range matched {
-		if enqueue != nil {
-			enqueue(l1Key, gvr)
-		}
-		marked++
-	}
-	if marked > 0 {
-		d.dirtyMarkTotal.Add(uint64(marked))
-		// enqueueUpdateTotal is retained as the pre-0.30.110 falsifier
-		// name the resolved_cache.summary log + existing tests read.
-		d.enqueueUpdateTotal.Add(uint64(marked))
-	}
-	slog.Info("cache_event.consumed",
-		slog.String("subsystem", "cache"),
-		slog.String("type", eventType),
-		slog.String("gvr", gvr.String()),
-		slog.String("ns", namespace),
-		slog.String("name", name),
-		slog.String("action", "refresh"),
-		slog.Int("l1_keys", marked),
-	)
-	return marked
-}
-
-// OnDelete is invoked by the watcher when an informer DELETE event
-// arrives for (gvr, namespace, name).
-//
-// R2/R7 (0.30.110) — three-way classification. Every matched L1 entry
-// falls into exactly one of three buckets:
-//
-//  1. self-representation — the entry's OWN dispatched object is the
-//     deleted object. The cached output is the resolution of an object
-//     that no longer exists → EVICT (the only authorised eviction
-//     trigger, per feedback_l1_invalidation_delete_only.md).
-//
-//  2. LIST-dep — the entry matched via the (gvr, ns, "*") wildcard
-//     bucket. The entry's own object still exists; one member of a list
-//     it depends on went away → DIRTY-MARK (stale-while-revalidate).
-//
-//  3. dependent-GET-dep — the entry matched via an exact (gvr, ns,
-//     name) bucket but its own object is a DIFFERENT object (e.g. a
-//     widget that GET-depends on a deleted RESTAction) → DIRTY-MARK.
-//
-// Returns the number of L1 keys EVICTED (self-representations only).
-// dirtyMarkTotal counts buckets 2 + 3.
-//
-// OnDelete itself is synchronous — classification + eviction both run on
-// the calling goroutine. R3 (the "never on the informer processor
-// goroutine" requirement) is satisfied at the watcher boundary: the
-// informer DeleteFunc hands OnDelete to the deps eviction worker (see
-// watcher.go submitDeleteEvent), so the eviction burst never blocks
-// event delivery. Unit tests call OnDelete directly and observe a
-// deterministic synchronous result.
-func (d *DepTracker) OnDelete(gvr schema.GroupVersionResource, namespace, name string) int {
-	if d == nil {
-		return 0
+		return 0, 0
 	}
 	matched := d.collectMatchesWithDep(gvr, namespace, name)
 	if len(matched) == 0 {
-		return 0
+		return 0, 0
 	}
 	d.storeMu.RLock()
 	store := d.store
@@ -734,47 +699,76 @@ func (d *DepTracker) OnDelete(gvr schema.GroupVersionResource, namespace, name s
 	enqueue := d.enqueueFn
 	d.enqueueMu.RUnlock()
 
-	deleted := DepKey{GVR: gvr, Namespace: namespace, Name: name}
+	self := DepKey{GVR: gvr, Namespace: namespace, Name: name}
 
-	// matched is map[l1Key]DepKey. The DepKey (LIST wildcard vs exact)
-	// distinguishes bucket 2 from bucket 3, but the ACTION for both
-	// non-self buckets is identical — dirty-mark — so OnDelete only needs
-	// the self-vs-non-self split, computed from the entry's own Inputs.
-	var toEvict []string
-	dirtyMarked := 0
+	var toEvict, toMark []string
 	for l1Key := range matched {
-		if d.isSelfRepresentation(store, l1Key, deleted) {
-			// Bucket 1: self-representation → evict.
-			toEvict = append(toEvict, l1Key)
+		if state == objAbsent && d.isSelfRepresentation(store, l1Key, self) {
+			toEvict = append(toEvict, l1Key) // bucket 1, and ONLY when absent
 			continue
 		}
-		// Bucket 2 (LIST-dep) or bucket 3 (dependent-GET-dep) → dirty-mark.
+		toMark = append(toMark, l1Key) // buckets 2 + 3, and self-when-present
+	}
+
+	if len(toEvict) > 0 {
+		d.runEvictionBatch(toEvict)
+	}
+	for _, l1Key := range toMark {
 		if enqueue != nil {
 			enqueue(l1Key, gvr)
 		}
-		dirtyMarked++
 	}
-	if dirtyMarked > 0 {
-		d.dirtyMarkTotal.Add(uint64(dirtyMarked))
+	if n := len(toMark); n > 0 {
+		d.dirtyMarkTotal.Add(uint64(n))
+		if state != objAbsent {
+			// enqueueUpdateTotal is retained as the pre-0.30.110 falsifier
+			// name for ADD/UPDATE-driven refresh enqueues.
+			d.enqueueUpdateTotal.Add(uint64(n))
+		}
 	}
 
-	evictCount := len(toEvict)
-	if evictCount > 0 {
-		d.runEvictionBatch(toEvict)
+	action := "refresh"
+	if len(toEvict) > 0 {
+		action = "evict+refresh"
 	}
-
 	slog.Info("cache_event.consumed",
 		slog.String("subsystem", "cache"),
-		slog.String("type", "DELETE"),
+		slog.String("type", state.String()),
 		slog.String("gvr", gvr.String()),
 		slog.String("ns", namespace),
 		slog.String("name", name),
-		slog.String("action", "evict+refresh"),
+		slog.String("action", action),
 		slog.Int("l1_keys", len(matched)),
-		slog.Int("evicted", evictCount),
-		slog.Int("dirty_marked", dirtyMarked),
+		slog.Int("evicted", len(toEvict)),
+		slog.Int("dirty_marked", len(toMark)),
 	)
-	return evictCount
+	return len(toEvict), len(toMark)
+}
+
+// OnAdd is a shim over OnObjectEvent for callers that still speak in event
+// types (the 0.30.110 test surface). Production handlers no longer call it:
+// they enqueue the coordinate and the worker derives the state. An ADD
+// means the object exists → dirty-mark every dependent, never evict.
+// Returns the number of L1 keys dirty-marked.
+func (d *DepTracker) OnAdd(gvr schema.GroupVersionResource, namespace, name string) int {
+	_, marked := d.OnObjectEvent(gvr, namespace, name, objExists)
+	return marked
+}
+
+// OnUpdate is a shim over OnObjectEvent (see OnAdd). An UPDATE means the
+// object exists → dirty-mark every dependent (stale-while-revalidate),
+// never evict. Returns the number of L1 keys dirty-marked.
+func (d *DepTracker) OnUpdate(gvr schema.GroupVersionResource, namespace, name string) int {
+	_, marked := d.OnObjectEvent(gvr, namespace, name, objExists)
+	return marked
+}
+
+// OnDelete is a shim over OnObjectEvent (see OnAdd). A DELETE means the
+// object is absent → evict its self-representation, dirty-mark buckets
+// 2/3. Returns the number of L1 keys EVICTED.
+func (d *DepTracker) OnDelete(gvr schema.GroupVersionResource, namespace, name string) int {
+	evicted, _ := d.OnObjectEvent(gvr, namespace, name, objAbsent)
+	return evicted
 }
 
 // isSelfRepresentation reports whether the L1 entry under l1Key is the
@@ -1156,8 +1150,11 @@ func resetDepsForTest() {
 // cross-package test cannot leak the DELETE-eviction worker goroutine
 // or stale bridge counters into the next case.
 func ResetDepsForTest() {
-	resetDepsForTest()
+	// Stop the dep-event worker FIRST: it reads Deps() on its own goroutine
+	// (1.12.6 C1 — every event, not only DELETEs), so resetting the tracker
+	// while it drains is a data race the -race detector reports.
 	resetDepWatchForTest()
+	resetDepsForTest()
 }
 
 // CollectMatchesForTest exposes the package-private collectMatches for
