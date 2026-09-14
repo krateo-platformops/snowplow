@@ -216,7 +216,7 @@ func TestF3_F1Guard_PostStartupCRD_StaysUnconfirmed(t *testing.T) {
 
 	// Once the CRD installs and the apiserver serves the type, the
 	// discovery refresh flips it confirmed → servable.
-	disco.served[gvString(neverWalkedGVR)] = true
+	disco.setServed(gvString(neverWalkedGVR), true)
 	rw.RefreshDiscovery(context.Background())
 	if !rw.IsServable(neverWalkedGVR) {
 		t.Fatalf("F1-guard: confirmed + synced GVR must become servable after refresh")

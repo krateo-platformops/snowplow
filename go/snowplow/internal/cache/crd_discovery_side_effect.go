@@ -31,7 +31,7 @@
 // informer processor goroutine would stall ADD delivery for every
 // other informer sharing that processor during the discovery hop
 // (~tens of ms × N versions). The pattern mirrors deps_watch.go's
-// existing deleteEvictCh — single bounded worker, drop-on-full
+// pre-1.12.6 deleteEvictCh — single bounded worker (1.12.5: park-and-drain, never drop)
 // with WARN log.
 //
 // PM TIGHTENING #2 — defer recover() inside triggerCRDDiscovery.

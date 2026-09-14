@@ -89,7 +89,7 @@ func TestServabilitySnapshotFor_ConsistentTupleAgreesWithIsServable(t *testing.T
 	}
 
 	// Install the type; refresh discovery → conjunct 4 flips true.
-	disco.served[gvString(servableTestGVR)] = true
+	disco.setServed(gvString(servableTestGVR), true)
 	rw.RefreshDiscovery(context.Background())
 
 	hit := rw.ServabilitySnapshotFor(servableTestGVR)
