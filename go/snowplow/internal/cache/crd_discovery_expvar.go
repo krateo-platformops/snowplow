@@ -64,6 +64,12 @@ func registerCRDDiscoveryExpvar() {
 				// schema-widen relist (followup-crd-schema-widen-informer-relist)
 				"schema_relists_fired": s.SchemaRelistsFired,
 				"schema_unchanged":     s.SchemaUnchanged,
+				// 1.12.5 / #187 — post-sync re-fire of the relist dirty-mark.
+				// postsync lagging schema_relists_fired means relisted
+				// informers are not syncing, which strands L1 entries whose
+				// objects were deleted inside the teardown window.
+				"relist_dirtymark_postsync_total": s.RelistDirtyMarkPostSync,
+				"relist_postsync_timeout_total":   s.RelistPostSyncTimeout,
 			}
 		}))
 	})

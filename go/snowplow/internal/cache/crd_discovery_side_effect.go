@@ -138,9 +138,15 @@ type crdDiscovery struct {
 	// guarded by the worker's single-threadedness is sufficient — but we use
 	// sync.Map for defensiveness against a future multi-worker change and so
 	// the test reset can clear it without a lock.
-	schemaFingerprints sync.Map // map[string]string (CRD name → schema fingerprint)
+	schemaFingerprints sync.Map      // map[string]string (CRD name → schema fingerprint)
 	schemaRelistsFired atomic.Uint64 // relist passes that tore down >=1 GVR on a detected schema change
 	schemaUnchanged    atomic.Uint64 // ADD/UPDATE where the schema fingerprint was unchanged (no relist — thrash guard hit)
+	// 1.12.5 / #187 — post-sync re-fires of the relist dirty-mark. One per
+	// relisted GVR whose new informer synced inside the timeout. A count
+	// lagging schema_relists_fired means informers are not syncing after a
+	// relist, which strands entries deleted in the teardown window.
+	relistDirtyMarkPostSync atomic.Uint64
+	relistPostSyncTimeout   atomic.Uint64
 }
 
 var (
@@ -607,9 +613,57 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 		if !rw.IsRegistered(gvr) {
 			continue
 		}
-		rw.RemoveResourceType(gvr)    // R6 per-GVR teardown; idempotent, nil-safe
-		_, _ = rw.EnsureResourceType(gvr)         // re-register → fresh LIST under current schema
+		rw.RemoveResourceType(gvr)               // R6 per-GVR teardown; idempotent, nil-safe
+		_, syncCh := rw.EnsureResourceType(gvr)  // re-register → fresh LIST under current schema
 		Deps().OnResourceTypeSchemaRelisted(gvr) // dirty-mark dependent L1 (logs SCHEMA_RELIST, not CRD_DELETE)
+		// 1.12.5 / #187 — RE-FIRE THE DIRTY-MARK AFTER THE NEW INFORMER SYNCS.
+		//
+		// The teardown above opens a window in which DELETEs are lost with no
+		// trace at any log level. RemoveResourceType closes the old informer's
+		// per-GVR stop channel and purges its state, so anything still in its
+		// DeltaFIFO or in flight on its watch is dropped with no handler run.
+		// The replacement informer is freshly constructed, so its knownObjects
+		// indexer is EMPTY — DeltaFIFO.Replace() has nothing to diff against
+		// and synthesises NO Deleted delta for an object that vanished before
+		// the new LIST. The object simply never appears.
+		//
+		// The dirty-mark on the line above does cover entries whose objects
+		// were ALREADY gone: OnResourceTypeSchemaRelisted walks the forward dep
+		// index, not the indexer, so an absent object is still matched. But it
+		// runs ONCE, at the START of the window. An entry dirty-marked at that
+		// instant re-resolves SUCCESSFULLY (its object still exists), survives,
+		// and is then stranded when the delete lands a moment later with no
+		// future trigger of any kind. That is the #187 burst shape exactly:
+		// relist at ~09:21, deletes 09:21-09:24.
+		//
+		// Re-firing the same dirty-mark once the new informer has synced closes
+		// it. Every stranded entry is re-resolved, its own object 404s, and the
+		// drop-point eviction removes it. Deliberately reuses the existing
+		// dirty-mark rather than adding a store walk: no RangeMetadata, no
+		// lock-order hazard between the store mutex and rw.mu, no new
+		// invalidation semantics. The pre-sync fire is KEPT — both run, and the
+		// dirty-mark is idempotent.
+		//
+		// Off the discovery worker goroutine: the relist runs on the single
+		// CRD-lifecycle worker, so blocking it on a sync channel would stall
+		// every other CRD event. Bounded by a timeout so a GVR that never syncs
+		// cannot leak the goroutine for the process lifetime.
+		//
+		// WORTHLESS WITHOUT THE SELF-404 EVICTION. On its own this just re-runs
+		// the five-requeue drop. It is the delivery half; the eviction is the
+		// other half.
+		// Accounted on workerWG so the bridge's stop path WAITS for it. The
+		// goroutine touches the Deps() singleton after it wakes, and an
+		// untracked goroutine outliving its bridge would read that singleton
+		// while a teardown is replacing it.
+		// The tracker handle is captured HERE, on the worker goroutine, not
+		// read from the Deps() singleton after the wait. The goroutine
+		// outlives this call by design, and a later read of the global would
+		// race anything that replaces the singleton (test teardown does
+		// exactly that). Capturing also makes the goroutine's dependency
+		// explicit rather than ambient.
+		c.workerWG.Add(1)
+		go c.refireRelistDirtyMarkAfterSync(Deps(), gvr, syncCh)
 		relisted++
 	}
 	if relisted > 0 {
@@ -623,6 +677,82 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 				"pre-change indexer (followup-crd-schema-widen-informer-relist)."),
 		)
 	}
+}
+
+// relistPostSyncTimeout bounds how long the post-sync re-fire goroutine
+// waits for a relisted informer to sync before giving up (1.12.5 / #187).
+// A relisted informer that has not synced in two minutes is not going to;
+// waiting longer only holds the goroutine. The give-up is counted and
+// logged, because it means entries deleted inside that GVR's teardown
+// window stay stranded until their TTL.
+const relistPostSyncWait = 2 * time.Minute
+
+// refireRelistDirtyMarkAfterSync waits for a relisted GVR's replacement
+// informer to finish its initial LIST, then re-fires the dependent
+// dirty-mark. See the call site for why the single pre-sync fire is not
+// enough.
+//
+// Runs on its own goroutine: the relist loop executes on the single
+// CRD-lifecycle worker, and blocking there would stall every other CRD
+// event. Panic-guarded for the same reason every other handler here is —
+// a goroutine panic takes the process down, and this one is spawned from
+// an informer-driven path.
+func (c *crdDiscovery) refireRelistDirtyMarkAfterSync(d *DepTracker, gvr schema.GroupVersionResource, syncCh <-chan struct{}) {
+	defer c.workerWG.Done()
+	defer func() {
+		if rec := recover(); rec != nil {
+			c.panicsRecovered.Add(1)
+			slog.Error("cache.crd_discovery.relist_postsync.panic",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.Any("panic", rec),
+				slog.String("stack", string(debug.Stack())),
+			)
+		}
+	}()
+
+	if syncCh == nil {
+		// EnsureResourceType returned no channel (passthrough / nil watcher).
+		// Nothing to wait for and nothing useful to re-mark.
+		return
+	}
+
+	timer := time.NewTimer(relistPostSyncWait)
+	defer timer.Stop()
+
+	select {
+	case <-syncCh:
+	case <-c.stopCh:
+		return
+	case <-timer.C:
+		c.relistPostSyncTimeout.Add(1)
+		slog.Warn("cache.crd_discovery.relist_postsync.timeout",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.Duration("waited", relistPostSyncWait),
+			slog.String("effect", "the relisted informer never synced, so the post-sync "+
+				"dirty-mark did not run — L1 entries whose objects were deleted inside the "+
+				"relist teardown window stay resident until TTL (#187)"),
+		)
+		return
+	}
+
+	// Re-check the stop signal: the bridge may have been torn down while we
+	// waited, and a dirty-mark issued after shutdown is pure noise.
+	select {
+	case <-c.stopCh:
+		return
+	default:
+	}
+	d.OnResourceTypeSchemaRelisted(gvr)
+	c.relistDirtyMarkPostSync.Add(1)
+	slog.Info("cache.crd_discovery.relist_postsync.dirty_marked",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("hint", "re-marked dependent L1 entries after the relisted informer synced; "+
+			"an entry whose object was deleted inside the teardown window gets no informer "+
+			"DELETE (a fresh informer synthesises none) and this is its only trigger (#187)"),
+	)
 }
 
 // triggerCRDDelete handles a CRD DELETE event: derive the GVRs that
@@ -811,6 +941,10 @@ type CRDDiscoveryStats struct {
 	// followup-crd-schema-widen-informer-relist
 	SchemaRelistsFired uint64 // ADD/UPDATE passes that relisted >=1 GVR on a detected structural-schema change
 	SchemaUnchanged    uint64 // ADD/UPDATE where the schema fingerprint was unchanged (thrash guard hit; no relist)
+
+	// 1.12.5 / #187
+	RelistDirtyMarkPostSync uint64 // post-sync re-fires of the relist dirty-mark
+	RelistPostSyncTimeout   uint64 // relisted GVRs whose new informer did not sync in time
 }
 
 // CRDDiscoveryStatsSnapshot returns the current bridge counters.
@@ -827,6 +961,9 @@ func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
 		PanicsRecovered:    c.panicsRecovered.Load(),
 		SchemaRelistsFired: c.schemaRelistsFired.Load(),
 		SchemaUnchanged:    c.schemaUnchanged.Load(),
+
+		RelistDirtyMarkPostSync: c.relistDirtyMarkPostSync.Load(),
+		RelistPostSyncTimeout:   c.relistPostSyncTimeout.Load(),
 	}
 }
 
