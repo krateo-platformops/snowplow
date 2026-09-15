@@ -361,6 +361,13 @@ var (
 	refresherInit     sync.Once
 )
 
+// refresherPeek returns the singleton if it has been built and nil
+// otherwise, WITHOUT constructing it. Every telemetry accessor reads through
+// this (#203): a /debug/vars scrape or an OTLP collection on a cache-off pod
+// must not build the two workqueues (and their waitingLoop goroutines) it is
+// reporting on.
+func refresherPeek() *refresher { return refresherInstance }
+
 // refresherSingleton returns the process-wide refresher, constructing
 // it lazily.
 func refresherSingleton() *refresher {
@@ -1006,25 +1013,35 @@ func (r *refresher) processOne(ctx context.Context, key string, entry *ResolvedE
 	return nil
 }
 
-// refresherStats is the read-only snapshot the summary log consumes.
+// refresherStats is the read-only snapshot the summary log, the
+// snowplow_refresher_* expvars and the OTLP mirror consume.
+//
+// 1.12.6 C7: the `stat` tag is the published name; the expvar key is
+// snowplow_refresher_<stat>_total for a counter and snowplow_refresher_<stat>
+// for a gauge, and the OTLP mirror publishes counters under the shared
+// snowplow_refresher{stat=...} instrument and gauges under
+// snowplow_refresher_<stat> (StatFamily.ExpvarKey / OTelInstrumentName).
+// `stat:"-"` marks a field published elsewhere or not at all — say where.
 type refresherStats struct {
-	enqueued          uint64
-	completed         uint64
-	failed            uint64
-	retried           uint64
-	dropped           uint64
-	skippedNoEntry    uint64
-	skippedNoHandler  uint64
-	skippedStageError uint64 // Ship 0.30.120 layer (b)
-	selfNotFoundEvict uint64 // 1.12.5 / #187 (i)
-	yielded           uint64 // Ship #98 — customer-priority yields
-	capped            uint64 // Ship #98 — max-parked cap hits
-	floored           uint64 // Task #321 (#318-R1a) — rate-floor deferrals
+	enqueued          uint64 `stat:"enqueue"`
+	completed         uint64 `stat:"completed"`
+	failed            uint64 `stat:"failed"`
+	retried           uint64 `stat:"retried"`
+	dropped           uint64 `stat:"dropped"`
+	skippedNoEntry    uint64 `stat:"skipped_no_entry"`
+	skippedNoHandler  uint64 `stat:"skipped_no_handler"`
+	skippedStageError uint64 `stat:"skipped_stage_error"`      // Ship 0.30.120 layer (b)
+	selfNotFoundEvict uint64 `stat:"-"`                        // 1.12.5 / #187 (i) — published as snowplow_deps.self_notfound_evict_total (deps_expvar.go), beside its tracker-side twin
+	yielded           uint64 `stat:"yielded"`                  // Ship #98 — customer-priority yields
+	capped            uint64 `stat:"capped"`                   // Ship #98 — max-parked cap hits
+	floored           uint64 `stat:"floored"`                  // Task #321 (#318-R1a) — rate-floor deferrals
+	queueDepth        int64  `stat:"queue_depth" kind:"gauge"` // live workqueue Len(); 0 before the pool is built
 
 	// Path 3.2 / 0.30.218 — per-tier observability for the two-tier
-	// priority queue.
-	clusterListEnqueued  uint64
-	clusterListCompleted uint64
+	// priority queue. Read by ClusterListRefresherStats for the Path 3.2
+	// falsifiers; not published on expvar or OTLP.
+	clusterListEnqueued  uint64 `stat:"-"`
+	clusterListCompleted uint64 `stat:"-"`
 }
 
 func refresherStatsSnapshot() refresherStats {
@@ -1047,7 +1064,52 @@ func refresherStatsSnapshot() refresherStats {
 		floored:              r.flooredTotal.Load(),
 		clusterListEnqueued:  r.clusterListEnqueueTotal.Load(),
 		clusterListCompleted: r.clusterListCompletedTotal.Load(),
+		queueDepth:           refresherQueueDepth(r),
 	}
+}
+
+// refresherQueueDepth is the live workqueue Len(), 0 before the pool exists.
+func refresherQueueDepth(r *refresher) int64 {
+	if r == nil || r.queue == nil {
+		return 0
+	}
+	return int64(r.queue.Len())
+}
+
+// AddRefresherPoolCounterForTest bumps ONE pool counter by stat name so the
+// C7 value arms can drive every published refresher stat to a distinct value
+// through the real atomics. Returns false for a stat this helper does not
+// know — the arm treats that as a failure, so a stat added to refresherStats
+// without a line here is caught, not skipped. TEST-ONLY.
+func AddRefresherPoolCounterForTest(stat string, n uint64) bool {
+	r := refresherSingleton()
+	switch stat {
+	case "enqueue":
+		r.enqueueTotal.Add(n)
+	case "completed":
+		r.completedTotal.Add(n)
+	case "failed":
+		r.failedTotal.Add(n)
+	case "retried":
+		r.retriedTotal.Add(n)
+	case "dropped":
+		r.droppedTotal.Add(n)
+	case "skipped_no_entry":
+		r.skippedNoEntryTotal.Add(n)
+	case "skipped_no_handler":
+		r.skippedNoHandler.Add(n)
+	case "skipped_stage_error":
+		r.refresherSkippedStageError.Add(n)
+	case "yielded":
+		r.yieldedTotal.Add(n)
+	case "capped":
+		r.cappedTotal.Add(n)
+	case "floored":
+		r.flooredTotal.Add(n)
+	default:
+		return false
+	}
+	return true
 }
 
 // ErrSelfObjectGone is the 1.12.5 / #187 (i) sentinel: a refresh's re-fetch of

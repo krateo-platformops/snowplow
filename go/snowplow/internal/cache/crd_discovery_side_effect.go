@@ -1020,32 +1020,48 @@ func warnOnceCRDDecodeSkip(obj interface{}, kind crdLifecycleKind) {
 // CRD DELETE lifecycle path. Both fields stay zero in test fixtures
 // that exercise only the ADD/UPDATE paths.
 type CRDDiscoveryStats struct {
-	EventsEnqueued     uint64
-	EventsDropped      uint64
-	EventsParked       uint64 // 1.12.5 #187: submits that parked on a full queue
-	EventsProcessed    uint64
-	DiscoveryInvoked   uint64 // ADD + UPDATE (DiscoverGroupResources calls)
-	DiscoverySkippedNG uint64 // ADD + UPDATE decode-skip / no-group / no-SA-rc
-	DeletesProcessed   uint64 // Ship L — successful DELETE teardowns
-	DeleteSkippedNG    uint64 // Ship L — DELETE decode-skip / no-served-versions / no-plural
-	PanicsRecovered    uint64
+	// 1.12.6 C7: every published field carries its /debug/vars key as a
+	// `stat` tag; expvar, the OTLP mirror, the docs guard and the parity arm
+	// all DERIVE the key set from these tags (stats_by_tag.go). A field
+	// without a tag fails TestC7_StatsByTag_EveryNumericFieldIsTaggedOrExcluded.
+	EventsEnqueued     uint64 `stat:"events_enqueued"`
+	EventsDropped      uint64 `stat:"events_dropped"`
+	EventsParked       uint64 `stat:"events_parked"` // 1.12.5 #187: submits that parked on a full queue
+	EventsProcessed    uint64 `stat:"events_processed"`
+	DiscoveryInvoked   uint64 `stat:"discovery_invoked"`    // ADD + UPDATE (DiscoverGroupResources calls)
+	DiscoverySkippedNG uint64 `stat:"discovery_skipped_ng"` // ADD + UPDATE decode-skip / no-group / no-SA-rc
+	DeletesProcessed   uint64 `stat:"deletes_processed"`    // Ship L — successful DELETE teardowns
+	DeleteSkippedNG    uint64 `stat:"delete_skipped_ng"`    // Ship L — DELETE decode-skip / no-served-versions / no-plural
+	PanicsRecovered    uint64 `stat:"panics_recovered"`
 	// followup-crd-schema-widen-informer-relist
-	SchemaRelistsFired uint64 // ADD/UPDATE passes that relisted >=1 GVR on a detected structural-schema change
-	SchemaUnchanged    uint64 // ADD/UPDATE where the schema fingerprint was unchanged (thrash guard hit; no relist)
+	SchemaRelistsFired uint64 `stat:"schema_relists_fired"` // ADD/UPDATE passes that relisted >=1 GVR on a detected structural-schema change
+	SchemaUnchanged    uint64 `stat:"schema_unchanged"`     // ADD/UPDATE where the schema fingerprint was unchanged (thrash guard hit; no relist)
 
 	// 1.12.5 / #187
-	RelistDirtyMarkPostSync uint64 // post-sync re-fires of the relist dirty-mark
-	RelistPostSyncTimeout   uint64 // relisted GVRs whose new informer did not sync in time
+	RelistDirtyMarkPostSync uint64 `stat:"relist_dirtymark_postsync_total"` // post-sync re-fires of the relist dirty-mark
+	RelistPostSyncTimeout   uint64 `stat:"relist_postsync_timeout_total"`   // relisted GVRs whose new informer did not sync in time
 
 	// 1.12.6 C2 — relist delta bridge (relist_bridge.go)
-	RelistBridgeRuns     uint64 // bridges spawned (one per relisted GVR with a registered indexer)
-	RelistBridgeEnqueued uint64 // coordinates synthesized from (old indexer keys \ fresh LIST)
-	RelistBridgeTimeout  uint64 // bridges that gave up because the fresh informer never synced — the soak signal
-	RelistBridgeAborted  uint64 // bridges with nothing to diff (no sync channel / GVR removed while waiting)
+	RelistBridgeRuns     uint64 `stat:"relist_bridge_runs_total"`     // bridges spawned (one per relisted GVR with a registered indexer)
+	RelistBridgeEnqueued uint64 `stat:"relist_bridge_enqueued_total"` // coordinates synthesized from (old indexer keys \ fresh LIST)
+	RelistBridgeTimeout  uint64 `stat:"relist_bridge_timeout_total"`  // bridges that gave up because the fresh informer never synced — the soak signal
+	RelistBridgeAborted  uint64 `stat:"relist_bridge_aborted_total"`  // bridges with nothing to diff (no sync channel / GVR removed while waiting)
 }
+
+// crdDiscoveryStatsOverride, when set, replaces the live snapshot. TEST-ONLY
+// seam for the 1.12.6 C7 parity arms, which set every tagged field to a
+// distinct value and read it back through expvar and OTLP; nil in production.
+var crdDiscoveryStatsOverride atomic.Pointer[CRDDiscoveryStats]
+
+// SetCRDDiscoveryStatsForTest installs (or, with nil, clears) a snapshot
+// override. Production callers MUST NOT use it.
+func SetCRDDiscoveryStatsForTest(s *CRDDiscoveryStats) { crdDiscoveryStatsOverride.Store(s) }
 
 // CRDDiscoveryStatsSnapshot returns the current bridge counters.
 func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
+	if o := crdDiscoveryStatsOverride.Load(); o != nil {
+		return *o
+	}
 	c := crdDiscoverySingleton()
 	return CRDDiscoveryStats{
 		EventsEnqueued:     c.eventsEnqueued.Load(),
