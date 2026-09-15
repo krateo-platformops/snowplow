@@ -112,7 +112,12 @@ def _manifests(run_id: str) -> str:
                   "apiVersion": "widgets.templates.krateo.io/v1beta1",
                   "resource": "paragraphs", "name": child,
                   "namespace": NS, "verb": "GET"}]},
-             "widgetData": {"items": [{"resourceRefId": "s6-probe"}]}}},
+             # `allowedResources` is REQUIRED by the Flex CRD alongside `items` — the §10.5
+             # sketch omitted it and run 1 was rejected at apply. It names the child's RESOURCE
+             # plural, matching the live access-detail-title-stack Flex on 057, which has a
+             # paragraph child and carries exactly this.
+             "widgetData": {"allowedResources": ["paragraphs"],
+                            "items": [{"resourceRefId": "s6-probe"}]}}},
     ]})
 
 

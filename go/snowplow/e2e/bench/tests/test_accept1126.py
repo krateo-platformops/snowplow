@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -479,3 +481,65 @@ def test_secret_read_failure_is_loud(monkeypatch):
     monkeypatch.setattr(a.cluster, "kubectl", _fake_kubectl)
     with pytest.raises(a.PreflightFailed):
         a._password_from_secret("s6-harness-password")
+
+
+# ─── S6 browser half: the manifest pair ────────────────────────────────────
+#
+# Run 1 died at `kubectl apply` on a required field the facts-doc sketch omitted
+# (Flex.spec.widgetData.allowedResources). The offline checks that preceded it asserted the
+# shape the DOCUMENT pins — child free of apiRef/resourcesRefs/keyExtras, root ref GET at the
+# child, ownership prefix, root name — every one of which passed on an invalid CR, because
+# none of them asked the schema. The structural arms stay; the dry-run below is what actually
+# catches this class, and it is the arm that would have saved the run.
+
+from bench import s6browser as sb  # noqa: E402
+
+
+def _pair(run_id="deadbeefcafe"):
+    return json.loads(sb._manifests(run_id))["items"]
+
+
+def test_s6_manifest_child_avoids_every_decline_branch():
+    child = next(i for i in _pair() if i["kind"] == "Paragraph")
+    for forbidden in ("apiRef", "resourcesRefs", "keyExtras"):
+        assert forbidden not in child["spec"], (
+            f"{forbidden} on the child would make it decline-eligible (facts §10.2); a declined "
+            f"body arms a key with no entry behind it and nothing can ever be evicted for it")
+
+
+def test_s6_manifest_root_is_named_for_the_shipped_nav_entry():
+    root = next(i for i in _pair() if i["kind"] == "Flex")
+    assert root["metadata"]["name"] == "page-s6-probe", (
+        "the /s6-probe route resolves flexes/page-<slug> by convention, so a per-run root name "
+        "resolves to nothing and the widget never renders or arms")
+
+
+def test_s6_manifest_root_declares_allowedResources_for_the_child():
+    """The field run 1 died on. It is REQUIRED by the Flex CRD and names the child's resource
+    plural; the §10.5 sketch had only `items`."""
+    root = next(i for i in _pair() if i["kind"] == "Flex")
+    wd = root["spec"]["widgetData"]
+    assert wd.get("allowedResources") == ["paragraphs"]
+    assert wd.get("items"), "the CRD requires items alongside allowedResources"
+
+
+#: Deliberately NOT gated on BENCH_GKE_CONTEXT: conftest.py:30 pops that variable so the suite
+#: is hermetic against the operator's environment, so a gate on it could never fire and this
+#: arm would skip forever — a guard that cannot run is not a guard. Its own opt-in instead, and
+#: it carries the context explicitly rather than inheriting one.
+@pytest.mark.skipif(os.environ.get("S6_LIVE_SCHEMA_CHECK") != "1",
+                    reason="live schema check: set S6_LIVE_SCHEMA_CHECK=1 (+ S6_SCHEMA_CONTEXT)")
+def test_s6_manifest_IS_ACCEPTED_BY_THE_LIVE_CRD():
+    """The arm that would have saved run 1.
+
+    Every other manifest arm asserts the shape the facts doc describes, and all of them passed
+    on a CR the API server rejected — a document is not a schema. This one asks the schema,
+    server-side, creating nothing: `kubectl apply --dry-run=server` validates exactly as a real
+    apply would and writes nothing.
+    """
+    ctx = os.environ.get("S6_SCHEMA_CONTEXT") or sb.accept1126.EXPECTED_CONTEXT
+    proc = subprocess.run(
+        ["kubectl", "--context", ctx, "apply", "--dry-run=server", "-f", "-"],
+        input=sb._manifests("dryrunprobe0"), capture_output=True, text=True)
+    assert proc.returncode == 0, (
+        f"the live CRDs REJECT the manifest pair:\n{proc.stderr.strip()[:500]}")
