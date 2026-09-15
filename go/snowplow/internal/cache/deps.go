@@ -1254,13 +1254,26 @@ func ResetDepsForTest() {
 // blocks until every goroutine that watcher spawned has exited
 // (ResourceWatcher.Stop joins the factory and the watcher-owned goroutines),
 // so no handler can reach the bridge after the reset that follows.
-// Idempotent (Stop is). Test-only — production never resets the bridge.
+// Idempotent (Stop is). A bare watcher built by struct literal in a test
+// (no NewResourceWatcher: nil stopCh, no factory, no goroutines) has
+// nothing to join and is skipped — Stop would close a nil channel.
+// Test-only — production never resets the bridge.
 func stopBoundDepWatcherForTest() {
-	if w := depWatchInstance; w != nil {
-		if rw := w.watcher.Load(); rw != nil {
-			rw.Stop()
-		}
+	w := depWatchInstance
+	if w == nil {
+		return
 	}
+	rw := w.watcher.Load()
+	if rw == nil {
+		return
+	}
+	rw.mu.RLock()
+	bare := rw.stopCh == nil
+	rw.mu.RUnlock()
+	if bare {
+		return
+	}
+	rw.Stop()
 }
 
 // CollectMatchesForTest exposes the package-private collectMatches for
