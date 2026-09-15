@@ -1235,11 +1235,32 @@ func resetDepsForTest() {
 // cross-package test cannot leak the DELETE-eviction worker goroutine
 // or stale bridge counters into the next case.
 func ResetDepsForTest() {
-	// Stop the dep-event worker FIRST: it reads Deps() on its own goroutine
-	// (1.12.6 C1 — every event, not only DELETEs), so resetting the tracker
-	// while it drains is a data race the -race detector reports.
+	// Order is load-bearing (1.12.6 item 7 gate, -race at -count=3):
+	//  1. stop + JOIN the watcher bound to the bridge — its informer
+	//     handlers captured the bridge singleton at registration, and an
+	//     ADD they deliver after the singleton is replaced would start a
+	//     worker nobody can stop any more (an orphan that keeps reading
+	//     Deps() under the next test's reset);
+	//  2. stop + join the dep-event worker: it reads Deps() on its own
+	//     goroutine (1.12.6 C1 — every event, not only DELETEs);
+	//  3. only then write the tracker fields.
+	stopBoundDepWatcherForTest()
 	resetDepWatchForTest()
 	resetDepsForTest()
+}
+
+// stopBoundDepWatcherForTest stops the ResourceWatcher currently bound to
+// the dep-watch bridge (the one whose informer handlers feed it) and
+// blocks until every goroutine that watcher spawned has exited
+// (ResourceWatcher.Stop joins the factory and the watcher-owned goroutines),
+// so no handler can reach the bridge after the reset that follows.
+// Idempotent (Stop is). Test-only — production never resets the bridge.
+func stopBoundDepWatcherForTest() {
+	if w := depWatchInstance; w != nil {
+		if rw := w.watcher.Load(); rw != nil {
+			rw.Stop()
+		}
+	}
 }
 
 // CollectMatchesForTest exposes the package-private collectMatches for
