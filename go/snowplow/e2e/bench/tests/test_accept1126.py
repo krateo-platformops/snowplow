@@ -26,6 +26,7 @@ No cluster access: everything here is a pure-function or filesystem arm
 
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
@@ -372,3 +373,55 @@ def test_MUTATION_dropping_the_reconcile_scan_hides_a_perturbing_call():
     assert rl.touched_reconcile(PAST, FUTURE), "the real scan must see it"
     assert _mutant_reconcile_check(rl, PAST, FUTURE) == [], (
         "the mutant must miss it — that is what the scan buys")
+
+
+# ─── Credential routes (harness-user-spec.md §6/§7) ────────────────────────
+
+
+def test_creds_prefers_the_environment_password(monkeypatch):
+    monkeypatch.setenv("HARNESS_USER", "s6-harness")
+    monkeypatch.setenv("HARNESS_PASSWORD", "pw")
+    monkeypatch.delenv("S6_PASSWORD_FROM_SECRET", raising=False)
+    assert a._creds() == ("s6-harness", "pw")
+
+
+def test_creds_raises_rather_than_skipping_when_absent(monkeypatch):
+    monkeypatch.delenv("HARNESS_USER", raising=False)
+    monkeypatch.delenv("HARNESS_PASSWORD", raising=False)
+    monkeypatch.delenv("S6_PASSWORD_FROM_SECRET", raising=False)
+    with pytest.raises(a.PreflightFailed):
+        a._creds()
+
+
+def test_creds_reads_the_scoped_secret_when_asked(monkeypatch):
+    """Option (b): the harness user's OWN Secret, not a platform credential."""
+    monkeypatch.setenv("HARNESS_USER", "s6-harness")
+    monkeypatch.delenv("HARNESS_PASSWORD", raising=False)
+    monkeypatch.setenv("S6_PASSWORD_FROM_SECRET", "s6-harness-password")
+    seen = {}
+
+    def _fake_kubectl(*args, **kw):
+        seen["args"] = args
+        # kubectl -o jsonpath returns Secret data STILL base64-encoded.
+        return 0, base64.b64encode(b"sekrit").decode(), ""
+
+    monkeypatch.setattr(a.cluster, "kubectl", _fake_kubectl)
+    assert a._creds() == ("s6-harness", "sekrit")
+    assert "s6-harness-password" in seen["args"]
+
+
+def test_secret_read_decodes_base64_rather_than_passing_the_blob(monkeypatch):
+    """kubectl jsonpath does NOT decode Secret data; forgetting that sends a
+    base64 blob as the password and yields a confusing 401."""
+    def _fake_kubectl(*args, **kw):
+        return 0, base64.b64encode(b"hunter2").decode(), ""
+    monkeypatch.setattr(a.cluster, "kubectl", _fake_kubectl)
+    assert a._password_from_secret("s6-harness-password") == "hunter2"
+
+
+def test_secret_read_failure_is_loud(monkeypatch):
+    def _fake_kubectl(*args, **kw):
+        return 1, "", "Error from server (Forbidden)"
+    monkeypatch.setattr(a.cluster, "kubectl", _fake_kubectl)
+    with pytest.raises(a.PreflightFailed):
+        a._password_from_secret("s6-harness-password")

@@ -164,20 +164,70 @@ class ReconcilePerturbation(RuntimeError):
 # ─── Credential handling ────────────────────────────────────────────────────
 
 
-def _creds() -> tuple[str, str]:
-    """Read HARNESS_USER / HARNESS_PASSWORD. Never logged, never persisted.
+def _password_from_secret(secret: str) -> str:
+    """Read the harness user's password from its OWN Secret on the cluster.
 
-    Raises PreflightFailed (not a skip) when unset — a run without an identity
-    cannot read /debug and must not silently degrade to "counters unavailable".
+    Available only when the operator has scoped this harness a read of that one
+    Secret (harness-user-spec.md §6 option b). It is NOT the platform-admin
+    Secret read that was denied: `s6-harness-password` belongs to a purpose-made
+    account with **no groups and no RBAC**, is rotatable independently, and
+    grants exactly one capability — authenticated GETs to a read-only
+    diagnostic surface.
+
+    `kubectl -o jsonpath` does **NOT** base64-decode Secret data
+    (`feedback_no_kubectl_jsonpath_for_in_process_reasoning`), so the value is
+    decoded here. A caller that skipped the decode would send a base64 blob as
+    the password and get a confusing 401.
+
+    The decoded value is returned to `_creds`, used once for the Basic header,
+    and never logged, persisted or put in a proof.
+    """
+    rc, out, err = cluster.kubectl(
+        "get", "secret", "-n", NS, secret,
+        "-o", "jsonpath={.data.password}")
+    if rc != 0 or not out.strip():
+        raise PreflightFailed(
+            f"could not read the harness password from Secret {secret!r} in "
+            f"{NS} (rc={rc}). Either the scoped read is not granted, or the "
+            f"Secret does not carry a `password` key. {err.strip()[:200]}")
+    try:
+        return base64.b64decode(out.strip()).decode()
+    except Exception as e:                                  # malformed data
+        raise PreflightFailed(
+            f"Secret {secret!r} .data.password is not valid base64: {e}"
+        ) from None
+
+
+def _creds() -> tuple[str, str]:
+    """The harness identity. Never logged, never persisted.
+
+    Two routes, in order of preference (harness-user-spec.md §6):
+      (a) HARNESS_USER + HARNESS_PASSWORD in the environment — no new
+          permissions, the operator supplies it;
+      (b) HARNESS_USER + S6_PASSWORD_FROM_SECRET naming the harness's OWN
+          Secret, read through `cluster.kubectl` (which pins --context
+          explicitly) when that scoped read has been granted.
+
+    Raises PreflightFailed (not a skip) when neither route yields a credential —
+    a run without an identity cannot read /debug and must not silently degrade
+    to "counters unavailable". There is deliberately no third route: no token is
+    ever accepted from another process.
     """
     user = os.environ.get("HARNESS_USER", "").strip()
     pw = os.environ.get("HARNESS_PASSWORD", "")
+    secret = os.environ.get("S6_PASSWORD_FROM_SECRET", "").strip()
+
+    if user and not pw and secret:
+        pw = _password_from_secret(secret)
+
     if not user or not pw:
         raise PreflightFailed(
-            "HARNESS_USER / HARNESS_PASSWORD must both be set. The counter half "
-            "authenticates as a DEDICATED least-privilege harness user (see "
-            "reports/harness-user-spec.md); it never reads a platform Secret "
-            "and never accepts a token handed over by another process.")
+            "no harness identity. Set HARNESS_USER plus either "
+            "HARNESS_PASSWORD, or S6_PASSWORD_FROM_SECRET naming the harness "
+            "user's own Secret when that scoped read is granted. The counter "
+            "half authenticates as a DEDICATED least-privilege user (see "
+            "reports/harness-user-spec.md) — never a platform credential, and "
+            "never a token handed over by another process.")
     return user, pw
 
 
