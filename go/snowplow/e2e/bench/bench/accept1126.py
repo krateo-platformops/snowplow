@@ -834,26 +834,31 @@ def stage_preflight(ctx: dict) -> dict:
 
     bundle = _served_bundle_hash(portal, reqlog)
 
-    # B1 — the tag is NOT sufficient, and this is not hypothetical. Measured on
-    # 057 on 2026-09-15: `frontend:1.6.11` was re-pushed under the SAME tag with
-    # a different bundle (index-D4naopHo.js → index-Kr5dAb3q.js, pod replaced at
-    # 08:59:29Z). A tag on this registry names an INTENT, not an artifact, so a
-    # tag-only gate passes across a real content change — exactly the case that
-    # would let the pre-re-auth SPA reach the measurement window and make S6
-    # measure nothing. Facts §15.5 P5 requires tag AND hash; this is the hash.
+    # B1 — the published tag is not the deployed build, so the tag alone cannot
+    # gate it. The served bundle hash is the only ground truth for what the
+    # browser is actually executing, and it is captured HERE, in the same
+    # preflight as the tag, so the two describe one moment.
+    #
+    # (Provenance note, because the earlier version of this comment was wrong:
+    # it claimed frontend:1.6.11 had been re-pushed under the same tag. It had
+    # not — the bundle change D4naopHo → Kr5dAb3q was the 1.6.10 → 1.6.11 roll,
+    # and I had compared a hash captured on 09-14 against a tag read on 09-15.
+    # That mistake is itself the argument for this assertion: two readings taken
+    # a day apart are not a comparison, and only a same-preflight hash is.)
     expected_bundle = ctx.get("expect_bundle")
     if not expected_bundle:
         problems.append(
             "no expected bundle hash supplied — pass --expect-bundle "
             "(or set S6_EXPECT_BUNDLE) with the `index-<hash>.js` filename of "
-            "the release under test. The image tag alone cannot gate the build: "
-            "frontend:1.6.11 on 057 was re-pushed under the same tag on "
-            "2026-09-15 with different content.")
+            "the release under test. The image tag alone cannot gate the "
+            "build: it names what was deployed, not what is being served, and "
+            "a roll between two readings makes the tag agree while the content "
+            "differs.")
     elif bundle != expected_bundle:
         problems.append(
             f"served SPA bundle is {bundle!r}, expected {expected_bundle!r}. "
-            f"The Deployment tag can match while the content does not (mutable "
-            f"tags on this registry) — this is the assertion that catches it.")
+            f"The Deployment tag can match while the served content does not — "
+            f"this is the assertion that catches it.")
 
     # Raise the BUILD problems before attempting login. They are the cheapest
     # and most decisive signal, they need no credential, and reporting "creds
@@ -1456,9 +1461,9 @@ def add_parsers(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--expect-bundle", default=None,
         help="Expected served SPA bundle filename, e.g. index-Kr5dAb3q.js. "
-             "REQUIRED (or S6_EXPECT_BUNDLE): the image tag alone cannot gate "
-             "the build — frontend:1.6.11 on 057 was re-pushed under the same "
-             "tag on 2026-09-15 with different content.")
+             "REQUIRED (or S6_EXPECT_BUNDLE): the image tag names what was "
+             "deployed, not what is being served, so only the content hash "
+             "gates the build the browser actually runs.")
     p.add_argument(
         "--enable-crd-relist", action="store_true",
         help="Run the gated CRD schema-relist stage. OFF by default; also "
