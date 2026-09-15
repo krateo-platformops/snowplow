@@ -192,7 +192,7 @@ Defined in `internal/cache/refresh_broadcaster_expvar.go`.
 
 | expvar | meaning | healthy range |
 |---|---|---|
-| `snowplow_refresh_broadcaster` | broadcaster counter snapshot (publishes, deliveries, subscriber counts, drops) | drops near 0; publishes track L1 commits under churn |
+| `snowplow_refresh_broadcaster` | broadcaster counter snapshot (publishes, deliveries, subscriber counts, drops; 1.12.6 item 7: `armed_keys`, `max_sink_depth`, `evict_published`, `evict_deferred`, `stream_seconds_total`, `streams_closed_total`) | drops near 0; publishes track L1 commits under churn; `evict_deferred` climbing = the provisional pacing bound (`REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND` / `_BURST`) engaged — the number to re-tune from |
 
 ### RBAC snapshot + authz memo — subject-index freshness and serve-time eval cache
 

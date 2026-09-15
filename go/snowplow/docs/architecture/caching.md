@@ -604,4 +604,4 @@ second, a never-evict the reverse) and
 | External bounded-TTL opt-in | `internal/handlers/dispatchers/external_ttl.go` | `krateo.io/external-cache-ttl-seconds`, 120s cap |
 | UAF short-TTL | `internal/handlers/dispatchers/uaf_shortttl.go` | `UAF_RESOLVED_TTL_SECONDS` |
 | Refresher wiring | `internal/handlers/dispatchers/dispatchers.go`, `resolve_populate.go` | `RegisterRefreshFunc`, `resolveAndPopulateL1` |
-| Live-refresh signal | `internal/cache/refresh_broadcaster.go` | `PublishRefresh`, `REFRESH_SSE_ENABLED` |
+| Live-refresh signal | `internal/cache/refresh_broadcaster.go` | `PublishRefresh`, `PublishEviction` (paced per subscriber: `REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND` / `_BURST`, provisional), `REFRESH_SSE_ENABLED` |

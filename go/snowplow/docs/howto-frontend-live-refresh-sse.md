@@ -247,6 +247,8 @@ class RefreshManager {
 | `REFRESH_SSE_ENABLED` | on (when cache on) | master toggle for the layer |
 | `REFRESH_SESSION_COOKIE` | `krateo-session` | cookie name the JWT is read from |
 | `REFRESH_COALESCE_WINDOW_MS` | `250` | server-side per-key dedup window |
+| `REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND` | `5` (provisional) | per-subscriber release rate of eviction-driven frames (§10); excess deferred, never dropped |
+| `REFRESH_EVICTION_PUBLISH_BURST` | `10` (provisional) | per-subscriber burst released before the rate applies (§10) |
 
 Live-refresh requires `CACHE_ENABLED=true` (it rides the cache's refresher).
 
