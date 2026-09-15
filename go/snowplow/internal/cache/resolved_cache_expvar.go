@@ -104,9 +104,10 @@ func ResolvedCacheStatsByStat() map[string]int64 {
 		"store_total": int64(s.StoreTotal),
 		// why entries leave — lru means the budget is the binding
 		// constraint, ttl means staleness, delete means invalidation
-		"evict_lru_total":    int64(s.EvictLRUTotal),
-		"evict_ttl_total":    int64(s.EvictTTLTotal),
-		"evict_delete_total": int64(s.EvictDeleteTotal),
+		"evict_lru_total":     int64(s.EvictLRUTotal),
+		"evict_ttl_total":     int64(s.EvictTTLTotal),
+		"evict_max_age_total": int64(s.EvictMaxAgeTotal), // 1.12.6 C5 bounded lifetime
+		"evict_delete_total":  int64(s.EvictDeleteTotal),
 		// Ship 4a resident region
 		"resident_entries":      int64(s.ResidentEntries),
 		"resident_bytes":        s.ResidentBytes,

@@ -76,8 +76,9 @@ toggle and the invariant that turning it off is a *transparent fallback*, not a 
     `RESOLVED_CACHE_MAX_BYTES` / `RESOLVED_CACHE_TTL_SECONDS` /
     `RESOLVED_CACHE_MAX_RESIDENT_BYTES` (the pinned-resident region; `0` disables pinning —
     the Ship 4a kill-switch), and the bounded-staleness backstops
-    `CATALOG_UNSERVABLE_TTL_SECONDS` (#36), `UAF_RESOLVED_TTL_SECONDS` (#118 (d)) and
-    `PARTIAL_RESULT_TTL_SECONDS` (#313 D) — each default `0` = off, purely additive.
+    `CATALOG_UNSERVABLE_TTL_SECONDS` (#36) and `UAF_RESOLVED_TTL_SECONDS` (#118 (d)) — each
+    default `0` = off, purely additive. (`PARTIAL_RESULT_TTL_SECONDS` (#313 D) was retired in
+    1.12.6 C9; it is audited as a retired flag.)
 - The subsystem is kept structurally removable (`internal/cache/cache.go` package contract,
   `project_caching_is_provisional`).
 

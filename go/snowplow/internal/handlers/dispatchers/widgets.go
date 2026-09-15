@@ -391,14 +391,15 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// PERSISTED, so a transient apiRef-item failure self-heals on the next
 	// resolve instead of pinning a partial cell for the TTL.
 	// 1.12.3 A-1 / R-1 (SECURITY, cross-tenant) — THE UAF DECLINE IS FIRST IN THE
-	// CHAIN, and the position is load-bearing. TWO branches below this point also
-	// WRITE: the stage-error branch Puts a bounded partial via putPartialWithTTL
-	// (when PARTIAL_RESULT_TTL_SECONDS is set), and the external-TTL branch Puts
-	// under the opt-in `krateo.io/external-cache-ttl-seconds` annotation. Gating
-	// only in front of the "genuine Put" branch would leave a refilter-narrowed
-	// widget body reachable through either of them, under the same shared
-	// per-binding key. A per-requester-narrowed body must not be persisted by ANY
-	// branch, so the gate sits ahead of all of them.
+	// CHAIN, and the position is load-bearing. The external-TTL branch below
+	// also WRITES (under the opt-in `krateo.io/external-cache-ttl-seconds`
+	// annotation). Gating only in front of the "genuine Put" branch would leave
+	// a refilter-narrowed widget body reachable through it, under the same
+	// shared per-binding key. A per-requester-narrowed body must not be
+	// persisted by ANY branch, so the gate sits ahead of all of them. (1.12.6
+	// C9 retired the other writer this comment used to name — the
+	// PARTIAL_RESULT_TTL_SECONDS bounded-partial Put on the stage-error branch;
+	// that branch is now a bare decline.)
 	//
 	// The envelope is still SERVED — the 200 with this requester's own narrowed
 	// widgetData is written below either way; only the shared-cell write, its dep
@@ -414,18 +415,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("effect", "envelope served (200) narrowed for THIS requester; not persisted — the widgets cell is keyed per BINDING, so a co-bound user would be served these rows verbatim (1.12.3 A-1/R-1; 1.13.0 folds the UAF scope into the key)"),
 		)
 	} else if stageErrSink.Count() > 0 {
-		// D (bounded partial-cache backstop, default-off) — twin of restactions.go;
-		// Put the partial under the SAME per-user widgets cacheKey with a bounded
-		// PARTIAL_RESULT_TTL_SECONDS window. No-op when the env is 0 (default). With
-		// R landed the widget path resolves clean so this branch is not reached for
-		// a self-referential widget (C6).
-		staleCached := putPartialWithTTL(cacheHandle, cacheKey, encoded, cacheInputs,
-			got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
+		// A bare decline, twin of restactions.go: the partial envelope is
+		// SERVED (written below) and not persisted. 1.12.6 C9 retired the D
+		// bounded-partial Put that used to sit here (PARTIAL_RESULT_TTL_SECONDS).
 		log.Warn("Widget served with per-item stage error(s); declining to cache the partial result",
 			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.Bool("partial_bounded_stale_cached", staleCached),
-			slog.String("partial_ttl_s", partialResultTTL().String()),
-			slog.String("effect", "partial body served (200); not persisted under the full TTL — transient item failures self-heal on next resolve (D bounded-stale window if enabled)"),
+			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
 		)
 	} else if extTTL := externalCacheTTLFromAnnotations(got.Unstructured); extTouchedSink.Count() > 0 && extTTL > 0 &&
 		cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {

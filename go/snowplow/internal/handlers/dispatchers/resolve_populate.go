@@ -40,6 +40,7 @@ package dispatchers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -249,12 +250,38 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// type-exists conjunct as the bound. That conjunct could not hold and
 		// was removed — see the comment at the wrap site in resolveOnceProd.
 		// The requeue budget is the only bound, and it is sufficient.
+		//
+		// 1.12.6 C4 (§6.2 row 4) — an entry kind the seam cannot refresh will
+		// never become refreshable for THIS entry: SUPPRESS it (refresh-by-
+		// traffic-only, cleared by the next real Put) instead of skipping it
+		// to TTL forever. Not an error for the refresher: nothing to retry.
+		if errors.Is(err, cache.ErrRefreshUnsupported) {
+			cache.NoteRefreshDecline(key, "unsupported_kind", true)
+			log.Debug("resolveAndPopulateL1: entry kind not refreshable; suppressed until the next real Put",
+				slog.String("subsystem", "cache"),
+				slog.String("key_hash", key),
+				slog.String("handler", inputs.CacheEntryClass),
+			)
+			return nil
+		}
 		return fmt.Errorf("resolveAndPopulateL1 %s/%s: %w",
 			inputs.CacheEntryClass, inputs.Name, err)
 	}
 	if encoded == nil {
-		// The seam declined to resolve (e.g. unknown handler kind) —
-		// skip-to-TTL, not an error.
+		// The seam declined to resolve without an error — today the two
+		// RAFullList sentinels (no status produced; the empty-full guard while
+		// its informer is still syncing). Skip-to-TTL for THIS dequeue, not an
+		// error; the next dirty-mark re-resolves it. The permanent "unknown
+		// kind" case is the typed ErrRefreshUnsupported above.
+		//
+		// 1.12.6 C4 (§6.1, architect N6): this must not be a "forget the key
+		// and keep the entry" outcome. A genuinely transient pre-sync window
+		// clears well inside K=REFRESH_SUPPRESS_AFTER_DECLINES dequeues and is
+		// unaffected; an RA whose full is PERMANENTLY empty would otherwise
+		// re-resolve on every dirty-mark forever — the #191 shape — so after K
+		// consecutive declines the key becomes refresh-by-traffic-only until
+		// the next real Put, like every other decline site.
+		cache.NoteRefreshDecline(key, "empty_full", false)
 		return nil
 	}
 
@@ -286,6 +313,14 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// inline so a decline can be attributed without a cross-grep
 		// against the resolver's error lines (which cost two traces).
 		sampleStage, sampleErr := stageErrSink.Sample()
+		// 1.12.6 C4 (§6.2 row 6, #191) — an inner stage that fails under the
+		// SA identity (an exportJwt loopback, a per-user RBAC denial) fails
+		// the same way on EVERY refresh; pre-1.12.6 this key re-resolved
+		// every ~3 min forever (956 WARNs from 23 keys in 4.5 h on
+		// krateo-057). After K consecutive declines the key is SUPPRESSED:
+		// refresh-by-traffic-only, cleared by the next real Put. The body is
+		// still correct — real user traffic is what writes it.
+		suppressed := cache.NoteRefreshDecline(key, "stage_error", false)
 		log.Warn("resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
@@ -294,7 +329,14 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("stage_err_stage", sampleStage),
 			slog.String("stage_err_sample", sampleErr),
-			slog.String("effect", "prior good entry kept; TTL is the outer net"),
+			slog.Bool("suppressed", suppressed),
+			slog.String("effect", "prior good entry kept; TTL is the outer net"+
+				func() string {
+					if suppressed {
+						return "; key now refresh-by-traffic-only (no further refresh WARNs until a real Put)"
+					}
+					return ""
+				}()),
 		)
 		cache.BumpRefresherSkippedStageError()
 		return nil
@@ -306,6 +348,10 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// entry; TTL is the outer net) exactly as the stage-error gate does.
 	if extTouchedSink.Count() > 0 {
 		cache.BumpExternalSkippedPut()
+		// 1.12.6 C4 (§6.2 row 7) — structurally permanent: an external RA has
+		// no dep edge, so every dirty-mark re-resolve is pure waste. Suppress
+		// on first occurrence; the next real Put clears it.
+		cache.NoteRefreshDecline(key, "external_touched", true)
 		// Not a fault: a designed defense-in-depth decline (external data has no
 		// dep edge to invalidate it, so keep the prior entry; TTL is the outer
 		// net). Fires on every refresh of an external-touching entry — DEBUG.
@@ -340,6 +386,9 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		} else {
 			declineUAFPut(&inputs, uafTouchedSink)
 		}
+		// 1.12.6 C4 (§6.2 row 8) — structurally permanent until 1.13.0 folds
+		// the UAF scope into the key (#180): suppress on first occurrence.
+		cache.NoteRefreshDecline(key, "uaf", true)
 		// DEBUG for the same reason as the dispatch site: expected, designed, and
 		// potentially per-refresh-cycle frequent. The counter carries the rate.
 		log.Debug("resolveAndPopulateL1: re-resolve is userAccessFilter-narrowed; declining to re-Put",
@@ -554,8 +603,9 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 		// the AC-G.5 contract.
 		return resolveWidgetForRefresh(ctx, got, inputs, authnNS)
 	default:
-		// Unknown handler kind — skip-to-TTL.
-		return nil, nil
+		// Unknown handler kind — 1.12.6 C4 (§6.2 row 4): typed, so the caller
+		// SUPPRESSES the key instead of skipping it to TTL forever.
+		return nil, fmt.Errorf("refresh of class %q: %w", inputs.CacheEntryClass, cache.ErrRefreshUnsupported)
 	}
 }
 

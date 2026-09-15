@@ -130,8 +130,8 @@
 //     data-plane override for their own degradation. Capping the substrate would
 //     be wrong-cell and would churn a shared hot cell for zero RBAC-freshness
 //     gain. (Traced + agreed with arch/PM; no disagreement to flag.)
-//   - partial_result_ttl.go:85 — self-stamps its OWN bounded TTLOverride for a
-//     partial-with-errors body; independent bounded-staleness mechanism. Untouched.
+//   - (partial_result_ttl.go — the bounded-partial writer this map used to list
+//     was RETIRED in 1.12.6 C9; the stage-error branch is a bare decline again.)
 //   - RETRACTED — THIS PARAGRAPH WAS THE R-1 BLOCKER. It previously read: "UAF is
 //     a restactions-STAGE contract ... the UAF refilter output only ever lands in
 //     a restactions-class cell, never a widget-class one", and on that basis put

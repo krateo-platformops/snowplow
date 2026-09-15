@@ -47,11 +47,18 @@ import (
 
 // Resolver-cache env knobs (defaults match chart-0.30.7 spec).
 const (
-	envResolvedCacheEnabled      = "RESOLVED_CACHE_ENABLED"
-	envResolvedCacheMaxEntries   = "RESOLVED_CACHE_MAX_ENTRIES"
-	envResolvedCacheMaxBytes     = "RESOLVED_CACHE_MAX_BYTES"
-	envResolvedCacheTTLSeconds   = "RESOLVED_CACHE_TTL_SECONDS"
-	envResolvedCacheSummaryEvery = "RESOLVED_CACHE_SUMMARY_EVERY_SECONDS"
+	envResolvedCacheEnabled    = "RESOLVED_CACHE_ENABLED"
+	envResolvedCacheMaxEntries = "RESOLVED_CACHE_MAX_ENTRIES"
+	envResolvedCacheMaxBytes   = "RESOLVED_CACHE_MAX_BYTES"
+	envResolvedCacheTTLSeconds = "RESOLVED_CACHE_TTL_SECONDS"
+	// 1.12.6 C5 (design §7) — bounded entry LIFETIME, distinct from the TTL.
+	// The TTL is measured from the last Put and a refresh re-Put resets it,
+	// so an entry the refresher keeps re-Putting never expires: a wrong
+	// refresh (stale body, missed edge) can be served for the life of the
+	// pod. BornAt is the FIRST Put under the key and survives every re-Put;
+	// Get evicts when now-BornAt exceeds this. String-typed; "0" disables.
+	envResolvedCacheMaxEntryAgeSeconds = "RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS"
+	envResolvedCacheSummaryEvery       = "RESOLVED_CACHE_SUMMARY_EVERY_SECONDS"
 
 	// envCatalogUnservableTTLSeconds is the R1 Layer 2 (#36) bounded
 	// staleness backstop. When > 0, an apistage entry stored while its
@@ -117,7 +124,8 @@ const (
 	defaultResolvedCacheMaxEntries          = 100_000
 	defaultResolvedCacheMaxBytes            = int64(2) * 1024 * 1024 * 1024 // 2 GiB
 	defaultResolvedCacheTTLSeconds          = 3600
-	defaultResolvedCacheSummaryEverySeconds = 300 // 5 min aggregate INFO line
+	defaultResolvedCacheMaxEntryAgeSeconds  = 86400 // 24h — the design's signed number
+	defaultResolvedCacheSummaryEverySeconds = 300   // 5 min aggregate INFO line
 
 	// defaultResolvedCacheMaxResidentBytes — Ship 4a (0.30.198). The
 	// resident region holds the EXPENSIVE prewarmed RAFullList cells
@@ -208,7 +216,18 @@ const CacheEntryClassRAFullList = "raFullList"
 // remain unchanged from sub-ship A.
 type ResolvedEntry struct {
 	RawJSON   []byte    // pre-encoded resolver output, ready to write
-	CreatedAt time.Time // for TTL eviction
+	CreatedAt time.Time // for TTL eviction (reset by every Put, refresh re-Puts included)
+
+	// BornAt — 1.12.6 C5 (design §7): when the FIRST entry under this key
+	// was Put. Put inherits it from the entry it replaces, so unlike
+	// CreatedAt it is NOT reset by a refresh re-Put; Get evicts an entry
+	// older than RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS (evict_max_age_total)
+	// and the next traffic re-resolves it from scratch. This is the
+	// bounded-lifetime backstop for a wrong refresh: no L1 cell can be
+	// served for longer than the max age without a cold re-resolve. Zero on
+	// a first Put means "now"; a non-zero value on a first Put is honoured
+	// (tests, and any future caller that knows the real birth).
+	BornAt time.Time
 
 	// SeededAtBoot marks an entry written by the Phase-1 boot seed
 	// (seedOneWidget / seedOneRestaction Put), as opposed to a real
@@ -530,11 +549,16 @@ type ResolvedCacheStore struct {
 	curResidentBytes int64
 	residentEntries  int
 
+	// 1.12.6 C5 — bounded entry lifetime measured from ResolvedEntry.BornAt
+	// (see the field). 0 disables. Read once at construction.
+	maxEntryAge time.Duration
+
 	// Falsifier counters (atomic; safe to read without mu).
 	hitTotal         atomic.Uint64
 	missTotal        atomic.Uint64
 	evictLRUTotal    atomic.Uint64
 	evictTTLTotal    atomic.Uint64
+	evictMaxAgeTotal atomic.Uint64 // 1.12.6 C5: Get-time evictions past maxEntryAge
 	evictDeleteTotal atomic.Uint64 // 0.30.8: DELETE-event-driven evictions
 	storeTotal       atomic.Uint64
 
@@ -691,6 +715,9 @@ func ResolvedCache() *ResolvedCacheStore {
 		// (e.g. "5e8") parses via the ParseFloat fallback.
 		resolvedCacheInstance.maxResidentBytes = int64BytesFromEnv(
 			envResolvedCacheMaxResidentBytes, defaultResolvedCacheMaxResidentBytes)
+		// 1.12.6 C5 — the bounded entry lifetime. An explicit "0" DISABLES
+		// it and is preserved; unset/unparseable/negative → the default.
+		resolvedCacheInstance.maxEntryAge = maxEntryAgeFromEnv()
 		// 0.30.8: wire the cache into the dep tracker so OnDelete can
 		// evict and so any eviction path (LRU/TTL/DELETE) calls
 		// Deps().RemoveL1Key to keep dep records and L1 entries
@@ -723,6 +750,9 @@ func newResolvedCache(maxEntries int, maxBytes int64, ttl time.Duration) *Resolv
 		maxEntries: maxEntries,
 		maxBytes:   maxBytes,
 		ttl:        ttl,
+		// 1.12.6 C5 — default the bounded lifetime; the production
+		// singleton OVERWRITES it from the env (where "0" disables).
+		maxEntryAge: time.Duration(defaultResolvedCacheMaxEntryAgeSeconds) * time.Second,
 		// Ship 4a (0.30.198) — default the resident budget so test
 		// construction has pinning available. The production singleton path
 		// OVERWRITES this from RESOLVED_CACHE_MAX_RESIDENT_BYTES (where an
@@ -941,6 +971,19 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 		c.missTotal.Add(1)
 		return nil, false
 	}
+	// 1.12.6 C5 (design §7) — bounded LIFETIME, measured from the first Put
+	// under this key (BornAt), which a refresh re-Put does not reset. Past
+	// the max age the entry is evicted here and the request that hit it
+	// re-resolves cold: the backstop that guarantees no L1 cell — however
+	// often the refresher re-Puts it — outlives the max age without a
+	// from-scratch resolve. Counted separately from TTL so the two reasons
+	// for leaving stay distinguishable.
+	if c.maxEntryAge > 0 && !item.entry.BornAt.IsZero() && time.Since(item.entry.BornAt) > c.maxEntryAge {
+		c.removeElementLocked(el)
+		c.evictMaxAgeTotal.Add(1)
+		c.missTotal.Add(1)
+		return nil, false
+	}
 	// LRU touch: move to front.
 	c.order.MoveToFront(el)
 	c.hitTotal.Add(1)
@@ -958,7 +1001,18 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now()
 	}
+	// 1.12.6 C5 — a first Put is the entry's birth; a replace-in-place Put
+	// INHERITS the prior entry's BornAt below (under mu), so a refresh
+	// re-Put never resets the lifetime clock.
+	if entry.BornAt.IsZero() {
+		entry.BornAt = entry.CreatedAt
+	}
 	bytes := entryBytes(entry)
+	// 1.12.6 C4 (§6.4) — a real Put is by definition the "next real Put" a
+	// refresh suppression waits for: clear the marker (and the consecutive-
+	// decline counter) BEFORE taking the store lock. Two sync.Map deletes,
+	// no allocation, no refresher construction.
+	clearRefreshSuppression(key)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1007,6 +1061,12 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 			c.residentEntries--
 		} else {
 			c.curBytes -= old.bytes
+		}
+		// 1.12.6 C5 — the lifetime clock belongs to the KEY, not the bytes:
+		// inherit the prior birth so a re-Put (refresher, keep-warm sweep,
+		// user traffic) extends the TTL but never the max age.
+		if old.entry != nil && !old.entry.BornAt.IsZero() {
+			entry.BornAt = old.entry.BornAt
 		}
 		old.entry = entry
 		old.bytes = bytes
@@ -1141,6 +1201,7 @@ type ResolvedCacheStats struct {
 	StoreTotal       uint64
 	EvictLRUTotal    uint64
 	EvictTTLTotal    uint64
+	EvictMaxAgeTotal uint64 // 1.12.6 C5: evicted at Get past RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS
 	EvictDeleteTotal uint64 // 0.30.8: DELETE-event-driven evictions
 
 	// Ship E (0.30.116) api-stage counters.
@@ -1182,6 +1243,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		StoreTotal:              c.storeTotal.Load(),
 		EvictLRUTotal:           c.evictLRUTotal.Load(),
 		EvictTTLTotal:           c.evictTTLTotal.Load(),
+		EvictMaxAgeTotal:        c.evictMaxAgeTotal.Load(),
 		EvictDeleteTotal:        c.evictDeleteTotal.Load(),
 		ApistageStoreTotal:      c.apistageStoreTotal.Load(),
 		ApistageEvictTotal:      c.apistageEvictTotal.Load(),
@@ -1568,6 +1630,9 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	item := el.Value.(*lruItem)
 	delete(c.index, item.key)
 	c.order.Remove(el)
+	// 1.12.6 C4 (§6.4) — a refresh-suppression marker must not outlive its
+	// key (every eviction path but deleteForDep funnels through here).
+	clearRefreshSuppression(item.key)
 	// Ship 4a (0.30.198) — debit the correct budget. A pinned entry's bytes
 	// live in the resident region; a transient entry's in curBytes.
 	if item.entry != nil && item.entry.Pinned {
@@ -1638,6 +1703,10 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	item := el.Value.(*lruItem)
 	delete(c.index, item.key)
 	c.order.Remove(el)
+	// 1.12.6 C4 (§6.4) — this is the one eviction body that does NOT go
+	// through removeElementLocked; the marker must not outlive its key here
+	// either (TestRefreshTerminal_F6e).
+	clearRefreshSuppression(item.key)
 	// Ship 4a (0.30.198) — debit the correct budget (a DELETE can evict a
 	// pinned cell; the resident region is TTL/DELETE-evictable, only LRU-
 	// pressure spares it).
@@ -1713,6 +1782,7 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 				slog.Float64("hit_rate", s.HitRate()),
 				slog.Uint64("evict_lru", s.EvictLRUTotal),
 				slog.Uint64("evict_ttl", s.EvictTTLTotal),
+				slog.Uint64("evict_max_age", s.EvictMaxAgeTotal),
 				slog.Uint64("evict_delete", s.EvictDeleteTotal),
 				slog.Uint64("refresh_enqueued", d.EnqueueUpdateTotal),
 				slog.Uint64("refresh_completed", r.completed),
@@ -1796,6 +1866,27 @@ func (c *ResolvedCacheStore) DeleteForTest(key string) {
 // intentionally accept any non-int value as "use default" with no
 // logging — env-knob misconfiguration is a deploy issue and the test
 // suite covers correct parses.
+// maxEntryAgeFromEnv reads RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS (1.12.6 C5).
+// An explicit "0" DISABLES the bound and is preserved; unset, unparseable or
+// negative → the 86400 s default. Exported through ResolvedCacheMaxEntryAge
+// for the summary line and the docs.
+func maxEntryAgeFromEnv() time.Duration {
+	n := intFromEnv(envResolvedCacheMaxEntryAgeSeconds, defaultResolvedCacheMaxEntryAgeSeconds)
+	if n < 0 {
+		n = defaultResolvedCacheMaxEntryAgeSeconds
+	}
+	return time.Duration(n) * time.Second
+}
+
+// ResolvedCacheMaxEntryAge returns the store's bounded entry lifetime (0 =
+// disabled). Nil-safe.
+func (c *ResolvedCacheStore) ResolvedCacheMaxEntryAge() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return c.maxEntryAge
+}
+
 func intFromEnv(key string, def int) int {
 	v := os.Getenv(key)
 	if v == "" {

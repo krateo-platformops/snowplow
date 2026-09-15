@@ -126,6 +126,27 @@ func registerRefresherMetrics() {
 		expvar.Publish("snowplow_refresher_floored_total", expvar.Func(func() any {
 			return refresherStatsSnapshot().floored
 		}))
+		// 1.12.6 C4 (§6) — terminal-semantics counters. drop_evict_total is
+		// the non-404 drop-point evictions performed; drop_evict_suspended_
+		// total the ones the breaker refused (a mass failure — the entries
+		// stayed resident and served); suppressed_* the #191 refresh-by-
+		// traffic-only markers. Alerting pair: drop_evict_suspended_total > 0
+		// means "an outage-shaped failure burst", not a cache defect.
+		expvar.Publish("snowplow_refresher_drop_evict_total", expvar.Func(func() any {
+			return RefreshTerminalStatsSnapshot().DropEvictTotal
+		}))
+		expvar.Publish("snowplow_refresher_drop_evict_suspended_total", expvar.Func(func() any {
+			return RefreshTerminalStatsSnapshot().DropEvictSuspendedTotal
+		}))
+		expvar.Publish("snowplow_refresher_suppressed_set_total", expvar.Func(func() any {
+			return RefreshTerminalStatsSnapshot().SuppressedSetTotal
+		}))
+		expvar.Publish("snowplow_refresher_suppressed_skips_total", expvar.Func(func() any {
+			return RefreshTerminalStatsSnapshot().SuppressedSkipsTotal
+		}))
+		expvar.Publish("snowplow_refresher_suppressed_keys", expvar.Func(func() any {
+			return RefreshTerminalStatsSnapshot().SuppressedKeys
+		}))
 	})
 }
 

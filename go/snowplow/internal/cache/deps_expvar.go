@@ -129,6 +129,13 @@ func DepsStatsByStat() map[string]int64 {
 		// gone by some other route.
 		"evict_self_gone_total":     int64(d.EvictSelfGoneTotal),
 		"self_notfound_evict_total": int64(RefresherSelfNotFoundEvictTotal()),
+		// 1.12.6 C4: the drop point evicts after a deterministic NON-404
+		// failure (403/500/timeout/parse/not-servable) exhausted the requeue
+		// budget under the breaker. Its OWN counter, so evict_self_gone_total
+		// keeps meaning "confirmed 404" during an apiserver outage (when this
+		// one climbs and snowplow_refresher_drop_evict_suspended_total says
+		// the breaker is holding the rest back).
+		"evict_drop_point_total": int64(d.EvictDropPointTotal),
 
 		// --- the informer bridge: ADD gate ---
 		"add_propagated":       int64(w.AddPropagated),

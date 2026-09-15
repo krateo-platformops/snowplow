@@ -244,8 +244,25 @@ TTL is always `min(override, store TTL)`:
   RBAC-staleness window the per-object refilter can otherwise accumulate. Default 0 =
   disabled — the durable fix is the `RBACSubGen` key fold (§3.1).
 - **External-widget bounded-TTL (opt-in)** — see §4 step 4 and `external_ttl.go`.
-- **Partial-result TTL** — `partial_result_ttl.go`, a short TTL for deliberately-partial
-  bodies.
+
+(A third mechanism, the `PARTIAL_RESULT_TTL_SECONDS` bounded Put of a partial-with-errors
+body, was retired in 1.12.6 C9. It was default-off and never enabled on any deployment; a
+partial body is exactly the content §5.3 and the lifetime bound below exist to keep out of L1.
+The env var is now a retired flag: setting it to anything but `0` logs a startup WARN.)
+
+**Bounded lifetime (1.12.6, `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS`, default `"86400"`).** The
+TTL above is measured from `CreatedAt`, which *every* `Put` resets — a refresher re-Put or a
+keep-warm sweep included — so an entry the event pipeline keeps re-Putting never expires, and a
+wrong refresh (a stale body, a missed dep edge) is served for the life of the pod. Nothing in
+the pipeline can catch a mistake the pipeline itself made; a lifetime bound measured from the
+**first** `Put` can. `ResolvedEntry.BornAt` is set on the first `Put` under a key and
+**inherited** by every replace-in-place `Put`; `Get` evicts an entry older than the max age
+(`evict_max_age_total`, distinct from `evict_ttl_total`) and the request that hit it re-resolves
+from scratch. It is a backstop, not a refresh cadence: at the default every L1 cell is
+guaranteed one from-scratch resolve per day, and the eviction lands on a customer request path
+only when that cell was not otherwise re-resolved in 24 h. `"0"` disables. Arms:
+`resolved_max_entry_age_test.go` (G1 is RED on 1.12.5: a key re-Put every 400 ms under a 1 s
+bound is still evicted).
 
 ---
 
@@ -387,9 +404,11 @@ spread by the refresher rate floor.
 Two further bounds, each with its own arm
 (`dispatchers/issue187_self_notfound_evict_test.go`, `cache/issue187_recreate_falsifier_test.go`):
 
-- **Only a definite 404.** A 403, a 500, a timeout or a parse failure never carries the
-  sentinel, so the key drops to TTL exactly as before. An apiserver hiccup or an RBAC blip
-  cannot evict a slice of L1.
+- **Only a definite 404 takes the self-gone route.** A 403, a 500, a timeout or a parse
+  failure never carries the sentinel and is never counted as a deletion. Until 1.12.5 such a
+  key dropped to TTL with its stale body resident; since 1.12.6 a failure that exhausts the
+  budget is evicted at the drop point too, behind the breaker of §5.3 — so an apiserver
+  hiccup or an RBAC blip still cannot evict a slice of L1 at once.
 - **Never a synthesised 404.** Under `cache.WithInformerOnlyReads`, `objects.Get` fabricates a
   NotFound without asking the apiserver; that means "absent from the indexer", not "deleted".
 - **Only the self object, structurally.** The sentinel is wrapped at exactly one site — the
@@ -449,6 +468,49 @@ up as `reconcile_divergence_total > 0` (alertable) and that entries which keep b
 stranded entry can be served. Raise `DEPS_RECONCILE_SAMPLE` for a tighter bound (O(sample)
 under the store mutex per tick). Full arithmetic next to the counter rows in observability.md.
 
+### 5.3 Terminal refresh semantics (1.12.6, #191)
+
+**No refresh outcome may end in "forget the key and keep the entry".** Every path through the
+refresher ends in exactly one of three states, all counted:
+
+| Outcome | When | Counter |
+|---|---|---|
+| **re-Put** | the re-resolve succeeded | `completed_total` |
+| **evict** | the entry's basis is gone or unverifiable: the self-object 404 (§5.1), and since 1.12.6 **every** deterministic failure that exhausts `maxRefreshRequeues` — 403, 500, timeout, parse failure, an apistage content call that is not servable | `self_notfound_evict_total`, `drop_evict_total` |
+| **suppress** | the decline sites in `resolveAndPopulateL1` (stage error, external endpoint, `userAccessFilter` cell, unsupported kind) — the key is marked *refresh-by-traffic-only*, skipped by the refresher without a resolve, and cleared by the next real `Put` or by any eviction | `suppressed_set_total`, `suppressed_skips_total`, `suppressed_keys` |
+
+Before 1.12.6 the drop point in `processNext` forgot a non-404 key and left the stale body
+resident until the 1 h TTL, and the decline gates re-resolved the same key on every dirty-mark
+forever — #191 was 956 WARNs from 23 keys in 4.5 h, every one a deterministic `exportJwt`
+401 under the SA identity.
+
+**The breaker (`REFRESH_DROP_EVICT_MAX_PER_MINUTE`, default `"64"`).** Evicting is right for a
+handful of dead objects and wrong for a mass failure: an apiserver outage fails every refresh,
+so after the budget every dirty-marked key reaches the drop point, and evicting them all turns a
+stale portal into a broken one on top of the outage. The knob is a token bucket on drop-point
+evictions, **not a rate limit** — it is the discriminator between the correctness regime (a few
+deterministic failures, evict) and the availability regime (a mass failure, keep serving).
+Over budget the key keeps the pre-1.12.6 drop-to-TTL, `drop_evict_suspended_total` ticks and
+**one** WARN per suspension window (`refresher.drop_evict_suspended`) names the suspected
+outage. `"0"` disables drop-point eviction for non-404 failures entirely — byte-identical to
+1.12.5 — and is the kill switch. The self-object 404 route is not subject to the breaker.
+
+**Suppression (`REFRESH_SUPPRESS_AFTER_DECLINES`, default `"3"`).** A stage-error decline is
+suppressed after K consecutive declines of the same key; the structurally permanent declines
+(external endpoint, UAF cell, unsupported kind) suppress on the first. The marker is package
+state in `refresher_terminal.go`, never a field on the resident entry (`Get` hands out the live
+pointer; mutating it is a data race), so `Put` and every eviction path can clear it without
+constructing the refresher. A suppressed entry is still served and still correct — real user
+traffic is what writes it; `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS` (§3.4) bounds how long it can
+live without one.
+
+The arms are `cache/refresh_terminal_test.go` (F5a/F5b are the two-regime pin: three failures
+under the default budget all evict with the breaker idle; six failures under budget `"1"` evict
+one and keep five resident **and served** — an unbounded evict passes the first and fails the
+second, a never-evict the reverse) and
+`dispatchers/issue1126_c4_terminal_e2e_test.go` (rows 3/4/6/9 driven through the production
+`resolveAndPopulateL1`).
+
 ---
 
 ## 6. Invariants
@@ -504,6 +566,10 @@ under the store mutex per tick). Full arithmetic next to the counter rows in obs
 - **Stale content past dirty-mark.** Dirty-marking only *enqueues* a refresher re-resolve; until
   the refresher runs, a hit serves the prior bytes (stale-while-revalidate by design). A wedged
   or back-pressured refresher leaves stale content until TTL.
+- **Breaker suspension during an outage.** While `refresher.drop_evict_suspended` is firing,
+  keys past the budget keep the old drop-to-TTL and serve stale until a later dirty-mark or the
+  max entry age; that is the intended availability posture, not a stuck refresher. A steadily
+  climbing `drop_evict_suspended_total` with a healthy apiserver means the budget is too low.
 - **Dep-record cap drop.** Past the cap, new dep edges are dropped silently and a one-shot WARN
   (`deps.cache.cap_reached`) fires; affected entries then rely on TTL rather than event-driven
   invalidation.
@@ -527,6 +593,7 @@ under the store mutex per tick). Full arithmetic next to the counter rows in obs
 | Retired-flag audit | `internal/cache/retired_flags.go` | `AuditRetiredFlags` |
 | L1 store, keys, dedup, TTL overrides | `internal/cache/resolved.go` | `ComputeKey`, `canonicaliseExtras`, `ResolvedKeyInputs` (`BindingUID`, `RBACSubGen`, `HasUAF`), `resolvedKeyVersion="v6"`, entry classes, `Get`, `Put` |
 | RBAC sub-generation | `internal/cache/rbac_subgen.go`, `rbac_subgen_pending.go` | `RBACSubGenForSubject`, publish-deferred bumps |
+| Terminal refresh semantics (breaker, suppression) | `internal/cache/refresher_terminal.go` | `dropEvictBreaker`, `NoteRefreshDecline`, `RefreshTerminalStatsSnapshot`; consulted in `refresher.go` `processNext` |
 | Invalidation | `internal/cache/deps.go`, `deps_watch.go` | `Record`, `RecordList`, `OnObjectEvent` (state-derived; `OnAdd`/`OnUpdate`/`OnDelete` are shims), `isSelfRepresentation`; bridge: `depEventHandlers` → `submitDepEvent` → `probeObjectState` |
 | External Put-gate | `internal/cache/external_touched_sink.go` | `WithExternalTouchedSink` |
 | L3 informer | `internal/cache/watcher.go` | `NewResourceWatcher`, `GetObject`, `ListObjects`, `depEventHandlers` |

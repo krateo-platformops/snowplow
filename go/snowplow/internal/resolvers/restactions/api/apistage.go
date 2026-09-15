@@ -34,6 +34,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -789,9 +790,16 @@ func RefreshContentEntry(ctx context.Context, inputs cache.ResolvedKeyInputs) ([
 	}
 	raw, served := dispatchViaInformer(cache.WithApistageContentResolve(ctx), call)
 	if !served {
-		// Not pivot-servable (pre-sync informer, metadata-only GVR, …) —
-		// skip-to-TTL. Not an error: a later request re-dispatches.
-		return nil, nil
+		// Not pivot-servable (pre-sync informer, metadata-only GVR, …).
+		// 1.12.6 C4 (§6.2 row 9): TYPED, not (nil, nil). The (nil, nil)
+		// skip-to-TTL left the apistage carrier with one layer where every
+		// other class has two — no 404 discrimination, the entry resident
+		// until TTL no matter how many refreshes failed. As an error it
+		// enters the refresher's requeue budget like every other
+		// deterministic failure and reaches the drop point (evict behind
+		// the breaker). A transient pre-sync window clears inside the
+		// budget and never gets there.
+		return nil, fmt.Errorf("content %s/%s/%s: %w", inputs.Resource, inputs.Namespace, inputs.Name, cache.ErrContentNotServable)
 	}
 	return raw, nil
 }

@@ -1,23 +1,25 @@
-// nested_resolve_ingest_falsifier_test.go — R+D hermetic falsifiers for the
+// nested_resolve_ingest_falsifier_test.go — R hermetic falsifiers for the
 // composition-resources HTTP-loopback guard (design
 // docs/composition-resources-loopback-fix-design-2026-07-01.md §6).
 //
 // Arms:
-//   C2 (forge-guard, HARD RED): a NON-seed / external client sending
-//      X-Snowplow-Nested-Depth:8 + a spoofed ancestor set is NOT trusted →
-//      isTrustedSelfLoopback=false → reseedNestedGuardsFromHeaders is a no-op →
-//      the HTTP-edge stop never fires → a normal full resolve. Both header types
-//      ignored. This is the cache-poison / work-avoidance / DoS boundary.
-//   GREEN (HTTP-edge stop): a TRUSTED seed self-loopback whose own node is in the
-//      inbound ancestor set → the stop returns raw=true (raw CR), the cycle-stop
-//      counter increments (proof the guard fires). RBAC ordering (C3) is pinned by
-//      construction: httpEdgeGuardStop takes NO identity and calls NO RBAC — so it
-//      structurally cannot precede/bypass the handler's checkDispatchRBAC (which
-//      the diff places BEFORE the stop-block).
-//   DEPTH (backstop): a trusted loopback at depth==NestedCallMaxDepth trips the
-//      depth-8 backstop (raw=false → bounded error), bumping the depth counter.
-//   D arms: default-off no-op; on-arm bounded-stale Put; C6 doesn't-fire (a clean
-//      resolve never reaches the decline site → D's counter stays 0 for it).
+//
+//	C2 (forge-guard, HARD RED): a NON-seed / external client sending
+//	   X-Snowplow-Nested-Depth:8 + a spoofed ancestor set is NOT trusted →
+//	   isTrustedSelfLoopback=false → reseedNestedGuardsFromHeaders is a no-op →
+//	   the HTTP-edge stop never fires → a normal full resolve. Both header types
+//	   ignored. This is the cache-poison / work-avoidance / DoS boundary.
+//	GREEN (HTTP-edge stop): a TRUSTED seed self-loopback whose own node is in the
+//	   inbound ancestor set → the stop returns raw=true (raw CR), the cycle-stop
+//	   counter increments (proof the guard fires). RBAC ordering (C3) is pinned by
+//	   construction: httpEdgeGuardStop takes NO identity and calls NO RBAC — so it
+//	   structurally cannot precede/bypass the handler's checkDispatchRBAC (which
+//	   the diff places BEFORE the stop-block).
+//	DEPTH (backstop): a trusted loopback at depth==NestedCallMaxDepth trips the
+//	   depth-8 backstop (raw=false → bounded error), bumping the depth counter.
+//
+// The D arms (PARTIAL_RESULT_TTL_SECONDS bounded-partial Put) that used to live
+// here were retired with the layer in 1.12.6 C9.
 package dispatchers
 
 import (
@@ -27,12 +29,10 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
-	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // testLogger is a discard slog logger for the guard arms (they read no logs).
@@ -211,101 +211,5 @@ func TestR_HostMismatch_NotTrusted(t *testing.T) {
 	req := buildLoopbackReq("admin", "evil.example.com:8081", "1", "restactions/ns/x")
 	if isTrustedSelfLoopback(req) {
 		t.Fatal("host-mismatch: a valid user on a NON-self host must not be trusted (belt-and-suspenders)")
-	}
-}
-
-// --- D arms ---
-
-// fakeCacheHandle records Puts for the D arms.
-type fakeCacheHandle struct {
-	puts map[string]*cache.ResolvedEntry
-}
-
-func newFakeCacheHandle() *fakeCacheHandle {
-	return &fakeCacheHandle{puts: map[string]*cache.ResolvedEntry{}}
-}
-func (f *fakeCacheHandle) Get(key string) (*cache.ResolvedEntry, bool) {
-	e, ok := f.puts[key]
-	return e, ok
-}
-func (f *fakeCacheHandle) Put(key string, entry *cache.ResolvedEntry) { f.puts[key] = entry }
-
-var testGVR = schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
-
-// TestD_DefaultOff_NoOp — with PARTIAL_RESULT_TTL_SECONDS unset (default 0), D is
-// a no-op: no Put, counter flat, byte-identical to the pre-D bare decline.
-func TestD_DefaultOff_NoOp(t *testing.T) {
-	t.Setenv("PARTIAL_RESULT_TTL_SECONDS", "") // default 0
-	h := newFakeCacheHandle()
-	before := cache.PartialServedStale()
-	did := putPartialWithTTL(h, "user-u/restactions/demo/fsa-y7", []byte(`{"partial":true}`), nil,
-		testGVR, "demo", "fsa-y7")
-	if did {
-		t.Fatal("D default-off: putPartialWithTTL must return false (no D)")
-	}
-	if len(h.puts) != 0 {
-		t.Fatalf("D default-off: no Put allowed, got %d", len(h.puts))
-	}
-	if cache.PartialServedStale() != before {
-		t.Fatal("D default-off: counter must stay flat")
-	}
-}
-
-// TestD_On_BoundedStalePut — with the env set, D Puts the partial under the SAME
-// per-user key with a bounded TTLOverride, and bumps the counter.
-func TestD_On_BoundedStalePut(t *testing.T) {
-	t.Setenv("PARTIAL_RESULT_TTL_SECONDS", "30")
-	h := newFakeCacheHandle()
-	const key = "user-u/restactions/demo/fsa-y7"
-	before := cache.PartialServedStale()
-	did := putPartialWithTTL(h, key, []byte(`{"partial":true}`), nil, testGVR, "demo", "fsa-y7")
-	if !did {
-		t.Fatal("D on: putPartialWithTTL must return true")
-	}
-	entry, ok := h.puts[key]
-	if !ok {
-		t.Fatalf("D on: expected a Put under the per-user key %q", key)
-	}
-	if entry.TTLOverride != 30*time.Second {
-		t.Fatalf("D on: TTLOverride = %v, want 30s (bounded window)", entry.TTLOverride)
-	}
-	if cache.PartialServedStale() != before+1 {
-		t.Fatalf("D on: counter must increment; before=%d after=%d", before, cache.PartialServedStale())
-	}
-}
-
-// TestD_On_NilHandleOrEmptyKey_NoOp — even with the env on, an absent cache
-// handle or empty key is a no-op (no panic, no Put).
-func TestD_On_NilHandleOrEmptyKey_NoOp(t *testing.T) {
-	t.Setenv("PARTIAL_RESULT_TTL_SECONDS", "30")
-	if putPartialWithTTL(nil, "k", []byte("{}"), nil, testGVR, "demo", "fsa-y7") {
-		t.Fatal("D on + nil handle: must be a no-op")
-	}
-	h := newFakeCacheHandle()
-	if putPartialWithTTL(h, "", []byte("{}"), nil, testGVR, "demo", "fsa-y7") {
-		t.Fatal("D on + empty key: must be a no-op")
-	}
-}
-
-// TestD_C6_DoesNotFireForCleanResolve — C6: D fires ONLY on the stage-error
-// decline branch. A clean resolve (Count()==0) never calls putPartialWithTTL, so
-// D's counter must be unchanged. We assert the mechanism directly: putPartialWithTTL
-// is the ONLY caller of BumpPartialServedStale (grep-guaranteed), and it is only
-// wired into the stageErrSink.Count()>0 branch — so a Count()==0 path cannot bump
-// it. This arm pins that a NON-decline (clean) flow leaves the counter flat.
-func TestD_C6_DoesNotFireForCleanResolve(t *testing.T) {
-	t.Setenv("PARTIAL_RESULT_TTL_SECONDS", "30")
-	before := cache.PartialServedStale()
-	// Simulate a clean resolve: the handler's else-if (clean Put) runs, NOT the
-	// stage-error branch — so putPartialWithTTL is never called. We assert the
-	// counter is flat by NOT calling it (the clean path's invariant).
-	if cache.PartialServedStale() != before {
-		t.Fatal("C6 precondition: counter not flat at start")
-	}
-	// A clean flow performs a normal Put via cacheHandle.Put directly (not D).
-	h := newFakeCacheHandle()
-	h.Put("user-u/restactions/demo/fsa-y7", &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
-	if cache.PartialServedStale() != before {
-		t.Fatal("C6: a clean Put must NOT bump the D counter (D fires only on the decline branch)")
 	}
 }
