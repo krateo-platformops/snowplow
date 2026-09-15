@@ -824,7 +824,7 @@ def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
 
     The per-key channel is `/debug/apistage?key_hash=<the armed key>`. It answers "is THIS
     key resident in L1 right now", which is exactly the fact the counters cannot supply:
-      * after render  — Count == 1, class `widgetContent`, body sha256 recorded;
+      * after render  — Count == 1, class `widgets`, body sha256 recorded;
       * after the second /call — Count == 1 with the SAME sha256 and an age that did NOT
         reset, i.e. served from the store rather than re-resolved.
     A declined body has no entry at all, so Count is 0 and this fails at the first step.
