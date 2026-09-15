@@ -254,7 +254,7 @@ def test_reconcile_detection_is_on_our_own_request_log():
 def _insp(count, sha="abc123", age=3, cls="widgets"):
     """One /debug/apistage?key_hash= reading. count=0 models a DECLINED widget: the key was
     stamped, no entry was ever stored, so nothing can be evicted for it later."""
-    meta = {"cacheEntryClass": cls, "bodySHA256": sha, "ageSeconds": age} if count else None
+    meta = {"cacheEntryClass": cls, "bodySha256": sha, "ageSeconds": age} if count else None
     return {"count": count, "meta": meta}
 
 
@@ -276,7 +276,7 @@ def test_cache_proof_rejects_an_entry_that_was_replaced_rather_than_served():
     cc = a.crosscheck_cache_proof(1, 1, _insp(1, sha="aaa", age=3),
                                   _insp(1, sha="zzz", age=6))
     assert not cc["passed"]
-    assert "sha256 changed" in cc["verdict"]
+    assert "sha256 CHANGED" in cc["verdict"]
 
 
 def test_cache_proof_rejects_a_re_resolve_that_reset_the_age():
@@ -286,6 +286,16 @@ def test_cache_proof_rejects_a_re_resolve_that_reset_the_age():
     cc = a.crosscheck_cache_proof(1, 1, _insp(1, age=9), _insp(1, age=1))
     assert not cc["passed"]
     assert "age RESET" in cc["verdict"]
+
+
+def test_cache_proof_REPORTS_a_MISSING_body_hash_as_missing_not_as_changed():
+    """Run 7. I read the Go FIELD name (BodySHA256) and assumed the wire name; the tag is
+    `bodySha256`, so the lookup returned None on every read, `same_body` was permanently False,
+    and the stage failed with a verdict blaming a change that never happened. An absent hash is
+    a harness or endpoint problem; a changed hash is a cache finding. They must not read alike."""
+    cc = a.crosscheck_cache_proof(1, 1, _insp(1, sha=None), _insp(1, sha=None))
+    assert not cc["passed"]
+    assert "no body hash" in cc["verdict"] and "not evidence" in cc["verdict"]
 
 
 def test_cache_proof_REFUSES_a_zero_age_rather_than_passing_vacuously():

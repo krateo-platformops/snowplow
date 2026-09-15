@@ -839,7 +839,16 @@ def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
     resident = after_render.get("count") == 1 and after_hit.get("count") == 1
     m0, m1 = after_render.get("meta") or {}, after_hit.get("meta") or {}
     cls = m0.get("cacheEntryClass")
-    same_body = bool(m0.get("bodySHA256")) and m0.get("bodySHA256") == m1.get("bodySHA256")
+    # THE JSON TAG IS `bodySha256`, NOT `bodySHA256`. The Go FIELD is BodySHA256, but its tag
+    # is `json:"bodySha256,omitempty"` (resolved.go:1322) — I read the field name off the struct
+    # and assumed the wire name, exactly as I once assumed a cache-status header that did not
+    # exist. The wrong key returns None on every read, so `same_body` was permanently False and
+    # run 7 failed a stage that could not pass, with a verdict blaming a body change that never
+    # happened. Verified live: the correct key returns a stable hash across reads of an
+    # unchanged entry while the age advances.
+    sha0, sha1 = m0.get("bodySha256"), m1.get("bodySha256")
+    sha_present = bool(sha0) and bool(sha1)
+    same_body = sha_present and sha0 == sha1
     # Age must not RESET. A re-resolve replaces the entry and restarts its age, so an age
     # that went backwards means the second call was served by the resolver, not the store.
     #
@@ -875,8 +884,18 @@ def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
             f"directly through /call is keyed under the per-identity `widgets` class; "
             f"`widgetContent` is the identity-free shell layer the walker populates, which a "
             f"browser fetch never lands in.")
+    elif not sha_present:
+        # Distinguished from a genuine change, because conflating them is what made run 7's
+        # failure unreadable: an ABSENT hash is a harness or endpoint problem, a CHANGED hash is
+        # a cache finding, and they need different people looking at them.
+        verdict = (
+            f"the inspector returned no body hash (after render={sha0!r}, after the second "
+            f"call={sha1!r}), so the bodies cannot be compared. That is not evidence the entry "
+            f"changed — it is a missing field, and the comparison must not be read either way.")
     elif not same_body:
-        verdict = "the body sha256 changed between the two lookups — the entry was replaced, not served."
+        verdict = (
+            f"the body sha256 CHANGED between the two lookups ({str(sha0)[:12]}… → "
+            f"{str(sha1)[:12]}…) — the entry was replaced, not served.")
     elif not age_measurable:
         verdict = (
             f"the entry's age is {age0}s at the first lookup, so the age comparison cannot "
@@ -896,7 +915,8 @@ def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
             "counters": {"store_total": stored, "hit_total": hits},
             "inspector": {"class": cls, "resident_after_render": after_render.get("count"),
                           "resident_after_hit": after_hit.get("count"),
-                          "body_sha256_stable": same_body, "age_kept": age_kept,
+                          "body_sha256_stable": same_body, "body_sha256_present": sha_present,
+                          "age_kept": age_kept,
                           "age_measurable": age_measurable,
                           "age_after_render": age0, "age_after_hit": age1}}
 
