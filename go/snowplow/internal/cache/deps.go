@@ -622,6 +622,26 @@ func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
 	}
 }
 
+// hasEdge reports whether an ABSENT verdict for dk can reach l1Key at all:
+// whether l1Key is among the keys the worker's own match
+// (collectMatchesWithDep — the four bucket forms, exact and wildcard,
+// namespaced and namespace-stripped) returns for that coordinate. It is
+// deliberately the SAME lookup OnObjectEvent uses, not a one-bucket probe,
+// so a change to how Record derives its coordinate cannot silently turn
+// evictable entries into no-edge ones (arch N10 minor). An entry with no
+// edge (its Record was dropped at DEPS_MAX_RECORDS — dropped_cap) is
+// dirty-markable by nothing and evictable by nothing but its TTL; the
+// reconcile audit (1.12.6 C3) counts such entries apart from divergence
+// because submitting their coordinate would evict nothing. Lock-free
+// (sync.Map loads and ranges).
+func (d *DepTracker) hasEdge(l1Key string, dk DepKey) bool {
+	if d == nil {
+		return false
+	}
+	_, ok := d.collectMatchesWithDep(dk.GVR, dk.Namespace, dk.Name)[l1Key]
+	return ok
+}
+
 // objectState is what the dep-event worker derived about an object at the
 // moment it processed the coordinate (1.12.6 C1, design §3.3). It is the
 // ONLY input OnObjectEvent uses to choose between evict and dirty-mark.

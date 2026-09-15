@@ -77,6 +77,7 @@ var debugRoutePatterns = []string{
 	"GET /debug/servable",
 	"GET /debug/apistage",
 	"GET /debug/refreshes",
+	"GET /debug/reconcile",
 }
 
 // debugMux is the minimal registration surface registerDebugRoutes needs.
@@ -149,4 +150,15 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// four unauthenticated siblings above, so this line is now the general
 	// case rather than the exception.
 	mux.Handle("GET /debug/refreshes", gated.Then(handlers.DebugRefreshes()))
+
+	// 1.12.6 C3 — opt-in FULL reconcile audit: walks every resident L1
+	// entry, probes each self coordinate against the informer indexer and
+	// hands every ABSENT one to the dep-event worker (the periodic ticker
+	// does the same on a 512-entry sample every 30 s). Returns the
+	// divergent set as METADATA ONLY (key hash / class / gvr / ns / name —
+	// the same projection /debug/apistage exposes; never a body). Behind
+	// the same gate as its siblings because it is a reconcile, not a dry
+	// run, and because the full walk holds the store mutex for its duration
+	// (docs/architecture/observability.md).
+	mux.Handle("GET /debug/reconcile", gated.Then(handlers.DebugReconcile()))
 }

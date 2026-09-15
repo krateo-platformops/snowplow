@@ -97,6 +97,7 @@ func RegisterDepsExpvarForTest() {
 func DepsStatsByStat() map[string]int64 {
 	d := Deps().Stats()
 	w := DepWatchStatsSnapshot()
+	rc := DepsReconcileStatsSnapshot()
 	return map[string]int64{
 		// --- dep records: occupancy vs its ceiling ---
 		"records":      d.TotalRecords,
@@ -154,5 +155,26 @@ func DepsStatsByStat() map[string]int64 {
 		"probe_absent_total":           int64(w.ProbeAbsent),
 		"probe_unknown_total":          int64(w.ProbeUnknown),
 		"probe_unknown_degraded_total": int64(w.ProbeUnknownDegraded),
+
+		// --- the sampled reconcile audit (1.12.6 C3, deps_reconcile.go) ---
+		// reconcile_divergence_total is THE pipeline-health number: each unit
+		// is a resident entry whose object was ABSENT from a synced indexer
+		// and that no event had evicted — a DELETE the pipeline lost. A
+		// steady non-zero rate means a handler, the queue or the relist
+		// bridge is dropping events; alert on it. reconcile_sampled_total is
+		// the entries visited, reconcile_probed_total the unique coordinates
+		// probed (the divergence denominator — cohort copies share one
+		// probe); reconcile_unknown_total counts coordinates skipped because
+		// the indexer was not authoritative; reconcile_skipped_no_edge_total
+		// counts ABSENT entries the worker could not evict (no self dep edge
+		// — dropped_cap), kept OUT of divergence so the alert above stays
+		// true. Each key publishes the field it is named after (arch N2).
+		"reconcile_ticks_total":           int64(rc.Ticks),
+		"reconcile_sampled_total":         int64(rc.Sampled),
+		"reconcile_probed_total":          int64(rc.Probed),
+		"reconcile_divergence_total":      int64(rc.Divergence),
+		"reconcile_unknown_total":         int64(rc.Unknown),
+		"reconcile_skipped_no_edge_total": int64(rc.SkippedNoEdge),
+		"reconcile_panics_total":          int64(rc.Panics),
 	}
 }

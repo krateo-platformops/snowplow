@@ -148,6 +148,18 @@ type crdDiscovery struct {
 	// relist, which strands entries deleted in the teardown window.
 	relistDirtyMarkPostSync atomic.Uint64
 	relistPostSyncTimeout   atomic.Uint64
+
+	// 1.12.6 C2 — the relist delta bridge (relist_bridge.go). runs counts
+	// bridges spawned (one per relisted GVR); enqueued counts coordinates
+	// synthesized from (old indexer keys \ fresh LIST); timeout counts
+	// bridges whose fresh informer never synced inside the bound (the
+	// bridge then enqueued nothing — the SOAK SIGNAL that keeps the 1.12.5
+	// re-fire in place); aborted counts bridges with nothing to diff (no
+	// sync channel, or the GVR removed again while waiting).
+	relistBridgeRuns     atomic.Uint64
+	relistBridgeEnqueued atomic.Uint64
+	relistBridgeTimeout  atomic.Uint64
+	relistBridgeAborted  atomic.Uint64
 }
 
 var (
@@ -675,6 +687,10 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 		if !rw.IsRegistered(gvr) {
 			continue
 		}
+		// 1.12.6 C2 — snapshot the OLD indexer's key set BEFORE the teardown
+		// (relist_bridge.go). Read-only; the diff against the fresh LIST runs
+		// on the bridge goroutine spawned below.
+		before, had := rw.IndexerKeys(gvr)
 		rw.RemoveResourceType(gvr)               // R6 per-GVR teardown; idempotent, nil-safe
 		_, syncCh := rw.EnsureResourceType(gvr)  // re-register → fresh LIST under current schema
 		Deps().OnResourceTypeSchemaRelisted(gvr) // dirty-mark dependent L1 (logs SCHEMA_RELIST, not CRD_DELETE)
@@ -726,6 +742,18 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 		// explicit rather than ambient.
 		c.workerWG.Add(1)
 		go c.refireRelistDirtyMarkAfterSync(Deps(), gvr, syncCh)
+		// 1.12.6 C2 — the delta bridge (relist_bridge.go). ADDITIVE to the
+		// re-fire above (PM condition C10): the re-fire stays until the bridge
+		// has soaked with relist_bridge_timeout_total at zero. Same goroutine
+		// discipline: off the discovery worker, on workerWG, bounded wait.
+		// The dep-event bridge handle is captured HERE, on the worker
+		// goroutine, for the same reason Deps() is captured above: the
+		// goroutine outlives this call and must not read a process singleton
+		// after its wait (depEventHandlers captures it the same way).
+		if had {
+			c.workerWG.Add(1)
+			go c.bridgeRelistDeletes(rw, depWatchSingleton(), gvr, before, syncCh)
+		}
 		relisted++
 	}
 	if relisted > 0 {
@@ -1008,6 +1036,12 @@ type CRDDiscoveryStats struct {
 	// 1.12.5 / #187
 	RelistDirtyMarkPostSync uint64 // post-sync re-fires of the relist dirty-mark
 	RelistPostSyncTimeout   uint64 // relisted GVRs whose new informer did not sync in time
+
+	// 1.12.6 C2 — relist delta bridge (relist_bridge.go)
+	RelistBridgeRuns     uint64 // bridges spawned (one per relisted GVR with a registered indexer)
+	RelistBridgeEnqueued uint64 // coordinates synthesized from (old indexer keys \ fresh LIST)
+	RelistBridgeTimeout  uint64 // bridges that gave up because the fresh informer never synced — the soak signal
+	RelistBridgeAborted  uint64 // bridges with nothing to diff (no sync channel / GVR removed while waiting)
 }
 
 // CRDDiscoveryStatsSnapshot returns the current bridge counters.
@@ -1028,6 +1062,11 @@ func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
 
 		RelistDirtyMarkPostSync: c.relistDirtyMarkPostSync.Load(),
 		RelistPostSyncTimeout:   c.relistPostSyncTimeout.Load(),
+
+		RelistBridgeRuns:     c.relistBridgeRuns.Load(),
+		RelistBridgeEnqueued: c.relistBridgeEnqueued.Load(),
+		RelistBridgeTimeout:  c.relistBridgeTimeout.Load(),
+		RelistBridgeAborted:  c.relistBridgeAborted.Load(),
 	}
 }
 

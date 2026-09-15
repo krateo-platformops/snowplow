@@ -102,6 +102,7 @@ var debugProbePaths = map[string]string{
 	"GET /debug/servable":      "/debug/servable",
 	"GET /debug/apistage":      "/debug/apistage",
 	"GET /debug/refreshes":     "/debug/refreshes",
+	"GET /debug/reconcile":     "/debug/reconcile",
 }
 
 // debugPathsSafeToDriveAuthenticated is debugProbePaths minus the two
@@ -117,6 +118,7 @@ var debugPathsSafeToDriveAuthenticated = []string{
 	"/debug/servable",
 	"/debug/apistage",
 	"/debug/refreshes",
+	"/debug/reconcile",
 }
 
 // recordingMux records the patterns registered on it and delegates to a real

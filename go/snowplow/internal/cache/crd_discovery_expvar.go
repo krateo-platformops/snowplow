@@ -76,6 +76,15 @@ func registerCRDDiscoveryExpvar() {
 				// objects were deleted inside the teardown window.
 				"relist_dirtymark_postsync_total": s.RelistDirtyMarkPostSync,
 				"relist_postsync_timeout_total":   s.RelistPostSyncTimeout,
+				// 1.12.6 C2 — relist delta bridge. enqueued moving with
+				// timeout at ZERO across real CRD schema changes is the soak
+				// evidence that retires the 1.12.5 re-fire above; timeout
+				// > 0 on a healthy cluster means the bridge is NOT covering
+				// the teardown window and the re-fire must stay.
+				"relist_bridge_runs_total":     s.RelistBridgeRuns,
+				"relist_bridge_enqueued_total": s.RelistBridgeEnqueued,
+				"relist_bridge_timeout_total":  s.RelistBridgeTimeout,
+				"relist_bridge_aborted_total":  s.RelistBridgeAborted,
 			}
 		}))
 	})

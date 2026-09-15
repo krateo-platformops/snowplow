@@ -364,6 +364,26 @@ env:
   #
   # Set to "0" to disable (UAF cells then use the standard TTL).
   UAF_RESOLVED_TTL_SECONDS: "300"
+  # 1.12.6 C2 — relist delta bridge: how long the bridge waits for a
+  # schema-relisted informer to sync before giving up (it then enqueues
+  # nothing; relist_bridge_timeout_total counts it and the 1.12.5 post-sync
+  # re-fire keeps covering the window). Matches the re-fire's own 2-minute
+  # wait. String (installer plumbing is string-only); unset/unparseable → 120.
+  DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS: "120"
+  # 1.12.6 C3 — the sampled reconcile audit (deps_reconcile.go): every
+  # DEPS_RECONCILE_PERIOD_SECONDS, sample DEPS_RECONCILE_SAMPLE resident L1
+  # entries, probe each entry's own object against the informer indexer and
+  # hand every ABSENT one to the dep-event worker (the DELETE the pipeline
+  # lost). Bounded O(sample) under the store mutex per tick. Period "0"
+  # disables the ticker (GET /debug/reconcile stays available). Strings
+  # (installer plumbing is string-only); unset/unparseable → 512 / 30.
+  # COVERAGE: a divergence DETECTOR, not a staleness bound. At 512/30 s
+  # against 100K resident entries the expected first visit of an entry is
+  # ≈ 1.6 h and 99 % coverage ≈ 7.5 h — longer than the 3600 s TTL, so
+  # the TTL usually fires first; a lost DELETE still surfaces as
+  # reconcile_divergence_total > 0. Raise the sample for a tighter bound.
+  DEPS_RECONCILE_SAMPLE: "512"
+  DEPS_RECONCILE_PERIOD_SECONDS: "30"
   # #57 — prewarm seed loopback auth. The seed exchanges its projected
   # (audience=authn) ServiceAccount token at URL_AUTHN for an authn-issued JWT
   # and appends it on a /call api-step whose resolved endpoint host EXACTLY
