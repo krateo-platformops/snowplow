@@ -407,12 +407,20 @@ class S6Browser:
                                "frames_before": frames_before,
                                "calls_before": calls_before})
 
+        # frames_total counts EVERY frame this subscriber received in the window, not only ours.
+        # It exists to ATTRIBUTE the global `delivered` counter, which is fed by two publish
+        # paths — PublishRefresh (the refresher re-resolving any of the ~10 keys this shell arms)
+        # and PublishEviction — while evict_published counts only the second. Without the total,
+        # a delivered delta of 2 is indistinguishable from a delivery to a subscriber that is NOT
+        # ours, which would contradict subscribers == 1. With it the counter half can tell them
+        # apart. Measured at the same evaluate() as frames_for_key so the two always agree.
         deadline = time.time() + CONVERGE_TIMEOUT_S
         frames_for_key = 0
+        frames_total = 0
         while time.time() < deadline:
-            frames = page.evaluate("() => window.__s6.frames")
-            frames_for_key = sum(1 for f in frames[frames_before:]
-                                 if f.get("key") == self.armed_key)
+            window = page.evaluate("() => window.__s6.frames")[frames_before:]
+            frames_total = len(window)
+            frames_for_key = sum(1 for f in window if f.get("key") == self.armed_key)
             uninitiated = len(self._child_calls) - calls_before
             if frames_for_key and uninitiated:
                 break
@@ -420,6 +428,7 @@ class S6Browser:
 
         uninitiated = len(self._child_calls) - calls_before
         result = {"frames_for_armed_key": frames_for_key,
+                  "frames_total": frames_total,
                   "uninitiated_calls": uninitiated,
                   "armed_key": self.armed_key,
                   "waited_s": CONVERGE_TIMEOUT_S if not (frames_for_key and uninitiated)

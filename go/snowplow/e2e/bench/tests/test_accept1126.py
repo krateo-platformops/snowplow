@@ -200,6 +200,47 @@ def test_channel_crosscheck_requires_exactly_one_each(frames, calls, expect):
     assert cc["passed"] is expect
 
 
+def test_a6_tolerates_a_second_delivery_from_the_ordinary_publish_path():
+    """`delivered` is fed by PublishRefresh AND PublishEviction; evict_published counts only
+    the second. The probe page arms the whole shell (~10 keys), so an ordinary refresh of any
+    other armed key delivers a second frame inside the window — run 9 read delivered 2 against
+    evict_published 1 for exactly that reason. A6 is bounded so ordinary refresh traffic cannot
+    fail a run; exactness lives in A5 and the per-key channels, not in a global counter.
+    """
+    a6 = next(r for r in a.stage_a_rows(1) if r.rid == "A6")
+    ok, actual = a6.check({f"{a.K_BROADCAST}.delivered": 2})
+    assert ok and actual == 2
+    # Bounded is not unbounded: zero deliveries still fails.
+    assert a6.check({f"{a.K_BROADCAST}.delivered": 0})[0] is False
+
+
+@pytest.mark.parametrize("delivered,published,frames_total,flagged", [
+    (1, 1, 1, False),  # clean: the only delivery in the window is the eviction frame
+    (2, 3, 2, False),  # the extra delivery reached us and the browser recorded it
+    (2, 3, 1, False),  # ...or landed in the settle gap, and published Δ covers it
+    (2, 0, 1, True),   # no publish accounts for it — contradicts subscribers == 1
+    (1, 1, 4, True),   # more frames than deliveries — a channel is miscounting
+])
+def test_delivery_attribution_flags_only_unaccountable_deliveries(
+        delivered, published, frames_total, flagged):
+    r = a.delivery_attribution(
+        {f"{a.K_BROADCAST}.delivered": delivered,
+         f"{a.K_BROADCAST}.published": published,
+         f"{a.K_BROADCAST}.evict_published": 1},
+        {"data": {"frames_total": frames_total, "frames_for_armed_key": 1}})
+    assert r["checked"] is True
+    assert r["flagged"] is flagged
+
+
+def test_delivery_attribution_is_inert_without_frames_total():
+    """A browser half that predates frames_total must leave the diagnostic unevaluated rather
+    than flag — attribution never gates the stage."""
+    r = a.delivery_attribution(
+        {f"{a.K_BROADCAST}.delivered": 2, f"{a.K_BROADCAST}.published": 3},
+        {"data": {"frames_for_armed_key": 1}})
+    assert r["checked"] is False and r["flagged"] is False
+
+
 def test_burst_rows_use_delivered_for_the_no_loss_half():
     """S9: there is NO `drained` counter (facts §2.4), so the "all N arrive"
     half must be asserted on `delivered`."""

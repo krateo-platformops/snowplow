@@ -703,9 +703,18 @@ def stage_a_rows(expect_n: int = 1) -> list[Row]:
         Row("A5", "C10 published the eviction frame",
             f"{B}.evict_published", f"+{expect_n}",
             _eq(f"{B}.evict_published", expect_n)),
-        Row("A6", "it reached the armed browser",
-            f"{B}.delivered", f"+{expect_n}",
-            _eq(f"{B}.delivered", expect_n)),
+        # BOUNDED, NOT EXACT — deliberately. `delivered` is fed by BOTH publish paths:
+        # PublishRefresh (the refresher re-resolving ANY armed key) and PublishEviction, while
+        # A5's evict_published counts only the second. The probe page arms ~10 keys (the whole
+        # shell), so one ordinary refresh of any of the other nine delivers a second frame to our
+        # single subscriber inside the window — run 9 read delivered 2 against evict_published 1
+        # for exactly this reason. Exactness belongs to the PER-KEY channels, which are exact and
+        # agree: frames_for_armed_key == 1 (R2) and evict_published == +1 (A5). Asserting == here
+        # fails on ordinary refresh traffic that has nothing to do with the widget under test.
+        # `delivery_attribution` records where the extra deliveries went.
+        Row("A6", "it reached the armed browser (bounded: two publish paths feed this counter)",
+            f"{B}.delivered", f">=+{expect_n}",
+            _ge(f"{B}.delivered", expect_n)),
         Row("A7", "no buffer-full drop (loss mode L2)",
             f"{B}.dropped", "0", _eq(f"{B}.dropped", 0)),
         Row("A8", "the pacing bucket did not defer at N=1",
@@ -955,6 +964,79 @@ def crosscheck_channels(hook_deleted: dict, hook_asserted: dict) -> dict:
             "measuring itself. Per R2 this fails the stage and is not "
             "reconciled."),
     }
+
+
+def delivery_attribution(d: dict, hook_asserted: dict) -> dict:
+    """Account for every frame the GLOBAL `delivered` counter counted.
+
+    `delivered` is fed by both publish paths — PublishRefresh (the refresher
+    re-resolving any armed key) and PublishEviction — while `evict_published`
+    counts only the second. The probe page arms ~10 keys (the whole shell), so
+    an ordinary refresh of any of the other nine delivers a second frame to our
+    single subscriber inside the window. That is why A6 is bounded; exactness
+    lives in the per-key channels (frames_for_armed_key == 1, evict_published
+    == +1), not here. This records WHERE the extra deliveries went.
+
+    With subscribers == 1 every delivery reached OUR subscriber, so the
+    browser's frames_total should account for them. One slack is inherent and
+    is stated rather than hidden: the browser counts frames when `asserted`
+    lands and this snapshot is taken COUNTER_SETTLE_SECONDS later, so a frame
+    arriving in that gap raises `delivered` without appearing in frames_total.
+    An unexplained delivery is therefore only called out when the ordinary
+    `published` delta cannot cover it either.
+
+    DIAGNOSTIC, NOT A GATE: this never fails the stage. A6 is bounded and the
+    per-key channels carry the verdict; a run is not rejected on attribution.
+    """
+    B = K_BROADCAST
+    data = (hook_asserted or {}).get("data", {})
+    frames_total = data.get("frames_total")
+    frames_key = data.get("frames_for_armed_key")
+    delivered = d.get(f"{B}.delivered")
+    published = d.get(f"{B}.published")
+    if frames_total is None or delivered is None or published is None:
+        return {"checked": False, "flagged": False,
+                "verdict": "frames_total or the broadcaster deltas are missing — "
+                           "attribution not evaluated. The stage is unaffected."}
+
+    extra_delivered = delivered - (frames_key or 0)
+    extra_frames = frames_total - (frames_key or 0)
+    base = {"checked": True,
+            "frames_total": frames_total, "frames_for_armed_key": frames_key,
+            "delivered_delta": delivered, "published_delta": published,
+            "evict_published_delta": d.get(f"{B}.evict_published"),
+            "extra_deliveries": extra_delivered, "extra_frames_to_us": extra_frames}
+
+    # Checked BEFORE the no-extras early return. A browser that recorded more frames than the
+    # broadcaster delivered is a miscount in one of the two channels, and that is true whether
+    # or not there were deliveries beyond ours — comparing the EXTRAS would let the impossible
+    # case fall through the `extra_delivered <= 0` branch and read as ok.
+    if frames_total > delivered:
+        return {**base, "flagged": True,
+                "verdict": f"IMPOSSIBLE — the browser recorded MORE frames ({frames_total}) "
+                           f"than the broadcaster delivered ({delivered}). One of the two "
+                           f"channels is miscounting; for the architect."}
+    if extra_delivered <= 0:
+        return {**base, "flagged": False,
+                "verdict": "ok — every delivery in the window is the eviction frame."}
+    if extra_frames == extra_delivered:
+        return {**base, "flagged": False,
+                "verdict": f"ok — {extra_delivered} extra deliver(y/ies) reached our "
+                           f"subscriber on the ordinary refresh path and the browser "
+                           f"recorded all of them (published Δ {published})."}
+    if published >= extra_delivered:
+        return {**base, "flagged": False,
+                "verdict": f"ok — {extra_delivered - extra_frames} delivery(ies) are not "
+                           f"in frames_total but land inside the "
+                           f"{COUNTER_SETTLE_SECONDS}s settle gap between `asserted` and "
+                           f"this snapshot, and the ordinary published Δ ({published}) "
+                           f"covers them."}
+    return {**base, "flagged": True,
+            "verdict": f"UNATTRIBUTED — {extra_delivered} delivery(ies) beyond ours, only "
+                       f"{extra_frames} seen by our browser and published Δ is "
+                       f"{published}, which cannot cover the rest. A delivery to a "
+                       f"subscriber that is not ours contradicts subscribers == 1. "
+                       f"For the architect; the stage is NOT failed on this."}
 
 
 # ─── Stages ─────────────────────────────────────────────────────────────────
@@ -1250,6 +1332,7 @@ def stage_counters_after(ctx: dict) -> dict:
 
     a1a2 = crosscheck_a1_a2(results)
     chan = crosscheck_channels(deleted, asserted)
+    attr = delivery_attribution(d, asserted)
     passed = ok and a1a2.get("agree", True) and chan.get("passed", False) and evicted
 
     ctx["window_end_iso"] = ctx["window_end"]
@@ -1263,6 +1346,7 @@ def stage_counters_after(ctx: dict) -> dict:
                         "the armed key is STILL resident in L1 after the delete and the frame: "
                         "the eviction did not remove this entry, so a moved global counter "
                         "belongs to something else."},
+        "delivery_attribution": attr,
         "window_end": ctx["window_end"],
         "settle_seconds": SETTLE_SECONDS,
         "quiescence_caveat": (
