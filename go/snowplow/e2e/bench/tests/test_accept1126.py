@@ -249,30 +249,64 @@ def test_reconcile_detection_is_on_our_own_request_log():
 # ─── The cache proof needs BOTH channels (review follow-up 1) ──────────────
 
 
-def test_cache_proof_requires_counters_and_the_browser_to_agree():
-    ok = a.crosscheck_cache_proof(1, 1, {"l1_hit": True, "refresh_key": "k"})
+def _insp(count, sha="abc123", age=3, cls="widgetContent"):
+    """One /debug/apistage?key_hash= reading. count=0 models a DECLINED widget: the key was
+    stamped, no entry was ever stored, so nothing can be evicted for it later."""
+    meta = {"cacheEntryClass": cls, "bodySHA256": sha, "ageSeconds": age} if count else None
+    return {"count": count, "meta": meta}
+
+
+def test_cache_proof_passes_when_the_entry_is_resident_and_served_from_the_store():
+    ok = a.crosscheck_cache_proof(1, 1, _insp(1, age=3), _insp(1, age=6))
     assert ok["passed"] and ok["verdict"] == "ok"
 
 
-def test_cache_proof_rejects_counters_moved_by_foreign_traffic():
-    """The case the architect raised: store_total/hit_total are GLOBAL and have
-    no per-key variant, so another portal session's fetch satisfies >=1 while
-    the harness widget was DECLINED. The browser's per-widget l1_hit is what
-    distinguishes them, so counters-only must NOT pass."""
-    cc = a.crosscheck_cache_proof(5, 9, {"l1_hit": False, "refresh_key": "k"})
+def test_cache_proof_rejects_a_declined_widget_riding_foreign_counter_traffic():
+    """THE case the whole per-key channel exists for. store_total/hit_total are GLOBAL, so
+    another session's fetch satisfies >=1 while our widget was DECLINED and never stored.
+    The inspector says our key is not resident, so counters-only must NOT pass."""
+    cc = a.crosscheck_cache_proof(5, 9, _insp(0), _insp(0))
     assert not cc["passed"]
-    assert "FOREIGN traffic" in cc["verdict"]
+    assert "NOT resident" in cc["verdict"]
 
 
-def test_cache_proof_rejects_an_uncorroborated_browser_claim():
-    cc = a.crosscheck_cache_proof(0, 0, {"l1_hit": True, "refresh_key": "k"})
+def test_cache_proof_rejects_an_entry_that_was_replaced_rather_than_served():
+    cc = a.crosscheck_cache_proof(1, 1, _insp(1, sha="aaa", age=3),
+                                  _insp(1, sha="zzz", age=6))
     assert not cc["passed"]
-    assert "not corroborated" in cc["verdict"]
+    assert "sha256 changed" in cc["verdict"]
 
 
-def test_cache_proof_rejects_a_missing_refresh_key():
-    cc = a.crosscheck_cache_proof(1, 1, {"l1_hit": True})
+def test_cache_proof_rejects_a_re_resolve_that_reset_the_age():
+    """A re-resolve REPLACES the entry and restarts its age, so an age that went backwards
+    means the resolver served that call, not the store — even when the bytes are identical,
+    which is entirely likely for a static Paragraph."""
+    cc = a.crosscheck_cache_proof(1, 1, _insp(1, age=9), _insp(1, age=1))
     assert not cc["passed"]
+    assert "age RESET" in cc["verdict"]
+
+
+def test_cache_proof_REFUSES_a_zero_age_rather_than_passing_vacuously():
+    """RB2. At age 0 the reset comparison degrades to `>= 0`, which nothing can fail — the
+    same defect as the header-based proof this replaced. A check that cannot fail must not
+    silently pass, so age 0 reaching the cross-check FAILS."""
+    cc = a.crosscheck_cache_proof(1, 1, _insp(1, age=0), _insp(1, age=0))
+    assert not cc["passed"]
+    assert "cannot discriminate" in cc["verdict"]
+
+
+def test_cache_proof_rejects_the_wrong_cache_entry_class():
+    """`widgets` is the RBAC-sensitive page root; the disposable CHILD is what this run
+    deletes and it must be widgetContent-eligible."""
+    cc = a.crosscheck_cache_proof(1, 1, _insp(1, cls="widgets"), _insp(1, cls="widgets"))
+    assert not cc["passed"]
+    assert "widgetContent" in cc["verdict"]
+
+
+def test_cache_proof_rejects_an_inspector_hit_the_counters_do_not_corroborate():
+    cc = a.crosscheck_cache_proof(0, 0, _insp(1, age=3), _insp(1, age=6))
+    assert not cc["passed"]
+    assert "neither global counter moved" in cc["verdict"]
 
 
 # ─── MUTATION PROBES ───────────────────────────────────────────────────────
@@ -349,17 +383,37 @@ def test_MUTATION_sharing_hook_names_makes_the_crd_stage_self_satisfying():
         "the mutant must overlap, so a Stage-A hook can satisfy a B1 wait")
 
 
-def _mutant_cache_proof(stored, hits, hook_data):
-    """MUTANT of crosscheck_cache_proof with the BROWSER channel REMOVED."""
+def _mutant_cache_proof(stored, hits, after_render, after_hit):
+    """MUTANT of crosscheck_cache_proof with the PER-KEY channel REMOVED."""
     return {"passed": stored >= 1 and hits >= 1}
 
 
-def test_MUTATION_dropping_the_browser_channel_accepts_a_declined_widget():
-    """Probe for review follow-up 1: counters-only accepts foreign traffic."""
-    declined = {"l1_hit": False, "refresh_key": "k"}
-    assert not a.crosscheck_cache_proof(5, 9, declined)["passed"]
-    assert _mutant_cache_proof(5, 9, declined)["passed"], (
+def test_MUTATION_dropping_the_per_key_channel_accepts_a_declined_widget():
+    """Probe for review follow-up 1, restated for the inspector channel: counters-only
+    accepts foreign traffic. The declined widget has NO entry, so the real check sees
+    count=0 and fails; the mutant sees only the global counters and passes."""
+    assert not a.crosscheck_cache_proof(5, 9, _insp(0), _insp(0))["passed"]
+    assert _mutant_cache_proof(5, 9, _insp(0), _insp(0))["passed"], (
         "the mutant must pass a DECLINED widget on foreign counter movement")
+
+
+def _mutant_age_guard(age0, age1):
+    """MUTANT of the age check as it was committed at 375d301: the comparison alone, with no
+    measurability precondition."""
+    return (age1 or 0) >= (age0 or 0)
+
+
+def test_MUTATION_the_unguarded_age_comparison_cannot_fail_on_a_fresh_entry():
+    """Probe for RB2. AgeSeconds is an integer and the first lookup used to happen immediately
+    after the cold fill, so age0 was 0 and `age1 >= age0` reduced to `age1 >= 0` — true for
+    EVERY reading, including a re-resolve that reset the age to 0. The mutant accepts exactly
+    that; the real check refuses it, because a predicate that cannot fail must not pass."""
+    assert _mutant_age_guard(0, 0), "the mutant must accept a reset at age 0 — the defect"
+    assert not a.crosscheck_cache_proof(1, 1, _insp(1, age=0), _insp(1, age=0))["passed"], (
+        "the real check must refuse an unmeasurable age rather than pass vacuously")
+    # And with a measurable age it still discriminates in the direction that matters.
+    assert a.crosscheck_cache_proof(1, 1, _insp(1, age=3), _insp(1, age=6))["passed"]
+    assert not a.crosscheck_cache_proof(1, 1, _insp(1, age=9), _insp(1, age=1))["passed"]
 
 
 def _mutant_reconcile_check(reqlog, start, end):

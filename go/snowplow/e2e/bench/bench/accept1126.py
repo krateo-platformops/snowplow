@@ -132,6 +132,11 @@ ALL_HOOKS = HOOK_ORDER + CRD_HOOK_ORDER
 
 HOOK_WAIT_TIMEOUT_S = int(os.environ.get("S6_HOOK_TIMEOUT", "900"))
 
+#: RB2 — how long to let the fresh entry AGE before the first inspector lookup. AgeSeconds is
+#: an integer; at age 0 the "did the age reset" comparison cannot fail. 1.5s puts the entry at
+#: >= 1s on any box while costing the run nothing.
+AGE_SETTLE_SECONDS = float(os.environ.get("S6_AGE_SETTLE_SECONDS", "1.5"))
+
 #: How long to let the deferred eviction drain settle before the after-snapshot.
 #: C10 defers under the per-subscriber token bucket (§15.3 A17), so an immediate
 #: read can legitimately miss frames that are still queued.
@@ -379,6 +384,10 @@ def read_apistage_key(portal_base: str, token: str, key: str,
     GLOBAL, so a declined widget can ride foreign traffic to a passing counter check; this
     says whether OUR entry exists. Metadata only — class, age, ttl, itemsCount, a body
     sha256 — never the body, and the sha256 is populated only on this single-key path.
+
+    COST: MetadataForKey takes the EXCLUSIVE store lock and scans c.order linearly — O(store),
+    not O(1). Three reads across a run is nothing; polling it would stall serving. Never put
+    this in a loop.
 
     Returns {"count": int, "meta": dict|None}. Never raises on a missing entry: absent IS
     the answer at the delete step.
@@ -833,7 +842,19 @@ def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
     same_body = bool(m0.get("bodySHA256")) and m0.get("bodySHA256") == m1.get("bodySHA256")
     # Age must not RESET. A re-resolve replaces the entry and restarts its age, so an age
     # that went backwards means the second call was served by the resolver, not the store.
-    age_kept = (m1.get("ageSeconds") or 0) >= (m0.get("ageSeconds") or 0)
+    #
+    # RB2: this was `m1.age >= m0.age` alone, and it was VACUOUS. AgeSeconds is an integer and
+    # the first lookup happened immediately after the cold fill, so m0.age was 0 and the
+    # predicate reduced to `m1.age >= 0` — true for every reading, including a re-resolve.
+    # A check that cannot fail, which is the same defect as the header-based proof it replaced.
+    #
+    # The fix is the operator, not the premise: the caller now waits before the first lookup so
+    # a reset lands STRICTLY below m0.age, and m0.age >= 1 is a precondition. If it is 0 the
+    # comparison is meaningless again and this FAILS rather than passing vacuously — so a fast
+    # box cannot quietly restore the bug.
+    age0, age1 = (m0.get("ageSeconds") or 0), (m1.get("ageSeconds") or 0)
+    age_measurable = age0 >= 1
+    age_kept = age_measurable and age1 >= age0
     inspector_ok = resident and cls == "widgetContent" and same_body and age_kept
     agree = counters_ok and inspector_ok
     if not resident:
@@ -849,8 +870,15 @@ def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
             f"page root, which is not what this run deletes.")
     elif not same_body:
         verdict = "the body sha256 changed between the two lookups — the entry was replaced, not served."
+    elif not age_measurable:
+        verdict = (
+            f"the entry's age is {age0}s at the first lookup, so the age comparison cannot "
+            f"discriminate: a reset would also read >= 0. The caller must let the entry age "
+            f"before looking it up. Failing rather than passing on a check that cannot fail.")
     elif not age_kept:
-        verdict = "the entry's age RESET — the second call was re-resolved, not served from L1."
+        verdict = (
+            f"the entry's age RESET ({age0}s → {age1}s) — the second call was re-resolved, "
+            f"not served from L1.")
     elif not counters_ok:
         verdict = (
             f"the inspector shows our entry resident but neither global counter moved "
@@ -862,8 +890,8 @@ def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
             "inspector": {"class": cls, "resident_after_render": after_render.get("count"),
                           "resident_after_hit": after_hit.get("count"),
                           "body_sha256_stable": same_body, "age_kept": age_kept,
-                          "age_after_render": m0.get("ageSeconds"),
-                          "age_after_hit": m1.get("ageSeconds")}}
+                          "age_measurable": age_measurable,
+                          "age_after_render": age0, "age_after_hit": age1}}
 
 
 def crosscheck_channels(hook_deleted: dict, hook_asserted: dict) -> dict:
@@ -1023,6 +1051,13 @@ def stage_counters_before(ctx: dict) -> dict:
 
     # PER-KEY CHANNEL, step 1: is OUR entry actually in L1 after the render? The value the
     # SPA armed on IS the store key, so this is a direct lookup rather than an inference.
+    #
+    # RB2 — the wait is load-bearing, not politeness. AgeSeconds is an integer, so reading
+    # immediately after the cold fill gives age 0 and the later "age did not reset" comparison
+    # degrades to `>= 0`, which nothing can fail. Letting the entry reach >= 1s means a reset
+    # lands STRICTLY below it and the comparison discriminates. crosscheck_cache_proof refuses
+    # to pass when age 0 reaches it anyway, so a faster box cannot silently reinstate the hole.
+    time.sleep(AGE_SETTLE_SECONDS)
     insp_render = read_apistage_key(portal, ctx["token"], key, reqlog)
 
     hit = wait_hook(run_dir, "hit_proved", rid, began)      # second /call → served from L1
