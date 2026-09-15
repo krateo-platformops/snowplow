@@ -11,6 +11,24 @@
 // signals reach subscribers (9.2), refreshDroppedTotal proves the slow-
 // consumer drop arm fired without stalling the refresher (9.6), and
 // subscribers is the connection-scale gauge (design §10).
+//
+// 1.12.6 item 7 (C12, design §6.5): the eviction-path and stream-lifetime
+// numbers are expvars + OTel instruments, NOT log lines — the chart ships
+// LOG_LEVEL=warn (helm/snowplow/values.yaml), so an INFO diagnostic is dark
+// in production. Same expvar key (no new top-level name; the C0 cache-off
+// structural guard counts publishers, not fields):
+//
+//	armed_keys           distinct l1Keys with >=1 armed connection (len(keySubs))
+//	max_sink_depth       high-water mark of a subscriber sink after a send (lag)
+//	evict_published      PublishEviction calls that reached >=1 subscriber
+//	evict_deferred       eviction signals the per-subscriber bucket deferred —
+//	                     the number that proves the C10 bound engaged
+//	stream_seconds_total accumulated /refreshes stream lifetime (s)
+//	streams_closed_total streams that ended; quotient = mean stream lifetime
+//
+// Alertable (design §6.5): sustained dropped > 0 => a wedged consumer;
+// delivered == 0 while subscribers > 0 and published > 0 => the key-space
+// mismatch (L7), live.
 
 package cache
 
@@ -29,19 +47,33 @@ func init() {
 }
 
 // registerRefreshBroadcasterExpvar publishes the broadcaster counters. The
-// handler reads the atomics via RefreshBroadcasterCounters so every scrape
-// observes a coherent point-in-time snapshot.
+// handler reads one RefreshBroadcasterStatsSnapshot so every scrape observes
+// a coherent point-in-time snapshot.
 func registerRefreshBroadcasterExpvar() {
 	refreshBroadcasterExpvarOnce.Do(func() {
 		expvar.Publish("snowplow_refresh_broadcaster", expvar.Func(func() any {
-			published, delivered, dropped, coalesced := RefreshBroadcasterCounters()
+			st := RefreshBroadcasterStatsSnapshot()
 			return map[string]any{
-				"published":   published,
-				"delivered":   delivered,
-				"dropped":     dropped,
-				"coalesced":   coalesced,
-				"subscribers": RefreshSubscriberCount(),
+				"published":            st.Published,
+				"delivered":            st.Delivered,
+				"dropped":              st.Dropped,
+				"coalesced":            st.Coalesced,
+				"subscribers":          st.Subscribers,
+				"armed_keys":           st.ArmedKeys,
+				"max_sink_depth":       st.MaxSinkDepth,
+				"evict_published":      st.EvictPublished,
+				"evict_deferred":       st.EvictDeferred,
+				"stream_seconds_total": st.StreamSecondsTotal,
+				"streams_closed_total": st.StreamsClosedTotal,
 			}
 		}))
 	})
+}
+
+// RegisterRefreshBroadcasterExpvarForTest forces the publisher to run when
+// CACHE_ENABLED was not set at process start (the init() gate ran first).
+// Idempotent (sync.Once). Test-only — production MUST NOT call it; same
+// discipline as RegisterDepsExpvarForTest.
+func RegisterRefreshBroadcasterExpvarForTest() {
+	registerRefreshBroadcasterExpvar()
 }

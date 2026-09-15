@@ -1023,19 +1023,36 @@ func (d *DepTracker) runEvictionBatch(keys []string) {
 	store := d.store
 	d.storeMu.RUnlock()
 
-	evicted := 0
+	var gone []string
 	for _, l1Key := range keys {
 		if store != nil {
 			if store.deleteForDep(l1Key) {
-				evicted++
+				gone = append(gone, l1Key)
 			}
 		}
 		d.RemoveL1Key(l1Key) // clear forward + reverse records
 	}
-	if evicted > 0 {
-		d.evictDeleteTotal.Add(uint64(evicted))
+	if len(gone) > 0 {
+		d.evictDeleteTotal.Add(uint64(len(gone)))
+	}
+	// 1.12.6 item 7 (C10): tell the armed frontend the body is gone. Runs
+	// AFTER every lock this path takes is released (d.storeMu above,
+	// c.mu inside deleteForDep) — the hub takes its own h.mu and the
+	// per-subscriber pmu, so the eviction path never nests a hub lock
+	// under a store lock (S10). Only keys that actually left the store
+	// publish; a key with no armed subscriber costs one map read.
+	for _, l1Key := range gone {
+		publishEvictionFn(l1Key)
 	}
 }
+
+// publishEvictionFn is the C10 publish hook the two DELETE-semantics
+// eviction sites call (runEvictionBatch, EvictSelfGone). A var seam ONLY so
+// the S10 arm can install a probe that asserts the store lock is free at
+// the call (repo idiom: refreshCoalesceWindowFn); production never
+// reassigns it. TTL / LRU / max-age evictions (resolved.go) deliberately do
+// NOT route here — design §6.2.5 / S1d.
+var publishEvictionFn = PublishEviction
 
 // EvictSelfGone evicts ONE L1 key whose own object has been observed
 // gone by a path other than an informer DELETE event — today the sole
@@ -1074,7 +1091,19 @@ func (d *DepTracker) runEvictionBatch(keys []string) {
 // same mechanism on its own counter, so evict_self_gone_total keeps meaning
 // "the object is confirmed gone" even during an apiserver outage.
 func (d *DepTracker) EvictSelfGone(l1Key string) bool {
-	return d.evictSelfEntry(l1Key, &d.evictSelfGoneTotal)
+	if !d.evictSelfEntry(l1Key, &d.evictSelfGoneTotal) {
+		return false
+	}
+	// 1.12.6 item 7 (C10): the object is CONFIRMED gone (404) — tell the
+	// armed frontend. Same hook and lock discipline as runEvictionBatch
+	// (c.mu released inside deleteForDep, d.storeMu released inside
+	// evictSelfEntry). Deliberately in THIS arm and not in evictSelfEntry:
+	// EvictDropPoint shares the body for a NON-404 failure (403 / 500 /
+	// timeout under the breaker), which is not a deletion — publishing it
+	// would tell every armed tab its widgets were deleted during an
+	// apiserver outage (S1d pins it silent).
+	publishEvictionFn(l1Key)
+	return true
 }
 
 // EvictDropPoint is EvictSelfGone for the 1.12.6 C4 drop point: the entry's
