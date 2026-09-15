@@ -367,6 +367,14 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
+	// 1.12.6 C4 (arch N9): the live count of refresh-by-traffic-only keys is
+	// a gauge (it drops on Put and eviction), so it cannot ride the
+	// monotonic snowplow_refresher counter like its four siblings.
+	refresherSuppressedKeys, err := m.Int64ObservableGauge("snowplow_refresher_suppressed_keys",
+		metric.WithDescription("Live count of L1 keys marked refresh-by-traffic-only after repeated declines (1.12.6 #191); bounded by the store."))
+	if err != nil {
+		return err
+	}
 
 	// --- discovery: SA-discovery client (one counter keyed by stat) ---
 	saDiscovery, err := m.Int64ObservableCounter("snowplow_sa_discovery",
@@ -630,6 +638,12 @@ func registerInstruments(m metric.Meter, build string) error {
 		rEnq, rComp, rFail, rRetried, rDropped,
 			rSkipNoEntry, rSkipNoHandler, rSkipStageErr,
 			rYielded, rCapped, rFloored, rQueueDepth := cache.RefresherSnapshot()
+		// 1.12.6 C4 terminal semantics (arch N9): the two ALERT numbers —
+		// drop_evict_suspended (a mass failure in progress) and
+		// suppressed_skips (the #191 cure working) — must reach ClickStack,
+		// not only /debug/vars. Same instrument, same stat label, so every
+		// refresher counter keeps both halves.
+		rDropEvict, rDropEvictSuspended, rSuppressedSet, rSuppressedSkips, rSuppressedKeys := cache.RefresherTerminalSnapshot()
 		for stat, v := range map[string]uint64{
 			"enqueue":             rEnq,
 			"completed":           rComp,
@@ -642,11 +656,17 @@ func registerInstruments(m metric.Meter, build string) error {
 			"yielded":             rYielded,
 			"capped":              rCapped,
 			"floored":             rFloored,
+			// 1.12.6 C4 — expvar twins snowplow_refresher_<stat>_total
+			"drop_evict":           rDropEvict,
+			"drop_evict_suspended": rDropEvictSuspended,
+			"suppressed_set":       rSuppressedSet,
+			"suppressed_skips":     rSuppressedSkips,
 		} {
 			o.ObserveInt64(refresher, int64(v),
 				metric.WithAttributes(attribute.String("stat", stat)))
 		}
 		o.ObserveInt64(refresherQueueDepth, rQueueDepth)
+		o.ObserveInt64(refresherSuppressedKeys, rSuppressedKeys)
 
 		// --- SA-discovery ---
 		sa := dynamic.SADiscoveryStatsSnapshot()
@@ -806,7 +826,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		phase1UnitsPlanned, phase1UnitsSeeded, phase1ApiRefPages, phase1EligibleNoContinue,
 		phase1WalkZeroChildren, phase1WalkObservations,
 		phase1SeedResolves, phase1SeedFailures, phase1SeedRBACDeny, phase1SeedOpFail,
-		refresher, refresherQueueDepth,
+		refresher, refresherQueueDepth, refresherSuppressedKeys,
 		saDiscovery, crdSchemaMemo,
 		upstreamControllers, upstreamWebhooks,
 		raFullListServe, bindingsDeltaSkipped,

@@ -48,6 +48,7 @@ package cache
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -244,6 +245,26 @@ func resetRefreshTerminalForTest() {
 	dropEvictSuspendedTotal.Store(0)
 	dropEvictWarnTotal.Store(0)
 }
+
+// AddRefreshTerminalCountersForTest moves the C4 counters through their
+// production atomics (no breaker, no refresher built) and marks
+// suppressedKeys synthetic keys refresh-by-traffic-only, so a cross-package
+// arm can prove the OTLP mirror reads the LIVE counters rather than
+// constants. Production callers MUST NOT use this; pair with
+// ResetRefreshTerminalForTest in t.Cleanup.
+func AddRefreshTerminalCountersForTest(dropEvict, dropEvictSuspended, suppressedSet, suppressedSkips uint64, suppressedKeys int) {
+	dropEvictTotal.Add(dropEvict)
+	dropEvictSuspendedTotal.Add(dropEvictSuspended)
+	refreshSuppressedSetTotal.Add(suppressedSet)
+	refreshSuppressedSkipsTotal.Add(suppressedSkips)
+	for i := 0; i < suppressedKeys; i++ {
+		refreshSuppressed.Store(fmt.Sprintf("test-suppressed-%d", i), "test")
+	}
+}
+
+// ResetRefreshTerminalForTest is the exported twin of resetRefreshTerminalForTest
+// for cross-package arms. Production callers MUST NOT use this.
+func ResetRefreshTerminalForTest() { resetRefreshTerminalForTest() }
 
 // RefreshTerminalStats is the read-only snapshot of the C4 counters (expvar
 // + OTLP + tests).
