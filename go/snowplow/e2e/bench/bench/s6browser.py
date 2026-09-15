@@ -532,12 +532,21 @@ def run_browser_half(run_dir: Path, portal_base: str) -> int:
         # a NameError. False is the honest default: nothing was proved.
         channels_ok = False
         try:
+            # CREATE BEFORE LOGIN, and the order is load-bearing rather than cosmetic.
+            # The counter half takes its `pre` snapshot after the `created` hook and asserts
+            # that armed_keys/subscribers RISE across the window. Logging in lands on the app
+            # shell, which arms ~10 keys — so with login first, `pre` was taken after the SPA
+            # had already armed and the delta read 0. Run 9 passed only because its SSE stream
+            # happened to open after `created` was written; run 10 lost the same race with
+            # subscribers 1 / armed_keys 10 live on the server at that very moment. create()
+            # only shells out to kubectl and needs no session, so moving it ahead of login
+            # makes `pre` deterministically pre-arming.
+            s6.create()
             if not bench_browser.browser_login(page, user, password):
                 raise accept1126.PreflightFailed(
                     "browser login failed — the harness identity could not sign in through "
                     "the UI. Check HARNESS_USER/HARNESS_PASSWORD and that the s6-harness "
                     "User CR still exists.")
-            s6.create()
             s6.render_and_prove(page)
             result = s6.delete_and_observe(page)
             ok = result["frames_for_armed_key"] == 1 and result["uninitiated_calls"] == 1
