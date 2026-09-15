@@ -31,6 +31,27 @@ this file claimed it by reading an `x-snowplow-cache` header that does not exist
 check degraded silently to one that is true for exactly the declined widget it was meant to
 reject.
 
+THE PHASE PROTOCOL, and why it has this many boundaries. Each one exists because a run proved
+the race it prevents; none was added defensively.
+
+    created → rendered → hit_proved → [hit_verified] → deleted → asserted → [window_closed] → teardown
+              └── browser writes hooks ──┘  └ counter ┘  └── browser ──┘        └ counter ┘
+
+  hit_verified (counter → browser). Run 6 deleted 0.6 s after hit_proved, before the counter
+    half had finished its second inspector lookup — so that lookup saw count 0, which was OUR
+    OWN eviction, and the cache proof failed on its own success signal. The delete now waits
+    until the cache proof has PASSED.
+  window_closed (counter → browser). Run 8 tore down inside the measurement window: deleting
+    the page ROOT counted as a second eviction (evict_delete_total 2), published and delivered
+    a second frame (evict_published 2, delivered 3), and closing the browser dropped the
+    subscriber (A13 −1). Teardown now waits until the after-snapshot is taken.
+
+Both acks carry the run id, not merely a filename: `--from-stage` reuses a run dir, and a stale
+announcement would release a phase against another run's evidence.
+
+ON TIMEOUT, TEARDOWN STILL RUNS. Cleanup is never skipped on a shared cluster — but the run is
+marked failed, because a teardown that ran before the snapshot cannot produce a pass.
+
 OWNERSHIP, AND THE SHARED PAGE ROOT. The child is per-run and name-prefixed. The page root is
 `page-s6-probe` — fixed, not per-run, because the `/s6-probe` route shipped in portal 1.8.23
 resolves `flexes/page-<slug>` by convention, so a per-run name would resolve to nothing. That
@@ -46,6 +67,7 @@ import base64
 import json
 import os
 import subprocess
+import traceback
 import sys
 import time
 from pathlib import Path
@@ -318,6 +340,8 @@ class S6Browser:
                                                  "store_total/hit_total"})
 
     def _await_ack(self, page, name: str, timeout_s: int = 120) -> dict:
+        # `page` may be None: teardown runs in a finally that can fire after the browser context
+        # is already gone, and the ack still has to be waited on.
         """Block until the counter half announces `name` for THIS run.
 
         The run id is checked, not just the file's presence: --from-stage reuses a run dir, and
@@ -335,7 +359,10 @@ class S6Browser:
                 if payload.get("run_id") == self.run_id:
                     print(f"    s6browser: ack {name} <- {json.dumps(payload.get('data', {}))[:120]}")
                     return payload
-            page.wait_for_timeout(500)
+            if page is not None:
+                page.wait_for_timeout(500)
+            else:
+                time.sleep(0.5)
         raise accept1126.AssertionsFailed(
             f"no {name!r} announcement from the counter half within {timeout_s}s. It either "
             f"failed its cache proof or is not running; either way the delete must NOT proceed, "
@@ -400,14 +427,26 @@ class S6Browser:
         self._hook("asserted", result)
         return result
 
-    def teardown(self) -> None:
-        """Delete only what THIS run created.
+    def teardown(self, page=None) -> tuple[bool, str]:
+        """Delete only what THIS run created, AFTER the measurement window has closed.
+
+        Returns (window_was_closed, reason). On an ack timeout it still tears down — leaving
+        objects on a shared cluster to protect a measurement is the wrong trade — but it reports
+        False so the caller fails the run rather than reporting a pass built on a contaminated
+        window.
 
         The child is per-run, so the name prefix settles it. The root is not: it is shared by
         construction, so removing it on the prefix alone would take a concurrent run's page with
         it. (b) — the root goes only when it still carries this run's label; a root belonging to
         someone else is left exactly where it is, and said so out loud.
         """
+        window_closed, reason = True, "ok"
+        try:
+            self._await_ack(page, "window_closed", timeout_s=180)
+        except Exception as exc:
+            window_closed, reason = False, str(exc)[:200]
+            print(f"    s6browser: window_closed NOT received — tearing down anyway, run FAILS: {exc}")
+
         try:
             accept1126.assert_owned("paragraphs", self.child)
             _kubectl("delete", "paragraph", self.child, "-n", NS, "--ignore-not-found")
@@ -423,6 +462,7 @@ class S6Browser:
                 _kubectl("delete", "flex", PAGE_ROOT, "-n", NS, "--ignore-not-found")
         except accept1126.NotOwned as exc:
             print(f"    s6browser: REFUSING to delete flex/{PAGE_ROOT}: {exc}")
+        return window_closed, reason
 
     # ─── network capture (channel B) ────────────────────────────────────────
 
@@ -478,6 +518,10 @@ def run_browser_half(run_dir: Path, portal_base: str) -> int:
         ctx = bench_browser.make_browser_context(browser, ignore_https_errors=False)
         ctx.add_init_script(_FRAME_RECORDER)
         page = ctx.new_page()
+        # Bound BEFORE the try. A failure anywhere below still runs teardown in the finally, and
+        # the exit path reads this — an unbound local there would replace a real diagnostic with
+        # a NameError. False is the honest default: nothing was proved.
+        channels_ok = False
         try:
             if not bench_browser.browser_login(page, user, password):
                 raise accept1126.PreflightFailed(
@@ -489,11 +533,21 @@ def run_browser_half(run_dir: Path, portal_base: str) -> int:
             result = s6.delete_and_observe(page)
             ok = result["frames_for_armed_key"] == 1 and result["uninitiated_calls"] == 1
             print(f"    s6browser: {'OK' if ok else 'MISMATCH'} {json.dumps(result)}")
-            return 0 if ok else 1
+            channels_ok = ok
+        except Exception as exc:
+            # Loud, not swallowed: the traceback is the diagnostic every failed run so far has
+            # been read from. But it does not escape — the docstring promises an exit code, and
+            # a raise here would skip the exit-path reporting below.
+            traceback.print_exc()
+            print(f"    s6browser: FAILED — {type(exc).__name__}: {str(exc)[:200]}")
         finally:
-            s6.teardown()
+            window_closed, reason = s6.teardown(page)
             ctx.close()
             browser.close()
+        if not window_closed:
+            print(f"    s6browser: FAIL — teardown ran before the measurement window closed: {reason}")
+            return 1
+        return 0 if channels_ok else 1
 
 
 def add_parsers(sub) -> None:

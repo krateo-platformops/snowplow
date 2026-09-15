@@ -137,6 +137,12 @@ HOOK_WAIT_TIMEOUT_S = int(os.environ.get("S6_HOOK_TIMEOUT", "900"))
 #: >= 1s on any box while costing the run nothing.
 AGE_SETTLE_SECONDS = float(os.environ.get("S6_AGE_SETTLE_SECONDS", "1.5"))
 
+#: Propagation grace between the `asserted` hook landing and the after-snapshot. Bounded and
+#: SHORT by design: the browser has already finished observing when `asserted` lands, so this
+#: covers only the server's own counter propagation. A long sleep here is what let run 8's
+#: teardown fall inside the measurement window.
+COUNTER_SETTLE_SECONDS = float(os.environ.get("S6_COUNTER_SETTLE_SECONDS", "1.0"))
+
 #: How long to let the deferred eviction drain settle before the after-snapshot.
 #: C10 defers under the per-subscriber token bucket (§15.3 A17), so an immediate
 #: read can legitimately miss frames that are still queued.
@@ -1154,6 +1160,9 @@ def stage_counters_before(ctx: dict) -> dict:
     # The browser half has its own arming guards (the ?sub= must contain the child), but those are
     # reported by the half the counters exist to corroborate. This is the server's own view of the
     # same fact, and it is the cheap one: if nothing armed, stop before the irreversible step.
+    # >= 1, NEVER == 1. The probe page renders the whole SHELL, so ten keys arm, not one: run 8
+    # measured armed_keys Δ 10 with a single disposable child. Tightening this to equality would
+    # fail for a reason that has nothing to do with the widget under test.
     armed = post[f"{K_BROADCAST}.armed_keys"] - pre[f"{K_BROADCAST}.armed_keys"]
     subs = post[f"{K_BROADCAST}.subscribers"] - pre[f"{K_BROADCAST}.subscribers"]
     if armed < 1 or subs < 1:
@@ -1204,9 +1213,14 @@ def stage_counters_after(ctx: dict) -> dict:
         assert_owned(kind, name)
     asserted = wait_hook(run_dir, "asserted", rid, began)
 
-    # C10 defers under the per-subscriber bucket, so an immediate read can
-    # legitimately miss frames still queued (§15.3 A17).
-    time.sleep(SETTLE_SECONDS)
+    # THE WINDOW CLOSES WHEN THE EVIDENCE CHANNELS CLOSE, not on a timer. `asserted` has just
+    # landed, which means the browser has finished observing; the only wait left is for the
+    # server's own counters to propagate, which is sub-second. Run 8 used a fixed 10s sleep
+    # here, and the browser's teardown — deleting the page ROOT and closing the browser — landed
+    # inside it: the root's eviction was counted as a second delete (evict_delete_total 2),
+    # published and delivered a second frame (evict_published 2, delivered 3), and the close
+    # dropped the subscriber (A13 -1). Every failing row in run 8 was this.
+    time.sleep(COUNTER_SETTLE_SECONDS)
 
     snap = read_debug_vars(portal, ctx["token"], reqlog)
     ctx["window_end"] = _now_iso()
@@ -1225,6 +1239,14 @@ def stage_counters_after(ctx: dict) -> dict:
     # the loop: the object we deleted is the object whose entry left the store.
     insp_after = read_apistage_key(portal, ctx["token"], ctx["refresh_key"], reqlog)
     evicted = insp_after.get("count") == 0
+
+    # THE WINDOW IS NOW CLOSED. Release the browser's teardown only here — after the snapshot
+    # that the teardown would otherwise contaminate. The browser blocks on this; on timeout it
+    # tears down ANYWAY (cleanup must never be skipped on a shared cluster) and marks the run
+    # failed, because a teardown that ran before this snapshot cannot produce a pass.
+    announce(run_dir, "window_closed", rid,
+             {"window_end": ctx["window_end"],
+              "next": "the harness may tear down; the measurement is taken"})
 
     a1a2 = crosscheck_a1_a2(results)
     chan = crosscheck_channels(deleted, asserted)
