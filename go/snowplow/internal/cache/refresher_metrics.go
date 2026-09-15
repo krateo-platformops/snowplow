@@ -64,28 +64,44 @@ func init() {
 // demand (handles the pre-StartRefresher window gracefully).
 func registerRefresherMetrics() {
 	refresherMetricsOnce.Do(func() {
-		// 1.12.6 C7: one top-level expvar per tagged stat of refresherStats +
-		// RefreshTerminalStats, named by StatFamily.ExpvarKey
-		// (snowplow_refresher_<stat>_total for counters, snowplow_refresher_<stat>
-		// for gauges) — the same rule the OTLP mirror and the parity arm apply.
-		// Each closure reads ONE coherent RefresherStatsByStat() map; none of
-		// them constructs the refresher (#203). Per-stat meaning lives on the
-		// struct fields and in docs/architecture/observability.md.
-		for _, fam := range TaggedStatFamilies() {
-			if fam.ExpvarPrefix != "snowplow_refresher_" {
-				continue
-			}
-			for _, spec := range fam.Specs {
-				stat := spec.Stat
-				expvar.Publish(fam.ExpvarKey(spec), expvar.Func(func() any {
-					return RefresherStatsByStat()[stat]
-				}))
-			}
-		}
+		// 1.12.6 C7: every closure reads ONE coherent RefresherStatsByStat() map
+		// derived from the `stat` tags on refresherStats + RefreshTerminalStats
+		// (stats_by_tag.go); none of them constructs the refresher (#203). The
+		// KEY strings stay literal on purpose: the C0 structural cache-off guard
+		// (e2e/bench/cfg1_probe) derives the CFG-1 key set from literal
+		// expvar.Publish arguments, so a computed key would be invisible to it.
+		// The two lists cannot drift apart: TestC7_Expvar_PublishesEveryDerivedStat
+		// asserts literal set == tag-derived set in both directions, and the
+		// literal for each stat is StatFamily.ExpvarKey (counters
+		// snowplow_refresher_<stat>_total, gauges snowplow_refresher_<stat>).
+		// Per-stat meaning lives on the struct fields and in
+		// docs/architecture/observability.md.
+		expvar.Publish("snowplow_refresher_enqueue_total", refresherStatFunc("enqueue"))
+		expvar.Publish("snowplow_refresher_completed_total", refresherStatFunc("completed"))
+		expvar.Publish("snowplow_refresher_failed_total", refresherStatFunc("failed"))
+		expvar.Publish("snowplow_refresher_retried_total", refresherStatFunc("retried"))
+		expvar.Publish("snowplow_refresher_dropped_total", refresherStatFunc("dropped"))
+		expvar.Publish("snowplow_refresher_skipped_no_entry_total", refresherStatFunc("skipped_no_entry"))
+		expvar.Publish("snowplow_refresher_skipped_no_handler_total", refresherStatFunc("skipped_no_handler"))
+		expvar.Publish("snowplow_refresher_skipped_stage_error_total", refresherStatFunc("skipped_stage_error"))
+		expvar.Publish("snowplow_refresher_queue_depth", refresherStatFunc("queue_depth"))
+		expvar.Publish("snowplow_refresher_yielded_total", refresherStatFunc("yielded"))
+		expvar.Publish("snowplow_refresher_capped_total", refresherStatFunc("capped"))
+		expvar.Publish("snowplow_refresher_floored_total", refresherStatFunc("floored"))
+		expvar.Publish("snowplow_refresher_drop_evict_total", refresherStatFunc("drop_evict"))
+		expvar.Publish("snowplow_refresher_drop_evict_suspended_total", refresherStatFunc("drop_evict_suspended"))
+		expvar.Publish("snowplow_refresher_suppressed_set_total", refresherStatFunc("suppressed_set"))
+		expvar.Publish("snowplow_refresher_suppressed_skips_total", refresherStatFunc("suppressed_skips"))
+		expvar.Publish("snowplow_refresher_suppressed_keys", refresherStatFunc("suppressed_keys"))
 	})
 }
 
-// RegisterRefresherMetricsForTest forces refresher expvar registration
+// refresherStatFunc is the expvar.Func for one derived refresher stat.
+func refresherStatFunc(stat string) expvar.Func {
+	return expvar.Func(func() any { return RefresherStatsByStat()[stat] })
+}
+
+// RegisterRefresherMetricsForTest// RegisterRefresherMetricsForTest forces refresher expvar registration
 // under tests that flip CACHE_ENABLED=true via t.Setenv after init()
 // already ran with CACHE_ENABLED unset. Idempotent (sync.Once-guarded).
 // Production callers MUST NOT use this function.

@@ -152,9 +152,19 @@ func TestC7_Expvar_PublishesEveryDerivedStat(t *testing.T) {
 			}
 			continue
 		}
+		derived := map[string]bool{}
 		for _, s := range f.Specs {
+			derived[f.ExpvarKey(s)] = true
 			if _, ok := all[f.ExpvarKey(s)]; !ok {
 				t.Errorf("%s: /debug/vars has no %q (stat %s, field %s)", f.Name(), f.ExpvarKey(s), s.Stat, s.Field)
+			}
+		}
+		// Reverse direction: the per-stat keys are LITERALS (the C0 structural
+		// guard derives the cache-off key set from literal expvar.Publish
+		// arguments), so a literal not backed by a tagged field must fail here.
+		for key := range all {
+			if strings.HasPrefix(key, f.ExpvarPrefix) && !derived[key] {
+				t.Errorf("%s: /debug/vars publishes %q but no tagged field derives it — a literal key with no source of truth", f.Name(), key)
 			}
 		}
 	}
