@@ -365,6 +365,41 @@ def read_debug_vars(portal_base: str, token: str,
     return json.loads(body)
 
 
+def read_apistage_key(portal_base: str, token: str, key: str,
+                      reqlog: _RequestLog) -> dict:
+    """Ask the L1 store whether ONE key is resident right now.
+
+    `GET /content/debug/apistage?key_hash=<key>` → `MetadataForKey(key)`, JWT-gated by
+    RefreshAuth like the rest of /debug. The value the SPA arms on — the
+    `X-Snowplow-Refresh-Key` header — IS the store key, so the key the browser reports is
+    the key this looks up. Verified live on 057: a bogus key answers 200 with
+    `{"cacheEnabled": true, "count": 0, "entries": []}`.
+
+    This is the per-widget channel no response header can give. store_total and hit_total are
+    GLOBAL, so a declined widget can ride foreign traffic to a passing counter check; this
+    says whether OUR entry exists. Metadata only — class, age, ttl, itemsCount, a body
+    sha256 — never the body, and the sha256 is populated only on this single-key path.
+
+    Returns {"count": int, "meta": dict|None}. Never raises on a missing entry: absent IS
+    the answer at the delete step.
+    """
+    url = f"{portal_base}{SNOWPLOW_PREFIX}/debug/apistage?key_hash={key}"
+    status, body = _http_get(url, token, reqlog)
+    if status == 503:
+        raise PreflightFailed(
+            "/debug/apistage returned 503 — authn or its JWKS is unreachable. NOT a snowplow "
+            "fault; fix authn and re-run rather than recording a cache-proof failure.")
+    if status != 200:
+        raise PreflightFailed(
+            f"/debug/apistage?key_hash=… returned {status}, expected 200. The cache proof "
+            f"cannot be evaluated, so this fails rather than degrading to the global counters "
+            f"alone — those cannot tell our entry from foreign traffic.")
+    data = json.loads(body) if isinstance(body, (str, bytes)) else body
+    entries = data.get("entries") or []
+    return {"count": int(data.get("count") or 0),
+            "meta": entries[0] if entries else None}
+
+
 def expvar_get(snapshot: dict, parent: str, stat: str) -> int:
     """Read `parent.stat` from a /debug/vars snapshot. Parent is MANDATORY.
 
@@ -769,56 +804,66 @@ def crosscheck_a1_a2(results: list[dict]) -> dict:
     }
 
 
-def crosscheck_cache_proof(stored: int, hits: int, hook_data: dict) -> dict:
-    """R2 applied to the cache proof: two channels, neither sufficient alone.
+def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
+                           after_hit: dict) -> dict:
+    """R2 applied to the cache proof, with the per-widget channel the inspector gives.
 
-    The counter channel (`store_total` / `hit_total`) proves **an** entry was
-    stored and served from L1. It cannot prove it was *ours*: both are GLOBAL
-    counters, there is no per-key store counter, and any other portal session's
-    widget fetch inside the window satisfies `>= 1` on its own. So a DECLINED
-    harness widget can ride foreign traffic to a passing counter check.
+    The counter channel (`store_total` / `hit_total`) proves **an** entry was stored and
+    served from L1. It cannot prove it was OURS: both are GLOBAL, there is no per-key store
+    counter, and any other portal session's fetch inside the window satisfies `>= 1` alone.
+    So a DECLINED harness widget can ride foreign traffic to a passing counter check.
 
-    The browser channel (`l1_hit` + `refresh_key`) is per-widget — it is the
-    response the harness's own `/call` got — but it is reported by the half
-    whose work the counters exist to corroborate, so it is not sufficient
-    either.
+    The per-key channel is `/debug/apistage?key_hash=<the armed key>`. It answers "is THIS
+    key resident in L1 right now", which is exactly the fact the counters cannot supply:
+      * after render  — Count == 1, class `widgetContent`, body sha256 recorded;
+      * after the second /call — Count == 1 with the SAME sha256 and an age that did NOT
+        reset, i.e. served from the store rather than re-resolved.
+    A declined body has no entry at all, so Count is 0 and this fails at the first step.
 
-    Together they are: counters say "an entry was cached and served", the
-    browser says "this one". **A mismatch fails the stage** — same discipline
-    as the delete's two channels, never reconciled.
+    An earlier design asked the BROWSER for `l1_hit`. It cannot know: snowplow stamps no
+    cache-status header on /call, and Refresh-Key is present on hits and declines alike. The
+    inspector replaces that with a server-side per-key fact, so both channels are real.
+
+    Disagreement FAILS the stage — same discipline as the delete's two channels.
     """
     counters_ok = stored >= 1 and hits >= 1
-    browser_hit = bool(hook_data.get("l1_hit"))
-    key = hook_data.get("refresh_key")
-    browser_ok = browser_hit and bool(key)
-    agree = counters_ok and browser_ok
-    if counters_ok and not browser_ok:
+    resident = after_render.get("count") == 1 and after_hit.get("count") == 1
+    m0, m1 = after_render.get("meta") or {}, after_hit.get("meta") or {}
+    cls = m0.get("cacheEntryClass")
+    same_body = bool(m0.get("bodySHA256")) and m0.get("bodySHA256") == m1.get("bodySHA256")
+    # Age must not RESET. A re-resolve replaces the entry and restarts its age, so an age
+    # that went backwards means the second call was served by the resolver, not the store.
+    age_kept = (m1.get("ageSeconds") or 0) >= (m0.get("ageSeconds") or 0)
+    inspector_ok = resident and cls == "widgetContent" and same_body and age_kept
+    agree = counters_ok and inspector_ok
+    if not resident:
         verdict = (
-            "MISMATCH — the counters moved but the browser did not report an "
-            "L1 hit for the harness widget. store_total/hit_total are global, "
-            "so this is consistent with the widget having been DECLINED "
-            "(facts §10.2) while FOREIGN traffic moved the counters. Nothing "
-            "can ever be evicted for a key whose entry never existed.")
-    elif browser_ok and not counters_ok:
+            f"the armed key is NOT resident in L1 (count after render="
+            f"{after_render.get('count')}, after the second call={after_hit.get('count')}). "
+            f"A DECLINED body stamps a refresh key and stores nothing, so nothing can ever "
+            f"be evicted for it — facts §10.2. Check the snowplow log for 'declining to cache'.")
+    elif cls != "widgetContent":
         verdict = (
-            "MISMATCH — the browser reported an L1 hit but neither "
-            "store_total nor hit_total moved. The reported hit is not "
-            "corroborated by the store; treat the browser evidence as "
-            "unreliable rather than accepting it.")
-    elif not agree:
-        verdict = ("neither channel confirms the widget was cached")
+            f"the entry is class {cls!r}, expected 'widgetContent'. The disposable child must "
+            f"be the widgetContent-eligible object; a `widgets` cell is the RBAC-sensitive "
+            f"page root, which is not what this run deletes.")
+    elif not same_body:
+        verdict = "the body sha256 changed between the two lookups — the entry was replaced, not served."
+    elif not age_kept:
+        verdict = "the entry's age RESET — the second call was re-resolved, not served from L1."
+    elif not counters_ok:
+        verdict = (
+            f"the inspector shows our entry resident but neither global counter moved "
+            f"(store_total Δ={stored}, hit_total Δ={hits}) — the two channels disagree.")
     else:
         verdict = "ok"
-    return {
-        "passed": agree,
-        "counters": {"store_total_delta": stored, "hit_total_delta": hits,
-                     "ok": counters_ok,
-                     "semantics": "global; proves AN entry, not THIS one"},
-        "browser": {"l1_hit": browser_hit, "refresh_key_present": bool(key),
-                    "ok": browser_ok,
-                    "semantics": "per-widget; proves THIS one, self-reported"},
-        "verdict": verdict,
-    }
+    return {"checked": True, "passed": agree, "verdict": verdict,
+            "counters": {"store_total": stored, "hit_total": hits},
+            "inspector": {"class": cls, "resident_after_render": after_render.get("count"),
+                          "resident_after_hit": after_hit.get("count"),
+                          "body_sha256_stable": same_body, "age_kept": age_kept,
+                          "age_after_render": m0.get("ageSeconds"),
+                          "age_after_hit": m1.get("ageSeconds")}}
 
 
 def crosscheck_channels(hook_deleted: dict, hook_asserted: dict) -> dict:
@@ -961,21 +1006,30 @@ def stage_counters_before(ctx: dict) -> dict:
     for kind, name in (created.get("data", {}).get("objects") or []):
         assert_owned(kind, name)                 # R1, on what was actually made
 
-    # P1/P2 — snapshot BEFORE the browser does any /call for the widget, so one
-    # of the two cache-proof channels is OURS. Trusting the browser's `l1_hit`
-    # alone would rest the guard on the very half the counters exist to
-    # corroborate; trusting the counters alone cannot say the entry was OURS
-    # (they are global, and there is no per-key store counter). Both are
-    # required, and they must agree — see crosscheck_cache_proof.
+    # P1/P2 — snapshot BEFORE the browser does any /call for the widget. The global
+    # counters bracket the window; the per-key inspector says whether OUR entry is the
+    # one in it. Neither alone is enough: the counters cannot tell our entry from foreign
+    # traffic, and a single channel reported by the half the counters exist to corroborate
+    # is not corroboration. Both are required and must agree — see crosscheck_cache_proof.
     pre = snapshot_counters(read_debug_vars(portal, ctx["token"], reqlog))
 
-    wait_hook(run_dir, "rendered", rid, began)       # first /call → cold fill
-    hit = wait_hook(run_dir, "hit_proved", rid, began)  # second /call → HIT
-    hd = hit.get("data", {})
-    if not hd.get("refresh_key"):
+    rendered = wait_hook(run_dir, "rendered", rid, began)   # first /call → cold fill
+    rd = rendered.get("data", {})
+    key = rd.get("refresh_key") or rd.get("armed_key")
+    if not key:
         raise PreflightFailed(
             "the browser half reported no X-Snowplow-Refresh-Key. Without the "
-            "armed key there is nothing to assert delivery against.")
+            "armed key there is nothing to look up and nothing to assert delivery against.")
+
+    # PER-KEY CHANNEL, step 1: is OUR entry actually in L1 after the render? The value the
+    # SPA armed on IS the store key, so this is a direct lookup rather than an inference.
+    insp_render = read_apistage_key(portal, ctx["token"], key, reqlog)
+
+    hit = wait_hook(run_dir, "hit_proved", rid, began)      # second /call → served from L1
+    hd = hit.get("data", {})
+
+    # Step 2: still resident, same body, age not reset → served from the store, not re-resolved.
+    insp_hit = read_apistage_key(portal, ctx["token"], key, reqlog)
 
     post = snapshot_counters(read_debug_vars(portal, ctx["token"], reqlog))
     cache_d = delta(pre, post)
@@ -986,20 +1040,19 @@ def stage_counters_before(ctx: dict) -> dict:
     # delete). `>= 1` on the counters, not `== 1`: both are GLOBAL and any
     # other portal session moves them, so equality would be flaky for a reason
     # unrelated to the test. But `>= 1` is for the same reason not PROOF that
-    # OUR widget was the one cached — there is no per-key store counter — so
-    # the browser's per-widget l1_hit must agree with it.
-    cache_cc = crosscheck_cache_proof(stored, hits, hd)
+    # OUR widget was the one cached — there is no per-key store counter — so the
+    # per-key inspector lookups above must agree with it.
+    cache_cc = crosscheck_cache_proof(stored, hits, insp_render, insp_hit)
     if not cache_cc["passed"]:
         raise PreflightFailed(
-            f"the disposable widget was NOT provably cached. "
-            f"{cache_cc['verdict']} "
-            f"(counters: store_total Δ={stored}, hit_total Δ={hits}; browser: "
-            f"l1_hit={hd.get('l1_hit')!r}). Facts §10.2: snowplow stamps "
-            f"X-Snowplow-Refresh-Key even on a DECLINE (stage-error, external "
-            f"touch, undeclared extras, UAF refilter), so the browser can arm a "
-            f"key whose entry never existed — nothing can ever be evicted for "
-            f"it and the run would read as a C10 failure. Refusing to proceed. "
-            f"Check the snowplow log for a 'declining to cache' WARN.")
+            f"the disposable widget was NOT provably cached. {cache_cc['verdict']} "
+            f"(counters: store_total Δ={stored}, hit_total Δ={hits}; inspector: "
+            f"{json.dumps(cache_cc['inspector'])}). Facts §10.2: snowplow stamps "
+            f"X-Snowplow-Refresh-Key even on a DECLINE (stage-error, external touch, "
+            f"undeclared extras, UAF refilter), so the browser can arm a key whose entry "
+            f"never existed — nothing can ever be evicted for it and the run would read as "
+            f"a C10 failure. Refusing to proceed. Check the snowplow log for a "
+            f"'declining to cache' WARN.")
 
     # (c) ARMING MUST BE VISIBLE SERVER-SIDE BEFORE THE DELETE.
     #
@@ -1023,7 +1076,7 @@ def stage_counters_before(ctx: dict) -> dict:
 
     ctx["window_start"] = _now_iso()
     ctx["before"] = post          # the delete window opens from the post-hit state
-    ctx["refresh_key"] = hd["refresh_key"]
+    ctx["refresh_key"] = key
     return {
         "window_start": ctx["window_start"],
         "refresh_class": hd.get("refresh_class"),
@@ -1061,13 +1114,30 @@ def stage_counters_after(ctx: dict) -> dict:
     rows = stage_a_rows(n) if n == 1 else burst_rows(n)
     ok, results = evaluate(rows, d)
 
+    # PER-KEY CHANNEL, step 3: the eviction must have removed THIS entry.
+    #
+    # The global evict counters say an eviction happened; they cannot say it was ours, for the
+    # same reason store_total cannot — evict_drop_point_total was already 1 at rest on an idle
+    # 057. A Count of 0 for the armed key is the per-key fact, and it is the one that closes
+    # the loop: the object we deleted is the object whose entry left the store.
+    insp_after = read_apistage_key(portal, ctx["token"], ctx["refresh_key"], reqlog)
+    evicted = insp_after.get("count") == 0
+
     a1a2 = crosscheck_a1_a2(results)
     chan = crosscheck_channels(deleted, asserted)
-    passed = ok and a1a2.get("agree", True) and chan.get("passed", False)
+    passed = ok and a1a2.get("agree", True) and chan.get("passed", False) and evicted
 
     ctx["window_end_iso"] = ctx["window_end"]
     return {
         "__passed__": passed,
+        # The per-key close of the loop: the global evict counters say AN eviction happened,
+        # this says it was OURS. A non-zero count here with the counters moved means something
+        # else was evicted and our entry survived — which the global rows cannot distinguish.
+        "key_evicted": {"passed": evicted, "count_after_delete": insp_after.get("count"),
+                        "verdict": "ok" if evicted else
+                        "the armed key is STILL resident in L1 after the delete and the frame: "
+                        "the eviction did not remove this entry, so a moved global counter "
+                        "belongs to something else."},
         "window_end": ctx["window_end"],
         "settle_seconds": SETTLE_SECONDS,
         "quiescence_caveat": (

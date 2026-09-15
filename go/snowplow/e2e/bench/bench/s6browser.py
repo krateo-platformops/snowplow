@@ -256,7 +256,8 @@ class S6Browser:
                 f"{self.child} is NOT in the subscription ({len(decoded)} coords armed). "
                 f"It rendered but did not arm — exactly the silent no-op this stage exists "
                 f"to catch.")
-        self._hook("rendered", {"armed_key": key, "armed_coords": len(decoded),
+        self._hook("rendered", {"armed_key": key, "refresh_key": key,
+                                "armed_coords": len(decoded),
                                 "stream_opens": page.evaluate(
                                     "() => window.__s6.streamOpens")})
 
@@ -281,26 +282,17 @@ class S6Browser:
             raise accept1126.AssertionsFailed(
                 f"the reload issued no second /call for {self.child}, so the counter half has "
                 f"no second lookup to bracket and prove-hit cannot be evaluated server-side.")
-        # `l1_hit` is reported as None, EXPLICITLY, rather than omitted or guessed.
-        #
-        # crosscheck_cache_proof wants a per-widget hit from this half because the counter
-        # channel is global and a DECLINED widget can ride foreign traffic to a passing
-        # counter check. That reasoning is sound — but the browser has no way to answer it:
-        # snowplow stamps no cache-status header on /call, and Refresh-Key is present on hits
-        # and declines alike, so there is nothing here that discriminates.
-        #
-        # Reporting None makes the cross-check FAIL loudly rather than pass on a fabricated
-        # value. That is deliberate: this contract needs resolving between the two halves
-        # (either a server-side cache-status header, or an explicit decision that the cache
-        # proof is single-channel and weaker), and a run that silently passed in the meantime
-        # would be exactly the kind of evidence this whole exercise exists to stop producing.
+        # No `l1_hit` field, deliberately. The browser cannot know whether its /call was served
+        # from L1: snowplow stamps no cache-status header, and Refresh-Key is present on hits
+        # and declines alike. The counter half answers it per-key instead, by looking the armed
+        # key up in the store itself (/debug/apistage?key_hash=…) around both calls. So this
+        # half's job is to REPORT the key and to make the second lookup happen — not to claim
+        # anything about the result.
         self._hook("hit_proved", {"armed_key": key, "refresh_key": key,
-                                  "l1_hit": None,
-                                  "l1_hit_undeterminable": "no cache-status header on /call; "
-                                  "Refresh-Key is stamped on hits and declines alike",
                                   "calls_seen": len(self._child_calls),
                                   "second_lookup_calls": len(later),
-                                  "proof_owner": "counter-half:store_total/hit_total bracket"})
+                                  "proof_owner": "counter-half:/debug/apistage?key_hash + "
+                                                 "store_total/hit_total"})
 
     def delete_and_observe(self, page) -> dict:
         """Delete the child, then watch BOTH channels without touching the browser."""
