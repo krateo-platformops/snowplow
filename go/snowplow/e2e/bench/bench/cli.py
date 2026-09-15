@@ -999,6 +999,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # half's stage-boundary signal). See bench/accept1126.py.
     from bench import accept1126
     accept1126.add_parsers(sub)
+    # The browser half is a SEPARATE subcommand, deliberately: the two halves run as two
+    # processes against one run dir, coordinating only through the hook files. A single
+    # process owning both would let the counter half observe the browser's own state instead
+    # of the cluster's — which is precisely how the 1.12.5 claim came to rest on a manual call.
+    from bench import s6browser
+    s6browser.add_parsers(sub)
 
     return p
 
