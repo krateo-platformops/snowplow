@@ -1000,9 +1000,37 @@ def stage_preflight(ctx: dict) -> dict:
             f"(CFG-1), so every assertion in the table would be a false zero.")
 
     ctx["token"] = token
+    # WIDGET-READ GRANT — the precondition run 4 died on, mid-run, after creating objects.
+    #
+    # /call is RBAC-narrowed at resolve under the CALLER's identity. The harness-user spec
+    # scoped s6-harness to no RBAC at all, correctly, on the premise that the browser half ran
+    # as a different identity; the one-owner decision made the browser half s6-harness, so the
+    # identity that needs nothing for /debug must now read two widget kinds.
+    #
+    # Checked here with a name that cannot exist, so it discriminates the grant from the object:
+    # 403 means no grant; 404 means the grant is present and the object is simply absent, which
+    # is exactly right at preflight. A PARTIAL grant — one kind and not the other — therefore
+    # fails here rather than half-way through a run that has already created CRs.
+    grants = {}
+    for resource in ("flexes", "paragraphs"):
+        probe = (f"{portal}{SNOWPLOW_PREFIX}/call?resource={resource}"
+                 f"&apiVersion=widgets.templates.krateo.io/v1beta1"
+                 f"&name=s6-grant-probe-does-not-exist&namespace={NS}")
+        status, _ = _http_get(probe, ctx["token"], reqlog)
+        grants[resource] = status
+        if status == 403:
+            raise PreflightFailed(
+                f"s6-harness cannot GET {resource}.widgets.templates.krateo.io in {NS} (403). "
+                f"The browser half renders as this identity, so the widget will never load and "
+                f"nothing will arm. Needs the narrow Role from harness-user-spec.md: get on "
+                f"paragraphs + flexes in {NS}, no list, no watch, nothing cluster-scoped. "
+                f"Failing at preflight deliberately — run 4 discovered this MID-RUN, after it "
+                f"had already created CRs.")
+
     return {
         "context": got_ctx,
         "run_id": ctx["run_id"],
+        "widget_read_grant": grants,
         "snowplow_image": sp_img, "snowplow_version": sp_ver,
         "frontend_image": fe_img, "frontend_version": fe_ver,
         "served_bundle": bundle,

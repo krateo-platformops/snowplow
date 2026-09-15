@@ -233,8 +233,14 @@ class S6Browser:
         the absence of a frame afterwards would be indistinguishable from a product bug.
         """
         page.on("response", self._on_response)
-        page.goto(f"{self.portal}{PROBE_PATH}", wait_until="networkidle", timeout=120000)
-        page.wait_for_timeout(3000)
+        # NOT networkidle. This page's whole purpose is to hold a /refreshes SSE stream open,
+        # and an SSE response is an in-flight request that never completes — so Playwright's
+        # idle condition is unreachable BY CONSTRUCTION here, and run 3 sat in page.goto for
+        # the full 120s timeout. (browser_login gets away with networkidle because the login
+        # page arms no widgets and opens no stream.) Wait for the document, then for the
+        # evidence that actually matters: the child's own /call landing.
+        page.goto(f"{self.portal}{PROBE_PATH}", wait_until="domcontentloaded", timeout=60000)
+        self._await_child_call(page, "the first render")
 
         first = [c for c in self._child_calls]
         if not first:
@@ -280,8 +286,8 @@ class S6Browser:
         # real evidence from the server's own accounting, which is also the project's
         # counters-not-timing rule. This half reports the key so that bracket can be attributed.
         before = len(self._child_calls)
-        page.reload(wait_until="networkidle", timeout=120000)
-        page.wait_for_timeout(2000)
+        page.reload(wait_until="domcontentloaded", timeout=60000)
+        self._await_child_call(page, "the second lookup", since=before)
         later = self._child_calls[before:]
         if not later:
             raise accept1126.AssertionsFailed(
@@ -298,6 +304,22 @@ class S6Browser:
                                   "second_lookup_calls": len(later),
                                   "proof_owner": "counter-half:/debug/apistage?key_hash + "
                                                  "store_total/hit_total"})
+
+    def _await_child_call(self, page, what: str, since: int = 0,
+                          timeout_s: int = 60) -> None:
+        """Wait until the child's own /call has landed, rather than for the network to fall
+        idle — which it never does while the refresh stream is open."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if len(self._child_calls) > since:
+                page.wait_for_timeout(1500)   # let the arm + any follow-up settle
+                return
+            page.wait_for_timeout(500)
+        raise accept1126.AssertionsFailed(
+            f"no /call for {self.child} within {timeout_s}s during {what}. The widget did not "
+            f"load, so nothing armed. Check that the /s6-probe route is live "
+            f"(acceptance.s6Probe on the portal component) and that the page root is named "
+            f"{PAGE_ROOT}.")
 
     def delete_and_observe(self, page) -> dict:
         """Delete the child, then watch BOTH channels without touching the browser."""
