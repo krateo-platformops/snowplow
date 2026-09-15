@@ -855,7 +855,13 @@ def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
     age0, age1 = (m0.get("ageSeconds") or 0), (m1.get("ageSeconds") or 0)
     age_measurable = age0 >= 1
     age_kept = age_measurable and age1 >= age0
-    inspector_ok = resident and cls == "widgetContent" and same_body and age_kept
+    # CLASS. facts §10.5 predicted `widgetContent`; run 6 measured `widgets` and the doc was
+    # wrong. widgetContent (resolved.go:159-179) is the identity-FREE shell layer the walker
+    # populates under the SA; a widget the BROWSER fetches through /call is keyed and served
+    # under the per-identity `widgets` class, and the SPA arms with whatever class the header
+    # carries (refresh_subscription.go:232 handles classWidgets). For a direct fetch of the
+    # child — which is what this harness does — `widgets` is the correct expected value.
+    inspector_ok = resident and cls == "widgets" and same_body and age_kept
     agree = counters_ok and inspector_ok
     if not resident:
         verdict = (
@@ -863,11 +869,12 @@ def crosscheck_cache_proof(stored: int, hits: int, after_render: dict,
             f"{after_render.get('count')}, after the second call={after_hit.get('count')}). "
             f"A DECLINED body stamps a refresh key and stores nothing, so nothing can ever "
             f"be evicted for it — facts §10.2. Check the snowplow log for 'declining to cache'.")
-    elif cls != "widgetContent":
+    elif cls != "widgets":
         verdict = (
-            f"the entry is class {cls!r}, expected 'widgetContent'. The disposable child must "
-            f"be the widgetContent-eligible object; a `widgets` cell is the RBAC-sensitive "
-            f"page root, which is not what this run deletes.")
+            f"the entry is class {cls!r}, expected 'widgets'. A widget the browser fetches "
+            f"directly through /call is keyed under the per-identity `widgets` class; "
+            f"`widgetContent` is the identity-free shell layer the walker populates, which a "
+            f"browser fetch never lands in.")
     elif not same_body:
         verdict = "the body sha256 changed between the two lookups — the entry was replaced, not served."
     elif not age_measurable:
@@ -1136,6 +1143,19 @@ def stage_counters_before(ctx: dict) -> dict:
             f"nothing can be delivered for this key and a delete would prove nothing. At rest "
             f"both read 0 on an idle 057, so this is a real signal rather than a threshold. "
             f"Refusing to proceed to the delete.")
+
+    # THE ACK THAT ORDERS THE TWO HALVES. Run 6 failed here for a sequencing reason, not a
+    # cache one: the browser deleted the child 0.6s after hit_proved, and this stage's second
+    # inspector lookup then ran AFTER that delete — so count 0 was OUR OWN eviction, the success
+    # signal read one step too early. Hooks alone cannot order this; the browser had no way to
+    # know the counter half had finished looking.
+    #
+    # So the delete now waits on this announcement, which is written only once the cache proof
+    # has PASSED. The browser blocks on it with a loud timeout rather than proceeding blind.
+    announce(run_dir, "hit_verified", rid,
+             {"armed_key": key, "cache_proof_passed": True,
+              "class": cache_cc["inspector"]["class"],
+              "next": "the child may now be deleted"})
 
     ctx["window_start"] = _now_iso()
     ctx["before"] = post          # the delete window opens from the post-hit state

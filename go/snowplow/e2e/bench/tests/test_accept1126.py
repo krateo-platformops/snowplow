@@ -251,7 +251,7 @@ def test_reconcile_detection_is_on_our_own_request_log():
 # ─── The cache proof needs BOTH channels (review follow-up 1) ──────────────
 
 
-def _insp(count, sha="abc123", age=3, cls="widgetContent"):
+def _insp(count, sha="abc123", age=3, cls="widgets"):
     """One /debug/apistage?key_hash= reading. count=0 models a DECLINED widget: the key was
     stamped, no entry was ever stored, so nothing can be evicted for it later."""
     meta = {"cacheEntryClass": cls, "bodySHA256": sha, "ageSeconds": age} if count else None
@@ -298,11 +298,14 @@ def test_cache_proof_REFUSES_a_zero_age_rather_than_passing_vacuously():
 
 
 def test_cache_proof_rejects_the_wrong_cache_entry_class():
-    """`widgets` is the RBAC-sensitive page root; the disposable CHILD is what this run
-    deletes and it must be widgetContent-eligible."""
-    cc = a.crosscheck_cache_proof(1, 1, _insp(1, cls="widgets"), _insp(1, cls="widgets"))
+    """Run 6 measured the child's key as class `widgets` and the facts doc's `widgetContent`
+    prediction was wrong: widgetContent is the identity-FREE shell layer the walker populates
+    under the SA, while a widget the BROWSER fetches through /call is keyed per-identity under
+    `widgets`. So `widgets` is correct here and widgetContent is the anomaly."""
+    cc = a.crosscheck_cache_proof(1, 1, _insp(1, cls="widgetContent"),
+                                  _insp(1, cls="widgetContent"))
     assert not cc["passed"]
-    assert "widgetContent" in cc["verdict"]
+    assert "widgets" in cc["verdict"]
 
 
 def test_cache_proof_rejects_an_inspector_hit_the_counters_do_not_corroborate():

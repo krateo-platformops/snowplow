@@ -191,6 +191,9 @@ class S6Browser:
         #: which is the whole claim: the browser refetched without being told to.
         self._initiating = True
         self._child_calls: list[dict] = []
+        #: The exact /call URL the SPA issued for the child, replayed for the second lookup so
+        #: it is the same request under the same identity — and therefore the same store key.
+        self._child_call_url: str | None = None
 
     # ─── hooks ──────────────────────────────────────────────────────────────
 
@@ -285,8 +288,17 @@ class S6Browser:
         # all. The counter half owns it: its store_total/hit_total bracket around this window is
         # real evidence from the server's own accounting, which is also the project's
         # counters-not-timing rule. This half reports the key so that bracket can be attributed.
+        # IN-PAGE REFETCH, not page.reload(). §12 asks for "the browser's second /call", and a
+        # reload is a far heavier instrument: run 6's reload re-stored the entire shell
+        # (store_total Δ=18) and muddied the global brackets the counter half reads. It also
+        # tears down the SPA and re-arms from scratch. Re-issuing the widget's own /call from
+        # inside the live page keeps the subscription and the shell exactly as they are, and is
+        # the thing the stage actually names.
         before = len(self._child_calls)
-        page.reload(wait_until="domcontentloaded", timeout=60000)
+        page.evaluate("""async (url) => {
+          const u = JSON.parse(localStorage.getItem('K_user') || '{}');
+          await fetch(url, { headers: { Authorization: `Bearer ${u.accessToken}` } });
+        }""", self._child_call_url or "")
         self._await_child_call(page, "the second lookup", since=before)
         later = self._child_calls[before:]
         if not later:
@@ -304,6 +316,30 @@ class S6Browser:
                                   "second_lookup_calls": len(later),
                                   "proof_owner": "counter-half:/debug/apistage?key_hash + "
                                                  "store_total/hit_total"})
+
+    def _await_ack(self, page, name: str, timeout_s: int = 120) -> dict:
+        """Block until the counter half announces `name` for THIS run.
+
+        The run id is checked, not just the file's presence: --from-stage reuses a run dir, and
+        a stale announcement from a previous run would release the delete against evidence that
+        belongs to someone else.
+        """
+        path = self.run_dir / "announce" / f"{name}.json"
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if path.exists():
+                try:
+                    payload = json.loads(path.read_text())
+                except Exception:
+                    payload = {}
+                if payload.get("run_id") == self.run_id:
+                    print(f"    s6browser: ack {name} <- {json.dumps(payload.get('data', {}))[:120]}")
+                    return payload
+            page.wait_for_timeout(500)
+        raise accept1126.AssertionsFailed(
+            f"no {name!r} announcement from the counter half within {timeout_s}s. It either "
+            f"failed its cache proof or is not running; either way the delete must NOT proceed, "
+            f"because an unverified entry makes the eviction evidence meaningless.")
 
     def _await_child_call(self, page, what: str, since: int = 0,
                           timeout_s: int = 60) -> None:
@@ -325,6 +361,13 @@ class S6Browser:
         """Delete the child, then watch BOTH channels without touching the browser."""
         # From here nothing this script does may cause a /call. Anything observed is the
         # browser acting on its own, which is the entire claim.
+        # WAIT FOR THE COUNTER HALF. Run 6 deleted 0.6s after hit_proved, before the counter
+        # half had finished its second inspector lookup — so that lookup saw count 0, which was
+        # OUR OWN eviction, and the cache proof failed on the success signal. The two halves
+        # cannot be ordered by hooks alone: the browser had no way to know the other side had
+        # looked. It blocks on the ack now, and fails loudly rather than deleting blind.
+        self._await_ack(page, "hit_verified")
+
         self._initiating = False
         frames_before = page.evaluate("() => window.__s6.frames.length")
         calls_before = len(self._child_calls)
@@ -392,6 +435,8 @@ class S6Browser:
             headers = response.headers
         except Exception:
             pass
+        if self._child_call_url is None:
+            self._child_call_url = url
         self._child_calls.append({
             "at": time.time(),
             "initiated_by_harness": self._initiating,
