@@ -403,6 +403,22 @@ env:
   # the SA identity). Permanent declines (external endpoint, userAccessFilter
   # cell, unsupported kind) suppress on the FIRST occurrence. Minimum 1.
   REFRESH_SUPPRESS_AFTER_DECLINES: "3"
+  # 1.12.6 item 7 — PROVISIONAL (chosen without production data; re-tune later).
+  # A DELETE-semantics eviction (informer DELETE, confirmed self-404) now
+  # publishes a `refresh` frame to every /refreshes subscriber armed for the
+  # key, so the tab stops rendering a body whose object is gone. This is the
+  # per-subscriber token bucket on those frames: at most BURST immediately,
+  # then RATE per second; the rest are DEFERRED in order (never dropped). It
+  # bounds the fleet-wide refetch storm a mass delete would otherwise induce
+  # (1000 tabs x 30 widgets in one tick). At 5/10 a 30-widget page converges
+  # in <= 6 s, a 512-widget page in ~100 s. The counters that justify a
+  # re-tune: snowplow_refresh_broadcaster.evict_deferred (how often the bound
+  # engaged) and evict_published (eviction volume) on /debug/vars, mirrored as
+  # snowplow_refresh_broadcaster_evict_{deferred,published}_total in OTel.
+  # Values < 1 fall back to the defaults. TTL / LRU / max-age and non-404
+  # drop-point evictions never publish and are not affected.
+  REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND: "5"
+  REFRESH_EVICTION_PUBLISH_BURST: "10"
   # 1.12.6 C5 — bounded L1 entry LIFETIME (docs/architecture/caching.md §3.4).
   # The 3600s TTL is measured from the last Put, and a refresh re-Put resets
   # it, so an entry the event pipeline keeps re-Putting never expires — a

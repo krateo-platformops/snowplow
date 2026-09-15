@@ -1023,19 +1023,36 @@ func (d *DepTracker) runEvictionBatch(keys []string) {
 	store := d.store
 	d.storeMu.RUnlock()
 
-	evicted := 0
+	var gone []string
 	for _, l1Key := range keys {
 		if store != nil {
 			if store.deleteForDep(l1Key) {
-				evicted++
+				gone = append(gone, l1Key)
 			}
 		}
 		d.RemoveL1Key(l1Key) // clear forward + reverse records
 	}
-	if evicted > 0 {
-		d.evictDeleteTotal.Add(uint64(evicted))
+	if len(gone) > 0 {
+		d.evictDeleteTotal.Add(uint64(len(gone)))
+	}
+	// 1.12.6 item 7 (C10): tell the armed frontend the body is gone. Runs
+	// AFTER every lock this path takes is released (d.storeMu above,
+	// c.mu inside deleteForDep) — the hub takes its own h.mu and the
+	// per-subscriber pmu, so the eviction path never nests a hub lock
+	// under a store lock (S10). Only keys that actually left the store
+	// publish; a key with no armed subscriber costs one map read.
+	for _, l1Key := range gone {
+		publishEvictionFn(l1Key)
 	}
 }
+
+// publishEvictionFn is the C10 publish hook the two DELETE-semantics
+// eviction sites call (runEvictionBatch, EvictSelfGone). A var seam ONLY so
+// the S10 arm can install a probe that asserts the store lock is free at
+// the call (repo idiom: refreshCoalesceWindowFn); production never
+// reassigns it. TTL / LRU / max-age evictions (resolved.go) deliberately do
+// NOT route here — design §6.2.5 / S1d.
+var publishEvictionFn = PublishEviction
 
 // EvictSelfGone evicts ONE L1 key whose own object has been observed
 // gone by a path other than an informer DELETE event — today the sole
@@ -1074,7 +1091,19 @@ func (d *DepTracker) runEvictionBatch(keys []string) {
 // same mechanism on its own counter, so evict_self_gone_total keeps meaning
 // "the object is confirmed gone" even during an apiserver outage.
 func (d *DepTracker) EvictSelfGone(l1Key string) bool {
-	return d.evictSelfEntry(l1Key, &d.evictSelfGoneTotal)
+	if !d.evictSelfEntry(l1Key, &d.evictSelfGoneTotal) {
+		return false
+	}
+	// 1.12.6 item 7 (C10): the object is CONFIRMED gone (404) — tell the
+	// armed frontend. Same hook and lock discipline as runEvictionBatch
+	// (c.mu released inside deleteForDep, d.storeMu released inside
+	// evictSelfEntry). Deliberately in THIS arm and not in evictSelfEntry:
+	// EvictDropPoint shares the body for a NON-404 failure (403 / 500 /
+	// timeout under the breaker), which is not a deletion — publishing it
+	// would tell every armed tab its widgets were deleted during an
+	// apiserver outage (S1d pins it silent).
+	publishEvictionFn(l1Key)
+	return true
 }
 
 // EvictDropPoint is EvictSelfGone for the 1.12.6 C4 drop point: the entry's
@@ -1206,11 +1235,45 @@ func resetDepsForTest() {
 // cross-package test cannot leak the DELETE-eviction worker goroutine
 // or stale bridge counters into the next case.
 func ResetDepsForTest() {
-	// Stop the dep-event worker FIRST: it reads Deps() on its own goroutine
-	// (1.12.6 C1 — every event, not only DELETEs), so resetting the tracker
-	// while it drains is a data race the -race detector reports.
+	// Order is load-bearing (1.12.6 item 7 gate, -race at -count=3):
+	//  1. stop + JOIN the watcher bound to the bridge — its informer
+	//     handlers captured the bridge singleton at registration, and an
+	//     ADD they deliver after the singleton is replaced would start a
+	//     worker nobody can stop any more (an orphan that keeps reading
+	//     Deps() under the next test's reset);
+	//  2. stop + join the dep-event worker: it reads Deps() on its own
+	//     goroutine (1.12.6 C1 — every event, not only DELETEs);
+	//  3. only then write the tracker fields.
+	stopBoundDepWatcherForTest()
 	resetDepWatchForTest()
 	resetDepsForTest()
+}
+
+// stopBoundDepWatcherForTest stops the ResourceWatcher currently bound to
+// the dep-watch bridge (the one whose informer handlers feed it) and
+// blocks until every goroutine that watcher spawned has exited
+// (ResourceWatcher.Stop joins the factory and the watcher-owned goroutines),
+// so no handler can reach the bridge after the reset that follows.
+// Idempotent (Stop is). A bare watcher built by struct literal in a test
+// (no NewResourceWatcher: nil stopCh, no factory, no goroutines) has
+// nothing to join and is skipped — Stop would close a nil channel.
+// Test-only — production never resets the bridge.
+func stopBoundDepWatcherForTest() {
+	w := depWatchInstance
+	if w == nil {
+		return
+	}
+	rw := w.watcher.Load()
+	if rw == nil {
+		return
+	}
+	rw.mu.RLock()
+	bare := rw.stopCh == nil
+	rw.mu.RUnlock()
+	if bare {
+		return
+	}
+	rw.Stop()
 }
 
 // CollectMatchesForTest exposes the package-private collectMatches for

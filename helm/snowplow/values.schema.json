@@ -606,6 +606,16 @@
           "description": "1.12.6: consecutive stage-error refresh declines of one L1 key before the key is marked refresh-by-traffic-only (no further background re-resolves or WARNs until a real Put or an eviction clears the marker). Structurally permanent declines (external endpoint, userAccessFilter cell, unsupported kind) suppress on the first occurrence. Minimum 1.",
           "title": "Refresh Suppress After Declines"
         },
+        "REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND": {
+          "type": "string",
+          "description": "1.12.6 item 7 (PROVISIONAL, no production data yet): per-subscriber release rate, in keys per second, of the `refresh` frames a DELETE-semantics eviction publishes to /refreshes. Excess frames are deferred in order, never dropped. Re-tune from snowplow_refresh_broadcaster.evict_deferred / evict_published. Values < 1 fall back to 5.",
+          "title": "Refresh Eviction Publish Rate Per Second"
+        },
+        "REFRESH_EVICTION_PUBLISH_BURST": {
+          "type": "string",
+          "description": "1.12.6 item 7 (PROVISIONAL, no production data yet): per-subscriber burst of eviction-driven `refresh` frames released immediately before REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND applies. Values < 1 fall back to 10.",
+          "title": "Refresh Eviction Publish Burst"
+        },
         "OTEL_ENABLED": {
           "type": "string",
           "description": "Master switch for OpenTelemetry export to ClickStack (traces + metrics over OTLP/HTTP). \"false\" restores a byte-identical pre-1.12.4 process. Per-signal overrides: OTEL_TRACING_ENABLED, OTEL_METRICS_ENABLED, OTEL_LOGS_ENABLED.",

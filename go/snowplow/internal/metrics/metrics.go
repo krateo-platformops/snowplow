@@ -245,6 +245,39 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
+	// 1.12.6 item 7 (C12): eviction-path pacing + stream lifetime. Mirrors
+	// /debug/vars snowplow_refresh_broadcaster field for field; no log lines
+	// (the chart runs LOG_LEVEL=warn).
+	refreshArmedKeys, err := m.Int64ObservableGauge("snowplow_refresh_broadcaster_armed_keys",
+		metric.WithDescription("Distinct L1 keys with at least one armed live-refresh subscriber (reverse-index size)."))
+	if err != nil {
+		return err
+	}
+	refreshMaxSinkDepth, err := m.Int64ObservableGauge("snowplow_refresh_broadcaster_max_sink_depth",
+		metric.WithDescription("High-water mark of a subscriber sink after a send (consumer lag, 0..64)."))
+	if err != nil {
+		return err
+	}
+	refreshEvictPublished, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_evict_published_total",
+		metric.WithDescription("Eviction-driven live-refresh publishes that reached at least one subscriber."))
+	if err != nil {
+		return err
+	}
+	refreshEvictDeferred, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_evict_deferred_total",
+		metric.WithDescription("Eviction-driven signals deferred by the per-subscriber token bucket (the bound engaged)."))
+	if err != nil {
+		return err
+	}
+	refreshStreamSeconds, err := m.Float64ObservableCounter("snowplow_refresh_broadcaster_stream_seconds_total",
+		metric.WithDescription("Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."))
+	if err != nil {
+		return err
+	}
+	refreshStreamsClosed, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_streams_closed_total",
+		metric.WithDescription("/refreshes streams that ended."))
+	if err != nil {
+		return err
+	}
 
 	// --- rbac: snapshot authz memo ---
 	memoHits, err := m.Int64ObservableCounter("snowplow_authz_memo_hits",
@@ -593,12 +626,18 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(prewarmDone, done)
 		o.ObserveInt64(prewarmElapsed, elapsed)
 
-		published, delivered, dropped, coalesced := cache.RefreshBroadcasterCounters()
-		o.ObserveInt64(refreshPublished, int64(published))
-		o.ObserveInt64(refreshDelivered, int64(delivered))
-		o.ObserveInt64(refreshDropped, int64(dropped))
-		o.ObserveInt64(refreshCoalesced, int64(coalesced))
-		o.ObserveInt64(refreshSubscribers, int64(cache.RefreshSubscriberCount()))
+		rb := cache.RefreshBroadcasterStatsSnapshot()
+		o.ObserveInt64(refreshPublished, int64(rb.Published))
+		o.ObserveInt64(refreshDelivered, int64(rb.Delivered))
+		o.ObserveInt64(refreshDropped, int64(rb.Dropped))
+		o.ObserveInt64(refreshCoalesced, int64(rb.Coalesced))
+		o.ObserveInt64(refreshSubscribers, int64(rb.Subscribers))
+		o.ObserveInt64(refreshArmedKeys, int64(rb.ArmedKeys))
+		o.ObserveInt64(refreshMaxSinkDepth, rb.MaxSinkDepth)
+		o.ObserveInt64(refreshEvictPublished, int64(rb.EvictPublished))
+		o.ObserveInt64(refreshEvictDeferred, int64(rb.EvictDeferred))
+		o.ObserveFloat64(refreshStreamSeconds, rb.StreamSecondsTotal)
+		o.ObserveInt64(refreshStreamsClosed, int64(rb.StreamsClosedTotal))
 
 		hits, misses, swaps, refused, denyUncached, entries := rbac.AuthzMemoSnapshot()
 		o.ObserveInt64(memoHits, int64(hits))

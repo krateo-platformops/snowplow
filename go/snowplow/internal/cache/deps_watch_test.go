@@ -25,11 +25,17 @@ import (
 // bridge test starts clean. Returns the cleanup func.
 func withCleanDepWatch(t *testing.T) func() {
 	t.Helper()
-	// Worker first, tracker second — the worker reads Deps() on its own
-	// goroutine (1.12.6 C1), so the tracker must not be reset under it.
+	// Bound watcher first (stop + join, so no informer handler can start a
+	// worker on the old singleton afterwards), worker second (stop + join —
+	// it reads Deps() on its own goroutine, 1.12.6 C1), tracker last. The
+	// same order as ResetDepsForTest; a test's own t.Cleanup(rw.Stop) runs
+	// AFTER a deferred call of the returned func, so the stop has to
+	// happen here.
+	stopBoundDepWatcherForTest()
 	resetDepWatchForTest()
 	resetDepsForTest()
 	return func() {
+		stopBoundDepWatcherForTest()
 		resetDepWatchForTest()
 		resetDepsForTest()
 	}
