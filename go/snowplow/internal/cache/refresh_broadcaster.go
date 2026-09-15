@@ -8,6 +8,13 @@
 // guaranteed L1 HIT (no apiserver read). Design:
 // docs/live-refresh-coherence-design-2026-06-18.md §2.
 //
+// 1.12.6 item 7 (C11, design-1.12.6-item7-refreshes.md §6.3): the hub fans
+// out through its reverse index. keyRefs (a per-key COUNT) became keySubs
+// (l1Key -> the subscribers armed for it), so a publish visits only the
+// connections armed for that key — O(armed-for-key), typically 1–5 —
+// instead of every live connection (O(|subs|), 1000 map lookups per
+// published key at fleet scale). The refcount is len(keySubs[k]).
+//
 // PRIOR ART (feedback_check_k8s_clientgo_prior_art): we BORROW the proven
 // per-watcher discipline of k8s.io/apimachinery/pkg/watch.Broadcaster
 // (mux.go: per-watcher buffered channel + DropIfChannelFull so one slow
@@ -19,7 +26,7 @@
 // CONCURRENCY (feedback_shared_vs_copy_is_a_concurrency_change): PublishRefresh
 // is called from the refresher worker goroutine(s), off the customer request
 // path; SubscribeRefresh / unsub / Arm / Disarm run on /refreshes connection
-// goroutines. All shared state is guarded by mu (subs + keyRefs) and the
+// goroutines. All shared state is guarded by mu (subs + keySubs) and the
 // coalesce map by cmu. The fan-out loop holds only an RLock and does NO I/O
 // inside it (a full sink takes the non-blocking default: arm). Exercised by
 // the -race falsifier 9.6.
@@ -109,6 +116,9 @@ type refreshSub struct {
 	hub  *refreshBroadcaster
 	keys map[string]struct{}
 	ch   chan string
+
+	// per-connection attribution (C12), read by RefreshSubSnapshotsForTest.
+	delivered atomic.Uint64
 }
 
 // refreshBroadcaster is the per-key fan-out hub. One process-singleton,
@@ -116,12 +126,14 @@ type refreshSub struct {
 type refreshBroadcaster struct {
 	mu   sync.RWMutex
 	subs map[uint64]*refreshSub
-	// keyRefs is the per-key subscriber reverse-index — l1Key -> number of
-	// connections armed for it. Maintained in lockstep with subs[*].keys
-	// under mu. Backs HasRefreshSubscriber's O(1) presence check (design
-	// §12.3); A populates and maintains it (it is a broadcaster feature, a
-	// no-op consumer until a later ship reads it on the floor path).
-	keyRefs map[string]int
+	// keySubs is the per-key subscriber reverse-index — l1Key -> the
+	// connections armed for it (C11; formerly keyRefs, a count). Maintained
+	// in lockstep with subs[*].keys under mu. Backs HasRefreshSubscriber's
+	// O(1) presence check and the fan-out (PublishRefresh visits only
+	// keySubs[l1Key]). A key with no armed connection has no entry (the
+	// inner map is deleted when it empties), so len(keySubs) is the
+	// armed_keys gauge.
+	keySubs map[string]map[uint64]*refreshSub
 	next    uint64
 
 	// coalesce state: per-key last-emit timestamp, guarded by cmu (a
@@ -151,11 +163,39 @@ func refreshHub() *refreshBroadcaster {
 	if refreshHubInstance == nil {
 		refreshHubInstance = &refreshBroadcaster{
 			subs:     map[uint64]*refreshSub{},
-			keyRefs:  map[string]int{},
+			keySubs:  map[string]map[uint64]*refreshSub{},
 			lastEmit: map[string]time.Time{},
 		}
 	}
 	return refreshHubInstance
+}
+
+// armLocked / disarmLocked maintain keySubs in lockstep with s.keys. Caller
+// holds h.mu (write).
+func (h *refreshBroadcaster) armLocked(s *refreshSub, l1Key string) {
+	if _, ok := s.keys[l1Key]; ok {
+		return
+	}
+	s.keys[l1Key] = struct{}{}
+	m := h.keySubs[l1Key]
+	if m == nil {
+		m = map[uint64]*refreshSub{}
+		h.keySubs[l1Key] = m
+	}
+	m[s.id] = s
+}
+
+func (h *refreshBroadcaster) disarmLocked(s *refreshSub, l1Key string) {
+	if _, ok := s.keys[l1Key]; !ok {
+		return
+	}
+	delete(s.keys, l1Key)
+	if m := h.keySubs[l1Key]; m != nil {
+		delete(m, s.id)
+		if len(m) == 0 {
+			delete(h.keySubs, l1Key)
+		}
+	}
 }
 
 // coalesced reports whether an emit for l1Key should be suppressed because
@@ -195,13 +235,17 @@ func PublishRefresh(l1Key string) {
 		return
 	}
 	h.mu.RLock()
-	for _, s := range h.subs {
-		if _, armed := s.keys[l1Key]; !armed {
-			continue
-		}
+	// C11: visit ONLY the subscribers armed for this key (the reverse
+	// index), not every live connection. fanoutVisitsForTest is the S2
+	// discriminating instrument — an absolute count of subscribers
+	// examined, which an O(|subs|) loop cannot keep small.
+	for _, s := range h.keySubs[l1Key] {
+		fanoutVisitsForTest.Add(1)
 		select {
 		case s.ch <- l1Key:
 			refreshDeliveredTotal.Add(1)
+			s.delivered.Add(1)
+			noteSinkDepth(len(s.ch))
 		default:
 			// Slow consumer: its buffer is full. Drop — the next committed
 			// refresh for this key re-signals and the frontend's refetch is
@@ -229,21 +273,17 @@ func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
 		close(ch)
 		return ch, func() {}
 	}
-	keys := make(map[string]struct{}, len(armedKeys))
-	for k := range armedKeys {
-		keys[k] = struct{}{}
-	}
 	s := &refreshSub{
 		hub:  h,
-		keys: keys,
+		keys: make(map[string]struct{}, len(armedKeys)),
 		ch:   make(chan string, refreshSubChanCap),
 	}
 	h.mu.Lock()
 	h.next++
 	s.id = h.next
 	h.subs[s.id] = s
-	for k := range keys {
-		h.keyRefs[k]++
+	for k := range armedKeys {
+		h.armLocked(s, k)
 	}
 	h.mu.Unlock()
 
@@ -253,11 +293,7 @@ func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
 			h.mu.Lock()
 			if _, ok := h.subs[s.id]; ok {
 				for k := range s.keys {
-					if h.keyRefs[k] <= 1 {
-						delete(h.keyRefs, k)
-					} else {
-						h.keyRefs[k]--
-					}
+					h.disarmLocked(s, k)
 				}
 				delete(h.subs, s.id)
 			}
@@ -271,52 +307,44 @@ func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
 	return s.ch, unsub
 }
 
-// ArmKey adds l1Key to a live connection's armed set without reconnecting
-// (the frontend mounts widgets over one multiplexed stream). Idempotent.
+// ArmKey adds l1Key to a live connection's armed set. Idempotent.
+//
+// NO PRODUCTION CALLER (design-1.12.6-item7-refreshes.md §1.3, TRACED):
+// SubscribeRefresh returns only (sink, unsub) and never hands out the
+// *refreshSub, so the handler cannot reach this — the armed set is FROZEN
+// per connection and the SPA re-arms by dropping and re-opening the stream.
+// Kept (not deleted) as the natural home for a future incremental-arm
+// protocol; exercised only by the broadcaster's own tests.
 func (s *refreshSub) ArmKey(l1Key string) {
 	if s == nil || s.hub == nil {
 		return
 	}
 	s.hub.mu.Lock()
-	if _, ok := s.keys[l1Key]; !ok {
-		s.keys[l1Key] = struct{}{}
-		s.hub.keyRefs[l1Key]++
-	}
+	s.hub.armLocked(s, l1Key)
 	s.hub.mu.Unlock()
 }
 
-// DisarmKey removes l1Key from a live connection's armed set (the frontend
-// unmounted the widget). Idempotent.
+// DisarmKey removes l1Key from a live connection's armed set. Idempotent.
+// Same status as ArmKey: no production caller (design §1.3), kept for a
+// future incremental-arm protocol, exercised only by the broadcaster's tests.
 func (s *refreshSub) DisarmKey(l1Key string) {
 	if s == nil || s.hub == nil {
 		return
 	}
 	s.hub.mu.Lock()
-	if _, ok := s.keys[l1Key]; ok {
-		delete(s.keys, l1Key)
-		if s.hub.keyRefs[l1Key] <= 1 {
-			delete(s.hub.keyRefs, l1Key)
-		} else {
-			s.hub.keyRefs[l1Key]--
-		}
-	}
+	s.hub.disarmLocked(s, l1Key)
 	s.hub.mu.Unlock()
 }
 
 // HasRefreshSubscriber reports whether >=1 connection is armed for l1Key.
 // O(1) map read under RLock. Nil-safe: cache-off / disabled / no hub -> false.
-//
-// A's broadcaster maintains keyRefs so this is available; Ship 1 itself has
-// no in-tree consumer on the hot path (the floor-bypass that reads it is
-// Ship 2 / option B, deliberately out of scope here). It is exercised only
-// by the broadcaster's own tests in Ship 1.
 func HasRefreshSubscriber(l1Key string) bool {
 	h := refreshHub()
 	if h == nil {
 		return false
 	}
 	h.mu.RLock()
-	n := h.keyRefs[l1Key]
+	n := len(h.keySubs[l1Key])
 	h.mu.RUnlock()
 	return n > 0
 }
@@ -331,6 +359,20 @@ func RefreshSubscriberCount() int {
 	}
 	h.mu.RLock()
 	n := len(h.subs)
+	h.mu.RUnlock()
+	return n
+}
+
+// RefreshArmedKeyCount returns the number of distinct l1Keys with >=1 armed
+// connection (len(keySubs)) — the memory-scale gauge for the reverse index
+// (C12 armed_keys).
+func RefreshArmedKeyCount() int {
+	h := refreshHub()
+	if h == nil {
+		return 0
+	}
+	h.mu.RLock()
+	n := len(h.keySubs)
 	h.mu.RUnlock()
 	return n
 }
@@ -350,7 +392,31 @@ var (
 	// refreshCoalescedTotal counts emits suppressed by the per-key coalesce
 	// window.
 	refreshCoalescedTotal atomic.Uint64
+
+	// refreshMaxSinkDepth is the high-water mark of a subscriber sink's
+	// occupancy after a send (0..refreshSubChanCap) — consumer lag.
+	refreshMaxSinkDepth atomic.Int64
+
+	// fanoutVisitsForTest counts subscribers EXAMINED by a fan-out loop —
+	// the S2 discriminating probe (an O(|subs|) loop cannot keep it small).
+	// Test-only reader; production never resets it.
+	fanoutVisitsForTest atomic.Uint64
 )
+
+func noteSinkDepth(depth int) {
+	d := int64(depth)
+	for {
+		cur := refreshMaxSinkDepth.Load()
+		if d <= cur || refreshMaxSinkDepth.CompareAndSwap(cur, d) {
+			return
+		}
+	}
+}
+
+// RefreshFanoutVisitsForTest returns the S2 probe. Test-only.
+func RefreshFanoutVisitsForTest() uint64 {
+	return fanoutVisitsForTest.Load()
+}
 
 // RefreshBroadcasterCounters returns (published, delivered, dropped,
 // coalesced) for post-deploy inspection + tests.
@@ -372,6 +438,8 @@ func resetRefreshBroadcasterForTest() {
 	refreshDeliveredTotal.Store(0)
 	refreshDroppedTotal.Store(0)
 	refreshCoalescedTotal.Store(0)
+	refreshMaxSinkDepth.Store(0)
+	fanoutVisitsForTest.Store(0)
 }
 
 // ResetRefreshBroadcasterForTest is the exported wrapper for cross-package
