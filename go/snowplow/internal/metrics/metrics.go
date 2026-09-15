@@ -185,15 +185,6 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
-	// --- cache: CRD discovery bridge counters (one gauge, keyed by stat) ---
-	crdDiscovery, err := m.Int64ObservableCounter(
-		"snowplow_crd_discovery",
-		metric.WithDescription("CRD-discovery bridge counters, labelled by stat."),
-	)
-	if err != nil {
-		return err
-	}
-
 	// --- cache: registered GVR count ---
 	registeredGVRs, err := m.Int64ObservableGauge(
 		"snowplow_plurals_registered_gvrs",
@@ -215,66 +206,6 @@ func registerInstruments(m metric.Meter, build string) error {
 		"snowplow_prewarm_complete_elapsed_ms",
 		metric.WithDescription("Process-start to Phase1Done wall-clock (ms); -1 until flip."),
 	)
-	if err != nil {
-		return err
-	}
-
-	// --- cache: live-refresh broadcaster ---
-	refreshPublished, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_published_total",
-		metric.WithDescription("Live-refresh signals published."))
-	if err != nil {
-		return err
-	}
-	refreshDelivered, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_delivered_total",
-		metric.WithDescription("Live-refresh signals delivered to subscribers."))
-	if err != nil {
-		return err
-	}
-	refreshDropped, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_dropped_total",
-		metric.WithDescription("Live-refresh signals dropped (slow consumer)."))
-	if err != nil {
-		return err
-	}
-	refreshCoalesced, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_coalesced_total",
-		metric.WithDescription("Live-refresh signals coalesced."))
-	if err != nil {
-		return err
-	}
-	refreshSubscribers, err := m.Int64ObservableGauge("snowplow_refresh_broadcaster_subscribers",
-		metric.WithDescription("Current live-refresh subscriber count."))
-	if err != nil {
-		return err
-	}
-	// 1.12.6 item 7 (C12): eviction-path pacing + stream lifetime. Mirrors
-	// /debug/vars snowplow_refresh_broadcaster field for field; no log lines
-	// (the chart runs LOG_LEVEL=warn).
-	refreshArmedKeys, err := m.Int64ObservableGauge("snowplow_refresh_broadcaster_armed_keys",
-		metric.WithDescription("Distinct L1 keys with at least one armed live-refresh subscriber (reverse-index size)."))
-	if err != nil {
-		return err
-	}
-	refreshMaxSinkDepth, err := m.Int64ObservableGauge("snowplow_refresh_broadcaster_max_sink_depth",
-		metric.WithDescription("High-water mark of a subscriber sink after a send (consumer lag, 0..64)."))
-	if err != nil {
-		return err
-	}
-	refreshEvictPublished, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_evict_published_total",
-		metric.WithDescription("Eviction-driven live-refresh publishes that reached at least one subscriber."))
-	if err != nil {
-		return err
-	}
-	refreshEvictDeferred, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_evict_deferred_total",
-		metric.WithDescription("Eviction-driven signals deferred by the per-subscriber token bucket (the bound engaged)."))
-	if err != nil {
-		return err
-	}
-	refreshStreamSeconds, err := m.Float64ObservableCounter("snowplow_refresh_broadcaster_stream_seconds_total",
-		metric.WithDescription("Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."))
-	if err != nil {
-		return err
-	}
-	refreshStreamsClosed, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_streams_closed_total",
-		metric.WithDescription("/refreshes streams that ended."))
 	if err != nil {
 		return err
 	}
@@ -389,22 +320,16 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
-	// --- refresher: background re-resolve worker pool (one counter keyed by stat) ---
-	refresher, err := m.Int64ObservableCounter("snowplow_refresher",
-		metric.WithDescription("Refresher worker-pool counters, labelled by stat."))
-	if err != nil {
-		return err
-	}
-	refresherQueueDepth, err := m.Int64ObservableGauge("snowplow_refresher_queue_depth",
-		metric.WithDescription("Live refresher workqueue depth; climbing with stagnant completed = workers stuck."))
-	if err != nil {
-		return err
-	}
-	// 1.12.6 C4 (arch N9): the live count of refresh-by-traffic-only keys is
-	// a gauge (it drops on Put and eviction), so it cannot ride the
-	// monotonic snowplow_refresher counter like its four siblings.
-	refresherSuppressedKeys, err := m.Int64ObservableGauge("snowplow_refresher_suppressed_keys",
-		metric.WithDescription("Live count of L1 keys marked refresh-by-traffic-only after repeated declines (1.12.6 #191); bounded by the store."))
+	// --- 1.12.6 C7: tag-derived families (crd_discovery, refresh_broadcaster,
+	// refresher). ONE loop: the instrument set, names, kinds and descriptions
+	// all come from the snapshot structs' `stat`/`kind`/`desc` tags
+	// (internal/cache/stats_by_tag.go), so a counter added there reaches OTLP
+	// with no edit here. Three drifts shipped in 1.12.6 before this loop
+	// existed, every one in a hand-written field list this replaces; the C12
+	// broadcaster instruments were even created and observed but never
+	// registered with the callback, so the SDK dropped every observation.
+	// TestC7_OTLP_EveryDerivedStatLeavesTheProcess pins all of it.
+	derived, derivedObservables, err := newDerivedFamilies(m)
 	if err != nil {
 		return err
 	}
@@ -603,21 +528,9 @@ func registerInstruments(m metric.Meter, build string) error {
 			metric.WithAttributes(attribute.String("check", "read_paths_scoped")))
 		o.ObserveInt64(rbacPublishSeq, int64(cache.RBACGen()))
 
-		s := cache.CRDDiscoveryStatsSnapshot()
-		for stat, v := range map[string]uint64{
-			"events_enqueued":      s.EventsEnqueued,
-			"events_dropped":       s.EventsDropped,
-			"events_processed":     s.EventsProcessed,
-			"discovery_invoked":    s.DiscoveryInvoked,
-			"discovery_skipped_ng": s.DiscoverySkippedNG,
-			"deletes_processed":    s.DeletesProcessed,
-			"delete_skipped_ng":    s.DeleteSkippedNG,
-			"panics_recovered":     s.PanicsRecovered,
-			"schema_relists_fired": s.SchemaRelistsFired,
-			"schema_unchanged":     s.SchemaUnchanged,
-		} {
-			o.ObserveInt64(crdDiscovery, int64(v),
-				metric.WithAttributes(attribute.String("stat", stat)))
+		// 1.12.6 C7: every tag-derived family, one loop.
+		for _, d := range derived {
+			d.observe(o)
 		}
 
 		o.ObserveInt64(registeredGVRs, registeredGVRCount())
@@ -625,19 +538,6 @@ func registerInstruments(m metric.Meter, build string) error {
 		done, elapsed := cache.PrewarmCompleteSnapshot()
 		o.ObserveInt64(prewarmDone, done)
 		o.ObserveInt64(prewarmElapsed, elapsed)
-
-		rb := cache.RefreshBroadcasterStatsSnapshot()
-		o.ObserveInt64(refreshPublished, int64(rb.Published))
-		o.ObserveInt64(refreshDelivered, int64(rb.Delivered))
-		o.ObserveInt64(refreshDropped, int64(rb.Dropped))
-		o.ObserveInt64(refreshCoalesced, int64(rb.Coalesced))
-		o.ObserveInt64(refreshSubscribers, int64(rb.Subscribers))
-		o.ObserveInt64(refreshArmedKeys, int64(rb.ArmedKeys))
-		o.ObserveInt64(refreshMaxSinkDepth, rb.MaxSinkDepth)
-		o.ObserveInt64(refreshEvictPublished, int64(rb.EvictPublished))
-		o.ObserveInt64(refreshEvictDeferred, int64(rb.EvictDeferred))
-		o.ObserveFloat64(refreshStreamSeconds, rb.StreamSecondsTotal)
-		o.ObserveInt64(refreshStreamsClosed, int64(rb.StreamsClosedTotal))
 
 		hits, misses, swaps, refused, denyUncached, entries := rbac.AuthzMemoSnapshot()
 		o.ObserveInt64(memoHits, int64(hits))
@@ -672,40 +572,6 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(phase1SeedFailures, int64(seedFailures))
 		o.ObserveInt64(phase1SeedRBACDeny, int64(seedRBACDeny))
 		o.ObserveInt64(phase1SeedOpFail, int64(seedOpFail))
-
-		// --- refresher pool ---
-		rEnq, rComp, rFail, rRetried, rDropped,
-			rSkipNoEntry, rSkipNoHandler, rSkipStageErr,
-			rYielded, rCapped, rFloored, rQueueDepth := cache.RefresherSnapshot()
-		// 1.12.6 C4 terminal semantics (arch N9): the two ALERT numbers —
-		// drop_evict_suspended (a mass failure in progress) and
-		// suppressed_skips (the #191 cure working) — must reach ClickStack,
-		// not only /debug/vars. Same instrument, same stat label, so every
-		// refresher counter keeps both halves.
-		rDropEvict, rDropEvictSuspended, rSuppressedSet, rSuppressedSkips, rSuppressedKeys := cache.RefresherTerminalSnapshot()
-		for stat, v := range map[string]uint64{
-			"enqueue":             rEnq,
-			"completed":           rComp,
-			"failed":              rFail,
-			"retried":             rRetried,
-			"dropped":             rDropped,
-			"skipped_no_entry":    rSkipNoEntry,
-			"skipped_no_handler":  rSkipNoHandler,
-			"skipped_stage_error": rSkipStageErr,
-			"yielded":             rYielded,
-			"capped":              rCapped,
-			"floored":             rFloored,
-			// 1.12.6 C4 — expvar twins snowplow_refresher_<stat>_total
-			"drop_evict":           rDropEvict,
-			"drop_evict_suspended": rDropEvictSuspended,
-			"suppressed_set":       rSuppressedSet,
-			"suppressed_skips":     rSuppressedSkips,
-		} {
-			o.ObserveInt64(refresher, int64(v),
-				metric.WithAttributes(attribute.String("stat", stat)))
-		}
-		o.ObserveInt64(refresherQueueDepth, rQueueDepth)
-		o.ObserveInt64(refresherSuppressedKeys, rSuppressedKeys)
 
 		// --- SA-discovery ---
 		sa := dynamic.SADiscoveryStatsSnapshot()
@@ -856,16 +722,14 @@ func registerInstruments(m metric.Meter, build string) error {
 		}
 		o.ObserveInt64(bindingsDeltaSkipped, int64(cache.BindingsIndexDeltaSkippedNonTyped()))
 		return nil
-	},
-		fallthroughTotal, assertionViolations, rbacPublishSeq, crdDiscovery,
+	}, append([]metric.Observable{
+		fallthroughTotal, assertionViolations, rbacPublishSeq,
 		registeredGVRs, prewarmDone, prewarmElapsed,
-		refreshPublished, refreshDelivered, refreshDropped, refreshCoalesced, refreshSubscribers,
 		memoHits, memoMisses, memoSwaps, memoRefused, memoDenyUncached, memoEntries,
 		prewarmEngEnqueued, prewarmEngProcessed, prewarmEngYield, prewarmEngPending,
 		phase1UnitsPlanned, phase1UnitsSeeded, phase1ApiRefPages, phase1EligibleNoContinue,
 		phase1WalkZeroChildren, phase1WalkObservations,
 		phase1SeedResolves, phase1SeedFailures, phase1SeedRBACDeny, phase1SeedOpFail,
-		refresher, refresherQueueDepth, refresherSuppressedKeys,
 		saDiscovery, crdSchemaMemo,
 		upstreamControllers, upstreamWebhooks,
 		raFullListServe, bindingsDeltaSkipped,
@@ -876,8 +740,107 @@ func registerInstruments(m metric.Meter, build string) error {
 		readyzBackstop, resolvedCache, informerServable, buildInfo,
 		// --- 1.12.5 ---
 		depsStats, informerFreshness,
-	)
+	}, derivedObservables...)...)
 	return err
+}
+
+// derivedFamily is one tag-derived stats family's instruments: a shared,
+// stat-labelled counter for the family's counters when it has one
+// (snowplow_crd_discovery, snowplow_refresher), and one instrument per stat
+// otherwise (snowplow_refresh_broadcaster_*, the refresher gauges).
+type derivedFamily struct {
+	fam     cache.StatFamily
+	shared  metric.Int64ObservableCounter
+	perStat map[string]metric.Observable
+}
+
+// newDerivedFamilies creates every instrument the tagged families declare
+// and returns them with the flat observable list RegisterCallback needs —
+// an instrument observed but not registered is silently dropped by the SDK,
+// which is how the C12 mirror shipped dead.
+func newDerivedFamilies(m metric.Meter) ([]derivedFamily, []metric.Observable, error) {
+	var out []derivedFamily
+	var observables []metric.Observable
+	for _, f := range cache.TaggedStatFamilies() {
+		d := derivedFamily{fam: f, perStat: map[string]metric.Observable{}}
+		for _, s := range f.Specs {
+			if f.OTelShared(s) {
+				if d.shared == nil {
+					inst, err := m.Int64ObservableCounter(f.OTelName, metric.WithDescription(f.Desc))
+					if err != nil {
+						return nil, nil, err
+					}
+					d.shared = inst
+					observables = append(observables, inst)
+				}
+				continue
+			}
+			name := f.OTelInstrumentName(s)
+			desc := metric.WithDescription(s.Desc)
+			var inst metric.Observable
+			var err error
+			switch {
+			case s.Float && s.Kind == "gauge":
+				inst, err = m.Float64ObservableGauge(name, desc)
+			case s.Float:
+				inst, err = m.Float64ObservableCounter(name, desc)
+			case s.Kind == "gauge":
+				inst, err = m.Int64ObservableGauge(name, desc)
+			default:
+				inst, err = m.Int64ObservableCounter(name, desc)
+			}
+			if err != nil {
+				return nil, nil, err
+			}
+			d.perStat[s.Stat] = inst
+			observables = append(observables, inst)
+		}
+		out = append(out, d)
+	}
+	return out, observables, nil
+}
+
+// observe reads the family's live values once and records every stat on
+// its instrument.
+func (d derivedFamily) observe(o metric.Observer) {
+	vals := d.fam.Values()
+	for _, s := range d.fam.Specs {
+		v := vals[s.Stat]
+		if d.fam.OTelShared(s) {
+			o.ObserveInt64(d.shared, statInt64(v), metric.WithAttributes(attribute.String("stat", s.Stat)))
+			continue
+		}
+		switch inst := d.perStat[s.Stat].(type) {
+		case metric.Int64ObservableCounter:
+			o.ObserveInt64(inst, statInt64(v))
+		case metric.Int64ObservableGauge:
+			o.ObserveInt64(inst, statInt64(v))
+		case metric.Float64ObservableCounter:
+			o.ObserveFloat64(inst, statFloat64(v))
+		case metric.Float64ObservableGauge:
+			o.ObserveFloat64(inst, statFloat64(v))
+		}
+	}
+}
+
+func statInt64(v any) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case float64:
+		return int64(x)
+	}
+	return 0
+}
+
+func statFloat64(v any) float64 {
+	switch x := v.(type) {
+	case int64:
+		return float64(x)
+	case float64:
+		return x
+	}
+	return 0
 }
 
 // buildLabel normalises the build string for the snowplow_build_info

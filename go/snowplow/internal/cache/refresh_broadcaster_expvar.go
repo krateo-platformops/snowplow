@@ -51,21 +51,10 @@ func init() {
 // a coherent point-in-time snapshot.
 func registerRefreshBroadcasterExpvar() {
 	refreshBroadcasterExpvarOnce.Do(func() {
+		// 1.12.6 C7: derived from the RefreshBroadcasterStats struct tags, one
+		// coherent snapshot per scrape (stats_families.go).
 		expvar.Publish("snowplow_refresh_broadcaster", expvar.Func(func() any {
-			st := RefreshBroadcasterStatsSnapshot()
-			return map[string]any{
-				"published":            st.Published,
-				"delivered":            st.Delivered,
-				"dropped":              st.Dropped,
-				"coalesced":            st.Coalesced,
-				"subscribers":          st.Subscribers,
-				"armed_keys":           st.ArmedKeys,
-				"max_sink_depth":       st.MaxSinkDepth,
-				"evict_published":      st.EvictPublished,
-				"evict_deferred":       st.EvictDeferred,
-				"stream_seconds_total": st.StreamSecondsTotal,
-				"streams_closed_total": st.StreamsClosedTotal,
-			}
+			return RefreshBroadcasterStatsByStat()
 		}))
 	})
 }

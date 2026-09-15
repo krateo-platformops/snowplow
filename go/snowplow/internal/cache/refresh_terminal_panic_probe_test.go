@@ -13,7 +13,7 @@ func TestRefreshTerminal_PanicProbe_NoRefresherAndDegenerateInputs(t *testing.T)
 	t.Setenv(envRefreshDropEvictMaxPerMinute, "0")
 	t.Setenv(envRefreshSuppressAfterDeclines, "0") // below the floor → default 3, never 0
 	resetRefresherForTest()
-	refresherInstance = nil
+	refresherInstance.Store(nil)
 	t.Cleanup(resetRefresherForTest)
 
 	// Snapshot with NO refresher: zeros, no construction (a scrape at boot).
@@ -21,7 +21,7 @@ func TestRefreshTerminal_PanicProbe_NoRefresherAndDegenerateInputs(t *testing.T)
 	if st.DropEvictTotal != 0 || st.DropEvictMaxPerMinute != 0 || st.SuppressAfterDeclines != 3 {
 		t.Fatalf("snapshot with no refresher = %+v", st)
 	}
-	if refresherInstance != nil {
+	if refresherPeek() != nil {
 		t.Fatal("RefreshTerminalStatsSnapshot constructed the refresher singleton")
 	}
 
@@ -90,7 +90,7 @@ func TestRefreshTerminal_PanicProbe_NoRefresherAndDegenerateInputs(t *testing.T)
 	if _, ok := RefreshSuppressedReason(k); ok {
 		t.Fatal("deleteForDep did not clear the marker")
 	}
-	if refresherInstance != nil {
+	if refresherPeek() != nil {
 		t.Fatal("a store path constructed the refresher singleton")
 	}
 }

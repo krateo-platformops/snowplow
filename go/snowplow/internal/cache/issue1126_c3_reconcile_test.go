@@ -270,6 +270,13 @@ func TestIssue1126_C3_Off_CacheDisabledBuildsNothing(t *testing.T) {
 	resetDepsReconcileForTest()
 	t.Cleanup(resetDepsReconcileForTest)
 
+	// C7 (#203 fixed): the arm is a RAW goroutine delta again, with a bounded
+	// settle for sibling goroutines still winding down — nothing this test
+	// calls may leave a goroutine behind, the refresher accessors included.
+	resetRefresherForTest()
+	t.Cleanup(resetRefresherForTest)
+	before := goroutinesQuiesce(2 * time.Second)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	StartDepsReconcile(ctx)
@@ -277,10 +284,6 @@ func TestIssue1126_C3_Off_CacheDisabledBuildsNothing(t *testing.T) {
 		t.Fatalf("cache-off: StartDepsReconcile started a ticker")
 	}
 	time.Sleep(50 * time.Millisecond)
-	// The check is SPECIFIC to the audit's goroutine, not a raw NumGoroutine
-	// diff: in the full package run other tests' goroutines are still
-	// winding down, and the stats read below touches refresher accessors
-	// that construct on cache-off (#203, outside C3's scope).
 	if n := c3ReconcileGoroutines(); n != 0 {
 		t.Fatalf("cache-off: %d reconcile ticker goroutine(s) running — StartDepsReconcile built one", n)
 	}
@@ -296,6 +299,10 @@ func TestIssue1126_C3_Off_CacheDisabledBuildsNothing(t *testing.T) {
 	}
 	if n := c3ReconcileGoroutines(); n != 0 {
 		t.Fatalf("cache-off: %d reconcile ticker goroutine(s) after the stats read", n)
+	}
+	if after := goroutinesSettleTo(before, 2*time.Second); after > before {
+		t.Fatalf("cache-off: %d goroutine(s) left running by StartDepsReconcile + the stats reads (%d → %d) — "+
+			"something this path touches constructs on cache-off (#203 shape)", after-before, before, after)
 	}
 }
 

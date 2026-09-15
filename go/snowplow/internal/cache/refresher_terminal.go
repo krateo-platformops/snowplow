@@ -269,15 +269,19 @@ func ResetRefreshTerminalForTest() { resetRefreshTerminalForTest() }
 // RefreshTerminalStats is the read-only snapshot of the C4 counters (expvar
 // + OTLP + tests).
 type RefreshTerminalStats struct {
-	DropEvictTotal          uint64 // non-404 drop-point evictions performed
-	DropEvictSuspendedTotal uint64 // drop-point evictions refused by the breaker
-	DropEvictSuspendWarns   uint64 // suspension windows entered (one WARN each)
-	DropEvictMaxPerMinute   int
-	SuppressedSetTotal      uint64
-	SuppressedSkipsTotal    uint64
-	DeclineNotedTotal       uint64
-	SuppressedKeys          int
-	SuppressAfterDeclines   int
+	// 1.12.6 C7: tagged like refresherStats — the four counters ride the
+	// shared snowplow_refresher instrument, suppressed_keys is a gauge of
+	// its own. `stat:"-"` fields are configuration echoes or diagnostics
+	// read by the arms only.
+	DropEvictTotal          uint64 `stat:"drop_evict"`           // non-404 drop-point evictions performed
+	DropEvictSuspendedTotal uint64 `stat:"drop_evict_suspended"` // drop-point evictions refused by the breaker
+	DropEvictSuspendWarns   uint64 `stat:"-"`                    // suspension windows entered (one WARN each); arms only
+	DropEvictMaxPerMinute   int    `stat:"-"`                    // configuration echo (REFRESH_DROP_EVICT_MAX_PER_MINUTE)
+	SuppressedSetTotal      uint64 `stat:"suppressed_set"`
+	SuppressedSkipsTotal    uint64 `stat:"suppressed_skips"`
+	DeclineNotedTotal       uint64 `stat:"-"` // arms only
+	SuppressedKeys          int    `stat:"suppressed_keys" kind:"gauge" desc:"Live count of L1 keys marked refresh-by-traffic-only after repeated declines (1.12.6 #191); bounded by the store."`
+	SuppressAfterDeclines   int    `stat:"-"` // configuration echo (REFRESH_SUPPRESS_AFTER_DECLINES)
 }
 
 // RefreshTerminalStatsSnapshot reads the counters. It does NOT construct the

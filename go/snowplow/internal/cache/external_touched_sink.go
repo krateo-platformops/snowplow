@@ -108,7 +108,11 @@ func ExternalTouchedSinkFromContext(ctx context.Context) *ExternalTouchedSink {
 // external-touched gate declined because the resolve touched a genuine
 // external endpoint. Production falsifier for "did the gate fire?".
 func ExternalSkippedPut() uint64 {
-	return refresherSingleton().externalSkippedPut.Load()
+	r := refresherPeek() // #203: a read never constructs the refresher
+	if r == nil {
+		return 0
+	}
+	return r.externalSkippedPut.Load()
 }
 
 // BumpExternalSkippedPut increments the external-touched-gate declined-Put

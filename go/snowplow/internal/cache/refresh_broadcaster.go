@@ -736,17 +736,41 @@ func RefreshBroadcasterCounters() (published, delivered, dropped, coalesced uint
 // /debug/vars snowplow_refresh_broadcaster and the OTel mirror
 // (internal/metrics). Identity-free aggregates only.
 type RefreshBroadcasterStats struct {
-	Published, Delivered, Dropped, Coalesced uint64
-	Subscribers, ArmedKeys                   int
-	MaxSinkDepth                             int64
-	EvictPublished, EvictDeferred            uint64
-	StreamSecondsTotal                       float64
-	StreamsClosedTotal                       uint64
+	// 1.12.6 C7: the `stat` tag is the /debug/vars key; `kind:"gauge"` marks a
+	// current value (everything else is a monotonic counter). The OTLP
+	// instrument name is derived: snowplow_refresh_broadcaster_<stat>, with
+	// "_total" appended to a counter that does not already carry it
+	// (StatFamily.OTelInstrumentName). Expvar, OTLP, docs guard and parity
+	// arm all read these tags — nothing here is copied by hand.
+	Published          uint64  `stat:"published" desc:"Live-refresh signals published."`
+	Delivered          uint64  `stat:"delivered" desc:"Live-refresh signals delivered to subscribers."`
+	Dropped            uint64  `stat:"dropped" desc:"Live-refresh signals dropped (slow consumer)."`
+	Coalesced          uint64  `stat:"coalesced" desc:"Live-refresh signals coalesced."`
+	Subscribers        int     `stat:"subscribers" kind:"gauge" desc:"Current live-refresh subscriber count."`
+	ArmedKeys          int     `stat:"armed_keys" kind:"gauge" desc:"Distinct L1 keys with at least one armed live-refresh subscriber (reverse-index size)."`
+	MaxSinkDepth       int64   `stat:"max_sink_depth" kind:"gauge" desc:"High-water mark of a subscriber sink after a send (consumer lag, 0..64)."`
+	EvictPublished     uint64  `stat:"evict_published" desc:"Eviction-driven live-refresh publishes that reached at least one subscriber."`
+	EvictDeferred      uint64  `stat:"evict_deferred" desc:"Eviction-driven signals deferred by the per-subscriber token bucket (the bound engaged)."`
+	StreamSecondsTotal float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
+	StreamsClosedTotal uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
+}
+
+// refreshBroadcasterStatsOverride, when set, replaces the live snapshot.
+// TEST-ONLY seam for the 1.12.6 C7 parity arms; nil in production.
+var refreshBroadcasterStatsOverride atomic.Pointer[RefreshBroadcasterStats]
+
+// SetRefreshBroadcasterStatsForTest installs (or, with nil, clears) a
+// snapshot override. Production callers MUST NOT use it.
+func SetRefreshBroadcasterStatsForTest(s *RefreshBroadcasterStats) {
+	refreshBroadcasterStatsOverride.Store(s)
 }
 
 // RefreshBroadcasterStatsSnapshot reads every broadcaster gauge/counter at
 // once (one RLock for the two hub-size gauges, atomics for the rest).
 func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
+	if o := refreshBroadcasterStatsOverride.Load(); o != nil {
+		return *o
+	}
 	st := RefreshBroadcasterStats{
 		Published:          refreshPublishedTotal.Load(),
 		Delivered:          refreshDeliveredTotal.Load(),

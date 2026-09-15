@@ -326,9 +326,10 @@ is safe, and a lost event is recoverable by the next enqueue for the same coordi
 (informer torn down, not synced, watch broken, type unconfirmed, passthrough) means the indexer
 is not authoritative: the coordinate is requeued with backoff on the refresher's
 `maxRefreshRequeues` budget and, on exhaustion, degraded to a dirty-mark so the refresher's
-re-fetch decides against the apiserver (a definite 404 evicts at the drop point — seconds; a
-403, a 500 or a timeout on that leg stays bounded by `RESOLVED_CACHE_TTL_SECONDS`, 3600 s,
-until 1.12.6 C4 extends drop-point eviction to non-404 deterministic failures). It never means
+re-fetch decides against the apiserver (a definite 404 takes the self-gone route and evicts at
+the drop point — seconds; since 1.12.6 C4 a 403, a 500, a timeout or a parse failure also
+evicts there after the budget, behind the `REFRESH_DROP_EVICT_MAX_PER_MINUTE` breaker, and only
+a suspended breaker leaves the body bounded by `RESOLVED_CACHE_TTL_SECONDS`, 3600 s). It never means
 "keep forever", and it never evicts by itself — that is what keeps a schema-relist teardown window
 from evicting a whole GVR. The probe reads the watcher directly and never calls
 `EnsureResourceType`, so it is not the inert `IsRegistered` conjunct 1.12.5 removed (different
@@ -513,6 +514,14 @@ second, a never-evict the reverse) and
 
 ---
 
+### 5.4 Where the pipeline is still blind — the delivery-failure matrix (1.12.6 C8)
+
+Every loss mode along informer → worker → refresher → store → broadcaster → gateway → SPA, each
+with the counter that detects it and the arm that pins it, and the rows that have neither
+listed as OPEN, is in `observability.md` § "Delivery-failure matrix". Read it before claiming a
+change "reaches the browser": the server half is pinned through the broadcaster; the gateway hop
+and the SPA's recovery are OPEN rows owned by the chart review checklist and frontend#256.
+
 ## 6. Invariants
 
 1. **Provisionality / toggle (transparent fallback).** `CACHE_ENABLED=false` (`cache.go`
@@ -594,6 +603,7 @@ second, a never-evict the reverse) and
 | L1 store, keys, dedup, TTL overrides | `internal/cache/resolved.go` | `ComputeKey`, `canonicaliseExtras`, `ResolvedKeyInputs` (`BindingUID`, `RBACSubGen`, `HasUAF`), `resolvedKeyVersion="v6"`, entry classes, `Get`, `Put` |
 | RBAC sub-generation | `internal/cache/rbac_subgen.go`, `rbac_subgen_pending.go` | `RBACSubGenForSubject`, publish-deferred bumps |
 | Terminal refresh semantics (breaker, suppression) | `internal/cache/refresher_terminal.go` | `dropEvictBreaker`, `NoteRefreshDecline`, `RefreshTerminalStatsSnapshot`; consulted in `refresher.go` `processNext` |
+| Tag-derived stats families (1.12.6 C7) | `internal/cache/stats_by_tag.go`, `internal/cache/stats_families.go` | `StatSpec`, `StatFamily`, `TaggedStatFamilies`; `stat`/`kind`/`desc` tags on `CRDDiscoveryStats`, `RefreshBroadcasterStats`, `refresherStats`, `RefreshTerminalStats` drive expvar, the OTLP mirror (`internal/metrics/metrics.go` `newDerivedFamilies`) and the parity arms |
 | Invalidation | `internal/cache/deps.go`, `deps_watch.go` | `Record`, `RecordList`, `OnObjectEvent` (state-derived; `OnAdd`/`OnUpdate`/`OnDelete` are shims), `isSelfRepresentation`; bridge: `depEventHandlers` → `submitDepEvent` → `probeObjectState` |
 | External Put-gate | `internal/cache/external_touched_sink.go` | `WithExternalTouchedSink` |
 | L3 informer | `internal/cache/watcher.go` | `NewResourceWatcher`, `GetObject`, `ListObjects`, `depEventHandlers` |
