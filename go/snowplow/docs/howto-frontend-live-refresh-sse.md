@@ -312,7 +312,10 @@ Three properties that recovery must have, and why each is load-bearing:
 **A 401 is not a transport error.** Retrying it re-presents the same dead token until the backoff
 ceiling, forever, with no path back to a live stream — measured as 553 `reason=JwtAuth` rejections
 at the gateway in one 4½-day window. The stream must raise the app's session-resume flow instead
-and stop; re-authentication re-arms the widgets, which re-opens the stream with a fresh token.
+and stop. On a successful session resume the client MUST re-open the stream itself (a fresh token
+is read at connect); re-authentication does not re-arm widgets — the arm hook does not re-run when
+the widget key is unchanged, so nothing else re-opens the stream (frontend#259 does this via
+`scheduleReconnect`; a logout leaves the stream closed).
 
 ---
 
