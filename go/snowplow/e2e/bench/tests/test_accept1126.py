@@ -5,9 +5,13 @@ test FAILS on the pre-fix code and passes after, so they are regression guards,
 not restatements:
 
   B1 — the served bundle hash was computed, recorded, and never compared, so a
-       re-tagged image (measured on 057 on 2026-09-15: frontend:1.6.11
-       re-pushed under the same tag with a different bundle) passed the build
-       gate and would have reached the measurement window.
+       tag-only gate could pass while the browser was served different content.
+       (An earlier version of this note attributed that to a same-tag re-push
+       of frontend:1.6.11. That was RETRACTED — it was the 1.6.10 -> 1.6.11
+       roll, and the mistake was comparing a hash captured on 09-14 against a
+       tag read on 09-15. The assertion stands on the narrower principle: the
+       published tag is not the deployed build, and only a hash captured in the
+       same preflight describes the same moment.)
   B2 — hook files carried no run identity, so a `--from-stage` resume in the
        same run dir was satisfied instantly by the PREVIOUS run's hooks, and
        the channel cross-check then compared two stale payloads that agreed
@@ -325,8 +329,10 @@ def _real_bundle_problems(served, expected):
 
 
 def test_MUTATION_dropping_the_bundle_compare_passes_a_retagged_image():
-    """Probe for B1, with the real values measured on 057 on 2026-09-15:
-    frontend:1.6.11 re-pushed under the same tag, D4naopHo -> Kr5dAb3q."""
+    """Probe for B1, with two real bundle hashes observed on 057 (the 1.6.10
+    and 1.6.11 bundles). The point is only that the compare distinguishes two
+    genuinely different served bundles — NOT that either came from a re-push.
+    """
     served, expected = "index-Kr5dAb3q.js", "index-D4naopHo.js"
     assert _real_bundle_problems(served, expected), (
         "the real check must flag a content change under an unchanged tag")
