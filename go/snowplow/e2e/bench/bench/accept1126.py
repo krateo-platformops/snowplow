@@ -132,6 +132,14 @@ ALL_HOOKS = HOOK_ORDER + CRD_HOOK_ORDER
 
 HOOK_WAIT_TIMEOUT_S = int(os.environ.get("S6_HOOK_TIMEOUT", "900"))
 
+#: How long to let SERVER-SIDE arming become visible after hit_proved. The browser's own
+#: arming guard is CLIENT-side — window.__s6.subs is filled when the /refreshes fetch is
+#: ISSUED, not when snowplow has registered the subscription — so hit_proved can legitimately
+#: land a beat before armed_keys/subscribers move. Run 11 hit exactly that (hit_proved ~5s
+#: after login, arming not yet visible, Δ=0) while run 10 passed only because its login was
+#: slower. A single sample turns that lag into a coin flip.
+ARMING_VISIBLE_TIMEOUT_S = float(os.environ.get("S6_ARMING_TIMEOUT", "30"))
+
 #: RB2 — how long to let the fresh entry AGE before the first inspector lookup. AgeSeconds is
 #: an integer; at age 0 the "did the age reset" comparison cannot fail. 1.5s puts the entry at
 #: >= 1s on any box while costing the run nothing.
@@ -1218,7 +1226,22 @@ def stage_counters_before(ctx: dict) -> dict:
     # Step 2: still resident, same body, age not reset → served from the store, not re-resolved.
     insp_hit = read_apistage_key(portal, ctx["token"], key, reqlog)
 
-    post = snapshot_counters(read_debug_vars(portal, ctx["token"], reqlog))
+    # POLL for server-side arming rather than sampling once. This does NOT weaken the
+    # assertion below: arming must still become visible before the delete, and a run where it
+    # never does still fails with the same refusal. It only stops a sub-second lag between the
+    # browser issuing its /refreshes fetch and snowplow registering it from deciding the run.
+    # A later `post` is harmless for cache_d too — store_total/hit_total are monotonic and
+    # asserted `>= 1`, so more time can only help them.
+    deadline = time.time() + ARMING_VISIBLE_TIMEOUT_S
+    arming_waited_s = 0.0
+    while True:
+        post = snapshot_counters(read_debug_vars(portal, ctx["token"], reqlog))
+        armed = post[f"{K_BROADCAST}.armed_keys"] - pre[f"{K_BROADCAST}.armed_keys"]
+        subs = post[f"{K_BROADCAST}.subscribers"] - pre[f"{K_BROADCAST}.subscribers"]
+        if (armed >= 1 and subs >= 1) or time.time() >= deadline:
+            break
+        time.sleep(1.0)
+        arming_waited_s += 1.0
     cache_d = delta(pre, post)
     stored = cache_d[f"{K_RESOLVED}.store_total"]
     hits = cache_d[f"{K_RESOLVED}.hit_total"]
@@ -1254,15 +1277,13 @@ def stage_counters_before(ctx: dict) -> dict:
     # >= 1, NEVER == 1. The probe page renders the whole SHELL, so ten keys arm, not one: run 8
     # measured armed_keys Δ 10 with a single disposable child. Tightening this to equality would
     # fail for a reason that has nothing to do with the widget under test.
-    armed = post[f"{K_BROADCAST}.armed_keys"] - pre[f"{K_BROADCAST}.armed_keys"]
-    subs = post[f"{K_BROADCAST}.subscribers"] - pre[f"{K_BROADCAST}.subscribers"]
     if armed < 1 or subs < 1:
         raise PreflightFailed(
-            f"arming is not visible server-side: armed_keys Δ={armed}, subscribers Δ={subs} "
-            f"(both must be >= 1). The browser rendered but snowplow saw no subscription, so "
-            f"nothing can be delivered for this key and a delete would prove nothing. At rest "
-            f"both read 0 on an idle 057, so this is a real signal rather than a threshold. "
-            f"Refusing to proceed to the delete.")
+            f"arming is not visible server-side after polling {ARMING_VISIBLE_TIMEOUT_S:.0f}s: "
+            f"armed_keys Δ={armed}, subscribers Δ={subs} (both must be >= 1). The browser "
+            f"rendered but snowplow saw no subscription, so nothing can be delivered for this "
+            f"key and a delete would prove nothing. At rest both read 0 on an idle 057, so this "
+            f"is a real signal rather than a threshold. Refusing to proceed to the delete.")
 
     # THE ACK THAT ORDERS THE TWO HALVES. Run 6 failed here for a sequencing reason, not a
     # cache one: the browser deleted the child 0.6s after hit_proved, and this stage's second
@@ -1287,6 +1308,9 @@ def stage_counters_before(ctx: dict) -> dict:
         "cache_proof": cache_cc,
         "armed_keys": post[f"{K_BROADCAST}.armed_keys"],
         "armed_keys_delta": armed,
+        # How long server-side arming lagged hit_proved. 0.0 means it was already visible on
+        # the first sample; anything above that is the lag a single sample used to gamble on.
+        "arming_waited_s": arming_waited_s,
         "subscribers": post[f"{K_BROADCAST}.subscribers"],
         "subscribers_delta": subs,
         "counters_before": ctx["before"],
