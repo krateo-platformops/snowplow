@@ -719,6 +719,58 @@ def crosscheck_a1_a2(results: list[dict]) -> dict:
     }
 
 
+def crosscheck_cache_proof(stored: int, hits: int, hook_data: dict) -> dict:
+    """R2 applied to the cache proof: two channels, neither sufficient alone.
+
+    The counter channel (`store_total` / `hit_total`) proves **an** entry was
+    stored and served from L1. It cannot prove it was *ours*: both are GLOBAL
+    counters, there is no per-key store counter, and any other portal session's
+    widget fetch inside the window satisfies `>= 1` on its own. So a DECLINED
+    harness widget can ride foreign traffic to a passing counter check.
+
+    The browser channel (`l1_hit` + `refresh_key`) is per-widget — it is the
+    response the harness's own `/call` got — but it is reported by the half
+    whose work the counters exist to corroborate, so it is not sufficient
+    either.
+
+    Together they are: counters say "an entry was cached and served", the
+    browser says "this one". **A mismatch fails the stage** — same discipline
+    as the delete's two channels, never reconciled.
+    """
+    counters_ok = stored >= 1 and hits >= 1
+    browser_hit = bool(hook_data.get("l1_hit"))
+    key = hook_data.get("refresh_key")
+    browser_ok = browser_hit and bool(key)
+    agree = counters_ok and browser_ok
+    if counters_ok and not browser_ok:
+        verdict = (
+            "MISMATCH — the counters moved but the browser did not report an "
+            "L1 hit for the harness widget. store_total/hit_total are global, "
+            "so this is consistent with the widget having been DECLINED "
+            "(facts §10.2) while FOREIGN traffic moved the counters. Nothing "
+            "can ever be evicted for a key whose entry never existed.")
+    elif browser_ok and not counters_ok:
+        verdict = (
+            "MISMATCH — the browser reported an L1 hit but neither "
+            "store_total nor hit_total moved. The reported hit is not "
+            "corroborated by the store; treat the browser evidence as "
+            "unreliable rather than accepting it.")
+    elif not agree:
+        verdict = ("neither channel confirms the widget was cached")
+    else:
+        verdict = "ok"
+    return {
+        "passed": agree,
+        "counters": {"store_total_delta": stored, "hit_total_delta": hits,
+                     "ok": counters_ok,
+                     "semantics": "global; proves AN entry, not THIS one"},
+        "browser": {"l1_hit": browser_hit, "refresh_key_present": bool(key),
+                    "ok": browser_ok,
+                    "semantics": "per-widget; proves THIS one, self-reported"},
+        "verdict": verdict,
+    }
+
+
 def crosscheck_channels(hook_deleted: dict, hook_asserted: dict) -> dict:
     """R2: the two evidence channels must AGREE; a mismatch FAILS the stage.
 
@@ -854,10 +906,12 @@ def stage_counters_before(ctx: dict) -> dict:
     for kind, name in (created.get("data", {}).get("objects") or []):
         assert_owned(kind, name)                 # R1, on what was actually made
 
-    # P1/P2 — snapshot BEFORE the browser does any /call for the widget, so the
-    # cache proof is OURS. Review finding: trusting the browser half's `l1_hit`
-    # boolean means the guard that stops a DECLINED widget reaching the delete
-    # rests on the very half whose evidence it is supposed to corroborate.
+    # P1/P2 — snapshot BEFORE the browser does any /call for the widget, so one
+    # of the two cache-proof channels is OURS. Trusting the browser's `l1_hit`
+    # alone would rest the guard on the very half the counters exist to
+    # corroborate; trusting the counters alone cannot say the entry was OURS
+    # (they are global, and there is no per-key store counter). Both are
+    # required, and they must agree — see crosscheck_cache_proof.
     pre = snapshot_counters(read_debug_vars(portal, ctx["token"], reqlog))
 
     wait_hook(run_dir, "rendered", rid, began)       # first /call → cold fill
@@ -873,19 +927,19 @@ def stage_counters_before(ctx: dict) -> dict:
     stored = cache_d[f"{K_RESOLVED}.store_total"]
     hits = cache_d[f"{K_RESOLVED}.hit_total"]
 
-    # `>= 1`, not `== 1`, and deliberately so: store_total and hit_total are
-    # GLOBAL counters on a live cluster, and any other portal session's widget
-    # fetch moves them during this window. Asserting equality here would be
-    # flaky for a reason that has nothing to do with the thing under test. The
-    # load-bearing claim is "a real entry was stored AND served from L1", which
-    # `>= 1` states exactly. (The Stage A eviction rows keep `== 1`: their
-    # window is seconds long and the event is specific — see the quiescence
-    # note in the A2 proof.)
-    if stored < 1 or hits < 1:
+    # TWO CHANNELS, neither sufficient alone (R2 discipline, same as the
+    # delete). `>= 1` on the counters, not `== 1`: both are GLOBAL and any
+    # other portal session moves them, so equality would be flaky for a reason
+    # unrelated to the test. But `>= 1` is for the same reason not PROOF that
+    # OUR widget was the one cached — there is no per-key store counter — so
+    # the browser's per-widget l1_hit must agree with it.
+    cache_cc = crosscheck_cache_proof(stored, hits, hd)
+    if not cache_cc["passed"]:
         raise PreflightFailed(
-            f"the disposable widget was NOT cached: "
-            f"{K_RESOLVED}.store_total Δ={stored}, {K_RESOLVED}.hit_total "
-            f"Δ={hits} (both must be >= 1). Facts §10.2: snowplow stamps "
+            f"the disposable widget was NOT provably cached. "
+            f"{cache_cc['verdict']} "
+            f"(counters: store_total Δ={stored}, hit_total Δ={hits}; browser: "
+            f"l1_hit={hd.get('l1_hit')!r}). Facts §10.2: snowplow stamps "
             f"X-Snowplow-Refresh-Key even on a DECLINE (stage-error, external "
             f"touch, undeclared extras, UAF refilter), so the browser can arm a "
             f"key whose entry never existed — nothing can ever be evicted for "
@@ -899,15 +953,7 @@ def stage_counters_before(ctx: dict) -> dict:
         "window_start": ctx["window_start"],
         "refresh_class": hd.get("refresh_class"),
         "refresh_key_sha256_prefix": (hd.get("refresh_key") or "")[:12],
-        "cache_proof": {
-            "store_total_delta": stored,
-            "hit_total_delta": hits,
-            "self_verified": True,
-            "browser_reported_l1_hit": hd.get("l1_hit"),
-            "note": "asserted from our own before/after snapshots around the "
-                    "browser's render + prove-hit steps; the browser's l1_hit "
-                    "flag is recorded for comparison but is NOT the gate.",
-        },
+        "cache_proof": cache_cc,
         "armed_keys": post[f"{K_BROADCAST}.armed_keys"],
         "subscribers": post[f"{K_BROADCAST}.subscribers"],
         "counters_before": ctx["before"],

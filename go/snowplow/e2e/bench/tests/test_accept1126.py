@@ -239,3 +239,130 @@ def test_reconcile_detection_is_on_our_own_request_log():
     rl.record("GET", "https://p/content/debug/reconcile", 200)
     assert rl.touched_reconcile(PAST, FUTURE) == [
         "https://p/content/debug/reconcile"]
+
+
+# ─── The cache proof needs BOTH channels (review follow-up 1) ──────────────
+
+
+def test_cache_proof_requires_counters_and_the_browser_to_agree():
+    ok = a.crosscheck_cache_proof(1, 1, {"l1_hit": True, "refresh_key": "k"})
+    assert ok["passed"] and ok["verdict"] == "ok"
+
+
+def test_cache_proof_rejects_counters_moved_by_foreign_traffic():
+    """The case the architect raised: store_total/hit_total are GLOBAL and have
+    no per-key variant, so another portal session's fetch satisfies >=1 while
+    the harness widget was DECLINED. The browser's per-widget l1_hit is what
+    distinguishes them, so counters-only must NOT pass."""
+    cc = a.crosscheck_cache_proof(5, 9, {"l1_hit": False, "refresh_key": "k"})
+    assert not cc["passed"]
+    assert "FOREIGN traffic" in cc["verdict"]
+
+
+def test_cache_proof_rejects_an_uncorroborated_browser_claim():
+    cc = a.crosscheck_cache_proof(0, 0, {"l1_hit": True, "refresh_key": "k"})
+    assert not cc["passed"]
+    assert "not corroborated" in cc["verdict"]
+
+
+def test_cache_proof_rejects_a_missing_refresh_key():
+    cc = a.crosscheck_cache_proof(1, 1, {"l1_hit": True})
+    assert not cc["passed"]
+
+
+# ─── MUTATION PROBES ───────────────────────────────────────────────────────
+#
+# Honest provenance, correcting a claim I got wrong. The arms above are NOT
+# behaviourally RED on the pre-fix module `dffd3e7`: run there they yield
+# 5 TypeError (the write_hook signature changed) and 2 AttributeError (new
+# symbols), and nothing else. I reported "four are behavioural" from the test
+# NAMES without reading the error types; the architect checked and was right.
+# Behavioural RED across a signature change is not achievable.
+#
+# The honest substitute is a mutation probe: weaken exactly one guard and
+# assert the property it guards now fails. That establishes the arm is
+# load-bearing rather than incidentally green, which is what "RED before the
+# fix" was meant to show. Each probe names the guard it removes.
+
+
+def _mutant_wait_hook_without_binding(run_dir, name, run_id, not_before):
+    """MUTANT of wait_hook with the run-id AND timestamp checks REMOVED.
+
+    This is the pre-fix behaviour: return whatever file is on disk.
+    """
+    p = a._hook_path(run_dir, name)
+    if p.exists():
+        return json.loads(p.read_text())
+    raise a.HookTimeout("no file")
+
+
+def test_MUTATION_dropping_the_hook_binding_lets_a_stale_hook_through(tmp_path):
+    """Probe for B2. Remove the binding and a previous run's hook is consumed."""
+    a.write_hook(tmp_path, "created", "OLD-RUN", {"objects": []})
+
+    with pytest.raises(a.HookTimeout):          # real guard refuses
+        a.wait_hook(tmp_path, "created", "NEW-RUN", PAST, timeout_s=1)
+
+    got = _mutant_wait_hook_without_binding(    # mutant consumes it
+        tmp_path, "created", "NEW-RUN", PAST)
+    assert got["run_id"] == "OLD-RUN", (
+        "the mutant must accept the stale hook, otherwise this probe proves "
+        "nothing about the guard")
+
+
+def _mutant_bundle_problems(served, expected):
+    """MUTANT of the preflight bundle check with the COMPARE removed."""
+    return []                    # pre-fix behaviour: computed, never compared
+
+
+def _real_bundle_problems(served, expected):
+    """The shape of the real check in stage_preflight (B1)."""
+    if not expected:
+        return ["no expected bundle hash supplied"]
+    if served != expected:
+        return [f"served SPA bundle is {served!r}, expected {expected!r}"]
+    return []
+
+
+def test_MUTATION_dropping_the_bundle_compare_passes_a_retagged_image():
+    """Probe for B1, with the real values measured on 057 on 2026-09-15:
+    frontend:1.6.11 re-pushed under the same tag, D4naopHo -> Kr5dAb3q."""
+    served, expected = "index-Kr5dAb3q.js", "index-D4naopHo.js"
+    assert _real_bundle_problems(served, expected), (
+        "the real check must flag a content change under an unchanged tag")
+    assert _mutant_bundle_problems(served, expected) == [], (
+        "the mutant must pass it — that is the defect B1 named")
+
+
+def test_MUTATION_sharing_hook_names_makes_the_crd_stage_self_satisfying():
+    """Probe for B3: with shared names, Stage A's hooks satisfy Stage B1."""
+    assert not (set(a.HOOK_ORDER) & set(a.CRD_HOOK_ORDER))
+    mutant_crd_hooks = list(a.HOOK_ORDER)        # the pre-fix arrangement
+    assert set(a.HOOK_ORDER) & set(mutant_crd_hooks), (
+        "the mutant must overlap, so a Stage-A hook can satisfy a B1 wait")
+
+
+def _mutant_cache_proof(stored, hits, hook_data):
+    """MUTANT of crosscheck_cache_proof with the BROWSER channel REMOVED."""
+    return {"passed": stored >= 1 and hits >= 1}
+
+
+def test_MUTATION_dropping_the_browser_channel_accepts_a_declined_widget():
+    """Probe for review follow-up 1: counters-only accepts foreign traffic."""
+    declined = {"l1_hit": False, "refresh_key": "k"}
+    assert not a.crosscheck_cache_proof(5, 9, declined)["passed"]
+    assert _mutant_cache_proof(5, 9, declined)["passed"], (
+        "the mutant must pass a DECLINED widget on foreign counter movement")
+
+
+def _mutant_reconcile_check(reqlog, start, end):
+    """MUTANT of the §16 self-check with the URL scan REMOVED."""
+    return []
+
+
+def test_MUTATION_dropping_the_reconcile_scan_hides_a_perturbing_call():
+    rl = a._RequestLog()
+    rl.record("GET", "https://p/content/debug/reconcile", 200)
+    assert rl.touched_reconcile(PAST, FUTURE), "the real scan must see it"
+    assert _mutant_reconcile_check(rl, PAST, FUTURE) == [], (
+        "the mutant must miss it — that is what the scan buys")
