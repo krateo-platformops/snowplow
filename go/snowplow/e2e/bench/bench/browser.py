@@ -98,6 +98,8 @@ __all__ = [
     "compute_l1_lookup_delta",
     # O-D3 (snowplow 1.12.3) — /debug/* is JWT-gated; park the bearer.
     "set_debug_token",
+    # GKE LB IPs drift — refuse to start on a dead FRONTEND_URL.
+    "assert_frontend_reachable",
 ]
 
 
@@ -105,8 +107,40 @@ __all__ = [
 
 SNOWPLOW = os.environ.get("SNOWPLOW_URL", "http://34.135.50.203:8081")
 AUTHN = os.environ.get("AUTHN_URL", "http://34.136.84.51:8082")
-FRONTEND = os.environ.get("FRONTEND_URL", "http://34.46.217.105:8080") or None
+# The default is the portal ORIGIN, not a LoadBalancer IP. It used to be a
+# hardcoded GKE LB address; GKE LB IPs drift, that one went dead, and Playwright
+# then dialled it and burned two 80s `networkidle` timeouts per login attempt
+# before anything was reported. See assert_frontend_reachable().
+FRONTEND = os.environ.get("FRONTEND_URL", "https://portal.krateo.dev") or None
 SCREENSHOTS = os.environ.get("SCREENSHOTS", "0") == "1"
+
+def assert_frontend_reachable(timeout_s: float = 5.0) -> None:
+    """Refuse to start when FRONTEND does not answer 200 on /login.
+
+    A dead endpoint is a CONFIG error, not a test result. Without this the
+    failure surfaced as two 80-second Playwright `networkidle` timeouts with
+    ERR_CONNECTION_TIMED_OUT, minutes after the run began and nowhere near the
+    setting that caused it. Fail in seconds, at the point the URL is used, and
+    name the URL and the fix in the message.
+    """
+    if not FRONTEND:
+        raise RuntimeError(
+            "FRONTEND_URL is empty. Set it to the portal origin serving the SPA, "
+            "e.g. https://portal.krateo.dev")
+    url = FRONTEND.rstrip("/") + "/login"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as r:
+            code = r.getcode()
+    except Exception as exc:
+        raise RuntimeError(
+            f"frontend not reachable at {url} within {timeout_s}s: {exc}. "
+            f"Set FRONTEND_URL to the portal origin serving the SPA "
+            f"(e.g. https://portal.krateo.dev); a LoadBalancer IP will drift.") from exc
+    if code != 200:
+        raise RuntimeError(
+            f"frontend at {url} answered HTTP {code}, expected 200. FRONTEND_URL "
+            f"must point at the origin serving the SPA login page.")
+
 
 # Iteration counts — kept at module level so callers / tests can monkeypatch.
 ITERS = int(os.environ.get("ITERS", "10"))

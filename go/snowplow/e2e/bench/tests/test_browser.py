@@ -2207,3 +2207,80 @@ def test_expvar_reader_sends_the_parked_bearer(monkeypatch):
         "snowplow_rbac_publish_seq", base_url="http://fake:8081") == 7
     # urllib title-cases header names on the Request object.
     assert captured["headers"].get("Authorization") == "Bearer tok-xyz"
+
+
+# ─── FRONTEND_URL fail-fast ─────────────────────────────────────────────────
+#
+# The default used to be a hardcoded GKE LoadBalancer IP. GKE LB IPs drift; that
+# one went dead, and the failure surfaced as two 80-second Playwright
+# `networkidle` timeouts with ERR_CONNECTION_TIMED_OUT — minutes into a run and
+# nowhere near the setting responsible. A dead endpoint is a config error, so it
+# must be refused in seconds, at the point the URL is read.
+
+
+class _FakeResponse:
+    def __init__(self, code):
+        self._code = code
+
+    def getcode(self):
+        return self._code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_assert_frontend_reachable_accepts_a_200(monkeypatch):
+    monkeypatch.setattr(browser_mod, "FRONTEND", "https://portal.example")
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=5: _FakeResponse(200))
+    browser_mod.assert_frontend_reachable()  # must not raise
+
+
+def test_assert_frontend_reachable_refuses_a_dead_endpoint(monkeypatch):
+    """The message must name the URL — that is the whole diagnosis."""
+    def boom(req, timeout=5):
+        raise OSError("timed out")
+
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://10.255.0.1:8080")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with pytest.raises(RuntimeError) as err:
+        browser_mod.assert_frontend_reachable(timeout_s=1)
+    assert "10.255.0.1:8080/login" in str(err.value)
+
+
+def test_assert_frontend_reachable_refuses_a_non_200(monkeypatch):
+    monkeypatch.setattr(browser_mod, "FRONTEND", "https://portal.example")
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=5: _FakeResponse(503))
+    with pytest.raises(RuntimeError) as err:
+        browser_mod.assert_frontend_reachable()
+    assert "503" in str(err.value)
+
+
+def test_assert_frontend_reachable_refuses_an_empty_url(monkeypatch):
+    monkeypatch.setattr(browser_mod, "FRONTEND", None)
+    with pytest.raises(RuntimeError):
+        browser_mod.assert_frontend_reachable()
+
+
+def test_frontend_default_is_an_origin_not_a_loadbalancer_ip():
+    """Regression guard: the default must never go back to a bare IP, which drifts.
+
+    Asserted against the SOURCE rather than by reloading the module. The first cut of
+    this test called importlib.reload(browser_mod), which rebinds every module-level
+    object — and bench.cli holds references to this module's exception classes, so a
+    reload mid-suite made `except ConvergenceTimeout` stop matching and failed an
+    unrelated test (test_cli.py::test_cmd_phase6_exits_4_on_ConvergenceTimeout). The
+    default is a literal; read it as one.
+    """
+    import re
+    src = Path(browser_mod.__file__).read_text(encoding="utf-8")
+    m = re.search(r'FRONTEND = os\.environ\.get\(\s*"FRONTEND_URL"\s*,\s*"([^"]+)"', src)
+    assert m, "could not find the FRONTEND default in bench/browser.py"
+    default = m.group(1)
+    assert default.startswith("https://"), f"default must be an https origin, got {default!r}"
+    assert not re.match(r"^https?://\d+\.\d+\.\d+\.\d+", default), (
+        f"default is a bare LoadBalancer IP ({default!r}) — those drift; use the origin")

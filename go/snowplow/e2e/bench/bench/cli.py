@@ -310,7 +310,7 @@ def _gate_helm_lockstep(expected_tag: str) -> tuple[bool, str]:
 
 def _gate_frontend_reachable() -> tuple[bool, str]:
     """Gate 6: frontend LB reachable (HTTP 200 on /login)."""
-    frontend = os.environ.get("FRONTEND_URL", "http://34.46.217.105:8080").strip()
+    frontend = os.environ.get("FRONTEND_URL", "https://portal.krateo.dev").strip()
     if not frontend:
         return False, "frontend_lb_reachable: FAIL (FRONTEND_URL not set)"
     url = frontend.rstrip("/") + "/login"
@@ -992,6 +992,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_rep.add_argument("--run-dir", dest="run_dir", required=True)
     p_rep.set_defaults(func=cmd_report)
+
+    # ─── 1.12.6 item-7 live acceptance (S6), counter half ───────────────
+    # Registered from its own module so the acceptance surface stays out of
+    # this file: `accept1126` (the run) and `accept1126-hook` (the browser
+    # half's stage-boundary signal). See bench/accept1126.py.
+    from bench import accept1126
+    accept1126.add_parsers(sub)
+    # The browser half is a SEPARATE subcommand, deliberately: the two halves run as two
+    # processes against one run dir, coordinating only through the hook files. A single
+    # process owning both would let the counter half observe the browser's own state instead
+    # of the cluster's — which is precisely how the 1.12.5 claim came to rest on a manual call.
+    from bench import s6browser
+    s6browser.add_parsers(sub)
 
     return p
 
