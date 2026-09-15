@@ -119,8 +119,16 @@ K_CRD = "snowplow_crd_discovery"
 RECONCILE_SAMPLE_PER_TICK = 512
 RECONCILE_TICK_SECONDS = 30
 
-#: Hook names the browser half signals, in the order they must arrive.
+#: Hook names the browser half signals for Stage A, in arrival order.
 HOOK_ORDER = ["created", "rendered", "hit_proved", "deleted", "asserted"]
+
+#: Stage B1 (the gated CRD relist) has its OWN hook names. Review finding B3:
+#: reusing Stage A's names made B1's waits return instantly with Stage A's
+#: payloads, because A1 had already consumed them earlier in the same process.
+#: A stage must never wait on a hook another stage can satisfy.
+CRD_HOOK_ORDER = ["crd_created", "crd_rendered", "crd_bumped"]
+
+ALL_HOOKS = HOOK_ORDER + CRD_HOOK_ORDER
 
 HOOK_WAIT_TIMEOUT_S = int(os.environ.get("S6_HOOK_TIMEOUT", "900"))
 
@@ -463,13 +471,36 @@ def _hook_path(run_dir: Path, name: str) -> Path:
     return Path(run_dir) / "hooks" / f"{name}.json"
 
 
-def write_hook(run_dir: Path, name: str, data: dict | None = None) -> Path:
-    """Called by the BROWSER half (via `python -m bench accept1126-hook`)."""
-    if name not in HOOK_ORDER:
-        raise ValueError(f"unknown hook {name!r}; expected one of {HOOK_ORDER}")
+def read_run_id(run_dir: Path) -> str:
+    """The run id the browser half must stamp on every hook.
+
+    Written by `run()` at start and read by the hook CLI, so the browser half
+    does not have to be told it out of band.
+    """
+    p = Path(run_dir) / "run_id"
+    if not p.exists():
+        raise PreflightFailed(
+            f"{p} does not exist — start `python -m bench accept1126` first; it "
+            f"writes the run id every hook must carry.")
+    return p.read_text().strip()
+
+
+def write_hook(run_dir: Path, name: str, run_id: str,
+               data: dict | None = None) -> Path:
+    """Called by the BROWSER half (via `python -m bench accept1126-hook`).
+
+    `run_id` is MANDATORY and is stamped into the payload. Review finding B2: a
+    hook file without a run identity is satisfied by the PREVIOUS run's evidence
+    when `--from-stage` re-uses the run dir, and the channel cross-check then
+    compares two stale payloads that agree trivially because they came from the
+    same prior run.
+    """
+    if name not in ALL_HOOKS:
+        raise ValueError(f"unknown hook {name!r}; expected one of {ALL_HOOKS}")
     p = _hook_path(run_dir, name)
     p.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"hook": name, "at": _now_iso(), "data": data or {}}
+    payload = {"hook": name, "run_id": run_id, "at": _now_iso(),
+               "data": data or {}}
     tmp = p.with_suffix(".tmp")
     with open(tmp, "w") as fh:
         json.dump(payload, fh, indent=2)
@@ -479,24 +510,57 @@ def write_hook(run_dir: Path, name: str, data: dict | None = None) -> Path:
     return p
 
 
-def wait_hook(run_dir: Path, name: str,
+def wait_hook(run_dir: Path, name: str, run_id: str, not_before: str,
               timeout_s: int = HOOK_WAIT_TIMEOUT_S) -> dict:
-    """Block until the browser half signals `name`. Raises on timeout.
+    """Block until the browser half signals `name` FOR THIS RUN AND STAGE.
 
-    A timeout RAISES rather than skipping: a missing hook means the browser half
-    died or never ran, and a counter-only "pass" would be meaningless
-    (`feedback_silent_skip_breaks_convergence_proof`).
+    Three binding conditions, all of which must hold before a file counts as a
+    signal (review finding B2):
+
+      - the payload's `run_id` equals this run's id — a hook from a previous
+        attempt in the same run dir is ignored, not consumed;
+      - the payload's `at` is >= `not_before`, the moment the waiting stage
+        began — so a hook written earlier in THIS run (by an earlier stage)
+        cannot satisfy a later wait either. That is what made B3 deterministic;
+      - the file parses.
+
+    A stale file is treated as NOT YET SIGNALLED and the wait continues, so the
+    browser half can simply overwrite it. A timeout RAISES rather than skipping
+    (`feedback_silent_skip_breaks_convergence_proof`), and the message says
+    which of the three conditions the newest candidate failed, because "timed
+    out" alone would not tell the operator a stale hook was sitting there.
     """
     p = _hook_path(run_dir, name)
     deadline = time.monotonic() + timeout_s
+    last_reason = "no hook file was ever written"
     while time.monotonic() < deadline:
         if p.exists():
-            with open(p) as fh:
-                return json.load(fh)
+            try:
+                with open(p) as fh:
+                    payload = json.load(fh)
+            except (json.JSONDecodeError, OSError) as e:
+                last_reason = f"hook file unparseable ({e})"
+                payload = None
+            if payload is not None:
+                got_id = payload.get("run_id")
+                got_at = payload.get("at", "")
+                if got_id != run_id:
+                    last_reason = (
+                        f"a hook file exists but carries run_id={got_id!r}, "
+                        f"not this run's {run_id!r} — it is left over from a "
+                        f"previous attempt in this run dir and was IGNORED")
+                elif got_at < not_before:
+                    last_reason = (
+                        f"a hook file exists for this run but was written at "
+                        f"{got_at}, before this stage began at {not_before} — "
+                        f"an earlier stage's signal, IGNORED")
+                else:
+                    return payload
         time.sleep(1.0)
     raise HookTimeout(
-        f"browser half did not signal hook {name!r} within {timeout_s}s "
-        f"(expected {p}). The counter half cannot assert anything without it.")
+        f"hook {name!r} not signalled within {timeout_s}s (expected {p}). "
+        f"Reason: {last_reason}. The counter half cannot assert anything "
+        f"without it.")
 
 
 # ─── The §15 assertion table ────────────────────────────────────────────────
@@ -718,6 +782,27 @@ def stage_preflight(ctx: dict) -> dict:
 
     bundle = _served_bundle_hash(portal, reqlog)
 
+    # B1 — the tag is NOT sufficient, and this is not hypothetical. Measured on
+    # 057 on 2026-09-15: `frontend:1.6.11` was re-pushed under the SAME tag with
+    # a different bundle (index-D4naopHo.js → index-Kr5dAb3q.js, pod replaced at
+    # 08:59:29Z). A tag on this registry names an INTENT, not an artifact, so a
+    # tag-only gate passes across a real content change — exactly the case that
+    # would let the pre-re-auth SPA reach the measurement window and make S6
+    # measure nothing. Facts §15.5 P5 requires tag AND hash; this is the hash.
+    expected_bundle = ctx.get("expect_bundle")
+    if not expected_bundle:
+        problems.append(
+            "no expected bundle hash supplied — pass --expect-bundle "
+            "(or set S6_EXPECT_BUNDLE) with the `index-<hash>.js` filename of "
+            "the release under test. The image tag alone cannot gate the build: "
+            "frontend:1.6.11 on 057 was re-pushed under the same tag on "
+            "2026-09-15 with different content.")
+    elif bundle != expected_bundle:
+        problems.append(
+            f"served SPA bundle is {bundle!r}, expected {expected_bundle!r}. "
+            f"The Deployment tag can match while the content does not (mutable "
+            f"tags on this registry) — this is the assertion that catches it.")
+
     # Raise the BUILD problems before attempting login. They are the cheapest
     # and most decisive signal, they need no credential, and reporting "creds
     # missing" while the cluster is running the wrong build would bury the
@@ -737,9 +822,12 @@ def stage_preflight(ctx: dict) -> dict:
     ctx["token"] = token
     return {
         "context": got_ctx,
+        "run_id": ctx["run_id"],
         "snowplow_image": sp_img, "snowplow_version": sp_ver,
         "frontend_image": fe_img, "frontend_version": fe_ver,
         "served_bundle": bundle,
+        "expected_bundle": expected_bundle,
+        "bundle_matches": bundle == expected_bundle,
         "debug_vars_reachable": True,
         "expvar_keys_present": sorted(
             k for k in (K_DEPS, K_RESOLVED, K_BROADCAST, K_CRD) if k in snap),
@@ -758,44 +846,84 @@ def stage_counters_before(ctx: dict) -> dict:
     snapshotting is what stops a DECLINED widget (armed but never cached) from
     reaching the delete and reading as a C10 failure.
     """
-    run_dir, portal, reqlog = ctx["run_dir"], ctx["portal_base"], ctx["reqlog"]
+    run_dir, portal = ctx["run_dir"], ctx["portal_base"]
+    reqlog, rid = ctx["reqlog"], ctx["run_id"]
+    began = _now_iso()
 
-    created = wait_hook(run_dir, "created")
+    created = wait_hook(run_dir, "created", rid, began)
     for kind, name in (created.get("data", {}).get("objects") or []):
         assert_owned(kind, name)                 # R1, on what was actually made
 
-    wait_hook(run_dir, "rendered")
-    hit = wait_hook(run_dir, "hit_proved")
-    hd = hit.get("data", {})
-    if not hd.get("l1_hit") or not hd.get("refresh_key"):
-        raise PreflightFailed(
-            "the browser half did not prove an L1 HIT with a stamped "
-            "X-Snowplow-Refresh-Key. Facts §10.2: snowplow stamps that header "
-            "even on a DECLINE, so the widget can arm a key that was never "
-            "cached — no eviction can ever fire for it. Refusing to proceed.")
+    # P1/P2 — snapshot BEFORE the browser does any /call for the widget, so the
+    # cache proof is OURS. Review finding: trusting the browser half's `l1_hit`
+    # boolean means the guard that stops a DECLINED widget reaching the delete
+    # rests on the very half whose evidence it is supposed to corroborate.
+    pre = snapshot_counters(read_debug_vars(portal, ctx["token"], reqlog))
 
-    snap = read_debug_vars(portal, ctx["token"], reqlog)
+    wait_hook(run_dir, "rendered", rid, began)       # first /call → cold fill
+    hit = wait_hook(run_dir, "hit_proved", rid, began)  # second /call → HIT
+    hd = hit.get("data", {})
+    if not hd.get("refresh_key"):
+        raise PreflightFailed(
+            "the browser half reported no X-Snowplow-Refresh-Key. Without the "
+            "armed key there is nothing to assert delivery against.")
+
+    post = snapshot_counters(read_debug_vars(portal, ctx["token"], reqlog))
+    cache_d = delta(pre, post)
+    stored = cache_d[f"{K_RESOLVED}.store_total"]
+    hits = cache_d[f"{K_RESOLVED}.hit_total"]
+
+    # `>= 1`, not `== 1`, and deliberately so: store_total and hit_total are
+    # GLOBAL counters on a live cluster, and any other portal session's widget
+    # fetch moves them during this window. Asserting equality here would be
+    # flaky for a reason that has nothing to do with the thing under test. The
+    # load-bearing claim is "a real entry was stored AND served from L1", which
+    # `>= 1` states exactly. (The Stage A eviction rows keep `== 1`: their
+    # window is seconds long and the event is specific — see the quiescence
+    # note in the A2 proof.)
+    if stored < 1 or hits < 1:
+        raise PreflightFailed(
+            f"the disposable widget was NOT cached: "
+            f"{K_RESOLVED}.store_total Δ={stored}, {K_RESOLVED}.hit_total "
+            f"Δ={hits} (both must be >= 1). Facts §10.2: snowplow stamps "
+            f"X-Snowplow-Refresh-Key even on a DECLINE (stage-error, external "
+            f"touch, undeclared extras, UAF refilter), so the browser can arm a "
+            f"key whose entry never existed — nothing can ever be evicted for "
+            f"it and the run would read as a C10 failure. Refusing to proceed. "
+            f"Check the snowplow log for a 'declining to cache' WARN.")
+
     ctx["window_start"] = _now_iso()
-    ctx["before"] = snapshot_counters(snap)
+    ctx["before"] = post          # the delete window opens from the post-hit state
     ctx["refresh_key"] = hd["refresh_key"]
     return {
         "window_start": ctx["window_start"],
         "refresh_class": hd.get("refresh_class"),
         "refresh_key_sha256_prefix": (hd.get("refresh_key") or "")[:12],
-        "armed_keys": ctx["before"][f"{K_BROADCAST}.armed_keys"],
-        "subscribers": ctx["before"][f"{K_BROADCAST}.subscribers"],
+        "cache_proof": {
+            "store_total_delta": stored,
+            "hit_total_delta": hits,
+            "self_verified": True,
+            "browser_reported_l1_hit": hd.get("l1_hit"),
+            "note": "asserted from our own before/after snapshots around the "
+                    "browser's render + prove-hit steps; the browser's l1_hit "
+                    "flag is recorded for comparison but is NOT the gate.",
+        },
+        "armed_keys": post[f"{K_BROADCAST}.armed_keys"],
+        "subscribers": post[f"{K_BROADCAST}.subscribers"],
         "counters_before": ctx["before"],
     }
 
 
 def stage_counters_after(ctx: dict) -> dict:
     """A2 — wait for the delete, let the drain settle, snapshot, assert."""
-    run_dir, portal, reqlog = ctx["run_dir"], ctx["portal_base"], ctx["reqlog"]
+    run_dir, portal = ctx["run_dir"], ctx["portal_base"]
+    reqlog, rid = ctx["reqlog"], ctx["run_id"]
+    began = _now_iso()
 
-    deleted = wait_hook(run_dir, "deleted")
+    deleted = wait_hook(run_dir, "deleted", rid, began)
     for kind, name in (deleted.get("data", {}).get("objects") or []):
         assert_owned(kind, name)
-    asserted = wait_hook(run_dir, "asserted")
+    asserted = wait_hook(run_dir, "asserted", rid, began)
 
     # C10 defers under the per-subscriber bucket, so an immediate read can
     # legitimately miss frames still queued (§15.3 A17).
@@ -819,6 +947,16 @@ def stage_counters_after(ctx: dict) -> dict:
         "__passed__": passed,
         "window_end": ctx["window_end"],
         "settle_seconds": SETTLE_SECONDS,
+        "quiescence_caveat": (
+            "The eviction rows assert EXACT deltas (== 1) against GLOBAL "
+            "counters. That is sound only while no other actor evicts an L1 "
+            "entry inside this window — a controller deleting a CR on 057 "
+            "would move snowplow_deps.evict_delete_total too. The window is a "
+            "few seconds and the run should be made without other portal "
+            "activity; if A1/A2 read higher than expected, treat it as "
+            "INCONCLUSIVE-AND-RERUN, not as a snowplow failure. "
+            "snowplow_resolved_cache.store_total / hit_total are asserted >= 1 "
+            "rather than == 1 for the same reason over a longer window."),
         "deleted_count": n,
         "counters_after": after,
         "delta": d,
@@ -866,6 +1004,97 @@ def stage_reconcile_selfcheck(ctx: dict) -> dict:
     }
 
 
+def announce(run_dir: Path, name: str, run_id: str,
+             data: dict | None = None) -> Path:
+    """Counter-half → browser-half fact file (the opposite direction to a hook).
+
+    The browser half polls these to learn that the counter half has finished a
+    mutation it must react to (the CRD and its CR now exist; the schema has been
+    bumped). Same payload shape and same atomic write as `write_hook`, in a
+    separate directory so the two directions can never be confused for each
+    other.
+    """
+    p = Path(run_dir) / "announce" / f"{name}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"announce": name, "run_id": run_id, "at": _now_iso(),
+               "data": data or {}}
+    tmp = p.with_suffix(".tmp")
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(p)
+    return p
+
+
+def _kubectl_apply(manifest: str, what: str) -> None:
+    """Server-side apply a harness-owned manifest.
+
+    `kubectl apply` for a BENCH FIXTURE is the established convention in this
+    package (`lifecycle.py:483` applies its user CRs the same way). The
+    helm-only rule (`feedback_never_kubectl_apply`, `feedback_chart_only_for_snowplow`)
+    governs deploying snowplow and portal COMPONENTS, not throwaway test objects
+    the harness creates and deletes under its own name prefix.
+    """
+    rc, _, err = cluster.kubectl(
+        "apply", "--server-side", "--force-conflicts", "-f", "-",
+        input_data=manifest)
+    if rc != 0:
+        raise RuntimeError(f"failed to apply {what}: {err}")
+
+
+def _crd_manifest(group: str, plural: str, kind: str, *, widened: bool) -> str:
+    """The disposable CRD, in its narrow and widened forms.
+
+    The ONLY difference between the two is one extra OPTIONAL property under
+    `spec.versions[0].schema.openAPIV3Schema`. That is exactly what the
+    fingerprint covers — `sha256(json([{name, schema.openAPIV3Schema}]))`,
+    `crd_discovery_side_effect.go:593` — so this edit changes it and a metadata
+    edit would not. Optional, so no existing CR becomes invalid.
+    """
+    extra = ('                  widened:\n'
+             '                    type: string\n') if widened else ""
+    return (
+        "apiVersion: apiextensions.k8s.io/v1\n"
+        "kind: CustomResourceDefinition\n"
+        "metadata:\n"
+        f"  name: {plural}.{group}\n"
+        "spec:\n"
+        f"  group: {group}\n"
+        "  scope: Namespaced\n"
+        "  names:\n"
+        f"    plural: {plural}\n"
+        f"    singular: {plural[:-1]}\n"
+        f"    kind: {kind}\n"
+        "  versions:\n"
+        "    - name: v1alpha1\n"
+        "      served: true\n"
+        "      storage: true\n"
+        "      schema:\n"
+        "        openAPIV3Schema:\n"
+        "          type: object\n"
+        "          properties:\n"
+        "            spec:\n"
+        "              type: object\n"
+        "              properties:\n"
+        "                note:\n"
+        "                  type: string\n"
+        + extra
+    )
+
+
+def _cr_manifest(group: str, kind: str, name: str) -> str:
+    return (
+        f"apiVersion: {group}/v1alpha1\n"
+        f"kind: {kind}\n"
+        "metadata:\n"
+        f"  name: {name}\n"
+        f"  namespace: {NS}\n"
+        "spec:\n"
+        "  note: s6 relist probe\n"
+    )
+
+
 def _iso_delta_seconds(a: str | None, b: str | None) -> float:
     if not a or not b:
         return 0.0
@@ -903,45 +1132,104 @@ def stage_crd_relist(ctx: dict) -> dict:
             "Creating/deleting a CRD on 057 is heavier than a CR and is never "
             "implied by the default S6 path.")
 
-    run_dir, portal, reqlog = ctx["run_dir"], ctx["portal_base"], ctx["reqlog"]
-    crd_name = ctx["crd_name"]
+    run_dir, portal = ctx["run_dir"], ctx["portal_base"]
+    reqlog, rid = ctx["reqlog"], ctx["run_id"]
+    began = _now_iso()
+
+    crd_name = ctx["crd_name"]                       # "<plural>.harness.krateo.io"
     assert_owned("crd", crd_name)
+    plural, group = crd_name.split(".", 1)
+    kind = plural[:-1].capitalize()
+    cr_name = f"{OWNED_PREFIX}{plural}"
+    assert_owned("cr", cr_name)
 
-    before = snapshot_crd_counters(read_debug_vars(portal, ctx["token"], reqlog))
+    created_objs: list[tuple[str, str]] = []
+    try:
+        # (1) CRD, narrow form. First observation only RECORDS the fingerprint —
+        #     it deliberately does NOT relist (§14.1 fact 2,
+        #     crd_discovery_side_effect.go:653-661).
+        _kubectl_apply(_crd_manifest(group, plural, kind, widened=False),
+                       f"CRD {crd_name}")
+        created_objs.append(("crd", crd_name))
 
-    # The browser half renders a widget over a CR of the new kind; that read is
-    # what REGISTERS the informer (§14.1 fact 3) and makes the bump relist.
-    wait_hook(run_dir, "rendered")
+        # (2) one CR of the new kind.
+        _kubectl_apply(_cr_manifest(group, kind, cr_name),
+                       f"{kind}/{cr_name}")
+        created_objs.append((plural, cr_name))
 
-    bumped = wait_hook(run_dir, "hit_proved")          # schema bump signalled
-    time.sleep(SETTLE_SECONDS)
+        announce(run_dir, "crd_created", rid, {
+            "crd": crd_name, "group": group, "plural": plural,
+            "kind": kind, "namespace": NS, "cr": cr_name,
+            "next": "render a widget over this CR, then signal crd_rendered",
+        })
 
-    after = snapshot_crd_counters(read_debug_vars(portal, ctx["token"], reqlog))
-    d = delta(before, after)
-    ok, results = evaluate(crd_rows(), d)
+        # (3) THE STEP THAT MAKES THE BUMP MEAN ANYTHING. The relist only fires
+        #     for a GVR that is already REGISTERED (`rw.IsRegistered(gvr)`,
+        #     :686-689), and registration is lazy — it happens when something
+        #     actually reads a CR of the kind (objects/get.go:113). Bumping the
+        #     schema before this wait would relist nothing and the stage would
+        #     fail for the wrong reason.
+        wait_hook(run_dir, "crd_rendered", rid, began)
 
-    return {
-        "__passed__": ok,
-        "crd": crd_name,
-        "approved": True,
-        "counters_before": before,
-        "counters_after": after,
-        "delta": d,
-        "assertions": results,
-        "failed_rows": [r["id"] for r in results if not r["passed"]],
-        "bump_detail": _redact((bumped or {}).get("data")),
-        "teardown_order": [
-            "1. disposable child widget (the S6 subject)",
-            "2. disposable page root Flex",
-            "3. CR of the disposable kind",
-            "4. the CRD last (cascades any remaining CRs)",
-        ],
-        "known_residue": (
-            "navDiscoveredGroups is APPEND-ONLY on DELETE by ratified design, "
-            "so the disposable group name stays in that in-memory set for the "
-            "life of the pod. Bounded and harmless — but use a FRESH name per "
-            "run and never assert the set is unchanged."),
-    }
+        before = snapshot_crd_counters(
+            read_debug_vars(portal, ctx["token"], reqlog))
+
+        # (4) the bump: one extra OPTIONAL property in the structural schema.
+        _kubectl_apply(_crd_manifest(group, plural, kind, widened=True),
+                       f"CRD {crd_name} (widened)")
+        announce(run_dir, "crd_bumped", rid, {"crd": crd_name})
+        time.sleep(SETTLE_SECONDS)
+
+        after = snapshot_crd_counters(
+            read_debug_vars(portal, ctx["token"], reqlog))
+        d = delta(before, after)
+        ok, results = evaluate(crd_rows(), d)
+
+        return {
+            "__passed__": ok,
+            "crd": crd_name, "cr": cr_name, "group": group, "kind": kind,
+            "approved": True,
+            "counters_before": before,
+            "counters_after": after,
+            "delta": d,
+            "assertions": results,
+            "failed_rows": [r["id"] for r in results if not r["passed"]],
+            "known_residue": (
+                "navDiscoveredGroups is APPEND-ONLY on DELETE by ratified "
+                "design, so the disposable group name stays in that in-memory "
+                "set for the life of the pod. Bounded and harmless — which is "
+                "why the group carries a FRESH per-run name and why nothing "
+                "asserts that set is unchanged."),
+        }
+    finally:
+        # Teardown in the documented order (§14.4), inner-most first, and ALWAYS
+        # — a failed assertion must not leave a CRD on a shared cluster.
+        _teardown_crd(created_objs)
+
+
+def _teardown_crd(objs: list[tuple[str, str]]) -> None:
+    """Delete what this stage created, inner-most first (§14.4).
+
+    Every delete is gated by `assert_owned` again at the point of use: the list
+    is built locally, but re-checking here means a future edit that widens it
+    cannot quietly delete something the harness does not own.
+
+    Deleting the CRD cascades any remaining CRs at the apiserver, and snowplow's
+    own teardown is clean (`triggerCRDDelete` → `RemoveResourceType`,
+    `watcher.go:1591-1600`, nil- and unknown-GVR-safe; `OnResourceTypeRemoved`,
+    `deps.go:872-877`, nil-safe). So no informer is left running.
+    """
+    for kind, name in reversed(objs):            # CR before CRD
+        try:
+            assert_owned("crd" if kind == "crd" else "cr", name)
+        except NotOwned:
+            continue
+        if kind == "crd":
+            cluster.kubectl("delete", "crd", name, "--ignore-not-found",
+                            "--wait=false")
+        else:
+            cluster.kubectl("delete", kind, name, "-n", NS,
+                            "--ignore-not-found", "--wait=false")
 
 
 # ─── Orchestration ──────────────────────────────────────────────────────────
@@ -965,17 +1253,40 @@ STAGES: list[tuple[str, Callable[[dict], dict], str]] = [
 
 
 def run(run_dir: Path, portal_base: str, *, enable_crd_relist: bool = False,
-        crd_name: str | None = None, from_stage: str | None = None) -> int:
+        crd_name: str | None = None, from_stage: str | None = None,
+        expect_bundle: str | None = None) -> int:
     """One invocation, every stage, per-stage proofs + state.json."""
     run_dir = Path(run_dir)
     (run_dir / "proofs").mkdir(parents=True, exist_ok=True)
     (run_dir / "hooks").mkdir(parents=True, exist_ok=True)
+    (run_dir / "announce").mkdir(parents=True, exist_ok=True)
+
+    # A fresh run gets a fresh identity AND a cleared hook directory; a
+    # --from-stage resume keeps the existing one so the browser half's already
+    # delivered hooks still count (review finding B2). Either way every wait
+    # checks run_id AND the stage start time, so a leftover file from a
+    # previous attempt is ignored rather than consumed.
+    rid_path = run_dir / "run_id"
+    if from_stage and rid_path.exists():
+        run_id = rid_path.read_text().strip()
+        print(f"[accept1126] resuming run_id={run_id} from {from_stage}")
+    else:
+        run_id = f"{int(time.time())}-{os.getpid()}"
+        for stale in (run_dir / "hooks").glob("*.json"):
+            stale.unlink()
+        for stale in (run_dir / "announce").glob("*.json"):
+            stale.unlink()
+        rid_path.write_text(run_id)
+        print(f"[accept1126] run_id={run_id} (hooks cleared)")
 
     ctx: dict[str, Any] = {
         "run_dir": run_dir,
+        "run_id": run_id,
         "portal_base": portal_base.rstrip("/"),
         "reqlog": _RequestLog(),
         "enable_crd_relist": enable_crd_relist,
+        "expect_bundle": expect_bundle or os.environ.get(
+            "S6_EXPECT_BUNDLE", "").strip() or None,
         "crd_name": crd_name or f"s6run{int(time.time())}{OWNED_CRD_SUFFIX}",
     }
 
@@ -1097,6 +1408,12 @@ def add_parsers(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--portal-base", default=DEFAULT_PORTAL_BASE)
     p.add_argument("--from-stage", default=None)
     p.add_argument(
+        "--expect-bundle", default=None,
+        help="Expected served SPA bundle filename, e.g. index-Kr5dAb3q.js. "
+             "REQUIRED (or S6_EXPECT_BUNDLE): the image tag alone cannot gate "
+             "the build — frontend:1.6.11 on 057 was re-pushed under the same "
+             "tag on 2026-09-15 with different content.")
+    p.add_argument(
         "--enable-crd-relist", action="store_true",
         help="Run the gated CRD schema-relist stage. OFF by default; also "
              "requires S6_CRD_RELIST_APPROVED=1 (Diego's approval).")
@@ -1107,7 +1424,11 @@ def add_parsers(sub: argparse._SubParsersAction) -> None:
         "accept1126-hook",
         help="Signal a stage boundary from the BROWSER half.")
     h.add_argument("--run-dir", required=True)
-    h.add_argument("--name", required=True, choices=HOOK_ORDER)
+    h.add_argument("--name", required=True, choices=ALL_HOOKS)
+    h.add_argument(
+        "--run-id", default=None,
+        help="Defaults to the id in <run-dir>/run_id. A hook whose run id does "
+             "not match the live run is IGNORED, not consumed.")
     h.add_argument("--data", default="{}", help="JSON payload")
     h.set_defaults(func=cmd_accept1126_hook)
 
@@ -1115,10 +1436,13 @@ def add_parsers(sub: argparse._SubParsersAction) -> None:
 def cmd_accept1126(args) -> int:
     return run(Path(args.run_dir), args.portal_base,
                enable_crd_relist=args.enable_crd_relist,
-               crd_name=args.crd_name, from_stage=args.from_stage)
+               crd_name=args.crd_name, from_stage=args.from_stage,
+               expect_bundle=args.expect_bundle)
 
 
 def cmd_accept1126_hook(args) -> int:
-    p = write_hook(Path(args.run_dir), args.name, json.loads(args.data))
-    print(f"[accept1126-hook] {args.name} → {p}")
+    run_dir = Path(args.run_dir)
+    rid = args.run_id or read_run_id(run_dir)
+    p = write_hook(run_dir, args.name, rid, json.loads(args.data))
+    print(f"[accept1126-hook] {args.name} (run_id={rid}) → {p}")
     return 0
