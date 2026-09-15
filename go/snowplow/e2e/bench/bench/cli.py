@@ -993,6 +993,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--run-dir", dest="run_dir", required=True)
     p_rep.set_defaults(func=cmd_report)
 
+    # ─── 1.12.6 item-7 live acceptance (S6), counter half ───────────────
+    # Registered from its own module so the acceptance surface stays out of
+    # this file: `accept1126` (the run) and `accept1126-hook` (the browser
+    # half's stage-boundary signal). See bench/accept1126.py.
+    from bench import accept1126
+    accept1126.add_parsers(sub)
+
     return p
 
 
