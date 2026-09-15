@@ -380,6 +380,11 @@ func TestRefreshEviction_Pace_DeferredNeverDroppedDedup(t *testing.T) {
 		t.Fatalf("pace RED: pending high-water %d exceeds the armed set %d", hw, n)
 	}
 	order, _ := readAll(ch, n, 5*time.Second)
+	// Keep reading past the N distinct keys: an over-delivery of the
+	// re-evicted key lands AFTER the FIFO backlog, where a read that stops
+	// at N distinct keys cannot see it (probe P9 stayed green until this).
+	extra, _ := readAll(ch, 4, 300*time.Millisecond)
+	order = append(order, extra...)
 	seen := map[string]int{}
 	for _, k := range order {
 		seen[k]++

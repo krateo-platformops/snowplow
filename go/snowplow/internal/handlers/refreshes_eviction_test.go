@@ -92,6 +92,18 @@ func seedPanels(t *testing.T, names []string) {
 		}})
 	}
 
+	// Reset the hub + dep tracker BEFORE the watcher is built: its informer
+	// handlers bind the dep-watch singleton at registration, and a reset
+	// AFTER that would orphan a worker goroutine that keeps reading Deps()
+	// (a -race report at cleanup, seen at -count=3). This cleanup is
+	// registered first, so it runs LAST — after rw.Stop below.
+	cache.ResetRefreshBroadcasterForTest()
+	cache.ResetDepsForTest()
+	t.Cleanup(func() {
+		cache.ResetDepsForTest()
+		cache.ResetRefreshBroadcasterForTest()
+	})
+
 	wctx, wcancel := context.WithCancel(context.Background())
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, seed...)
 	rw, err := cache.NewResourceWatcher(wctx, dyn)
@@ -119,13 +131,13 @@ func seedPanels(t *testing.T, names []string) {
 	})
 }
 
-// evictionWiring resets the hub + dep tracker and wires the process L1 store
-// into the tracker (what ResolvedCache()'s once-init does in production).
-// Returns the store. Cleanup deletes the keys the test put.
+// evictionWiring wires the process L1 store into the dep tracker (what
+// ResolvedCache()'s once-init does in production). seedPanels must have run
+// first: it reset the hub + tracker before the watcher bound them (resetting
+// here again would orphan the watcher's dep-event worker). Returns the
+// store. Cleanup deletes the keys the test put.
 func evictionWiring(t *testing.T, keys *[]string) *cache.ResolvedCacheStore {
 	t.Helper()
-	cache.ResetRefreshBroadcasterForTest()
-	cache.ResetDepsForTest()
 	store := cache.ResolvedCache()
 	if store == nil {
 		t.Fatalf("ResolvedCache() nil — RESOLVED_CACHE_ENABLED not honoured")
@@ -135,8 +147,6 @@ func evictionWiring(t *testing.T, keys *[]string) *cache.ResolvedCacheStore {
 		for _, k := range *keys {
 			store.DeleteForTest(k)
 		}
-		cache.ResetDepsForTest()
-		cache.ResetRefreshBroadcasterForTest()
 	})
 	return store
 }
