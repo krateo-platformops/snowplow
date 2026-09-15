@@ -249,6 +249,17 @@ def test_burst_rows_use_delivered_for_the_no_loss_half():
     assert not any("drained" in (k or "") for k in keys)
 
 
+def test_a17_tolerates_ordinary_refresh_traffic_in_the_burst_window():
+    """A17 is bounded for the same reason as A6: `delivered` is fed by both publish paths,
+    so refreshes of the other armed shell keys land in the burst window too. "Nothing was
+    lost" is `>= n`; `== n` additionally claimed no other key was ever refreshed, which is
+    not S9's claim."""
+    a17 = next(r for r in a.burst_rows(3) if r.rid == "A17")
+    assert a17.check({f"{a.K_BROADCAST}.delivered": 5})[0] is True   # extras are fine
+    assert a17.check({f"{a.K_BROADCAST}.delivered": 3})[0] is True   # exactly n is fine
+    assert a17.check({f"{a.K_BROADCAST}.delivered": 2})[0] is False  # a LOSS still fails
+
+
 def test_crd_rows_pin_the_timeout_falsifier():
     rows = {r.rid: r for r in a.crd_rows()}
     assert rows["B4"].key == f"{a.K_CRD}.relist_bridge_timeout_total"

@@ -515,6 +515,16 @@ def run_browser_half(run_dir: Path, portal_base: str) -> int:
     """Entry point. Returns a process exit code; never raises past this boundary."""
     from playwright.sync_api import sync_playwright
 
+    # FAIL FAST ON A DEAD ENDPOINT, before Playwright is launched and before any CR is
+    # created. A wrong FRONTEND_URL used to surface as two 80-second `networkidle` timeouts
+    # inside the login retry loop — minutes in, with ERR_CONNECTION_TIMED_OUT and no mention
+    # of the setting responsible. Five seconds here, naming the URL, is the whole diagnosis.
+    try:
+        bench_browser.assert_frontend_reachable()
+    except RuntimeError as exc:
+        print(f"    s6browser: FAILED — {exc}")
+        return 1
+
     user, password = accept1126._creds()
     s6 = S6Browser(run_dir, portal_base)
     print(f"    s6browser: run_id={s6.run_id} child={s6.child} page={PAGE_ROOT}")

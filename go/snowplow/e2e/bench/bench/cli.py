@@ -310,7 +310,7 @@ def _gate_helm_lockstep(expected_tag: str) -> tuple[bool, str]:
 
 def _gate_frontend_reachable() -> tuple[bool, str]:
     """Gate 6: frontend LB reachable (HTTP 200 on /login)."""
-    frontend = os.environ.get("FRONTEND_URL", "http://34.46.217.105:8080").strip()
+    frontend = os.environ.get("FRONTEND_URL", "https://portal.krateo.dev").strip()
     if not frontend:
         return False, "frontend_lb_reachable: FAIL (FRONTEND_URL not set)"
     url = frontend.rstrip("/") + "/login"
