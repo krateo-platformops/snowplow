@@ -1,7 +1,7 @@
 ---
 type: Architecture
 title: snowplow — observability
-description: The runtime observability surface — expvars at /debug/vars, structured slog events, pprof, the default-off OTel export (traces/metrics/logs + audit), and the probe endpoints.
+description: The runtime observability surface — expvars at /debug/vars, structured slog events, pprof, the OTel export (traces/metrics/logs + audit; default-on since 1.12.4), and the probe endpoints.
 resource: oci://ghcr.io/krateo-platformops/charts/snowplow
 tags: [observability, expvar, otel, metrics, logging, pprof]
 timestamp: 2026-08-06T00:00:00Z
@@ -16,7 +16,7 @@ port the server listens on (`main.go` `server.Addr = :<port>`):
 2. **structured `slog` events** on stdout — the event log.
 3. **pprof** at `GET /debug/pprof/*` — runtime profiling.
 4. **OTel export** — traces, metrics and logs to an OTLP collector,
-   **default-off** behind the `OTEL_ENABLED` master switch (see below).
+   **default-on since 1.12.4** behind the `OTEL_ENABLED` master switch (see below).
 
 Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage`,
 `GET /debug/refreshes` (the live-refresh subscription registry) and
@@ -52,7 +52,7 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
 
 ---
 
-## OTel export (default-off)
+## OTel export (default-on since 1.12.4)
 
 `main.go` wires three gated pipelines at boot, all no-ops unless enabled:
 
@@ -114,11 +114,29 @@ Defined in `internal/cache/fallthrough_meter_expvar.go`.
 | `snowplow_apiserver_fallthrough_total` | grand-total `uint64` of read requests that **genuinely reached the live apiserver** (client-build, secret-get, the informer-fallthrough-* gate misses, apistage partial-shape GETs, the discovery hop) | climbs during boot/cold; should plateau once warm. A steadily climbing total on a warm pod = cache not covering the live request mix. **Reclassified in 1.12.4:** in-process cache HITs (`resolver-plurals-hit`, `widget-content-hit`, …) no longer count here — on the krateo-057 corpus the lifetime value drops **936,320 → 107,795** (of which customer-scope **22,015 ≈ 2.9/min**; the rest is prewarm-scope). That drop is the fix, not a regression |
 | `snowplow_apiserver_fallthrough_cells` | per-cell `map["path\|gvr\|reason"]→uint64` breakdown of the above | use to attribute fallthrough to a specific path/GVR/reason. `resolver-plurals-hit` and the other diagnostic reasons now live **only** in `snowplow_cache_diagnostic_cells` |
 | `snowplow_cache_diagnostic_total` / `snowplow_cache_diagnostic_cells` (`fallthrough_meter.go`, 1.12.4) | the six reasons that reach **no** apiserver (`resolver-plurals-hit`, `resolver-plurals-miss` — double-counted against the discovery hop, `widget-content-hit`, `widget-content-miss-per-user-fallback`, `cluster-list-dispatch`, `cluster-list-shape-fallback`), same cell shape | should **dwarf** the fallthrough total ~8:1 on a warm pod — the reclassification visible at a glance. Routing is by enum membership inside the meter; call sites are unchanged |
-| `snowplow_resolved_cache` (`resolved_cache_expvar.go`, 1.12.4) | L1 store `Stats()` by stat: `entries`, `bytes`, `max_*`, `hit/miss/store_total`, `evict_{lru,ttl,delete}_total`, `resident_*`, per-class `{apistage,widget_content,ra_full_list}_{store,evict}_total` | previously reachable only through an INFO summary line the chart's `LOG_LEVEL=warn` suppresses |
+| `snowplow_resolved_cache` (`resolved_cache_expvar.go`, 1.12.4) | L1 store `Stats()` as `map{stat → value}`; per-stat table below. Mirrored to OTLP as `snowplow_resolved_cache{stat}` | previously reachable only through an INFO summary line the chart's `LOG_LEVEL=warn` suppresses |
 | `snowplow_informer_servable` (`servable.go` `ServableCounts`, 1.12.4) | `{registered, synced, servable, watch_broken, confirmed}` | the leading indicator for the `informer-fallthrough-not-synced` cell; `watch_broken > 0` = the stale-delete latch |
 | `snowplow_build_info` (`build_info_expvar.go`, 1.12.4) | `{version}` = `main.build` (git short commit; `unknown` for an unstamped local build) | pins every other metric to a commit. Also the `service.version` OTel resource attribute |
 | `snowplow_metrics_series_truncated_total` (OTLP only, 1.12.4) | per-family count of `path\|gvr\|reason` series folded into `gvr="__other__"` by the 5000-series OTLP cap | **0**. Non-zero = a cardinality regression (the cap kept it from becoming an incident); `/debug/vars` keeps the uncapped maps |
 | `snowplow_assertion_violations_total` | per-check `map[string]→uint64` of architectural-invariant breaches. Keys: `read_paths_scoped` (a `/call`-class route not wrapped with `FallthroughScopeMiddleware`, asserted at boot by `cache.AssertReadPathsScoped()`), `serve_requires_servable` (an authoritative cache HIT was about to be served from a not-servable informer — asserted per-serve in `internal/cache/serve_assert.go`) | **0** for every key. Non-zero = an invariant is broken in prod (logged ERROR, pod stays up). **`serve_requires_servable` > 0 is P1** — never-serve-from-not-synced is the most load-bearing cache guarantee |
+
+#### `snowplow_resolved_cache` stats
+
+| stat | meaning | healthy range |
+|---|---|---|
+| `entries`, `bytes` | live L1 entries and their byte footprint | under the ceilings below; a flat line at the ceiling = the budget is binding |
+| `max_entries`, `max_bytes` | the two ceilings (`RESOLVED_CACHE_MAX_ENTRIES`, `RESOLVED_CACHE_MAX_BYTES`) | configuration echo |
+| `hit_total`, `miss_total`, `store_total` | lifetime `Get` hits / misses and `Put` count | hit rate → 100 % warm (`feedback_l1_hit_invariant_is_100_percent`); a miss after a mutation is a defect, not a cold fill |
+| `evict_lru_total` | entries evicted because a ceiling was hit — the budget is the binding constraint | **0** on a right-sized pod; climbing = raise the ceiling or the store is oversubscribed |
+| `evict_ttl_total` | entries evicted at `RESOLVED_CACHE_TTL_SECONDS` (3600 s) on `Get` — staleness, the outer net | low; every TTL eviction is a body the pipeline did not refresh in an hour |
+| `evict_max_age_total` | **1.12.6 C5.** entries evicted on `Get` because they were born more than `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS` (86400 s) ago, however many times they were re-Put since | low and steady (≈ one per resident cell per day) |
+| `evict_delete_total` | entries evicted by invalidation (the dep tracker's DELETE route) — the store-side twin of `snowplow_deps.evict_delete_total` | tracks object deletions |
+| `resident_entries`, `resident_bytes`, `max_resident_bytes` | the pinned resident region (Ship 4a): entries the keep-warm sweep keeps out of LRU, and its own byte ceiling | `resident_bytes` under `max_resident_bytes` |
+| `resident_pin_total`, `resident_demote_total` | entries pinned into / demoted out of the resident region | demotions low; a burst = the resident ceiling is binding |
+| `apistage_store_total`, `apistage_evict_total` | per-class store / evict for `apistage` cells | evicts ≪ stores |
+| `widget_content_store_total`, `widget_content_evict_total` | per-class store / evict for `widgetContent` cells | evicts ≪ stores |
+| `ra_full_list_store_total`, `ra_full_list_evict_total` | per-class store / evict for `RAFullList` cells | evicts ≪ stores |
+
 
 ### Dispatch L1 lookups — resolved-output cache hit rate
 Defined in `internal/handlers/dispatchers/l1_lookup_metrics.go`.
@@ -178,21 +196,51 @@ Defined in `internal/handlers/dispatchers/phase1_pip_metrics.go` (+ siblings).
 ### Refresher — background re-resolve worker pool
 Defined in `internal/cache/refresher_metrics.go`.
 
+All keys below are derived from the `stat` tags on `refresherStats` /
+`RefreshTerminalStats` (1.12.6 C7): counters are `snowplow_refresher_<stat>_total`,
+gauges `snowplow_refresher_<stat>`; the OTLP mirror publishes the counters as
+`snowplow_refresher{stat=<stat>}` and the gauges under their expvar name. None of them
+constructs the refresher: before the first enqueue, and on a cache-off pod, every value is 0
+(#203).
+
 | expvar | meaning | healthy range |
 |---|---|---|
-| `snowplow_refresher_enqueue_total` / `_completed_total` / `_failed_total` / `_retried_total` / `_dropped_total` | task lifecycle counters | completed tracks enqueue under steady state; failed/retried/dropped low |
-| `snowplow_refresher_skipped_no_entry_total` / `_skipped_no_handler_total` / `_skipped_stage_error_total` | skip reasons | informational |
-| `snowplow_refresher_queue_depth` | live workqueue `Len()` | near 0; climbing depth with stagnant `completed_total` = workers stuck (back-pressure) |
+| `snowplow_refresher_enqueue_total`, `snowplow_refresher_completed_total`, `snowplow_refresher_failed_total`, `snowplow_refresher_retried_total`, `snowplow_refresher_dropped_total` | task lifecycle counters. **1.12.6 C4:** `dropped` is terminal — a key dropped after its requeue budget is evicted at the drop point (see `_drop_evict_total`) or, for a confirmed 404, via `evict_self_gone_total` | completed tracks enqueue under steady state; failed/retried/dropped low |
+| `snowplow_refresher_skipped_no_entry_total`, `snowplow_refresher_skipped_no_handler_total`, `snowplow_refresher_skipped_stage_error_total` | skip reasons | informational |
+| `snowplow_refresher_queue_depth` | live workqueue `Len()` (gauge) | near 0; climbing depth with stagnant `completed_total` = workers stuck (back-pressure) |
 | `snowplow_refresher_yielded_total` | worker yield-parked for a customer `/call` | >0 under customer burst (if 0, hook broken) |
 | `snowplow_refresher_capped_total` | yield max-parked cap fired (proceeded anyway) | **near 0**; steady climb = inflight counter leaking or sustained pressure |
 | `snowplow_refresher_floored_total` | dequeue rate-floor deferred a key (entry younger than floor) | >0 under install-churn storm = the floor gate is protecting against re-resolve storms |
+| `snowplow_refresher_drop_evict_total` | **1.12.6 C4.** entries evicted at the drop point after a deterministic **non-404** failure exhausted the requeue budget and the breaker granted a token; tracker-side twin `evict_drop_point_total` under `snowplow_deps` | **0** on a healthy apiserver |
+| `snowplow_refresher_drop_evict_suspended_total` | **1.12.6 C4 — ALERT.** drop-point evictions the breaker (`REFRESH_DROP_EVICT_MAX_PER_MINUTE`, default 64) refused: a mass failure is in progress, the entries stayed resident and are still served (availability over freshness; bounded by the TTL) | **0**. Non-zero = an outage-shaped failure burst, not a cache defect |
+| `snowplow_refresher_suppressed_set_total` | **1.12.6 C4 / #191.** keys marked refresh-by-traffic-only after `REFRESH_SUPPRESS_AFTER_DECLINES` (default 3) consecutive identity-bound declines (first occurrence for external-endpoint and UAF cells) | low; each is one WARN → DEBUG transition |
+| `snowplow_refresher_suppressed_skips_total` | **1.12.6 C4 — ALERT pair.** refresh ticks skipped on a suppressed key (the #191 cure working) | proportional to suppressed keys × keep-warm ticks |
+| `snowplow_refresher_suppressed_keys` | live count of suppressed keys (gauge; cleared by the next real Put or eviction) | bounded by the store |
 
 ### Live refresh (SSE)
-Defined in `internal/cache/refresh_broadcaster_expvar.go`.
+Defined in `internal/cache/refresh_broadcaster_expvar.go`; one expvar key,
+`snowplow_refresh_broadcaster`, a `map{stat → value}` derived from the `RefreshBroadcasterStats`
+tags (1.12.6 C7). The OTLP mirror publishes each stat as
+`snowplow_refresh_broadcaster_<stat>` (counters gain `_total`).
 
-| expvar | meaning | healthy range |
+| stat | meaning | healthy range |
 |---|---|---|
-| `snowplow_refresh_broadcaster` | broadcaster counter snapshot (publishes, deliveries, subscriber counts, drops; 1.12.6 item 7: `armed_keys`, `max_sink_depth`, `evict_published`, `evict_deferred`, `stream_seconds_total`, `streams_closed_total`) | drops near 0; publishes track L1 commits under churn; `evict_deferred` climbing = the provisional pacing bound (`REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND` / `_BURST`) engaged — the number to re-tune from |
+| `published` | live-refresh signals published by the resolver / refresher on an L1 commit | tracks L1 commits under churn |
+| `delivered` | signals delivered into a subscriber's sink | tracks published × armed subscribers |
+| `dropped` | signals dropped because a subscriber's sink was full (slow consumer); the subscriber receives a terminal degrade signal instead and must refetch | **near 0**; sustained > 0 = a wedged consumer |
+| `coalesced` | signals collapsed by the per-key 250 ms coalesce window | informational |
+| `subscribers` | live `/refreshes` connections (gauge) | tracks open tabs |
+| `armed_keys` | **1.12.6 C11.** distinct L1 keys with ≥1 armed subscriber — the reverse-index size (gauge) | ≈ subscribers × keys per page; ≈95 MB at 3000 × 93 (0.4 % of the pod) |
+| `max_sink_depth` | **1.12.6 C12.** high-water mark of a subscriber sink after a send — consumer lag, 0..64 (gauge) | low; near 64 = a consumer about to drop |
+| `evict_published` | **1.12.6 C10.** DELETE-semantics evictions (informer DELETE, confirmed self-404) that reached ≥1 armed subscriber as a `refresh` frame. TTL, LRU, max-age and non-404 drop-point evictions stay silent by design | moves with deletions on watched pages |
+| `evict_deferred` | **1.12.6 C10.** eviction frames the per-subscriber token bucket (`REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND` 5, `_BURST` 10 — provisional) deferred into the pending set; never dropped, drained at the pace | > 0 only during a bulk delete — the proof the bound engaged |
+| `stream_seconds_total` | **1.12.6 C12.** accumulated `/refreshes` stream lifetime (seconds) | ÷ `streams_closed_total` = mean stream lifetime (live: ≈3,336 s; a collapse means something upstream is cutting streams, see the delivery-failure matrix row G1) |
+| `streams_closed_total` | **1.12.6 C12.** streams that ended (client close, hub reset, pod restart) | tracks reconnects |
+
+The key-space mismatch detector (loss modes L7/L8): `delivered == 0` while `subscribers > 0`
+and `published > 0` for longer than the coalesce window means the armed keys and the published
+keys are not the same keys — an identity drift on a long stream, or an SPA key-derivation
+change. No arm pins it (see the matrix); alert on the rule.
 
 ### RBAC snapshot + authz memo — subject-index freshness and serve-time eval cache
 
@@ -207,9 +255,30 @@ Defined in `internal/cache/refresh_broadcaster_expvar.go`.
 | expvar | meaning | healthy range |
 |---|---|---|
 | `snowplow_plurals_registered_gvrs` (`internal/cache/registered_gvrs_expvar.go`) | `{count, gvrs:[…], last_register_unix_ns}` — live set of GVRs with a registered informer | `count` tracks the cluster's served GVR set; two scrapes with identical `last_register_unix_ns` = informer set quiesced |
-| `snowplow_crd_discovery` (`internal/cache/crd_discovery_expvar.go`) | `map{events_enqueued, events_dropped, events_parked, events_processed, discovery_invoked, discovery_skipped_ng, deletes_processed, delete_skipped_ng, panics_recovered, relist_dirtymark_postsync_total, relist_postsync_timeout_total}`. **1.12.5**: `events_parked` counts submits that had to wait on a full queue; `events_dropped` is now a LAST RESORT after a 30s park, and a dropped DELETE means an informer is never torn down and its dependent L1 entries stay resident until TTL | `events_dropped`/`*_skipped_ng`/`panics_recovered` should be **0** — a non-zero `discovery_skipped_ng` is a flashing red flag (silent-skip defect class) |
+| `snowplow_crd_discovery` (`internal/cache/crd_discovery_expvar.go`) | `map{stat → value}` derived from the `CRDDiscoveryStats` tags (1.12.6 C7); mirrored to OTLP as `snowplow_crd_discovery{stat}`. Per-stat table below | `events_dropped`/`*_skipped_ng`/`panics_recovered` should be **0** |
 | `snowplow_crd_schema_memo_hits_total` / `_misses_total` / `_stale_dropped_total` / `_invalidations_total` (`internal/resolvers/crds/schema/schema_cache_metrics.go`) | compiled-CRD-schema memo counters | high hit ratio warm; stale-drops expected under concurrent CRD install |
 | `snowplow_sa_discovery_builds_total` / `_invalidations_total` / `_fallbacks_total` (`internal/dynamic/cached_client_metrics.go`) | SA-discovery client lifecycle | fallbacks low; climb = discovery degrading |
+
+#### `snowplow_crd_discovery` stats
+
+| stat | meaning | healthy range |
+|---|---|---|
+| `events_enqueued`, `events_processed` | CRD lifecycle events (ADD/UPDATE/DELETE) enqueued to / processed by the single discovery worker | processed tracks enqueued |
+| `events_parked` | **1.12.5.** submits that had to wait on a full queue (the worker fell 256 events behind; the informer processor goroutine parks up to 30 s) | 0 on a stable cluster; bursts during a bulk CRD install |
+| `events_dropped` | lifecycle events dropped after the park deadline — the last resort. A dropped DELETE means an informer is never torn down and its dependent L1 entries stay resident until TTL | **0** |
+| `discovery_invoked` | ADD/UPDATE passes that ran `DiscoverGroupResources` | tracks CRD churn |
+| `discovery_skipped_ng` | ADD/UPDATE decode-skip / no-group / no-SA-rc | **0** — a non-zero value is the silent-skip defect class |
+| `deletes_processed` | successful DELETE teardowns (informer removed, dependents dirty-marked) | tracks CRD deletions |
+| `delete_skipped_ng` | DELETE decode-skip / no-served-versions / no-plural | **0** |
+| `panics_recovered` | discovery passes that panicked (recovered; the worker survives) | **0** |
+| `schema_relists_fired` | ADD/UPDATE passes that relisted ≥1 GVR on a detected structural-schema change | tracks CRD schema churn |
+| `schema_unchanged` | ADD/UPDATE where the schema fingerprint was unchanged (thrash guard; no relist) | informational |
+| `relist_dirtymark_postsync_total` | **1.12.5.** post-sync re-fires of the relist dirty-mark (the containment for the teardown window; stays until the bridge below has soaked) | tracks `schema_relists_fired`; lagging it = relisted informers are not syncing |
+| `relist_postsync_timeout_total` | **1.12.5.** relisted GVRs whose new informer did not sync in time (the re-fire could not run) | **0** |
+| `relist_bridge_runs_total` | **1.12.6 C2.** relist delta bridges spawned (one per relisted GVR with a registered indexer): the old indexer's key set is snapshotted before teardown and diffed against the fresh LIST | tracks `schema_relists_fired` |
+| `relist_bridge_enqueued_total` | **1.12.6 C2.** coordinates the bridge synthesised (old keys the fresh LIST omits) and handed to the dep-event worker, which probes ABSENT and evicts — the DELETEs a fresh informer never emits | moves only when objects vanish inside a teardown window |
+| `relist_bridge_timeout_total` | **1.12.6 C2 — the SOAK SIGNAL.** bridges that gave up because the fresh informer never synced (`RELIST_BRIDGE_TIMEOUT_SECONDS`). The 1.12.5 re-fire is retired only after this has stayed at **0** across real CRD schema changes on a healthy cluster; > 0 means the bridge is not covering the window and the re-fire must stay | **0** |
+| `relist_bridge_aborted_total` | **1.12.6 C2.** bridges with nothing to diff (no sync channel / GVR removed while waiting) | 0; small on CRD deletions |
 
 ### Dependency tracker + DELETE eviction bridge — "is invalidation actually happening?" (1.12.5)
 Defined in `internal/cache/deps_expvar.go`; counters in `deps.go` (`DepStats`) and
@@ -229,6 +298,10 @@ The stats that answer an invalidation question:
 
 | stat | meaning | healthy range |
 |---|---|---|
+| `records`, `max_records`, `record_total` | live dep records (an L1 key ↔ object edge), the `DEPS_MAX_RECORDS` ceiling, and the cumulative number recorded | `records` well under `max_records` |
+| `dropped_cap` | dep edges **silently dropped** because `records` hit `max_records`: the entry becomes dirty-markable-but-not-evictable (the #187 H4 shape) and only its TTL or the max-age bound can remove it. The reconcile audit counts these under `reconcile_skipped_no_edge_total`; it cannot repair them | **0** — alert on it and raise `DEPS_MAX_RECORDS` |
+| `dropped_no_key` | edge registrations that arrived with an empty L1 key (a caller bug; counted, never stored) | **0** |
+| `remove_l1_total` | L1 keys whose dep records were removed (entry evicted or re-Put with a new edge set) | tracks evictions |
 | `evict_delete_total` | L1 entries evicted by an **informer DELETE** (`OnDelete` bucket 1). Deliberately does NOT include the refresher's self-404 evictions — one counter, one meaning | moves whenever a CR with a live L1 entry is deleted. **Frozen across a known deletion = DELETE handling is not reaching the store** — the strongest single test, and it only works because this counter is not folded |
 | `evict_self_gone_total` | L1 entries evicted because the refresher's re-fetch of their own object returned a confirmed **404** across the **whole** requeue budget — 404 ONLY; the 1.12.6 non-404 drop-point evictions are `evict_drop_point_total` below, so this counter keeps meaning "the object is confirmed gone" even during an apiserver outage | non-zero is **normal** on a cluster that deletes CRs |
 | `evict_drop_point_total` | **1.12.6 C4.** L1 entries evicted at the refresher drop point after a deterministic **non-404** failure (403/500/timeout/parse/not-servable) exhausted the requeue budget and the breaker granted a token. Tracker-side twin of `snowplow_refresher_drop_evict_total` (they differ only when the entry had already gone by another route). Counted apart from both `evict_delete_total` and `evict_self_gone_total` — one counter, one meaning | **0** on a healthy apiserver. Climbing = deterministic non-404 failures are being evicted; if `snowplow_refresher_drop_evict_suspended_total` climbs with it, a mass failure is in progress and the breaker is holding the rest resident |
@@ -244,8 +317,6 @@ The stats that answer an invalidation question:
 | `snowplow_refresher_drop_evict_total` | **1.12.6.** entries evicted at the drop point after a deterministic **non-404** failure exhausted the requeue budget (403/500/timeout/parse/not-servable); the `refresher.refresh_dropped` WARN now says `entry EVICTED`. OTLP twin: `snowplow_refresher{stat="drop_evict"}` | non-zero is normal on a cluster with dead objects or broken RESTActions. Every one is an entry that used to sit stale until the 1 h TTL |
 | `snowplow_refresher_drop_evict_suspended_total` | **1.12.6.** drop-point evictions refused by the breaker (`REFRESH_DROP_EVICT_MAX_PER_MINUTE`); the key kept the old drop-to-TTL. OTLP twin: `snowplow_refresher{stat="drop_evict_suspended"}` — the alert lives on that series, not on `/debug/vars` | **0** on a healthy apiserver. Climbing = a mass failure is in progress (one `refresher.drop_evict_suspended` WARN per window names it) or the budget is too low |
 | `snowplow_refresher_suppressed_set_total` / `_suppressed_keys` / `_suppressed_skips_total` | **1.12.6 (#191).** keys marked refresh-by-traffic-only after K consecutive declines (or one permanent decline), the live count of such keys, and dequeues skipped because of the marker. OTLP twins: `snowplow_refresher{stat="suppressed_set"}` / `{stat="suppressed_skips"}` (counters) and the `snowplow_refresher_suppressed_keys` gauge (it drops on `Put` and eviction, so it cannot ride the cumulative counter) | `suppressed_skips_total` climbing while the stage-error WARN is **flat** is the #191 cure working; `suppressed_keys` is bounded by the store — it drops on `Put` and eviction |
-| `dropped_cap` | dep edges dropped because `DEPS_MAX_RECORDS` was reached | **0**. Non-zero means new edges are being dropped silently, leaving entries dirty-markable but not evictable |
-| `records` / `max_records` | dep-record occupancy vs its ceiling | `records` well under `max_records` |
 | `dirty_mark_total` / `enqueue_update_total` | stale-while-revalidate marks from ADD/UPDATE and from DELETE buckets 2/3 | tracks cluster churn |
 | `add_propagated` / `add_dropped_pre_sync` / `add_nil_syncch` | the ADD initial-replay gate | `add_nil_syncch` should be **0** (a registration path skipped the syncCh allocation; dep marks for that GVR degrade to TTL) |
 | `reconcile_divergence_total` | **1.12.6 C3** — coordinates the sampled reconcile audit found whose own object is ABSENT from a synced indexer, that a resident entry still holds a self dep edge for, and that no event had evicted: each one is a DELETE the pipeline lost, re-derived from the indexer and handed to the dep-event worker (`internal/cache/deps_reconcile.go`). Entries the worker could NOT evict (no edge — see `reconcile_skipped_no_edge_total`) are kept out of it | **0** on a healthy cluster. A rate that does not fall back to zero between ticks means a handler, the queue or the relist bridge is dropping events — alert on it. The per-tick `cache.deps_reconcile.divergence` WARN names up to three coordinates |
@@ -335,6 +406,48 @@ Defined in `internal/cache/controller_health_expvar.go` / `controller_health.go`
 
 ---
 
+## Delivery-failure matrix (1.12.6 C8)
+
+One row per way a change to a Kubernetes object can fail to reach the browser, along the whole
+path **informer → dep-event worker → refresher → L1 store → `/refreshes` broadcaster → agent
+gateway → SPA**. Each row names the counter that DETECTS the loss and the arm (test name) that
+PINS the fix. A row with no counter or no arm is **OPEN**, never omitted — the table exists to
+show where the pipeline is still blind, not to list what works.
+`TestC8_DeliveryFailureMatrix_EveryRowNamesLiveCountersAndArms` parses this table and fails the
+build when a named counter is not published or a named arm does not exist, so the matrix cannot
+rot. Detector names are `<expvar>.<stat>` for map families or a bare expvar key.
+
+<!-- c8-matrix:begin -->
+| # | hop | loss mode | detector | arm | status |
+|---|---|---|---|---|---|
+| I1 | informer → worker | the DELETE handler's worker dies on a panic; every later eviction is lost (the 1.12.5 #187 H1 defect) | `snowplow_deps.delete_worker_panics_total` (each = one lost eviction), `snowplow_deps.evict_delete_total` frozen across a known deletion | `TestIssue187_A4_DeleteWorkerSurvivesAPanic`, `TestIssue187_A4b_DeleteWorkerSurvivesAConcurrentPanicStorm` | PINNED — the worker is supervised; a panic costs one event, counted |
+| I2 | informer → worker | a CRD schema relist swaps the informer; an object deleted inside the teardown window never produces a DELETE | `snowplow_crd_discovery.relist_bridge_enqueued_total` (the bridge saw it), `snowplow_crd_discovery.relist_bridge_timeout_total` (the bridge could not run — the soak signal), `snowplow_crd_discovery.relist_dirtymark_postsync_total` (the 1.12.5 containment) | `TestIssue1126_E1_RelistBridgeEvictsTheObjectTheFreshListOmits`, `TestIssue1126_E3_RelistBridgeTimeoutIsCountedAndEnqueuesNothing`, `TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry` | PINNED — additive: bridge + re-fire until the timeout counter has soaked at 0 |
+| I3 | informer → worker | the CRD lifecycle queue overflows and drops a DELETE (an informer is never torn down; dependents stay resident until TTL) | `snowplow_crd_discovery.events_dropped`, `snowplow_crd_discovery.events_parked` | `TestCRDLifecycleQueue_OverflowParksAndNeverDrops`, `TestCRDLifecycleQueue_ParkGivesUpOnShutdown` | PINNED — park-and-drain; a drop is a last resort after 30 s and counted |
+| W1 | worker | the indexer is not authoritative (unsynced, watch broken, relist window) and the coordinate stays UNKNOWN past the requeue budget | `snowplow_deps.probe_unknown_total`, `snowplow_deps.probe_unknown_degraded_total` | `TestIssue1126_C2_UnknownDegradesToDirtyMarkAfterTheBudget`, `TestIssue1126_E2_TeardownWindowEvictsNothing` | PINNED — degrades to a dirty-mark; the refresher decides against the apiserver |
+| W2 | worker | the entry holds no dep edge (`dropped_cap`), so the worker's ABSENT verdict cannot reach it; the body is served until TTL / max age | `snowplow_deps.dropped_cap`, `snowplow_deps.reconcile_skipped_no_edge_total` | `TestIssue1126_C3_FU2_NoEdgeEntryIsCountedApartAndNeverPinsDivergence` | OPEN — detected, NOT repaired: the audit counts it apart and does not submit a coordinate that would evict nothing; the fix is `DEPS_MAX_RECORDS` |
+| W3 | worker | any lost DELETE not covered above (unknown cause) leaves a stranded entry | `snowplow_deps.reconcile_divergence_total` (detector; ≈1.6 h to first visit, ≈7.5 h to 99 % at 512/30 s — NOT a staleness bound) | `TestIssue1126_D2_ReconcileTickerEvictsAStrandedEntry`, `TestIssue1126_D2c_ReconcileOnceCountsExactlyAndSkipsUnknown` | PINNED as a detector; the TTL (3600 s) remains the bound |
+| R1 | refresher | the re-fetch of the entry's own object returns a confirmed 404 | `snowplow_deps.evict_self_gone_total`, `snowplow_deps.self_notfound_evict_total` | `TestIssue187_B3b_SelfGoneEvictsAtTheDropPoint`, `TestIssue187_B2E2E_RefresherSelfNotFoundEvictsThroughTheRealLoop` | PINNED — evicted at the drop point after the full budget |
+| R2 | refresher | a deterministic non-404 failure (403 / 500 / timeout / parse / not-servable) used to drop the key and keep the body until TTL | `snowplow_refresher_drop_evict_total`, `snowplow_deps.evict_drop_point_total` | `TestIssue1126_C4_F4_DeterministicNon404IsEvictedAtTheDropPoint`, `TestRefreshTerminal_F5a_FewDeterministicFailuresAreEvicted`, `TestIssue1126_C4_F7_ApistageNotServableIsEvictedAtTheDropPoint` | PINNED — evicted behind the breaker (`REFRESH_DROP_EVICT_MAX_PER_MINUTE`) |
+| R3 | refresher | a mass failure (apiserver outage): the breaker refuses eviction and stale bodies are served on purpose | `snowplow_refresher_drop_evict_suspended_total` (ALERT) | `TestRefreshTerminal_F5b_MassFailureIsSuspendedAndStillServed` | PINNED by design — availability over freshness, bounded by the TTL; the counter is the alert |
+| R4 | refresher | an identity-bound inner stage keeps declining under the service account; the key is refreshed only by traffic (#191) | `snowplow_refresher_suppressed_set_total`, `snowplow_refresher_suppressed_skips_total`, `snowplow_refresher_suppressed_keys` | `TestIssue1126_C4_F6_StageErrorDeclinesSuppressThenPutResumes`, `TestIssue1126_C4_F6n_EmptyFullDeclinesSuppressAfterKNotAfterOne` | PINNED — suppression after `REFRESH_SUPPRESS_AFTER_DECLINES`, cleared by the next Put |
+| R5 | refresher | a poison key is dropped after the requeue cap | `snowplow_refresher_dropped_total` | `TestRefresher_PoisonPillDroppedAfterCap` | PINNED — since C4 a drop is terminal (R1/R2), never "forget the key, keep the body" |
+| S1 | store | keep-warm re-Puts let an entry outlive its object forever | `snowplow_resolved_cache.evict_max_age_total` | `TestMaxEntryAge_G1_RePutsDoNotExtendTheLifetime`, `TestMaxEntryAge_G1c_BornAtInheritedAndCountedSeparately` | PINNED — 24 h bound (`RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS`) |
+| S2 | store | an in-flight cold Put lands after the DELETE and resurrects the pre-delete body | — | `TestIssue187_A5_InFlightColdDispatchCannotResurrectPreDeleteBody` | OPEN detector — pinned by the arm for the cold-dispatch shape; the general race needs a generation counter (#189) and has no counter |
+| B1 | broadcaster | a DELETE-semantics eviction published nothing, so the browser never learned (1.12.5 and earlier) | `snowplow_refresh_broadcaster.evict_published` | `TestRefreshes_S1_DeleteEvictionWritesRefreshFrame`, `TestRefreshes_S1b_SelfGoneEvictionWritesRefreshFrame`, `TestRefreshEviction_S1d_TTLAndLRU_Silent` | PINNED — 1.12.6 C10; TTL / LRU / max-age / drop-point stay silent by design |
+| B2 | broadcaster | a bulk delete would fan out an unbounded cold-refetch burst; excess frames are deferred by the per-subscriber bucket | `snowplow_refresh_broadcaster.evict_deferred` | `TestRefreshes_S9_BurstIsPacedAndComplete`, `TestRefreshes_S9b_PendingNeverExceedsArmed`, `TestRefreshEviction_Pace_DeferredNeverDroppedDedup` | PINNED — deferred, never dropped; pending ≤ armed |
+| B3 | broadcaster | a slow consumer's sink fills and a signal is dropped | `snowplow_refresh_broadcaster.dropped`, `snowplow_refresh_broadcaster.max_sink_depth` | `TestRefreshBroadcaster_SlowConsumerNeverStalls`, `TestRefreshBroadcaster_DroppedTerminalSignalDegrades` | PINNED — the subscriber gets a terminal degrade signal and must refetch; the refresher never stalls |
+| B4 | broadcaster | key-space mismatch on a long stream (identity drift, SPA key-derivation change): frames are published but never match an armed key (L7/L8) | rule: `snowplow_refresh_broadcaster.delivered` == 0 while `snowplow_refresh_broadcaster.subscribers` > 0 and `snowplow_refresh_broadcaster.published` > 0 | — | OPEN — the rule is the only detector; no arm drives a real drift |
+| B5 | broadcaster | hub reset / pod restart ends every stream; frames published before the client reconnects are gone (no replay, by design) | `snowplow_refresh_broadcaster.streams_closed_total`, `snowplow_refresh_broadcaster.stream_seconds_total` | `TestRefreshes_S5_HubResetOldStreamIdleNewStreamDelivers`, `TestRefreshes_S5_ReconnectArmsAfreshAndDelivers` | OPEN on the client half — the server re-arms afresh (pinned); recovery is the SPA's re-validation (frontend#256, howto §9) |
+| G1 | gateway | a proxy-side cut, buffer or timeout silently ends or stalls every stream (`traffic.timeouts.request`, `traffic.buffer`, `traffic.retry`, `rateLimit` on the route) | — (indirect only: the mean stream lifetime `snowplow_refresh_broadcaster.stream_seconds_total` ÷ `snowplow_refresh_broadcaster.streams_closed_total` collapsing) | — | OPEN — no snowplow-side counter can see the hop; S8 measured the route clean today; a configuration hazard with a never-add table in the howto §11 and the chart review checklist |
+| C1 | SPA | reconnect gap: a frame published while the tab was disconnected is gone (L4) | — | — | OPEN — the client owns recovery: re-validate on transport loss through the single bounded queue (frontend#256, howto §9) |
+| C2 | SPA | the 5 s per-widget throttle discards a second frame inside the window instead of deferring it (L5) | — | — | OPEN — frontend#256 (trailing catch-up) |
+| C3 | SPA | a 401 on `/refreshes` is retried forever at the backoff ceiling instead of re-authenticating (S13; 553 gateway rejections in one window) | — (gateway-side JwtAuth rejection logs only) | — | OPEN — frontend#256 (session resume) |
+| C4 | SPA | the subscription is truncated at the 16 KiB `?sub=` cap (≈93 coordinates); tail widgets silently never arm and miss every frame | — (the cap is enforced silently on both sides today) | — | OPEN — frontend#256 makes the truncation loud; design rev 4.1 A2.5 (coarse subscribe / precise publish) removes the cap |
+<!-- c8-matrix:end -->
+
+Rows marked OPEN on the SPA side are tracked in `krateo-platformops/frontend#256`; the
+integration contract they implement is `docs/howto-frontend-live-refresh-sse.md` §9–§11.
+
 ## Key `slog` events
 
 JSON structured logs on stdout. Message strings are stable, dotted, and greppable. The
@@ -415,5 +528,15 @@ from compression buffering.
   `/readyz`; the chart actually points **startupProbe → `/health`** (with a
   long failure budget) and only the readinessProbe at `/readyz`.
 - The observability surface used to be expvar/slog/pprof only; the OTel export
-  (traces + expvar-mirror metrics + log/audit bridge) is additive and
-  default-off — enabling it changes no expvar semantics.
+  (traces + expvar-mirror metrics + log/audit bridge) is additive and, since
+  1.12.4, default-on — disabling it changes no expvar semantics.
+- **1.12.6 C7.** Three metric families (`snowplow_crd_discovery`,
+  `snowplow_refresh_broadcaster`, `snowplow_refresher_*`) are now DERIVED from
+  `stat` tags on their snapshot structs (`internal/cache/stats_by_tag.go`):
+  expvar, the OTLP mirror, this document and the parity arms all read the same
+  tag set, so a counter cannot again reach `/debug/vars` and miss ClickStack
+  (three did in 1.12.6 before C7: the five C4 refresher counters, seven
+  `snowplow_crd_discovery` stats including the whole relist bridge, and the six
+  C12 broadcaster instruments, which were created but never registered with
+  the observable callback). `TestC7_Docs_EveryPublishedStatIsDocumented` fails
+  the build when a published stat is not named in this file.

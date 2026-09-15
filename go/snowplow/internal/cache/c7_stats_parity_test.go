@@ -101,6 +101,22 @@ func expvarVars(t *testing.T) map[string]json.RawMessage {
 	return all
 }
 
+// withLiveResolvedCache builds the L1 store so ResolvedCacheStatsByStat()
+// reports the real key set (it is an EMPTY map before the store exists, which
+// would make a docs guard vacuous).
+func withLiveResolvedCache(t *testing.T) {
+	t.Helper()
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	resetResolvedCacheForTest()
+	t.Cleanup(resetResolvedCacheForTest)
+	if ResolvedCache() == nil {
+		t.Fatal("setup: ResolvedCache() returned nil with both gates on")
+	}
+	if len(ResolvedCacheStatsByStat()) == 0 {
+		t.Fatal("setup: ResolvedCacheStatsByStat() is empty with a live store")
+	}
+}
+
 func registerAllExpvarForTest() {
 	RegisterExpvarForTest() // refresher + crd_discovery (+ fallthrough, controller health)
 	RegisterRefreshBroadcasterExpvarForTest()
@@ -158,6 +174,7 @@ func observabilityDoc(t *testing.T) string {
 
 func TestC7_Docs_EveryPublishedStatIsDocumented(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
+	withLiveResolvedCache(t)
 	doc := observabilityDoc(t)
 	missing := func(family, name string) {
 		t.Errorf("observability.md does not name `%s` (%s) — an operator cannot read a counter the doc does not list", name, family)

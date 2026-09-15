@@ -99,13 +99,13 @@ func terminalRun(t *testing.T, c *ResolvedCacheStore, keys []string, handler Ref
 // resetRefresherForTestKeepTerminalCounters drains the pool but leaves the
 // breaker counters readable for the assertions that follow.
 func resetRefresherForTestKeepTerminalCounters() {
-	if refresherInstance != nil {
-		refresherInstance.queue.ShutDown()
-		if refresherInstance.clusterListQueue != nil {
-			refresherInstance.clusterListQueue.ShutDown()
+	if r := refresherPeek(); r != nil {
+		r.queue.ShutDown()
+		if r.clusterListQueue != nil {
+			r.clusterListQueue.ShutDown()
 		}
 		done := make(chan struct{})
-		go func() { refresherInstance.workersWG.Wait(); close(done) }()
+		go func() { r.workersWG.Wait(); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
@@ -250,7 +250,7 @@ func TestRefreshTerminal_F6m_SuppressAfterKDeclinesAndClearOnPut(t *testing.T) {
 	// a suppressed skip, not left to force-miss an arbitrarily later dequeue.
 	// Stored before the enqueue so the worker cannot outrun the store.
 	n3GVR := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "flexes"}
-	refresherInstance.triggerGVRByKey.Store(key, n3GVR)
+	refresherPeek().triggerGVRByKey.Store(key, n3GVR)
 
 	// The (K+1)th dequeue must NOT invoke the handler. BEHAVIOUR FIRST: wait
 	// for either outcome (the skip was counted, or the handler ran a 4th
@@ -271,7 +271,7 @@ func TestRefreshTerminal_F6m_SuppressAfterKDeclinesAndClearOnPut(t *testing.T) {
 	if reason, ok := RefreshSuppressedReason(key); !ok || reason != "stage_error" {
 		t.Fatalf("F6m: key not marked suppressed after 3 consecutive declines (reason=%q ok=%v)", reason, ok)
 	}
-	if v, present := refresherInstance.triggerGVRByKey.Load(key); present {
+	if v, present := refresherPeek().triggerGVRByKey.Load(key); present {
 		t.Fatalf("F6m RED (N3): the suppressed skip left the trigger GVR %v in triggerGVRByKey — "+
 			"it would force-miss whatever dequeue first runs after the next real Put", v)
 	}
@@ -298,7 +298,7 @@ func TestRefreshTerminal_B1_SnapshotRacesFirstConstructionWithoutConstructing(t 
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
 	resetRefresherForTest()
-	if refresherInstance != nil {
+	if refresherPeek() != nil {
 		t.Fatal("precondition: singleton must not exist")
 	}
 
@@ -325,7 +325,7 @@ func TestRefreshTerminal_B1_SnapshotRacesFirstConstructionWithoutConstructing(t 
 	// And in isolation: a read on a clean process must not construct.
 	resetRefresherForTest()
 	_ = RefreshTerminalStatsSnapshot()
-	if refresherInstance != nil {
+	if refresherPeek() != nil {
 		t.Fatal("B1: RefreshTerminalStatsSnapshot constructed the refresher singleton")
 	}
 }

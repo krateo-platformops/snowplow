@@ -42,6 +42,9 @@ type StatSpec struct {
 	Float bool
 	// Field is the Go field name, for error messages only.
 	Field string
+	// Desc is the `desc` tag: the OTLP instrument description for a
+	// per-stat instrument (ignored on a shared, stat-labelled one).
+	Desc string
 }
 
 // statSpecsOf lists the published stats of a tagged struct type, in
@@ -78,6 +81,7 @@ func statSpecsOf(t reflect.Type) []StatSpec {
 			Kind:  kind,
 			Float: f.Type.Kind() == reflect.Float32 || f.Type.Kind() == reflect.Float64,
 			Field: f.Name,
+			Desc:  f.Tag.Get("desc"),
 		})
 	}
 	return out
@@ -186,6 +190,11 @@ type StatFamily struct {
 	OTelName string
 	// OTelPrefix is the per-stat OTLP instrument prefix when OTelName is "".
 	OTelPrefix string
+	// Desc describes the shared OTLP instrument (OTelName).
+	Desc string
+	// Values reads the live family as stat -> value (int64 or float64) —
+	// the ONE map expvar and the OTLP mirror both publish.
+	Values func() map[string]any
 	// Specs are the published stats derived from the struct tags.
 	Specs []StatSpec
 	// Untagged are numeric fields with no stat tag — must be empty.
@@ -205,6 +214,8 @@ func TaggedStatFamilies() []StatFamily {
 		{
 			Expvar:   "snowplow_crd_discovery",
 			OTelName: "snowplow_crd_discovery",
+			Desc:     "CRD-discovery bridge counters, labelled by stat.",
+			Values:   func() map[string]any { return statsByTag(CRDDiscoveryStatsSnapshot()) },
 			Specs:    statSpecsOf(reflect.TypeOf(CRDDiscoveryStats{})),
 			Untagged: untaggedNumericFields(reflect.TypeOf(CRDDiscoveryStats{})),
 			typ:      reflect.TypeOf(CRDDiscoveryStats{}),
@@ -212,6 +223,7 @@ func TaggedStatFamilies() []StatFamily {
 		{
 			Expvar:     "snowplow_refresh_broadcaster",
 			OTelPrefix: "snowplow_refresh_broadcaster_",
+			Values:     RefreshBroadcasterStatsByStat,
 			Specs:      statSpecsOf(reflect.TypeOf(RefreshBroadcasterStats{})),
 			Untagged:   untaggedNumericFields(reflect.TypeOf(RefreshBroadcasterStats{})),
 			typ:        reflect.TypeOf(RefreshBroadcasterStats{}),
@@ -220,6 +232,8 @@ func TaggedStatFamilies() []StatFamily {
 			ExpvarPrefix: "snowplow_refresher_",
 			OTelName:     "snowplow_refresher",
 			OTelPrefix:   "snowplow_refresher_",
+			Desc:         "Refresher worker-pool counters, labelled by stat.",
+			Values:       refresherStatsValues,
 			Specs:        refresherStatSpecs(),
 			Untagged: append(untaggedNumericFields(reflect.TypeOf(refresherStats{})),
 				untaggedNumericFields(reflect.TypeOf(RefreshTerminalStats{}))...),

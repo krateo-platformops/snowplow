@@ -742,17 +742,17 @@ type RefreshBroadcasterStats struct {
 	// "_total" appended to a counter that does not already carry it
 	// (StatFamily.OTelInstrumentName). Expvar, OTLP, docs guard and parity
 	// arm all read these tags — nothing here is copied by hand.
-	Published          uint64  `stat:"published"`
-	Delivered          uint64  `stat:"delivered"`
-	Dropped            uint64  `stat:"dropped"`
-	Coalesced          uint64  `stat:"coalesced"`
-	Subscribers        int     `stat:"subscribers" kind:"gauge"`
-	ArmedKeys          int     `stat:"armed_keys" kind:"gauge"`
-	MaxSinkDepth       int64   `stat:"max_sink_depth" kind:"gauge"`
-	EvictPublished     uint64  `stat:"evict_published"`
-	EvictDeferred      uint64  `stat:"evict_deferred"`
-	StreamSecondsTotal float64 `stat:"stream_seconds_total"`
-	StreamsClosedTotal uint64  `stat:"streams_closed_total"`
+	Published          uint64  `stat:"published" desc:"Live-refresh signals published."`
+	Delivered          uint64  `stat:"delivered" desc:"Live-refresh signals delivered to subscribers."`
+	Dropped            uint64  `stat:"dropped" desc:"Live-refresh signals dropped (slow consumer)."`
+	Coalesced          uint64  `stat:"coalesced" desc:"Live-refresh signals coalesced."`
+	Subscribers        int     `stat:"subscribers" kind:"gauge" desc:"Current live-refresh subscriber count."`
+	ArmedKeys          int     `stat:"armed_keys" kind:"gauge" desc:"Distinct L1 keys with at least one armed live-refresh subscriber (reverse-index size)."`
+	MaxSinkDepth       int64   `stat:"max_sink_depth" kind:"gauge" desc:"High-water mark of a subscriber sink after a send (consumer lag, 0..64)."`
+	EvictPublished     uint64  `stat:"evict_published" desc:"Eviction-driven live-refresh publishes that reached at least one subscriber."`
+	EvictDeferred      uint64  `stat:"evict_deferred" desc:"Eviction-driven signals deferred by the per-subscriber token bucket (the bound engaged)."`
+	StreamSecondsTotal float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
+	StreamsClosedTotal uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
 }
 
 // refreshBroadcasterStatsOverride, when set, replaces the live snapshot.

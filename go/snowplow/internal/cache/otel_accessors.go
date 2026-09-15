@@ -182,10 +182,7 @@ func RefresherSnapshot() (enqueued, completed, failed, retried, dropped,
 	yielded, capped, floored uint64, queueDepth int64) {
 
 	s := refresherStatsSnapshot()
-	r := refresherInstance
-	if r != nil && r.queue != nil {
-		queueDepth = int64(r.queue.Len())
-	}
+	queueDepth = s.queueDepth
 	return s.enqueued, s.completed, s.failed, s.retried, s.dropped,
 		s.skippedNoEntry, s.skippedNoHandler, s.skippedStageError,
 		s.yielded, s.capped, s.floored, queueDepth

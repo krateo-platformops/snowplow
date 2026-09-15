@@ -357,7 +357,12 @@ type refresher struct {
 }
 
 var (
-	refresherInstance *refresher
+	// refresherInstance is the process-wide singleton, stored ONCE by
+	// refresherSingleton and read WITHOUT constructing by refresherPeek.
+	// An atomic pointer (1.12.6 C7 / #203): the telemetry surfaces
+	// (/debug/vars, the OTLP callback) read it concurrently with the first
+	// enqueue's construction, and a plain pointer read there is the B1 race.
+	refresherInstance atomic.Pointer[refresher]
 	refresherInit     sync.Once
 )
 
@@ -366,7 +371,7 @@ var (
 // this (#203): a /debug/vars scrape or an OTLP collection on a cache-off pod
 // must not build the two workqueues (and their waitingLoop goroutines) it is
 // reporting on.
-func refresherPeek() *refresher { return refresherInstance }
+func refresherPeek() *refresher { return refresherInstance.Load() }
 
 // refresherSingleton returns the process-wide refresher, constructing
 // it lazily.
@@ -387,15 +392,15 @@ func refresherSingleton() *refresher {
 			time.Duration(baseMS)*time.Millisecond,
 			time.Duration(maxMS)*time.Millisecond,
 		)
-		refresherInstance = &refresher{
+		refresherInstance.Store(&refresher{
 			parallelism:      parallelism,
 			queue:            workqueue.NewTypedRateLimitingQueue[string](rl),
 			clusterListQueue: workqueue.NewTypedRateLimitingQueue[string](clRL),
 			handlers:         map[string]RefreshFunc{},
 			dropEvict:        newDropEvictBreaker(RefreshDropEvictMaxPerMinute()),
-		}
+		})
 	})
-	return refresherInstance
+	return refresherInstance.Load()
 }
 
 // rateFloor returns the active #318-R1a per-key re-resolve rate-floor as a
@@ -1030,12 +1035,12 @@ type refresherStats struct {
 	dropped           uint64 `stat:"dropped"`
 	skippedNoEntry    uint64 `stat:"skipped_no_entry"`
 	skippedNoHandler  uint64 `stat:"skipped_no_handler"`
-	skippedStageError uint64 `stat:"skipped_stage_error"`      // Ship 0.30.120 layer (b)
-	selfNotFoundEvict uint64 `stat:"-"`                        // 1.12.5 / #187 (i) — published as snowplow_deps.self_notfound_evict_total (deps_expvar.go), beside its tracker-side twin
-	yielded           uint64 `stat:"yielded"`                  // Ship #98 — customer-priority yields
-	capped            uint64 `stat:"capped"`                   // Ship #98 — max-parked cap hits
-	floored           uint64 `stat:"floored"`                  // Task #321 (#318-R1a) — rate-floor deferrals
-	queueDepth        int64  `stat:"queue_depth" kind:"gauge"` // live workqueue Len(); 0 before the pool is built
+	skippedStageError uint64 `stat:"skipped_stage_error"`                                                                                               // Ship 0.30.120 layer (b)
+	selfNotFoundEvict uint64 `stat:"-"`                                                                                                                 // 1.12.5 / #187 (i) — published as snowplow_deps.self_notfound_evict_total (deps_expvar.go), beside its tracker-side twin
+	yielded           uint64 `stat:"yielded"`                                                                                                           // Ship #98 — customer-priority yields
+	capped            uint64 `stat:"capped"`                                                                                                            // Ship #98 — max-parked cap hits
+	floored           uint64 `stat:"floored"`                                                                                                           // Task #321 (#318-R1a) — rate-floor deferrals
+	queueDepth        int64  `stat:"queue_depth" kind:"gauge" desc:"Live refresher workqueue depth; climbing with stagnant completed = workers stuck."` // 0 before the pool is built
 
 	// Path 3.2 / 0.30.218 — per-tier observability for the two-tier
 	// priority queue. Read by ClusterListRefresherStats for the Path 3.2
@@ -1045,7 +1050,9 @@ type refresherStats struct {
 }
 
 func refresherStatsSnapshot() refresherStats {
-	r := refresherSingleton()
+	// #203: a telemetry read never constructs the pool. Before the first
+	// enqueue (and forever on a cache-off pod) every counter reads zero.
+	r := refresherPeek()
 	if r == nil {
 		return refresherStats{}
 	}
@@ -1134,13 +1141,17 @@ var ErrSelfObjectGone = errors.New("self object gone (apiserver 404 on the entry
 // returned a definite apiserver 404 (1.12.5 / #187 (i)). Read by the
 // expvar + OTLP surfaces.
 func RefresherSelfNotFoundEvictTotal() uint64 {
-	return refresherSingleton().selfNotFoundEvict.Load()
+	r := refresherPeek() // #203: never construct from a scrape
+	if r == nil {
+		return 0
+	}
+	return r.selfNotFoundEvict.Load()
 }
 
 // ClusterListRefresherStats exposes the Path 3.2 two-tier counters for
 // OBS-1 expvar wiring + falsifier tests. Read-only snapshot.
 func ClusterListRefresherStats() (enqueued, completed uint64) {
-	r := refresherSingleton()
+	r := refresherPeek() // #203: never construct from a scrape
 	if r == nil {
 		return 0, 0
 	}
@@ -1155,22 +1166,22 @@ func ClusterListRefresherStats() (enqueued, completed uint64) {
 // has actually exited. Without this barrier, a worker mid-processOne
 // can race with the next test's resetResolvedCacheForTest.
 func resetRefresherForTest() {
-	if refresherInstance != nil {
+	if r := refresherInstance.Load(); r != nil {
 		// Clear cluster_list tier registry so a future singleton starts
 		// with no inherited memberships.
-		refresherInstance.clusterListKeys.Range(func(k, _ any) bool {
-			refresherInstance.clusterListKeys.Delete(k)
+		r.clusterListKeys.Range(func(k, _ any) bool {
+			r.clusterListKeys.Delete(k)
 			return true
 		})
-		refresherInstance.queue.ShutDown()
-		if refresherInstance.clusterListQueue != nil {
-			refresherInstance.clusterListQueue.ShutDown()
+		r.queue.ShutDown()
+		if r.clusterListQueue != nil {
+			r.clusterListQueue.ShutDown()
 		}
 		// Wait for workers to drain + exit. Capped at 5s as a defensive
 		// deadline that should never fire.
 		done := make(chan struct{})
 		go func() {
-			refresherInstance.workersWG.Wait()
+			r.workersWG.Wait()
 			close(done)
 		}()
 		select {
@@ -1180,7 +1191,7 @@ func resetRefresherForTest() {
 			// downstream because of corruption.
 		}
 	}
-	refresherInstance = nil
+	refresherInstance.Store(nil)
 	refresherInit = sync.Once{}
 	// 1.12.6 C4 — suppression markers + counters are package state.
 	resetRefreshTerminalForTest()

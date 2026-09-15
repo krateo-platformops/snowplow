@@ -42,6 +42,15 @@ func refresherStatSpecs() []StatSpec {
 // RefresherStatSpecs is refresherStatSpecs for internal/metrics.
 func RefresherStatSpecs() []StatSpec { return refresherStatSpecs() }
 
+// refresherStatsValues is RefresherStatsByStat as the family's Values reader.
+func refresherStatsValues() map[string]any {
+	out := statsByTag(refresherStatsSnapshot())
+	for k, v := range statsByTag(RefreshTerminalStatsSnapshot()) {
+		out[k] = v
+	}
+	return out
+}
+
 // RefresherStatsByStat flattens the refresher pool counters AND the C4
 // terminal counters into one `stat -> value` map. It never constructs the
 // refresher (#203): before the first enqueue, or under CACHE_ENABLED=false,

@@ -48,44 +48,13 @@ func init() {
 // a coherent point-in-time snapshot — no torn reads.
 func registerCRDDiscoveryExpvar() {
 	crdDiscoveryExpvarOnce.Do(func() {
+		// 1.12.6 C7: the map is DERIVED from the CRDDiscoveryStats struct tags
+		// (stats_families.go) — the same map the OTLP mirror ranges over, so
+		// the two surfaces cannot drift and a new counter needs one tag, not
+		// four edits. Per-stat meaning lives on the struct fields and in
+		// docs/architecture/observability.md (guarded by TestC7_Docs_*).
 		expvar.Publish("snowplow_crd_discovery", expvar.Func(func() any {
-			s := CRDDiscoveryStatsSnapshot()
-			return map[string]uint64{
-				"events_enqueued": s.EventsEnqueued,
-				"events_dropped":  s.EventsDropped,
-				// 1.12.5 / #187 — parked > 0 means the worker fell 256 events
-				// behind and the informer processor goroutine had to wait. A
-				// DROPPED lifecycle event is now a last resort after the park
-				// deadline; for a DELETE it means an informer is never torn
-				// down and its dependent L1 entries stay resident until TTL.
-				"events_parked":    s.EventsParked,
-				"events_processed": s.EventsProcessed,
-				// ADD + UPDATE path
-				"discovery_invoked":    s.DiscoveryInvoked,
-				"discovery_skipped_ng": s.DiscoverySkippedNG,
-				// DELETE path (Ship L)
-				"deletes_processed": s.DeletesProcessed,
-				"delete_skipped_ng": s.DeleteSkippedNG,
-				"panics_recovered":  s.PanicsRecovered,
-				// schema-widen relist (followup-crd-schema-widen-informer-relist)
-				"schema_relists_fired": s.SchemaRelistsFired,
-				"schema_unchanged":     s.SchemaUnchanged,
-				// 1.12.5 / #187 — post-sync re-fire of the relist dirty-mark.
-				// postsync lagging schema_relists_fired means relisted
-				// informers are not syncing, which strands L1 entries whose
-				// objects were deleted inside the teardown window.
-				"relist_dirtymark_postsync_total": s.RelistDirtyMarkPostSync,
-				"relist_postsync_timeout_total":   s.RelistPostSyncTimeout,
-				// 1.12.6 C2 — relist delta bridge. enqueued moving with
-				// timeout at ZERO across real CRD schema changes is the soak
-				// evidence that retires the 1.12.5 re-fire above; timeout
-				// > 0 on a healthy cluster means the bridge is NOT covering
-				// the teardown window and the re-fire must stay.
-				"relist_bridge_runs_total":     s.RelistBridgeRuns,
-				"relist_bridge_enqueued_total": s.RelistBridgeEnqueued,
-				"relist_bridge_timeout_total":  s.RelistBridgeTimeout,
-				"relist_bridge_aborted_total":  s.RelistBridgeAborted,
-			}
+			return CRDDiscoveryStatsByStat()
 		}))
 	})
 }

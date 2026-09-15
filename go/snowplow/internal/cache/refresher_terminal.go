@@ -280,7 +280,7 @@ type RefreshTerminalStats struct {
 	SuppressedSetTotal      uint64 `stat:"suppressed_set"`
 	SuppressedSkipsTotal    uint64 `stat:"suppressed_skips"`
 	DeclineNotedTotal       uint64 `stat:"-"` // arms only
-	SuppressedKeys          int    `stat:"suppressed_keys" kind:"gauge"`
+	SuppressedKeys          int    `stat:"suppressed_keys" kind:"gauge" desc:"Live count of L1 keys marked refresh-by-traffic-only after repeated declines (1.12.6 #191); bounded by the store."`
 	SuppressAfterDeclines   int    `stat:"-"` // configuration echo (REFRESH_SUPPRESS_AFTER_DECLINES)
 }
 
