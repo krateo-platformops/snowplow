@@ -162,12 +162,19 @@ func DepsStatsByStat() map[string]int64 {
 		// and that no event had evicted — a DELETE the pipeline lost. A
 		// steady non-zero rate means a handler, the queue or the relist
 		// bridge is dropping events; alert on it. reconcile_sampled_total is
-		// the probe count (the denominator); reconcile_unknown_total counts
-		// coordinates skipped because the indexer was not authoritative.
-		"reconcile_ticks_total":      int64(rc.Ticks),
-		"reconcile_sampled_total":    int64(rc.Probed),
-		"reconcile_divergence_total": int64(rc.Divergence),
-		"reconcile_unknown_total":    int64(rc.Unknown),
-		"reconcile_panics_total":     int64(rc.Panics),
+		// the entries visited, reconcile_probed_total the unique coordinates
+		// probed (the divergence denominator — cohort copies share one
+		// probe); reconcile_unknown_total counts coordinates skipped because
+		// the indexer was not authoritative; reconcile_skipped_no_edge_total
+		// counts ABSENT entries the worker could not evict (no self dep edge
+		// — dropped_cap), kept OUT of divergence so the alert above stays
+		// true. Each key publishes the field it is named after (arch N2).
+		"reconcile_ticks_total":           int64(rc.Ticks),
+		"reconcile_sampled_total":         int64(rc.Sampled),
+		"reconcile_probed_total":          int64(rc.Probed),
+		"reconcile_divergence_total":      int64(rc.Divergence),
+		"reconcile_unknown_total":         int64(rc.Unknown),
+		"reconcile_skipped_no_edge_total": int64(rc.SkippedNoEdge),
+		"reconcile_panics_total":          int64(rc.Panics),
 	}
 }

@@ -12,11 +12,21 @@ type debugReconcileBody struct {
 	// CacheEnabled is false when the resolved cache is off or no watcher is
 	// installed; the audit then has nothing to walk and every count is 0.
 	CacheEnabled bool `json:"cacheEnabled"`
-	// Sampled / Probed / Divergent / Unknown mirror cache.ReconcileReport.
+	// Sampled / Probed / Divergent / Unknown / SkippedNoEdge mirror
+	// cache.ReconcileReport.
 	Sampled   int `json:"sampled"`
 	Probed    int `json:"probed"`
 	Divergent int `json:"divergent"`
 	Unknown   int `json:"unknown"`
+	// SkippedNoEdge: ABSENT entries with no self dep edge (dropped_cap) —
+	// not evictable by the worker, counted apart from divergence.
+	SkippedNoEdge int `json:"skippedNoEdge"`
+	// Batches / SnapshotHoldMicros / MaxBatchHoldMicros / Truncated: the
+	// chunked walk's measured store-mutex holds (PM condition 3).
+	Batches            int   `json:"batches"`
+	SnapshotHoldMicros int64 `json:"snapshotHoldMicros"`
+	MaxBatchHoldMicros int64 `json:"maxBatchHoldMicros"`
+	Truncated          bool  `json:"truncated"`
 	// Entries is the divergent set, METADATA ONLY (key hash / class / gvr /
 	// namespace / name) — never a body, never a body hash.
 	Entries []cache.ReconcileEntry `json:"entries"`
@@ -33,9 +43,12 @@ type debugReconcileBody struct {
 // wants it gone), and the reason the route sits behind the debug JWT gate
 // with its siblings rather than being anonymous.
 //
-// COST: the full walk holds the store mutex for its duration (RangeMetadata),
-// unlike the periodic ticker's bounded sample. Fine on demand; not something
-// to poll.
+// COST: the full walk is CHUNKED (cache.RangeMetadataBatched): the store
+// mutex is held once for a key snapshot and then per batch of 512 entries,
+// with the probes between batches outside it, so a customer /call waits at
+// most one batch (measured, reported as maxBatchHoldMicros) — never the
+// whole residency. Wall time is capped (truncated=true past it). Fine on
+// demand; still not something to poll.
 //
 // STRUCTURAL LEAK GUARD: the rows are cache.ReconcileEntry — five strings
 // (key hash / class / gvr / ns / name), the same projection /debug/apistage
@@ -52,12 +65,17 @@ func DebugReconcile() http.HandlerFunc {
 	return func(wri http.ResponseWriter, req *http.Request) {
 		rep, ok := cache.ReconcileFull()
 		body := debugReconcileBody{
-			CacheEnabled: ok,
-			Sampled:      rep.Sampled,
-			Probed:       rep.Probed,
-			Divergent:    rep.Divergent,
-			Unknown:      rep.Unknown,
-			Entries:      rep.Entries,
+			CacheEnabled:       ok,
+			Sampled:            rep.Sampled,
+			Probed:             rep.Probed,
+			Divergent:          rep.Divergent,
+			Unknown:            rep.Unknown,
+			SkippedNoEdge:      rep.SkippedNoEdge,
+			Batches:            rep.Batches,
+			SnapshotHoldMicros: rep.SnapshotHoldMicros,
+			MaxBatchHoldMicros: rep.MaxBatchHoldMicros,
+			Truncated:          rep.Truncated,
+			Entries:            rep.Entries,
 		}
 		if body.Entries == nil {
 			body.Entries = []cache.ReconcileEntry{}

@@ -144,9 +144,10 @@ func TestIssue1126_D2_ReconcileTickerEvictsAStrandedEntry(t *testing.T) {
 	if s.Panics != 0 {
 		t.Fatalf("D2: reconcile_panics_total=%d", s.Panics)
 	}
-	if got := Deps().Stats().EvictDeleteTotal - before; got != 1 {
+	// Bounded wait, not a single read: the worker counts AFTER deleteForDep.
+	if got := c3WaitEvictDelete(before+1, harnessWaitBound); got != before+1 {
 		t.Fatalf("D2: evict_delete_total moved by %d, want 1 — the audit must evict through the worker's "+
-			"ABSENT verdict (the same path as an informer DELETE)", got)
+			"ABSENT verdict (the same path as an informer DELETE)", got-before)
 	}
 }
 
@@ -287,7 +288,8 @@ func TestIssue1126_C3_Off_CacheDisabledBuildsNothing(t *testing.T) {
 		t.Fatalf("cache-off: ReconcileFull ok=%v sampled=%d, want false/0", ok, rep.Sampled)
 	}
 	// The stats read must not construct the ticker either (architect N1 discipline).
-	for _, k := range []string{"reconcile_ticks_total", "reconcile_sampled_total", "reconcile_divergence_total", "reconcile_unknown_total", "reconcile_panics_total"} {
+	for _, k := range []string{"reconcile_ticks_total", "reconcile_sampled_total", "reconcile_probed_total",
+		"reconcile_divergence_total", "reconcile_unknown_total", "reconcile_skipped_no_edge_total", "reconcile_panics_total"} {
 		if v, ok := DepsStatsByStat()[k]; !ok || v != 0 {
 			t.Fatalf("cache-off: DepsStatsByStat()[%q] = %d,%v want 0,true", k, v, ok)
 		}

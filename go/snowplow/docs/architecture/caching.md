@@ -434,9 +434,20 @@ the self-404 eviction above. The pre-sync fire is kept as well; both run. Counte
 `relist_dirtymark_postsync_total` under `snowplow_deps`.
 
 This is containment, not the precise form: it evicts by re-resolving and observing a 404, so it
-costs the requeue budget and depends on the refresh path being healthy. The precise
-evict-by-absence reconcile (walk the store's metadata for the GVR, probe the new indexer, evict
-the misses) is tracked separately.
+costs the requeue budget and depends on the refresh path being healthy. Since 1.12.6 C2 the
+relist delta bridge re-derives the missing DELETEs from the indexer (`relist_bridge.go`), and
+the C3 **sampled reconcile audit** (`deps_reconcile.go`) is the safety net under the whole
+pipeline: every `DEPS_RECONCILE_PERIOD_SECONDS` (30) it probes `DEPS_RECONCILE_SAMPLE` (512)
+resident entries against the indexer and hands ABSENT ones to the dep-event worker.
+
+**Coverage — the audit is a divergence detector, not a staleness bound.** With a random window
+of 512 per tick against 100K resident entries, the expected first visit of a given entry is
+≈ 1.6 h and 99 % coverage takes ≈ 900 ticks ≈ **7.5 h** — longer than the 3600 s TTL, so for
+most entries the TTL still fires first. What the audit guarantees is that a lost DELETE shows
+up as `reconcile_divergence_total > 0` (alertable) and that entries which keep being re-Put
+(keep-warm cells, C4-suppressed keys) are eventually evicted; it does not bound how long a
+stranded entry can be served. Raise `DEPS_RECONCILE_SAMPLE` for a tighter bound (O(sample)
+under the store mutex per tick). Full arithmetic next to the counter rows in observability.md.
 
 ---
 

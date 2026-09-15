@@ -1286,6 +1286,58 @@ func (c *ResolvedCacheStore) RangeMetadata(fn func(ResolvedEntryMeta) bool) {
 	}
 }
 
+// RangeMetadataBatched walks EVERY live entry in batches, holding c.mu only
+// per batch (1.12.6 C3 follow-up, PM condition 3 — the /debug/reconcile
+// full walk). Same structural leak guard as RangeMetadata: fn receives
+// ResolvedEntryMeta only.
+//
+// Two lock scopes, both bounded: one O(N) key snapshot of c.index (string
+// headers only — reported as snapshotHeld), then per batch an O(batch)
+// projection of the keys still resident. fn runs OUTSIDE the lock with the
+// batch and the time c.mu was held for it, and returns false to stop.
+// Between batches customer Gets proceed; an entry evicted after the
+// snapshot is skipped, one Put after it is not visited — both fine for an
+// audit. A single exclusive hold across the whole residency (RangeMetadata)
+// stalls every /call for the walk's duration; this bounds the stall to one
+// batch (numbers: TestIssue1126_C3_FU4 and the developer report).
+func (c *ResolvedCacheStore) RangeMetadataBatched(batch int, fn func(metas []ResolvedEntryMeta, held time.Duration) bool) (snapshotHeld time.Duration) {
+	if c == nil || batch <= 0 {
+		return 0
+	}
+	t0 := time.Now()
+	c.mu.Lock()
+	keys := make([]string, 0, len(c.index))
+	for k := range c.index {
+		keys = append(keys, k)
+	}
+	c.mu.Unlock()
+	snapshotHeld = time.Since(t0)
+	for len(keys) > 0 {
+		n := batch
+		if n > len(keys) {
+			n = len(keys)
+		}
+		chunk := keys[:n]
+		keys = keys[n:]
+		metas := make([]ResolvedEntryMeta, 0, n)
+		now := time.Now()
+		t1 := time.Now()
+		c.mu.Lock()
+		for _, k := range chunk {
+			el, ok := c.index[k]
+			if !ok {
+				continue // evicted since the snapshot
+			}
+			metas = append(metas, c.metaForItemLocked(el.Value.(*lruItem), now))
+		}
+		c.mu.Unlock()
+		if !fn(metas, time.Since(t1)) {
+			return snapshotHeld
+		}
+	}
+	return snapshotHeld
+}
+
 // RangeMetadataSample invokes fn with the metadata projection of UP TO n
 // live entries (1.12.6 C3, design §5 — the sampled reconcile audit). Same
 // structural leak guard as RangeMetadata: fn receives ResolvedEntryMeta only.

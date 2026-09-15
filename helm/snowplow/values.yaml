@@ -377,6 +377,11 @@ env:
   # lost). Bounded O(sample) under the store mutex per tick. Period "0"
   # disables the ticker (GET /debug/reconcile stays available). Strings
   # (installer plumbing is string-only); unset/unparseable → 512 / 30.
+  # COVERAGE: a divergence DETECTOR, not a staleness bound. At 512/30 s
+  # against 100K resident entries the expected first visit of an entry is
+  # ≈ 1.6 h and 99 % coverage ≈ 7.5 h — longer than the 3600 s TTL, so
+  # the TTL usually fires first; a lost DELETE still surfaces as
+  # reconcile_divergence_total > 0. Raise the sample for a tighter bound.
   DEPS_RECONCILE_SAMPLE: "512"
   DEPS_RECONCILE_PERIOD_SECONDS: "30"
   # #57 — prewarm seed loopback auth. The seed exchanges its projected

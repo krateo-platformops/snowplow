@@ -243,8 +243,9 @@ The stats that answer an invalidation question:
 | `records` / `max_records` | dep-record occupancy vs its ceiling | `records` well under `max_records` |
 | `dirty_mark_total` / `enqueue_update_total` | stale-while-revalidate marks from ADD/UPDATE and from DELETE buckets 2/3 | tracks cluster churn |
 | `add_propagated` / `add_dropped_pre_sync` / `add_nil_syncch` | the ADD initial-replay gate | `add_nil_syncch` should be **0** (a registration path skipped the syncCh allocation; dep marks for that GVR degrade to TTL) |
-| `reconcile_divergence_total` | **1.12.6 C3** — resident entries the sampled reconcile audit found whose own object is ABSENT from a synced indexer and that no event had evicted: each one is a DELETE the pipeline lost, re-derived from the indexer and handed to the dep-event worker (`internal/cache/deps_reconcile.go`) | **0** on a healthy cluster. A rate that does not fall back to zero between ticks means a handler, the queue or the relist bridge is dropping events — alert on it. The per-tick `cache.deps_reconcile.divergence` WARN names up to three coordinates |
-| `reconcile_sampled_total` / `reconcile_ticks_total` | coordinates probed by the audit (the denominator) / ticks run. Defaults `DEPS_RECONCILE_SAMPLE=512` every `DEPS_RECONCILE_PERIOD_SECONDS=30` (`"0"` disables the ticker) | `sampled` grows by ≤ 512 per tick; `ticks` grows by 2/min |
+| `reconcile_divergence_total` | **1.12.6 C3** — coordinates the sampled reconcile audit found whose own object is ABSENT from a synced indexer, that a resident entry still holds a self dep edge for, and that no event had evicted: each one is a DELETE the pipeline lost, re-derived from the indexer and handed to the dep-event worker (`internal/cache/deps_reconcile.go`). Entries the worker could NOT evict (no edge — see `reconcile_skipped_no_edge_total`) are kept out of it | **0** on a healthy cluster. A rate that does not fall back to zero between ticks means a handler, the queue or the relist bridge is dropping events — alert on it. The per-tick `cache.deps_reconcile.divergence` WARN names up to three coordinates |
+| `reconcile_sampled_total` / `reconcile_probed_total` / `reconcile_ticks_total` | resident entries visited by the audit / unique self coordinates probed (the divergence denominator — cohort copies of one widget share one probe; LIST entries are visited, not probed) / ticks run. Defaults `DEPS_RECONCILE_SAMPLE=512` every `DEPS_RECONCILE_PERIOD_SECONDS=30` (`"0"` disables the ticker) | `sampled` grows by ≤ 512 per tick, `probed` by ≤ `sampled`; `ticks` grows by 2/min |
+| `reconcile_skipped_no_edge_total` | ABSENT entries the audit found that hold **no self dep edge** — their `Record` was dropped at `DEPS_MAX_RECORDS` (`dropped_cap`), so the worker's ABSENT verdict cannot reach them and they are served until their TTL. Counted here, NOT as divergence, and their coordinate is not submitted (it would evict nothing) | **0**. Non-zero is the `dropped_cap` symptom made visible (read it next to `dropped_cap`), not a lost DELETE — raise `DEPS_MAX_RECORDS` |
 | `reconcile_unknown_total` | coordinates the audit SKIPPED because the indexer was not authoritative for their GVR (unregistered, unsynced, watch broken, relist window). Never guessed | small; persistently large means entries are resident for GVRs that are not watched |
 | `reconcile_panics_total` | audit ticks that panicked (recovered; the ticker survives) | **0** |
 
@@ -254,11 +255,29 @@ never the LRU head), probes OUTSIDE that lock (the store and watcher locks are n
 and evicts only through the worker's own ABSENT verdict, so `evict_delete_total` moves for its
 evictions too.
 
+**Coverage — it is a divergence DETECTOR, not a staleness bound.** Each tick visits a random
+window of `DEPS_RECONCILE_SAMPLE` entries, so against a residency of N the chance one entry is
+still unvisited after T ticks is ≈ (1 − sample/N)^T. At the defaults (512 every 30 s) and
+N = 100K entries the expected first visit is ≈ 195 ticks ≈ **1.6 h**, and 99 % coverage needs
+≈ 900 ticks ≈ **7.5 h** — longer than the 3600 s TTL. So for most entries the TTL fires first;
+the audit is the backstop for entries that keep being re-Put (keep-warm cells, entries C4
+suppression keeps alive) and the detector that turns a lost DELETE into
+`reconcile_divergence_total > 0`. Do not expect it to catch a lost DELETE "within a tick". A
+tighter bound costs `DEPS_RECONCILE_SAMPLE` (O(sample) under the store mutex per tick): at
+4096 / 30 s the 99 % figure is ≈ 56 min at 100K. Go's map iteration samples a random *window*
+rather than 512 independent draws, so these figures are slightly optimistic.
+
 `GET /debug/reconcile` (JWT-gated like its siblings) runs ONE full walk on demand and returns
 the divergent set as metadata only (key hash / class / gvr / namespace / name — never a body).
 It is a reconcile, not a dry run: the entries it lists are evicted by the worker right after.
-Unlike the ticker, the full walk holds the store mutex for its whole duration (`RangeMetadata`),
-so it is something to call when a stranded entry is suspected, not something to poll.
+The full walk is **chunked** (`RangeMetadataBatched`): the store mutex is held once for a key
+snapshot and then per batch of 512 entries, each batch is probed outside the lock before the
+next is collected, and wall time is capped at 60 s (`truncated: true` past it). A customer
+`/call` therefore waits at most one batch, never the whole residency; the body reports
+`batches`, `snapshotHoldMicros` and `maxBatchHoldMicros` (also on the
+`cache.deps_reconcile.full_walk` INFO line) so the number is measured on every call. Measured
+under `-race` on a 20K-entry store: see `TestIssue1126_C3_FU4` in the developer report. Still
+something to call when a stranded entry is suspected, not something to poll.
 
 All of it is mirrored to OTLP as the `snowplow_deps` observable gauge, labelled by `stat`
 (`internal/metrics/metrics.go`).
