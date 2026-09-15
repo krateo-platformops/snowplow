@@ -1001,6 +1001,26 @@ def stage_counters_before(ctx: dict) -> dict:
             f"it and the run would read as a C10 failure. Refusing to proceed. "
             f"Check the snowplow log for a 'declining to cache' WARN.")
 
+    # (c) ARMING MUST BE VISIBLE SERVER-SIDE BEFORE THE DELETE.
+    #
+    # Both counters were previously RECORDED here and asserted nowhere, while A13 asserts a zero
+    # delta on `subscribers` across the DELETE window — so a run where the browser never armed at
+    # all satisfied A13 trivially (0 → 0) and proceeded to delete an object nobody was subscribed
+    # to. The absence of a frame afterwards would then be indistinguishable from a C10 failure.
+    #
+    # The browser half has its own arming guards (the ?sub= must contain the child), but those are
+    # reported by the half the counters exist to corroborate. This is the server's own view of the
+    # same fact, and it is the cheap one: if nothing armed, stop before the irreversible step.
+    armed = post[f"{K_BROADCAST}.armed_keys"] - pre[f"{K_BROADCAST}.armed_keys"]
+    subs = post[f"{K_BROADCAST}.subscribers"] - pre[f"{K_BROADCAST}.subscribers"]
+    if armed < 1 or subs < 1:
+        raise PreflightFailed(
+            f"arming is not visible server-side: armed_keys Δ={armed}, subscribers Δ={subs} "
+            f"(both must be >= 1). The browser rendered but snowplow saw no subscription, so "
+            f"nothing can be delivered for this key and a delete would prove nothing. At rest "
+            f"both read 0 on an idle 057, so this is a real signal rather than a threshold. "
+            f"Refusing to proceed to the delete.")
+
     ctx["window_start"] = _now_iso()
     ctx["before"] = post          # the delete window opens from the post-hit state
     ctx["refresh_key"] = hd["refresh_key"]
@@ -1010,7 +1030,9 @@ def stage_counters_before(ctx: dict) -> dict:
         "refresh_key_sha256_prefix": (hd.get("refresh_key") or "")[:12],
         "cache_proof": cache_cc,
         "armed_keys": post[f"{K_BROADCAST}.armed_keys"],
+        "armed_keys_delta": armed,
         "subscribers": post[f"{K_BROADCAST}.subscribers"],
+        "subscribers_delta": subs,
         "counters_before": ctx["before"],
     }
 

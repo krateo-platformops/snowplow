@@ -17,19 +17,27 @@ never reconciles it — a frame with no refetch is an SPA defect; a refetch with
 the test measuring itself.
 
 THE SILENT NO-OP THIS IS SHAPED TO PREVENT. A widget that never armed produces: no frame, no
-refetch, no error — a clean pass proving nothing. Three independent guards:
+refetch, no error — a clean pass proving nothing. Two guards live here, both asserted before
+the delete, and either failing aborts rather than proceeding to a meaningless delete:
   * `X-Snowplow-Refresh-Key` must be present on the child's `/call` (snowplow stamps it on
     all non-hit paths INCLUDING declines, so its presence is necessary, not sufficient);
-  * the `?sub=` of the `/refreshes` request must actually contain the child's coordinates;
-  * the second `/call` must be an L1 HIT — proving an entry exists that an eviction can
-    later evict. A declined body arms a key with nothing behind it.
-All three are asserted before the delete. Failing any of them aborts rather than proceeding
-to a delete whose result would be meaningless.
+  * the `?sub=` the SPA actually sent must contain the child's coordinates, decoded rather
+    than assumed.
+A third question — does an L1 entry actually EXIST behind the armed key — cannot be answered
+from the browser: no cache-status header is stamped on `/call`, only Refresh-Key and
+Refresh-Class. It belongs to the counter half's store_total/hit_total bracket, which is the
+server's own accounting and the project's counters-not-timing rule. An earlier version of
+this file claimed it by reading an `x-snowplow-cache` header that does not exist, so the
+check degraded silently to one that is true for exactly the declined widget it was meant to
+reject.
 
-OWNERSHIP. Creates exactly two CRs, both name-prefixed so `assert_owned` can refuse anything
-else, and deletes only what it created. Never touches pre-existing content. The page root is
-`page-s6-probe` — fixed, not per-run — because the route `/s6-probe` shipped in portal 1.8.23
-resolves `flexes/page-<slug>` by convention, so the name is pinned by the nav entry.
+OWNERSHIP, AND THE SHARED PAGE ROOT. The child is per-run and name-prefixed. The page root is
+`page-s6-probe` — fixed, not per-run, because the `/s6-probe` route shipped in portal 1.8.23
+resolves `flexes/page-<slug>` by convention, so a per-run name would resolve to nothing. That
+makes the root SHARED, and a prefix cannot tell two concurrent runs apart: both match it, and
+apply-then-delete would let whichever finishes first remove the page the other is measuring
+on. So the root also carries a `krateo.io/s6-run` label, create refuses a root belonging to a
+different run, and teardown removes only a root carrying this run's id.
 """
 
 from __future__ import annotations
@@ -187,9 +195,27 @@ class S6Browser:
 
     # ─── stages ─────────────────────────────────────────────────────────────
 
+    def _root_run_label(self) -> str | None:
+        """The run id stamped on an existing page root, or None if there is no root."""
+        out = _kubectl("get", "flex", PAGE_ROOT, "-n", NS, "--ignore-not-found",
+                       "-o", r"jsonpath={.metadata.labels.krateo\.io/s6-run}")
+        return out.strip() or None
+
     def create(self) -> None:
         accept1126.assert_owned("paragraphs", self.child)
         accept1126.assert_owned("flexes", PAGE_ROOT)
+        # (b) The root is shared by construction, so the prefix alone cannot detect a collision:
+        # a concurrent run matches it too. Refuse to overwrite a root another run is measuring
+        # on — `apply` would silently repoint it at that run's child, and the first teardown to
+        # fire would delete the page out from under the other.
+        owner = self._root_run_label()
+        mine = self.run_id[:12]
+        if owner and owner != mine:
+            raise accept1126.NotOwned(
+                f"{PAGE_ROOT} already exists and belongs to run {owner!r}, not {mine!r}. A "
+                f"concurrent S6 run is using it. This is expected — the root name is pinned by "
+                f"the nav entry and cannot be per-run — so wait for that run to finish rather "
+                f"than overwriting the page it is measuring on.")
         _kubectl("apply", "-f", "-", stdin=_manifests(self.run_id))
         self._hook("created", {"child": self.child, "page_root": PAGE_ROOT,
                                "namespace": NS})
@@ -234,21 +260,47 @@ class S6Browser:
                                 "stream_opens": page.evaluate(
                                     "() => window.__s6.streamOpens")})
 
-        # Prove the entry is CACHED: a second call must be served from L1. A declined body
-        # stamps a key and caches nothing, and then no eviction can fire for it.
+        # Re-request the child so the counter half has a second lookup to bracket. The claim
+        # that an L1 entry EXISTS is deliberately NOT made here.
+        #
+        # BB1: an earlier version read `x-snowplow-cache` / `x-cache` to prove a hit. Neither
+        # header exists — snowplow stamps only Refresh-Key and Refresh-Class on /call — so the
+        # check always fell through to `refresh_key == key`, which is deterministic from the
+        # inputs and is stamped on DECLINES too. It was therefore true for exactly the declined
+        # widget the guard existed to reject: a tautology wearing the shape of a proof.
+        #
+        # There is no cache-status header to read, so the browser cannot answer this question at
+        # all. The counter half owns it: its store_total/hit_total bracket around this window is
+        # real evidence from the server's own accounting, which is also the project's
+        # counters-not-timing rule. This half reports the key so that bracket can be attributed.
         before = len(self._child_calls)
         page.reload(wait_until="networkidle", timeout=120000)
         page.wait_for_timeout(2000)
         later = self._child_calls[before:]
-        hit = next((c for c in later if c.get("cache") in ("hit", "HIT")), None)
-        proved = hit is not None or (later and later[0].get("refresh_key") == key)
-        if not proved:
+        if not later:
             raise accept1126.AssertionsFailed(
-                f"could not prove an L1 entry for {self.child}: the second /call was not a "
-                f"hit and did not re-present the same refresh key. Arming a key with no "
-                f"cache entry behind it is the failure mode this proof exists for.")
-        self._hook("hit_proved", {"armed_key": key, "calls_seen": len(self._child_calls),
-                                  "cache_header": (hit or later[0]).get("cache")})
+                f"the reload issued no second /call for {self.child}, so the counter half has "
+                f"no second lookup to bracket and prove-hit cannot be evaluated server-side.")
+        # `l1_hit` is reported as None, EXPLICITLY, rather than omitted or guessed.
+        #
+        # crosscheck_cache_proof wants a per-widget hit from this half because the counter
+        # channel is global and a DECLINED widget can ride foreign traffic to a passing
+        # counter check. That reasoning is sound — but the browser has no way to answer it:
+        # snowplow stamps no cache-status header on /call, and Refresh-Key is present on hits
+        # and declines alike, so there is nothing here that discriminates.
+        #
+        # Reporting None makes the cross-check FAIL loudly rather than pass on a fabricated
+        # value. That is deliberate: this contract needs resolving between the two halves
+        # (either a server-side cache-status header, or an explicit decision that the cache
+        # proof is single-channel and weaker), and a run that silently passed in the meantime
+        # would be exactly the kind of evidence this whole exercise exists to stop producing.
+        self._hook("hit_proved", {"armed_key": key, "refresh_key": key,
+                                  "l1_hit": None,
+                                  "l1_hit_undeterminable": "no cache-status header on /call; "
+                                  "Refresh-Key is stamped on hits and declines alike",
+                                  "calls_seen": len(self._child_calls),
+                                  "second_lookup_calls": len(later),
+                                  "proof_owner": "counter-half:store_total/hit_total bracket"})
 
     def delete_and_observe(self, page) -> dict:
         """Delete the child, then watch BOTH channels without touching the browser."""
@@ -258,6 +310,9 @@ class S6Browser:
         frames_before = page.evaluate("() => window.__s6.frames.length")
         calls_before = len(self._child_calls)
 
+        # (a) Re-assert at the point of use. create() and teardown() both check, but the delete
+        # is the irreversible one and the name has travelled through the object since then.
+        accept1126.assert_owned("paragraphs", self.child)
         _kubectl("delete", "paragraph", self.child, "-n", NS, "--ignore-not-found")
         self._hook("deleted", {"child": self.child, "armed_key": self.armed_key,
                                "frames_before": frames_before,
@@ -284,15 +339,28 @@ class S6Browser:
         return result
 
     def teardown(self) -> None:
-        """Delete only what this run created. Ownership is re-asserted rather than trusted:
-        a teardown that deletes by label alone would remove a concurrent run's objects."""
-        for kind, name in (("paragraph", self.child), ("flex", PAGE_ROOT)):
-            try:
-                accept1126.assert_owned(
-                    "paragraphs" if kind == "paragraph" else "flexes", name)
-                _kubectl("delete", kind, name, "-n", NS, "--ignore-not-found")
-            except accept1126.NotOwned as exc:
-                print(f"    s6browser: REFUSING to delete {kind}/{name}: {exc}")
+        """Delete only what THIS run created.
+
+        The child is per-run, so the name prefix settles it. The root is not: it is shared by
+        construction, so removing it on the prefix alone would take a concurrent run's page with
+        it. (b) — the root goes only when it still carries this run's label; a root belonging to
+        someone else is left exactly where it is, and said so out loud.
+        """
+        try:
+            accept1126.assert_owned("paragraphs", self.child)
+            _kubectl("delete", "paragraph", self.child, "-n", NS, "--ignore-not-found")
+        except accept1126.NotOwned as exc:
+            print(f"    s6browser: REFUSING to delete paragraph/{self.child}: {exc}")
+        try:
+            accept1126.assert_owned("flexes", PAGE_ROOT)
+            owner = self._root_run_label()
+            if owner and owner != self.run_id[:12]:
+                print(f"    s6browser: leaving {PAGE_ROOT} — it belongs to run {owner!r}, "
+                      f"not {self.run_id[:12]!r}")
+            else:
+                _kubectl("delete", "flex", PAGE_ROOT, "-n", NS, "--ignore-not-found")
+        except accept1126.NotOwned as exc:
+            print(f"    s6browser: REFUSING to delete flex/{PAGE_ROOT}: {exc}")
 
     # ─── network capture (channel B) ────────────────────────────────────────
 
@@ -311,7 +379,10 @@ class S6Browser:
             "status": response.status,
             "refresh_key": headers.get("x-snowplow-refresh-key"),
             "refresh_class": headers.get("x-snowplow-refresh-class"),
-            "cache": headers.get("x-snowplow-cache") or headers.get("x-cache"),
+            # No cache-status field: snowplow stamps only Refresh-Key and Refresh-Class on
+            # /call. Recording a header that does not exist is what let the removed hit-proof
+            # look like it was checking something, so the field goes rather than lingering as
+            # a permanently-None value for someone to build on again.
         })
 
 
@@ -337,7 +408,10 @@ def run_browser_half(run_dir: Path, portal_base: str) -> int:
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx = bench_browser.make_browser_context(browser)
+        # BB2 — make_browser_context defaults ignore_https_errors=True (browser.py:1253), which
+        # is wrong for the context that types the harness password. The portal serves a real
+        # Let's Encrypt certificate, so there is nothing to tolerate and a MITM must fail the run.
+        ctx = bench_browser.make_browser_context(browser, ignore_https_errors=False)
         ctx.add_init_script(_FRAME_RECORDER)
         page = ctx.new_page()
         try:
