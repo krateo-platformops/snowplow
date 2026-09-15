@@ -6,8 +6,8 @@
 // the ones with neither. Its value is that every name in it is real: this
 // guard parses the table between the c8-matrix markers and fails when
 //
-//	- a detector names an expvar key that is not published, or a
-//	  `<family>.<stat>` whose stat the family does not derive;
+//	- a detector names a key no family derives (the key sets come from the
+//	  struct tags and the static flattenings — never from live values, N1);
 //	- an arm names a Test function that exists in no _test.go under the
 //	  module;
 //	- a row is neither PINNED nor OPEN, a PINNED row has no arm, or an OPEN
@@ -72,32 +72,24 @@ func c8TestFunctions(t *testing.T) map[string]bool {
 	return names
 }
 
-// c8FamilyStats maps each map-family expvar key to its derived stat set.
-func c8FamilyStats() map[string]map[string]bool {
-	out := map[string]map[string]bool{}
-	add := func(fam string, m map[string]int64) {
-		s := map[string]bool{}
-		for k := range m {
-			s[k] = true
-		}
-		out[fam] = s
-	}
-	add("snowplow_deps", DepsStatsByStat())
-	add("snowplow_resolved_cache", ResolvedCacheStatsByStat())
-	add("snowplow_crd_discovery", CRDDiscoveryStatsByStat())
-	rb := map[string]bool{}
-	for k := range RefreshBroadcasterStatsByStat() {
-		rb[k] = true
-	}
-	out["snowplow_refresh_broadcaster"] = rb
-	return out
-}
+// c8FamilyStats is the state-free key set of every family (N1): derived
+// from the struct tags and the static flattenings by publishedStatKeys, never
+// from a live store or a live expvar value that a sibling test's reset can
+// empty. Map families → stat set; "" → the per-stat top-level expvar keys.
+func c8FamilyStats() map[string]map[string]bool { return publishedStatKeys() }
 
-// c8DetectorExists resolves one backticked detector name.
+// c8DetectorExists resolves one backticked detector name: `<family>.<stat>`
+// against the derived stat set, a bare key against the derived top-level
+// keys, and as a last resort against the expvar REGISTRY (append-only: a key
+// once published is never removed, so membership — unlike a value — cannot
+// be reset by a sibling test).
 func c8DetectorExists(name string, fams map[string]map[string]bool) bool {
 	if fam, stat, ok := strings.Cut(name, "."); ok {
 		stats, known := fams[fam]
 		return known && stats[stat]
+	}
+	if fams[""][name] {
+		return true
 	}
 	return expvar.Get(name) != nil
 }
@@ -183,10 +175,6 @@ func c8CheckRows(rows []c8Row, tests map[string]bool, fams map[string]map[string
 }
 
 func TestC8_DeliveryFailureMatrix_EveryRowNamesLiveCountersAndArms(t *testing.T) {
-	t.Setenv("CACHE_ENABLED", "true")
-	withLiveResolvedCache(t)
-	registerAllExpvarForTest()
-	RegisterResolvedCacheExpvarForTest()
 	rows := c8ParseMatrix(t, observabilityDoc(t))
 	defects := c8CheckRows(rows, c8TestFunctions(t), c8FamilyStats())
 	for _, d := range defects {
@@ -207,9 +195,6 @@ func TestC8_DeliveryFailureMatrix_EveryRowNamesLiveCountersAndArms(t *testing.T)
 }
 
 func TestC8_DeliveryFailureMatrix_MutationProbe(t *testing.T) {
-	t.Setenv("CACHE_ENABLED", "true")
-	withLiveResolvedCache(t)
-	registerAllExpvarForTest()
 	tests := c8TestFunctions(t)
 	fams := c8FamilyStats()
 	bad := []c8Row{
@@ -232,7 +217,7 @@ func TestC8_DeliveryFailureMatrix_MutationProbe(t *testing.T) {
 			t.Errorf("the checker did not reject %q (defects: %v) — the guard is not reading the tree", w, defects)
 		}
 	}
-	good := []c8Row{{"G1", "store", "ok", "`snowplow_deps.evict_delete_total`, `snowplow_refresher_dropped_total`", "`TestC8_DeliveryFailureMatrix_MutationProbe`", "PINNED — ok"}}
+	good := []c8Row{{"G1", "store", "ok", "`snowplow_deps.evict_delete_total`, `snowplow_refresher_dropped_total`, `snowplow_resolved_cache.evict_max_age_total`, `snowplow_crd_discovery.relist_bridge_timeout_total`", "`TestC8_DeliveryFailureMatrix_MutationProbe`", "PINNED — ok"}}
 	if d := c8CheckRows(good, tests, fams); len(d) != 0 {
 		t.Errorf("a valid row was rejected: %v", d)
 	}

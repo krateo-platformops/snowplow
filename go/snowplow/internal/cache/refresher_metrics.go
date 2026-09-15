@@ -101,7 +101,7 @@ func refresherStatFunc(stat string) expvar.Func {
 	return expvar.Func(func() any { return RefresherStatsByStat()[stat] })
 }
 
-// RegisterRefresherMetricsForTest// RegisterRefresherMetricsForTest forces refresher expvar registration
+// RegisterRefresherMetricsForTest forces refresher expvar registration
 // under tests that flip CACHE_ENABLED=true via t.Setenv after init()
 // already ran with CACHE_ENABLED unset. Idempotent (sync.Once-guarded).
 // Production callers MUST NOT use this function.

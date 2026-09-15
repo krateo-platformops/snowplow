@@ -101,20 +101,43 @@ func expvarVars(t *testing.T) map[string]json.RawMessage {
 	return all
 }
 
-// withLiveResolvedCache builds the L1 store so ResolvedCacheStatsByStat()
-// reports the real key set (it is an EMPTY map before the store exists, which
-// would make a docs guard vacuous).
-func withLiveResolvedCache(t *testing.T) {
-	t.Helper()
-	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
-	resetResolvedCacheForTest()
-	t.Cleanup(resetResolvedCacheForTest)
-	if ResolvedCache() == nil {
-		t.Fatal("setup: ResolvedCache() returned nil with both gates on")
+// publishedStatKeys is the KEY SET of every stats family, derived without
+// any process-global state (N1): the tagged families from their struct
+// tags, snowplow_deps from its flattening (its key set does not depend on
+// values — Deps() is always non-nil), snowplow_resolved_cache from the
+// flattening of a ZERO ResolvedCacheStats (the live map is empty until a
+// store is published, and a sibling test's reset can empty it again). Map
+// families are keyed by expvar name → stat set; the per-stat refresher
+// family contributes its full expvar keys under "".
+func publishedStatKeys() map[string]map[string]bool {
+	out := map[string]map[string]bool{"": {}}
+	for _, f := range TaggedStatFamilies() {
+		if f.Expvar != "" {
+			s := map[string]bool{}
+			for _, sp := range f.Specs {
+				s[sp.Stat] = true
+			}
+			out[f.Expvar] = s
+			continue
+		}
+		for _, sp := range f.Specs {
+			out[""][f.ExpvarKey(sp)] = true
+		}
 	}
-	if len(ResolvedCacheStatsByStat()) == 0 {
-		t.Fatal("setup: ResolvedCacheStatsByStat() is empty with a live store")
+	deps := map[string]bool{}
+	for k := range DepsStatsByStat() {
+		deps[k] = true
 	}
+	out["snowplow_deps"] = deps
+	rc := map[string]bool{}
+	for k := range resolvedCacheStatsByStatOf(ResolvedCacheStats{}) {
+		rc[k] = true
+	}
+	out["snowplow_resolved_cache"] = rc
+	if len(rc) == 0 || len(deps) == 0 {
+		panic("publishedStatKeys: a static key set came back empty")
+	}
+	return out
 }
 
 func registerAllExpvarForTest() {
@@ -183,33 +206,14 @@ func observabilityDoc(t *testing.T) string {
 }
 
 func TestC7_Docs_EveryPublishedStatIsDocumented(t *testing.T) {
-	t.Setenv("CACHE_ENABLED", "true")
-	withLiveResolvedCache(t)
 	doc := observabilityDoc(t)
-	missing := func(family, name string) {
-		t.Errorf("observability.md does not name `%s` (%s) — an operator cannot read a counter the doc does not list", name, family)
-	}
-	for _, f := range TaggedStatFamilies() {
-		for _, s := range f.Specs {
-			name := s.Stat
-			if f.Expvar == "" {
-				name = f.ExpvarKey(s) // per-stat expvar families are documented by full key
-			}
+	// State-free (N1): every key set comes from the types / static flattenings.
+	for family, keys := range publishedStatKeys() {
+		for name := range keys {
 			if !strings.Contains(doc, "`"+name+"`") {
-				missing(f.Name(), name)
+				t.Errorf("observability.md does not name `%s` (%s) — an operator cannot read a counter the doc does not list",
+					name, map[bool]string{true: family, false: "top-level expvar"}[family != ""])
 			}
-		}
-	}
-	// The two map families the mirror ranges over already; their docs guard
-	// was a list in a test — now it is the map itself.
-	for k := range DepsStatsByStat() {
-		if !strings.Contains(doc, "`"+k+"`") {
-			missing("snowplow_deps", k)
-		}
-	}
-	for k := range ResolvedCacheStatsByStat() {
-		if !strings.Contains(doc, "`"+k+"`") {
-			missing("snowplow_resolved_cache", k)
 		}
 	}
 }

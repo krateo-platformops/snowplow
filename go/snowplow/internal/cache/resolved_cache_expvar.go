@@ -91,7 +91,14 @@ func ResolvedCacheStatsByStat() map[string]int64 {
 	if c == nil {
 		return map[string]int64{}
 	}
-	s := c.Stats()
+	return resolvedCacheStatsByStatOf(c.Stats())
+}
+
+// resolvedCacheStatsByStatOf is the flattening itself, separated from the
+// live-store read so the KEY SET can be derived from a zero value with no
+// process-global state (1.12.6 C7 N1: the docs and matrix guards must not
+// depend on whether a sibling test left the store published).
+func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 	return map[string]int64{
 		// occupancy vs its two ceilings
 		"entries":     int64(s.Entries),
