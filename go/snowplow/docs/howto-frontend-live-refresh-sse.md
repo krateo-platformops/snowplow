@@ -275,3 +275,89 @@ curl -N -H "Authorization: Bearer $JWT" \
   **Arm the subscription with that header value verbatim** — no arm-both, no
   guessing. (snowplow 1.5.5+ / the `X-Snowplow-Refresh-Class` header is in the
   CORS `ExposedHeaders` list.)
+
+---
+
+## 9. Recovery after an interruption — the CLIENT owns it
+
+**Snowplow offers no replay, deliberately.** The handler sends no `id:` field, keeps no ring, and
+honours no `Last-Event-ID`. A frame published while a browser was disconnected is gone. This is a
+design choice, not a gap: the frames are idempotent key pings, so N missed frames for key K are
+equivalent to one refetch of K — and "refetch what I am displaying" is a strictly smaller, always-
+correct recovery than replaying a delta stream that may have rolled past, reset on a pod restart,
+or been armed against a different widget set.
+
+The consequence for the SPA is a contract, not an optimisation:
+
+> After a stream drops and reconnects, the client MUST re-fetch every armed widget once. Nothing
+> else will tell it what changed while it was away.
+
+Three properties that recovery must have, and why each is load-bearing:
+
+1. **Gate on CAUSE, not on "is this the first connect".** Arming and disarming abort and re-open
+   the stream — every widget mount does. Re-validating on that path fires the whole armed set on
+   every page navigation: the same amplification this section exists to bound, triggered by
+   routine use instead of by a fault. Re-validate only when the stream dropped for a transport
+   reason or a server idle-close.
+2. **Bound concurrency and arrival rate with ONE queue.** Re-validation and frame-driven refetches
+   must enqueue onto the same bounded queue (6 in flight per tab). Two separate caps do not bound
+   their sum, and a stagger placed *beside* a cap only spreads an unbounded burst. Spread the
+   re-validation over `W = min(30 s, N × 300 ms)`: the cap bounds how many run at once, the spread
+   bounds how fast they arrive, and a fleet reconnecting together needs both.
+3. **Jitter the reconnect backoff (±25 %).** Without it, tabs that dropped together retry in
+   lockstep forever, turning one outage into a synchronised herd on every subsequent attempt.
+
+**A 401 is not a transport error.** Retrying it re-presents the same dead token until the backoff
+ceiling, forever, with no path back to a live stream — measured as 553 `reason=JwtAuth` rejections
+at the gateway in one 4½-day window. The stream must raise the app's session-resume flow instead
+and stop; re-authentication re-arms the widgets, which re-opens the stream with a fresh token.
+
+---
+
+## 10. Eviction now publishes a frame — and what a 404 means afterwards
+
+From snowplow 1.12.6, a **DELETE-semantics eviction publishes a paced `refresh` frame** (token
+bucket per subscriber). Two things follow for the browser, and both change existing behaviour.
+
+**The induced refetch is a cold MISS by construction.** The entry was just evicted, so the `/call`
+it triggers cannot be served from L1 and goes to the resolver. That is why the server paces
+publication, and why the client must cap its own in-flight refetches: an unbounded fan-out of cold
+misses is the failure mode, not the refetch itself.
+
+**A 404 answering a frame-triggered refetch is a CONFIRMED DELETE.** This inverts the normal
+policy, and only for that case. A 404 is otherwise transient — right after page load snowplow can
+404 a widget whose CR exists while its informer is still cold, and retrying is what stops an error
+flash on first paint. But when the refetch was triggered by a frame, snowplow has just said this
+object changed, and 404 is the answer. Retrying cannot discover anything new: at 3 retries with
+700/1400/2800 ms backoff it costs **four requests and ~4.9 s per widget**, a fourfold amplification
+of exactly the bulk delete the server is pacing.
+
+So the client must carry one bit — *was this refetch triggered by a frame?* — from its stream
+handler into its retry policy, and treat 404 as terminal when it is set. Keep that bit as narrow as
+possible: a single boolean keyed by widget id is enough, and it lets the retry policy stay ignorant
+of the transport. Failing fast also shows the not-found state in ~0 s instead of ~4.9 s.
+
+**TTL, LRU and max-age evictions stay silent, and clients must not expect frames from them.**
+Those are capacity or freshness decisions about snowplow's cache, not facts about the data: the
+object still exists and the body the browser holds is still valid. The same holds for the
+non-404 drop-point eviction behind the refresh breaker (new in 1.12.6 Track B), which drops an
+entry without any evidence the object is gone. Only the two DELETE-semantics sites publish; that third site (`EvictDropPoint`) is pinned silent by snowplow's S1d drop-point test.
+
+---
+
+## 11. Gateway configuration hazards — what must never be attached to this route
+
+The stream survives the gateway today: no route policy buffers, times out, or cuts the hop at any
+duration. That is **one config edit away from being false**, and the damage is invisible without
+delivery metrics — every stream simply stops, and the browser degrades to looking merely stale.
+
+None of the following may be added to `agentgateway-policies-platform-snowplow`. This belongs in
+the chart review checklist as well as here, because the edit that would cause it lives in the
+agentgateway-policies chart, not in snowplow or the SPA.
+
+| never add | why it breaks the stream |
+|---|---|
+| `traffic.timeouts.request` | Per the CRD it covers "the time from when the request first starts being sent from the gateway to when the **full response has been received**". An SSE response never completes, so **any** value hard-cuts **every** stream at exactly that duration. It is also the only timeout this API exposes — there is no idle, stream-idle or max-duration knob — so a well-meaning "add a reasonable timeout" edit has **no safe form here**. |
+| `traffic.buffer` (either direction) | Accumulates the unbounded SSE body until completion. The browser receives nothing, then gets a 502 at the 2 Mi FailClosed default. |
+| `traffic.retry` | Meaningless on a streamed response, and per the CRD retry requires buffering the request body for replay. |
+| `rateLimit` on this route | Not a substitute for the per-subscriber token bucket: it sheds `/call` and `/refreshes` alike at the edge, turning a paced notification into a user-facing error. |
