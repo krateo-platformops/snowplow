@@ -125,6 +125,49 @@ func registerEngineGVRDiscoveredHook(e *prewarmEngine) {
 	})
 }
 
+// registerHarvesterGoneForgetHook subscribes BOTH Phase-1 harvesters to the
+// cache-side GONE verdict (1.12.7 F6b). Sibling of
+// registerEngineGVRDiscoveredHook above, wired from the same place and for the
+// same reason: the import graph is one-way, so the cache cannot reach the
+// harvesters and publishes a registry instead.
+//
+// WHAT IT FIXES. Both harvesters are append-only. A widget harvested once
+// keeps its DeepCopy for the life of the process and the per-binding seed
+// re-resolves THAT COPY on every pass; the seed never fetches the object, so a
+// deleted widget can never 404 and no decline guard can fire. Eviction cannot
+// win — the re-drive skips live cells, so a successful eviction is exactly what
+// makes the cell eligible to be seeded again. This drops the copy on the
+// authoritative verdict the process already derives.
+//
+// REMOVE ON POSITIVE EVIDENCE, NEVER ON ABSENCE. The cache fires this only for
+// objAbsent — a servable informer whose indexer does not hold the object. An
+// uncertain or degraded informer never reaches it, and a lossy walk never
+// removes anything (see the rejected build-and-swap).
+//
+// CONTRACT: the cache fires this synchronously on its dep-event worker. The
+// callback is a bounded map scan under each harvester's own mutex — no I/O and
+// no apiserver call — so it satisfies the non-blocking requirement in
+// RegisterGoneForgetHook's doc comment. Either harvester may be nil (prewarm
+// off); both forget methods are nil-safe.
+func registerHarvesterGoneForgetHook(deps rePrewarmDeps) {
+	cache.RegisterGoneForgetHook(func(gvr schema.GroupVersionResource, namespace, name string) {
+		dropped := deps.navHarv.forgetCoordinate(gvr, namespace, name)
+		dropped += deps.harvester.forgetCoordinate(gvr, namespace, name)
+		if dropped == 0 {
+			return // the common case: the gone object was never harvested
+		}
+		slog.Info("prewarm.harvest.forgot_gone_object",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", namespace),
+			slog.String("name", name),
+			slog.Int("entries_dropped", dropped),
+			slog.String("effect", "the harvested in-memory copy is gone, so the per-binding seed will "+
+				"no longer re-resolve and re-write a cell for a deleted object"),
+		)
+	})
+}
+
 // rePrewarmGVRDiscovered is the Ship 2 Stage 2 sub-handler for
 // scopeKindGVRDiscovered. Invoked once per (distinct) GVR discovered
 // post-boot via the cache→dispatchers hook

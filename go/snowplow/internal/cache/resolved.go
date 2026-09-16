@@ -526,6 +526,24 @@ const resolvedKeyVersion = "v6"
 type ResolvedCacheStore struct {
 	mu sync.Mutex
 
+	// depStrip removes every dep edge recorded for an L1 key. 1.12.7 F6a strips
+	// edges inside deleteForDep, under the same mutex hold as the index delete,
+	// and it must strip them from the tracker this store is actually wired to
+	// rather than from the process singleton — a non-singleton tracker (every
+	// hermetic fixture) would otherwise have its records left behind.
+	//
+	// A HOOK, NOT A TRACKER POINTER (architect review, 1.12.7). Holding a
+	// *DepTracker here would make this a second field describing the same
+	// relationship DepTracker.store already describes, and invite the question
+	// of which one owns which. A callback has no ownership to reason about, and
+	// it is the idiom every other seam of this kind in this package uses
+	// (SetRefreshHook, RegisterGVRDiscoveredHook, publishEvictionFn).
+	//
+	// nil until DepTracker.SetStore installs it, in which case the singleton is
+	// the correct fallback: nothing else can hold edges for a store no tracker
+	// has claimed. See stripDepEdges.
+	depStrip atomic.Pointer[depStripFn]
+
 	// LRU eviction order: front = most-recently-used.
 	order *list.List
 	// Lookup index. Value is *list.Element whose Value is *lruItem.
@@ -1668,9 +1686,49 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 		c.raFullListEvictTotal.Add(1)
 	}
 	// Dep-tracker cleanup. Safe even when L1 is the only consumer
-	// (Deps() is always non-nil); a no-op when no edges were ever
-	// recorded for this key.
-	Deps().RemoveL1Key(item.key)
+	// (stripDepEdges always resolves to a strip); a no-op when no edges were
+	// ever recorded for this key.
+	c.stripDepEdges(item.key)
+}
+
+// depStripFn removes every dep edge recorded against an L1 key. The production
+// value is DepTracker.RemoveL1Key, installed by DepTracker.SetStore.
+type depStripFn func(l1Key string)
+
+// setDepStripHook installs the dep-edge strip this store calls when it removes
+// an entry. Idempotent, and safe to call again to re-wire.
+//
+// NIL CLEARS, it does not silently keep the previous hook. Leaving a stale hook
+// installed after an explicit nil would be the same asymmetry a nil-ignoring
+// back-pointer had: the caller says "no longer wired" and the store goes on
+// stripping into whatever it was wired to before. Clearing is safe precisely
+// because it is NOT the same as "do not strip" — an unhooked store falls back
+// to the process singleton in stripDepEdges, so edges are always removed on
+// eviction no matter what this is set to. F6a's invariant does not depend on
+// the hook being present, only on the strip happening under the lock.
+func (c *ResolvedCacheStore) setDepStripHook(fn depStripFn) {
+	if c == nil {
+		return
+	}
+	if fn == nil {
+		c.depStrip.Store(nil)
+		return
+	}
+	c.depStrip.Store(&fn)
+}
+
+// stripDepEdges drops every dep edge recorded against l1Key, through the hook
+// this store was wired with, falling back to the process singleton when no hook
+// was installed. Never panics on an unwired store: a key that never recorded an
+// edge is a no-op on either path.
+func (c *ResolvedCacheStore) stripDepEdges(l1Key string) {
+	if c != nil {
+		if fn := c.depStrip.Load(); fn != nil && *fn != nil {
+			(*fn)(l1Key)
+			return
+		}
+	}
+	Deps().RemoveL1Key(l1Key)
 }
 
 // deleteForDep removes the entry under key, returning true if a live
@@ -1681,10 +1739,22 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 //
 // Performs a separate lock acquisition from any in-flight Get/Put —
 // holds c.mu only for the duration of the index lookup + LRU detach.
-// The dep tracker calls RemoveL1Key AFTER deleteForDep returns; since
-// the entry is already gone from index/order, the second cleanup pass
-// is a cheap no-op on the L1 side and does the actual dep-record
-// removal on the dep side.
+//
+// 1.12.7 F6a — THE EDGE STRIP IS PART OF THIS PRIMITIVE, under the same
+// mutex hold as the index delete. It used to be the caller's job, run
+// AFTER this returned and outside the lock, which left a window in which
+// the entry was gone but its edges were not: a concurrent resolve could
+// re-Put the key and record fresh edges inside that window, and the
+// caller's trailing strip would then remove the NEW entry's edges. The
+// result is a resident entry with no dep edge — invisible to the audit's
+// submit path (the hasEdge gate skips it) and therefore unreachable by
+// every repair path there is. Deleting an entry and orphaning its edges
+// must not be separately observable, so both happen under one hold.
+//
+// No new lock order: removeElementLocked already strips under this same
+// mutex on every TTL / max-age / LRU eviction, so store-mutex-then-dep-map
+// is the established and dominant order, and the strip itself takes no
+// store lock. The eviction publish still runs after every lock releases.
 func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	if c == nil {
 		return false
@@ -1695,14 +1765,14 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 		c.mu.Unlock()
 		return false
 	}
-	// removeElementLocked also calls Deps().RemoveL1Key — but in this
-	// path the dep tracker is mid-iteration over the reverse index
-	// for THIS key, and LoadAndDelete inside RemoveL1Key is a no-op
-	// the second time. We accept the trivial double-call rather than
-	// branching the eviction body.
 	item := el.Value.(*lruItem)
 	delete(c.index, item.key)
 	c.order.Remove(el)
+	// 1.12.7 F6a — strip the dep edges HERE, under the same hold as the
+	// index delete, so no window exists in which the key is gone and its
+	// edges are not. The strip is a sync.Map operation that takes no store
+	// lock, and it is a no-op when the key never recorded an edge.
+	c.stripDepEdges(item.key)
 	// 1.12.6 C4 (§6.4) — this is the one eviction body that does NOT go
 	// through removeElementLocked; the marker must not outlive its key here
 	// either (TestRefreshTerminal_F6e).

@@ -383,6 +383,44 @@ func navWidgetHarvestKey(gvr schema.GroupVersionResource, ns, name string, perPa
 	return gvr.String() + "|" + ns + "|" + name + "|" + fmt.Sprintf("%d|%d", perPage, page)
 }
 
+// forgetCoordinate drops every harvested entry for (gvr, ns, name), whatever
+// pagination tuple it was harvested under. 1.12.7 F6b — the ONLY removal path
+// on this harvester, and it runs exclusively on an authoritative GONE verdict
+// derived by the dep tracker from a servable informer's indexer
+// (cache.RegisterGoneForgetHook). Returns the number of entries dropped, so
+// the caller can log and count actual effect rather than hook invocations.
+//
+// WHY A SCAN AND NOT A KEYED DELETE. The dedup key carries the (perPage, page)
+// tuple, so one widget can hold several entries and the verdict names none of
+// them. The match is therefore on the entry's own coordinate — GVR plus the
+// harvested CR's namespace/name — which is also immune to any future change in
+// navWidgetHarvestKey's format. The map is bounded by the navigation widget
+// set (tens), the scan runs once per gone verdict, and it holds the same mutex
+// harvestNavWidget already takes per widget.
+//
+// REMOVE ON POSITIVE EVIDENCE, NEVER ON ABSENCE: nothing else in this type may
+// delete, and a walk that fails to reach a widget must never drop it (the walk
+// is lossy — that is why build-and-swap was rejected).
+func (h *navWidgetHarvester) forgetCoordinate(gvr schema.GroupVersionResource, ns, name string) int {
+	if h == nil || name == "" {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	dropped := 0
+	for k, e := range h.entries {
+		if e.GVR != gvr || e.W == nil {
+			continue
+		}
+		if e.W.GetNamespace() != ns || e.W.GetName() != name {
+			continue
+		}
+		delete(h.entries, k)
+		dropped++
+	}
+	return dropped
+}
+
 // snapshot returns a stable list of harvested widget entries.
 func (h *navWidgetHarvester) snapshot() []navWidgetEntry {
 	if h == nil {
@@ -493,6 +531,7 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 //   - restactions.Resolve same entrypoint at restactions.go:183-189.
 //   - encodeResolvedJSON + cacheHandle.Put + ensureWatcherInformerForGVR
 //   - cache.Deps().Record — same Put shape as restactions.go:212-230.
+//
 // seedSkipDecision is the SHARED per-mode seed-skip predicate for both seed
 // primitives (single derivation site — F4-C2a / keepwarm c2 §4.2). It consumes
 // the EXACT `key` the Put will use (passed by the caller, itself the single

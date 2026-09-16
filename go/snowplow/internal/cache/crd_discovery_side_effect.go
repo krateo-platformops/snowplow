@@ -142,6 +142,12 @@ type crdDiscovery struct {
 	schemaFingerprints sync.Map      // map[string]string (CRD name → schema fingerprint)
 	schemaRelistsFired atomic.Uint64 // relist passes that tore down >=1 GVR on a detected schema change
 	schemaUnchanged    atomic.Uint64 // ADD/UPDATE where the schema fingerprint was unchanged (no relist — thrash guard hit)
+	// 1.12.7 F2 / #219 — per-GVR state torn down because the CRD stopped
+	// serving that version. Non-zero is NORMAL on a cluster that upgrades
+	// components (every upgrade mints a new API version and retires the
+	// previous one); it is the number that should have been moving while
+	// watch_broken climbed 4 -> 40 and never fell.
+	staleVersionPruned atomic.Uint64
 	// 1.12.5 / #187 — post-sync re-fires of the relist dirty-mark. One per
 	// relisted GVR whose new informer synced inside the timeout. A count
 	// lagging schema_relists_fired means informers are not syncing after a
@@ -671,10 +677,28 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 	// load-bearing case (a runtime widen of an already-watched CRD). Relist its
 	// registered+served GVRs so the data informer re-LISTs under the new schema.
 	gvrs := crdServedGVRs(u)
+	rw := Global()
+	// 1.12.7 F2 (#219) — PRUNE the per-GVR state of versions this CRD no
+	// longer serves, BEFORE re-registering the ones it does.
+	//
+	// WHY HERE. Both RemoveResourceType call sites (this loop and
+	// triggerCRDDelete) iterate crdServedGVRs(u) — the CRD's CURRENT served
+	// versions — so a version already dropped from spec.versions can never be
+	// named by either of them. Its informers / syncCh / confirmed /
+	// watchBroken / informerStop / lastSyncRV entries and its dep edges then
+	// persist for the life of the process, and its reflector keeps retrying a
+	// LIST/WATCH against an API version the apiserver no longer serves. That
+	// is the measured #219 leak: on krateo-057 watch_broken rose 4 -> 40 over
+	// 24 h with ZERO decreases, and every latched GVR was a composition
+	// version that an upgrade had replaced.
+	//
+	// A version replacement always changes the fingerprint (crdSchemaFingerprint
+	// projects spec.versions[].name), so the relist pass is exactly where the
+	// retirement is observable.
+	c.pruneUnservedGVRs(rw, u, gvrs)
 	if len(gvrs) == 0 {
 		return
 	}
-	rw := Global()
 	relisted := 0
 	for _, gvr := range gvrs {
 		if rw == nil {
@@ -767,6 +791,80 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 				"pre-change indexer (followup-crd-schema-widen-informer-relist)."),
 		)
 	}
+}
+
+// pruneUnservedGVRs tears down the per-GVR state of every registered GVR that
+// belongs to THIS CRD (same group + plural) and is no longer in its served
+// version set. 1.12.7 F2 / #219.
+//
+// SCOPED, DELIBERATELY. The candidate set is filtered to the CRD's own
+// group+plural before anything is removed, so a global prune can never tear
+// down a kind this CRD knows nothing about — including kinds that were
+// registered lazily by the resolver and that no CRD event will ever name.
+//
+// CONSERVATIVE ON AN EMPTY SERVED SET. When served is empty we prune NOTHING.
+// crdServedGVRs returns nil both for "this CRD serves no version" (vanishingly
+// rare, and the DELETE path's job) and for "the versions subtree could not be
+// read" — and those two are indistinguishable here. Pruning on an unreadable
+// spec would tear down every live informer for the kind, so the empty case
+// declines. A version REPLACEMENT, which is the measured leak, always leaves
+// at least one served version and is therefore always covered.
+//
+// STOPPED, NOT FORGOTTEN. RemoveResourceType closes the per-GVR stop channel
+// (watcher.go) before deleting the map entries, so the reflector goroutine
+// exits rather than continuing to retry a LIST/WATCH against an API version
+// the apiserver no longer serves. Dropping the map entries alone would leave
+// that goroutine running for the life of the process.
+//
+// Runs on the single CRD-lifecycle worker goroutine, like every other
+// side-effect in this file. rw.RegisteredGVRs takes rw.mu.RLock and
+// RemoveResourceType takes rw.mu.Lock — sequentially, never nested.
+func (c *crdDiscovery) pruneUnservedGVRs(rw *ResourceWatcher, u *unstructured.Unstructured, served []schema.GroupVersionResource) {
+	if rw == nil || len(served) == 0 {
+		return
+	}
+	group, _, _ := unstructured.NestedString(u.Object, "spec", "group")
+	plural, _, _ := unstructured.NestedString(u.Object, "spec", "names", "plural")
+	if group == "" || plural == "" {
+		// Cannot scope the prune to this CRD — decline rather than guess.
+		return
+	}
+	keep := make(map[schema.GroupVersionResource]struct{}, len(served))
+	for _, g := range served {
+		keep[g] = struct{}{}
+	}
+	var pruned []schema.GroupVersionResource
+	for _, reg := range rw.RegisteredGVRs() {
+		if reg.Group != group || reg.Resource != plural {
+			continue
+		}
+		if _, ok := keep[reg]; ok {
+			continue
+		}
+		pruned = append(pruned, reg)
+	}
+	if len(pruned) == 0 {
+		return
+	}
+	for _, gvr := range pruned {
+		rw.RemoveResourceType(gvr)
+	}
+	c.staleVersionPruned.Add(uint64(len(pruned)))
+	names := make([]string, 0, len(pruned))
+	for _, gvr := range pruned {
+		names = append(names, gvr.Version)
+	}
+	slog.Info("cache.crd_discovery.stale_version_pruned",
+		slog.String("subsystem", "cache"),
+		slog.String("crd", u.GetName()),
+		slog.String("group", group),
+		slog.String("resource", plural),
+		slog.Any("versions", names),
+		slog.String("hint", "the CRD stopped serving these versions; their informers, sync channels, "+
+			"confirmation, watch-broken and last-sync state and dep edges are torn down. Before 1.12.7 "+
+			"they persisted for the life of the process with a reflector retrying a dead API version, and "+
+			"every dep event for those kinds degraded to a dirty-mark forever (#219)."),
+	)
 }
 
 // relistPostSyncTimeout bounds how long the post-sync re-fire goroutine
@@ -1036,6 +1134,8 @@ type CRDDiscoveryStats struct {
 	// followup-crd-schema-widen-informer-relist
 	SchemaRelistsFired uint64 `stat:"schema_relists_fired"` // ADD/UPDATE passes that relisted >=1 GVR on a detected structural-schema change
 	SchemaUnchanged    uint64 `stat:"schema_unchanged"`     // ADD/UPDATE where the schema fingerprint was unchanged (thrash guard hit; no relist)
+	// 1.12.7 F2 / #219
+	StaleVersionPruned uint64 `stat:"stale_version_pruned_total"` // per-GVR state torn down because the CRD stopped serving that version
 
 	// 1.12.5 / #187
 	RelistDirtyMarkPostSync uint64 `stat:"relist_dirtymark_postsync_total"` // post-sync re-fires of the relist dirty-mark
@@ -1075,6 +1175,7 @@ func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
 		PanicsRecovered:    c.panicsRecovered.Load(),
 		SchemaRelistsFired: c.schemaRelistsFired.Load(),
 		SchemaUnchanged:    c.schemaUnchanged.Load(),
+		StaleVersionPruned: c.staleVersionPruned.Load(),
 
 		RelistDirtyMarkPostSync: c.relistDirtyMarkPostSync.Load(),
 		RelistPostSyncTimeout:   c.relistPostSyncTimeout.Load(),
