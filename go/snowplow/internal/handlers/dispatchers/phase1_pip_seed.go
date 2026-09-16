@@ -418,6 +418,12 @@ func (h *navWidgetHarvester) forgetCoordinate(gvr schema.GroupVersionResource, n
 		delete(h.entries, k)
 		dropped++
 	}
+	// 1.12.7 observability — count the EFFECT, at the removal. One widget can
+	// hold several entries (one per pagination tuple), so this may move by more
+	// than one per gone coordinate; that is the number of replays stopped.
+	if dropped > 0 {
+		harvestForgottenNavTotal.Add(uint64(dropped))
+	}
 	return dropped
 }
 

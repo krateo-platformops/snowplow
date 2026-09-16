@@ -114,6 +114,11 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 		_, already := rw.watchBroken[gvr]
 		rw.watchBroken[gvr] = struct{}{}
 		rw.mu.Unlock()
+		// 1.12.7 — count EVERY reflector error. The WARN below is one-shot per
+		// GVR (map membership), which keeps a broken watch from flooding the
+		// log but also hides the retry rate: one failure and a failure every
+		// second look identical. The counter is what makes the rate visible.
+		recordWatchError()
 		if !already {
 			slog.Warn("cache.watch.broken",
 				slog.String("subsystem", "cache"),
@@ -254,7 +259,7 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 	defer rw.mu.Unlock()
 	rw.ensureConfirmMapsLocked()
 	for i, gvr := range gvrs {
-		rw.applyConfirmLocked(gvr, gis[i], disco != nil, served[groupVersionString(gvr)])
+		rw.applyConfirmLocked(gvr, gis[i], disco != nil, served[groupVersionString(gvr)], confirmRetractDiscoveryRefresh)
 	}
 }
 
@@ -288,6 +293,9 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	gi informers.GenericInformer,
 	haveDisco bool,
 	typeServed bool,
+	// 1.12.7 — which call path is re-evaluating conjunct 4, so a retraction
+	// counted below names the code path rather than a category.
+	reason string,
 ) {
 	// Conjunct 4: confirm the resource type. With no discovery client,
 	// haveDisco==false ⇒ resourceTypeConfirmedLocked already returns true,
@@ -300,6 +308,14 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 			// gates a post-startup CRD until the apiserver publishes its
 			// API, and also correctly retracts a confirmation if a CRD is
 			// deleted.
+			//
+			// 1.12.7 — count it, but ONLY when a confirmation actually
+			// existed: this delete is unconditional and runs on every pass
+			// for a GVR that was never confirmed, so counting the call would
+			// count non-events.
+			if _, was := rw.confirmed[gvr]; was {
+				recordConfirmRetracted(reason)
+			}
 			delete(rw.confirmed, gvr)
 		}
 	}
@@ -399,7 +415,7 @@ func (rw *ResourceWatcher) ConfirmResourceType(ctx context.Context, gvr schema.G
 		return
 	}
 	rw.ensureConfirmMapsLocked()
-	rw.applyConfirmLocked(gvr, curGI, disco != nil, typeServed)
+	rw.applyConfirmLocked(gvr, curGI, disco != nil, typeServed, confirmRetractScopedConfirm)
 }
 
 // ConfirmResourceTypes runs the scoped conjunct-3/4 confirmation pass over a
@@ -476,7 +492,7 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 		if !stillRegistered {
 			continue
 		}
-		rw.applyConfirmLocked(gvr, curGI, disco != nil, served[groupVersionString(gvr)])
+		rw.applyConfirmLocked(gvr, curGI, disco != nil, served[groupVersionString(gvr)], confirmRetractWalkConfirm)
 	}
 }
 

@@ -18,7 +18,7 @@ port the server listens on (`main.go` `server.Addr = :<port>`):
 4. **OTel export** — traces, metrics and logs to an OTLP collector,
    **default-on since 1.12.4** behind the `OTEL_ENABLED` master switch (see below).
 
-Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage`,
+Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage`, `GET /debug/harvest`,
 `GET /debug/refreshes` (the live-refresh subscription registry) and
 `GET /debug/reconcile` (1.12.6 C3 — the on-demand full reconcile audit, see the
 dependency-tracker section), and two probe endpoints used by the chart.
@@ -190,6 +190,8 @@ Defined in `internal/handlers/dispatchers/phase1_pip_metrics.go` (+ siblings).
 | `snowplow_phase1_seed_fresh_skip_total` | `uint64` — seed units skipped because the cell is still fresh (boot-resume / keepwarm passes) | evidence the resume/sweep is incremental, not redundant |
 | `snowplow_phase1_keepwarm_age_skip_total` | `uint64` — keepwarm sweep age-skips (cell young enough) | climbs with sweeps over a warm store |
 | `snowplow_phase1_seed_skipped_stage_error_total` | `uint64` — seed Puts declined by the error-aware Put-gate | low; a climb = a systematically-degraded seed target |
+| `prewarm.coverage` | map — `{harvested_widgets, harvested_restactions, walked_roots, max_harvested_widgets, regressed_total}` (#220). `max_harvested_widgets` is the process-lived high-water mark of DISTINCT widgets a COMPLETED walk reached; it is the self-adapting baseline, so there is no threshold to tune | `harvested_widgets` should track `max_harvested_widgets`. A gap between them means the walk stopped reaching part of the navigation tree and those pages are a cold first load. `regressed_total` > 0 ⇒ read the `prewarm.coverage.regressed` WARN, which carries both numbers |
+| `snowplow_phase1_harvest_forgotten_total` | map keyed by harvester (`nav_widget` / `apiref`) — harvested ENTRIES DROPPED because the object was confirmed gone (1.12.7 F6b/F6c) | `0` on a cluster where nothing is deleted. Climbs only when a deletion actually stopped a replay; counts removals, **not** hook firings, so it does not climb for gone objects that were never harvested. `nav_widget` can move by more than 1 per object (one entry per pagination tuple) |
 | `snowplow_phase1_widget_seed_failure_total` / `snowplow_phase1_restaction_seed_failure_total` | per-cohort×object failure maps | pinpoint which widget/RA broke which cohort |
 | `snowplow_resolved_cache_hits_seed_attributable` | hits on cells the seed wrote (seed attribution) | the seed-is-actually-useful signal |
 
@@ -259,6 +261,23 @@ change. No arm pins it (see the matrix); alert on the rule.
 | `snowplow_crd_schema_memo_hits_total` / `_misses_total` / `_stale_dropped_total` / `_invalidations_total` (`internal/resolvers/crds/schema/schema_cache_metrics.go`) | compiled-CRD-schema memo counters | high hit ratio warm; stale-drops expected under concurrent CRD install |
 | `snowplow_sa_discovery_builds_total` / `_invalidations_total` / `_fallbacks_total` (`internal/dynamic/cached_client_metrics.go`) | SA-discovery client lifecycle | fallbacks low; climb = discovery degrading |
 
+#### `snowplow_informer_watch` stats
+
+Two 1.12.7 counters for informer failures that previously left no trace anywhere but a log line.
+Tag-derived (`InformerWatchStats`), so they reach expvar, OTLP, this doc's guard and the C7 parity
+arms from one struct tag each.
+
+| stat | meaning | healthy range |
+|---|---|---|
+| `watch_errors_total` | reflector `ListAndWatch` errors across **every** informer family (per-GVR, secrets, controller-health). Counts EVERY invocation — our handlers replace client-go's default and each logs only its FIRST failure, so before this a watch failing once and a watch failing every second produced the same single WARN | **0**. A climbing value is the retry RATE, which is the thing the one-shot WARN hides. Read it next to `cache.watch.broken` / `cache.secrets.watch.broken` |
+| `confirm_retracted_total` | GVRs whose servability confirmation was retracted **after having been granted**. A retracted GVR silently stops serving from the informer and falls through to the apiserver; #217 took a day to characterise because the retraction left no trace. Counted only when a confirmation actually existed, so ordinary teardowns of never-confirmed GVRs do not inflate it | **0** in steady state. Non-zero is expected around a CRD upgrade or delete — use the by-reason map below to tell which |
+
+`snowplow_informer_confirm_retracted_by_reason` is the `{reason}` breakdown, a map keyed by the
+code path that retracted: `discovery_refresh` / `scoped_confirm` / `walk_confirm` (the apiserver no
+longer serves the type) and `schema_relist` / `stale_version_pruned` / `crd_deleted` (the informer
+was torn down). It rides alongside rather than inside the tagged family because the C7 tag system
+has no label facility — a `stat` tag yields exactly one scalar.
+
 #### `snowplow_crd_discovery` stats
 
 | stat | meaning | healthy range |
@@ -313,6 +332,7 @@ The stats that answer an invalidation question:
 | `probe_exists_total` / `probe_absent_total` | actions derived from an authoritative indexer read: exists → dirty-mark, absent → evict self | track churn; `absent` moves with deletions |
 | `probe_unknown_total` | probes where the indexer was **not authoritative** for the GVR (relist teardown window, unsynced informer, broken watch, unconfirmed type) → requeued with backoff | small bursts around CRD schema churn are normal |
 | `probe_unknown_degraded_total` | coordinates that stayed unknown for the whole requeue budget and were degraded to a dirty-mark (the refresher then decides against the apiserver) | **0**. Non-zero means an informer is not recovering — alert on it |
+| `on_object_event_degraded_no_evict_total` | **1.12.7** — the CONSEQUENCE of the row above, which that counter does not carry: a degraded verdict that reached at least one dependent entry and therefore evicted **nothing**, deferring the eviction decision to the refresher. Counted per event, and only when the match set was non-empty — a degraded verdict naming a coordinate nothing depends on cost nothing | **0**. Read it against `probe_unknown_degraded_total`: that one counts budget exhaustions, this one counts the ones that had something at stake. Non-zero means entries are being held resident on an informer's say-so that the informer could not give |
 | `self_notfound_evict_total` | refresher-side count of times the drop-point eviction branch fired. Differs from `evict_self_gone_total` only when the entry had already gone by another route | non-zero is **normal**. It is the healthy replacement for the `refresher.refresh_failed` ×5 + `refresher.refresh_dropped` pair that used to leave the body resident |
 | `evict_max_age_total` (under `snowplow_resolved_cache`) | **1.12.6.** entries evicted on `Get` because they were born more than `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS` ago, however many times they were re-Put since | low and steady (≈ one per resident cell per day at the default). A burst right after a pod's first 24 h is the boot seed's cohort aging out together and is expected |
 | `snowplow_refresher_drop_evict_total` | **1.12.6.** entries evicted at the drop point after a deterministic **non-404** failure exhausted the requeue budget (403/500/timeout/parse/not-servable); the `refresher.refresh_dropped` WARN now says `entry EVICTED`. OTLP twin: `snowplow_refresher{stat="drop_evict"}` | non-zero is normal on a cluster with dead objects or broken RESTActions. Every one is an entry that used to sit stale until the 1 h TTL |
@@ -322,7 +342,7 @@ The stats that answer an invalidation question:
 | `add_propagated` / `add_dropped_pre_sync` / `add_nil_syncch` | the ADD initial-replay gate | `add_nil_syncch` should be **0** (a registration path skipped the syncCh allocation; dep marks for that GVR degrade to TTL) |
 | `reconcile_divergence_total` | **1.12.6 C3** — coordinates the sampled reconcile audit found whose own object is ABSENT from a synced indexer, that a resident entry still holds a self dep edge for, and that no event had evicted: each one is a DELETE the pipeline lost, re-derived from the indexer and handed to the dep-event worker (`internal/cache/deps_reconcile.go`). Entries the worker could NOT evict (no edge — see `reconcile_skipped_no_edge_total`) are kept out of it | **0** on a healthy cluster. A rate that does not fall back to zero between ticks means a handler, the queue or the relist bridge is dropping events — alert on it. The per-tick `cache.deps_reconcile.divergence` WARN names up to three coordinates |
 | `reconcile_sampled_total` / `reconcile_probed_total` / `reconcile_ticks_total` | resident entries visited by the audit / unique self coordinates probed (the divergence denominator — cohort copies of one widget share one probe; LIST entries are visited, not probed) / ticks run. Defaults `DEPS_RECONCILE_SAMPLE=512` every `DEPS_RECONCILE_PERIOD_SECONDS=30` (`"0"` disables the ticker) | `sampled` grows by ≤ 512 per tick, `probed` by ≤ `sampled`; `ticks` grows by 2/min |
-| `reconcile_skipped_no_edge_total` | ABSENT entries the audit found that hold **no self dep edge** — their `Record` was dropped at `DEPS_MAX_RECORDS` (`dropped_cap`), so the worker's ABSENT verdict cannot reach them and they are served until their TTL. Counted here, NOT as divergence, and their coordinate is not submitted (it would evict nothing) | **0**. Non-zero is the `dropped_cap` symptom made visible (read it next to `dropped_cap`), not a lost DELETE — raise `DEPS_MAX_RECORDS` |
+| `reconcile_skipped_no_edge_total` | ABSENT entries the audit found that hold **no self dep edge**, so the worker's ABSENT verdict cannot reach them: the worker's match set for their coordinate is empty and submitting it would evict nothing. Counted here rather than as divergence. **Two distinct causes, and they need different fixes.** (1) `Record` was dropped at `DEPS_MAX_RECORDS` — read `dropped_cap` alongside; the fix is raising the cap. (2) Pre-1.12.7, the edges were stripped by an eviction racing a re-Put, leaving a resident entry with no edge; 1.12.7 F6a closed that by stripping under the same lock as the index delete, so newly-created entries of this shape should not appear. **NOT a statement about repairability** — these entries are unreachable by the *current* repair path, which submits through the worker; a repair that deletes from the store directly reaches them, and that is what F1 is for | **0**. Non-zero with `dropped_cap` also climbing = raise `DEPS_MAX_RECORDS`. Non-zero with `dropped_cap` flat, on 1.12.7 or later, is the population F1 exists to remove and should be reported |
 | `reconcile_unknown_total` | coordinates the audit SKIPPED because the indexer was not authoritative for their GVR (unregistered, unsynced, watch broken, relist window). Never guessed | small; persistently large means entries are resident for GVRs that are not watched |
 | `reconcile_panics_total` | audit ticks that panicked (recovered; the ticker survives) | **0** |
 
@@ -359,12 +379,47 @@ something to call when a stranded entry is suspected, not something to poll.
 All of it is mirrored to OTLP as the `snowplow_deps` observable gauge, labelled by `stat`
 (`internal/metrics/metrics.go`).
 
+### Inspecting the Phase-1 harvesters (1.12.7)
+`GET /debug/harvest` answers **"does the harvester still hold this coordinate?"** — the question
+the 1.12.7 acceptance step has to settle and that no surface could answer.
+
+    GET /debug/harvest
+        counts only: navEntries (harvested ENTRIES, one per pagination tuple, not per widget)
+        and apiRefs (distinct RESTActions).
+    GET /debug/harvest?group=&version=&resource=&namespace=&name=
+        the same counts plus heldByNavHarvester / heldByApiRefHarvester for that coordinate.
+
+`available:false` means **no harvester has been published** — prewarm is off, or boot has not
+reached the engine. It is deliberately distinct from "the harvesters are empty", which is a
+healthy post-forget state; conflating them would let a misconfigured pod read as a successful
+forget.
+
+Why it exists: 1.12.7 F6b/F6c drop a confirmed-gone object from both harvesters, which is what
+stops a deleted widget being re-resolved into L1 on every seed pass. Until this endpoint that
+state was verifiable in tests and nowhere else.
+`snowplow_phase1_harvest_forgotten_total` says a forget HAPPENED; this says what is held NOW.
+
+**Metadata only, structurally.** Every field is an int or a bool. The harvested value is a whole
+widget CR and what the seed makes of it is per-identity resolved output, so the same boundary
+that keeps bodies off `/debug/apistage` applies here — and the response type has no field that
+could carry one.
+
 ### Inspecting ONE resolved entry (1.12.5)
 `GET /debug/apistage?key_hash=<hex>` returns the metadata row for a single resident entry
 instead of the full walk, with two fields populated only on that path: `bodySha256` and the
 opaque `bindingUID`. It is how you answer "how old is this entry, and is its body the same one
 as before?" in one request — the question #187 had to infer from the client's subsequent child
 fetches because no surface could answer it directly.
+
+**`lifetimeSeconds` vs `ageSeconds` (1.12.7).** `ageSeconds` is the age of the BODY, measured
+from `CreatedAt` and reset by every refresh re-Put — so a cell the refresher keeps warm reports a
+small `ageSeconds` forever, however long it has been resident. `lifetimeSeconds` is the age of the
+KEY, measured from `BornAt`, which a re-Put inherits and never resets. It is the value
+`RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS` bounds, **and that bound is enforced ON READ** — the check
+lives in `Get`, so the entry is evicted by the request that hits it. An entry that is never read
+therefore sits past the bound indefinitely without breaching anything. Before this field an
+operator could see that an entry was past its TTL but not whether it was past the age the bound
+would enforce on its next read.
 
 **It returns a hash, never the body, and that is a security boundary rather than a size
 choice.** L1 cells are per-identity: the key folds `BindingUID`, so on krateo-057 one widget
@@ -425,7 +480,8 @@ rot. Detector names are `<expvar>.<stat>` for map families or a bare expvar key.
 | I2 | informer → worker | a CRD schema relist swaps the informer; an object deleted inside the teardown window never produces a DELETE | `snowplow_crd_discovery.relist_bridge_enqueued_total` (the bridge saw it), `snowplow_crd_discovery.relist_bridge_timeout_total` (the bridge could not run — the soak signal), `snowplow_crd_discovery.relist_dirtymark_postsync_total` (the 1.12.5 containment) | `TestIssue1126_E1_RelistBridgeEvictsTheObjectTheFreshListOmits`, `TestIssue1126_E3_RelistBridgeTimeoutIsCountedAndEnqueuesNothing`, `TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry` | PINNED — additive: bridge + re-fire until the timeout counter has soaked at 0 |
 | I3 | informer → worker | the CRD lifecycle queue overflows and drops a DELETE (an informer is never torn down; dependents stay resident until TTL) | `snowplow_crd_discovery.events_dropped`, `snowplow_crd_discovery.events_parked` | `TestCRDLifecycleQueue_OverflowParksAndNeverDrops`, `TestCRDLifecycleQueue_ParkGivesUpOnShutdown` | PINNED — park-and-drain; a drop is a last resort after 30 s and counted |
 | W1 | worker | the indexer is not authoritative (unsynced, watch broken, relist window) and the coordinate stays UNKNOWN past the requeue budget | `snowplow_deps.probe_unknown_total`, `snowplow_deps.probe_unknown_degraded_total` | `TestIssue1126_C2_UnknownDegradesToDirtyMarkAfterTheBudget`, `TestIssue1126_E2_TeardownWindowEvictsNothing` | PINNED — degrades to a dirty-mark; the refresher decides against the apiserver |
-| W2 | worker | the entry holds no dep edge (`dropped_cap`), so the worker's ABSENT verdict cannot reach it; the body is served until TTL / max age | `snowplow_deps.dropped_cap`, `snowplow_deps.reconcile_skipped_no_edge_total` | `TestIssue1126_C3_FU2_NoEdgeEntryIsCountedApartAndNeverPinsDivergence` | OPEN — detected, NOT repaired: the audit counts it apart and does not submit a coordinate that would evict nothing; the fix is `DEPS_MAX_RECORDS` |
+| W2 | worker | the entry holds no dep edge, so the worker's ABSENT verdict cannot reach it; the body is served until TTL / max age. Two causes: `Record` dropped at the cap, or (pre-1.12.7) edges stripped by an eviction racing a re-Put | `snowplow_deps.dropped_cap`, `snowplow_deps.reconcile_skipped_no_edge_total` | `TestIssue1126_C3_FU2_NoEdgeEntryIsCountedApartAndNeverPinsDivergence`, `TestIssue216_F6a_ConcurrentRewriteKeepsItsEdges` | OPEN — detected, and not reachable by the CURRENT repair path, which submits through the worker and would evict nothing. NOT inherently unrepairable: 1.12.7 F6a stops new ones being created, and a repair that deletes from the store directly reaches the rest (F1). Raise `DEPS_MAX_RECORDS` for the cap half |
+| W4 | worker | divergence is DETECTED but nothing is repaired: `reconcile_divergence_total` climbs while the entries stay resident, because every diverged entry is skipped before the submit (no edge) or its submit evicts nothing | `snowplow_deps.reconcile_divergence_total` climbing with `snowplow_deps.reconcile_skipped_no_edge_total` non-zero and `snowplow_deps.evict_delete_total` flat across the same window | `TestIssue1126_C3_FU2_NoEdgeEntryIsCountedApartAndNeverPinsDivergence` | OPEN — this is the combination that made #216 cost a day: detection and repair are counted separately and nothing named the gap between them. The direct-delete repair and its own repaired / repair_failed counters ship with F1; until then read the three counters together |
 | W3 | worker | any lost DELETE not covered above (unknown cause) leaves a stranded entry | `snowplow_deps.reconcile_divergence_total` (detector; ≈1.6 h to first visit, ≈7.5 h to 99 % at 512/30 s — NOT a staleness bound) | `TestIssue1126_D2_ReconcileTickerEvictsAStrandedEntry`, `TestIssue1126_D2c_ReconcileOnceCountsExactlyAndSkipsUnknown` | PINNED as a detector; the TTL (3600 s) remains the bound |
 | R1 | refresher | the re-fetch of the entry's own object returns a confirmed 404 | `snowplow_deps.evict_self_gone_total`, `snowplow_deps.self_notfound_evict_total` | `TestIssue187_B3b_SelfGoneEvictsAtTheDropPoint`, `TestIssue187_B2E2E_RefresherSelfNotFoundEvictsThroughTheRealLoop` | PINNED — evicted at the drop point after the full budget |
 | R2 | refresher | a deterministic non-404 failure (403 / 500 / timeout / parse / not-servable) used to drop the key and keep the body until TTL | `snowplow_refresher_drop_evict_total`, `snowplow_deps.evict_drop_point_total` | `TestIssue1126_C4_F4_DeterministicNon404IsEvictedAtTheDropPoint`, `TestRefreshTerminal_F5a_FewDeterministicFailuresAreEvicted`, `TestIssue1126_C4_F7_ApistageNotServableIsEvictedAtTheDropPoint` | PINNED — evicted behind the breaker (`REFRESH_DROP_EVICT_MAX_PER_MINUTE`) |

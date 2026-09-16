@@ -8,8 +8,13 @@
 //   frontend ConfigMap — that ConfigMap IS the navigation contract.
 //
 //   The frontend ConfigMap `krateo-system/frontend-config-vars` carries a
-//   single key `config.json` (a JSON string). Two fields name the two
+//   single key `config.json` (a JSON string). Up to two fields name the
 //   `/call` entry points the frontend itself dispatches on login:
+//
+//   1.12.7 / #220 — TODAY ONLY `INIT` IS DECLARED, and that is the normal
+//   shape: the routes loader was removed, so `.api.ROUTES_LOADER` is absent
+//   from config.json and its absence is logged at Info, not WARN. The field is
+//   still read, so a config that declares it again works with no Go change.
 //
 //     .api.INIT          — e.g. /call?resource=navmenus&apiVersion=...
 //                          &name=sidebar-nav-menu&namespace=krateo-system
@@ -164,10 +169,33 @@ func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Int
 	)
 	for _, rr := range rawRoots {
 		if rr.url == "" {
+			// 1.12.7 / #220 — LEVEL BY FIELD, because the two are not the same
+			// event.
+			//
+			// ROUTES_LOADER is DEAD, not missing: the routes loader was removed
+			// and a config.json declaring only INIT is the normal shape today.
+			// This WARN fired 14 times in 50 minutes on 057 and was the ONLY
+			// warning emitted while the walk's reachable set collapsed from 177
+			// widgets to 5 — noise that actively masked a real outage. Info.
+			//
+			// INIT empty is the opposite: it means NO navigation roots at all,
+			// so nothing is prewarmed and every page is a cold first load. That
+			// stays a WARN, and says so.
+			if rr.field == "ROUTES_LOADER" {
+				log.Info("phase1.roots.entry_point_absent",
+					slog.String("subsystem", "cache"),
+					slog.String("field", rr.field),
+					slog.String("effect", "not declared in config.json — expected: the routes loader "+
+						"was removed and a single INIT entry point is the current shape"),
+				)
+				continue
+			}
 			log.Warn("phase1.roots.entry_point_empty",
 				slog.String("subsystem", "cache"),
 				slog.String("field", rr.field),
-				slog.String("effect", "navigation entry point not declared in config.json — skipped"),
+				slog.String("effect", "navigation entry point not declared in config.json — skipped. "+
+					"With INIT absent the walk has NO roots: nothing is prewarmed and every page is a "+
+					"cold first load"),
 			)
 			continue
 		}

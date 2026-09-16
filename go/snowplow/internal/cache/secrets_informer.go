@@ -320,6 +320,11 @@ func initialSecretCount() int {
 // "diagnostic" mitigation can be added later).
 func installSecretsWatchErrorHandler(inf clientcache.SharedIndexInformer) {
 	handler := func(_ *clientcache.Reflector, err error) {
+		// 1.12.7 — count EVERY error, ABOVE the CAS. This one-shot is sticky
+		// until pod restart, so an increment below it would record exactly one
+		// error for the life of the process however long the watch stays
+		// broken.
+		recordWatchError()
 		if !secretsWatchBroken.CompareAndSwap(false, true) {
 			// Already broken — suppress duplicate WARN.
 			return

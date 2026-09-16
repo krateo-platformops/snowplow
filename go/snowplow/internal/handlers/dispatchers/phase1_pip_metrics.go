@@ -127,6 +127,33 @@ var (
 	// age-skip (F4-C3 per-mode boundary). Exposed as
 	// snowplow_phase1_keepwarm_age_skip_total.
 	keepwarmAgeSkipTotal atomic.Uint64
+
+	// 1.12.7 observability — harvestForgottenNavTotal / harvestForgottenApiRefTotal
+	// count HARVESTED ENTRIES ACTUALLY REMOVED from each Phase-1 harvester
+	// because the object was confirmed gone: the dep tracker's ABSENT verdict
+	// (F6b, via cache.RegisterGoneForgetHook) or the walk's confirmed 404 (F6c).
+	//
+	// COUNT THE EFFECT, NEVER THE INVOCATION. These bump inside each
+	// harvester's forgetCoordinate, once per entry dropped — NOT where the hook
+	// fires. Almost every gone verdict names a coordinate that was never
+	// harvested, so counting hook invocations would report a large, steadily
+	// climbing number that says nothing about whether any replay was actually
+	// stopped. A non-zero value here means a specific harvested copy stopped
+	// being re-resolved into L1. Incrementing at the removal also makes the
+	// count structural: a future third caller of forgetCoordinate cannot forget
+	// to count.
+	//
+	// SPLIT PER HARVESTER, because they fail independently: the nav-widget
+	// harvester feeds the per-binding widget seed and the content-prewarm
+	// harvester feeds the apiRef RESTAction pass. A forget landing on one and
+	// not the other is the shape worth seeing. The nav counter can move by more
+	// than one per coordinate — one widget may be harvested under several
+	// pagination tuples, and all of them go.
+	//
+	// Exposed as snowplow_phase1_harvest_forgotten_total, a map keyed by
+	// harvester ("nav_widget" / "apiref").
+	harvestForgottenNavTotal    atomic.Uint64
+	harvestForgottenApiRefTotal atomic.Uint64
 )
 
 // Ship 0.30.187 D1 — per-(cohort, target) failure maps. Keyed by
@@ -183,6 +210,7 @@ func init() {
 		return
 	}
 	registerPIPMetrics()
+	registerWalkCoverageExpvar()
 }
 
 // registerPIPMetrics performs the expvar.Publish calls for the PIP
@@ -263,6 +291,20 @@ func registerPIPMetrics() {
 		// actively firing (gate-working vs informer-dead/churn-stopped).
 		expvar.Publish("snowplow_phase1_configvars_skipped_total", expvar.Func(func() any {
 			return configVarsSkippedTotal.Load()
+		}))
+
+		// 1.12.7 observability — harvested entries actually DROPPED because the
+		// object was confirmed gone, split by harvester. Zero on a cluster where
+		// nothing is deleted; a climbing value is the proof that the 1.12.7
+		// replay fix is doing work, and the only production-visible evidence
+		// that a coordinate was forgotten rather than merely reported gone.
+		// See the counter var block for why this counts removals, not hook
+		// invocations.
+		expvar.Publish("snowplow_phase1_harvest_forgotten_total", expvar.Func(func() any {
+			return map[string]uint64{
+				"nav_widget": harvestForgottenNavTotal.Load(),
+				"apiref":     harvestForgottenApiRefTotal.Load(),
+			}
 		}))
 
 		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so

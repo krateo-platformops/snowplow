@@ -162,6 +162,13 @@ func DepsStatsByStat() map[string]int64 {
 		"probe_absent_total":           int64(w.ProbeAbsent),
 		"probe_unknown_total":          int64(w.ProbeUnknown),
 		"probe_unknown_degraded_total": int64(w.ProbeUnknownDegraded),
+		// 1.12.7 — the CONSEQUENCE of a degrade, which probe_unknown_degraded_total
+		// does not carry: the verdict reached at least one dependent entry and
+		// evicted nothing, so the eviction decision was deferred to the
+		// refresher. Read next to probe_unknown_degraded_total: that one counts
+		// budget exhaustions, this one counts the ones that had something at
+		// stake.
+		"on_object_event_degraded_no_evict_total": int64(d.OnObjectEventDegradedNoEvict),
 
 		// --- the sampled reconcile audit (1.12.6 C3, deps_reconcile.go) ---
 		// reconcile_divergence_total is THE pipeline-health number: each unit

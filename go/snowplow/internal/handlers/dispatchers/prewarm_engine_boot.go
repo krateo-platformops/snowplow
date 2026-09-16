@@ -431,6 +431,11 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 		rewalked++
 	}
 
+	// 1.12.7 / #220 — same observation for the engine re-walk. A root that
+	// failed above `continue`s without incrementing rewalked, so rewalked <
+	// len(roots) is exactly the partial-pass case that must not alarm.
+	recordWalkCoverage(rewalked, rewalked == len(roots))
+
 	// ── (2) SETTLE the registered set once (single pass, not a loop) so a
 	// CRD the re-walk discovered has its informer registered before the
 	// seed reads RegisteredGVRs().

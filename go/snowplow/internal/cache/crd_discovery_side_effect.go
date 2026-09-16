@@ -715,9 +715,9 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 		// (relist_bridge.go). Read-only; the diff against the fresh LIST runs
 		// on the bridge goroutine spawned below.
 		before, had := rw.IndexerKeys(gvr)
-		rw.RemoveResourceType(gvr)               // R6 per-GVR teardown; idempotent, nil-safe
-		_, syncCh := rw.EnsureResourceType(gvr)  // re-register → fresh LIST under current schema
-		Deps().OnResourceTypeSchemaRelisted(gvr) // dirty-mark dependent L1 (logs SCHEMA_RELIST, not CRD_DELETE)
+		rw.removeResourceTypeWithReason(gvr, confirmRetractSchemaRelist) // R6 per-GVR teardown; idempotent, nil-safe
+		_, syncCh := rw.EnsureResourceType(gvr)                          // re-register → fresh LIST under current schema
+		Deps().OnResourceTypeSchemaRelisted(gvr)                         // dirty-mark dependent L1 (logs SCHEMA_RELIST, not CRD_DELETE)
 		// 1.12.5 / #187 — RE-FIRE THE DIRTY-MARK AFTER THE NEW INFORMER SYNCS.
 		//
 		// The teardown above opens a window in which DELETEs are lost with no
@@ -847,7 +847,7 @@ func (c *crdDiscovery) pruneUnservedGVRs(rw *ResourceWatcher, u *unstructured.Un
 		return
 	}
 	for _, gvr := range pruned {
-		rw.RemoveResourceType(gvr)
+		rw.removeResourceTypeWithReason(gvr, confirmRetractStaleVersionPruned)
 	}
 	c.staleVersionPruned.Add(uint64(len(pruned)))
 	names := make([]string, 0, len(pruned))
@@ -1044,7 +1044,7 @@ func triggerCRDDelete(obj interface{}) {
 			Resource: plural,
 		}
 		if rw != nil {
-			rw.RemoveResourceType(gvr) // idempotent, nil-safe
+			rw.removeResourceTypeWithReason(gvr, confirmRetractCRDDeleted) // idempotent, nil-safe
 		}
 		Deps().OnResourceTypeRemoved(gvr) // dirty-mark dependent L1
 		torn++

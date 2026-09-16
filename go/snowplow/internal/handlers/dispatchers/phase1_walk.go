@@ -399,6 +399,12 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		navHarvester = newNavWidgetHarvester()
 	}
 
+	// 1.12.7 observability — publish both harvesters for the read-only debug
+	// surface and the coverage alarm AS SOON AS THEY EXIST, before the walk
+	// runs. Publishing later (at engine wiring) would leave the boot walk's own
+	// coverage unobservable, which is the pass #220 regressed on.
+	publishHarvestersForInspection(navHarvester, harvester)
+
 	// Path 3.2.2.b (0.30.221) — the deferred apiRef pagination collector.
 	// The walker writes jobs here during Phase 1 (cheap mutex append);
 	// phase1WarmupWith drains them in a background goroutine AFTER
@@ -778,6 +784,11 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		}
 		resolved++
 	}
+
+	// 1.12.7 / #220 — observe this pass's coverage. COMPLETED means every root
+	// resolved and ctx never expired: a pass that lost a root legitimately
+	// harvests less and must not raise the alarm.
+	recordWalkCoverage(resolved, walkErr == nil && resolved == len(roots))
 
 	// Step 5 — (Ship 0.5 / 0.30.223, v6) DELETED. The pre-v6 path
 	// invoked a CRD-store re-scan here to close the CRD-
