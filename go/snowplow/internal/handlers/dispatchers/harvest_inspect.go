@@ -43,8 +43,22 @@ var liveHarvesters atomic.Pointer[harvestInspectSource]
 // surface. Called from the same boot site as the gone-forget hook, with the
 // same instances the engine seeds from, so what the surface reports is exactly
 // what the seed will read.
+//
+// BOTH OR NEITHER (1.12.7 review C-1). The guard requires both harvesters,
+// because a half-published pair is the one shape that breaks this file's
+// contract: with a nil nav harvester the accessors below would report
+// available=true with navEntries=0 — an ABSENT harvester reading as an EMPTY
+// one, which is exactly what the header above forbids and what the acceptance
+// step would misread as "the coordinate was forgotten". A nil pair leaves the
+// pointer unset and every accessor answers ok=false, which is the truthful
+// "this pod cannot answer".
+//
+// Today the three prewarm gates collapse to a single flag (phase1_walk.go), so
+// the two are always both present or both nil and this cannot trigger. It is
+// written for the day one of those gates separates again, because the failure
+// would otherwise be a silent false pass rather than a visible refusal.
 func publishHarvestersForInspection(nav *navWidgetHarvester, apiRef *contentPrewarmHarvester) {
-	if nav == nil && apiRef == nil {
+	if nav == nil || apiRef == nil {
 		return
 	}
 	liveHarvesters.Store(&harvestInspectSource{nav: nav, apiRef: apiRef})

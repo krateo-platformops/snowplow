@@ -362,7 +362,21 @@ func installControllerHealthHandlers(inf clientcache.SharedIndexInformer) {
 // installControllerHealthWatchErrorHandler wires the sticky-broken
 // WATCH-error handler. Mirrors installSecretsWatchErrorHandler.
 func installControllerHealthWatchErrorHandler(inf clientcache.SharedIndexInformer) {
-	handler := func(_ *clientcache.Reflector, err error) {
+	handler := controllerHealthWatchErrorHandler()
+	if err := inf.SetWatchErrorHandler(handler); err != nil {
+		slog.Warn("cache.controller_health.watch.set_error_handler_failed",
+			slog.String("subsystem", "cache"),
+			slog.Any("err", err),
+		)
+	}
+}
+
+// controllerHealthWatchErrorHandler builds the controller-health reflector
+// error handler. Named rather than inline (1.12.7 review C-2) so an arm can
+// drive the REAL handler twice and pin that the count sits ABOVE the sticky
+// one-shot.
+func controllerHealthWatchErrorHandler() func(*clientcache.Reflector, error) {
+	return func(_ *clientcache.Reflector, err error) {
 		// 1.12.7 — count EVERY error, ABOVE the CAS. This one-shot is sticky
 		// until pod restart, so an increment below it would record exactly one
 		// error for the life of the process however long the watch stays
@@ -375,12 +389,6 @@ func installControllerHealthWatchErrorHandler(inf clientcache.SharedIndexInforme
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
 			slog.String("effect", "ControllerHealthCacheServable=false until pod restart; gauge values stay at last-published"),
-		)
-	}
-	if err := inf.SetWatchErrorHandler(handler); err != nil {
-		slog.Warn("cache.controller_health.watch.set_error_handler_failed",
-			slog.String("subsystem", "cache"),
-			slog.Any("err", err),
 		)
 	}
 }

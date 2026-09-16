@@ -151,6 +151,10 @@ func registerEngineGVRDiscoveredHook(e *prewarmEngine) {
 // off); both forget methods are nil-safe.
 func registerHarvesterGoneForgetHook(deps rePrewarmDeps) {
 	cache.RegisterGoneForgetHook(func(gvr schema.GroupVersionResource, namespace, name string) {
+		// 1.12.7 review §2(a) — every verdict delivered, forgotten or not. This
+		// is the denominator that tells a 0 in harvest_forgotten_total apart
+		// from a dead hook.
+		goneVerdictsTotal.Add(1)
 		dropped := deps.navHarv.forgetCoordinate(gvr, namespace, name)
 		dropped += deps.harvester.forgetCoordinate(gvr, namespace, name)
 		if dropped == 0 {

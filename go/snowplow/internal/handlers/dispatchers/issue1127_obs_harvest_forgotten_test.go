@@ -144,3 +144,86 @@ func TestIssue1127Obs_HarvestForgotten_SplitsPerHarvester(t *testing.T) {
 		t.Fatalf("1.12.7 obs: a RESTAction verdict moved the nav counter by %d, want 0", got-navBefore)
 	}
 }
+
+// TestIssue1127Obs_GoneVerdicts_IsTheDenominatorForForgotten — 1.12.7 review
+// §2(a). harvest_forgotten_total reports forgets that HAPPENED, so a regressed
+// hook reads 0 — indistinguishable from a quiet week with no deletions. This
+// pins the counter that tells those two apart.
+func TestIssue1127Obs_GoneVerdicts_IsTheDenominatorForForgotten(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	t.Setenv("CACHE_ENABLED", "true")
+	cache.ResetDepsForTest()
+	t.Cleanup(cache.ResetDepsForTest)
+	cache.ResetGoneForgetHooksForTest()
+	t.Cleanup(cache.ResetGoneForgetHooksForTest)
+
+	const ns = "krateo-system"
+	nav := newNavWidgetHarvester()
+	obsHarvestWidget(nav, ns, "harvested-flex", -1, -1)
+	registerHarvesterGoneForgetHook(rePrewarmDeps{navHarv: nav, harvester: newContentPrewarmHarvester()})
+
+	// A verdict for a coordinate NOTHING harvested: forgotten must not move,
+	// verdicts MUST. This is the case the pair exists to describe — deletions
+	// are arriving and none of them concerns a harvested widget.
+	fBefore, vBefore := harvestForgottenNavTotal.Load(), goneVerdictsTotal.Load()
+	cache.Deps().OnDelete(obsWidgetGVR(), ns, "never-harvested")
+	if got := harvestForgottenNavTotal.Load(); got != fBefore {
+		t.Fatalf("premise: forgotten moved by %d for an unharvested coordinate", got-fBefore)
+	}
+	if got := goneVerdictsTotal.Load() - vBefore; got != 1 {
+		t.Fatalf("RED (§2(a)): a delivered gone verdict moved gone_verdicts_total by %d, want 1. "+
+			"Without this denominator a forgotten==0 reading cannot be told apart from a hook that "+
+			"stopped firing, which is the whole failure mode the counter exists to expose", got)
+	}
+
+	// A verdict that DOES forget must move both.
+	fBefore, vBefore = harvestForgottenNavTotal.Load(), goneVerdictsTotal.Load()
+	cache.Deps().OnDelete(obsWidgetGVR(), ns, "harvested-flex")
+	if got := harvestForgottenNavTotal.Load() - fBefore; got != 1 {
+		t.Fatalf("§2(a): forgotten moved by %d for a harvested coordinate, want 1", got)
+	}
+	if got := goneVerdictsTotal.Load() - vBefore; got != 1 {
+		t.Fatalf("RED (§2(a)): gone_verdicts_total moved by %d on a verdict that DID forget, want 1 — "+
+			"the denominator must count every verdict, not only the ones that found nothing", got)
+	}
+}
+
+// TestIssue1127Obs_HarvestSurface_HalfPublishedPairIsUnavailable — 1.12.7
+// review C-1. The acceptance step reads this surface to decide whether a
+// coordinate is still held, so an ABSENT harvester reporting as an EMPTY one is
+// a false pass: it says "not held" about a harvester that was never asked.
+//
+// A pod with content prewarm on and PIP prewarm off publishes a nil nav
+// harvester. Latent today because the three gates collapse to one flag, which
+// is exactly why it needs an arm rather than a comment — the day a gate
+// separates, nothing else would catch it.
+func TestIssue1127Obs_HarvestSurface_HalfPublishedPairIsUnavailable(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	ResetHarvestInspectionForTest()
+	t.Cleanup(ResetHarvestInspectionForTest)
+
+	// PIP off: no nav harvester, content harvester present.
+	publishHarvestersForInspection(nil, newContentPrewarmHarvester())
+
+	navEntries, _, ok := HarvestCounts()
+	if ok {
+		t.Fatalf("RED (C-1): the surface reports available=true with a NIL nav harvester "+
+			"(navEntries=%d). Absent is being reported as empty, so the acceptance step would read "+
+			"a coordinate as forgotten when the harvester that holds it was never consulted — a "+
+			"false pass on the endpoint the acceptance depends on", navEntries)
+	}
+
+	nav, apiRef, ok := HarvestHoldsCoordinate(obsWidgetGVR(), "krateo-system", "anything")
+	if ok || nav || apiRef {
+		t.Fatalf("RED (C-1): the per-coordinate lookup answered ok=%v nav=%v apiRef=%v with a nil "+
+			"nav harvester; it must refuse rather than answer 'not held'", ok, nav, apiRef)
+	}
+
+	// Both present is the healthy shape and must answer normally.
+	publishHarvestersForInspection(newNavWidgetHarvester(), newContentPrewarmHarvester())
+	if _, _, ok := HarvestCounts(); !ok {
+		t.Fatalf("C-1: a fully published pair reports unavailable — the guard is too strict")
+	}
+}

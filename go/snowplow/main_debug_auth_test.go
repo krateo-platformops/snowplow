@@ -103,7 +103,7 @@ var debugProbePaths = map[string]string{
 	"GET /debug/apistage":      "/debug/apistage",
 	"GET /debug/refreshes":     "/debug/refreshes",
 	"GET /debug/reconcile":     "/debug/reconcile",
-	"GET /debug/harvest":      "/debug/harvest",
+	"GET /debug/harvest":       "/debug/harvest",
 }
 
 // debugPathsSafeToDriveAuthenticated is debugProbePaths minus the two

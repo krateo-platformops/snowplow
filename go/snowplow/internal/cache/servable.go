@@ -106,7 +106,30 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 	if gi == nil {
 		return
 	}
-	handler := func(_ *clientcache.Reflector, err error) {
+	handler := rw.watchErrorHandlerFor(gvr)
+	if err := gi.Informer().SetWatchErrorHandler(handler); err != nil {
+		// Reachable only if the informer already started — which the
+		// callers guarantee against (handler installed pre-Run). Log a
+		// WARN so the regression is visible without failing the boot.
+		slog.Warn("cache.watch.set_error_handler_failed",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	rw.markWatchHandlerInstalledLocked(gvr)
+}
+
+// watchErrorHandlerFor builds the per-GVR reflector error handler.
+//
+// A NAMED CONSTRUCTOR, not an inline closure (1.12.7 review C-2): the ONLY
+// thing worth asserting about this handler is that the count happens ABOVE the
+// one-shot, and an arm can only assert that by driving the real handler twice.
+// Hoisting it here is what lets the falsifier hold the installed closure rather
+// than re-implement its arithmetic.
+func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource) func(*clientcache.Reflector, error) {
+	return func(_ *clientcache.Reflector, err error) {
 		rw.mu.Lock()
 		if rw.watchBroken == nil {
 			rw.watchBroken = map[schema.GroupVersionResource]struct{}{}
@@ -128,21 +151,14 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 			)
 		}
 	}
-	if err := gi.Informer().SetWatchErrorHandler(handler); err != nil {
-		// Reachable only if the informer already started — which the
-		// callers guarantee against (handler installed pre-Run). Log a
-		// WARN so the regression is visible without failing the boot.
-		slog.Warn("cache.watch.set_error_handler_failed",
-			slog.String("subsystem", "cache"),
-			slog.String("gvr", gvr.String()),
-			slog.String("error", err.Error()),
-		)
-		return
-	}
-	// 0.30.99 Tag B — watch-handler coverage guard. Record the
-	// successful install so assertWatchHandlerCoverageLocked (run from
-	// the constructor's terminal block) can verify every registered GVR
-	// has a handler. Caller holds rw.mu, so this write is safe.
+}
+
+// markWatchHandlerInstalledLocked records a successful install.
+//
+// 0.30.99 Tag B — watch-handler coverage guard, so
+// assertWatchHandlerCoverageLocked (run from the constructor's terminal block)
+// can verify every registered GVR has a handler. Caller holds rw.mu.
+func (rw *ResourceWatcher) markWatchHandlerInstalledLocked(gvr schema.GroupVersionResource) {
 	if rw.watchHandlerInstalled == nil {
 		rw.watchHandlerInstalled = map[schema.GroupVersionResource]struct{}{}
 	}

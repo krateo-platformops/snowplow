@@ -191,7 +191,7 @@ Defined in `internal/handlers/dispatchers/phase1_pip_metrics.go` (+ siblings).
 | `snowplow_phase1_keepwarm_age_skip_total` | `uint64` — keepwarm sweep age-skips (cell young enough) | climbs with sweeps over a warm store |
 | `snowplow_phase1_seed_skipped_stage_error_total` | `uint64` — seed Puts declined by the error-aware Put-gate | low; a climb = a systematically-degraded seed target |
 | `prewarm.coverage` | map — `{harvested_widgets, harvested_restactions, walked_roots, max_harvested_widgets, regressed_total}` (#220). `max_harvested_widgets` is the process-lived high-water mark of DISTINCT widgets a COMPLETED walk reached; it is the self-adapting baseline, so there is no threshold to tune | `harvested_widgets` should track `max_harvested_widgets`. A gap between them means the walk stopped reaching part of the navigation tree and those pages are a cold first load. `regressed_total` > 0 ⇒ read the `prewarm.coverage.regressed` WARN, which carries both numbers |
-| `snowplow_phase1_harvest_forgotten_total` | map keyed by harvester (`nav_widget` / `apiref`) — harvested ENTRIES DROPPED because the object was confirmed gone (1.12.7 F6b/F6c) | `0` on a cluster where nothing is deleted. Climbs only when a deletion actually stopped a replay; counts removals, **not** hook firings, so it does not climb for gone objects that were never harvested. `nav_widget` can move by more than 1 per object (one entry per pagination tuple) |
+| `snowplow_phase1_harvest_forgotten_total` | map keyed by harvester (`nav_widget` / `apiref`), plus `gone_verdicts` — harvested ENTRIES DROPPED because the object was confirmed gone (1.12.7 F6b/F6c), and the count of gone verdicts DELIVERED to the harvesters whether or not anything was held | `0` on a cluster where nothing is deleted. Climbs only when a deletion actually stopped a replay; counts removals, **not** hook firings, so it does not climb for gone objects that were never harvested. `nav_widget` can move by more than 1 per object (one entry per pagination tuple). **Read the forget counts against `gone_verdicts`:** both zero is a quiet cluster with nothing deleted; `gone_verdicts` climbing while the forget counts stay flat means deletions ARE arriving and none is being forgotten — the mechanism or the instrument is dead |
 | `snowplow_phase1_widget_seed_failure_total` / `snowplow_phase1_restaction_seed_failure_total` | per-cohort×object failure maps | pinpoint which widget/RA broke which cohort |
 | `snowplow_resolved_cache_hits_seed_attributable` | hits on cells the seed wrote (seed attribution) | the seed-is-actually-useful signal |
 
@@ -389,8 +389,10 @@ the 1.12.7 acceptance step has to settle and that no surface could answer.
     GET /debug/harvest?group=&version=&resource=&namespace=&name=
         the same counts plus heldByNavHarvester / heldByApiRefHarvester for that coordinate.
 
-`available:false` means **no harvester has been published** — prewarm is off, or boot has not
-reached the engine. It is deliberately distinct from "the harvesters are empty", which is a
+`available:false` means **no harvester has been published** — prewarm is off, boot has not
+reached the engine, or only one of the two harvesters exists (the surface publishes both or
+neither, so a half-configured pod refuses to answer rather than reporting an absent harvester as
+an empty one). It is deliberately distinct from "the harvesters are empty", which is a
 healthy post-forget state; conflating them would let a misconfigured pod read as a successful
 forget.
 

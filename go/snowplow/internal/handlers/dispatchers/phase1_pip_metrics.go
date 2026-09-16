@@ -154,6 +154,20 @@ var (
 	// harvester ("nav_widget" / "apiref").
 	harvestForgottenNavTotal    atomic.Uint64
 	harvestForgottenApiRefTotal atomic.Uint64
+
+	// 1.12.7 review §2(a) — goneVerdictsTotal counts GONE VERDICTS DELIVERED to
+	// the harvesters: one per invocation of the forget hook, whether or not
+	// anything was harvested under that coordinate.
+	//
+	// WHY IT IS NOT REDUNDANT WITH harvest_forgotten_total. That counter reports
+	// forgets that HAPPENED, so a regressed F6b hook reads 0 — identical to a
+	// quiet week with no deletions. The pair disambiguates:
+	//   forgotten == 0 && verdicts == 0  → a quiet cluster; nothing was deleted.
+	//   forgotten == 0 && verdicts  > 0  → deletions ARE arriving and none is
+	//                                      being forgotten: the mechanism or the
+	//                                      instrument is dead.
+	// A silence that excludes nothing is not information; this is its denominator.
+	goneVerdictsTotal atomic.Uint64
 )
 
 // Ship 0.30.187 D1 — per-(cohort, target) failure maps. Keyed by
@@ -304,6 +318,8 @@ func registerPIPMetrics() {
 			return map[string]uint64{
 				"nav_widget": harvestForgottenNavTotal.Load(),
 				"apiref":     harvestForgottenApiRefTotal.Load(),
+				// The denominator: verdicts delivered, forgotten or not.
+				"gone_verdicts": goneVerdictsTotal.Load(),
 			}
 		}))
 

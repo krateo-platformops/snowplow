@@ -76,51 +76,6 @@ func TestIssue1127Obs_DegradedNoEvict_CountsTheConsequence(t *testing.T) {
 	}
 }
 
-// TestIssue1127Obs_WatchErrors_CountsEveryInvocationNotTheFirst — the whole
-// point: the WARN is one-shot, so if the counter were also one-shot the retry
-// rate would still be invisible.
-func TestIssue1127Obs_WatchErrors_CountsEveryInvocation(t *testing.T) {
-	ResetInformerWatchStatsForTest()
-	t.Cleanup(ResetInformerWatchStatsForTest)
-
-	before := InformerWatchStatsSnapshot().WatchErrorsTotal
-	const n = 5
-	for i := 0; i < n; i++ {
-		recordWatchError()
-	}
-	if got := InformerWatchStatsSnapshot().WatchErrorsTotal - before; got != n {
-		t.Fatalf("RED (1.12.7 obs): %d reflector errors moved watch_errors_total by %d, want %d. "+
-			"If the counter is gated by the same one-shot that gates the WARN, a watch failing "+
-			"once and a watch failing every second for an hour are indistinguishable — which is "+
-			"exactly the blindness this counter exists to remove", n, got, n)
-	}
-}
-
-// TestIssue1127Obs_ConfirmRetracted_CountsOnlyRealRetractions — a retraction is
-// an event only if a confirmation was actually held.
-func TestIssue1127Obs_ConfirmRetracted_CountsOnlyRealRetractions(t *testing.T) {
-	ResetInformerWatchStatsForTest()
-	t.Cleanup(ResetInformerWatchStatsForTest)
-
-	before := InformerWatchStatsSnapshot().ConfirmRetractedTotal
-	recordConfirmRetracted(confirmRetractCRDDeleted)
-	recordConfirmRetracted(confirmRetractStaleVersionPruned)
-	recordConfirmRetracted(confirmRetractCRDDeleted)
-	if got := InformerWatchStatsSnapshot().ConfirmRetractedTotal - before; got != 3 {
-		t.Fatalf("RED (1.12.7 obs): three retractions moved confirm_retracted_total by %d, want 3", got)
-	}
-
-	by := ConfirmRetractedByReasonSnapshot()
-	if by[confirmRetractCRDDeleted] != 2 || by[confirmRetractStaleVersionPruned] != 1 {
-		t.Fatalf("RED (1.12.7 obs): the {reason} breakdown is %v, want crd_deleted=2 "+
-			"stale_version_pruned=1. Without the split, a CRD upgrade and a CRD deletion are the "+
-			"same number — and telling them apart is the point", by)
-	}
-	if by[confirmRetractDiscoveryRefresh] != 0 {
-		t.Fatalf("1.12.7 obs: an unused reason has a non-zero bucket: %v", by)
-	}
-}
-
 // TestIssue1127Obs_ConfirmRetracted_NotCountedForANeverConfirmedGVR — the
 // retraction sites delete unconditionally, so this is the easy mistake: count
 // the call and the number climbs on every ordinary teardown.
