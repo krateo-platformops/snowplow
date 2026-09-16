@@ -526,6 +526,16 @@ const resolvedKeyVersion = "v6"
 type ResolvedCacheStore struct {
 	mu sync.Mutex
 
+	// depOwner is the DepTracker this store is wired to (DepTracker.SetStore).
+	// 1.12.7 F6a strips dep edges inside deleteForDep, under the same mutex
+	// hold as the index delete, and it must strip them from the tracker that
+	// OWNS this store rather than from the process singleton — a non-singleton
+	// tracker (every hermetic fixture, and any future multi-tracker shape)
+	// would otherwise have its records left behind. nil until SetStore runs,
+	// in which case the singleton is the correct fallback: nothing else can be
+	// holding edges for a store no tracker has claimed.
+	depOwner atomic.Pointer[DepTracker]
+
 	// LRU eviction order: front = most-recently-used.
 	order *list.List
 	// Lookup index. Value is *list.Element whose Value is *lruItem.
@@ -1668,9 +1678,20 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 		c.raFullListEvictTotal.Add(1)
 	}
 	// Dep-tracker cleanup. Safe even when L1 is the only consumer
-	// (Deps() is always non-nil); a no-op when no edges were ever
+	// (depTracker() is always non-nil); a no-op when no edges were ever
 	// recorded for this key.
-	Deps().RemoveL1Key(item.key)
+	c.depTracker().RemoveL1Key(item.key)
+}
+
+// depTracker returns the DepTracker that owns this store, falling back to the
+// process singleton when the store has not been wired to one. Never nil.
+func (c *ResolvedCacheStore) depTracker() *DepTracker {
+	if c != nil {
+		if d := c.depOwner.Load(); d != nil {
+			return d
+		}
+	}
+	return Deps()
 }
 
 // deleteForDep removes the entry under key, returning true if a live
@@ -1681,10 +1702,22 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 //
 // Performs a separate lock acquisition from any in-flight Get/Put —
 // holds c.mu only for the duration of the index lookup + LRU detach.
-// The dep tracker calls RemoveL1Key AFTER deleteForDep returns; since
-// the entry is already gone from index/order, the second cleanup pass
-// is a cheap no-op on the L1 side and does the actual dep-record
-// removal on the dep side.
+//
+// 1.12.7 F6a — THE EDGE STRIP IS PART OF THIS PRIMITIVE, under the same
+// mutex hold as the index delete. It used to be the caller's job, run
+// AFTER this returned and outside the lock, which left a window in which
+// the entry was gone but its edges were not: a concurrent resolve could
+// re-Put the key and record fresh edges inside that window, and the
+// caller's trailing strip would then remove the NEW entry's edges. The
+// result is a resident entry with no dep edge — invisible to the audit's
+// submit path (the hasEdge gate skips it) and therefore unreachable by
+// every repair path there is. Deleting an entry and orphaning its edges
+// must not be separately observable, so both happen under one hold.
+//
+// No new lock order: removeElementLocked already strips under this same
+// mutex on every TTL / max-age / LRU eviction, so store-mutex-then-dep-map
+// is the established and dominant order, and the strip itself takes no
+// store lock. The eviction publish still runs after every lock releases.
 func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	if c == nil {
 		return false
@@ -1695,14 +1728,14 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 		c.mu.Unlock()
 		return false
 	}
-	// removeElementLocked also calls Deps().RemoveL1Key — but in this
-	// path the dep tracker is mid-iteration over the reverse index
-	// for THIS key, and LoadAndDelete inside RemoveL1Key is a no-op
-	// the second time. We accept the trivial double-call rather than
-	// branching the eviction body.
 	item := el.Value.(*lruItem)
 	delete(c.index, item.key)
 	c.order.Remove(el)
+	// 1.12.7 F6a — strip the dep edges HERE, under the same hold as the
+	// index delete, so no window exists in which the key is gone and its
+	// edges are not. RemoveL1Key is a sync.Map operation that takes no store
+	// lock, and it is a no-op when the key never recorded an edge.
+	c.depTracker().RemoveL1Key(item.key)
 	// 1.12.6 C4 (§6.4) — this is the one eviction body that does NOT go
 	// through removeElementLocked; the marker must not outlive its key here
 	// either (TestRefreshTerminal_F6e).

@@ -533,6 +533,11 @@ func (d *DepTracker) SetStore(s *ResolvedCacheStore) {
 	d.storeMu.Lock()
 	d.store = s
 	d.storeMu.Unlock()
+	// 1.12.7 F6a — the store strips dep edges inside its delete primitive and
+	// must strip them from THIS tracker, not from the process singleton.
+	if s != nil {
+		s.depOwner.Store(d)
+	}
 }
 
 // SetRefreshHook wires the refresher enqueue function. Safe to call
@@ -1016,7 +1021,8 @@ func (d *DepTracker) collectMatchesWithDep(gvr schema.GroupVersionResource, name
 }
 
 // runEvictionBatch drops each self-representation L1 key from the store
-// and clears its dep records. Counts evictDeleteTotal — self-evictions
+// and clears its dep records (1.12.7 F6a: inside the delete primitive, under
+// the same store-mutex hold). Counts evictDeleteTotal — self-evictions
 // only, per the R2/R7 counter contract.
 func (d *DepTracker) runEvictionBatch(keys []string) {
 	d.storeMu.RLock()
@@ -1026,11 +1032,16 @@ func (d *DepTracker) runEvictionBatch(keys []string) {
 	var gone []string
 	for _, l1Key := range keys {
 		if store != nil {
+			// 1.12.7 F6a — deleteForDep strips the dep edges under the same
+			// store-mutex hold as the index delete. There is deliberately NO
+			// trailing RemoveL1Key here: the old unconditional strip ran
+			// outside the lock and, on a key a concurrent resolve had already
+			// re-Put, removed the NEW entry's freshly recorded edges, leaving
+			// a resident entry no repair path could reach.
 			if store.deleteForDep(l1Key) {
 				gone = append(gone, l1Key)
 			}
 		}
-		d.RemoveL1Key(l1Key) // clear forward + reverse records
 	}
 	if len(gone) > 0 {
 		d.evictDeleteTotal.Add(uint64(len(gone)))
@@ -1119,10 +1130,10 @@ func (d *DepTracker) EvictDropPoint(l1Key string) bool {
 
 // evictSelfEntry is the shared body of EvictSelfGone / EvictDropPoint. It
 // deletes the entry through store.deleteForDep (which also bumps the STORE's
-// evict_delete_total under snowplow_resolved_cache and clears the C4
-// suppression marker) and then drops the key's dep records, bumping counter
-// only when an entry was actually removed. It never touches the tracker's
-// evictDeleteTotal.
+// evict_delete_total under snowplow_resolved_cache, clears the C4 suppression
+// marker and — 1.12.7 F6a — strips the key's dep records under the same hold),
+// bumping counter only when an entry was actually removed. It never touches the
+// tracker's evictDeleteTotal.
 func (d *DepTracker) evictSelfEntry(l1Key string, counter *atomic.Uint64) bool {
 	if d == nil || l1Key == "" {
 		return false
@@ -1133,9 +1144,11 @@ func (d *DepTracker) evictSelfEntry(l1Key string, counter *atomic.Uint64) bool {
 
 	evicted := false
 	if store != nil {
+		// 1.12.7 F6a — the edge strip is inside deleteForDep, under the same
+		// hold as the index delete. No trailing strip here either; see
+		// runEvictionBatch.
 		evicted = store.deleteForDep(l1Key)
 	}
-	d.RemoveL1Key(l1Key)
 	if evicted {
 		counter.Add(1)
 	}
