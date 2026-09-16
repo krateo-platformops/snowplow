@@ -68,6 +68,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
 
@@ -170,6 +171,29 @@ func (h *contentPrewarmHarvester) harvestApiRef(w *unstructured.Unstructured) {
 	h.mu.Lock()
 	h.refs[ns+"/"+name] = ref
 	h.mu.Unlock()
+}
+
+// forgetCoordinate drops the harvested apiRef for (gvr, ns, name). 1.12.7 F6b
+// — the ONLY removal path on this harvester, driven exclusively by an
+// authoritative GONE verdict from the dep tracker
+// (cache.RegisterGoneForgetHook). Returns the number of entries dropped.
+//
+// SCOPED TO RESTActions. Every ref this harvester holds targets a RESTAction —
+// harvestApiRef stamps restActionGVR unconditionally — so a verdict for any
+// other kind cannot match and is declined here rather than being allowed to
+// delete a same-named ref of a different kind.
+func (h *contentPrewarmHarvester) forgetCoordinate(gvr schema.GroupVersionResource, ns, name string) int {
+	if h == nil || name == "" || gvr != restActionGVR {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	k := ns + "/" + name
+	if _, ok := h.refs[k]; !ok {
+		return 0
+	}
+	delete(h.refs, k)
+	return 1
 }
 
 // snapshot returns a copy of the harvested reference set, stable for the

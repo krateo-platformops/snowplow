@@ -85,6 +85,7 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +93,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
@@ -486,6 +488,15 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			// SetEngineProcessContext at boot so the fallback fires only
 			// under unit tests or misconfigured environments.
 			processCtx := resolveEngineProcessCtx()
+
+			// 1.12.7 F6b — subscribe both harvesters to the cache's GONE
+			// verdict BEFORE the boot scope is enqueued, so a deletion
+			// observed while the first seed is running is not missed.
+			// Registration is idempotent at the cache side (fn pointer), and
+			// the harvesters above are process-lived — the engine shares them
+			// by reference for the life of the process, which is exactly the
+			// retention this hook exists to bound.
+			registerHarvesterGoneForgetHook(deps)
 
 			StartPrewarmEngine(processCtx, makeBootScopeHandler(deps), func(s prewarmScope, err error) {
 				if s.kind == scopeKindBoot {
@@ -1711,10 +1722,34 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		// child is required.
 		got := objects.Get(ctx, ref)
 		if got.Err != nil {
+			// 1.12.7 F6c — split this branch on NotFound. A child the
+			// apiserver says is GONE is positive evidence, and it is the one
+			// error here that must also drop the harvested copy: without it a
+			// widget deleted after its first harvest keeps being re-resolved
+			// from that copy and re-written into L1 on every seed pass.
+			//
+			// THE SAME TWO BOUNDS resolve_populate.go:562 already applies to
+			// the refresher's self-gone verdict, and for the same reasons:
+			//   - ONLY a definite 404. A 403, a 500, a timeout or a parse
+			//     failure keeps the record — an apiserver hiccup must never
+			//     empty the warm set.
+			//   - NEVER the informer-only miss. Under
+			//     cache.WithInformerOnlyReads objects.Get SYNTHESISES a
+			//     NotFound (objects/get.go informerOnlyMiss) that means "not
+			//     in the indexer", not "deleted from the cluster". The Phase-1
+			//     walk does not mark its ctx that way today; the guard keeps
+			//     the claim structural rather than contingent on the caller.
+			//
+			// PARTIAL, NOT PRIMARY. This fires for any child fetched under a
+			// walked root, which is most of the walk, but it cannot reach a
+			// widget only the routes loader would have found (#220). F6b is
+			// the closer — it needs no walk at all.
+			gone := w.forgetChildIfGone(ctx, ref, got.Err)
 			log.Warn("phase1.walk.child_fetch_failed",
 				slog.String("subsystem", "cache"),
 				slog.Int("depth", depth),
 				slog.String("child", key),
+				slog.Bool("gone", gone),
 				slog.Any("err", got.Err),
 			)
 			continue
@@ -1736,6 +1771,69 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		_ = w.walk(ctx, got.Unstructured, got.GVR, depth+1, childPage, childPerPage, childKeyPerPage, childKeyPage)
 	}
 	return nil
+}
+
+// forgetChildIfGone is the 1.12.7 F6c decision: does this child-fetch failure
+// constitute positive evidence that the object is gone, and if so drop its
+// harvested copy. Returns whether the error was an authoritative GONE, which
+// the caller logs.
+//
+// It is a named method rather than an inline branch so the decision can be
+// driven with REAL objects.Get results — a real apiserver 404, a real 500, a
+// real 403 and the informer-only synthesised 404 — instead of hand-built
+// error values. See issue216_f6c_walker_notfound_test.go.
+//
+// The two bounds are the ones resolve_populate.go:562 already applies to the
+// refresher's self-gone verdict; the doc at the call site carries the full
+// reasoning for each.
+func (w *phase1Walker) forgetChildIfGone(ctx context.Context, ref templatesv1.ObjectReference, status *response.Status) bool {
+	if w == nil || status == nil {
+		return false
+	}
+	if status.Code != http.StatusNotFound {
+		return false // 403 / 500 / timeout / parse — never evidence of deletion
+	}
+	if cache.InformerOnlyReadsFromContext(ctx) {
+		return false // a SYNTHESISED 404: "not in the indexer", not "deleted"
+	}
+	w.forgetHarvestedRef(ref)
+	return true
+}
+
+// forgetHarvestedRef drops a child widget's harvested copy from both Phase-1
+// harvesters. 1.12.7 F6c — called ONLY from the child-fetch branch's confirmed
+// NotFound leg, never on any other error and never on a path the walk simply
+// failed to reach.
+//
+// The GVR is reconstructed from the ref the same way every other consumer of a
+// parsed /call path does it (schema.ParseGroupVersion + WithResource; see
+// widget_content.go:627). A ref whose apiVersion does not parse is left alone —
+// there is no coordinate to act on, and doing nothing is the safe direction.
+//
+// Nil-safe on both harvesters (prewarm off leaves them nil).
+func (w *phase1Walker) forgetHarvestedRef(ref templatesv1.ObjectReference) {
+	if w == nil {
+		return
+	}
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return
+	}
+	gvr := gv.WithResource(ref.Resource)
+	dropped := w.navWidgetHarvester.forgetCoordinate(gvr, ref.Namespace, ref.Name)
+	dropped += w.apiRefHarvester.forgetCoordinate(gvr, ref.Namespace, ref.Name)
+	if dropped == 0 {
+		return
+	}
+	slog.Info("prewarm.harvest.forgot_gone_child",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("ns", ref.Namespace),
+		slog.String("name", ref.Name),
+		slog.Int("entries_dropped", dropped),
+		slog.String("effect", "the apiserver confirmed this child is gone, so the per-binding seed will "+
+			"no longer re-resolve and re-write a cell from the harvested copy"),
+	)
 }
 
 // navChildRef is the subset of a resolved status.resourcesRefs item the

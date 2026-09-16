@@ -534,9 +534,16 @@ func (d *DepTracker) SetStore(s *ResolvedCacheStore) {
 	d.store = s
 	d.storeMu.Unlock()
 	// 1.12.7 F6a — the store strips dep edges inside its delete primitive and
-	// must strip them from THIS tracker, not from the process singleton.
+	// must strip them from THIS tracker, not from the process singleton. A
+	// hook, not a back-pointer: the store needs the operation, not the owner.
+	//
+	// A nil store installs nothing — there is no store to wire, and the store
+	// this tracker was previously pointed at is not reachable from here to
+	// unwire. That is harmless: an unhooked store still strips, through the
+	// singleton fallback in stripDepEdges. No production caller passes nil; the
+	// single production call site is resolved.go's, with a real store.
 	if s != nil {
-		s.depOwner.Store(d)
+		s.setDepStripHook(d.RemoveL1Key)
 	}
 }
 
@@ -717,9 +724,26 @@ func (s objectState) String() string {
 // Eviction stays DELETE-only in MEANING (feedback_l1_invalidation_delete_only):
 // objAbsent IS the informer's DELETE fact, derived from state instead of
 // carried by the message. Returns (evicted, dirtyMarked).
+//
+// 1.12.7 F6b — this is also where the GONE verdict leaves the cache. The
+// objAbsent branch fires notifyObjectGone (gone_forget_hook.go) so the
+// Phase-1 harvesters drop the in-memory copy they would otherwise replay
+// into L1 forever. See the fire site for why it precedes the no-matches
+// return.
 func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, name string, state objectState) (int, int) {
 	if d == nil {
 		return 0, 0
+	}
+	// 1.12.7 F6b — carry the GONE verdict to whoever holds a harvested
+	// in-memory copy of this object, BEFORE the no-matches return below.
+	// The placement is load-bearing: the population this exists for is
+	// precisely the one with no L1 dependency edge left (a harvested widget
+	// whose cell was already evicted has nothing in `matched`), so firing
+	// after that return would miss every entry that matters. Fires ONLY on
+	// objAbsent — a servable informer whose indexer does not hold the object.
+	// objUnknown / objUnknownDegraded must never empty a warm set.
+	if state == objAbsent {
+		notifyObjectGone(gvr, namespace, name)
 	}
 	matched := d.collectMatchesWithDep(gvr, namespace, name)
 	if len(matched) == 0 {
