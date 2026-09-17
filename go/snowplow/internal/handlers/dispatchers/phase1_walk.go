@@ -764,6 +764,17 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// every composition GVR in the encountered group (Ship 0.5 / v6).
 	// Output discarded. Resolution errors are collected, not fatal: one
 	// broken root must not block warming the rest.
+	//
+	// 1.12.7 / #220 — OPEN the coverage pass before the first root: it clears
+	// the per-pass reach set so what this pass reaches is recorded from empty.
+	// It does NOT roll the baseline or the forget window — those are promoted at
+	// the completed evaluation below, so a partial pass can never install itself
+	// as the baseline the next collapse is compared against. Both drivers go
+	// through this one function, on the published instance recordWalkCoverage
+	// reads. Inert for curRoot on this path — the constructor already starts it
+	// at -1 and the boot walk runs once.
+	beginWalkCoveragePass()
+
 	var walkErr error
 	resolved := 0
 	for _, root := range roots {
@@ -785,10 +796,25 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		resolved++
 	}
 
-	// 1.12.7 / #220 — observe this pass's coverage. COMPLETED means every root
-	// resolved and ctx never expired: a pass that lost a root legitimately
-	// harvests less and must not raise the alarm.
-	recordWalkCoverage(resolved, walkErr == nil && resolved == len(roots))
+	// 1.12.7 / #220 — observe this pass's coverage. OUTCOMES, because a boolean
+	// cannot express the first one: with no roots (the config-vars ConfigMap
+	// absent at boot, `roots = nil` above) this driver walked NOTHING, and the
+	// shipped `resolved == len(roots)` evaluated 0 == 0 and reported a completed
+	// pass that never ran. The classification is on len(roots) == 0, not
+	// roots == nil: the lister can legitimately return a non-nil empty slice,
+	// and that shape would otherwise be left unclassified and fall through to
+	// "completed". This driver never resumes — a roots-absent boot means there
+	// was nothing to walk, which is its own counter and not a reuse. COMPLETED
+	// means every root resolved and ctx never expired; a pass that lost a root
+	// legitimately reaches less and publishes its figures without alarming.
+	outcome := walkPassNoRoots
+	if len(roots) > 0 {
+		outcome = walkPassPartial
+		if walkErr == nil && resolved == len(roots) {
+			outcome = walkPassCompleted
+		}
+	}
+	recordWalkCoverage(resolved, outcome)
 
 	// Step 5 — (Ship 0.5 / 0.30.223, v6) DELETED. The pre-v6 path
 	// invoked a CRD-store re-scan here to close the CRD-
