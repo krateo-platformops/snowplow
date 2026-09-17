@@ -638,6 +638,85 @@ func TestIssue220_ArmH_DeleteDuringTheReachingPassIsSilent(t *testing.T) {
 	}
 }
 
+// ── ARM I — a delete during an intervening PARTIAL, several partials deep ──
+//
+// THE PROPERTY: the forget window must span the SAME interval the baseline
+// spans. Only a COMPLETED pass promotes, so the baseline can sit still across
+// an arbitrary run of partials — and the forget evidence has to survive that
+// whole run, not one rotation.
+//
+// RED against re-anchoring the forgottenPass clear back to BeginWalk, which is
+// the exact simplification the field comment records three reviewers reaching
+// for. Arms B and H do NOT reach this: each has a single rotation between the
+// delete and the evaluation, so a one-pass carry still covers them and both
+// stay GREEN under that mutation. Only a multi-partial run rotates the
+// evidence out entirely, and then an ordinary delete reads as an unexplained
+// loss — the false-alarm direction, which is worse than a missed detection.
+func TestIssue220_ArmI_DeleteDuringInterveningPartialsIsSilent(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	t.Setenv("CACHE_ENABLED", "true")
+	cache.ResetDepsForTest()
+	t.Cleanup(cache.ResetDepsForTest)
+	cache.ResetGoneForgetHooksForTest()
+	t.Cleanup(cache.ResetGoneForgetHooksForTest)
+
+	r := newCovRig(t)
+	all := covNames(177)
+	if out := r.bootPass(t, all); covAlarms(out) != 0 {
+		t.Fatalf("premise: the first completed pass alarmed:\n%s", out)
+	}
+	registerHarvesterGoneForgetHook(rePrewarmDeps{navHarv: r.nav, harvester: r.api})
+
+	// PARTIAL 1 — the second root fails, so this pass can neither be evaluated
+	// nor promote. The real gone verdict lands INSIDE it, through the
+	// production removal path.
+	r.midPass = func() { cache.Deps().OnDelete(covGVR(), covNS, all[0]) }
+	if out := r.bootPass(t, all, nil); covAlarms(out) != 0 {
+		t.Fatalf("premise: the partial pass carrying the delete alarmed:\n%s", out)
+	}
+	if r.midPass != nil {
+		t.Fatalf("premise: the mid-pass delete never fired — the arm is not testing its own subject")
+	}
+	if held, _, ok := HarvestHoldsCoordinate(covGVR(), covNS, all[0]); !ok || held {
+		t.Fatalf("premise: the gone verdict did not reach the harvester (held=%v ok=%v)", held, ok)
+	}
+
+	// PARTIALS 2..4 — nothing completes, so nothing promotes. Each is one more
+	// pass boundary that a BeginWalk-anchored forget window would age the
+	// evidence out of. Three is past the two-generation depth on purpose: a
+	// single rotation must not be able to cover this.
+	const interveningPartials = 3
+	for i := 0; i < interveningPartials; i++ {
+		if out := r.bootPass(t, all[1:], nil); covAlarms(out) != 0 {
+			t.Fatalf("premise: intervening partial %d alarmed:\n%s", i+2, out)
+		}
+	}
+	if f := WalkCoverageForTest(); f.CompletedPasses != 1 {
+		t.Fatalf("premise: completed_passes=%d, want 1 — the intervening passes were NOT partial, "+
+			"so this arm is not testing a multi-partial run at all", f.CompletedPasses)
+	}
+
+	// The next COMPLETED pass reaches everything that still exists. Four
+	// partials have gone by since the delete; the evidence must still discount
+	// it against a baseline that has not moved since before the delete.
+	out := r.bootPass(t, all[1:])
+	f := WalkCoverageForTest()
+	if covAlarms(out) != 0 || f.RegressedTotal != 0 {
+		t.Fatalf("RED (#220 amendment): a widget deleted during an intervening PARTIAL pass raised the "+
+			"coverage alarm after %d further partials (regressed=%d). The baseline spans the whole run "+
+			"of partials, so the forget window must span it too — a window rotated at the pass boundary "+
+			"ages the evidence out and turns an ordinary delete into a false alarm:\n%s",
+			interveningPartials, f.RegressedTotal, out)
+	}
+	if f.Reached != 176 || f.Lost != 0 {
+		t.Fatalf("RED (#220 amendment): reached=%d lost=%d, want 176/0", f.Reached, f.Lost)
+	}
+	if f.CompletedPasses != 2 {
+		t.Fatalf("premise: completed_passes=%d, want 2 — only the first and last passes may complete", f.CompletedPasses)
+	}
+}
+
 // ── the coverage sets are SHARED MUTABLE STATE — race arm ─────────────────
 //
 // This change adds four maps to a type that is already written from two
