@@ -319,7 +319,30 @@ func initialSecretCount() int {
 // degraded). Documented as Ship D.2 out-of-scope (§7 X1's
 // "diagnostic" mitigation can be added later).
 func installSecretsWatchErrorHandler(inf clientcache.SharedIndexInformer) {
-	handler := func(_ *clientcache.Reflector, err error) {
+	handler := secretsWatchErrorHandler()
+	if err := inf.SetWatchErrorHandler(handler); err != nil {
+		// Reachable only if the informer already started — the
+		// caller guarantees against (installed pre-Start). Log a
+		// WARN so the regression is visible without failing the
+		// boot.
+		slog.Warn("cache.secrets.watch.set_error_handler_failed",
+			slog.String("subsystem", "cache"),
+			slog.Any("err", err),
+		)
+	}
+}
+
+// secretsWatchErrorHandler builds the secrets reflector error handler. Named
+// rather than inline (1.12.7 review C-2) so an arm can drive the REAL handler
+// twice and pin that the count sits ABOVE the sticky one-shot — the only
+// property of this closure worth asserting.
+func secretsWatchErrorHandler() func(*clientcache.Reflector, error) {
+	return func(_ *clientcache.Reflector, err error) {
+		// 1.12.7 — count EVERY error, ABOVE the CAS. This one-shot is sticky
+		// until pod restart, so an increment below it would record exactly one
+		// error for the life of the process however long the watch stays
+		// broken.
+		recordWatchError()
 		if !secretsWatchBroken.CompareAndSwap(false, true) {
 			// Already broken — suppress duplicate WARN.
 			return
@@ -329,16 +352,6 @@ func installSecretsWatchErrorHandler(inf clientcache.SharedIndexInformer) {
 			slog.Any("err", err),
 			slog.String("effect", "SecretsCacheServable=false until pod restart; "+
 				"FromInformerSecret falls through to upstream"),
-		)
-	}
-	if err := inf.SetWatchErrorHandler(handler); err != nil {
-		// Reachable only if the informer already started — the
-		// caller guarantees against (installed pre-Start). Log a
-		// WARN so the regression is visible without failing the
-		// boot.
-		slog.Warn("cache.secrets.watch.set_error_handler_failed",
-			slog.String("subsystem", "cache"),
-			slog.Any("err", err),
 		)
 	}
 }

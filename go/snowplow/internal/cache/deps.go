@@ -457,6 +457,15 @@ type DepTracker struct {
 	recordDroppedNoKey atomic.Uint64 // O15: Record*/WithL1KeyContext with empty l1Key
 	evictDeleteTotal   atomic.Uint64 // L1 self-representation evictions (OnDelete ONLY — the H1 live discriminator)
 	evictSelfGoneTotal atomic.Uint64 // 1.12.5 #187: evictions from a confirmed self-object 404 (EvictSelfGone)
+	// 1.12.7 observability — onObjectEventDegradedNoEvict counts DEGRADED
+	// verdicts that reached at least one dependent entry and therefore evicted
+	// NOTHING. The degrade itself is already logged at WARN and counted
+	// (probe_unknown_degraded_total); what was invisible is its CONSEQUENCE —
+	// that an eviction decision was deferred to the refresher for entries that
+	// actually exist. Counted per EVENT, and only when the match set is
+	// non-empty: a degraded verdict naming a coordinate nothing depends on
+	// cost nothing, and counting it would bury the cases that did.
+	onObjectEventDegradedNoEvict atomic.Uint64
 	// 1.12.6 C4: evictions at the refresher drop point after a deterministic
 	// NON-404 failure (403/500/timeout/parse/not-servable) exhausted the
 	// requeue budget under the breaker (EvictDropPoint). Kept apart from
@@ -767,6 +776,14 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 		toMark = append(toMark, l1Key) // buckets 2 + 3, and self-when-present
 	}
 
+	// 1.12.7 observability — an UNKNOWN_DEGRADED verdict structurally cannot
+	// evict (the eviction arm above is guarded on objAbsent), so every entry
+	// it matched is dirty-marked and left resident for the refresher to decide
+	// against the apiserver. Count that consequence here, where it is a fact
+	// about this call rather than an inference from two counters.
+	if state == objUnknownDegraded {
+		d.onObjectEventDegradedNoEvict.Add(1)
+	}
 	if len(toEvict) > 0 {
 		d.runEvictionBatch(toEvict)
 	}
@@ -1231,6 +1248,8 @@ type DepStats struct {
 	DirtyMarkTotal      uint64 // dirty-marks (ADD/UPDATE + DELETE non-self)
 	EnqueueUpdateTotal  uint64
 	RemoveL1Total       uint64
+	// 1.12.7: degraded verdicts that reached dependents and evicted nothing.
+	OnObjectEventDegradedNoEvict uint64
 }
 
 func (d *DepTracker) Stats() DepStats {
@@ -1238,17 +1257,18 @@ func (d *DepTracker) Stats() DepStats {
 		return DepStats{}
 	}
 	return DepStats{
-		TotalRecords:        d.totalRecords.Load(),
-		MaxRecords:          d.maxRecords,
-		RecordTotal:         d.recordTotal.Load(),
-		RecordDroppedCap:    d.recordDroppedCap.Load(),
-		RecordDroppedNoKey:  d.recordDroppedNoKey.Load(),
-		EvictDeleteTotal:    d.evictDeleteTotal.Load(),
-		EvictSelfGoneTotal:  d.evictSelfGoneTotal.Load(),
-		EvictDropPointTotal: d.evictDropPointTotal.Load(),
-		DirtyMarkTotal:      d.dirtyMarkTotal.Load(),
-		EnqueueUpdateTotal:  d.enqueueUpdateTotal.Load(),
-		RemoveL1Total:       d.removeL1Total.Load(),
+		TotalRecords:                 d.totalRecords.Load(),
+		MaxRecords:                   d.maxRecords,
+		RecordTotal:                  d.recordTotal.Load(),
+		RecordDroppedCap:             d.recordDroppedCap.Load(),
+		RecordDroppedNoKey:           d.recordDroppedNoKey.Load(),
+		EvictDeleteTotal:             d.evictDeleteTotal.Load(),
+		EvictSelfGoneTotal:           d.evictSelfGoneTotal.Load(),
+		EvictDropPointTotal:          d.evictDropPointTotal.Load(),
+		DirtyMarkTotal:               d.dirtyMarkTotal.Load(),
+		EnqueueUpdateTotal:           d.enqueueUpdateTotal.Load(),
+		OnObjectEventDegradedNoEvict: d.onObjectEventDegradedNoEvict.Load(),
+		RemoveL1Total:                d.removeL1Total.Load(),
 	}
 }
 

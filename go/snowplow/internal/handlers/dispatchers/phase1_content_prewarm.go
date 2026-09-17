@@ -193,6 +193,10 @@ func (h *contentPrewarmHarvester) forgetCoordinate(gvr schema.GroupVersionResour
 		return 0
 	}
 	delete(h.refs, k)
+	// 1.12.7 observability — count the EFFECT, at the removal (see
+	// harvestForgottenApiRefTotal). Dedupe is by (namespace,name), so this
+	// moves at most once per gone RESTAction.
+	harvestForgottenApiRefTotal.Add(1)
 	return 1
 }
 

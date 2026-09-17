@@ -151,6 +151,10 @@ func registerEngineGVRDiscoveredHook(e *prewarmEngine) {
 // off); both forget methods are nil-safe.
 func registerHarvesterGoneForgetHook(deps rePrewarmDeps) {
 	cache.RegisterGoneForgetHook(func(gvr schema.GroupVersionResource, namespace, name string) {
+		// 1.12.7 review §2(a) — every verdict delivered, forgotten or not. This
+		// is the denominator that tells a 0 in harvest_forgotten_total apart
+		// from a dead hook.
+		goneVerdictsTotal.Add(1)
 		dropped := deps.navHarv.forgetCoordinate(gvr, namespace, name)
 		dropped += deps.harvester.forgetCoordinate(gvr, namespace, name)
 		if dropped == 0 {
@@ -370,11 +374,21 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 		// preserves any boot-walk stamp. Nil-safe. Inert on single-root config
 		// (curRoot pinned 0 after the first BeginRoot); required for multi-root.
 		//
-		// #135 F4b Lever B — BeginWalk() lives INSIDE the walk branch: a reuse pass
-		// does no BeginRoot(), so resetting curRoot to -1 (with nothing to re-stamp)
-		// would only strand the index at -1. The existing RootIndex stamps must
-		// stand; the seed drains the already-populated snapshot unchanged.
-		deps.navHarv.BeginWalk()
+		// #135 F4b Lever B — the pass-open lives INSIDE the walk branch: a reuse
+		// pass does no BeginRoot(), so resetting curRoot to -1 (with nothing to
+		// re-stamp) would only strand the index at -1. The existing RootIndex
+		// stamps must stand; the seed drains the already-populated snapshot
+		// unchanged.
+		//
+		// 1.12.7 / #220 — routed through beginWalkCoveragePass rather than calling
+		// deps.navHarv.BeginWalk() directly. Same call site, same #99b semantics,
+		// same instant; what changes is that the pass boundary is now taken on the
+		// harvester recordWalkCoverage will read, STRUCTURALLY, instead of on a
+		// pointer that happens to be the same one (phase1_walk.go publishes the
+		// pair it hands this engine). A future wiring that publishes a different
+		// instance would otherwise open the pass on one harvester and measure the
+		// other — silently, and reading as a total collapse.
+		beginWalkCoveragePass()
 	} else {
 		// #135 F4b Lever B — F.4 RESUME pass: SKIP the ~255s discovery re-walk and
 		// REUSE the process-lived harvester snapshot (already the UNION of every
@@ -430,6 +444,32 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 		}
 		rewalked++
 	}
+
+	// 1.12.7 / #220 — same observation for the engine re-walk, classified into
+	// outcomes rather than a boolean. An F.4 RESUME pass (!doWalk) walked
+	// nothing: `roots` is nil and the shipped `rewalked == len(roots)` evaluated
+	// 0 == 0, reporting a completed pass that never ran and republishing
+	// walked_roots=0 over the last real walk's figures. It is not a pass that
+	// reached zero; it is not a pass, and it records nothing but
+	// reuse_passes_total. A walk branch that listed roots and got an EMPTY list
+	// is a different thing again — it meant to walk and covered nothing — and is
+	// counted apart, on len(roots) == 0 rather than roots == nil, because the
+	// lister can hand back a non-nil empty slice and that must not fall through
+	// to "completed". A root that failed above `continue`s without incrementing
+	// rewalked, so rewalked < len(roots) is exactly the partial-pass case that
+	// must not alarm.
+	outcome := walkPassReusedSnapshot
+	if doWalk {
+		switch {
+		case len(roots) == 0:
+			outcome = walkPassNoRoots
+		case rewalked == len(roots):
+			outcome = walkPassCompleted
+		default:
+			outcome = walkPassPartial
+		}
+	}
+	recordWalkCoverage(rewalked, outcome)
 
 	// ── (2) SETTLE the registered set once (single pass, not a loop) so a
 	// CRD the re-walk discovered has its informer registered before the

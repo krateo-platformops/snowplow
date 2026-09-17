@@ -121,6 +121,14 @@ func TestC7_OTLP_EveryDerivedStatLeavesTheProcess(t *testing.T) {
 	}
 	want["refresherStats"] = wantR
 
+	// 1.12.7 — the informer-watch family. Driven through its override seam
+	// like the first two, so this arm proves its stats actually leave the
+	// process rather than merely being registered.
+	iw := &cache.InformerWatchStats{}
+	want["InformerWatchStats"] = c7SetDistinct(iw, fams[3].Specs, 4000)
+	cache.SetInformerWatchStatsForTest(iw)
+	t.Cleanup(func() { cache.SetInformerWatchStatsForTest(nil) })
+
 	ctx := context.Background()
 	shutdown, err := Setup(ctx, "deadbeef")
 	if err != nil {

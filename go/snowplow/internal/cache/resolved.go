@@ -1308,7 +1308,25 @@ type ResolvedEntryMeta struct {
 	Stage               string `json:"stage,omitempty"`
 	AgeSeconds          int64  `json:"ageSeconds"`
 	TTLRemainingSeconds int64  `json:"ttlRemainingSeconds"`
-	Pinned              bool   `json:"pinned"`
+	// LifetimeSeconds is now − BornAt: the age of the KEY, measured from the
+	// first Put under it, which a refresh re-Put does not reset. AgeSeconds
+	// above measures the current BODY (from CreatedAt) and is reset by every
+	// refresh, so a cell the refresher keeps re-Putting reports a small
+	// ageSeconds forever however long it has actually been resident.
+	//
+	// WHY IT IS WORTH A FIELD. maxEntryAge (RESOLVED_CACHE_MAX_ENTRY_AGE) is
+	// the bound on this value, and it is enforced ON READ — the check lives in
+	// Get, so the entry is evicted by the request that hits it. An entry that
+	// is never read therefore sits past the bound indefinitely without
+	// breaching anything, and until now an operator could see that an entry
+	// was past its TTL but had no way to see whether it was past the age the
+	// bound would enforce on its next read. That is exactly the question
+	// "is this cell about to go cold under a customer?" — and it was
+	// unanswerable from this surface.
+	//
+	// 0 when BornAt is unset (an entry Put before the field existed).
+	LifetimeSeconds int64 `json:"lifetimeSeconds"`
+	Pinned          bool  `json:"pinned"`
 	// ItemsCount is the LENGTH of the pre-parsed LIST envelope (0 when not a
 	// parsed-list apistage entry). A count only — never the items themselves.
 	ItemsCount int `json:"itemsCount"`
@@ -1451,17 +1469,32 @@ func (c *ResolvedCacheStore) RangeMetadataSample(n int, fn func(ResolvedEntryMet
 	}
 }
 
+// lifetimeSecondsOf is now − BornAt in whole seconds, 0 when BornAt is unset.
+// Split out so the walk and the single-key lookup cannot compute it
+// differently, and guarded the same way Get's max-age check is
+// (!BornAt.IsZero()).
+func lifetimeSecondsOf(entry *ResolvedEntry, now time.Time) int64 {
+	if entry == nil || entry.BornAt.IsZero() {
+		return 0
+	}
+	return int64(now.Sub(entry.BornAt).Seconds())
+}
+
 // metaForItemLocked builds the metadata projection of one LRU item. Caller
 // holds c.mu. Reads RawJSON / Items / Inputs ONLY for scalar projections —
 // never copies a body, an item, or the extras map into the value.
 func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) ResolvedEntryMeta {
 	entry := item.entry
 	meta := ResolvedEntryMeta{
-		KeyHash:      item.key,
-		AgeSeconds:   int64(now.Sub(entry.CreatedAt).Seconds()),
-		Pinned:       entry.Pinned,
-		ItemsCount:   len(entry.Items),
-		RawJSONBytes: len(entry.RawJSON),
+		KeyHash:    item.key,
+		AgeSeconds: int64(now.Sub(entry.CreatedAt).Seconds()),
+		// 1.12.7 — the KEY's age (BornAt), distinct from the body's age above.
+		// Guarded like Get's max-age check: a zero BornAt reports 0 rather
+		// than the epoch.
+		LifetimeSeconds: lifetimeSecondsOf(entry, now),
+		Pinned:          entry.Pinned,
+		ItemsCount:      len(entry.Items),
+		RawJSONBytes:    len(entry.RawJSON),
 	}
 	if eff := c.effectiveTTLLocked(entry); eff > 0 {
 		rem := eff - now.Sub(entry.CreatedAt)

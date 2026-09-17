@@ -236,12 +236,101 @@ type navWidgetHarvester struct {
 	// BeginRoot() sets it to 0 (the default-route/dashboard subtree). Stamped
 	// into RootIndex on first harvest; no consumer here (FIX-F builds the latch).
 	curRoot int
+
+	// ── 1.12.7 / #220 — PER-PASS COVERAGE OBSERVATION. Four sets, written
+	// under the mu above (no new lock), read ONLY by recordWalkCoverage
+	// (phase1_walk_coverage.go). NOTHING that decides what is seeded,
+	// resolved or evicted reads them, and nothing here participates in the
+	// dedupe or the removal policy — `entries` is the harvested set and stays
+	// the only thing the seed drains.
+	//
+	// WHY THEY EXIST. `entries` is a monotonic cumulative UNION by deliberate
+	// design (see forgetCoordinate: remove on positive evidence only, never on
+	// absence, because the walk is lossy). A coverage collapse is therefore
+	// UNREACHABLE against it — measuring the union answers "what has this pod
+	// ever reached", when the question #220 asks is "what did the LAST PASS
+	// reach". These sets carry that second measure and nothing else.
+	//
+	// KEYED BY COORDINATE (gvr|ns|name) — deliberately NOT by the entry key,
+	// which carries the pagination tuple. The same widget reached under two
+	// tuples is ONE reached widget; the coordinate is also the unit
+	// forgetCoordinate removes by, so the set difference subtracts like for
+	// like.
+	//
+	//   passReached    — coordinates THIS pass reached. CLEARED at the top of
+	//                    every walking pass (BeginWalk).
+	//   prevReached    — the baseline: what the last COMPLETED pass reached.
+	//   forgottenPass  — coordinates dropped by an authoritative GONE verdict
+	//                    in the current generation.
+	//   forgottenPrev  — the same for the preceding generation.
+	//
+	// ── TWO CLOCKS IS THE BUG THIS SHAPE EXISTS TO AVOID. The baseline and the
+	// forget generations roll at the COMPLETED EVALUATION, never at the pass
+	// boundary — coveragePassSnapshotAndPromote, called once from
+	// recordWalkCoverage after `lost` has been computed, promotes BOTH in the
+	// SAME mu hold that read them. Rolling either one at BeginWalk instead puts
+	// it on a different clock from the evaluation, and both halves of that are
+	// live defects:
+	//
+	//   - roll prevReached at the boundary and a benign PARTIAL pass becomes the
+	//     baseline. Partial passes are routine (the F.4 resume path exists
+	//     because deadline cuts happen) and a collapse whose root stopped
+	//     resolving FIRST MANIFESTS as a partial, so the arrival order
+	//     completed(177) → partial(5) → completed(5) is the likely one, not an
+	//     exotic one. The real collapse then compares equal and is SILENT.
+	//   - roll only the reach and leave the forgets on the pass clock (or vice
+	//     versa) and a forget falls out of the discount window while its widget
+	//     is still in prevReached, turning an ordinary delete into a FALSE
+	//     ALARM — strictly worse than the missed detection above. Move both or
+	//     neither.
+	//
+	// ── forgottenPrev IS NOT A TOLERANCE. It is two generations because `prev`
+	// is captured DURING a pass: a widget deleted mid-pass, AFTER that pass had
+	// already reached it, has its forget consumed at that pass's evaluation
+	// without being needed (the widget was still in `reached`). The loss
+	// surfaces at the NEXT evaluation — after the promote drops it from
+	// `reached` but while it is still in `prevReached` — and with a ~255 s walk
+	// that ordering is the COMMON one, not the corner. A forget must therefore
+	// survive exactly one evaluation to be available when `prev` is compared.
+	// Collapse these two into one set and every ordinary delete of a widget
+	// removed mid-pass raises a false alarm.
+	//
+	// ── THE REJECTED ALTERNATIVE, AND THE TRAP IN IT. A single accumulating
+	// forget set can be made to work, but ONLY with BOTH of its rules: drain it
+	// by INTERSECTING it with the new baseline (never an unconditional clear),
+	// AND remove a coordinate from it when the coordinate is re-harvested.
+	// Three reviewers independently reached for the wrong form — one set,
+	// unconditional clear — which is precisely the shape that reintroduces the
+	// mid-pass-delete false alarm described above. Two generations rolled at the
+	// evaluation is the form that does not depend on getting both of those rules
+	// right. If you are about to simplify this to one set, that is the step you
+	// are missing.
+	passReached   map[string]struct{}
+	prevReached   map[string]struct{}
+	forgottenPass map[string]struct{}
+	forgottenPrev map[string]struct{}
 }
 
 // newNavWidgetHarvester returns an empty harvester.
 func newNavWidgetHarvester() *navWidgetHarvester {
 	// curRoot starts at -1 so the first BeginRoot() sets RootIndex 0.
-	return &navWidgetHarvester{entries: map[string]navWidgetEntry{}, curRoot: -1}
+	return &navWidgetHarvester{
+		entries:       map[string]navWidgetEntry{},
+		curRoot:       -1,
+		passReached:   map[string]struct{}{},
+		prevReached:   map[string]struct{}{},
+		forgottenPass: map[string]struct{}{},
+		forgottenPrev: map[string]struct{}{},
+	}
+}
+
+// navWidgetCoordKey is the DISTINCT-WIDGET key: the harvested coordinate
+// without the pagination tuple. One widget, one key, however many tuples it
+// was reached under. It is the unit forgetCoordinate removes by and the unit
+// the #220 coverage measure counts; navWidgetHarvestKey (which appends the
+// tuple) is the ENTRY key and is a different thing on purpose.
+func navWidgetCoordKey(gvr schema.GroupVersionResource, ns, name string) string {
+	return gvr.String() + "|" + ns + "|" + name
 }
 
 // BeginWalk resets the current config-root index to -1 (#99b Fix 2) at the top
@@ -256,13 +345,74 @@ func newNavWidgetHarvester() *navWidgetHarvester {
 // Nil-safe. Inert on this deployment's single-root config (curRoot pinned at 0
 // after the first BeginRoot); required the day a second config root
 // (ROUTES_LOADER) is declared and the effective harvest arrives via a re-walk.
+// 1.12.7 / #220 — BeginWalk ALSO opens a coverage pass: it CLEARS passReached
+// so what this pass reaches is recorded from empty. That is ALL it does to the
+// coverage sets. The baseline (prevReached) and the forget generations roll at
+// the COMPLETED EVALUATION instead — coveragePassSnapshotAndPromote — because
+// rolling them here would put them on a different clock from the evaluation and
+// let a benign PARTIAL pass become the baseline the next real collapse is
+// compared against (see the field block above for both failure modes). Called
+// from the top of each REAL walk on both drivers, via beginWalkCoveragePass, so
+// a RESUME pass — which walks nothing — does not even clear.
 func (h *navWidgetHarvester) BeginWalk() {
 	if h == nil {
 		return
 	}
 	h.mu.Lock()
 	h.curRoot = -1
+	h.passReached = map[string]struct{}{}
 	h.mu.Unlock()
+}
+
+// coveragePassSnapshotAndPromote is the completed-pass evaluation step: it
+// returns COPIES of the three sets the measure needs — what THIS pass reached,
+// the baseline the last completed pass left, and the union of the two forget
+// generations — and in the SAME mu hold promotes both generations for the next
+// evaluation.
+//
+// ONE ACQUISITION, DELIBERATELY. Reading under one hold and promoting under a
+// second leaves a gap, and a forgetCoordinate landing in that gap is dropped on
+// the floor: it is neither counted in the union just read nor carried into
+// forgottenPrev, so at the FOLLOWING evaluation its widget is missing from
+// `reached`, still present in `prevReached`, and unexplained — an ordinary
+// delete raising a false alarm, which is the same defect the two generations
+// exist to prevent, reached by another route.
+//
+// Observation-only, and the ONLY caller is recordWalkCoverage.
+func (h *navWidgetHarvester) coveragePassSnapshotAndPromote() (reached, prev, forgotten map[string]struct{}) {
+	reached, prev, forgotten = map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}
+	if h == nil {
+		return reached, prev, forgotten
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k := range h.passReached {
+		reached[k] = struct{}{}
+	}
+	for k := range h.prevReached {
+		prev[k] = struct{}{}
+	}
+	for k := range h.forgottenPrev {
+		forgotten[k] = struct{}{}
+	}
+	for k := range h.forgottenPass {
+		forgotten[k] = struct{}{}
+	}
+	// PROMOTE — both generations, or neither, in this same hold. A SECOND copy
+	// of passReached becomes the baseline: handing the caller the map the
+	// harvester keeps would let a caller's write land in the next evaluation's
+	// baseline, and passReached itself stays live until the next BeginWalk.
+	next := make(map[string]struct{}, len(reached))
+	for k := range reached {
+		next[k] = struct{}{}
+	}
+	h.prevReached = next
+	h.forgottenPrev = h.forgottenPass
+	if h.forgottenPrev == nil {
+		h.forgottenPrev = map[string]struct{}{}
+	}
+	h.forgottenPass = map[string]struct{}{}
+	return reached, prev, forgotten
 }
 
 // BeginRoot advances the current config-root index (#42 FIX-F seam, STAMP-ONLY).
@@ -305,6 +455,18 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 	key := navWidgetHarvestKey(gvr, w.GetNamespace(), w.GetName(), keyPerPage, keyPage)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// ── 1.12.7 / #220 — RECORD THE REACH, ABOVE THE DEDUPE RETURN BELOW.
+	// This is the last point EVERY reaching call passes through. Below the
+	// first-write-wins return the only calls left are first-ever sightings of a
+	// (widget, pagination tuple) — near zero in steady state — so a set
+	// populated there would read "177 reached, then 0" on the second healthy
+	// pass and the alarm would report a total collapse on a healthy cluster.
+	// Observation-only: the dedupe, `entries` and the removal policy below are
+	// untouched, and nothing that decides seeding reads this set.
+	if h.passReached == nil {
+		h.passReached = map[string]struct{}{}
+	}
+	h.passReached[navWidgetCoordKey(gvr, w.GetNamespace(), w.GetName())] = struct{}{}
 	if _, seen := h.entries[key]; seen {
 		// First-write-wins. The dedupe is intentional: the walk's
 		// visited-set in phase1Walker.walk already prevents re-traversal,
@@ -417,6 +579,22 @@ func (h *navWidgetHarvester) forgetCoordinate(gvr schema.GroupVersionResource, n
 		}
 		delete(h.entries, k)
 		dropped++
+	}
+	// 1.12.7 observability — count the EFFECT, at the removal. One widget can
+	// hold several entries (one per pagination tuple), so this may move by more
+	// than one per gone coordinate; that is the number of replays stopped.
+	if dropped > 0 {
+		harvestForgottenNavTotal.Add(uint64(dropped))
+		// 1.12.7 / #220 — and record the coordinate as an EXPLAINED
+		// disappearance for the coverage alarm. A widget that legitimately
+		// stopped existing must not read as a reachability collapse: the next
+		// pass will not reach it, and this is the evidence that says why.
+		// Recorded only when something was actually dropped — a verdict for a
+		// coordinate this harvester never held explains nothing.
+		if h.forgottenPass == nil {
+			h.forgottenPass = map[string]struct{}{}
+		}
+		h.forgottenPass[navWidgetCoordKey(gvr, ns, name)] = struct{}{}
 	}
 	return dropped
 }

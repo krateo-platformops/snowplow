@@ -78,6 +78,7 @@ var debugRoutePatterns = []string{
 	"GET /debug/apistage",
 	"GET /debug/refreshes",
 	"GET /debug/reconcile",
+	"GET /debug/harvest",
 }
 
 // debugMux is the minimal registration surface registerDebugRoutes needs.
@@ -161,4 +162,11 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// run, and because the full walk holds the store mutex for its duration
 	// (docs/architecture/observability.md).
 	mux.Handle("GET /debug/reconcile", gated.Then(handlers.DebugReconcile()))
+
+	// 1.12.7 observability — the Phase-1 harvester diagnostic. Same JWT gate,
+	// same metadata-only contract as /debug/apistage: counts and booleans, no
+	// harvested object ever leaves the pod. This is what lets the acceptance
+	// step prove a confirmed-gone coordinate was actually FORGOTTEN, which
+	// until now was observable only in tests.
+	mux.Handle("GET /debug/harvest", gated.Then(handlers.DebugHarvest()))
 }

@@ -239,6 +239,21 @@ func TaggedStatFamilies() []StatFamily {
 				untaggedNumericFields(reflect.TypeOf(RefreshTerminalStats{}))...),
 			typ: reflect.TypeOf(refresherStats{}),
 		},
+		// 1.12.7 — informer watch/servability failure counters. Shared
+		// instrument labelled by stat, like crd_discovery.
+		//
+		// APPENDED, not inserted: the OTLP parity arm indexes this slice
+		// POSITIONALLY (fams[0..2]), so inserting a family mid-list silently
+		// re-points those assertions at the wrong struct.
+		{
+			Expvar:   "snowplow_informer_watch",
+			OTelName: "snowplow_informer_watch",
+			Desc:     "Informer watch + servability-confirmation failure counters, labelled by stat.",
+			Values:   InformerWatchStatsByStat,
+			Specs:    statSpecsOf(reflect.TypeOf(InformerWatchStats{})),
+			Untagged: untaggedNumericFields(reflect.TypeOf(InformerWatchStats{})),
+			typ:      reflect.TypeOf(InformerWatchStats{}),
+		},
 	}
 }
 

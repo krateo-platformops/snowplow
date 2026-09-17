@@ -1589,11 +1589,28 @@ func (rw *ResourceWatcher) closePerGVRStopLocked(gvr schema.GroupVersionResource
 // bootstrap GVRs are factory-driven on rw.stopCh and are structurally never
 // removed (and never schema-relisted — typed-RBAC GVRs are not widget GVRs).
 func (rw *ResourceWatcher) RemoveResourceType(gvr schema.GroupVersionResource) {
+	rw.removeResourceTypeWithReason(gvr, confirmRetractUnspecified)
+}
+
+// removeResourceTypeWithReason is RemoveResourceType plus the 1.12.7
+// attribution of WHY the teardown happened, for the confirmation-retraction
+// counter. Unexported and additive: the exported entry point keeps its
+// signature and delegates with "unspecified", so no caller outside this
+// package changes and the three production teardowns name themselves.
+func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionResource, reason string) {
 	if rw == nil || rw.mode == modePassthrough {
 		return
 	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
+
+	// 1.12.7 — a teardown takes the GVR's confirmation with it. Count it only
+	// when one was actually held: deletePerGVRStateLocked deletes
+	// unconditionally and this function is idempotent and nil-safe, so
+	// counting the call would count repeat teardowns and never-confirmed GVRs.
+	if _, was := rw.confirmed[gvr]; was {
+		recordConfirmRetracted(reason)
+	}
 
 	if _, ok := rw.informers[gvr]; !ok {
 		// Unknown GVR — nothing registered. Still attempt the channel

@@ -106,23 +106,7 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 	if gi == nil {
 		return
 	}
-	handler := func(_ *clientcache.Reflector, err error) {
-		rw.mu.Lock()
-		if rw.watchBroken == nil {
-			rw.watchBroken = map[schema.GroupVersionResource]struct{}{}
-		}
-		_, already := rw.watchBroken[gvr]
-		rw.watchBroken[gvr] = struct{}{}
-		rw.mu.Unlock()
-		if !already {
-			slog.Warn("cache.watch.broken",
-				slog.String("subsystem", "cache"),
-				slog.String("gvr", gvr.String()),
-				slog.Any("err", err),
-				slog.String("effect", "servable=false until reflector relists; pivot falls through to apiserver"),
-			)
-		}
-	}
+	handler := rw.watchErrorHandlerFor(gvr)
 	if err := gi.Informer().SetWatchErrorHandler(handler); err != nil {
 		// Reachable only if the informer already started — which the
 		// callers guarantee against (handler installed pre-Run). Log a
@@ -134,10 +118,47 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 		)
 		return
 	}
-	// 0.30.99 Tag B — watch-handler coverage guard. Record the
-	// successful install so assertWatchHandlerCoverageLocked (run from
-	// the constructor's terminal block) can verify every registered GVR
-	// has a handler. Caller holds rw.mu, so this write is safe.
+	rw.markWatchHandlerInstalledLocked(gvr)
+}
+
+// watchErrorHandlerFor builds the per-GVR reflector error handler.
+//
+// A NAMED CONSTRUCTOR, not an inline closure (1.12.7 review C-2): the ONLY
+// thing worth asserting about this handler is that the count happens ABOVE the
+// one-shot, and an arm can only assert that by driving the real handler twice.
+// Hoisting it here is what lets the falsifier hold the installed closure rather
+// than re-implement its arithmetic.
+func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource) func(*clientcache.Reflector, error) {
+	return func(_ *clientcache.Reflector, err error) {
+		rw.mu.Lock()
+		if rw.watchBroken == nil {
+			rw.watchBroken = map[schema.GroupVersionResource]struct{}{}
+		}
+		_, already := rw.watchBroken[gvr]
+		rw.watchBroken[gvr] = struct{}{}
+		rw.mu.Unlock()
+		// 1.12.7 — count EVERY reflector error. The WARN below is one-shot per
+		// GVR (map membership), which keeps a broken watch from flooding the
+		// log but also hides the retry rate: one failure and a failure every
+		// second look identical. The counter is what makes the rate visible.
+		recordWatchError()
+		if !already {
+			slog.Warn("cache.watch.broken",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.Any("err", err),
+				slog.String("effect", "servable=false until reflector relists; pivot falls through to apiserver"),
+			)
+		}
+	}
+}
+
+// markWatchHandlerInstalledLocked records a successful install.
+//
+// 0.30.99 Tag B — watch-handler coverage guard, so
+// assertWatchHandlerCoverageLocked (run from the constructor's terminal block)
+// can verify every registered GVR has a handler. Caller holds rw.mu.
+func (rw *ResourceWatcher) markWatchHandlerInstalledLocked(gvr schema.GroupVersionResource) {
 	if rw.watchHandlerInstalled == nil {
 		rw.watchHandlerInstalled = map[schema.GroupVersionResource]struct{}{}
 	}
@@ -254,7 +275,7 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 	defer rw.mu.Unlock()
 	rw.ensureConfirmMapsLocked()
 	for i, gvr := range gvrs {
-		rw.applyConfirmLocked(gvr, gis[i], disco != nil, served[groupVersionString(gvr)])
+		rw.applyConfirmLocked(gvr, gis[i], disco != nil, served[groupVersionString(gvr)], confirmRetractDiscoveryRefresh)
 	}
 }
 
@@ -288,6 +309,9 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	gi informers.GenericInformer,
 	haveDisco bool,
 	typeServed bool,
+	// 1.12.7 — which call path is re-evaluating conjunct 4, so a retraction
+	// counted below names the code path rather than a category.
+	reason string,
 ) {
 	// Conjunct 4: confirm the resource type. With no discovery client,
 	// haveDisco==false ⇒ resourceTypeConfirmedLocked already returns true,
@@ -300,6 +324,14 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 			// gates a post-startup CRD until the apiserver publishes its
 			// API, and also correctly retracts a confirmation if a CRD is
 			// deleted.
+			//
+			// 1.12.7 — count it, but ONLY when a confirmation actually
+			// existed: this delete is unconditional and runs on every pass
+			// for a GVR that was never confirmed, so counting the call would
+			// count non-events.
+			if _, was := rw.confirmed[gvr]; was {
+				recordConfirmRetracted(reason)
+			}
 			delete(rw.confirmed, gvr)
 		}
 	}
@@ -399,7 +431,7 @@ func (rw *ResourceWatcher) ConfirmResourceType(ctx context.Context, gvr schema.G
 		return
 	}
 	rw.ensureConfirmMapsLocked()
-	rw.applyConfirmLocked(gvr, curGI, disco != nil, typeServed)
+	rw.applyConfirmLocked(gvr, curGI, disco != nil, typeServed, confirmRetractScopedConfirm)
 }
 
 // ConfirmResourceTypes runs the scoped conjunct-3/4 confirmation pass over a
@@ -476,7 +508,7 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 		if !stillRegistered {
 			continue
 		}
-		rw.applyConfirmLocked(gvr, curGI, disco != nil, served[groupVersionString(gvr)])
+		rw.applyConfirmLocked(gvr, curGI, disco != nil, served[groupVersionString(gvr)], confirmRetractWalkConfirm)
 	}
 }
 
