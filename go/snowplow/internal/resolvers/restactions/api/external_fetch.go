@@ -131,9 +131,20 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		}
 	}
 
-	// REUSED verbatim: builds the HTTP client (TLS/CA/client-certs/proxy/
-	// timeouts + bearer/basic/AWS auth roundtrippers) from the Endpoint.
-	cli, err := httpcall.HTTPClientForEndpoint(opts.Endpoint, &opts.RequestInfo)
+	// Builds the HTTP client (TLS/CA/client-certs/proxy/timeouts +
+	// bearer/basic/AWS auth roundtrippers) from the Endpoint.
+	//
+	// snowplow#229 / audit A1: this was `httpcall.HTTPClientForEndpoint`
+	// verbatim, which DROPS the CA bundle of a TOKEN-AUTH endpoint
+	// (plumbing transport.go:37 returns before the CA install when
+	// !HasCertAuth()). That is snowplow's own SA endpoint — the default
+	// for every api-step with no `endpointRef` — so every non-GET such
+	// step failed TLS with x509-unknown-authority while GETs escaped by
+	// being intercepted upstream. httpClientForEndpoint covers exactly
+	// that shape and DELEGATES to plumbing verbatim for every other one,
+	// so the live cert-auth population is byte-identical. See
+	// endpoints_tls.go for the full trace.
+	cli, err := httpClientForEndpoint(opts.Endpoint, &opts.RequestInfo)
 	if err != nil {
 		werr := fmt.Errorf("unable to create HTTP Client for endpoint: %w", err)
 		return response.New(http.StatusInternalServerError, werr), nil, "", werr
