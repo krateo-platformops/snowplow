@@ -168,6 +168,24 @@ func DepsStatsByStat() map[string]int64 {
 		// refresher. Read next to probe_unknown_degraded_total: that one counts
 		// budget exhaustions, this one counts the ones that had something at
 		// stake.
+		//
+		// 1.12.8 CORRECTION — "had something at stake" was misleading as the
+		// whole story, and its FIRST live reading proved it: 28,622 / 29,069 =
+		// 98.5% of this counter on 057 was a SINGLE structurally unanswerable
+		// probe on metrics.k8s.io, whose resources advertise ["get","list"] with
+		// no `watch`. A GVR whose informer can NEVER become servable (conjunct 3
+		// can never clear) contributes to this counter INDEFINITELY, at a rate
+		// set by the reflector's relist cadence rather than by anything actually
+		// at stake — it had a dependent entry, but no eviction was ever possible
+		// or appropriate.
+		//
+		// So: this counter is only interpretable once the unwatchable-GVR gate
+		// (resourceAuthoritativelyUnwatchable, servable.go) is in place to keep
+		// such informers from being registered at all. With that gate live, a
+		// non-zero reading means what the 1.12.7 sentence above says. Without
+		// it, the number is dominated by a GVR that can never recover. If this
+		// counter is high, FIRST check /debug/servable for a GVR with
+		// watchBroken=true that is never going to clear.
 		"on_object_event_degraded_no_evict_total": int64(d.OnObjectEventDegradedNoEvict),
 
 		// --- the sampled reconcile audit (1.12.6 C3, deps_reconcile.go) ---

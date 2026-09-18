@@ -689,17 +689,66 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 	// dispatch still serves live via httpcall.Do apiserver fall-through
 	// meanwhile, exactly as an unregistered GVR does today.
 	//
+	// A2 (1.12.8) EXTENDS this same gate to the RESOURCE level, ||-joined
+	// below: a group can be served while the RESOURCE it holds cannot sustain
+	// an informer at all. metrics.k8s.io/v1beta1 pods+nodes advertise
+	// ["get","list"] with NO `watch` — the reflector LISTs and then fails WATCH
+	// forever, conjunct 3 never clears, and every dep-event probe on those
+	// coordinates is structurally unanswerable (+236,300 dirty-marks and
+	// +236,329 refresher enqueues per ~14 min on 057, for ZERO evictions). The
+	// same gate also drops the stray authorization.k8s.io subjectaccessreviews
+	// reflector, whose only verb is `create`. See
+	// resourceAuthoritativelyUnwatchable (servable.go).
+	//
+	// The RESOURCE check does NOT weaken the group-granularity ruling above,
+	// because it is fail-safe open on exactly the state that ruling protects:
+	// a post-startup CRD is ABSENT from discovery's resource list, and ABSENT
+	// REGISTERS. Only a resource PRESENT in a successful list whose declared
+	// verbs lack list+watch is skipped.
+	//
 	// Gated by SkipUnservedGroupInformers() (default ON, flips both ways);
-	// flag-off restores register-unconditionally.
-	if SkipUnservedGroupInformers() && groupAuthoritativelyAbsent(disco, gvr.Group) {
+	// flag-off restores register-unconditionally. The A2 resource check shares
+	// that existing kill-switch deliberately rather than adding a second flag —
+	// it is the same "discovery says do not spawn this informer" mechanism at a
+	// finer granularity, and a new default-off flag would be parking a
+	// confirmed defect (feedback_no_park_broken_behind_flag).
+	//
+	// gateVerbs is the resource list the gate LIVE-FETCHED here, or nil when it
+	// answered from the memo (or never fetched at all). It is handed to the
+	// confirm-prime on the success paths below so the prime does not re-fetch
+	// the identical list microseconds later: the gate's round-trip REPLACES the
+	// prime's, keeping first touch of a new group/version at exactly ONE
+	// discovery call — the cost bound
+	// TestF1b_LazyRegister_PrimesConfirm_NoFlagNoDirectCall pins. On a memo hit
+	// gateVerbs is nil and the prime fetches for itself, which is both
+	// byte-identical to pre-A2 behaviour and REQUIRED: confirming a
+	// post-startup CRD off a list up to one TTL old would delay its heal by a
+	// ticker cycle.
+	skipReason, gateVerbs := unregisterableReason(disco, gvr)
+	if skipReason != "" {
 		closed := make(chan struct{})
 		close(closed)
+		// LEVEL IS DELIBERATE, AND SO IS THE LIMIT IT IMPLIES. This fires on
+		// EnsureResourceType's MISS path, which for a permanently-skipped GVR is
+		// every dispatch that touches it — so at WARN it would be thousands of
+		// lines a day, which is the very noise class this gate exists to remove.
+		// At INFO it sits below the shipped LOG_LEVEL=warn floor and is NOT
+		// emitted in production at all.
+		//
+		// Both levels are wrong for operator visibility, so do not claim it:
+		// this is a debug breadcrumb for someone who has raised the level
+		// deliberately, NOT the instrument for confirming the gate works. That
+		// evidence is the CONSEQUENCE counters (dep-event probe outcomes,
+		// dirty-marks, refresher enqueues), which are expvar and always on —
+		// and which are the stronger evidence anyway, since they measure the
+		// harm being removed rather than the decision being taken.
 		slog.Info("cache.lazy_register.skipped_unserved_group",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("group", gvr.Group),
-			slog.String("reason", "apiserver ServerGroups() authoritatively does not serve this group"),
+			slog.String("reason", skipReason),
 			slog.String("effect", "informer NOT registered — no perpetual watch-404 churn; dispatch falls through to live apiserver; re-touch recovers if the group is later served"),
+			slog.String("visibility", "INFO, below the shipped warn floor and emitted per dispatch — confirm this gate from the consequence counters, not from this line"),
 		)
 		return false, closed
 	}
@@ -747,7 +796,7 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 		// just lazily registered so the NEXT dispatch serves from the informer
 		// rather than falling through to a live LIST. Async + skip-guarded; runs
 		// after this critical section releases rw.mu. See primeConfirmAsyncLocked.
-		rw.primeConfirmAsyncLocked(gvr)
+		rw.primeConfirmAsyncLocked(gvr, gateVerbs)
 		return true, ch
 	}
 	// Soft-fail observability: if the predicate WOULD have routed
@@ -789,7 +838,7 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 	// fall-through the 1.7.3/1.7.4 serve_miss readout showed). Async +
 	// skip-guarded; runs after this critical section releases rw.mu. See
 	// primeConfirmAsyncLocked.
-	rw.primeConfirmAsyncLocked(gvr)
+	rw.primeConfirmAsyncLocked(gvr, gateVerbs)
 
 	return true, ch
 }
@@ -1032,7 +1081,33 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 // ~10ms of async discovery beats a 23s live-LIST fall-through, and because the
 // confirm runs off the register path's lock it never stalls unrelated
 // dispatches.
-func (rw *ResourceWatcher) primeConfirmAsyncLocked(gvr schema.GroupVersionResource) {
+//
+// # gateVerbs — the A2 hand-off (1.12.8)
+//
+// The A2 pre-check (unregisterableReason) asks discovery for this
+// group/version's resource list BEFORE registering, and the confirm below needs
+// THE SAME LIST. Left alone that is two round-trips where there was one, which
+// is a real cost regression on first touch of a new group/version and is caught
+// by TestF1b_LazyRegister_PrimesConfirm_NoFlagNoDirectCall's "exactly 1"
+// guard — a guard on lines this change touches, so it is fixed, not relaxed.
+//
+// gateVerbs is that list when the gate LIVE-FETCHED it, else nil:
+//
+//   - non-nil → the confirm answers conjunct 4 from it and issues ZERO
+//     round-trips. The gate's fetch REPLACED the prime's; total stays 1.
+//   - nil     → the confirm does its own live fetch, byte-identical to
+//     pre-A2. This is the memo-hit case (a later GVR in a
+//     group/version fetched earlier this window) and it is
+//     deliberate: priming off a list up to one memo TTL (30s) old
+//     would let a post-startup CRD's confirm miss the transition it
+//     is waiting for and wait a full ticker cycle. Total is again 1,
+//     paid by the prime instead of the gate.
+//
+// So the round-trip count is never worse than before A2 on either path, and no
+// confirm is ever decided on stale data. The 30s RefreshDiscovery ticker and
+// every other ConfirmResourceType caller are untouched — they keep passing nil
+// through ConfirmResourceType's unchanged signature.
+func (rw *ResourceWatcher) primeConfirmAsyncLocked(gvr schema.GroupVersionResource, gateVerbs map[string]metav1.Verbs) {
 	// Skip-guard 1 — offline degrade preserved: with no discovery client,
 	// conjunct 4 is degraded-true and there is nothing to confirm. Bail before
 	// spawning a goroutine that would immediately no-op inside ConfirmResourceType.
@@ -1067,7 +1142,12 @@ func (rw *ResourceWatcher) primeConfirmAsyncLocked(gvr schema.GroupVersionResour
 			return
 		default:
 		}
-		rw.ConfirmResourceType(bgCtx, gvr)
+		// gateVerbs is read here, on this goroutine, AFTER the caller released
+		// rw.mu. It is safe to read unsynchronised because it is a copy made
+		// for this hand-off (resourceAuthoritativelyUnwatchable) that nothing
+		// else retains or mutates — not the memo's map, and not shared with
+		// any other registrant.
+		rw.confirmResourceTypeWithVerbs(bgCtx, gvr, gateVerbs)
 		slog.Info("cache.lazy_register.confirm_primed",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
