@@ -35,6 +35,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/informers"
 	clientcache "k8s.io/client-go/tools/cache"
 )
@@ -385,6 +386,30 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 //
 // Nil-receiver / passthrough safe.
 func (rw *ResourceWatcher) ConfirmResourceType(ctx context.Context, gvr schema.GroupVersionResource) {
+	rw.confirmResourceTypeWithVerbs(ctx, gvr, nil)
+}
+
+// confirmResourceTypeWithVerbs is ConfirmResourceType's body, with ONE addition:
+// an optional resource-verb list the caller has ALREADY fetched for gvr's
+// group/version.
+//
+//   - verbs == nil → fetch via resourceTypeServed, exactly as before. This is
+//     what ConfirmResourceType (and therefore the 30s RefreshDiscovery ticker
+//     path, the dispatch re-touch and every other existing caller) does, so
+//     those paths are untouched.
+//   - verbs != nil → answer conjunct 4 from it and issue NO round-trip. Used
+//     only by the lazy-register confirm-prime, which is reached from
+//     EnsureResourceType immediately after the A2 gate live-fetched that very
+//     list (see unregisterableReason). The gate's fetch REPLACES the prime's:
+//     one round-trip per first touch, not two.
+//
+// EQUIVALENCE (why a verb map can answer a question about a resource LIST):
+// resourceTypeServed asks ONLY whether gvr.Resource appears among the
+// group/version's APIResources. resourceVerbsSnapshot keys that same list by
+// r.Name for EVERY entry it contains, so map-presence and list-presence are the
+// same predicate — including the empty-verbs case, where the resource is a key
+// with a zero-length value and both answer PRESENT.
+func (rw *ResourceWatcher) confirmResourceTypeWithVerbs(ctx context.Context, gvr schema.GroupVersionResource, verbs map[string]metav1.Verbs) {
 	if rw == nil || rw.mode == modePassthrough {
 		return
 	}
@@ -409,7 +434,14 @@ func (rw *ResourceWatcher) ConfirmResourceType(ctx context.Context, gvr schema.G
 
 	typeServed := false
 	if disco != nil {
-		typeServed = resourceTypeServed(disco, gvr)
+		if verbs != nil {
+			// Hand-off from the A2 gate's live fetch — no round-trip. Presence
+			// in the by-name map IS resourceTypeServed's predicate; see the
+			// EQUIVALENCE note on this function.
+			_, typeServed = verbs[gvr.Resource]
+		} else {
+			typeServed = resourceTypeServed(disco, gvr)
+		}
 	}
 
 	rw.mu.Lock()
@@ -995,4 +1027,305 @@ func (rw *ResourceWatcher) HasWatchHandlerForTest(gvr schema.GroupVersionResourc
 	defer rw.mu.RUnlock()
 	_, ok := rw.watchHandlerInstalled[gvr]
 	return ok
+}
+
+// --- A2 unwatchable-RESOURCE pre-check (audit A2 / 1.12.8) -----------------
+//
+// Reclassified residual of the #119 work: EnsureResourceType gated only on
+// whether the GROUP is served (groupAuthoritativelyAbsent above), never on what
+// the RESOURCE can actually DO. A resource that does not advertise `watch`
+// LISTs successfully and then fails WATCH forever — conjunct 3 (watchBroken)
+// never clears, so it is never servable, so every dep-event probe on its
+// coordinates is structurally unanswerable.
+//
+// LIVE WIRE SHAPE that motivated this (kubectl get --raw /apis/metrics.k8s.io/v1beta1):
+//
+//	{"name":"nodes","namespaced":false,"kind":"NodeMetrics","verbs":["get","list"]}
+//	{"name":"pods", "namespaced":true, "kind":"PodMetrics", "verbs":["get","list"]}
+//
+// No `watch`. /debug/servable confirmed `watchBroken=true servable=false` for
+// both, and the cost over a ~14-minute window on 057 was +236,300 dirty-marks,
+// +236,329 refresher enqueues and +0 evictions — ~280 refresher enqueues per
+// second of pure waste, with 92.5% of ALL dep-event probes returning UNKNOWN.
+// It also buried the one genuinely broken informer on the pod (7 portalagents
+// degrades under 5,021 structurally-unanswerable lines).
+//
+// The dependency contract for such a resource is already complete elsewhere: an
+// entry stored while its GVR informer is not servable is stamped with the short
+// CATALOG_UNSERVABLE_TTL_SECONDS, and an UNREGISTERED GVR takes that same
+// branch. So the correct behaviour is simply to not create the informer. Live
+// metrics are continuously varying by nature; a watch edge would be the wrong
+// model even if the API offered one.
+
+// resourceVerbsMemoTTL bounds the freshness of the cached per-resource verb
+// data the unwatchable pre-check consults. It is the SAME window as the
+// served-group memo and the confirm ticker, so the skip window matches the heal
+// window.
+//
+// THE STALENESS BOUND IS THE SAFETY ARGUMENT: a skip is a decision made on
+// possibly-stale data, and the neighbour's comment names the hazard exactly —
+// a PERMANENT false-skip is data dropped forever. It is bounded here because a
+// resource that GAINS `watch` after its entry was written is admitted within AT
+// MOST ONE resourceVerbsMemoTTL (30s), when the memo expires wholesale and the
+// next dispatch's re-touch re-reads discovery. The exposure is one TTL window,
+// never indefinite.
+const resourceVerbsMemoTTL = discoveryRefreshInterval
+
+// resourceVerbsMemo caches the DISCOVERY DATA (per group/version, the verbs
+// each resource advertises) — deliberately NOT the skip verdict. Caching the
+// verdict would survive its own evidence: a resource that later gains `watch`
+// would keep being skipped because the cached answer, not the cached input, was
+// consulted. Caching the inputs means expiry re-derives the verdict from fresh
+// discovery for free.
+//
+// The whole map carries ONE timestamp and is replaced WHOLESALE on expiry — it
+// is not a per-GVR entry with its own lifetime, so nothing accretes and no
+// removal path is needed. Growth within a window is bounded by the number of
+// distinct group/versions touched in that window; expiry resets it.
+//
+// Reads the RAW disco for the same reason the served-group memo does: a
+// memcache-backed client's global Invalidate can leave it stale, and for a SKIP
+// decision stale means a false-skip. This in-process memo bounds the raw
+// round-trip cost to ~one ServerResourcesForGroupVersion per group/version per
+// TTL window across ALL registration misses — which matters because the miss on
+// a skipped GVR is PERMANENT (it never registers), so an un-memoised gate would
+// issue a discovery round-trip on every single dispatch that touches it.
+var (
+	resourceVerbsMu        sync.Mutex
+	resourceVerbsByGV      map[string]map[string]metav1.Verbs
+	resourceVerbsFetchedAt time.Time
+)
+
+// ResetResourceVerbsMemoForTest clears the resource-verb memo so each test
+// reads its freshly-installed discovery double. TEST-ONLY. Mirrors
+// ResetServedGroupsMemoForTest.
+func ResetResourceVerbsMemoForTest() {
+	resourceVerbsMu.Lock()
+	resourceVerbsByGV = nil
+	resourceVerbsFetchedAt = time.Time{}
+	resourceVerbsMu.Unlock()
+}
+
+// ExpireResourceVerbsMemoForTest backdates the memo's timestamp past
+// resourceVerbsMemoTTL while LEAVING THE CACHED MAP IN PLACE, so the next
+// resourceVerbsSnapshot drives the REAL wholesale-expiry branch instead of the
+// nil-map branch. TEST-ONLY.
+//
+// This exists rather than reusing ResetResourceVerbsMemoForTest because the
+// staleness bound is a correctness claim, not a convenience: the arm that
+// proves a resource which LATER gains `watch` is admitted within one TTL must
+// actually execute the expiry code path. Resetting the map to nil would bypass
+// the very branch under test and the arm would pass without testing it.
+func ExpireResourceVerbsMemoForTest() {
+	resourceVerbsMu.Lock()
+	resourceVerbsFetchedAt = time.Now().Add(-2 * resourceVerbsMemoTTL)
+	resourceVerbsMu.Unlock()
+}
+
+// ResourceVerbsMemoHasGVForTest reports whether the memo currently holds a live
+// (non-expired) entry for gv. TEST-ONLY.
+//
+// It exists so the option-4 hand-off arms can ATTRIBUTE a discovery round-trip
+// to the gate or to the confirm-prime, rather than infer it from a total count
+// that cannot tell them apart. Only the A2 gate writes this memo — the confirm
+// path (resourceTypeServed) never touches it — so:
+//
+//   - empty before a registration and populated after ⇒ the GATE live-fetched;
+//   - already populated before a registration        ⇒ the gate CANNOT fetch,
+//     so any round-trip observed during it is the PRIME's own.
+//
+// That second reading is what makes the memo-hit arm discriminating: an
+// implementation that hands the memo to the prime in BOTH cases shows ZERO
+// round-trips there and is caught, where a bare count would pass it.
+func ResourceVerbsMemoHasGVForTest(gv string) bool {
+	resourceVerbsMu.Lock()
+	defer resourceVerbsMu.Unlock()
+	if resourceVerbsByGV == nil || time.Since(resourceVerbsFetchedAt) >= resourceVerbsMemoTTL {
+		return false
+	}
+	_, ok := resourceVerbsByGV[gv]
+	return ok
+}
+
+// resourceVerbsSnapshot returns the memoised resource-name → verbs map for gv,
+// refreshing from disco when the memo is empty or older than
+// resourceVerbsMemoTTL. Returns (map, true, fresh) on success and
+// (nil, false, false) on ANY uncertainty — the fail-safe-open signal.
+//
+// FRESH reports whether THIS call performed a live
+// ServerResourcesForGroupVersion (true) or answered from the memo (false). It
+// exists so the caller can hand a JUST-FETCHED list to the lazy-register
+// confirm-prime, which would otherwise fetch the SAME list microseconds later —
+// the gate's fetch REPLACES the prime's, keeping first-touch cost at exactly one
+// discovery round-trip (the F1b cost guard). A memo HIT deliberately reports
+// false so the prime does its own live fetch: priming off memo data up to one
+// TTL old would delay a post-startup CRD's confirm by a ticker cycle, which is
+// the heal property the #119 group-granularity ruling protects. Freshness is
+// therefore a correctness signal, not an optimisation hint.
+//
+// A fetch error is deliberately NOT memoised. Caching "we could not tell" would
+// let one transient discovery failure suppress registration decisions for a
+// whole TTL window; re-asking is the conservative choice, and since the
+// uncertain verdict REGISTERS, the cost of re-asking is bounded by how often a
+// genuinely-broken group/version is touched.
+//
+// DELIBERATE DIVERGENCE FROM servedGroupsSnapshot — do NOT harmonise them.
+// That memo, on a transient refresh error, RETURNS ITS PRIOR GOOD SNAPSHOT;
+// this one RE-ASKS. The asymmetry is intentional because the two fail in
+// OPPOSITE directions: the group memo's fallback exists because fail-open there
+// means re-admitting every GVR of a dead group, i.e. a false-OPEN storm, so
+// bounded staleness is the safer answer; here a memoised error would be
+// consulted as evidence for a SKIP, i.e. a false-SKIP that silently drops real
+// data. Both rules are the same invariant applied to different blast radii —
+// UNCERTAINTY NEVER SKIPS. Replacing this re-ask with the neighbour's fallback
+// reintroduces exactly the memoised-error false-skip it is written to prevent.
+func resourceVerbsSnapshot(disco ResourceTypeDiscovery, gv string) (byName map[string]metav1.Verbs, ok, fresh bool) {
+	resourceVerbsMu.Lock()
+	defer resourceVerbsMu.Unlock()
+
+	// Wholesale expiry: ONE timestamp for the entire map.
+	if resourceVerbsByGV != nil && time.Since(resourceVerbsFetchedAt) >= resourceVerbsMemoTTL {
+		resourceVerbsByGV = nil
+	}
+	if resourceVerbsByGV == nil {
+		resourceVerbsByGV = map[string]map[string]metav1.Verbs{}
+		resourceVerbsFetchedAt = time.Now()
+	}
+
+	if memoised, hit := resourceVerbsByGV[gv]; hit {
+		return memoised, true, false // memo hit — NOT fresh
+	}
+
+	list, err := disco.ServerResourcesForGroupVersion(gv)
+	if err != nil || list == nil {
+		return nil, false, false // discovery unavailable/errored — fail-safe open
+	}
+
+	fetched := make(map[string]metav1.Verbs, len(list.APIResources))
+	for _, r := range list.APIResources {
+		fetched[r.Name] = r.Verbs
+	}
+	resourceVerbsByGV[gv] = fetched
+	return fetched, true, true // live fetch — fresh
+}
+
+// resourceAuthoritativelyUnwatchable is the A2 pre-check's THREE-STATE
+// predicate, with the IDENTICAL fail-safe-open discipline as its neighbour
+// groupAuthoritativelyAbsent. It returns true ONLY when a SUCCESSFUL discovery
+// response definitively shows the resource CANNOT sustain an informer.
+//
+// EXACTLY ONE STATE SKIPS:
+//
+//   - resource PRESENT in a successful list, Verbs non-empty, and those verbs
+//     do NOT include both `list` and `watch`  → AUTHORITATIVELY unwatchable (SKIP)
+//
+// EVERY OTHER STATE REGISTERS (fail-safe open):
+//
+//   - disco == nil                                  → NOT authoritative (register)
+//   - ServerResourcesForGroupVersion errors         → NOT authoritative (register)
+//   - it returns a nil list                         → NOT authoritative (register)
+//   - resource ABSENT from a successful list        → NOT authoritative (register)
+//   - resource present but Verbs empty/nil          → NOT authoritative (register)
+//   - verbs include list+watch                      → watchable (register)
+//
+// THE ABSENT CASE IS THE SUBTLE ONE, and reading it the other way would convert
+// this fail-safe-OPEN check into a fail-safe-CLOSED one: absent is NOT
+// unwatchable. A post-startup CRD that discovery has not published yet is
+// absent from the list, and it MUST register — that is exactly the S4/
+// stale-delete heal path (#50/#116) the group-granularity ruling was written to
+// protect. Uncertainty NEVER skips, because a false-skip of a genuinely
+// watchable resource silently drops real data forever, which is strictly worse
+// than the churn this removes.
+//
+// EMPTY VERBS likewise register: aggregated API servers sometimes omit the
+// field, and "no information" is not "cannot watch".
+//
+// PRIOR ART (feedback_check_k8s_clientgo_prior_art): the verb test is
+// client-go's own discovery.SupportsAllVerbs (discovery/helper.go:138-144) —
+// the canonical "can I build an informer on this?" predicate — not a
+// hand-rolled verb-string scan. An informer's ListAndWatch needs BOTH `list`
+// and `watch`, which is why both are required rather than `watch` alone.
+//
+// SECOND RETURN — the just-fetched list, or nil. It is non-nil ONLY when this
+// call performed a LIVE discovery fetch (resourceVerbsSnapshot's `fresh`), and
+// it is a DEFENSIVE COPY, never the memo's own map. The caller hands it to the
+// lazy-register confirm-prime so the prime answers from it instead of
+// re-fetching the identical list microseconds later; see
+// primeConfirmAsyncLocked. A memo HIT returns nil, which makes the prime do its
+// own live fetch — deliberately, so a later GVR in an already-memoised
+// group/version never confirms off data up to one TTL old.
+//
+// The copy is what makes that hand-off safe: the prime reads the map from a
+// goroutine that runs AFTER rw.mu releases, with no resourceVerbsMu held, while
+// the memo's entry stays reachable from the package-global map
+// (feedback_shared_vs_copy_is_a_concurrency_change). Copying is cheap — it
+// happens once per live fetch, i.e. at most once per group/version per TTL.
+func resourceAuthoritativelyUnwatchable(disco ResourceTypeDiscovery, gvr schema.GroupVersionResource) (bool, map[string]metav1.Verbs) {
+	if disco == nil {
+		return false, nil // no discovery surface — fail-safe open (register)
+	}
+
+	gv := groupVersionString(gvr)
+	byName, ok, fresh := resourceVerbsSnapshot(disco, gv)
+	if !ok {
+		return false, nil // discovery unavailable/errored — fail-safe open (register)
+	}
+
+	var fetched map[string]metav1.Verbs
+	if fresh {
+		fetched = make(map[string]metav1.Verbs, len(byName))
+		for name, verbs := range byName {
+			fetched[name] = verbs
+		}
+	}
+
+	verbs, present := byName[gvr.Resource]
+	if !present {
+		return false, fetched // ABSENT != unwatchable — a not-yet-published CRD must register
+	}
+	if len(verbs) == 0 {
+		return false, fetched // no verb information at all — fail-safe open (register)
+	}
+
+	res := metav1.APIResource{Name: gvr.Resource, Verbs: verbs}
+	return !discovery.SupportsAllVerbs{Verbs: []string{"list", "watch"}}.Match(gv, &res), fetched
+}
+
+// unregisterableReason is the single decision the EnsureResourceType pre-check
+// asks: may we spawn an informer for gvr? It returns "" to REGISTER, or a
+// human-readable reason to SKIP — the reason discriminator that keeps the two
+// skip causes distinguishable in one log line rather than forking the log site.
+//
+// Both conjuncts are fail-safe open, so "" (register) is the answer to every
+// form of uncertainty. Order matters only for the reason string: a group that
+// is not served at all is the coarser and more actionable diagnosis, so it is
+// reported in preference to the resource-level one.
+//
+// Honours SkipUnservedGroupInformers() for BOTH checks — flag-off restores
+// register-unconditionally, exactly as before A2.
+//
+// SECOND RETURN — the resource-verb list this call LIVE-FETCHED for gvr's
+// group/version, or nil. Threaded through to the confirm-prime so the gate's
+// fetch REPLACES the prime's rather than adding to it: first touch of a new
+// group/version costs ONE discovery round-trip, exactly as it did before A2
+// (the F1b cost guard). Every path that did not live-fetch returns nil and the
+// prime fetches for itself, byte-identically to today:
+//
+//   - kill-switch off        → returns before any fetch                → nil
+//   - group absent (SKIP)    → no informer is registered, so no prime   → nil
+//   - disco == nil           → no fetch possible; the prime also bails  → nil
+//   - memo HIT               → nothing fetched HERE, and a 30s-old list
+//     must not be what confirms a post-startup CRD → nil
+func unregisterableReason(disco ResourceTypeDiscovery, gvr schema.GroupVersionResource) (string, map[string]metav1.Verbs) {
+	if !SkipUnservedGroupInformers() {
+		return "", nil
+	}
+	if groupAuthoritativelyAbsent(disco, gvr.Group) {
+		return "apiserver ServerGroups() authoritatively does not serve this group", nil
+	}
+	unwatchable, fetched := resourceAuthoritativelyUnwatchable(disco, gvr)
+	if unwatchable {
+		return "apiserver discovery declares this resource without list+watch — an informer on it can never become servable", nil
+	}
+	return "", fetched
 }
