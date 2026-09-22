@@ -79,6 +79,7 @@ var debugRoutePatterns = []string{
 	"GET /debug/refreshes",
 	"GET /debug/reconcile",
 	"GET /debug/harvest",
+	"GET /debug/store",
 }
 
 // debugMux is the minimal registration surface registerDebugRoutes needs.
@@ -169,4 +170,18 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// step prove a confirmed-gone coordinate was actually FORGOTTEN, which
 	// until now was observable only in tests.
 	mux.Handle("GET /debug/harvest", gated.Then(handlers.DebugHarvest()))
+
+	// #237 — the per-object informer-store read. The incident it exists for
+	// could not be diagnosed because every surface above is DOWNSTREAM of the
+	// store: /debug/apistage reports L1 entry metadata and /debug/reconcile
+	// probes L1 against the informer's own indexer, so "is the store stale or
+	// is the cell stale?" renders identically either way. This route reports
+	// the store's own resourceVersion/uid for one coordinate.
+	//
+	// Same gate, same metadata-and-hashes-only contract as its siblings, and
+	// it reads NOTHING from the apiserver: a comparison served as the snowplow
+	// ServiceAccount would tell any valid-JWT holder the existence and
+	// resourceVersion of objects their own RBAC forbids. The operator runs
+	// that half with kubectl, under their own identity.
+	mux.Handle("GET /debug/store", gated.Then(handlers.DebugStore()))
 }

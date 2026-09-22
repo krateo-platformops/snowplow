@@ -104,6 +104,11 @@ var debugProbePaths = map[string]string{
 	"GET /debug/refreshes":     "/debug/refreshes",
 	"GET /debug/reconcile":     "/debug/reconcile",
 	"GET /debug/harvest":       "/debug/harvest",
+	// #237 — /debug/store takes required query parameters. The probe carries
+	// valid ones so the authenticated arm below sees the route's real 200 and
+	// not its 400: a gating arm that only ever drove a rejected request would
+	// pass whether or not the handler works past the gate.
+	"GET /debug/store": "/debug/store?gvr=v1/configmaps&namespace=krateo-system&name=probe",
 }
 
 // debugPathsSafeToDriveAuthenticated is debugProbePaths minus the two
@@ -120,6 +125,7 @@ var debugPathsSafeToDriveAuthenticated = []string{
 	"/debug/apistage",
 	"/debug/refreshes",
 	"/debug/reconcile",
+	"/debug/store?gvr=v1/configmaps&namespace=krateo-system&name=probe",
 }
 
 // recordingMux records the patterns registered on it and delegates to a real
