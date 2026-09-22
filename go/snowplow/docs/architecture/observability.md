@@ -19,9 +19,10 @@ port the server listens on (`main.go` `server.Addr = :<port>`):
    **default-on since 1.12.4** behind the `OTEL_ENABLED` master switch (see below).
 
 Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage`, `GET /debug/harvest`,
-`GET /debug/refreshes` (the live-refresh subscription registry) and
+`GET /debug/refreshes` (the live-refresh subscription registry),
 `GET /debug/reconcile` (1.12.6 C3 — the on-demand full reconcile audit, see the
-dependency-tracker section), and two probe endpoints used by the chart.
+dependency-tracker section) and `GET /debug/store` (#237 — the per-object informer-store read),
+and two probe endpoints used by the chart.
 
 > **Every `/debug/*` route needs a JWT (since 1.12.3).** The whole surface —
 > pprof, vars, servable, apistage, refreshes — is registered by
@@ -405,6 +406,52 @@ state was verifiable in tests and nowhere else.
 widget CR and what the seed makes of it is per-identity resolved output, so the same boundary
 that keeps bodies off `/debug/apistage` applies here — and the response type has no field that
 could carry one.
+
+### Inspecting the informer store for ONE object (#237)
+`GET /debug/store` answers **"is the STORE stale, or is the L1 cell stale?"** — the question
+#237 spent two sessions failing to answer, because every other surface is DOWNSTREAM of the
+informer store and renders the two states identically. `/debug/apistage` reports L1 entry
+metadata; `/debug/reconcile` probes L1 against the informer's **own** indexer, i.e. against the
+layer under suspicion, and its `probeObjectState` oracle answers `objExists` for a present object
+whatever its `resourceVersion`.
+
+    GET /debug/store?gvr=<group>/<version>/<resource>&namespace=<ns>&name=<name>
+        gvr takes 2 segments for the core group (v1/configmaps) or 3 otherwise.
+        namespace is omitted for a cluster-scoped object.
+
+The answer is the store's own `resourceVersion`, `uid`, `generation` and `creationTimestamp` for
+that coordinate, a `bodySHA256` of the stored bytes, the stored `representation`
+(`bytesObject` / `unstructured` / `partialObjectMetadata`), the GVR's four servability conjuncts,
+its `indexerCount`, `gvrLastSyncResourceVersion` and `gvrLastEventAgeSeconds`. Compare the
+`resourceVersion` against `kubectl get <resource> <name> -o jsonpath='{.metadata.resourceVersion}'`
+and the divergence IS the staleness — no inference.
+
+**It does NOT read the apiserver, and that is deliberate.** Serving the comparison here would
+read as the snowplow ServiceAccount, telling any valid-JWT holder the existence and
+`resourceVersion` of objects their own RBAC forbids. The operator runs that half themselves, under
+their own identity.
+
+**It does NOT gate on servability.** The four conjuncts are reported as fields and gate nothing —
+a retracted or watch-broken GVR is exactly when the store needs reading, and `confirm_retracted_total`
+was **10158** on the pod #237 was filed from. This is the one behaviour that separates it from
+`probeObjectState`, which returns `objUnknown` in that state by design.
+
+**Status codes.** `400` for a missing or malformed `gvr`/`name`. `200` for everything else,
+including a coordinate the store does not hold (`found:false`) and a GVR with no informer
+(`registered:false`) — never `404`, because `404` is what an unregistered route looks like.
+
+**`bodySHA256` is comparable only between two snowplow reads** — never against
+`kubectl get -o json | sha256sum`. The informer's `SetTransform` has already stripped
+`managedFields` and the last-applied-configuration annotation, so a kubectl comparison reports a
+divergence that is not one.
+
+**Metadata only, structurally.** Every field is a string, bool or number; the response type has
+no `[]byte`, map or slice, so it cannot carry an object body. Same boundary as `/debug/apistage`.
+
+There is deliberately **no per-object "last seen"**: tracking one would be a 50K-entry map per GVR
+written on the informer's processor goroutine. The per-object `resourceVersion` answers "is this
+object stale"; `gvrLastEventAgeSeconds` answers "is this GVR receiving events at all", which is
+what the #237 capture actually needed.
 
 ### Inspecting ONE resolved entry (1.12.5)
 `GET /debug/apistage?key_hash=<hex>` returns the metadata row for a single resident entry
