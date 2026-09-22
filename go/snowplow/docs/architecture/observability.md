@@ -279,6 +279,59 @@ longer serves the type) and `schema_relist` / `stale_version_pruned` / `crd_dele
 was torn down). It rides alongside rather than inside the tagged family because the C7 tag system
 has no label facility — a `stat` tag yields exactly one scalar.
 
+#### `snowplow_reflector_path` stats
+
+**#237 A3.** Which path our informers' LISTs and WATCHes take on the wire, per process, plus a
+per-GVR breakdown. Before this the question "is this GVR being served from the apiserver watch
+cache, or is it paging etcd?" was answerable only from a `slog.Info` — and the chart ships
+`LOG_LEVEL=warn`, so the live pod's 20 h log was 217 WARN + 30 ERROR and **zero INFO**. Absence
+there was a statement about the instrument, not about the code path. Tag-derived
+(`ReflectorPathStats`), so the counters reach expvar, OTLP, this doc's guard and the C7 parity
+arms from one struct tag each.
+
+Classification is on the request **path shape**: only GETs to a collection endpoint
+(`/apis/<g>/<v>/<r>`, `/api/<v>/<r>`, with or without an interposed `/namespaces/<ns>/`) are
+bucketed. Named GETs, subresources, discovery, non-resource paths and every non-GET verb are
+**not counted at all** rather than swept into a catch-all — the wrapper rides the shared
+`rest.Config`, so a catch-all would mix "the reflector listed" with "a customer request fell
+through to the apiserver", which is two regimes in one number.
+
+| stat | meaning | healthy range |
+|---|---|---|
+| `reflector_transport_requests_total` | every outbound request the wrapper delegated | **DENOMINATOR, not a detector.** `0` means the wrapper is not installed (or the process issues no requests) and makes every zero below meaningless |
+| `reflector_collection_requests_total` | collection GETs (LIST or WATCH) classified into the five buckets below | climbing. `transport > 0` with **this at 0** is the alarmable reading: the wrapper sees traffic but recognises no LIST at all — a broken classifier masquerading as a quiet reflector |
+| `reflector_watchlist_established_total` | WATCHes carrying `sendInitialEvents`: initial state streamed from the apiserver watch cache | climbing on a server that honours watch-list. **Flat or 0 means nothing on its own** — read it against the two `list_*` counters below; the PAIR is the detector |
+| `reflector_watch_plain_total` | WATCHes without `sendInitialEvents` — the ordinary re-watch after a clean timeout | climbs under **both** regimes, so it is not a discriminator; it is the proof the wrapper is wired at all |
+| `reflector_list_page_total` | LISTs carrying a `continue` token | a continue page is an etcd read by definition and its page size bounds it — correct traffic, not a bypass |
+| `reflector_list_etcd_delegated_total` | LISTs carrying a `limit` **together with** a `resourceVersion` that is neither empty nor `0` — delegated to etcd, **skipping the watch cache** | **non-zero by construction on today's binary** (`listOptionsTweak` sets `Limit` unconditionally, inside the ListFunc, after the pager has already decided). This is the C1 follow-up's only production proof: it must read **0** once the tweak mirrors client-go's rule |
+| `reflector_list_cache_eligible_total` | every other LIST (`resourceVersion` empty or `0`, or no `limit`) — the cacher can serve these | climbing at boot, ~0 afterwards |
+| `reflector_path_transitions_total` | per-GVR path changes, including each GVR's first observation | one per GVR at boot, then **flat**. A later increment means a GVR flipped between `watchlist` and `list` and is paired with a `cache.reflector.path` WARN naming the GVR and both sides |
+
+`snowplow_reflector_path_by_gvr` is the per-GVR breakdown, a map of GVR → current path
+(`watchlist` or `list`). It rides alongside rather than inside the tagged family for the same
+reason the retraction breakdown does — a `stat` tag yields exactly one scalar. This map is what
+answers "has **this** GVR relisted, and how?", which #237 recorded as unanswerable from outside
+the process: `watch_errors_total` is a single global total that cannot separate one GVR failing in
+a loop from every GVR recycling normally.
+
+**The map is narrower than the counters, on purpose.** A GVR appears only while it has a
+registered informer, and only a request shaped like a reflector establishment updates it —
+a watch carrying `sendInitialEvents`, or a LIST carrying a `resourceVersion` (`r.list()` always
+sets one; our own passthrough and fallthrough LISTs do not). Without those two rules the map
+would record for LISTs no reflector issued: in `CACHE_ENABLED=false` there are **no reflectors at
+all**, yet a passthrough LIST would raise a `cache.reflector.path` WARN saying the apiserver
+stopped honouring `SendInitialEvents`; and a fallthrough LIST for a registered-but-unservable GVR
+would flip an established `watchlist` to `list` and back on the next re-establishment. The
+counters are deliberately *not* narrowed — an inflated total is a number you can caveat, an alarm
+naming a cause that did not happen is not. The row is dropped when the informer is torn down, so
+after a CRD version is retired no path is reported for it; a rebuild logs a fresh first
+observation, which is what you want confirmed after a relist.
+
+The log line is `cache.reflector.path`, at **WARN** and **only on a transition** (first
+observation, and any change after). Warn because the chart ships at warn and an INFO line would be
+invisible exactly when it is needed; transition-only because a per-request line would flood the
+log it is meant to be readable in.
+
 #### `snowplow_crd_discovery` stats
 
 | stat | meaning | healthy range |

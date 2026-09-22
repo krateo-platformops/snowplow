@@ -51,6 +51,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/transport"
 )
 
 const (
@@ -419,6 +420,19 @@ func main() {
 			log.Warn("cache: rest.InClusterConfig failed; staying on apiserver branch",
 				slog.Any("err", rcErr))
 		} else {
+			// #237 A3 — install the reflector-path classifier BEFORE the
+			// first client is built. Every informer family descends from this
+			// one rest.Config (the dynamic client's streaming and standalone
+			// informers, the metadata client, the streaming REST client via
+			// rest.CopyConfig, and the secrets / controller-health
+			// clientsets), so one wrap attributes all of them. It counts and
+			// delegates — one atomic add and a non-allocating path scan; no
+			// request modified, no response read.
+			//
+			// COMPOSED, never assigned: a bare assignment would silently drop
+			// any wrapper already on the config.
+			rc.WrapTransport = transport.Wrappers(rc.WrapTransport, cache.ReflectorPathWrapper())
+
 			dynCli, dynErr := dynamic.NewForConfig(rc)
 			if dynErr != nil {
 				log.Warn("cache: dynamic.NewForConfig failed; staying on apiserver branch",
