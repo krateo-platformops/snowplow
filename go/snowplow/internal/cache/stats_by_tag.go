@@ -254,6 +254,22 @@ func TaggedStatFamilies() []StatFamily {
 			Untagged: untaggedNumericFields(reflect.TypeOf(InformerWatchStats{})),
 			typ:      reflect.TypeOf(InformerWatchStats{}),
 		},
+		// #237 A3 — per-GVR reflector-path attribution. Shared instrument
+		// labelled by stat, like crd_discovery and informer_watch. The per-GVR
+		// breakdown cannot ride here (a stat tag yields one scalar and this
+		// system has no label facility); it is published alongside as
+		// snowplow_reflector_path_by_gvr.
+		//
+		// APPENDED, not inserted — see the note above.
+		{
+			Expvar:   "snowplow_reflector_path",
+			OTelName: "snowplow_reflector_path",
+			Desc:     "Reflector LIST/WATCH wire-shape counters, labelled by stat.",
+			Values:   ReflectorPathStatsByStat,
+			Specs:    statSpecsOf(reflect.TypeOf(ReflectorPathStats{})),
+			Untagged: untaggedNumericFields(reflect.TypeOf(ReflectorPathStats{})),
+			typ:      reflect.TypeOf(ReflectorPathStats{}),
+		},
 	}
 }
 

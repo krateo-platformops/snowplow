@@ -947,6 +947,13 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// of this function early-returns for idempotent re-entries, so
 	// reaching this line implies a genuine new insertion.
 	NotifyGVRRegistered()
+	// #237 A3 — mirror the registration for the reflector-path classifier. It
+	// runs inside every outbound request and must never take rw.mu, so it
+	// cannot consult rw.informers directly (reflector_path.go, lock order).
+	// BOTH registration sites carry this, next to NotifyGVRRegistered, so the
+	// two lifecycle mirrors stay together and a third site cannot pick up one
+	// without the other.
+	rememberReflectorPathGVR(gvr)
 	if rw.metadataOnly == nil {
 		rw.metadataOnly = map[schema.GroupVersionResource]struct{}{}
 	}
@@ -1413,6 +1420,13 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// of this function early-returns for idempotent re-entries, so
 	// reaching this line implies a genuine new insertion.
 	NotifyGVRRegistered()
+	// #237 A3 — mirror the registration for the reflector-path classifier. It
+	// runs inside every outbound request and must never take rw.mu, so it
+	// cannot consult rw.informers directly (reflector_path.go, lock order).
+	// BOTH registration sites carry this, next to NotifyGVRRegistered, so the
+	// two lifecycle mirrors stay together and a third site cannot pick up one
+	// without the other.
+	rememberReflectorPathGVR(gvr)
 
 	// 0.30.9 Sub-scope B: allocate the sync channel BEFORE we spawn
 	// any goroutine that could close it. The channel is closed by
@@ -1727,6 +1741,12 @@ func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResour
 	delete(rw.metadataOnly, gvr)
 	delete(rw.lastSyncRV, gvr)
 	delete(rw.watchHandlerInstalled, gvr)
+	// #237 A3 — the reflector-path attribution state is keyed by GVR too, so
+	// it is purged here like every other per-GVR map. It lives behind its own
+	// mutex rather than in this struct because the classifier that reads it
+	// runs inside every outbound request and must never take rw.mu; see the
+	// lock-order note in reflector_path.go.
+	forgetReflectorPath(gvr)
 }
 
 // waitInformerSync polls the informer's HasSynced predicate and
