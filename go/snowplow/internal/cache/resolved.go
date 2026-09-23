@@ -637,14 +637,32 @@ type lruItem struct {
 	// BodySHA256 is single-key-only. Moving the cost to Put makes the
 	// projection O(1) and puts the hash on the write path instead.
 	//
-	// THE PUT RATE, SOURCED. snowplow_resolved_cache.store_total = 6,118,601
-	// over ~34 h uptime = 49.99 Puts/s (preroll-237/vars.json, the #247
-	// capture). That is a MEASURED RATE on one pod at one workload, not a
-	// capacity bound — do not re-use it as one.
+	// THE PUT RATE, SOURCED — AND IT HAS TWO REGIMES. Quote whichever one
+	// answers the question being asked; neither is a capacity bound and
+	// neither should be re-used as one.
 	//
-	// It reads low against snowplow_refresher_completed_total = 36,599,293
-	// (299/s) and the two are reconciled, not in conflict: store_total counts
-	// PUTS, completed_total counts refresher COMPLETIONS, and
+	// STEADY STATE: snowplow_resolved_cache.store_total = 6,118,601 over
+	// ~34 h uptime = 49.99 Puts/s (preroll-237/vars.json, the #247 capture).
+	// A measured rate on one pod at one workload.
+	//
+	// BOOT: this hash is ALSO paid per boot-seed Put, on the path that gates
+	// /readyz — a burst regime the steady-state figure does not describe, and
+	// the regime that matters for readiness. Recorded because a capacity
+	// number that silently answers a different question than the reader's is
+	// worse than no number (PM H4).
+	//
+	// WHY BOOT EXPOSURE STAYS SMALL ANYWAY: HashExtras short-circuits to "e0"
+	// on an empty map (see HashExtras below), so a seed Put with nil or empty
+	// extras costs a length check — no marshal, no SHA-256. The restactions
+	// seed path passes nil extras outright (phase1_pip_seed.go:902, :911).
+	// Real invocations are bounded by the widgets share carrying non-empty
+	// extras, NOT by phase1_bindingset_seed_resolves_total, which counts seed
+	// units rather than hashes.
+	//
+	// The steady-state figure reads low against
+	// snowplow_refresher_completed_total = 36,599,293 (299/s); the two are
+	// reconciled, not in conflict. store_total counts PUTS, completed_total
+	// counts refresher COMPLETIONS, and
 	// snowplow_refresher_skipped_no_entry_total = 33,629,860 — 91.9% of
 	// completions — never find an entry and so never Put. Completions that
 	// could Put are 2,969,433 (24.3/s); customer and seed Puts make up the

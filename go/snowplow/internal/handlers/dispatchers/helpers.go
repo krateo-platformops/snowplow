@@ -772,17 +772,30 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		// residency join and cannot see an eviction.
 		//
 		// NO extras_hash HERE, DELIBERATELY — do not "complete the set".
+		//
+		// THE REASON IS NOT MAGNITUDE. An extras_hash on this line buys
+		// NOTHING the metadata surface does not already carry: extrasHash on
+		// cache.ResolvedEntryMeta is the same derivation, per resident cell,
+		// readable at warn, and joinable to residency — which this line is
+		// not. That holds at any traffic level, which is why it is the
+		// reasoning recorded here.
+		//
+		// There is also an eager-evaluation cost, stated second because it is
+		// the weaker argument and it has been over-claimed twice already.
 		// slog evaluates every argument BEFORE log.Info checks the level, so
-		// a HashExtras call here would marshal-and-SHA256 on every emit at
-		// warn, producing nothing. On /call that is 0.14/s and would not
-		// matter; the material site is BOOT — phase1_pip_seed.go:906 and
-		// :1302 fire per seed unit (phase1_bindingset_seed_resolves_total =
-		// 279,588) on the path that gates /readyz. Hundreds of thousands of
-		// discarded hashes on the readiness path buys nothing the metadata
-		// surface does not already carry. extras_len above remains the log
-		// line's extras signal, with its known blindness to a
-		// same-cardinality value change; extrasHash on ResolvedEntryMeta is
-		// where that blindness is actually fixed. (TL ruling, #247.)
+		// a HashExtras call here would run at warn where the line emits
+		// nothing. Do NOT size that from seed-unit counters: HashExtras
+		// short-circuits to "e0" on an empty map (resolved.go:937-939) and
+		// the restactions seed site passes nil extras
+		// (phase1_pip_seed.go:902, :911), so the real invocation count is
+		// bounded by the widgets share carrying non-empty extras — far below
+		// phase1_bindingset_seed_resolves_total, which counts seed units and
+		// not hashes. Small either way; the first paragraph is the argument.
+		//
+		// extras_len above remains this line's extras signal, with its known
+		// blindness to a same-cardinality VALUE change. extrasHash on
+		// ResolvedEntryMeta is where that blindness is actually fixed.
+		// (TL ruling + PM H7, #247.)
 		slog.Uint64("rbac_subgen", subgenOf(inputs)),
 	)
 
