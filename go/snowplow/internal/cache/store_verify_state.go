@@ -80,6 +80,20 @@ type gvrVerification struct {
 	// state say "undecorated" out loud instead.
 	decorated bool
 
+	// ownsInformer is whether this GVR's informer is its OWN — built fresh by
+	// the streaming constructor or by the standalone path — rather than handed
+	// out by a shared informer factory. It is RECORDED BY THE CONSTRUCTING
+	// BRANCH and must never be re-derived from the GVR's group.
+	//
+	// The property the repair verb needs is "can this informer be torn down
+	// and rebuilt". A group name is a PROXY for that, and a proxy that happens
+	// to be right today is a defect with a delay fuse: H5 has already re-routed
+	// informers once, and the next routing change would let a factory-built GVR
+	// pass a group check and be KILLED BY ITS OWN REPAIR — the exact outage the
+	// bound exists to prevent, with no arm failing, because a group-derived
+	// check and an ownership check agree on every GVR that exists today.
+	ownsInformer bool
+
 	// lastObjects is the object count of the last completed verification —
 	// the R4 coverage assertion's own number (Δ objects_verified == IndexerCount
 	// means the deadline chose WHEN, never WHAT).
@@ -125,9 +139,13 @@ var storeVerify = struct {
 // It is recorded at registration rather than inferred later because the
 // routing decision is made once, in addResourceTypeLocked, and is not
 // re-derivable from the informer handle afterwards.
-func rememberStoreVerification(gvr schema.GroupVersionResource, decorated bool) {
+func rememberStoreVerification(gvr schema.GroupVersionResource, decorated, ownsInformer bool) {
 	storeVerify.mu.Lock()
-	storeVerify.gvrs[gvr] = &gvrVerification{epoch: time.Now(), decorated: decorated}
+	storeVerify.gvrs[gvr] = &gvrVerification{
+		epoch:        time.Now(),
+		decorated:    decorated,
+		ownsInformer: ownsInformer,
+	}
 	storeVerify.mu.Unlock()
 	if !decorated {
 		// Gate condition B-7. An undecorated informer is one the snapshot
@@ -136,14 +154,15 @@ func rememberStoreVerification(gvr schema.GroupVersionResource, decorated bool) 
 		// moment at which a snapshot "fails" to verify it, because no snapshot
 		// ever reaches it.
 		//
-		// Healthy this reads the typed-RBAC count, not 0: those four GVRs take
-		// the stock factory informer by design, and client-go builds their
-		// ListWatch where snowplow cannot decorate it. What matters is the
-		// JUMP — under the coverage cliff (RESOLVER_COMPOSITION_STREAMING_LIST
-		// off) this goes to nearly every GVR while every
-		// store_divergent_*_snapshot_total silently drops to 0, and a zero
-		// divergence count must never be reachable without something else
-		// saying why.
+		// Healthy this is NOT 0: it reads the size of the non-streaming class
+		// — GVRs whose ListWatch client-go builds internally, where snowplow
+		// has nothing to decorate. Read it as a CLASS, never as a list of
+		// today's members: membership follows from informer routing, which H5
+		// has already changed once. What matters is the JUMP — under the
+		// coverage cliff (RESOLVER_COMPOSITION_STREAMING_LIST off) this goes
+		// to nearly every GVR while every store_divergent_*_snapshot_total
+		// silently drops to 0, and a zero divergence count must never be
+		// reachable without something else saying why.
 		recordVerifySkipped(verifySkipUndecorated)
 	}
 }
@@ -240,6 +259,7 @@ type verificationRow struct {
 	epoch                  time.Time
 	verified               bool
 	decorated              bool
+	ownsInformer           bool
 	lastObjects            int
 	divergentSinceBoot     uint64
 	repairPending          bool
@@ -257,6 +277,7 @@ func verificationRows() map[schema.GroupVersionResource]verificationRow {
 			epoch:                  st.epoch,
 			verified:               st.verified,
 			decorated:              st.decorated,
+			ownsInformer:           st.ownsInformer,
 			lastObjects:            st.lastObjects,
 			divergentSinceBoot:     st.divergentSinceBoot,
 			repairPending:          st.repairPending,
@@ -279,6 +300,7 @@ func verificationRowFor(gvr schema.GroupVersionResource) (verificationRow, bool)
 		epoch:                  st.epoch,
 		verified:               st.verified,
 		decorated:              st.decorated,
+		ownsInformer:           st.ownsInformer,
 		lastObjects:            st.lastObjects,
 		divergentSinceBoot:     st.divergentSinceBoot,
 		repairPending:          st.repairPending,
