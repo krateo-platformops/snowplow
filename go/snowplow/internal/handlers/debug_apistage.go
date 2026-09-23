@@ -27,7 +27,15 @@ type debugApistageBody struct {
 //
 // It dumps, per cached resolved-output entry, METADATA ONLY:
 // class / key-hash / GVR coordinates / derived path / stage hash / age /
-// ttl-remaining / pinned / items_count / rawjson_bytes — the signal needed
+// ttl-remaining / pinned / items_count / rawjson_bytes / binding-uid, plus
+// the #247 key-attribution set rbacSubGen / perPage / page / extrasHash —
+// which together with the coordinates above carry every ComputeKey input
+// except the class-constant resolvedKeyVersion, so two resident keys for one
+// (object, identity) can be diffed to a NAMED component instead of to
+// "something else". Read rbacSubGen ONLY alongside cacheEntryClass: it is
+// stamped at one construction site, so a 0 means either "this subject's RBAC
+// never moved" or "this class never stamps" (see the field doc on
+// cache.ResolvedEntryMeta). This is the signal needed
 // to diagnose a degraded apistage entry (e.g. an `allCompositionResources`
 // entry whose `path` is `/api/v1/configmaps` with an `itemsCount` reflecting
 // the cluster-wide LIST, or a stale `getComposition` entry with a large
