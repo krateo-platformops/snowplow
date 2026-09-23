@@ -156,6 +156,19 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 		return true, obj, nil
 	})
 
+	// The repair verb needs a GVR that OWNS its informer: a shared-factory
+	// informer torn down by RemoveResourceType is handed straight back,
+	// stopped. Production gets that from the streaming constructor; with no
+	// *rest.Config here the standalone dynamic path provides it, and that path
+	// is selected by the group being navigation-discovered.
+	//
+	// IT MUST BE MARKED BEFORE REGISTRATION. ownsInformer is recorded by the
+	// branch that CONSTRUCTS the informer, so marking the group afterwards
+	// would leave the GVR recorded as factory-built and every repair refused —
+	// the arms would then fail for a fixture reason that looks exactly like
+	// the defect they exist to catch.
+	AddNavigationDiscoveredGroup(repairGVR.Group)
+
 	rw, err := NewResourceWatcher(context.Background(), dyn)
 	if err != nil || rw == nil {
 		t.Fatalf("NewResourceWatcher: %v (rw=%v)", err, rw)
@@ -177,14 +190,6 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	if !rw.IsServable(repairGVR) {
 		t.Fatalf("precondition: %s is registered and synced but not servable", repairGVR)
 	}
-	// The repair verb needs a GVR that OWNS its informer: a shared-factory
-	// informer torn down by RemoveResourceType is handed straight back,
-	// stopped. Production gets that from the streaming constructor; here the
-	// standalone dynamic path provides it, which is what a
-	// navigation-discovered group selects. Without this the repair arms would
-	// be exercising a path that cannot rebuild — and passing for the wrong
-	// reason, or failing for one.
-	AddNavigationDiscoveredGroup(repairGVR.Group)
 	SetGlobal(rw)
 	t.Cleanup(func() { SetGlobal(nil) })
 	return rw, dyn
@@ -641,7 +646,7 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 		// otherwise be enqueued twice — doubling the gauge and the work.
 		c3Setup(t)
 		resetVerificationForArm(t)
-		rememberStoreVerification(repairGVR, true)
+		rememberStoreVerification(repairGVR, true, true)
 
 		if !enqueueStoreRepair(repairGVR, "first") {
 			t.Fatal("the first enqueue was refused")
@@ -655,6 +660,66 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 		}
 	})
 
+	t.Run("repair_is_refused_on_ownership_not_on_group_name", func(t *testing.T) {
+		// THE DRIFT ARM (PM condition C-B1). The property bound 6 needs is
+		// "does this GVR own its informer" — can it be torn down and rebuilt.
+		// An earlier draft derived that from the GVR's GROUP, which answers
+		// the right question only by coincidence of today's routing.
+		//
+		// This arm constructs the exact state a group-derived check would
+		// misjudge: a GVR whose informer is FACTORY-BUILT (not owned) sitting
+		// in a group the walker HAS navigation-discovered. Today's routing
+		// cannot produce that pair, which is precisely why no other arm in the
+		// matrix would fail if the predicate regressed to the group name —
+		// they agree on every GVR that currently exists. H5 has already
+		// re-routed informers once; the next change makes this pair real, and
+		// the GVR would then be killed by its own repair.
+		c3Setup(t)
+		resetVerificationForArm(t)
+		drifted := schema.GroupVersionResource{
+			Group: "widgets.krateo.io", Version: "v1beta1", Resource: "driftedpanels",
+		}
+		AddNavigationDiscoveredGroup(drifted.Group)
+		if !IsNavigationDiscoveredGroup(drifted.Group) {
+			t.Fatal("precondition: the group must be navigation-discovered, or this arm proves nothing")
+		}
+		// Factory-built: NOT owned, and not decorated either.
+		rememberStoreVerification(drifted, false, false)
+
+		if enqueueStoreRepair(drifted, "drift") {
+			t.Fatal("a repair was queued for a GVR that does NOT own its informer. The teardown would " +
+				"stop the factory's cached informer and the re-register would hand the STOPPED one " +
+				"back, killing the cache for this GVR while store_repairs_fired_total counted a success")
+		}
+		if got := storeRepairUnsupportedTotal.Load(); got != 1 {
+			t.Errorf("store_repair_unsupported_total = %d, want 1 — the refusal must be counted, or "+
+				"a GVR that is detected-but-never-repaired looks identical to one nobody acted on", got)
+		}
+		if got := storeRepairQueueDepth(); got != 0 {
+			t.Errorf("store_repairs_pending = %d after a refused repair, want 0", got)
+		}
+
+		// The mirror image: OWNED but in a group that is NOT
+		// navigation-discovered. A group-derived check would wrongly REFUSE
+		// this one, silently withdrawing repair from a GVR that can be
+		// rebuilt perfectly well — the same proxy failing in the other
+		// direction, and just as invisible.
+		owned := schema.GroupVersionResource{
+			Group: "undiscovered.krateo.io", Version: "v1beta1", Resource: "ownedpanels",
+		}
+		if IsNavigationDiscoveredGroup(owned.Group) {
+			t.Fatal("precondition: this group must NOT be navigation-discovered")
+		}
+		rememberStoreVerification(owned, true, true)
+		if !enqueueStoreRepair(owned, "owned") {
+			t.Fatal("a repair was refused for a GVR that DOES own its informer — the predicate is " +
+				"still reading the group name, not the recorded ownership")
+		}
+		if got := storeRepairUnsupportedTotal.Load(); got != 1 {
+			t.Errorf("store_repair_unsupported_total = %d after one refusal and one acceptance, want 1", got)
+		}
+	})
+
 	t.Run("queue_is_fifo_by_detection_and_counts_the_inflight_repair", func(t *testing.T) {
 		// FIFO BY DETECTION TIME, not by GVR size: a 50K GVR at the head must
 		// not starve everything behind it by being re-detected first each
@@ -663,8 +728,8 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 		resetVerificationForArm(t)
 		gvrA := repairGVR
 		gvrB := schema.GroupVersionResource{Group: "widgets.krateo.io", Version: "v1beta1", Resource: "cards"}
-		rememberStoreVerification(gvrA, true)
-		rememberStoreVerification(gvrB, true)
+		rememberStoreVerification(gvrA, true, true)
+		rememberStoreVerification(gvrB, true, true)
 
 		if !enqueueStoreRepair(gvrA, "a") {
 			t.Fatal("enqueue A refused")

@@ -916,8 +916,16 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// metadata-only path when annotated/static-seeded, so this is the
 	// common path for the GVRs RemoveResourceType actually tears down.
 	var gi informers.GenericInformer
+	// #237 B — ownsInformer is set by the branch that CONSTRUCTS the informer,
+	// because that branch is the only place that knows the answer. It must
+	// never be re-derived from the GVR's group: a shared-factory informer
+	// cannot be torn down and rebuilt (the factory caches by GVR with no
+	// eviction API and hands the stopped one back), and a repair that assumed
+	// otherwise would kill the cache for that GVR. See enqueueStoreRepair.
+	ownsInformer := false
 	standalone := IsNavigationDiscoveredGroup(gvr.Group)
 	if standalone {
+		ownsInformer = true // standalone: this GVR owns it outright
 		gi = metadatainformer.NewFilteredMetadataInformer(
 			rw.metaClient,
 			gvr,
@@ -938,6 +946,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 				listOptionsTweak,
 			)
 		}
+		// Shared factory: NOT owned — ownsInformer stays false.
 		gi = rw.metaFactory.ForResource(gvr)
 	}
 	rw.informers[gvr] = gi
@@ -960,7 +969,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// covers it. (shouldUseMetadataOnly is constant-false in production
 	// post-H5, so this site is unreachable there — recorded honestly rather
 	// than assumed away.)
-	rememberStoreVerification(gvr, false)
+	rememberStoreVerification(gvr, false, ownsInformer)
 	if rw.metadataOnly == nil {
 		rw.metadataOnly = map[schema.GroupVersionResource]struct{}{}
 	}
@@ -1374,12 +1383,16 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// registration because the routing decision is made HERE, once, and is not
 	// re-derivable from the informer handle afterwards.
 	decorated := false
+	// #237 B — see the note at the other registration site: ownership is
+	// recorded by the constructing branch, never inferred from the group.
+	ownsInformer := false
 	if !isStreamingException(gvr) && compositionStreamingListEnabled() {
 		if sgi, ok := newStreamingDynamicInformer(
 			rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak,
 		); ok {
 			gi = sgi
 			decorated = true
+			ownsInformer = true // the streaming constructor builds a fresh informer every call
 			slog.Info("cache.streaming_list.informer_routed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
@@ -1416,6 +1429,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	if gi == nil {
 		standalone := IsNavigationDiscoveredGroup(gvr.Group)
 		if standalone {
+			ownsInformer = true // standalone: this GVR owns it outright
 			gi = dynamicinformer.NewFilteredDynamicInformer(
 				rw.dyn,
 				gvr,
@@ -1425,6 +1439,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 				listOptionsTweak,
 			)
 		} else {
+			// Shared factory: NOT owned — ownsInformer stays false.
 			gi = rw.factory.ForResource(gvr)
 		}
 	}
@@ -1447,7 +1462,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// would make store_verification_max_age_seconds read 0 at boot and through
 	// any window where verification has never run — a zero that reads as
 	// perfect health while nothing has been verified at all.
-	rememberStoreVerification(gvr, decorated)
+	rememberStoreVerification(gvr, decorated, ownsInformer)
 
 	// 0.30.9 Sub-scope B: allocate the sync channel BEFORE we spawn
 	// any goroutine that could close it. The channel is closed by

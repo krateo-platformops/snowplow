@@ -359,6 +359,11 @@ block until it reaches OUR resourceVersion, which is a guarantee about our store
 about etcd's. This is not closed, because the only thing that would close it is a quorum read per
 snapshot — precisely the apiserver load the cache exists to avoid.
 
+**So what this deliverable may be said to have done, with the qualifier attached every time:** it
+closes invisibility for every loss class **except a stale cacher**. Root cause on #237 is still
+**open** and the stale-cacher candidate is live, so this must not be described as having made #237
+detectable — only its other candidate classes.
+
 The four divergence classes carry a **site**. `snapshot` divergences are already repaired by
 client-go (`processDeltas` writes the store and *then* calls the handler), so
 `store_repairs_fired_total` correctly stays 0 for them; only `forced` divergences need snowplow's
@@ -382,13 +387,13 @@ signal it exists for with it.
 | `store_divergence_candidates_total` | RAW divergences, before the bounded re-read confirmed them | ~0. A large candidates-minus-confirmed gap is a **DeltaFIFO backlog** (the indexer lagging the queue), not a stale store — which is why the raw number is published rather than hidden |
 | `store_gvrs_unverified` | servable, synced, reachable GVRs past `maxVerificationAge` | **0**. During #237 with B working this reads **0** — the deadline reached the GVR and found the divergence. It is NOT the detector; it is the DENOMINATOR that makes a zero divergence readable: `(unverified 0, divergent 0)` = *I looked and found nothing*; `(unverified >0, divergent 0)` = **I did not look**. That is exactly the distinction the 1.12.6 audit's `divergent: 0` could not express |
 | `store_gvrs_unverifiable` | registered GVRs no mechanism reaches right now — breakdown in `snowplow_store_verification_unverifiable_by_reason` (`retracted` / `not_synced` / `unreachable`) | **0**. Split from `store_gvrs_unverified` so a retracted GVR cannot be quietly dropped from that gauge's set and produce a zero that reads as health |
-| `store_gvrs_undecorated` | registered GVRs whose informer never got the verifying ListerWatcher, so only the deadline pass covers them | the **four typed-RBAC GVRs**, which take the stock factory informer by design — not 0. Watch for the JUMP: with `RESOLVER_COMPOSITION_STREAMING_LIST=false` this goes to nearly every GVR while every `*_snapshot_total` silently drops to 0 |
+| `store_gvrs_undecorated` | registered GVRs whose informer never got the verifying ListerWatcher, so only the deadline pass covers them | **not 0** — the healthy value is the size of the non-streaming class (GVRs whose informer client-go constructs internally, where snowplow cannot decorate the ListerWatcher). Read it as a CLASS, not a list: membership follows from informer routing, which H5 has already changed once. Watch for the JUMP: with `RESOLVER_COMPOSITION_STREAMING_LIST=false` this goes to nearly every GVR while every `*_snapshot_total` silently drops to 0 |
 | `store_verification_max_age_seconds` | oldest age-since-last-verified across the `store_gvrs_unverified` set | at or below `maxVerificationAge`. **At boot it reads age-since-REGISTRATION and never 0** — a never-verified GVR excluded from the max would read 0 while nothing had been verified at all |
 | `store_verification_skipped_total` | comparisons declined — breakdown in `snowplow_store_verification_skipped_by_reason` | read the **breakdown**, never this total: it deliberately spans expected reasons (`initial_sync`, once per GVR per informer lifetime; `undecorated_informer`, once per undecorated registration) and unexpected ones (`torn_down`, `metaclient_nil`, `list_error`). It is what gives *"no divergence found"* its scope — without it, a pass that never ran and a pass that found nothing are the same zero |
 | `store_verification_invalidated_total` | verifications ended by a servability retraction | **CONTEXT, NOT A DETECTOR** — it climbs in both regimes (krateo-057 measured 10,011 `discovery_refresh` retractions in 18 h). It is what explains a GVR's age resetting with no verification having run |
 | `store_repairs_fired_total` | targeted relists fired to repair a divergence the deadline pass found | **0**. Read it AGAINST `store_divergent_*_forced_total`: divergence climbing while this stays flat is a green counter over a still-wrong store |
 | `store_repair_ineffective_total` | repairs after which the NEXT verification still reported divergence | **0, and ALARMABLE.** The only stat here whose non-zero means the **detector** is wrong rather than the store: a full relist that does not clear a divergence does not indicate a lost event |
-| `store_repair_unsupported_total` | divergences whose GVR cannot be repaired by a relist at all, because its informer comes from the **shared dynamic factory** — which caches by GVR with no eviction API, so a teardown plus re-register hands back the **stopped** informer and kills the cache for that GVR instead of repairing it | **0**, and it should stay 0 in production because every non-typed-RBAC GVR takes the streaming path. Non-zero is the honest statement that this GVR is **detected and not repaired** — a state that would otherwise be indistinguishable from a divergence nobody acted on. The four typed-RBAC GVRs are the known factory-built exception |
+| `store_repair_unsupported_total` | divergences whose GVR cannot be repaired by a relist at all, because its informer comes from the **shared dynamic factory** — which caches by GVR with no eviction API, so a teardown plus re-register hands back the **stopped** informer and kills the cache for that GVR instead of repairing it | **0** in production, where the streaming path owns the informer for the overwhelming majority of GVRs. Non-zero is the honest statement that this GVR is **detected and never repaired** — a state that would otherwise be indistinguishable from a divergence nobody acted on, and one the permanence bound below does NOT cover. The refused set is a CLASS — *a GVR whose informer is factory-built rather than owned* — determined by construction and recorded at registration, never inferred from the GVR's group. Naming today's members here would make this row wrong the next time informer routing changes |
 | `store_repair_suppressed_total` | GVRs the circuit breaker has latched | **0**. Non-zero means the staleness bound no longer holds for that GVR — it is **unbounded** and the alarm is the only mitigation. Detection continues; the breaker never produces silence |
 | `store_repairs_pending` | GVRs waiting in the serialised repair queue | **0**. Repairs run ONE AT A TIME across all GVRs, so a correlated divergence cannot take the cache non-servable everywhere at once; the price is queue wait, and this is where it shows |
 | `store_repair_queue_age_seconds` | age of the oldest queued repair, measured from detection | **0**. Rising without bound means the serialised queue is not draining — the regime in which the staleness bound (`maxVerificationAge` + **queue wait** + one relist) stops being minutes and becomes hours |
@@ -396,9 +401,19 @@ signal it exists for with it.
 A repair **retracts the GVR's confirmation for the whole rebuild window** — minutes at 50K — so
 every resolve for it falls through to the apiserver until the replacement informer syncs. That is
 the deliberate trade of *fast-but-wrong* for *slow-but-correct*, it is the largest single cost in
-this deliverable, and it is why repairs are globally serialised and circuit-broken. The log lines
-are `cache.store.divergent` and `cache.store.repair` at **WARN**, and
+this deliverable, and it is why repairs are globally serialised (one in flight across all GVRs,
+waiting for the replacement informer to sync — serialising only the teardown *calls* would leave
+the rebuild *windows* overlapping, and the window is what makes a GVR non-servable) and
+circuit-broken. The log lines are `cache.store.divergent` and `cache.store.repair` at **WARN**, and
 `cache.store.repair_ineffective` at **ERROR**.
+
+**What this does and does not close.** Invisibility is closed for every loss class **except a stale
+apiserver watch cache** — see the scope limit above; that qualifier travels with every claim made
+about this deliverable. Staleness is bounded by `maxVerificationAge` + repair-queue wait + one
+relist for a GVR that is repairable and unsuppressed. It is **unbounded** for two classes: a GVR the
+circuit breaker has latched, and **a GVR whose informer is factory-built rather than owned**, which
+is detected, refused out loud, and never repaired. Neither is a bound and neither may be described
+as one.
 
 #### `snowplow_crd_discovery` stats
 

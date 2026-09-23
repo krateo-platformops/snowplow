@@ -108,7 +108,7 @@ func enqueueStoreRepair(gvr schema.GroupVersionResource, reason string) bool {
 		storeVerify.mu.Unlock()
 		return false
 	}
-	decorated := st.decorated
+	ownsInformer := st.ownsInformer
 	storeVerify.mu.Unlock()
 
 	// BOUND 6 — THE GVR MUST BE REBUILDABLE, and this one is not optional.
@@ -131,11 +131,20 @@ func enqueueStoreRepair(gvr schema.GroupVersionResource, reason string) bool {
 	// counted it as a success. So it is refused, out loud, and detection
 	// continues.
 	//
-	// In production this refusal should never fire: every non-typed-RBAC GVR
-	// takes the streaming path. The four typed-RBAC GVRs are factory-built,
-	// and for them the honest answer is that this deliverable detects and
-	// cannot repair.
-	if !decorated && !IsNavigationDiscoveredGroup(gvr.Group) {
+	// THE TEST IS THE RECORDED PROPERTY, NEVER THE GROUP NAME. An earlier
+	// draft asked `!decorated && !IsNavigationDiscoveredGroup(gvr.Group)`,
+	// which answers the right question only by coincidence of today's routing.
+	// H5 has already re-routed informers once; the next change would let a
+	// factory-built GVR in a navigation-discovered group pass that check and
+	// be killed by its own repair — and NO arm would have failed, because a
+	// group-derived check and an ownership check agree on every GVR that
+	// exists right now. ownsInformer is set by the branch that CONSTRUCTS the
+	// informer (watcher.go), which is the only place that knows.
+	//
+	// The refused set is a CLASS, not a list: "a GVR whose informer is
+	// factory-built rather than owned". Naming today's members would make this
+	// comment wrong the next time routing changes.
+	if !ownsInformer {
 		storeRepairUnsupportedTotal.Add(1)
 		slog.Warn("cache.store.repair_unsupported",
 			slog.String("subsystem", "cache"),
