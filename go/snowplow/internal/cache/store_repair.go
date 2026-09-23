@@ -144,6 +144,14 @@ func enqueueStoreRepair(gvr schema.GroupVersionResource, reason string) bool {
 	// The refused set is a CLASS, not a list: "a GVR whose informer is
 	// factory-built rather than owned". Naming today's members would make this
 	// comment wrong the next time routing changes.
+	//
+	// Leaving that class unrepairable is a DECISION, not an oversight — #244.
+	// Its members' construction is load-bearing for RBAC correctness
+	// (stripAndType needs *unstructured.Unstructured), and the risk is
+	// inverted: RBAC staleness surfaces as an authorization decision, which is
+	// loud and attributable, whereas #237 is severe precisely because widget
+	// staleness is silent. If it ever does matter, the right verb is a
+	// targeted rebuildRBACSnapshot, not an informer teardown.
 	if !ownsInformer {
 		storeRepairUnsupportedTotal.Add(1)
 		slog.Warn("cache.store.repair_unsupported",
@@ -156,10 +164,20 @@ func enqueueStoreRepair(gvr schema.GroupVersionResource, reason string) bool {
 		return false
 	}
 
+	// RE-CHECK UNDER THE SECOND LOCK. The mutex was dropped across the
+	// ownership decision above, so the dedupe would otherwise be true only
+	// because today's single caller — the strictly-serial deadline walker —
+	// cannot race itself. This function's own comment says the suppression
+	// check lives here "so every future caller inherits it", i.e. more callers
+	// are expected; a guarantee that holds by caller discipline rather than by
+	// construction is one a future caller will break without noticing.
 	storeVerify.mu.Lock()
-	if st, ok := storeVerify.gvrs[gvr]; ok {
-		st.repairPending = true
+	st, ok := storeVerify.gvrs[gvr]
+	if !ok || st.suppressed || st.repairPending {
+		storeVerify.mu.Unlock()
+		return false
 	}
+	st.repairPending = true
 	storeVerify.mu.Unlock()
 
 	storeRepair.mu.Lock()

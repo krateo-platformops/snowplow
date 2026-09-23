@@ -441,6 +441,67 @@ func TestStoreVerification_DeadlineForcesFullGVRPass(t *testing.T) {
 	}
 }
 
+// TestStoreVerification_NoSyncPosition_SkipsRatherThanWeakensTheOracle.
+//
+// The architect's REQUIRED fix, as an executable guard. With no recorded sync
+// position the pass must issue NO LIST AT ALL and count a skip — it must not
+// fall back to resourceVersion="0".
+//
+// Why a fallback is not a lesser evil: the forced pass's soundness rests
+// entirely on NotOlderThan at OUR lastSyncRV making the returned set provably
+// no older than the store, which is what licenses an OPAQUE resourceVersion
+// inequality to mean "the store is behind". Under RV="0" the cacher may answer
+// from BEHIND our store, and then every class inverts — objects created after
+// its snapshot read as lost DELETEs, objects deleted after it read as lost
+// ADDs. The chain ends with a repair that was never needed, a real
+// multi-minute non-servable window, and the breaker latching
+// store_repair_ineffective_total, which this family's own description defines
+// as "our detector is wrong". The instrument would accuse itself of a fault it
+// caused.
+func TestStoreVerification_NoSyncPosition_SkipsRatherThanWeakensTheOracle(t *testing.T) {
+	c3Setup(t)
+	resetVerificationForArm(t)
+	rw, _ := silentWatchCluster(t, panelObj("demo", "panel-a", "1", "uid-a"))
+	rec := attachMetaClient(t, rw, partialMeta("demo", "panel-a", "1", "uid-a"))
+
+	// Clear the recorded sync position, reproducing the reachable window the
+	// architect traced: applyConfirmLocked writes `confirmed` and writes
+	// lastSyncRV only when the informer reports a non-empty
+	// LastSyncResourceVersion, AFTER and independently — so a confirm pass
+	// landing before the informer syncs leaves servable && synced && rv == "".
+	rw.mu.Lock()
+	delete(rw.lastSyncRV, repairGVR)
+	rw.mu.Unlock()
+	if got := lastSyncRVForTest(rw, repairGVR); got != "" {
+		t.Fatalf("precondition: lastSyncRV is %q, want empty", got)
+	}
+
+	forcedVerify(context.Background(), repairGVR)
+
+	if n := len(rec.recorded()); n != 0 {
+		t.Errorf("the pass issued %d LIST(s) with no sync position; it must issue NONE rather than "+
+			"downgrade to resourceVersion=0, which can return a set OLDER than our store and "+
+			"invert every divergence class", n)
+	}
+	if got := storeVerifyForcedListsTotal.Load(); got != 0 {
+		t.Errorf("store_verification_forced_lists_total = %d, want 0", got)
+	}
+	if got := VerifySkippedByReasonSnapshot()[verifySkipNoSyncPosition]; got != 1 {
+		t.Errorf("skipped_by_reason[%s] = %d, want 1 — a skip must be VISIBLE, because "+
+			"'I could not run a sound comparison' and 'I compared and found nothing' are "+
+			"different statements that would otherwise share one spelling",
+			verifySkipNoSyncPosition, got)
+	}
+	if lu, ld, la, um := divergenceCounts(verifySiteForced); lu+ld+la+um != 0 {
+		t.Errorf("divergences reported from a pass that never ran: %d/%d/%d/%d", lu, ld, la, um)
+	}
+	if got := storeRepairQueueDepth(); got != 0 {
+		t.Errorf("store_repairs_pending = %d — a skipped pass must never enqueue a repair, which "+
+			"would open a real non-servable window on the strength of a comparison that did "+
+			"not happen", got)
+	}
+}
+
 // --- B-7 — the pass repairs the STORE, not just a counter -----------------
 
 // TestForcedPass_RepairsTheStore_NotJustL1 — B-7, the arm a gate should look at
@@ -717,6 +778,64 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 		}
 		if got := storeRepairUnsupportedTotal.Load(); got != 1 {
 			t.Errorf("store_repair_unsupported_total = %d after one refusal and one acceptance, want 1", got)
+		}
+	})
+
+	t.Run("the_unrepairable_class_is_exactly_the_typed_rbac_four", func(t *testing.T) {
+		// THE DRIFT GUARD on the refused SET, not just on the predicate.
+		//
+		// `store_repair_unsupported_total` going non-zero cannot, on its own,
+		// distinguish "the known unrepairable GVRs, as designed" from "a new
+		// GVR has quietly joined the unrepairable set". That is two regimes in
+		// one number — the shape this whole investigation exists to remove —
+		// and the counter alone cannot fix it, because the number is the same
+		// either way. What fixes it is pinning the SET.
+		//
+		// Under production routing a GVR is unrepairable iff it takes the
+		// shared factory, which is iff it is a streaming exception AND its
+		// group is not navigation-discovered. isStreamingException is true
+		// exactly for the typed-RBAC overrides, which exist because
+		// stripAndType requires *unstructured.Unstructured — their
+		// construction is load-bearing for RBAC correctness, which is why the
+		// right answer is to leave them unrepairable rather than to re-route
+		// them for a diagnostic's benefit.
+		//
+		// So: if a fifth typed override is ever added, this arm fails and
+		// NAMES it, instead of the operator discovering a silently widened
+		// unrepairable class from a counter that merely ticked higher.
+		for _, gvr := range RBACResourceTypes {
+			if !isStreamingException(gvr) {
+				t.Errorf("%s is no longer a streaming exception — it would now take the streaming "+
+					"path and become repairable, which changes the unrepairable class", gvr)
+			}
+		}
+		exceptions := map[schema.GroupVersionResource]bool{}
+		for gvr := range typedResourceOverrides {
+			exceptions[gvr] = true
+		}
+		if len(exceptions) != len(RBACResourceTypes) {
+			t.Fatalf("the typed-override set has %d members, the RBAC set has %d — the unrepairable "+
+				"class has changed size. Every member of the typed-override set is factory-built and "+
+				"therefore DETECTED BUT NEVER REPAIRED, so a new member silently widens the class "+
+				"whose staleness is unbounded. Members: %v",
+				len(exceptions), len(RBACResourceTypes), exceptions)
+		}
+		for _, gvr := range RBACResourceTypes {
+			if !exceptions[gvr] {
+				t.Errorf("%s is in RBACResourceTypes but has no typed override — the two sets have "+
+					"drifted apart and the unrepairable class is no longer either of them", gvr)
+			}
+		}
+
+		// And the other half: a GVR OUTSIDE that set must be repairable, so
+		// the arm fails if the exception predicate ever widens to swallow
+		// ordinary widget GVRs.
+		ordinary := schema.GroupVersionResource{
+			Group: "widgets.krateo.io", Version: "v1beta1", Resource: "pageheaders",
+		}
+		if isStreamingException(ordinary) {
+			t.Errorf("%s is a streaming exception — an ordinary widget GVR has joined the "+
+				"factory-built, never-repaired class", ordinary)
 		}
 	})
 

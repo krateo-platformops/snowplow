@@ -91,6 +91,10 @@ const (
 	// The GVR's informer never got the verifying ListerWatcher, so the
 	// snapshot path cannot see it. Gate condition B-7.
 	verifySkipUndecorated = "undecorated_informer"
+	// The watcher holds no recorded sync position for this GVR, so the forced
+	// pass cannot issue a LIST whose result is provably at least as fresh as
+	// our store. Skipped rather than downgraded — see forcedVerify.
+	verifySkipNoSyncPosition = "no_sync_position"
 )
 
 // Unverifiable reasons — a registered GVR that no verification mechanism

@@ -221,17 +221,45 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		return
 	}
 
+	if rv == "" {
+		// NO SYNC POSITION — SKIP, NEVER FALL BACK TO RV="0".
+		//
+		// The soundness of this entire pass rests on ONE property: with
+		// NotOlderThan at our own lastSyncRV the cacher BLOCKS until it
+		// reaches OUR resourceVersion, so the returned set is provably at
+		// least as fresh as the store. That is what licenses compareStore's
+		// `st.rv != up.rv` to mean "the store is behind" — resourceVersions
+		// are opaque and cannot be ordered, so inequality only carries a
+		// direction because one side is known to be no older.
+		//
+		// Under RV="0" that property is GONE: the cacher serves whatever it
+		// has, which may be OLDER than our store, and then no class is safe —
+		// an object created after the cacher's snapshot reads as a lost
+		// DELETE, one deleted after it reads as a lost ADD. Follow the chain:
+		// false divergence -> a repair that was never needed -> a REAL
+		// multi-minute non-servable window -> still "divergent" at the next
+		// pass while the cacher lags -> the breaker latches and
+		// store_repair_ineffective_total fires, which this family's own
+		// description defines as "OUR detector is wrong". A transient cacher
+		// lag would manufacture precisely the alarm that says B is broken.
+		//
+		// Reachable, not theoretical. rw.lastSyncRV has exactly one writer
+		// (applyConfirmLocked, servable.go) and it writes only when the
+		// informer reports a non-empty LastSyncResourceVersion — AFTER, and
+		// independently of, the `confirmed` write. A confirm pass landing
+		// before the informer syncs therefore leaves
+		// HasSynced && servable && rv == "" until the next pass.
+		//
+		// So it is counted as a skip, under its own reason. "I could not run
+		// a sound comparison" must never be spelled the same way as "I
+		// compared and found nothing".
+		recordVerifySkipped(verifySkipNoSyncPosition)
+		return
+	}
 	opts := metav1.ListOptions{
 		ResourceVersion:      rv,
 		ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
 		Limit:                0, // MUST stay 0 — see the file header.
-	}
-	if rv == "" {
-		// No recorded sync position: NotOlderThan requires a resourceVersion,
-		// and sending the pair without one is rejected. Fall back to the
-		// watch-cache-served read (RV="0"), which the cacher serves
-		// unpaginated and which cannot be older than nothing.
-		opts.ResourceVersion = "0"
 	}
 	storeVerifyForcedListsTotal.Add(1)
 	list, err := cli.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, opts)
@@ -269,5 +297,11 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	if report.total() == 0 {
 		return
 	}
+	// ORDERING IS LOAD-BEARING, and it reads as incidental: noteVerified above
+	// runs BEFORE this enqueue, so when it latches the breaker the enqueue
+	// below is already refused (enqueueStoreRepair returns false for a
+	// suppressed GVR). Reverse the two and an ineffective repair would latch
+	// AND re-enqueue in the same pass, which is the hammering the breaker
+	// exists to stop.
 	enqueueStoreRepair(gvr, "store_divergence")
 }
