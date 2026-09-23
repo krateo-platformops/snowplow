@@ -620,6 +620,47 @@ type lruItem struct {
 	key   string
 	entry *ResolvedEntry
 	bytes int64
+	// extrasHash is HashExtras(entry.Inputs.Extras), computed ONCE per Put
+	// (off the lock) and projected O(1) by metaForItemLocked (#247
+	// instrument). It is derived state about THIS item's entry and must be
+	// written wherever entry is written — both Put branches, the
+	// replace-in-place one included. A replace that updates entry but not
+	// extrasHash would project the PRIOR extras identity against the NEW
+	// body, which is a silently wrong attribution rather than a missing one;
+	// TestResolvedMeta_ExtrasHashTracksReplaceInPlace is the arm that reds
+	// for it.
+	//
+	// WHY NOT COMPUTE IT IN THE WALK. RangeMetadata holds c.mu for the entire
+	// iteration. HashExtras is a json.Marshal per extras key plus a SHA-256;
+	// paying it per entry at max_entries (100K) would hold the store mutex
+	// for hundreds of milliseconds and stall every /call — the same reason
+	// BodySHA256 is single-key-only. Moving the cost to Put makes the
+	// projection O(1) and puts the hash on the write path instead.
+	//
+	// THE PUT RATE, SOURCED. snowplow_resolved_cache.store_total = 6,118,601
+	// over ~34 h uptime = 49.99 Puts/s (preroll-237/vars.json, the #247
+	// capture). That is a MEASURED RATE on one pod at one workload, not a
+	// capacity bound — do not re-use it as one.
+	//
+	// It reads low against snowplow_refresher_completed_total = 36,599,293
+	// (299/s) and the two are reconciled, not in conflict: store_total counts
+	// PUTS, completed_total counts refresher COMPLETIONS, and
+	// snowplow_refresher_skipped_no_entry_total = 33,629,860 — 91.9% of
+	// completions — never find an entry and so never Put. Completions that
+	// could Put are 2,969,433 (24.3/s); customer and seed Puts make up the
+	// rest of the 50/s.
+	//
+	// CONCURRENCY. Written under c.mu in both Put branches, read under c.mu
+	// in metaForItemLocked — the same discipline as key/entry/bytes, which is
+	// why it lives on lruItem (store-internal) rather than on ResolvedEntry.
+	// The decisive reason for that choice is STRUCTURAL, not stylistic: Get
+	// hands a *ResolvedEntry out to callers, so derived state parked there
+	// would be readable OUTSIDE c.mu and a race would only surface if some
+	// test happened to read it concurrently. An lruItem is never handed out,
+	// so the lock discipline holds by construction instead of by test
+	// coverage. Covered by
+	// TestResolvedMeta_ExtrasHashRaceUnderConcurrentPutAndWalk under -race.
+	extrasHash string
 }
 
 var (
@@ -1026,6 +1067,10 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 		entry.BornAt = entry.CreatedAt
 	}
 	bytes := entryBytes(entry)
+	// #247 instrument — the extras identity for the metadata surface, derived
+	// ONCE here and carried on the lruItem. Computed BEFORE c.mu is taken:
+	// HashExtras marshals and hashes, and none of that needs the store lock.
+	extrasHash := extrasHashForEntry(entry)
 	// 1.12.6 C4 (§6.4) — a real Put is by definition the "next real Put" a
 	// refresh suppression waits for: clear the marker (and the consecutive-
 	// decline counter) BEFORE taking the store lock. Two sync.Map deletes,
@@ -1088,6 +1133,11 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 		}
 		old.entry = entry
 		old.bytes = bytes
+		// #247 — derived from entry, so it is re-stamped with entry. A
+		// refresher re-Put can carry different extras than the cell it
+		// replaces; leaving the prior hash here would attribute the new body
+		// to the old extras identity.
+		old.extrasHash = extrasHash
 		if entry.Pinned {
 			c.curResidentBytes += bytes
 			c.residentEntries++
@@ -1102,7 +1152,7 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 		return
 	}
 
-	item := &lruItem{key: key, entry: entry, bytes: bytes}
+	item := &lruItem{key: key, entry: entry, bytes: bytes, extrasHash: extrasHash}
 	el := c.order.PushFront(item)
 	c.index[key] = el
 	if entry.Pinned {
@@ -1116,6 +1166,25 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	c.bumpClassStoreLocked(apistage, widgetContent, raFullList)
 
 	c.evictUntilUnderCapsLocked()
+}
+
+// extrasHashForEntry returns the extras identity to stamp on an entry's
+// lruItem (#247 instrument): HashExtras over the entry's key Inputs, or ""
+// when the entry carries no Inputs at all.
+//
+// The "" is deliberate and is NOT the same reading as HashExtras's "e0"
+// sentinel. "e0" means "this cell HAS a key-inputs record and its extras fold
+// was empty". "" means "this cell carries no Inputs", which is how a pre-
+// Inputs residue and the cache-disabled/no-identity paths present — the same
+// condition under which BindingUID/CacheEntryClass/Path are all left zero by
+// metaForItemLocked. Collapsing the two would make an absent record read as a
+// measured empty one, which is the reading error this whole instrument exists
+// to stop making.
+func extrasHashForEntry(entry *ResolvedEntry) string {
+	if entry == nil || entry.Inputs == nil {
+		return ""
+	}
+	return HashExtras(entry.Inputs.Extras)
 }
 
 // bumpClassStoreLocked increments the per-class store counters. Must be
@@ -1343,6 +1412,81 @@ type ResolvedEntryMeta struct {
 	// TTLOverrideSeconds is the per-entry override when one is stamped (UAF
 	// cells), 0 otherwise. It can only ever SHORTEN the effective TTL.
 	TTLOverrideSeconds int64 `json:"ttlOverrideSeconds,omitempty"`
+	// RBACSubGen is the per-subject RBAC sub-generation folded into this
+	// cell's key (#247 instrument). Together with PerPage/Page/ExtrasHash
+	// below, ResolvedEntryMeta now carries EVERY ComputeKey input except the
+	// class-constant resolvedKeyVersion — so two resident keys for one
+	// (object, identity) diff to a NAMED component rather than to "something
+	// else". That is the whole point: #247 attributes 40.7% of L1 to this one
+	// field, and the surface the 40.7% was measured on could not show it.
+	//
+	// READ IT WITH CacheEntryClass, NEVER ALONE. RBACSubGen is written at
+	// exactly ONE construction site — dispatchers/helpers.go:275, the
+	// `widgets`/`restactions` path. Every other site leaves it zero:
+	// dispatchWidgetContentKey (dispatchers/helpers.go:193),
+	// widgetContentL1Key (dispatchers/widget_content.go:87), contentKeyInputs
+	// (restactions/api/apistage.go:66), RAFullListKeyInputs
+	// (ra_full_list_slice.go:88). So a 0 means EITHER "this subject's RBAC has
+	// never moved" OR "this cell's class never stamps" — two regimes, one
+	// number. CacheEntryClass is what separates them, it is on the same row,
+	// and a reader that drops it turns this field into the seventh
+	// two-regimes-one-number of the #237/#247 investigation.
+	//
+	// NOT omitempty, for that same reason. A zero sub-gen is one of the two
+	// READINGS above, not the absence of one — omitting it would make the
+	// reader recover a measured value from a missing key, which is the error
+	// the ExtrasHash ""/"e0" split below also exists to avoid. Under the
+	// hypothesis this instrument tests, the BASELINE cell carries 0 and its
+	// duplicates carry >0, so the zero rows are half of every comparison.
+	// Omitting them would also defeat field-coverage counting — the §2.1
+	// method that excluded Stage — because an omitted zero cannot be told
+	// apart from a build that lacks the field at all.
+	//
+	// THE ASYMMETRY WITH ExtrasHash IS DELIBERATE, NOT AN OVERSIGHT.
+	// ExtrasHash IS omitempty because its "" genuinely means "no key-inputs
+	// record on this cell" — the same condition that blanks BindingUID,
+	// CacheEntryClass and Path — so there omission is the honest encoding of
+	// an absence. Here there is no absent value to encode: every resident
+	// cell folded SOME sub-gen, and 0 is a real one.
+	RBACSubGen uint64 `json:"rbacSubGen"`
+	// PerPage and Page are the pagination components of the key. They are
+	// here so "these two keys differ by pagination" is directly READABLE
+	// rather than reachable only by elimination — pagination (portal#235 /
+	// frontend#309) is the hypothesis #247 §2.3 excluded, and an excluded
+	// hypothesis should be re-checkable from the capture that excluded it.
+	//
+	// -1/-1 is the "unpaginated" tuple the seed path passes; 0/0 is the
+	// page-independent raFullList fold. Neither is a missing value, so
+	// these are NOT omitempty — a zero here is data.
+	//
+	// AND THEREFORE THEY CARRY THEIR OWN TWO-REGIME ZERO. Because they are
+	// not omitempty, an entry with NO Inputs record also serialises
+	// perPage:0, page:0 — indistinguishable, on the number alone, from the
+	// genuine page-independent raFullList fold just described. Same
+	// discriminator as for RBACSubGen and ExtrasHash, and it is on the same
+	// row: CacheEntryClass == "" means there was no Inputs record to read, so
+	// the zero was never measured. A reader that takes 0/0 at face value
+	// without checking the class is counting absences as raFullList cells.
+	PerPage int `json:"perPage"`
+	Page    int `json:"page"`
+	// ExtrasHash is the hex SHA-256 of the SAME canonicaliseExtras bytes
+	// ComputeKey folds (HashExtras and ComputeKey share that function, so
+	// extras-equal ⟺ hash-equal and there is no second derivation to drift).
+	// "e0" is the fixed empty-extras sentinel.
+	//
+	// A HASH, NOT THE EXTRAS — same argument BodySHA256 already carries.
+	// Extras can hold per-identity values; the hash answers "did the extras
+	// fold differ between these two keys" without exposing what differed.
+	// This is strictly sharper than the extras_len the dispatch diag log
+	// carries, which is blind to a same-cardinality VALUE change — precisely
+	// the case #247's Extras exclusion turns on.
+	//
+	// Computed ONCE per Put and carried on the store-internal lruItem, NOT
+	// recomputed per walk. Hashing every entry's extras under c.mu would
+	// repeat the mistake BodySHA256 exists to avoid (see below): at
+	// max_entries the walk would stall every /call for the hold. The Put-side
+	// cost is one hash at the observed 50 Puts/s, taken OFF the lock.
+	ExtrasHash string `json:"extrasHash,omitempty"`
 	// BodySHA256 is the hex SHA-256 of the encoded body. Populated ONLY for a
 	// single-key lookup (/debug/apistage?key_hash=...), never for the full
 	// walk — hashing every body under the store mutex would stall serving at
@@ -1504,6 +1648,10 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 		meta.TTLRemainingSeconds = int64(rem.Seconds())
 	}
 	meta.TTLOverrideSeconds = int64(entry.TTLOverride.Seconds())
+	// #247 instrument — the extras identity is NOT derived here. It was
+	// computed once at Put and carried on the item, so this stays O(1) and
+	// the full walk never hashes under c.mu (see lruItem.extrasHash).
+	meta.ExtrasHash = item.extrasHash
 	if in := entry.Inputs; in != nil {
 		meta.BindingUID = in.BindingUID
 		meta.CacheEntryClass = in.CacheEntryClass
@@ -1513,6 +1661,14 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 		meta.Namespace = in.Namespace
 		meta.Name = in.Name
 		meta.Stage = in.Stage
+		// #247 — the remaining ComputeKey inputs, all O(1) reads off the
+		// Inputs record already dereferenced here. With these the row carries
+		// every ComputeKey component except the class-constant
+		// resolvedKeyVersion. RBACSubGen is only meaningful alongside
+		// CacheEntryClass, set just above and on every row (see the field doc).
+		meta.RBACSubGen = in.RBACSubGen
+		meta.PerPage = in.PerPage
+		meta.Page = in.Page
 		meta.Path = metaPathFromCoords(in.Group, in.Version, in.Resource, in.Namespace, in.Name)
 	}
 	return meta

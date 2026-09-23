@@ -755,6 +755,35 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		slog.Int("per_page", perPage),
 		slog.Int("page", page),
 		slog.Int("extras_len", len(extras)),
+		// #247 — the sub-gen this key folded, so the line can attribute a
+		// seed-vs-dispatcher_get key divergence to it. Reading it needs
+		// handler_kind and key_hash from the same line; see subgenOf.
+		//
+		// NOT THE #247 INSTRUMENT, AND NOT ITS EVIDENCE. This whole line is
+		// log.Info and the chart ships LOG_LEVEL=warn
+		// (helm/snowplow/values.yaml), so it emits NOTHING in production —
+		// this field is readable only in a bench/kind run with INFO on. The
+		// #247 instrument is the resident-cell metadata surface
+		// (cache.ResolvedEntryMeta: rbacSubGen / extrasHash / perPage /
+		// page), which is not a log and is readable at warn. This field is
+		// here for the one thing that surface cannot give — WHICH SITE
+		// computed a key, i.e. the divergence diff this line was built for.
+		// Do not cite it as evidence for a residency claim; a log line has no
+		// residency join and cannot see an eviction.
+		//
+		// NO extras_hash HERE, DELIBERATELY — do not "complete the set".
+		// slog evaluates every argument BEFORE log.Info checks the level, so
+		// a HashExtras call here would marshal-and-SHA256 on every emit at
+		// warn, producing nothing. On /call that is 0.14/s and would not
+		// matter; the material site is BOOT — phase1_pip_seed.go:906 and
+		// :1302 fire per seed unit (phase1_bindingset_seed_resolves_total =
+		// 279,588) on the path that gates /readyz. Hundreds of thousands of
+		// discarded hashes on the readiness path buys nothing the metadata
+		// surface does not already carry. extras_len above remains the log
+		// line's extras signal, with its known blindness to a
+		// same-cardinality value change; extrasHash on ResolvedEntryMeta is
+		// where that blindness is actually fixed. (TL ruling, #247.)
+		slog.Uint64("rbac_subgen", subgenOf(inputs)),
 	)
 
 	// Ship 0.30.190 Fix B / 0.30.191 carried-forward — additive
@@ -768,6 +797,22 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 			handlerKind, group, version, resource, namespace, name, perPage, page, len(extras),
 		)
 	}
+}
+
+// subgenOf reads the RBAC sub-generation off a key-inputs record for the
+// dispatch diag line, nil-safe (#247).
+//
+// A 0 from here has THREE readings, not one: the cache-disabled / no-identity
+// branch returns nil inputs (and with it an empty key_hash, which is what
+// separates that case on the row); an identity-free class folds a constant
+// zero; or the subject's RBAC genuinely has not moved. handler_kind on the
+// same line resolves the second — both classes that reach this emit are
+// stamped classes — and key_hash resolves the first.
+func subgenOf(inputs *cache.ResolvedKeyInputs) uint64 {
+	if inputs == nil {
+		return 0
+	}
+	return inputs.RBACSubGen
 }
 
 // encodeResolvedJSON marshals res with a single canonical encoder shape.
