@@ -255,6 +255,16 @@ func TestC7_Wiring_DistinctValuesReachEveryDerivedStat(t *testing.T) {
 	SetRefreshBroadcasterStatsForTest(rb)
 	t.Cleanup(func() { SetRefreshBroadcasterStatsForTest(nil) })
 
+	// #237 B. This family mixes counters (atomics) with GAUGES computed from
+	// live state at scrape time, so the override seam is the only way a
+	// distinct value can be driven through every stat — and without this arm a
+	// gauge could be derived but never reach the map, which is the drift the
+	// whole C7 mechanism exists to catch.
+	sv := &StoreVerificationStats{}
+	wantSV := setDistinct(t, sv, 500)
+	SetStoreVerificationStatsForTest(sv)
+	t.Cleanup(func() { SetStoreVerificationStatsForTest(nil) })
+
 	all := expvarVars(t)
 	check := func(family string, raw json.RawMessage, want map[string]int64) {
 		var got map[string]float64
@@ -269,6 +279,7 @@ func TestC7_Wiring_DistinctValuesReachEveryDerivedStat(t *testing.T) {
 	}
 	check("snowplow_crd_discovery", all["snowplow_crd_discovery"], wantCRD)
 	check("snowplow_refresh_broadcaster", all["snowplow_refresh_broadcaster"], wantRB)
+	check("snowplow_store_verification", all["snowplow_store_verification"], wantSV)
 	for k, w := range wantCRD {
 		if got := CRDDiscoveryStatsByStat()[k]; got != w {
 			t.Errorf("CRDDiscoveryStatsByStat()[%s] = %d; want %d", k, got, w)

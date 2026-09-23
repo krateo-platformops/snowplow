@@ -451,6 +451,41 @@ type DepTracker struct {
 	totalRecords atomic.Int64
 	maxRecords   int64
 
+	// coordinates is the number of live buckets in the forward index, i.e.
+	// DISTINCT dependency coordinates (GVR, namespace, name). #239.
+	//
+	// WHY IT IS COUNTED RATHER THAN DERIVED. The #239 scaling conclusion —
+	// that dirty-mark fan-out grows LINEARLY with cohort count, because
+	// coordinates are a property of the CLUSTER while L1 entries are a
+	// property of COHORTS x WIDGETS — rests on a coordinate count of ~364
+	// that was DERIVED as edges divided by measured fan-out, never measured.
+	// That single number decides whether the finding is a scaling wall or
+	// arithmetic, and the issue names instrumenting it as the thing that would
+	// falsify the conclusion: if a real count showed coordinates growing with
+	// cohorts, the scaling conclusion collapses.
+	//
+	// READ IT AGAINST `records`, ALWAYS. Alone it says nothing, and its zero
+	// is not a health reading: zero coordinates with zero records is an empty
+	// tracker (cache off, or boot). The PAIR is the instrument —
+	// records/coordinates is the fan-out multiplier, and it is that ratio's
+	// behaviour as cohorts grow that answers #239.
+	//
+	// O(1), maintained at the two bucket-lifecycle sites rather than by
+	// ranging the forward map: a sync.Map walk over 90K+ edges on every OTLP
+	// collection is not a cost a gauge should carry.
+	//
+	// ONE KNOWN OVER-READ, recorded rather than fixed here. recordInternal
+	// LoadOrStores a forward bucket and then, if the record cap is hit, rolls
+	// back only the KEY inside it — leaving an empty keySet in the map. This
+	// counter counts that bucket, so `coordinates` over-reads whenever
+	// dropped_cap > 0. It is a pre-existing defect with its own cause and its
+	// own fix, filed separately rather than bundled into #237 B: a one-line
+	// change to this hot path is how an unrelated regression gets attributed
+	// to the wrong ship. dropped_cap reads 0 on the live pod, so the over-read
+	// does not affect the discrimination this gauge exists to perform — but
+	// read the two together, never this one alone.
+	coordinates atomic.Int64
+
 	// Falsifier counters (atomic; safe to read without holding anything).
 	recordTotal        atomic.Uint64
 	recordDroppedCap   atomic.Uint64
@@ -618,7 +653,11 @@ func (d *DepTracker) RecordList(l1Key string, gvr schema.GroupVersionResource, n
 // honours the global cap.
 func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
 	// Forward: DepKey -> *keySet[l1Key]
-	ksI, _ := d.forward.LoadOrStore(dk, &keySet{})
+	ksI, loadedBucket := d.forward.LoadOrStore(dk, &keySet{})
+	if !loadedBucket {
+		// A coordinate nothing depended on until now (#239).
+		d.coordinates.Add(1)
+	}
 	ks := ksI.(*keySet)
 	if _, loaded := ks.keys.LoadOrStore(l1Key, struct{}{}); loaded {
 		return // already recorded — idempotent no-op
@@ -948,6 +987,26 @@ func (d *DepTracker) OnResourceTypeSchemaRelisted(gvr schema.GroupVersionResourc
 	return d.dirtyMarkResourceType("SCHEMA_RELIST", gvr, matched)
 }
 
+// OnResourceTypeStoreRepaired is the #237 deliverable B sibling of
+// OnResourceTypeSchemaRelisted: the same dirty-mark-only, never-evict body,
+// reached when a relist was fired because the informer STORE was found to
+// disagree with the apiserver — not because a CRD's schema changed.
+//
+// It exists for one reason: the event label. The relist machinery is shared
+// (relistGVRForRepair, crd_discovery_side_effect.go), so a store repair that
+// reused OnResourceTypeSchemaRelisted would log cache_event.consumed
+// type=SCHEMA_RELIST and the event log would attribute a store divergence to a
+// CRD schema widen. That is the same misattribution this whole issue is about:
+// #237 spent two sessions on a defect whose instruments named the wrong cause.
+// One label, one caller each, so a non-zero bucket names the code path.
+func (d *DepTracker) OnResourceTypeStoreRepaired(gvr schema.GroupVersionResource) int {
+	if d == nil {
+		return 0
+	}
+	matched := d.collectTypeMatches(gvr, false /* listOnly */)
+	return d.dirtyMarkResourceType("STORE_REPAIR", gvr, matched)
+}
+
 // dirtyMarkResourceType dirty-marks every L1 key in matched via the
 // refreshHook — the shared body of OnResourceTypeAvailable +
 // OnResourceTypeRemoved. NEVER evicts. Returns the number marked.
@@ -1225,7 +1284,12 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 				// hits the deleted bucket simply LoadOrStores a
 				// fresh keySet.
 				if newCount == 0 {
-					d.forward.CompareAndDelete(dk, ks)
+					// #239: decrement only when WE removed the bucket, so a
+					// concurrent losing CompareAndDelete cannot double-count
+					// the coordinate's disappearance.
+					if d.forward.CompareAndDelete(dk, ks) {
+						d.coordinates.Add(-1)
+					}
 				}
 			}
 		}
@@ -1237,8 +1301,12 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 // DepStats is a snapshot of the falsifier counters. All numbers are
 // atomic and may drift by a single call between fields.
 type DepStats struct {
-	TotalRecords        int64
-	MaxRecords          int64
+	TotalRecords int64
+	MaxRecords   int64
+	// Coordinates is the distinct-dependency-coordinate count (#239). Read it
+	// against TotalRecords — the RATIO is the fan-out multiplier and neither
+	// number means anything alone.
+	Coordinates         int64
 	RecordTotal         uint64
 	RecordDroppedCap    uint64
 	RecordDroppedNoKey  uint64 // O15: empty-l1Key Record*/WithL1KeyContext
@@ -1259,6 +1327,7 @@ func (d *DepTracker) Stats() DepStats {
 	return DepStats{
 		TotalRecords:                 d.totalRecords.Load(),
 		MaxRecords:                   d.maxRecords,
+		Coordinates:                  d.coordinates.Load(),
 		RecordTotal:                  d.recordTotal.Load(),
 		RecordDroppedCap:             d.recordDroppedCap.Load(),
 		RecordDroppedNoKey:           d.recordDroppedNoKey.Load(),

@@ -270,6 +270,23 @@ func TaggedStatFamilies() []StatFamily {
 			Untagged: untaggedNumericFields(reflect.TypeOf(ReflectorPathStats{})),
 			typ:      reflect.TypeOf(ReflectorPathStats{}),
 		},
+		// #237 B — store-divergence detection. Counters ride the shared,
+		// stat-labelled instrument; the GAUGES cannot (a shared observable
+		// counter is monotonic by construction) so they take OTelPrefix and
+		// get one instrument each. The two by-reason breakdowns ride alongside
+		// as their own expvar maps, like confirm_retracted_by_reason.
+		//
+		// APPENDED, not inserted — see the note above.
+		{
+			Expvar:     "snowplow_store_verification",
+			OTelName:   "snowplow_store_verification",
+			OTelPrefix: "snowplow_store_verification_",
+			Desc:       "Informer-store divergence detection and repair counters, labelled by stat.",
+			Values:     StoreVerificationStatsByStat,
+			Specs:      statSpecsOf(reflect.TypeOf(StoreVerificationStats{})),
+			Untagged:   untaggedNumericFields(reflect.TypeOf(StoreVerificationStats{})),
+			typ:        reflect.TypeOf(StoreVerificationStats{}),
+		},
 	}
 }
 

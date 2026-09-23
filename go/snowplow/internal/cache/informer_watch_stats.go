@@ -70,6 +70,12 @@ const (
 	confirmRetractStaleVersionPruned = "stale_version_pruned" // #219: CRD stopped serving this version
 	confirmRetractCRDDeleted         = "crd_deleted"          // the CRD itself was deleted
 	confirmRetractUnspecified        = "unspecified"          // a bare RemoveResourceType (tests)
+	// #237 B: the store was found to disagree with the apiserver and the GVR
+	// was relisted to repair it. It shares the relist machinery with
+	// schema_relist and MUST NOT share its bucket — a store repair folded into
+	// schema_relist would read as a CRD schema widen, which is the
+	// wrong-cause misattribution #237 exists to stop.
+	confirmRetractStoreRepair = "store_repair"
 )
 
 // InformerWatchStats is the tagged family. Counters only — the servable GAUGES

@@ -232,8 +232,18 @@ func newStreamingDynamicInformer(
 		},
 	}
 
+	// #237 deliverable B — the verifying decorator. THIS is the hook point,
+	// and it is the ListerWatcher rather than the ListFunc above for one
+	// reason: production takes the WATCH-LIST path, not the LIST path
+	// (WatchListClient defaults true at client-go v0.35.3 and nothing here
+	// opts out), so a hook on ListFunc would only ever cover the fallback.
+	// The decorator sees both — see store_verify.go.
+	//
+	// It sits ABOVE streamingList's continue-walk, so it always observes one
+	// assembled, complete object set rather than a page.
+	verifier := newVerifyingListerWatcher(lw, gvr)
 	informer := clientcache.NewSharedIndexInformerWithOptions(
-		lw,
+		verifier,
 		&unstructured.Unstructured{},
 		clientcache.SharedIndexInformerOptions{
 			ResyncPeriod:      0, // pure event-driven — matches the factory
@@ -241,6 +251,11 @@ func newStreamingDynamicInformer(
 			ObjectDescription: gvr.String(),
 		},
 	)
+	// Bind the informer the decorator verifies. Done here, before Run, so the
+	// compare path reads a field that was written before the goroutine that
+	// reads it existed — and so it never needs rw.mu on the reflector's own
+	// goroutine, which is the deadlock hazard reflector_path.go documents.
+	verifier.bind(informer)
 	return &streamingDynamicInformer{informer: informer, gvr: gvr}, true
 }
 

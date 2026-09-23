@@ -332,6 +332,74 @@ observation, and any change after). Warn because the chart ships at warn and an 
 invisible exactly when it is needed; transition-only because a per-request line would flood the
 log it is meant to be readable in.
 
+#### `snowplow_store_verification` stats
+
+**#237 B.** Does the informer store still agree with the apiserver? Before this, nothing in
+snowplow handled *"still there, but different"*: `DepTracker.OnUpdate` fires on the watch UPDATE
+event (for a LOST event the signal and the data share one failure), the C2 relist bridge diffs
+`ns/name` key SETS (a key present on both sides takes the `continue` no matter how much its
+content changed — which is why `relist_bridge_enqueued_total` read 0 across 108 runs, correctly),
+and the C3 reconcile audit acts only on `objAbsent` (a present-but-stale object is skipped before
+any field is compared, which is why the live capture read `divergent: 0` with the defect active).
+Every safety net was a **deletion detector**.
+
+The comparison runs where truth already arrives: every relist fetches the complete authoritative
+object set for its GVR, and a decorator on the ListerWatcher diffs it against the store an instant
+before `Replace()`. Total coverage per GVR, **zero additional apiserver load**, and it fires on the
+event rather than on a cadence. The deadline walker below is the backstop for GVRs whose watch only
+ever recycles and therefore never snapshot.
+
+**READ THIS BEFORE READING A ZERO.** The oracle is *the snapshot we just received*, not the
+apiserver. These counters answer "does our store match the object set the apiserver last handed
+us", **not** "does our store match the apiserver". If the incoming snapshot is itself a stale
+watch-cache read — #237's *"the relist happened and did not fix it"* candidate — the comparison
+finds equality and **every divergence counter reads 0 with the defect active**. The forced pass is
+only partly immune: `ResourceVersionMatch=NotOlderThan` at our own `lastSyncRV` makes the cacher
+block until it reaches OUR resourceVersion, which is a guarantee about our store's position, not
+about etcd's. This is not closed, because the only thing that would close it is a quorum read per
+snapshot — precisely the apiserver load the cache exists to avoid.
+
+The four divergence classes carry a **site**. `snapshot` divergences are already repaired by
+client-go (`processDeltas` writes the store and *then* calls the handler), so
+`store_repairs_fired_total` correctly stays 0 for them; only `forced` divergences need snowplow's
+own repair verb. Without the split, "divergence climbing while repairs flat" would fire on every
+correctly repaired snapshot divergence — and an alarm that cries wolf gets muted, taking the
+signal it exists for with it.
+
+| stat | meaning | healthy range |
+|---|---|---|
+| `store_verifications_total` | completed comparisons (snapshot plus forced) | **DENOMINATOR, not a detector.** Climbs in both regimes. A zero here makes every zero below meaningless |
+| `store_objects_verified_total` | objects compared across all verifications | **DENOMINATOR.** Per forced pass it must advance by the GVR's FULL `indexerCount` — a shortfall means sampling crept in and the coverage guarantee (*the deadline chooses WHEN, never WHAT*) is silently gone |
+| `store_verification_forced_lists_total` | `PartialObjectMetadata` LISTs issued by the deadline walker | **DENOMINATOR for the forced path.** At most one per GVR per `maxVerificationAge` (= `ResolvedCacheTTL`, 3600 s default). Above that rate the deadline or the pacing is broken — the failure mode that could pressure the apiserver |
+| `store_divergent_lost_update_snapshot_total` | same uid, different `resourceVersion`, found at a snapshot — a lost UPDATE | **0**. Non-zero during #237. Already repaired by client-go when counted here |
+| `store_divergent_lost_update_forced_total` | same class, found by the deadline pass | **0**. NOT self-repairing: climbing while `store_repairs_fired_total` stays flat is detection without repair |
+| `store_divergent_lost_delete_snapshot_total` | in the store, absent upstream, found at a snapshot | **0**. Repaired by client-go's synthesised `Deleted` delta |
+| `store_divergent_lost_delete_forced_total` | same class, found by the deadline pass | **0**. Needs the repair verb |
+| `store_divergent_lost_add_snapshot_total` | upstream, absent from the store, found at a snapshot | **0**. NOT counted on a GVR's first sync — an empty store against a full set is the normal case, and that skip is `skipped_by_reason{initial_sync}` |
+| `store_divergent_lost_add_forced_total` | same class, found by the deadline pass | **0** |
+| `store_divergent_uid_mismatch_snapshot_total` | same `(namespace,name)`, **different uid** — a delete-and-recreate phantom | **0**. The class every existing repair path is structurally blind to: the C2 bridge diffs `ns/name`, and `ResolvedKeyInputs` carries no object uid, so a recreate under the same name reuses the byte-identical L1 cell |
+| `store_divergent_uid_mismatch_forced_total` | same class, found by the deadline pass | **0**. Load-bearing rather than defensive — #237's ten-day staleness IS a uid phantom |
+| `store_divergence_candidates_total` | RAW divergences, before the bounded re-read confirmed them | ~0. A large candidates-minus-confirmed gap is a **DeltaFIFO backlog** (the indexer lagging the queue), not a stale store — which is why the raw number is published rather than hidden |
+| `store_gvrs_unverified` | servable, synced, reachable GVRs past `maxVerificationAge` | **0**. During #237 with B working this reads **0** — the deadline reached the GVR and found the divergence. It is NOT the detector; it is the DENOMINATOR that makes a zero divergence readable: `(unverified 0, divergent 0)` = *I looked and found nothing*; `(unverified >0, divergent 0)` = **I did not look**. That is exactly the distinction the 1.12.6 audit's `divergent: 0` could not express |
+| `store_gvrs_unverifiable` | registered GVRs no mechanism reaches right now — breakdown in `snowplow_store_verification_unverifiable_by_reason` (`retracted` / `not_synced` / `unreachable`) | **0**. Split from `store_gvrs_unverified` so a retracted GVR cannot be quietly dropped from that gauge's set and produce a zero that reads as health |
+| `store_gvrs_undecorated` | registered GVRs whose informer never got the verifying ListerWatcher, so only the deadline pass covers them | the **four typed-RBAC GVRs**, which take the stock factory informer by design — not 0. Watch for the JUMP: with `RESOLVER_COMPOSITION_STREAMING_LIST=false` this goes to nearly every GVR while every `*_snapshot_total` silently drops to 0 |
+| `store_verification_max_age_seconds` | oldest age-since-last-verified across the `store_gvrs_unverified` set | at or below `maxVerificationAge`. **At boot it reads age-since-REGISTRATION and never 0** — a never-verified GVR excluded from the max would read 0 while nothing had been verified at all |
+| `store_verification_skipped_total` | comparisons declined — breakdown in `snowplow_store_verification_skipped_by_reason` | read the **breakdown**, never this total: it deliberately spans expected reasons (`initial_sync`, once per GVR per informer lifetime; `undecorated_informer`, once per undecorated registration) and unexpected ones (`torn_down`, `metaclient_nil`, `list_error`). It is what gives *"no divergence found"* its scope — without it, a pass that never ran and a pass that found nothing are the same zero |
+| `store_verification_invalidated_total` | verifications ended by a servability retraction | **CONTEXT, NOT A DETECTOR** — it climbs in both regimes (krateo-057 measured 10,011 `discovery_refresh` retractions in 18 h). It is what explains a GVR's age resetting with no verification having run |
+| `store_repairs_fired_total` | targeted relists fired to repair a divergence the deadline pass found | **0**. Read it AGAINST `store_divergent_*_forced_total`: divergence climbing while this stays flat is a green counter over a still-wrong store |
+| `store_repair_ineffective_total` | repairs after which the NEXT verification still reported divergence | **0, and ALARMABLE.** The only stat here whose non-zero means the **detector** is wrong rather than the store: a full relist that does not clear a divergence does not indicate a lost event |
+| `store_repair_unsupported_total` | divergences whose GVR cannot be repaired by a relist at all, because its informer comes from the **shared dynamic factory** — which caches by GVR with no eviction API, so a teardown plus re-register hands back the **stopped** informer and kills the cache for that GVR instead of repairing it | **0**, and it should stay 0 in production because every non-typed-RBAC GVR takes the streaming path. Non-zero is the honest statement that this GVR is **detected and not repaired** — a state that would otherwise be indistinguishable from a divergence nobody acted on. The four typed-RBAC GVRs are the known factory-built exception |
+| `store_repair_suppressed_total` | GVRs the circuit breaker has latched | **0**. Non-zero means the staleness bound no longer holds for that GVR — it is **unbounded** and the alarm is the only mitigation. Detection continues; the breaker never produces silence |
+| `store_repairs_pending` | GVRs waiting in the serialised repair queue | **0**. Repairs run ONE AT A TIME across all GVRs, so a correlated divergence cannot take the cache non-servable everywhere at once; the price is queue wait, and this is where it shows |
+| `store_repair_queue_age_seconds` | age of the oldest queued repair, measured from detection | **0**. Rising without bound means the serialised queue is not draining — the regime in which the staleness bound (`maxVerificationAge` + **queue wait** + one relist) stops being minutes and becomes hours |
+
+A repair **retracts the GVR's confirmation for the whole rebuild window** — minutes at 50K — so
+every resolve for it falls through to the apiserver until the replacement informer syncs. That is
+the deliberate trade of *fast-but-wrong* for *slow-but-correct*, it is the largest single cost in
+this deliverable, and it is why repairs are globally serialised and circuit-broken. The log lines
+are `cache.store.divergent` and `cache.store.repair` at **WARN**, and
+`cache.store.repair_ineffective` at **ERROR**.
+
 #### `snowplow_crd_discovery` stats
 
 | stat | meaning | healthy range |
@@ -372,6 +440,7 @@ The stats that answer an invalidation question:
 
 | stat | meaning | healthy range |
 |---|---|---|
+| `coordinates` | **#239.** DISTINCT dependency coordinates — the `(GVR, namespace, name)` tuples the edges point at, counted rather than derived. `records` counts EDGES; the ratio `records / coordinates` is the dirty-mark fan-out multiplier | **not a health signal, and its zero is not a health reading** — zero coordinates with zero `records` is simply an empty tracker, so read the PAIR. #239 measured fan-out at ~250 dirty-marks per object event and *derived* a coordinate count of ~364 from it; the scaling conclusion (fan-out grows **linearly with cohort count**, because coordinates are cluster-scoped while L1 entries are cohort-scoped) had no falsifier until this number existed. Coordinates flat while `records` grows with cohorts CONFIRMS it; coordinates growing with cohorts KILLS it. Read against `dropped_cap`: a cap rollback leaves an empty forward bucket, so this over-reads while `dropped_cap > 0` |
 | `records`, `max_records`, `record_total` | live dep records (an L1 key ↔ object edge), the `DEPS_MAX_RECORDS` ceiling, and the cumulative number recorded | `records` well under `max_records` |
 | `dropped_cap` | dep edges **silently dropped** because `records` hit `max_records`: the entry becomes dirty-markable-but-not-evictable (the #187 H4 shape) and only its TTL or the max-age bound can remove it. The reconcile audit counts these under `reconcile_skipped_no_edge_total`; it cannot repair them | **0** — alert on it and raise `DEPS_MAX_RECORDS` |
 | `dropped_no_key` | edge registrations that arrived with an empty L1 key (a caller bug; counted, never stored) | **0** |

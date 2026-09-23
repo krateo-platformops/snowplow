@@ -954,6 +954,13 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// two lifecycle mirrors stay together and a third site cannot pick up one
 	// without the other.
 	rememberReflectorPathGVR(gvr)
+	// #237 B — seed this GVR's verification deadline. decorated=false: the
+	// metadata-informer path builds its ListWatch inside client-go, so the
+	// verifying decorator cannot be installed on it and only the deadline pass
+	// covers it. (shouldUseMetadataOnly is constant-false in production
+	// post-H5, so this site is unreachable there — recorded honestly rather
+	// than assumed away.)
+	rememberStoreVerification(gvr, false)
 	if rw.metadataOnly == nil {
 		rw.metadataOnly = map[schema.GroupVersionResource]struct{}{}
 	}
@@ -1360,11 +1367,19 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// the toggle is off, OR newStreamingDynamicInformer cannot build its
 	// REST client, gi stays nil and we fall through to the
 	// stock-informer path below.
+	// #237 B — decorated records whether this GVR's informer got the verifying
+	// ListerWatcher. Only the streaming constructor installs it: the stock
+	// factory and standalone dynamic informers build their ListWatch inside
+	// client-go where snowplow cannot reach it. The flag is recorded at
+	// registration because the routing decision is made HERE, once, and is not
+	// re-derivable from the informer handle afterwards.
+	decorated := false
 	if !isStreamingException(gvr) && compositionStreamingListEnabled() {
 		if sgi, ok := newStreamingDynamicInformer(
 			rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak,
 		); ok {
 			gi = sgi
+			decorated = true
 			slog.Info("cache.streaming_list.informer_routed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
@@ -1427,6 +1442,12 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// two lifecycle mirrors stay together and a third site cannot pick up one
 	// without the other.
 	rememberReflectorPathGVR(gvr)
+	// #237 B — seed this GVR's verification deadline at REGISTRATION time, not
+	// at the zero time. A never-verified GVR excluded from the age computation
+	// would make store_verification_max_age_seconds read 0 at boot and through
+	// any window where verification has never run — a zero that reads as
+	// perfect health while nothing has been verified at all.
+	rememberStoreVerification(gvr, decorated)
 
 	// 0.30.9 Sub-scope B: allocate the sync channel BEFORE we spawn
 	// any goroutine that could close it. The channel is closed by
@@ -1747,6 +1768,13 @@ func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResour
 	// runs inside every outbound request and must never take rw.mu; see the
 	// lock-order note in reflector_path.go.
 	forgetReflectorPath(gvr)
+	// #237 B — the verification bookkeeping is keyed by GVR too. Leaving it
+	// out would be #219's leak shape verbatim: pruneUnservedGVRs retires a
+	// composition version on every CRD upgrade, so the registry would
+	// accumulate a permanent row per retired version — each one permanently
+	// past its deadline, driving store_gvrs_unverified up with GVRs that no
+	// longer exist.
+	forgetStoreVerification(gvr)
 }
 
 // waitInformerSync polls the informer's HasSynced predicate and

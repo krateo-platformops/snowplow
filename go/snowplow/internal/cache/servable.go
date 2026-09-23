@@ -332,6 +332,14 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 			// count non-events.
 			if _, was := rw.confirmed[gvr]; was {
 				recordConfirmRetracted(reason)
+				// #237 B — a retraction does not change the store, but it does
+				// end the validity of this GVR's last verification: while
+				// retracted nothing serves from the store, and when it is
+				// confirmed again the store it comes back with has not been
+				// compared against anything. Resetting the epoch puts it back
+				// in the deadline's queue rather than letting it inherit a
+				// verification from before the gap.
+				invalidateStoreVerification(gvr)
 			}
 			delete(rw.confirmed, gvr)
 		}
@@ -577,6 +585,40 @@ type ServableGVRStatus struct {
 	IndexerCount            int     `json:"indexerCount"`
 	LastSyncResourceVersion string  `json:"lastSyncResourceVersion,omitempty"`
 	LastEventAgeSeconds     float64 `json:"lastEventAgeSeconds"`
+
+	// #237 B — VERIFICATION. The three fields above say what the store holds
+	// and when it last heard anything; none of them says whether what it holds
+	// has ever been checked against the apiserver. That was the gap #237 spent
+	// two sessions in: divergent:0 was read as "the store is fine" when it
+	// meant "nothing compared the store to anything".
+	//
+	// LastVerifiedAgeSeconds is the time since this GVR's full object set was
+	// last compared against an authoritative set; -1 means NEVER — which is a
+	// different answer from 0 and must not be rendered as one.
+	//
+	// LastVerifiedObjects is how many objects that comparison covered. Read it
+	// against IndexerCount: the deadline chooses WHEN a GVR is verified, never
+	// WHAT, so a comparison covering fewer objects than the store holds means
+	// sampling has crept in and the coverage guarantee is gone.
+	//
+	// DivergentSinceBoot is the running total of all four divergence classes
+	// for this GVR. It is NEVER reset by a repair — "has this GVR ever been
+	// wrong" is the question an operator asks after the fact, and a counter
+	// cleared by the fix cannot answer it.
+	//
+	// VerificationDecorated says whether the snapshot-time comparison covers
+	// this GVR at all. False means only the deadline pass does, so its
+	// divergence counters move at deadline cadence rather than at every
+	// snapshot — and a zero for it is a much weaker statement.
+	//
+	// RepairSuppressed means the circuit breaker has latched for this GVR
+	// after a relist failed to clear its divergence: detection continues, but
+	// staleness here is now unbounded.
+	LastVerifiedAgeSeconds float64 `json:"lastVerifiedAgeSeconds"`
+	LastVerifiedObjects    int     `json:"lastVerifiedObjects"`
+	DivergentSinceBoot     uint64  `json:"divergentSinceBoot"`
+	VerificationDecorated  bool    `json:"verificationDecorated"`
+	RepairSuppressed       bool    `json:"repairSuppressed"`
 }
 
 // ServableSnapshot returns a read-only per-GVR servability snapshot over
@@ -617,6 +659,15 @@ func (rw *ResourceWatcher) ServableSnapshot() []ServableGVRStatus {
 		if ns := rw.lastEventUnixNano(gvr); ns > 0 {
 			ageSeconds = time.Since(time.Unix(0, ns)).Seconds()
 		}
+		// #237 B — the verification row. verificationRowFor takes its own
+		// mutex and never takes rw.mu, so reading it from inside this
+		// rw.mu-held loop respects the one-way lock order
+		// (store_verify_state.go).
+		verifiedAge := float64(-1)
+		row, haveRow := verificationRowFor(gvr)
+		if haveRow && row.verified {
+			verifiedAge = time.Since(row.epoch).Seconds()
+		}
 		out = append(out, ServableGVRStatus{
 			GVR:                     gvr.String(),
 			HasSynced:               gi.Informer().HasSynced(),
@@ -626,6 +677,11 @@ func (rw *ResourceWatcher) ServableSnapshot() []ServableGVRStatus {
 			IndexerCount:            indexerCount,
 			LastSyncResourceVersion: rw.lastSyncRV[gvr],
 			LastEventAgeSeconds:     ageSeconds,
+			LastVerifiedAgeSeconds:  verifiedAge,
+			LastVerifiedObjects:     row.lastObjects,
+			DivergentSinceBoot:      row.divergentSinceBoot,
+			VerificationDecorated:   row.decorated,
+			RepairSuppressed:        row.suppressed,
 		})
 	}
 	return out

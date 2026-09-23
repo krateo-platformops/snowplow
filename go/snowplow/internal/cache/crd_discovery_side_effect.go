@@ -704,79 +704,13 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 		if rw == nil {
 			break
 		}
-		// Only relist a GVR we are actually watching. EnsureResourceType is
-		// registration-idempotent, so an unconditional Ensure would SPAWN an
-		// informer for a never-watched GVR (wrong — lazy registration is the
-		// resolver's job). Gate on current registration via IsRegistered.
-		if !rw.IsRegistered(gvr) {
+		// The sync channel is deliberately DISCARDED here: this loop runs on
+		// the single CRD-lifecycle worker, and blocking it on a rebuild would
+		// stall every other CRD event. The store-repair caller does wait — see
+		// the note at the end of relistGVRForRepair.
+		if _, ok := c.relistGVRForRepair(rw, gvr, confirmRetractSchemaRelist,
+			func(d *DepTracker, g schema.GroupVersionResource) int { return d.OnResourceTypeSchemaRelisted(g) }); !ok {
 			continue
-		}
-		// 1.12.6 C2 — snapshot the OLD indexer's key set BEFORE the teardown
-		// (relist_bridge.go). Read-only; the diff against the fresh LIST runs
-		// on the bridge goroutine spawned below.
-		before, had := rw.IndexerKeys(gvr)
-		rw.removeResourceTypeWithReason(gvr, confirmRetractSchemaRelist) // R6 per-GVR teardown; idempotent, nil-safe
-		_, syncCh := rw.EnsureResourceType(gvr)                          // re-register → fresh LIST under current schema
-		Deps().OnResourceTypeSchemaRelisted(gvr)                         // dirty-mark dependent L1 (logs SCHEMA_RELIST, not CRD_DELETE)
-		// 1.12.5 / #187 — RE-FIRE THE DIRTY-MARK AFTER THE NEW INFORMER SYNCS.
-		//
-		// The teardown above opens a window in which DELETEs are lost with no
-		// trace at any log level. RemoveResourceType closes the old informer's
-		// per-GVR stop channel and purges its state, so anything still in its
-		// DeltaFIFO or in flight on its watch is dropped with no handler run.
-		// The replacement informer is freshly constructed, so its knownObjects
-		// indexer is EMPTY — DeltaFIFO.Replace() has nothing to diff against
-		// and synthesises NO Deleted delta for an object that vanished before
-		// the new LIST. The object simply never appears.
-		//
-		// The dirty-mark on the line above does cover entries whose objects
-		// were ALREADY gone: OnResourceTypeSchemaRelisted walks the forward dep
-		// index, not the indexer, so an absent object is still matched. But it
-		// runs ONCE, at the START of the window. An entry dirty-marked at that
-		// instant re-resolves SUCCESSFULLY (its object still exists), survives,
-		// and is then stranded when the delete lands a moment later with no
-		// future trigger of any kind. That is the #187 burst shape exactly:
-		// relist at ~09:21, deletes 09:21-09:24.
-		//
-		// Re-firing the same dirty-mark once the new informer has synced closes
-		// it. Every stranded entry is re-resolved, its own object 404s, and the
-		// drop-point eviction removes it. Deliberately reuses the existing
-		// dirty-mark rather than adding a store walk: no RangeMetadata, no
-		// lock-order hazard between the store mutex and rw.mu, no new
-		// invalidation semantics. The pre-sync fire is KEPT — both run, and the
-		// dirty-mark is idempotent.
-		//
-		// Off the discovery worker goroutine: the relist runs on the single
-		// CRD-lifecycle worker, so blocking it on a sync channel would stall
-		// every other CRD event. Bounded by a timeout so a GVR that never syncs
-		// cannot leak the goroutine for the process lifetime.
-		//
-		// WORTHLESS WITHOUT THE SELF-404 EVICTION. On its own this just re-runs
-		// the five-requeue drop. It is the delivery half; the eviction is the
-		// other half.
-		// Accounted on workerWG so the bridge's stop path WAITS for it. The
-		// goroutine touches the Deps() singleton after it wakes, and an
-		// untracked goroutine outliving its bridge would read that singleton
-		// while a teardown is replacing it.
-		// The tracker handle is captured HERE, on the worker goroutine, not
-		// read from the Deps() singleton after the wait. The goroutine
-		// outlives this call by design, and a later read of the global would
-		// race anything that replaces the singleton (test teardown does
-		// exactly that). Capturing also makes the goroutine's dependency
-		// explicit rather than ambient.
-		c.workerWG.Add(1)
-		go c.refireRelistDirtyMarkAfterSync(Deps(), gvr, syncCh)
-		// 1.12.6 C2 — the delta bridge (relist_bridge.go). ADDITIVE to the
-		// re-fire above (PM condition C10): the re-fire stays until the bridge
-		// has soaked with relist_bridge_timeout_total at zero. Same goroutine
-		// discipline: off the discovery worker, on workerWG, bounded wait.
-		// The dep-event bridge handle is captured HERE, on the worker
-		// goroutine, for the same reason Deps() is captured above: the
-		// goroutine outlives this call and must not read a process singleton
-		// after its wait (depEventHandlers captures it the same way).
-		if had {
-			c.workerWG.Add(1)
-			go c.bridgeRelistDeletes(rw, depWatchSingleton(), gvr, before, syncCh)
 		}
 		relisted++
 	}
@@ -791,6 +725,142 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 				"pre-change indexer (followup-crd-schema-widen-informer-relist)."),
 		)
 	}
+}
+
+// relistGVRForRepair tears one GVR's informer down and re-registers it, so the
+// replacement's fresh snapshot Replace()s the store and processDeltas repairs
+// the indexer AND fires the handlers from it.
+//
+// EXTRACTED VERBATIM from triggerCRDSchemaRelist's per-GVR loop body (#237
+// deliverable B). The CRD-fingerprint logic stays where it was and remains one
+// of the two callers; the other is the store-repair queue (store_repair.go).
+// A move, not a rewrite: every goroutine, every guard and every comment below
+// was already running in production on the schema-relist path.
+//
+// WHY THIS IS THE REPAIR VERB, when two cheaper-looking ones were rejected:
+//
+//   - Indexer.Update (write the fresh object straight into the store) has NO
+//     compare-and-swap. We would GET the object and then write it, and a real
+//     watch UPDATE landing in that window is silently clobbered by our older
+//     fetch — MANUFACTURING the exact defect class we are detecting. The
+//     mutex that makes processDeltas atomic against this (blockDeltas) is
+//     private. It also bypasses processDeltas entirely, so no handler fires
+//     and L1 keeps the stale rendering.
+//
+//   - Injecting a synthetic watch.Modified goes through the real path, but
+//     handleAnyWatch calls setLastSyncResourceVersion on EVERY event it
+//     processes. The injected object's RV comes from our own apiserver read
+//     and is typically far ahead of the watch position, so it would advance
+//     that position past every event for the GVR in between. On the plain
+//     re-watch path — which resumes from LastSyncResourceVersion and is a
+//     DELTA watch — that is an undetected multi-object event gap traded for
+//     one detected stale object. Strictly worse, and self-inflicted.
+//
+// THE COST, stated because it is the largest in deliverable B:
+// removeResourceTypeWithReason retracts the GVR's confirmation, so it is NOT
+// SERVABLE for the whole rebuild window and every resolve for it falls through
+// to the apiserver — minutes at 50K. That is the right trade for a CONFIRMED
+// divergence (slow-and-correct replacing fast-and-wrong) and an unacceptable
+// one to pay speculatively, which is what the bounds in store_repair.go exist
+// for. It is also why repairs are globally serialised: unserialised, a
+// correlated divergence would take N GVRs non-servable at once and send the
+// whole portal to the apiserver — the pre-cache regime plus a self-inflicted
+// thundering herd.
+//
+// retractReason names the teardown in confirm_retracted_by_reason; dirtyMark is
+// the caller's dep-tracker cause so a store repair does not log itself as a
+// SCHEMA_RELIST. Returns false when there was nothing to relist.
+func (c *crdDiscovery) relistGVRForRepair(
+	rw *ResourceWatcher,
+	gvr schema.GroupVersionResource,
+	retractReason string,
+	dirtyMark func(*DepTracker, schema.GroupVersionResource) int,
+) (<-chan struct{}, bool) {
+	if rw == nil {
+		return nil, false
+	}
+	// Only relist a GVR we are actually watching. EnsureResourceType is
+	// registration-idempotent, so an unconditional Ensure would SPAWN an
+	// informer for a never-watched GVR (wrong — lazy registration is the
+	// resolver's job). Gate on current registration via IsRegistered.
+	if !rw.IsRegistered(gvr) {
+		return nil, false
+	}
+	// 1.12.6 C2 — snapshot the OLD indexer's key set BEFORE the teardown
+	// (relist_bridge.go). Read-only; the diff against the fresh LIST runs
+	// on the bridge goroutine spawned below.
+	before, had := rw.IndexerKeys(gvr)
+	rw.removeResourceTypeWithReason(gvr, retractReason) // R6 per-GVR teardown; idempotent, nil-safe
+	_, syncCh := rw.EnsureResourceType(gvr)             // re-register → fresh LIST under current schema
+	dirtyMark(Deps(), gvr)                              // dirty-mark dependent L1 under the CALLER's cause label
+	// 1.12.5 / #187 — RE-FIRE THE DIRTY-MARK AFTER THE NEW INFORMER SYNCS.
+	//
+	// The teardown above opens a window in which DELETEs are lost with no
+	// trace at any log level. RemoveResourceType closes the old informer's
+	// per-GVR stop channel and purges its state, so anything still in its
+	// DeltaFIFO or in flight on its watch is dropped with no handler run.
+	// The replacement informer is freshly constructed, so its knownObjects
+	// indexer is EMPTY — DeltaFIFO.Replace() has nothing to diff against
+	// and synthesises NO Deleted delta for an object that vanished before
+	// the new LIST. The object simply never appears.
+	//
+	// The dirty-mark on the line above does cover entries whose objects
+	// were ALREADY gone: OnResourceTypeSchemaRelisted walks the forward dep
+	// index, not the indexer, so an absent object is still matched. But it
+	// runs ONCE, at the START of the window. An entry dirty-marked at that
+	// instant re-resolves SUCCESSFULLY (its object still exists), survives,
+	// and is then stranded when the delete lands a moment later with no
+	// future trigger of any kind. That is the #187 burst shape exactly:
+	// relist at ~09:21, deletes 09:21-09:24.
+	//
+	// Re-firing the same dirty-mark once the new informer has synced closes
+	// it. Every stranded entry is re-resolved, its own object 404s, and the
+	// drop-point eviction removes it. Deliberately reuses the existing
+	// dirty-mark rather than adding a store walk: no RangeMetadata, no
+	// lock-order hazard between the store mutex and rw.mu, no new
+	// invalidation semantics. The pre-sync fire is KEPT — both run, and the
+	// dirty-mark is idempotent.
+	//
+	// Off the discovery worker goroutine: the relist runs on the single
+	// CRD-lifecycle worker, so blocking it on a sync channel would stall
+	// every other CRD event. Bounded by a timeout so a GVR that never syncs
+	// cannot leak the goroutine for the process lifetime.
+	//
+	// WORTHLESS WITHOUT THE SELF-404 EVICTION. On its own this just re-runs
+	// the five-requeue drop. It is the delivery half; the eviction is the
+	// other half.
+	// Accounted on workerWG so the bridge's stop path WAITS for it. The
+	// goroutine touches the Deps() singleton after it wakes, and an
+	// untracked goroutine outliving its bridge would read that singleton
+	// while a teardown is replacing it.
+	// The tracker handle is captured HERE, on the worker goroutine, not
+	// read from the Deps() singleton after the wait. The goroutine
+	// outlives this call by design, and a later read of the global would
+	// race anything that replaces the singleton (test teardown does
+	// exactly that). Capturing also makes the goroutine's dependency
+	// explicit rather than ambient.
+	c.workerWG.Add(1)
+	go c.refireRelistDirtyMarkAfterSync(Deps(), gvr, syncCh)
+	// 1.12.6 C2 — the delta bridge (relist_bridge.go). ADDITIVE to the
+	// re-fire above (PM condition C10): the re-fire stays until the bridge
+	// has soaked with relist_bridge_timeout_total at zero. Same goroutine
+	// discipline: off the discovery worker, on workerWG, bounded wait.
+	// The dep-event bridge handle is captured HERE, on the worker
+	// goroutine, for the same reason Deps() is captured above: the
+	// goroutine outlives this call and must not read a process singleton
+	// after its wait (depEventHandlers captures it the same way).
+	if had {
+		c.workerWG.Add(1)
+		go c.bridgeRelistDeletes(rw, depWatchSingleton(), gvr, before, syncCh)
+	}
+	// The replacement informer's sync channel is returned so the CALLER can
+	// wait for the rebuild. The CRD caller does not (it is on the single
+	// discovery worker and must not block it); the store-repair worker DOES, and
+	// that wait is what makes global serialisation mean what it claims. Without
+	// it only the teardown CALLS would be serialised, while the rebuild WINDOWS
+	// overlapped freely -- and it is the window, not the call, during which a
+	// GVR is non-servable and its resolves fall through to the apiserver.
+	return syncCh, true
 }
 
 // pruneUnservedGVRs tears down the per-GVR state of every registered GVR that
