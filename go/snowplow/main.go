@@ -633,6 +633,17 @@ func main() {
 					// within ~TTL/2 instead of TTL). Cache-off / period 0 is
 					// a no-op inside the Start fn. Process-lifetime cacheCtx.
 					cache.StartDepsReconcile(cacheCtx)
+					// #237 B — store verification. The reconcile audit above
+					// compares L1 against the informer indexer, i.e. against
+					// the layer under suspicion, and acts only on ABSENCE: a
+					// present-but-stale object is skipped before any field is
+					// compared, which is why the #237 capture read divergent:0
+					// with the defect active. This compares the INDEXER
+					// against the authoritative object set — on every snapshot
+					// for free, and on a deadline for GVRs whose watch only
+					// ever recycles and therefore never snapshot. Cache-off is
+					// a no-op inside the Start fn. Process-lifetime cacheCtx.
+					cache.StartStoreVerification(cacheCtx)
 					// Ship #91 / 0.30.211 — Lever C async invalidator worker.
 					// Bounded queue, drop-on-full. Receives raKey enqueues
 					// from the deps refresh hook for stuck-false memo

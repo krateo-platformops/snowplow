@@ -37,4 +37,5 @@ func RegisterExpvarForTest() {
 	registerCRDDiscoveryExpvar()
 	registerInformerWatchExpvar()
 	registerReflectorPathExpvar()
+	registerStoreVerificationExpvar()
 }

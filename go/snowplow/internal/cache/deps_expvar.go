@@ -103,6 +103,22 @@ func DepsStatsByStat() map[string]int64 {
 		"records":      d.TotalRecords,
 		"max_records":  d.MaxRecords,
 		"record_total": int64(d.RecordTotal),
+		// #239 — DISTINCT dependency coordinates, counted rather than derived.
+		// `records` counts EDGES; this counts the (GVR, namespace, name)
+		// tuples they point at. The ratio records/coordinates is the
+		// dirty-mark fan-out multiplier, which #239 measured at ~250 per
+		// object event and derived a coordinate count of ~364 from — derived,
+		// never measured, which is why the scaling conclusion (fan-out grows
+		// linearly with cohort count, because coordinates are cluster-scoped
+		// while L1 entries are cohort-scoped) had no falsifier. This is that
+		// falsifier: coordinates flat while records grows with cohorts
+		// confirms it; coordinates growing with cohorts kills it.
+		//
+		// NOT a health signal and its zero is not a health reading — zero
+		// coordinates with zero records is simply an empty tracker. Read the
+		// pair, and read it against dropped_cap (see deps.go on the empty-
+		// bucket over-read when the record cap is hit).
+		"coordinates": d.Coordinates,
 		// dropped_cap > 0 means new dep edges are being SILENTLY dropped:
 		// entries become dirty-markable-but-not-evictable, which is the
 		// #187 H4 shape. Alert on it.
