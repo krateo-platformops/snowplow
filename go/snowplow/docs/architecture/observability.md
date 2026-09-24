@@ -97,6 +97,11 @@ The exceptions, **registered unconditionally** in `main.go`'s HTTP bootstrap so
 a bench probe gets `0` rather than a missing-key error under cache-off:
 
 - `snowplow_rbac_publish_seq` — `cache.RegisterRBACSnapshotExpvar()`
+- `snowplow_rbac_subgen_bumps_total`, `snowplow_rbac_subgen_subjects_tracked` —
+  `cache.RegisterRBACSubGenExpvar()`
+- `snowplow_rbac_binding_noop_updates_total`,
+  `snowplow_rbac_binding_semantic_noop_updates_total` —
+  `cache.RegisterRBACBindingNoopExpvar()`
 - `snowplow_authz_memo_*` — `rbac.RegisterAuthzMemoExpvar()`
 
 ---
@@ -250,6 +255,10 @@ change. No arm pins it (see the matrix); alert on the rule.
 | expvar | meaning | healthy range |
 |---|---|---|
 | `snowplow_rbac_publish_seq` (`internal/cache/rbac_snapshot_expvar.go`) | `uint64` — incremented once per successful RBAC-snapshot publish (also the point per-subject sub-generation bumps land) | bumps within ~30s of a RoleBinding ADD/DELETE; `0` = no snapshot published (cache-off or pre-readiness) |
+| `snowplow_rbac_subgen_bumps_total` (`internal/cache/rbac_subgen_expvar.go`) | `uint64` — cumulative PER-SUBJECT sub-generation bumps (one per subject per bump, so a publish flushing 40 subjects adds 40). This, not `publish_seq`, is the rate at which identity-bound L1 keys rotate | rises with RBAC churn; `0` = no identity-bound key has ever rotated for an RBAC reason. The key is always present, so `0` never means "not instrumented" |
+| `snowplow_rbac_subgen_subjects_tracked` (`internal/cache/rbac_subgen_expvar.go`) | `uint64` — distinct subjects that have a sub-generation counter; the blast-radius denominator for `bumps_total`. **HIGH-WATER MARK, NOT A RATE** — entries are never removed, so it ratchets up then saturates | read the RATIO, never a delta: `bumps_total` high with `subjects_tracked` low = churn concentrated on a few subjects (one tenant); both high = fleet-wide rotation. A **flat line means saturation, not quiet** — it reads the same healthy and broken |
+| `snowplow_rbac_binding_noop_updates_total` (`internal/cache/rbac_binding_noop_counters.go`) | `uint64` — (Cluster)RoleBinding UPDATE events redelivering the SAME per-object `resourceVersion`. `onBindingUpdate` bumps every subject on every UPDATE with no old/new comparison, and a watch re-establishment dispatches a Sync delta as `OnUpdate(old,new)` with old == new, so this isolates RELIST FAN-OUT | rising in steps of roughly the binding count = watch churn; correlate with `snowplow_rbac_subgen_bumps_total`. **A zero means "no relists", NOT "no wasted rotation"** — a label/annotation write changes the RV and passes straight through. Both no-op counters are **UPDATE-only and structurally blind to creates/deletes** (`onBindingAdd`/`onBindingDelete` bump unconditionally; an ADD has no old side), so on a cluster whose binding count never grows they say nothing about a create-dominated production workload |
+| `snowplow_rbac_binding_semantic_noop_updates_total` (`internal/cache/rbac_binding_noop_counters.go`) | `uint64` — UPDATE events whose subject set (order-insensitive) and roleRef were both unchanged, at any `resourceVersion`. A strict SUPERSET of the key above | **the difference between the two is the number that matters**: it is the count of updates that genuinely rewrote the object but touched nothing RBAC-relevant (label/annotation churn). ~0 difference ⇒ a fix may key on `resourceVersion`; large ⇒ it must key on semantics |
 | `snowplow_authz_memo_hits` / `_misses` / `_swaps` / `_refused` / `_entries` (`internal/rbac/snapshot_authz_memo.go` via `RegisterAuthzMemoExpvar`) | memo hit/miss, generation shard swaps, cap-breach refusals, live entry count | hit rate ≥0.85 warm; swaps bump on snapshot generation change; refused low |
 | `snowplow_authz_memo_deny_uncached_total` | `uint64` — denies (never cached, by design) | informational; should be > 0 and rising on a live cluster — a flat 0 with denied traffic would suggest the PERMITS-only rule regressed |
 

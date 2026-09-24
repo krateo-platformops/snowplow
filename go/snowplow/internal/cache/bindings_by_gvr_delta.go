@@ -152,17 +152,30 @@ func onBindingAdd(obj interface{}) {
 // binding, enrol the NEW. The informer hands old,new (we wire UpdateFunc
 // to pass both — see rbacSnapshotEventHandlers). A subject-list edit or a
 // roleRef change both flow through unrol(old)+enrol(new).
+//
+// #247 INSTRUMENT (no behaviour change): the bumps below fire unconditionally,
+// with NO old-vs-new comparison — so every UPDATE rotates the cache key for
+// every subject of the binding, including an UPDATE that changed nothing. That
+// includes the Sync deltas a watch re-establishment dispatches as OnUpdate with
+// old == new. Each branch therefore also records what it normalised into a
+// bindingUpdateSide, and recordBindingUpdateNoop classifies the event ONCE at
+// the end. It only counts; skipping a bump is a separate, gated change.
 func onBindingUpdate(oldObj, newObj interface{}) {
 	idx := bindingsByGVRSingleton()
 	if !idx.deltaActive() {
 		return
 	}
+	var oldSide, newSide bindingUpdateSide
 	if o, ok := asCRB(oldObj); ok {
+		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
-		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects)) // #118 (c)-v2 GAP-2 — OLD subjects lost this grant
+		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2 — OLD subjects lost this grant
+		oldSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(oldObj); ok {
+		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
-		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects)) // #118 (c)-v2 GAP-2
+		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2
+		oldSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-old)")
 	}
@@ -170,13 +183,16 @@ func onBindingUpdate(oldObj, newObj interface{}) {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
 		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2 — NEW subjects gained this grant (a subject in BOTH old+new is deduped by the pending set; the key only needs to change once)
+		newSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
 		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2
+		newSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-new)")
 	}
+	recordBindingUpdateNoop(oldSide, newSide)
 }
 
 // onBindingDelete unrols a removed (Cluster)RoleBinding. Unwraps a
