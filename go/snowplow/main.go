@@ -1147,6 +1147,22 @@ func main() {
 	// under cache-off the value remains 0 and the bench's
 	// _wait_rbac_propagation_to_snowplow times out as expected.
 	cache.RegisterRBACSnapshotExpvar()
+	// #247 — register the per-subject RBAC sub-generation counters next to the
+	// global publish-seq above. snowplow_rbac_publish_seq counts snapshot
+	// publishes; the L1 key folds the PER-SUBJECT counters, so publish_seq
+	// cannot say whether a key rotation touched the reading identity or a
+	// disjoint one. Unconditional (cache mode-agnostic) for the same reason the
+	// publish-seq key is: a `0` must read as "no rotation", never as "not
+	// instrumented".
+	cache.RegisterRBACSubGenExpvar()
+	// #247 — the companion pair: how many (Cluster)RoleBinding UPDATE events
+	// rotated keys for nothing. onBindingUpdate bumps every subject on every
+	// UPDATE with no old-vs-new comparison, and a watch re-establishment
+	// redelivers every binding as an OnUpdate, so these two say how much of the
+	// rotation above is relist fan-out (same resourceVersion) versus any change
+	// that touched no subject and no roleRef (the superset). Unconditional for
+	// the same zero-readability reason as the keys above.
+	cache.RegisterRBACBindingNoopExpvar()
 	// Ship L2 (0.30.253) / Task #291 — register the snapshot authz memo
 	// counters (hits/misses/swaps/refused/entries) next to the publish-seq
 	// expvar, BEFORE the mux mount accepts scrapes, so the F1/F5 falsifiers

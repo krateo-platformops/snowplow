@@ -185,6 +185,52 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- cache: per-subject RBAC sub-generation (#247) ---
+	// rbacPublishSeq above is GLOBAL — one bump per snapshot publish, one link
+	// too early on the chain publish -> per-subject bump -> key minted ->
+	// resident excess (each link necessary for the next, sufficient for none;
+	// see internal/cache/rbac_subgen.go). A publish count therefore cannot say
+	// whether any key rotated. bumps_total closes that second link: whether
+	// keys rotate at all, and how fast. subjects_tracked is its one-time blast
+	// radius denominator (12k bumps on 3 subjects vs on 12k subjects are
+	// different systems) — a saturating high-water mark, never a rate.
+	rbacSubGenBumps, err := m.Int64ObservableCounter(
+		"snowplow_rbac_subgen_bumps_total",
+		metric.WithDescription("Cumulative per-subject RBAC sub-generation bumps."),
+	)
+	if err != nil {
+		return err
+	}
+	rbacSubGenSubjects, err := m.Int64ObservableGauge(
+		"snowplow_rbac_subgen_subjects_tracked",
+		metric.WithDescription("Number of distinct subjects with an RBAC sub-generation counter."),
+	)
+	if err != nil {
+		return err
+	}
+
+	// --- cache: binding UPDATE events that rotated keys for nothing (#247) ---
+	// onBindingUpdate bumps every subject on every UPDATE with no old-vs-new
+	// comparison, and a watch re-establishment redelivers every binding as an
+	// OnUpdate. noop (same resourceVersion) isolates that relist fan-out;
+	// semantic_noop (same subjects + roleRef at any RV) is the superset. Their
+	// DIFFERENCE — rewrites that touched nothing RBAC-relevant — is what decides
+	// whether a fix keys on resourceVersion or on semantics.
+	bindingNoopUpdates, err := m.Int64ObservableCounter(
+		"snowplow_rbac_binding_noop_updates_total",
+		metric.WithDescription("Cumulative (Cluster)RoleBinding UPDATE events redelivering the same resourceVersion."),
+	)
+	if err != nil {
+		return err
+	}
+	bindingSemanticNoopUpdates, err := m.Int64ObservableCounter(
+		"snowplow_rbac_binding_semantic_noop_updates_total",
+		metric.WithDescription("Cumulative (Cluster)RoleBinding UPDATE events with unchanged subjects and roleRef."),
+	)
+	if err != nil {
+		return err
+	}
+
 	// --- cache: registered GVR count ---
 	registeredGVRs, err := m.Int64ObservableGauge(
 		"snowplow_plurals_registered_gvrs",
@@ -527,6 +573,10 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(assertionViolations, int64(cache.AssertionViolationsTotal()),
 			metric.WithAttributes(attribute.String("check", "read_paths_scoped")))
 		o.ObserveInt64(rbacPublishSeq, int64(cache.RBACGen()))
+		o.ObserveInt64(rbacSubGenBumps, int64(cache.RBACSubGenBumpsTotal()))
+		o.ObserveInt64(rbacSubGenSubjects, int64(cache.RBACSubGenSubjectsTracked()))
+		o.ObserveInt64(bindingNoopUpdates, int64(cache.RBACBindingNoopUpdatesTotal()))
+		o.ObserveInt64(bindingSemanticNoopUpdates, int64(cache.RBACBindingSemanticNoopUpdatesTotal()))
 
 		// 1.12.6 C7: every tag-derived family, one loop.
 		for _, d := range derived {
@@ -724,6 +774,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		return nil
 	}, append([]metric.Observable{
 		fallthroughTotal, assertionViolations, rbacPublishSeq,
+		rbacSubGenBumps, rbacSubGenSubjects,
+		bindingNoopUpdates, bindingSemanticNoopUpdates,
 		registeredGVRs, prewarmDone, prewarmElapsed,
 		memoHits, memoMisses, memoSwaps, memoRefused, memoDenyUncached, memoEntries,
 		prewarmEngEnqueued, prewarmEngProcessed, prewarmEngYield, prewarmEngPending,

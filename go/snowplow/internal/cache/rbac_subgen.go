@@ -50,14 +50,109 @@ import (
 // map reads as 0 (never granted/revoked yet) — the zero value is correct.
 var rbacSubGen sync.Map // subjectKey -> *atomic.Uint64
 
+// #247 KEY-ROTATION VANTAGE: rbacSubGen is unexported and per-subject, so the
+// only published RBAC counter (snowplow_rbac_publish_seq / RBACGen) is GLOBAL —
+// one bump per snapshot publish, saying nothing about WHOSE key rotated. The two
+// counters below close that hole from the surface the rotation happens on.
+//
+// WHAT NEITHER OF THEM CLOSES — the bound is a CHAIN, and each link can hold
+// while the next one fails:
+//
+//	publish_seq → bumps_total → minting events → resident excess
+//
+// publish_seq does not say whose key rotated. bumps_total does not say whether a
+// rotation ever MINTED anything: a bump on an idle subject rotates that
+// subject's key and mints nothing until traffic next arrives — the cost lands as
+// a cold miss on that user's next request, which no counter here observes.
+// Reading any link as if it were the last one is the error these counters exist
+// to stop, and it is the error the original 40.7% analysis made by reading
+// publish_seq as a rotation rate.
+//
+// The arrows are NECESSITY, NOT an ordering by size — do not rewrite them as
+// `>=`. Each link is required for the next and sufficient for none, so the ZERO
+// propagates forward (no publishes ⇒ no bumps ⇒ no RBAC-caused mints) while a
+// large number propagates forward not at all. The necessity is structural:
+// flushPendingSubGenBumps has exactly one production caller, rebuildRBACSnapshot
+// immediately after rbacSnap.Store (rbac_snapshot.go), and it is the only path
+// to BumpSubjectSubGens. Magnitudes order NEITHER way: one publish flushes the
+// whole accumulated subject set, so bumps_total routinely exceeds publish_seq,
+// while a rebuild whose pending set is empty advances publish_seq alone.
+//
+// NOT an identity-scoped limitation. /debug/apistage is a GLOBAL residency dump
+// — DebugApistage calls RangeMetadata, which walks the whole store with no
+// requester predicate (the body is hash-only because CELLS are per-identity, but
+// the enumeration is not). So a capture cannot hide rotation happening on some
+// other tenant's subjects; it can only fail to show rotation that has not minted
+// yet. An earlier draft of this comment claimed the opposite and was wrong.
+//
+// Both are process-lifetime monotonic and read only by the metrics surfaces;
+// nothing on the /call path reads them, and subGenValue (the hot read side)
+// is untouched.
+var (
+	// rbacSubGenBumps counts CUMULATIVE per-subject sub-generation bumps —
+	// one per (subject, bump) pair, so a publish flushing 40 subjects adds 40.
+	// Answers "is the key rotating at all, and how fast".
+	rbacSubGenBumps atomic.Uint64
+
+	// rbacSubGenSubjects counts DISTINCT subjects that have ever had a
+	// counter created, i.e. the size of rbacSubGen. Answers "over how wide a
+	// blast radius". rbacSubGenBumps alone cannot tell 12,000 bumps on 3
+	// subjects (a hot loop on one tenant) from 12,000 bumps on 12,000
+	// subjects (a fleet-wide rotation) — and that shape is exactly what the
+	// per-subject design exists to bound.
+	//
+	// HIGH-WATER MARK, NOT A RATE. subGenCounterFor LoadOrStores an entry that
+	// is NEVER removed, so this only ever ratchets up and then SATURATES: once
+	// the first broad storm has touched the subject population, the delta over
+	// any window is ~0 forever — in a healthy cluster and a sick one alike. Do
+	// not chart it as a rate and do not read a flat line as "quiet"; a flat
+	// line is the expected steady state. Its meaning is the one-time
+	// denominator for rbacSubGenBumps, nothing more.
+	rbacSubGenSubjects atomic.Uint64
+)
+
+// RBACSubGenBumpsTotal returns the cumulative count of per-subject
+// sub-generation bumps since process start. Monotonic.
+//
+// READING THE ZERO: 0 means no subject's sub-generation has ever moved — no
+// identity-bound L1 key has rotated for an RBAC reason. That reading is only
+// admissible because a LIVENESS arm has shown the counter can move through the
+// production path: TestBindingNoopCounters_BumpsStillFireOnEveryNoop drives the
+// real onBindingUpdate hook, flushes the pending set, and fails if this stays
+// 0. Without such an arm a zero would mean "not looking", not "not rotating" —
+// and the other two counters in this workstream do NOT yet have one (see
+// rbacSubGenSubjects here, and bindingNoopUpdates in
+// rbac_binding_noop_counters.go).
+func RBACSubGenBumpsTotal() uint64 { return rbacSubGenBumps.Load() }
+
+// RBACSubGenSubjectsTracked returns the number of DISTINCT subjects that have a
+// sub-generation counter — the blast radius denominator for
+// RBACSubGenBumpsTotal.
+//
+// READING THE ZERO — AND THE FLAT LINE: monotone and SATURATING, because
+// counters are never removed (see rbacSubGenSubjects). 0 means no subject has
+// ever been touched; a value that stops moving means the subject population has
+// been covered, NOT that RBAC went quiet. Healthy and broken read the same here
+// over any window after the first storm, so never derive a rate from it —
+// rbacSubGenBumps is the rate, this is its denominator.
+func RBACSubGenSubjectsTracked() uint64 { return rbacSubGenSubjects.Load() }
+
 // subGenCounterFor returns the (creating if absent) atomic counter for subj.
 // LoadOrStore is the single amortized-O(1) map op; the returned pointer is
 // stable for the process lifetime so a bump and a concurrent read share it.
+//
+// The distinct-subject counter is incremented ONLY on the branch that genuinely
+// stored: the Load fast path above never creates an entry, and LoadOrStore's
+// loaded=true means a concurrent racer won the store for this subject — counting
+// either would over-report the blast radius.
 func subGenCounterFor(subj subjectKey) *atomic.Uint64 {
 	if v, ok := rbacSubGen.Load(subj); ok {
 		return v.(*atomic.Uint64)
 	}
-	v, _ := rbacSubGen.LoadOrStore(subj, new(atomic.Uint64))
+	v, loaded := rbacSubGen.LoadOrStore(subj, new(atomic.Uint64))
+	if !loaded {
+		rbacSubGenSubjects.Add(1)
+	}
 	return v.(*atomic.Uint64)
 }
 
@@ -75,6 +170,10 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 	for _, s := range subjects {
 		subGenCounterFor(s).Add(1)
 	}
+	// One atomic add for the whole batch, not one per element — the counter is
+	// a cumulative total, so len(subjects) is the exact delta. Sequenced AFTER
+	// the loop so the published total never claims work that has not landed.
+	rbacSubGenBumps.Add(uint64(len(subjects)))
 }
 
 // RBACSubGenForSubject returns the requesting identity's EFFECTIVE RBAC
@@ -153,11 +252,19 @@ func parseServiceAccountUsername(username string) (namespace, name string, ok bo
 	return ns, nm, true
 }
 
-// ResetRBACSubGenForTest clears all per-subject counters. TEST-ONLY — production
-// never resets (the counters are monotonic for the process lifetime).
+// ResetRBACSubGenForTest clears all per-subject counters AND the two published
+// observability counters. TEST-ONLY — production never resets (the counters are
+// monotonic for the process lifetime).
+//
+// The observability counters are reset HERE rather than behind a separate
+// helper: rbacSubGenSubjects is defined as "distinct subjects that have a
+// counter", so emptying the map without zeroing it would leave the published
+// gauge permanently over-reporting for every later test in the package.
 func ResetRBACSubGenForTest() {
 	rbacSubGen.Range(func(k, _ any) bool {
 		rbacSubGen.Delete(k)
 		return true
 	})
+	rbacSubGenBumps.Store(0)
+	rbacSubGenSubjects.Store(0)
 }
