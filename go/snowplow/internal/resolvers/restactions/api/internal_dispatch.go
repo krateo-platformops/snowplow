@@ -85,12 +85,20 @@
 //   shape (no internal config, non-GET verb, external/subresource path)
 //   falls through to the unchanged httpcall.Do path.
 //
-//   BEHAVIOR-NEUTRAL: ordinary per-user requests NEVER set
-//   cache.WithInternalRESTConfig, so dispatchViaInternalRESTConfig
-//   immediately returns served=false for them and the path is byte-
-//   identical to pre-0.30.104. The mechanism is keyed only on context
-//   state — uniform across GVRs, no per-resource carve-out
-//   (feedback_no_special_cases.md).
+//   KEYED ON CONTEXT STATE: the mechanism is uniform across GVRs, no
+//   per-resource carve-out (feedback_no_special_cases.md).
+//
+//   AUTHORIZATION (fix/sa-config-fallthrough-rbac-regate): ordinary
+//   per-user in-cluster requests DO carry cache.WithInternalRESTConfig —
+//   dispatchers/restactions.go:262 and dispatchers/widgets.go:273 attach
+//   the SA *rest.Config (r.saRC) to EVERY in-cluster per-user request so
+//   the TLS-CA fix above applies to them too. That means branch C fetches
+//   those per-user GET/LIST calls with the SA client. To avoid serving a
+//   denied per-user read under the SA identity, both serve points below
+//   re-gate the fetched bytes with the SAME per-user RBAC helpers branch B
+//   uses (filterGetByRBAC / filterListByRBAC), EXCEPT for genuine
+//   ServiceAccount / identity-free operations — see
+//   internalDispatchServesUnnarrowed.
 //
 // CRITICAL — this path is validated ON-CLUSTER. Two prior Phase-1-SA
 // fixes (0.30.102 base64, 0.30.103) passed unit tests and failed on the
@@ -114,6 +122,8 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sdynamic "k8s.io/client-go/dynamic"
@@ -207,6 +217,93 @@ func resetInternalClientCacheForTest() {
 	internalClientCache = map[*rest.Config]k8sdynamic.Interface{}
 }
 
+// internalDispatchServesUnnarrowed reports whether branch C may serve the
+// SA-fetched apiserver bytes WITHOUT a per-user RBAC re-gate — i.e. the
+// un-narrowed serve is correct for this ctx because the request is a genuine
+// identity-free / ServiceAccount operation, NOT an end-user per-user read.
+//
+// dispatchers/restactions.go:262 and dispatchers/widgets.go:273 attach the
+// SA *rest.Config to EVERY in-cluster per-user request (for the TLS-CA
+// reason in this file's header), so branch C fetches per-user GET/LIST under
+// the SA client. Without a re-gate a denied per-user read would be served
+// under the SA identity (the leak this predicate + the serve-point gates
+// close). It returns TRUE (serve un-narrowed) iff ANY of:
+//
+//	(a) a serve-watcher is on the ctx (cache.WithServeWatcher) — the Phase-1
+//	    SA walk / cohort seed / content-prewarm. These run under the SA
+//	    identity and legitimately read the full cluster set.
+//	(b) the ctx is marked an api-stage CONTENT resolve
+//	    (cache.WithApistageContentResolve) — an identity-free content-cell
+//	    populate whose per-user gate runs later at the stage loop's single
+//	    gate site; narrowing here would poison an identity-free content
+//	    entry with one user's view.
+//	(c) no UserInfo on the ctx (xcontext.UserInfo error) — a truly
+//	    identity-free populate (e.g. cluster_list async). No subject exists
+//	    to narrow against; the shared substrate is populated un-narrowed and
+//	    the per-user gate runs on read.
+//	(d) UserInfo present AND its Username is a canonical ServiceAccount
+//	    (system:serviceaccount:<ns>:<name>) — the refresher's identity-free
+//	    path carries the SA identity rather than an end-user subject.
+//
+// CRITICAL (RC2): a group-only end-user (empty Username, NON-empty Groups)
+// is a REAL end-user and is NOT exempt. Clause (c) does not fire (UserInfo
+// is PRESENT — an empty Username is a valid value, not a lookup error) and
+// clause (d) does not fire (an empty Username is not a canonical SA). It
+// falls through to narrowing. Exempting on Username=="" would re-open the
+// leak for group-only identities.
+func internalDispatchServesUnnarrowed(ctx context.Context) bool {
+	// (a) Phase-1 walk / cohort seed / content-prewarm.
+	if _, ok := cache.ServeWatcherFromContext(ctx); ok {
+		return true
+	}
+	// (b) api-stage content-cell populate.
+	if cache.ApistageContentResolveFromContext(ctx) {
+		return true
+	}
+	// (c) identity-free populate — no subject to narrow against.
+	user, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return true
+	}
+	// (d) canonical ServiceAccount identity. Reuse the rbac package's
+	// canonical SA-username parser — never hand-roll the
+	// "system:serviceaccount:" prefix test.
+	if rbac.IsServiceAccountUsername(user.Username) {
+		return true
+	}
+	// A group-only user (empty Username, non-empty Groups) reaches here and
+	// IS narrowed — it is a real end-user (RC2).
+	return false
+}
+
+// internalDispatchRBACSnapshotUnpublished reports whether the RBAC snapshot
+// the narrowing helpers consult has NOT been published yet — the one clean
+// "cannot evaluate yet" signal cache exposes (cache.Global()==nil or
+// cache.LiveRBACSnapshot()==nil, i.e. pre-readiness). It is consulted ONLY
+// on a narrowing DENY: when a deny COINCIDES with an unpublished snapshot the
+// dispatcher falls through (nil,false,nil) instead of serving/storing a
+// spurious Forbidden (GET) or an empty LIST, either of which would
+// re-populate a warm cell empty for the refresher's per-cohort
+// Representative identity (the RC1 residual).
+//
+// RESIDUAL (documented, deliberately NOT guarded — no clean signal exists):
+// a MID-REBUILD transient incoherence, where rbacSnap holds a non-nil but
+// momentarily-incoherent snapshot during a whole-shard swap, is NOT exposed
+// by any per-call signal and is NOT covered here. EvaluateRBAC already
+// declines to CACHE a deny for exactly this reason (evaluate.go — "NEVER
+// cache a deny"), so a transient wrong-deny self-heals on the next refresh
+// cycle rather than pinning. Inventing a per-call incoherence signal was out
+// of scope (do-not-guess); flagged for a follow-up.
+func internalDispatchRBACSnapshotUnpublished() bool {
+	if cache.Disabled() {
+		// cache=off narrows via a live SelfSubjectAccessReview against the
+		// apiserver — a real per-user answer, no snapshot. The guard does
+		// not apply.
+		return false
+	}
+	return cache.Global() == nil || cache.LiveRBACSnapshot() == nil
+}
+
 // dispatchViaInternalRESTConfig attempts to serve `call` through a
 // client-go dynamic client built from the context-carried internal
 // *rest.Config (cache.WithInternalRESTConfig). It is the api-stage
@@ -218,8 +315,9 @@ func resetInternalClientCacheForTest() {
 // informer-pivot branch. Returns (nil, false, nil) for every gate that
 // must take the unchanged httpcall.Do path:
 //
-//   - no internal *rest.Config on the context (every ordinary per-user
-//     request — the behavior-neutral invariant);
+//   - no internal *rest.Config on the context (an OUT-of-cluster request —
+//     dev / unit test — where r.saRC is nil so nothing is attached; note
+//     in-cluster per-user requests DO carry it, see the header);
 //   - the context value is the wrong type / a nil pointer;
 //   - non-GET verb (POST/PUT/PATCH/DELETE — client-go dynamic Get/List
 //     here is read-only; writes are not a Phase-1 shape and stay on the
@@ -229,20 +327,29 @@ func resetInternalClientCacheForTest() {
 //   - a subresource path (.../status, .../scale, ...) — no dynamic-Get
 //     shape, same gate as the informer pivot.
 //
-// Returns (nil, false, err) ONLY when the apiserver call itself errored
-// after the dispatcher committed to serving (client build failed, or the
-// Get/List returned a non-recoverable error). resolve.go treats a non-nil
-// err here exactly as it treats an httpcall.Do StatusFailure — it does
-// NOT silently fall through to httpcall.Do, because that would just
-// re-hit the same broken plumbing TLS path. Surfacing the error keeps
-// the failure diagnosable (it is the real apiserver error, e.g. a 403 or
-// a genuine connectivity fault) rather than masking it behind a second
-// x509 error.
+// Returns (nil, false, err) when the apiserver call itself errored after
+// the dispatcher committed to serving (client build failed, or the Get/List
+// returned a non-recoverable error), OR when a per-user GET is DENIED by the
+// RBAC re-gate (err is an apierrors.NewForbidden — a denied per-user read is
+// no longer served under the SA identity). resolve.go treats a non-nil err
+// here exactly as it treats an httpcall.Do StatusFailure — it does NOT
+// silently fall through to httpcall.Do, because that would just re-hit the
+// same broken plumbing TLS path. Surfacing the error keeps the failure
+// diagnosable (the real apiserver error, e.g. a 403 or a genuine
+// connectivity fault) rather than masking it behind a second x509 error.
+//
+// Returns (nil, false, nil) — fall through to httpcall.Do — additionally
+// when the RBAC re-gate DENIES but the RBAC snapshot is not yet published
+// (the RC1 guard, internalDispatchRBACSnapshotUnpublished): the per-user
+// apiserver path then answers rather than a spurious empty/forbidden serve.
 //
 // On the served path the LIST output is wrapped in the apiserver LIST
-// envelope (apiVersion/kind/items) and a GET-by-name returns the bare
-// object — byte-equivalent to what httpcall.Do would have delivered, so
-// the downstream JQ pipeline is invariant (feedback_cache_must_not_constrain_jq.md).
+// envelope (apiVersion/kind/items), narrowed to the ctx identity's
+// authorized subset unless the request is a genuine SA / identity-free
+// operation (internalDispatchServesUnnarrowed); a GET-by-name returns the
+// bare object. The bytes are byte-equivalent to what httpcall.Do would have
+// delivered for an authorized read, so the downstream JQ pipeline is
+// invariant (feedback_cache_must_not_constrain_jq.md).
 func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, error) {
 	// Gate 1: internal *rest.Config present? Absent => ordinary per-user
 	// request => behavior-neutral fall-through to httpcall.Do.
@@ -286,6 +393,15 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		return nil, false, nil
 	}
 
+	// Per-user RBAC re-gate decision (defensive authorization). The SA
+	// *rest.Config is attached to every in-cluster per-user request, so
+	// branch C fetches per-user reads under the SA client; unless this is a
+	// genuine SA / identity-free operation, the fetched bytes MUST be
+	// re-gated with the ctx identity at both serve points below (mirrors the
+	// branch-B informer gate). Computed once here; the two serve points
+	// (GET-by-name, LIST) consult it.
+	serveUnnarrowed := internalDispatchServesUnnarrowed(ctx)
+
 	cli, err := internalClientFor(rc)
 	if err != nil {
 		return nil, false, err
@@ -305,6 +421,25 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		obj, getErr := nri.Get(ctx, name, metav1.GetOptions{})
 		if getErr != nil {
 			return nil, false, getErr
+		}
+		// Per-user RBAC re-gate on the GET-by-name (defensive authorization).
+		// obj is already the *unstructured.Unstructured client-go decoded;
+		// filterGetByRBAC evaluates `get` for the ctx identity against the
+		// object's own namespace/name — the SAME helper branch B uses.
+		if !serveUnnarrowed && !filterGetByRBAC(ctx, gvr, obj) {
+			if internalDispatchRBACSnapshotUnpublished() {
+				// RC1 guard: the deny coincides with an unpublished RBAC
+				// snapshot — fall through to the per-user apiserver path
+				// rather than forbid, so a mid-rebuild refresher does not
+				// overwrite a warm cell with a spurious 403.
+				return nil, false, nil
+			}
+			// Denied per-user GET → forbidden per-item error (resolve.go
+			// records it as an internal-rest-config-error, honouring
+			// ContinueOnError). This is the leak fix: a denied per-user read
+			// is no longer served under the SA identity.
+			return nil, false, apierrors.NewForbidden(gvr.GroupResource(), name,
+				fmt.Errorf("user not authorized to get %s/%s", namespace, name))
 		}
 		raw, mErr := json.Marshal(obj.Object)
 		if mErr != nil {
@@ -556,6 +691,40 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		slog.Int64("total_ms", time.Since(listStart).Milliseconds()),
 		slog.String("note", "Task #268 / 0.30.250 — paged LIST walk replaces unpaginated nri.List"),
 	)
+
+	// Per-user RBAC re-gate on the LIST (defensive authorization). See the
+	// GET branch above: branch C reads under the SA client, so an un-narrowed
+	// LIST would serve every namespace's items to a denied per-user caller.
+	// DEFAULT POSTURE on a full deny: a served-EMPTY `items` list, byte-
+	// consistent with the informer path (filterListByRBAC returns an empty
+	// subset, not a fall-through). The informer-serve early return above is
+	// unreachable for a per-user request (it is gated on a serve-watcher,
+	// which is itself clause (a) of serveUnnarrowed), so this is the single
+	// narrowing site for a live-LIST branch-C serve.
+	if !serveUnnarrowed {
+		if internalDispatchRBACSnapshotUnpublished() {
+			// RC1 guard: cannot evaluate under an unpublished snapshot — fall
+			// through to the per-user apiserver path rather than serve/store
+			// an empty LIST that would re-populate a warm cell empty.
+			return nil, false, nil
+		}
+		items := make([]*unstructured.Unstructured, len(resultList.Items))
+		for i := range resultList.Items {
+			items[i] = &resultList.Items[i]
+		}
+		filtered, servedOK := filterListByRBAC(ctx, gvr, items)
+		if !servedOK {
+			// filterListByRBAC's no-identity contract (fall-through, not
+			// serve). Unreachable here — clause (c) already exempts a
+			// no-identity ctx before we narrow — but honour it defensively.
+			return nil, false, nil
+		}
+		narrowed := make([]unstructured.Unstructured, len(filtered))
+		for i, p := range filtered {
+			narrowed[i] = *p
+		}
+		resultList.Items = narrowed
+	}
 
 	// CRITICAL — marshal resultList.UnstructuredContent(), NOT
 	// resultList.Object. UnstructuredContent() shallow-copies the

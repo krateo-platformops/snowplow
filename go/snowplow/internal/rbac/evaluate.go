@@ -784,6 +784,17 @@ func parseServiceAccountUsername(u string) (string, string, bool) {
 	return parts[0], parts[1], true
 }
 
+// IsServiceAccountUsername reports whether u is a canonical Kubernetes
+// ServiceAccount username of the form "system:serviceaccount:<ns>:<name>".
+// It is the boolean projection of parseServiceAccountUsername — the single
+// source of truth for the SA-identity prefix test — so callers outside this
+// package (e.g. the internal-REST-config dispatcher's serve-un-narrowed
+// predicate) never hand-roll the "system:serviceaccount:" prefix check.
+func IsServiceAccountUsername(u string) bool {
+	_, _, ok := parseServiceAccountUsername(u)
+	return ok
+}
+
 // asClusterRoleBinding extracts a *rbacv1.ClusterRoleBinding from an
 // indexer object. Happy path: the indexer already holds a typed
 // pointer (cache/strip.go stripAndTypeClusterRoleBinding ran at the

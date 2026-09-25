@@ -629,7 +629,16 @@ func pdfeResolveInternalRC(t *testing.T, multiYield bool) map[string]any {
 		Filter:    ptr.To(".downstream"),
 	}
 
-	ctx := pdfeResolveCtx(pdfeAdminUser)
+	// The internal-rest-config path IS the SA-credentialed path (the SA
+	// *rest.Config is what makes branch C reachable). Drive it under a
+	// canonical ServiceAccount identity so branch C's per-user RBAC re-gate
+	// (fix/sa-config-fallthrough-rbac-regate) exempts the serve via clause d —
+	// the only per-item failure under test here is the FILTER zero-/multi-yield,
+	// never an RBAC drop. (An end-user identity would be narrowed and, with no
+	// RBAC/SAR grant wired in this hermetic fixture, denied — masking the
+	// feed-error path this Site exercises. The narrowing ALLOW/DENY behaviour
+	// itself is covered by internal_dispatch_sa_regate_test.go.)
+	ctx := pdfeResolveCtx("system:serviceaccount:krateo-system:snowplow")
 	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid"})
 	ctx = cache.WithInternalRESTConfig(ctx, rc)
 	return Resolve(ctx, ResolveOptions{

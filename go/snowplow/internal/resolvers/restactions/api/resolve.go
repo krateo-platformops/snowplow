@@ -895,10 +895,17 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// carries the cluster CA verbatim; client-go's transport
 	// installs it correctly. See internal_dispatch.go.
 	//
-	// BEHAVIOR-NEUTRAL: ordinary per-user requests never set
-	// cache.WithInternalRESTConfig, so dispatchViaInternalRESTConfig
-	// returns served=false for them and this block is a no-op —
-	// the path is byte-identical to pre-0.30.104.
+	// AUTHORIZATION: in-cluster per-user requests DO carry
+	// cache.WithInternalRESTConfig (dispatchers/restactions.go:262,
+	// dispatchers/widgets.go:273 attach the SA *rest.Config to every
+	// in-cluster per-user request for the TLS-CA reason), so branch C
+	// fetches them under the SA client. dispatchViaInternalRESTConfig
+	// re-gates the fetched bytes with the ctx identity at both serve points
+	// (GET-by-name / LIST), exempting only genuine SA / identity-free
+	// operations — a denied per-user read is not served under the SA
+	// identity. OUT-of-cluster requests (dev / unit test) carry no SA config
+	// so dispatchViaInternalRESTConfig returns served=false and this block
+	// is a no-op.
 	//
 	// A non-nil err here is the REAL apiserver error (a 403, a
 	// genuine connectivity fault). We do NOT fall through to
