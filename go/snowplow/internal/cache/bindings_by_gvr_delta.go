@@ -153,13 +153,38 @@ func onBindingAdd(obj interface{}) {
 // to pass both — see rbacSnapshotEventHandlers). A subject-list edit or a
 // roleRef change both flow through unrol(old)+enrol(new).
 //
-// #247 INSTRUMENT (no behaviour change): the bumps below fire unconditionally,
-// with NO old-vs-new comparison — so every UPDATE rotates the cache key for
-// every subject of the binding, including an UPDATE that changed nothing. That
-// includes the Sync deltas a watch re-establishment dispatches as OnUpdate with
-// old == new. Each branch therefore also records what it normalised into a
-// bindingUpdateSide, and recordBindingUpdateNoop classifies the event ONCE at
-// the end. It only counts; skipping a bump is a separate, gated change.
+// #253 FIX — AN UPDATE THAT CHANGED NOTHING RBAC-RELEVANT RECORDS NO BUMP.
+// #247 instrumented this hook because the bumps fired unconditionally, with NO
+// old-vs-new comparison: every UPDATE rotated the L1 key for every subject of
+// the binding, including the Sync deltas a watch re-establishment dispatches as
+// OnUpdate with old == new, and including a bare annotation write. The
+// instrument came back (see rbac_binding_noop_counters.go for the 057 numbers),
+// and the skip below is its inversion — the SAME predicate the semantic-no-op
+// counter classifies on, consulted once per event.
+//
+// WHAT IS AND IS NOT SKIPPED. Only the two recordPendingSubGenBumps calls are
+// conditional. The index delta (applyBindingDelete + applyBindingAdd) runs
+// exactly as before on every event — the binding's bucket membership is derived
+// from the snapshot, which may have moved even when the binding did not — and
+// both no-op counters still increment exactly as before, so the skip's effect
+// stays measurable in production after it ships.
+//
+// WHY THE BUMPS MOVED BELOW THE BRANCHES. The predicate needs BOTH sides, so
+// the calls cannot stay inside the per-side branches. Deferring them costs
+// nothing: recordPendingSubGenBumps only inserts into the pending set and
+// re-arms a rebuild, and the actual bump lands at the next snapshot publish
+// (rbac_subgen_pending.go) — so the union recorded is identical, and it is now
+// recorded with the index already fully consistent rather than mid-delta.
+//
+// A side that failed to normalise contributes nil subjects, so its
+// recordPendingSubGenBumps call returns immediately, exactly as today's missing
+// call did — and an unnormalisable or mixed-kind event is never skipped
+// (bindingUpdateSemanticallyUnchanged returns false), so its normalisable side
+// still bumps. Bump when in doubt: a missed bump is a stale RBAC scope, a
+// spurious one is only waste.
+//
+// onBindingAdd and onBindingDelete are deliberately NOT given this treatment: a
+// create and a delete are real RBAC changes and bump unconditionally.
 func onBindingUpdate(oldObj, newObj interface{}) {
 	idx := bindingsByGVRSingleton()
 	if !idx.deltaActive() {
@@ -169,12 +194,10 @@ func onBindingUpdate(oldObj, newObj interface{}) {
 	if o, ok := asCRB(oldObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2 — OLD subjects lost this grant
 		oldSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(oldObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2
 		oldSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-old)")
@@ -182,15 +205,17 @@ func onBindingUpdate(oldObj, newObj interface{}) {
 	if o, ok := asCRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2 — NEW subjects gained this grant (a subject in BOTH old+new is deduped by the pending set; the key only needs to change once)
 		newSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2
 		newSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-new)")
+	}
+	if !bindingUpdateSemanticallyUnchanged(oldSide, newSide) {
+		recordPendingSubGenBumps(oldSide.subjects) // #118 (c)-v2 GAP-2 — OLD subjects lost this grant
+		recordPendingSubGenBumps(newSide.subjects) // #118 (c)-v2 GAP-2 — NEW subjects gained it (a subject in BOTH is deduped by the pending set; the key only needs to change once)
 	}
 	recordBindingUpdateNoop(oldSide, newSide)
 }

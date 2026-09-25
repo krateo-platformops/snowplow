@@ -18,9 +18,24 @@
 // creation rate. That is a HYPOTHESIS; these counters are what makes it
 // measurable instead of argued.
 //
-// THIS FILE CHANGES NO BEHAVIOUR. Every bump still fires exactly as before,
-// including on both no-op paths. The number comes first; skipping a bump is a
-// separate, gated change.
+// #253 UPDATE — THIS FILE NOW OWNS THE SKIP PREDICATE. The number came first;
+// the number came back, and it decided the shape of the fix. On 057 against
+// 1.12.13, annotating and then un-annotating a RoleBinding whose roleRef points
+// at a Role with `rules: []` (subjects and roleRef untouched throughout) moved
+// rbac_subgen_bumps_total 0 -> 1 -> 2 and
+// rbac_binding_semantic_noop_updates_total 0 -> 1 -> 2, while
+// rbac_binding_noop_updates_total stayed at 0 THROUGHOUT. An annotation write
+// advances the resourceVersion, so a fix keyed on RV equality would have
+// skipped NONE of those bumps — a 100% miss rate for that traffic shape.
+//
+// So bindingUpdateSemanticallyUnchanged (below) keys the skip on the SEMANTIC
+// comparison and never on the resourceVersion. That is measured, not preferred.
+//
+// THE COUNTERS THEMSELVES ARE UNCHANGED by the skip: both still increment on
+// exactly the events they incremented on before, including the same-RV
+// shortcut, so the fix's effect stays measurable after it ships (a healthy
+// deployment now reads semantic_noop_updates_total climbing while
+// rbac_subgen_bumps_total does not).
 //
 // # THE TWO COUNTERS AND WHY NEITHER IS SUFFICIENT ALONE
 //
@@ -163,20 +178,56 @@ func recordBindingUpdateNoop(oldSide, newSide bindingUpdateSide) {
 	}
 
 	// Different RV: the object really was rewritten. Did the rewrite touch
-	// anything the sub-generation bump exists to react to?
-	//
-	// The namespace is compared alongside the roleRef because a "Role" roleRef
-	// is namespace-scoped — the same discrimination roleRefKey makes by folding
-	// the namespace into the key for Role refs. Comparing the RoleRef struct
-	// directly (APIGroup + Kind + Name, all comparable strings) rather than via
-	// roleRefKey is deliberate: roleRefKey collapses every unrecognised Kind to
-	// "", which would make two DIFFERENT malformed roleRefs compare equal and
-	// over-report a no-op.
-	if oldSide.namespace == newSide.namespace &&
-		oldSide.roleRef == newSide.roleRef &&
-		subjectSetsEqual(oldSide.subjects, newSide.subjects) {
+	// anything the sub-generation bump exists to react to? Same predicate the
+	// bump skip uses — one definition, so the counter can never report a
+	// no-op the skip disagrees about.
+	if bindingUpdateSemanticallyUnchanged(oldSide, newSide) {
 		bindingSemanticNoopUpdates.Add(1)
 	}
+}
+
+// bindingUpdateSemanticallyUnchanged reports whether an UPDATE event left both
+// the subject set and the roleRef exactly as they were — i.e. changed nothing
+// the per-subject sub-generation bump exists to react to. #253: this is THE
+// predicate onBindingUpdate consults before recording bumps, and the same one
+// recordBindingUpdateNoop counts on. It is deliberately the whole contract in
+// one place: a skip and a count that could drift apart would make the shipped
+// counter stop describing the shipped behaviour.
+//
+// NOT KEYED ON resourceVersion, BY MEASUREMENT. See the file header: the
+// production shape that motivated the fix (an annotation write) advances the
+// RV, so an RV-keyed skip catches none of it. The same-RV relist case needs no
+// special arm here — redelivering one object version yields identical subjects
+// and roleRef, so it falls out of the semantic comparison on its own. Where the
+// two disagree (equal RVs but differing content: a fabricated or malformed
+// event) this returns false and the bump fires, which is the safe direction.
+//
+// BUMP WHEN IN DOUBT. A missed bump is a stale RBAC scope — a correctness and
+// cross-tenant issue. A spurious bump is only waste. So every uncertain
+// classification returns false:
+//
+//   - either side unnormalisable (kind == "") — there is no old-vs-new
+//     comparison to make, and that side already bumped the drift canary;
+//   - the two sides normalised to DIFFERENT kinds — nothing meaningful to
+//     compare across a CRB and an RB.
+//
+// NEVER A WHOLE-OBJECT COMPARISON. Label and annotation churn is precisely the
+// traffic this skip exists to drop; folding metadata in would defeat the fix.
+//
+// The namespace is compared alongside the roleRef because a "Role" roleRef is
+// namespace-scoped — the same discrimination roleRefKey makes by folding the
+// namespace into the key for Role refs. Comparing the RoleRef struct directly
+// (APIGroup + Kind + Name, all comparable strings) rather than via roleRefKey
+// is deliberate: roleRefKey collapses every unrecognised Kind to "", which
+// would make two DIFFERENT malformed roleRefs compare equal and skip a bump
+// that a real retarget needs.
+func bindingUpdateSemanticallyUnchanged(oldSide, newSide bindingUpdateSide) bool {
+	if oldSide.kind == "" || newSide.kind == "" || oldSide.kind != newSide.kind {
+		return false
+	}
+	return oldSide.namespace == newSide.namespace &&
+		oldSide.roleRef == newSide.roleRef &&
+		subjectSetsEqual(oldSide.subjects, newSide.subjects)
 }
 
 // subjectSetsEqual reports whether two normalised subject lists carry the same

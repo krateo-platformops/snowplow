@@ -17,7 +17,12 @@
 //	either side unnormalisable                0       0
 //
 // The two rows that carry the decision are rows 2-3: if the difference between
-// the counters is large, an RV-keyed fix would miss most of the waste.
+// the counters is large, an RV-keyed fix would miss most of the waste. It was
+// large — on 057 against 1.12.13 the same-RV counter never moved at all while
+// the semantic one tracked every write — so #253 keys the bump skip on the
+// semantic comparison. THIS MATRIX IS UNCHANGED BY THAT FIX: the skip reuses
+// the predicate, it does not alter what either counter counts. The bump-side
+// arms live in rbac_binding_subgen_skip_test.go.
 
 package cache
 
@@ -222,12 +227,17 @@ func TestBindingNoopCounters_ClassificationMatrix(t *testing.T) {
 	}
 }
 
-// TestBindingNoopCounters_BumpsStillFireOnEveryNoop is the no-behaviour-change
-// arm. The brief is explicit that the instrument must not start skipping bumps;
-// a relist no-op must STILL rotate every subject's sub-generation exactly as
-// before, so the number we are about to measure describes today's system and
-// not a system this commit quietly changed.
-func TestBindingNoopCounters_BumpsStillFireOnEveryNoop(t *testing.T) {
+// TestBindingNoopCounters_CountersSurviveTheSkip replaces #247's
+// BumpsStillFireOnEveryNoop arm, which asserted the exact opposite and could
+// not survive #253 — it was the no-behaviour-change guard for an
+// instrument-only commit, and this commit is the behaviour change it was
+// guarding against. The half of its contract that still holds is kept and
+// tightened here: the counters must go on counting every no-op even though the
+// bump no longer fires, because they are what makes the skip's effect
+// observable on a live cluster after it ships. The bump-side assertions it
+// carried are inverted in rbac_binding_subgen_skip_test.go (arms 4 and 5),
+// where the MUST-BUMP directions are pinned alongside them.
+func TestBindingNoopCounters_CountersSurviveTheSkip(t *testing.T) {
 	activateBindingDeltaHooksForTest(t)
 	t.Cleanup(ResetBindingsByGVRIndexForTest)
 
@@ -237,11 +247,17 @@ func TestBindingNoopCounters_BumpsStillFireOnEveryNoop(t *testing.T) {
 	t.Cleanup(ResetRBACSubGenForTest)
 	t.Cleanup(ResetPendingSubGenBumpsForTest)
 
-	crb := noopArmCRB("still-bumps", "100", "role-a", noopArmUser("alice"), noopArmGroup("devs"))
+	crb := noopArmCRB("still-counts", "100", "role-a", noopArmUser("alice"), noopArmGroup("devs"))
 	onBindingUpdate(crb, crb) // the pure relist case
 
 	if got := RBACBindingNoopUpdatesTotal(); got != 1 {
-		t.Fatalf("setup: noop_updates_total = %d; want 1 — this arm must be measuring the no-op path", got)
+		t.Errorf("noop_updates_total = %d; want 1. The #253 skip must not take the COUNTER with it: "+
+			"a counter that stopped moving would make a healthy cluster and an uninstrumented one "+
+			"read identically, and the rate this fix is judged on would be unreadable", got)
+	}
+	if got := RBACBindingSemanticNoopUpdatesTotal(); got != 1 {
+		t.Errorf("semantic_noop_updates_total = %d; want 1 — this is the counter the fix's effect is "+
+			"read from (it climbs while rbac_subgen_bumps_total does not)", got)
 	}
 
 	// The bump is deferred to snapshot-publish (#118 (c)-v2 GAP-2), so the
@@ -249,17 +265,8 @@ func TestBindingNoopCounters_BumpsStillFireOnEveryNoop(t *testing.T) {
 	// rebuildRBACSnapshot does.
 	flushPendingSubGenBumps()
 
-	if got := RBACSubGenBumpsTotal(); got == 0 {
-		t.Error("a relist no-op recorded ZERO sub-generation bumps. This commit is instrument-only: " +
-			"the bump must still fire on the no-op path, or the counters would be measuring a system " +
-			"this change already altered")
-	}
-	if got := subGenValue(subjectKey{Kind: subjectKindUser, Name: "alice"}); got == 0 {
-		t.Error("alice's sub-generation did not move on a no-op UPDATE — the traced behaviour " +
-			"(every UPDATE rotates every subject's key) must be intact for the measurement to mean anything")
-	}
-	if got := subGenValue(subjectKey{Kind: subjectKindGroup, Name: "devs"}); got == 0 {
-		t.Error("the devs group's sub-generation did not move on a no-op UPDATE")
+	if got := RBACSubGenBumpsTotal(); got != 0 {
+		t.Errorf("a relist no-op recorded %d sub-generation bumps; want 0 after #253", got)
 	}
 }
 

@@ -117,12 +117,24 @@ var (
 // READING THE ZERO: 0 means no subject's sub-generation has ever moved — no
 // identity-bound L1 key has rotated for an RBAC reason. That reading is only
 // admissible because a LIVENESS arm has shown the counter can move through the
-// production path: TestBindingNoopCounters_BumpsStillFireOnEveryNoop drives the
-// real onBindingUpdate hook, flushes the pending set, and fails if this stays
-// 0. Without such an arm a zero would mean "not looking", not "not rotating" —
-// and the other two counters in this workstream do NOT yet have one (see
+// production path: TestSubGenSkip_GenuineSubjectEditStillBumps drives the real
+// onBindingUpdate hook with a genuine subject-set edit, flushes the pending
+// set, and fails if this stays 0; TestSubGenSkip_AddAndDeleteStillBumpUncondi-
+// tionally does the same through onBindingAdd and onBindingDelete. Without
+// such an arm a zero would mean "not looking", not "not rotating" — and the
+// other two counters in this workstream do NOT yet have one (see
 // rbacSubGenSubjects here, and bindingNoopUpdates in
 // rbac_binding_noop_counters.go).
+//
+// #253 NARROWED WHAT THE ZERO MEANS, AND THE LIVENESS ARM MOVED WITH IT. The
+// old arm was TestBindingNoopCounters_BumpsStillFireOnEveryNoop, which proved
+// liveness through a RELIST no-op — valid only while every UPDATE bumped
+// unconditionally. It no longer does: an UPDATE whose subject set and roleRef
+// are both unchanged records nothing (bindings_by_gvr_delta.go). So a 0 here no
+// longer means "no binding events happened"; it means "no binding event carried
+// a real RBAC change". That is the healthier reading and the one this fix is
+// judged on — read it against snowplow_rbac_binding_semantic_noop_updates_total,
+// which keeps climbing on exactly the traffic that no longer rotates a key.
 func RBACSubGenBumpsTotal() uint64 { return rbacSubGenBumps.Load() }
 
 // RBACSubGenSubjectsTracked returns the number of DISTINCT subjects that have a
