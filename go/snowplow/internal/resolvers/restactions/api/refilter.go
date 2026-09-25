@@ -343,13 +343,25 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 	// nameCode==nil → evalSingle denies the item.
 	nameExpr, nameCode := compileNameFrom(uaf)
 
+	// perf/uaf-refilter-namespace-memo — ONE RBAC verdict memo for the whole
+	// slice. Keyed by uafRBACMemoKey (resource, namespace, name); the
+	// identity + verb + group are invocation-constant so they are folded in
+	// implicitly. For a collection-verb LIST over many items in few namespaces
+	// this turns O(items) EvaluateRBAC calls into O(distinct namespaces) while
+	// producing a byte-identical kept/dropped result. It is a LOCAL map,
+	// discarded at return — no shared state, no global, no cross-call
+	// staleness (a subsequent refilter builds a fresh memo against the live
+	// RBAC store, exactly like filterListByRBAC AC-6).
+	rbacMemo := make(map[uafRBACMemoKey]bool, len(items))
+
 	for _, item := range items {
 		switch item.(type) {
 		case map[string]any, string:
-			// Object OR bare scalar — both reach the evaluator. evalSingle
+			// Object OR bare scalar — both reach the evaluator. evalSingleMemo
 			// resolves NamespaceFrom + NameFrom against the item (jq handles a
-			// string receiver fine) and calls EvaluateRBAC.
-			permitted := evalSingle(ctx, log, username, groups, uaf, resources, item, nsExpr, nsCode, nameExpr, nameCode)
+			// string receiver fine) and calls EvaluateRBAC, consulting the
+			// per-slice memo to skip redundant identical checks.
+			permitted := evalSingleMemo(ctx, log, username, groups, uaf, resources, item, nsExpr, nsCode, nameExpr, nameCode, rbacMemo)
 			calls++
 			if permitted {
 				kept = append(kept, item)
@@ -364,6 +376,35 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 		}
 	}
 	return kept, dropped, calls
+}
+
+// uafRBACMemoKey is the tuple that fully determines a single EvaluateRBAC
+// verdict WITHIN one refilterSlice invocation — the perf/uaf-refilter-
+// namespace-memo memo key (v7 UAF-digest "Step 0").
+//
+// Username, Groups, Verb and Group are invocation-constant: they come from
+// the one authenticated identity and the one UAF stanza this refilterSlice
+// call is evaluating, so every lookup in a given memo already shares them and
+// they are DELIBERATELY not in the key. Only Resource (across the OR-set),
+// Namespace and Name (per-object, via the NamespaceFrom / NameFrom jq) vary
+// item-to-item, so those three ARE the key. SkipBindingUID is always true on
+// this per-item path.
+//
+// Correctness is BY CONSTRUCTION: the memo value is exactly the `allowed`
+// return of rbac.EvaluateRBAC for {Username, Groups, Verb, Group, Resource,
+// Namespace, Name, SkipBindingUID}. All of those are either invocation-
+// constant or in this key, and EvaluateRBAC is a pure function of them against
+// the live snapshot, so two lookups with the same key have IDENTICAL evaluator
+// inputs and therefore an IDENTICAL verdict. Including Name (rather than
+// dropping it for collection verbs) needs no verb branch here: evalSingleMemo
+// only resolves Name for name-specific verbs (rbac.IsNameSpecificVerb) and
+// leaves it "" otherwise, so a collection-verb key collapses to
+// (resource, namespace) automatically while a name-specific key keeps two
+// same-(resource,namespace) items with different names correctly APART.
+type uafRBACMemoKey struct {
+	resource  string
+	namespace string
+	name      string
 }
 
 // evalSingle resolves NamespaceFrom against item and calls EvaluateRBAC.
@@ -383,7 +424,29 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 //
 // JQ-eval errors and RBAC errors both fail closed. An EMPTY `resources`
 // set denies (no resource to grant against) — never allow-all.
+//
+// evalSingle is the NO-MEMO entry point used by the single-object branches
+// (a lone GET-by-name has nothing to memoize) and by unit tests. It delegates
+// to evalSingleMemo with a nil memo, which is byte-identical to the pre-memo
+// behaviour (every EvaluateRBAC call is made).
 func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *gojq.Code, nameExpr string, nameCode *gojq.Code) bool {
+	return evalSingleMemo(ctx, log, username, groups, uaf, resources, item, nsExpr, nsCode, nameExpr, nameCode, nil)
+}
+
+// evalSingleMemo is evalSingle with an OPTIONAL per-refilterSlice-invocation
+// RBAC verdict memo (perf/uaf-refilter-namespace-memo). When memo is non-nil,
+// each EvaluateRBAC verdict is recorded keyed by uafRBACMemoKey and reused for
+// a later item with the same (resource, namespace, name), so a LIST spanning
+// K namespaces makes O(K) EvaluateRBAC calls instead of O(items).
+//
+// memo == nil restores the exact pre-memo path (evalSingle). The memo is a
+// LOCAL map owned by one refilterSlice call — never shared, never global,
+// discarded at return — so there is no cross-invocation staleness. Evaluator
+// ERRORS are NOT memoized (mirroring filterListByRBAC AC-6): a transient error
+// on one (resource,namespace,name) must not poison a later same-tuple item;
+// the next item retries. The filtering RESULT is byte-identical either way —
+// the memo only removes redundant EvaluateRBAC calls.
+func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *gojq.Code, nameExpr string, nameCode *gojq.Code, memo map[uafRBACMemoKey]bool) bool {
 	// #121 1b — nsExpr + nsCode are the ONCE-compiled NamespaceFrom
 	// expression, hoisted out of the per-item loop by the caller
 	// (compileNamespaceFrom). nsExpr is kept for error/log fidelity; nsCode
@@ -445,6 +508,22 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 	// resource in the set. An empty set yields no iterations -> false
 	// (fail-closed — an unresolvable / empty resource set never permits).
 	for _, resource := range resources {
+		// perf/uaf-refilter-namespace-memo — consult the per-invocation memo
+		// FIRST. A hit reuses the recorded verdict for this exact
+		// (resource, namespace, name) tuple and skips the EvaluateRBAC call.
+		// A recorded DENY continues to the next resource in the OR-set (the
+		// item may still be granted on another resource); a recorded ALLOW
+		// keeps the item. memo == nil (single-object / test path) makes this a
+		// no-op — every call is made, byte-identical to pre-memo.
+		key := uafRBACMemoKey{resource: resource, namespace: namespace, name: name}
+		if memo != nil {
+			if allowed, hit := memo[key]; hit {
+				if allowed {
+					return true
+				}
+				continue
+			}
+		}
 		// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
 		// ignores matchedBindingUID return.
 		allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
@@ -476,7 +555,12 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 			)
 			continue // a transient evaluator error on one resource must
 			// not mask a genuine grant on another — but it also must not
-			// permit: try the rest, default-deny if none grant.
+			// permit: try the rest, default-deny if none grant. The error is
+			// deliberately NOT memoized (AC-6): a later same-tuple item retries.
+		}
+		// Record the verdict for reuse by a later same-tuple item.
+		if memo != nil {
+			memo[key] = allowed
 		}
 		if allowed {
 			return true
