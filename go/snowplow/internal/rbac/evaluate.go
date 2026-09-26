@@ -499,16 +499,36 @@ func selectCRBCandidates(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbac
 	return out
 }
 
-// selectRBCandidates is the RoleBinding analogue of selectCRBCandidates,
-// scoped to a single namespace. Same routing rules; inner-map lookup on a
-// missing namespace returns nil and the function falls through to
-// RBsCatchAllByNS[ns] (also nil for an absent namespace), so the empty
-// case yields an empty candidate set with no allocations.
-func selectRBCandidates(snap *cache.RBACSnapshot, ns string, opts EvaluateOptions) []*rbacv1.RoleBinding {
-	if snap == nil || ns == "" {
-		return nil
-	}
-
+// routeRBSubjects is the shared subject-routing body extracted from
+// selectRBCandidates (v7 Step 2A — design §2.1; PM condition 6, the
+// evaluate.go:512-543 span: parseServiceAccountUsername + effectiveGroups +
+// the seen/add pointer-dedup + the User/Group/system:authenticated-gated/SA/
+// catch-all routing). It routes an identity onto a set of ALREADY
+// namespace-scoped RoleBinding subject-index maps and returns the ORDERED,
+// pointer-deduped candidate slice.
+//
+// The four map arguments differ only in how the caller scoped them:
+//   - selectRBCandidates passes the per-namespace inner maps
+//     (snap.RBs*ByNS[ns]) → candidates for that one namespace.
+//   - selectRBCandidatesAllNS passes the flat all-namespace maps
+//     (snap.RBs*AllNS) → the union of the subject's candidates across every
+//     namespace.
+//
+// Both selectors share this ONE routing function, so the per-ns path and the
+// all-namespace path can never drift (resolves R2-M2; guarded by F-C0).
+//
+// Behaviour is byte-identical to the pre-extraction inline body: indexing a
+// nil map yields a nil slice and add() ranges over it as zero iterations, so
+// the old inline nil-map guards (`if inner := m[ns]; inner != nil`) only ever
+// skipped a nil-slice add — dropping them changes nothing. The candidate
+// ORDER is preserved exactly: User, then each effective group in order, then
+// system:authenticated (gated on a non-empty username), then the SA key, then
+// the catch-all — first-occurrence position preserved under dedup.
+func routeRBSubjects(
+	opts EvaluateOptions,
+	byUser, byGroup, byServiceAccount map[string][]*rbacv1.RoleBinding,
+	catchAll []*rbacv1.RoleBinding,
+) []*rbacv1.RoleBinding {
 	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
 	groups := effectiveGroups(opts, isSA, saNS)
 
@@ -524,25 +544,71 @@ func selectRBCandidates(snap *cache.RBACSnapshot, ns string, opts EvaluateOption
 		}
 	}
 
-	if userInner := snap.RBsByUserByNS[ns]; userInner != nil && opts.Username != "" {
-		add(userInner[opts.Username])
+	if opts.Username != "" {
+		add(byUser[opts.Username])
 	}
-	if groupInner := snap.RBsByGroupByNS[ns]; groupInner != nil {
-		for _, g := range groups {
-			add(groupInner[g])
-		}
-		if opts.Username != "" {
-			add(groupInner["system:authenticated"])
-		}
+	for _, g := range groups {
+		add(byGroup[g])
+	}
+	// system:authenticated is implicit for every authenticated request;
+	// mirror anySubjectMatches by gating it on a non-empty username.
+	if opts.Username != "" {
+		add(byGroup["system:authenticated"])
 	}
 	if isSA {
-		if saInner := snap.RBsByServiceAccountByNS[ns]; saInner != nil {
-			add(saInner[saNS+"/"+saName])
-		}
+		add(byServiceAccount[saNS+"/"+saName])
 	}
-	add(snap.RBsCatchAllByNS[ns])
+	add(catchAll)
 
 	return out
+}
+
+// selectRBCandidates is the RoleBinding analogue of selectCRBCandidates,
+// scoped to a single namespace. Same routing rules; inner-map lookup on a
+// missing namespace returns nil and the routing falls through to
+// RBsCatchAllByNS[ns] (also nil for an absent namespace), so the empty
+// case yields an empty candidate set with no allocations.
+//
+// v7 Step 2A: the routing body was extracted verbatim into routeRBSubjects
+// (behaviour-preserving — F-C0). This function now only namespace-scopes the
+// index maps and delegates.
+func selectRBCandidates(snap *cache.RBACSnapshot, ns string, opts EvaluateOptions) []*rbacv1.RoleBinding {
+	if snap == nil || ns == "" {
+		return nil
+	}
+	return routeRBSubjects(
+		opts,
+		snap.RBsByUserByNS[ns],
+		snap.RBsByGroupByNS[ns],
+		snap.RBsByServiceAccountByNS[ns],
+		snap.RBsCatchAllByNS[ns],
+	)
+}
+
+// selectRBCandidatesAllNS is the all-namespace analogue of
+// selectRBCandidates (v7 Step 2A — design §3). It returns the union of a
+// subject's RoleBinding candidates across EVERY namespace, using the flat
+// all-namespace reverse indexes on the snapshot and the SAME routeRBSubjects
+// routing selectRBCandidates uses. The result is pointer-deduped; each
+// returned RB carries its own .Namespace, so a caller (the Step B
+// requester-profile builder) can bucket the candidates by namespace after an
+// anySubjectMatches gate.
+//
+// DARK in Step 2A: no serving path calls this. Its first consumer is the
+// Step B requester profile; it is exercised now only by F-C1 (via
+// SelectRBCandidatesAllNSForTest), which proves it equals the union over
+// every namespace of selectRBCandidates.
+func selectRBCandidatesAllNS(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbacv1.RoleBinding {
+	if snap == nil {
+		return nil
+	}
+	return routeRBSubjects(
+		opts,
+		snap.RBsByUserAllNS,
+		snap.RBsByGroupAllNS,
+		snap.RBsByServiceAccountAllNS,
+		snap.RBsCatchAllAllNS,
+	)
 }
 
 // roleRefPermits resolves ref (Role or ClusterRole) against the

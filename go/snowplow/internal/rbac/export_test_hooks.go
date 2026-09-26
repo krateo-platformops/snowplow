@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -43,6 +45,31 @@ func EffectiveGroupsForTest(groups []string, isSA bool, saNS string) []string {
 // caught at the unit boundary. Thin pass-through; zero production surface.
 func CanonicalGroupsHashForTest(groups []string) uint64 {
 	return canonicalGroupsHash(groups)
+}
+
+// SelectCRBCandidatesForTest exposes selectCRBCandidates to the
+// cross-package v7 Step 2A falsifiers in internal/rbac/evaltest (F-C0
+// behavior-preservation). Thin pass-through; zero production surface.
+func SelectCRBCandidatesForTest(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbacv1.ClusterRoleBinding {
+	return selectCRBCandidates(snap, opts)
+}
+
+// SelectRBCandidatesForTest exposes the per-namespace selectRBCandidates
+// to the v7 Step 2A falsifiers (F-C0 ordered-output behavior-preservation
+// across the routeRBSubjects extraction; F-C1 per-ns union reference).
+// Thin pass-through; zero production surface.
+func SelectRBCandidatesForTest(snap *cache.RBACSnapshot, ns string, opts EvaluateOptions) []*rbacv1.RoleBinding {
+	return selectRBCandidates(snap, ns, opts)
+}
+
+// SelectRBCandidatesAllNSForTest exposes the all-namespace
+// selectRBCandidatesAllNS to the v7 Step 2A F-C1 union-equivalence falsifier.
+// Thin pass-through; zero production surface. It also makes
+// selectRBCandidatesAllNS a used symbol for the unused-symbol linter — no
+// serving path calls it in Step A (its first real consumer is the Step B
+// requester-profile builder).
+func SelectRBCandidatesAllNSForTest(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbacv1.RoleBinding {
+	return selectRBCandidatesAllNS(snap, opts)
 }
 
 // SetSARClientsetForTest overrides the SAR-baseline clientset factory
