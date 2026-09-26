@@ -326,6 +326,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// apiRef a UAF RA, and this cell served 298,064 hits vs 365 misses over 5d7h.
 	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 
+	// v7 Step 2D — DARK shadow-parity (twin of restactions.go). Install the
+	// read-only shadow context (the widget cell's access domain D + requester
+	// identity + projection digest) so the dark hook can compare R against the
+	// live verdict on the widget's apiRef / resourcesRefs checks. Recover-
+	// isolated; gated on the observability toggle (default-off) AND cache-on;
+	// changes no verdict, served byte, or cache key.
+	ctx = installShadowParityWidget(ctx, got.Unstructured.Object)
+
 	res, err := widgetsResolveFn(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
 		RC:      r.saRC,

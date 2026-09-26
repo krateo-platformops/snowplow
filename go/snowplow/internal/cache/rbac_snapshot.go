@@ -167,6 +167,33 @@ type RBACSnapshot struct {
 	RBsByGroupByNS          map[string]map[string][]*rbacv1.RoleBinding
 	RBsByServiceAccountByNS map[string]map[string][]*rbacv1.RoleBinding // inner key = "<ns>/<name>"
 	RBsCatchAllByNS         map[string][]*rbacv1.RoleBinding
+
+	// All-namespace RoleBinding subject reverse indexes (v7 Step 2A —
+	// design §3). Flat analogues of the per-namespace RBs*ByNS maps above:
+	// a subject key maps to the RoleBindings that name it as a subject
+	// across EVERY namespace, so a caller can enumerate a subject's RBs
+	// cluster-wide in O(subject's RBs) rather than walking every namespace.
+	// The values are the SAME *rbacv1.RoleBinding pointers held in
+	// RoleBindingsByNS — NO struct copy; each RB carries its own .Namespace
+	// so per-RB scope is recoverable from a flat lookup. Keys mirror the
+	// per-ns maps exactly: User→s.Name, Group→s.Name, ServiceAccount→
+	// "<subject-ns>/<subject-name>", unrecognised Kind→RBsCatchAllAllNS.
+	//
+	// Built inside the SAME rebuildSubjectIndexes RB switch that builds the
+	// RBs*ByNS maps (one flat append per arm), so they are structurally the
+	// per-ns index flattened. An RB has exactly one namespace ⇒ one entry
+	// per subject key ⇒ no cross-ns duplicate, no dedup at build time.
+	//
+	// ADDITIVE + DARK (Step 2A): no existing reader consults these fields;
+	// they are nil under cache-off (rebuildRBACSnapshot early-returns in
+	// modePassthrough before rebuildSubjectIndexes runs); GC'd with the old
+	// snapshot on publish. Reader-side contract is identical to the
+	// RBs*ByNS maps: callers MUST NOT mutate the returned slices;
+	// concurrent read is lock-free post-publish.
+	RBsByUserAllNS           map[string][]*rbacv1.RoleBinding
+	RBsByGroupAllNS          map[string][]*rbacv1.RoleBinding
+	RBsByServiceAccountAllNS map[string][]*rbacv1.RoleBinding // key = "<ns>/<name>"
+	RBsCatchAllAllNS         []*rbacv1.RoleBinding            // unrecognised Subject.Kind, any namespace
 }
 
 // rbacSnap is the sole publish container — a single-writer / many-reader
@@ -601,6 +628,15 @@ func rebuildSubjectIndexes(snap *RBACSnapshot) {
 	snap.RBsByServiceAccountByNS = make(map[string]map[string][]*rbacv1.RoleBinding, len(snap.RoleBindingsByNS))
 	snap.RBsCatchAllByNS = make(map[string][]*rbacv1.RoleBinding)
 
+	// v7 Step 2A — all-namespace flat reverse indexes, allocated beside the
+	// per-ns maps. Capacities mirror the CRB subject-index heuristics
+	// (subject-name cardinality, NOT the binding count): ~tens of users /
+	// groups, ~hundreds-to-thousands of SA keys. Maps grow as needed;
+	// RBsCatchAllAllNS stays nil until an unrecognised-Kind subject appears.
+	snap.RBsByUserAllNS = make(map[string][]*rbacv1.RoleBinding, 64)
+	snap.RBsByGroupAllNS = make(map[string][]*rbacv1.RoleBinding, 64)
+	snap.RBsByServiceAccountAllNS = make(map[string][]*rbacv1.RoleBinding, 256)
+
 	for ns, rbs := range snap.RoleBindingsByNS {
 		for _, rb := range rbs {
 			if rb == nil {
@@ -616,6 +652,9 @@ func rebuildSubjectIndexes(snap *RBACSnapshot) {
 						snap.RBsByUserByNS[ns] = inner
 					}
 					inner[s.Name] = append(inner[s.Name], rb)
+					// v7 Step 2A — flat all-namespace mirror (same key, same
+					// pointer).
+					snap.RBsByUserAllNS[s.Name] = append(snap.RBsByUserAllNS[s.Name], rb)
 				case rbacv1.GroupKind:
 					inner := snap.RBsByGroupByNS[ns]
 					if inner == nil {
@@ -623,6 +662,7 @@ func rebuildSubjectIndexes(snap *RBACSnapshot) {
 						snap.RBsByGroupByNS[ns] = inner
 					}
 					inner[s.Name] = append(inner[s.Name], rb)
+					snap.RBsByGroupAllNS[s.Name] = append(snap.RBsByGroupAllNS[s.Name], rb)
 				case rbacv1.ServiceAccountKind:
 					inner := snap.RBsByServiceAccountByNS[ns]
 					if inner == nil {
@@ -631,8 +671,13 @@ func rebuildSubjectIndexes(snap *RBACSnapshot) {
 					}
 					key := s.Namespace + "/" + s.Name
 					inner[key] = append(inner[key], rb)
+					// Flat mirror uses the SAME "<subject-ns>/<subject-name>"
+					// key as the per-ns SA map, so selectRBCandidatesAllNS's SA
+					// lookup matches selectRBCandidates's exactly.
+					snap.RBsByServiceAccountAllNS[key] = append(snap.RBsByServiceAccountAllNS[key], rb)
 				default:
 					snap.RBsCatchAllByNS[ns] = append(snap.RBsCatchAllByNS[ns], rb)
+					snap.RBsCatchAllAllNS = append(snap.RBsCatchAllAllNS, rb)
 				}
 			}
 		}

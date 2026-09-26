@@ -330,6 +330,16 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// closes with the refilter bump on fix/1.12.3-authz-hardening, whose own arm
 	// is TestA4_RefilterBumpsUAFTouchedSink.
 	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
+	// v7 Step 2D — DARK shadow-parity. Install the read-only shadow context (the
+	// cell's identity-free access domain D + this requester's identity + the
+	// projection digest) on the resolve ctx so the dark hook inside EvaluateRBAC
+	// can compare R against the live verdict on every served check the resolve
+	// makes — WITHOUT changing any verdict, served byte, or cache key. Gated on
+	// the observability toggle (default-off) AND cache-on; the whole derivation
+	// is recover-isolated (a dark panic never crashes /call — it returns ctx
+	// unchanged). No-op (ctx unchanged) in production until an observability
+	// control turns the toggle on.
+	ctx = installShadowParityRESTAction(ctx, &cr)
 	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,

@@ -164,9 +164,38 @@ type EvaluateOptions struct {
 // callers (dispatchCacheLookupKey, ra_full_list, the helpers.go
 // diagnostic) leave SkipBindingUID at its safe zero-value (false) and
 // keep the deterministic UID.
-func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, error) {
+func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matchedBindingUID string, err error) {
 	log := xcontext.Logger(ctx)
 	evaluateRBACCallCount.Add(1)
+
+	// v7 Step 2D — DARK shadow-parity hook. NAMED RETURNS + hoisted `snap`
+	// exist ONLY so this defer can read the final (allowed, err) and the
+	// snapshot the verdict was decided against. The logic below is unchanged —
+	// F-D6(b) proves the verdict+UID table is byte-identical before/after this
+	// signature refactor.
+	//
+	// The hook fires on returns where snap != nil && err == nil: the memo-hit
+	// permit (:249-ish) and the walk permit/deny (:301-ish). It NO-OPS on
+	// cache-off (snap stays nil), nil-snap / not-wired (err != nil), and
+	// evaluator error (err != nil). It is read-only and recover-isolated (the
+	// hook body owns dark_panic_total and its own recover; this deferred
+	// recover is the ultimate backstop — a dark panic must never crash a live
+	// request). Toggle DEFAULT-OFF: one atomic load then return on the hot path.
+	var snap *cache.RBACSnapshot
+	defer func() {
+		if !shadowParityEnabled.Load() {
+			return
+		}
+		if snap == nil || err != nil {
+			return
+		}
+		h := shadowHook.Load()
+		if h == nil {
+			return
+		}
+		defer func() { _ = recover() }()
+		(*h)(ctx, snap, opts, allowed)
+	}()
 
 	if cache.Disabled() {
 		// Cache=off correctness baseline. UserCan reads the user's
@@ -203,7 +232,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, erro
 	// explicit parameter into evaluateAgainstInformerFirstMatch AND
 	// roleRefPermits, so every read inside one EvaluateRBAC call observes
 	// the SAME snapshot version (AC-B.3).
-	snap := rw.Snapshot()
+	snap = rw.Snapshot()
 	if snap == nil {
 		// AC-B.8 — degrade-to-deny pre-readiness gate.
 		log.Warn("rbac.evaluate: typed-RBAC snapshot not yet published — denying",
@@ -249,7 +278,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, erro
 		return v.Allowed, v.MatchedBindingUID, nil
 	}
 
-	allowed, matchedBindingUID, err := evaluateAgainstInformerFirstMatch(ctx, snap, opts)
+	allowed, matchedBindingUID, err = evaluateAgainstInformerFirstMatch(ctx, snap, opts)
 	if err != nil {
 		log.Error("rbac.evaluate: informer evaluation failed",
 			slog.String("user", opts.Username), slog.Any("err", err))
@@ -310,13 +339,14 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, erro
 //
 // Ship 0.30.242 H.c-layered (Phase 2 step 2a) — RENAMED from
 // evaluateAgainstInformer. Two ADDITIVE changes vs the pre-rename body:
-//   (a) selectCRBCandidates / selectRBCandidates results are sorted into
-//       stable lexicographic order (Name, UID) BEFORE iteration. This
-//       guarantees the FIRST-MATCH BindingUID is deterministic across
-//       snapshot republishes (design §6).
-//   (b) on first permit the function returns the binding's UID alongside
-//       the verdict. CRB matches produce "C:<uid>"; RB matches produce
-//       "R:<ns>/<uid>" (cache.BindingUIDFromCRB / FromRB).
+//
+//	(a) selectCRBCandidates / selectRBCandidates results are sorted into
+//	    stable lexicographic order (Name, UID) BEFORE iteration. This
+//	    guarantees the FIRST-MATCH BindingUID is deterministic across
+//	    snapshot republishes (design §6).
+//	(b) on first permit the function returns the binding's UID alongside
+//	    the verdict. CRB matches produce "C:<uid>"; RB matches produce
+//	    "R:<ns>/<uid>" (cache.BindingUIDFromCRB / FromRB).
 //
 // Ship B (0.30.138) — reads typed *rbacv1.{ClusterRole,Role}Binding
 // from a pre-built `*cache.RBACSnapshot` passed in by EvaluateRBAC. No
@@ -499,16 +529,36 @@ func selectCRBCandidates(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbac
 	return out
 }
 
-// selectRBCandidates is the RoleBinding analogue of selectCRBCandidates,
-// scoped to a single namespace. Same routing rules; inner-map lookup on a
-// missing namespace returns nil and the function falls through to
-// RBsCatchAllByNS[ns] (also nil for an absent namespace), so the empty
-// case yields an empty candidate set with no allocations.
-func selectRBCandidates(snap *cache.RBACSnapshot, ns string, opts EvaluateOptions) []*rbacv1.RoleBinding {
-	if snap == nil || ns == "" {
-		return nil
-	}
-
+// routeRBSubjects is the shared subject-routing body extracted from
+// selectRBCandidates (v7 Step 2A — design §2.1; PM condition 6, the
+// evaluate.go:512-543 span: parseServiceAccountUsername + effectiveGroups +
+// the seen/add pointer-dedup + the User/Group/system:authenticated-gated/SA/
+// catch-all routing). It routes an identity onto a set of ALREADY
+// namespace-scoped RoleBinding subject-index maps and returns the ORDERED,
+// pointer-deduped candidate slice.
+//
+// The four map arguments differ only in how the caller scoped them:
+//   - selectRBCandidates passes the per-namespace inner maps
+//     (snap.RBs*ByNS[ns]) → candidates for that one namespace.
+//   - selectRBCandidatesAllNS passes the flat all-namespace maps
+//     (snap.RBs*AllNS) → the union of the subject's candidates across every
+//     namespace.
+//
+// Both selectors share this ONE routing function, so the per-ns path and the
+// all-namespace path can never drift (resolves R2-M2; guarded by F-C0).
+//
+// Behaviour is byte-identical to the pre-extraction inline body: indexing a
+// nil map yields a nil slice and add() ranges over it as zero iterations, so
+// the old inline nil-map guards (`if inner := m[ns]; inner != nil`) only ever
+// skipped a nil-slice add — dropping them changes nothing. The candidate
+// ORDER is preserved exactly: User, then each effective group in order, then
+// system:authenticated (gated on a non-empty username), then the SA key, then
+// the catch-all — first-occurrence position preserved under dedup.
+func routeRBSubjects(
+	opts EvaluateOptions,
+	byUser, byGroup, byServiceAccount map[string][]*rbacv1.RoleBinding,
+	catchAll []*rbacv1.RoleBinding,
+) []*rbacv1.RoleBinding {
 	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
 	groups := effectiveGroups(opts, isSA, saNS)
 
@@ -524,25 +574,120 @@ func selectRBCandidates(snap *cache.RBACSnapshot, ns string, opts EvaluateOption
 		}
 	}
 
-	if userInner := snap.RBsByUserByNS[ns]; userInner != nil && opts.Username != "" {
-		add(userInner[opts.Username])
+	if opts.Username != "" {
+		add(byUser[opts.Username])
 	}
-	if groupInner := snap.RBsByGroupByNS[ns]; groupInner != nil {
-		for _, g := range groups {
-			add(groupInner[g])
-		}
-		if opts.Username != "" {
-			add(groupInner["system:authenticated"])
-		}
+	for _, g := range groups {
+		add(byGroup[g])
+	}
+	// system:authenticated is implicit for every authenticated request;
+	// mirror anySubjectMatches by gating it on a non-empty username.
+	if opts.Username != "" {
+		add(byGroup["system:authenticated"])
 	}
 	if isSA {
-		if saInner := snap.RBsByServiceAccountByNS[ns]; saInner != nil {
-			add(saInner[saNS+"/"+saName])
-		}
+		add(byServiceAccount[saNS+"/"+saName])
 	}
-	add(snap.RBsCatchAllByNS[ns])
+	add(catchAll)
 
 	return out
+}
+
+// selectRBCandidates is the RoleBinding analogue of selectCRBCandidates,
+// scoped to a single namespace. Same routing rules; inner-map lookup on a
+// missing namespace returns nil and the routing falls through to
+// RBsCatchAllByNS[ns] (also nil for an absent namespace), so the empty
+// case yields an empty candidate set with no allocations.
+//
+// v7 Step 2A: the routing body was extracted verbatim into routeRBSubjects
+// (behaviour-preserving — F-C0). This function now only namespace-scopes the
+// index maps and delegates.
+func selectRBCandidates(snap *cache.RBACSnapshot, ns string, opts EvaluateOptions) []*rbacv1.RoleBinding {
+	if snap == nil || ns == "" {
+		return nil
+	}
+	return routeRBSubjects(
+		opts,
+		snap.RBsByUserByNS[ns],
+		snap.RBsByGroupByNS[ns],
+		snap.RBsByServiceAccountByNS[ns],
+		snap.RBsCatchAllByNS[ns],
+	)
+}
+
+// selectRBCandidatesAllNS is the all-namespace analogue of
+// selectRBCandidates (v7 Step 2A — design §3). It returns the union of a
+// subject's RoleBinding candidates across EVERY namespace, using the flat
+// all-namespace reverse indexes on the snapshot and the SAME routeRBSubjects
+// routing selectRBCandidates uses. The result is pointer-deduped; each
+// returned RB carries its own .Namespace, so a caller (the Step B
+// requester-profile builder) can bucket the candidates by namespace after an
+// anySubjectMatches gate.
+//
+// DARK in Step 2A: no serving path calls this. Its first consumer is the
+// Step B requester profile; it is exercised now only by F-C1 (via
+// SelectRBCandidatesAllNSForTest), which proves it equals the union over
+// every namespace of selectRBCandidates.
+func selectRBCandidatesAllNS(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbacv1.RoleBinding {
+	if snap == nil {
+		return nil
+	}
+	return routeRBSubjects(
+		opts,
+		snap.RBsByUserAllNS,
+		snap.RBsByGroupAllNS,
+		snap.RBsByServiceAccountAllNS,
+		snap.RBsCatchAllAllNS,
+	)
+}
+
+// lookupRoleRefRules is the PURE, SIDE-EFFECT-FREE resolve half split out of
+// roleRefPermits (v7 Step 2B — design §2.1, Part B). It performs ONLY the
+// snapshot map read + kind routing and returns the resolved PolicyRules:
+//
+//   - ClusterRole: snap.ClusterRolesByName[ref.Name]; miss → (nil, false).
+//   - Role: namespace=="" (kind=Role in a ClusterRoleBinding — invalid per
+//     Kubernetes) → (nil, false); else snap.RolesByNSName[namespace+"/"+
+//     ref.Name]; miss → (nil, false).
+//   - any other kind → (nil, false).
+//
+// The second return ("resolved") is true iff a rule set was found. A
+// (nil, true) never happens: a hit always carries the target's .Rules slice
+// (which may be empty for a rule-less Role/ClusterRole — still a resolve hit,
+// just a deny once rulesPermit runs).
+//
+// DARK-SAFETY — LOAD-BEARING: lookupRoleRefRules calls NO counter and NO log;
+// in particular it MUST NOT call cache.RecordRBACSnapshotMiss. The dark
+// requester profile (profile.go) resolves a requester's every roleRef through
+// this function, once per (identity, generation). Recording a miss here would
+// inflate the production AC-B.10 miss ratio (cache.RecordRBACSnapshotMiss /
+// rbac_snapshot.go:221-234) and break the Step-2 dark invariant. All miss
+// accounting stays at roleRefPermits' OWN (served-path) call site below, so the
+// served path's miss-count is byte-identical to pre-split (F-D1).
+func lookupRoleRefRules(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef) ([]rbacv1.PolicyRule, bool) {
+	switch ref.Kind {
+	case "ClusterRole":
+		cr, ok := snap.ClusterRolesByName[ref.Name]
+		if !ok {
+			return nil, false
+		}
+		return cr.Rules, true
+
+	case "Role":
+		if namespace == "" {
+			// kind=Role in a ClusterRoleBinding is invalid per
+			// Kubernetes — treat as deny (no resolve).
+			return nil, false
+		}
+		r, ok := snap.RolesByNSName[namespace+"/"+ref.Name]
+		if !ok {
+			return nil, false
+		}
+		return r.Rules, true
+
+	default:
+		return nil, false
+	}
 }
 
 // roleRefPermits resolves ref (Role or ClusterRole) against the
@@ -555,33 +700,33 @@ func selectRBCandidates(snap *cache.RBACSnapshot, ns string, opts EvaluateOption
 // missed lookup (`!ok`) is recorded via cache.RecordRBACSnapshotMiss
 // (AC-B.10) and treated as a deny — same fail-closed posture as
 // today's GetTypedObject !ok.
+//
+// v7 Step 2B — the resolve half is now lookupRoleRefRules (above); this
+// function is resolve + rulesPermit + miss-accounting. The miss bump stays
+// HERE, at the served-path call site, with the SAME (kind, namespace, name)
+// labels and the SAME selectivity as the pre-split switch: ONLY a ClusterRole
+// absent from the snapshot, and a namespaced Role (namespace != "") absent from
+// the snapshot, were ever recorded. The kind=Role-in-CRB (namespace=="") and
+// unknown-kind arms denied WITHOUT recording, so they stay silent here too.
+// This keeps roleRefPermits byte-identical in verdict AND miss-count to
+// pre-split (F-D1); lookupRoleRefRules records nothing, so the dark profile
+// builder never reaches this bump.
 func roleRefPermits(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions, log *slog.Logger) (bool, error) {
 	_ = log // reserved for future per-ref debug logging; kept in signature for parity
+	rules, ok := lookupRoleRefRules(snap, namespace, ref)
+	if ok {
+		return rulesPermit(rules, opts), nil
+	}
+	// Resolve miss — record it with the exact pre-split labels/selectivity.
 	switch ref.Kind {
 	case "ClusterRole":
-		cr, ok := snap.ClusterRolesByName[ref.Name]
-		if !ok {
-			cache.RecordRBACSnapshotMiss("ClusterRole", "", ref.Name)
-			return false, nil
-		}
-		return rulesPermit(cr.Rules, opts), nil
-
+		cache.RecordRBACSnapshotMiss("ClusterRole", "", ref.Name)
 	case "Role":
-		if namespace == "" {
-			// kind=Role in a ClusterRoleBinding is invalid per
-			// Kubernetes — treat as deny.
-			return false, nil
-		}
-		r, ok := snap.RolesByNSName[namespace+"/"+ref.Name]
-		if !ok {
+		if namespace != "" {
 			cache.RecordRBACSnapshotMiss("Role", namespace, ref.Name)
-			return false, nil
 		}
-		return rulesPermit(r.Rules, opts), nil
-
-	default:
-		return false, nil
 	}
+	return false, nil
 }
 
 // rulesPermit returns true iff any PolicyRule in rules permits opts.
