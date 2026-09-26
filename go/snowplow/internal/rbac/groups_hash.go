@@ -85,3 +85,13 @@ func canonicalGroupsHash(groups []string) uint64 {
 	}
 	return h.Sum64()
 }
+
+// CanonicalGroupsHash is the exported, production-safe view of
+// canonicalGroupsHash — the SINGLE canonical groups hasher (do NOT inline a
+// second one, per this file's header). v7 Step 2D uses it to fold a requester's
+// groups SET into one order-independent scalar for the dark shadow-parity
+// anomaly log, so the log carries a HASHED identity only (never the raw group
+// names) — the debug-surface rule (metadata + hash, never per-identity content).
+func CanonicalGroupsHash(groups []string) uint64 {
+	return canonicalGroupsHash(groups)
+}

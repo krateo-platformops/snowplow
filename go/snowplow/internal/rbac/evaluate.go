@@ -164,9 +164,38 @@ type EvaluateOptions struct {
 // callers (dispatchCacheLookupKey, ra_full_list, the helpers.go
 // diagnostic) leave SkipBindingUID at its safe zero-value (false) and
 // keep the deterministic UID.
-func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, error) {
+func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matchedBindingUID string, err error) {
 	log := xcontext.Logger(ctx)
 	evaluateRBACCallCount.Add(1)
+
+	// v7 Step 2D — DARK shadow-parity hook. NAMED RETURNS + hoisted `snap`
+	// exist ONLY so this defer can read the final (allowed, err) and the
+	// snapshot the verdict was decided against. The logic below is unchanged —
+	// F-D6(b) proves the verdict+UID table is byte-identical before/after this
+	// signature refactor.
+	//
+	// The hook fires on returns where snap != nil && err == nil: the memo-hit
+	// permit (:249-ish) and the walk permit/deny (:301-ish). It NO-OPS on
+	// cache-off (snap stays nil), nil-snap / not-wired (err != nil), and
+	// evaluator error (err != nil). It is read-only and recover-isolated (the
+	// hook body owns dark_panic_total and its own recover; this deferred
+	// recover is the ultimate backstop — a dark panic must never crash a live
+	// request). Toggle DEFAULT-OFF: one atomic load then return on the hot path.
+	var snap *cache.RBACSnapshot
+	defer func() {
+		if !shadowParityEnabled.Load() {
+			return
+		}
+		if snap == nil || err != nil {
+			return
+		}
+		h := shadowHook.Load()
+		if h == nil {
+			return
+		}
+		defer func() { _ = recover() }()
+		(*h)(ctx, snap, opts, allowed)
+	}()
 
 	if cache.Disabled() {
 		// Cache=off correctness baseline. UserCan reads the user's
@@ -203,7 +232,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, erro
 	// explicit parameter into evaluateAgainstInformerFirstMatch AND
 	// roleRefPermits, so every read inside one EvaluateRBAC call observes
 	// the SAME snapshot version (AC-B.3).
-	snap := rw.Snapshot()
+	snap = rw.Snapshot()
 	if snap == nil {
 		// AC-B.8 — degrade-to-deny pre-readiness gate.
 		log.Warn("rbac.evaluate: typed-RBAC snapshot not yet published — denying",
@@ -249,7 +278,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, erro
 		return v.Allowed, v.MatchedBindingUID, nil
 	}
 
-	allowed, matchedBindingUID, err := evaluateAgainstInformerFirstMatch(ctx, snap, opts)
+	allowed, matchedBindingUID, err = evaluateAgainstInformerFirstMatch(ctx, snap, opts)
 	if err != nil {
 		log.Error("rbac.evaluate: informer evaluation failed",
 			slog.String("user", opts.Username), slog.Any("err", err))
@@ -310,13 +339,14 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, erro
 //
 // Ship 0.30.242 H.c-layered (Phase 2 step 2a) — RENAMED from
 // evaluateAgainstInformer. Two ADDITIVE changes vs the pre-rename body:
-//   (a) selectCRBCandidates / selectRBCandidates results are sorted into
-//       stable lexicographic order (Name, UID) BEFORE iteration. This
-//       guarantees the FIRST-MATCH BindingUID is deterministic across
-//       snapshot republishes (design §6).
-//   (b) on first permit the function returns the binding's UID alongside
-//       the verdict. CRB matches produce "C:<uid>"; RB matches produce
-//       "R:<ns>/<uid>" (cache.BindingUIDFromCRB / FromRB).
+//
+//	(a) selectCRBCandidates / selectRBCandidates results are sorted into
+//	    stable lexicographic order (Name, UID) BEFORE iteration. This
+//	    guarantees the FIRST-MATCH BindingUID is deterministic across
+//	    snapshot republishes (design §6).
+//	(b) on first permit the function returns the binding's UID alongside
+//	    the verdict. CRB matches produce "C:<uid>"; RB matches produce
+//	    "R:<ns>/<uid>" (cache.BindingUIDFromCRB / FromRB).
 //
 // Ship B (0.30.138) — reads typed *rbacv1.{ClusterRole,Role}Binding
 // from a pre-built `*cache.RBACSnapshot` passed in by EvaluateRBAC. No
