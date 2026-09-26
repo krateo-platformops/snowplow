@@ -611,6 +611,55 @@ func selectRBCandidatesAllNS(snap *cache.RBACSnapshot, opts EvaluateOptions) []*
 	)
 }
 
+// lookupRoleRefRules is the PURE, SIDE-EFFECT-FREE resolve half split out of
+// roleRefPermits (v7 Step 2B — design §2.1, Part B). It performs ONLY the
+// snapshot map read + kind routing and returns the resolved PolicyRules:
+//
+//   - ClusterRole: snap.ClusterRolesByName[ref.Name]; miss → (nil, false).
+//   - Role: namespace=="" (kind=Role in a ClusterRoleBinding — invalid per
+//     Kubernetes) → (nil, false); else snap.RolesByNSName[namespace+"/"+
+//     ref.Name]; miss → (nil, false).
+//   - any other kind → (nil, false).
+//
+// The second return ("resolved") is true iff a rule set was found. A
+// (nil, true) never happens: a hit always carries the target's .Rules slice
+// (which may be empty for a rule-less Role/ClusterRole — still a resolve hit,
+// just a deny once rulesPermit runs).
+//
+// DARK-SAFETY — LOAD-BEARING: lookupRoleRefRules calls NO counter and NO log;
+// in particular it MUST NOT call cache.RecordRBACSnapshotMiss. The dark
+// requester profile (profile.go) resolves a requester's every roleRef through
+// this function, once per (identity, generation). Recording a miss here would
+// inflate the production AC-B.10 miss ratio (cache.RecordRBACSnapshotMiss /
+// rbac_snapshot.go:221-234) and break the Step-2 dark invariant. All miss
+// accounting stays at roleRefPermits' OWN (served-path) call site below, so the
+// served path's miss-count is byte-identical to pre-split (F-D1).
+func lookupRoleRefRules(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef) ([]rbacv1.PolicyRule, bool) {
+	switch ref.Kind {
+	case "ClusterRole":
+		cr, ok := snap.ClusterRolesByName[ref.Name]
+		if !ok {
+			return nil, false
+		}
+		return cr.Rules, true
+
+	case "Role":
+		if namespace == "" {
+			// kind=Role in a ClusterRoleBinding is invalid per
+			// Kubernetes — treat as deny (no resolve).
+			return nil, false
+		}
+		r, ok := snap.RolesByNSName[namespace+"/"+ref.Name]
+		if !ok {
+			return nil, false
+		}
+		return r.Rules, true
+
+	default:
+		return nil, false
+	}
+}
+
 // roleRefPermits resolves ref (Role or ClusterRole) against the
 // passed-in snapshot and walks its rules. namespace is the
 // RoleBinding's namespace (used to resolve kind=Role); empty when ref
@@ -621,33 +670,33 @@ func selectRBCandidatesAllNS(snap *cache.RBACSnapshot, opts EvaluateOptions) []*
 // missed lookup (`!ok`) is recorded via cache.RecordRBACSnapshotMiss
 // (AC-B.10) and treated as a deny — same fail-closed posture as
 // today's GetTypedObject !ok.
+//
+// v7 Step 2B — the resolve half is now lookupRoleRefRules (above); this
+// function is resolve + rulesPermit + miss-accounting. The miss bump stays
+// HERE, at the served-path call site, with the SAME (kind, namespace, name)
+// labels and the SAME selectivity as the pre-split switch: ONLY a ClusterRole
+// absent from the snapshot, and a namespaced Role (namespace != "") absent from
+// the snapshot, were ever recorded. The kind=Role-in-CRB (namespace=="") and
+// unknown-kind arms denied WITHOUT recording, so they stay silent here too.
+// This keeps roleRefPermits byte-identical in verdict AND miss-count to
+// pre-split (F-D1); lookupRoleRefRules records nothing, so the dark profile
+// builder never reaches this bump.
 func roleRefPermits(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions, log *slog.Logger) (bool, error) {
 	_ = log // reserved for future per-ref debug logging; kept in signature for parity
+	rules, ok := lookupRoleRefRules(snap, namespace, ref)
+	if ok {
+		return rulesPermit(rules, opts), nil
+	}
+	// Resolve miss — record it with the exact pre-split labels/selectivity.
 	switch ref.Kind {
 	case "ClusterRole":
-		cr, ok := snap.ClusterRolesByName[ref.Name]
-		if !ok {
-			cache.RecordRBACSnapshotMiss("ClusterRole", "", ref.Name)
-			return false, nil
-		}
-		return rulesPermit(cr.Rules, opts), nil
-
+		cache.RecordRBACSnapshotMiss("ClusterRole", "", ref.Name)
 	case "Role":
-		if namespace == "" {
-			// kind=Role in a ClusterRoleBinding is invalid per
-			// Kubernetes — treat as deny.
-			return false, nil
-		}
-		r, ok := snap.RolesByNSName[namespace+"/"+ref.Name]
-		if !ok {
+		if namespace != "" {
 			cache.RecordRBACSnapshotMiss("Role", namespace, ref.Name)
-			return false, nil
 		}
-		return rulesPermit(r.Rules, opts), nil
-
-	default:
-		return false, nil
 	}
+	return false, nil
 }
 
 // rulesPermit returns true iff any PolicyRule in rules permits opts.

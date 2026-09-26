@@ -72,6 +72,38 @@ func SelectRBCandidatesAllNSForTest(snap *cache.RBACSnapshot, opts EvaluateOptio
 	return selectRBCandidatesAllNS(snap, opts)
 }
 
+// LookupRoleRefRulesForTest exposes the PURE, side-effect-free
+// lookupRoleRefRules (evaluate.go) to the v7 Step 2B F-D1 dark-purity /
+// resolve-fidelity falsifiers. It is the exact resolve half the requester
+// profile uses; the falsifier asserts calling it records NO snapshot miss.
+// Thin pass-through; zero production surface.
+func LookupRoleRefRulesForTest(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef) ([]rbacv1.PolicyRule, bool) {
+	return lookupRoleRefRules(snap, namespace, ref)
+}
+
+// RoleRefPermitsForTest exposes roleRefPermits (the served-path resolve +
+// rulesPermit + miss-accounting) to the F-D1 behavior-preserving falsifier,
+// which asserts the miss bump stayed at this call site with the pre-split
+// selectivity. log is unused by roleRefPermits (reserved), so nil is safe.
+// Thin pass-through; zero production surface.
+func RoleRefPermitsForTest(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions) (bool, error) {
+	return roleRefPermits(snap, namespace, ref, opts, nil)
+}
+
+// ResetRequesterProfileMemoForTest clears the v7 Step 2B requester-profile memo
+// singleton and its counters. TEST-ONLY (F-D7) — production code MUST NOT call
+// it. Thin pass-through; zero production surface.
+func ResetRequesterProfileMemoForTest() {
+	resetRequesterProfileMemo()
+}
+
+// RequesterProfileMemoStatsForTest returns (hits, misses, stores, refused,
+// entries) for the requester-profile memo. TEST-ONLY (F-D7). The memo emits no
+// expvar/log (it is dark); this is its only observable surface, for tests.
+func RequesterProfileMemoStatsForTest() (hits, misses, stores, refused uint64, entries int) {
+	return requesterProfileMemoStats()
+}
+
 // SetSARClientsetForTest overrides the SAR-baseline clientset factory
 // (rbac.go's sarClientsetForEndpoint) so the hermetic cache=off L5 test
 // can inject a fake authorization clientset instead of building a real
