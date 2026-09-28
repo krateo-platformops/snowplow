@@ -35,12 +35,18 @@
 // THE FIX: the SA cannot be expressed as a kubeconfig-loadable endpoint.
 // Its *rest.Config must be built directly from the raw in-cluster
 // credentials (rest.InClusterConfig, which reads the raw token/ca.crt
-// files with the correct semantics). Phase 1 already holds that
-// *rest.Config; it attaches it to the context via WithInternalRESTConfig.
+// files with the correct semantics). Phase 1 (and the background refresher /
+// prewarm) hold that *rest.Config; they attach it to their OWN ctx via
+// WithInternalRESTConfig.
 // ClientConfigFor consults the context first and returns that pre-built
 // *rest.Config verbatim — bypassing the base64/cert-only kubeconfig path.
-// Ordinary per-user requests never set it and take the unchanged
-// kubeconfig.NewClientConfig path, so this is behavior-neutral for them.
+// LIVE per-user requests never set it and take the unchanged
+// kubeconfig.NewClientConfig path (dialing as the user), so this is
+// behavior-neutral for them. (Briefly FALSE under the 0.30.166 dispatcher attach —
+// the #268/#269 leak vector that put the SA rc on every per-user /call, so THIS
+// function handed getFromAPIServer the SA config for a per-user read — and TRUE
+// again since Part 1 removed that attach; Part 2 re-gates the remaining background
+// SA-transport re-resolve via rbac.MustRegateSADial.)
 //
 // feedback_no_special_cases.md: this is a uniform mechanism — any
 // internal driver can hand the resolver a pre-built *rest.Config; the
@@ -60,11 +66,15 @@ import (
 // to build a kube client for the given context.
 //
 //   - If the context carries an internal-dispatch *rest.Config (attached
-//     by WithInternalRESTConfig — Phase 1's SA-credentialed walk), that
-//     pre-built config is returned verbatim. This is the load-bearing fix
-//     path: it bypasses kubeconfig.NewClientConfig, which cannot carry the
-//     SA's raw-PEM CA or bearer token.
-//   - Otherwise (every ordinary per-user request) it delegates to
+//     by WithInternalRESTConfig — Phase 1's SA walk, or the background refresher /
+//     prewarm re-resolve, on their OWN ctx), that pre-built config is returned
+//     verbatim. This is the load-bearing fix path: it bypasses
+//     kubeconfig.NewClientConfig, which cannot carry the SA's raw-PEM CA or bearer
+//     token. Post-#268/#269 Part 1 a LIVE per-user request never carries it (the
+//     dispatcher attach was removed); Part 2 re-gates the background re-resolve at
+//     getFromAPIServer via rbac.MustRegateSADial so a denied read is not served
+//     under the SA identity.
+//   - Otherwise (every LIVE per-user request) it delegates to
 //     plumbing's kubeconfig.NewClientConfig(ctx, ep), unchanged — the
 //     per-user `<user>-clientconfig` endpoint is cert-based and
 //     base64-encoded, exactly what that path expects.

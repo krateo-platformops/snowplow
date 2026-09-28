@@ -898,17 +898,17 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// carries the cluster CA verbatim; client-go's transport
 	// installs it correctly. See internal_dispatch.go.
 	//
-	// AUTHORIZATION: in-cluster per-user requests DO carry
-	// cache.WithInternalRESTConfig (dispatchers/restactions.go:262,
-	// dispatchers/widgets.go:273 attach the SA *rest.Config to every
-	// in-cluster per-user request for the TLS-CA reason), so branch C
-	// fetches them under the SA client. dispatchViaInternalRESTConfig
+	// AUTHORIZATION (#268/#269 Part 1): LIVE per-user requests do NOT carry
+	// cache.WithInternalRESTConfig any more — the 0.30.166 dispatcher attach (the
+	// SA-serve leak vector) was removed, so a live request dials its own cert-auth
+	// <user>-clientconfig at branch E and branch C's Gate 1 is false for it. The SA
+	// *rest.Config is on this ctx only for an internal driver (Phase-1 walk /
+	// background refresher / prewarm re-resolve). dispatchViaInternalRESTConfig
 	// re-gates the fetched bytes with the ctx identity at both serve points
-	// (GET-by-name / LIST), exempting only genuine SA / identity-free
-	// operations — a denied per-user read is not served under the SA
-	// identity. OUT-of-cluster requests (dev / unit test) carry no SA config
-	// so dispatchViaInternalRESTConfig returns served=false and this block
-	// is a no-op.
+	// (GET-by-name / LIST), exempting only genuine SA / identity-free operations —
+	// a denied read is not served under the SA identity. Live + OUT-of-cluster
+	// requests carry no SA config so dispatchViaInternalRESTConfig returns
+	// served=false and this block is a no-op.
 	//
 	// A non-nil err here is the REAL apiserver error (a 403, a
 	// genuine connectivity fault). We do NOT fall through to
@@ -967,11 +967,14 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// a bare group-discovery URL /apis/<g>/<v> (no resource segment, no
 	// endpointRef) to enumerate a managed apiVersion's served resources.
 	// That 2-segment path parse-fails ParseAPIServerPathToDep, so it fell
-	// through every CA-bearing branch above to the external fetch, which
-	// builds a plumbing client from the per-user <user>-clientconfig TOKEN-
-	// auth Endpoint — plumbing's tlsConfigFor drops the cluster caData for a
-	// token-auth endpoint (HasCertAuth()-only CA install) → x509: certificate
-	// signed by unknown authority. TRACED:
+	// through every CA-bearing branch above to the external fetch, which builds a
+	// plumbing client from the resolved Endpoint. The x509 failure occurs for a
+	// TOKEN-AUTH endpoint (the snowplow SA endpoint — HasCertAuth() false):
+	// plumbing's tlsConfigFor drops the cluster caData for it (HasCertAuth()-only
+	// CA install) → x509: certificate signed by unknown authority. (The live
+	// <user>-clientconfig is CERT-auth by construction — authn's AuthInfo has no
+	// token field — so it takes the CA-install branch and does NOT hit this; the
+	// dropped-CA defect is specific to the token-auth SA endpoint.) TRACED:
 	// docs/troubleshoot-discovery-url-apistep-x509-2026-06-23.md. Same
 	// plumbing TLS defect internal_dispatch.go documents for the Phase-1 SA
 	// path (0.30.104).

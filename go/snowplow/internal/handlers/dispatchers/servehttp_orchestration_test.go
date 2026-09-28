@@ -47,6 +47,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/rest"
 )
 
 var (
@@ -699,5 +700,66 @@ func TestM12_Widget_NoInternalTransportOnResolveCtx(t *testing.T) {
 
 	if sawEP || sawRC {
 		t.Fatalf("M12 RED (#268/#269 widget): the resolve ctx carried an internal SA endpoint/restconfig (sawEP=%v sawRC=%v) — the attach must stay removed", sawEP, sawRC)
+	}
+}
+
+// TestM12_RA_InClusterSaRCSet_StillNoInternalTransportOnResolveCtx — the
+// architect's strengthening arm (#268/#269 Part 1). The out-of-cluster M12 tests
+// above have saRC==nil, so a nil-guarded endpoint-ONLY re-add
+// (`if r.saEP != nil { WithInternalEndpoint }`) would slip past them. This arm
+// simulates IN-CLUSTER by constructing the handler with saRC NON-nil (as
+// snowplowSARC returns in a pod) and asserts the resolve ctx STILL carries no
+// internal transport — because Part 1 deleted the attach entirely, saRC rides
+// ResolveOptions.SArc only, never the ctx. RED against any regression that
+// re-attaches the SA endpoint/rc to the per-user ctx.
+func TestM12_RA_InClusterSaRCSet_StillNoInternalTransportOnResolveCtx(t *testing.T) {
+	h1BuildWatcher(t)
+	reqCtx := h1ReqCtx(h1User)
+
+	h := &restActionHandler{authnNS: h1NS, saRC: &rest.Config{Host: "https://sa.invalid"}}
+
+	var sawEP, sawRC bool
+	resolved := &templatesv1.RESTAction{}
+	resolved.SetName(h1RAName)
+	resolved.SetNamespace(h1NS)
+	restore := installRAFakes(t, h1RAUnstructured(), func() bool { return true },
+		func(ctx context.Context, opts restactions.ResolveOptions) (*templatesv1.RESTAction, error) {
+			_, sawEP = cache.InternalEndpointFromContext(ctx)
+			_, sawRC = cache.InternalRESTConfigFromContext(ctx)
+			return resolved, nil
+		})
+	defer restore()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/call", nil).WithContext(reqCtx)
+	h.ServeHTTP(rec, req)
+
+	if sawEP || sawRC {
+		t.Fatalf("M12 in-cluster RED (#268/#269): saRC set on the handler (in-cluster) must NOT reach the resolve ctx as WithInternalEndpoint/WithInternalRESTConfig — the attach was removed in Part 1 and must NOT return (sawEP=%v sawRC=%v). saRC rides ResolveOptions.SArc only.", sawEP, sawRC)
+	}
+}
+
+// TestM12_Widget_InClusterSaRCSet_StillNoInternalTransportOnResolveCtx — the widget twin.
+func TestM12_Widget_InClusterSaRCSet_StillNoInternalTransportOnResolveCtx(t *testing.T) {
+	h1BuildWatcher(t)
+	reqCtx := h1ReqCtx(h1User)
+
+	h := &widgetsHandler{authnNS: h1NS, saRC: &rest.Config{Host: "https://sa.invalid"}}
+
+	var sawEP, sawRC bool
+	restore := installWidgetFakes(t, h1WidgetUnstructured(map[string]any{}), func() bool { return true },
+		func(ctx context.Context, opts widgets.ResolveOptions) (*widgets.Widget, error) {
+			_, sawEP = cache.InternalEndpointFromContext(ctx)
+			_, sawRC = cache.InternalRESTConfigFromContext(ctx)
+			return h1WidgetUnstructured(map[string]any{}), nil
+		})
+	defer restore()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/call", nil).WithContext(reqCtx)
+	h.ServeHTTP(rec, req)
+
+	if sawEP || sawRC {
+		t.Fatalf("M12 in-cluster RED (#268/#269 widget): saRC set on the handler must NOT reach the resolve ctx (sawEP=%v sawRC=%v) — the attach must stay removed.", sawEP, sawRC)
 	}
 }

@@ -66,14 +66,16 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 	}
 	if ref == nil {
 		// 0.30.102 Tag B: when the request is driven by an internal /
-		// startup path (Phase 1's SA-credentialed resolution walk) the
-		// context carries an explicit internal-dispatch endpoint via
-		// cache.WithInternalEndpoint. There is no `<user>-clientconfig`
+		// startup path (Phase 1's SA walk, or the background refresher /
+		// prewarm re-resolve) the context carries an explicit internal-dispatch
+		// endpoint via cache.WithInternalEndpoint. There is no `<user>-clientconfig`
 		// Secret for the synthetic SA identity, so the per-user lookup
 		// below would fail; consult the context-carried endpoint first.
-		// Ordinary per-user requests never set it — they fall through
-		// to the unchanged clientconfig path. General mechanism, not a
-		// per-resource carve-out (feedback_no_special_cases.md).
+		// LIVE per-user requests never set it — they fall through to the unchanged
+		// clientconfig path. (This was briefly FALSE under the 0.30.166 attach,
+		// which put the SA endpoint on every per-user /call — the #268/#269 leak
+		// vector — and is TRUE again since Part 1 removed that attach.) General
+		// mechanism, not a per-resource carve-out (feedback_no_special_cases.md).
 		if v, ok := cache.InternalEndpointFromContext(ctx); ok {
 			if ep, epOK := v.(*endpoints.Endpoint); epOK && ep != nil {
 				// PROVENANCE: the context-carried internal endpoint is ALWAYS the SA

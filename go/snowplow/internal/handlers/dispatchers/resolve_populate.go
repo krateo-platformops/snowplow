@@ -493,6 +493,15 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 	// (it still COUNTS toward the aggregate once admitted — the OOM floor is
 	// preserved). Covers BOTH the content-refresh and RA/widget-refresh branches
 	// below (this is the single refresher resolve entry).
+	//
+	// LOAD-BEARING for rbac.MustRegateSADial (#268/#269 Part 2 drift-guard):
+	// this is THE stamp that makes the refresher's per-user-representative
+	// re-resolve (saCred + a REAL non-SA identity, i.e. !ServesUnnarrowed)
+	// satisfy the guard's BackgroundResolve conjunct, so a denied read is
+	// re-gated at objects.getFromAPIServer / branch E. Dropping it makes
+	// MustRegateSADial go false for the refresher and re-opens the leak. The
+	// drift-guard (the WithInternal* producer census + the sa_regate invariant
+	// table) enforces this; the step-4 refresher arm trips if it is removed.
 	ctx = cache.WithBackgroundResolve(ctx)
 
 	// Ship F1 (0.30.119): an api-stage entry is a CONTENT-keyed K8s call
