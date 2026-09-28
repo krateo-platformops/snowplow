@@ -8,6 +8,7 @@ package objects
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -16,6 +17,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -268,6 +270,31 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 			res.Err = response.New(http.StatusNotFound, err)
 		}
 
+		return
+	}
+
+	// Part 2 (#269 site 3): re-gate the SA-credentialed fetch. cli.Get above ran
+	// under the ctx *rest.Config, which for the BACKGROUND refresher is the SA
+	// config (cache.ClientConfigFor) even though the ctx identity is a
+	// per-user-cohort REPRESENTATIVE (non-SA). Without this gate the refresher's
+	// re-resolve serves a denied object under the SA and re-populates a per-user L1
+	// cell cross-user. mustRegateSADial is FALSE for a live request (no SA cred on
+	// ctx post-Part-1 → dials as the user, authoritative 403) and for a genuine
+	// SA / identity-free operation (serveUnnarrowed) — so both are unchanged; it is
+	// TRUE only for an SA-credentialed dispatch under a real narrowing identity,
+	// where we apply the SAME per-user gate the informer branch uses (filterGetByRBAC)
+	// and FAIL CLOSED on deny. No per-resource carve-outs (feedback_no_special_cases).
+	if rbac.MustRegateSADial(ctx) && !filterGetByRBAC(ctx, res.GVR, uns) {
+		log.Warn("objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", res.GVR.String()),
+			slog.String("namespace", ref.Namespace),
+			slog.String("name", ref.Name),
+		)
+		res.Unstructured = nil
+		res.Err = response.New(http.StatusForbidden,
+			apierrors.NewForbidden(res.GVR.GroupResource(), ref.Name,
+				fmt.Errorf("user not authorized to get %s/%s", ref.Namespace, ref.Name)))
 		return
 	}
 

@@ -252,28 +252,13 @@ func resetInternalClientCacheForTest() {
 // falls through to narrowing. Exempting on Username=="" would re-open the
 // leak for group-only identities.
 func internalDispatchServesUnnarrowed(ctx context.Context) bool {
-	// (a) Phase-1 walk / cohort seed / content-prewarm.
-	if _, ok := cache.ServeWatcherFromContext(ctx); ok {
-		return true
-	}
-	// (b) api-stage content-cell populate.
-	if cache.ApistageContentResolveFromContext(ctx) {
-		return true
-	}
-	// (c) identity-free populate — no subject to narrow against.
-	user, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		return true
-	}
-	// (d) canonical ServiceAccount identity. Reuse the rbac package's
-	// canonical SA-username parser — never hand-roll the
-	// "system:serviceaccount:" prefix test.
-	if rbac.IsServiceAccountUsername(user.Username) {
-		return true
-	}
-	// A group-only user (empty Username, non-empty Groups) reaches here and
-	// IS narrowed — it is a real end-user (RC2).
-	return false
+	// Part 2 (#268/#269): single source of truth. The predicate (clauses (a)
+	// ServeWatcher, (b) ApistageContentResolve, (c) no-UserInfo, (d) canonical SA
+	// username; a real/representative/group-only end-user → false) now lives in
+	// rbac.ServesUnnarrowed so BOTH carriers — branch C here, branch E, and
+	// objects.getFromAPIServer — and the Part-2 rbac.MustRegateSADial guard share
+	// ONE derivation and cannot drift.
+	return rbac.ServesUnnarrowed(ctx)
 }
 
 // internalDispatchRBACSnapshotUnpublished reports whether the RBAC snapshot

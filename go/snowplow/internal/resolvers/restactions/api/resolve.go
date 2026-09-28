@@ -33,6 +33,7 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -1115,6 +1116,37 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// result is still SERVED — identical to the #313 partial posture), so
 	// external data is re-fetched LIVE every /call and never persisted under a
 	// TTL it has no dep edge to invalidate.
+	// Part 2 (#268 site 1) — re-gate the SA-ENDPOINT dial at branch E. Reaching here
+	// is the external fall-through: every CA-bearing in-memory / branch-C path
+	// declined. For a NON-UAF step whose endpoint is snowplow's own SA endpoint
+	// (provenance: cache.ServiceAccountDialFromContext, set when resolveOne returned
+	// the ctx internal endpoint) under a re-gate context (rbac.MustRegateSADial — the
+	// SA cred is on the ctx AND the identity is a REAL narrowing subject, i.e. the
+	// refresher's per-user-cohort representative), the SA dial would read tenant data
+	// the caller may not (subresource / RC1 / unparseable — none reached the branch-C
+	// re-gate). FAIL CLOSED BEFORE the fetch — never issue the SA read — recording a
+	// per-item error (ContinueOnError honoured), so the refresher's Put-gate declines.
+	//   - UAF stages (UserAccessFilter != nil) are EXEMPT: they dial the SA endpoint
+	//     BY DESIGN and re-narrow the result via the refilter — their gate is downstream.
+	//   - A LIVE request carries no SA cred on the ctx post-Part-1 (mustRegateSADial
+	//     false) → dials the per-user endpoint unchanged.
+	//   - A genuine SA / identity-free refresh (serveUnnarrowed) → mustRegateSADial
+	//     false → the legitimate un-gated SA serve is unchanged.
+	if apiCall.UserAccessFilter == nil && cache.ServiceAccountDialFromContext(gctx) && rbac.MustRegateSADial(gctx) {
+		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", call.Path)
+		r.log.Warn("branch-E SA-endpoint dial re-gated and failed closed",
+			slog.String("name", id), slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path))
+		var itemErr error
+		if !call.ContinueOnError {
+			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
+		}
+		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, msg, msg, itemErr)
+		r.log.Debug("api resolved (branch-E SA-endpoint dial re-gated, fail-closed)",
+			slog.String("name", id), slog.String("host", call.Endpoint.ServerURL),
+			slog.String("path", call.Path),
+			slog.String("dispatch", "branch-e-sa-regate-denied"))
+		return nil
+	}
 	cache.ExternalTouchedSinkFromContext(gctx).Bump()
 	// Boot-readiness external-fetch wall-clock bound (external_seed_bound.go).
 	// The Bump() STAYS before the wrap so a timed-out fetch still records the
