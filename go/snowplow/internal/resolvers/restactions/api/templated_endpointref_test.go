@@ -74,7 +74,7 @@ func TestT1_ClientconfigForgery_RefusedInResolveOne_NeverDials(t *testing.T) {
 
 	// GREEN: templated=true → refused BEFORE the snapshot lookup. The sentinel
 	// admin ServerURL must NEVER be returned.
-	ep, err := m.resolveOne(context.Background(), forged, true /*templated*/)
+	ep, _, err := m.resolveOne(context.Background(), forged, true /*templated*/)
 	if err == nil {
 		t.Fatal("C-113-1 layer(b) VIOLATED: resolveOne accepted a templated ref resolving to admin-clientconfig — a request-driven endpointRef selected a per-user credential Secret (escalation)")
 	}
@@ -91,7 +91,7 @@ func TestT1_ClientconfigForgery_RefusedInResolveOne_NeverDials(t *testing.T) {
 	// This is EXACTLY what a request-templated ref must never be able to reach;
 	// it proves the guard's verdict flips SOLELY on the templated marker (if the
 	// marker didn't gate, the templated call above would have returned this too).
-	epRed, errRed := m.resolveOne(context.Background(), forged, false /*NOT templated → the pre-guard path*/)
+	epRed, _, errRed := m.resolveOne(context.Background(), forged, false /*NOT templated → the pre-guard path*/)
 	if errRed != nil || epRed.ServerURL != forgedAdminServerURL {
 		t.Fatalf("C-113-1 RED-control broke: an UNGATED (templated=false) lookup of admin-clientconfig must HIT the seeded sentinel (proving the forge target is reachable absent the marker); got ep=%+v err=%v", epRed, errRed)
 	}
@@ -174,12 +174,36 @@ func TestC113_2_MarkerDefault_InternalSynthesisResolves_TemplatedRefused(t *test
 	// the default every internal/static caller passes). The internal path resolved
 	// SOMETHING (no guardrail refusal); its ServerURL is the internal-dispatch
 	// override (kubernetes.default.svc) OR the seeded victim URL under TestMode.
-	ep, err := m.resolveOne(context.Background(), nil /*internal nil-ref*/, false)
+	ep, isSA, err := m.resolveOne(context.Background(), nil /*internal nil-ref*/, false)
 	if err != nil {
 		t.Fatalf("C-113-2 (i) VIOLATED: the internal nil-ref clientconfig synthesis was refused when UNMARKED (templated=false); the internal path must never be gated by guardrail (b); got %v", err)
 	}
 	if ep.ServerURL == "" {
 		t.Fatalf("C-113-2 (i): internal synthesis resolved to an empty endpoint; got ep=%+v", ep)
+	}
+	// #267 provenance: this nil-ref path consulted the ctx-carried internal endpoint
+	// (the SA endpoint) → resolveOne must report isSAEndpoint=true so the dial site
+	// threads the SA token file. (Here there is no internal endpoint on ctx, so it
+	// fell through to the clientconfig synthesis → isSA=false; assert that shape.)
+	if isSA {
+		t.Fatalf("C-113-2 (i): a clientconfig-synthesis (no internal endpoint on ctx) must report isSAEndpoint=false; got true")
+	}
+
+	// #267 provenance TRUE side (symmetric with the false assertion above, the
+	// load-bearing mechanism): a nil ref WITH an internal (SA) endpoint on ctx MUST
+	// report isSAEndpoint=true — this is what makes runStage stamp
+	// WithServiceAccountDial so the dial threads the self-reloading SA token FILE.
+	saCtx := cache.WithInternalEndpoint(context.Background(),
+		&endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc", Token: "sa-token"})
+	saResolved, saIsSA, saErr := m.resolveOne(saCtx, nil /*internal nil-ref*/, false)
+	if saErr != nil {
+		t.Fatalf("C-113-2 provenance: resolveOne with an internal endpoint on ctx must resolve; got %v", saErr)
+	}
+	if !saIsSA {
+		t.Fatalf("#267 provenance: resolveOne consulting the ctx-carried internal (SA) endpoint MUST report isSAEndpoint=true; got false — the dial-site SA token-file wiring would be silently disabled")
+	}
+	if saResolved.ServerURL != "https://kubernetes.default.svc" {
+		t.Fatalf("C-113-2 provenance: the internal-endpoint branch must return the SA endpoint verbatim; got %+v", saResolved)
 	}
 
 	// (i)-discriminator — the marker is LOAD-BEARING: pass the SAME kind of
@@ -189,7 +213,7 @@ func TestC113_2_MarkerDefault_InternalSynthesisResolves_TemplatedRefused(t *test
 	// (The internal synthesis itself is guard-safe because its ref is nil at the
 	// guard, but the marker's default is what keeps a `-clientconfig`-shaped name
 	// resolvable for the internal path and refused for a request-driven one.)
-	_, markedErr := m.resolveOne(context.Background(), &templates.Reference{Name: "victim-clientconfig", Namespace: authnNS}, true /*templated*/)
+	_, _, markedErr := m.resolveOne(context.Background(), &templates.Reference{Name: "victim-clientconfig", Namespace: authnNS}, true /*templated*/)
 	if markedErr == nil {
 		t.Fatal("C-113-2 (i)-discriminator: a templated `-clientconfig` ref must be refused — proving the templated marker is what gates guardrail (b), so the internal path MUST pass false")
 	}
@@ -198,7 +222,7 @@ func TestC113_2_MarkerDefault_InternalSynthesisResolves_TemplatedRefused(t *test
 	// name is refused. (Uses victim's own name to show even self-selection via a
 	// template is refused: the boundary is the reserved suffix, not cross-user.)
 	forged := &templates.Reference{Name: "victim-clientconfig", Namespace: authnNS}
-	_, terr := m.resolveOne(context.Background(), forged, true /*templated*/)
+	_, _, terr := m.resolveOne(context.Background(), forged, true /*templated*/)
 	if terr == nil {
 		t.Fatal("C-113-2 (ii) VIOLATED: a request-templated `-clientconfig` ref was NOT refused")
 	}

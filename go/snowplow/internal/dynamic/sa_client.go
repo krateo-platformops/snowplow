@@ -200,3 +200,37 @@ func resetSARestConfigForTest() {
 	defer saRestConfigMu.Unlock()
 	saRestConfigInstance = nil
 }
+
+// ServiceAccountTokenFile returns the filesystem path of the projected SA token
+// (#267 robust fix). The dial site (httpClientForEndpoint, package api) threads
+// this into transport.Config.TokenFile, for a dispatch marked
+// cache.WithServiceAccountDial, so client-go's NewCachedFileTokenSource re-reads
+// it on expiry — self-adapting, no static snapshot, no timer. dynamic is the sole
+// minter of the SA endpoint, so the path lives with the minter
+// (feedback_self_adapt_no_magic_env_knobs).
+//
+// There is deliberately NO shape predicate (IsServiceAccountEndpoint): a token-auth
+// per-user <user>-clientconfig is shape-identical to the SA endpoint (same apiserver
+// ServerURL + cluster CAData + token-auth, !HasCertAuth), so the SA endpoint is
+// recognised by PROVENANCE at the resolver (cache.WithServiceAccountDial), never by
+// field shape (arch-268 safety ruling).
+func ServiceAccountTokenFile() string {
+	return saTokenPath
+}
+
+// SetServiceAccountTokenPathForTest overrides the projected SA token path so a
+// cross-package test (the api dial-site wire-bearer arm) can plant + rotate a
+// hermetic token file and observe the file-backed credential on the wire. Returns
+// a restore. Exported test-support ONLY — mirrors the package's other *ForTest
+// hooks (SetSecretsClientForTest, RebuildRBACSnapshotForTest, …); production never
+// calls it. Also clears the SA endpoint singleton so the next mint reads the
+// overridden path.
+func SetServiceAccountTokenPathForTest(path string) func() {
+	orig := saTokenPath
+	saTokenPath = path
+	resetSAEndpointForTest()
+	return func() {
+		saTokenPath = orig
+		resetSAEndpointForTest()
+	}
+}

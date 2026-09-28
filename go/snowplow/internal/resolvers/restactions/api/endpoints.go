@@ -41,7 +41,15 @@ const clientConfigSuffix = "-clientconfig"
 // legitimately produces a `<user>-clientconfig` name and MUST still resolve).
 // Every non-templated caller (internal nil-ref, static author-literal refs)
 // passes false and is byte-identical to pre-#113.
-func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference, templated bool) (endpoints.Endpoint, error) {
+// resolveOne additionally reports isSAEndpoint: true ONLY on the
+// InternalEndpointFromContext branch, which always carries snowplow's own SA
+// endpoint (every WithInternalEndpoint attach passes saEP). This is the PROVENANCE
+// signal the dial site uses to thread the SA token FILE (#267) — the SA endpoint is
+// shape-identical to a token-auth per-user clientconfig, so it can only be
+// distinguished by where it came from, never by field shape (arch-268 ruling). All
+// other returns (guardrail-b, wrong-type fall-through, clientconfig cache-hit,
+// FromSecret, errors) report false.
+func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference, templated bool) (endpoints.Endpoint, bool, error) {
 	isInternal := false
 	// #113 guardrail (b) — defense-in-depth. A REQUEST-TEMPLATED ref may never
 	// resolve to the reserved `<user>-clientconfig` internal-identity class. This
@@ -52,7 +60,7 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 	// credential Secret. Gated on templated so the internal nil-ref synthesis
 	// below (which DOES build a `-clientconfig` name) is never refused.
 	if templated && ref != nil && strings.HasSuffix(ref.Name, clientConfigSuffix) {
-		return endpoints.Endpoint{}, fmt.Errorf(
+		return endpoints.Endpoint{}, false, fmt.Errorf(
 			"templated endpointRef resolved to the reserved internal-identity name %q (suffix %q); refusing — a request-driven endpointRef may not select a per-user credential Secret (#113 guardrail b)",
 			ref.Name, clientConfigSuffix)
 	}
@@ -68,7 +76,11 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 		// per-resource carve-out (feedback_no_special_cases.md).
 		if v, ok := cache.InternalEndpointFromContext(ctx); ok {
 			if ep, epOK := v.(*endpoints.Endpoint); epOK && ep != nil {
-				return *ep, nil
+				// PROVENANCE: the context-carried internal endpoint is ALWAYS the SA
+				// endpoint → isSAEndpoint=true. The dial site threads the SA token
+				// FILE (#267) for it; a per-user clientconfig (resolved below via
+				// FromSecret) is never marked, so it keeps its own static token.
+				return *ep, true, nil
 			}
 			// The context carried an internal endpoint but it is not a
 			// usable *endpoints.Endpoint (wrong shape, or a nil pointer).
@@ -106,7 +118,7 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 		// (server-url missing). Upstream FromSecret would have
 		// returned the same error verbatim — we propagate it.
 		if ferr != nil {
-			return ep, ferr
+			return ep, false, ferr
 		}
 		// AC-D2.7 — the isInternal+!env.TestMode ServerURL override
 		// applies UNIFORMLY on both the cache-hit and the upstream-
@@ -117,7 +129,7 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 		if isInternal && !env.TestMode() {
 			ep.ServerURL = "https://kubernetes.default.svc"
 		}
-		return ep, nil
+		return ep, false, nil
 	}
 
 	// Ship D (0.30.141) — F-3: endpoints.FromSecret issues a per-user
@@ -131,7 +143,7 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 	cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
 	ep, err := endpoints.FromSecret(ctx, m.rc, ref.Name, ref.Namespace)
 	if err != nil {
-		return ep, err
+		return ep, false, err
 	}
 	// Ship 0.30.165 — normalize CA bytes to the single-base64-encoded
 	// PEM shape that plumbing's transport expects (see endpoints_ca.go).
@@ -143,5 +155,5 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 		ep.ServerURL = "https://kubernetes.default.svc"
 	}
 
-	return ep, nil
+	return ep, false, nil
 }

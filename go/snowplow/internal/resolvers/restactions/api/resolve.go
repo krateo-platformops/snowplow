@@ -371,7 +371,7 @@ const (
 //   - non-UAF + resolveOne err → log; return (zero, stageReturn)
 //     (R-2: the resolve truncates — the orchestrator returns r.dict).
 //   - success → return (ep, stageProceed).
-func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, stageAction) {
+func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, bool, stageAction) {
 	if uafActive {
 		saEP, saErr := serviceAccountEndpointFn()
 		if saErr != nil {
@@ -383,9 +383,11 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 			// bearer token to a SA-marked stage). Returning
 			// an empty result for this stage and continuing.
 			r.dict[id] = map[string]any{"items": []any{}}
-			return endpoints.Endpoint{}, stageContinue
+			return endpoints.Endpoint{}, false, stageContinue
 		}
-		return *saEP, stageProceed
+		// The UAF stage dials the SA endpoint → isSAEndpoint=true (provenance): the
+		// dial site threads the SA token FILE (#267).
+		return *saEP, true, stageProceed
 	}
 	// #113 — template endpointRef.name through the SAME jq/extras evaluator that
 	// already renders this stage's path/payload/headers (evalJQ over r.dict, the
@@ -403,15 +405,15 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		// failure (R-2 stageReturn) — the Secret is never dialed.
 		r.log.Error("templated endpoint reference refused",
 			slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", guardErr))
-		return endpoints.Endpoint{}, stageReturn
+		return endpoints.Endpoint{}, false, stageReturn
 	}
-	resolved, err := r.mapper.resolveOne(r.ctx, ref, templated)
+	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref, templated)
 	if err != nil {
 		r.log.Error("unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
-		return endpoints.Endpoint{}, stageReturn
+		return endpoints.Endpoint{}, false, stageReturn
 	}
-	return resolved, stageProceed
+	return resolved, isSA, stageProceed
 }
 
 // evalEndpointRef renders a templated endpointRef.name (#113). For a nil ref or
@@ -1315,7 +1317,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// #57 (C-b): the user-bearer-token append moved to AFTER endpoint
 	// resolution (was before) so the self-loopback arm can compare the
 	// RESOLVED endpoint host against the configured self-host.
-	ep, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
+	ep, isSA, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
 	switch epAction {
 	case stageContinue:
 		recordStageTiming()
@@ -1448,6 +1450,16 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// neither the walk nor the lock runs.
 	var dictMu sync.Mutex
 	g, gctx := errgroup.WithContext(r.ctx)
+	// #267/#268/#269 — PROVENANCE marker for the dial site. When this stage's
+	// endpoint is snowplow's own SA endpoint (isSA, from resolveStageEndpoint:
+	// the ctx-carried internal endpoint or the UAF SA endpoint), mark the per-stage
+	// dispatch ctx so httpClientForEndpoint threads the SA token FILE (self-reloading,
+	// #267) rather than a read-once static token. Per-stage granularity: a non-SA
+	// (per-user clientconfig / named-ref) stage's gctx is never marked. Only ADDS a
+	// ctx value — g's Done channel (errgroup cancellation) is preserved.
+	if isSA {
+		gctx = cache.WithServiceAccountDial(gctx)
+	}
 	g.SetLimit(iterParallelism(r.ctx))
 
 	// Ship 0.30.257 (#313) — per-item error slots (design §2.1 / §3.2).
