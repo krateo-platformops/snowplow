@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"k8s.io/client-go/transport"
 )
 
@@ -79,7 +82,7 @@ import (
 // memoises the transport in client-go's `tlsCache`, so repeated calls
 // share connections instead of building a fresh transport per request
 // the way plumbing does.
-func httpClientForEndpoint(ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, error) {
+func httpClientForEndpoint(ctx context.Context, ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, error) {
 	if !endpointNeedsOwnedCAClient(ep) {
 		return httpcall.HTTPClientForEndpoint(ep, ri)
 	}
@@ -112,8 +115,28 @@ func httpClientForEndpoint(ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*h
 	}
 
 	cfg := &transport.Config{
-		TLS:         transport.TLSConfig{CAData: caPEM},
-		BearerToken: ep.Token,
+		TLS: transport.TLSConfig{CAData: caPEM},
+	}
+	// #267 robust fix (design §4). When this dispatch dials snowplow's own SA
+	// endpoint — recognised by PROVENANCE (cache.WithServiceAccountDial, stamped by
+	// runStage when resolveStageEndpoint returned the ctx-carried internal endpoint
+	// or the UAF SA endpoint), NEVER by field shape — thread the token FILE so
+	// client-go's NewBearerAuthWithRefreshRoundTripper / NewCachedFileTokenSource
+	// re-reads it on expiry (self-adapting, no timer). A read-once static ep.Token
+	// goes stale → 401 (the #267 defect, the accident masking #268 branch E).
+	//
+	// Every unmarked dispatch keeps the static ep.Token — a per-user
+	// <user>-clientconfig (token OR cert auth, resolved via FromSecret, never
+	// marked) and any external endpoint are byte-identical to before. This is why
+	// the marker is provenance, not shape: a token-auth clientconfig is
+	// shape-identical to the SA endpoint (same apiserver ServerURL + cluster CAData
+	// + token-auth) and would be misclassified by a field predicate, reintroducing
+	// #268/#269. (client-go lets BearerTokenFile take precedence over BearerToken,
+	// config.go:45; the if/else sets exactly one, so precedence never matters here.)
+	if cache.ServiceAccountDialFromContext(ctx) {
+		cfg.BearerTokenFile = dynamic.ServiceAccountTokenFile()
+	} else {
+		cfg.BearerToken = ep.Token
 	}
 
 	// THE TWO LIBRARIES DEFINE "basic auth" ON DIFFERENT FIELDS, and copying

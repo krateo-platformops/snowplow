@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
@@ -100,7 +101,7 @@ func TestIssue229_Arm11_PasswordOnlyBasicAuthIsNotSilentlyDropped(t *testing.T) 
 	}
 
 	// (2) THE WIRE: the credential must actually arrive.
-	cli, err := httpClientForEndpoint(ep, &httpcall.RequestInfo{Verb: ptr.To(http.MethodGet)})
+	cli, err := httpClientForEndpoint(context.Background(), ep, &httpcall.RequestInfo{Verb: ptr.To(http.MethodGet)})
 	if err != nil {
 		t.Fatalf("ARM11 FAIL: building a client for this shape errored: %v", err)
 	}

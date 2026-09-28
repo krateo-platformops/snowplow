@@ -8,7 +8,6 @@ import (
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
-	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/maps"
@@ -20,18 +19,14 @@ import (
 )
 
 func Widgets() http.Handler {
-	// Ship 0.30.167 — Option 2 parallelism regression fix. Same shape
-	// as RESTAction() above and RegisterRefreshHandlers at
-	// dispatchers.go:56-66 (the load-bearing prior art): resolve the
-	// SA transport pair ONCE at handler construction, capture into
-	// struct fields, attach in ServeHTTP via a cheap nil-check + field
-	// read. Eliminates the per-request snowplowSACtx() helper call
-	// that serialised dispatches through the SA singletons' mutexes.
-	saEP, saRC := snowplowSACtx()
+	// Part 1 (#268/#269): same shape as RESTAction() — the SA-credential ATTACH is
+	// REMOVED (see ServeHTTP). Only the SA *rest.Config is captured once and passed
+	// as ResolveOptions.RC (clientconfig-Secret read + CRD-status validation), never
+	// put on the per-user ctx.
+	saRC := snowplowSARC()
 	return &widgetsHandler{
 		authnNS: env.String("AUTHN_NAMESPACE", ""),
 		verbose: env.True("DEBUG"),
-		saEP:    saEP,
 		saRC:    saRC,
 	}
 }
@@ -39,9 +34,10 @@ func Widgets() http.Handler {
 type widgetsHandler struct {
 	authnNS string
 	verbose bool
-	// saEP + saRC: see restActionHandler.saEP / saRC. Same shape;
-	// captured at handler construction.
-	saEP *endpoints.Endpoint
+	// saRC: see restActionHandler.saRC. Part 1 (#268/#269) removed the SA-credential
+	// attach; saRC is passed ONLY as ResolveOptions.RC (clientconfig-Secret read +
+	// CRD-status validation), never attached to the per-user request ctx. nil
+	// out-of-cluster.
 	saRC *rest.Config
 }
 
@@ -263,15 +259,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 
 	ctx := xcontext.BuildContext(req.Context())
-	// Ship 0.30.167 — Option 2 parallelism regression fix. Symmetric
-	// with restactions.go: read the SA transport pair from struct
-	// fields populated once at Widgets() construction. AC-307.7 byte-
-	// identical out-of-cluster: snowplowSACtx returned (nil, nil) so
-	// both fields are nil and the attach below SKIPS.
-	if r.saEP != nil && r.saRC != nil {
-		ctx = cache.WithInternalEndpoint(ctx, r.saEP)
-		ctx = cache.WithInternalRESTConfig(ctx, r.saRC)
-	}
+	// Part 1 (#268/#269) — the SA-credential ATTACH is REMOVED (symmetric with
+	// restactions.go). It put the SA endpoint + *rest.Config on THIS per-user ctx,
+	// which #269 rode via objects.getFromAPIServer → cache.ClientConfigFor to fetch a
+	// widget apiRef target the caller may not read, under the SA. With the attach
+	// gone, ClientConfigFor returns the per-user config → the apiRef target is dialed
+	// as the user (authoritative 403). saRC is still passed as ResolveOptions.RC
+	// below (clientconfig-Secret read + CRD-status validation), never on the ctx.
 	// 0.30.94 Edge type 3: attach the L1 key being populated so the
 	// underlying restactions resolver (called transitively via apiRef)
 	// records dep edges against each inner K8s call. Widget L1 key

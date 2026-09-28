@@ -11,7 +11,6 @@ import (
 	"strconv"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
-	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/http/response"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
@@ -964,16 +963,23 @@ func writeResolvedJSON(wri http.ResponseWriter, payload []byte) {
 // warn already exists at dispatchers.go:58-66 (RegisterRefreshHandlers)
 // where the SAME SA pair is fetched once for the refresher; a missing
 // SA there is surfaced once and is sufficient for diagnosis.
-func snowplowSACtx() (*endpoints.Endpoint, *rest.Config) {
-	saEP, err := idynamic.ServiceAccountEndpoint()
-	if err != nil {
-		return nil, nil
-	}
+func snowplowSARC() *rest.Config {
+	// Part 1 (#268/#269): the SA-credential ATTACH on the per-user dispatch ctx
+	// (WithInternalEndpoint/WithInternalRESTConfig) is REMOVED — it was the SA-serve
+	// leak vector (branch C and objects.getFromAPIServer dialed tenant data as the
+	// SA). The SA endpoint is therefore no longer acquired here; UAF stages get it
+	// independently via serviceAccountEndpointFn. Only the SA *rest.Config remains,
+	// captured once (Ship 0.30.167 cadence) and passed as ResolveOptions.SArc/RC —
+	// used solely to READ the caller's own <user>-clientconfig Secret
+	// (endpoints.FromSecret, the informer-miss fallback) and for CRD-status
+	// validation; it is NEVER put on the per-user ctx, so no dispatch dials tenant
+	// data as the SA. AC-307.7 out-of-cluster invariant preserved: no in-cluster
+	// config → nil → SArc nil → the unchanged empty-resolve behaviour.
 	saRC, err := idynamic.ServiceAccountRESTConfig()
 	if err != nil {
-		return nil, nil
+		return nil
 	}
-	return saEP, saRC
+	return saRC
 }
 
 // rcFromCtx returns the SA *rest.Config that an internal driver

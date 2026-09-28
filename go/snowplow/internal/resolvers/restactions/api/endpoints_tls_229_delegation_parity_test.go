@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -172,7 +173,7 @@ func TestIssue229_Arm10_DelegationParityForNonOwnedShapes(t *testing.T) {
 			// next reader does not mistake it for a divergence introduced by
 			// this fix.
 			ri := &httpcall.RequestInfo{Verb: ptr.To(http.MethodGet)}
-			ownedCli, ownedErr := httpClientForEndpoint(tc.ep(srv.URL), ri)
+			ownedCli, ownedErr := httpClientForEndpoint(context.Background(), tc.ep(srv.URL), ri)
 			delegateCli, delegateErr := httpcall.HTTPClientForEndpoint(tc.ep(srv.URL), ri)
 
 			// (a) construction-outcome parity.

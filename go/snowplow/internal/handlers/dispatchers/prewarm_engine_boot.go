@@ -329,6 +329,15 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 	// bound (the 1.5.28 adaptive aggregate). 1 line, ctx-only, no behaviour
 	// change to accounting (background differs only at admission). See
 	// cache.WithBackgroundResolve.
+	//
+	// Named in rbac.MustRegateSADial's production-equivalence argument
+	// (sa_regate.go: "both set WithBackgroundResolve: resolve_populate.go,
+	// prewarm_engine_boot.go") as one of the two BackgroundResolve stamps that
+	// scope the #268/#269 Part 2 guard. Here it is belt-and-braces: the
+	// withPhase1SAContext below ALSO makes this ctx ServesUnnarrowed (its
+	// ServeWatcher / canonical-SA identity), so MustRegateSADial is already
+	// false via !ServesUnnarrowed. The load-bearing BackgroundResolve stamp is
+	// resolve_populate.go:496 (the refresher's per-user representative).
 	ctx = cache.WithBackgroundResolve(ctx)
 	rctx := withPhase1SAContext(ctx, deps.saEP, deps.saRC)
 

@@ -254,7 +254,7 @@ func TestResolveStageEndpoint_UAF_SAAcquireFailure_FailClosedButResponds(t *test
 		},
 	}
 
-	ep, action := r.resolveStageEndpoint("compositions", apiCall, true /*uafActive*/)
+	ep, _, action := r.resolveStageEndpoint("compositions", apiCall, true /*uafActive*/)
 
 	if acquireCalls.Load() != 1 {
 		t.Fatalf("SA-endpoint acquire must be attempted exactly once via the seam, got %d", acquireCalls.Load())
@@ -304,12 +304,20 @@ func TestResolveStageEndpoint_UAF_SAAcquireSuccess_Proceeds(t *testing.T) {
 		UserAccessFilter: &templates.UserAccessFilterSpec{Verb: "list", Group: "composition.krateo.io", Resource: "compositions"},
 	}
 
-	ep, action := r.resolveStageEndpoint("compositions", apiCall, true)
+	ep, isSA, action := r.resolveStageEndpoint("compositions", apiCall, true)
 	if action != stageProceed {
 		t.Fatalf("control: a successful SA acquire must return stageProceed; got %v", action)
 	}
 	if ep.ServerURL != saEP.ServerURL || ep.Token != saEP.Token {
 		t.Fatalf("control: a successful SA acquire must return the SA endpoint; got %+v", ep)
+	}
+	// #267 PROVENANCE (load-bearing): the UAF stage dials the SA endpoint, so it
+	// MUST report isSAEndpoint=true — this is what makes runStage stamp
+	// WithServiceAccountDial and the dial thread the self-reloading SA token FILE.
+	// A regression that dropped the stamp (returned false) would silently disable
+	// the #267 fix; assert the TRUE side, not only the false side.
+	if !isSA {
+		t.Fatalf("#267: a UAF stage (SA-endpoint dispatch) must report isSAEndpoint=true; got false — the dial-site SA token-file wiring would be silently disabled")
 	}
 	if _, wrote := r.dict["compositions"]; wrote {
 		t.Fatalf("control: the SUCCESS path must NOT write the empty-result placeholder")
