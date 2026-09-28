@@ -7,7 +7,6 @@ import (
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
-	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/snowplow/apis"
@@ -20,25 +19,16 @@ import (
 )
 
 func RESTAction() http.Handler {
-	// Ship 0.30.167 — Option 2 parallelism regression fix.
-	// Resolve the snowplow SA endpoint + *rest.Config ONCE at handler
-	// construction (the same cadence the refresher uses at
-	// dispatchers.go:56-66 RegisterRefreshHandlers — the load-bearing
-	// prior art for this shape). The resolved pair is then captured as
-	// struct fields and attached to the per-request ctx in ServeHTTP
-	// via a cheap nil-check + field read, eliminating the per-request
-	// snowplowSACtx() helper call (which transitively re-acquired the
-	// SA singletons' mutexes on every dispatch).
-	//
-	// Out-of-cluster (unit tests, developer runs): snowplowSACtx
-	// returns (nil, nil); both fields stay nil; the ServeHTTP attach
-	// block then skips the WithInternalEndpoint / WithInternalRESTConfig
-	// calls, preserving AC-307.7 byte-identically.
-	saEP, saRC := snowplowSACtx()
+	// Part 1 (#268/#269): the SA-credential ATTACH is REMOVED (see ServeHTTP). Only
+	// the SA *rest.Config is captured ONCE at construction (Ship 0.30.167 cadence)
+	// and passed as ResolveOptions.SArc — used solely to read the caller's own
+	// <user>-clientconfig Secret (FromSecret, informer-miss fallback), never put on
+	// the per-user ctx. Out-of-cluster (unit tests): snowplowSARC returns nil →
+	// SArc nil → the unchanged empty-resolve behaviour (AC-307.7 preserved).
+	saRC := snowplowSARC()
 	return &restActionHandler{
 		authnNS: env.String("AUTHN_NAMESPACE", ""),
 		verbose: env.True("DEBUG"),
-		saEP:    saEP,
 		saRC:    saRC,
 	}
 }
@@ -46,12 +36,11 @@ func RESTAction() http.Handler {
 type restActionHandler struct {
 	authnNS string
 	verbose bool
-	// saEP + saRC are the snowplow ServiceAccount transport pair
-	// captured at handler construction (Ship 0.30.167 Option 2). Both
-	// may be nil in out-of-cluster runs; ServeHTTP nil-checks before
-	// attaching to the request ctx. Mirrors RegisterRefreshHandlers'
-	// closure-captured saEP/saRC at dispatchers.go:56-66.
-	saEP *endpoints.Endpoint
+	// saRC is the snowplow ServiceAccount *rest.Config captured at construction
+	// (Ship 0.30.167 cadence). Post Part 1 it is passed ONLY as ResolveOptions.SArc
+	// (read the caller's own clientconfig Secret + CRD-status validation); it is
+	// NEVER attached to the per-user request ctx — that attach was the #268/#269
+	// SA-serve leak vector and is removed. nil out-of-cluster.
 	saRC *rest.Config
 }
 
@@ -244,23 +233,16 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	}
 
 	ctx := xcontext.BuildContext(req.Context())
-	// Ship 0.30.167 — Option 2 parallelism regression fix.
-	// Read the SA transport pair from struct fields populated once at
-	// RESTAction() construction (Ship 0.30.166 attached the pair to ctx
-	// PER REQUEST via snowplowSACtx() — under concurrent /call load that
-	// serialised every dispatch through the SA singletons' mutexes).
-	// The construction-time capture mirrors RegisterRefreshHandlers'
-	// closure-captured saEP/saRC at dispatchers.go:56-66.
-	//
-	// AC-307.7 OUT-OF-CLUSTER INVARIANT: snowplowSACtx returns (nil, nil)
-	// when the projected SA volume is absent (every unit test, every
-	// out-of-cluster developer run); both fields stay nil; the nil-guard
-	// below then SKIPS the attach and the request ctx is byte-identical
-	// to pre-0.30.166.
-	if r.saEP != nil && r.saRC != nil {
-		ctx = cache.WithInternalEndpoint(ctx, r.saEP)
-		ctx = cache.WithInternalRESTConfig(ctx, r.saRC)
-	}
+	// Part 1 (#268/#269) — the SA-credential ATTACH is REMOVED. Ship 0.30.166 put
+	// the SA endpoint + *rest.Config on THIS per-user ctx
+	// (WithInternalEndpoint/WithInternalRESTConfig) for a TLS-CA reason; that made
+	// branch C and objects.getFromAPIServer (via cache.ClientConfigFor) dial tenant
+	// data as the SA — the SA-serve leak. With the attach gone, a no-endpointRef
+	// step's resolveOne(nil) falls to the per-user <user>-clientconfig (cert-auth,
+	// apiserver-authoritative RBAC) and getFromAPIServer's ClientConfigFor dials as
+	// the user. UAF stages still reach the SA endpoint via serviceAccountEndpointFn
+	// (marked WithServiceAccountDial → the #267 file-backed token at the dial). The
+	// TLS-CA reason is superseded by #229's owned-CA client (endpoints_tls.go).
 	// 0.30.94 Edge type 3: attach the L1 key being populated so the
 	// resolver can record dep edges for each inner K8s call it makes.
 	// Empty cacheKey (L1 disabled, RBAC-skipped) is a no-op inside

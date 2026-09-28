@@ -199,27 +199,30 @@ func discoveryDoc(path string) (string, bool) {
 	return "", false
 }
 
-// saLeakEP / saLeakRC are the SA credentials the harness attaches to the handler
-// struct — the SAME shape snowplowSACtx() returns in-cluster (dynamic.
-// ServiceAccountEndpoint / ServiceAccountRESTConfig), pointed at the hermetic
-// server and carrying a VALID token.
-func saLeakEP(url string) *endpoints.Endpoint {
-	return &endpoints.Endpoint{ServerURL: url, Token: saLeakToken}
-}
-
+// saLeakRC is the SA *rest.Config the harness sets on the handler (the SAME field
+// production populates via snowplowSARC in-cluster), pointed at the hermetic server
+// and carrying a VALID token.
+//
+// PRE Part 1 these arms were RED: the dispatcher's attach put the SA endpoint +
+// this rc on the per-user ctx (WithInternalEndpoint/WithInternalRESTConfig), which
+// branch E and objects.getFromAPIServer dialed as the SA → the leak. POST Part 1
+// there is NO attach — saRC rides ResolveOptions.SArc only (clientconfig-Secret
+// read), never the ctx — so a no-endpointRef step dials as the user and the arms
+// flip GREEN. They remain permanent regression guards: driving the REAL ServeHTTP,
+// they go RED again if any change re-attaches the SA transport to the per-user ctx.
 func saLeakRC(url string) *rest.Config {
 	return &rest.Config{Host: url, BearerToken: saLeakToken}
 }
 
-// newRALeakHandler / newWidgetLeakHandler construct the REAL handler with the
-// production attach ARMED (saEP/saRC non-nil) — the crossed state the leak needs,
-// produced exactly as in-cluster, not hand-installed on the ctx.
+// newRALeakHandler / newWidgetLeakHandler construct the REAL handler as production
+// does in-cluster (saRC set from the SA rc). No attach exists post Part 1; the
+// handler drives the REAL ServeHTTP so the arms observe the live dispatch path.
 func newRALeakHandler(url string) *restActionHandler {
-	return &restActionHandler{authnNS: "krateo-system", saEP: saLeakEP(url), saRC: saLeakRC(url)}
+	return &restActionHandler{authnNS: "krateo-system", saRC: saLeakRC(url)}
 }
 
 func newWidgetLeakHandler(url string) *widgetsHandler {
-	return &widgetsHandler{authnNS: "krateo-system", saEP: saLeakEP(url), saRC: saLeakRC(url)}
+	return &widgetsHandler{authnNS: "krateo-system", saRC: saLeakRC(url)}
 }
 
 // installLeakFetch swaps ONLY the CR-fetch and the top-level dispatch-RBAC gate
