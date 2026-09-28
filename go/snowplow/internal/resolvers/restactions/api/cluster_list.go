@@ -468,6 +468,15 @@ func populateClusterListCellSync(
 	return true
 }
 
+// populateClusterListCellSyncFn seams populateClusterListCellSync for tests
+// (mirrors the materialiseClusterListItemsFn idiom below, cluster_list.go — an
+// accepted repo test-seam pattern; the production binary never reassigns it). The
+// #268/#269 Part 2 drift-guard swaps it to capture the populateCtx that
+// populateClusterListCellAsync builds, so the arm can assert that ctx is
+// ServesUnnarrowed (identity-free, via no-UserInfo) — the classification the
+// producer census pins for this cluster-list SA-transport producer.
+var populateClusterListCellSyncFn = populateClusterListCellSync
+
 // populateClusterListCellAsync spawns a bounded background goroutine
 // that calls populateClusterListCellSync. Used by
 // attemptClusterListCollapse's cold-miss path to populate the cell
@@ -563,7 +572,7 @@ func populateClusterListCellAsync(
 		populateCtx = xcontext.BuildContext(populateCtx, xcontext.WithLogger(log))
 		_ = ep // ep retained in closure for future SA-context wiring if needed
 
-		ok := populateClusterListCellSync(populateCtx, log, apiCall, gvr, contentKey, clusterCall, apistageStore)
+		ok := populateClusterListCellSyncFn(populateCtx, log, apiCall, gvr, contentKey, clusterCall, apistageStore)
 		if ok {
 			log.Debug("cluster_list.cell.async_populate_completed",
 				slog.String("subsystem", "cache"),

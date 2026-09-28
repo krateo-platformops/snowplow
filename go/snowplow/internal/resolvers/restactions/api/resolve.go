@@ -33,6 +33,7 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -371,7 +372,7 @@ const (
 //   - non-UAF + resolveOne err → log; return (zero, stageReturn)
 //     (R-2: the resolve truncates — the orchestrator returns r.dict).
 //   - success → return (ep, stageProceed).
-func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, stageAction) {
+func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, bool, stageAction) {
 	if uafActive {
 		saEP, saErr := serviceAccountEndpointFn()
 		if saErr != nil {
@@ -383,9 +384,11 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 			// bearer token to a SA-marked stage). Returning
 			// an empty result for this stage and continuing.
 			r.dict[id] = map[string]any{"items": []any{}}
-			return endpoints.Endpoint{}, stageContinue
+			return endpoints.Endpoint{}, false, stageContinue
 		}
-		return *saEP, stageProceed
+		// The UAF stage dials the SA endpoint → isSAEndpoint=true (provenance): the
+		// dial site threads the SA token FILE (#267).
+		return *saEP, true, stageProceed
 	}
 	// #113 — template endpointRef.name through the SAME jq/extras evaluator that
 	// already renders this stage's path/payload/headers (evalJQ over r.dict, the
@@ -403,15 +406,15 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		// failure (R-2 stageReturn) — the Secret is never dialed.
 		r.log.Error("templated endpoint reference refused",
 			slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", guardErr))
-		return endpoints.Endpoint{}, stageReturn
+		return endpoints.Endpoint{}, false, stageReturn
 	}
-	resolved, err := r.mapper.resolveOne(r.ctx, ref, templated)
+	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref, templated)
 	if err != nil {
 		r.log.Error("unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
-		return endpoints.Endpoint{}, stageReturn
+		return endpoints.Endpoint{}, false, stageReturn
 	}
-	return resolved, stageProceed
+	return resolved, isSA, stageProceed
 }
 
 // evalEndpointRef renders a templated endpointRef.name (#113). For a nil ref or
@@ -895,17 +898,17 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// carries the cluster CA verbatim; client-go's transport
 	// installs it correctly. See internal_dispatch.go.
 	//
-	// AUTHORIZATION: in-cluster per-user requests DO carry
-	// cache.WithInternalRESTConfig (dispatchers/restactions.go:262,
-	// dispatchers/widgets.go:273 attach the SA *rest.Config to every
-	// in-cluster per-user request for the TLS-CA reason), so branch C
-	// fetches them under the SA client. dispatchViaInternalRESTConfig
+	// AUTHORIZATION (#268/#269 Part 1): LIVE per-user requests do NOT carry
+	// cache.WithInternalRESTConfig any more — the 0.30.166 dispatcher attach (the
+	// SA-serve leak vector) was removed, so a live request dials its own cert-auth
+	// <user>-clientconfig at branch E and branch C's Gate 1 is false for it. The SA
+	// *rest.Config is on this ctx only for an internal driver (Phase-1 walk /
+	// background refresher / prewarm re-resolve). dispatchViaInternalRESTConfig
 	// re-gates the fetched bytes with the ctx identity at both serve points
-	// (GET-by-name / LIST), exempting only genuine SA / identity-free
-	// operations — a denied per-user read is not served under the SA
-	// identity. OUT-of-cluster requests (dev / unit test) carry no SA config
-	// so dispatchViaInternalRESTConfig returns served=false and this block
-	// is a no-op.
+	// (GET-by-name / LIST), exempting only genuine SA / identity-free operations —
+	// a denied read is not served under the SA identity. Live + OUT-of-cluster
+	// requests carry no SA config so dispatchViaInternalRESTConfig returns
+	// served=false and this block is a no-op.
 	//
 	// A non-nil err here is the REAL apiserver error (a 403, a
 	// genuine connectivity fault). We do NOT fall through to
@@ -964,11 +967,14 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// a bare group-discovery URL /apis/<g>/<v> (no resource segment, no
 	// endpointRef) to enumerate a managed apiVersion's served resources.
 	// That 2-segment path parse-fails ParseAPIServerPathToDep, so it fell
-	// through every CA-bearing branch above to the external fetch, which
-	// builds a plumbing client from the per-user <user>-clientconfig TOKEN-
-	// auth Endpoint — plumbing's tlsConfigFor drops the cluster caData for a
-	// token-auth endpoint (HasCertAuth()-only CA install) → x509: certificate
-	// signed by unknown authority. TRACED:
+	// through every CA-bearing branch above to the external fetch, which builds a
+	// plumbing client from the resolved Endpoint. The x509 failure occurs for a
+	// TOKEN-AUTH endpoint (the snowplow SA endpoint — HasCertAuth() false):
+	// plumbing's tlsConfigFor drops the cluster caData for it (HasCertAuth()-only
+	// CA install) → x509: certificate signed by unknown authority. (The live
+	// <user>-clientconfig is CERT-auth by construction — authn's AuthInfo has no
+	// token field — so it takes the CA-install branch and does NOT hit this; the
+	// dropped-CA defect is specific to the token-auth SA endpoint.) TRACED:
 	// docs/troubleshoot-discovery-url-apistep-x509-2026-06-23.md. Same
 	// plumbing TLS defect internal_dispatch.go documents for the Phase-1 SA
 	// path (0.30.104).
@@ -1113,6 +1119,37 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// result is still SERVED — identical to the #313 partial posture), so
 	// external data is re-fetched LIVE every /call and never persisted under a
 	// TTL it has no dep edge to invalidate.
+	// Part 2 (#268 site 1) — re-gate the SA-ENDPOINT dial at branch E. Reaching here
+	// is the external fall-through: every CA-bearing in-memory / branch-C path
+	// declined. For a NON-UAF step whose endpoint is snowplow's own SA endpoint
+	// (provenance: cache.ServiceAccountDialFromContext, set when resolveOne returned
+	// the ctx internal endpoint) under a re-gate context (rbac.MustRegateSADial — the
+	// SA cred is on the ctx AND the identity is a REAL narrowing subject, i.e. the
+	// refresher's per-user-cohort representative), the SA dial would read tenant data
+	// the caller may not (subresource / RC1 / unparseable — none reached the branch-C
+	// re-gate). FAIL CLOSED BEFORE the fetch — never issue the SA read — recording a
+	// per-item error (ContinueOnError honoured), so the refresher's Put-gate declines.
+	//   - UAF stages (UserAccessFilter != nil) are EXEMPT: they dial the SA endpoint
+	//     BY DESIGN and re-narrow the result via the refilter — their gate is downstream.
+	//   - A LIVE request carries no SA cred on the ctx post-Part-1 (mustRegateSADial
+	//     false) → dials the per-user endpoint unchanged.
+	//   - A genuine SA / identity-free refresh (serveUnnarrowed) → mustRegateSADial
+	//     false → the legitimate un-gated SA serve is unchanged.
+	if apiCall.UserAccessFilter == nil && cache.ServiceAccountDialFromContext(gctx) && rbac.MustRegateSADial(gctx) {
+		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", call.Path)
+		r.log.Warn("branch-E SA-endpoint dial re-gated and failed closed",
+			slog.String("name", id), slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path))
+		var itemErr error
+		if !call.ContinueOnError {
+			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
+		}
+		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, msg, msg, itemErr)
+		r.log.Debug("api resolved (branch-E SA-endpoint dial re-gated, fail-closed)",
+			slog.String("name", id), slog.String("host", call.Endpoint.ServerURL),
+			slog.String("path", call.Path),
+			slog.String("dispatch", "branch-e-sa-regate-denied"))
+		return nil
+	}
 	cache.ExternalTouchedSinkFromContext(gctx).Bump()
 	// Boot-readiness external-fetch wall-clock bound (external_seed_bound.go).
 	// The Bump() STAYS before the wrap so a timed-out fetch still records the
@@ -1315,7 +1352,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// #57 (C-b): the user-bearer-token append moved to AFTER endpoint
 	// resolution (was before) so the self-loopback arm can compare the
 	// RESOLVED endpoint host against the configured self-host.
-	ep, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
+	ep, isSA, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
 	switch epAction {
 	case stageContinue:
 		recordStageTiming()
@@ -1448,6 +1485,16 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// neither the walk nor the lock runs.
 	var dictMu sync.Mutex
 	g, gctx := errgroup.WithContext(r.ctx)
+	// #267/#268/#269 — PROVENANCE marker for the dial site. When this stage's
+	// endpoint is snowplow's own SA endpoint (isSA, from resolveStageEndpoint:
+	// the ctx-carried internal endpoint or the UAF SA endpoint), mark the per-stage
+	// dispatch ctx so httpClientForEndpoint threads the SA token FILE (self-reloading,
+	// #267) rather than a read-once static token. Per-stage granularity: a non-SA
+	// (per-user clientconfig / named-ref) stage's gctx is never marked. Only ADDS a
+	// ctx value — g's Done channel (errgroup cancellation) is preserved.
+	if isSA {
+		gctx = cache.WithServiceAccountDial(gctx)
+	}
 	g.SetLimit(iterParallelism(r.ctx))
 
 	// Ship 0.30.257 (#313) — per-item error slots (design §2.1 / §3.2).

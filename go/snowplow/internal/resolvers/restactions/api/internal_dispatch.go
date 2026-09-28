@@ -88,17 +88,21 @@
 //   KEYED ON CONTEXT STATE: the mechanism is uniform across GVRs, no
 //   per-resource carve-out (feedback_no_special_cases.md).
 //
-//   AUTHORIZATION (fix/sa-config-fallthrough-rbac-regate): ordinary
-//   per-user in-cluster requests DO carry cache.WithInternalRESTConfig —
-//   dispatchers/restactions.go:262 and dispatchers/widgets.go:273 attach
-//   the SA *rest.Config (r.saRC) to EVERY in-cluster per-user request so
-//   the TLS-CA fix above applies to them too. That means branch C fetches
-//   those per-user GET/LIST calls with the SA client. To avoid serving a
-//   denied per-user read under the SA identity, both serve points below
-//   re-gate the fetched bytes with the SAME per-user RBAC helpers branch B
-//   uses (filterGetByRBAC / filterListByRBAC), EXCEPT for genuine
-//   ServiceAccount / identity-free operations — see
-//   internalDispatchServesUnnarrowed.
+//   AUTHORIZATION (#268/#269 Part 1): ordinary per-user in-cluster requests
+//   do NOT carry cache.WithInternalRESTConfig any more. The 0.30.166 attach on
+//   dispatchers/restactions.go + widgets.go was the SA-serve leak vector and was
+//   REMOVED in Part 1 — a live per-user request now dials its own cert-auth
+//   <user>-clientconfig (branch E), so branch C's Gate 1 (rc on ctx) is false for
+//   it and it falls through to the per-user path. The SA *rest.Config reaches THIS
+//   ctx only from an internal driver: the Phase-1 SA walk and the BACKGROUND
+//   refresher / prewarm (resolve_populate.go, prewarm_engine_boot.go), which attach
+//   it to their OWN re-resolve ctx. To avoid serving a denied read under the SA
+//   identity, both serve points below re-gate the fetched bytes with the SAME
+//   per-user RBAC helpers branch B uses (filterGetByRBAC / filterListByRBAC),
+//   EXCEPT for genuine ServiceAccount / identity-free operations — see
+//   internalDispatchServesUnnarrowed. (#268/#269 Part 2 extends the same re-gate to
+//   the two sites this branch does not cover — branch E and
+//   objects.getFromAPIServer — via rbac.MustRegateSADial.)
 //
 // CRITICAL — this path is validated ON-CLUSTER. Two prior Phase-1-SA
 // fixes (0.30.102 base64, 0.30.103) passed unit tests and failed on the
@@ -222,12 +226,14 @@ func resetInternalClientCacheForTest() {
 // un-narrowed serve is correct for this ctx because the request is a genuine
 // identity-free / ServiceAccount operation, NOT an end-user per-user read.
 //
-// dispatchers/restactions.go:262 and dispatchers/widgets.go:273 attach the
-// SA *rest.Config to EVERY in-cluster per-user request (for the TLS-CA
-// reason in this file's header), so branch C fetches per-user GET/LIST under
-// the SA client. Without a re-gate a denied per-user read would be served
-// under the SA identity (the leak this predicate + the serve-point gates
-// close). It returns TRUE (serve un-narrowed) iff ANY of:
+// Post-#268/#269 Part 1 the SA *rest.Config is on THIS ctx only for an internal
+// driver (Phase-1 SA walk, or the BACKGROUND refresher / prewarm re-resolve —
+// resolve_populate.go / prewarm_engine_boot.go), never a live per-user request
+// (that attach was removed). When such a driver re-resolves under a REAL
+// (representative) identity, branch C fetches under the SA client; without a
+// re-gate a denied read would be served under the SA identity (the leak this
+// predicate + the serve-point gates close). It returns TRUE (serve un-narrowed)
+// iff ANY of:
 //
 //	(a) a serve-watcher is on the ctx (cache.WithServeWatcher) — the Phase-1
 //	    SA walk / cohort seed / content-prewarm. These run under the SA
@@ -252,28 +258,13 @@ func resetInternalClientCacheForTest() {
 // falls through to narrowing. Exempting on Username=="" would re-open the
 // leak for group-only identities.
 func internalDispatchServesUnnarrowed(ctx context.Context) bool {
-	// (a) Phase-1 walk / cohort seed / content-prewarm.
-	if _, ok := cache.ServeWatcherFromContext(ctx); ok {
-		return true
-	}
-	// (b) api-stage content-cell populate.
-	if cache.ApistageContentResolveFromContext(ctx) {
-		return true
-	}
-	// (c) identity-free populate — no subject to narrow against.
-	user, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		return true
-	}
-	// (d) canonical ServiceAccount identity. Reuse the rbac package's
-	// canonical SA-username parser — never hand-roll the
-	// "system:serviceaccount:" prefix test.
-	if rbac.IsServiceAccountUsername(user.Username) {
-		return true
-	}
-	// A group-only user (empty Username, non-empty Groups) reaches here and
-	// IS narrowed — it is a real end-user (RC2).
-	return false
+	// Part 2 (#268/#269): single source of truth. The predicate (clauses (a)
+	// ServeWatcher, (b) ApistageContentResolve, (c) no-UserInfo, (d) canonical SA
+	// username; a real/representative/group-only end-user → false) now lives in
+	// rbac.ServesUnnarrowed so BOTH carriers — branch C here, branch E, and
+	// objects.getFromAPIServer — and the Part-2 rbac.MustRegateSADial guard share
+	// ONE derivation and cannot drift.
+	return rbac.ServesUnnarrowed(ctx)
 }
 
 // internalDispatchRBACSnapshotUnpublished reports whether the RBAC snapshot
@@ -315,9 +306,11 @@ func internalDispatchRBACSnapshotUnpublished() bool {
 // informer-pivot branch. Returns (nil, false, nil) for every gate that
 // must take the unchanged httpcall.Do path:
 //
-//   - no internal *rest.Config on the context (an OUT-of-cluster request —
-//     dev / unit test — where r.saRC is nil so nothing is attached; note
-//     in-cluster per-user requests DO carry it, see the header);
+//   - no internal *rest.Config on the context — a LIVE per-user request (the
+//     0.30.166 attach was removed in #268/#269 Part 1, so a live request dials its
+//     own <user>-clientconfig at branch E), or an OUT-of-cluster dev / unit test;
+//     it is present only for an internal driver (Phase-1 walk / background
+//     refresher / prewarm), see the header;
 //   - the context value is the wrong type / a nil pointer;
 //   - non-GET verb (POST/PUT/PATCH/DELETE — client-go dynamic Get/List
 //     here is read-only; writes are not a Phase-1 shape and stay on the
@@ -393,13 +386,14 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		return nil, false, nil
 	}
 
-	// Per-user RBAC re-gate decision (defensive authorization). The SA
-	// *rest.Config is attached to every in-cluster per-user request, so
-	// branch C fetches per-user reads under the SA client; unless this is a
-	// genuine SA / identity-free operation, the fetched bytes MUST be
-	// re-gated with the ctx identity at both serve points below (mirrors the
-	// branch-B informer gate). Computed once here; the two serve points
-	// (GET-by-name, LIST) consult it.
+	// Per-user RBAC re-gate decision (defensive authorization). Reaching here means
+	// the SA *rest.Config is on the ctx — post-#268/#269 Part 1 that is an internal
+	// driver (Phase-1 walk / background refresher / prewarm re-resolve), never a live
+	// per-user request. When such a driver re-resolves under a REAL identity, branch C
+	// fetches under the SA client; unless this is a genuine SA / identity-free
+	// operation, the fetched bytes MUST be re-gated with the ctx identity at both
+	// serve points below (mirrors the branch-B informer gate). Computed once here; the
+	// two serve points (GET-by-name, LIST) consult it.
 	serveUnnarrowed := internalDispatchServesUnnarrowed(ctx)
 
 	cli, err := internalClientFor(rc)

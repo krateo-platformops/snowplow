@@ -144,7 +144,7 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	// that shape and DELEGATES to plumbing verbatim for every other one,
 	// so the live cert-auth population is byte-identical. See
 	// endpoints_tls.go for the full trace.
-	cli, err := httpClientForEndpoint(opts.Endpoint, &opts.RequestInfo)
+	cli, err := httpClientForEndpoint(ctx, opts.Endpoint, &opts.RequestInfo)
 	if err != nil {
 		werr := fmt.Errorf("unable to create HTTP Client for endpoint: %w", err)
 		return response.New(http.StatusInternalServerError, werr), nil, "", werr
