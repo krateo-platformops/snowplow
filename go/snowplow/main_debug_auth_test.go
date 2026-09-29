@@ -42,6 +42,7 @@ import (
 	"net/http/httptest"
 	"net/http/pprof"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +51,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 )
 
 const debugAuthTestKeyID = "test-kid-for-debug-auth-od3-1.12.3"
@@ -57,6 +59,14 @@ const debugAuthTestKeyID = "test-kid-for-debug-auth-od3-1.12.3"
 var (
 	debugAuthTestPrivateKey *rsa.PrivateKey
 	debugAuthTestKeys       jwtutil.KeySource
+	// debugAuthWrongPrivateKey signs the C1 "well-formed but wrong-key" token:
+	// the mux verifies against debugAuthTestKeys (the PUBLIC half of
+	// debugAuthTestPrivateKey), so a token signed with THIS key is well-formed,
+	// reaches the KeySource, and fails signature verification → 401. It is NOT
+	// malformed garbage, which would 401 at the parse stage before the
+	// KeySource is ever consulted and so could not distinguish a real
+	// signature-rejection (401) from an unavailable-JWKS (503).
+	debugAuthWrongPrivateKey *rsa.PrivateKey
 )
 
 func init() {
@@ -69,6 +79,32 @@ func init() {
 	// (jwtutil.NewJWKSKeySource, main.go); a static source is the same
 	// jwtutil.KeySource contract without the network.
 	debugAuthTestKeys = jwtutil.NewStaticKeySource(&key.PublicKey)
+
+	wrong, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	debugAuthWrongPrivateKey = wrong
+}
+
+// mintWrongKeyDebugToken issues a WELL-FORMED, unexpired JWT signed with a key
+// the mux does NOT trust (C1). It reuses the trusted KeyID so the KeySource is
+// consulted for the same kid and the rejection is a signature failure (401),
+// not a missing-key 503 — exercising real signature/key verification rather
+// than the parser's malformed-token path.
+func mintWrongKeyDebugToken(t *testing.T) string {
+	t.Helper()
+	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
+		Username:   "od3-operator",
+		Groups:     []string{"devs"},
+		Duration:   time.Hour,
+		KeyID:      debugAuthTestKeyID,
+		PrivateKey: debugAuthWrongPrivateKey,
+	})
+	if err != nil {
+		t.Fatalf("CreateToken (wrong key): %v", err)
+	}
+	return tok
 }
 
 // mintDebugToken issues a JWT signed with the test private key. A negative
@@ -109,6 +145,13 @@ var debugProbePaths = map[string]string{
 	// not its 400: a gating arm that only ever drove a rejected request would
 	// pass whether or not the handler works past the gate.
 	"GET /debug/store": "/debug/store?gvr=v1/configmaps&namespace=krateo-system&name=probe",
+	// #272 — the shadow-parity toggle. Two patterns on ONE path, split by
+	// method. The GET probe reads state; the POST probe carries a valid
+	// `enabled` so the authenticated arm below sees the route's real 200
+	// (and mutates the process-local toggle — the method-aware test that
+	// drives this resets it in cleanup).
+	"GET /debug/shadow-parity":  "/debug/shadow-parity",
+	"POST /debug/shadow-parity": "/debug/shadow-parity?enabled=true",
 }
 
 // debugPathsSafeToDriveAuthenticated is debugProbePaths minus the two
@@ -126,6 +169,10 @@ var debugPathsSafeToDriveAuthenticated = []string{
 	"/debug/refreshes",
 	"/debug/reconcile",
 	"/debug/store?gvr=v1/configmaps&namespace=krateo-system&name=probe",
+	// #272 — GET /debug/shadow-parity is a pure read (no mutation), safe to
+	// drive authenticated. The POST route's authenticated 200 is covered by
+	// the method-aware arm below, not here (A3 drives GET only).
+	"/debug/shadow-parity",
 }
 
 // recordingMux records the patterns registered on it and delegates to a real
@@ -164,13 +211,36 @@ func buildProdDebugMux(t *testing.T) (*recordingMux, http.Handler) {
 // non-empty, is sent as an `Authorization: Bearer` header.
 func getStatus(t *testing.T, h http.Handler, path, bearer string) int {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "http://snowplow.example"+path, nil)
+	return statusForMethod(t, h, http.MethodGet, path, bearer)
+}
+
+// statusForMethod drives one request through h with the given HTTP method and
+// returns the status code. It is what lets the drift-guard probe each route
+// with its DECLARED verb: a GET probe against a POST-only pattern would hit a
+// coincidentally-registered sibling (or 405) rather than the POST handler, an
+// arm that cannot fail. `bearer`, when non-empty, is sent as `Authorization:
+// Bearer`.
+func statusForMethod(t *testing.T, h http.Handler, method, path, bearer string) int {
+	t.Helper()
+	req := httptest.NewRequest(method, "http://snowplow.example"+path, nil)
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec.Result().StatusCode
+}
+
+// methodOf returns the HTTP verb declared at the head of a "VERB /path" mux
+// pattern (Go 1.22 method-aware patterns). Every debugRoutePatterns entry
+// carries one.
+func methodOf(t *testing.T, pattern string) string {
+	t.Helper()
+	method, _, ok := strings.Cut(pattern, " ")
+	if !ok || method == "" {
+		t.Fatalf("pattern %q has no leading HTTP method", pattern)
+	}
+	return method
 }
 
 // assertAllDebugPathsUnauthorized is THE A1 assertion, factored out so the RED
@@ -268,6 +338,70 @@ func TestDebugRoutePatternsMatchRegistration(t *testing.T) {
 			t.Errorf("registerDebugRoutes registers %q but debugRoutePatterns does not list it "+
 				"— add it there (and to debugProbePaths) so the 401 arm drives it", p)
 		}
+	}
+}
+
+// ─── A6 — every pattern is gated UNDER ITS DECLARED METHOD (#272 C2) ────────
+//
+// A1 drives every probe with GET. For a GET-only route that is the route's own
+// verb, but for a POST route a GET probe lands on the coincidentally-registered
+// GET sibling (or a 405) and 401s for the wrong reason — an arm that cannot
+// fail. This arm drives each debugRoutePatterns entry with the verb the pattern
+// actually declares, so the POST route is exercised as a POST. Two rejections
+// per route: no credential, and a WELL-FORMED wrong-key token (C1) that forces
+// real signature verification (401), never the parser's malformed-garbage path.
+func TestDebugSurface_EachPatternGatedUnderDeclaredMethod(t *testing.T) {
+	// Defensive: the POST probes here never reach the handler (the gate 401s
+	// first), so this arm does not mutate the toggle — but reset in cleanup
+	// anyway so the arm is order-independent regardless of the build it runs in
+	// (architect Nit 1).
+	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })
+
+	_, h := buildProdDebugMux(t)
+	wrong := mintWrongKeyDebugToken(t)
+
+	for _, pattern := range debugRoutePatterns {
+		method := methodOf(t, pattern)
+		path, ok := debugProbePaths[pattern]
+		if !ok {
+			t.Fatalf("pattern %q has no debugProbePaths entry — cannot drive it", pattern)
+		}
+		// No credential → 401 at the gate (the handler never runs, so a POST
+		// probe here does not mutate the toggle).
+		if code := statusForMethod(t, h, method, path, ""); code != http.StatusUnauthorized {
+			t.Errorf("%s (no credential) = %d, want 401", pattern, code)
+		}
+		// Well-formed wrong-key token → 401 (signature failure, KeySource
+		// consulted), NOT 503 (which is what an unavailable JWKS returns).
+		if code := statusForMethod(t, h, method, path, wrong); code != http.StatusUnauthorized {
+			t.Errorf("%s (well-formed wrong-key token) = %d, want 401 (real signature verification)", pattern, code)
+		}
+	}
+}
+
+// ─── A7 — the #272 POST route: authenticated 200, and wrong-method 405 ──────
+//
+// The POST route's gating is covered by A6; this pins its POST-specific
+// behaviour through the real gated mux: a valid JWT POST flips and reports the
+// toggle (200), and a verb that is neither GET nor POST on the same path is a
+// mux-level 405 (Method Not Allowed) before any handler or gate runs. The
+// toggle is process-local; reset it in cleanup so no state leaks.
+func TestDebugShadowParityRoute_MethodGatingAndAuth(t *testing.T) {
+	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })
+
+	_, h := buildProdDebugMux(t)
+	tok := mintDebugToken(t, time.Hour)
+
+	// Valid JWT POST ?enabled=true → 200 (flips the toggle past the gate).
+	if code := statusForMethod(t, h, http.MethodPost, "/debug/shadow-parity?enabled=true", tok); code != http.StatusOK {
+		t.Errorf("POST /debug/shadow-parity?enabled=true with a valid JWT = %d, want 200", code)
+	}
+
+	// A verb neither GET nor POST on the same path → 405 from the mux, even
+	// authenticated: the path matches registered patterns but the method does
+	// not, so the request never reaches a handler or the gate.
+	if code := statusForMethod(t, h, http.MethodPut, "/debug/shadow-parity", tok); code != http.StatusMethodNotAllowed {
+		t.Errorf("PUT /debug/shadow-parity = %d, want 405 (path registered, method not)", code)
 	}
 }
 

@@ -80,6 +80,8 @@ var debugRoutePatterns = []string{
 	"GET /debug/reconcile",
 	"GET /debug/harvest",
 	"GET /debug/store",
+	"GET /debug/shadow-parity",
+	"POST /debug/shadow-parity",
 }
 
 // debugMux is the minimal registration surface registerDebugRoutes needs.
@@ -184,4 +186,15 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// resourceVersion of objects their own RBAC forbids. The operator runs
 	// that half with kubectl, under their own identity.
 	mux.Handle("GET /debug/store", gated.Then(handlers.DebugStore()))
+
+	// #272 (1.12.17) — the runtime flip surface for the v7 Step-2 shadow-parity
+	// toggle. GET reports the process-local, default-off toggle; POST
+	// ?enabled=true|false flips it and reports the committed live state (absent
+	// or unparseable → 400). Same authn-only gate as every sibling: any valid
+	// Krateo JWT can flip it, an accepted zero-blast-radius control because the
+	// shadow-parity hook is read-only and changes no verdict/byte/key — it only
+	// turns the dark parity MEASUREMENT on or off. The toggle is per-pod, so a
+	// measurement that uses it must pin to one pod (see the handler doc).
+	mux.Handle("GET /debug/shadow-parity", gated.Then(handlers.DebugShadowParityGet()))
+	mux.Handle("POST /debug/shadow-parity", gated.Then(handlers.DebugShadowParitySet()))
 }
