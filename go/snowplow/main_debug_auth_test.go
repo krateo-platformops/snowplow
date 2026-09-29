@@ -152,6 +152,9 @@ var debugProbePaths = map[string]string{
 	// drives this resets it in cleanup).
 	"GET /debug/shadow-parity":  "/debug/shadow-parity",
 	"POST /debug/shadow-parity": "/debug/shadow-parity?enabled=true",
+	// #277 — /debug/deps. A bare GET is a valid 200 (usage summary); the
+	// authenticated arm drives it to prove the route works past the gate.
+	"GET /debug/deps": "/debug/deps",
 }
 
 // debugPathsSafeToDriveAuthenticated is debugProbePaths minus the two
@@ -173,6 +176,8 @@ var debugPathsSafeToDriveAuthenticated = []string{
 	// drive authenticated. The POST route's authenticated 200 is covered by
 	// the method-aware arm below, not here (A3 drives GET only).
 	"/debug/shadow-parity",
+	// #277 — /debug/deps bare GET is a read-only usage summary.
+	"/debug/deps",
 }
 
 // recordingMux records the patterns registered on it and delegates to a real

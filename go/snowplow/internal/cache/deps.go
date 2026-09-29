@@ -437,6 +437,19 @@ type depSet struct {
 	count atomic.Int64
 }
 
+// captureSlot holds the STACK of OPEN capture buffers for one l1Key (issue
+// #277 / edge-3 — DECISION 1, [C2-B]). Each *[]DepKey is a distinct capture's
+// buffer; recordInternal's tapCapture appends every DepKey recorded under the
+// key to EVERY buffer in the stack, so an outer (nested) capture observes an
+// inner capture's edges, and two concurrent non-nested captures each observe
+// the key's edges (benign over-capture — same key ⇒ same edge set ⇒ idempotent
+// replay). slot.mu serialises append/tap/prune; the buffer POINTER is the
+// capture handle so EndCapture is unambiguous even with duplicate edge sets.
+type captureSlot struct {
+	mu   sync.Mutex
+	bufs []*[]DepKey
+}
+
 // DepTracker is the package-private dependency map. The exported entry
 // point is the package-level singleton accessed via Deps(); production
 // code MUST NOT instantiate DepTracker directly so the eviction +
@@ -446,6 +459,21 @@ type DepTracker struct {
 	forward sync.Map
 	// reverse: l1Key -> *depSet
 	reverse sync.Map
+
+	// captures is the edge-3 serve-seam dep-capture registry (issue #277 + the
+	// C2 carrier): l1Key -> *captureSlot. recordInternal taps every OPEN buffer
+	// for the key at the TOP (before the dedup early-return, [C2-A]), so a
+	// capture observes every edge recorded under the key while it is open —
+	// INCLUDING edges written by ReplayEdges, which routes through
+	// Record/RecordList→recordInternal ([C1-A]). This is how a memo-MISS body
+	// produced by the 4a fast path (whose edge-3 is REPLAYED, not resolved)
+	// still yields a NON-EMPTY captured dep set for the seed-resolve memo.
+	captures sync.Map
+	// activeCaptures is the lock-free fast-path gate: recordInternal Loads it
+	// once and skips the whole tap path (and its map lookup) whenever no
+	// capture is open anywhere, so the hot record path pays a single atomic
+	// load in the overwhelmingly common no-capture case.
+	activeCaptures atomic.Int64
 
 	// totalRecords is the global record count — bounded by maxRecords.
 	totalRecords atomic.Int64
@@ -652,6 +680,16 @@ func (d *DepTracker) RecordList(l1Key string, gvr schema.GroupVersionResource, n
 // recordInternal is the shared body of Record + RecordList. Idempotent;
 // honours the global cap.
 func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
+	// [C2-A] edge-3 capture tap — at the VERY TOP, BEFORE the forward
+	// LoadOrStore and the idempotent dedup early-return below. An idempotent
+	// re-Record (an edge the key already holds) still BELONGS in an open
+	// capture: the memo's stored dep set must be COMPLETE, and a replayed edge
+	// the widget key happened to already carry would otherwise be dropped. The
+	// tap is gated on the lock-free activeCaptures counter so the common
+	// no-capture record pays only one atomic load.
+	if d.activeCaptures.Load() > 0 {
+		d.tapCapture(l1Key, dk)
+	}
 	// Forward: DepKey -> *keySet[l1Key]
 	ksI, loadedBucket := d.forward.LoadOrStore(dk, &keySet{})
 	if !loadedBucket {
@@ -688,6 +726,187 @@ func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
 	if _, loaded := ds.deps.LoadOrStore(dk, struct{}{}); !loaded {
 		ds.count.Add(1)
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// edge-3 serve-seam dep capture / replay (issue #277 + the C2 carrier)
+// ─────────────────────────────────────────────────────────────────────────
+
+// tapCapture appends dk to every OPEN capture buffer registered under l1Key.
+// Called from recordInternal's top only when activeCaptures>0. Lock-free map
+// Load + a brief per-slot lock; a no-slot key is a single map miss.
+func (d *DepTracker) tapCapture(l1Key string, dk DepKey) {
+	slotI, ok := d.captures.Load(l1Key)
+	if !ok {
+		return
+	}
+	slot := slotI.(*captureSlot)
+	slot.mu.Lock()
+	for _, buf := range slot.bufs {
+		*buf = append(*buf, dk)
+	}
+	slot.mu.Unlock()
+}
+
+// BeginCapture opens a fresh capture for l1Key and returns its buffer POINTER
+// as the handle. Every edge recorded under l1Key (via Record/RecordList→
+// recordInternal, including ReplayEdges) until the matching EndCapture is
+// appended to this buffer. Pairs 1:1 with EndCapture; nil-safe on an empty key
+// (a no-op handle the caller's EndCapture also no-ops).
+//
+// DECISION 1 [C2-B]: a per-key STACK, re-entrancy + concurrency safe. The
+// LoadOrStore/Lock/re-validate loop closes the prune race with a concurrent
+// EndCapture that deletes an emptied slot (see EndCapture): if the slot we
+// loaded was pruned before we appended, we retry with a fresh one.
+func (d *DepTracker) BeginCapture(l1Key string) *[]DepKey {
+	buf := &[]DepKey{}
+	if d == nil || l1Key == "" {
+		return buf
+	}
+	for {
+		slotI, _ := d.captures.LoadOrStore(l1Key, &captureSlot{})
+		slot := slotI.(*captureSlot)
+		slot.mu.Lock()
+		// Re-validate the slot is still the one installed under l1Key. An
+		// EndCapture may have pruned it (CompareAndDelete under slot.mu)
+		// between our LoadOrStore and our Lock; appending to a detached slot
+		// would make it invisible to tapCapture (which Loads by key).
+		if cur, ok := d.captures.Load(l1Key); !ok || cur != slotI {
+			slot.mu.Unlock()
+			continue
+		}
+		slot.bufs = append(slot.bufs, buf)
+		// N4: bump the gate UNDER slot.mu, before unlock. Once the buffer is
+		// publicly consumable (a concurrent tapCapture that acquires slot.mu
+		// after this unlock), activeCaptures is already ≥1 — closing the benign
+		// window where a record on the same key read the gate at 0 while the
+		// buffer was already registered.
+		d.activeCaptures.Add(1)
+		slot.mu.Unlock()
+		return buf
+	}
+}
+
+// EndCapture closes the capture identified by handle h under l1Key and returns
+// the edges it observed (*h). Removes h from the key's stack by pointer
+// identity and prunes the slot when it empties. nil-safe: a nil/foreign handle
+// returns nil without touching activeCaptures, so an unbalanced call cannot
+// drive the gate negative.
+func (d *DepTracker) EndCapture(l1Key string, h *[]DepKey) []DepKey {
+	if d == nil || h == nil {
+		return nil
+	}
+	removed := false
+	if slotI, ok := d.captures.Load(l1Key); ok {
+		slot := slotI.(*captureSlot)
+		slot.mu.Lock()
+		for i := len(slot.bufs) - 1; i >= 0; i-- {
+			if slot.bufs[i] == h {
+				slot.bufs = append(slot.bufs[:i], slot.bufs[i+1:]...)
+				removed = true
+				break
+			}
+		}
+		// Prune the emptied slot UNDER slot.mu (CompareAndDelete only when it
+		// is still the installed slot), so BeginCapture's re-validate is the
+		// sole synchronisation point for the detach.
+		if len(slot.bufs) == 0 {
+			d.captures.CompareAndDelete(l1Key, slotI)
+		}
+		slot.mu.Unlock()
+	}
+	if removed {
+		d.activeCaptures.Add(-1)
+	}
+	return *h
+}
+
+// ReplayEdges records each edge in `edges` under dst, routing EXCLUSIVELY
+// through Record/RecordList→recordInternal ([C1-A] HARD INVARIANT — never a
+// direct forward/reverse map write), so an active capture on dst observes the
+// replay (proved by F-INV). Idempotent (recordInternal dedups). For each edge
+// it first ensures the backing GVR's informer exists so a later event on the
+// replayed coordinate actually fires. nil-safe on dst=="" (never routes an
+// empty key through the loudFail).
+func (d *DepTracker) ReplayEdges(dst string, edges []DepKey) {
+	if d == nil || dst == "" {
+		return
+	}
+	for _, e := range edges {
+		d.ensureInformer(e.GVR)
+		if e.Name == listWildcard {
+			d.RecordList(dst, e.GVR, e.Namespace)
+		} else {
+			d.Record(dst, e.GVR, e.Namespace, e.Name)
+		}
+	}
+}
+
+// ensureInformer registers (idempotently, singleflighted) the informer for gvr
+// so a future event on a replayed coordinate reaches the dep tracker. Mirrors
+// the dispatcher's ensureWatcherInformerForGVR (deps_extract.go): nil-safe when
+// the global watcher is absent (cache-off / unit tests without a watcher).
+func (d *DepTracker) ensureInformer(gvr schema.GroupVersionResource) {
+	rw := Global()
+	if rw == nil {
+		return
+	}
+	rw.EnsureResourceType(gvr)
+}
+
+// RangeEdges calls fn for each l1Key in the reverse index with a snapshot of
+// its edges, until fn returns false. Lock-free (sync.Map.Range over the reverse
+// index + each key's depSet). Read-only — the /debug/deps diagnostic's scan
+// primitive. The CALLER bounds how many keys it inspects (the diagnostic caps
+// the sample); this never holds a store/serve mutex.
+func (d *DepTracker) RangeEdges(fn func(l1Key string, edges []DepKey) bool) {
+	if d == nil {
+		return
+	}
+	d.reverse.Range(func(k, v any) bool {
+		ds := v.(*depSet)
+		var edges []DepKey
+		ds.deps.Range(func(dk, _ any) bool {
+			edges = append(edges, dk.(DepKey))
+			return true
+		})
+		return fn(k.(string), edges)
+	})
+}
+
+// RangeKeys calls fn for each l1Key in the reverse index, until fn returns
+// false. Lock-free; unlike RangeEdges it does NOT materialize each key's edge
+// slice, so a scan that needs only the key (e.g. the /debug/deps stale-risk
+// filter) pays no per-key allocation. Read-only. The CALLER bounds how many
+// keys it inspects.
+func (d *DepTracker) RangeKeys(fn func(l1Key string) bool) {
+	if d == nil {
+		return
+	}
+	d.reverse.Range(func(k, _ any) bool {
+		return fn(k.(string))
+	})
+}
+
+// EdgesUnder returns a snapshot of the dependency edges recorded under l1Key
+// (the reverse index), or nil. Read-only. Used by the 4a serve seam to replay
+// the raKey cell's backing edges onto the widget key (C2) and by the
+// /debug/deps diagnostic.
+func (d *DepTracker) EdgesUnder(l1Key string) []DepKey {
+	if d == nil || l1Key == "" {
+		return nil
+	}
+	dsI, ok := d.reverse.Load(l1Key)
+	if !ok {
+		return nil
+	}
+	ds := dsI.(*depSet)
+	var out []DepKey
+	ds.deps.Range(func(k, _ any) bool {
+		out = append(out, k.(DepKey))
+		return true
+	})
+	return out
 }
 
 // hasEdge reports whether an ABSENT verdict for dk can reach l1Key at all:

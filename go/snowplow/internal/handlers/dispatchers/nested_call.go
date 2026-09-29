@@ -166,6 +166,11 @@ func ResolveNestedCall(
 	// depth-8 guard above stays as the backstop for a non-cyclic pathologically
 	// deep chain (RC-3).
 	node := nestedResolveNodeKey(got.GVR.Resource, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
+	// #277 edge-3 / C4 (INFERRED, not verified): this cycle-stop returns the raw
+	// CR bytes INLINE below — no store.Put and no Deps().Record — so it cannot
+	// create an edgeless resident L1 cell (the serve-seam staleness concern
+	// C4 addresses cannot arise on this path). The real-recursion C4 confirm-arm
+	// is DEFERRED to its follow-up ticket; do not treat C4 as verified.
 	if cache.NestedResolveAncestorPresent(ctx, node) {
 		log.Debug("nested resolve cycle-stop: node already an ancestor — returning raw CR",
 			slog.String("node", node),
