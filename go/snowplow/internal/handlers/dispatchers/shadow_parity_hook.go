@@ -95,6 +95,17 @@ var (
 	// shadowDarkPanicTotal — a panic in EITHER carrier (hook body or inline
 	// D-derivation) was recovered (F-panic).
 	shadowDarkPanicTotal atomic.Uint64
+
+	// Step 2E (#275) — populate-side (boot-seed) instrument. installs counts the
+	// seed resolves that successfully carried a shadow context (INVARIANT b: bumped
+	// only after the shadowContext is on ctx). The four buckets partition those
+	// installs exactly — b1+b2+b3+b4 == installs (the sum-integrity invariant, the
+	// false-green guard): a silently-missed resolve makes the sum fall short.
+	shadowPopulateSeedInstallsTotal     atomic.Uint64
+	shadowPopulateAllowBearingTotal     atomic.Uint64 // b1: dGated & allowsInResolve≥1
+	shadowPopulateRBACDeniedTotal       atomic.Uint64 // b2: dGated & checks≥1 & allows==0
+	shadowPopulateRBACGatedNoCheckTotal atomic.Uint64 // b3: dGated & checksInResolve==0
+	shadowPopulatePassthroughTotal      atomic.Uint64 // b4: NOT dGated
 )
 
 var shadowMetricsOnce sync.Once
@@ -110,6 +121,11 @@ func registerShadowParityMetrics() {
 				"coverage_miss_total":                  shadowCoverageMissTotal.Load(),
 				"projection_name_ambiguous_leak_total": shadowProjectionNameAmbiguousLeakTotal.Load(),
 				"dark_panic_total":                     shadowDarkPanicTotal.Load(),
+				"populate_seed_installs_total":         shadowPopulateSeedInstallsTotal.Load(),
+				"populate_allow_bearing_total":         shadowPopulateAllowBearingTotal.Load(),
+				"populate_rbac_denied_total":           shadowPopulateRBACDeniedTotal.Load(),
+				"populate_rbac_gated_no_check_total":   shadowPopulateRBACGatedNoCheckTotal.Load(),
+				"populate_passthrough_total":           shadowPopulatePassthroughTotal.Load(),
 			}
 		}))
 	})
@@ -135,6 +151,17 @@ type shadowContext struct {
 	digest    string
 	shareable bool
 	untrusted atomic.Bool
+
+	// Step 2E (#275) — per-resolve accumulation for the populate-side classify.
+	// Bumped by runShadowParityHook alongside the process-wide checks/allow/deny
+	// counters, but scoped to THIS resolve's shadowContext; read ONCE at seedOne*
+	// return by classifyShadowSeedResolve. Atomic ⇒ safe under the resolve's
+	// errgroup inner-call fan-out (the goroutines share this pointer via the ctx).
+	// Inert on the serve path: nobody classifies there and the fields die with the
+	// ctx. dGated is stamped once at seed install (D has ≥1 non-escape class).
+	checksInResolve atomic.Uint64
+	allowsInResolve atomic.Uint64
+	dGated          bool
 }
 
 // shadowProfileFor is the requester-profile accessor seam. Production points at
@@ -225,6 +252,68 @@ func installShadowParity(ctx context.Context, derive func() AccessDomain) (out c
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Seed-path installation + classification (Step 2E, #275 — the populate side).
+//
+// The #266 shadow context installs ONLY at the two SERVE entries, so the boot
+// seed resolves are off-hook — a boot walk fires ZERO checks for the COHORT
+// (populator) identities that KEY L1 cells (the v7-key #254 leak vector). 2E
+// installs the same dark context on the seed resolve ctx (which already carries
+// the cohort identity via withCohortSeedContext) and classifies each completed
+// resolve into one of four buckets. Reuses the serve-path install VERBATIM; the
+// only new logic is the install-count + dGated stamp and the classify switch.
+// ─────────────────────────────────────────────────────────────────────────
+
+// installShadowParitySeedRESTAction installs the dark shadow context for a
+// boot-SEED RESTAction resolve, over the serve-path installShadowParityRESTAction.
+func installShadowParitySeedRESTAction(ctx context.Context, ra *templatesv1.RESTAction) context.Context {
+	return finishSeedInstall(installShadowParityRESTAction(ctx, ra))
+}
+
+// installShadowParitySeedWidget — the widget twin.
+func installShadowParitySeedWidget(ctx context.Context, widget map[string]any) context.Context {
+	return finishSeedInstall(installShadowParityWidget(ctx, widget))
+}
+
+// finishSeedInstall stamps dGated (D has ≥1 non-escape class) and bumps
+// populate_seed_installs_total IFF the wrapped serve-path install actually put a
+// shadowContext on out — INVARIANT b: only after a successful install, so a
+// derive-panicked resolve stays OUT of installs AND all four buckets (its
+// dark_panic_total>0 is the backstop; sum-integrity preserved). Off (toggle/cache)
+// ⇒ no shadowContext ⇒ no bump ⇒ classify no-ops. Returns out unchanged.
+func finishSeedInstall(out context.Context) context.Context {
+	if sc, ok := out.Value(shadowCtxKey).(*shadowContext); ok && sc != nil {
+		sc.dGated = sc.domain.HasClasses()
+		shadowPopulateSeedInstallsTotal.Add(1)
+	}
+	return out
+}
+
+// classifyShadowSeedResolve buckets ONE completed seed resolve into exactly one
+// of the four populate counters. It MUST run at seedOne* return, AFTER the resolve
+// has fully returned (errgroup joined — INVARIANT a): reading the per-resolve
+// atomics before the inner-call fan-out joins would misclassify. No shadow context
+// (toggle/cache off, or a derive-panicked install) ⇒ no-op. Comma-ok read — never
+// panics on a foreign ctx value.
+func classifyShadowSeedResolve(ctx context.Context) {
+	sc, ok := ctx.Value(shadowCtxKey).(*shadowContext)
+	if !ok || sc == nil {
+		return
+	}
+	allows := sc.allowsInResolve.Load()
+	checks := sc.checksInResolve.Load()
+	switch {
+	case !sc.dGated:
+		shadowPopulatePassthroughTotal.Add(1) // b4 — no gated class; nothing to certify.
+	case allows >= 1:
+		shadowPopulateAllowBearingTotal.Add(1) // b1 — a live-serve allow direction exists.
+	case checks >= 1: // dGated & checks≥1 & allows==0
+		shadowPopulateRBACDeniedTotal.Add(1) // b2 — every check denied for this cohort.
+	default: // dGated & checks==0
+		shadowPopulateRBACGatedNoCheckTotal.Add(1) // b3 — memo hit or iterator-empty.
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // The dark hook (carrier #1 — recover-isolated).
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -265,6 +354,16 @@ func runShadowParityHook(ctx context.Context, snap *cache.RBACSnapshot, opts rba
 		shadowChecksAllowTotal.Add(1)
 	} else {
 		shadowChecksDenyTotal.Add(1)
+	}
+
+	// Step 2E (#275) — per-resolve accumulation for the populate-side classify.
+	// Same partition as the process-wide split, but scoped to THIS resolve's
+	// shadowContext so classifyShadowSeedResolve can bucket the seed at seedOne*
+	// return. Serve path: harmless — nothing classifies there and these die with
+	// the ctx.
+	sc.checksInResolve.Add(1)
+	if allowed {
+		sc.allowsInResolve.Add(1)
 	}
 
 	// R from the CHECK's own snapshot (design V10: the hook builds R from the

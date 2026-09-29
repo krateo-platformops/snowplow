@@ -1109,6 +1109,17 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// signature is unchanged; the tail reads it back off the context).
 	resCtx, _ = cache.WithUAFTouchedSink(resCtx)
 
+	// Step 2E (#275) — install the DARK shadow context on the seed resolve ctx so
+	// the boot walk measures COHORT parity: resCtx already carries the cohort
+	// identity (withCohortSeedContext → WithUserInfo{cohort.Username, cohort.Groups}),
+	// the very identity that KEYS the L1 cell (the v7-key leak vector). The wrapper
+	// self-gates on ShadowParityEnabled()&&!cache.Disabled() and is recover-isolated
+	// — a no-op when off. classifyShadowSeedResolve fires at THIS function's return,
+	// AFTER seedRestactionResolveAndPutFn (and its Resolve) fully returns — INVARIANT
+	// a (errgroup joined). No-op when nothing was installed (INVARIANT b).
+	resCtx = installShadowParitySeedRESTAction(resCtx, &cr)
+	defer classifyShadowSeedResolve(resCtx)
+
 	// Resolve + encode + GTTL-gate + Put TAIL (via the seedRestactionResolveAndPutFn
 	// seam — prod default is seedRestactionResolveAndPutProd). The #113 templated-
 	// endpointRef skip above short-circuits BEFORE this tail, so a templated RA
@@ -1409,6 +1420,15 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// resolves and then declines. That costs the resolve; it is the price of the
 	// carrier being transitive.
 	resCtx, uafTouchedSink := cache.WithUAFTouchedSink(resCtx)
+
+	// Step 2E (#275) — install the DARK shadow context on the widget seed resolve
+	// ctx (the cohort identity is on resCtx via withCohortSeedContext). D is derived
+	// from the PRE-resolve widget object (in.Object): the wrapper's derive runs
+	// synchronously here, before widgetsResolveFn mutates `in`. Self-gated +
+	// recover-isolated (no-op when off). classify fires at seedOneWidget return,
+	// after the resolve fully returns (INVARIANT a).
+	resCtx = installShadowParitySeedWidget(resCtx, in.Object)
+	defer classifyShadowSeedResolve(resCtx)
 
 	// 1.12.3 R-1 (adv-cache-isolation) — route through the SAME widgetsResolveFn
 	// seam the dispatcher uses (dispatch_seams.go) instead of calling
