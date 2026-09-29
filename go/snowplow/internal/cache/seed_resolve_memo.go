@@ -62,6 +62,23 @@ type ctxKeySeedResolveMemoType struct{}
 
 var ctxKeySeedResolveMemo = ctxKeySeedResolveMemoType{}
 
+// seedMemoValue is the memo's stored value: the resolved body PLUS the
+// dependency edges captured while it was produced (issue #277 / edge-3). A
+// memo hit replays Deps under the hitting caller's L1 key so a widget served
+// from the memo carries the SAME backing-GVR edges a real resolve would have
+// recorded — without which the memo-served widget cell goes stale on a backing
+// mutation (edge-3). Body stays the JSON-native, caller-deep-copied snapshot;
+// Deps is a flat slice of cache-package DepKeys, captured by the apiref seam
+// via Deps().BeginCapture/EndCapture around the producing resolve.
+//
+// [C-lifetime] the struct lives in the SeedResolveMemo = seed-pass lifetime;
+// it is never promoted into the L1 store, so the captured Deps cannot outlive
+// the pass or cross into a user /call.
+type seedMemoValue struct {
+	Body map[string]any
+	Deps []DepKey
+}
+
 // SeedResolveMemo memoizes the resolved output of a heavy RESTAction across the
 // many widgets that share it WITHIN A SINGLE SEED PASS. It is keyed by
 // (RA ns/name, RBAC identity, effective-extras hash, perPage, page) — every
@@ -74,7 +91,7 @@ var ctxKeySeedResolveMemo = ctxKeySeedResolveMemoType{}
 // Store (and the memo deep-copies again on Load) so stored bodies are never
 // aliased or mutated.
 type SeedResolveMemo struct {
-	m    sync.Map // key string -> map[string]any (JSON-native, caller-deep-copied)
+	m    sync.Map // key string -> *seedMemoValue (JSON-native body, caller-deep-copied, + captured deps)
 	// copyFn deep-copies a stored JSON-native map on Load so no two callers
 	// alias the stored value. Injected by the installer (apiref/widgets seam
 	// owns plumbing/maps.DeepCopyJSON; keeping the dep out of the cache package
@@ -141,25 +158,31 @@ func sortStrings(s []string) {
 // the stored snapshot or aliasing a sibling caller. nil-receiver-safe:
 // (nil).Load is always a miss so a call site with no memo installed behaves as
 // "always resolve".
-func (mo *SeedResolveMemo) Load(key string) (map[string]any, bool) {
+func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, bool) {
 	if mo == nil {
-		return nil, false
+		return nil, nil, false
 	}
 	v, ok := mo.m.Load(key)
 	if !ok {
 		mo.mu.Lock()
 		mo.misses++
 		mo.mu.Unlock()
-		return nil, false
+		return nil, nil, false
 	}
-	stored, _ := v.(map[string]any)
+	val, _ := v.(*seedMemoValue)
 	mo.mu.Lock()
 	mo.hits++
 	mo.mu.Unlock()
-	if mo.copyFn == nil {
-		return stored, true
+	if val == nil {
+		return nil, nil, true
 	}
-	return mo.copyFn(stored), true
+	// Deps is returned as a slice-header copy — the caller only reads it to
+	// replay edges; the underlying DepKeys are immutable value structs.
+	deps := val.Deps
+	if mo.copyFn == nil {
+		return val.Body, deps, true
+	}
+	return mo.copyFn(val.Body), deps, true
 }
 
 // Store records a JSON-native, caller-deep-copied resolved body under key. The
@@ -168,11 +191,11 @@ func (mo *SeedResolveMemo) Load(key string) (map[string]any, bool) {
 // the FIRST writer wins; a concurrent second resolve of the same tuple discards
 // its (byte-identical) body. nil-receiver-safe (no-op) so an uninstalled call
 // site never stores.
-func (mo *SeedResolveMemo) Store(key string, snapshot map[string]any) {
+func (mo *SeedResolveMemo) Store(key string, snapshot map[string]any, deps []DepKey) {
 	if mo == nil {
 		return
 	}
-	mo.m.LoadOrStore(key, snapshot)
+	mo.m.LoadOrStore(key, &seedMemoValue{Body: snapshot, Deps: deps})
 }
 
 // Stats returns the memo's hit/miss counters (diagnostic — feeds the

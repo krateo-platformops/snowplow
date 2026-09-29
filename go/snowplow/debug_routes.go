@@ -82,6 +82,7 @@ var debugRoutePatterns = []string{
 	"GET /debug/store",
 	"GET /debug/shadow-parity",
 	"POST /debug/shadow-parity",
+	"GET /debug/deps",
 }
 
 // debugMux is the minimal registration surface registerDebugRoutes needs.
@@ -197,4 +198,14 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// measurement that uses it must pin to one pod (see the handler doc).
 	mux.Handle("GET /debug/shadow-parity", gated.Then(handlers.DebugShadowParityGet()))
 	mux.Handle("POST /debug/shadow-parity", gated.Then(handlers.DebugShadowParitySet()))
+
+	// #277 (edge-3) — the read-only dep-graph diagnostic. Same JWT gate, same
+	// METADATA-ONLY contract as /debug/apistage: it returns dependency edges as
+	// cluster coordinates + per-cell freshness metadata + a body sha256, NEVER a
+	// resolved body or a pre-hash key input. ?key inspects one cell; ?filter=
+	// missing-backing-edges / stale-risk surface the serve-seam staleness class
+	// (the C3 residual detector). The ?filter scans are lock-free (reverse-index
+	// Range) and capped, so a diagnostic pull never holds a store/serve mutex
+	// for a scan-length span.
+	mux.Handle("GET /debug/deps", gated.Then(handlers.DebugDeps()))
 }

@@ -238,27 +238,50 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// key includes (perPage, page), so the unpaginated first-sight (0,0), the 4a
 	// paginated serve, and any page-keyed fallthrough occupy distinct memo slots
 	// and never cross-serve.
+	// l1Key is the WIDGET cell's key this resolve populates (set by the widgets
+	// dispatcher / seedOneWidget before it calls apiref.Resolve). It anchors
+	// BOTH the edge-3 memo capture and the memo-hit replay.
+	l1Key := cache.L1KeyFromContext(ctx)
+
 	memo := cache.SeedResolveMemoFromContext(ctx)
 	var memoKey string
+	var capBuf *[]cache.DepKey
 	if memo != nil {
 		username, groups := identityForMemo(ctx)
 		memoKey = memo.Key(opts.ApiRef.Namespace, opts.ApiRef.Name,
 			username, groups, cache.HashExtras(opts.Extras), opts.PerPage, opts.Page)
-		if hit, ok := memo.Load(memoKey); ok {
-			// Load returns a fresh deep copy; safe to hand straight back.
-			return hit, nil
+		if body, deps, ok := memo.Load(memoKey); ok {
+			// #277 / edge-3: replay the deps captured when this body was first
+			// produced onto THIS widget's L1 key, so a memo-served widget cell
+			// carries the same backing-GVR edges a real resolve would have
+			// recorded (else it goes stale on a backing mutation). Load returns
+			// a fresh deep copy; safe to hand straight back.
+			cache.Deps().ReplayEdges(l1Key, deps)
+			return body, nil
 		}
+		// #277 / edge-3: open a capture over the PRODUCING block below so the
+		// deps recorded under l1Key (including edge-3 REPLAYED by the 4a fast
+		// path inside raFullListServe — THE blocking-finding composition) are
+		// stored in the memo for sibling widgets to replay. The deferred
+		// EndCapture is a safety net: it releases the capture on an early error
+		// return; on the normal path storeMemo already ended it (a second
+		// EndCapture on the same handle is a no-op).
+		capBuf = cache.Deps().BeginCapture(l1Key)
+		defer cache.Deps().EndCapture(l1Key, capBuf)
 	}
 
 	// storeMemo deep-copies the resolved body (JSON-native round-trip, C-F4-3 —
 	// panics AT THIS SEAM on a non-JSON-native value rather than aliasing a bad
-	// value into the shared memo) and records it so sibling widgets in the pass
-	// hit it. No-op when no memo is installed (nil memo / empty key).
+	// value into the shared memo), closes the edge-3 capture, and records BOTH
+	// under memoKey so sibling widgets in the pass hit the body AND replay its
+	// deps. No-op when no memo is installed (nil memo / empty key). Called
+	// exactly once per resolve.
 	storeMemo := func(out map[string]any) {
 		if memo == nil || memoKey == "" || out == nil {
 			return
 		}
-		memo.Store(memoKey, pmaps.DeepCopyJSON(out))
+		deps := cache.Deps().EndCapture(l1Key, capBuf)
+		memo.Store(memoKey, pmaps.DeepCopyJSON(out), deps)
 	}
 
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef

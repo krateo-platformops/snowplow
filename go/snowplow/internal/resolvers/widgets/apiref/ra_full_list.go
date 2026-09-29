@@ -306,6 +306,15 @@ func raFullListServe(
 		return nil, false, nil
 	}
 
+	// widgetL1Key is the ORIGINAL widget cell's key (the request ctx's L1
+	// key), NEVER fullCtx/raKey. #277 / edge-3: the serve seams replay the
+	// raKey cell's backing edges onto THIS key so a backing-object mutation
+	// invalidates the widget cell that was served a Go-slice — otherwise the
+	// widget cell (served directly by the dispatcher on a warm hit) carries no
+	// backing edge and goes stale. Empty on paths with no widget L1 key on ctx
+	// (e.g. the direct-serve unit tests); ReplayEdges is nil-safe there.
+	widgetL1Key := cache.L1KeyFromContext(ctx)
+
 	// fullCtx scopes the UNPAGINATED resolves' inner-call dep edges to the
 	// RAFullList key, so an informer event on any object the RA reads
 	// dirty-marks THIS cell and the refresher re-resolves + re-pins it
@@ -332,6 +341,20 @@ func raFullListServe(
 			full, derr := decodeRAFullList(entry.RawJSON)
 			if derr == nil {
 				if sliced, sok := cache.GoSliceFullList(full, offset, perPage); sok {
+					// #277 / edge-3 [C2 + DECISION 2, C2-TOCTOU]: replay the
+					// raKey cell's backing edges onto the widget key so a
+					// backing mutation invalidates this widget's cell too. An
+					// EMPTY edge set means the raKey cell was evicted between
+					// c.Get above and here (TOCTOU) — DECLINE the fast path
+					// (served=false, no error), exactly like the decode-mismatch
+					// decline below, so apiref.Resolve falls through to the
+					// full page-keyed resolve which records edge-3 under the
+					// widget key. NEVER serve a cell with no backing edge.
+					edges := cache.Deps().EdgesUnder(raKey)
+					if len(edges) == 0 {
+						return nil, false, nil
+					}
+					cache.Deps().ReplayEdges(widgetL1Key, edges)
 					cache.RecordRAFullListServe(cache.RAFullListServeHit)
 					return sliced, true, nil
 				}
@@ -365,6 +388,16 @@ func raFullListServe(
 		}
 		c.PutRAFullList(raKey, keyInputs, full)
 		cache.Deps().Record(raKey, gvr, namespace, name)
+		// #277 / edge-3: the unpaginated resolve above recorded the backing
+		// edges under raKey (fullCtx); replay them onto the widget key so this
+		// widget's cell is invalidated by a backing mutation too. Same
+		// defensive TOCTOU decline as the hit branch — an empty edge set means
+		// the cell we just Put carries no backing edge, so fall through.
+		edges := cache.Deps().EdgesUnder(raKey)
+		if len(edges) == 0 {
+			return nil, false, nil
+		}
+		cache.Deps().ReplayEdges(widgetL1Key, edges)
 		cache.RecordRAFullListServe(cache.RAFullListServeRepopulateSlice)
 		return sliced, true, nil
 	}
@@ -378,6 +411,14 @@ func raFullListServe(
 	// 2. Resolve the OLD page-keyed way -> S_ra (the fall-back reference).
 	//    Under the ORIGINAL ctx so its deps belong to the widget cell,
 	//    unchanged from today.
+	//
+	// #277 / edge-3 [C3 + C-branch-precision] PIN: this first-sight page-keyed
+	// resolve runs under the ORIGINAL ctx (widget L1 key), so its inner LIST/
+	// GET dispatch records the backing-GVR edge ("edge-3") DIRECTLY under the
+	// widget key — the fast-path hit + repopulate branches replay it instead
+	// (they never run this resolve). NO ReplayEdges here: adding one would
+	// double-record (harmless but misleading). F-PIN asserts this resolve
+	// records edge-3 under ctx. Do NOT swap ctx for fullCtx here.
 	sRA, err := resolveRA(ctx, perPage, page)
 	if err != nil {
 		return nil, false, err
