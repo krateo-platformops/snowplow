@@ -924,6 +924,13 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				slog.String("host", call.Endpoint.ServerURL),
 				slog.String("path", call.Path),
 				slog.String("dispatch", "internal-rest-config"),
+				// diagnostic for #271 — self-name the SAR-401 root cause. sa_dial
+				// reads the SAME provenance marker the dial consumes (gctx :=
+				// sc.gctx, marked at runStage when isSA), so at this
+				// internal-rest-config site sa_dial=true names a stale SA-endpoint
+				// token (#267 gap, cause a′) vs sa_dial=false a rejected
+				// per-user clientconfig (cause b).
+				slog.Bool("sa_dial", cache.ServiceAccountDialFromContext(gctx)),
 				slog.String("error", ierr.Error()))
 			// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
 			// deduplicated into recordItemError. The %w-wrapped cause
@@ -1005,6 +1012,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				slog.String("host", call.Endpoint.ServerURL),
 				slog.String("path", call.Path),
 				slog.String("dispatch", "discovery"),
+				// diagnostic for #271 (C3 caveat). dispatchViaDiscovery uses the
+				// process-wide SA rest.Config SINGLETON, independent of the
+				// per-stage endpoint marker, so sa_dial HERE reflects
+				// ENDPOINT-PROVENANCE, not the dial transport actually used —
+				// do NOT read it as the a′/b discriminator. At this site the
+				// operative discriminator is the dispatch="discovery" field above;
+				// the clean a′/b read via sa_dial is the internal-rest-config and
+				// external/owned-fetch sites.
+				slog.Bool("sa_dial", cache.ServiceAccountDialFromContext(gctx)),
 				slog.String("error", derr.Error()))
 			var itemErr error
 			if !call.ContinueOnError {
@@ -1202,6 +1218,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Error("api call response failure", slog.String("name", id),
 			slog.String("host", call.Endpoint.ServerURL),
 			slog.String("path", call.Path),
+			// diagnostic for #271 — external/owned-fetch site. sa_dial reads
+			// the SAME provenance marker the dial consumes (gctx := sc.gctx,
+			// marked at runStage when isSA): sa_dial=true names a stale
+			// SA-endpoint token (#267 gap, cause a′) vs sa_dial=false a
+			// rejected per-user clientconfig (cause b).
+			slog.Bool("sa_dial", cache.ServiceAccountDialFromContext(gctx)),
 			slog.String("error", res.Message))
 
 		asMap, mapErr := response.AsMap(res)
