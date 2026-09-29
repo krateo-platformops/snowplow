@@ -36,6 +36,7 @@ package dispatchers
 
 import (
 	"context"
+	"expvar"
 	"io"
 	"log/slog"
 	"sync/atomic"
@@ -137,17 +138,21 @@ func shadowWatcher(t testing.TB) {
 
 func resetShadowCounters() {
 	shadowChecksTotal.Store(0)
+	shadowChecksAllowTotal.Store(0)
+	shadowChecksDenyTotal.Store(0)
 	shadowVerdictMismatchTotal.Store(0)
 	shadowCoverageMissTotal.Store(0)
 	shadowProjectionNameAmbiguousLeakTotal.Store(0)
 	shadowDarkPanicTotal.Store(0)
 }
 
-type shadowCounters struct{ checks, mismatch, coverage, leak, panic uint64 }
+type shadowCounters struct{ checks, allow, deny, mismatch, coverage, leak, panic uint64 }
 
 func snapCounters() shadowCounters {
 	return shadowCounters{
 		checks:   shadowChecksTotal.Load(),
+		allow:    shadowChecksAllowTotal.Load(),
+		deny:     shadowChecksDenyTotal.Load(),
 		mismatch: shadowVerdictMismatchTotal.Load(),
 		coverage: shadowCoverageMissTotal.Load(),
 		leak:     shadowProjectionNameAmbiguousLeakTotal.Load(),
@@ -240,8 +245,8 @@ func TestFD6a_HookDoesNotFire_ToggleOff_NoCtx_ErrPath(t *testing.T) {
 	if _, err, _ := driveCheck(t, "alice", []string{spGroup}, d, opts); err != nil {
 		t.Fatalf("toggle-off drive: %v", err)
 	}
-	if c := snapCounters(); c.checks != 0 {
-		t.Fatalf("toggle-off must not fire: %+v", c)
+	if c := snapCounters(); c.checks != 0 || c.allow != 0 || c.deny != 0 {
+		t.Fatalf("toggle-off must not fire (incl. the allow/deny split): %+v", c)
 	}
 	rbac.SetShadowParityEnabled(true)
 
@@ -626,6 +631,143 @@ func TestFSeed_SeedPathHasNoShadowCtxSoHookNoOps(t *testing.T) {
 	}
 	if c := snapCounters(); c.checks != 0 {
 		t.Fatalf("a check with no shadow context (seed/refresher shape) must not fire: %+v", c)
+	}
+}
+
+// ───────────────────────── 1.12.18 — dark allow/deny split (RED-first) ─────────────────────────
+//
+// The split partitions checks_total into checks_allow_total / checks_deny_total
+// on the hook's own `allowed` param (the live EvaluateRBAC verdict). It is a pure
+// instrument — no gate, no v7-key certification. Two claims:
+//
+//	F-split-attribution — a real PERMIT bumps ONLY allow; a real DENY bumps ONLY
+//	                       deny; an interleave attributes each check to the right
+//	                       branch. Each arm fails alone if the bump is on the wrong
+//	                       branch (a swapped allow↔deny REDs arm1 or arm2).
+//	F-sum-invariant     — allow + deny == checks_total after any drive, including
+//	                       one with anomalies. The whole integrity claim; standalone.
+
+// TestFSplit_AttributionByBranch drives the REAL EvaluateRBAC (via driveCheck) so
+// `allowed` is the genuine verdict, and asserts each check lands on the correct
+// branch. A permit → allow only; a deny → deny only.
+func TestFSplit_AttributionByBranch(t *testing.T) {
+	shadowWatcher(t)
+	d := coverGetPods("p1") // covers get/core/pods; no coverage miss on either arm.
+	opts := rbac.EvaluateOptions{Verb: "get", Group: "", Resource: "pods", Namespace: "default", Name: "p1"}
+
+	// arm1 — a real PERMIT (alice is bound reader): Δallow=1, Δdeny=0.
+	resetShadowCounters()
+	allowed, err, _ := driveCheck(t, "alice", []string{spGroup}, d, opts)
+	if err != nil || !allowed {
+		t.Fatalf("arm1: alice must be permitted: allowed=%v err=%v", allowed, err)
+	}
+	if c := snapCounters(); c.allow != 1 || c.deny != 0 || c.checks != 1 {
+		t.Fatalf("arm1 (real permit) = %+v, want allow=1 deny=0 checks=1 (bump on the wrong branch REDs here)", c)
+	}
+
+	// arm2 — a real DENY (nobody has no binding): Δallow=0, Δdeny=1.
+	resetShadowCounters()
+	allowed, err, _ = driveCheck(t, "nobody", nil, d, opts)
+	if err != nil || allowed {
+		t.Fatalf("arm2: nobody must be denied: allowed=%v err=%v", allowed, err)
+	}
+	if c := snapCounters(); c.allow != 0 || c.deny != 1 || c.checks != 1 {
+		t.Fatalf("arm2 (real deny) = %+v, want allow=0 deny=1 checks=1 (bump on the wrong branch REDs here)", c)
+	}
+
+	// arm3 — interleave a permits + d denies: allow==a && deny==d && checks==a+d.
+	const a, dn = 3, 2
+	resetShadowCounters()
+	pending := []bool{true, false, true, false, true} // 3 permits, 2 denies, interleaved.
+	for i, permit := range pending {
+		if permit {
+			if allowed, err, _ := driveCheck(t, "alice", []string{spGroup}, d, opts); err != nil || !allowed {
+				t.Fatalf("arm3 step %d (permit): allowed=%v err=%v", i, allowed, err)
+			}
+		} else {
+			if allowed, err, _ := driveCheck(t, "nobody", nil, d, opts); err != nil || allowed {
+				t.Fatalf("arm3 step %d (deny): allowed=%v err=%v", i, allowed, err)
+			}
+		}
+	}
+	if c := snapCounters(); c.allow != a || c.deny != dn || c.checks != a+dn {
+		t.Fatalf("arm3 (interleave) = %+v, want allow=%d deny=%d checks=%d", c, a, dn, a+dn)
+	}
+}
+
+// TestFSplit_SumInvariant is the standalone PM condition: after ANY drive —
+// including one that trips anomaly counters — the two split counters partition
+// checks_total exactly. allow + deny == checks_total, unconditionally.
+func TestFSplit_SumInvariant(t *testing.T) {
+	shadowWatcher(t)
+	pods := coverGetPods("p1")
+	opts := rbac.EvaluateOptions{Verb: "get", Group: "", Resource: "pods", Namespace: "default", Name: "p1"}
+
+	// The ${._getpath} external domain (NO class) — a permit that ALSO trips
+	// coverage_miss, proving the split is independent of the anomaly counters.
+	getpath := DeriveRESTActionAccessDomain(&templatesv1.RESTAction{Spec: templatesv1.RESTActionSpec{
+		API: []*templatesv1.API{{Name: "s1", Path: "${.getpath}", Verb: strptr("GET")}},
+	}}, NilChainResolver)
+
+	resetShadowCounters()
+	driveCheck(t, "alice", []string{spGroup}, pods, opts)    // permit
+	driveCheck(t, "nobody", nil, pods, opts)                 // deny
+	driveCheck(t, "alice", []string{spGroup}, getpath, opts) // permit + coverage miss
+	driveCheck(t, "nobody", nil, getpath, opts)              // deny + coverage miss
+
+	c := snapCounters()
+	if c.allow+c.deny != c.checks {
+		t.Fatalf("F-sum-invariant VIOLATED: allow(%d) + deny(%d) = %d != checks_total(%d): %+v",
+			c.allow, c.deny, c.allow+c.deny, c.checks, c)
+	}
+	if c.checks != 4 || c.coverage == 0 {
+		t.Fatalf("F-sum-invariant precondition: want checks=4 with at least one coverage miss, got %+v", c)
+	}
+}
+
+// TestFStillDark_SplitKeysOnlyInsideGatedMap — the two new keys live ONLY inside
+// the single CFG-1-gated surface's map; the split adds no separate expvar.Publish.
+//
+// Whether the aggregate surface is published at all is decided once at package
+// init() (registration is behind cache.Disabled(), sync.Once) from the boot-time
+// CACHE_ENABLED — a per-test t.Setenv cannot un-publish or publish it. So this
+// test reads the REAL boot-time surface state instead of forcing one:
+//   - if the surface is present (cache-on boot), the two keys must appear INSIDE
+//     its map (they ride the gated Func, not a new publish);
+//   - if it is absent (cache-off boot — the default `go test` posture, which CI
+//     provides), the keys cannot exist at all.
+//
+// Either way the mode-independent guard holds: neither key is ever published as a
+// STANDALONE expvar, so neither can escape the cache gate.
+func TestFStillDark_SplitKeysOnlyInsideGatedMap(t *testing.T) {
+	// Mode-independent, unconditionally sound: the split must not have added a
+	// SEPARATE ungated publish for either counter (in EITHER boot mode).
+	for _, name := range []string{"snowplow_v7_shadow_parity_checks_allow_total", "snowplow_v7_shadow_parity_checks_deny_total"} {
+		if v := expvar.Get(name); v != nil {
+			t.Fatalf("split counter %q must live only inside the gated map, not a standalone expvar; got %v", name, v)
+		}
+	}
+
+	// Gate the surface assertion on the REAL boot-time publish decision (the
+	// presence of the surface itself), so it cannot false-fail under a cache-on
+	// boot the way an unconditional `== nil` would.
+	surface := expvar.Get("snowplow_v7_shadow_parity")
+	if surface == nil {
+		return // cache-off boot: nothing published ⇒ the two keys don't exist. Guard above suffices.
+	}
+	// cache-on boot: the two keys must be present INSIDE the gated map.
+	fn, ok := surface.(expvar.Func)
+	if !ok {
+		t.Fatalf("snowplow_v7_shadow_parity must be an expvar.Func, got %T", surface)
+	}
+	m, ok := fn().(map[string]uint64)
+	if !ok {
+		t.Fatalf("snowplow_v7_shadow_parity Func must return map[string]uint64, got %T", fn())
+	}
+	for _, key := range []string{"checks_allow_total", "checks_deny_total"} {
+		if _, present := m[key]; !present {
+			t.Fatalf("split key %q must be inside the gated snowplow_v7_shadow_parity map: %v", key, m)
+		}
 	}
 }
 

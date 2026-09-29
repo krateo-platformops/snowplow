@@ -76,6 +76,13 @@ var (
 	// carried a shadow context (F-H5's LHS). Its independent RHS is
 	// rbac.EvaluateRBACCallCount() in a hermetic served-only window.
 	shadowChecksTotal atomic.Uint64
+	// shadowChecksAllowTotal / shadowChecksDenyTotal — the dark allow/deny split of
+	// checks_total (1.12.18). Partitioned on the hook's own `allowed` param (the
+	// live EvaluateRBAC verdict): bumped once per served check, immediately after
+	// checks_total, so allow+deny == checks_total holds unconditionally. Pure
+	// instrument — no gate, no v7-key certification (that is Step 2E).
+	shadowChecksAllowTotal atomic.Uint64
+	shadowChecksDenyTotal  atomic.Uint64
 	// shadowVerdictMismatchTotal — R.Permits(opts) != live allowed (F-verdict).
 	shadowVerdictMismatchTotal atomic.Uint64
 	// shadowCoverageMissTotal — the check's coordinate is covered by no class in
@@ -97,6 +104,8 @@ func registerShadowParityMetrics() {
 		expvar.Publish("snowplow_v7_shadow_parity", expvar.Func(func() any {
 			return map[string]uint64{
 				"checks_total":                         shadowChecksTotal.Load(),
+				"checks_allow_total":                   shadowChecksAllowTotal.Load(),
+				"checks_deny_total":                    shadowChecksDenyTotal.Load(),
 				"verdict_mismatch_total":               shadowVerdictMismatchTotal.Load(),
 				"coverage_miss_total":                  shadowCoverageMissTotal.Load(),
 				"projection_name_ambiguous_leak_total": shadowProjectionNameAmbiguousLeakTotal.Load(),
@@ -247,6 +256,16 @@ func runShadowParityHook(ctx context.Context, snap *cache.RBACSnapshot, opts rba
 	// checks_total — the served-path denominator (F-H5). One bump per served
 	// EvaluateRBAC check that carried a shadow context.
 	shadowChecksTotal.Add(1)
+
+	// Dark allow/deny split (1.12.18). Attribute this check to the live verdict
+	// (`allowed` — the exact bool compared against R.Permits below). Placed
+	// immediately after checks_total with nothing between, so the partition
+	// invariant allow+deny == checks_total can never diverge.
+	if allowed {
+		shadowChecksAllowTotal.Add(1)
+	} else {
+		shadowChecksDenyTotal.Add(1)
+	}
 
 	// R from the CHECK's own snapshot (design V10: the hook builds R from the
 	// check's snap, so generation skew is impossible). Memoised.
