@@ -11,8 +11,73 @@ package api
 
 import (
 	"net/http"
+	"runtime"
 	"testing"
+	"time"
 )
+
+// waitGoroutineCount polls runtime.NumGoroutine() until pred(n) holds or
+// the deadline elapses; it returns whether pred was satisfied. Used by the
+// summary-goroutine lifecycle test to observe the goroutine start and then
+// return to baseline after a stop, tolerating scheduler lag on Done().
+func waitGoroutineCount(pred func(n int) bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if pred(runtime.NumGoroutine()) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return pred(runtime.NumGoroutine())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestDispatchSummary_GoroutineStops is the #221 goroutine-leak arm: the
+// summary goroutine must have a REACHABLE stop. It starts the loop, proves
+// the goroutine is alive, then stops it via the test seam and asserts the
+// goroutine actually exits — NumGoroutine returns to baseline and the
+// joined WaitGroup guarantees the frame is gone (no leak). On pre-#221 code
+// the loop is `for range t.C` with an unreachable `defer t.Stop()` and NO
+// stop seam, so this arm cannot even be written against it (stop API
+// absent) — that is the RED.
+func TestDispatchSummary_GoroutineStops(t *testing.T) {
+	// Short interval so the goroutine is unambiguously running; the value
+	// is irrelevant to the stop path, which is signal-driven, not tick-driven.
+	t.Setenv(envDispatchSummaryEvery, "1")
+
+	// Clean slate in case an earlier test in this binary already started it.
+	stopDispatchSummaryForTest()
+
+	base := runtime.NumGoroutine()
+	startDispatchSummary()
+
+	if !waitGoroutineCount(func(n int) bool { return n > base }, time.Second) {
+		t.Fatalf("summary goroutine did not start: NumGoroutine stayed at baseline %d", base)
+	}
+	afterStart := runtime.NumGoroutine()
+	t.Logf("goroutines: baseline=%d after-start=%d (delta=%+d)", base, afterStart, afterStart-base)
+
+	// The stop must join the goroutine; if the stop is unreachable this
+	// call blocks forever and the test times out.
+	stopDispatchSummaryForTest()
+
+	if !waitGoroutineCount(func(n int) bool { return n <= base }, 2*time.Second) {
+		t.Fatalf("summary goroutine did not exit after stop: NumGoroutine=%d baseline=%d", runtime.NumGoroutine(), base)
+	}
+	t.Logf("goroutines: after-stop=%d baseline=%d (back to baseline)", runtime.NumGoroutine(), base)
+
+	// The Once must have been reset so a subsequent production start
+	// relaunches the goroutine (lifecycle contract preserved).
+	startDispatchSummary()
+	if !waitGoroutineCount(func(n int) bool { return n > base }, time.Second) {
+		t.Fatalf("summary goroutine did not restart after reset: NumGoroutine stayed at baseline %d", base)
+	}
+	stopDispatchSummaryForTest()
+	if !waitGoroutineCount(func(n int) bool { return n <= base }, 2*time.Second) {
+		t.Fatalf("summary goroutine did not exit after second stop: NumGoroutine=%d baseline=%d", runtime.NumGoroutine(), base)
+	}
+}
 
 // resetDispatchCounters zeroes the package-level pivot counters so each
 // test asserts deltas from a clean slate.
@@ -106,9 +171,9 @@ func TestDispatchCounters_MixedTotals(t *testing.T) {
 	)
 
 	served := []string{
-		"/apis/templates.krateo.io/v1/namespaces/default/restactions",        // LIST
-		"/apis/templates.krateo.io/v1/namespaces/default/restactions/a",      // GET
-		"/apis/templates.krateo.io/v1/namespaces/default/restactions/b",      // GET
+		"/apis/templates.krateo.io/v1/namespaces/default/restactions",   // LIST
+		"/apis/templates.krateo.io/v1/namespaces/default/restactions/a", // GET
+		"/apis/templates.krateo.io/v1/namespaces/default/restactions/b", // GET
 	}
 	for _, p := range served {
 		if _, ok := dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, p)); !ok {
@@ -116,8 +181,8 @@ func TestDispatchCounters_MixedTotals(t *testing.T) {
 		}
 	}
 	fallthroughs := []string{
-		"/apis/templates.krateo.io/v1/namespaces/default/restactions/nope",   // GET-miss
-		"https://external.invalid/x",                                         // external
+		"/apis/templates.krateo.io/v1/namespaces/default/restactions/nope", // GET-miss
+		"https://external.invalid/x",                                       // external
 	}
 	for _, p := range fallthroughs {
 		if _, ok := dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, p)); ok {

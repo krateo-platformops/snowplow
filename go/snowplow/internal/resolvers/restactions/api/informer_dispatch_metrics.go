@@ -85,13 +85,25 @@ const (
 	defaultDispatchSummarySeconds = 60
 )
 
-var dispatchSummaryOnce sync.Once
+var (
+	dispatchSummaryOnce sync.Once
+	// dispatchSummaryStop signals the summary goroutine to exit. It is
+	// created inside the sync.Once and read only there and by the test
+	// seam, so it needs no separate lock. Production never closes it (the
+	// goroutine's lifetime is the process's); the test seam does (#221).
+	dispatchSummaryStop chan struct{}
+	// dispatchSummaryWG joins the summary goroutine so a stop can prove it
+	// has actually exited — the goroutine-leak arm (#221) relies on this.
+	dispatchSummaryWG sync.WaitGroup
+)
 
 // startDispatchSummary launches a single bounded goroutine that emits an
 // `informer_dispatch.summary` INFO line every N seconds. Lifecycle bound:
-// a sync.Once guarantees exactly one goroutine for the process lifetime;
-// it does constant work per tick and is never stopped (process-scoped,
-// same contract as `startResolvedCacheSummary`).
+// a sync.Once guarantees exactly one goroutine at a time; in production the
+// process never stops it, but the loop now selects on a stop channel so the
+// deferred `t.Stop()` is REACHABLE and the goroutine can be joined and
+// drained by the test seam (#221 — an unstoppable goroutine is
+// indistinguishable from a leak and makes every log-capture test racy).
 //
 // Started lazily on the first `dispatchViaInformer` call so the goroutine
 // never exists when the pivot is inactive (#57: implicit-on-cache — never
@@ -99,25 +111,50 @@ var dispatchSummaryOnce sync.Once
 func startDispatchSummary() {
 	dispatchSummaryOnce.Do(func() {
 		every := time.Duration(dispatchSummaryEverySeconds()) * time.Second
+		stop := make(chan struct{})
+		dispatchSummaryStop = stop
+		dispatchSummaryWG.Add(1)
 		go func() {
+			defer dispatchSummaryWG.Done()
 			t := time.NewTicker(every)
 			defer t.Stop()
-			for range t.C {
-				s := DispatchInformerStatsSnapshot()
-				// STABLE single-line falsifier shape (greppable):
-				//   informer_dispatch.summary list_served=N get_served=M
-				//   apiserver_fallthrough=K
-				slog.Info("informer_dispatch.summary",
-					slog.String("subsystem", "cache"),
-					slog.Uint64("list_served", s.ListServed),
-					slog.Uint64("get_served", s.GetServed),
-					slog.Uint64("apiserver_fallthrough", s.Fallthrough),
-					slog.Uint64("rbac_dropped", s.RBACDropped),
-					slog.Uint64("sync_wait_served", s.SyncWaitServed),
-				)
+			for {
+				select {
+				case <-stop:
+					return
+				case <-t.C:
+					s := DispatchInformerStatsSnapshot()
+					// STABLE single-line falsifier shape (greppable):
+					//   informer_dispatch.summary list_served=N get_served=M
+					//   apiserver_fallthrough=K
+					slog.Info("informer_dispatch.summary",
+						slog.String("subsystem", "cache"),
+						slog.Uint64("list_served", s.ListServed),
+						slog.Uint64("get_served", s.GetServed),
+						slog.Uint64("apiserver_fallthrough", s.Fallthrough),
+						slog.Uint64("rbac_dropped", s.RBACDropped),
+						slog.Uint64("sync_wait_served", s.SyncWaitServed),
+					)
+				}
 			}
 		}()
 	})
+}
+
+// stopDispatchSummaryForTest stops the summary goroutine started by
+// startDispatchSummary, blocks until it has actually exited (joined
+// WaitGroup), and resets the sync.Once so a subsequent start relaunches it.
+// TEST-ONLY — production never stops the goroutine (its lifetime is the
+// process's), mirroring this package's other `*ForTest` reset seams
+// (resetInternalClientCacheForTest / resetDiscoveryClientCacheForTest). It
+// is idempotent: safe to call when the goroutine was never started.
+func stopDispatchSummaryForTest() {
+	if dispatchSummaryStop != nil {
+		close(dispatchSummaryStop)
+	}
+	dispatchSummaryWG.Wait()
+	dispatchSummaryStop = nil
+	dispatchSummaryOnce = sync.Once{}
 }
 
 // dispatchSummaryEverySeconds resolves the summary interval from the env
