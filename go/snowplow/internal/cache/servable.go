@@ -578,10 +578,22 @@ type ServableGVRStatus struct {
 	// successful relist) and never published.
 	//
 	// LastEventAgeSeconds is the time since the bridge last delivered ANY
-	// event for this GVR; -1 means never. A GVR whose objects churn but whose
-	// age keeps climbing has a dead watch that watchBroken did not catch —
-	// HasSynced stays true forever once the initial LIST completes, so it
-	// cannot express this.
+	// POST-SYNC event for this GVR. The stamp sits AFTER the pre-sync gate
+	// (noteInformerEvent runs only when addEventPostSync returns true), so the
+	// initial LIST replay never stamps it.
+	//
+	// -1 (#249) is NOT a dead-watch signal on its own: it reads identically for
+	// a healthy GVR with nothing to deliver and one whose watch died before
+	// delivering. Disambiguate by reading IndexerCount ALONGSIDE it —
+	//   idx == 0 && age < 0 → nothing to deliver (healthy empty collection);
+	//   idx  > 0 && age < 0 → LISTed at boot, nothing since (benign by
+	//                          construction, e.g. static config CRs);
+	//   age > 0             → an event WAS genuinely delivered that long ago.
+	// A positive value proves an event was delivered, NOT that none was missed
+	// (a dead-watch kill needs this field JOINED with independent evidence —
+	// the affected L1 cells' refresh ages, say; the field alone is not a kill).
+	// A genuinely dead / never-synced watch is caught by WatchBroken / HasSynced,
+	// not by this field. Interpretation only — no serve-path / JQ dependency.
 	IndexerCount            int     `json:"indexerCount"`
 	LastSyncResourceVersion string  `json:"lastSyncResourceVersion,omitempty"`
 	LastEventAgeSeconds     float64 `json:"lastEventAgeSeconds"`
