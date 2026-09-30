@@ -502,16 +502,13 @@ type DepTracker struct {
 	// ranging the forward map: a sync.Map walk over 90K+ edges on every OTLP
 	// collection is not a cost a gauge should carry.
 	//
-	// ONE KNOWN OVER-READ, recorded rather than fixed here. recordInternal
-	// LoadOrStores a forward bucket and then, if the record cap is hit, rolls
-	// back only the KEY inside it — leaving an empty keySet in the map. This
-	// counter counts that bucket, so `coordinates` over-reads whenever
-	// dropped_cap > 0. It is a pre-existing defect with its own cause and its
-	// own fix, filed separately rather than bundled into #237 B: a one-line
-	// change to this hot path is how an unrelated regression gets attributed
-	// to the wrong ship. dropped_cap reads 0 on the live pod, so the over-read
-	// does not affect the discrimination this gauge exists to perform — but
-	// read the two together, never this one alone.
+	// EXACT ACROSS THE CAP ROLLBACK (#242). recordInternal LoadOrStores a
+	// forward bucket and, if the record cap is then hit, rolls back the KEY
+	// inside it; the rollback also prunes the bucket WE just created when no
+	// concurrent Record has committed into it (!loadedBucket && count==0,
+	// CompareAndDelete-gated) and undoes the matching coordinates.Add(1). So an
+	// empty keySet is never left behind and `coordinates` counts only live
+	// buckets, whatever dropped_cap is.
 	coordinates atomic.Int64
 
 	// Falsifier counters (atomic; safe to read without holding anything).
@@ -707,6 +704,17 @@ func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
 		// add, we accept the off-by-one (worst case 1 extra record).
 		ks.keys.Delete(l1Key)
 		d.recordDroppedCap.Add(1)
+		// #242 — if WE created this bucket (!loadedBucket, so WE did the
+		// coordinates.Add(1) above) and no concurrent Record has committed an
+		// edge into it (ks.count is still 0 — the commit path at ks.count.Add(1)
+		// runs AFTER this cap check), the bucket is a phantom the coordinates
+		// gauge would over-read forever. Prune it, gating coordinates.Add(-1) on
+		// the CompareAndDelete success so a losing racer cannot double-count —
+		// the count-guarded pattern RemoveL1Key uses (#239). The residual
+		// check-then-delete race is the identical benign one accepted there.
+		if !loadedBucket && ks.count.Load() == 0 && d.forward.CompareAndDelete(dk, ks) {
+			d.coordinates.Add(-1)
+		}
 		if d.capWarned.CompareAndSwap(false, true) {
 			slog.Warn("deps.record.cap_reached",
 				slog.String("subsystem", "cache"),
