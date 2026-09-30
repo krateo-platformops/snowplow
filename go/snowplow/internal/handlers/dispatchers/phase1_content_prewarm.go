@@ -426,25 +426,29 @@ func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference,
 		return 0, fmt.Errorf("unstructured -> RESTAction %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 
-	// Thread the content L1 key so each inner K8s call's content entry
-	// records its dep edge (the content path's dep recording — F1 wires
-	// it; this keeps it wired for the prewarm resolve too).
-	keyCtx := cache.WithL1KeyContext(rctx,
-		cache.ComputeKey(cache.ResolvedKeyInputs{
-			CacheEntryClass: "restactions",
-			Group:           restActionGVR.Group,
-			Version:         restActionGVR.Version,
-			Resource:        restActionGVR.Resource,
-			Namespace:       ref.Namespace,
-			Name:            ref.Name,
-		}))
-
-	res, err := restactions.Resolve(keyCtx, restactions.ResolveOptions{
+	// #250 — resolve under the BARE rctx: do NOT thread a restactions-class
+	// WithL1KeyContext here. The content prewarm resolves purely to WARM the
+	// per-K8s-call content L1: apistageContentServe (apistage.go) and the
+	// cluster-list collapse (cluster_list.go) Put each call's cell under its
+	// OWN identity-free contentKey AND record that cell's dep edge under the
+	// SAME contentKey — so every entry this pass warms is invalidatable via
+	// its own edge, independent of any ambient key. prewarmOneRESTAction
+	// itself Puts NO restactions entry (the dispatcher/seed paths Put the
+	// per-identity restactions serve cell, carrying their own edges). So the
+	// former WithL1KeyContext(restactions,GVRNN) only anchored the resolver's
+	// top-level dep edges (resolve.go:483/:1610) under a key that is NEVER
+	// Put — a phantom invalidation target (dirty-marking a non-existent
+	// entry: pure dep-index bloat + a no-op dirty-mark on every backing
+	// change, sole-coverage = NO / double-covered). Dropping the install is a
+	// no-behaviour-change cleanup: recordGetDep (objects/get.go:320-322) and
+	// resolve.go:483/:1610 all guard `l1Key != ""` → a clean no-op under the
+	// keyless ctx; the content cells keep their contentKey edges unchanged.
+	res, err := restactions.Resolve(rctx, restactions.ResolveOptions{
 		In: &cr,
 		// Ship 0.30.230 fix-at-root: SArc threaded from ctx — the
 		// content prewarm runs under withContentPrewarmSAContext which
 		// installs the SA rc via cache.WithInternalRESTConfig upstream.
-		SArc:    rcFromCtx(keyCtx),
+		SArc:    rcFromCtx(rctx),
 		AuthnNS: authnNS,
 		PerPage: -1,
 		Page:    -1,
