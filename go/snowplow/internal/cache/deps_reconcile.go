@@ -438,7 +438,7 @@ func (s *reconcileState) probe(cands []reconcileCandidate) {
 			// below, but hands it to the dep-event worker only in the real
 			// reconcile — so an observe-only walk evicts nothing.
 			if !s.dryRun {
-				s.w.submitDepEvent(s.rw, c.key)
+				s.w.submitDepEvent(s.rw, c.key, dmSourceReconcile)
 			}
 		}
 		s.rep.Entries = append(s.rep.Entries, ReconcileEntry{

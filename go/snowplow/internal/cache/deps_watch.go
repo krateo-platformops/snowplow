@@ -315,10 +315,14 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 // submitDepEvent binds the watcher, starts the worker on first use and
 // enqueues the coordinate. Never blocks, never drops: the typed workqueue is
 // unbounded and deduplicates pending keys.
-func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey) {
+func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey, source string) {
 	w.watcher.Store(rw)
 	w.startWorker()
 	w.counters.eventsSubmitted.Add(1)
+	// #239 — count the submitting mechanism PRE-dedup: the workqueue coalesces
+	// same-coordinate submits across sources, so this is the only place "which
+	// mechanism submits the most events" is soundly answerable.
+	Deps().recordSubmitSource(source)
 	w.q().Add(k)
 }
 
@@ -359,7 +363,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 			ns, name := metaNSName(obj)
 			w.counters.addPropagated.Add(1)
 			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name})
+			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
 			// Ship 0.30.233 — CRD-ADD discovery side-effect, off the informer
 			// processor goroutine. See crd_discovery_side_effect.go.
 			if crdSideEffect {
@@ -369,7 +373,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 		UpdateFunc: func(_, newObj interface{}) {
 			ns, name := metaNSName(newObj)
 			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name})
+			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
 			// Ship L / 0.30.246 — CRD UPDATE lifecycle hook.
 			if crdSideEffect {
 				crdDiscoverySingleton().submitCRDLifecycleEvent(newObj, crdLifecycleUpdate)
@@ -385,7 +389,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 			}
 			ns, name := metaNSName(obj)
 			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name})
+			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
 			// Ship L / 0.30.246 — CRD DELETE lifecycle hook (triggerCRDDelete).
 			if crdSideEffect {
 				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleDelete)

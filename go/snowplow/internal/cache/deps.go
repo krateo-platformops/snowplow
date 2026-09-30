@@ -538,6 +538,12 @@ type DepTracker struct {
 	enqueueUpdateTotal  atomic.Uint64 // refresh enqueues triggered by OnUpdate
 	removeL1Total       atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
 
+	// #239 dirty-mark attribution: the {path,cause,class} distribution, per-
+	// submit-source counts, fan-out denominator and /debug/vars-only GVR
+	// drill-down. recordDirtyMarks is the SINGLE writer of dirtyMarkTotal AND
+	// the buckets, so Σ buckets == dirtyMarkTotal by construction.
+	dmAttr *dmAttribution
+
 	// One-shot WARN flag for cap reached. We only want to log once
 	// (process lifetime) so the log file doesn't fill with the same
 	// line every record under steady-state pressure.
@@ -587,6 +593,7 @@ func newDepTracker(maxRecords int64) *DepTracker {
 	}
 	return &DepTracker{
 		maxRecords: maxRecords,
+		dmAttr:     newDMAttribution(),
 	}
 }
 
@@ -1034,12 +1041,15 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 	self := DepKey{GVR: gvr, Namespace: namespace, Name: name}
 
 	var toEvict, toMark []string
-	for l1Key := range matched {
-		if state == objAbsent && d.isSelfRepresentation(store, l1Key, self) {
+	classCounts := map[string]int{} // #239: self / list_dep / exact_dep of the marked keys
+	for l1Key, dk := range matched {
+		isSelf := d.isSelfRepresentation(store, l1Key, self)
+		if state == objAbsent && isSelf {
 			toEvict = append(toEvict, l1Key) // bucket 1, and ONLY when absent
 			continue
 		}
 		toMark = append(toMark, l1Key) // buckets 2 + 3, and self-when-present
+		classCounts[dirtyMarkClass(dk, isSelf)]++
 	}
 
 	// 1.12.7 observability — an UNKNOWN_DEGRADED verdict structurally cannot
@@ -1059,7 +1069,8 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 		}
 	}
 	if n := len(toMark); n > 0 {
-		d.dirtyMarkTotal.Add(uint64(n))
+		// #239 — single writer of dirtyMarkTotal + the {path,cause,class} buckets.
+		d.recordDirtyMarks(dmPathObject, dirtyMarkCauseForState(state), classCounts, gvr)
 		if state != objAbsent {
 			// enqueueUpdateTotal is retained as the pre-0.30.110 falsifier
 			// name for ADD/UPDATE-driven refresh enqueues.
@@ -1237,7 +1248,7 @@ func (d *DepTracker) OnResourceTypeStoreRepaired(gvr schema.GroupVersionResource
 // dirtyMarkResourceType dirty-marks every L1 key in matched via the
 // refreshHook — the shared body of OnResourceTypeAvailable +
 // OnResourceTypeRemoved. NEVER evicts. Returns the number marked.
-func (d *DepTracker) dirtyMarkResourceType(eventType string, gvr schema.GroupVersionResource, matched map[string]struct{}) int {
+func (d *DepTracker) dirtyMarkResourceType(eventType string, gvr schema.GroupVersionResource, matched map[string]DepKey) int {
 	if len(matched) == 0 {
 		return 0
 	}
@@ -1246,14 +1257,17 @@ func (d *DepTracker) dirtyMarkResourceType(eventType string, gvr schema.GroupVer
 	d.enqueueMu.RUnlock()
 
 	marked := 0
-	for l1Key := range matched {
+	classCounts := map[string]int{} // #239: list_dep vs exact_dep (type deps have no self class)
+	for l1Key, dk := range matched {
 		if enqueue != nil {
 			enqueue(l1Key, gvr)
 		}
+		classCounts[dirtyMarkClass(dk, false)]++
 		marked++
 	}
 	if marked > 0 {
-		d.dirtyMarkTotal.Add(uint64(marked))
+		// #239 — single writer of dirtyMarkTotal + the {path,cause,class} buckets.
+		d.recordDirtyMarks(dmPathType, dirtyMarkCauseForEventType(eventType), classCounts, gvr)
 	}
 	slog.Info("cache_event.consumed",
 		slog.String("subsystem", "cache"),
@@ -1279,8 +1293,8 @@ func (d *DepTracker) dirtyMarkResourceType(eventType string, gvr schema.GroupVer
 // A forward-index Range is O(distinct DepKeys); CRD-add/delete is a rare
 // event so the scan cost is paid only at CRD-lifecycle time, never on a
 // resolver hot path.
-func (d *DepTracker) collectTypeMatches(gvr schema.GroupVersionResource, listOnly bool) map[string]struct{} {
-	out := map[string]struct{}{}
+func (d *DepTracker) collectTypeMatches(gvr schema.GroupVersionResource, listOnly bool) map[string]DepKey {
+	out := map[string]DepKey{}
 	d.forward.Range(func(k, v any) bool {
 		dk := k.(DepKey)
 		if dk.GVR != gvr {
@@ -1290,7 +1304,12 @@ func (d *DepTracker) collectTypeMatches(gvr schema.GroupVersionResource, listOnl
 			return true
 		}
 		v.(*keySet).keys.Range(func(kk, _ any) bool {
-			out[kk.(string)] = struct{}{}
+			l1 := kk.(string)
+			// #239 — keep the most specific bucket per key (exact beats list) so
+			// the type-path dirty-mark is classified list_dep vs exact_dep.
+			if prev, seen := out[l1]; !seen || (prev.Name == listWildcard && dk.Name != listWildcard) {
+				out[l1] = dk
+			}
 			return true
 		})
 		return true

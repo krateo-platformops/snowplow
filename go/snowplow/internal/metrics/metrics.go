@@ -538,6 +538,35 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #239: dirty-mark ATTRIBUTION. snowplow_deps{stat=dirty_mark_total} is
+	// the grand total; these decompose it so a rise can be told from benign
+	// fan-out — {path,cause,class}, the fan-out denominator, and the pre-dedup
+	// submit source. Bounded cardinality (~15 buckets x 3 sources).
+	dirtyMarkAttributed, err := m.Int64ObservableCounter(
+		"snowplow_deps_dirty_mark_attributed_total",
+		metric.WithDescription("Dirty-marks by path (object_event/type_event), cause and entry class. Their sum equals snowplow_deps{stat=dirty_mark_total}."))
+	if err != nil {
+		return err
+	}
+	dirtyMarkEvents, err := m.Int64ObservableCounter(
+		"snowplow_deps_dirty_mark_events_total",
+		metric.WithDescription("Object/type events that dirty-marked >=1 entry — the fan-out denominator (mean fan-out = dirty_mark_total / this)."))
+	if err != nil {
+		return err
+	}
+	dirtyMarkSubmits, err := m.Int64ObservableCounter(
+		"snowplow_deps_dirty_mark_submits_total",
+		metric.WithDescription("Dep-event submissions by source (watch/relist_bridge/reconcile), counted PRE-dedup — which mechanism drives the queue."))
+	if err != nil {
+		return err
+	}
+	dirtyMarkUnattributed, err := m.Int64ObservableCounter(
+		"snowplow_deps_dirty_mark_unattributed_total",
+		metric.WithDescription("Dirty-marks whose {path,cause,class} combo was not pre-registered — a classifier bug. Alert on > 0."))
+	if err != nil {
+		return err
+	}
+
 	// --- informer servability, the leading indicator for the
 	// informer-fallthrough-not-synced cell.
 	informerServable, err := m.Int64ObservableGauge(
@@ -758,6 +787,21 @@ func registerInstruments(m metric.Meter, build string) error {
 				metric.WithAttributes(attribute.String("stat", stat)))
 		}
 
+		// --- #239: dirty-mark attribution (Σ attributed == dirty_mark_total) ---
+		for _, b := range cache.DirtyMarkAttributionSnapshot() {
+			o.ObserveInt64(dirtyMarkAttributed, int64(b.Count),
+				metric.WithAttributes(
+					attribute.String("path", b.Path),
+					attribute.String("cause", b.Cause),
+					attribute.String("class", b.Class)))
+		}
+		o.ObserveInt64(dirtyMarkEvents, int64(cache.DirtyMarkEventsTotal()))
+		o.ObserveInt64(dirtyMarkUnattributed, int64(cache.DirtyMarkUnattributedTotal()))
+		for source, n := range cache.DirtyMarkSubmitSourceSnapshot() {
+			o.ObserveInt64(dirtyMarkSubmits, int64(n),
+				metric.WithAttributes(attribute.String("source", source)))
+		}
+
 		// --- 1.12.4: informer servability ---
 		reg, syncedN, servableN, brokenN, confirmedN := cache.ServableCountsSnapshot()
 		for state, v := range map[string]int{
@@ -830,6 +874,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		unparseableCADelegations,
 		// --- #244 ---
 		storeFactoryDivergenceAge,
+		// --- #239: dirty-mark attribution ---
+		dirtyMarkAttributed, dirtyMarkEvents, dirtyMarkSubmits, dirtyMarkUnattributed,
 	}, derivedObservables...)...)
 	return err
 }
