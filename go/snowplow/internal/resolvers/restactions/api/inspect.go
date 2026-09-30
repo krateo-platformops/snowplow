@@ -252,6 +252,13 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 				Resource:  gvr.Resource,
 				Namespace: ns,
 				Verb:      verb,
+				// #179 (arch nit): the in-cluster verb is get/list by
+				// construction, so this is ALWAYS false today (byte-identical
+				// wire, omitempty) — but computing it at EVERY emit site makes
+				// the invariant NonReadVerb == !uafVerbIsRead(Verb) hold
+				// structurally, so a future change that emits a non-read verb
+				// here cannot ship unflagged.
+				NonReadVerb: !uafVerbIsRead(verb),
 			})
 			continue
 		}
