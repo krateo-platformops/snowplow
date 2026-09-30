@@ -280,13 +280,20 @@ arms from one struct tag each.
 | stat | meaning | healthy range |
 |---|---|---|
 | `watch_errors_total` | reflector `ListAndWatch` errors across **every** informer family (per-GVR, secrets, controller-health). Counts EVERY invocation — our handlers replace client-go's default and each logs only its FIRST failure, so before this a watch failing once and a watch failing every second produced the same single WARN | **0**. A climbing value is the retry RATE, which is the thing the one-shot WARN hides. Read it next to `cache.watch.broken` / `cache.secrets.watch.broken` |
-| `confirm_retracted_total` | GVRs whose servability confirmation was retracted **after having been granted**. A retracted GVR silently stops serving from the informer and falls through to the apiserver; #217 took a day to characterise because the retraction left no trace. Counted only when a confirmation actually existed, so ordinary teardowns of never-confirmed GVRs do not inflate it | **0** in steady state. Non-zero is expected around a CRD upgrade or delete — use the by-reason map below to tell which |
+| `confirm_retracted_total` | GVRs whose servability confirmation was retracted **after having been granted**, on a **definite-absent** discovery answer — either a **successful** `ServerResourcesForGroupVersion` whose list omits the resource, or an **authoritative** `NotFound(404)`/`Gone(410)` error (the apiserver stating the group/version is gone). A retracted GVR silently stops serving from the informer and falls through to the apiserver; #217 took a day to characterise because the retraction left no trace. Counted only when a confirmation actually existed, so ordinary teardowns of never-confirmed GVRs do not inflate it. **#217:** a *transient* discovery error (timeout/5xx/throttle/transport/nil list) no longer retracts — it fails open and increments `confirm_retained_unknown_total` instead. An authoritative 404/410 still retracts, so `RefreshDiscovery` stays the reconciling backstop for a genuine removal whose CRD-DELETE event was missed | **0** in steady state. Non-zero is expected around a CRD upgrade or delete — use the by-reason map below to tell which |
+| `confirm_retained_unknown_total` | **#217 detector — pairs with `confirm_retracted_total`.** Retain-on-**unknown** decisions: a granted confirmation **held open** because discovery was genuinely uncertain — a *transient* error (timeout/5xx/throttle/transport) or a nil list, where conjunct-4 could not be evaluated — rather than retracted. Fail-open on uncertainty ONLY; an authoritative `NotFound`/`Gone` is definite-absent and **retracts** instead (never held). Mirrors the #119 group pre-check registering when `ServerGroups()` cannot answer. Incremented **per decision** (per group/version per refresh), so it carries the flap RATE. Unlike `confirm_retracted_total`, which reads-as-*health* during flaky discovery (retractions stop once errors stop), this reads **non-zero DURING** the defect, so it is the real detector | **0** in steady state. `retained_unknown` climbing while `retracted` stays **flat** = discovery is blipping and fail-open is holding a healthy GVR (working as designed, **not** an error). Both climbing = a genuine type change amid discovery noise. Use the by-reason map below |
 
 `snowplow_informer_confirm_retracted_by_reason` is the `{reason}` breakdown, a map keyed by the
-code path that retracted: `discovery_refresh` / `scoped_confirm` / `walk_confirm` (the apiserver no
-longer serves the type) and `schema_relist` / `stale_version_pruned` / `crd_deleted` (the informer
+code path that retracted: `discovery_refresh` / `scoped_confirm` / `walk_confirm` (a **definite-absent**
+successful discovery) and `schema_relist` / `stale_version_pruned` / `crd_deleted` (the informer
 was torn down). It rides alongside rather than inside the tagged family because the C7 tag system
 has no label facility — a `stat` tag yields exactly one scalar.
+
+`snowplow_informer_confirm_retained_unknown_by_reason` is the matching `{reason}` breakdown for the
+retain-on-unknown detector, keyed by the discovery-error **class**: `discovery_error` (a generic
+`ServerResourcesForGroupVersion` error), `timeout` (an apiserver timeout / unavailable / throttle /
+internal-error class) and `nil_list` (no error but a nil resource list). Same shape and gating as the
+retracted map — one scalar per key, published outside the tagged family for the same reason.
 
 #### `snowplow_reflector_path` stats
 

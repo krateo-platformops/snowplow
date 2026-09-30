@@ -33,6 +33,7 @@ import (
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
@@ -255,7 +256,7 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 	// can share a group/version (e.g. several CompositionDefinition
 	// versions) — dedupe so we issue one discovery call per gv.
 	type gvKey = string
-	served := map[gvKey]bool{}
+	served := map[gvKey]gvServedResult{}
 	if disco != nil {
 		queried := map[gvKey]struct{}{}
 		for _, gvr := range gvrs {
@@ -267,7 +268,8 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 				continue
 			}
 			queried[gv] = struct{}{}
-			served[gv] = resourceTypeServed(disco, gvr)
+			s, known, reason := resourceTypeServed(disco, gvr)
+			served[gv] = gvServedResult{served: s, known: known, reason: reason}
 		}
 	}
 
@@ -276,7 +278,8 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 	defer rw.mu.Unlock()
 	rw.ensureConfirmMapsLocked()
 	for i, gvr := range gvrs {
-		rw.applyConfirmLocked(gvr, gis[i], disco != nil, served[groupVersionString(gvr)], confirmRetractDiscoveryRefresh)
+		r := served[groupVersionString(gvr)]
+		rw.applyConfirmLocked(gvr, gis[i], disco != nil, r.served, r.known, r.reason, confirmRetractDiscoveryRefresh)
 	}
 }
 
@@ -290,6 +293,37 @@ func (rw *ResourceWatcher) ensureConfirmMapsLocked() {
 	if rw.lastSyncRV == nil {
 		rw.lastSyncRV = map[schema.GroupVersionResource]string{}
 	}
+	if rw.retainUnknownWarned == nil {
+		rw.retainUnknownWarned = map[schema.GroupVersionResource]struct{}{}
+	}
+}
+
+// warnRetainUnknownLocked logs ONE WARN per GVR per #217 retain-on-unknown
+// episode (rate-limited via rw.retainUnknownWarned). Callers MUST hold
+// rw.mu.Lock() and MUST have called ensureConfirmMapsLocked. The counter
+// (recordConfirmRetainedUnknown) carries the per-decision RATE; this log carries
+// the human-readable episode edge without flooding on a sustained outage.
+func (rw *ResourceWatcher) warnRetainUnknownLocked(gvr schema.GroupVersionResource, reason string) {
+	if _, warned := rw.retainUnknownWarned[gvr]; warned {
+		return
+	}
+	rw.retainUnknownWarned[gvr] = struct{}{}
+	slog.Warn("cache.servable.confirm_retained_unknown",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("reason", reason),
+		slog.String("hint", "#217 conjunct-4 discovery was UNKNOWN (unavailable/errored); "+
+			"the existing servability confirmation is being HELD OPEN rather than retracted — "+
+			"fail-open on uncertainty. This warns once per GVR per flap episode; watch "+
+			"snowplow_informer_confirm_retained_unknown_total for the rate."),
+	)
+}
+
+// clearRetainUnknownWarnLocked ends a GVR's retain-on-unknown episode when a
+// DEFINITE discovery answer (served or absent) arrives, re-arming the one-shot
+// WARN for the next flap. Callers MUST hold rw.mu.Lock().
+func (rw *ResourceWatcher) clearRetainUnknownWarnLocked(gvr schema.GroupVersionResource) {
+	delete(rw.retainUnknownWarned, gvr)
 }
 
 // applyConfirmLocked is the per-GVR conjunct-3/4 update body extracted from
@@ -303,13 +337,16 @@ func (rw *ResourceWatcher) ensureConfirmMapsLocked() {
 //     discovery client, conjunct 4 is degraded-true (resourceTypeConfirmedLocked
 //     returns true) so rw.confirmed is left untouched — identical to the
 //     pre-extraction RefreshDiscovery branch.
-//   - typeServed: whether the apiserver currently serves gvr's resource
-//     type (the result of resourceTypeServed for gvr's group/version).
+//   - served/known/unknownReason: resourceTypeServed's three-state answer for
+//     gvr's group/version (#217). served && known ⇒ confirm; !served && known ⇒
+//     DEFINITE absent ⇒ retract; !known ⇒ UNKNOWN ⇒ fail-open (retain).
 func (rw *ResourceWatcher) applyConfirmLocked(
 	gvr schema.GroupVersionResource,
 	gi informers.GenericInformer,
 	haveDisco bool,
-	typeServed bool,
+	served bool,
+	known bool,
+	unknownReason string,
 	// 1.12.7 — which call path is re-evaluating conjunct 4, so a retraction
 	// counted below names the code path rather than a category.
 	reason string,
@@ -318,18 +355,33 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	// haveDisco==false ⇒ resourceTypeConfirmedLocked already returns true,
 	// so we leave rw.confirmed untouched here.
 	if haveDisco {
-		if typeServed {
+		switch {
+		case !known:
+			// #217 UNKNOWN — discovery was unavailable/errored, so we could not
+			// ask whether the type is served. FAIL OPEN: leave rw.confirmed
+			// exactly as it is (mirrors groupAuthoritativelyAbsent registering
+			// on uncertainty). A confirmed GVR STAYS confirmed — a transient
+			// discovery blip must not un-serve a healthy informer; a
+			// never-confirmed GVR stays unconfirmed (retain of nothing). Count
+			// the retain-on-unknown DETECTOR — per decision, so it carries the
+			// flap RATE — and WARN once per GVR per episode.
+			recordConfirmRetainedUnknown(unknownReason)
+			rw.warnRetainUnknownLocked(gvr, unknownReason)
+		case served:
 			rw.confirmed[gvr] = struct{}{}
-		} else {
-			// Resource type not served — un-confirm it. This is what
-			// gates a post-startup CRD until the apiserver publishes its
-			// API, and also correctly retracts a confirmation if a CRD is
-			// deleted.
+			// A definite answer arrived — this GVR's retain episode (if any) is
+			// over; re-arm the one-shot WARN for the next flap.
+			rw.clearRetainUnknownWarnLocked(gvr)
+		default:
+			// DEFINITE absent: a SUCCESSFUL discovery whose list omits the
+			// resource. Un-confirm it. This gates a post-startup CRD until the
+			// apiserver publishes its API, and retracts a version pruned while
+			// its group stays served. (A deleted CRD is retracted by the
+			// dedicated RemoveResourceType teardown, not reached here.)
 			//
-			// 1.12.7 — count it, but ONLY when a confirmation actually
-			// existed: this delete is unconditional and runs on every pass
-			// for a GVR that was never confirmed, so counting the call would
-			// count non-events.
+			// 1.12.7 — count it, but ONLY when a confirmation actually existed:
+			// this delete is unconditional and runs on every pass for a GVR that
+			// was never confirmed, so counting the call would count non-events.
 			if _, was := rw.confirmed[gvr]; was {
 				recordConfirmRetracted(reason)
 				// #237 B — a retraction does not change the store, but it does
@@ -342,6 +394,7 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 				invalidateStoreVerification(gvr)
 			}
 			delete(rw.confirmed, gvr)
+			rw.clearRetainUnknownWarnLocked(gvr)
 		}
 	}
 
@@ -440,15 +493,20 @@ func (rw *ResourceWatcher) confirmResourceTypeWithVerbs(ctx context.Context, gvr
 		return
 	}
 
-	typeServed := false
+	var res gvServedResult
 	if disco != nil {
 		if verbs != nil {
 			// Hand-off from the A2 gate's live fetch — no round-trip. Presence
 			// in the by-name map IS resourceTypeServed's predicate; see the
-			// EQUIVALENCE note on this function.
-			_, typeServed = verbs[gvr.Resource]
+			// EQUIVALENCE note on this function. The A2 gate's fetch is an
+			// AUTHORITATIVE list, so this answer is always KNOWN (never
+			// fail-open): #217's UNKNOWN state only arises from a discovery
+			// round-trip that errored, which this branch does not make.
+			_, present := verbs[gvr.Resource]
+			res = gvServedResult{served: present, known: true}
 		} else {
-			typeServed = resourceTypeServed(disco, gvr)
+			s, known, reason := resourceTypeServed(disco, gvr)
+			res = gvServedResult{served: s, known: known, reason: reason}
 		}
 	}
 
@@ -471,7 +529,7 @@ func (rw *ResourceWatcher) confirmResourceTypeWithVerbs(ctx context.Context, gvr
 		return
 	}
 	rw.ensureConfirmMapsLocked()
-	rw.applyConfirmLocked(gvr, curGI, disco != nil, typeServed, confirmRetractScopedConfirm)
+	rw.applyConfirmLocked(gvr, curGI, disco != nil, res.served, res.known, res.reason, confirmRetractScopedConfirm)
 }
 
 // ConfirmResourceTypes runs the scoped conjunct-3/4 confirmation pass over a
@@ -520,7 +578,7 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 	// Resolve resource-type existence per group/version, deduped — identical
 	// to RefreshDiscovery's dedup loop, run OFF the lock. One discovery call
 	// per distinct gv across the whole set (the cost bound), not per GVR.
-	served := map[string]bool{}
+	served := map[string]gvServedResult{}
 	if disco != nil {
 		queried := map[string]struct{}{}
 		for _, gvr := range gvrs {
@@ -532,7 +590,8 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 				continue
 			}
 			queried[gv] = struct{}{}
-			served[gv] = resourceTypeServed(disco, gvr)
+			s, known, reason := resourceTypeServed(disco, gvr)
+			served[gv] = gvServedResult{served: s, known: known, reason: reason}
 		}
 	}
 
@@ -548,7 +607,8 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 		if !stillRegistered {
 			continue
 		}
-		rw.applyConfirmLocked(gvr, curGI, disco != nil, served[groupVersionString(gvr)], confirmRetractWalkConfirm)
+		r := served[groupVersionString(gvr)]
+		rw.applyConfirmLocked(gvr, curGI, disco != nil, r.served, r.known, r.reason, confirmRetractWalkConfirm)
 	}
 }
 
@@ -824,23 +884,89 @@ func InformerFreshnessSnapshotGlobal() InformerFreshness {
 	return Global().InformerFreshnessSnapshot()
 }
 
-// resourceTypeServed reports whether the apiserver currently serves
-// gvr's resource *type*. It asks discovery for the group/version's
-// APIResourceList and checks the Resource name appears. A discovery
-// error or an empty list both mean "not served" — the conservative
-// direction: an unconfirmed GVR falls through to apiserver, which is
-// always safe.
-func resourceTypeServed(disco ResourceTypeDiscovery, gvr schema.GroupVersionResource) bool {
+// resourceTypeServed reports whether the apiserver currently serves gvr's
+// resource *type* — and, crucially, whether that answer is KNOWN. It asks
+// discovery for the group/version's APIResourceList and checks the resource
+// name appears.
+//
+// #217 three-state (mirrors groupAuthoritativelyAbsent's fail-open model). The
+// pre-#217 signature returned a bare bool and folded a discovery ERROR into
+// "not served", conflating "the apiserver does not serve this" (DEFINITE
+// absent) with "we could not ask" (UNKNOWN). applyConfirmLocked then RETRACTED
+// a granted confirmation on either, so a transient discovery blip un-served a
+// healthy GVR (~10%-of-minutes eviction degradation). The answer is now
+// (served, known, unknownReason):
+//
+//   - a successful list CONTAINING the resource   → (true,  true,  "")
+//   - a successful list OMITTING the resource       → (false, true,  "")          DEFINITE absent
+//   - a NotFound(404)/Gone(410) discovery error      → (false, true,  "")          DEFINITE absent (authoritative)
+//   - a transient discovery error (timeout/5xx/…)     → (false, false, <err class>) UNKNOWN
+//   - a nil list with no error                        → (false, false, nil_list)   UNKNOWN
+//
+// Only a KNOWN answer drives a retraction; UNKNOWN fails OPEN (retain), exactly
+// as the #119 group pre-check registers on uncertainty. This does NOT weaken
+// the CRD-deletion retraction: a deleted CRD is torn down by the dedicated
+// RemoveResourceType path (confirmRetractCRDDeleted / _stale_version_pruned),
+// which drops the informer entirely — RefreshDiscovery only ever sees a GVR
+// whose GROUP is still served, where a successful-list omission is authoritative.
+func resourceTypeServed(disco ResourceTypeDiscovery, gvr schema.GroupVersionResource) (served bool, known bool, unknownReason string) {
 	list, err := disco.ServerResourcesForGroupVersion(groupVersionString(gvr))
-	if err != nil || list == nil {
-		return false
+	if err != nil {
+		// #217 — an AUTHORITATIVE-absent discovery error is NOT uncertainty. A
+		// 404 (NotFound) / 410 (Gone) is the apiserver stating that this
+		// group/version does not exist — the discovery-level TWIN of a successful
+		// list that omits the resource — so it must RETRACT (definite-absent),
+		// not fail-open. Otherwise a genuine WHOLE-group/version removal whose
+		// CRD-DELETE watch event was MISSED (dropped event / relist-window gap —
+		// the exact #217/#218/#190 event-pipeline degradation) would be RETAINED
+		// forever: RefreshDiscovery is the reconciling BACKSTOP for a missed
+		// DELETE, and fail-open here would remove that backstop → unbounded
+		// stale-serve. Only a transient class (timeout / 5xx / throttle /
+		// transport / nil list below) is genuinely UNKNOWN → retain. The
+		// asymmetry favours retract: a rare transient 404 self-heals as ONE
+		// bounded retract-then-reconfirm flap, whereas retaining a genuine
+		// removal is unbounded. This mirrors groupAuthoritativelyAbsent treating
+		// a successful ServerGroups response that lacks the group as authoritative.
+		if apierrors.IsNotFound(err) || apierrors.IsGone(err) {
+			return false, true, "" // authoritative absent → DEFINITE absent (retract)
+		}
+		return false, false, classifyDiscoveryError(err)
+	}
+	if list == nil {
+		return false, false, retainUnknownNilList
 	}
 	for _, r := range list.APIResources {
 		if r.Name == gvr.Resource {
-			return true
+			return true, true, ""
 		}
 	}
-	return false
+	return false, true, "" // successful list, resource absent → DEFINITE absent
+}
+
+// classifyDiscoveryError maps a discovery error onto a retain-on-unknown reason
+// class (the CLOSED label set). Timeout/unavailable/throttle/internal are the
+// canonical transient-apiserver classes; anything else is the generic bucket.
+// The class only labels the DETECTOR counter — every non-nil error is UNKNOWN
+// and fails open regardless of class.
+func classifyDiscoveryError(err error) string {
+	switch {
+	case apierrors.IsServerTimeout(err),
+		apierrors.IsTimeout(err),
+		apierrors.IsServiceUnavailable(err),
+		apierrors.IsInternalError(err),
+		apierrors.IsTooManyRequests(err):
+		return retainUnknownTimeout
+	default:
+		return retainUnknownDiscoveryError
+	}
+}
+
+// gvServedResult carries resourceTypeServed's three-state answer for one
+// group/version through the per-GV dedup maps to applyConfirmLocked.
+type gvServedResult struct {
+	served bool
+	known  bool
+	reason string // retain-on-unknown class when !known; "" when known
 }
 
 // groupVersionString renders gvr's group/version the way discovery keys

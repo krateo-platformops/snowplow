@@ -53,6 +53,26 @@ var (
 	// event, so there is no contention to design around.
 	confirmRetractedMu       sync.Mutex
 	confirmRetractedByReason = map[string]uint64{}
+
+	// #217 three-state servable confirmation — the DETECTOR counter. It counts
+	// each retain-on-UNKNOWN decision (a conjunct-4 re-eval where discovery was
+	// unavailable/errored, so a granted confirmation was HELD rather than
+	// retracted). Unlike confirmRetractedTotal — which reads-as-health during
+	// the defect, dropping toward zero once transient-error retractions stop —
+	// this reads NON-ZERO precisely DURING flaky discovery, so it is the real
+	// detector. Incremented PER retain decision (per group/version per refresh)
+	// so it carries the rate signal. {reason} is the discovery-error CLASS below.
+	confirmRetainedUnknownTotal    atomic.Uint64
+	confirmRetainedUnknownMu       sync.Mutex
+	confirmRetainedUnknownByReason = map[string]uint64{}
+)
+
+// Retain-on-unknown discovery-error classes (CLOSED label set — bounded
+// cardinality for expvar/OTel).
+const (
+	retainUnknownDiscoveryError = "discovery_error" // generic ServerResourcesForGroupVersion error
+	retainUnknownTimeout        = "timeout"         // apiserver timeout / unavailable / server error
+	retainUnknownNilList        = "nil_list"        // no error but a nil resource list
 )
 
 // Retraction reasons. Closed set, enumerated from the two sites that can
@@ -83,7 +103,9 @@ const (
 // GVRs are servable right now) from these (how often did it break).
 type InformerWatchStats struct {
 	WatchErrorsTotal      uint64 `stat:"watch_errors_total" desc:"Reflector ListAndWatch errors across every informer family. Counts EVERY invocation; the WARN is one-shot."`
-	ConfirmRetractedTotal uint64 `stat:"confirm_retracted_total" desc:"GVRs whose servability confirmation was retracted after having been granted. See the by-reason map for which path."`
+	ConfirmRetractedTotal uint64 `stat:"confirm_retracted_total" desc:"GVRs whose servability confirmation was retracted after a DEFINITE-ABSENT successful discovery (#217: transient discovery errors no longer retract). See the by-reason map for which path."`
+	// #217 detector: pairs with confirm_retracted_total. retained_unknown climbing while retracted stays flat = discovery blipping + fail-open holding (working as designed, NOT an error). Reads non-zero DURING the defect.
+	ConfirmRetainedUnknownTotal uint64 `stat:"confirm_retained_unknown_total" desc:"Retain-on-unknown decisions: a granted confirmation HELD because discovery was unavailable/errored (fail-open), not retracted. See the by-reason (discovery-error class) map."`
 }
 
 // informerWatchStatsOverride is the test seam every C7 family carries, so the
@@ -102,8 +124,9 @@ func InformerWatchStatsSnapshot() InformerWatchStats {
 		return *o
 	}
 	return InformerWatchStats{
-		WatchErrorsTotal:      watchErrorsTotal.Load(),
-		ConfirmRetractedTotal: confirmRetractedTotal.Load(),
+		WatchErrorsTotal:            watchErrorsTotal.Load(),
+		ConfirmRetractedTotal:       confirmRetractedTotal.Load(),
+		ConfirmRetainedUnknownTotal: confirmRetainedUnknownTotal.Load(),
 	}
 }
 
@@ -143,13 +166,40 @@ func ConfirmRetractedByReasonSnapshot() map[string]uint64 {
 	return out
 }
 
-// ResetInformerWatchStatsForTest zeroes both counters and the breakdown.
+// recordConfirmRetainedUnknown counts one retain-on-unknown decision (#217).
+// Unlike recordConfirmRetracted this is called PER decision (per group/version
+// per refresh), NOT gated on prior membership: the rate IS the signal, and the
+// retain applies whether or not the GVR was already confirmed (a GVR pending
+// its first confirmation under flaky discovery is also being held-open).
+func recordConfirmRetainedUnknown(reason string) {
+	confirmRetainedUnknownTotal.Add(1)
+	confirmRetainedUnknownMu.Lock()
+	confirmRetainedUnknownByReason[reason]++
+	confirmRetainedUnknownMu.Unlock()
+}
+
+// ConfirmRetainedUnknownByReasonSnapshot returns a copy of the {reason} breakdown.
+func ConfirmRetainedUnknownByReasonSnapshot() map[string]uint64 {
+	confirmRetainedUnknownMu.Lock()
+	defer confirmRetainedUnknownMu.Unlock()
+	out := make(map[string]uint64, len(confirmRetainedUnknownByReason))
+	for k, v := range confirmRetainedUnknownByReason {
+		out[k] = v
+	}
+	return out
+}
+
+// ResetInformerWatchStatsForTest zeroes the counters and the breakdowns.
 func ResetInformerWatchStatsForTest() {
 	watchErrorsTotal.Store(0)
 	confirmRetractedTotal.Store(0)
 	confirmRetractedMu.Lock()
 	confirmRetractedByReason = map[string]uint64{}
 	confirmRetractedMu.Unlock()
+	confirmRetainedUnknownTotal.Store(0)
+	confirmRetainedUnknownMu.Lock()
+	confirmRetainedUnknownByReason = map[string]uint64{}
+	confirmRetainedUnknownMu.Unlock()
 	informerWatchStatsOverride.Store(nil)
 }
 
@@ -168,6 +218,10 @@ func registerInformerWatchExpvar() {
 		// snowplow_phase1_harvest_forgotten_total.
 		expvar.Publish("snowplow_informer_confirm_retracted_by_reason", expvar.Func(func() any {
 			return ConfirmRetractedByReasonSnapshot()
+		}))
+		// #217 — the retain-on-unknown {reason} breakdown, same shape/gating.
+		expvar.Publish("snowplow_informer_confirm_retained_unknown_by_reason", expvar.Func(func() any {
+			return ConfirmRetainedUnknownByReasonSnapshot()
 		}))
 	})
 }
