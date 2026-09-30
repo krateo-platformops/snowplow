@@ -47,6 +47,19 @@ func buildF3AdminsParityWatcher(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 
+	// #205 / #224-step1: the RBAC sub-generation counters are process-lived.
+	// This test's seed folds subGen(admins); the browser derivation folds
+	// subGen(admin-User)+subGen(admins). They are equal iff subGen(admin-User)
+	// is 0 — which is the TRUE contract here (admin is GROUP-granted; there is
+	// no User:admin binding), but it only holds if OTHER tests' admin-User
+	// sub-gen bumps do not leak into this process. Reset to the clean baseline
+	// at setup and restore on cleanup so the parity reflects this test's own
+	// group-granted contract, not ambient sub-gen churn (the ~2/3 full-suite
+	// flake at the ComputeKey digest assertion). This is real isolation of the
+	// test's stated contract, NOT a quiesce-to-force-equality.
+	cache.ResetRBACSubGenForTest()
+	t.Cleanup(cache.ResetRBACSubGenForTest)
+
 	scheme := runtime.NewScheme()
 	_ = rbacv1.AddToScheme(scheme)
 	listKinds := map[schema.GroupVersionResource]string{
@@ -222,7 +235,7 @@ func deriveBrowserInputs(t *testing.T, widgetName string, declared bool) (*cache
 
 // hashedKeyInputsEqual compares the SUBSET of ResolvedKeyInputs fields that
 // ComputeKey actually hashes (CacheEntryClass, Group, Version, Resource,
-// Namespace, Name, BindingUID, PerPage, Page, Extras) — NOT the diagnostic
+// Namespace, Name, BindingUID, RBACSubGen, PerPage, Page, Extras) — NOT the diagnostic
 // RepresentativeUsername/RepresentativeGroups, which ComputeKey deliberately
 // does NOT fold (resolved.go: "Carried on Inputs but NOT folded into
 // ComputeKey"). A raw struct DeepEqual would false-RED on the representative
@@ -237,6 +250,13 @@ func hashedKeyInputsEqual(a, b *cache.ResolvedKeyInputs) bool {
 		a.Group == b.Group && a.Version == b.Version && a.Resource == b.Resource &&
 		a.Namespace == b.Namespace && a.Name == b.Name &&
 		a.BindingUID == b.BindingUID &&
+		// #205 / #224-step1: ComputeKey folds RBACSubGen for every identity-bound
+		// class (resolved.go, right after BindingUID). Mirror it here so a
+		// sub-gen divergence REDs as a clear FIELD mismatch at the pre-hash
+		// assertion instead of an opaque ComputeKey digest mismatch, AND so this
+		// guard would catch a real multi-subject sub-gen divergence, not only the
+		// test-isolation leak this change also fixes.
+		a.RBACSubGen == b.RBACSubGen &&
 		a.PerPage == b.PerPage && a.Page == b.Page &&
 		a.Stage == b.Stage &&
 		reflect.DeepEqual(a.Extras, b.Extras)
@@ -343,7 +363,7 @@ func TestF3SAExclusion_NeverWorse_SATrafficStillServes(t *testing.T) {
 		f3WidgetGVR.Group, f3WidgetGVR.Version, f3WidgetGVR.Resource,
 		"krateo-system", "undeclared-flex", -1, -1, nil)
 	if inputs == nil {
-		t.Fatalf("never-worse: excluded SA derived nil inputs — the SA can no longer be served (WORSE); "+
+		t.Fatalf("never-worse: excluded SA derived nil inputs — the SA can no longer be served (WORSE); " +
 			"exclusion must touch SEED only, not serve")
 	}
 	if inputs.BindingUID == "" {
