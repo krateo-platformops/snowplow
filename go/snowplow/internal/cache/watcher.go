@@ -169,6 +169,15 @@ type ResourceWatcher struct {
 	// rw.mu.
 	lastSyncRV map[schema.GroupVersionResource]string
 
+	// retainUnknownWarned records GVRs currently inside a #217 retain-on-unknown
+	// EPISODE — a contiguous run of discovery-UNKNOWN conjunct-4 re-evals during
+	// which a granted confirmation is being held open. It rate-limits the WARN to
+	// once per GVR per episode: an entry is added on the first retain and removed
+	// the moment a DEFINITE answer (served or absent) arrives, so a persistent
+	// discovery outage logs once, not every 30s tick, while a NEW flap warns
+	// again. Guarded by rw.mu; allocated by ensureConfirmMapsLocked.
+	retainUnknownWarned map[schema.GroupVersionResource]struct{}
+
 	// watchHandlerInstalled records GVRs whose informer has had the
 	// conjunct-3 WATCH-error handler successfully installed (0.30.99
 	// Tag B — watch-handler coverage guard). installWatchErrorHandler
