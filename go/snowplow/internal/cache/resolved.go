@@ -127,6 +127,15 @@ const (
 	defaultResolvedCacheMaxEntryAgeSeconds  = 86400 // 24h — the design's signed number
 	defaultResolvedCacheSummaryEverySeconds = 300   // 5 min aggregate INFO line
 
+	// defaultResolvedCacheTombstoneTTLSeconds — #189. The window a removed key's
+	// bumped generation stays comparable, so an in-flight resolve's tail PutIfGen
+	// is refused when a DELETE landed during it. It must cover the longest
+	// possible in-flight resolve = the server request WRITE DEADLINE. This
+	// default TRACKS main.writeTimeout (300s); the production path OVERWRITES it
+	// from the actual writeTimeout via SetTombstoneTTL, so the bound self-adapts
+	// with no new env knob (feedback_self_adapt_no_magic_env_knobs). 0 disables.
+	defaultResolvedCacheTombstoneTTLSeconds = 300
+
 	// defaultResolvedCacheMaxResidentBytes — Ship 4a (0.30.198). The
 	// resident region holds the EXPENSIVE prewarmed RAFullList cells
 	// (e.g. admin's full compositions-panels list — ~18 MiB at 49K panels,
@@ -587,6 +596,19 @@ type ResolvedCacheStore struct {
 	// never-yet-refreshed cells (not suppressed). A during-defect detector.
 	suppressedResidentGauge atomic.Uint64
 
+	// #189 generation-guarded Put. Each key carries a generation (lruItem.gen);
+	// every removal funnel (removeElementLocked + deleteForDep) bumps it into a
+	// tombstone here, so PutIfGen refuses a stale in-flight write carrying a
+	// pre-removal generation and a DELETE-evicted body is never resurrected. All
+	// three fields are guarded by mu.
+	tombstones       map[string]tombstone
+	tombstoneTTL     time.Duration // comparable window for a bumped gen = the request write deadline (self-adapting; 0 disables the guard)
+	tombstoneSweepAt time.Time
+
+	// putRefusedGenerationMovedTotal counts PutIfGen refusals (the generation
+	// moved between capture and write). Atomic; safe to read without mu.
+	putRefusedGenerationMovedTotal atomic.Uint64
+
 	// Ship E (0.30.116) api-stage counters. apistageStoreTotal counts
 	// Put()s of an "apistage"-kind entry; apistageEvictTotal counts
 	// evictions (LRU/TTL/DELETE) of one. apistage_evict_pressure in the
@@ -686,6 +708,12 @@ type lruItem struct {
 	// coverage. Covered by
 	// TestResolvedMeta_ExtrasHashRaceUnderConcurrentPutAndWalk under -race.
 	extrasHash string
+
+	// #189 — the per-key generation the gen-guarded Put (PutIfGen) checks
+	// against. Bumped into a tombstone by every removal funnel so a stale
+	// in-flight Put carrying a pre-removal generation is refused. Written
+	// wherever entry is (both putCoreLocked branches). Guarded by c.mu.
+	gen uint64
 }
 
 var (
@@ -860,6 +888,10 @@ func newResolvedCache(maxEntries int, maxBytes int64, ttl time.Duration) *Resolv
 		// explicit 0 disables pinning). Tests that exercise pin behaviour set
 		// the field directly.
 		maxResidentBytes: defaultResolvedCacheMaxResidentBytes,
+		// #189 — gen-guard state. Default the tombstone window to the
+		// design-time write-deadline (production OVERWRITES via SetTombstoneTTL).
+		tombstones:   map[string]tombstone{},
+		tombstoneTTL: time.Duration(defaultResolvedCacheTombstoneTTLSeconds) * time.Second,
 	}
 }
 
@@ -1099,20 +1131,7 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	if c == nil || entry == nil {
 		return
 	}
-	if entry.CreatedAt.IsZero() {
-		entry.CreatedAt = time.Now()
-	}
-	// 1.12.6 C5 — a first Put is the entry's birth; a replace-in-place Put
-	// INHERITS the prior entry's BornAt below (under mu), so a refresh
-	// re-Put never resets the lifetime clock.
-	if entry.BornAt.IsZero() {
-		entry.BornAt = entry.CreatedAt
-	}
-	bytes := entryBytes(entry)
-	// #247 instrument — the extras identity for the metadata surface, derived
-	// ONCE here and carried on the lruItem. Computed BEFORE c.mu is taken:
-	// HashExtras marshals and hashes, and none of that needs the store lock.
-	extrasHash := extrasHashForEntry(entry)
+	bytes, extrasHash := c.putPreamble(entry)
 	// 1.12.6 C4 (§6.4) — a real Put is by definition the "next real Put" a
 	// refresh suppression waits for: clear the marker (and the consecutive-
 	// decline counter) BEFORE taking the store lock. Two sync.Map deletes,
@@ -1121,6 +1140,183 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// #189 — a plain (non-guarded) Put PRESERVES the key's current generation:
+	// replace-in-place keeps the live gen; a first Put over a tombstone adopts
+	// the tombstone's gen (and putCoreLocked drops the tombstone). Plain Put is
+	// the DOCUMENTED-SAFE / exempt carriers (boot seed, external-TTL) that cannot
+	// resurrect a raced DELETE; the request-path carriers use PutIfGen.
+	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key))
+}
+
+// PutIfGen is the #189 generation-guarded write. It stores entry under key ONLY
+// if key's current generation still equals capturedGen — the value the caller
+// read via CaptureGen BEFORE the resolve/fetch that produced entry. If a
+// DELETE-eviction (removeElementLocked or deleteForDep) bumped the generation in
+// between, the Put is REFUSED and the pre-delete body is not resurrected. The
+// check and the write are ONE c.mu critical section — no Get-then-Put TOCTOU.
+// Returns true iff the entry was stored.
+func (c *ResolvedCacheStore) PutIfGen(key string, entry *ResolvedEntry, capturedGen uint64) bool {
+	if c == nil || entry == nil {
+		return false
+	}
+	bytes, extrasHash := c.putPreamble(entry)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.currentGenLocked(key) != capturedGen {
+		// The key was DELETE-evicted (or otherwise removed) between capture and
+		// now — the eviction is authoritative; drop the stale body on the floor.
+		c.putRefusedGenerationMovedTotal.Add(1)
+		return false
+	}
+	// Committing a real Put: clear the refresh-suppression marker (a real Put is
+	// the "next real Put" a suppression waits for). Only on ACCEPT — a refused
+	// Put populated nothing, so its key's suppression marker must stand.
+	clearRefreshSuppression(key)
+	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen)
+	return true
+}
+
+// ReplaceIfGen is the #189 generation-guarded REPLACE. It stores entry under key
+// ONLY if key is CURRENTLY LIVE and its generation still equals capturedGen; it
+// never INSERTS — an absent key (evicted, tombstoned, or never present) is
+// refused. The REFRESHER uses this: a refresh replaces a live entry and must
+// never resurrect one that was evicted before OR during the re-resolve, which
+// preserves the "a non-resurrecting refresh emits no live-refresh signal"
+// contract while closing the resurrection race in one c.mu section. Request-path
+// COLD fills use PutIfGen (which inserts on absent). Returns true iff stored.
+func (c *ResolvedCacheStore) ReplaceIfGen(key string, entry *ResolvedEntry, capturedGen uint64) bool {
+	if c == nil || entry == nil {
+		return false
+	}
+	bytes, extrasHash := c.putPreamble(entry)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, live := c.index[key]
+	if !live || el.Value.(*lruItem).gen != capturedGen {
+		// Absent (evicted/never-present) OR the live entry moved to a newer
+		// generation (a cold request re-inserted it) — refuse, do not clobber or
+		// resurrect. The eviction / newer write is authoritative.
+		c.putRefusedGenerationMovedTotal.Add(1)
+		return false
+	}
+	clearRefreshSuppression(key)
+	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen)
+	return true
+}
+
+// CaptureGen returns key's current generation, to be threaded into a later
+// PutIfGen for the same key. Capture it BEFORE the resolve/fetch whose result
+// will be Put — the point is to detect a DELETE that lands during that window.
+// A key with no live entry and no live tombstone reports 0. Nil-safe.
+func (c *ResolvedCacheStore) CaptureGen(key string) uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.currentGenLocked(key)
+}
+
+// currentGenLocked reports key's current generation: the live entry's gen if
+// present, else a non-expired tombstone's gen, else 0. Lazily reaps an expired
+// tombstone it encounters. Callers MUST hold c.mu.
+func (c *ResolvedCacheStore) currentGenLocked(key string) uint64 {
+	if el, ok := c.index[key]; ok {
+		return el.Value.(*lruItem).gen
+	}
+	if t, ok := c.tombstones[key]; ok {
+		if c.tombstoneExpiredLocked(t) {
+			delete(c.tombstones, key)
+			return 0
+		}
+		return t.gen
+	}
+	return 0
+}
+
+// bumpGenTombstoneLocked records key's generation, bumped by one, in a tombstone
+// so a PutIfGen carrying the pre-removal generation is refused for the tombstone
+// window. Called from BOTH removal funnels (removeElementLocked + deleteForDep)
+// under c.mu. gen is the removed entry's current generation. A tombstoneTTL of 0
+// disables the guard (no tombstone recorded). It is the removeElementLocked
+// bump that closes the LRU-evict-THEN-DELETE interleave: a DELETE cannot
+// tombstone an already-evicted key, so the earlier eviction's advanced gen must.
+func (c *ResolvedCacheStore) bumpGenTombstoneLocked(key string, gen uint64) {
+	if c.tombstoneTTL <= 0 {
+		return
+	}
+	if c.tombstones == nil {
+		c.tombstones = map[string]tombstone{}
+	}
+	c.tombstones[key] = tombstone{gen: gen + 1, expireAt: time.Now().Add(c.tombstoneTTL)}
+	c.maybeSweepTombstonesLocked()
+}
+
+// tombstoneExpiredLocked reports whether t is past its window. Callers hold c.mu.
+func (c *ResolvedCacheStore) tombstoneExpiredLocked(t tombstone) bool {
+	return !t.expireAt.IsZero() && time.Now().After(t.expireAt)
+}
+
+// maybeSweepTombstonesLocked amortises expired-tombstone reclamation to at most
+// one O(n) walk per tombstoneTTL window, so the map cannot grow unbounded from
+// keys evicted and never re-Put within the window. Re-Put clears a key's
+// tombstone directly (putCoreLocked); this sweep collects the rest. Callers hold
+// c.mu.
+func (c *ResolvedCacheStore) maybeSweepTombstonesLocked() {
+	if c.tombstoneTTL <= 0 || len(c.tombstones) == 0 {
+		return
+	}
+	now := time.Now()
+	if !c.tombstoneSweepAt.IsZero() && now.Sub(c.tombstoneSweepAt) < c.tombstoneTTL {
+		return
+	}
+	c.tombstoneSweepAt = now
+	for k, t := range c.tombstones {
+		if !t.expireAt.IsZero() && now.After(t.expireAt) {
+			delete(c.tombstones, k)
+		}
+	}
+}
+
+// SetTombstoneTTL overwrites the #189 tombstone window. main.go calls it once at
+// startup with the server http.Server WriteTimeout, so the window self-adapts to
+// the request write deadline (the longest an in-flight resolve can run) with no
+// new env knob. A non-positive d disables the guard. Nil-safe.
+func (c *ResolvedCacheStore) SetTombstoneTTL(d time.Duration) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.tombstoneTTL = d
+	c.mu.Unlock()
+}
+
+// putPreamble does the off-critical-path preparation shared by Put and PutIfGen:
+// stamp CreatedAt/BornAt and compute the LRU byte weight + the #247 extras hash
+// (both marshal/hash work that does not need the store lock).
+func (c *ResolvedCacheStore) putPreamble(entry *ResolvedEntry) (bytes int64, extrasHash string) {
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = time.Now()
+	}
+	// 1.12.6 C5 — a first Put is the entry's birth; a replace-in-place Put
+	// INHERITS the prior entry's BornAt in putCoreLocked, so a refresh re-Put
+	// never resets the lifetime clock.
+	if entry.BornAt.IsZero() {
+		entry.BornAt = entry.CreatedAt
+	}
+	return entryBytes(entry), extrasHashForEntry(entry)
+}
+
+// putCoreLocked performs the pin-resolution, replace-in-place / insert, byte
+// accounting, class counters and cap eviction for one entry, stamping the
+// per-key generation (item.gen = gen) in BOTH branches (#189) and dropping any
+// tombstone for key (a live entry supersedes its tombstone). Callers MUST hold
+// c.mu; bytes/extrasHash are from putPreamble.
+func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, bytes int64, extrasHash string, gen uint64) {
+	// #189 — a live entry supersedes any tombstone for its key.
+	delete(c.tombstones, key)
 
 	apistage := isApistageEntry(entry)
 	widgetContent := isWidgetContentEntry(entry)
@@ -1180,6 +1376,7 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 		// replaces; leaving the prior hash here would attribute the new body
 		// to the old extras identity.
 		old.extrasHash = extrasHash
+		old.gen = gen
 		if entry.Pinned {
 			c.curResidentBytes += bytes
 			c.residentEntries++
@@ -1194,7 +1391,7 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 		return
 	}
 
-	item := &lruItem{key: key, entry: entry, bytes: bytes, extrasHash: extrasHash}
+	item := &lruItem{key: key, entry: entry, bytes: bytes, extrasHash: extrasHash, gen: gen}
 	el := c.order.PushFront(item)
 	c.index[key] = el
 	if entry.Pinned {
@@ -1208,6 +1405,14 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	c.bumpClassStoreLocked(apistage, widgetContent, raFullList)
 
 	c.evictUntilUnderCapsLocked()
+}
+
+// tombstone remembers a removed key's (bumped) generation for a bounded window
+// so #189's PutIfGen can refuse a stale in-flight write. gen is one past the
+// removed entry's generation; expireAt bounds it to the request write deadline.
+type tombstone struct {
+	gen      uint64
+	expireAt time.Time
 }
 
 // extrasHashForEntry returns the extras identity to stamp on an entry's
@@ -1354,6 +1559,11 @@ type ResolvedCacheStats struct {
 	MaxResidentBytes     int64
 	ResidentPinTotal     uint64
 	ResidentDemoteTotal  uint64
+
+	// #189 — PutIfGen refusals (the key's generation moved between capture and
+	// write, so a DELETE-evicted body was NOT resurrected). Reads non-zero
+	// exactly when the write-side resurrection race is being closed.
+	PutRefusedGenerationMovedTotal uint64
 }
 
 func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
@@ -1391,6 +1601,8 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		MaxResidentBytes:        maxResidentBytes,
 		ResidentPinTotal:        c.residentPinTotal.Load(),
 		ResidentDemoteTotal:     c.residentDemoteTotal.Load(),
+
+		PutRefusedGenerationMovedTotal: c.putRefusedGenerationMovedTotal.Load(),
 	}
 }
 
@@ -1883,6 +2095,23 @@ func (c *ResolvedCacheStore) evictUntilUnderCapsLocked() {
 // the reverse path never re-enters the store.
 func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	item := el.Value.(*lruItem)
+	// #189 — bump the key's generation into a tombstone so an in-flight PutIfGen
+	// carrying the pre-eviction generation is refused. This funnel is TTL / LRU /
+	// max-age eviction, and the bump here is a STRUCTURAL necessity, not a
+	// precaution: removeElementLocked STRIPS the key's dep edges (stripDepEdges
+	// below), so after an LRU-evict of K a subsequent DELETE of K finds NO edge
+	// (OnObjectEvent → collectMatchesWithDep → runEvictionBatch) and
+	// deleteForDep(K) is NEVER called — the DELETE literally cannot tombstone an
+	// LRU-evicted key. This eviction is therefore the ONLY site that can carry
+	// the "evicted since gen0" signal for the LRU-evict-THEN-DELETE interleave,
+	// so it MUST bump. Cost: a bounded, benign over-refusal — an LRU-evict-then-
+	// rePut of still-valid data is refused, becoming a cold miss that re-resolves
+	// with a fresh gen0. It refuses only the cache-FILL, never a navigation (the
+	// current request's resolve already returned to the customer); it is a rare
+	// LRU-mid-resolve race; and it self-heals via re-resolve / prewarm — so it
+	// does not cross the zero-cold-nav line (sustained LRU pressure is a capacity
+	// problem, not caused by this). Confirmed by freshness-audit + pm-freshness.
+	c.bumpGenTombstoneLocked(item.key, item.gen)
 	delete(c.index, item.key)
 	c.order.Remove(el)
 	// 1.12.6 C4 (§6.4) — a refresh-suppression marker must not outlive its
@@ -2003,6 +2232,11 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 		return false
 	}
 	item := el.Value.(*lruItem)
+	// #189 — bump the key's generation into a tombstone so an in-flight PutIfGen
+	// (the request-path resurrection race this ticket closes) carrying the
+	// pre-DELETE generation is refused. deleteForDep is the DELETE-eviction
+	// funnel and bypasses removeElementLocked, so it bumps directly here.
+	c.bumpGenTombstoneLocked(item.key, item.gen)
 	delete(c.index, item.key)
 	c.order.Remove(el)
 	// 1.12.7 F6a — strip the dep edges HERE, under the same hold as the

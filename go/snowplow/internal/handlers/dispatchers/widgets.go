@@ -258,6 +258,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		pcs.l1Hit = "miss"
 	}
 
+	// #189 — capture the widget key's generation BEFORE the resolve below, so the
+	// tail PutIfGen (main per-user-fallback branch) refuses rather than
+	// resurrecting a pre-delete body if the widget CR is DELETE-evicted during the
+	// resolve. CaptureGen is nil-safe; a cold miss is gen 0 → the fill still
+	// inserts. (The external-TTL Put branch stays a plain Put — it is exempt: its
+	// dep-Record is declined, so a widget DELETE never evicts that cell.)
+	cacheGen0 := cacheHandle.CaptureGen(cacheKey)
+
 	ctx := xcontext.BuildContext(req.Context())
 	// Part 1 (#268/#269) — the SA-credential ATTACH is REMOVED (symmetric with
 	// restactions.go). It put the SA endpoint + *rest.Config on THIS per-user ctx,
@@ -518,26 +526,33 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, keyExtras)
+		// #189 — generation-guarded write: refuse (do not resurrect a pre-delete
+		// body) if a DELETE-eviction bumped the widget key's generation during the
+		// resolve; a cold fill (key absent, gen 0) still inserts. The dep-Record +
+		// publish run ONLY on an accepted write — a refused PutIfGen stored no
+		// cell, so (same as the declined branches above) there is nothing to
+		// dep-track or announce.
 		// scope-waiver:TTLOverride: widgets-class cell. 1.12.3 A-1/R-1 CORRECTED WAIVER: the pre-1.12.3 text claimed "UAF refilter output only ever lands in a restactions-class cell ... a widgets Put is never the UAF-stale cell". That was WRONG, and it was the R-1 blocker — widgets/resolve.go folds the apiRef'd RA's UAF-refiltered rows into status.widgetData, i.e. into THIS cell, which live measurement showed is the hot carrier (298,064 hits / 365 misses in 5d7h across 66 UAF-backed widgets). A refilter-touched envelope can no longer REACH this Put: the UAFTouchedSink gate at the HEAD of this chain declines it, so every cell written here is refilter-free and needs no UAF cap (uaf_shortttl.go R-d-4 SITE MAP).
-		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
+		if cacheHandle.PutIfGen(cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,
-		})
-		// 0.30.8: record dep edges. Widget self-dep, apiRef→RestAction
-		// dep, and render-eligible resourcesRefs deps (action-only
-		// refs filtered out per Revision 14). Edge type 3 (inner K8s
-		// calls inside the RestAction) is OUT OF SCOPE at this tag.
-		recordWidgetDeps(log, cacheKey, got.GVR, res)
+		}, cacheGen0) {
+			// 0.30.8: record dep edges. Widget self-dep, apiRef→RestAction
+			// dep, and render-eligible resourcesRefs deps (action-only
+			// refs filtered out per Revision 14). Edge type 3 (inner K8s
+			// calls inside the RestAction) is OUT OF SCOPE at this tag.
+			recordWidgetDeps(log, cacheKey, got.GVR, res)
 
-		// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
-		// Put + dep-Record — never the stage-error / external-skip declines
-		// above). If a /refreshes connection is already armed for this key
-		// (it re-armed after a TTL-eviction, and this cold-fill replaces the
-		// evicted entry), announce the fill so the viewer's frame goes fresh
-		// now instead of waiting for the next churn. No-op when unarmed.
-		// SCOPE: widgets only — NOT widgetContent (shared key w/o BindingUID
-		// fold → cross-deliver risk) per refresh_publish.go.
-		publishIfSubscribed(cacheKey)
+			// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
+			// Put + dep-Record — never the stage-error / external-skip declines
+			// above). If a /refreshes connection is already armed for this key
+			// (it re-armed after a TTL-eviction, and this cold-fill replaces the
+			// evicted entry), announce the fill so the viewer's frame goes fresh
+			// now instead of waiting for the next churn. No-op when unarmed.
+			// SCOPE: widgets only — NOT widgetContent (shared key w/o BindingUID
+			// fold → cross-deliver risk) per refresh_publish.go.
+			publishIfSubscribed(cacheKey)
+		}
 	}
 
 	log.Info("Widget successfully resolved",

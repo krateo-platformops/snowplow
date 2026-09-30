@@ -763,3 +763,100 @@ func TestM12_Widget_InClusterSaRCSet_StillNoInternalTransportOnResolveCtx(t *tes
 		t.Fatalf("M12 in-cluster RED (#268/#269 widget): saRC set on the handler must NOT reach the resolve ctx (sawEP=%v sawRC=%v) — the attach must stay removed.", sawEP, sawRC)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #189 per-carrier generation-guard real-race REFUSAL arms
+// ---------------------------------------------------------------------------
+//
+// Each dispatch carrier CAPTURES the key's generation before its resolve and
+// PutIfGen's after (the capture points are inline-DUPLICATED per carrier, so each
+// is an independent failure surface — the store-primitive suite proves PutIfGen's
+// SEMANTICS but pins ZERO carriers' captures). These arms drive the REAL
+// ServeHTTP so the production capture point runs, and use the resolve seam
+// (widgetsResolveFn / restactionsResolveFn — which sits BETWEEN the capture and
+// the Put) to DELETE-evict the derived key mid-resolve, bumping its generation
+// past the captured value, then return a CLEAN body (no stage/external/uaf touch,
+// so the generation guard is the SOLE Put decider). The tail PutIfGen must
+// REFUSE: the pre-delete body is NOT resurrected and put_refused_generation_moved
+// bumps. The discriminator is the REFUSAL (counter + cell-absent), body-
+// independent. Catches BOTH mis-wiring modes at THIS carrier: M1 (PutIfGen checks
+// the WRONG key → its unmoved gen LANDS → no refusal → RED) and M2 (a future edit
+// moving CaptureGen BELOW the resolve → the captured gen already reflects the
+// eviction → LANDS → RED). The positive twin (no eviction → Put lands) is the
+// cold-miss arm above for each carrier.
+
+func TestH1_RA_S189_ResolveRacingDelete_RefusedNotResurrected(t *testing.T) {
+	h1BuildWatcher(t)
+	reqCtx := h1ReqCtx(h1User)
+	key, handle, _ := dispatchCacheLookupKey(reqCtx, "restactions",
+		h1RAGVR.Group, h1RAGVR.Version, h1RAGVR.Resource, h1NS, h1RAName, -1, -1, nil)
+	if handle == nil || key == "" {
+		t.Fatalf("setup: live key/handle expected")
+	}
+	c := cache.ResolvedCache()
+	refusedBefore := c.Stats().PutRefusedGenerationMovedTotal
+
+	resolved := &templatesv1.RESTAction{}
+	resolved.SetName(h1RAName)
+	resolved.SetNamespace(h1NS)
+	restore := installRAFakes(t, h1RAUnstructured(), func() bool { return true },
+		func(ctx context.Context, opts restactions.ResolveOptions) (*templatesv1.RESTAction, error) {
+			// Runs AFTER the dispatcher captured the key's generation (restactions.go:221)
+			// and BEFORE its PutIfGen (:463): a real Put+DELETE-evict bumps the
+			// generation past the captured value.
+			c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+			c.DeleteForTest(key)
+			return resolved, nil
+		})
+	defer restore()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/call", nil).WithContext(reqCtx)
+	RESTAction().ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("#189 RA A5: the request must still SERVE 200 from its fresh resolve; got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := c.Stats().PutRefusedGenerationMovedTotal; got != refusedBefore+1 {
+		t.Fatalf("#189 RA A5 RED: the tail PutIfGen was NOT refused (refused_total %d->%d). A DELETE-eviction during the resolve must refuse the write — a wrong capture key (M1) or a capture-after-resolve (M2) resurrects here.", refusedBefore, got)
+	}
+	if _, ok := handle.Get(key); ok {
+		t.Fatalf("#189 RA A5 RED: the DELETE-evicted cell was RESURRECTED by the racing PutIfGen under key %q", key)
+	}
+}
+
+func TestH1_Widget_S189_ResolveRacingDelete_RefusedNotResurrected(t *testing.T) {
+	h1BuildWatcher(t)
+	reqCtx := h1ReqCtx(h1User)
+	key, handle, _ := dispatchCacheLookupKey(reqCtx, "widgets",
+		h1WidgetGVR.Group, h1WidgetGVR.Version, h1WidgetGVR.Resource, h1NS, h1WName, -1, -1, nil)
+	if handle == nil || key == "" {
+		t.Fatalf("setup: live widget key/handle expected")
+	}
+	c := cache.ResolvedCache()
+	refusedBefore := c.Stats().PutRefusedGenerationMovedTotal
+
+	restore := installWidgetFakes(t, h1WidgetUnstructured(map[string]any{}), func() bool { return true },
+		func(ctx context.Context, opts widgets.ResolveOptions) (*widgets.Widget, error) {
+			// Between the widget-cell capture (widgets.go:267) and its PutIfGen
+			// (:522): bump the widget key's generation via a real Put+DELETE-evict.
+			c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+			c.DeleteForTest(key)
+			return h1WidgetUnstructured(map[string]any{}), nil
+		})
+	defer restore()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/call", nil).WithContext(reqCtx)
+	Widgets().ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("#189 widget A5: the request must still SERVE 200; got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := c.Stats().PutRefusedGenerationMovedTotal; got != refusedBefore+1 {
+		t.Fatalf("#189 widget A5 RED: the widget-cell PutIfGen (widgets.go:522) was NOT refused (refused_total %d->%d) — the pre-delete widget body would be resurrected.", refusedBefore, got)
+	}
+	if _, ok := handle.Get(key); ok {
+		t.Fatalf("#189 widget A5 RED: the DELETE-evicted widget cell was RESURRECTED under key %q", key)
+	}
+}

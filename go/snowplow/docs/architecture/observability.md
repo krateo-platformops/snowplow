@@ -142,6 +142,7 @@ Defined in `internal/cache/fallthrough_meter_expvar.go`.
 | `apistage_store_total`, `apistage_evict_total` | per-class store / evict for `apistage` cells | evicts ≪ stores |
 | `widget_content_store_total`, `widget_content_evict_total` | per-class store / evict for `widgetContent` cells | evicts ≪ stores |
 | `ra_full_list_store_total`, `ra_full_list_evict_total` | per-class store / evict for `RAFullList` cells | evicts ≪ stores |
+| `put_refused_generation_moved_total` | **#189.** request-path `PutIfGen` writes REFUSED because the key's generation moved between the dispatcher's pre-resolve capture and the tail write — i.e. a DELETE-eviction (or any removal) landed during the in-flight resolve, so the pre-delete body was NOT resurrected. Reads non-zero exactly when the write-side resurrection race is being closed | **0** in steady state; a low rate around object churn is healthy (the guard doing its job). A sustained climb = many resolves are racing evictions — read next to `snowplow_deps.evict_delete_total` |
 
 
 ### Dispatch L1 lookups — resolved-output cache hit rate
