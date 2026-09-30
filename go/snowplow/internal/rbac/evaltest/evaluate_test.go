@@ -32,9 +32,9 @@ import (
 // Duplicated here to avoid exporting a test-only API from cache.
 func rbacListKinds() map[schema.GroupVersionResource]string {
 	return map[schema.GroupVersionResource]string{
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:                "RoleList",
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:         "RoleBindingList",
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:         "ClusterRoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
 	}
 }
@@ -46,6 +46,17 @@ func rbacListKinds() map[schema.GroupVersionResource]string {
 func newTestWatcher(t *testing.T, seed ...runtime.Object) {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
+
+	// #327: the per-subject RBAC sub-generation counters are process-lived.
+	// Tests through this shared harness reuse common usernames (alice/bob/
+	// admin), so a prior test's sub-gen bumps leak into this one and diverge
+	// sub-gen-folded keys per run (e.g. TestA1's alice/bob shared-cell parity,
+	// which flaked 2/3 under -count>1). Reset to the clean baseline at setup and
+	// on cleanup so every test through this harness sees its own sub-gen state,
+	// not ambient churn — and future tests inherit it. Safe: no t.Parallel in
+	// this package, so the process-global reset is sequential.
+	cache.ResetRBACSubGenForTest()
+	t.Cleanup(cache.ResetRBACSubGenForTest)
 
 	sch := runtime.NewScheme()
 	if err := rbacv1.AddToScheme(sch); err != nil {
@@ -534,10 +545,10 @@ func TestEvaluateRBAC_TypedHappyPath(t *testing.T) {
 		user, verb, resource string
 		want                 bool
 	}{
-		{"alice", "delete", "secrets", true},  // admin
-		{"bob", "get", "pods", true},          // viewer
-		{"bob", "delete", "secrets", false},   // viewer rule doesn't match
-		{"eve", "get", "anything", false},     // no binding
+		{"alice", "delete", "secrets", true}, // admin
+		{"bob", "get", "pods", true},         // viewer
+		{"bob", "delete", "secrets", false},  // viewer rule doesn't match
+		{"eve", "get", "anything", false},    // no binding
 	}
 	for _, c := range cases {
 		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
@@ -982,7 +993,7 @@ func TestEvaluateRBAC_SAGroups_ConcreteNamespaceGrant(t *testing.T) {
 		name      string
 		namespace string
 	}{
-		{"cluster_scope_empty_ns", ""},           // the PROBE-1 form
+		{"cluster_scope_empty_ns", ""},             // the PROBE-1 form
 		{"concrete_ns_demo_system", "demo-system"}, // the PROBE-1b form (was non-asserting)
 		{"concrete_ns_other", "other"},
 	}

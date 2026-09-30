@@ -60,6 +60,13 @@ func buildWidgetParityWatcher(t *testing.T, seedWidget bool, inlineApiRefExtras 
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 
+	// #327: reset the process-lived RBAC sub-gen counters so cross-test
+	// username reuse can't leak sub-gen into this parity harness (same class
+	// as newTestWatcher / buildF3AdminsParityWatcher). No t.Parallel here, so
+	// the process-global reset is sequential-safe.
+	cache.ResetRBACSubGenForTest()
+	t.Cleanup(cache.ResetRBACSubGenForTest)
+
 	crbGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}
 	crGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}
 	scheme := runtime.NewScheme()
