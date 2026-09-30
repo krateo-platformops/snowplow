@@ -14,6 +14,7 @@
 package cache
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -64,18 +65,40 @@ func TestIssue1126_C3_FU4b_ChunkedWalkReportsBatchesAndBoundedHolds(t *testing.T
 
 	// Batched iteration is exact: every entry once, an entry evicted
 	// between batches is skipped (not re-visited, not counted twice).
+	//
+	// #243: pick the evicted entry as one NOT collected in the first batch, so
+	// the "evicted between batches ⇒ skipped" property holds regardless of Go
+	// map iteration order. The old code deleted a hardcoded key
+	// ("L1_button-19999") on batch 1, but whether that key had already been
+	// collected into batch 1's metas depends on the store's map order — so ~5%
+	// of runs the evicted key WAS in batch 1 (counted before the delete) and
+	// len(seen) stayed fu4Entries, a false RED at :80. A still-pending victim
+	// is deleted before its own (later) batch is collected, every run.
 	seen := map[string]int{}
 	batches := 0
+	var victim string
 	store.RangeMetadataBatched(512, func(metas []ResolvedEntryMeta, held time.Duration) bool {
 		batches++
-		if batches == 1 {
-			store.DeleteForTest("L1_button-19999") // gone before its batch is collected
-		}
 		for _, m := range metas {
 			seen[m.KeyHash]++
 		}
+		if batches == 1 {
+			// Any key absent from the first batch is still pending in a later
+			// batch of THIS walk; deleting it now precedes its own batch.
+			for i := 0; i < fu4Entries; i++ {
+				k := fmt.Sprintf("L1_button-%d", i)
+				if _, collected := seen[k]; !collected {
+					victim = k
+					break
+				}
+			}
+			store.DeleteForTest(victim)
+		}
 		return true
 	})
+	if victim == "" {
+		t.Fatal("FU4b: no uncollected victim after batch 1 — batch 1 held every entry?")
+	}
 	if len(seen) != fu4Entries-1 {
 		t.Fatalf("FU4b: batched walk visited %d distinct entries, want %d (one evicted between batches)", len(seen), fu4Entries-1)
 	}
@@ -84,7 +107,7 @@ func TestIssue1126_C3_FU4b_ChunkedWalkReportsBatchesAndBoundedHolds(t *testing.T
 			t.Fatalf("FU4b: %s visited %d times", k, n)
 		}
 	}
-	if _, twice := seen["L1_button-19999"]; twice {
+	if _, twice := seen[victim]; twice {
 		t.Fatalf("FU4b: the entry evicted between batches was still visited")
 	}
 }
