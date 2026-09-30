@@ -1,14 +1,25 @@
-// issue1126_c3_followup_fields_test.go — the C3 follow-up arms that read the
-// NEW ReconcileReport fields (they do not compile on 2000cba; the
-// behavioural RED twins are in issue1126_c3_followup_test.go).
+// issue1126_c3_followup_fields_test.go — the C3 follow-up arms built on the
+// follow-up's NEW API/fields (RangeMetadataBatched, the new ReconcileReport
+// fields). They do NOT compile on 2000cba by design — a full chunking revert is
+// caught at compile time here; the behavioural-RED-on-2000cba arms (FU1, FU2)
+// are in issue1126_c3_followup_test.go.
 //
+//	FU4  — the full batched walk holds the store lock per BATCH, not across the
+//	       residency (PM condition 3), asserted DETERMINISTICALLY with no
+//	       wall-clock ratio, in TWO arms (kept separate so a concurrent Get never
+//	       races the lock probe): a GRANULARITY arm — exactly ⌈N/512⌉ acquisitions
+//	       AND a race-free store.mu.TryLock() free in every between-batch gap
+//	       (catches a hold spanning several batches even when the count stays
+//	       intact), with NO concurrent Get; and a LIVENESS arm — a concurrent
+//	       customer Get completes during the walk within a generous deadlock
+//	       backstop. The removed fu4Ratio/fu4Rounds/fu4ExclusiveWalk/fu4Measure/
+//	       fu4Hammer were the old ratio's machinery (#326).
 //	FU4b — the chunked full walk reports its batches and measured holds:
-//	       ⌈20000/512⌉ batches, a measured per-batch hold, no truncation,
-//	       and — same-run ratio, arch N10 — the longest batch hold is at
-//	       most 1/fu4Ratio of the exclusive walk's single hold measured in
-//	       the same run; a batched walk visits every entry exactly once
-//	       while entries evicted between batches are skipped, not
-//	       re-visited.
+//	       ⌈20000/512⌉ batches (SEPARATE acquisitions, not one hold across the
+//	       residency), a measured per-batch hold, no truncation; and a batched
+//	       walk visits every entry exactly once while entries evicted between
+//	       batches are skipped, not re-visited. The batch-bounded-hold MECHANISM
+//	       is asserted structurally (the batch count) — no wall-clock ratio.
 //	FU2b — SkippedNoEdge is the report-level twin of the expvar key.
 
 package cache
@@ -17,50 +28,37 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func TestIssue1126_C3_FU4b_ChunkedWalkReportsBatchesAndBoundedHolds(t *testing.T) {
 	store, rw := fu4Store(t)
 
 	wantBatches := (fu4Entries + reconcileFullBatch - 1) / reconcileFullBatch
-	// Same-run ratio (arch N10): the exclusive walk's ONE hold is the time
-	// RangeMetadata takes with a trivial fn; the chunked walk's longest
-	// batch hold is measured by the walk itself. Interleaved, min of rounds.
-	var minEx, minCh time.Duration = -1, -1
-	var rep ReconcileReport
-	for i := 0; i < fu4Rounds; i++ {
-		t0 := time.Now()
-		n := 0
-		store.RangeMetadata(func(ResolvedEntryMeta) bool { n++; return true })
-		exHold := time.Since(t0)
-		if n != fu4Entries {
-			t.Fatalf("FU4b: exclusive walk visited %d, want %d", n, fu4Entries)
-		}
-		rep = reconcileOnce(store, rw, 0)
-		chHold := time.Duration(rep.MaxBatchHoldMicros) * time.Microsecond
-		t.Logf("FU4b round %d: exclusive hold %s | chunked batches=%d snapshotHold=%dµs maxBatchHold=%s truncated=%v",
-			i+1, exHold, rep.Batches, rep.SnapshotHoldMicros, chHold, rep.Truncated)
-		if rep.Batches != wantBatches {
-			t.Fatalf("FU4b: batches=%d, want %d (%d entries / %d per batch)", rep.Batches, wantBatches, fu4Entries, reconcileFullBatch)
-		}
-		if rep.Truncated {
-			t.Fatalf("FU4b: a %d-entry walk hit the %s wall cap", fu4Entries, reconcileFullMaxWall)
-		}
-		if rep.MaxBatchHoldMicros <= 0 {
-			t.Fatalf("FU4b: maxBatchHoldMicros=%d — the hold was not measured", rep.MaxBatchHoldMicros)
-		}
-		if minEx < 0 || exHold < minEx {
-			minEx = exHold
-		}
-		if minCh < 0 || chHold < minCh {
-			minCh = chHold
-		}
+
+	// The chunked full walk reports its batches and measured holds. The
+	// batch-bounded-hold MECHANISM is asserted deterministically — no
+	// wall-clock ratio: the walk runs in wantBatches SEPARATE acquisitions
+	// (not one hold across the residency), visits and probes everything without
+	// hitting the wall cap, and records a per-batch hold. The behavioural twin
+	// — a concurrent customer Get is never blocked for the whole walk — is
+	// TestIssue1126_C3_FU4.
+	rep := reconcileOnce(store, rw, 0)
+	t.Logf("FU4b: chunked batches=%d snapshotHold=%dµs maxBatchHold=%dµs truncated=%v",
+		rep.Batches, rep.SnapshotHoldMicros, rep.MaxBatchHoldMicros, rep.Truncated)
+	if rep.Sampled != fu4Entries || rep.Probed != fu4Entries {
+		t.Fatalf("FU4b: sampled=%d probed=%d, want %d each", rep.Sampled, rep.Probed, fu4Entries)
 	}
-	t.Logf("FU4b: min hold — exclusive %s, chunked batch %s, ratio %.1f (need ≥ %d)",
-		minEx, minCh, float64(minEx)/float64(minCh), fu4Ratio)
-	if minCh*fu4Ratio > minEx {
-		t.Fatalf("FU4b: longest batch hold %s is not ≤ 1/%d of the exclusive walk's hold %s in the same run — "+
-			"a batch of %d costs as much as the whole residency", minCh, fu4Ratio, minEx, reconcileFullBatch)
+	if rep.Batches != wantBatches {
+		t.Fatalf("FU4b: batches=%d, want %d (%d entries / %d per batch) — the walk did not chunk into "+
+			"batch-bounded holds; it held one acquisition across the residency", rep.Batches, wantBatches, fu4Entries, reconcileFullBatch)
+	}
+	if rep.Truncated {
+		t.Fatalf("FU4b: a %d-entry walk hit the %s wall cap", fu4Entries, reconcileFullMaxWall)
+	}
+	if rep.MaxBatchHoldMicros <= 0 {
+		t.Fatalf("FU4b: maxBatchHoldMicros=%d — the per-batch hold was not measured", rep.MaxBatchHoldMicros)
 	}
 
 	// Batched iteration is exact: every entry once, an entry evicted
@@ -129,5 +127,108 @@ func TestIssue1126_C3_FU2b_ReportCarriesSkippedNoEdge(t *testing.T) {
 	}
 	if _, alive := store.Get("L1_flex-z"); !alive {
 		t.Fatalf("FU2b: the no-edge entry was evicted")
+	}
+}
+
+// --- FU4 — the full walk holds the store lock per batch, not across residency -
+
+const fu4Entries = 20000
+
+// fu4Store builds a store of fu4Entries widget entries whose GVR is NOT
+// watched, so every probe is a cheap UNKNOWN (no submits, no worker
+// traffic) and the walk's cost is the store-mutex hold under test.
+func fu4Store(t *testing.T) (*ResolvedCacheStore, *ResourceWatcher) {
+	t.Helper()
+	c3Setup(t)
+	store := newResolvedCache(fu4Entries+100, 1<<30, time.Hour)
+	Deps().SetStore(store)
+	rw, _ := realWatcher(t, gvrFlexes())
+	unwatched := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "buttons"}
+	for i := 0; i < fu4Entries; i++ {
+		name := fmt.Sprintf("button-%d", i)
+		store.Put("L1_"+name, &ResolvedEntry{RawJSON: []byte(`{"i":1}`), Inputs: widgetInputs(unwatched, "demo-system", name)})
+	}
+	return store, rw
+}
+
+func TestIssue1126_C3_FU4_FullWalkHoldsLockPerBatchNotAcrossResidency(t *testing.T) {
+	store, rw := fu4Store(t)
+	if _, alive := store.Get("L1_button-0"); !alive {
+		t.Fatalf("premise: entry not resident")
+	}
+
+	// Load-independent: the chunked full walk visits and probes everything.
+	rep := reconcileOnce(store, rw, 0)
+	if rep.Sampled != fu4Entries || rep.Probed != fu4Entries || rep.Unknown != fu4Entries {
+		t.Fatalf("FU4: sampled=%d probed=%d unknown=%d, want %d each (an unwatched GVR is UNKNOWN, never absent)",
+			rep.Sampled, rep.Probed, rep.Unknown, fu4Entries)
+	}
+
+	// GRANULARITY (deterministic, no wall-clock ratio). The full walk runs in
+	// exactly wantBatches acquisitions, and store.mu is FREE during every
+	// between-batch gap. NO concurrent Get runs here (arch): the walk is then
+	// the ONLY c.mu contender, so a correct per-batch release makes TryLock
+	// ALWAYS succeed — a background Get holding c.mu at a TryLock instant would
+	// false-fail it. sync.Mutex is non-reentrant, so a walk that holds c.mu
+	// across a batch (the whole-residency shape, or a hold spanning several
+	// batches that keeps the count at wantBatches) fails TryLock -> RED,
+	// race-free. Closes the blind spot the batch count alone leaves. The
+	// behavioural liveness twin is TestIssue1126_C3_FU4_ConcurrentGet...
+	wantBatches := (fu4Entries + reconcileFullBatch - 1) / reconcileFullBatch
+	batches, visited := 0, 0
+	store.RangeMetadataBatched(reconcileFullBatch, func(metas []ResolvedEntryMeta, _ time.Duration) bool {
+		batches++
+		visited += len(metas)
+		if len(metas) > reconcileFullBatch {
+			t.Fatalf("FU4: a batch copied %d entries under one lock hold, want <= %d", len(metas), reconcileFullBatch)
+		}
+		if !store.mu.TryLock() {
+			t.Fatalf("FU4: the store lock is held during a between-batch gap — the full walk holds c.mu across " +
+				"batches; at 50K-100K entries /debug/reconcile would stall every customer /call for the whole walk (PM condition 3)")
+		}
+		store.mu.Unlock()
+		return true
+	})
+	if batches != wantBatches {
+		t.Fatalf("FU4: full walk ran in %d acquisitions, want %d (%d entries / %d per batch) — the walk did not "+
+			"chunk into batch-bounded holds", batches, wantBatches, fu4Entries, reconcileFullBatch)
+	}
+	if visited != fu4Entries {
+		t.Fatalf("FU4: batched walk visited %d entries, want %d", visited, fu4Entries)
+	}
+}
+
+func TestIssue1126_C3_FU4_ConcurrentGetNeverBlockedForTheWholeWalk(t *testing.T) {
+	store, rw := fu4Store(t)
+	if _, alive := store.Get("L1_button-0"); !alive {
+		t.Fatalf("premise: entry not resident")
+	}
+
+	// LIVENESS (behavioural symptom). A real customer store.Get fired DURING the
+	// full walk must complete within a GENEROUS deadlock backstop; a walk that
+	// holds c.mu across the whole residency blocks it for the entire walk -> the
+	// backstop fires -> RED. The backstop is a safety net, NOT a latency gate
+	// (the #328 pattern): correct code completes each Get in ~ms. Kept SEPARATE
+	// from the TryLock arm (arch) so a concurrent Get never races that TryLock.
+	const backstop = 30 * time.Second
+	walkDone := make(chan struct{})
+	go func() {
+		reconcileOnce(store, rw, 0)
+		close(walkDone)
+	}()
+	for {
+		select {
+		case <-walkDone:
+			return // the walk finished; every concurrent Get completed within the backstop
+		default:
+		}
+		done := make(chan struct{})
+		go func() { store.Get("L1_button-0"); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(backstop):
+			t.Fatalf("FU4: a concurrent customer store.Get blocked >%s during the full walk — the walk holds "+
+				"c.mu across the residency (PM condition 3)", backstop)
+		}
 	}
 }
