@@ -89,12 +89,6 @@ func TestF3_NeverWalkedGVR_RegisterOnNavigation(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	})
 
-	// Discovery client that DOES serve the GVR's resource type — this is
-	// an existing-resource navigation, not a post-startup CRD (that case
-	// is F1, below). Conjunct 4 must confirm it once the refresh runs.
-	disco := &fakeDiscovery{served: map[string]bool{gvString(neverWalkedGVR): true}}
-	rw.SetDiscoveryClient(disco)
-
 	// Pre-condition: the GVR is genuinely never-walked. Nothing has
 	// registered it, so it must not be servable.
 	if rw.IsServable(neverWalkedGVR) {
@@ -111,17 +105,31 @@ func TestF3_NeverWalkedGVR_RegisterOnNavigation(t *testing.T) {
 		t.Fatalf("F3: register-on-navigation must register a never-walked GVR (want added=true)")
 	}
 
+	// #204: wire discovery AFTER the register above, so the lazy-register
+	// auto-prime (primeConfirmAsyncLocked) short-circuited on its disco==nil
+	// guard and did NOT confirm the type — the same ordering
+	// walk_confirm_prime_f1_test.go:166-175 uses to dodge this race. The
+	// discovery client DOES serve the GVR's type, so step 3's RefreshDiscovery
+	// confirms conjunct 4. (An existing-resource navigation, not a
+	// post-startup CRD — that case is F1, below.)
+	disco := &fakeDiscovery{served: map[string]bool{gvString(neverWalkedGVR): true}}
+	rw.SetDiscoveryClient(disco)
+
 	// --- Step 2: the triggering request must fall through. -------------
-	// EnsureResourceType is fire-and-forget; it does NOT block on sync.
-	// At this instant the informer has not synced, so the four-conjunct
-	// gate must report servable=false — the triggering request serves
-	// via apiserver fallthrough, never from a not-ready informer.
+	// EnsureResourceType is fire-and-forget and the type is NOT yet confirmed
+	// (the auto-prime short-circuited above; no RefreshDiscovery has run). So
+	// conjunct 4 (typeConfirmed) is DETERMINISTICALLY false and the
+	// four-conjunct gate reports servable=false regardless of whether the
+	// informer has raced to synced — the triggering request serves via
+	// apiserver fallthrough, never from a not-ready/unconfirmed informer.
+	// (Asserting on "not yet synced" instead would rest on informer-sync
+	// timing, which raced this assertion ~2% at -race -count=200 — #204.)
 	if rw.IsServable(neverWalkedGVR) {
 		t.Fatalf("F3: triggering request must fall through — a just-registered, " +
-			"not-yet-synced GVR must NOT be servable")
+			"not-yet-confirmed GVR must NOT be servable")
 	}
 	if _, servable := rw.ListObjectsServable(neverWalkedGVR, ""); servable {
-		t.Fatalf("F3: triggering LIST must fall through — not-yet-synced GVR " +
+		t.Fatalf("F3: triggering LIST must fall through — not-yet-confirmed GVR " +
 			"must NOT be servable")
 	}
 
