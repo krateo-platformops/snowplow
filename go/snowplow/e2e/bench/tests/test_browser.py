@@ -2284,3 +2284,104 @@ def test_frontend_default_is_an_origin_not_a_loadbalancer_ip():
     assert default.startswith("https://"), f"default must be an https origin, got {default!r}"
     assert not re.match(r"^https?://\d+\.\d+\.\d+\.\d+", default), (
         f"default is a bare LoadBalancer IP ({default!r}) — those drift; use the origin")
+
+
+# ─── #178: no live HTTP from a bench UNIT test's cache-list CONTENT check ────
+#
+# browser_measure_stage's post-VERIFY CONTENT check calls
+# list_composition_names_from_cache(token) → http_get_json → a LIVE
+# urllib.request.urlopen when cache_mode="ON" and a token is set. In a bench
+# UNIT test there is no snowplow to reach, so that call blocks on sock.connect
+# (http_get timeout=120 × retries=3 ≈ 6 min) and HANGS the suite — the #178
+# root cause (traced to test_browser_measure_stage_cyber_uses_intra_user_
+# consistency). The conftest autouse `_stub_cache_list_transport` neutralises
+# it by default; these two arms pin that.
+
+
+def test_178_measure_stage_makes_no_live_cache_list_http(monkeypatch, fake_page,
+                                                         tmp_path):
+    """PRIMARY (#178): a cache_mode=ON + token measure-stage must make NO live
+    urlopen in a unit test. RED without the autouse stub — the tripwire below
+    trips on the real list_composition_names_from_cache → http_get → urlopen.
+    """
+    _patch_cluster_count(monkeypatch, comp_count=50_000, ns_count=50)
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: 10)
+    monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
+                        lambda page: 10)
+    monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
+                        lambda u, p, **kw: None)
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    # RECORD any urlopen ATTEMPT (a raise would be swallowed by
+    # list_composition_names_from_cache's broad except → returns None → no
+    # signal; instead return a non-200 fake so nothing connects/hangs and we
+    # ASSERT the attempt count). On main the real cache-list call attempts one
+    # urlopen → RED; with the autouse stub it never does → GREEN.
+    calls = []
+
+    class _FakeResp:
+        status = 599
+
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _record_urlopen(req, *a, **k):
+        calls.append(getattr(req, "full_url", str(req)))
+        return _FakeResp()
+
+    monkeypatch.setattr(browser_mod.urllib.request, "urlopen", _record_urlopen)
+
+    result = browser_measure_stage(
+        fake_page, stage_num=6, stage_desc="178 no-live", cache_mode="ON",
+        token="tok", num_navs=1, user="cyberjoker",
+        verify_against_cluster=False, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+    )
+    assert not calls, (
+        "#178: the measure-stage cache-list CONTENT check attempted a LIVE "
+        f"urllib.request.urlopen ({calls}) — it must be autouse-stubbed so a "
+        "bench UNIT test never blocks on sock.connect")
+    dash = result["pages"]["Dashboard"]["navigations"][0]
+    assert dash["verified_api"] == 10 and dash["convergence_ms"] >= 0
+
+
+def test_178_control_content_match_reachable_when_cache_list_explicitly_stubbed(
+        monkeypatch, fake_page, tmp_path):
+    """CONTROL (#178): the autouse cache-list stub is a DEFAULT — a test that
+    DOES exercise the CONTENT-match path (by re-stubbing
+    list_composition_names_from_cache per-test) still drives it. Guards against
+    an over-broad stub that would blind real CONTENT coverage (fixtures apply
+    before the test body, so the per-test setattr wins over the autouse one).
+    """
+    names = {"krateo-system/a", "krateo-system/b"}
+    _patch_cluster_count(monkeypatch, comp_count=2, ns_count=1)
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: 2)
+    monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
+                        lambda page: 2)
+    monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
+                        lambda u, p, **kw: None)
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+    # Explicit per-test overrides → CONTENT-match runs against these, hermetically.
+    monkeypatch.setattr(browser_mod, "_list_composition_names", lambda: names)
+    monkeypatch.setattr(browser_mod, "list_composition_names_from_cache",
+                        lambda token: names)
+
+    result = browser_measure_stage(
+        fake_page, stage_num=2, stage_desc="178 ctrl", cache_mode="ON",
+        token="tok", num_navs=1, user="admin",
+        verify_against_cluster=True, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+    )
+    dash = result["pages"]["Dashboard"]["navigations"][0]
+    assert dash.get("content_match") is True, (
+        "#178 control: an explicit per-test list_composition_names_from_cache stub "
+        "must still drive the CONTENT-match — the autouse default must be "
+        "overridable, not blinding")
