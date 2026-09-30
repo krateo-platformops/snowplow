@@ -180,15 +180,27 @@ func authzMemoLookup(gen uint64, key snapshotAuthzKey) (snapshotAuthzVerdict, bo
 // store of an existing key (idempotent overwrite) is always allowed so a
 // hot key never gets stuck refused after the map fills.
 func authzMemoStore(gen uint64, key snapshotAuthzKey, v snapshotAuthzVerdict) {
-	shard := currentAuthzShard(gen)
-	shard.mu.Lock()
-	if _, exists := shard.m[key]; !exists && len(shard.m) >= snapshotAuthzMemoCap {
-		shard.mu.Unlock()
+	currentAuthzShard(gen).storeWithCap(key, v)
+}
+
+// storeWithCap records v under key on THIS shard, refusing a NEW key (no-op,
+// counted via authzMemoRefused) once the shard is at snapshotAuthzMemoCap,
+// while an idempotent overwrite of an existing key is always allowed so a hot
+// key never gets stuck refused after the map fills. Extracted from
+// authzMemoStore (behaviour-identical) so the cap-refuse-never-evict invariant
+// can be exercised on a PINNED shard — immune to the generation pointer swap
+// (currentAuthzShard's CAS) that a background republish performs — in a
+// package-rbac unit test (#327), instead of only through the swap-prone
+// end-to-end EvaluateRBAC path.
+func (s *snapshotAuthzShard) storeWithCap(key snapshotAuthzKey, v snapshotAuthzVerdict) {
+	s.mu.Lock()
+	if _, exists := s.m[key]; !exists && len(s.m) >= snapshotAuthzMemoCap {
+		s.mu.Unlock()
 		authzMemoRefused.Add(1)
 		return
 	}
-	shard.m[key] = v
-	shard.mu.Unlock()
+	s.m[key] = v
+	s.mu.Unlock()
 }
 
 // authzMemoEntriesForExpvar returns the current shard's entry count for
@@ -220,6 +232,50 @@ func ResetAuthzMemoForTest() {
 func AuthzMemoStatsForTest() (hits, misses, swaps, refused uint64, entries int) {
 	return authzMemoHits.Load(), authzMemoMisses.Load(), authzMemoSwaps.Load(),
 		authzMemoRefused.Load(), authzMemoEntriesForExpvar()
+}
+
+// AuthzShardCapInvariantForTest exercises the cap-refuse-never-evict invariant
+// of a single shard on a PINNED shard, immune BY CONSTRUCTION to the
+// generation pointer swap that currentAuthzShard performs on a background
+// snapshot republish (the correct per-gen invalidation) — the swap that made
+// the old end-to-end evaltest fill flake 2/3 under -count (#241-M8 / #327). It
+// resets the memo, pins ONE shard, fills it past snapshotAuthzMemoCap with
+// distinct keys via storeWithCap, then re-stores an EXISTING key to check the
+// idempotent-overwrite exemption. Returns the post-fill entry count, the count
+// of inserts refused during the fill, and whether the idempotent overwrite
+// grew the map (it must not). TEST-ONLY (evaltest) — production code MUST NOT
+// call it. No shard type escapes the signature (plain ints/bool); the
+// assertions live in the caller.
+func AuthzShardCapInvariantForTest() (entries int, refusedDelta uint64, overwriteGrew bool) {
+	ResetAuthzMemoForTest()
+	const overfill = snapshotAuthzMemoCap + 500
+	// Pin one shard: a background republish swaps the GLOBAL pointer to a fresh
+	// shard at a new gen, but this captured object is filled directly.
+	shard := currentAuthzShard(1)
+	permit := snapshotAuthzVerdict{Allowed: true}
+	// Distinct keys via GroupsHash (one new key each) — no fmt dependency.
+	mkKey := func(i int) snapshotAuthzKey {
+		return snapshotAuthzKey{Gen: 1, Username: "alice", Verb: "get", Resource: "secrets", Namespace: "default", GroupsHash: uint64(i)}
+	}
+	before := authzMemoRefused.Load()
+	for i := 0; i < overfill; i++ {
+		shard.storeWithCap(mkKey(i), permit)
+	}
+	shard.mu.RLock()
+	entries = len(shard.m)
+	shard.mu.RUnlock()
+	refusedDelta = authzMemoRefused.Load() - before
+
+	// Idempotent overwrite of an EXISTING key (one of the first cap stored)
+	// must be allowed and must NOT grow the map (exempt from the cap refuse).
+	shard.mu.RLock()
+	lenBefore := len(shard.m)
+	shard.mu.RUnlock()
+	shard.storeWithCap(mkKey(0), snapshotAuthzVerdict{Allowed: true, MatchedBindingUID: "u"})
+	shard.mu.RLock()
+	overwriteGrew = len(shard.m) != lenBefore
+	shard.mu.RUnlock()
+	return entries, refusedDelta, overwriteGrew
 }
 
 // AuthzMemoDenyUncachedForTest returns the count of deny verdicts not

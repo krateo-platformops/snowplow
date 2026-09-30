@@ -295,7 +295,7 @@ func TestL2_F2_ConcurrentRepublishHammer(t *testing.T) {
 		{"alice", "get", "configmaps", true},
 		{"alice", "list", "secrets", true},
 		{"bob", "get", "secrets", true},
-		{"bob", "get", "pods", false},     // not granted
+		{"bob", "get", "pods", false},         // not granted
 		{"carol", "get", "configmaps", false}, // unbound identity
 	}
 
@@ -575,77 +575,43 @@ func TestL2_H3_RoleRuleRepublish_NarrowWiden(t *testing.T) {
 //   - LRU-evict instead of refuse: authzMemoRefused would stay 0.
 //   - wrong verdict on a refused key: the refused tuple would deny.
 func TestL2_M8_CapRefusesNeverEvicts(t *testing.T) {
-	rbac.ResetAuthzMemoForTest()
-
-	// Wildcard admin — alice may do anything, so every tuple permits and
-	// therefore every tuple is a cache CANDIDATE (only permits are stored,
-	// see #301). Keeping every tuple a permit is what lets us fill the map.
-	newTestWatcher(t,
-		clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
-		clusterRoleBindingWithUID("alice-bind", "admin", "uid-alice", userSubject("alice")),
-	)
-
 	const cap = 16384 // snapshotAuthzMemoCap (snapshot_authz_memo.go)
 	const overfill = cap + 500
 
-	base := rbac.EvaluateOptions{
-		Username: "alice", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
-		SkipBindingUID: true,
-	}
-
-	// Fill past the cap with DISTINCT Name values -> distinct keys.
-	// Every call MUST permit (wildcard admin); the memo silently refuses
-	// once full.
-	for i := 0; i < overfill; i++ {
-		o := base
-		o.Name = fmt.Sprintf("obj-%06d", i)
-		a, _, err := rbac.EvaluateRBAC(context.Background(), o)
-		if err != nil {
-			t.Fatalf("M8 fill i=%d: err=%v", i, err)
-		}
-		if !a {
-			t.Fatalf("M8 fill i=%d: wildcard admin must permit every tuple; got deny for Name=%q", i, o.Name)
-		}
-	}
-
-	_, _, _, refused, entries := rbac.AuthzMemoStatsForTest()
+	// #327: the cap-refuse-never-evict invariant is exercised on a PINNED shard
+	// via rbac.AuthzShardCapInvariantForTest — immune to the background snapshot
+	// republish that swaps the global memo pointer (correct per-gen
+	// invalidation) and made the old end-to-end EvaluateRBAC fill flake 2/3
+	// under -count (#241).
+	//
+	// DROPPED here on purpose (diff-for-deleted-tests): the old end-to-end
+	// cap-fill (EvaluateRBAC over `overfill` distinct tuples + AuthzMemoStats
+	// assertions) is the flake, now relocated to the pinned-shard seam; and the
+	// old "a refused key re-walks to the correct verdict" arm — a refused key is
+	// a plain memo MISS, whose walk-fallback is already covered by the F2/F3/F5
+	// arms in this package, so keeping it would duplicate them with no new
+	// coverage AND re-introduce the flaky cap-fill.
+	entries, refusedDelta, overwriteGrew := rbac.AuthzShardCapInvariantForTest()
 
 	// Cap breach must have REFUSED inserts (not evicted to make room).
-	if refused == 0 {
-		t.Fatalf("M8 CAP BROKEN: filled %d distinct permit tuples (cap=%d) but authzMemoRefused==0 — the memo EVICTED instead of refusing (or the cap is not enforced)", overfill, cap)
+	if refusedDelta == 0 {
+		t.Fatalf("M8 CAP BROKEN: filled %d distinct permit tuples (cap=%d) but refused==0 — the memo EVICTED instead of refusing (or the cap is not enforced)", overfill, cap)
 	}
 	// Entries must settle EXACTLY at the cap: never above (unbounded), and
 	// never below (refuse, don't evict).
 	if entries != cap {
-		t.Fatalf("M8 CAP BROKEN: entries=%d, want exactly cap=%d (>cap = unbounded growth; <cap = eviction). refused=%d", entries, cap, refused)
+		t.Fatalf("M8 CAP BROKEN: entries=%d, want exactly cap=%d (>cap = unbounded growth; <cap = eviction). refusedDelta=%d", entries, cap, refusedDelta)
 	}
 	// The number of refused inserts must equal the overflow beyond the cap
-	// (each distinct tuple is a new key; the first `cap` fill the map, the
-	// rest are refused). This pins "refuse, don't evict" precisely.
-	if want := uint64(overfill - cap); refused != want {
-		t.Fatalf("M8 CAP: refused=%d, want exactly overflow=%d (overfill %d - cap %d) — off means evict-then-reinsert churn", refused, want, overfill, cap)
+	// (each distinct key; the first `cap` fill the map, the rest are refused).
+	// This pins "refuse, don't evict" precisely.
+	if want := uint64(overfill - cap); refusedDelta != want {
+		t.Fatalf("M8 CAP: refusedDelta=%d, want exactly overflow=%d (overfill %d - cap %d) — off means evict-then-reinsert churn", refusedDelta, want, overfill, cap)
 	}
-
-	// A tuple whose insert was refused (one of the LAST `overfill-cap`
-	// filled) MUST still return the correct walk-fallback verdict on a
-	// re-ask. Re-ask the very last one — its key is not in the map, so
-	// this re-walks; the verdict MUST be allow.
-	refusedOpts := base
-	refusedOpts.Name = fmt.Sprintf("obj-%06d", overfill-1)
-	a, _, err := rbac.EvaluateRBAC(context.Background(), refusedOpts)
-	if err != nil {
-		t.Fatalf("M8 refused re-ask: err=%v", err)
-	}
-	if !a {
-		t.Fatalf("M8 CAP BROKEN: a refused-insert tuple returned deny on re-ask — the walk-fallback verdict is wrong (the caller must always get the freshly-walked allow; only the cache insert is skipped)")
-	}
-
-	// Entries must STILL be exactly the cap after the refused re-ask (the
-	// re-ask of a refused key must not grow the map beyond cap, and the
-	// idempotent-overwrite exemption applies only to keys ALREADY present).
-	_, _, _, _, entriesAfter := rbac.AuthzMemoStatsForTest()
-	if entriesAfter != cap {
-		t.Fatalf("M8 CAP: entries grew to %d after re-asking a refused key (want steady at cap=%d)", entriesAfter, cap)
+	// Idempotent overwrite of an EXISTING key must be allowed and must NOT grow
+	// the map beyond cap (the refuse guard exempts keys already present).
+	if overwriteGrew {
+		t.Fatalf("M8 CAP: idempotent overwrite of an existing key grew the map beyond cap=%d — the already-present exemption is broken", cap)
 	}
 }
 
