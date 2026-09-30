@@ -145,13 +145,35 @@ func enqueueStoreRepair(gvr schema.GroupVersionResource, reason string) bool {
 	// factory-built rather than owned". Naming today's members would make this
 	// comment wrong the next time routing changes.
 	//
-	// Leaving that class unrepairable is a DECISION, not an oversight — #244.
-	// Its members' construction is load-bearing for RBAC correctness
+	// Leaving that class unrepairable BY RELIST is a DECISION, not an oversight
+	// — #244. Its members' construction is load-bearing for RBAC correctness
 	// (stripAndType needs *unstructured.Unstructured), and the risk is
 	// inverted: RBAC staleness surfaces as an authorization decision, which is
 	// loud and attributable, whereas #237 is severe precisely because widget
-	// staleness is silent. If it ever does matter, the right verb is a
-	// targeted rebuildRBACSnapshot, not an informer teardown.
+	// staleness is silent.
+	//
+	// #244 DEBUNK — the tempting "just rebuild the RBAC snapshot" is the WRONG
+	// verb, and wiring it would be actively HARMFUL, not merely impotent.
+	// compareStore compares the raw informer INDEXER (inf.GetIndexer()) against a
+	// fresh apiserver LIST, so the divergence here is indexer-vs-apiserver.
+	// rebuildRBACSnapshot re-derives the snapshot FROM that same stale indexer
+	// (and the snapshot is already rebuilt on every RBAC event via
+	// scheduleRBACRebuild), so it CANNOT clear an indexer-vs-apiserver
+	// divergence. Wired as the repair it would set repairedAwaitingVerify=true;
+	// the next pass would still be divergent → noteVerified latches the breaker →
+	// a FALSE store_repair_ineffective + SUPPRESSED detection — strictly worse
+	// than the honest detected-and-unrepaired state this branch produces.
+	//
+	// What actually clears it is PASSIVE: the shared factory's reflector re-LISTs
+	// on the next watch RE-ESTABLISHMENT (ListAndWatch returns on watch
+	// error/close → BackoffUntil re-invokes → a fresh apiserver LIST Replaces the
+	// indexer), independent of resyncPeriod=0 (which only disables the periodic
+	// re-deliver-from-store, not the relist). So the divergence is BOUNDED by the
+	// watch-reconnect cadence — the apiserver's --min-request-timeout,
+	// cluster-config-dependent (nominally ~30-60min) — not unbounded. That bound
+	// is made observable by store_factory_divergence_age_seconds (the age of an
+	// unrepaired factory divergence): within the cluster's reconnect window it
+	// reads as expected self-heal, beyond it as genuinely stuck.
 	if !ownsInformer {
 		storeRepairUnsupportedTotal.Add(1)
 		slog.Warn("cache.store.repair_unsupported",

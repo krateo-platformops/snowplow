@@ -118,6 +118,16 @@ type gvrVerification struct {
 	// suppressed latches the breaker. Detection CONTINUES under suppression
 	// (bound 4): silence must never be produced by the breaker.
 	suppressed bool
+
+	// factoryDivergentSince (#244) times an unrepaired FACTORY-BUILT
+	// (!ownsInformer) divergence: SET when a verify pass finds this GVR divergent
+	// (its informer cannot be relist-repaired — a shared-factory teardown hands
+	// back the STOPPED informer), CLEARED when a later pass finds it clean (the
+	// passive watch-reconnect self-heal landed). Zero when there is no unrepaired
+	// factory divergence. It backs store_factory_divergence_age_seconds: the age
+	// against the cluster's watch-reconnect cadence (--min-request-timeout)
+	// discriminates an expected-self-heal window from a genuinely stuck one.
+	factoryDivergentSince time.Time
 }
 
 // storeVerify is the process-wide registry. A plain map under one mutex, not a
@@ -221,6 +231,22 @@ func noteVerified(gvr schema.GroupVersionResource, objects int, divergences uint
 	st.lastObjects = objects
 	st.divergentSinceBoot += divergences
 
+	// #244 — age an unrepaired factory-built divergence. A factory (!ownsInformer)
+	// GVR's divergence is refused by enqueueStoreRepair (a relist cannot repair a
+	// shared-factory informer) and clears only on the reflector's next watch
+	// re-establishment; timing it from first-detection makes that bounded passive
+	// self-heal observable, and stuck-detectable if it ever exceeds the cluster's
+	// reconnect cadence. Owned GVRs are relist-repaired, so they never age here.
+	if !st.ownsInformer {
+		if divergences > 0 {
+			if st.factoryDivergentSince.IsZero() {
+				st.factoryDivergentSince = time.Now()
+			}
+		} else {
+			st.factoryDivergentSince = time.Time{}
+		}
+	}
+
 	if !st.repairedAwaitingVerify {
 		return false
 	}
@@ -240,6 +266,32 @@ func noteVerified(gvr schema.GroupVersionResource, objects int, divergences uint
 		return true
 	}
 	return false
+}
+
+// FactoryDivergenceMaxAgeSeconds (#244) returns the age in seconds of the
+// OLDEST unrepaired factory-built (!ownsInformer) divergence, or 0 when there
+// is none. It backs the store_factory_divergence_age_seconds OTLP gauge: read
+// against the cluster's watch-reconnect cadence (the apiserver
+// --min-request-timeout), a value WITHIN that window is an expected passive
+// self-heal (the reflector re-List that Replaces the indexer is imminent), a
+// value BEYOND it is a genuinely stuck divergence — the age-discriminating
+// detector for this bounded-self-stale class.
+func FactoryDivergenceMaxAgeSeconds() int64 {
+	storeVerify.mu.Lock()
+	defer storeVerify.mu.Unlock()
+	var oldest time.Time
+	for _, st := range storeVerify.gvrs {
+		if st.factoryDivergentSince.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || st.factoryDivergentSince.Before(oldest) {
+			oldest = st.factoryDivergentSince
+		}
+	}
+	if oldest.IsZero() {
+		return 0
+	}
+	return int64(time.Since(oldest).Seconds())
 }
 
 // verificationDecorated reports whether gvr's informer got the decorator. Used
