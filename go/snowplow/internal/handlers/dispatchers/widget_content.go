@@ -328,6 +328,16 @@ func populateWidgetContentL1(
 		return
 	}
 
+	// #189 / #323 — this content Put is a genuine resurrection carrier that is
+	// DEFERRED to #323 (not exempt). populateWidgetContentL1 is called by the
+	// prewarm walkers, but the keep-warm sweep (prewarm_engine_boot.go →
+	// rePrewarmKeepwarm → the shared walk) re-Puts this cell POST-readyz on the
+	// TTL×3/4 ticker, and the widget dispatcher SERVES it (widgets.go:186 Get) — so
+	// a DELETE during a keep-warm re-resolve can resurrect a served body. It is a
+	// widgetContent CONTENT cell whose interim staleness is TTL + #248-reaper
+	// bounded (same class as cluster_list / PutRAFullList), which is why it rides
+	// #323 with a keep-warm-race acceptance arm rather than #189's directly-served
+	// set. Left a plain Put here until #323 threads CaptureGen/PutIfGen.
 	// scope-waiver:TTLOverride: widgetContent-class cell — identity-free shared envelope, per-user serve-time filter (gateWidgetEnvelope). 1.12.3 A-1/R-1: it holds no per-user UAF refilter output because a refilter-touched resolve can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it) — previously this rested on isRBACSensitiveApiRefWidget's routing argument alone, which the R-1 finding showed is not a safe basis for a UAF claim (uaf_shortttl.go R-d-4 SITE MAP).
 	c.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,

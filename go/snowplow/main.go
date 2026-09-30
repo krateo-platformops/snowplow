@@ -1253,6 +1253,13 @@ func main() {
 		IdleTimeout:  30 * time.Second, // keep-alive; unchanged (#351/C2)
 	}
 
+	// #189 — self-adapt the resolved cache's generation-guard tombstone window to
+	// THIS server's write deadline (the longest an in-flight resolve can run
+	// before the connection is torn down, so the longest a captured generation
+	// must stay comparable). No new env knob: the single source is writeTimeout
+	// above (feedback_self_adapt_no_magic_env_knobs). Nil-safe when cache is off.
+	cache.ResolvedCache().SetTombstoneTTL(writeTimeout)
+
 	// Ship D (0.30.141) — architectural-consistency invariant boot
 	// assert. Verifies every /call-class route is wrapped with
 	// FallthroughScopeMiddleware. Test mode panics on missing routes;

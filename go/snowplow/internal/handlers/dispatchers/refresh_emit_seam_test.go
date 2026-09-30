@@ -207,6 +207,75 @@ func TestEmitSeam_EvictedDuringRefresh_NoSignal(t *testing.T) {
 	}
 }
 
+// TestEmitSeam_S189_RefreshRePutRacingReinsert_RefusedNoClobberNoSignal is the
+// MANDATORY #189 positive refresher-race-closure arm. It DISCRIMINATES the
+// generation guard from the old racy Get-before-Put: a real DELETE-evict AND a
+// cold RE-INSERT (fresh body at a new generation) both land DURING the
+// re-resolve. The old code's Get-before-Put would find the key ALIVE (the
+// re-inserted entry) and CLOBBER it with the refresher's stale body; the #189
+// ReplaceIfGen(gen0) sees the generation moved and REFUSES, so the fresh
+// re-inserted body survives and no signal fires. RED on the pre-#189 tree
+// (clobbered → stale), GREEN after.
+func TestEmitSeam_S189_RefreshRePutRacingReinsert_RefusedNoClobberNoSignal(t *testing.T) {
+	inputs, key := withEmitSeamHarness(t)
+	c := cache.ResolvedCache()
+	if c == nil {
+		t.Fatal("setup: resolved cache is nil with the harness gates on")
+	}
+	// Seed the entry so the refresher captures a LIVE generation (gen0) at the
+	// head of resolveAndPopulateL1, before the resolve below.
+	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(emitStaleBytes), Inputs: &inputs})
+
+	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{key: {}})
+	defer unsub()
+
+	const freshBody = `{"reinserted":"by-a-cold-request-mid-refresh"}`
+	// The resolve stub performs, DURING the re-resolve (after gen0 was captured,
+	// before the tail write): a REAL DELETE-evict, then a cold RE-INSERT of a
+	// FRESH body at the new generation. The refresher then tries to write its
+	// now-STALE body.
+	restore := setResolveOnceForTest(func(_ context.Context, in cache.ResolvedKeyInputs) ([]byte, error) {
+		c.DeleteForTest(key)             // real deleteForDep — bumps the generation
+		reinsertGen := c.CaptureGen(key) // the fresh generation post-delete
+		c.PutIfGen(key, &cache.ResolvedEntry{RawJSON: []byte(freshBody), Inputs: &in}, reinsertGen)
+		return []byte(emitStaleBytes), nil // the refresher's STALE body
+	})
+	t.Cleanup(restore)
+
+	pubBefore, _, _, _ := cache.RefreshBroadcasterCounters()
+	refusedBefore := c.Stats().PutRefusedGenerationMovedTotal
+	if err := resolveAndPopulateL1(context.Background(), inputs, nil, nil); err != nil {
+		t.Fatalf("resolveAndPopulateL1 error: %v", err)
+	}
+	pubAfter, _, _, _ := cache.RefreshBroadcasterCounters()
+
+	// EXPLICIT REFUSAL discriminator (not just no-clobber): ReplaceIfGen must have
+	// REFUSED the stale re-Put because the generation moved — the refusal counter
+	// bumps exactly once.
+	if got := c.Stats().PutRefusedGenerationMovedTotal; got != refusedBefore+1 {
+		t.Fatalf("#189 refresher race RED: the stale re-Put was NOT refused (refused_total %d->%d) — ReplaceIfGen must refuse when the generation moved during the re-resolve", refusedBefore, got)
+	}
+
+	// The fresh re-inserted body must survive — the stale refresh must NOT clobber it.
+	got, ok := c.Get(key)
+	if !ok {
+		t.Fatalf("#189 refresher race: the re-inserted entry is gone")
+	}
+	if string(got.RawJSON) != freshBody {
+		t.Fatalf("#189 refresher race RED: the refresher's stale body CLOBBERED the re-inserted fresh body "+
+			"(got %s) — ReplaceIfGen must refuse when the generation moved", got.RawJSON)
+	}
+	// A refused re-Put changed no L1 state → no signal.
+	if pubAfter != pubBefore {
+		t.Fatalf("#189 refresher race: a refused re-Put emitted a signal (delta=%d)", pubAfter-pubBefore)
+	}
+	select {
+	case <-ch:
+		t.Fatalf("#189 refresher race: a refused re-Put fired a refresh signal")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
 // TestEmitSeam_CacheOff_NoSignal — resolve_populate.go:96-99: cache off, the
 // function returns before the Put. No Put -> no signal. (Belt-and-braces to the
 // broadcaster's own cache-off unreachability test 9.5a.)

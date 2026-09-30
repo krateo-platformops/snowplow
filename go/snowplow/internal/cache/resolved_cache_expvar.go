@@ -129,5 +129,8 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		"widget_content_evict_total": int64(s.WidgetContentEvictTotal),
 		"ra_full_list_store_total":   int64(s.RAFullListStoreTotal),
 		"ra_full_list_evict_total":   int64(s.RAFullListEvictTotal),
+		// #189 write-side generation guard — refusals of a stale in-flight Put
+		// that would have resurrected a DELETE-evicted body.
+		"put_refused_generation_moved_total": int64(s.PutRefusedGenerationMovedTotal),
 	}
 }

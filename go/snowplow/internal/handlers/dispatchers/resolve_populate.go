@@ -115,6 +115,14 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 
 	key := cache.ComputeKey(inputs)
 
+	// #189 — capture the key's generation BEFORE the re-resolve. If a DELETE-
+	// eviction lands during the (possibly long) re-resolve, the tail write below
+	// is refused via PutIfGen rather than resurrecting the pre-delete body. This
+	// REPLACES the racy Get-before-Put re-check (resolve_populate.go's former
+	// alive-check — the TOCTOU the issue rejects): capture-then-guarded-write is
+	// one atomic store-lock section where Get-then-Put was two.
+	gen0 := c.CaptureGen(key)
+
 	// Ship 4a (0.30.198) — capture the prior entry's pin status so a
 	// RAFullList refresh RE-PINS rather than demoting a resident cell to
 	// transient on a dirty-mark (the prewarm-protection contract:
@@ -285,16 +293,10 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		return nil
 	}
 
-	// A refresh that lands AFTER the entry was DELETE-evicted must not
-	// resurrect it. Re-Get under the key: if it is gone, drop the fresh
-	// bytes on the floor (the eviction is authoritative).
-	if _, alive := c.Get(key); !alive {
-		log.Debug("resolveAndPopulateL1: entry evicted during refresh; not resurrecting",
-			slog.String("subsystem", "cache"),
-			slog.String("key_hash", key),
-		)
-		return nil
-	}
+	// #189 — the "was it DELETE-evicted during the refresh?" check is no longer a
+	// racy Get-before-Put here; it is folded into the atomic PutIfGen below
+	// (capturedGen = gen0), which refuses the write under the same store-lock
+	// section that would otherwise resurrect the pre-delete body.
 
 	// Ship 0.30.120 layer (b) — error-aware Put-gate. If the re-resolve
 	// observed ANY stage error (a swallowed, continueOnError'd inner-call
@@ -442,7 +444,19 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			entry.ItemsKind = kind
 		}
 	}
-	c.Put(key, entry)
+	// #189 — GENERATION-GUARDED REPLACE. A refresh only ever REPLACES a live
+	// entry; ReplaceIfGen refuses if the key was evicted (before or during the
+	// re-resolve) or moved to a newer generation, so a non-resurrecting refresh
+	// drops the fresh bytes and does NOT emit the live-refresh signal (L1 did not
+	// change). This closes the resurrection race atomically (was the racy
+	// alive-check above) AND preserves the "evicted → no signal" contract.
+	if !c.ReplaceIfGen(key, entry, gen0) {
+		log.Debug("resolveAndPopulateL1: entry evicted during refresh; not resurrecting (generation moved)",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+		)
+		return nil
+	}
 	// Ship 1 (live-refresh-coherence, option A) — emit the live-refresh
 	// signal STRICTLY post-commit, on the refresher path only. This line is
 	// reached ONLY after the Put returned and ONLY on a genuine L1 change:

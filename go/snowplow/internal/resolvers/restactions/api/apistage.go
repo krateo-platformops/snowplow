@@ -598,7 +598,11 @@ func apistageContentServe(
 		)
 	} else {
 		// MISS — dispatch UN-GATED so the stored envelope is identity-free.
-		dispatched, dispatchedOK := dispatchViaInformer(
+		// #189 — capture the content key's generation BEFORE the dispatch/resolve
+		// so the tail PutIfGen refuses (rather than resurrecting a pre-delete
+		// body) if the underlying object is DELETE-evicted during the resolve.
+		contentGen0 := store.CaptureGen(contentKey)
+		dispatched, dispatchedOK := dispatchViaInformerFn(
 			cache.WithApistageContentResolve(ctx), call)
 		if !dispatchedOK {
 			// Not pivot-servable — the content layer cannot serve it.
@@ -636,29 +640,47 @@ func apistageContentServe(
 				haveParsed = true
 			}
 		}
-		store.Put(contentKey, newEntry)
-		// Ship 0.30.212 — wire informer-event invalidation for this content
-		// entry. Without a dep edge an informer ADD/UPDATE/DELETE on the
-		// underlying objects can never dirty-mark this cell, leaving it
-		// TTL-stale-forever (F-4 defect). Symmetric with dispatcher L1
-		// dep-record at resolve.go:546-562 and widget_content.go:267
-		// recordWidgetDeps (AC-G.5 pattern). `isList` was computed above
-		// on the same `name == ""` predicate the content layer keys on.
-		// Idempotent (sync.Map.LoadOrStore) and sub-µs (two atomic.Add).
-		if isList {
-			cache.Deps().RecordList(contentKey, gvr, ns)
+		// #189 — generation-guarded write: refuse (do not resurrect a pre-delete
+		// body) if a DELETE-eviction bumped the content key's generation during
+		// the resolve. A cold fill (key absent, gen 0) still inserts. On refusal
+		// the current request STILL serves `dispatched` below (envelope / parsed
+		// are already set); only the CACHE fill + its dep-record are skipped.
+		if store.PutIfGen(contentKey, newEntry, contentGen0) {
+			// Ship 0.30.212 — wire informer-event invalidation for this content
+			// entry. Without a dep edge an informer ADD/UPDATE/DELETE on the
+			// underlying objects can never dirty-mark this cell, leaving it
+			// TTL-stale-forever (F-4 defect). Symmetric with dispatcher L1
+			// dep-record at resolve.go:546-562 and widget_content.go:267
+			// recordWidgetDeps (AC-G.5 pattern). `isList` was computed above
+			// on the same `name == ""` predicate the content layer keys on.
+			// Idempotent (sync.Map.LoadOrStore) and sub-µs (two atomic.Add).
+			// #189 — dep-Record + entryRef only on an accepted write: a refused
+			// PutIfGen stored no cell, so there is nothing to dep-track and no
+			// entry for the cohort-gate memo to attach to.
+			if isList {
+				cache.Deps().RecordList(contentKey, gvr, ns)
+			} else {
+				cache.Deps().Record(contentKey, gvr, ns, name)
+			}
+			entryRef = newEntry
+			log.Debug("apistage.content_store",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.String("ns", ns),
+				slog.String("name", name),
+				slog.Bool("preparsed", haveParsed),
+				slog.String("key_hash", contentKey),
+			)
 		} else {
-			cache.Deps().Record(contentKey, gvr, ns, name)
+			log.Debug("apistage.content_store_refused_gen_moved",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.String("ns", ns),
+				slog.String("name", name),
+				slog.String("key_hash", contentKey),
+				slog.String("effect", "#189 DELETE-eviction during resolve — not resurrecting; request still served from the fresh resolve, cache fill skipped"),
+			)
 		}
-		entryRef = newEntry
-		log.Debug("apistage.content_store",
-			slog.String("subsystem", "cache"),
-			slog.String("gvr", gvr.String()),
-			slog.String("ns", ns),
-			slog.String("name", name),
-			slog.Bool("preparsed", haveParsed),
-			slog.String("key_hash", contentKey),
-		)
 	}
 
 	// Step 3 — the per-user RBAC gate (skipped on the F2 prewarm path).
@@ -879,4 +901,3 @@ func apiserverPathFor(gvr schema.GroupVersionResource, namespace, name string) s
 	}
 	return string(b)
 }
-

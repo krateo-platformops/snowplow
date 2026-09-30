@@ -213,6 +213,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		pcs.l1Hit = "miss"
 	}
 
+	// #189 — capture the cache key's generation BEFORE the resolve below. If the
+	// RESTAction CR is DELETE-evicted during the (live-apiserver) resolve, the
+	// tail PutIfGen refuses rather than resurrecting the pre-delete body.
+	// CaptureGen is nil-safe; on a cold miss the key is absent → gen 0 → the fill
+	// still inserts.
+	cacheGen0 := cacheHandle.CaptureGen(cacheKey)
+
 	scheme := runtime.NewScheme()
 	if err := apis.AddToScheme(scheme); err != nil {
 		log.Error("unable to add apis to scheme",
@@ -450,39 +457,43 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// reaching here means the body is NOT per-requester-narrowed. HasUAF was
 		// stamped on cacheInputs there; it is read here only for the TTL override.
 		{
-			cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
+			// #189 — generation-guarded write. Refuse (do not resurrect a pre-
+			// delete body) if a DELETE-eviction bumped the key's generation during
+			// the resolve; a cold fill (key absent, gen 0) still inserts.
+			putStored := cacheHandle.PutIfGen(cacheKey, &cache.ResolvedEntry{
 				RawJSON:     encoded,
 				Inputs:      cacheInputs,
 				TTLOverride: uafTTLOverrideForEntry(cacheInputs),
-			})
-			// 0.30.8: record the self-dep so a DELETE on this RestAction
-			// CR evicts the cached entry, and an UPDATE re-resolves it.
-			// Inner-K8s-call deps (edge type 3) are NOT recorded at this
-			// tag — that would require a *RecordingDeps context threaded
-			// through resolve.go, which is deferred to a future sub-ship.
-			// TTL remains the outer safety net for changes the dep
-			// tracker cannot see.
-			//
-			// 0.30.9 Sub-scope B: ensure the informer for got.GVR is
-			// registered BEFORE recording the dep. Without this, a
-			// previously-unseen RestAction GVR would record a forward
-			// edge whose DELETE/UPDATE events the watcher never wires.
-			//
-			// 1.12.3 A-1: the dep Record + the /refreshes publish are INSIDE the
-			// non-declined branch on purpose — a declined entry has no cell, so
-			// there is nothing for a dep edge to invalidate and nothing for a
-			// subscriber to be told about (the same shape as the external-skip
-			// decline above, which also declines its Record).
-			ensureWatcherInformerForGVR(got.GVR)
-			cache.Deps().Record(cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
+			}, cacheGen0)
+			// #189 — the dep Record + the /refreshes publish run ONLY on an
+			// accepted write. A refused PutIfGen (a DELETE-eviction bumped the gen
+			// during the resolve) stored no cell, so — exactly like the declined
+			// branches above (1.12.3 A-1) — there is nothing to dep-track and
+			// nothing to announce.
+			if putStored {
+				// 0.30.8: record the self-dep so a DELETE on this RestAction
+				// CR evicts the cached entry, and an UPDATE re-resolves it.
+				// Inner-K8s-call deps (edge type 3) are NOT recorded at this
+				// tag — that would require a *RecordingDeps context threaded
+				// through resolve.go, which is deferred to a future sub-ship.
+				// TTL remains the outer safety net for changes the dep
+				// tracker cannot see.
+				//
+				// 0.30.9 Sub-scope B: ensure the informer for got.GVR is
+				// registered BEFORE recording the dep. Without this, a
+				// previously-unseen RestAction GVR would record a forward
+				// edge whose DELETE/UPDATE events the watcher never wires.
+				ensureWatcherInformerForGVR(got.GVR)
+				cache.Deps().Record(cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 
-			// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
-			// Put + dep-Record — never the stage-error / external-skip declines
-			// above). If a /refreshes connection is already armed for this key
-			// (it re-armed after a TTL-eviction, and this cold-fill replaces the
-			// evicted entry), announce the fill so the viewer's frame goes fresh
-			// now instead of waiting for the next churn. No-op when unarmed.
-			publishIfSubscribed(cacheKey)
+				// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
+				// Put + dep-Record — never the stage-error / external-skip declines
+				// above). If a /refreshes connection is already armed for this key
+				// (it re-armed after a TTL-eviction, and this cold-fill replaces the
+				// evicted entry), announce the fill so the viewer's frame goes fresh
+				// now instead of waiting for the next churn. No-op when unarmed.
+				publishIfSubscribed(cacheKey)
+			}
 		}
 	}
 

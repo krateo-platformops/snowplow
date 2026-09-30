@@ -258,6 +258,15 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 // belongs to `call.ResponseHandler` (the lambda the resolver constructs
 // that wraps jsonHandler under dictMu). The pivot only returns bytes;
 // the caller honours dictMu through the same handler.
+// dispatchViaInformerFn is the #189 TEST SEAM for the apistage content-serve MISS
+// resolve. Production is dispatchViaInformer; the apistage MISS branch calls
+// through this var so a test can inject a DELETE-eviction of the content key
+// BETWEEN CaptureGen and PutIfGen (the resurrection-race window) — the same
+// injectable-dispatch-seam idiom as dispatchers/dispatch_seams.go's
+// widgetsResolveFn. Never reassigned in production; only the apistage MISS site
+// reads it (the other dispatchViaInformer callers call the func directly).
+var dispatchViaInformerFn = dispatchViaInformer
+
 func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
 	log := xcontext.Logger(ctx)
 

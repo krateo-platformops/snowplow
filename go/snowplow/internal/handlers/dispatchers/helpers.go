@@ -628,6 +628,12 @@ func inlineParentIdentityForKey(ctx context.Context, cr map[string]any) map[stri
 type cacheHandle interface {
 	Get(key string) (*cache.ResolvedEntry, bool)
 	Put(key string, entry *cache.ResolvedEntry)
+	// #189 — generation-guarded write. CaptureGen reads the key's generation
+	// before a resolve; PutIfGen stores only if it has not moved (a DELETE-
+	// eviction during the resolve would refuse the write rather than resurrect
+	// the pre-delete body).
+	CaptureGen(key string) uint64
+	PutIfGen(key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
 }
 
 // emitResolvedCacheLookup writes the per-request falsifier line per
