@@ -686,6 +686,23 @@ var (
 	resolvedCacheOnce     sync.Once
 	resolvedCacheStarted  atomic.Bool
 
+	// #206 quiescence — the summary goroutine started by
+	// startResolvedCacheSummary is a reader of the Deps() package globals
+	// (it calls Deps().Stats() each tick) and of the resolved-cache
+	// singleton. Test resets of those globals (ResetDepsForTest and
+	// resetResolvedCacheForTest) MUST stop+JOIN it first, exactly as
+	// ResetDepsForTest already joins the dep-watcher and the dep-event
+	// worker — the OTHER Deps() readers — before it writes. These fields
+	// give the join a stop signal and something to wait on. Production
+	// never closes the channel, so the goroutine keeps the same
+	// process-lifetime contract it always had; only the test reset path
+	// stops it. Guarded by the mutex so the WaitGroup.Add at start is
+	// ordered before the Wait at stop and the channel is published
+	// race-free.
+	resolvedCacheSummaryMu   sync.Mutex
+	resolvedCacheSummaryStop chan struct{}
+	resolvedCacheSummaryWG   sync.WaitGroup
+
 	// resolvedCachePublished mirrors resolvedCacheInstance as a
 	// race-free, NON-CONSTRUCTING handle (1.12.4 §7b). Observability
 	// readers — the expvar closure and the OTLP observable callback —
@@ -2027,97 +2044,140 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 // startResolvedCacheSummary launches a single bounded goroutine that
 // emits a `resolved_cache.summary` INFO line every N seconds. The
 // goroutine self-suppresses on duplicate starts via resolvedCacheStarted.
-// We never expose a stop method: the goroutine's lifetime is the
-// process's lifetime and it does only constant work per tick.
+// In production its lifetime is the process's lifetime (the stop channel is
+// never closed) and it does only constant work per tick. A test-only join —
+// stopResolvedCacheSummaryForTest (#206) — can stop it so the test reset of
+// the Deps()/resolved-cache globals it reads each tick does not race it.
 func startResolvedCacheSummary(c *ResolvedCacheStore) {
 	if c == nil {
-		return
-	}
-	if !resolvedCacheStarted.CompareAndSwap(false, true) {
 		return
 	}
 	every := time.Duration(intFromEnv(envResolvedCacheSummaryEvery, defaultResolvedCacheSummaryEverySeconds)) * time.Second
 	if every <= 0 {
 		every = time.Duration(defaultResolvedCacheSummaryEverySeconds) * time.Second
 	}
+	// #206 — decide-and-register under the mutex the test-only stop path
+	// uses: the resolvedCacheStarted CAS, the WaitGroup.Add and the stop-
+	// channel publish are ONE atomic step vs stop's held Wait, so start can
+	// never win the CAS and then — after a full stop ran in between — launch
+	// an UNJOINED goroutine. Production never closes stop; the goroutine
+	// keeps its process-lifetime contract.
+	resolvedCacheSummaryMu.Lock()
+	if !resolvedCacheStarted.CompareAndSwap(false, true) {
+		resolvedCacheSummaryMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	resolvedCacheSummaryStop = stop
+	resolvedCacheSummaryWG.Add(1)
 	go func() {
+		defer resolvedCacheSummaryWG.Done()
 		t := time.NewTicker(every)
 		defer t.Stop()
-		for range t.C {
-			s := c.Stats()
-			d := Deps().Stats()
-			r := refresherStatsSnapshot()
-			dw := DepWatchStatsSnapshot()
-			// Falsifier shape per plan §"Code-path falsifier" (0.30.8):
-			//   resolved_cache.summary entries=N bytes=B hit_rate=0.NN
-			//   evict_lru=X evict_delete=Y refresh_enqueued=M refresh_completed=K
-			//   dep_map_size=D
-			slog.Info("resolved_cache.summary",
-				slog.String("subsystem", "cache"),
-				slog.Int("entries", s.Entries),
-				slog.Int64("bytes", s.Bytes),
-				slog.Float64("hit_rate", s.HitRate()),
-				slog.Uint64("evict_lru", s.EvictLRUTotal),
-				slog.Uint64("evict_ttl", s.EvictTTLTotal),
-				slog.Uint64("evict_max_age", s.EvictMaxAgeTotal),
-				slog.Uint64("evict_delete", s.EvictDeleteTotal),
-				slog.Uint64("refresh_enqueued", d.EnqueueUpdateTotal),
-				slog.Uint64("refresh_completed", r.completed),
-				slog.Uint64("refresh_failed", r.failed),
-				slog.Uint64("refresh_retried", r.retried),
-				slog.Uint64("refresh_dropped", r.dropped),
-				slog.Uint64("refresh_skipped_stage_error", r.skippedStageError),
-				slog.Int64("dep_map_size", d.TotalRecords),
-				slog.Uint64("dep_record_total", d.RecordTotal),
-				slog.Uint64("dep_record_dropped_cap", d.RecordDroppedCap),
-				slog.Uint64("dep_record_dropped_no_key", d.RecordDroppedNoKey),
-				slog.Uint64("dep_dirty_mark_total", d.DirtyMarkTotal),
-				slog.Uint64("dep_add_dropped_pre_sync", dw.AddDroppedPreSync),
-				slog.Uint64("dep_add_propagated", dw.AddPropagated),
-				slog.Uint64("hit_total", s.HitTotal),
-				slog.Uint64("miss_total", s.MissTotal),
-				slog.Uint64("store_total", s.StoreTotal),
-				slog.Int("max_entries", s.MaxEntries),
-				slog.Int64("max_bytes", s.MaxBytes),
-				// Ship E (0.30.116) O6 budget signal — AC-E7.
-				slog.Uint64("apistage_store_total", s.ApistageStoreTotal),
-				slog.Uint64("apistage_evict_total", s.ApistageEvictTotal),
-				slog.Float64("apistage_evict_pressure", s.ApistageEvictPressure()),
-				slog.Bool("apistage_enabled", ApistageL1Enabled()),
-				// Ship G (0.30.16x) — AC-G.1 / AC-G.12 / AC-G.14 surface.
-				slog.Uint64("widget_content_store_total", s.WidgetContentStoreTotal),
-				slog.Uint64("widget_content_evict_total", s.WidgetContentEvictTotal),
-				slog.Float64("widget_content_evict_pressure", s.WidgetContentEvictPressure()),
-				slog.Bool("widget_content_enabled", WidgetContentL1Enabled()),
-				// Ship 4a (0.30.198) — raFullList + resident-region surface
-				// (per feedback_measurement_use_expvar_not_log_tails — also
-				// in /debug/vars via the same Stats snapshot). resident_entries
-				// is the prewarm-coverage signal; resident_demote_total > 0
-				// means the resident budget overflowed or pinning is disabled.
-				slog.Uint64("ra_full_list_store_total", s.RAFullListStoreTotal),
-				slog.Uint64("ra_full_list_evict_total", s.RAFullListEvictTotal),
-				slog.Float64("ra_full_list_evict_pressure", s.RAFullListEvictPressure()),
-				slog.Int("resident_entries", s.ResidentEntries),
-				slog.Int64("resident_bytes", s.ResidentBytes),
-				slog.Int64("max_resident_bytes", s.MaxResidentBytes),
-				slog.Uint64("resident_pin_total", s.ResidentPinTotal),
-				slog.Uint64("resident_demote_total", s.ResidentDemoteTotal),
-			)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				s := c.Stats()
+				d := Deps().Stats()
+				r := refresherStatsSnapshot()
+				dw := DepWatchStatsSnapshot()
+				// Falsifier shape per plan §"Code-path falsifier" (0.30.8):
+				//   resolved_cache.summary entries=N bytes=B hit_rate=0.NN
+				//   evict_lru=X evict_delete=Y refresh_enqueued=M refresh_completed=K
+				//   dep_map_size=D
+				slog.Info("resolved_cache.summary",
+					slog.String("subsystem", "cache"),
+					slog.Int("entries", s.Entries),
+					slog.Int64("bytes", s.Bytes),
+					slog.Float64("hit_rate", s.HitRate()),
+					slog.Uint64("evict_lru", s.EvictLRUTotal),
+					slog.Uint64("evict_ttl", s.EvictTTLTotal),
+					slog.Uint64("evict_max_age", s.EvictMaxAgeTotal),
+					slog.Uint64("evict_delete", s.EvictDeleteTotal),
+					slog.Uint64("refresh_enqueued", d.EnqueueUpdateTotal),
+					slog.Uint64("refresh_completed", r.completed),
+					slog.Uint64("refresh_failed", r.failed),
+					slog.Uint64("refresh_retried", r.retried),
+					slog.Uint64("refresh_dropped", r.dropped),
+					slog.Uint64("refresh_skipped_stage_error", r.skippedStageError),
+					slog.Int64("dep_map_size", d.TotalRecords),
+					slog.Uint64("dep_record_total", d.RecordTotal),
+					slog.Uint64("dep_record_dropped_cap", d.RecordDroppedCap),
+					slog.Uint64("dep_record_dropped_no_key", d.RecordDroppedNoKey),
+					slog.Uint64("dep_dirty_mark_total", d.DirtyMarkTotal),
+					slog.Uint64("dep_add_dropped_pre_sync", dw.AddDroppedPreSync),
+					slog.Uint64("dep_add_propagated", dw.AddPropagated),
+					slog.Uint64("hit_total", s.HitTotal),
+					slog.Uint64("miss_total", s.MissTotal),
+					slog.Uint64("store_total", s.StoreTotal),
+					slog.Int("max_entries", s.MaxEntries),
+					slog.Int64("max_bytes", s.MaxBytes),
+					// Ship E (0.30.116) O6 budget signal — AC-E7.
+					slog.Uint64("apistage_store_total", s.ApistageStoreTotal),
+					slog.Uint64("apistage_evict_total", s.ApistageEvictTotal),
+					slog.Float64("apistage_evict_pressure", s.ApistageEvictPressure()),
+					slog.Bool("apistage_enabled", ApistageL1Enabled()),
+					// Ship G (0.30.16x) — AC-G.1 / AC-G.12 / AC-G.14 surface.
+					slog.Uint64("widget_content_store_total", s.WidgetContentStoreTotal),
+					slog.Uint64("widget_content_evict_total", s.WidgetContentEvictTotal),
+					slog.Float64("widget_content_evict_pressure", s.WidgetContentEvictPressure()),
+					slog.Bool("widget_content_enabled", WidgetContentL1Enabled()),
+					// Ship 4a (0.30.198) — raFullList + resident-region surface
+					// (per feedback_measurement_use_expvar_not_log_tails — also
+					// in /debug/vars via the same Stats snapshot). resident_entries
+					// is the prewarm-coverage signal; resident_demote_total > 0
+					// means the resident budget overflowed or pinning is disabled.
+					slog.Uint64("ra_full_list_store_total", s.RAFullListStoreTotal),
+					slog.Uint64("ra_full_list_evict_total", s.RAFullListEvictTotal),
+					slog.Float64("ra_full_list_evict_pressure", s.RAFullListEvictPressure()),
+					slog.Int("resident_entries", s.ResidentEntries),
+					slog.Int64("resident_bytes", s.ResidentBytes),
+					slog.Int64("max_resident_bytes", s.MaxResidentBytes),
+					slog.Uint64("resident_pin_total", s.ResidentPinTotal),
+					slog.Uint64("resident_demote_total", s.ResidentDemoteTotal),
+				)
+			}
 		}
 	}()
+	resolvedCacheSummaryMu.Unlock()
 }
 
 // resetResolvedCacheForTest tears the singleton down so each test sees
 // a clean cache. Exported only via the *_test.go shim — production
 // code MUST NOT call this.
 func resetResolvedCacheForTest() {
+	// #206 — stop + JOIN the summary goroutine before clearing the
+	// singleton, so it cannot read c.Stats()/Deps() during or after the
+	// reset (mirrors ResetDepsForTest's join-before-write ordering). Also
+	// clears resolvedCacheStarted so a subsequent ResolvedCache() — after
+	// the Once below is reset — starts a fresh summary.
+	stopResolvedCacheSummaryForTest()
 	resolvedCacheInstance = nil
 	resolvedCacheOnce = sync.Once{}
-	resolvedCacheStarted.Store(false)
 	// 1.12.4 §7b — drop the observability handle too, else a test that
 	// tears the singleton down still reports the previous store's stats
 	// through /debug/vars and OTLP.
 	resolvedCachePublished.Store(nil)
+}
+
+// stopResolvedCacheSummaryForTest stops the summary goroutine started by
+// startResolvedCacheSummary and BLOCKS until it has exited, then clears the
+// started flag so a subsequent ResolvedCache() (after the Once is reset)
+// starts a fresh one. Held under resolvedCacheSummaryMu across the Wait so a
+// concurrent start's WaitGroup.Add cannot race the Wait. Idempotent: a second
+// call finds no stop channel and waits on a zero WaitGroup. Test-only —
+// production never stops the summary (its lifetime is the process's).
+func stopResolvedCacheSummaryForTest() {
+	resolvedCacheSummaryMu.Lock()
+	defer resolvedCacheSummaryMu.Unlock()
+	if resolvedCacheSummaryStop != nil {
+		close(resolvedCacheSummaryStop)
+		resolvedCacheSummaryStop = nil
+	}
+	resolvedCacheSummaryWG.Wait()
+	resolvedCacheStarted.Store(false)
 }
 
 // ResetResolvedCacheForTest is the exported variant for cross-package
