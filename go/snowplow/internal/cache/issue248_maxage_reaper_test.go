@@ -52,12 +52,21 @@ func i248PutSuppressedOld(t *testing.T, store *ResolvedCacheStore, name string, 
 }
 
 // TestIssue248_MaxAgeReaper drives the production reap (reapPastMaxEntryAge, the
-// exact function the summary tick calls) against a real store. R2 scope:
-//   - suppressed + past maxEntryAge   → REAPED via evict_max_age (NOT evict_delete),
-//     dep edges stripped (the frozen class — RED on unfixed main: never evicted)
-//   - suppressed + YOUNG              → NOT reaped (never over-evict a within-cap cell)
-//   - NOT suppressed + past maxEntryAge → NOT reaped (a served cell hits the lazy Get
-//     evict on its own reads; reaping it here would manufacture a cold navigation)
+// exact function the summary tick calls) against a real store.
+//
+// #315 INVERTED this test's original R2 rule. The old rule was "NOT suppressed +
+// past maxEntryAge → NOT reaped (a served cell hits the lazy Get evict; reaping
+// here would manufacture a cold nav)". That rationale SILENTLY conflated
+// not-suppressed ≡ SERVED ≡ warm. A not-suppressed cell that is NEVER served
+// (never Get-read → never hits the lazy maxAge evict) is exactly the #315 hole:
+// it freezes forever. #315 splits the not-suppressed case by read-recency:
+//   - suppressed + past maxEntryAge     → REAPED (#248 frozen class), evict_max_age
+//   - suppressed + YOUNG                → NOT reaped (never over-evict within-cap)
+//   - NOT-suppressed COLD + past cap    → REAPED (#315 — never served, no future
+//     lazy Get, no cold-nav cost). THIS INVERTS the old assertion.
+//   - NOT-suppressed WARM + past cap    → NOT reaped (C3 — a warm cell IS served;
+//     evicting it manufactures the cold nav; it is kept + refreshed by #316) and
+//     counted into the warm-past-maxAge AT-RISK gauge (#315 C4).
 //   - the resident-suppressed GAUGE reads the live suppressed-resident count.
 //
 // MetadataForKey is read-only (no lazy Get evict, no LRU touch, no counter), so a
@@ -81,25 +90,44 @@ func TestIssue248_MaxAgeReaper(t *testing.T) {
 
 	gvr := gvrFlexes()
 	const ns = "krateo-system"
-	frozenKey := i248PutSuppressedOld(t, store, "frozen", 2*time.Hour, true) // suppressed + old  → reaped
+	frozenKey := i248PutSuppressedOld(t, store, "frozen", 2*time.Hour, true) // suppressed + old   → reaped (#248)
 	youngKey := i248PutSuppressedOld(t, store, "young", 1*time.Second, true) // suppressed + young → kept
-	unsupKey := i248PutSuppressedOld(t, store, "unsup", 2*time.Hour, false)  // old + NOT suppressed → kept (R2)
+	coldKey := i248PutSuppressedOld(t, store, "cold", 2*time.Hour, false)    // NOT-suppressed COLD + old → reaped (#315)
+
+	// NOT-suppressed WARM + old → KEPT (C3). Warm via SeededAtBoot; body FRESH
+	// (CreatedAt=now) so it is past the maxAge cap on the KEY (BornAt 2h) without
+	// being a #316 approaching-TTL refresh candidate — isolating the eviction axis.
+	warmInputs := widgetInputs(gvrFlexes(), ns, "warmseed")
+	warmKey := ComputeKey(*warmInputs)
+	store.Put(warmKey, &ResolvedEntry{
+		RawJSON:      []byte(`{"warm":"seed"}`),
+		Inputs:       warmInputs,
+		BornAt:       time.Now().Add(-2 * time.Hour),
+		CreatedAt:    time.Now(),
+		SeededAtBoot: true,
+	})
+	if _, ok := store.MetadataForKey(warmKey); !ok {
+		t.Fatalf("precondition: warmseed must be resident after Put")
+	}
 
 	beforeMaxAge := store.Stats().EvictMaxAgeTotal
 	beforeDelete := store.Stats().EvictDeleteTotal
 
 	reaped := store.reapPastMaxEntryAge()
 
-	// --- the frozen class is reaped ---
-	if reaped != 1 {
-		t.Fatalf("RED (#248): exactly ONE cell (suppressed+old) must be reaped, got %d — on unfixed main "+
-			"there is no read-independent reaper, so a never-read suppressed cell freezes forever (~143@19h)", reaped)
+	// --- both past-cap non-warm classes are reaped: #248 frozen + #315 cold ---
+	if reaped != 2 {
+		t.Fatalf("#248+#315: exactly TWO cells must be reaped (suppressed-frozen + cold-non-suppressed), got %d", reaped)
 	}
 	if _, ok := store.MetadataForKey(frozenKey); ok {
 		t.Fatalf("#248: the suppressed past-maxEntryAge cell must be reaped")
 	}
-	if got := store.Stats().EvictMaxAgeTotal; got != beforeMaxAge+1 {
-		t.Fatalf("#248: the reap must count on evict_max_age (Get-lazy + reaper share it); delta=%d want 1", got-beforeMaxAge)
+	if _, ok := store.MetadataForKey(coldKey); ok {
+		t.Fatalf("#315: a COLD (never-read, not-seeded) NOT-suppressed past-maxEntryAge cell must be reaped — " +
+			"this INVERTS the old R2 assertion that wrongly kept it (it is never served, so no lazy Get ever evicts it)")
+	}
+	if got := store.Stats().EvictMaxAgeTotal; got != beforeMaxAge+2 {
+		t.Fatalf("#248+#315: both reaps must count on evict_max_age (Get-lazy + reaper share it); delta=%d want 2", got-beforeMaxAge)
 	}
 	if got := store.Stats().EvictDeleteTotal; got != beforeDelete {
 		t.Fatalf("#248: the reap must NOT move evict_delete_total (the informer-DELETE H1 live discriminator); moved %d->%d", beforeDelete, got)
@@ -112,18 +140,23 @@ func TestIssue248_MaxAgeReaper(t *testing.T) {
 	if _, ok := store.MetadataForKey(youngKey); !ok {
 		t.Fatalf("#248 discriminator: a suppressed but YOUNG cell must NOT be reaped (never over-evict a within-cap cell)")
 	}
-	if _, ok := store.MetadataForKey(unsupKey); !ok {
-		t.Fatalf("#248 R2 discriminator: an old but NOT-suppressed cell must NOT be reaped (a served cell hits the lazy Get evict; reaping here would manufacture a cold nav)")
+	if _, ok := store.MetadataForKey(warmKey); !ok {
+		t.Fatalf("#315 C3 discriminator: a WARM (seeded) NOT-suppressed past-maxEntryAge cell must NOT be reaped — " +
+			"evicting a served cell manufactures a cold nav; it is kept and refreshed by #316")
 	}
 
-	// --- gauge (during-defect detector) ---
-	// A second reap walk — after `frozen` is gone — sees the steady state: `young`
-	// is still suppressed+resident (1); `unsup` is resident but NOT suppressed (0).
+	// --- gauges (during-defect detectors) ---
+	// A second reap — after `frozen` and `cold` are gone — sees the steady state:
+	// `young` is still suppressed+resident (suppressed_resident=1); `warmseed` is
+	// warm+past-cap+resident (warm_past_max_age=1) and is NEVER evicted.
 	if reaped2 := store.reapPastMaxEntryAge(); reaped2 != 0 {
-		t.Fatalf("#248: a second reap must evict nothing (young is within-cap, unsup is unsuppressed); reaped=%d", reaped2)
+		t.Fatalf("#248/#315: a second reap must evict nothing (young within-cap, warmseed is warm→C3); reaped=%d", reaped2)
 	}
 	if got := store.Stats().SuppressedResident; got != 1 {
-		t.Fatalf("#248 gauge: suppressed_resident = %d, want 1 (the young suppressed cell; the reaped one is gone, the unsuppressed one does not count)", got)
+		t.Fatalf("#248 gauge: suppressed_resident = %d, want 1 (the young suppressed cell; frozen is gone, the non-suppressed cells do not count)", got)
+	}
+	if got := store.Stats().WarmPastMaxAge; got != 1 {
+		t.Fatalf("#315 C4 gauge: warm_past_max_age = %d, want 1 (warmseed: warm + past cap, kept by C3)", got)
 	}
 }
 

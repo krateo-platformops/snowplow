@@ -637,6 +637,24 @@ type ResolvedCacheStore struct {
 	// never-yet-refreshed cells (not suppressed). A during-defect detector.
 	suppressedResidentGauge atomic.Uint64
 
+	// #315-warm C4 detector — resident WARM cells (read within TTL OR seeded)
+	// that are ALSO past maxEntryAge, recomputed on every reaper walk. A GAUGE:
+	// the AT-RISK population that #315's cold-evict deliberately does NOT reap
+	// (evicting a warm cell would manufacture a cold nav, C3) and that #316's
+	// refresh keeps fresh but does NOT re-mint under a new key. Its age-triggered
+	// re-mint is the DEFERRED C5 sibling of #258's reseed. Framed as the #261
+	// T1/T3 AT-RISK population (off-zero => a warm cell is outliving the cap
+	// without a from-scratch re-mint), NOT a confirmed-leak count.
+	warmPastMaxAgeGauge atomic.Uint64
+
+	// #316 — proactive refreshes ENQUEUED by the read-independent pass (a warm,
+	// approaching-TTL cell handed to the existing refresher). Monotonic counter,
+	// the pass's falsifier readout: non-zero DURING a missed-dirty-mark defect
+	// (the pass is catching cells the dirty-mark hook missed), zero if the pass
+	// is dead. Counts ENQUEUES (the refresher's own dedup/rate-floor collapses
+	// them into far fewer re-resolves — completed_total).
+	proactiveRefreshTotal atomic.Uint64
+
 	// #189 generation-guarded Put. Each key carries a generation (lruItem.gen);
 	// every removal funnel (removeElementLocked + deleteForDep) bumps it into a
 	// tombstone here, so PutIfGen refuses a stale in-flight write carrying a
@@ -787,6 +805,28 @@ type lruItem struct {
 	// in-flight Put carrying a pre-removal generation is refused. Written
 	// wherever entry is (both putCoreLocked branches). Guarded by c.mu.
 	gen uint64
+
+	// #315/#316 — the per-RESIDENCY read-recency stamp: the wall-clock time of
+	// the last Get HIT on this key. It is the WARM/COLD discriminator the two
+	// read-independent passes need and neither BornAt (key lifetime) nor
+	// CreatedAt (body age) supplies: a cell can be within both bounds yet never
+	// SERVED (a boot-seed the frontend never navigated to), or past a bound yet
+	// hot. WARM = (lastRead within the store TTL) OR entry.SeededAtBoot; COLD =
+	// neither. #315 evicts COLD past-maxEntryAge cells (no future lazy Get to
+	// evict them, so no cold-nav cost); a WARM one is NEVER evicted (C3) and is
+	// refreshed by #316 instead.
+	//
+	// WHY lruItem, NOT ResolvedEntry — the SAME structural argument as
+	// extrasHash above: Get hands *ResolvedEntry out to callers, so a mutable
+	// field there would be read OUTSIDE c.mu; an lruItem is never handed out, so
+	// the lock discipline (written on the Get-HIT path, read in metaForItemLocked,
+	// both under c.mu) holds by construction rather than by test coverage. It
+	// also rides putCoreLocked's replace-in-place for free: a refresh re-Put
+	// REUSES the lruItem, so a refreshed warm cell stays warm with no explicit
+	// inherit (unlike BornAt, which is copied entry→entry at :1442). Zero when
+	// never read; a boot-seed carries warmth via SeededAtBoot until real traffic
+	// stamps a read here. Covered under -race by the reaper/walk concurrency arm.
+	lastRead time.Time
 }
 
 var (
@@ -1166,12 +1206,16 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 		return nil, false
 	}
 	item := el.Value.(*lruItem)
+	// #315/#316 — one time reference for both bound checks AND the lastRead
+	// stamp below, so the read-recency signal is exactly the instant the two
+	// lazy bounds are evaluated against (no second time.Now, no new lock).
+	now := time.Now()
 	// R1 Layer 2 (#36): a per-entry TTLOverride (the short
 	// CATALOG_UNSERVABLE_TTL_SECONDS set on entries stored while their GVR
 	// was not servable) takes precedence over the store's standard ttl, so a
 	// degraded catalog entry self-evicts within the bound. Zero override =
 	// the standard ttl (every healthy entry).
-	if eff := c.effectiveTTLLocked(item.entry); eff > 0 && time.Since(item.entry.CreatedAt) > eff {
+	if eff := c.effectiveTTLLocked(item.entry); eff > 0 && now.Sub(item.entry.CreatedAt) > eff {
 		c.removeElementLocked(el)
 		c.evictTTLTotal.Add(1)
 		c.missTotal.Add(1)
@@ -1184,14 +1228,17 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 	// often the refresher re-Puts it — outlives the max age without a
 	// from-scratch resolve. Counted separately from TTL so the two reasons
 	// for leaving stay distinguishable.
-	if c.maxEntryAge > 0 && !item.entry.BornAt.IsZero() && time.Since(item.entry.BornAt) > c.maxEntryAge {
+	if c.maxEntryAge > 0 && !item.entry.BornAt.IsZero() && now.Sub(item.entry.BornAt) > c.maxEntryAge {
 		c.removeElementLocked(el)
 		c.evictMaxAgeTotal.Add(1)
 		c.missTotal.Add(1)
 		return nil, false
 	}
-	// LRU touch: move to front.
+	// LRU touch: move to front, and stamp the read-recency (#315/#316). This is
+	// a HIT — a customer served this cell — so it is warm as of `now`. Written
+	// under c.mu; read only in metaForItemLocked under the same lock.
 	c.order.MoveToFront(el)
+	item.lastRead = now
 	c.hitTotal.Add(1)
 	return item.entry, true
 }
@@ -1465,6 +1512,18 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 	}
 
 	item := &lruItem{key: key, entry: entry, bytes: bytes, extrasHash: extrasHash, gen: gen}
+	// #315/#316 — read-recency on a FRESH insert. A non-seeded insert is a
+	// customer COLD-FILL (Get-MISS → populate → serve): the customer DID read it,
+	// but via a MISS, so without this a cold-filled cell would carry lastRead=zero
+	// (COLD) until its SECOND read — a one-read-lag that would let the pass skip
+	// refreshing a genuinely-used cell and cold-nav it at TTL. Stamp it warm now
+	// (CreatedAt == the fill instant, set by putPreamble). A boot-seed insert
+	// (SeededAtBoot) leaves lastRead zero and rides the seed warmth signal until
+	// real traffic stamps a Get-HIT. A refresh re-Put takes the replace-in-place
+	// branch above and INHERITS lastRead, so it never reaches here.
+	if !entry.SeededAtBoot {
+		item.lastRead = entry.CreatedAt
+	}
 	el := c.order.PushFront(item)
 	c.index[key] = el
 	if entry.Pinned {
@@ -1616,6 +1675,17 @@ type ResolvedCacheStats struct {
 	// never-yet-refreshed cells.
 	SuppressedResident uint64
 
+	// #315 C4 — resident WARM cells past maxEntryAge, un-re-minted (see
+	// warmPastMaxAgeGauge). AT-RISK population the cold-evict deliberately keeps
+	// (C3) and #316 keeps body-fresh; off-zero => warm cells outliving the cap
+	// without a from-scratch re-mint (re-mint deferred to C5/#258).
+	WarmPastMaxAge uint64
+
+	// #316 — proactive refreshes enqueued by the read-independent pass (see
+	// proactiveRefreshTotal). Monotonic; non-zero DURING a missed-dirty-mark
+	// defect the pass is catching, zero if the pass is dead.
+	ProactiveRefreshTotal uint64
+
 	// Ship E (0.30.116) api-stage counters.
 	ApistageStoreTotal uint64
 	ApistageEvictTotal uint64
@@ -1676,6 +1746,8 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		EvictMaxAgeTotal:        c.evictMaxAgeTotal.Load(),
 		EvictDeleteTotal:        c.evictDeleteTotal.Load(),
 		SuppressedResident:      c.suppressedResidentGauge.Load(),
+		WarmPastMaxAge:          c.warmPastMaxAgeGauge.Load(),
+		ProactiveRefreshTotal:   c.proactiveRefreshTotal.Load(),
 		ApistageStoreTotal:      c.apistageStoreTotal.Load(),
 		ApistageEvictTotal:      c.apistageEvictTotal.Load(),
 		WidgetContentStoreTotal: c.widgetContentStoreTotal.Load(),
@@ -1775,6 +1847,19 @@ type ResolvedEntryMeta struct {
 	// 0 when BornAt is unset (an entry Put before the field existed).
 	LifetimeSeconds int64 `json:"lifetimeSeconds"`
 	Pinned          bool  `json:"pinned"`
+	// LastReadSeconds is now − the last Get-HIT on this cell (#315/#316), in
+	// seconds. -1 means NEVER read since it was Put (a boot-seed or a
+	// cold-filled cell no request has hit yet). It is the read-recency signal
+	// the two read-independent passes use to tell a WARM (served) cell from a
+	// COLD (resident-but-unserved) one — a distinction neither AgeSeconds
+	// (body) nor LifetimeSeconds (key) can make. WARM = (LastReadSeconds in
+	// [0, TTL)) OR SeededAtBoot.
+	LastReadSeconds int64 `json:"lastReadSeconds"`
+	// SeededAtBoot mirrors entry.SeededAtBoot: a cell the Phase-1 boot seed /
+	// keep-warm sweep put into the working set. Such a cell is WARM even before
+	// any real traffic reads it (LastReadSeconds == -1) — the prewarm-follows-
+	// frontend contract — so the passes must not treat a never-read seed as cold.
+	SeededAtBoot bool `json:"seededAtBoot"`
 	// ItemsCount is the LENGTH of the pre-parsed LIST envelope (0 when not a
 	// parsed-list apistage entry). A count only — never the items themselves.
 	ItemsCount int `json:"itemsCount"`
@@ -2003,6 +2088,19 @@ func lifetimeSecondsOf(entry *ResolvedEntry, now time.Time) int64 {
 	return int64(now.Sub(entry.BornAt).Seconds())
 }
 
+// lastReadSecondsOf is now − the item's last Get-HIT in whole seconds, or -1
+// when the cell has NEVER been read (a zero lastRead: a boot-seed or a
+// cold-filled cell no request has hit yet). -1, not 0, so "read this instant"
+// (0s) and "never read" are distinct — the WARM/COLD passes treat never-read as
+// not-lastRead-warm (warmth then rests on SeededAtBoot alone). Reads item under
+// the caller's c.mu, the same discipline as lastRead's write in Get.
+func lastReadSecondsOf(item *lruItem, now time.Time) int64 {
+	if item == nil || item.lastRead.IsZero() {
+		return -1
+	}
+	return int64(now.Sub(item.lastRead).Seconds())
+}
+
 // metaForItemLocked builds the metadata projection of one LRU item. Caller
 // holds c.mu. Reads RawJSON / Items / Inputs ONLY for scalar projections —
 // never copies a body, an item, or the extras map into the value.
@@ -2016,6 +2114,8 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 		// than the epoch.
 		LifetimeSeconds: lifetimeSecondsOf(entry, now),
 		Pinned:          entry.Pinned,
+		LastReadSeconds: lastReadSecondsOf(item, now),
+		SeededAtBoot:    entry.SeededAtBoot,
 		ItemsCount:      len(entry.Items),
 		RawJSONBytes:    len(entry.RawJSON),
 	}
@@ -2411,53 +2511,151 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 // mirroring the /debug/reconcile full walk (reconcileFullBatch).
 const reapMaxAgeBatch = 512
 
-// reapPastMaxEntryAge is the #248 read-independent maxEntryAge reaper. It closes
-// the lazy-enforcement hole: both TTL (CreatedAt, Get:~1045) and maxEntryAge
-// (BornAt, Get:~1058) are enforced ONLY inside Get, so a cell that is
-// refresh-SUPPRESSED (the refresher skips it) AND never read is evicted by neither
-// and lives forever — the ~143 UAF-decline-frozen `widgets` cells at ~19h.
+// proactiveRefreshDisabledForTest gates the #316 proactive-refresh enqueue for the
+// C1 amplification A/B bench ONLY. Default false = ENABLED, so production and every
+// non-bench path run the pass exactly as designed (self-adapting, no knob) — there
+// is NO production reader that turns it off. SetProactiveRefreshEnabledForTest flips
+// it so the in-process C1 harness can measure the SAME build with the pass ON
+// (proactive-on arm) vs OFF (baseline arm), isolating the pass's amplification from
+// the #315 reaper changes a cross-build baseline would confound. #315 cold-evict and
+// #248 suppressed-reap are UNAFFECTED (this gates ONLY the refresh-enqueue branch).
+var proactiveRefreshDisabledForTest atomic.Bool
+
+// Its ONLY writer, SetProactiveRefreshEnabledForTest, is defined in a _test.go file
+// (issue316_toggle_bench_test.go) and is therefore NEVER compiled into the production
+// binary — arch-1217's build discipline: the flag can only be flipped under `go test`,
+// so the pass can never be turned off in prod (the production gate below reads a var
+// that in a real process only ever holds its enabled default).
+
+// reapPastMaxEntryAge is the read-independent maintenance pass that closes the
+// two lazy-enforcement holes (#248 / #315 / #316) in ONE full walk. Both TTL
+// (CreatedAt) and maxEntryAge (BornAt) are enforced ONLY inside Get, so a cell
+// that is never READ is touched by neither lazy path. The pass makes three
+// read-independent decisions per resident cell, using the WARM/COLD discriminator
+// (WARM = read within the store TTL OR SeededAtBoot; COLD = neither):
 //
-// SCOPE (R2, per the #248 design steer): evict entries that are BOTH suppressed
-// AND past maxEntryAge — precisely the frozen class. A non-suppressed cell is left
-// to the lazy Get path (it is served, so it hits the lazy maxEntryAge evict on its
-// own reads); reaping it here would manufacture a cold navigation. Post-reap the
-// frozen UAF cell is served LIVE (fresh, uncached) on its next read instead of
-// frozen-stale, so this strictly IMPROVES freshness for the class.
+//   - #248 SUPPRESSED + past maxEntryAge → REAP (the UAF-decline-frozen class;
+//     the refresher permanently skips it, so it is never re-Put and never read →
+//     evicted by neither lazy path). Served LIVE (fresh) on its next read.
+//   - #315 COLD (non-suppressed, unserved) + past maxEntryAge → REAP. There is no
+//     future lazy Get to evict it (it is never read) and no cold-nav cost to
+//     reaping it (it is not in the working set) — the general non-suppressed hole
+//     the #248 R2 scope deliberately left open. This INVERTS the old R2 rule
+//     "non-suppressed past-cap is left to lazy Get": that reasoning silently
+//     assumed non-suppressed ⇒ SERVED; a cold non-suppressed cell is never served,
+//     so lazy Get never fires.
+//   - #316 WARM (served/seeded) + approaching TTL (TTLRemaining < TTL/4, i.e. past
+//     ~3/4 of the body's life) → ENQUEUE a proactive refresh into the EXISTING
+//     refresher (inherits its customer-priority yield, gen-guarded ReplaceIfGen,
+//     backoff and dedup). Keeps the working set FRESH without a cold nav — the
+//     read-independent backstop for a MISSED dirty-mark (fresh indexer, enqueue
+//     missed; a STALE indexer is #244, and the refresher's own re-resolve reads
+//     stale there too — this pass cannot manufacture freshness from a stale
+//     source). Refresh resets CreatedAt, so a refreshed cell re-qualifies only
+//     ~3/4-TTL later: the ~TTL×3/4 refresh interval is EMERGENT, not a timer.
 //
-// It also recomputes the resident-suppressed gauge over the full walk (the
-// during-defect detector). Runs once per startResolvedCacheSummary tick. Returns
-// the number of entries reaped this pass.
+// C3 — a WARM cell past maxEntryAge is NEVER reaped (that would manufacture a cold
+// nav); it is counted into warmPastMaxAgeGauge (the AT-RISK detector) and, if
+// approaching TTL, kept body-fresh by the #316 refresh. Its age-triggered key
+// RE-MINT is the deferred C5 sibling of #258.
 //
-// A FULL walk (not sampled like the C3 reconcile): a hard bound at maxEntryAge
-// requires every past-cap cell reaped, which a probabilistic sample would not give.
-// Candidate keys are collected under the per-batch hold and evicted AFTER the walk,
-// because the per-key evict takes c.mu itself and must not nest inside the walk.
+// SCOPE DISCIPLINE (feedback: customer-over-refresher, refresher-populate-
+// amplification 0.30.185): refresh is scoped to the WARM working set only, NEVER
+// refresh-everything. A COLD or suppressed cell is never enqueued.
+//
+// The gauges (suppressed-resident #248, warm-past-maxAge #315 C4) are recomputed
+// over the full walk. Runs once per startResolvedCacheSummary tick. Returns the
+// number of entries REAPED this pass (#248 + #315); refreshes enqueued are counted
+// in proactiveRefreshTotal.
+//
+// A FULL walk (not sampled): a hard bound at maxEntryAge requires every past-cap
+// cell reaped, which a probabilistic sample would not give. Candidate keys are
+// collected under the per-batch hold and acted on AFTER the walk, because the
+// per-key evict / enqueue takes c.mu (or the refresher) itself and must not nest
+// inside the walk hold.
 func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	if c == nil {
 		return 0
 	}
 	maxAgeSec := int64(c.maxEntryAge.Seconds())
+	ttlSec := int64(c.ttl.Seconds())
+	refreshBelow := ttlSec / 4 // enqueue a warm cell once past ~3/4 of its TTL
 	suppressedResident := 0
-	var candidates []string
+	warmPastMaxAge := 0
+	var suppressedCandidates, coldCandidates, refreshCandidates []string
 	c.RangeMetadataBatched(reapMaxAgeBatch, func(metas []ResolvedEntryMeta, _ time.Duration) bool {
 		for i := range metas {
 			m := metas[i]
-			if _, suppressed := RefreshSuppressedReason(m.KeyHash); suppressed {
+			// WARM = seeded OR read within the store TTL. The lastRead branch is
+			// LOAD-BEARING even for PAST-maxAge cells — do NOT reduce it to
+			// SeededAtBoot-only here. It is tempting to think a past-maxAge cell can
+			// only be warm via seed (Get evicts a past-maxAge cell before it could
+			// stamp a fresh lastRead), but that is FALSE: a cell Get-read at, say,
+			// maxAge−400s stamps lastRead THEN (while still within the cap), is not
+			// read again, and crosses maxAge carrying that lastRead — which stays
+			// within TTL for the whole [crossing, crossing+TTL] window (~one TTL,
+			// e.g. ~53min at TTL=3600). That is a COMMON production state, not a
+			// knife-edge. Counting such a cell warm is what keeps C3 from cold-
+			// evicting a genuinely-served cell and keeps the C4 gauge honest;
+			// TestIssue315_LastReadWarmPastMaxAge_NotEvicted exercises this exact path.
+			warm := m.SeededAtBoot || (m.LastReadSeconds >= 0 && ttlSec > 0 && m.LastReadSeconds < ttlSec)
+			_, suppressed := RefreshSuppressedReason(m.KeyHash)
+			pastMaxAge := maxAgeSec > 0 && m.LifetimeSeconds > maxAgeSec
+			switch {
+			case suppressed:
 				suppressedResident++
-				if maxAgeSec > 0 && m.LifetimeSeconds > maxAgeSec {
-					candidates = append(candidates, m.KeyHash)
+				if pastMaxAge {
+					suppressedCandidates = append(suppressedCandidates, m.KeyHash) // #248
 				}
+				// A suppressed cell is never a refresh candidate: the refresher
+				// skips it by construction, so enqueuing it would be a no-op churn.
+			case pastMaxAge && !warm:
+				coldCandidates = append(coldCandidates, m.KeyHash) // #315 cold-evict
+			case pastMaxAge && warm:
+				warmPastMaxAge++ // #315 C4 — kept (C3), re-mint deferred
+			}
+			// #316 — proactive refresh, orthogonal to the maxAge axis: any WARM,
+			// non-suppressed cell (within OR past maxAge) whose body is approaching
+			// TTL is enqueued. A cold-evict candidate is !warm, so it is never also
+			// a refresh candidate.
+			//
+			// EXCLUDE TTLOverride cells (arch-1217): a per-entry TTLOverride>0 is a
+			// DELIBERATE short bounded-staleness stopgap (UAF #118-d, degraded #36
+			// R1-L2 catalog). Proactively refreshing it resets CreatedAt and extends
+			// its life, undermining that stopgap — so leave it to its own short
+			// effective-TTL expiry. This also keeps the 300s-tick vs TTL/4 sampling
+			// valid: the standard TTL (3600s) gives a ~900s window sampled ~3× per
+			// tick, while the short-TTL cells the tick could UNDER-sample are excluded.
+			// m.TTLRemainingSeconds is already the EFFECTIVE-TTL remaining
+			// (metaForItemLocked uses effectiveTTLLocked); for the non-override cells
+			// that remain, effective == standard, so refreshBelow (standard TTL/4) is
+			// the right threshold.
+			if warm && !suppressed && m.TTLOverrideSeconds == 0 && ttlSec > 0 && m.TTLRemainingSeconds < refreshBelow && !proactiveRefreshDisabledForTest.Load() {
+				refreshCandidates = append(refreshCandidates, m.KeyHash)
 			}
 		}
 		return true // FULL walk
 	})
 	c.suppressedResidentGauge.Store(uint64(suppressedResident))
+	c.warmPastMaxAgeGauge.Store(uint64(warmPastMaxAge))
 
 	reaped := 0
-	for _, key := range candidates {
+	for _, key := range suppressedCandidates {
 		if c.reapOneMaxAgeSuppressed(key) {
 			reaped++
 		}
+	}
+	for _, key := range coldCandidates {
+		if c.reapOneMaxAgeCold(key) {
+			reaped++
+		}
+	}
+	for _, key := range refreshCandidates {
+		// EnqueueRefresh is idempotent, non-blocking and deduped; the refresher's
+		// ReplaceIfGen re-validates residency+generation, so no under-lock recheck
+		// is needed here. Count the pass's INTENT; the refresher collapses dups.
+		EnqueueRefresh(key)
+		c.proactiveRefreshTotal.Add(1)
 	}
 	return reaped
 }
@@ -2486,6 +2684,47 @@ func (c *ResolvedCacheStore) reapOneMaxAgeSuppressed(key string) bool {
 	item := el.Value.(*lruItem)
 	if item.entry == nil || item.entry.BornAt.IsZero() || time.Since(item.entry.BornAt) <= c.maxEntryAge {
 		return false // read/re-validated young — never over-evict a within-cap cell
+	}
+	c.removeElementLocked(el)
+	c.evictMaxAgeTotal.Add(1)
+	return true
+}
+
+// reapOneMaxAgeCold is the #315 sibling of reapOneMaxAgeSuppressed: it evicts a
+// COLD, NON-suppressed cell that is still past maxEntryAge, through the SAME
+// evict_max_age internal (removeElementLocked + evictMaxAgeTotal, NOT
+// deleteForDep — the informer-DELETE discriminator a reaper must never move).
+//
+// It RE-VALIDATES the WARM/COLD verdict under c.mu, which is the C3 guarantee:
+// between the walk (that classified this key cold) and now, a customer Get may
+// have HIT the cell and stamped lastRead=now — making it WARM. Evicting it then
+// would manufacture the exact cold navigation #315 exists to avoid. So a cell
+// that is seeded, or read within the store TTL, is SPARED here. It also re-checks
+// suppression (a decline since the walk moves it to the #248 path) and the age
+// bound (a re-Put may have refreshed the body, though BornAt is inherited so the
+// key age rarely drops — belt-and-suspenders, mirroring the suppressed sibling).
+func (c *ResolvedCacheStore) reapOneMaxAgeCold(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.maxEntryAge <= 0 {
+		return false
+	}
+	el, ok := c.index[key]
+	if !ok {
+		return false
+	}
+	if _, suppressed := RefreshSuppressedReason(key); suppressed {
+		return false // became suppressed since the walk — the #248 path owns it next tick
+	}
+	item := el.Value.(*lruItem)
+	if item.entry == nil || item.entry.BornAt.IsZero() || time.Since(item.entry.BornAt) <= c.maxEntryAge {
+		return false // young / re-validated within cap
+	}
+	// C3 re-validation: a Get between the walk and now stamps lastRead=now → warm.
+	now := time.Now()
+	warm := item.entry.SeededAtBoot || (!item.lastRead.IsZero() && c.ttl > 0 && now.Sub(item.lastRead) < c.ttl)
+	if warm {
+		return false // served/seeded since the walk — NEVER evict a warm cell (C3)
 	}
 	c.removeElementLocked(el)
 	c.evictMaxAgeTotal.Add(1)
