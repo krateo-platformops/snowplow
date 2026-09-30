@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
@@ -12,6 +13,11 @@ type debugReconcileBody struct {
 	// CacheEnabled is false when the resolved cache is off or no watcher is
 	// installed; the audit then has nothing to walk and every count is 0.
 	CacheEnabled bool `json:"cacheEnabled"`
+	// DryRun echoes cache.ReconcileReport.DryRun (#238): true when this body was
+	// produced by ?dryRun=1 (the divergent set was REPORTED, not evicted).
+	// Always present (no omitempty) so a saved reconcile.json states its mode in
+	// BOTH modes and can be trusted afterwards as a pre-repair observation.
+	DryRun bool `json:"dryRun"`
 	// Sampled / Probed / Divergent / Unknown / SkippedNoEdge mirror
 	// cache.ReconcileReport.
 	Sampled   int `json:"sampled"`
@@ -38,10 +44,21 @@ type debugReconcileBody struct {
 // hands every ABSENT coordinate to the dep-event worker — the same path an
 // informer DELETE takes — then reports the divergent set.
 //
-// NOT A DRY RUN: divergent entries are evicted by the worker after this
-// returns. That is the point (an operator who suspects a stranded entry
-// wants it gone), and the reason the route sits behind the debug JWT gate
-// with its siblings rather than being anonymous.
+// DEFAULT IS A RECONCILE, NOT A DRY RUN: without ?dryRun, divergent entries are
+// evicted by the worker after this returns. That is the point (an operator who
+// suspects a stranded entry wants it gone), and the reason the route sits
+// behind the debug JWT gate with its siblings rather than being anonymous.
+//
+// ?dryRun=1 (#238) REPORTS the divergent set WITHOUT evicting it and WITHOUT
+// moving any reconcile counter — observe-before-repair. The #237 need: the
+// informer store and the L1 layer produce byte-identical /call output, so the
+// only way to tell "store stale" from "cell stale" is to look BEFORE anything
+// repairs, and every other lever (an annotation poke firing a watch UPDATE)
+// repairs the store as it clears the cache. The response echoes the mode in
+// "dryRun" so a captured reconcile.json is self-describing. `dryRun` is parsed
+// with strconv.ParseBool: absent → the reconcile default (unchanged);
+// present-but-unparseable → 400 (never silently fall to the DESTRUCTIVE
+// default).
 //
 // COST: the full walk is CHUNKED (cache.RangeMetadataBatched): the store
 // mutex is held once for a key snapshot and then per batch of 512 entries,
@@ -56,16 +73,31 @@ type debugReconcileBody struct {
 // RBAC-sensitive; this surface cannot carry it.
 //
 // @Summary Full resolved-cache reconcile audit
-// @Description Walks every resident resolved-output cache entry, probes its own object against the informer indexer and evicts (via the dep-event worker) those whose object is absent. Returns the divergent set as metadata only. Never returns resolved bodies.
+// @Description Walks every resident resolved-output cache entry, probes its own object against the informer indexer and evicts (via the dep-event worker) those whose object is absent. Returns the divergent set as metadata only. Never returns resolved bodies. With dryRun=1 the divergent set is reported WITHOUT eviction (observe-before-repair, #238); the response echoes the mode in the dryRun field.
 // @ID debug-reconcile
 // @Produce  json
+// @Param dryRun query bool false "report the divergent set without evicting it (observe-before-repair)"
 // @Success 200 {object} debugReconcileBody
+// @Failure 400 {string} string "unparseable dryRun"
 // @Router /debug/reconcile [get]
 func DebugReconcile() http.HandlerFunc {
 	return func(wri http.ResponseWriter, req *http.Request) {
-		rep, ok := cache.ReconcileFull()
+		// ?dryRun: absent → false (reconcile, today's default); present but
+		// unparseable → 400, never a silent fall to the DESTRUCTIVE default.
+		dryRun := false
+		if q := req.URL.Query(); q.Has("dryRun") {
+			v, err := strconv.ParseBool(q.Get("dryRun"))
+			if err != nil {
+				http.Error(wri, "dryRun must be a boolean (1/true/0/false)", http.StatusBadRequest)
+				return
+			}
+			dryRun = v
+		}
+
+		rep, ok := cache.ReconcileFullDryRun(dryRun)
 		body := debugReconcileBody{
 			CacheEnabled:       ok,
+			DryRun:             rep.DryRun,
 			Sampled:            rep.Sampled,
 			Probed:             rep.Probed,
 			Divergent:          rep.Divergent,
