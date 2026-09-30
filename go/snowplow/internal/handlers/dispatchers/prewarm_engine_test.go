@@ -455,6 +455,23 @@ func TestEngineWorker_PendingDepthDrainsToZero(t *testing.T) {
 	e.yieldPoll = 2 * time.Millisecond
 	e.scopeHandler = func(ctx context.Context, s prewarmScope) error { return nil }
 
+	// Deterministic drain signal (#328). The worker fires scopeDone once per
+	// scope, AFTER processedTotal++ and after the queue.Get that decrements
+	// pending depth (prewarm_engine.go:692/747), so awaiting one scopeDone per
+	// enqueued scope proves the drain is COMPLETE — no wall-clock deadline on
+	// the async drain. The old 2s time.After poll asserted a wall-clock bound
+	// on that async work and flaked on a loaded/-race runner even when the
+	// worker drained correctly (the reported #328 flake). Buffered +
+	// non-blocking send so an unexpected extra scopeDone can never block the
+	// worker on a full channel.
+	processed := make(chan struct{}, 8)
+	e.scopeDone = func(_ prewarmScope, _ error) {
+		select {
+		case processed <- struct{}{}:
+		default:
+		}
+	}
+
 	processCtx, processCancel := context.WithCancel(context.Background())
 	defer processCancel()
 	go e.runWorker(processCtx)
@@ -471,22 +488,27 @@ func TestEngineWorker_PendingDepthDrainsToZero(t *testing.T) {
 		})
 	}
 
-	// Wait for the worker to drain. Poll pending depth.
-	deadline := time.After(2 * time.Second)
-	for {
-		depth := e.pendingLenForTest()
-		if depth == 0 {
-			break
-		}
+	// Await one scopeDone per enqueued scope — the deterministic drain
+	// completion. The timeout is a GENEROUS BACKSTOP for a genuinely-stuck
+	// worker (a dead worker never fires scopeDone), NOT the pass/fail
+	// discriminator: it sits far above any real drain (~ms) so it never
+	// false-flakes under load, and the signal — not the clock — decides.
+	const drainBackstop = 30 * time.Second
+	for i := 0; i < 3; i++ {
 		select {
-		case <-deadline:
-			t.Fatalf("pending_depth did not drain to 0 within 2s "+
-				"(current depth=%d, processed=%d) — worker stuck",
-				depth, e.processedTotal.Load())
-		case <-time.After(5 * time.Millisecond):
+		case <-processed:
+		case <-time.After(drainBackstop):
+			t.Fatalf("pending_depth did not drain: worker stuck after %d/3 scopes "+
+				"(depth=%d, processed=%d) — a live worker fires scopeDone per scope",
+				i, e.pendingLenForTest(), e.processedTotal.Load())
 		}
 	}
 
+	// After all 3 scopes are processed the pending depth (the PM Change #1
+	// expvar signal) and the processed counter are both settled — no poll.
+	if depth := e.pendingLenForTest(); depth != 0 {
+		t.Fatalf("pending_depth=%d after all 3 scopes processed, want 0 — drain incomplete", depth)
+	}
 	if e.processedTotal.Load() != 3 {
 		t.Fatalf("processedTotal=%d, want 3 (all 3 distinct GVRs processed)",
 			e.processedTotal.Load())
