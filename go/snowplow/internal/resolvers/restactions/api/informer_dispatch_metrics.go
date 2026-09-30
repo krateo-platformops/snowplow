@@ -157,6 +157,18 @@ func stopDispatchSummaryForTest() {
 	dispatchSummaryOnce = sync.Once{}
 }
 
+// ResetDispatchSummaryForTest is the EXPORTED variant of
+// stopDispatchSummaryForTest, for cross-package tests (internal/handlers/
+// dispatchers) that capture the default slog logger: it stops + joins the
+// summary goroutine so its 60s-default ticker cannot write into a test's
+// captured buffer concurrently with the test's read (#221 — the leaked-
+// goroutine-vs-log-capture race). Idempotent and restart-capable (the Once is
+// reset), so a later dispatch relaunches the summary. Production MUST NOT call
+// it (the goroutine's lifetime is the process's).
+func ResetDispatchSummaryForTest() {
+	stopDispatchSummaryForTest()
+}
+
 // dispatchSummaryEverySeconds resolves the summary interval from the env
 // knob, falling back to the default on unset / non-int / non-positive.
 func dispatchSummaryEverySeconds() int {

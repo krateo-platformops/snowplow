@@ -27,7 +27,6 @@
 package dispatchers
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -146,11 +145,7 @@ func TestPhase1PIPSeedKey_RootWidgetUsesDispatcherDefaultTuple(t *testing.T) {
 // fails this test. RED against the pre-emit engine: seedScopeYielding returned
 // ctx.Err() with NO greppable abort line → the assertions below cannot hold.
 func TestSeedScopeYielding_CtxCancelEmitsAbortLog(t *testing.T) {
-	var buf bytes.Buffer
-	h := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
-	prevDefault := slog.Default()
-	slog.SetDefault(slog.New(h))
-	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+	buf := captureDefaultSlogForTest(t, slog.LevelInfo)
 
 	// Pre-cancelled ctx — seedScopeYielding hits ctx.Err() != nil on the first
 	// restactions-loop iteration, emits the abort, and returns.

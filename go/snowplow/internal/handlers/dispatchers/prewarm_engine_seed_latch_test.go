@@ -41,7 +41,6 @@
 package dispatchers
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -168,11 +167,7 @@ func runSeedScopeYielding(t *testing.T,
 	zeroCustomerInFlight()
 
 	// Capture logs for level/event assertions.
-	var buf bytes.Buffer
-	h := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
-	prevDefault := slog.Default()
-	slog.SetDefault(slog.New(h))
-	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+	buf := captureDefaultSlogForTest(t, slog.LevelInfo)
 
 	prevEnum := enumeratePrewarmTargetsForGVRFn
 	enumeratePrewarmTargetsForGVRFn = enumFn
@@ -485,6 +480,6 @@ func TestSeedScopeYielding_TwoInvocations_QueueCoalescesToOnePending(t *testing.
 // production functions expose (so a signature drift breaks the build here,
 // not silently at the swap site).
 var (
-	_ func(schema.GroupVersionResource, string) []cache.PrewarmTarget = cache.EnumeratePrewarmTargetsForGVR
-	_ func(context.Context, navWidgetEntry, string, seedScopeMode) error       = seedOneWidget
+	_ func(schema.GroupVersionResource, string) []cache.PrewarmTarget    = cache.EnumeratePrewarmTargetsForGVR
+	_ func(context.Context, navWidgetEntry, string, seedScopeMode) error = seedOneWidget
 )

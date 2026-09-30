@@ -39,7 +39,6 @@
 package dispatchers
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -110,8 +109,8 @@ const (
 // bootConvTarget is one injected widget target: its name + outcome + (for the
 // transient) the pass at which it starts succeeding.
 type bootConvTarget struct {
-	name                string
-	outcome             bootConvOutcome
+	name                  string
+	outcome               bootConvOutcome
 	transientClearsAtPass int // 1-based; only for outcomeTransientThenSucceed
 }
 
@@ -168,10 +167,7 @@ func runBootConvergence(t *testing.T, targets []bootConvTarget, maxIters int, he
 	// t.Setenv restores the prior value on cleanup.
 	t.Setenv("CACHE_ENABLED", "true")
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureDefaultSlogForTest(t, slog.LevelInfo)
 
 	prevTO := prewarmScopeTimeoutFn
 	prewarmScopeTimeoutFn = func(prewarmScope) time.Duration { return time.Hour }
@@ -313,12 +309,13 @@ func write105Artifact(t *testing.T, name, body string) {
 // fix: the boot re-walk is BOUNDED — after bootMaxNoProgressPasses consecutive
 // no-set-progress passes it STOPS and converged_with_skips fires with ONLY the
 // failer given up. Double-RED:
-//   (a) current unbounded: TestArmA_CountBasedModel_NeverConverges below models
-//       the pre-fix / count-based impl and shows it does NOT converge.
-//   (b) the healthy target is the discriminator (feedback_falsifier_shape_must_
-//       discriminate): its seeded-set membership is stable from pass 2 (no
-//       growth), so ONLY a set-delta reads "no progress"; a count would see its
-//       per-pass activity as progress-forever.
+//
+//	(a) current unbounded: TestArmA_CountBasedModel_NeverConverges below models
+//	    the pre-fix / count-based impl and shows it does NOT converge.
+//	(b) the healthy target is the discriminator (feedback_falsifier_shape_must_
+//	    discriminate): its seeded-set membership is stable from pass 2 (no
+//	    growth), so ONLY a set-delta reads "no progress"; a count would see its
+//	    per-pass activity as progress-forever.
 func TestArmA_SetDelta_BoundsRewalk_ConvergesWithOnlyFailerGivenUp(t *testing.T) {
 	targets := []bootConvTarget{
 		{name: "healthy-w", outcome: outcomeHealthy},
@@ -370,7 +367,7 @@ func TestArmA_CountBasedModel_NeverConverges(t *testing.T) {
 		var priorFailed map[string]struct{} = map[string]struct{}{}
 		noProg := 0
 		for p := 1; p <= passes && setDeltaTrips < 0; p++ {
-			seeded["healthy-key"] = struct{}{}    // Put pass1 / re-Put+fresh-skip later — same key
+			seeded["healthy-key"] = struct{}{} // Put pass1 / re-Put+fresh-skip later — same key
 			failed := map[string]struct{}{"failer": {}}
 			grew := len(seeded) > priorSeeded
 			shrank := len(failed) < len(priorFailed) && subsetOf(failed, priorFailed)
