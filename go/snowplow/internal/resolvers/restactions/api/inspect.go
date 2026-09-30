@@ -60,6 +60,17 @@ type Resource struct {
 	Namespace string `json:"namespace,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Verb      string `json:"verb"`
+	// NonReadVerb flags a row whose Verb is not a read verb (get/list/watch —
+	// uafVerbIsRead, refilter.go). Only a userAccessFilter stage can produce
+	// one: its verb is threaded verbatim into rbac.EvaluateRBAC, so a UAF
+	// authored (or written straight to etcd) with a write verb would otherwise
+	// suggest a Role granting that write verb (#179). The verb is still emitted
+	// verbatim — bounding it would corrupt the read-set for the legit
+	// `verb: create` portal pickers (refilter.go warn-only rationale) — but the
+	// flag lets the caller (core-provider) refuse to mint a write-granting Role.
+	// omitempty: read rows omit it, so every existing response stays
+	// byte-identical (design §4).
+	NonReadVerb bool `json:"nonReadVerb,omitempty"`
 }
 
 // Unresolved names a stage the inspect pass could not enumerate from the
@@ -294,6 +305,9 @@ func inspectUAFStage(rc *rest.Config, uaf *templates.UserAccessFilterSpec, resou
 			Version:  "", // version-less: the SAR check is version-less; see doc above.
 			Resource: plural,
 			Verb:     uaf.Verb,
+			// #179: flag (do not bound) a non-read verb, using the same
+			// single-source predicate the refilter warn uses (refilter.go).
+			NonReadVerb: !uafVerbIsRead(uaf.Verb),
 		})
 	}
 	return out, nil
@@ -389,6 +403,10 @@ func dedupeSortResources(in []Resource) []Resource {
 		key := Resource{
 			Group: r.Group, Version: r.Version, Resource: r.Resource,
 			Namespace: r.Namespace, Verb: r.Verb,
+			// #179: NonReadVerb is a pure function of Verb, so it never splits a
+			// tuple into two rows; carry it here so dedupe (which rebuilds the
+			// row from this literal) does not drop the flag.
+			NonReadVerb: r.NonReadVerb,
 		}
 		if _, dup := seen[key]; dup {
 			continue
