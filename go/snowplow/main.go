@@ -1163,6 +1163,10 @@ func main() {
 	// that touched no subject and no roleRef (the superset). Unconditional for
 	// the same zero-readability reason as the keys above.
 	cache.RegisterRBACBindingNoopExpvar()
+	// #257 — the role-path companion: how many ClusterRole/Role UPDATEs the skip
+	// suppressed (relist same-RV, or a rewrite that changed no rules) + the
+	// denominator. Unconditional, same zero-readability reason as the keys above.
+	cache.RegisterRBACRoleNoopExpvar()
 	// Ship L2 (0.30.253) / Task #291 — register the snapshot authz memo
 	// counters (hits/misses/swaps/refused/entries) next to the publish-seq
 	// expvar, BEFORE the mux mount accepts scrapes, so the F1/F5 falsifiers

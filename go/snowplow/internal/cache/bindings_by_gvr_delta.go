@@ -237,14 +237,49 @@ func onRoleObjectChanged(source subGenBumpSource, obj interface{}) {
 		obj = tomb.Obj
 	}
 	if o, ok := asCR(obj); ok {
-		onRoleRulesChanged(source, "ClusterRole", "", o.Name, o.Rules)
+		onRoleRulesChanged(source, "ClusterRole", "", o.Name, o.Rules, false)
 		return
 	}
 	if o, ok := asRole(obj); ok {
-		onRoleRulesChanged(source, "Role", o.Namespace, o.Name, o.Rules)
+		onRoleRulesChanged(source, "Role", o.Namespace, o.Name, o.Rules, false)
 		return
 	}
 	deltaDropNonTyped("Role/ClusterRole(change)")
+}
+
+// onRoleUpdated is the role UPDATE path (#257). It re-routes the index exactly
+// like onRoleObjectChanged, but SKIPS the deferred sub-gen bump when the old and
+// new rules are semantically EQUAL (a label-only write / relist) — oldObj is the
+// object the informer UpdateFunc dropped (rbac_snapshot.go). Re-bucketing stays
+// UNCONDITIONAL (index op). The FIRED update bump keeps #260's bumpSrcRoleUpdate
+// source tag (so the role_update by_source bucket survives).
+//
+// bump-when-in-doubt (C4 fail-safe): an unparseable side, a mixed-kind event, or
+// a nil side yields skip=false (bump) — a missed rule change is a revoke/grant
+// that does not rotate, i.e. a leak. policyRulesEqual (rbac_role_rules_equal.go)
+// canonicalizes all five rule dimensions order-insensitively.
+func onRoleUpdated(oldObj, newObj interface{}) {
+	idx := bindingsByGVRSingleton()
+	if !idx.deltaActive() {
+		return
+	}
+	// #260/#257 role no-op attribution (relist same-RV / rules-unchanged).
+	recordRoleUpdateNoop(oldObj, newObj)
+
+	oldSide := roleSideOf(oldObj)
+	newSide := roleSideOf(newObj)
+	skip := oldSide.kind != "" && newSide.kind != "" && oldSide.kind == newSide.kind &&
+		policyRulesEqual(oldSide.rules, newSide.rules)
+
+	if o, ok := asCR(newObj); ok {
+		onRoleRulesChanged(bumpSrcRoleUpdate, "ClusterRole", "", o.Name, o.Rules, skip)
+		return
+	}
+	if o, ok := asRole(newObj); ok {
+		onRoleRulesChanged(bumpSrcRoleUpdate, "Role", o.Namespace, o.Name, o.Rules, skip)
+		return
+	}
+	deltaDropNonTyped("Role/ClusterRole(update-new)")
 }
 
 // onRoleRulesChanged re-routes every binding referencing the given role
@@ -255,7 +290,7 @@ func onRoleObjectChanged(source subGenBumpSource, obj interface{}) {
 // bindings × navigatedGVRs); the Gate-2 measurement found the
 // most-referenced role had only 4 referencing bindings (the topology is
 // ~1:1 role:binding from per-composition RBAC).
-func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name string, rules []rbacv1.PolicyRule) {
+func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name string, rules []rbacv1.PolicyRule, skipBump bool) {
 	idx := bindingsByGVRSingleton()
 	if !idx.deltaActive() {
 		return
@@ -322,7 +357,9 @@ func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name strin
 			}
 		}
 	}
-	if len(changed) > 0 {
+	if len(changed) > 0 && !skipBump {
+		// #257: skipBump gates ONLY the bump — the re-bucketing above ran
+		// unconditionally (index op). The bump keeps its #260 source tag.
 		subjects := make([]subjectKey, 0, len(changed))
 		for s := range changed {
 			subjects = append(subjects, s)
