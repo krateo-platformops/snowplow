@@ -109,6 +109,36 @@ def _stub_conv_discrimination_probes(monkeypatch):
                         lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _stub_cache_list_transport(monkeypatch):
+    """#178: neutralise the post-VERIFY CONTENT cache-list call by default.
+
+    browser_measure_stage's CONTENT check calls
+    `list_composition_names_from_cache(token)` when `cache_mode=="ON"` and a
+    token is set — which does a LIVE `http_get` → `urllib.request.urlopen` to
+    the default snowplow URL. In a bench UNIT test there is no snowplow, so it
+    blocks on `sock.connect` (http_get timeout=120 × retries=3 ≈ 6 min) and
+    HANGS the whole suite (#178: test_browser_measure_stage_cyber_uses_intra_
+    user_consistency was the one that reached it, via cache_mode="ON").
+
+    Default to None — the CONTENT check treats None as "cache-list transport
+    unavailable, skip", so no measure-stage unit test can make a live call.
+    This mirrors the expvar / k8s / deploy-fingerprint autouse stubs above (no
+    live network from a unit test). It is stubbed at
+    `list_composition_names_from_cache` (NOT at `http_get`/`urlopen`) so the
+    http_get transport unit tests — which fake urlopen and call http_get with
+    base_url=None — are NOT blinded.
+
+    A test that DOES exercise the CONTENT-match path re-monkeypatches
+    `list_composition_names_from_cache` explicitly; fixtures apply before the
+    test body, so the per-test setattr wins over this default (see the Task
+    #181 / #298 CONTENT tests, which are unaffected).
+    """
+    import bench.browser as browser_mod
+    monkeypatch.setattr(browser_mod, "list_composition_names_from_cache",
+                        lambda token: None)
+
+
 @pytest.fixture
 def reset_k8s_state():
     """Reset bench.cluster k8s-client module globals between tests.
