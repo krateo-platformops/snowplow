@@ -1603,15 +1603,25 @@ func resetDepsForTest() {
 // cross-package test cannot leak the DELETE-eviction worker goroutine
 // or stale bridge counters into the next case.
 func ResetDepsForTest() {
-	// Order is load-bearing (1.12.6 item 7 gate, -race at -count=3):
-	//  1. stop + JOIN the watcher bound to the bridge — its informer
+	// Order is load-bearing (1.12.6 item 7 gate + #206, -race at -count=3):
+	//  1. stop + JOIN the resolved_cache.summary goroutine FIRST. It is a
+	//     PURE READER that starts no workers, and each tick reads THREE
+	//     subsystems — Deps().Stats(), the refresher, AND DepWatch
+	//     (DepWatchStatsSnapshot). Quiescing it before any teardown
+	//     eliminates the reader-vs-teardown window for ALL THREE by
+	//     construction — in particular vs resetDepWatchForTest (step 3),
+	//     which replaces depWatchOnce while a tick could still be inside
+	//     DepWatchStatsSnapshot. (The 300s default hid this; #248's
+	//     1s-cadence wiring test removes that improbability.)
+	//  2. stop + JOIN the watcher bound to the bridge — its informer
 	//     handlers captured the bridge singleton at registration, and an
 	//     ADD they deliver after the singleton is replaced would start a
 	//     worker nobody can stop any more (an orphan that keeps reading
 	//     Deps() under the next test's reset);
-	//  2. stop + join the dep-event worker: it reads Deps() on its own
+	//  3. stop + join the dep-event worker: it reads Deps() on its own
 	//     goroutine (1.12.6 C1 — every event, not only DELETEs);
-	//  3. only then write the tracker fields.
+	//  4. only then write the tracker fields.
+	stopResolvedCacheSummaryForTest()
 	stopBoundDepWatcherForTest()
 	resetDepWatchForTest()
 	resetDepsForTest()
