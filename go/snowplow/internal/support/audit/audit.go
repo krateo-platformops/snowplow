@@ -140,6 +140,9 @@ type Event struct {
 	Resource  string
 	Name      string
 	Namespace string
+	// Subresource is the addressed subresource (#282), e.g. "status" ->
+	// k8s.resource.subresource. Empty for a whole-object call (omitted).
+	Subresource string
 	// Outcome is "success" | "failure" | "denied" -> outcome (and drives
 	// SeverityNumber: Info on success, Error otherwise).
 	Outcome string
@@ -229,6 +232,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	add("k8s.resource.group", ev.Group)
 	add("k8s.resource.version", ev.Version)
 	add("k8s.resource.resource", ev.Resource)
+	add("k8s.resource.subresource", ev.Subresource)
 	add("k8s.resource.name", ev.Name)
 	add("krateo.action", ev.Action)
 	add("http.request.method", ev.Verb)

@@ -1,0 +1,40 @@
+# #282 — the STATUS-subresource discriminator grant. Group status-writers-282
+# is authorized to write restactions/status (the DISTINCT RBAC subresource),
+# which a plain grant on `restactions` (admin-restactions, rbac.restactions.yaml)
+# does NOT cover. Used by the arm-2 pair: a devs user (parent grant only) is
+# forbidden on the status write, while this group's user succeeds — proving the
+# apiserver enforces the status-subresource grant on the /call?subresource=status
+# route.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: restactions-status-writer-282
+rules:
+- apiGroups:
+  - templates.krateo.io
+  resources:
+  - restactions/status
+  verbs:
+  - get
+  - update
+  - patch
+- apiGroups:
+  - templates.krateo.io
+  resources:
+  - restactions
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: restactions-status-writers-282
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: restactions-status-writer-282
+subjects:
+- kind: Group
+  name: status-writers-282
+  apiGroup: rbac.authorization.k8s.io
