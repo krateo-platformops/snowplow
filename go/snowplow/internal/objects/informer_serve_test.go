@@ -712,12 +712,14 @@ func TestObjectsGetSummary_LineFormat(t *testing.T) {
 // starts exactly once even under concurrent first-call races (sync.Once
 // bound — no goroutine leak).
 func TestObjectsGetSummary_GoroutineLifecycle(t *testing.T) {
-	// startObjectsGetSummary is sync.Once-guarded process-wide; we cannot
-	// reset the Once without unsafe reflection. Calling it many times
+	// startObjectsGetSummary is sync.Once-guarded. Calling it many times
 	// concurrently must not panic and must not spawn extra goroutines —
 	// the Once swallows every call after the first. This is a smoke test
 	// for the lifecycle bound; the absence of a panic + race-detector
-	// silence is the assertion.
+	// silence is the assertion. The #348 stop seam lets us join the one
+	// goroutine on cleanup so it does not leak past this test (the reachable-
+	// stop contract is asserted directly by TestObjectsGetSummary_GoroutineStops).
+	t.Cleanup(stopObjectsGetSummaryForTest)
 	var done atomic.Int32
 	for i := 0; i < 32; i++ {
 		go func() {
