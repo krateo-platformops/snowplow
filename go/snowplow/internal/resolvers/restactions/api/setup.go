@@ -36,11 +36,11 @@ func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.A
 
 	if len(it) == 0 {
 		all = make([]httpcall.RequestOptions, 0, 1)
-		el, ok := createRequestOption(in, dict)
+		el, ok, sr := createRequestOption(in, dict)
 		if ok {
 			all = append(all, el)
 		} else {
-			recordMalformedDialSkip(log, in.Name, el.Path)
+			recordMalformedDialSkip(log, in.Name, el.Path, sr)
 		}
 		return
 	}
@@ -48,9 +48,9 @@ func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.A
 	all = []httpcall.RequestOptions{}
 
 	action := func(sa any) error {
-		el, ok := createRequestOption(in, sa)
+		el, ok, sr := createRequestOption(in, sa)
 		if !ok {
-			recordMalformedDialSkip(log, in.Name, el.Path)
+			recordMalformedDialSkip(log, in.Name, el.Path, sr)
 			return nil
 		}
 		all = append(all, el)
@@ -81,12 +81,16 @@ func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.A
 // coordinate-shape triage, mirroring the C-3 empty-iterator precedent (a
 // "nothing sensible to call" continue is benign + data-dependent — DEBUG, never
 // the WARN-floor firehose).
-func recordMalformedDialSkip(log *slog.Logger, name, path string) {
-	bumpMalformedDialSkipped()
-	log.Debug("skipping api call: interpolated path has an empty or DNS-1123-invalid "+
-		"name/namespace segment — not dialing (#288 empty-interpolation guard)",
+func recordMalformedDialSkip(log *slog.Logger, name, path string, sr skipReason) {
+	// Two-tier (pm-1217): the bounded CLASS key drives the per-reason metric (what
+	// a spike alert needs — 3 fixed compile-time keys, no per-path cardinality); the
+	// finer sub-reason DETAIL rides the DEBUG line for coordinate-shape triage.
+	bumpMalformedDialSkipped(sr.class)
+	log.Debug("skipping api call: "+sr.detail+" — not dialing",
 		slog.String("name", name),
 		slog.String("path", path),
+		slog.String("reason_class", sr.class),
+		slog.String("reason", sr.detail),
 	)
 }
 
@@ -97,11 +101,12 @@ func recordMalformedDialSkip(log *slog.Logger, name, path string) {
 // — e.g. a trailing '-'), so the caller must NOT append/dial it. valid=true for
 // well-formed paths AND for out-of-scope paths (external URLs, LIST paths) —
 // byte-identical to pre-#288 behaviour.
-func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions, valid bool) {
+func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions, valid bool, sr skipReason) {
 	out.ContinueOnError = ptr.Deref(in.ContinueOnError, false)
 	out.ErrorKey = ptr.Deref(in.ErrorKey, "error")
 
-	out.Path = evalJQ(in.Path, ds)
+	path, pathErr := evalJQE(in.Path, ds)
+	out.Path = path
 	out.Verb = ptr.To(ptr.Deref(in.Verb, http.MethodGet))
 
 	if in.Payload != nil {
@@ -116,7 +121,17 @@ func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions
 		}
 	}
 
-	valid = validInterpolatedPath(out.Path, ptr.Deref(out.Verb, http.MethodGet))
+	if pathErr != nil {
+		// #293 sub-case 2: the path jq expression ERRORED. evalJQE surfaces the
+		// error (evalJQ would have masqueraded it as the path string and dialed it
+		// as a garbage apiserver path → 404). Mark invalid so the caller SKIPS the
+		// dial; the error text is surfaced in out.Path for the skip DEBUG only,
+		// never dialed. Payload/header jq errors keep evalJQ's swallow behaviour
+		// (out of #293 scope, different blast radius — deferred follow-up).
+		out.Path = pathErr.Error()
+		return out, false, skipReason{class: reasonJQPathError, detail: "path jq expression errored: " + pathErr.Error()}
+	}
+	valid, sr = validInterpolatedPath(out.Path, ptr.Deref(out.Verb, http.MethodGet))
 	return
 }
 
@@ -155,12 +170,20 @@ func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions
 //
 // (Out of scope, filed #293: an UNRENDERED `${...}` / garbage path from an evalJQ
 // error — parseOK=false, left to pre-#288 dial behaviour.)
-func validInterpolatedPath(path, verb string) bool {
+func validInterpolatedPath(path, verb string) (bool, skipReason) {
+	// #293 sub-case 1: an UNRENDERED "${" template (jqutil.MaybeQuery leaves it
+	// literal on unbalanced braces) is never a dialable apiserver path. Reject it
+	// before the parseOK=false early-return below (which would otherwise pass it
+	// through as a legit external path). A genuine external URL never carries
+	// "${", so external-dial behaviour is unchanged.
+	if strings.Contains(path, "${") {
+		return false, skipReason{class: reasonUnrenderedTemplate, detail: "unrendered ${...} template (#293)"}
+	}
 	_, ns, name, ok := cache.ParseAPIServerPathToDep(path)
 	if !ok {
 		// Not a single-object/list apiserver path we guard (external URL,
 		// unresolved template, or a shape ParseAPIServerPathToDep rejects).
-		return true
+		return true, skipReason{}
 	}
 
 	// Inspect the RAW rendered path, query-stripped (mirror the parser's own
@@ -173,14 +196,14 @@ func validInterpolatedPath(path, verb string) bool {
 
 	// Collapsed NAMESPACE — the empty segment "/namespaces//" (blocker fix).
 	if strings.Contains(p, "/namespaces//") {
-		return false
+		return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty namespace segment (#288)"}
 	}
 	// Present-but-invalid namespace / name segments.
 	if ns != "" && len(validation.IsDNS1123Label(ns)) > 0 {
-		return false
+		return false, skipReason{class: reasonEmptyInterp, detail: "DNS-1123-invalid namespace segment (#288)"}
 	}
 	if name != "" && len(validation.IsDNS1123Subdomain(name)) > 0 {
-		return false
+		return false, skipReason{class: reasonEmptyInterp, detail: "DNS-1123-invalid name segment (#288)"}
 	}
 
 	// Collapsed trailing NAME on a mutating verb (safety-gap b). name=="" is a
@@ -190,24 +213,29 @@ func validInterpolatedPath(path, verb string) bool {
 		case http.MethodPut, http.MethodPatch:
 			// No nameless update exists (apiserver 405s a collection PUT/PATCH),
 			// so an empty name here is always a collapse.
-			return false
+			return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty name on a mutating verb (#288)"}
 		case http.MethodDelete:
 			// A collapsed by-name DELETE leaves a trailing "/" (`.../configmaps/`
 			// from `".../configmaps/"+(.name)` with name==""); a genuine
 			// collection DELETE is written `.../configmaps` (no trailing slash).
 			if strings.HasSuffix(p, "/") {
-				return false
+				return false, skipReason{class: reasonEmptyInterp, detail: "collapsed by-name DELETE (empty name, trailing slash) (#288)"}
 			}
 		}
 	}
 
-	return true
+	return true, skipReason{}
 }
 
-func evalJQ(q string, ds any) string {
+// evalJQE evaluates a jq template and SURFACES the Eval error instead of
+// swallowing it into the output string. The api-call PATH render uses it so a
+// failed jq expression is NOT dialed as a garbage apiserver path (#293
+// sub-case 2). A non-template string (MaybeQuery !ok) returns unchanged with a
+// nil error.
+func evalJQE(q string, ds any) (string, error) {
 	q, ok := jqutil.MaybeQuery(q)
 	if !ok {
-		return q
+		return q, nil
 	}
 
 	out, err := jqutil.Eval(context.TODO(),
@@ -218,8 +246,17 @@ func evalJQ(q string, ds any) string {
 			ModuleLoader: jqsupport.ModuleLoader(),
 		})
 	if err != nil {
-		out = err.Error()
+		return "", err
 	}
+	return out, nil
+}
 
+// evalJQ preserves the pre-#293 contract (jq errors swallowed into the returned
+// string) for the payload/header renders, which are out of #293 scope.
+func evalJQ(q string, ds any) string {
+	out, err := evalJQE(q, ds)
+	if err != nil {
+		return err.Error()
+	}
 	return out
 }
