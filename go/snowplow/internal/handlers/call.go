@@ -179,16 +179,17 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			outcome, code, msg = "failure", rt.Code, rt.Message
 		}
 		audit.Emit(req.Context(), audit.Event{
-			Action:    "call",
-			Verb:      strings.ToUpper(opts.verb),
-			Group:     opts.gvr.Group,
-			Version:   opts.gvr.Version,
-			Resource:  opts.gvr.Resource,
-			Name:      opts.nsn.Name,
-			Namespace: opts.nsn.Namespace,
-			Outcome:   outcome,
-			Code:      code,
-			Message:   msg,
+			Action:      "call",
+			Verb:        strings.ToUpper(opts.verb),
+			Group:       opts.gvr.Group,
+			Version:     opts.gvr.Version,
+			Resource:    opts.gvr.Resource,
+			Subresource: opts.subresource,
+			Name:        opts.nsn.Name,
+			Namespace:   opts.nsn.Namespace,
+			Outcome:     outcome,
+			Code:        code,
+			Message:     msg,
 		})
 	}
 
@@ -296,6 +297,29 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 		opts.nsn = types.NamespacedName{Name: name} // Namespace deliberately empty
 	}
 
+	// #282 — a subresource (e.g. "status", "scale") addresses
+	// .../{name}/<subresource>. A subresource lives on a NAMED object, so it
+	// requires a by-name verb (GET/PUT/PATCH/DELETE); a POST (collection
+	// create) has no subresource target and is rejected. The by-name verbs
+	// already require a non-empty name in both branches above, so a valid
+	// subresource request always has a name to hang it on. RBAC is unchanged:
+	// the request carries the USER's credentials to request.Do, so the
+	// apiserver enforces the DISTINCT subresource RBAC verb natively (a plain
+	// grant on the resource does NOT authorize its <subresource>).
+	//
+	// Scope note (reviewers): for #282 — a CR status is GET/PUT/PATCH/DELETE —
+	// the by-name-verb rule is exact and fails CLOSED (a nameless GET carrying a
+	// subresource is already a 400 via the name-required checks in both branches
+	// above, so a malformed .../<subresource> path is never built). A FUTURE
+	// by-name POST subresource (e.g. pods/eviction, serviceaccounts/token,
+	// pods/binding) would relax this to "requires a non-empty name", not
+	// "rejects POST" — those are by-name POSTs. Out of scope here.
+	opts.subresource = req.URL.Query().Get("subresource")
+	if opts.subresource != "" && !has([]string{http.MethodGet, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
+		err = fmt.Errorf("subresource %q requires a by-name verb (GET/PUT/PATCH/DELETE); it cannot be used with %s", opts.subresource, opts.verb)
+		return
+	}
+
 	if val := req.URL.Query().Get("perPage"); val != "" {
 		opts.perPage, err = strconv.Atoi(val)
 		if err != nil {
@@ -350,6 +374,11 @@ type callOptions struct {
 	//         supplied).
 	// false → cluster-scoped: OMIT the namespaces/<ns> segment.
 	namespaced bool
+	// subresource is the optional subresource segment (#282), e.g. "status"
+	// or "scale", appended as .../{name}/<subresource>. Empty for the
+	// historical whole-object addressing (byte-identical path). validateRequest
+	// enforces that it only rides a by-name verb.
+	subresource string
 }
 
 func buildURIPath(opts callOptions) (string, error) {
@@ -383,6 +412,14 @@ func buildURIPath(opts callOptions) (string, error) {
 		http.MethodPatch,
 	}, opts.verb) {
 		uriPath = path.Join(uriPath, opts.nsn.Name)
+	}
+
+	// #282 — append the subresource segment (.../{name}/<subresource>, e.g.
+	// /status). validateRequest guarantees a subresource only rides a by-name
+	// verb, so the name was just appended above; hang the subresource off it.
+	// Empty subresource → byte-identical to the pre-#282 whole-object path.
+	if opts.subresource != "" {
+		uriPath = path.Join(uriPath, opts.subresource)
 	}
 
 	// Aggiunta dei query parametri, se necessario

@@ -186,3 +186,42 @@ func TestPackageEmitNoOpWhenUnset(t *testing.T) {
 	// Must not panic.
 	Emit(context.Background(), Event{Action: "call", Outcome: "success"})
 }
+
+// TestEmitRecordsSubresource (#282, arm 5) verifies a subresource write records
+// k8s.resource.subresource for correlation, and that a whole-object call OMITS
+// it (the add() empty-skip → backward-compatible record shape).
+func TestEmitRecordsSubresource(t *testing.T) {
+	rec := logtest.NewRecorder()
+	New(rec.Logger("test")).Emit(context.Background(), Event{
+		Action: "call", Verb: "PUT", Group: "example.com", Version: "v1",
+		Resource: "widgets", Subresource: "status", Name: "w1", Namespace: "ns1",
+		Outcome: "success", Code: 200,
+	})
+	got := flattenRecords(rec.Result())
+	if len(got) != 1 {
+		t.Fatalf("want 1 record, got %d", len(got))
+	}
+	attrs := map[string]log.Value{}
+	for _, kv := range got[0].Attributes {
+		attrs[kv.Key] = kv.Value
+	}
+	if v, ok := attrs["k8s.resource.subresource"]; !ok || v.AsString() != "status" {
+		t.Errorf("k8s.resource.subresource = %v (present=%v), want status", attrs["k8s.resource.subresource"], ok)
+	}
+
+	// A whole-object call (no subresource) must OMIT the attribute entirely.
+	rec2 := logtest.NewRecorder()
+	New(rec2.Logger("test")).Emit(context.Background(), Event{
+		Action: "call", Verb: "PUT", Resource: "widgets", Name: "w1",
+		Namespace: "ns1", Outcome: "success", Code: 200,
+	})
+	g2 := flattenRecords(rec2.Result())
+	if len(g2) != 1 {
+		t.Fatalf("want 1 record, got %d", len(g2))
+	}
+	for _, kv := range g2[0].Attributes {
+		if kv.Key == "k8s.resource.subresource" {
+			t.Errorf("whole-object call must omit k8s.resource.subresource, got %v", kv.Value)
+		}
+	}
+}

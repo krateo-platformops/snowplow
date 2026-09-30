@@ -40,6 +40,19 @@ func ReadDispatcher(handlers map[string]http.Handler) func(http.Handler) http.Ha
 func dispatcherForMethod(handlers map[string]http.Handler, dispatchMethod string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
+			// #282 — a request addressing a SUBRESOURCE (.../{name}/<subresource>,
+			// e.g. status) must NOT be served from the resolve/cache handlers: they
+			// key on the WHOLE object (ParseGVR + name, no subresource), so a
+			// subresource GET would be mis-served the PARENT's cached body. Fall
+			// straight through to next (handlers.Call / CallRead), which builds the
+			// subresource path (buildURIPath) and hits the apiserver directly. This
+			// is uniform for the GET dispatcher and the POST /call/read variant;
+			// write verbs already fall through via the method check below. Caching
+			// subresources is a separate future feature, out of #282 scope.
+			if req.URL.Query().Get("subresource") != "" {
+				next.ServeHTTP(wri, req)
+				return
+			}
 			if req.Method != dispatchMethod {
 				next.ServeHTTP(wri, req)
 				return
