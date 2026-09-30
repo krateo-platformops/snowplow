@@ -725,11 +725,23 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 	var bindingUID string
 	if inputs != nil {
 		bindingUID = inputs.BindingUID
-	} else {
+	} else if log.Handler().Enabled(ctx, slog.LevelInfo) || env.True("DISPATCH_KEY_DIAG_ENABLED") {
 		// Compute directly so the field still differentiates — the
 		// cache-disabled / no-identity branch returns nil inputs, but
 		// the diagnostic is interested in the per-layer BindingUID
 		// value itself. Path B direct call (Phase 2b R3 deferral).
+		//
+		// #251 — this is the ONLY expensive computation in this function,
+		// and its result (bindingUID) is consumed by exactly two sinks:
+		// the log.Info line below (emits only at >= Info) and the stderr
+		// lane (emits only under DISPATCH_KEY_DIAG_ENABLED). Go evaluates a
+		// call argument BEFORE slog checks the handler level, so an
+		// unconditional EvaluateRBAC here is paid in full at the shipped
+		// LOG_LEVEL=warn to build a line nobody can read — on the seed path
+		// that gates /readyz. Gate the evaluation on the SAME conditions
+		// its two consumers gate on: behaviour is unchanged wherever a
+		// consumer actually runs (kind/bench INFO, or the diag env), and
+		// the cost is dropped exactly when the value would be discarded.
 		_, bindingUID, _ = rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
 			Username:  username,
 			Groups:    groups,
