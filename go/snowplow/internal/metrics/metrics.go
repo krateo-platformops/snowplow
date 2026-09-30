@@ -573,6 +573,20 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #244: factory-built GVR divergence age — the observable bound on the
+	// passive watch-reconnect self-heal. A factory (shared-informer) GVR whose
+	// indexer diverged from the apiserver cannot be relist-repaired; it clears on
+	// the reflector's next watch re-establishment, bounded by the cluster's
+	// --min-request-timeout. This gauge is the age of the oldest such unrepaired
+	// divergence: within the reconnect window = expected self-heal, beyond it =
+	// genuinely stuck.
+	storeFactoryDivergenceAge, err := m.Int64ObservableGauge(
+		"snowplow_store_factory_divergence_age_seconds",
+		metric.WithDescription("Age in seconds of the oldest unrepaired factory-built (shared-informer, !ownsInformer) GVR divergence — 0 when none. It self-heals on the reflector's next watch re-establishment, bounded by the apiserver --min-request-timeout (cluster-config-dependent); a value beyond that cadence is a genuinely stuck divergence, within it an expected passive self-heal (#244)."))
+	if err != nil {
+		return err
+	}
+
 	// --- build identity, so every other panel can be pinned to a commit.
 	buildInfo, err := m.Int64ObservableGauge(
 		"snowplow_build_info",
@@ -772,6 +786,9 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- #233: unparseable-CA delegation detector (uncapped rate) ---
 		o.ObserveInt64(unparseableCADelegations, int64(restactionsapi.UnparseableCADelegationTotal()))
 
+		// --- #244: factory-built divergence age (bounded self-heal detector) ---
+		o.ObserveInt64(storeFactoryDivergenceAge, cache.FactoryDivergenceMaxAgeSeconds())
+
 		// --- 1.12.4: build identity, constant 1 ---
 		o.ObserveInt64(buildInfo, 1,
 			metric.WithAttributes(attribute.String("version", buildLabel(build))))
@@ -811,6 +828,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		depsStats, informerFreshness,
 		// --- #233 ---
 		unparseableCADelegations,
+		// --- #244 ---
+		storeFactoryDivergenceAge,
 	}, derivedObservables...)...)
 	return err
 }
