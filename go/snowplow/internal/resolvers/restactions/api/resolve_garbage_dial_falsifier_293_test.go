@@ -224,38 +224,130 @@ func TestFalsifier293_ValidInterpolatedPath_RejectsUnrenderedTemplate(t *testing
 	}
 }
 
-// TestFalsifier293_PayloadJQError_PathStillDials — path-only scope CONTROL
-// (arch-1217): a stage with a VALID path but a PAYLOAD that jq-errors must STILL
-// DIAL the path. Payload/header jq-errors are out of #293 scope (deferred
-// follow-up); this proves the fix did not start skipping on them.
-func TestFalsifier293_PayloadJQError_PathStillDials(t *testing.T) {
+// TestFalsifier302_PayloadJQError_SkipsDial — #302 REVERSES the #293-era
+// placeholder (formerly TestFalsifier293_PayloadJQError_PathStillDials), which
+// PINNED the DEFERRED behaviour "a payload jq-error still dials, swallowed into
+// the body." That deferred follow-up has now landed: a payload whose jq
+// expression errors must NOT be dialed (the swallowed error would be the request
+// BODY) — it must SKIP + bump the jq_payload_error per-reason counter. A
+// valid-payload control still dials (discriminated skip, arm-that-cannot-fail).
+//
+// RED on the pre-#302 tree (evalJQ swallowed the error into the body → the
+// bad-payload stage dialed → 2 dials); GREEN after (skip → 1 dial).
+func TestFalsifier302_PayloadJQError_SkipsDial(t *testing.T) {
 	garbage293FailFast(t)
 	f := newGarbageDialFixture(t)
 
-	stage := &templates.API{
+	// Erroring payload (jq divide-by-zero) on an otherwise-valid path/verb.
+	badPayload := &templates.API{
 		Name:            "payload_jq_error",
-		Path:            "/good",
+		Path:            "/bad-pl",
 		Verb:            ptr.To(http.MethodPost),
-		Payload:         ptr.To("${1/0}"), // jq divide-by-zero: evalJQ swallows to err string (out of scope)
+		Payload:         ptr.To("${1/0}"),
 		ContinueOnError: ptr.To(true),
 		ErrorKey:        ptr.To("errPl"),
 	}
+	// Control: a VALID (non-template) payload on the same shape MUST still dial.
+	okPayload := &templates.API{
+		Name:            "payload_ok_control",
+		Path:            "/good-ok",
+		Verb:            ptr.To(http.MethodPost),
+		Payload:         ptr.To(`{"literal":"body"}`),
+		ContinueOnError: ptr.To(true),
+		ErrorKey:        ptr.To("errOk"),
+	}
+
+	beforeTotal := MalformedDialSkippedTotal()
+	beforePayload := MalformedDialSkippedByReason(reasonJQPayloadError)
 	_ = Resolve(garbage293Ctx(f), ResolveOptions{
 		RC:                  &rest.Config{},
-		Items:               []*templates.API{stage},
+		Items:               []*templates.API{badPayload, okPayload},
 		RESTActionNamespace: "default",
-		RESTActionName:      "garbage-293-payload-control",
+		RESTActionName:      "garbage-302-payload",
 	})
 
-	sawGood := false
-	for _, p := range f.received() {
-		if p == "/good" {
-			sawGood = true
-		}
+	got := f.received()
+
+	// The erroring-payload stage must be SKIPPED (its path never dialed); the
+	// valid-payload control MUST dial. Exactly ONE dial, and it is /good-ok.
+	if len(got) != 1 || got[0] != "/good-ok" {
+		t.Fatalf("#302 payload (RED pre-fix): expected exactly ONE dial (the valid-payload control /good-ok); got %v — a payload jq-error must SKIP the dial (never dial a request whose body is a swallowed jq error), while the valid control still dials", got)
 	}
-	if !sawGood {
-		t.Fatalf("#293 path-only scope: a stage with a VALID path but a payload jq-error must STILL dial the "+
-			"path (payload/header jq-errors are out of #293 scope, deferred) — the fix must not skip on them. received=%v", f.received())
+	if d := MalformedDialSkippedByReason(reasonJQPayloadError) - beforePayload; d != 1 {
+		t.Fatalf("#302 payload: the payload-jq-error skip must bump the %q per-reason metric by 1; got delta %d", reasonJQPayloadError, d)
+	}
+	if d := MalformedDialSkippedTotal() - beforeTotal; d != 1 {
+		t.Fatalf("#302 payload: exactly one total skip expected; got delta %d", d)
+	}
+}
+
+// TestFalsifier302_HeaderJQError_SkipsDial — the SECURITY crux (arch-1217 C2). A
+// header whose jq expression errors must NOT be dialed: the swallowed error would
+// be a garbage HEADER value (e.g. Authorization). Assert SKIP + jq_header_error
+// counter + that the ONLY dialed request carries the intended Authorization, not
+// an error string; a valid-header control still dials.
+func TestFalsifier302_HeaderJQError_SkipsDial(t *testing.T) {
+	garbage293FailFast(t)
+
+	type dialRec struct{ path, auth string }
+	var mu sync.Mutex
+	var dials []dialRec
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		dials = append(dials, dialRec{r.RequestURI, r.Header.Get("Authorization")})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	ctx := xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "garbage-302-user"}),
+	)
+	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: srv.URL})
+
+	// Erroring header (jq divide-by-zero as the header value) on a valid path.
+	badHeader := &templates.API{
+		Name:            "header_jq_error",
+		Path:            "/bad-hdr",
+		Verb:            ptr.To(http.MethodGet),
+		Headers:         []string{"${1/0}"},
+		ContinueOnError: ptr.To(true),
+		ErrorKey:        ptr.To("errHdr"),
+	}
+	// Control: a VALID literal header MUST still dial, carrying its real value.
+	okHeader := &templates.API{
+		Name:            "header_ok_control",
+		Path:            "/good-hdr",
+		Verb:            ptr.To(http.MethodGet),
+		Headers:         []string{"Authorization: Bearer literal-token"},
+		ContinueOnError: ptr.To(true),
+		ErrorKey:        ptr.To("errOkHdr"),
+	}
+
+	beforeHeader := MalformedDialSkippedByReason(reasonJQHeaderError)
+	_ = Resolve(ctx, ResolveOptions{
+		RC:                  &rest.Config{},
+		Items:               []*templates.API{badHeader, okHeader},
+		RESTActionNamespace: "default",
+		RESTActionName:      "garbage-302-header",
+	})
+
+	mu.Lock()
+	got := append([]dialRec(nil), dials...)
+	mu.Unlock()
+
+	// The erroring-header stage must SKIP (never dial /bad-hdr). Only /good-hdr dials.
+	if len(got) != 1 || got[0].path != "/good-hdr" {
+		t.Fatalf("#302 header (RED pre-fix): expected exactly ONE dial (the valid-header control /good-hdr); got %+v — a header jq-error must SKIP the dial, never dial a request carrying a swallowed jq error as a header value", got)
+	}
+	// SECURITY: the one dialed request carries the intended Authorization, never
+	// an error string — a garbage-header dial can never leak onto the wire.
+	if got[0].auth != "Bearer literal-token" {
+		t.Fatalf("#302 header SECURITY: the dialed request's Authorization must be the intended value, never a jq-error string; got %q", got[0].auth)
+	}
+	if d := MalformedDialSkippedByReason(reasonJQHeaderError) - beforeHeader; d != 1 {
+		t.Fatalf("#302 header: the header-jq-error skip must bump the %q per-reason metric by 1; got delta %d", reasonJQHeaderError, d)
 	}
 }
 
