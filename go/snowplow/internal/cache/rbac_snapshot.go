@@ -938,7 +938,10 @@ func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionReso
 			if isBinding {
 				onBindingUpdate(oldObj, newObj)
 			} else {
-				onRoleObjectChanged(bumpSrcRoleUpdate, newObj)
+				// #257: thread BOTH sides so the role path can skip the bump on a
+				// rules-equal (label-only / relist) UPDATE. onRoleUpdated keeps the
+				// bumpSrcRoleUpdate source tag on a bump that fires (#260).
+				onRoleUpdated(oldObj, newObj)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
