@@ -246,15 +246,39 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		return "", nil, nil
 	}
 	// Path B direct call — derive BindingUID for the layer's GET-permit.
+	//
+	// #261 MARK-AT-MINT (pm load-bearing #4): the serve-time at-risk class is
+	// computed HERE, as a byproduct of the key-derivation EvaluateRBAC call, and
+	// carried on inputs.AtRiskClass so the L1 hit-site merely READS it — never
+	// re-evaluating RBAC or the bindings_by_gvr index at hit. winClass captures
+	// the case-2 RBAC fact (implicit-group winning subject) via the OPTIONAL
+	// out-param; EvaluateRBAC's public (bool,string,error) signature is
+	// unchanged. On deny/err the out-param is left at its default (regular).
+	var winClass rbac.WinningSubjectClass
 	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:  ui.Username,
-		Groups:    ui.Groups,
-		Verb:      "get",
-		Group:     group,
-		Resource:  resource,
-		Namespace: namespace,
-		Name:      name,
+		Username:               ui.Username,
+		Groups:                 ui.Groups,
+		Verb:                   "get",
+		Group:                  group,
+		Resource:               resource,
+		Namespace:              namespace,
+		Name:                   name,
+		WinningSubjectClassOut: &winClass,
 	})
+	// Assemble the mint-time at-risk MARK. Only meaningful for a real permit (a
+	// non-empty first-match BindingUID); a "" BindingUID serves as a MISS
+	// (serveFromCacheEligible) so it can never reach the hit-site bump. Case-2
+	// (implicit-group, the RBAC fact) takes precedence over case-3
+	// (roleref-unresolved, the index fact) in the rare overlap — see AtRiskClass.
+	atRiskClass := cache.AtRiskNone
+	if bindingUID != "" {
+		switch {
+		case winClass == rbac.SubjectClassImplicitGroup:
+			atRiskClass = cache.AtRiskImplicitGroup
+		case cache.IsRoleRefUnresolvedAtBuild(bindingUID):
+			atRiskClass = cache.AtRiskRolerefUnresolved
+		}
+	}
 	inputs := cache.ResolvedKeyInputs{
 		CacheEntryClass: handlerKind,
 		Group:           group,
@@ -284,6 +308,8 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		PerPage:                perPage,
 		Page:                   page,
 		Extras:                 extras,
+		// #261 MARK-AT-MINT — carried, NOT folded into ComputeKey (bookkeeping).
+		AtRiskClass: atRiskClass,
 	}
 	return cache.ComputeKey(inputs), c, &inputs
 }

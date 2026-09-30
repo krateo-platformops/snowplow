@@ -100,6 +100,14 @@ type snapshotAuthzKey struct {
 type snapshotAuthzVerdict struct {
 	Allowed           bool
 	MatchedBindingUID string
+	// WinningSubjectClass — #261 case-2. The FIRST-permitting binding's
+	// winning-subject class, persisted on the verdict at the EvaluateRBAC build
+	// site so a memo HIT (the hot at-risk serve path) surfaces it via
+	// EvaluateOptions.WinningSubjectClassOut. Field-transparent through
+	// storeWithCap (dev-271b confirmed #327's memo-cap rework is field-agnostic);
+	// it adds no cap/cardinality impact (not part of snapshotAuthzKey). Only
+	// meaningful when Allowed (denies are never cached).
+	WinningSubjectClass WinningSubjectClass
 }
 
 // snapshotAuthzShard is one generation's worth of memoised verdicts. The

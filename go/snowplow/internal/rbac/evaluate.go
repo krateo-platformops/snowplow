@@ -50,6 +50,38 @@ func ResetEvaluateRBACCallCount() {
 	evaluateRBACCallCount.Store(0)
 }
 
+// WinningSubjectClass classifies HOW the FIRST-permitting binding's WINNING
+// subject matched the request — the RBAC fact only the evaluator knows. It is
+// the #261 case-2 serve-time-detector substrate: a binding that permits a
+// request ONLY through an IMPLICIT group (system:authenticated, or a synthetic
+// system:serviceaccounts[:ns] group) rotates no per-subject RBAC sub-gen when
+// its grant changes (RBACSubGenForSubject sums only the presented ui.Groups,
+// not the implicit ones), so a grant/revoke through it can shift the serve-time
+// first-match BindingUID with NO sub-gen bump — the bounded self-stale-leak
+// carrier. Surfaced via EvaluateOptions.WinningSubjectClassOut (below) WITHOUT
+// widening EvaluateRBAC's public (bool,string,error) signature.
+//
+// CRITICAL (arch): it is the WINNING subject specifically — the FIRST subject
+// of the FIRST-permitting binding that matched. A binding whose requester
+// matched a REGULAR subject (User / a presented Group / a direct
+// ServiceAccount) is NOT implicit-group even if that same binding ALSO lists an
+// implicit subject; only the first-permitting match's subject counts.
+type WinningSubjectClass int
+
+const (
+	// SubjectClassRegular (0/default) — the winning subject was a direct User
+	// match, a match against one of the requester's PRESENTED groups
+	// (opts.Groups), or a direct ServiceAccount subject. Also the value left on
+	// a deny / cache-off / evaluator error (no winning subject).
+	SubjectClassRegular WinningSubjectClass = iota
+	// SubjectClassImplicitGroup — the winning subject matched via the implicit
+	// system:authenticated group, or via a synthetic system:serviceaccounts /
+	// system:serviceaccounts:<ns> group that exists only because the requester
+	// is a ServiceAccount (effectiveGroups' SA-synthetic additions). The
+	// #261 case-2 at-risk carrier.
+	SubjectClassImplicitGroup
+)
+
 // EvaluateOptions captures every input the evaluator needs to make a
 // permit/deny decision. Mirrors authorizationv1.ResourceAttributes so
 // the cache=off fallback (SubjectAccessReview) is a one-to-one mapping.
@@ -109,6 +141,24 @@ type EvaluateOptions struct {
 	// 17,929-CRB SA-refilter path this removes the per-item stable-sort
 	// (~43% of pod CPU at 50K scale — task-288 §levers L1).
 	SkipBindingUID bool
+
+	// WinningSubjectClassOut, when non-nil, is an OPTIONAL out-param the
+	// evaluator writes the FIRST-permitting binding's WinningSubjectClass into
+	// (#261 case-2). It mirrors SkipBindingUID's opt-in discipline: the
+	// zero-value struct (nil) preserves the pre-#261 behaviour exactly — no
+	// caller that does not opt in observes any change, and the public
+	// (bool,string,error) signature is UNCHANGED (the ~11 external EvaluateRBAC
+	// callers are untouched). ONLY the cache-key mint site
+	// (dispatchCacheLookupKey) sets it, to capture the case-2 class as a
+	// byproduct of the key-derivation call it already makes.
+	//
+	// The evaluator writes it ONLY on an ALLOW (SubjectClassRegular when
+	// permitted but not implicit-group; SubjectClassImplicitGroup when the
+	// winning subject was implicit). On a deny / cache-off / evaluator error it
+	// is LEFT UNTOUCHED (the caller's pre-set default — SubjectClassRegular —
+	// stands). It rides the snapshot-authz memo (snapshotAuthzVerdict) so a
+	// memo-HIT serve — the hot at-risk path — still surfaces the class.
+	WinningSubjectClassOut *WinningSubjectClass
 }
 
 // Ship B (0.30.138): the rbac-package GVR vars are dead — the snapshot
@@ -269,6 +319,13 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		SkipUID:    opts.SkipBindingUID,
 	}
 	if v, ok := authzMemoLookup(snap.PublishSeq, memoKey); ok {
+		// #261 case-2 — a memo HIT is the HOT at-risk serve path; surface the
+		// winning-subject class the cold walk persisted so a memo-hit serve does
+		// NOT lose it. Written only on an allow (per WinningSubjectClassOut's
+		// contract); a cached deny leaves the caller's default untouched.
+		if opts.WinningSubjectClassOut != nil && v.Allowed {
+			*opts.WinningSubjectClassOut = v.WinningSubjectClass
+		}
 		log.Debug("rbac.evaluate",
 			slog.String("path", "in-process-memo-hit"),
 			slog.String("user", opts.Username),
@@ -278,7 +335,8 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		return v.Allowed, v.MatchedBindingUID, nil
 	}
 
-	allowed, matchedBindingUID, err = evaluateAgainstInformerFirstMatch(ctx, snap, opts)
+	var winClass WinningSubjectClass
+	allowed, matchedBindingUID, winClass, err = evaluateAgainstInformerFirstMatch(ctx, snap, opts)
 	if err != nil {
 		log.Error("rbac.evaluate: informer evaluation failed",
 			slog.String("user", opts.Username), slog.Any("err", err))
@@ -309,10 +367,18 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 	// binding removal bumps PublishSeq and CAS-swaps the shard), so it is
 	// safe to cache; only the deny verdict can be transiently wrong.
 	if allowed {
+		// #261 case-2 — persist the winning-subject class on the verdict at the
+		// BUILD site so storeWithCap carries it unchanged (field-transparent) and
+		// a later memo-HIT serve surfaces it. Also write it to the caller's
+		// out-param on this cold-walk allow.
 		authzMemoStore(snap.PublishSeq, memoKey, snapshotAuthzVerdict{
-			Allowed:           true,
-			MatchedBindingUID: matchedBindingUID,
+			Allowed:             true,
+			MatchedBindingUID:   matchedBindingUID,
+			WinningSubjectClass: winClass,
 		})
+		if opts.WinningSubjectClassOut != nil {
+			*opts.WinningSubjectClassOut = winClass
+		}
 	} else {
 		authzMemoDenyUncached.Add(1)
 	}
@@ -361,7 +427,13 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 // COST: the sort is O(K log K) where K = candidate count. K is bounded:
 // admin matches ~50 CRBs at production scale; cyberjoker matches ~12.
 // The sort is negligible vs the rule-walk inside roleRefPermits.
-func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnapshot, opts EvaluateOptions) (bool, string, error) {
+//
+// #261 case-2 — the return is widened to also carry the FIRST-permitting
+// binding's WinningSubjectClass (SubjectClassRegular on every non-permit
+// return). The class is computed at the winning CRB/RB via
+// firstMatchSubjectClass; only this function's two in-package callers change
+// (EvaluateRBAC's cold-walk site). The verdict is unaffected.
+func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnapshot, opts EvaluateOptions) (bool, string, WinningSubjectClass, error) {
 	log := xcontext.Logger(ctx)
 
 	// 1) ClusterRoleBindings — apply cluster-wide. Cluster-wide
@@ -384,10 +456,10 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 		}
 		permits, err := roleRefPermits(snap, "", crb.RoleRef, opts, log)
 		if err != nil {
-			return false, "", err
+			return false, "", SubjectClassRegular, err
 		}
 		if permits {
-			return true, cache.BindingUIDFromCRB(crb), nil
+			return true, cache.BindingUIDFromCRB(crb), firstMatchSubjectClass(crb.Subjects, opts), nil
 		}
 	}
 
@@ -406,15 +478,68 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 			}
 			permits, err := roleRefPermits(snap, opts.Namespace, rb.RoleRef, opts, log)
 			if err != nil {
-				return false, "", err
+				return false, "", SubjectClassRegular, err
 			}
 			if permits {
-				return true, cache.BindingUIDFromRB(rb), nil
+				return true, cache.BindingUIDFromRB(rb), firstMatchSubjectClass(rb.Subjects, opts), nil
 			}
 		}
 	}
 
-	return false, "", nil
+	return false, "", SubjectClassRegular, nil
+}
+
+// firstMatchSubjectClass classifies the FIRST subject in subjects that matches
+// opts — the WINNING subject of a permitting binding — using the SAME match
+// order and rules as anySubjectMatches (so the subject it lands on is exactly
+// the one anySubjectMatches matched). It is called ONLY at a binding that has
+// already permitted (a matching subject is guaranteed to exist); the trailing
+// SubjectClassRegular return is a defensive fallback for the impossible
+// no-match case.
+//
+// #261 case-2: the class is IMPLICIT-GROUP iff the winning subject is a Group
+// subject that matched via system:authenticated, or via a synthetic
+// system:serviceaccounts[:ns] group that exists only because the requester is a
+// ServiceAccount (effectiveGroups' SA additions). A User match, a match against
+// a PRESENTED group (opts.Groups), or a direct ServiceAccount subject is
+// REGULAR. The winning subject specifically decides the class — a binding whose
+// requester matched a regular subject is NOT implicit-group even if it also
+// lists an implicit subject (regular subjects are checked in subject order, so
+// the first matching subject wins).
+func firstMatchSubjectClass(subjects []rbacv1.Subject, opts EvaluateOptions) WinningSubjectClass {
+	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
+	for _, s := range subjects {
+		switch s.Kind {
+		case rbacv1.UserKind:
+			if s.Name == opts.Username {
+				return SubjectClassRegular
+			}
+		case rbacv1.GroupKind:
+			// A PRESENTED group (opts.Groups) match is REGULAR — checked first
+			// so an author-presented group name that happens to collide with a
+			// synthetic name is classed as regular.
+			for _, g := range opts.Groups {
+				if s.Name == g {
+					return SubjectClassRegular
+				}
+			}
+			// A synthetic system:serviceaccounts[:ns] group match — present only
+			// because the requester is a ServiceAccount — is IMPLICIT.
+			if isSA && (s.Name == allServiceAccountsGroup || s.Name == serviceAccountsNamespacePfx+saNS) {
+				return SubjectClassImplicitGroup
+			}
+			// system:authenticated is an IMPLICIT group for every authenticated
+			// request (mirrors anySubjectMatches' username-gated branch).
+			if s.Name == "system:authenticated" && opts.Username != "" {
+				return SubjectClassImplicitGroup
+			}
+		case rbacv1.ServiceAccountKind:
+			if isSA && s.Namespace == saNS && s.Name == saName {
+				return SubjectClassRegular
+			}
+		}
+	}
+	return SubjectClassRegular
 }
 
 // sortCRBsStable sorts candidate CRBs into stable lexicographic order

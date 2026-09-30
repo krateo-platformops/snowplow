@@ -363,6 +363,28 @@ type ResolvedEntry struct {
 //
 // HG-178.6 falsifier: no `Username string` + `Groups []string` literal
 // columns survive in ResolvedKeyInputs for restactions/widgets.
+// AtRiskClass is the #261 serve-time-detector MARK computed at KEY-MINT (as a
+// byproduct of the mint-time EvaluateRBAC key-derivation call + a bindings_by_gvr
+// index query) and carried on ResolvedKeyInputs so the L1 hit-site merely READS
+// it — never re-evaluates RBAC or the index at hit (pm load-bearing #4). It
+// records WHY a served cell is at risk for the bounded self-stale-leak class
+// (a BindingUID identity key that can rotate with no sub-gen bump). Observability
+// only; the keying fix is v7-deferred.
+type AtRiskClass int
+
+const (
+	// AtRiskNone (0/default) — the mint found no at-risk carrier for this cell.
+	AtRiskNone AtRiskClass = iota
+	// AtRiskImplicitGroup — #261 case-2: the mint-time first-permitting binding's
+	// winning subject matched only through an implicit group (an RBAC fact from
+	// EvaluateRBAC's WinningSubjectClassOut).
+	AtRiskImplicitGroup
+	// AtRiskRolerefUnresolved — #261 case-3: the mint-time first-permitting
+	// BindingUID was roleRef-unresolved at the last bindings_by_gvr index build
+	// (a cache-index fact from IsRoleRefUnresolvedAtBuild).
+	AtRiskRolerefUnresolved
+)
+
 type ResolvedKeyInputs struct {
 	// CacheEntryClass is the entry-class discriminant — one of the string
 	// values "restactions", "widgets", "apistage", "widgetContent", or
@@ -465,6 +487,25 @@ type ResolvedKeyInputs struct {
 	// an authz-staleness bug), ticketed separately. UNLIKE HasUAF this IS folded
 	// into ComputeKey → resolvedKeyVersion (v4→v5→v6 across (c) and (c)-v2).
 	RBACSubGen uint64
+
+	// AtRiskClass — #261 serve-time-detector MARK-AT-MINT. Computed by
+	// dispatchCacheLookupKey as a byproduct of the SAME EvaluateRBAC call that
+	// derives BindingUID (case-2 via WinningSubjectClassOut) plus a
+	// bindings_by_gvr IsRoleRefUnresolvedAtBuild query (case-3), so the L1
+	// hit-site READS this mark and bumps the matching detector counter WITHOUT
+	// re-evaluating RBAC or the index at hit (pm load-bearing #4). Both classes
+	// flow through ONE hit-site read+bump.
+	//
+	// EXCLUDED FROM COMPUTEKEY. Like RepresentativeUsername/Groups and HasUAF
+	// above, this is bookkeeping carried on the derived inputs, NOT key material
+	// — ComputeKey does not hash it, so adding it does NOT shift the key space
+	// (no resolvedKeyVersion bump) and a cell keeps the SAME key. When both
+	// carriers hold for one cell (rare — a case-3 binding re-resolved since
+	// build whose winning subject is also implicit), AtRiskImplicitGroup takes
+	// precedence (the RBAC-fact carrier the plan lists first); the class as a
+	// whole still bumps, so off-zero → reassess is preserved (no silent
+	// false-zero for the at-risk population).
+	AtRiskClass AtRiskClass
 }
 
 // resolvedKeyVersion is folded into every key hash so a key-schema
@@ -608,6 +649,38 @@ type ResolvedCacheStore struct {
 	// putRefusedGenerationMovedTotal counts PutIfGen refusals (the generation
 	// moved between capture and write). Atomic; safe to read without mu.
 	putRefusedGenerationMovedTotal atomic.Uint64
+
+	// serveMissedRotationAtriskRolerefUnresolved counts serve-time L1 HITs of a
+	// cell whose serve-time first-permitting BindingUID was roleRef-UNRESOLVED
+	// at the last bindings_by_gvr index build (#261 case-3). Bumped HIT-GATED
+	// ONLY from the restactions serve hit-site.
+	//
+	// T1/T3 SEMANTICS (documented in code per the plan): this measures the
+	// AT-RISK SERVE POPULATION — a STRUCTURAL PROXY for the bounded
+	// self-stale-leak class where a BindingUID identity key can rotate with no
+	// sub-gen bump — NOT a confirmed-stale-leak count. Off-zero means an
+	// at-risk-keyed cell was served → REASSESS (the keying fix is v7-deferred);
+	// it is NEVER "N leaks". Zero means no at-risk cell was served (matches the
+	// 057 0/2517 baseline). It reads NON-ZERO exactly during the defect surface
+	// (a real at-risk serve), so it is a during-defect detector, not a
+	// zero-reads-as-health non-detector. Atomic; safe to read without mu.
+	serveMissedRotationAtriskRolerefUnresolved atomic.Uint64
+
+	// serveMissedRotationAtriskImplicitGroup counts serve-time L1 HITs of a cell
+	// whose serve-time first-permitting binding's WINNING subject matched only
+	// through an IMPLICIT group — system:authenticated, or a synthetic
+	// system:serviceaccounts[:ns] group (#261 case-2, the RBAC-fact carrier).
+	// RBACSubGenForSubject sums only the requester's PRESENTED groups, so a
+	// grant/revoke through such a binding rotates the serve-time first-match
+	// BindingUID with NO sub-gen bump — the bounded self-stale-leak carrier.
+	// Bumped HIT-GATED ONLY from the restactions serve hit-site, off a MARK the
+	// key-mint stamped (never re-evaluated at hit). Same T1/T3 SEMANTICS as
+	// serveMissedRotationAtriskRolerefUnresolved above: this is the AT-RISK
+	// SERVE POPULATION (a structural proxy), NOT a confirmed-stale-leak count —
+	// off-zero means an at-risk-keyed cell was served → REASSESS (the keying fix
+	// is v7-deferred), never "N leaks"; zero means no at-risk cell served
+	// (matches the 057 baseline). Atomic; safe to read without mu.
+	serveMissedRotationAtriskImplicitGroup atomic.Uint64
 
 	// Ship E (0.30.116) api-stage counters. apistageStoreTotal counts
 	// Put()s of an "apistage"-kind entry; apistageEvictTotal counts
@@ -1564,6 +1637,19 @@ type ResolvedCacheStats struct {
 	// write, so a DELETE-evicted body was NOT resurrected). Reads non-zero
 	// exactly when the write-side resurrection race is being closed.
 	PutRefusedGenerationMovedTotal uint64
+
+	// #261 case-3 — serve-time L1 HITs of a cell whose first-permitting
+	// BindingUID was roleRef-unresolved at the last bindings_by_gvr index build.
+	// AT-RISK SERVE POPULATION proxy (see the store field's T1/T3 note), NOT a
+	// confirmed-leak count: off-zero => reassess, never N leaks.
+	ServeMissedRotationAtriskRolerefUnresolved uint64
+
+	// #261 case-2 — serve-time L1 HITs of a cell whose first-permitting
+	// binding's winning subject matched only through an IMPLICIT group
+	// (system:authenticated / synthetic system:serviceaccounts[:ns]). AT-RISK
+	// SERVE POPULATION proxy (see the store field's T1/T3 note), NOT a
+	// confirmed-leak count: off-zero => reassess, never N leaks.
+	ServeMissedRotationAtriskImplicitGroup uint64
 }
 
 func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
@@ -1603,7 +1689,40 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		ResidentDemoteTotal:     c.residentDemoteTotal.Load(),
 
 		PutRefusedGenerationMovedTotal: c.putRefusedGenerationMovedTotal.Load(),
+
+		ServeMissedRotationAtriskRolerefUnresolved: c.serveMissedRotationAtriskRolerefUnresolved.Load(),
+
+		ServeMissedRotationAtriskImplicitGroup: c.serveMissedRotationAtriskImplicitGroup.Load(),
 	}
+}
+
+// BumpServeMissedRotationAtriskImplicitGroup increments the #261 case-2
+// at-risk-serve counter. Called HIT-GATED ONLY from the restactions serve
+// hit-site (dispatchers) when the served cell's mint-carried at-risk class is
+// implicit_group (the first-permitting binding's winning subject matched via an
+// implicit group). Nil-safe. Mirrors the roleref-unresolved bump discipline
+// (atomic, off-mu). The value it feeds is a STRUCTURAL PROXY for the AT-RISK
+// SERVE POPULATION, not a confirmed-leak count (see the store field's T1/T3
+// note).
+func (c *ResolvedCacheStore) BumpServeMissedRotationAtriskImplicitGroup() {
+	if c == nil {
+		return
+	}
+	c.serveMissedRotationAtriskImplicitGroup.Add(1)
+}
+
+// BumpServeMissedRotationAtriskRolerefUnresolved increments the #261 case-3
+// at-risk-serve counter. Called HIT-GATED ONLY from the restactions serve
+// hit-site (dispatchers) when the served cell's first-permitting BindingUID
+// was roleRef-unresolved at the last bindings_by_gvr index build. Nil-safe.
+// Mirrors the putRefusedGenerationMovedTotal.Add(1) bump discipline (atomic,
+// off-mu). The value it feeds is a STRUCTURAL PROXY for the AT-RISK SERVE
+// POPULATION, not a confirmed-leak count (see the store field's T1/T3 note).
+func (c *ResolvedCacheStore) BumpServeMissedRotationAtriskRolerefUnresolved() {
+	if c == nil {
+		return
+	}
+	c.serveMissedRotationAtriskRolerefUnresolved.Add(1)
 }
 
 // ResolvedEntryMeta is the METADATA-ONLY projection of one cached

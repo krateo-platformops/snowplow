@@ -79,7 +79,9 @@ func TestResolvedCacheStatsByStat_ReportsLiveStore(t *testing.T) {
 		"apistage_store_total", "apistage_evict_total",
 		"widget_content_store_total", "widget_content_evict_total",
 		"ra_full_list_store_total", "ra_full_list_evict_total",
-		"put_refused_generation_moved_total", // #189 write-side generation guard
+		"put_refused_generation_moved_total",              // #189 write-side generation guard
+		"serve_missed_rotation_atrisk_roleref_unresolved", // #261 case-3 serve-time detector
+		"serve_missed_rotation_atrisk_implicit_group",     // #261 case-2 serve-time detector
 	}
 	for _, k := range want {
 		if _, ok := stats[k]; !ok {
