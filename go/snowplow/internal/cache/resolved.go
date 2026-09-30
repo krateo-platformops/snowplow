@@ -576,9 +576,16 @@ type ResolvedCacheStore struct {
 	missTotal        atomic.Uint64
 	evictLRUTotal    atomic.Uint64
 	evictTTLTotal    atomic.Uint64
-	evictMaxAgeTotal atomic.Uint64 // 1.12.6 C5: Get-time evictions past maxEntryAge
+	evictMaxAgeTotal atomic.Uint64 // 1.12.6 C5: evictions past maxEntryAge (Get-lazy + #248 reaper)
 	evictDeleteTotal atomic.Uint64 // 0.30.8: DELETE-event-driven evictions
 	storeTotal       atomic.Uint64
+
+	// #248 — resident cells carrying a live refreshSuppressed marker, recomputed
+	// on every reaper walk (startResolvedCacheSummary tick). This is a GAUGE, not
+	// a monotonic counter: it reads non-zero DURING the decline-freeze (the ~143
+	// UAF-declined-and-never-refreshed cells) and distinguishes them from
+	// never-yet-refreshed cells (not suppressed). A during-defect detector.
+	suppressedResidentGauge atomic.Uint64
 
 	// Ship E (0.30.116) api-stage counters. apistageStoreTotal counts
 	// Put()s of an "apistage"-kind entry; apistageEvictTotal counts
@@ -1323,8 +1330,13 @@ type ResolvedCacheStats struct {
 	StoreTotal       uint64
 	EvictLRUTotal    uint64
 	EvictTTLTotal    uint64
-	EvictMaxAgeTotal uint64 // 1.12.6 C5: evicted at Get past RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS
+	EvictMaxAgeTotal uint64 // 1.12.6 C5: evicted past RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS (Get-lazy + #248 reaper)
 	EvictDeleteTotal uint64 // 0.30.8: DELETE-event-driven evictions
+
+	// #248 — resident-suppressed gauge (see suppressedResidentGauge). Non-zero
+	// DURING the UAF-decline-freeze; distinguishes decline-frozen from
+	// never-yet-refreshed cells.
+	SuppressedResident uint64
 
 	// Ship E (0.30.116) api-stage counters.
 	ApistageStoreTotal uint64
@@ -1367,6 +1379,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		EvictTTLTotal:           c.evictTTLTotal.Load(),
 		EvictMaxAgeTotal:        c.evictMaxAgeTotal.Load(),
 		EvictDeleteTotal:        c.evictDeleteTotal.Load(),
+		SuppressedResident:      c.suppressedResidentGauge.Load(),
 		ApistageStoreTotal:      c.apistageStoreTotal.Load(),
 		ApistageEvictTotal:      c.apistageEvictTotal.Load(),
 		WidgetContentStoreTotal: c.widgetContentStoreTotal.Load(),
@@ -2041,6 +2054,91 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	return true
 }
 
+// reapMaxAgeBatch bounds the per-batch mutex hold of the #248 reaper's full walk,
+// mirroring the /debug/reconcile full walk (reconcileFullBatch).
+const reapMaxAgeBatch = 512
+
+// reapPastMaxEntryAge is the #248 read-independent maxEntryAge reaper. It closes
+// the lazy-enforcement hole: both TTL (CreatedAt, Get:~1045) and maxEntryAge
+// (BornAt, Get:~1058) are enforced ONLY inside Get, so a cell that is
+// refresh-SUPPRESSED (the refresher skips it) AND never read is evicted by neither
+// and lives forever — the ~143 UAF-decline-frozen `widgets` cells at ~19h.
+//
+// SCOPE (R2, per the #248 design steer): evict entries that are BOTH suppressed
+// AND past maxEntryAge — precisely the frozen class. A non-suppressed cell is left
+// to the lazy Get path (it is served, so it hits the lazy maxEntryAge evict on its
+// own reads); reaping it here would manufacture a cold navigation. Post-reap the
+// frozen UAF cell is served LIVE (fresh, uncached) on its next read instead of
+// frozen-stale, so this strictly IMPROVES freshness for the class.
+//
+// It also recomputes the resident-suppressed gauge over the full walk (the
+// during-defect detector). Runs once per startResolvedCacheSummary tick. Returns
+// the number of entries reaped this pass.
+//
+// A FULL walk (not sampled like the C3 reconcile): a hard bound at maxEntryAge
+// requires every past-cap cell reaped, which a probabilistic sample would not give.
+// Candidate keys are collected under the per-batch hold and evicted AFTER the walk,
+// because the per-key evict takes c.mu itself and must not nest inside the walk.
+func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
+	if c == nil {
+		return 0
+	}
+	maxAgeSec := int64(c.maxEntryAge.Seconds())
+	suppressedResident := 0
+	var candidates []string
+	c.RangeMetadataBatched(reapMaxAgeBatch, func(metas []ResolvedEntryMeta, _ time.Duration) bool {
+		for i := range metas {
+			m := metas[i]
+			if _, suppressed := RefreshSuppressedReason(m.KeyHash); suppressed {
+				suppressedResident++
+				if maxAgeSec > 0 && m.LifetimeSeconds > maxAgeSec {
+					candidates = append(candidates, m.KeyHash)
+				}
+			}
+		}
+		return true // FULL walk
+	})
+	c.suppressedResidentGauge.Store(uint64(suppressedResident))
+
+	reaped := 0
+	for _, key := range candidates {
+		if c.reapOneMaxAgeSuppressed(key) {
+			reaped++
+		}
+	}
+	return reaped
+}
+
+// reapOneMaxAgeSuppressed re-validates under c.mu — the entry may have been read,
+// re-Put, or un-suppressed (a customer /call re-Put clears the marker) since the
+// walk — that key is still resident, still suppressed, and still past maxEntryAge,
+// then evicts it through the SAME internal the lazy Get maxAge path uses:
+// removeElementLocked (which clears the refreshSuppressed marker at :1860 and
+// strips dep edges at :1898) + evictMaxAgeTotal. It deliberately does NOT use
+// deleteForDep, which bumps evict_delete_total — the informer-DELETE H1 live
+// discriminator that a reaper must never move.
+func (c *ResolvedCacheStore) reapOneMaxAgeSuppressed(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.maxEntryAge <= 0 {
+		return false
+	}
+	el, ok := c.index[key]
+	if !ok {
+		return false
+	}
+	if _, suppressed := RefreshSuppressedReason(key); !suppressed {
+		return false // un-suppressed since the walk (e.g. a customer re-Put) — R2 leaves it
+	}
+	item := el.Value.(*lruItem)
+	if item.entry == nil || item.entry.BornAt.IsZero() || time.Since(item.entry.BornAt) <= c.maxEntryAge {
+		return false // read/re-validated young — never over-evict a within-cap cell
+	}
+	c.removeElementLocked(el)
+	c.evictMaxAgeTotal.Add(1)
+	return true
+}
+
 // startResolvedCacheSummary launches a single bounded goroutine that
 // emits a `resolved_cache.summary` INFO line every N seconds. The
 // goroutine self-suppresses on duplicate starts via resolvedCacheStarted.
@@ -2079,6 +2177,13 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 			case <-stop:
 				return
 			case <-t.C:
+				// #248 — read-independent maxEntryAge reap of the suppressed-frozen
+				// class, and refresh of the resident-suppressed gauge, BEFORE the
+				// snapshot so this tick's line reflects them. Hosted in #206's
+				// stoppable case <-t.C: arm: a concurrent stop is observed by the
+				// NEXT tick, so stop+join completes after at most one bounded,
+				// batched reap walk (no mid-walk preemption needed).
+				reapedMaxAge := c.reapPastMaxEntryAge()
 				s := c.Stats()
 				d := Deps().Stats()
 				r := refresherStatsSnapshot()
@@ -2095,6 +2200,8 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 					slog.Uint64("evict_lru", s.EvictLRUTotal),
 					slog.Uint64("evict_ttl", s.EvictTTLTotal),
 					slog.Uint64("evict_max_age", s.EvictMaxAgeTotal),
+					slog.Int("reap_max_age_evicted", reapedMaxAge),
+					slog.Uint64("suppressed_resident", s.SuppressedResident),
 					slog.Uint64("evict_delete", s.EvictDeleteTotal),
 					slog.Uint64("refresh_enqueued", d.EnqueueUpdateTotal),
 					slog.Uint64("refresh_completed", r.completed),
