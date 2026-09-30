@@ -468,6 +468,34 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 		// C-3 (a normal "continue" condition): an iterator stage evaluated to
 		// zero items, so there is nothing to call. Benign and per-resolve —
 		// DEBUG, not the WARN that dominates the healthy-cluster firehose.
+		//
+		// #279 C3 empty-fan fix: with zero request options the per-item edge-3
+		// recorder below (the `for i := range tmp` loop) never runs, so the
+		// fanned GVR's (gvr, ns, "*") LIST edge is never recorded and a later CR
+		// ADD of that GVR dirty-marks nothing → stale-negative. The target GVR is
+		// STATIC in the path template even with 0 items, so record the LIST edge
+		// from the skeleton here. ParseAPIServerListDepSkeleton returns ok=false
+		// on a templated version/resource → we skip and leave that residual to
+		// the #285 seed re-walk fence. Same guards as the edge-3 loop (L1 key
+		// present, cache on, GET) + nil-safe cache.Global() per the #277
+		// ensureInformer seam. Scope: cures the own-GVR list-then-get-each fan; a
+		// cross-GVR iterator's invalidation is the source stage's own LIST edge.
+		if l1Key := cache.L1KeyFromContext(r.ctx); l1Key != "" && !cache.Disabled() &&
+			ptr.Deref(apiCall.Verb, http.MethodGet) == http.MethodGet {
+			if gvr, ns, ok := cache.ParseAPIServerListDepSkeleton(apiCall.Path); ok {
+				cache.Deps().RecordList(l1Key, gvr, ns)
+				if rw := cache.Global(); rw != nil {
+					rw.EnsureResourceType(gvr)
+				}
+				r.log.Debug("dep.recorded",
+					slog.String("subsystem", "cache"),
+					slog.String("edge_type", "emptyFanSkeleton"),
+					slog.String("gvr", gvr.String()),
+					slog.String("ns", ns),
+					slog.String("l1_key", l1Key),
+				)
+			}
+		}
 		r.log.Debug("empty request options for http call", slog.Any("name", id))
 		return tmp
 	}
