@@ -1518,6 +1518,11 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// so the content cell matches the dispatcher's serve-time lookup
 	// (which composes its key from paginationInfo's URL-derived tuple).
 	wcKey, _ := widgetContentL1Key(gvr, in.GetNamespace(), in.GetName(), keyPerPage, keyPage)
+	// #323 — capture the content cell's generation BEFORE widgets.Resolve below, so
+	// populateWidgetContentL1's post-readyz PutIfGen refuses (rather than
+	// resurrecting) if a DELETE lands during this keep-warm / gvr-discovered
+	// re-resolve. Cheap + nil-safe; used only on the post-readyz guarded path.
+	wcGen0 := cache.ResolvedCache().CaptureGen(wcKey)
 	resolveCtx := ctx
 	if wcKey != "" {
 		resolveCtx = cache.WithL1KeyContext(ctx, wcKey)
@@ -1620,7 +1625,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// stage-error sink installed above — and bumped by this widget's
 	// apiRef RESTAction resolve — reaches populateWidgetContentL1's
 	// Cache-A gate. The bare ctx carries no sink; resolveCtx does.
-	populateWidgetContentL1(resolveCtx, gvr, in, keyPerPage, keyPage, res)
+	populateWidgetContentL1(resolveCtx, gvr, in, keyPerPage, keyPage, res, wcGen0)
 
 	// Path 3.2.2.b (0.30.221) — DEFERRED apiRef pagination. Path 3.2.2
 	// (0.30.220) ran iterateApiRefPages INLINE here on the Phase 1

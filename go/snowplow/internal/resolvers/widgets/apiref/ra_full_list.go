@@ -306,6 +306,14 @@ func raFullListServe(
 		return nil, false, nil
 	}
 
+	// #323 — capture the raKey cell's generation ONCE here, BEFORE either
+	// unpaginated re-resolve below (resolveRA at the repopulate + first-sight
+	// branches), so both tail PutRAFullListIfGen writes refuse (rather than
+	// resurrecting a pre-delete full body) if the RA-CR / its backing objects are
+	// DELETE-evicted during the resolve. PutIfGen (insert-or-replace): this is the
+	// SERVE path and first-populates the raKey cell on a cold /call.
+	raGen0 := c.CaptureGen(raKey)
+
 	// widgetL1Key is the ORIGINAL widget cell's key (the request ctx's L1
 	// key), NEVER fullCtx/raKey. #277 / edge-3: the serve seams replay the
 	// raKey cell's backing edges onto THIS key so a backing-object mutation
@@ -386,18 +394,23 @@ func raFullListServe(
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
-		c.PutRAFullList(raKey, keyInputs, full)
-		cache.Deps().Record(raKey, gvr, namespace, name)
-		// #277 / edge-3: the unpaginated resolve above recorded the backing
-		// edges under raKey (fullCtx); replay them onto the widget key so this
-		// widget's cell is invalidated by a backing mutation too. Same
-		// defensive TOCTOU decline as the hit branch — an empty edge set means
-		// the cell we just Put carries no backing edge, so fall through.
-		edges := cache.Deps().EdgesUnder(raKey)
-		if len(edges) == 0 {
-			return nil, false, nil
+		// #323 — generation-guarded write: on accept, record the self-dep + replay
+		// the backing edges; on REFUSE (a DELETE-eviction bumped the generation
+		// during the unpaginated resolve) skip the cache-side wiring (no cell was
+		// stored — do not resurrect) and serve the fresh slice `sliced` directly.
+		if c.PutRAFullListIfGen(raKey, keyInputs, full, raGen0) {
+			cache.Deps().Record(raKey, gvr, namespace, name)
+			// #277 / edge-3: the unpaginated resolve above recorded the backing
+			// edges under raKey (fullCtx); replay them onto the widget key so this
+			// widget's cell is invalidated by a backing mutation too. Same
+			// defensive TOCTOU decline as the hit branch — an empty edge set means
+			// the cell we just Put carries no backing edge, so fall through.
+			edges := cache.Deps().EdgesUnder(raKey)
+			if len(edges) == 0 {
+				return nil, false, nil
+			}
+			cache.Deps().ReplayEdges(widgetL1Key, edges)
 		}
-		cache.Deps().ReplayEdges(widgetL1Key, edges)
 		cache.RecordRAFullListServe(cache.RAFullListServeRepopulateSlice)
 		return sliced, true, nil
 	}
@@ -520,7 +533,11 @@ func raFullListServe(
 	// Sliceable — Put the full cell (possibly pinned by cost predicate),
 	// then serve the verified Go-slice. The RA-CR self-dep was already
 	// recorded above (symmetric with the false branch — Ship #91).
-	c.PutRAFullList(raKey, keyInputs, full)
+	// #323 — generation-guarded write: a REFUSE (DELETE-eviction during the
+	// resolve bumped the generation) declines the cache fill without resurrecting
+	// the pre-delete body; the verified slice sGo is served regardless, and the
+	// self-dep Record above (the Lever-C memo wiring) stands either way.
+	c.PutRAFullListIfGen(raKey, keyInputs, full, raGen0)
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
 	return sGo, true, nil
 }

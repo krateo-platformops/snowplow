@@ -48,8 +48,9 @@ func raFullListPinBytesThreshold() int64 {
 // marshal) and whether the cell was pinned.
 //
 // Inputs is stored so the refresher re-resolves the cell on a dirty-mark
-// (and re-pins — see PutRAFullListPinned). A nil/marshal-fail full is a
-// no-op returning (nil,false).
+// (and re-pins via the refresher's own path — resolve_populate.go carries the
+// prior pin and re-Puts through the #189-guarded ReplaceIfGen). A nil/marshal-
+// fail full is a no-op returning (nil,false).
 func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs, full map[string]any) ([]byte, bool) {
 	if c == nil {
 		return nil, false
@@ -70,27 +71,45 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 	return encoded, pin
 }
 
-// PutRAFullListPinned stores a RAFullList cell with an EXPLICIT pin decision
-// (the PIP prewarm + refresher path, which has measured the resolve
-// wall-clock and decided expensiveness from the PIPStageTiming sink rather
-// than re-deriving from envelope bytes). pin=true requests the resident
-// region (honoured by Put subject to the resident budget). Used so a
-// prewarmed expensive cell is pinned even if its envelope happens to be
-// under the byte threshold, and so the refresher RE-pins on every
-// re-resolve (never demoting a pinned cell on a dirty-mark).
-func (c *ResolvedCacheStore) PutRAFullListPinned(key string, inputs ResolvedKeyInputs, encoded []byte, pin bool) {
-	if c == nil || encoded == nil {
-		return
+// PutRAFullListIfGen is the #323 generation-guarded PutRAFullList. It stores the
+// RA full-result cell ONLY if key's generation still equals capturedGen — the
+// value captured (via CaptureGen) BEFORE the raFullListServe re-resolve that
+// produced `full`. If a DELETE-eviction bumped the generation during that
+// resolve, the write is REFUSED (the pre-delete full body is not resurrected) and
+// it returns false — the caller still serves the fresh slice from its already-
+// resolved `full` and declines the dep-Record. Returns true iff the cell was
+// stored. Same marshal + cost-based pin predicate as PutRAFullList; a nil/marshal-
+// fail full is a no-op returning false. PutIfGen (insert-or-replace), not
+// ReplaceIfGen: raFullListServe is the SERVE path and first-populates the raKey
+// cell on a cold /call, so an insert-on-absent (gen 0) must succeed.
+func (c *ResolvedCacheStore) PutRAFullListIfGen(key string, inputs ResolvedKeyInputs, full map[string]any, capturedGen uint64) bool {
+	if c == nil {
+		return false
 	}
-	in := inputs
-	// uaf-scope-waiver: UNREACHABLE for a refilter-narrowed body, same as PutRAFullList above. This explicit-pin path only ever re-Puts a cell that raFullListServe (gated) or the refresher (gated) already produced; a UAF RA never produces one.
-	// scope-waiver:TTLOverride: raFullList-class cell (explicit-pin path) — same class as PutRAFullList above, same 1.12.3 A-1 CORRECTED reasoning: NOT "UAF output never lands here" (it did), but "a UAF-bearing RA can no longer reach this Put" — raFullListServe bypasses the layer for it, and this explicit-pin path re-Puts only cells that path (or the refresher, over its stored Inputs) already produced (uaf_shortttl.go R-d-4 SITE MAP, "THE FOURTH SITE").
-	c.Put(key, &ResolvedEntry{
+	encoded, err := json.Marshal(full)
+	if err != nil {
+		return false
+	}
+	pin := int64(len(encoded)) >= raFullListPinBytesThreshold()
+	in := inputs // copy onto the heap for the entry
+	// uaf-scope-waiver: UNREACHABLE for a refilter-narrowed body — twin of PutRAFullList above. The only caller is apiref.raFullListServe, which bypasses this whole layer (returns served=false) for a RESTAction declaring a userAccessFilter BEFORE it derives the key, so no refilter output can arrive here. The #323 generation guard does not change the UAF-scope reasoning — it is the same identity-free cell as PutRAFullList (uaf_shortttl.go R-d-4 SITE MAP).
+	// scope-waiver:TTLOverride: raFullList-class cell — identical class + reasoning to PutRAFullList above (a UAF-bearing RA can no longer reach this Put; raFullListServe bypasses the whole layer for it before deriving the key), uaf_shortttl.go R-d-4 SITE MAP "THE FOURTH SITE".
+	return c.PutIfGen(key, &ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &in,
 		Pinned:  pin,
-	})
+	}, capturedGen)
 }
+
+// #323 — PutRAFullListPinned (an explicit-pin RAFullList re-Put) was REMOVED
+// here as dead code: it had zero call sites (verified across all *.go incl.
+// tests; no method-value / interface use). Leaving it unguarded would have been
+// a #189-resurrection loaded gun — a future caller would get an un-gen-guarded
+// Put with no arm covering it. The live RAFullList re-pin path is the refresher
+// (resolve_populate.go: CacheEntryClassRAFullList → prePinned → ReplaceIfGen),
+// already generation-guarded by #189. If an explicit-pin re-Put is ever needed
+// again, add it as a gen-guarded variant (ReplaceIfGen — a re-pin replaces a
+// resident cell and must never resurrect an evicted one).
 
 // --- Serve-outcome metrics ---------------------------------------------
 //

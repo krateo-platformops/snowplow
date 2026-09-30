@@ -151,6 +151,10 @@ func populateWidgetContentL1(
 	in *unstructured.Unstructured,
 	perPage, page int,
 	res *unstructured.Unstructured,
+	// #323 — the walker's CaptureGen(contentKey), taken BEFORE widgets.Resolve.
+	// Used only on the post-readyz guarded path (cache.IsPhase1Done()); ignored on
+	// the pre-readyz boot-seed plain Put. Test/boot callers pass 0.
+	capturedGen uint64,
 ) {
 	if in == nil || res == nil {
 		return
@@ -328,21 +332,40 @@ func populateWidgetContentL1(
 		return
 	}
 
-	// #189 / #323 — this content Put is a genuine resurrection carrier that is
-	// DEFERRED to #323 (not exempt). populateWidgetContentL1 is called by the
-	// prewarm walkers, but the keep-warm sweep (prewarm_engine_boot.go →
-	// rePrewarmKeepwarm → the shared walk) re-Puts this cell POST-readyz on the
-	// TTL×3/4 ticker, and the widget dispatcher SERVES it (widgets.go:186 Get) — so
-	// a DELETE during a keep-warm re-resolve can resurrect a served body. It is a
-	// widgetContent CONTENT cell whose interim staleness is TTL + #248-reaper
-	// bounded (same class as cluster_list / PutRAFullList), which is why it rides
-	// #323 with a keep-warm-race acceptance arm rather than #189's directly-served
-	// set. Left a plain Put here until #323 threads CaptureGen/PutIfGen.
+	// #189 / #323 — this widgetContent CONTENT cell is a genuine resurrection
+	// carrier (the keep-warm sweep re-Puts it POST-readyz and the dispatcher SERVES
+	// it, widgets.go:186 Get). #323 GENERATION-GUARDS it: the walker captures this
+	// cell's generation (capturedGen) BEFORE widgets.Resolve and threads it here, so
+	// a DELETE landing during that (keep-warm / gvr-discovered) post-readyz
+	// re-resolve REFUSES the write rather than resurrecting a pre-delete served
+	// body. The pre-readyz BOOT seed is EXEMPT (plain Put): no served /call can race
+	// it (the boot-seed exemption). cache.IsPhase1Done() — the same atomic /readyz
+	// consults — is the authoritative pre/post-readyz boundary (the seed-mode
+	// discriminator freshness-audit ruled; seedScopeMode is not threaded into walk()).
 	// scope-waiver:TTLOverride: widgetContent-class cell — identity-free shared envelope, per-user serve-time filter (gateWidgetEnvelope). 1.12.3 A-1/R-1: it holds no per-user UAF refilter output because a refilter-touched resolve can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it) — previously this rested on isRBACSensitiveApiRefWidget's routing argument alone, which the R-1 finding showed is not a safe basis for a UAF claim (uaf_shortttl.go R-d-4 SITE MAP).
-	c.Put(key, &cache.ResolvedEntry{
+	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
-	})
+	}
+	if cache.IsPhase1Done() {
+		// Post-readyz (keep-warm / gvr-discovered) re-Put — generation-guarded.
+		// PutIfGen (insert-or-replace): gvr-discovered cells FIRST-fill post-readyz,
+		// so an insert-on-absent (gen 0) must succeed; a mid-resolve DELETE tombstones
+		// the gen → refuse.
+		if !c.PutIfGen(key, entry, capturedGen) {
+			log.Debug("widget_content.populate_refused_gen_moved",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.String("ns", in.GetNamespace()),
+				slog.String("name", in.GetName()),
+				slog.String("effect", "#323 DELETE-eviction during a post-readyz re-resolve — not resurrecting; content-cell fill declined"),
+			)
+			return
+		}
+	} else {
+		// Pre-readyz BOOT seed — exempt (no served /call races it).
+		c.Put(key, entry)
+	}
 
 	// Record dep edges so K8s informer events dirty-mark this entry and
 	// the refresher re-resolves it. Without this, the entry is TTL-only

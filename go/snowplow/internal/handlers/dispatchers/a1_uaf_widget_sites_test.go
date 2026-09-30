@@ -64,7 +64,7 @@ func TestR1_WidgetContentPopulate_DeclinesOnRefilter_ControlPopulates(t *testing
 	// --- REFILTERED: a sink with a touch on ctx → decline. ------------------
 	ctx, sink := cache.WithUAFTouchedSink(context.Background())
 	sink.Bump()
-	populateWidgetContentL1(ctx, h1WidgetGVR, in, -1, -1, res)
+	populateWidgetContentL1(ctx, h1WidgetGVR, in, -1, -1, res, 0)
 	if entry, ok := c.Get(key); ok {
 		t.Fatalf("R-1 RED (widgetContent carrier): a userAccessFilter-narrowed envelope was seeded into the "+
 			"IDENTITY-FREE shared content cell at %q (%q). That cell has no identity fold whatsoever and its serve-time "+
@@ -77,7 +77,7 @@ func TestR1_WidgetContentPopulate_DeclinesOnRefilter_ControlPopulates(t *testing
 
 	// --- CONTROL: no refilter observed → the layer still works. -------------
 	ctlCtx, _ := cache.WithUAFTouchedSink(context.Background())
-	populateWidgetContentL1(ctlCtx, h1WidgetGVR, in, -1, -1, res)
+	populateWidgetContentL1(ctlCtx, h1WidgetGVR, in, -1, -1, res, 0)
 	if _, ok := c.Get(key); !ok {
 		t.Fatalf("R-1 CONTROL BROKE: a widget whose resolve ran NO refilter was not seeded into the content cell at "+
 			"%q — the gate is over-broad and has disabled the identity-free content layer wholesale, which would make "+
