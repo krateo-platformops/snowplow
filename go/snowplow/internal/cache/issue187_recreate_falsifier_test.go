@@ -330,7 +330,7 @@ func TestIssue187_B2_EvictSelfGoneRemovesEntryAndItsDepEdges(t *testing.T) {
 		t.Fatalf("#187 B2 precondition: the self edge was not recorded")
 	}
 
-	if !d.EvictSelfGone(key) {
+	if !d.EvictSelfGone(key, nil) {
 		t.Fatalf("#187 B2: EvictSelfGone reported no eviction for a resident entry")
 	}
 	if _, ok := store.Get(key); ok {
@@ -352,7 +352,7 @@ func TestIssue187_B2_EvictSelfGoneRemovesEntryAndItsDepEdges(t *testing.T) {
 			beforeDelete, got)
 	}
 	// Idempotent: a second call must not double-count or panic.
-	if d.EvictSelfGone(key) {
+	if d.EvictSelfGone(key, nil) {
 		t.Fatalf("#187 B2: EvictSelfGone reported a second eviction for an already-evicted key")
 	}
 	if got := d.Stats().EvictSelfGoneTotal; got != before+1 {
@@ -395,7 +395,7 @@ func TestIssue187_B2_ResolvedOutcomeIsNotRequeued(t *testing.T) {
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, in ResolvedKeyInputs) error {
 		attempts.Add(1)
 		// What resolveAndPopulateL1 now does on a confirmed self-object 404.
-		Deps().EvictSelfGone(ComputeKey(in))
+		Deps().EvictSelfGone(ComputeKey(in), nil)
 		return nil
 	})
 

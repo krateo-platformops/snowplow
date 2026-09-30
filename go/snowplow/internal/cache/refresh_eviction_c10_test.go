@@ -189,7 +189,7 @@ func TestRefreshEviction_S10_LockFreeAtPublish(t *testing.T) {
 	putSelf(store, d, "L1_s10_a", gvr, "ns", "a")
 	putSelf(store, d, "L1_s10_b", gvr, "ns", "b")
 	d.OnDelete(gvr, "ns", "a")        // runEvictionBatch route
-	if !d.EvictSelfGone("L1_s10_b") { // self-404 route
+	if !d.EvictSelfGone("L1_s10_b", nil) { // self-404 route
 		t.Fatalf("S10: EvictSelfGone reported no eviction")
 	}
 	if probed.Load() != 2 {
@@ -277,7 +277,7 @@ func TestRefreshEviction_S10_RaceConcurrentSubscribeEvict(t *testing.T) {
 				if r.Intn(2) == 0 {
 					d.OnDelete(gvr, "ns", nameOf(i))
 				} else {
-					d.EvictSelfGone(keyOf(i))
+					d.EvictSelfGone(keyOf(i), nil)
 				}
 			}
 		}(int64(g))

@@ -314,7 +314,7 @@ func TestRefreshes_S1b_SelfGoneEvictionWritesRefreshFrame(t *testing.T) {
 	putSelfEntry(store, key, name)
 
 	// The refresher self-404 route (1.12.5 #187).
-	if !cache.Deps().EvictSelfGone(key) {
+	if !cache.Deps().EvictSelfGone(key, nil) {
 		t.Fatalf("S1b precondition: EvictSelfGone reported no eviction")
 	}
 	f, ok := awaitFrame(t, frames, 3*time.Second)
@@ -327,7 +327,7 @@ func TestRefreshes_S1b_SelfGoneEvictionWritesRefreshFrame(t *testing.T) {
 	}
 	// Idempotence probe: a second EvictSelfGone on the now-absent key is
 	// not an eviction and must not publish.
-	if cache.Deps().EvictSelfGone(key) {
+	if cache.Deps().EvictSelfGone(key, nil) {
 		t.Fatalf("S1b: EvictSelfGone reported a second eviction")
 	}
 	if _, extra := awaitFrame(t, frames, 200*time.Millisecond); extra {

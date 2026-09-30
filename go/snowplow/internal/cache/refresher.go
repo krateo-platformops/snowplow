@@ -887,7 +887,16 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// OWN counter — evict_delete_total stays informer-DELETE-driven so
 			// the H1 live discriminator keeps working.
 			if errors.Is(err, ErrSelfObjectGone) {
-				evicted := Deps().EvictSelfGone(key)
+				// #216 — pass the confirmed-gone self-object coordinate so
+				// EvictSelfGone can fire the object-level gone-forget hook
+				// (drop harvested copies). `entry` (from c.Get(key) above)
+				// still holds the 404'd object's Inputs; nil-guarded because
+				// c.Get may have missed (EvictSelfGone skips the fire on nil).
+				var goneInputs *ResolvedKeyInputs
+				if entry != nil {
+					goneInputs = entry.Inputs
+				}
+				evicted := Deps().EvictSelfGone(key, goneInputs)
 				r.selfNotFoundEvict.Add(1)
 				slog.Warn("refresher.self_object_gone_evicted",
 					slog.String("subsystem", "cache"),
