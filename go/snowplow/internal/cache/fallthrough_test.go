@@ -236,14 +236,14 @@ func TestAssertReadPathsScoped_LogsAndCountsInProd_OnMissingMiddleware(t *testin
 	missing := AssertReadPathsScoped()
 	after := AssertionViolationsTotal()
 
-	// 6 required routes minus the one registered = 5 missing
+	// 8 required routes minus the one registered = 7 missing
 	// (GET /api-info/names, GET /list, POST /call, PUT /call,
-	// PATCH /call, DELETE /call).
-	if missing != 6 {
-		t.Errorf("missing count = %d; want 6", missing)
+	// PATCH /call, DELETE /call, POST /call/read — the #186 body-read path).
+	if missing != 7 {
+		t.Errorf("missing count = %d; want 7", missing)
 	}
-	if delta := after - before; delta != 6 {
-		t.Errorf("assertionViolationsTotal delta = %d; want 6", delta)
+	if delta := after - before; delta != 7 {
+		t.Errorf("assertionViolationsTotal delta = %d; want 7", delta)
 	}
 }
 
@@ -257,9 +257,50 @@ func TestAssertReadPathsScoped_AllPresentReturnsZero(t *testing.T) {
 	RegisterScopedRoute("PUT /call", ScopeCallWritePut)
 	RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
+	RegisterScopedRoute("POST /call/read", ScopeCallGeneric) // #186
 
 	if missing := AssertReadPathsScoped(); missing != 0 {
 		t.Errorf("missing count = %d; want 0 (all required routes present)", missing)
+	}
+}
+
+// TestAssertReadPathsScoped_CallRead186_RequiredAndRegistered — #186 boot-assert
+// arm. POST /call/read issues per-user apiserver reads (via the resolve handlers
+// or the read-only CallRead fallthrough), so it is IN the read-path-scoped
+// invariant, exactly like GET /call. Two halves, both gated by the boot-assert:
+// with it registered the assert passes; with it required but NOT registered
+// (main.go dropped the RegisterScopedRoute half) the assert reports it missing —
+// the RED that catches a half-wired route.
+func TestAssertReadPathsScoped_CallRead186_RequiredAndRegistered(t *testing.T) {
+	// Positive: register every required route incl. POST /call/read → 0 missing.
+	ResetRouteScopeRegistryForTest()
+	RegisterScopedRoute("GET /api-info/names", ScopePlurals)
+	RegisterScopedRoute("GET /list", ScopeList)
+	RegisterScopedRoute("GET /call", ScopeCallGeneric)
+	RegisterScopedRoute("POST /call", ScopeCallWritePost)
+	RegisterScopedRoute("PUT /call", ScopeCallWritePut)
+	RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
+	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
+	RegisterScopedRoute("POST /call/read", ScopeCallGeneric)
+	if missing := AssertReadPathsScoped(); missing != 0 {
+		t.Fatalf("#186 all-present: missing=%d; want 0 — POST /call/read must be a recognised required route", missing)
+	}
+
+	// Negative (the RED): every OTHER required route registered, but the #186
+	// RegisterScopedRoute half omitted → the assert flags POST /call/read.
+	env.SetTestMode(false)
+	t.Cleanup(func() { env.SetTestMode(false) })
+	ResetRouteScopeRegistryForTest()
+	RegisterScopedRoute("GET /api-info/names", ScopePlurals)
+	RegisterScopedRoute("GET /list", ScopeList)
+	RegisterScopedRoute("GET /call", ScopeCallGeneric)
+	RegisterScopedRoute("POST /call", ScopeCallWritePost)
+	RegisterScopedRoute("PUT /call", ScopeCallWritePut)
+	RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
+	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
+	// POST /call/read deliberately NOT registered.
+	if missing := AssertReadPathsScoped(); missing != 1 {
+		t.Fatalf("#186 half-wired: missing=%d; want exactly 1 (POST /call/read required but unregistered)", missing)
 	}
 }
 
@@ -282,6 +323,7 @@ func TestAssertReadPathsScoped_RBACEndpointUnregisteredStillPasses(t *testing.T)
 	RegisterScopedRoute("PUT /call", ScopeCallWritePut)
 	RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
+	RegisterScopedRoute("POST /call/read", ScopeCallGeneric) // #186
 	// GET /rbac deliberately NOT registered (mirrors /refreshes).
 
 	if missing := AssertReadPathsScoped(); missing != 0 {

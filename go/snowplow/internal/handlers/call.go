@@ -49,6 +49,22 @@ func Call() http.Handler {
 	}
 }
 
+// CallRead is the read-only /call handler for the POST /call/read
+// body-carrying read route (#186). It is the ReadDispatcher's terminal
+// fallthrough: a POST /call/read addressing a GVR that has no resolve handler
+// lands here. Being read-only, it FORCES the apiserver verb to GET and NEVER
+// forwards the request body as an object payload — so the body-carrying read
+// route can never create or mutate a resource, even on a dispatch miss. Every
+// other field (auth, scope, addressing) is identical to Call().
+func CallRead() http.Handler {
+	return &callHandler{
+		authnNS:       env.String("AUTHN_NAMESPACE", ""),
+		verbose:       env.True("DEBUG"),
+		scopeResolver: dynamic.SharedSAScopeForGVR,
+		readOnly:      true,
+	}
+}
+
 var _ http.Handler = (*callHandler)(nil)
 
 // scopeResolverFn resolves whether a GVR is namespace-scoped. It returns
@@ -67,6 +83,13 @@ type callHandler struct {
 	// cold/erroring resolver can never regress a currently-working
 	// namespaced request.
 	scopeResolver scopeResolverFn
+	// readOnly marks the POST /call/read handler (#186 — handlers.CallRead).
+	// When set, validateRequest FORCES opts.verb to GET and SKIPS reading the
+	// request body into opts.dat, so ServeHTTP never sets callOpts.Payload and
+	// the apiserver call is an unconditional read — the body-carrying read
+	// route cannot create/mutate a resource. Zero value (false) is the
+	// historical Call() write-capable behaviour, byte-identical.
+	readOnly bool
 }
 
 // @Summary Call Endpoint
@@ -196,6 +219,14 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err error) {
 	opts.verb = req.Method
+	// #186 — the read-only /call/read handler forces GET regardless of the
+	// inbound method (always POST on that route) so a body-carrying READ can
+	// never turn into an apiserver create/update. The body is deliberately NOT
+	// read into opts.dat below (see the readOnly guard on the body read), so
+	// callOpts.Payload stays nil in ServeHTTP and no audit WRITE is emitted.
+	if r.readOnly {
+		opts.verb = http.MethodGet
+	}
 	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch}, opts.verb) {
 		opts.contentType = req.Header.Get("Content-type")
 		if opts.contentType == "" {
@@ -279,7 +310,11 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 		}
 	}
 
-	if req.Body != nil {
+	// #186 — a read-only handler NEVER reads the body into opts.dat, so
+	// callOpts.Payload can never be set (ServeHTTP gates Payload on
+	// opts.dat != nil AND a write verb). On POST /call/read the body has
+	// already been consumed by the BodyExtrasDecode middleware anyway.
+	if req.Body != nil && !r.readOnly {
 		opts.dat, err = io.ReadAll(io.LimitReader(req.Body, 1048576))
 		if err != nil {
 			return

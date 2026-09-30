@@ -1063,6 +1063,29 @@ func main() {
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("GET /call", cache.ScopeCallGeneric)
 
+	// #186 — POST /call/read is the body-carrying READ path. It exists so a
+	// large `extras` input rides the request BODY instead of the URL query,
+	// where over HTTP/2 it is charged against the gateway's ~16 KiB header
+	// budget and 431s before Snowplow is invoked. It shares the GET /call
+	// chain EXACTLY — UserConfig, the call-generic read scope, and crucially
+	// the dispatcher into the restactions / widgets resolve handlers — with
+	// two additions: BodyExtrasDecode (decodes {"extras":{...}} → context, so
+	// the context-first util.ParseExtras returns it) runs BEFORE the
+	// dispatcher, and the dispatcher is the POST variant (ReadDispatcher —
+	// the plain Dispatcher is GET-only by design). The terminal fallthrough
+	// is handlers.CallRead(), the READ-ONLY /call (verb forced GET, no
+	// Payload): a POST /call/read to an unhandled GVR is a read passthrough,
+	// never a create. Same read-path invariant as GET /call, so it is
+	// RegisterScopedRoute'd + listed in requiredScopedRoutes (a boot-assert
+	// fails if either half is missing).
+	mux.Handle("POST /call/read", chain.Append(
+		middleware.UserConfig(jwtKeys, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
+		middleware.BodyExtrasDecode,
+		handlers.ReadDispatcher(dispatchers.All())).
+		Then(handlers.CallRead()))
+	cache.RegisterScopedRoute("POST /call/read", cache.ScopeCallGeneric)
+
 	// GET /export — GENERIC export: any /call-resolvable list
 	// (RESTAction or list/table Widget) serialized as a CSV/JSON
 	// attachment. The handler re-dispatches IN-PROCESS through the same
