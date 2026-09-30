@@ -262,7 +262,12 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		Limit:                0, // MUST stay 0 — see the file header.
 	}
 	storeVerifyForcedListsTotal.Add(1)
-	list, err := cli.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, opts)
+	// #263 — tag THIS List's ctx so the reflector-path classifier
+	// (reflector_path.go isForcedVerifyRequest) excludes it from establishment
+	// attribution: a forced-verification LIST carries RV=lastSyncRV and would
+	// otherwise flip the GVR's reflector path to 'list' and WARN falsely. Scoped to
+	// this single List call — a metaClient.List spawns no nested establishment LIST.
+	list, err := cli.Resource(gvr).Namespace(metav1.NamespaceAll).List(withForcedVerifyTag(ctx), opts)
 	if err != nil {
 		recordVerifySkipped(verifySkipListError)
 		slog.Warn("cache.store.verification_list_failed",

@@ -73,6 +73,7 @@
 package cache
 
 import (
+	"context"
 	"expvar"
 	"log/slog"
 	"net/http"
@@ -254,6 +255,37 @@ func (rt *reflectorPathRoundTripper) RoundTrip(req *http.Request) (*http.Respons
 // cancellation, which would be a real behaviour change from an instrument.
 func (rt *reflectorPathRoundTripper) WrappedRoundTripper() http.RoundTripper { return rt.next }
 
+// forcedVerifyCtxKeyType tags a request context as the store-verification forced
+// LIST (#263). The verifier is the SOLE issuer of forced-verification LISTs and
+// KNOWS its LIST is not a reflector establishment, so it DECLARES that (positive
+// self-identification) rather than the classifier inferring it from wire shape —
+// which is unsafe here: the informers are metadata-only, so a genuine RBAC relist
+// shares the verifier's metadata Accept header, and its resourceVersionMatch is
+// version-fragile. A genuine relist is UNTAGGED → still attributed → the detector
+// stays live (post-fix zero-mislabels reads as health, not a dead detector).
+type forcedVerifyCtxKeyType struct{}
+
+var forcedVerifyCtxKey = forcedVerifyCtxKeyType{}
+
+// withForcedVerifyTag marks ctx as the forced-verification LIST's context. Scope
+// it to the single verification List call, never a broader ctx a sibling
+// establishment LIST could inherit.
+func withForcedVerifyTag(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forcedVerifyCtxKey, true)
+}
+
+// isForcedVerifyRequest reports whether req carries the forced-verification tag,
+// read from req.Context(): client-go builds the request with req.WithContext(the
+// caller's List ctx), and this RoundTripper is on the shared rc.WrapTransport (so
+// in the metaClient chain), so the verifier's tagged List ctx reaches here.
+func isForcedVerifyRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	tagged, _ := req.Context().Value(forcedVerifyCtxKey).(bool)
+	return tagged
+}
+
 // classifyReflectorRequest buckets one outbound request.
 //
 // COST ON THE HOT PATH, which matters because this wrapper sits on the SHARED
@@ -289,6 +321,17 @@ func classifyReflectorRequest(req *http.Request) {
 		reflectorListEtcdDelegatedTotal.Add(1)
 	case reflectorPathListCacheEligible:
 		reflectorListCacheEligibleTotal.Add(1)
+	}
+	// #263 — a store-verification forced LIST (store_verify_deadline.go forcedVerify)
+	// carries RV=lastSyncRV so it LOOKS like a reflector establishment, but it is
+	// NOT one. The verifier tags its own request ctx (positive self-ID); exclude it
+	// from per-GVR path attribution — the establishment record + the transition WARN.
+	// It stays in the wire-shape bucket counters above and is separately counted by
+	// storeVerifyForcedListsTotal, so it is not a silent zero. A genuine relist is
+	// UNTAGGED → still attributed → the detector stays live for the widest rotation
+	// trigger (an RBAC role-informer relist).
+	if isForcedVerifyRequest(req) {
+		return
 	}
 	recordReflectorPath(gvr, bucket, q.Get("resourceVersion") != "")
 }
