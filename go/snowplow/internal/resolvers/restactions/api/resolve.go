@@ -438,6 +438,12 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 		// is the author's own business): pass through, NOT templated, NOT gated.
 		return ref, false, nil
 	}
+	// #302 sibling / #341 — non-dial evalJQ-swallow, deferred out of #302 (which
+	// fixes the dial-class payload/header). A swallowed jq error here becomes a
+	// garbage resourceRef NAME → MakeDNS1123Compatible → a 404-ing lookup, NOT a
+	// dialed malformed request (lowest severity). The evalJQE cleanliness switch
+	// (surface the error to a DEBUG line instead of masquerading as a name) is
+	// tracked in #341.
 	name := kubeutil.MakeDNS1123Compatible(evalJQ(ref.Name, r.dict))
 	// Guardrail (b), layer 1 (fail-fast): a request-templated name may never
 	// resolve to the reserved `<user>-clientconfig` internal-identity class.

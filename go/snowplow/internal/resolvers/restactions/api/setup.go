@@ -109,15 +109,27 @@ func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions
 	out.Path = path
 	out.Verb = ptr.To(ptr.Deref(in.Verb, http.MethodGet))
 
+	// #302 — payload/header render through evalJQE too, so a jq eval error is
+	// SURFACED (not swallowed into the value by evalJQ). A swallowed error would
+	// be dialed as a garbage request BODY, or a garbage HEADER value (e.g.
+	// Authorization); on error we SKIP the dial below, mirroring the path limb.
+	// out.Payload / out.Headers hold the evalJQE result ("" on error) — never the
+	// error text — and are not dialed at all on the skip path.
+	var payloadErr, headerErr error
 	if in.Payload != nil {
-		out.Payload = ptr.To(evalJQ(*in.Payload, ds))
+		var pv string
+		pv, payloadErr = evalJQE(*in.Payload, ds)
+		out.Payload = ptr.To(pv)
 	}
 
 	if in.Headers != nil {
 		out.Headers = make([]string, 0, len(in.Headers))
-		//copy(el.Headers, in.Headers)
 		for _, h := range in.Headers {
-			out.Headers = append(out.Headers, evalJQ(h, ds))
+			hv, herr := evalJQE(h, ds)
+			if herr != nil && headerErr == nil {
+				headerErr = herr // first erroring header wins the skip reason
+			}
+			out.Headers = append(out.Headers, hv)
 		}
 	}
 
@@ -126,10 +138,20 @@ func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions
 		// error (evalJQ would have masqueraded it as the path string and dialed it
 		// as a garbage apiserver path → 404). Mark invalid so the caller SKIPS the
 		// dial; the error text is surfaced in out.Path for the skip DEBUG only,
-		// never dialed. Payload/header jq errors keep evalJQ's swallow behaviour
-		// (out of #293 scope, different blast radius — deferred follow-up).
+		// never dialed.
 		out.Path = pathErr.Error()
 		return out, false, skipReason{class: reasonJQPathError, detail: "path jq expression errored: " + pathErr.Error()}
+	}
+	// #302 — a payload or header jq error must NEVER be dialed (a garbage request
+	// body, or a garbage Authorization/header value). Skip the dial, mirroring the
+	// path limb; the error text rides skipReason.detail (the DEBUG), never the
+	// wire. Precedence: path first (it decides dialability), then payload, then
+	// header.
+	if payloadErr != nil {
+		return out, false, skipReason{class: reasonJQPayloadError, detail: "payload jq expression errored: " + payloadErr.Error()}
+	}
+	if headerErr != nil {
+		return out, false, skipReason{class: reasonJQHeaderError, detail: "header jq expression errored: " + headerErr.Error()}
 	}
 	valid, sr = validInterpolatedPath(out.Path, ptr.Deref(out.Verb, http.MethodGet))
 	return

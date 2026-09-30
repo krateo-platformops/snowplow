@@ -703,6 +703,17 @@ func deriveTargetGVRForClusterList(
 	// Resolve the path template against the first element. Re-use
 	// evalJQ — same jq engine, same module loader as
 	// createRequestOption.
+	//
+	// #302 sibling / #341 — non-dial evalJQ-swallow, deferred out of #302. WHY THE
+	// SWALLOW IS BENIGN HERE (and must stay so): resolvedPath is NEVER dialed — it
+	// is used only just below (the empty/${ check) and at ParseAPIServerPathToDep
+	// to derive the GVR for the collapse DECISION; buildClusterListCall synthesises
+	// the actual LIST path from that GVR, not from this string. On a swallowed jq
+	// error, err.Error() → ParseAPIServerPathToDep fails (parseOK=false) → return
+	// {},false → NO collapse → per-element fallback whose path IS evalJQE-guarded
+	// (#293), so a garbage value can never reach a dial. A FUTURE change to
+	// deriveTargetGVRForClusterList that dialed resolvedPath directly would break
+	// that invariant — switch this to evalJQE (tracked #341) before doing so.
 	resolvedPath := evalJQ(apiCall.Path, firstElement)
 	if resolvedPath == "" || strings.Contains(resolvedPath, "${") {
 		return schema.GroupVersionResource{}, false
