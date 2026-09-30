@@ -1389,6 +1389,13 @@ func unregisterableReason(disco ResourceTypeDiscovery, gvr schema.GroupVersionRe
 		return "", nil
 	}
 	if groupAuthoritativelyAbsent(disco, gvr.Group) {
+		// #215: promote the INFO-level skip breadcrumb to an always-on expvar.
+		// This is the single decision point for the unserved-GROUP skip and its
+		// one caller (EnsureResourceType) skips deterministically on this
+		// reason, so a bump here == one bump per real skip. The sibling
+		// resource-unwatchable branch below is a DIFFERENT cause and is
+		// deliberately not counted here (group-granular counter).
+		BumpLazyRegisterSkippedUnservedGroup()
 		return "apiserver ServerGroups() authoritatively does not serve this group", nil
 	}
 	unwatchable, fetched := resourceAuthoritativelyUnwatchable(disco, gvr)
