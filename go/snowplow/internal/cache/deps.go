@@ -1420,18 +1420,41 @@ var publishEvictionFn = PublishEviction
 // exhausted the same budget under the breaker — takes EvictDropPoint, the
 // same mechanism on its own counter, so evict_self_gone_total keeps meaning
 // "the object is confirmed gone" even during an apiserver outage.
-func (d *DepTracker) EvictSelfGone(l1Key string) bool {
+func (d *DepTracker) EvictSelfGone(l1Key string, gone *ResolvedKeyInputs) bool {
+	// #216 — fire the object-level gone-forget from the coordinate the CALLER holds.
+	// EvictSelfGone has exactly one production caller (refresher.go, the drop-point
+	// self-404 arm), which still has the 404'd entry's Inputs in scope — that IS the
+	// confirmed-gone self-object coordinate. The forget target is the OBJECT (this is
+	// the confirmed-404 arm), not the L1 cell, so fire UNCONDITIONALLY: before
+	// evictSelfEntry and REGARDLESS of its result. A concurrent LRU/TTL evict may
+	// already have removed the cell, but the object is still confirmed gone and its
+	// harvested copies must be dropped (notifyObjectGone / gone_forget_hook.go), or
+	// the next seed pass re-Puts the deleted object's content for the pod's life. This
+	// is idempotent (the double-forget arm proves it) and confirmed-404-only (ONLY
+	// here, NEVER EvictDropPoint — a 403 / 500 / timeout is not a deletion), so it can
+	// never wrongly forget a live object. Sourcing the coordinate from the caller (not
+	// a store peek) means the forget no longer depends on the entry still being
+	// resident, so the LRU/TTL pre-eviction race is ELIMINATED. nil / empty → skip.
+	if gone != nil {
+		gvr := schema.GroupVersionResource{Group: gone.Group, Version: gone.Version, Resource: gone.Resource}
+		if !(gvr.Empty() && gone.Namespace == "" && gone.Name == "") {
+			notifyObjectGone(gvr, gone.Namespace, gone.Name)
+		}
+	}
+
 	if !d.evictSelfEntry(l1Key, &d.evictSelfGoneTotal) {
 		return false
 	}
+
 	// 1.12.6 item 7 (C10): the object is CONFIRMED gone (404) — tell the
-	// armed frontend. Same hook and lock discipline as runEvictionBatch
-	// (c.mu released inside deleteForDep, d.storeMu released inside
-	// evictSelfEntry). Deliberately in THIS arm and not in evictSelfEntry:
-	// EvictDropPoint shares the body for a NON-404 failure (403 / 500 /
-	// timeout under the breaker), which is not a deletion — publishing it
-	// would tell every armed tab its widgets were deleted during an
-	// apiserver outage (S1d pins it silent).
+	// armed frontend. Gated on evictSelfEntry==true (the publish is about the
+	// CELL / subscriber, unlike the object-level forget above). Same hook and lock
+	// discipline as runEvictionBatch (c.mu released inside deleteForDep, d.storeMu
+	// released inside evictSelfEntry). Deliberately in THIS arm and not in
+	// evictSelfEntry: EvictDropPoint shares the body for a NON-404 failure (403 /
+	// 500 / timeout under the breaker), which is not a deletion — publishing it
+	// would tell every armed tab its widgets were deleted during an apiserver
+	// outage (S1d pins it silent).
 	publishEvictionFn(l1Key)
 	return true
 }
