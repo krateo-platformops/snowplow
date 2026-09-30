@@ -36,5 +36,10 @@ func RegisterRBACBindingNoopExpvar() {
 		expvar.Publish("snowplow_rbac_binding_semantic_noop_updates_total", expvar.Func(func() any {
 			return RBACBindingSemanticNoopUpdatesTotal()
 		}))
+		// #260: uid-changed updates (delete+recreate-same-name) — excluded from
+		// semantic_noop, a real-rotation source. Same main() bootstrap surface.
+		expvar.Publish("snowplow_rbac_binding_uid_changed_updates_total", expvar.Func(func() any {
+			return RBACBindingUidChangedUpdatesTotal()
+		}))
 	})
 }

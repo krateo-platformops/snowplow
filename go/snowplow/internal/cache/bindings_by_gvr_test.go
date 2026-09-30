@@ -998,7 +998,7 @@ func TestBindingsByGVRIndex_ConcurrentRace(t *testing.T) {
 				case 2:
 					onBindingDelete(b)
 				case 3:
-					onRoleObjectChanged(adminCR)
+					onRoleObjectChanged(bumpSrcRoleUpdate, adminCR)
 				}
 				i++
 			}

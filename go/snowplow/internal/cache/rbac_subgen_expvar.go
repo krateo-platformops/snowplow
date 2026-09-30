@@ -70,5 +70,8 @@ func RegisterRBACSubGenExpvar() {
 		expvar.Publish("snowplow_rbac_subgen_subjects_tracked", expvar.Func(func() any {
 			return RBACSubGenSubjectsTracked()
 		}))
+		// #260: bounded per-source attribution (6 fixed keys) — same main()
+		// bootstrap / cache-mode-agnostic surface, zero-readable from first scrape.
+		expvar.Publish("snowplow_rbac_subgen_bumps_by_source_total", expvar.Func(subGenBumpsBySourceSnapshot))
 	})
 }

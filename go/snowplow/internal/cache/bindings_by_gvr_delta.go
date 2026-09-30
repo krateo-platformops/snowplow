@@ -136,13 +136,13 @@ func onBindingAdd(obj interface{}) {
 	if o, ok := asCRB(obj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2 — defer the bump to snapshot-publish; this binding's subjects' effective RBAC changed
+		recordPendingSubGenBumps(subj, bumpSrcBindingAdd) // #118 (c)-v2 GAP-2 / #260 source
 		return
 	}
 	if o, ok := asRB(obj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2
+		recordPendingSubGenBumps(subj, bumpSrcBindingAdd) // #118 (c)-v2 GAP-2 / #260 source
 		return
 	}
 	deltaDropNonTyped("RoleBinding/ClusterRoleBinding(add)")
@@ -169,26 +169,26 @@ func onBindingUpdate(oldObj, newObj interface{}) {
 	if o, ok := asCRB(oldObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2 — OLD subjects lost this grant
-		oldSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, roleRef: o.RoleRef, subjects: subj}
+		recordPendingSubGenBumps(subj, bumpSrcBindingUpdate) // #118 (c)-v2 GAP-2 / #260 source — OLD subjects lost this grant
+		oldSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, uid: string(o.UID), roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(oldObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2
-		oldSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
+		recordPendingSubGenBumps(subj, bumpSrcBindingUpdate) // #118 (c)-v2 GAP-2 / #260 source
+		oldSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, uid: string(o.UID), namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-old)")
 	}
 	if o, ok := asCRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2 — NEW subjects gained this grant (a subject in BOTH old+new is deduped by the pending set; the key only needs to change once)
-		newSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, roleRef: o.RoleRef, subjects: subj}
+		recordPendingSubGenBumps(subj, bumpSrcBindingUpdate) // #118 (c)-v2 GAP-2 / #260 source — NEW subjects gained this grant (deduped per subject in the pending set)
+		newSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, uid: string(o.UID), roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
-		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2
-		newSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
+		recordPendingSubGenBumps(subj, bumpSrcBindingUpdate) // #118 (c)-v2 GAP-2 / #260 source
+		newSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, uid: string(o.UID), namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-new)")
 	}
@@ -209,12 +209,12 @@ func onBindingDelete(obj interface{}) {
 	}
 	if o, ok := asCRB(obj); ok {
 		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
-		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects)) // #118 (c)-v2 GAP-2 — subjects lost this grant (REVOKE — the security-load-bearing arm)
+		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects), bumpSrcBindingDelete) // #118 (c)-v2 GAP-2 / #260 source — REVOKE
 		return
 	}
 	if o, ok := asRB(obj); ok {
 		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
-		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects)) // #118 (c)-v2 GAP-2
+		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects), bumpSrcBindingDelete) // #118 (c)-v2 GAP-2 / #260 source
 		return
 	}
 	deltaDropNonTyped("RoleBinding/ClusterRoleBinding(delete)")
@@ -228,7 +228,7 @@ func onBindingDelete(obj interface{}) {
 // hook runs. A DELETE delivers the role with its last-known rules; we
 // re-route against those, but since the role is gone the next binding
 // event / build will re-resolve to "no grant".
-func onRoleObjectChanged(obj interface{}) {
+func onRoleObjectChanged(source subGenBumpSource, obj interface{}) {
 	idx := bindingsByGVRSingleton()
 	if !idx.deltaActive() {
 		return
@@ -237,11 +237,11 @@ func onRoleObjectChanged(obj interface{}) {
 		obj = tomb.Obj
 	}
 	if o, ok := asCR(obj); ok {
-		onRoleRulesChanged("ClusterRole", "", o.Name, o.Rules)
+		onRoleRulesChanged(source, "ClusterRole", "", o.Name, o.Rules)
 		return
 	}
 	if o, ok := asRole(obj); ok {
-		onRoleRulesChanged("Role", o.Namespace, o.Name, o.Rules)
+		onRoleRulesChanged(source, "Role", o.Namespace, o.Name, o.Rules)
 		return
 	}
 	deltaDropNonTyped("Role/ClusterRole(change)")
@@ -255,7 +255,7 @@ func onRoleObjectChanged(obj interface{}) {
 // bindings × navigatedGVRs); the Gate-2 measurement found the
 // most-referenced role had only 4 referencing bindings (the topology is
 // ~1:1 role:binding from per-composition RBAC).
-func onRoleRulesChanged(roleKind, namespace, name string, rules []rbacv1.PolicyRule) {
+func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name string, rules []rbacv1.PolicyRule) {
 	idx := bindingsByGVRSingleton()
 	if !idx.deltaActive() {
 		return
@@ -330,7 +330,7 @@ func onRoleRulesChanged(roleKind, namespace, name string, rules []rbacv1.PolicyR
 		// recordPendingSubGenBumps takes a DIFFERENT lock (pendingSubGenBumps.mu)
 		// and never acquires idx.mu, so calling it while holding idx.mu here
 		// introduces no lock-ordering cycle. Deferred to publish per §3.2.
-		recordPendingSubGenBumps(subjects)
+		recordPendingSubGenBumps(subjects, source) // #260 role source (add/update/delete from the informer event kind)
 	}
 }
 
