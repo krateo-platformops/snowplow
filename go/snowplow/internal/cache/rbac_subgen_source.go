@@ -109,6 +109,20 @@ func subGenBumpsBySourceSnapshot() any {
 	}
 }
 
+// RBACSubGenBumpsBySourceSnapshot returns the 6 bounded per-source bump counts,
+// exported so the OTLP layer (metrics.go, #260 change-4) can range the same map
+// the expvar surface does (C7 anti-drift).
+func RBACSubGenBumpsBySourceSnapshot() map[string]uint64 {
+	return map[string]uint64{
+		bumpSrcKeyBindingAdd:    subGenBumpsBySource.bindingAdd.Load(),
+		bumpSrcKeyBindingUpdate: subGenBumpsBySource.bindingUpdate.Load(),
+		bumpSrcKeyBindingDelete: subGenBumpsBySource.bindingDelete.Load(),
+		bumpSrcKeyRoleAdd:       subGenBumpsBySource.roleAdd.Load(),
+		bumpSrcKeyRoleUpdate:    subGenBumpsBySource.roleUpdate.Load(),
+		bumpSrcKeyRoleDelete:    subGenBumpsBySource.roleDelete.Load(),
+	}
+}
+
 // ResetSubGenBumpsBySourceForTest zeroes the per-source counters. TEST-ONLY —
 // production never resets (monotonic process-wide counters).
 func ResetSubGenBumpsBySourceForTest() {

@@ -144,6 +144,10 @@ func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource)
 		// log but also hides the retry rate: one failure and a failure every
 		// second look identical. The counter is what makes the rate visible.
 		recordWatchError()
+		// #260 change-4 — per-RBAC-GVR watch-error RATE (no-op for non-RBAC). A
+		// forced-verification LIST is a LIST, never a WATCH, so it never reaches
+		// this handler: this counter is #263-safe by code path.
+		recordRBACWatchError(gvr)
 		if !already {
 			slog.Warn("cache.watch.broken",
 				slog.String("subsystem", "cache"),
