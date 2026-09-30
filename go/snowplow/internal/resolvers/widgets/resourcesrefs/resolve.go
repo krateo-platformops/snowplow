@@ -118,12 +118,29 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 			Namespace:     in.Namespace,
 		})
 		if !el.Allowed {
-			log.Warn("resource ref action not allowed",
-				slog.String("id", in.ID),
-				slog.String("verb", verb),
-				slog.String("group", gvr.Group),
-				slog.String("resource", gvr.Resource),
-				slog.String("namespace", in.Namespace))
+			// #214: a resourceRef RBAC denial is EXPECTED on the prewarm walk
+			// (the per-user login-cohort seed resolves write-verb refs the user
+			// may not hold) — Debug + count it there instead of WARN-spamming
+			// (546 lines/12h on 057). A SERVE-path denial STILL WARNs: it may be
+			// a real access problem and must stay visible. Log-only — el.Allowed
+			// and the emitted result are untouched, so prewarm and serve stay
+			// byte-identical.
+			if cache.PrewarmPathFromContext(ctx) {
+				cache.RecordPrewarmRefDenied()
+				log.Debug("resource ref action not allowed",
+					slog.String("id", in.ID),
+					slog.String("verb", verb),
+					slog.String("group", gvr.Group),
+					slog.String("resource", gvr.Resource),
+					slog.String("namespace", in.Namespace))
+			} else {
+				log.Warn("resource ref action not allowed",
+					slog.String("id", in.ID),
+					slog.String("verb", verb),
+					slog.String("group", gvr.Group),
+					slog.String("resource", gvr.Resource),
+					slog.String("namespace", in.Namespace))
+			}
 		}
 
 		el.Path = buildPath(gvr, in)

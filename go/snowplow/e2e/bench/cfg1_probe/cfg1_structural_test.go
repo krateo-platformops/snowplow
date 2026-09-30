@@ -81,8 +81,9 @@ const (
 	// On main 63fdf99 (1.12.5): 18 init-time files / 61 keys (deps_expvar.go
 	// `snowplow_deps` joined in 1.12.5) + 1 runtime-gated file / 5 keys
 	// (prewarm engine). Raised from 18/65 (pre-1.12.5 main 98a64cc).
-	cfg1MinGatedFiles = 19
-	cfg1MinGatedKeys  = 66
+	// #214: +1 file / +1 key — prewarm_path.go gates snowplow_prewarm_ref_denied_total.
+	cfg1MinGatedFiles = 20
+	cfg1MinGatedKeys  = 67
 )
 
 // nonCacheInitPublishers is the EXPLICIT exception list: files whose init()

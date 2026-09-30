@@ -1428,6 +1428,15 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// recover-isolated (no-op when off). classify fires at seedOneWidget return,
 	// after the resolve fully returns (INVARIANT a).
 	resCtx = installShadowParitySeedWidget(resCtx, in.Object)
+	// #214: seedOneWidget is the PREWARM-ONLY per-user widget seed (never the
+	// serve dispatcher). Mark resCtx — the exact ctx handed to the resolver —
+	// as a prewarm path so a resourceRef RBAC denial (the user lacks a write
+	// verb on a Form's builder/publish ref) is Debug+counted in
+	// resourcesrefs.resolveOne, not WARN-spammed (546 lines/12h on 057). Marked
+	// at this choke (not the cohort-scope root) so it holds even if a future
+	// caller reaches the resolve by another path, and so a seam-stub falsifier
+	// can prove the resolver received a prewarm-marked ctx.
+	resCtx = cache.WithPrewarmPath(resCtx)
 	defer classifyShadowSeedResolve(resCtx)
 
 	// 1.12.3 R-1 (adv-cache-isolation) — route through the SAME widgetsResolveFn
