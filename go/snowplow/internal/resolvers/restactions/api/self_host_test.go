@@ -192,8 +192,10 @@ func TestBearerAppendForStage_SelfLoopbackArm(t *testing.T) {
 			"the #57 arm: a named-endpoint step that resolves to the self-host needs the seed bearer"},
 		{"external near-miss host w/ named ref → NO append", &templates.API{EndpointRef: namedRef}, extEP, false, false,
 			"the leak guard: a genuine external endpoint (host merely contains 'snowplow') must NOT get the bearer"},
-		{"no EndpointRef → APPEND (original gate)", &templates.API{}, extEP, false, true,
-			"the original gate: no named endpoint → per-user clientconfig path, bearer appended"},
+		{"#292 no EndpointRef (isSA=false) → NO append (dropped disjunct)", &templates.API{}, extEP, false, false,
+			"#292: the bare EndpointRef==nil disjunct is dropped — a nil ref is an apiserver-credential (SA or " +
+				"clientconfig) dial that never carries the user Krateo JWT (leak/suppress); ExportJWT + self-loopback " +
+				"remain the only append triggers"},
 		{"named ref + ExportJWT → APPEND (original gate)", &templates.API{EndpointRef: namedRef, ExportJWT: ptr.To(true)}, extEP, false, true,
 			"the original gate: exportJWT:true forces the bearer even on a named external endpoint"},
 		{"named external ref, no exportJWT, not self → NO append", &templates.API{EndpointRef: namedRef}, endpoints.Endpoint{ServerURL: "https://api.github.com"}, false, false,

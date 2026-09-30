@@ -157,8 +157,9 @@ func parsedHostEqualsSelf(rawURL string) bool {
 // the WHICH-endpoint half.
 //
 // True (append the bearer) when EITHER:
-//   - the original gate: no named EndpointRef, or ExportJWT==true (a named
-//     endpoint is assumed to carry its own auth); OR
+//   - ExportJWT==true — an explicit author opt-in to export the JWT to the
+//     endpoint (#292 dropped the legacy "no named EndpointRef → append" clause:
+//     a nil ref is an apiserver-credential dial that never wants the Krateo JWT); OR
 //   - the #57 self-loopback arm (ADDITIVE): the resolved endpoint host EXACTLY
 //     equals the configured self-host (parsedHostEqualsSelf — exact
 //     scheme+host+port, never a substring near-miss), i.e. the step loops back
@@ -184,7 +185,16 @@ func bearerAppendForStage(apiCall *templates.API, ep endpoints.Endpoint, isSA bo
 	if isSA {
 		return false
 	}
-	return apiCall.EndpointRef == nil ||
-		ptr.Deref(apiCall.ExportJWT, false) ||
+	// #292: the bare EndpointRef==nil disjunct is DROPPED (the #271/#292 shared
+	// root fix). A nil ref resolves to an apiserver-credential dial — the SA
+	// endpoint (isSA, suppressed above) or the user's <user>-clientconfig — that
+	// carries its OWN k8s credential (client cert, or its own token) and never
+	// accepts a Krateo authn JWT: appending it there only LEAKS (cert-auth
+	// presents it on the wire, #292) or SUPPRESSES (token-auth, the #271
+	// mechanism). The two legitimate JWT targets remain — an explicit ExportJWT
+	// opt-in, and the self-loopback back at snowplow's own JWT-gated /call (a
+	// NAMED ref matched by parsedHostEqualsSelf, never the nil-ref disjunct, so
+	// #57 is unaffected).
+	return ptr.Deref(apiCall.ExportJWT, false) ||
 		parsedHostEqualsSelf(ep.ServerURL)
 }
