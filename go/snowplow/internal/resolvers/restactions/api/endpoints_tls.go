@@ -105,12 +105,14 @@ func httpClientForEndpoint(ctx context.Context, ep *endpoints.Endpoint, ri *http
 		// an empty pool would fall back to the system roots and turn a
 		// loud misconfiguration into a confusing x509 error.
 		//
-		// KNOWN GAP, tracked as snowplow#233: this delegation is itself SILENT,
-		// so the operator sees plumbing's x509 error with nothing saying
-		// snowplow read the bundle and could not parse it. The fix needs a
-		// BOUNDED warning — the endpoint resolves per stage per /call, so an
-		// unconditional one floods — and that decision belongs with #233, not
-		// with this diff.
+		// #233 (was a KNOWN GAP): this delegation was SILENT — the operator saw
+		// plumbing's x509 error with nothing saying snowplow read the bundle and
+		// could not parse it. warnUnparseableCADelegation now surfaces it: an
+		// uncapped OTLP detector counter (snowplow_unparseable_ca_delegations_total)
+		// + a BOUNDED one-shot WARN keyed by (ServerURL, CA sha256) — the endpoint
+		// resolves per stage per /call, so an unconditional WARN would flood. It
+		// touches ONLY this capability site, never the POLICY delegation above.
+		warnUnparseableCADelegation(ep)
 		return httpcall.HTTPClientForEndpoint(ep, ri)
 	}
 
