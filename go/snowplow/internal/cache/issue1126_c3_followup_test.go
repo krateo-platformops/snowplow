@@ -1,8 +1,17 @@
 // issue1126_c3_followup_test.go — 1.12.6 C3 review follow-ups (arch N2 /
-// N5, PM condition 3). Every arm here uses ONLY symbols that exist on the
+// N5, PM condition 3). FU1 and FU2 use ONLY symbols that exist on the
 // pre-follow-up tree 2000cba (string expvar keys, ReconcileReport fields
-// C3 shipped with, reconcileOnce, RangeMetadata*), so the file compiles
-// there and each arm is a BEHAVIOURAL RED on 2000cba and GREEN here:
+// C3 shipped with, reconcileOnce, RangeMetadata*), so they compile there and
+// each is a BEHAVIOURAL RED on 2000cba and GREEN here. FU4 is the EXCEPTION
+// (see its note): its bounded-hold property is only observable as a wall-clock
+// HOLD DURATION with 2000cba-only symbols — both the chunked and the
+// pre-chunking walk snapshot keys once and release c.mu during probes, so the
+// meta-collection hold length is the only difference — which made a same-run
+// RATIO the only available signal, and it flaked. #326 replaces it with a
+// deterministic mechanism assertion built on the follow-up's batched API, so
+// FU4 is now COMPILE-RED on 2000cba (like the fields file), not a runtime twin:
+// a full chunking revert is caught at compile time, a keep-the-API hold is
+// caught by the deterministic guard.
 //
 //	FU1 — reconcile_sampled_total publishes Sampled and reconcile_probed_total
 //	      publishes Probed (arch N2: 2000cba published Probed under the
@@ -12,12 +21,15 @@
 //	      reconcile_skipped_no_edge_total, NOT as divergence, on every pass;
 //	      the edged sibling is divergent exactly once and evicted (arch N5:
 //	      on 2000cba the no-edge entry pinned divergence non-zero forever).
-//	FU4 — the full walk over a 20K-entry store: the worst concurrent
-//	      store.Get during the CHUNKED walk is at most 1/fu4Ratio of the
-//	      worst during the EXCLUSIVE walk, both measured in the same run
-//	      (PM condition 3, arch N10: a same-run ratio, never an absolute
-//	      millisecond bound; on 2000cba reconcileOnce IS the exclusive
-//	      walk, so the ratio is 1 and the arm is RED).
+//	FU4 — the full walk over a 20K-entry store holds the store lock per BATCH
+//	      and releases it between batches (PM condition 3), asserted
+//	      DETERMINISTICALLY with no wall-clock ratio: the walk runs in exactly
+//	      ceil(N/512) acquisitions, store.mu is free during every between-batch
+//	      gap (a race-free TryLock — so a hold spanning several batches is
+//	      caught even when the count stays intact), and a concurrent customer
+//	      Get completes in every gap within a generous backstop. The removed
+//	      fu4Ratio/fu4Rounds/fu4ExclusiveWalk/fu4Measure/fu4Hammer were the
+//	      ratio's machinery (#326).
 //
 // The arms that read the follow-up's NEW report fields live in
 // issue1126_c3_followup_fields_test.go.
@@ -188,23 +200,7 @@ func c3WaitEvictDelete(want uint64, within time.Duration) uint64 {
 
 // --- FU4 — the full walk never stalls a customer Get for the whole residency --
 
-const (
-	fu4Entries = 20000
-	// fu4Ratio: the chunked walk's worst concurrent Get must be at most
-	// 1/fu4Ratio of the EXCLUSIVE walk's worst concurrent Get, measured in
-	// the SAME run on the SAME machine (arch N10: an absolute millisecond
-	// bound measures the machine — 11–251 ms for the fixed code under three
-	// concurrent builds — and cannot tell chunked from exclusive). Data on a
-	// quiet box under -race, 20K entries: exclusive 55 ms vs chunked
-	// 6.4–12 ms, ratio ≥ 4.5; K=2 leaves that margin on both sides and both
-	// terms scale together under load. On 2000cba the two walks are the same
-	// walk, so the ratio is 1 and the arm is RED.
-	fu4Ratio = 2
-	// fu4Rounds: each shape is measured this many times, interleaved, and
-	// the MIN worst-Get per shape is compared — the min is the estimator a
-	// load spike on one round cannot inflate.
-	fu4Rounds = 3
-)
+const fu4Entries = 20000
 
 // fu4Store builds a store of fu4Entries widget entries whose GVR is NOT
 // watched, so every probe is a cheap UNKNOWN (no submits, no worker
@@ -223,73 +219,37 @@ func fu4Store(t *testing.T) (*ResolvedCacheStore, *ResourceWatcher) {
 	return store, rw
 }
 
-// fu4ExclusiveWalk is the PRE-CHUNKING shape of the full walk, kept here as
-// the in-run baseline: one RangeMetadata pass (the store mutex held across
-// the whole residency) collecting every self coordinate, then the probes
-// outside the lock. Returns the number of entries visited and probed.
-func fu4ExclusiveWalk(store *ResolvedCacheStore, rw *ResourceWatcher) (sampled, probed int) {
-	var keys []depEventKey
-	store.RangeMetadata(func(m ResolvedEntryMeta) bool {
-		sampled++
-		if m.Name == "" || m.Resource == "" {
-			return true
-		}
-		keys = append(keys, depEventKey{
-			gvr:       schema.GroupVersionResource{Group: m.Group, Version: m.Version, Resource: m.Resource},
-			namespace: m.Namespace, name: m.Name,
-		})
-		return true
-	})
-	seen := map[depEventKey]struct{}{}
-	for _, k := range keys {
-		if _, dup := seen[k]; dup {
-			continue
-		}
-		seen[k] = struct{}{}
-		rw.probeObjectState(k.gvr, k.namespace, k.name)
-		probed++
+// fu4AssertGapBoundedHold asserts, from inside a between-batch gap of the
+// chunked full walk, that the store lock is NOT held across the batch — the
+// batch-bounded-hold MECHANISM, checked deterministically with NO wall-clock
+// ratio:
+//
+//   - TryLock (the deterministic core): during a genuine gap the walk holds no
+//     lock, so store.mu.TryLock() succeeds. sync.Mutex is non-reentrant, so a
+//     walk that holds c.mu across this batch — the whole-residency shape, or a
+//     regression that spans several batches per acquisition — fails TryLock
+//     here, race-free and with no timing. This closes the granularity blind
+//     spot the batch COUNT alone leaves (a hold spanning 2 batches keeps the
+//     count at ceil(N/512) but is caught here).
+//   - concurrent Get (behavioural liveness): a real customer store.Get
+//     completes within a GENEROUS deadlock backstop; a walk holding c.mu across
+//     the residency blocks it. The backstop is a safety net for a stuck walk,
+//     NOT the discriminator (the #328 pattern) — the TryLock above decides.
+func fu4AssertGapBoundedHold(t *testing.T, store *ResolvedCacheStore) {
+	t.Helper()
+	if !store.mu.TryLock() {
+		t.Fatalf("FU4: the store lock is held during a between-batch gap — the full walk holds c.mu across " +
+			"batches; at 50K-100K entries /debug/reconcile would stall every customer /call for the whole walk (PM condition 3)")
 	}
-	return sampled, probed
-}
-
-// fu4Hammer runs store.Get in a loop until stop is closed and returns the
-// longest single Get observed and the number of Gets completed.
-func fu4Hammer(store *ResolvedCacheStore, key string, stop <-chan struct{}) (max time.Duration, n int64) {
-	for {
-		select {
-		case <-stop:
-			return
-		default:
-		}
-		t0 := time.Now()
-		store.Get(key)
-		if d := time.Since(t0); d > max {
-			max = d
-		}
-		n++
+	store.mu.Unlock()
+	const releaseBackstop = 30 * time.Second
+	done := make(chan struct{})
+	go func() { store.Get("L1_button-0"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(releaseBackstop):
+		t.Fatalf("FU4: a concurrent customer store.Get blocked >%s in a between-batch gap — the walk holds the store lock across the residency", releaseBackstop)
 	}
-}
-
-// fu4Measure runs walk with a concurrent Get hammer and returns the walk's
-// wall time, the worst concurrent Get and the number of Gets completed.
-func fu4Measure(store *ResolvedCacheStore, walk func()) (wall, worstGet time.Duration, gets int64) {
-	stop := make(chan struct{})
-	type res struct {
-		max time.Duration
-		n   int64
-	}
-	resCh := make(chan res, 1)
-	go func() {
-		m, n := fu4Hammer(store, "L1_button-0", stop)
-		resCh <- res{m, n}
-	}()
-	time.Sleep(20 * time.Millisecond) // the hammer is running before the walk starts
-	t0 := time.Now()
-	walk()
-	wall = time.Since(t0)
-	close(stop)
-	r := <-resCh
-	return wall, r.max, r.n
 }
 
 func TestIssue1126_C3_FU4_FullWalkNeverBlocksAConcurrentGetBeyondOneBatch(t *testing.T) {
@@ -298,40 +258,37 @@ func TestIssue1126_C3_FU4_FullWalkNeverBlocksAConcurrentGetBeyondOneBatch(t *tes
 		t.Fatalf("premise: entry not resident")
 	}
 
-	// Load-independent half: the chunked walk visits and probes everything.
+	// Load-independent: the chunked full walk visits and probes everything.
 	rep := reconcileOnce(store, rw, 0)
 	if rep.Sampled != fu4Entries || rep.Probed != fu4Entries || rep.Unknown != fu4Entries {
 		t.Fatalf("FU4: sampled=%d probed=%d unknown=%d, want %d each (an unwatched GVR is UNKNOWN, never absent)",
 			rep.Sampled, rep.Probed, rep.Unknown, fu4Entries)
 	}
 
-	// Same-run ratio: exclusive vs chunked, interleaved, min of fu4Rounds.
-	var minEx, minCh time.Duration = -1, -1
-	for i := 0; i < fu4Rounds; i++ {
-		wallEx, worstEx, getsEx := fu4Measure(store, func() {
-			if s, p := fu4ExclusiveWalk(store, rw); s != fu4Entries || p != fu4Entries {
-				t.Errorf("FU4: exclusive baseline visited %d / probed %d, want %d", s, p, fu4Entries)
-			}
-		})
-		wallCh, worstCh, getsCh := fu4Measure(store, func() { reconcileOnce(store, rw, 0) })
-		t.Logf("FU4 round %d: exclusive walk %s worst Get %s (%d Gets) | chunked walk %s worst Get %s (%d Gets)",
-			i+1, wallEx, worstEx, getsEx, wallCh, worstCh, getsCh)
-		if getsEx == 0 || getsCh == 0 {
-			t.Fatalf("FU4: the hammer completed no Get during a walk (exclusive %d, chunked %d)", getsEx, getsCh)
+	// Mechanism (deterministic, no wall-clock ratio). The full walk holds the
+	// store lock per BATCH, releasing it between batches, so a customer Get is
+	// never blocked for the whole residency. Two axes, per arch's ruling:
+	//   GRANULARITY — the walk runs in exactly wantBatches acquisitions, and the
+	//                 store lock is free during EVERY gap (fu4AssertGapBoundedHold's
+	//                 TryLock), so a hold spanning multiple batches is caught even
+	//                 though it keeps the batch count intact.
+	//   LIVENESS    — a concurrent customer Get completes in every gap.
+	wantBatches := (fu4Entries + reconcileFullBatch - 1) / reconcileFullBatch
+	batches, visited := 0, 0
+	store.RangeMetadataBatched(reconcileFullBatch, func(metas []ResolvedEntryMeta, _ time.Duration) bool {
+		batches++
+		visited += len(metas)
+		if len(metas) > reconcileFullBatch {
+			t.Fatalf("FU4: a batch copied %d entries under one lock hold, want <= %d", len(metas), reconcileFullBatch)
 		}
-		if minEx < 0 || worstEx < minEx {
-			minEx = worstEx
-		}
-		if minCh < 0 || worstCh < minCh {
-			minCh = worstCh
-		}
+		fu4AssertGapBoundedHold(t, store)
+		return true
+	})
+	if batches != wantBatches {
+		t.Fatalf("FU4: full walk ran in %d acquisitions, want %d (%d entries / %d per batch) — the walk did not "+
+			"chunk into batch-bounded holds", batches, wantBatches, fu4Entries, reconcileFullBatch)
 	}
-	t.Logf("FU4: min worst Get — exclusive %s, chunked %s, ratio %.1f (need ≥ %d)",
-		minEx, minCh, float64(minEx)/float64(minCh), fu4Ratio)
-	if minCh*fu4Ratio > minEx {
-		t.Fatalf("RED: the chunked full walk stalls a concurrent store.Get for %s vs %s for the exclusive walk "+
-			"(ratio %.1f, need ≥ %d) — the walk still holds the store mutex across the whole residency; at "+
-			"50K–100K entries /debug/reconcile stalls every customer /call for the whole walk (PM condition 3)",
-			minCh, minEx, float64(minEx)/float64(minCh), fu4Ratio)
+	if visited != fu4Entries {
+		t.Fatalf("FU4: batched walk visited %d entries, want %d", visited, fu4Entries)
 	}
 }
