@@ -2511,6 +2511,22 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 // mirroring the /debug/reconcile full walk (reconcileFullBatch).
 const reapMaxAgeBatch = 512
 
+// proactiveRefreshDisabledForTest gates the #316 proactive-refresh enqueue for the
+// C1 amplification A/B bench ONLY. Default false = ENABLED, so production and every
+// non-bench path run the pass exactly as designed (self-adapting, no knob) — there
+// is NO production reader that turns it off. SetProactiveRefreshEnabledForTest flips
+// it so the in-process C1 harness can measure the SAME build with the pass ON
+// (proactive-on arm) vs OFF (baseline arm), isolating the pass's amplification from
+// the #315 reaper changes a cross-build baseline would confound. #315 cold-evict and
+// #248 suppressed-reap are UNAFFECTED (this gates ONLY the refresh-enqueue branch).
+var proactiveRefreshDisabledForTest atomic.Bool
+
+// Its ONLY writer, SetProactiveRefreshEnabledForTest, is defined in a _test.go file
+// (issue316_toggle_bench_test.go) and is therefore NEVER compiled into the production
+// binary — arch-1217's build discipline: the flag can only be flipped under `go test`,
+// so the pass can never be turned off in prod (the production gate below reads a var
+// that in a real process only ever holds its enabled default).
+
 // reapPastMaxEntryAge is the read-independent maintenance pass that closes the
 // two lazy-enforcement holes (#248 / #315 / #316) in ONE full walk. Both TTL
 // (CreatedAt) and maxEntryAge (BornAt) are enforced ONLY inside Get, so a cell
@@ -2614,7 +2630,7 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 			// (metaForItemLocked uses effectiveTTLLocked); for the non-override cells
 			// that remain, effective == standard, so refreshBelow (standard TTL/4) is
 			// the right threshold.
-			if warm && !suppressed && m.TTLOverrideSeconds == 0 && ttlSec > 0 && m.TTLRemainingSeconds < refreshBelow {
+			if warm && !suppressed && m.TTLOverrideSeconds == 0 && ttlSec > 0 && m.TTLRemainingSeconds < refreshBelow && !proactiveRefreshDisabledForTest.Load() {
 				refreshCandidates = append(refreshCandidates, m.KeyHash)
 			}
 		}
