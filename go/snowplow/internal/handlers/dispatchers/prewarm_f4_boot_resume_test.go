@@ -95,10 +95,7 @@ func TestF4_Straddle_RequeueResumesAndLatchFiresExactlyOnce(t *testing.T) {
 		resetFirstNavLatchForTest()
 		latch := ensureFirstNavLatch()
 
-		var buf bytes.Buffer
-		prev := slog.Default()
-		slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-		t.Cleanup(func() { slog.SetDefault(prev) })
+		buf := captureDefaultSlogForTest(t, slog.LevelInfo)
 
 		// Observe the latch fire count + whether the tail was already seeded when
 		// it fired (ARM-TAIL: it must NOT be).
@@ -329,10 +326,7 @@ func TestF4_FreshSkip_RealSeedOneWidget_SkipsLiveCell(t *testing.T) {
 	skipBefore := pipSeedFreshSkipTotal.Load()
 	resolvesBefore := pipBindingSetSeedResolvesTotal.Load()
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureDefaultSlogForTest(t, slog.LevelDebug)
 
 	_ = seedOneWidget(granted, e, "authn-ns", seedModeBoot)
 	if pipSeedFreshSkipTotal.Load() != skipBefore {
@@ -451,10 +445,7 @@ func TestF4_Boundary_GVRDiscoveredScopeNeverSkipsLiveCell(t *testing.T) {
 		t.Fatal("setup: live cell installed")
 	}
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureDefaultSlogForTest(t, slog.LevelDebug)
 
 	freshBefore := pipSeedFreshSkipTotal.Load()
 	ageBefore := keepwarmAgeSkipTotal.Load()

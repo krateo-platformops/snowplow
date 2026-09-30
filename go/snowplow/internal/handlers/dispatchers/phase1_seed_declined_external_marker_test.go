@@ -41,7 +41,6 @@
 package dispatchers
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"os"
@@ -571,10 +570,7 @@ func TestF4bLeverA_R4_SummaryIsWholeBootCumulative(t *testing.T) {
 	defer engineLatchTestMu.Unlock()
 	t.Setenv("CACHE_ENABLED", "true")
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureDefaultSlogForTest(t, slog.LevelInfo)
 
 	e := newTestEngine()
 	const widget = "krateo-system/obs-perf-p50"

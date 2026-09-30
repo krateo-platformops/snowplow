@@ -19,6 +19,7 @@ import (
 //     errors (one-time semantics via sync.Once).
 //   - Every call returns a non-nil ctx (context.Background fallback).
 func TestEngineWorker_NilProcessCtxLogsErrorOnce(t *testing.T) {
+	quiesceDefaultSummaryForTest(t) // #221: this test captures the default slog (TextHandler) — quiesce the summary goroutine so its ticker can't race &buf
 	ResetEngineProcessCtxForTest()
 	defer ResetEngineProcessCtxForTest()
 
@@ -69,6 +70,7 @@ func TestEngineWorker_NilProcessCtxLogsErrorOnce(t *testing.T) {
 // called with a non-nil ctx, resolveEngineProcessCtx returns that
 // exact ctx and emits ZERO error logs.
 func TestEngineWorker_SetEngineProcessContextSuppressesNilFallback(t *testing.T) {
+	quiesceDefaultSummaryForTest(t) // #221: TextHandler default-slog capture — quiesce the summary goroutine
 	ResetEngineProcessCtxForTest()
 	defer ResetEngineProcessCtxForTest()
 
@@ -99,6 +101,7 @@ func TestEngineWorker_SetEngineProcessContextSuppressesNilFallback(t *testing.T)
 // sync.Once gate, so a test that drives the nil-fallback path
 // repeatedly within one binary doesn't see the first-test's gate.
 func TestEngineWorker_ResetEngineProcessCtxForTestResetsOnceGate(t *testing.T) {
+	quiesceDefaultSummaryForTest(t) // #221: two TextHandler default-slog captures (buf1/buf2) — quiesce the summary goroutine for the whole func
 	// First nil-fire cycle.
 	ResetEngineProcessCtxForTest()
 	var buf1 bytes.Buffer
