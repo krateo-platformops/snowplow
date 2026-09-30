@@ -248,6 +248,7 @@ func withContentPrewarmSAContext(ctx context.Context, saEP endpoints.Endpoint, s
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 	rctx = cache.WithApistagePrewarm(rctx)   // populate content L1, skip the per-user gate
 	rctx = cache.WithPrewarmIterSerial(rctx) // OOM mitigation 2 / Fork B serial — serial inner-call fan-out
+	rctx = cache.WithPrewarmPath(rctx)       // #214: content prewarm reaches resourcesrefs.Resolve via nested_call; mark it so any denial here is Debug+counted, not WARN
 	// #130 F2 — attach the shared watcher so the content pass's inner LIST calls
 	// (dispatchViaInternalRESTConfig, resolve.go:849) serve a servable GVR's LIST
 	// from the synced informer indexer instead of a live ~23s/60K paged apiserver
