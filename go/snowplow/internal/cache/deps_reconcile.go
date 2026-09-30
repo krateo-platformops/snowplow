@@ -291,6 +291,12 @@ type ReconcileReport struct {
 	SnapshotHoldMicros int64 `json:"snapshotHoldMicros,omitempty"`
 	MaxBatchHoldMicros int64 `json:"maxBatchHoldMicros,omitempty"`
 	Truncated          bool  `json:"truncated,omitempty"`
+	// DryRun records which mode produced this report (#238): true means the
+	// divergent set was REPORTED without handing any coordinate to the
+	// dep-event worker (observe-before-repair). NOT omitempty — a captured
+	// reconcile.json must state its mode in BOTH modes, or a saved body cannot
+	// later be trusted as a pre-repair observation.
+	DryRun bool `json:"dryRun"`
 }
 
 // reconcileCandidate is the phase-1 projection of one entry.
@@ -300,12 +306,16 @@ type reconcileCandidate struct {
 	key     depEventKey
 }
 
-// reconcileOnce runs one audit pass over store against rw. limit > 0 samples
+// reconcileWalk runs one audit pass over store against rw. limit > 0 samples
 // up to limit entries (RangeMetadataSample, one bounded lock hold); limit
 // <= 0 walks EVERY entry (the /debug/reconcile full walk) in batches of
 // reconcileFullBatch — RangeMetadataBatched holds the store mutex per
 // batch only, each batch is probed before the next is collected, and the
 // walk stops between batches at reconcileFullMaxWall.
+//
+// When dryRun is true the walk still classifies and REPORTS every divergent
+// coordinate but hands NONE to the dep-event worker (#238): the observe-only
+// mode behind /debug/reconcile?dryRun=1.
 //
 // Two phases per batch, two locks, never nested:
 //
@@ -313,10 +323,19 @@ type reconcileCandidate struct {
 //	          with a self coordinate (Name != "" && Resource != "").
 //	phase 2 — outside c.mu: probeObjectState per unique coordinate (takes
 //	          rw.mu.RLock inside); ABSENT + edge → submitDepEvent on the
-//	          shared worker; ABSENT + no edge → skippedNoEdge; UNKNOWN →
-//	          count and skip; EXISTS → nothing.
+//	          shared worker (SKIPPED under dryRun); ABSENT + no edge →
+//	          skippedNoEdge; UNKNOWN → count and skip; EXISTS → nothing.
+//
+// reconcileOnce is the non-dryRun entry (the periodic tick and the existing
+// test call sites): reconcileWalk with dryRun=false, kept as a stable
+// signature so those callers are untouched.
 func reconcileOnce(store *ResolvedCacheStore, rw *ResourceWatcher, limit int) ReconcileReport {
-	st := reconcileState{rw: rw, w: depWatchSingleton(), deps: Deps(), verdicts: map[depEventKey]objectState{}}
+	return reconcileWalk(store, rw, limit, false)
+}
+
+func reconcileWalk(store *ResolvedCacheStore, rw *ResourceWatcher, limit int, dryRun bool) ReconcileReport {
+	st := reconcileState{rw: rw, w: depWatchSingleton(), deps: Deps(), verdicts: map[depEventKey]objectState{}, dryRun: dryRun}
+	st.rep.DryRun = dryRun
 	if store == nil || rw == nil {
 		return st.rep
 	}
@@ -364,6 +383,10 @@ type reconcileState struct {
 	rep       ReconcileReport
 	verdicts  map[depEventKey]objectState
 	submitted map[depEventKey]struct{}
+	// dryRun (#238): when true, probe REPORTS a divergent coordinate (counts it,
+	// appends the row) but does NOT hand it to the dep-event worker — so a full
+	// walk can observe the divergent set without evicting it.
+	dryRun bool
 }
 
 func (s *reconcileState) collect(cands []reconcileCandidate, m ResolvedEntryMeta) []reconcileCandidate {
@@ -411,7 +434,12 @@ func (s *reconcileState) probe(cands []reconcileCandidate) {
 		if _, done := s.submitted[c.key]; !done {
 			s.submitted[c.key] = struct{}{}
 			s.rep.Divergent++
-			s.w.submitDepEvent(s.rw, c.key)
+			// #238: dryRun still COUNTS the coordinate and appends its row
+			// below, but hands it to the dep-event worker only in the real
+			// reconcile — so an observe-only walk evicts nothing.
+			if !s.dryRun {
+				s.w.submitDepEvent(s.rw, c.key)
+			}
 		}
 		s.rep.Entries = append(s.rep.Entries, ReconcileEntry{
 			KeyHash:         c.keyHash,
@@ -423,25 +451,40 @@ func (s *reconcileState) probe(cands []reconcileCandidate) {
 	}
 }
 
-// ReconcileFull runs ONE full-walk audit on demand (GET /debug/reconcile).
-// Returns ok=false (and an empty report) when the resolved cache is off or
-// no watcher is installed. Divergent coordinates ARE submitted to the
-// dep-event worker — the endpoint is a reconcile, not a dry run; that is
-// why it is opt-in and JWT-gated. Counted on sampled/probed/divergence/
-// unknown/skipped_no_edge (not on ticks). CHUNKED: the store mutex is held
-// per batch of reconcileFullBatch, never across the residency; the
-// measured holds are in the report and in the INFO line.
+// ReconcileFull runs ONE full-walk audit on demand and EVICTS the divergent
+// set via the dep-event worker — the default operator-remediation behaviour
+// behind GET /debug/reconcile. Equivalent to ReconcileFullDryRun(false).
 func ReconcileFull() (ReconcileReport, bool) {
+	return ReconcileFullDryRun(false)
+}
+
+// ReconcileFullDryRun runs ONE full-walk audit on demand. When dryRun is true
+// it REPORTS the divergent set WITHOUT handing any coordinate to the dep-event
+// worker and WITHOUT moving any reconcile counter — the #238 observe-before-
+// repair mode behind /debug/reconcile?dryRun=1 (rep.DryRun records the mode so
+// a saved body is self-describing). dryRun=false is the reconcile: divergent
+// coordinates ARE submitted and the pass is counted on sampled/probed/
+// divergence/unknown/skipped_no_edge (not on ticks). Returns ok=false (empty
+// report) when the resolved cache is off or no watcher is installed. CHUNKED:
+// the store mutex is held per batch of reconcileFullBatch, never across the
+// residency; the measured holds are in the report and in the INFO line.
+func ReconcileFullDryRun(dryRun bool) (ReconcileReport, bool) {
 	store := ResolvedCache()
 	rw := Global()
 	if store == nil || rw == nil {
-		return ReconcileReport{}, false
+		return ReconcileReport{DryRun: dryRun}, false
 	}
 	start := time.Now()
-	rep := reconcileOnce(store, rw, 0)
-	depsReconcileInstance.account(rep)
+	rep := reconcileWalk(store, rw, 0, dryRun)
+	// A dry run is a pure observation: it must not move the reconcile counters.
+	// reconcile_divergence_total in particular feeds the lost-DELETE operator
+	// signal, and under dryRun nothing was evicted to justify moving it (#238).
+	if !dryRun {
+		depsReconcileInstance.account(rep)
+	}
 	slog.Info("cache.deps_reconcile.full_walk",
 		slog.String("subsystem", "cache"),
+		slog.Bool("dry_run", dryRun),
 		slog.Int("sampled", rep.Sampled),
 		slog.Int("probed", rep.Probed),
 		slog.Int("divergent", rep.Divergent),
