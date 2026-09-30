@@ -83,6 +83,23 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 
 	verb := ptr.Deref(opts.Verb, http.MethodGet)
 
+	// snowplow#232: on the AWS-auth branch, opts.RequestInfo is handed to
+	// plumbing's SigV4 signer BOTH via ComputeAwsHeaders below AND via the
+	// client builder (httpClientForEndpoint → HTTPClientForEndpoint →
+	// ComputeAwsSignature), which dereference RequestInfo.Verb UNGUARDED
+	// (http/request/util.go:134 — `method := *ex.Verb`; only the struct
+	// pointer is nil-checked, not the field). The line above already defaults
+	// a nil Verb to GET for the request itself, but that default never
+	// reaches RequestInfo, so an AWS endpoint dialed with a nil Verb panics
+	// instead of signing a GET. Carry the same GET-default onto RequestInfo
+	// so the signer sees the verb the request actually uses. This is the
+	// established convention (setup.go:105, apistage.go:788) — the owned
+	// builder cannot widen the unexported plumbing signer, so the guard lives
+	// here at the delegation boundary.
+	if opts.Verb == nil {
+		opts.Verb = ptr.To(verb)
+	}
+
 	var body io.Reader
 	if s := ptr.Deref(opts.Payload, ""); len(s) > 0 {
 		body = strings.NewReader(s)
