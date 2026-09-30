@@ -115,6 +115,15 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		"evict_ttl_total":     int64(s.EvictTTLTotal),
 		"evict_max_age_total": int64(s.EvictMaxAgeTotal), // 1.12.6 C5 bounded lifetime
 		"evict_delete_total":  int64(s.EvictDeleteTotal),
+		// #345 — #248's resident-suppressed GAUGE (current count, up/down), not a
+		// total. Non-zero DURING the UAF-decline-freeze; distinguishes decline-
+		// frozen cells from never-yet-refreshed ones. Was computed by the #248
+		// reaper every summary tick and thrown away into the LOG_LEVEL=warn-
+		// suppressed INFO line; now on /debug/vars + OTLP (rides snowplow_resolved_
+		// cache, the Int64ObservableGauge whose ObserveInt64 reports the current
+		// value each callback — correct gauge semantics — via metrics.go's range
+		// over ResolvedCacheStatsByStat(), OTLP-observed by construction).
+		"suppressed_resident": int64(s.SuppressedResident),
 		// Ship 4a resident region
 		"resident_entries":      int64(s.ResidentEntries),
 		"resident_bytes":        s.ResidentBytes,
