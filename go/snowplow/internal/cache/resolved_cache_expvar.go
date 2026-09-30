@@ -124,6 +124,15 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		// value each callback — correct gauge semantics — via metrics.go's range
 		// over ResolvedCacheStatsByStat(), OTLP-observed by construction).
 		"suppressed_resident": int64(s.SuppressedResident),
+		// #315 C4 detector — resident WARM cells past maxEntryAge, un-re-minted
+		// (a GAUGE): the AT-RISK population the read-independent pass keeps (C3)
+		// rather than cold-evicts, and keeps body-fresh via #316. Re-mint deferred.
+		"warm_past_max_age": int64(s.WarmPastMaxAge),
+		// #316 — proactive refreshes ENQUEUED by the read-independent pass (a
+		// monotonic total): non-zero DURING a missed-dirty-mark defect the pass is
+		// catching, zero if the pass is inert. Read next to snowplow_refresher's
+		// completed_total (the refresher's dedup collapses these enqueues).
+		"proactive_refresh_total": int64(s.ProactiveRefreshTotal),
 		// Ship 4a resident region
 		"resident_entries":      int64(s.ResidentEntries),
 		"resident_bytes":        s.ResidentBytes,
