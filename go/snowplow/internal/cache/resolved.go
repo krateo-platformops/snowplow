@@ -1512,6 +1512,18 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 	}
 
 	item := &lruItem{key: key, entry: entry, bytes: bytes, extrasHash: extrasHash, gen: gen}
+	// #315/#316 — read-recency on a FRESH insert. A non-seeded insert is a
+	// customer COLD-FILL (Get-MISS → populate → serve): the customer DID read it,
+	// but via a MISS, so without this a cold-filled cell would carry lastRead=zero
+	// (COLD) until its SECOND read — a one-read-lag that would let the pass skip
+	// refreshing a genuinely-used cell and cold-nav it at TTL. Stamp it warm now
+	// (CreatedAt == the fill instant, set by putPreamble). A boot-seed insert
+	// (SeededAtBoot) leaves lastRead zero and rides the seed warmth signal until
+	// real traffic stamps a Get-HIT. A refresh re-Put takes the replace-in-place
+	// branch above and INHERITS lastRead, so it never reaches here.
+	if !entry.SeededAtBoot {
+		item.lastRead = entry.CreatedAt
+	}
 	el := c.order.PushFront(item)
 	c.index[key] = el
 	if entry.Pinned {
@@ -2578,7 +2590,19 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 			// non-suppressed cell (within OR past maxAge) whose body is approaching
 			// TTL is enqueued. A cold-evict candidate is !warm, so it is never also
 			// a refresh candidate.
-			if warm && !suppressed && ttlSec > 0 && m.TTLRemainingSeconds < refreshBelow {
+			//
+			// EXCLUDE TTLOverride cells (arch-1217): a per-entry TTLOverride>0 is a
+			// DELIBERATE short bounded-staleness stopgap (UAF #118-d, degraded #36
+			// R1-L2 catalog). Proactively refreshing it resets CreatedAt and extends
+			// its life, undermining that stopgap — so leave it to its own short
+			// effective-TTL expiry. This also keeps the 300s-tick vs TTL/4 sampling
+			// valid: the standard TTL (3600s) gives a ~900s window sampled ~3× per
+			// tick, while the short-TTL cells the tick could UNDER-sample are excluded.
+			// m.TTLRemainingSeconds is already the EFFECTIVE-TTL remaining
+			// (metaForItemLocked uses effectiveTTLLocked); for the non-override cells
+			// that remain, effective == standard, so refreshBelow (standard TTL/4) is
+			// the right threshold.
+			if warm && !suppressed && m.TTLOverrideSeconds == 0 && ttlSec > 0 && m.TTLRemainingSeconds < refreshBelow {
 				refreshCandidates = append(refreshCandidates, m.KeyHash)
 			}
 		}

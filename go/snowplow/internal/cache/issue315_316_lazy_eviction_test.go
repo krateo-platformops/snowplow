@@ -79,17 +79,19 @@ func TestIssue315_ColdNonSuppressedPastMaxAge_IsReaped(t *testing.T) {
 }
 
 // TestIssue315_GetHitStampsLastRead is the discriminator SUBSTRATE arm: a Get HIT
-// stamps the read-recency (LastReadSeconds moves from -1 "never read" to >=0), and
-// a never-read cell reports -1. This is what tells WARM (served) from COLD.
+// stamps the read-recency (LastReadSeconds moves from -1 "never traffic-read" to
+// >=0). A boot-SEED cell starts at -1 (warm via SeededAtBoot, not lastRead) until
+// real traffic reads it — the clean way to observe the Get stamp in isolation (a
+// cold-fill Put is warm at insert, see TestIssue315_ColdFillPut_IsImmediatelyWarm).
 func TestIssue315_GetHitStampsLastRead(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "w"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in})
+	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in, SeededAtBoot: true})
 
-	// Never read yet → LastReadSeconds == -1.
+	// Seeded, never traffic-read → LastReadSeconds == -1.
 	if m, ok := c.MetadataForKey(key); !ok || m.LastReadSeconds != -1 {
-		t.Fatalf("a never-read cell must report LastReadSeconds=-1; ok=%v got=%d", ok, m.LastReadSeconds)
+		t.Fatalf("a seeded, never-traffic-read cell must report LastReadSeconds=-1; ok=%v got=%d", ok, m.LastReadSeconds)
 	}
 	// A Get HIT stamps it.
 	if _, ok := c.Get(key); !ok {
@@ -273,14 +275,84 @@ func TestIssue316_NoAmplification_WithinTTLWarmNotEnqueued(t *testing.T) {
 	// WARM (Get-hit) but body only 2s old → TTLRemaining ~18s > TTL/4 (5s): NOT
 	// approaching TTL, so NOT a refresh candidate.
 	_ = i316WarmApproachingTTL(t, c, "young-warm", 2*time.Second, true)
-	// COLD (never read) approaching TTL → NOT in the warm set → NOT refreshed
-	// (and within maxAge, so NOT evicted either).
-	_ = i316WarmApproachingTTL(t, c, "cold-approaching", 16*time.Second, false)
+	// COLD: last read 100s ago (> W=TTL 20s) and never re-read — NOT in the warm
+	// set. Its body is past TTL (TTLRemaining=0, well under TTL/4) so it WOULD be
+	// a refresh candidate if warm, which makes this a sharp cold-vs-warm control:
+	// it must NOT be enqueued (cold), and within maxAge it is NOT cold-evicted.
+	_ = i316WarmApproachingTTL(t, c, "cold-stale", 100*time.Second, false)
 
 	before := c.Stats().ProactiveRefreshTotal
 	c.reapPastMaxEntryAge()
 	if got := c.Stats().ProactiveRefreshTotal; got != before {
-		t.Fatalf("#316 no-amplification: neither a within-TTL warm cell nor a COLD approaching-TTL cell "+
+		t.Fatalf("#316 no-amplification: neither a within-TTL warm cell nor a COLD stale cell "+
 			"may be enqueued; proactive_refresh_total moved %d->%d", before, got)
+	}
+}
+
+// TestIssue316_TTLOverrideCell_NotProactivelyRefreshed (arch-1217 addition): a
+// WARM cell approaching its EFFECTIVE TTL but carrying a TTLOverride>0 (the short
+// bounded-staleness stopgap — UAF #118-d / degraded #36 R1-L2) must NOT be
+// proactively refreshed. Refreshing it resets CreatedAt and extends the very life
+// the override deliberately bounds. Left to its own short-TTL expiry.
+func TestIssue316_TTLOverrideCell_NotProactivelyRefreshed(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20") // standard TTL/4 = 5s
+	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "86400")
+	t.Setenv("RESOLVED_CACHE_SUMMARY_EVERY_SECONDS", "36000")
+	resetResolvedCacheForTest()
+	t.Cleanup(resetResolvedCacheForTest)
+
+	c := ResolvedCache()
+	if c == nil {
+		t.Skip("resolved cache disabled in this environment")
+	}
+	Deps().SetStore(c)
+
+	gvr := coherenceProbeGVR()
+	const ns = "team-a"
+	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: ns, Name: "override"}
+	key := ComputeKey(in)
+	// TTLOverride=8s, body 7s old → EFFECTIVE TTLRemaining ~1s (< standard TTL/4=5),
+	// so it WOULD be a refresh candidate if not for the TTLOverride exclusion.
+	c.Put(key, &ResolvedEntry{
+		RawJSON:     []byte(coherenceV1),
+		Inputs:      &in,
+		CreatedAt:   time.Now().Add(-7 * time.Second),
+		TTLOverride: 8 * time.Second,
+	})
+	Deps().Record(key, gvr, ns, "override")
+	if _, ok := c.Get(key); !ok {
+		t.Fatal("precondition: the override cell (1s left on its 8s effective TTL) must HIT → warm")
+	}
+
+	before := c.Stats().ProactiveRefreshTotal
+	c.reapPastMaxEntryAge()
+	if got := c.Stats().ProactiveRefreshTotal; got != before {
+		t.Fatalf("#316: a TTLOverride>0 cell must NOT be proactively refreshed (extending its "+
+			"deliberate short bounded-staleness stopgap); proactive_refresh_total moved %d->%d", before, got)
+	}
+}
+
+// TestIssue315_ColdFillPut_IsImmediatelyWarm (arch-1217 addition): a cold-fill
+// (non-seeded fresh Put — a customer Get-MISS → populate → serve) is warm IMMEDIATELY
+// (lastRead stamped at the fill), not only after a 2nd read. Without this a
+// genuinely-used cell would be treated COLD for one cycle and cold-nav at TTL. A
+// boot-seed Put, by contrast, leaves lastRead unset (warm via the seed signal).
+func TestIssue315_ColdFillPut_IsImmediatelyWarm(t *testing.T) {
+	c := newResolvedCache(10, 1<<20, time.Hour)
+
+	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "coldfill"}
+	key := ComputeKey(in)
+	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in}) // cold-fill (SeededAtBoot=false)
+	if m, ok := c.MetadataForKey(key); !ok || m.LastReadSeconds < 0 {
+		t.Fatalf("a cold-fill (non-seeded) Put must be immediately warm (LastReadSeconds>=0, no 2nd read); ok=%v got=%d", ok, m.LastReadSeconds)
+	}
+
+	sin := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "seed"}
+	skey := ComputeKey(sin)
+	c.Put(skey, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &sin, SeededAtBoot: true})
+	if m, ok := c.MetadataForKey(skey); !ok || m.LastReadSeconds != -1 {
+		t.Fatalf("a boot-seed Put must leave LastReadSeconds=-1 (warm via SeededAtBoot, not lastRead); ok=%v got=%d", ok, m.LastReadSeconds)
 	}
 }
