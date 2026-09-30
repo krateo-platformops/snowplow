@@ -68,6 +68,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/otelresource"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -559,6 +560,19 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #233: unparseable-CA delegation DETECTOR. Non-zero = an endpoint's CA
+	// bundle is present + endpoint-owned-CA shape but UNPARSEABLE, so snowplow
+	// delegated to plumbing (which almost certainly fails x509:unknown-authority).
+	// A monotonic rate (the WARN is one-shot; this counter is never bounded) —
+	// alertable, which is why it is OTLP-native, not expvar-only (#311, opposite
+	// to an expected-value counter that /debug/vars suffices for).
+	unparseableCADelegations, err := m.Int64ObservableCounter(
+		"snowplow_unparseable_ca_delegations_total",
+		metric.WithDescription("Count of TLS-client construction delegations caused by an UNPARSEABLE endpoint-owned CA bundle (neither raw PEM nor (double-)base64 PEM). Non-zero is a misconfiguration DETECTOR: the operator gave a CA snowplow cannot parse, so the dial delegates to plumbing and almost certainly fails x509:unknown-authority — fix the CA bundle. #233."))
+	if err != nil {
+		return err
+	}
+
 	// --- build identity, so every other panel can be pinned to a commit.
 	buildInfo, err := m.Int64ObservableGauge(
 		"snowplow_build_info",
@@ -755,6 +769,9 @@ func registerInstruments(m metric.Meter, build string) error {
 				metric.WithAttributes(attribute.String("stat", stat)))
 		}
 
+		// --- #233: unparseable-CA delegation detector (uncapped rate) ---
+		o.ObserveInt64(unparseableCADelegations, int64(restactionsapi.UnparseableCADelegationTotal()))
+
 		// --- 1.12.4: build identity, constant 1 ---
 		o.ObserveInt64(buildInfo, 1,
 			metric.WithAttributes(attribute.String("version", buildLabel(build))))
@@ -792,6 +809,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		readyzBackstop, resolvedCache, informerServable, buildInfo,
 		// --- 1.12.5 ---
 		depsStats, informerFreshness,
+		// --- #233 ---
+		unparseableCADelegations,
 	}, derivedObservables...)...)
 	return err
 }
