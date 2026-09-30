@@ -20,3 +20,11 @@ regexes = [
   '''8CGb87PaNXmdUCdlwVbqwq5C9uNAFq6bcFx842uca''',
   '''JSqt0OLM6YAT''',
 ]
+paths = [
+  # go/snowplow/testdata/curl-samples.txt is documentation sample material: the
+  # bearer tokens are placeholders (`ACCESS_TOKEN_HERE`, `${ACCESS_TOKEN}`/`${KRATEO_TOKEN}`
+  # shell refs), not real credentials. Path-scoped so the whole sample doc is exempt from
+  # the default `curl-auth-header` rule (which local `gitleaks dir` 8.30.1 trips on the
+  # literal placeholder). Placeholder-not-secret; see #335.
+  '''go/snowplow/testdata/curl-samples\.txt''',
+]
