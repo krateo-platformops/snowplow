@@ -1,17 +1,8 @@
 // issue1126_c3_followup_test.go — 1.12.6 C3 review follow-ups (arch N2 /
-// N5, PM condition 3). FU1 and FU2 use ONLY symbols that exist on the
+// N5, PM condition 3). Every arm here uses ONLY symbols that exist on the
 // pre-follow-up tree 2000cba (string expvar keys, ReconcileReport fields
-// C3 shipped with, reconcileOnce, RangeMetadata*), so they compile there and
-// each is a BEHAVIOURAL RED on 2000cba and GREEN here. FU4 is the EXCEPTION
-// (see its note): its bounded-hold property is only observable as a wall-clock
-// HOLD DURATION with 2000cba-only symbols — both the chunked and the
-// pre-chunking walk snapshot keys once and release c.mu during probes, so the
-// meta-collection hold length is the only difference — which made a same-run
-// RATIO the only available signal, and it flaked. #326 replaces it with a
-// deterministic mechanism assertion built on the follow-up's batched API, so
-// FU4 is now COMPILE-RED on 2000cba (like the fields file), not a runtime twin:
-// a full chunking revert is caught at compile time, a keep-the-API hold is
-// caught by the deterministic guard.
+// C3 shipped with, reconcileOnce, RangeMetadata*), so the file compiles
+// there and each arm is a BEHAVIOURAL RED on 2000cba and GREEN here:
 //
 //	FU1 — reconcile_sampled_total publishes Sampled and reconcile_probed_total
 //	      publishes Probed (arch N2: 2000cba published Probed under the
@@ -21,24 +12,15 @@
 //	      reconcile_skipped_no_edge_total, NOT as divergence, on every pass;
 //	      the edged sibling is divergent exactly once and evicted (arch N5:
 //	      on 2000cba the no-edge entry pinned divergence non-zero forever).
-//	FU4 — the full walk over a 20K-entry store holds the store lock per BATCH,
-//	      not across the whole residency (PM condition 3), asserted
-//	      DETERMINISTICALLY with no wall-clock ratio, in TWO arms (kept separate
-//	      so a concurrent Get never races the lock probe): a GRANULARITY arm —
-//	      exactly ceil(N/512) acquisitions AND a race-free store.mu.TryLock()
-//	      free in every between-batch gap (catches a hold spanning several
-//	      batches even when the count stays intact), with NO concurrent Get; and
-//	      a LIVENESS arm — a concurrent customer Get completes during the walk
-//	      within a generous deadlock backstop. The removed fu4Ratio/fu4Rounds/
-//	      fu4ExclusiveWalk/fu4Measure/fu4Hammer were the ratio's machinery (#326).
 //
-// The arms that read the follow-up's NEW report fields live in
-// issue1126_c3_followup_fields_test.go.
+// The deterministic-mechanism arms built on the follow-up's BATCHED API — FU4
+// (the batch-bounded full-walk hold) and FU4b (its report fields), plus FU2b —
+// live in issue1126_c3_followup_fields_test.go, which is COMPILE-RED on 2000cba
+// by design and does NOT honor this file's compile-there invariant.
 
 package cache
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -196,108 +178,5 @@ func c3WaitEvictDelete(want uint64, within time.Duration) uint64 {
 			return got
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// --- FU4 — the full walk never stalls a customer Get for the whole residency --
-
-const fu4Entries = 20000
-
-// fu4Store builds a store of fu4Entries widget entries whose GVR is NOT
-// watched, so every probe is a cheap UNKNOWN (no submits, no worker
-// traffic) and the walk's cost is the store-mutex hold under test.
-func fu4Store(t *testing.T) (*ResolvedCacheStore, *ResourceWatcher) {
-	t.Helper()
-	c3Setup(t)
-	store := newResolvedCache(fu4Entries+100, 1<<30, time.Hour)
-	Deps().SetStore(store)
-	rw, _ := realWatcher(t, gvrFlexes())
-	unwatched := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "buttons"}
-	for i := 0; i < fu4Entries; i++ {
-		name := fmt.Sprintf("button-%d", i)
-		store.Put("L1_"+name, &ResolvedEntry{RawJSON: []byte(`{"i":1}`), Inputs: widgetInputs(unwatched, "demo-system", name)})
-	}
-	return store, rw
-}
-
-func TestIssue1126_C3_FU4_FullWalkHoldsLockPerBatchNotAcrossResidency(t *testing.T) {
-	store, rw := fu4Store(t)
-	if _, alive := store.Get("L1_button-0"); !alive {
-		t.Fatalf("premise: entry not resident")
-	}
-
-	// Load-independent: the chunked full walk visits and probes everything.
-	rep := reconcileOnce(store, rw, 0)
-	if rep.Sampled != fu4Entries || rep.Probed != fu4Entries || rep.Unknown != fu4Entries {
-		t.Fatalf("FU4: sampled=%d probed=%d unknown=%d, want %d each (an unwatched GVR is UNKNOWN, never absent)",
-			rep.Sampled, rep.Probed, rep.Unknown, fu4Entries)
-	}
-
-	// GRANULARITY (deterministic, no wall-clock ratio). The full walk runs in
-	// exactly wantBatches acquisitions, and store.mu is FREE during every
-	// between-batch gap. NO concurrent Get runs here (arch): the walk is then
-	// the ONLY c.mu contender, so a correct per-batch release makes TryLock
-	// ALWAYS succeed — a background Get holding c.mu at a TryLock instant would
-	// false-fail it. sync.Mutex is non-reentrant, so a walk that holds c.mu
-	// across a batch (the whole-residency shape, or a hold spanning several
-	// batches that keeps the count at wantBatches) fails TryLock -> RED,
-	// race-free. Closes the blind spot the batch count alone leaves. The
-	// behavioural liveness twin is TestIssue1126_C3_FU4_ConcurrentGet...
-	wantBatches := (fu4Entries + reconcileFullBatch - 1) / reconcileFullBatch
-	batches, visited := 0, 0
-	store.RangeMetadataBatched(reconcileFullBatch, func(metas []ResolvedEntryMeta, _ time.Duration) bool {
-		batches++
-		visited += len(metas)
-		if len(metas) > reconcileFullBatch {
-			t.Fatalf("FU4: a batch copied %d entries under one lock hold, want <= %d", len(metas), reconcileFullBatch)
-		}
-		if !store.mu.TryLock() {
-			t.Fatalf("FU4: the store lock is held during a between-batch gap — the full walk holds c.mu across " +
-				"batches; at 50K-100K entries /debug/reconcile would stall every customer /call for the whole walk (PM condition 3)")
-		}
-		store.mu.Unlock()
-		return true
-	})
-	if batches != wantBatches {
-		t.Fatalf("FU4: full walk ran in %d acquisitions, want %d (%d entries / %d per batch) — the walk did not "+
-			"chunk into batch-bounded holds", batches, wantBatches, fu4Entries, reconcileFullBatch)
-	}
-	if visited != fu4Entries {
-		t.Fatalf("FU4: batched walk visited %d entries, want %d", visited, fu4Entries)
-	}
-}
-
-func TestIssue1126_C3_FU4_ConcurrentGetNeverBlockedForTheWholeWalk(t *testing.T) {
-	store, rw := fu4Store(t)
-	if _, alive := store.Get("L1_button-0"); !alive {
-		t.Fatalf("premise: entry not resident")
-	}
-
-	// LIVENESS (behavioural symptom). A real customer store.Get fired DURING the
-	// full walk must complete within a GENEROUS deadlock backstop; a walk that
-	// holds c.mu across the whole residency blocks it for the entire walk -> the
-	// backstop fires -> RED. The backstop is a safety net, NOT a latency gate
-	// (the #328 pattern): correct code completes each Get in ~ms. Kept SEPARATE
-	// from the TryLock arm (arch) so a concurrent Get never races that TryLock.
-	const backstop = 30 * time.Second
-	walkDone := make(chan struct{})
-	go func() {
-		reconcileOnce(store, rw, 0)
-		close(walkDone)
-	}()
-	for {
-		select {
-		case <-walkDone:
-			return // the walk finished; every concurrent Get completed within the backstop
-		default:
-		}
-		done := make(chan struct{})
-		go func() { store.Get("L1_button-0"); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(backstop):
-			t.Fatalf("FU4: a concurrent customer store.Get blocked >%s during the full walk — the walk holds "+
-				"c.mu across the residency (PM condition 3)", backstop)
-		}
 	}
 }
