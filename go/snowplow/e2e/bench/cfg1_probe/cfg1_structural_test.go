@@ -96,6 +96,13 @@ const (
 var nonCacheInitPublishers = map[string][]string{
 	// /readyz backstop: a readiness surface, meaningful with the cache off.
 	"internal/handlers/dispatchers/readiness_backstop_metrics.go": {"snowplow_readyz_backstop_fired"},
+	// #288 malformed-dial guard: a RESOLVER-path (restactions/api) dial guard, NOT
+	// a cache surface — it runs on every RESTAction resolve regardless of cache
+	// mode (incl. cache-off transparent-fallback), so a malformed-dial skip must
+	// stay observable with the cache off (C1 observability). Deliberately ungated
+	// on Disabled() for that reason; gating it (CFG-1 option A) would hide the
+	// counter cache-off exactly when skips still occur.
+	"internal/resolvers/restactions/api/malformed_dial_metrics.go": {"snowplow_malformed_dial_skipped_total"},
 }
 
 // legacyHG321Keys are the five names the shell falsifier asserted since
