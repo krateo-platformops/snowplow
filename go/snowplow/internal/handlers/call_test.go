@@ -29,6 +29,8 @@ import (
 	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/klient/decoder"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -325,6 +327,27 @@ func TestCall156ClusterScopedWriteWithClusterRBAC(t *testing.T) {
 				Path: "/call?apiVersion=rbac.authorization.k8s.io/v1&resource=clusterroles&name=" + crName,
 			},
 		}, http.StatusOK)).
+		// #223: both cluster-scoped objects this test creates — the
+		// cluster-admins ClusterRoleBinding (applied in Setup) and the
+		// /call-POSTed ClusterRole crName — persist on the shared kind cluster
+		// across -count iterations and would fail AlreadyExists on the next
+		// run (the package could not run under -count>1). Delete both so every
+		// iteration starts clean. Best-effort: a NotFound (test failed before
+		// creating one) is logged, not fatal.
+		Teardown(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			r, err := resources.New(cfg.Client().RESTConfig())
+			if err != nil {
+				t.Fatalf("#223 teardown: resources.New: %v", err)
+			}
+			_ = rbacv1.AddToScheme(r.GetScheme())
+			if err := r.Delete(ctx, &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: crName}}); err != nil {
+				t.Logf("#223 teardown: delete ClusterRole %q: %v", crName, err)
+			}
+			if err := r.Delete(ctx, &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "issue156-cluster-admins"}}); err != nil {
+				t.Logf("#223 teardown: delete ClusterRoleBinding %q: %v", "issue156-cluster-admins", err)
+			}
+			return ctx
+		}).
 		Feature()
 
 	testenv.Test(t, f)
