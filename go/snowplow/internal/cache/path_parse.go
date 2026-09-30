@@ -85,9 +85,12 @@ const skeletonSentinel = "\x00tpl\x00"
 // coordinate. That residual (LARGER than "only a templated GVR segment") falls
 // back to the #285 seed re-walk fence.
 //
-// namespace: a static namespace segment is returned verbatim; a templated OR
-// cluster-scoped namespace returns "" (a cluster-wide LIST edge). name is never
-// returned — this is always a LIST-scope edge (RecordList).
+// namespace: a static namespace segment is returned verbatim; a TEMPLATED
+// namespace on a NAMESPACED resource DECLINES (ok=false → #285 fence) rather than
+// guess a cluster-wide (gvr,"","*") super-scope (#279 ns-scope hardening — the
+// wrong scope would feed the #239 dirty-mark fan-out at 50K×1000). ns="" is
+// returned ONLY for a genuinely cluster-scoped path (no /namespaces/ segment),
+// where "" is its TRUE scope. name is never returned — always a LIST-scope edge.
 //
 // SCOPE (#279 condition 3): this cures the empty fan for stages whose fan is over
 // apiCall.Path's OWN GVR (the dominant list-then-get-each). A CROSS-GVR iterator
@@ -138,7 +141,11 @@ func ParseAPIServerListDepSkeleton(path string) (gvr schema.GroupVersionResource
 			}
 			ns := parts[3]
 			if templated(ns) {
-				ns = ""
+				// #279 ns-scope hardening: a TEMPLATED namespace on a NAMESPACED
+				// resource is UNDETERMINED. DECLINE (→ #285 seed re-walk fence)
+				// rather than guess a cluster-wide (gvr, "", "*") super-scope — the
+				// wrong scope would feed the #239 dirty-mark fan-out at 50K×1000.
+				return schema.GroupVersionResource{}, "", false
 			}
 			return schema.GroupVersionResource{Group: group, Version: version, Resource: resource}, ns, true
 		}
@@ -168,7 +175,9 @@ func ParseAPIServerListDepSkeleton(path string) (gvr schema.GroupVersionResource
 			}
 			ns := parts[2]
 			if templated(ns) {
-				ns = ""
+				// #279 ns-scope hardening (symmetric with the grouped branch): a
+				// templated namespace on a core namespaced resource DECLINES.
+				return schema.GroupVersionResource{}, "", false
 			}
 			return schema.GroupVersionResource{Version: version, Resource: resource}, ns, true
 		}

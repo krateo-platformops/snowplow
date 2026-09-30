@@ -208,18 +208,21 @@ func TestFC3_GVRParity_SkeletonMatchesConcrete(t *testing.T) {
 		template string
 		concrete string
 	}{
-		{"grouped-list-templated-ns",
-			`${ "/apis/widgets.krateo.io/v1/namespaces/" + .ns + "/widgets" }`,
-			"/apis/widgets.krateo.io/v1/namespaces/team-a/widgets"},
+		// ns-scope hardening: templated-ns namespaced paths now DECLINE (they are
+		// asserted in TestFC3_TemplatedNamespace_NamespacedResource_Declines), so
+		// the ok-parity set is STATIC-ns + genuinely cluster-scoped only.
 		{"grouped-get-each-static-ns",
 			fc3GetEachPath,
 			"/apis/widgets.krateo.io/v1/namespaces/team-a/widgets/widget-team-a"},
 		{"grouped-cluster-scope",
 			`${ "/apis/apps.krateo.io/v1/compositions/" + .name }`,
 			"/apis/apps.krateo.io/v1/compositions/comp-1"},
-		{"core-namespaced",
-			`${ "/api/v1/namespaces/" + .ns + "/configmaps" }`,
-			"/api/v1/namespaces/team-a/configmaps"},
+		{"core-namespaced-static-ns",
+			`${ "/api/v1/namespaces/team-a/configmaps/" + .name }`,
+			"/api/v1/namespaces/team-a/configmaps/cm-1"},
+		{"core-cluster-scope",
+			`${ "/api/v1/nodes/" + .name }`,
+			"/api/v1/nodes/node-1"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -236,6 +239,58 @@ func TestFC3_GVRParity_SkeletonMatchesConcrete(t *testing.T) {
 					skelGVR, concGVR, c.template, c.concrete)
 			}
 		})
+	}
+}
+
+// TestFC3_TemplatedNamespace_NamespacedResource_Declines — #279 ns-scope
+// hardening: a TEMPLATED namespace on a NAMESPACED resource must DECLINE
+// (ok=false → #285 fence), never a guessed cluster-wide (gvr,"","*") edge that
+// would feed the #239 dirty-mark fan-out at 50K×1000. A genuinely CLUSTER-scoped
+// path (no /namespaces/) is unaffected — its ns="" edge is its TRUE scope.
+//
+// RED on the pre-hardening tree: the templated-ns empty fan records (gvr,"","*")
+// (ns templated → ""), so the "no cluster-wide edge" assertion REDs. GREEN after
+// the namespaced branches decline on a templated ns.
+func TestFC3_TemplatedNamespace_NamespacedResource_Declines(t *testing.T) {
+	const groupedTemplNs = `${ "/apis/widgets.krateo.io/v1/namespaces/" + .ns + "/widgets/" + .name }`
+	const coreTemplNs = `${ "/api/v1/namespaces/" + .ns + "/configmaps/" + .name }`
+
+	// (a) UNIT: templated-ns namespaced paths (grouped AND core) decline.
+	if _, _, ok := cache.ParseAPIServerListDepSkeleton(groupedTemplNs); ok {
+		t.Fatalf("#279 ns-hardening: a templated-ns GROUPED namespaced path must decline (ok=false); it did not")
+	}
+	if _, _, ok := cache.ParseAPIServerListDepSkeleton(coreTemplNs); ok {
+		t.Fatalf("#279 ns-hardening: a templated-ns CORE namespaced path must decline (ok=false); it did not")
+	}
+
+	// (b) END-TO-END: a real empty fan over a templated-ns namespaced widgets path
+	// records NO edge — specifically NO cluster-wide (widgets,"","*").
+	rw := newF1Watcher(t)
+	fanned := fc3FannedGVR()
+	const templNsL1 = "L1_fc3_templ_ns"
+	_ = fc3Resolve(t, rw, templNsL1, groupedTemplNs, []any{})
+	edges := cache.Deps().EdgesUnder(templNsL1)
+	for _, e := range edges {
+		if e.GVR == fanned && e.Namespace == "" {
+			t.Fatalf("#279 ns-hardening RED (pre-fix): a templated-ns empty fan recorded the cluster-wide "+
+				"edge (%s,\"\",\"*\") under %q — the #239 super-scope this hardening removes. It must DECLINE.",
+				fanned.String(), templNsL1)
+		}
+	}
+	if len(edges) != 0 {
+		t.Fatalf("#279 ns-hardening: a templated-ns namespaced empty fan must record NO edge (decline → "+
+			"#285 fence); got %v under %q", edges, templNsL1)
+	}
+
+	// (c) POSITIVE counterpart: a genuinely CLUSTER-scoped empty fan (no
+	// /namespaces/) over the registered widgets GVR STILL records (widgets,"","*")
+	// — its true scope, unchanged by the hardening (cluster branch untouched).
+	const clusterPath = `${ "/apis/widgets.krateo.io/v1/widgets/" + .name }`
+	const clusterL1 = "L1_fc3_cluster"
+	_ = fc3Resolve(t, rw, clusterL1, clusterPath, []any{})
+	if !fc3HasListEdge(clusterL1, fanned, "") {
+		t.Fatalf("#279 ns-hardening: a genuinely cluster-scoped empty fan must STILL record (%s,\"\",\"*\") "+
+			"(its true scope, cluster branch unchanged); EdgesUnder=%v", fanned.String(), cache.Deps().EdgesUnder(clusterL1))
 	}
 }
 
