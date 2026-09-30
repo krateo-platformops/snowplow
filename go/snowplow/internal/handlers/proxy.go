@@ -8,10 +8,39 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+// Dispatcher routes a GET /call whose addressed GVR is handled (restactions /
+// widgets) to that per-GVR resolve handler, falling through to next for every
+// other GVR. It is GET-ONLY BY DESIGN: a write-verb /call (POST/PUT/PATCH/
+// DELETE) is a raw apiserver passthrough and MUST reach handlers.Call()
+// unchanged, never a resolve handler. #186 adds ReadDispatcher for the
+// body-carrying read route; this GET-only guard is left byte-identical, so no
+// existing route's semantics shift.
 func Dispatcher(handlers map[string]http.Handler) func(http.Handler) http.Handler {
+	return dispatcherForMethod(handlers, http.MethodGet)
+}
+
+// ReadDispatcher is the POST /call/read variant (#186). It routes a POST whose
+// addressing (apiVersion/resource — still carried in the query, only extras
+// moves to the body) names a handled GVR to the SAME resolve handlers GET
+// /call uses, so a read carrying a large extras BODY reaches the resolver. It
+// is mounted ONLY on POST /call/read; the plain GET-only Dispatcher above is
+// untouched. The read route's terminal fallthrough MUST be a read-only Call
+// (handlers.CallRead) so an unhandled-GVR POST is a GET passthrough, never a
+// create.
+func ReadDispatcher(handlers map[string]http.Handler) func(http.Handler) http.Handler {
+	return dispatcherForMethod(handlers, http.MethodPost)
+}
+
+// dispatcherForMethod is the shared core of Dispatcher/ReadDispatcher. On a
+// request whose method equals dispatchMethod it looks up the addressed GVR's
+// resolve handler and forwards to it (or to next on a miss); any other method
+// falls straight through to next. Splitting on the method keeps GET /call and
+// POST /call/read each single-purpose — the GET-only guard that protects the
+// write-verb passthrough is preserved exactly for Dispatcher.
+func dispatcherForMethod(handlers map[string]http.Handler, dispatchMethod string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
-			if req.Method != http.MethodGet {
+			if req.Method != dispatchMethod {
 				next.ServeHTTP(wri, req)
 				return
 			}

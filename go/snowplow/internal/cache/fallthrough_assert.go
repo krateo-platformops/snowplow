@@ -48,6 +48,11 @@ var requiredScopedRoutes = []string{
 	"PUT /call",
 	"PATCH /call",
 	"DELETE /call",
+	// #186 — body-carrying READ path. Per-user apiserver reads (via the
+	// resolve handlers or the read-only CallRead fallthrough) put it IN the
+	// read-path invariant, exactly like GET /call — unlike /rbac & /refreshes,
+	// which issue zero per-user reads and are deliberately unregistered.
+	"POST /call/read",
 }
 
 // assertionViolationsTotal is the production-mode counter bumped by
