@@ -426,9 +426,11 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 // (a) (namespace stays the author-literal — NEVER templated) and guardrail (b)
 // (a resolved `-clientconfig` name is REFUSED here, fail-fast, so the Secret
 // lookup never fires), and returns templated=true so resolveOne applies its
-// defense-in-depth reserved-suffix refusal too. A jq error yields evalJQ's
-// error-string, which is sanitized like any other miss and resolves to a Secret
-// miss downstream (§1.2 honest-error posture) — not a new error class.
+// defense-in-depth reserved-suffix refusal too. A jq error keeps the §1.2
+// honest-error posture — the error string is still sanitized to a name that
+// resolves to a Secret miss downstream, byte-identical to pre-#341 — but #341
+// now also SURFACES it (a DEBUG line + snowplow_nondial_jq_error_total) instead
+// of swallowing it silently; not a new error class.
 func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Reference, bool, error) {
 	if ref == nil {
 		return ref, false, nil
@@ -438,13 +440,23 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 		// is the author's own business): pass through, NOT templated, NOT gated.
 		return ref, false, nil
 	}
-	// #302 sibling / #341 — non-dial evalJQ-swallow, deferred out of #302 (which
-	// fixes the dial-class payload/header). A swallowed jq error here becomes a
-	// garbage resourceRef NAME → MakeDNS1123Compatible → a 404-ing lookup, NOT a
-	// dialed malformed request (lowest severity). The evalJQE cleanliness switch
-	// (surface the error to a DEBUG line instead of masquerading as a name) is
-	// tracked in #341.
-	name := kubeutil.MakeDNS1123Compatible(evalJQ(ref.Name, r.dict))
+	// #341 — NON-dial evalJQ-swallow cleanup (#302 sibling). Render through
+	// evalJQE and SURFACE a jq error (a DEBUG line + the per-site
+	// snowplow_nondial_jq_error_total counter). Behaviour is BYTE-IDENTICAL to the
+	// pre-#341 evalJQ swallow: on error we feed the SAME error-string to
+	// MakeDNS1123Compatible, so the name still sanitizes to a downstream Secret
+	// miss (the §1.2 honest-error posture) — the only change is the error is now
+	// observable instead of invisible.
+	rendered, jqErr := evalJQE(ref.Name, r.dict)
+	if jqErr != nil {
+		bumpNondialJQError(nondialEndpointRefName)
+		r.log.Debug("endpoint_ref.name.jq_error",
+			slog.String("ref_name", ref.Name),
+			slog.Any("err", jqErr),
+		)
+		rendered = jqErr.Error() // byte-identical to evalJQ's pre-#341 swallow value
+	}
+	name := kubeutil.MakeDNS1123Compatible(rendered)
 	// Guardrail (b), layer 1 (fail-fast): a request-templated name may never
 	// resolve to the reserved `<user>-clientconfig` internal-identity class.
 	if strings.HasSuffix(name, clientConfigSuffix) {

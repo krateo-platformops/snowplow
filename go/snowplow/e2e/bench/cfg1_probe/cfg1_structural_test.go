@@ -104,6 +104,13 @@ var nonCacheInitPublishers = map[string][]string{
 	// on Disabled() for that reason; gating it (CFG-1 option A) would hide the
 	// counter cache-off exactly when skips still occur.
 	"internal/resolvers/restactions/api/malformed_dial_metrics.go": {"snowplow_malformed_dial_skipped_total"},
+	// #341 non-dial jq-error surface: same RESOLVER-path family as the malformed
+	// dial guard — the two non-dial evalJQ sites (cluster_list GVR probe,
+	// endpointRef.name) run on every RESTAction resolve regardless of cache mode,
+	// so a surfaced jq error must stay observable with the cache off. Ungated on
+	// Disabled() for that reason (gating would hide the counter cache-off exactly
+	// when a mis-authored RA is erroring).
+	"internal/resolvers/restactions/api/nondial_jq_error_metrics.go": {"snowplow_nondial_jq_error_total"},
 }
 
 // legacyHG321Keys are the five names the shell falsifier asserted since

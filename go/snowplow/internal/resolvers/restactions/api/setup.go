@@ -273,8 +273,16 @@ func evalJQE(q string, ds any) (string, error) {
 	return out, nil
 }
 
-// evalJQ preserves the pre-#293 contract (jq errors swallowed into the returned
-// string) for the payload/header renders, which are out of #293 scope.
+// evalJQ is the pre-#293 jq render that SWALLOWS an Eval error into the returned
+// string (err.Error()). As of #302 (payload/header → evalJQE) and #341
+// (cluster_list GVR-probe + endpointRef.name → evalJQE) it has ZERO PRODUCTION
+// callers — every prod render now uses evalJQE and SURFACES the error. It is
+// retained TEST-ONLY as three fixtures: the #293 swallow-contract oracle
+// (TestFalsifier293_EvalJQErrorContract), the #341 byte-parity oracle
+// (TestFalsifier341_EndpointRefName_JQError_Surfaced), and the empty-interp
+// render helper (setup_empty_interp_guard_test). DO NOT add a production caller:
+// routing a new render through this reintroduces the exact swallow #302/#341
+// removed — use evalJQE and surface the error.
 func evalJQ(q string, ds any) string {
 	out, err := evalJQE(q, ds)
 	if err != nil {
