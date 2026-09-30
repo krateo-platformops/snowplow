@@ -73,8 +73,8 @@ func SetRebuildBarrierForTest(fn func()) {
 // flushPendingSubGenBumps, called right after rbacSnap.Store.
 var pendingSubGenBumps = struct {
 	mu  sync.Mutex
-	set map[subjectKey]struct{}
-}{set: map[subjectKey]struct{}{}}
+	set map[subjectKey]subGenBumpSource
+}{set: map[subjectKey]subGenBumpSource{}}
 
 // recordPendingSubGenBumps records the subjects whose effective RBAC changed
 // on an informer delta event, to be bumped at the next snapshot publish. This
@@ -90,13 +90,15 @@ var pendingSubGenBumps = struct {
 // ahead of this record; re-arming forces the in-flight rebuild's dirty-loop to
 // run one more Store+flush (or spawns a fresh one). See the file header's
 // DEBOUNCE SAFETY note.
-func recordPendingSubGenBumps(subjects []subjectKey) {
+func recordPendingSubGenBumps(subjects []subjectKey, source subGenBumpSource) {
 	if len(subjects) == 0 {
 		return
 	}
 	pendingSubGenBumps.mu.Lock()
 	for _, s := range subjects {
-		pendingSubGenBumps.set[s] = struct{}{}
+		// #260: OR the event source into the subject's pending mask (a subject
+		// touched by >1 source in the window carries every bit; flush counts each).
+		pendingSubGenBumps.set[s] |= source
 	}
 	pendingSubGenBumps.mu.Unlock()
 
@@ -128,14 +130,22 @@ func flushPendingSubGenBumps() {
 		return
 	}
 	drained := make([]subjectKey, 0, len(pendingSubGenBumps.set))
-	for s := range pendingSubGenBumps.set {
+	masks := make([]subGenBumpSource, 0, len(pendingSubGenBumps.set))
+	for s, m := range pendingSubGenBumps.set {
 		drained = append(drained, s)
+		masks = append(masks, m)
 	}
 	// Clear by reallocating — cheaper than deleting each key and lets the old
 	// backing map be GC'd once the drained slice is done with the keys.
-	pendingSubGenBumps.set = map[subjectKey]struct{}{}
+	pendingSubGenBumps.set = map[subjectKey]subGenBumpSource{}
 	pendingSubGenBumps.mu.Unlock()
 
+	// #260: attribute each subject's bump to its recorded source(s), counted
+	// HERE at flush — the SAME (subject, publish) dedup point as bumps_total,
+	// outside the lock (mirrors the BumpSubjectSubGens call below).
+	for _, m := range masks {
+		countSubGenBumpSources(m)
+	}
 	BumpSubjectSubGens(drained)
 }
 
@@ -143,6 +153,6 @@ func flushPendingSubGenBumps() {
 // never resets (the set self-drains at every publish).
 func ResetPendingSubGenBumpsForTest() {
 	pendingSubGenBumps.mu.Lock()
-	pendingSubGenBumps.set = map[subjectKey]struct{}{}
+	pendingSubGenBumps.set = map[subjectKey]subGenBumpSource{}
 	pendingSubGenBumps.mu.Unlock()
 }

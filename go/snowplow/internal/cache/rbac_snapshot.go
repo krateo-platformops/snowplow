@@ -930,7 +930,7 @@ func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionReso
 			if isBinding {
 				onBindingAdd(obj)
 			} else {
-				onRoleObjectChanged(obj)
+				onRoleObjectChanged(bumpSrcRoleAdd, obj)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -938,7 +938,7 @@ func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionReso
 			if isBinding {
 				onBindingUpdate(oldObj, newObj)
 			} else {
-				onRoleObjectChanged(newObj)
+				onRoleObjectChanged(bumpSrcRoleUpdate, newObj)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -946,7 +946,7 @@ func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionReso
 			if isBinding {
 				onBindingDelete(obj)
 			} else {
-				onRoleObjectChanged(obj)
+				onRoleObjectChanged(bumpSrcRoleDelete, obj)
 			}
 		},
 	}

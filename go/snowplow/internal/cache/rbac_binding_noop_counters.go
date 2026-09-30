@@ -106,6 +106,18 @@ func RBACBindingNoopUpdatesTotal() uint64 { return bindingNoopUpdates.Load() }
 // RBACBindingNoopUpdatesTotal: rewrites that touched nothing RBAC-relevant.
 func RBACBindingSemanticNoopUpdatesTotal() uint64 { return bindingSemanticNoopUpdates.Load() }
 
+// bindingUidChangedUpdates counts UPDATE events whose old/new metadata.uid
+// DIFFER — a binding deleted+recreated under the same name, which a relist
+// delivers as ONE OnUpdate. #260 amendment-2 item 8: these MUST be excluded
+// from semantic_noop, which otherwise credits a rotation it did not prevent (the
+// next publish DOES rotate the key through BindingUID). This counter makes that
+// exclusion observable and is a real-rotation source for #258/#259.
+var bindingUidChangedUpdates atomic.Uint64
+
+// RBACBindingUidChangedUpdatesTotal returns the cumulative count of UPDATE
+// events whose binding uid changed (delete+recreate-same-name).
+func RBACBindingUidChangedUpdatesTotal() uint64 { return bindingUidChangedUpdates.Load() }
+
 // bindingUpdateSide is the comparison surface of ONE side of an UPDATE event,
 // captured in onBindingUpdate as it normalises the object it was already
 // normalising. kind == "" means the object was neither typed nor convertible
@@ -117,6 +129,7 @@ func RBACBindingSemanticNoopUpdatesTotal() uint64 { return bindingSemanticNoopUp
 type bindingUpdateSide struct {
 	kind      string // bindingKindCRB / bindingKindRB; "" = not normalisable
 	rv        string // metadata.resourceVersion (the etcd modRevision)
+	uid       string // metadata.uid — #260: a delete+recreate-same-name rotates it
 	namespace string // "" for a ClusterRoleBinding
 	roleRef   rbacv1.RoleRef
 	subjects  []subjectKey
@@ -172,6 +185,15 @@ func recordBindingUpdateNoop(oldSide, newSide bindingUpdateSide) {
 	// roleRefKey is deliberate: roleRefKey collapses every unrecognised Kind to
 	// "", which would make two DIFFERENT malformed roleRefs compare equal and
 	// over-report a no-op.
+	// #260 amendment-2 item 8: a delete+recreate-same-name arrives (via relist)
+	// as one OnUpdate with a DIFFERENT uid and a new RV. The next publish DOES
+	// rotate the key through BindingUID, so this is NOT a semantic no-op —
+	// semantic_noop must not credit a rotation it did not prevent. Count it as a
+	// uid-changed update instead of falling through to the semantic-noop credit.
+	if oldSide.uid != newSide.uid {
+		bindingUidChangedUpdates.Add(1)
+		return
+	}
 	if oldSide.namespace == newSide.namespace &&
 		oldSide.roleRef == newSide.roleRef &&
 		subjectSetsEqual(oldSide.subjects, newSide.subjects) {
@@ -223,4 +245,5 @@ func compareSubjectKey(x, y subjectKey) int {
 func ResetBindingNoopCountersForTest() {
 	bindingNoopUpdates.Store(0)
 	bindingSemanticNoopUpdates.Store(0)
+	bindingUidChangedUpdates.Store(0)
 }
