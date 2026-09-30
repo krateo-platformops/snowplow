@@ -1,31 +1,32 @@
 //go:build c1amplification
 
-// issue316_c1_amplification_test.go — the C1 50K refresh-amplification GATE
-// harness for PR #357 (#315/#316 proactive-refresh fix).
+// issue316_c1_amplification_test.go — the C1 refresh-amplification GATE
+// harness for #315/#316 (proactive-refresh). VERDICT: GREEN (all 8 arms) on
+// the landed fix; recorded gate evidence for PR #357.
 //
 // SUBSTRATE (arch-1217 ruling, joint build): in-process Go, extending the
 // fix's own issue315_316_lazy_eviction_test.go approach — a real
-// ResolvedCacheStore populated to 50K entries, a LIVE refresher goroutine
-// (StartRefresher + RegisterRefreshFunc), the read-independent pass
-// (reapPastMaxEntryAge) driven on-demand, real Gets to warm the working set
-// and to measure cold-navs, and the customer-inflight hook to exercise the
-// Ship #98 cooperative yield. "Hermetic OFF 057" = this: no cluster, no
-// external deps.
+// ResolvedCacheStore populated to the per-pod warm-set ceiling (~27K resident
+// at the 057-anchored 75.6 KiB mean under the 2 GiB cap; "50K" is the
+// deployment composition count — the RESIDENT warm-set is cap-bound at ~27K),
+// a LIVE refresher goroutine (StartRefresher + RegisterRefreshFunc), the
+// read-independent pass (reapPastMaxEntryAge) driven on-demand, real Gets to
+// warm the working set and to measure cold-navs, and the customer-inflight
+// hook to exercise the Ship #98 cooperative yield. "Hermetic OFF 057" = this:
+// no cluster, no external deps.
 //
-// This file holds the DECISION-INDEPENDENT substrate (population, the
-// realistic re-resolve latency model, metric-snapshot capture, working-set
-// navigation, pickup-latency instrumentation) plus a small smoke test that
-// validates the plumbing end-to-end at reduced scale. The three GATE CONFIGS
-// (baseline-headroom / throttle-stress / main) are added once arch-1217 pins
-// the time-compression approach and the TTL/RTT/entry-size anchors — see the
-// C1PENDING markers.
+// This file holds the substrate (population, the realistic re-resolve latency
+// model, metric-snapshot capture, working-set navigation, pickup-latency
+// instrumentation) plus a reduced-scale smoke test. The 8 GATE CONFIGS live in
+// issue316_c1_configs_test.go. Anchors are FINAL (arch-confirmed from the 057
+// read) — see the constants below.
 //
 // Build-tagged (c1amplification) so `go test ./internal/cache/` does NOT run
-// this heavy 50K harness in normal CI. Run explicitly:
+// this heavy harness in normal CI. Run explicitly:
 //
-//	go test -tags c1amplification -run TestC1 -timeout 30m ./internal/cache/
+//	C1_WARMSET=27000 go test -tags c1amplification -run TestC1 -timeout 30m ./internal/cache/
 //
-// COLD-NAV MEASUREMENT (arch-confirm pending): measured as a cache-layer
+// COLD-NAV MEASUREMENT (arch-confirmed): measured as a cache-layer
 // c.Get MISS on a navigated warm-set cell. This is the mechanism-true signal
 // — the #315/#316 hole IS a cache eviction of a warm cell — and it is 1:1
 // with the named dispatch_l1_lookups MISS: the dispatcher emits hit=true
@@ -48,10 +49,10 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// C1PENDING — calibration constants. Placeholder figures; anchor with
-// arch-1217 (real GET-by-name RTT + the #247/preroll vars.json body-size
-// distribution) before the authoritative run. Marked so the report states
-// exactly what was assumed.
+// Calibration constants — FINAL (arch-confirmed from the 057 read): GET-by-name
+// RTT 5ms + ~10ms/MB decode; entry-size mean 75.6 KiB (c1MeanBytes, configs
+// file). The refresh workload is GET-by-name (single object), so re-resolve
+// latency is RTT-dominated. No longer pending.
 // ---------------------------------------------------------------------------
 const (
 	// Decode irreducibility (feedback_cluster_list_decode_irreducibility): a
@@ -59,8 +60,8 @@ const (
 	// free, which is what keeps the in-process refresher-throughput honest.
 	c1DecodeMsPerMB = 10.0
 
-	// GET-by-name apiserver round-trip. C1PENDING: confirm the intra-cluster
-	// figure with arch.
+	// GET-by-name apiserver round-trip (arch-confirmed: single-digit-ms
+	// intra-cluster GET-by-name; the workload is RTT-dominated).
 	c1GetByNameRTT = 5 * time.Millisecond
 )
 
@@ -73,13 +74,10 @@ func c1RealisticResolveCost(bodyBytes int) time.Duration {
 	return c1GetByNameRTT + decode
 }
 
-// c1SampleBodySize returns a deterministic body size (bytes) for cell i,
-// modelling a realistic resolved /call body-size mix (arch-1217 anchor):
-// median 8KB, p90 64KB, p99 256KB, p99.9/max ~1MB — the 1MB tail models the
-// large-LIST cells (cluster_list / ArgoCD-apps at ~30K items) whose
-// ~10ms/MB decode is the load-bearing re-resolve cost. C1PENDING: anchor to
-// the #247 vars.json distribution if the bench state.json carries it;
-// otherwise this proposed-mix + 1MB tail is the agreed starting anchor.
+// c1SampleBodySize is a mixed body-size distribution (median 8KB / p90 64KB /
+// p99 256KB / max 1MB) used ONLY by the reduced-scale smoke test. The GATE
+// configs use c1UniformSize75 (the 057-anchored 75.6 KiB mean) and
+// c1SkewSize75 (same mean, 1 MiB p99 tail) instead — see the configs file.
 func c1SampleBodySize(i int) int {
 	switch r := i % 1000; {
 	case r < 900: // 90% — body-median class
@@ -271,6 +269,10 @@ func c1RegisterRealisticRefresh(c *ResolvedCacheStore, meter *c1PickupMeter, siz
 			cost = time.Duration(float64(cost) * elevation)
 		}
 		time.Sleep(cost)
+		// FAITHFULNESS (arch review): this uses a plain c.Put, NOT the real #189
+		// ReplaceIfGen. Deliberate + faithful here — the controlled burst has no
+		// raced DELETE, so plain Put ≡ ReplaceIfGen outcome; the harness models
+		// refresh LATENCY/WORK (the amplification question), not the gen-guard.
 		c.Put(k, &ResolvedEntry{RawJSON: c1Body(sizeOf(k)), Inputs: &used})
 		if meter != nil {
 			meter.observe(k)
