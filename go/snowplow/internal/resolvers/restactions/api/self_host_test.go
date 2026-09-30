@@ -39,10 +39,10 @@ func TestParsedHostEqualsSelf_ExactMatchOnly(t *testing.T) {
 	t.Cleanup(func() { SetSelfHost("") })
 
 	cases := []struct {
-		name    string
-		rawURL  string
-		want    bool
-		why     string
+		name   string
+		rawURL string
+		want   bool
+		why    string
 	}{
 		{"exact self", self, true, "the configured self-loopback host"},
 		{"exact self, trailing path differs", "http://snowplow.krateo-system.svc.cluster.local:8081/call?x=1", true,
@@ -184,24 +184,31 @@ func TestBearerAppendForStage_SelfLoopbackArm(t *testing.T) {
 		name    string
 		apiCall *templates.API
 		ep      endpoints.Endpoint
+		isSA    bool
 		want    bool
 		why     string
 	}{
-		{"self-loopback w/ named ref → APPEND", &templates.API{EndpointRef: namedRef}, selfEP, true,
+		{"self-loopback w/ named ref → APPEND", &templates.API{EndpointRef: namedRef}, selfEP, false, true,
 			"the #57 arm: a named-endpoint step that resolves to the self-host needs the seed bearer"},
-		{"external near-miss host w/ named ref → NO append", &templates.API{EndpointRef: namedRef}, extEP, false,
+		{"external near-miss host w/ named ref → NO append", &templates.API{EndpointRef: namedRef}, extEP, false, false,
 			"the leak guard: a genuine external endpoint (host merely contains 'snowplow') must NOT get the bearer"},
-		{"no EndpointRef → APPEND (original gate)", &templates.API{}, extEP, true,
+		{"no EndpointRef → APPEND (original gate)", &templates.API{}, extEP, false, true,
 			"the original gate: no named endpoint → per-user clientconfig path, bearer appended"},
-		{"named ref + ExportJWT → APPEND (original gate)", &templates.API{EndpointRef: namedRef, ExportJWT: ptr.To(true)}, extEP, true,
+		{"named ref + ExportJWT → APPEND (original gate)", &templates.API{EndpointRef: namedRef, ExportJWT: ptr.To(true)}, extEP, false, true,
 			"the original gate: exportJWT:true forces the bearer even on a named external endpoint"},
-		{"named external ref, no exportJWT, not self → NO append", &templates.API{EndpointRef: namedRef}, endpoints.Endpoint{ServerURL: "https://api.github.com"}, false,
+		{"named external ref, no exportJWT, not self → NO append", &templates.API{EndpointRef: namedRef}, endpoints.Endpoint{ServerURL: "https://api.github.com"}, false, false,
 			"a genuine external named endpoint carries its own auth — no user bearer"},
-		{"nil apiCall → NO append (defensive)", nil, selfEP, false, "nil guard"},
+		{"nil apiCall → NO append (defensive)", nil, selfEP, false, false, "nil guard"},
+		{"#271 SA dial + nil ref → NO append (isSA gate)", &templates.API{}, selfEP, true, false,
+			"#271: isSA overrides the nil-ref append trigger — an apiserver SA dial never carries the user Krateo JWT"},
+		{"#271 SA dial + ExportJWT → NO append (isSA gate)", &templates.API{ExportJWT: ptr.To(true)}, selfEP, true, false,
+			"#271: isSA overrides ExportJWT:true — provenance beats the export flag on an SA dial"},
+		{"#271 SA dial + self-loopback → NO append (isSA gate)", &templates.API{EndpointRef: namedRef}, selfEP, true, false,
+			"#271: isSA overrides the #57 self-loopback trigger — an SA dial never carries the user JWT"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := bearerAppendForStage(tc.apiCall, tc.ep); got != tc.want {
+			if got := bearerAppendForStage(tc.apiCall, tc.ep, tc.isSA); got != tc.want {
 				t.Fatalf("bearerAppendForStage = %v, want %v — %s", got, tc.want, tc.why)
 			}
 		})

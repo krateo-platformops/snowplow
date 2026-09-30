@@ -1434,7 +1434,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 			//     so an EXTERNAL endpoint whose host merely CONTAINS
 			//     "snowplow" (e.g. snowplow-foo.example.com) does NOT match
 			//     and the bearer stays OFF it (the leak guard).
-			if bearerAppendForStage(apiCall, ep) {
+			if bearerAppendForStage(apiCall, ep, isSA) {
 				// 0.30.164: stage-local Headers — never write the user
 				// bearer back into the shared CR slice (the CR is marshaled
 				// into the /call response body at restactions.go:149; an

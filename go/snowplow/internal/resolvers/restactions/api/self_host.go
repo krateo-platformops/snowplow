@@ -82,6 +82,7 @@ func SetSelfHost(rawURL string) bool {
 //   - name.namespace                       (2 labels)
 //   - name.namespace.svc                   (3 labels, trailing "svc")
 //   - name.namespace.svc.cluster.local     (5 labels, trailing "svc.cluster.local")
+//
 // Any other shape (an external FQDN, a subdomain-of-self leak attempt, a
 // trailing-garbage prefix attempt, a bare hostname) returns ok=false, so the
 // caller falls back to exact-string host equality — the leak guard.
@@ -93,6 +94,7 @@ func SetSelfHost(rawURL string) bool {
 //   - snowplow.krateo-system.svc.cluster.local.evil.com → trailing set includes
 //     "evil"/"com" → not allowed → ok=false → exact-string fallback → no match.
 //   - snowplow-foo.example.com → trailing {"com"} → not allowed → ok=false.
+//
 // Only the SAME (name, namespace) with a canonical svc trailing set collapses.
 func svcCanonicalKey(host string) (name, namespace string, ok bool) {
 	labels := strings.Split(host, ".")
@@ -162,10 +164,24 @@ func parsedHostEqualsSelf(rawURL string) bool {
 //     scheme+host+port, never a substring near-miss), i.e. the step loops back
 //     at snowplow's OWN JWT-gated /call and needs the seed bearer despite its
 //     named snowplow-endpoint ref.
+//
 // False for a genuine EXTERNAL named endpoint (incl. a host that merely
 // CONTAINS "snowplow") — the bearer stays off it (the JWT-leak guard).
-func bearerAppendForStage(apiCall *templates.API, ep endpoints.Endpoint) bool {
+func bearerAppendForStage(apiCall *templates.API, ep endpoints.Endpoint, isSA bool) bool {
 	if apiCall == nil {
+		return false
+	}
+	// #271: never append the user's Krateo authn JWT to a dial of snowplow's own
+	// SA endpoint (the apiserver). The apiserver accepts only k8s tokens; a Krateo
+	// RS256 JWT on this dial suppresses the SA BearerTokenFile token (client-go's
+	// bearer round-tripper won't overwrite an existing Authorization header,
+	// transport/round_trippers.go) → the SAR reaches the apiserver bearing a
+	// non-k8s JWT → 401, and the JWT leaks to the apiserver. Keyed on PROVENANCE
+	// (isSA), never shape — a token-auth clientconfig is shape-identical to the SA
+	// endpoint (the #267/#268 discipline). NOT redundant with the caller's
+	// !uafActive gate: the #271 bug is a NON-UAF nil-ref stage that resolves to the
+	// SA endpoint via an internal (prewarm) driver.
+	if isSA {
 		return false
 	}
 	return apiCall.EndpointRef == nil ||
