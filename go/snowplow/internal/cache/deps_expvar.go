@@ -72,6 +72,11 @@ func registerDepsExpvar() {
 		expvar.Publish("snowplow_deps", expvar.Func(func() any {
 			return DepsStatsByStat()
 		}))
+		// #239 — the dirty-mark attribution, incl. the /debug/vars-only per-GVR
+		// drill-down that is deliberately kept OFF OTLP (cardinality).
+		expvar.Publish("snowplow_deps_dirty_mark_attribution", expvar.Func(func() any {
+			return DirtyMarkAttributionExpvar()
+		}))
 	})
 }
 

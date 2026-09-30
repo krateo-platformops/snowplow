@@ -107,6 +107,7 @@ func TestIssue1126_E1_RelistBridgeEvictsTheObjectTheFreshListOmits(t *testing.T)
 	// THE RELIST: real CRD ADD (narrow schema) + UPDATE (widened) through the
 	// real lifecycle handlers → triggerCRDSchemaRelist → teardown + fresh
 	// informer + pre-sync/post-sync dirty-marks + (C2) the bridge.
+	relistSrcBefore := Deps().dirtyMarkSubmitSourceSnapshot()[dmSourceRelistBridge]
 	b5DriveRelist(t, rw)
 
 	if !c2WaitGone(store, keyX, harnessWaitBound) {
@@ -126,6 +127,14 @@ func TestIssue1126_E1_RelistBridgeEvictsTheObjectTheFreshListOmits(t *testing.T)
 	}
 	if s.RelistBridgeEnqueued != 1 {
 		t.Fatalf("E1: bridge synthesized %d coordinates, want exactly 1 (before \\ after = {button-x})", s.RelistBridgeEnqueued)
+	}
+	// #239 — the bridge's submitDepEvent must carry source=relist_bridge through
+	// the REAL path (pre-dedup), or the amplifier-localizer is blind to a relist
+	// storm. The bridge is the ONLY relist_bridge submitter here, so its delta
+	// equals the coordinates it enqueued.
+	if got := Deps().dirtyMarkSubmitSourceSnapshot()[dmSourceRelistBridge] - relistSrcBefore; got != uint64(s.RelistBridgeEnqueued) {
+		t.Fatalf("E1 #239: submit-source[relist_bridge] rose by %d, want %d (the bridge's enqueues) — the "+
+			"relist bridge's submitDepEvent did not attribute source=relist_bridge", got, s.RelistBridgeEnqueued)
 	}
 	if got := Deps().Stats().EvictDeleteTotal; got != 1 {
 		t.Fatalf("E1: evict_delete_total=%d, want 1 — the eviction must be the worker's ABSENT verdict on "+

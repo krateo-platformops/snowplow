@@ -119,6 +119,7 @@ func TestIssue1126_D2_ReconcileTickerEvictsAStrandedEntry(t *testing.T) {
 
 	c3Strand(t, rw, dyn, gvr, "demo-system", "flex-x", store, "L1_flex-x", 2)
 	before := Deps().Stats().EvictDeleteTotal
+	reconcileSrcBefore := Deps().dirtyMarkSubmitSourceSnapshot()[dmSourceReconcile]
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -148,6 +149,13 @@ func TestIssue1126_D2_ReconcileTickerEvictsAStrandedEntry(t *testing.T) {
 	if got := c3WaitEvictDelete(before+1, harnessWaitBound); got != before+1 {
 		t.Fatalf("D2: evict_delete_total moved by %d, want 1 — the audit must evict through the worker's "+
 			"ABSENT verdict (the same path as an informer DELETE)", got-before)
+	}
+	// #239 — the reconcile's submitDepEvent must carry source=reconcile through
+	// the REAL path (pre-dedup), so a reconcile storm is localizable and never
+	// mistaken for watch fan-out.
+	if got := Deps().dirtyMarkSubmitSourceSnapshot()[dmSourceReconcile]; got <= reconcileSrcBefore {
+		t.Fatalf("D2 #239: submit-source[reconcile] did not rise (%d -> %d) — the reconcile path did not "+
+			"attribute source=reconcile", reconcileSrcBefore, got)
 	}
 }
 

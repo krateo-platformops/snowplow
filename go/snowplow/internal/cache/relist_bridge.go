@@ -159,7 +159,7 @@ func (c *crdDiscovery) bridgeRelistDeletes(rw *ResourceWatcher, w *depWatch, gvr
 		if name == "" {
 			continue
 		}
-		w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name})
+		w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceRelistBridge)
 		synthesized++
 		if len(logged) < relistBridgeMaxLoggedKeys {
 			logged = append(logged, k)
