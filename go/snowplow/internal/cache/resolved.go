@@ -2570,6 +2570,18 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	c.RangeMetadataBatched(reapMaxAgeBatch, func(metas []ResolvedEntryMeta, _ time.Duration) bool {
 		for i := range metas {
 			m := metas[i]
+			// WARM = seeded OR read within the store TTL. The lastRead branch is
+			// LOAD-BEARING even for PAST-maxAge cells — do NOT reduce it to
+			// SeededAtBoot-only here. It is tempting to think a past-maxAge cell can
+			// only be warm via seed (Get evicts a past-maxAge cell before it could
+			// stamp a fresh lastRead), but that is FALSE: a cell Get-read at, say,
+			// maxAge−400s stamps lastRead THEN (while still within the cap), is not
+			// read again, and crosses maxAge carrying that lastRead — which stays
+			// within TTL for the whole [crossing, crossing+TTL] window (~one TTL,
+			// e.g. ~53min at TTL=3600). That is a COMMON production state, not a
+			// knife-edge. Counting such a cell warm is what keeps C3 from cold-
+			// evicting a genuinely-served cell and keeps the C4 gauge honest;
+			// TestIssue315_LastReadWarmPastMaxAge_NotEvicted exercises this exact path.
 			warm := m.SeededAtBoot || (m.LastReadSeconds >= 0 && ttlSec > 0 && m.LastReadSeconds < ttlSec)
 			_, suppressed := RefreshSuppressedReason(m.KeyHash)
 			pastMaxAge := maxAgeSec > 0 && m.LifetimeSeconds > maxAgeSec

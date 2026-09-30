@@ -356,3 +356,73 @@ func TestIssue315_ColdFillPut_IsImmediatelyWarm(t *testing.T) {
 		t.Fatalf("a boot-seed Put must leave LastReadSeconds=-1 (warm via SeededAtBoot, not lastRead); ok=%v got=%d", ok, m.LastReadSeconds)
 	}
 }
+
+// TestIssue315_LastReadWarmPastMaxAge_NotEvicted (arch-1217 #3 coverage) exercises
+// the LIVE, common path the (false) "past-maxAge ⟹ seed-only-warm" invariant would
+// mask: a cell that is past maxEntryAge AND lastRead-WARM (not seeded). In
+// production this is any cell Get-read shortly before it crossed maxAge and not
+// re-read since — resident past the cap carrying a lastRead still within TTL (the
+// ~one-TTL [crossing, crossing+TTL] window). Constructed directly here: BornAt
+// long-past (past the cap) but a fresh non-seeded Put stamps lastRead=CreatedAt=now
+// (the cold-fill rule) → warm via the lastRead branch ALONE (SeededAtBoot=false).
+// It must be COUNTED in warm_past_max_age (C4) and NEVER cold-evicted (C3) — proving
+// the reaper's warm check does not rely on the false seed-only invariant.
+func TestIssue315_LastReadWarmPastMaxAge_NotEvicted(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "60")
+	// Standard TTL left at its default (3600s) → W=3600s, so a lastRead stamped
+	// ~now is comfortably within TTL = warm, while BornAt 2h ago is past the 60s cap.
+	t.Setenv("RESOLVED_CACHE_SUMMARY_EVERY_SECONDS", "36000")
+	resetResolvedCacheForTest()
+	t.Cleanup(resetResolvedCacheForTest)
+
+	store := ResolvedCache()
+	if store == nil {
+		t.Skip("resolved cache disabled in this environment")
+	}
+
+	const ns = "krateo-system"
+	in := widgetInputs(gvrFlexes(), ns, "lastread-warm")
+	key := ComputeKey(*in)
+	store.Put(key, &ResolvedEntry{
+		RawJSON:   []byte(`{"lrw":1}`),
+		Inputs:    in,
+		BornAt:    time.Now().Add(-2 * time.Hour), // past the 60s cap
+		CreatedAt: time.Now(),                     // fresh body → cold-fill stamps lastRead=now
+		// SeededAtBoot: false — warmth MUST come from lastRead, not seed.
+	})
+
+	// Precondition: warm via lastRead ONLY (not seed), and past the cap.
+	m, ok := store.MetadataForKey(key)
+	if !ok {
+		t.Fatal("precondition: cell must be resident after Put")
+	}
+	if m.SeededAtBoot {
+		t.Fatal("precondition: cell must NOT be seeded — this arm exercises the lastRead warm branch")
+	}
+	if m.LastReadSeconds < 0 || m.LastReadSeconds >= 3600 {
+		t.Fatalf("precondition: cell must be lastRead-warm (0 <= LastReadSeconds < TTL 3600); got %d", m.LastReadSeconds)
+	}
+	if m.LifetimeSeconds <= 60 {
+		t.Fatalf("precondition: cell must be past the 60s maxEntryAge cap; LifetimeSeconds=%d", m.LifetimeSeconds)
+	}
+
+	beforeMaxAge := store.Stats().EvictMaxAgeTotal
+	reaped := store.reapPastMaxEntryAge()
+
+	if reaped != 0 {
+		t.Fatalf("#315 C3: a lastRead-warm past-maxEntryAge cell must NOT be reaped; reaped=%d", reaped)
+	}
+	if _, ok := store.MetadataForKey(key); !ok {
+		t.Fatal("#315 C3: a lastRead-warm (non-seeded) past-maxEntryAge cell was cold-evicted — " +
+			"the reaper wrongly treated a served cell as cold (the false seed-only invariant); " +
+			"this manufactures a cold navigation")
+	}
+	if got := store.Stats().EvictMaxAgeTotal; got != beforeMaxAge {
+		t.Fatalf("#315 C3: evict_max_age moved (%d->%d) — a warm cell was evicted", beforeMaxAge, got)
+	}
+	if got := store.Stats().WarmPastMaxAge; got != 1 {
+		t.Fatalf("#315 C4: warm_past_max_age = %d, want 1 (the lastRead-warm past-cap cell must be counted, not just seeded ones)", got)
+	}
+}
