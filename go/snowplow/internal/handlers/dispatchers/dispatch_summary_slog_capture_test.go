@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/krateo-platformops/snowplow/internal/objects"
 	restapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
@@ -43,18 +44,27 @@ func captureDefaultSlogForTest(t *testing.T, level slog.Level) *bytes.Buffer {
 	return &buf
 }
 
-// quiesceDefaultSummaryForTest stops + joins the dispatch-summary goroutine for
-// the duration of the test — joining any goroutine a prior test left running
-// now, and any this test starts on cleanup — so its ticker cannot write the
-// DEFAULT slog logger while a test has captured it (#221). Use it DIRECTLY for
-// capture sites that install their OWN handler and cannot use
-// captureDefaultSlogForTest's JSON buffer (e.g. a TextHandler whose format the
-// JSON helper would change, or a multi-buffer flow); captureDefaultSlogForTest
-// wires it for the JSON-capture sites. One seam quiesces the goroutine for
-// EVERY default-slog capture site (enumerate-ALL, not just the JSON set).
-// Test-only.
+// quiesceDefaultSummaryForTest stops + joins the process-lifetime summary
+// goroutines that log via the DEFAULT slog logger for the duration of the test
+// — joining any a prior test left running now, and any this test starts on
+// cleanup — so no ticker can write the DEFAULT slog logger while a test has
+// captured it (#221 / #329 / #348). Use it DIRECTLY for capture sites that
+// install their OWN handler and cannot use captureDefaultSlogForTest's JSON
+// buffer (e.g. a TextHandler whose format the JSON helper would change, or a
+// multi-buffer flow); captureDefaultSlogForTest wires it for the JSON-capture
+// sites.
+//
+// It enumerates ALL default-slog summary EMITTERS, not just the dispatch one:
+//   - startDispatchSummary  (internal/resolvers/restactions/api) — #221 / #329
+//   - startObjectsGetSummary (internal/objects)                  — #348
+//
+// (startResolvedCacheSummary owns its own in-package quiescence and is never
+// started from a dispatchers test, so it cannot leak into this capture.) One
+// seam quiesces EVERY emitter for EVERY default-slog capture site. Test-only.
 func quiesceDefaultSummaryForTest(t *testing.T) {
 	t.Helper()
 	restapi.ResetDispatchSummaryForTest()
+	objects.ResetObjectsGetSummaryForTest()
 	t.Cleanup(restapi.ResetDispatchSummaryForTest)
+	t.Cleanup(objects.ResetObjectsGetSummaryForTest)
 }

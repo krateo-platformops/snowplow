@@ -112,13 +112,27 @@ const (
 	defaultObjectsGetSummarySeconds = 60
 )
 
-var objectsGetSummaryOnce sync.Once
+var (
+	objectsGetSummaryOnce sync.Once
+	// objectsGetSummaryStop signals the summary goroutine to exit. Created
+	// inside the sync.Once and read only there and by the test seam, so it
+	// needs no separate lock. Production never closes it (the goroutine's
+	// lifetime is the process's); the test seam does (#348, mirroring the
+	// dispatch-summary #221 stop).
+	objectsGetSummaryStop chan struct{}
+	// objectsGetSummaryWG joins the summary goroutine so a stop can prove it
+	// has actually exited — the goroutine-leak arm relies on this.
+	objectsGetSummaryWG sync.WaitGroup
+)
 
 // startObjectsGetSummary launches a single bounded goroutine that emits
 // an `objects_get.summary` INFO line every N seconds. Lifecycle bound: a
-// sync.Once guarantees exactly one goroutine for the process lifetime; it
-// does constant work per tick and is never stopped (process-scoped, same
-// contract as `startResolvedCacheSummary`).
+// sync.Once guarantees exactly one goroutine at a time; in production the
+// process never stops it, but the loop now selects on a stop channel so the
+// deferred `t.Stop()` is REACHABLE and the goroutine can be joined and
+// drained by the test seam (#348 — an unstoppable goroutine that logs via the
+// DEFAULT slog logger races every default-slog capture test, exactly the
+// #221/#329 class the sibling `startDispatchSummary` already fixed).
 //
 // Started lazily on the first routed `Get` call rather than from main.go
 // — avoids a startup-wiring change and keeps the goroutine from existing
@@ -126,21 +140,67 @@ var objectsGetSummaryOnce sync.Once
 func startObjectsGetSummary() {
 	objectsGetSummaryOnce.Do(func() {
 		every := time.Duration(objectsGetSummaryEverySeconds()) * time.Second
+		stop := make(chan struct{})
+		objectsGetSummaryStop = stop
+		objectsGetSummaryWG.Add(1)
 		go func() {
+			defer objectsGetSummaryWG.Done()
 			t := time.NewTicker(every)
 			defer t.Stop()
-			for range t.C {
-				s := ObjectsGetStatsSnapshot()
-				// STABLE single-line falsifier shape (greppable):
-				//   objects_get.summary informer_served=N apiserver_fallthrough=M
-				slog.Info("objects_get.summary",
-					slog.String("subsystem", "cache"),
-					slog.Uint64("informer_served", s.InformerServed),
-					slog.Uint64("apiserver_fallthrough", s.ApiserverFallthrough),
-				)
+			for {
+				select {
+				case <-stop:
+					return
+				case <-t.C:
+					s := ObjectsGetStatsSnapshot()
+					// STABLE single-line falsifier shape (greppable):
+					//   objects_get.summary informer_served=N apiserver_fallthrough=M
+					slog.Info("objects_get.summary",
+						slog.String("subsystem", "cache"),
+						slog.Uint64("informer_served", s.InformerServed),
+						slog.Uint64("apiserver_fallthrough", s.ApiserverFallthrough),
+					)
+				}
 			}
 		}()
 	})
+}
+
+// stopObjectsGetSummaryForTest stops the summary goroutine started by
+// startObjectsGetSummary, blocks until it has actually exited (joined
+// WaitGroup), and resets the sync.Once so a subsequent start relaunches it.
+// TEST-ONLY — production never stops the goroutine (its lifetime is the
+// process's), mirroring startDispatchSummary's stopDispatchSummaryForTest
+// (#221). Idempotent: safe to call when the goroutine was never started.
+func stopObjectsGetSummaryForTest() {
+	if objectsGetSummaryStop != nil {
+		close(objectsGetSummaryStop)
+	}
+	objectsGetSummaryWG.Wait()
+	objectsGetSummaryStop = nil
+	objectsGetSummaryOnce = sync.Once{}
+}
+
+// ResetObjectsGetSummaryForTest is the EXPORTED variant of
+// stopObjectsGetSummaryForTest, for cross-package tests (internal/handlers/
+// dispatchers) that capture the default slog logger: it stops + joins the
+// summary goroutine so its default-interval ticker cannot write into a test's
+// captured buffer concurrently with the test's read (#348 — the leaked-
+// goroutine-vs-log-capture race, the objects-get sibling of the dispatch-
+// summary #221/#329 fix). Idempotent and restart-capable (the Once is reset),
+// so a later routed Get relaunches the summary. Production MUST NOT call it
+// (the goroutine's lifetime is the process's).
+func ResetObjectsGetSummaryForTest() {
+	stopObjectsGetSummaryForTest()
+}
+
+// StartObjectsGetSummaryForTest lazily launches the summary goroutine the way
+// the first routed Get does, exposed so cross-package tests (internal/handlers/
+// dispatchers) can prove quiesceDefaultSummaryForTest actually joins THIS
+// emitter — without wiring a full objects.Get. TEST-ONLY; production starts the
+// goroutine only through Get.
+func StartObjectsGetSummaryForTest() {
+	startObjectsGetSummary()
 }
 
 // objectsGetSummaryEverySeconds resolves the summary interval from the
