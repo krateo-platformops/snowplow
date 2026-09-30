@@ -157,6 +157,31 @@ func SubmitSliceabilityInvalidate(raKey string) bool {
 
 // SliceabilityReverifyStats is a read-only snapshot of the worker
 // counters. Used by /debug/vars + the bench validator (F-7 / F-9 / F-12).
+//
+// READING THE droppedTotal:processedTotal RATIO (#344). A HIGH ratio is
+// EXPECTED and HEALTHY, not a defect — observed ~2.7:1 at bench scale. Under a
+// noisy informer stream many dep-events fire for the SAME raKey faster than the
+// single worker drains the bounded (queueCap, drop-on-full) queue, so most
+// submits are SHED at enqueue (droppedTotal++) rather than blocking the
+// dep-event hook. Every drop is a REDUNDANT re-enqueue that loses NOTHING:
+//   - InvalidateSliceabilityForKey is COALESCING — one processed reverify
+//     deletes EVERY memo entry for that raKey, covering the dropped duplicates;
+//   - and it is RATE-FLOORED (T_unverify, SLICEABILITY_REVERIFY_RATE_FLOOR_
+//     SECONDS, default 60s), so redundant reverifies within the floor are no-ops
+//     whether they were dropped at submit OR processed and floored at invalidate.
+//
+// So a rising drop:process ratio just means MORE coalescing. This is the
+// bounded-amplification design — a separate bounded channel keeps invalidate
+// OFF the refresher workqueue (feedback_refresher_populate_amplification).
+// TestIssue344_* pins both halves: drop-on-full is deterministic/counted, and a
+// drop loses no invalidation (coalescing is idempotent).
+//
+// droppedTotal is therefore a DIAGNOSTIC, not a detector — its non-zero is
+// HEALTH (feedback_a_counter_whose_zero_reads_as_health_is_not_a_detector), so
+// it stays expvar-only (no OTLP alert bridge, #311). The signals that ACTUALLY
+// mean trouble are the inverse: processedTotal frozen at 0 while enqueuedTotal
+// climbs (the worker is dead), or queueLen pinned at queueCap for a sustained
+// window (overload the coalescing cannot keep pace with).
 type SliceabilityReverifyStats struct {
 	EnqueuedTotal    uint64 `json:"enqueuedTotal"`
 	DroppedTotal     uint64 `json:"droppedTotal"`

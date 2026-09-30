@@ -75,6 +75,10 @@ func registerBindingsByGVRMetrics() {
 		// (informer event triggers re-verify on stuck-false within ≤ 60s)
 		// + F-9 (pod-restart proof) + F-12 (8 Class D raKeys converge)
 		// validate via these counters from the bench harness.
+		// #344: a HIGH droppedTotal:processedTotal ratio (~2.7:1 at bench scale)
+		// is EXPECTED/healthy backpressure, NOT a defect — see the
+		// SliceabilityReverifyStats doc for how to read it (drops are coalesced
+		// redundant re-enqueues; the real trouble signals are the inverse).
 		expvar.Publish("snowplow_sliceability_reverify", expvar.Func(func() any {
 			return SliceabilityReverifyStatsSnapshot()
 		}))
