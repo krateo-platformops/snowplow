@@ -323,15 +323,15 @@ func attemptClusterListCollapse(
 // by (gvr, contentKey). This is the pre-Path-3.2 customer-path body,
 // extracted so it can run from THREE call sites without duplication:
 //
-//   1. PIP boot pre-warm (phase1_clusterlist_prewarm.go) — invoked at
-//      Step 7.5 BEFORE MarkPhase1Done, populates the cell roster under
-//      SA identity in parallel.
-//   2. populateClusterListCellAsync — the cold-miss async populate goroutine
-//      spawned from attemptClusterListCollapse when a customer /call hits
-//      an unpopulated cell. Runs OFF the customer goroutine.
-//   3. The refresher handler (registered indirectly via the RestActions
-//      refresh path) — invoked when the dep-tracker dirty-marks the
-//      cluster_list cell on an informer event.
+//  1. PIP boot pre-warm (phase1_clusterlist_prewarm.go) — invoked at
+//     Step 7.5 BEFORE MarkPhase1Done, populates the cell roster under
+//     SA identity in parallel.
+//  2. populateClusterListCellAsync — the cold-miss async populate goroutine
+//     spawned from attemptClusterListCollapse when a customer /call hits
+//     an unpopulated cell. Runs OFF the customer goroutine.
+//  3. The refresher handler (registered indirectly via the RestActions
+//     refresh path) — invoked when the dep-tracker dirty-marks the
+//     cluster_list cell on an informer event.
 //
 // Returns ok=true when the cell was successfully populated; false on any
 // failure (dispatch unservable, shape fallback, materialise error). The
@@ -358,9 +358,16 @@ func populateClusterListCellSync(
 		return true
 	}
 
+	// #323 — capture the content key's generation BEFORE the defensive resolve
+	// below, so the tail PutIfGen refuses (rather than resurrecting a pre-delete
+	// cluster-LIST body) if the underlying objects are DELETE-evicted during the
+	// resolve. PutIfGen (not ReplaceIfGen): BOTH callers (dispatch cold-miss +
+	// prewarm) are legitimate FIRST-fills, so an insert-on-absent must succeed.
+	contentGen0 := apistageStore.CaptureGen(contentKey)
+
 	pipSink := cache.PIPStageTimingSinkFrom(ctx)
 	dispatchStart := time.Now()
-	rawEnvelope, dispatchedOK := dispatchViaInformer(
+	rawEnvelope, dispatchedOK := dispatchViaInformerFn(
 		cache.WithApistageContentResolve(ctx), clusterCall)
 	defensiveDispatchMs := time.Since(dispatchStart).Milliseconds()
 	if !dispatchedOK {
@@ -435,7 +442,20 @@ func populateClusterListCellSync(
 	defensiveParseMs := materialiseElapsed.Milliseconds()
 
 	putStart := time.Now()
-	apistageStore.Put(contentKey, newEntry)
+	// #323 — generation-guarded write: refuse (do not resurrect a pre-delete
+	// cluster-LIST body) if a DELETE-eviction bumped the content key's generation
+	// during the defensive resolve. On refusal the populate DECLINES — the caller
+	// degrades (per-NS fallback / log-only), same as any other populate failure —
+	// and the dep-Record + tier-key registration are skipped (no cell to track).
+	if !apistageStore.PutIfGen(contentKey, newEntry, contentGen0) {
+		log.Debug("cluster_list.populate_refused_gen_moved",
+			slog.String("subsystem", "cache"),
+			slog.String("ra_stage", apiCall.Name),
+			slog.String("gvr", gvr.String()),
+			slog.String("effect", "#323 DELETE-eviction during defensive resolve — not resurrecting; populate declined"),
+		)
+		return false
+	}
 	cache.Deps().RecordList(contentKey, gvr, "")
 	defensivePutMs := time.Since(putStart).Milliseconds()
 
@@ -847,31 +867,31 @@ type envelopeShape struct {
 // is HOISTED out; this function is now O(envelope-fields + first-K-items
 // nil-check) and never touches per-item field maps):
 //
-//   Bug 1 (slow shape check, 1.3-1.5s observed): the function previously
-//   iterated EVERY item in the envelope with 4 map ops + per-item
-//   stripManagedFields + unstructured.Unstructured allocation. At
-//   cyberjoker scale (~44K items, ~10.9 MiB envelope) this dominated
-//   per-/call latency. Item materialisation is redundant work in the
-//   shape budget — `parseListEnvelope` runs the SAME decode at the Put
-//   site (apistage.go:140-170). Fix: the shape check itself is O(1) at
-//   the envelope level + sample-bounded at the item level (first k=8
-//   items for nil-check only). It now returns the deferred
-//   []json.RawMessage so the caller can pay the per-item decode under
-//   its OWN separately-named/separately-timed step
-//   (`materialise_elapsed`) — see the call site near cluster_list.go:312.
+//	Bug 1 (slow shape check, 1.3-1.5s observed): the function previously
+//	iterated EVERY item in the envelope with 4 map ops + per-item
+//	stripManagedFields + unstructured.Unstructured allocation. At
+//	cyberjoker scale (~44K items, ~10.9 MiB envelope) this dominated
+//	per-/call latency. Item materialisation is redundant work in the
+//	shape budget — `parseListEnvelope` runs the SAME decode at the Put
+//	site (apistage.go:140-170). Fix: the shape check itself is O(1) at
+//	the envelope level + sample-bounded at the item level (first k=8
+//	items for nil-check only). It now returns the deferred
+//	[]json.RawMessage so the caller can pay the per-item decode under
+//	its OWN separately-named/separately-timed step
+//	(`materialise_elapsed`) — see the call site near cluster_list.go:312.
 //
-//   Bug 3 (per-item TypeMeta false-negative): the previous check
-//   asserted `it["apiVersion"]` and `it["kind"]` are non-empty strings.
-//   The apiserver does NOT emit per-item apiVersion/kind on a typed
-//   LIST endpoint (those live only on the envelope; k8s API convention)
-//   — and the dynamic-informer-served path (`marshalAsList` at
-//   informer_dispatch.go:209-222) stores items AS DECODED with no
-//   per-item TypeMeta injection. Result: EVERY informer-served
-//   cluster-LIST tripped this assertion, paying both the dispatch cost
-//   AND the shape-check cost for ZERO collapse benefit. Fix: drop the
-//   per-item TypeMeta assertion. `parseListEnvelope` already tolerates
-//   this — envelope-level TypeMeta (apiVersion/kind) is the source of
-//   truth and is synthesized from the GVR if missing.
+//	Bug 3 (per-item TypeMeta false-negative): the previous check
+//	asserted `it["apiVersion"]` and `it["kind"]` are non-empty strings.
+//	The apiserver does NOT emit per-item apiVersion/kind on a typed
+//	LIST endpoint (those live only on the envelope; k8s API convention)
+//	— and the dynamic-informer-served path (`marshalAsList` at
+//	informer_dispatch.go:209-222) stores items AS DECODED with no
+//	per-item TypeMeta injection. Result: EVERY informer-served
+//	cluster-LIST tripped this assertion, paying both the dispatch cost
+//	AND the shape-check cost for ZERO collapse benefit. Fix: drop the
+//	per-item TypeMeta assertion. `parseListEnvelope` already tolerates
+//	this — envelope-level TypeMeta (apiVersion/kind) is the source of
+//	truth and is synthesized from the GVR if missing.
 //
 // Definition (post-Path-3.1):
 //

@@ -109,7 +109,7 @@
 //                            so driving the seam directly cannot write one.
 //
 // THE FOURTH SITE (1.12.3, previously mis-waived): the raFullList cell
-// (ra_full_list_store.go PutRAFullList / PutRAFullListPinned, written from
+// (ra_full_list_store.go PutRAFullList, written from
 // apiref's raFullListServe). The pre-1.12.3 waiver text claimed UAF refilter
 // output "lands in the per-page restactions cell, never here". That was WRONG:
 // raFullListServe caches the apiRef'd RA's OWN full resolve output, UAF stage

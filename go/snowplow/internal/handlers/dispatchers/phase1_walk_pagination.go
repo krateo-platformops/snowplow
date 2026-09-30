@@ -458,6 +458,11 @@ func iterateApiRefPages(
 		// compute keyPageForThisPage + keyPerPage identically.
 		keyPageForThisPage := drainKeyPageFor(keyPage, page)
 		wcKey, _ := widgetContentL1Key(gvr, ns, name, keyPerPage, keyPageForThisPage)
+		// #323 — capture the content cell's generation BEFORE the page resolve
+		// below (paginationResolvePageFn), so populateWidgetContentL1's post-readyz
+		// PutIfGen refuses (rather than resurrecting) if a DELETE lands during this
+		// keep-warm / gvr-discovered re-resolve. Cheap + nil-safe.
+		wcGen0 := cache.ResolvedCache().CaptureGen(wcKey)
 		resolveCtx := ctx
 		if wcKey != "" {
 			resolveCtx = cache.WithL1KeyContext(resolveCtx, wcKey)
@@ -523,7 +528,7 @@ func iterateApiRefPages(
 		// (which carries the stage-error sink + the L1 key) NOT the bare
 		// ctx, so the Cache-A gate inside populateWidgetContentL1 sees this
 		// resolve's sink (parity with phase1_walk.go:1226).
-		populateWidgetContentL1(resolveCtx, gvr, got.Unstructured, keyPerPage, keyPageForThisPage, res)
+		populateWidgetContentL1(resolveCtx, gvr, got.Unstructured, keyPerPage, keyPageForThisPage, res, wcGen0)
 		pagesWalked++
 
 		// Recurse into the children this page produced. Honours the

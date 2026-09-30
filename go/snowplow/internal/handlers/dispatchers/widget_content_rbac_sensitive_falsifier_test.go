@@ -261,7 +261,7 @@ func TestRBACSensitive_PopulateSkipsClassifiedWidget(t *testing.T) {
 	beforeStore := cache.ResolvedCache().Stats().WidgetContentStoreTotal
 	beforeSkip := widgetContentSkippedRBACSensitiveTotal.Load()
 
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res)
+	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
 
 	if got := cache.ResolvedCache().Stats().WidgetContentStoreTotal; got != beforeStore {
 		t.Fatalf("LEAK GUARD FAIL: a classified RBAC-sensitive widget was STORED into the "+
@@ -303,7 +303,7 @@ func TestRBACSensitive_PopulateStillStoresUnclassified(t *testing.T) {
 	res := widgetWithTemplates("some-action-ra", false, false, 3)
 	res.Object["metadata"] = map[string]any{"namespace": "krateo-system", "name": "nav-panel"}
 
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res)
+	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
 
 	key := cache.ComputeKey(cache.ResolvedKeyInputs{
 		CacheEntryClass: cache.CacheEntryClassWidgetContent,
@@ -343,7 +343,7 @@ func TestRBACSensitive_ClassificationSupersedesEmptyShellGuard(t *testing.T) {
 	beforeRBAC := widgetContentSkippedRBACSensitiveTotal.Load()
 	beforeEmpty := widgetContentSkippedEmptyShellTotal.Load()
 
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res)
+	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
 
 	if got := widgetContentSkippedRBACSensitiveTotal.Load(); got != beforeRBAC+1 {
 		t.Fatalf("expected the RBAC-sensitivity guard to fire FIRST (%d -> %d)", beforeRBAC, got)

@@ -511,7 +511,7 @@ func TestPopulateWidgetContentL1_PutHappensWhenEnabled(t *testing.T) {
 	}, "status", "resourcesRefs", "items")
 
 	gvr := someWidgetContentGVR()
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res)
+	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
 
 	// The cache MUST now hold the entry under the identity-free key.
 	c := cache.ResolvedCache()
@@ -559,7 +559,7 @@ func TestPopulateWidgetContentL1_NoOpWhenLayerOff(t *testing.T) {
 
 	in := newUnstructuredWidget("ns", "w")
 	res := newUnstructuredWidget("ns", "w")
-	populateWidgetContentL1(context.Background(), someWidgetContentGVR(), in, 5, 1, res)
+	populateWidgetContentL1(context.Background(), someWidgetContentGVR(), in, 5, 1, res, 0)
 
 	c := cache.ResolvedCache()
 	if c == nil {
@@ -581,7 +581,7 @@ func TestPopulateWidgetContentL1_NoOpWhenCacheOff(t *testing.T) {
 
 	in := newUnstructuredWidget("ns", "w")
 	res := newUnstructuredWidget("ns", "w")
-	populateWidgetContentL1(context.Background(), someWidgetContentGVR(), in, 5, 1, res)
+	populateWidgetContentL1(context.Background(), someWidgetContentGVR(), in, 5, 1, res, 0)
 
 	// ResolvedCache MUST be nil under CACHE_ENABLED=false — nothing to inspect.
 	if c := cache.ResolvedCache(); c != nil {
@@ -692,7 +692,7 @@ func TestPopulateWidgetContentL1_RecordsDepEdges(t *testing.T) {
 		t.Fatalf("RecordTotal baseline = %d; want 0 after ResetDepsForTest", beforeRecord)
 	}
 
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res)
+	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
 
 	// AC-G.5 PRIMARY ASSERTION: the dep tracker MUST have advanced.
 	afterRecord := cache.Deps().Stats().RecordTotal
