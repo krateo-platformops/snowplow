@@ -487,6 +487,16 @@ func recordReflectorPath(gvr schema.GroupVersionResource, bucket string, hasReso
 		return
 	}
 	previous, seen := reflectorPaths.current[gvr]
+	// #260 change-4 — a RE-ESTABLISHMENT: an already-established RBAC GVR
+	// re-issuing a fresh establishment (watchlist OR list) re-delivers every
+	// object → re-evaluates RBAC → sub-gen churn. Counted here, BEFORE the
+	// same-path dedup below, so a watchlist→watchlist re-delivery is not hidden.
+	// This site is reached ONLY after classifyReflectorRequest's #263
+	// isForcedVerifyRequest skip, so the tagged forced-verification LIST never
+	// reaches it and is never mis-counted as a re-establishment (no #334 regress).
+	if seen && isRBACTypedGVR(gvr) {
+		recordRBACReestablishment(gvr)
+	}
 	if seen && previous == path {
 		reflectorPaths.mu.Unlock()
 		return
@@ -538,6 +548,15 @@ func registerReflectorPathExpvar() {
 		}))
 		expvar.Publish("snowplow_reflector_path_by_gvr", expvar.Func(func() any {
 			return ReflectorPathsSnapshot()
+		}))
+		// #260 change-4 — the per-RBAC-GVR re-establishment /debug/vars sibling
+		// (the OTLP counter lives in metrics.go). Same shape as the path map.
+		expvar.Publish("snowplow_rbac_reflector_reestablished_by_gvr", expvar.Func(func() any {
+			return RBACReestablishmentSnapshot()
+		}))
+		// #260 change-4 — the per-RBAC-GVR watch-error /debug/vars sibling.
+		expvar.Publish("snowplow_rbac_reflector_watch_errors_by_gvr", expvar.Func(func() any {
+			return RBACWatchErrorSnapshot()
 		}))
 	})
 }

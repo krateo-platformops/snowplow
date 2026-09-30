@@ -210,6 +210,46 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #260 change-4: RBAC sub-gen churn attribution on OTLP. Decision-critical
+	// for the #253/#258/#259 keying call (correlate rotation drivers vs ClickStack
+	// cold-fills on one time axis). Bounded cardinality: 4 GVRs / 6 sources / scalars.
+	rbacReestablished, err := m.Int64ObservableCounter(
+		"snowplow_rbac_reflector_reestablished_total",
+		metric.WithDescription("Reflector re-establishments (a fresh watchlist/list re-delivery) per typed-RBAC GVR — the sub-gen churn driver. Excludes the #263-tagged forced-verification LIST by construction."))
+	if err != nil {
+		return err
+	}
+	rbacWatchError, err := m.Int64ObservableCounter(
+		"snowplow_rbac_reflector_watch_errors_total",
+		metric.WithDescription("Reflector ListAndWatch errors per typed-RBAC GVR — the watch DISRUPTION rate. Its relationship to reestablished_total tells watch-driven RBAC churn (fixable) from apiserver-inherent churn (a 410/compaction re-list with no watch error)."))
+	if err != nil {
+		return err
+	}
+	rbacBumpsBySource, err := m.Int64ObservableCounter(
+		"snowplow_rbac_subgen_bumps_by_source_total",
+		metric.WithDescription("RBAC sub-gen bumps by source (binding/role add/update/delete). Promoted from expvar so the keying decision can correlate drivers on ClickStack."))
+	if err != nil {
+		return err
+	}
+	rbacRoleNoop, err := m.Int64ObservableCounter(
+		"snowplow_rbac_role_noop_updates_total",
+		metric.WithDescription("Role UPDATE events that were relist fan-out (same resourceVersion) — a re-establishment redelivering roles, not a real change."))
+	if err != nil {
+		return err
+	}
+	rbacRoleSemanticNoop, err := m.Int64ObservableCounter(
+		"snowplow_rbac_role_semantic_noop_updates_total",
+		metric.WithDescription("Role UPDATE events whose rules were unchanged, order-insensitive (#257's skip predicate) — label-only role churn."))
+	if err != nil {
+		return err
+	}
+	rbacBindingUidChanged, err := m.Int64ObservableCounter(
+		"snowplow_rbac_binding_uid_changed_updates_total",
+		metric.WithDescription("Binding UPDATE events whose metadata.uid changed (delete+recreate seen via relist) — excluded from semantic_noop so a real rotation is not credited as a no-op."))
+	if err != nil {
+		return err
+	}
+
 	// --- cache: binding UPDATE events that rotated keys for nothing (#247) ---
 	// onBindingUpdate bumps every subject on every UPDATE with no old-vs-new
 	// comparison, and a watch re-establishment redelivers every binding as an
@@ -632,6 +672,20 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(rbacPublishSeq, int64(cache.RBACGen()))
 		o.ObserveInt64(rbacSubGenBumps, int64(cache.RBACSubGenBumpsTotal()))
 		o.ObserveInt64(rbacSubGenSubjects, int64(cache.RBACSubGenSubjectsTracked()))
+		// #260 change-4 — RBAC sub-gen churn attribution (re-establishment {gvr},
+		// bumps_by_source {source}, and the role/uid no-op scalars).
+		for gvr, n := range cache.RBACReestablishmentSnapshot() {
+			o.ObserveInt64(rbacReestablished, int64(n), metric.WithAttributes(attribute.String("gvr", gvr)))
+		}
+		for gvr, n := range cache.RBACWatchErrorSnapshot() {
+			o.ObserveInt64(rbacWatchError, int64(n), metric.WithAttributes(attribute.String("gvr", gvr)))
+		}
+		for source, n := range cache.RBACSubGenBumpsBySourceSnapshot() {
+			o.ObserveInt64(rbacBumpsBySource, int64(n), metric.WithAttributes(attribute.String("source", source)))
+		}
+		o.ObserveInt64(rbacRoleNoop, int64(cache.RBACRoleNoopUpdatesTotal()))
+		o.ObserveInt64(rbacRoleSemanticNoop, int64(cache.RBACRoleSemanticNoopUpdatesTotal()))
+		o.ObserveInt64(rbacBindingUidChanged, int64(cache.RBACBindingUidChangedUpdatesTotal()))
 		o.ObserveInt64(bindingNoopUpdates, int64(cache.RBACBindingNoopUpdatesTotal()))
 		o.ObserveInt64(bindingSemanticNoopUpdates, int64(cache.RBACBindingSemanticNoopUpdatesTotal()))
 
@@ -853,6 +907,8 @@ func registerInstruments(m metric.Meter, build string) error {
 	}, append([]metric.Observable{
 		fallthroughTotal, assertionViolations, rbacPublishSeq,
 		rbacSubGenBumps, rbacSubGenSubjects,
+		// --- #260 change-4 ---
+		rbacReestablished, rbacWatchError, rbacBumpsBySource, rbacRoleNoop, rbacRoleSemanticNoop, rbacBindingUidChanged,
 		bindingNoopUpdates, bindingSemanticNoopUpdates,
 		registeredGVRs, prewarmDone, prewarmElapsed,
 		memoHits, memoMisses, memoSwaps, memoRefused, memoDenyUncached, memoEntries,
