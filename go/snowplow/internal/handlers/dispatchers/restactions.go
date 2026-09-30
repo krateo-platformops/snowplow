@@ -199,6 +199,48 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			pcs.l1Hit = "hit"
+			// #261 serve-time detector (observability only; the keying FIX is
+			// v7-deferred — this changes NO serving behaviour, RawJSON below is
+			// untouched). Both at-risk carriers of the bounded self-stale-leak
+			// class — case-2 (winning subject is an implicit group; an RBAC fact)
+			// and case-3 (first-permitting binding's roleRef was unresolved at the
+			// last bindings_by_gvr index build; an index fact) — were computed at
+			// KEY-MINT (dispatchCacheLookupKey) and carried on cacheInputs.
+			// AtRiskClass. Here we merely READ that MARK and bump the matching
+			// counter — never re-evaluating RBAC or the index at the hit (pm
+			// load-bearing #4). Through such a binding a grant/revoke can shift the
+			// serve-time first-match BindingUID with NO sub-gen bump, so a HIT of
+			// the at-risk-keyed cell can serve potentially-stale bytes.
+			// HIT-GATED ONLY: a MISS re-resolves under fresh perms (no stale), so
+			// the bump lands exactly on a HIT of the at-risk-keyed cell. The
+			// counter is a STRUCTURAL PROXY for the at-risk serve population, not a
+			// confirmed-leak count (off-zero => reassess, never N leaks). The note
+			// is METADATA-ONLY: class + coordinate {gvr,ns,name} + a HASHED
+			// bindingUID — never the raw UID, never the response body. Guard ""
+			// (serveFromCacheEligible already requires a non-empty BindingUID, but
+			// keep the no-op explicit).
+			if matchedBindingUID := cacheInputs.BindingUID; matchedBindingUID != "" &&
+				cacheInputs.AtRiskClass != cache.AtRiskNone {
+				var class string
+				switch cacheInputs.AtRiskClass {
+				case cache.AtRiskImplicitGroup:
+					cache.ResolvedCache().BumpServeMissedRotationAtriskImplicitGroup()
+					class = "implicit_group"
+				case cache.AtRiskRolerefUnresolved:
+					cache.ResolvedCache().BumpServeMissedRotationAtriskRolerefUnresolved()
+					class = "roleref_unresolved"
+				}
+				if class != "" {
+					log.Debug("l1.serve_missed_rotation_atrisk",
+						slog.String("subsystem", "cache"),
+						slog.String("class", class),
+						slog.String("gvr", got.GVR.String()),
+						slog.String("namespace", got.Unstructured.GetNamespace()),
+						slog.String("name", got.Unstructured.GetName()),
+						slog.String("binding_uid_hash", hashUsername(matchedBindingUID)),
+					)
+				}
+			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
 			writeResolvedJSON(wri, entry.RawJSON)
 			log.Info("RESTAction successfully resolved",

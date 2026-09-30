@@ -132,5 +132,20 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		// #189 write-side generation guard — refusals of a stale in-flight Put
 		// that would have resurrected a DELETE-evicted body.
 		"put_refused_generation_moved_total": int64(s.PutRefusedGenerationMovedTotal),
+		// #261 case-3 serve-time detector — L1 hits of an at-risk cell whose
+		// serve-time first-permitting binding's roleRef was unresolved at the
+		// last bindings_by_gvr index build. AT-RISK SERVE POPULATION proxy (off-
+		// zero => reassess), NOT a confirmed-leak count. Rides both this expvar
+		// (snowplow_resolved_cache) and the OTLP RegisterCallback that ranges
+		// ResolvedCacheStatsByStat() (metrics.go) — OTLP-observed by construction.
+		"serve_missed_rotation_atrisk_roleref_unresolved": int64(s.ServeMissedRotationAtriskRolerefUnresolved),
+		// #261 case-2 serve-time detector — L1 hits of an at-risk cell whose
+		// serve-time first-permitting binding's winning subject matched only
+		// through an implicit group (system:authenticated / synthetic
+		// system:serviceaccounts[:ns]). AT-RISK SERVE POPULATION proxy (off-zero
+		// => reassess), NOT a confirmed-leak count. Rides both this expvar
+		// (snowplow_resolved_cache) and the OTLP RegisterCallback that ranges
+		// ResolvedCacheStatsByStat() (metrics.go) — OTLP-observed by construction.
+		"serve_missed_rotation_atrisk_implicit_group": int64(s.ServeMissedRotationAtriskImplicitGroup),
 	}
 }
