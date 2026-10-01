@@ -150,6 +150,20 @@ Defined in `internal/cache/fallthrough_meter_expvar.go`.
 | `serve_missed_rotation_atrisk_implicit_group` | **#261 case-2 serve-time detector.** restactions serve HITs (hit-gated) of a cell whose serve-time first-permitting binding's WINNING subject matched only through an IMPLICIT group (`system:authenticated`, or a synthetic `system:serviceaccounts[:ns]` group) — `RBACSubGenForSubject` sums only the requester's PRESENTED groups, so a grant/revoke through such a binding shifts the serve-time first-match `BindingUID` with no sub-gen bump (the bounded self-stale-leak carrier). The class is computed at KEY-MINT (the evaluator's winning-subject fact, surfaced via `WinningSubjectClassOut`) and merely READ at the hit. Measures the **AT-RISK SERVE POPULATION** (structural proxy), NOT a confirmed-leak count | **0** in steady state (none of the 4 implicit-group CRBs on 057 grants `get`). Off-zero => an at-risk-keyed cell was served → REASSESS (the keying fix is v7-deferred); NEVER read as "N leaks" |
 
 
+### RA resolve guard — malformed single-object dials skipped (#288 / #293 / #302)
+Defined in `internal/resolvers/restactions/api/malformed_dial_metrics.go`. The
+guard runs on **every** RA resolve (cache on or off), so the family is never
+cache-mode-gated. A non-zero is a **DETECTOR**: an upstream render/keying/jq fault
+was caught before it could be dialed as a garbage single-object apiserver request
+(empty/DNS-invalid name, an unrendered `${...}` template, or a jq
+path/payload/header error). Each reason has a distinct owner/urgency, so the count
+is broken out **per reason** on both surfaces.
+
+| metric | meaning | healthy range |
+|---|---|---|
+| `snowplow_malformed_dial_skipped_total` (expvar) | `/debug/vars` `map{reason → uint64}` over the fixed reason set `{empty_interp, unrendered_template, jq_path_error, jq_payload_error, jq_header_error}`. Single published KEY (the CFG-1 `nonCacheInitPublishers` exception); the inner reason set grows, the key name never does | **0** in steady state. Non-zero = the guard fired — read the per-reason breakdown: `empty_interp` (#288) = a key-minting/interpolation regression; `unrendered_template` (#293) = an RA-authoring/unresolved-template fault; `jq_*_error` (#293/#302) = a jq fault that would otherwise have dialed a garbage path / body / header |
+| `snowplow_malformed_dial_skipped_total{reason}` (OTLP, **#311**) | the same counter mirrored to ClickStack as one `{reason}` series per enum member, observed in `metrics.go` by ranging `MalformedDialSkippedByReasonSnapshot()`. Previously `/debug/vars`-only (observable-if-you-look); #311 makes it **alertable** | **0**. The `reason` attribute is bounded **by construction** — it is the fixed code-defined `MalformedDialReasonEnum()`, NEVER request-derived (the #260 bounded-attribute discipline), so it cannot blow up OTLP cardinality. Expvar and OTLP read the SAME snapshot, so the two surfaces never diverge (guarded by `metrics_311_malformed_dial_otlp_test.go`: `len(series) == len(enum)` + every emitted reason ∈ enum) |
+
 ### Dispatch L1 lookups — resolved-output cache hit rate
 Defined in `internal/handlers/dispatchers/l1_lookup_metrics.go`.
 
