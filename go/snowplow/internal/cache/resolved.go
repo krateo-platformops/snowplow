@@ -1243,6 +1243,26 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 	return item.entry, true
 }
 
+// Has reports whether key is currently resident, WITHOUT any of Get's side
+// effects: no hitTotal/missTotal, no lastRead stamp (#315/#316 read-recency), no
+// MoveToFront (LRU order), and NO lazy TTL/maxAge eviction. It takes the plain
+// c.mu Lock (the store's mutex is a sync.Mutex, not RWMutex) for ONLY the
+// map-membership read — a far shorter critical section than Get's — so internal
+// callers (the #374 refresher residency cheapening) can probe residency without
+// the customer-facing c.mu cost or the read-recency/LRU pollution a Get would
+// cause. The TTL/maxAge evict bound stays on the Get path and the reaper; a
+// TTL-expired-but-not-yet-evicted key reads as resident here and is caught by the
+// authoritative Get downstream.
+func (c *ResolvedCacheStore) Has(key string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	_, ok := c.index[key]
+	c.mu.Unlock()
+	return ok
+}
+
 // Put stores entry under key, evicting LRU tail entries until both
 // entry-count and byte-budget caps are satisfied. The entry's CreatedAt
 // is set to time.Now() if zero. Putting under a key that already exists

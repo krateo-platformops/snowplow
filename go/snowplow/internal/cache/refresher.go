@@ -472,6 +472,16 @@ func StartRefresher(ctx context.Context) {
 			} else {
 				r.enqueue(l1Key)
 			}
+			// #374/#375 INVARIANT — the eventual post-#375 residency-gated
+			// enqueue-DROP must gate ONLY the r.enqueue/enqueueClusterList calls
+			// above; SubmitSliceabilityInvalidate MUST keep firing UNCONDITIONALLY
+			// for every dirty-marked key. It is #91 Lever C: a stuck-false
+			// RAFullList raKey has NO L1 cell by construction, so it would be
+			// "non-resident" to any drop filter — but this call is the ONLY thing
+			// that clears its stuck-false sliceability memo on a backing change.
+			// Dropping it with the enqueue = #91 regression. (#374 does NOT drop;
+			// Part B only skips the yield-park for non-resident no-ops — this
+			// marker guards the FUTURE residency-gated drop.)
 			SubmitSliceabilityInvalidate(l1Key)
 		})
 
@@ -753,7 +763,21 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// immediate return. Applied IDENTICALLY for both tiers — Path 3.2
 	// preserves the Ship #98 customer-priority invariant: NO refresher
 	// work, cluster_list-tier or otherwise, races a customer /call.
-	r.yieldToCustomer(ctx)
+	//
+	// #374 Part B (pickup-cheapen): probe residency with the side-effect-free
+	// Has() BEFORE the park. A non-resident key is a no-op at processOne
+	// (skipped_no_entry — no resolve, no Put, no customer-racing work), so it
+	// must never PARK a worker (up to refresherYieldMaxParked) behind a customer
+	// burst. Skip the yield for a non-resident key (+ bump the diagnostic
+	// counter); a resident key yields exactly as today. The dequeue Get below
+	// stays AUTHORITATIVE: a key that became resident between this probe and the
+	// Get is still re-resolved (freshness Arm C) — this gates the PARK only,
+	// never the refresh decision.
+	if cc := ResolvedCache(); cc != nil && !cc.Has(key) {
+		pickupNoopNoPark.Add(1)
+	} else {
+		r.yieldToCustomer(ctx)
+	}
 
 	// Select the queue to mutate on success/failure (Forget /
 	// AddRateLimited / NumRequeues all read per-tier rate-limiter
