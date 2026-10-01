@@ -810,7 +810,11 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		ok    bool
 	)
 	if c != nil {
-		entry, ok = c.Get(key)
+		// #376 — GetNoTouch: the refresher's dequeue read must NOT stamp lastRead /
+		// hitTotal / MoveToFront. Otherwise the refresher self-perpetuates #315/#316
+		// warmth (its re-Put inherits the stamped lastRead) and inflates the customer
+		// hit metric on cells no customer touched. Keeps the lazy TTL/maxAge evicts.
+		entry, ok = c.GetNoTouch(key)
 	}
 	// 1.12.6 C4 (§6.4) — SUPPRESSION consult, before the rate floor and
 	// before any resolve. A key marked refresh-by-traffic-only (K
@@ -913,9 +917,9 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			if errors.Is(err, ErrSelfObjectGone) {
 				// #216 — pass the confirmed-gone self-object coordinate so
 				// EvictSelfGone can fire the object-level gone-forget hook
-				// (drop harvested copies). `entry` (from c.Get(key) above)
+				// (drop harvested copies). `entry` (from c.GetNoTouch(key) above)
 				// still holds the 404'd object's Inputs; nil-guarded because
-				// c.Get may have missed (EvictSelfGone skips the fire on nil).
+				// GetNoTouch may have missed (EvictSelfGone skips the fire on nil).
 				var goneInputs *ResolvedKeyInputs
 				if entry != nil {
 					goneInputs = entry.Inputs

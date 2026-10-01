@@ -141,7 +141,9 @@ func depsKeyViewFor(keyHash string) depsKeyView {
 		EdgeCount: len(edges),
 		Edges:     toEdgeCoords(edges),
 	}
-	entry, ok := cache.ResolvedCache().Get(keyHash)
+	// #376 — GetNoTouch: a /debug inspection is a pure peek; observing a cell must
+	// never stamp lastRead, bump hit_total or move it in the LRU (observer-effect).
+	entry, ok := cache.ResolvedCache().GetNoTouch(keyHash)
 	view.HasBackingEdge = hasBackingEdge(entry, edges)
 	if !ok || entry == nil {
 		return view
@@ -184,7 +186,10 @@ func depsFilterMissingBacking() depsFilterView {
 			return false
 		}
 		inspected++
-		entry, ok := cache.ResolvedCache().Get(l1Key)
+		// #376 — GetNoTouch: this /debug filter ITERATES the dep index; a touching
+		// Get here would stamp lastRead + MoveToFront on every entry it dumps =
+		// warming the whole cache and defeating #315/#316 cold-eviction for a TTL.
+		entry, ok := cache.ResolvedCache().GetNoTouch(l1Key)
 		if !ok || entry == nil || entry.Inputs == nil {
 			return true
 		}
@@ -220,7 +225,10 @@ func depsFilterStaleRisk() depsFilterView {
 			return false
 		}
 		inspected++
-		entry, ok := cache.ResolvedCache().Get(l1Key)
+		// #376 — GetNoTouch: this /debug filter ITERATES the dep index; a touching
+		// Get here would stamp lastRead + MoveToFront on every entry it dumps =
+		// warming the whole cache and defeating #315/#316 cold-eviction for a TTL.
+		entry, ok := cache.ResolvedCache().GetNoTouch(l1Key)
 		if !ok || entry == nil || entry.BornAt.IsZero() {
 			return true
 		}

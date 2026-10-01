@@ -647,6 +647,16 @@ type ResolvedCacheStore struct {
 	// without a from-scratch re-mint), NOT a confirmed-leak count.
 	warmPastMaxAgeGauge atomic.Uint64
 
+	// #376 — resident WARM cells split by warmth SOURCE, recomputed on the same
+	// reaper walk as the gauges above (where `warm` is already evaluated per cell).
+	// warmSeededGauge = SeededAtBoot cells; warmLastReadGauge = cells warm via a
+	// read-within-TTL lastRead and NOT seeded. The decomposition makes #376
+	// observable: once GetNoTouch stops internal reads from stamping lastRead, the
+	// lastRead bucket on an unbrowsed cluster collapses toward ~0 while the seeded
+	// bucket holds. GAUGES (up/down), recomputed every tick, not monotonic totals.
+	warmSeededGauge   atomic.Uint64
+	warmLastReadGauge atomic.Uint64
+
 	// #316 — proactive refreshes ENQUEUED by the read-independent pass (a warm,
 	// approaching-TTL cell handed to the existing refresher). Monotonic counter,
 	// the pass's falsifier readout: non-zero DURING a missed-dirty-mark defect
@@ -1190,10 +1200,35 @@ func (c *ResolvedCacheStore) effectiveTTLLocked(entry *ResolvedEntry) time.Durat
 	return c.ttl
 }
 
-// Get returns the cached entry for key, or (nil, false). A TTL-expired
-// entry is treated as a miss and is dropped during the same call so
-// memory pressure is bounded. Increments hit/miss counters atomically.
+// Get returns the cached entry for key, or (nil, false). A TTL-expired entry is
+// treated as a miss and is dropped during the same call so memory pressure is
+// bounded. On a HIT it stamps the CUSTOMER read-recency (lastRead), moves the LRU
+// front and bumps hitTotal — the customer-warmth effects. GetNoTouch is the
+// internal, non-stamping twin.
 func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
+	return c.getCore(key, true)
+}
+
+// GetNoTouch is the INTERNAL read path (#376): identical to Get — same lazy TTL +
+// maxAge evicts (correctness; arch's #315/#316 guard — keep the evicts) and same
+// miss-side accounting — EXCEPT on a HIT it does NOT MoveToFront, does NOT stamp
+// lastRead, and does NOT bump hitTotal. Internal readers (the depWatch
+// isSelfRepresentation probe deps.go, and the refresher dequeue refresher.go) must
+// not fake #315/#316 warmth (lastRead IS the WARM signal) nor inflate the customer
+// hit_total — only real customer traffic does (Get). Keeping the lazy evicts makes
+// it the prompt orphan backstop at maxAge (a customer-cold cell an internal read
+// touches past maxAge is still evicted, not stranded to the reaper tick).
+func (c *ResolvedCacheStore) GetNoTouch(key string) (*ResolvedEntry, bool) {
+	return c.getCore(key, false)
+}
+
+// getCore is the shared body of Get (touch=true) and GetNoTouch (touch=false). The
+// lookup and the lazy TTL/maxAge evicts (including their evict counters) are
+// IDENTICAL on both paths; touch gates the three hit-side customer-warmth effects
+// AND the miss accounting, so a GetNoTouch read is fully metric-neutral — it never
+// inflates hit_total NOR miss_total (freshness-audit: full metric neutrality for
+// internal reads). One implementation so the evict discipline can never drift.
+func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bool) {
 	if c == nil {
 		return nil, false
 	}
@@ -1202,7 +1237,9 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 
 	el, ok := c.index[key]
 	if !ok {
-		c.missTotal.Add(1)
+		if touch {
+			c.missTotal.Add(1)
+		}
 		return nil, false
 	}
 	item := el.Value.(*lruItem)
@@ -1218,7 +1255,9 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 	if eff := c.effectiveTTLLocked(item.entry); eff > 0 && now.Sub(item.entry.CreatedAt) > eff {
 		c.removeElementLocked(el)
 		c.evictTTLTotal.Add(1)
-		c.missTotal.Add(1)
+		if touch {
+			c.missTotal.Add(1)
+		}
 		return nil, false
 	}
 	// 1.12.6 C5 (design §7) — bounded LIFETIME, measured from the first Put
@@ -1227,19 +1266,26 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 	// re-resolves cold: the backstop that guarantees no L1 cell — however
 	// often the refresher re-Puts it — outlives the max age without a
 	// from-scratch resolve. Counted separately from TTL so the two reasons
-	// for leaving stay distinguishable.
+	// for leaving stay distinguishable. KEPT on the GetNoTouch path too (the
+	// internal-read orphan backstop).
 	if c.maxEntryAge > 0 && !item.entry.BornAt.IsZero() && now.Sub(item.entry.BornAt) > c.maxEntryAge {
 		c.removeElementLocked(el)
 		c.evictMaxAgeTotal.Add(1)
-		c.missTotal.Add(1)
+		if touch {
+			c.missTotal.Add(1)
+		}
 		return nil, false
 	}
-	// LRU touch: move to front, and stamp the read-recency (#315/#316). This is
-	// a HIT — a customer served this cell — so it is warm as of `now`. Written
-	// under c.mu; read only in metaForItemLocked under the same lock.
-	c.order.MoveToFront(el)
-	item.lastRead = now
-	c.hitTotal.Add(1)
+	// Customer-warmth effects — ONLY on the touch (customer Get) path (#376). A HIT
+	// here means a customer served this cell, so it is warm as of `now`: move to
+	// front, stamp read-recency, count the hit. GetNoTouch skips all three so an
+	// internal read never fakes #315/#316 warmth or inflates hit_total. Written
+	// under c.mu; lastRead is read only in metaForItemLocked under the same lock.
+	if touch {
+		c.order.MoveToFront(el)
+		item.lastRead = now
+		c.hitTotal.Add(1)
+	}
 	return item.entry, true
 }
 
@@ -1701,6 +1747,16 @@ type ResolvedCacheStats struct {
 	// without a from-scratch re-mint (re-mint deferred to C5/#258).
 	WarmPastMaxAge uint64
 
+	// #376 — resident WARM cells split by warmth SOURCE, recomputed on the same
+	// reaper walk that evaluates `warm` per cell. WarmSeeded = SeededAtBoot;
+	// WarmLastRead = warm via a read-within-TTL lastRead and NOT seeded. Together
+	// they decompose the warm working set so #376's effect is observable: after
+	// GetNoTouch stops internal reads faking warmth, WarmLastRead on an unbrowsed
+	// cluster collapses toward ~0 (only genuine customer reads keep a cell in it)
+	// while WarmSeeded holds at the boot-prewarm set. GAUGES, not totals.
+	WarmSeeded   uint64
+	WarmLastRead uint64
+
 	// #316 — proactive refreshes enqueued by the read-independent pass (see
 	// proactiveRefreshTotal). Monotonic; non-zero DURING a missed-dirty-mark
 	// defect the pass is catching, zero if the pass is dead.
@@ -1767,6 +1823,8 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		EvictDeleteTotal:        c.evictDeleteTotal.Load(),
 		SuppressedResident:      c.suppressedResidentGauge.Load(),
 		WarmPastMaxAge:          c.warmPastMaxAgeGauge.Load(),
+		WarmSeeded:              c.warmSeededGauge.Load(),
+		WarmLastRead:            c.warmLastReadGauge.Load(),
 		ProactiveRefreshTotal:   c.proactiveRefreshTotal.Load(),
 		ApistageStoreTotal:      c.apistageStoreTotal.Load(),
 		ApistageEvictTotal:      c.apistageEvictTotal.Load(),
@@ -2602,6 +2660,8 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	refreshBelow := ttlSec / 4 // enqueue a warm cell once past ~3/4 of its TTL
 	suppressedResident := 0
 	warmPastMaxAge := 0
+	warmSeeded := 0   // #376 — resident warm cells that are warm via SeededAtBoot
+	warmLastRead := 0 // #376 — resident warm cells warm via read-within-TTL lastRead, not seeded
 	var suppressedCandidates, coldCandidates, refreshCandidates []string
 	c.RangeMetadataBatched(reapMaxAgeBatch, func(metas []ResolvedEntryMeta, _ time.Duration) bool {
 		for i := range metas {
@@ -2619,6 +2679,21 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 			// evicting a genuinely-served cell and keeps the C4 gauge honest;
 			// TestIssue315_LastReadWarmPastMaxAge_NotEvicted exercises this exact path.
 			warm := m.SeededAtBoot || (m.LastReadSeconds >= 0 && ttlSec > 0 && m.LastReadSeconds < ttlSec)
+			// #376 — decompose the warm set by SOURCE over this same walk. Seeded wins
+			// the split (a cell can be both seeded and recently read; the boot-prewarm
+			// identity is the stable one). The else-branch reaches warmLastRead only
+			// when !SeededAtBoot, where warm ⟺ lastRead-within-TTL by construction. An
+			// internal-only-read cell (GetNoTouch, no lastRead stamp) whose cold-fill
+			// lastRead has aged past TTL is warm by NEITHER source → counted in neither
+			// bucket; a customer Get stamps lastRead=now → warmLastRead. This is the
+			// readout that makes #376 observable (warm_lastread → ~0 on an unbrowsed
+			// cluster once internal reads stop faking lastRead warmth).
+			switch {
+			case m.SeededAtBoot:
+				warmSeeded++
+			case warm:
+				warmLastRead++
+			}
 			_, suppressed := RefreshSuppressedReason(m.KeyHash)
 			pastMaxAge := maxAgeSec > 0 && m.LifetimeSeconds > maxAgeSec
 			switch {
@@ -2658,6 +2733,8 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	})
 	c.suppressedResidentGauge.Store(uint64(suppressedResident))
 	c.warmPastMaxAgeGauge.Store(uint64(warmPastMaxAge))
+	c.warmSeededGauge.Store(uint64(warmSeeded))     // #376
+	c.warmLastReadGauge.Store(uint64(warmLastRead)) // #376
 
 	reaped := 0
 	for _, key := range suppressedCandidates {
@@ -2904,6 +2981,16 @@ func stopResolvedCacheSummaryForTest() {
 // Production code MUST NOT call it.
 func ResetResolvedCacheForTest() {
 	resetResolvedCacheForTest()
+}
+
+// ReapPastMaxEntryAgeForTest runs ONE read-independent maintenance pass (the #248/
+// #315/#316 reaper + the #376 warm_seeded/warm_lastread gauge recompute) and returns
+// the number of entries reaped. Cross-package test-only seam so a dispatchers arm can
+// drive the gauge over the REAL seed-sweep path (seedSkipDecision → GetNoTouch) and
+// assert an internal-only read leaves a cell in neither warm bucket. Production runs
+// this on the summary tick; production code MUST NOT call this wrapper.
+func (c *ResolvedCacheStore) ReapPastMaxEntryAgeForTest() int {
+	return c.reapPastMaxEntryAge()
 }
 
 // DeleteForTest removes key from the resolved cache. Cross-package

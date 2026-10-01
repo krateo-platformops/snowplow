@@ -279,7 +279,11 @@ func attemptClusterListCollapse(
 	// the refresher's async work — warmth improves monotonically without
 	// any customer ever paying raw decode.
 	contentKey := cache.ComputeKey(contentKeyInputs(gvr, "", ""))
-	if entry, hit := apistageStore.Get(contentKey); hit && entry != nil {
+	// #376 — this is the collapse-DECISION warmth probe, NOT the serve (the real serve is
+	// apistageContentServe, which stamps on a customer /call). A decision-probe must never
+	// stamp — on the customer OR the refresher path — so GetNoTouch unconditional; the
+	// cell is still FOUND (warmth recognized), just not re-stamped ahead of the serve.
+	if entry, hit := apistageStore.GetNoTouch(contentKey); hit && entry != nil {
 		// CELL WARM. Customer keeps the cluster-scope call; the worker
 		// loop's apistageContentServe will Get-hit on this entry and
 		// skip the redundant dispatchViaInformer call. NO decode on the
@@ -354,7 +358,10 @@ func populateClusterListCellSync(
 	// sync.Map.Load. Two cold-miss goroutines for the same cell may
 	// have raced past attemptClusterListCollapse's fast-path check;
 	// the second one Puts identical bytes — harmless but wasteful.
-	if entry, hit := apistageStore.Get(contentKey); hit && entry != nil {
+	// #376 — populateClusterListCellSync is a POPULATE worker (customer-cold-miss async
+	// populate or boot prewarm), NEVER a customer serve; this belt-and-braces warmth
+	// re-check must not stamp. GetNoTouch unconditional.
+	if entry, hit := apistageStore.GetNoTouch(contentKey); hit && entry != nil {
 		return true
 	}
 

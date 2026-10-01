@@ -776,7 +776,13 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 			)
 			return true
 		}
-		entry, live := handle.Get(key)
+		// #376 — GetNoTouch: this seedModeBoot liveness read (after the Lever-A
+		// declined-external short-circuit) is a boot-scope internal read, not a
+		// customer serve, so it must NOT stamp lastRead/hitTotal (else the boot
+		// sweep fakes #315/#316 warmth and inflates the hit ratio). Sibling of the
+		// keepwarm :813 read. The evict is kept (GetNoTouch does): a past-TTL/maxAge
+		// seed cell still evicts → live=false → re-resolve+re-Put fresh.
+		entry, live := handle.GetNoTouch(key)
 		if !live || entry == nil {
 			return false
 		}
@@ -799,7 +805,14 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 		)
 		return true
 	case seedModeKeepwarm:
-		entry, live := handle.Get(key)
+		// #376 — GetNoTouch: the keepwarm sweep's age-skip read must NOT stamp
+		// lastRead/hitTotal (it is not a customer serve), else every sweep fakes
+		// #315/#316 warmth and inflates the hit ratio. It MUST keep the TTL/maxAge
+		// evict (GetNoTouch does): a >maxAge cell read here evicts → live=false →
+		// the sweep re-resolves+re-Puts with a FRESH BornAt (pop-A self-heal, the
+		// only 24h bound on a warm cell the reaper never cold-evicts). GetNoTouch
+		// returns the entry (for the CreatedAt age-skip) without the stamp.
+		entry, live := handle.GetNoTouch(key)
 		if !live || entry == nil {
 			return false
 		}

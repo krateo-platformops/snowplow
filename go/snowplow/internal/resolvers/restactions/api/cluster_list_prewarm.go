@@ -292,7 +292,12 @@ func PrewarmClusterListCells(
 			contentKey := cache.ComputeKey(contentKeyInputs(cell.GVR, "", ""))
 			// If the cell is already warm (from a prior boot's
 			// refresher OR from a concurrent populate), skip.
-			if existing, hit := apistageStore.Get(contentKey); hit && existing != nil {
+			// #376 — GetNoTouch: this is a PREWARM already-warm probe (not a customer
+			// serve) on the shared resolved store; it must not stamp lastRead/hitTotal,
+			// else the populate sweep fakes #315/#316 warmth on the content set and
+			// contaminates the warm_lastread gauge. Output-neutral: (existing, hit) is
+			// identical, only the warmth perturbation is dropped.
+			if existing, hit := apistageStore.GetNoTouch(contentKey); hit && existing != nil {
 				mu.Lock()
 				popOK++
 				mu.Unlock()

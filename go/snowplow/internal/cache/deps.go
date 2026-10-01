@@ -1136,7 +1136,11 @@ func (d *DepTracker) isSelfRepresentation(store *ResolvedCacheStore, l1Key strin
 	if store == nil {
 		return false
 	}
-	entry, ok := store.Get(l1Key)
+	// #376 — GetNoTouch: this is the dirty-mark fan-out self-representation PROBE
+	// (reads only entry.Inputs to compare GVR), fired for every resident matched key
+	// on every dep event — NOT a customer read. It must not stamp lastRead/hitTotal/
+	// MoveToFront (the dominant source of faked #315/#316 warmth, ~222.9:1 fan-out).
+	entry, ok := store.GetNoTouch(l1Key)
 	if !ok || entry == nil || entry.Inputs == nil {
 		return false
 	}

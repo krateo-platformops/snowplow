@@ -128,6 +128,14 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		// (a GAUGE): the AT-RISK population the read-independent pass keeps (C3)
 		// rather than cold-evicts, and keeps body-fresh via #316. Re-mint deferred.
 		"warm_past_max_age": int64(s.WarmPastMaxAge),
+		// #376 — resident WARM cells split by warmth SOURCE (both GAUGES). warm_seeded
+		// = boot-prewarmed cells; warm_lastread = cells kept warm by a read-within-TTL
+		// lastRead and NOT seeded. Decomposes the warm working set so GetNoTouch's
+		// effect is observable: post-fix, warm_lastread on an unbrowsed cluster
+		// collapses toward ~0 (internal reads no longer fake lastRead warmth) while
+		// warm_seeded holds. Rides snowplow_resolved_cache on OTLP by construction.
+		"warm_seeded":   int64(s.WarmSeeded),
+		"warm_lastread": int64(s.WarmLastRead),
 		// #316 — proactive refreshes ENQUEUED by the read-independent pass (a
 		// monotonic total): non-zero DURING a missed-dirty-mark defect the pass is
 		// catching, zero if the pass is inert. Read next to snowplow_refresher's
