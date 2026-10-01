@@ -215,7 +215,8 @@ All keys below are derived from the `stat` tags on `refresherStats` /
 gauges `snowplow_refresher_<stat>`; the OTLP mirror publishes the counters as
 `snowplow_refresher{stat=<stat>}` and the gauges under their expvar name. None of them
 constructs the refresher: before the first enqueue, and on a cache-off pod, every value is 0
-(#203).
+(#203). The one exception is `snowplow_refresher_p95_resolve_ms` (#386 M1) — a STANDALONE
+expvar scalar, deliberately NOT a C7-tagged `refresherStats` stat (so it stays expvar-only; see its row).
 
 | expvar | meaning | healthy range |
 |---|---|---|
@@ -230,6 +231,26 @@ constructs the refresher: before the first enqueue, and on a cache-off pod, ever
 | `snowplow_refresher_suppressed_set_total` | **1.12.6 C4 / #191.** keys marked refresh-by-traffic-only after `REFRESH_SUPPRESS_AFTER_DECLINES` (default 3) consecutive identity-bound declines (first occurrence for external-endpoint and UAF cells) | low; each is one WARN → DEBUG transition |
 | `snowplow_refresher_suppressed_skips_total` | **1.12.6 C4 — ALERT pair.** refresh ticks skipped on a suppressed key (the #191 cure working) | proportional to suppressed keys × keep-warm ticks |
 | `snowplow_refresher_suppressed_keys` | live count of suppressed keys (gauge; cleared by the next real Put or eviction) | bounded by the store |
+| `snowplow_refresher_p95_resolve_ms` (**#386 M1** — standalone scalar, NOT a C7 `refresherStats` stat) | p95 of the REAL resolve latency (the handler re-resolve+Put in `processOne`), a P² streaming estimate sampled ONLY on the ok=true path AFTER `yieldToCustomer` returns — so it EXCLUDES the dequeue, the customer-priority park, the `skipped_no_entry`/`skipped_no_handler` skips and the rate-floor defer | a DIAGNOSTIC sizing input for #384/#365 (≈≲31ms observed). **expvar-only by design** — a sizing input read on demand, not an alert (the backlog `queue_depth`/`completed` is the alert), so deliberately NOT OTLP-mirrored and kept out of the auto-mirrored C7 family |
+
+**#386 M2 — real drain rate (reader-computed; NO new metric).** The refresher's real
+re-resolve throughput is `Δ(snowplow_refresher_completed_total − snowplow_refresher_skipped_no_entry_total)/interval`,
+computed by the reader (the #365 model / the #384 control loop) at its own interval — it is
+NOT a stored rate metric (that would hard-code one interval and need a background sampler).
+Why the subtraction: `completed_total` increments on **every** non-error dequeue, and a
+`skipped_no_entry` dequeue (a non-resident key the refresher picked up) hits the success
+branch and bumps `completed_total` too — so raw `completed/s` **over-estimates** real work
+(on 057 ~92% of completions are cheap skips → ~12.5× over-estimate). **Source
+`skipped_no_entry_total`, NOT the L1 `miss_total`:** post-#376 (GetNoTouch) the refresher's
+dequeue read no longer contaminates `miss_total`, so `miss_total` is miss-neutral and the
+refresher's own skip counter is the independent, #376-surviving source.
+
+### Customer resolve-path in-flight (#386 M3)
+Defined in `internal/handlers/dispatchers/customer_inflight_metrics.go`.
+
+| expvar | meaning | healthy range |
+|---|---|---|
+| `snowplow_customer_resolve_inflight` | gauge — customer `/call` dispatches currently executing on the **RESOLVE path**: GET `/call` + POST `/call/read` that reached a restactions/widgets handler, where `markCustomerInFlight` brackets `ServeHTTP`. This is the SAME population the refresher's customer-priority yield keys off, so #384 serveReserve sizes against the same customer definition the live yield uses | 0 at idle (no customers in flight = healthy — a correlation signal, not an alarm); rises with concurrent resolve-path load. **SCOPE — NOT "all customer activity":** EXCLUDES the direct-proxy `Call()`/`CallRead()` fallthrough, `GET /list`, and all write verbs (POST/PUT/PATCH/DELETE `/call` route straight to `Call()` with no Dispatcher) — those are I/O-bound apiserver proxies that do not contend for the refresher's resolve-CPU. Counted ONCE per OUTERMOST call — `markCustomerInFlight` is at `ServeHTTP` entry only; a nested resolve runs via the in-process `apiref.Resolve` path and never re-enters `ServeHTTP`, so it does not re-mark. Cache-gated expvar; the OTLP `Int64ObservableGauge` mirror lands in a follow-up PR (after #387's #311 hand-wire merges) |
 
 ### Live refresh (SSE)
 Defined in `internal/cache/refresh_broadcaster_expvar.go`; one expvar key,
