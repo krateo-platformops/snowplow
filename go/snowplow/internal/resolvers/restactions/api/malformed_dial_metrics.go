@@ -7,10 +7,12 @@
 // single counter is the fallthrough_total mistake). The per-event DEBUG line
 // (recordMalformedDialSkip) also names the reason for coordinate-shape triage.
 //
-// NOTE (#311-class, tracked separately): this family is /debug/vars-only — there
-// is no expvar→OTLP bridge, so the reasons below are visible at /debug/vars, not
-// ClickStack. The #302 additions inherit that; wiring the family to OTLP is out
-// of #302 scope.
+// NOTE (#311): this family reaches BOTH /debug/vars AND OTLP/ClickStack. There is
+// no expvar→OTLP auto-bridge, so metrics.go hand-wires it: registerInstruments
+// observes MalformedDialSkippedByReasonSnapshot() per bounded reason into one
+// Int64ObservableCounter. The hand-wire reads the SAME atomics the expvar Func
+// below reads, so the two surfaces share a single source of truth and the reason
+// key set cannot diverge.
 
 package api
 
@@ -109,6 +111,50 @@ func MalformedDialSkippedTotal() uint64 {
 		malformedDialSkipped.jqPathError.Load() +
 		malformedDialSkipped.jqPayloadError.Load() +
 		malformedDialSkipped.jqHeaderError.Load()
+}
+
+// MalformedDialSkippedByReasonSnapshot returns the per-reason skip counts keyed
+// by the BOUNDED reason enum — the fixed, code-defined set below, NEVER derived
+// from request data — so an OTLP `reason` attribute built from these keys has
+// cardinality bounded by construction (#311 / the #260 bumps_by_source bounded-
+// attribute pattern; metrics.go ranges this and observes one counter per key).
+// Mirrors cache.RBACSubGenBumpsBySourceSnapshot. The key set is EXACTLY the
+// expvar map's reasons, so /debug/vars and OTLP never diverge.
+func MalformedDialSkippedByReasonSnapshot() map[string]uint64 {
+	return map[string]uint64{
+		reasonEmptyInterp:        malformedDialSkipped.emptyInterp.Load(),
+		reasonUnrenderedTemplate: malformedDialSkipped.unrenderedTemplate.Load(),
+		reasonJQPathError:        malformedDialSkipped.jqPathError.Load(),
+		reasonJQPayloadError:     malformedDialSkipped.jqPayloadError.Load(),
+		reasonJQHeaderError:      malformedDialSkipped.jqHeaderError.Load(),
+	}
+}
+
+// MalformedDialReasonEnum returns the fixed reason set — the bound the OTLP
+// attribute must stay within. Exported so the #311 falsifier can assert every
+// emitted reason is in this enum (cardinality-bound guard).
+func MalformedDialReasonEnum() []string {
+	return []string{
+		reasonEmptyInterp,
+		reasonUnrenderedTemplate,
+		reasonJQPathError,
+		reasonJQPayloadError,
+		reasonJQHeaderError,
+	}
+}
+
+// RecordMalformedDialSkipForTest bumps the per-reason counter for the #311 OTLP
+// falsifier. Production MUST NOT use it — the real bump is recordMalformedDialSkip.
+func RecordMalformedDialSkipForTest(reason string) { bumpMalformedDialSkipped(reason) }
+
+// ResetMalformedDialSkippedForTest zeroes all per-reason counters so a falsifier
+// can assert an exact delta. Production MUST NOT use it.
+func ResetMalformedDialSkippedForTest() {
+	malformedDialSkipped.emptyInterp.Store(0)
+	malformedDialSkipped.unrenderedTemplate.Store(0)
+	malformedDialSkipped.jqPathError.Store(0)
+	malformedDialSkipped.jqPayloadError.Store(0)
+	malformedDialSkipped.jqHeaderError.Store(0)
 }
 
 var malformedDialExpvarOnce sync.Once

@@ -659,6 +659,18 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// #311/#293: malformed-dial skip detector, per BOUNDED reason. Promoted from
+	// the expvar family so a mis-interpolation / garbage-path / jq-error spike is
+	// alertable on ClickStack. One counter + a `reason` attribute drawn from a
+	// fixed code-defined enum (cardinality bounded by construction — the #260
+	// bumps_by_source pattern).
+	malformedDialSkipped, err := m.Int64ObservableCounter(
+		"snowplow_malformed_dial_skipped_total",
+		metric.WithDescription("Malformed single-object apiserver dials SKIPPED by the #288/#293/#302 guard, by bounded reason {empty_interp, unrendered_template, jq_path_error, jq_payload_error, jq_header_error}. Non-zero is a DETECTOR: an upstream render defect was caught (collapsed interpolation / unrendered ${ template / jq error in path|payload|header) — fix the RESTAction or the key-minting. #311."))
+	if err != nil {
+		return err
+	}
+
 	// --- #244: factory-built GVR divergence age — the observable bound on the
 	// passive watch-reconnect self-heal. A factory (shared-informer) GVR whose
 	// indexer diverged from the apiserver cannot be relist-repaired; it clears on
@@ -907,6 +919,12 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- #233: unparseable-CA delegation detector (uncapped rate) ---
 		o.ObserveInt64(unparseableCADelegations, int64(restactionsapi.UnparseableCADelegationTotal()))
 
+		// --- #311/#293: malformed-dial skip detector, per bounded reason ---
+		for reason, n := range restactionsapi.MalformedDialSkippedByReasonSnapshot() {
+			o.ObserveInt64(malformedDialSkipped, int64(n),
+				metric.WithAttributes(attribute.String("reason", reason)))
+		}
+
 		// --- #244: factory-built divergence age (bounded self-heal detector) ---
 		o.ObserveInt64(storeFactoryDivergenceAge, cache.FactoryDivergenceMaxAgeSeconds())
 
@@ -951,6 +969,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		depsStats, informerFreshness,
 		// --- #233 ---
 		unparseableCADelegations,
+		// --- #311/#293 ---
+		malformedDialSkipped,
 		// --- #244 ---
 		storeFactoryDivergenceAge,
 		// --- #239: dirty-mark attribution ---
