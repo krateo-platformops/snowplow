@@ -277,8 +277,33 @@ func classifyPhase1SeedExit(parentErr, seedCtxErr, seedErr error, panicked bool)
 // panics into the caller: it runs in the seed block's defer chain right before
 // MarkPhase1Done, and instrumentation must not be able to change readiness.
 func recordPhase1ReadinessExit(outcome, cause string, elapsed time.Duration, steps phase1StepTimings) {
+	recordPhase1ReadinessExitWith(func() (string, string) { return outcome, cause }, elapsed, steps)
+}
+
+// recordPhase1SeedExit is the Step 7.6 seed-block recorder: classification
+// (classifyPhase1SeedExit) runs INSIDE the once + recover guard, so a panic in
+// classification, snapshotting or logging is swallowed here and can never
+// escape the seed block's defer chain (C3).
+func recordPhase1SeedExit(parentErr, seedCtxErr, seedErr error, panicked bool, elapsed time.Duration, steps phase1StepTimings) {
+	recordPhase1ReadinessExitWith(func() (string, string) {
+		return classifyPhase1SeedExit(parentErr, seedCtxErr, seedErr, panicked)
+	}, elapsed, steps)
+}
+
+// phase1ExitLevel is the log level of the readiness-exit line for an outcome:
+// WARN whenever readiness was NOT released by the latch or a no-seed path.
+func phase1ExitLevel(outcome string) slog.Level {
+	switch outcome {
+	case phase1ExitLatch, phase1ExitNoneConfigured, phase1ExitSeedReturned:
+		return slog.LevelInfo
+	}
+	return slog.LevelWarn
+}
+
+func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elapsed time.Duration, steps phase1StepTimings) {
 	phase1ExitOnce.Do(func() {
 		defer func() { _ = recover() }()
+		outcome, cause := classify()
 		phase1ExitOutcome.Store(outcome)
 		phase1Stage.Store(phase1StageReadinessReleased)
 		if outcome == phase1ExitDeadline {
@@ -290,10 +315,7 @@ func recordPhase1ReadinessExit(outcome, cause string, elapsed time.Duration, ste
 		if l := currentFirstNavLatch(); l != nil {
 			latchFired = l.fired()
 		}
-		level := slog.LevelInfo
-		if outcome != phase1ExitLatch && outcome != phase1ExitNoneConfigured && outcome != phase1ExitSeedReturned {
-			level = slog.LevelWarn
-		}
+		level := phase1ExitLevel(outcome)
 		effect := "readiness released by the first-nav latch: every cohort's nav-widget units were processed"
 		switch outcome {
 		case phase1ExitDeadline:

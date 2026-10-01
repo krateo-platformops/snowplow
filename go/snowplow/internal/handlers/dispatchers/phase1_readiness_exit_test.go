@@ -24,6 +24,7 @@ package dispatchers
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -130,7 +131,9 @@ func exitFixture(t *testing.T, seedWidget func(ctx context.Context, widget, coho
 			}
 			return nil
 		},
-		func(templatesv1.ObjectReference) (schema.GroupVersionResource, bool) { return schema.GroupVersionResource{}, false })
+		func(templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
+			return schema.GroupVersionResource{}, false
+		})
 	prevW := seedOneWidgetFn
 	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, _ string, _ seedScopeMode) error {
 		return seedWidget(ctx, e.W.GetName(), eIdentityLabel(ctx))
@@ -365,5 +368,121 @@ func TestIssue397_X4_NoSeed_NoneConfigured(t *testing.T) {
 	}
 	if Phase1DeadlineReleasedTotal() != 0 {
 		t.Error("no-seed exit must not bump the deadline detector")
+	}
+}
+
+// TestIssue397_X5_ClassifyEveryBranch_OutcomeCauseLevel — C1. Every outcome the
+// seed-block recorder can take, driven through the REAL recorder
+// (recordPhase1SeedExit → classifyPhase1SeedExit inside the once/recover guard),
+// asserting the emitted line's outcome, deadline_cause AND level, plus the
+// detector (1 iff deadline — including a shutdown-mid-boot "canceled").
+func TestIssue397_X5_ClassifyEveryBranch_OutcomeCauseLevel(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+
+	boom := errors.New("boot scope failed")
+	rows := []struct {
+		name                           string
+		fireLatch                      bool
+		parentErr, seedCtxErr, seedErr error
+		panicked                       bool
+		noSeed                         bool
+		wantOutcome, wantCause         string
+		wantLevel                      slog.Level
+		wantDetector                   int64
+	}{
+		{name: "latch", fireLatch: true, wantOutcome: "latch", wantLevel: slog.LevelInfo},
+		{name: "latch_wins_tie_with_deadline", fireLatch: true, parentErr: context.DeadlineExceeded, seedCtxErr: context.DeadlineExceeded, seedErr: context.DeadlineExceeded, wantOutcome: "latch", wantLevel: slog.LevelInfo},
+		{name: "deadline_phase1_timeout", parentErr: context.DeadlineExceeded, seedCtxErr: context.DeadlineExceeded, seedErr: context.DeadlineExceeded, wantOutcome: "deadline", wantCause: "phase1_timeout", wantLevel: slog.LevelWarn, wantDetector: 1},
+		{name: "deadline_pip_global_timeout", seedCtxErr: context.DeadlineExceeded, seedErr: context.DeadlineExceeded, wantOutcome: "deadline", wantCause: "pip_global_timeout", wantLevel: slog.LevelWarn, wantDetector: 1},
+		{name: "deadline_canceled_parent_shutdown", parentErr: context.Canceled, seedCtxErr: context.Canceled, seedErr: context.Canceled, wantOutcome: "deadline", wantCause: "canceled", wantLevel: slog.LevelWarn, wantDetector: 1},
+		{name: "deadline_canceled_seed_only", seedCtxErr: context.Canceled, wantOutcome: "deadline", wantCause: "canceled", wantLevel: slog.LevelWarn, wantDetector: 1},
+		{name: "boot_error", seedErr: boom, wantOutcome: "boot_error", wantLevel: slog.LevelWarn},
+		{name: "seed_panic", panicked: true, wantOutcome: "seed_panic", wantLevel: slog.LevelWarn},
+		{name: "seed_returned", wantOutcome: "seed_returned", wantLevel: slog.LevelInfo},
+		{name: "none_configured", noSeed: true, wantOutcome: "none-configured", wantLevel: slog.LevelInfo},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			resetExitWorld(t)
+			logs := captureExitLogs(t)
+			if r.fireLatch {
+				ensureFirstNavLatch().fire("segment-complete", 1, 1, "", -1, 0)
+			}
+			if r.noSeed {
+				RecordPhase1ReadinessExitNoSeed()
+			} else {
+				recordPhase1SeedExit(r.parentErr, r.seedCtxErr, r.seedErr, r.panicked, time.Second, noPhase1StepTimings())
+			}
+			ex := logs.exits()
+			if len(ex) != 1 {
+				t.Fatalf("want ONE readiness_exit line, got %d", len(ex))
+			}
+			if got := exitStr(t, ex[0], "outcome"); got != r.wantOutcome {
+				t.Errorf("outcome = %q, want %q", got, r.wantOutcome)
+			}
+			if got := exitStr(t, ex[0], "deadline_cause"); got != r.wantCause {
+				t.Errorf("deadline_cause = %q, want %q", got, r.wantCause)
+			}
+			if ex[0].level != r.wantLevel {
+				t.Errorf("level = %v, want %v", ex[0].level, r.wantLevel)
+			}
+			if got := Phase1DeadlineReleasedTotal(); got != r.wantDetector {
+				t.Errorf("snowplow_phase1_deadline_released_total = %d, want %d", got, r.wantDetector)
+			}
+			if got := Phase1ReadinessExitOutcome(); got != r.wantOutcome {
+				t.Errorf("Phase1ReadinessExitOutcome() = %q, want %q", got, r.wantOutcome)
+			}
+		})
+	}
+}
+
+// TestIssue397_X6_RealSeedPanic_SeedPanicAtWarn_ReadinessFlips — C1 panic arm.
+// A panicking seed drives the REAL phase1WarmupWith defer chain: recover →
+// readiness-exit record (outcome=seed_panic at WARN) → MarkPhase1Done.
+func TestIssue397_X6_RealSeedPanic_SeedPanicAtWarn_ReadinessFlips(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	rw := phase1TestWatcher(t)
+	resetExitWorld(t)
+	logs := captureExitLogs(t)
+
+	panicSeed := pipSeedFn(func(context.Context) error { panic("#397 X6: seed panic") })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := phase1WarmupWith(ctx, rw, exitNoRoots, exitNoResolve, nil, nil, panicSeed, nil); err != nil {
+		t.Fatalf("phase1WarmupWith must survive a panicking seed; got %v", err)
+	}
+	if !cache.IsPhase1Done() {
+		t.Fatal("readiness must still flip after a seed panic (C2 backstop unchanged)")
+	}
+	ex := logs.exits()
+	if len(ex) != 1 {
+		t.Fatalf("want ONE readiness_exit line, got %d", len(ex))
+	}
+	if got := exitStr(t, ex[0], "outcome"); got != "seed_panic" || ex[0].level != slog.LevelWarn {
+		t.Fatalf("outcome=%q level=%v, want seed_panic at WARN", got, ex[0].level)
+	}
+	if Phase1DeadlineReleasedTotal() != 0 {
+		t.Error("a seed panic is not a deadline release; the detector must stay 0")
+	}
+}
+
+// TestIssue397_X7_ClassifierPanicIsContained — C3. A panic inside the
+// classification step is swallowed by the recorder's own guard and cannot
+// escape into the seed block's defer chain.
+func TestIssue397_X7_ClassifierPanicIsContained(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	resetExitWorld(t)
+	_ = captureExitLogs(t)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("C3 RED: a classifier panic escaped the recorder: %v", r)
+		}
+	}()
+	recordPhase1ReadinessExitWith(func() (string, string) { panic("classifier boom") }, time.Second, noPhase1StepTimings())
+	if Phase1DeadlineReleasedTotal() != 0 {
+		t.Error("a contained classifier panic must not move the detector")
 	}
 }

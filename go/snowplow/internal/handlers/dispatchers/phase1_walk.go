@@ -918,8 +918,10 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			defer cache.MarkPhase1Done()
 			// #397: the readiness-exit record runs immediately BEFORE the flip
 			// (after the recover below), on every exit of this block.
-			// recordPhase1ReadinessExit swallows its own panics, so it cannot
-			// bypass the MarkPhase1Done defer. The ctx errors are captured the
+			// Classification and recording both run inside recordPhase1SeedExit's
+			// once + recover guard, so no panic from the instrumentation can
+			// escape this defer chain (MarkPhase1Done still runs last, as
+			// before). The ctx errors are captured the
 			// instant pipSeed returns — by the time this defer runs, the
 			// seedCancel defer has already cancelled seedCtx.
 			var (
@@ -930,9 +932,8 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			)
 			setPhase1Stage(phase1StageBootSeed)
 			defer func() {
-				outcome, cause := classifyPhase1SeedExit(parentErrAtExit, seedCtxErrAtExit, seedErr, seedPanicked)
 				steps.seed = time.Since(panicStart)
-				recordPhase1ReadinessExit(outcome, cause, time.Since(start), steps)
+				recordPhase1SeedExit(parentErrAtExit, seedCtxErrAtExit, seedErr, seedPanicked, time.Since(start), steps)
 			}()
 			defer func() {
 				if r := recover(); r != nil {
