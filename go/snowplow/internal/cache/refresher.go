@@ -354,6 +354,17 @@ type refresher struct {
 	// REFRESH_DROP_EVICT_MAX_PER_MINUTE; perMinute 0 means "never evict a
 	// non-404 deterministic failure" (today's drop-to-TTL, byte-for-byte).
 	dropEvict *dropEvictBreaker
+
+	// #386 M1 — streaming p95 of the REAL resolve latency: the registered
+	// re-resolve+Put handler fn() in processOne, timed ONLY on the ok=true path
+	// AFTER yieldToCustomer returns (so the dequeue, the customer-priority park,
+	// the skipped_no_entry/no_handler skips and the rate-floor defer never reach
+	// it). resolveLatencyMu serializes the P² estimator across the worker pool.
+	// The estimate is a DIAGNOSTIC sizing input (snowplow_resolve_latency_p95_ms,
+	// #384/#365), deliberately kept OUTSIDE the C7-tagged refresherStats family so
+	// it stays expvar-only — M1 is not an OTLP detector.
+	resolveLatencyMu sync.Mutex
+	resolveLatency   *p2Quantile
 }
 
 var (
@@ -398,6 +409,7 @@ func refresherSingleton() *refresher {
 			clusterListQueue: workqueue.NewTypedRateLimitingQueue[string](clRL),
 			handlers:         map[string]RefreshFunc{},
 			dropEvict:        newDropEvictBreaker(RefreshDropEvictMaxPerMinute()),
+			resolveLatency:   newP2Quantile(0.95),
 		})
 	})
 	return refresherInstance.Load()
@@ -1042,7 +1054,16 @@ func (r *refresher) processOne(ctx context.Context, key string, entry *ResolvedE
 		r.skippedNoHandler.Add(1)
 		return nil
 	}
-	if err := fn(ctx, key, *entry.Inputs); err != nil {
+	// #386 M1 — time the REAL resolve (the handler fn) ONLY. We are past every
+	// skip early-return and past yieldToCustomer (called in processNext before
+	// us), so this measures resolve+Put work exclusively — never the dequeue, the
+	// customer-priority park, the skipped_no_entry/no_handler skips, or the
+	// rate-floor defer. Recorded for success AND failure: a failed re-resolve
+	// still did the resolve work whose cost #384/#365 are sizing.
+	resolveStart := time.Now()
+	err := fn(ctx, key, *entry.Inputs)
+	r.recordResolveLatency(time.Since(resolveStart))
+	if err != nil {
 		slog.Warn("refresher.refresh_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("handler_kind", entry.Inputs.CacheEntryClass),
@@ -1118,6 +1139,37 @@ func refresherQueueDepth(r *refresher) int64 {
 		return 0
 	}
 	return int64(r.queue.Len())
+}
+
+// recordResolveLatency folds one REAL resolve's wall time into the p95 estimator
+// (#386 M1). Called once per fn() invocation in processOne — AFTER yieldToCustomer
+// returned and ONLY on the ok=true real-resolve path, so park, dequeue, the skips
+// and the rate-floor defer never reach it. Serialized across the worker pool.
+func (r *refresher) recordResolveLatency(d time.Duration) {
+	ms := float64(d) / float64(time.Millisecond)
+	r.resolveLatencyMu.Lock()
+	if r.resolveLatency != nil {
+		r.resolveLatency.Observe(ms)
+	}
+	r.resolveLatencyMu.Unlock()
+}
+
+// RefresherP95ResolveMS returns the current p95 of the refresher's REAL resolve
+// latency in milliseconds — 0 before the pool is built or before any real
+// resolve. DIAGNOSTIC sizing input (#386 M1 → #384/#365), published as the
+// expvar scalar snowplow_resolve_latency_p95_ms. Deliberately NOT an OTLP
+// detector and NOT in the C7-tagged refresherStats family.
+func RefresherP95ResolveMS() float64 {
+	r := refresherPeek()
+	if r == nil {
+		return 0
+	}
+	r.resolveLatencyMu.Lock()
+	defer r.resolveLatencyMu.Unlock()
+	if r.resolveLatency == nil {
+		return 0
+	}
+	return r.resolveLatency.Value()
 }
 
 // AddRefresherPoolCounterForTest bumps ONE pool counter by stat name so the

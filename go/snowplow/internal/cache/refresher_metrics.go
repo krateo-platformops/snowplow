@@ -56,7 +56,8 @@ func init() {
 }
 
 // registerRefresherMetrics performs the expvar.Publish calls for the
-// nine refresher observability keys. Guarded by refresherMetricsOnce
+// refresher observability keys (incl. the #386 M1 p95_resolve_ms scalar).
+// Guarded by refresherMetricsOnce
 // so it is safe to call from init() and from RegisterExpvarForTest.
 //
 // All values are expvar.Func — evaluated lazily at scrape time, so
@@ -93,6 +94,17 @@ func registerRefresherMetrics() {
 		expvar.Publish("snowplow_refresher_suppressed_set_total", refresherStatFunc("suppressed_set"))
 		expvar.Publish("snowplow_refresher_suppressed_skips_total", refresherStatFunc("suppressed_skips"))
 		expvar.Publish("snowplow_refresher_suppressed_keys", refresherStatFunc("suppressed_keys"))
+
+		// #386 M1 — p95 of the REAL resolve latency (ms). A STANDALONE expvar
+		// scalar, published OUTSIDE the snowplow_refresher_ family ON PURPOSE: that
+		// family is C7-tagged and auto-mirrored to OTLP, and a snowplow_refresher_-
+		// prefixed literal with no tagged source fails the C7 parity guard
+		// (c7_stats_parity_test.go). M1 is a DIAGNOSTIC sizing input (#384/#365) that
+		// stays expvar-only, so it gets its own name. expvar.Func is lazy — it reads
+		// the live P² estimate at scrape time.
+		expvar.Publish("snowplow_resolve_latency_p95_ms", expvar.Func(func() any {
+			return RefresherP95ResolveMS()
+		}))
 	})
 }
 
