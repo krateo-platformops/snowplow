@@ -351,6 +351,23 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #368: v7 wildcard digest-collision probe (the 4th dark detector). ---
+	shadowWildcardDigestCollision, err := m.Int64ObservableCounter("snowplow_v7_shadow_wildcard_digest_collision_total",
+		metric.WithDescription("#368 DETECTOR (zero-means-safe): shareable, UNGATED wildcard cells whose digest failed to distinguish two different-access identities (evaluator-truth) — a Step-3 share leak. ALERT on > 0. 0 today because every ClassWildcard is gated; certifies the real encoding once the enumerate projection ungates."))
+	if err != nil {
+		return err
+	}
+	shadowWildcardDigestObserved, err := m.Int64ObservableCounter("snowplow_v7_shadow_wildcard_digest_observed_total",
+		metric.WithDescription("#368 denominator: distinct (cell,digest) wildcard pairs observed with >=2 identities (shareable+ungated). Certified = collision_total == 0 over observed_total > 0; observed_total == 0 = not-yet-exercised, NOT certified."))
+	if err != nil {
+		return err
+	}
+	shadowWildcardDigestEvicted, err := m.Int64ObservableCounter("snowplow_v7_shadow_wildcard_digest_evicted_total",
+		metric.WithDescription("#368 cap-eviction counter: dropped (cell,digest) observations (LRU + identity/coord-cap truncations). A dropped observation could MISS a collision, so certification requires evicted_total == 0 too: certified = collision==0 AND observed>0 AND evicted==0. Non-zero → raise caps/shard and re-measure."))
+	if err != nil {
+		return err
+	}
+
 	// --- prewarm phase-1: apiRef pagination coverage ---
 	phase1UnitsPlanned, err := m.Int64ObservableGauge("snowplow_phase1_units_planned",
 		metric.WithDescription("widgetContent cells the apiRef pagination walk planned to seed."))
@@ -714,6 +731,12 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(prewarmEngProcessed, int64(engProc))
 		o.ObserveInt64(prewarmEngYield, int64(engYield))
 		o.ObserveInt64(prewarmEngPending, engPending)
+
+		// --- #368 wildcard digest-collision detector (hand-wired, #311) ---
+		wcCollision, wcObserved, wcEvicted := dispatchers.ShadowWildcardDigestCounts()
+		o.ObserveInt64(shadowWildcardDigestCollision, wcCollision)
+		o.ObserveInt64(shadowWildcardDigestObserved, wcObserved)
+		o.ObserveInt64(shadowWildcardDigestEvicted, wcEvicted)
 
 		// --- phase-1 pagination ---
 		planned, seeded, apiRefPages, eligibleNoCont := dispatchers.Phase1PaginationSnapshot()
