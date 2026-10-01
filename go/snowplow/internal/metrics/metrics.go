@@ -693,6 +693,20 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #386 M3 (PR2): resolve-path customer in-flight, as an OTLP CORRELATION
+	// gauge. The expvar twin snowplow_customer_resolve_inflight (PR1) is
+	// /debug/vars-only; this hand-wires it to ClickStack (no expvar->OTLP bridge),
+	// scalars-only. An Int64ObservableGauge (current count, up/down — like
+	// rbacSubGenSubjects), NOT a counter: it is a correlation signal
+	// (0 = no customers = healthy), NOT a fault detector. Reads the SAME atomic the
+	// refresher's customer-priority yield / #384 serveReserve key off.
+	customerResolveInflight, err := m.Int64ObservableGauge(
+		"snowplow_customer_resolve_inflight",
+		metric.WithDescription("Customer /call dispatches currently on the RESOLVE path (GET /call + POST /call/read reaching a restactions/widgets handler). CORRELATION gauge (0 = idle = healthy), NOT a detector. Excludes the direct-proxy Call()/CallRead() fallthrough, GET /list, and write verbs. #386 M3."))
+	if err != nil {
+		return err
+	}
+
 	// Single callback reading every snapshot at collection time.
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		o.ObserveInt64(fallthroughTotal, int64(cache.FallthroughTotal()))
@@ -749,6 +763,9 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(shadowWildcardDigestCollision, wcCollision)
 		o.ObserveInt64(shadowWildcardDigestObserved, wcObserved)
 		o.ObserveInt64(shadowWildcardDigestEvicted, wcEvicted)
+
+		// --- #386 M3 (PR2): resolve-path customer in-flight (correlation gauge) ---
+		o.ObserveInt64(customerResolveInflight, dispatchers.CustomerResolveInFlightCount())
 
 		// --- phase-1 pagination ---
 		planned, seeded, apiRefPages, eligibleNoCont := dispatchers.Phase1PaginationSnapshot()
@@ -963,6 +980,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- 1.12.4 ---
 		uafRestactionsDeclined, uafWidgetsDeclined, uafRAFullListBypass,
 		dispatchL1Cells, seedAttributableHits,
+		// --- #386 M3 (PR2) ---
+		customerResolveInflight,
 		fallthroughCells, diagnosticTotal, diagnosticCells, seriesTruncated,
 		readyzBackstop, resolvedCache, informerServable, buildInfo,
 		// --- 1.12.5 ---
