@@ -97,6 +97,9 @@ const (
 var nonCacheInitPublishers = map[string][]string{
 	// /readyz backstop: a readiness surface, meaningful with the cache off.
 	"internal/handlers/dispatchers/readiness_backstop_metrics.go": {"snowplow_readyz_backstop_fired"},
+	// #397 phase-1 readiness-exit detector: same readiness surface (a pod's
+	// Ready release is meaningful with the cache off — the none-configured exit).
+	"internal/handlers/dispatchers/phase1_readiness_exit.go": {"snowplow_phase1_deadline_released_total"},
 	// #288 malformed-dial guard: a RESOLVER-path (restactions/api) dial guard, NOT
 	// a cache surface — it runs on every RESTAction resolve regardless of cache
 	// mode (incl. cache-off transparent-fallback), so a malformed-dial skip must

@@ -572,6 +572,17 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #397: phase-1 deadline-release DETECTOR. 0 or 1 per process: 1 iff
+	// readiness was released by the seed ctx / PHASE1_TIMEOUT deadline before
+	// the first-nav latch fired (prewarm.phase1.readiness_exit outcome=deadline).
+	// Hand-wired: there is no expvar->OTLP bridge.
+	phase1DeadlineReleased, err := m.Int64ObservableCounter(
+		"snowplow_phase1_deadline_released_total",
+		metric.WithDescription("1 iff this process's /readyz was released by the boot-seed / PHASE1_TIMEOUT deadline before the first-nav latch fired (nav widgets still unseeded at Ready); 0 on a latch-released boot. Healthy = 0. #397."))
+	if err != nil {
+		return err
+	}
+
 	// --- L1 store occupancy + lifetime, keyed by stat. Computed by
 	// Stats() every N seconds since forever and emitted only into an
 	// INFO line the production LOG_LEVEL=warn discards.
@@ -880,6 +891,8 @@ func registerInstruments(m metric.Meter, build string) error {
 
 		// --- 1.12.4: boot SLI ---
 		o.ObserveInt64(readyzBackstop, dispatchers.ReadinessBackstopFired())
+		// --- #397: phase-1 deadline-release detector ---
+		o.ObserveInt64(phase1DeadlineReleased, dispatchers.Phase1DeadlineReleasedTotal())
 
 		// --- 1.12.4: L1 store occupancy + lifetime ---
 		for stat, v := range cache.ResolvedCacheStatsByStat() {
@@ -983,7 +996,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- #386 M3 (PR2) ---
 		customerResolveInflight,
 		fallthroughCells, diagnosticTotal, diagnosticCells, seriesTruncated,
-		readyzBackstop, resolvedCache, informerServable, buildInfo,
+		readyzBackstop, phase1DeadlineReleased, resolvedCache, informerServable, buildInfo,
 		// --- 1.12.5 ---
 		depsStats, informerFreshness,
 		// --- #233 ---

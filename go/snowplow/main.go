@@ -964,7 +964,9 @@ func main() {
 								slog.String("rationale", "prewarm is implicit-on-cache (#57); the cache-off no-op flips Phase1Done via the readiness safety-net"),
 							)
 							// Nothing to warm — flip the readiness gate now
-							// so /readyz is an immediate-200 no-op.
+							// so /readyz is an immediate-200 no-op. #397:
+							// record the none-configured readiness exit first.
+							dispatchers.RecordPhase1ReadinessExitNoSeed()
 							cache.MarkPhase1Done()
 						}
 					}
@@ -1042,6 +1044,8 @@ func main() {
 		cache.PrewarmEnabled(),
 		cacheWatcher == nil,
 	) {
+		// #397: nothing to warm — record the none-configured readiness exit.
+		dispatchers.RecordPhase1ReadinessExitNoSeed()
 		cache.MarkPhase1Done()
 	}
 
