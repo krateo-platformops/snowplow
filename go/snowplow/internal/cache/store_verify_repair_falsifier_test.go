@@ -571,13 +571,25 @@ func TestForcedPass_RepairsTheStore_NotJustL1(t *testing.T) {
 		// very thing informer_watch_stats.go warns against, so the fixture
 		// cannot assert it and says so instead of asserting something weaker
 		// under the same name.
-		if !sawEventType(logs, "STORE_REPAIR") {
-			t.Errorf("no cache_event.consumed carried type=STORE_REPAIR; the repair's dirty-mark did "+
-				"not name its own cause. Records seen: %v", eventTypes(logs))
+		//
+		// #380: both assertions are SCOPED to repairGVR (the capture is
+		// process-global), and the negative one runs only after the post-sync
+		// re-fire has happened. Asserted any earlier it checks a fire that
+		// has not run yet, which is how a hardcoded SCHEMA_RELIST in that
+		// re-fire passed here most of the time. The wait is on the
+		// label-agnostic #239 type-path total of THIS test's tracker
+		// (pre-sync fire + re-fire, one dependent cell = 2).
+		d := Deps()
+		waitForVerify(t, "the repair's post-sync dirty-mark re-fire", verifyBound, func() bool {
+			return typeMarksAnyCause(d) >= 2
+		})
+		if countEventTypeForGVR(logs, "STORE_REPAIR", repairGVR) == 0 {
+			t.Errorf("no cache_event.consumed for %s carried type=STORE_REPAIR; the repair's dirty-mark did "+
+				"not name its own cause. Records seen: %v", repairGVR, eventTypes(logs))
 		}
-		if sawEventType(logs, "SCHEMA_RELIST") {
-			t.Errorf("the store repair logged itself as SCHEMA_RELIST — an instrument naming the " +
-				"wrong cause, which is the defect class #237 is about")
+		if n := countEventTypeForGVR(logs, "SCHEMA_RELIST", repairGVR); n != 0 {
+			t.Errorf("the store repair logged %d SCHEMA_RELIST record(s) for %s — an instrument naming the "+
+				"wrong cause, which is the defect class #237 is about", n, repairGVR)
 		}
 
 		// 3. THE STORE. This is the assertion B-1 was about.
@@ -893,6 +905,7 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 type cacheEventLog struct {
 	mu    sync.Mutex
 	types []string
+	gvrs  []string // the gvr attr of each record, index-aligned with types (#380)
 }
 
 type cacheEventHandler struct {
@@ -902,15 +915,22 @@ type cacheEventHandler struct {
 
 func (h *cacheEventHandler) Handle(ctx context.Context, r slog.Record) error {
 	if r.Message == "cache_event.consumed" {
+		var typ, gvr string
 		r.Attrs(func(a slog.Attr) bool {
-			if a.Key == "type" {
-				h.log.mu.Lock()
-				h.log.types = append(h.log.types, a.Value.String())
-				h.log.mu.Unlock()
-				return false
+			switch a.Key {
+			case "type":
+				typ = a.Value.String()
+			case "gvr":
+				gvr = a.Value.String()
 			}
 			return true
 		})
+		if typ != "" {
+			h.log.mu.Lock()
+			h.log.types = append(h.log.types, typ)
+			h.log.gvrs = append(h.log.gvrs, gvr)
+			h.log.mu.Unlock()
+		}
 	}
 	return nil
 }
@@ -928,15 +948,20 @@ func captureCacheEvents(t *testing.T) *cacheEventLog {
 	return log
 }
 
-func sawEventType(l *cacheEventLog, want string) bool {
+// countEventTypeForGVR counts the records of one type for ONE GVR (#380). The
+// capture swaps the process-global slog default, so it also sees records from
+// goroutines other tests left running; a negative assertion over the whole
+// stream can be tripped by a relist that has nothing to do with the arm.
+func countEventTypeForGVR(l *cacheEventLog, want string, gvr schema.GroupVersionResource) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for _, got := range l.types {
-		if got == want {
-			return true
+	g, n := gvr.String(), 0
+	for i, got := range l.types {
+		if got == want && l.gvrs[i] == g {
+			n++
 		}
 	}
-	return false
+	return n
 }
 
 func eventTypes(l *cacheEventLog) []string {
