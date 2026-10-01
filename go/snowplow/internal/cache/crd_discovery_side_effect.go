@@ -859,7 +859,7 @@ func (c *crdDiscovery) relistGVRForRepair(
 	// exactly that). Capturing also makes the goroutine's dependency
 	// explicit rather than ambient.
 	c.workerWG.Add(1)
-	go c.refireRelistDirtyMarkAfterSync(Deps(), gvr, syncCh)
+	go c.refireRelistDirtyMarkAfterSync(Deps(), gvr, dirtyMark, syncCh)
 	// 1.12.6 C2 — the delta bridge (relist_bridge.go). ADDITIVE to the
 	// re-fire above (PM condition C10): the re-fire stays until the bridge
 	// has soaked with relist_bridge_timeout_total at zero. Same goroutine
@@ -969,12 +969,24 @@ const relistPostSyncWait = 2 * time.Minute
 // dirty-mark. See the call site for why the single pre-sync fire is not
 // enough.
 //
+// dirtyMark is the CALLER's dep-tracker cause, the same function the pre-sync
+// fire in relistGVRForRepair used (#380). Before #380 this re-fire hardcoded
+// OnResourceTypeSchemaRelisted, so a store repair's post-sync re-mark logged
+// cache_event.consumed type=SCHEMA_RELIST and landed in the schema_relist #239
+// bucket: the #237 wrong-cause defect, reintroduced inside the shared relist
+// mechanism. Both fires of one relist now carry one label.
+//
 // Runs on its own goroutine: the relist loop executes on the single
 // CRD-lifecycle worker, and blocking there would stall every other CRD
 // event. Panic-guarded for the same reason every other handler here is —
 // a goroutine panic takes the process down, and this one is spawned from
 // an informer-driven path.
-func (c *crdDiscovery) refireRelistDirtyMarkAfterSync(d *DepTracker, gvr schema.GroupVersionResource, syncCh <-chan struct{}) {
+func (c *crdDiscovery) refireRelistDirtyMarkAfterSync(
+	d *DepTracker,
+	gvr schema.GroupVersionResource,
+	dirtyMark func(*DepTracker, schema.GroupVersionResource) int,
+	syncCh <-chan struct{},
+) {
 	defer c.workerWG.Done()
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -1021,7 +1033,7 @@ func (c *crdDiscovery) refireRelistDirtyMarkAfterSync(d *DepTracker, gvr schema.
 		return
 	default:
 	}
-	d.OnResourceTypeSchemaRelisted(gvr)
+	dirtyMark(d, gvr) // the caller's cause label, as the pre-sync fire (#380)
 	c.relistDirtyMarkPostSync.Add(1)
 	slog.Info("cache.crd_discovery.relist_postsync.dirty_marked",
 		slog.String("subsystem", "cache"),
