@@ -444,13 +444,14 @@ as one.
 | `events_enqueued`, `events_processed` | CRD lifecycle events (ADD/UPDATE/DELETE) enqueued to / processed by the single discovery worker | processed tracks enqueued |
 | `events_parked` | **1.12.5.** submits that had to wait on a full queue (the worker fell 256 events behind; the informer processor goroutine parks up to 30 s) | 0 on a stable cluster; bursts during a bulk CRD install |
 | `events_dropped` | lifecycle events dropped after the park deadline — the last resort. A dropped DELETE means an informer is never torn down and its dependent L1 entries stay resident until TTL | **0** |
-| `discovery_invoked` | ADD/UPDATE passes that ran `DiscoverGroupResources` | tracks CRD churn |
+| `discovery_invoked` | ADD/UPDATE passes that ran `DiscoverGroupResources` (**#218:** only when the schema OR discovery-identity fingerprint changed — no longer on an idle ~9.5min re-list) | tracks real CRD churn; **flat** across idle re-lists |
 | `discovery_skipped_ng` | ADD/UPDATE decode-skip / no-group / no-SA-rc | **0** — a non-zero value is the silent-skip defect class |
 | `deletes_processed` | successful DELETE teardowns (informer removed, dependents dirty-marked) | tracks CRD deletions |
 | `delete_skipped_ng` | DELETE decode-skip / no-served-versions / no-plural | **0** |
 | `panics_recovered` | discovery passes that panicked (recovered; the worker survives) | **0** |
 | `schema_relists_fired` | ADD/UPDATE passes that relisted ≥1 GVR on a detected structural-schema change | tracks CRD schema churn |
 | `schema_unchanged` | ADD/UPDATE where the schema fingerprint was unchanged (thrash guard; no relist) | informational |
+| `crd_discovery_noop` | **#218.** ADD/UPDATE where NEITHER the schema nor the discovery-identity fingerprint (`spec.group`/`names`/`scope`/per-version `served`,`storage`,`deprecated`,status/scale subresource) changed → no discovery memcache wipe, no SA `RESTMapper` rebuild, no schema-memo reset ran (the ~9.5min idle CRD re-list amplifier removed) | climbs ~1 per CRD per reflector re-list at steady state — that rising count IS the healthy signal the amplifier is gone, paired with a flat `discovery_invoked` |
 | `stale_version_pruned_total` | **1.12.7 F2 (#219).** per-GVR state (informer, sync channel, confirmation, watch-broken, last-sync RV, dep edges) torn down because the CRD stopped serving that version — the informer is **stopped**, not merely forgotten | non-zero is **normal** on a cluster that upgrades components: every upgrade mints a new API version and retires the previous one. Read it against `watch_broken`, which before 1.12.7 climbed monotonically (measured 4 → 40 over 24 h on krateo-057, zero decreases) because retired versions were never pruned |
 | `relist_dirtymark_postsync_total` | **1.12.5.** post-sync re-fires of the relist dirty-mark (the containment for the teardown window; stays until the bridge below has soaked) | tracks `schema_relists_fired`; lagging it = relisted informers are not syncing |
 | `relist_postsync_timeout_total` | **1.12.5.** relisted GVRs whose new informer did not sync in time (the re-fire could not run) | **0** |

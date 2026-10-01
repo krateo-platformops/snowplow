@@ -142,6 +142,15 @@ type crdDiscovery struct {
 	schemaFingerprints sync.Map      // map[string]string (CRD name → schema fingerprint)
 	schemaRelistsFired atomic.Uint64 // relist passes that tore down >=1 GVR on a detected schema change
 	schemaUnchanged    atomic.Uint64 // ADD/UPDATE where the schema fingerprint was unchanged (no relist — thrash guard hit)
+	// #218 — discovery-identity fingerprint (spec.group / names / scope /
+	// per-version {served,storage,deprecated,status/scale subresource}): the served-GVR SHAPE the global
+	// discovery memcache (:519) and the SA CachedDiscoveryClient→RESTMapper
+	// (:534) are built from — NOT the schema (that's schemaFingerprints). Gates
+	// the two discovery invalidations on the fail-safe union (schema OR discovery
+	// changed) so an idle ~9.5min CRD re-list (UpdateFunc Sync, ResyncPeriod:0)
+	// re-pays neither. Same single-worker-serialised sync.Map discipline.
+	discoveryFingerprints sync.Map      // map[string]string (CRD name → discovery-identity fingerprint)
+	crdDiscoveryNoop      atomic.Uint64 // ADD/UPDATE where NEITHER fingerprint changed → full no-op (the amplifier removed)
 	// 1.12.7 F2 / #219 — per-GVR state torn down because the CRD stopped
 	// serving that version. Non-zero is NORMAL on a cluster that upgrades
 	// components (every upgrade mints a new API version and retires the
@@ -501,45 +510,55 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 		return
 	}
 
-	c.discoveryInvoked.Add(1)
+	// #218 — TWO-FINGERPRINT GATE. Before #218 the three invalidations below
+	// fired UNCONDITIONALLY on every ADD/UPDATE, including the ~9.5min idle
+	// re-list (UpdateFunc Sync, ResyncPeriod:0) → a cluster-wide discovery wipe +
+	// schema recompile every 9.5min per CRD. Gate them on what actually changed:
+	// the compare makes an ADD (no prior fp) and a real change fire, while an
+	// idle re-list trips NEITHER → full no-op. Fail-safe: an unreadable fp reads
+	// as CHANGED (invalidate, never leave a cache stale).
+	//
+	// The discovery pair (:519 memcache + :534 SA discovery/RESTMapper) fires on
+	// the UNION (schema OR discovery changed): both wipe SHARED caches holding
+	// discovery AND OpenAPI, so a schema change may invalidate their OpenAPI too —
+	// fire on either (over-invalidate on a rare real schema change, never toward
+	// staleness). The schema memo (:542) fires on schema alone.
+	// schemaFingerprintChanged is LOAD-ONLY so triggerCRDSchemaRelist below
+	// decides its relist against the SAME prior schema fingerprint.
+	name := u.GetName()
+	schemaChanged := c.schemaFingerprintChanged(name, crdSchemaFingerprint(u))
+	discoveryChanged := c.discoveryFingerprintChangedAndStore(name, crdDiscoveryFingerprint(u))
 
-	// Fire-and-forget discovery hop. DiscoverGroupResources is
-	// per-group singleflighted (discovery_lookup.go:228-232) and
-	// idempotent (EnsureResourceType is itself singleflighted via
-	// rw.mu). Soft-fails on apiserver errors (warn-logged inside
-	// DiscoverGroupResources at discovery_lookup.go:255-258 +
-	// :270-275).
-	ctx := context.Background()
-	// Fix A2 — the CRD-event path MUST force-fresh: Invalidate the cached
-	// discovery surface (a GLOBAL memcache wipe — all groups) and re-read
-	// the apiserver BEFORE the registration walk, so a CREATE/UPDATE never
-	// registers against a stale cached read (the S4/F-4 stuck-zero
-	// regression class). The hot /call walker keeps the cached/short-
-	// circuit DiscoverGroupResources.
-	if _, derr := DiscoverGroupResourcesFresh(ctx, saRC, group); derr != nil {
-		slog.Warn("cache.crd_discovery.discover_group_failed",
-			slog.String("subsystem", "cache"),
-			slog.String("group", group),
-			slog.Any("err", derr),
-		)
+	if schemaChanged || discoveryChanged {
+		c.discoveryInvoked.Add(1)
+		// Fix A2 — force-fresh: GLOBAL discovery memcache wipe + apiserver
+		// re-read before the registration walk, so a CREATE/UPDATE never
+		// registers against a stale cached read (S4/F-4 stuck-zero class).
+		ctx := context.Background()
+		if _, derr := DiscoverGroupResourcesFresh(ctx, saRC, group); derr != nil {
+			slog.Warn("cache.crd_discovery.discover_group_failed",
+				slog.String("subsystem", "cache"),
+				slog.String("group", group),
+				slog.Any("err", derr),
+			)
+		}
+		// #322/#318-R2 — invalidate the SA cached discovery client AFTER
+		// discovery (F-4 ordering), so the next ValidateObjectStatus rebuilds the
+		// RESTMapper against the new served-GVR shape. Soft no-op when unwired.
+		invalidateSADiscovery()
 	}
-
-	// Task #322 (#318-R2) Commit 1 — invalidate the SA-singleton cached
-	// discovery client AFTER DiscoverGroupResources, so the next
-	// ValidateObjectStatus for the new/changed GVR rebuilds the mapper
-	// and sees the new CRD's schema. STRICTLY ordered after discovery
-	// (F-4 safety): a stale discovery cache cannot persist past this CRD
-	// ADD/UPDATE. Soft no-op when the dynamic singleton is unwired
-	// (discovery_invalidation_hook.go).
-	invalidateSADiscovery()
-
-	// Task #323 (#318-R2 Commit 2-B) — reset the per-GVR compiled-CRD-schema
-	// memo (crds/schema) in lockstep with the discovery cache, AFTER
-	// DiscoverGroupResources, so the next ValidateObjectStatus for the
-	// new/changed GVR recompiles from fresh CRD bytes (a CRD UPDATE that
-	// changes the schema MUST invalidate; this is that path). Soft no-op when
-	// the schema-memo invalidator is unwired (discovery_invalidation_hook.go).
-	invalidateCRDSchemaMemo()
+	if schemaChanged {
+		// #323/#318-R2 — reset the compiled-CRD-schema validation memo so the
+		// next ValidateObjectStatus recompiles from fresh CRD bytes. Soft no-op
+		// when unwired.
+		invalidateCRDSchemaMemo()
+	}
+	if !schemaChanged && !discoveryChanged {
+		// The idle re-list this fix exists for: neither the schema nor the
+		// served-GVR shape moved, so nothing is invalidated. Counted so the
+		// amplifier's removal is measurable on /debug/vars.
+		c.crdDiscoveryNoop.Add(1)
+	}
 
 	// followup-crd-schema-widen-informer-relist — the invalidators above
 	// refresh the DISCOVERY client + the compiled-schema VALIDATION memo, but
@@ -1067,6 +1086,12 @@ func triggerCRDDelete(obj interface{}) {
 		return
 	}
 
+	// #218 — drop this CRD's fingerprints so a delete+recreate re-fires the
+	// discovery/schema invalidations. A recreate reusing the identical spec would
+	// otherwise match the stale fingerprint and no-op, leaving the discovery cache
+	// / RESTMapper without the recreated GVR.
+	c.dropCRDFingerprints(u.GetName())
+
 	group, _, _ := unstructured.NestedString(u.Object, "spec", "group")
 	plural, _, _ := unstructured.NestedString(u.Object, "spec", "names", "plural")
 	if group == "" || plural == "" {
@@ -1204,6 +1229,7 @@ type CRDDiscoveryStats struct {
 	// followup-crd-schema-widen-informer-relist
 	SchemaRelistsFired uint64 `stat:"schema_relists_fired"` // ADD/UPDATE passes that relisted >=1 GVR on a detected structural-schema change
 	SchemaUnchanged    uint64 `stat:"schema_unchanged"`     // ADD/UPDATE where the schema fingerprint was unchanged (thrash guard hit; no relist)
+	CRDDiscoveryNoop   uint64 `stat:"crd_discovery_noop"`   // #218 ADD/UPDATE where NEITHER the schema nor the discovery-identity fingerprint changed → nothing invalidated (the ~9.5min re-list amplifier removed; climbs ~1/CRD/re-list at steady state)
 	// 1.12.7 F2 / #219
 	StaleVersionPruned uint64 `stat:"stale_version_pruned_total"` // per-GVR state torn down because the CRD stopped serving that version
 
@@ -1245,6 +1271,7 @@ func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
 		PanicsRecovered:    c.panicsRecovered.Load(),
 		SchemaRelistsFired: c.schemaRelistsFired.Load(),
 		SchemaUnchanged:    c.schemaUnchanged.Load(),
+		CRDDiscoveryNoop:   c.crdDiscoveryNoop.Load(),
 		StaleVersionPruned: c.staleVersionPruned.Load(),
 
 		RelistDirtyMarkPostSync: c.relistDirtyMarkPostSync.Load(),
