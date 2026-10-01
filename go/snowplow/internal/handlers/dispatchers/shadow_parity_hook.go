@@ -113,6 +113,10 @@ var shadowMetricsOnce sync.Once
 func registerShadowParityMetrics() {
 	shadowMetricsOnce.Do(func() {
 		expvar.Publish("snowplow_v7_shadow_parity", expvar.Func(func() any {
+			// Cache-only measurement counters (gated off cache-off). The toggle
+			// STATE/SOURCE is published separately + UNGATED in
+			// shadow_parity_toggle_metrics.go (#367) so a latency window can read it
+			// regardless of CACHE_ENABLED.
 			return map[string]uint64{
 				"checks_total":                         shadowChecksTotal.Load(),
 				"checks_allow_total":                   shadowChecksAllowTotal.Load(),

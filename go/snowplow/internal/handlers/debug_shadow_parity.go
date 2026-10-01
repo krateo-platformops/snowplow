@@ -26,11 +26,16 @@ type shadowParityBody struct {
 // the cache subsystem flag (unlike /debug/store, it has nothing to read from the
 // informer store).
 //
-// PROCESS-LOCAL (per-pod). The toggle it reports is a process-local atomic with
-// no env/config backing (rbac/shadow_hook.go): each pod carries its own state
-// and a restart resets it to default-off. A measurement that toggles this MUST
+// PROCESS-LOCAL (per-pod). The toggle it reports is a process-local atomic
+// (rbac/shadow_hook.go): each pod carries its own state. A restart resets it to
+// its BOOT value — default-off, or on if SHADOW_PARITY_ENABLED is set for the pod
+// (#367). A measurement that FLIPS this at runtime via the POST sibling MUST
 // therefore pin to a single pod — a multi-pod Deployment would report and flip
-// whichever replica the request happened to land on (#272 acceptance C4).
+// whichever replica the request happened to land on (#272 acceptance C4); the env
+// backing, by contrast, applies uniformly to every replica at boot. The effective
+// state + source is published on /debug/vars (snowplow_v7_shadow_parity{enabled,
+// source}) so a latency-acceptance window can ASSERT enabled==0 instead of trusting
+// the default (#367).
 //
 // GATE. Mounted behind the SAME authn-only /debug gate as its siblings
 // (debug_routes.go, middleware.RefreshAuth). That gate is authn-only: any valid

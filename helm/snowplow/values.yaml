@@ -233,6 +233,14 @@ env:
   # Lower GOGC (default 100) trades ~1% CPU for tighter memory headroom.
   GOGC: "50"
   CACHE_ENABLED: "true"
+  # #367 — boot-time backing for the DARK v7 shadow-parity measurement. DEFAULT
+  # OFF: leave "false" for normal operation and for any latency-acceptance window.
+  # Set "true" ONLY for a v7 measurement window (#254/#290): a fresh pod then boots
+  # with the dark parity measurement ON so the boot-walk populate arm is reachable
+  # (the boot seed walk runs during readyz, before any POST could flip the toggle).
+  # DARK — changes no verdict, served byte or cache key; adds per-EvaluateRBAC
+  # measurement overhead while on. POST /debug/shadow-parity still overrides at runtime.
+  SHADOW_PARITY_ENABLED: "false"
   # Structured single-line JSON logs in production. The default pretty
   # (ANSI, multi-line, synchronous-stderr) handler measured ~7,355
   # lines/sec on krateo-enterprise and is a steady-state CPU/I/O drag; set

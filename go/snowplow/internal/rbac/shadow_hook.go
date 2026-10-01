@@ -13,11 +13,20 @@
 // init; package rbac calls it through the pointer. nil until registered.
 //
 // DARK-SAFETY (design §4.1, PM condition 1/2/3):
-//   - shadowParityEnabled is the observability TOGGLE. DEFAULT-OFF. It is a
-//     process-local runtime flag with NO env/config backing, so a fresh pod
-//     always starts with it off — it is structurally unable to persist into a
-//     latency-acceptance window (which runs on fresh pods). It is NOT a behavior
-//     knob: it gates ONLY the dark measurement, never a verdict / byte / key.
+//   - shadowParityEnabled is the observability TOGGLE. DEFAULT-OFF. It has
+//     boot-time env backing (SHADOW_PARITY_ENABLED, default off — shadow_parity_env.go,
+//     #367) plus the runtime POST /debug/shadow-parity override. A pod with the env
+//     UNSET still starts off (byte-identical to the pre-#367 default); the env only
+//     lets a MEASUREMENT window opt a fresh pod into the dark walk at boot, so the
+//     boot-walk populate arm (unreachable before #367 — the boot seed walk runs
+//     during readyz, before any POST could flip the toggle) becomes reachable. The
+//     cost of that reachability: with the env SET a fresh pod boots with the dark
+//     measurement ON, so a LATENCY-acceptance window must run with the env UNSET
+//     (chart default-off) and can ASSERT that via /debug/vars
+//     snowplow_v7_shadow_parity{enabled==0,source} rather than trust the default
+//     (#367 — the guarantee is now OPERATIONAL + DETECTABLE, not structural). It is
+//     NOT a behavior knob: it gates ONLY the dark measurement, never a verdict /
+//     byte / key.
 //   - The hook fires only when snap != nil && err == nil (see the EvaluateRBAC
 //     defer), i.e. on memo-hit permits and walk permit/deny — never on
 //     cache-off / nil-snap / error.
@@ -46,9 +55,11 @@ type ShadowHookFunc func(ctx context.Context, snap *cache.RBACSnapshot, opts Eva
 var shadowHook atomic.Pointer[ShadowHookFunc]
 
 // shadowParityEnabled is the observability toggle for the dark shadow-parity
-// subsystem. DEFAULT-OFF (atomic.Bool zero value). See the file header for why
-// it cannot persist into a latency-acceptance window and why it is not a
-// behavior knob.
+// subsystem. DEFAULT-OFF (atomic.Bool zero value); seeded at boot from
+// SHADOW_PARITY_ENABLED (shadow_parity_env.go, #367) and flippable at runtime via
+// POST /debug/shadow-parity. See the file header for the env-backing safety note
+// (keep it UNSET during a latency-acceptance window) and why it is not a behavior
+// knob.
 var shadowParityEnabled atomic.Bool
 
 // SetShadowHook registers (or, with nil, clears) the dark shadow-parity hook.
@@ -62,9 +73,14 @@ func SetShadowHook(fn ShadowHookFunc) {
 	shadowHook.Store(&fn)
 }
 
-// SetShadowParityEnabled turns the dark shadow-parity measurement on/off. An
-// observability control calls this; it gates nothing that changes behavior.
-func SetShadowParityEnabled(on bool) { shadowParityEnabled.Store(on) }
+// SetShadowParityEnabled turns the dark shadow-parity measurement on/off at
+// RUNTIME (the POST /debug/shadow-parity handler). It records the toggle source as
+// "runtime-post" for the /debug/vars detectability scalar (#367). It gates nothing
+// that changes behavior.
+func SetShadowParityEnabled(on bool) {
+	shadowParityEnabled.Store(on)
+	setShadowParitySource(shadowParitySourceRuntimePost)
+}
 
 // ShadowParityEnabled reports whether the dark shadow-parity toggle is on. The
 // dispatcher entry reads it to decide whether to install the (otherwise wasted)
