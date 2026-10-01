@@ -335,7 +335,7 @@ func TestC1Smoke_SubstratePlumbing(t *testing.T) {
 	c1RegisterRealisticRefresh(c, meter, sizeOf, 1.0)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer func() { cancel(); resetRefresherForTest() }() // harness teardown-race fix (#366): stop+wait refresher (resetRefresherForTest waits the worker WaitGroup) before the cache reset — processNext calls ResolvedCache() sync.Once
 	StartRefresher(ctx)
 
 	before := c1Capture(c)
