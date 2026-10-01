@@ -371,6 +371,10 @@ func populateClusterListCellSync(
 	// resolve. PutIfGen (not ReplaceIfGen): BOTH callers (dispatch cold-miss +
 	// prewarm) are legitimate FIRST-fills, so an insert-on-absent must succeed.
 	contentGen0 := apistageStore.CaptureGen(contentKey)
+	// #375 (A) — the collapse cell's OWN resolve entry: CHILD dep-gen sink installed
+	// BEFORE the defensive dispatch, pre-declaring the cell's cluster-wide LIST coordinate
+	// (Recorded only after the accepted Put below). See apistageContentServe.
+	ctx = cache.WithContentDepGenSink(ctx, gvr, "", "")
 
 	pipSink := cache.PIPStageTimingSinkFrom(ctx)
 	dispatchStart := time.Now()
@@ -454,7 +458,7 @@ func populateClusterListCellSync(
 	// during the defensive resolve. On refusal the populate DECLINES — the caller
 	// degrades (per-NS fallback / log-only), same as any other populate failure —
 	// and the dep-Record + tier-key registration are skipped (no cell to track).
-	if !apistageStore.PutIfGen(contentKey, newEntry, contentGen0) {
+	if !apistageStore.PutIfGen(ctx, contentKey, newEntry, contentGen0) {
 		log.Debug("cluster_list.populate_refused_gen_moved",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
@@ -463,7 +467,7 @@ func populateClusterListCellSync(
 		)
 		return false
 	}
-	cache.Deps().RecordList(contentKey, gvr, "")
+	cache.Deps().RecordList(ctx, contentKey, gvr, "")
 	defensivePutMs := time.Since(putStart).Milliseconds()
 
 	// Path 3.2 / 0.30.218 — register the populated cell as a

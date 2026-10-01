@@ -108,7 +108,7 @@ func TestIssue216_DegradedConfirmed404_ForgetsHarvestAndStopsSeedReplay(t *testi
 		RawJSON: []byte(`{"stale":"deleted-content"}`),
 		Inputs:  &del,
 	})
-	cache.Deps().Record(delKey, i187GVR(), i187NS, i187Name) // the self dep edge
+	cache.Deps().Record(context.Background(), delKey, i187GVR(), i187NS, i187Name) // the self dep edge
 
 	// Harvest BOTH the deleted coordinate and a LIVE one (dashboard-flex, the CR
 	// buildFixCWatcher seeds). The live one is the over-forget guard AND the proof
@@ -232,7 +232,7 @@ func TestIssue216_DropPointNon404_DoesNotForgetHarvest(t *testing.T) {
 	}
 	key := cache.ComputeKey(in)
 	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"outage-not-deletion"}`), Inputs: &in})
-	cache.Deps().Record(key, i187GVR(), i187NS, i187Name)
+	cache.Deps().Record(context.Background(), key, i187GVR(), i187NS, i187Name)
 
 	nav := newNavWidgetHarvester()
 	i216HarvestFlex(nav, i187NS, i187Name)

@@ -296,7 +296,7 @@ func i187Fixture(t *testing.T, srv *i187APIServer, typeRegistered bool) (store *
 		Inputs:  &inputs,
 	})
 	// The self dep edge a cold dispatch records (deps_extract.go).
-	cache.Deps().Record(key, i187GVR(), i187NS, i187Name)
+	cache.Deps().Record(context.Background(), key, i187GVR(), i187NS, i187Name)
 
 	saEP = &endpoints.Endpoint{ServerURL: srv.URL}
 	saRC = &rest.Config{Host: srv.URL}

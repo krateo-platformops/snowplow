@@ -35,6 +35,7 @@
 package dispatchers
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"time"
@@ -70,8 +71,8 @@ var restActionGVR = schema.GroupVersionResource{
 // signature is untouched; production never reassigns it.
 //
 // Idiom-match: resolveOnceFn / paginationFetchPageFn in this package.
-var recordListDepFn = func(deps *cache.DepTracker, l1Key string, gvr schema.GroupVersionResource, namespace string) {
-	deps.RecordList(l1Key, gvr, namespace)
+var recordListDepFn = func(ctx context.Context, deps *cache.DepTracker, l1Key string, gvr schema.GroupVersionResource, namespace string) {
+	deps.RecordList(ctx, l1Key, gvr, namespace)
 }
 
 // recordWidgetDeps walks the resolved widget object and records dep
@@ -93,7 +94,7 @@ var recordListDepFn = func(deps *cache.DepTracker, l1Key string, gvr schema.Grou
 //
 // Returns nil to allow chaining; counters track failures via the dep
 // tracker's Stats.
-func recordWidgetDeps(log *slog.Logger, l1Key string, gvr schema.GroupVersionResource, w *unstructured.Unstructured) {
+func recordWidgetDeps(ctx context.Context, log *slog.Logger, l1Key string, gvr schema.GroupVersionResource, w *unstructured.Unstructured) {
 	if l1Key == "" || w == nil {
 		return
 	}
@@ -110,12 +111,12 @@ func recordWidgetDeps(log *slog.Logger, l1Key string, gvr schema.GroupVersionRes
 	// singleflight under rw.mu; concurrent first-readers share a
 	// single informer.
 	ensureWatcherInformerForGVR(gvr)
-	deps.Record(l1Key, gvr, w.GetNamespace(), w.GetName())
+	deps.Record(ctx, l1Key, gvr, w.GetNamespace(), w.GetName())
 
 	// Edge type 2: spec.apiRef → RestAction.
 	if apiRefName, apiRefNS, ok := readApiRef(w); ok {
 		ensureWatcherInformerForGVR(restActionGVR)
-		deps.Record(l1Key, restActionGVR, apiRefNS, apiRefName)
+		deps.Record(ctx, l1Key, restActionGVR, apiRefNS, apiRefName)
 	}
 
 	// Edge type 1: status.resourcesRefs.items[], filtered by
@@ -135,10 +136,10 @@ func recordWidgetDeps(log *slog.Logger, l1Key string, gvr schema.GroupVersionRes
 			// List-scope dep (e.g., a ref that targets "all of kind X
 			// in namespace Y"). Record with name="*" (via the
 			// recordListDepFn seam — prod default is deps.RecordList).
-			recordListDepFn(deps, l1Key, refGVR, ref.Namespace)
+			recordListDepFn(ctx, deps, l1Key, refGVR, ref.Namespace)
 			continue
 		}
-		deps.Record(l1Key, refGVR, ref.Namespace, ref.Name)
+		deps.Record(ctx, l1Key, refGVR, ref.Namespace, ref.Name)
 	}
 }
 
@@ -184,11 +185,11 @@ func ensureWatcherInformerForGVR(gvr schema.GroupVersionResource) {
 // recordRestActionSelfDep records the self-dep edge for a RestAction
 // dispatch. Kept as a separate exported helper so the restactions.go
 // dispatcher doesn't reach into deps directly.
-func recordRestActionSelfDep(l1Key string, gvr schema.GroupVersionResource, ns, name string) {
+func recordRestActionSelfDep(ctx context.Context, l1Key string, gvr schema.GroupVersionResource, ns, name string) {
 	if l1Key == "" {
 		return
 	}
-	cache.Deps().Record(l1Key, gvr, ns, name)
+	cache.Deps().Record(ctx, l1Key, gvr, ns, name)
 }
 
 // readApiRef returns (name, namespace, ok) from a widget's spec.apiRef.

@@ -238,7 +238,7 @@ func (h *s394RecordingHandle) GetNoTouch(string) (*cache.ResolvedEntry, bool) {
 }
 func (h *s394RecordingHandle) Put(string, *cache.ResolvedEntry) { h.puts++ }
 func (h *s394RecordingHandle) CaptureGen(string) uint64         { return h.gen }
-func (h *s394RecordingHandle) PutIfGen(_ string, _ *cache.ResolvedEntry, g uint64) bool {
+func (h *s394RecordingHandle) PutIfGen(_ context.Context, _ string, _ *cache.ResolvedEntry, g uint64) bool {
 	h.putIfGens++
 	h.lastCapturedGenInPut = g
 	return g == h.gen
@@ -272,7 +272,7 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 		if g.guarded != c.guarded {
 			t.Errorf("#394: seedTerminalGuardFor(%s).guarded = %v, want %v", name, g.guarded, c.guarded)
 		}
-		if !seedTerminalPut(h, "k", &cache.ResolvedEntry{}, g) {
+		if !seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, g) {
 			t.Errorf("#394: %s: an unmoved generation must be accepted", name)
 		}
 		if c.guarded {
@@ -281,7 +281,7 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 					"puts=%d putIfGens=%d gen=%d", name, h.puts, h.putIfGens, h.lastCapturedGenInPut)
 			}
 			h.gen = 8 // a removal moved the generation
-			if seedTerminalPut(h, "k", &cache.ResolvedEntry{}, g) {
+			if seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, g) {
 				t.Errorf("#394: %s: a moved generation must be REFUSED", name)
 			}
 		} else if h.puts != 1 || h.putIfGens != 0 {

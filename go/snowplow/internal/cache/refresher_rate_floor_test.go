@@ -337,7 +337,7 @@ func TestRefresher_RateFloorDeleteListDepReResolvesWithinFloor(t *testing.T) {
 	// floored (entry younger than floor): that is the C3 scenario (LIST-dep
 	// refresh after DELETE is floor-delayed ≤ floor).
 	c.Put(listKey, &ResolvedEntry{RawJSON: []byte(`{"rows":["row-1"]}`), Inputs: listIn})
-	Deps().RecordList(listKey, gvr, "ns") // LIST-dep edge on the deleted row's ns
+	Deps().RecordList(context.Background(), listKey, gvr, "ns") // LIST-dep edge on the deleted row's ns
 
 	var resolves atomic.Int32
 	var resolveAt atomic.Int64

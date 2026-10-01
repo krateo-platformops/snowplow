@@ -5,6 +5,7 @@
 package cache
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"strconv"
@@ -82,7 +83,7 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 // fail full is a no-op returning false. PutIfGen (insert-or-replace), not
 // ReplaceIfGen: raFullListServe is the SERVE path and first-populates the raKey
 // cell on a cold /call, so an insert-on-absent (gen 0) must succeed.
-func (c *ResolvedCacheStore) PutRAFullListIfGen(key string, inputs ResolvedKeyInputs, full map[string]any, capturedGen uint64) bool {
+func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, key string, inputs ResolvedKeyInputs, full map[string]any, capturedGen uint64) bool {
 	if c == nil {
 		return false
 	}
@@ -94,7 +95,7 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(key string, inputs ResolvedKeyIn
 	in := inputs // copy onto the heap for the entry
 	// uaf-scope-waiver: UNREACHABLE for a refilter-narrowed body — twin of PutRAFullList above. The only caller is apiref.raFullListServe, which bypasses this whole layer (returns served=false) for a RESTAction declaring a userAccessFilter BEFORE it derives the key, so no refilter output can arrive here. The #323 generation guard does not change the UAF-scope reasoning — it is the same identity-free cell as PutRAFullList (uaf_shortttl.go R-d-4 SITE MAP).
 	// scope-waiver:TTLOverride: raFullList-class cell — identical class + reasoning to PutRAFullList above (a UAF-bearing RA can no longer reach this Put; raFullListServe bypasses the whole layer for it before deriving the key), uaf_shortttl.go R-d-4 SITE MAP "THE FOURTH SITE".
-	return c.PutIfGen(key, &ResolvedEntry{
+	return c.PutIfGen(ctx, key, &ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &in,
 		Pinned:  pin,

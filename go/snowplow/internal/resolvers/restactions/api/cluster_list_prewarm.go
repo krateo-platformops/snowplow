@@ -276,6 +276,11 @@ func PrewarmClusterListCells(
 		parallelism = 4
 	}
 
+	// #375 — install a STANDALONE dep-gen sink (no L1 key: this pass Puts only the
+	// identity-free collapse cells, each of which installs its own CHILD sink at
+	// populateClusterListCellSync entry). It gives every nested gen-guarded Put a real
+	// startSeq instead of a nil sink (fail-fresh remark + unguarded_put_total).
+	ctx = cache.WithDepGenSink(ctx)
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(parallelism)
 

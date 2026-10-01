@@ -52,7 +52,7 @@ func c3Setup(t *testing.T) {
 
 func c3Put(store *ResolvedCacheStore, key string, gvr schema.GroupVersionResource, ns, name string) {
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"k":"` + key + `"}`), Inputs: widgetInputs(gvr, ns, name)})
-	Deps().Record(key, gvr, ns, name)
+	Deps().Record(context.Background(), key, gvr, ns, name)
 }
 
 // c3Strand deletes ns/name on the fake cluster while the dep-event worker is

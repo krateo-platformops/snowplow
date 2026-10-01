@@ -170,7 +170,7 @@ func seedStoreArm(t *testing.T, storeRV string) {
 	// The self edge, so /debug/reconcile PROBES this coordinate rather than
 	// counting it as skippedNoEdge — arm 3 asserts on probed, so the edge has
 	// to be there or the arm compares two zeros.
-	cache.Deps().Record(storeArmL1Key, storeArmGVR, storeArmNS, storeArmName)
+	cache.Deps().Record(context.Background(), storeArmL1Key, storeArmGVR, storeArmNS, storeArmName)
 	t.Cleanup(func() { store.DeleteForTest(storeArmL1Key) })
 }
 

@@ -21,6 +21,7 @@
 package cache
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -130,7 +131,7 @@ func TestDepsExpvar_TracksRealEvictionAndPanic(t *testing.T) {
 			Namespace: "ns", Name: "evictme",
 		},
 	})
-	d.Record("L1_evictme", gvr, "ns", "evictme")
+	d.Record(context.Background(), "L1_evictme", gvr, "ns", "evictme")
 
 	// (2) A panicking OnDelete -> one lost eviction, counted.
 	d.SetRefreshHook(func(string, schema.GroupVersionResource) {
@@ -144,7 +145,7 @@ func TestDepsExpvar_TracksRealEvictionAndPanic(t *testing.T) {
 			Namespace: "ns", Name: "somebody-else",
 		},
 	})
-	d.Record("L1_other", gvr, "ns", "panicky")
+	d.Record(context.Background(), "L1_other", gvr, "ns", "panicky")
 
 	h := syncedWatcher(t, gvr).depEventHandlers(gvr)
 	h.DeleteFunc(unstructuredObj(gvr, "ns", "panicky"))

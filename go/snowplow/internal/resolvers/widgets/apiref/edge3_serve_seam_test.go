@@ -101,7 +101,7 @@ func edge3StubResolveRA(t *testing.T, markerPtr *string, backingGVR schema.Group
 		// Model the inner-call dep recording the real resolver performs: the
 		// backing LIST edge attaches to whatever L1 key the ctx carries.
 		if l1 := cache.L1KeyFromContext(rctx); l1 != "" {
-			cache.Deps().RecordList(l1, backingGVR, edge3BackingNS)
+			cache.Deps().RecordList(context.Background(), l1, backingGVR, edge3BackingNS)
 		}
 		items := make([]any, n)
 		for i := 0; i < n; i++ {
@@ -446,7 +446,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 	}
 	store.PutRAFullList(raKey, raKeyInputs, fullDict)
 	cache.RecordSliceability(raKey, shape, true)
-	d.Record(raKey, gRA, edge3BackingNS, raName) // RA-CR self-dep (mirror ra_full_list.go:469)
+	d.Record(context.Background(), raKey, gRA, edge3BackingNS, raName) // RA-CR self-dep (mirror ra_full_list.go:469)
 
 	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
 
@@ -479,7 +479,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 	if !ok {
 		t.Fatalf("harness broken: w2 memo load MISS under key %q", memoKey)
 	}
-	d.ReplayEdges(w2Key, deps2)
+	d.ReplayEdges(context.Background(), w2Key, deps2)
 	store.Put(w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body2), Inputs: edge3WidgetInputs("w2")})
 	if !edge3EdgesContainBacking(d.EdgesUnder(w2Key), backing) {
 		t.Fatalf("F-C1b RED: w2 (memo hit) cell carries no edge-3 after replay: %v", d.EdgesUnder(w2Key))
@@ -548,7 +548,7 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 	if !ok {
 		t.Fatalf("harness broken: memo widget load MISS")
 	}
-	d.ReplayEdges(wmemoKey, depsMemo)
+	d.ReplayEdges(context.Background(), wmemoKey, depsMemo)
 	store.Put(wmemoKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, bodyMemo), Inputs: edge3WidgetInputs("memo")})
 
 	// Each carrier's cell must carry edge-3.
@@ -652,7 +652,7 @@ func TestEdge3_E2E_ResolveB2B3WiringThroughApirefResolve(t *testing.T) {
 	}
 	store.PutRAFullList(raKey, raKeyInputs, fullDict)
 	cache.RecordSliceability(raKey, shape, true)
-	d.Record(raKey, gRA, ns, raName) // RA-CR self-dep
+	d.Record(context.Background(), raKey, gRA, ns, raName) // RA-CR self-dep
 
 	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
 	apiRef := templatesv1.ObjectReference{

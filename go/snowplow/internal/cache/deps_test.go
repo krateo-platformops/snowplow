@@ -37,13 +37,13 @@ func gvrCompositions() schema.GroupVersionResource {
 func TestDeps_RecordExactObject(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
-	d.Record("L1A", gvr, "bench-ns-01", "app-1")
+	d.Record(context.Background(), "L1A", gvr, "bench-ns-01", "app-1")
 
 	if got := d.totalRecords.Load(); got != 1 {
 		t.Fatalf("totalRecords=%d want 1", got)
 	}
 	// Idempotent re-record.
-	d.Record("L1A", gvr, "bench-ns-01", "app-1")
+	d.Record(context.Background(), "L1A", gvr, "bench-ns-01", "app-1")
 	if got := d.totalRecords.Load(); got != 1 {
 		t.Fatalf("idempotent re-record bumped count: %d", got)
 	}
@@ -52,7 +52,7 @@ func TestDeps_RecordExactObject(t *testing.T) {
 func TestDeps_RecordListEncodedAsWildcard(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
-	d.RecordList("L1A", gvr, "bench-ns-01")
+	d.RecordList(context.Background(), "L1A", gvr, "bench-ns-01")
 
 	// Internally the list-bucket key has Name="*".
 	bucket := DepKey{GVR: gvr, Namespace: "bench-ns-01", Name: listWildcard}
@@ -65,10 +65,10 @@ func TestDeps_FourBucketLookup(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
 
-	d.Record("L1_exact", gvr, "bench-ns-01", "app-1") // exact
-	d.RecordList("L1_nslist", gvr, "bench-ns-01")     // ns-list
-	d.Record("L1_clustname", gvr, "", "app-1")        // cluster-name (rare)
-	d.RecordList("L1_clustlist", gvr, "")             // cluster-list
+	d.Record(context.Background(), "L1_exact", gvr, "bench-ns-01", "app-1") // exact
+	d.RecordList(context.Background(), "L1_nslist", gvr, "bench-ns-01")     // ns-list
+	d.Record(context.Background(), "L1_clustname", gvr, "", "app-1")        // cluster-name (rare)
+	d.RecordList(context.Background(), "L1_clustlist", gvr, "")             // cluster-list
 
 	matched := d.collectMatches(gvr, "bench-ns-01", "app-1")
 	want := []string{"L1_exact", "L1_nslist", "L1_clustname", "L1_clustlist"}
@@ -122,7 +122,7 @@ func TestDeps_OnDelete_EvictsSelfRepresentation(t *testing.T) {
 		RawJSON: []byte(`{"a":1}`),
 		Inputs:  inputsFor(gvr, "bench-ns-01", "app-1"),
 	})
-	d.Record("L1A", gvr, "bench-ns-01", "app-1")
+	d.Record(context.Background(), "L1A", gvr, "bench-ns-01", "app-1")
 
 	got := d.OnDelete(gvr, "bench-ns-01", "app-1")
 	if got != 1 {
@@ -154,7 +154,7 @@ func TestDeps_OnDelete_DirtyMarksDependentGet(t *testing.T) {
 		RawJSON: []byte(`{}`),
 		Inputs:  inputsFor(gvr, "ns", "owner"),
 	})
-	d.Record("L1A", gvr, "ns", "dependency")
+	d.Record(context.Background(), "L1A", gvr, "ns", "dependency")
 
 	var marked []string
 	var mu sync.Mutex
@@ -189,7 +189,7 @@ func TestDeps_OnDelete_NilStoreIsNoOp(t *testing.T) {
 	// (degraded) refresher path.
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
-	d.Record("L1A", gvr, "ns", "n")
+	d.Record(context.Background(), "L1A", gvr, "ns", "n")
 	if got := d.OnDelete(gvr, "ns", "n"); got != 0 {
 		t.Fatalf("expected 0 evictions with no store, got %d", got)
 	}
@@ -211,7 +211,7 @@ func TestDeps_OnUpdate_EnqueuesAndDoesNotEvict(t *testing.T) {
 
 	gvr := gvrCompositions()
 	store.Put("L1A", &ResolvedEntry{RawJSON: []byte(`{}`)})
-	d.Record("L1A", gvr, "ns", "n")
+	d.Record(context.Background(), "L1A", gvr, "ns", "n")
 
 	var enqueued []string
 	var mu sync.Mutex
@@ -246,7 +246,7 @@ func TestDeps_OnUpdate_EnqueuesAndDoesNotEvict(t *testing.T) {
 func TestDeps_OnUpdate_NoHookIsNoOp(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
-	d.Record("L1A", gvr, "ns", "n")
+	d.Record(context.Background(), "L1A", gvr, "ns", "n")
 	got := d.OnUpdate(gvr, "ns", "n")
 	if got != 1 {
 		t.Fatalf("OnUpdate must still return matched count even without a hook, got %d", got)
@@ -258,9 +258,9 @@ func TestDeps_OnUpdate_NoHookIsNoOp(t *testing.T) {
 func TestDeps_RemoveL1Key_PurgesForwardAndReverse(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
-	d.Record("L1A", gvr, "ns", "n1")
-	d.Record("L1A", gvr, "ns", "n2")
-	d.RecordList("L1A", gvr, "ns")
+	d.Record(context.Background(), "L1A", gvr, "ns", "n1")
+	d.Record(context.Background(), "L1A", gvr, "ns", "n2")
+	d.RecordList(context.Background(), "L1A", gvr, "ns")
 
 	if got := d.totalRecords.Load(); got != 3 {
 		t.Fatalf("setup: totalRecords=%d want 3", got)
@@ -286,10 +286,10 @@ func TestDeps_RemoveL1Key_PurgesForwardAndReverse(t *testing.T) {
 func TestDeps_CapDropsAndWarnsOnce(t *testing.T) {
 	d := newTestDepTracker(t, 2) // tiny cap for the test
 	gvr := gvrCompositions()
-	d.Record("L1A", gvr, "ns", "n1")
-	d.Record("L1A", gvr, "ns", "n2")
-	d.Record("L1A", gvr, "ns", "n3") // dropped
-	d.Record("L1A", gvr, "ns", "n4") // dropped
+	d.Record(context.Background(), "L1A", gvr, "ns", "n1")
+	d.Record(context.Background(), "L1A", gvr, "ns", "n2")
+	d.Record(context.Background(), "L1A", gvr, "ns", "n3") // dropped
+	d.Record(context.Background(), "L1A", gvr, "ns", "n4") // dropped
 
 	if got := d.totalRecords.Load(); got != 2 {
 		t.Fatalf("totalRecords=%d want 2 (cap)", got)
@@ -311,7 +311,7 @@ func TestACO10_CapMeteredAgainstMaxRecords(t *testing.T) {
 
 	// Record 8 distinct edges under one L1 key — 5 land, 3 drop.
 	for i := 0; i < 8; i++ {
-		d.Record("L1A", gvr, "ns", "n"+itoa(i))
+		d.Record(context.Background(), "L1A", gvr, "ns", "n"+itoa(i))
 	}
 	if got := d.totalRecords.Load(); got != cap {
 		t.Fatalf("AC-O10: totalRecords=%d want %d (capped)", got, cap)
@@ -339,8 +339,8 @@ func TestACO15_EmptyKeyProdCounterAndNoPanic(t *testing.T) {
 	d := Deps()
 	gvr := gvrCompositions()
 
-	d.Record("", gvr, "ns", "n")
-	d.RecordList("", gvr, "ns")
+	d.Record(context.Background(), "", gvr, "ns", "n")
+	d.RecordList(context.Background(), "", gvr, "ns")
 	_ = WithL1KeyContext(context.Background(), "")
 
 	if got := d.Stats().RecordDroppedNoKey; got != 3 {
@@ -361,8 +361,8 @@ func TestACO15_EmptyKeyTestModePanics(t *testing.T) {
 	d := Deps()
 	gvr := gvrCompositions()
 
-	assertPanics(t, "Record", func() { d.Record("", gvr, "ns", "n") })
-	assertPanics(t, "RecordList", func() { d.RecordList("", gvr, "ns") })
+	assertPanics(t, "Record", func() { d.Record(context.Background(), "", gvr, "ns", "n") })
+	assertPanics(t, "RecordList", func() { d.RecordList(context.Background(), "", gvr, "ns") })
 	assertPanics(t, "WithL1KeyContext", func() { _ = WithL1KeyContext(context.Background(), "") })
 }
 
@@ -393,7 +393,7 @@ func TestACO15_TestModeToggleIsNotEnvDriven(t *testing.T) {
 			t.Fatalf("AC-O15: empty-key call panicked despite env vars only — toggle leaked to env")
 		}
 	}()
-	Deps().Record("", gvrCompositions(), "ns", "n")
+	Deps().Record(context.Background(), "", gvrCompositions(), "ns", "n")
 }
 
 // --- Concurrency -----------------------------------------------------------
@@ -415,7 +415,7 @@ func TestDeps_ConcurrentRecordAndDelete_RaceFree(t *testing.T) {
 		for i := 0; i < N; i++ {
 			key := "L1_" + itoa(i)
 			store.Put(key, &ResolvedEntry{RawJSON: []byte("x")})
-			d.Record(key, gvr, "ns", "n_"+itoa(i%50))
+			d.Record(context.Background(), key, gvr, "ns", "n_"+itoa(i%50))
 		}
 	}()
 
@@ -507,7 +507,7 @@ func TestRecordingInnerCallDep_ListScope(t *testing.T) {
 	if name != "" {
 		t.Fatalf("list-form must have name=\"\"; got %q", name)
 	}
-	d.RecordList("L1_admin_list", gvr, ns)
+	d.RecordList(context.Background(), "L1_admin_list", gvr, ns)
 
 	var marked []string
 	var mu sync.Mutex
@@ -560,9 +560,9 @@ func TestRecordingInnerCallDep_ExactObject(t *testing.T) {
 	if name != "bench-app-02-06" {
 		t.Fatalf("expected name=bench-app-02-06, got %q", name)
 	}
-	d.Record("L1_widget_a", gvr, ns, name)
+	d.Record(context.Background(), "L1_widget_a", gvr, ns, name)
 	// A second entry depends on the list-scope bucket for the same gvr+ns.
-	d.RecordList("L1_widget_b", gvr, ns)
+	d.RecordList(context.Background(), "L1_widget_b", gvr, ns)
 
 	var marked []string
 	var mu sync.Mutex
@@ -623,7 +623,7 @@ func TestIteratorEmitsPerNamespaceEdges(t *testing.T) {
 		} else if gvr != iterGVR {
 			t.Fatalf("iterator GVR drifted at i=%d: got %v want %v", i, gvr, iterGVR)
 		}
-		d.RecordList(adminL1, gvr, parsedNS)
+		d.RecordList(context.Background(), adminL1, gvr, parsedNS)
 	}
 
 	// 49 distinct list-scope buckets recorded under one L1 key.
@@ -673,7 +673,7 @@ func TestOnDelete_DirtyMarksViaListScope(t *testing.T) {
 	gvr := gvrCompositions()
 	const l1Key = "L1_admin_list_dirty"
 	store.Put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`)})
-	d.RecordList(l1Key, gvr, "bench-ns-02")
+	d.RecordList(context.Background(), l1Key, gvr, "bench-ns-02")
 
 	if got := d.evictDeleteTotal.Load(); got != 0 {
 		t.Fatalf("evictDeleteTotal=%d (must start at 0)", got)
@@ -714,9 +714,9 @@ func TestDeps_OnResourceTypeAvailable_DirtyMarksListDeps(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
 
-	d.RecordList("L1_nslist", gvr, "bench-ns-01")  // ns LIST-dep — must mark
-	d.RecordList("L1_clusterlist", gvr, "")        // cluster LIST-dep — must mark
-	d.Record("L1_exact", gvr, "bench-ns-01", "n1") // exact GET-dep — must NOT mark
+	d.RecordList(context.Background(), "L1_nslist", gvr, "bench-ns-01")  // ns LIST-dep — must mark
+	d.RecordList(context.Background(), "L1_clusterlist", gvr, "")        // cluster LIST-dep — must mark
+	d.Record(context.Background(), "L1_exact", gvr, "bench-ns-01", "n1") // exact GET-dep — must NOT mark
 
 	var marked []string
 	var mu sync.Mutex
@@ -751,7 +751,7 @@ func TestDeps_OnResourceTypeAvailable_NoMatchIsNoOp(t *testing.T) {
 	gvr := gvrCompositions()
 	other := schema.GroupVersionResource{Group: gvr.Group, Version: "v1", Resource: "others"}
 
-	d.RecordList("L1_other", other, "ns") // LIST-dep for a different GVR
+	d.RecordList(context.Background(), "L1_other", other, "ns") // LIST-dep for a different GVR
 
 	var marked []string
 	var mu sync.Mutex
@@ -793,9 +793,9 @@ func TestDeps_OnResourceTypeRemoved_DirtyMarksListAndGetDeps(t *testing.T) {
 		Inputs:  inputsFor(gvr, "ns", "self-obj"),
 	})
 
-	d.RecordList("L1_list", gvr, "ns")         // LIST-dep
-	d.Record("L1_get", gvr, "ns", "thing-1")   // dependent GET-dep
-	d.Record("L1_self", gvr, "ns", "self-obj") // self-representation GET-dep
+	d.RecordList(context.Background(), "L1_list", gvr, "ns")         // LIST-dep
+	d.Record(context.Background(), "L1_get", gvr, "ns", "thing-1")   // dependent GET-dep
+	d.Record(context.Background(), "L1_self", gvr, "ns", "self-obj") // self-representation GET-dep
 
 	var marked []string
 	var mu sync.Mutex
@@ -829,7 +829,7 @@ func TestDeps_OnResourceTypeRemoved_NoMatchIsNoOp(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
 	other := schema.GroupVersionResource{Group: gvr.Group, Version: "v1", Resource: "others"}
-	d.RecordList("L1_other", other, "ns")
+	d.RecordList(context.Background(), "L1_other", other, "ns")
 
 	var marked []string
 	var mu sync.Mutex

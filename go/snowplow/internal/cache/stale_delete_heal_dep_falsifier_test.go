@@ -179,7 +179,7 @@ func TestFalsifierHealB_DeleteDirtyMarksListDepContent(t *testing.T) {
 	})
 	// The /blueprints entry LIST-depends on the secrets GVR in ns-a — the
 	// cluster-list bucket edge the apistage content path records.
-	Deps().RecordList(blueprintsL1, healBSecretsGVR, "ns-a")
+	Deps().RecordList(context.Background(), blueprintsL1, healBSecretsGVR, "ns-a")
 
 	// ACT: delete secret-doomed through the fake client. The reflector
 	// observes the DELETE -> DeleteFunc -> worker -> OnDelete.

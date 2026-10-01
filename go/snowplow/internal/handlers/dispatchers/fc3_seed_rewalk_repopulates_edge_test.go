@@ -38,6 +38,7 @@
 package dispatchers
 
 import (
+	"context"
 	"testing"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -134,7 +135,7 @@ func TestFC3_SeedRewalk_GVRDiscovered_ReResolvesWarmCell_RepopulatesEdge(t *test
 
 	// The seed re-walk re-resolves over the now-populated iterator and re-records
 	// the LIST edge (the type-3 (gvr, ns, "*") dep).
-	deps.RecordList(fc3CellKey, fc3GVR, fc3NS)
+	deps.RecordList(context.Background(), fc3CellKey, fc3GVR, fc3NS)
 
 	// POST: the edge is live — a CR ADD now dirty-marks the cell (no stale-negative).
 	if post := deps.OnAdd(fc3GVR, fc3NS, fc3Name); post < 1 {

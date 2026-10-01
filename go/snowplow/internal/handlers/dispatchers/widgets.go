@@ -63,6 +63,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// #375 — the dep-generation epoch is taken at handler ENTRY, BEFORE the dispatched
+	// CR is read: an edit of that CR anywhere in [fetch, Put] must remark the Put (its
+	// self-dep is pre-declared at the WithL1KeyContextFromEpoch site below; the apiRef
+	// RA and resourcesRefs are read later under the sink and recorded at read).
+	depEpoch := cache.DepGenEpochNow()
 	got := fetchObjectFn(req)
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
@@ -281,7 +286,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// records against the widget L1 key because the widget cache entry
 	// depends on every K8s object its underlying RestActions touch.
 	if cacheKey != "" {
-		ctx = cache.WithL1KeyContext(ctx, cacheKey)
+		ctx = cache.WithL1KeyContextFromEpoch(ctx, cacheKey, depEpoch, cache.DepKey{
+			GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
 	}
 	// #83 Option A — seed THIS top-level widget as an ancestor of the
 	// nested-resolve descent BEFORE resolving (symmetric with restactions.go).
@@ -533,7 +539,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// cell, so (same as the declined branches above) there is nothing to
 		// dep-track or announce.
 		// scope-waiver:TTLOverride: widgets-class cell. 1.12.3 A-1/R-1 CORRECTED WAIVER: the pre-1.12.3 text claimed "UAF refilter output only ever lands in a restactions-class cell ... a widgets Put is never the UAF-stale cell". That was WRONG, and it was the R-1 blocker — widgets/resolve.go folds the apiRef'd RA's UAF-refiltered rows into status.widgetData, i.e. into THIS cell, which live measurement showed is the hot carrier (298,064 hits / 365 misses in 5d7h across 66 UAF-backed widgets). A refilter-touched envelope can no longer REACH this Put: the UAFTouchedSink gate at the HEAD of this chain declines it, so every cell written here is refilter-free and needs no UAF cap (uaf_shortttl.go R-d-4 SITE MAP).
-		if cacheHandle.PutIfGen(cacheKey, &cache.ResolvedEntry{
+		if cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,
 		}, cacheGen0) {
@@ -541,7 +547,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// dep, and render-eligible resourcesRefs deps (action-only
 			// refs filtered out per Revision 14). Edge type 3 (inner K8s
 			// calls inside the RestAction) is OUT OF SCOPE at this tag.
-			recordWidgetDeps(log, cacheKey, got.GVR, res)
+			recordWidgetDeps(ctx, log, cacheKey, got.GVR, res)
 
 			// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
 			// Put + dep-Record — never the stage-error / external-skip declines

@@ -237,7 +237,7 @@ func TestEmitSeam_S189_RefreshRePutRacingReinsert_RefusedNoClobberNoSignal(t *te
 	restore := setResolveOnceForTest(func(_ context.Context, in cache.ResolvedKeyInputs) ([]byte, error) {
 		c.DeleteForTest(key)             // real deleteForDep — bumps the generation
 		reinsertGen := c.CaptureGen(key) // the fresh generation post-delete
-		c.PutIfGen(key, &cache.ResolvedEntry{RawJSON: []byte(freshBody), Inputs: &in}, reinsertGen)
+		c.PutIfGen(context.Background(), key, &cache.ResolvedEntry{RawJSON: []byte(freshBody), Inputs: &in}, reinsertGen)
 		return []byte(emitStaleBytes), nil // the refresher's STALE body
 	})
 	t.Cleanup(restore)

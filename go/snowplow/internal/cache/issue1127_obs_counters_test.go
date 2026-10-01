@@ -9,6 +9,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func TestIssue1127Obs_DegradedNoEvict_CountsTheConsequence(t *testing.T) {
 		CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource,
 		Namespace: ns, Name: name,
 	}})
-	Deps().Record(key, gvr, ns, name)
+	Deps().Record(context.Background(), key, gvr, ns, name)
 
 	// A degraded verdict with a dependent entry: nothing can be evicted, and
 	// that is the consequence worth counting.

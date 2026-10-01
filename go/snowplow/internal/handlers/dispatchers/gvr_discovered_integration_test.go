@@ -345,7 +345,7 @@ func TestGVRDiscoveredIntegration_DepRecordedThenAddFiresConsumed(t *testing.T) 
 	// Record a LIST-scope edge: l1Key depends on (gvr, ns, "*"). This
 	// is the edge type 3 dep that resolve.go:567-585 would record IF
 	// the iterator at resolve.go:377-381 had not short-circuited.
-	deps.RecordList(l1Key, gvr, ns)
+	deps.RecordList(context.Background(), l1Key, gvr, ns)
 
 	// POST-record: OnAdd MUST match the L1 key (the edge is live).
 	post := deps.OnAdd(gvr, ns, name)
@@ -404,7 +404,7 @@ func TestGVRDiscoveredIntegration_AdminPerBindingCellsExceedPreExistingClusterLi
 	// l1_keys=19 propagate to the same 19 pre-existing apistage
 	// cluster_list cells.
 	clusterListCellKey := "apistage-cluster-list-pm2-test"
-	deps.RecordList(clusterListCellKey, gvr, "") // cluster-wide LIST
+	deps.RecordList(context.Background(), clusterListCellKey, gvr, "") // cluster-wide LIST
 
 	baseline := deps.OnAdd(gvr, ns, name)
 	if baseline < 1 {
@@ -421,7 +421,7 @@ func TestGVRDiscoveredIntegration_AdminPerBindingCellsExceedPreExistingClusterLi
 		"admin-piechart-binding-c1894d2b9a-pm2",
 	}
 	for _, k := range adminPerBindingCellKeys {
-		deps.RecordList(k, gvr, ns) // namespaced LIST per cohort
+		deps.RecordList(context.Background(), k, gvr, ns) // namespaced LIST per cohort
 	}
 
 	// Install a counter to track WHICH cells are dirty-marked.

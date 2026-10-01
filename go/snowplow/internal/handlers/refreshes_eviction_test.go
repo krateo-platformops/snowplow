@@ -178,7 +178,7 @@ func putSelfEntry(store *cache.ResolvedCacheStore, key, name string) {
 		Group:           panelGVR.Group, Version: panelGVR.Version, Resource: panelGVR.Resource,
 		Namespace: evictTestNS, Name: name,
 	}})
-	cache.Deps().Record(key, panelGVR, evictTestNS, name)
+	cache.Deps().Record(context.Background(), key, panelGVR, evictTestNS, name)
 }
 
 // subParamForNames builds ?sub= for the named panels (widgetContent coordinates).

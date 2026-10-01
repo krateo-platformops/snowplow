@@ -501,7 +501,7 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 		if l1Key := cache.L1KeyFromContext(r.ctx); l1Key != "" && !cache.Disabled() &&
 			ptr.Deref(apiCall.Verb, http.MethodGet) == http.MethodGet {
 			if gvr, ns, ok := cache.ParseAPIServerListDepSkeleton(apiCall.Path); ok {
-				cache.Deps().RecordList(l1Key, gvr, ns)
+				cache.Deps().RecordList(r.ctx, l1Key, gvr, ns)
 				if rw := cache.Global(); rw != nil {
 					rw.EnsureResourceType(gvr)
 				}
@@ -1629,9 +1629,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 			if ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
 				if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
 					if name == "" {
-						cache.Deps().RecordList(l1Key, gvr, ns)
+						cache.Deps().RecordList(r.ctx, l1Key, gvr, ns)
 					} else {
-						cache.Deps().Record(l1Key, gvr, ns, name)
+						cache.Deps().Record(r.ctx, l1Key, gvr, ns, name)
 					}
 					r.log.Debug("dep.recorded",
 						slog.String("subsystem", "cache"),

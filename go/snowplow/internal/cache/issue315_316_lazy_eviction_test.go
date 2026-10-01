@@ -113,7 +113,7 @@ func i316WarmApproachingTTL(t *testing.T, c *ResolvedCacheStore, name string, tt
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: ns, Name: name}
 	key := ComputeKey(in)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-ttlAgo)})
-	Deps().Record(key, gvr, ns, name)
+	Deps().Record(context.Background(), key, gvr, ns, name)
 	if warmViaGet {
 		if _, ok := c.Get(key); !ok {
 			t.Fatalf("precondition: %s must still be a HIT (within TTL) to warm it via Get", name)
@@ -321,7 +321,7 @@ func TestIssue316_TTLOverrideCell_NotProactivelyRefreshed(t *testing.T) {
 		CreatedAt:   time.Now().Add(-7 * time.Second),
 		TTLOverride: 8 * time.Second,
 	})
-	Deps().Record(key, gvr, ns, "override")
+	Deps().Record(context.Background(), key, gvr, ns, "override")
 	if _, ok := c.Get(key); !ok {
 		t.Fatal("precondition: the override cell (1s left on its 8s effective TTL) must HIT → warm")
 	}

@@ -12,6 +12,7 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -44,7 +45,7 @@ func TestIssue216_F6a_DeletePrimitiveStripsEdgesBeforeItReturns(t *testing.T) {
 		CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource,
 		Namespace: "demo-system", Name: "f6a-flex",
 	}})
-	Deps().Record(key, gvr, "demo-system", "f6a-flex")
+	Deps().Record(context.Background(), key, gvr, "demo-system", "f6a-flex")
 	dk := DepKey{GVR: gvr, Namespace: "demo-system", Name: "f6a-flex"}
 	if !Deps().hasEdge(key, dk) {
 		t.Fatalf("premise: the edge was not recorded")
@@ -96,7 +97,7 @@ func TestIssue216_F6a_ConcurrentRewriteKeepsItsEdges(t *testing.T) {
 			CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource,
 			Namespace: r.dk.Namespace, Name: r.dk.Name,
 		}})
-		Deps().Record(r.key, gvr, r.dk.Namespace, r.dk.Name)
+		Deps().Record(context.Background(), r.key, gvr, r.dk.Namespace, r.dk.Name)
 	}
 	for _, r := range rows {
 		put(r)

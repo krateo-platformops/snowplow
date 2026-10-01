@@ -85,13 +85,20 @@ func seedTerminalGuardFor(mode seedScopeMode, handle cacheHandle, key string) se
 // guard was captured). The #394 enumeration guard
 // (TestS394_SeedTerminalPutSitesAreGenGuarded) pins that the seed primitives
 // write through here and nowhere else.
-func seedTerminalPut(handle cacheHandle, key string, entry *cache.ResolvedEntry, g seedTerminalGuard) bool {
+//
+// ctx MUST be the seed's resCtx (built by cache.WithL1KeyContext for key), never
+// the outer ctx: it carries the #375 dep-gen sink + startSeq, so an accepted
+// guarded Put whose deps moved after the seed started re-marks the key once
+// (the refresh-overwrite case above converges fresh). A sink-less ctx would make
+// every accepted keepwarm / gvr-discovered seed Put a nil-sink drift
+// (unguarded_put_total++ plus a fail-fresh remark = refresher amplification).
+func seedTerminalPut(ctx context.Context, handle cacheHandle, key string, entry *cache.ResolvedEntry, g seedTerminalGuard) bool {
 	if !g.guarded {
 		// boot = plain, pre-readyz exemption (#323); not under #375's IfGen check.
 		handle.Put(key, entry)
 		return true
 	}
-	return handle.PutIfGen(key, entry, g.gen)
+	return handle.PutIfGen(ctx, key, entry, g.gen)
 }
 
 // seedTerminalGuardCtxKey carries the captured seedTerminalGuard from

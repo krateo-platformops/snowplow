@@ -295,7 +295,7 @@ func TestIssue1126_C4_F7_ApistageNotServableIsEvictedAtTheDropPoint(t *testing.T
 	}
 	key := cache.ComputeKey(inputs)
 	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"kind":"Flex","metadata":{"name":"stale"}}`), Inputs: &inputs})
-	cache.Deps().Record(key, i187GVR(), i187NS, i187Name)
+	cache.Deps().Record(context.Background(), key, i187GVR(), i187NS, i187Name)
 
 	// Classification first: typed, and NOT a self-gone.
 	err := resolveAndPopulateL1(context.Background(), inputs, saEP, saRC)

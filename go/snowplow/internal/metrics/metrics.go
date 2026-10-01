@@ -682,6 +682,18 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #375: dep-generation guard DETECTOR. Non-zero = an ACCEPTED gen-guarded L1
+	// Put whose resolve ctx carried no dep-gen sink (a resolve entry outside
+	// WithL1KeyContext / WithDepGenSink) — the PUT-THEN-REMARK guard could not tell
+	// whether a dependency moved during the resolve, so the Put was fail-fresh remarked.
+	// Expected 0; a detector, so OTLP-native and alertable (#311), not expvar-only.
+	unguardedPutTotal, err := m.Int64ObservableCounter(
+		"snowplow_deps_unguarded_put_total",
+		metric.WithDescription("Count of ACCEPTED generation-guarded L1 Puts (PutIfGen/ReplaceIfGen/PutRAFullListIfGen) whose resolve context carried NO dependency-generation sink — a resolve entry outside the #375 PUT-THEN-REMARK guard. Each was remarked once (fail-fresh). Expected 0; non-zero is #375 drift (a resolve entry that does not install the sink). #375."))
+	if err != nil {
+		return err
+	}
+
 	// --- #244: factory-built GVR divergence age — the observable bound on the
 	// passive watch-reconnect self-heal. A factory (shared-informer) GVR whose
 	// indexer diverged from the apiserver cannot be relist-repaired; it clears on
@@ -955,6 +967,9 @@ func registerInstruments(m metric.Meter, build string) error {
 				metric.WithAttributes(attribute.String("reason", reason)))
 		}
 
+		// --- #375: dep-generation guard detector (expected 0) ---
+		o.ObserveInt64(unguardedPutTotal, int64(cache.UnguardedPutTotal()))
+
 		// --- #244: factory-built divergence age (bounded self-heal detector) ---
 		o.ObserveInt64(storeFactoryDivergenceAge, cache.FactoryDivergenceMaxAgeSeconds())
 
@@ -1003,6 +1018,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		unparseableCADelegations,
 		// --- #311/#293 ---
 		malformedDialSkipped,
+		// --- #375 ---
+		unguardedPutTotal,
 		// --- #244 ---
 		storeFactoryDivergenceAge,
 		// --- #239: dirty-mark attribution ---

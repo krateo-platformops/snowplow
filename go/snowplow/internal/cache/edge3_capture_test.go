@@ -13,6 +13,7 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -48,7 +49,7 @@ func TestEdge3_FINV_ReplayObservedByActiveCapture(t *testing.T) {
 	if got := d.activeCaptures.Load(); got != 1 {
 		t.Fatalf("activeCaptures=%d after one BeginCapture, want 1", got)
 	}
-	d.ReplayEdges(l1,[]DepKey{exact, list})
+	d.ReplayEdges(context.Background(), l1, []DepKey{exact, list})
 	edges := d.EndCapture(l1,h)
 
 	if got := d.activeCaptures.Load(); got != 0 {
@@ -78,12 +79,12 @@ func TestEdge3_FINV_TapBeforeDedup(t *testing.T) {
 	e := DepKey{GVR: g, Namespace: "ns", Name: "pre-existing"}
 
 	// Pre-record the edge OUTSIDE any capture — the key already holds it.
-	d.Record(l1,e.GVR, e.Namespace, e.Name)
+	d.Record(context.Background(), l1, e.GVR, e.Namespace, e.Name)
 
 	// Now open a capture and re-record the SAME edge: the tap must observe it
 	// even though recordInternal's dedup early-returns.
 	h := d.BeginCapture(l1)
-	d.Record(l1,e.GVR, e.Namespace, e.Name)
+	d.Record(context.Background(), l1, e.GVR, e.Namespace, e.Name)
 	edges := d.EndCapture(l1,h)
 	if !edge3ContainsDep(edges, e) {
 		t.Fatalf("[C2-A] RED: an idempotent re-Record of an already-held edge was NOT captured (tap runs after the dedup early-return). got=%v", edges)
@@ -105,7 +106,7 @@ func TestEdge3_FINV_NestedCapturesBothObserve(t *testing.T) {
 	if got := d.activeCaptures.Load(); got != 2 {
 		t.Fatalf("activeCaptures=%d with two open captures, want 2", got)
 	}
-	d.Record(l1,e.GVR, e.Namespace, e.Name)
+	d.Record(context.Background(), l1, e.GVR, e.Namespace, e.Name)
 	innerEdges := d.EndCapture(l1,inner)
 	outerEdges := d.EndCapture(l1,outer)
 
@@ -135,7 +136,7 @@ func TestEdge3_FINV_DoubleEndCaptureIsIdempotent(t *testing.T) {
 	e := DepKey{GVR: g, Namespace: "ns", Name: "obj"}
 
 	h := d.BeginCapture(l1)
-	d.Record(l1,e.GVR, e.Namespace, e.Name)
+	d.Record(context.Background(), l1, e.GVR, e.Namespace, e.Name)
 
 	first := d.EndCapture(l1,h)
 	if !edge3ContainsDep(first, e) {
@@ -172,8 +173,8 @@ func TestEdge3_FINV_ConcurrentCapturesRace(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			h := d.BeginCapture(l1)
-			d.Record(l1,g, "ns", "obj")
-			d.ReplayEdges(l1,[]DepKey{{GVR: g, Namespace: "ns", Name: listWildcard}})
+			d.Record(context.Background(), l1, g, "ns", "obj")
+			d.ReplayEdges(context.Background(), l1, []DepKey{{GVR: g, Namespace: "ns", Name: listWildcard}})
 			_ = d.EndCapture(l1,h)
 		}(i)
 	}

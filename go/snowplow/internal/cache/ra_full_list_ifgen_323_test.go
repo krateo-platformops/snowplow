@@ -6,6 +6,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -15,7 +16,7 @@ func TestPutRAFullListIfGen_S323_AcceptColdFill_RefuseAfterDelete(t *testing.T) 
 	full := map[string]any{"apiVersion": "v1", "kind": "List", "items": []any{}}
 
 	// ACCEPT — a cold fill (key absent, gen 0) is stored.
-	if !c.PutRAFullListIfGen("rk", ResolvedKeyInputs{}, full, c.CaptureGen("rk")) {
+	if !c.PutRAFullListIfGen(context.Background(), "rk", ResolvedKeyInputs{}, full, c.CaptureGen("rk")) {
 		t.Fatalf("#323: a cold-fill PutRAFullListIfGen (no intervening removal) must be ACCEPTED")
 	}
 	if _, ok := c.Get("rk"); !ok {
@@ -25,7 +26,7 @@ func TestPutRAFullListIfGen_S323_AcceptColdFill_RefuseAfterDelete(t *testing.T) 
 	// REFUSE — a real DELETE-evict between capture and write bumps the generation.
 	gen0 := c.CaptureGen("rk")
 	c.DeleteForTest("rk") // real deleteForDep — tombstones + bumps the gen
-	if c.PutRAFullListIfGen("rk", ResolvedKeyInputs{}, full, gen0) {
+	if c.PutRAFullListIfGen(context.Background(), "rk", ResolvedKeyInputs{}, full, gen0) {
 		t.Fatalf("#323: PutRAFullListIfGen carrying the pre-DELETE generation must be REFUSED")
 	}
 	if _, ok := c.Get("rk"); ok {
@@ -36,7 +37,7 @@ func TestPutRAFullListIfGen_S323_AcceptColdFill_RefuseAfterDelete(t *testing.T) 
 	}
 
 	// ACCEPT (no over-refusal) — an independent cold key with no eviction stores.
-	if !c.PutRAFullListIfGen("rk2", ResolvedKeyInputs{}, full, c.CaptureGen("rk2")) {
+	if !c.PutRAFullListIfGen(context.Background(), "rk2", ResolvedKeyInputs{}, full, c.CaptureGen("rk2")) {
 		t.Fatalf("#323: a second cold-fill (no eviction) must be ACCEPTED — no over-refusal")
 	}
 }

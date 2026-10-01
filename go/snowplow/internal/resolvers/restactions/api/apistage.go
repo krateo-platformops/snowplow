@@ -520,15 +520,18 @@ func apistageContentServe(
 	// fresh + re-Puts, so the whole-RA re-resolve reads the FRESH input.
 	// #376 — refresherDriven distinguishes a refresher whole-RA re-resolve (which set
 	// WithRefreshTriggerGVR, NEVER a request-path /call) from a real customer serve.
-	// forceContentMiss is the R1 content-shield (trigger GVR == this unit's GVR →
-	// re-dispatch fresh), unchanged.
-	tg, refresherDriven := cache.RefreshTriggerGVRFromContext(ctx)
-	forceContentMiss := refresherDriven && tg == gvr
+	// forceContentMiss is the R1 content-shield (this unit's GVR is a trigger →
+	// re-dispatch fresh). #375 B — membership in the refresher's trigger SET (every
+	// GVR that marked or remarked the key before this dequeue), not equality with a
+	// single last-write GVR.
+	_, refresherDriven := cache.RefreshTriggerGVRFromContext(ctx)
+	forceContentMiss := refresherDriven && cache.RefreshTriggerHas(ctx, gvr)
 	// #376 — the content cell is stamped ONLY by a true customer serve. On
 	// forceContentMiss the entry is discarded + re-dispatched fresh anyway → skip the
 	// read entirely (no stamp, no wasted Get). Any OTHER refresher re-resolve read (a
-	// sibling stage, tg!=gvr) is served-as-input but INTERNAL → GetNoTouch. A real
-	// /call is the serve → Get (the one legitimate #315/#316 warmth stamp).
+	// sibling stage whose GVR is not a trigger) is served-as-input but INTERNAL →
+	// GetNoTouch. A real /call is the serve → Get (the one legitimate #315/#316
+	// warmth stamp).
 	readContent := func(k string) (*cache.ResolvedEntry, bool) {
 		switch {
 		case forceContentMiss:
@@ -561,7 +564,7 @@ func apistageContentServe(
 		// semantics make this a no-op for already-present edges — sub-µs
 		// hot-path cost per Deps.Record/RecordList doc.
 		if isList {
-			cache.Deps().RecordList(contentKey, gvr, ns)
+			cache.Deps().RecordList(ctx, contentKey, gvr, ns)
 			// Fix #1 (1a) — stale-delete heal/re-touch
 			// (docs/rca-stale-delete-compositiondefinitions-informer-2026-06-25.md).
 			// A LIST served from this content HIT short-circuits BEFORE
@@ -603,7 +606,7 @@ func apistageContentServe(
 				rw.EnsureResourceType(gvr)
 			}
 		} else {
-			cache.Deps().Record(contentKey, gvr, ns, name)
+			cache.Deps().Record(ctx, contentKey, gvr, ns, name)
 		}
 		log.Debug("apistage.content_hit",
 			slog.String("subsystem", "cache"),
@@ -619,6 +622,14 @@ func apistageContentServe(
 		// so the tail PutIfGen refuses (rather than resurrecting a pre-delete
 		// body) if the underlying object is DELETE-evicted during the resolve.
 		contentGen0 := store.CaptureGen(contentKey)
+		// #375 (A) — the content cell's OWN resolve entry: install a CHILD dep-gen sink
+		// BEFORE the data read below, pre-declaring the cell's own coordinate (its dep is
+		// Recorded only AFTER the accepted Put, #189). The tail PutIfGen then remarks the
+		// content key iff its own coordinate churned in [read, Put]; Records made under the
+		// child still propagate to the outer resolve's sink.
+		// Block-scoped shadow: the child sink covers exactly this MISS branch's read → Put
+		// → Record; the gate below keeps the caller's ctx.
+		ctx := cache.WithContentDepGenSink(ctx, gvr, ns, name)
 		dispatched, dispatchedOK := dispatchViaInformerFn(
 			cache.WithApistageContentResolve(ctx), call)
 		if !dispatchedOK {
@@ -662,7 +673,7 @@ func apistageContentServe(
 		// the resolve. A cold fill (key absent, gen 0) still inserts. On refusal
 		// the current request STILL serves `dispatched` below (envelope / parsed
 		// are already set); only the CACHE fill + its dep-record are skipped.
-		if store.PutIfGen(contentKey, newEntry, contentGen0) {
+		if store.PutIfGen(ctx, contentKey, newEntry, contentGen0) {
 			// Ship 0.30.212 — wire informer-event invalidation for this content
 			// entry. Without a dep edge an informer ADD/UPDATE/DELETE on the
 			// underlying objects can never dirty-mark this cell, leaving it
@@ -675,9 +686,9 @@ func apistageContentServe(
 			// PutIfGen stored no cell, so there is nothing to dep-track and no
 			// entry for the cohort-gate memo to attach to.
 			if isList {
-				cache.Deps().RecordList(contentKey, gvr, ns)
+				cache.Deps().RecordList(ctx, contentKey, gvr, ns)
 			} else {
-				cache.Deps().Record(contentKey, gvr, ns, name)
+				cache.Deps().Record(ctx, contentKey, gvr, ns, name)
 			}
 			entryRef = newEntry
 			log.Debug("apistage.content_store",

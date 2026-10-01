@@ -328,7 +328,21 @@ func raFullListServe(
 	// dirty-marks THIS cell and the refresher re-resolves + re-pins it
 	// (stale-while-revalidate). Idempotent dep recording lets this coexist
 	// with the widget cell's own deps recorded under the request ctx.
-	fullCtx := cache.WithL1KeyContext(ctx, raKey)
+	//
+	// #375 C2 — the RESTAction itself was fetched (apiref resolve.go) under the
+	// WIDGET ctx, BEFORE fullCtx exists, and its self-dep is Recorded on raKey only
+	// AFTER the PutRAFullListIfGen below. So fullCtx's dep-gen sink starts at the
+	// enclosing widget sink's startSeq (which precedes that read) and pre-declares
+	// the RA's own coordinate: an edit of the RA during a cold raKey resolve then
+	// remarks raKey instead of leaving it stale (the widget's re-resolve would
+	// fast-path and slice the stale cell). With no enclosing sink (a nil-sink drift,
+	// already detected at the Put) fall back to an epoch taken now.
+	raEpoch, haveEpoch := cache.DepGenStartSeqFromContext(ctx)
+	if !haveEpoch {
+		raEpoch = cache.DepGenEpochNow()
+	}
+	fullCtx := cache.WithL1KeyContextFromEpoch(ctx, raKey, raEpoch,
+		cache.DepKey{GVR: gvr, Namespace: namespace, Name: name})
 
 	// Single source of truth for the sliceShape — the SAME derivation the #42
 	// FIX-B pre-check (SeedFullListShapeKnownNonSliceable) uses, so the seed
@@ -362,7 +376,7 @@ func raFullListServe(
 					if len(edges) == 0 {
 						return nil, false, nil
 					}
-					cache.Deps().ReplayEdges(widgetL1Key, edges)
+					cache.Deps().ReplayEdges(ctx, widgetL1Key, edges)
 					cache.RecordRAFullListServe(cache.RAFullListServeHit)
 					return sliced, true, nil
 				}
@@ -398,8 +412,13 @@ func raFullListServe(
 		// the backing edges; on REFUSE (a DELETE-eviction bumped the generation
 		// during the unpaginated resolve) skip the cache-side wiring (no cell was
 		// stored — do not resurrect) and serve the fresh slice `sliced` directly.
-		if c.PutRAFullListIfGen(raKey, keyInputs, full, raGen0) {
-			cache.Deps().Record(raKey, gvr, namespace, name)
+		// #375 — Put under fullCtx: its dep-gen sink (WithL1KeyContext(raKey)) holds the
+		// UNPAGINATED resolve's deps, which is what this cell's body was built from. The
+		// request ctx's sink is the WIDGET resolve's (it receives these deps by chaining).
+		if c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0) {
+			// #375 C3 — under fullCtx (the Put's sink; it chains to the widget sink, which
+			// still receives the dep), so an RA edit in [Put-check, Record) is re-checked.
+			cache.Deps().Record(fullCtx, raKey, gvr, namespace, name)
 			// #277 / edge-3: the unpaginated resolve above recorded the backing
 			// edges under raKey (fullCtx); replay them onto the widget key so this
 			// widget's cell is invalidated by a backing mutation too. Same
@@ -409,7 +428,7 @@ func raFullListServe(
 			if len(edges) == 0 {
 				return nil, false, nil
 			}
-			cache.Deps().ReplayEdges(widgetL1Key, edges)
+			cache.Deps().ReplayEdges(ctx, widgetL1Key, edges)
 		}
 		cache.RecordRAFullListServe(cache.RAFullListServeRepopulateSlice)
 		return sliced, true, nil
@@ -520,7 +539,7 @@ func raFullListServe(
 	// class-prefix hook (Lever C) call InvalidateSliceabilityForKey(raKey)
 	// when the dep-tuple fires, clearing the memo and letting the next
 	// /call re-enter first-sight. THIS IS THE WIRING THE ARCHITECT GUARDS.
-	cache.Deps().Record(raKey, gvr, namespace, name)
+	cache.Deps().Record(ctx, raKey, gvr, namespace, name)
 
 	if !verdict {
 		// NOT cleanly sliceable for this shape — serve the page-keyed S_ra
@@ -537,7 +556,7 @@ func raFullListServe(
 	// resolve bumped the generation) declines the cache fill without resurrecting
 	// the pre-delete body; the verified slice sGo is served regardless, and the
 	// self-dep Record above (the Lever-C memo wiring) stands either way.
-	c.PutRAFullListIfGen(raKey, keyInputs, full, raGen0)
+	c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0)
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
 	return sGo, true, nil
 }

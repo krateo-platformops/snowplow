@@ -26,6 +26,7 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -133,7 +134,7 @@ func TestCRDSchemaWiden_RelistsRunningInformer(t *testing.T) {
 
 	// Record a dependent L1 edge + wire a dirty-mark recorder so we can assert
 	// the relist dirty-marks that entry (via OnResourceTypeSchemaRelisted → refresher).
-	Deps().Record("l1-widget-key", target, "demo-system", "button-x")
+	Deps().Record(context.Background(), "l1-widget-key", target, "demo-system", "button-x")
 	rec := newDirtyRecorder()
 	Deps().SetRefreshHook(rec.hook())
 

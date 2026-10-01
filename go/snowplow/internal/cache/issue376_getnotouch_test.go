@@ -6,6 +6,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -132,7 +133,7 @@ func TestIssue376_InternalReadStaysCold_No316Enqueue(t *testing.T) {
 	// inherits lastRead=-100s). Models a refresher-kept-fresh cell no customer read in 100s.
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: in, CreatedAt: time.Now().Add(-100 * time.Second)})
 	gen := c.CaptureGen(key)
-	if !c.ReplaceIfGen(key, &ResolvedEntry{RawJSON: []byte(`{"v":"refreshed"}`), Inputs: in, CreatedAt: time.Now().Add(-16 * time.Second)}, gen) {
+	if !c.ReplaceIfGen(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"v":"refreshed"}`), Inputs: in, CreatedAt: time.Now().Add(-16 * time.Second)}, gen) {
 		t.Fatal("setup: ReplaceIfGen must succeed")
 	}
 	if m, _ := c.MetadataForKey(key); m.LastReadSeconds < 20 || m.TTLRemainingSeconds >= 5 {
@@ -179,7 +180,7 @@ func TestIssue376_WarmGauge_InternalReadNeitherBucket(t *testing.T) {
 	// in-place inherits the old lastRead=-100s while the body is freshly within TTL.
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: in, CreatedAt: time.Now().Add(-100 * time.Second)})
 	gen := c.CaptureGen(key)
-	if !c.ReplaceIfGen(key, &ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
+	if !c.ReplaceIfGen(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
 		t.Fatal("setup: ReplaceIfGen must succeed")
 	}
 	if _, ok := c.GetNoTouch(key); !ok {

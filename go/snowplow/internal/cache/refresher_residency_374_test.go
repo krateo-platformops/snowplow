@@ -14,6 +14,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func TestFalsifier374_91LeverC_StuckFalseRAKeyStillEnqueued(t *testing.T) {
 
 	// Stuck-false RAFullList raKey: dep edge recorded (ra_full_list.go:523), NO
 	// cell (PutRAFullList only on verdict=true). THIS is the #91 Lever C shape.
-	d.Record("raKey-stuck-false", gvr, ns, name)
+	d.Record(context.Background(), "raKey-stuck-false", gvr, ns, name)
 
 	fired := []string{}
 	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { fired = append(fired, k) })

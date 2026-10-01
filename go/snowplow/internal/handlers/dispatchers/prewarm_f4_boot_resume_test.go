@@ -370,7 +370,7 @@ func TestF4_FreshSkip_RealSeedOneWidget_SkipsLiveCell(t *testing.T) {
 	// bootScoped run still SKIPS. (The refresher's independent re-resolve of the
 	// dirty key is a refresher property, covered by the deps/refresher dirty-mark
 	// tests — not re-proven here to avoid a fabricated refresher.)
-	cache.Deps().Record(key, fixCWidgetGVR, "krateo-system", "dashboard-flex")
+	cache.Deps().Record(context.Background(), key, fixCWidgetGVR, "krateo-system", "dashboard-flex")
 	cache.Deps().OnUpdate(fixCWidgetGVR, "krateo-system", "dashboard-flex") // genuine dirty event
 	if _, live := handle.Get(key); !live {
 		t.Fatal("F4-C2b: a dirty-marked (updated) cell must remain live per the store's TTL-expiry Get (dirty enqueues for the refresher, does not evict)")

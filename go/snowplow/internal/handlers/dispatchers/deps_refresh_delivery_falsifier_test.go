@@ -42,6 +42,7 @@
 package dispatchers
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -109,7 +110,7 @@ func TestFalsifier61_StatusRefDepCoverage(t *testing.T) {
 	cache.ResetDepsForTest()
 
 	l1Key := "L1_detail_demo_vpc"
-	recordWidgetDeps(slog.Default(), l1Key, detailWidgetGVR, detailWidgetForTest())
+	recordWidgetDeps(context.Background(), slog.Default(), l1Key, detailWidgetGVR, detailWidgetForTest())
 
 	// The widget key MUST depend on the DISPLAYED resource (status ref).
 	matched := cache.Deps().CollectMatchesForTest(displayedGVR, displayedNS, displayedName)
@@ -159,7 +160,7 @@ func TestFalsifier61_StaticSpecRefStillRecorded(t *testing.T) {
 	}}
 
 	l1Key := "L1_static_panel"
-	recordWidgetDeps(slog.Default(), l1Key, detailWidgetGVR, w)
+	recordWidgetDeps(context.Background(), slog.Default(), l1Key, detailWidgetGVR, w)
 
 	matched := cache.Deps().CollectMatchesForTest(staticGVR, "bench-ns-01", "static-app-01")
 	if _, ok := matched[l1Key]; !ok {
@@ -200,7 +201,7 @@ func TestFalsifier61_EndToEndDelivery(t *testing.T) {
 	})
 
 	// Record the dep edges from the resolved detail widget (status-bearing).
-	recordWidgetDeps(slog.Default(), l1Key, detailWidgetGVR, detailWidgetForTest())
+	recordWidgetDeps(context.Background(), slog.Default(), l1Key, detailWidgetGVR, detailWidgetForTest())
 
 	// Arm a /refreshes subscriber for the widget key (the seam
 	// handlers.Refreshes uses after re-deriving the key under the connection
@@ -295,13 +296,13 @@ func TestFalsifierM19_NameLessListTarget_RecordsWildcard(t *testing.T) {
 	orig := recordListDepFn
 	t.Cleanup(func() { recordListDepFn = orig })
 	cache.ResetDepsForTest()
-	recordListDepFn = func(deps *cache.DepTracker, l1Key string, gvr schema.GroupVersionResource, namespace string) {
+	recordListDepFn = func(ctx context.Context, deps *cache.DepTracker, l1Key string, gvr schema.GroupVersionResource, namespace string) {
 		// The wrong-granularity impl: a by-name exact edge. name!="" (Record
 		// drops name==""), but the name is a fixed placeholder that no real
 		// list member will ever equal.
-		deps.Record(l1Key, gvr, namespace, "__wrong_byname_placeholder__")
+		deps.Record(ctx, l1Key, gvr, namespace, "__wrong_byname_placeholder__")
 	}
-	recordWidgetDeps(slog.Default(), "L1_list_red", detailWidgetGVR, listWidgetForTest())
+	recordWidgetDeps(context.Background(), slog.Default(), "L1_list_red", detailWidgetGVR, listWidgetForTest())
 	if marked := cache.Deps().OnUpdate(displayedGVR, displayedNS, siblingMember); marked != 0 {
 		t.Fatalf("RED arm expected to MISS: a by-name edge dirty-marked %d keys for a sibling member "+
 			"OnUpdate — the wrong-granularity Record was supposed to wildcard-miss", marked)
@@ -311,7 +312,7 @@ func TestFalsifierM19_NameLessListTarget_RecordsWildcard(t *testing.T) {
 	recordListDepFn = orig
 	cache.ResetDepsForTest()
 	l1Key := "L1_list_green"
-	recordWidgetDeps(slog.Default(), l1Key, detailWidgetGVR, listWidgetForTest())
+	recordWidgetDeps(context.Background(), slog.Default(), l1Key, detailWidgetGVR, listWidgetForTest())
 
 	// The list edge must be a wildcard: a member NEVER named in the ref matches.
 	matched := cache.Deps().CollectMatchesForTest(displayedGVR, displayedNS, siblingMember)
@@ -343,7 +344,7 @@ func TestFalsifierM19_NameLessListTarget_EndToEndDelivery(t *testing.T) {
 	cache.Deps().SetRefreshHook(func(key string, _ schema.GroupVersionResource) {
 		cache.PublishRefresh(key)
 	})
-	recordWidgetDeps(slog.Default(), l1Key, detailWidgetGVR, listWidgetForTest())
+	recordWidgetDeps(context.Background(), slog.Default(), l1Key, detailWidgetGVR, listWidgetForTest())
 
 	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{l1Key: {}})
 	defer unsub()
@@ -417,7 +418,7 @@ func TestFalsifierM19_ActionOnlyRef_RecordsNoDepEdge(t *testing.T) {
 	// GREEN: the action-only ref records NO edge → its reconcile marks 0.
 	cache.ResetDepsForTest()
 	l1Key := "L1_action_only"
-	recordWidgetDeps(slog.Default(), l1Key, detailWidgetGVR, actionWidget())
+	recordWidgetDeps(context.Background(), slog.Default(), l1Key, detailWidgetGVR, actionWidget())
 	matched := cache.Deps().CollectMatchesForTest(actionGVR, actionNS, actionName)
 	if _, ok := matched[l1Key]; ok {
 		t.Fatalf("M19: an action-only ref (id in status.widgetData.actions) recorded a render dep edge on "+
@@ -437,7 +438,7 @@ func TestFalsifierM19_ActionOnlyRef_RecordsNoDepEdge(t *testing.T) {
 	unstructured.RemoveNestedField(renderWidget.Object, "status", "widgetData")
 	cache.ResetDepsForTest()
 	l1Key2 := "L1_render_ref"
-	recordWidgetDeps(slog.Default(), l1Key2, detailWidgetGVR, renderWidget)
+	recordWidgetDeps(context.Background(), slog.Default(), l1Key2, detailWidgetGVR, renderWidget)
 	matched2 := cache.Deps().CollectMatchesForTest(actionGVR, actionNS, actionName)
 	if _, ok := matched2[l1Key2]; !ok {
 		t.Fatalf("M19 control: with the action classification removed, the ref MUST record a render dep edge "+

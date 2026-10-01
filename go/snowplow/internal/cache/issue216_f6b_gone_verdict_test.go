@@ -18,6 +18,7 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -69,7 +70,7 @@ func TestIssue216_F6b_OnlyTheAbsentVerdictFires(t *testing.T) {
 		CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource,
 		Namespace: ns, Name: name,
 	}})
-	Deps().Record(key, gvr, ns, name)
+	Deps().Record(context.Background(), key, gvr, ns, name)
 
 	for _, tc := range []struct {
 		label string

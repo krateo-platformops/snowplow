@@ -81,7 +81,7 @@ func TestRecordWidgetDeps_RenderRefsRecorded_ActionRefsFiltered(t *testing.T) {
 		Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "panels",
 	}
 
-	recordWidgetDeps(slog.Default(), l1Key, widgetGVR, w)
+	recordWidgetDeps(context.Background(), slog.Default(), l1Key, widgetGVR, w)
 
 	deps := cache.Deps()
 	// Expected edges:
@@ -250,7 +250,7 @@ func TestRecordWidgetDeps_TriggersEnsureResourceType(t *testing.T) {
 		Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "panels",
 	}
 
-	recordWidgetDeps(slog.Default(), l1Key, widgetGVR, w)
+	recordWidgetDeps(context.Background(), slog.Default(), l1Key, widgetGVR, w)
 
 	// Every GVR the dep tracker recorded an edge for MUST be
 	// registered on the watcher (i.e., ListObjects returns non-nil).
@@ -296,5 +296,5 @@ func TestRecordWidgetDeps_CacheOffSkipsEnsure(t *testing.T) {
 	// not exercising L1 lookup, but recordWidgetDeps still emits
 	// deps.Record calls — the tracker handles them but no informer
 	// exists to fire events).
-	recordWidgetDeps(slog.Default(), "L1_panel_off", widgetGVR, w)
+	recordWidgetDeps(context.Background(), slog.Default(), "L1_panel_off", widgetGVR, w)
 }

@@ -41,7 +41,7 @@ func TestIssue1126_E1_RedProbe_MissedDeleteSurvivesRelistWithoutTheBridge(t *tes
 	createObj(t, rw, dyn, gvr, b5NS, "button-x", "x")
 	key := "L1_button-x"
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"pre-delete"}`), Inputs: widgetInputs(gvr, b5NS, "button-x")})
-	Deps().Record(key, gvr, b5NS, "button-x")
+	Deps().Record(context.Background(), key, gvr, b5NS, "button-x")
 
 	faults.swallow("button-x")
 	if err := dyn.Resource(gvr).Namespace(b5NS).Delete(context.Background(), "button-x", metav1.DeleteOptions{}); err != nil {
