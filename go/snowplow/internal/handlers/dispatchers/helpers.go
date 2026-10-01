@@ -653,6 +653,11 @@ func inlineParentIdentityForKey(ctx context.Context, cr map[string]any) map[stri
 // so it never leaks beyond dispatchers.
 type cacheHandle interface {
 	Get(key string) (*cache.ResolvedEntry, bool)
+	// #376 — GetNoTouch is Get minus the three customer-warmth stamps (MoveToFront,
+	// lastRead, hit_total) and the miss accounting; it KEEPS the lazy TTL/maxAge
+	// evicts. Internal seed-sweep reads (phase1_pip_seed seedSkipDecision) use it so
+	// they never fake #315/#316 warmth or contaminate the customer hit/miss ratio.
+	GetNoTouch(key string) (*cache.ResolvedEntry, bool)
 	Put(key string, entry *cache.ResolvedEntry)
 	// #189 — generation-guarded write. CaptureGen reads the key's generation
 	// before a resolve; PutIfGen stores only if it has not moved (a DELETE-

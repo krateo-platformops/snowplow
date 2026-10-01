@@ -130,7 +130,11 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// class prePinned stays false and the re-Put is unchanged.
 	prePinned := false
 	if inputs.CacheEntryClass == cache.CacheEntryClassRAFullList {
-		if prior, ok := c.Get(key); ok && prior != nil {
+		// #376 — GetNoTouch: this is the refresher re-resolve reading the prior
+		// entry's pin status; an internal read, not a customer serve, so it must not
+		// stamp lastRead/hitTotal (it would feed the self-#316 loop and contaminate
+		// the warm_lastread gauge). GetNoTouch returns the entry for prior.Pinned.
+		if prior, ok := c.GetNoTouch(key); ok && prior != nil {
 			prePinned = prior.Pinned
 		}
 	}

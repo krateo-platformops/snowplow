@@ -59,8 +59,9 @@ import (
 // the declined external cell that is never warmed. Put records nothing (the seed
 // declines it). Concurrency-safe: the seed fans cohorts across goroutines.
 type getRecordingHandle struct {
-	mu      sync.Mutex
-	getKeys []string
+	mu          sync.Mutex
+	getKeys     []string // customer-warmth Get() calls
+	noTouchKeys []string // #376 — internal no-stamp GetNoTouch() calls
 }
 
 func (h *getRecordingHandle) Get(key string) (*cache.ResolvedEntry, bool) {
@@ -68,6 +69,17 @@ func (h *getRecordingHandle) Get(key string) (*cache.ResolvedEntry, bool) {
 	h.getKeys = append(h.getKeys, key)
 	h.mu.Unlock()
 	return nil, false // MISS — the declined external cell is never Put/warmed
+}
+
+// GetNoTouch is the #376 internal no-stamp read the seed-skip decision now uses
+// (seedModeBoot + seedModeKeepwarm). Recorded SEPARATELY from Get so a wiring arm
+// can assert the decision routes through GetNoTouch and NOT Get; getCount/sawGet
+// report the UNION so the "a liveness read occurred" assertions stay method-agnostic.
+func (h *getRecordingHandle) GetNoTouch(key string) (*cache.ResolvedEntry, bool) {
+	h.mu.Lock()
+	h.noTouchKeys = append(h.noTouchKeys, key)
+	h.mu.Unlock()
+	return nil, false // MISS — same as Get: the declined external cell is never warmed
 }
 
 func (h *getRecordingHandle) Put(key string, entry *cache.ResolvedEntry) {}
@@ -79,13 +91,46 @@ func (h *getRecordingHandle) PutIfGen(key string, entry *cache.ResolvedEntry, ca
 	return true
 }
 
+// getCount is method-AGNOSTIC: the number of liveness reads (Get + #376 GetNoTouch),
+// so "a liveness read occurred / did not occur" assertions survive the #376 switch
+// of the seed-skip read from Get to GetNoTouch.
 func (h *getRecordingHandle) getCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return len(h.getKeys)
+	return len(h.getKeys) + len(h.noTouchKeys)
 }
 
+// sawGet is method-AGNOSTIC: a liveness read of key via EITHER Get or GetNoTouch.
 func (h *getRecordingHandle) sawGet(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, k := range h.getKeys {
+		if k == key {
+			return true
+		}
+	}
+	for _, k := range h.noTouchKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// sawGetNoTouch / sawGetTouch are the #376 method-SPECIFIC probes a wiring arm uses
+// to assert the seed-skip decision read via GetNoTouch and NOT the warmth-stamping Get.
+func (h *getRecordingHandle) sawGetNoTouch(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, k := range h.noTouchKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *getRecordingHandle) sawGetTouch(key string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, k := range h.getKeys {

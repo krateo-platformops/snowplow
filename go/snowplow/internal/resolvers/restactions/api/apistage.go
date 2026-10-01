@@ -518,11 +518,28 @@ func apistageContentServe(
 	//     feedback_no_special_cases).
 	// On a forced miss we fall through to the MISS branch, which re-dispatches
 	// fresh + re-Puts, so the whole-RA re-resolve reads the FRESH input.
-	forceContentMiss := false
-	if tg, ok := cache.RefreshTriggerGVRFromContext(ctx); ok && tg == gvr {
-		forceContentMiss = true
+	// #376 — refresherDriven distinguishes a refresher whole-RA re-resolve (which set
+	// WithRefreshTriggerGVR, NEVER a request-path /call) from a real customer serve.
+	// forceContentMiss is the R1 content-shield (trigger GVR == this unit's GVR →
+	// re-dispatch fresh), unchanged.
+	tg, refresherDriven := cache.RefreshTriggerGVRFromContext(ctx)
+	forceContentMiss := refresherDriven && tg == gvr
+	// #376 — the content cell is stamped ONLY by a true customer serve. On
+	// forceContentMiss the entry is discarded + re-dispatched fresh anyway → skip the
+	// read entirely (no stamp, no wasted Get). Any OTHER refresher re-resolve read (a
+	// sibling stage, tg!=gvr) is served-as-input but INTERNAL → GetNoTouch. A real
+	// /call is the serve → Get (the one legitimate #315/#316 warmth stamp).
+	readContent := func(k string) (*cache.ResolvedEntry, bool) {
+		switch {
+		case forceContentMiss:
+			return nil, false
+		case refresherDriven:
+			return store.GetNoTouch(k)
+		default:
+			return store.Get(k)
+		}
 	}
-	if entry, hit := store.Get(contentKey); hit && entry != nil && !forceContentMiss {
+	if entry, hit := readContent(contentKey); hit && entry != nil {
 		hitObserved = true // Ship 0.30.193 C3 — observed cache hit.
 		envelope = entry.RawJSON
 		entryRef = entry
