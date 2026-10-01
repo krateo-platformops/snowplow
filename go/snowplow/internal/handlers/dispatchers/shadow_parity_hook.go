@@ -130,6 +130,12 @@ func registerShadowParityMetrics() {
 				"populate_rbac_denied_total":           shadowPopulateRBACDeniedTotal.Load(),
 				"populate_rbac_gated_no_check_total":   shadowPopulateRBACGatedNoCheckTotal.Load(),
 				"populate_passthrough_total":           shadowPopulatePassthroughTotal.Load(),
+				// #368 — wildcard digest-collision probe. collision/observed are the
+				// DETECTOR + denominator (also on OTLP, metrics.go); the gated counter
+				// is an expvar-only diagnostic (expected non-zero until enumerate lands).
+				"wildcard_digest_collision_total":       shadowWildcardDigestCollisionTotal.Load(),
+				"wildcard_digest_observed_total":        shadowWildcardDigestObservedTotal.Load(),
+				"wildcard_gated_digest_collision_total": shadowWildcardGatedDigestCollisionTotal.Load(),
 			}
 		}))
 	})
@@ -154,7 +160,12 @@ type shadowContext struct {
 	identity  rbac.EvaluateOptions // Username + Groups only
 	digest    string
 	shareable bool
-	untrusted atomic.Bool
+	// wildcardGated mirrors Projection.WildcardGated for this cell (#368): true iff
+	// D's digest incorporated a gated ClassWildcard (AnswerWildcardGated). The
+	// wildcard digest-collision probe routes gated cells to an expvar-only
+	// diagnostic and the real detector counts only Shareable && !wildcardGated.
+	wildcardGated bool
+	untrusted     atomic.Bool
 
 	// Step 2E (#275) — per-resolve accumulation for the populate-side classify.
 	// Bumped by runShadowParityHook alongside the process-wide checks/allow/deny
@@ -245,13 +256,14 @@ func installShadowParity(ctx context.Context, derive func() AccessDomain) (out c
 	}
 
 	r := shadowProfileFor(snap, id)
-	digest, _ := ComputeProjectionDigest(r, d)
+	digest, proj := ComputeProjectionDigest(r, d)
 
 	return context.WithValue(ctx, shadowCtxKey, &shadowContext{
-		domain:    d,
-		identity:  id,
-		digest:    digest,
-		shareable: Shareable(d),
+		domain:        d,
+		identity:      id,
+		digest:        digest,
+		shareable:     Shareable(d),
+		wildcardGated: proj.WildcardGated, // #368 — route gated cells to the diagnostic
 	})
 }
 
@@ -398,6 +410,13 @@ func runShadowParityHook(ctx context.Context, snap *cache.RBACSnapshot, opts rba
 		sc.untrusted.Store(true)
 		logShadowAnomaly(ctx, "projection_name_ambiguous_leak", opts)
 	}
+
+	// #368 — the 4th dark detector: the cross-identity wildcard digest-collision
+	// probe. Independent of the three above (it uses the EVALUATOR, not the
+	// projection, for the access-hash) so it catches the wrong-wildcard-projection
+	// leak the three are structurally blind to. Dark: counters only, inside this
+	// function's recover, wildcard-bearing cells only.
+	wildcardProbe.observe(snap, sc, opts)
 }
 
 // markShadowUntrusted marks this resolve's digest untrusted, if a shadow context
