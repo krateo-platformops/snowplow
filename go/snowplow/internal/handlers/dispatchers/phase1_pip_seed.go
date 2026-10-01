@@ -960,6 +960,12 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	if seedSkipDecision(ctx, mode, handle, key, "restactions", ref.Namespace+"/"+ref.Name, cohortLabel) {
 		return nil
 	}
+	// #394 — capture the terminal-Put guard at seed ENTRY: after the skip
+	// decision (its Get may lazily evict an expired cell, which must not count
+	// as a removal DURING this seed) and before the admission + resolve. Post-
+	// readyz modes get CaptureGen → PutIfGen; boot stays a plain Put (#323).
+	// Carried to the tail on resCtx below (seam signature unchanged).
+	terminalGuard := seedTerminalGuardFor(mode, handle, key)
 
 	// #46 / fold 2026-07-03: bound this seed unit's footprint via the ADAPTIVE
 	// seed-unit gate (enterSeedUnit — serialize against live GOMEMLIMIT
@@ -1102,6 +1108,9 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// restactions.go:180-182.
 	resCtx := cache.WithL1KeyContext(ctx, key)
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
+	// #394 — the terminal-Put guard captured at seed entry, read back by the
+	// resolve+Put tail (seedTerminalGuardFromContext).
+	resCtx = withSeedTerminalGuard(resCtx, terminalGuard)
 	// #102 GTTL-1 (arch Option A, uniform): install the error-aware Put-gate
 	// sinks so the seed honors the SAME backstop the refresher does
 	// (resolve_populate.go:207-285). A swallowed/continueOnError'd STAGE error
@@ -1228,12 +1237,22 @@ func seedRestactionResolveAndPutProd(
 	}
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
-	handle.Put(key, &cache.ResolvedEntry{
+	entry := &cache.ResolvedEntry{
 		RawJSON:      encoded,
 		Inputs:       inputs,
 		SeededAtBoot: true, // #130 F3 seed-attribution: this cell was warmed by the boot seed
 		TTLOverride:  uafTTLOverrideForEntry(inputs),
-	})
+	}
+	// #394 — the terminal write goes through seedTerminalPut with the guard
+	// seedOneRestaction captured at seed entry: PutIfGen for the post-readyz
+	// modes (a removal during the resolve refuses the write instead of
+	// resurrecting the cell), plain Put for boot (pre-readyz exemption, #323).
+	// A refusal wrote nothing, so the resolves counter, the seeded-set Mark and
+	// the dep Record below are all skipped; the engine closure re-seeds once.
+	if !seedTerminalPut(handle, key, entry, seedTerminalGuardFromContext(resCtx)) {
+		logSeedTerminalPutRefused("restactions", ref.Namespace+"/"+ref.Name)
+		return fmt.Errorf("restaction %s/%s: %w", ref.Namespace, ref.Name, errSeedTerminalPutRefused)
+	}
 	// counters-hygiene 2026-07-04: this success Put is a seed UNIT resolved +
 	// written to per-user L1 — the real meaning of
 	// snowplow_phase1_bindingset_seed_resolves_total. Its only historical
@@ -1364,6 +1383,10 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	if seedSkipDecision(ctx, mode, handle, key, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), "") {
 		return nil
 	}
+	// #394 — capture the terminal-Put guard at seed ENTRY (mirror of
+	// seedOneRestaction): after the skip decision, before the admission and the
+	// resolve. Post-readyz modes → PutIfGen at the terminal Put; boot → plain.
+	terminalGuard := seedTerminalGuardFor(mode, handle, key)
 
 	// #46: bound this seed unit's footprint (semaphore admission + per-unit
 	// HeapInuse assert), AFTER the identity short-circuit so the customer
@@ -1516,11 +1539,18 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	}
 
 	// scope-waiver:TTLOverride: seedOneWidget — widgets-class boot seed. 1.12.3 A-1/R-1 CORRECTED WAIVER: the pre-1.12.3 text claimed "UAF is a restactions-STAGE contract, so a widget's apiRef-resolved UAF RA warms the restactions cell, never this widgets cell". That was WRONG and it was the R-1 blocker — widgets/resolve.go folds the apiRef'd RA's UAF-refiltered output into status.widgetData, which IS this cell. A refilter-touched widget can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it), so every cell written here is refilter-free and needs no UAF cap.
-	handle.Put(key, &cache.ResolvedEntry{
+	entry := &cache.ResolvedEntry{
 		RawJSON:      encoded,
 		Inputs:       inputs,
 		SeededAtBoot: true, // #130 F3 seed-attribution: this cell was warmed by the boot seed
-	})
+	}
+	// #394 — generation-guarded terminal write for the post-readyz modes (plain
+	// for boot); see seedOneRestaction's tail. A refusal skips the counter, the
+	// seeded-set Mark, the dep Record and the 4a full-list pin below.
+	if !seedTerminalPut(handle, key, entry, terminalGuard) {
+		logSeedTerminalPutRefused("widgets", e.W.GetNamespace()+"/"+e.W.GetName())
+		return fmt.Errorf("widget %s/%s: %w", e.W.GetNamespace(), e.W.GetName(), errSeedTerminalPutRefused)
+	}
 	// counters-hygiene 2026-07-04 — see seedOneRestaction: this success Put is
 	// a seed UNIT resolved+written; wired so snowplow_phase1_bindingset_seed_resolves_total
 	// again means "seed units resolved+Put" (was dead-at-0 post-fold).

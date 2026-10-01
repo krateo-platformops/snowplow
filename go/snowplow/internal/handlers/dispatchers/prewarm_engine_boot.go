@@ -38,6 +38,7 @@ package dispatchers
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"strings"
@@ -1087,9 +1088,18 @@ func seedScopeYielding(ctx context.Context,
 			return true
 		}
 		engineYieldCheckpoint(ctx)
-		err := seedOneTarget(c, func(cohortCtx context.Context) error {
+		do := func(cohortCtx context.Context) error {
 			return seedOneWidgetFn(cohortCtx, e, authnNS, mode)
-		})
+		}
+		err := seedOneTarget(c, do)
+		if errors.Is(err, errSeedTerminalPutRefused) && ctx.Err() == nil {
+			// #394 — the post-readyz terminal PutIfGen was refused (the cell was
+			// removed during the resolve). ONE inline re-seed in the SAME mode
+			// (so PutIfGen again, fresh capture). NOT via failedSet →
+			// finalizeBootReEnqueue: that redrives a BOOT (plain-Put) scope.
+			err = reseedAfterTerminalPutRefusal("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c),
+				func() error { return seedOneTarget(c, do) })
+		}
 		if err != nil && ctx.Err() != nil {
 			emitSeedAbort("widgets", ctx.Err())
 			return true
@@ -1107,9 +1117,16 @@ func seedScopeYielding(ctx context.Context,
 			return true
 		}
 		engineYieldCheckpoint(ctx)
-		err := seedOneTarget(c, func(cohortCtx context.Context) error {
+		do := func(cohortCtx context.Context) error {
 			return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS, mode)
-		})
+		}
+		err := seedOneTarget(c, do)
+		if errors.Is(err, errSeedTerminalPutRefused) && ctx.Err() == nil {
+			// #394 — one-shot same-mode re-seed of the refused unit; see
+			// seedWidgetTarget. Never routed through failedSet.
+			err = reseedAfterTerminalPutRefusal("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c),
+				func() error { return seedOneTarget(c, do) })
+		}
 		if err != nil && ctx.Err() != nil {
 			emitSeedAbort("restactions", ctx.Err())
 			return true
