@@ -11,36 +11,26 @@ package api
 
 import (
 	"net/http"
-	"runtime"
 	"testing"
-	"time"
 )
 
-// waitGoroutineCount polls runtime.NumGoroutine() until pred(n) holds or
-// the deadline elapses; it returns whether pred was satisfied. Used by the
-// summary-goroutine lifecycle test to observe the goroutine start and then
-// return to baseline after a stop, tolerating scheduler lag on Done().
-func waitGoroutineCount(pred func(n int) bool, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if pred(runtime.NumGoroutine()) {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return pred(runtime.NumGoroutine())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 // TestDispatchSummary_GoroutineStops is the #221 goroutine-leak arm: the
-// summary goroutine must have a REACHABLE stop. It starts the loop, proves
-// the goroutine is alive, then stops it via the test seam and asserts the
-// goroutine actually exits — NumGoroutine returns to baseline and the
-// joined WaitGroup guarantees the frame is gone (no leak). On pre-#221 code
-// the loop is `for range t.C` with an unreachable `defer t.Stop()` and NO
-// stop seam, so this arm cannot even be written against it (stop API
-// absent) — that is the RED.
+// summary goroutine must have a REACHABLE stop. It starts the loop, proves the
+// emitter reports running, then stops it via the test seam and asserts the
+// emitter reports stopped — stopDispatchSummaryForTest joins the WaitGroup, so a
+// stopped report guarantees the goroutine frame is gone (no leak). On pre-#221
+// code the loop is `for range t.C` with an unreachable `defer t.Stop()` and NO
+// stop seam, so this arm cannot even be written against it (stop API absent) —
+// that is the RED.
+//
+// #368 — the start/stop assertions read the emitter's OWN lifecycle state
+// (DispatchSummaryRunningForTest, backed by the stop channel the sync.Once
+// installs) instead of a process-global runtime.NumGoroutine() delta, which is
+// contaminated by neighbour-test goroutine churn in the shared package binary
+// and made the old `n > base` / `n <= base` checks flaky under -race. The join
+// itself is still proven by stopDispatchSummaryForTest's WaitGroup.Wait(): an
+// unreachable stop blocks it forever → test timeout. Only the flaky liveness
+// SIGNAL is replaced.
 func TestDispatchSummary_GoroutineStops(t *testing.T) {
 	// Short interval so the goroutine is unambiguously running; the value
 	// is irrelevant to the stop path, which is signal-driven, not tick-driven.
@@ -48,34 +38,31 @@ func TestDispatchSummary_GoroutineStops(t *testing.T) {
 
 	// Clean slate in case an earlier test in this binary already started it.
 	stopDispatchSummaryForTest()
-
-	base := runtime.NumGoroutine()
-	startDispatchSummary()
-
-	if !waitGoroutineCount(func(n int) bool { return n > base }, time.Second) {
-		t.Fatalf("summary goroutine did not start: NumGoroutine stayed at baseline %d", base)
+	if DispatchSummaryRunningForTest() {
+		t.Fatalf("precondition: emitter still reports running after stop")
 	}
-	afterStart := runtime.NumGoroutine()
-	t.Logf("goroutines: baseline=%d after-start=%d (delta=%+d)", base, afterStart, afterStart-base)
+
+	startDispatchSummary()
+	if !DispatchSummaryRunningForTest() {
+		t.Fatalf("summary goroutine did not start: DispatchSummaryRunningForTest()=false")
+	}
 
 	// The stop must join the goroutine; if the stop is unreachable this
 	// call blocks forever and the test times out.
 	stopDispatchSummaryForTest()
-
-	if !waitGoroutineCount(func(n int) bool { return n <= base }, 2*time.Second) {
-		t.Fatalf("summary goroutine did not exit after stop: NumGoroutine=%d baseline=%d", runtime.NumGoroutine(), base)
+	if DispatchSummaryRunningForTest() {
+		t.Fatalf("summary goroutine did not exit after stop: DispatchSummaryRunningForTest()=true")
 	}
-	t.Logf("goroutines: after-stop=%d baseline=%d (back to baseline)", runtime.NumGoroutine(), base)
 
 	// The Once must have been reset so a subsequent production start
 	// relaunches the goroutine (lifecycle contract preserved).
 	startDispatchSummary()
-	if !waitGoroutineCount(func(n int) bool { return n > base }, time.Second) {
-		t.Fatalf("summary goroutine did not restart after reset: NumGoroutine stayed at baseline %d", base)
+	if !DispatchSummaryRunningForTest() {
+		t.Fatalf("summary goroutine did not restart after reset: DispatchSummaryRunningForTest()=false")
 	}
 	stopDispatchSummaryForTest()
-	if !waitGoroutineCount(func(n int) bool { return n <= base }, 2*time.Second) {
-		t.Fatalf("summary goroutine did not exit after second stop: NumGoroutine=%d baseline=%d", runtime.NumGoroutine(), base)
+	if DispatchSummaryRunningForTest() {
+		t.Fatalf("summary goroutine did not exit after second stop: DispatchSummaryRunningForTest()=true")
 	}
 }
 
