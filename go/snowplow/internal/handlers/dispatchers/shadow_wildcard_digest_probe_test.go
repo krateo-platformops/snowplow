@@ -90,6 +90,14 @@ func wcOpts(verb, group, resource, ns string) rbac.EvaluateOptions {
 	return rbac.EvaluateOptions{Verb: verb, Group: group, Resource: resource, Namespace: ns}
 }
 
+// wcCertified is the certification triad (code doc + #368 issue): certified ⇔
+// collision==0 AND observed>0 AND evicted==0. Any drop (evicted>0) VOIDS the window.
+func wcCertified() bool {
+	return shadowWildcardDigestCollisionTotal.Load() == 0 &&
+		shadowWildcardDigestObservedTotal.Load() > 0 &&
+		shadowWildcardDigestEvictedTotal.Load() == 0
+}
+
 // ───────────────────────────── arms ─────────────────────────────
 
 func TestF368a_WrongShareableProjection_FiresCollision(t *testing.T) {
@@ -240,5 +248,114 @@ func TestF368wire_HookCallsProbe(t *testing.T) {
 	}
 	if got := shadowWildcardGatedDigestCollisionTotal.Load(); got == 0 {
 		t.Fatalf("WIRING (#368): runShadowParityHook did not call the wildcard digest probe (seam-is-a-floor: the probe can be correct yet never invoked)")
+	}
+}
+
+// TestF368g_EvictionObservableVoidsCertification (TL condition): a cap eviction must
+// be OBSERVABLE (evicted_total) so collision_total==0 can't be misread as certified
+// while the LRU silently dropped a pair that WOULD have collided. Forces the entry
+// cap to 1, thrashes it, and shows the alice/bob collision (same wrong digest,
+// different access) is MISSED because alice's entry was evicted before bob arrived —
+// with evicted_total recording it. Certification rule: evicted_total>0 VOIDS the window.
+func TestF368g_EvictionObservableVoidsCertification(t *testing.T) {
+	resetWildcardDigestProbeForTest()
+	prev := maxWildcardDigestEntries
+	maxWildcardDigestEntries = 1 // tiny cap → any second (cell,digest) evicts the first
+	t.Cleanup(func() { maxWildcardDigestEntries = prev })
+
+	withProfiles(t, map[string]*rbac.RequesterProfile{
+		"alice": wcProfileCluster("list", "", "pods"), // permits
+		"bob":   wcProfileDeny(),                      // denies — a real collision pair with alice under one digest
+		"carol": wcProfileDeny(),                      // filler to force the eviction
+	})
+	snap := wcSnap()
+	opts := wcOpts("list", "", "pods", "default")
+
+	wildcardProbe.observe(snap, wcSC("alice", "dWrong", true, false), opts)                             // entry(cell,dWrong)
+	wildcardProbe.observe(snap, wcSC("carol", "dOther", true, false), wcOpts("list", "", "pods", "n9")) // evicts (cell,dWrong)
+	wildcardProbe.observe(snap, wcSC("bob", "dWrong", true, false), opts)                               // re-creates (cell,dWrong) fresh — alice gone
+
+	if got := shadowWildcardDigestEvictedTotal.Load(); got == 0 {
+		t.Fatalf("#368(g1/LRU): LRU eviction of a tracked (cell,digest) must bump evicted_total (make the false-negative OBSERVABLE); got 0")
+	}
+	if got := shadowWildcardDigestCollisionTotal.Load(); got != 0 {
+		t.Fatalf("#368(g1/LRU): the evicted-pair collision must NOT be counted — this documents the cap false-negative; got %d", got)
+	}
+	// RED-provable: remove the evicted++ in evictLRULocked → this arm REDs.
+}
+
+// TestF368g2_CoordCapTruncationObservable — drop path (b): a NEW coordinate dropped
+// because the per-entry coordUnion cap is hit must bump evicted_total. Without this,
+// a coord-cap false-negative (a dimension the oracle never fingerprinted) would read
+// clean. RED-provable: remove the coord-cap else-branch evicted++ → this arm REDs.
+func TestF368g2_CoordCapTruncationObservable(t *testing.T) {
+	resetWildcardDigestProbeForTest()
+	prev := maxWildcardCoordsPerEntry
+	maxWildcardCoordsPerEntry = 1
+	t.Cleanup(func() { maxWildcardCoordsPerEntry = prev })
+
+	withProfiles(t, map[string]*rbac.RequesterProfile{"alice": wcProfileCluster("list", "", "pods")})
+	snap := wcSnap()
+	// Same (cell,digest,identity); two DIFFERENT coordinates → the 2nd is dropped.
+	wildcardProbe.observe(snap, wcSC("alice", "d", true, false), wcOpts("list", "", "pods", "n1"))
+	wildcardProbe.observe(snap, wcSC("alice", "d", true, false), wcOpts("list", "", "pods", "n2"))
+
+	if got := shadowWildcardDigestEvictedTotal.Load(); got == 0 {
+		t.Fatalf("#368(g2/coord-cap): a coordUnion-cap truncation drops an observation and MUST bump evicted_total; got 0")
+	}
+}
+
+// TestF368g3_IdentityCapTruncationObservable — drop path (c): a NEW identity dropped
+// because the per-entry identities cap is hit must bump evicted_total (that dropped
+// identity could be the colliding one). RED-provable: remove the identity-cap
+// else-branch evicted++ → this arm REDs.
+func TestF368g3_IdentityCapTruncationObservable(t *testing.T) {
+	resetWildcardDigestProbeForTest()
+	prev := maxWildcardIdentityPerEntry
+	maxWildcardIdentityPerEntry = 1
+	t.Cleanup(func() { maxWildcardIdentityPerEntry = prev })
+
+	withProfiles(t, map[string]*rbac.RequesterProfile{
+		"alice": wcProfileCluster("list", "", "pods"),
+		"bob":   wcProfileDeny(),
+	})
+	snap := wcSnap()
+	opts := wcOpts("list", "", "pods", "default")
+	// Same (cell,digest); two DIFFERENT identities → the 2nd is dropped (cap=1).
+	wildcardProbe.observe(snap, wcSC("alice", "d", true, false), opts)
+	wildcardProbe.observe(snap, wcSC("bob", "d", true, false), opts)
+
+	if got := shadowWildcardDigestEvictedTotal.Load(); got == 0 {
+		t.Fatalf("#368(g3/identity-cap): an identities-cap truncation drops an identity and MUST bump evicted_total; got 0")
+	}
+}
+
+// TestF368g4_EvictionVoidsCertTriad — a window that WOULD certify (a clean pair:
+// collision==0 ∧ observed>0) is VOIDED by any eviction (evicted>0). Proves the triad
+// is mechanically enforced, not just documented.
+func TestF368g4_EvictionVoidsCertTriad(t *testing.T) {
+	resetWildcardDigestProbeForTest()
+	withProfiles(t, map[string]*rbac.RequesterProfile{
+		"alice": wcProfileCluster("list", "", "pods"), // identical access → same digest, no collision
+		"bob":   wcProfileCluster("list", "", "pods"),
+	})
+	snap := wcSnap()
+	opts := wcOpts("list", "", "pods", "n1")
+	// A clean, certified-looking pair: observed>0, collision==0, evicted==0.
+	wildcardProbe.observe(snap, wcSC("alice", "dClean", true, false), opts)
+	wildcardProbe.observe(snap, wcSC("bob", "dClean", true, false), opts)
+	if !wcCertified() {
+		t.Fatalf("precondition: a clean ≥2-identity same-access pair must be certified (collision=%d observed=%d evicted=%d)",
+			shadowWildcardDigestCollisionTotal.Load(), shadowWildcardDigestObservedTotal.Load(), shadowWildcardDigestEvictedTotal.Load())
+	}
+	// Now force a drop elsewhere (identity-cap on a different digest) → evicted>0.
+	prev := maxWildcardIdentityPerEntry
+	maxWildcardIdentityPerEntry = 1
+	t.Cleanup(func() { maxWildcardIdentityPerEntry = prev })
+	wildcardProbe.observe(snap, wcSC("alice", "dOther", true, false), opts)
+	wildcardProbe.observe(snap, wcSC("bob", "dOther", true, false), opts) // dropped → evicted>0
+	if wcCertified() {
+		t.Fatalf("#368(g4): evicted_total>0 must VOID certification even with collision==0 ∧ observed>0 (evicted=%d)",
+			shadowWildcardDigestEvictedTotal.Load())
 	}
 }

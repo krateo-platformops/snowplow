@@ -362,6 +362,11 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
+	shadowWildcardDigestEvicted, err := m.Int64ObservableCounter("snowplow_v7_shadow_wildcard_digest_evicted_total",
+		metric.WithDescription("#368 cap-eviction counter: dropped (cell,digest) observations (LRU + identity/coord-cap truncations). A dropped observation could MISS a collision, so certification requires evicted_total == 0 too: certified = collision==0 AND observed>0 AND evicted==0. Non-zero → raise caps/shard and re-measure."))
+	if err != nil {
+		return err
+	}
 
 	// --- prewarm phase-1: apiRef pagination coverage ---
 	phase1UnitsPlanned, err := m.Int64ObservableGauge("snowplow_phase1_units_planned",
@@ -728,9 +733,10 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(prewarmEngPending, engPending)
 
 		// --- #368 wildcard digest-collision detector (hand-wired, #311) ---
-		wcCollision, wcObserved := dispatchers.ShadowWildcardDigestCounts()
+		wcCollision, wcObserved, wcEvicted := dispatchers.ShadowWildcardDigestCounts()
 		o.ObserveInt64(shadowWildcardDigestCollision, wcCollision)
 		o.ObserveInt64(shadowWildcardDigestObserved, wcObserved)
+		o.ObserveInt64(shadowWildcardDigestEvicted, wcEvicted)
 
 		// --- phase-1 pagination ---
 		planned, seeded, apiRefPages, eligibleNoCont := dispatchers.Phase1PaginationSnapshot()

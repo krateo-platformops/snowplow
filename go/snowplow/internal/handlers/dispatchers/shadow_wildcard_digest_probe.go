@@ -76,6 +76,12 @@ var (
 	shadowWildcardDigestCollisionTotal      atomic.Uint64
 	shadowWildcardDigestObservedTotal       atomic.Uint64
 	shadowWildcardGatedDigestCollisionTotal atomic.Uint64
+	// shadowWildcardDigestEvictedTotal counts DROPPED observations — LRU evictions of
+	// tracked (cell,digest) entries + per-entry identity/coordinate-cap truncations.
+	// It makes the cap false-negative OBSERVABLE (TL): a non-zero value VOIDS
+	// certification for the window (collision_total==0 could be a missed collision, not
+	// a clean one). On expvar AND OTLP alongside observed_total so the cert query sees it.
+	shadowWildcardDigestEvictedTotal atomic.Uint64
 )
 
 // ShadowWildcardDigestCounts exposes the #368 DETECTOR counters for the OTLP
@@ -84,8 +90,10 @@ var (
 // denominator. The gated-collision diagnostic stays expvar-only and is deliberately
 // NOT exported (it is expected non-zero until enumerate lands, so it must not reach
 // the alerting surface).
-func ShadowWildcardDigestCounts() (collision, observed int64) {
-	return int64(shadowWildcardDigestCollisionTotal.Load()), int64(shadowWildcardDigestObservedTotal.Load())
+func ShadowWildcardDigestCounts() (collision, observed, evicted int64) {
+	return int64(shadowWildcardDigestCollisionTotal.Load()),
+		int64(shadowWildcardDigestObservedTotal.Load()),
+		int64(shadowWildcardDigestEvictedTotal.Load())
 }
 
 // Bounded-memory caps (hard). The probe scope is wildcard-bearing cells only, so
@@ -93,21 +101,26 @@ func ShadowWildcardDigestCounts() (collision, observed int64) {
 // growth. Overflow drops observations (dark-safe for SERVING — the probe never
 // affects a verdict/serve/key).
 //
-// CERTIFICATION CAVEAT (pm-1217 condition 2 — empirical-capacity-caps). An LRU
-// eviction or a per-entry coord/identity cap drops an observation, which toward
-// COUNTING is a FALSE-NEGATIVE: a (cell,digest) collision that would have fired
-// could be missed, so collision_total==0 over a capped population does NOT fully
-// certify. This is safe for the dark window (never a false POSITIVE / false alarm)
-// but it WEAKENS the enumerate certification. These values are a DARK Step-2 bound,
-// NOT yet validated against the live wildcard (cell,digest) population: the 057
-// wildcard corpus (distinct wildcard-bearing cells × digests × identities-per-cell)
-// must VALIDATE/RETUNE them — and any Step-3/enumerate certification that leans on
-// collision_total==0 MUST account for possible cap-eviction false-negatives (or
-// confirm the caps exceed the measured population) before relying on this probe as
-// the sole runtime cert detector. Same discipline as requesterProfileMemoCap
-// (profile.go): a DARK bound retuned from the corpus before any promotion. Not env
-// knobs (no magic env vars).
-const (
+// CAPS + THE CERTIFICATION RULE (pm-1217 condition 2 + TL — empirical-capacity-caps,
+// a-counter-whose-zero-reads-as-health-is-not-a-detector). An LRU eviction or a
+// per-entry coord/identity-cap truncation DROPS an observation, which toward counting
+// is a FALSE-NEGATIVE: a (cell,digest) collision that would have fired could be
+// missed, so collision_total==0 over a capped population does NOT by itself certify.
+// A code comment can't stop someone reading 0 as "certified" while the LRU silently
+// evicted — so eviction is made OBSERVABLE via shadowWildcardDigestEvictedTotal.
+//
+// CERTIFICATION RULE (also stated in the #368 issue): the enumerate projection is
+// certified over a window IFF
+//
+//	collision_total == 0  AND  observed_total > 0  AND  evicted_total == 0.
+//
+// Any eviction (evicted_total > 0) VOIDS certification for that window → raise the
+// caps or shard, then re-measure. Dark-safe for serving regardless (never a false
+// positive). These are a DARK Step-2 bound, NOT yet validated against the live
+// wildcard (cell,digest) corpus; vars (not consts) so a test can force eviction to
+// prove it is observable. Same retune-from-corpus discipline as requesterProfileMemoCap.
+// Not env knobs (no magic env vars).
+var (
 	maxWildcardDigestEntries    = 4096
 	maxWildcardCoordsPerEntry   = 64
 	maxWildcardIdentityPerEntry = 32
@@ -153,6 +166,7 @@ func resetWildcardDigestProbeForTest() {
 	shadowWildcardDigestCollisionTotal.Store(0)
 	shadowWildcardDigestObservedTotal.Store(0)
 	shadowWildcardGatedDigestCollisionTotal.Store(0)
+	shadowWildcardDigestEvictedTotal.Store(0)
 }
 
 // domainHasWildcard reports whether D carries at least one ClassWildcard — the
@@ -207,12 +221,20 @@ func (p *wildcardDigestProbe) observe(snap *cache.RBACSnapshot, sc *shadowContex
 		p.order.MoveToFront(e.el)
 	}
 
-	if len(e.coordUnion) < maxWildcardCoordsPerEntry {
-		e.coordUnion[coord] = struct{}{}
+	if _, have := e.coordUnion[coord]; !have {
+		if len(e.coordUnion) < maxWildcardCoordsPerEntry {
+			e.coordUnion[coord] = struct{}{}
+		} else {
+			shadowWildcardDigestEvictedTotal.Add(1) // coord-cap truncation = a dropped observation
+		}
 	}
-	if _, seen := e.identities[idHandle]; !seen && len(e.identities) < maxWildcardIdentityPerEntry {
-		// RAW identity retained in-process ONLY, for the fix-(b) recompute.
-		e.identities[idHandle] = sc.identity
+	if _, seen := e.identities[idHandle]; !seen {
+		if len(e.identities) < maxWildcardIdentityPerEntry {
+			// RAW identity retained in-process ONLY, for the fix-(b) recompute.
+			e.identities[idHandle] = sc.identity
+		} else {
+			shadowWildcardDigestEvictedTotal.Add(1) // identity-cap truncation = a dropped observation
+		}
 	}
 
 	// Denominator (real path only): a (cell,digest) seen with ≥2 distinct identities.
@@ -261,6 +283,7 @@ func (p *wildcardDigestProbe) evictLRULocked() {
 	k := back.Value.(string)
 	p.order.Remove(back)
 	delete(p.entries, k)
+	shadowWildcardDigestEvictedTotal.Add(1) // a tracked (cell,digest) dropped → certification-voiding
 }
 
 // fingerprintOver is the INDEPENDENT access-hash: the requester's evaluator permit

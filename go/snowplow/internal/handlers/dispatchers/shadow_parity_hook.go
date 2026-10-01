@@ -135,6 +135,7 @@ func registerShadowParityMetrics() {
 				// is an expvar-only diagnostic (expected non-zero until enumerate lands).
 				"wildcard_digest_collision_total":       shadowWildcardDigestCollisionTotal.Load(),
 				"wildcard_digest_observed_total":        shadowWildcardDigestObservedTotal.Load(),
+				"wildcard_digest_evicted_total":         shadowWildcardDigestEvictedTotal.Load(),
 				"wildcard_gated_digest_collision_total": shadowWildcardGatedDigestCollisionTotal.Load(),
 			}
 		}))
