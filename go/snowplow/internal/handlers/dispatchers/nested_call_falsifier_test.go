@@ -40,6 +40,7 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -280,9 +281,9 @@ func nestedCallRoleBinding(ns, user string) *rbacv1.RoleBinding {
 // inner RESTAction CR (nestedInnerRESTAction) plus the RBAC grants. The
 // inner restactions informer is registered + synced so objects.Get
 // serves it.
-func newNestedCallWatcher(t *testing.T, ns, name string, bindings ...*rbacv1.RoleBinding) {
+func newNestedCallWatcher(t *testing.T, ns, name string, bindings ...*rbacv1.RoleBinding) *cache.ResourceWatcher {
 	t.Helper()
-	newNestedCallWatcherWithInner(t, ns, name, nestedInnerRESTAction(ns, name), bindings...)
+	return newNestedCallWatcherWithInner(t, ns, name, nestedInnerRESTAction(ns, name), bindings...)
 }
 
 // newNestedCallWatcherWithInner is newNestedCallWatcher with the inner
@@ -290,7 +291,7 @@ func newNestedCallWatcher(t *testing.T, ns, name string, bindings ...*rbacv1.Rol
 // status shape (e.g. nestedInnerRESTActionArrayStatus for the Ship
 // 0.30.124 content-shape falsifier).
 func newNestedCallWatcherWithInner(t *testing.T, ns, name string,
-	inner *unstructured.Unstructured, bindings ...*rbacv1.RoleBinding) {
+	inner *unstructured.Unstructured, bindings ...*rbacv1.RoleBinding) *cache.ResourceWatcher {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
@@ -339,7 +340,41 @@ func newNestedCallWatcherWithInner(t *testing.T, ns, name string,
 		t.Fatalf("WaitForCacheSync (RBAC informers): %v", err)
 	}
 	cache.SetGlobal(rw)
+	// #385: synchronously publish THIS watcher's RBAC snapshot into the global
+	// rbacSnap. WaitForCacheSync only guarantees informer HasSynced, not that this
+	// watcher's async initial publish (waitAndPublishInitialRBACSnapshot) has
+	// landed — so in the shared package binary the global can still hold a
+	// stale/foreign snapshot from a neighbour test (missing this test's seeded
+	// bindings) → spurious RBAC deny → the nested resolve falls through to the
+	// per-user path → "user *Endpoint not found in context" (#385). Built FROM rw
+	// (a leaked neighbour cannot satisfy it) and synchronous (no publish race).
+	// The watcher's OWN async initial publish may still land afterwards; that is
+	// benign (same rw, same content).
+	if err := rw.WaitInitialRBACPublishForTest(5 * time.Second); err != nil {
+		t.Fatalf("#385: %v", err)
+	}
+	cache.RebuildRBACSnapshotForTest(rw)
+	// #385 post-condition: the live global snapshot now grants each seeded
+	// binding's subject — proves the own-publish landed and cleared any stale one.
+	for _, b := range bindings {
+		for _, s := range b.Subjects {
+			opts := rbac.EvaluateOptions{
+				Verb: "get", Group: nestedCallInnerGVR.Group,
+				Resource: nestedCallInnerGVR.Resource, Namespace: b.Namespace,
+			}
+			if s.Kind == rbacv1.GroupKind {
+				opts.Groups = []string{s.Name}
+			} else {
+				opts.Username = s.Name
+			}
+			if allowed, _, err := rbac.EvaluateRBAC(context.Background(), opts); err != nil || !allowed {
+				t.Fatalf("#385 post-condition: after own-publish the global RBAC snapshot must grant %s %q get %s in ns %q (allowed=%v err=%v) — stale/foreign snapshot not cleared",
+					s.Kind, s.Name, nestedCallInnerGVR.Resource, b.Namespace, allowed, err)
+			}
+		}
+	}
 	t.Cleanup(func() { cache.SetGlobal(nil) })
+	return rw
 }
 
 // --- F5 — denied dispatch surfaces an error, NOT empty -------------------

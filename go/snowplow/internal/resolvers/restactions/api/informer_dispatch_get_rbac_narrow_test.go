@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -144,7 +145,26 @@ func newRBACNarrowGetWatcher(t *testing.T) *cache.ResourceWatcher {
 	}
 
 	cache.SetGlobal(rw)
+	// #385: synchronously publish THIS watcher's RBAC snapshot (full rationale in
+	// dispatchers newNestedCallWatcherWithInner) so the dispatch evaluates against
+	// its OWN bindings, not a stale/foreign snapshot left by a neighbour test in
+	// the shared package binary. Built FROM rw (a leaked neighbour cannot satisfy
+	// it); synchronous (no publish race). The watcher's own async initial publish
+	// may still land later — benign (same rw, same content).
+	if err := rw.WaitInitialRBACPublishForTest(5 * time.Second); err != nil {
+		t.Fatalf("#385: %v", err)
+	}
+	cache.RebuildRBACSnapshotForTest(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
+	// #385 post-condition: the live global snapshot grants the seeded narrow user
+	// in an authorized namespace — proves the own-publish landed over any stale one.
+	if allowed, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		Username: narrowUser, Verb: "get", Group: dispatchTestGVR.Group,
+		Resource: dispatchTestGVR.Resource, Namespace: authorizedNamespaces[0],
+	}); err != nil || !allowed {
+		t.Fatalf("#385: live RBAC snapshot must grant %q get %s in ns %q (allowed=%v err=%v) — stale/foreign snapshot not cleared",
+			narrowUser, dispatchTestGVR.Resource, authorizedNamespaces[0], allowed, err)
+	}
 	return rw
 }
 
@@ -282,7 +302,27 @@ func TestDispatchViaInformer_RBACNarrowing_GetGroupGrant(t *testing.T) {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
 	cache.SetGlobal(rw)
+	// #385: synchronously publish THIS watcher's RBAC snapshot (full rationale in
+	// dispatchers newNestedCallWatcherWithInner) so the dispatch evaluates against
+	// its OWN bindings, not a stale/foreign snapshot left by a neighbour test in
+	// the shared package binary. Built FROM rw (a leaked neighbour cannot satisfy
+	// it); synchronous (no publish race). The watcher's own async initial publish
+	// may still land later — benign (same rw, same content).
+	if err := rw.WaitInitialRBACPublishForTest(5 * time.Second); err != nil {
+		t.Fatalf("#385: %v", err)
+	}
+	cache.RebuildRBACSnapshotForTest(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
+
+	// #385 post-condition: the live global snapshot grants the seeded group
+	// binding — proves the own-publish landed over any stale/foreign snapshot.
+	if allowed, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		Groups: []string{"devs"}, Verb: "get", Group: dispatchTestGVR.Group,
+		Resource: dispatchTestGVR.Resource, Namespace: "team-a",
+	}); err != nil || !allowed {
+		t.Fatalf("#385: live RBAC snapshot must grant group devs get %s in team-a (allowed=%v err=%v)",
+			dispatchTestGVR.Resource, allowed, err)
+	}
 
 	// User "alice" is in group "devs".
 	raw, served := dispatchViaInformer(ctxWithUser("alice", "devs"),
