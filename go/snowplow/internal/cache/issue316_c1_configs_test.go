@@ -292,7 +292,7 @@ func TestC1Gate_Config1_BaselineHeadroom(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer func() { cancel(); resetRefresherForTest() }() // harness teardown-race fix (#366): stop+wait refresher (resetRefresherForTest waits the worker WaitGroup) before the cache reset — processNext calls ResolvedCache() sync.Once
 	StartRefresher(ctx)
 
 	base := refresherStatsSnapshot()
@@ -371,7 +371,7 @@ func TestC1Gate_Config2_ThrottleStress_F1Reachable(t *testing.T) {
 	c1RegisterRealisticRefresh(c, nil, c1SizeIndex(cells), elevation)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer func() { cancel(); resetRefresherForTest() }() // harness teardown-race fix (#366): stop+wait refresher (resetRefresherForTest waits the worker WaitGroup) before the cache reset — processNext calls ResolvedCache() sync.Once
 	StartRefresher(ctx)
 
 	// customer load throughout — assert the /call path is NEVER blocked even as
@@ -516,7 +516,7 @@ func c1RunWorstCaseBurst(t *testing.T, warmset int, sizeFn func(i int) int, labe
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer func() { cancel(); resetRefresherForTest() }() // harness teardown-race fix (#366): stop+wait refresher (resetRefresherForTest waits the worker WaitGroup) before the cache reset — processNext calls ResolvedCache() sync.Once
 	StartRefresher(ctx)
 
 	keys := make([]string, len(cells))
@@ -764,7 +764,7 @@ func c1RunColdNavArm(t *testing.T, warmset, warmFrac int, proactiveOn bool) c1Co
 	c1RegisterRealisticRefresh(c, nil, c1SizeIndex(cells), 1.0)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer func() { cancel(); resetRefresherForTest() }() // harness teardown-race fix (#366): stop+wait refresher (resetRefresherForTest waits the worker WaitGroup) before the cache reset — processNext calls ResolvedCache() sync.Once
 	StartRefresher(ctx)
 
 	base := refresherStatsSnapshot()
@@ -891,7 +891,7 @@ func TestC1Gate_Config3_SaturatingFalsifier(t *testing.T) {
 	residentBytes := c.Stats().Bytes
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer func() { cancel(); resetRefresherForTest() }() // harness teardown-race fix (#366): stop+wait refresher (resetRefresherForTest waits the worker WaitGroup) before the cache reset — processNext calls ResolvedCache() sync.Once
 	StartRefresher(ctx)
 
 	// only the still-RESIDENT cells can be refreshed; capacity eviction removed the LRU tail.
