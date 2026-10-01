@@ -360,7 +360,7 @@ type refresher struct {
 	// AFTER yieldToCustomer returns (so the dequeue, the customer-priority park,
 	// the skipped_no_entry/no_handler skips and the rate-floor defer never reach
 	// it). resolveLatencyMu serializes the P² estimator across the worker pool.
-	// The estimate is a DIAGNOSTIC sizing input (snowplow_refresher_p95_resolve_ms,
+	// The estimate is a DIAGNOSTIC sizing input (snowplow_resolve_latency_p95_ms,
 	// #384/#365), deliberately kept OUTSIDE the C7-tagged refresherStats family so
 	// it stays expvar-only — M1 is not an OTLP detector.
 	resolveLatencyMu sync.Mutex
@@ -1129,7 +1129,7 @@ func (r *refresher) recordResolveLatency(d time.Duration) {
 // RefresherP95ResolveMS returns the current p95 of the refresher's REAL resolve
 // latency in milliseconds — 0 before the pool is built or before any real
 // resolve. DIAGNOSTIC sizing input (#386 M1 → #384/#365), published as the
-// expvar scalar snowplow_refresher_p95_resolve_ms. Deliberately NOT an OTLP
+// expvar scalar snowplow_resolve_latency_p95_ms. Deliberately NOT an OTLP
 // detector and NOT in the C7-tagged refresherStats family.
 func RefresherP95ResolveMS() float64 {
 	r := refresherPeek()

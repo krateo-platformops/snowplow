@@ -215,8 +215,11 @@ All keys below are derived from the `stat` tags on `refresherStats` /
 gauges `snowplow_refresher_<stat>`; the OTLP mirror publishes the counters as
 `snowplow_refresher{stat=<stat>}` and the gauges under their expvar name. None of them
 constructs the refresher: before the first enqueue, and on a cache-off pod, every value is 0
-(#203). The one exception is `snowplow_refresher_p95_resolve_ms` (#386 M1) — a STANDALONE
-expvar scalar, deliberately NOT a C7-tagged `refresherStats` stat (so it stays expvar-only; see its row).
+(#203). The refresher's real-resolve p95 (#386 M1) is published SEPARATELY as
+`snowplow_resolve_latency_p95_ms` — a standalone expvar scalar kept OUTSIDE this
+`snowplow_refresher_` family ON PURPOSE: a C7-tagged stat would auto-mirror it to OTLP
+(the ruling excludes that), and a `snowplow_refresher_`-prefixed literal fails the C7 parity
+guard. So it stays expvar-only; see its row below.
 
 | expvar | meaning | healthy range |
 |---|---|---|
@@ -231,7 +234,7 @@ expvar scalar, deliberately NOT a C7-tagged `refresherStats` stat (so it stays e
 | `snowplow_refresher_suppressed_set_total` | **1.12.6 C4 / #191.** keys marked refresh-by-traffic-only after `REFRESH_SUPPRESS_AFTER_DECLINES` (default 3) consecutive identity-bound declines (first occurrence for external-endpoint and UAF cells) | low; each is one WARN → DEBUG transition |
 | `snowplow_refresher_suppressed_skips_total` | **1.12.6 C4 — ALERT pair.** refresh ticks skipped on a suppressed key (the #191 cure working) | proportional to suppressed keys × keep-warm ticks |
 | `snowplow_refresher_suppressed_keys` | live count of suppressed keys (gauge; cleared by the next real Put or eviction) | bounded by the store |
-| `snowplow_refresher_p95_resolve_ms` (**#386 M1** — standalone scalar, NOT a C7 `refresherStats` stat) | p95 of the REAL resolve latency (the handler re-resolve+Put in `processOne`), a P² streaming estimate sampled ONLY on the ok=true path AFTER `yieldToCustomer` returns — so it EXCLUDES the dequeue, the customer-priority park, the `skipped_no_entry`/`skipped_no_handler` skips and the rate-floor defer | a DIAGNOSTIC sizing input for #384/#365 (≈≲31ms observed). **expvar-only by design** — a sizing input read on demand, not an alert (the backlog `queue_depth`/`completed` is the alert), so deliberately NOT OTLP-mirrored and kept out of the auto-mirrored C7 family |
+| `snowplow_resolve_latency_p95_ms` (**#386 M1** — standalone scalar OUTSIDE the `snowplow_refresher_` C7 family) | p95 of the REAL resolve latency (the handler re-resolve+Put in `processOne`), a P² streaming estimate sampled ONLY on the ok=true path AFTER `yieldToCustomer` returns — so it EXCLUDES the dequeue, the customer-priority park, the `skipped_no_entry`/`skipped_no_handler` skips and the rate-floor defer | a DIAGNOSTIC sizing input for #384/#365 (≈≲31ms observed). **expvar-only by design** — a sizing input read on demand, not an alert (the backlog `queue_depth`/`completed` is the alert), so deliberately NOT OTLP-mirrored and kept out of the auto-mirrored C7 family |
 
 **#386 M2 — real drain rate (reader-computed; NO new metric).** The refresher's real
 re-resolve throughput is `Δ(snowplow_refresher_completed_total − snowplow_refresher_skipped_no_entry_total)/interval`,
