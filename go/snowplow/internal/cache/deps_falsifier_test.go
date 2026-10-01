@@ -21,6 +21,7 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -83,7 +84,7 @@ func TestFalsifierF1_AddDirtyMarksListDep(t *testing.T) {
 	gvr := gvrCompositions()
 
 	const adminL1 = "L1_admin_compositions"
-	d.RecordList(adminL1, gvr, "bench-ns-07")
+	d.RecordList(context.Background(), adminL1, gvr, "bench-ns-07")
 
 	hook := &captureHook{}
 	d.SetRefreshHook(hook.fn())
@@ -139,7 +140,7 @@ func TestFalsifierF2_DeleteDirtyMarksDependentGet(t *testing.T) {
 	// The widget GET-depends on RESTAction "list-users" — a DIFFERENT
 	// object. This is an exact (gvr, ns, name) dep, NOT the widget's own
 	// self-representation.
-	d.Record(widgetL1, restGVR, "app", "list-users")
+	d.Record(context.Background(), widgetL1, restGVR, "app", "list-users")
 
 	hook := &captureHook{}
 	d.SetRefreshHook(hook.fn())

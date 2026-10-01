@@ -24,6 +24,7 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"testing"
 )
@@ -56,8 +57,8 @@ func forwardBucketBreakdown(d *DepTracker) (live, empty, total int) {
 func TestIssue242_A_CapRollbackOnNewCoordinateDoesNotLeakBucketOrCoordinate(t *testing.T) {
 	d := newTestDepTracker(t, 2) // tiny cap
 	gvr := gvrCompositions()
-	d.Record("L1A", gvr, "ns", "n1") // bucket n1: coordinates=1, records=1
-	d.Record("L1A", gvr, "ns", "n2") // bucket n2: coordinates=2, records=2 (AT cap)
+	d.Record(context.Background(), "L1A", gvr, "ns", "n1") // bucket n1: coordinates=1, records=1
+	d.Record(context.Background(), "L1A", gvr, "ns", "n2") // bucket n2: coordinates=2, records=2 (AT cap)
 
 	before := d.Stats()
 	beforeBuckets := forwardBucketCount(d)
@@ -68,7 +69,7 @@ func TestIssue242_A_CapRollbackOnNewCoordinateDoesNotLeakBucketOrCoordinate(t *t
 	// A NEW coordinate n3: recordInternal creates the bucket (coordinates.Add(1))
 	// THEN the cap check rolls the key back. The bucket must not survive and the
 	// gauge must return to its pre-attempt value.
-	d.Record("L1A", gvr, "ns", "n3")
+	d.Record(context.Background(), "L1A", gvr, "ns", "n3")
 
 	after := d.Stats()
 	afterBuckets := forwardBucketCount(d)
@@ -96,8 +97,8 @@ func TestIssue242_A_CapRollbackOnNewCoordinateDoesNotLeakBucketOrCoordinate(t *t
 func TestIssue242_B_CapRollbackOnExistingBucketDoesNotOverPrune(t *testing.T) {
 	d := newTestDepTracker(t, 2) // tiny cap
 	gvr := gvrCompositions()
-	d.Record("L1A", gvr, "ns", "n1") // bucket n1 (count=1): coordinates=1, records=1
-	d.Record("L1B", gvr, "ns", "n1") // SAME bucket n1 (count=2): coordinates=1, records=2 (AT cap)
+	d.Record(context.Background(), "L1A", gvr, "ns", "n1") // bucket n1 (count=1): coordinates=1, records=1
+	d.Record(context.Background(), "L1B", gvr, "ns", "n1") // SAME bucket n1 (count=2): coordinates=1, records=2 (AT cap)
 
 	before := d.Stats()
 	if before.Coordinates != 1 || forwardBucketCount(d) != 1 {
@@ -109,7 +110,7 @@ func TestIssue242_B_CapRollbackOnExistingBucketDoesNotOverPrune(t *testing.T) {
 	// The bucket must SURVIVE — L1A and L1B still depend on it — and coordinates
 	// must not move. A bare CompareAndDelete without the !loadedBucket/count==0
 	// guards would delete n1 here and orphan L1A/L1B.
-	d.Record("L1C", gvr, "ns", "n1")
+	d.Record(context.Background(), "L1C", gvr, "ns", "n1")
 
 	after := d.Stats()
 	if after.RecordDroppedCap != before.RecordDroppedCap+1 {
@@ -142,8 +143,8 @@ func TestIssue242_C_GaugeInvariantUnderConcurrentCapRollback(t *testing.T) {
 			for i := 0; i < iters; i++ {
 				// Contended shared coordinates (same bucket, many keys) + unique
 				// coordinates (fresh buckets that mostly hit the cap → rollback).
-				d.Record("L1_"+itoa(g), gvr, "ns", "shared"+itoa(i%8))
-				d.Record("L1_"+itoa(g), gvr, "ns", "uniq"+itoa(g)+"_"+itoa(i))
+				d.Record(context.Background(), "L1_"+itoa(g), gvr, "ns", "shared"+itoa(i%8))
+				d.Record(context.Background(), "L1_"+itoa(g), gvr, "ns", "uniq"+itoa(g)+"_"+itoa(i))
 			}
 		}(g)
 	}

@@ -7,6 +7,7 @@
 package handlers
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -34,7 +35,7 @@ func TestIssue376_DebugDepsKeyView_IsPurePeek(t *testing.T) {
 	// bucket unless something stamps its lastRead.
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: &in, CreatedAt: time.Now().Add(-100 * time.Second)})
 	gen := c.CaptureGen(key)
-	if !c.ReplaceIfGen(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
+	if !c.ReplaceIfGen(context.Background(), key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
 		t.Fatal("setup: ReplaceIfGen must succeed")
 	}
 

@@ -444,6 +444,13 @@ func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference,
 	// no-behaviour-change cleanup: recordGetDep (objects/get.go:320-322) and
 	// resolve.go:483/:1610 all guard `l1Key != ""` → a clean no-op under the
 	// keyless ctx; the content cells keep their contentKey edges unchanged.
+	//
+	// #375 — the dep-gen SINK is separable from the #250 phantom KEY: install the sink
+	// STANDALONE (WithDepGenSink, NOT WithL1KeyContext) so this resolve's gen-guarded
+	// content Puts carry a real resolve-entry startSeq rather than a nil sink (which would
+	// fail-fresh remark every warmed cell + bump unguarded_put_total on each boot /
+	// keepwarm cycle). No L1 key is set, so no phantom restactions edge is recorded.
+	rctx = cache.WithDepGenSink(rctx)
 	res, err := restactions.Resolve(rctx, restactions.ResolveOptions{
 		In: &cr,
 		// Ship 0.30.230 fix-at-root: SArc threaded from ctx — the

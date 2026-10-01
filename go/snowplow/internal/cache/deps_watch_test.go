@@ -14,6 +14,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -68,7 +69,7 @@ func TestACR1b_AddPreSyncDropped(t *testing.T) {
 	// would be dirty-marked.
 	const adminL1 = "L1_admin_list"
 	d := Deps()
-	d.RecordList(adminL1, gvr, "bench-ns-01")
+	d.RecordList(context.Background(), adminL1, gvr, "bench-ns-01")
 	marked := 0
 	d.SetRefreshHook(func(string, schema.GroupVersionResource) { marked++ })
 
@@ -101,7 +102,7 @@ func TestACR1a_AddPostSyncDirtyMarksListDep(t *testing.T) {
 
 	const adminL1 = "L1_admin_list"
 	d := Deps()
-	d.RecordList(adminL1, gvr, "bench-ns-07")
+	d.RecordList(context.Background(), adminL1, gvr, "bench-ns-07")
 	marked := make(chan string, 8)
 	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { marked <- k })
 
@@ -147,7 +148,7 @@ func TestACO14_NilSyncChDrops(t *testing.T) {
 
 	const adminL1 = "L1_admin_list"
 	d := Deps()
-	d.RecordList(adminL1, gvr, "bench-ns-01")
+	d.RecordList(context.Background(), adminL1, gvr, "bench-ns-01")
 	marked := 0
 	d.SetRefreshHook(func(string, schema.GroupVersionResource) { marked++ })
 
@@ -186,7 +187,7 @@ func TestR3_DeleteFuncDispatchesViaWorker(t *testing.T) {
 		RawJSON: []byte(`{}`),
 		Inputs:  inputsFor(gvr, "ns", "victim"),
 	})
-	d.Record(l1Key, gvr, "ns", "victim")
+	d.Record(context.Background(), l1Key, gvr, "ns", "victim")
 
 	// 1.12.6 C1: a REAL synced informer that never held "victim", so the
 	// worker's probe reads objAbsent and evicts the self-representation.

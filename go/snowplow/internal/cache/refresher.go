@@ -439,6 +439,48 @@ func RegisterRefreshFunc(handlerKind string, fn RefreshFunc) {
 	r.handlersMu.Unlock()
 }
 
+// mergeTriggerGVR adds gvr to l1Key's pending trigger SET (#375 B). The stored value is
+// an IMMUTABLE []GVR replaced by CompareAndSwap, so a merge racing processNext's
+// LoadAndDelete can never write into a set the dequeue already consumed (the CAS on the
+// deleted key fails and the merge retries via LoadOrStore, starting a fresh set for the
+// re-enqueued key). A zero GVR is kept as an entry marker but never force-misses. Bounded
+// by the distinct GVRs that marked the key between two dequeues.
+func (r *refresher) mergeTriggerGVR(l1Key string, gvr schema.GroupVersionResource) {
+	if l1Key == "" {
+		return
+	}
+	for {
+		cur, loaded := r.triggerGVRByKey.LoadOrStore(l1Key, &triggerGVRSet{gvrs: []schema.GroupVersionResource{gvr}})
+		if !loaded {
+			return
+		}
+		var old []schema.GroupVersionResource
+		switch v := cur.(type) {
+		case *triggerGVRSet:
+			old = v.gvrs
+		case schema.GroupVersionResource:
+			old = []schema.GroupVersionResource{v}
+		}
+		if containsGVR(old, gvr) {
+			return
+		}
+		next := make([]schema.GroupVersionResource, len(old), len(old)+1)
+		copy(next, old)
+		next = append(next, gvr)
+		// CAS on the (comparable) POINTER of the immutable set: fails if a concurrent
+		// merge replaced it or processNext consumed it (LoadAndDelete) → retry.
+		if r.triggerGVRByKey.CompareAndSwap(l1Key, cur, &triggerGVRSet{gvrs: next}) {
+			return
+		}
+	}
+}
+
+// triggerGVRSet is the IMMUTABLE trigger set stored per key in triggerGVRByKey (#375
+// B/C). Never mutated after publication — a merge publishes a new one by CAS.
+type triggerGVRSet struct {
+	gvrs []schema.GroupVersionResource
+}
+
 // StartRefresher launches the worker pool. Idempotent — repeated calls
 // are no-ops (the second StartRefresher does NOT spawn more workers).
 // The pool exits cleanly when ctx is canceled OR when StopRefresher is
@@ -464,6 +506,7 @@ func StartRefresher(ctx context.Context) {
 		// branch); the memo holds the entry, so we MUST consult the memo
 		// directly, not the L1 store. The invalidator is non-blocking
 		// (drop-on-full) so this never delays the refresher enqueue path.
+		Deps().SetRefreshTriggerMergeHook(r.mergeTriggerGVR)
 		Deps().SetRefreshHook(func(l1Key string, triggerGVR schema.GroupVersionResource) {
 			// R1 Layer 1 — record the GVR whose dirty-mark enqueued this key
 			// BEFORE the queue.Add, so processNext can stamp it on the
@@ -471,7 +514,11 @@ func StartRefresher(ctx context.Context) {
 			// on concurrent re-marks (any dirtying GVR is a valid target);
 			// an empty (zero) GVR is still stored — RefreshTriggerGVRFromContext
 			// only matches a non-empty equality so a zero never force-misses.
-			r.triggerGVRByKey.Store(l1Key, triggerGVR)
+			//
+			// #375 B — MERGE into the key's trigger SET (was Store = last-write-
+			// wins, which dropped an earlier mark's GVR: two marks with different
+			// GVRs before dequeue force-missed only the later one).
+			r.mergeTriggerGVR(l1Key, triggerGVR)
 			// Path 3.2 / 0.30.218 — two-tier dispatch. If the key is a
 			// registered cluster_list cell, route it to the
 			// HIGH-PRIORITY tier; otherwise the normal tier. The
@@ -885,8 +932,13 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// floor deferral and is consumed at the eventual real dispatch.
 	rctx := ctx
 	if v, present := r.triggerGVRByKey.LoadAndDelete(key); present {
-		if tg, isGVR := v.(schema.GroupVersionResource); isGVR && !tg.Empty() {
-			rctx = WithRefreshTriggerGVR(ctx, tg)
+		switch tg := v.(type) {
+		case *triggerGVRSet: // #375 B — the merged trigger SET, consumed in full
+			rctx = WithRefreshTriggerGVRs(ctx, tg.gvrs)
+		case schema.GroupVersionResource:
+			if !tg.Empty() {
+				rctx = WithRefreshTriggerGVR(ctx, tg)
+			}
 		}
 	}
 	if err := r.processOne(rctx, key, entry, ok); err != nil {

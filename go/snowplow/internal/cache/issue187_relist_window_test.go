@@ -186,7 +186,7 @@ func TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry(t *testing.T) {
 	}
 	key := ComputeKey(*inputs)
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"pre-delete"}`), Inputs: inputs})
-	Deps().Record(key, b5GVR(), b5NS, b5Object) // the self dep edge
+	Deps().Record(context.Background(), key, b5GVR(), b5NS, b5Object) // the self dep edge
 
 	// objectGone models the delete landing INSIDE the teardown window: the
 	// first re-resolve (the relist's pre-sync dirty-mark) still finds the
@@ -290,7 +290,7 @@ func TestIssue187_B5b_RelistDoesNotEvictALiveObject(t *testing.T) {
 	}
 	key := ComputeKey(*inputs)
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: inputs})
-	Deps().Record(key, b5GVR(), b5NS, "button-live")
+	Deps().Record(context.Background(), key, b5GVR(), b5NS, "button-live")
 
 	var attempts atomic.Int64
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {

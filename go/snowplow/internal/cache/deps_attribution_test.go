@@ -16,6 +16,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -50,13 +51,13 @@ func threeClassDeps(t *testing.T) (*DepTracker, string, string, string) {
 	ns, name := "ns", "obj"
 	// self: its own dispatched object IS (gvr, ns, name).
 	store.Put("L1self", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, name)})
-	d.Record("L1self", gvr, ns, name)
+	d.Record(context.Background(), "L1self", gvr, ns, name)
 	// exact_dep: own object is a DIFFERENT object; GET-depends on (gvr,ns,name).
 	store.Put("L1exact", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "owner")})
-	d.Record("L1exact", gvr, ns, name)
+	d.Record(context.Background(), "L1exact", gvr, ns, name)
 	// list_dep: LIST-depends on (gvr, ns, *).
 	store.Put("L1list", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "listowner")})
-	d.RecordList("L1list", gvr, ns)
+	d.RecordList(context.Background(), "L1list", gvr, ns)
 	return d, "L1self", "L1exact", "L1list"
 }
 
@@ -109,9 +110,9 @@ func TestIssue239_A_TypePathAttribution(t *testing.T) {
 		store := newResolvedCache(100, 1<<20, time.Hour)
 		d.SetStore(store)
 		store.Put("L1exact", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, "ns", "owner")})
-		d.Record("L1exact", gvr, "ns", "obj")
+		d.Record(context.Background(), "L1exact", gvr, "ns", "obj")
 		store.Put("L1list", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, "ns", "listowner")})
-		d.RecordList("L1list", gvr, "ns")
+		d.RecordList(context.Background(), "L1list", gvr, "ns")
 		return d
 	}
 
@@ -198,7 +199,7 @@ func TestIssue239_B_Discrimination(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		k := "L1_" + itoa(i)
 		histore.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "o"+itoa(i))})
-		hi.RecordList(k, gvr, ns)
+		hi.RecordList(context.Background(), k, gvr, ns)
 	}
 	hi.OnObjectEvent(gvr, ns, name, objExists) // ONE event, fan-out 4
 	if got := hi.dirtyMarkTotal.Load(); got != 4 {
@@ -214,7 +215,7 @@ func TestIssue239_B_Discrimination(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		k := "L1_" + itoa(i)
 		lostore.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "o"+itoa(i))})
-		lo.Record(k, gvr, ns, "n"+itoa(i)) // exact dep on a distinct coordinate each
+		lo.Record(context.Background(), k, gvr, ns, "n"+itoa(i)) // exact dep on a distinct coordinate each
 	}
 	for i := 0; i < 4; i++ {
 		lo.OnObjectEvent(gvr, ns, "n"+itoa(i), objExists) // 4 events, fan-out 1 each

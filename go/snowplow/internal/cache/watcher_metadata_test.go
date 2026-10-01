@@ -171,7 +171,7 @@ func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
 			Name:            "victim",
 		},
 	})
-	cache.Deps().Record(l1Key, compositionGVR, "bench-ns-01", "victim")
+	cache.Deps().Record(context.Background(), l1Key, compositionGVR, "bench-ns-01", "victim")
 
 	// Trigger metadata-only registration. We use the explicit entry
 	// point so the test asserts THIS path even if predicate behaviour

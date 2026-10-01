@@ -18,6 +18,7 @@
 package cache
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -35,7 +36,7 @@ func TestPutIfGen_S189_ColdFillAcceptsAtGenZero(t *testing.T) {
 	if gen0 != 0 {
 		t.Fatalf("cold key gen want 0, got %d", gen0)
 	}
-	if !c.PutIfGen("k", entry189(`{"v":1}`), gen0) {
+	if !c.PutIfGen(context.Background(), "k", entry189(`{"v":1}`), gen0) {
 		t.Fatalf("#189: a cold-fill PutIfGen (no intervening removal) must be ACCEPTED")
 	}
 	if _, ok := c.Get("k"); !ok {
@@ -52,7 +53,7 @@ func TestPutIfGen_S189_ReplaceInPlaceSameGenAccepts(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.Put("k", entry189(`{"v":1}`))
 	gen0 := c.CaptureGen("k")
-	if !c.PutIfGen("k", entry189(`{"v":2}`), gen0) {
+	if !c.PutIfGen(context.Background(), "k", entry189(`{"v":2}`), gen0) {
 		t.Fatalf("#189: a replace-in-place PutIfGen with unchanged gen must be ACCEPTED")
 	}
 	got, ok := c.Get("k")
@@ -76,7 +77,7 @@ func TestPutIfGen_S189_RefuseAfterRealDeleteEvict(t *testing.T) {
 	c.DeleteForTest("k")
 
 	// The resolve's tail Put lands with the pre-delete body.
-	if c.PutIfGen("k", entry189(`{"v":"pre-delete"}`), gen0) {
+	if c.PutIfGen(context.Background(), "k", entry189(`{"v":"pre-delete"}`), gen0) {
 		t.Fatalf("#189: a PutIfGen carrying the pre-DELETE generation must be REFUSED")
 	}
 	if _, ok := c.Get("k"); ok {
@@ -101,7 +102,7 @@ func TestPutIfGen_S189_RefuseAfterLRUEvict(t *testing.T) {
 	if _, ok := c.Get("k"); ok {
 		t.Fatalf("setup: k should have been LRU-evicted")
 	}
-	if c.PutIfGen("k", entry189(`{"v":1}`), gen0) {
+	if c.PutIfGen(context.Background(), "k", entry189(`{"v":1}`), gen0) {
 		t.Fatalf("#189: a PutIfGen carrying the pre-LRU-eviction generation must be REFUSED")
 	}
 	if _, ok := c.Get("k"); ok {
@@ -125,13 +126,13 @@ func TestPutIfGen_S189_LRUOverRefuseThenReResolveSelfHeals(t *testing.T) {
 	c.Put("b", entry189(`{"v":"b"}`))
 
 	// The in-flight fill carrying the pre-eviction gen is REFUSED (over-refusal).
-	if c.PutIfGen("k", entry189(`{"v":1}`), staleGen) {
+	if c.PutIfGen(context.Background(), "k", entry189(`{"v":1}`), staleGen) {
 		t.Fatalf("#189: a fill carrying the pre-LRU-eviction gen must be refused (bounded over-refusal)")
 	}
 	// SELF-HEAL: the next resolve captures a FRESH gen and its fill SUCCEEDS —
 	// proving the over-refusal is a recoverable cold miss, not a dead key.
 	freshGen := c.CaptureGen("k")
-	if !c.PutIfGen("k", entry189(`{"v":1}`), freshGen) {
+	if !c.PutIfGen(context.Background(), "k", entry189(`{"v":1}`), freshGen) {
 		t.Fatalf("#189: the self-healing re-resolve (fresh gen0) must ACCEPT — the over-refusal must be a cold miss, not a permanent refusal")
 	}
 	if _, ok := c.Get("k"); !ok {
@@ -149,7 +150,7 @@ func TestPutIfGen_S189_TombstoneExpiryAllowsFreshPut(t *testing.T) {
 	staleGen := c.CaptureGen("k")
 	c.DeleteForTest("k")
 	// A stale in-flight Put is still refused while the tombstone is live.
-	if c.PutIfGen("k", entry189(`{"v":1}`), staleGen) {
+	if c.PutIfGen(context.Background(), "k", entry189(`{"v":1}`), staleGen) {
 		t.Fatalf("#189: within the tombstone window the stale Put must be refused")
 	}
 	time.Sleep(60 * time.Millisecond) // outlive the tombstone
@@ -157,7 +158,7 @@ func TestPutIfGen_S189_TombstoneExpiryAllowsFreshPut(t *testing.T) {
 	if freshGen != 0 {
 		t.Fatalf("#189: after tombstone expiry the key gen must reset to 0, got %d", freshGen)
 	}
-	if !c.PutIfGen("k", entry189(`{"v":2}`), freshGen) {
+	if !c.PutIfGen(context.Background(), "k", entry189(`{"v":2}`), freshGen) {
 		t.Fatalf("#189: after tombstone expiry a fresh-capture PutIfGen must be ACCEPTED (no permanent refusal)")
 	}
 	if _, ok := c.Get("k"); !ok {
@@ -182,7 +183,7 @@ func TestReplaceIfGen_S189_ReplacesLiveKeyAtSameGen(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.Put("k", entry189(`{"v":1}`))
 	gen0 := c.CaptureGen("k")
-	if !c.ReplaceIfGen("k", entry189(`{"v":2}`), gen0) {
+	if !c.ReplaceIfGen(context.Background(), "k", entry189(`{"v":2}`), gen0) {
 		t.Fatalf("#189: ReplaceIfGen must replace a live key at the captured generation")
 	}
 	got, ok := c.Get("k")
@@ -196,7 +197,7 @@ func TestReplaceIfGen_S189_ReplacesLiveKeyAtSameGen(t *testing.T) {
 // contract: a refresh must never create a cell for an evicted key.
 func TestReplaceIfGen_S189_RefusesAbsentKeyNeverInserts(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
-	if c.ReplaceIfGen("cold", entry189(`{"v":1}`), 0) {
+	if c.ReplaceIfGen(context.Background(), "cold", entry189(`{"v":1}`), 0) {
 		t.Fatalf("#189: ReplaceIfGen must REFUSE an absent key (replace-only, never insert)")
 	}
 	if _, ok := c.Get("cold"); ok {
@@ -205,7 +206,7 @@ func TestReplaceIfGen_S189_RefusesAbsentKeyNeverInserts(t *testing.T) {
 	c.Put("k", entry189(`{"v":1}`))
 	gen0 := c.CaptureGen("k")
 	c.DeleteForTest("k")
-	if c.ReplaceIfGen("k", entry189(`{"v":1}`), gen0) {
+	if c.ReplaceIfGen(context.Background(), "k", entry189(`{"v":1}`), gen0) {
 		t.Fatalf("#189: ReplaceIfGen must REFUSE a DELETE-evicted key (no resurrection)")
 	}
 	if _, ok := c.Get("k"); ok {
@@ -221,10 +222,10 @@ func TestReplaceIfGen_S189_RefusesWhenGenMovedUnderLiveKey(t *testing.T) {
 	staleGen := c.CaptureGen("k")
 	c.DeleteForTest("k")
 	freshGen := c.CaptureGen("k")
-	if !c.PutIfGen("k", entry189(`{"v":"fresh"}`), freshGen) {
+	if !c.PutIfGen(context.Background(), "k", entry189(`{"v":"fresh"}`), freshGen) {
 		t.Fatalf("setup: cold re-insert should succeed")
 	}
-	if c.ReplaceIfGen("k", entry189(`{"v":"stale"}`), staleGen) {
+	if c.ReplaceIfGen(context.Background(), "k", entry189(`{"v":"stale"}`), staleGen) {
 		t.Fatalf("#189: ReplaceIfGen must REFUSE a stale-gen replace over a re-inserted live key")
 	}
 	got, _ := c.Get("k")
@@ -248,7 +249,7 @@ func TestPutIfGen_S189_ConcurrentDeleteEvictRace(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); c.DeleteForTest(key) }()
-		go func() { defer wg.Done(); c.PutIfGen(key, entry189(`{"v":"pre-delete"}`), gen0) }()
+		go func() { defer wg.Done(); c.PutIfGen(context.Background(), key, entry189(`{"v":"pre-delete"}`), gen0) }()
 		wg.Wait()
 
 		// After BOTH complete, if the delete is authoritative the body must be

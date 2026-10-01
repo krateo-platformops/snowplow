@@ -209,6 +209,14 @@ func DepsStatsByStat() map[string]int64 {
 		// watchBroken=true that is never going to clear.
 		"on_object_event_degraded_no_evict_total": int64(d.OnObjectEventDegradedNoEvict),
 
+		// #375 (B) — the dep-generation guard's DETECTOR. Each unit is an ACCEPTED
+		// gen-guarded Put whose resolve ctx carried no dep-gen sink (a resolve entry
+		// outside WithL1KeyContext/WithDepGenSink). The Put was remarked once
+		// (fail-fresh), so the cell converges, but the path is unguarded. Expected 0;
+		// non-zero = #375 drift — alert. Also its own OTLP counter
+		// (snowplow_deps_unguarded_put_total).
+		"unguarded_put_total": int64(d.UnguardedPutTotal),
+
 		// --- the sampled reconcile audit (1.12.6 C3, deps_reconcile.go) ---
 		// reconcile_divergence_total is THE pipeline-health number: each unit
 		// is a resident entry whose object was ABSENT from a synced indexer

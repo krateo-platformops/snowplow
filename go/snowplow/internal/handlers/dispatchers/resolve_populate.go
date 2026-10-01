@@ -454,7 +454,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// drops the fresh bytes and does NOT emit the live-refresh signal (L1 did not
 	// change). This closes the resurrection race atomically (was the racy
 	// alive-check above) AND preserves the "evicted → no signal" contract.
-	if !c.ReplaceIfGen(key, entry, gen0) {
+	if !c.ReplaceIfGen(rctx, key, entry, gen0) {
 		log.Debug("resolveAndPopulateL1: entry evicted during refresh; not resurrecting (generation moved)",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),

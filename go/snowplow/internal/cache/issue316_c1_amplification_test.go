@@ -187,7 +187,7 @@ func c1Populate(t *testing.T, c *ResolvedCacheStore, n int, ttl, maxAge time.Dur
 			e.SeededAtBoot = true
 		}
 		c.Put(key, e)
-		Deps().Record(key, gvr, ns, name)
+		Deps().Record(context.Background(), key, gvr, ns, name)
 		if state == c1WarmGet || state == c1WarmPastMaxAge {
 			c.Get(key)
 		}

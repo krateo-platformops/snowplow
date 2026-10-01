@@ -119,7 +119,7 @@ func TestCRDPostBoot_RegistersAndServesCached_116Discriminating(t *testing.T) {
 	// that returned empty because the type was unknown at LIST time. When the
 	// type becomes available, #116's OnResourceTypeAvailable must dirty-mark it.
 	// Observe the dirty-mark via the refresh hook.
-	Deps().RecordList("L1_stale_negative_list", postBootGVR, "some-ns")
+	Deps().RecordList(context.Background(), "L1_stale_negative_list", postBootGVR, "some-ns")
 	var mu sync.Mutex
 	marked := map[string]bool{}
 	Deps().SetRefreshHook(func(k string, _ schema.GroupVersionResource) {

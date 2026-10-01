@@ -352,7 +352,7 @@ func populateWidgetContentL1(
 		// PutIfGen (insert-or-replace): gvr-discovered cells FIRST-fill post-readyz,
 		// so an insert-on-absent (gen 0) must succeed; a mid-resolve DELETE tombstones
 		// the gen → refuse.
-		if !c.PutIfGen(key, entry, capturedGen) {
+		if !c.PutIfGen(ctx, key, entry, capturedGen) {
 			log.Debug("widget_content.populate_refused_gen_moved",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
@@ -363,7 +363,10 @@ func populateWidgetContentL1(
 			return
 		}
 	} else {
-		// Pre-readyz BOOT seed — exempt (no served /call races it).
+		// Pre-readyz BOOT seed — exempt (no served /call races it). #375-uncovered BY
+		// DESIGN, like the phase1_pip_seed seedModeBoot terminal Put (#394 keeps boot a
+		// plain Put): a plain Put rides neither #189 nor #375 (both hang off IfGen); the
+		// post-readyz branch above is a PutIfGen and IS #375-covered.
 		c.Put(key, entry)
 	}
 
@@ -375,7 +378,7 @@ func populateWidgetContentL1(
 	// carries spec.apiRef and spec/status.resourcesRefs.items[] that
 	// recordWidgetDeps reads (the walker's `in` and `res` are the same CR
 	// shape; recordWidgetDeps is robust to either, but we mirror widgets.go).
-	recordWidgetDeps(log, key, gvr, res)
+	recordWidgetDeps(ctx, log, key, gvr, res)
 }
 
 // isRBACSensitiveApiRefWidget reports whether `obj` (a widget CR's

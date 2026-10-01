@@ -94,6 +94,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// with it and needs the same sanitiser — widgets.Resolve's
 	// sanitizeUndeclaredIdentityExtras — applied to the resolve input.
 
+	// #375 — the dep-generation epoch is taken at handler ENTRY, BEFORE the dispatched
+	// CR is read: an edit of that CR anywhere in [fetch, Put] must remark the Put (its
+	// self-dep is pre-declared at the WithL1KeyContextFromEpoch site below).
+	depEpoch := cache.DepGenEpochNow()
 	got := fetchObjectFn(req)
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
@@ -298,7 +302,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// WithL1KeyContext — the resolver sees an empty key and skips
 	// recording.
 	if cacheKey != "" {
-		ctx = cache.WithL1KeyContext(ctx, cacheKey)
+		ctx = cache.WithL1KeyContextFromEpoch(ctx, cacheKey, depEpoch, cache.DepKey{
+			GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
 	}
 	// #83 Option A — seed THIS top-level RESTAction as an ancestor of the
 	// nested-resolve descent BEFORE resolving. The #79 cycle-stop
@@ -502,7 +507,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// #189 — generation-guarded write. Refuse (do not resurrect a pre-
 			// delete body) if a DELETE-eviction bumped the key's generation during
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
-			putStored := cacheHandle.PutIfGen(cacheKey, &cache.ResolvedEntry{
+			putStored := cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
 				RawJSON:     encoded,
 				Inputs:      cacheInputs,
 				TTLOverride: uafTTLOverrideForEntry(cacheInputs),
@@ -526,7 +531,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				// previously-unseen RestAction GVR would record a forward
 				// edge whose DELETE/UPDATE events the watcher never wires.
 				ensureWatcherInformerForGVR(got.GVR)
-				cache.Deps().Record(cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
+				cache.Deps().Record(ctx, cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 
 				// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
 				// Put + dep-Record — never the stage-error / external-skip declines

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -67,13 +68,13 @@ func TestDebugDeps_MissingBackingEdgeDetectorAndNoBodyLeak(t *testing.T) {
 
 	// Cell WITH a backing edge: templates edge + a real backing LIST edge.
 	store.Put(backingKey, &cache.ResolvedEntry{RawJSON: body, Inputs: depsWidgetInputs("w-backing")})
-	d.Record(backingKey, restactionsGVR, "krateo-system", "some-ra")
-	d.RecordList(backingKey, backing, "krateo-system")
+	d.Record(context.Background(), backingKey, restactionsGVR, "krateo-system", "some-ra")
+	d.RecordList(context.Background(), backingKey, backing, "krateo-system")
 
 	// Cell WITHOUT a backing edge: only the RA-CR template edge (the edge-3
 	// staleness class — served by the 4a fast path pre-fix).
 	store.Put(edgelessKey, &cache.ResolvedEntry{RawJSON: body, Inputs: depsWidgetInputs("w-edgeless")})
-	d.Record(edgelessKey, restactionsGVR, "krateo-system", "some-ra")
+	d.Record(context.Background(), edgelessKey, restactionsGVR, "krateo-system", "some-ra")
 
 	// --- ?filter=missing-backing-edges ---
 	code, out := driveDebugDeps(t, "filter=missing-backing-edges")

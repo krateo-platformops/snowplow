@@ -69,7 +69,7 @@ func TestIssue1126_D4_LateDeleteDoesNotEvictTheRecreatedEntry(t *testing.T) {
 	// and a cold dispatch has already Put the CORRECT fresh entry.
 	createObj(t, rw, dyn, gvr, ns, name, newBody)
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(oldBody), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name)
+	d.Record(context.Background(), key, gvr, ns, name)
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(newBody), Inputs: widgetInputs(gvr, ns, name)})
 
 	// The DELETE from the old incarnation arrives LATE — and duplicated,
@@ -118,7 +118,7 @@ func TestIssue1126_D4b_StateAbsentStillEvictsAcrossDuplicates(t *testing.T) {
 
 	createObj(t, rw, dyn, gvr, ns, name, "x")
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name)
+	d.Record(context.Background(), key, gvr, ns, name)
 	deleteObj(t, rw, dyn, gvr, ns, name)
 
 	h := rw.depEventHandlers(gvr)
@@ -154,7 +154,7 @@ func TestIssue1126_E2_TeardownWindowEvictsNothing(t *testing.T) {
 	for _, n := range []string{"alive-a", "alive-b"} {
 		createObj(t, rw, dyn, gvr, ns, n, "x")
 		store.Put("L1_"+n, &ResolvedEntry{RawJSON: []byte(`{"v":"` + n + `"}`), Inputs: widgetInputs(gvr, ns, n)})
-		d.Record("L1_"+n, gvr, ns, n)
+		d.Record(context.Background(), "L1_"+n, gvr, ns, n)
 	}
 	h := rw.depEventHandlers(gvr)
 
@@ -248,7 +248,7 @@ func TestIssue1126_C2_UnknownDegradesToDirtyMarkAfterTheBudget(t *testing.T) {
 	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { marked <- k })
 
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"resident"}`), Inputs: widgetInputs(other, ns, name)})
-	d.Record(key, other, ns, name)
+	d.Record(context.Background(), key, other, ns, name)
 
 	h := rw.depEventHandlers(other)
 	h.DeleteFunc(unstructuredObj(other, ns, name))

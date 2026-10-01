@@ -90,7 +90,56 @@ func WithL1KeyContext(ctx context.Context, l1Key string) context.Context {
 	if ctx == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, ctxKeyL1Record, l1Key)
+	// #375 (option c) — a resolve that sets an L1 key is a resolve-terminal-Put ENTRY.
+	// Install the per-resolve dep-gen sink HERE (WithDepGenSink captures startSeq at entry,
+	// before any dep read) so EVERY such resolve is guarded STRUCTURALLY — no per-entry
+	// drift to enumerate. Each distinct resolve (distinct l1Key) gets its own sink; nested
+	// inner-call dispatch PRESERVES the parent ctx (one sink per resolve). A gen-guarded Put
+	// whose ctx has no sink (a resolve that Put without setting an L1 key — e.g. a content-
+	// populate path keyed directly) is caught by remarkIfDepsMoved's nil-sink detector.
+	return WithDepGenSink(context.WithValue(ctx, ctxKeyL1Record, l1Key))
+}
+
+// DepGenEpochNow returns the current dep-event sequence (#375). A customer handler
+// captures it at ENTRY, BEFORE its first read of the dispatched CR (fetchObjectFn), and
+// hands it to WithL1KeyContextFromEpoch: the CR is read before the L1 key is known, so
+// WithL1KeyContext's own capture would come too late to see an edit of that CR.
+func DepGenEpochNow() uint64 { return depEventSeq.Load() }
+
+// DepGenStartSeqFromContext returns the startSeq of ctx's dep-gen sink and true, or 0
+// and false when ctx carries no sink (#375 C2). A NESTED resolve whose input was read
+// under the ENCLOSING resolve (apiref's RAFullList cell: the RESTAction is fetched under
+// the widget ctx before fullCtx exists) hands it to WithL1KeyContextFromEpoch, so its own
+// sink starts no later than that read.
+func DepGenStartSeqFromContext(ctx context.Context) (uint64, bool) {
+	s := depGenSinkFromContext(ctx)
+	if s == nil {
+		return 0, false
+	}
+	return s.startSeq, true
+}
+
+// WithL1KeyContextFromEpoch is WithL1KeyContext for a resolve whose entry reads came
+// BEFORE the key was known (#375, CR self-dep, TL ruling): the sink's startSeq is the
+// handler-entry epoch, and pre lists the coordinates already read under it — the
+// dispatched CR's self coordinate — which the handler otherwise Records only AFTER the
+// accepted Put. An edit of the CR anywhere in [fetch, Put] then remarks the Put.
+func WithL1KeyContextFromEpoch(ctx context.Context, l1Key string, epoch uint64, pre ...DepKey) context.Context {
+	if l1Key == "" {
+		loudFailEmptyL1Key("WithL1KeyContextFromEpoch")
+		return ctx
+	}
+	if ctx == nil {
+		return ctx
+	}
+	if now := depEventSeq.Load(); epoch > now {
+		epoch = now
+	}
+	return context.WithValue(context.WithValue(ctx, ctxKeyL1Record, l1Key), ctxKeyDepGenSink, &depGenSink{
+		startSeq: epoch,
+		deps:     append([]DepKey(nil), pre...),
+		parent:   depGenSinkFromContext(ctx),
+	})
 }
 
 // loudFailEmptyL1Key implements the O15 empty-l1Key contract: panic in
@@ -381,16 +430,67 @@ func WithRefreshTriggerGVR(ctx context.Context, gvr schema.GroupVersionResource)
 	return context.WithValue(ctx, ctxKeyRefreshTriggerGVR, gvr)
 }
 
+// refreshTriggerSet is the multi-GVR form of the R1 Layer 1 marker (#375 B): the
+// refresher accumulates EVERY GVR that dirty-marked / remarked a key before its dequeue
+// (pre-#375 a second mark overwrote the first, so only the last GVR force-missed).
+type refreshTriggerSet []schema.GroupVersionResource
+
+// WithRefreshTriggerGVRs is WithRefreshTriggerGVR for a SET of trigger GVRs (#375 B):
+// apistageContentServe force-misses a content cell whose own GVR is ANY member. Zero
+// GVRs are dropped; an empty set returns ctx unchanged (no forced miss).
+func WithRefreshTriggerGVRs(ctx context.Context, gvrs []schema.GroupVersionResource) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	set := make(refreshTriggerSet, 0, len(gvrs))
+	for _, g := range gvrs {
+		if !g.Empty() && !containsGVR(set, g) {
+			set = append(set, g)
+		}
+	}
+	switch len(set) {
+	case 0:
+		return ctx
+	case 1:
+		return context.WithValue(ctx, ctxKeyRefreshTriggerGVR, set[0])
+	}
+	return context.WithValue(ctx, ctxKeyRefreshTriggerGVR, set)
+}
+
 // RefreshTriggerGVRFromContext returns the trigger GVR set by
 // WithRefreshTriggerGVR and true, or a zero GVR and false when the ctx is
-// not a refresher re-resolve (every request-path /call). apistageContentServe
-// consults it to decide a forced-miss on dep-edge equality.
+// not a refresher re-resolve (every request-path /call). For a multi-GVR
+// trigger set (WithRefreshTriggerGVRs) it returns the first member; use
+// RefreshTriggerHas for the membership test.
 func RefreshTriggerGVRFromContext(ctx context.Context) (schema.GroupVersionResource, bool) {
 	if ctx == nil {
 		return schema.GroupVersionResource{}, false
 	}
-	v, ok := ctx.Value(ctxKeyRefreshTriggerGVR).(schema.GroupVersionResource)
-	return v, ok
+	switch v := ctx.Value(ctxKeyRefreshTriggerGVR).(type) {
+	case schema.GroupVersionResource:
+		return v, true
+	case refreshTriggerSet:
+		if len(v) > 0 {
+			return v[0], true
+		}
+	}
+	return schema.GroupVersionResource{}, false
+}
+
+// RefreshTriggerHas reports whether gvr is a refresh trigger of this re-resolve
+// (single marker or any member of a trigger set). A zero gvr never matches.
+// apistageContentServe consults it to decide a forced-miss on dep-edge equality.
+func RefreshTriggerHas(ctx context.Context, gvr schema.GroupVersionResource) bool {
+	if ctx == nil || gvr.Empty() {
+		return false
+	}
+	switch v := ctx.Value(ctxKeyRefreshTriggerGVR).(type) {
+	case schema.GroupVersionResource:
+		return v == gvr
+	case refreshTriggerSet:
+		return containsGVR(v, gvr)
+	}
+	return false
 }
 
 // Dependency env knobs.
@@ -428,6 +528,139 @@ type DepKey struct {
 type keySet struct {
 	keys  sync.Map // map[string]struct{}  (l1Key -> {})
 	count atomic.Int64
+	// #375 (option c) — the generation of the LAST dep-event that touched this
+	// coordinate's bucket, stamped from the monotonic depEventSeq by the handler-only
+	// bumpCoordinateGen (R1: only on a real post-indexer OnObjectEvent, never on the
+	// read-only collectMatchesWithDep callers). A resolve captures startSeq at ENTRY;
+	// at its accepted Put, lastBumpSeq > startSeq for any recorded dep ⇒ the dep moved
+	// DURING the resolve ⇒ PUT-THEN-REMARK. Atomic; read lock-free by the Put-check.
+	lastBumpSeq atomic.Uint64
+}
+
+// depEventSeq is the process-global monotonic dep-event sequence (#375 option c).
+// bumpCoordinateGen advances it once per real OnObjectEvent and stamps the value onto
+// the changed coordinate's forward buckets' lastBumpSeq. A resolve snapshots it at ENTRY
+// (startSeq, via WithDepGenSink); the accepted-Put check compares recorded deps'
+// lastBumpSeq against startSeq (strictly >, since the seq is monotone).
+var depEventSeq atomic.Uint64
+
+// depGenSink is the per-resolve dep-generation sink (#375 option c). Installed at a
+// resolve-terminal-Put ENTRY via WithDepGenSink, which captures startSeq BEFORE any dep
+// read. recordInternal appends each recorded DepKey (gated on the sink being present, like
+// the activeCaptures tap). remarkIfDepsMoved reads it on the accepted Put.
+type depGenSink struct {
+	startSeq uint64
+	mu       sync.Mutex
+	deps     []DepKey
+	// parent is the enclosing resolve's sink when this is a CHILD sink installed by
+	// WithContentDepGenSink (#375 A): a content cell Put nested inside an outer resolve.
+	// recordInternal appends to the child AND every ancestor, so the outer resolve's
+	// Put-check still sees every dep its nested content reads recorded.
+	parent *depGenSink
+	// seen dedups deps (a resolve re-Records the same coordinate many times, and every
+	// Record is appended to each ancestor sink). Lazily initialised under mu.
+	seen map[DepKey]struct{}
+	// #375 C3 — the post-Put window. Set by remarkIfDepsMoved on an ACCEPTED gen-guarded
+	// Put checked against this sink: putKey is the key that was Put, checkedSeq the
+	// dep-event seq at the check, putRemarked whether that check (or a later re-check)
+	// already remarked putKey. A dep Recorded for putKey AFTER the Put (the content /
+	// customer handlers Record only on accept, #189) has no edge during
+	// [check, Record): an event there dirty-marks nothing on a cold cell. recordInternal
+	// therefore re-checks such a Record against checkedSeq and remarks putKey once.
+	putKey      string
+	checkedSeq  uint64
+	putRemarked bool
+}
+
+// addDepLocked appends dk unless already present. Caller holds s.mu.
+func (s *depGenSink) addDepLocked(dk DepKey) {
+	if s.seen == nil {
+		s.seen = make(map[DepKey]struct{}, len(s.deps)+4)
+		for _, d := range s.deps {
+			s.seen[d] = struct{}{}
+		}
+	}
+	if _, dup := s.seen[dk]; dup {
+		return
+	}
+	s.seen[dk] = struct{}{}
+	s.deps = append(s.deps, dk)
+}
+
+type ctxKeyDepGenSinkType struct{}
+
+var ctxKeyDepGenSink = ctxKeyDepGenSinkType{}
+
+// WithDepGenSink installs a per-resolve dep-gen sink on ctx and snapshots startSeq at
+// resolve ENTRY (before any data read) — the (c) capture point. Call ONCE at each
+// resolve-terminal-Put entry (resolve.go, apiref, resolve_populate, boot seed, reseed
+// core). A gen-guarded Put whose ctx has NO sink is a drifted entry (see remarkIfDepsMoved).
+func WithDepGenSink(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	// Chain to an enclosing resolve's sink (a nested WithL1KeyContext — resolve:true
+	// nested dispatch, apiref's RAFullList fullCtx): the nested resolve's Records also
+	// reach the outer resolve's Put-check, because the outer body embeds the nested output.
+	return context.WithValue(ctx, ctxKeyDepGenSink, &depGenSink{
+		startSeq: depEventSeq.Load(),
+		parent:   depGenSinkFromContext(ctx),
+	})
+}
+
+// WithContentDepGenSink installs a CHILD dep-gen sink for an identity-free CONTENT cell
+// (apistage content / cluster_list collapse cell) whose fetch + gen-guarded Put run NESTED
+// inside an outer resolve (#375 A, TL ruling). Call it at the content cell's own resolve
+// entry — BEFORE its data read. It:
+//   - captures the cell's OWN startSeq (the (c) capture point for the cell);
+//   - PRE-DECLARES the cell's own coordinate (gvr, namespace, name; name "" = LIST
+//     wildcard) — the cell Records its dep only AFTER its accepted Put (#189: no edge for
+//     a refused Put), so without the pre-declaration the Put-check could never see it;
+//   - chains to the outer sink (parent), so Records made under the child still reach the
+//     outer resolve's Put-check.
+//
+// The content PutIfGen then checks exactly the cell's own coordinate against the cell's
+// own entry seq — no false positives from the outer resolve's unrelated deps.
+func WithContentDepGenSink(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	if name == "" {
+		name = listWildcard
+	}
+	return context.WithValue(ctx, ctxKeyDepGenSink, &depGenSink{
+		startSeq: depEventSeq.Load(),
+		deps:     []DepKey{{GVR: gvr, Namespace: namespace, Name: name}},
+		parent:   depGenSinkFromContext(ctx),
+	})
+}
+
+func depGenSinkFromContext(ctx context.Context) *depGenSink {
+	if ctx == nil {
+		return nil
+	}
+	s, _ := ctx.Value(ctxKeyDepGenSink).(*depGenSink)
+	return s
+}
+
+// unguardedPutHook is a test-build seam: when non-nil it fires on a nil-sink accepted
+// gen-guarded Put (a drifted resolve-entry). Production leaves it nil (the drift is
+// handled by the detector counter + a one-shot remark); the test build sets it to fail
+// loudly so a missed resolve-entry sink-install goes RED in CI (#375 (B)).
+//
+// Atomic so a test can install/clear it while Puts run on other goroutines (-race).
+var unguardedPutHook atomic.Pointer[func(l1Key string)]
+
+// depGenRemarkObserver is a test-build seam (nil in production): when non-nil it is told
+// every PUT-THEN-REMARK remarkIfDepsMoved fires, with the reason ("moved" | "nil_sink").
+// The remark itself (EnqueueRefresh) is unchanged; this only lets arms COUNT remarks on a
+// channel distinct from the dirty-mark fan-out (which goes through enqueueFn).
+var depGenRemarkObserver atomic.Pointer[func(l1Key, reason string)]
+
+func observeDepGenRemark(l1Key, reason string) {
+	if fn := depGenRemarkObserver.Load(); fn != nil {
+		(*fn)(l1Key, reason)
+	}
 }
 
 // depSet is the DepKey set stored under a reverse l1Key index entry.
@@ -474,6 +707,20 @@ type DepTracker struct {
 	// capture is open anywhere, so the hot record path pays a single atomic
 	// load in the overwhelmingly common no-capture case.
 	activeCaptures atomic.Int64
+
+	// #375 (B) — DETECTOR: accepted gen-guarded Puts whose resolve ctx carried NO
+	// dep-gen sink (a resolve-entry that drifted = didn't install one). Expected 0;
+	// non-zero ⇒ an unguarded resolve path. Hand-wired to OTLP + expvar.
+	unguardedPutTotal atomic.Uint64
+
+	// #375 (option c, fix ii — TL ruling) — per-GVR floor: the depEventSeq of the LAST
+	// OnObjectEvent on ANY coordinate of the GVR (gvr -> *atomic.Uint64). bumpCoordinateGen
+	// stamps only EXISTING forward buckets, and an empty bucket is pruned, so a COLD
+	// coordinate (no dependent at event time) would otherwise be created later by
+	// recordInternal with lastBumpSeq=0 and a [entry,Record] churn on it would go unseen.
+	// A newly created bucket inherits this floor instead. Bounded by the number of GVRs
+	// that ever produced a dep event (not a per-coordinate map).
+	gvrLastBump sync.Map
 
 	// totalRecords is the global record count — bounded by maxRecords.
 	totalRecords atomic.Int64
@@ -564,6 +811,18 @@ type DepTracker struct {
 	// for the dep-edge-equality forced-miss.
 	enqueueMu sync.RWMutex
 	enqueueFn func(l1Key string, triggerGVR schema.GroupVersionResource)
+	// mergeTriggersFn (#375 B) merges one more trigger GVR into l1Key's pending
+	// trigger set WITHOUT enqueueing — so a remark carrying several moved GVRs is still
+	// ONE enqueue. Wired by the refresher via SetRefreshTriggerMergeHook; nil-safe.
+	mergeTriggersFn func(l1Key string, triggerGVR schema.GroupVersionResource)
+}
+
+// SetRefreshTriggerMergeHook installs the refresher's trigger-set merge (#375 B).
+// Used together with SetRefreshHook by StartRefresher.
+func (d *DepTracker) SetRefreshTriggerMergeHook(fn func(l1Key string, triggerGVR schema.GroupVersionResource)) {
+	d.enqueueMu.Lock()
+	d.mergeTriggersFn = fn
+	d.enqueueMu.Unlock()
 }
 
 // depsInstance is the singleton — lazily initialised on first call to
@@ -646,7 +905,7 @@ func (d *DepTracker) SetRefreshHook(fn func(l1Key string, triggerGVR schema.Grou
 // When the global record cap is reached, the call is silently dropped
 // (counter `record_dropped_cap_total` increments). The first cap-hit
 // also emits a one-shot WARN log line.
-func (d *DepTracker) Record(l1Key string, gvr schema.GroupVersionResource, namespace, name string) {
+func (d *DepTracker) Record(ctx context.Context, l1Key string, gvr schema.GroupVersionResource, namespace, name string) {
 	if d == nil {
 		return
 	}
@@ -662,13 +921,13 @@ func (d *DepTracker) Record(l1Key string, gvr schema.GroupVersionResource, names
 		// list-scope must use RecordList explicitly.
 		return
 	}
-	d.recordInternal(l1Key, DepKey{GVR: gvr, Namespace: namespace, Name: name})
+	d.recordInternal(ctx, l1Key, DepKey{GVR: gvr, Namespace: namespace, Name: name})
 }
 
 // RecordList stores a list-scope dependency edge: l1Key depends on
 // every object of (gvr) in namespace (or cluster-wide when namespace is
 // ""). Internally encodes the bucket as (gvr, namespace, "*").
-func (d *DepTracker) RecordList(l1Key string, gvr schema.GroupVersionResource, namespace string) {
+func (d *DepTracker) RecordList(ctx context.Context, l1Key string, gvr schema.GroupVersionResource, namespace string) {
 	if d == nil {
 		return
 	}
@@ -678,12 +937,30 @@ func (d *DepTracker) RecordList(l1Key string, gvr schema.GroupVersionResource, n
 		loudFailEmptyL1Key("RecordList")
 		return
 	}
-	d.recordInternal(l1Key, DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
+	d.recordInternal(ctx, l1Key, DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
 }
 
 // recordInternal is the shared body of Record + RecordList. Idempotent;
 // honours the global cap.
-func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
+func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey) {
+	// #375 (option c) — append the recorded dep to the per-resolve sink (installed at
+	// resolve ENTRY via WithDepGenSink), gated like the capture tap below. The accepted-
+	// Put check (remarkIfDepsMoved) compares each recorded dep's bucket lastBumpSeq to
+	// startSeq. Appended BEFORE the dedup early-return so the resolve's dep set is complete.
+	var recheck *depGenSink
+	for s := depGenSinkFromContext(ctx); s != nil; s = s.parent {
+		s.mu.Lock()
+		s.addDepLocked(dk)
+		if recheck == nil && s.putKey != "" && s.putKey == l1Key && !s.putRemarked {
+			recheck = s // #375 C3: a Record for a key this sink's resolve already Put
+		}
+		s.mu.Unlock()
+	}
+	if recheck != nil {
+		// After the edge is in place (deferred past the forward insert below), so an
+		// event is then either seen by this re-check or dirty-marks through the edge.
+		defer d.recheckAfterPutRecord(recheck, l1Key, dk)
+	}
 	// [C2-A] edge-3 capture tap — at the VERY TOP, BEFORE the forward
 	// LoadOrStore and the idempotent dedup early-return below. An idempotent
 	// re-Record (an edge the key already holds) still BELONGS in an open
@@ -696,11 +973,15 @@ func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
 	}
 	// Forward: DepKey -> *keySet[l1Key]
 	ksI, loadedBucket := d.forward.LoadOrStore(dk, &keySet{})
+	ks := ksI.(*keySet)
 	if !loadedBucket {
 		// A coordinate nothing depended on until now (#239).
 		d.coordinates.Add(1)
+		// #375 fix (ii) — a COLD bucket inherits the GVR's last-bump floor, read AFTER the
+		// bucket is published: bumpCoordinateGen raises the floor BEFORE it Loads buckets,
+		// so either its Load sees this bucket or this read sees its floor (seq-cst atomics).
+		storeMaxSeq(&ks.lastBumpSeq, d.gvrLastBumpSeq(dk.GVR))
 	}
-	ks := ksI.(*keySet)
 	if _, loaded := ks.keys.LoadOrStore(l1Key, struct{}{}); loaded {
 		return // already recorded — idempotent no-op
 	}
@@ -741,6 +1022,227 @@ func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
 	if _, loaded := ds.deps.LoadOrStore(dk, struct{}{}); !loaded {
 		ds.count.Add(1)
 	}
+}
+
+// bumpCoordinateGen is the #375 (option c) handler-only gen bump (R1). It advances the
+// global depEventSeq ONCE and stamps the new value onto every EXISTING forward bucket the
+// changed coordinate matches — exact + ns-wildcard + list-wildcard — mirroring
+// collectMatchesWithDep's addAll bucket set, so a resolve that recorded ANY of those
+// (incl. a LIST edge whose individual member it never read) sees the move. MUST be called
+// ONLY from the post-indexer mutation handler (OnObjectEvent), BEFORE the dirty-mark
+// fan-out (R2: Store-before-mark), and NEVER from the read-only collectMatchesWithDep
+// callers (:943 membership, :1326 iterate) — a read-path bump would be a spurious gen move.
+func (d *DepTracker) bumpCoordinateGen(gvr schema.GroupVersionResource, namespace, name string) {
+	if d == nil {
+		return
+	}
+	s := depEventSeq.Add(1)
+	fireDepBumpHook("after_add") // test seam (nil in prod): the torn [Add→Store] window
+	// #375 fix (ii) — raise the per-GVR floor FIRST (even when no bucket exists yet), so a
+	// bucket created after this point by a racing recordInternal inherits s (see there).
+	fI, _ := d.gvrLastBump.LoadOrStore(gvr, new(atomic.Uint64))
+	storeMaxSeq(fI.(*atomic.Uint64), s)
+	stamp := func(dk DepKey) {
+		if ksI, ok := d.forward.Load(dk); ok {
+			storeMaxSeq(&ksI.(*keySet).lastBumpSeq, s)
+		}
+	}
+	stamp(DepKey{GVR: gvr, Namespace: namespace, Name: name})
+	if namespace != "" {
+		stamp(DepKey{GVR: gvr, Namespace: "", Name: name})
+	}
+	stamp(DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
+	if namespace != "" {
+		stamp(DepKey{GVR: gvr, Namespace: "", Name: listWildcard})
+	}
+	fireDepBumpHook("after_store") // test seam (nil in prod): the R2 [Store→mark] window
+}
+
+// depBumpHook is a test-build seam (nil in production) fired inside bumpCoordinateGen at
+// the two #375 (D) windows: "after_add" (depEventSeq advanced, buckets not yet stamped —
+// the torn [Add→Store] window) and "after_store" (buckets stamped, dirty-mark fan-out not
+// yet run — the R2 window). The R2 / torn-window arms land a Put there.
+var depBumpHook atomic.Pointer[func(stage string)]
+
+func fireDepBumpHook(stage string) {
+	if fn := depBumpHook.Load(); fn != nil {
+		(*fn)(stage)
+	}
+}
+
+// bumpResourceTypeGen is bumpCoordinateGen's TYPE-LEVEL twin (#375, TL ruling): the four
+// GVR-lifecycle dirty-mark sources (OnResourceTypeAvailable / Removed / SchemaRelisted /
+// StoreRepaired) mark every dependent of a whole GVR without an OnObjectEvent, so they
+// must advance the generation too, or a resolve in flight across a CRD add / delete /
+// schema relist / store repair could have its type-level mark consumed while it is
+// non-resident and its Put-check see no move. It advances depEventSeq ONCE, raises the
+// GVR floor (cold buckets), and stamps every bucket of the GVR the matching
+// collectTypeMatches scan would fan out to (LIST buckets only when listOnly). Called by
+// those handlers BEFORE collectTypeMatches + the fan-out (R2). R1: each caller fires
+// after the new data is readable — see the enumeration in the #375 PR body.
+func (d *DepTracker) bumpResourceTypeGen(gvr schema.GroupVersionResource, listOnly bool) {
+	if d == nil {
+		return
+	}
+	s := depEventSeq.Add(1)
+	fireDepBumpHook("after_add")
+	fI, _ := d.gvrLastBump.LoadOrStore(gvr, new(atomic.Uint64))
+	storeMaxSeq(fI.(*atomic.Uint64), s)
+	d.forward.Range(func(k, v any) bool {
+		dk := k.(DepKey)
+		if dk.GVR == gvr && (!listOnly || dk.Name == listWildcard) {
+			storeMaxSeq(&v.(*keySet).lastBumpSeq, s)
+		}
+		return true
+	})
+	fireDepBumpHook("after_store")
+}
+
+// gvrLastBumpSeq returns the per-GVR floor (#375 fix ii): the seq of the last dep event
+// on any coordinate of gvr, 0 when the GVR never produced one.
+func (d *DepTracker) gvrLastBumpSeq(gvr schema.GroupVersionResource) uint64 {
+	if fI, ok := d.gvrLastBump.Load(gvr); ok {
+		return fI.(*atomic.Uint64).Load()
+	}
+	return 0
+}
+
+// storeMaxSeq raises a to v if v is larger (monotone CAS-max). Two handlers can stamp
+// out of seq order; a plain Store could LOWER a floor/bucket below a seq a cold-bucket
+// inheritor or a Put-check needs to see.
+func storeMaxSeq(a *atomic.Uint64, v uint64) {
+	for {
+		cur := a.Load()
+		if v <= cur || a.CompareAndSwap(cur, v) {
+			return
+		}
+	}
+}
+
+// remarkIfDepsMoved is the #375 (option c) PUT-THEN-REMARK check, called on an ACCEPTED
+// gen-guarded Put (PutIfGen/ReplaceIfGen; PutRAFullListIfGen via PutIfGen), AFTER putCoreLocked + the
+// store lock is released (the enqueue must not run under c.mu). Semantics:
+//   - NIL sink (drifted resolve-entry: ctx never installed one) → remark THIS key ONCE
+//     (fail-fresh) + unguardedPutTotal++ (detector) + fire unguardedPutHook (test-build
+//     RED). NOT startSeq=0 (that would remark EVERY Put = amplification).
+//   - EMPTY sink (legit no-deps resolve) → no remark.
+//   - any recorded dep that moved since startSeq → remark THIS key ONCE, keeping the
+//     just-Put body warm. "Moved" = its bucket's lastBumpSeq > startSeq, or — when the
+//     bucket is gone (pruned between Record and Put) — its GVR floor > startSeq
+//     (conservative, fix ii).
+//
+// The remark goes through the SAME refresher hook the dirty-mark fan-out uses
+// (enqueueRemark) — one enqueue per Put, carrying EVERY moved dep's GVR as refresh
+// triggers (#375 B): the re-resolve force-misses the content cells of those GVRs
+// (apistageContentServe forceContentMiss) instead of re-reading a content cell that may
+// itself be stale, and a cluster_list cell keeps its high-priority tier.
+func (d *DepTracker) remarkIfDepsMoved(ctx context.Context, l1Key string) {
+	if d == nil || l1Key == "" {
+		return
+	}
+	s := depGenSinkFromContext(ctx)
+	if s == nil {
+		d.unguardedPutTotal.Add(1)
+		if fn := unguardedPutHook.Load(); fn != nil {
+			(*fn)(l1Key)
+		}
+		observeDepGenRemark(l1Key, "nil_sink")
+		d.enqueueRemark(l1Key, nil) // fail-fresh: the one drifted key
+		return
+	}
+	s.mu.Lock()
+	deps := append([]DepKey(nil), s.deps...)
+	// #375 C3 — remember this accepted Put so a Record for l1Key landing after the check
+	// can be re-checked (recheckAfterPutRecord). checkedSeq is taken BEFORE the dep scan:
+	// an event racing the scan is seen by the scan or by the re-check, never by neither.
+	s.putKey = l1Key
+	s.checkedSeq = depEventSeq.Load()
+	s.putRemarked = false
+	s.mu.Unlock()
+	var moved []schema.GroupVersionResource
+	for _, dk := range deps {
+		if d.depMovedSince(dk, s.startSeq) && !containsGVR(moved, dk.GVR) {
+			moved = append(moved, dk.GVR)
+		}
+	}
+	if len(moved) > 0 {
+		s.mu.Lock()
+		s.putRemarked = true
+		s.mu.Unlock()
+		observeDepGenRemark(l1Key, "moved")
+		d.enqueueRemark(l1Key, moved) // once per Put, not per dep
+	}
+}
+
+// recheckAfterPutRecord is #375 C3: dk was just Recorded for l1Key, which s's resolve
+// already Put and checked (the content / customer handlers Record only after an accepted
+// Put, #189). An event on dk in [Put-check, Record) found no edge (a cold cell has none
+// until this Record), so its dirty-mark was lost. The new bucket inherits the GVR floor
+// (fix ii), so dk reads as moved since checkedSeq exactly when such an event happened.
+// Then remark l1Key ONCE (putRemarked), carrying dk's GVR. Idempotent with a dirty-mark
+// that does find the edge (an event after the Record): both enqueue the same key.
+func (d *DepTracker) recheckAfterPutRecord(s *depGenSink, l1Key string, dk DepKey) {
+	s.mu.Lock()
+	checked := s.checkedSeq
+	done := s.putRemarked || s.putKey != l1Key
+	s.mu.Unlock()
+	if done || !d.depMovedSince(dk, checked) {
+		return
+	}
+	s.mu.Lock()
+	if s.putRemarked {
+		s.mu.Unlock()
+		return
+	}
+	s.putRemarked = true
+	s.mu.Unlock()
+	observeDepGenRemark(l1Key, "moved_after_put")
+	d.enqueueRemark(l1Key, []schema.GroupVersionResource{dk.GVR})
+}
+
+func containsGVR(gs []schema.GroupVersionResource, g schema.GroupVersionResource) bool {
+	for _, x := range gs {
+		if x == g {
+			return true
+		}
+	}
+	return false
+}
+
+// depMovedSince reports whether dk saw a dep event after seq: its bucket's lastBumpSeq,
+// or the GVR floor when no bucket exists (fix ii, conservative).
+func (d *DepTracker) depMovedSince(dk DepKey, seq uint64) bool {
+	if ksI, ok := d.forward.Load(dk); ok {
+		return ksI.(*keySet).lastBumpSeq.Load() > seq
+	}
+	return d.gvrLastBumpSeq(dk.GVR) > seq
+}
+
+// enqueueRemark schedules the PUT-THEN-REMARK refresh of l1Key ONCE through the
+// refresher's dirty-mark hook (trigger GVRs merged into the key's trigger set + tier
+// routing), falling back to EnqueueRefresh when no hook is installed (refresher not
+// started). No triggers (nil-sink) → one hook call with the zero GVR (never force-misses).
+func (d *DepTracker) enqueueRemark(l1Key string, triggers []schema.GroupVersionResource) {
+	d.enqueueMu.RLock()
+	fn := d.enqueueFn
+	mfn := d.mergeTriggersFn
+	d.enqueueMu.RUnlock()
+	if fn == nil {
+		EnqueueRefresh(l1Key)
+		return
+	}
+	if len(triggers) == 0 {
+		fn(l1Key, schema.GroupVersionResource{})
+		return
+	}
+	// Merge all but the last trigger into the key's pending trigger set WITHOUT
+	// enqueueing, then one hook call (merge-last + enqueue) — one remark per Put.
+	if mfn != nil {
+		for _, g := range triggers[:len(triggers)-1] {
+			mfn(l1Key, g)
+		}
+	}
+	fn(l1Key, triggers[len(triggers)-1])
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -843,16 +1345,16 @@ func (d *DepTracker) EndCapture(l1Key string, h *[]DepKey) []DepKey {
 // it first ensures the backing GVR's informer exists so a later event on the
 // replayed coordinate actually fires. nil-safe on dst=="" (never routes an
 // empty key through the loudFail).
-func (d *DepTracker) ReplayEdges(dst string, edges []DepKey) {
+func (d *DepTracker) ReplayEdges(ctx context.Context, dst string, edges []DepKey) {
 	if d == nil || dst == "" {
 		return
 	}
 	for _, e := range edges {
 		d.ensureInformer(e.GVR)
 		if e.Name == listWildcard {
-			d.RecordList(dst, e.GVR, e.Namespace)
+			d.RecordList(ctx, dst, e.GVR, e.Namespace)
 		} else {
-			d.Record(dst, e.GVR, e.Namespace, e.Name)
+			d.Record(ctx, dst, e.GVR, e.Namespace, e.Name)
 		}
 	}
 }
@@ -1027,6 +1529,11 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 	if state == objAbsent {
 		notifyObjectGone(gvr, namespace, name)
 	}
+	// #375 (option c) R1/R2 — advance the per-coordinate gen BEFORE the dirty-mark
+	// fan-out below (R2: Store-before-mark), ONLY here in the post-indexer mutation
+	// handler (R1). A resolve that recorded any of this coordinate's buckets and has
+	// not yet done its accepted Put will see lastBumpSeq > startSeq and self-remark.
+	d.bumpCoordinateGen(gvr, namespace, name)
 	matched := d.collectMatchesWithDep(gvr, namespace, name)
 	if len(matched) == 0 {
 		return 0, 0
@@ -1174,6 +1681,7 @@ func (d *DepTracker) OnResourceTypeAvailable(gvr schema.GroupVersionResource) in
 	if d == nil {
 		return 0
 	}
+	d.bumpResourceTypeGen(gvr, true) // #375 R1/R2: handler-only, BEFORE the fan-out
 	matched := d.collectTypeMatches(gvr, true /* listOnly */)
 	return d.dirtyMarkResourceType("CRD_ADD", gvr, matched)
 }
@@ -1200,6 +1708,7 @@ func (d *DepTracker) OnResourceTypeRemoved(gvr schema.GroupVersionResource) int 
 	if d == nil {
 		return 0
 	}
+	d.bumpResourceTypeGen(gvr, false) // #375 R1/R2: handler-only, BEFORE the fan-out
 	matched := d.collectTypeMatches(gvr, false /* listOnly */)
 	return d.dirtyMarkResourceType("CRD_DELETE", gvr, matched)
 }
@@ -1225,6 +1734,7 @@ func (d *DepTracker) OnResourceTypeSchemaRelisted(gvr schema.GroupVersionResourc
 	if d == nil {
 		return 0
 	}
+	d.bumpResourceTypeGen(gvr, false) // #375 R1/R2: handler-only, BEFORE the fan-out
 	matched := d.collectTypeMatches(gvr, false /* listOnly */)
 	return d.dirtyMarkResourceType("SCHEMA_RELIST", gvr, matched)
 }
@@ -1245,6 +1755,7 @@ func (d *DepTracker) OnResourceTypeStoreRepaired(gvr schema.GroupVersionResource
 	if d == nil {
 		return 0
 	}
+	d.bumpResourceTypeGen(gvr, false) // #375 R1/R2: handler-only, BEFORE the fan-out
 	matched := d.collectTypeMatches(gvr, false /* listOnly */)
 	return d.dirtyMarkResourceType("STORE_REPAIR", gvr, matched)
 }
@@ -1591,6 +2102,9 @@ type DepStats struct {
 	RemoveL1Total       uint64
 	// 1.12.7: degraded verdicts that reached dependents and evicted nothing.
 	OnObjectEventDegradedNoEvict uint64
+	// #375 (B): accepted gen-guarded Puts whose resolve ctx carried NO dep-gen sink
+	// (a drifted resolve-entry). DETECTOR — expected 0.
+	UnguardedPutTotal uint64
 }
 
 func (d *DepTracker) Stats() DepStats {
@@ -1611,7 +2125,19 @@ func (d *DepTracker) Stats() DepStats {
 		EnqueueUpdateTotal:           d.enqueueUpdateTotal.Load(),
 		OnObjectEventDegradedNoEvict: d.onObjectEventDegradedNoEvict.Load(),
 		RemoveL1Total:                d.removeL1Total.Load(),
+		UnguardedPutTotal:            d.unguardedPutTotal.Load(),
 	}
+}
+
+// UnguardedPutTotal is the #375 (B) DETECTOR accessor: the number of ACCEPTED
+// gen-guarded Puts (PutIfGen / ReplaceIfGen / PutRAFullListIfGen) whose resolve ctx
+// carried NO dep-gen sink — i.e. a resolve entry that never went through
+// WithL1KeyContext / WithDepGenSink. Each such Put was remarked once (fail-fresh), but a
+// non-zero value means a resolve path is outside the dep-generation guard. Expected 0.
+// Published on expvar (snowplow_deps.unguarded_put_total) and OTLP
+// (snowplow_deps_unguarded_put_total).
+func UnguardedPutTotal() uint64 {
+	return Deps().unguardedPutTotal.Load()
 }
 
 // resetDepsForTest tears the singleton down so each test sees a clean

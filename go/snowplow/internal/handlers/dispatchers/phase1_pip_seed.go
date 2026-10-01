@@ -890,6 +890,13 @@ var seedObjectsGetFn = objects.Get
 var seedRestactionResolveAndPutFn = seedRestactionResolveAndPutProd
 
 func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
+	// #375 C1 — CR self-dep epoch, taken BEFORE the RESTAction read (same as the
+	// customer handler, restactions.go). The CR is read here on the outer ctx, before
+	// the L1 key is known, and its self-dep is Recorded only AFTER the terminal Put,
+	// so WithL1KeyContext's own startSeq would come too late: an edit of the RA in
+	// [read, PutIfGen] would be invisible for keepwarm / gvr-discovered. resCtx below
+	// is built from this epoch with the RA's own coordinate pre-declared.
+	selfEpoch := cache.DepGenEpochNow()
 	got := seedObjectsGetFn(ctx, ref)
 	if got.Err != nil {
 		// #158 (design §1.3): preserve the typed status error so the call
@@ -1105,8 +1112,11 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 
 	// Install the L1 key on ctx BEFORE Resolve so the inner-call dep
 	// tracker records edges against this entry — matches
-	// restactions.go:180-182.
-	resCtx := cache.WithL1KeyContext(ctx, key)
+	// restactions.go:180-182. #375 C1: the dep-gen sink starts at selfEpoch
+	// (before the RA read) and pre-declares the RA's own coordinate, exactly as
+	// the customer handler's WithL1KeyContextFromEpoch does.
+	resCtx := cache.WithL1KeyContextFromEpoch(ctx, key, selfEpoch, cache.DepKey{
+		GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 	// #394 — the terminal-Put guard captured at seed entry, read back by the
 	// resolve+Put tail (seedTerminalGuardFromContext).
@@ -1249,7 +1259,7 @@ func seedRestactionResolveAndPutProd(
 	// resurrecting the cell), plain Put for boot (pre-readyz exemption, #323).
 	// A refusal wrote nothing, so the resolves counter, the seeded-set Mark and
 	// the dep Record below are all skipped; the engine closure re-seeds once.
-	if !seedTerminalPut(handle, key, entry, seedTerminalGuardFromContext(resCtx)) {
+	if !seedTerminalPut(resCtx, handle, key, entry, seedTerminalGuardFromContext(resCtx)) {
 		logSeedTerminalPutRefused("restactions", ref.Namespace+"/"+ref.Name)
 		return fmt.Errorf("restaction %s/%s: %w", ref.Namespace, ref.Name, errSeedTerminalPutRefused)
 	}
@@ -1274,7 +1284,10 @@ func seedRestactionResolveAndPutProd(
 	// the seeded entry; falsifier #5 triggers). Matches
 	// restactions.go:229-230.
 	ensureWatcherInformerForGVR(got.GVR)
-	cache.Deps().Record(key, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
+	// #375 C3 — Recorded under resCtx (the sink the terminal PutIfGen was checked
+	// against), so an RA edit in [Put-check, this Record) — no edge yet on a cold
+	// cell — is re-checked and remarks the key once.
+	cache.Deps().Record(resCtx, key, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 	return nil
 }
 
@@ -1434,7 +1447,18 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		)
 	}()
 
-	resCtx := cache.WithL1KeyContext(ctx, key)
+	// #375 C1 (widget) — the widget resolves from the HARVESTED e.W, not from a read
+	// here, and its self-dep is Recorded only after the terminal Put. Pre-declare the
+	// widget's own coordinate so an edit of the widget CR during [resolve entry,
+	// PutIfGen] remarks the cell (the body was resolved from the pre-edit spec).
+	// HARVEST-FRESHNESS RESIDUAL (tracked in PR #395): an edit of the widget in
+	// [harvest, this entry) is NOT seen by this sink — no epoch is carried from the
+	// harvest, and the bump precedes startSeq. The seed then Puts a body resolved from
+	// the pre-edit harvested spec with no remark; if the edit's own dirty-mark was
+	// already consumed (refresher re-resolve, or skipped_no_entry on a non-resident
+	// cell) the cell stays stale until its next dirty-mark or TTL.
+	resCtx := cache.WithL1KeyContextFromEpoch(ctx, key, cache.DepGenEpochNow(), cache.DepKey{
+		GVR: e.GVR, Namespace: e.W.GetNamespace(), Name: e.W.GetName()})
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 	// #102 GTTL-1 (arch Option A, uniform) — see seedOneRestaction: the
 	// error-aware Put-gate sinks make the seed honor the refresher's backstop
@@ -1547,7 +1571,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// #394 — generation-guarded terminal write for the post-readyz modes (plain
 	// for boot); see seedOneRestaction's tail. A refusal skips the counter, the
 	// seeded-set Mark, the dep Record and the 4a full-list pin below.
-	if !seedTerminalPut(handle, key, entry, terminalGuard) {
+	if !seedTerminalPut(resCtx, handle, key, entry, terminalGuard) {
 		logSeedTerminalPutRefused("widgets", e.W.GetNamespace()+"/"+e.W.GetName())
 		return fmt.Errorf("widget %s/%s: %w", e.W.GetNamespace(), e.W.GetName(), errSeedTerminalPutRefused)
 	}
@@ -1562,8 +1586,9 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// Record widget deps — self + apiRef + render-eligible
 	// resourcesRefs. Matches widgets.go:230. recordWidgetDeps ensures
 	// the informer for every recorded GVR is wired (AC-PIP.5 / falsifier
-	// #5).
-	recordWidgetDeps(slog.Default(), key, e.GVR, res)
+	// #5). #375 C3 — under resCtx (the terminal Put's sink) so a dep event in
+	// [Put-check, Record) is re-checked.
+	recordWidgetDeps(resCtx, slog.Default(), key, e.GVR, res)
 
 	// Ship 4a (0.30.198) — prewarm + PIN the page-independent RAFullList
 	// cell for this (widget→RESTAction × cohort). The cell survives LRU

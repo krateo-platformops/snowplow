@@ -16,6 +16,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -36,7 +37,7 @@ func i248PutSuppressedOld(t *testing.T, store *ResolvedCacheStore, name string, 
 		BornAt:    born,
 		CreatedAt: born,
 	})
-	Deps().Record(key, gvr, ns, name)
+	Deps().Record(context.Background(), key, gvr, ns, name)
 	if suppress {
 		// The real UAF decline: permanent-suppress on the first occurrence
 		// (resolve_populate.go:391 → NoteRefreshDecline(key,"uaf",true)).

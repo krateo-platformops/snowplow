@@ -190,8 +190,8 @@ func e3286PrewarmRAKey(t *testing.T, marker string) string {
 	shape := cache.SliceShapeHash("apiref", g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286SliceJQ)
 	cache.ResolvedCache().PutRAFullList(raKey, inputs, e3286FullDict(marker))
 	cache.RecordSliceability(raKey, shape, true)
-	cache.Deps().RecordList(raKey, e3286BackingGVR(), e3286NS) // edge-2 (backing LIST)
-	cache.Deps().Record(raKey, g, e3286NS, e3286RAName)        // RA-CR self-dep
+	cache.Deps().RecordList(context.Background(), raKey, e3286BackingGVR(), e3286NS) // edge-2 (backing LIST)
+	cache.Deps().Record(context.Background(), raKey, g, e3286NS, e3286RAName)        // RA-CR self-dep
 	return raKey
 }
 
@@ -377,7 +377,7 @@ func TestEdge3_286_SeedShadowParityDoesNotPerturbCapture(t *testing.T) {
 	if pre := cache.Deps().OnAdd(depGVR, depNS, depName); pre != 0 {
 		t.Fatalf("#286 dep-substrate setup: expected 0 matches before the LIST record on a unique GVR; got %d (cross-test bleed)", pre)
 	}
-	cache.Deps().RecordList(depCell, depGVR, depNS)
+	cache.Deps().RecordList(context.Background(), depCell, depGVR, depNS)
 	if post := cache.Deps().OnAdd(depGVR, depNS, depName); post < 1 {
 		t.Fatalf("#286 dep-substrate: LIST-edge record→match broke with the toggle ON; OnAdd=%d", post)
 	}

@@ -28,6 +28,7 @@ package cache
 
 import (
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -1341,18 +1342,18 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 // between, the Put is REFUSED and the pre-delete body is not resurrected. The
 // check and the write are ONE c.mu critical section — no Get-then-Put TOCTOU.
 // Returns true iff the entry was stored.
-func (c *ResolvedCacheStore) PutIfGen(key string, entry *ResolvedEntry, capturedGen uint64) bool {
+func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(entry)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.currentGenLocked(key) != capturedGen {
 		// The key was DELETE-evicted (or otherwise removed) between capture and
 		// now — the eviction is authoritative; drop the stale body on the floor.
 		c.putRefusedGenerationMovedTotal.Add(1)
+		c.mu.Unlock()
 		return false
 	}
 	// Committing a real Put: clear the refresh-suppression marker (a real Put is
@@ -1360,6 +1361,12 @@ func (c *ResolvedCacheStore) PutIfGen(key string, entry *ResolvedEntry, captured
 	// Put populated nothing, so its key's suppression marker must stand.
 	clearRefreshSuppression(key)
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen)
+	c.mu.Unlock()
+	// #375 (option c) — ACCEPTED gen-guarded Put: after RELEASING c.mu (EnqueueRefresh
+	// must never run under the store lock), PUT-THEN-REMARK — remark this key once if any
+	// dep the resolve recorded moved since resolve entry (lastBumpSeq>startSeq), or if the
+	// resolve installed no sink (nil-sink drift → fail-fresh remark + unguarded_put detector).
+	Deps().remarkIfDepsMoved(ctx, key)
 	return true
 }
 
@@ -1371,24 +1378,27 @@ func (c *ResolvedCacheStore) PutIfGen(key string, entry *ResolvedEntry, captured
 // preserves the "a non-resurrecting refresh emits no live-refresh signal"
 // contract while closing the resurrection race in one c.mu section. Request-path
 // COLD fills use PutIfGen (which inserts on absent). Returns true iff stored.
-func (c *ResolvedCacheStore) ReplaceIfGen(key string, entry *ResolvedEntry, capturedGen uint64) bool {
+func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(entry)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	el, live := c.index[key]
 	if !live || el.Value.(*lruItem).gen != capturedGen {
 		// Absent (evicted/never-present) OR the live entry moved to a newer
 		// generation (a cold request re-inserted it) — refuse, do not clobber or
 		// resurrect. The eviction / newer write is authoritative.
 		c.putRefusedGenerationMovedTotal.Add(1)
+		c.mu.Unlock()
 		return false
 	}
 	clearRefreshSuppression(key)
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen)
+	c.mu.Unlock()
+	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
+	Deps().remarkIfDepsMoved(ctx, key)
 	return true
 }
 

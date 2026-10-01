@@ -99,7 +99,7 @@ func runStaleWindowProbe(t *testing.T, floorSeconds string, customerInflight boo
 	// JUST populated, i.e. YOUNGER than the 2s floor.
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
 	// (2) Real dep edge: widget L1 key depends on the backing object.
-	Deps().Record(key, gvr, ns, objName)
+	Deps().Record(context.Background(), key, gvr, ns, objName)
 
 	// Registered RefreshFunc re-resolves to v2 (models the resolver re-running
 	// against the now-reconciled cluster state).
@@ -253,7 +253,7 @@ func TestLiveRefreshCoherence_RefetchLandsInsideWindow(t *testing.T) {
 	key := ComputeKey(in)
 
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
-	Deps().Record(key, gvr, ns, objName)
+	Deps().Record(context.Background(), key, gvr, ns, objName)
 
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
 		time.Sleep(5 * time.Millisecond)
@@ -356,7 +356,7 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 	// putAgedEntry's intent in refresher_rate_floor_test.go). agedBackoff
 	// (30s) is past every test floor yet under the cache TTL.
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
-	Deps().Record(key, gvr, ns, objName)
+	Deps().Record(context.Background(), key, gvr, ns, objName)
 
 	var resolves atomic.Int32
 	var lastCommitAt atomic.Int64

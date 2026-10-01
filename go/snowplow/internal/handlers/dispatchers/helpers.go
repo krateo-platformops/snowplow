@@ -664,7 +664,7 @@ type cacheHandle interface {
 	// eviction during the resolve would refuse the write rather than resurrect
 	// the pre-delete body).
 	CaptureGen(key string) uint64
-	PutIfGen(key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
+	PutIfGen(ctx context.Context, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
 }
 
 // emitResolvedCacheLookup writes the per-request falsifier line per

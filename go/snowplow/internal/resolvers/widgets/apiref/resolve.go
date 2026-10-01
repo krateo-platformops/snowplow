@@ -256,7 +256,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// carries the same backing-GVR edges a real resolve would have
 			// recorded (else it goes stale on a backing mutation). Load returns
 			// a fresh deep copy; safe to hand straight back.
-			cache.Deps().ReplayEdges(l1Key, deps)
+			cache.Deps().ReplayEdges(ctx, l1Key, deps)
 			return body, nil
 		}
 		// #277 / edge-3: open a capture over the PRODUCING block below so the

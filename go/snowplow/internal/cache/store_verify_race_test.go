@@ -10,6 +10,7 @@ package cache
 // (feedback_shared_vs_copy_is_a_concurrency_change).
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -107,7 +108,7 @@ func TestDepsCoordinates_CountsDistinctCoordinatesNotEdges(t *testing.T) {
 	// THE COHORT AXIS. Many L1 keys — one per cohort — onto ONE coordinate.
 	// This is the shape #239 describes: adding users adds entries, not objects.
 	for i := 0; i < 25; i++ {
-		d.Record("L1_cohort_"+verifyItoa(i), gvr, "demo", "panel-a")
+		d.Record(context.Background(), "L1_cohort_"+verifyItoa(i), gvr, "demo", "panel-a")
 	}
 	if got := d.Stats().Coordinates; got != 1 {
 		t.Fatalf("coordinates = %d after 25 cohorts depended on ONE object, want 1 — if this grows "+
@@ -118,15 +119,15 @@ func TestDepsCoordinates_CountsDistinctCoordinatesNotEdges(t *testing.T) {
 	}
 
 	// THE CLUSTER AXIS. Distinct objects add coordinates.
-	d.Record("L1_cohort_0", gvr, "demo", "panel-b")
-	d.Record("L1_cohort_0", gvr, "demo", "panel-c")
+	d.Record(context.Background(), "L1_cohort_0", gvr, "demo", "panel-b")
+	d.Record(context.Background(), "L1_cohort_0", gvr, "demo", "panel-c")
 	if got := d.Stats().Coordinates; got != 3 {
 		t.Fatalf("coordinates = %d after two more distinct objects, want 3", got)
 	}
 
 	// Idempotence: re-recording an existing edge must move neither number.
 	before := d.Stats()
-	d.Record("L1_cohort_0", gvr, "demo", "panel-b")
+	d.Record(context.Background(), "L1_cohort_0", gvr, "demo", "panel-b")
 	after := d.Stats()
 	if before.Coordinates != after.Coordinates || before.TotalRecords != after.TotalRecords {
 		t.Errorf("a duplicate Record moved the counters: %+v -> %+v", before, after)

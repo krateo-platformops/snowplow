@@ -10,6 +10,7 @@
 package metrics
 
 import (
+	"context"
 	"testing"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -23,7 +24,7 @@ func TestIssue239_D_DirtyMarkAttributionReachesOTLP(t *testing.T) {
 	// A list-scope dependent, then an ADD for an object in its namespace: one
 	// dirty-mark in (object_event, add_update, list_dep). No store needed — a
 	// list_dep is classified by the dependency form, not the entry's output.
-	cache.Deps().RecordList("L1_issue239_otlp", gvr, "ns")
+	cache.Deps().RecordList(context.Background(), "L1_issue239_otlp", gvr, "ns")
 	cache.Deps().OnAdd(gvr, "ns", "obj")
 
 	all := flatten(collectViaRealCallback(t, "test"))

@@ -333,5 +333,5 @@ func recordGetDep(ctx context.Context, res *Result) {
 	if res == nil || res.Err != nil || res.Unstructured == nil {
 		return
 	}
-	cache.Deps().Record(l1Key, res.GVR, res.Unstructured.GetNamespace(), res.Unstructured.GetName())
+	cache.Deps().Record(ctx, l1Key, res.GVR, res.Unstructured.GetNamespace(), res.Unstructured.GetName())
 }

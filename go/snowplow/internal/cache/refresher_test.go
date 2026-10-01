@@ -462,7 +462,7 @@ func TestRefresher_OnUpdateRefreshesContent(t *testing.T) {
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &inputs})
 
 	gvr := gvrCompositions()
-	Deps().Record(key, gvr, "ns", "n")
+	Deps().Record(context.Background(), key, gvr, "ns", "n")
 
 	fresh := []byte(`{"v":"fresh"}`)
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, _ ResolvedKeyInputs) error {
@@ -572,7 +572,7 @@ func TestRefresher_DepTrackerOnUpdateEnqueues(t *testing.T) {
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	gvr := gvrCompositions()
-	Deps().Record(key, gvr, "ns", "n")
+	Deps().Record(context.Background(), key, gvr, "ns", "n")
 
 	var fired atomic.Int32
 	RegisterRefreshFunc("widgets", func(context.Context, string, ResolvedKeyInputs) error {

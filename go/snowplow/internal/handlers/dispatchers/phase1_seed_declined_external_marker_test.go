@@ -87,7 +87,7 @@ func (h *getRecordingHandle) Put(key string, entry *cache.ResolvedEntry) {}
 // #189 — stub the generation-guarded surface; this handle never warms a cell
 // (Get is always a miss, Put is a no-op), so the gen ops are inert too.
 func (h *getRecordingHandle) CaptureGen(key string) uint64 { return 0 }
-func (h *getRecordingHandle) PutIfGen(key string, entry *cache.ResolvedEntry, capturedGen uint64) bool {
+func (h *getRecordingHandle) PutIfGen(ctx context.Context, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool {
 	return true
 }
 

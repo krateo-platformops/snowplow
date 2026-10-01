@@ -89,7 +89,7 @@ func (rs *refresherStub) onDirty(k string, _ schema.GroupVersionResource) {
 		RawJSON: []byte(body),
 		Inputs:  widgetInputs(rs.gvr, rs.ns, rs.name),
 	})
-	Deps().Record(rs.key, rs.gvr, rs.ns, rs.name)
+	Deps().Record(context.Background(), rs.key, rs.gvr, rs.ns, rs.name)
 }
 
 func served(t *testing.T, store *ResolvedCacheStore, key string) string {
@@ -124,7 +124,7 @@ func TestIssue187_A1_DeleteThenRecreateDoesNotServePreDeleteBody(t *testing.T) {
 
 	// Cold dispatch: resolve + Put + self dep edge (deps_extract.go:113).
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(oldBody), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name)
+	d.Record(context.Background(), key, gvr, ns, name)
 
 	rw, dyn := realWatcher(t, gvr)
 	h := rw.depEventHandlers(gvr)
@@ -178,7 +178,7 @@ func TestIssue187_A2_LateDeleteDoesNotRestoreOrPinPreDeleteBody(t *testing.T) {
 	d.SetRefreshHook(rs.onDirty)
 
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(oldBody), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name)
+	d.Record(context.Background(), key, gvr, ns, name)
 
 	rw, dyn := realWatcher(t, gvr)
 	h := rw.depEventHandlers(gvr)
@@ -229,8 +229,8 @@ func TestIssue187_A3_DeletedListMemberDirtyMarksListWidget(t *testing.T) {
 	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { marked <- k })
 
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"items":["a","b"]}`), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name)  // self edge
-	d.RecordList(key, member, ns) // list-scope edge on the member kind
+	d.Record(context.Background(), key, gvr, ns, name)  // self edge
+	d.RecordList(context.Background(), key, member, ns) // list-scope edge on the member kind
 
 	h := syncedWatcher(t, member).depEventHandlers(member)
 	h.DeleteFunc(unstructuredObj(member, ns, "b"))
@@ -266,7 +266,7 @@ func TestIssue187_B1_PlainDeleteEvictsSelfEntry(t *testing.T) {
 	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { marked = append(marked, k) })
 
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"resident"}`), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name) // deps_extract.go:113 self edge
+	d.Record(context.Background(), key, gvr, ns, name) // deps_extract.go:113 self edge
 
 	h := syncedWatcher(t, gvr).depEventHandlers(gvr)
 	h.DeleteFunc(unstructuredObj(gvr, ns, name))
@@ -320,9 +320,9 @@ func TestIssue187_B2_EvictSelfGoneRemovesEntryAndItsDepEdges(t *testing.T) {
 	d.SetStore(store)
 
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name)                    // self edge
-	d.RecordList(key, gvr, ns)                      // a second edge, so the
-	d.Record(key, gvr, ns, "some-other-dependency") // cleanup is non-trivial
+	d.Record(context.Background(), key, gvr, ns, name)                    // self edge
+	d.RecordList(context.Background(), key, gvr, ns)                      // a second edge, so the
+	d.Record(context.Background(), key, gvr, ns, "some-other-dependency") // cleanup is non-trivial
 
 	before := d.Stats().EvictSelfGoneTotal
 	beforeDelete := d.Stats().EvictDeleteTotal
@@ -389,7 +389,7 @@ func TestIssue187_B2_ResolvedOutcomeIsNotRequeued(t *testing.T) {
 	inputs := widgetInputs(gvr, ns, name)
 	key := ComputeKey(*inputs)
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: inputs})
-	d.Record(key, gvr, ns, name)
+	d.Record(context.Background(), key, gvr, ns, name)
 
 	var attempts atomic.Int64
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, in ResolvedKeyInputs) error {
@@ -459,7 +459,7 @@ func TestIssue187_B3_TransientNotFoundMustNotEvict(t *testing.T) {
 	inputs := widgetInputs(gvr, ns, name)
 	key := ComputeKey(*inputs)
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"prior"}`), Inputs: inputs})
-	Deps().Record(key, gvr, ns, name)
+	Deps().Record(context.Background(), key, gvr, ns, name)
 
 	before := RefresherSelfNotFoundEvictTotal()
 
@@ -532,7 +532,7 @@ func TestIssue187_B3b_SelfGoneEvictsAtTheDropPoint(t *testing.T) {
 	inputs := widgetInputs(gvr, ns, name)
 	key := ComputeKey(*inputs)
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: inputs})
-	Deps().Record(key, gvr, ns, name)
+	Deps().Record(context.Background(), key, gvr, ns, name)
 
 	beforeSelfGone := Deps().Stats().EvictSelfGoneTotal
 	beforeDelete := Deps().Stats().EvictDeleteTotal
@@ -650,7 +650,7 @@ func TestIssue187_A5_InFlightColdDispatchCannotResurrectPreDeleteBody(t *testing
 	d.SetRefreshHook(rs.onDirty)
 
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(oldBody), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name)
+	d.Record(context.Background(), key, gvr, ns, name)
 
 	h := syncedWatcher(t, gvr).depEventHandlers(gvr)
 
@@ -666,7 +666,7 @@ func TestIssue187_A5_InFlightColdDispatchCannotResurrectPreDeleteBody(t *testing
 	// The in-flight dispatch now completes and Puts what IT resolved (old),
 	// exactly as widgets.go:511 does — unconditionally.
 	store.Put(key, &ResolvedEntry{RawJSON: []byte(oldBody), Inputs: widgetInputs(gvr, ns, name)})
-	d.Record(key, gvr, ns, name)
+	d.Record(context.Background(), key, gvr, ns, name)
 
 	if got := served(t, store, key); got == oldBody {
 		t.Fatalf("#187 A5 RED: an in-flight cold dispatch resurrected the PRE-DELETE body after " +
@@ -698,10 +698,10 @@ func TestIssue187_A4_DeleteWorkerSurvivesAPanic(t *testing.T) {
 
 	// Victim 1 — non-self dep, so the panicking enqueue hook is reached.
 	store.Put("L1_v1", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: widgetInputs(gvr, "ns", "other")})
-	d.Record("L1_v1", gvr, "ns", "victim1")
+	d.Record(context.Background(), "L1_v1", gvr, "ns", "victim1")
 	// Victim 2 — a SELF representation that MUST be evicted afterwards.
 	store.Put("L1_v2", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: widgetInputs(gvr, "ns", "victim2")})
-	d.Record("L1_v2", gvr, "ns", "victim2")
+	d.Record(context.Background(), "L1_v2", gvr, "ns", "victim2")
 
 	h := syncedWatcher(t, gvr).depEventHandlers(gvr)
 	h.DeleteFunc(unstructuredObj(gvr, "ns", "victim1")) // panics inside the worker
@@ -767,7 +767,7 @@ func TestIssue187_A4b_DeleteWorkerSurvivesAConcurrentPanicStorm(t *testing.T) {
 				RawJSON: []byte(`{"v":"resident"}`),
 				Inputs:  widgetInputs(gvr, "ns", name),
 			})
-			d.Record(key, gvr, "ns", name)
+			d.Record(context.Background(), key, gvr, "ns", name)
 		}
 	}
 
@@ -776,7 +776,7 @@ func TestIssue187_A4b_DeleteWorkerSurvivesAConcurrentPanicStorm(t *testing.T) {
 	// dep edge so the hook is reached for it.
 	for _, v := range victims {
 		if v.bad {
-			d.Record("L1_sibling_"+v.name, gvr, "ns", v.name)
+			d.Record(context.Background(), "L1_sibling_"+v.name, gvr, "ns", v.name)
 		}
 	}
 	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) {
