@@ -486,3 +486,65 @@ func TestIssue397_X7_ClassifierPanicIsContained(t *testing.T) {
 		t.Error("a contained classifier panic must not move the detector")
 	}
 }
+
+// TestIssue397_X8_TerminalPutRefusedReseed_CountsOnceAsAttempted — composition
+// with #394. A nav unit whose terminal Put is refused and then re-seeded once
+// (the seedWidgetTarget one-shot) is ONE unit to the tracker, the same as the
+// latch's navWidgetRemaining. It is classified by the re-seed's outcome: a
+// re-seed that succeeds and one refused twice (reseedAfterTerminalPutRefusal →
+// nil, "not a failure") both count as attempted with no failure class. The
+// refusal never shows up as an operational failure.
+func TestIssue397_X8_TerminalPutRefusedReseed_CountsOnceAsAttempted(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	rw := phase1TestWatcher(t)
+	resetExitWorld(t)
+	logs := captureExitLogs(t)
+
+	var mu sync.Mutex
+	calls := map[string]int{}
+	widgets := exitFixture(t, func(_ context.Context, widget, cohort string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		k := widget + "|" + cohort
+		calls[k]++
+		switch {
+		case widget == "w-a" && cohort == "group:devs" && calls[k] == 1:
+			return errSeedTerminalPutRefused // refused once, the re-seed succeeds
+		case widget == "w-b" && cohort == "group:ops":
+			return errSeedTerminalPutRefused // refused twice
+		}
+		return nil
+	})
+	ensureFirstNavLatch()
+	seed := pipSeedFn(func(ctx context.Context) error {
+		return seedScopeYielding(ctx, nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := phase1WarmupWith(ctx, rw, exitNoRoots, exitNoResolve, nil, nil, seed, nil); err != nil {
+		t.Fatalf("phase1WarmupWith: %v", err)
+	}
+
+	mu.Lock()
+	reA, reB := calls["w-a|group:devs"], calls["w-b|group:ops"]
+	mu.Unlock()
+	if reA != 2 || reB != 2 {
+		t.Fatalf("setup: the #394 one-shot re-seed must run exactly once per refused unit; calls w-a/devs=%d w-b/ops=%d, want 2/2", reA, reB)
+	}
+	ex := logs.exits()
+	if len(ex) != 1 {
+		t.Fatalf("want ONE readiness_exit line, got %d", len(ex))
+	}
+	if got := exitStr(t, ex[0], "outcome"); got != "latch" {
+		t.Fatalf("outcome = %q, want latch", got)
+	}
+	for k, want := range map[string]int64{
+		"nav_units_total": 4, "nav_units_seeded": 4, "nav_units_remaining": 0,
+		"nav_units_expected_deny": 0, "nav_units_operational_failure": 0,
+	} {
+		if got := exitInt(t, ex[0], k); got != want {
+			t.Errorf("%s = %d, want %d (a refused-then-reseeded unit counts ONCE, as attempted, never as a failure)", k, got, want)
+		}
+	}
+}
