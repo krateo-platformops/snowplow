@@ -203,6 +203,15 @@ func StartObjectsGetSummaryForTest() {
 	startObjectsGetSummary()
 }
 
+// ObjectsGetSummaryRunningForTest reports whether the summary emitter is
+// currently running, read from the objects package's OWN lifecycle state
+// (the stop channel the Once installs) rather than a process-global
+// runtime.NumGoroutine() sample. TEST-ONLY. Order-independent: it reflects
+// exactly this emitter, immune to goroutine churn from other tests.
+func ObjectsGetSummaryRunningForTest() bool {
+	return objectsGetSummaryStop != nil
+}
+
 // objectsGetSummaryEverySeconds resolves the summary interval from the
 // env knob, falling back to the default on unset / non-int / non-positive.
 func objectsGetSummaryEverySeconds() int {

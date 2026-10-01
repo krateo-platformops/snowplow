@@ -169,6 +169,15 @@ func ResetDispatchSummaryForTest() {
 	stopDispatchSummaryForTest()
 }
 
+// DispatchSummaryRunningForTest reports whether the summary emitter is
+// currently running, read from this package's OWN lifecycle state (the stop
+// channel the Once installs) rather than a process-global
+// runtime.NumGoroutine() sample. TEST-ONLY. Order-independent: it reflects
+// exactly this emitter, immune to goroutine churn from neighbour tests (#368).
+func DispatchSummaryRunningForTest() bool {
+	return dispatchSummaryStop != nil
+}
+
 // dispatchSummaryEverySeconds resolves the summary interval from the env
 // knob, falling back to the default on unset / non-int / non-positive.
 func dispatchSummaryEverySeconds() int {
