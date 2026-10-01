@@ -231,6 +231,23 @@ func main() {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
 	}
 
+	// #367 — boot-time env backing for the dark shadow-parity toggle. Read ONCE
+	// here, BEFORE the Phase 1 boot seed walk below, so a cold boot can run the
+	// boot-walk populate arm (populate_seed_installs_total + the four classify
+	// buckets) that certifies the populator keying — the walk runs during readyz,
+	// before any POST /debug/shadow-parity could flip the toggle (#254/#275/#290).
+	// DEFAULT-OFF: an absent SHADOW_PARITY_ENABLED leaves the dark measurement off,
+	// byte-identical to before. The runtime POST override still applies. DARK:
+	// changes no verdict, served byte or cache key (rbac/shadow_hook.go).
+	rbac.InitShadowParityFromEnv()
+	if rbac.ShadowParityEnabled() {
+		log.Warn("shadow-parity ENABLED via SHADOW_PARITY_ENABLED — dark R/projection overhead active; do not run latency-acceptance on this pod",
+			slog.String("subsystem", "cache"),
+			slog.String("source", rbac.ShadowParitySource()),
+			slog.String("hint", "boot-walk populate arm reachable this process; DARK (no verdict/byte/key change); effective state on /debug/vars snowplow_v7_shadow_parity{enabled,source}; POST /debug/shadow-parity still overrides"),
+		)
+	}
+
 	// authn signs tokens asymmetrically (RS256); snowplow verifies them against
 	// the public key authn publishes at its JWKS endpoint. The key set is
 	// fetched lazily (first validation, NOT at boot) and cached for

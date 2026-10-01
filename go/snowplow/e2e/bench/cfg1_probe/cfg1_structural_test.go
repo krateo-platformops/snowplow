@@ -111,6 +111,11 @@ var nonCacheInitPublishers = map[string][]string{
 	// Disabled() for that reason (gating would hide the counter cache-off exactly
 	// when a mis-authored RA is erroring).
 	"internal/resolvers/restactions/api/nondial_jq_error_metrics.go": {"snowplow_nondial_jq_error_total"},
+	// #367 shadow-parity toggle STATE: enabled/source is a CONFIG fact (not a cache
+	// measurement) a latency-acceptance window must assert regardless of
+	// CACHE_ENABLED, so its publisher runs ungated. The measurement COUNTERS
+	// (snowplow_v7_shadow_parity) stay cache-gated in shadow_parity_hook.go.
+	"internal/handlers/dispatchers/shadow_parity_toggle_metrics.go": {"snowplow_v7_shadow_parity_toggle"},
 }
 
 // legacyHG321Keys are the five names the shell falsifier asserted since
