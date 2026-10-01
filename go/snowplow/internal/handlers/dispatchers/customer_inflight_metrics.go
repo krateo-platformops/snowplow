@@ -74,3 +74,11 @@ func registerCustomerInflightMetrics() {
 		}))
 	})
 }
+
+// MarkCustomerResolveInFlightForTest increments the resolve-path in-flight count
+// and returns the matching decrement — for the #386 M3 OTLP falsifier (drive K
+// concurrent in-flight, assert the gauge reads K, then drains to 0). It is the
+// SAME mechanism production uses (markCustomerInFlight), exported only so the
+// metrics-package OTLP test can drive it. Production MUST NOT call it — the real
+// bracket is `defer markCustomerInFlight()()` at restactions/widgets ServeHTTP.
+func MarkCustomerResolveInFlightForTest() func() { return markCustomerInFlight() }
