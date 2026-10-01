@@ -57,9 +57,11 @@
 package cache
 
 import (
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync/atomic"
+	"time"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1085,6 +1087,24 @@ func RebuildRBACSnapshotForTest(rw *ResourceWatcher) {
 	rebuildRBACSnapshot(rw)
 }
 
+// WaitInitialRBACPublishForTest blocks until THIS watcher's initial RBAC-snapshot
+// publish goroutine (waitAndPublishInitialRBACSnapshot) has returned — the
+// watcher's own first snapshot is live and no further async INITIAL publish will
+// race a test by overwriting the global rbacSnap. TEST-ONLY (#385). Returns an
+// error on timeout so a wiring regression fails loud; a nil done-channel
+// (passthrough watcher, no RBAC publisher) returns nil immediately.
+func (rw *ResourceWatcher) WaitInitialRBACPublishForTest(timeout time.Duration) error {
+	if rw == nil || rw.rbacInitialPublishDone == nil {
+		return nil
+	}
+	select {
+	case <-rw.rbacInitialPublishDone:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("cache: initial RBAC snapshot publish did not complete within %s", timeout)
+	}
+}
+
 // waitAndPublishInitialRBACSnapshot is the initial-publish goroutine
 // spawned by NewResourceWatcher (Ship B / AC-B.9). It blocks until all
 // 4 RBAC syncCh channels close — the "Servable" signal that the
@@ -1099,6 +1119,10 @@ func RebuildRBACSnapshotForTest(rw *ResourceWatcher) {
 // Exits early (no publish) if rw.stopCh closes mid-wait — process
 // shutdown.
 func waitAndPublishInitialRBACSnapshot(rw *ResourceWatcher) {
+	// #385: signal completion (published / skipped / aborted) so tests can
+	// deterministically wait for THIS watcher's initial publish instead of racing it.
+	defer close(rw.rbacInitialPublishDone)
+
 	// Snapshot the 4 RBAC sync channels under the watcher lock. The
 	// channels are allocated by addResourceTypeLocked and never
 	// re-allocated for the same GVR, so capturing the pointers here is

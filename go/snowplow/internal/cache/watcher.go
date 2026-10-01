@@ -254,6 +254,13 @@ type ResourceWatcher struct {
 
 	stopCh chan struct{}
 
+	// rbacInitialPublishDone is closed by waitAndPublishInitialRBACSnapshot when
+	// the initial RBAC-snapshot publish goroutine returns (whether it published,
+	// skipped, or aborted on stopCh). Lets tests deterministically wait for THIS
+	// watcher's own initial publish to land instead of racing it (#385). nil on a
+	// passthrough watcher (no RBAC publisher spawned).
+	rbacInitialPublishDone chan struct{}
+
 	// goroutineWG tracks the watcher-owned goroutines that are NOT
 	// reaped by factory.Shutdown() — i.e. everything this type spawns
 	// directly with `go`: the standalone (lazily-registered / navigation-
@@ -384,7 +391,8 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		confirmed:             map[schema.GroupVersionResource]struct{}{},
 		lastSyncRV:            map[schema.GroupVersionResource]string{},
 		watchHandlerInstalled: map[schema.GroupVersionResource]struct{}{},
-		stopCh:                make(chan struct{}),
+		stopCh:                 make(chan struct{}),
+		rbacInitialPublishDone: make(chan struct{}),
 	}
 	_ = ctx // reserved for future wiring (0.30.6 eager-registration caller may pass-through)
 
