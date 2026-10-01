@@ -1082,6 +1082,10 @@ func seedScopeYielding(ctx context.Context,
 	// seedWidgetTarget / seedRestactionTarget — the per-target seed bodies,
 	// shared by the rank-major loop. Each returns (abort bool, err) where abort
 	// signals a ctx-cancel that must stop the whole seed.
+	// lastWidgetSeedErr is the seed error of the most recent seedWidgetTarget call
+	// (nil on success) — read by the boot flat loop to classify each processed nav
+	// unit into the #397 readiness-exit summary. Serial loop → plain var.
+	var lastWidgetSeedErr error
 	seedWidgetTarget := func(e navWidgetEntry, c seedTarget) bool {
 		if ctx.Err() != nil {
 			emitSeedAbort("widgets", ctx.Err())
@@ -1100,6 +1104,12 @@ func seedScopeYielding(ctx context.Context,
 			err = reseedAfterTerminalPutRefusal("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c),
 				func() error { return seedOneTarget(c, do) })
 		}
+		// #397: the FINAL error of this unit, after the #394 one-shot re-seed. A
+		// refused-then-reseeded unit is still ONE unit (the flat loop counts it
+		// once, exactly as the latch's navWidgetRemaining does), classified by the
+		// re-seed's outcome; a refused-twice unit returns nil there ("not a
+		// failure") so it counts as attempted with no failure class.
+		lastWidgetSeedErr = err
 		if err != nil && ctx.Err() != nil {
 			emitSeedAbort("widgets", ctx.Err())
 			return true
@@ -1310,6 +1320,19 @@ func seedScopeYielding(ctx context.Context,
 	navWidgetRemaining := len(flat)
 	distinctNavWidgets := len(widgetSeeds)
 	navUnitsTotal := navWidgetRemaining
+
+	// #397: mirror the latch's arming into the readiness-exit progress tracker,
+	// under EXACTLY the condition under which this pass can fire the latch (built
+	// and not yet fired). Instrumentation only — the latch arithmetic above and
+	// the fire points below are untouched.
+	trackNav := latch != nil && !latch.fired()
+	if trackNav {
+		navCohorts := make(map[string]struct{}, len(ranked))
+		for i := range flat {
+			navCohorts[identityKey(flat[i].target)] = struct{}{}
+		}
+		bootNavProgressState.arm(navUnitsTotal, len(navCohorts))
+	}
 	if navWidgetRemaining == 0 {
 		// Provably-empty: no nav-widget units at all (all-tail topology, or the
 		// walk reached no widget). There is nothing to warm on the nav-widget
@@ -1326,7 +1349,13 @@ func seedScopeYielding(ctx context.Context,
 	// — a permanently-failing widget must not hang /readyz to the backstop.
 	for i := range flat {
 		if seedWidgetTarget(flat[i].e, flat[i].target) {
+			if trackNav {
+				bootNavProgressState.cut()
+			}
 			return ctx.Err()
+		}
+		if trackNav {
+			bootNavProgressState.unitProcessed(lastWidgetSeedErr)
 		}
 		navWidgetRemaining--
 		if navWidgetRemaining == 0 {

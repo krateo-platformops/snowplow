@@ -318,6 +318,9 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			slog.Any("err", saErr),
 			slog.String("effect", "Phase 1 cannot resolve under SA identity; lazy register-on-navigation still covers every GVR on first request"),
 		)
+		// #397: surface this stage on the /readyz warming body. Readiness is NOT
+		// flipped on this path (unchanged behaviour).
+		setPhase1Stage(phase1StageNoSAEndpoint)
 		return saErr
 	}
 
@@ -694,6 +697,10 @@ type pipSeedFn func(ctx context.Context) error
 func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver, contentWarm contentPrewarm, clusterListPrewarm clusterListPrewarmFn, pipSeed pipSeedFn, paginationDrain paginationDrainFn) error {
 	log := slog.Default()
 	start := time.Now()
+	// #397: per-step wall-clock for the prewarm.phase1.readiness_exit line, and
+	// the /readyz warming `reason`. Instrumentation only.
+	steps := noPhase1StepTimings()
+	setPhase1Stage(phase1StageRootsWalk)
 
 	// Step 1 — register the hardcoded meta-query seeds. This is the ONLY
 	// place a hardcoded GVR is handed to the watcher at startup. Ship 0
@@ -825,6 +832,10 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// informers spawned during Step 4 are already in rw.informers by
 	// the time Step 4 returns.
 
+	steps.walk = time.Since(start)
+	setPhase1Stage(phase1StageInformerSync)
+	syncStart := time.Now()
+
 	// Step 6 — let the registered set settle. A composition informer's
 	// initial LIST runs asynchronously even though its EnsureResource-
 	// Type registration is synchronous. Poll RegisteredGVRs until it
@@ -835,6 +846,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// informer (meta-query seeds + resolution-discovered + CRD-watch-
 	// spawned) reaches HasSynced, bounded by ctx.
 	syncErr := rw.WaitAllInformersSynced(ctx)
+	steps.syncWait = time.Since(syncStart)
 
 	// Step 7.5 — Ship F2 (0.30.125): the SA content-population pass. Runs
 	// AFTER the sync barrier (the informers it resolves against are warm)
@@ -844,7 +856,10 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// 0.30.124. The pass is best-effort: any failure is logged inside
 	// runContentPrewarmPass and never blocks readiness.
 	if contentWarm != nil {
+		setPhase1Stage(phase1StageContentPrewarm)
+		contentStart := time.Now()
 		contentWarm(ctx)
+		steps.content = time.Since(contentStart)
 	}
 
 	// Step 7.5 (Path 3.2 / 0.30.218) — cluster_list cell pre-warm. Runs
@@ -855,7 +870,10 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// path covers any unwarmed cell at /call time. nil-safe when
 	// cache off / no harvester.
 	if clusterListPrewarm != nil {
+		setPhase1Stage(phase1StageClusterListPrewarm)
+		clusterListStart := time.Now()
 		clusterListPrewarm(ctx)
+		steps.clusterList = time.Since(clusterListStart)
 	}
 
 	// Step 7.6 — Ship PIP (0.30.173): the per-identity prewarm seed. Seeds
@@ -898,8 +916,28 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			// C2: guaranteed flip — runs on normal return, error, timeout, AND
 			// after a panic-recover. Innermost so it is the LAST deferred to run.
 			defer cache.MarkPhase1Done()
+			// #397: the readiness-exit record runs immediately BEFORE the flip
+			// (after the recover below), on every exit of this block.
+			// Classification and recording both run inside recordPhase1SeedExit's
+			// once + recover guard, so no panic from the instrumentation can
+			// escape this defer chain (MarkPhase1Done still runs last, as
+			// before). The ctx errors are captured the
+			// instant pipSeed returns — by the time this defer runs, the
+			// seedCancel defer has already cancelled seedCtx.
+			var (
+				parentErrAtExit  error
+				seedCtxErrAtExit error
+				seedErr          error
+				seedPanicked     bool
+			)
+			setPhase1Stage(phase1StageBootSeed)
+			defer func() {
+				steps.seed = time.Since(panicStart)
+				recordPhase1SeedExit(parentErrAtExit, seedCtxErrAtExit, seedErr, seedPanicked, time.Since(start), steps)
+			}()
 			defer func() {
 				if r := recover(); r != nil {
+					seedPanicked = true
 					log.Error("phase1.seed.panic",
 						slog.String("subsystem", "cache"),
 						slog.Any("panic", r),
@@ -922,7 +960,9 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			defer seedCancel()
 			seedCtx = xcontext.BuildContext(seedCtx, xcontext.WithLogger(slog.Default()))
 			seedStart := time.Now()
-			if err := pipSeed(seedCtx); err != nil {
+			seedErr = pipSeed(seedCtx)
+			parentErrAtExit, seedCtxErrAtExit = ctx.Err(), seedCtx.Err()
+			if err := seedErr; err != nil {
 				log.Warn("phase1.seed.sync_incomplete",
 					slog.String("subsystem", "cache"),
 					slog.Any("err", err),
@@ -940,6 +980,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	} else {
 		// PIP off — nothing to seed; flip Ready right after the sync barrier +
 		// content pass (byte-identical to the pre-gate flip point for this case).
+		recordPhase1ReadinessExit(phase1ExitNoneConfigured, "", time.Since(start), steps)
 		cache.MarkPhase1Done()
 	}
 

@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 )
 
 // readyzInfo is the JSON body returned by /readyz.
@@ -14,6 +15,16 @@ type readyzInfo struct {
 	// Phase1Done mirrors cache.IsPhase1Done() — the Tag B startup
 	// informer-warmup signal.
 	Phase1Done bool `json:"phase1Done"`
+	// Reason (#397, warming only) is the phase-1 stage the pod is in, from a
+	// closed code-defined set (e.g. "informer_sync", "boot_seed_in_progress").
+	Reason string `json:"reason,omitempty"`
+	// ElapsedS (#397, warming only) is the whole seconds since process start.
+	ElapsedS *int64 `json:"elapsed_s,omitempty"`
+	// Outcome (#397, ready only) is how readiness was released: "latch",
+	// "deadline", "boot_error", "seed_panic", "seed_returned" or
+	// "none-configured" — the prewarm.phase1.readiness_exit outcome. Omitted
+	// when no exit was recorded.
+	Outcome string `json:"outcome,omitempty"`
 }
 
 // ReadyCheck is the 0.30.102 Tag B probe-gated readiness endpoint.
@@ -56,6 +67,11 @@ func ReadyCheck() http.HandlerFunc {
 		if done {
 			code = http.StatusOK
 			body.Status = "ready"
+			body.Outcome = dispatchers.Phase1ReadinessExitOutcome()
+		} else {
+			body.Reason = dispatchers.Phase1WarmingReason()
+			elapsed := int64(dispatchers.Phase1SinceProcessStart().Seconds())
+			body.ElapsedS = &elapsed
 		}
 
 		wri.Header().Set("Content-Type", "application/json")
