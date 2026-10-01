@@ -648,19 +648,24 @@ func init() {
 	clusterListAsyncSemaphore = make(chan struct{}, n)
 }
 
-// deriveTargetGVRForClusterList runs ONE jq evaluation of the
-// iterator's path template against the FIRST iterator element and
-// parses the result via cache.ParseAPIServerPathToDep. Returns
-// (gvr, true) ONLY when the parsed path was namespace-scoped — i.e.
-// the iterator IS a per-namespace fan-out. A cluster-scope path
-// (parsed ns=="") means the RA already operates cluster-wide — no
-// collapse is needed; the caller should keep the iterator path
-// verbatim. A non-apiserver / malformed path also returns false.
+// deriveTargetGVRForClusterList decides whether an iterator stage may be
+// collapsed into ONE cluster-wide LIST, and if so for which GVR. It evaluates
+// the stage's path template against EVERY iterator element (via jqutil.ForEach)
+// and returns (gvr, true) ONLY when all elements resolve to the SAME
+// namespace-scoped LIST GVR. A cluster-scope path (ns==""), a by-name GET
+// (#74 Class 3, name!=""), a jq/parse error, or a GVR that differs across
+// elements all return false, so the caller keeps the per-element fan-out.
 //
-// Per design §2.3 Approach (i): the GVR is identical across all
-// iteration elements by construction (the iterator fans out over
-// (crd × namespace) pairs; same CRD across all of them). One
-// evaluation suffices.
+// #351 — HOMOGENEITY GATE (was: element-0 only). The collapse replaces the
+// WHOLE fan-out with one cluster-wide LIST of a single GVR, so it is correct
+// only for a GVR-homogeneous iterator. The previous implementation read the
+// FIRST element only and ASSUMED homogeneity "by construction"; a heterogeneous
+// ns-scoped iterator (e.g. (plural x namespace) over several CRD kinds) then
+// listed element-0's kind alone and SILENTLY DROPPED the rest (incomplete
+// content), and lazyRegisterInnerCallPaths registered an informer for that one
+// GVR only, so the dropped kinds' DELETEs went untracked too. Walking all
+// elements fails toward correctness: on any divergence the per-element fallback
+// (resolve.go) fetches every kind and registers every informer.
 func deriveTargetGVRForClusterList(
 	ctx context.Context,
 	log *slog.Logger,
@@ -675,87 +680,70 @@ func deriveTargetGVRForClusterList(
 		return schema.GroupVersionResource{}, false
 	}
 
-	// Pull the FIRST iterator element via jqutil.ForEach with an
-	// early-exit sentinel. Matches the per-element materialisation
-	// createRequestOptions performs but stops at element 0.
-	var firstElement any
+	// Walk ALL elements (no early-exit, no sampling cap). Element 0 sets the
+	// reference GVR; every later element must yield the SAME GVR and the same
+	// ns-scoped-LIST shape. Once a divergence is seen the decision is false and
+	// the remaining elements are drained without further work.
+	var ref schema.GroupVersionResource
 	have := false
+	diverged := false
 	probeErr := jqutil.ForEach(ctx, jqutil.EvalOptions{
 		Query:   iter,
 		Unquote: true,
 		Data:    dict,
 	}, func(sa any) error {
+		if diverged {
+			return nil
+		}
+		gvr, ok := gvrForClusterListElement(apiCall.Path, sa)
+		if !ok {
+			// cluster-scope / by-name / empty / jq|parse error → collapse-unsafe.
+			diverged = true
+			return nil
+		}
 		if !have {
-			firstElement = sa
-			have = true
+			ref, have = gvr, true
+			return nil
+		}
+		if gvr != ref {
+			// A different GVR across elements — a heterogeneous iterator. #351.
+			diverged = true
 		}
 		return nil
 	})
-	if probeErr != nil || !have {
-		log.Debug("cluster_list.gvr_probe.iterator_empty_or_error",
+	if probeErr != nil || !have || diverged {
+		log.Debug("cluster_list.gvr_probe.declined",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
+			slog.Bool("diverged", diverged),
 			slog.Any("err", probeErr),
 		)
 		return schema.GroupVersionResource{}, false
 	}
+	return ref, true
+}
 
-	// Resolve the path template against the first element — same jq engine +
-	// module loader as createRequestOption.
-	//
-	// #341 — NON-dial evalJQ-swallow cleanup (#302 sibling). resolvedPath is NEVER
-	// dialed: it is used only just below (the empty/${ check) and at
-	// ParseAPIServerPathToDep to derive the GVR for the collapse DECISION;
-	// buildClusterListCall synthesises the actual LIST path from that GVR, not
-	// from this string. So a jq error here fails SAFE (no collapse → per-element
-	// fallback, whose path is evalJQE-guarded by #293). We now render through
-	// evalJQE and SURFACE the error (a bounded DEBUG line + the per-site
-	// snowplow_nondial_jq_error_total counter) instead of letting evalJQ
-	// masquerade it as a non-parsing path. Behaviour is BYTE-IDENTICAL — the error
-	// path returns {},false exactly as err.Error()→parseOK=false did — pure
-	// observability. A FUTURE change that dialed resolvedPath directly must
-	// re-audit this (a jq error would then need to SKIP the dial, not just count).
-	resolvedPath, jqErr := evalJQE(apiCall.Path, firstElement)
+// gvrForClusterListElement resolves apiCall.Path against ONE iterator element
+// and returns the target GVR only when the resolved path is a namespace-scoped
+// LIST (ns != "", name == "") on a parseable apiserver path. A cluster-scope
+// path (ns==""), a by-name GET (#74 Class 3, name!=""), an empty/unresolved
+// template, or a jq/parse error all return false — every collapse-unsafe shape.
+//
+// #341 — a jq error is SURFACED (bumpNondialJQError), not swallowed; the path is
+// never dialed (buildClusterListCall synthesises the LIST path from the GVR), so
+// a jq error fails safe to no-collapse. The ns==""/name!="" guards are keyed on
+// the parsed path SHAPE, never resource/name literals (feedback_no_special_cases).
+func gvrForClusterListElement(pathTmpl string, element any) (schema.GroupVersionResource, bool) {
+	resolvedPath, jqErr := evalJQE(pathTmpl, element)
 	if jqErr != nil {
 		bumpNondialJQError(nondialClusterListGVRProbe)
-		log.Debug("cluster_list.gvr_probe.jq_error",
-			slog.String("subsystem", "cache"),
-			slog.String("ra_stage", apiCall.Name),
-			slog.Any("err", jqErr),
-		)
 		return schema.GroupVersionResource{}, false
 	}
 	if resolvedPath == "" || strings.Contains(resolvedPath, "${") {
 		return schema.GroupVersionResource{}, false
 	}
-
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(resolvedPath)
-	if !parseOK {
-		return schema.GroupVersionResource{}, false
-	}
-	if ns == "" {
-		// Cluster-scope path already — no collapse needed. The RA's
-		// iterator does not fan out over namespaces; keep verbatim.
-		return schema.GroupVersionResource{}, false
-	}
-	if name != "" {
-		// #74 Class 3 — the iterator's first element resolves to a
-		// BY-NAME GET (/…/namespaces/<ns>/<resource>/<name>), NOT a
-		// per-namespace LIST. A by-name fan-out must NEVER collapse: the
-		// collapse replaces N targeted GET-by-name fetches with ONE
-		// cluster-wide LIST, returning the {apiVersion,kind,items} LIST
-		// ENVELOPE (an OBJECT) instead of the per-element bare objects the
-		// RA filter expects. The RA then runs `map(select(.metadata.name…))`
-		// over the OBJECT and indexes its first scalar field (apiVersion
-		// "v1") → gojq "expected an object but got: string". It is ALSO a
-		// correctness bug (a cluster-wide LIST returns ALL N resources, not
-		// the composition's by-name subset). Collapse is valid ONLY for a
-		// name=="" per-namespace LIST. Bug introduced at Ship 0.30.216
-		// (911b1a8) when collapse flipped on; this restores the by-name
-		// fan-out (= the bare array the RA filter consumes).
-		//
-		// STRUCTURAL guard (feedback_no_special_cases) — keyed on the parsed
-		// path SHAPE (a name segment present), never a resource/name literal.
+	if !parseOK || ns == "" || name != "" {
 		return schema.GroupVersionResource{}, false
 	}
 	return gvr, true
