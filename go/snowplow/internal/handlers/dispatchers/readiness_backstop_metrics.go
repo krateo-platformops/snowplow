@@ -68,6 +68,9 @@ func registerReadinessBackstopMetrics() {
 //   - "boot_error"         — the seed returned an error with its ctx still live
 //     (the boot scope finished with an error before the latch could fire).
 //   - "seed_panic"         — the seed panicked; the recover + C2 backstop flipped.
+//   - "no_sa_endpoint" / "no_dyn_client" — Phase1Warmup could not start the walk
+//     (#401); readiness released Ready-DEGRADED with nothing prewarmed
+//     (outcome boot_aborted). Recorded once by releasePhase1BootAborted.
 func recordReadinessBackstop(reason string, elapsed time.Duration, unseededRemaining int) {
 	readinessBackstopFired.Add(1)
 	slog.Error("readyz.backstop.fired",

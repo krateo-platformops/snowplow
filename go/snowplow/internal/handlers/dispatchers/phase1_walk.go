@@ -294,9 +294,15 @@ func ResetEngineProcessCtxForTest() {
 
 // ctx bounds the whole walk + sync barrier (main.go gives it the
 // startupProbe budget). On ctx cancellation Phase1Warmup still calls
-// MarkPhase1Done in its caller — a pod that cannot warm in the budget
-// is better Ready-and-degraded than CrashLoop; main.go owns that
-// decision. Phase1Warmup itself returns the first error encountered.
+// MarkPhase1Done — a pod that cannot warm in the budget is better
+// Ready-and-degraded than CrashLoop. Phase1Warmup itself returns the first
+// error encountered.
+//
+// #401: EVERY return of Phase1Warmup reaches a readiness decision (main.go's
+// safety net does not flip when the cache is on with a watcher, so a return
+// without one leaves /readyz 503 forever). The pre-walk aborts (no SA endpoint,
+// no dynamic client) release readiness Ready-DEGRADED via
+// releasePhase1BootAborted; the walk path flips inside phase1WarmupWith.
 //
 // MUST be called only when cache.PrewarmEnabled() — main.go enforces
 // this. Calling it with the cache disabled / passthrough is a no-op.
@@ -308,19 +314,30 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			slog.String("subsystem", "cache"),
 			slog.String("reason", "cache disabled — no informer factory to warm"),
 		)
+		// #401: nothing to warm — flip here too, so "Phase1Warmup always calls
+		// MarkPhase1Done" holds on every return (main.go's safety net also flips
+		// this shape; both are idempotent and the exit is recorded once).
+		RecordPhase1ReadinessExitNoSeed()
+		cache.MarkPhase1Done()
 		return nil
 	}
 
 	saEP, saErr := idynamic.ServiceAccountEndpoint()
 	if saErr != nil {
-		log.Warn("phase1.warmup.no_sa_endpoint",
+		log.Error("phase1.warmup.no_sa_endpoint",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", saErr),
-			slog.String("effect", "Phase 1 cannot resolve under SA identity; lazy register-on-navigation still covers every GVR on first request"),
+			slog.String("effect", "Phase 1 cannot resolve under SA identity; readiness is released "+
+				"Ready-DEGRADED with nothing prewarmed (lazy register-on-navigation still covers every GVR "+
+				"on first request). Check the pod's projected service-account token "+
+				"(automountServiceAccountToken / serviceAccountName)."),
 		)
-		// #397: surface this stage on the /readyz warming body. Readiness is NOT
-		// flipped on this path (unchanged behaviour).
+		// #397: the stage this boot stopped at. #401: release readiness instead
+		// of leaving /readyz 503 forever (resilience invariant). The token is a
+		// kubelet-projected file present before the container starts, so a
+		// missing one is a misconfiguration, not a transient: no retry.
 		setPhase1Stage(phase1StageNoSAEndpoint)
+		releasePhase1BootAborted(phase1AbortNoSAEndpoint)
 		return saErr
 	}
 
@@ -344,10 +361,14 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	// controller-health clients — keeps its throttling untouched.
 	dynCli, dynErr := k8sdynamic.NewForConfig(rootsReadRESTConfig(rc))
 	if dynErr != nil {
-		log.Warn("phase1.warmup.no_dyn_client",
+		log.Error("phase1.warmup.no_dyn_client",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", dynErr),
+			slog.String("effect", "Phase 1 cannot read the navigation roots; readiness is released "+
+				"Ready-DEGRADED with nothing prewarmed"),
 		)
+		// #401: the same never-Ready hole as the SA-endpoint abort above.
+		releasePhase1BootAborted(phase1AbortNoDynClient)
 		return dynErr
 	}
 

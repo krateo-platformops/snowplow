@@ -950,7 +950,9 @@ func main() {
 								}
 								// Phase1Warmup always calls
 								// cache.MarkPhase1Done internally before it
-								// returns — /readyz is now 200.
+								// returns, on EVERY return including the
+								// pre-walk aborts (#401: a missing SA endpoint
+								// releases Ready-degraded) — /readyz is now 200.
 							}()
 						} else {
 							// #57: PrewarmEnabled() is implicit-on-cache, so
