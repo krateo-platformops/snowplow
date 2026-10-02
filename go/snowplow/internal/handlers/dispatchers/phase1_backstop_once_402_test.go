@@ -75,16 +75,20 @@ func TestIssue402_OneBackstopPerRelease(t *testing.T) {
 	rows := []struct {
 		name string
 		// closeBoot closes bootDone with bootErr before the seed runs.
-		closeBoot   bool
-		bootErr     error
-		fireLatch   bool
-		ctxBudget   time.Duration
+		closeBoot bool
+		bootErr   error
+		fireLatch bool
+		ctxBudget time.Duration
+		// cancelAfter > 0 cancels the parent ctx mid-boot (a SIGTERM shape).
+		cancelAfter time.Duration
 		wantDelta   int64
 		wantReasons []string
 		wantOutcome string
 	}{
 		{name: "deadline_phase1_timeout", ctxBudget: 300 * time.Millisecond, wantDelta: 1,
 			wantReasons: []string{"phase1_timeout"}, wantOutcome: phase1ExitDeadline},
+		{name: "deadline_canceled_shutdown_mid_boot", ctxBudget: 20 * time.Second, cancelAfter: 300 * time.Millisecond, wantDelta: 1,
+			wantReasons: []string{"canceled"}, wantOutcome: phase1ExitDeadline},
 		{name: "boot_error", closeBoot: true, bootErr: boom, ctxBudget: 20 * time.Second, wantDelta: 1,
 			wantReasons: []string{"boot_error"}, wantOutcome: phase1ExitBootError},
 		{name: "latch_control_no_backstop", fireLatch: true, ctxBudget: 20 * time.Second, wantDelta: 0,
@@ -114,6 +118,10 @@ func TestIssue402_OneBackstopPerRelease(t *testing.T) {
 			before := readinessBackstopFired.Value()
 			ctx, cancel := context.WithTimeout(context.Background(), r.ctxBudget)
 			defer cancel()
+			if r.cancelAfter > 0 {
+				timer := time.AfterFunc(r.cancelAfter, cancel)
+				defer timer.Stop()
+			}
 			_ = phase1WarmupWith(ctx, rw, exitNoRoots, exitNoResolve, nil, nil, seed, nil)
 			if !cache.IsPhase1Done() {
 				t.Fatal("readiness did not flip (C2 backstop behaviour must be unchanged)")
@@ -130,5 +138,29 @@ func TestIssue402_OneBackstopPerRelease(t *testing.T) {
 				t.Errorf("readiness exit outcome = %q, want %q", o, r.wantOutcome)
 			}
 		})
+	}
+}
+
+// TestIssue402_SeedExitBackstopReason_PipGlobalTimeout — the pipGlobalTimeout
+// arm (the seed's own 8m budget ends while the PHASE1 parent is live) cannot be
+// reached through phase1WarmupWith in a unit-test budget, so it drives the REAL
+// single record site (recordPhase1SeedExit) with the ctx errors that release
+// produces: exactly one backstop, reason pip_global_timeout.
+func TestIssue402_SeedExitBackstopReason_PipGlobalTimeout(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	resetExitWorld(t)
+	logs := captureBackstopLogs(t)
+
+	before := readinessBackstopFired.Value()
+	recordPhase1SeedExit(nil, context.DeadlineExceeded, context.DeadlineExceeded, false, time.Second, noPhase1StepTimings())
+	if got := readinessBackstopFired.Value() - before; got != 1 {
+		t.Errorf("#402: backstop delta = %d, want 1", got)
+	}
+	if got := logs.reasons(t); strings.Join(got, ",") != "pip_global_timeout" {
+		t.Errorf("#402: reasons = %v, want [pip_global_timeout]", got)
+	}
+	if o := Phase1ReadinessExitOutcome(); o != phase1ExitDeadline {
+		t.Errorf("outcome = %q, want deadline", o)
 	}
 }

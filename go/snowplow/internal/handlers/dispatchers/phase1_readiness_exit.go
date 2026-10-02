@@ -286,7 +286,11 @@ func recordPhase1ReadinessExit(outcome, cause string, elapsed time.Duration, ste
 // classification, the backstop record, snapshotting or logging is swallowed
 // here and can never escape the seed block's defer chain (C3). The backstop
 // and the readiness-exit outcome come from the SAME classification, so they
-// can no longer disagree (e.g. a latch/deadline tie).
+// agree on every release (e.g. a latch/deadline tie is a latch release with no
+// backstop) with ONE named exception: a seed that panics after the latch fired
+// is outcome=latch (readiness was latch-released) but still records a
+// seed_panic backstop, because the seed aborted mid-flight
+// (phase1BackstopReason).
 func recordPhase1SeedExit(parentErr, seedCtxErr, seedErr error, panicked bool, elapsed time.Duration, steps phase1StepTimings) {
 	var outcome, cause string
 	classified := false
