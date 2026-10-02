@@ -35,7 +35,7 @@ func TestRAServe_S323_ResolveRacingDelete_RefusedNotResurrected(t *testing.T) {
 	}
 	// The raKey the production path derives (admin re-derives the f6 first-match
 	// BindingUID C:crb-a-f6-uid — matching TestRAServe_* in this file).
-	keyInputs := cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
+	keyInputs := f6KeyInputs(gvr().Group, gvr().Version, gvr().Resource,
 		"krateo-system", raName, "C:crb-a-f6-uid", nil)
 	raKey := cache.ComputeKey(keyInputs)
 	refusedBefore := store.Stats().PutRefusedGenerationMovedTotal

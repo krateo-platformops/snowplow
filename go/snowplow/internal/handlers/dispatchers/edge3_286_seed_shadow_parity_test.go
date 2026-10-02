@@ -184,7 +184,7 @@ func e3286BuildWatcher(t *testing.T) {
 func e3286PrewarmRAKey(t *testing.T, marker string) string {
 	t.Helper()
 	g := e3286RAGVR()
-	inputs := cache.RAFullListKeyInputs(g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286BindingUID, nil)
+	inputs := e3286KeyInputs(g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286BindingUID, nil)
 	raKey := cache.ComputeKey(inputs)
 	// The apiRef caller-class is "apiref" (raFullListServe's raFullListCallerClass).
 	shape := cache.SliceShapeHash("apiref", g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286SliceJQ)
@@ -275,7 +275,7 @@ func TestEdge3_286_SeedShadowParityDoesNotPerturbCapture(t *testing.T) {
 	cache.Deps().SetStore(cache.ResolvedCache())
 
 	g := e3286RAGVR()
-	raKey := cache.ComputeKey(cache.RAFullListKeyInputs(g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286BindingUID, nil))
+	raKey := cache.ComputeKey(e3286KeyInputs(g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286BindingUID, nil))
 	e3286PrewarmRAKey(t, "OLD")
 
 	base := e3286Ctx("admin", []string{"system:masters"})
@@ -319,7 +319,7 @@ func TestEdge3_286_SeedShadowParityDoesNotPerturbCapture(t *testing.T) {
 	// edge-2's raKey refresh — not under test), then drive the backing UPDATE
 	// through the real dep decision site; a refresher re-serves any dirty-marked
 	// widget. Both siblings carry edge-3, so both must converge.
-	inputs := cache.RAFullListKeyInputs(g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286BindingUID, nil)
+	inputs := e3286KeyInputs(g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286BindingUID, nil)
 	cache.ResolvedCache().PutRAFullList(raKey, inputs, e3286FullDict("NEW"))
 
 	widgets := map[string]context.Context{

@@ -420,6 +420,25 @@ type ResolvedKeyInputs struct {
 	// site — design §4.3).
 	BindingUID string
 
+	// SubjectBindingSet — #423. The digest of EVERY binding (CRB + RB, every
+	// namespace) whose subjects match the requester — rbac.SubjectBindingSetDigest.
+	// Folded into ComputeKey for every identity-bound class (everything except
+	// widgetContent), right after BindingUID.
+	//
+	// WHY: BindingUID names only the FIRST binding granting the dispatched CR's
+	// GET. Two users co-bound by it shared one cell even when one held an extra
+	// binding that changed what the RESTAction's own steps could read; the hit
+	// path serves RawJSON verbatim, so the other was served data their RBAC
+	// denies (#423). Every verdict EvaluateRBAC can return is a function of the
+	// requester's matching-binding set, so equal sets ⇒ byte-identical output
+	// and the sharing below is sound; a different set ⇒ a different key.
+	//
+	// Every mint site of an identity-bound key MUST set it — dispatchCacheLookupKey
+	// (restactions + widgets, customer AND prewarm seed) and the apiref
+	// seedFullListRAKey (raFullList). The refresher re-derives its key from the
+	// carried Inputs, so it inherits the field.
+	SubjectBindingSet string
+
 	// RepresentativeUsername + RepresentativeGroups — Ship A.3 / 0.30.179
 	// Option A; KEPT in H.c-layered. The L1 cell is per-binding (keyed by
 	// BindingUID), but the REFRESHER must re-resolve under a CONCRETE
@@ -565,7 +584,14 @@ type ResolvedKeyInputs struct {
 // a v6 hit and re-pin the very staleness this fix removes. The salt rotation
 // forces every pod to treat pre-v6 cells as non-hits — a clean cross-regime
 // break, identical rationale to v3→v4 and v4→v5.
-const resolvedKeyVersion = "v6"
+// #423 — BUMPED v6 → v7. ComputeKey now folds SubjectBindingSet (the digest of
+// every binding matching the requester) for every identity-bound class. A v6
+// cell was keyed by the first-match BindingUID alone and could be SHARED by two
+// users whose step-level RBAC differs — exactly the cross-identity serve #423
+// removes — so no v6 cell may serve as a v7 hit. The salt rotation makes every
+// pre-v7 cell unreachable on rollout; the prewarm seed re-mints under v7 before
+// readyz admits traffic (readyz gates on prewarm complete).
+const resolvedKeyVersion = "v7"
 
 // ResolvedCacheStore is the L1 resolved-output cache: a bounded LRU
 // guarded by a single mutex with a per-entry byte budget. Constructed
@@ -1069,6 +1095,11 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	if in.CacheEntryClass != CacheEntryClassWidgetContent {
 		h.Write([]byte(in.BindingUID))
 		h.Write([]byte{0xff}) // identity terminator
+		// #423 (v6 → v7): the requester's full matching-binding-set digest. A
+		// fixed-width hex SHA-256 (or "" when no snapshot), then its own
+		// terminator so it cannot run into the sub-gen bytes.
+		h.Write([]byte(in.SubjectBindingSet))
+		h.Write([]byte{0xfd}) // binding-set terminator (distinct from 0xff / 0xfe)
 		// #118 (c) v4→v5: fold the requesting identity's per-subject RBAC
 		// sub-generation alongside BindingUID for every identity-bound class.
 		// The BindingUID captures WHICH binding authorised THIS layer's GET;
@@ -1961,6 +1992,11 @@ type ResolvedEntryMeta struct {
 	// #187 needed (the same widget was held under admin,
 	// system:gke-common-webhooks and system:kubestore-collector).
 	BindingUID string `json:"bindingUID,omitempty"`
+	// SubjectBindingSet is the #423 binding-set digest folded into the key — a
+	// SHA-256 over sorted binding ids, never a name or a body. Two rows with the
+	// same coordinates and different digests are two RBAC-distinct identity
+	// classes, which is exactly the separation #423 adds.
+	SubjectBindingSet string `json:"subjectBindingSet,omitempty"`
 	// TTLOverrideSeconds is the per-entry override when one is stamped (UAF
 	// cells), 0 otherwise. It can only ever SHORTEN the effective TTL.
 	TTLOverrideSeconds int64 `json:"ttlOverrideSeconds,omitempty"`
@@ -2221,6 +2257,7 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 	meta.ExtrasHash = item.extrasHash
 	if in := entry.Inputs; in != nil {
 		meta.BindingUID = in.BindingUID
+		meta.SubjectBindingSet = in.SubjectBindingSet
 		meta.CacheEntryClass = in.CacheEntryClass
 		meta.Group = in.Group
 		meta.Version = in.Version

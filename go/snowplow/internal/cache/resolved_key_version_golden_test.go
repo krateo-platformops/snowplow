@@ -4,13 +4,14 @@
 // ComputeKey hash so a key-schema change forces a clean rolling-restart break:
 // no pre-bump entry ever serves as a post-bump hit. This test pins two things:
 //
-//   1. resolvedKeyVersion == "v6" — the current schema generation (#118 (c)-v2).
-//      A silent bump here without a matching golden update fails loud, forcing a
-//      deliberate decision (matches the compile-once golden discipline).
+//  1. resolvedKeyVersion == "v7" — the current schema generation (#423: the
+//     SubjectBindingSet fold; v6 was #118 (c)-v2).
+//     A silent bump here without a matching golden update fails loud, forcing a
+//     deliberate decision (matches the compile-once golden discipline).
 //
-//   2. A GOLDEN DIGEST anchor for a fixed ResolvedKeyInputs. The golden was
-//      captured from the real ComputeKey; if the key ENCODING (field order,
-//      terminators, version fold) drifts, the digest changes and this reds.
+//  2. A GOLDEN DIGEST anchor for a fixed ResolvedKeyInputs. The golden was
+//     captured from the real ComputeKey; if the key ENCODING (field order,
+//     terminators, version fold) drifts, the digest changes and this reds.
 //
 // RED PROOF: dropping the version prefix from the key encoding leaves the
 // digest UNCHANGED for a same-version corpus — the version salt's whole job is
@@ -36,26 +37,27 @@ func goldenKeyInputs() ResolvedKeyInputs {
 		CacheEntryClass: CacheEntryClassRestactions,
 		Group:           "g", Version: "v", Resource: "r",
 		Namespace: "ns", Name: "n",
-		BindingUID: "C:uid-fixed",
-		PerPage:    20, Page: 1,
+		BindingUID:        "C:uid-fixed",
+		SubjectBindingSet: "sbs-fixed",
+		PerPage:           20, Page: 1,
 		RBACSubGen: 7,
 		Extras:     map[string]any{"a": "1", "z": float64(2)},
 	}
 }
 
 // goldenResolvedKeyDigest is the SHA-256 hex ComputeKey produces for
-// goldenKeyInputs() under resolvedKeyVersion "v6". Captured empirically from the
+// goldenKeyInputs() under resolvedKeyVersion "v7". Captured empirically from the
 // real implementation. A drift in the key encoding (or an unannounced version
 // bump) changes this and reds the test.
 // gitleaks:allow — this is a SHA-256 test golden (ComputeKey output), not a credential.
-const goldenResolvedKeyDigest = "8accc561ccc518aff43998d0f7959d0dacb2dcac728dbe988c4630e73f999031" //gitleaks:allow
+const goldenResolvedKeyDigest = "f796e62505b1589d8f04487982211120c2da67199726aa7b243718e9470d320c" //gitleaks:allow
 
-// TestResolvedKeyVersion_ConstantAnchor is L3 part 1: the version const is "v6".
+// TestResolvedKeyVersion_ConstantAnchor is L3 part 1: the version const is "v7".
 func TestResolvedKeyVersion_ConstantAnchor(t *testing.T) {
-	if resolvedKeyVersion != "v6" {
+	if resolvedKeyVersion != "v7" {
 		t.Fatalf("resolvedKeyVersion = %q, want %q — a key-schema bump must be a "+
 			"DELIBERATE change; update this anchor and the golden digest together",
-			resolvedKeyVersion, "v6")
+			resolvedKeyVersion, "v7")
 	}
 }
 
@@ -95,6 +97,8 @@ func computeKeyWithoutVersionPrefix(in ResolvedKeyInputs) string {
 	if in.CacheEntryClass != CacheEntryClassWidgetContent {
 		h.Write([]byte(in.BindingUID))
 		h.Write([]byte{0xff})
+		h.Write([]byte(in.SubjectBindingSet))
+		h.Write([]byte{0xfd})
 		var subgen [8]byte
 		binary.LittleEndian.PutUint64(subgen[:], in.RBACSubGen)
 		h.Write(subgen[:])

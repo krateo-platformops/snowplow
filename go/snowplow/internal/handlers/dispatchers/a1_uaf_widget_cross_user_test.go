@@ -140,10 +140,11 @@ func TestR2_UAFCrossUser_WidgetNoSharedCellServe(t *testing.T) {
 		t.Fatalf("PRECONDITION (ii) FAILED: both users must derive the SAME non-empty widgets BindingUID (that sharing "+
 			"IS the defect); alice=%q bob=%q", aliceIn.BindingUID, bobIn.BindingUID)
 	}
-	if aliceKey != bobKey {
-		t.Fatalf("PRECONDITION (ii) FAILED: the two users' PRODUCTION-derived WIDGETS keys must be IDENTICAL — that one "+
-			"shared cell is what alice's narrowed widgetData would be written into and bob served from. alice=%q bob=%q",
-			aliceKey, bobKey)
+	// #423: see the restactions twin — keys are identical on every dimension
+	// except the SubjectBindingSet fold (the pre-#423 shared cell).
+	if keyWithoutSBS423(*aliceIn) != keyWithoutSBS423(*bobIn) {
+		t.Fatalf("PRECONDITION (ii) FAILED: apart from the #423 SubjectBindingSet the two users' PRODUCTION-derived "+
+			"WIDGETS keys must be IDENTICAL (the pre-#423 shared cell). alice=%q bob=%q", aliceKey, bobKey)
 	}
 	if _, ok := handle.Get(aliceKey); ok {
 		t.Fatalf("PRECONDITION: the shared widgets key must be cold before alice's request")

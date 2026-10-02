@@ -83,6 +83,12 @@ func extrasMinusSlice(extras map[string]any) map[string]any {
 // `bindingSetHash uint64` to `bindingUID string`. The caller (widgets/apiref/
 // ra_full_list.go:85) is migrated in lockstep to derive the BindingUID via
 // rbac.EvaluateRBAC instead of cache.BindingSetHash.
+//
+// #423: the caller MUST also set the returned SubjectBindingSet to the
+// requester's full matching-binding-set digest (rbac.SubjectBindingSetDigest —
+// package cache cannot import rbac). The sole production caller,
+// apiref.seedFullListRAKey, does; RA output is narrowed per requester by every
+// step, so the first-match bindingUID alone is not a sound sharing class.
 func RAFullListKeyInputs(group, version, resource, namespace, name string,
 	bindingUID string, extras map[string]any) ResolvedKeyInputs {
 	return ResolvedKeyInputs{

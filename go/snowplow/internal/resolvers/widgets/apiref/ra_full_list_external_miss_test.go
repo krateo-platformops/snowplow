@@ -55,7 +55,7 @@ func TestRAServe_KnownSliceableCellMiss_ExternalTouched_DeclinesPut(t *testing.T
 
 	// The raKey the serve path derives (seedFullListRAKey → RAFullListKeyInputs
 	// → ComputeKey), keyed on admin's f6 first-match BindingUID on restactions.
-	keyInputs := cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
+	keyInputs := f6KeyInputs(gvr().Group, gvr().Version, gvr().Resource,
 		"krateo-system", raName, "C:crb-a-f6-uid", nil)
 	raKey := cache.ComputeKey(keyInputs)
 	shape := cache.SliceShapeHash(raFullListCallerClass, gvr().Group, gvr().Version,

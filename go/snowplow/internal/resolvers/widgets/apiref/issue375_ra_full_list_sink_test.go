@@ -23,7 +23,7 @@ import (
 var g375Dep = schema.GroupVersionResource{Group: "deps.example.io", Version: "v1", Resource: "things"}
 
 func raKey375(raName string) string {
-	return cache.ComputeKey(cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
+	return cache.ComputeKey(f6KeyInputs(gvr().Group, gvr().Version, gvr().Resource,
 		"krateo-system", raName, "C:crb-a-f6-uid", nil))
 }
 

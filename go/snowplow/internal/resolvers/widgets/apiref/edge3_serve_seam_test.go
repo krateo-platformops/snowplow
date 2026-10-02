@@ -233,7 +233,7 @@ func TestEdge3_FC2_FastPathServeGoesStale(t *testing.T) {
 	// is NOT the subject of this falsifier. raKey must be fresh BEFORE the
 	// widget re-serve so a widget that DOES get dirty-marked re-slices NEW.
 	marker = "NEW"
-	raKeyInputs := cache.RAFullListKeyInputs(gRA.Group, gRA.Version, gRA.Resource,
+	raKeyInputs := f6KeyInputs(gRA.Group, gRA.Version, gRA.Resource,
 		edge3BackingNS, raName, "C:crb-a-f6-uid", nil)
 	raKey := cache.ComputeKey(raKeyInputs)
 	freshFull, err := resolve(cache.WithL1KeyContext(base, raKey), 0, 0)
@@ -331,7 +331,7 @@ func edge3MutateAndAssertConverge(t *testing.T, base context.Context, gRA, backi
 	d := cache.Deps()
 
 	*markerPtr = "NEW"
-	raKeyInputs := cache.RAFullListKeyInputs(gRA.Group, gRA.Version, gRA.Resource,
+	raKeyInputs := f6KeyInputs(gRA.Group, gRA.Version, gRA.Resource,
 		edge3BackingNS, raName, "C:crb-a-f6-uid", nil)
 	raKey := cache.ComputeKey(raKeyInputs)
 	freshFull, err := resolve(cache.WithL1KeyContext(base, raKey), 0, 0)
@@ -436,7 +436,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 	// PRE-WARM raKey: resident cell + known-sliceable verdict + edge-2 + RA-CR
 	// self-dep (the state a prior first-sight leaves), so w1's serve is a pure
 	// 4a fast-path HIT with no real resolveRA.
-	raKeyInputs := cache.RAFullListKeyInputs(gRA.Group, gRA.Version, gRA.Resource,
+	raKeyInputs := f6KeyInputs(gRA.Group, gRA.Version, gRA.Resource,
 		edge3BackingNS, raName, "C:crb-a-f6-uid", nil)
 	raKey := cache.ComputeKey(raKeyInputs)
 	shape := seedFullListShape(gRA, edge3BackingNS, raName, ra(raSliceJQ))
@@ -642,7 +642,7 @@ func TestEdge3_E2E_ResolveB2B3WiringThroughApirefResolve(t *testing.T) {
 
 	// PRE-WARM raKey: resident cell + known-sliceable verdict + edge-2 + RA-CR
 	// self-dep, so raFullListServe HITs the fast path (no real resolve).
-	raKeyInputs := cache.RAFullListKeyInputs(gRA.Group, gRA.Version, gRA.Resource,
+	raKeyInputs := f6KeyInputs(gRA.Group, gRA.Version, gRA.Resource,
 		ns, raName, "C:crb-a-f6-uid", nil)
 	raKey := cache.ComputeKey(raKeyInputs)
 	shape := seedFullListShape(gRA, ns, raName, ra(raSliceJQ))

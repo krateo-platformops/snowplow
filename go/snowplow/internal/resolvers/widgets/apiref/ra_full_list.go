@@ -169,6 +169,10 @@ func seedFullListRAKey(ctx context.Context, gvr schema.GroupVersionResource,
 	}
 	keyInputs := cache.RAFullListKeyInputs(gvr.Group, gvr.Version, gvr.Resource,
 		namespace, name, bindingUID, extras)
+	// #423 — fold the requester's FULL matching-binding set (same derivation as
+	// dispatchCacheLookupKey) so a co-bound requester with different step-level
+	// RBAC never shares this cell.
+	keyInputs.SubjectBindingSet = rbac.SubjectBindingSetDigest(ui.Username, ui.Groups)
 	return keyInputs, cache.ComputeKey(keyInputs), true
 }
 
