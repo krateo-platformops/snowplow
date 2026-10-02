@@ -199,7 +199,8 @@ func crdDiscoverySingleton() *crdDiscovery {
 // and invokes triggerCRDDiscovery per event OFF the informer
 // processor goroutine. It exits on stopCh close (test cleanup);
 // production never stops it — its lifetime is the process
-// lifetime.
+// lifetime. startOnce doubles as the stop guard (#393): see
+// stopCRDDiscoveryWorker.
 func (c *crdDiscovery) startCRDDiscoveryWorker() {
 	c.startOnce.Do(func() {
 		c.workerWG.Add(1)
@@ -397,7 +398,18 @@ func crdLifecycleKindString(k crdLifecycleKind) string {
 // until the worker goroutine has exited (and drained pending
 // events). Used by the _test.go shim; production code MUST NOT
 // call it.
+//
+// #393: it first consumes startOnce, the same guard as depWatch.stopWorker.
+// sync.Once returns from every Do only after the winning function finished,
+// so either a concurrent startCRDDiscoveryWorker already won and its
+// workerWG.Add(1) happens-before the Wait below, or this call wins with a
+// no-op and no later start can Add from zero against the Wait. Events
+// submitted after the stop stay in the buffer, unprocessed, which is what
+// the pre-#393 shim also did once its (late-started) worker had drained and
+// exited. Production never calls this, so its first event always wins the
+// Once and starts the worker as before.
 func (c *crdDiscovery) stopCRDDiscoveryWorker() {
+	c.startOnce.Do(func() {})
 	select {
 	case <-c.stopCh:
 		// already stopped
