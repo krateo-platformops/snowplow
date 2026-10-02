@@ -329,8 +329,18 @@ func TestIssue407_E4_SetExactlyOnce(t *testing.T) {
 	if err := phase1WarmupWith(ctx, rw, exitNoRoots, exitNoResolve, nil, nil, seed, nil); err != nil {
 		t.Fatalf("phase1WarmupWith: %v", err)
 	}
-	first, _ := json.Marshal(readExitExpvar(t))
+	firstMap := readExitExpvar(t)
+	first, _ := json.Marshal(firstMap)
 	firstPtr := phase1ExitRec.Load()
+	// Non-vacuity: the exit DID store a record. Without these, a recorder that
+	// never stores passes the identity / unchanged-map checks below trivially
+	// (nil == nil, {} == {}).
+	if firstPtr == nil {
+		t.Fatal("E4 RED: the latch exit stored no record")
+	}
+	if firstMap["outcome"] != "latch" {
+		t.Fatalf("E4 RED: the first map has no latch outcome before the re-drive: %v", firstMap)
+	}
 
 	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeKeepwarm); err != nil {
 		t.Fatalf("keepwarm: %v", err)

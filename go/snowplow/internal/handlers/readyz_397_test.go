@@ -126,4 +126,23 @@ func TestIssue407_Readyz_ReadyBodyCarriesStepTimings(t *testing.T) {
 	if _, has := body["reason"]; has {
 		t.Fatalf("ready body must not carry a warming reason; body=%v", body)
 	}
+
+	// -1 arm: a step that did not run (the -1ns sentinel) reads -1 on the ready
+	// body, never 0 ((-1ns).Milliseconds() truncates to 0 without stepMs).
+	cache.ResetPhase1DoneForTest()
+	dispatchers.ResetPhase1ReadinessExitForTest()
+	dispatchers.RecordPhase1ReadinessExitForTest("latch",
+		9500*time.Millisecond, 1100*time.Millisecond, 2200*time.Millisecond,
+		time.Duration(-1), 440*time.Millisecond, 2460*time.Millisecond)
+	cache.MarkPhase1Done()
+	code, body = readyzRaw(t)
+	if code != http.StatusOK {
+		t.Fatalf("ready /readyz returned %d, want 200", code)
+	}
+	if got, ok := body["content_prewarm_ms"].(float64); !ok || got != -1 {
+		t.Errorf("not-run step: ready body content_prewarm_ms = %v, want -1; body=%v", body["content_prewarm_ms"], body)
+	}
+	if got, ok := body["walk_ms"].(float64); !ok || got != 1100 {
+		t.Errorf("-1 arm: walk_ms = %v, want 1100", body["walk_ms"])
+	}
 }
