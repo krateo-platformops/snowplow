@@ -1,4 +1,4 @@
-// residency_metrics_374.go — #374 Part B diagnostic counter. (The
+// residency_metrics_374.go — #374 Part B and #383 diagnostic counters. (The
 // side-effect-free Has() membership probe Part B uses is canonical on
 // ResolvedCacheStore in resolved.go, next to Get.)
 //
@@ -24,6 +24,32 @@ var pickupNoopNoPark atomic.Uint64
 // gate assert the realized cut via the counter (not by log-tailing).
 func PickupNoopNoParkTotal() uint64 { return pickupNoopNoPark.Load() }
 
+// enqueueDroppedNonResident (#383) counts dirty-marks whose refresher queue slot
+// was DROPPED at the hook because the key was not resident in L1 (the SSI still
+// fired). Load-dependent by nature (the non-resident share of marks swings with
+// traffic), so quote it with its load. DIAGNOSTIC, expvar only, like the counter
+// above.
+var enqueueDroppedNonResident atomic.Uint64
+
+// EnqueueDroppedNonResidentTotal — exported for the #383 arms and the C1 harness.
+func EnqueueDroppedNonResidentTotal() uint64 { return enqueueDroppedNonResident.Load() }
+
+// refreshHookResidencyChecked is a TEST seam (nil in production): called by the
+// refresher hook right after its residency check, before the drop/enqueue
+// decision takes effect, so an arm can land a Put inside that window.
+var refreshHookResidencyChecked atomic.Pointer[func(l1Key string, resident bool)]
+
+// SetRefreshHookResidencyCheckedHookForTest installs fn as the #383 check→decision
+// window seam. Production code MUST NOT call it. Returns a restore func.
+func SetRefreshHookResidencyCheckedHookForTest(fn func(l1Key string, resident bool)) (restore func()) {
+	var p *func(string, bool)
+	if fn != nil {
+		p = &fn
+	}
+	prev := refreshHookResidencyChecked.Swap(p)
+	return func() { refreshHookResidencyChecked.Store(prev) }
+}
+
 var residencyMetrics374Once sync.Once
 
 func init() {
@@ -39,7 +65,8 @@ func registerResidencyMetrics374Expvar() {
 	residencyMetrics374Once.Do(func() {
 		expvar.Publish("snowplow_refresher_residency_cheapen", expvar.Func(func() any {
 			return map[string]uint64{
-				"pickup_noop_no_park": pickupNoopNoPark.Load(),
+				"pickup_noop_no_park":          pickupNoopNoPark.Load(),
+				"enqueue_dropped_non_resident": enqueueDroppedNonResident.Load(),
 			}
 		}))
 	})

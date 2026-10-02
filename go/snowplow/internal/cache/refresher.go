@@ -506,8 +506,36 @@ func StartRefresher(ctx context.Context) {
 		// branch); the memo holds the entry, so we MUST consult the memo
 		// directly, not the L1 store. The invalidator is non-blocking
 		// (drop-on-full) so this never delays the refresher enqueue path.
-		Deps().SetRefreshTriggerMergeHook(r.mergeTriggerGVR)
+		// #383 — the trigger merge (a multi-GVR #375 remark merges all but its last
+		// trigger here BEFORE the hook call) is residency-gated like the enqueue: a
+		// trigger merged for a key the hook then drops would sit in triggerGVRByKey
+		// with no dequeue to consume it.
+		Deps().SetRefreshTriggerMergeHook(func(l1Key string, triggerGVR schema.GroupVersionResource) {
+			if refreshTargetResident(l1Key) {
+				r.mergeTriggerGVR(l1Key, triggerGVR)
+			}
+		})
 		Deps().SetRefreshHook(func(l1Key string, triggerGVR schema.GroupVersionResource) {
+			// #383 — DROP the queue slot for a key that is NOT resident in L1
+			// (#374's side-effect-free Has). A non-resident key is a no-op at
+			// processOne (skipped_no_entry), so its slot is pure occupancy. Safe
+			// because of #375 (+ #408 for the boot carrier): a resolve in flight
+			// across this dep change remarks the key at its accepted Put, through
+			// THIS hook, after the Put commits, when the key IS resident. The dep's
+			// bump (bumpCoordinateGen) precedes this fan-out, so a Put landing
+			// between the check below and the drop still sees the dep moved.
+			// The trigger-GVR store is gated with the enqueue: it is consumed only
+			// by a dequeue, so storing it for a dropped key would orphan it.
+			resident := refreshTargetResident(l1Key)
+			if fn := refreshHookResidencyChecked.Load(); fn != nil {
+				(*fn)(l1Key, resident)
+			}
+			if !resident {
+				enqueueDroppedNonResident.Add(1)
+				// SSI split (#91 Lever C) — see the invariant below.
+				SubmitSliceabilityInvalidate(l1Key)
+				return
+			}
 			// R1 Layer 1 — record the GVR whose dirty-mark enqueued this key
 			// BEFORE the queue.Add, so processNext can stamp it on the
 			// re-resolve ctx (dep-edge-equality force-miss). Last-write-wins
@@ -531,16 +559,14 @@ func StartRefresher(ctx context.Context) {
 			} else {
 				r.enqueue(l1Key)
 			}
-			// #374/#375 INVARIANT — the eventual post-#375 residency-gated
-			// enqueue-DROP must gate ONLY the r.enqueue/enqueueClusterList calls
-			// above; SubmitSliceabilityInvalidate MUST keep firing UNCONDITIONALLY
-			// for every dirty-marked key. It is #91 Lever C: a stuck-false
-			// RAFullList raKey has NO L1 cell by construction, so it would be
-			// "non-resident" to any drop filter — but this call is the ONLY thing
-			// that clears its stuck-false sliceability memo on a backing change.
-			// Dropping it with the enqueue = #91 regression. (#374 does NOT drop;
-			// Part B only skips the yield-park for non-resident no-ops — this
-			// marker guards the FUTURE residency-gated drop.)
+			// #374/#375/#383 INVARIANT — the residency-gated enqueue-DROP (#383,
+			// above) gates ONLY the trigger store + r.enqueue/enqueueClusterList;
+			// SubmitSliceabilityInvalidate fires UNCONDITIONALLY for every
+			// dirty-marked key (on the drop branch above and here). It is #91
+			// Lever C: a stuck-false RAFullList raKey has NO L1 cell by
+			// construction, so it is "non-resident" to the drop filter — but this
+			// call is the ONLY thing that clears its stuck-false sliceability memo
+			// on a backing change. Dropping it with the enqueue = #91 regression.
 			SubmitSliceabilityInvalidate(l1Key)
 		})
 
@@ -585,6 +611,15 @@ func StopRefresher() {
 		r.queue.ShutDown()
 		r.clusterListQueue.ShutDown()
 	})
+}
+
+// refreshTargetResident is the #383 drop gate: is l1Key resident in the L1 store the
+// refresher re-resolves against (ResolvedCache, the store processOne reads)? Has is
+// #374's side-effect-free probe (no warmth, no lazy evict). No store (cache off) →
+// true: never drop on a missing store (the refresher does not run cache-off anyway).
+func refreshTargetResident(l1Key string) bool {
+	c := ResolvedCache()
+	return c == nil || c.Has(l1Key)
 }
 
 // enqueue adds l1Key to the workqueue. Add is idempotent: a key already
