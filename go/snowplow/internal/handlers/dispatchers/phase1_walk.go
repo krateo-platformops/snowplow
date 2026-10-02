@@ -458,10 +458,9 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			authnNS:   authnNS,
 		}
 		engineSeed = func(pctx context.Context) error {
-			// F5 (#131): anchor the backstop-elapsed clock. Used only to
-			// attribute the readyz.backstop.fired ERROR when the flip takes the
-			// C2 backstop arm rather than the firstNav-complete happy path.
-			engineSeedStart := time.Now()
+			// #402: the F5 (#131) backstop-elapsed clock moved to the Step 7.6
+			// block (steps.seed): the single backstop record lives there.
+			//
 			// bootDone is closed by the engine's scopeDone callback the
 			// instant the BOOT scope finishes — so this goroutine returns at
 			// ACTUAL completion (S2), not after the full pipGlobalTimeout.
@@ -553,28 +552,7 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			//   - pctx.Done() — the PHASE1_TIMEOUT parent / pipGlobalTimeout
 			//     child backstop (§F.0/C2). UNCHANGED: readiness is never
 			//     withheld forever; on backstop the pod goes Ready-degraded.
-			select {
-			case <-firstNav.wait():
-				// Happy path — every cohort's nav widgets seeded. NOT a backstop.
-				return nil
-			case <-bootDone:
-				// The boot scope finished before the latch could fire. If the
-				// latch DID fire (e.g. a tie ordering) this is the happy path;
-				// otherwise the boot ended early (roots_list_failed / re-walk
-				// error) with nav widgets unseeded → F5 backstop alert (#131).
-				if !firstNav.fired() {
-					recordReadinessBackstop("boot_error", time.Since(engineSeedStart), -1)
-				}
-				return bootErr
-			case <-pctx.Done():
-				// PHASE1_TIMEOUT / pipGlobalTimeout backstop. If the latch never
-				// fired, readiness flips Ready-DEGRADED with nav widgets unseeded
-				// — the FAILED-but-serving boot #130/#131 requires be surfaced.
-				if !firstNav.fired() {
-					recordReadinessBackstop("phase1_timeout", time.Since(engineSeedStart), -1)
-				}
-				return pctx.Err()
-			}
+			return awaitEngineBootRelease(pctx, firstNav, bootDone, func() error { return bootErr })
 		}
 	}
 
@@ -909,14 +887,17 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// flips at min(seed-complete, pipGlobalTimeout).
 	if pipSeed != nil {
 		func() {
-			// F5 (#131): anchor the panic-path backstop clock BEFORE the defers,
-			// so the recover block can attribute elapsed (seedStart below is not
-			// yet in scope at defer-declaration time).
+			// F5 (#131): anchor the seed-block clock BEFORE the defers, so the
+			// exit recorder (steps.seed, also the #402 single backstop record's
+			// elapsed) covers a panic too (seedStart below is not yet in scope at
+			// defer-declaration time).
 			panicStart := time.Now()
 			// C2: guaranteed flip — runs on normal return, error, timeout, AND
 			// after a panic-recover. Innermost so it is the LAST deferred to run.
 			defer cache.MarkPhase1Done()
 			// #397: the readiness-exit record runs immediately BEFORE the flip
+			// (#402: and it is the single site that records the F5 backstop for
+			// this release)
 			// (after the recover below), on every exit of this block.
 			// Classification and recording both run inside recordPhase1SeedExit's
 			// once + recover guard, so no panic from the instrumentation can
@@ -944,12 +925,9 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 						slog.String("effect", "per-cohort SYNC seed aborted; readiness flips to "+
 							"Ready-DEGRADED (backstop) — first /call per cohort falls back to per-user resolve"),
 					)
-					// F5 (#131): a panicking seed is the WORST failure mode —
-					// readiness flips Ready-DEGRADED via the MarkPhase1Done defer
-					// with the seed aborted mid-flight. Count + alert it like the
-					// other backstop paths, never silent. elapsed is best-effort
-					// from panicStart (anchored before the defers below).
-					recordReadinessBackstop("seed_panic", time.Since(panicStart), -1)
+					// F5 (#131): a panicking seed is the WORST failure mode. #402:
+					// its backstop (reason seed_panic) is recorded once by the
+					// exit recorder in the defer above, not here.
 				}
 			}()
 			// Bound the SYNC seed by pipGlobalTimeout (its own existing budget,
@@ -970,11 +948,10 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 						"cohort falls back to per-user resolve"),
 					slog.Int64("elapsed_ms", time.Since(seedStart).Milliseconds()),
 				)
-				// F5 (#131): a seed error means readiness flips Ready-DEGRADED via
-				// the C2 backstop with an incomplete seed — a FAILED-but-serving
-				// boot per #130. Surface it loud (ERROR + expvar) on top of the
-				// existing WARN, which stays as the human-readable per-cohort note.
-				recordReadinessBackstop("seed_incomplete", time.Since(seedStart), -1)
+				// F5 (#131): the loud backstop signal (ERROR + expvar) for this
+				// release is recorded ONCE by recordPhase1SeedExit in the defer
+				// above, with the most specific cause (#402) — not here, where a
+				// deadline (pctx.Err()) or boot error was counted a second time.
 			}
 		}()
 	} else {
@@ -2052,4 +2029,29 @@ func navWidgetEndpointKey(ref templatesv1.ObjectReference) string {
 // resource/name match.
 func refHasUnresolvedTemplateToken(ref templatesv1.ObjectReference) bool {
 	return strings.Contains(ref.Name, "{") || strings.Contains(ref.Namespace, "{")
+}
+
+// awaitEngineBootRelease is engineSeed's readiness-release select (#99 FIX-F),
+// extracted so a test can drive the REAL release arms (#402). It returns on the
+// FIRST of: the first-nav latch firing (nil), the boot scope finishing (its
+// error, read through bootErr only after bootDone is closed), or pctx ending
+// (pctx.Err()).
+func awaitEngineBootRelease(pctx context.Context, firstNav *firstNavLatch, bootDone <-chan struct{}, bootErr func() error) error {
+	select {
+	case <-firstNav.wait():
+		// Happy path — every cohort's nav widgets seeded. NOT a backstop.
+		return nil
+	case <-bootDone:
+		// The boot scope finished before the latch could fire (or tied
+		// with it). #402: the F5 backstop (#131) is NOT recorded here: the
+		// Step 7.6 exit recorder records exactly one per release, from the
+		// same classification as the readiness-exit outcome (boot_error).
+		return bootErr()
+	case <-pctx.Done():
+		// PHASE1_TIMEOUT / pipGlobalTimeout backstop. #402: surfaced once by
+		// the Step 7.6 exit recorder (outcome deadline, reason = the
+		// deadline cause), not here — recording here AND on the returned
+		// pctx.Err() double-counted every deadline release.
+		return pctx.Err()
+	}
 }
