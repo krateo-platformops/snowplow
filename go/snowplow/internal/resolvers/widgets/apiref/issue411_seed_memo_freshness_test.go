@@ -27,6 +27,7 @@ package apiref
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -34,7 +35,14 @@ import (
 	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 )
 
 type i411Fixture struct {
@@ -50,6 +58,8 @@ type i411Fixture struct {
 	memo    *cache.SeedResolveMemo
 	opts    ResolveOptions
 
+	dyn *dynamicfake.FakeDynamicClient
+
 	mu     sync.Mutex
 	marked map[string]bool
 }
@@ -63,7 +73,7 @@ func i411Setup(t *testing.T, raName string) *i411Fixture {
 	gRA := gvr()
 	backing := edge3BackingGVR()
 	seed := append(f6BuildFixture(), edge3RAUnstructured(ns, raName))
-	edge3NewWatcher(t, seed...)
+	dyn := edge3NewWatcher(t, seed...)
 
 	added, syncCh := cache.Global().EnsureResourceType(gRA)
 	if added {
@@ -87,9 +97,10 @@ func i411Setup(t *testing.T, raName string) *i411Fixture {
 		base:   f6CtxWithUser(t, "admin", []string{"system:masters"}),
 		memo:   cache.NewSeedResolveMemo(pmaps.DeepCopyJSON),
 		marked: map[string]bool{},
+		dyn:    dyn,
 	}
 	f.resolve = edge3StubResolveRA(t, f.marker, backing)
-	f.raIn = cache.RAFullListKeyInputs(gRA.Group, gRA.Version, gRA.Resource, ns, raName, "C:crb-a-f6-uid", nil)
+	f.raIn = f6KeyInputs(gRA.Group, gRA.Version, gRA.Resource, ns, raName, "C:crb-a-f6-uid", nil)
 	f.raKey = cache.ComputeKey(f.raIn)
 	shape := seedFullListShape(gRA, ns, raName, ra(raSliceJQ))
 	fullDict, err := f.resolve(cache.WithL1KeyContext(f.base, f.raKey), 0, 0) // edge-2 under raKey
@@ -460,4 +471,104 @@ func TestIssue411_AsOfFloorOnlyOnReplayedDeps(t *testing.T) {
 		t.Fatalf("#411 C1: a bump of the hitter's OWN self-dep before its entry remarked its Put (%v) — the "+
 			"as-of floor must apply only to the deps replayed from the memo (spurious remark = amplification)", got)
 	}
+}
+
+// i411Unstructured converts a typed RBAC object for the fake dynamic client.
+func i411Unstructured(t *testing.T, obj any) *unstructured.Unstructured {
+	t.Helper()
+	m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		t.Fatalf("ToUnstructured: %v", err)
+	}
+	return &unstructured.Unstructured{Object: m}
+}
+
+// i411WaitFor polls cond until true or the deadline (the RBAC snapshot
+// republishes asynchronously off the informer).
+func i411WaitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("setup: timed out waiting for %s", what)
+}
+
+// i411CrossClassArm drives the #424 composition. w1 produces the memo body for
+// (admin, [system:masters]) in RBAC class A; mutate then changes admin's class
+// (asserted through the same derivation #424 folds into the L1 key); w2, the
+// SAME identity, resolves in class B. w2's L1 key names class B and #424's
+// Put-time class guard re-derives class B, so nothing downstream stops a
+// class-A body from landing in the class-B cell that every class-B member
+// derives. The memo must not cross classes: w2's lookup must be a miss.
+func i411CrossClassArm(t *testing.T, raName string, mutate func(f *i411Fixture), classOf func() string) {
+	f := i411Setup(t, raName)
+	w1Key, w2Key := "L1_"+raName+"_w1", "L1_"+raName+"_w2"
+	// Unpaginated: the body comes from the real restactions.Resolve under ctx's
+	// identity (the 4a path's raKey has folded the class itself since #424).
+	f.opts.PerPage, f.opts.Page = 0, 0
+
+	classA := classOf()
+	f.seedResolve(w1Key, "w1")
+	mutate(f)
+	i411WaitFor(t, "admin's RBAC class to change", func() bool { return classOf() != classA })
+
+	hitsBefore, missBefore := f.memo.Stats()
+	f.seedResolve(w2Key, "w2")
+	hitsAfter, missAfter := f.memo.Stats()
+	if hitsAfter != hitsBefore || missAfter-missBefore != 1 {
+		t.Fatalf("#411 x #424 RED: w2 resolved in a DIFFERENT RBAC class from w1 (same username+groups; the "+
+			"class moved mid-pass), yet it reused w1's memo body (hit delta=%d, miss delta=%d). A memo key that "+
+			"folds (username, groups) but not the class #424 keys L1 cells by writes a class-A body into the "+
+			"class-B cell, served to every class-B member: a #423-class cross-identity leak",
+			hitsAfter-hitsBefore, missAfter-missBefore)
+	}
+}
+
+// TestIssue411_MemoDoesNotCrossBindingSetClass — a new binding for admin lands
+// mid-pass, so admin's SubjectBindingSet digest changes.
+func TestIssue411_MemoDoesNotCrossBindingSetClass(t *testing.T) {
+	i411CrossClassArm(t, "i411-xclass-sbs-ra", func(f *i411Fixture) {
+		crb := &rbacv1.ClusterRoleBinding{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+			ObjectMeta: metav1.ObjectMeta{Name: "crb-411-extra-admin", UID: types.UID("crb-411-extra-uid")},
+			Subjects:   []rbacv1.Subject{{Kind: "User", APIGroup: "rbac.authorization.k8s.io", Name: "admin"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "widgets-reader"},
+		}
+		g := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}
+		if _, err := f.dyn.Resource(g).Create(context.Background(), i411Unstructured(t, crb), metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create CRB: %v", err)
+		}
+	}, func() string { return rbac.SubjectBindingSetDigest("admin", []string{"system:masters"}) })
+}
+
+// TestIssue411_MemoDoesNotCrossRBACSubGenClass — the rules of a role admin is
+// bound to change mid-pass. The binding set is unchanged, but admin's
+// per-subject RBACSubGen (also folded into the widgets/restactions L1 key) moves.
+func TestIssue411_MemoDoesNotCrossRBACSubGenClass(t *testing.T) {
+	cache.ResetBindingsByGVRIndexForTest()
+	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
+	i411CrossClassArm(t, "i411-xclass-subgen-ra", func(f *i411Fixture) {
+		// Activate the sub-gen deltas (production builds this index at boot over
+		// the navigated GVRs), then edit the role's rules.
+		cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{f.gRA})
+		role := &rbacv1.ClusterRole{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
+			ObjectMeta: metav1.ObjectMeta{Name: "widgets-reader"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups: []string{"templates.krateo.io"},
+				Resources: []string{"restactions", "widgets"},
+				Verbs:     []string{"get", "list"},
+			}},
+		}
+		g := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}
+		if _, err := f.dyn.Resource(g).Update(context.Background(), i411Unstructured(t, role), metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("update ClusterRole: %v", err)
+		}
+	}, func() string {
+		return fmt.Sprint(cache.RBACSubGenForSubject("admin", rbac.WithAuthenticatedGroup([]string{"system:masters"})))
+	})
 }

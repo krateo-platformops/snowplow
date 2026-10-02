@@ -123,7 +123,16 @@ type SeedResolveMemo struct {
 // is stable regardless of group ordering and cannot collide across cohorts with
 // divergent RBAC. extrasHash is the caller-computed stable hash of the
 // effective extras map (the same effective-extras the resolve folds).
-func seedResolveMemoKey(raNS, raName, username string, groups []string, extrasHash string, perPage, page int) string {
+//
+// rbacClass (#411 x #424) is the identity's CURRENT RBAC class: the same
+// (SubjectBindingSet digest, RBACSubGen) the widgets / restactions L1 key folds
+// since #424. (username, groups) alone is not enough: within one seed pass a
+// binding grant/revoke or a rules edit on a bound role moves the SAME identity
+// into another class. The hitter's L1 key then names the new class and #424's
+// Put-time guard re-derives the new class, so only the memo key can stop a body
+// resolved under the old class from being written into the new class's cell
+// (served to every member of that class: a #423-class leak).
+func seedResolveMemoKey(raNS, raName, username string, groups []string, rbacClass, extrasHash string, perPage, page int) string {
 	// Copy + sort groups so ["a","b"] and ["b","a"] fold identically without
 	// mutating the caller's slice.
 	g := make([]string, len(groups))
@@ -137,6 +146,8 @@ func seedResolveMemoKey(raNS, raName, username string, groups []string, extrasHa
 	b.WriteString(username)
 	b.WriteString("|g=")
 	b.WriteString(strings.Join(g, "\x1f"))
+	b.WriteString("|c=")
+	b.WriteString(rbacClass)
 	b.WriteString("|x=")
 	b.WriteString(extrasHash)
 	b.WriteString("|pp=")
@@ -147,13 +158,14 @@ func seedResolveMemoKey(raNS, raName, username string, groups []string, extrasHa
 }
 
 // Key builds the canonical memo key for a resolve of RESTAction (raNS/raName)
-// under the RBAC identity (username + groups), effective-extras hash extrasHash
+// under the RBAC identity (username + groups) in RBAC class rbacClass (#424;
+// see seedResolveMemoKey), effective-extras hash extrasHash
 // (from HashExtras), at pagination (perPage, page). The apiref seam calls this
 // so the identity/extras/page folding lives in ONE place (cannot drift from the
 // Load/Store consumers). nil-receiver-safe: a nil memo still produces a
 // well-formed key (harmless — the subsequent nil.Load is a miss).
-func (mo *SeedResolveMemo) Key(raNS, raName, username string, groups []string, extrasHash string, perPage, page int) string {
-	return seedResolveMemoKey(raNS, raName, username, groups, extrasHash, perPage, page)
+func (mo *SeedResolveMemo) Key(raNS, raName, username string, groups []string, rbacClass, extrasHash string, perPage, page int) string {
+	return seedResolveMemoKey(raNS, raName, username, groups, rbacClass, extrasHash, perPage, page)
 }
 
 // sortStrings is a tiny insertion sort (groups slices are short: a handful of

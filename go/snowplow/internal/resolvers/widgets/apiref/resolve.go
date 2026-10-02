@@ -7,12 +7,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/client-go/rest"
 )
@@ -259,7 +261,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	if memo != nil {
 		username, groups := identityForMemo(ctx)
 		memoKey = memo.Key(opts.ApiRef.Namespace, opts.ApiRef.Name,
-			username, groups, cache.HashExtras(opts.Extras), opts.PerPage, opts.Page)
+			username, groups, rbacClassForMemo(username, groups), cache.HashExtras(opts.Extras), opts.PerPage, opts.Page)
 		// #411: Load serves the entry only if none of its captured deps moved
 		// since the entry's stamp (the producer's entry epoch). A dep that moved
 		// after the body was produced but before THIS resolve's entry is
@@ -356,6 +358,22 @@ func identityForMemo(ctx context.Context) (string, []string) {
 		return "", nil
 	}
 	return ui.Username, ui.Groups
+}
+
+// rbacClassForMemo is the identity's current RBAC class as #424 keys L1 cells
+// by: the SubjectBindingSet digest plus the per-subject RBACSubGen (the same
+// derivation identityClassDrift re-checks at Put). Folded into the memo key so
+// a memo entry never crosses classes when the identity's RBAC moves mid-pass.
+//
+// The value is derived at the hitter's (and producer's) memo lookup, after the
+// widget's own L1 key was minted. A class change between the two is caught
+// downstream: the L1 key names the old class, #424's Put guard re-derives the
+// new one and declines. A change during the producer's resolve (after its memo
+// key) is caught the same way: any hitter still deriving the old memo key
+// derived its L1 key before the change, and its Put is declined.
+func rbacClassForMemo(username string, groups []string) string {
+	return rbac.SubjectBindingSetDigest(username, groups) + "/" +
+		strconv.FormatUint(cache.RBACSubGenForSubject(username, rbac.WithAuthenticatedGroup(groups)), 10)
 }
 
 // containsDep reports whether deps already holds dk.
