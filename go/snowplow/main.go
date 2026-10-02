@@ -1217,8 +1217,6 @@ func main() {
 	// can read hit-rate + entry count over /debug/vars. Cache mode-agnostic
 	// registration; the memo itself is only populated on the cache=on path.
 	rbac.RegisterAuthzMemoExpvar()
-	// #424 — binding-set memo (the resolved-output L1 identity dimension).
-	rbac.RegisterSubjectBindingSetExpvar()
 
 	// 1.12.4 §7a — publish the build stamp as an observable. `build` is
 	// stamped correctly as of 1.12.3 (the Dockerfile's -X main.build= fix),

@@ -228,11 +228,21 @@ var (
 	bindingSetExpvarOnce  sync.Once
 )
 
+// init publishes the binding-set memo keys only when the cache subsystem is on
+// (CFG-1: the memo backs the resolved-output L1 key, which does not exist under
+// cache-off, so its keys must be absent there — e2e/bench/cfg1_probe).
+func init() {
+	if cache.Disabled() {
+		return
+	}
+	RegisterSubjectBindingSetExpvar()
+}
+
 // RegisterSubjectBindingSetExpvar publishes the binding-set memo counters on
 // /debug/vars. Every RBAC event republishes the snapshot and swaps the memo
 // shard, so the hit ratio is the operator's read on how often /call pays the
-// cold build (hits / (hits + misses)). Idempotent (sync.Once); called from
-// main.go next to RegisterAuthzMemoExpvar.
+// cold build (hits / (hits + misses)). Idempotent (sync.Once); called from the
+// Disabled()-gated init above.
 //
 //	snowplow_binding_set_memo_hits    — cumulative memo hits
 //	snowplow_binding_set_memo_misses  — cumulative cold builds

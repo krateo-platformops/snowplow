@@ -34,6 +34,8 @@ package dispatchers
 import (
 	"context"
 	"expvar"
+	"sync"
+	"sync/atomic"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -70,17 +72,37 @@ func identityClassDrift(ctx context.Context, inputs *cache.ResolvedKeyInputs, us
 // (/debug/vars snowplow_l1_identity_class_drift_declined_total). Non-zero is
 // expected and benign — every grant/revoke that lands mid-resolve on a
 // requester ticks it once — and it is the evidence the guard fires.
-var identityClassDriftDeclined = expvar.NewMap("snowplow_l1_identity_class_drift_declined_total")
+//
+// CFG-1: the counters always exist (the guard can run in tests regardless of
+// env); the expvar KEY is published only when the cache subsystem is on, from
+// a Disabled()-gated init — under cache-off there is no L1 to write, so the key
+// must be absent (e2e/bench/cfg1_probe).
+var identityClassDriftDeclined sync.Map // "<site>/<reason>" -> *atomic.Int64
+
+func init() {
+	if cache.Disabled() {
+		return
+	}
+	expvar.Publish("snowplow_l1_identity_class_drift_declined_total", expvar.Func(func() any {
+		out := map[string]int64{}
+		identityClassDriftDeclined.Range(func(k, v any) bool {
+			out[k.(string)] = v.(*atomic.Int64).Load()
+			return true
+		})
+		return out
+	}))
+}
 
 // noteIdentityClassDrift records one declined write at site for reason.
 func noteIdentityClassDrift(site, reason string) {
-	identityClassDriftDeclined.Add(site+"/"+reason, 1)
+	v, _ := identityClassDriftDeclined.LoadOrStore(site+"/"+reason, &atomic.Int64{})
+	v.(*atomic.Int64).Add(1)
 }
 
 // identityClassDriftDeclinedForTest reads one site/reason counter.
 func identityClassDriftDeclinedForTest(site, reason string) int64 {
-	if v, ok := identityClassDriftDeclined.Get(site + "/" + reason).(*expvar.Int); ok {
-		return v.Value()
+	if v, ok := identityClassDriftDeclined.Load(site + "/" + reason); ok {
+		return v.(*atomic.Int64).Load()
 	}
 	return 0
 }

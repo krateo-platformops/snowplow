@@ -400,4 +400,161 @@ func k424SeedParity(t *testing.T, step string) {
 	}
 }
 
+// --- RBACSubGen-only drift: the binding set is UNCHANGED at Put time ----------
+
+// k424Revoke deletes the grant k424Grant made and waits until the snapshot no
+// longer reflects it.
+func k424Revoke(t *testing.T, dyn *dynamicfake.FakeDynamicClient, a psArm, user string) {
+	t.Helper()
+	if err := dyn.Resource(k424RBGVR).Namespace(psTargetNS).Delete(context.Background(), user+"-target", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !k424Can(a, user, "get") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("revoke of %s did not reach the published snapshot within 5s", user)
+}
+
+// k424SubGenSettled waits until user's RBACSubGen has moved off `from` (the
+// deferred bumps are flushed on the snapshot publish that follows the event).
+func k424SubGenSettled(t *testing.T, user string, groups []string, from uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cache.RBACSubGenForSubject(user, rbac.WithAuthenticatedGroup(groups)) != from {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("RBACSubGen for %s never moved off %d", user, from)
+}
+
+// TestKey424_RestactionsPut_SubGenOnlyDrift_GrantThenRevokeMidResolve — the ABA
+// case the binding-set limb CANNOT see. During carol's resolve she is granted
+// the target, the step reads it (sentinel), and the grant is revoked again
+// before the Put. At Put time her binding set equals the one the key was minted
+// for (the digest limb says "unchanged"), but her body carries data from the
+// transient grant. Only the monotone RBACSubGen limb sees that her RBAC moved.
+// dave — same class, never granted — must not be served that body.
+//
+// Mutation check: dropping the rbac_subgen limb from identityClassDrift makes
+// this arm RED (dave is served the sentinel).
+func TestKey424_RestactionsPut_SubGenOnlyDrift_GrantThenRevokeMidResolve(t *testing.T) {
+	a := psArm{name: "configmaps/group", target: psConfigmapsGVR, watchShape: true}
+	dyn := psBuildWatcher(t, a)
+	cache.ResetBindingsByGVRIndexForTest()
+	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
+	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target}) // activates the sub-gen deltas
+	carolCtx, daveCtx := psUserCtx(a, psCarol), psUserCtx(a, psDave)
+	cKey, cIn := k423RAKey(t, carolCtx)
+	if dKey, _ := k423RAKey(t, daveCtx); cKey != dKey {
+		t.Fatalf("PRE: carol and dave must share one cell")
+	}
+	var armed atomic.Bool
+	seam := func(ctx context.Context, opts restactions.ResolveOptions) (*templatesv1.RESTAction, error) {
+		body := k424Body(t, ctx, a)
+		if ui, _ := xcontext.UserInfo(ctx); ui.Username == psCarol && armed.CompareAndSwap(false, true) {
+			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psGroups(a)))
+			k424Grant(t, dyn, a, psCarol)
+			body = k424Body(t, ctx, a) // read under the transient grant
+			k424Revoke(t, dyn, a, psCarol)
+			k424SubGenSettled(t, psCarol, psGroups(a), sg0)
+		}
+		raw, _ := json.Marshal(map[string]any{"password": body})
+		out := opts.In.DeepCopy()
+		out.Status = &runtime.RawExtension{Raw: raw}
+		return out, nil
+	}
+	serve := func(ctx context.Context) *httptest.ResponseRecorder {
+		cr := psRACR(a)
+		r1 := setFetchObjectForTest(func(*http.Request) objects.Result {
+			return objects.Result{GVR: h1RAGVR, Unstructured: cr.DeepCopy()}
+		})
+		r2 := setRestactionsResolveForTest(seam)
+		defer func() { r2(); r1() }()
+		rec := httptest.NewRecorder()
+		h := &restActionHandler{authnNS: psAuthnNS, saRC: &rest.Config{}}
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/call", nil).WithContext(ctx))
+		return rec
+	}
+	before := identityClassDriftDeclinedForTest("restactions", "rbac_subgen")
+	if !psHasSentinel(serve(carolCtx).Body.Bytes()) {
+		t.Fatalf("SETUP: carol's body must carry the transient grant's sentinel")
+	}
+	// PRE (the arm's discriminating shape): after the grant+revoke carol's binding
+	// set is back to the minted one — so ONLY the sub-gen limb can decline.
+	if got := rbac.SubjectBindingSetDigest(psCarol, psGroups(a)); got != cIn.SubjectBindingSet {
+		t.Fatalf("PRE: carol's binding set must be unchanged at Put time (digest moved), else the arm is not sub-gen-only")
+	}
+	if rec := serve(daveCtx); psHasSentinel(rec.Body.Bytes()) {
+		t.Fatalf("SUBGEN-ONLY TOCTOU LEAK: a grant+revoke inside carol's resolve left her binding set unchanged, and "+
+			"her transient-grant body was written under K that dave derives; dave's body=%s", psTrunc(rec.Body.String(), 300))
+	}
+	if identityClassDriftDeclinedForTest("restactions", "rbac_subgen") <= before {
+		t.Fatalf("the decline must have come from the rbac_subgen limb")
+	}
+}
+
+// TestKey424_RefresherSubGenOnlyDrift_RoleEditMidResolve — a ROLE edit (no
+// binding changes at all) referenced by the representative's binding lands
+// during the refresher's re-resolve. The binding set is unchanged; RBACSubGen
+// moves. The re-Put under the carried key must be declined by the sub-gen limb
+// (the post-edit body is not the class the carried key names).
+//
+// Mutation check: dropping the rbac_subgen limb makes this arm RED (the
+// post-edit body is re-Put under K).
+func TestKey424_RefresherSubGenOnlyDrift_RoleEditMidResolve(t *testing.T) {
+	a := psArm{name: "configmaps/group", target: psConfigmapsGVR, watchShape: true}
+	dyn := psBuildWatcher(t, a, k423PortalReaders(a)...) // Group:portal → target-reader in ns x
+	cache.ResetBindingsByGVRIndexForTest()
+	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
+	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+	carolCtx := psUserCtx(a, psCarol)
+	key, in := k423RAKey(t, carolCtx)
+	in.RepresentativeUsername, in.RepresentativeGroups = psCarol, psGroups(a)
+	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"password":"pre-edit"}`), Inputs: in})
+
+	rGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}
+	var armed atomic.Bool
+	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
+		if armed.CompareAndSwap(false, true) {
+			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psGroups(a)))
+			u, err := dyn.Resource(rGVR).Namespace(psTargetNS).Get(context.Background(), "target-reader", metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get role: %v", err)
+			}
+			_ = unstructured.SetNestedSlice(u.Object, []any{map[string]any{
+				"verbs": []any{"get"}, "apiGroups": []any{""}, "resources": []any{"pods"}, // target REVOKED via the role
+			}}, "rules")
+			if _, err := dyn.Resource(rGVR).Namespace(psTargetNS).Update(context.Background(), u, metav1.UpdateOptions{}); err != nil {
+				t.Fatalf("update role: %v", err)
+			}
+			k424SubGenSettled(t, psCarol, psGroups(a), sg0)
+		}
+		return []byte(`{"password":"post-edit"}`), nil
+	})
+	defer restore()
+
+	if got := rbac.SubjectBindingSetDigest(psCarol, psGroups(a)); got != in.SubjectBindingSet {
+		t.Fatalf("PRE: a role edit must not change the binding set")
+	}
+	before := identityClassDriftDeclinedForTest("refresher", "rbac_subgen")
+	if err := resolveAndPopulateL1(context.Background(), *in, nil, nil); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if rbac.SubjectBindingSetDigest(psCarol, psGroups(a)) != in.SubjectBindingSet {
+		t.Fatalf("PRE: the binding set must still be unchanged after the edit (sub-gen-only drift)")
+	}
+	if e, ok := cache.ResolvedCache().Get(key); ok && strings.Contains(string(e.RawJSON), "post-edit") {
+		t.Fatalf("SUBGEN-ONLY DRIFT: the refresher re-Put a post-role-edit body under the pre-edit key")
+	}
+	if identityClassDriftDeclinedForTest("refresher", "rbac_subgen") <= before {
+		t.Fatalf("the decline must have come from the rbac_subgen limb")
+	}
+}
+
 var _ = jwtutil.UserInfo{}
