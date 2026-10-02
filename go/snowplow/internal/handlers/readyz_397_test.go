@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
@@ -79,5 +80,50 @@ func TestIssue397_Readyz_WarmingBodyCarriesReasonAndElapsed_ReadyCarriesOutcome(
 	}
 	if _, has := body["elapsed_s"]; has {
 		t.Fatalf("ready body must not carry elapsed_s; body=%v", body)
+	}
+}
+
+// TestIssue407_Readyz_ReadyBodyCarriesStepTimings — #407: the ready body carries
+// elapsed_ms and the per-step *_ms values from the readiness-exit record
+// (exactly the values recorded); the warming body carries none of them, and the
+// status codes / pre-#407 fields are unchanged. RED without #407: the ready body
+// has no *_ms field.
+func TestIssue407_Readyz_ReadyBodyCarriesStepTimings(t *testing.T) {
+	cache.ResetPhase1DoneForTest()
+	dispatchers.ResetPhase1ReadinessExitForTest()
+	t.Cleanup(func() {
+		cache.ResetPhase1DoneForTest()
+		dispatchers.ResetPhase1ReadinessExitForTest()
+	})
+	timingKeys := []string{"elapsed_ms", "walk_ms", "sync_wait_ms", "content_prewarm_ms", "cluster_list_prewarm_ms", "seed_ms"}
+
+	code, body := readyzRaw(t)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("warming /readyz returned %d, want 503", code)
+	}
+	for _, k := range timingKeys {
+		if _, has := body[k]; has {
+			t.Fatalf("warming body must not carry %s; body=%v", k, body)
+		}
+	}
+
+	dispatchers.RecordPhase1ReadinessExitForTest("latch",
+		9500*time.Millisecond, 1100*time.Millisecond, 2200*time.Millisecond,
+		3300*time.Millisecond, 440*time.Millisecond, 2460*time.Millisecond)
+	cache.MarkPhase1Done()
+	code, body = readyzRaw(t)
+	if code != http.StatusOK || body["status"] != "ready" || body["phase1Done"] != true || body["outcome"] != "latch" {
+		t.Fatalf("ready body/status changed: %d %v", code, body)
+	}
+	for k, want := range map[string]float64{
+		"elapsed_ms": 9500, "walk_ms": 1100, "sync_wait_ms": 2200,
+		"content_prewarm_ms": 3300, "cluster_list_prewarm_ms": 440, "seed_ms": 2460,
+	} {
+		if got, ok := body[k].(float64); !ok || got != want {
+			t.Errorf("#407 RED: ready body %s = %v, want %v; body=%v", k, body[k], want, body)
+		}
+	}
+	if _, has := body["reason"]; has {
+		t.Fatalf("ready body must not carry a warming reason; body=%v", body)
 	}
 }
