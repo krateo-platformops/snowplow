@@ -60,6 +60,7 @@ package api
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -90,6 +91,16 @@ import (
 // saRegateIdentity is a canonical Kubernetes ServiceAccount username — the
 // refresher's identity-free path (clause d of internalDispatchServesUnnarrowed).
 const saRegateIdentity = "system:serviceaccount:krateo-system:snowplow"
+
+// saRegateSAToken is an unsigned JWT whose `sub` is saRegateIdentity — the shape
+// of the projected SA token the Phase-1 builders decode the identity from.
+func saRegateSAToken() string {
+	enc := func(v map[string]any) string {
+		b, _ := json.Marshal(v)
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	return enc(map[string]any{"alg": "none"}) + "." + enc(map[string]any{"sub": saRegateIdentity}) + ".sig"
+}
 
 // fakeRAItem is one restaction the fake apiserver holds.
 type fakeRAItem struct{ ns, name string }
@@ -252,6 +263,7 @@ func TestSARegate_ARM2_AllowedPerUserGet_ByteParity(t *testing.T) {
 	// Un-narrowed reference serve (canonical SA identity — clause d exempts).
 	resetInternalClientCacheForTest()
 	ctxSA := cache.WithInternalRESTConfig(ctxWithUser(saRegateIdentity), rc)
+	ctxSA = cache.WithInternalEndpoint(ctxSA, &endpoints.Endpoint{ServerURL: rc.Host, Token: saRegateSAToken()})
 	rawSA, servedSA, errSA := dispatchViaInternalRESTConfig(ctxSA,
 		buildCall(http.MethodGet, getByNamePath("team-a", "team-a-x")))
 	if errSA != nil || !servedSA {
@@ -333,8 +345,12 @@ func TestSARegate_ARM4_Phase1SAWalk_Unnarrowed(t *testing.T) {
 	rc := newFakeRestActionAPIServer(t, []fakeRAItem{
 		{"team-a", "team-a-x"}, {"team-b", "team-b-x"}, {"bench-ns-1", "bench-ns-1-x"},
 	})
+	// Production shape (withPhase1SAContext): the identity IS the `sub` of the SA
+	// token the ctx's internal endpoint carries. Since #425 a ServeWatcher exempts
+	// only that snowplow-SA identity, not any identity riding a ServeWatcher.
 	ctx := cache.WithServeWatcher(
 		cache.WithInternalRESTConfig(ctxWithUser(saRegateIdentity), rc), rw)
+	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: rc.Host, Token: saRegateSAToken()})
 
 	raw, served, derr := dispatchViaInternalRESTConfig(ctx,
 		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions"))
@@ -502,8 +518,11 @@ func TestSARegate_ARM7_RefresherIdentityFree_Unnarrowed(t *testing.T) {
 	rc := newFakeRestActionAPIServer(t, []fakeRAItem{
 		{"team-a", "team-a-x"}, {"team-b", "team-b-x"}, {"bench-ns-1", "bench-ns-1-x"},
 	})
-	// Canonical SA, NO ServeWatcher on ctx.
+	// snowplow's SA, NO ServeWatcher on ctx. Production shape (resolve_populate.go
+	// identity-free class): the identity is phase1SAUsername(saEP.Token) and saEP is
+	// the ctx's internal endpoint — since #427 a canonical SA FORM alone narrows.
 	ctx := cache.WithInternalRESTConfig(ctxWithUser(saRegateIdentity), rc)
+	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: rc.Host, Token: saRegateSAToken()})
 
 	raw, served, err := dispatchViaInternalRESTConfig(ctx,
 		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions"))

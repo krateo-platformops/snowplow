@@ -266,10 +266,15 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #189 — capture the widget key's generation BEFORE the resolve below, so the
 	// tail PutIfGen (main per-user-fallback branch) refuses rather than
 	// resurrecting a pre-delete body if the widget CR is DELETE-evicted during the
-	// resolve. CaptureGen is nil-safe; a cold miss is gen 0 → the fill still
-	// inserts. (The external-TTL Put branch stays a plain Put — it is exempt: its
-	// dep-Record is declined, so a widget DELETE never evicts that cell.)
-	cacheGen0 := cacheHandle.CaptureGen(cacheKey)
+	// resolve. A cold miss is gen 0 → the fill still inserts. (The external-TTL
+	// Put branch stays a plain Put — it is exempt: its dep-Record is declined, so a
+	// widget DELETE never evicts that cell.) #429: cache-off yields a nil
+	// cacheHandle INTERFACE (CaptureGen's nil-receiver safety does not cover
+	// that), and the tail never Puts then — skip the capture.
+	var cacheGen0 uint64
+	if cacheHandle != nil {
+		cacheGen0 = cacheHandle.CaptureGen(cacheKey)
+	}
 
 	ctx := xcontext.BuildContext(req.Context())
 	// Part 1 (#268/#269) — the SA-credential ATTACH is REMOVED (symmetric with

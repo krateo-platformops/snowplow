@@ -684,6 +684,13 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 	// CACHE_ENABLED=false → WithServeWatcher returns ctx unchanged → live LIST as
 	// today).
 	rctx = cache.WithServeWatcher(rctx, cache.Global())
+	// #425 — the cohort identity is a REAL narrowing subject, so this ctx is NOT
+	// rbac.ServesUnnarrowed (the ServeWatcher above exempts only snowplow's own SA
+	// identity). Stamp BackgroundResolve so rbac.MustRegateSADial also re-gates the
+	// seed's SA-credentialed dials at objects.getFromAPIServer and branch E, not
+	// only branch C. Behaviour-neutral in production: the only caller
+	// (rePrewarmBootScoped → seedScopeYielding) already passes a ctx carrying it.
+	rctx = cache.WithBackgroundResolve(rctx)
 	rctx = cache.WithPrewarmIterSerial(rctx)
 	// #42 Option-2 — OVERRIDE the inherited discovery-walk scope with the SEED
 	// scope. rePrewarmBootScoped passes seedScopeYielding the SAME walk-scoped
