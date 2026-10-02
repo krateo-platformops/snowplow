@@ -363,11 +363,13 @@ func populateWidgetContentL1(
 			return
 		}
 	} else {
-		// Pre-readyz BOOT seed — exempt (no served /call races it). #375-uncovered BY
-		// DESIGN, like the phase1_pip_seed seedModeBoot terminal Put (#394 keeps boot a
-		// plain Put): a plain Put rides neither #189 nor #375 (both hang off IfGen); the
-		// post-readyz branch above is a PutIfGen and IS #375-covered.
-		c.Put(key, entry)
+		// Pre-readyz BOOT seed — exempt from the gen guard (no served /call races it),
+		// so a plain Put, but WITH the #375 remark (#408), like the phase1_pip_seed
+		// seedModeBoot terminal Put. The resolve recorded its inner-call deps on ctx
+		// before this Put; a dep event in between dirty-marked a key that was not
+		// resident yet. The remark re-marks it once if any of those deps moved since
+		// the resolve began. It never refuses.
+		c.PutThenRemark(ctx, key, entry)
 	}
 
 	// Record dep edges so K8s informer events dirty-mark this entry and

@@ -201,6 +201,8 @@ var closedAttributeKeys = map[string]struct{}{
 	// #239 dirty-mark attribution — both bounded enums: cause is the ~7
 	// object/type causes, source is {watch, relist_bridge, reconcile}.
 	"cause": {}, "source": {},
+	// #408 moved-remark carrier — a 2-value enum {boot, guarded}.
+	"carrier": {},
 }
 
 // neverAnAttribute lists the three expvar keys whose VALUES carry

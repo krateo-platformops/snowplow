@@ -347,6 +347,9 @@ func TestS394_PostReadyzSeed_RemovalDuringResolve_NotResurrected_ReseededOnce(t 
 // under which the boot Put is refused and the cell stays cold.
 func TestS394_BootSeed_LRUEvictionDuringResolve_StillPlainPuts(t *testing.T) {
 	t.Setenv("RESOLVED_CACHE_MAX_ENTRIES", "1")
+	// #408 — this arm is the PRE-readyz boot exemption; post-readyz boot is guarded.
+	cache.ResetPhase1DoneForTest()
+	t.Cleanup(cache.ResetPhase1DoneForTest)
 	quietLoggingE(t)
 	a1BuildTwoTenantWatcher(t)
 	widgetKey, raKey, handle, wIn, raIn := s394Keys(t)
