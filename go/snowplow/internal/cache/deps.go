@@ -842,6 +842,20 @@ type DepTracker struct {
 	// trigger set WITHOUT enqueueing — so a remark carrying several moved GVRs is still
 	// ONE enqueue. Wired by the refresher via SetRefreshTriggerMergeHook; nil-safe.
 	mergeTriggersFn func(l1Key string, triggerGVR schema.GroupVersionResource)
+	// enqueueMultiFn (#383) is the refresher's multi-trigger dirty-mark hook: ONE call
+	// carries every trigger GVR of a remark, so the refresher decides residency ONCE for
+	// the whole remark (merge + enqueue, or drop). Preferred by enqueueRemark over the
+	// merge-then-hook sequence, which made a separate residency decision per trigger.
+	// Wired by the refresher via SetRefreshMultiTriggerHook; nil-safe.
+	enqueueMultiFn func(l1Key string, last schema.GroupVersionResource, earlier []schema.GroupVersionResource)
+}
+
+// SetRefreshMultiTriggerHook installs the refresher's multi-trigger dirty-mark hook
+// (#383). fn receives the key, its last trigger GVR and any earlier ones.
+func (d *DepTracker) SetRefreshMultiTriggerHook(fn func(l1Key string, last schema.GroupVersionResource, earlier []schema.GroupVersionResource)) {
+	d.enqueueMu.Lock()
+	d.enqueueMultiFn = fn
+	d.enqueueMu.Unlock()
 }
 
 // SetRefreshTriggerMergeHook installs the refresher's trigger-set merge (#375 B).
@@ -918,9 +932,15 @@ func (d *DepTracker) SetStore(s *ResolvedCacheStore) {
 // for dedup, ordering, and the actual re-resolve, and carries the trigger
 // GVR to the re-resolve so apistageContentServe can force-miss a content
 // entry keyed on that same GVR.
+//
+// It also CLEARS the multi-trigger hook (#383): a multi-trigger hook belongs to the
+// single hook it was installed with, and a later SetRefreshHook (a test recorder, a
+// re-wiring) must receive the remarks too, not have them diverted to a stale multi
+// hook. The refresher installs its multi hook right after its SetRefreshHook.
 func (d *DepTracker) SetRefreshHook(fn func(l1Key string, triggerGVR schema.GroupVersionResource)) {
 	d.enqueueMu.Lock()
 	d.enqueueFn = fn
+	d.enqueueMultiFn = nil
 	d.enqueueMu.Unlock()
 }
 
@@ -1284,7 +1304,20 @@ func (d *DepTracker) enqueueRemark(l1Key string, triggers []schema.GroupVersionR
 	d.enqueueMu.RLock()
 	fn := d.enqueueFn
 	mfn := d.mergeTriggersFn
+	multi := d.enqueueMultiFn
 	d.enqueueMu.RUnlock()
+	if multi != nil {
+		// #383 — one hook call for the whole remark: the refresher decides residency
+		// once, so a key cannot be resident for the merges and dropped at the enqueue
+		// (which would orphan the merged triggers).
+		var last schema.GroupVersionResource
+		var earlier []schema.GroupVersionResource
+		if n := len(triggers); n > 0 {
+			last, earlier = triggers[n-1], triggers[:n-1]
+		}
+		multi(l1Key, last, earlier)
+		return
+	}
 	if fn == nil {
 		EnqueueRefresh(l1Key)
 		return

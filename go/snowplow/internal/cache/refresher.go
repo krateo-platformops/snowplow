@@ -506,69 +506,21 @@ func StartRefresher(ctx context.Context) {
 		// branch); the memo holds the entry, so we MUST consult the memo
 		// directly, not the L1 store. The invalidator is non-blocking
 		// (drop-on-full) so this never delays the refresher enqueue path.
-		// #383 — the trigger merge (a multi-GVR #375 remark merges all but its last
-		// trigger here BEFORE the hook call) is residency-gated like the enqueue: a
-		// trigger merged for a key the hook then drops would sit in triggerGVRByKey
-		// with no dequeue to consume it.
+		// #383 — a #375 remark carrying several moved GVRs reaches the refresher as
+		// ONE multi-trigger call (enqueueRemark prefers it), so residency is decided
+		// ONCE for the whole remark: merge every trigger + enqueue, or drop all of
+		// them. The merge hook stays installed (residency-gated through the same
+		// decision helper) only for a caller that still merges trigger by trigger.
 		Deps().SetRefreshTriggerMergeHook(func(l1Key string, triggerGVR schema.GroupVersionResource) {
-			if refreshTargetResident(l1Key) {
+			if r.residentDecision(l1Key) {
 				r.mergeTriggerGVR(l1Key, triggerGVR)
 			}
 		})
 		Deps().SetRefreshHook(func(l1Key string, triggerGVR schema.GroupVersionResource) {
-			// #383 — DROP the queue slot for a key that is NOT resident in L1
-			// (#374's side-effect-free Has). A non-resident key is a no-op at
-			// processOne (skipped_no_entry), so its slot is pure occupancy. Safe
-			// because of #375 (+ #408 for the boot carrier): a resolve in flight
-			// across this dep change remarks the key at its accepted Put, through
-			// THIS hook, after the Put commits, when the key IS resident. The dep's
-			// bump (bumpCoordinateGen) precedes this fan-out, so a Put landing
-			// between the check below and the drop still sees the dep moved.
-			// The trigger-GVR store is gated with the enqueue: it is consumed only
-			// by a dequeue, so storing it for a dropped key would orphan it.
-			resident := refreshTargetResident(l1Key)
-			if fn := refreshHookResidencyChecked.Load(); fn != nil {
-				(*fn)(l1Key, resident)
-			}
-			if !resident {
-				enqueueDroppedNonResident.Add(1)
-				// SSI split (#91 Lever C) — see the invariant below.
-				SubmitSliceabilityInvalidate(l1Key)
-				return
-			}
-			// R1 Layer 1 — record the GVR whose dirty-mark enqueued this key
-			// BEFORE the queue.Add, so processNext can stamp it on the
-			// re-resolve ctx (dep-edge-equality force-miss). Last-write-wins
-			// on concurrent re-marks (any dirtying GVR is a valid target);
-			// an empty (zero) GVR is still stored — RefreshTriggerGVRFromContext
-			// only matches a non-empty equality so a zero never force-misses.
-			//
-			// #375 B — MERGE into the key's trigger SET (was Store = last-write-
-			// wins, which dropped an earlier mark's GVR: two marks with different
-			// GVRs before dequeue force-missed only the later one).
-			r.mergeTriggerGVR(l1Key, triggerGVR)
-			// Path 3.2 / 0.30.218 — two-tier dispatch. If the key is a
-			// registered cluster_list cell, route it to the
-			// HIGH-PRIORITY tier; otherwise the normal tier. The
-			// clusterListKeys set is populated by PIP boot pre-warm
-			// (phase1_clusterlist_prewarm.go) AND by
-			// EnqueueClusterListRefresh from cluster_list.go's
-			// cold-miss async-populate path.
-			if _, isClusterList := r.clusterListKeys.Load(l1Key); isClusterList {
-				r.enqueueClusterList(l1Key)
-			} else {
-				r.enqueue(l1Key)
-			}
-			// #374/#375/#383 INVARIANT — the residency-gated enqueue-DROP (#383,
-			// above) gates ONLY the trigger store + r.enqueue/enqueueClusterList;
-			// SubmitSliceabilityInvalidate fires UNCONDITIONALLY for every
-			// dirty-marked key (on the drop branch above and here). It is #91
-			// Lever C: a stuck-false RAFullList raKey has NO L1 cell by
-			// construction, so it is "non-resident" to the drop filter — but this
-			// call is the ONLY thing that clears its stuck-false sliceability memo
-			// on a backing change. Dropping it with the enqueue = #91 regression.
-			SubmitSliceabilityInvalidate(l1Key)
+			r.onDirtyMark(l1Key, triggerGVR, nil)
 		})
+		// AFTER SetRefreshHook, which clears any multi-trigger hook (see there).
+		Deps().SetRefreshMultiTriggerHook(r.onDirtyMark)
 
 		for i := 0; i < r.parallelism; i++ {
 			r.workersWG.Add(1)
@@ -611,6 +563,75 @@ func StopRefresher() {
 		r.queue.ShutDown()
 		r.clusterListQueue.ShutDown()
 	})
+}
+
+// onDirtyMark is the refresher's dirty-mark hook (#383), for a plain dirty-mark (one
+// trigger) and for a #375 remark (triggerGVR plus any earlier moved GVRs). Residency is
+// decided ONCE per call: resident → merge every trigger + enqueue; not resident → drop the
+// queue slot and the triggers. SubmitSliceabilityInvalidate fires either way.
+func (r *refresher) onDirtyMark(l1Key string, triggerGVR schema.GroupVersionResource, earlier []schema.GroupVersionResource) {
+	// #383 — DROP the queue slot for a key that is NOT resident in L1
+	// (#374's side-effect-free Has). A non-resident key is a no-op at
+	// processOne (skipped_no_entry), so its slot is pure occupancy. Safe
+	// because of #375 (+ #408 for the boot carrier): a resolve in flight
+	// across this dep change remarks the key at its accepted Put, through
+	// THIS hook, after the Put commits, when the key IS resident. The dep's
+	// bump (bumpCoordinateGen) precedes this fan-out, so a Put landing
+	// between the check below and the drop still sees the dep moved.
+	// The trigger-GVR store is gated with the enqueue: it is consumed only
+	// by a dequeue, so storing it for a dropped key would orphan it.
+	if !r.residentDecision(l1Key) {
+		enqueueDroppedNonResident.Add(1)
+		// SSI split (#91 Lever C) — see the invariant below.
+		SubmitSliceabilityInvalidate(l1Key)
+		return
+	}
+	// R1 Layer 1 — record the GVR whose dirty-mark enqueued this key
+	// BEFORE the queue.Add, so processNext can stamp it on the
+	// re-resolve ctx (dep-edge-equality force-miss). Last-write-wins
+	// on concurrent re-marks (any dirtying GVR is a valid target);
+	// an empty (zero) GVR is still stored — RefreshTriggerGVRFromContext
+	// only matches a non-empty equality so a zero never force-misses.
+	//
+	// #375 B — MERGE into the key's trigger SET (was Store = last-write-
+	// wins, which dropped an earlier mark's GVR: two marks with different
+	// GVRs before dequeue force-missed only the later one).
+	for _, g := range earlier {
+		r.mergeTriggerGVR(l1Key, g)
+	}
+	r.mergeTriggerGVR(l1Key, triggerGVR)
+	// Path 3.2 / 0.30.218 — two-tier dispatch. If the key is a
+	// registered cluster_list cell, route it to the
+	// HIGH-PRIORITY tier; otherwise the normal tier. The
+	// clusterListKeys set is populated by PIP boot pre-warm
+	// (phase1_clusterlist_prewarm.go) AND by
+	// EnqueueClusterListRefresh from cluster_list.go's
+	// cold-miss async-populate path.
+	if _, isClusterList := r.clusterListKeys.Load(l1Key); isClusterList {
+		r.enqueueClusterList(l1Key)
+	} else {
+		r.enqueue(l1Key)
+	}
+	// #374/#375/#383 INVARIANT — the residency-gated enqueue-DROP (#383,
+	// above) gates ONLY the trigger store + r.enqueue/enqueueClusterList;
+	// SubmitSliceabilityInvalidate fires UNCONDITIONALLY for every
+	// dirty-marked key (on the drop branch above and here). It is #91
+	// Lever C: a stuck-false RAFullList raKey has NO L1 cell by
+	// construction, so it is "non-resident" to the drop filter — but this
+	// call is the ONLY thing that clears its stuck-false sliceability memo
+	// on a backing change. Dropping it with the enqueue = #91 regression.
+	SubmitSliceabilityInvalidate(l1Key)
+}
+
+// residentDecision is the ONE residency decision a dirty-mark makes (#383), reported to
+// the test seam (refreshHookResidencyChecked) so an arm can count decisions and land a
+// Put inside the decision→drop window.
+func (r *refresher) residentDecision(l1Key string) bool {
+	resident := refreshTargetResident(l1Key)
+	if fn := refreshHookResidencyChecked.Load(); fn != nil {
+		(*fn)(l1Key, resident)
+	}
+	return resident
 }
 
 // refreshTargetResident is the #383 drop gate: is l1Key resident in the L1 store the

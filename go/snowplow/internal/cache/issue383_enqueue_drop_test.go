@@ -21,12 +21,20 @@
 //   - arm 4: same neuter as arm 1 (remark unwired) → RED; the seam proves the
 //     Put lands inside the check→decision window;
 //   - arm 5: residency gate removed (today's main) → enqueue_total == burst → RED;
-//   - arm 6: the trigger-merge hook left ungated → orphan triggers → RED.
+//   - arm 6: multi-trigger hook not installed AND the trigger-merge hook left ungated
+//     → orphan triggers → RED;
+//   - arm 7: the multi-trigger hook not installed (remark falls back to merge-per-
+//     trigger + hook) → 3 residency decisions for one remark → RED;
+//   - arm 8: the counter not published in the residency map → RED.
 
 package cache
 
 import (
 	"context"
+	"encoding/json"
+	"expvar"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -326,5 +334,82 @@ func TestIssue383_Arm6_MultiGVRRemark_NonResident_NoOrphanTriggers(t *testing.T)
 	set, _ := v.(*triggerGVRSet)
 	if !ok || set == nil || len(set.gvrs) != 3 {
 		t.Fatalf("control: a resident multi-GVR remark must carry all 3 triggers; got %+v", v)
+	}
+}
+
+// arm 7 — ONE residency decision per remark. A #375 remark with three moved GVRs reaches
+// the refresher as one multi-trigger hook call, so the refresher decides residency once
+// and merges all three triggers (or drops all three). Before this, enqueueRemark merged
+// the first two through the merge hook and then called the single hook: three separate
+// decisions, and a key evicted between them was resident for the merges and dropped at
+// the enqueue, which orphaned the merged triggers.
+func TestIssue383_Arm7_MultiGVRRemark_OneResidencyDecision(t *testing.T) {
+	c, _, _ := start383(t)
+	k, in := key383("arm7")
+	c.Put(k, &ResolvedEntry{RawJSON: []byte(`"r"`), Inputs: &in})
+	r := refresherSingleton()
+	StopRefresher() // no dequeue: the trigger set stays observable
+	var decisions atomic.Int32
+	t.Cleanup(SetRefreshHookResidencyCheckedHookForTest(func(key string, _ bool) {
+		if key == k {
+			decisions.Add(1)
+		}
+	}))
+	gA := schema.GroupVersionResource{Group: "a.example.io", Version: "v1", Resource: "as"}
+	gB := schema.GroupVersionResource{Group: "b.example.io", Version: "v1", Resource: "bs"}
+	enq0 := r.enqueueTotal.Load()
+	Deps().enqueueRemark(k, []schema.GroupVersionResource{gA, gB, g383Dep})
+	if n := decisions.Load(); n != 1 {
+		t.Fatalf("#383 arm 7 RED: one remark made %d residency decisions, want exactly 1 — a key can then be "+
+			"resident for the trigger merges and dropped at the enqueue (orphan triggers)", n)
+	}
+	if d := r.enqueueTotal.Load() - enq0; d != 1 {
+		t.Fatalf("#383 arm 7: a resident remark must enqueue once; delta=%d", d)
+	}
+	v, _ := r.triggerGVRByKey.Load(k)
+	if set, _ := v.(*triggerGVRSet); set == nil || len(set.gvrs) != 3 {
+		t.Fatalf("#383 arm 7: a resident remark must carry all 3 triggers; got %+v", v)
+	}
+}
+
+// arm 8 — the drop counter is PUBLISHED: read through the real expvar handler (the
+// /debug/vars route), not the Go accessor, after a real dropped mark.
+func TestIssue383_Arm8_DroppedCounterReadableAtDebugVars(t *testing.T) {
+	_, _, _ = start383(t)
+	RegisterResidencyMetrics374ExpvarForTest()
+	read := func() map[string]uint64 {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		expvar.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/vars", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("/debug/vars returned %d", rec.Code)
+		}
+		var all map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &all); err != nil {
+			t.Fatalf("decoding /debug/vars: %v", err)
+		}
+		raw, ok := all["snowplow_refresher_residency_cheapen"]
+		if !ok {
+			t.Fatal("snowplow_refresher_residency_cheapen is not published at /debug/vars")
+		}
+		var m map[string]uint64
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("decoding snowplow_refresher_residency_cheapen: %v", err)
+		}
+		return m
+	}
+	before := read()
+	if _, ok := before["enqueue_dropped_non_resident"]; !ok {
+		t.Fatalf("#383 arm 8 RED: /debug/vars snowplow_refresher_residency_cheapen has no "+
+			"enqueue_dropped_non_resident key (got %v)", before)
+	}
+	if _, ok := before["pickup_noop_no_park"]; !ok {
+		t.Fatalf("#383 arm 8: the #374 key pickup_noop_no_park must stay published (got %v)", before)
+	}
+	Deps().Record(context.Background(), "i383-arm8-nonresident", g383Dep, "ns", "arm8")
+	Deps().OnUpdate(g383Dep, "ns", "arm8")
+	after := read()
+	if d := after["enqueue_dropped_non_resident"] - before["enqueue_dropped_non_resident"]; d != 1 {
+		t.Fatalf("#383 arm 8: one dropped mark must move /debug/vars enqueue_dropped_non_resident by 1; got %d", d)
 	}
 }
