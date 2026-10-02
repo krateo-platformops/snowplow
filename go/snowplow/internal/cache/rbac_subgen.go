@@ -117,12 +117,29 @@ var (
 // READING THE ZERO: 0 means no subject's sub-generation has ever moved — no
 // identity-bound L1 key has rotated for an RBAC reason. That reading is only
 // admissible because a LIVENESS arm has shown the counter can move through the
-// production path: TestBindingNoopCounters_BumpsStillFireOnEveryNoop drives the
-// real onBindingUpdate hook, flushes the pending set, and fails if this stays
-// 0. Without such an arm a zero would mean "not looking", not "not rotating" —
-// and the other two counters in this workstream do NOT yet have one (see
+// production path: TestSubGenSkip_GenuineSubjectEditStillBumps drives the real
+// onBindingUpdate hook with a genuine subject-set edit, flushes the pending
+// set, and fails if this stays 0; TestSubGenSkip_AddAndDeleteStillBumpUncondi-
+// tionally does the same through onBindingAdd and onBindingDelete. Without
+// such an arm a zero would mean "not looking", not "not rotating" — and the
+// other two counters in this workstream do NOT yet have one (see
 // rbacSubGenSubjects here, and bindingNoopUpdates in
 // rbac_binding_noop_counters.go).
+//
+// #253 MOVED THE LIVENESS ARM, AND NARROWED ONLY THE BINDING-UPDATE LEG. The
+// old arm was TestBindingNoopCounters_BumpsStillFireOnEveryNoop, which proved
+// liveness through a RELIST no-op — valid only while every binding UPDATE
+// bumped unconditionally. It no longer does: a binding UPDATE whose uid,
+// subject set and roleRef are all unchanged records nothing
+// (bindings_by_gvr_delta.go). That changes what this TOTAL can tell you about
+// binding UPDATEs and nothing else: the total still moves on binding ADD/DELETE,
+// on every role-path bump (#257 skips only rules-equal role UPDATEs) and on
+// ServiceAccount churn. So a 0 here still means only "no identity-bound key has
+// rotated for an RBAC reason" — it is NOT evidence that every binding event
+// carried a real change. To judge #253, read the binding_update bucket of
+// snowplow_rbac_subgen_bumps_by_source_total against
+// snowplow_rbac_binding_semantic_noop_updates_total, which keeps climbing on
+// exactly the traffic that no longer rotates a key.
 func RBACSubGenBumpsTotal() uint64 { return rbacSubGenBumps.Load() }
 
 // RBACSubGenSubjectsTracked returns the number of DISTINCT subjects that have a
