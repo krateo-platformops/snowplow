@@ -217,6 +217,15 @@ func DepsStatsByStat() map[string]int64 {
 		// (snowplow_deps_unguarded_put_total).
 		"unguarded_put_total": int64(d.UnguardedPutTotal),
 
+		// #408 — moved remarks: each unit is a PUT-THEN-REMARK fired because a dep the
+		// resolve recorded moved during it (one refresher enqueue each, rate-floored and
+		// coalesced). moved_remark_boot_total is the subset from the pre-readyz boot
+		// carrier, the cost #408 added at boot (worst case: one per cell depending on a
+		// churning GVR). A DIAGNOSTIC: zero is a quiet cluster, not a defect. Also
+		// OTLP snowplow_deps_moved_remark_total{carrier=boot|guarded}.
+		"moved_remark_total":      int64(d.MovedRemarkTotal),
+		"moved_remark_boot_total": int64(d.MovedRemarkBootTotal),
+
 		// --- the sampled reconcile audit (1.12.6 C3, deps_reconcile.go) ---
 		// reconcile_divergence_total is THE pipeline-health number: each unit
 		// is a resident entry whose object was ABSENT from a synced indexer

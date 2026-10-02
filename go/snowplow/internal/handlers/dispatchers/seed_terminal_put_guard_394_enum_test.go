@@ -96,7 +96,7 @@ func s394CollectSeedSites(t *testing.T) []s394SeedSite {
 				switch f := call.Fun.(type) {
 				case *ast.SelectorExpr:
 					switch f.Sel.Name {
-					case "Put", "ReplaceIfGen", "PutIfGen":
+					case "Put", "ReplaceIfGen", "PutIfGen", "PutThenRemark": // #408: PutThenRemark is a store write too
 						site.directWrites = append(site.directWrites, f.Sel.Name+"@"+itoaLine(fset.Position(call.Pos()).Line))
 					}
 				case *ast.Ident:

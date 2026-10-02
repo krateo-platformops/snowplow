@@ -1386,7 +1386,7 @@ func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entr
 		return
 	}
 	c.Put(key, entry)
-	Deps().remarkIfDepsMoved(ctx, key)
+	Deps().remarkIfDepsMovedFrom(ctx, key, true)
 }
 
 // PutIfGen is the #189 generation-guarded write. It stores entry under key ONLY

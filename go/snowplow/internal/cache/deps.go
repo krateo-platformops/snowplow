@@ -581,6 +581,9 @@ type depGenSink struct {
 	// the replayed deps carry a floor; every other dep keeps startSeq (no
 	// spurious remarks). Lazily initialised under mu.
 	asOf map[DepKey]uint64
+	// putBoot (#408) records that putKey's Put came through the boot carrier
+	// (PutThenRemark), so a C3 re-check remark is attributed to it too.
+	putBoot bool
 }
 
 // addDepLocked appends dk unless already present. Caller holds s.mu.
@@ -723,6 +726,15 @@ type DepTracker struct {
 	// dep-gen sink (a resolve-entry that drifted = didn't install one). Expected 0;
 	// non-zero ⇒ an unguarded resolve path. Hand-wired to OTLP + expvar.
 	unguardedPutTotal atomic.Uint64
+
+	// #408 — moved remarks: PUT-THEN-REMARKs fired because a dep the resolve recorded
+	// moved during it (reasons "moved" and "moved_after_put"; the nil-sink drift is
+	// unguardedPutTotal). movedRemarkTotal counts all of them; movedRemarkBootTotal the
+	// subset from the pre-readyz boot carrier (PutThenRemark), so the boot remark cost
+	// can be read in production. Each is one refresher enqueue. A DIAGNOSTIC (zero
+	// is health), on expvar snowplow_deps + OTLP snowplow_deps_moved_remark_total{carrier}.
+	movedRemarkTotal     atomic.Uint64
+	movedRemarkBootTotal atomic.Uint64
 
 	// #375 (option c, fix ii — TL ruling) — per-GVR floor: the depEventSeq of the LAST
 	// OnObjectEvent on ANY coordinate of the GVR (gvr -> *atomic.Uint64). bumpCoordinateGen
@@ -1148,6 +1160,21 @@ func storeMaxSeq(a *atomic.Uint64, v uint64) {
 // (apistageContentServe forceContentMiss) instead of re-reading a content cell that may
 // itself be stale, and a cluster_list cell keeps its high-priority tier.
 func (d *DepTracker) remarkIfDepsMoved(ctx context.Context, l1Key string) {
+	d.remarkIfDepsMovedFrom(ctx, l1Key, false)
+}
+
+// noteMovedRemark counts one moved remark (#408), attributed to the boot carrier
+// when boot is set.
+func (d *DepTracker) noteMovedRemark(boot bool) {
+	d.movedRemarkTotal.Add(1)
+	if boot {
+		d.movedRemarkBootTotal.Add(1)
+	}
+}
+
+// remarkIfDepsMovedFrom is remarkIfDepsMoved with the carrier recorded: boot is true for
+// the pre-readyz boot plain Put (PutThenRemark, #408), false for the IfGen methods.
+func (d *DepTracker) remarkIfDepsMovedFrom(ctx context.Context, l1Key string, boot bool) {
 	if d == nil || l1Key == "" {
 		return
 	}
@@ -1176,6 +1203,7 @@ func (d *DepTracker) remarkIfDepsMoved(ctx context.Context, l1Key string) {
 	s.putKey = l1Key
 	s.checkedSeq = depEventSeq.Load()
 	s.putRemarked = false
+	s.putBoot = boot
 	s.mu.Unlock()
 	var moved []schema.GroupVersionResource
 	for _, dk := range deps {
@@ -1192,6 +1220,7 @@ func (d *DepTracker) remarkIfDepsMoved(ctx context.Context, l1Key string) {
 		s.putRemarked = true
 		s.mu.Unlock()
 		observeDepGenRemark(l1Key, "moved")
+		d.noteMovedRemark(boot)
 		d.enqueueRemark(l1Key, moved) // once per Put, not per dep
 	}
 }
@@ -1217,8 +1246,10 @@ func (d *DepTracker) recheckAfterPutRecord(s *depGenSink, l1Key string, dk DepKe
 		return
 	}
 	s.putRemarked = true
+	boot := s.putBoot
 	s.mu.Unlock()
 	observeDepGenRemark(l1Key, "moved_after_put")
+	d.noteMovedRemark(boot)
 	d.enqueueRemark(l1Key, []schema.GroupVersionResource{dk.GVR})
 }
 
@@ -2155,6 +2186,9 @@ type DepStats struct {
 	// #375 (B): accepted gen-guarded Puts whose resolve ctx carried NO dep-gen sink
 	// (a drifted resolve-entry). DETECTOR — expected 0.
 	UnguardedPutTotal uint64
+	// #408: moved PUT-THEN-REMARKs (all carriers) and the boot-carrier subset.
+	MovedRemarkTotal     uint64
+	MovedRemarkBootTotal uint64
 }
 
 func (d *DepTracker) Stats() DepStats {
@@ -2176,6 +2210,9 @@ func (d *DepTracker) Stats() DepStats {
 		OnObjectEventDegradedNoEvict: d.onObjectEventDegradedNoEvict.Load(),
 		RemoveL1Total:                d.removeL1Total.Load(),
 		UnguardedPutTotal:            d.unguardedPutTotal.Load(),
+		// boot loaded before total (see MovedRemarkTotals): total >= boot in the snapshot.
+		MovedRemarkBootTotal: d.movedRemarkBootTotal.Load(),
+		MovedRemarkTotal:     d.movedRemarkTotal.Load(),
 	}
 }
 
@@ -2188,6 +2225,17 @@ func (d *DepTracker) Stats() DepStats {
 // (snowplow_deps_unguarded_put_total).
 func UnguardedPutTotal() uint64 {
 	return Deps().unguardedPutTotal.Load()
+}
+
+// MovedRemarkTotals returns the #408 moved-remark counters: all carriers, and the
+// pre-readyz boot carrier's subset. Published on expvar (snowplow_deps.moved_remark_total,
+// .moved_remark_boot_total) and OTLP (snowplow_deps_moved_remark_total{carrier}).
+func MovedRemarkTotals() (total, boot uint64) {
+	d := Deps()
+	// Boot first: noteMovedRemark bumps total before boot, so reading boot first keeps
+	// total >= boot in the returned pair (the guarded share total-boot never underflows).
+	boot = d.movedRemarkBootTotal.Load()
+	return d.movedRemarkTotal.Load(), boot
 }
 
 // resetDepsForTest tears the singleton down so each test sees a clean

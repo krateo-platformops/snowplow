@@ -205,6 +205,11 @@ func TestIssue408_BootRemarkAmplification_ProductionScale(t *testing.T) {
 		r := i408Boot(t, i408BootUnits, true, false, false)
 		t.Logf("#408 worst case (boot PutThenRemark): %s", r)
 		r.assertBound(t, "worst case")
+		// The production counters (expvar snowplow_deps / OTLP) read the same boot cost.
+		if total, boot := MovedRemarkTotals(); int(total) != r.remarksTotal || int(boot) != r.remarksTotal {
+			t.Errorf("#408 (worst case): moved_remark_total=%d moved_remark_boot_total=%d, want both %d",
+				total, boot, r.remarksTotal)
+		}
 		if r.remarksTotal != r.dependentsChurn {
 			t.Errorf("#408 (worst case): every churn-dependent cell saw an event after its startSeq and must be "+
 				"remarked exactly once (non-vacuity of the bound); %s", r)
@@ -221,4 +226,71 @@ func TestIssue408_BootRemarkAmplification_ProductionScale(t *testing.T) {
 		t.Logf("#408 continuous churn (boot PutThenRemark): %s", r)
 		r.assertBound(t, "continuous churn")
 	})
+}
+
+// TestIssue408_MovedRemarkCounters_AttributeTheCarrier pins the production counters the
+// boot remark cost is read from (#419). Every moved remark counts once in
+// moved_remark_total. The boot carrier's remarks also count in moved_remark_boot_total,
+// including a C3 re-check remark (moved_after_put) after a boot Put. A quiet Put counts
+// nowhere.
+func TestIssue408_MovedRemarkCounters_AttributeTheCarrier(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	resetRefresherForTest()
+	resetDepsForTest()
+	c := newResolvedCache(64, 1<<22, time.Hour)
+	Deps().SetStore(c)
+	Deps().SetRefreshHook(func(string, schema.GroupVersionResource) {})
+	t.Cleanup(func() {
+		resetDepsForTest()
+		resetRefresherForTest()
+	})
+	var mu sync.Mutex
+	reasons := map[string]int{}
+	t.Cleanup(SetDepGenRemarkObserverForTest(func(_, r string) {
+		mu.Lock()
+		reasons[r]++
+		mu.Unlock()
+	}))
+
+	// boot, dep moved during the resolve → "moved", boot.
+	ctx := WithL1KeyContext(context.Background(), "c408-boot")
+	Deps().Record(ctx, "c408-boot", g408Churn, "ns", "b")
+	Deps().OnUpdate(g408Churn, "ns", "b")
+	c.PutThenRemark(ctx, "c408-boot", &ResolvedEntry{RawJSON: []byte(`{}`)})
+
+	// boot, the dep is Recorded AFTER the Put and moved in [check, Record) → C3
+	// "moved_after_put", still attributed to boot.
+	ctx2 := WithL1KeyContext(context.Background(), "c408-boot-c3")
+	c.PutThenRemark(ctx2, "c408-boot-c3", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	Deps().OnUpdate(g408Quiet, "ns", "late")
+	Deps().Record(ctx2, "c408-boot-c3", g408Quiet, "ns", "late")
+
+	// guarded, dep moved → "moved", not boot.
+	ctx3 := WithL1KeyContext(context.Background(), "c408-guarded")
+	gen := c.CaptureGen("c408-guarded")
+	Deps().Record(ctx3, "c408-guarded", g408Churn, "ns", "g")
+	Deps().OnUpdate(g408Churn, "ns", "g")
+	if !c.PutIfGen(ctx3, "c408-guarded", &ResolvedEntry{RawJSON: []byte(`{}`)}, gen) {
+		t.Fatal("setup: PutIfGen refused")
+	}
+
+	// quiet boot Put → nothing.
+	ctx4 := WithL1KeyContext(context.Background(), "c408-quiet")
+	Deps().Record(ctx4, "c408-quiet", g408Churn, "ns", "q")
+	c.PutThenRemark(ctx4, "c408-quiet", &ResolvedEntry{RawJSON: []byte(`{}`)})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if reasons["moved"] != 2 || reasons["moved_after_put"] != 1 {
+		t.Fatalf("PRECONDITION: want 2 moved + 1 moved_after_put remarks, got %v", reasons)
+	}
+	total, boot := MovedRemarkTotals()
+	if total != 3 || boot != 2 {
+		t.Fatalf("#408: moved_remark_total=%d moved_remark_boot_total=%d, want 3 and 2 (the C3 re-check after a "+
+			"boot Put is a boot remark; the quiet Put counts nowhere)", total, boot)
+	}
+	if s := Deps().Stats(); s.MovedRemarkTotal != total || s.MovedRemarkBootTotal != boot {
+		t.Fatalf("#408: Stats() drift: %+v", s)
+	}
 }

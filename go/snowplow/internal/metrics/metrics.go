@@ -694,6 +694,16 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #408: moved PUT-THEN-REMARKs, by carrier (boot = the pre-readyz boot plain Put,
+	// guarded = the IfGen methods). Each is one refresher enqueue. A diagnostic sizing
+	// input for the boot remark cost (#419), OTLP so it is readable on the cluster.
+	movedRemarkTotal, err := m.Int64ObservableCounter(
+		"snowplow_deps_moved_remark_total",
+		metric.WithDescription("Count of #375 PUT-THEN-REMARKs fired because a dependency the resolve recorded moved during it (one refresher enqueue each), by carrier: boot = the pre-readyz boot seed plain Put (PutThenRemark, #408), guarded = the generation-guarded Put methods. Diagnostic; sizes the boot remark cost. #408."))
+	if err != nil {
+		return err
+	}
+
 	// --- #244: factory-built GVR divergence age — the observable bound on the
 	// passive watch-reconnect self-heal. A factory (shared-informer) GVR whose
 	// indexer diverged from the apiserver cannot be relist-repaired; it clears on
@@ -969,6 +979,10 @@ func registerInstruments(m metric.Meter, build string) error {
 
 		// --- #375: dep-generation guard detector (expected 0) ---
 		o.ObserveInt64(unguardedPutTotal, int64(cache.UnguardedPutTotal()))
+		// --- #408: moved remarks by carrier ---
+		movedTotal, movedBoot := cache.MovedRemarkTotals()
+		o.ObserveInt64(movedRemarkTotal, int64(movedBoot), metric.WithAttributes(attribute.String("carrier", "boot")))
+		o.ObserveInt64(movedRemarkTotal, int64(movedTotal-movedBoot), metric.WithAttributes(attribute.String("carrier", "guarded")))
 
 		// --- #244: factory-built divergence age (bounded self-heal detector) ---
 		o.ObserveInt64(storeFactoryDivergenceAge, cache.FactoryDivergenceMaxAgeSeconds())
@@ -1020,6 +1034,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		malformedDialSkipped,
 		// --- #375 ---
 		unguardedPutTotal,
+		// --- #408 ---
+		movedRemarkTotal,
 		// --- #244 ---
 		storeFactoryDivergenceAge,
 		// --- #239: dirty-mark attribution ---
