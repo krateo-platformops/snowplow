@@ -71,12 +71,18 @@ func rePrewarmRBACShift(ctx context.Context, deps rePrewarmDeps, rotated cache.R
 	reqs := enumerateRotatedResidentTargets(ctx, deps, rotated)
 	reEnqueue := reseedTargets(ctx, deps, reqs)
 
-	if len(reEnqueue) > 0 {
-		// A ctx cancel cut the batch: the unprocessed tail must not be dropped
-		// (no-dropped-rotation). Re-merge the rotated set and re-arm the payload-free
-		// scope; the workqueue coalesces it to a single follow-up run. A refused
-		// terminal Put is NOT in reEnqueue — it took the #394 one-shot inline re-seed
-		// (reseedWithRefusalPolicy), so one removed cell never re-runs the whole set.
+	if cut := ctx.Err() != nil; cut || len(reEnqueue) > 0 {
+		// The run was CUT (ctx done — during the enumeration, which returns a
+		// partial target list, or during the reseed loop, which returns its
+		// unprocessed tail): the drained rotation must not be dropped
+		// (no-dropped-rotation). Re-merge the WHOLE drained set and re-arm the
+		// payload-free scope; the workqueue coalesces it to a single follow-up run,
+		// and the seedModeRBACShift liveness skip makes the already-minted prefix
+		// cost a read, not a resolve. Gated on ctx.Err() too, not only on a tail:
+		// a cut inside the enumeration can leave reqs (and so the tail) empty. A
+		// refused terminal Put is NOT in reEnqueue — it took the #394 one-shot
+		// inline re-seed (reseedWithRefusalPolicy), so one removed cell never
+		// re-runs the whole set.
 		if e := prewarmEngineSingleton(); e != nil {
 			e.rbacShift.Merge(rotated)
 			e.enqueueScope(prewarmScope{kind: scopeKindRBACShift})

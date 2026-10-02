@@ -197,7 +197,7 @@ func TestS258_WideningSubjectAppearsInReseedSet(t *testing.T) {
 
 	// RED control (pre-grant): a rotated set naming carol (driven through the
 	// same hook chain) yields NO target for her — she has no access yet.
-	cache.NotifyRBACShiftForTest([]cache.RotatedSubject{{Kind: "User", Name: s258WideningUser, Widening: true}})
+	cache.NotifyRBACShiftForTest([]cache.RotatedSubject{{Kind: "User", Name: s258WideningUser}})
 	forged, ok := s258RotatedFor(s258WideningUser)
 	if !ok {
 		t.Fatal("precondition: the hook sink did not capture the forged rotated set (hook not registered?)")
@@ -255,9 +255,6 @@ func TestS258_WideningSubjectAppearsInReseedSet(t *testing.T) {
 		}
 		cache.RebuildRBACSnapshotForTest(rw)
 		time.Sleep(20 * time.Millisecond)
-	}
-	if !rotated.Widening(s258WideningUser, nil) {
-		t.Fatal("a binding ADD must be classified WIDENING in the rotated set")
 	}
 
 	// THE ARM: carol now appears in the reseed set for the resident widget.

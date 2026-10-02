@@ -23,24 +23,23 @@ import "sync"
 // worker). Construct with NewRBACShiftAccumulator.
 type RBACShiftAccumulator struct {
 	mu  sync.Mutex
-	set map[subjectKey]subGenBumpSource
+	set map[subjectKey]struct{}
 }
 
 // NewRBACShiftAccumulator returns an empty accumulator.
 func NewRBACShiftAccumulator() *RBACShiftAccumulator {
-	return &RBACShiftAccumulator{set: map[subjectKey]subGenBumpSource{}}
+	return &RBACShiftAccumulator{set: map[subjectKey]struct{}{}}
 }
 
-// Merge unions a flush's rotated subjects (OR-ing their source masks, so the
-// widening tag carried by any contributing flush survives) into the pending set.
+// Merge unions a flush's rotated subjects into the pending set.
 // No-op on an empty set. O(len(r)); called on the flush goroutine via the hook.
 func (a *RBACShiftAccumulator) Merge(r RotatedSubjectSet) {
 	if len(r.set) == 0 {
 		return
 	}
 	a.mu.Lock()
-	for s, m := range r.set {
-		a.set[s] |= m
+	for s := range r.set {
+		a.set[s] = struct{}{}
 	}
 	a.mu.Unlock()
 }
@@ -52,7 +51,7 @@ func (a *RBACShiftAccumulator) Merge(r RotatedSubjectSet) {
 func (a *RBACShiftAccumulator) Drain() RotatedSubjectSet {
 	a.mu.Lock()
 	taken := a.set
-	a.set = map[subjectKey]subGenBumpSource{}
+	a.set = map[subjectKey]struct{}{}
 	a.mu.Unlock()
 	return RotatedSubjectSet{set: taken}
 }

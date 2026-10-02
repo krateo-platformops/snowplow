@@ -1466,12 +1466,12 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 // SOLE freshMint=true carrier — ordinary refresh / keepwarm / seed / serve Puts
 // (Put/PutIfGen/ReplaceIfGen pass freshMint=false, hardcoded) can NEVER reset the
 // max-age clock, so the C5 / #259 anchor holds by construction; the single-setter
-// audit is a static grep of ReplaceIfGenReMint callers (expected: exactly one, the
-// reseed core).
+// audit is a static grep of ReplaceIfGenReMint callers (expected: exactly one,
+// dispatchers seedTerminalPut in seedModeReMint — TestReMint_SingleSetterAudit).
 //
 // ARCHITECTURAL INVARIANT (arch C5 condition a — load-bearing): the re-mint TARGET
-// Put MUST be THIS explicit call from the reseed core, via resolve-to-bytes-THEN-
-// Put; it MUST NOT be routed through the resolve pipeline's generic PutIfGen.
+// Put MUST be THIS explicit call from the seed primitive's terminal write
+// (seedTerminalPut), via resolve-to-bytes-THEN-Put; it MUST NOT be routed through the resolve pipeline's generic PutIfGen.
 // Nested Puts during a re-mint resolve go through the generic (freshMint=false)
 // methods, so freshMint can never reach a nested cell — that is exactly what makes
 // a key-scoped ctx marker unnecessary (arch dropped it). If a future change routes
@@ -1480,9 +1480,11 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 //
 // Resolve-FIRST-then-atomic-replace: the old cell keeps serving until this replace
 // lands (no evict, no cold-nav window). Refuses on absent / gen-moved exactly like
-// ReplaceIfGen (the aging cell was evicted or re-inserted meanwhile). The caller
-// MUST handle a false return by RE-ENQUEUEING — it lost the gen race to a
-// concurrent customer Put and the cell is still past-cap (arch C5 condition e).
+// ReplaceIfGen. The generation moves ONLY on removal (Put / PutIfGen / ReplaceIfGen
+// keep it), so a false return means the cell was REMOVED during the re-mint
+// resolve: it is absent, or a customer already re-filled it with a fresh BornAt.
+// Either way there is nothing left to re-mint, so the caller does NOT retry or
+// re-enqueue (this supersedes arch C5 condition e; see seed_terminal_put_guard.go).
 //
 // #375 (arch C5 condition f): like PutIfGen / ReplaceIfGen, this gen-guarded Put
 // takes the resolve ctx and, on ACCEPT, runs #375's PUT-THEN-REMARK off-lock

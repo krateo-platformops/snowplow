@@ -13,14 +13,11 @@
 // RegisterGVRDiscoveredHook exactly (idempotent fn-pointer dedup,
 // snapshot-under-lock + fire-unlocked, non-blocking-callback contract).
 //
-// SOURCE TAG (#260). The payload carries each rotated subject's OR'd
-// subGenBumpSource mask so the consumer can split the reseed path: a NARROWING
-// rotation (binding/role DELETE only) adds no topology → the engine reuses the
-// harvester snapshot and re-keys the existing targets; a WIDENING rotation
-// (binding/role ADD, or any UPDATE — which may re-route to new access, so
-// unclassifiable UPDATEs fail toward WIDENING = warm) can make new widgets/
-// namespaces visible → the engine does a per-subject scoped nav walk so the
-// newly-visible cells are not left cold.
+// ONE PATH for every rotation. The payload is just the set of rotated subjects;
+// the consumer reseeds every resident (unit × identity) target whose folded
+// subject is in it. Narrowing and widening rotations take the same path: the
+// identities are read from the live binding index at reseed time, so a subject
+// newly authorized for a resident unit is already a target (Rotated covers it).
 
 package cache
 
@@ -29,48 +26,31 @@ import (
 	"sync"
 )
 
-// wideningSources is the set of mask bits that mark a rotation as WIDENING — one
-// that can EXPAND a subject's visible topology, so a snapshot reuse would miss
-// newly-visible cells and the reseed must do a per-subject scoped WALK. ADDs
-// inherently widen (a new binding/role grants new access). UPDATEs are NOT
-// classified by event type — a plain bumpSrcBindingUpdate/bumpSrcRoleUpdate is
-// the relist-storm / re-delivery shape and must stay NON-widening (snapshot
-// re-key); the delta site content-classifies the genuinely-widening updates
-// (binding gained-subjects/roleRef-change, non-semantic-noop role update) and
-// OR's in the bumpSrcWiden TAG. Pure DELETEs only remove access → never widen.
-// Single source for the widening predicate.
-const wideningSources = bumpSrcBindingAdd | bumpSrcRoleAdd | bumpSrcWiden
-
 // RotatedSubject is the exported subjectKey form, used by NotifyRBACShiftForTest
 // to construct a rotated set from another package without the internal type.
 // Kind is the rbac/v1 subject kind ("User" | "Group" | "ServiceAccount");
-// Namespace is set only for a ServiceAccount; Widening selects the source mask
-// the shim stamps (a widening ADD vs a narrowing DELETE) so a test can drive
-// either reseed path.
+// Namespace is set only for a ServiceAccount.
 type RotatedSubject struct {
 	Kind      string
 	Name      string
 	Namespace string
-	Widening  bool
 }
 
 // RotatedSubjectSet is the read-only payload carried to an RBAC-shift hook: the
-// subjects whose sub-gen counter was bumped in ONE flush, each mapped to its
-// OR'd source mask. subjectKey is cache-internal, so the set is opaque and
-// exposes exactly the two membership tests the consumer needs. Keeping the
-// subject→identity mapping HERE — mirroring RBACSubGenForSubject — makes it the
-// single source shared with the key fold, so the reseed-reachability predicate
-// can never drift from the serve-key derivation (the #64/#66 anti-shadow-drift
-// rule).
+// subjects whose sub-gen counter was bumped in ONE flush. subjectKey is
+// cache-internal, so the set is opaque and exposes the one membership test the
+// consumer needs. Keeping the subject→identity mapping HERE — mirroring
+// RBACSubGenForSubject — makes it the single source shared with the key fold, so
+// the reseed-reachability predicate can never drift from the serve-key derivation
+// (the #64/#66 anti-shadow-drift rule).
 type RotatedSubjectSet struct {
-	set map[subjectKey]subGenBumpSource
+	set map[subjectKey]struct{}
 }
 
 // foldSubjects returns the subjectKeys an identity (username + presented groups)
 // folds into its effective RBAC sub-gen — mirroring RBACSubGenForSubject EXACTLY
 // (a ServiceAccount username folds the SA subject, a human username the User
-// subject, every non-empty group its Group subject). Shared by Rotated/Widening
-// so both tests use the identical mapping the key fold uses.
+// subject, every non-empty group its Group subject).
 func foldSubjects(username string, groups []string) []subjectKey {
 	out := make([]subjectKey, 0, 1+len(groups))
 	if username != "" {
@@ -99,23 +79,6 @@ func (r RotatedSubjectSet) Rotated(username string, groups []string) bool {
 	}
 	for _, s := range foldSubjects(username, groups) {
 		if _, hit := r.set[s]; hit {
-			return true
-		}
-	}
-	return false
-}
-
-// Widening reports whether the identity's rotation includes a WIDENING source on
-// at least one of its folded subjects — so the reseed must do a per-subject
-// scoped nav walk (new topology possible) rather than reuse the snapshot. A
-// delete-only rotation returns false (snapshot-reuse is safe). False for an
-// identity that did not rotate at all.
-func (r RotatedSubjectSet) Widening(username string, groups []string) bool {
-	if len(r.set) == 0 {
-		return false
-	}
-	for _, s := range foldSubjects(username, groups) {
-		if mask, hit := r.set[s]; hit && mask&wideningSources != 0 {
 			return true
 		}
 	}
@@ -156,30 +119,25 @@ func RegisterRBACShiftHook(fn func(RotatedSubjectSet)) {
 	rbacShiftHooks.hooks = append(rbacShiftHooks.hooks, fn)
 }
 
-// notifyRBACShift fires every registered hook with the rotated-subject set built
-// from the flush's parallel (drained, masks) slices. Called from
-// flushPendingSubGenBumps AFTER BumpSubjectSubGens. No-op when nothing rotated OR
-// no hook is registered (a flush with no consumer costs nothing; the set is
-// built only when a hook will read it). Snapshot-under-lock + fire-unlocked.
-func notifyRBACShift(drained []subjectKey, masks []subGenBumpSource) {
+// notifyRBACShift fires every registered hook with the flush's rotated subjects.
+// Called from flushPendingSubGenBumps AFTER BumpSubjectSubGens. No-op when nothing
+// rotated OR no hook is registered (a flush with no consumer costs nothing; the
+// set is built only when a hook will read it). Snapshot-under-lock + fire-unlocked.
+func notifyRBACShift(drained []subjectKey) {
 	if len(drained) == 0 {
 		return
 	}
+	set := make(map[subjectKey]struct{}, len(drained))
+	for _, s := range drained {
+		set[s] = struct{}{}
+	}
+	fireRBACShift(RotatedSubjectSet{set: set})
+}
+
+func fireRBACShift(rs RotatedSubjectSet) {
 	rbacShiftHooks.mu.Lock()
 	hooks := append([]func(RotatedSubjectSet){}, rbacShiftHooks.hooks...)
 	rbacShiftHooks.mu.Unlock()
-	if len(hooks) == 0 {
-		return
-	}
-	set := make(map[subjectKey]subGenBumpSource, len(drained))
-	for i, s := range drained {
-		var m subGenBumpSource
-		if i < len(masks) {
-			m = masks[i]
-		}
-		set[s] |= m
-	}
-	rs := RotatedSubjectSet{set: set}
 	for _, fn := range hooks {
 		fn(rs)
 	}
@@ -196,23 +154,12 @@ func ResetRBACShiftHooksForTest() {
 
 // NotifyRBACShiftForTest fires the hook chain with an explicit rotated set, for
 // cross-package tests (internal/handlers/dispatchers) that drive the cache→engine
-// reseed without standing up a full RBAC snapshot rebuild. Each RotatedSubject's
-// Widening bit selects a representative widening (ADD) or narrowing (DELETE)
-// source mask. Mirrors NotifyGVRDiscoveredForReprewarmTest.
+// reseed without standing up a full RBAC snapshot rebuild. Mirrors
+// NotifyGVRDiscoveredForReprewarmTest.
 func NotifyRBACShiftForTest(rotated []RotatedSubject) {
-	set := make(map[subjectKey]subGenBumpSource, len(rotated))
+	set := make(map[subjectKey]struct{}, len(rotated))
 	for _, r := range rotated {
-		mask := bumpSrcBindingDelete
-		if r.Widening {
-			mask = bumpSrcBindingAdd
-		}
-		set[subjectKey{Kind: r.Kind, Name: r.Name, Namespace: r.Namespace}] |= mask
+		set[subjectKey{Kind: r.Kind, Name: r.Name, Namespace: r.Namespace}] = struct{}{}
 	}
-	rbacShiftHooks.mu.Lock()
-	hooks := append([]func(RotatedSubjectSet){}, rbacShiftHooks.hooks...)
-	rbacShiftHooks.mu.Unlock()
-	rs := RotatedSubjectSet{set: set}
-	for _, fn := range hooks {
-		fn(rs)
-	}
+	fireRBACShift(RotatedSubjectSet{set: set})
 }

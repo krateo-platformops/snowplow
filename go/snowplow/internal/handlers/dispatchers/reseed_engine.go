@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -248,20 +249,37 @@ func reseedIdentityTargets(gvr schema.GroupVersionResource) []seedTarget {
 // WIDENING subject newly authorized for a resident unit is included with no extra
 // walk (TestS258_WideningSubjectAppearsInReseedSet). Units the harvester never
 // saw (a runtime-new GVR) belong to scopeKindGVRDiscovered.
+//
+// ORDER (zero-cold-nav): widget targets first, in NavOrder ASC (the walk's
+// first-nav priority — the dashboard / first pages warm first, as in the boot
+// flat pass), ties broken by ns/name then identity; RESTAction targets after
+// (the boot RA tail), by ns/name then identity. The harvester snapshots are map
+// iterations, so without this the reseed order would be random.
 func enumerateRotatedResidentTargets(ctx context.Context, deps rePrewarmDeps, rotated cache.RotatedSubjectSet) []reseedRequest {
 	var reqs []reseedRequest
-	for _, e := range deps.navHarv.snapshot() {
+	widgetsUnits := deps.navHarv.snapshot()
+	sort.SliceStable(widgetsUnits, func(i, j int) bool {
+		if widgetsUnits[i].NavOrder != widgetsUnits[j].NavOrder {
+			return widgetsUnits[i].NavOrder < widgetsUnits[j].NavOrder
+		}
+		return reseedWidgetNSName(widgetsUnits[i]) < reseedWidgetNSName(widgetsUnits[j])
+	})
+	raUnits := deps.harvester.snapshot()
+	sort.SliceStable(raUnits, func(i, j int) bool {
+		return raUnits[i].Namespace+"/"+raUnits[i].Name < raUnits[j].Namespace+"/"+raUnits[j].Name
+	})
+	for _, e := range widgetsUnits {
 		if ctx.Err() != nil {
 			return reqs
 		}
 		engineYieldCheckpoint(ctx)
-		for _, c := range reseedIdentityTargets(e.GVR) {
+		for _, c := range sortedReseedIdentities(e.GVR) {
 			if rotated.Rotated(c.Username, c.Groups) {
 				reqs = append(reqs, reseedRequest{identity: c, isWidget: true, widget: e})
 			}
 		}
 	}
-	for _, ref := range deps.harvester.snapshot() {
+	for _, ref := range raUnits {
 		if ctx.Err() != nil {
 			return reqs
 		}
@@ -270,11 +288,26 @@ func enumerateRotatedResidentTargets(ctx context.Context, deps rePrewarmDeps, ro
 		if !haveTarget {
 			continue
 		}
-		for _, c := range reseedIdentityTargets(targetGVR) {
+		for _, c := range sortedReseedIdentities(targetGVR) {
 			if rotated.Rotated(c.Username, c.Groups) {
 				reqs = append(reqs, reseedRequest{identity: c, isWidget: false, ra: ref})
 			}
 		}
 	}
 	return reqs
+}
+
+// sortedReseedIdentities is reseedIdentityTargets in a deterministic identity
+// order (cohort label ASC), so the reseed order within one unit is stable.
+func sortedReseedIdentities(gvr schema.GroupVersionResource) []seedTarget {
+	ids := reseedIdentityTargets(gvr)
+	sort.SliceStable(ids, func(i, j int) bool { return cohortLogLabel(ids[i]) < cohortLogLabel(ids[j]) })
+	return ids
+}
+
+func reseedWidgetNSName(e navWidgetEntry) string {
+	if e.W == nil {
+		return ""
+	}
+	return e.W.GetNamespace() + "/" + e.W.GetName()
 }

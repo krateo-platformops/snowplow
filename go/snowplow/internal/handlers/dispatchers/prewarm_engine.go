@@ -232,8 +232,10 @@ const (
 	// seedModeRBACShift — #258. Reseed ONLY the targets whose folded subject
 	// rotated in this flush (RotatedSubjectSet.Rotated), re-resolving each under
 	// its own identity so dispatchCacheLookupKey stamps the NEW per-subject
-	// RBACSubGenForSubject (the SERVE key). NO skip: the new-sub-gen key is
-	// absent (the rotation just cold-rotated it), so the re-resolve mints it.
+	// RBACSubGenForSubject (the SERVE key). LIVENESS skip only (never an
+	// age-skip): a live cell under the new-sub-gen key was minted after the
+	// rotation, so a re-armed run reads it instead of re-resolving it
+	// (seedSkipDecision); an absent key is resolved and minted.
 	seedModeRBACShift
 	// seedModeReMint — #378 (dev-1218). Age-triggered re-mint of the SAME key
 	// (sub-gen unchanged): resolve-first, then an atomic gen-guarded REPLACE that

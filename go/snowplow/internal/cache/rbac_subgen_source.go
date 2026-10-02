@@ -28,17 +28,6 @@ const (
 	bumpSrcRoleDelete
 )
 
-// bumpSrcWiden is a #258 TAG bit, NOT a #260 source. It is OR'd into a subject's
-// pending mask when a WIDENING content change (a binding that gained subjects or
-// changed its roleRef, or a non-semantic-noop role update) means the reseed must
-// do a per-subject scoped WALK rather than reuse the harvester snapshot (new
-// topology may be visible). It is DELIBERATELY NOT counted by
-// countSubGenBumpSources and is NOT a key in snowplow_rbac_subgen_bumps_by_source_total
-// — it rides the same uint8 mask ONLY to reach #258's RotatedSubjectSet.Widening.
-// Pinned at 1<<6, above the six source bits (1<<0..1<<5), so it never collides
-// with a source and the by-source sum/attribution invariant is unchanged.
-const bumpSrcWiden subGenBumpSource = 1 << 6
-
 // The six fixed metric label keys (bounded, compile-time).
 const (
 	bumpSrcKeyBindingAdd    = "binding_add"
