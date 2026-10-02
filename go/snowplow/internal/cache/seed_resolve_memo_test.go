@@ -81,7 +81,7 @@ func TestSeedResolveMemo_RBACKeyDivergence_DECISIVE(t *testing.T) {
 		t.Fatal("RED: production memo key COLLIDES across divergent-RBAC cohorts — identity is not folded into the key. This is the A→B leak. C-F4-4.")
 	}
 	prod.Store(keyA, pmaps.DeepCopyJSON(bodyA), nil, DepGenEpochNow())
-	if _, _, ok := prod.Load(keyB); ok {
+	if _, _, _, ok := prod.Load(keyB); ok {
 		t.Fatal("RED: cohort B HIT cohort A's memo cell under the production (identity-folded) key — cross-user RBAC leak. C-F4-4.")
 	}
 
@@ -92,7 +92,7 @@ func TestSeedResolveMemo_RBACKeyDivergence_DECISIVE(t *testing.T) {
 	}
 	leak := NewSeedResolveMemo(pmaps.DeepCopyJSON)
 	leak.Store(leakKey(), pmaps.DeepCopyJSON(bodyA), nil, DepGenEpochNow()) // A resolves first
-	got, _, ok := leak.Load(leakKey())                  // B "resolves" — same key
+	got, _, _, ok := leak.Load(leakKey())                                   // B "resolves" — same key
 	if !ok {
 		t.Fatal("harness broken: identity-less key should self-hit")
 	}
@@ -119,7 +119,7 @@ func TestSeedResolveMemo_CorrectnessByteIdentical(t *testing.T) {
 	key := memo.Key("ns", "ra", "carol", []string{"g1", "g2"}, HashExtras(nil), 5, 1)
 
 	memo.Store(key, pmaps.DeepCopyJSON(body), nil, DepGenEpochNow())
-	hit, _, ok := memo.Load(key)
+	hit, _, _, ok := memo.Load(key)
 	if !ok {
 		t.Fatal("RED: expected memo HIT for the stored (RA, identity, page). C-F4-6.")
 	}
@@ -130,7 +130,7 @@ func TestSeedResolveMemo_CorrectnessByteIdentical(t *testing.T) {
 	}
 	// Aliasing guard: mutate the hit; a second Load must still equal the original.
 	hit["items"] = []any{}
-	hit2, _, _ := memo.Load(key)
+	hit2, _, _, _ := memo.Load(key)
 	got2JSON, _ := json.Marshal(hit2)
 	if string(got2JSON) != string(wantJSON) {
 		t.Fatalf("RED: mutating a memo hit corrupted the stored snapshot (aliasing). Load must return a fresh deep copy.\n want %s\n got  %s", wantJSON, got2JSON)
@@ -194,7 +194,7 @@ func TestSeedResolveMemo_Teardown_NoSurviveAcrossPass(t *testing.T) {
 func TestSeedResolveMemo_MissWhenAbsent(t *testing.T) {
 	memoCacheOn(t)
 	var nilMemo *SeedResolveMemo // as returned by SeedResolveMemoFromContext off the /call path
-	if _, _, ok := nilMemo.Load("anything"); ok {
+	if _, _, _, ok := nilMemo.Load("anything"); ok {
 		t.Fatal("RED: nil memo (no memo installed — the /call path) reported a HIT. C-F4-8.")
 	}
 	nilMemo.Store("anything", map[string]any{"x": 1}, nil, 0) // must not panic
@@ -253,7 +253,7 @@ func TestSeedResolveMemo_JSONNativeConcurrent_Race(t *testing.T) {
 				inner.Add(1)
 				go func() {
 					defer inner.Done()
-					if hit, _, ok := memo.Load(key); ok {
+					if hit, _, _, ok := memo.Load(key); ok {
 						if got, _ := json.Marshal(hit); string(got) != string(wantJSON) {
 							t.Errorf("RED: concurrent memo hit corrupted: got %s", got)
 						}
@@ -264,7 +264,7 @@ func TestSeedResolveMemo_JSONNativeConcurrent_Race(t *testing.T) {
 			}
 			inner.Wait()
 			// After the storm every cohort key must resolve to the body.
-			hit, _, ok := memo.Load(key)
+			hit, _, _, ok := memo.Load(key)
 			if !ok {
 				t.Errorf("RED: cohort %d key never populated", c)
 				return

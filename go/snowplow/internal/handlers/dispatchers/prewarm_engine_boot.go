@@ -662,6 +662,9 @@ func seedScopeYielding(ctx context.Context,
 			slog.String("mode", mode.String()),
 			slog.Uint64("memo_hits", h),
 			slog.Uint64("memo_misses", m),
+			// #411: of memo_misses, how many found an entry whose captured deps
+			// had moved since it was produced and so resolved fresh.
+			slog.Uint64("memo_stale_misses", memo.StaleMisses()),
 			slog.String("effect", "F4 per-seed-pass RA-resolve memo — each hit skipped a full "+
 				"gojq-over-benchapps re-resolve of a heavy RESTAction shared across statistics/tag widgets"),
 		)

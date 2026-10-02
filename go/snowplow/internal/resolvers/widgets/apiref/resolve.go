@@ -265,13 +265,20 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// after the body was produced but before THIS resolve's entry is
 		// invisible to this resolve's own #375 Put-check, so a stale entry is a
 		// MISS here: fall through, resolve fresh, and storeMemo replaces it.
-		if body, deps, ok := memo.Load(memoKey); ok {
+		if body, deps, stamp, ok := memo.Load(memoKey); ok {
 			// #277 / edge-3: replay the deps captured when this body was first
 			// produced onto THIS widget's L1 key, so a memo-served widget cell
 			// carries the same backing-GVR edges a real resolve would have
 			// recorded (else it goes stale on a backing mutation). Load returns
 			// a fresh deep copy; safe to hand straight back.
-			cache.Deps().ReplayEdges(ctx, l1Key, deps)
+			//
+			// #411 C1: replay AS OF the entry's stamp, so this resolve's own
+			// Put-check judges the reused deps from when the body was produced,
+			// not from this resolve's entry. That closes the torn
+			// [depEventSeq.Add → bucket stamp] window, where this resolve's
+			// startSeq already counts an event whose bucket stamp this Load
+			// did not yet see.
+			cache.Deps().ReplayEdgesAsOf(ctx, l1Key, deps, stamp)
 			return body, nil
 		}
 		// #277 / edge-3: open a capture over the PRODUCING block below so the

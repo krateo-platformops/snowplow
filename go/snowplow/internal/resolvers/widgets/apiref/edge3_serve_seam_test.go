@@ -475,7 +475,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 
 	// w2: memo HIT → replay the captured deps under w2's key (B3).
 	ctx2 := cache.WithL1KeyContext(base, w2Key)
-	body2, deps2, ok := memo.Load(memoKey)
+	body2, deps2, _, ok := memo.Load(memoKey)
 	if !ok {
 		t.Fatalf("harness broken: w2 memo load MISS under key %q", memoKey)
 	}
@@ -544,7 +544,7 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 
 	// Carrier 3 — MEMO HIT (page 1). edge-3 via B3's memo replay.
 	ctxMemo := cache.WithL1KeyContext(base, wmemoKey)
-	bodyMemo, depsMemo, ok := memo.Load(memoKey)
+	bodyMemo, depsMemo, _, ok := memo.Load(memoKey)
 	if !ok {
 		t.Fatalf("harness broken: memo widget load MISS")
 	}

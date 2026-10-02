@@ -29,11 +29,11 @@ func TestSeedResolveMemo411_StaleEntryIsMiss(t *testing.T) {
 	m := NewSeedResolveMemo(pmaps.DeepCopyJSON)
 	stamp := DepGenEpochNow()
 	m.Store("k", map[string]any{"v": "OLD"}, []DepKey{listDep}, stamp)
-	if _, _, ok := m.Load("k"); !ok {
+	if _, _, _, ok := m.Load("k"); !ok {
 		t.Fatal("no dep event since the stamp: the entry must be served")
 	}
 	d.bumpCoordinateGen(memo411GVR, ns, "obj-0") // stamps the LIST bucket
-	if _, _, ok := m.Load("k"); ok {
+	if _, _, _, ok := m.Load("k"); ok {
 		t.Fatal("#411 RED: a captured dep's bucket moved past the stamp, yet the memo served the entry")
 	}
 	if got := m.StaleMisses(); got != 1 {
@@ -44,11 +44,11 @@ func TestSeedResolveMemo411_StaleEntryIsMiss(t *testing.T) {
 	cold := DepKey{GVR: schema.GroupVersionResource{Group: "x.io", Version: "v1", Resource: "things"}, Namespace: ns, Name: "t"}
 	stamp2 := DepGenEpochNow()
 	m.Store("cold", map[string]any{"v": 1}, []DepKey{cold}, stamp2)
-	if _, _, ok := m.Load("cold"); !ok {
+	if _, _, _, ok := m.Load("cold"); !ok {
 		t.Fatal("cold dep, no event on its GVR: must be served")
 	}
 	d.bumpCoordinateGen(cold.GVR, ns, "other") // raises the GVR floor; no bucket for cold
-	if _, _, ok := m.Load("cold"); ok {
+	if _, _, _, ok := m.Load("cold"); ok {
 		t.Fatal("#411 RED: a cold dep's GVR floor moved past the stamp, yet the memo served the entry")
 	}
 }
@@ -61,15 +61,15 @@ func TestSeedResolveMemo411_ReplaceIsMonotone(t *testing.T) {
 	m := NewSeedResolveMemo(pmaps.DeepCopyJSON)
 	m.Store("k", map[string]any{"v": "A"}, nil, 5)
 	m.Store("k", map[string]any{"v": "A2"}, nil, 5) // equal stamp: first writer wins
-	if b, _, _ := m.Load("k"); b["v"] != "A" {
+	if b, _, _, _ := m.Load("k"); b["v"] != "A" {
 		t.Fatalf("equal-stamp Store replaced the entry: %v", b)
 	}
 	m.Store("k", map[string]any{"v": "B"}, nil, 9) // fresher: replaces
-	if b, _, _ := m.Load("k"); b["v"] != "B" {
+	if b, _, _, _ := m.Load("k"); b["v"] != "B" {
 		t.Fatalf("a fresher Store must replace the entry: %v", b)
 	}
 	m.Store("k", map[string]any{"v": "C"}, nil, 7) // older: discarded
-	if b, _, _ := m.Load("k"); b["v"] != "B" {
+	if b, _, _, _ := m.Load("k"); b["v"] != "B" {
 		t.Fatalf("an OLDER-stamped Store overwrote a fresher entry: %v", b)
 	}
 }
@@ -96,7 +96,7 @@ func TestSeedResolveMemo411_ConcurrentLoadStoreBump_Race(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
 				key := fmt.Sprintf("k%d", i%4)
-				if body, _, ok := m.Load(key); ok {
+				if body, _, _, ok := m.Load(key); ok {
 					if _, ok := body["stamp"].(float64); !ok {
 						t.Errorf("served a body with no producer stamp: %v", body)
 						return
@@ -126,7 +126,7 @@ func TestSeedResolveMemo411_ConcurrentLoadStoreBump_Race(t *testing.T) {
 	// served entry: monotone replacement converges on the freshest producer.
 	now := DepGenEpochNow()
 	m.Store("k0", map[string]any{"stamp": float64(now)}, []DepKey{dep}, now)
-	b, _, ok := m.Load("k0")
+	b, _, _, ok := m.Load("k0")
 	if !ok || b["stamp"] != float64(now) {
 		t.Fatalf("after the storm the freshest producer's entry must be served: ok=%v body=%v (maxStamp=%d now=%d)", ok, b, maxStamp, now)
 	}

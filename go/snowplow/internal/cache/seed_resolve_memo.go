@@ -184,16 +184,22 @@ func sortStrings(s []string) {
 // its Store REPLACES this entry with a later Stamp, so later siblings hit the
 // fresh body again (no cascade of re-resolves). Lock-free: the value is
 // immutable and the seq reads are atomics.
-func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, bool) {
+//
+// The fourth return is the served entry's Stamp, read off the SAME value the
+// body and deps come from (no second lookup, no TOCTOU against a concurrent
+// replacing Store). The caller hands it to DepTracker.ReplayEdgesAsOf so its own
+// Put-check judges the reused deps from the body's as-of, not its own entry
+// (#411 C1, the torn [depEventSeq.Add → bucket stamp] window).
+func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, uint64, bool) {
 	if mo == nil {
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	v, ok := mo.m.Load(key)
 	if !ok {
 		mo.mu.Lock()
 		mo.misses++
 		mo.mu.Unlock()
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	val, _ := v.(*seedMemoValue)
 	if val != nil && seedMemoDepsMovedSince(val.Deps, val.Stamp) {
@@ -201,21 +207,21 @@ func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, bool) {
 		mo.misses++
 		mo.staleMisses++
 		mo.mu.Unlock()
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	mo.mu.Lock()
 	mo.hits++
 	mo.mu.Unlock()
 	if val == nil {
-		return nil, nil, true
+		return nil, nil, 0, true
 	}
 	// Deps is returned as a slice-header copy — the caller only reads it to
 	// replay edges; the underlying DepKeys are immutable value structs.
 	deps := val.Deps
 	if mo.copyFn == nil {
-		return val.Body, deps, true
+		return val.Body, deps, val.Stamp, true
 	}
-	return mo.copyFn(val.Body), deps, true
+	return mo.copyFn(val.Body), deps, val.Stamp, true
 }
 
 // seedMemoDepsMovedSince reports whether any dep saw a dep event after stamp,

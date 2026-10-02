@@ -125,13 +125,48 @@ func (f *i411Fixture) seedResolve(key, name string) map[string]any {
 	f.t.Helper()
 	store := cache.ResolvedCache()
 	gen := store.CaptureGen(key)
-	ctx := cache.WithSeedResolveMemo(cache.WithL1KeyContext(f.base, key), f.memo)
+	ctx := f.seedCtx(key, name)
 	body, err := Resolve(ctx, f.opts)
 	if err != nil {
 		f.t.Fatalf("seed apiref.Resolve(%s) failed: %v", key, err)
 	}
 	store.PutIfGen(ctx, key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(f.t, body), Inputs: edge3WidgetInputs(name)}, gen)
 	return body
+}
+
+// i411WidgetGVR is the widget CR's GVR (the seed's self-dep coordinate).
+func i411WidgetGVR() schema.GroupVersionResource {
+	return schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "widgets"}
+}
+
+// seedCtx builds the seed resolve ctx exactly as seedOneWidget does
+// (phase1_pip_seed.go: WithL1KeyContextFromEpoch(ctx, key, DepGenEpochNow(),
+// widget self-dep)), with the pass's memo installed.
+func (f *i411Fixture) seedCtx(key, name string) context.Context {
+	return cache.WithSeedResolveMemo(cache.WithL1KeyContextFromEpoch(f.base, key, cache.DepGenEpochNow(),
+		cache.DepKey{GVR: i411WidgetGVR(), Namespace: edge3BackingNS, Name: name}), f.memo)
+}
+
+// remarksFor installs the #375 remark observer and returns a func reporting the
+// reasons observed for key so far.
+func i411RemarksFor(t *testing.T, key string) func() []string {
+	t.Helper()
+	var mu sync.Mutex
+	var reasons []string
+	restore := cache.SetDepGenRemarkObserverForTest(func(k, reason string) {
+		if k != key {
+			return
+		}
+		mu.Lock()
+		reasons = append(reasons, reason)
+		mu.Unlock()
+	})
+	t.Cleanup(restore)
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), reasons...)
+	}
 }
 
 // mutateBacking flips the backing marker to NEW and drives ONE real backing
@@ -331,5 +366,98 @@ func TestIssue411_MemoHitAfterRESTActionEdit_ResolvesFresh(t *testing.T) {
 	if hitsAfter != hitsBefore || missAfter-missBefore != 1 {
 		t.Fatalf("#411 RED (RA edit): w2's resolve began after its RESTAction CR was edited, yet it reused w1's "+
 			"pre-edit memo body (hit delta=%d, miss delta=%d)", hitsAfter-hitsBefore, missAfter-missBefore)
+	}
+}
+
+// TestIssue411_TornWindowMemoHitIsRemarked — #411 C1 (reviewer-415's probe,
+// keepwarm shape; RED on a83dcc99). bumpCoordinateGen advances depEventSeq to s
+// BEFORE it stamps the coordinate's buckets. A seed hitter whose resolve starts
+// INSIDE that torn window has startSeq = s, yet its memo Load sees the bucket
+// still unstamped, so the stale-check passes and it takes a valid hit on the
+// pre-s body. Its #375 Put-check then compares bucket (= s) > startSeq (= s):
+// false, so no remark — and the keepwarm PutIfGen overwrites the refresher's
+// fresh cell with the pre-event body. The fix judges the replayed (reused) deps
+// from the memo entry's Stamp, so the Put is remarked.
+func TestIssue411_TornWindowMemoHitIsRemarked(t *testing.T) {
+	f := i411Setup(t, "i411-torn-ra")
+	const w1Key, w2Key = "L1_i411_torn_w1", "L1_i411_torn_w2"
+	store := cache.ResolvedCache()
+
+	// Resident w2 from a PRIOR pass (no memo): OLD body + edge-3.
+	prior, ok, err := raFullListServe(cache.WithL1KeyContext(f.base, w2Key), f.gRA, edge3BackingNS, f.raName,
+		ra(raSliceJQ), 5, 1, nil, f.resolve)
+	if err != nil || !ok {
+		t.Fatalf("prior-pass w2 serve failed: ok=%v err=%v", ok, err)
+	}
+	store.Put(w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, prior), Inputs: edge3WidgetInputs("w2")})
+
+	f.seedResolve(w1Key, "w1") // current pass: memo body (OLD)
+
+	gen := store.CaptureGen(w2Key)
+	var w2ctx context.Context
+	var w2body map[string]any
+	var fired bool
+	restoreHook := cache.SetDepBumpHookForTest(func(stage string) {
+		if stage != "after_add" || fired {
+			return
+		}
+		fired = true
+		// Inside the torn window: depEventSeq already = s, buckets not stamped.
+		w2ctx = f.seedCtx(w2Key, "w2")
+		b, rerr := Resolve(w2ctx, f.opts)
+		if rerr != nil {
+			t.Errorf("torn-window w2 Resolve failed: %v", rerr)
+			return
+		}
+		w2body = b
+	})
+	f.mutateBacking()
+	restoreHook()
+	if !fired || w2body == nil {
+		t.Fatalf("setup: the after_add hook did not run the w2 resolve inside the torn window")
+	}
+	if !f6ContainsMarker(t, w2body, "OLD") {
+		t.Fatalf("setup: inside the torn window the memo hit must still serve the pre-event body (this arm " +
+			"targets the Put-check, not Load)")
+	}
+
+	f.drain(map[string]string{w2Key: "w2"}) // the refresher writes NEW into resident w2
+	if !edge3ServedContainsMarker(t, w2Key, "NEW") {
+		t.Fatalf("setup: the refresher must have written NEW into resident w2")
+	}
+
+	reasons := i411RemarksFor(t, w2Key)
+	if !store.PutIfGen(w2ctx, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, w2body), Inputs: edge3WidgetInputs("w2")}, gen) {
+		t.Fatalf("setup: the keepwarm PutIfGen must be accepted (a refresh does not move the gen)")
+	}
+	if got := reasons(); len(got) == 0 {
+		t.Fatalf("#411 C1 RED: the torn-window memo hitter Put the pre-event body over the refresher's fresh cell " +
+			"and was NOT remarked — its Put-check judged the reused deps from its own startSeq (= the event's seq) " +
+			"instead of the memo body's stamp, so w2 stays stale until the next dep event or TTL")
+	}
+}
+
+// TestIssue411_AsOfFloorOnlyOnReplayedDeps — #411 C1 no-amplification arm. The
+// as-of floor applies ONLY to the deps replayed from the memo. A bump of the
+// hitter's OWN self-dep (its widget CR) in (memoStamp, hitterStart] happened
+// before the hitter read anything, so its body reflects it; the hitter's Put
+// must NOT be remarked. RED if the floor leaks onto every sink dep.
+func TestIssue411_AsOfFloorOnlyOnReplayedDeps(t *testing.T) {
+	f := i411Setup(t, "i411-floor-ra")
+	const w1Key, w2Key = "L1_i411_floor_w1", "L1_i411_floor_w2"
+
+	f.seedResolve(w1Key, "w1") // memo produced at stamp S
+	// The hitter's widget CR is edited after S, before the hitter starts.
+	cache.Deps().OnUpdate(i411WidgetGVR(), edge3BackingNS, "w2")
+
+	hitsBefore, _ := f.memo.Stats()
+	reasons := i411RemarksFor(t, w2Key)
+	f.seedResolve(w2Key, "w2")
+	if hitsAfter, _ := f.memo.Stats(); hitsAfter-hitsBefore != 1 {
+		t.Fatalf("setup: w2 must take a valid memo hit (no memo dep moved); hit delta=%d", hitsAfter-hitsBefore)
+	}
+	if got := reasons(); len(got) != 0 {
+		t.Fatalf("#411 C1: a bump of the hitter's OWN self-dep before its entry remarked its Put (%v) — the "+
+			"as-of floor must apply only to the deps replayed from the memo (spurious remark = amplification)", got)
 	}
 }
