@@ -262,9 +262,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// #189 — capture the cache key's generation BEFORE the resolve below. If the
 	// RESTAction CR is DELETE-evicted during the (live-apiserver) resolve, the
 	// tail PutIfGen refuses rather than resurrecting the pre-delete body.
-	// CaptureGen is nil-safe; on a cold miss the key is absent → gen 0 → the fill
-	// still inserts.
-	cacheGen0 := cacheHandle.CaptureGen(cacheKey)
+	// On a cold miss the key is absent → gen 0 → the fill still inserts. #429:
+	// cache-off yields a nil cacheHandle INTERFACE (CaptureGen's nil-receiver
+	// safety does not cover that), and the tail never Puts then — skip the capture.
+	var cacheGen0 uint64
+	if cacheHandle != nil {
+		cacheGen0 = cacheHandle.CaptureGen(cacheKey)
+	}
 
 	scheme := runtime.NewScheme()
 	if err := apis.AddToScheme(scheme); err != nil {
