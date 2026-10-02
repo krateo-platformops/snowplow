@@ -421,7 +421,17 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// widgetData is written below either way; only the shared-cell write, its dep
 	// Record and its /refreshes publish are skipped. Reverts in 1.13.0 when the
 	// UAF-scope digest (v7) separates co-bound requesters in the key.
-	if declineWidgetUAFPut(cacheInputs, uafTouchedSink) {
+	// #424 — identity-class re-check FIRST (see restactions.go): a requester
+	// whose RBAC class moved mid-resolve must not write into the pre-resolve
+	// key. Ahead of the external-TTL branch too, since that branch also writes.
+	if drift := identityClassDriftCtx(ctx, cacheInputs); cacheHandle != nil && cacheKey != "" && drift != "" {
+		noteIdentityClassDrift("widgets", drift)
+		log.Debug("Widget requester's RBAC class moved during the resolve; declining to cache",
+			slog.String("key_hash", cacheKey),
+			slog.String("drift", drift),
+			slog.String("effect", "envelope served (200) for this requester; not persisted under the pre-resolve key (#424)"),
+		)
+	} else if declineWidgetUAFPut(cacheInputs, uafTouchedSink) {
 		// DEBUG, not WARN: on a portal rendering UAF-backed widgets this fires on
 		// essentially every /call, and LOG_LEVEL=warn is the production floor.
 		// snowplow_widgets_uaf_put_declined_total carries the rate.

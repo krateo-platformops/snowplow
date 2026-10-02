@@ -60,6 +60,7 @@ package rbac
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"expvar"
 	"sort"
 	"strings"
 	"sync"
@@ -115,6 +116,8 @@ func subjectBindingSetDigestFor(snap *cache.RBACSnapshot, username string, group
 	}
 	if len(shard.m) < bindingSetMemoCap {
 		shard.m[key] = d
+	} else {
+		bindingSetMemoRefused.Add(1)
 	}
 	shard.mu.Unlock()
 	return d
@@ -127,10 +130,7 @@ func SubjectBindingIDs(snap *cache.RBACSnapshot, username string, groups []strin
 	if snap == nil {
 		return nil
 	}
-	gs := make([]string, 0, len(groups)+1)
-	gs = append(gs, groups...)
-	gs = append(gs, systemAuthenticatedGroup)
-	id := EvaluateOptions{Username: username, Groups: gs}
+	id := EvaluateOptions{Username: username, Groups: WithAuthenticatedGroup(groups)}
 
 	seen := map[string]struct{}{}
 	var ids []string
@@ -169,6 +169,26 @@ func buildSubjectBindingSetDigest(snap *cache.RBACSnapshot, username string, gro
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// WithAuthenticatedGroup returns groups plus system:authenticated (once,
+// de-duplicated, order otherwise preserved). Every real request is
+// authenticated, so this is the requester's EFFECTIVE group set. #424 uses it
+// at three sites that must agree for one identity class: the binding-set digest
+// (above), the RBACSubGen fold (dispatchCacheLookupKey) and the prewarm seed's
+// resolve identity (withCohortSeedContext) — a seed representative with
+// Username=="" would otherwise not match system:authenticated subjects in
+// EvaluateRBAC (that match is gated on a non-empty username) and its seeded body
+// would be NARROWER than a real member's under the same key.
+func WithAuthenticatedGroup(groups []string) []string {
+	for _, g := range groups {
+		if g == systemAuthenticatedGroup {
+			return groups
+		}
+	}
+	out := make([]string, 0, len(groups)+1)
+	out = append(out, groups...)
+	return append(out, systemAuthenticatedGroup)
+}
+
 // canonicalGroupsKey is an EXACT (collision-free) order-independent encoding of
 // a group set — the memo key must never alias two different group sets, since
 // the memoised value is a security-relevant key dimension.
@@ -203,7 +223,36 @@ var (
 	bindingSetMemo       atomic.Pointer[bindingSetShard]
 	bindingSetMemoHits   atomic.Uint64
 	bindingSetMemoMisses atomic.Uint64
+	// bindingSetMemoRefused counts cap-breach inserts (digest computed, not cached).
+	bindingSetMemoRefused atomic.Uint64
+	bindingSetExpvarOnce  sync.Once
 )
+
+// RegisterSubjectBindingSetExpvar publishes the binding-set memo counters on
+// /debug/vars. Every RBAC event republishes the snapshot and swaps the memo
+// shard, so the hit ratio is the operator's read on how often /call pays the
+// cold build (hits / (hits + misses)). Idempotent (sync.Once); called from
+// main.go next to RegisterAuthzMemoExpvar.
+//
+//	snowplow_binding_set_memo_hits    — cumulative memo hits
+//	snowplow_binding_set_memo_misses  — cumulative cold builds
+//	snowplow_binding_set_memo_refused — cap-breach (computed, not cached)
+//	snowplow_binding_set_memo_entries — live entries in the current shard
+func RegisterSubjectBindingSetExpvar() {
+	bindingSetExpvarOnce.Do(func() {
+		expvar.Publish("snowplow_binding_set_memo_hits", expvar.Func(func() any { return bindingSetMemoHits.Load() }))
+		expvar.Publish("snowplow_binding_set_memo_misses", expvar.Func(func() any { return bindingSetMemoMisses.Load() }))
+		expvar.Publish("snowplow_binding_set_memo_refused", expvar.Func(func() any { return bindingSetMemoRefused.Load() }))
+		expvar.Publish("snowplow_binding_set_memo_entries", expvar.Func(func() any {
+			if cur := bindingSetMemo.Load(); cur != nil {
+				cur.mu.RLock()
+				defer cur.mu.RUnlock()
+				return len(cur.m)
+			}
+			return 0
+		}))
+	})
+}
 
 func currentBindingSetShard(snap *cache.RBACSnapshot) *bindingSetShard {
 	for {
@@ -230,6 +279,7 @@ func ResetSubjectBindingSetMemoForTest() {
 	bindingSetMemo.Store(nil)
 	bindingSetMemoHits.Store(0)
 	bindingSetMemoMisses.Store(0)
+	bindingSetMemoRefused.Store(0)
 }
 
 // SubjectBindingSetMemoStatsForTest returns (hits, misses).

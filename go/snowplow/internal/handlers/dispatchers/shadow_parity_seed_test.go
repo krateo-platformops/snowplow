@@ -230,8 +230,12 @@ func TestF2E_Identity_CohortDeniedClassifiesDeniedNotSA(t *testing.T) {
 	if sc.identity.Username != denied {
 		t.Fatalf("F-2E-IDENTITY: sc.identity.Username=%q, want the cohort %q (reading the SA transport identity is the leak vector this arm exists to catch)", sc.identity.Username, denied)
 	}
-	if len(sc.identity.Groups) != 1 || sc.identity.Groups[0] != a1Group {
-		t.Fatalf("F-2E-IDENTITY: sc.identity.Groups=%v, want the cohort groups [%s]", sc.identity.Groups, a1Group)
+	// #424: the seed resolves the cohort as an AUTHENTICATED identity — its
+	// effective groups are the cohort groups plus system:authenticated
+	// (rbac.WithAuthenticatedGroup), never anything of the SA's.
+	want := rbac.WithAuthenticatedGroup([]string{a1Group})
+	if len(sc.identity.Groups) != len(want) || sc.identity.Groups[0] != want[0] || sc.identity.Groups[1] != want[1] {
+		t.Fatalf("F-2E-IDENTITY: sc.identity.Groups=%v, want the cohort's effective groups %v", sc.identity.Groups, want)
 	}
 }
 

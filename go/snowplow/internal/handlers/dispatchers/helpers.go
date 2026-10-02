@@ -303,7 +303,13 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		// crux). ui.Username/ui.Groups are already in hand here (the same tuple
 		// EvaluateRBAC read above), so this is a handful of lock-free map reads,
 		// no extra walk.
-		RBACSubGen: cache.RBACSubGenForSubject(ui.Username, ui.Groups),
+		//
+		// #424 — folded over the EFFECTIVE groups (system:authenticated
+		// included) so a customer whose JWT omits it and the seed representative
+		// (which now resolves with it, withCohortSeedContext) fold the same
+		// counters, and a change to a system:authenticated binding rotates
+		// every authenticated requester's key (it changes all of their rights).
+		RBACSubGen: cache.RBACSubGenForSubject(ui.Username, rbac.WithAuthenticatedGroup(ui.Groups)),
 		// Representative identity for the refresher's re-resolve.
 		// Carried on Inputs but NOT folded into ComputeKey (the cell
 		// is keyed by BindingUID, not by the literal name). The first

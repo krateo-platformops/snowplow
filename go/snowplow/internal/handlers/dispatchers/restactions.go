@@ -441,7 +441,19 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// either way; only the shared-cell write is skipped, so no other identity can
 	// ever read it. Reverts in 1.13.0 when the UAF-scope digest (v7) separates
 	// them in the key.
-	if reason := uafDeclineReason(cacheInputs, uafTouchedSink); reason != "" {
+	// #424 — THE IDENTITY-CLASS RE-CHECK IS FIRST IN THE CHAIN. cacheKey was
+	// minted before the resolve; if this requester's RBAC class moved since
+	// (a grant/revoke landed mid-resolve), the body belongs to the NEW class
+	// while cacheKey still names the OLD one, which every other old-class member
+	// derives. Serve the body (it is correct for this requester), never write it.
+	if drift := identityClassDriftCtx(ctx, cacheInputs); cacheHandle != nil && cacheKey != "" && drift != "" {
+		noteIdentityClassDrift("restactions", drift)
+		log.Debug("RESTAction requester's RBAC class moved during the resolve; declining to cache",
+			slog.String("key_hash", cacheKey),
+			slog.String("drift", drift),
+			slog.String("effect", "body served (200) for this requester; not persisted under the pre-resolve key (#424)"),
+		)
+	} else if reason := uafDeclineReason(cacheInputs, uafTouchedSink); reason != "" {
 		declineUAFPut(cacheInputs, uafTouchedSink) // bumps the class counter
 		// DEBUG, not WARN: this fires on EVERY /call of a UAF RA and
 		// LOG_LEVEL=warn is the production floor — a WARN here would flood.

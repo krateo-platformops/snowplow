@@ -1,0 +1,100 @@
+// identity_class_guard.go — #424: the Put-time re-check of an identity-bound
+// key's RBAC class.
+//
+// An identity-bound key (restactions / widgets / raFullList) names an RBAC
+// class: (first-match BindingUID, SubjectBindingSet digest, RBACSubGen) for
+// the identity that minted it. The key is minted BEFORE the resolve and the
+// body is written AFTER it. Two ways the body can stop belonging to the class
+// its key names:
+//
+//  1. TOCTOU (every Put path). A grant/revoke lands between mint and Put. The
+//     resolve then reads (some of) the requester's NEW rights while the key
+//     still names the OLD class — and every other member of the old class
+//     derives that key. Writing would serve the new rights to them.
+//
+//  2. Representative drift (the refresher). The refresher re-resolves under
+//     the cell's recorded representative using the representative's CURRENT
+//     RBAC, then re-Puts under the carried key. If the representative gained
+//     or lost a binding since the cell was minted, the re-resolve is for a
+//     different class than the one still deriving the key.
+//
+// The guard re-derives the identity dimensions for the identity the body was
+// resolved under, AFTER the resolve, and declines the write when they differ
+// from the key's. The body is still served to its own requester (it is correct
+// for them); only the shared-cell write is skipped. RBACSubGen is monotone per
+// subject, so a grant-then-revoke inside one resolve (ABA on the binding set)
+// still differs and is caught.
+//
+// A change landing AFTER this check but before the Put is harmless: then the
+// whole resolve ran under the minting class, so the body is that class's body;
+// the next request derives the new key and misses.
+
+package dispatchers
+
+import (
+	"context"
+	"expvar"
+
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
+)
+
+// identityClassDrift reports why (username, groups) no longer belongs to the
+// RBAC class inputs' key was minted for, or "" when it still does (or when the
+// class is identity-free / inputs is nil — nothing to check).
+func identityClassDrift(ctx context.Context, inputs *cache.ResolvedKeyInputs, username string, groups []string) string {
+	if inputs == nil || isIdentityFreeClass(inputs.CacheEntryClass) {
+		return ""
+	}
+	if rbac.SubjectBindingSetDigest(username, groups) != inputs.SubjectBindingSet {
+		return "binding_set"
+	}
+	// raFullList keys do not fold RBACSubGen (RAFullListKeyInputs leaves it 0).
+	if inputs.CacheEntryClass != cache.CacheEntryClassRAFullList &&
+		cache.RBACSubGenForSubject(username, rbac.WithAuthenticatedGroup(groups)) != inputs.RBACSubGen {
+		return "rbac_subgen"
+	}
+	// No separate first-match BindingUID re-evaluation: BindingUID is a function
+	// of (the binding set, the roles those bindings reference, the cell's fixed
+	// coordinates). An unchanged binding set rules out the first; any rules change
+	// on a referenced role bumps the per-subject RBACSubGen of every subject of the
+	// referencing bindings (#257 onRoleRulesChanged) — rotating the restactions /
+	// widgets key above. (raFullList, which folds no sub-gen, re-derives its whole
+	// key through seedFullListRAKey at its own Put sites instead.)
+	_ = ctx
+	return ""
+}
+
+// identityClassDriftDeclined counts Put/re-Put declines by "<site>/<reason>"
+// (/debug/vars snowplow_l1_identity_class_drift_declined_total). Non-zero is
+// expected and benign — every grant/revoke that lands mid-resolve on a
+// requester ticks it once — and it is the evidence the guard fires.
+var identityClassDriftDeclined = expvar.NewMap("snowplow_l1_identity_class_drift_declined_total")
+
+// noteIdentityClassDrift records one declined write at site for reason.
+func noteIdentityClassDrift(site, reason string) {
+	identityClassDriftDeclined.Add(site+"/"+reason, 1)
+}
+
+// identityClassDriftDeclinedForTest reads one site/reason counter.
+func identityClassDriftDeclinedForTest(site, reason string) int64 {
+	if v, ok := identityClassDriftDeclined.Get(site + "/" + reason).(*expvar.Int); ok {
+		return v.Value()
+	}
+	return 0
+}
+
+// identityClassDriftCtx is identityClassDrift for the identity on ctx (the
+// customer and seed Put paths). A missing identity is drift: a key that was
+// minted for an identity cannot be re-confirmed without one.
+func identityClassDriftCtx(ctx context.Context, inputs *cache.ResolvedKeyInputs) string {
+	if inputs == nil || isIdentityFreeClass(inputs.CacheEntryClass) {
+		return ""
+	}
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return "no_identity"
+	}
+	return identityClassDrift(ctx, inputs, ui.Username, ui.Groups)
+}

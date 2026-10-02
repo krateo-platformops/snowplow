@@ -29,6 +29,7 @@ package apiref
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/ptr"
@@ -419,6 +420,13 @@ func raFullListServe(
 		// #375 — Put under fullCtx: its dep-gen sink (WithL1KeyContext(raKey)) holds the
 		// UNPAGINATED resolve's deps, which is what this cell's body was built from. The
 		// request ctx's sink is the WIDGET resolve's (it receives these deps by chaining).
+		// #424 — the requester's RBAC class must still be the one raKey was
+		// minted for; a change mid-resolve makes `full` another class's body.
+		// Serve the slice (correct for this requester), never write it.
+		if !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+			return sliced, true, nil
+		}
 		if c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0) {
 			// #375 C3 — under fullCtx (the Put's sink; it chains to the widget sink, which
 			// still receives the dep), so an RA edit in [Put-check, Record) is re-checked.
@@ -560,9 +568,35 @@ func raFullListServe(
 	// resolve bumped the generation) declines the cache fill without resurrecting
 	// the pre-delete body; the verified slice sGo is served regardless, and the
 	// self-dep Record above (the Lever-C memo wiring) stands either way.
+	// #424 — same identity-class re-check as the repopulate branch.
+	if !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+		return sGo, true, nil
+	}
 	c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0)
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
 	return sGo, true, nil
+}
+
+// raKeyClassDriftDeclined counts raFullList cell writes declined because the
+// requester's RBAC class moved between mint and Put (#424).
+var raKeyClassDriftDeclined atomic.Uint64
+
+// RAKeyClassDriftDeclinedForTest reads the counter.
+func RAKeyClassDriftDeclinedForTest() uint64 { return raKeyClassDriftDeclined.Load() }
+
+// raKeyClassCurrent re-derives the raFullList key for ctx's identity through the
+// SAME single-source helper the producer minted with (seedFullListRAKey: real
+// EvaluateRBAC first-match + the binding-set digest) and reports whether it still
+// equals raKey. A grant/revoke that landed during the resolve moves it (#424).
+func raKeyClassCurrent(ctx context.Context, gvr schema.GroupVersionResource,
+	namespace, name string, extras map[string]any, raKey string) bool {
+	_, now, ok := seedFullListRAKey(ctx, gvr, namespace, name, extras)
+	if ok && now == raKey {
+		return true
+	}
+	raKeyClassDriftDeclined.Add(1)
+	return false
 }
 
 // decodeRAFullList unmarshals a cached RAFullList envelope back to a map.

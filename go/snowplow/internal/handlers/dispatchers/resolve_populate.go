@@ -190,6 +190,27 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			}
 		}
 	}
+	// #424 R1 — REPRESENTATIVE DRIFT. An identity-bound cell is keyed by the
+	// RBAC class of its first writer, recorded here as the representative. The
+	// re-resolve below runs under the representative's CURRENT RBAC; if they
+	// gained or lost a binding since the cell was minted, their own key has
+	// moved but every other member of the old class still derives THIS key, and
+	// re-Putting would hand those members the representative's new view.
+	// Decline (and suppress: the representative cannot drift back into a class
+	// it has left without a sub-gen bump, which is a different key) before
+	// paying for the resolve; re-checked after it (TOCTOU, below).
+	if drift := identityClassDrift(ctx, &inputs, refreshUser, refreshGroups); drift != "" {
+		noteIdentityClassDrift("refresher", drift)
+		cache.NoteRefreshDecline(key, "representative_drift", true)
+		log.Debug("resolveAndPopulateL1: representative's RBAC class no longer matches the cell key; declining to refresh",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("handler", inputs.CacheEntryClass),
+			slog.String("drift", drift),
+			slog.String("effect", "prior entry kept (correct for its class at write time), not refreshed; TTL is the bound (#424 R1)"),
+		)
+		return nil
+	}
 	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserInfo(jwtutil.UserInfo{
 			Username: refreshUser,
@@ -405,6 +426,19 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("uaf_reason", reason),
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
 			slog.String("effect", "prior entry kept, not refreshed; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
+		)
+		return nil
+	}
+
+	// #424 — TOCTOU re-check: an RBAC change on the representative that landed
+	// during the re-resolve makes the fresh bytes another class's.
+	if drift := identityClassDrift(ctx, &inputs, refreshUser, refreshGroups); drift != "" {
+		noteIdentityClassDrift("refresher", drift)
+		cache.NoteRefreshDecline(key, "representative_drift", true)
+		log.Debug("resolveAndPopulateL1: representative's RBAC class moved during the re-resolve; declining to re-Put",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("drift", drift),
 		)
 		return nil
 	}

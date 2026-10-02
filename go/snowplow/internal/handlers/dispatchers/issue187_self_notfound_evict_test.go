@@ -59,6 +59,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -249,6 +250,11 @@ func i187Watcher(t *testing.T, registerSelfGVR bool) *cache.ResourceWatcher {
 		t.Fatalf("setup: %s should NOT be registered — the arm would be vacuous", i187GVR())
 	}
 
+	// #424: publish the RBAC snapshot synchronously so the fixture's cell is
+	// minted against the SAME snapshot the refresher later reads (the initial
+	// publish is async; a cell minted before it would carry a pre-snapshot
+	// binding-set digest and the drift guard would — correctly — decline it).
+	cache.RebuildRBACSnapshotForTest(rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 	return rw
@@ -289,6 +295,10 @@ func i187Fixture(t *testing.T, srv *i187APIServer, typeRegistered bool) (store *
 		BindingUID:             "uid-187",
 		RepresentativeUsername: "admin",
 		RepresentativeGroups:   []string{"admins"},
+		// #424: a real identity-bound cell always carries the binding-set digest
+		// it was minted with (dispatchCacheLookupKey); the refresher's drift
+		// guard compares the representative's current set against it.
+		SubjectBindingSet: rbac.SubjectBindingSetDigest("admin", []string{"admins"}),
 	}
 	key = cache.ComputeKey(inputs)
 	store.Put(key, &cache.ResolvedEntry{
