@@ -42,23 +42,25 @@ import (
 const s258WideningUser = "carol" // starts with NO binding; gains one mid-test
 
 // s258WideningSink collects every RotatedSubjectSet the cache hands the RBAC-shift
-// hook. The hook registry dedups by function pointer, so ONE package-level
-// closure is registered once (registerS258WideningHook) and writes here.
+// hook. registerS258WideningHook resets the registry and installs ONLY this sink
+// for the calling test (the registry dedups by function pointer, so a reset is
+// what makes re-registration under -count>1 work); it resets again on cleanup.
 var s258WideningSink struct {
 	mu   sync.Mutex
 	sets []cache.RotatedSubjectSet
 }
 
-var s258WideningHookOnce sync.Once
+func s258WideningHookFn(rs cache.RotatedSubjectSet) {
+	s258WideningSink.mu.Lock()
+	s258WideningSink.sets = append(s258WideningSink.sets, rs)
+	s258WideningSink.mu.Unlock()
+}
 
-func registerS258WideningHook() {
-	s258WideningHookOnce.Do(func() {
-		cache.RegisterRBACShiftHook(func(rs cache.RotatedSubjectSet) {
-			s258WideningSink.mu.Lock()
-			s258WideningSink.sets = append(s258WideningSink.sets, rs)
-			s258WideningSink.mu.Unlock()
-		})
-	})
+func registerS258WideningHook(t *testing.T) {
+	t.Helper()
+	cache.ResetRBACShiftHooksForTest()
+	t.Cleanup(cache.ResetRBACShiftHooksForTest)
+	cache.RegisterRBACShiftHook(s258WideningHookFn)
 }
 
 func s258ResetSink() {
@@ -87,9 +89,10 @@ var (
 )
 
 // s258BuildWatcher publishes a ClusterRole granting get/list on the RA + widget
-// GVRs, bound ONLY to alice. carol has no binding. Returns the dynamic client so
-// the test can ADD carol's binding through the informer path.
-func s258BuildWatcher(t *testing.T) (dynamic.Interface, *cache.ResourceWatcher) {
+// GVRs, bound to alice plus one ClusterRoleBinding per extraUsers entry (carol
+// has none unless listed). Returns the dynamic client so a test can ADD a binding
+// through the informer path.
+func s258BuildWatcher(t *testing.T, extraUsers ...string) (dynamic.Interface, *cache.ResourceWatcher) {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
@@ -122,6 +125,13 @@ func s258BuildWatcher(t *testing.T) (dynamic.Interface, *cache.ResourceWatcher) 
 			Subjects:   []rbacv1.Subject{{Kind: "User", APIGroup: "rbac.authorization.k8s.io", Name: a1Alice}},
 			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "s258-reader"},
 		},
+	}
+	for _, u := range extraUsers {
+		seed = append(seed, &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "s258-" + u, UID: types.UID("uid-s258-" + u)},
+			Subjects:   []rbacv1.Subject{{Kind: "User", APIGroup: "rbac.authorization.k8s.io", Name: u}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "s258-reader"},
+		})
 	}
 	wctx, wcancel := context.WithCancel(context.Background())
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, seed...)
@@ -173,7 +183,7 @@ func s258TargetsFor(reqs []reseedRequest, user string) int {
 }
 
 func TestS258_WideningSubjectAppearsInReseedSet(t *testing.T) {
-	registerS258WideningHook()
+	registerS258WideningHook(t)
 	dyn, rw := s258BuildWatcher(t)
 	stubWidgetResolve(t)
 	s258ResetSink()
