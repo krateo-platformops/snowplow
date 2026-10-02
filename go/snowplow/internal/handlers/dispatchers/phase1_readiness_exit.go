@@ -280,14 +280,59 @@ func recordPhase1ReadinessExit(outcome, cause string, elapsed time.Duration, ste
 	recordPhase1ReadinessExitWith(func() (string, string) { return outcome, cause }, elapsed, steps)
 }
 
-// recordPhase1SeedExit is the Step 7.6 seed-block recorder: classification
-// (classifyPhase1SeedExit) runs INSIDE the once + recover guard, so a panic in
-// classification, snapshotting or logging is swallowed here and can never
-// escape the seed block's defer chain (C3).
+// recordPhase1SeedExit is the Step 7.6 seed-block recorder and (#402) the
+// SINGLE site that records the F5 readiness backstop for a seed-block release.
+// Classification runs once, under a recover guard, so a panic in
+// classification, the backstop record, snapshotting or logging is swallowed
+// here and can never escape the seed block's defer chain (C3). The backstop
+// and the readiness-exit outcome come from the SAME classification, so they
+// agree on every release (e.g. a latch/deadline tie is a latch release with no
+// backstop) with ONE named exception: a seed that panics after the latch fired
+// is outcome=latch (readiness was latch-released) but still records a
+// seed_panic backstop, because the seed aborted mid-flight
+// (phase1BackstopReason).
 func recordPhase1SeedExit(parentErr, seedCtxErr, seedErr error, panicked bool, elapsed time.Duration, steps phase1StepTimings) {
+	var outcome, cause string
+	classified := false
+	func() {
+		defer func() { _ = recover() }()
+		outcome, cause = classifyPhase1SeedExit(parentErr, seedCtxErr, seedErr, panicked)
+		classified = true
+		if reason, ok := phase1BackstopReason(outcome, cause, panicked); ok {
+			backstopElapsed := steps.seed
+			if backstopElapsed < 0 {
+				backstopElapsed = elapsed
+			}
+			recordReadinessBackstop(reason, backstopElapsed, -1)
+		}
+	}()
 	recordPhase1ReadinessExitWith(func() (string, string) {
-		return classifyPhase1SeedExit(parentErr, seedCtxErr, seedErr, panicked)
+		if !classified {
+			return classifyPhase1SeedExit(parentErr, seedCtxErr, seedErr, panicked)
+		}
+		return outcome, cause
 	}, elapsed, steps)
+}
+
+// phase1BackstopReason maps a seed-block release to its ONE F5 backstop reason
+// (#402), or ok=false when readiness was not released by the backstop.
+//   - a panic is always a backstop (seed_panic), even if the latch had fired:
+//     the seed was aborted mid-flight.
+//   - deadline → its cause: phase1_timeout (the PHASE1_TIMEOUT parent),
+//     pip_global_timeout (the seed's own budget) or canceled (shutdown).
+//   - boot_error → boot_error (the seed returned an error with its ctx live).
+//   - latch / seed_returned → not a backstop.
+func phase1BackstopReason(outcome, cause string, panicked bool) (string, bool) {
+	if panicked {
+		return phase1ExitSeedPanic, true
+	}
+	switch outcome {
+	case phase1ExitDeadline:
+		return cause, true
+	case phase1ExitBootError:
+		return phase1ExitBootError, true
+	}
+	return "", false
 }
 
 // phase1ExitLevel is the log level of the readiness-exit line for an outcome:
