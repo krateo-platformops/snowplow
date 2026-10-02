@@ -235,9 +235,10 @@ func resetInternalClientCacheForTest() {
 // predicate + the serve-point gates close). It returns TRUE (serve un-narrowed)
 // iff ANY of:
 //
-//	(a) a serve-watcher is on the ctx (cache.WithServeWatcher) — the Phase-1
-//	    SA walk / cohort seed / content-prewarm. These run under the SA
-//	    identity and legitimately read the full cluster set.
+//	(a) the Phase-1 SA walk / content-prewarm (serve-watcher on ctx) running
+//	    under snowplow's OWN SA identity — see (d). Since #425 the serve-watcher
+//	    alone exempts nothing: the cohort seed carries one but resolves as the
+//	    cohort representative, and narrows.
 //	(b) the ctx is marked an api-stage CONTENT resolve
 //	    (cache.WithApistageContentResolve) — an identity-free content-cell
 //	    populate whose per-user gate runs later at the stage loop's single
@@ -247,9 +248,10 @@ func resetInternalClientCacheForTest() {
 //	    identity-free populate (e.g. cluster_list async). No subject exists
 //	    to narrow against; the shared substrate is populated un-narrowed and
 //	    the per-user gate runs on read.
-//	(d) UserInfo present AND its Username is a canonical ServiceAccount
-//	    (system:serviceaccount:<ns>:<name>) — the refresher's identity-free
-//	    path carries the SA identity rather than an end-user subject.
+//	(d) UserInfo present AND its Username EQUALS the subject of the snowplow SA
+//	    credential on the ctx (rbac.isSnowplowSAIdentity) — the refresher's
+//	    identity-free path carries that SA identity. Since #427 a merely
+//	    canonical ServiceAccount form (e.g. a tenant SA representative) narrows.
 //
 // CRITICAL (RC2): a group-only end-user (empty Username, NON-empty Groups)
 // is a REAL end-user and is NOT exempt. Clause (c) does not fire (UserInfo

@@ -22,23 +22,26 @@ import (
 // maximal shell, re-narrowed at read). It is the single source of truth for the
 // predicate api.internalDispatchServesUnnarrowed also uses:
 //
-//	(a) a Phase-1 walk / content-prewarm (ServeWatcher on ctx) whose identity is
-//	    snowplow's OWN ServiceAccount, or absent (then (c) answers). A ServeWatcher
-//	    on its own exempts NOTHING (#425): the cohort seed (withCohortSeedContext)
-//	    carries one but resolves as the cohort REPRESENTATIVE, and an un-narrowed
-//	    serve there caches SA-fetched data under the cohort's key. Under a
-//	    ServeWatcher the identity must EQUAL the subject of the SA credential on
-//	    the ctx; any other identity narrows — including a different
-//	    ServiceAccount picked as a cohort representative
-//	    (cache.pickRepresentativeFromSubjects), which (d) would otherwise exempt;
 //	(b) an api-stage content-cell populate (WithApistageContentResolve);
 //	(c) a truly identity-free populate (no UserInfo — cluster_list async, or a
 //	    Phase-1 walk whose SA token carries no canonical subject);
-//	(d) outside a ServeWatcher ctx, a canonical ServiceAccount username (the
-//	    refresher's identity-free class).
+//	(a+d) the identity IS snowplow's own ServiceAccount: the username EQUALS the
+//	    subject of the SA credential on the ctx (isSnowplowSAIdentity). This covers
+//	    the Phase-1 walk and content prewarm (ServeWatcher, identity from
+//	    phase1SAUsername) and the refresher's identity-free class (the same
+//	    phase1SAUsername identity + WithInternalEndpoint(saEP)).
+//
+// Neither a ServeWatcher (#425) nor the canonical ServiceAccount FORM of a
+// username (#427) exempts anything on its own. The cohort seed carries a
+// ServeWatcher but resolves as the cohort REPRESENTATIVE; a representative can
+// itself be a tenant ServiceAccount (cache.pickRepresentativeFromSubjects), and
+// the refresher re-resolves its cell under that identity with snowplow's SA
+// transport. An un-narrowed serve in either case caches SA-fetched data under
+// that cohort's key. A ctx whose SA credential carries no decodable subject, or
+// a different one, narrows (fail closed).
 //
 // A REAL end-user — including the refresher's per-user-cohort REPRESENTATIVE
-// identity (non-SA Username), the cohort seed's representative, and a
+// identity, the cohort seed's representative, a tenant ServiceAccount, and a
 // group-only user — returns FALSE (must narrow).
 func ServesUnnarrowed(ctx context.Context) bool {
 	if cache.ApistageContentResolveFromContext(ctx) {
@@ -48,13 +51,7 @@ func ServesUnnarrowed(ctx context.Context) bool {
 	if err != nil {
 		return true
 	}
-	if _, ok := cache.ServeWatcherFromContext(ctx); ok {
-		return isSnowplowSAIdentity(ctx, user.Username)
-	}
-	if IsServiceAccountUsername(user.Username) {
-		return true
-	}
-	return false
+	return isSnowplowSAIdentity(ctx, user.Username)
 }
 
 // isSnowplowSAIdentity reports whether username is the identity of the snowplow
@@ -133,7 +130,7 @@ func saCredentialOnContext(ctx context.Context) bool {
 // of production contexts carrying an SA credential under a real identity: a LIVE
 // request has no SA cred on the ctx (the attach was removed), and every internal
 // SA-credentialed driver either sets WithBackgroundResolve OR uses a serveUnnarrowed
-// (Phase-1 ServeWatcher / canonical-SA) identity. So the conjunct is production-
+// (snowplow-SA / identity-free) identity. So the conjunct is production-
 // equivalent to (saCred && !serveUnnarrowed) while EXCLUDING a non-background
 // real-user + internal-endpoint dispatch, which is not a production-reachable shape
 // (only tests construct it). Verdict/outcomes:

@@ -586,3 +586,127 @@ func TestSeed425_OtherServiceAccountRepresentative_Narrowed(t *testing.T) {
 		t.Fatalf("#425 SEED LEAK: the tenant-SA cohort's seeded cell holds SA-fetched objects it may not read; cell=%s", s425Trunc(cell))
 	}
 }
+
+// s425Token mints an unsigned JWT with the given `sub`.
+func s425Token(sub string) string {
+	enc := func(v any) string {
+		b, _ := json.Marshal(v)
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	return enc(map[string]any{"alg": "none"}) + "." + enc(map[string]any{"sub": sub}) + ".sig"
+}
+
+// TestRefresher427_TenantSARepresentative_Narrowed — #427, the reviewer's probe
+// (#428 review, zz_review428_refresher_tenantsa_test.go) on this file's harness.
+// OUTSIDE a ServeWatcher, the canonical ServiceAccount FORM of a username used to
+// exempt (clause d). A restactions cell whose representative is a TENANT SA (a
+// seed representative picked from a ServiceAccount-kind subject, or an
+// SA-identity /call) is re-resolved by the REAL refresher (resolveAndPopulateL1)
+// under that username with snowplow's SA transport; the GET the tenant SA is
+// denied fell through the apistage gate to branch C and was served un-gated, and
+// the refresher re-Put it under the tenant SA's key. RED on fd5df128 and c20cc763.
+func TestRefresher427_TenantSARepresentative_Narrowed(t *testing.T) {
+	s425Env(t)
+	s425BuildWatcher(t, s425Opts{servable: true})
+	var saDials, userDials atomic.Int64
+	saSrv := s425SAServer(t, &saDials)
+	userSrv := s425UserServer(t, &userDials)
+	if ok, _, _ := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		Username: s425TenantSA, Verb: "get", Resource: "configmaps", Namespace: s425NSAllowed, Name: s425ObjY}); ok {
+		t.Fatalf("PRE: the tenant SA must be denied get configmaps %s/%s", s425NSAllowed, s425ObjY)
+	}
+	tok := s425SAToken()
+	saEP := &endpoints.Endpoint{ServerURL: saSrv.URL, Token: tok}
+	saRC := &rest.Config{Host: saSrv.URL, BearerToken: tok}
+
+	botCtx := xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: s425TenantSA}))
+	key, h, inputs := dispatchCacheLookupKey(botCtx, "restactions",
+		h1RAGVR.Group, h1RAGVR.Version, h1RAGVR.Resource, h1NS, s425RAName, -1, -1, nil)
+	if h == nil || inputs == nil || inputs.BindingUID == "" {
+		t.Fatalf("PRE: the tenant SA must derive a live cell key; inputs=%v", inputs)
+	}
+	// A narrowed body already sits in the cell (what the #425-fixed seed or a
+	// narrowed resolve produces). The arm drives the REAL refresher over it.
+	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{
+		RawJSON: []byte(`{"kind":"RESTAction","status":{"sa":"narrowed"}}`), Inputs: inputs})
+
+	cr := s425RA(s425PathGetY())
+	restore := setResolveOnceForTest(func(ctx context.Context, in cache.ResolvedKeyInputs) ([]byte, error) {
+		ctx = cache.WithBackgroundResolve(ctx) // as resolveOnceProd
+		if rbac.ServesUnnarrowed(ctx) {
+			t.Errorf("#427: the refresher ctx for a tenant-SA representative is ServesUnnarrowed")
+		}
+		return resolveRestActionForRefresh(ctx, objects.Result{GVR: h1RAGVR, Unstructured: cr.DeepCopy()}, in, s425AuthnNS)
+	})
+	defer restore()
+	if err := resolveAndPopulateL1(context.Background(), *inputs, saEP, saRC); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if saDials.Load() == 0 {
+		t.Fatalf("PRE (non-vacuity): the refresh never fetched through the SA credential (branch C did not run)")
+	}
+	if e, ok := cache.ResolvedCache().Get(key); ok && s425Has(e.RawJSON, s425SentinelY) {
+		t.Fatalf("#427 LEAK: the refresher re-resolved the tenant-SA cell un-narrowed and stored data the tenant SA "+
+			"is denied under its key; cell=%s", s425Trunc(e.RawJSON))
+	}
+	restoreFetch := setFetchObjectForTest(func(*http.Request) objects.Result {
+		return objects.Result{GVR: h1RAGVR, Unstructured: cr.DeepCopy()}
+	})
+	defer restoreFetch()
+	rec := httptest.NewRecorder()
+	(&restActionHandler{authnNS: s425AuthnNS, saRC: &rest.Config{Host: userSrv.URL}}).
+		ServeHTTP(rec, httptest.NewRequest("GET", "/call", nil).WithContext(botCtx))
+	if s425Has(rec.Body.Bytes(), s425SentinelY) {
+		t.Fatalf("#427 LEAK at serve: the tenant SA was served SA-fetched data; body=%s", s425Trunc(rec.Body.Bytes()))
+	}
+}
+
+// TestSAIdentity427_FailsClosedWithoutMatchingCredential — #428 C2. The exemption
+// is "the identity IS the subject of the SA credential on the ctx", never "the
+// username has the canonical SA form". With a ServeWatcher (walk/seed shape) and
+// without one (refresher shape), an SA username whose ctx carries NO SA token, an
+// opaque (non-JWT) token, or a token for a DIFFERENT subject must narrow (and be
+// re-gated). RED under M6 (`return !ok || sa == username`) and under any
+// mutation that exempts on the SA form alone.
+func TestSAIdentity427_FailsClosedWithoutMatchingCredential(t *testing.T) {
+	s425Env(t)
+	s425BuildWatcher(t, s425Opts{servable: true})
+	rc := &rest.Config{Host: "https://kubernetes.default.svc"}
+	build := func(watch bool, ep *endpoints.Endpoint) context.Context {
+		ctx := xcontext.BuildContext(context.Background(),
+			xcontext.WithUserInfo(jwtutil.UserInfo{Username: s425SnowplowSA}))
+		ctx = cache.WithInternalRESTConfig(ctx, rc)
+		if ep != nil {
+			ctx = cache.WithInternalEndpoint(ctx, ep)
+		}
+		if watch {
+			ctx = cache.WithServeWatcher(ctx, cache.Global())
+		}
+		return cache.WithBackgroundResolve(ctx)
+	}
+	for _, watch := range []bool{true, false} {
+		if _, ok := cache.ServeWatcherFromContext(build(watch, nil)); ok != watch {
+			t.Fatalf("PRE: ServeWatcher presence must be %v", watch)
+		}
+		for _, tc := range []struct {
+			name string
+			ep   *endpoints.Endpoint
+			want bool
+		}{
+			{"no-endpoint", nil, false},
+			{"endpoint-without-token", &endpoints.Endpoint{ServerURL: rc.Host}, false},
+			{"opaque-token", &endpoints.Endpoint{ServerURL: rc.Host, Token: "opaque-not-a-jwt"}, false},
+			{"token-for-other-sa", &endpoints.Endpoint{ServerURL: rc.Host, Token: s425Token(s425TenantSA)}, false},
+			{"token-for-this-sa (control)", &endpoints.Endpoint{ServerURL: rc.Host, Token: s425SAToken()}, true},
+		} {
+			ctx := build(watch, tc.ep)
+			if got := rbac.ServesUnnarrowed(ctx); got != tc.want {
+				t.Errorf("serveWatcher=%v %s: ServesUnnarrowed=%v, want %v", watch, tc.name, got, tc.want)
+			}
+			if got := rbac.MustRegateSADial(ctx); got != !tc.want {
+				t.Errorf("serveWatcher=%v %s: MustRegateSADial=%v, want %v", watch, tc.name, got, !tc.want)
+			}
+		}
+	}
+}

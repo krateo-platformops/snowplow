@@ -1,5 +1,3 @@
-//go:build falsifier_268_267
-
 // sa_regate_invariant_268_267_test.go — #268/#269 Part 2 drift-guard, invariant
 // table (architect's form; TL ship-choice: keep the 3-conjunct MustRegateSADial and
 // ENCODE its production-equivalence per producer here).
@@ -84,10 +82,22 @@ func saProducerBuilders() []saProducerCtx {
 	}
 }
 
-func saLeakEndpointAndRC(t *testing.T) (endpoints.Endpoint, *rest.Config) {
+// invSAEndpointAndRC is the production SA credential shape: the projected SA token
+// (a JWT whose `sub` is the snowplow SA username) on both the endpoint and the
+// *rest.Config. Default tags (#428 C3): CI must enforce these production guards.
+func invSAEndpointAndRC(t *testing.T) (endpoints.Endpoint, *rest.Config) {
 	t.Helper()
-	ep := endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc", Token: saLeakToken}
-	return ep, saLeakRC(ep.ServerURL)
+	tok := s425SAToken()
+	ep := endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc", Token: tok}
+	return ep, &rest.Config{Host: ep.ServerURL, BearerToken: tok}
+}
+
+// invCacheOn installs a synced cache-on watcher as cache.Global() so the nil-safe
+// WithServeWatcher attaches, exactly as in production.
+func invCacheOn(t *testing.T) {
+	t.Helper()
+	s425Env(t)
+	s425BuildWatcher(t, s425Opts{servable: true})
 }
 
 // TestSAProducerContexts_SatisfyRegateInvariant is the core drift-guard: each
@@ -96,15 +106,14 @@ func saLeakEndpointAndRC(t *testing.T) (endpoints.Endpoint, *rest.Config) {
 // feedback_arm_that_cannot_fail_is_not_coverage). Run cache-on so the nil-safe
 // WithServeWatcher attaches the watcher exactly as in production.
 func TestSAProducerContexts_SatisfyRegateInvariant(t *testing.T) {
-	// refresherDeniedWatcher (sa_serve_refresher_leak_268_test.go) turns CACHE_ENABLED
-	// on and installs a synced watcher as cache.Global(), so WithServeWatcher(ctx,
+	// invCacheOn installs a synced watcher as cache.Global(), so WithServeWatcher(ctx,
 	// cache.Global()) attaches a non-nil watcher — the production cache-on precondition.
-	refresherDeniedWatcher(t)
+	invCacheOn(t)
 	if cache.Global() == nil {
 		t.Fatalf("precondition: cache.Global() must be non-nil (cache-on) so WithServeWatcher attaches")
 	}
 
-	saEP, saRC := saLeakEndpointAndRC(t)
+	saEP, saRC := invSAEndpointAndRC(t)
 
 	for _, p := range saProducerBuilders() {
 		t.Run(p.name, func(t *testing.T) {
@@ -146,7 +155,7 @@ func TestSAProducerContexts_SatisfyRegateInvariant(t *testing.T) {
 // census + invariant table must PREVENT it from existing. This is a deliberate
 // counter-example, NOT a production producer.
 func TestSAProducerInvariant_Control_UngatedShapeIsCaught(t *testing.T) {
-	saEP, saRC := saLeakEndpointAndRC(t)
+	saEP, saRC := invSAEndpointAndRC(t)
 
 	ctx := xcontext.BuildContext(context.Background(),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "real-user", Groups: []string{"tenant-a"}}),
@@ -182,11 +191,11 @@ func TestSAProducerInvariant_Control_UngatedShapeIsCaught(t *testing.T) {
 // the seed's SA-credentialed dials as well as branch C. RED if the ServeWatcher
 // clause is reverted to "any ServeWatcher" or the stamp is dropped.
 func TestCohortSeedContext_IsNarrowedAndRegated(t *testing.T) {
-	refresherDeniedWatcher(t)
+	invCacheOn(t)
 	if cache.Global() == nil {
 		t.Fatalf("precondition: cache.Global() must be non-nil (cache-on) so WithServeWatcher attaches")
 	}
-	saEP, saRC := saLeakEndpointAndRC(t)
+	saEP, saRC := invSAEndpointAndRC(t)
 	cohort := seedTarget{BindingUID: "uid-cohort", Username: "cohort-rep", Groups: []string{"tenant-a"}}
 	ctx := withCohortSeedContext(context.Background(), cohort, saEP, saRC)
 

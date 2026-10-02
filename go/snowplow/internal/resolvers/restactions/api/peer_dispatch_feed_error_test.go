@@ -329,7 +329,9 @@ func pdfeResolveCached(t *testing.T, watcher *cache.ResourceWatcher, stage *temp
 		Filter:    ptr.To(".downstream"),
 	}
 	ctx := pdfeResolveCtx(pdfeAdminUser)
-	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid"})
+	// #427: the SA identity is exempt only when it IS the subject of the SA
+	// credential on the ctx (production shape: phase1SAUsername(saEP.Token)).
+	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid", Token: saRegateSAToken()})
 	return Resolve(ctx, ResolveOptions{
 		RC:                  &rest.Config{},
 		Items:               []*templates.API{stage, downstream},
@@ -390,7 +392,9 @@ func pdfeResolveOneGetByName(t *testing.T, watcher *cache.ResourceWatcher, ns, o
 		Filter:  ptr.To(".ref"),
 	}
 	ctx := pdfeResolveCtx(pdfeAdminUser)
-	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid"})
+	// #427: the SA identity is exempt only when it IS the subject of the SA
+	// credential on the ctx (production shape: phase1SAUsername(saEP.Token)).
+	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid", Token: saRegateSAToken()})
 	if outerKey != "" {
 		ctx = cache.WithL1KeyContext(ctx, outerKey)
 	}
@@ -639,7 +643,9 @@ func pdfeResolveInternalRC(t *testing.T, multiYield bool) map[string]any {
 	// feed-error path this Site exercises. The narrowing ALLOW/DENY behaviour
 	// itself is covered by internal_dispatch_sa_regate_test.go.)
 	ctx := pdfeResolveCtx("system:serviceaccount:krateo-system:snowplow")
-	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid"})
+	// #427: the SA identity is exempt only when it IS the subject of the SA
+	// credential on the ctx (production shape: phase1SAUsername(saEP.Token)).
+	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid", Token: saRegateSAToken()})
 	ctx = cache.WithInternalRESTConfig(ctx, rc)
 	return Resolve(ctx, ResolveOptions{
 		RC:                  &rest.Config{},

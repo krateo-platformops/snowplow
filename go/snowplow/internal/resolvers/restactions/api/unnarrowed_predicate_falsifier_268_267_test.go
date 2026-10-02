@@ -15,8 +15,8 @@
 //     drops the real-user narrowing.
 //   - a genuinely identity-free ctx (no UserInfo)         → serveUnnarrowed==true
 //     (clause c) — the legitimate identity-free populate.
-//   - a canonical ServiceAccount username                 → serveUnnarrowed==true
-//     (clause d).
+//   - snowplow's OWN SA identity (subject of the ctx SA token) → serveUnnarrowed==true
+//     (clause d); a canonical SA username without that credential → narrowed (#427).
 //   - a GROUP-ONLY end-user (empty Username, groups set)  → serveUnnarrowed==false
 //     (RC2 — a group-only user is a REAL end-user, NOT exempt).
 //
@@ -29,7 +29,9 @@ import (
 	"testing"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 func TestUnnarrowedPredicate_ArmE_UserInfoResidual(t *testing.T) {
@@ -50,13 +52,19 @@ func TestUnnarrowedPredicate_ArmE_UserInfoResidual(t *testing.T) {
 	}
 	t.Logf("Arm E: identity-free ctx → serveUnnarrowed=true (clause c). GREEN.")
 
-	// (3) canonical ServiceAccount identity → clause (d) → un-narrowed.
+	// (3) snowplow's own SA identity (the subject of the SA credential on the ctx)
+	// → clause (d) → un-narrowed. Without that credential the canonical SA FORM
+	// alone narrows (#427).
 	saCtx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "system:serviceaccount:krateo-system:snowplow"}))
-	if got := internalDispatchServesUnnarrowed(saCtx); !got {
-		t.Fatalf("Arm E: a canonical SA username must serveUnnarrowed=true (clause d); got false.")
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: saRegateIdentity}))
+	if got := internalDispatchServesUnnarrowed(saCtx); got {
+		t.Fatalf("Arm E (#427): a canonical SA username with NO SA credential on the ctx must narrow; got serveUnnarrowed=true.")
 	}
-	t.Logf("Arm E: canonical SA identity → serveUnnarrowed=true (clause d). GREEN.")
+	saCtx = cache.WithInternalEndpoint(saCtx, &endpoints.Endpoint{Token: saRegateSAToken()})
+	if got := internalDispatchServesUnnarrowed(saCtx); !got {
+		t.Fatalf("Arm E: snowplow's own SA identity must serveUnnarrowed=true (clause d); got false.")
+	}
+	t.Logf("Arm E: snowplow SA identity → serveUnnarrowed=true (clause d); bare SA form → narrowed. GREEN.")
 
 	// (4) group-only end-user (empty Username, non-empty Groups) → NARROWED (RC2).
 	// Exempting on Username=="" would re-open the leak for group-only identities.
