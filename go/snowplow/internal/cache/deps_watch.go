@@ -185,6 +185,11 @@ func (w *depWatch) q() workqueue.TypedRateLimitingInterface[depEventKey] {
 // its lifetime is the process lifetime. The queue is built HERE, on the
 // first real event, so that reading the bridge (stats, expvar, the OTLP
 // mirror) never creates the thing it measures.
+//
+// startOnce is ALSO the stop guard (#393): the test-only stopWorker consumes
+// it before it Waits, so a startWorker that has not run by then never runs —
+// no workerWG.Add can follow the Wait. In production stopWorker is never
+// called, so the first event always wins the Once and behaviour is unchanged.
 func (w *depWatch) startWorker() {
 	w.startOnce.Do(func() {
 		w.queue.Store(newDepQueue())
@@ -323,14 +328,34 @@ func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey, source str
 	// same-coordinate submits across sources, so this is the only place "which
 	// mechanism submits the most events" is soundly answerable.
 	Deps().recordSubmitSource(source)
-	w.q().Add(k)
+	q := w.q()
+	if q == nil {
+		// Only reachable after the test-only stopWorker consumed startOnce
+		// before any event built the queue (#393): the bridge is stopped, so
+		// the event is dropped — what an Add onto the shut-down queue does.
+		// In production startWorker above always builds the queue.
+		return
+	}
+	q.Add(k)
 }
 
 // stopWorker shuts the queue down, lets the worker drain what is already
 // queued, and blocks until the goroutine has exited. Coordinates still
 // waiting in the rate limiter's delay are dropped. Used by the _test.go
 // shim; production code MUST NOT call it.
+//
+// #393: it first consumes startOnce. sync.Once returns from every Do only
+// after the winning call's function has finished, so either (a) a concurrent
+// startWorker already won — its queue.Store and workerWG.Add(1) happen-before
+// this Do returns, so the queue is visible below and the Add is ordered
+// before the Wait — or (b) this call wins with a no-op and no later
+// startWorker can ever Add. Without this, an informer event racing teardown
+// either Added concurrently with the Wait (the -race report), started a
+// worker AFTER the Wait returned (a leaked goroutine processing the event
+// the caller meant to lose), or Added between the nil q() load and the Wait
+// (Wait blocked forever on a queue nobody shut down).
 func (w *depWatch) stopWorker() {
+	w.startOnce.Do(func() {})
 	if q := w.q(); q != nil {
 		q.ShutDownWithDrain()
 	}
