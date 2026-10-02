@@ -218,6 +218,11 @@ func onBindingUpdate(oldObj, newObj interface{}) {
 		recordPendingSubGenBumps(newSide.subjects, bumpSrcBindingUpdate) // #118 (c)-v2 GAP-2 / #260 source — NEW subjects gained it (deduped per subject in the pending set; the key only needs to change once)
 	}
 	recordBindingUpdateNoop(oldSide, newSide)
+	// #258: content-classify WIDENING (gained subjects / roleRef change) and OR
+	// the bumpSrcWiden TAG onto those subjects so the reseed does a per-subject
+	// scoped walk. A pure re-delivery (same subjects, same roleRef) tags nothing
+	// → stays NON-widening → snapshot re-key (the #253 relist-storm shape).
+	recordBindingUpdateWidening(oldSide, newSide)
 }
 
 // onBindingDelete unrols a removed (Cluster)RoleBinding. Unwraps a
@@ -392,7 +397,18 @@ func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name strin
 		// recordPendingSubGenBumps takes a DIFFERENT lock (pendingSubGenBumps.mu)
 		// and never acquires idx.mu, so calling it while holding idx.mu here
 		// introduces no lock-ordering cycle. Deferred to publish per §3.2.
-		recordPendingSubGenBumps(subjects, source) // #260 role source (add/update/delete from the informer event kind)
+		recSource := source
+		if source == bumpSrcRoleUpdate {
+			// #258: a role UPDATE that reached here is NOT a semantic-noop (onRoleUpdated
+			// gates those out via skipBump — role_semantic_noop_updates_total), so it is
+			// a real rule change. We cannot cheaply tell broadened from narrowed, so fail
+			// toward WARM: OR the bumpSrcWiden TAG so the reseed does a per-subject scoped
+			// walk (new rules may expose new GVRs/namespaces). The #260 metric is
+			// unaffected — the source bits are untouched; countSubGenBumpSources ignores
+			// the tag. roleAdd is already widening (mask); roleDelete stays narrowing.
+			recSource |= bumpSrcWiden
+		}
+		recordPendingSubGenBumps(subjects, recSource) // #260 role source (add/update/delete from the informer event kind); +#258 widen tag on real updates
 	}
 }
 

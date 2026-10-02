@@ -484,7 +484,7 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 			t.Errorf("#375 arm-9 RED: accepted %s on a NIL-sink ctx remarked %d times, want 1", m.Name, got)
 		}
 	}
-	for _, must := range []string{"PutIfGen", "ReplaceIfGen", "PutRAFullListIfGen"} {
+	for _, must := range []string{"PutIfGen", "ReplaceIfGen", "PutRAFullListIfGen", "ReplaceIfGenReMint"} {
 		found := false
 		for _, n := range covered {
 			found = found || n == must

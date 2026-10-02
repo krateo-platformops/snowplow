@@ -499,13 +499,17 @@ type ResolvedKeyInputs struct {
 	// counter → this term changes → new key → cold miss → fresh resolve → fresh
 	// UAF refilter. Blast radius = only users whose own bindings changed (herd-
 	// proportional; survives the 50K install storm that global RBACGen dies in).
-	// Stamped on the DISPATCH path (dispatchCacheLookupKey → helpers.go, for
-	// dispatch/subscription) from the RBACSubGenForSubject reader. The SEED does
-	// NOT stamp it (the identity-bound seed Put writes RBACSubGen==0): #118
-	// (c)-v2 GAP-3 de-scoped this as a #42-class seed-reachability perf gap
-	// (dispatch key stays correct — a warm-miss for a moved-sub-gen subject, not
-	// an authz-staleness bug), ticketed separately. UNLIKE HasUAF this IS folded
-	// into ComputeKey → resolvedKeyVersion (v4→v5→v6 across (c) and (c)-v2).
+	// Stamped by dispatchCacheLookupKey (helpers.go) from the RBACSubGenForSubject
+	// reader for EVERY caller that derives a key through it — the dispatch /
+	// subscription serve path AND the seed (seedOneRestaction / seedOneWidget
+	// derive their Put key with dispatchCacheLookupKey under the cohort identity),
+	// so a seed cell's key equals the serve key: there is no RBACSubGen==0 seed
+	// class. What #118 (c)-v2 GAP-3 left open was REACHABILITY, not keying: after
+	// a rotation moves a subject's sub-gen, its new key is cold until something
+	// re-seeds it. #258 closes that edge: the RBAC-shift hook (flushPendingSubGenBumps
+	// → notifyRBACShift) re-seeds the rotated subjects' resident cohorts under
+	// their new sub-gen. UNLIKE HasUAF this IS folded into ComputeKey →
+	// resolvedKeyVersion (v4→v5→v6 across (c) and (c)-v2).
 	RBACSubGen uint64
 
 	// AtRiskClass — #261 serve-time-detector MARK-AT-MINT. Computed by
@@ -1363,7 +1367,8 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	// the tombstone's gen (and putCoreLocked drops the tombstone). Plain Put is
 	// the DOCUMENTED-SAFE / exempt carriers (boot seed, external-TTL) that cannot
 	// resurrect a raced DELETE; the request-path carriers use PutIfGen.
-	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key))
+	// Plain Put is never a re-mint (no ctx, exempt carriers) → freshMint=false.
+	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key), false)
 }
 
 // PutThenRemark is a plain Put followed by the #375 PUT-THEN-REMARK check
@@ -1414,7 +1419,7 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 	// the "next real Put" a suppression waits for). Only on ACCEPT — a refused
 	// Put populated nothing, so its key's suppression marker must stand.
 	clearRefreshSuppression(key)
-	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen)
+	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
 	c.mu.Unlock()
 	// #375 (option c) — ACCEPTED gen-guarded Put: after RELEASING c.mu (EnqueueRefresh
 	// must never run under the store lock), PUT-THEN-REMARK — remark this key once if any
@@ -1449,7 +1454,60 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 		return false
 	}
 	clearRefreshSuppression(key)
-	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen)
+	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
+	c.mu.Unlock()
+	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
+	Deps().remarkIfDepsMoved(ctx, key)
+	return true
+}
+
+// ReplaceIfGenReMint is the #258/#378 re-mint variant of ReplaceIfGen: a
+// gen-guarded REPLACE of a LIVE cell that RESETS BornAt (a fresh birth). It is the
+// SOLE freshMint=true carrier — ordinary refresh / keepwarm / seed / serve Puts
+// (Put/PutIfGen/ReplaceIfGen pass freshMint=false, hardcoded) can NEVER reset the
+// max-age clock, so the C5 / #259 anchor holds by construction; the single-setter
+// audit is a static grep of ReplaceIfGenReMint callers (expected: exactly one, the
+// reseed core).
+//
+// ARCHITECTURAL INVARIANT (arch C5 condition a — load-bearing): the re-mint TARGET
+// Put MUST be THIS explicit call from the reseed core, via resolve-to-bytes-THEN-
+// Put; it MUST NOT be routed through the resolve pipeline's generic PutIfGen.
+// Nested Puts during a re-mint resolve go through the generic (freshMint=false)
+// methods, so freshMint can never reach a nested cell — that is exactly what makes
+// a key-scoped ctx marker unnecessary (arch dropped it). If a future change routes
+// the target Put through the pipeline, this invariant breaks and a key-scoped
+// fresh-mint marker (or equivalent) must return.
+//
+// Resolve-FIRST-then-atomic-replace: the old cell keeps serving until this replace
+// lands (no evict, no cold-nav window). Refuses on absent / gen-moved exactly like
+// ReplaceIfGen (the aging cell was evicted or re-inserted meanwhile). The caller
+// MUST handle a false return by RE-ENQUEUEING — it lost the gen race to a
+// concurrent customer Put and the cell is still past-cap (arch C5 condition e).
+//
+// #375 (arch C5 condition f): like PutIfGen / ReplaceIfGen, this gen-guarded Put
+// takes the resolve ctx and, on ACCEPT, runs #375's PUT-THEN-REMARK off-lock
+// (remarkIfDepsMoved) against the per-resolve dep-gen sink the seed installed at
+// its resolve entry. ctx is the #375 dep-sink carrier ONLY — it never selects
+// freshMint (the dropped fresh-mint marker stays dropped). #375's arm-9 reflective
+// enumeration of the gen-guarded Put methods covers this one.
+// Returns true iff stored.
+func (c *ResolvedCacheStore) ReplaceIfGenReMint(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+	if c == nil || entry == nil {
+		return false
+	}
+	bytes, extrasHash := c.putPreamble(entry)
+
+	c.mu.Lock()
+	el, live := c.index[key]
+	if !live || el.Value.(*lruItem).gen != capturedGen {
+		c.putRefusedGenerationMovedTotal.Add(1)
+		c.mu.Unlock()
+		return false
+	}
+	clearRefreshSuppression(key)
+	// freshMint=true is INHERENT to the re-mint method (not computed from ctx): a
+	// fresh birth on the same-key REPLACE resets the max-age clock.
+	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, true)
 	c.mu.Unlock()
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
@@ -1564,7 +1622,13 @@ func (c *ResolvedCacheStore) putPreamble(entry *ResolvedEntry) (bytes int64, ext
 // per-key generation (item.gen = gen) in BOTH branches (#189) and dropping any
 // tombstone for key (a live entry supersedes its tombstone). Callers MUST hold
 // c.mu; bytes/extrasHash are from putPreamble.
-func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, bytes int64, extrasHash string, gen uint64) {
+// freshMint (#258/#378 re-mint): when true, a replace-in-place Put RESETS BornAt
+// (fresh birth) instead of inheriting the prior entry's BornAt. It is a hardcoded
+// constant per entry point: ReplaceIfGenReMint passes true; Put, PutIfGen and
+// ReplaceIfGen pass false (the ctx marker was dropped, arch C5). Only the re-mint
+// method reaches true (single-setter), so ordinary refresh/keepwarm/seed re-Puts
+// keep inheriting BornAt (the C5 / #259 max-age anchor is intact by construction).
+func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, bytes int64, extrasHash string, gen uint64, freshMint bool) {
 	// #189 — a live entry supersedes any tombstone for its key.
 	delete(c.tombstones, key)
 
@@ -1616,9 +1680,12 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		// 1.12.6 C5 — the lifetime clock belongs to the KEY, not the bytes:
 		// inherit the prior birth so a re-Put (refresher, keep-warm sweep,
 		// user traffic) extends the TTL but never the max age.
-		if old.entry != nil && !old.entry.BornAt.IsZero() {
+		if !freshMint && old.entry != nil && !old.entry.BornAt.IsZero() {
 			entry.BornAt = old.entry.BornAt
 		}
+		// freshMint re-mint (#258/#378): skip the inherit → entry.BornAt stays the
+		// fresh CreatedAt stamped in putPreamble → the replace-in-place is a FRESH
+		// birth (resets the max-age clock) without evicting first (no cold window).
 		old.entry = entry
 		old.bytes = bytes
 		// #247 — derived from entry, so it is re-stamped with entry. A
@@ -3073,6 +3140,47 @@ func (c *ResolvedCacheStore) DeleteForTest(key string) {
 		return
 	}
 	c.deleteForDep(key)
+}
+
+// KeysForTest returns a snapshot of all LIVE (non-tombstone) keys in the store.
+// Cross-package test-only enumeration seam — no production path walks the whole
+// index under the lock, so this exists only to let a test discover which cells a
+// resolve populated (e.g. the #258/#378 reseed nested-Put arm).
+func (c *ResolvedCacheStore) KeysForTest() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.index))
+	for k, el := range c.index {
+		if el.Value.(*lruItem).entry != nil {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// SetBornAtForTest overrides a live cell's BornAt (the max-age birth clock).
+// Cross-package test-only seam: pre-age a cell so a reseed / reaper arm can observe
+// whether a given write path RESETS the clock (fresh-mint) or INHERITS it. Returns
+// false if the key has no live entry.
+func (c *ResolvedCacheStore) SetBornAtForTest(key string, t time.Time) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.index[key]
+	if !ok {
+		return false
+	}
+	li := el.Value.(*lruItem)
+	if li.entry == nil {
+		return false
+	}
+	li.entry.BornAt = t
+	return true
 }
 
 // intFromEnv parses an env var as int with a default fallback. We

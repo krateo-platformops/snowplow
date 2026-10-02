@@ -683,6 +683,16 @@ type cacheHandle interface {
 	// carriers. Never refuses; re-marks the key once if a dep recorded on ctx's
 	// dep-gen sink moved since the resolve began.
 	PutThenRemark(ctx context.Context, key string, entry *cache.ResolvedEntry)
+	// #258/#378 — fresh-mint re-seed. ReplaceIfGenReMint REPLACES a live,
+	// gen-captured key and resets its BornAt to now, instead of inheriting the
+	// prior cell's BornAt the way the plain gen-guarded REPLACE does. It is the
+	// SOLE freshMint=true carrier and is reached only through seedTerminalPut in
+	// seedModeReMint (#378's same-key age re-mint). The #258 RBAC-shift reseed
+	// does NOT use it: the rotated subject's new-sub-gen key is absent, so its
+	// PutIfGen INSERT already gets a fresh BornAt. ctx is the #375 dep-gen sink
+	// (the seed's resCtx). Returns false (and writes nothing) if the key is absent
+	// or its generation moved since capture.
+	ReplaceIfGenReMint(ctx context.Context, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
 }
 
 // emitResolvedCacheLookup writes the per-request falsifier line per
