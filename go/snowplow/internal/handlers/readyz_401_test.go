@@ -1,6 +1,10 @@
-// readyz_401_test.go — #401: a boot whose service-account endpoint is missing
-// (no projected SA token, e.g. automountServiceAccountToken: false) must still
-// reach a readiness decision. Before #401, Phase1Warmup returned saErr without
+// readyz_401_test.go — #401: a boot whose service-account endpoint cannot be
+// built must still reach a readiness decision. In production this is reachable
+// with an EMPTY token file or a missing/unreadable ca.crt (an absent token makes
+// rest.InClusterConfig fail first, so the watcher is nil and main.go's safety
+// net flips). The arm points the token path at an absent file only as the
+// hermetic way to make dynamic.ServiceAccountEndpoint fail: the same error
+// branch. Before #401, Phase1Warmup returned saErr without
 // cache.MarkPhase1Done, and main.go's safety net does not flip when the cache is
 // on with a watcher, so /readyz stayed 503 forever.
 //

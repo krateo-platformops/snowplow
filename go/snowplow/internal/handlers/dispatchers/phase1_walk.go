@@ -329,13 +329,15 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			slog.Any("err", saErr),
 			slog.String("effect", "Phase 1 cannot resolve under SA identity; readiness is released "+
 				"Ready-DEGRADED with nothing prewarmed (lazy register-on-navigation still covers every GVR "+
-				"on first request). Check the pod's projected service-account token "+
-				"(automountServiceAccountToken / serviceAccountName)."),
+				"on first request). Check the projected service-account volume: the token "+
+				"file is empty or ca.crt is missing/unreadable."),
 		)
 		// #397: the stage this boot stopped at. #401: release readiness instead
-		// of leaving /readyz 503 forever (resilience invariant). The token is a
-		// kubelet-projected file present before the container starts, so a
-		// missing one is a misconfiguration, not a transient: no retry.
+		// of leaving /readyz 503 forever (resilience invariant). Reachable
+		// causes: an EMPTY token file or a missing/unreadable ca.crt (an absent
+		// token never gets here: rest.InClusterConfig fails first, the watcher
+		// is nil and main.go's safety net flips). Both are a broken projected
+		// volume, not a transient: no retry.
 		setPhase1Stage(phase1StageNoSAEndpoint)
 		releasePhase1BootAborted(phase1AbortNoSAEndpoint)
 		return saErr
