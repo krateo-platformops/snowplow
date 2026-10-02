@@ -80,7 +80,7 @@ func TestSeedResolveMemo_RBACKeyDivergence_DECISIVE(t *testing.T) {
 	if keyA == keyB {
 		t.Fatal("RED: production memo key COLLIDES across divergent-RBAC cohorts — identity is not folded into the key. This is the A→B leak. C-F4-4.")
 	}
-	prod.Store(keyA, pmaps.DeepCopyJSON(bodyA), nil)
+	prod.Store(keyA, pmaps.DeepCopyJSON(bodyA), nil, DepGenEpochNow())
 	if _, _, ok := prod.Load(keyB); ok {
 		t.Fatal("RED: cohort B HIT cohort A's memo cell under the production (identity-folded) key — cross-user RBAC leak. C-F4-4.")
 	}
@@ -91,7 +91,7 @@ func TestSeedResolveMemo_RBACKeyDivergence_DECISIVE(t *testing.T) {
 		return raNS + "|" + raName + "|pp=0|p=0" // NO username/groups
 	}
 	leak := NewSeedResolveMemo(pmaps.DeepCopyJSON)
-	leak.Store(leakKey(), pmaps.DeepCopyJSON(bodyA), nil) // A resolves first
+	leak.Store(leakKey(), pmaps.DeepCopyJSON(bodyA), nil, DepGenEpochNow()) // A resolves first
 	got, _, ok := leak.Load(leakKey())                  // B "resolves" — same key
 	if !ok {
 		t.Fatal("harness broken: identity-less key should self-hit")
@@ -118,7 +118,7 @@ func TestSeedResolveMemo_CorrectnessByteIdentical(t *testing.T) {
 	body := filteredBody([]string{"comp-x", "comp-y"})
 	key := memo.Key("ns", "ra", "carol", []string{"g1", "g2"}, HashExtras(nil), 5, 1)
 
-	memo.Store(key, pmaps.DeepCopyJSON(body), nil)
+	memo.Store(key, pmaps.DeepCopyJSON(body), nil, DepGenEpochNow())
 	hit, _, ok := memo.Load(key)
 	if !ok {
 		t.Fatal("RED: expected memo HIT for the stored (RA, identity, page). C-F4-6.")
@@ -177,7 +177,7 @@ func TestSeedResolveMemo_Teardown_NoSurviveAcrossPass(t *testing.T) {
 		t.Fatal("premise broken: pass-1 ctx should carry a memo")
 	}
 	k := m1.Key("ns", "ra", "u", nil, HashExtras(nil), 0, 0)
-	m1.Store(k, pmaps.DeepCopyJSON(filteredBody([]string{"leftover"})), nil)
+	m1.Store(k, pmaps.DeepCopyJSON(filteredBody([]string{"leftover"})), nil, DepGenEpochNow())
 
 	// Pass 2: a fresh base context (the previous pass returned; nothing
 	// references its memo). No memo installed ⇒ nil ⇒ the pass MUST resolve, not
@@ -197,7 +197,7 @@ func TestSeedResolveMemo_MissWhenAbsent(t *testing.T) {
 	if _, _, ok := nilMemo.Load("anything"); ok {
 		t.Fatal("RED: nil memo (no memo installed — the /call path) reported a HIT. C-F4-8.")
 	}
-	nilMemo.Store("anything", map[string]any{"x": 1}, nil) // must not panic
+	nilMemo.Store("anything", map[string]any{"x": 1}, nil, 0) // must not panic
 	h, mi := nilMemo.Stats()
 	if h != 0 || mi != 0 {
 		t.Fatalf("RED: nil memo Stats non-zero (%d/%d).", h, mi)
@@ -258,7 +258,7 @@ func TestSeedResolveMemo_JSONNativeConcurrent_Race(t *testing.T) {
 							t.Errorf("RED: concurrent memo hit corrupted: got %s", got)
 						}
 					} else {
-						memo.Store(key, pmaps.DeepCopyJSON(body), nil)
+						memo.Store(key, pmaps.DeepCopyJSON(body), nil, DepGenEpochNow())
 					}
 				}()
 			}

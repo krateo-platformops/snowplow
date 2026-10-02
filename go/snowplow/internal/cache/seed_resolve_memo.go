@@ -74,9 +74,19 @@ var ctxKeySeedResolveMemo = ctxKeySeedResolveMemoType{}
 // [C-lifetime] the struct lives in the SeedResolveMemo = seed-pass lifetime;
 // it is never promoted into the L1 store, so the captured Deps cannot outlive
 // the pass or cross into a user /call.
+//
+// [#411] Stamp is the dep-event seq (depEventSeq, #375) the body is fresh AS OF:
+// the PRODUCER resolve's entry epoch (its dep-gen sink startSeq), the
+// conservative choice — every read the body folds happened at or after it, so a
+// dep event at seq <= Stamp is already reflected in Body, and one at seq > Stamp
+// may not be. Load treats the entry as STALE (a miss) when any of Deps moved
+// past Stamp. The struct is immutable once stored: a fresher producer REPLACES
+// the pointer (Store), it never mutates one in place, so a concurrent Load reads
+// a consistent (Body, Deps, Stamp) triple without a lock.
 type seedMemoValue struct {
-	Body map[string]any
-	Deps []DepKey
+	Body  map[string]any
+	Deps  []DepKey
+	Stamp uint64
 }
 
 // SeedResolveMemo memoizes the resolved output of a heavy RESTAction across the
@@ -91,7 +101,7 @@ type seedMemoValue struct {
 // Store (and the memo deep-copies again on Load) so stored bodies are never
 // aliased or mutated.
 type SeedResolveMemo struct {
-	m    sync.Map // key string -> *seedMemoValue (JSON-native body, caller-deep-copied, + captured deps)
+	m sync.Map // key string -> *seedMemoValue (JSON-native body, caller-deep-copied, + captured deps)
 	// copyFn deep-copies a stored JSON-native map on Load so no two callers
 	// alias the stored value. Injected by the installer (apiref/widgets seam
 	// owns plumbing/maps.DeepCopyJSON; keeping the dep out of the cache package
@@ -101,7 +111,11 @@ type SeedResolveMemo struct {
 
 	hits   uint64
 	misses uint64
-	mu     sync.Mutex // guards hits/misses (diagnostic counters only)
+	// staleMisses counts the #411 hits-turned-misses: a key WAS present but a
+	// captured dep moved past the entry's Stamp, so the caller resolved fresh.
+	// Also counted in misses (a stale entry is a miss to the caller).
+	staleMisses uint64
+	mu          sync.Mutex // guards hits/misses/staleMisses (diagnostic counters only)
 }
 
 // seedResolveMemoKey canonicalizes the memo key. The identity component is the
@@ -153,11 +167,23 @@ func sortStrings(s []string) {
 }
 
 // Load returns the memoized resolved body for the key and true on a hit, or
-// (nil, false) on a miss. On a hit the returned map is a FRESH deep copy (via
-// the injected copyFn) so the caller may mutate/consume it without corrupting
-// the stored snapshot or aliasing a sibling caller. nil-receiver-safe:
-// (nil).Load is always a miss so a call site with no memo installed behaves as
-// "always resolve".
+// (nil, nil, false) on a miss. On a hit the returned map is a FRESH deep copy
+// (via the injected copyFn) so the caller may mutate/consume it without
+// corrupting the stored snapshot or aliasing a sibling caller. nil-receiver-
+// safe: (nil).Load is always a miss so a call site with no memo installed
+// behaves as "always resolve".
+//
+// #411 — FAIL SAFE TOWARD FRESHNESS. A present entry is served ONLY if none of
+// its captured deps saw a dep event after the entry's Stamp (the producer's
+// entry epoch): the SAME per-bucket lastBumpSeq / per-GVR floor test #375's
+// accepted-Put check uses (DepTracker.depMovedSince — no new map). A dep that
+// moved after the body was produced but BEFORE the hitting resolve's own entry
+// is invisible to the hitter's #375 Put-check (its bump is < the hitter's
+// startSeq), so without this check the hitter would Put the pre-move body as
+// fresh. A moved dep turns the hit into a MISS: the caller resolves fresh and
+// its Store REPLACES this entry with a later Stamp, so later siblings hit the
+// fresh body again (no cascade of re-resolves). Lock-free: the value is
+// immutable and the seq reads are atomics.
 func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, bool) {
 	if mo == nil {
 		return nil, nil, false
@@ -170,6 +196,13 @@ func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, bool) {
 		return nil, nil, false
 	}
 	val, _ := v.(*seedMemoValue)
+	if val != nil && seedMemoDepsMovedSince(val.Deps, val.Stamp) {
+		mo.mu.Lock()
+		mo.misses++
+		mo.staleMisses++
+		mo.mu.Unlock()
+		return nil, nil, false
+	}
 	mo.mu.Lock()
 	mo.hits++
 	mo.mu.Unlock()
@@ -185,17 +218,64 @@ func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, bool) {
 	return mo.copyFn(val.Body), deps, true
 }
 
-// Store records a JSON-native, caller-deep-copied resolved body under key. The
-// caller MUST deep-copy (plumbing/maps.DeepCopyJSON) before Store so the stored
-// snapshot is not aliased by the caller's live result. LoadOrStore semantics:
-// the FIRST writer wins; a concurrent second resolve of the same tuple discards
-// its (byte-identical) body. nil-receiver-safe (no-op) so an uninstalled call
-// site never stores.
-func (mo *SeedResolveMemo) Store(key string, snapshot map[string]any, deps []DepKey) {
+// seedMemoDepsMovedSince reports whether any dep saw a dep event after stamp,
+// through the process DepTracker's #375 generation (bucket lastBumpSeq, or the
+// per-GVR floor for a coordinate with no bucket). nil tracker ⇒ false.
+func seedMemoDepsMovedSince(deps []DepKey, stamp uint64) bool {
+	d := Deps()
+	if d == nil {
+		return false
+	}
+	for _, dk := range deps {
+		if d.depMovedSince(dk, stamp) {
+			return true
+		}
+	}
+	return false
+}
+
+// Store records a JSON-native, caller-deep-copied resolved body under key,
+// fresh as of stamp (#411: the producer resolve's entry epoch —
+// cache.DepGenStartSeqFromContext, or DepGenEpochNow taken before the
+// producer's first read). The caller MUST deep-copy (plumbing/maps.DeepCopyJSON)
+// before Store so the stored snapshot is not aliased by the caller's live
+// result. Replacement is MONOTONE in stamp: an entry is replaced only by one
+// with a strictly later stamp (the fresh resolve that a stale hit turned into a
+// miss); an equal-or-older concurrent producer of the same tuple discards its
+// body (first-writer-wins among same-epoch producers, as before #411). A
+// later-stamped producer can therefore never be overwritten by an older one
+// racing it. nil-receiver-safe (no-op) so an uninstalled call site never stores.
+func (mo *SeedResolveMemo) Store(key string, snapshot map[string]any, deps []DepKey, stamp uint64) {
 	if mo == nil {
 		return
 	}
-	mo.m.LoadOrStore(key, &seedMemoValue{Body: snapshot, Deps: deps})
+	nv := &seedMemoValue{Body: snapshot, Deps: deps, Stamp: stamp}
+	for {
+		cur, loaded := mo.m.LoadOrStore(key, nv)
+		if !loaded {
+			return
+		}
+		cv, _ := cur.(*seedMemoValue)
+		if cv != nil && cv.Stamp >= stamp {
+			return // an equal-or-fresher body is already memoised
+		}
+		if mo.m.CompareAndSwap(key, cur, nv) {
+			return
+		}
+		// Lost a race with another Store; re-read and re-decide.
+	}
+}
+
+// StaleMisses returns how many lookups found an entry whose captured deps had
+// moved past its stamp and therefore resolved fresh (#411). Diagnostic;
+// nil-receiver-safe. Each is also counted in Stats' misses.
+func (mo *SeedResolveMemo) StaleMisses() uint64 {
+	if mo == nil {
+		return 0
+	}
+	mo.mu.Lock()
+	defer mo.mu.Unlock()
+	return mo.staleMisses
 }
 
 // Stats returns the memo's hit/miss counters (diagnostic — feeds the

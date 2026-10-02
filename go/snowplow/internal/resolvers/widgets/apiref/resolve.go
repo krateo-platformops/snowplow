@@ -110,6 +110,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		return map[string]any{}, nil
 	}
 
+	// #411 — the dep-event epoch this resolve's body is fresh AS OF, taken
+	// BEFORE the first read (the RESTAction fetch below). It stamps a memo entry
+	// this resolve produces. The enclosing resolve's dep-gen sink startSeq
+	// (the widget resolve's entry, #375) is earlier still and preferred — the
+	// conservative choice; the local epoch is the fallback for a ctx with no sink.
+	memoStamp, ok := cache.DepGenStartSeqFromContext(ctx)
+	if !ok {
+		memoStamp = cache.DepGenEpochNow()
+	}
+
 	res := objects.Get(ctx, opts.ApiRef)
 	if res.Err != nil {
 		// Task #272 / 0.30.251 — error-type preservation. Pre-fix,
@@ -250,6 +260,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		username, groups := identityForMemo(ctx)
 		memoKey = memo.Key(opts.ApiRef.Namespace, opts.ApiRef.Name,
 			username, groups, cache.HashExtras(opts.Extras), opts.PerPage, opts.Page)
+		// #411: Load serves the entry only if none of its captured deps moved
+		// since the entry's stamp (the producer's entry epoch). A dep that moved
+		// after the body was produced but before THIS resolve's entry is
+		// invisible to this resolve's own #375 Put-check, so a stale entry is a
+		// MISS here: fall through, resolve fresh, and storeMemo replaces it.
 		if body, deps, ok := memo.Load(memoKey); ok {
 			// #277 / edge-3: replay the deps captured when this body was first
 			// produced onto THIS widget's L1 key, so a memo-served widget cell
@@ -281,7 +296,19 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			return
 		}
 		deps := cache.Deps().EndCapture(l1Key, capBuf)
-		memo.Store(memoKey, pmaps.DeepCopyJSON(out), deps)
+		// #411: the RESTAction CR is the body's first dep, but objects.Get
+		// Records it under l1Key BEFORE the capture opens, so on the
+		// unpaginated path (real restactions.Resolve, no raKey edge replay) it
+		// is missing from the capture. Fold it in so an RA edit after this
+		// production turns a sibling's hit into a miss. Replaying it onto a
+		// hitter's key is idempotent: the hitter's own objects.Get Recorded it.
+		if res.Unstructured != nil {
+			raDep := cache.DepKey{GVR: res.GVR, Namespace: res.Unstructured.GetNamespace(), Name: res.Unstructured.GetName()}
+			if !containsDep(deps, raDep) {
+				deps = append(deps, raDep)
+			}
+		}
+		memo.Store(memoKey, pmaps.DeepCopyJSON(out), deps, memoStamp)
 	}
 
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef
@@ -322,4 +349,14 @@ func identityForMemo(ctx context.Context) (string, []string) {
 		return "", nil
 	}
 	return ui.Username, ui.Groups
+}
+
+// containsDep reports whether deps already holds dk.
+func containsDep(deps []cache.DepKey, dk cache.DepKey) bool {
+	for _, d := range deps {
+		if d == dk {
+			return true
+		}
+	}
+	return false
 }

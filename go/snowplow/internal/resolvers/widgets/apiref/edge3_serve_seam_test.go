@@ -470,7 +470,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 		t.Fatalf("F-C1b RED: captured deps do not contain the backing edge (edge-3): %v", deps)
 	}
 	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, cache.HashExtras(nil), 5, 1)
-	memo.Store(memoKey, pmaps.DeepCopyJSON(served1), deps)
+	memo.Store(memoKey, pmaps.DeepCopyJSON(served1), deps, cache.DepGenEpochNow())
 	store.Put(w1Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, served1), Inputs: edge3WidgetInputs("w1")})
 
 	// w2: memo HIT → replay the captured deps under w2's key (B3).
@@ -527,7 +527,7 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 	depsFS := d.EndCapture(wfsKey, capBuf)
 	store.Put(wfsKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, gotFS), Inputs: edge3WidgetInputs("fs")})
 	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, cache.HashExtras(nil), 5, 1)
-	memo.Store(memoKey, pmaps.DeepCopyJSON(gotFS), depsFS)
+	memo.Store(memoKey, pmaps.DeepCopyJSON(gotFS), depsFS, cache.DepGenEpochNow())
 
 	// Carrier 2 — 4a FAST-PATH HIT (page 2). edge-3 via C2's replay in the hit
 	// branch.
