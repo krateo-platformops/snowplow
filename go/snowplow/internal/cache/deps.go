@@ -729,12 +729,16 @@ type DepTracker struct {
 
 	// #408 — moved remarks: PUT-THEN-REMARKs fired because a dep the resolve recorded
 	// moved during it (reasons "moved" and "moved_after_put"; the nil-sink drift is
-	// unguardedPutTotal). movedRemarkTotal counts all of them; movedRemarkBootTotal the
-	// subset from the pre-readyz boot carrier (PutThenRemark), so the boot remark cost
-	// can be read in production. Each is one refresher enqueue. A DIAGNOSTIC (zero
-	// is health), on expvar snowplow_deps + OTLP snowplow_deps_moved_remark_total{carrier}.
-	movedRemarkTotal     atomic.Uint64
-	movedRemarkBootTotal atomic.Uint64
+	// unguardedPutTotal), one atomic PER CARRIER: movedRemarkBootTotal for the pre-readyz
+	// boot carrier (PutThenRemark), movedRemarkGuardedTotal for the IfGen methods. Each
+	// remark bumps exactly one of them, so each OTLP series (an ObservableCounter) is
+	// monotonic on its own; the total is DERIVED as guarded + boot, never the reverse (a
+	// total-first derivation of guarded could over-read between two increments and then
+	// decrease, which a backend reads as a counter reset). Each remark is one refresher
+	// enqueue. A DIAGNOSTIC (zero is health), on expvar snowplow_deps + OTLP
+	// snowplow_deps_moved_remark_total{carrier}.
+	movedRemarkGuardedTotal atomic.Uint64
+	movedRemarkBootTotal    atomic.Uint64
 
 	// #375 (option c, fix ii — TL ruling) — per-GVR floor: the depEventSeq of the LAST
 	// OnObjectEvent on ANY coordinate of the GVR (gvr -> *atomic.Uint64). bumpCoordinateGen
@@ -1166,10 +1170,11 @@ func (d *DepTracker) remarkIfDepsMoved(ctx context.Context, l1Key string) {
 // noteMovedRemark counts one moved remark (#408), attributed to the boot carrier
 // when boot is set.
 func (d *DepTracker) noteMovedRemark(boot bool) {
-	d.movedRemarkTotal.Add(1)
 	if boot {
 		d.movedRemarkBootTotal.Add(1)
+		return
 	}
+	d.movedRemarkGuardedTotal.Add(1)
 }
 
 // remarkIfDepsMovedFrom is remarkIfDepsMoved with the carrier recorded: boot is true for
@@ -2195,7 +2200,7 @@ func (d *DepTracker) Stats() DepStats {
 	if d == nil {
 		return DepStats{}
 	}
-	return DepStats{
+	s := DepStats{
 		TotalRecords:                 d.totalRecords.Load(),
 		MaxRecords:                   d.maxRecords,
 		Coordinates:                  d.coordinates.Load(),
@@ -2210,10 +2215,10 @@ func (d *DepTracker) Stats() DepStats {
 		OnObjectEventDegradedNoEvict: d.onObjectEventDegradedNoEvict.Load(),
 		RemoveL1Total:                d.removeL1Total.Load(),
 		UnguardedPutTotal:            d.unguardedPutTotal.Load(),
-		// boot loaded before total (see MovedRemarkTotals): total >= boot in the snapshot.
-		MovedRemarkBootTotal: d.movedRemarkBootTotal.Load(),
-		MovedRemarkTotal:     d.movedRemarkTotal.Load(),
 	}
+	guarded, boot := d.movedRemarkGuardedTotal.Load(), d.movedRemarkBootTotal.Load()
+	s.MovedRemarkTotal, s.MovedRemarkBootTotal = guarded+boot, boot
+	return s
 }
 
 // UnguardedPutTotal is the #375 (B) DETECTOR accessor: the number of ACCEPTED
@@ -2227,15 +2232,20 @@ func UnguardedPutTotal() uint64 {
 	return Deps().unguardedPutTotal.Load()
 }
 
-// MovedRemarkTotals returns the #408 moved-remark counters: all carriers, and the
-// pre-readyz boot carrier's subset. Published on expvar (snowplow_deps.moved_remark_total,
-// .moved_remark_boot_total) and OTLP (snowplow_deps_moved_remark_total{carrier}).
-func MovedRemarkTotals() (total, boot uint64) {
+// MovedRemarkByCarrier returns the #408 moved-remark counters per carrier: guarded (the
+// IfGen methods) and boot (the pre-readyz boot plain Put, PutThenRemark). Each is its own
+// monotonic atomic, so the OTLP series snowplow_deps_moved_remark_total{carrier} it feeds
+// never decrease between scrapes. expvar publishes moved_remark_total (= guarded + boot)
+// and moved_remark_boot_total.
+func MovedRemarkByCarrier() (guarded, boot uint64) {
 	d := Deps()
-	// Boot first: noteMovedRemark bumps total before boot, so reading boot first keeps
-	// total >= boot in the returned pair (the guarded share total-boot never underflows).
-	boot = d.movedRemarkBootTotal.Load()
-	return d.movedRemarkTotal.Load(), boot
+	return d.movedRemarkGuardedTotal.Load(), d.movedRemarkBootTotal.Load()
+}
+
+// MovedRemarkTotals returns all moved remarks (guarded + boot) and the boot subset.
+func MovedRemarkTotals() (total, boot uint64) {
+	guarded, boot := MovedRemarkByCarrier()
+	return guarded + boot, boot
 }
 
 // resetDepsForTest tears the singleton down so each test sees a clean

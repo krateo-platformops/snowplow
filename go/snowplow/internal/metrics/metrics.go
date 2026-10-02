@@ -980,9 +980,11 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- #375: dep-generation guard detector (expected 0) ---
 		o.ObserveInt64(unguardedPutTotal, int64(cache.UnguardedPutTotal()))
 		// --- #408: moved remarks by carrier ---
-		movedTotal, movedBoot := cache.MovedRemarkTotals()
+		// Each carrier is its own monotonic atomic (never derived as total−boot), so neither
+		// ObservableCounter series can decrease between scrapes.
+		movedGuarded, movedBoot := cache.MovedRemarkByCarrier()
 		o.ObserveInt64(movedRemarkTotal, int64(movedBoot), metric.WithAttributes(attribute.String("carrier", "boot")))
-		o.ObserveInt64(movedRemarkTotal, int64(movedTotal-movedBoot), metric.WithAttributes(attribute.String("carrier", "guarded")))
+		o.ObserveInt64(movedRemarkTotal, int64(movedGuarded), metric.WithAttributes(attribute.String("carrier", "guarded")))
 
 		// --- #244: factory-built divergence age (bounded self-heal detector) ---
 		o.ObserveInt64(storeFactoryDivergenceAge, cache.FactoryDivergenceMaxAgeSeconds())
