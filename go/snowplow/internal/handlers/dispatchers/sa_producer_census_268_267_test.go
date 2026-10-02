@@ -46,8 +46,9 @@ import (
 //	cluster_list.go           — populateCtx (async cluster-scope populate): ServesUnnarrowed
 //	                            via no-UserInfo (identity-free Class-3 by-name collapse).
 //	phase1_walk.go            — withPhase1SAContext:          ServesUnnarrowed (ServeWatcher / canonical SA).
-//	phase1_pip_seed.go        — withCohortSeedContext:        ServesUnnarrowed (ServeWatcher); a REAL cohort
-//	                            identity, so ServeWatcher is the SOLE unnarrowed mechanism here.
+//	phase1_pip_seed.go        — withCohortSeedContext:        a REAL cohort identity (!ServesUnnarrowed since
+//	                            #425 — a ServeWatcher exempts only snowplow's own SA), made safe by the
+//	                            WithBackgroundResolve it stamps.
 //	phase1_content_prewarm.go — withContentPrewarmSAContext:  ServesUnnarrowed (ServeWatcher / canonical SA).
 //	resolve_populate.go       — the refresher rctx: a per-user REPRESENTATIVE identity (!ServesUnnarrowed),
 //	                            made safe by WithBackgroundResolve (resolveOnceProd:496). THE load-bearing case.

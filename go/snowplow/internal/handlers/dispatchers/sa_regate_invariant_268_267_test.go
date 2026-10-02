@@ -46,9 +46,9 @@ type saProducerCtx struct {
 	name  string
 	build func(saEP endpoints.Endpoint, saRC *rest.Config) context.Context
 	// unnarrowed records whether this producer is expected to be ServesUnnarrowed
-	// (true) or to rely on BackgroundResolve (false). All three callable builders
-	// are ServesUnnarrowed; the BackgroundResolve case is the refresher, covered by
-	// the step-4 arm (see the file header).
+	// (true) or to rely on BackgroundResolve (false). The Phase-1 walk and the
+	// content prewarm are ServesUnnarrowed (snowplow SA identity or none); the
+	// cohort seed (#425) and the refresher rely on BackgroundResolve.
 	unnarrowed bool
 }
 
@@ -70,11 +70,12 @@ func saProducerBuilders() []saProducerCtx {
 		},
 		{
 			// The SENSITIVE row: withCohortSeedContext installs a REAL cohort
-			// identity (non-SA), so ServeWatcher (cache-on) is its SOLE
-			// ServesUnnarrowed mechanism. Dropping it flips the invariant false
-			// (see TestCohortSeedContext_ServeWatcherIsSoleUnnarrowedMechanism).
+			// identity (non-SA), so it is NOT ServesUnnarrowed even with its
+			// ServeWatcher (#425 — that exemption served SA-fetched data under the
+			// cohort key). Its own WithBackgroundResolve stamp is what keeps the
+			// invariant (see TestCohortSeedContext_IsNarrowedAndRegated).
 			name:       "withCohortSeedContext",
-			unnarrowed: true,
+			unnarrowed: false,
 			build: func(saEP endpoints.Endpoint, saRC *rest.Config) context.Context {
 				cohort := seedTarget{BindingUID: "uid-cohort", Username: "cohort-rep", Groups: []string{"tenant-a"}}
 				return withCohortSeedContext(context.Background(), cohort, saEP, saRC)
@@ -126,6 +127,9 @@ func TestSAProducerContexts_SatisfyRegateInvariant(t *testing.T) {
 					"  MustRegateSADial would go false for it (BackgroundResolve && saCred && !ServesUnnarrowed), so an SA-served read under a real identity would NOT be re-gated — a leak.\n"+
 					"  Restore the ServeWatcher/canonical-SA identity, or set WithBackgroundResolve on this builder's ctx.", p.name)
 			}
+			if !p.unnarrowed && serves {
+				t.Errorf("%s: a REAL narrowing identity is classified ServesUnnarrowed — SA-fetched reads under it are served un-gated (#425).", p.name)
+			}
 			if p.unnarrowed && !serves {
 				t.Errorf("%s: architect-verified classification is ServesUnnarrowed, but ServesUnnarrowed(ctx)=false (invariant held only via BackgroundResolve=%v). Re-verify the classification and the sa_regate table.", p.name, bg)
 			}
@@ -170,30 +174,29 @@ func TestSAProducerInvariant_Control_UngatedShapeIsCaught(t *testing.T) {
 	}
 }
 
-// TestCohortSeedContext_ServeWatcherIsSoleUnnarrowedMechanism proves ServeWatcher
-// is LOAD-BEARING for withCohortSeedContext: cache-off (cache.Global()==nil, so the
-// nil-safe WithServeWatcher no-ops), the cohort ctx carries a REAL non-SA identity
-// and is therefore NOT ServesUnnarrowed. Production forbids a cache-off cohort seed
-// (the seed never runs cache-off — phase1_pip_seed.go), so this is only reachable as
-// a control; it is what makes the cache-on cohort row in
-// TestSAProducerContexts_SatisfyRegateInvariant sensitive to a dropped ServeWatcher.
-func TestCohortSeedContext_ServeWatcherIsSoleUnnarrowedMechanism(t *testing.T) {
-	prev := cache.Global()
-	cache.SetGlobal(nil)
-	t.Cleanup(func() { cache.SetGlobal(prev) })
-	if cache.Global() != nil {
-		t.Fatalf("precondition: cache.Global() must be nil for this cache-off control")
+// TestCohortSeedContext_IsNarrowedAndRegated (#425) proves the cohort seed ctx —
+// cache-on, so it DOES carry a ServeWatcher — is a narrowing subject: it is NOT
+// ServesUnnarrowed (the ServeWatcher exempts only snowplow's own SA identity), and
+// rbac.MustRegateSADial fires for it from the builder alone (its own
+// WithBackgroundResolve stamp), so objects.getFromAPIServer and branch E re-gate
+// the seed's SA-credentialed dials as well as branch C. RED if the ServeWatcher
+// clause is reverted to "any ServeWatcher" or the stamp is dropped.
+func TestCohortSeedContext_IsNarrowedAndRegated(t *testing.T) {
+	refresherDeniedWatcher(t)
+	if cache.Global() == nil {
+		t.Fatalf("precondition: cache.Global() must be non-nil (cache-on) so WithServeWatcher attaches")
 	}
-
 	saEP, saRC := saLeakEndpointAndRC(t)
 	cohort := seedTarget{BindingUID: "uid-cohort", Username: "cohort-rep", Groups: []string{"tenant-a"}}
 	ctx := withCohortSeedContext(context.Background(), cohort, saEP, saRC)
 
-	if _, ok := cache.ServeWatcherFromContext(ctx); ok {
-		t.Fatalf("cache-off: expected no ServeWatcher on the cohort ctx (WithServeWatcher(nil) should no-op)")
+	if _, ok := cache.ServeWatcherFromContext(ctx); !ok {
+		t.Fatalf("precondition: the cache-on cohort ctx must carry a ServeWatcher (else this arm cannot see the #425 clause)")
 	}
 	if rbac.ServesUnnarrowed(ctx) {
-		t.Fatalf("cache-off cohort ctx unexpectedly ServesUnnarrowed — the cache-on row would not be sensitive to a dropped ServeWatcher")
+		t.Fatalf("#425: the cohort seed ctx (REAL cohort identity) is ServesUnnarrowed — branch C would serve SA-fetched data un-gated and the seed would cache it under the cohort key")
 	}
-	t.Logf("cache-off cohort ctx: ServesUnnarrowed=false (ServeWatcher is the sole unnarrowed mechanism, as expected)")
+	if !rbac.MustRegateSADial(ctx) {
+		t.Fatalf("the cohort seed ctx is not re-gated at the SA dial sites — withCohortSeedContext must stamp WithBackgroundResolve")
+	}
 }

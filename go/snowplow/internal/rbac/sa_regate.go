@@ -4,7 +4,10 @@ import (
 	"context"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"k8s.io/client-go/rest"
 )
 
 // sa_regate.go — Part 2 (#268/#269, design §5): the ONE uniform guard for the
@@ -19,17 +22,25 @@ import (
 // maximal shell, re-narrowed at read). It is the single source of truth for the
 // predicate api.internalDispatchServesUnnarrowed also uses:
 //
-//	(a) a Phase-1 walk / cohort seed / content-prewarm (ServeWatcher on ctx);
+//	(a) a Phase-1 walk / content-prewarm (ServeWatcher on ctx) whose identity is
+//	    snowplow's OWN ServiceAccount, or absent (then (c) answers). A ServeWatcher
+//	    on its own exempts NOTHING (#425): the cohort seed (withCohortSeedContext)
+//	    carries one but resolves as the cohort REPRESENTATIVE, and an un-narrowed
+//	    serve there caches SA-fetched data under the cohort's key. Under a
+//	    ServeWatcher the identity must EQUAL the subject of the SA credential on
+//	    the ctx; any other identity narrows — including a different
+//	    ServiceAccount picked as a cohort representative
+//	    (cache.pickRepresentativeFromSubjects), which (d) would otherwise exempt;
 //	(b) an api-stage content-cell populate (WithApistageContentResolve);
-//	(c) a truly identity-free populate (no UserInfo — cluster_list async);
-//	(d) a canonical ServiceAccount username (the refresher's identity-free class).
+//	(c) a truly identity-free populate (no UserInfo — cluster_list async, or a
+//	    Phase-1 walk whose SA token carries no canonical subject);
+//	(d) outside a ServeWatcher ctx, a canonical ServiceAccount username (the
+//	    refresher's identity-free class).
 //
 // A REAL end-user — including the refresher's per-user-cohort REPRESENTATIVE
-// identity (non-SA Username) and a group-only user — returns FALSE (must narrow).
+// identity (non-SA Username), the cohort seed's representative, and a
+// group-only user — returns FALSE (must narrow).
 func ServesUnnarrowed(ctx context.Context) bool {
-	if _, ok := cache.ServeWatcherFromContext(ctx); ok {
-		return true
-	}
 	if cache.ApistageContentResolveFromContext(ctx) {
 		return true
 	}
@@ -37,10 +48,57 @@ func ServesUnnarrowed(ctx context.Context) bool {
 	if err != nil {
 		return true
 	}
+	if _, ok := cache.ServeWatcherFromContext(ctx); ok {
+		return isSnowplowSAIdentity(ctx, user.Username)
+	}
 	if IsServiceAccountUsername(user.Username) {
 		return true
 	}
 	return false
+}
+
+// isSnowplowSAIdentity reports whether username is the identity of the snowplow
+// ServiceAccount credential carried on ctx. The canonical source is the one the
+// Phase-1 builders install the identity from (dispatchers.phase1SAUsername): the
+// `sub` claim of the projected SA token in the ctx's internal endpoint, or of the
+// internal *rest.Config's bearer token when no endpoint token is present. No
+// literal names the SA. A ctx with no decodable SA credential has no snowplow-SA
+// identity to match, so the answer is false (narrow).
+func isSnowplowSAIdentity(ctx context.Context, username string) bool {
+	if !IsServiceAccountUsername(username) {
+		return false
+	}
+	sa, ok := snowplowSAUsernameFromContext(ctx)
+	return ok && sa == username
+}
+
+func snowplowSAUsernameFromContext(ctx context.Context) (string, bool) {
+	var token string
+	if v, ok := cache.InternalEndpointFromContext(ctx); ok {
+		switch ep := v.(type) {
+		case *endpoints.Endpoint:
+			if ep != nil {
+				token = ep.Token
+			}
+		case endpoints.Endpoint:
+			token = ep.Token
+		}
+	}
+	if token == "" {
+		if v, ok := cache.InternalRESTConfigFromContext(ctx); ok {
+			if rc, rcOK := v.(*rest.Config); rcOK && rc != nil {
+				token = rc.BearerToken
+			}
+		}
+	}
+	if token == "" {
+		return "", false
+	}
+	ui, err := jwtutil.ExtractUserInfo(token)
+	if err != nil || !IsServiceAccountUsername(ui.Username) {
+		return "", false
+	}
+	return ui.Username, true
 }
 
 // saCredentialOnContext reports whether the ctx carries a snowplow SA credential
