@@ -50,7 +50,7 @@ import (
 // GVR registered up front. No RA/backing objects are seeded — the stub
 // resolveRA supplies the data; the informers exist only so a replayed edge has
 // a live informer to fire from.
-func edge3NewWatcher(t *testing.T, seed ...runtime.Object) {
+func edge3NewWatcher(t *testing.T, seed ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
@@ -77,6 +77,7 @@ func edge3NewWatcher(t *testing.T, seed ...runtime.Object) {
 	}
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
+	return dyn
 }
 
 // edge3BackingGVR is the GVR of the objects the shared RESTAction LISTs —
@@ -469,13 +470,13 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 	if !edge3EdgesContainBacking(deps, backing) {
 		t.Fatalf("F-C1b RED: captured deps do not contain the backing edge (edge-3): %v", deps)
 	}
-	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, cache.HashExtras(nil), 5, 1)
-	memo.Store(memoKey, pmaps.DeepCopyJSON(served1), deps)
+	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, "", cache.HashExtras(nil), 5, 1)
+	memo.Store(memoKey, pmaps.DeepCopyJSON(served1), deps, cache.DepGenEpochNow())
 	store.Put(w1Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, served1), Inputs: edge3WidgetInputs("w1")})
 
 	// w2: memo HIT → replay the captured deps under w2's key (B3).
 	ctx2 := cache.WithL1KeyContext(base, w2Key)
-	body2, deps2, ok := memo.Load(memoKey)
+	body2, deps2, _, ok := memo.Load(memoKey)
 	if !ok {
 		t.Fatalf("harness broken: w2 memo load MISS under key %q", memoKey)
 	}
@@ -526,8 +527,8 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 	}
 	depsFS := d.EndCapture(wfsKey, capBuf)
 	store.Put(wfsKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, gotFS), Inputs: edge3WidgetInputs("fs")})
-	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, cache.HashExtras(nil), 5, 1)
-	memo.Store(memoKey, pmaps.DeepCopyJSON(gotFS), depsFS)
+	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, "", cache.HashExtras(nil), 5, 1)
+	memo.Store(memoKey, pmaps.DeepCopyJSON(gotFS), depsFS, cache.DepGenEpochNow())
 
 	// Carrier 2 — 4a FAST-PATH HIT (page 2). edge-3 via C2's replay in the hit
 	// branch.
@@ -544,7 +545,7 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 
 	// Carrier 3 — MEMO HIT (page 1). edge-3 via B3's memo replay.
 	ctxMemo := cache.WithL1KeyContext(base, wmemoKey)
-	bodyMemo, depsMemo, ok := memo.Load(memoKey)
+	bodyMemo, depsMemo, _, ok := memo.Load(memoKey)
 	if !ok {
 		t.Fatalf("harness broken: memo widget load MISS")
 	}

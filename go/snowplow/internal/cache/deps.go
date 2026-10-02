@@ -570,6 +570,17 @@ type depGenSink struct {
 	putKey      string
 	checkedSeq  uint64
 	putRemarked bool
+	// #411 C1 — per-dep AS-OF floor for deps whose body this resolve did NOT read
+	// itself but reused (a SeedResolveMemo hit): the memo entry's Stamp, i.e. the
+	// producer's entry epoch. remarkIfDepsMoved checks such a dep against
+	// min(startSeq, asOf[dk]) instead of startSeq, closing the torn
+	// [depEventSeq.Add → bucket stamp] window: a hitter whose startSeq already
+	// includes event s, but whose memo Load ran before s's bucket stamp, took a
+	// valid hit on the pre-s body; against startSeq (= s) the bucket (= s) reads
+	// "not moved", against the memo's Stamp (< s) it reads moved → remark. Only
+	// the replayed deps carry a floor; every other dep keeps startSeq (no
+	// spurious remarks). Lazily initialised under mu.
+	asOf map[DepKey]uint64
 }
 
 // addDepLocked appends dk unless already present. Caller holds s.mu.
@@ -1152,6 +1163,13 @@ func (d *DepTracker) remarkIfDepsMoved(ctx context.Context, l1Key string) {
 	}
 	s.mu.Lock()
 	deps := append([]DepKey(nil), s.deps...)
+	var asOf map[DepKey]uint64 // #411 C1: copied under the same lock as deps
+	if len(s.asOf) > 0 {
+		asOf = make(map[DepKey]uint64, len(s.asOf))
+		for k, v := range s.asOf {
+			asOf[k] = v
+		}
+	}
 	// #375 C3 — remember this accepted Put so a Record for l1Key landing after the check
 	// can be re-checked (recheckAfterPutRecord). checkedSeq is taken BEFORE the dep scan:
 	// an event racing the scan is seen by the scan or by the re-check, never by neither.
@@ -1161,7 +1179,11 @@ func (d *DepTracker) remarkIfDepsMoved(ctx context.Context, l1Key string) {
 	s.mu.Unlock()
 	var moved []schema.GroupVersionResource
 	for _, dk := range deps {
-		if d.depMovedSince(dk, s.startSeq) && !containsGVR(moved, dk.GVR) {
+		seq := s.startSeq
+		if f, ok := asOf[dk]; ok && f < seq {
+			seq = f // #411 C1: a reused (memo-hit) dep is checked from the body's as-of
+		}
+		if d.depMovedSince(dk, seq) && !containsGVR(moved, dk.GVR) {
 			moved = append(moved, dk.GVR)
 		}
 	}
@@ -1357,6 +1379,34 @@ func (d *DepTracker) ReplayEdges(ctx context.Context, dst string, edges []DepKey
 			d.Record(ctx, dst, e.GVR, e.Namespace, e.Name)
 		}
 	}
+}
+
+// ReplayEdgesAsOf is ReplayEdges for edges whose BODY the caller reuses rather
+// than reads (#411 C1: a SeedResolveMemo hit). Besides recording each edge under
+// dst, it sets the as-of floor of each edge, in ctx's dep-gen sink AND every
+// ancestor sink (an enclosing resolve embeds the same body), to min(existing,
+// asOf), where asOf is the seq the reused body is fresh as of (the memo entry's
+// Stamp). The accepted-Put check then treats an event on such an edge after asOf
+// as a move, even when it is not after the resolve's own startSeq. The floors are
+// set BEFORE the Records, so any check that observes the Record also observes
+// the floor. No sink on ctx ⇒ plain ReplayEdges.
+func (d *DepTracker) ReplayEdgesAsOf(ctx context.Context, dst string, edges []DepKey, asOf uint64) {
+	if d == nil || dst == "" {
+		return
+	}
+	for s := depGenSinkFromContext(ctx); s != nil; s = s.parent {
+		s.mu.Lock()
+		if s.asOf == nil {
+			s.asOf = make(map[DepKey]uint64, len(edges))
+		}
+		for _, e := range edges {
+			if cur, ok := s.asOf[e]; !ok || asOf < cur {
+				s.asOf[e] = asOf
+			}
+		}
+		s.mu.Unlock()
+	}
+	d.ReplayEdges(ctx, dst, edges)
 }
 
 // ensureInformer registers (idempotently, singleflighted) the informer for gvr
