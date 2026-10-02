@@ -136,6 +136,7 @@ func newGizmoWatcher(t *testing.T, registerGadgets bool) *cache.ResourceWatcher 
 	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 	return rw
