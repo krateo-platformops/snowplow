@@ -28,6 +28,9 @@
 //     latch / deadline / boot_error / seed_panic / seed_returned. Recorded by
 //     the defer that runs immediately BEFORE the MarkPhase1Done defer.
 //   - phase1_walk.go Step 8 PIP-off else (pipSeed == nil) — none-configured.
+//   - phase1_walk.go Phase1Warmup pre-walk aborts (no SA endpoint / no dynamic
+//     client, #401) — boot_aborted via releasePhase1BootAborted.
+//   - phase1_walk.go Phase1Warmup nil-watcher skip — none-configured.
 //   - main.go "prewarm not scheduled" else (unreachable under cache-on, #57) —
 //     none-configured via RecordPhase1ReadinessExitNoSeed.
 //   - main.go readiness safety net (cache off / no watcher) — none-configured
@@ -46,6 +49,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // Readiness-exit outcomes (the `outcome` attribute + the /readyz `outcome`
@@ -66,9 +71,20 @@ const (
 	// phase1ExitSeedReturned — the seed fn returned nil without the engine latch
 	// having been armed/fired (a non-engine seed fn; not a production shape).
 	phase1ExitSeedReturned = "seed_returned"
+	// phase1ExitBootAborted — Phase1Warmup could not start the walk (no SA
+	// endpoint / no dynamic client, #401): readiness was released Ready-DEGRADED
+	// with nothing prewarmed. The cause is one of the phase1Abort* values.
+	phase1ExitBootAborted = "boot_aborted"
 	// phase1ExitNoneConfigured — there was no seed to wait on (PIP/prewarm off,
 	// cache off, or no watcher): readiness flipped with nothing to warm.
 	phase1ExitNoneConfigured = "none-configured"
+)
+
+// Boot-abort causes (#401): the `abort_cause` attribute of a boot_aborted exit
+// and the readyz.backstop.fired `reason`. A closed, code-defined set.
+const (
+	phase1AbortNoSAEndpoint = "no_sa_endpoint"
+	phase1AbortNoDynClient  = "no_dyn_client"
 )
 
 // Phase-1 stage reasons surfaced on the /readyz warming body (`reason`). A
@@ -349,6 +365,10 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 	phase1ExitOnce.Do(func() {
 		defer func() { _ = recover() }()
 		outcome, cause := classify()
+		deadlineCause, abortCause := cause, ""
+		if outcome == phase1ExitBootAborted {
+			deadlineCause, abortCause = "", cause
+		}
 		phase1ExitOutcome.Store(outcome)
 		phase1Stage.Store(phase1StageReadinessReleased)
 		if outcome == phase1ExitDeadline {
@@ -368,6 +388,8 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 				"nav_units_remaining nav units were still unprocessed at Ready; snowplow_phase1_deadline_released_total=1"
 		case phase1ExitBootError, phase1ExitSeedPanic:
 			effect = "readiness released by the C2 backstop after a seed error/panic, before the first-nav latch fired"
+		case phase1ExitBootAborted:
+			effect = "readiness released Ready-DEGRADED because phase 1 could not start (abort_cause): nothing was prewarmed"
 		case phase1ExitNoneConfigured:
 			effect = "readiness released with no boot seed to wait on (prewarm/PIP off, cache off, or no watcher)"
 		case phase1ExitSeedReturned:
@@ -376,7 +398,8 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 		slog.Default().Log(context.Background(), level, "prewarm.phase1.readiness_exit",
 			slog.String("subsystem", "cache"),
 			slog.String("outcome", outcome),
-			slog.String("deadline_cause", cause),
+			slog.String("deadline_cause", deadlineCause),
+			slog.String("abort_cause", abortCause),
 			slog.Bool("latch_fired", latchFired),
 			slog.Int64("elapsed_ms", elapsed.Milliseconds()),
 			slog.Int64("since_process_start_ms", Phase1SinceProcessStart().Milliseconds()),
@@ -397,6 +420,16 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 			slog.String("effect", effect),
 		)
 	})
+}
+
+// releasePhase1BootAborted is the #401 readiness decision for a Phase1Warmup
+// that cannot start the walk: count + ERROR the degraded release (backstop),
+// record the boot_aborted exit, then flip. Without it /readyz stays 503 forever
+// (main.go's safety net does not flip when the cache is on with a watcher).
+func releasePhase1BootAborted(cause string) {
+	recordReadinessBackstop(cause, Phase1SinceProcessStart(), -1)
+	recordPhase1ReadinessExit(phase1ExitBootAborted, cause, Phase1SinceProcessStart(), noPhase1StepTimings())
+	cache.MarkPhase1Done()
 }
 
 // RecordPhase1ReadinessExitNoSeed records the "none-configured" exit for the

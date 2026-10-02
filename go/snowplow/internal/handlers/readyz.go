@@ -21,7 +21,7 @@ type readyzInfo struct {
 	// ElapsedS (#397, warming only) is the whole seconds since process start.
 	ElapsedS *int64 `json:"elapsed_s,omitempty"`
 	// Outcome (#397, ready only) is how readiness was released: "latch",
-	// "deadline", "boot_error", "seed_panic", "seed_returned" or
+	// "deadline", "boot_error", "boot_aborted", "seed_panic", "seed_returned" or
 	// "none-configured" — the prewarm.phase1.readiness_exit outcome. Omitted
 	// when no exit was recorded.
 	Outcome string `json:"outcome,omitempty"`
