@@ -679,6 +679,10 @@ type cacheHandle interface {
 	// the pre-delete body).
 	CaptureGen(key string) uint64
 	PutIfGen(ctx context.Context, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
+	// #408 — a plain Put plus the #375 remark, for the PRE-readyz boot seed
+	// carriers. Never refuses; re-marks the key once if a dep recorded on ctx's
+	// dep-gen sink moved since the resolve began.
+	PutThenRemark(ctx context.Context, key string, entry *cache.ResolvedEntry)
 }
 
 // emitResolvedCacheLookup writes the per-request falsifier line per

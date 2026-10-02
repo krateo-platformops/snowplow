@@ -30,8 +30,15 @@
 // case closes by COMPOSITION with #375 (PR #395): #375's remarkIfDepsMoved runs
 // inside the IfGen Put methods, so once this terminal Put is a PutIfGen, a dep
 // that moved after the seed started re-marks the key and the refresher
-// re-resolves it at mark latency. seedModeBoot stays a plain Put and is
-// therefore NOT under #375's IfGen check either (pre-readyz, no customer race).
+// re-resolves it at mark latency.
+//
+// #408 — BOOT. seedModeBoot is plain only BEFORE /readyz, and even then it gets
+// the #375 remark (PutThenRemark): a boot resolve records its deps before its
+// Put, so a dep event in between dirty-marks a key that is not resident yet,
+// and without the remark the plain Put would store the pre-event body with no
+// mark pending. AFTER /readyz (the boot scope keeps seeding the RA content tail
+// after the first-nav latch) a boot-mode Put is a PutIfGen like every other
+// post-readyz mode.
 package dispatchers
 
 import (
@@ -54,10 +61,16 @@ import (
 var errSeedTerminalPutRefused = errors.New("seed terminal Put refused: the cell was removed during the seed resolve (#394)")
 
 // seedTerminalGuard is the per-seed-unit write discipline for the terminal Put.
-// The zero value is UNGUARDED (plain Put) — the boot exemption.
+// The zero value is UNGUARDED (a plain Put plus the #375 remark, PutThenRemark),
+// reachable only by a test that drives the restaction tail seam directly.
 type seedTerminalGuard struct {
 	// guarded selects PutIfGen(gen) over a plain Put.
 	guarded bool
+	// boot (#408) marks a seedModeBoot unit captured BEFORE /readyz. It decides at
+	// the Put: PutIfGen(gen) if /readyz has flipped by then (the boot scope keeps
+	// seeding the RA content tail after the first-nav latch, so its Puts can land
+	// post-readyz), otherwise a plain Put plus the #375 remark (PutThenRemark).
+	boot bool
 	// gen is the cell's generation captured at seed entry (CaptureGen).
 	gen uint64
 }
@@ -66,17 +79,28 @@ type seedTerminalGuard struct {
 // it at seed ENTRY: after seedSkipDecision, before enterSeedUnit and the
 // resolve.
 //
-//   - seedModeBoot: boot = plain, pre-readyz exemption (#323); not under #375's
-//     IfGen check. A boot re-fill of an LRU-evicted cell must not be
-//     over-refused, and no served /call can race a pre-readyz seed.
+//   - seedModeBoot BEFORE /readyz: plain, the pre-readyz exemption (#323). A boot
+//     re-fill of an LRU-evicted cell must not be over-refused, and no served
+//     /call can race a pre-readyz seed. The generation is still captured here,
+//     and the Put re-checks cache.IsPhase1Done (#408): see seedTerminalPut.
+//   - seedModeBoot AFTER /readyz (#408): guarded. The boot scope keeps seeding
+//     the RA content tail after the first-nav latch flips /readyz.
 //   - every other mode (seedModeKeepwarm, seedModeGVRDiscovered, and any mode
 //     added later): guarded. Fail closed — a new mode is post-readyz unless
 //     someone argues otherwise here.
 func seedTerminalGuardFor(mode seedScopeMode, handle cacheHandle, key string) seedTerminalGuard {
-	if mode == seedModeBoot {
-		// boot = plain, pre-readyz exemption (#323); not under #375's IfGen check.
-		return seedTerminalGuard{}
+	if mode == seedModeBoot && !cache.IsPhase1Done() {
+		// boot, captured pre-readyz (#323 exemption, #408): capture the generation
+		// NOW, before the resolve, so that a Put landing after /readyz flips can
+		// still be gen-guarded against a removal during this resolve. The
+		// pre-readyz Put stays plain and gets the #375 remark.
+		return seedTerminalGuard{boot: true, gen: handle.CaptureGen(key)}
 	}
+	// Post-readyz: every mode is guarded, including seedModeBoot (#408). The boot
+	// scope seeds the RA content tail in the background after the first-nav
+	// latch flips /readyz (phase1_walk.go engineSeed select → MarkPhase1Done;
+	// prewarm_engine_boot.go RA tail), so a boot-mode Put can race a served /call
+	// and a removal exactly like keepwarm.
 	return seedTerminalGuard{guarded: true, gen: handle.CaptureGen(key)}
 }
 
@@ -97,19 +121,25 @@ func seedTerminalPut(ctx context.Context, handle cacheHandle, key string, entry 
 	// (a grant/revoke on the representative mid-resolve makes the body another
 	// class's). Refused like a generation move: no cell, no dep Record. Applies
 	// to boot seeds too — #323's boot exemption is about LRU eviction, not about
-	// writing a body into the wrong identity class.
+	// writing a body into the wrong identity class. Runs BEFORE every write below,
+	// the pre-readyz PutThenRemark included (#408).
 	if entry != nil {
 		if drift := identityClassDriftCtx(ctx, entry.Inputs); drift != "" {
 			noteIdentityClassDrift("seed", drift)
 			return false
 		}
 	}
-	if !g.guarded {
-		// boot = plain, pre-readyz exemption (#323); not under #375's IfGen check.
-		handle.Put(key, entry)
-		return true
+	if g.guarded || (g.boot && cache.IsPhase1Done()) {
+		// Post-readyz (any mode, or a boot unit whose Put crossed the /readyz
+		// flip): gen-guarded. The IfGen method runs the #375 remark on accept.
+		return handle.PutIfGen(ctx, key, entry, g.gen)
 	}
-	return handle.PutIfGen(ctx, key, entry, g.gen)
+	// Pre-readyz boot: plain, so an LRU-evicted cell is never refused (#323), but
+	// with the #375 remark (#408). A dep that moved during this resolve dirty-
+	// marked a key that was not resident yet, so the refresher skipped it; the
+	// remark re-marks it now that it is.
+	handle.PutThenRemark(ctx, key, entry)
+	return true
 }
 
 // seedTerminalGuardCtxKey carries the captured seedTerminalGuard from

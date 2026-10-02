@@ -91,6 +91,10 @@ func (h *getRecordingHandle) PutIfGen(ctx context.Context, key string, entry *ca
 	return true
 }
 
+// #408 — the boot plain-Put-plus-remark surface; inert like Put.
+func (h *getRecordingHandle) PutThenRemark(ctx context.Context, key string, entry *cache.ResolvedEntry) {
+}
+
 // getCount is method-AGNOSTIC: the number of liveness reads (Get + #376 GetNoTouch),
 // so "a liveness read occurred / did not occur" assertions survive the #376 switch
 // of the seed-skip read from Get to GetNoTouch.

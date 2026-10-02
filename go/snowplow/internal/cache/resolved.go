@@ -1366,6 +1366,29 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key))
 }
 
+// PutThenRemark is a plain Put followed by the #375 PUT-THEN-REMARK check
+// (#408). It is for the PRE-readyz boot carriers: the boot seed terminal Put
+// (seedTerminalPut, seedModeBoot before /readyz) and widget_content's boot branch.
+// They stay plain, so a boot re-fill of an LRU-evicted cell is never refused
+// (#323). But a boot resolve records its dep edges BEFORE its Put. A dep event in
+// that window dirty-marks a key that is not resident yet, the refresher skips the
+// mark as no-entry, and the plain Put then stores the pre-event body. The remark
+// closes that window the same way the IfGen methods do. It re-marks this key once
+// if a dep it recorded moved since the resolve began. It never refuses: the body
+// is stored either way. Like the IfGen methods, it runs the remark after the
+// store lock is released.
+//
+// ctx must be the resolve's ctx (WithL1KeyContext*), which carries the dep-gen
+// sink. On a ctx with no sink, the check treats the Put as drift: it counts
+// unguarded_put_total and remarks once, failing fresh.
+func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entry *ResolvedEntry) {
+	if c == nil || entry == nil {
+		return
+	}
+	c.Put(key, entry)
+	Deps().remarkIfDepsMoved(ctx, key)
+}
+
 // PutIfGen is the #189 generation-guarded write. It stores entry under key ONLY
 // if key's current generation still equals capturedGen — the value the caller
 // read via CaptureGen BEFORE the resolve/fetch that produced entry. If a

@@ -229,6 +229,7 @@ func s394DeclaredSeedModes(t *testing.T) []string {
 type s394RecordingHandle struct {
 	gen                  uint64
 	puts, putIfGens      int
+	putThenRemarks       int
 	lastCapturedGenInPut uint64
 }
 
@@ -238,6 +239,9 @@ func (h *s394RecordingHandle) GetNoTouch(string) (*cache.ResolvedEntry, bool) {
 }
 func (h *s394RecordingHandle) Put(string, *cache.ResolvedEntry) { h.puts++ }
 func (h *s394RecordingHandle) CaptureGen(string) uint64         { return h.gen }
+func (h *s394RecordingHandle) PutThenRemark(context.Context, string, *cache.ResolvedEntry) {
+	h.putThenRemarks++
+}
 func (h *s394RecordingHandle) PutIfGen(_ context.Context, _ string, _ *cache.ResolvedEntry, g uint64) bool {
 	h.putIfGens++
 	h.lastCapturedGenInPut = g
@@ -251,10 +255,14 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 		mode    seedScopeMode
 		guarded bool
 	}{
-		"seedModeBoot":          {seedModeBoot, false}, // boot = plain, pre-readyz exemption (#323)
+		"seedModeBoot":          {seedModeBoot, false}, // boot = plain+remark PRE-readyz (#323, #408); guarded post-readyz (below)
 		"seedModeKeepwarm":      {seedModeKeepwarm, true},
 		"seedModeGVRDiscovered": {seedModeGVRDiscovered, true},
 	}
+	// This table classifies the PRE-readyz guard; the post-readyz boot row is the
+	// #408 block after the loop.
+	cache.ResetPhase1DoneForTest()
+	t.Cleanup(cache.ResetPhase1DoneForTest)
 	declared := s394DeclaredSeedModes(t)
 	if len(declared) < 3 {
 		t.Fatalf("VACUOUS GUARD: found only %v seedScopeMode constants", declared)
@@ -284,10 +292,34 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 			if seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, g) {
 				t.Errorf("#394: %s: a moved generation must be REFUSED", name)
 			}
-		} else if h.puts != 1 || h.putIfGens != 0 {
-			t.Errorf("#394: boot must stay a plain Put (#323); puts=%d putIfGens=%d", h.puts, h.putIfGens)
+		} else if h.puts != 0 || h.putIfGens != 0 || h.putThenRemarks != 1 {
+			t.Errorf("#394/#408: pre-readyz boot must stay a plain Put (#323) carrying the #375 remark "+
+				"(PutThenRemark); puts=%d putIfGens=%d putThenRemarks=%d", h.puts, h.putIfGens, h.putThenRemarks)
 		}
 	}
+
+	// #408 — boot after /readyz. (a) A boot unit CAPTURED post-readyz is guarded.
+	// (b) A boot unit captured pre-readyz whose Put lands post-readyz (the RA
+	// content tail keeps seeding after the first-nav latch) is gen-guarded with
+	// the generation captured BEFORE the flip.
+	cache.MarkPhase1Done()
+	h := &s394RecordingHandle{gen: 7}
+	if g := seedTerminalGuardFor(seedModeBoot, h, "k"); !g.guarded || g.gen != 7 {
+		t.Errorf("#408: seedTerminalGuardFor(seedModeBoot) post-readyz = %+v, want guarded with gen 7", g)
+	}
+	cache.ResetPhase1DoneForTest()
+	h = &s394RecordingHandle{gen: 7}
+	pre := seedTerminalGuardFor(seedModeBoot, h, "k")
+	cache.MarkPhase1Done()
+	h.gen = 8 // a removal during the resolve, after the capture
+	if seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, pre) {
+		t.Errorf("#408: a boot Put that crossed the /readyz flip must be gen-guarded and REFUSE a moved generation")
+	}
+	if h.putIfGens != 1 || h.lastCapturedGenInPut != 7 || h.puts != 0 || h.putThenRemarks != 0 {
+		t.Errorf("#408: crossed boot Put must be PutIfGen(pre-flip gen 7); puts=%d putIfGens=%d gen=%d putThenRemarks=%d",
+			h.puts, h.putIfGens, h.lastCapturedGenInPut, h.putThenRemarks)
+	}
+	cache.ResetPhase1DoneForTest()
 
 	// The ctx carrier round-trips, and a ctx without it yields the zero guard.
 	want := seedTerminalGuard{guarded: true, gen: 3}
