@@ -43,6 +43,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -102,6 +103,10 @@ func TestIssue216_DegradedConfirmed404_ForgetsHarvestAndStopsSeedReplay(t *testi
 		BindingUID:             "uid-216",
 		RepresentativeUsername: "admin",
 		RepresentativeGroups:   []string{"admins"},
+		// #424: a real identity-bound cell always carries the binding-set digest
+		// it was minted with (dispatchCacheLookupKey); the refresher's drift
+		// guard compares the representative's current set against it.
+		SubjectBindingSet: rbac.SubjectBindingSetDigest("admin", []string{"admins"}),
 	}
 	delKey := cache.ComputeKey(del)
 	store.Put(delKey, &cache.ResolvedEntry{
@@ -229,6 +234,10 @@ func TestIssue216_DropPointNon404_DoesNotForgetHarvest(t *testing.T) {
 		BindingUID:             "uid-216-neg",
 		RepresentativeUsername: "admin",
 		RepresentativeGroups:   []string{"admins"},
+		// #424: a real identity-bound cell always carries the binding-set digest
+		// it was minted with (dispatchCacheLookupKey); the refresher's drift
+		// guard compares the representative's current set against it.
+		SubjectBindingSet: rbac.SubjectBindingSetDigest("admin", []string{"admins"}),
 	}
 	key := cache.ComputeKey(in)
 	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"outage-not-deletion"}`), Inputs: &in})

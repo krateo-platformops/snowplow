@@ -52,6 +52,18 @@ func withEmitSeamHarness(t *testing.T) (cache.ResolvedKeyInputs, string) {
 		cache.ResetDepsForTest()
 		cache.ResetResolvedCacheForTest()
 	})
+	// #424: isolate from a watcher another test left installed. The refresher's
+	// identity-class guard reads the global RBAC snapshot; this seam harness
+	// mints its cell with no snapshot (SubjectBindingSet ""), so a leaked
+	// snapshot would (correctly) make the guard decline the re-Put.
+	prevGlobal := cache.Global()
+	cache.SetGlobal(nil)
+	t.Cleanup(func() { cache.SetGlobal(prevGlobal) })
+	// The per-subject sub-gen counters are process-global; another test's
+	// binding events for "cyberjoker"/"devs" must not read as this cell's
+	// representative having changed class (the guard's rbac_subgen reason).
+	cache.ResetRBACSubGenForTest()
+	t.Cleanup(cache.ResetRBACSubGenForTest)
 	inputs := cache.ResolvedKeyInputs{
 		CacheEntryClass:        "widgets",
 		Group:                  "widgets.templates.krateo.io",

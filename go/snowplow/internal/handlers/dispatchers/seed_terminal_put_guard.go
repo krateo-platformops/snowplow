@@ -93,6 +93,17 @@ func seedTerminalGuardFor(mode seedScopeMode, handle cacheHandle, key string) se
 // every accepted keepwarm / gvr-discovered seed Put a nil-sink drift
 // (unguarded_put_total++ plus a fail-fresh remark = refresher amplification).
 func seedTerminalPut(ctx context.Context, handle cacheHandle, key string, entry *cache.ResolvedEntry, g seedTerminalGuard) bool {
+	// #424 — the cohort's RBAC class must still be the one key was minted for
+	// (a grant/revoke on the representative mid-resolve makes the body another
+	// class's). Refused like a generation move: no cell, no dep Record. Applies
+	// to boot seeds too — #323's boot exemption is about LRU eviction, not about
+	// writing a body into the wrong identity class.
+	if entry != nil {
+		if drift := identityClassDriftCtx(ctx, entry.Inputs); drift != "" {
+			noteIdentityClassDrift("seed", drift)
+			return false
+		}
+	}
 	if !g.guarded {
 		// boot = plain, pre-readyz exemption (#323); not under #375's IfGen check.
 		handle.Put(key, entry)

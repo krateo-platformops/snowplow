@@ -287,6 +287,14 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		Namespace:       namespace,
 		Name:            name,
 		BindingUID:      bindingUID,
+		// #423 — the requester's FULL matching-binding set. BindingUID above only
+		// proves THIS layer's GET; it does not distinguish two co-bound users whose
+		// step-level RBAC differs, and the hit path serves RawJSON verbatim. Equal
+		// sets => equal verdicts everywhere => byte-identical output, so cells are
+		// still shared across same-set users (group-only members of the same
+		// groups). The prewarm seed mints through THIS function under its
+		// representative identity, so seed and customer keys use one derivation.
+		SubjectBindingSet: rbac.SubjectBindingSetDigest(ui.Username, ui.Groups),
 		// #118 (c) — the requesting identity's EFFECTIVE per-subject RBAC
 		// sub-generation, folded into ComputeKey (identity-bound classes) so an
 		// out-of-band grant/revoke touching THIS user's own bindings rotates the
@@ -295,7 +303,13 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		// crux). ui.Username/ui.Groups are already in hand here (the same tuple
 		// EvaluateRBAC read above), so this is a handful of lock-free map reads,
 		// no extra walk.
-		RBACSubGen: cache.RBACSubGenForSubject(ui.Username, ui.Groups),
+		//
+		// #424 — folded over the EFFECTIVE groups (system:authenticated
+		// included) so a customer whose JWT omits it and the seed representative
+		// (which now resolves with it, withCohortSeedContext) fold the same
+		// counters, and a change to a system:authenticated binding rotates
+		// every authenticated requester's key (it changes all of their rights).
+		RBACSubGen: cache.RBACSubGenForSubject(ui.Username, rbac.WithAuthenticatedGroup(ui.Groups)),
 		// Representative identity for the refresher's re-resolve.
 		// Carried on Inputs but NOT folded into ComputeKey (the cell
 		// is keyed by BindingUID, not by the literal name). The first
@@ -794,6 +808,10 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		slog.String("site", site),
 		slog.String("key_hash", cacheKey),
 		slog.String("binding_uid", bindingUID),
+		// #423 — the binding-set digest this key folded (a SHA-256 over
+		// sorted binding ids — never a name or a body). Read off the inputs,
+		// so it costs nothing at warn; "" when no inputs were derived.
+		slog.String("subject_binding_set", sbsOfInputs(inputs)),
 		slog.String("username", username),
 		slog.Any("groups", groups),
 		slog.String("handler_kind", handlerKind),
@@ -874,6 +892,15 @@ func subgenOf(inputs *cache.ResolvedKeyInputs) uint64 {
 		return 0
 	}
 	return inputs.RBACSubGen
+}
+
+// sbsOfInputs is subgenOf's #423 sibling: the binding-set digest a key folded,
+// or "" for nil inputs.
+func sbsOfInputs(inputs *cache.ResolvedKeyInputs) string {
+	if inputs == nil {
+		return ""
+	}
+	return inputs.SubjectBindingSet
 }
 
 // encodeResolvedJSON marshals res with a single canonical encoder shape.

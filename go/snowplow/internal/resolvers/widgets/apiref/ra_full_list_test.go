@@ -340,7 +340,7 @@ func TestRAServe_EmptyFullDoesNotFreeze(t *testing.T) {
 	// f6 crb-A-admin UID). The test's raKey computation MUST match that — NOT
 	// "" (the pre-C-1 no-snapshot path, which C-1 now declines before this
 	// point).
-	keyInputs := cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
+	keyInputs := f6KeyInputs(gvr().Group, gvr().Version, gvr().Resource,
 		"krateo-system", raName,
 		"C:crb-a-f6-uid", nil)
 	raKey := cache.ComputeKey(keyInputs)
@@ -419,7 +419,7 @@ func TestRAServe_EmptyBindingDeclines(t *testing.T) {
 	// have left behind (the shared cross-identity cell C-1 must not serve).
 	shape := cache.SliceShapeHash(raFullListCallerClass, gvr().Group, gvr().Version,
 		gvr().Resource, "krateo-system", raName, raSliceJQ)
-	keyInputs := cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
+	keyInputs := f6KeyInputs(gvr().Group, gvr().Version, gvr().Resource,
 		"krateo-system", raName, "" /* the empty-identity key */, nil)
 	raKey := cache.ComputeKey(keyInputs)
 	cache.ResolvedCache().PutRAFullList(raKey, keyInputs, panelDict(40))

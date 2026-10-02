@@ -303,9 +303,9 @@ func TestF6_CrossBinding_KeysAreDistinct(t *testing.T) {
 	// KEY-isolation assertion (the structural invariant): the two
 	// users produce two DIFFERENT BindingUIDs → two DIFFERENT raKeys.
 	// We compute them directly to confirm.
-	keyInputsA := cache.RAFullListKeyInputs(gvrW.Group, gvrW.Version, gvrW.Resource,
+	keyInputsA := f6KeyInputs(gvrW.Group, gvrW.Version, gvrW.Resource,
 		ns, name, "C:crb-a-f6-uid", nil)
-	keyInputsB := cache.RAFullListKeyInputs(gvrW.Group, gvrW.Version, gvrW.Resource,
+	keyInputsB := f6KeyInputs(gvrW.Group, gvrW.Version, gvrW.Resource,
 		ns, name, "C:crb-b-f6-uid", nil)
 	raKeyA := cache.ComputeKey(keyInputsA)
 	raKeyB := cache.ComputeKey(keyInputsB)
@@ -411,9 +411,9 @@ func TestF6_CrossBinding_ConcurrentRace_100Iterations(t *testing.T) {
 
 	// After the burst, both cells should still be KEY-distinct and
 	// independently addressable from the cache.
-	keyInputsA := cache.RAFullListKeyInputs(gvrW.Group, gvrW.Version, gvrW.Resource,
+	keyInputsA := f6KeyInputs(gvrW.Group, gvrW.Version, gvrW.Resource,
 		ns, name, "C:crb-a-f6-uid", nil)
-	keyInputsB := cache.RAFullListKeyInputs(gvrW.Group, gvrW.Version, gvrW.Resource,
+	keyInputsB := f6KeyInputs(gvrW.Group, gvrW.Version, gvrW.Resource,
 		ns, name, "C:crb-b-f6-uid", nil)
 	if cache.ComputeKey(keyInputsA) == cache.ComputeKey(keyInputsB) {
 		t.Fatalf("F6 KEY-ISOLATION BROKEN at end of %d iterations: raKeys collapsed", iterations)

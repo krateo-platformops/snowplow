@@ -276,10 +276,15 @@ func TestA1_UAFCrossUser_NoSharedCellServe(t *testing.T) {
 		t.Fatalf("PRECONDITION (ii) FAILED: the two users must share the SAME first-match binding (that sharing IS "+
 			"the defect); alice=%q bob=%q", aliceIn.BindingUID, bobIn.BindingUID)
 	}
-	if aliceKey != bobKey {
-		t.Fatalf("PRECONDITION (ii) FAILED: the two users' PRODUCTION-derived cache keys must be IDENTICAL — that "+
-			"single shared cell is what one user's narrowed body would be written into and the other served from. "+
-			"alice=%q bob=%q (subgen alice=%d bob=%d)", aliceKey, bobKey, aliceIn.RBACSubGen, bobIn.RBACSubGen)
+	// #423: the two users hold DIFFERENT matching-binding sets (alice-cm vs
+	// bob-cm), so SubjectBindingSet now separates their keys. This arm pins the
+	// UAF Put-decline, so it requires the keys to be identical on every OTHER
+	// dimension — i.e. they WOULD share one cell without the #423 fold — and its
+	// body + decline-counter assertions below still hold independently of #423.
+	if keyWithoutSBS423(*aliceIn) != keyWithoutSBS423(*bobIn) {
+		t.Fatalf("PRECONDITION (ii) FAILED: apart from the #423 SubjectBindingSet the two users' PRODUCTION-derived "+
+			"keys must be IDENTICAL (the pre-#423 shared cell). alice=%q bob=%q (subgen alice=%d bob=%d)",
+			aliceKey, bobKey, aliceIn.RBACSubGen, bobIn.RBACSubGen)
 	}
 	if _, ok := handle.Get(aliceKey); ok {
 		t.Fatalf("PRECONDITION: the shared key must be cold before alice's request")

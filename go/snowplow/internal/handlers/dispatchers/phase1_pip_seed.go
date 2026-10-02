@@ -92,6 +92,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
@@ -653,9 +654,17 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserConfig(saEP),
 		xcontext.WithLogger(slog.Default()),
+		// #424 — resolve the representative as an AUTHENTICATED identity. A
+		// group representative carries Username=="" (pickRepresentativeFromSubjects),
+		// and EvaluateRBAC matches a system:authenticated subject only for a
+		// non-empty username; without the explicit group the seeded body would
+		// lack every grant a real member gets through system:authenticated —
+		// a NARROWER body under the very key that member derives (the binding-set
+		// digest always counts system:authenticated). Every real /call is
+		// authenticated, so this is the member's effective group set.
 		xcontext.WithUserInfo(jwtutil.UserInfo{
 			Username: cohort.Username,
-			Groups:   cohort.Groups,
+			Groups:   rbac.WithAuthenticatedGroup(cohort.Groups),
 		}),
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
