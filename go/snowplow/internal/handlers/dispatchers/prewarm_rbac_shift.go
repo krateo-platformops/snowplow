@@ -66,15 +66,24 @@ func rePrewarmRBACShift(ctx context.Context, deps rePrewarmDeps, rotated cache.R
 		slog.Int("rotated_subjects", rotated.Len()),
 	)
 
-	// #262 — a rotation can make a learned class DISTINCT (a binding added on a
-	// group it presents moves its binding set away from its representative's);
-	// re-apply the learned-class bound over the resident units first, so the
-	// reseed below (which reseeds only ADMITTED learned classes) includes it.
-	refreshLearnedAdmission(ctx, deps)
+	// ONE resident pass (customer-yielding per unit) feeds both the #262
+	// learned-class bound and the #258 target filter. A rotation can make a
+	// learned class DISTINCT (a binding added on a group it presents moves its
+	// binding set away from its representative's), so the bound is re-applied
+	// over this pass before the filter, which reseeds only ADMITTED learned
+	// classes. With no learned class registered the pass is exactly #258's.
+	learnedRegistered := false
+	if r, _, _ := cache.LearnedClassCounts(); r > 0 {
+		learnedRegistered = true
+	}
+	units := enumerateResident(ctx, deps, learnedRegistered)
+	if learnedRegistered && ctx.Err() == nil {
+		decideLearnedAdmission(planFromResident(units).plan, 0, false, -1)
+	}
 
 	// Q1 TARGET-FILTER (snapshot-reuse re-key): reseed the RESIDENT (unit ×
 	// identity) targets whose folded subject rotated — no fresh nav walk.
-	reqs := enumerateRotatedResidentTargets(ctx, deps, rotated)
+	reqs := rotatedReqsFromResident(units, rotated)
 	reEnqueue := reseedTargets(ctx, deps, reqs)
 
 	if cut := ctx.Err() != nil; cut || len(reEnqueue) > 0 {

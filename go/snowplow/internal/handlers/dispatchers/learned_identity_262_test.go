@@ -269,19 +269,21 @@ func TestF4_262_BoundHolds_EngineBindsFirst(t *testing.T) {
 
 	seeded, unseeded := cache.LearnedAdmissionStats()
 	capm := l262CapacityMap(t)
-	tUnit := time.Duration(capm["t_unit_us"].(int64)) * time.Microsecond
+	us := func(k string) time.Duration { return time.Duration(capm[k].(int64)) * time.Microsecond }
+	tW, tR := us("t_widget_us"), us("t_ra_us")
 	interval := keepwarmSweepInterval()
-	baseUnits := capm["base_units"].(int)
-	capUnits := capm["capacity_units"].(int64)
-	usedUnits := capm["admitted_units"].(int64)
-	t.Logf("F4 engine bound: t_unit=%v interval=%v base_units=%d capacity_units=%d admitted_units=%d seeded=%d unseeded_capacity=%d bound=%v",
-		tUnit, interval, baseUnits, capUnits, usedUnits, seeded, unseeded, capm["bound"])
+	baseW, baseR := capm["base_widget_units"].(int), capm["base_ra_units"].(int)
+	budget, used := us("budget_us"), us("admitted_cost_us")
+	t.Logf("F4 engine bound: t_widget=%v t_ra=%v interval=%v base_units=%d+%d budget=%v admitted_cost=%v seeded=%d unseeded_capacity=%d bound=%v",
+		tW, tR, interval, baseW, baseR, budget, used, seeded, unseeded, capm["bound"])
 
-	if !capm["t_unit_measured"].(bool) || tUnit < 40*time.Millisecond {
-		t.Fatalf("t_unit must be MEASURED from the seeded units (each ≥40ms), got measured=%v %v", capm["t_unit_measured"], tUnit)
+	if !capm["t_widget_measured"].(bool) || !capm["t_ra_measured"].(bool) || tW < 40*time.Millisecond || tR < 40*time.Millisecond {
+		t.Fatalf("both per-kind costs must be MEASURED from the seeded units (each ≥40ms): widget %v/%v ra %v/%v",
+			capm["t_widget_measured"], tW, capm["t_ra_measured"], tR)
 	}
-	if want := int64(interval/tUnit) - int64(baseUnits); capUnits != want {
-		t.Fatalf("capacity identity: capacity_units=%d, want interval/t_unit − base_units = %d", capUnits, want)
+	want := interval - time.Duration(baseW)*tW - time.Duration(baseR)*tR
+	if d := budget - want; d < -time.Millisecond || d > time.Millisecond {
+		t.Fatalf("budget identity: budget=%v, want interval − W_base·t_widget − R_base·t_ra = %v", budget, want)
 	}
 	if seeded < 1 || unseeded < 1 || seeded+unseeded != 5 {
 		t.Errorf("F4 RED: the bound must admit some and leave some out: seeded=%d unseeded_capacity=%d (5 distinct)", seeded, unseeded)
@@ -289,9 +291,9 @@ func TestF4_262_BoundHolds_EngineBindsFirst(t *testing.T) {
 	if capm["bound"] != "engine" {
 		t.Errorf("bound=%v, want engine", capm["bound"])
 	}
-	const unitsPerClass = 4
-	if usedUnits > capUnits || usedUnits+unitsPerClass <= capUnits {
-		t.Errorf("the admitted prefix must be the LONGEST that fits: admitted_units=%d capacity_units=%d", usedUnits, capUnits)
+	classCost := 2*tW + 2*tR // 2 widgets + 2 RESTActions per class
+	if used > budget || used+classCost <= budget {
+		t.Errorf("the admitted prefix must be the LONGEST that fits: admitted_cost=%v budget=%v (one class costs %v)", used, budget, classCost)
 	}
 	// NEWEST FIRST: the admitted classes are exactly the `seeded` newest.
 	for i, u := range users {
@@ -346,8 +348,8 @@ func TestF4_262_BoundHolds_MemoryBindsFirst(t *testing.T) {
 
 	capm := l262CapacityMap(t)
 	seeded, unseeded := cache.LearnedAdmissionStats()
-	t.Logf("F4 memory bound: memory_headroom_bytes=%v avg_entry_bytes=%v capacity_units=%v seeded=%d unseeded_capacity=%d bound=%v",
-		capm["memory_headroom_bytes"], capm["avg_entry_bytes"], capm["capacity_units"], seeded, unseeded, capm["bound"])
+	t.Logf("F4 memory bound: memory_headroom_bytes=%v avg_entry_bytes=%v budget_us=%v seeded=%d unseeded_capacity=%d bound=%v",
+		capm["memory_headroom_bytes"], capm["avg_entry_bytes"], capm["budget_us"], seeded, unseeded, capm["bound"])
 	if capm["bound"] != "memory" || seeded != 2 || unseeded != 3 {
 		t.Fatalf("F4 RED (memory): bound=%v seeded=%d unseeded=%d, want memory / 2 / 3", capm["bound"], seeded, unseeded)
 	}

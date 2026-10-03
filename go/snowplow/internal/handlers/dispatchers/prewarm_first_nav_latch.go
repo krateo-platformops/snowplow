@@ -46,6 +46,7 @@ package dispatchers
 import (
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -59,6 +60,29 @@ import (
 type firstNavLatch struct {
 	done chan struct{}
 	once sync.Once
+	// backstop — #262: the readiness BACKSTOP deadline (unix nanos; 0 = none):
+	// the engineSeed ctx deadline (min of PHASE1_TIMEOUT and pipGlobalTimeout).
+	// A latch released by it is a FAILED boot, so pre-latch work that is not
+	// required (learned classes) is admitted only within the time left.
+	backstop atomic.Int64
+}
+
+// setBackstopDeadline records the readiness backstop deadline.
+func (l *firstNavLatch) setBackstopDeadline(t time.Time) {
+	l.backstop.Store(t.UnixNano())
+}
+
+// backstopRemaining is the time left before the readiness backstop; ok=false
+// when no backstop was recorded or the latch has already fired.
+func (l *firstNavLatch) backstopRemaining() (time.Duration, bool) {
+	if l == nil || l.fired() {
+		return 0, false
+	}
+	n := l.backstop.Load()
+	if n == 0 {
+		return 0, false
+	}
+	return time.Until(time.Unix(0, n)), true
 }
 
 func newFirstNavLatch() *firstNavLatch {

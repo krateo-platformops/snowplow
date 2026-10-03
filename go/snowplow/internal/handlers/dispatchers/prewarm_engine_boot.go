@@ -860,7 +860,7 @@ func seedScopeYielding(ctx context.Context,
 	// ranking / NavOrder flat pass / keepwarm prefix see exactly the
 	// representative set they always did; the learned targets seed in their
 	// own capacity-bounded phase.
-	lp := &learnedPass{units: map[string]int{}}
+	lp := newLearnedPass()
 
 	// seedOneTarget runs one (target, layer) seed under a per-target
 	// timeout (pipCohortTimeout — matches seedCohort's stuck-cohort
@@ -868,7 +868,7 @@ func seedScopeYielding(ctx context.Context,
 	// (seedOneRestaction / seedOneWidget) is passed as a closure so the
 	// restaction + widget loops share the timeout + yield + error-
 	// containment wrapper.
-	seedOneTarget := func(c seedTarget, do func(cohortCtx context.Context) error) error {
+	seedOneTarget := func(c seedTarget, isWidget bool, do func(cohortCtx context.Context) error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -877,7 +877,7 @@ func seedScopeYielding(ctx context.Context,
 		defer cancel()
 		// #262: measuredSeedUnit records the target's wall cost when it really
 		// resolved (the learned-class engine bound's t_unit).
-		return measuredSeedUnit(cctx, func(mctx context.Context) error {
+		return measuredSeedUnit(cctx, isWidget, func(mctx context.Context) error {
 			cohortCtx := withCohortSeedContext(mctx, c, saEP, saRC)
 			// #46: the footprint bound (semaphore admission + per-unit HeapInuse
 			// assert) lives in the SHARED primitives seedOneWidget/seedOneRestaction
@@ -941,7 +941,7 @@ func seedScopeYielding(ctx context.Context,
 		engineYieldCheckpoint(ctx)
 		targets, scoped := targetsFor(e.GVR, true)
 		targets, learnedTargets := splitLearned(targets)
-		lp.note(learnedTargets)
+		lp.note(learnedTargets, true)
 		widgetSeeds = append(widgetSeeds, widgetSeed{e: e, targets: targets, learned: learnedTargets, scoped: scoped})
 	}
 	// FIRST-NAV WALK ORDER within rank (FIX-E, replaces the A2 count-sort):
@@ -966,7 +966,7 @@ func seedScopeYielding(ctx context.Context,
 		targetGVR, haveTarget := restActionTargetGVRFn(ctx, ref)
 		targets, scoped := targetsFor(targetGVR, haveTarget)
 		targets, learnedTargets := splitLearned(targets)
-		lp.note(learnedTargets)
+		lp.note(learnedTargets, false)
 		restactionSeeds = append(restactionSeeds, restactionSeed{
 			ref: ref, targetGVR: targetGVR, targets: targets, learned: learnedTargets, scoped: scoped,
 		})
@@ -1123,14 +1123,14 @@ func seedScopeYielding(ctx context.Context,
 		do := func(cohortCtx context.Context) error {
 			return seedOneWidgetFn(cohortCtx, e, authnNS, mode)
 		}
-		err := seedOneTarget(c, do)
+		err := seedOneTarget(c, true, do)
 		if errors.Is(err, errSeedTerminalPutRefused) && ctx.Err() == nil {
 			// #394 — the post-readyz terminal PutIfGen was refused (the cell was
 			// removed during the resolve). ONE inline re-seed in the SAME mode
 			// (so PutIfGen again, fresh capture). NOT via failedSet →
 			// finalizeBootReEnqueue: that redrives a BOOT (plain-Put) scope.
 			err = reseedAfterTerminalPutRefusal("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c),
-				func() error { return seedOneTarget(c, do) })
+				func() error { return seedOneTarget(c, true, do) })
 		}
 		// #397: the FINAL error of this unit, after the #394 one-shot re-seed. A
 		// refused-then-reseeded unit is still ONE unit (the flat loop counts it
@@ -1158,12 +1158,12 @@ func seedScopeYielding(ctx context.Context,
 		do := func(cohortCtx context.Context) error {
 			return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS, mode)
 		}
-		err := seedOneTarget(c, do)
+		err := seedOneTarget(c, false, do)
 		if errors.Is(err, errSeedTerminalPutRefused) && ctx.Err() == nil {
 			// #394 — one-shot same-mode re-seed of the refused unit; see
 			// seedWidgetTarget. Never routed through failedSet.
 			err = reseedAfterTerminalPutRefusal("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c),
-				func() error { return seedOneTarget(c, do) })
+				func() error { return seedOneTarget(c, false, do) })
 		}
 		if err != nil && ctx.Err() != nil {
 			emitSeedAbort("restactions", ctx.Err())
@@ -1178,17 +1178,18 @@ func seedScopeYielding(ctx context.Context,
 	}
 
 	// ── #262: the LEARNED-class phases. ──
-	// learnedNBase is this pass's base-cohort unit count (the engine bound's
-	// T_base = t_unit · N_base). seedLearnedWidgetsFor / seedLearnedRAsFor seed
-	// one ADMITTED class's units; the admitted classes (newest LastSeen first; the admission runs once, lazily,
-	// after the base nav units so t_unit is measured) with the SAME per-target
-	// bodies as the base cohorts. Each returns true on a ctx abort.
-	learnedNBase := 0
+	// baseWidgetUnits / baseRAUnits are this pass's base-cohort units (the
+	// engine bound's T_base = W_base·t_widget + R_base·t_ra).
+	// seedLearnedWidgetsFor / seedLearnedRAsFor seed ONE admitted class's units
+	// with the SAME per-target bodies as the base cohorts; each returns true on
+	// a ctx abort. The admission (lp.decide) is taken at each phase boundary, so
+	// it reads the costs measured by the base units seeded just before it.
+	baseWidgetUnits, baseRAUnits := 0, 0
 	for _, ws := range widgetSeeds {
-		learnedNBase += len(ws.targets)
+		baseWidgetUnits += len(ws.targets)
 	}
 	for _, rs := range restactionSeeds {
-		learnedNBase += len(rs.targets)
+		baseRAUnits += len(rs.targets)
 	}
 	seedLearnedWidgetsFor := func(k string) bool {
 		for _, ws := range widgetSeeds {
@@ -1322,7 +1323,7 @@ func seedScopeYielding(ctx context.Context,
 		}
 		// #262: then the admitted learned classes, newest first, each class's
 		// widgets then its RESTActions (a capacity cut always leaves whole classes).
-		for _, k := range lp.orderedAdmitted(learnedNBase) {
+		for _, k := range lp.decide(baseWidgetUnits, baseRAUnits, 0, false).order {
 			if seedLearnedWidgetsFor(k) || seedLearnedRAsFor(k) {
 				return ctx.Err()
 			}
@@ -1434,12 +1435,16 @@ func seedScopeYielding(ctx context.Context,
 		}
 		navWidgetRemaining--
 	}
-	// #262: the admitted learned classes' nav widgets, newest class first, BEFORE
-	// the latch fires — a learned user's first navigation is warm when the pod
-	// turns Ready. The admission runs here (once), after the base nav units, so
-	// t_unit is measured. No learned class → the latch fires at the same instant
-	// as before (right after the last base nav unit).
-	for _, k := range lp.orderedAdmitted(learnedNBase) {
+	// #262: the admitted learned classes' nav widgets, newest class first. Those
+	// whose nav units fit the time left before the readiness BACKSTOP seed BEFORE
+	// the latch fires (a learned user's first navigation is warm when the pod
+	// turns Ready); the rest seed right AFTER it, in the same order — a latch
+	// released by the backstop is a failed boot, never worth one learned class.
+	// The admission is taken here, after the base nav units, so t_widget is
+	// measured. No learned class → the latch fires at the same instant as before.
+	backstopLeft, hasBackstop := latch.backstopRemaining()
+	navDecision := lp.decide(baseWidgetUnits, baseRAUnits, backstopLeft, hasBackstop)
+	for _, k := range navDecision.preLatch {
 		if seedLearnedWidgetsFor(k) {
 			if trackNav {
 				bootNavProgressState.cut()
@@ -1449,6 +1454,11 @@ func seedScopeYielding(ctx context.Context,
 	}
 	if navUnitsTotal > 0 && navWidgetRemaining == 0 {
 		fireFirstNav("segment-complete", distinctNavWidgets, navUnitsTotal)
+	}
+	for _, k := range navDecision.order[len(navDecision.preLatch):] {
+		if seedLearnedWidgetsFor(k) {
+			return ctx.Err()
+		}
 	}
 
 	// RA tail — RAs carry no NavOrder (they are the background content layer, not
@@ -1471,8 +1481,11 @@ func seedScopeYielding(ctx context.Context,
 			}
 		}
 	}
-	// #262: the admitted learned classes' RESTActions, after the base RA tail.
-	for _, k := range lp.orderedAdmitted(learnedNBase) {
+	// #262: the admitted learned classes' RESTActions, after the base RA tail —
+	// re-admitted now that the base RA tail has measured t_ra (a class admitted
+	// on the provisional nav-phase estimate but no longer fitting is left out and
+	// counted, its nav cells simply age out).
+	for _, k := range lp.decide(baseWidgetUnits, baseRAUnits, 0, false).order {
 		if seedLearnedRAsFor(k) {
 			return ctx.Err()
 		}

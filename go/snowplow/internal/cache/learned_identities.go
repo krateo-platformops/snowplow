@@ -52,8 +52,8 @@ import (
 
 // clientconfigSecretSuffix / clientCertificateDataKey are authn's storage
 // contract (authn internal/helpers/kube/config/storage/storage.go:
-// "%s-clientconfig" and ClientCertLabel). A Secret that does not carry both is
-// not a login artifact and is ignored.
+// "%s-clientconfig" and ClientCertLabel). The NAME selects a login artifact; a
+// clientconfig Secret without a readable certificate is counted unparseable.
 const (
 	clientconfigSecretSuffix = "-clientconfig"
 	clientCertificateDataKey = "client-certificate-data"
@@ -293,12 +293,13 @@ func parseClientconfigCertificate(sec *corev1.Secret) (username string, groups [
 	return cert.Subject.CommonName, g, cert.NotBefore, true
 }
 
+// isClientconfigSecret selects the login artifacts by NAME ONLY. It never
+// filters on the certificate key: a clientconfig authn writes in some other
+// format (no client-certificate-data) must count as UNPARSEABLE, not be skipped,
+// or the format-drift alarm (from_secrets == 0 while clientconfig Secrets
+// exist) reads 0/0 — a zero that looks like health.
 func isClientconfigSecret(sec *corev1.Secret) bool {
-	if sec == nil || !strings.HasSuffix(sec.Name, clientconfigSecretSuffix) {
-		return false
-	}
-	_, has := sec.Data[clientCertificateDataKey]
-	return has
+	return sec != nil && strings.HasSuffix(sec.Name, clientconfigSecretSuffix)
 }
 
 // detachSecretLocked removes the Secret source from its class, dropping the
@@ -467,6 +468,14 @@ func LearnedClassCounts() (registered, fromSecrets, unparseable int) {
 	return registered, fromSecrets, int(learned.unparseable.Load())
 }
 
+// LearnedClientconfigSecrets returns how many `*-clientconfig` Secrets the
+// registry sees — the denominator of the format-drift alarm.
+func LearnedClientconfigSecrets() int {
+	learned.mu.RLock()
+	defer learned.mu.RUnlock()
+	return len(learned.secrets)
+}
+
 // LearnedAdmissionStats returns (seeded, unseededCapacity).
 func LearnedAdmissionStats() (seeded, unseededCapacity int) {
 	return int(learnedAdmission.seeded.Load()), int(learnedAdmission.unseededCapacity.Load())
@@ -481,7 +490,8 @@ func LearnedAdmissionStats() (seeded, unseededCapacity int) {
 //	snowplow_learned_classes_from_secrets        — classes backed by a clientconfig Secret;
 //	                                               0 while clientconfig Secrets exist is an ALARM
 //	                                               (authn's certificate format moved)
-//	snowplow_learned_classes_secrets_unparseable — clientconfig Secrets whose certificate did not parse
+//	snowplow_learned_classes_secrets_unparseable — clientconfig Secrets no class could be read from
+//	snowplow_learned_clientconfig_secrets        — every `*-clientconfig` Secret seen (the alarm's denominator)
 //	snowplow_learned_classes_capacity            — the measured inputs of the last bound
 func init() {
 	if Disabled() {
@@ -516,6 +526,9 @@ func publishLearnedClassesExpvar() {
 	}))
 	expvar.Publish("snowplow_learned_classes_secrets_unparseable", expvar.Func(func() any {
 		return learned.unparseable.Load()
+	}))
+	expvar.Publish("snowplow_learned_clientconfig_secrets", expvar.Func(func() any {
+		return LearnedClientconfigSecrets()
 	}))
 	expvar.Publish("snowplow_learned_classes_capacity", expvar.Func(func() any {
 		learnedAdmission.mu.Lock()

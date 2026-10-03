@@ -30,28 +30,34 @@
 // LastSeen first, until the first of two measured capacities is reached:
 //
 //   - ENGINE: every keepwarm cycle must re-resolve every seeded unit before the
-//     next one, so Σ U_c · t_unit ≤ keepwarmSweepInterval − T_base, where
-//     t_unit is the measured mean wall cost of a resolved seed unit
-//     (enterSeedUnit), T_base = t_unit · (this pass's base-cohort units) and
-//     U_c the class's units in this pass. Equivalently
-//     Σ U_c ≤ interval/t_unit − N_base. Until a unit has been measured no
-//     class is admitted (never over-commit on a guess).
-//   - MEMORY: the new classes' cells (U_c · the store's measured mean entry
-//     size) must fit the L1 store's own byte/entry headroom AND the adaptive
-//     admission ceiling (cache.AdmissionCeiling, GOMEMLIMIT-relative). A class
-//     admitted last time already holds its cells and costs no new memory.
+//     next one, so Σ (W_c·t_widget + R_c·t_ra) ≤ keepwarmSweepInterval −
+//     (W_base·t_widget + R_base·t_ra), with t_widget / t_ra the measured mean
+//     wall cost of a resolved widget / RESTAction seed unit (kept apart: an RA
+//     can cost far more than an informer-served widget) and W/R the class's (or
+//     the base cohorts') units of each kind in this pass. Until a unit has been
+//     measured no class is admitted (never over-commit on a guess); until an RA
+//     has been measured t_ra borrows t_widget and the RA phase re-decides.
+//   - MEMORY: the new classes' cells (their units · the store's measured mean
+//     entry size) must fit the L1 store's own byte/entry headroom AND the
+//     adaptive admission ceiling (cache.AdmissionCeiling, GOMEMLIMIT-relative).
+//     A class admitted last time already holds its cells and costs no new memory.
 //
 // A class over capacity stays registered, unseeded, and counted
 // (snowplow_learned_classes_unseeded_capacity).
 //
 // SEEDING runs under each class's OWN identity through withCohortSeedContext
 // (the same seed primitives and terminal-Put guard as every cohort, so #424's
-// identityClassDrift still re-derives the class at Put). Order: boot /
-// gvr-discovered seed the admitted classes' nav widgets right after the base
-// nav widgets and before the first-nav latch fires (a learned user's first
-// navigation is warm when the pod turns Ready), then their RESTActions after
-// the base RA tail; keepwarm re-seeds them after the base cohorts. A login or a
-// membership change (a new class) enqueues the payload-free class-seed scope.
+// identityClassDrift still re-derives the class at Put). Order at boot /
+// gvr-discovered: the admitted classes whose nav units fit the time left before
+// the readiness BACKSTOP (the first-nav latch's recorded PHASE1_TIMEOUT /
+// pipGlobalTimeout deadline) seed their nav widgets right after the base nav
+// widgets and BEFORE the latch fires (a learned user's first navigation is warm
+// when the pod turns Ready); the remaining admitted classes seed theirs right
+// after the latch, in the same order — a latch released by the backstop is a
+// failed boot. Their RESTActions follow the base RA tail. Keepwarm re-seeds them
+// after the base cohorts. A login or a membership change (a new class) enqueues
+// the payload-free class-seed scope. The class-seed scope and the #258 reseed
+// share ONE customer-yielding resident pass (enumerateResident).
 
 package dispatchers
 
@@ -64,11 +70,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -126,12 +132,37 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 // learnedKey is a seed target's class key.
 func learnedKey(c seedTarget) string { return cache.LearnedClassKey(c.Username, c.Groups) }
 
-// ── per-unit cost measurement (the engine bound's t_unit) ───────────────────
+// ── per-unit cost measurement (the engine bound's t_unit, per kind) ─────────
+//
+// A widget seed and a RESTAction seed cost very differently (a nav widget is
+// mostly informer-served; an RA can run gojq over a large list), so the two
+// means are kept apart and every class is weighted by its own unit mix. At boot
+// only widgets have run when the pre-latch decision is taken; until an RA has
+// been measured the RA mean falls back to the widget mean, and the post-latch
+// RA decision is re-taken once the base RA tail has measured it.
 
-var (
-	seedUnitCostSumNs atomic.Int64
-	seedUnitCostCount atomic.Int64
-)
+type seedUnitCost struct {
+	sumNs atomic.Int64
+	count atomic.Int64
+}
+
+func (c *seedUnitCost) add(d time.Duration) {
+	if d <= 0 {
+		d = time.Nanosecond
+	}
+	c.sumNs.Add(int64(d))
+	c.count.Add(1)
+}
+
+func (c *seedUnitCost) mean() (time.Duration, bool) {
+	n := c.count.Load()
+	if n <= 0 {
+		return 0, false
+	}
+	return time.Duration(c.sumNs.Load() / n), true
+}
+
+var widgetUnitCost, raUnitCost seedUnitCost
 
 // seedUnitMarkerKey carries a per-target flag that enterSeedUnit sets when the
 // target really resolves (a fresh/age/liveness skip never reaches it).
@@ -139,13 +170,18 @@ type seedUnitMarkerKey struct{}
 
 // measuredSeedUnit runs one seed target and, if it resolved, records its whole
 // per-target wall cost (seed ctx build, key derivation, admission wait,
-// resolve, terminal Put) — the t_unit a keepwarm cycle pays per seeded unit.
-func measuredSeedUnit(ctx context.Context, do func(context.Context) error) error {
+// resolve, terminal Put) under its kind — the cost a keepwarm cycle pays per
+// seeded unit.
+func measuredSeedUnit(ctx context.Context, isWidget bool, do func(context.Context) error) error {
 	m := new(atomic.Bool)
 	start := time.Now()
 	err := do(context.WithValue(ctx, seedUnitMarkerKey{}, m))
 	if m.Load() {
-		recordSeedUnitCost(time.Since(start))
+		if isWidget {
+			widgetUnitCost.add(time.Since(start))
+		} else {
+			raUnitCost.add(time.Since(start))
+		}
 	}
 	return err
 }
@@ -157,54 +193,57 @@ func markSeedUnitResolved(ctx context.Context) {
 	}
 }
 
-// recordSeedUnitCost records one resolved seed unit's wall cost.
-func recordSeedUnitCost(d time.Duration) {
-	if d <= 0 {
-		d = time.Nanosecond
+// seedUnitCosts returns the per-kind costs the bound uses. ok=false until a
+// unit of either kind was measured; an unmeasured kind borrows the other's
+// mean (and says so in the measured flags).
+func seedUnitCosts() (tWidget, tRA time.Duration, wMeasured, rMeasured, ok bool) {
+	tWidget, wMeasured = widgetUnitCost.mean()
+	tRA, rMeasured = raUnitCost.mean()
+	switch {
+	case wMeasured && rMeasured:
+	case wMeasured:
+		tRA = tWidget
+	case rMeasured:
+		tWidget = tRA
+	default:
+		return 0, 0, false, false, false
 	}
-	seedUnitCostSumNs.Add(int64(d))
-	seedUnitCostCount.Add(1)
-}
-
-// seedUnitMeanCost is the measured mean wall cost of a resolved seed unit over
-// the process lifetime; ok=false until one unit has been measured.
-func seedUnitMeanCost() (time.Duration, bool) {
-	n := seedUnitCostCount.Load()
-	if n <= 0 {
-		return 0, false
-	}
-	return time.Duration(seedUnitCostSumNs.Load() / n), true
+	return tWidget, tRA, wMeasured, rMeasured, true
 }
 
 func resetSeedUnitCostForTest() {
-	seedUnitCostSumNs.Store(0)
-	seedUnitCostCount.Store(0)
+	widgetUnitCost.sumNs.Store(0)
+	widgetUnitCost.count.Store(0)
+	raUnitCost.sumNs.Store(0)
+	raUnitCost.count.Store(0)
 }
 
 // ── admission (the self-adapting bound) ──────────────────────────────────────
 
 // learnedPlan is one pass's learned workload: every class with ≥1 distinct
-// target, newest LastSeen first, its units, and the pass's base-cohort units.
+// target (newest LastSeen first), its widget and RESTAction units, and the
+// pass's base-cohort units of each kind.
 type learnedPlan struct {
-	order []string
-	units map[string]int
-	nBase int
+	order  []string
+	wUnits map[string]int
+	rUnits map[string]int
+	baseW  int
+	baseR  int
 }
 
-// newLearnedPlan orders the classes present in units by the registry's
-// newest-LastSeen-first order.
-func newLearnedPlan(units map[string]int, nBase int) learnedPlan {
-	p := learnedPlan{units: units, nBase: nBase}
-	if len(units) == 0 {
+// newLearnedPlan orders the classes present in the unit maps by the registry's
+// newest-LastSeen-first order. A class that left the registry since the targets
+// were enumerated (Secret deleted / JWT expired) is not seeded.
+func newLearnedPlan(wUnits, rUnits map[string]int, baseW, baseR int) learnedPlan {
+	p := learnedPlan{wUnits: wUnits, rUnits: rUnits, baseW: baseW, baseR: baseR}
+	if len(wUnits) == 0 && len(rUnits) == 0 {
 		return p
 	}
 	for _, c := range cache.LearnedIdentitiesSnapshot() {
-		if units[c.Key()] > 0 {
-			p.order = append(p.order, c.Key())
+		if k := c.Key(); wUnits[k]+rUnits[k] > 0 {
+			p.order = append(p.order, k)
 		}
 	}
-	// A class that left the registry since the targets were enumerated is not
-	// seeded (its Secret was deleted / its JWT expired).
 	return p
 }
 
@@ -223,15 +262,20 @@ func learnedClassAdmitted(key string) bool {
 
 // learnedDecision is the outcome of one admission, with the measured inputs.
 type learnedDecision struct {
-	admitted      map[string]struct{}
+	admitted map[string]struct{}
+	order    []string // admitted, newest first
+	// preLatch is the newest-first prefix of order whose NAV units fit the
+	// readiness backstop budget (all of order when no backstop applies); the
+	// rest of order seeds right after the latch fires, in the same order.
+	preLatch      []string
 	bound         string // "engine" | "memory" | "none"
-	tUnit         time.Duration
-	measured      bool
-	capUnits      int64
-	usedUnits     int64
+	tWidget, tRA  time.Duration
+	budget        time.Duration // keepwarm interval − the base cohorts' cost
+	used          time.Duration
 	memHeadroom   int64
 	entryHeadroom int64
 	avgEntryBytes int64
+	memFit        int // the memory-feasible newest-first prefix length
 }
 
 // learnedMemoryInputs reads the memory side of the bound: the byte headroom
@@ -262,13 +306,28 @@ func learnedMemoryInputs() (memHeadroom, entryHeadroom, avgEntryBytes int64) {
 
 // decideLearnedAdmission applies the bound to plan, newest first, stopping at
 // the first class that does not fit (the admitted set is a newest-LastSeen
-// prefix). Publishes the decision (learnedAdmitted + the expvar stats).
-func decideLearnedAdmission(plan learnedPlan) learnedDecision {
+// prefix):
+//
+//   - ENGINE: Σ (W_c·t_widget + R_c·t_ra) ≤ keepwarmSweepInterval −
+//     (W_base·t_widget + R_base·t_ra) — every keepwarm cycle re-resolves every
+//     seeded unit; nothing is admitted until a unit has been measured.
+//   - MEMORY: a new class's cells (W_c+R_c at the store's mean entry size) fit
+//     the L1 byte/entry headroom and the adaptive admission ceiling.
+//
+// preLatchBudget (hasBackstop) is the time left before the readiness backstop:
+// the pre-latch prefix is the admitted classes whose NAV units fit it at
+// t_widget. Publishes the decision (learnedAdmitted + the expvar stats).
+//
+// memFit < 0 computes the memory side; memFit >= 0 reuses an earlier decision's
+// memory-feasible prefix length from the SAME pass (the cells that decision's
+// seeding just wrote are now in the store and must not be charged twice).
+func decideLearnedAdmission(plan learnedPlan, preLatchBudget time.Duration, hasBackstop bool, memFit int) learnedDecision {
 	d := learnedDecision{admitted: map[string]struct{}{}, bound: "none"}
-	d.tUnit, d.measured = seedUnitMeanCost()
+	tW, tR, wMeasured, rMeasured, measured := seedUnitCosts()
+	d.tWidget, d.tRA = tW, tR
 	interval := keepwarmSweepInterval()
-	if d.measured && d.tUnit > 0 {
-		d.capUnits = int64(interval/d.tUnit) - int64(plan.nBase)
+	if measured {
+		d.budget = interval - time.Duration(plan.baseW)*tW - time.Duration(plan.baseR)*tR
 	}
 	d.memHeadroom, d.entryHeadroom, d.avgEntryBytes = learnedMemoryInputs()
 
@@ -280,37 +339,82 @@ func decideLearnedAdmission(plan learnedPlan) learnedDecision {
 		_, ok := (*prev)[k]
 		return ok
 	}
-	var usedMem, usedEntries int64
+	// The two sides are newest-first prefixes, computed independently; the
+	// admitted set is the shorter one (that side is the binding bound).
+	engineFit := 0
 	for _, k := range plan.order {
-		u := int64(plan.units[k])
-		if d.usedUnits+u > d.capUnits {
-			d.bound = "engine"
+		cost := time.Duration(plan.wUnits[k])*tW + time.Duration(plan.rUnits[k])*tR
+		if !measured || d.used+cost > d.budget {
 			break
 		}
-		var mem, entries int64
-		if !resident(k) {
-			mem, entries = u*d.avgEntryBytes, u
+		d.used += cost
+		engineFit++
+	}
+	if memFit < 0 {
+		memFit = 0
+		var usedMem, usedEntries int64
+		for _, k := range plan.order {
+			var mem, entries int64
+			if !resident(k) {
+				u := int64(plan.wUnits[k] + plan.rUnits[k])
+				mem, entries = u*d.avgEntryBytes, u
+			}
+			if usedMem+mem > d.memHeadroom || usedEntries+entries > d.entryHeadroom {
+				break
+			}
+			usedMem += mem
+			usedEntries += entries
+			memFit++
 		}
-		if usedMem+mem > d.memHeadroom || usedEntries+entries > d.entryHeadroom {
-			d.bound = "memory"
-			break
+	}
+	d.memFit = memFit
+	n := engineFit
+	switch {
+	case memFit < engineFit:
+		n, d.bound = memFit, "memory"
+		d.used = 0
+		for _, k := range plan.order[:n] {
+			d.used += time.Duration(plan.wUnits[k])*tW + time.Duration(plan.rUnits[k])*tR
 		}
-		d.usedUnits += u
-		usedMem += mem
-		usedEntries += entries
+	case engineFit < len(plan.order):
+		d.bound = "engine"
+	}
+	for _, k := range plan.order[:n] {
 		d.admitted[k] = struct{}{}
+		d.order = append(d.order, k)
+	}
+	// The readiness backstop: only the nav units that fit the time left before
+	// it seed pre-latch; a latch released by the backstop is a FAILED boot.
+	var navUsed time.Duration
+	for _, k := range d.order {
+		nav := time.Duration(plan.wUnits[k]) * tW
+		if hasBackstop && navUsed+nav > preLatchBudget {
+			break
+		}
+		navUsed += nav
+		d.preLatch = append(d.preLatch, k)
 	}
 	admitted := d.admitted
 	learnedAdmitted.Store(&admitted)
+	backstopUs := int64(-1)
+	if hasBackstop {
+		backstopUs = preLatchBudget.Microseconds()
+	}
 	cache.SetLearnedAdmissionStats(len(d.admitted), len(plan.order)-len(d.admitted), map[string]any{
 		"bound":                 d.bound,
-		"t_unit_measured":       d.measured,
-		"t_unit_us":             d.tUnit.Microseconds(),
-		"keepwarm_interval_s":   int64(interval / time.Second),
-		"base_units":            plan.nBase,
-		"capacity_units":        d.capUnits,
-		"admitted_units":        d.usedUnits,
+		"t_widget_us":           tW.Microseconds(),
+		"t_ra_us":               tR.Microseconds(),
+		"t_widget_measured":     wMeasured,
+		"t_ra_measured":         rMeasured,
+		"keepwarm_interval_us":  interval.Microseconds(),
+		"base_widget_units":     plan.baseW,
+		"base_ra_units":         plan.baseR,
+		"budget_us":             d.budget.Microseconds(),
+		"admitted_cost_us":      d.used.Microseconds(),
 		"distinct_classes":      len(plan.order),
+		"prelatch_budget_us":    backstopUs,
+		"prelatch_classes":      len(d.preLatch),
+		"prelatch_nav_cost_us":  navUsed.Microseconds(),
 		"memory_headroom_bytes": d.memHeadroom,
 		"entry_headroom":        d.entryHeadroom,
 		"avg_entry_bytes":       d.avgEntryBytes,
@@ -322,12 +426,14 @@ func decideLearnedAdmission(plan learnedPlan) learnedDecision {
 		slog.String("subsystem", "cache"),
 		slog.Int("distinct_classes", len(plan.order)),
 		slog.Int("admitted", len(d.admitted)),
+		slog.Int("prelatch", len(d.preLatch)),
 		slog.String("bound", d.bound),
-		slog.Bool("t_unit_measured", d.measured),
-		slog.Int64("t_unit_us", d.tUnit.Microseconds()),
-		slog.Int("base_units", plan.nBase),
-		slog.Int64("capacity_units", d.capUnits),
-		slog.Int64("admitted_units", d.usedUnits),
+		slog.Int64("t_widget_us", tW.Microseconds()),
+		slog.Int64("t_ra_us", tR.Microseconds()),
+		slog.Bool("t_ra_measured", rMeasured),
+		slog.Int64("budget_us", d.budget.Microseconds()),
+		slog.Int64("admitted_cost_us", d.used.Microseconds()),
+		slog.Int64("prelatch_budget_us", backstopUs),
 	)
 	return d
 }
@@ -338,17 +444,17 @@ func resetLearnedAdmissionForTest() {
 
 // ── per-pass learned seeding (called from seedScopeYielding) ────────────────
 
-// learnedPass holds one seedScopeYielding pass's learned targets, split out of
-// the precomputed widget / restaction seeds so the base-cohort ranking, the
+// learnedPass collects one seedScopeYielding pass's learned workload, split out
+// of the precomputed widget / restaction seeds so the base-cohort ranking, the
 // NavOrder flat pass and the keepwarm prefix are unchanged.
 type learnedPass struct {
-	widgets [][]seedTarget // parallel to widgetSeeds
-	ras     [][]seedTarget // parallel to restactionSeeds
-	units   map[string]int
+	wUnits map[string]int
+	rUnits map[string]int
+	memFit int // -1 until the pass's first decision measured the memory side
+}
 
-	once          sync.Once
-	decision      learnedDecision
-	admittedOrder []string
+func newLearnedPass() *learnedPass {
+	return &learnedPass{wUnits: map[string]int{}, rUnits: map[string]int{}, memFit: -1}
 }
 
 // splitLearned returns targets without the learned ones, and the learned ones.
@@ -363,34 +469,29 @@ func splitLearned(targets []seedTarget) (base, learned []seedTarget) {
 	return base, learned
 }
 
-func (lp *learnedPass) note(learned []seedTarget) {
+func (lp *learnedPass) note(learned []seedTarget, isWidget bool) {
 	for _, c := range learned {
-		lp.units[learnedKey(c)]++
+		if isWidget {
+			lp.wUnits[learnedKey(c)]++
+		} else {
+			lp.rUnits[learnedKey(c)]++
+		}
 	}
 }
 
-// decide runs the admission once per pass, lazily — after the base nav units
-// have been seeded, so t_unit is measured by the time it is read.
-func (lp *learnedPass) decide(nBase int) learnedDecision {
-	lp.once.Do(func() {
-		plan := newLearnedPlan(lp.units, nBase)
-		lp.decision = decideLearnedAdmission(plan)
-		for _, k := range plan.order {
-			if _, ok := lp.decision.admitted[k]; ok {
-				lp.admittedOrder = append(lp.admittedOrder, k)
-			}
-		}
-	})
-	return lp.decision
+// decide applies the bound to this pass (re-taken at each phase boundary, so
+// the RA phase uses the RA cost the base RA tail just measured).
+//
+// The memory side is measured once per pass (the first decision); later
+// decisions in the pass reuse it, so the cells the pass itself wrote are not
+// charged again.
+func (lp *learnedPass) decide(baseW, baseR int, preLatchBudget time.Duration, hasBackstop bool) learnedDecision {
+	d := decideLearnedAdmission(newLearnedPlan(lp.wUnits, lp.rUnits, baseW, baseR), preLatchBudget, hasBackstop, lp.memFit)
+	lp.memFit = d.memFit
+	return d
 }
 
-// orderedAdmitted returns this pass's admitted classes, newest first.
-func (lp *learnedPass) orderedAdmitted(nBase int) []string {
-	lp.decide(nBase)
-	return lp.admittedOrder
-}
-
-// ── the class-seed scope (a login / membership change) ──────────────────────
+// ── the resident pass (class-seed scope + #258 reseed) ──────────────────────
 
 // registerEngineLearnedClassHook subscribes the engine to new learned classes.
 // The callback only enqueues the payload-free scope (coalesced); the new class
@@ -401,19 +502,25 @@ func registerEngineLearnedClassHook(e *prewarmEngine) {
 	})
 }
 
-// residentLearnedPlan is the learned workload over the RESIDENT units (the
-// harvester snapshots — no walk): the plan the bound is applied to, plus the
-// per-class reseed requests (widgets NavOrder first, then RESTActions).
-type residentLearnedPlan struct {
-	plan       learnedPlan
-	widgetReqs map[string][]reseedRequest
-	raReqs     map[string][]reseedRequest
+// residentUnit is one RESIDENT unit (harvester snapshot — no walk) with its
+// full, unfiltered identity target set (base + learned), in cohort-label order.
+type residentUnit struct {
+	isWidget bool
+	widget   navWidgetEntry
+	ra       templatesv1.ObjectReference
+	// harvested — the unit is in the harvester snapshot (the #258 reseed's
+	// domain); a proactive-only RA (RBAC-reachable, never walked) is enumerated
+	// only for the learned plan.
+	harvested bool
+	targets   []seedTarget
 }
 
-// planLearnedOverResident enumerates every resident unit once through the
-// learned wrapper. ok=false when nothing is resident yet (before the boot walk
-// harvested; the boot pass then reads the whole registry itself) or ctx ended.
-func planLearnedOverResident(ctx context.Context, deps rePrewarmDeps) (residentLearnedPlan, bool) {
+// enumerateResident walks the resident units ONCE — widgets in NavOrder, then
+// RESTActions by ns/name — yielding to customers before every unit (it runs on
+// every RBAC shift and every class-seed scope). withProactive adds the
+// RBAC-reachable RESTActions the boot seed unions in (learned plan only). On a
+// ctx cut it returns the prefix it reached.
+func enumerateResident(ctx context.Context, deps rePrewarmDeps, withProactive bool) []residentUnit {
 	widgetUnits := deps.navHarv.snapshot()
 	sort.SliceStable(widgetUnits, func(i, j int) bool {
 		if widgetUnits[i].NavOrder != widgetUnits[j].NavOrder {
@@ -422,90 +529,130 @@ func planLearnedOverResident(ctx context.Context, deps rePrewarmDeps) (residentL
 		return reseedWidgetNSName(widgetUnits[i]) < reseedWidgetNSName(widgetUnits[j])
 	})
 	raUnits := deps.harvester.snapshot()
-	if ProactiveRASeedEnabled() && deps.rw != nil {
+	harvested := make(map[string]struct{}, len(raUnits))
+	for _, r := range raUnits {
+		harvested[r.Namespace+"/"+r.Name] = struct{}{}
+	}
+	if withProactive && ProactiveRASeedEnabled() && deps.rw != nil {
 		raUnits = unionProactiveRARefs(raUnits, deps.rw, slog.Default())
 	}
 	sort.SliceStable(raUnits, func(i, j int) bool {
 		return raUnits[i].Namespace+"/"+raUnits[i].Name < raUnits[j].Namespace+"/"+raUnits[j].Name
 	})
-	if len(widgetUnits) == 0 && len(raUnits) == 0 {
-		return residentLearnedPlan{}, false
+	byLabel := func(ts []seedTarget) []seedTarget {
+		sort.SliceStable(ts, func(i, j int) bool { return cohortLogLabel(ts[i]) < cohortLogLabel(ts[j]) })
+		return ts
 	}
-	units := map[string]int{}
-	nBase := 0
-	rp := residentLearnedPlan{widgetReqs: map[string][]reseedRequest{}, raReqs: map[string][]reseedRequest{}}
+	out := make([]residentUnit, 0, len(widgetUnits)+len(raUnits))
 	for _, e := range widgetUnits {
 		if ctx.Err() != nil {
-			return residentLearnedPlan{}, false
+			return out
 		}
-		for _, c := range reseedIdentityTargetsAll(e.GVR) {
-			if !c.Learned {
-				nBase++
-				continue
-			}
-			k := learnedKey(c)
-			units[k]++
-			rp.widgetReqs[k] = append(rp.widgetReqs[k], reseedRequest{identity: c, isWidget: true, widget: e})
-		}
+		engineYieldCheckpoint(ctx)
+		out = append(out, residentUnit{isWidget: true, widget: e, harvested: true,
+			targets: byLabel(reseedIdentityTargetsAll(e.GVR))})
 	}
 	for _, ref := range raUnits {
 		if ctx.Err() != nil {
-			return residentLearnedPlan{}, false
+			return out
 		}
+		engineYieldCheckpoint(ctx)
 		targetGVR, ok := restActionTargetGVRFn(ctx, ref)
 		if !ok {
 			continue
 		}
-		for _, c := range reseedIdentityTargetsAll(targetGVR) {
-			if !c.Learned {
-				nBase++
-				continue
-			}
-			k := learnedKey(c)
-			units[k]++
-			rp.raReqs[k] = append(rp.raReqs[k], reseedRequest{identity: c, isWidget: false, ra: ref})
-		}
+		_, h := harvested[ref.Namespace+"/"+ref.Name]
+		out = append(out, residentUnit{ra: ref, harvested: h, targets: byLabel(reseedIdentityTargetsAll(targetGVR))})
 	}
-	rp.plan = newLearnedPlan(units, nBase)
-	return rp, true
+	return out
 }
 
-// refreshLearnedAdmission re-applies the bound over the resident units, so a
-// class that just BECAME distinct (a binding added on a group it presents — a
-// rotation) is admitted before the #258 reseed filters on the admission. A
-// no-op when no class is registered.
-func refreshLearnedAdmission(ctx context.Context, deps rePrewarmDeps) {
-	if r, _, _ := cache.LearnedClassCounts(); r == 0 {
-		return
+func (u residentUnit) request(c seedTarget) reseedRequest {
+	if u.isWidget {
+		return reseedRequest{identity: c, isWidget: true, widget: u.widget}
 	}
-	if rp, ok := planLearnedOverResident(ctx, deps); ok {
-		decideLearnedAdmission(rp.plan)
+	return reseedRequest{identity: c, isWidget: false, ra: u.ra}
+}
+
+// residentLearnedPlan is the learned plan over the resident units plus the
+// per-class reseed requests (widgets NavOrder first, then RESTActions).
+type residentLearnedPlan struct {
+	plan       learnedPlan
+	widgetReqs map[string][]reseedRequest
+	raReqs     map[string][]reseedRequest
+}
+
+func planFromResident(units []residentUnit) residentLearnedPlan {
+	wUnits, rUnits := map[string]int{}, map[string]int{}
+	baseW, baseR := 0, 0
+	rp := residentLearnedPlan{widgetReqs: map[string][]reseedRequest{}, raReqs: map[string][]reseedRequest{}}
+	for _, u := range units {
+		for _, c := range u.targets {
+			switch {
+			case !c.Learned && u.isWidget:
+				baseW++
+			case !c.Learned:
+				baseR++
+			case u.isWidget:
+				k := learnedKey(c)
+				wUnits[k]++
+				rp.widgetReqs[k] = append(rp.widgetReqs[k], u.request(c))
+			default:
+				k := learnedKey(c)
+				rUnits[k]++
+				rp.raReqs[k] = append(rp.raReqs[k], u.request(c))
+			}
+		}
 	}
+	rp.plan = newLearnedPlan(wUnits, rUnits, baseW, baseR)
+	return rp
+}
+
+// rotatedReqsFromResident is the #258 Q1 TARGET-FILTER over a resident pass:
+// the harvested (unit × identity) pairs whose folded subject rotated; a learned
+// class only if the bound admits it. Order: widgets NavOrder, RESTActions by
+// ns/name, identities by cohort label (unchanged from #258).
+func rotatedReqsFromResident(units []residentUnit, rotated cache.RotatedSubjectSet) []reseedRequest {
+	var reqs []reseedRequest
+	for _, u := range units {
+		if !u.harvested {
+			continue
+		}
+		for _, c := range u.targets {
+			if c.Learned && !learnedClassAdmitted(learnedKey(c)) {
+				continue
+			}
+			if rotated.Rotated(c.Username, c.Groups) {
+				reqs = append(reqs, u.request(c))
+			}
+		}
+	}
+	return reqs
 }
 
 // rePrewarmLearnedClasses is the scopeKindLearnedClass handler: seed the NEW
 // classes (drained from the registry) across the resident units, NavOrder
-// first, under their own identity, within the bound.
+// first, under their own identity, within the bound. Before the boot walk has
+// harvested anything there is nothing resident; the boot pass reads the whole
+// registry itself, so the drained classes are not lost.
 func rePrewarmLearnedClasses(ctx context.Context, deps rePrewarmDeps) error {
 	pending := cache.DrainPendingLearnedClasses()
 	if len(pending) == 0 {
 		return nil
 	}
-	rp, ok := planLearnedOverResident(ctx, deps)
-	if !ok {
-		if ctx.Err() != nil {
-			cache.RemergePendingLearnedClasses(pending)
-			return ctx.Err()
-		}
-		return nil // nothing resident yet: the boot pass seeds the whole registry
+	units := enumerateResident(ctx, deps, true)
+	if ctx.Err() != nil {
+		cache.RemergePendingLearnedClasses(pending)
+		return ctx.Err()
 	}
-	d := decideLearnedAdmission(rp.plan)
+	if len(units) == 0 {
+		return nil
+	}
+	rp := planFromResident(units)
+	d := decideLearnedAdmission(rp.plan, 0, false, -1)
 	var reqs []reseedRequest
-	for _, k := range rp.plan.order {
+	for _, k := range d.order {
 		if _, isNew := pending[k]; !isNew {
-			continue
-		}
-		if _, admitted := d.admitted[k]; !admitted {
 			continue
 		}
 		reqs = append(reqs, rp.widgetReqs[k]...)
