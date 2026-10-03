@@ -5,6 +5,7 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -52,3 +53,6 @@ func isSensitive398(gvr schema.GroupVersionResource) bool { return cache.IsSensi
 
 // sensitiveSkipped398 reads the #398 sensitive-resource Put-decline counter.
 func sensitiveSkipped398() uint64 { return cache.SensitiveSkippedPutForTest() }
+
+// sensitiveMemoSkipped398 reads the #398 seed-memo Store-skip counter.
+func sensitiveMemoSkipped398() uint64 { return apiref.SensitiveMemoStoreSkippedForTest() }
