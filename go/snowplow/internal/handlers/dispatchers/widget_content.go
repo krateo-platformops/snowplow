@@ -343,6 +343,15 @@ func populateWidgetContentL1(
 	// consults — is the authoritative pre/post-readyz boundary (the seed-mode
 	// discriminator freshness-audit ruled; seedScopeMode is not threaded into walk()).
 	// scope-waiver:TTLOverride: widgetContent-class cell — identity-free shared envelope, per-user serve-time filter (gateWidgetEnvelope). 1.12.3 A-1/R-1: it holds no per-user UAF refilter output because a refilter-touched resolve can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it) — previously this rested on isRBACSensitiveApiRefWidget's routing argument alone, which the R-1 finding showed is not a safe basis for a UAF claim (uaf_shortttl.go R-d-4 SITE MAP).
+	// #398 — the identity-FREE content shell must never hold a Secret body.
+	if cache.DeclineSensitivePut(ctx) {
+		log.Debug("widget_content.populate_declined_sensitive",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("effect", "the walker resolve read a sensitive resource; content cell not seeded (#398)"),
+		)
+		return
+	}
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,

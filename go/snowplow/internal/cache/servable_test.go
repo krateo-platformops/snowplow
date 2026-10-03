@@ -38,14 +38,16 @@ import (
 // servableTestGVR is the customer-style GVR used across the servability
 // tests. Secrets are registered in every fake-dynamic scheme builder, so
 // the informer LIST does not panic on an unknown List kind.
-var servableTestGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+// #398: core v1/secrets is never informed (IsSensitiveResource), so this
+// fixture uses v1/configmaps as its arbitrary core-group GVR instead.
+var servableTestGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
 
 // servableListKinds extends rbacListKinds with the Secrets List entry so
 // the fake dynamic client accepts a registered Secret informer's initial
 // LIST without panicking.
 func servableListKinds() map[schema.GroupVersionResource]string {
 	m := rbacListKinds()
-	m[servableTestGVR] = "SecretList"
+	m[servableTestGVR] = "ConfigMapList"
 	return m
 }
 
@@ -197,7 +199,7 @@ func newUnstructuredSecret(ns, name string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]any{
 			"apiVersion": "v1",
-			"kind":       "Secret",
+			"kind":       "ConfigMap",
 			"metadata": map[string]any{
 				"namespace": ns,
 				"name":      name,

@@ -631,6 +631,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	dict := r.dict
 
 	call := sc.calls[i]
+	// #398 — a call on a sensitive resource (core v1/secrets) marks the whole
+	// resolve: every resolved-output Put above it declines, so the Secret body
+	// is served to this requester and held nowhere. Bumped here, before any
+	// dispatch branch, so it holds whichever branch serves the call (the
+	// informer pivot never does — Gate 5b — but UAF/SA, the per-user apiserver
+	// dial and the in-process paths all pass through here).
+	if gvr, _, _, ok := cache.ParseAPIServerPathToDep(call.Path); ok && cache.IsSensitiveResource(gvr) {
+		cache.SensitiveTouchedSinkFromContext(gctx).Bump()
+	}
 	// Ship 0.30.121 R1-a — per-call verbose decision. `sc.ep` is shared
 	// across every call of this stage; setting Debug in place would race the
 	// concurrent workers. When this call wants the wire-dump, take a SHALLOW

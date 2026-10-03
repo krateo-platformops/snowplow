@@ -5,6 +5,7 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // e3286KeyInputs is cache.RAFullListKeyInputs PLUS the #423 SubjectBindingSet the
@@ -44,3 +45,10 @@ func expectDriftCounted424(t *testing.T, site string, before int64) {
 
 // sbsOf423 reads the #423 SubjectBindingSet (diagnostics in arm messages).
 func sbsOf423(in cache.ResolvedKeyInputs) string { return in.SubjectBindingSet }
+
+// isSensitive398 is the #398 classification (core v1/secrets is never informed).
+// A separate helper so the #423 harness reads it from one place.
+func isSensitive398(gvr schema.GroupVersionResource) bool { return cache.IsSensitiveResource(gvr) }
+
+// sensitiveSkipped398 reads the #398 sensitive-resource Put-decline counter.
+func sensitiveSkipped398() uint64 { return cache.SensitiveSkippedPutForTest() }

@@ -175,6 +175,10 @@ func seedTerminalPut(ctx context.Context, handle cacheHandle, key string, entry 
 	// to boot seeds too — #323's boot exemption is about LRU eviction, not about
 	// writing a body into the wrong identity class. Runs BEFORE every write below,
 	// the pre-readyz PutThenRemark included (#408).
+	// #398 — a seed resolve that read a sensitive resource writes nothing.
+	if cache.DeclineSensitivePut(ctx) {
+		return false
+	}
 	if entry != nil {
 		if drift := identityClassDriftCtx(ctx, entry.Inputs); drift != "" {
 			noteIdentityClassDrift("seed", drift)

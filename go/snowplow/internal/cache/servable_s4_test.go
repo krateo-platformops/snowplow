@@ -102,7 +102,9 @@ func (f *fakeDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*me
 	if served {
 		return &metav1.APIResourceList{
 			GroupVersion: groupVersion,
-			APIResources: []metav1.APIResource{{Name: "secrets", Namespaced: true, Kind: "Secret"}},
+			// #398: the shared servable fixture GVR is v1/configmaps (v1/secrets is
+			// never informed), so the fake serves that type.
+			APIResources: []metav1.APIResource{{Name: "configmaps", Namespaced: true, Kind: "ConfigMap"}},
 		}, nil
 	}
 	// Resource type not (yet) served — empty list, no error. This mirrors

@@ -37,8 +37,8 @@ import (
 // It re-derives, from the same package state `recordCell` reads, the two
 // conditions under which `recordCell` silently returns without counting:
 //
-//	1. Disabled() — CACHE_ENABLED is not truthy;
-//	2. the ctx carries no active FallthroughScope.
+//  1. Disabled() — CACHE_ENABLED is not truthy;
+//  2. the ctx carries no active FallthroughScope.
 //
 // Neither condition can be detected from the counters themselves: both
 // leave every total at 0, which is also the legitimate post-reset value.
@@ -112,6 +112,8 @@ var splitCases = []splitCase{
 	{ReasonApistageGetPartialShape, false, "returns (nil,false) -> fresh apiserver GET-by-name"},
 	{ReasonGetMissLetApiserver404, false, "deliberately lets the apiserver answer 404"},
 	{ReasonRawRead, false, "#443 raw=true skips the resolver and issues a live apiserver GET as the caller"},
+	{ReasonInformerSensitive, false, "#398: a sensitive resource is never informed — always a live apiserver read"},
+	{ReasonInformerRepresentation, false, "#398: a non-default representation is only the apiserver's to produce"},
 }
 
 // TestFallthroughSplit_RoutingCellsAndTotals is F4.
@@ -222,10 +224,11 @@ func TestFallthroughSplit_TableCoversEveryReason(t *testing.T) {
 		ReasonWidgetContentHit, ReasonWidgetContentMissPerUserFallback,
 		ReasonPluralsDiscoveryHop,
 		ReasonResolverPluralsHit, ReasonResolverPluralsMiss,
-		ReasonRawRead, // #443
+		ReasonRawRead,                                         // #443
+		ReasonInformerSensitive, ReasonInformerRepresentation, // #398
 	}
-	if len(allReasons) != 22 {
-		t.Fatalf("closed enum size = %d; design §3.2 states 21, plus #443's raw-read = 22 — update both this list and the "+
+	if len(allReasons) != 24 {
+		t.Fatalf("closed enum size = %d; design §3.2 states 21, plus #443's raw-read and #398's sensitive + representation = 24 — update both this list and the "+
 			"cardinality arithmetic if a reason was added", len(allReasons))
 	}
 

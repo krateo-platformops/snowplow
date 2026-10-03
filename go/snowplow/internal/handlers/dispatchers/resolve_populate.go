@@ -303,6 +303,9 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// reached this path it would still decline the re-Put rather than persist
 	// stale external data. Additive to the stage-error sink.
 	rctx, extTouchedSink := cache.WithExternalTouchedSink(rctx)
+	// #398 — sensitive-resource sink: a resolve that dispatched a core
+	// v1/secrets read must not be persisted by any resolved-output Put.
+	rctx, _ = cache.WithSensitiveTouchedSink(rctx)
 	// 1.12.3 A-1 / R-1 — install the UAF-touched sink, third sibling of the two
 	// above. The refresher has no CR, so the declaration limb of the gate can
 	// only read the HasUAF the original Put carried; the sink gives it a SECOND,
@@ -468,6 +471,17 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("uaf_reason", reason),
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
 			slog.String("effect", "prior entry kept, not refreshed; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
+		)
+		return nil
+	}
+
+	// #398 — a re-resolve that read a sensitive resource is never re-Put
+	// (structurally permanent for this cell: suppress on first occurrence).
+	if cache.DeclineSensitivePut(rctx) {
+		cache.NoteRefreshDecline(key, "sensitive_resource", true)
+		log.Debug("resolveAndPopulateL1: re-resolve read a sensitive resource; declining to re-Put",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
 		)
 		return nil
 	}
