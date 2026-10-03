@@ -10,7 +10,7 @@
 // released readiness, how long phase 1 took, or how many nav units were still
 // cold at the flip.
 //
-// THE INSTRUMENT (no behaviour change). Three surfaces:
+// THE INSTRUMENT (no behaviour change). Four surfaces:
 //
 //  1. ONE structured line per process, `prewarm.phase1.readiness_exit`, emitted
 //     at the readiness flip with outcome / elapsed / nav-unit counts / a bounded
@@ -22,6 +22,14 @@
 //  3. The detector `snowplow_phase1_deadline_released_total` (expvar here + the
 //     OTLP Int64ObservableCounter hand-wired in internal/metrics/metrics.go):
 //     0 or 1 per process, 1 iff outcome == "deadline". Healthy = 0.
+//  4. (#407) The SAME record as the expvar map `snowplow_phase1_readiness_exit`,
+//     set once, inside the same sync.Once that emits the line, from the same
+//     phase1ExitRecord value the line is built from. The line is INFO on a
+//     latch exit and production runs LOG_LEVEL=warn, so on the normal path this
+//     map (and the ready /readyz body's *_ms fields) is the only place the
+//     per-step timings can be read. Before the exit the map is the EMPTY OBJECT
+//     `{}` (no keys, not {"outcome":""}): a reader tells "not yet exited" by the
+//     absence of `outcome`.
 //
 // EXIT POINTS (enumerated, #397). Every cache.MarkPhase1Done call in the tree:
 //   - phase1_walk.go Step 7.6 seed-block defer (the C2 backstop) — outcomes
@@ -117,6 +125,14 @@ var (
 	phase1DeadlineReleased expvar.Int
 
 	phase1ExitMetricsOnce sync.Once
+
+	// phase1ExitRec is the #407 readiness-exit record, stored exactly once by
+	// recordPhase1ReadinessExitWith (nil before the exit). Read by the
+	// snowplow_phase1_readiness_exit expvar Func and by /readyz.
+	phase1ExitRec atomic.Pointer[phase1ExitRecord]
+	// phase1ExitRecSets counts stores of phase1ExitRec, so a test can assert
+	// the record is set exactly once per process.
+	phase1ExitRecSets atomic.Int64
 )
 
 func init() { registerPhase1ReadinessExitMetrics() }
@@ -128,6 +144,7 @@ func init() { registerPhase1ReadinessExitMetrics() }
 func registerPhase1ReadinessExitMetrics() {
 	phase1ExitMetricsOnce.Do(func() {
 		expvar.Publish("snowplow_phase1_deadline_released_total", &phase1DeadlineReleased)
+		expvar.Publish("snowplow_phase1_readiness_exit", expvar.Func(phase1ReadinessExitExpvar))
 	})
 }
 
@@ -158,6 +175,62 @@ func Phase1SinceProcessStart() time.Duration { return time.Since(phase1ProcessSt
 func Phase1ReadinessExitOutcome() string {
 	s, _ := phase1ExitOutcome.Load().(string)
 	return s
+}
+
+// phase1ExitRecord is the readiness-exit record (#397 line fields, #407 expvar
+// map). Counts, durations in ms and code-defined enums only — never an identity
+// or a widget name. *_ms step values are -1 when the step did not run.
+// AbortCause (#401) is set only on outcome=boot_aborted (a phase1Abort* value)
+// and DeadlineCause is then empty; on every other outcome AbortCause is empty.
+type phase1ExitRecord struct {
+	Outcome                    string `json:"outcome"`
+	DeadlineCause              string `json:"deadline_cause"`
+	AbortCause                 string `json:"abort_cause"`
+	LatchFired                 bool   `json:"latch_fired"`
+	ElapsedMs                  int64  `json:"elapsed_ms"`
+	SinceProcessStartMs        int64  `json:"since_process_start_ms"`
+	NavLatchArmed              bool   `json:"nav_latch_armed"`
+	NavBootPasses              int    `json:"nav_boot_passes"`
+	NavUnitsTotal              int    `json:"nav_units_total"`
+	NavUnitsSeeded             int    `json:"nav_units_seeded"`
+	NavUnitsRemaining          int    `json:"nav_units_remaining"`
+	Cohorts                    int    `json:"cohorts"`
+	NavUnitsExpectedDeny       int    `json:"nav_units_expected_deny"`
+	NavUnitsOperationalFailure int    `json:"nav_units_operational_failure"`
+	NavUnitsAborted            int    `json:"nav_units_aborted"`
+	WalkMs                     int64  `json:"walk_ms"`
+	SyncWaitMs                 int64  `json:"sync_wait_ms"`
+	ContentPrewarmMs           int64  `json:"content_prewarm_ms"`
+	ClusterListPrewarmMs       int64  `json:"cluster_list_prewarm_ms"`
+	SeedMs                     int64  `json:"seed_ms"`
+}
+
+// phase1ReadinessExitExpvar is the snowplow_phase1_readiness_exit value: the
+// record once the exit was recorded, the empty object {} before.
+func phase1ReadinessExitExpvar() any {
+	if r := phase1ExitRec.Load(); r != nil {
+		return *r
+	}
+	return struct{}{}
+}
+
+// Phase1ExitTimings are the ready /readyz body's #407 timing fields, copied
+// from the readiness-exit record. -1 = the step did not run.
+type Phase1ExitTimings struct {
+	ElapsedMs, WalkMs, SyncWaitMs, ContentPrewarmMs, ClusterListPrewarmMs, SeedMs int64
+}
+
+// Phase1ReadinessExitTimings returns the recorded exit's timings; ok is false
+// before the exit was recorded.
+func Phase1ReadinessExitTimings() (t Phase1ExitTimings, ok bool) {
+	r := phase1ExitRec.Load()
+	if r == nil {
+		return Phase1ExitTimings{}, false
+	}
+	return Phase1ExitTimings{
+		ElapsedMs: r.ElapsedMs, WalkMs: r.WalkMs, SyncWaitMs: r.SyncWaitMs,
+		ContentPrewarmMs: r.ContentPrewarmMs, ClusterListPrewarmMs: r.ClusterListPrewarmMs, SeedMs: r.SeedMs,
+	}, true
 }
 
 // Phase1DeadlineReleasedTotal is the OTLP accessor for the #397 detector.
@@ -250,6 +323,16 @@ func (p *bootNavProgress) snapshot() navProgressSnapshot {
 // cluster_list / seed). -1 = the step did not run.
 type phase1StepTimings struct {
 	walk, syncWait, content, clusterList, seed time.Duration
+}
+
+// stepMs is a step duration in ms, -1 when the step did not run (d < 0). The
+// sentinel is -1ns, and (-1ns).Milliseconds() truncates to 0 — before #407 the
+// line reported 0, not the documented -1, for a step that never ran.
+func stepMs(d time.Duration) int64 {
+	if d < 0 {
+		return -1
+	}
+	return d.Milliseconds()
 }
 
 func noPhase1StepTimings() phase1StepTimings {
@@ -375,11 +458,36 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 			phase1DeadlineReleased.Set(1)
 		}
 		snap := bootNavProgressState.snapshot()
-		remaining := snap.total - snap.processed
 		latchFired := false
 		if l := currentFirstNavLatch(); l != nil {
 			latchFired = l.fired()
 		}
+		rec := &phase1ExitRecord{
+			Outcome:                    outcome,
+			DeadlineCause:              deadlineCause,
+			AbortCause:                 abortCause,
+			LatchFired:                 latchFired,
+			ElapsedMs:                  elapsed.Milliseconds(),
+			SinceProcessStartMs:        Phase1SinceProcessStart().Milliseconds(),
+			NavLatchArmed:              snap.armed,
+			NavBootPasses:              snap.passes,
+			NavUnitsTotal:              snap.total,
+			NavUnitsSeeded:             snap.processed,
+			NavUnitsRemaining:          snap.total - snap.processed,
+			Cohorts:                    snap.cohorts,
+			NavUnitsExpectedDeny:       snap.expectedDeny,
+			NavUnitsOperationalFailure: snap.operational,
+			NavUnitsAborted:            snap.aborted,
+			WalkMs:                     stepMs(steps.walk),
+			SyncWaitMs:                 stepMs(steps.syncWait),
+			ContentPrewarmMs:           stepMs(steps.content),
+			ClusterListPrewarmMs:       stepMs(steps.clusterList),
+			SeedMs:                     stepMs(steps.seed),
+		}
+		// #407: publish BEFORE the log line, so a panicking handler cannot
+		// leave the map empty after the exit.
+		phase1ExitRec.Store(rec)
+		phase1ExitRecSets.Add(1)
 		level := phase1ExitLevel(outcome)
 		effect := "readiness released by the first-nav latch: every cohort's nav-widget units were processed"
 		switch outcome {
@@ -397,26 +505,26 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 		}
 		slog.Default().Log(context.Background(), level, "prewarm.phase1.readiness_exit",
 			slog.String("subsystem", "cache"),
-			slog.String("outcome", outcome),
-			slog.String("deadline_cause", deadlineCause),
-			slog.String("abort_cause", abortCause),
-			slog.Bool("latch_fired", latchFired),
-			slog.Int64("elapsed_ms", elapsed.Milliseconds()),
-			slog.Int64("since_process_start_ms", Phase1SinceProcessStart().Milliseconds()),
-			slog.Bool("nav_latch_armed", snap.armed),
-			slog.Int("nav_boot_passes", snap.passes),
-			slog.Int("nav_units_total", snap.total),
-			slog.Int("nav_units_seeded", snap.processed),
-			slog.Int("nav_units_remaining", remaining),
-			slog.Int("cohorts", snap.cohorts),
-			slog.Int("nav_units_expected_deny", snap.expectedDeny),
-			slog.Int("nav_units_operational_failure", snap.operational),
-			slog.Int("nav_units_aborted", snap.aborted),
-			slog.Int64("walk_ms", steps.walk.Milliseconds()),
-			slog.Int64("sync_wait_ms", steps.syncWait.Milliseconds()),
-			slog.Int64("content_prewarm_ms", steps.content.Milliseconds()),
-			slog.Int64("cluster_list_prewarm_ms", steps.clusterList.Milliseconds()),
-			slog.Int64("seed_ms", steps.seed.Milliseconds()),
+			slog.String("outcome", rec.Outcome),
+			slog.String("deadline_cause", rec.DeadlineCause),
+			slog.String("abort_cause", rec.AbortCause),
+			slog.Bool("latch_fired", rec.LatchFired),
+			slog.Int64("elapsed_ms", rec.ElapsedMs),
+			slog.Int64("since_process_start_ms", rec.SinceProcessStartMs),
+			slog.Bool("nav_latch_armed", rec.NavLatchArmed),
+			slog.Int("nav_boot_passes", rec.NavBootPasses),
+			slog.Int("nav_units_total", rec.NavUnitsTotal),
+			slog.Int("nav_units_seeded", rec.NavUnitsSeeded),
+			slog.Int("nav_units_remaining", rec.NavUnitsRemaining),
+			slog.Int("cohorts", rec.Cohorts),
+			slog.Int("nav_units_expected_deny", rec.NavUnitsExpectedDeny),
+			slog.Int("nav_units_operational_failure", rec.NavUnitsOperationalFailure),
+			slog.Int("nav_units_aborted", rec.NavUnitsAborted),
+			slog.Int64("walk_ms", rec.WalkMs),
+			slog.Int64("sync_wait_ms", rec.SyncWaitMs),
+			slog.Int64("content_prewarm_ms", rec.ContentPrewarmMs),
+			slog.Int64("cluster_list_prewarm_ms", rec.ClusterListPrewarmMs),
+			slog.Int64("seed_ms", rec.SeedMs),
 			slog.String("effect", effect),
 		)
 	})
@@ -447,6 +555,8 @@ func resetPhase1ReadinessExitForTest() {
 	phase1ExitOutcome.Store("")
 	phase1Stage.Store("")
 	phase1DeadlineReleased.Set(0)
+	phase1ExitRec.Store(nil)
+	phase1ExitRecSets.Store(0)
 	bootNavProgressState.reset()
 }
 
@@ -457,6 +567,15 @@ func ResetPhase1ReadinessExitForTest() { resetPhase1ReadinessExitForTest() }
 // SetPhase1StageForTest drives the /readyz `reason` from another package's
 // test. TEST-ONLY.
 func SetPhase1StageForTest(stage string) { setPhase1Stage(stage) }
+
+// RecordPhase1ReadinessExitForTest drives the REAL recorder with explicit
+// per-step timings so a cross-package test (/readyz) reads genuine values.
+// TEST-ONLY.
+func RecordPhase1ReadinessExitForTest(outcome string, elapsed, walk, syncWait, content, clusterList, seed time.Duration) {
+	recordPhase1ReadinessExit(outcome, "", elapsed, phase1StepTimings{
+		walk: walk, syncWait: syncWait, content: content, clusterList: clusterList, seed: seed,
+	})
+}
 
 // RecordPhase1DeadlineExitForTest drives the REAL recorder down the deadline
 // outcome so a cross-package test (the OTLP callback) reads a genuine 1.

@@ -25,6 +25,17 @@ type readyzInfo struct {
 	// "none-configured" — the prewarm.phase1.readiness_exit outcome. Omitted
 	// when no exit was recorded.
 	Outcome string `json:"outcome,omitempty"`
+	// #407 (ready only): the readiness-exit record's timings — elapsed_ms
+	// (Phase1Warmup start to flip) and the per-step walk / sync_wait /
+	// content_prewarm / cluster_list_prewarm / seed wall-clock in ms (-1 = the
+	// step did not run). The same values as snowplow_phase1_readiness_exit.
+	// Omitted when no exit was recorded.
+	ElapsedMs            *int64 `json:"elapsed_ms,omitempty"`
+	WalkMs               *int64 `json:"walk_ms,omitempty"`
+	SyncWaitMs           *int64 `json:"sync_wait_ms,omitempty"`
+	ContentPrewarmMs     *int64 `json:"content_prewarm_ms,omitempty"`
+	ClusterListPrewarmMs *int64 `json:"cluster_list_prewarm_ms,omitempty"`
+	SeedMs               *int64 `json:"seed_ms,omitempty"`
 }
 
 // ReadyCheck is the 0.30.102 Tag B probe-gated readiness endpoint.
@@ -68,6 +79,10 @@ func ReadyCheck() http.HandlerFunc {
 			code = http.StatusOK
 			body.Status = "ready"
 			body.Outcome = dispatchers.Phase1ReadinessExitOutcome()
+			if tm, ok := dispatchers.Phase1ReadinessExitTimings(); ok {
+				body.ElapsedMs, body.WalkMs, body.SyncWaitMs = &tm.ElapsedMs, &tm.WalkMs, &tm.SyncWaitMs
+				body.ContentPrewarmMs, body.ClusterListPrewarmMs, body.SeedMs = &tm.ContentPrewarmMs, &tm.ClusterListPrewarmMs, &tm.SeedMs
+			}
 		} else {
 			body.Reason = dispatchers.Phase1WarmingReason()
 			elapsed := int64(dispatchers.Phase1SinceProcessStart().Seconds())
