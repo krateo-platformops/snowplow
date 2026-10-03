@@ -8,9 +8,11 @@
 // identity (the UserInfo placed on ctx by middleware.RefreshAuth) using the
 // IDENTICAL key-derivation the /call dispatcher uses:
 //
-//   - identity-bound classes (restactions/widgets/apistage/raFullList) ->
+//   - identity-bound classes (restactions/widgets/apistage) ->
 //     dispatchCacheLookupKey: rbac.EvaluateRBAC(ctx-identity, get, gvr, ns,
 //     name) -> BindingUID -> cache.ComputeKey (helpers.go:200-243).
+//   - raFullList (identity-bound, page-independent) -> apiref.RAFullListKey,
+//     the same builder the cell is stored and refreshed under (#426).
 //   - widgetContent (identity-free) -> dispatchWidgetContentKey
 //     (helpers.go:147-168, identity-free ComputeKey).
 //
@@ -38,6 +40,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -247,16 +250,34 @@ func deriveSubscriptionWithReason(ctx context.Context, coords SubscriptionCoordi
 		}
 		return key, inputs, true, SubscriptionArmed
 
+	case cache.CacheEntryClassRAFullList:
+		// #426: a raFullList cell is keyed by its OWN builder
+		// (apiref.RAFullListKey: page-independent, no RBACSubGen fold, slice
+		// extras stripped), not by dispatchCacheLookupKey. Mint through that
+		// same builder so the armed key is the key the refresher emits. Still
+		// identity-bound and forgery-proof: the BindingUID and binding-set
+		// digest come from ctx's identity. No objects.Get, so an empty key is
+		// never an informer-miss.
+		if cache.ResolvedCache() == nil {
+			return "", nil, false, SubscriptionSkipOther
+		}
+		inputs, key, ok := apiref.RAFullListKey(ctx,
+			schema.GroupVersionResource{Group: coords.Group, Version: coords.Version, Resource: coords.Resource},
+			coords.Namespace, coords.Name, coords.Extras)
+		if !ok || key == "" {
+			return "", nil, false, SubscriptionSkipOther
+		}
+		return key, &inputs, true, SubscriptionArmed
+
 	case classRestActions,
-		cache.CacheEntryClassApistage,
-		cache.CacheEntryClassRAFullList:
+		cache.CacheEntryClassApistage:
 		// Identity-bound: dispatchCacheLookupKey folds the BindingUID derived
 		// from ctx's identity. A foreign coordinate set yields the caller's
 		// own BindingUID -> a key the foreign cell never publishes to.
 		//
 		// #64: these classes carry NO inline-extras blocks (they are not
-		// widgets — a RESTAction/apistage/raFullList cell's emit key folds only
-		// the request extras), so raw coords.Extras is request-only parity on
+		// widgets — a RESTAction/apistage cell's emit key folds only the
+		// request extras), so raw coords.Extras is request-only parity on
 		// BOTH sides. UNCHANGED. These arms issue NO objects.Get (only
 		// dispatchCacheLookupKey → in-process rbac.EvaluateRBAC), so an empty
 		// key here is never an informer-miss — SubscriptionSkipOther.
