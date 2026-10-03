@@ -3447,3 +3447,16 @@ func int64BytesFromEnv(key string, def int64) int64 {
 	}
 	return int64(f)
 }
+
+// Caps returns the transient LRU budgets (maxEntries, maxBytes). #262: the
+// learned-class memory bound reads the store's own headroom against these, so
+// a learned seed is never admitted into a store that would LRU-evict another
+// cohort's warm cell to hold it.
+func (c *ResolvedCacheStore) Caps() (maxEntries int, maxBytes int64) {
+	if c == nil {
+		return 0, 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.maxEntries, c.maxBytes
+}

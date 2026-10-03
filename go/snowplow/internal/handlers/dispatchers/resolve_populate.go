@@ -190,6 +190,15 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			}
 		}
 	}
+	// #262 privacy — a cell whose representative is a LEARNED class (a real
+	// username + its full group set, seeded from authn's clientconfig
+	// certificate) is refreshed under that identity; its refresh logs, and the
+	// resolve path below through the ctx logger, carry the class only as its
+	// sha256 label.
+	learnedRep := isLearnedIdentity(refreshUser)
+	if learnedRep {
+		log = learnedRedactingLogger(log, refreshUser, refreshGroups)
+	}
 	// #424 R1 — REPRESENTATIVE DRIFT. An identity-bound cell is keyed by the
 	// RBAC class of its first writer, recorded here as the representative. The
 	// re-resolve below runs under the representative's CURRENT RBAC; if they
@@ -226,6 +235,9 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// Mirrors withPhase1SAContext (phase1_walk.go).
 	if saEP != nil {
 		opts = append(opts, xcontext.WithUserConfig(*saEP))
+	}
+	if learnedRep {
+		opts = append(opts, xcontext.WithLogger(log))
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
 	// WithInternalEndpoint / WithInternalRESTConfig make cache.ClientConfigFor

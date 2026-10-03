@@ -195,6 +195,14 @@ const (
 	// mid-reseed is merged + re-armed (no dropped event).
 	scopeKindRBACShift prewarmScopeKind = "rbac-shift"
 
+	// scopeKindLearnedClass — #262. A NEW learned identity class appeared (a
+	// login or a membership change seen through a clientconfig Secret ADD /
+	// UPDATE, or a new live identity). Payload-free and coalesced on
+	// key()=="learned-class"; the new class keys wait in the cache registry's
+	// pending set, drained when the scope runs (rePrewarmLearnedClasses), which
+	// seeds them NavOrder first within the learned-class bound.
+	scopeKindLearnedClass prewarmScopeKind = "learned-class"
+
 	// Ship 2 (NOT wired this ship): scopeKindWidgetCR (a widget/RESTAction
 	// CR add/update/delete re-walks that object's subtree). The engine queue +
 	// rePrewarm core are built to accept it with no refactor.
@@ -577,6 +585,7 @@ func StartPrewarmEngine(ctx context.Context, handler func(ctx context.Context, s
 		// fn pointer) so a future engine re-entry would not double-wire.
 		registerEngineGVRDiscoveredHook(e)
 		registerEngineRBACShiftHook(e)
+		registerEngineLearnedClassHook(e)
 
 		// Publish expvar counters — Fix v2 PM Change #1. Inside startedOnce
 		// so initialisation runs exactly once.

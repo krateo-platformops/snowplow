@@ -56,6 +56,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// /call as in-flight so the prewarm engine yields its background
 	// re-seed work for the dispatch's duration.
 	defer markCustomerInFlight()()
+	// #262 S2 — see restactions.go.
+	observeLiveCaller(req)
 
 	extras, err := util.ParseExtras(req)
 	if err != nil {

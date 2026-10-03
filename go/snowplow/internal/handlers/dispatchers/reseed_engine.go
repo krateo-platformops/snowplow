@@ -21,7 +21,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sort"
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -61,9 +60,11 @@ func reseedUnderCurrentIdentity(cohortCtx context.Context, deps rePrewarmDeps, r
 
 // reseedOnce runs one target under a fresh per-target cohort ctx.
 func reseedOnce(ctx context.Context, deps rePrewarmDeps, req reseedRequest, mode seedScopeMode) error {
-	cohortCtx, cancel := reseedCohortCtx(ctx, deps, req.identity)
-	defer cancel()
-	return reseedUnderCurrentIdentity(cohortCtx, deps, req, mode)
+	return measuredSeedUnit(ctx, req.isWidget, func(mctx context.Context) error {
+		cohortCtx, cancel := reseedCohortCtx(mctx, deps, req.identity)
+		defer cancel()
+		return reseedUnderCurrentIdentity(cohortCtx, deps, req, mode)
+	})
 }
 
 // reseedWithRefusalPolicy reseeds one target and applies the per-mode refusal
@@ -223,86 +224,27 @@ func reseedTargetLabel(req reseedRequest) string {
 	return req.ra.Namespace + "/" + req.ra.Name
 }
 
-// reseedIdentityTargets resolves the per-binding identity target set for a target
-// GVR — the SAME enumeration the boot seed uses (enumeratePrewarmTargetsForGVRFn),
-// so the reseed's (unit × identity) set is a faithful subset of the boot's, never
-// a parallel derivation (feedback_no_special_cases).
-func reseedIdentityTargets(gvr schema.GroupVersionResource) []seedTarget {
-	raw := enumeratePrewarmTargetsForGVRFn(gvr, "list")
-	out := make([]seedTarget, 0, len(raw))
-	for _, t := range raw {
-		out = append(out, seedTarget{
-			BindingUID:        t.BindingUID,
-			Username:          t.Subject.Username,
-			Groups:            append([]string(nil), t.Subject.Groups...),
-			CollapsedBindings: t.CollapsedBindings,
-		})
-	}
-	return out
-}
-
 // enumerateRotatedResidentTargets is the #258 Q1 TARGET-FILTER: it walks the
 // RESIDENT units (the harvester snapshots — NO fresh nav walk) and keeps only the
 // (unit × identity) pairs whose folded subject ROTATED in this flush
 // (RotatedSubjectSet.Rotated, mirroring the RBACSubGenForSubject key fold). The
-// identity side is the LIVE binding index (reseedIdentityTargets) read now, so a
-// WIDENING subject newly authorized for a resident unit is included with no extra
-// walk (TestS258_WideningSubjectAppearsInReseedSet). Units the harvester never
-// saw (a runtime-new GVR) belong to scopeKindGVRDiscovered.
+// identity side is the LIVE binding index (the SAME enumeration the boot seed
+// uses, enumeratePrewarmTargetsForGVRFn) read now, so a WIDENING subject newly
+// authorized for a resident unit is included with no extra walk
+// (TestS258_WideningSubjectAppearsInReseedSet). Units the harvester never saw (a
+// runtime-new GVR) belong to scopeKindGVRDiscovered.
 //
 // ORDER (zero-cold-nav): widget targets first, in NavOrder ASC (the walk's
 // first-nav priority — the dashboard / first pages warm first, as in the boot
 // flat pass), ties broken by ns/name then identity; RESTAction targets after
 // (the boot RA tail), by ns/name then identity. The harvester snapshots are map
 // iterations, so without this the reseed order would be random.
+//
+// #262: one resident pass (enumerateResident, customer-yielding per unit) feeds
+// both this filter and the learned-class plan; a learned class is reseeded only
+// if the bound admits it.
 func enumerateRotatedResidentTargets(ctx context.Context, deps rePrewarmDeps, rotated cache.RotatedSubjectSet) []reseedRequest {
-	var reqs []reseedRequest
-	widgetsUnits := deps.navHarv.snapshot()
-	sort.SliceStable(widgetsUnits, func(i, j int) bool {
-		if widgetsUnits[i].NavOrder != widgetsUnits[j].NavOrder {
-			return widgetsUnits[i].NavOrder < widgetsUnits[j].NavOrder
-		}
-		return reseedWidgetNSName(widgetsUnits[i]) < reseedWidgetNSName(widgetsUnits[j])
-	})
-	raUnits := deps.harvester.snapshot()
-	sort.SliceStable(raUnits, func(i, j int) bool {
-		return raUnits[i].Namespace+"/"+raUnits[i].Name < raUnits[j].Namespace+"/"+raUnits[j].Name
-	})
-	for _, e := range widgetsUnits {
-		if ctx.Err() != nil {
-			return reqs
-		}
-		engineYieldCheckpoint(ctx)
-		for _, c := range sortedReseedIdentities(e.GVR) {
-			if rotated.Rotated(c.Username, c.Groups) {
-				reqs = append(reqs, reseedRequest{identity: c, isWidget: true, widget: e})
-			}
-		}
-	}
-	for _, ref := range raUnits {
-		if ctx.Err() != nil {
-			return reqs
-		}
-		engineYieldCheckpoint(ctx)
-		targetGVR, haveTarget := restActionTargetGVRFn(ctx, ref)
-		if !haveTarget {
-			continue
-		}
-		for _, c := range sortedReseedIdentities(targetGVR) {
-			if rotated.Rotated(c.Username, c.Groups) {
-				reqs = append(reqs, reseedRequest{identity: c, isWidget: false, ra: ref})
-			}
-		}
-	}
-	return reqs
-}
-
-// sortedReseedIdentities is reseedIdentityTargets in a deterministic identity
-// order (cohort label ASC), so the reseed order within one unit is stable.
-func sortedReseedIdentities(gvr schema.GroupVersionResource) []seedTarget {
-	ids := reseedIdentityTargets(gvr)
-	sort.SliceStable(ids, func(i, j int) bool { return cohortLogLabel(ids[i]) < cohortLogLabel(ids[j]) })
-	return ids
+	return rotatedReqsFromResident(enumerateResident(ctx, deps, false), rotated)
 }
 
 func reseedWidgetNSName(e navWidgetEntry) string {

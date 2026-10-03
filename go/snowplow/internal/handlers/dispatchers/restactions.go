@@ -64,6 +64,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// duration of the dispatch (feedback_customer_priority_over_refresher).
 	// Cheap atomic; deferred decrement covers every return path.
 	defer markCustomerInFlight()()
+	// #262 S2 — record the caller's identity class (in memory) so a class no
+	// clientconfig Secret describes is still seeded. At the ServeHTTP entry,
+	// never in the key-mint path the seeds also run through.
+	observeLiveCaller(req)
 
 	extras, err := util.ParseExtras(req)
 	if err != nil {
