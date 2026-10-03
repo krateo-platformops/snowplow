@@ -382,6 +382,13 @@ func raFullListServe(
 						return nil, false, nil
 					}
 					cache.Deps().ReplayEdges(ctx, widgetL1Key, edges)
+					// #406 — this body is DERIVED from the raKey cell, which may be
+					// dirty-marked and not yet refreshed (an RA edit marks both; the
+					// refresher may dequeue the widget first). Note which raKey version
+					// was sliced; it travels with this resolve to its Put, which remarks
+					// the widget if raKey is by then absent or at another version, and a
+					// later raKey commit at a new version remarks the stored widget.
+					c.NoteRAFullListSlice(ctx, raKey, entry)
 					cache.RecordRAFullListServe(cache.RAFullListServeHit)
 					return sliced, true, nil
 				}
@@ -393,6 +400,11 @@ func raFullListServe(
 		// Cell miss under a known-sliceable verdict: resolve unpaginated,
 		// re-Put the cell, then Go-slice. No re-verify needed (the verdict
 		// is already established for this shape).
+		//
+		// #406 — this widget's body now comes from the fresh resolve, not from a
+		// cached raKey version: it is no longer a consumer of an older one, so the
+		// raKey Put below must not remark it.
+		c.ForgetRAFullListConsumer(raKey, widgetL1Key)
 		full, rerr := resolveRA(fullCtx, 0, 0)
 		if rerr != nil {
 			return nil, false, rerr
@@ -448,6 +460,8 @@ func raFullListServe(
 
 	// --- First sight of (RA × shape): byte-VERIFY, then memoise ---------
 	// 1. Resolve UNPAGINATED -> full F (deps scoped to the RAFullList key).
+	// #406 — as on the repopulate branch: a fresh-resolve body is no consumer.
+	c.ForgetRAFullListConsumer(raKey, widgetL1Key)
 	full, err := resolveRA(fullCtx, 0, 0)
 	if err != nil {
 		return nil, false, err

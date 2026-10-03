@@ -312,6 +312,13 @@ type ResolvedEntry struct {
 	// accounting.
 	Pinned bool
 
+	// contentVersion — #406: content version of a RAFullList entry (0 for every
+	// other class), stamped under mu by raLayerCommitLocked as the entry is stored:
+	// the resident prior's version when the bytes are identical, a new one otherwise.
+	// Widgets that Go-slice the entry carry it to their Put (ra_full_list_layers.go).
+	// Written only under mu before the entry is readable; never mutated after.
+	contentVersion uint64
+
 	// TTLOverride — R1 Layer 2 (#36) bounded-staleness backstop. When > 0,
 	// THIS entry expires after TTLOverride instead of the store's standard
 	// ttl. Set to the short CATALOG_UNSERVABLE_TTL_SECONDS when an apistage
@@ -627,6 +634,10 @@ type ResolvedCacheStore struct {
 
 	// LRU eviction order: front = most-recently-used.
 	order *list.List
+	// layers — #406: the raKey <-> widget consumer index (ra_full_list_layers.go).
+	// Updated under mu (lock order mu → layers.mu).
+	layers raLayerIndex
+
 	// Lookup index. Value is *list.Element whose Value is *lruItem.
 	index map[string]*list.Element
 
@@ -1350,10 +1361,15 @@ func (c *ResolvedCacheStore) Has(key string) bool {
 // is set to time.Now() if zero. Putting under a key that already exists
 // replaces the entry and adjusts curBytes accordingly.
 func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
+	c.putPlain(context.Background(), false, key, entry)
+}
+
+func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool, key string, entry *ResolvedEntry) {
 	if c == nil || entry == nil {
 		return
 	}
 	bytes, extrasHash := c.putPreamble(entry)
+	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 	// 1.12.6 C4 (§6.4) — a real Put is by definition the "next real Put" a
 	// refresh suppression waits for: clear the marker (and the consecutive-
 	// decline counter) BEFORE taking the store lock. Two sync.Map deletes,
@@ -1361,14 +1377,17 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	clearRefreshSuppression(key)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	// #189 — a plain (non-guarded) Put PRESERVES the key's current generation:
 	// replace-in-place keeps the live gen; a first Put over a tombstone adopts
 	// the tombstone's gen (and putCoreLocked drops the tombstone). Plain Put is
 	// the DOCUMENTED-SAFE / exempt carriers (boot seed, external-TTL) that cannot
 	// resurrect a raced DELETE; the request-path carriers use PutIfGen.
 	// Plain Put is never a re-mint (no ctx, exempt carriers) → freshMint=false.
+	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key), false)
+	layerRemarks := c.raLayerCommitLocked(ctx, provenanceKnown, key, samePrior, entry)
+	c.mu.Unlock()
+	remarkLayerConsumers(layerRemarks)
 }
 
 // PutThenRemark is a plain Put followed by the #375 PUT-THEN-REMARK check
@@ -1386,11 +1405,15 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 // ctx must be the resolve's ctx (WithL1KeyContext*), which carries the dep-gen
 // sink. On a ctx with no sink, the check treats the Put as drift: it counts
 // unguarded_put_total and remarks once, failing fresh.
+//
+// #406 — the store runs with provenanceKnown=true (putPlain): ctx's sink also holds
+// the raKey versions the body Go-sliced, so the layer check judges this Put by them.
+// #323's plain no-gen semantics are unchanged.
 func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entry *ResolvedEntry) {
 	if c == nil || entry == nil {
 		return
 	}
-	c.Put(key, entry)
+	c.putPlain(ctx, true, key, entry)
 	Deps().remarkIfDepsMovedFrom(ctx, key, true)
 }
 
@@ -1406,6 +1429,7 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(entry)
+	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 
 	c.mu.Lock()
 	if c.currentGenLocked(key) != capturedGen {
@@ -1419,13 +1443,18 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 	// the "next real Put" a suppression waits for). Only on ACCEPT — a refused
 	// Put populated nothing, so its key's suppression marker must stand.
 	clearRefreshSuppression(key)
+	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
+	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
 	c.mu.Unlock()
 	// #375 (option c) — ACCEPTED gen-guarded Put: after RELEASING c.mu (EnqueueRefresh
 	// must never run under the store lock), PUT-THEN-REMARK — remark this key once if any
 	// dep the resolve recorded moved since resolve entry (lastBumpSeq>startSeq), or if the
 	// resolve installed no sink (nil-sink drift → fail-fresh remark + unguarded_put detector).
 	Deps().remarkIfDepsMoved(ctx, key)
+	// #406 — a raKey commit with changed content remarks the widgets holding a slice of
+	// the old body; a widget Put of a slice of a since-superseded raKey remarks itself.
+	remarkLayerConsumers(layerRemarks)
 	return true
 }
 
@@ -1442,6 +1471,7 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(entry)
+	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 
 	c.mu.Lock()
 	el, live := c.index[key]
@@ -1454,10 +1484,14 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 		return false
 	}
 	clearRefreshSuppression(key)
+	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
+	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
 	c.mu.Unlock()
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
+	// #406 — see PutIfGen.
+	remarkLayerConsumers(layerRemarks)
 	return true
 }
 
@@ -1498,6 +1532,7 @@ func (c *ResolvedCacheStore) ReplaceIfGenReMint(ctx context.Context, key string,
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(entry)
+	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 
 	c.mu.Lock()
 	el, live := c.index[key]
@@ -1509,10 +1544,14 @@ func (c *ResolvedCacheStore) ReplaceIfGenReMint(ctx context.Context, key string,
 	clearRefreshSuppression(key)
 	// freshMint=true is INHERENT to the re-mint method (not computed from ctx): a
 	// fresh birth on the same-key REPLACE resets the max-age clock.
+	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, true)
+	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
 	c.mu.Unlock()
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
+	// #406 — see PutIfGen.
+	remarkLayerConsumers(layerRemarks)
 	return true
 }
 
@@ -2550,6 +2589,7 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	c.bumpGenTombstoneLocked(item.key, item.gen)
 	delete(c.index, item.key)
 	c.order.Remove(el)
+	c.raLayerForgetLocked(item.key) // #406
 	// 1.12.6 C4 (§6.4) — a refresh-suppression marker must not outlive its
 	// key (every eviction path but deleteForDep funnels through here).
 	clearRefreshSuppression(item.key)
@@ -2675,6 +2715,7 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	c.bumpGenTombstoneLocked(item.key, item.gen)
 	delete(c.index, item.key)
 	c.order.Remove(el)
+	c.raLayerForgetLocked(item.key) // #406
 	// 1.12.7 F6a — strip the dep edges HERE, under the same hold as the
 	// index delete, so no window exists in which the key is gone and its
 	// edges are not. The strip is a sync.Map operation that takes no store

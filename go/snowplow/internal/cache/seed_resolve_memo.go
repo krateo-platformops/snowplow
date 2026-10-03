@@ -87,6 +87,10 @@ type seedMemoValue struct {
 	Body  map[string]any
 	Deps  []DepKey
 	Stamp uint64
+	// Layers — #406: the raKey content versions the producing resolve Go-sliced. A
+	// hit replays them onto its own sink (ReplayRAFullListSlices) so the memo-served
+	// widget's Put is judged against them, like the producer's.
+	Layers LayeredSources
 }
 
 // SeedResolveMemo memoizes the resolved output of a heavy RESTAction across the
@@ -203,15 +207,22 @@ func sortStrings(s []string) {
 // Put-check judges the reused deps from the body's as-of, not its own entry
 // (#411 C1, the torn [depEventSeq.Add → bucket stamp] window).
 func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, uint64, bool) {
+	body, deps, stamp, _, ok := mo.LoadLayered(key)
+	return body, deps, stamp, ok
+}
+
+// LoadLayered is Load plus the raKey versions the producing resolve sliced (#406),
+// read off the SAME value as the body, deps and stamp.
+func (mo *SeedResolveMemo) LoadLayered(key string) (map[string]any, []DepKey, uint64, LayeredSources, bool) {
 	if mo == nil {
-		return nil, nil, 0, false
+		return nil, nil, 0, nil, false
 	}
 	v, ok := mo.m.Load(key)
 	if !ok {
 		mo.mu.Lock()
 		mo.misses++
 		mo.mu.Unlock()
-		return nil, nil, 0, false
+		return nil, nil, 0, nil, false
 	}
 	val, _ := v.(*seedMemoValue)
 	if val != nil && seedMemoDepsMovedSince(val.Deps, val.Stamp) {
@@ -219,21 +230,21 @@ func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, uint64, b
 		mo.misses++
 		mo.staleMisses++
 		mo.mu.Unlock()
-		return nil, nil, 0, false
+		return nil, nil, 0, nil, false
 	}
 	mo.mu.Lock()
 	mo.hits++
 	mo.mu.Unlock()
 	if val == nil {
-		return nil, nil, 0, true
+		return nil, nil, 0, nil, true
 	}
 	// Deps is returned as a slice-header copy — the caller only reads it to
 	// replay edges; the underlying DepKeys are immutable value structs.
 	deps := val.Deps
 	if mo.copyFn == nil {
-		return val.Body, deps, val.Stamp, true
+		return val.Body, deps, val.Stamp, val.Layers, true
 	}
-	return mo.copyFn(val.Body), deps, val.Stamp, true
+	return mo.copyFn(val.Body), deps, val.Stamp, val.Layers, true
 }
 
 // seedMemoDepsMovedSince reports whether any dep saw a dep event after stamp,
@@ -264,10 +275,16 @@ func seedMemoDepsMovedSince(deps []DepKey, stamp uint64) bool {
 // later-stamped producer can therefore never be overwritten by an older one
 // racing it. nil-receiver-safe (no-op) so an uninstalled call site never stores.
 func (mo *SeedResolveMemo) Store(key string, snapshot map[string]any, deps []DepKey, stamp uint64) {
+	mo.StoreLayered(key, snapshot, deps, stamp, nil)
+}
+
+// StoreLayered is Store plus the raKey versions the producing resolve sliced (#406).
+// Same monotone-in-stamp CAS replacement as Store.
+func (mo *SeedResolveMemo) StoreLayered(key string, snapshot map[string]any, deps []DepKey, stamp uint64, layers LayeredSources) {
 	if mo == nil {
 		return
 	}
-	nv := &seedMemoValue{Body: snapshot, Deps: deps, Stamp: stamp}
+	nv := &seedMemoValue{Body: snapshot, Deps: deps, Stamp: stamp, Layers: layers}
 	for {
 		cur, loaded := mo.m.LoadOrStore(key, nv)
 		if !loaded {

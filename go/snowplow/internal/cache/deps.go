@@ -584,6 +584,10 @@ type depGenSink struct {
 	// putBoot (#408) records that putKey's Put came through the boot carrier
 	// (PutThenRemark), so a C3 re-check remark is attributed to it too.
 	putBoot bool
+	// layered — #406: the (raKey, contentVersion) cell sources this resolve Go-sliced (apiref
+	// fast path, NoteRAFullListSlice), captured by the SeedResolveMemo for its hit
+	// siblings (LayeredSourcesMark / LayeredSourcesSince).
+	layered []layeredSource
 }
 
 // addDepLocked appends dk unless already present. Caller holds s.mu.
