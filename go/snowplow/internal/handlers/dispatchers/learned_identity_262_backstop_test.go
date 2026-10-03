@@ -21,6 +21,8 @@ import (
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 )
 
@@ -44,6 +46,19 @@ func TestS262_PreLatchLearnedWorkFitsTheBackstop(t *testing.T) {
 		return inner(ctx, o)
 	}
 	t.Cleanup(func() { widgetsResolveFn = inner })
+	// PRIORITY (TL ruling): the base cohorts' RA content tail serves every user,
+	// so it seeds BEFORE the learned overflow's nav widgets.
+	var baseRA []time.Time
+	innerGet := seedObjectsGetFn
+	seedObjectsGetFn = func(ctx context.Context, ref templatesv1.ObjectReference) objects.Result {
+		if ui, err := xcontext.UserInfo(ctx); err == nil && ui.Username == "" {
+			mu.Lock()
+			baseRA = append(baseRA, time.Now())
+			mu.Unlock()
+		}
+		return innerGet(ctx, ref)
+	}
+	t.Cleanup(func() { seedObjectsGetFn = innerGet })
 	prevObs := firstNavFireObserver
 	firstNavFireObserver = func(string) {
 		mu.Lock()
@@ -102,6 +117,18 @@ func TestS262_PreLatchLearnedWorkFitsTheBackstop(t *testing.T) {
 		for _, j := range post {
 			if i < j {
 				t.Errorf("pre-latch classes must be the NEWEST: %s (older) pre-latch while %s (newer) post-latch", users[i], users[j])
+			}
+		}
+	}
+	if len(baseRA) == 0 {
+		t.Fatal("NON-VACUITY: the base cohort's RA tail never seeded")
+	}
+	lastBaseRA := baseRA[len(baseRA)-1]
+	for _, j := range post {
+		for _, ti := range resolves[users[j]] {
+			if ti.Before(lastBaseRA) {
+				t.Errorf("ORDER RED: the overflow class %s seeded a nav widget before the base RA content tail finished", users[j])
+				break
 			}
 		}
 	}

@@ -44,6 +44,7 @@
 package dispatchers
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,18 @@ type firstNavLatch struct {
 	// A latch released by it is a FAILED boot, so pre-latch work that is not
 	// required (learned classes) is admitted only within the time left.
 	backstop atomic.Int64
+}
+
+// armFirstNavLatchForSeed is engineSeed's latch arming (phase1_walk.go): it
+// builds the process latch and records the readiness BACKSTOP — the seed ctx's
+// deadline, which inherits the PHASE1_TIMEOUT parent and pipGlobalTimeout, so it
+// is their minimum. Extracted so an arm drives the production wiring.
+func armFirstNavLatchForSeed(pctx context.Context) *firstNavLatch {
+	l := ensureFirstNavLatch()
+	if dl, ok := pctx.Deadline(); ok {
+		l.setBackstopDeadline(dl)
+	}
+	return l
 }
 
 // setBackstopDeadline records the readiness backstop deadline.

@@ -27,6 +27,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"math/big"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -305,8 +306,29 @@ func l262WaitLearned(t *testing.T, n int) {
 // the resolve path's own sites do), the RESTAction fetch (a hermetic RA, no api
 // steps) and the RA target GVR.
 type l262StubOpts struct {
-	sleep time.Duration
-	probe bool
+	sleep time.Duration // both kinds, unless overridden below
+	// widgetSleep / raSleep — fixed, DISTINCT per-kind costs (deterministic
+	// bound arms); widgetSleepFor overrides the widget cost per requester.
+	widgetSleep, raSleep time.Duration
+	widgetSleepFor       map[string]time.Duration
+	probe                bool
+}
+
+func (o l262StubOpts) widgetCost(user string) time.Duration {
+	if d, ok := o.widgetSleepFor[user]; ok {
+		return d
+	}
+	if o.widgetSleep > 0 {
+		return o.widgetSleep
+	}
+	return o.sleep
+}
+
+func (o l262StubOpts) raCost() time.Duration {
+	if o.raSleep > 0 {
+		return o.raSleep
+	}
+	return o.sleep
 }
 
 func l262Stubs(t *testing.T, o l262StubOpts) {
@@ -316,8 +338,12 @@ func l262Stubs(t *testing.T, o l262StubOpts) {
 		widgetsResolveFn, seedObjectsGetFn, restActionTargetGVRFn, seedRestactionResolveAndPutFn = origW, origGet, origTGVR, origTail
 	})
 	widgetsResolveFn = func(ctx context.Context, _ widgets.ResolveOptions) (*widgets.Widget, error) {
-		if o.sleep > 0 {
-			time.Sleep(o.sleep)
+		user := ""
+		if ui, err := xcontext.UserInfo(ctx); err == nil {
+			user = ui.Username
+		}
+		if d := o.widgetCost(user); d > 0 {
+			time.Sleep(d)
 		}
 		if o.probe {
 			if ui, err := xcontext.UserInfo(ctx); err == nil {
@@ -341,13 +367,13 @@ func l262Stubs(t *testing.T, o l262StubOpts) {
 	restActionTargetGVRFn = func(_ context.Context, _ templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
 		return l262TargetGVR, true
 	}
-	if o.sleep > 0 {
+	if o.raCost() > 0 {
 		seedRestactionResolveAndPutFn = func(
 			ctx, resCtx context.Context, cr *templatesv1.RESTAction, ref templatesv1.ObjectReference,
 			authnNS, key string, handle cacheHandle, inputs *cache.ResolvedKeyInputs, got objects.Result,
 			stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink,
 		) error {
-			time.Sleep(o.sleep)
+			time.Sleep(o.raCost())
 			return seedRestactionResolveAndPutProd(ctx, resCtx, cr, ref, authnNS, key, handle, inputs, got, stageErrSink, extTouchedSink)
 		}
 	}
@@ -436,4 +462,71 @@ func l262StartWorker(t *testing.T, e *prewarmEngine) {
 			t.Error("the engine worker did not exit within 30s of its ctx cancel")
 		}
 	})
+}
+
+// l262WarmByKind splits a customer's warm units into widgets and RESTActions.
+func l262WarmByKind(t *testing.T, env *l262Env, ctx context.Context) (wWarm, wTotal, rWarm, rTotal int) {
+	t.Helper()
+	keys, handle := l262Keys(t, env, ctx)
+	for i, k := range keys {
+		_, ok := handle.GetNoTouch(k)
+		if i < len(env.widgets) {
+			wTotal++
+			if ok {
+				wWarm++
+			}
+		} else {
+			rTotal++
+			if ok {
+				rWarm++
+			}
+		}
+	}
+	return wWarm, wTotal, rWarm, rTotal
+}
+
+// l262Phases records the classes each learned phase seeded (learnedPhaseObserver).
+type l262Phases struct {
+	mu sync.Mutex
+	m  map[string][]string
+}
+
+func (p *l262Phases) get(phase string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.m[phase]...)
+}
+
+func l262ObservePhases(t *testing.T) *l262Phases {
+	t.Helper()
+	p := &l262Phases{m: map[string][]string{}}
+	prev := learnedPhaseObserver
+	learnedPhaseObserver = func(phase string, classes []string) {
+		p.mu.Lock()
+		p.m[phase] = classes
+		p.mu.Unlock()
+	}
+	t.Cleanup(func() { learnedPhaseObserver = prev })
+	return p
+}
+
+func l262Contains(xs []string, k string) bool {
+	for _, x := range xs {
+		if x == k {
+			return true
+		}
+	}
+	return false
+}
+
+func l262SameKeys(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -1323,7 +1323,9 @@ func seedScopeYielding(ctx context.Context,
 		}
 		// #262: then the admitted learned classes, newest first, each class's
 		// widgets then its RESTActions (a capacity cut always leaves whole classes).
-		for _, k := range lp.decide(baseWidgetUnits, baseRAUnits, 0, false).order {
+		kwDecision := lp.decide(baseWidgetUnits, baseRAUnits, 0, false)
+		noteLearnedPhase("keepwarm", kwDecision.order)
+		for _, k := range kwDecision.order {
 			if seedLearnedWidgetsFor(k) || seedLearnedRAsFor(k) {
 				return ctx.Err()
 			}
@@ -1435,30 +1437,37 @@ func seedScopeYielding(ctx context.Context,
 		}
 		navWidgetRemaining--
 	}
-	// #262: the admitted learned classes' nav widgets, newest class first. Those
-	// whose nav units fit the time left before the readiness BACKSTOP seed BEFORE
-	// the latch fires (a learned user's first navigation is warm when the pod
-	// turns Ready); the rest seed right AFTER it, in the same order — a latch
-	// released by the backstop is a failed boot, never worth one learned class.
-	// The admission is taken here, after the base nav units, so t_widget is
-	// measured. No learned class → the latch fires at the same instant as before.
+	// #262: the admitted learned classes' nav widgets, newest class first, whose
+	// nav units fit the time left before the readiness BACKSTOP seed BEFORE the
+	// latch fires (a learned user's first navigation is warm when the pod turns
+	// Ready). A latch released by the backstop is a failed boot, never worth one
+	// learned class: the admission is taken here (after the base nav units, so
+	// t_widget is measured) AND the time left is re-checked before EACH class
+	// (#442), so a slow tail moves the rest to after the latch. No learned class →
+	// the latch fires at the same instant as before.
 	backstopLeft, hasBackstop := latch.backstopRemaining()
 	navDecision := lp.decide(baseWidgetUnits, baseRAUnits, backstopLeft, hasBackstop)
+	seededPre := map[string]struct{}{}
+	var preOrder []string
 	for _, k := range navDecision.preLatch {
+		if hasBackstop {
+			tW, _, _, _, _ := seedUnitCosts()
+			if left, ok := latch.backstopRemaining(); !ok || left < lp.navCost(k, tW) {
+				break // #442: the rest seed after the latch
+			}
+		}
 		if seedLearnedWidgetsFor(k) {
 			if trackNav {
 				bootNavProgressState.cut()
 			}
 			return ctx.Err()
 		}
+		seededPre[k] = struct{}{}
+		preOrder = append(preOrder, k)
 	}
+	noteLearnedPhase("prelatch", preOrder)
 	if navUnitsTotal > 0 && navWidgetRemaining == 0 {
 		fireFirstNav("segment-complete", distinctNavWidgets, navUnitsTotal)
-	}
-	for _, k := range navDecision.order[len(navDecision.preLatch):] {
-		if seedLearnedWidgetsFor(k) {
-			return ctx.Err()
-		}
 	}
 
 	// RA tail — RAs carry no NavOrder (they are the background content layer, not
@@ -1481,15 +1490,35 @@ func seedScopeYielding(ctx context.Context,
 			}
 		}
 	}
-	// #262: the admitted learned classes' RESTActions, after the base RA tail —
-	// re-admitted now that the base RA tail has measured t_ra (a class admitted
-	// on the provisional nav-phase estimate but no longer fitting is left out and
-	// counted, its nav cells simply age out).
-	for _, k := range lp.decide(baseWidgetUnits, baseRAUnits, 0, false).order {
+	// #262: the learned overflow, AFTER the base RA tail (the base cohorts' RA
+	// content serves every user; it comes first). The admission is re-taken now
+	// that the base RA tail measured t_ra: the admitted classes not seeded
+	// pre-latch get their nav widgets now, newest first, then every admitted
+	// class gets its RESTActions. A pre-latch class the RA-phase bound no longer
+	// admits keeps only its nav cells (they age out); it is counted in
+	// snowplow_learned_classes_nav_only.
+	raDecision := lp.decide(baseWidgetUnits, baseRAUnits, 0, false)
+	noteLearnedPhase("ra", raDecision.order)
+	for _, k := range raDecision.order {
+		if _, done := seededPre[k]; done {
+			continue
+		}
+		if seedLearnedWidgetsFor(k) {
+			return ctx.Err()
+		}
+	}
+	for _, k := range raDecision.order {
 		if seedLearnedRAsFor(k) {
 			return ctx.Err()
 		}
 	}
+	navOnly := 0
+	for k := range seededPre {
+		if _, ok := raDecision.admitted[k]; !ok {
+			navOnly++
+		}
+	}
+	cache.SetLearnedNavOnly(navOnly)
 	// #105: the pass reached its CLEAN tail (no ctx-cut abort). Decide the
 	// re-enqueue via the set-delta bound (boot scope) or the legacy per-pass
 	// latch (gvr-discovered / cache-off / pure-unit tests). NIL return through

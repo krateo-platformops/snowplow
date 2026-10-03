@@ -501,13 +501,11 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			// warm rather than at the PHASE1_TIMEOUT backstop with cold cells.
 			// bootDone and the scopeDone callback are UNTOUCHED — the boot scope
 			// keeps seeding the RA content tail in background after the flip.
-			firstNav := ensureFirstNavLatch()
-			// #262: the latch carries the readiness backstop deadline (pctx is the
-			// seed ctx: min(PHASE1_TIMEOUT, pipGlobalTimeout)), so the boot pass
-			// admits pre-latch learned-class work only within the time left.
-			if dl, ok := pctx.Deadline(); ok {
-				firstNav.setBackstopDeadline(dl)
-			}
+			// #262: armFirstNavLatchForSeed also records the readiness backstop
+			// deadline (pctx is the seed ctx: min(PHASE1_TIMEOUT, pipGlobalTimeout))
+			// on the latch, so the boot pass admits pre-latch learned-class work only
+			// within the time left.
+			firstNav := armFirstNavLatchForSeed(pctx)
 
 			// Fix v2 / 0.30.248: the engine worker MUST use a process-
 			// lifetime ctx, NOT pctx. pctx is the boot-seed orchestration

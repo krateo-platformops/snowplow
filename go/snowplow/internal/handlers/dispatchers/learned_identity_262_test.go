@@ -255,13 +255,17 @@ func l262ManyUsers(t *testing.T, n int) ([]string, []*corev1.Secret) {
 }
 
 func TestF4_262_BoundHolds_EngineBindsFirst(t *testing.T) {
-	// keepwarm interval = TTL×3/4 = 750ms; every resolve costs ~40ms, so the
-	// interval affords ~18 units: 4 base + some, never all 5 learned classes.
+	// keepwarm interval = TTL×3/4 = 750ms. Fixed, DISTINCT per-kind costs (widget
+	// 40ms, RESTAction 60ms) make the bound deterministic: the nav-phase decision
+	// (t_ra not yet measured, so it borrows t_widget) and the RA-phase decision
+	// (t_ra measured) are asserted separately — widgets against the classes
+	// seeded pre-latch, RESTActions against the RA-phase admitted set.
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "1")
 	users, secrets := l262ManyUsers(t, 5)
 	env := l262Setup(t, l262Opts{extraUsers: users, secrets: secrets, widgets: 2, ras: 2})
-	l262Stubs(t, l262StubOpts{sleep: 40 * time.Millisecond})
+	l262Stubs(t, l262StubOpts{widgetSleep: 40 * time.Millisecond, raSleep: 60 * time.Millisecond})
 	l262WaitLearned(t, 5)
+	phases := l262ObservePhases(t)
 
 	l262Boot(t, env, seedModeBoot)
 
@@ -272,19 +276,22 @@ func TestF4_262_BoundHolds_EngineBindsFirst(t *testing.T) {
 	interval := keepwarmSweepInterval()
 	baseW, baseR := capm["base_widget_units"].(int), capm["base_ra_units"].(int)
 	budget, used := us("budget_us"), us("admitted_cost_us")
-	t.Logf("F4 engine bound: t_widget=%v t_ra=%v interval=%v base_units=%d+%d budget=%v admitted_cost=%v seeded=%d unseeded_capacity=%d bound=%v",
-		tW, tR, interval, baseW, baseR, budget, used, seeded, unseeded, capm["bound"])
+	pre, ra := phases.get("prelatch"), phases.get("ra")
+	t.Logf("F4 engine bound: t_widget=%v t_ra=%v interval=%v base_units=%d+%d budget=%v admitted_cost=%v "+
+		"prelatch=%d ra_admitted=%d seeded=%d unseeded_capacity=%d nav_only=%d bound=%v",
+		tW, tR, interval, baseW, baseR, budget, used, len(pre), len(ra), seeded, unseeded, cache.LearnedNavOnly(), capm["bound"])
 
-	if !capm["t_widget_measured"].(bool) || !capm["t_ra_measured"].(bool) || tW < 40*time.Millisecond || tR < 40*time.Millisecond {
-		t.Fatalf("both per-kind costs must be MEASURED from the seeded units (each ≥40ms): widget %v/%v ra %v/%v",
+	if !capm["t_widget_measured"].(bool) || !capm["t_ra_measured"].(bool) || tW < 40*time.Millisecond || tR < 60*time.Millisecond {
+		t.Fatalf("both per-kind costs must be MEASURED (widget ≥40ms, RA ≥60ms): widget %v/%v ra %v/%v",
 			capm["t_widget_measured"], tW, capm["t_ra_measured"], tR)
 	}
 	want := interval - time.Duration(baseW)*tW - time.Duration(baseR)*tR
 	if d := budget - want; d < -time.Millisecond || d > time.Millisecond {
 		t.Fatalf("budget identity: budget=%v, want interval − W_base·t_widget − R_base·t_ra = %v", budget, want)
 	}
-	if seeded < 1 || unseeded < 1 || seeded+unseeded != 5 {
-		t.Errorf("F4 RED: the bound must admit some and leave some out: seeded=%d unseeded_capacity=%d (5 distinct)", seeded, unseeded)
+	if seeded != len(ra) || seeded < 1 || unseeded < 1 || seeded+unseeded != 5 {
+		t.Errorf("F4 RED: the bound must admit some and leave some out: seeded=%d unseeded_capacity=%d ra_admitted=%d (5 distinct)",
+			seeded, unseeded, len(ra))
 	}
 	if capm["bound"] != "engine" {
 		t.Errorf("bound=%v, want engine", capm["bound"])
@@ -293,15 +300,30 @@ func TestF4_262_BoundHolds_EngineBindsFirst(t *testing.T) {
 	if used > budget || used+classCost <= budget {
 		t.Errorf("the admitted prefix must be the LONGEST that fits: admitted_cost=%v budget=%v (one class costs %v)", used, budget, classCost)
 	}
-	// NEWEST FIRST: the admitted classes are exactly the `seeded` newest.
-	for i, u := range users {
-		w, n := l262Warm(t, env, l262CustomerCtx(u, []string{l262Group}))
-		newest := i >= len(users)-seeded
-		if newest && w != n {
-			t.Errorf("F4 RED: %s is among the %d newest classes but only %d/%d warm", u, seeded, w, n)
+	// NEWEST FIRST, per kind: both sets are newest-first prefixes, the RA-phase
+	// set is a prefix of the pre-latch set, and warmth matches each kind's set.
+	newest := func(n int) []string {
+		out := make([]string, 0, n)
+		for i := len(users) - 1; i >= len(users)-n && i >= 0; i-- {
+			out = append(out, cache.LearnedClassKey(users[i], []string{l262Group}))
 		}
-		if !newest && w != 0 {
-			t.Errorf("F4 RED: %s is older than every admitted class yet %d units are warm (not newest-first)", u, w)
+		return out
+	}
+	if !l262SameKeys(pre, newest(len(pre))) || !l262SameKeys(ra, newest(len(ra))) || len(ra) > len(pre) {
+		t.Fatalf("F4 RED: the pre-latch (%d) and RA-phase (%d) sets must be newest-first prefixes, RA ⊆ pre-latch", len(pre), len(ra))
+	}
+	if navOnly := cache.LearnedNavOnly(); navOnly != len(pre)-len(ra) {
+		t.Errorf("nav_only=%d, want the pre-latch classes the RA phase dropped = %d", navOnly, len(pre)-len(ra))
+	}
+	for i, u := range users {
+		k := cache.LearnedClassKey(u, []string{l262Group})
+		wWarm, wTotal, rWarm, rTotal := l262WarmByKind(t, env, l262CustomerCtx(u, []string{l262Group}))
+		inPre, inRA := l262Contains(pre, k), l262Contains(ra, k)
+		if (inPre && wWarm != wTotal) || (!inPre && wWarm != 0) {
+			t.Errorf("F4 RED (widgets): %s (index %d) pre-latch=%v but %d/%d widget units warm", u, i, inPre, wWarm, wTotal)
+		}
+		if (inRA && rWarm != rTotal) || (!inRA && rWarm != 0) {
+			t.Errorf("F4 RED (RESTActions): %s (index %d) RA-admitted=%v but %d/%d RA units warm", u, i, inRA, rWarm, rTotal)
 		}
 	}
 
@@ -312,7 +334,7 @@ func TestF4_262_BoundHolds_EngineBindsFirst(t *testing.T) {
 	start := time.Now()
 	l262Boot(t, env, seedModeKeepwarm)
 	cycle := time.Since(start)
-	t.Logf("F4 keepwarm cycle: %v (interval %v)", cycle, interval)
+	t.Logf("F4 keepwarm cycle: %v (interval %v) over %d admitted classes", cycle, interval, len(phases.get("keepwarm")))
 	if cycle > interval {
 		t.Fatalf("F4 RED: a keepwarm cycle over the admitted set took %v, longer than the %v sweep interval", cycle, interval)
 	}

@@ -131,6 +131,7 @@ var learned struct {
 var learnedAdmission struct {
 	seeded           atomic.Int64
 	unseededCapacity atomic.Int64
+	navOnly          atomic.Int64
 	mu               sync.Mutex
 	capacity         map[string]any
 }
@@ -477,6 +478,13 @@ func LearnedClassCounts() (registered, fromSecrets, unparseable int) {
 	return registered, fromSecrets, int(learned.unparseable.Load())
 }
 
+// SetLearnedNavOnly records how many classes the last boot pass seeded
+// pre-latch (nav widgets) but its RA-phase admission then dropped.
+func SetLearnedNavOnly(n int) { learnedAdmission.navOnly.Store(int64(n)) }
+
+// LearnedNavOnly returns the last SetLearnedNavOnly value.
+func LearnedNavOnly() int { return int(learnedAdmission.navOnly.Load()) }
+
 // LearnedClientconfigSecrets returns how many `*-clientconfig` Secrets the
 // registry sees — the denominator of the format-drift alarm.
 func LearnedClientconfigSecrets() int {
@@ -495,7 +503,12 @@ func LearnedAdmissionStats() (seeded, unseededCapacity int) {
 //
 //	snowplow_learned_classes_registered          — every class in the registry
 //	snowplow_learned_classes_seeded              — admitted classes with ≥1 distinct target
-//	snowplow_learned_classes_unseeded_capacity   — distinct classes left out by the bound
+//	snowplow_learned_classes_unseeded_capacity   — distinct classes left out by the LAST bound decision
+//	                                               (at boot, the RA-phase decision: a class seeded nav-only
+//	                                               pre-latch but pruned there is INCLUDED, and also counted in
+//	                                               snowplow_learned_classes_nav_only)
+//	snowplow_learned_classes_nav_only            — classes the last boot pass seeded pre-latch whose RA-phase
+//	                                               admission then dropped them (nav cells only; they age out)
 //	snowplow_learned_classes_from_secrets        — classes backed by a clientconfig Secret;
 //	                                               0 while clientconfig Secrets exist is an ALARM
 //	                                               (authn's certificate format moved)
@@ -525,6 +538,9 @@ func publishLearnedClassesExpvar() {
 	}))
 	expvar.Publish("snowplow_learned_classes_seeded", expvar.Func(func() any {
 		return learnedAdmission.seeded.Load()
+	}))
+	expvar.Publish("snowplow_learned_classes_nav_only", expvar.Func(func() any {
+		return learnedAdmission.navOnly.Load()
 	}))
 	expvar.Publish("snowplow_learned_classes_unseeded_capacity", expvar.Func(func() any {
 		return learnedAdmission.unseededCapacity.Load()
@@ -564,6 +580,7 @@ func ResetLearnedIdentitiesForTest() {
 	learned.unparseable.Store(0)
 	learned.mu.Unlock()
 	SetLearnedAdmissionStats(0, 0, nil)
+	SetLearnedNavOnly(0)
 }
 
 // LearnedAdmissionCapacity returns a copy of the last bound's measured inputs

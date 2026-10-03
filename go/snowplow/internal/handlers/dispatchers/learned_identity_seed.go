@@ -491,6 +491,22 @@ func (lp *learnedPass) decide(baseW, baseR int, preLatchBudget time.Duration, ha
 	return d
 }
 
+// navCost is one class's nav units at the measured widget cost (#442 re-check).
+func (lp *learnedPass) navCost(k string, tWidget time.Duration) time.Duration {
+	return time.Duration(lp.wUnits[k]) * tWidget
+}
+
+// learnedPhaseObserver is a TEST-ONLY synchronous view of the classes each boot
+// / keepwarm learned phase seeds ("prelatch", "ra", "keepwarm"); nil in
+// production.
+var learnedPhaseObserver func(phase string, classes []string)
+
+func noteLearnedPhase(phase string, classes []string) {
+	if learnedPhaseObserver != nil {
+		learnedPhaseObserver(phase, append([]string(nil), classes...))
+	}
+}
+
 // ── the resident pass (class-seed scope + #258 reseed) ──────────────────────
 
 // registerEngineLearnedClassHook subscribes the engine to new learned classes.
