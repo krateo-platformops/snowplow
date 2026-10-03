@@ -29,6 +29,7 @@ package apiref
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"sync/atomic"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -174,6 +175,14 @@ func seedFullListRAKey(ctx context.Context, gvr schema.GroupVersionResource,
 	// dispatchCacheLookupKey) so a co-bound requester with different step-level
 	// RBAC never shares this cell.
 	keyInputs.SubjectBindingSet = rbac.SubjectBindingSetDigest(ui.Username, ui.Groups)
+	// #431 — the refresher re-resolves the cell under this representative (same
+	// pattern as dispatchCacheLookupKey). It is the identity the key was just
+	// minted from, so it is a member of the key's class by construction; the #424
+	// guard re-checks that before every refresh. Not key material (ComputeKey
+	// skips it). Without it the refresher resolved ("", nil) — an empty body
+	// pre-#424, a permanent binding_set decline after it.
+	keyInputs.RepresentativeUsername = ui.Username
+	keyInputs.RepresentativeGroups = slices.Clone(ui.Groups)
 	return keyInputs, cache.ComputeKey(keyInputs), true
 }
 
