@@ -118,6 +118,7 @@ func newWatcher375(t *testing.T) dynamic.Interface {
 	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 	return dyn

@@ -500,6 +500,7 @@ func newGroupGrantGetWatcher(t *testing.T, group, ns string) *cache.ResourceWatc
 	if err := rw.WaitForCacheSync(sctx, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync (RBAC informers): %v", err)
 	}
+	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 	return rw

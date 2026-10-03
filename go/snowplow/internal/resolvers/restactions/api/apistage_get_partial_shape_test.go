@@ -112,6 +112,7 @@ func newD42WatcherWithGetConfigmaps(t *testing.T) *cache.ResourceWatcher {
 	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync (RBAC informers): %v", err)
 	}
+	waitOwnRBACPublish(t, rw)
 	return rw
 }
 

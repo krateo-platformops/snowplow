@@ -175,6 +175,7 @@ func newRBACNarrowWatcher(t *testing.T) (*cache.ResourceWatcher, map[string]bool
 	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync (RBAC informers): %v", err)
 	}
+	waitOwnRBACPublish(t, rw)
 
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
@@ -383,6 +384,7 @@ func TestDispatchViaInformer_RBACNarrowing_GroupGrant(t *testing.T) {
 	if err := rw.WaitForCacheSync(ctx2, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 

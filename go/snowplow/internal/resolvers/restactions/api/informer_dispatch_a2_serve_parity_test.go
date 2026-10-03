@@ -170,6 +170,7 @@ func newA2ParityWatcher(t *testing.T, gateOn bool, seed ...runtime.Object) *cach
 	if err := rw.WaitForCacheSync(syncCtx, 5*time.Second); err != nil {
 		t.Fatalf("setup: WaitForCacheSync (RBAC informers): %v", err)
 	}
+	waitOwnRBACPublish(t, rw)
 
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
