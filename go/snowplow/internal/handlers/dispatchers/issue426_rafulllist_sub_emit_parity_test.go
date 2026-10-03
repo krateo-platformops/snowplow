@@ -387,14 +387,12 @@ func TestIssue426_RAFullListRefreshDeliversToSubscriber(t *testing.T) {
 	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{armed: {}})
 	defer unsub()
 
-	// #431: raFullList cells carry no representative yet, so the refresher's
-	// #424 guard declines their re-Put (binding_set) and emits nothing, whatever
-	// the key. Until #431 lands, stamp the representative the producer will carry.
-	// It is not a key field (ComputeKey ignores it), so the emitted key is still
-	// the stored one. Once the producer sets it, this is a no-op.
-	if stored.RepresentativeUsername == "" {
-		stored.RepresentativeUsername = i426User
-		stored.RepresentativeGroups = i426Groups()
+	// #431: the refresher re-resolves under the cell's representative, which the
+	// producer (seedFullListRAKey) stamps. Without it the #424 guard declines the
+	// re-Put and nothing is emitted, whatever the key.
+	if stored.RepresentativeUsername != i426User {
+		t.Fatalf("SETUP: the stored raFullList cell must carry alice as its representative (#431); got %q",
+			stored.RepresentativeUsername)
 	}
 	restore := setResolveOnceForTest(func(_ context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
 		return []byte(`{"items":[{"name":"fresh"}]}`), nil
