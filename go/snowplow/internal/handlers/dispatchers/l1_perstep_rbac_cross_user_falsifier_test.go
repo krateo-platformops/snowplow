@@ -102,6 +102,9 @@ const (
 
 var psUsers = []string{psAlice, psBob, psCarol, psDave}
 
+// psSAUser is the fake apiserver's identity for the "tok-sa" token.
+const psSAUser = "system:serviceaccount:krateo-system:snowplow"
+
 var (
 	psSecretsGVR    = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
 	psConfigmapsGVR = schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}
@@ -117,6 +120,9 @@ type psArm struct {
 	// delivers (initial sync / relist), which the apistage GET partial-shape
 	// guard (apistage.go gateGetEnvelope) refuses to serve.
 	watchShape bool
+	// noPrereg: do not pre-register the target informer (the #398 arms observe
+	// whether the REQUEST path registers it).
+	noPrereg bool
 }
 
 func psGroups(a psArm) []string {
@@ -243,15 +249,24 @@ func psBuildWatcher(t *testing.T, a psArm, extra ...runtime.Object) *dynamicfake
 	// register). A per-user apiserver fall-through is classified "external" by
 	// the dispatch site (resolve.go external branch) and declines the Put, so
 	// the shared cell is written only when the informer pivot serves the read.
-	if _, ch := rw.EnsureResourceType(a.target); ch != nil {
-		select {
-		case <-ch:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("target informer %s did not sync", a.target)
+	//
+	// #398: a SENSITIVE target (core v1/secrets) is never informed — that is the
+	// steady state now — so it is not pre-registered and must stay unregistered.
+	if a.noPrereg || isSensitive398(a.target) {
+		if rw.IsRegistered(a.target) {
+			t.Fatalf("PRE: %s must not be registered before the arm runs", a.target)
 		}
-	}
-	if !rw.IsServable(a.target) {
-		t.Fatalf("PRE: target informer %s must be servable (steady state)", a.target)
+	} else {
+		if _, ch := rw.EnsureResourceType(a.target); ch != nil {
+			select {
+			case <-ch:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("target informer %s did not sync", a.target)
+			}
+		}
+		if !rw.IsServable(a.target) {
+			t.Fatalf("PRE: target informer %s must be servable (steady state)", a.target)
+		}
 	}
 	// Settle the snapshot, then zero the sub-gens: initial-sync ADD ordering
 	// (a Role arriving before vs after its binding) makes the boot-time bump
@@ -281,6 +296,9 @@ func psFakeAPIServer(t *testing.T, a psArm, perUser map[string]*atomic.Int64) *h
 	for _, u := range psUsers {
 		tokens["tok-"+u] = u
 	}
+	// snowplow's own ServiceAccount (the seed / refresher transport): the
+	// apiserver lets it read everything (the chart's */* get/list/watch).
+	tokens["tok-sa"] = psSAUser
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		user, ok := tokens[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
@@ -302,6 +320,9 @@ func psFakeAPIServer(t *testing.T, a psArm, perUser map[string]*atomic.Int64) *h
 				Username: user, Groups: psGroups(a), Verb: "list",
 				Resource: a.target.Resource, Namespace: psTargetNS,
 			})
+			if user == psSAUser {
+				allowed, err = true, nil
+			}
 			if err != nil || !allowed {
 				w.WriteHeader(http.StatusForbidden)
 				_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`))
@@ -321,9 +342,22 @@ func psFakeAPIServer(t *testing.T, a psArm, perUser map[string]*atomic.Int64) *h
 			Username: user, Groups: psGroups(a), Verb: "get",
 			Resource: a.target.Resource, Namespace: psTargetNS, Name: psTargetObj,
 		})
+		if user == psSAUser {
+			allowed, err = true, nil
+		}
 		if err != nil || !allowed {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`))
+			return
+		}
+		// The apiserver's own content negotiation: a metadata-only request
+		// (#398 arm) gets a PartialObjectMetadata — never the object's data.
+		if strings.Contains(r.Header.Get("Accept"), "as=PartialObjectMetadata") {
+			body, _ := json.Marshal(map[string]any{
+				"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadata",
+				"metadata": map[string]any{"name": psTargetObj, "namespace": psTargetNS},
+			})
+			_, _ = w.Write(body)
 			return
 		}
 		body, _ := json.Marshal(obj)

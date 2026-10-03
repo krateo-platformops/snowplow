@@ -649,6 +649,17 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 	if rw.mode == modePassthrough {
 		return false, nil
 	}
+	// #398 — a sensitive resource (core v1/secrets) is NEVER informed: a
+	// cluster-wide informer would hold every object's body for the process
+	// lifetime. Closed skip, same shape as the unregisterable-GVR skip below, so
+	// a caller waiting on the channel never blocks and every dispatch falls
+	// through to the apiserver under the caller's own credentials.
+	if IsSensitiveResource(gvr) {
+		noteSensitiveRegistrationRefused()
+		closed := make(chan struct{})
+		close(closed)
+		return false, closed
+	}
 
 	// Path 3.1 Bug 2 — fast-path hit lookup under RLock. The hit path
 	// is the dominant code path under cluster-list-collapse (every
@@ -910,6 +921,13 @@ func metadataOnlyReason(gvr schema.GroupVersionResource) string {
 // refreshes — preserved byte-for-byte from the full-informer path.
 func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVersionResource) {
 	if rw.mode == modePassthrough {
+		return
+	}
+	// #398 — defense in depth behind EnsureResourceType's skip: the locked
+	// helpers are the true lowest registration point (AddResourceType,
+	// EnsureResourceTypeMetadataOnly and the constructor reach them directly).
+	if IsSensitiveResource(gvr) {
+		noteSensitiveRegistrationRefused()
 		return
 	}
 	if _, exists := rw.informers[gvr]; exists {
@@ -1333,6 +1351,12 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// — without it, rw.factory.ForResource(gvr) on the next line
 	// would nil-panic.
 	if rw.mode == modePassthrough {
+		return
+	}
+	// #398 — see addResourceTypeMetadataOnlyLocked: never register a
+	// sensitive resource, whatever the caller.
+	if IsSensitiveResource(gvr) {
+		noteSensitiveRegistrationRefused()
 		return
 	}
 	if _, exists := rw.informers[gvr]; exists {

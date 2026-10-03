@@ -357,6 +357,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (no informer/dep edge can invalidate it). Additive to the stage-error
 	// sink — both gate the Put independently. nil-receiver-safe.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
+	// #398 — sensitive-resource sink: a resolve that dispatched a core
+	// v1/secrets read must not be persisted by any resolved-output Put.
+	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
 	// 1.12.3 A-1 / R-1 — install the UAF-touched sink, third sibling of the two
 	// above. Whatever bumps it, wherever that happens and however many resolver
 	// frames down, the Put-gate below reads Count()>0 and declines.
@@ -450,7 +453,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (a grant/revoke landed mid-resolve), the body belongs to the NEW class
 	// while cacheKey still names the OLD one, which every other old-class member
 	// derives. Serve the body (it is correct for this requester), never write it.
-	if drift := identityClassDriftCtx(ctx, cacheInputs); cacheHandle != nil && cacheKey != "" && drift != "" {
+	if cache.DeclineSensitivePut(ctx) {
+		// #398 — the resolve read a sensitive resource (core v1/secrets): serve
+		// the body, persist it nowhere.
+		log.Debug("RESTAction resolve read a sensitive resource; declining to cache",
+			slog.String("key_hash", cacheKey),
+			slog.String("effect", "body served (200); not persisted — Secret reads are always live (#398)"),
+		)
+	} else if drift := identityClassDriftCtx(ctx, cacheInputs); cacheHandle != nil && cacheKey != "" && drift != "" {
 		noteIdentityClassDrift("restactions", drift)
 		log.Debug("RESTAction requester's RBAC class moved during the resolve; declining to cache",
 			slog.String("key_hash", cacheKey),
