@@ -205,20 +205,50 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// gained or lost a binding since the cell was minted, their own key has
 	// moved but every other member of the old class still derives THIS key, and
 	// re-Putting would hand those members the representative's new view.
-	// Decline (and suppress: the representative cannot drift back into a class
-	// it has left without a sub-gen bump, which is a different key) before
-	// paying for the resolve; re-checked after it (TOCTOU, below).
+	// Never refresh under it (checked before paying for the resolve; re-checked
+	// after it, TOCTOU, below).
+	//
+	// #444 — and never leave the cell un-refreshable either (the pre-#444
+	// suppress-to-TTL left every remaining member on a stale cell for up to the
+	// TTL). Re-pick an identity that is in the key's class NOW — the canonical
+	// group representative, else a recent hitter — and refresh under it; the
+	// re-Put carries it as the new representative (ReplaceIfGen below keeps the
+	// generation guard). If none is in the class, EVICT: a cold, correct refill
+	// beats a stale cell.
+	repSource := repSourceRecorded
 	if drift := identityClassDrift(ctx, &inputs, refreshUser, refreshGroups); drift != "" {
 		noteIdentityClassDrift("refresher", drift)
-		cache.NoteRefreshDecline(key, "representative_drift", true)
-		log.Debug("resolveAndPopulateL1: representative's RBAC class no longer matches the cell key; declining to refresh",
-			slog.String("subsystem", "cache"),
-			slog.String("key_hash", key),
-			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("drift", drift),
-			slog.String("effect", "prior entry kept (correct for its class at write time), not refreshed; TTL is the bound (#424 R1)"),
-		)
-		return nil
+		prior, _ := c.GetNoTouch(key)
+		u, g, src, ok := repickRepresentative(ctx, &inputs, prior)
+		if !ok {
+			evicted := c.EvictUnrefreshable(key, prior)
+			if evicted {
+				noteRepresentativeRepick("evicted")
+			}
+			log.Debug("resolveAndPopulateL1: representative left the cell's RBAC class and no in-class replacement exists; evicting",
+				slog.String("subsystem", "cache"),
+				slog.String("key_hash", key),
+				slog.String("handler", inputs.CacheEntryClass),
+				slog.String("drift", drift),
+				slog.Bool("evicted", evicted),
+				slog.String("effect", "the next request re-resolves the cell fresh under its own identity (#444)"),
+			)
+			return nil
+		}
+		noteRepresentativeRepick(src)
+		refreshUser, refreshGroups, repSource = u, g, src
+		inputs.RepresentativeUsername, inputs.RepresentativeGroups = u, g
+		// #262 privacy x #444 — the re-resolve now runs (and its resolve path
+		// logs) under the replacement. A recent hitter is a live identity like
+		// #262's S2 classes, and a learned identity is one by definition: carry
+		// either only as its sha256 label. Wrapping the existing logger keeps the
+		// drifted learned representative's tokens redacted too; a group
+		// representative of a learned class reuses that class's group tokens,
+		// which the existing redacting logger (learnedRep) already scrubs.
+		if src == repSourceHitter || isLearnedIdentity(u) {
+			log = learnedRedactingLogger(log, u, g)
+			learnedRep = true
+		}
 	}
 	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserInfo(jwtutil.UserInfo{
@@ -364,7 +394,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshUser),
+			slog.String("user", refreshLogUser(refreshUser, repSource)),
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("stage_err_stage", sampleStage),
 			slog.String("stage_err_sample", sampleErr),
@@ -399,7 +429,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshUser),
+			slog.String("user", refreshLogUser(refreshUser, repSource)),
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
 		)
@@ -434,7 +464,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshUser),
+			slog.String("user", refreshLogUser(refreshUser, repSource)),
 			slog.String("uaf_reason", reason),
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
 			slog.String("effect", "prior entry kept, not refreshed; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
@@ -443,16 +473,14 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	}
 
 	// #424 — TOCTOU re-check: an RBAC change on the representative that landed
-	// during the re-resolve makes the fresh bytes another class's.
+	// during the re-resolve makes the fresh bytes another class's. Never write
+	// them. #444 — nor suppress: return a retryable error, so the refresher
+	// requeues and the next attempt re-picks an in-class representative (or
+	// evicts); a spent budget drops → evicts at the drop point.
 	if drift := identityClassDrift(ctx, &inputs, refreshUser, refreshGroups); drift != "" {
 		noteIdentityClassDrift("refresher", drift)
-		cache.NoteRefreshDecline(key, "representative_drift", true)
-		log.Debug("resolveAndPopulateL1: representative's RBAC class moved during the re-resolve; declining to re-Put",
-			slog.String("subsystem", "cache"),
-			slog.String("key_hash", key),
-			slog.String("drift", drift),
-		)
-		return nil
+		return fmt.Errorf("resolveAndPopulateL1 %s/%s (%s): %w",
+			inputs.CacheEntryClass, inputs.Name, drift, errRepresentativeDriftedMidRefresh)
 	}
 
 	entry := &cache.ResolvedEntry{
@@ -523,7 +551,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
 		slog.String("handler", inputs.CacheEntryClass),
-		slog.String("user", refreshUser),
+		slog.String("user", refreshLogUser(refreshUser, repSource)),
 		slog.Bool("pinned", prePinned),
 	)
 	return nil

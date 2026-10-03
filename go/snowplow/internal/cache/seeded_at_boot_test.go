@@ -66,9 +66,10 @@ func TestSeededAtBoot_RoundTripsThroughGet(t *testing.T) {
 // the boot marker).
 func putPreservingSeededAtBoot(c *ResolvedCacheStore, key string, entry *ResolvedEntry) {
 	if prior, ok := c.Get(key); ok {
-		merged := *entry
+		// Field copy, not `*entry` (ResolvedEntry holds an atomic since #444).
+		merged := &ResolvedEntry{RawJSON: entry.RawJSON, Inputs: entry.Inputs, Pinned: entry.Pinned}
 		merged.SeededAtBoot = prior.SeededAtBoot // the defect: carry over old provenance
-		c.Put(key, &merged)
+		c.Put(key, merged)
 		return
 	}
 	c.Put(key, entry)

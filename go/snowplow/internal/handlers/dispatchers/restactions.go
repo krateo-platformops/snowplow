@@ -206,6 +206,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	if cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
+			// #444 — the requester joins the cell's representative pool (the
+			// refresher's replacement if the recorded representative drifts).
+			entry.NoteHitter(cacheInputs.RepresentativeUsername, cacheInputs.RepresentativeGroups)
 			pcs.l1Hit = "hit"
 			// #261 serve-time detector (observability only; the keying FIX is
 			// v7-deferred — this changes NO serving behaviour, RawJSON below is

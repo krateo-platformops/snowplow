@@ -243,6 +243,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
+			// #444 — the requester joins the cell's representative pool (the
+			// refresher's replacement if the recorded representative drifts).
+			entry.NoteHitter(cacheInputs.RepresentativeUsername, cacheInputs.RepresentativeGroups)
 			pcs.l1Hit = "hit"
 			// External-widget bounded-TTL cache (Option A, 2026-07-10) — C2
 			// arming kill on the HIT branch. The entry may have been Put under

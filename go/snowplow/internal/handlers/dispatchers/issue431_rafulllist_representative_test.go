@@ -31,12 +31,13 @@
 //       the wide cell keeps w/v, the narrow cell never gains it. RED on main
 //       (stale).
 //   (c) TestIssue431_RepresentativeDriftStillDeclines — the representative
-//       (carol) gains a binding in ns w; the refresh is declined
-//       (representative_drift), dave is never served w/v. And
+//       (carol) gains a binding in ns w; she is never refreshed under (dave is
+//       never served w/v) and, since #444, the canonical group representative
+//       replaces her so the cell still converges for dave. And
 //       TestIssue431_SubGenMovesInsideRefresh_NoWrite — a grant+revoke on the
 //       representative inside the re-resolve (binding set unchanged at both
-//       checks) must not be written. Mutation: dropping the sub-gen bracket
-//       makes the second arm RED.
+//       checks) must not be written (#435: the rbac_subgen limb; #444: a
+//       retryable error, not a suppress).
 //   (d) TestIssue431_SeedAndCustomerRAKeyParity — the seed-minted raKey equals
 //       the customer's raKey byte-for-byte (pre-hash inputs equal modulo the
 //       representative), and both carry an in-class representative. RED on main
@@ -48,6 +49,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -411,8 +413,18 @@ func TestIssue431_RepresentativeDriftStillDeclines(t *testing.T) {
 	if got := i431Body(key); strings.Contains(got, "wide-only") {
 		t.Fatalf("REPRESENTATIVE DRIFT LEAK: the refresher re-Put carol's widened view under the key dave derives; body=%s", psTrunc(got, 300))
 	}
-	if got := i431Body(key); got != pre && got != "<absent>" {
-		t.Fatalf("the declined refresh changed the cell: pre=%s now=%s", psTrunc(pre, 200), psTrunc(got, 200))
+	// #444 — the drifted representative is replaced, not left suppressing the
+	// cell: the canonical group representative is still in the class, so the
+	// refresher converges the cell to the class's (dave's) fresh body.
+	if !i431Eventually(10*time.Second, func() bool { return strings.Contains(i431Body(key), "after-431-c") }) {
+		t.Fatalf("#444 STALE: after the representative drifted, the dep change was not refreshed for the remaining "+
+			"members (pre=%s now=%s)", psTrunc(pre, 200), psTrunc(i431Body(key), 200))
+	}
+	if got, want := i431Body(key), string(i431Fresh(t, dave, ra, saRC)); got != want {
+		t.Fatalf("#444: the re-picked refresh must equal dave's fresh body\n cell =%s\n fresh=%s", got, want)
+	}
+	if representativeRepickForTest(repSourceGroup) == 0 {
+		t.Fatalf("#444: the replacement must have come from the canonical group representative")
 	}
 }
 
@@ -452,8 +464,9 @@ func TestIssue431_SubGenMovesInsideRefresh_NoWrite(t *testing.T) {
 	defer restore()
 
 	before := identityClassDriftDeclinedForTest("refresher", "rbac_subgen")
-	if err := resolveAndPopulateL1(context.Background(), stored, saEP, saRC); err != nil {
-		t.Fatalf("refresh: %v", err)
+	// #444: a mid-resolve drift is a retryable error (requeue → re-pick), not a suppress.
+	if err := resolveAndPopulateL1(context.Background(), stored, saEP, saRC); !errors.Is(err, errRepresentativeDriftedMidRefresh) {
+		t.Fatalf("refresh: want errRepresentativeDriftedMidRefresh, got %v", err)
 	}
 	if identityClassDriftDeclinedForTest("refresher", "rbac_subgen") <= before {
 		t.Fatalf("the decline must be counted on refresher/rbac_subgen")
