@@ -602,7 +602,11 @@ type ResolvedKeyInputs struct {
 // removes — so no v6 cell may serve as a v7 hit. The salt rotation makes every
 // pre-v7 cell unreachable on rollout; the prewarm seed re-mints under v7 before
 // readyz admits traffic (readyz gates on prewarm complete).
-const resolvedKeyVersion = "v7"
+// #435 — BUMPED v7 → v8. The raFullList key now folds RBACSubGen (stamped by
+// apiref.seedFullListRAKey, the single raFullList key builder; it was 0 for that
+// class before). A v7 raFullList cell was blind to a Role-rules edit and to a
+// grant-then-revoke inside its resolve, so no v7 cell may serve as a v8 hit.
+const resolvedKeyVersion = "v8"
 
 // ResolvedCacheStore is the L1 resolved-output cache: a bounded LRU
 // guarded by a single mutex with a per-entry byte budget. Constructed
@@ -2140,12 +2144,12 @@ type ResolvedEntryMeta struct {
 	// field, and the surface the 40.7% was measured on could not show it.
 	//
 	// READ IT WITH CacheEntryClass, NEVER ALONE. RBACSubGen is written at
-	// exactly ONE construction site — dispatchers/helpers.go:275, the
-	// `widgets`/`restactions` path. Every other site leaves it zero:
+	// exactly TWO construction sites — dispatchers/helpers.go dispatchCacheLookupKey
+	// (the `widgets`/`restactions` path) and, since #435, apiref.seedFullListRAKey
+	// (the `raFullList` path). Every other site leaves it zero:
 	// dispatchWidgetContentKey (dispatchers/helpers.go:193),
 	// widgetContentL1Key (dispatchers/widget_content.go:87), contentKeyInputs
-	// (restactions/api/apistage.go:66), RAFullListKeyInputs
-	// (ra_full_list_slice.go:88). So a 0 means EITHER "this subject's RBAC has
+	// (restactions/api/apistage.go:66). So a 0 means EITHER "this subject's RBAC has
 	// never moved" OR "this cell's class never stamps" — two regimes, one
 	// number. CacheEntryClass is what separates them, it is on the same row,
 	// and a reader that drops it turns this field into the seventh

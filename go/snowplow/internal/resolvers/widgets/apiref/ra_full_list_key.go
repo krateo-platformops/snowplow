@@ -13,10 +13,11 @@ import (
 // /refreshes subscription (dispatchers.DeriveSubscriptionKey, class raFullList)
 // both mint through it, so the armed key equals the emitted key by construction
 // (#426). Before #426 the subscription minted through dispatchCacheLookupKey,
-// which folds RBACSubGen and the request's normalized pagination. This cell's
-// key folds neither: it is page-independent and deliberately omits RBACSubGen
-// (see raKeyClassCurrent). The armed key never matched, so no raFullList refresh
-// was ever delivered.
+// which folds the request's normalized pagination (and, at the time, an
+// RBACSubGen this key lacked). This cell's key is page-independent, so the armed
+// key never matched and no raFullList refresh was ever delivered. Since #435 the
+// key folds RBACSubGen too — through THIS builder, so producer, refresher and
+// subscription rotate together on a Role edit or grant/revoke.
 //
 // ok=false when ctx has no identity or EvaluateRBAC fails closed to "". The
 // shared empty-identity cell is never populated, so there is nothing to arm.

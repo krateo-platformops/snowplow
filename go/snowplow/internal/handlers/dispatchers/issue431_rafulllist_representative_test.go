@@ -48,7 +48,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -420,7 +419,9 @@ func TestIssue431_RepresentativeDriftStillDeclines(t *testing.T) {
 // TestIssue431_SubGenMovesInsideRefresh_NoWrite — carol is granted ns w and
 // revoked again INSIDE the refresher's re-resolve, which reads under the
 // transient grant. At both drift checks her binding set equals the minted one,
-// and raFullList keys fold no sub-gen, so only the sub-gen bracket can see it.
+// so only the sub-gen can see it: since #435 the raFullList key folds RBACSubGen
+// and identityClassDrift's rbac_subgen limb declines the write (it replaced the
+// #431 refresher bracket, which this arm drove first).
 func TestIssue431_SubGenMovesInsideRefresh_NoWrite(t *testing.T) {
 	const ra = "rafl431-c2"
 	dyn, saEP, saRC := i431Fixture(t, ra)
@@ -451,9 +452,8 @@ func TestIssue431_SubGenMovesInsideRefresh_NoWrite(t *testing.T) {
 	defer restore()
 
 	before := identityClassDriftDeclinedForTest("refresher", "rbac_subgen")
-	err := resolveAndPopulateL1(context.Background(), stored, saEP, saRC)
-	if !errors.Is(err, errRepresentativeRBACMoved) {
-		t.Fatalf("the refresh must return the retryable errRepresentativeRBACMoved (requeue, not suppress); got %v", err)
+	if err := resolveAndPopulateL1(context.Background(), stored, saEP, saRC); err != nil {
+		t.Fatalf("refresh: %v", err)
 	}
 	if identityClassDriftDeclinedForTest("refresher", "rbac_subgen") <= before {
 		t.Fatalf("the decline must be counted on refresher/rbac_subgen")
@@ -468,12 +468,10 @@ func TestIssue431_SubGenMovesInsideRefresh_NoWrite(t *testing.T) {
 		t.Fatalf("SUB-GEN DRIFT LEAK: a body read under carol's transient grant was written under the class key; body=%s",
 			psTrunc(got, 300))
 	}
-	// Control: with RBAC settled, the next refresh lands the class's body.
-	if err := resolveAndPopulateL1(context.Background(), stored, saEP, saRC); err != nil {
-		t.Fatalf("CONTROL refresh: %v", err)
-	}
-	if got, want := i431Body(key), string(i431Fresh(t, i431Ctx(psDave), ra, saRC)); got != want {
-		t.Fatalf("CONTROL: a settled refresh must write the class's body\n cell =%s\n fresh=%s", got, want)
+	// The representative's own key rotated with its sub-gen (#435): carol's next
+	// call mints a new cell; the old one is not hers any more.
+	if nk, _ := i431RAKey(t, carol, ra); nk == key {
+		t.Fatalf("carol's raKey must rotate with her RBAC sub-gen (#435)")
 	}
 }
 
