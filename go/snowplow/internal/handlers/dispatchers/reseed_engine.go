@@ -61,9 +61,11 @@ func reseedUnderCurrentIdentity(cohortCtx context.Context, deps rePrewarmDeps, r
 
 // reseedOnce runs one target under a fresh per-target cohort ctx.
 func reseedOnce(ctx context.Context, deps rePrewarmDeps, req reseedRequest, mode seedScopeMode) error {
-	cohortCtx, cancel := reseedCohortCtx(ctx, deps, req.identity)
-	defer cancel()
-	return reseedUnderCurrentIdentity(cohortCtx, deps, req, mode)
+	return measuredSeedUnit(ctx, func(mctx context.Context) error {
+		cohortCtx, cancel := reseedCohortCtx(mctx, deps, req.identity)
+		defer cancel()
+		return reseedUnderCurrentIdentity(cohortCtx, deps, req, mode)
+	})
 }
 
 // reseedWithRefusalPolicy reseeds one target and applies the per-mode refusal
@@ -227,16 +229,19 @@ func reseedTargetLabel(req reseedRequest) string {
 // GVR — the SAME enumeration the boot seed uses (enumeratePrewarmTargetsForGVRFn),
 // so the reseed's (unit × identity) set is a faithful subset of the boot's, never
 // a parallel derivation (feedback_no_special_cases).
+//
+// #262: a LEARNED class (the wrapper's Learned targets) is reseeded only if the
+// last learned-class admission admitted it — a rotation never seeds past the
+// capacity bound.
 func reseedIdentityTargets(gvr schema.GroupVersionResource) []seedTarget {
 	raw := enumeratePrewarmTargetsForGVRFn(gvr, "list")
 	out := make([]seedTarget, 0, len(raw))
 	for _, t := range raw {
-		out = append(out, seedTarget{
-			BindingUID:        t.BindingUID,
-			Username:          t.Subject.Username,
-			Groups:            append([]string(nil), t.Subject.Groups...),
-			CollapsedBindings: t.CollapsedBindings,
-		})
+		c := seedTargetFromPrewarm(t)
+		if c.Learned && !learnedClassAdmitted(learnedKey(c)) {
+			continue
+		}
+		out = append(out, c)
 	}
 	return out
 }

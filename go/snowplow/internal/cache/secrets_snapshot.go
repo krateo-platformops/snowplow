@@ -187,6 +187,7 @@ func rebuildSecretsSnapshot() {
 	snap := &SecretsSnapshot{
 		ByName: make(map[string]*corev1.Secret, len(items)),
 	}
+	typed := make([]*corev1.Secret, 0, len(items))
 	for _, it := range items {
 		sec, ok := it.(*corev1.Secret)
 		if !ok {
@@ -199,10 +200,15 @@ func rebuildSecretsSnapshot() {
 			continue
 		}
 		snap.ByName[sec.Name] = sec
+		typed = append(typed, sec)
 	}
 
 	secretsSnap.Store(snap)
 	secretsSnapshotPublishSeq.Add(1)
+
+	// #262 S1 — reconcile the learned identity classes with the clientconfig
+	// Secrets (a certificate is parsed only when its ResourceVersion moved).
+	syncLearnedFromSecrets(typed)
 
 	slog.Debug("cache.secrets.snapshot.published",
 		slog.String("subsystem", "cache"),

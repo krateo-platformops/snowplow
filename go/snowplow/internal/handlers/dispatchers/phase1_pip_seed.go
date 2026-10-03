@@ -635,6 +635,10 @@ type seedTarget struct {
 	// ONLY to rank identities for the identity-rank-major seed order; NOT part
 	// of the seed dispatch or the cell key.
 	CollapsedBindings int
+	// Learned — #262: a LEARNED identity class (carried from
+	// cache.PrewarmTarget.Learned). Seeded in its own capacity-bounded phase,
+	// and its identity reaches logs only as cache.LearnedClassLabel.
+	Learned bool
 }
 
 // withCohortSeedContext builds the per-cohort seed context. Mirrors
@@ -651,9 +655,18 @@ type seedTarget struct {
 func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 	saEP endpoints.Endpoint, saRC *rest.Config) context.Context {
 
+	// #262 privacy — a learned class is a real username + its full group set.
+	// Its seed resolves under that identity, and the resolve path logs its
+	// requester through the ctx logger, so the ctx logger redacts the class's
+	// tokens. Base cohorts keep slog.Default() (unchanged).
+	learned := isLearnedSeedTarget(cohort)
+	seedLogger := slog.Default()
+	if learned {
+		seedLogger = learnedRedactingLogger(seedLogger, cohort.Username, cohort.Groups)
+	}
 	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserConfig(saEP),
-		xcontext.WithLogger(slog.Default()),
+		xcontext.WithLogger(seedLogger),
 		// #424 — resolve the representative as an AUTHENTICATED identity. A
 		// group representative carries Username=="" (pickRepresentativeFromSubjects),
 		// and EvaluateRBAC matches a system:authenticated subject only for a
@@ -668,6 +681,9 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 		}),
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
+	if learned {
+		rctx = withLearnedSeedLabel(rctx, cache.LearnedClassLabel(cohort.Username, cohort.Groups))
+	}
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 	// #130 F3b Fix 2 — attach the shared watcher so the cohort seed's inner LIST
@@ -974,7 +990,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// Ship 0.30.188 — diagnostic slog: emit the seed-side cache key +
 	// its components so it can be diff'd against the dispatcher_get and
 	// per_user_fallback_put log lines at widgets.go / restactions.go.
-	emitDispatchCacheKeyDiag(slog.Default(), "seed", ctx,
+	emitDispatchCacheKeyDiag(seedDiagLogger(ctx), "seed", ctx,
 		key, inputs, "restactions",
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
@@ -1410,7 +1426,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// Ship 0.30.188 — diagnostic slog: emit the widget seed Put cache
 	// key + components so it can be diff'd against the dispatcher_get
 	// and per_user_fallback_put log lines at widgets.go.
-	emitDispatchCacheKeyDiag(slog.Default(), "seed", ctx,
+	emitDispatchCacheKeyDiag(seedDiagLogger(ctx), "seed", ctx,
 		key, inputs, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
@@ -1888,6 +1904,9 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string,
 // (withCohortSeedContext installs WithUserInfo). Username else first group else
 // "anonymous" — mirrors cohortLogLabel's domain for log parity.
 func seedIdentityLabelFromCtx(ctx context.Context) string {
+	if label, learned := learnedSeedLabelFromCtx(ctx); learned {
+		return label // #262: a learned class is never logged in clear
+	}
 	ui, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		return "anonymous"
@@ -1911,6 +1930,11 @@ func seedIdentityLabelFromCtx(ctx context.Context) string {
 // A cohort with neither (defensive — should never happen post-enum)
 // falls back to "anonymous".
 func cohortLogLabel(c seedTarget) string {
+	if c.Username != "" && isLearnedSeedTarget(c) {
+		// #262: a learned class is a real username + groups; its label is the
+		// class's sha256 tag (it is also an expvar map key — never in clear).
+		return cache.LearnedClassLabel(c.Username, c.Groups)
+	}
 	if c.Username != "" {
 		return c.Username
 	}

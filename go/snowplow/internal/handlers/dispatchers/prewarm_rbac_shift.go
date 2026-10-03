@@ -66,6 +66,12 @@ func rePrewarmRBACShift(ctx context.Context, deps rePrewarmDeps, rotated cache.R
 		slog.Int("rotated_subjects", rotated.Len()),
 	)
 
+	// #262 — a rotation can make a learned class DISTINCT (a binding added on a
+	// group it presents moves its binding set away from its representative's);
+	// re-apply the learned-class bound over the resident units first, so the
+	// reseed below (which reseeds only ADMITTED learned classes) includes it.
+	refreshLearnedAdmission(ctx, deps)
+
 	// Q1 TARGET-FILTER (snapshot-reuse re-key): reseed the RESIDENT (unit ×
 	// identity) targets whose folded subject rotated — no fresh nav walk.
 	reqs := enumerateRotatedResidentTargets(ctx, deps, rotated)
