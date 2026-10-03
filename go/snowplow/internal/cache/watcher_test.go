@@ -522,14 +522,16 @@ func TestNewResourceWatcher_PassthroughMode_WaitForCacheSyncReturnsNil(t *testin
 // secretGVR is the canonical "previously-unseen, non-RBAC" GVR used by
 // the EnsureResourceType tests. Secrets are registered in the scheme
 // every fake-dynamic builder accepts.
-var secretGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+// #398: core v1/secrets is never informed (IsSensitiveResource), so this
+// fixture uses v1/configmaps as its arbitrary core-group GVR instead.
+var secretGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
 
 // secretsListKinds extends rbacListKinds with the Secrets List entry
 // so the fake dynamic client accepts a lazy-registered Secret informer
 // without panicking on the initial LIST.
 func secretsListKinds() map[schema.GroupVersionResource]string {
 	m := rbacListKinds()
-	m[secretGVR] = "SecretList"
+	m[secretGVR] = "ConfigMapList"
 	return m
 }
 

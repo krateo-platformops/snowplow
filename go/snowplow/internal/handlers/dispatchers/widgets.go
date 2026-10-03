@@ -326,6 +326,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// widget→apiref→RA ctx inheritance (context.WithValue is preserved down
 	// the resolve chain). Additive to the stage-error sink.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
+	// #398 — sensitive-resource sink: a resolve that dispatched a core
+	// v1/secrets read must not be persisted by any resolved-output Put.
+	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
 	// 1.12.3 A-1 / R-1 (SECURITY, cross-tenant) — install the UAF-touched sink,
 	// third sibling of the two above. THIS IS THE HOT CARRIER. A widget's apiRef
 	// RESTAction is resolved transitively under THIS ctx (widgets.Resolve →
@@ -429,7 +432,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #424 — identity-class re-check FIRST (see restactions.go): a requester
 	// whose RBAC class moved mid-resolve must not write into the pre-resolve
 	// key. Ahead of the external-TTL branch too, since that branch also writes.
-	if drift := identityClassDriftCtx(ctx, cacheInputs); cacheHandle != nil && cacheKey != "" && drift != "" {
+	if cache.DeclineSensitivePut(ctx) {
+		// #398 — see restactions.go: a Secret-bearing envelope is never persisted.
+		log.Debug("Widget resolve read a sensitive resource; declining to cache",
+			slog.String("key_hash", cacheKey),
+			slog.String("effect", "envelope served (200); not persisted — Secret reads are always live (#398)"),
+		)
+	} else if drift := identityClassDriftCtx(ctx, cacheInputs); cacheHandle != nil && cacheKey != "" && drift != "" {
 		noteIdentityClassDrift("widgets", drift)
 		log.Debug("Widget requester's RBAC class moved during the resolve; declining to cache",
 			slog.String("key_hash", cacheKey),

@@ -1187,6 +1187,9 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// → still Put). Uniform across boot + sweep (feedback_no_special_cases).
 	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
 	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
+	// #398 — sensitive-resource sink: a resolve that dispatched a core
+	// v1/secrets read must not be persisted by any resolved-output Put.
+	resCtx, _ = cache.WithSensitiveTouchedSink(resCtx)
 	// 1.12.3 A-1 / R-1 — install the UAF-touched sink, third sibling of the two
 	// above, so the tail's Put-gate sees a refilter that ran ANYWHERE under this
 	// resolve. The pre-resolve declaration skip above already caught an RA that
@@ -1522,6 +1525,9 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// so the keepwarm sweep never blind-re-Puts degraded bytes over a warm cell.
 	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
 	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
+	// #398 — sensitive-resource sink: a resolve that dispatched a core
+	// v1/secrets read must not be persisted by any resolved-output Put.
+	resCtx, _ = cache.WithSensitiveTouchedSink(resCtx)
 	// 1.12.3 A-1 / R-1 — install the UAF-touched sink around the WIDGET resolve.
 	// This is the seed leg of the hot carrier: widgets.Resolve → resolveApiRef →
 	// apiref.Resolve → restactions.Resolve folds the apiRef'd RA's refiltered

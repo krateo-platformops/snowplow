@@ -111,6 +111,8 @@ var splitCases = []splitCase{
 	{ReasonInformerMetadataOnly, false, "gate-miss arm hands the call to the live apiserver"},
 	{ReasonApistageGetPartialShape, false, "returns (nil,false) -> fresh apiserver GET-by-name"},
 	{ReasonGetMissLetApiserver404, false, "deliberately lets the apiserver answer 404"},
+	{ReasonInformerSensitive, false, "#398: a sensitive resource is never informed — always a live apiserver read"},
+	{ReasonInformerRepresentation, false, "#398: a non-default representation is only the apiserver's to produce"},
 }
 
 // TestFallthroughSplit_RoutingCellsAndTotals is F4.
@@ -221,9 +223,10 @@ func TestFallthroughSplit_TableCoversEveryReason(t *testing.T) {
 		ReasonWidgetContentHit, ReasonWidgetContentMissPerUserFallback,
 		ReasonPluralsDiscoveryHop,
 		ReasonResolverPluralsHit, ReasonResolverPluralsMiss,
+		ReasonInformerSensitive, ReasonInformerRepresentation,
 	}
-	if len(allReasons) != 21 {
-		t.Fatalf("closed enum size = %d; design §3.2 states 21 — update both this list and the "+
+	if len(allReasons) != 23 {
+		t.Fatalf("closed enum size = %d; design §3.2 states 21, #398 adds 2 (= 23) — update both this list and the "+
 			"cardinality arithmetic if a reason was added", len(allReasons))
 	}
 

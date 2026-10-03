@@ -41,7 +41,9 @@ import (
 
 // healBSecretsGVR / healBListKinds mirror the secrets GVR + List-kind
 // registration the cache_test servability harness uses, restated in-package.
-var healBSecretsGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+// #398: core v1/secrets is never informed (IsSensitiveResource), so this
+// fixture uses v1/configmaps as its arbitrary core-group GVR instead.
+var healBSecretsGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
 
 // healBListKinds registers the secrets List-kind PLUS the RBAC bootstrap
 // List-kinds the watcher registers informers for at construction (roles /
@@ -49,7 +51,7 @@ var healBSecretsGVR = schema.GroupVersionResource{Group: "", Version: "v1", Reso
 // RBAC reflectors panic on their initial LIST.
 func healBListKinds() map[schema.GroupVersionResource]string {
 	return map[schema.GroupVersionResource]string{
-		healBSecretsGVR: "SecretList",
+		healBSecretsGVR: "ConfigMapList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
@@ -68,7 +70,7 @@ func healBScheme() *k8sruntime.Scheme {
 func healBSecret(ns, name string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1",
-		"kind":       "Secret",
+		"kind":       "ConfigMap",
 		"metadata":   map[string]any{"namespace": ns, "name": name},
 	}}
 }
@@ -112,7 +114,7 @@ func (healBDiscovery) ServerResourcesForGroupVersion(gv string) (*metav1.APIReso
 	if gv == "v1" {
 		return &metav1.APIResourceList{
 			GroupVersion: "v1",
-			APIResources: []metav1.APIResource{{Name: "secrets", Namespaced: true, Kind: "Secret"}},
+			APIResources: []metav1.APIResource{{Name: "configmaps", Namespaced: true, Kind: "ConfigMap"}},
 		}, nil
 	}
 	return &metav1.APIResourceList{GroupVersion: gv}, nil

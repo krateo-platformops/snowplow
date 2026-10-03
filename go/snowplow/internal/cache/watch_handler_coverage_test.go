@@ -77,7 +77,8 @@ func TestWatchHandlerCoverage_LazyRegisteredGVR(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	})
 
-	lazyGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+	// #398: v1/secrets is never informed; any core GVR serves this arm.
+	lazyGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
 
 	// Pre-condition: never registered → no handler.
 	if rw.HasWatchHandlerForTest(lazyGVR) {

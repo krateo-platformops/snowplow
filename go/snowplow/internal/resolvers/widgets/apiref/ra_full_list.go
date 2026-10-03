@@ -444,7 +444,7 @@ func raFullListServe(
 		// #424 — the requester's RBAC class must still be the one raKey was
 		// minted for; a change mid-resolve makes `full` another class's body.
 		// Serve the slice (correct for this requester), never write it.
-		if !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+		if cache.DeclineSensitivePut(fullCtx) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
@@ -592,7 +592,8 @@ func raFullListServe(
 	// the pre-delete body; the verified slice sGo is served regardless, and the
 	// self-dep Record above (the Lever-C memo wiring) stands either way.
 	// #424 — same identity-class re-check as the repopulate branch.
-	if !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+	// #398 — a full list built from a sensitive read is never cached.
+	if cache.DeclineSensitivePut(fullCtx) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sGo, true, nil
 	}

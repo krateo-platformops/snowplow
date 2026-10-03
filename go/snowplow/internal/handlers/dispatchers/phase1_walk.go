@@ -1588,6 +1588,9 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// external endpoint — exactly as it declines on a stage error. Additive to
 	// the stage-error sink; both gate the Put independently.
 	resolveCtx, _ = cache.WithExternalTouchedSink(resolveCtx)
+	// #398 — sensitive-resource sink: a resolve that dispatched a core
+	// v1/secrets read must not be persisted by any resolved-output Put.
+	resolveCtx, _ = cache.WithSensitiveTouchedSink(resolveCtx)
 	// 1.12.3 A-1 / R-1 — install the UAF-touched sink on the SAME resolveCtx,
 	// third sibling of the two above. populateWidgetContentL1 (below) reads it
 	// via UAFTouchedSinkFromContext and declines to seed the identity-free

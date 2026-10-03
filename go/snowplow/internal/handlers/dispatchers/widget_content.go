@@ -332,6 +332,16 @@ func populateWidgetContentL1(
 		return
 	}
 
+	// #398 — the identity-FREE content shell must never hold a Secret body.
+	if cache.DeclineSensitivePut(ctx) {
+		log.Debug("widget_content.populate_declined_sensitive",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("effect", "the walker resolve read a sensitive resource; content cell not seeded (#398)"),
+		)
+		return
+	}
+
 	// #189 / #323 — this widgetContent CONTENT cell is a genuine resurrection
 	// carrier (the keep-warm sweep re-Puts it POST-readyz and the dispatcher SERVES
 	// it, widgets.go:186 Get). #323 GENERATION-GUARDS it: the walker captures this

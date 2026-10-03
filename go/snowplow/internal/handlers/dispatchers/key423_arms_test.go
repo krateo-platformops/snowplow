@@ -131,7 +131,12 @@ func TestKey423_ListStep_CrossUser(t *testing.T) {
 			if !psHasSentinel(aliceRec.Body.Bytes()) {
 				t.Fatalf("SETUP: alice's own LIST body must carry the sentinel; body=%s", aliceRec.Body.String())
 			}
-			if _, ok := cache.ResolvedCache().Get(aKey); !ok {
+			_, cached := cache.ResolvedCache().Get(aKey)
+			switch {
+			case isSensitive398(a.target) && cached:
+				// #398: a Secret-bearing body is never persisted in any L1 cell.
+				t.Fatalf("#398: alice's Secret-bearing LIST body was cached under her resolved-output key")
+			case !isSensitive398(a.target) && !cached:
 				t.Fatalf("SETUP: alice's LIST body must be cached (else the arm cannot detect a cross-user serve)")
 			}
 			bobRec := psServeCR(t, cr, srv.URL, bobCtx)
