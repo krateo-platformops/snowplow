@@ -9,10 +9,12 @@ package dispatchers
 // pre-latch; the rest seed right after the latch, in the same order.
 //
 // TestS262_PreLatchLearnedWorkFitsTheBackstop: five distinct learned classes,
-// every resolve ~40ms, and a backstop deadline that leaves room for about two
-// classes' nav units after the base nav units. The latch must fire BEFORE the
-// deadline, the pre-latch classes must be a newest-first prefix (≥1), the rest
-// (≥1) must seed only after the latch, and every class must still end up warm.
+// every resolve costing exactly 40ms on a VIRTUAL seed clock (deterministic
+// cost injection — no wall-clock margin), and a backstop deadline that leaves
+// room for 2.5 classes' nav units after the base nav units. The latch must fire
+// BEFORE the deadline, exactly the 2 newest classes seed pre-latch, the rest
+// seed only after the latch AND after the base RA content tail, and every class
+// ends up warm.
 
 import (
 	"context"
@@ -30,7 +32,8 @@ func TestS262_PreLatchLearnedWorkFitsTheBackstop(t *testing.T) {
 	const unit = 40 * time.Millisecond
 	users, secrets := l262ManyUsers(t, 5)
 	env := l262Setup(t, l262Opts{extraUsers: users, secrets: secrets, widgets: 2, ras: 2})
-	l262Stubs(t, l262StubOpts{sleep: unit})
+	clk := l262VirtualClock(t)
+	l262Stubs(t, l262StubOpts{sleep: unit, clock: clk})
 	l262WaitLearned(t, 5)
 
 	var mu sync.Mutex
@@ -40,7 +43,7 @@ func TestS262_PreLatchLearnedWorkFitsTheBackstop(t *testing.T) {
 	widgetsResolveFn = func(ctx context.Context, o widgets.ResolveOptions) (*widgets.Widget, error) {
 		if ui, err := xcontext.UserInfo(ctx); err == nil && ui.Username != "" {
 			mu.Lock()
-			resolves[ui.Username] = append(resolves[ui.Username], time.Now())
+			resolves[ui.Username] = append(resolves[ui.Username], clk.now())
 			mu.Unlock()
 		}
 		return inner(ctx, o)
@@ -53,7 +56,7 @@ func TestS262_PreLatchLearnedWorkFitsTheBackstop(t *testing.T) {
 	seedObjectsGetFn = func(ctx context.Context, ref templatesv1.ObjectReference) objects.Result {
 		if ui, err := xcontext.UserInfo(ctx); err == nil && ui.Username == "" {
 			mu.Lock()
-			baseRA = append(baseRA, time.Now())
+			baseRA = append(baseRA, clk.now())
 			mu.Unlock()
 		}
 		return innerGet(ctx, ref)
@@ -62,15 +65,16 @@ func TestS262_PreLatchLearnedWorkFitsTheBackstop(t *testing.T) {
 	prevObs := firstNavFireObserver
 	firstNavFireObserver = func(string) {
 		mu.Lock()
-		fired = time.Now()
+		fired = clk.now()
 		mu.Unlock()
 	}
 	t.Cleanup(func() { firstNavFireObserver = prevObs })
 
-	// The backstop: base nav (2 units) + ~2.5 classes' nav units (2 each).
+	// The backstop: base nav (2 units) + 2.5 classes' nav units (2 each) on the
+	// virtual clock.
 	latch := ensureFirstNavLatch()
-	start := time.Now()
-	deadline := start.Add(2*unit + 5*unit + unit/2 + 20*time.Millisecond)
+	start := clk.now()
+	deadline := start.Add(2*unit + 5*unit)
 	latch.setBackstopDeadline(deadline)
 
 	l262Boot(t, env, seedModeBoot)
@@ -110,8 +114,8 @@ func TestS262_PreLatchLearnedWorkFitsTheBackstop(t *testing.T) {
 		}
 	}
 	t.Logf("MUST2: pre-latch classes %v, post-latch classes %v (users index; higher = newer)", pre, post)
-	if len(pre) < 1 || len(post) < 1 {
-		t.Errorf("MUST2 RED: want ≥1 class pre-latch and ≥1 seeded post-latch, got pre=%v post=%v", pre, post)
+	if len(pre) != 2 || len(post) != 3 {
+		t.Errorf("MUST2 RED: the backstop fits exactly the 2 newest classes pre-latch, got pre=%v post=%v", pre, post)
 	}
 	for _, i := range pre {
 		for _, j := range post {

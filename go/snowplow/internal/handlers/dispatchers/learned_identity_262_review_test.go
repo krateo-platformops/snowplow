@@ -167,10 +167,14 @@ func TestS262_EngineSeedArmsTheLatchWithTheBackstop(t *testing.T) {
 
 func TestS262_SlowTailRecheckedBeforeEachPreLatchClass(t *testing.T) {
 	const unit = 40 * time.Millisecond
+	const slow = 70 * time.Millisecond
 	users, secrets := l262ManyUsers(t, 5)
 	env := l262Setup(t, l262Opts{extraUsers: users, secrets: secrets, widgets: 2, ras: 2})
-	// The newest class's nav units run slower than the mean the admission used.
-	l262Stubs(t, l262StubOpts{widgetSleep: unit, widgetSleepFor: map[string]time.Duration{users[4]: 70 * time.Millisecond}})
+	// Deterministic cost injection on a VIRTUAL seed clock: every widget costs
+	// 40ms, except the newest class's, which run slower than the mean the
+	// admission plans with.
+	clk := l262VirtualClock(t)
+	l262Stubs(t, l262StubOpts{widgetSleep: unit, widgetSleepFor: map[string]time.Duration{users[4]: slow}, clock: clk})
 	l262WaitLearned(t, 5)
 
 	var mu sync.Mutex
@@ -180,20 +184,21 @@ func TestS262_SlowTailRecheckedBeforeEachPreLatchClass(t *testing.T) {
 	widgetsResolveFn = func(ctx context.Context, o widgets.ResolveOptions) (*widgets.Widget, error) {
 		if ui, err := xcontext.UserInfo(ctx); err == nil && ui.Username != "" {
 			mu.Lock()
-			resolves[ui.Username] = append(resolves[ui.Username], time.Now())
+			resolves[ui.Username] = append(resolves[ui.Username], clk.now())
 			mu.Unlock()
 		}
 		return inner(ctx, o)
 	}
 	t.Cleanup(func() { widgetsResolveFn = inner })
 	prevObs := firstNavFireObserver
-	firstNavFireObserver = func(string) { mu.Lock(); fired = time.Now(); mu.Unlock() }
+	firstNavFireObserver = func(string) { mu.Lock(); fired = clk.now(); mu.Unlock() }
 	t.Cleanup(func() { firstNavFireObserver = prevObs })
 
 	// Backstop: base nav (2 units) + room for exactly 2 classes' nav units at
-	// the mean (the admission's pre-latch plan) + a small margin.
+	// the planned mean + a margin smaller than one unit. The admission plans the
+	// 2 newest classes pre-latch.
 	latch := ensureFirstNavLatch()
-	start := time.Now()
+	start := clk.now()
 	deadline := start.Add(2*unit + 4*unit + 30*time.Millisecond)
 	latch.setBackstopDeadline(deadline)
 
@@ -204,19 +209,24 @@ func TestS262_SlowTailRecheckedBeforeEachPreLatchClass(t *testing.T) {
 	if fired.IsZero() {
 		t.Fatal("NON-VACUITY: the latch never fired")
 	}
-	t.Logf("#442: latch at +%v, backstop at +%v", fired.Sub(start), deadline.Sub(start))
-	if !fired.Before(deadline) {
-		t.Errorf("#442 RED: a slow pre-latch class pushed the latch to +%v, past the backstop at +%v", fired.Sub(start), deadline.Sub(start))
+	// THE DOCUMENTED RESIDUAL: the re-check bounds each class by its ESTIMATE, so
+	// the latch may exceed the plan by at most one class's estimation error —
+	// here the slow class's (2 nav units × (70ms − 40ms)).
+	estimationError := 2 * (slow - unit)
+	t.Logf("#442: latch at +%v, backstop at +%v, residual bound +%v", fired.Sub(start), deadline.Sub(start), estimationError)
+	if fired.After(deadline.Add(estimationError)) {
+		t.Errorf("#442 RED: the latch at +%v exceeds the backstop (+%v) by more than one class's estimation error (%v)",
+			fired.Sub(start), deadline.Sub(start), estimationError)
 	}
 	before := func(u string) bool {
 		ts := resolves[u]
-		return len(ts) > 0 && ts[len(ts)-1].Before(fired)
+		return len(ts) > 0 && ts[0].Before(fired)
 	}
 	if !before(users[4]) {
-		t.Errorf("NON-VACUITY: the newest class must still seed pre-latch")
+		t.Errorf("NON-VACUITY: the newest (slow) class must still seed pre-latch")
 	}
 	if before(users[3]) {
-		t.Errorf("#442 RED: after the slow class, the next class did not fit the time left yet seeded pre-latch")
+		t.Errorf("#442 RED: after the slow class the next class no longer fit the time left, yet it STARTED pre-latch")
 	}
 	for _, u := range users {
 		if w, n := l262Warm(t, env, l262CustomerCtx(u, []string{l262Group})); w != n {

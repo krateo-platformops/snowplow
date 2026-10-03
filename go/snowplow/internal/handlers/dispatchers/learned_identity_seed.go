@@ -164,6 +164,13 @@ func (c *seedUnitCost) mean() (time.Duration, bool) {
 
 var widgetUnitCost, raUnitCost seedUnitCost
 
+// seedClock is the clock the learned-class bound reads: the per-unit seed cost
+// (measuredSeedUnit) and the time left before the readiness backstop
+// (firstNavLatch.backstopRemaining) are measured on the SAME clock. A test
+// seam (deterministic cost injection, never a wall-clock margin); production
+// always uses time.Now.
+var seedClock = time.Now
+
 // seedUnitMarkerKey carries a per-target flag that enterSeedUnit sets when the
 // target really resolves (a fresh/age/liveness skip never reaches it).
 type seedUnitMarkerKey struct{}
@@ -174,13 +181,13 @@ type seedUnitMarkerKey struct{}
 // seeded unit.
 func measuredSeedUnit(ctx context.Context, isWidget bool, do func(context.Context) error) error {
 	m := new(atomic.Bool)
-	start := time.Now()
+	start := seedClock()
 	err := do(context.WithValue(ctx, seedUnitMarkerKey{}, m))
 	if m.Load() {
 		if isWidget {
-			widgetUnitCost.add(time.Since(start))
+			widgetUnitCost.add(seedClock().Sub(start))
 		} else {
-			raUnitCost.add(time.Since(start))
+			raUnitCost.add(seedClock().Sub(start))
 		}
 	}
 	return err

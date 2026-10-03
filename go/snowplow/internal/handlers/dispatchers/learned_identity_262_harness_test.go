@@ -312,6 +312,41 @@ type l262StubOpts struct {
 	widgetSleep, raSleep time.Duration
 	widgetSleepFor       map[string]time.Duration
 	probe                bool
+	// clock, when set, makes the costs VIRTUAL: a resolve advances the
+	// injected seedClock by its cost instead of sleeping — the bound's cost
+	// measurement and the backstop arithmetic become exact and load-proof.
+	clock *l262Clock
+}
+
+func (o l262StubOpts) spend(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	if o.clock != nil {
+		o.clock.advance(d)
+		return
+	}
+	time.Sleep(d)
+}
+
+// l262Clock is a deterministic seedClock: time moves only when a stubbed
+// resolve spends its injected cost.
+type l262Clock struct {
+	base   time.Time
+	offset atomic.Int64
+}
+
+func (c *l262Clock) now() time.Time          { return c.base.Add(time.Duration(c.offset.Load())) }
+func (c *l262Clock) advance(d time.Duration) { c.offset.Add(int64(d)) }
+
+// l262VirtualClock installs a virtual seedClock for the arm.
+func l262VirtualClock(t *testing.T) *l262Clock {
+	t.Helper()
+	c := &l262Clock{base: time.Now()}
+	prev := seedClock
+	seedClock = c.now
+	t.Cleanup(func() { seedClock = prev })
+	return c
 }
 
 func (o l262StubOpts) widgetCost(user string) time.Duration {
@@ -342,9 +377,7 @@ func l262Stubs(t *testing.T, o l262StubOpts) {
 		if ui, err := xcontext.UserInfo(ctx); err == nil {
 			user = ui.Username
 		}
-		if d := o.widgetCost(user); d > 0 {
-			time.Sleep(d)
-		}
+		o.spend(o.widgetCost(user))
 		if o.probe {
 			if ui, err := xcontext.UserInfo(ctx); err == nil {
 				xcontext.Logger(ctx).Info("l262.resolve_path.requester",
@@ -373,7 +406,7 @@ func l262Stubs(t *testing.T, o l262StubOpts) {
 			authnNS, key string, handle cacheHandle, inputs *cache.ResolvedKeyInputs, got objects.Result,
 			stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink,
 		) error {
-			time.Sleep(o.raCost())
+			o.spend(o.raCost())
 			return seedRestactionResolveAndPutProd(ctx, resCtx, cr, ref, authnNS, key, handle, inputs, got, stageErrSink, extTouchedSink)
 		}
 	}

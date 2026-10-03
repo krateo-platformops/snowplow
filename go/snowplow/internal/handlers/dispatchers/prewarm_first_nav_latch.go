@@ -95,7 +95,7 @@ func (l *firstNavLatch) backstopRemaining() (time.Duration, bool) {
 	if n == 0 {
 		return 0, false
 	}
-	return time.Until(time.Unix(0, n)), true
+	return time.Unix(0, n).Sub(seedClock()), true
 }
 
 func newFirstNavLatch() *firstNavLatch {
