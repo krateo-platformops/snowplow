@@ -340,17 +340,22 @@ func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[sche
 	cache.StartRefresher(rctx)
 
 	skipped0 := cache.RefresherStatsByStat()["skipped_no_entry"]
+	dropped0 := cache.EnqueueDroppedNonResidentTotal()
 	octx := cache.WithL1KeyContext(context.Background(), outerKey)
 	gen0 := store.CaptureGen(outerKey)
 	armed.Store(true)
 	dict := resolve375(octx, stages...)
 	armed.Store(false)
 	// The #375 race, for real: the churn dirty-marked the (not-yet-resident) outer and the
-	// refresher consumed that mark as skipped_no_entry BEFORE the stale Put below.
+	// mark was LOST before the stale Put below. Two ways to lose it: since #383 the hook
+	// drops a non-resident key's mark at enqueue (enqueue_dropped_non_resident); before
+	// #383, or for a mark that slipped past the drop, the refresher consumed it as
+	// skipped_no_entry. Either way the outer is stale with no pending mark until the remark.
 	deadline := time.Now().Add(5 * time.Second)
-	for cache.RefresherStatsByStat()["skipped_no_entry"] == skipped0 {
+	for cache.RefresherStatsByStat()["skipped_no_entry"] == skipped0 && cache.EnqueueDroppedNonResidentTotal() == dropped0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("setup: the outer's dirty-mark was never consumed as skipped_no_entry (race not driven)")
+			t.Fatalf("setup: the outer's dirty-mark was never lost (neither dropped at enqueue nor consumed as " +
+				"skipped_no_entry) — race not driven")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
