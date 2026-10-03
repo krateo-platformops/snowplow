@@ -175,6 +175,15 @@ func seedFullListRAKey(ctx context.Context, gvr schema.GroupVersionResource,
 	// dispatchCacheLookupKey) so a co-bound requester with different step-level
 	// RBAC never shares this cell.
 	keyInputs.SubjectBindingSet = rbac.SubjectBindingSetDigest(ui.Username, ui.Groups)
+	// #435 — fold the requester's EFFECTIVE per-subject RBAC sub-generation, the
+	// same derivation (system:authenticated included) as dispatchCacheLookupKey.
+	// The binding set alone is blind to an edit of a Role those bindings
+	// reference (a rules revoke keeps every binding): without this the key never
+	// rotated, nothing dirty-marks raFullList cells on RBAC events, and a member
+	// was served the pre-revoke rows until the TTL. It also makes
+	// raKeyClassCurrent see a grant-then-revoke inside the resolve (the sub-gen
+	// is monotone; the binding set is back where it was).
+	keyInputs.RBACSubGen = cache.RBACSubGenForSubject(ui.Username, rbac.WithAuthenticatedGroup(ui.Groups))
 	// #431 — the refresher re-resolves the cell under this representative (same
 	// pattern as dispatchCacheLookupKey). It is the identity the key was just
 	// minted from, so it is a member of the key's class by construction; the #424
@@ -278,8 +287,8 @@ func raFullListServe(
 	// a RESTAction that declares a userAccessFilter stage. The cell this path
 	// serves AND populates holds the RA's full resolve output, UAF refilter
 	// INCLUDED, under a key that folds the RA-CR's first-match BindingUID ALONE
-	// (seedFullListRAKey → RAFullListKeyInputs — no RBACSubGen, strictly weaker
-	// separation than the restactions cell). So two co-bound users with divergent
+	// (seedFullListRAKey → RAFullListKeyInputs — at the time no RBACSubGen, which
+	// #435 has since folded in; still no UAF scope). So two co-bound users with divergent
 	// per-object narrowings key onto ONE cell and the second is served the first
 	// one's rows — the same defect the three restactions Put sites now decline,
 	// with fewer defences in front of it.
@@ -610,8 +619,10 @@ func RAKeyClassDriftDeclinedForTest() uint64 { return raKeyClassDriftDeclined.Lo
 
 // raKeyClassCurrent re-derives the raFullList key for ctx's identity through the
 // SAME single-source helper the producer minted with (seedFullListRAKey: real
-// EvaluateRBAC first-match + the binding-set digest) and reports whether it still
-// equals raKey. A grant/revoke that landed during the resolve moves it (#424).
+// EvaluateRBAC first-match + the binding-set digest + the RBAC sub-gen) and
+// reports whether it still equals raKey. A grant/revoke that landed during the
+// resolve moves it (#424) — including a grant-then-revoke or a Role edit that
+// leaves the binding set unchanged, via the monotone sub-gen (#435).
 func raKeyClassCurrent(ctx context.Context, gvr schema.GroupVersionResource,
 	namespace, name string, extras map[string]any, raKey string) bool {
 	_, now, ok := seedFullListRAKey(ctx, gvr, namespace, name, extras)

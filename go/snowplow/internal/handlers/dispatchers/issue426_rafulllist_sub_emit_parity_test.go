@@ -6,8 +6,9 @@
 // dispatchCacheLookupKey. That builder folds RBACSubGen and the normalized
 // request pagination (0 -> -1, or the real page). The cell's own builder
 // (apiref seedFullListRAKey -> cache.RAFullListKeyInputs) is page-independent
-// (0/0), strips the slice extras, and folds no RBACSubGen. So the armed key never
-// matched the emitted key, and no raFullList refresh reached a subscriber.
+// (0/0), strips the slice extras, and (until #435) folded no RBACSubGen. So the
+// armed key never matched the emitted key, and no raFullList refresh reached a
+// subscriber. Since #435 both sides fold RBACSubGen through the same builder.
 //
 // Two arms, both RED on 248601d1 and both RED again if the two sides diverge:
 //
@@ -274,8 +275,10 @@ func TestIssue426_RAFullListSubscribeKeyEqualsEmitKey(t *testing.T) {
 			if !ok {
 				t.Fatalf("PRE: the producer must derive a raKey for alice")
 			}
-			if emit.RBACSubGen != 0 {
-				t.Fatalf("PRE: the raFullList key folds no RBACSubGen (#424); got %d", emit.RBACSubGen)
+			// #435 — the raFullList key folds RBACSubGen; i426MoveSubGen moved
+			// alice's, so a subscription that dropped or mis-derived it diverges.
+			if emit.RBACSubGen == 0 {
+				t.Fatalf("PRE: the raFullList key must fold alice's moved RBACSubGen (#435); got 0")
 			}
 
 			// The arm can fail: the pre-#426 subscription derivation

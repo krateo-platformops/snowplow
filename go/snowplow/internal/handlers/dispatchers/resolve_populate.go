@@ -211,11 +211,6 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		)
 		return nil
 	}
-	// #431 — raFullList keys fold no sub-gen, so the class check above cannot see
-	// RBAC that moves under the representative while its binding set stays put
-	// (a grant+revoke or a Role edit inside the re-resolve). Bracket the
-	// re-resolve with the representative's sub-gen; checked before the write.
-	repRBACMoved := raFullListSubGenBracket(&inputs, refreshUser, refreshGroups)
 	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserInfo(jwtutil.UserInfo{
 			Username: refreshUser,
@@ -446,15 +441,6 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("drift", drift),
 		)
 		return nil
-	}
-	// #431 — the representative is still in the class (the check above passed),
-	// but its RBAC moved during the re-resolve, so the body may hold rights the
-	// class lacks. Do not write; return a retryable error so the refresher
-	// re-resolves under the settled RBAC (a spent budget drops → evicts).
-	if repRBACMoved() {
-		noteIdentityClassDrift("refresher", "rbac_subgen")
-		return fmt.Errorf("resolveAndPopulateL1 %s/%s: %w",
-			inputs.CacheEntryClass, inputs.Name, errRepresentativeRBACMoved)
 	}
 
 	entry := &cache.ResolvedEntry{
