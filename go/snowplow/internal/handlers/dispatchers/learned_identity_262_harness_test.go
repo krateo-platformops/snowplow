@@ -415,3 +415,25 @@ func l262LearnedTargets(gvr schema.GroupVersionResource) map[string]int {
 	}
 	return out
 }
+
+// l262StartWorker runs the engine worker for an arm and JOINS it on cleanup:
+// the cleanup cancels the worker ctx and waits for runWorker to return BEFORE
+// the earlier-registered cleanups (LIFO) restore the resolver seams the worker
+// reads — an un-joined worker raced those restores (reviewer-415, 1/100 -race).
+func l262StartWorker(t *testing.T, e *prewarmEngine) {
+	t.Helper()
+	wctx, wcancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.runWorker(wctx)
+	}()
+	t.Cleanup(func() {
+		wcancel()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Error("the engine worker did not exit within 30s of its ctx cancel")
+		}
+	})
+}

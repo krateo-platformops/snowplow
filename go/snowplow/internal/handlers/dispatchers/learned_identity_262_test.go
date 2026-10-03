@@ -205,9 +205,7 @@ func TestF3_262_LoginSecretUpdateSeedsNewClass(t *testing.T) {
 	e := newTestEngine()
 	e.scopeHandler = makeBootScopeHandler(env.deps)
 	registerEngineLearnedClassHook(e)
-	wctx, wcancel := context.WithCancel(context.Background())
-	t.Cleanup(wcancel)
-	go e.runWorker(wctx)
+	l262StartWorker(t, e)
 
 	newCtx := l262CustomerCtx("gina", []string{l262Group, ops})
 	if w, _ := l262Warm(t, env, newCtx); w != 0 {

@@ -87,9 +87,7 @@ func TestF6_262_Privacy_NoClassTokenInLogsOrDebug(t *testing.T) {
 	e := newTestEngine()
 	e.scopeHandler = makeBootScopeHandler(env.deps)
 	registerEngineLearnedClassHook(e)
-	wctx, wcancel := context.WithCancel(context.Background())
-	t.Cleanup(wcancel)
-	go e.runWorker(wctx)
+	l262StartWorker(t, e)
 	upd := l262ClientconfigSecret(t, secretName, cn, []string{l262Group, privGroup, privGroup2}, time.Now(), "2")
 	if _, err := env.kube.CoreV1().Secrets(l262AuthnNS).Update(context.Background(), upd, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)

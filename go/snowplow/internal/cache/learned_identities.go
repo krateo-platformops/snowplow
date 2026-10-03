@@ -88,6 +88,9 @@ func (c *learnedClass) lastSeen() time.Time {
 			ls = t
 		}
 	}
+	if now := time.Now(); ls.After(now) {
+		ls = now // never in the future (see the ingest clamp)
+	}
 	return ls
 }
 
@@ -374,6 +377,12 @@ func syncLearnedFromSecrets(items []*corev1.Secret) {
 			added = true
 		}
 		c.secrets[sec.Name] = struct{}{}
+		// LastSeen orders admission newest-first: a future NotBefore (forged, or
+		// a skewed signer clock) is clamped to the instant it was observed, so it
+		// cannot sort newest forever and crowd real logins out of the bound.
+		if notBefore.After(now) {
+			notBefore = now
+		}
 		if notBefore.After(c.secretSeen) {
 			c.secretSeen = notBefore
 		}

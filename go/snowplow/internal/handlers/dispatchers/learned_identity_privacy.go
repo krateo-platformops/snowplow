@@ -106,6 +106,12 @@ func (h *redactingHandler) scrubAttr(a slog.Attr) slog.Attr {
 				cp[i] = h.scrub(s)
 			}
 			a.Value = slog.AnyValue(cp)
+		case []byte:
+			// slog's JSON handler base64-encodes a []byte, which a text scan
+			// would miss; scrub the decoded content.
+			if h.carries(string(x)) {
+				a.Value = slog.StringValue(h.scrub(string(x)))
+			}
 		case error:
 			if h.carries(x.Error()) {
 				a.Value = slog.StringValue(h.scrub(x.Error()))
