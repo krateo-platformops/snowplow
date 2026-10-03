@@ -33,6 +33,7 @@ package dispatchers
 
 import (
 	"context"
+	"errors"
 	"expvar"
 	"sync"
 	"sync/atomic"
@@ -52,7 +53,9 @@ func identityClassDrift(ctx context.Context, inputs *cache.ResolvedKeyInputs, us
 	if rbac.SubjectBindingSetDigest(username, groups) != inputs.SubjectBindingSet {
 		return "binding_set"
 	}
-	// raFullList keys do not fold RBACSubGen (RAFullListKeyInputs leaves it 0).
+	// raFullList keys do not fold RBACSubGen (RAFullListKeyInputs leaves it 0);
+	// the refresher brackets its raFullList re-resolve with the representative's
+	// sub-gen instead (raFullListSubGenBracket, #431).
 	if inputs.CacheEntryClass != cache.CacheEntryClassRAFullList &&
 		cache.RBACSubGenForSubject(username, rbac.WithAuthenticatedGroup(groups)) != inputs.RBACSubGen {
 		return "rbac_subgen"
@@ -119,4 +122,27 @@ func identityClassDriftCtx(ctx context.Context, inputs *cache.ResolvedKeyInputs)
 		return "no_identity"
 	}
 	return identityClassDrift(ctx, inputs, ui.Username, ui.Groups)
+}
+
+// errRepresentativeRBACMoved is the refresher's error when the representative's
+// RBAC moved during a raFullList re-resolve (#431). It is an ordinary retryable
+// refresh error: the refresher requeues the key and re-resolves under the
+// settled RBAC; a spent budget drops → evicts (never a stale or foreign body).
+var errRepresentativeRBACMoved = errors.New("representative's RBAC moved during the re-resolve")
+
+// raFullListSubGenBracket is the #431 refresher bracket for the raFullList
+// class, whose key folds no RBACSubGen — so identityClassDrift's rbac_subgen
+// limb cannot run for it. Opened before the re-resolve, the returned check
+// (called after it) reports whether the representative's per-subject
+// sub-generation moved in between: a grant-then-revoke, or a referenced Role
+// edit, that leaves the binding set where it was while the re-resolve read
+// rights the class does not hold. Every other class gets a check that is always
+// false (their key carries the sub-gen, which identityClassDrift compares).
+func raFullListSubGenBracket(inputs *cache.ResolvedKeyInputs, username string, groups []string) (moved func() bool) {
+	if inputs == nil || inputs.CacheEntryClass != cache.CacheEntryClassRAFullList {
+		return func() bool { return false }
+	}
+	eff := rbac.WithAuthenticatedGroup(groups)
+	sg0 := cache.RBACSubGenForSubject(username, eff)
+	return func() bool { return cache.RBACSubGenForSubject(username, eff) != sg0 }
 }
