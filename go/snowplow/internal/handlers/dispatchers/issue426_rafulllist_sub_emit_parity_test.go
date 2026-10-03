@@ -417,3 +417,52 @@ func TestIssue426_RAFullListRefreshDeliversToSubscriber(t *testing.T) {
 			storedKey, armed)
 	}
 }
+
+// TestIssue426_RAFullListSubscriptionFailsClosed: the raFullList subscription
+// arms nothing unless the identity-bound key is mintable. Each sub-arm
+// discriminates a distinct guard:
+//   - no-grant identity: seedFullListRAKey's `bindingUID == ""` refusal, the
+//     check the producer shares. Without it a no-binding identity would arm,
+//     and populate, the shared empty-identity cell (the A4 class);
+//   - no UserInfo: seedFullListRAKey's identity check;
+//   - L1 off (nil ResolvedCache): the subscription arm's own cache check. The
+//     same identity arms with L1 on, so the skip is the cache check alone.
+func TestIssue426_RAFullListSubscriptionFailsClosed(t *testing.T) {
+	i426BuildWatcher(t)
+	coords := i426Coords(5, 1, nil)
+
+	expectSkip := func(t *testing.T, ctx context.Context) {
+		t.Helper()
+		key, ok, reason := DeriveSubscriptionKeyWithReason(cache.WithInformerOnlyReads(ctx), coords)
+		if ok || key != "" || reason != SubscriptionSkipOther {
+			t.Fatalf("raFullList subscription must fail closed: ok=%v key=%q reason=%d (want false, \"\", SkipOther=%d)",
+				ok, key, reason, SubscriptionSkipOther)
+		}
+	}
+
+	t.Run("no-grant-identity", func(t *testing.T) {
+		mallory := xcontext.BuildContext(context.Background(),
+			xcontext.WithUserInfo(jwtutil.UserInfo{Username: "mallory-426", Groups: []string{"nobody-426"}}))
+		if allowed, uid, _ := rbac.EvaluateRBAC(mallory, rbac.EvaluateOptions{Username: "mallory-426",
+			Groups: []string{"nobody-426"}, Verb: "get", Group: i426RAGVR().Group, Resource: i426RAGVR().Resource,
+			Namespace: i426NS, Name: i426RAName}); allowed || uid != "" {
+			t.Fatalf("PRE: mallory must hold no grant on the RA (allowed=%v uid=%q)", allowed, uid)
+		}
+		expectSkip(t, mallory)
+	})
+
+	t.Run("no-userinfo", func(t *testing.T) {
+		expectSkip(t, context.Background())
+	})
+
+	t.Run("nil-resolved-cache", func(t *testing.T) {
+		if _, ok := DeriveSubscriptionKey(i426Ctx(), coords); !ok {
+			t.Fatalf("PRE: alice must arm with L1 on, or this sub-arm cannot isolate the cache check")
+		}
+		t.Setenv("RESOLVED_CACHE_ENABLED", "false")
+		if cache.ResolvedCache() != nil {
+			t.Fatalf("PRE: ResolvedCache must be nil with RESOLVED_CACHE_ENABLED=false")
+		}
+		expectSkip(t, i426Ctx())
+	})
+}
