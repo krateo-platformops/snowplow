@@ -73,11 +73,20 @@ func foldSubjects(username string, groups []string) []subjectKey {
 // this flush — i.e. whether any of its folded subjects is in the rotated set. A
 // co-bound identity whose own subjects did not move returns false (#258
 // falsifier b — precision).
+//
+// #436 — the fold runs over the EFFECTIVE group set (WithAuthenticatedGroup),
+// the SAME set the key mints over (dispatchCacheLookupKey folds
+// RBACSubGenForSubject(username, WithAuthenticatedGroup(groups)), #424). A cohort
+// representative carries its RAW groups ({"", [devs]}), which never name
+// system:authenticated; without this, a change to a system:authenticated binding
+// (or a role it references) rotated EVERY identity's key while only the
+// {"", [system:authenticated]} representative counted as rotated, leaving every
+// other cohort's new key cold until keepwarm reached it.
 func (r RotatedSubjectSet) Rotated(username string, groups []string) bool {
 	if len(r.set) == 0 {
 		return false
 	}
-	for _, s := range foldSubjects(username, groups) {
+	for _, s := range foldSubjects(username, WithAuthenticatedGroup(groups)) {
 		if _, hit := r.set[s]; hit {
 			return true
 		}
@@ -162,4 +171,22 @@ func NotifyRBACShiftForTest(rotated []RotatedSubject) {
 		set[subjectKey{Kind: r.Kind, Name: r.Name, Namespace: r.Namespace}] = struct{}{}
 	}
 	fireRBACShift(RotatedSubjectSet{set: set})
+}
+
+// WithAuthenticatedGroup returns groups plus system:authenticated (once,
+// de-duplicated, order otherwise preserved): the requester's EFFECTIVE group
+// set. The single source for every site that must agree on one identity class —
+// the RBACSubGen key fold, the binding-set digest, the seed resolve identity
+// (rbac.WithAuthenticatedGroup delegates here) and the reseed reachability
+// predicate (Rotated, #436). It lives in this package so Rotated can use it
+// without an import cycle.
+func WithAuthenticatedGroup(groups []string) []string {
+	for _, g := range groups {
+		if g == systemAuthenticatedGroup {
+			return groups
+		}
+	}
+	out := make([]string, 0, len(groups)+1)
+	out = append(out, groups...)
+	return append(out, systemAuthenticatedGroup)
 }

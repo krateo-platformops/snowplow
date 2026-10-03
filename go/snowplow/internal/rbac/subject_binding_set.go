@@ -178,15 +178,11 @@ func buildSubjectBindingSetDigest(snap *cache.RBACSnapshot, username string, gro
 // Username=="" would otherwise not match system:authenticated subjects in
 // EvaluateRBAC (that match is gated on a non-empty username) and its seeded body
 // would be NARROWER than a real member's under the same key.
+//
+// #436: the implementation is cache.WithAuthenticatedGroup, so the reseed
+// reachability predicate (cache.RotatedSubjectSet.Rotated) folds the same set.
 func WithAuthenticatedGroup(groups []string) []string {
-	for _, g := range groups {
-		if g == systemAuthenticatedGroup {
-			return groups
-		}
-	}
-	out := make([]string, 0, len(groups)+1)
-	out = append(out, groups...)
-	return append(out, systemAuthenticatedGroup)
+	return cache.WithAuthenticatedGroup(groups)
 }
 
 // canonicalGroupsKey is an EXACT (collision-free) order-independent encoding of
