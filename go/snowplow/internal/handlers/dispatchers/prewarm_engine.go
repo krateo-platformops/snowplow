@@ -184,11 +184,20 @@ const (
 	// dedups to at most one pending sweep. Per-scope timeout = the boot budget.
 	scopeKindKeepwarm prewarmScopeKind = "keepwarm"
 
+	// scopeKindRBACShift — #258. An RBAC sub-gen flush rotated one or more
+	// subjects' keys; the engine scope-reseeds ONLY the affected resident
+	// cohorts (targets whose folded subject is in the rotated set) so the
+	// rotated identity's NEW-sub-gen SERVE key is warm on its next navigation.
+	// Fired from cache.flushPendingSubGenBumps via cache.RegisterRBACShiftHook
+	// (registerEngineRBACShiftHook). Coalesces on key()=="rbac-shift" with an
+	// engine-side merge-accumulator of the rotated subjects (union-then-drain),
+	// so a burst of flushes collapses to one scope and a rotation arriving
+	// mid-reseed is merged + re-armed (no dropped event).
+	scopeKindRBACShift prewarmScopeKind = "rbac-shift"
+
 	// Ship 2 (NOT wired this ship): scopeKindWidgetCR (a widget/RESTAction
-	// CR add/update/delete re-walks that object's subtree) and
-	// scopeKindRBACShift (an RBAC binding shift re-seeds the affected GVRs'
-	// cohorts). The engine queue + rePrewarm core are built to accept these
-	// with no refactor.
+	// CR add/update/delete re-walks that object's subtree). The engine queue +
+	// rePrewarm core are built to accept it with no refactor.
 )
 
 // seedScopeMode is the per-scope seed policy the rePrewarm core threads through
@@ -220,6 +229,20 @@ const (
 	seedModeBoot seedScopeMode = iota
 	seedModeKeepwarm
 	seedModeGVRDiscovered
+	// seedModeRBACShift — #258. Reseed ONLY the targets whose folded subject
+	// rotated in this flush (RotatedSubjectSet.Rotated), re-resolving each under
+	// its own identity so dispatchCacheLookupKey stamps the NEW per-subject
+	// RBACSubGenForSubject (the SERVE key). LIVENESS skip only (never an
+	// age-skip): a live cell under the new-sub-gen key was minted after the
+	// rotation, so a re-armed run reads it instead of re-resolving it
+	// (seedSkipDecision); an absent key is resolved and minted.
+	seedModeRBACShift
+	// seedModeReMint — #378 (dev-1218). Age-triggered re-mint of the SAME key
+	// (sub-gen unchanged): resolve-first, then an atomic gen-guarded REPLACE that
+	// RESETS BornAt (the fresh-mint strategy) so the kept-warm cell's max-age
+	// clock restarts without an evict-then-reinsert cold-nav window. NO skip (the
+	// reaper already selected this cell as past-age — a skip would defeat it).
+	seedModeReMint
 )
 
 // String renders the mode for the seed's completion log (replaces the old
@@ -232,6 +255,10 @@ func (m seedScopeMode) String() string {
 		return "keepwarm"
 	case seedModeGVRDiscovered:
 		return "gvr-discovered"
+	case seedModeRBACShift:
+		return "rbac-shift"
+	case seedModeReMint:
+		return "re-mint"
 	default:
 		return "unknown"
 	}
@@ -319,6 +346,15 @@ type prewarmEngine struct {
 	bootConvMu   sync.Mutex
 	bootConvSets map[string]*bootConvergenceState
 
+	// rbacShift is the #258 merge-accumulator of rotated subjects pending a
+	// scoped reseed. The cache→engine RBAC-shift hook (registerEngineRBACShiftHook)
+	// MERGEs each sub-gen flush's RotatedSubjectSet into it and enqueues the
+	// payload-free scopeKindRBACShift scope (coalesces); rePrewarmRBACShift DRAINs
+	// it (take-and-reset) when the scope runs. A rotation arriving mid-reseed
+	// merges into the fresh post-drain set and re-arms the scope → exactly one
+	// follow-up (≤2 reseeds per burst). Set once in prewarmEngineSingleton.
+	rbacShift *cache.RBACShiftAccumulator
+
 	// customer-priority yield knobs.
 	yieldPoll time.Duration // how long a worker parks while a customer call is in flight
 
@@ -331,7 +367,7 @@ type prewarmEngine struct {
 
 var (
 	prewarmEngineInstance *prewarmEngine
-	prewarmEngineOnce      sync.Once
+	prewarmEngineOnce     sync.Once
 )
 
 // defaultEngineYieldPoll is how long an engine worker parks before
@@ -349,6 +385,7 @@ func prewarmEngineSingleton() *prewarmEngine {
 			queue: workqueue.NewTypedRateLimitingQueue(
 				workqueue.DefaultTypedControllerRateLimiter[prewarmScope](),
 			),
+			rbacShift: cache.NewRBACShiftAccumulator(),
 			yieldPoll: defaultEngineYieldPoll,
 		}
 	})
@@ -539,6 +576,7 @@ func StartPrewarmEngine(ctx context.Context, handler func(ctx context.Context, s
 		// The registration is idempotent at the cache side (compares
 		// fn pointer) so a future engine re-entry would not double-wire.
 		registerEngineGVRDiscoveredHook(e)
+		registerEngineRBACShiftHook(e)
 
 		// Publish expvar counters — Fix v2 PM Change #1. Inside startedOnce
 		// so initialisation runs exactly once.

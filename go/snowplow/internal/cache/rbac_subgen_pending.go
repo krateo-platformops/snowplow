@@ -147,6 +147,16 @@ func flushPendingSubGenBumps() {
 		countSubGenBumpSources(m)
 	}
 	BumpSubjectSubGens(drained)
+
+	// #258 — fire the RBAC-shift reseed hook AFTER the counters are bumped, so
+	// the dispatchers engine's scoped reseed mints each rotated subject's NEW
+	// sub-gen key. Fired synchronously here (the sub-gen publish-barrier drain);
+	// the hook handler is non-blocking (builds a prewarmScope + O(1)
+	// enqueueScope). No-op when no hook is registered (prewarm off / cache-off).
+	// Mirrors notifyGVRDiscoveredForReprewarm's placement at the discovery
+	// publish point. Carries only the rotated subjects; every rotation takes the
+	// same reseed path (see rbac_shift_hook.go).
+	notifyRBACShift(drained)
 }
 
 // ResetPendingSubGenBumpsForTest clears the accumulator. TEST-ONLY — production

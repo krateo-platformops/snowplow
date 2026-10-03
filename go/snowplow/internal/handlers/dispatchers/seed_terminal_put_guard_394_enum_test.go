@@ -96,7 +96,7 @@ func s394CollectSeedSites(t *testing.T) []s394SeedSite {
 				switch f := call.Fun.(type) {
 				case *ast.SelectorExpr:
 					switch f.Sel.Name {
-					case "Put", "ReplaceIfGen", "PutIfGen", "PutThenRemark": // #408: PutThenRemark is a store write too
+					case "Put", "ReplaceIfGen", "PutIfGen", "PutThenRemark", "ReplaceIfGenReMint": // #408 PutThenRemark, #378 ReplaceIfGenReMint are store writes too
 						site.directWrites = append(site.directWrites, f.Sel.Name+"@"+itoaLine(fset.Position(call.Pos()).Line))
 					}
 				case *ast.Ident:
@@ -227,10 +227,17 @@ func s394DeclaredSeedModes(t *testing.T) []string {
 
 // s394RecordingHandle is a cacheHandle that records which write the helper used.
 type s394RecordingHandle struct {
-	gen                  uint64
-	puts, putIfGens      int
-	putThenRemarks       int
-	lastCapturedGenInPut uint64
+	gen                      uint64
+	puts, putIfGens, reMints int
+	putThenRemarks           int
+	lastCapturedGenInPut     uint64
+}
+
+// #258/#378 — the re-mint write, recorded like PutIfGen.
+func (h *s394RecordingHandle) ReplaceIfGenReMint(_ context.Context, _ string, _ *cache.ResolvedEntry, g uint64) bool {
+	h.reMints++
+	h.lastCapturedGenInPut = g
+	return g == h.gen
 }
 
 func (h *s394RecordingHandle) Get(string) (*cache.ResolvedEntry, bool) { return nil, false }
@@ -254,10 +261,13 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 	guardedByMode := map[string]struct {
 		mode    seedScopeMode
 		guarded bool
+		reMint  bool // #378: the guarded write is ReplaceIfGenReMint, not PutIfGen
 	}{
-		"seedModeBoot":          {seedModeBoot, false}, // boot = plain+remark PRE-readyz (#323, #408); guarded post-readyz (below)
-		"seedModeKeepwarm":      {seedModeKeepwarm, true},
-		"seedModeGVRDiscovered": {seedModeGVRDiscovered, true},
+		"seedModeBoot":          {seedModeBoot, false, false}, // boot = plain+remark PRE-readyz (#323, #408); guarded post-readyz (below)
+		"seedModeKeepwarm":      {seedModeKeepwarm, true, false},
+		"seedModeGVRDiscovered": {seedModeGVRDiscovered, true, false},
+		"seedModeRBACShift":     {seedModeRBACShift, true, false}, // #258: new-sub-gen INSERT via PutIfGen
+		"seedModeReMint":        {seedModeReMint, true, true},     // #378: same-key fresh-mint REPLACE
 	}
 	// This table classifies the PRE-readyz guard; the post-readyz boot row is the
 	// #408 block after the loop.
@@ -277,16 +287,22 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 		}
 		h := &s394RecordingHandle{gen: 7}
 		g := seedTerminalGuardFor(c.mode, h, "k")
-		if g.guarded != c.guarded {
-			t.Errorf("#394: seedTerminalGuardFor(%s).guarded = %v, want %v", name, g.guarded, c.guarded)
+		if g.guarded != c.guarded || g.reMint != c.reMint {
+			t.Errorf("#394: seedTerminalGuardFor(%s) = {guarded:%v reMint:%v}, want {guarded:%v reMint:%v}",
+				name, g.guarded, g.reMint, c.guarded, c.reMint)
 		}
 		if !seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, g) {
 			t.Errorf("#394: %s: an unmoved generation must be accepted", name)
 		}
 		if c.guarded {
-			if h.puts != 0 || h.putIfGens != 1 || h.lastCapturedGenInPut != 7 {
-				t.Errorf("#394: post-readyz mode %s must write via PutIfGen(capturedGen=7) and never plain Put; "+
-					"puts=%d putIfGens=%d gen=%d", name, h.puts, h.putIfGens, h.lastCapturedGenInPut)
+			wantPutIfGens, wantReMints := 1, 0
+			if c.reMint {
+				wantPutIfGens, wantReMints = 0, 1
+			}
+			if h.puts != 0 || h.putIfGens != wantPutIfGens || h.reMints != wantReMints || h.lastCapturedGenInPut != 7 {
+				t.Errorf("#394: post-readyz mode %s must write via its gen-guarded method (capturedGen=7) and never "+
+					"plain Put; puts=%d putIfGens=%d reMints=%d gen=%d (want putIfGens=%d reMints=%d)",
+					name, h.puts, h.putIfGens, h.reMints, h.lastCapturedGenInPut, wantPutIfGens, wantReMints)
 			}
 			h.gen = 8 // a removal moved the generation
 			if seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, g) {

@@ -752,6 +752,9 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 //   - seedModeGVRDiscovered: NEVER skip. gvr-discovered must RE-RESOLVE
 //     already-warm cells so the dep edge against the newly-registered GVR is
 //     recorded (the S4 fix; F4-C3 boundary).
+//   - seedModeRBACShift (#258): bare liveness on the NEW-sub-gen key — a live
+//     cell there was minted after the rotation, so a re-armed run skips it.
+//   - seedModeReMint (#378): NEVER skip (the cell was selected as past-age).
 //
 // The store's Get is itself the freshness/liveness oracle — it returns
 // (entry, true) iff the entry exists AND is non-expired per the exact
@@ -850,6 +853,38 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 			)
 			return true
 		}
+		return false
+	case seedModeRBACShift:
+		// #258 — bare LIVENESS skip on the NEW-sub-gen key (never an age-skip). The
+		// key embeds the rotated subject's bumped sub-gen counter, a value no cell
+		// existed under before the flush, so a LIVE cell under it was necessarily
+		// resolved after the rotation's publish (a customer fill, or an earlier run
+		// of this scope) and is already the warm cell #258 exists to mint. Skipping
+		// it is the dedup that keeps the reseed's work 1:1 with distinct rotated
+		// keys: a re-armed run (ctx cut at the per-scope budget, or a coalesced
+		// follow-up after a second flush) pays one GetNoTouch for every target an
+		// earlier run already minted, instead of re-resolving it — so a cut run
+		// makes monotone progress instead of restarting its prefix every budget.
+		// #376 — GetNoTouch: an internal read, no warmth stamp, no hit/miss count.
+		entry, live := handle.GetNoTouch(key)
+		if !live || entry == nil {
+			return false
+		}
+		slog.Default().Debug("phase1.seed.rbac_shift_live_skip",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("cohort", cohortLabel),
+			slog.String("effect", "#258 the rotated subject's new-sub-gen key is already live (minted after "+
+				"the rotation); resolve+Put skipped"),
+		)
+		return true
+	case seedModeReMint:
+		// #378 — a FORCED write; never age/liveness-skipped. The reaper SELECTED
+		// this cell because it is past-age, so a keepwarm-style age-skip (or a
+		// liveness skip: the cell IS live) would defeat the re-mint. Explicit (not
+		// folded into the default) so a future skip added to the default cannot
+		// silently start skipping re-mints.
 		return false
 	default: // seedModeGVRDiscovered — never skip (F4-C3 boundary).
 		return false
@@ -987,7 +1022,10 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// decision (its Get may lazily evict an expired cell, which must not count
 	// as a removal DURING this seed) and before the admission + resolve. Post-
 	// readyz modes get CaptureGen → PutIfGen; boot stays a plain Put (#323).
-	// Carried to the tail on resCtx below (seam signature unchanged).
+	// Carried to the tail on resCtx below (seam signature unchanged). #258/#378:
+	// the same guard also carries the reseed modes' write (rbacShift → PutIfGen
+	// INSERT, remint → ReplaceIfGenReMint); it governs ONLY this unit's final
+	// restactions-cell Put, never the nested apistage/RA Puts of the resolve.
 	terminalGuard := seedTerminalGuardFor(mode, handle, key)
 
 	// #46 / fold 2026-07-03: bound this seed unit's footprint via the ADAPTIVE
@@ -1272,9 +1310,10 @@ func seedRestactionResolveAndPutProd(
 	// #394 — the terminal write goes through seedTerminalPut with the guard
 	// seedOneRestaction captured at seed entry: PutIfGen for the post-readyz
 	// modes (a removal during the resolve refuses the write instead of
-	// resurrecting the cell), plain Put for boot (pre-readyz exemption, #323).
-	// A refusal wrote nothing, so the resolves counter, the seeded-set Mark and
-	// the dep Record below are all skipped; the engine closure re-seeds once.
+	// resurrecting the cell), ReplaceIfGenReMint for the #378 re-mint, plain Put
+	// for boot (pre-readyz exemption, #323). A refusal wrote nothing, so the
+	// resolves counter, the seeded-set Mark and the dep Record below are all
+	// skipped; the engine closure re-seeds once.
 	if !seedTerminalPut(resCtx, handle, key, entry, seedTerminalGuardFromContext(resCtx)) {
 		logSeedTerminalPutRefused("restactions", ref.Namespace+"/"+ref.Name)
 		return fmt.Errorf("restaction %s/%s: %w", ref.Namespace, ref.Name, errSeedTerminalPutRefused)
@@ -1414,7 +1453,9 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	}
 	// #394 — capture the terminal-Put guard at seed ENTRY (mirror of
 	// seedOneRestaction): after the skip decision, before the admission and the
-	// resolve. Post-readyz modes → PutIfGen at the terminal Put; boot → plain.
+	// resolve. Post-readyz modes → PutIfGen at the terminal Put (remint →
+	// ReplaceIfGenReMint); boot → plain. Governs ONLY the widget-cell Put below —
+	// never the nested apiref/apistage Puts inside widgetsResolveFn (#258 TL cond 1).
 	terminalGuard := seedTerminalGuardFor(mode, handle, key)
 
 	// #46: bound this seed unit's footprint (semaphore admission + per-unit

@@ -86,9 +86,13 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 		case scopeKindKeepwarm:
 			// keepwarm c2 — the TTL-cadenced widget-capable-cohort keep-warm sweep.
 			return rePrewarmKeepwarm(ctx, deps)
+		case scopeKindRBACShift:
+			// #258 — scoped reseed of the cohorts a sub-gen flush rotated. DRAIN the
+			// merge-accumulator (take-and-reset) at dequeue so a rotation arriving
+			// mid-reseed is picked up by the re-armed follow-up run.
+			return rePrewarmRBACShift(ctx, deps, prewarmEngineSingleton().rbacShift.Drain())
 		default:
-			// Ship 2 future scopes (scopeKindWidgetCR / scopeKindRBACShift)
-			// land here when unwired.
+			// Ship 2 future scope (scopeKindWidgetCR) lands here when unwired.
 			slog.Warn("prewarm.engine.unknown_scope",
 				slog.String("subsystem", "cache"),
 				slog.String("scope", s.key()),
