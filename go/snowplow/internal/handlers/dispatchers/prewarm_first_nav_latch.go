@@ -44,8 +44,10 @@
 package dispatchers
 
 import (
+	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -59,6 +61,41 @@ import (
 type firstNavLatch struct {
 	done chan struct{}
 	once sync.Once
+	// backstop — #262: the readiness BACKSTOP deadline (unix nanos; 0 = none):
+	// the engineSeed ctx deadline (min of PHASE1_TIMEOUT and pipGlobalTimeout).
+	// A latch released by it is a FAILED boot, so pre-latch work that is not
+	// required (learned classes) is admitted only within the time left.
+	backstop atomic.Int64
+}
+
+// armFirstNavLatchForSeed is engineSeed's latch arming (phase1_walk.go): it
+// builds the process latch and records the readiness BACKSTOP — the seed ctx's
+// deadline, which inherits the PHASE1_TIMEOUT parent and pipGlobalTimeout, so it
+// is their minimum. Extracted so an arm drives the production wiring.
+func armFirstNavLatchForSeed(pctx context.Context) *firstNavLatch {
+	l := ensureFirstNavLatch()
+	if dl, ok := pctx.Deadline(); ok {
+		l.setBackstopDeadline(dl)
+	}
+	return l
+}
+
+// setBackstopDeadline records the readiness backstop deadline.
+func (l *firstNavLatch) setBackstopDeadline(t time.Time) {
+	l.backstop.Store(t.UnixNano())
+}
+
+// backstopRemaining is the time left before the readiness backstop; ok=false
+// when no backstop was recorded or the latch has already fired.
+func (l *firstNavLatch) backstopRemaining() (time.Duration, bool) {
+	if l == nil || l.fired() {
+		return 0, false
+	}
+	n := l.backstop.Load()
+	if n == 0 {
+		return 0, false
+	}
+	return time.Unix(0, n).Sub(seedClock()), true
 }
 
 func newFirstNavLatch() *firstNavLatch {

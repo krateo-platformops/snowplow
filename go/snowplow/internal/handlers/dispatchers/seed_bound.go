@@ -196,6 +196,10 @@ func (b *seedAdmissionBound) waitForReleaseOrCtx(ctx context.Context) error {
 // broadcasts to wake parked units.
 func enterSeedUnit(ctx context.Context, label string) (release func(), err error) {
 	b := seedBound()
+	// #262 — this unit really resolves (the skip decisions short-circuit BEFORE
+	// this bracket), so its whole per-target wall cost counts toward the
+	// learned-class engine bound's t_unit (measuredSeedUnit).
+	markSeedUnitResolved(ctx)
 
 	b.mu.Lock()
 	var est int64

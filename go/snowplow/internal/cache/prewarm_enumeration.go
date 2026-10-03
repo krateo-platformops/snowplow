@@ -99,6 +99,12 @@ type PrewarmTarget struct {
 	// by this count DESCENDING so the highest-population cohort (the 95% mix)
 	// warms first across ALL widgets, regardless of heavy-widget tails.
 	CollapsedBindings int
+	// Learned — #262: the target is a LEARNED identity class (a real
+	// username + its full group set, read from authn's clientconfig
+	// certificates or live traffic), not a binding representative. Never
+	// produced here; the dispatchers-side enumeration wrapper adds such
+	// targets, and they never reach a log line in clear (LearnedClassLabel).
+	Learned bool
 }
 
 // EnumeratePrewarmTargetsForGVR returns the per-binding prewarm targets
@@ -320,4 +326,40 @@ func allSubjectsAreServiceAccountKind(subjects []subjectKey) bool {
 		}
 	}
 	return true
+}
+
+// IdentityAuthorisedForGVR reports whether ANY binding in the (gvr) bucket ∪
+// the wildcard bucket names one of the identity's folded subjects — the User
+// (or ServiceAccount) for username, and a Group for every EFFECTIVE group
+// (WithAuthenticatedGroup: a real requester is always authenticated). #262: the
+// AUTHORISED half of the learned-identity emission rule — a learned class is a
+// seed target for a GVR only if a matching binding sits in that GVR's bucket.
+// Read live from the published index on every call (never memoised); false
+// before the index is built.
+func IdentityAuthorisedForGVR(gvr schema.GroupVersionResource, username string, groups []string) bool {
+	want := make(map[subjectKey]struct{}, 2+len(groups))
+	for _, s := range foldSubjects(username, WithAuthenticatedGroup(groups)) {
+		want[s] = struct{}{}
+	}
+	idx := bindingsByGVRSingleton()
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if !idx.built {
+		return false
+	}
+	match := func(set map[bindingID]struct{}) bool {
+		for id := range set {
+			entry, ok := idx.entries[id]
+			if !ok {
+				continue
+			}
+			for _, s := range entry.subjects {
+				if _, hit := want[s]; hit {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return match(idx.byGVR[grFromGVR(gvr)]) || match(idx.wildcard)
 }
