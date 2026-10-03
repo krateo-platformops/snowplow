@@ -252,11 +252,11 @@ func deriveSubscriptionWithReason(ctx context.Context, coords SubscriptionCoordi
 
 	case cache.CacheEntryClassRAFullList:
 		// #426: a raFullList cell is keyed by its OWN builder
-		// (apiref.RAFullListKey: page-independent, no RBACSubGen fold, slice
-		// extras stripped), not by dispatchCacheLookupKey. Mint through that
-		// same builder so the armed key is the key the refresher emits. Still
-		// identity-bound and forgery-proof: the BindingUID and binding-set
-		// digest come from ctx's identity. No objects.Get, so an empty key is
+		// (apiref.RAFullListKey: page-independent, slice extras stripped), not
+		// by dispatchCacheLookupKey. Mint through that same builder so the armed
+		// key is the key the refresher emits. Still identity-bound and
+		// forgery-proof: the BindingUID, binding-set digest and (since #435)
+		// RBACSubGen come from ctx's identity. No objects.Get, so an empty key is
 		// never an informer-miss.
 		if cache.ResolvedCache() == nil {
 			return "", nil, false, SubscriptionSkipOther

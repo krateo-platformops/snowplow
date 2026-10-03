@@ -4,7 +4,7 @@
 // ComputeKey hash so a key-schema change forces a clean rolling-restart break:
 // no pre-bump entry ever serves as a post-bump hit. This test pins two things:
 //
-//  1. resolvedKeyVersion == "v7" — the current schema generation (#423: the
+//  1. resolvedKeyVersion == "v8" — the current schema generation (#435: the raFullList RBACSubGen fold; v7 was #423, the
 //     SubjectBindingSet fold; v6 was #118 (c)-v2).
 //     A silent bump here without a matching golden update fails loud, forcing a
 //     deliberate decision (matches the compile-once golden discipline).
@@ -46,18 +46,18 @@ func goldenKeyInputs() ResolvedKeyInputs {
 }
 
 // goldenResolvedKeyDigest is the SHA-256 hex ComputeKey produces for
-// goldenKeyInputs() under resolvedKeyVersion "v7". Captured empirically from the
+// goldenKeyInputs() under resolvedKeyVersion "v8". Captured empirically from the
 // real implementation. A drift in the key encoding (or an unannounced version
 // bump) changes this and reds the test.
 // gitleaks:allow — this is a SHA-256 test golden (ComputeKey output), not a credential.
-const goldenResolvedKeyDigest = "f796e62505b1589d8f04487982211120c2da67199726aa7b243718e9470d320c" //gitleaks:allow
+const goldenResolvedKeyDigest = "c302990dc7748f6111df7715604cedfebcee5f629ea2cad8a4c3c2a123f462af" //gitleaks:allow
 
-// TestResolvedKeyVersion_ConstantAnchor is L3 part 1: the version const is "v7".
+// TestResolvedKeyVersion_ConstantAnchor is L3 part 1: the version const is "v8".
 func TestResolvedKeyVersion_ConstantAnchor(t *testing.T) {
-	if resolvedKeyVersion != "v7" {
+	if resolvedKeyVersion != "v8" {
 		t.Fatalf("resolvedKeyVersion = %q, want %q — a key-schema bump must be a "+
 			"DELIBERATE change; update this anchor and the golden digest together",
-			resolvedKeyVersion, "v7")
+			resolvedKeyVersion, "v8")
 	}
 }
 

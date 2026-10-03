@@ -89,6 +89,11 @@ func extrasMinusSlice(extras map[string]any) map[string]any {
 // package cache cannot import rbac). The sole production caller,
 // apiref.seedFullListRAKey, does; RA output is narrowed per requester by every
 // step, so the first-match bindingUID alone is not a sound sharing class.
+//
+// #435: likewise RBACSubGen (cache.RBACSubGenForSubject over
+// rbac.WithAuthenticatedGroup(groups)) — set by the same caller, so a Role-rules
+// edit or a grant-then-revoke that leaves the binding set unchanged rotates the
+// key, exactly as it does for the restactions/widgets classes.
 func RAFullListKeyInputs(group, version, resource, namespace, name string,
 	bindingUID string, extras map[string]any) ResolvedKeyInputs {
 	return ResolvedKeyInputs{

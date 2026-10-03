@@ -109,12 +109,12 @@ func TestRBACSubGen_HerdBound_TenantYStaysStableUnderTenantXStorm(t *testing.T) 
 
 // C-118-7 + the fold — ComputeKey folds RBACSubGen for identity-bound classes
 // (different sub-gen → different key) and NOT for widgetContent (identity-free);
-// and the version is v7 (#118 (c)-v2 bumped v5→v6 for the deferred-bump timeline
-// change; #423 bumped v6→v7 for the SubjectBindingSet fold — see
+// and the version is v8 (#118 (c)-v2 bumped v5→v6 for the deferred-bump timeline
+// change; #423 bumped v6→v7 for the SubjectBindingSet fold; #435 v7→v8 for the raFullList RBACSubGen fold — see
 // resolvedKeyVersion history).
 func TestRBACSubGen_FoldedIntoKey_NotForWidgetContent(t *testing.T) {
-	if resolvedKeyVersion != "v7" {
-		t.Fatalf("C-118-7: resolvedKeyVersion must be v7 (v6: the RBACSubGen fold + (c)-v2 deferred-bump timeline; v7: #423 SubjectBindingSet); got %q", resolvedKeyVersion)
+	if resolvedKeyVersion != "v8" {
+		t.Fatalf("C-118-7: resolvedKeyVersion must be v8 (v6: the RBACSubGen fold + (c)-v2 deferred-bump timeline; v7: #423 SubjectBindingSet; v8: #435 raFullList RBACSubGen); got %q", resolvedKeyVersion)
 	}
 
 	base := ResolvedKeyInputs{
