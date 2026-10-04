@@ -1043,7 +1043,192 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- #239: dirty-mark attribution ---
 		dirtyMarkAttributed, dirtyMarkEvents, dirtyMarkSubmits, dirtyMarkUnattributed,
 	}, derivedObservables...)...)
+	if err != nil {
+		return err
+	}
+	// #448: the security/verification counters. CFG-1: every one of them is a
+	// cache surface whose expvar key is published only from a Disabled()-gated
+	// init, so under cache-off its OTLP series is absent too (not present-zero).
+	if cache.Disabled() {
+		return nil
+	}
+	return registerSecurityInstruments(m)
+}
+
+// learnedCapacityStats is the CLOSED set of numeric inputs of the last
+// learned-class bound decision (dispatchers' SetLearnedAdmissionStats map),
+// mirrored as snowplow_learned_classes_capacity{stat}. Booleans export as 0/1.
+// The string-valued "bound" is not here; it is one-hot over learnedBounds.
+var learnedCapacityStats = []string{
+	"t_widget_us", "t_ra_us", "t_widget_measured", "t_ra_measured",
+	"keepwarm_interval_us", "base_widget_units", "base_ra_units",
+	"budget_us", "admitted_cost_us", "distinct_classes",
+	"prelatch_budget_us", "prelatch_classes", "prelatch_nav_cost_us",
+	"memory_headroom_bytes", "entry_headroom", "avg_entry_bytes",
+}
+
+// learnedBounds is the CLOSED set of learnedDecision.bound values.
+var learnedBounds = []string{"none", "memory", "engine"}
+
+// registerSecurityInstruments hand-wires the #448 post-roll verification
+// counters (previously /debug/vars-only, which needs a user JWT) onto OTLP.
+// No expvar->OTLP bridge: each instrument reads the typed accessor the expvar
+// closure reads. Attribute hygiene (F8): every attribute is drawn from a
+// closed, code-defined set (site/reason, outcome, stat, bound) and none carries an
+// identity, a username or a Secret name. Monotonic counters are
+// ObservableCounters over their own atomics; nothing is derived by subtracting
+// two series (the #413 moved_remark lesson). Registered only when the cache is
+// on (see the caller).
+func registerSecurityInstruments(m metric.Meter) error {
+	// --- #424: identity-class drift declines, per {site, reason} ---
+	driftDeclined, err := m.Int64ObservableCounter(
+		"snowplow_l1_identity_class_drift_declined_total",
+		metric.WithDescription("L1 Puts / re-Puts declined because the writer's identity no longer belongs to the RBAC class the key was minted for, by site {restactions, widgets, seed, refresher} and reason {binding_set, rbac_subgen, no_identity}. Non-zero is expected and benign (a grant/revoke landing mid-resolve); it is the evidence the #424 guard fires."))
+	if err != nil {
+		return err
+	}
+
+	// --- #444: refresher representative re-pick outcomes ---
+	repick, err := m.Int64ObservableCounter(
+		"snowplow_l1_representative_repick_total",
+		metric.WithDescription("Refresher outcomes when an identity-bound cell's recorded representative drifted out of the key's RBAC class (#444), by outcome {group, hitter, evicted}: re-picked the canonical group representative, re-picked a recent hitter, or evicted the cell (no in-class representative). The evictions also count on snowplow_resolved_cache{stat=evict_no_representative_total}."))
+	if err != nil {
+		return err
+	}
+
+	// --- #424: subject binding-set digest memo ---
+	bsHits, err := m.Int64ObservableCounter("snowplow_binding_set_memo_hits",
+		metric.WithDescription("Subject binding-set digest memo hits (#424). Hit ratio = hits / (hits + misses)."))
+	if err != nil {
+		return err
+	}
+	bsMisses, err := m.Int64ObservableCounter("snowplow_binding_set_memo_misses",
+		metric.WithDescription("Subject binding-set digest memo misses, i.e. cold digest builds (#424)."))
+	if err != nil {
+		return err
+	}
+	bsRefused, err := m.Int64ObservableCounter("snowplow_binding_set_memo_refused",
+		metric.WithDescription("Subject binding-set digest memo cap-breach inserts (digest computed, not cached) (#424)."))
+	if err != nil {
+		return err
+	}
+	bsEntries, err := m.Int64ObservableGauge("snowplow_binding_set_memo_entries",
+		metric.WithDescription("Live entries in the current binding-set memo shard (#424)."))
+	if err != nil {
+		return err
+	}
+
+	// --- #262: learned identity classes (all current-state gauges) ---
+	gauge := func(name, desc string) (metric.Int64ObservableGauge, error) {
+		return m.Int64ObservableGauge(name, metric.WithDescription(desc))
+	}
+	lRegistered, err := gauge("snowplow_learned_classes_registered",
+		"Learned identity classes in the registry (#262).")
+	if err != nil {
+		return err
+	}
+	lSeeded, err := gauge("snowplow_learned_classes_seeded",
+		"Learned classes the last bound decision admitted with at least one distinct target (#262). ~0 on group-only clusters.")
+	if err != nil {
+		return err
+	}
+	lUnseeded, err := gauge("snowplow_learned_classes_unseeded_capacity",
+		"Distinct learned classes the last bound decision left out for capacity (#262).")
+	if err != nil {
+		return err
+	}
+	lNavOnly, err := gauge("snowplow_learned_classes_nav_only",
+		"Learned classes the last boot pass seeded pre-latch whose RA-phase admission then dropped them (#262).")
+	if err != nil {
+		return err
+	}
+	lFromSecrets, err := gauge("snowplow_learned_classes_from_secrets",
+		"Learned classes backed by a clientconfig Secret (#262). ALARM: 0 while snowplow_learned_clientconfig_secrets > 0 (authn's certificate format moved).")
+	if err != nil {
+		return err
+	}
+	lUnparseable, err := gauge("snowplow_learned_classes_secrets_unparseable",
+		"clientconfig Secrets no class could be read from (#262).")
+	if err != nil {
+		return err
+	}
+	lClientconfig, err := gauge("snowplow_learned_clientconfig_secrets",
+		"Every *-clientconfig Secret the registry sees: the denominator of the from_secrets alarm (#262).")
+	if err != nil {
+		return err
+	}
+	lCapacity, err := gauge("snowplow_learned_classes_capacity",
+		"Measured inputs of the last learned-class bound decision, labelled by stat (closed set; booleans as 0/1) (#262).")
+	if err != nil {
+		return err
+	}
+	lBound, err := gauge("snowplow_learned_classes_capacity_bound",
+		"Which bound limited the last learned-class decision: 1 on the active bound {none, memory, engine}, 0 on the others; no series before the first decision (#262).")
+	if err != nil {
+		return err
+	}
+
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, c := range dispatchers.IdentityClassDriftDeclinedCells() {
+			o.ObserveInt64(driftDeclined, c.Count, metric.WithAttributes(
+				attribute.String("site", c.Site), attribute.String("reason", c.Reason)))
+		}
+		for _, c := range dispatchers.RepresentativeRepickCells() {
+			o.ObserveInt64(repick, c.Count, metric.WithAttributes(attribute.String("outcome", c.Outcome)))
+		}
+
+		hits, misses, refused, entries := rbac.BindingSetMemoSnapshot()
+		o.ObserveInt64(bsHits, int64(hits))
+		o.ObserveInt64(bsMisses, int64(misses))
+		o.ObserveInt64(bsRefused, int64(refused))
+		o.ObserveInt64(bsEntries, int64(entries))
+
+		registered, fromSecrets, unparseable := cache.LearnedClassCounts()
+		seeded, unseeded := cache.LearnedAdmissionStats()
+		o.ObserveInt64(lRegistered, int64(registered))
+		o.ObserveInt64(lSeeded, int64(seeded))
+		o.ObserveInt64(lUnseeded, int64(unseeded))
+		o.ObserveInt64(lNavOnly, int64(cache.LearnedNavOnly()))
+		o.ObserveInt64(lFromSecrets, int64(fromSecrets))
+		o.ObserveInt64(lUnparseable, int64(unparseable))
+		o.ObserveInt64(lClientconfig, int64(cache.LearnedClientconfigSecrets()))
+		if capacity := cache.LearnedAdmissionCapacity(); capacity != nil {
+			for _, stat := range learnedCapacityStats {
+				if v, ok := capacityInt64(capacity[stat]); ok {
+					o.ObserveInt64(lCapacity, v, metric.WithAttributes(attribute.String("stat", stat)))
+				}
+			}
+			active, _ := capacity["bound"].(string)
+			for _, b := range learnedBounds {
+				var v int64
+				if b == active {
+					v = 1
+				}
+				o.ObserveInt64(lBound, v, metric.WithAttributes(attribute.String("bound", b)))
+			}
+		}
+		return nil
+	}, driftDeclined, repick, bsHits, bsMisses, bsRefused, bsEntries,
+		lRegistered, lSeeded, lUnseeded, lNavOnly, lFromSecrets, lUnparseable, lClientconfig,
+		lCapacity, lBound)
 	return err
+}
+
+// capacityInt64 converts one learned-capacity map value to int64; ok is false
+// for a type the map never carries (the stat is then not observed).
+func capacityInt64(v any) (int64, bool) {
+	switch x := v.(type) {
+	case int:
+		return int64(x), true
+	case int64:
+		return x, true
+	case bool:
+		if x {
+			return 1, true
+		}
+		return 0, true
+	}
+	return 0, false
 }
 
 // derivedFamily is one tag-derived stats family's instruments: a shared,

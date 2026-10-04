@@ -99,6 +99,53 @@ func noteIdentityClassDrift(site, reason string) {
 	v.(*atomic.Int64).Add(1)
 }
 
+// IdentityClassDriftSites and IdentityClassDriftReasons are the CLOSED
+// attribute sets of snowplow_l1_identity_class_drift_declined_total on OTLP
+// (#448, F8 attribute hygiene): the four noteIdentityClassDrift call sites and
+// the three reasons identityClassDrift/identityClassDriftCtx return. Neither
+// carries identity. TestIdentityClassDrift448_CallSitesUseTheClosedSets pins
+// every literal at the call sites to these lists.
+var (
+	IdentityClassDriftSites   = []string{"restactions", "widgets", "seed", "refresher"}
+	IdentityClassDriftReasons = []string{"binding_set", "rbac_subgen", "no_identity"}
+)
+
+// IdentityClassDriftCell is one {site, reason} decline count.
+type IdentityClassDriftCell struct {
+	Site, Reason string
+	Count        int64
+}
+
+// IdentityClassDriftDeclinedCells returns every {site, reason} pair of the
+// closed sets with its live count (0 when never ticked), so the OTLP series set
+// is fixed by construction and never grows with traffic. Each count is its own
+// monotonic atomic.
+func IdentityClassDriftDeclinedCells() []IdentityClassDriftCell {
+	out := make([]IdentityClassDriftCell, 0, len(IdentityClassDriftSites)*len(IdentityClassDriftReasons))
+	for _, site := range IdentityClassDriftSites {
+		for _, reason := range IdentityClassDriftReasons {
+			var n int64
+			if v, ok := identityClassDriftDeclined.Load(site + "/" + reason); ok {
+				n = v.(*atomic.Int64).Load()
+			}
+			out = append(out, IdentityClassDriftCell{Site: site, Reason: reason, Count: n})
+		}
+	}
+	return out
+}
+
+// NoteIdentityClassDriftForTest ticks one site/reason counter through the
+// production recorder (the OTLP parity arms in internal/metrics).
+func NoteIdentityClassDriftForTest(site, reason string) { noteIdentityClassDrift(site, reason) }
+
+// ResetIdentityClassDriftForTest clears every site/reason counter.
+func ResetIdentityClassDriftForTest() {
+	identityClassDriftDeclined.Range(func(k, _ any) bool {
+		identityClassDriftDeclined.Delete(k)
+		return true
+	})
+}
+
 // identityClassDriftDeclinedForTest reads one site/reason counter.
 func identityClassDriftDeclinedForTest(site, reason string) int64 {
 	if v, ok := identityClassDriftDeclined.Load(site + "/" + reason); ok {
@@ -200,6 +247,36 @@ func representativeRepickForTest(outcome string) int64 {
 	}
 	return 0
 }
+
+// RepresentativeRepickOutcomes is the CLOSED `outcome` attribute set of
+// snowplow_l1_representative_repick_total on OTLP (#448, F8): the two
+// repickRepresentative sources and the eviction. No identity is carried.
+// TestRepresentativeRepick448_CallSitesUseTheClosedSet pins it to the source.
+var RepresentativeRepickOutcomes = []string{repSourceGroup, repSourceHitter, "evicted"}
+
+// RepresentativeRepickCell is one outcome count.
+type RepresentativeRepickCell struct {
+	Outcome string
+	Count   int64
+}
+
+// RepresentativeRepickCells returns every outcome of the closed set with its
+// live count (0 when never ticked); each count is its own monotonic atomic.
+func RepresentativeRepickCells() []RepresentativeRepickCell {
+	out := make([]RepresentativeRepickCell, 0, len(RepresentativeRepickOutcomes))
+	for _, o := range RepresentativeRepickOutcomes {
+		var n int64
+		if v, ok := representativeRepick.Load(o); ok {
+			n = v.(*atomic.Int64).Load()
+		}
+		out = append(out, RepresentativeRepickCell{Outcome: o, Count: n})
+	}
+	return out
+}
+
+// NoteRepresentativeRepickForTest ticks one outcome through the production
+// recorder (the OTLP parity arms in internal/metrics).
+func NoteRepresentativeRepickForTest(outcome string) { noteRepresentativeRepick(outcome) }
 
 // refreshLogUser is the representative as it may appear in a refresher log
 // line: a promoted recent hitter is redacted (#444, #262 redaction rules).

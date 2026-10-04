@@ -203,6 +203,11 @@ var closedAttributeKeys = map[string]struct{}{
 	"cause": {}, "source": {},
 	// #408 moved-remark carrier — a 2-value enum {boot, guarded}.
 	"carrier": {},
+	// #448 drift-decline site {restactions, widgets, seed, refresher} and the
+	// learned-class capacity bound {none, memory, engine}; both closed enums
+	// pinned to their producers by metrics_448_security_otlp_test.go and
+	// dispatchers' identity_class_drift_closed_sets_test.go.
+	"site": {}, "bound": {},
 }
 
 // neverAnAttribute lists the three expvar keys whose VALUES carry

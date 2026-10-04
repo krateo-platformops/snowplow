@@ -129,6 +129,12 @@ func TestC7_OTLP_EveryDerivedStatLeavesTheProcess(t *testing.T) {
 	cache.SetInformerWatchStatsForTest(iw)
 	t.Cleanup(func() { cache.SetInformerWatchStatsForTest(nil) })
 
+	// #448 — the hand-wired security/verification series (drift declines,
+	// binding-set memo, learned classes). Not tag-derived, so the expected set
+	// is listed by c7Seed448; each series gets a distinct value through its
+	// production recorder and must arrive with it (c7Assert448 below).
+	want448 := c7Seed448(t)
+
 	ctx := context.Background()
 	shutdown, err := Setup(ctx, "deadbeef")
 	if err != nil {
@@ -169,4 +175,6 @@ func TestC7_OTLP_EveryDerivedStatLeavesTheProcess(t *testing.T) {
 			}
 		}
 	}
+
+	c7Assert448(t, exports, want448)
 }

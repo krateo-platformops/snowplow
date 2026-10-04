@@ -312,6 +312,43 @@ change. No arm pins it (see the matrix); alert on the rule.
 | `snowplow_authz_memo_hits` / `_misses` / `_swaps` / `_refused` / `_entries` (`internal/rbac/snapshot_authz_memo.go` via `RegisterAuthzMemoExpvar`) | memo hit/miss, generation shard swaps, cap-breach refusals, live entry count | hit rate ≥0.85 warm; swaps bump on snapshot generation change; refused low |
 | `snowplow_authz_memo_deny_uncached_total` | `uint64` — denies (never cached, by design) | informational; should be > 0 and rising on a live cluster — a flat 0 with denied traffic would suggest the PERMITS-only rule regressed |
 
+### Security / verification counters on OTLP (#448)
+
+These counters used to be `/debug/vars`-only, which needs a user JWT, so the
+post-roll checks of three security releases went unread. Since #448 each one is
+hand-wired in `internal/metrics/metrics.go` (`registerSecurityInstruments`, no
+expvar→OTLP bridge) and reads the same typed accessor its expvar closure reads.
+Rules the mirror follows:
+
+- **Closed attributes (F8).** Every attribute comes from a code-defined set:
+  `site` ∈ {restactions, widgets, seed, refresher}, `reason` ∈ {binding_set,
+  rbac_subgen, no_identity}, `outcome` ∈ {group, hitter, evicted}, `stat` ∈
+  the learned-capacity inputs, `bound` ∈ {none, memory, engine}. No username,
+  group or Secret name is ever an attribute. The drift and re-pick counters
+  emit their full closed sets (zeros included), so their series sets never grow
+  with traffic.
+- **Cache-off.** Same CFG-1 rule as the expvar keys: under `CACHE_ENABLED`
+  off, none of these series is registered (absent, not zero).
+- **Monotonic counters** are `ObservableCounter`s over their own atomics, and
+  no series is derived by subtracting two others. Gauges are current-state.
+
+| OTLP instrument | kind | meaning | healthy |
+|---|---|---|---|
+| `snowplow_l1_identity_class_drift_declined_total{site,reason}` | counter (sum) | L1 Puts / re-Puts the #424 guard declined because the writer's identity no longer belongs to the RBAC class the key was minted for | low, non-zero rate on a cluster with RBAC churn (a grant/revoke landing mid-resolve). `no_identity` should stay 0 |
+| `snowplow_l1_representative_repick_total{outcome}` | counter (sum) | #444 refresher outcomes when a cell's recorded representative drifted out of its RBAC class: `group` (re-picked the canonical group representative), `hitter` (re-picked a recent hitter), `evicted` (no in-class representative; the cell was evicted). The evictions are also `snowplow_resolved_cache{stat=evict_no_representative_total}` (a gauge row, already on OTLP through the `snowplow_resolved_cache` mirror) | low; follows personal (User-subject) RBAC changes on representatives. `evicted` should stay well below `group` + `hitter` |
+| `snowplow_binding_set_memo_hits` / `_misses` / `_refused` | counter (sum) | subject binding-set digest memo (#424). The memo shard swaps on every RBAC snapshot publish | hit ratio `hits/(hits+misses)` high once warm. `refused` = 0 (cap 4096 per shard) |
+| `snowplow_binding_set_memo_entries` | gauge | live entries in the current memo shard | ≈ active identities |
+| `snowplow_learned_classes_registered` / `_seeded` / `_unseeded_capacity` / `_nav_only` | gauge | learned identity classes (#262): in the registry, admitted with ≥1 distinct target, left out by the capacity bound, seeded nav-only at boot then dropped | `seeded` ≈ 0 on group-only RBAC clusters (a group-only member is not a distinct target) |
+| `snowplow_learned_classes_from_secrets` / `_secrets_unparseable`, `snowplow_learned_clientconfig_secrets` | gauge | classes backed by a `*-clientconfig` Secret, Secrets no class could be read from, and every `*-clientconfig` Secret seen | **ALARM: `from_secrets == 0` while `clientconfig_secrets > 0`** (authn's certificate format moved) |
+| `snowplow_learned_classes_capacity{stat}` | gauge | the measured inputs of the last learned-class bound decision (booleans as 0/1) | informational |
+| `snowplow_learned_classes_capacity_bound{bound}` | gauge | 1 on the bound that limited the last decision, 0 on the others; no series before the first decision | informational |
+
+The parity arm is `TestC7_OTLP_EveryDerivedStatLeavesTheProcess` (each series
+driven to a distinct value through its production recorder, then read off the
+OTLP/HTTP wire). The `metrics_448_security_otlp_test.go` arms pin cache-off
+absence, attribute hygiene, the clientconfig alarm, and that the closed sets
+match what the producers write.
+
 ### Informer / discovery surface
 
 | expvar | meaning | healthy range |
@@ -714,6 +751,187 @@ Defined in `internal/cache/controller_health_expvar.go` / `controller_health.go`
 |---|---|---|
 | `snowplow_upstream_controller_health` | `map["<ns>/<name>"→{Healthy, Reason, PodRestartCount, EndpointReadyCount, …}]` for auto-discovered controllers | every entry `Healthy=1`, `Reason=""`. `Reason` enum: `pod-restart-within-window`, `endpoints-zero-ready`, `both`, `unwired` |
 | `snowplow_upstream_webhook_failurepolicy` | `map["<webhookName>"→{Policy:"Fail"/"Ignore", Configuration, Type}]` | a `Fail`-policy webhook on a crash-looping controller explains apiserver pressure / write hangs |
+
+---
+
+## POST-ROLL CHECKLIST (ClickStack)
+
+Run after every snowplow roll. It needs no user credential: everything below is
+on OTLP in ClickHouse (ClickStack default schema: `otel_metrics_sum` for
+counters, `otel_metrics_gauge` for gauges). Set `{version}` to the rolled
+build (`service.version`, the git short commit) and `{since}` to the roll time.
+Counters are cumulative per pod, so a window delta is `max(Value) - min(Value)`
+per pod-and-attribute series (a restarted pod is a new `k8s.pod.name`, so a
+reset never produces a negative delta). The delta omits what a pod counted
+before its first export (one export interval); for a pod that started after
+`{since}`, `max(Value)` alone is its lifetime total.
+
+**0. The series exist on the rolled pods, in the right table.** Every check
+below passes vacuously when its series is missing, and a counter exported as a
+gauge (or the reverse) lands in the other table, where checks 2-5 would match
+nothing. So run this first. **Pass = zero rows.** Each row names a rolled pod
+(the roster is `snowplow_build_info`, which is always exported) that is missing
+one of the 11 (table, metric) pairs, or that has fewer than the full 4×3 drift
+or 3 repick series. `missing` lists what is absent.
+
+```sql
+WITH
+  ['sum:snowplow_l1_identity_class_drift_declined_total',
+   'sum:snowplow_l1_representative_repick_total',
+   'sum:snowplow_binding_set_memo_hits',
+   'sum:snowplow_binding_set_memo_misses',
+   'sum:snowplow_binding_set_memo_refused',
+   'sum:snowplow_deps_unguarded_put_total',
+   'gauge:snowplow_learned_classes_registered',
+   'gauge:snowplow_learned_classes_seeded',
+   'gauge:snowplow_learned_classes_from_secrets',
+   'gauge:snowplow_learned_classes_secrets_unparseable',
+   'gauge:snowplow_learned_clientconfig_secrets'] AS expected
+SELECT r.pod,
+       arrayFilter(x -> NOT has(s.present, x), expected) AS missing,
+       s.drift_series, s.repick_series
+FROM (
+  SELECT DISTINCT ResourceAttributes['k8s.pod.name'] AS pod
+  FROM otel_metrics_gauge
+  WHERE ServiceName = 'snowplow'
+    AND ResourceAttributes['service.version'] = '{version}'
+    AND TimeUnix >= {since}
+    AND MetricName = 'snowplow_build_info'
+) AS r
+LEFT JOIN (
+  SELECT pod,
+         groupUniqArray(concat(tbl, ':', MetricName)) AS present,
+         uniqExactIf(toString(Attributes), MetricName = 'snowplow_l1_identity_class_drift_declined_total') AS drift_series,
+         uniqExactIf(toString(Attributes), MetricName = 'snowplow_l1_representative_repick_total') AS repick_series
+  FROM (
+    SELECT 'sum' AS tbl, ResourceAttributes['k8s.pod.name'] AS pod, MetricName, Attributes
+    FROM otel_metrics_sum
+    WHERE ServiceName = 'snowplow'
+      AND ResourceAttributes['service.version'] = '{version}'
+      AND TimeUnix >= {since}
+    UNION ALL
+    SELECT 'gauge' AS tbl, ResourceAttributes['k8s.pod.name'] AS pod, MetricName, Attributes
+    FROM otel_metrics_gauge
+    WHERE ServiceName = 'snowplow'
+      AND ResourceAttributes['service.version'] = '{version}'
+      AND TimeUnix >= {since}
+  )
+  WHERE has(expected, concat(tbl, ':', MetricName))
+  GROUP BY pod
+) AS s ON s.pod = r.pod
+WHERE length(arrayFilter(x -> NOT has(s.present, x), expected)) > 0
+   OR s.drift_series < 12
+   OR s.repick_series < 3
+```
+
+If `snowplow_build_info` itself returns no pods for `{version}`, nothing was
+rolled or metrics export is off, and that is a failure, not a pass.
+
+**1. Learned classes seeded ≈ 0 on group-only clusters.** On a cluster whose
+RBAC is bound to groups only, no learned class has a distinct target, so
+`seeded` stays ≈ 0 while `registered` tracks logins. A sizable `seeded` there
+means distinct-target detection regressed. On a cluster with per-user bindings,
+`seeded` > 0 is expected.
+
+```sql
+SELECT ResourceAttributes['k8s.pod.name'] AS pod, MetricName,
+       argMax(Value, TimeUnix) AS latest
+FROM otel_metrics_gauge
+WHERE ServiceName = 'snowplow'
+  AND ResourceAttributes['service.version'] = '{version}'
+  AND TimeUnix >= {since}
+  AND MetricName IN ('snowplow_learned_classes_registered', 'snowplow_learned_classes_seeded',
+                     'snowplow_learned_classes_unseeded_capacity', 'snowplow_learned_classes_nav_only')
+GROUP BY pod, MetricName
+ORDER BY pod, MetricName
+```
+
+**2. The clientconfig alarm.** `from_secrets == 0` while
+`clientconfig_secrets > 0` means authn's certificate format moved and no class
+is learned from Secrets. Expect **zero rows**.
+
+```sql
+SELECT pod, from_secrets, clientconfig_secrets, unparseable
+FROM (
+  SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+         argMaxIf(Value, TimeUnix, MetricName = 'snowplow_learned_classes_from_secrets') AS from_secrets,
+         argMaxIf(Value, TimeUnix, MetricName = 'snowplow_learned_clientconfig_secrets') AS clientconfig_secrets,
+         argMaxIf(Value, TimeUnix, MetricName = 'snowplow_learned_classes_secrets_unparseable') AS unparseable
+  FROM otel_metrics_gauge
+  WHERE ServiceName = 'snowplow'
+    AND ResourceAttributes['service.version'] = '{version}'
+    AND TimeUnix >= {since}
+    AND MetricName IN ('snowplow_learned_classes_from_secrets', 'snowplow_learned_clientconfig_secrets',
+                       'snowplow_learned_classes_secrets_unparseable')
+  GROUP BY pod
+)
+WHERE from_secrets = 0 AND clientconfig_secrets > 0
+```
+
+**3. `unguarded_put == 0`.** A non-zero value is #375 drift (a resolve entry
+that does not install the dep-generation sink). Expect **zero rows**.
+
+```sql
+SELECT ResourceAttributes['k8s.pod.name'] AS pod, argMax(Value, TimeUnix) AS unguarded_put
+FROM otel_metrics_sum
+WHERE ServiceName = 'snowplow'
+  AND ResourceAttributes['service.version'] = '{version}'
+  AND TimeUnix >= {since}
+  AND MetricName = 'snowplow_deps_unguarded_put_total'
+GROUP BY pod
+HAVING unguarded_put > 0
+```
+
+**4. Drift-decline rate.** Declines per minute by site and reason. Expect a low
+rate that follows RBAC churn, and `reason = 'no_identity'` at 0. A rate that
+climbs without RBAC churn means keys and identities disagree outside a
+grant/revoke race.
+
+```sql
+SELECT site, reason,
+       sum(delta) AS declines,
+       round(sum(delta) / greatest(dateDiff('minute', {since}, now()), 1), 3) AS per_minute
+FROM (
+  SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+         Attributes['site'] AS site, Attributes['reason'] AS reason,
+         max(Value) - min(Value) AS delta
+  FROM otel_metrics_sum
+  WHERE ServiceName = 'snowplow'
+    AND ResourceAttributes['service.version'] = '{version}'
+    AND TimeUnix >= {since}
+    AND MetricName = 'snowplow_l1_identity_class_drift_declined_total'
+  GROUP BY pod, site, reason
+)
+GROUP BY site, reason
+ORDER BY declines DESC
+```
+
+**5. Binding-set memo hit ratio.** Every RBAC snapshot publish swaps the memo
+shard, so the ratio reads how often `/call` pays the cold digest build. Expect
+it high once warm, and `refused` at 0.
+
+```sql
+SELECT pod,
+       hits, misses, refused,
+       round(hits / greatest(hits + misses, 1), 4) AS hit_ratio
+FROM (
+  SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+         maxIf(Value, MetricName = 'snowplow_binding_set_memo_hits')
+           - minIf(Value, MetricName = 'snowplow_binding_set_memo_hits') AS hits,
+         maxIf(Value, MetricName = 'snowplow_binding_set_memo_misses')
+           - minIf(Value, MetricName = 'snowplow_binding_set_memo_misses') AS misses,
+         maxIf(Value, MetricName = 'snowplow_binding_set_memo_refused')
+           - minIf(Value, MetricName = 'snowplow_binding_set_memo_refused') AS refused
+  FROM otel_metrics_sum
+  WHERE ServiceName = 'snowplow'
+    AND ResourceAttributes['service.version'] = '{version}'
+    AND TimeUnix >= {since}
+    AND MetricName IN ('snowplow_binding_set_memo_hits', 'snowplow_binding_set_memo_misses',
+                       'snowplow_binding_set_memo_refused')
+  GROUP BY pod
+)
+ORDER BY pod
+```
 
 ---
 
