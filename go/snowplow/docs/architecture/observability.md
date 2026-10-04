@@ -289,38 +289,8 @@ SDK dropped every observation and none of them reached ClickStack.
 | `snowplow_v7_shadow_wildcard_digest_observed_total` | the denominator: distinct (cell, digest) pairs seen with ≥ 2 identities, shareable and ungated | > 0 once the enumerate projection ungates. 0 means not yet exercised, **not** certified |
 | `snowplow_v7_shadow_wildcard_digest_evicted_total` | observations dropped by the probe's caps (LRU, per-entry coordinate or identity cap). A dropped observation can miss a collision | **0**. Any value voids certification for the window: raise the caps and re-measure |
 
-**Post-roll check: #368 certification.** The projection is certified on a pod
-iff `collision == 0 AND observed > 0 AND evicted == 0`. The counters are per
-process, so read each pod's lifetime value (`max(Value)`). Expect
-`certified = 1` on every pod once the enumerate projection ungates. Until then
-`observed = 0` on every pod and the row reads `not_exercised`, which is
-expected, not a pass.
-
-```sql
-SELECT pod, collision, observed, evicted,
-       multiIf(collision > 0, 'COLLISION',
-               evicted > 0, 'void_evicted',
-               observed = 0, 'not_exercised',
-               'certified') AS verdict
-FROM (
-  SELECT ResourceAttributes['k8s.pod.name'] AS pod,
-         maxIf(Value, MetricName = 'snowplow_v7_shadow_wildcard_digest_collision_total') AS collision,
-         maxIf(Value, MetricName = 'snowplow_v7_shadow_wildcard_digest_observed_total') AS observed,
-         maxIf(Value, MetricName = 'snowplow_v7_shadow_wildcard_digest_evicted_total') AS evicted,
-         uniqExactIf(MetricName, MetricName LIKE 'snowplow_v7_shadow_wildcard_digest_%') AS present
-  FROM otel_metrics_sum
-  WHERE ServiceName = 'snowplow'
-    AND ResourceAttributes['service.version'] = '{version}'
-    AND TimeUnix >= {since}
-    AND MetricName LIKE 'snowplow_v7_shadow_wildcard_digest_%'
-  GROUP BY pod
-)
-WHERE present = 3
-ORDER BY pod
-```
-
-No rows at all means the series are missing (for example, a build from before
-#455). That is not a pass.
+The certification rule is read in ClickStack as step 6 of the
+[POST-ROLL CHECKLIST](#post-roll-checklist-clickstack).
 
 ### Live refresh (SSE)
 Defined in `internal/cache/refresh_broadcaster_expvar.go`; one expvar key,
@@ -977,6 +947,39 @@ FROM (
                        'snowplow_binding_set_memo_refused')
   GROUP BY pod
 )
+ORDER BY pod
+```
+
+**6. #368 certification.** The ClassWildcard projection is certified on a pod
+iff `collision == 0 AND observed > 0 AND evicted == 0`. The counters are per
+process, so read each pod's lifetime value (`max(Value)`). Once the enumerate
+projection ungates, expect `verdict = 'certified'` on every pod. Until then
+`observed = 0` on every pod and the verdict reads `not_exercised`. That is
+expected, not a pass. `COLLISION` is a share leak (alert); `void_evicted`
+voids the window (raise the probe caps and re-measure). No rows at all means the
+series are missing (for example, a build from before #455); that is not a pass
+either.
+
+```sql
+SELECT pod, collision, observed, evicted,
+       multiIf(collision > 0, 'COLLISION',
+               evicted > 0, 'void_evicted',
+               observed = 0, 'not_exercised',
+               'certified') AS verdict
+FROM (
+  SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+         maxIf(Value, MetricName = 'snowplow_v7_shadow_wildcard_digest_collision_total') AS collision,
+         maxIf(Value, MetricName = 'snowplow_v7_shadow_wildcard_digest_observed_total') AS observed,
+         maxIf(Value, MetricName = 'snowplow_v7_shadow_wildcard_digest_evicted_total') AS evicted,
+         uniqExactIf(MetricName, MetricName LIKE 'snowplow_v7_shadow_wildcard_digest_%') AS present
+  FROM otel_metrics_sum
+  WHERE ServiceName = 'snowplow'
+    AND ResourceAttributes['service.version'] = '{version}'
+    AND TimeUnix >= {since}
+    AND MetricName LIKE 'snowplow_v7_shadow_wildcard_digest_%'
+  GROUP BY pod
+)
+WHERE present = 3
 ORDER BY pod
 ```
 
