@@ -113,6 +113,7 @@ func snowplowCORSOptions() cors.Options {
 			handlers.HeaderFieldValidation,
 			handlers.HeaderRaw,
 			handlers.HeaderResolveSource,
+			handlers.HeaderStageOutcomes,
 			"Warning",
 		},
 		AllowCredentials: true,

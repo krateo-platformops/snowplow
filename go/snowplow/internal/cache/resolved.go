@@ -1358,6 +1358,10 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	if c == nil || entry == nil {
 		return
 	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
+		return
+	}
 	bytes, extrasHash := c.putPreamble(entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 	// 1.12.6 C4 (§6.4) — a real Put is by definition the "next real Put" a
@@ -1403,6 +1407,10 @@ func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entr
 	if c == nil || entry == nil {
 		return
 	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
+		return
+	}
 	c.putPlain(ctx, true, key, entry)
 	Deps().remarkIfDepsMovedFrom(ctx, key, true)
 }
@@ -1416,6 +1424,10 @@ func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entr
 // Returns true iff the entry was stored.
 func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
+		return false
+	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(entry)
@@ -1458,6 +1470,10 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 // COLD fills use PutIfGen (which inserts on absent). Returns true iff stored.
 func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
+		return false
+	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(entry)
@@ -1519,6 +1535,10 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 // Returns true iff stored.
 func (c *ResolvedCacheStore) ReplaceIfGenReMint(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
+		return false
+	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(entry)

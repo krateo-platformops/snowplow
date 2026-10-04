@@ -14,6 +14,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )
@@ -26,6 +27,20 @@ func RESTAction() http.Handler {
 	// the per-user ctx. Out-of-cluster (unit tests): snowplowSARC returns nil →
 	// SArc nil → the unchanged empty-resolve behaviour (AC-307.7 preserved).
 	saRC := snowplowSARC()
+	return &restActionHandler{
+		authnNS: env.String("AUTHN_NAMESPACE", ""),
+		verbose: env.True("DEBUG"),
+		saRC:    saRC,
+	}
+}
+
+// RESTActionWithServiceAccountConfig is RESTAction() with an explicit
+// ServiceAccount *rest.Config instead of the in-cluster one. It exists for
+// out-of-cluster harnesses (the #443 kind arms), where snowplowSARC() is nil
+// and every stage would resolve empty, which makes a stored-vs-inline parity
+// comparison vacuous. The config is used exactly as saRC is in production:
+// only as ResolveOptions.SArc, never attached to the per-user ctx.
+func RESTActionWithServiceAccountConfig(saRC *rest.Config) http.Handler {
 	return &restActionHandler{
 		authnNS: env.String("AUTHN_NAMESPACE", ""),
 		verbose: env.True("DEBUG"),
@@ -47,7 +62,18 @@ type restActionHandler struct {
 var _ http.Handler = (*restActionHandler)(nil)
 
 func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
+	// #443 (j) ingest — FIRST, before observeLiveCaller and the L1 key mint.
+	req = reseedInertFromHeaders(req)
 	log := xcontext.Logger(req.Context())
+
+	// #443 part 2 — an inline RESTAction is resolved, never stored. Echo it
+	// before the first byte is written, so the echo rides every reply this
+	// handler produces (2xx, a stage-error 200, a 4xx/5xx).
+	_, inline := util.InlineObject(req.Context())
+	if inline {
+		wri.Header().Set(util.HeaderDryRun, "All")
+		wri.Header().Set(util.HeaderResolveSource, util.ResolveSourceRequestBody)
+	}
 
 	start := time.Now()
 
@@ -390,6 +416,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// unchanged). No-op (ctx unchanged) in production until an observability
 	// control turns the toggle on.
 	ctx = installShadowParityRESTAction(ctx, &cr)
+	// #443 part 2 — an inline resolve reports per-stage outcomes in a header
+	// (reason codes only), outside the body, so the body stays byte-identical
+	// to a stored resolve even when the draft's filter drops its error keys.
+	var outcomes *api.StageOutcomes
+	if inline {
+		ctx, outcomes = api.WithStageOutcomes(ctx)
+	}
 	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,
@@ -397,7 +430,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		PerPage: perPage,
 		Page:    page,
 		Extras:  extras,
+		// #443 part 2 — the ONE place Provenance is set: an inline body is
+		// vouched for only by the caller, so its endpointRef Secrets and UAF
+		// stages are read as the caller (api.ProvenanceCallerSupplied).
+		Provenance: provenanceFor(inline),
 	})
+	if outcomes != nil {
+		wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
+	}
 	if err != nil {
 		log.Error("unable to resolve rest action",
 			slog.String("name", cr.GetName()),
@@ -460,7 +500,15 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (a grant/revoke landed mid-resolve), the body belongs to the NEW class
 	// while cacheKey still names the OLD one, which every other old-class member
 	// derives. Serve the body (it is correct for this requester), never write it.
-	if cache.DeclineSensitivePut(ctx) {
+	if cache.Inert(ctx) {
+		// #443 (g) — an inert (dry-run) resolve skips the whole Put chain,
+		// including the decline counters: dry-run traffic must not count as
+		// a UAF, external or stage-error decline.
+		log.Debug("RESTAction resolved inert (dry run); nothing persisted",
+			slog.String("name", cr.Name),
+			slog.String("namespace", cr.Namespace),
+		)
+	} else if cache.DeclineSensitivePut(ctx) {
 		// #398 — the resolve read a sensitive resource (core v1/secrets): serve
 		// the body, persist it nowhere.
 		log.Debug("RESTAction resolve read a sensitive resource; declining to cache",

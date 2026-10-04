@@ -112,7 +112,7 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 					// under rw.mu. This call still falls through to the
 					// apiserver — pre-sync reads would look identical to
 					// a real NotFound.
-					_, _ = rw.EnsureResourceType(gvr)
+					_, _ = rw.EnsureResourceTypeFor(ctx, gvr)
 					log.Debug("objects.Get: informer not servable; apiserver fallthrough",
 						slog.String("gvr", gvr.String()),
 						slog.String("ns", ref.Namespace),

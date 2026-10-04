@@ -960,6 +960,10 @@ func (d *DepTracker) Record(ctx context.Context, l1Key string, gvr schema.GroupV
 	if d == nil {
 		return
 	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
+		return
+	}
 	if l1Key == "" {
 		// O15: a Record call with no L1 key is an unambiguous bug — a
 		// DepKey with nowhere to attach it. Loud-fail.
@@ -980,6 +984,10 @@ func (d *DepTracker) Record(ctx context.Context, l1Key string, gvr schema.GroupV
 // ""). Internally encodes the bucket as (gvr, namespace, "*").
 func (d *DepTracker) RecordList(ctx context.Context, l1Key string, gvr schema.GroupVersionResource, namespace string) {
 	if d == nil {
+		return
+	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
 		return
 	}
 	if l1Key == "" {
@@ -1444,8 +1452,13 @@ func (d *DepTracker) ReplayEdges(ctx context.Context, dst string, edges []DepKey
 	if d == nil || dst == "" {
 		return
 	}
+	// #443 — an inert (dry-run) resolve replays no edge and registers no
+	// informer (Record/RecordList refuse too; this also skips ensureInformer).
+	if Inert(ctx) {
+		return
+	}
 	for _, e := range edges {
-		d.ensureInformer(e.GVR)
+		d.ensureInformer(ctx, e.GVR)
 		if e.Name == listWildcard {
 			d.RecordList(ctx, dst, e.GVR, e.Namespace)
 		} else {
@@ -1486,12 +1499,12 @@ func (d *DepTracker) ReplayEdgesAsOf(ctx context.Context, dst string, edges []De
 // so a future event on a replayed coordinate reaches the dep tracker. Mirrors
 // the dispatcher's ensureWatcherInformerForGVR (deps_extract.go): nil-safe when
 // the global watcher is absent (cache-off / unit tests without a watcher).
-func (d *DepTracker) ensureInformer(gvr schema.GroupVersionResource) {
+func (d *DepTracker) ensureInformer(ctx context.Context, gvr schema.GroupVersionResource) {
 	rw := Global()
 	if rw == nil {
 		return
 	}
-	rw.EnsureResourceType(gvr)
+	rw.EnsureResourceTypeFor(ctx, gvr)
 }
 
 // RangeEdges calls fn for each l1Key in the reverse index with a snapshot of

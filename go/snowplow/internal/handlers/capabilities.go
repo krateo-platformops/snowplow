@@ -21,15 +21,21 @@ const (
 	// restactions / widgets object, read as the caller, and echoes
 	// X-Snowplow-Raw.
 	CapCallRaw = "call.raw"
+	// CapCallReadInline: POST /call/read on a RESTAction with body
+	// {"extras":{...},"object":{<RESTAction>}} resolves the body instead of
+	// the stored CR, as the caller, persisting nothing, and echoes
+	// X-Snowplow-Dry-Run: All and X-Snowplow-Resolve-Source: request-body.
+	CapCallReadInline = "call.read.inline"
 )
 
 // capabilities is the static advertised set. A token is added here only in the
-// change that ships its behaviour (call.read.inline lands with #443 part 2,
-// call.warnings with the plumbing warning passthrough).
+// change that ships its behaviour (call.warnings lands with the plumbing
+// warning passthrough).
 var capabilities = []string{
 	CapCallDryRun,
 	CapCallFieldValidation,
 	CapCallRaw,
+	CapCallReadInline,
 }
 
 // Capabilities returns a sorted copy of the advertised capability tokens.

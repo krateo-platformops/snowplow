@@ -38,6 +38,8 @@ import (
 	xenv "github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"go.opentelemetry.io/otel/log/logtest"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -660,6 +662,32 @@ func itoa443(n int) string {
 // the implementation and reports whether the behaviour the token promises is
 // there. Removing an implementation turns its probe false.
 var capProbes443 = map[string]func(t *testing.T) bool{
+	// call.read.inline: POST /call/read with an inline RESTAction resolves
+	// the BODY (its filter output appears) with the two echoes, and reads no
+	// stored object from the apiserver (the caller's own access check on
+	// restactions may still run). The draft has no stages, so the probe needs
+	// no ServiceAccount config.
+	CapCallReadInline: func(t *testing.T) bool {
+		f, ep := newFakeAPI443(t)
+		obj := map[string]any{
+			"apiVersion": "templates.krateo.io/v1", "kind": "RESTAction",
+			"metadata": map[string]any{"name": "draft-cap", "namespace": "demo-system"},
+			"spec":     map[string]any{"filter": `{"probe":"inline-cap-443"}`},
+		}
+		body, _ := json.Marshal(map[string]any{"extras": map[string]any{}, "object": obj})
+		h := middleware.BodyExtrasDecode(ReadDispatcher(map[string]http.Handler{
+			"restactions.templates.krateo.io": dispatchers.RESTAction(),
+		})(CallRead()))
+		rec := serve443(h, ep, http.MethodPost,
+			"/call/read?apiVersion=templates.krateo.io/v1&resource=restactions&namespace=demo-system&name=draft-cap", string(body))
+		for _, r := range f.requests() {
+			if strings.Contains(r.path, "/restactions/") {
+				return false // the stored object was read: not an inline resolve
+			}
+		}
+		return rec.Code == http.StatusOK && strings.Contains(rec.Body.String(), "inline-cap-443") &&
+			rec.Header().Get(HeaderDryRun) == "All" && rec.Header().Get(HeaderResolveSource) == "request-body"
+	},
 	CapCallDryRun: func(t *testing.T) bool {
 		f, ep := newFakeAPI443(t)
 		rec := serve443(CallDryRun(), ep, http.MethodPost, "/call/dry-run?"+cmQuery443, cmCreate443)
@@ -707,9 +735,9 @@ func TestS443_Capabilities(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
 		}
-		want := []string{"call.dryRun", "call.fieldValidation", "call.raw"}
+		want := []string{"call.dryRun", "call.fieldValidation", "call.raw", "call.read.inline"}
 		if !reflect.DeepEqual(body.Capabilities, want) {
-			t.Fatalf("capabilities=%v, want %v (sorted; no call.read.inline before part 2)", body.Capabilities, want)
+			t.Fatalf("capabilities=%v, want %v (sorted)", body.Capabilities, want)
 		}
 		for _, tok := range body.Capabilities {
 			probe, ok := capProbes443[tok]

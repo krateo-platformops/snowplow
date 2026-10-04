@@ -87,6 +87,10 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, key string,
 	if c == nil {
 		return false
 	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
+		return false
+	}
 	encoded, err := json.Marshal(full)
 	if err != nil {
 		return false

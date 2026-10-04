@@ -726,7 +726,8 @@ func seedTargetFromPrewarm(t cache.PrewarmTarget) seedTarget {
 // observeLiveCaller records the /call's identity (S2) at the dispatcher
 // ServeHTTP entry. Never called from the key-mint path the seeds share.
 func observeLiveCaller(req *http.Request) {
-	if cache.Disabled() || req == nil {
+	// #443 (h) — an inert (dry-run) resolve records no learned identity.
+	if cache.Disabled() || req == nil || cache.Inert(req.Context()) {
 		return
 	}
 	ui, err := xcontext.UserInfo(req.Context())

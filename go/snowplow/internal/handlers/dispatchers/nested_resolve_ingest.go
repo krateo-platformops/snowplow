@@ -56,6 +56,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
 // selfLoopbackHost is the URL_SELF host (Hostname, no port/scheme) parsed once at
@@ -152,6 +153,40 @@ func isTrustedSelfLoopback(req *http.Request) bool {
 	// Belt-and-suspenders secondary (tightens only; returns true when URL_SELF
 	// is unconfigured). The validated-identity check above is the primary anchor.
 	return requestArrivedOnSelfHost(req)
+}
+
+// provenanceFor maps "the RESTAction came from the request body" to its
+// resolve Provenance (#443 part 2). Used at the single place Provenance is set
+// (restactions.go, the restactionsResolveFn call).
+func provenanceFor(inline bool) api.Provenance {
+	if inline {
+		return api.ProvenanceCallerSupplied
+	}
+	return api.ProvenanceStored
+}
+
+// reseedInertFromHeaders is the ingest half of #443 choke point (j): every
+// egress of an inert resolve carries cache.InertHeader: 1, and a snowplow hop
+// that receives it must be inert too, whichever hostname it was reached by.
+//
+// Trust rule: the header is honoured on ANY request with a snowplow-validated
+// identity (UserInfo is present only after the UserConfig middleware verified
+// the JWT). Unlike the depth and ancestor headers it is NOT pinned to the
+// URL_SELF host, because it can only make a request MORE restrictive: it
+// skips L1, persists nothing and refuses write stages for that one request.
+// A user forging it affects only their own request, never another identity,
+// and a hop reached through a hostname alias still goes inert (a pinned rule
+// would let a dry run execute a stored RESTAction's write stages through an
+// alias). Returns req unchanged otherwise. It must run first in ServeHTTP,
+// before observeLiveCaller and before the L1 key is minted.
+func reseedInertFromHeaders(req *http.Request) *http.Request {
+	if req == nil || req.Header.Get(cache.InertHeader) != "1" || cache.Inert(req.Context()) {
+		return req
+	}
+	if _, err := xcontext.UserInfo(req.Context()); err != nil {
+		return req
+	}
+	return req.WithContext(cache.WithInert(req.Context()))
 }
 
 // reseedNestedGuardsFromHeaders re-installs the depth counter + ancestor set from

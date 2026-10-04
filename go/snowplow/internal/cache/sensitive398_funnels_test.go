@@ -22,7 +22,7 @@ func TestS398_ProductionFunnelsNeverRegisterSecrets(t *testing.T) {
 	if rw.IsRegistered(s398Secrets) {
 		t.Fatal("eager registration registered v1/secrets")
 	}
-	Deps().ensureInformer(s398Secrets)
+	Deps().ensureInformer(ctx, s398Secrets)
 	if rw.IsRegistered(s398Secrets) {
 		t.Fatal("deps replay ensureInformer registered v1/secrets")
 	}

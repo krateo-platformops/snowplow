@@ -199,7 +199,8 @@ var (
 // RESTAction dispatch. No-op (returns ctx unchanged) when the toggle is off or
 // cache is off (PM condition 5 — no wasted dark work at cache-off).
 func installShadowParityRESTAction(ctx context.Context, ra *templatesv1.RESTAction) context.Context {
-	if !rbac.ShadowParityEnabled() || cache.Disabled() {
+	// #443 (i) — no shadow parity for an inert (dry-run) resolve.
+	if !rbac.ShadowParityEnabled() || cache.Disabled() || cache.Inert(ctx) {
 		return ctx
 	}
 	return installShadowParity(ctx, func() AccessDomain {
@@ -210,7 +211,8 @@ func installShadowParityRESTAction(ctx context.Context, ra *templatesv1.RESTActi
 // installShadowParityWidget installs the dark shadow context for a widget
 // dispatch. Same gates as the RESTAction twin.
 func installShadowParityWidget(ctx context.Context, widget map[string]any) context.Context {
-	if !rbac.ShadowParityEnabled() || cache.Disabled() {
+	// #443 (i) — no shadow parity for an inert (dry-run) resolve.
+	if !rbac.ShadowParityEnabled() || cache.Disabled() || cache.Inert(ctx) {
 		return ctx
 	}
 	return installShadowParity(ctx, func() AccessDomain {

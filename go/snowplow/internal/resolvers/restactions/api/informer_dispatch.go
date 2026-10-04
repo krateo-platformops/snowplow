@@ -388,7 +388,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		// (singleflight under rw.mu); duplicate calls are sub-microsecond
 		// no-ops. It returns the per-GVR sync channel — closed once that
 		// informer's initial WaitForCacheSync completes.
-		added, syncCh := rw.EnsureResourceType(gvr)
+		added, syncCh := rw.EnsureResourceTypeFor(ctx, gvr)
 
 		// Fix #1 (1b) — stale-delete confirm-on-register
 		// (docs/rca-stale-delete-compositiondefinitions-informer-2026-06-25.md §6).

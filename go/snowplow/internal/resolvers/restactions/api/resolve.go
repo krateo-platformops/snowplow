@@ -165,6 +165,12 @@ type ResolveOptions struct {
 	// to the 0.30.115 path rather than mis-keying.
 	RESTActionNamespace string
 	RESTActionName      string
+
+	// Provenance (#443 part 2) says who vouches for Items. The zero value,
+	// ProvenanceStored, is today's behaviour. ProvenanceCallerSupplied (an
+	// inline dry-run draft) switches UAF stages and endpointRef Secret reads
+	// to the caller's own identity (see Provenance).
+	Provenance Provenance
 }
 
 // accumulateErrorKey implements Ship 0.30.257 (#313) Option W-A: the shared
@@ -226,7 +232,11 @@ type resolveRun struct {
 	apistageEnabled bool                      // F1 content-keyed api-stage L1 gate (read once)
 	apistageStore   *cache.ResolvedCacheStore // nil when apistage disabled / store unavailable
 	stageErrSink    *cache.StageErrorSink     // nil on the request path (refresher-only)
-	pipTimingSink   *cache.PIPStageTimingSink // nil on the request path (PIP-seed-only)
+	// outcomes (#443 part 2) collects per-stage outcomes for the
+	// X-Snowplow-Stage-Outcomes header; non-nil only for the top-level
+	// caller-supplied (inline) resolve.
+	outcomes      *StageOutcomes
+	pipTimingSink *cache.PIPStageTimingSink // nil on the request path (PIP-seed-only)
 }
 
 // newResolveRun builds the per-call resolveRun. user is already resolved by
@@ -239,9 +249,10 @@ type resolveRun struct {
 func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, user jwtutil.UserInfo) *resolveRun {
 	// Endpoints reference mapper
 	mapper := endpointReferenceMapper{
-		authnNS:  opts.AuthnNS,
-		username: user.Username,
-		rc:       opts.RC,
+		authnNS:    opts.AuthnNS,
+		username:   user.Username,
+		rc:         opts.RC,
+		provenance: opts.Provenance,
 	}
 
 	dict := map[string]any{}
@@ -340,6 +351,7 @@ func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string
 	accumulateErrorKey(r.dict, errKey, accumVal)
 	mu.Unlock()
 	r.stageErrSink.Bump(id, bumpMsg)
+	r.outcomes.fail(id, stageReasonOf(accumVal))
 	if itemErr != nil {
 		itemErrs[i] = itemErr
 	}
@@ -373,6 +385,19 @@ const (
 //     (R-2: the resolve truncates — the orchestrator returns r.dict).
 //   - success → return (ep, stageProceed).
 func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, bool, stageAction) {
+	if uafActive && r.opts.Provenance == ProvenanceCallerSupplied {
+		// #443 part 2 — an inline (caller-vouched) draft's UAF stage dials the
+		// CALLER's own clientconfig, never the ServiceAccount: isSA=false, so
+		// the SA-dial mark never fires. The refilter still runs unchanged. A
+		// path the caller cannot list is then the apiserver's 403 stage error.
+		resolved, isSA, err := r.mapper.resolveOne(r.ctx, nil, false)
+		if err != nil {
+			r.log.Error("userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
+				slog.String("name", id), slog.Any("error", err))
+			return endpoints.Endpoint{}, false, stageReturn
+		}
+		return resolved, isSA, stageProceed
+	}
 	if uafActive {
 		saEP, saErr := serviceAccountEndpointFn()
 		if saErr != nil {
@@ -503,7 +528,7 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 			if gvr, ns, ok := cache.ParseAPIServerListDepSkeleton(apiCall.Path); ok {
 				cache.Deps().RecordList(r.ctx, l1Key, gvr, ns)
 				if rw := cache.Global(); rw != nil {
-					rw.EnsureResourceType(gvr)
+					rw.EnsureResourceTypeFor(r.ctx, gvr)
 				}
 				r.log.Debug("dep.recorded",
 					slog.String("subsystem", "cache"),
@@ -639,6 +664,22 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// dial and the in-process paths all pass through here).
 	if gvr, _, _, ok := cache.ParseAPIServerPathToDep(call.Path); ok && cache.IsSensitiveResource(gvr) {
 		cache.SensitiveTouchedSinkFromContext(gctx).Bump()
+	}
+	// #443 (k) — the one REFUSE of an inert (dry-run) resolve: a write-verb
+	// stage is NOT executed. It gets an explicit per-stage error and returns
+	// before any egress (no informer, no internal rest config, no discovery,
+	// no external fetch), so a draft can never mutate anything.
+	if verb := ptr.Deref(call.Verb, http.MethodGet); cache.Inert(gctx) && verb != http.MethodGet {
+		// Stable contract (#443): reason "StageNotExecuted" is the machine
+		// field; the message keeps its stable prefix/suffix.
+		msg := fmt.Sprintf("dry-run: stage %q verb %s is not executed", id, verb)
+		var itemErr error
+		if !call.ContinueOnError {
+			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
+		}
+		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey,
+			map[string]any{"reason": StageReasonNotExecuted, "message": msg}, msg, itemErr)
+		return nil
 	}
 	// Ship 0.30.121 R1-a — per-call verbose decision. `sc.ep` is shared
 	// across every call of this stage; setting Debug in place would race the
@@ -835,7 +876,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// to the 0.30.118 pivot path.
 	if resolverUseInformer() {
 		if r.apistageEnabled {
-			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call, apiCall.UserAccessFilter != nil); ok {
+			// #443 part 2 — a caller-supplied UAF stage is dispatched as the
+			// caller (non-UAF gating: the requester's own RBAC narrows the
+			// content), and the UAF refilter still runs downstream. Only a
+			// STORED UAF stage is served un-narrowed for the refilter alone.
+			uafContent := apiCall.UserAccessFilter != nil && r.opts.Provenance != ProvenanceCallerSupplied
+			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call, uafContent); ok {
 				if served {
 					// Ship 0.30.128 P-CORE-2: the gated envelope is
 					// already a decoded structured value — feed it
@@ -1516,6 +1562,21 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 			}
 		}
 	}
+	// #443 (j) egress — EVERY egress of an inert (dry-run) resolve carries
+	// X-Snowplow-Inert: 1, not only a recognised self-host loopback. A snowplow
+	// reached through any hostname alias (a short/FQDN Service name, an
+	// ingress) then resolves the hop inert as well, so a stored RESTAction it
+	// serves cannot execute a write stage on behalf of a dry run. To any other
+	// server the header is inert data. Stage-local copy: the CR's own header
+	// slice is never written.
+	if cache.Inert(r.ctx) {
+		hdrs := make([]string, 0, len(apiCall.Headers)+1)
+		hdrs = append(hdrs, apiCall.Headers...)
+		hdrs = append(hdrs, fmt.Sprintf("%s: 1", cache.InertHeader))
+		local := *apiCall
+		local.Headers = hdrs
+		apiCall = &local
+	}
 	// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
 	// is the single largest transient-memory consumer (~1.94 GiB
 	// alloc_space on the 50K bench: it stringifies every HTTP response
@@ -1725,7 +1786,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 	if opts.RC == nil {
 		var err error
-		opts.RC, err = rest.InClusterConfig()
+		opts.RC, err = inClusterConfigFn()
 		if err != nil {
 			return map[string]any{}
 		}
@@ -1773,13 +1834,21 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// per-stage mutable primitives stay loop-local (see the resolveRun
 	// concurrency note).
 	r := newResolveRun(ctx, opts, log, user)
+	if opts.Provenance == ProvenanceCallerSupplied {
+		r.outcomes = stageOutcomesFrom(ctx)
+		r.outcomes.register(names)
+	}
 	// Each api stage runs through runStage in topological order. runStage
 	// returns stop=true on a truncating exit (R-1 caller-cancel, R-2 endpoint
 	// err, R-3 g.Wait hard error) — the orchestrator then returns the
 	// (truncated) dict; stop=false advances to the next stage. runStage owns
 	// the recordStageTiming()-before-every-exit invariant internally.
 	for _, id := range names {
+		r.outcomes.ran(id)
 		if r.runStage(id, apiMap) {
+			// A truncating exit: this stage failed (its own item errors, if
+			// any, already carry a more specific reason).
+			r.outcomes.fail(id, StageReasonError)
 			return r.dict
 		}
 	}
@@ -1820,6 +1889,31 @@ var discoverGroupResourcesFn = cache.DiscoverGroupResources
 // var-seam idiom.
 var serviceAccountEndpointFn = dynamic.ServiceAccountEndpoint
 
+// SetServiceAccountEndpointForTest swaps serviceAccountEndpointFn and returns a
+// restore func. Out of cluster the real one fails, so a STORED UAF stage never
+// dials anything; a hermetic arm (#443 f) points it at a fake apiserver with a
+// distinct ServiceAccount token so it can tell an SA read from a caller read.
+// TEST-ONLY: production code MUST NOT call it.
+func SetServiceAccountEndpointForTest(fn func() (*endpoints.Endpoint, error)) func() {
+	prev := serviceAccountEndpointFn
+	serviceAccountEndpointFn = fn
+	return func() { serviceAccountEndpointFn = prev }
+}
+
+// inClusterConfigFn is the indirection over rest.InClusterConfig used when a
+// resolve has no RC (a nested in-process resolve on a live request). Out of
+// cluster it fails and the resolve is empty; SetInClusterConfigForTest lets a
+// hermetic arm (#443 e4) run nested stages against a fake apiserver.
+var inClusterConfigFn = rest.InClusterConfig
+
+// SetInClusterConfigForTest swaps inClusterConfigFn and returns a restore
+// func. TEST-ONLY: production code MUST NOT call it.
+func SetInClusterConfigForTest(fn func() (*rest.Config, error)) func() {
+	prev := inClusterConfigFn
+	inClusterConfigFn = fn
+	return func() { inClusterConfigFn = prev }
+}
+
 // lazyRegisterInnerCallPaths walks the per-stage RequestOptions slice
 // (one entry per iterator dispatch — the iterator + non-iterator paths
 // share this code) and calls cache.Global().EnsureResourceType for the
@@ -1839,6 +1933,11 @@ var serviceAccountEndpointFn = dynamic.ServiceAccountEndpoint
 // lazyRegisterSlowThreshold emit a WARN log so a regression in
 // rw.mu contention or factory.ForResource cost becomes visible.
 func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []httpcall.RequestOptions) {
+	// #443 (c) — an inert (dry-run) resolve registers no informer and no
+	// navigation-discovered group.
+	if cache.Inert(ctx) {
+		return
+	}
 	rw := cache.Global()
 	if rw == nil {
 		return
@@ -1936,7 +2035,7 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 		seen[gvr] = struct{}{}
 
 		start := time.Now()
-		added, _ := rw.EnsureResourceType(gvr)
+		added, _ := rw.EnsureResourceTypeFor(ctx, gvr)
 		elapsed := time.Since(start)
 
 		// Emit a one-shot INFO line on first registration of a GVR so
