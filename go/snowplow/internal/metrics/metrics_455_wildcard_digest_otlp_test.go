@@ -18,6 +18,7 @@ package metrics
 //     callback but left out of the observable list fails here by name.
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"github.com/go-logr/logr/funcr"
 	"github.com/go-logr/stdr"
 	"go.opentelemetry.io/otel"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 )
@@ -69,7 +71,39 @@ func c7Assert455(t *testing.T, exports []capturedExport, want map[string]int64) 
 		if int64(got) != w {
 			t.Errorf("#455: %s = %v on the wire, want %d", name, got, w)
 		}
+		if k := c7Kind455(exports, name); k != "monotonic-cumulative-sum" {
+			t.Errorf("#455: %s is exported as %s, want a monotonic CUMULATIVE Sum (an ObservableCounter): "+
+				"a Gauge lands in otel_metrics_gauge where the certification query reads otel_metrics_sum", name, k)
+		}
 	}
+}
+
+// c7Kind455 names the OTLP data kind of instrument name in the export.
+func c7Kind455(exports []capturedExport, name string) string {
+	for _, e := range exports {
+		for _, rm := range e.req.GetResourceMetrics() {
+			for _, sm := range rm.GetScopeMetrics() {
+				for _, mt := range sm.GetMetrics() {
+					if mt.GetName() != name {
+						continue
+					}
+					switch d := mt.GetData().(type) {
+					case *metricspb.Metric_Sum:
+						if d.Sum.GetIsMonotonic() &&
+							d.Sum.GetAggregationTemporality() == metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE {
+							return "monotonic-cumulative-sum"
+						}
+						return fmt.Sprintf("sum(monotonic=%v,%s)", d.Sum.GetIsMonotonic(), d.Sum.GetAggregationTemporality())
+					case *metricspb.Metric_Gauge:
+						return "gauge"
+					default:
+						return fmt.Sprintf("%T", d)
+					}
+				}
+			}
+		}
+	}
+	return "absent"
 }
 
 // TestIssue455_EveryObservedInstrumentIsRegistered — every instrument the
