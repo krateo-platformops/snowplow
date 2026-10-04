@@ -243,6 +243,15 @@ const (
 	// (Ship G's 21 + Ship 1's +1 + Ship 2's +2 − Ship 2's −3) = 21.
 	ReasonResolverPluralsHit  FallthroughReason = "resolver-plurals-hit"
 	ReasonResolverPluralsMiss FallthroughReason = "resolver-plurals-miss"
+
+	// #443 — ReasonRawRead fires when a /call read carrying raw=true reaches
+	// the apiserver passthrough (handlers.Call / CallRead) for a GVR the
+	// dispatcher WOULD have resolved (restactions, the widgets group). The
+	// dispatcher deliberately falls through, so the request is a genuine live
+	// apiserver GET, made as the caller. It gets its own reason so a raw read
+	// is never mistaken for an unhandled-GVR ReasonClientBuild passthrough.
+	// Closed-enum count: 21 + 1 = 22.
+	ReasonRawRead FallthroughReason = "raw-read"
 )
 
 // RecordResolverPluralsHit records that a resolver-side plurals/kind

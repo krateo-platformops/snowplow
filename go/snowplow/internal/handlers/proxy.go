@@ -3,6 +3,7 @@ package handlers
 import (
 	"log/slog"
 	"net/http"
+	"net/url"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -53,6 +54,16 @@ func dispatcherForMethod(handlers map[string]http.Handler, dispatchMethod string
 				next.ServeHTTP(wri, req)
 				return
 			}
+			// #443 — the /call-only parameters fall through the same way.
+			// raw=true asks for the STORED restactions / widgets object as the
+			// caller, so it must skip the resolver. dryRun and fieldValidation
+			// are never valid on a read. Falling through on PRESENCE (any
+			// value) lets the call handler validate every one of them, so a
+			// bad value is a 400 and never a silently resolved read.
+			if hasCallOnlyParam(req.URL.Query()) {
+				next.ServeHTTP(wri, req)
+				return
+			}
 			if req.Method != dispatchMethod {
 				next.ServeHTTP(wri, req)
 				return
@@ -95,4 +106,18 @@ func dispatcherForMethod(handlers map[string]http.Handler, dispatchMethod string
 
 		return http.HandlerFunc(fn)
 	}
+}
+
+// callOnlyParams are the #443 query parameters only the /call handler acts on.
+// A request carrying any of them bypasses the resolve handlers (see
+// dispatcherForMethod).
+var callOnlyParams = []string{"raw", "dryRun", "fieldValidation"}
+
+func hasCallOnlyParam(q url.Values) bool {
+	for _, p := range callOnlyParams {
+		if _, ok := q[p]; ok {
+			return true
+		}
+	}
+	return false
 }

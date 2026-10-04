@@ -104,9 +104,70 @@ func snowplowCORSOptions() cors.Options {
 			"tracestate",
 			"baggage",
 		},
-		ExposedHeaders:   []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class"},
+		ExposedHeaders: []string{
+			"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class",
+			// #443 — the echo headers a browser client must READ to confirm a
+			// dry run / field validation / raw read actually happened (a
+			// missing echo means FAIL), plus the apiserver Warning header.
+			handlers.HeaderDryRun,
+			handlers.HeaderFieldValidation,
+			handlers.HeaderRaw,
+			handlers.HeaderResolveSource,
+			"Warning",
+		},
 		AllowCredentials: true,
 		MaxAge:           300, // Maximum value not ignored by any of major browsers
+	}
+}
+
+// mountCallWriteRoutes mounts the write-verb /call routes and their #443
+// /call/dry-run twins on mux. Every route gets the SAME chain: userConfig (the
+// caller's identity) then the call-write-* fallthrough scope, and each pattern
+// is RegisterScopedRoute'd so the boot-assert catches a half-wired route.
+//
+// Ship D — write-verb `/call` routes also get the middleware (PM explicit).
+// Write verbs are out of the read-path invariant (F-11 in the design), but
+// centralizing classification prevents silent escapes: a future GET-class
+// route mistakenly registered under `call-write-*` would still trip the
+// counter on the wrong cell.
+//
+// #443 — dry-run writes use their own route rather than a /call parameter. A
+// pre-#443 snowplow forwards only page/perPage, so it would turn
+// POST /call?dryRun=All into a REAL create. It has no /call/dry-run pattern,
+// so during a rolling deploy an old pod answers 404 and writes nothing. The
+// dry-run route shares the write-verb scope of the verb it dry-runs.
+//
+// It is a function (not inline in main) so the route table is testable with a
+// test identity middleware in place of the JWT + clientconfig lookup.
+func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(http.Handler) http.Handler) {
+	writes := []struct {
+		method string
+		scope  string
+	}{
+		{http.MethodPost, cache.ScopeCallWritePost},
+		{http.MethodPut, cache.ScopeCallWritePut},
+		{http.MethodPatch, cache.ScopeCallWritePatch},
+		{http.MethodDelete, cache.ScopeCallWriteDelete},
+	}
+	for _, w := range writes {
+		pattern := w.method + " /call"
+		mux.Handle(pattern, chain.Append(
+			userConfig,
+			cache.FallthroughScopeMiddleware(w.scope)).
+			Then(handlers.Call()))
+		cache.RegisterScopedRoute(pattern, w.scope)
+
+		// DELETE has no dryRun object to validate (and no fieldValidation);
+		// /call/dry-run serves only the verbs that send an object.
+		if w.method == http.MethodDelete {
+			continue
+		}
+		dryPattern := w.method + " /call/dry-run"
+		mux.Handle(dryPattern, chain.Append(
+			userConfig,
+			cache.FallthroughScopeMiddleware(w.scope)).
+			Then(handlers.CallDryRun()))
+		cache.RegisterScopedRoute(dryPattern, w.scope)
 	}
 }
 
@@ -1154,34 +1215,12 @@ func main() {
 		middleware.UserConfig(jwtKeys, *authnNS)).
 		Then(handlers.RBAC()))
 
-	// Ship D — write-verb `/call` routes also get the middleware (PM
-	// explicit). Write verbs are out of the read-path invariant (F-11
-	// in the design), but centralizing classification prevents silent
-	// escapes: a future GET-class route mistakenly registered under
-	// `call-write-*` would still trip the counter on the wrong cell.
-	mux.Handle("POST /call", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePost)).
-		Then(handlers.Call()))
-	cache.RegisterScopedRoute("POST /call", cache.ScopeCallWritePost)
+	mountCallWriteRoutes(mux, chain, middleware.UserConfig(jwtKeys, *authnNS))
 
-	mux.Handle("PUT /call", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePut)).
-		Then(handlers.Call()))
-	cache.RegisterScopedRoute("PUT /call", cache.ScopeCallWritePut)
-
-	mux.Handle("PATCH /call", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePatch)).
-		Then(handlers.Call()))
-	cache.RegisterScopedRoute("PATCH /call", cache.ScopeCallWritePatch)
-
-	mux.Handle("DELETE /call", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallWriteDelete)).
-		Then(handlers.Call()))
-	cache.RegisterScopedRoute("DELETE /call", cache.ScopeCallWriteDelete)
+	// #443 — GET /capabilities: a static, unauthenticated token list a client
+	// gates on by presence (a 404 means none). No identity, no apiserver call,
+	// so it is outside the read-path-scoped invariant (like /refreshes).
+	mux.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
 
 	mux.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
 

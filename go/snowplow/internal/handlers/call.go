@@ -65,6 +65,26 @@ func CallRead() http.Handler {
 	}
 }
 
+// CallDryRun is the /call/dry-run write handler (#443): the twin of CallRead.
+// It is mounted ONLY on POST|PUT|PATCH /call/dry-run, behind the same
+// middleware chain as the write-verb /call routes, and it always sends the
+// apiserver dryRun=All, so the apiserver validates and admits the request and
+// persists nothing. It has no dispatcher in front of it, so it never touches
+// the L1 cache, the informers or the refresher.
+//
+// The route is separate from /call on purpose. A pre-#443 snowplow forwards
+// only page/perPage, so it would treat POST /call?dryRun=All as a REAL
+// create. It has no /call/dry-run pattern, so during a rolling deploy an old
+// pod answers a dry-run with 404 and writes nothing.
+func CallDryRun() http.Handler {
+	return &callHandler{
+		authnNS:       env.String("AUTHN_NAMESPACE", ""),
+		verbose:       env.True("DEBUG"),
+		scopeResolver: dynamic.SharedSAScopeForGVR,
+		dryRun:        true,
+	}
+}
+
 var _ http.Handler = (*callHandler)(nil)
 
 // scopeResolverFn resolves whether a GVR is namespace-scoped. It returns
@@ -90,6 +110,11 @@ type callHandler struct {
 	// route cannot create/mutate a resource. Zero value (false) is the
 	// historical Call() write-capable behaviour, byte-identical.
 	readOnly bool
+	// dryRun marks the /call/dry-run handler (#443 — handlers.CallDryRun).
+	// When set, the outbound apiserver request always carries dryRun=All and
+	// only the write verbs POST/PUT/PATCH are accepted. Zero value (false) is
+	// the plain /call, where an inbound dryRun is a 400.
+	dryRun bool
 }
 
 // @Summary Call Endpoint
@@ -141,6 +166,13 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	log.Debug("user config succesfully loaded", slog.Any("endpoint", ep))
 
+	// #443 — the echo headers say what the apiserver call actually carried.
+	// They are read back from the BUILT outbound URI (not from the inbound
+	// query), and set before the first byte of any response is written, so
+	// they ride both a 2xx and an apiserver failure. A validation 400 returns
+	// above, before this point, and carries none of them.
+	setCallEchoHeaders(wri.Header(), uri, opts)
+
 	dict := map[string]any{}
 	callOpts := request.RequestOptions{
 		RequestInfo: request.RequestInfo{
@@ -165,7 +197,15 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// dispatchers.All() map (every "raw apiserver passthrough" /call).
 	// Record BEFORE request.Do so a panicking plumbing call still
 	// counts (AC-D.3 ordering).
-	cache.RecordApiserverFallthrough(req.Context(), cache.ReasonClientBuild, "")
+	//
+	// #443 — a raw read (raw=true) of a restactions / widgets object is a
+	// deliberate skip of the resolver, so it is recorded under its own reason
+	// and is never confused with an unhandled-GVR passthrough.
+	reason := cache.ReasonClientBuild
+	if opts.raw {
+		reason = cache.ReasonRawRead
+	}
+	cache.RecordApiserverFallthrough(req.Context(), reason, "")
 	rt := request.Do(req.Context(), callOpts)
 
 	// Audit correlation: every WRITE through /call emits a
@@ -178,8 +218,12 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if rt.Status == response.StatusFailure {
 			outcome, code, msg = "failure", rt.Code, rt.Message
 		}
+		action := "call"
+		if opts.dryRun {
+			action = "call.dryRun"
+		}
 		audit.Emit(req.Context(), audit.Event{
-			Action:      "call",
+			Action:      action,
 			Verb:        strings.ToUpper(opts.verb),
 			Group:       opts.gvr.Group,
 			Version:     opts.gvr.Version,
@@ -320,6 +364,13 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 		return
 	}
 
+	// #443 — dryRun, fieldValidation and raw. Every check runs before the
+	// body is read and before any apiserver call, so a rejected request
+	// issues zero outbound requests.
+	if err = r.validate443(req.URL.Query(), &opts); err != nil {
+		return
+	}
+
 	if val := req.URL.Query().Get("perPage"); val != "" {
 		opts.perPage, err = strconv.Atoi(val)
 		if err != nil {
@@ -346,6 +397,106 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 	}
 
 	return
+}
+
+// writeVerbs are the verbs that send an object to the apiserver: the only
+// verbs dryRun and fieldValidation apply to.
+var writeVerbs = []string{http.MethodPost, http.MethodPut, http.MethodPatch}
+
+// validate443 applies the #443 query rules on top of the addressing checks.
+// Values are case-sensitive and single-valued, and any value outside the
+// accepted set is a 400, never silently dropped:
+//
+//   - dryRun: only on the /call/dry-run handler, and only exactly "All". On
+//     plain /call it is always a 400 ("dry-run writes use /call/dry-run"),
+//     because forwarding it there would make the route choice meaningless and
+//     dropping it would turn a dry run into a real write.
+//   - The /call/dry-run handler serves only POST/PUT/PATCH.
+//   - fieldValidation: only on POST/PUT/PATCH, and only Ignore or Strict.
+//     Warn is a 400 until apiserver Warning headers can be passed through.
+//   - raw: only exactly "true", and only on a read (GET /call or the
+//     read-only POST /call/read). It is set by a client that wants the stored
+//     object rather than the resolved one; the dispatcher has already fallen
+//     through to this handler when it saw the parameter.
+func (r *callHandler) validate443(q url.Values, opts *callOptions) error {
+	if vals, present := q["dryRun"]; present {
+		if !r.dryRun {
+			return fmt.Errorf("dry-run writes use /call/dry-run")
+		}
+		if len(vals) != 1 || vals[0] != "All" {
+			return fmt.Errorf("invalid 'dryRun' value %q: the only accepted value is \"All\"", strings.Join(vals, ","))
+		}
+	}
+	if r.dryRun {
+		if !has(writeVerbs, opts.verb) {
+			return fmt.Errorf("/call/dry-run accepts only POST, PUT and PATCH, not %s", opts.verb)
+		}
+		opts.dryRun = true
+	}
+
+	if vals, present := q["fieldValidation"]; present {
+		if !has(writeVerbs, opts.verb) {
+			return fmt.Errorf("'fieldValidation' applies only to POST, PUT and PATCH, not %s", opts.verb)
+		}
+		if len(vals) != 1 {
+			return fmt.Errorf("'fieldValidation' must be given once")
+		}
+		switch vals[0] {
+		case "Ignore", "Strict":
+			opts.fieldValidation = vals[0]
+		case "Warn":
+			return fmt.Errorf("'fieldValidation=Warn' is not supported yet: apiserver warnings are not passed through; use Ignore or Strict")
+		default:
+			return fmt.Errorf("invalid 'fieldValidation' value %q: accepted values are \"Ignore\" and \"Strict\"", vals[0])
+		}
+	}
+
+	if vals, present := q["raw"]; present {
+		if opts.verb != http.MethodGet {
+			return fmt.Errorf("'raw' applies only to reads, not %s", opts.verb)
+		}
+		if len(vals) != 1 || vals[0] != "true" {
+			return fmt.Errorf("invalid 'raw' value %q: the only accepted value is \"true\"", strings.Join(vals, ","))
+		}
+		opts.raw = true
+	}
+	return nil
+}
+
+// Echo response headers (#443). A client that relies on one of these
+// behaviours must treat a missing echo as a failure: an older snowplow sends
+// none of them.
+const (
+	// HeaderDryRun is "All" when the apiserver call carried dryRun=All.
+	HeaderDryRun = "X-Snowplow-Dry-Run"
+	// HeaderFieldValidation is the fieldValidation value the apiserver call
+	// carried.
+	HeaderFieldValidation = "X-Snowplow-Field-Validation"
+	// HeaderRaw is "true" when the stored object was read without resolving.
+	HeaderRaw = "X-Snowplow-Raw"
+	// HeaderResolveSource is reserved for the inline dry-run resolve (#443
+	// part 2). It is listed here so the CORS exposure and the header name
+	// have one source.
+	HeaderResolveSource = "X-Snowplow-Resolve-Source"
+)
+
+// setCallEchoHeaders sets the #443 echo headers from the BUILT outbound URI,
+// so an echo can only appear when the parameter really goes to the apiserver.
+// raw has no apiserver parameter: it is echoed from the validated options,
+// because reaching this handler with raw set is what skips the resolver.
+func setCallEchoHeaders(h http.Header, uri string, opts callOptions) {
+	if u, err := url.Parse(uri); err == nil {
+		q := u.Query()
+		if v := q.Get("dryRun"); v != "" {
+			h.Set(HeaderDryRun, v)
+		}
+		if v := q.Get("fieldValidation"); v != "" {
+			h.Set(HeaderFieldValidation, v)
+		}
+	}
+	if opts.raw {
+		h.Set(HeaderRaw, "true")
+	}
 }
 
 // resolveScope reports whether opts.gvr is namespace-scoped. It is called
@@ -379,6 +530,15 @@ type callOptions struct {
 	// historical whole-object addressing (byte-identical path). validateRequest
 	// enforces that it only rides a by-name verb.
 	subresource string
+	// dryRun (#443) adds dryRun=All to the outbound URI. Set only by the
+	// /call/dry-run handler.
+	dryRun bool
+	// fieldValidation (#443) is "", "Ignore" or "Strict"; when set it is
+	// forwarded as the fieldValidation query parameter.
+	fieldValidation string
+	// raw (#443) records a validated raw=true read. It changes no outbound
+	// parameter; it selects the fallthrough reason and the X-Snowplow-Raw echo.
+	raw bool
 }
 
 func buildURIPath(opts callOptions) (string, error) {
@@ -429,6 +589,14 @@ func buildURIPath(opts callOptions) (string, error) {
 	}
 	if opts.page > 0 {
 		query.Set("page", strconv.Itoa(opts.page))
+	}
+	// #443 — the apiserver's own dry-run and field validation, carried on the
+	// caller's request. These are what the echo headers are read back from.
+	if opts.dryRun {
+		query.Set("dryRun", "All")
+	}
+	if opts.fieldValidation != "" {
+		query.Set("fieldValidation", opts.fieldValidation)
 	}
 
 	if len(query) > 0 {
