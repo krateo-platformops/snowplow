@@ -53,6 +53,11 @@ var requiredScopedRoutes = []string{
 	// read-path invariant, exactly like GET /call — unlike /rbac & /refreshes,
 	// which issue zero per-user reads and are deliberately unregistered.
 	"POST /call/read",
+	// #443 — the dry-run write twins. Same per-user apiserver writes as the
+	// /call write verbs they mirror, so the same scoping rule applies.
+	"POST /call/dry-run",
+	"PUT /call/dry-run",
+	"PATCH /call/dry-run",
 }
 
 // assertionViolationsTotal is the production-mode counter bumped by

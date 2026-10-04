@@ -83,7 +83,7 @@ type splitCase struct {
 
 // splitCases enumerates every reason the 27 production sites can pass,
 // with the classification hand-written from design §5.2 (NOT read from
-// the production map). All 21 closed-enum values are present: an added
+// the production map). All 22 closed-enum values are present (#443 added raw-read): an added
 // reason that is not listed here fails TestFallthroughSplit_TableCovers
 // EveryReason below.
 var splitCases = []splitCase{
@@ -111,6 +111,7 @@ var splitCases = []splitCase{
 	{ReasonInformerMetadataOnly, false, "gate-miss arm hands the call to the live apiserver"},
 	{ReasonApistageGetPartialShape, false, "returns (nil,false) -> fresh apiserver GET-by-name"},
 	{ReasonGetMissLetApiserver404, false, "deliberately lets the apiserver answer 404"},
+	{ReasonRawRead, false, "#443 raw=true skips the resolver and issues a live apiserver GET as the caller"},
 }
 
 // TestFallthroughSplit_RoutingCellsAndTotals is F4.
@@ -221,9 +222,10 @@ func TestFallthroughSplit_TableCoversEveryReason(t *testing.T) {
 		ReasonWidgetContentHit, ReasonWidgetContentMissPerUserFallback,
 		ReasonPluralsDiscoveryHop,
 		ReasonResolverPluralsHit, ReasonResolverPluralsMiss,
+		ReasonRawRead, // #443
 	}
-	if len(allReasons) != 21 {
-		t.Fatalf("closed enum size = %d; design §3.2 states 21 — update both this list and the "+
+	if len(allReasons) != 22 {
+		t.Fatalf("closed enum size = %d; design §3.2 states 21, plus #443's raw-read = 22 — update both this list and the "+
 			"cardinality arithmetic if a reason was added", len(allReasons))
 	}
 
