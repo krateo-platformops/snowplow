@@ -264,6 +264,14 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 }
 
 func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err error) {
+	// #443 part 2 — an inline object is resolved only by the RESTAction
+	// handler. BodyExtrasDecode already refuses one for any other GVR; this is
+	// the backstop for one that still reaches the passthrough (e.g. with
+	// raw=true), so a stored object is never read in place of a draft.
+	if _, inline := util.InlineObject(req.Context()); inline {
+		err = fmt.Errorf("an inline object is resolved only for resource=restactions, without raw")
+		return
+	}
 	opts.verb = req.Method
 	// #186 — the read-only /call/read handler forces GET regardless of the
 	// inbound method (always POST on that route) so a body-carrying READ can
@@ -518,16 +526,16 @@ func (r *callHandler) validate443(q url.Values, opts *callOptions) error {
 // none of them.
 const (
 	// HeaderDryRun is "All" when the apiserver call carried dryRun=All.
-	HeaderDryRun = "X-Snowplow-Dry-Run"
+	HeaderDryRun = util.HeaderDryRun
 	// HeaderFieldValidation is the fieldValidation value the apiserver call
 	// carried.
-	HeaderFieldValidation = "X-Snowplow-Field-Validation"
+	HeaderFieldValidation = util.HeaderFieldValidation
 	// HeaderRaw is "true" when the stored object was read without resolving.
-	HeaderRaw = "X-Snowplow-Raw"
-	// HeaderResolveSource is reserved for the inline dry-run resolve (#443
-	// part 2). It is listed here so the CORS exposure and the header name
-	// have one source.
-	HeaderResolveSource = "X-Snowplow-Resolve-Source"
+	HeaderRaw = util.HeaderRaw
+	// HeaderResolveSource is "request-body" on an inline dry-run resolve (#443
+	// part 2, set by the dispatchers package). Re-exported here so the CORS
+	// exposure and the header name have one source.
+	HeaderResolveSource = util.HeaderResolveSource
 )
 
 // setCallEchoHeaders sets the #443 echo headers from the BUILT outbound URI,

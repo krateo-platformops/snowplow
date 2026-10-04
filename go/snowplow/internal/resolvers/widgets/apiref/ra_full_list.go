@@ -374,9 +374,18 @@ func raFullListServe(
 		return nil, false, nil
 	}
 	if known && sliceable {
-		if entry, ok := c.Get(raKey); ok {
+		// #443 (e) — an inert (dry-run) resolve reads the cell without
+		// stamping it warm and without joining its representative pool.
+		inert := cache.Inert(ctx)
+		readRA := c.Get
+		if inert {
+			readRA = c.GetNoTouch
+		}
+		if entry, ok := readRA(raKey); ok {
 			// #444 — the requester joins the cell's representative pool.
-			entry.NoteHitter(keyInputs.RepresentativeUsername, keyInputs.RepresentativeGroups)
+			if !inert {
+				entry.NoteHitter(keyInputs.RepresentativeUsername, keyInputs.RepresentativeGroups)
+			}
 			full, derr := decodeRAFullList(entry.RawJSON)
 			if derr == nil {
 				if sliced, sok := cache.GoSliceFullList(full, offset, perPage); sok {

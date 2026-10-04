@@ -536,7 +536,9 @@ func apistageContentServe(
 		switch {
 		case forceContentMiss:
 			return nil, false
-		case refresherDriven:
+		case refresherDriven || cache.Inert(ctx):
+			// #443 (e) — an inert (dry-run) resolve reads the cell as input
+			// but must not stamp it warm either.
 			return store.GetNoTouch(k)
 		default:
 			return store.Get(k)
@@ -603,7 +605,7 @@ func apistageContentServe(
 			// re-touched — no child informer is ever forced. AFTER the cache
 			// read.
 			if rw := cache.Global(); rw != nil {
-				rw.EnsureResourceType(gvr)
+				rw.EnsureResourceTypeFor(ctx, gvr)
 			}
 		} else {
 			cache.Deps().Record(ctx, contentKey, gvr, ns, name)

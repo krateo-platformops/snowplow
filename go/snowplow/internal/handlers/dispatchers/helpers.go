@@ -27,6 +27,19 @@ import (
 func fetchObject(req *http.Request) (got objects.Result) {
 	log := xcontext.Logger(req.Context())
 
+	// #443 part 2 — an inline RESTAction (POST /call/read body "object",
+	// already validated against this query by middleware.BodyExtrasDecode)
+	// is the spec source INSTEAD of the stored CR. Everything downstream is
+	// the unchanged RESTAction handler, so the envelope is identical.
+	if obj, ok := util.InlineObject(req.Context()); ok {
+		gvr, err := util.ParseGVR(req)
+		if err != nil {
+			got.Err = response.New(http.StatusBadRequest, err)
+			return
+		}
+		return objects.Result{Unstructured: obj, GVR: gvr}
+	}
+
 	gvr, err := util.ParseGVR(req)
 	if err != nil {
 		got.Err = response.New(http.StatusBadRequest, err)
@@ -182,6 +195,11 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 // case symmetrically with the existing per-user lookup (which DOES
 // nil-check UserInfo at dispatchCacheLookupKey).
 func dispatchWidgetContentKey(ctx context.Context, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
+	// #443 (f), widget-content twin — an inert (dry-run) hop neither reads
+	// (touches) nor fills the identity-free widget content cell.
+	if cache.Inert(ctx) {
+		return "", nil, nil
+	}
 	c := cache.ResolvedCache()
 	if c == nil {
 		return "", nil, nil
@@ -235,6 +253,13 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 // collapses to the empty-identity row — same shape as cache=off's
 // transparent fallback, project_cache_off_is_transparent_fallback).
 func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
+	// #443 (f) — an inert (dry-run) resolve mints no key and gets no handle:
+	// no L1 lookup, no capture, no Put. This is also a CORRECTNESS rule: an
+	// inline draft named like a stored RESTAction must never be served the
+	// stored cell.
+	if cache.Inert(ctx) {
+		return "", nil, nil
+	}
 	c := cache.ResolvedCache()
 	if c == nil {
 		return "", nil, nil

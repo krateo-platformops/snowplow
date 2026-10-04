@@ -56,6 +56,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
 // selfLoopbackHost is the URL_SELF host (Hostname, no port/scheme) parsed once at
@@ -152,6 +153,35 @@ func isTrustedSelfLoopback(req *http.Request) bool {
 	// Belt-and-suspenders secondary (tightens only; returns true when URL_SELF
 	// is unconfigured). The validated-identity check above is the primary anchor.
 	return requestArrivedOnSelfHost(req)
+}
+
+// provenanceFor maps "the RESTAction came from the request body" to its
+// resolve Provenance (#443 part 2). Used at the single place Provenance is set
+// (restactions.go, the restactionsResolveFn call).
+func provenanceFor(inline bool) api.Provenance {
+	if inline {
+		return api.ProvenanceCallerSupplied
+	}
+	return api.ProvenanceStored
+}
+
+// reseedInertFromHeaders is the ingest half of #443 choke point (j): a nested
+// HTTP self-loopback /call made by an inert resolve carries
+// cache.InertHeader: 1, and the next hop must be inert too. The header is
+// honoured ONLY on a trusted self-loopback (isTrustedSelfLoopback: a
+// snowplow-validated JWT arriving on the URL_SELF host), the same anchor as
+// the depth and ancestor headers. A user forging it affects only their own
+// request (it skips L1 and makes no fill). Returns req unchanged otherwise.
+// It must run first in ServeHTTP, before observeLiveCaller and before the L1
+// key is minted.
+func reseedInertFromHeaders(req *http.Request) *http.Request {
+	if req == nil || req.Header.Get(cache.InertHeader) != "1" || cache.Inert(req.Context()) {
+		return req
+	}
+	if !isTrustedSelfLoopback(req) {
+		return req
+	}
+	return req.WithContext(cache.WithInert(req.Context()))
 }
 
 // reseedNestedGuardsFromHeaders re-installs the depth counter + ancestor set from

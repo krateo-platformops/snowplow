@@ -1,21 +1,23 @@
-# Frontend integration: dry-run writes, field validation, raw reads and capability discovery (#443)
+# Frontend integration: dry-run writes, field validation, raw reads, inline resolve and capability discovery (#443)
 
 This guide is for a frontend session integrating snowplow's #443 contract. The
 first consumer is the builder gate (krateo-platformops/frontend#446,
 `builder-gate/docs/snowplow-contract.md`). Everything below comes from the
 handler code: `internal/handlers/call.go`, `internal/handlers/proxy.go`,
-`internal/handlers/capabilities.go` and the route table in `main.go`
-(`mountCallWriteRoutes`).
+`internal/handlers/capabilities.go`, the route table in `main.go`
+(`mountCallWriteRoutes`), and for the inline resolve
+`internal/handlers/middleware/callread.go` and
+`internal/handlers/dispatchers/restactions.go`.
 
-This release ships part 1 (dry-run, fieldValidation, discovery) and part 3
-(raw reads). Part 2, the inline dry-run resolve of a RESTAction body, is not
-in it, and its token `call.read.inline` is not advertised yet.
+Part 1 (dry-run, fieldValidation, discovery) and part 3 (raw reads) shipped
+together. Part 2, the inline dry-run resolve of a RESTAction body (section 5),
+is advertised as `call.read.inline`.
 
 ## 1. Gate on capabilities, never on a version
 
 ```
 GET /capabilities            (no auth)
-200 {"capabilities":["call.dryRun","call.fieldValidation","call.raw"]}
+200 {"capabilities":["call.dryRun","call.fieldValidation","call.raw","call.read.inline"]}
 ```
 
 - The list is static and sorted.
@@ -29,10 +31,11 @@ GET /capabilities            (no auth)
 | `call.dryRun` | `POST\|PUT\|PATCH /call/dry-run` sends the apiserver `dryRun=All` and echoes `X-Snowplow-Dry-Run: All`. |
 | `call.fieldValidation` | `fieldValidation=Ignore\|Strict` is forwarded on write verbs of `/call` and `/call/dry-run`, and echoed in `X-Snowplow-Field-Validation`. |
 | `call.raw` | `raw=true` on `GET /call` and `POST /call/read` returns the stored object for restactions and the widgets group, read as the caller, and echoes `X-Snowplow-Raw: true`. |
+| `call.read.inline` | `POST /call/read` on a RESTAction with body `{"extras":{…},"object":{<RESTAction>}}` resolves the body instead of the stored CR, as the caller, persisting nothing, and echoes `X-Snowplow-Dry-Run: All` and `X-Snowplow-Resolve-Source: request-body`. |
 
-Not advertised yet: `call.read.inline` (part 2) and `call.warnings` (apiserver
-`Warning` passthrough and `fieldValidation=Warn`, which needs a plumbing
-change).
+Not advertised yet: `call.warnings` (apiserver `Warning` passthrough and
+`fieldValidation=Warn`, which needs a plumbing change) and
+`call.read.inline.dependencies` (a draft that references another draft).
 
 ## 2. Dry-run writes: `POST|PUT|PATCH /call/dry-run`
 
@@ -93,13 +96,56 @@ POST /call/read?…&raw=true          (body {"extras":{…}} is ignored for a ra
   `400`, and so is `raw` on any write verb.
 - A raw read doesn't touch snowplow's cache or informers.
 
-## 5. Echo headers: a missing echo means FAIL
+## 5. Inline dry-run resolve: `POST /call/read` with an `object`
+
+```
+POST /call/read?apiVersion=templates.krateo.io/v1&resource=restactions&namespace=<ns>&name=<name>[&page=&perPage=]
+Authorization: Bearer <jwt>
+Content-Type: application/json
+
+{"extras": {…}, "object": {"apiVersion":"templates.krateo.io/v1","kind":"RESTAction","metadata":{"name":"<name>","namespace":"<ns>"},"spec":{…}}}
+```
+
+- The reply has the same envelope as resolving the stored RESTAction (`GET
+  /call` or `POST /call/read` without `object`), including per-stage errors in
+  `.status`. For the same caller and the same spec it is byte-identical.
+- Echoes on every reply from the resolver (`200`, a stage-error `200`, a filter
+  `500`): `X-Snowplow-Dry-Run: All` and `X-Snowplow-Resolve-Source:
+  request-body`. A missing echo means an older snowplow resolved the STORED
+  RESTAction instead: treat it as a failure.
+- **Nothing is persisted.** No cache entry is written or touched, no informer
+  is registered, and nothing is announced on `/refreshes`. A draft with the
+  same name as a stored RESTAction never reads the stored cell.
+- **Write-verb stages are not executed.** A `POST`/`PUT`/`PATCH`/`DELETE`
+  stage gets the stage error `dry-run: stage "<id>" verb <V> is not executed`
+  (under its `errorKey` when it has one).
+- **Everything runs as the caller.** A named `endpointRef` Secret is read with
+  the caller's own credentials (a Secret the caller cannot read is a stage
+  error), and a `-clientconfig` endpointRef is refused. A `userAccessFilter`
+  stage reads with the caller's own RBAC, never through snowplow's
+  ServiceAccount: rows the caller cannot read are not returned, and a path the
+  caller cannot list that is not served from snowplow's informers is the
+  apiserver's `403` stage error. The filter still narrows the rows. A STORED
+  RESTAction that the draft nests keeps its stored behaviour.
+- **Validation (each a `400`, nothing resolved):** the object must be
+  `templates.krateo.io/v1` `RESTAction` and convert to one; its
+  `metadata.name`/`namespace` must equal the query's; the query must address
+  `restactions` in `templates.krateo.io` (an `object` on a widget or any other
+  resource is refused, and so is `object` together with `raw=true`); the body
+  must be at most 1 MiB.
+- Scope cut: a draft that references ANOTHER draft is not supported; nested
+  references resolve stored objects.
+- On an older snowplow the `object` is ignored and the STORED RESTAction is
+  resolved (a read, so harmless), without the echoes.
+
+## 6. Echo headers: a missing echo means FAIL
 
 | Header | Set when |
 |---|---|
 | `X-Snowplow-Dry-Run: All` | The apiserver request carried `dryRun=All`. |
 | `X-Snowplow-Field-Validation: <Ignore\|Strict>` | The apiserver request carried that `fieldValidation`. |
 | `X-Snowplow-Raw: true` | The stored object was read without resolving. |
+| `X-Snowplow-Resolve-Source: request-body` | The RESTAction resolved was the request body (with `X-Snowplow-Dry-Run: All`). |
 
 - The echoes are derived from the outbound request snowplow actually built,
   and set before the reply is written.
@@ -114,7 +160,7 @@ POST /call/read?…&raw=true          (body {"extras":{…}} is ignored for a ra
   includes an unexpected `200`, which could mean an old snowplow did something
   else.
 
-## 6. Example (TypeScript)
+## 7. Example (TypeScript)
 
 ```ts
 type Caps = Set<string>;
@@ -154,7 +200,7 @@ async function rawGet(base: string, jwt: string, caps: Caps, q: URLSearchParams)
 }
 ```
 
-## 7. Edge cases
+## 8. Edge cases
 
 - **Spelling is exact:** any key that is a case, underscore or hyphen variant
   of `dryRun` or `fieldValidation` (`dryrun`, `DryRun`, `dry_run`,

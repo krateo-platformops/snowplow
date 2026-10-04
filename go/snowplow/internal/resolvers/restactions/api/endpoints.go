@@ -19,6 +19,9 @@ type endpointReferenceMapper struct {
 	authnNS  string
 	username string
 	rc       *rest.Config
+	// provenance (#443 part 2) — under ProvenanceCallerSupplied a named
+	// endpointRef Secret is read with the caller's own credentials.
+	provenance Provenance
 }
 
 // clientConfigSuffix is snowplow's OWN reserved internal-identity suffix: the
@@ -63,6 +66,15 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 		return endpoints.Endpoint{}, false, fmt.Errorf(
 			"templated endpointRef resolved to the reserved internal-identity name %q (suffix %q); refusing — a request-driven endpointRef may not select a per-user credential Secret (#113 guardrail b)",
 			ref.Name, clientConfigSuffix)
+	}
+	// #443 part 2 — a caller-supplied (inline draft) named ref is read as the
+	// CALLER, never through the ServiceAccount or the SA-backed Secrets
+	// snapshot, so a draft can only use credentials its author can already
+	// read. A literal `-clientconfig` ref is refused too (the #113 guardrail
+	// applied to literal refs, defense in depth): a draft must never select
+	// another user's clientconfig even if the caller could read it.
+	if ref != nil && m.provenance == ProvenanceCallerSupplied {
+		return m.resolveOneAsCaller(ctx, ref)
 	}
 	if ref == nil {
 		// 0.30.102 Tag B: when the request is driven by an internal /

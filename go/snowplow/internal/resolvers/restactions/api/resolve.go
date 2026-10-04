@@ -165,6 +165,12 @@ type ResolveOptions struct {
 	// to the 0.30.115 path rather than mis-keying.
 	RESTActionNamespace string
 	RESTActionName      string
+
+	// Provenance (#443 part 2) says who vouches for Items. The zero value,
+	// ProvenanceStored, is today's behaviour. ProvenanceCallerSupplied (an
+	// inline dry-run draft) switches UAF stages and endpointRef Secret reads
+	// to the caller's own identity (see Provenance).
+	Provenance Provenance
 }
 
 // accumulateErrorKey implements Ship 0.30.257 (#313) Option W-A: the shared
@@ -239,9 +245,10 @@ type resolveRun struct {
 func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, user jwtutil.UserInfo) *resolveRun {
 	// Endpoints reference mapper
 	mapper := endpointReferenceMapper{
-		authnNS:  opts.AuthnNS,
-		username: user.Username,
-		rc:       opts.RC,
+		authnNS:    opts.AuthnNS,
+		username:   user.Username,
+		rc:         opts.RC,
+		provenance: opts.Provenance,
 	}
 
 	dict := map[string]any{}
@@ -373,6 +380,19 @@ const (
 //     (R-2: the resolve truncates — the orchestrator returns r.dict).
 //   - success → return (ep, stageProceed).
 func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, bool, stageAction) {
+	if uafActive && r.opts.Provenance == ProvenanceCallerSupplied {
+		// #443 part 2 — an inline (caller-vouched) draft's UAF stage dials the
+		// CALLER's own clientconfig, never the ServiceAccount: isSA=false, so
+		// the SA-dial mark never fires. The refilter still runs unchanged. A
+		// path the caller cannot list is then the apiserver's 403 stage error.
+		resolved, isSA, err := r.mapper.resolveOne(r.ctx, nil, false)
+		if err != nil {
+			r.log.Error("userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
+				slog.String("name", id), slog.Any("error", err))
+			return endpoints.Endpoint{}, false, stageReturn
+		}
+		return resolved, isSA, stageProceed
+	}
 	if uafActive {
 		saEP, saErr := serviceAccountEndpointFn()
 		if saErr != nil {
@@ -503,7 +523,7 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 			if gvr, ns, ok := cache.ParseAPIServerListDepSkeleton(apiCall.Path); ok {
 				cache.Deps().RecordList(r.ctx, l1Key, gvr, ns)
 				if rw := cache.Global(); rw != nil {
-					rw.EnsureResourceType(gvr)
+					rw.EnsureResourceTypeFor(r.ctx, gvr)
 				}
 				r.log.Debug("dep.recorded",
 					slog.String("subsystem", "cache"),
@@ -639,6 +659,19 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// dial and the in-process paths all pass through here).
 	if gvr, _, _, ok := cache.ParseAPIServerPathToDep(call.Path); ok && cache.IsSensitiveResource(gvr) {
 		cache.SensitiveTouchedSinkFromContext(gctx).Bump()
+	}
+	// #443 (k) — the one REFUSE of an inert (dry-run) resolve: a write-verb
+	// stage is NOT executed. It gets an explicit per-stage error and returns
+	// before any egress (no informer, no internal rest config, no discovery,
+	// no external fetch), so a draft can never mutate anything.
+	if verb := ptr.Deref(call.Verb, http.MethodGet); cache.Inert(gctx) && verb != http.MethodGet {
+		msg := fmt.Sprintf("dry-run: stage %q verb %s is not executed", id, verb)
+		var itemErr error
+		if !call.ContinueOnError {
+			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
+		}
+		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, msg, msg, itemErr)
+		return nil
 	}
 	// Ship 0.30.121 R1-a — per-call verbose decision. `sc.ep` is shared
 	// across every call of this stage; setting Debug in place would race the
@@ -835,7 +868,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// to the 0.30.118 pivot path.
 	if resolverUseInformer() {
 		if r.apistageEnabled {
-			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call, apiCall.UserAccessFilter != nil); ok {
+			// #443 part 2 — a caller-supplied UAF stage is dispatched as the
+			// caller (non-UAF gating: the requester's own RBAC narrows the
+			// content), and the UAF refilter still runs downstream. Only a
+			// STORED UAF stage is served un-narrowed for the refilter alone.
+			uafContent := apiCall.UserAccessFilter != nil && r.opts.Provenance != ProvenanceCallerSupplied
+			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call, uafContent); ok {
 				if served {
 					// Ship 0.30.128 P-CORE-2: the gated envelope is
 					// already a decoded structured value — feed it
@@ -1508,6 +1546,13 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 						stageHeaders = append(stageHeaders,
 							fmt.Sprintf("%s: %s", cache.ResolveAncestorsHeader, anc))
 					}
+					// #443 (j) egress — an inert (dry-run) resolve makes the next
+					// self-loopback hop inert too. Self-host arm only: the header
+					// is never sent to an external host.
+					if cache.Inert(r.ctx) {
+						stageHeaders = append(stageHeaders,
+							fmt.Sprintf("%s: 1", cache.InertHeader))
+					}
 				}
 
 				local := *apiCall
@@ -1839,6 +1884,11 @@ var serviceAccountEndpointFn = dynamic.ServiceAccountEndpoint
 // lazyRegisterSlowThreshold emit a WARN log so a regression in
 // rw.mu contention or factory.ForResource cost becomes visible.
 func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []httpcall.RequestOptions) {
+	// #443 (c) — an inert (dry-run) resolve registers no informer and no
+	// navigation-discovered group.
+	if cache.Inert(ctx) {
+		return
+	}
 	rw := cache.Global()
 	if rw == nil {
 		return
@@ -1936,7 +1986,7 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 		seen[gvr] = struct{}{}
 
 		start := time.Now()
-		added, _ := rw.EnsureResourceType(gvr)
+		added, _ := rw.EnsureResourceTypeFor(ctx, gvr)
 		elapsed := time.Since(start)
 
 		// Emit a one-shot INFO line on first registration of a GVR so

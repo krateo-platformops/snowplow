@@ -247,6 +247,10 @@ func (c *ResolvedCacheStore) NoteRAFullListSlice(ctx context.Context, raKey stri
 	if c == nil || raKey == "" || entry == nil {
 		return
 	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
+		return
+	}
 	ReplayRAFullListSlices(ctx, LayeredSources{{raKey: raKey, version: entry.contentVersion}})
 }
 

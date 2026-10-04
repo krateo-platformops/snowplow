@@ -35,6 +35,9 @@ type ResolveOptions struct {
 	PerPage int
 	Page    int
 	Extras  map[string]any
+	// Provenance (#443 part 2) — who vouches for In. Zero value: a stored CR.
+	// Passed straight through to api.ResolveOptions.
+	Provenance api.Provenance
 }
 
 func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, error) {
@@ -51,6 +54,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 		// RESTAction. opts.In is the typed RESTAction CR.
 		RESTActionNamespace: opts.In.GetNamespace(),
 		RESTActionName:      opts.In.GetName(),
+		Provenance:          opts.Provenance,
 	})
 	if dict == nil {
 		dict = map[string]any{}

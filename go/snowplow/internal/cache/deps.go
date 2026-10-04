@@ -960,6 +960,10 @@ func (d *DepTracker) Record(ctx context.Context, l1Key string, gvr schema.GroupV
 	if d == nil {
 		return
 	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
+		return
+	}
 	if l1Key == "" {
 		// O15: a Record call with no L1 key is an unambiguous bug — a
 		// DepKey with nowhere to attach it. Loud-fail.
@@ -980,6 +984,10 @@ func (d *DepTracker) Record(ctx context.Context, l1Key string, gvr schema.GroupV
 // ""). Internally encodes the bucket as (gvr, namespace, "*").
 func (d *DepTracker) RecordList(ctx context.Context, l1Key string, gvr schema.GroupVersionResource, namespace string) {
 	if d == nil {
+		return
+	}
+	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	if Inert(ctx) {
 		return
 	}
 	if l1Key == "" {

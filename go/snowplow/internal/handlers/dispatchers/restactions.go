@@ -33,6 +33,20 @@ func RESTAction() http.Handler {
 	}
 }
 
+// RESTActionWithServiceAccountConfig is RESTAction() with an explicit
+// ServiceAccount *rest.Config instead of the in-cluster one. It exists for
+// out-of-cluster harnesses (the #443 kind arms), where snowplowSARC() is nil
+// and every stage would resolve empty, which makes a stored-vs-inline parity
+// comparison vacuous. The config is used exactly as saRC is in production:
+// only as ResolveOptions.SArc, never attached to the per-user ctx.
+func RESTActionWithServiceAccountConfig(saRC *rest.Config) http.Handler {
+	return &restActionHandler{
+		authnNS: env.String("AUTHN_NAMESPACE", ""),
+		verbose: env.True("DEBUG"),
+		saRC:    saRC,
+	}
+}
+
 type restActionHandler struct {
 	authnNS string
 	verbose bool
@@ -47,7 +61,18 @@ type restActionHandler struct {
 var _ http.Handler = (*restActionHandler)(nil)
 
 func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
+	// #443 (j) ingest — FIRST, before observeLiveCaller and the L1 key mint.
+	req = reseedInertFromHeaders(req)
 	log := xcontext.Logger(req.Context())
+
+	// #443 part 2 — an inline RESTAction is resolved, never stored. Echo it
+	// before the first byte is written, so the echo rides every reply this
+	// handler produces (2xx, a stage-error 200, a 4xx/5xx).
+	_, inline := util.InlineObject(req.Context())
+	if inline {
+		wri.Header().Set(util.HeaderDryRun, "All")
+		wri.Header().Set(util.HeaderResolveSource, util.ResolveSourceRequestBody)
+	}
 
 	start := time.Now()
 
@@ -397,6 +422,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		PerPage: perPage,
 		Page:    page,
 		Extras:  extras,
+		// #443 part 2 — the ONE place Provenance is set: an inline body is
+		// vouched for only by the caller, so its endpointRef Secrets and UAF
+		// stages are read as the caller (api.ProvenanceCallerSupplied).
+		Provenance: provenanceFor(inline),
 	})
 	if err != nil {
 		log.Error("unable to resolve rest action",
@@ -460,7 +489,15 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (a grant/revoke landed mid-resolve), the body belongs to the NEW class
 	// while cacheKey still names the OLD one, which every other old-class member
 	// derives. Serve the body (it is correct for this requester), never write it.
-	if cache.DeclineSensitivePut(ctx) {
+	if cache.Inert(ctx) {
+		// #443 (g) — an inert (dry-run) resolve skips the whole Put chain,
+		// including the decline counters: dry-run traffic must not count as
+		// a UAF, external or stage-error decline.
+		log.Debug("RESTAction resolved inert (dry run); nothing persisted",
+			slog.String("name", cr.Name),
+			slog.String("namespace", cr.Namespace),
+		)
+	} else if cache.DeclineSensitivePut(ctx) {
 		// #398 — the resolve read a sensitive resource (core v1/secrets): serve
 		// the body, persist it nowhere.
 		log.Debug("RESTAction resolve read a sensitive resource; declining to cache",

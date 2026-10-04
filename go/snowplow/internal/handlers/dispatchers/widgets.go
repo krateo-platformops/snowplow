@@ -44,7 +44,17 @@ type widgetsHandler struct {
 var _ http.Handler = (*widgetsHandler)(nil)
 
 func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
+	// #443 (j) ingest — FIRST, before observeLiveCaller and the L1 key mint.
+	req = reseedInertFromHeaders(req)
 	start := time.Now()
+
+	// #443 part 2 — an inline object is a RESTAction only. BodyExtrasDecode
+	// already refuses one addressed at the widgets group; this is the
+	// handler-side backstop, so a widget can never be resolved from a body.
+	if _, inline := util.InlineObject(req.Context()); inline {
+		response.BadRequest(wri, fmt.Errorf("an inline object is accepted only for RESTActions (resource=restactions)"))
+		return
+	}
 
 	// Ship 0.30.171-debug — per-/call structured timing log; see
 	// restactions.go for the rationale. Emits dispatcher.call.complete
@@ -437,7 +447,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #424 — identity-class re-check FIRST (see restactions.go): a requester
 	// whose RBAC class moved mid-resolve must not write into the pre-resolve
 	// key. Ahead of the external-TTL branch too, since that branch also writes.
-	if cache.DeclineSensitivePut(ctx) {
+	if cache.Inert(ctx) {
+		// #443 (g), widget twin — a widget reached by an inert (dry-run)
+		// self-loopback hop skips the whole Put chain, decline counters
+		// included, exactly like the RESTAction handler.
+		log.Debug("Widget resolved inert (dry run); nothing persisted")
+	} else if cache.DeclineSensitivePut(ctx) {
 		// #398 — see restactions.go: a Secret-bearing envelope is never persisted.
 		log.Debug("Widget resolve read a sensitive resource; declining to cache",
 			slog.String("key_hash", cacheKey),

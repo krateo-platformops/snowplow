@@ -540,6 +540,13 @@ func populateClusterListCellAsync(
 	clusterCall httpcall.RequestOptions,
 	apistageStore *cache.ResolvedCacheStore,
 ) {
+	// #443 (d) — an inert (dry-run) resolve never populates a cell. The
+	// check sits BEFORE the inflight LoadOrStore and is required here
+	// because the goroutine below detaches to context.Background(), which
+	// would drop the flag.
+	if cache.Inert(customerCtx) {
+		return
+	}
 	// Per-cell dedup: only ONE populate goroutine inflight per cell.
 	// LoadOrStore returns (loaded=true) when the key was already
 	// present — another populate is in flight; this one returns

@@ -690,6 +690,19 @@ func RegisterClusterListKey(l1Key string) {
 	refresherSingleton().clusterListKeys.Store(l1Key, struct{}{})
 }
 
+// ClusterListKeyCountForTest returns how many L1 keys are registered in the
+// cluster_list tier. A read never constructs the refresher. Cross-package
+// test-only seam (#443 inertness arms); production code MUST NOT call it.
+func ClusterListKeyCountForTest() int {
+	r := refresherPeek()
+	if r == nil {
+		return 0
+	}
+	n := 0
+	r.clusterListKeys.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
 // EnqueueClusterListRefresh schedules an L1 re-resolve via the
 // HIGH-PRIORITY cluster_list tier. Used by cluster_list.go's cold-miss
 // async-populate path: a customer /call hits an unpopulated cluster_list

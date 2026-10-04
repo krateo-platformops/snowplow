@@ -179,6 +179,9 @@ func psBuildWatcher(t *testing.T, a psArm, extra ...runtime.Object) *dynamicfake
 		rGVR:            "RoleList",
 		psSecretsGVR:    "SecretList",
 		psConfigmapsGVR: "ConfigMapList",
+		// #443 inline arms: a GVR that is never informed in steady state, so
+		// an arm can prove an inert resolve does not register it.
+		in443PodsGVR: "PodList",
 	}
 
 	seed := []runtime.Object{
