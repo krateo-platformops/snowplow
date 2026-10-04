@@ -28,7 +28,10 @@
 //	   parameter are a re-hash, not a mint. Identity-FREE inputs (a class in
 //	   identityFreeClasses) must not call SetIdentity.
 //	R2 nothing but SetIdentity writes an identity dimension of a
-//	   ResolvedKeyInputs — no keyed literal element, no field assignment.
+//	   ResolvedKeyInputs — no keyed literal element, no field assignment or
+//	   ++/--; no IdentityClass field is edited outside packages cache and rbac
+//	   (a class reaches SetIdentity exactly as IdentityClassOf returned it);
+//	   and nothing takes the address of an identity field of either type.
 //	R3 one derivation: only rbac.IdentityClassOf reads the class sources
 //	   (SubjectBindingSetDigest, RBACSubGenForSubject), and every SetIdentity
 //	   call takes its class from it (directly, through a local, or through a
@@ -67,6 +70,7 @@ import (
 
 const (
 	keyInputsType = "ResolvedKeyInputs"
+	classType     = "IdentityClass"
 	computeKey    = "ComputeKey"
 	setIdentity   = "SetIdentity"
 	classOf       = "IdentityClassOf"
@@ -145,6 +149,7 @@ type finding struct {
 }
 
 type fnInfo struct {
+	pkg       string
 	name      string
 	decl      *ast.FuncDecl
 	recvType  string
@@ -152,6 +157,7 @@ type fnInfo struct {
 	callsSet  bool            // calls .SetIdentity(
 	calls     map[string]bool // simple callee names
 	kiVars    map[string]bool // locals / params typed ResolvedKeyInputs
+	icVars    map[string]bool // locals / params typed IdentityClass
 }
 
 type gate struct {
@@ -231,6 +237,7 @@ func (g *gate) run() {
 		for _, d := range f.Decls {
 			if fd, ok := d.(*ast.FuncDecl); ok && fd.Body != nil {
 				fi := g.collect(fd)
+				fi.pkg = f.Name.Name
 				g.funcs = append(g.funcs, fi)
 				g.byName[fi.name] = append(g.byName[fi.name], fi)
 			}
@@ -358,7 +365,7 @@ func (g *gate) r0() {
 // ── collection ──────────────────────────────────────────────────────────────
 
 func (g *gate) collect(fd *ast.FuncDecl) *fnInfo {
-	fi := &fnInfo{name: fd.Name.Name, decl: fd, calls: map[string]bool{}, kiVars: map[string]bool{}}
+	fi := &fnInfo{name: fd.Name.Name, decl: fd, calls: map[string]bool{}, kiVars: map[string]bool{}, icVars: map[string]bool{}}
 	if fd.Recv != nil && len(fd.Recv.List) > 0 {
 		fi.recvType = typeName(fd.Recv.List[0].Type)
 		for _, n := range fd.Recv.List[0].Names {
@@ -368,9 +375,12 @@ func (g *gate) collect(fd *ast.FuncDecl) *fnInfo {
 		}
 	}
 	for _, p := range fd.Type.Params.List {
-		if typeName(p.Type) == keyInputsType {
-			for _, n := range p.Names {
+		for _, n := range p.Names {
+			switch typeName(p.Type) {
+			case keyInputsType:
 				fi.kiVars[n.Name] = true
+			case classType:
+				fi.icVars[n.Name] = true
 			}
 		}
 	}
@@ -393,9 +403,15 @@ func (g *gate) collect(fd *ast.FuncDecl) *fnInfo {
 				fi.callsSet = true
 			}
 		case *ast.ValueSpec:
-			if x.Type != nil && typeName(x.Type) == keyInputsType {
-				for _, n := range x.Names {
+			if x.Type == nil {
+				break
+			}
+			for _, n := range x.Names {
+				switch typeName(x.Type) {
+				case keyInputsType:
 					fi.kiVars[n.Name] = true
+				case classType:
+					fi.icVars[n.Name] = true
 				}
 			}
 		}
@@ -539,16 +555,89 @@ func (g *gate) r2() {
 				}
 			case *ast.AssignStmt:
 				for _, l := range x.Lhs {
-					se, ok := l.(*ast.SelectorExpr)
-					if !ok || !g.dims[se.Sel.Name] || !g.isKeyInputs(fi, se.X) {
-						continue
-					}
-					g.add(x.Pos(), "R2", "%s assigns identity dimension %s directly; only SetIdentity may write it", fi.name, se.Sel.Name)
+					g.r2Write(fi, l, x.Pos())
+				}
+			case *ast.IncDecStmt:
+				g.r2Write(fi, x.X, x.Pos())
+			case *ast.UnaryExpr:
+				// &x.RBACSubGen hands out a pointer that writes past every rule
+				// above (`p := &in.RBACSubGen; *p = 0`). No production code needs
+				// the address of an identity field, so taking it is the violation.
+				se, ok := x.X.(*ast.SelectorExpr)
+				if x.Op != token.AND || !ok || !g.dims[se.Sel.Name] {
+					return true
+				}
+				if g.isKeyInputs(fi, se.X) || g.isIdentityClass(fi, se.X) {
+					g.add(x.Pos(), "R2", "%s takes the address of identity dimension %s; a pointer to it is an unchecked writer", fi.name, se.Sel.Name)
 				}
 			}
 			return true
 		})
 	}
+}
+
+// r2Write flags a write to an identity dimension through lhs: of a
+// ResolvedKeyInputs anywhere (only SetIdentity may write those), and of an
+// IdentityClass outside the packages that own it (cache defines it,
+// rbac.IdentityClassOf produces it). Editing a class between IdentityClassOf
+// and SetIdentity — `c := rbac.IdentityClassOf(ui); c.RBACSubGen = 0` — is
+// the #435 shape one step removed.
+func (g *gate) r2Write(fi *fnInfo, lhs ast.Expr, pos token.Pos) {
+	se, ok := lhs.(*ast.SelectorExpr)
+	if !ok || !g.dims[se.Sel.Name] {
+		return
+	}
+	switch {
+	case g.isKeyInputs(fi, se.X):
+		g.add(pos, "R2", "%s assigns identity dimension %s directly; only SetIdentity may write it", fi.name, se.Sel.Name)
+	case fi.pkg != "cache" && fi.pkg != "rbac" && g.isIdentityClass(fi, se.X):
+		g.add(pos, "R2", "%s edits field %s of an IdentityClass; a class must reach SetIdentity exactly as rbac.IdentityClassOf returned it", fi.name, se.Sel.Name)
+	}
+}
+
+// isIdentityClass reports whether e is (syntactically known to be) an
+// IdentityClass: a typed local / param, or a local assigned from
+// IdentityClassOf, from a ResolvedKeyInputs Class() read, or from an
+// IdentityClass literal.
+func (g *gate) isIdentityClass(fi *fnInfo, e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.StarExpr:
+		return g.isIdentityClass(fi, x.X)
+	case *ast.ParenExpr:
+		return g.isIdentityClass(fi, x.X)
+	case *ast.Ident:
+		if fi.icVars[x.Name] {
+			return true
+		}
+		found := false
+		ast.Inspect(fi.decl.Body, func(n ast.Node) bool {
+			as, ok := n.(*ast.AssignStmt)
+			if !ok || found {
+				return !found
+			}
+			for i, l := range as.Lhs {
+				if identName(l) != x.Name {
+					continue
+				}
+				r := as.Rhs[0]
+				if len(as.Rhs) == len(as.Lhs) {
+					r = as.Rhs[i]
+				}
+				if u, ok := r.(*ast.UnaryExpr); ok {
+					r = u.X
+				}
+				switch v := r.(type) {
+				case *ast.CompositeLit:
+					found = typeName(v.Type) == classType
+				case *ast.CallExpr:
+					found = calleeName(v) == classOf || calleeName(v) == "Class"
+				}
+			}
+			return !found
+		})
+		return found
+	}
+	return false
 }
 
 // isKeyInputs reports whether e is (syntactically known to be) a

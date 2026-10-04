@@ -2,7 +2,9 @@
 //
 // testdata/red is a miniature tree with the sources of truth intact (R0 passes)
 // and one site per rule shaped like the defect it exists for: an identity-bound
-// key hashed with no class (#435), hand-assembled identity fields (pre-#449), a
+// key hashed with no class (#435), hand-assembled identity fields (pre-#449),
+// an IdentityClass edited between IdentityClassOf and SetIdentity and pointers
+// to identity fields (reviewer-424 D3/D4), a
 // forged class (direct, forwarded, through a test seam), a second class
 // derivation outside rbac.IdentityClassOf, a reuse key without
 // the class (#432), an identity-free class given an identity, and an
@@ -23,16 +25,19 @@ func TestGate_FlagsRedFixture(t *testing.T) {
 	}
 	s := string(out)
 	mustFlag := map[string]string{
-		"R1 internal/app/sites.go:42": "identity-bound key hashed with no class (#435 shape)",
-		"R1 internal/app/sites.go:83": "identity-free class given an identity",
-		"R2 internal/app/sites.go:49": "identity dimension in a literal",
-		"R2 internal/app/sites.go:52": "identity dimension assigned directly",
-		"R3 internal/app/sites.go:59": "forged class",
-		"R3 internal/app/sites.go:65": "forged class through a forwarding builder",
-		"R3 internal/app/sites.go:70": "production call of the identity test seam",
-		"R3 internal/app/sites.go:88": "a second class derivation",
-		"R4 internal/app/sites.go:76": "reuse key without the class (#432 shape)",
-		"R5 internal/cache/key.go:66": "unregistered store",
+		"R1 internal/app/sites.go:42":  "identity-bound key hashed with no class (#435 shape)",
+		"R1 internal/app/sites.go:83":  "identity-free class given an identity",
+		"R2 internal/app/sites.go:49":  "identity dimension in a literal",
+		"R2 internal/app/sites.go:52":  "identity dimension assigned directly",
+		"R3 internal/app/sites.go:59":  "forged class",
+		"R3 internal/app/sites.go:65":  "forged class through a forwarding builder",
+		"R3 internal/app/sites.go:70":  "production call of the identity test seam",
+		"R2 internal/app/sites.go:90":  "IdentityClass field edited before SetIdentity (review D4)",
+		"R2 internal/app/sites.go:100": "address of a ResolvedKeyInputs identity field (review D3)",
+		"R2 internal/app/sites.go:108": "address of an IdentityClass field",
+		"R3 internal/app/sites.go:113": "a second class derivation",
+		"R4 internal/app/sites.go:76":  "reuse key without the class (#432 shape)",
+		"R5 internal/cache/key.go:66":  "unregistered store",
 	}
 	for site, what := range mustFlag {
 		if !strings.Contains(s, site+":") {

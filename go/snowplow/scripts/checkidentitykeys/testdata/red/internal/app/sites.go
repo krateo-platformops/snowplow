@@ -83,6 +83,31 @@ func badFreeWithIdentity(ui rbac.UserInfo) string {
 	return cache.ComputeKey(in) // BAD-R1-free
 }
 
+// BAD (R2, review D4): the #435 shape as an IdentityClass field write between
+// IdentityClassOf and SetIdentity.
+func badEditedClass(ui rbac.UserInfo, uid string) string {
+	c := rbac.IdentityClassOf(ui)
+	c.RBACSubGen = 0 // BAD-R2-classedit
+	in := cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Name: "ra"}
+	in.SetIdentity(uid, c)
+	return cache.ComputeKey(in)
+}
+
+// BAD (R2, review D3): a pointer to an identity field, written after SetIdentity.
+func badAddressOf(ui rbac.UserInfo, uid string) string {
+	in := cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Name: "ra"}
+	in.SetIdentity(uid, rbac.IdentityClassOf(ui))
+	p := &in.RBACSubGen // BAD-R2-addr
+	*p = 0
+	return cache.ComputeKey(in)
+}
+
+// BAD (R2): a pointer to an IdentityClass field.
+func badClassAddressOf(ui rbac.UserInfo) *string {
+	c := rbac.IdentityClassOf(ui)
+	return &c.SubjectBindingSet // BAD-R2-classaddr
+}
+
 // BAD (R3): a second class derivation, the shape #435's lagging copy had.
 func badOwnClass(ui rbac.UserInfo) string {
 	return rbac.SubjectBindingSetDigest(ui.Username, ui.Groups) // BAD-R3-own
