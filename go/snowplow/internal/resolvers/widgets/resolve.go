@@ -354,6 +354,11 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 	// the cross-namespace aggregate while the predicate still de-classified,
 	// the SA-maximal aggregate would land in the shared identity-free cell —
 	// reopening the cross-user leak task #69 closed. Keep both fail-soft.
+	// The same symmetry holds for resourcesRefsTemplate (resolveResourceRefs,
+	// its GetResourcesRefsTemplate read): on a read error the predicate
+	// de-classifies AND the resolver fans out NO template items, so a widget
+	// de-classified by an rrt accessor error never carries apiRef-fanned rows
+	// into the identity-free cell (#450 review).
 	wdt, err := GetWidgetDataTemplate(obj.Object)
 	if err != nil {
 		log.Warn("unable to get widgetDataTemplate", slog.Any("err", err))
