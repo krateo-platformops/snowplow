@@ -14,6 +14,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )
@@ -415,6 +416,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// unchanged). No-op (ctx unchanged) in production until an observability
 	// control turns the toggle on.
 	ctx = installShadowParityRESTAction(ctx, &cr)
+	// #443 part 2 — an inline resolve reports per-stage outcomes in a header
+	// (reason codes only), outside the body, so the body stays byte-identical
+	// to a stored resolve even when the draft's filter drops its error keys.
+	var outcomes *api.StageOutcomes
+	if inline {
+		ctx, outcomes = api.WithStageOutcomes(ctx)
+	}
 	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,
@@ -427,6 +435,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// stages are read as the caller (api.ProvenanceCallerSupplied).
 		Provenance: provenanceFor(inline),
 	})
+	if outcomes != nil {
+		wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
+	}
 	if err != nil {
 		log.Error("unable to resolve rest action",
 			slog.String("name", cr.GetName()),

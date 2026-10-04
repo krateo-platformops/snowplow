@@ -20,6 +20,10 @@ const (
 	HeaderRaw = "X-Snowplow-Raw"
 	// HeaderResolveSource is ResolveSourceRequestBody on an inline resolve.
 	HeaderResolveSource = "X-Snowplow-Resolve-Source"
+	// HeaderStageOutcomes carries an inline resolve's per-stage outcomes as
+	// compact JSON ([{"name","ok","reason"}], reason codes only), or
+	// {"truncated":true,"failed":N} above 4 KiB. Never on a stored resolve.
+	HeaderStageOutcomes = "X-Snowplow-Stage-Outcomes"
 
 	// ResolveSourceRequestBody is the HeaderResolveSource value of a resolve
 	// whose RESTAction came from the request body, not from the cluster.

@@ -536,6 +536,9 @@ const (
 	// part 2, set by the dispatchers package). Re-exported here so the CORS
 	// exposure and the header name have one source.
 	HeaderResolveSource = util.HeaderResolveSource
+	// HeaderStageOutcomes is the inline resolve's per-stage outcome header
+	// (#443 part 2, set by the dispatchers package).
+	HeaderStageOutcomes = util.HeaderStageOutcomes
 )
 
 // setCallEchoHeaders sets the #443 echo headers from the BUILT outbound URI,

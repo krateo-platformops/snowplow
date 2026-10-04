@@ -232,7 +232,11 @@ type resolveRun struct {
 	apistageEnabled bool                      // F1 content-keyed api-stage L1 gate (read once)
 	apistageStore   *cache.ResolvedCacheStore // nil when apistage disabled / store unavailable
 	stageErrSink    *cache.StageErrorSink     // nil on the request path (refresher-only)
-	pipTimingSink   *cache.PIPStageTimingSink // nil on the request path (PIP-seed-only)
+	// outcomes (#443 part 2) collects per-stage outcomes for the
+	// X-Snowplow-Stage-Outcomes header; non-nil only for the top-level
+	// caller-supplied (inline) resolve.
+	outcomes      *StageOutcomes
+	pipTimingSink *cache.PIPStageTimingSink // nil on the request path (PIP-seed-only)
 }
 
 // newResolveRun builds the per-call resolveRun. user is already resolved by
@@ -347,6 +351,7 @@ func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string
 	accumulateErrorKey(r.dict, errKey, accumVal)
 	mu.Unlock()
 	r.stageErrSink.Bump(id, bumpMsg)
+	r.outcomes.fail(id, stageReasonOf(accumVal))
 	if itemErr != nil {
 		itemErrs[i] = itemErr
 	}
@@ -665,12 +670,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// before any egress (no informer, no internal rest config, no discovery,
 	// no external fetch), so a draft can never mutate anything.
 	if verb := ptr.Deref(call.Verb, http.MethodGet); cache.Inert(gctx) && verb != http.MethodGet {
+		// Stable contract (#443): reason "StageNotExecuted" is the machine
+		// field; the message keeps its stable prefix/suffix.
 		msg := fmt.Sprintf("dry-run: stage %q verb %s is not executed", id, verb)
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
 		}
-		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, msg, msg, itemErr)
+		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey,
+			map[string]any{"reason": StageReasonNotExecuted, "message": msg}, msg, itemErr)
 		return nil
 	}
 	// Ship 0.30.121 R1-a — per-call verbose decision. `sc.ep` is shared
@@ -1818,13 +1826,21 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// per-stage mutable primitives stay loop-local (see the resolveRun
 	// concurrency note).
 	r := newResolveRun(ctx, opts, log, user)
+	if opts.Provenance == ProvenanceCallerSupplied {
+		r.outcomes = stageOutcomesFrom(ctx)
+		r.outcomes.register(names)
+	}
 	// Each api stage runs through runStage in topological order. runStage
 	// returns stop=true on a truncating exit (R-1 caller-cancel, R-2 endpoint
 	// err, R-3 g.Wait hard error) — the orchestrator then returns the
 	// (truncated) dict; stop=false advances to the next stage. runStage owns
 	// the recordStageTiming()-before-every-exit invariant internally.
 	for _, id := range names {
+		r.outcomes.ran(id)
 		if r.runStage(id, apiMap) {
+			// A truncating exit: this stage failed (its own item errors, if
+			// any, already carry a more specific reason).
+			r.outcomes.fail(id, StageReasonError)
 			return r.dict
 		}
 	}

@@ -92,7 +92,7 @@ func TestS443_Capabilities(t *testing.T) {
 		exposed := exposeList(hdr.Get("Access-Control-Expose-Headers"))
 		for _, want := range []string{
 			"X-Snowplow-Dry-Run", "X-Snowplow-Resolve-Source", "X-Snowplow-Raw",
-			"X-Snowplow-Field-Validation", "Warning",
+			"X-Snowplow-Field-Validation", "X-Snowplow-Stage-Outcomes", "Warning",
 			// the pre-#443 set must survive the change
 			"X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class", "Link",
 		} {
