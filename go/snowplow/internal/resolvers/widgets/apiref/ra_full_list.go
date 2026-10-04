@@ -137,7 +137,7 @@ func SeedFullListPerKeyKnownNonSliceable(ctx context.Context, gvr schema.GroupVe
 		return false // no identity / fail-closed "" → don't consult the shared cell
 	}
 	shape := seedFullListShape(gvr, namespace, name, ra)
-	sliceable, known := cache.SliceabilityLookup(raKey, shape)
+	sliceable, known := cache.SliceabilityLookupCtx(ctx, raKey, shape)
 	return known && !sliceable
 }
 
@@ -367,7 +367,7 @@ func raFullListServe(
 	offset := (page - 1) * perPage
 
 	// --- Fast path: known-sliceable verdict + cell hit -> Go-slice -------
-	sliceable, known := cache.SliceabilityLookup(raKey, shape)
+	sliceable, known := cache.SliceabilityLookupCtx(ctx, raKey, shape)
 	if known && !sliceable {
 		// This (RA × shape) was proven NOT cleanly sliceable. Always fall
 		// back — never a wrong result.
@@ -425,7 +425,9 @@ func raFullListServe(
 		// #406 — this widget's body now comes from the fresh resolve, not from a
 		// cached raKey version: it is no longer a consumer of an older one, so the
 		// raKey Put below must not remark it.
-		c.ForgetRAFullListConsumer(raKey, widgetL1Key)
+		if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
+			c.ForgetRAFullListConsumer(raKey, widgetL1Key)
+		}
 		full, rerr := resolveRA(fullCtx, 0, 0)
 		if rerr != nil {
 			return nil, false, rerr
@@ -442,7 +444,9 @@ func raFullListServe(
 		// edge to invalidate the cell). Load-bearing surface #4 — without this
 		// the external aggregate would be cached + served stale across pages.
 		if extSink := cache.ExternalTouchedSinkFromContext(fullCtx); extSink.Count() > 0 {
-			cache.BumpExternalSkippedPut()
+			if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
+				cache.BumpExternalSkippedPut()
+			}
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
@@ -482,7 +486,9 @@ func raFullListServe(
 	// --- First sight of (RA × shape): byte-VERIFY, then memoise ---------
 	// 1. Resolve UNPAGINATED -> full F (deps scoped to the RAFullList key).
 	// #406 — as on the repopulate branch: a fresh-resolve body is no consumer.
-	c.ForgetRAFullListConsumer(raKey, widgetL1Key)
+	if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
+		c.ForgetRAFullListConsumer(raKey, widgetL1Key)
+	}
 	full, err := resolveRA(fullCtx, 0, 0)
 	if err != nil {
 		return nil, false, err
@@ -511,7 +517,9 @@ func raFullListServe(
 	// (the exact defect this proposal kills). Checked AFTER both resolves so
 	// the sink reflects either one touching the external fetch.
 	if extSink := cache.ExternalTouchedSinkFromContext(fullCtx); extSink.Count() > 0 {
-		cache.BumpExternalSkippedPut()
+		if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
+			cache.BumpExternalSkippedPut()
+		}
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
 	}
@@ -568,7 +576,7 @@ func raFullListServe(
 	// (e.g. compositions-page-datagrid) instead of by the raKey/sliceShape
 	// sha256 hashes alone. The labels are READ-SIDE ONLY (they do not change
 	// the memo key) — see RecordSliceabilityWithLabels.
-	cache.RecordSliceabilityClassified(raKey, shape, verdict, permanent, cache.SliceabilityLabels{
+	cache.RecordSliceabilityClassifiedCtx(ctx, raKey, shape, verdict, permanent, cache.SliceabilityLabels{
 		CallerClass:     raFullListCallerClass,
 		CallerGroup:     gvr.Group,
 		CallerVersion:   gvr.Version,

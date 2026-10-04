@@ -25,11 +25,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// InertHeader is set on an HTTP self-loopback /call made by an inert resolve,
-// so the next hop is inert too. It is honoured only on a trusted self-loopback
-// (a snowplow-validated JWT arriving on the URL_SELF host), exactly like
-// NestedDepthHeader and ResolveAncestorsHeader, and is never sent to an
-// external host. A caller forging it affects only their own request.
+// InertHeader is set on EVERY egress of an inert resolve, so a snowplow hop
+// reached by any hostname is inert too. It is honoured on any request with a
+// snowplow-validated identity: it can only make that one request more
+// restrictive, so a caller forging it affects only their own request.
 const InertHeader = "X-Snowplow-Inert"
 
 type inertCtxKey struct{}

@@ -550,6 +550,9 @@ func TestS443_Inline(t *testing.T) {
 	})
 
 	t.Run("c5_SelfLoopbackIngest", func(t *testing.T) {
+		// The header is honoured on any request with a validated identity,
+		// whichever host it arrived on (an alias included); without it the
+		// same request fills L1 normally (the control).
 		f := in443Setup(t)
 		SetSelfLoopbackHost("http://snowplow.self.example:8081")
 		t.Cleanup(func() { SetSelfLoopbackHost("") })
@@ -570,18 +573,84 @@ func TestS443_Inline(t *testing.T) {
 		}
 		store := cache.ResolvedCache()
 		before := len(store.KeysForTest())
-		if rec := hop("snowplow.self.example:8081", true); rec.Code != http.StatusOK {
-			t.Fatalf("trusted hop: code=%d", rec.Code)
+		for _, host := range []string{"snowplow.self.example:8081", "snowplow-alias.example:8081"} {
+			if rec := hop(host, true); rec.Code != http.StatusOK {
+				t.Fatalf("hop via %s: code=%d", host, rec.Code)
+			}
+			if got := len(store.KeysForTest()); got != before {
+				t.Errorf("a hop via %s carrying %s filled L1 (%d → %d keys); it must be inert", host, cache.InertHeader, before, got)
+			}
 		}
-		if got := len(store.KeysForTest()); got != before {
-			t.Errorf("a TRUSTED self-loopback hop carrying %s filled L1 (%d → %d keys); it must be inert", cache.InertHeader, before, got)
-		}
-		// Untrusted: the header arrives on another host → ignored → a normal fill.
-		if rec := hop("evil.example:8081", true); rec.Code != http.StatusOK {
-			t.Fatalf("untrusted hop: code=%d", rec.Code)
+		// Control: the same hop without the header fills L1.
+		if rec := hop("snowplow-alias.example:8081", false); rec.Code != http.StatusOK {
+			t.Fatalf("control hop: code=%d", rec.Code)
 		}
 		if got := len(store.KeysForTest()); got == before {
-			t.Errorf("an UNTRUSTED request carrying %s was treated as inert (no L1 fill); the header must be ignored", cache.InertHeader)
+			t.Errorf("CONTROL: a hop without %s did not fill L1 — the arm cannot fail", cache.InertHeader)
+		}
+	})
+
+	t.Run("c5_AliasLoopbackNoWriteStage", func(t *testing.T) {
+		// reviewer-424 C4: an inert draft whose stage reaches snowplow through
+		// a hostname ALIAS (not the configured self host) must make that hop
+		// inert too, so the STORED RESTAction it serves cannot execute its
+		// write stage. Control: the same outer spec resolved STORED (not
+		// inert) does reach the inner write stage.
+		f := in443Setup(t)
+		const innerName = "inner-writer-443"
+		inner := in443RA(innerName, "", map[string]any{"name": "write", "verb": "POST", "continueOnError": true,
+			"path": "/api/v1/namespaces/" + psTargetNS + "/configmaps", "payload": `{"metadata":{"name":"evil-443"}}`})
+		var posts atomic.Int64
+		f.extra["POST /api/v1/namespaces/"+psTargetNS+"/configmaps"] = func(w http.ResponseWriter, r *http.Request) {
+			posts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"kind":"ConfigMap"}`))
+		}
+		// The "alias" snowplow: the real RESTAction handler behind a stand-in
+		// for the UserConfig middleware (identity + the caller's endpoint).
+		alias := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r = r.WithContext(in443Ctx(f, psAlice))
+			(&restActionHandler{authnNS: psAuthnNS, saRC: &rest.Config{Host: f.srv.URL}}).ServeHTTP(w, r)
+		}))
+		defer alias.Close()
+		// The caller-readable endpointRef the outer stage dials through.
+		f.extra["GET /api/v1/namespaces/"+psAuthnNS+"/secrets/alias-ep"] = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"Secret","metadata":{"name":"alias-ep","namespace":"` + psAuthnNS +
+				`"},"data":{"server-url":"` + b64(alias.URL) + `","token":"` + b64("tok-"+psAlice) + `"}}`))
+		}
+		outer := in443RA(psRAName, "", map[string]any{"name": "hop", "continueOnError": true,
+			"endpointRef": map[string]any{"name": "alias-ep", "namespace": psAuthnNS},
+			"path":        "/call?apiVersion=" + h1RAGVR.Group + "/" + h1RAGVR.Version + "&resource=restactions&namespace=" + h1NS + "&name=" + innerName})
+		innerCR := &unstructured.Unstructured{Object: inner}
+		outerCR := &unstructured.Unstructured{Object: outer}
+		restore := setFetchObjectForTest(func(req *http.Request) objects.Result {
+			if req.URL.Query().Get("name") == innerName {
+				return objects.Result{GVR: h1RAGVR, Unstructured: innerCR.DeepCopy()}
+			}
+			if _, ok := util.InlineObject(req.Context()); ok {
+				return fetchObject(req)
+			}
+			return objects.Result{GVR: h1RAGVR, Unstructured: outerCR.DeepCopy()}
+		})
+		defer restore()
+
+		rec := serveInline(t, f, in443Ctx(f, psAlice), outer)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("inline outer: code=%d body=%s", rec.Code, psTrunc(rec.Body.String(), 400))
+		}
+		if n := posts.Load(); n != 0 {
+			t.Fatalf("a dry-run draft executed a STORED RESTAction's write stage through an alias loopback (%d POST)", n)
+		}
+		if !strings.Contains(rec.Body.String(), "is not executed") {
+			t.Errorf("the alias hop's write stage was not refused as a dry run: %s", psTrunc(rec.Body.String(), 600))
+		}
+		// Control: the same outer resolved STORED reaches the inner write stage.
+		ctl := httptest.NewRecorder()
+		(&restActionHandler{authnNS: psAuthnNS, saRC: &rest.Config{Host: f.srv.URL}}).ServeHTTP(ctl,
+			httptest.NewRequest(http.MethodGet, "/call?name="+psRAName, nil).WithContext(in443Ctx(f, psAlice)))
+		if posts.Load() == 0 {
+			t.Fatalf("CONTROL: the stored outer did not reach the inner write stage — the arm cannot fail (body=%s)", psTrunc(ctl.Body.String(), 400))
 		}
 	})
 

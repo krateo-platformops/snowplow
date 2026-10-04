@@ -1554,13 +1554,6 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 						stageHeaders = append(stageHeaders,
 							fmt.Sprintf("%s: %s", cache.ResolveAncestorsHeader, anc))
 					}
-					// #443 (j) egress — an inert (dry-run) resolve makes the next
-					// self-loopback hop inert too. Self-host arm only: the header
-					// is never sent to an external host.
-					if cache.Inert(r.ctx) {
-						stageHeaders = append(stageHeaders,
-							fmt.Sprintf("%s: 1", cache.InertHeader))
-					}
 				}
 
 				local := *apiCall
@@ -1568,6 +1561,21 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 				apiCall = &local
 			}
 		}
+	}
+	// #443 (j) egress — EVERY egress of an inert (dry-run) resolve carries
+	// X-Snowplow-Inert: 1, not only a recognised self-host loopback. A snowplow
+	// reached through any hostname alias (a short/FQDN Service name, an
+	// ingress) then resolves the hop inert as well, so a stored RESTAction it
+	// serves cannot execute a write stage on behalf of a dry run. To any other
+	// server the header is inert data. Stage-local copy: the CR's own header
+	// slice is never written.
+	if cache.Inert(r.ctx) {
+		hdrs := make([]string, 0, len(apiCall.Headers)+1)
+		hdrs = append(hdrs, apiCall.Headers...)
+		hdrs = append(hdrs, fmt.Sprintf("%s: 1", cache.InertHeader))
+		local := *apiCall
+		local.Headers = hdrs
+		apiCall = &local
 	}
 	// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
 	// is the single largest transient-memory consumer (~1.94 GiB
@@ -1778,7 +1786,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 	if opts.RC == nil {
 		var err error
-		opts.RC, err = rest.InClusterConfig()
+		opts.RC, err = inClusterConfigFn()
 		if err != nil {
 			return map[string]any{}
 		}
@@ -1880,6 +1888,20 @@ var discoverGroupResourcesFn = cache.DiscoverGroupResources
 // (discovery_lookup.go:151) — the established resolveOnceFn/nestedCallResolver
 // var-seam idiom.
 var serviceAccountEndpointFn = dynamic.ServiceAccountEndpoint
+
+// inClusterConfigFn is the indirection over rest.InClusterConfig used when a
+// resolve has no RC (a nested in-process resolve on a live request). Out of
+// cluster it fails and the resolve is empty; SetInClusterConfigForTest lets a
+// hermetic arm (#443 e4) run nested stages against a fake apiserver.
+var inClusterConfigFn = rest.InClusterConfig
+
+// SetInClusterConfigForTest swaps inClusterConfigFn and returns a restore
+// func. TEST-ONLY: production code MUST NOT call it.
+func SetInClusterConfigForTest(fn func() (*rest.Config, error)) func() {
+	prev := inClusterConfigFn
+	inClusterConfigFn = fn
+	return func() { inClusterConfigFn = prev }
+}
 
 // lazyRegisterInnerCallPaths walks the per-stage RequestOptions slice
 // (one entry per iterator dispatch — the iterator + non-iterator paths

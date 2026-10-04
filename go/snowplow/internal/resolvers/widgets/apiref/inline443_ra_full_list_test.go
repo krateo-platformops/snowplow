@@ -13,6 +13,7 @@ package apiref
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -80,4 +81,35 @@ func TestS443_Inline_c4_RAFullList(t *testing.T) {
 			t.Fatal("CONTROL: a stored serve did not store the cold cell — the arm cannot fail")
 		}
 	})
+}
+
+// TestS443_Inline_c4_FirstSightNoVerdict — reviewer-424 probe I1, adopted
+// (C3): an inert (dry-run) raFullList FIRST SIGHT records no sliceability
+// verdict (RecordSliceabilityClassifiedCtx refuses under the flag). The
+// control — a stored first sight of another RA — does record one.
+func TestS443_Inline_c4_FirstSightNoVerdict(t *testing.T) {
+	_ = r435Base(t)
+	const ns = "krateo-system"
+	// The sliceability memo is process-global: a unique name per run keeps
+	// the control meaningful under -count>1.
+	name := fmt.Sprintf("inline443-first-sight-%d", time.Now().UnixNano())
+	alice := f6CtxWithUser(t, "alice-423", []string{"portal-423"})
+	var calls atomic.Int64
+	rows := k423PerUserRows(t, &calls)
+	count := func() int { return len(cache.SliceabilityMemoSnapshot()) }
+
+	before := count()
+	if _, _, err := raFullListServe(cache.WithInert(alice), gvr(), ns, name, ra(raSliceJQ), 10, 1, nil, rows); err != nil {
+		t.Fatalf("inert serve: %v", err)
+	}
+	afterInert := count()
+	if _, _, err := raFullListServe(alice, gvr(), ns, name+"-control", ra(raSliceJQ), 10, 1, nil, rows); err != nil {
+		t.Fatalf("control serve: %v", err)
+	}
+	if count() <= afterInert {
+		t.Fatalf("CONTROL: a stored first sight must record a verdict, else the arm cannot fail")
+	}
+	if afterInert != before {
+		t.Fatalf("an inert first sight recorded a sliceability verdict (%d → %d)", before, afterInert)
+	}
 }

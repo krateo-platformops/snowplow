@@ -21,6 +21,7 @@
 package cache
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -549,6 +550,13 @@ func memoKey(raFullListKey, sliceShape string) string {
 // The TTL gate does NOT mutate the entry — invalidate (via the async
 // worker) Delete()s it, and the next /call's record() repopulates it.
 func (m *sliceabilityMemo) lookup(raFullListKey, sliceShape string) (sliceable, known bool) {
+	return m.lookupWith(raFullListKey, sliceShape, true)
+}
+
+// lookupWith is lookup with the aged-verdict side effects (the async
+// re-verify: SubmitSliceabilityInvalidate + EnqueueRefresh) made optional.
+// #443 — an inert (dry-run) lookup reads the verdict and schedules nothing.
+func (m *sliceabilityMemo) lookupWith(raFullListKey, sliceShape string, sideEffects bool) (sliceable, known bool) {
 	v, ok := m.verdicts.Load(memoKey(raFullListKey, sliceShape))
 	if !ok {
 		// #42 FIX-A — no PER-KEY verdict for this (raKey × shape) yet. Before
@@ -579,7 +587,7 @@ func (m *sliceabilityMemo) lookup(raFullListKey, sliceShape string) (sliceable, 
 		now := currentNowUnix()
 		ttl := sliceabilityReverifyRateFloorSeconds()
 		cap := sliceabilityRetryCap(false)
-		if (now-e.lastUpdatedAtUnix) > ttl && int(e.retryCount) < cap {
+		if sideEffects && (now-e.lastUpdatedAtUnix) > ttl && int(e.retryCount) < cap {
 			SubmitSliceabilityInvalidate(raFullListKey)
 			EnqueueRefresh(raFullListKey)
 		}
@@ -751,6 +759,13 @@ func SliceabilityLookup(raFullListKey, sliceShape string) (sliceable, known bool
 	return raSliceabilityMemo.lookup(raFullListKey, sliceShape)
 }
 
+// SliceabilityLookupCtx is the resolve-path form of SliceabilityLookup
+// (#443): under the inert (dry-run) flag it returns the verdict but schedules
+// no re-verify (no SubmitSliceabilityInvalidate, no EnqueueRefresh).
+func SliceabilityLookupCtx(ctx context.Context, raFullListKey, sliceShape string) (sliceable, known bool) {
+	return raSliceabilityMemo.lookupWith(raFullListKey, sliceShape, !Inert(ctx))
+}
+
 // SliceabilityShapeKnownNegative reports whether the given sliceShape has been
 // recorded structurally non-sliceable (Class C, false+permanent) under ANY
 // raKey — the #42 FIX-A shape-level negative set. Identity-free by
@@ -797,6 +812,16 @@ func RecordSliceabilityWithLabels(raFullListKey, sliceShape string, sliceable bo
 // recorded permanent=true, a later record() with permanent=false does NOT
 // un-permanent it (see record()).
 func RecordSliceabilityClassified(raFullListKey, sliceShape string, sliceable, permanent bool, labels SliceabilityLabels) {
+	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable, permanent, labels)
+}
+
+// RecordSliceabilityClassifiedCtx is the resolve-path form of
+// RecordSliceabilityClassified (#443): an inert (dry-run) resolve records no
+// verdict.
+func RecordSliceabilityClassifiedCtx(ctx context.Context, raFullListKey, sliceShape string, sliceable, permanent bool, labels SliceabilityLabels) {
+	if Inert(ctx) {
+		return
+	}
 	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable, permanent, labels)
 }
 
