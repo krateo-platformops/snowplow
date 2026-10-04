@@ -319,6 +319,17 @@ type ResolvedEntry struct {
 	// Written only under mu before the entry is readable; never mutated after.
 	contentVersion uint64
 
+	// recentHitters — #444: the last few DISTINCT identities (username + groups,
+	// nothing else) that were served this cell on a customer hit, most recent
+	// first, at most recentHittersCap. The refresher draws a replacement
+	// representative from them when the recorded one has drifted out of the
+	// cell's RBAC class (every candidate is re-verified against the key's class
+	// before use, so a stale tuple can never be promoted). In-memory only: never
+	// logged, never exported, never part of ResolvedEntryMeta (#262 redaction
+	// rules). Copy-on-write behind an atomic pointer, so noting a hit takes no
+	// store lock; putCoreLocked carries it across a replace-in-place.
+	recentHitters atomic.Pointer[[]HitterIdentity]
+
 	// TTLOverride — R1 Layer 2 (#36) bounded-staleness backstop. When > 0,
 	// THIS entry expires after TTLOverride instead of the store's standard
 	// ttl. Set to the short CATALOG_UNSERVABLE_TTL_SECONDS when an apistage
@@ -675,6 +686,10 @@ type ResolvedCacheStore struct {
 	evictMaxAgeTotal atomic.Uint64 // 1.12.6 C5: evictions past maxEntryAge (Get-lazy + #248 reaper)
 	evictDeleteTotal atomic.Uint64 // 0.30.8: DELETE-event-driven evictions
 	storeTotal       atomic.Uint64
+	// #444: identity-bound cells the refresher evicted because no in-class
+	// representative could be found to refresh them (a cold, correct refill
+	// instead of a stale cell until the TTL).
+	evictNoRepresentativeTotal atomic.Uint64
 
 	// #248 — resident cells carrying a live refreshSuppressed marker, recomputed
 	// on every reaper walk (startResolvedCacheSummary tick). This is a GAUGE, not
@@ -1728,6 +1743,11 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		if !freshMint && old.entry != nil && !old.entry.BornAt.IsZero() {
 			entry.BornAt = old.entry.BornAt
 		}
+		// #444 — the recent hitters belong to the KEY too: a refresh re-Put must
+		// not forget who the cell is served to (they are its representative pool).
+		if old.entry != nil && old.entry != entry && entry.recentHitters.Load() == nil {
+			entry.recentHitters.Store(old.entry.recentHitters.Load())
+		}
 		// freshMint re-mint (#258/#378): skip the inherit → entry.BornAt stays the
 		// fresh CreatedAt stamped in putPreamble → the replace-in-place is a FRESH
 		// birth (resets the max-age clock) without evicting first (no cold window).
@@ -1910,7 +1930,9 @@ type ResolvedCacheStats struct {
 	EvictLRUTotal    uint64
 	EvictTTLTotal    uint64
 	EvictMaxAgeTotal uint64 // 1.12.6 C5: evicted past RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS (Get-lazy + #248 reaper)
-	EvictDeleteTotal uint64 // 0.30.8: DELETE-event-driven evictions
+	// #444: evicted by the refresher because no in-class representative was found.
+	EvictNoRepresentativeTotal uint64
+	EvictDeleteTotal           uint64 // 0.30.8: DELETE-event-driven evictions
 
 	// #248 — resident-suppressed gauge (see suppressedResidentGauge). Non-zero
 	// DURING the UAF-decline-freeze; distinguishes decline-frozen from
@@ -1986,33 +2008,34 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 	maxResidentBytes := c.maxResidentBytes
 	c.mu.Unlock()
 	return ResolvedCacheStats{
-		Entries:                 entries,
-		Bytes:                   bytes,
-		MaxEntries:              c.maxEntries,
-		MaxBytes:                c.maxBytes,
-		HitTotal:                c.hitTotal.Load(),
-		MissTotal:               c.missTotal.Load(),
-		StoreTotal:              c.storeTotal.Load(),
-		EvictLRUTotal:           c.evictLRUTotal.Load(),
-		EvictTTLTotal:           c.evictTTLTotal.Load(),
-		EvictMaxAgeTotal:        c.evictMaxAgeTotal.Load(),
-		EvictDeleteTotal:        c.evictDeleteTotal.Load(),
-		SuppressedResident:      c.suppressedResidentGauge.Load(),
-		WarmPastMaxAge:          c.warmPastMaxAgeGauge.Load(),
-		WarmSeeded:              c.warmSeededGauge.Load(),
-		WarmLastRead:            c.warmLastReadGauge.Load(),
-		ProactiveRefreshTotal:   c.proactiveRefreshTotal.Load(),
-		ApistageStoreTotal:      c.apistageStoreTotal.Load(),
-		ApistageEvictTotal:      c.apistageEvictTotal.Load(),
-		WidgetContentStoreTotal: c.widgetContentStoreTotal.Load(),
-		WidgetContentEvictTotal: c.widgetContentEvictTotal.Load(),
-		RAFullListStoreTotal:    c.raFullListStoreTotal.Load(),
-		RAFullListEvictTotal:    c.raFullListEvictTotal.Load(),
-		ResidentEntries:         residentEntries,
-		ResidentBytes:           residentBytes,
-		MaxResidentBytes:        maxResidentBytes,
-		ResidentPinTotal:        c.residentPinTotal.Load(),
-		ResidentDemoteTotal:     c.residentDemoteTotal.Load(),
+		Entries:                    entries,
+		Bytes:                      bytes,
+		MaxEntries:                 c.maxEntries,
+		MaxBytes:                   c.maxBytes,
+		HitTotal:                   c.hitTotal.Load(),
+		MissTotal:                  c.missTotal.Load(),
+		StoreTotal:                 c.storeTotal.Load(),
+		EvictLRUTotal:              c.evictLRUTotal.Load(),
+		EvictTTLTotal:              c.evictTTLTotal.Load(),
+		EvictMaxAgeTotal:           c.evictMaxAgeTotal.Load(),
+		EvictNoRepresentativeTotal: c.evictNoRepresentativeTotal.Load(),
+		EvictDeleteTotal:           c.evictDeleteTotal.Load(),
+		SuppressedResident:         c.suppressedResidentGauge.Load(),
+		WarmPastMaxAge:             c.warmPastMaxAgeGauge.Load(),
+		WarmSeeded:                 c.warmSeededGauge.Load(),
+		WarmLastRead:               c.warmLastReadGauge.Load(),
+		ProactiveRefreshTotal:      c.proactiveRefreshTotal.Load(),
+		ApistageStoreTotal:         c.apistageStoreTotal.Load(),
+		ApistageEvictTotal:         c.apistageEvictTotal.Load(),
+		WidgetContentStoreTotal:    c.widgetContentStoreTotal.Load(),
+		WidgetContentEvictTotal:    c.widgetContentEvictTotal.Load(),
+		RAFullListStoreTotal:       c.raFullListStoreTotal.Load(),
+		RAFullListEvictTotal:       c.raFullListEvictTotal.Load(),
+		ResidentEntries:            residentEntries,
+		ResidentBytes:              residentBytes,
+		MaxResidentBytes:           maxResidentBytes,
+		ResidentPinTotal:           c.residentPinTotal.Load(),
+		ResidentDemoteTotal:        c.residentDemoteTotal.Load(),
 
 		PutRefusedGenerationMovedTotal: c.putRefusedGenerationMovedTotal.Load(),
 
@@ -2939,6 +2962,33 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 		c.proactiveRefreshTotal.Add(1)
 	}
 	return reaped
+}
+
+// EvictUnrefreshable is the #444 terminal state for an identity-bound cell the
+// refresher cannot refresh: its representative drifted out of the key's RBAC
+// class and no in-class replacement was found. A cold, correct refill beats
+// serving the cell stale until its TTL (delete-only invalidation allows it).
+//
+// It evicts ONLY if the live entry is still `want` — the entry the refresher
+// decided on. A customer Put after that decision carries a fresh, in-class
+// representative and must survive; the generation alone cannot tell (a
+// replace-in-place keeps it). Goes through removeElementLocked (dep edges
+// stripped, suppression marker cleared, generation tombstoned so an in-flight
+// PutIfGen of the old generation is refused), NOT deleteForDep: it must not move
+// evict_delete_total, the informer-DELETE discriminator. Returns true iff evicted.
+func (c *ResolvedCacheStore) EvictUnrefreshable(key string, want *ResolvedEntry) bool {
+	if c == nil || want == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.index[key]
+	if !ok || el.Value.(*lruItem).entry != want {
+		return false
+	}
+	c.removeElementLocked(el)
+	c.evictNoRepresentativeTotal.Add(1)
+	return true
 }
 
 // reapOneMaxAgeSuppressed re-validates under c.mu — the entry may have been read,

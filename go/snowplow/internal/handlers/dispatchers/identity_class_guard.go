@@ -33,7 +33,9 @@ package dispatchers
 
 import (
 	"context"
+	"errors"
 	"expvar"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -117,4 +119,93 @@ func identityClassDriftCtx(ctx context.Context, inputs *cache.ResolvedKeyInputs)
 		return "no_identity"
 	}
 	return identityClassDrift(ctx, inputs, ui.Username, ui.Groups)
+}
+
+// errRepresentativeDriftedMidRefresh is returned when the representative's RBAC
+// class moved DURING a refresh re-resolve (#444). The body is not written; the
+// error is retryable, so the refresher requeues the key and the next attempt
+// re-picks an in-class representative (repickRepresentative) or evicts. A spent
+// requeue budget drops → evicts at the drop point. Never a suppress-to-TTL.
+var errRepresentativeDriftedMidRefresh = errors.New("representative's RBAC class moved during the re-resolve")
+
+// Where the refresher's representative came from (#444).
+const (
+	repSourceRecorded = "recorded"
+	repSourceGroup    = "group"
+	repSourceHitter   = "hitter"
+)
+
+// repickRepresentative finds a replacement representative for an identity-bound
+// cell whose recorded representative drifted out of the key's RBAC class (#444).
+// Candidates, in order, each accepted only if identityClassDrift says it is in
+// the class NOW (the sub-gen is monotone, so an identity that has left a class
+// can never be promoted back into it):
+//
+//	(a) the canonical group representative ("", RepresentativeGroups ∪
+//	    system:authenticated) — the seed's own representative shape
+//	    (withCohortSeedContext); covers every group-only class with no per-user
+//	    tracking;
+//	(b) the cell's recent hitters (ResolvedEntry.RecentHitters, most recent
+//	    first), skipping the drifted representative itself.
+//
+// ok=false when none is in the class: the caller evicts. The returned identity
+// is never logged (#262 redaction rules).
+func repickRepresentative(ctx context.Context, inputs *cache.ResolvedKeyInputs, prior *cache.ResolvedEntry) (username string, groups []string, source string, ok bool) {
+	if inputs == nil {
+		return "", nil, "", false
+	}
+	g := rbac.WithAuthenticatedGroup(inputs.RepresentativeGroups)
+	if identityClassDrift(ctx, inputs, "", g) == "" {
+		return "", g, repSourceGroup, true
+	}
+	for _, h := range prior.RecentHitters() {
+		if h.Username == inputs.RepresentativeUsername && slices.Equal(h.Groups, inputs.RepresentativeGroups) {
+			continue
+		}
+		if identityClassDrift(ctx, inputs, h.Username, h.Groups) == "" {
+			return h.Username, slices.Clone(h.Groups), repSourceHitter, true
+		}
+	}
+	return "", nil, "", false
+}
+
+// representativeRepick counts the refresher's #444 outcomes by "group" /
+// "hitter" / "evicted" (/debug/vars snowplow_l1_representative_repick_total).
+// CFG-1: the key is published only cache-on (no L1 to refresh otherwise).
+var representativeRepick sync.Map // outcome -> *atomic.Int64
+
+func init() {
+	if cache.Disabled() {
+		return
+	}
+	expvar.Publish("snowplow_l1_representative_repick_total", expvar.Func(func() any {
+		out := map[string]int64{}
+		representativeRepick.Range(func(k, v any) bool {
+			out[k.(string)] = v.(*atomic.Int64).Load()
+			return true
+		})
+		return out
+	}))
+}
+
+func noteRepresentativeRepick(outcome string) {
+	v, _ := representativeRepick.LoadOrStore(outcome, &atomic.Int64{})
+	v.(*atomic.Int64).Add(1)
+}
+
+// representativeRepickForTest reads one outcome counter.
+func representativeRepickForTest(outcome string) int64 {
+	if v, ok := representativeRepick.Load(outcome); ok {
+		return v.(*atomic.Int64).Load()
+	}
+	return 0
+}
+
+// refreshLogUser is the representative as it may appear in a refresher log
+// line: a promoted recent hitter is redacted (#444, #262 redaction rules).
+func refreshLogUser(user, source string) string {
+	if source == repSourceHitter {
+		return "<recent-hitter>"
+	}
+	return user
 }

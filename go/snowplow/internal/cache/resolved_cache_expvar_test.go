@@ -73,12 +73,13 @@ func TestResolvedCacheStatsByStat_ReportsLiveStore(t *testing.T) {
 		"entries", "bytes", "max_entries", "max_bytes",
 		"hit_total", "miss_total", "store_total",
 		"evict_lru_total", "evict_ttl_total", "evict_delete_total",
-		"evict_max_age_total",     // 1.12.6 C5 bounded lifetime
-		"suppressed_resident",     // #345 — #248's resident-suppressed validation gauge
-		"warm_past_max_age",       // #315 C4 — warm-past-cap at-risk gauge
-		"warm_seeded",             // #376 — warm working set split by source: boot-prewarmed
-		"warm_lastread",           // #376 — warm working set split by source: read-within-TTL (not seeded)
-		"proactive_refresh_total", // #316 — read-independent refresh pass enqueues
+		"evict_max_age_total",           // 1.12.6 C5 bounded lifetime
+		"evict_no_representative_total", // #444 refresher eviction: no in-class representative
+		"suppressed_resident",           // #345 — #248's resident-suppressed validation gauge
+		"warm_past_max_age",             // #315 C4 — warm-past-cap at-risk gauge
+		"warm_seeded",                   // #376 — warm working set split by source: boot-prewarmed
+		"warm_lastread",                 // #376 — warm working set split by source: read-within-TTL (not seeded)
+		"proactive_refresh_total",       // #316 — read-independent refresh pass enqueues
 		"resident_entries", "resident_bytes", "max_resident_bytes",
 		"resident_pin_total", "resident_demote_total",
 		"apistage_store_total", "apistage_evict_total",

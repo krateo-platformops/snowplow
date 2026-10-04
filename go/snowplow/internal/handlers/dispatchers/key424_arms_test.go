@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -543,8 +544,9 @@ func TestKey424_RefresherSubGenOnlyDrift_RoleEditMidResolve(t *testing.T) {
 		t.Fatalf("PRE: a role edit must not change the binding set")
 	}
 	before := identityClassDriftDeclinedForTest("refresher", "rbac_subgen")
-	if err := resolveAndPopulateL1(context.Background(), *in, nil, nil); err != nil {
-		t.Fatalf("refresh: %v", err)
+	// #444: a mid-resolve drift is a retryable error (requeue → re-pick), not a suppress.
+	if err := resolveAndPopulateL1(context.Background(), *in, nil, nil); !errors.Is(err, errRepresentativeDriftedMidRefresh) {
+		t.Fatalf("refresh: want errRepresentativeDriftedMidRefresh, got %v", err)
 	}
 	if rbac.SubjectBindingSetDigest(psCarol, psGroups(a)) != in.SubjectBindingSet {
 		t.Fatalf("PRE: the binding set must still be unchanged after the edit (sub-gen-only drift)")

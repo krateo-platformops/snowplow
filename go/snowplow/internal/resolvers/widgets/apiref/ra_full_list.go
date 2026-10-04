@@ -383,6 +383,8 @@ func raFullListServe(
 	}
 	if known && sliceable {
 		if entry, ok := c.Get(raKey); ok {
+			// #444 — the requester joins the cell's representative pool.
+			entry.NoteHitter(keyInputs.RepresentativeUsername, keyInputs.RepresentativeGroups)
 			full, derr := decodeRAFullList(entry.RawJSON)
 			if derr == nil {
 				if sliced, sok := cache.GoSliceFullList(full, offset, perPage); sok {

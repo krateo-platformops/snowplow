@@ -111,10 +111,11 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		"store_total": int64(s.StoreTotal),
 		// why entries leave — lru means the budget is the binding
 		// constraint, ttl means staleness, delete means invalidation
-		"evict_lru_total":     int64(s.EvictLRUTotal),
-		"evict_ttl_total":     int64(s.EvictTTLTotal),
-		"evict_max_age_total": int64(s.EvictMaxAgeTotal), // 1.12.6 C5 bounded lifetime
-		"evict_delete_total":  int64(s.EvictDeleteTotal),
+		"evict_lru_total":               int64(s.EvictLRUTotal),
+		"evict_ttl_total":               int64(s.EvictTTLTotal),
+		"evict_max_age_total":           int64(s.EvictMaxAgeTotal),           // 1.12.6 C5 bounded lifetime
+		"evict_no_representative_total": int64(s.EvictNoRepresentativeTotal), // #444
+		"evict_delete_total":            int64(s.EvictDeleteTotal),
 		// #345 — #248's resident-suppressed GAUGE (current count, up/down), not a
 		// total. Non-zero DURING the UAF-decline-freeze; distinguishes decline-
 		// frozen cells from never-yet-refreshed ones. Was computed by the #248
