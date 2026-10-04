@@ -135,6 +135,10 @@ func TestC7_OTLP_EveryDerivedStatLeavesTheProcess(t *testing.T) {
 	// production recorder and must arrive with it (c7Assert448 below).
 	want448 := c7Seed448(t)
 
+	// #455 — the hand-wired #368 wildcard digest-collision detector, driven
+	// through its production recorder to distinct values (c7Assert455 below).
+	want455 := c7Seed455(t)
+
 	ctx := context.Background()
 	shutdown, err := Setup(ctx, "deadbeef")
 	if err != nil {
@@ -177,4 +181,5 @@ func TestC7_OTLP_EveryDerivedStatLeavesTheProcess(t *testing.T) {
 	}
 
 	c7Assert448(t, exports, want448)
+	c7Assert455(t, exports, want455)
 }
