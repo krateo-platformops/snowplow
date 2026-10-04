@@ -26,8 +26,8 @@ func twoIdentityRAKeys(t *testing.T) (raKeyA, raKeyB, shape string) {
 		sliceJQ = ".items |= sort_by(.x)" // the RA's Spec.Filter
 	)
 	// Two identities → two BindingUIDs → two distinct raKeys.
-	raKeyA = ComputeKey(RAFullListKeyInputs(g, v, r, ns, nm, "C:uid-identity-A", nil))
-	raKeyB = ComputeKey(RAFullListKeyInputs(g, v, r, ns, nm, "C:uid-identity-B", nil))
+	raKeyA = ComputeKey(RAFullListKeyInputsForTest(g, v, r, ns, nm, "C:uid-identity-A", nil))
+	raKeyB = ComputeKey(RAFullListKeyInputsForTest(g, v, r, ns, nm, "C:uid-identity-B", nil))
 	if raKeyA == raKeyB {
 		t.Fatalf("test setup wrong: the two raKeys must differ (distinct BindingUID); both=%s", raKeyA)
 	}

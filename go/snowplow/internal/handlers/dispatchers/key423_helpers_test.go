@@ -12,7 +12,7 @@ import (
 // (admin / [system:masters], e3286Ctx). A hand-built "production raKey" that
 // omits it names a cell production never mints.
 func e3286KeyInputs(group, version, resource, namespace, name, bindingUID string, extras map[string]any) cache.ResolvedKeyInputs {
-	in := cache.RAFullListKeyInputs(group, version, resource, namespace, name, bindingUID, extras)
+	in := cache.RAFullListKeyInputsForTest(group, version, resource, namespace, name, bindingUID, extras)
 	in.SubjectBindingSet = rbac.SubjectBindingSetDigest("admin", []string{"system:masters"})
 	return in
 }

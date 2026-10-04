@@ -169,21 +169,13 @@ func seedFullListRAKey(ctx context.Context, gvr schema.GroupVersionResource,
 	if bindingUID == "" {
 		return cache.ResolvedKeyInputs{}, "", false
 	}
+	// The requester's class (rbac.IdentityClassOf, the same derivation as
+	// dispatchCacheLookupKey): #423's full binding set keeps a co-bound requester
+	// with different step-level RBAC out of this cell; #435's effective sub-gen
+	// rotates the key on a Role-rules edit (which keeps every binding) and lets
+	// raKeyClassCurrent see a grant-then-revoke inside the resolve.
 	keyInputs := cache.RAFullListKeyInputs(gvr.Group, gvr.Version, gvr.Resource,
-		namespace, name, bindingUID, extras)
-	// #423 — fold the requester's FULL matching-binding set (same derivation as
-	// dispatchCacheLookupKey) so a co-bound requester with different step-level
-	// RBAC never shares this cell.
-	keyInputs.SubjectBindingSet = rbac.SubjectBindingSetDigest(ui.Username, ui.Groups)
-	// #435 — fold the requester's EFFECTIVE per-subject RBAC sub-generation, the
-	// same derivation (system:authenticated included) as dispatchCacheLookupKey.
-	// The binding set alone is blind to an edit of a Role those bindings
-	// reference (a rules revoke keeps every binding): without this the key never
-	// rotated, nothing dirty-marks raFullList cells on RBAC events, and a member
-	// was served the pre-revoke rows until the TTL. It also makes
-	// raKeyClassCurrent see a grant-then-revoke inside the resolve (the sub-gen
-	// is monotone; the binding set is back where it was).
-	keyInputs.RBACSubGen = cache.RBACSubGenForSubject(ui.Username, rbac.WithAuthenticatedGroup(ui.Groups))
+		namespace, name, bindingUID, rbac.IdentityClassOf(ui), extras)
 	// #431 — the refresher re-resolves the cell under this representative (same
 	// pattern as dispatchCacheLookupKey). It is the identity the key was just
 	// minted from, so it is a member of the key's class by construction; the #424

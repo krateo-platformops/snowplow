@@ -557,17 +557,15 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	return nil
 }
 
-// isIdentityFreeClass reports whether the entry class is one of the two
-// SHARED, identity-free cache classes whose ComputeKey skips the identity
-// fold (resolved.go:611-612): the widget-content shell and the api-stage
+// isIdentityFreeClass reports whether the entry class is a SHARED,
+// identity-free cache class (cache.IdentityFreeClasses — the single list
+// ComputeKey keys by, #449): the widget-content shell and the api-stage
 // content cell. Both hold an SA-maximal SHELL that the serve-time gate
-// (gateWidgetEnvelope) narrows per-requester; their refresh therefore
-// re-resolves under the SA canonical identity (lever 2) rather than the
-// empty representative tuple. Kept as a single predicate so the two
-// call-class checks stay symmetric and the rule is stated once.
+// (gateWidgetEnvelope / gateContentEnvelope) narrows per-requester; their
+// refresh therefore re-resolves under the SA canonical identity (lever 2)
+// rather than the empty representative tuple.
 func isIdentityFreeClass(class string) bool {
-	return class == cache.CacheEntryClassWidgetContent ||
-		class == cache.CacheEntryClassApistage
+	return cache.IsIdentityFreeClass(class)
 }
 
 // resolveOnceProd is the production resolve-and-encode implementation.

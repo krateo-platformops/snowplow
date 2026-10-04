@@ -13,9 +13,9 @@
 //     cells. The RED arm is an impl that folds Representative* into the hash.
 //
 //   M2 [SEC]: BindingUID is folded for every identity-bound class
-//     (restactions / widgets / apistage / raFullList) but SKIPPED for the
-//     identity-free widgetContent class (resolved.go ComputeKey
-//     `if in.CacheEntryClass != CacheEntryClassWidgetContent`). If widgetContent
+//     (restactions / widgets / raFullList) but SKIPPED for the identity-free
+//     classes (IdentityFreeClasses — widgetContent, and apistage since #449;
+//     resolved.go ComputeKey `if !IsIdentityFreeClass(...)`). If widgetContent
 //     folded BindingUID it would fragment the shared envelope per binding
 //     (breaking the shared-content invariant); if an identity-bound class
 //     SKIPPED it, two distinct bindings would COLLIDE on one cell — a
@@ -94,22 +94,31 @@ func TestComputeKey_RepresentativeIdentityExcluded(t *testing.T) {
 // RED PROOF: a shadow impl that folds BindingUID for widgetContent
 // (computeKeyFoldingBindingUIDForWidgetContent) diverges the two — proven in the
 // dedicated RED sub-test.
+//
+// #449: the same holds for EVERY identity-free class (IdentityFreeClasses —
+// widgetContent and apistage), for all three identity dimensions.
 func TestComputeKey_WidgetContentIsIdentityFree(t *testing.T) {
-	in1 := ResolvedKeyInputs{
-		CacheEntryClass: CacheEntryClassWidgetContent,
-		Group:           "g", Version: "v", Resource: "r",
-		Namespace: "ns", Name: "n",
-		BindingUID: "C:uid-alpha",
-		RBACSubGen: 11, // also identity-bound-only; must be excluded for widgetContent
-	}
-	in2 := in1
-	in2.BindingUID = "R:ns/uid-beta"
-	in2.RBACSubGen = 999
+	for _, class := range IdentityFreeClasses() {
+		in1 := ResolvedKeyInputs{
+			CacheEntryClass: class,
+			Group:           "g", Version: "v", Resource: "r",
+			Namespace: "ns", Name: "n",
+			BindingUID:        "C:uid-alpha",
+			SubjectBindingSet: "digest-alpha",
+			RBACSubGen:        11, // also identity-bound-only; must be excluded
+		}
+		in2 := in1
+		in2.BindingUID = "R:ns/uid-beta"
+		in2.SubjectBindingSet = "digest-beta"
+		in2.RBACSubGen = 999
+		zero := in1
+		zero.SetIdentity("", IdentityClass{})
 
-	if ComputeKey(in1) != ComputeKey(in2) {
-		t.Fatalf("M2(1): widgetContent keys diverged on BindingUID/RBACSubGen — the "+
-			"identity-free shared envelope must NOT fold identity\n a=%s\n b=%s",
-			ComputeKey(in1), ComputeKey(in2))
+		if ComputeKey(in1) != ComputeKey(in2) || ComputeKey(in1) != ComputeKey(zero) {
+			t.Fatalf("M2(1): %s keys diverged on identity — the identity-free shared "+
+				"content must NOT fold identity\n a=%s\n b=%s\n zero=%s",
+				class, ComputeKey(in1), ComputeKey(in2), ComputeKey(zero))
+		}
 	}
 }
 
@@ -124,7 +133,6 @@ func TestComputeKey_IdentityBoundClassesFoldBindingUID(t *testing.T) {
 	for _, class := range []string{
 		CacheEntryClassRestactions,
 		CacheEntryClassWidgets,
-		CacheEntryClassApistage,
 		CacheEntryClassRAFullList,
 	} {
 		t.Run(class, func(t *testing.T) {
@@ -221,7 +229,6 @@ func TestComputeKey_NeverFoldBindingUID_RedArm(t *testing.T) {
 	for _, class := range []string{
 		CacheEntryClassRestactions,
 		CacheEntryClassWidgets,
-		CacheEntryClassApistage,
 		CacheEntryClassRAFullList,
 	} {
 		in1 := ResolvedKeyInputs{CacheEntryClass: class, BindingUID: "C:a"}

@@ -68,12 +68,12 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
@@ -88,10 +88,10 @@ var enumerateBasePrewarmTargetsFn = cache.EnumeratePrewarmTargetsForGVR
 // learnedClassSignature is the identity-class signature the DISTINCT rule
 // compares: (binding-set digest, RBACSubGen over the effective groups) — the
 // two identity dimensions of a resolved-output key besides the first-match
-// BindingUID, which is a function of the binding set.
+// BindingUID, which is a function of the binding set. #449: derived by the
+// single class derivation the keys use, rbac.IdentityClassOf.
 func learnedClassSignature(username string, groups []string) string {
-	return rbac.SubjectBindingSetDigest(username, groups) + "\x1f" +
-		strconv.FormatUint(cache.RBACSubGenForSubject(username, rbac.WithAuthenticatedGroup(groups)), 10)
+	return rbac.IdentityClassOf(jwtutil.UserInfo{Username: username, Groups: groups}).String()
 }
 
 // enumeratePrewarmTargetsWithLearned is THE wrapper: the representative targets

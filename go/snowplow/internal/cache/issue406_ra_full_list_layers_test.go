@@ -37,7 +37,7 @@ func newLayerRig(t *testing.T) *layerRig {
 	t.Cleanup(ResetDepsForTest)
 	r := &layerRig{t: t, c: ResolvedCache(), marked: map[string]int{}, remark: map[string]int{}}
 	Deps().SetStore(r.c)
-	r.raIn = RAFullListKeyInputs("templates.krateo.io", "v1", "restactions", "ns", "ra-406", "C:uid", nil)
+	r.raIn = RAFullListKeyInputsForTest("templates.krateo.io", "v1", "restactions", "ns", "ra-406", "C:uid", nil)
 	r.raKey = ComputeKey(r.raIn)
 	Deps().SetRefreshHook(func(k string, _ schema.GroupVersionResource) {
 		r.mu.Lock()

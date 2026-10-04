@@ -84,31 +84,37 @@ func extrasMinusSlice(extras map[string]any) map[string]any {
 // ra_full_list.go:85) is migrated in lockstep to derive the BindingUID via
 // rbac.EvaluateRBAC instead of cache.BindingSetHash.
 //
-// #423: the caller MUST also set the returned SubjectBindingSet to the
-// requester's full matching-binding-set digest (rbac.SubjectBindingSetDigest —
-// package cache cannot import rbac). The sole production caller,
-// apiref.seedFullListRAKey, does; RA output is narrowed per requester by every
-// step, so the first-match bindingUID alone is not a sound sharing class.
-//
-// #435: likewise RBACSubGen (cache.RBACSubGenForSubject over
-// rbac.WithAuthenticatedGroup(groups)) — set by the same caller, so a Role-rules
-// edit or a grant-then-revoke that leaves the binding set unchanged rotates the
-// key, exactly as it does for the restactions/widgets classes.
+// class is the requester's RBAC class (rbac.IdentityClassOf — package cache
+// cannot import rbac): the binding-set digest (#423) and the sub-generation
+// (#435). RA output is narrowed per requester by every step, so the
+// first-match bindingUID alone is not a sound sharing class, and a Role-rules
+// edit or a grant-then-revoke that leaves the binding set unchanged must
+// rotate the key. #449: the builder takes the whole class and writes it through
+// SetIdentity, so no caller can return half-built inputs (the #435 shape).
 func RAFullListKeyInputs(group, version, resource, namespace, name string,
-	bindingUID string, extras map[string]any) ResolvedKeyInputs {
-	return ResolvedKeyInputs{
+	bindingUID string, class IdentityClass, extras map[string]any) ResolvedKeyInputs {
+	in := ResolvedKeyInputs{
 		CacheEntryClass: CacheEntryClassRAFullList,
 		Group:           group,
 		Version:         version,
 		Resource:        resource,
 		Namespace:       namespace,
 		Name:            name,
-		BindingUID:      bindingUID,
 		// Page-INDEPENDENT: slice folded out of the key.
 		PerPage: 0,
 		Page:    0,
 		Extras:  extrasMinusSlice(extras),
 	}
+	in.SetIdentity(bindingUID, class)
+	return in
+}
+
+// RAFullListKeyInputsForTest is RAFullListKeyInputs with only a BindingUID (a
+// zero class), the shape the cache-, apiref- and dispatchers-package tests
+// key their raFullList cells with. Test-only; no production caller.
+func RAFullListKeyInputsForTest(group, version, resource, namespace, name string,
+	bindingUID string, extras map[string]any) ResolvedKeyInputs {
+	return RAFullListKeyInputs(group, version, resource, namespace, name, bindingUID, IdentityClass{}, extras)
 }
 
 // GoSliceFullList applies a per-/call page slice [offset:offset+perPage] over

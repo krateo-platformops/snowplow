@@ -7,9 +7,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -378,8 +378,7 @@ func identityForMemo(ctx context.Context) (string, []string) {
 // key) is caught the same way: any hitter still deriving the old memo key
 // derived its L1 key before the change, and its Put is declined.
 func rbacClassForMemo(username string, groups []string) string {
-	return rbac.SubjectBindingSetDigest(username, groups) + "/" +
-		strconv.FormatUint(cache.RBACSubGenForSubject(username, rbac.WithAuthenticatedGroup(groups)), 10)
+	return rbac.IdentityClassOf(jwtutil.UserInfo{Username: username, Groups: groups}).String()
 }
 
 // containsDep reports whether deps already holds dk.

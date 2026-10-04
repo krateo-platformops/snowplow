@@ -191,7 +191,7 @@ func TestF367_Arm3_RuntimePostOverridesEnvInit(t *testing.T) {
 // golden-locked separately in package cache; this diff touches no key-path code.)
 func TestF367_Arm4_DarkComputeKeyUnchangedByEnv(t *testing.T) {
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })
-	in := cache.RAFullListKeyInputs("templates.krateo.io", "v1", "restactions", "ns-x", "ra-x", "bind-uid-x", nil)
+	in := cache.RAFullListKeyInputsForTest("templates.krateo.io", "v1", "restactions", "ns-x", "ra-x", "bind-uid-x", nil)
 
 	rbac.SetShadowParityEnabled(false)
 	rbac.InitShadowParityFromEnv() // env unset in this sub-scope → off

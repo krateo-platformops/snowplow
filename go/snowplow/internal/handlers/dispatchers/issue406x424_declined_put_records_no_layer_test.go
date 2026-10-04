@@ -44,7 +44,7 @@ func TestIssue406x424_DeclinedSeedPutRecordsNoLayeredSources(t *testing.T) {
 				endpoints.Endpoint{}, nil)
 
 			// A resident raKey the seed widget Go-sliced.
-			raIn := cache.RAFullListKeyInputs("templates.krateo.io", "v1", "restactions",
+			raIn := cache.RAFullListKeyInputsForTest("templates.krateo.io", "v1", "restactions",
 				"krateo-system", "ra-406x424-"+tc.name, "C:uid-406x424", nil)
 			raKey := cache.ComputeKey(raIn)
 			putRA := func(body string) {
