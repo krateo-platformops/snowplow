@@ -1074,7 +1074,7 @@ var learnedBounds = []string{"none", "memory", "engine"}
 // counters (previously /debug/vars-only, which needs a user JWT) onto OTLP.
 // No expvar->OTLP bridge: each instrument reads the typed accessor the expvar
 // closure reads. Attribute hygiene (F8): every attribute is drawn from a
-// closed, code-defined set (site/reason, stat, bound) and none carries an
+// closed, code-defined set (site/reason, outcome, stat, bound) and none carries an
 // identity, a username or a Secret name. Monotonic counters are
 // ObservableCounters over their own atomics; nothing is derived by subtracting
 // two series (the #413 moved_remark lesson). Registered only when the cache is
@@ -1084,6 +1084,14 @@ func registerSecurityInstruments(m metric.Meter) error {
 	driftDeclined, err := m.Int64ObservableCounter(
 		"snowplow_l1_identity_class_drift_declined_total",
 		metric.WithDescription("L1 Puts / re-Puts declined because the writer's identity no longer belongs to the RBAC class the key was minted for, by site {restactions, widgets, seed, refresher} and reason {binding_set, rbac_subgen, no_identity}. Non-zero is expected and benign (a grant/revoke landing mid-resolve); it is the evidence the #424 guard fires."))
+	if err != nil {
+		return err
+	}
+
+	// --- #444: refresher representative re-pick outcomes ---
+	repick, err := m.Int64ObservableCounter(
+		"snowplow_l1_representative_repick_total",
+		metric.WithDescription("Refresher outcomes when an identity-bound cell's recorded representative drifted out of the key's RBAC class (#444), by outcome {group, hitter, evicted}: re-picked the canonical group representative, re-picked a recent hitter, or evicted the cell (no in-class representative). The evictions also count on snowplow_resolved_cache{stat=evict_no_representative_total}."))
 	if err != nil {
 		return err
 	}
@@ -1165,6 +1173,9 @@ func registerSecurityInstruments(m metric.Meter) error {
 			o.ObserveInt64(driftDeclined, c.Count, metric.WithAttributes(
 				attribute.String("site", c.Site), attribute.String("reason", c.Reason)))
 		}
+		for _, c := range dispatchers.RepresentativeRepickCells() {
+			o.ObserveInt64(repick, c.Count, metric.WithAttributes(attribute.String("outcome", c.Outcome)))
+		}
 
 		hits, misses, refused, entries := rbac.BindingSetMemoSnapshot()
 		o.ObserveInt64(bsHits, int64(hits))
@@ -1197,7 +1208,7 @@ func registerSecurityInstruments(m metric.Meter) error {
 			}
 		}
 		return nil
-	}, driftDeclined, bsHits, bsMisses, bsRefused, bsEntries,
+	}, driftDeclined, repick, bsHits, bsMisses, bsRefused, bsEntries,
 		lRegistered, lSeeded, lUnseeded, lNavOnly, lFromSecrets, lUnparseable, lClientconfig,
 		lCapacity, lBound)
 	return err

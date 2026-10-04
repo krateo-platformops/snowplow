@@ -49,6 +49,9 @@ func TestIdentityClassDrift448_CallSitesUseTheClosedSets(t *testing.T) {
 					v, _ := strconv.Unquote(lit.Value)
 					sites[v] = true
 				case *ast.FuncDecl:
+					if strings.HasSuffix(x.Name.Name, "ForTest") {
+						return false // test seams forward a parameter; not a production site
+					}
 					if x.Name.Name != "identityClassDrift" && x.Name.Name != "identityClassDriftCtx" {
 						return true
 					}
@@ -115,5 +118,95 @@ func TestIdentityClassDrift448_CellsCoverTheClosedProduct(t *testing.T) {
 	}
 	if after["seed/rbac_subgen"] != identityClassDriftDeclinedForTest("seed", "rbac_subgen") {
 		t.Fatalf("cells and the expvar map disagree")
+	}
+}
+
+// TestRepresentativeRepick448_CallSitesUseTheClosedSet — #448 (F8): every
+// outcome noteRepresentativeRepick can record is in RepresentativeRepickOutcomes,
+// and vice versa. An outcome is either a string literal at the call site or a
+// source returned by repickRepresentative (a named constant).
+func TestRepresentativeRepick448_CallSitesUseTheClosedSet(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	consts := map[string]string{}
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			for _, d := range f.Decls {
+				gd, ok := d.(*ast.GenDecl)
+				if !ok || gd.Tok != token.CONST {
+					continue
+				}
+				for _, sp := range gd.Specs {
+					vs := sp.(*ast.ValueSpec)
+					for i, n := range vs.Names {
+						if i < len(vs.Values) {
+							if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+								consts[n.Name], _ = strconv.Unquote(lit.Value)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	outcomes := map[string]bool{}
+	calls := 0
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			ast.Inspect(f, func(n ast.Node) bool {
+				switch x := n.(type) {
+				case *ast.CallExpr:
+					id, ok := x.Fun.(*ast.Ident)
+					if !ok || id.Name != "noteRepresentativeRepick" || len(x.Args) != 1 {
+						return true
+					}
+					calls++
+					if lit, ok := x.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						v, _ := strconv.Unquote(lit.Value)
+						outcomes[v] = true
+					}
+				case *ast.FuncDecl:
+					if x.Name.Name != "repickRepresentative" {
+						return true
+					}
+					ast.Inspect(x.Body, func(m ast.Node) bool {
+						r, ok := m.(*ast.ReturnStmt)
+						if !ok || len(r.Results) != 4 {
+							return true
+						}
+						switch v := r.Results[2].(type) {
+						case *ast.Ident:
+							if s, ok := consts[v.Name]; ok {
+								outcomes[s] = true
+							}
+						case *ast.BasicLit:
+							if s, _ := strconv.Unquote(v.Value); s != "" {
+								outcomes[s] = true
+							}
+						}
+						return true
+					})
+				}
+				return true
+			})
+		}
+	}
+	if calls < 2 {
+		t.Fatalf("non-exercise guard: found %d noteRepresentativeRepick call sites, want >= 2", calls)
+	}
+	var g []string
+	for k := range outcomes {
+		g = append(g, k)
+	}
+	w := append([]string(nil), RepresentativeRepickOutcomes...)
+	sort.Strings(g)
+	sort.Strings(w)
+	if strings.Join(g, ",") != strings.Join(w, ",") {
+		t.Errorf("#448: repick outcomes derived from source = %v, declared closed set = %v", g, w)
 	}
 }

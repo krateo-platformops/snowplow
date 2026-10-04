@@ -248,6 +248,36 @@ func representativeRepickForTest(outcome string) int64 {
 	return 0
 }
 
+// RepresentativeRepickOutcomes is the CLOSED `outcome` attribute set of
+// snowplow_l1_representative_repick_total on OTLP (#448, F8): the two
+// repickRepresentative sources and the eviction. No identity is carried.
+// TestRepresentativeRepick448_CallSitesUseTheClosedSet pins it to the source.
+var RepresentativeRepickOutcomes = []string{repSourceGroup, repSourceHitter, "evicted"}
+
+// RepresentativeRepickCell is one outcome count.
+type RepresentativeRepickCell struct {
+	Outcome string
+	Count   int64
+}
+
+// RepresentativeRepickCells returns every outcome of the closed set with its
+// live count (0 when never ticked); each count is its own monotonic atomic.
+func RepresentativeRepickCells() []RepresentativeRepickCell {
+	out := make([]RepresentativeRepickCell, 0, len(RepresentativeRepickOutcomes))
+	for _, o := range RepresentativeRepickOutcomes {
+		var n int64
+		if v, ok := representativeRepick.Load(o); ok {
+			n = v.(*atomic.Int64).Load()
+		}
+		out = append(out, RepresentativeRepickCell{Outcome: o, Count: n})
+	}
+	return out
+}
+
+// NoteRepresentativeRepickForTest ticks one outcome through the production
+// recorder (the OTLP parity arms in internal/metrics).
+func NoteRepresentativeRepickForTest(outcome string) { noteRepresentativeRepick(outcome) }
+
 // refreshLogUser is the representative as it may appear in a refresher log
 // line: a promoted recent hitter is redacted (#444, #262 redaction rules).
 func refreshLogUser(user, source string) string {

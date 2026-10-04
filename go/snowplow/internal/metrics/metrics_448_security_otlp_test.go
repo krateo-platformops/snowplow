@@ -63,6 +63,7 @@ var security448Scalars = []string{
 // security448Labelled are the #448 instruments keyed by closed attribute sets.
 var security448Labelled = []string{
 	"snowplow_l1_identity_class_drift_declined_total",
+	"snowplow_l1_representative_repick_total",
 	"snowplow_learned_classes_capacity",
 	"snowplow_learned_classes_capacity_bound",
 }
@@ -121,6 +122,19 @@ func c7Seed448(t *testing.T) c7Want448 {
 			want[seriesID("snowplow_l1_identity_class_drift_declined_total",
 				map[string]string{"site": site, "reason": reason})] = base[site+"/"+reason] + int64(n)
 		}
+	}
+
+	// --- #444 representative re-pick outcomes: baseline + a distinct delta.
+	repBase := map[string]int64{}
+	for _, c := range dispatchers.RepresentativeRepickCells() {
+		repBase[c.Outcome] = c.Count
+	}
+	for i, outcome := range dispatchers.RepresentativeRepickOutcomes {
+		for j := 0; j <= 20+i; j++ {
+			dispatchers.NoteRepresentativeRepickForTest(outcome)
+		}
+		want[seriesID("snowplow_l1_representative_repick_total", map[string]string{"outcome": outcome})] =
+			repBase[outcome] + int64(21+i)
 	}
 
 	// --- #424 binding-set memo, driven through the real memo against one
@@ -250,7 +264,7 @@ func c7Assert448(t *testing.T, exports []capturedExport, want c7Want448) {
 			t.Errorf("#448: unexpected series %s (attribute set not closed)", id)
 		}
 	}
-	if len(want) < len(security448Scalars)+12+len(learnedCapacityStats)+len(learnedBounds) {
+	if len(want) < len(security448Scalars)+12+3+len(learnedCapacityStats)+len(learnedBounds) {
 		t.Fatalf("#448 non-exercise guard: only %d series seeded", len(want))
 	}
 }
@@ -290,15 +304,17 @@ func TestIssue448_AttributeHygiene_ClosedSetsNoIdentity(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	c7Seed448(t)
 	allowed := map[string]map[string]bool{
-		"site":   setOf(dispatchers.IdentityClassDriftSites),
-		"reason": setOf(dispatchers.IdentityClassDriftReasons),
-		"stat":   setOf(learnedCapacityStats),
-		"bound":  setOf(learnedBounds),
+		"site":    setOf(dispatchers.IdentityClassDriftSites),
+		"reason":  setOf(dispatchers.IdentityClassDriftReasons),
+		"outcome": setOf(dispatchers.RepresentativeRepickOutcomes),
+		"stat":    setOf(learnedCapacityStats),
+		"bound":   setOf(learnedBounds),
 	}
 	all := flatten(collectViaRealCallback(t, "deadbeef"))
 	seen := 0
 	for _, p := range all {
 		if !strings.HasPrefix(p.metric, "snowplow_l1_identity_class_drift") &&
+			!strings.HasPrefix(p.metric, "snowplow_l1_representative_repick") &&
 			!strings.HasPrefix(p.metric, "snowplow_binding_set_memo") &&
 			!strings.HasPrefix(p.metric, "snowplow_learned_") {
 			continue

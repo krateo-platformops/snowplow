@@ -322,10 +322,11 @@ Rules the mirror follows:
 
 - **Closed attributes (F8).** Every attribute comes from a code-defined set:
   `site` ∈ {restactions, widgets, seed, refresher}, `reason` ∈ {binding_set,
-  rbac_subgen, no_identity}, `stat` ∈ the learned-capacity inputs, `bound` ∈
-  {none, memory, engine}. No username, group or Secret name is ever an
-  attribute. The drift counter emits the full 4×3 product (zeros included), so
-  its series set never grows with traffic.
+  rbac_subgen, no_identity}, `outcome` ∈ {group, hitter, evicted}, `stat` ∈
+  the learned-capacity inputs, `bound` ∈ {none, memory, engine}. No username,
+  group or Secret name is ever an attribute. The drift and re-pick counters
+  emit their full closed sets (zeros included), so their series sets never grow
+  with traffic.
 - **Cache-off.** Same CFG-1 rule as the expvar keys: under `CACHE_ENABLED`
   off, none of these series is registered (absent, not zero).
 - **Monotonic counters** are `ObservableCounter`s over their own atomics, and
@@ -334,6 +335,7 @@ Rules the mirror follows:
 | OTLP instrument | kind | meaning | healthy |
 |---|---|---|---|
 | `snowplow_l1_identity_class_drift_declined_total{site,reason}` | counter (sum) | L1 Puts / re-Puts the #424 guard declined because the writer's identity no longer belongs to the RBAC class the key was minted for | low, non-zero rate on a cluster with RBAC churn (a grant/revoke landing mid-resolve). `no_identity` should stay 0 |
+| `snowplow_l1_representative_repick_total{outcome}` | counter (sum) | #444 refresher outcomes when a cell's recorded representative drifted out of its RBAC class: `group` (re-picked the canonical group representative), `hitter` (re-picked a recent hitter), `evicted` (no in-class representative; the cell was evicted). The evictions are also `snowplow_resolved_cache{stat=evict_no_representative_total}` (a gauge row, already on OTLP through the `snowplow_resolved_cache` mirror) | low; follows personal (User-subject) RBAC changes on representatives. `evicted` should stay well below `group` + `hitter` |
 | `snowplow_binding_set_memo_hits` / `_misses` / `_refused` | counter (sum) | subject binding-set digest memo (#424). The memo shard swaps on every RBAC snapshot publish | hit ratio `hits/(hits+misses)` high once warm. `refused` = 0 (cap 4096 per shard) |
 | `snowplow_binding_set_memo_entries` | gauge | live entries in the current memo shard | ≈ active identities |
 | `snowplow_learned_classes_registered` / `_seeded` / `_unseeded_capacity` / `_nav_only` | gauge | learned identity classes (#262): in the registry, admitted with ≥1 distinct target, left out by the capacity bound, seeded nav-only at boot then dropped | `seeded` ≈ 0 on group-only RBAC clusters (a group-only member is not a distinct target) |
