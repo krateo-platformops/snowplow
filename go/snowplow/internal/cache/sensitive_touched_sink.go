@@ -89,11 +89,18 @@ var sensitiveSkippedPut atomic.Uint64
 // DeclineSensitivePut reports whether the resolve under ctx touched a sensitive
 // resource, counting the declined Put when it did. Call exactly once per
 // candidate Put, at the decision point.
+//
+// #443: under the inert (dry-run) flag the decline STILL fires (it returns
+// true): the #398 decline and the inert Put refusal are independent checks, so
+// neither hides the other. Only the counter is skipped, because dry-run traffic
+// must not count as a decline.
 func DeclineSensitivePut(ctx context.Context) bool {
 	if SensitiveTouchedSinkFromContext(ctx).Count() == 0 {
 		return false
 	}
-	sensitiveSkippedPut.Add(1)
+	if !Inert(ctx) {
+		sensitiveSkippedPut.Add(1)
+	}
 	return true
 }
 

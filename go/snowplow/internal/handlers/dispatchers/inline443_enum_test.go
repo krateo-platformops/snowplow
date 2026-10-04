@@ -74,6 +74,9 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ResourceWatcher.EnsureResourceTypeFor":  gatedInCache443,
 	"RecordSliceabilityClassifiedCtx":        gatedInCache443,
 	"SliceabilityLookupCtx":                  gatedInCache443,
+	// #398 decline: always returns true on a sensitive read (inert or not), so
+	// the decline is never hidden by the flag; only its counter is gated.
+	"DeclineSensitivePut": gatedInCache443,
 	// --- side-effecting, gated at the (listed) caller -----------------------
 	"ResolvedCacheStore.Get":                      gatedAtCaller443, // warmth stamp → GetNoTouch under the flag
 	"ResolvedEntry.NoteHitter":                    gatedAtCaller443, // representative pool
@@ -142,6 +145,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	"WithContentDepGenSink": readOnly443, "WithInternalEndpoint": readOnly443,
 	"WithInternalRESTConfig": readOnly443, "WithL1KeyContextFromEpoch": readOnly443,
 	"WithNestedCallDepth": readOnly443, "WithNestedResolveAncestor": readOnly443, "WithServiceAccountDial": readOnly443,
+	// #398 (#440): a pure GVR classifier and the request-scoped sensitive-touched sink.
+	"IsSensitiveResource": readOnly443, "SensitiveTouchedSink.Bump": readOnly443,
+	"SensitiveTouchedSink.Count": readOnly443, "SensitiveTouchedSinkFromContext": readOnly443,
+	"WithSensitiveTouchedSink": readOnly443,
 }
 
 // callerAllow443: for each gatedAtCaller symbol, the "<file>:<func>" sites
