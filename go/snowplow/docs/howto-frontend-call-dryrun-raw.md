@@ -156,6 +156,12 @@ async function rawGet(base: string, jwt: string, caps: Caps, q: URLSearchParams)
 
 ## 7. Edge cases
 
+- **Spelling is exact:** any key that is a case, underscore or hyphen variant
+  of `dryRun` or `fieldValidation` (`dryrun`, `DryRun`, `dry_run`,
+  `FieldValidation`, `field_validation`, …) is a `400` naming the correct
+  spelling. It applies on every verb and route, and nothing is sent to the
+  apiserver. A misspelled key is never dropped.
+
 - **Mixed-version rollout:** `GET /capabilities` and the write can land on
   different pods. The echo check closes that gap. An old pod answers
   `/call/dry-run` with `404` (no echo, nothing written).

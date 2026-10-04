@@ -119,5 +119,12 @@ func hasCallOnlyParam(q url.Values) bool {
 			return true
 		}
 	}
+	// reviewer-415 H1 — a misspelling of dryRun / fieldValidation also falls
+	// through, so the call handler rejects it instead of a resolver ignoring it.
+	for k := range q {
+		if nearMissParam(k) != "" {
+			return true
+		}
+	}
 	return false
 }

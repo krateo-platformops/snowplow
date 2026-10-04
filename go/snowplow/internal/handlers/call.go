@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -399,6 +400,47 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 	return
 }
 
+// strictParams are the #443 query keys whose exact spelling is load-bearing.
+var strictParams = []string{"dryRun", "fieldValidation"}
+
+// normalizeParamKey folds case and drops '_' and '-', so "dry_run", "DryRun"
+// and "dry-run" all compare equal to "dryRun".
+func normalizeParamKey(k string) string {
+	return strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(k))
+}
+
+// nearMissParam returns the exact spelling a query key nearly matches ("" when
+// the key is exact or unrelated).
+func nearMissParam(key string) string {
+	n := normalizeParamKey(key)
+	for _, p := range strictParams {
+		if key != p && n == normalizeParamKey(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// nearMissParamError reports the first query key (in sorted order, so the
+// message is deterministic) that is a misspelling of a strict parameter.
+func nearMissParamError(q url.Values) error {
+	keys := make([]string, 0, len(q))
+	for k := range q {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if want := nearMissParam(k); want != "" {
+			hint := ""
+			if want == "dryRun" {
+				hint = " (dry-run writes use /call/dry-run, which always sends dryRun=All)"
+			}
+			return fmt.Errorf("unknown query parameter %q: the parameter is spelled %q%s", k, want, hint)
+		}
+	}
+	return nil
+}
+
 // writeVerbs are the verbs that send an object to the apiserver: the only
 // verbs dryRun and fieldValidation apply to.
 var writeVerbs = []string{http.MethodPost, http.MethodPut, http.MethodPatch}
@@ -419,6 +461,14 @@ var writeVerbs = []string{http.MethodPost, http.MethodPut, http.MethodPatch}
 //     object rather than the resolved one; the dispatcher has already fallen
 //     through to this handler when it saw the parameter.
 func (r *callHandler) validate443(q url.Values, opts *callOptions) error {
+	// reviewer-415 H1 — a misspelled dryRun / fieldValidation key (dryrun,
+	// DryRun, dry_run, FieldValidation, field_validation, …) is a 400 naming
+	// the correct spelling. Dropping it silently would turn
+	// POST /call?dryrun=All into a REAL write with no echo, which is the very
+	// hazard the /call/dry-run route split exists to prevent.
+	if err := nearMissParamError(q); err != nil {
+		return err
+	}
 	if vals, present := q["dryRun"]; present {
 		if !r.dryRun {
 			return fmt.Errorf("dry-run writes use /call/dry-run")
