@@ -157,8 +157,14 @@ func TestIdentityKeyParityGolden_MintSites(t *testing.T) {
 			t.Fatalf("%s: RAFullListKey not minted", u.name)
 		}
 		got[u.name+"/raFullList"] = k
-		got[u.name+"/memoClass"] = rbac.SubjectBindingSetDigest(u.user, u.groups) + "/" +
-			strconv.FormatUint(cache.RBACSubGenForSubject(u.user, rbac.WithAuthenticatedGroup(u.groups)), 10)
+		// #449: the class string the SeedResolveMemo key folds is now
+		// rbac.IdentityClassOf(..).String(); it must equal the pre-#449
+		// "<digest>/<sub-gen>" formula captured in the want values.
+		got[u.name+"/memoClass"] = rbac.IdentityClassOf(jwtutil.UserInfo{Username: u.user, Groups: u.groups}).String()
+		if legacy := rbac.SubjectBindingSetDigest(u.user, u.groups) + "/" +
+			strconv.FormatUint(cache.RBACSubGenForSubject(u.user, rbac.WithAuthenticatedGroup(u.groups)), 10); legacy != got[u.name+"/memoClass"] {
+			t.Errorf("%s: IdentityClassOf().String() = %q, pre-#449 memo class = %q", u.name, got[u.name+"/memoClass"], legacy)
+		}
 	}
 	for name, w := range want {
 		if got[name] != w {

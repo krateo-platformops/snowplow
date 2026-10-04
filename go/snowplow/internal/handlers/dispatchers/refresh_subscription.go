@@ -8,7 +8,7 @@
 // identity (the UserInfo placed on ctx by middleware.RefreshAuth) using the
 // IDENTICAL key-derivation the /call dispatcher uses:
 //
-//   - identity-bound classes (restactions/widgets/apistage) ->
+//   - identity-bound classes (restactions/widgets) ->
 //     dispatchCacheLookupKey: rbac.EvaluateRBAC(ctx-identity, get, gvr, ns,
 //     name) -> BindingUID -> cache.ComputeKey (helpers.go:200-243).
 //   - raFullList (identity-bound, page-independent) -> apiref.RAFullListKey,
@@ -55,6 +55,12 @@ const (
 	classRestActions = "restactions"
 	classWidgets     = "widgets"
 )
+
+// identityFreeArmable lists the identity-free classes a /refreshes connection
+// may arm: those whose arm checks the connection can read the watched object.
+var identityFreeArmable = map[string]bool{
+	cache.CacheEntryClassWidgetContent: true,
+}
 
 // SubscriptionCoordinates is the resource tuple a /refreshes connection
 // supplies to arm one widget. It is the SAME coordinate set the /call
@@ -208,6 +214,22 @@ func deriveSubscription(ctx context.Context, coords SubscriptionCoordinates) (st
 func deriveSubscriptionWithReason(ctx context.Context, coords SubscriptionCoordinates) (string, *cache.ResolvedKeyInputs, bool, SubscriptionSkipReason) {
 	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page)
 
+	// #449: an identity-free class (cache.IdentityFreeClasses) is one cell
+	// shared by every user, so a connection may arm it only through an arm that
+	// first checks the connection can read what it would watch. widgetContent's
+	// arm does (subscriptionKeyExtras GETs the widget CR as the connection).
+	// apistage has no such arm: its cell is a raw K8s call (gvr, ns, name), and
+	// arming it would let a connection watch change events on objects its RBAC
+	// denies — and no browser is ever handed the class (setRefreshKeyHeader
+	// stamps restactions / widgets / widgetContent only). Before #449 the
+	// apistage arm minted an identity-BOUND key through dispatchCacheLookupKey,
+	// a key no apistage cell is stored under (contentKeyInputs mints zero
+	// identity), so it never delivered a signal: failing closed changes no
+	// delivered refresh.
+	if cache.IsIdentityFreeClass(coords.Class) && !identityFreeArmable[coords.Class] {
+		return "", nil, false, SubscriptionSkipOther
+	}
+
 	switch coords.Class {
 	case cache.CacheEntryClassWidgetContent:
 		// Identity-free shared shell. The key is the same for every subject
@@ -269,18 +291,17 @@ func deriveSubscriptionWithReason(ctx context.Context, coords SubscriptionCoordi
 		}
 		return key, &inputs, true, SubscriptionArmed
 
-	case classRestActions,
-		cache.CacheEntryClassApistage:
+	case classRestActions:
 		// Identity-bound: dispatchCacheLookupKey folds the BindingUID derived
 		// from ctx's identity. A foreign coordinate set yields the caller's
 		// own BindingUID -> a key the foreign cell never publishes to.
 		//
-		// #64: these classes carry NO inline-extras blocks (they are not
-		// widgets — a RESTAction/apistage cell's emit key folds only the
-		// request extras), so raw coords.Extras is request-only parity on
-		// BOTH sides. UNCHANGED. These arms issue NO objects.Get (only
-		// dispatchCacheLookupKey → in-process rbac.EvaluateRBAC), so an empty
-		// key here is never an informer-miss — SubscriptionSkipOther.
+		// #64: this class carries NO inline-extras blocks (it is not a widget —
+		// a RESTAction cell's emit key folds only the request extras), so raw
+		// coords.Extras is request-only parity on BOTH sides. UNCHANGED. This
+		// arm issues NO objects.Get (only dispatchCacheLookupKey → in-process
+		// rbac.EvaluateRBAC), so an empty key here is never an informer-miss —
+		// SubscriptionSkipOther.
 		key, handle, inputs := dispatchCacheLookupKey(ctx, coords.Class,
 			coords.Group, coords.Version, coords.Resource,
 			coords.Namespace, coords.Name, coords.PerPage, coords.Page, coords.Extras)

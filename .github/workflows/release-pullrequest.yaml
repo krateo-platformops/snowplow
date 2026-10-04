@@ -4,8 +4,8 @@
 #
 # The reusable go-checks covers `go test ./...` and the crds/ drift guard (crd_drift: true replaces
 # the old `codegen` job's scripts/gen.sh --check). The snowplow-specific AST-lint gates
-# (ResolveOptions rc/SArc, ResolvedEntry Put-site scope-completeness, BindingUID single-source, and
-# the unchecked *unstructured assert guard) are NOT covered by the reusable, so they are kept as a
+# (ResolveOptions rc/SArc, ResolvedEntry Put-site scope-completeness, BindingUID single-source,
+# identity-key completeness, and the unchecked *unstructured assert guard) are NOT covered by the reusable, so they are kept as a
 # local `lint-gates` job that runs from the go/snowplow module dir (fold-safe).
 name: release-pullrequest
 
@@ -72,6 +72,13 @@ jobs:
       # production tree and fails the PR on any parallel derivation.
       - name: BindingUID single-source (no parallel derivation) gate
         run: bash scripts/check_no_parallel_binding_derivation.sh
+      # #449 identity-key completeness: fail the PR if an identity-bound cache
+      # or reuse key can be minted without the full identity class (the
+      # #423 / #432 / #435 class), if anything but SetIdentity writes an identity
+      # field, or if a new memo / cache / store map is not declared in the
+      # identity registry.
+      - name: Identity-key completeness gate
+        run: bash scripts/check_identity_key_completeness.sh
       # H6 companion: the Ship 0.30.233 defect class — a raw
       # obj.(*unstructured.Unstructured) content-assert inside a literal
       # informer event-handler body — silently drops every CRD event post-H5

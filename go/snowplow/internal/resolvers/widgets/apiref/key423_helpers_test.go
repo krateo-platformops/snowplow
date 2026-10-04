@@ -15,7 +15,7 @@ import (
 //	C:crb-b-f6-uid → dev-1 / [devs]            (f6 user B)
 //	""             → no identity (the empty-identity key; no digest)
 func f6KeyInputs(group, version, resource, namespace, name, bindingUID string, extras map[string]any) cache.ResolvedKeyInputs {
-	in := cache.RAFullListKeyInputs(group, version, resource, namespace, name, bindingUID, extras)
+	in := cache.RAFullListKeyInputsForTest(group, version, resource, namespace, name, bindingUID, extras)
 	switch bindingUID {
 	case "C:crb-a-f6-uid":
 		in.SubjectBindingSet = rbac.SubjectBindingSetDigest("admin", []string{"system:masters"})

@@ -273,11 +273,11 @@ func TestKeyParity_SeedEqualsDispatch_RAFullList(t *testing.T) {
 
 	// SEED side — page 1 requested (the boot-seed shape; no browser).
 	seedExtras := map[string]any{"region": "eu", "slice": map[string]any{"perPage": 10, "page": 1}}
-	seed := cache.RAFullListKeyInputs(g, v, r, ns, name, bindingUID, seedExtras)
+	seed := cache.RAFullListKeyInputsForTest(g, v, r, ns, name, bindingUID, seedExtras)
 
 	// /CALL side — a DIFFERENT requested page (9) of the SAME cell.
 	callExtras := map[string]any{"region": "eu", "slice": map[string]any{"perPage": 50, "page": 9}}
-	dispatch := cache.RAFullListKeyInputs(g, v, r, ns, name, bindingUID, callExtras)
+	dispatch := cache.RAFullListKeyInputsForTest(g, v, r, ns, name, bindingUID, callExtras)
 
 	assertKeyInputsFieldEqual(t, "raFullList/seed-vs-dispatch", &seed, &dispatch)
 	if seed.PerPage != 0 || seed.Page != 0 {
@@ -301,11 +301,11 @@ func TestKeyParity_SeedEqualsDispatch_RAFullList_RED(t *testing.T) {
 	const bindingUID = "C:test-crb-uid"
 
 	seedExtras := map[string]any{"region": "eu", "slice": map[string]any{"perPage": 10, "page": 1}}
-	seed := cache.RAFullListKeyInputs(g, v, r, ns, name, bindingUID, seedExtras)
+	seed := cache.RAFullListKeyInputsForTest(g, v, r, ns, name, bindingUID, seedExtras)
 
 	// One flipped NON-slice extra on the /call side (region eu → us).
 	callExtras := map[string]any{"region": "us", "slice": map[string]any{"perPage": 50, "page": 9}}
-	dispatch := cache.RAFullListKeyInputs(g, v, r, ns, name, bindingUID, callExtras)
+	dispatch := cache.RAFullListKeyInputsForTest(g, v, r, ns, name, bindingUID, callExtras)
 
 	if cache.ComputeKey(seed) == cache.ComputeKey(dispatch) {
 		t.Fatalf("RED arm did NOT discriminate: a region=eu seed key equals a region=us /call key — the "+

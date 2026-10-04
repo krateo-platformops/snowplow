@@ -96,14 +96,14 @@ func TestInlineExtras_6_SeedParity_RAFullListSubCell(t *testing.T) {
 	cr := widgetCRWithExtras(t, `{"tenant":"acme"}`, `{"targetNs":"team-a"}`)
 
 	// SEED RAFullList key: seedRAFullListForWidget threads GetApiRefExtras(w)
-	// (no request) as apiref.Resolve Extras → RAFullListKeyInputs(..., apiRefInline).
-	seedRAKey := cache.ComputeKey(cache.RAFullListKeyInputs(rg, rv, rr, rns, rname, bUID,
+	// (no request) as apiref.Resolve Extras → RAFullListKeyInputsForTest(..., apiRefInline).
+	seedRAKey := cache.ComputeKey(cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		widgets.GetApiRefExtras(cr)))
 
 	// SERVE RAFullList key: the dispatcher's apiRef path threads
 	// merge(apiRefInline, request) — with no ?extras= the request is empty, so
 	// the effective map IS apiRefInline.
-	serveRAKey := cache.ComputeKey(cache.RAFullListKeyInputs(rg, rv, rr, rns, rname, bUID,
+	serveRAKey := cache.ComputeKey(cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		keyExtrasForApiRefEffective(t, cr, map[string]any{})))
 
 	if seedRAKey != serveRAKey {
@@ -118,7 +118,7 @@ func TestInlineExtras_6_SeedParity_RAFullListSubCell(t *testing.T) {
 		t.Fatal("expected a live resolved cache")
 	}
 	full := map[string]any{"items": []any{map[string]any{"x": float64(1)}}}
-	c.PutRAFullList(seedRAKey, cache.RAFullListKeyInputs(rg, rv, rr, rns, rname, bUID,
+	c.PutRAFullList(seedRAKey, cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		widgets.GetApiRefExtras(cr)), full)
 	if _, hit := c.Get(serveRAKey); !hit {
 		t.Fatal("FALSIFIER #6 FAILED (RAFullList sub-cell): serve-key lookup MISSED the seeded full-list cell")

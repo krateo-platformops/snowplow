@@ -51,7 +51,7 @@ func TestFullListIsEmpty(t *testing.T) {
 // extrasMinusSlice strips slice/page/perPage/offset keys.
 func TestRAFullList_PageIndependentKey(t *testing.T) {
 	base := func(extras map[string]any) ResolvedKeyInputs {
-		return RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
+		return RAFullListKeyInputsForTest("composition.krateo.io", "v1", "panels",
 			"krateo-system", "compositions-panels", "uid-c0ffee", extras)
 	}
 
@@ -77,11 +77,11 @@ func TestRAFullList_PageIndependentKey(t *testing.T) {
 		in   ResolvedKeyInputs
 	}
 	muts := []mut{
-		{"resource", RAFullListKeyInputs("composition.krateo.io", "v1", "OTHER", "krateo-system", "compositions-panels", "uid-c0ffee", nil)},
-		{"namespace", RAFullListKeyInputs("composition.krateo.io", "v1", "panels", "OTHER-NS", "compositions-panels", "uid-c0ffee", nil)},
-		{"name", RAFullListKeyInputs("composition.krateo.io", "v1", "panels", "krateo-system", "OTHER-NAME", "uid-c0ffee", nil)},
-		{"cohort", RAFullListKeyInputs("composition.krateo.io", "v1", "panels", "krateo-system", "compositions-panels", "uid-dead", nil)},
-		{"nonsliceExtra", RAFullListKeyInputs("composition.krateo.io", "v1", "panels", "krateo-system", "compositions-panels", "uid-c0ffee", map[string]any{"tenant": "different"})},
+		{"resource", RAFullListKeyInputsForTest("composition.krateo.io", "v1", "OTHER", "krateo-system", "compositions-panels", "uid-c0ffee", nil)},
+		{"namespace", RAFullListKeyInputsForTest("composition.krateo.io", "v1", "panels", "OTHER-NS", "compositions-panels", "uid-c0ffee", nil)},
+		{"name", RAFullListKeyInputsForTest("composition.krateo.io", "v1", "panels", "krateo-system", "OTHER-NAME", "uid-c0ffee", nil)},
+		{"cohort", RAFullListKeyInputsForTest("composition.krateo.io", "v1", "panels", "krateo-system", "compositions-panels", "uid-dead", nil)},
+		{"nonsliceExtra", RAFullListKeyInputsForTest("composition.krateo.io", "v1", "panels", "krateo-system", "compositions-panels", "uid-c0ffee", map[string]any{"tenant": "different"})},
 	}
 	zero := ComputeKey(base(nil))
 	for _, m := range muts {
@@ -284,7 +284,7 @@ func TestRAFullList_NonSliceableFallsBack(t *testing.T) {
 func TestRAFullList_SliceabilityMemoPerShape(t *testing.T) {
 	resetSliceabilityMemoForTest()
 
-	raKey := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
+	raKey := ComputeKey(RAFullListKeyInputsForTest("composition.krateo.io", "v1", "panels",
 		"krateo-system", "compositions-panels", "uid-1234", nil))
 
 	// Widget A: a table widget that slices cleanly.
@@ -321,7 +321,7 @@ func TestRAFullList_SliceabilityMemoPerShape(t *testing.T) {
 	}
 
 	// A DIFFERENT RAFullList key with shapeA gets its OWN (unknown) verdict.
-	otherKey := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
+	otherKey := ComputeKey(RAFullListKeyInputsForTest("composition.krateo.io", "v1", "panels",
 		"OTHER-NS", "compositions-panels", "uid-1234", nil))
 	if _, known := SliceabilityLookup(otherKey, shapeA); known {
 		t.Fatalf("verdict leaked across RAFullList keys")

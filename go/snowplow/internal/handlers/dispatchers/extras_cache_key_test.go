@@ -273,11 +273,11 @@ func TestInlineExtras_4a_ApiRefExtras_DistinctWidgetKeys(t *testing.T) {
 	// effective map IS the apiRef-inline map.
 	const rg, rv, rr, rns, rname = "templates.krateo.io", "v1", "restactions", "demo-system", "some-ra"
 	const bUID = "binding-xyz"
-	raA := cache.ComputeKey(cache.RAFullListKeyInputs(rg, rv, rr, rns, rname, bUID,
+	raA := cache.ComputeKey(cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		keyExtrasForApiRefEffective(t, crA, req)))
-	raB := cache.ComputeKey(cache.RAFullListKeyInputs(rg, rv, rr, rns, rname, bUID,
+	raB := cache.ComputeKey(cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		keyExtrasForApiRefEffective(t, crB, req)))
-	raA2 := cache.ComputeKey(cache.RAFullListKeyInputs(rg, rv, rr, rns, rname, bUID,
+	raA2 := cache.ComputeKey(cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		keyExtrasForApiRefEffective(t, crA2, req)))
 	if raA == raB {
 		t.Fatalf("FALSIFIER #4a FAILED: differing apiRef.extras produced the SAME RAFullList sub-cell key %q — apiRef fetch collision", raA)
@@ -349,9 +349,9 @@ func TestInlineExtras_4b_RrtExtras_DistinctContentKeys_RAFullListUnchanged(t *te
 	// apiRef sub-cell key is invariant to it.
 	const rg, rv, rr, rns, rname = "templates.krateo.io", "v1", "restactions", "demo-system", "some-ra"
 	const bUID = "binding-xyz"
-	raA := cache.ComputeKey(cache.RAFullListKeyInputs(rg, rv, rr, rns, rname, bUID,
+	raA := cache.ComputeKey(cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		keyExtrasForApiRefEffective(t, crA, req)))
-	raB := cache.ComputeKey(cache.RAFullListKeyInputs(rg, rv, rr, rns, rname, bUID,
+	raB := cache.ComputeKey(cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		keyExtrasForApiRefEffective(t, crB, req)))
 	if raA != raB {
 		t.Fatalf("FALSIFIER #4b FAILED: differing resourcesRefsTemplateExtras perturbed the RAFullList sub-cell key (%q vs %q) — rrt-inline MUST NOT key the apiRef cell", raA, raB)

@@ -229,7 +229,7 @@ func TestRAFullListMemoExpvarPublished(t *testing.T) {
 	}
 
 	// Seed two entries: one TRUE verdict + labels, one FALSE verdict + labels.
-	raKeyA := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
+	raKeyA := ComputeKey(RAFullListKeyInputsForTest("composition.krateo.io", "v1", "panels",
 		"krateo-system", "compositions-panels", "uid-1234", nil))
 	shapeA := SliceShapeHash("apiref", "widgets.templates.krateo.io", "v1beta1",
 		"tables", "krateo-system", "compositions-page-datagrid", "{}")
@@ -243,7 +243,7 @@ func TestRAFullListMemoExpvarPublished(t *testing.T) {
 	}
 	RecordSliceabilityWithLabels(raKeyA, shapeA, true, labelsA)
 
-	raKeyB := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
+	raKeyB := ComputeKey(RAFullListKeyInputsForTest("composition.krateo.io", "v1", "panels",
 		"OTHER-NS", "compositions-panels", "uid-c0ffee", nil))
 	shapeB := SliceShapeHash("apiref", "widgets.templates.krateo.io", "v1beta1",
 		"charts", "krateo-system", "compositions-chart", "{ sum: 0 }")

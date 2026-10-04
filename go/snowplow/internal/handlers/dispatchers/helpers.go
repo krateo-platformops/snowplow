@@ -286,30 +286,6 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		Resource:        resource,
 		Namespace:       namespace,
 		Name:            name,
-		BindingUID:      bindingUID,
-		// #423 — the requester's FULL matching-binding set. BindingUID above only
-		// proves THIS layer's GET; it does not distinguish two co-bound users whose
-		// step-level RBAC differs, and the hit path serves RawJSON verbatim. Equal
-		// sets => equal verdicts everywhere => byte-identical output, so cells are
-		// still shared across same-set users (group-only members of the same
-		// groups). The prewarm seed mints through THIS function under its
-		// representative identity, so seed and customer keys use one derivation.
-		SubjectBindingSet: rbac.SubjectBindingSetDigest(ui.Username, ui.Groups),
-		// #118 (c) — the requesting identity's EFFECTIVE per-subject RBAC
-		// sub-generation, folded into ComputeKey (identity-bound classes) so an
-		// out-of-band grant/revoke touching THIS user's own bindings rotates the
-		// key → cold miss → fresh UAF refilter. RBACSubGenForSubject folds the
-		// user + every presented group (+ SA) counter (C-118-2 group-grant
-		// crux). ui.Username/ui.Groups are already in hand here (the same tuple
-		// EvaluateRBAC read above), so this is a handful of lock-free map reads,
-		// no extra walk.
-		//
-		// #424 — folded over the EFFECTIVE groups (system:authenticated
-		// included) so a customer whose JWT omits it and the seed representative
-		// (which now resolves with it, withCohortSeedContext) fold the same
-		// counters, and a change to a system:authenticated binding rotates
-		// every authenticated requester's key (it changes all of their rights).
-		RBACSubGen: cache.RBACSubGenForSubject(ui.Username, rbac.WithAuthenticatedGroup(ui.Groups)),
 		// Representative identity for the refresher's re-resolve.
 		// Carried on Inputs but NOT folded into ComputeKey (the cell
 		// is keyed by BindingUID, not by the literal name). The first
@@ -325,6 +301,13 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		// #261 MARK-AT-MINT — carried, NOT folded into ComputeKey (bookkeeping).
 		AtRiskClass: atRiskClass,
 	}
+	// Identity: BindingUID only proves THIS layer's GET; the class (#423 binding
+	// set + #118 (c) / #424 effective sub-gen, rbac.IdentityClassOf) is what
+	// separates two co-bound users whose step-level RBAC differs — the hit path
+	// serves RawJSON verbatim. The prewarm seed and the /refreshes subscription
+	// mint through THIS function, so seed, customer and subscription keys share
+	// one derivation (#449: SetIdentity is the only writer of these fields).
+	inputs.SetIdentity(bindingUID, rbac.IdentityClassOf(ui))
 	return cache.ComputeKey(inputs), c, &inputs
 }
 

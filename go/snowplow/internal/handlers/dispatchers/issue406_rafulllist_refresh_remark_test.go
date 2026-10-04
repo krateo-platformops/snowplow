@@ -35,7 +35,7 @@ func TestIssue406_RefresherRAFullListRePut_RemarksSlicedWidgetOnlyOnChange(t *te
 	}))
 	cache.Deps().SetRefreshHook(func(string, schema.GroupVersionResource) {})
 
-	inputs := cache.RAFullListKeyInputs("templates.krateo.io", "v1", "restactions",
+	inputs := cache.RAFullListKeyInputsForTest("templates.krateo.io", "v1", "restactions",
 		"krateo-system", "ra-406-refresher", "C:uid-406", nil)
 	inputs.RepresentativeUsername = "admin"
 	raKey := cache.ComputeKey(inputs)

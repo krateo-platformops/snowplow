@@ -40,6 +40,7 @@ import (
 	"sync/atomic"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 )
@@ -48,15 +49,17 @@ import (
 // RBAC class inputs' key was minted for, or "" when it still does (or when the
 // class is identity-free / inputs is nil — nothing to check).
 func identityClassDrift(ctx context.Context, inputs *cache.ResolvedKeyInputs, username string, groups []string) string {
-	if inputs == nil || isIdentityFreeClass(inputs.CacheEntryClass) {
+	if inputs == nil || cache.IsIdentityFreeClass(inputs.CacheEntryClass) {
 		return ""
 	}
-	if rbac.SubjectBindingSetDigest(username, groups) != inputs.SubjectBindingSet {
+	// The same derivation every identity-bound key was minted with (#449).
+	now, minted := rbac.IdentityClassOf(jwtutil.UserInfo{Username: username, Groups: groups}), inputs.Class()
+	if now.SubjectBindingSet != minted.SubjectBindingSet {
 		return "binding_set"
 	}
 	// Every identity-bound class folds RBACSubGen — raFullList too since #435
 	// (seedFullListRAKey), so one limb covers all three.
-	if cache.RBACSubGenForSubject(username, rbac.WithAuthenticatedGroup(groups)) != inputs.RBACSubGen {
+	if now.RBACSubGen != minted.RBACSubGen {
 		return "rbac_subgen"
 	}
 	// No separate first-match BindingUID re-evaluation: BindingUID is a function
@@ -158,7 +161,7 @@ func identityClassDriftDeclinedForTest(site, reason string) int64 {
 // customer and seed Put paths). A missing identity is drift: a key that was
 // minted for an identity cannot be re-confirmed without one.
 func identityClassDriftCtx(ctx context.Context, inputs *cache.ResolvedKeyInputs) string {
-	if inputs == nil || isIdentityFreeClass(inputs.CacheEntryClass) {
+	if inputs == nil || cache.IsIdentityFreeClass(inputs.CacheEntryClass) {
 		return ""
 	}
 	ui, err := xcontext.UserInfo(ctx)

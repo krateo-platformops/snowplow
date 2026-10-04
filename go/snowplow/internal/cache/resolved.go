@@ -30,7 +30,6 @@ import (
 	"container/list"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1101,54 +1100,26 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	h.Write([]byte(in.Name))
 	h.Write([]byte{0})
 
-	// Identity. Ship G (0.30.16x): widgetContent is identity-free — the
-	// widget envelope is shared, the per-user `allowed` flag is re-derived
-	// at serve time.
+	// Identity. An identity-bound class (restactions, widgets, raFullList) folds
+	// the dimensions SetIdentity wrote: the first-match BindingUID that
+	// authorised this layer's GET (Ship 0.30.242), the requester's full
+	// matching-binding-set digest (#423) and the per-subject RBAC sub-generation
+	// (#118 (c)). Together they name the requester's RBAC class, so two users
+	// share a cell only when every RBAC verdict their resolve can reach is equal.
 	//
-	// Ship 0.30.242 H.c-layered (Phase 2 step 2a): identity-bound classes
-	// (restactions, widgets, apistage, raFullList) fold in `BindingUID` —
-	// the first-match per-layer binding identity from the cache snapshot
-	// (cache.BindingUIDFromCRB / FromRB applied to whichever CRB or RB
-	// granted THIS layer's access for the request's identity). Two users
-	// granted by the SAME binding land on the SAME cell — finer-grained
-	// sharing than v3's per-cohort hash (per design §3.3 + §3.4).
-	//
-	// apistage flipped from identity-free (v3) to identity-bound (v4):
-	// under v3 the apistage cell held SA-populated raw items filtered
-	// per-cohort at serve time by gateListItemsWithMemo. Under v4 the
-	// apistage cell is RBAC-narrowed AT POPULATE TIME by the specific
-	// binding that authorised it; the cohort-gate-memo apparatus is
-	// deleted (design §3.4). widgetContent stays identity-free.
+	// An identity-free class (IdentityFreeClasses, identity_class.go) holds
+	// content shared across users and re-gated per requester at serve time; its
+	// key never folds a caller's identity, whatever the inputs carry. widgetContent
+	// writes no identity segment (Ship G); apistage writes the all-zero segment
+	// its content cells have always been keyed with (#449 — see identity_class.go
+	// for why apistage is identity-free and why its encoding is kept).
 	//
 	// This is a per-CLASS key shape, NOT a per-resource switch
-	// (feedback_no_special_cases): the discriminant is the entry class,
-	// uniform for every entry of every GVR. widgetContent skips the
-	// identity fold entirely; all other classes fold the BindingUID
-	// string. The v3 → v4 resolvedKeyVersion bump rotates the key space
-	// cleanly on the rolling restart so no v3 entry serves as a v4 hit.
-	if in.CacheEntryClass != CacheEntryClassWidgetContent {
-		h.Write([]byte(in.BindingUID))
-		h.Write([]byte{0xff}) // identity terminator
-		// #423 (v6 → v7): the requester's full matching-binding-set digest. A
-		// fixed-width hex SHA-256 (or "" when no snapshot), then its own
-		// terminator so it cannot run into the sub-gen bytes.
-		h.Write([]byte(in.SubjectBindingSet))
-		h.Write([]byte{0xfd}) // binding-set terminator (distinct from 0xff / 0xfe)
-		// #118 (c) v4→v5: fold the requesting identity's per-subject RBAC
-		// sub-generation alongside BindingUID for every identity-bound class.
-		// The BindingUID captures WHICH binding authorised THIS layer's GET;
-		// RBACSubGen captures "did anything about this user's effective RBAC
-		// change" (incl a per-namespace grant/revoke the single dispatch-GET
-		// BindingUID is blind to — the userAccessFilter refilter dependency,
-		// #118 defect 1). A change to the user's own bindings bumps a subject
-		// counter → this fold changes → new key → cold miss → fresh refilter.
-		// widgetContent is excluded (identity-free shared envelope) exactly as
-		// for BindingUID — folding identity there would break the shared-content
-		// invariant (design §key-parity-surface). uint64 LE, then a terminator.
-		var subgen [8]byte
-		binary.LittleEndian.PutUint64(subgen[:], in.RBACSubGen)
-		h.Write(subgen[:])
-		h.Write([]byte{0xfe}) // sub-gen terminator (distinct from the 0xff identity terminator)
+	// (feedback_no_special_cases).
+	if !IsIdentityFreeClass(in.CacheEntryClass) {
+		writeIdentitySegment(h, in.BindingUID, in.SubjectBindingSet, in.RBACSubGen)
+	} else if identityFreeClasses[in.CacheEntryClass] == zeroIdentitySegment {
+		writeIdentitySegment(h, "", "", 0)
 	}
 
 	h.Write([]byte(strconv.Itoa(in.PerPage)))
