@@ -467,19 +467,19 @@ func iterateApiRefPages(
 		if wcKey != "" {
 			resolveCtx = cache.WithL1KeyContext(resolveCtx, wcKey)
 		}
-		// Task #318 Step 1 — Cache-A sink parity. Install a stage-error
-		// sink on the resolve ctx so the populate below (passed resolveCtx,
-		// NOT the bare ctx) can decline to seed a partial-with-errors shell
-		// for the recursed leaf-CHILD cells (the drain's only serveable
-		// value, design §1d) — symmetric with the page-1 site
-		// (phase1_walk.go:1162/1226), the request paths (widgets.go,
-		// restactions.go), and the refresher (resolve_populate.go). For the
-		// RBAC-sensitive datagrid PAGE cell the gate is moot (the Put is
-		// already declined upstream at widget_content.go:213) but harmless.
-		resolveCtx, _ = cache.WithStageErrorSink(resolveCtx)
-		// #398 — the page resolve feeds the identity-free content cell below;
-		// a sensitive read under it must decline that Put.
-		resolveCtx, _ = cache.WithSensitiveTouchedSink(resolveCtx)
+		// Task #318 Step 1 / #450 — Put-gate sink parity with the page-1 walk.
+		// Install the FULL widgetContent sink set (stage-error, external-
+		// touched, sensitive-touched, UAF-touched) via the SAME helper
+		// phase1Walker.walk uses, on
+		// the resolve ctx that the populate below is also handed (resolveCtx,
+		// NOT the bare ctx), so every gate inside populateWidgetContentL1 reads
+		// THIS page's resolve. Pre-#450 only the stage-error sink was installed
+		// here (#440 then added the sensitive sink inline; #450 folds it into
+		// the helper), leaving the external and UAF gates inert on this path: the
+		// identity-free page cell's isolation then rested on the
+		// isRBACSensitiveApiRefWidget heuristic alone (which today does decline
+		// every apiRef+template page, but de-classifies on accessor error).
+		resolveCtx = withWidgetContentPutSinks(resolveCtx)
 
 		res, err := paginationResolvePageFn(resolveCtx, widgets.ResolveOptions{
 			In:      got.Unstructured,

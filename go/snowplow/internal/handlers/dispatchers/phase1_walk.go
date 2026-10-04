@@ -1572,44 +1572,17 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	if wcKey != "" {
 		resolveCtx = cache.WithL1KeyContext(ctx, wcKey)
 	}
-	// Ship 0.30.257 (#313) Cache-A — install a stage-error sink on the
-	// resolve ctx so populateWidgetContentL1 (below) can decline to seed the
-	// identity-free widget-content cell with a partial-with-errors shell. The
-	// api resolver bumps this sink on any per-item iterator hard error; after
-	// #313 such an error no longer truncates the resolve, so the gate (not
-	// the truncation) is what keeps a partial out of the cache. The SAME
-	// resolveCtx flows into widgets.Resolve AND into populateWidgetContentL1
-	// so the post-resolve Count() reflects this widget's resolve. (The
-	// deferred-pagination walk's own populateWidgetContentL1 call site lives
-	// in phase1_walk_pagination*.go and is not wired here — its Put stays at
-	// the pre-0.30.257 posture, an unchanged-behaviour gap, not a regression.)
-	resolveCtx, _ = cache.WithStageErrorSink(resolveCtx)
-	// External-no-cache (proposal 2026-06-22) — install the external-touched
-	// sink on the SAME resolveCtx (the F2 walker installs none by default —
-	// proposal §"FIVE Put surfaces" #3). populateWidgetContentL1 (below) reads
-	// it via ExternalTouchedSinkFromContext and declines to seed the
-	// identity-free content cell when the widget's resolve touched a genuine
-	// external endpoint — exactly as it declines on a stage error. Additive to
-	// the stage-error sink; both gate the Put independently.
-	resolveCtx, _ = cache.WithExternalTouchedSink(resolveCtx)
-	// #398 — sensitive-resource sink: a resolve that dispatched a core
-	// v1/secrets read must not be persisted by any resolved-output Put.
-	resolveCtx, _ = cache.WithSensitiveTouchedSink(resolveCtx)
-	// 1.12.3 A-1 / R-1 — install the UAF-touched sink on the SAME resolveCtx,
-	// third sibling of the two above. populateWidgetContentL1 (below) reads it
-	// via UAFTouchedSinkFromContext and declines to seed the identity-free
-	// content cell when the widget's resolve ran a userAccessFilter refilter —
-	// exactly as it declines on a stage error or an external touch.
-	//
-	// The widgetContent cell is SHARED (no identity fold) and its serve-time gate
-	// (gateWidgetEnvelope) re-derives only status.resourcesRefs.items[].allowed —
-	// it NEVER narrows status.widgetData. isRBACSensitiveApiRefWidget is supposed
-	// to route apiRef+template widgets away from this cell for exactly that
-	// reason, but that predicate is a DECLARATION-shaped heuristic over the widget
-	// CR and it de-classifies on accessor error. Gating on the observed refilter
-	// closes the question empirically instead of by argument: whatever the
-	// predicate decides, a refilter-narrowed body cannot enter the shared cell.
-	resolveCtx, _ = cache.WithUAFTouchedSink(resolveCtx)
+	// Install EVERY sink populateWidgetContentL1 (below) gates the identity-free
+	// widgetContent Put on — stage-error (#313 Cache-A), external-touched
+	// (external-no-cache 2026-06-22), sensitive-touched (#398) and UAF-touched
+	// (1.12.3 A-1/R-1) — on the
+	// SAME resolveCtx that flows into widgets.Resolve AND into the populate, so
+	// each post-resolve Count() reflects this widget's resolve. The set lives in
+	// ONE helper shared with the deep-page drain (iterateApiRefPages), so both
+	// widgetContent Put paths decline identically (#450); see
+	// withWidgetContentPutSinks for why each gate exists — in particular why the
+	// UAF gate must not rest on the isRBACSensitiveApiRefWidget heuristic.
+	resolveCtx = withWidgetContentPutSinks(resolveCtx)
 
 	// Resolve this widget. The resolver recursively reaches this widget's
 	// apiRef RESTAction (firing lazyRegisterInnerCallPaths on any
