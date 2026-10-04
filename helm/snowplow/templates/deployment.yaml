@@ -96,6 +96,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # SNOWPLOW_SERVICE_VERSION (#462) is the pod's own
+            # app.kubernetes.io/version label: the value the collector's
+            # k8sattributes stamps as service.version on the rows IT produces
+            # for this pod (kubeletstats metrics, filelog lines). The SDK uses
+            # it as service.version too, so every row about the pod carries
+            # ONE value. The git commit stays on vcs.ref.head.revision.
+            - name: SNOWPLOW_SERVICE_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/version']
             # envFrom (the ConfigMap) performs NO $(VAR) expansion — only a
             # container env: entry does, against another env: entry in the same
             # container. This entry OVERRIDES the same key from the ConfigMap and

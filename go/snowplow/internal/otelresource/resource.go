@@ -17,17 +17,24 @@
 // `service.namespace` and `service.instance.id` verbatim, plus every pod
 // label via `key_regex: (.*)`. Two consequences drive this file.
 //
-// (1) DIVERGENCE. The chart labels every pod
-// `app.kubernetes.io/version: {{ .Chart.AppVersion }}`, so the processor
-// would derive service.version = the CHART version (1.12.4) while the
-// SDK sets it to the GIT SHORT COMMIT. Two values, one key. The
-// processor's documented contract is not to overwrite an attribute
-// already on the resource, so the SDK should win — but that is inferred,
-// not traced, and F7(a) settles it after deploy. Setting all four
-// explicitly is correct EITHER WAY: there is nothing left to derive.
-// The chart appVersion is not lost — it stays on the
-// app.kubernetes.io/version label, which the processor copies in under
-// its own raw key regardless.
+// (1) ONE service.version (#462). The collector's own receivers export rows
+// about the snowplow pod too: kubeletstats (container/pod CPU, memory,
+// network) and filelog (the stdout log lines). Those rows carry no SDK
+// resource, so k8sattributes derives their service.version from the pod
+// label app.kubernetes.io/version, which the chart sets to
+// {{ .Chart.AppVersion }} (the release, e.g. 1.12.35). Until #462 the SDK
+// set service.version to the git commit instead, so one pod exported two
+// values under one key (verified on 057: SDK metrics carried the 40-char
+// SHA, kubeletstats metrics and every filelog line carried 1.12.35), and a
+// query filtered on one value silently missed the other half of the pod.
+//
+// The fix makes the SDK read the SAME label: the chart passes it through
+// the downward API as SNOWPLOW_SERVICE_VERSION (fieldRef
+// metadata.labels['app.kubernetes.io/version']), so service.version is
+// equal by construction on every row, SDK or collector. The commit is not
+// lost: it stays on the resource as vcs.ref.head.revision and on the
+// snowplow_build_info{version} metric attribute. Outside a pod (no env) the
+// build string is used, as before.
 //
 // (2) ASSOCIATION [C5], the more dangerous one. The processor's
 // `pod_association` is, in order, `k8s.pod.ip` -> `k8s.pod.uid` ->
@@ -82,14 +89,35 @@ const (
 	EnvPodUID       = "POD_UID"
 	EnvPodName      = "POD_NAME"
 	EnvPodNamespace = "POD_NAMESPACE"
+
+	// EnvServiceVersion is the downward-API entry carrying the pod's
+	// app.kubernetes.io/version label: the value the collector's
+	// k8sattributes processor stamps on the rows it produces for this pod
+	// (#462). It is service.version when set.
+	EnvServiceVersion = "SNOWPLOW_SERVICE_VERSION"
+
+	// AttrVCSRevision carries the build commit once service.version is the
+	// release (#462). The semconv key (vcs.ref.head.revision) postdates the
+	// semconv package this module pins, so it is spelled out.
+	AttrVCSRevision = attribute.Key("vcs.ref.head.revision")
 )
+
+// ServiceVersion is the service.version every pipeline reports: the pod's
+// app.kubernetes.io/version label (EnvServiceVersion) when the chart wires
+// it, else the build string.
+func ServiceVersion(build string) string {
+	if v := env.String(EnvServiceVersion, ""); v != "" {
+		return v
+	}
+	return build
+}
 
 // Build returns the resource for all three pipelines.
 //
-// build is the snowplow build string (main.build — the git short
-// commit), recorded as service.version. It is the artifact identity: it
-// answers "which commit produced this row", which the chart appVersion
-// cannot.
+// build is the snowplow build string (main.build, the full 40-character git
+// commit the Dockerfile stamps). service.version is ServiceVersion(build):
+// the pod's release label when the chart wires it, so every row about the
+// pod agrees (#462). The commit is recorded as vcs.ref.head.revision.
 //
 // nsFallback supplies service.namespace when POD_NAMESPACE is unset —
 // callers pass kubeutil.ServiceAccountNamespace, which reads the
@@ -109,7 +137,10 @@ const (
 func Build(ctx context.Context, build string, nsFallback func() (string, error)) (*resource.Resource, error) {
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName(ServiceName),
-		semconv.ServiceVersion(build),
+		semconv.ServiceVersion(ServiceVersion(build)),
+	}
+	if build != "" {
+		attrs = append(attrs, AttrVCSRevision.String(build))
 	}
 
 	ns := env.String(EnvPodNamespace, "")

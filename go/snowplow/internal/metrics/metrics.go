@@ -721,7 +721,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// --- build identity, so every other panel can be pinned to a commit.
 	buildInfo, err := m.Int64ObservableGauge(
 		"snowplow_build_info",
-		metric.WithDescription("Constant 1, labelled with the snowplow build (git short commit)."))
+		metric.WithDescription("Constant 1, labelled with the snowplow build (the full 40-character git commit); the per-pod release is the resource service.version."))
 	if err != nil {
 		return err
 	}
