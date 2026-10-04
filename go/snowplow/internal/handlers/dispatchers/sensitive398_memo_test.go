@@ -2,11 +2,8 @@ package dispatchers
 
 import (
 	"context"
-	"encoding/json"
 
-	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
-	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	"testing"
 	"time"
 
@@ -62,14 +59,8 @@ func TestS398_SeedMemoHitStillDeclinesSecret(t *testing.T) {
 		}
 		return out, nil
 	}
-	{
-		ds, aerr := apiref.Resolve(cohort, apiref.ResolveOptions{ApiRef: templatesv1.ObjectReference{
-			Reference: templatesv1.Reference{Name: psRAName, Namespace: h1NS}, Resource: h1RAGVR.Resource,
-			APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version}, AuthnNS: psAuthnNS, PerPage: -7, Page: -7})
-		b, _ := json.Marshal(ds)
-		t.Logf("DEBUG apiref err=%v sentinel=%v ds=%.500s", aerr, psHasSentinel(b), string(b))
-	}
 	declinedBefore := cache.SensitiveSkippedPutForTest()
+	memoSkippedBefore := sensitiveMemoSkipped398()
 	for _, w := range []*unstructured.Unstructured{w1, w2} {
 		e := navWidgetEntry{W: w, GVR: h1WidgetGVR, PerPage: -1, Page: -1, KeyPerPage: -1, KeyPage: -1}
 		_ = seedOneWidget(cohort, e, psAuthnNS, seedModeBoot)
@@ -79,7 +70,7 @@ func TestS398_SeedMemoHitStillDeclinesSecret(t *testing.T) {
 	// The arm must exercise the memo: either a sibling HIT it (the pre-fix shape,
 	// where the memo held the Secret-derived body) or the producer's Store was
 	// skipped for the sensitive read (the fix).
-	if hits == 0 && sensitiveMemoSkipped398() == 0 {
+	if hits == 0 && sensitiveMemoSkipped398() == memoSkippedBefore {
 		t.Fatalf("SETUP: the seed memo path was not exercised (hits=%d misses=%d, no sensitive Store skip)", hits, misses)
 	}
 	if hits > 0 {
@@ -87,11 +78,6 @@ func TestS398_SeedMemoHitStillDeclinesSecret(t *testing.T) {
 			"with no dispatch (hits=%d) — the sibling never re-bumps the sensitive sink", hits)
 	}
 	c := cache.ResolvedCache()
-	for _, k := range c.KeysForTest() {
-		if e, ok := c.GetNoTouch(k); ok && e != nil && e.Inputs != nil {
-			t.Logf("DEBUG cell class=%s name=%s len=%d", e.Inputs.CacheEntryClass, e.Inputs.Name, len(e.RawJSON))
-		}
-	}
 	for _, k := range c.KeysForTest() {
 		if e, ok := c.GetNoTouch(k); ok && e != nil && psHasSentinel(e.RawJSON) {
 			class := ""
