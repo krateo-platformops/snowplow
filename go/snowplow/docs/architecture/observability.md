@@ -766,28 +766,66 @@ reset never produces a negative delta). The delta omits what a pod counted
 before its first export (one export interval); for a pod that started after
 `{since}`, `max(Value)` alone is its lifetime total.
 
-**0. The series exist on the rolled pods.** Every check below passes vacuously
-when its series is missing, so run this first. Expect one row per rolled pod,
-with `series` ≥ 12 (the 4×3 drift product) and every `metric` listed.
+**0. The series exist on the rolled pods, in the right table.** Every check
+below passes vacuously when its series is missing, and a counter exported as a
+gauge (or the reverse) lands in the other table, where checks 2-5 would match
+nothing. So run this first. **Pass = zero rows.** Each row names a rolled pod
+(the roster is `snowplow_build_info`, which is always exported) that is missing
+one of the 11 (table, metric) pairs, or that has fewer than the full 4×3 drift
+or 3 repick series. `missing` lists what is absent.
 
 ```sql
-SELECT ResourceAttributes['k8s.pod.name'] AS pod,
-       uniqExact(MetricName, toString(Attributes)) AS series,
-       groupUniqArray(MetricName) AS metric
+WITH
+  ['sum:snowplow_l1_identity_class_drift_declined_total',
+   'sum:snowplow_l1_representative_repick_total',
+   'sum:snowplow_binding_set_memo_hits',
+   'sum:snowplow_binding_set_memo_misses',
+   'sum:snowplow_binding_set_memo_refused',
+   'sum:snowplow_deps_unguarded_put_total',
+   'gauge:snowplow_learned_classes_registered',
+   'gauge:snowplow_learned_classes_seeded',
+   'gauge:snowplow_learned_classes_from_secrets',
+   'gauge:snowplow_learned_classes_secrets_unparseable',
+   'gauge:snowplow_learned_clientconfig_secrets'] AS expected
+SELECT r.pod,
+       arrayFilter(x -> NOT has(s.present, x), expected) AS missing,
+       s.drift_series, s.repick_series
 FROM (
-  SELECT ResourceAttributes, MetricName, Attributes, TimeUnix FROM otel_metrics_sum
-  UNION ALL
-  SELECT ResourceAttributes, MetricName, Attributes, TimeUnix FROM otel_metrics_gauge
-)
-WHERE ServiceName = 'snowplow'
-  AND ResourceAttributes['service.version'] = '{version}'
-  AND TimeUnix >= {since}
-  AND MetricName IN ('snowplow_l1_identity_class_drift_declined_total',
-                     'snowplow_binding_set_memo_hits', 'snowplow_binding_set_memo_misses',
-                     'snowplow_learned_classes_seeded', 'snowplow_learned_classes_from_secrets',
-                     'snowplow_learned_clientconfig_secrets', 'snowplow_deps_unguarded_put_total')
-GROUP BY pod
+  SELECT DISTINCT ResourceAttributes['k8s.pod.name'] AS pod
+  FROM otel_metrics_gauge
+  WHERE ServiceName = 'snowplow'
+    AND ResourceAttributes['service.version'] = '{version}'
+    AND TimeUnix >= {since}
+    AND MetricName = 'snowplow_build_info'
+) AS r
+LEFT JOIN (
+  SELECT pod,
+         groupUniqArray(concat(tbl, ':', MetricName)) AS present,
+         uniqExactIf(toString(Attributes), MetricName = 'snowplow_l1_identity_class_drift_declined_total') AS drift_series,
+         uniqExactIf(toString(Attributes), MetricName = 'snowplow_l1_representative_repick_total') AS repick_series
+  FROM (
+    SELECT 'sum' AS tbl, ResourceAttributes['k8s.pod.name'] AS pod, MetricName, Attributes
+    FROM otel_metrics_sum
+    WHERE ServiceName = 'snowplow'
+      AND ResourceAttributes['service.version'] = '{version}'
+      AND TimeUnix >= {since}
+    UNION ALL
+    SELECT 'gauge' AS tbl, ResourceAttributes['k8s.pod.name'] AS pod, MetricName, Attributes
+    FROM otel_metrics_gauge
+    WHERE ServiceName = 'snowplow'
+      AND ResourceAttributes['service.version'] = '{version}'
+      AND TimeUnix >= {since}
+  )
+  WHERE has(expected, concat(tbl, ':', MetricName))
+  GROUP BY pod
+) AS s ON s.pod = r.pod
+WHERE length(arrayFilter(x -> NOT has(s.present, x), expected)) > 0
+   OR s.drift_series < 12
+   OR s.repick_series < 3
 ```
+
+If `snowplow_build_info` itself returns no pods for `{version}`, nothing was
+rolled or metrics export is off, and that is a failure, not a pass.
 
 **1. Learned classes seeded ≈ 0 on group-only clusters.** On a cluster whose
 RBAC is bound to groups only, no learned class has a distinct target, so

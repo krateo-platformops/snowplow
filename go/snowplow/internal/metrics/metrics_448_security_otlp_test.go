@@ -209,13 +209,52 @@ func c7Seed448(t *testing.T) c7Want448 {
 	return want
 }
 
+// security448Counters are the #448 instruments that must be monotonic,
+// cumulative Sums on the wire (ObservableCounter). Every other #448 instrument
+// must be a Gauge. The kind decides the ClickHouse table a series lands in
+// (otel_metrics_sum vs otel_metrics_gauge), so a kind flip would make the
+// post-roll checklist queries silently match nothing.
+var security448Counters = map[string]bool{
+	"snowplow_l1_identity_class_drift_declined_total": true,
+	"snowplow_l1_representative_repick_total":         true,
+	"snowplow_binding_set_memo_hits":                  true,
+	"snowplow_binding_set_memo_misses":                true,
+	"snowplow_binding_set_memo_refused":               true,
+}
+
+const (
+	kindMonotonicCumulativeSum = "sum(monotonic,cumulative)"
+	kindGauge                  = "gauge"
+)
+
+// wireKind448 names a metric's OTLP data kind precisely enough to tell an
+// ObservableCounter from a non-monotonic or delta Sum and from a Gauge.
+func wireKind448(mt *metricspb.Metric) string {
+	switch d := mt.GetData().(type) {
+	case *metricspb.Metric_Sum:
+		if d.Sum.GetIsMonotonic() && d.Sum.GetAggregationTemporality() == metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE {
+			return kindMonotonicCumulativeSum
+		}
+		return fmt.Sprintf("sum(monotonic=%v,%s)", d.Sum.GetIsMonotonic(), d.Sum.GetAggregationTemporality())
+	case *metricspb.Metric_Gauge:
+		return kindGauge
+	}
+	return fmt.Sprintf("%T", mt.GetData())
+}
+
+// wire448Point is one exported #448 data point: its value and its data kind.
+type wire448Point struct {
+	value int64
+	kind  string
+}
+
 // c7Wire448 indexes every exported #448 data point by series id (latest wins).
-func c7Wire448(exports []capturedExport) map[string]int64 {
+func c7Wire448(exports []capturedExport) map[string]wire448Point {
 	names := map[string]bool{}
 	for _, n := range append(append([]string{}, security448Scalars...), security448Labelled...) {
 		names[n] = true
 	}
-	out := map[string]int64{}
+	out := map[string]wire448Point{}
 	for _, e := range exports {
 		for _, rm := range e.req.GetResourceMetrics() {
 			for _, sm := range rm.GetScopeMetrics() {
@@ -223,6 +262,7 @@ func c7Wire448(exports []capturedExport) map[string]int64 {
 					if !names[mt.GetName()] {
 						continue
 					}
+					kind := wireKind448(mt)
 					var dps []*metricspb.NumberDataPoint
 					switch d := mt.GetData().(type) {
 					case *metricspb.Metric_Sum:
@@ -235,7 +275,7 @@ func c7Wire448(exports []capturedExport) map[string]int64 {
 						for _, kv := range dp.GetAttributes() {
 							attrs[kv.GetKey()] = kv.GetValue().GetStringValue()
 						}
-						out[seriesID(mt.GetName(), attrs)] = dp.GetAsInt()
+						out[seriesID(mt.GetName(), attrs)] = wire448Point{value: dp.GetAsInt(), kind: kind}
 					}
 				}
 			}
@@ -244,8 +284,9 @@ func c7Wire448(exports []capturedExport) map[string]int64 {
 	return out
 }
 
-// c7Assert448 requires every seeded #448 series on the wire with its value,
-// and no #448 series the seed did not predict (a stray attribute value).
+// c7Assert448 requires every seeded #448 series on the wire with its value and
+// its data kind, and no #448 series the seed did not predict (a stray
+// attribute value).
 func c7Assert448(t *testing.T, exports []capturedExport, want c7Want448) {
 	t.Helper()
 	got := c7Wire448(exports)
@@ -255,8 +296,19 @@ func c7Assert448(t *testing.T, exports []capturedExport, want c7Want448) {
 			t.Errorf("#448: %s never left the process", id)
 			continue
 		}
-		if g != w {
-			t.Errorf("#448: %s = %d on the wire, want %d (the mirror observed the wrong counter)", id, g, w)
+		if g.value != w {
+			t.Errorf("#448: %s = %d on the wire, want %d (the mirror observed the wrong counter)", id, g.value, w)
+		}
+		name := id
+		if i := strings.IndexByte(id, '{'); i >= 0 {
+			name = id[:i]
+		}
+		wantKind := kindGauge
+		if security448Counters[name] {
+			wantKind = kindMonotonicCumulativeSum
+		}
+		if g.kind != wantKind {
+			t.Errorf("#448: %s is exported as %s, want %s (a Gauge lands in otel_metrics_gauge where the checklist reads otel_metrics_sum; a non-monotonic or delta Sum breaks its max-min deltas)", id, g.kind, wantKind)
 		}
 	}
 	for id := range got {
