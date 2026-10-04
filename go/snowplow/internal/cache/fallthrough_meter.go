@@ -187,6 +187,16 @@ const (
 	ReasonApistageGetPartialShape FallthroughReason = "apistage-get-partial-shape"
 	ReasonGetMissLetApiserver404  FallthroughReason = "get-miss-let-apiserver-404"
 
+	// #398 — two genuine apiserver hops added by the Secrets-informer fix.
+	// ReasonInformerSensitive: the GVR is classified sensitive
+	// (IsSensitiveResource — core v1/secrets), never informed, always served
+	// live under the caller's credentials. ReasonInformerRepresentation: the
+	// call's Accept header asks for a non-default representation
+	// (`as=PartialObjectMetadata`, `as=Table`) the informer cannot produce.
+	// Closed-enum count: 21 + 2 = 23 (24 with #443's ReasonRawRead below).
+	ReasonInformerSensitive      FallthroughReason = "informer-fallthrough-sensitive"
+	ReasonInformerRepresentation FallthroughReason = "informer-fallthrough-representation"
+
 	// Ship D.5 / 0.30.152 — cluster-list-when-allowed iterator collapse.
 	// ReasonClusterListDispatch is a diagnostic (NOT a fall-through) counter
 	// recording that a stage's iterator fan-out was successfully collapsed

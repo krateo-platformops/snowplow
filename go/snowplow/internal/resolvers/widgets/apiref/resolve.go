@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
@@ -259,6 +260,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	var memoKey string
 	var capBuf *[]cache.DepKey
 	var layerMark int
+	// #398 — the producing resolve's own sensitive-read sink (a child: every bump
+	// still reaches the caller's sink, so the caller's Put declines as before).
+	var memoSensitive *cache.SensitiveTouchedSink
 	if memo != nil {
 		username, groups := identityForMemo(ctx)
 		memoKey = memo.Key(opts.ApiRef.Namespace, opts.ApiRef.Name,
@@ -298,6 +302,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// EndCapture on the same handle is a no-op).
 		capBuf = cache.Deps().BeginCapture(l1Key)
 		defer cache.Deps().EndCapture(l1Key, capBuf)
+		// #398 — a memo HIT serves a stored body with NO dispatch, so it can never
+		// re-bump the sensitive sink: a sibling widget served from the memo would
+		// Put the Secret body its producer declined. So a body produced from a
+		// sensitive read is never STORED in the memo (which also keeps the Secret
+		// out of the per-pass memo itself); every sibling re-resolves live.
+		ctx, memoSensitive = cache.WithSensitiveTouchedSink(ctx)
 	}
 
 	// storeMemo deep-copies the resolved body (JSON-native round-trip, C-F4-3 —
@@ -311,6 +321,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			return
 		}
 		deps := cache.Deps().EndCapture(l1Key, capBuf)
+		if memoSensitive.Count() > 0 {
+			noteSensitiveMemoStoreSkipped()
+			return // #398: never memoise a body produced from a sensitive read
+		}
 		// #411: the RESTAction CR is the body's first dep, but objects.Get
 		// Records it under l1Key BEFORE the capture opens, so on the
 		// unpaginated path (real restactions.Resolve, no raKey edge replay) it
@@ -390,3 +404,12 @@ func containsDep(deps []cache.DepKey, dk cache.DepKey) bool {
 	}
 	return false
 }
+
+// sensitiveMemoStoreSkipped counts SeedResolveMemo Stores skipped because the
+// producing resolve read a sensitive resource (#398).
+var sensitiveMemoStoreSkipped atomic.Uint64
+
+func noteSensitiveMemoStoreSkipped() { sensitiveMemoStoreSkipped.Add(1) }
+
+// SensitiveMemoStoreSkippedForTest reads the counter.
+func SensitiveMemoStoreSkippedForTest() uint64 { return sensitiveMemoStoreSkipped.Load() }

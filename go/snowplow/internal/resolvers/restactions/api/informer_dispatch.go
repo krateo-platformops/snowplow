@@ -342,6 +342,29 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		return nil, false
 	}
 
+	// Gate 5a (#398): non-default response REPRESENTATION. The informer holds
+	// full objects and can only answer in the default JSON shape; a call whose
+	// Accept header asks for another representation (`as=PartialObjectMetadata`,
+	// `as=Table`, ...) must reach the apiserver, which honours it natively.
+	// General for every GVR — this is how a portal asks "does this object
+	// exist?" without receiving its body.
+	if wantsNonDefaultRepresentation(call.Headers) {
+		dispatchInformerFallthrough.Add(1)
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerRepresentation, gvr.String())
+		return nil, false
+	}
+
+	// Gate 5b (#398): sensitive resource (cache.IsSensitiveResource — core
+	// v1/secrets). Never informed (EnsureResourceType refuses it), so never
+	// served here: fall straight through to the apiserver under the caller's own
+	// credentials, with a reason of its own rather than a perpetual
+	// "not-synced", and without touching EnsureResourceType.
+	if cache.IsSensitiveResource(gvr) {
+		dispatchInformerFallthrough.Add(1)
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerSensitive, gvr.String())
+		return nil, false
+	}
+
 	// Gate 6: informer registered + synced. If the GVR is not yet
 	// registered, fire EnsureResourceType (sub-microsecond singleflight
 	// when already registered; lazy registration when not) so a
@@ -614,4 +637,26 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	)
 	dispatchInformerGetServed.Add(1)
 	return raw, true
+}
+
+// wantsNonDefaultRepresentation reports whether any Accept header in headers
+// asks for a non-default representation via the `as=` media-type parameter
+// (e.g. `application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`).
+// Headers are "Name: value" strings (httpcall convention); the name match is
+// case-insensitive.
+func wantsNonDefaultRepresentation(headers []string) bool {
+	for _, h := range headers {
+		name, value, ok := strings.Cut(h, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(name), "Accept") {
+			continue
+		}
+		for _, mediaType := range strings.Split(value, ",") {
+			for _, param := range strings.Split(mediaType, ";")[1:] {
+				if k, _, ok := strings.Cut(strings.TrimSpace(param), "="); ok && strings.EqualFold(k, "as") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

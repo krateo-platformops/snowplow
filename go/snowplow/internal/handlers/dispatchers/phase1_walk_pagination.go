@@ -477,6 +477,9 @@ func iterateApiRefPages(
 		// RBAC-sensitive datagrid PAGE cell the gate is moot (the Put is
 		// already declined upstream at widget_content.go:213) but harmless.
 		resolveCtx, _ = cache.WithStageErrorSink(resolveCtx)
+		// #398 — the page resolve feeds the identity-free content cell below;
+		// a sensitive read under it must decline that Put.
+		resolveCtx, _ = cache.WithSensitiveTouchedSink(resolveCtx)
 
 		res, err := paginationResolvePageFn(resolveCtx, widgets.ResolveOptions{
 			In:      got.Unstructured,
