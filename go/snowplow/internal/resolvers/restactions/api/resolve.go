@@ -1889,6 +1889,17 @@ var discoverGroupResourcesFn = cache.DiscoverGroupResources
 // var-seam idiom.
 var serviceAccountEndpointFn = dynamic.ServiceAccountEndpoint
 
+// SetServiceAccountEndpointForTest swaps serviceAccountEndpointFn and returns a
+// restore func. Out of cluster the real one fails, so a STORED UAF stage never
+// dials anything; a hermetic arm (#443 f) points it at a fake apiserver with a
+// distinct ServiceAccount token so it can tell an SA read from a caller read.
+// TEST-ONLY: production code MUST NOT call it.
+func SetServiceAccountEndpointForTest(fn func() (*endpoints.Endpoint, error)) func() {
+	prev := serviceAccountEndpointFn
+	serviceAccountEndpointFn = fn
+	return func() { serviceAccountEndpointFn = prev }
+}
+
 // inClusterConfigFn is the indirection over rest.InClusterConfig used when a
 // resolve has no RC (a nested in-process resolve on a live request). Out of
 // cluster it fails and the resolve is empty; SetInClusterConfigForTest lets a

@@ -81,11 +81,14 @@ type in443API struct {
 	waitCh chan struct{}
 }
 
-func newIn443API(t *testing.T) *in443API {
+func newIn443API(t *testing.T) *in443API { return newIn443APIFor(t, in443Arm) }
+
+// newIn443APIFor is newIn443API over the ps fake apiserver for arm a.
+func newIn443APIFor(t *testing.T, a psArm) *in443API {
 	t.Helper()
 	perUser := map[string]*atomic.Int64{psAlice: {}, psBob: {}}
 	f := &in443API{extra: map[string]http.HandlerFunc{}, waitCh: make(chan struct{}, 8)}
-	f.inner = psFakeAPIServer(t, in443Arm, perUser)
+	f.inner = psFakeAPIServer(t, a, perUser)
 	u, _ := url.Parse(f.inner.URL)
 	proxy := httputil.NewSingleHostReverseProxy(u)
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -137,12 +140,18 @@ func (f *in443API) reset() {
 // in443Setup builds the cache-on harness and returns the fake apiserver.
 func in443Setup(t *testing.T, extra ...runtime.Object) *in443API {
 	t.Helper()
+	return in443SetupFor(t, in443Arm, extra...)
+}
+
+// in443SetupFor is in443Setup over arm a (arm f: a core Secret target).
+func in443SetupFor(t *testing.T, a psArm, extra ...runtime.Object) *in443API {
+	t.Helper()
 	t.Setenv("CLIENT_MAX_RETRIES", "0")
 	t.Setenv("CLIENT_BASE_BACKOFF", "1ms")
 	t.Setenv("CLIENT_MAX_BACKOFF", "1ms")
 	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
-	psBuildWatcher(t, in443Arm, extra...)
-	f := newIn443API(t)
+	psBuildWatcher(t, a, extra...)
+	f := newIn443APIFor(t, a)
 	psSeedClientconfigs(t, f.srv.URL)
 	return f
 }
