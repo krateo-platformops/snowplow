@@ -787,6 +787,15 @@ receivers produce for the pod), and typing the release selected rows without
 `snowplow_build_info`, so step 0 returned nothing and read as a pass. Since
 #462 both carry the release, and the commit is `vcs.ref.head.revision` and
 `snowplow_build_info{version}`.
+
+> **Rollout note (1.12.36, #462).** From 1.12.36 on, `service.version` on
+> snowplow's own OTLP rows (metrics, traces, logs) is the **release** (the pod's
+> `app.kubernetes.io/version`, e.g. `1.12.36`), no longer the git commit. A
+> saved query, alert or dashboard that filters `service.version` on a commit
+> SHA matches nothing for 1.12.36+ pods. Filter on the resource attribute
+> `vcs.ref.head.revision`, or on the `snowplow_build_info{version}` metric
+> attribute, instead. Both carry the full 40-character commit.
+
 Counters are cumulative per pod, so a window delta is `max(Value) - min(Value)`
 per pod-and-attribute series (a restarted pod is a new `k8s.pod.name`, so a
 reset never produces a negative delta). The delta omits what a pod counted
@@ -798,8 +807,10 @@ below passes vacuously when its series is missing, and a counter exported as a
 gauge (or the reverse) lands in the other table, where checks 2-5 would match
 nothing. So run this first. **Pass = zero rows.** Each row names a rolled pod
 (the roster is `snowplow_build_info`, which is always exported) that is missing
-one of the 11 (table, metric) pairs, or that has fewer than the full 4×3 drift
-or 3 repick series. `missing` lists what is absent.
+one of the 14 (table, metric) pairs, or that has fewer than the full 4×3 drift
+or 3 repick series. `missing` lists what is absent. Step 0 is the single
+presence gate for every later step, including the three #368 counters step 6
+reads.
 
 ```sql
 WITH
@@ -823,6 +834,9 @@ WITH
    'sum:snowplow_binding_set_memo_misses',
    'sum:snowplow_binding_set_memo_refused',
    'sum:snowplow_deps_unguarded_put_total',
+   'sum:snowplow_v7_shadow_wildcard_digest_collision_total',
+   'sum:snowplow_v7_shadow_wildcard_digest_observed_total',
+   'sum:snowplow_v7_shadow_wildcard_digest_evicted_total',
    'gauge:snowplow_learned_classes_registered',
    'gauge:snowplow_learned_classes_seeded',
    'gauge:snowplow_learned_classes_from_secrets',
@@ -1055,9 +1069,8 @@ process, so read each pod's lifetime value (`max(Value)`). Once the enumerate
 projection ungates, expect `verdict = 'certified'` on every pod. Until then
 `observed = 0` on every pod and the verdict reads `not_exercised`. That is
 expected, not a pass. `COLLISION` is a share leak (alert); `void_evicted`
-voids the window (raise the probe caps and re-measure). No rows at all means the
-series are missing (for example, a build from before #455); that is not a pass
-either.
+voids the window (raise the probe caps and re-measure). Their presence is
+checked by step 0; if step 6 returns no rows at all, step 0 has already failed.
 
 ```sql
 WITH
