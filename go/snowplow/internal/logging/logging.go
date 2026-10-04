@@ -82,8 +82,8 @@ func logsEnabled() bool {
 func Enabled() bool { return logsEnabled() }
 
 // Setup wires an OTLP/HTTP log exporter and a batch LoggerProvider carrying
-// a Resource with service.name=snowplow / service.version=build (identical
-// to the TracerProvider's resource so logs and spans agree). It returns the
+// the shared otelresource.Build resource (identical to the TracerProvider's
+// and MeterProvider's, so logs, spans and metrics agree on service.version). It returns the
 // provider — from which callers obtain a log.Logger for the audit emitter —
 // and a shutdown to flush on exit.
 //

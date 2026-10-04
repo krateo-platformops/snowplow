@@ -122,7 +122,7 @@ Defined in `internal/cache/fallthrough_meter_expvar.go`.
 | `snowplow_cache_diagnostic_total` / `snowplow_cache_diagnostic_cells` (`fallthrough_meter.go`, 1.12.4) | the six reasons that reach **no** apiserver (`resolver-plurals-hit`, `resolver-plurals-miss` — double-counted against the discovery hop, `widget-content-hit`, `widget-content-miss-per-user-fallback`, `cluster-list-dispatch`, `cluster-list-shape-fallback`), same cell shape | should **dwarf** the fallthrough total ~8:1 on a warm pod — the reclassification visible at a glance. Routing is by enum membership inside the meter; call sites are unchanged |
 | `snowplow_resolved_cache` (`resolved_cache_expvar.go`, 1.12.4) | L1 store `Stats()` as `map{stat → value}`; per-stat table below. Mirrored to OTLP as `snowplow_resolved_cache{stat}` | previously reachable only through an INFO summary line the chart's `LOG_LEVEL=warn` suppresses |
 | `snowplow_informer_servable` (`servable.go` `ServableCounts`, 1.12.4) | `{registered, synced, servable, watch_broken, confirmed}` | the leading indicator for the `informer-fallthrough-not-synced` cell; `watch_broken > 0` = the stale-delete latch |
-| `snowplow_build_info` (`build_info_expvar.go`, 1.12.4) | `{version}` = `main.build` (git short commit; `unknown` for an unstamped local build) | pins every other metric to a commit. Also the `service.version` OTel resource attribute |
+| `snowplow_build_info` (`build_info_expvar.go`, 1.12.4) | `{version}` = `main.build` (the full 40-character git commit the Dockerfile stamps; `unknown` for an unstamped local build) | pins every other metric to a commit. On OTLP the same commit is the resource attribute `vcs.ref.head.revision`; the resource `service.version` is the pod's release label (`app.kubernetes.io/version`, the chart appVersion), the value the collector stamps on its own rows for the pod (#462) |
 | `snowplow_metrics_series_truncated_total` (OTLP only, 1.12.4) | per-family count of `path\|gvr\|reason` series folded into `gvr="__other__"` by the 5000-series OTLP cap | **0**. Non-zero = a cardinality regression (the cap kept it from becoming an incident); `/debug/vars` keeps the uncapped maps |
 | `snowplow_assertion_violations_total` | per-check `map[string]→uint64` of architectural-invariant breaches. Keys: `read_paths_scoped` (a `/call`-class route not wrapped with `FallthroughScopeMiddleware`, asserted at boot by `cache.AssertReadPathsScoped()`), `serve_requires_servable` (an authoritative cache HIT was about to be served from a not-servable informer — asserted per-serve in `internal/cache/serve_assert.go`) | **0** for every key. Non-zero = an invariant is broken in prod (logged ERROR, pod stays up). **`serve_requires_servable` > 0 is P1** — never-serve-from-not-synced is the most load-bearing cache guarantee |
 
@@ -775,8 +775,18 @@ Defined in `internal/cache/controller_health_expvar.go` / `controller_health.go`
 
 Run after every snowplow roll. It needs no user credential: everything below is
 on OTLP in ClickHouse (ClickStack default schema: `otel_metrics_sum` for
-counters, `otel_metrics_gauge` for gauges). Set `{version}` to the rolled
-build (`service.version`, the git short commit) and `{since}` to the roll time.
+counters, `otel_metrics_gauge` for gauges). The only parameter is `{since}`, the
+roll time (for example `toDateTime64('2026-10-04 09:00:00', 9)`). Which pods and
+which `service.version` to read is DERIVED, never typed: every query starts
+from the `roster` CTE, the pods whose first `snowplow_build_info` row is at or
+after `{since}`, each with the `service.version` and build commit it reports
+(#462). A typed version can silently select the wrong row set: before #462 one
+pod exported two `service.version` values (the SDK's 40-character commit, and
+the chart release on the rows the collector's kubeletstats and filelog
+receivers produce for the pod), and typing the release selected rows without
+`snowplow_build_info`, so step 0 returned nothing and read as a pass. Since
+#462 both carry the release, and the commit is `vcs.ref.head.revision` and
+`snowplow_build_info{version}`.
 Counters are cumulative per pod, so a window delta is `max(Value) - min(Value)`
 per pod-and-attribute series (a restarted pod is a new `k8s.pod.name`, so a
 reset never produces a negative delta). The delta omits what a pod counted
@@ -793,6 +803,20 @@ or 3 repick series. `missing` lists what is absent.
 
 ```sql
 WITH
+  roster AS (
+    -- The rolled pods: every pod whose FIRST snowplow_build_info row is at or
+    -- after {since}, with the service.version and build commit it reports.
+    -- Derived, never typed (#462).
+    SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+           argMax(ResourceAttributes['service.version'], TimeUnix) AS version,
+           argMax(Attributes['version'], TimeUnix) AS build
+    FROM otel_metrics_gauge
+    WHERE ServiceName = 'snowplow'
+      AND MetricName = 'snowplow_build_info'
+      AND TimeUnix >= {since} - INTERVAL 1 HOUR
+    GROUP BY pod
+    HAVING min(TimeUnix) >= {since}
+  ),
   ['sum:snowplow_l1_identity_class_drift_declined_total',
    'sum:snowplow_l1_representative_repick_total',
    'sum:snowplow_binding_set_memo_hits',
@@ -807,14 +831,7 @@ WITH
 SELECT r.pod,
        arrayFilter(x -> NOT has(s.present, x), expected) AS missing,
        s.drift_series, s.repick_series
-FROM (
-  SELECT DISTINCT ResourceAttributes['k8s.pod.name'] AS pod
-  FROM otel_metrics_gauge
-  WHERE ServiceName = 'snowplow'
-    AND ResourceAttributes['service.version'] = '{version}'
-    AND TimeUnix >= {since}
-    AND MetricName = 'snowplow_build_info'
-) AS r
+FROM roster AS r
 LEFT JOIN (
   SELECT pod,
          groupUniqArray(concat(tbl, ':', MetricName)) AS present,
@@ -824,13 +841,13 @@ LEFT JOIN (
     SELECT 'sum' AS tbl, ResourceAttributes['k8s.pod.name'] AS pod, MetricName, Attributes
     FROM otel_metrics_sum
     WHERE ServiceName = 'snowplow'
-      AND ResourceAttributes['service.version'] = '{version}'
+      AND (ResourceAttributes['k8s.pod.name'], ResourceAttributes['service.version']) IN (SELECT pod, version FROM roster)
       AND TimeUnix >= {since}
     UNION ALL
     SELECT 'gauge' AS tbl, ResourceAttributes['k8s.pod.name'] AS pod, MetricName, Attributes
     FROM otel_metrics_gauge
     WHERE ServiceName = 'snowplow'
-      AND ResourceAttributes['service.version'] = '{version}'
+      AND (ResourceAttributes['k8s.pod.name'], ResourceAttributes['service.version']) IN (SELECT pod, version FROM roster)
       AND TimeUnix >= {since}
   )
   WHERE has(expected, concat(tbl, ':', MetricName))
@@ -839,10 +856,17 @@ LEFT JOIN (
 WHERE length(arrayFilter(x -> NOT has(s.present, x), expected)) > 0
    OR s.drift_series < 12
    OR s.repick_series < 3
+UNION ALL
+-- An empty roster is a FAILURE row, never a silent pass: no pod has exported
+-- snowplow_build_info since {since} (nothing rolled, wrong {since}, or
+-- metrics export off).
+SELECT concat('NO ROLLED POD since ', toString({since})) AS pod, expected AS missing,
+       toUInt64(0) AS drift_series, toUInt64(0) AS repick_series
+WHERE (SELECT count() FROM roster) = 0
 ```
 
-If `snowplow_build_info` itself returns no pods for `{version}`, nothing was
-rolled or metrics export is off, and that is a failure, not a pass.
+`SELECT pod, version, build FROM roster` (the CTE alone) shows which pods the
+checklist is reading, the `service.version` each reports and its commit.
 
 **1. Learned classes seeded ≈ 0 on group-only clusters.** On a cluster whose
 RBAC is bound to groups only, no learned class has a distinct target, so
@@ -851,11 +875,26 @@ means distinct-target detection regressed. On a cluster with per-user bindings,
 `seeded` > 0 is expected.
 
 ```sql
+WITH
+  roster AS (
+    -- The rolled pods: every pod whose FIRST snowplow_build_info row is at or
+    -- after {since}, with the service.version and build commit it reports.
+    -- Derived, never typed (#462).
+    SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+           argMax(ResourceAttributes['service.version'], TimeUnix) AS version,
+           argMax(Attributes['version'], TimeUnix) AS build
+    FROM otel_metrics_gauge
+    WHERE ServiceName = 'snowplow'
+      AND MetricName = 'snowplow_build_info'
+      AND TimeUnix >= {since} - INTERVAL 1 HOUR
+    GROUP BY pod
+    HAVING min(TimeUnix) >= {since}
+  )
 SELECT ResourceAttributes['k8s.pod.name'] AS pod, MetricName,
        argMax(Value, TimeUnix) AS latest
 FROM otel_metrics_gauge
 WHERE ServiceName = 'snowplow'
-  AND ResourceAttributes['service.version'] = '{version}'
+  AND (ResourceAttributes['k8s.pod.name'], ResourceAttributes['service.version']) IN (SELECT pod, version FROM roster)
   AND TimeUnix >= {since}
   AND MetricName IN ('snowplow_learned_classes_registered', 'snowplow_learned_classes_seeded',
                      'snowplow_learned_classes_unseeded_capacity', 'snowplow_learned_classes_nav_only')
@@ -868,6 +907,21 @@ ORDER BY pod, MetricName
 is learned from Secrets. Expect **zero rows**.
 
 ```sql
+WITH
+  roster AS (
+    -- The rolled pods: every pod whose FIRST snowplow_build_info row is at or
+    -- after {since}, with the service.version and build commit it reports.
+    -- Derived, never typed (#462).
+    SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+           argMax(ResourceAttributes['service.version'], TimeUnix) AS version,
+           argMax(Attributes['version'], TimeUnix) AS build
+    FROM otel_metrics_gauge
+    WHERE ServiceName = 'snowplow'
+      AND MetricName = 'snowplow_build_info'
+      AND TimeUnix >= {since} - INTERVAL 1 HOUR
+    GROUP BY pod
+    HAVING min(TimeUnix) >= {since}
+  )
 SELECT pod, from_secrets, clientconfig_secrets, unparseable
 FROM (
   SELECT ResourceAttributes['k8s.pod.name'] AS pod,
@@ -876,7 +930,7 @@ FROM (
          argMaxIf(Value, TimeUnix, MetricName = 'snowplow_learned_classes_secrets_unparseable') AS unparseable
   FROM otel_metrics_gauge
   WHERE ServiceName = 'snowplow'
-    AND ResourceAttributes['service.version'] = '{version}'
+    AND (ResourceAttributes['k8s.pod.name'], ResourceAttributes['service.version']) IN (SELECT pod, version FROM roster)
     AND TimeUnix >= {since}
     AND MetricName IN ('snowplow_learned_classes_from_secrets', 'snowplow_learned_clientconfig_secrets',
                        'snowplow_learned_classes_secrets_unparseable')
@@ -889,10 +943,25 @@ WHERE from_secrets = 0 AND clientconfig_secrets > 0
 that does not install the dep-generation sink). Expect **zero rows**.
 
 ```sql
+WITH
+  roster AS (
+    -- The rolled pods: every pod whose FIRST snowplow_build_info row is at or
+    -- after {since}, with the service.version and build commit it reports.
+    -- Derived, never typed (#462).
+    SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+           argMax(ResourceAttributes['service.version'], TimeUnix) AS version,
+           argMax(Attributes['version'], TimeUnix) AS build
+    FROM otel_metrics_gauge
+    WHERE ServiceName = 'snowplow'
+      AND MetricName = 'snowplow_build_info'
+      AND TimeUnix >= {since} - INTERVAL 1 HOUR
+    GROUP BY pod
+    HAVING min(TimeUnix) >= {since}
+  )
 SELECT ResourceAttributes['k8s.pod.name'] AS pod, argMax(Value, TimeUnix) AS unguarded_put
 FROM otel_metrics_sum
 WHERE ServiceName = 'snowplow'
-  AND ResourceAttributes['service.version'] = '{version}'
+  AND (ResourceAttributes['k8s.pod.name'], ResourceAttributes['service.version']) IN (SELECT pod, version FROM roster)
   AND TimeUnix >= {since}
   AND MetricName = 'snowplow_deps_unguarded_put_total'
 GROUP BY pod
@@ -905,6 +974,21 @@ climbs without RBAC churn means keys and identities disagree outside a
 grant/revoke race.
 
 ```sql
+WITH
+  roster AS (
+    -- The rolled pods: every pod whose FIRST snowplow_build_info row is at or
+    -- after {since}, with the service.version and build commit it reports.
+    -- Derived, never typed (#462).
+    SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+           argMax(ResourceAttributes['service.version'], TimeUnix) AS version,
+           argMax(Attributes['version'], TimeUnix) AS build
+    FROM otel_metrics_gauge
+    WHERE ServiceName = 'snowplow'
+      AND MetricName = 'snowplow_build_info'
+      AND TimeUnix >= {since} - INTERVAL 1 HOUR
+    GROUP BY pod
+    HAVING min(TimeUnix) >= {since}
+  )
 SELECT site, reason,
        sum(delta) AS declines,
        round(sum(delta) / greatest(dateDiff('minute', {since}, now()), 1), 3) AS per_minute
@@ -914,7 +998,7 @@ FROM (
          max(Value) - min(Value) AS delta
   FROM otel_metrics_sum
   WHERE ServiceName = 'snowplow'
-    AND ResourceAttributes['service.version'] = '{version}'
+    AND (ResourceAttributes['k8s.pod.name'], ResourceAttributes['service.version']) IN (SELECT pod, version FROM roster)
     AND TimeUnix >= {since}
     AND MetricName = 'snowplow_l1_identity_class_drift_declined_total'
   GROUP BY pod, site, reason
@@ -928,6 +1012,21 @@ shard, so the ratio reads how often `/call` pays the cold digest build. Expect
 it high once warm, and `refused` at 0.
 
 ```sql
+WITH
+  roster AS (
+    -- The rolled pods: every pod whose FIRST snowplow_build_info row is at or
+    -- after {since}, with the service.version and build commit it reports.
+    -- Derived, never typed (#462).
+    SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+           argMax(ResourceAttributes['service.version'], TimeUnix) AS version,
+           argMax(Attributes['version'], TimeUnix) AS build
+    FROM otel_metrics_gauge
+    WHERE ServiceName = 'snowplow'
+      AND MetricName = 'snowplow_build_info'
+      AND TimeUnix >= {since} - INTERVAL 1 HOUR
+    GROUP BY pod
+    HAVING min(TimeUnix) >= {since}
+  )
 SELECT pod,
        hits, misses, refused,
        round(hits / greatest(hits + misses, 1), 4) AS hit_ratio
@@ -941,7 +1040,7 @@ FROM (
            - minIf(Value, MetricName = 'snowplow_binding_set_memo_refused') AS refused
   FROM otel_metrics_sum
   WHERE ServiceName = 'snowplow'
-    AND ResourceAttributes['service.version'] = '{version}'
+    AND (ResourceAttributes['k8s.pod.name'], ResourceAttributes['service.version']) IN (SELECT pod, version FROM roster)
     AND TimeUnix >= {since}
     AND MetricName IN ('snowplow_binding_set_memo_hits', 'snowplow_binding_set_memo_misses',
                        'snowplow_binding_set_memo_refused')
@@ -961,6 +1060,21 @@ series are missing (for example, a build from before #455); that is not a pass
 either.
 
 ```sql
+WITH
+  roster AS (
+    -- The rolled pods: every pod whose FIRST snowplow_build_info row is at or
+    -- after {since}, with the service.version and build commit it reports.
+    -- Derived, never typed (#462).
+    SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+           argMax(ResourceAttributes['service.version'], TimeUnix) AS version,
+           argMax(Attributes['version'], TimeUnix) AS build
+    FROM otel_metrics_gauge
+    WHERE ServiceName = 'snowplow'
+      AND MetricName = 'snowplow_build_info'
+      AND TimeUnix >= {since} - INTERVAL 1 HOUR
+    GROUP BY pod
+    HAVING min(TimeUnix) >= {since}
+  )
 SELECT pod, collision, observed, evicted,
        multiIf(collision > 0, 'COLLISION',
                evicted > 0, 'void_evicted',
@@ -974,7 +1088,7 @@ FROM (
          uniqExactIf(MetricName, MetricName LIKE 'snowplow_v7_shadow_wildcard_digest_%') AS present
   FROM otel_metrics_sum
   WHERE ServiceName = 'snowplow'
-    AND ResourceAttributes['service.version'] = '{version}'
+    AND (ResourceAttributes['k8s.pod.name'], ResourceAttributes['service.version']) IN (SELECT pod, version FROM roster)
     AND TimeUnix >= {since}
     AND MetricName LIKE 'snowplow_v7_shadow_wildcard_digest_%'
   GROUP BY pod

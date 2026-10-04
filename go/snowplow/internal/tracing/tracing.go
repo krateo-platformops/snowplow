@@ -108,8 +108,9 @@ func tracingEnabled() bool {
 // When the gate is off it returns a no-op ShutdownFunc and registers
 // nothing (off-path byte-identical guarantee).
 //
-// build is the snowplow build string (main.build), recorded as the
-// service.version resource attribute.
+// build is the snowplow build string (main.build, the full git commit). The
+// resource (otelresource.Build) records it as vcs.ref.head.revision; its
+// service.version is the pod's release label when the chart wires it (#462).
 func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 	noop := func(context.Context) error { return nil }
 
