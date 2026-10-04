@@ -249,15 +249,26 @@ func RegisterSubjectBindingSetExpvar() {
 		expvar.Publish("snowplow_binding_set_memo_hits", expvar.Func(func() any { return bindingSetMemoHits.Load() }))
 		expvar.Publish("snowplow_binding_set_memo_misses", expvar.Func(func() any { return bindingSetMemoMisses.Load() }))
 		expvar.Publish("snowplow_binding_set_memo_refused", expvar.Func(func() any { return bindingSetMemoRefused.Load() }))
-		expvar.Publish("snowplow_binding_set_memo_entries", expvar.Func(func() any {
-			if cur := bindingSetMemo.Load(); cur != nil {
-				cur.mu.RLock()
-				defer cur.mu.RUnlock()
-				return len(cur.m)
-			}
-			return 0
-		}))
+		expvar.Publish("snowplow_binding_set_memo_entries", expvar.Func(func() any { return bindingSetMemoEntries() }))
 	})
+}
+
+// bindingSetMemoEntries is the live entry count of the current memo shard.
+func bindingSetMemoEntries() int {
+	if cur := bindingSetMemo.Load(); cur != nil {
+		cur.mu.RLock()
+		defer cur.mu.RUnlock()
+		return len(cur.m)
+	}
+	return 0
+}
+
+// BindingSetMemoSnapshot returns the binding-set memo counters (hits, misses,
+// refused, entries) — the same atomics the snowplow_binding_set_memo_* expvar
+// keys read — so the OTLP mirror (internal/metrics, #448) observes the values
+// /debug/vars shows. hits/misses/refused are monotonic; entries is a gauge.
+func BindingSetMemoSnapshot() (hits, misses, refused uint64, entries int) {
+	return bindingSetMemoHits.Load(), bindingSetMemoMisses.Load(), bindingSetMemoRefused.Load(), bindingSetMemoEntries()
 }
 
 func currentBindingSetShard(snap *cache.RBACSnapshot) *bindingSetShard {
