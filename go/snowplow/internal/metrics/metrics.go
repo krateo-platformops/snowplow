@@ -1015,6 +1015,9 @@ func registerInstruments(m metric.Meter, build string) error {
 		registeredGVRs, prewarmDone, prewarmElapsed,
 		memoHits, memoMisses, memoSwaps, memoRefused, memoDenyUncached, memoEntries,
 		prewarmEngEnqueued, prewarmEngProcessed, prewarmEngYield, prewarmEngPending,
+		// --- #368 (registered since #455; observed but unregistered before, so
+		// the SDK dropped every observation) ---
+		shadowWildcardDigestCollision, shadowWildcardDigestObserved, shadowWildcardDigestEvicted,
 		phase1UnitsPlanned, phase1UnitsSeeded, phase1ApiRefPages, phase1EligibleNoContinue,
 		phase1WalkZeroChildren, phase1WalkObservations,
 		phase1SeedResolves, phase1SeedFailures, phase1SeedRBACDeny, phase1SeedOpFail,

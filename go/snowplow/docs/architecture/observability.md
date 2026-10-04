@@ -275,6 +275,23 @@ Defined in `internal/handlers/dispatchers/customer_inflight_metrics.go`.
 |---|---|---|
 | `snowplow_customer_resolve_inflight` | gauge — customer `/call` dispatches currently executing on the **RESOLVE path**: GET `/call` + POST `/call/read` that reached a restactions/widgets handler, where `markCustomerInFlight` brackets `ServeHTTP`. This is the SAME population the refresher's customer-priority yield keys off, so #384 serveReserve sizes against the same customer definition the live yield uses | 0 at idle (no customers in flight = healthy — a correlation signal, not an alarm); rises with concurrent resolve-path load. **SCOPE — NOT "all customer activity":** EXCLUDES the direct-proxy `Call()`/`CallRead()` fallthrough, `GET /list`, and all write verbs (POST/PUT/PATCH/DELETE `/call` route straight to `Call()` with no Dispatcher) — those are I/O-bound apiserver proxies that do not contend for the refresher's resolve-CPU. Counted ONCE per OUTERMOST call — `markCustomerInFlight` is at `ServeHTTP` entry only; a nested resolve runs via the in-process `apiref.Resolve` path and never re-enters `ServeHTTP`, so it does not re-mark. Cache-gated expvar, mirrored to OTLP as the `snowplow_customer_resolve_inflight` `Int64ObservableGauge` (#386 M3 PR2 — hand-wired in `metrics.go` on #311's pattern, no expvar→OTLP bridge, scalars-only) for ClickStack correlation (refresher/cache behavior vs customer load). A correlation gauge, NOT a detector |
 
+### v7 wildcard digest-collision probe (#368)
+
+A dark probe (`internal/handlers/dispatchers/shadow_wildcard_digest_probe.go`)
+that certifies the ClassWildcard projection digest before v7 shares cells
+across identities. Its three counters are hand-wired OTLP counters (sums).
+Before #455 they were observed but never registered with the callback, so the
+SDK dropped every observation and none of them reached ClickStack.
+
+| OTLP instrument | meaning | healthy |
+|---|---|---|
+| `snowplow_v7_shadow_wildcard_digest_collision_total` | **DETECTOR.** Shareable, ungated wildcard cells whose digest failed to tell apart two identities with different evaluator access (a Step-3 share leak) | **0**. Alert on > 0 |
+| `snowplow_v7_shadow_wildcard_digest_observed_total` | the denominator: distinct (cell, digest) pairs seen with ≥ 2 identities, shareable and ungated | > 0 once the enumerate projection ungates. 0 means not yet exercised, **not** certified |
+| `snowplow_v7_shadow_wildcard_digest_evicted_total` | observations dropped by the probe's caps (LRU, per-entry coordinate or identity cap). A dropped observation can miss a collision | **0**. Any value voids certification for the window: raise the caps and re-measure |
+
+The certification rule is read in ClickStack as step 6 of the
+[POST-ROLL CHECKLIST](#post-roll-checklist-clickstack).
+
 ### Live refresh (SSE)
 Defined in `internal/cache/refresh_broadcaster_expvar.go`; one expvar key,
 `snowplow_refresh_broadcaster`, a `map{stat → value}` derived from the `RefreshBroadcasterStats`
@@ -930,6 +947,39 @@ FROM (
                        'snowplow_binding_set_memo_refused')
   GROUP BY pod
 )
+ORDER BY pod
+```
+
+**6. #368 certification.** The ClassWildcard projection is certified on a pod
+iff `collision == 0 AND observed > 0 AND evicted == 0`. The counters are per
+process, so read each pod's lifetime value (`max(Value)`). Once the enumerate
+projection ungates, expect `verdict = 'certified'` on every pod. Until then
+`observed = 0` on every pod and the verdict reads `not_exercised`. That is
+expected, not a pass. `COLLISION` is a share leak (alert); `void_evicted`
+voids the window (raise the probe caps and re-measure). No rows at all means the
+series are missing (for example, a build from before #455); that is not a pass
+either.
+
+```sql
+SELECT pod, collision, observed, evicted,
+       multiIf(collision > 0, 'COLLISION',
+               evicted > 0, 'void_evicted',
+               observed = 0, 'not_exercised',
+               'certified') AS verdict
+FROM (
+  SELECT ResourceAttributes['k8s.pod.name'] AS pod,
+         maxIf(Value, MetricName = 'snowplow_v7_shadow_wildcard_digest_collision_total') AS collision,
+         maxIf(Value, MetricName = 'snowplow_v7_shadow_wildcard_digest_observed_total') AS observed,
+         maxIf(Value, MetricName = 'snowplow_v7_shadow_wildcard_digest_evicted_total') AS evicted,
+         uniqExactIf(MetricName, MetricName LIKE 'snowplow_v7_shadow_wildcard_digest_%') AS present
+  FROM otel_metrics_sum
+  WHERE ServiceName = 'snowplow'
+    AND ResourceAttributes['service.version'] = '{version}'
+    AND TimeUnix >= {since}
+    AND MetricName LIKE 'snowplow_v7_shadow_wildcard_digest_%'
+  GROUP BY pod
+)
+WHERE present = 3
 ORDER BY pod
 ```
 
