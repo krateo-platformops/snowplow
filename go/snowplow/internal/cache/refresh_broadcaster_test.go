@@ -6,14 +6,12 @@
 // Covers:
 //   9.5a — PublishRefresh provably unreachable under cache-off (hub nil,
 //          counters stay 0; the §2.4 nil-path).
-//   9.6  — slow-consumer never stalls the producer (-race; blocked sink, drop
-//          counter climbs, OTHER subscribers still receive, publish returns
-//          promptly).
-//   9.8  — a dropped TERMINAL signal does not strand state: after the last
-//          signal is dropped (saturated sink), the cell is still fresh and a
-//          later read (modelling the frontend's 5s-throttle refetch) sees it
-//          — the SSE signal is an optimisation over the throttle, never a
-//          deadlock-on-drop replacement.
+//   9.6  — slow-consumer never stalls the producer (-race; blocked sink
+//          DEFERS (#484, formerly dropped), OTHER subscribers still receive,
+//          publish returns promptly, the slow sink gets the tail frame).
+//   9.8  — the TERMINAL signal on a saturated sink is deferred and delivered
+//          once the sink drains; its re-read is fresh (#484: the old premise,
+//          a blind 5s-throttle refetch, does not exist in the SPA).
 //   plus broadcaster mechanics: coalesce-per-key, keyRefs/HasRefreshSubscriber
 //   refcount under arm/disarm/unsub, per-key routing (a sub only gets its own
 //   armed keys).
@@ -375,17 +373,25 @@ func TestRefreshBroadcaster_ZeroWindowRedArm(t *testing.T) {
 
 // TestRefreshBroadcaster_SlowConsumerNeverStalls is falsifier 9.6. Run under
 // -race. A subscriber whose sink is never drained must NOT block PublishRefresh:
-// once its buffer (cap refreshSubChanCap) fills, further sends DROP (counter
-// climbs) and the producer returns promptly. A second, healthy subscriber must
-// keep receiving throughout. Concurrent publishers + a concurrent (blocked)
-// reader exercise the RWMutex fan-out path for the race detector.
+// once its buffer (cap refreshSubChanCap) fills, further signals DEFER into its
+// refresh pending set (#484 — formerly they dropped) and the producer returns
+// promptly. A second, healthy subscriber must keep receiving throughout.
+// Concurrent publishers + a concurrent (blocked) reader exercise the RWMutex
+// fan-out path and the per-subscriber pmu for the race detector. Once the slow
+// sink drains, the key's last change reaches it (it was not lost).
+//
+// #484 assertion changes (feedback_diff_for_deleted_tests_not_just_added):
+//   - REMOVED `dropped > 0` ("the drop arm was exercised"). REPLACED by
+//     `dropped == 0` AND `deferred + pending_coalesced > 0` (the full-sink arm
+//     was exercised and deferred instead), the pending set <= the armed set,
+//     and the slow sink receives the key after it drains.
+//   - KEPT the producer-latency bound and the healthy-subscriber assertion.
 func TestRefreshBroadcaster_SlowConsumerNeverStalls(t *testing.T) {
 	withRefreshLayer(t)
 
-	// Slow sink: subscribe, never read from chSlow.
+	// Slow sink: subscribe, do not read until the publishers are done.
 	chSlow, unsubSlow := SubscribeRefresh(map[string]struct{}{"hot": {}})
 	defer unsubSlow()
-	_ = chSlow // deliberately never drained
 
 	// Healthy sink on the same key.
 	chFast, unsubFast := SubscribeRefresh(map[string]struct{}{"hot": {}})
@@ -426,39 +432,64 @@ func TestRefreshBroadcaster_SlowConsumerNeverStalls(t *testing.T) {
 	wg.Wait()
 	publishElapsed := time.Since(publishStart)
 
-	// The producer must never have blocked on the full slow sink. 800
-	// non-blocking publishes are sub-ms work; a generous ceiling that still
-	// catches a real stall (a blocked send would hang indefinitely).
+	// The producer must never have blocked on the full slow sink.
 	if publishElapsed > 2*time.Second {
-		t.Fatalf("PublishRefresh took %s for %d publishes — a slow consumer STALLED the producer (the default: drop arm failed)",
+		t.Fatalf("PublishRefresh took %s for %d publishes — a slow consumer STALLED the producer",
 			publishElapsed, publishers*perPublisher)
 	}
 
-	// The slow sink must have caused drops (its buffer filled).
-	_, delivered, dropped, _ := RefreshBroadcasterCounters()
-	if dropped == 0 {
-		t.Fatalf("dropped counter=0 — the slow sink never overflowed; the drop arm was not exercised")
+	st := RefreshBroadcasterStatsSnapshot()
+	if st.Dropped != 0 {
+		t.Fatalf("dropped=%d — a full sink must DEFER, never drop (#484)", st.Dropped)
+	}
+	if st.Deferred+st.PendingCoalesced == 0 {
+		t.Fatalf("deferred=%d pending_coalesced=%d — the slow sink never overflowed; the full-sink arm was not exercised",
+			st.Deferred, st.PendingCoalesced)
+	}
+	if hw := RefreshPendingHighWaterForTest(); hw > 1 {
+		t.Fatalf("refresh pending high-water=%d exceeds the slow sub's armed set (1) — dedup broken", hw)
 	}
 
-	// The healthy sink must have received signals throughout (it was not
-	// starved by the slow one).
+	// The healthy sink must have received signals throughout.
 	<-fastDone
 	if fastReceived.Load() == 0 {
 		t.Fatalf("healthy subscriber received 0 signals — the slow consumer starved it")
 	}
-	t.Logf("9.6 slow-consumer: %d publishes in %s, delivered=%d dropped=%d, healthy_received=%d (producer never stalled)",
-		publishers*perPublisher, publishElapsed.Round(time.Millisecond), delivered, dropped, fastReceived.Load())
+
+	// Drain the slow sink: everything queued arrives, the last one included —
+	// the backlog's tail is a frame for "hot" sent AFTER the last publish was
+	// deferred, so the slow tab learns of the final change.
+	got := 0
+	for {
+		if _, ok := drainOne(t, chSlow, 200*time.Millisecond); !ok {
+			break
+		}
+		got++
+	}
+	if got != refreshSubChanCap+1 {
+		t.Fatalf("slow sink drained %d frames, want %d (the full sink + exactly one deferred tail frame)", got, refreshSubChanCap+1)
+	}
+	t.Logf("9.6 slow-consumer: %d publishes in %s, delivered=%d deferred=%d pending_coalesced=%d, healthy_received=%d, slow drained=%d",
+		publishers*perPublisher, publishElapsed.Round(time.Millisecond), st.Delivered, st.Deferred, st.PendingCoalesced, fastReceived.Load(), got)
 }
 
-// --- 9.8 — dropped TERMINAL signal degrades to the throttle, never stale ----
+// --- 9.8 — the TERMINAL signal on a saturated sink is deferred, never lost ---
 
 // TestRefreshBroadcaster_DroppedTerminalSignalDegrades is falsifier 9.8 at the
-// cache layer. A saturated sink drops the FINAL signal for a key (no further
-// commit re-signals). The invariant: a dropped signal must NOT strand the
-// widget — because the dropped signal carried no payload, the L1 entry is
-// ALREADY fresh, so the frontend's blind 5s-throttle refetch (modelled here as
-// a plain Get after the drop) reads the fresh value. The SSE signal is an
-// optimisation over the throttle, never a deadlock-on-drop replacement.
+// cache layer. A saturated sink receives the FINAL signal for a key (no
+// further commit re-signals). Since #484 that signal is DEFERRED into the
+// subscriber's pending set and delivered once the sink drains, and the
+// re-read it triggers returns the fresh body.
+//
+// #484 assertion changes (feedback_diff_for_deleted_tests_not_just_added):
+//   - REMOVED the premise "the frontend's blind 5s-throttle refetch (a plain
+//     Get) reads the fresh value". It is false: the SPA does not poll and
+//     does not refetch on focus (#484 trace), so a Get the client never
+//     issues proved nothing about the tab. REMOVED `dropped > 0` as setup.
+//   - REPLACED by: setup `deferred > 0` (the terminal signal hit a full
+//     sink), `dropped == 0`, and the SUBSCRIBER receives a frame for the key
+//     after draining, whose re-read is the fresh body (F-DROP's cache twin,
+//     TestRefresh484_FDrop_FullSinkChangeReachesClient, runs it K×M).
 func TestRefreshBroadcaster_DroppedTerminalSignalDegrades(t *testing.T) {
 	withRefreshLayer(t)
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "3600")
@@ -469,35 +500,45 @@ func TestRefreshBroadcaster_DroppedTerminalSignalDegrades(t *testing.T) {
 	}
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "w"}
 	key := ComputeKey(in)
+	t.Cleanup(func() { c.DeleteForTest(key) })
 
-	// A saturated subscriber on the key: never drained, buffer will fill.
 	chSlow, unsub := SubscribeRefresh(map[string]struct{}{key: {}})
 	defer unsub()
-	_ = chSlow
 
-	// Refresher commits the FRESH value to L1 (this is what makes the signal
-	// coherent: the data is in L1 before the signal fires).
-	const fresh = `{"phase":"v2-FRESH"}`
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(fresh), Inputs: &in})
-
-	// Now flood signals so the slow sink's buffer fills and the TERMINAL
-	// signal for this key is dropped.
-	for i := 0; i < refreshSubChanCap+50; i++ {
+	// Saturate the sink with signals for the stale value.
+	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"phase":"v1"}`), Inputs: &in})
+	for i := 0; i < refreshSubChanCap; i++ {
 		PublishRefresh(key)
 	}
-	if _, _, dropped, _ := RefreshBroadcasterCounters(); dropped == 0 {
-		t.Fatalf("setup: no drop occurred; cannot test the dropped-terminal case")
+	// The refresher commits the FRESH value, then the TERMINAL signal.
+	const fresh = `{"phase":"v2-FRESH"}`
+	c.Put(key, &ResolvedEntry{RawJSON: []byte(fresh), Inputs: &in})
+	PublishRefresh(key)
+	st := RefreshBroadcasterStatsSnapshot()
+	if st.Deferred == 0 {
+		t.Fatalf("setup: the terminal signal was not deferred (deferred=0); cannot test the full-sink case")
+	}
+	if st.Dropped != 0 {
+		t.Fatalf("dropped=%d — the terminal signal on a full sink was discarded (#484)", st.Dropped)
 	}
 
-	// The frontend's 5s throttle eventually refetches REGARDLESS of the
-	// dropped signal — modelled as a Get. The entry must be FRESH (the drop
-	// did not strand it stale), proving degrade-to-throttle convergence.
-	entry, ok := c.Get(key)
-	if !ok || entry == nil {
-		t.Fatalf("entry absent after dropped terminal signal — widget stranded")
+	// The client drains; the LAST frame it reads was sent after the fresh
+	// commit, and its re-read returns the fresh body.
+	frames, last := 0, ""
+	for {
+		k, ok := drainOne(t, chSlow, 200*time.Millisecond)
+		if !ok {
+			break
+		}
+		frames++
+		if e, hit := c.Get(k); hit && e != nil {
+			last = string(e.RawJSON)
+		}
 	}
-	if string(entry.RawJSON) != fresh {
-		t.Fatalf("throttle refetch read stale body %q want %q — dropped signal stranded the widget stale (9.8 FAIL)",
-			entry.RawJSON, fresh)
+	if frames != refreshSubChanCap+1 {
+		t.Fatalf("drained %d frames, want %d (the saturated sink + the deferred terminal frame)", frames, refreshSubChanCap+1)
+	}
+	if last != fresh {
+		t.Fatalf("the re-read after the final frame returned %q want %q — the terminal signal stranded the widget (9.8 FAIL)", last, fresh)
 	}
 }

@@ -25,6 +25,31 @@
 //     PublishRefresh (the refresher's post-commit path, which induces L1
 //     HITs) is untouched and un-bucketed.
 //
+// #484 (a quiet key's LAST change must reach the tab): the refresher path
+// used to lose a signal two ways, and the SPA repairs neither (no polling,
+// no refetch on focus), so an open tab stayed stale until navigation:
+//
+//   - TRAILING-EDGE COALESCING. A coalesced emit is not a duplicate when it
+//     announces a newer commit. Every leading emit opens a per-key window;
+//     a signal suppressed inside it marks the window, and the window's end
+//     emits EXACTLY ONE trailing signal (then opens a fresh window, so a
+//     continuously-changing key settles at one emit per window). A window
+//     exists only for an ARMED key and is torn down on the key's last
+//     disarm, on an eviction of the key (the eviction frame supersedes it)
+//     and on hub reset, so the armed-timer count is bounded by armed keys.
+//   - PER-SUBSCRIBER REFRESH PENDING SET (modelled on the eviction path's,
+//     but un-paced: customer-priority). A full sink DEFERS the key into a
+//     dedup'd FIFO set drained by the subscriber's own goroutine — never
+//     dropped. The set is a subset of the armed set (<= refreshSubMaxEntries
+//     per connection), so it cannot outgrow it. Its overflow rule is a
+//     STALL rule: when the drain cannot place a key for a full liveness
+//     interval (RefreshLivenessInterval, the heartbeat contract) while the
+//     consumer made no progress at all, the subscriber is force-RESYNCED —
+//     both pending sets are released and the handler ends the stream with an
+//     `event: resync` frame; the SPA's transport-loss path (refreshSse.ts
+//     scheduleRetry → revalidateOnConnect → revalidateArmed) re-fetches every
+//     armed widget, so no key is ever silently lost.
+//
 // PRIOR ART (feedback_check_k8s_clientgo_prior_art): we BORROW the proven
 // per-watcher discipline of k8s.io/apimachinery/pkg/watch.Broadcaster
 // (mux.go: per-watcher buffered channel + DropIfChannelFull so one slow
@@ -42,12 +67,17 @@
 // the store lock (resolved.go deleteForDep) is released; SubscribeRefresh /
 // unsub / Arm / Disarm run on /refreshes connection goroutines. Shared hub
 // state is guarded by mu (subs + keySubs), the coalesce map by cmu, and each
-// subscriber's pacing state by its own pmu. Lock order: h.mu -> s.pmu; the
-// per-subscriber drain goroutine takes only s.pmu and never h.mu, and the
-// hub takes no store lock, so there is no inversion against the
+// subscriber's pacing state by its own pmu. Lock order: h.mu -> s.pmu and
+// h.mu -> cmu (cmu and pmu are never nested; nothing takes h.mu under
+// either); the per-subscriber drain goroutines take only s.pmu and never
+// h.mu, the coalesce timers take cmu and release it before fanning out, and
+// the hub takes no store lock, so there is no inversion against the
 // d.storeMu -> c.mu eviction path (S10). The fan-out loops hold only an
-// RLock and do NO I/O inside it (a full sink takes the non-blocking default).
-// Exercised by the -race falsifiers 9.6 and S10.
+// RLock and do NO I/O inside it; every sink send is a non-blocking
+// select/default under pmu, so no lock is ever held across a blocking send
+// (PublishRefresh is also reached from the customer cold-fill,
+// publishIfSubscribed). Exercised by the -race falsifiers 9.6, S10 and the
+// #484 arms (refresh_484_*_test.go).
 //
 // REMOVABILITY (project_cache_off_is_transparent_fallback, project_caching_
 // is_provisional): refreshHub() returns nil under RefreshSSEEnabled()==false
@@ -106,14 +136,36 @@ const (
 	defaultRefreshEvictionPublishRate      = 5
 	defaultRefreshEvictionPublishBurst     = 10
 
-	// refreshSubChanCap is the per-connection buffered-channel depth. A
-	// full channel DROPS (coalesce-by-design) on the refresher path; the
-	// value is the burst the hub absorbs before a slow consumer starts
-	// shedding duplicate signals. Borrowed sizing intent from
-	// watch.Broadcaster's per-watcher queue. The eviction path never drops:
-	// a full sink defers the key instead.
+	// refreshSubChanCap is the per-connection buffered-channel depth: the
+	// burst the hub absorbs before a slow consumer's keys start deferring
+	// into its pending sets. Borrowed sizing intent from watch.Broadcaster's
+	// per-watcher queue. Since #484 NEITHER path drops: a full sink defers
+	// the key (refresh pending set / eviction pending set).
 	refreshSubChanCap = 64
+
+	// RefreshLivenessInterval is the /refreshes liveness contract: the SSE
+	// heartbeat period (handlers.refreshHeartbeatInterval), the per-write
+	// deadline (a client that cannot accept one frame within it is gone),
+	// and the pending-drain stall bound (a subscriber whose consumer made no
+	// progress for it is force-resynced, #484). One interval, not three
+	// knobs: each is "the client did not keep up with the stream's own
+	// heartbeat". 20s beats the server IdleTimeout (30s) with margin.
+	RefreshLivenessInterval = 20 * time.Second
 )
+
+// refreshPendingStallBound is the #484 overflow rule's bound. A var only so
+// the force-resync arms can shorten it (SetRefreshPendingStallBoundForTest);
+// production never reassigns it.
+var refreshPendingStallBound atomic.Int64
+
+func init() { refreshPendingStallBound.Store(int64(RefreshLivenessInterval)) }
+
+// SetRefreshPendingStallBoundForTest shortens the stall bound for an arm and
+// returns the restore func. Test-only — production MUST NOT call it.
+func SetRefreshPendingStallBoundForTest(d time.Duration) (restore func()) {
+	prev := refreshPendingStallBound.Swap(int64(d))
+	return func() { refreshPendingStallBound.Store(prev) }
+}
 
 // RefreshSSEEnabled reports whether the Ship 1 live-refresh SSE layer is
 // active. TWO gates, both must hold (same shape as WidgetContentL1Enabled):
@@ -167,10 +219,10 @@ func refreshEvictionBucket() (rate.Limit, int) {
 	return rate.Limit(r), b
 }
 
-// refreshSub is one SSE connection's sink. ch is buffered; on the refresher
-// path a full channel DROPS (the refresher never blocks on a slow consumer);
-// on the eviction path a full channel DEFERS. keys is the set of l1Keys this
-// connection is armed for; it is consulted under the hub mu.
+// refreshSub is one SSE connection's sink. ch is buffered; a full channel
+// DEFERS on both paths (#484: the refresher path used to drop) — the producer
+// never blocks on a slow consumer. keys is the set of l1Keys this connection
+// is armed for; it is consulted under the hub mu.
 type refreshSub struct {
 	id   uint64
 	hub  *refreshBroadcaster
@@ -195,6 +247,18 @@ type refreshSub struct {
 	closed   bool          // unsub ran; nothing more is queued or sent
 	done     chan struct{} // closed at unsub; wakes the drain goroutine
 
+	// #484 refresh pending set (guarded by pmu): refresher-path keys a full
+	// sink deferred, dedup'd, FIFO in rorder (same invariant as pending /
+	// order). NOT bucket-paced. Subset of keys.
+	rpending  map[string]struct{}
+	rorder    []string
+	rdraining bool // a refresh drain goroutine is live for this sub
+	// resynced: the stall rule fired; nothing more is queued or sent and
+	// resync is closed so the handler ends the stream (the SPA re-validates
+	// on reconnect).
+	resynced bool
+	resync   chan struct{}
+
 	// per-connection attribution (C12), read by RefreshSubSnapshotForTest.
 	delivered     atomic.Uint64
 	evictDeferred atomic.Uint64
@@ -215,10 +279,23 @@ type refreshBroadcaster struct {
 	keySubs map[string]map[uint64]*refreshSub
 	next    uint64
 
-	// coalesce state: per-key last-emit timestamp, guarded by cmu (a
-	// separate lock so coalescing never contends with the fan-out RLock).
-	cmu      sync.Mutex
-	lastEmit map[string]time.Time
+	// coalesce state (#484 trailing edge): one window per ARMED key with an
+	// emit inside the last coalesce interval, guarded by cmu (a separate lock
+	// so coalescing never contends with the fan-out RLock). Lock order:
+	// h.mu -> cmu (disarmLocked tears a window down under h.mu); nothing
+	// takes h.mu while holding cmu. stopped is set at hub reset: every window
+	// is stopped and a late timer fire is inert.
+	cmu     sync.Mutex
+	windows map[string]*coalesceWindow
+	stopped bool
+}
+
+// coalesceWindow is one key's open coalesce window. Exactly one timer is
+// armed per window; suppressed records that a signal arrived inside it, so
+// its end owes exactly one trailing emit.
+type coalesceWindow struct {
+	timer      *time.Timer
+	suppressed bool
 }
 
 var (
@@ -241,9 +318,9 @@ func refreshHub() *refreshBroadcaster {
 	defer refreshHubMu.Unlock()
 	if refreshHubInstance == nil {
 		refreshHubInstance = &refreshBroadcaster{
-			subs:     map[uint64]*refreshSub{},
-			keySubs:  map[string]map[uint64]*refreshSub{},
-			lastEmit: map[string]time.Time{},
+			subs:    map[uint64]*refreshSub{},
+			keySubs: map[string]map[uint64]*refreshSub{},
+			windows: map[string]*coalesceWindow{},
 		}
 	}
 	return refreshHubInstance
@@ -273,70 +350,248 @@ func (h *refreshBroadcaster) disarmLocked(s *refreshSub, l1Key string) {
 		delete(m, s.id)
 		if len(m) == 0 {
 			delete(h.keySubs, l1Key)
+			// Nobody is armed for the key any more: its coalesce window has
+			// no one to owe a trailing emit to (lock order h.mu -> cmu).
+			h.stopWindow(l1Key)
 		}
 	}
 }
 
-// coalesced reports whether an emit for l1Key should be suppressed because
-// the previous emit for the SAME key was within the coalesce window. On a
-// non-suppressed emit it stamps lastEmit[l1Key]=now. A window <= 0 disables
-// coalescing entirely (always returns false). Design §2.3.
-func (h *refreshBroadcaster) coalesced(l1Key string, now time.Time) bool {
+// coalesced reports whether an emit for l1Key should be suppressed because a
+// coalesce window for the SAME key is open (the previous emit was within the
+// window). A suppressed signal marks the window so its end emits exactly one
+// trailing signal (#484 — a coalesced emit announces a NEWER commit, so it is
+// not a duplicate). A non-suppressed emit opens a window. A window <= 0
+// disables coalescing entirely (always false), and a key nobody is armed for
+// gets no window (there is no fan-out to bound and nobody to owe a trailing
+// emit to), so live windows <= armed keys. Design §2.3.
+func (h *refreshBroadcaster) coalesced(l1Key string) bool {
 	win := refreshCoalesceWindowFn()
 	if win <= 0 {
 		return false
 	}
+	h.mu.RLock()
+	armed := len(h.keySubs[l1Key]) > 0
+	h.mu.RUnlock()
+	if !armed {
+		return false
+	}
 	h.cmu.Lock()
 	defer h.cmu.Unlock()
-	if last, ok := h.lastEmit[l1Key]; ok && now.Sub(last) < win {
+	if h.stopped {
+		return false
+	}
+	if w := h.windows[l1Key]; w != nil {
+		w.suppressed = true
 		return true
 	}
-	h.lastEmit[l1Key] = now
+	w := &coalesceWindow{}
+	w.timer = time.AfterFunc(win, func() { h.windowEnd(l1Key, w) })
+	h.windows[l1Key] = w
 	return false
 }
 
+// windowEnd closes l1Key's window. A window that saw a suppressed signal
+// emits exactly ONE trailing signal and opens a fresh window (so a key that
+// keeps changing settles at one emit per window); one that saw none is
+// released. A fire for a window that was torn down meanwhile (last disarm,
+// eviction, hub reset) is inert: identity check under cmu, and fan-out goes
+// through the live reverse index, which no longer holds an unsubscribed sink.
+func (h *refreshBroadcaster) windowEnd(l1Key string, w *coalesceWindow) {
+	h.cmu.Lock()
+	if h.stopped || h.windows[l1Key] != w {
+		h.cmu.Unlock()
+		return
+	}
+	if !w.suppressed {
+		delete(h.windows, l1Key)
+		h.cmu.Unlock()
+		return
+	}
+	w.suppressed = false
+	if win := refreshCoalesceWindowFn(); win > 0 {
+		w.timer = time.AfterFunc(win, func() { h.windowEnd(l1Key, w) })
+	} else {
+		delete(h.windows, l1Key)
+	}
+	h.cmu.Unlock()
+	refreshTrailingEmittedTotal.Add(1)
+	h.fanoutRefresh(l1Key) // no cmu held: lock order h.mu -> cmu
+}
+
+// stopWindow tears l1Key's coalesce window down (timer stopped; a fire
+// already in flight is inert via windowEnd's identity check). Caller may hold
+// h.mu (lock order h.mu -> cmu).
+func (h *refreshBroadcaster) stopWindow(l1Key string) {
+	h.cmu.Lock()
+	if w := h.windows[l1Key]; w != nil {
+		w.timer.Stop()
+		delete(h.windows, l1Key)
+	}
+	h.cmu.Unlock()
+}
+
 // PublishRefresh announces that l1Key was just committed to L1. Non-blocking:
-// it fans the key out to every connection armed for it; a full sink is
-// dropped (refreshDroppedTotal bump) rather than blocking the refresher
-// goroutine. No-op when the layer is disabled or no hub exists.
+// it fans the key out to every connection armed for it; a full sink DEFERS
+// the key into that connection's refresh pending set (#484) rather than
+// blocking the refresher goroutine or dropping. No-op when the layer is
+// disabled or no hub exists.
 //
-// Called from internal/handlers/dispatchers/resolve_populate.go:291,
-// immediately after c.Put — strictly post-commit, on the refresher path
-// only, so it fires only when L1 actually changed (design §1.1). NOT paced:
-// a refresher-driven refetch is an L1 HIT (feedback_customer_priority_
-// over_refresher — pacing the eviction path must never slow this one).
+// Called from internal/handlers/dispatchers/resolve_populate.go,
+// immediately after the commit — strictly post-commit, so it fires only when
+// L1 actually changed (design §1.1) — and from the cold-dispatch
+// publishIfSubscribed. NOT paced: a refresher-driven refetch is an L1 HIT
+// (feedback_customer_priority_over_refresher — pacing the eviction path must
+// never slow this one).
 func PublishRefresh(l1Key string) {
 	h := refreshHub()
 	if h == nil {
 		return // disabled / cache-off — transparent no-op
 	}
-	now := time.Now()
-	if h.coalesced(l1Key, now) {
+	if h.coalesced(l1Key) {
 		refreshCoalescedTotal.Add(1)
 		return
 	}
+	h.fanoutRefresh(l1Key)
+}
+
+// fanoutRefresh offers l1Key to every subscriber armed for it. C11: visit
+// ONLY the subscribers armed for this key (the reverse index), not every live
+// connection. fanoutVisitsForTest is the S2 discriminating instrument — an
+// absolute count of subscribers examined, which an O(|subs|) loop cannot keep
+// small. Holds only the RLock (+ each sub's pmu, briefly); no I/O and no
+// blocking send.
+func (h *refreshBroadcaster) fanoutRefresh(l1Key string) {
 	h.mu.RLock()
-	// C11: visit ONLY the subscribers armed for this key (the reverse
-	// index), not every live connection. fanoutVisitsForTest is the S2
-	// discriminating instrument — an absolute count of subscribers
-	// examined, which an O(|subs|) loop cannot keep small.
 	for _, s := range h.keySubs[l1Key] {
 		fanoutVisitsForTest.Add(1)
+		s.offerRefresh(l1Key)
+	}
+	h.mu.RUnlock()
+	refreshPublishedTotal.Add(1)
+}
+
+// offerRefresh hands one committed key to this subscriber: straight into the
+// sink when it has room and no refresh backlog is draining, otherwise into
+// the dedup'd refresh pending set (never dropped, #484). A key already queued
+// for this connection — refresh-pending, or eviction-pending (the eviction
+// frame is the same `refresh` frame and supersedes it) — is absorbed: one
+// frame per key per backlog. Caller holds h.mu (read); takes s.pmu (lock
+// order h.mu -> s.pmu). The send is non-blocking, so pmu is never held
+// across a blocking operation.
+func (s *refreshSub) offerRefresh(l1Key string) {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	if s.closed || s.resynced {
+		return
+	}
+	_, rdup := s.rpending[l1Key]
+	_, edup := s.pending[l1Key]
+	if rdup || edup {
+		refreshPendingCoalescedTotal.Add(1)
+		return
+	}
+	// While a backlog drains every new key joins the queue (FIFO fairness).
+	if !s.rdraining {
 		select {
 		case s.ch <- l1Key:
 			refreshDeliveredTotal.Add(1)
 			s.delivered.Add(1)
 			noteSinkDepth(len(s.ch))
+			return
 		default:
-			// Slow consumer: its buffer is full. Drop — the next committed
-			// refresh for this key re-signals and the frontend's refetch is
-			// idempotent. A dropped TERMINAL signal degrades to the frontend
-			// 5s throttle (falsifier 9.8), never indefinite stale.
-			refreshDroppedTotal.Add(1)
+			// Full sink: defer — never drop the key's last change (#484).
 		}
 	}
-	h.mu.RUnlock()
-	refreshPublishedTotal.Add(1)
+	s.rpending[l1Key] = struct{}{}
+	s.rorder = append(s.rorder, l1Key)
+	refreshDeferredTotal.Add(1)
+	noteRefreshPendingHighWater(len(s.rpending))
+	if !s.rdraining {
+		s.rdraining = true
+		go s.drainRefreshes()
+	}
+}
+
+// drainRefreshes releases this subscriber's deferred refresh keys in FIFO
+// order as soon as the sink has room (un-paced), then exits (a new backlog
+// starts a new goroutine). It takes only s.pmu, never h.mu, and blocks only
+// on its own retry timer / done — every send is non-blocking under pmu with
+// closed==false, so nothing is sent after unsub.
+//
+// The overflow rule (#484): if the consumer makes NO progress — no frame of
+// any kind leaves this subscriber's sink (delivered does not move) — for the
+// stall bound (RefreshLivenessInterval), the subscriber is force-resynced.
+func (s *refreshSub) drainRefreshes() {
+	var stalledSince time.Time
+	var seen uint64
+	for {
+		s.pmu.Lock()
+		if s.closed || s.resynced {
+			s.rdraining = false
+			s.pmu.Unlock()
+			return
+		}
+		for len(s.rorder) > 0 {
+			if _, live := s.rpending[s.rorder[0]]; live {
+				break
+			}
+			s.rorder = s.rorder[1:] // disarmed / superseded by an eviction
+		}
+		if len(s.rorder) == 0 {
+			s.rdraining = false
+			s.rorder = nil
+			s.pmu.Unlock()
+			return
+		}
+		l1Key := s.rorder[0]
+		select {
+		case s.ch <- l1Key:
+			s.rorder = s.rorder[1:]
+			delete(s.rpending, l1Key)
+			refreshDeliveredTotal.Add(1)
+			s.delivered.Add(1)
+			noteSinkDepth(len(s.ch))
+			stalledSince = time.Time{}
+			s.pmu.Unlock()
+			continue
+		default:
+		}
+		now := time.Now()
+		if d := s.delivered.Load(); stalledSince.IsZero() || d != seen {
+			stalledSince, seen = now, d // first miss, or the consumer moved
+		} else if now.Sub(stalledSince) >= time.Duration(refreshPendingStallBound.Load()) {
+			s.forceResyncLocked()
+			s.rdraining = false
+			s.pmu.Unlock()
+			return
+		}
+		s.pmu.Unlock()
+		if !s.sleepOrDone(drainFullSinkRetry) {
+			return
+		}
+	}
+}
+
+// forceResyncLocked applies the #484 overflow rule: the subscriber's consumer
+// is wedged, so instead of holding its backlog indefinitely it is released —
+// BOTH pending sets are emptied, nothing more is queued for this
+// subscriber, and resync is closed so the handler writes `event: resync` and
+// ends the stream. The SPA treats the end as a transport loss and, on the
+// reconnect, re-fetches every armed widget (refreshSse.ts scheduleRetry sets
+// revalidateOnConnect; connect() runs revalidateArmed), so every released key
+// is repaired, none is silently lost. Caller holds s.pmu.
+func (s *refreshSub) forceResyncLocked() {
+	if s.resynced || s.closed {
+		return
+	}
+	s.resynced = true
+	s.rpending = nil
+	s.rorder = nil
+	s.pending = nil
+	s.order = nil
+	close(s.resync)
+	refreshPendingOverflowResyncTotal.Add(1)
 }
 
 // PublishEviction announces that l1Key was just EVICTED from L1 by a
@@ -363,6 +618,9 @@ func PublishEviction(l1Key string) {
 	if h == nil {
 		return // disabled / cache-off — transparent no-op
 	}
+	// #484: the eviction frame supersedes any trailing refresh the key's
+	// coalesce window still owes (the entry is gone; one frame says so).
+	h.stopWindow(l1Key)
 	h.mu.RLock()
 	targets := h.keySubs[l1Key]
 	if len(targets) == 0 {
@@ -383,9 +641,12 @@ func PublishEviction(l1Key string) {
 func (s *refreshSub) offerEviction(l1Key string) {
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
-	if s.closed {
+	if s.closed || s.resynced {
 		return
 	}
+	// #484: an eviction supersedes a deferred refresh of the same key — both
+	// are the same `refresh` frame, so the connection gets ONE.
+	delete(s.rpending, l1Key)
 	if _, dup := s.pending[l1Key]; dup {
 		return // already queued for this connection — one slot per key
 	}
@@ -428,7 +689,8 @@ const drainFullSinkRetry = 5 * time.Millisecond
 func (s *refreshSub) drainEvictions() {
 	for {
 		s.pmu.Lock()
-		if s.closed {
+		if s.closed || s.resynced {
+			s.draining = false
 			s.pmu.Unlock()
 			return
 		}
@@ -489,7 +751,7 @@ func (s *refreshSub) sleepOrDone(d time.Duration) bool {
 func (s *refreshSub) trySendDeferred(l1Key string) bool {
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
-	if s.closed {
+	if s.closed || s.resynced {
 		return true
 	}
 	if _, live := s.pending[l1Key]; !live {
@@ -509,20 +771,37 @@ func (s *refreshSub) trySendDeferred(l1Key string) bool {
 	}
 }
 
-// SubscribeRefresh registers a connection armed for the given validated
-// l1Key set (the caller — handlers.Refreshes — has already re-derived these
-// keys under the connection's authenticated identity; §5). Returns the sink
-// channel to read signals from and an idempotent unsubscribe func that the
-// handler MUST defer.
-//
-// When the layer is disabled it returns a closed channel + a no-op unsub, so
-// the handler degrades to a clean idle stream (transparent fallback).
+// RefreshStream is one subscription: Keys carries the l1Keys to signal;
+// Resync is closed when the #484 overflow rule fires (the handler then writes
+// `event: resync` and ends the stream so the SPA re-validates every armed
+// widget on reconnect); Unsub is idempotent and the handler MUST defer it.
+type RefreshStream struct {
+	Keys   <-chan string
+	Resync <-chan struct{}
+	Unsub  func()
+}
+
+// SubscribeRefresh is SubscribeRefreshStream without the resync channel —
+// the shape the in-process falsifiers read. The /refreshes handler uses
+// SubscribeRefreshStream.
 func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
+	st := SubscribeRefreshStream(armedKeys)
+	return st.Keys, st.Unsub
+}
+
+// SubscribeRefreshStream registers a connection armed for the given validated
+// l1Key set (the caller — handlers.Refreshes — has already re-derived these
+// keys under the connection's authenticated identity; §5).
+//
+// When the layer is disabled it returns a closed Keys channel, a nil Resync
+// (never fires) and a no-op unsub, so the handler degrades to a clean idle
+// stream (transparent fallback).
+func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 	h := refreshHub()
 	if h == nil {
 		ch := make(chan string)
 		close(ch)
-		return ch, func() {}
+		return RefreshStream{Keys: ch, Unsub: func() {}}
 	}
 	limit, burst := refreshEvictionBucket()
 	s := &refreshSub{
@@ -532,7 +811,9 @@ func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
 		subscribedAt: time.Now(),
 		limiter:      rate.NewLimiter(limit, burst),
 		pending:      map[string]struct{}{},
+		rpending:     map[string]struct{}{},
 		done:         make(chan struct{}),
+		resync:       make(chan struct{}),
 	}
 	h.mu.Lock()
 	h.next++
@@ -561,7 +842,7 @@ func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
 			// uses the same "producer never sends to a closed chan" discipline.)
 		})
 	}
-	return s.ch, unsub
+	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub}
 }
 
 // close marks the subscriber dead for the eviction path (no more queueing,
@@ -576,6 +857,8 @@ func (s *refreshSub) close() {
 	s.closed = true
 	s.pending = nil
 	s.order = nil
+	s.rpending = nil
+	s.rorder = nil
 	close(s.done)
 	s.pmu.Unlock()
 	refreshStreamNanosTotal.Add(time.Since(s.subscribedAt).Nanoseconds())
@@ -611,9 +894,8 @@ func (s *refreshSub) DisarmKey(l1Key string) {
 	s.hub.mu.Lock()
 	s.hub.disarmLocked(s, l1Key)
 	s.pmu.Lock()
-	if s.pending != nil {
-		delete(s.pending, l1Key)
-	}
+	delete(s.pending, l1Key)  // nil-safe
+	delete(s.rpending, l1Key) // #484: the refresh pending set never outgrows the armed set either
 	s.pmu.Unlock()
 	s.hub.mu.Unlock()
 }
@@ -668,10 +950,26 @@ var (
 	// refreshDeliveredTotal counts individual (key -> subscriber) sends that
 	// succeeded, on BOTH the refresher and the eviction path.
 	refreshDeliveredTotal atomic.Uint64
-	// refreshDroppedTotal counts (key -> subscriber) sends dropped because
-	// the subscriber's buffer was full (slow consumer) — refresher path only;
-	// the eviction path defers instead.
+	// refreshDroppedTotal counted (key -> subscriber) sends dropped on a full
+	// sink. Structurally 0 since #484 — a full sink DEFERS on both paths
+	// (refreshDeferredTotal); nothing increments it. Kept so the series and
+	// RefreshBroadcasterCounters' shape survive; a nonzero value would be a
+	// regression of the never-drop invariant.
 	refreshDroppedTotal atomic.Uint64
+	// refreshDeferredTotal counts refresher-path (key -> subscriber) signals
+	// a full sink deferred into the subscriber's refresh pending set (#484).
+	refreshDeferredTotal atomic.Uint64
+	// refreshTrailingEmittedTotal counts trailing-edge emits: windows that
+	// had a suppressed signal and re-announced the key at their end (#484).
+	refreshTrailingEmittedTotal atomic.Uint64
+	// refreshPendingCoalescedTotal counts refresher-path signals absorbed
+	// because the key was already queued for that connection (refresh- or
+	// eviction-pending) — delivered once, not lost (#484).
+	refreshPendingCoalescedTotal atomic.Uint64
+	// refreshPendingOverflowResyncTotal counts subscribers force-resynced by
+	// the #484 overflow (stall) rule: stream ended with `event: resync`, the
+	// SPA re-validates every armed widget on reconnect.
+	refreshPendingOverflowResyncTotal atomic.Uint64
 	// refreshCoalescedTotal counts emits suppressed by the per-key coalesce
 	// window.
 	refreshCoalescedTotal atomic.Uint64
@@ -701,7 +999,20 @@ var (
 	// evictPendingHighWaterForTest is the largest per-subscriber pending
 	// set observed — S9's "pending never exceeds armed" instrument.
 	evictPendingHighWaterForTest atomic.Int64
+	// refreshPendingHighWaterForTest is the largest per-subscriber REFRESH
+	// pending set observed (#484: never exceeds the armed set).
+	refreshPendingHighWaterForTest atomic.Int64
 )
+
+func noteRefreshPendingHighWater(n int) {
+	d := int64(n)
+	for {
+		cur := refreshPendingHighWaterForTest.Load()
+		if d <= cur || refreshPendingHighWaterForTest.CompareAndSwap(cur, d) {
+			return
+		}
+	}
+}
 
 func noteSinkDepth(depth int) {
 	d := int64(depth)
@@ -742,17 +1053,21 @@ type RefreshBroadcasterStats struct {
 	// "_total" appended to a counter that does not already carry it
 	// (StatFamily.OTelInstrumentName). Expvar, OTLP, docs guard and parity
 	// arm all read these tags — nothing here is copied by hand.
-	Published          uint64  `stat:"published" desc:"Live-refresh signals published."`
-	Delivered          uint64  `stat:"delivered" desc:"Live-refresh signals delivered to subscribers."`
-	Dropped            uint64  `stat:"dropped" desc:"Live-refresh signals dropped (slow consumer)."`
-	Coalesced          uint64  `stat:"coalesced" desc:"Live-refresh signals coalesced."`
-	Subscribers        int     `stat:"subscribers" kind:"gauge" desc:"Current live-refresh subscriber count."`
-	ArmedKeys          int     `stat:"armed_keys" kind:"gauge" desc:"Distinct L1 keys with at least one armed live-refresh subscriber (reverse-index size)."`
-	MaxSinkDepth       int64   `stat:"max_sink_depth" kind:"gauge" desc:"High-water mark of a subscriber sink after a send (consumer lag, 0..64)."`
-	EvictPublished     uint64  `stat:"evict_published" desc:"Eviction-driven live-refresh publishes that reached at least one subscriber."`
-	EvictDeferred      uint64  `stat:"evict_deferred" desc:"Eviction-driven signals deferred by the per-subscriber token bucket (the bound engaged)."`
-	StreamSecondsTotal float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
-	StreamsClosedTotal uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
+	Published             uint64  `stat:"published" desc:"Live-refresh signals published."`
+	Delivered             uint64  `stat:"delivered" desc:"Live-refresh signals delivered to subscribers."`
+	Dropped               uint64  `stat:"dropped" desc:"Live-refresh signals dropped on a full sink. Structurally 0 since #484 (a full sink defers, see deferred); nonzero is a regression."`
+	Deferred              uint64  `stat:"deferred" desc:"Refresher-path signals a full subscriber sink deferred into its refresh pending set (never dropped, #484)."`
+	TrailingEmitted       uint64  `stat:"trailing_emitted" desc:"Trailing-edge emits: coalesce windows that had a suppressed signal re-announced the key at window end (#484)."`
+	PendingCoalesced      uint64  `stat:"pending_coalesced" desc:"Refresher-path signals absorbed because the key was already queued for that subscriber (delivered once, #484)."`
+	PendingOverflowResync uint64  `stat:"pending_overflow_resync" desc:"Subscribers force-resynced by the pending-drain stall rule: stream ended with a resync frame so the SPA re-validates every armed widget (#484)."`
+	Coalesced             uint64  `stat:"coalesced" desc:"Live-refresh signals coalesced."`
+	Subscribers           int     `stat:"subscribers" kind:"gauge" desc:"Current live-refresh subscriber count."`
+	ArmedKeys             int     `stat:"armed_keys" kind:"gauge" desc:"Distinct L1 keys with at least one armed live-refresh subscriber (reverse-index size)."`
+	MaxSinkDepth          int64   `stat:"max_sink_depth" kind:"gauge" desc:"High-water mark of a subscriber sink after a send (consumer lag, 0..64)."`
+	EvictPublished        uint64  `stat:"evict_published" desc:"Eviction-driven live-refresh publishes that reached at least one subscriber."`
+	EvictDeferred         uint64  `stat:"evict_deferred" desc:"Eviction-driven signals deferred by the per-subscriber token bucket (the bound engaged)."`
+	StreamSecondsTotal    float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
+	StreamsClosedTotal    uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
 }
 
 // refreshBroadcasterStatsOverride, when set, replaces the live snapshot.
@@ -772,15 +1087,19 @@ func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
 		return *o
 	}
 	st := RefreshBroadcasterStats{
-		Published:          refreshPublishedTotal.Load(),
-		Delivered:          refreshDeliveredTotal.Load(),
-		Dropped:            refreshDroppedTotal.Load(),
-		Coalesced:          refreshCoalescedTotal.Load(),
-		MaxSinkDepth:       refreshMaxSinkDepth.Load(),
-		EvictPublished:     refreshEvictPublishedTotal.Load(),
-		EvictDeferred:      refreshEvictDeferredTotal.Load(),
-		StreamSecondsTotal: float64(refreshStreamNanosTotal.Load()) / float64(time.Second),
-		StreamsClosedTotal: refreshStreamsClosedTotal.Load(),
+		Published:             refreshPublishedTotal.Load(),
+		Delivered:             refreshDeliveredTotal.Load(),
+		Dropped:               refreshDroppedTotal.Load(),
+		Coalesced:             refreshCoalescedTotal.Load(),
+		Deferred:              refreshDeferredTotal.Load(),
+		TrailingEmitted:       refreshTrailingEmittedTotal.Load(),
+		PendingCoalesced:      refreshPendingCoalescedTotal.Load(),
+		PendingOverflowResync: refreshPendingOverflowResyncTotal.Load(),
+		MaxSinkDepth:          refreshMaxSinkDepth.Load(),
+		EvictPublished:        refreshEvictPublishedTotal.Load(),
+		EvictDeferred:         refreshEvictDeferredTotal.Load(),
+		StreamSecondsTotal:    float64(refreshStreamNanosTotal.Load()) / float64(time.Second),
+		StreamsClosedTotal:    refreshStreamsClosedTotal.Load(),
 	}
 	if h := refreshHub(); h != nil {
 		h.mu.RLock()
@@ -797,6 +1116,9 @@ type RefreshSubSnapshot struct {
 	Armed, Pending int
 	Delivered      uint64
 	EvictDeferred  uint64
+	// #484: the refresh pending set's size and whether the stall rule fired.
+	RefreshPending int
+	Resynced       bool
 }
 
 // RefreshSubSnapshotsForTest returns every live subscriber's pacing state.
@@ -812,10 +1134,12 @@ func RefreshSubSnapshotsForTest() []RefreshSubSnapshot {
 	for _, s := range h.subs {
 		s.pmu.Lock()
 		out = append(out, RefreshSubSnapshot{
-			Armed:         len(s.keys),
-			Pending:       len(s.pending),
-			Delivered:     s.delivered.Load(),
-			EvictDeferred: s.evictDeferred.Load(),
+			Armed:          len(s.keys),
+			Pending:        len(s.pending),
+			Delivered:      s.delivered.Load(),
+			EvictDeferred:  s.evictDeferred.Load(),
+			RefreshPending: len(s.rpending),
+			Resynced:       s.resynced,
 		})
 		s.pmu.Unlock()
 	}
@@ -826,6 +1150,26 @@ func RefreshSubSnapshotsForTest() []RefreshSubSnapshot {
 // pending set observed since the last reset. Test-only.
 func RefreshEvictPendingHighWaterForTest() int64 {
 	return evictPendingHighWaterForTest.Load()
+}
+
+// RefreshPendingHighWaterForTest returns the largest per-subscriber REFRESH
+// pending set observed since the last reset (#484). Test-only.
+func RefreshPendingHighWaterForTest() int64 {
+	return refreshPendingHighWaterForTest.Load()
+}
+
+// RefreshCoalesceWindowsForTest returns the number of open coalesce windows —
+// each holds exactly one armed timer, so this IS the armed-timer count the
+// #484 lifecycle arms bound (a leak check that does not lean on goroutine
+// counts). Test-only.
+func RefreshCoalesceWindowsForTest() int {
+	h := refreshHub()
+	if h == nil {
+		return 0
+	}
+	h.cmu.Lock()
+	defer h.cmu.Unlock()
+	return len(h.windows)
 }
 
 // RefreshFanoutVisitsForTest returns the S2 probe. Test-only.
@@ -848,11 +1192,24 @@ func resetRefreshBroadcasterForTest() {
 			s.close()
 		}
 		old.mu.Unlock()
+		// #484: stop every coalesce window; a timer already firing is inert.
+		old.cmu.Lock()
+		old.stopped = true
+		for k, w := range old.windows {
+			w.timer.Stop()
+			delete(old.windows, k)
+		}
+		old.cmu.Unlock()
 	}
 	refreshPublishedTotal.Store(0)
 	refreshDeliveredTotal.Store(0)
 	refreshDroppedTotal.Store(0)
 	refreshCoalescedTotal.Store(0)
+	refreshDeferredTotal.Store(0)
+	refreshTrailingEmittedTotal.Store(0)
+	refreshPendingCoalescedTotal.Store(0)
+	refreshPendingOverflowResyncTotal.Store(0)
+	refreshPendingHighWaterForTest.Store(0)
 	refreshEvictPublishedTotal.Store(0)
 	refreshEvictDeferredTotal.Store(0)
 	refreshStreamNanosTotal.Store(0)

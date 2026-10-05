@@ -298,3 +298,177 @@ func TestRefreshes484_FDrop_Wire(t *testing.T) {
 			len(miss), w484K*w484M, dropped, miss)
 	}
 }
+
+// floodUntilBlocked publishes the fillers until every handler is parked in
+// Write and every sink is full: the per-connection delivered counters stop
+// moving while publishing continues.
+func floodUntilBlocked(t *testing.T, store *cache.ResolvedCacheStore, fkeys, fillers []string) {
+	t.Helper()
+	totalDelivered := func() (n uint64) {
+		for _, s := range cache.RefreshSubSnapshotsForTest() {
+			n += s.Delivered
+		}
+		return n
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	last, stableSince := totalDelivered(), time.Now()
+	for {
+		for i, k := range fkeys {
+			w484Commit(store, k, fillers[i], `{"filler":true}`)
+		}
+		if cur := totalDelivered(); cur != last {
+			last, stableSince = cur, time.Now()
+		} else if time.Since(stableSince) > 300*time.Millisecond {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("precondition: the streams never blocked (delivered still moving after 20s)")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestRefreshes484_StallForcesResyncAndReconnectRepairs — the #484 overflow
+// rule end to end. Wedged tabs (body reader stalled) with v2 deferred in their
+// pending sets: once the consumer has made no progress for the stall bound,
+// the broadcaster force-resyncs each subscriber; when the tab's reader
+// resumes it reads `event: resync` and the stream ENDS. The SPA's contract
+// for an ended stream (refreshSse.ts:572,582-583 → scheduleRetry, :620-626 sets
+// revalidateOnConnect; :558-563 connect() → revalidateArmed, :599-614 a
+// re-fetch of EVERY armed widget) is modelled literally: reconnect with the
+// same coordinates, then re-read every armed key. Assertions: the old stream
+// carried the resync frame and ended, the reconnect is armed and LIVE (a
+// later commit reaches it), and the re-validation renders v2 everywhere.
+func TestRefreshes484_StallForcesResyncAndReconnectRepairs(t *testing.T) {
+	targets := w484Names("rsy484", w484K)
+	fillers := w484Names("rfil484", 40)
+	names := append(append([]string{}, targets...), fillers...)
+	seedPanels(t, names)
+	restore := cache.SetRefreshPendingStallBoundForTest(300 * time.Millisecond)
+	t.Cleanup(restore)
+	var keys []string
+	store := evictionWiring(t, &keys)
+	for _, n := range names {
+		keys = append(keys, expectedKey(t, n))
+	}
+	tkeys, fkeys := keys[:w484K], keys[w484K:]
+	base := refreshServer(t)
+
+	for _, k := range tkeys {
+		store.Put(k, &cache.ResolvedEntry{RawJSON: []byte(w484Body(k, 1))})
+	}
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	openGate := func() { gateOnce.Do(func() { close(gate) }) }
+	t.Cleanup(openGate)
+	streams := make([]*spaStream, w484M)
+	for i := range streams {
+		s, cancel := openSPAStream(t, base, store, names, gate)
+		t.Cleanup(cancel)
+		streams[i] = s
+	}
+	awaitArmed(t, keys, w484M)
+	floodUntilBlocked(t, store, fkeys, fillers)
+	for i, k := range tkeys {
+		w484Commit(store, k, targets[i], w484Body(k, 2))
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for cache.RefreshBroadcasterStatsSnapshot().PendingOverflowResync < w484M {
+		if time.Now().After(deadline) {
+			t.Fatalf("pending_overflow_resync=%d after 5s, want %d — wedged subscribers were never resynced",
+				cache.RefreshBroadcasterStatsSnapshot().PendingOverflowResync, w484M)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	openGate()
+	for i, s := range streams {
+		select {
+		case <-s.eof:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("stream%d did not END after its subscriber was resynced", i)
+		}
+		if n := s.eventCount("resync"); n != 1 {
+			t.Fatalf("stream%d carried %d `event: resync` frames before ending, want 1", i, n)
+		}
+	}
+
+	// SPA: the ended stream → reconnect (same coordinates) → revalidateArmed.
+	re := make([]*spaStream, w484M)
+	for i := range re {
+		s, cancel := openSPAStream(t, base, store, names, nil)
+		t.Cleanup(cancel)
+		re[i] = s
+	}
+	awaitArmed(t, keys, w484M)
+	for i := range re {
+		re[i].mu.Lock()
+		for _, k := range tkeys { // revalidateArmed: one re-fetch per armed widget
+			if e, ok := store.Get(k); ok && e != nil {
+				re[i].holds[k] = string(e.RawJSON)
+			}
+		}
+		re[i].mu.Unlock()
+	}
+	if miss := awaitHold(re, tkeys, 2, time.Second); len(miss) > 0 {
+		t.Fatalf("after resync + reconnect re-validation, %d cells still render v1: %v", len(miss), miss)
+	}
+	// The reconnected subscribers are live: a later commit reaches them.
+	for i, k := range tkeys {
+		w484Commit(store, k, targets[i], w484Body(k, 3))
+	}
+	if miss := awaitHold(re, tkeys, 3, time.Second); len(miss) > 0 {
+		t.Fatalf("reconnected streams are not delivering: %d cells missed v3: %v", len(miss), miss)
+	}
+	for _, s := range cache.RefreshSubSnapshotsForTest() {
+		if s.Resynced {
+			t.Fatalf("a reconnected subscriber is marked resynced")
+		}
+	}
+}
+
+// TestRefreshes484_WriteDeadlineReleasesWedgedClient — the SSE write deadline:
+// a tab that stops reading entirely cannot park its handler goroutine in Write
+// forever. With the deadline shortened (production: the 20s heartbeat), the
+// blocked write fails, the handler returns and the subscriber is released.
+// The stall rule is disabled (bound far beyond the test) so only the
+// deadline can end the stream.
+func TestRefreshes484_WriteDeadlineReleasesWedgedClient(t *testing.T) {
+	fillers := w484Names("wdl484", 40)
+	seedPanels(t, fillers)
+	prev := refreshWriteDeadlineNS.Swap(int64(300 * time.Millisecond))
+	t.Cleanup(func() { refreshWriteDeadlineNS.Store(prev) })
+	restore := cache.SetRefreshPendingStallBoundForTest(time.Hour)
+	t.Cleanup(restore)
+	var keys []string
+	store := evictionWiring(t, &keys)
+	for _, n := range fillers {
+		keys = append(keys, expectedKey(t, n))
+	}
+	base := refreshServer(t)
+	gate := make(chan struct{}) // never opened during the arm
+	t.Cleanup(func() { close(gate) })
+	for i := 0; i < w484M; i++ {
+		_, cancel := openSPAStream(t, base, store, fillers, gate)
+		t.Cleanup(cancel)
+	}
+	awaitArmed(t, keys, w484M)
+	closed0 := cache.RefreshBroadcasterStatsSnapshot().StreamsClosedTotal
+	floodUntilBlocked(t, store, keys, fillers)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for cache.RefreshSubscriberCount() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d wedged subscribers still held 5s after a 300ms write deadline — a slow client stalls its handler forever",
+				cache.RefreshSubscriberCount())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := cache.RefreshBroadcasterStatsSnapshot().StreamsClosedTotal - closed0; got != w484M {
+		t.Fatalf("streams_closed_total moved by %d, want %d", got, w484M)
+	}
+	if n := cache.RefreshBroadcasterStatsSnapshot().PendingOverflowResync; n != 0 {
+		t.Fatalf("pending_overflow_resync=%d — the deadline arm must not be satisfied by the stall rule", n)
+	}
+}
