@@ -61,6 +61,13 @@ func URL(raw string) string {
 	//
 	// A protocol-relative "//user:pw@host/x" DOES get its authority split, so
 	// it keeps its Host here and needs only the stripping below.
+	//
+	// What this costs, measured rather than assumed (#502 gate): against the
+	// narrower `Scheme == "" && Host == ""` test it changes 241 inputs, ALL of
+	// them credential-free one-slash shapes like "https:/h/base", which now
+	// render as <unparseable> instead of in clear. It gains no rendering. It is
+	// kept because it closes the #499 class independently of the "@" refusal at
+	// the end of this function, not because it reads better.
 	schemeless := u.Opaque != "" || u.Host == ""
 	if schemeless {
 		reparsed, rerr := url.Parse("//" + raw)
@@ -98,21 +105,30 @@ func URL(raw string) string {
 		out = strings.TrimPrefix(out, "//")
 	}
 
-	// THE CATCH-ALL, and the one check that does not depend on having reasoned
-	// correctly about url.Parse's shapes. Credentials live before an "@"; query
-	// values (where a token would otherwise hide) are already replaced above.
-	// So nothing this function returns may contain an "@" AT ALL — if one
-	// survived, some shape outwitted the parsing above and the URL is not
-	// rendered. Inspecting u.Host alone was not enough: for an opaque URL the
-	// real "@" ends up in Path, where the old guard never looked.
+	// THE SECOND BARRIER. Measured over 3,000 credential-bearing inputs (#502
+	// gate): the authority handling above and this clause EACH close #499 on
+	// their own — remove either and there are still 0 leaks; remove both and
+	// there are 900. They are kept together deliberately, because this class of
+	// bug has now recurred three times (#487 → #499 → the first cut of #502),
+	// every time because one mechanism was reasoned about correctly and one
+	// shape was not.
+	//
+	// They fail differently, which is the point: the handling above STRIPS and
+	// still renders a usable URL, this one REFUSES. A fix that only refused
+	// would hide a stripper that had stopped working — which is why
+	// TestS499_CredentialShapesAreSTRIPPEDNotRefused asserts that a
+	// credential-bearing URL comes back rendered, not as <unparseable>.
+	//
+	// Credentials live before an "@", and query values (where a token would
+	// otherwise hide) are already replaced above, so nothing returned here may
+	// contain an "@" AT ALL. Inspecting u.Host alone was not enough: for an
+	// opaque URL the real "@" ends up in Path, where the old guard never looked.
 	//
 	// The cost is that a URL with a literal "@" in its PATH renders as
 	// unparseable. That is deliberate: a lost diagnostic is cheaper than a
 	// leaked credential, and it keeps the invariant stated as something a test
 	// can assert over any corpus rather than over an enumerated shape list.
-	// "%40" is "@" that survived encoding: "u:p%40host/x" has no literal "@" for
-	// the check above to catch, yet it reads back as the userinfo "u:p".
-	if strings.Contains(out, "@") || strings.Contains(strings.ToUpper(out), "%40") {
+	if strings.Contains(out, "@") {
 		return URLUnparseable
 	}
 	return out

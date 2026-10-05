@@ -196,3 +196,44 @@ func TestS499_URLNeverLeaksOverAShapeCorpus(t *testing.T) {
 			"refusing everything would satisfy the leak properties vacuously", rendered)
 	}
 }
+
+// TestS499_CredentialShapesAreSTRIPPEDNotRefused closes a coverage gap the
+// #502 gate found in the corpus arm above.
+//
+// That arm asserts "no credential sentinel, and no surviving @". Both
+// properties are satisfied EQUALLY by "the userinfo was stripped and the URL
+// rendered" and by "the URL was thrown away as <unparseable>" — so it cannot
+// tell the two apart, and removing the stripping while keeping the catch-all
+// leaves it GREEN. Its REDs under that mutation are all the corpus's own
+// `/a@b` PATH dimension, not one of them a credential.
+//
+// This arm pins the behaviour the corpus arm cannot see: for a URL that
+// carries real userinfo, the credential must be REMOVED and the rest of the
+// URL must SURVIVE. Refusing the URL is not an acceptable answer here —
+// <unparseable> would hide a stripper that had stopped working, which is
+// exactly the state #499 shipped in.
+func TestS499_CredentialShapesAreSTRIPPEDNotRefused(t *testing.T) {
+	const pw = "hunter2-zq499-pw"
+	for _, tc := range []struct{ raw, want string }{
+		{"https://u:" + pw + "@h:6443/base", "https://h:6443/base"},
+		{"https://u:" + pw + "@h/base", "https://h/base"},
+		{"u:" + pw + "@h/base", "h/base"},
+		{"u:" + pw + "@h:6443/base", "h:6443/base"},
+		{"u:" + pw + "@h", "h"},
+		{"u@h", "h"},
+		{"u@h/base", "h/base"},
+		{"//u:" + pw + "@h/base", "//h/base"},
+		{"https://u:" + pw + "@[::1]:6443/x", "https://[::1]:6443/x"},
+		{"https://u:" + pw + "@h/base?token=t", "https://h/base?token=" + URLRedactedValue},
+	} {
+		got := URL(tc.raw)
+		if got == URLUnparseable {
+			t.Errorf("URL(%q) = <unparseable>: a credential-bearing URL must be STRIPPED and RENDERED, "+
+				"not refused — refusing hides whether the stripper still works", tc.raw)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("URL(%q)\n got  %q\n want %q", tc.raw, got, tc.want)
+		}
+	}
+}

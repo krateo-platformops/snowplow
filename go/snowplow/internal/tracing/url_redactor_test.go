@@ -145,6 +145,10 @@ func TestS489_EveryTracerProviderInThisPackageCarriesTheRedactor(t *testing.T) {
 	}
 
 	providers, registrations := 0, 0
+	// positions of sdktrace.X selectors that are the Fun of a CallExpr, i.e. the
+	// ones the walk below actually vetted; anything else is the name taken as a
+	// VALUE, which can then be called through a variable.
+	calledSel := map[token.Pos]bool{}
 	for _, pkg := range pkgs {
 		for name, file := range pkg.Files {
 			// enclosing function of each node, so a NewTracerProvider call can be
@@ -167,6 +171,7 @@ func TestS489_EveryTracerProviderInThisPackageCarriesTheRedactor(t *testing.T) {
 					return true
 				}
 				pos := fset.Position(call.Pos())
+				calledSel[sel.Sel.Pos()] = true
 				switch sel.Sel.Name {
 				case "NewTracerProvider":
 					providers++
@@ -186,6 +191,67 @@ func TestS489_EveryTracerProviderInThisPackageCarriesTheRedactor(t *testing.T) {
 							"redactingExporter — spans would export url.full with the query in clear (#489)",
 							name, pos.Line, sel.Sel.Name)
 					}
+				}
+				return true
+			})
+		}
+	}
+
+	// The checks above key on the SPELLING "sdktrace", which the #502 gate
+	// defeated three ways: a different import alias, a dot-import (the call is
+	// then a bare *ast.Ident, never a SelectorExpr), and a variable indirection
+	// (`ntp := sdktrace.NewTracerProvider; ntp(...)`). go/types resolution is
+	// the complete answer; these two cheaper checks close all three without the
+	// dependency, by removing the spellings they rely on.
+	for _, pkg := range pkgs {
+		for name, file := range pkg.Files {
+			for _, imp := range file.Imports {
+				if imp.Path == nil || imp.Path.Value != `"go.opentelemetry.io/otel/sdk/trace"` {
+					continue
+				}
+				pos := fset.Position(imp.Pos())
+				switch {
+				case imp.Name == nil:
+					t.Errorf("%s:%d: otel/sdk/trace must be imported as `sdktrace`, not unaliased — "+
+						"the guard above resolves that spelling (#489)", name, pos.Line)
+				case imp.Name.Name == ".":
+					t.Errorf("%s:%d: otel/sdk/trace must not be DOT-imported — a dot-imported "+
+						"NewTracerProvider is a bare identifier the guard cannot see (#489)", name, pos.Line)
+				case imp.Name.Name != "sdktrace":
+					t.Errorf("%s:%d: otel/sdk/trace is aliased %q; the guard resolves `sdktrace` only, "+
+						"so another alias would hide a provider construction (#489)",
+						name, pos.Line, imp.Name.Name)
+				}
+			}
+
+			// Any mention of these names that is NOT the sdktrace.X selector the
+			// walk above already vetted — a dot-imported call, or the function
+			// taken as a value and called through a variable.
+			ast.Inspect(file, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok {
+					if id, isIdent := sel.X.(*ast.Ident); isIdent && id.Name == "sdktrace" {
+						switch sel.Sel.Name {
+						case "NewTracerProvider", "WithBatcher", "WithSyncer":
+							if !calledSel[sel.Sel.Pos()] {
+								pos := fset.Position(sel.Pos())
+								t.Errorf("%s:%d: sdktrace.%s is taken as a VALUE rather than called — "+
+									"calling it through a variable routes around the provider/exporter "+
+									"guard (#489)", name, pos.Line, sel.Sel.Name)
+							}
+						}
+						return false // vetted above; do not re-walk sel.Sel as a bare ident
+					}
+				}
+				id, ok := n.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				switch id.Name {
+				case "NewTracerProvider", "WithBatcher", "WithSyncer":
+					pos := fset.Position(id.Pos())
+					t.Errorf("%s:%d: %q appears outside an `sdktrace.` selector — a dot-import or a "+
+						"function value would route around the provider/exporter guard (#489)",
+						name, pos.Line, id.Name)
 				}
 				return true
 			})
