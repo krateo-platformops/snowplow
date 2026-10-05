@@ -42,6 +42,7 @@ import (
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // GTTL-2 — cadence == TTL×3/4 derived from RESOLVED_CACHE_TTL_SECONDS.
@@ -215,7 +216,7 @@ func TestKeepwarmSweep_WidgetCapablePrefix_SeedsAllCapableNotWidgetless(t *testi
 			widgetSeen[eIdentityLabel(ctx)] = true
 			return nil
 		}
-		seedOneRestactionFn = func(ctx context.Context, _ string, _ templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
+		seedOneRestactionFn = func(ctx context.Context, _ redact.Label, _ templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
 			raSeen[eIdentityLabel(ctx)] = true
 			return nil
 		}

@@ -54,6 +54,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // engineLatchTestMu serializes the tests in this file: they share the
@@ -250,8 +251,8 @@ func TestSeedScopeYielding_OneOperationalFailure_EnqueuesExactlyOnce(t *testing.
 	if lvl, _ := rec["level"].(string); lvl != "WARN" {
 		t.Errorf("operational_failure level = %q; want WARN", lvl)
 	}
-	if tgt, _ := rec["target"].(string); tgt != "user-0" {
-		t.Errorf("operational_failure target(cohort-label) field = %q; want %q", tgt, "user-0")
+	if tgt, _ := rec["target"].(string); tgt != redact.User("user-0") { // #453: the cohort label, never the username
+		t.Errorf("operational_failure target(cohort-label) field = %q; want %q", tgt, redact.User("user-0"))
 	}
 	// No expected_deny event for a pure-operational run.
 	if d := findLogRecord(t, res.logText, "prewarm.engine.seed.expected_deny"); d != nil {
@@ -333,8 +334,8 @@ func TestSeedScopeYielding_RBACDeny_NoEnqueue_BumpsDenyCounter(t *testing.T) {
 	// — prewarm_engine_boot.go:353,357-363. The COHORT/identity label is
 	// logged under "target"; the RESOURCE (ns/name) is logged under the
 	// kind-named key ("widget").
-	if tgt, _ := rec["target"].(string); tgt != "user-0" {
-		t.Errorf("expected_deny target(cohort-label) field = %q; want %q", tgt, "user-0")
+	if tgt, _ := rec["target"].(string); tgt != redact.User("user-0") { // #453: the cohort label, never the username
+		t.Errorf("expected_deny target(cohort-label) field = %q; want %q", tgt, redact.User("user-0"))
 	}
 	if w, _ := rec["widget"].(string); w != "ns/w0" {
 		t.Errorf("expected_deny widget(resource) field = %q; want %q", w, "ns/w0")

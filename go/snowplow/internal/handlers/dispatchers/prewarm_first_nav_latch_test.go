@@ -43,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // ── recorder that timestamps the latch fire relative to seed events ─────────
@@ -141,7 +142,7 @@ func installLatchSeams(t *testing.T, rec *latchRecorder,
 	t.Cleanup(func() { seedOneWidgetFn = prevW })
 
 	prevR := seedOneRestactionFn
-	seedOneRestactionFn = func(ctx context.Context, _ string, ref templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
+	seedOneRestactionFn = func(ctx context.Context, _ redact.Label, ref templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
 		rec.rec(latchSeedEvent{class: "restaction", label: ref.Name, rootIdx: -1, identity: eIdentityLabel(ctx)})
 		return nil
 	}

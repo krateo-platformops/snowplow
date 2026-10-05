@@ -55,6 +55,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -338,7 +339,7 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
 		log.Warn("objects.Get.rbac_get_filter.evaluate_error",
 			slog.String("subsystem", "cache"),
-			slog.String("user", user.Username),
+			slog.String("user", redact.User(user.Username)),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", obj.GetNamespace()),
 			slog.String("name", obj.GetName()),
@@ -350,7 +351,7 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 
 	log.Debug("objects.Get.rbac_get_filter",
 		slog.String("subsystem", "cache"),
-		slog.String("user", user.Username),
+		slog.String("user", redact.User(user.Username)),
 		slog.String("gvr", gvr.String()),
 		slog.String("namespace", obj.GetNamespace()),
 		slog.String("name", obj.GetName()),

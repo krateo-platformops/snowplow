@@ -39,6 +39,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 const (
@@ -163,7 +164,7 @@ func Refreshes() http.HandlerFunc {
 
 		log.Info("refreshes: subscribed",
 			slog.String("subsystem", "cache"),
-			slog.String("user", ui.Username),
+			slog.String("user", redact.User(ui.Username)),
 			slog.Int("armed_keys", len(armed)),
 		)
 

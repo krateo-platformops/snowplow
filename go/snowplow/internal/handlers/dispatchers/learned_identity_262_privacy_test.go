@@ -30,6 +30,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -65,8 +66,12 @@ func TestF6_262_Privacy_NoClassTokenInLogsOrDebug(t *testing.T) {
 	cache.RegisterLearnedClassesExpvar()
 	registerS258WideningHook(t)
 	s258ResetSink()
+	// #453 — a BASE (non-learned) group cohort is an identity too: its group
+	// string may not reach a log line in clear either.
+	const baseGroup = "grp-zq7-base-cohort"
 	env := l262Setup(t, l262Opts{
-		extraUsers: []string{cn},
+		extraUsers:   []string{cn},
+		groupCohorts: []string{baseGroup},
 		secrets: []*corev1.Secret{
 			l262ClientconfigSecret(t, secretName, cn, []string{l262Group, privGroup}, time.Now().Add(-time.Hour), "1"),
 		},
@@ -160,6 +165,32 @@ func TestF6_262_Privacy_NoClassTokenInLogsOrDebug(t *testing.T) {
 			leaks["/debug/vars ⇐ "+tok]++
 		}
 	}
+	// #453 — base identities. The arm's own l262.* probe records stand in for
+	// resolve-path sites and log their requester raw on purpose (the #262
+	// redactor's input). The production sites they model are redacted at
+	// source, and internal/redact's structural guard covers those, so the
+	// probes are excluded here. The group is matched as a whole string value or
+	// a pre-#453 "group:<g>" label, not as a substring: the harness binding
+	// UID "uid-l262-cohort-<g>" embeds the group name and is not an identity.
+	for _, line := range strings.Split(logs, "\n") {
+		var rec struct {
+			Msg string `json:"msg"`
+		}
+		_ = json.Unmarshal([]byte(line), &rec)
+		if strings.HasPrefix(rec.Msg, "l262.") {
+			continue
+		}
+		for _, tok := range []string{`"` + baseGroup + `"`, "group:" + baseGroup} {
+			if strings.Contains(line, tok) {
+				leaks["#453 "+rec.Msg+" ⇐ "+tok]++
+			}
+		}
+	}
+	for _, tok := range []string{`"` + baseGroup + `"`, "group:" + baseGroup} {
+		if strings.Contains(debugVars, tok) {
+			leaks["#453 /debug/vars ⇐ "+tok]++
+		}
+	}
 	if len(leaks) > 0 {
 		for k, n := range leaks {
 			t.Errorf("F6 RED: learned-class token in %s (%d record(s))", k, n)
@@ -171,6 +202,10 @@ func TestF6_262_Privacy_NoClassTokenInLogsOrDebug(t *testing.T) {
 	if !strings.Contains(logs, label) {
 		t.Fatalf("NON-VACUITY: the class label %s never appeared in the captured logs — the learned seed's "+
 			"records did not reach the sink, so a clean scan proves nothing", label)
+	}
+	if !strings.Contains(logs, redact.Group(baseGroup)) {
+		t.Fatalf("NON-VACUITY (#453): the base group cohort's label %s never appeared — its seed records did not "+
+			"reach the sink, so a clean base scan proves nothing", redact.Group(baseGroup))
 	}
 	if !strings.Contains(logs, "l262.refresh_path.requester") || !strings.Contains(logs, "l262.resolve_path.requester") {
 		t.Fatal("NON-VACUITY: the resolve-path and refresh-path probe records were not captured")

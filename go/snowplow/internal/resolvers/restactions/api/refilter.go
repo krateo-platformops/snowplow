@@ -42,6 +42,7 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
@@ -545,7 +546,7 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		})
 		if err != nil {
 			log.Warn("userAccessFilter: EvaluateRBAC error; treating resource as denied",
-				slog.String("user", username),
+				slog.String("user", redact.User(username)),
 				slog.String("verb", uaf.Verb),
 				slog.String("group", uaf.Group),
 				slog.String("resource", resource),
@@ -932,7 +933,7 @@ func emitRefilterFalsifierFromHandler(ctx context.Context, log *slog.Logger, api
 	log.Debug("userAccessFilter",
 		slog.String("subsystem", "uaf"),
 		slog.String("dispatch", "service_account"),
-		slog.String("user", username),
+		slog.String("user", redact.User(username)),
 		slog.String("api", apiCallName),
 		slog.String("verb", uaf.Verb),
 		slog.String("group", uaf.Group),
@@ -957,7 +958,7 @@ func emitRefilterFalsifier(log *slog.Logger, apiCall *templates.API, username st
 	log.Debug("userAccessFilter",
 		slog.String("subsystem", "uaf"),
 		slog.String("dispatch", "service_account"),
-		slog.String("user", username),
+		slog.String("user", redact.User(username)),
 		slog.String("api", apiCall.Name),
 		slog.String("verb", apiCall.UserAccessFilter.Verb),
 		slog.String("group", apiCall.UserAccessFilter.Group),

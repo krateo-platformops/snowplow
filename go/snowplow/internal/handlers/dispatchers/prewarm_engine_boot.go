@@ -49,6 +49,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -742,16 +743,16 @@ func seedScopeYielding(ctx context.Context,
 	// back-compat grand total pipBindingSetSeedFailuresTotal is bumped for
 	// parity (= rbac_deny + operational).
 	failedSet := map[string]struct{}{}
-	classifyEngineSeedErr := func(kind, label, target string, err error) {
+	classifyEngineSeedErr := func(kind, label string, target redact.Label, err error) {
 		pipBindingSetSeedFailuresTotal.Add(1)
 		if classifySeedErr(err) == seedFailRBACDeny {
 			pipSeedRBACDenyTotal.Add(1)
 			slog.Info("prewarm.engine.seed.expected_deny",
 				slog.String("subsystem", "cache"),
 				slog.String("kind", kind),
-				slog.String("target", target),
+				slog.String("target", target.String()),
 				slog.String(kind, label),
-				slog.Any("err", err),
+				slog.String("err", redact.Err(err)),
 			)
 			return
 		}
@@ -765,9 +766,9 @@ func seedScopeYielding(ctx context.Context,
 		slog.Warn("prewarm.engine.seed.operational_failure",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", kind),
-			slog.String("target", target),
+			slog.String("target", target.String()),
 			slog.String(kind, label),
-			slog.Any("err", err),
+			slog.String("err", redact.Err(err)),
 			slog.String("effect", "operational seed failure (NOT an RBAC deny); recorded into the boot "+
 				"failed-set — a coalesced boot re-walk is enqueued at the pass tail (dedup on key()==\"boot\") "+
 				"UNLESS the #105 set-delta bound has tripped (deterministic failer, no forward progress)"),
@@ -1012,6 +1013,7 @@ func seedScopeYielding(ctx context.Context,
 	// metric stays data-derived CollapsedBindings.
 	type rankedIdentity struct {
 		key       string
+		label     redact.Label // #453: the only form of the identity that is logged
 		widgetMax int
 		allMax    int
 	}
@@ -1020,6 +1022,7 @@ func seedScopeYielding(ctx context.Context,
 		k := identityKey(c)
 		ri := rankOf[k] // zero value {key:"", 0, 0} for a first observation
 		ri.key = k
+		ri.label = cohortLogLabel(c)
 		if c.CollapsedBindings > ri.allMax {
 			ri.allMax = c.CollapsedBindings
 		}
@@ -1066,7 +1069,7 @@ func seedScopeYielding(ctx context.Context,
 			log.Info("prewarm.engine.seed.rank",
 				slog.String("subsystem", "cache"),
 				slog.Int("rank", r),
-				slog.String("identity", ranked[r].key),
+				slog.String("identity", ranked[r].label.String()),
 				slog.Int("widget_max", ranked[r].widgetMax),
 				slog.Int("all_max", ranked[r].allMax),
 			)
@@ -1312,7 +1315,7 @@ func seedScopeYielding(ctx context.Context,
 			}
 			log.Info("prewarm.keepwarm.cohort_summary",
 				slog.String("subsystem", "cache"),
-				slog.String("identity", rankKey),
+				slog.String("identity", ranked[ri].label.String()),
 				slog.Int("widget_max", ranked[ri].widgetMax),
 				slog.Int64("reseeds", reseeds),
 				slog.Int64("age_skips", int64(ageSkips)),

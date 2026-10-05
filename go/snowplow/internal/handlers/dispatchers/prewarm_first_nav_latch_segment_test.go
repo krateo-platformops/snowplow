@@ -56,7 +56,6 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
-	"strings"
 	"testing"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
@@ -64,6 +63,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // ── ARM-GREEN-BOOT600 (§5 GREEN, Fix 1) ─────────────────────────────────────
@@ -469,7 +469,7 @@ func TestF3bR2_C_r2_3_KeepwarmUnchanged_PrefixBoundAndCohortSummary(t *testing.T
 	// (1) PREFIX BOUND: the widget-less machineSA cohort must NOT be swept — no
 	// cohort_summary for it (the break at widgetMax==0 stops before it).
 	for _, id := range summaries {
-		if strings.Contains(id, "machine") {
+		if id == redact.Group("machine") { // #453: cohorts log as their redact label
 			t.Fatalf("cond-3 PREFIX BOUND broken: widget-less cohort 'machine' (widgetMax==0) was swept "+
 				"(got a cohort_summary) — the keepwarm prefix-break at widgetMax==0 is gone. summaries=%v", summaries)
 		}
@@ -481,10 +481,10 @@ func TestF3bR2_C_r2_3_KeepwarmUnchanged_PrefixBoundAndCohortSummary(t *testing.T
 	}
 	devsSeen, opsSeen := false, false
 	for _, id := range summaries {
-		if strings.Contains(id, "devs") {
+		if id == redact.Group("devs") {
 			devsSeen = true
 		}
-		if strings.Contains(id, "ops") {
+		if id == redact.Group("ops") {
 			opsSeen = true
 		}
 	}
