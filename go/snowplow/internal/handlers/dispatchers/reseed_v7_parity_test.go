@@ -11,10 +11,10 @@ package dispatchers
 //     SubjectBindingSet digest, same post-rotation RBACSubGen) — and that key
 //     must HIT. RED if the reseed minted under any other identity dimension
 //     (key mismatch / miss) or if the guard declined it (drift counter moved).
-//   - TestS258_V7_ReMintIsUnderTheClassDriftGuard: ReplaceIfGenReMint's only
-//     caller is seedTerminalPut, and the #424 guard runs before every write
-//     there, so a re-mint whose identity class drifted is declined with no
-//     write. RED if the guard is moved below the re-mint branch.
+//
+// #378 retired the seed-path re-mint (TestS258_V7_ReMintIsUnderTheClassDriftGuard
+// went with it). The re-mint now rides the refresher terminal, whose #424 guard
+// and #444 re-pick run before the write: TestIssue378_F3_ReMintAcrossRotation_KeyAndOutput.
 
 import (
 	"context"
@@ -109,30 +109,5 @@ func TestS258_V7_ReseededKeyEqualsRotatedCustomerKey(t *testing.T) {
 	}
 	if _, ok := handle.Get(custKey); !ok {
 		t.Fatalf("carol's first navigation after the rotation must HIT the reseeded cell %q", custKey)
-	}
-}
-
-func TestS258_V7_ReMintIsUnderTheClassDriftGuard(t *testing.T) {
-	s258BuildWatcher(t)
-	h := &s394RecordingHandle{gen: 7}
-	g := seedTerminalGuardFor(seedModeReMint, h, "k")
-	if !g.reMint {
-		t.Fatal("precondition: remint guard")
-	}
-	ctx := s258IdentityCtx(a1Alice)
-	// A key minted for a DIFFERENT class than alice's current one.
-	drifted := &cache.ResolvedEntry{Inputs: &cache.ResolvedKeyInputs{
-		CacheEntryClass:   "widgets",
-		SubjectBindingSet: "not-alices-binding-set",
-	}}
-	before := identityClassDriftDeclinedForTest("seed", "binding_set")
-	if seedTerminalPut(ctx, h, "k", drifted, g) {
-		t.Fatal("a re-mint whose identity class drifted must be DECLINED")
-	}
-	if h.reMints != 0 || h.putIfGens != 0 || h.puts != 0 {
-		t.Fatalf("a declined re-mint must write nothing; reMints=%d putIfGens=%d puts=%d", h.reMints, h.putIfGens, h.puts)
-	}
-	if got := identityClassDriftDeclinedForTest("seed", "binding_set") - before; got != 1 {
-		t.Fatalf("drift counter moved by %d, want 1", got)
 	}
 }

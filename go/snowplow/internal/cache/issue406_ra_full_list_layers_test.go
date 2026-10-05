@@ -393,7 +393,7 @@ func TestIssue406_Layers_IndexBoundedByResidentWidgets(t *testing.T) {
 
 // STRUCTURAL: every function in this package that stores an entry (calls putCoreLocked)
 // must also run raLayerCommitLocked, so a new store write path (e.g. #416's
-// ReplaceIfGenReMint) cannot stamp or skip the content version silently.
+// ReplaceIfGenRefresh) cannot stamp or skip the content version silently.
 func TestIssue406_Layers_EveryStoreWriteRunsTheLayerCommit(t *testing.T) {
 	fset := token.NewFileSet()
 	ents, err := os.ReadDir(".")

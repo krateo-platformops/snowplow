@@ -1105,6 +1105,16 @@ func registerSecurityInstruments(m metric.Meter) error {
 		return err
 	}
 
+	// --- #378: refresher-terminal re-mints (BornAt resets), per class. The
+	// closed class set (cache.RemintClasses) is emitted in full, zeros included;
+	// the sum is snowplow_resolved_cache{stat=remint_total}. ---
+	remint, err := m.Int64ObservableCounter(
+		"snowplow_resolved_cache_remint_total",
+		metric.WithDescription("L1 refresher-terminal writes that re-minted the cell (reset its BornAt under the same key) because it was inside the lead window [maxAge - L, ...), L = min(TTL, maxAge/2), by class {restactions, widgets, widgetContent, apistage, raFullList}. Read with snowplow_resolved_cache{stat=evict_max_age_warm_customer_total}, which must stay 0 (#378)."))
+	if err != nil {
+		return err
+	}
+
 	// --- #424: subject binding-set digest memo ---
 	bsHits, err := m.Int64ObservableCounter("snowplow_binding_set_memo_hits",
 		metric.WithDescription("Subject binding-set digest memo hits (#424). Hit ratio = hits / (hits + misses)."))
@@ -1185,6 +1195,9 @@ func registerSecurityInstruments(m metric.Meter) error {
 		for _, c := range dispatchers.RepresentativeRepickCells() {
 			o.ObserveInt64(repick, c.Count, metric.WithAttributes(attribute.String("outcome", c.Outcome)))
 		}
+		for _, c := range cache.ResolvedCacheRemintByClass() {
+			o.ObserveInt64(remint, int64(c.Count), metric.WithAttributes(attribute.String("class", c.Class)))
+		}
 
 		hits, misses, refused, entries := rbac.BindingSetMemoSnapshot()
 		o.ObserveInt64(bsHits, int64(hits))
@@ -1217,7 +1230,7 @@ func registerSecurityInstruments(m metric.Meter) error {
 			}
 		}
 		return nil
-	}, driftDeclined, repick, bsHits, bsMisses, bsRefused, bsEntries,
+	}, driftDeclined, repick, remint, bsHits, bsMisses, bsRefused, bsEntries,
 		lRegistered, lSeeded, lUnseeded, lNavOnly, lFromSecrets, lUnparseable, lClientconfig,
 		lCapacity, lBound)
 	return err

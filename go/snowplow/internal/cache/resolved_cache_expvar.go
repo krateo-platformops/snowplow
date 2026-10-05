@@ -127,8 +127,27 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		"suppressed_resident": int64(s.SuppressedResident),
 		// #315 C4 detector — resident WARM cells past maxEntryAge, un-re-minted
 		// (a GAUGE): the AT-RISK population the read-independent pass keeps (C3)
-		// rather than cold-evicts, and keeps body-fresh via #316. Re-mint deferred.
+		// rather than cold-evicts, and keeps body-fresh via #316. #378: the
+		// refresher terminal re-mints a warm cell it refreshes inside the lead
+		// window [maxAge − L, …), L = min(TTL, maxAge/2), so a cell lands here only
+		// if no refresh was accepted in its window.
 		"warm_past_max_age": int64(s.WarmPastMaxAge),
+		// #378 — the warm-cell cap detectors (monotonic). A maxAge evict of a WARM
+		// cell on the CUSTOMER read path is a cold navigation of the working set:
+		// evict_max_age_warm_customer_total is the owner's P5 trigger. The internal
+		// twin is the same evict on the GetNoTouch path. evict_ttl_warm_customer_total
+		// is a warm cell whose BODY lapsed under a customer. All three are subsets of
+		// evict_max_age_total / evict_ttl_total, which are unchanged.
+		"evict_max_age_warm_customer_total": int64(s.EvictMaxAgeWarmCustomerTotal),
+		"evict_max_age_warm_internal_total": int64(s.EvictMaxAgeWarmInternalTotal),
+		"evict_ttl_warm_customer_total":     int64(s.EvictTTLWarmCustomerTotal),
+		// #378 — GAUGE: the oldest BornAt age (s) over warm cells at the last reaper
+		// walk. The detectors' scope: a zero above is evidence only once this has
+		// exceeded maxEntryAge − L.
+		"oldest_warm_born_age_seconds": int64(s.OldestWarmBornAgeSeconds),
+		// #378 — refresher-terminal writes that re-minted (reset BornAt). By class:
+		// the hand-wired OTLP counter snowplow_resolved_cache_remint_total{class}.
+		"remint_total": int64(s.RemintTotal),
 		// #376 — resident WARM cells split by warmth SOURCE (both GAUGES). warm_seeded
 		// = boot-prewarmed cells; warm_lastread = cells kept warm by a read-within-TTL
 		// lastRead and NOT seeded. Decomposes the warm working set so GetNoTouch's

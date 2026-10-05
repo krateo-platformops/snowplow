@@ -1,19 +1,18 @@
-// reseed_engine.go — #258/#378 SHARED reseed engine: the composition over the
-// seed primitives (seedOneWidgetFn/seedOneRestactionFn) that re-resolves a target
-// under its CURRENT sub-generation key. Two entrypoints differ ONLY in how the
-// unit is acquired:
+// reseed_engine.go — #258 reseed engine: the composition over the seed
+// primitives (seedOneWidgetFn/seedOneRestactionFn) that re-resolves a target
+// under its CURRENT sub-generation key. reseedTargets takes units IN HAND from
+// the harvester — NEVER re-fetched (the #258 amplification bound depends on not
+// walking/fetching).
 //
-//   - reseedTargets   (#258): units IN HAND from the harvester — NEVER re-fetched
-//     (the #258 amplification bound depends on not walking/fetching).
-//   - reseedFromInputs (#378): the reaper holds only each aging cell's
-//     ResolvedKeyInputs (coords + representative identity), so this FETCHES the
-//     unit by coords before re-minting the SAME key.
-//
-// Both funnel reseedUnderCurrentIdentity, which stamps the current sub-gen under
+// It funnels reseedUnderCurrentIdentity, which stamps the current sub-gen under
 // the subject/representative identity (NEVER the SA), customer-priority-yielded
-// and per-target-timeout-bounded. The MODE selects the terminal write through the
-// ONE #394 mechanism (seedTerminalGuardFor / seedTerminalPut):
-// seedModeRBACShift = PutIfGen INSERT, seedModeReMint = ReplaceIfGenReMint.
+// and per-target-timeout-bounded. The terminal write goes through the ONE #394
+// mechanism (seedTerminalGuardFor / seedTerminalPut): seedModeRBACShift =
+// PutIfGen INSERT.
+//
+// #378: the age re-mint is NOT a reseed. It rides the refresher terminal
+// (cache.ReplaceIfGenRefresh); the seed-path re-mint (reseedFromInputs,
+// seedModeReMint) was retired.
 
 package dispatchers
 
@@ -24,13 +23,11 @@ import (
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // reseedRequest is one reseed unit: a resident target (widget OR restaction)
 // paired with the cohort identity to re-resolve it under. For #258 the unit is in
-// hand (widget CR / RA ObjectReference from the harvester); for #378 it is
-// reconstructed from fetched coords.
+// hand (widget CR / RA ObjectReference from the harvester).
 type reseedRequest struct {
 	identity seedTarget
 	isWidget bool
@@ -67,14 +64,11 @@ func reseedOnce(ctx context.Context, deps rePrewarmDeps, req reseedRequest, mode
 	})
 }
 
-// reseedWithRefusalPolicy reseeds one target and applies the per-mode refusal
-// policy of the ONE #394 mechanism (seed_terminal_put_guard.go):
-//   - seedModeRBACShift: the #394 one-shot inline re-seed in the SAME mode
-//     (reseedAfterTerminalPutRefusal — fresh capture, PutIfGen may INSERT); a
-//     second refusal is logged and swallowed (nil), exactly like keepwarm /
-//     gvr-discovered.
-//   - seedModeReMint: NO retry (retriesTerminalPutRefusal) — a refused
-//     ReplaceIfGenReMint means the cell was removed; it is logged and swallowed.
+// reseedWithRefusalPolicy reseeds one target and applies the refusal policy of
+// the ONE #394 mechanism (seed_terminal_put_guard.go): the #394 one-shot inline
+// re-seed in the SAME mode (reseedAfterTerminalPutRefusal — fresh capture,
+// PutIfGen may INSERT); a second refusal is logged and swallowed (nil), exactly
+// like keepwarm / gvr-discovered.
 //
 // A refusal is never re-enqueued and never classified as a failure: the removal
 // is authoritative. Re-arming the whole rotated set for one refused cell would
@@ -83,16 +77,6 @@ func reseedWithRefusalPolicy(ctx context.Context, deps rePrewarmDeps, req reseed
 	err := reseedOnce(ctx, deps, req, mode)
 	if !errors.Is(err, errSeedTerminalPutRefused) || ctx.Err() != nil {
 		return err
-	}
-	if !retriesTerminalPutRefusal(mode) {
-		slog.Default().Info("prewarm.engine.reseed.remint_refused",
-			slog.String("subsystem", "cache"),
-			slog.String("class", reseedClass(req)),
-			slog.String("target", reseedTargetLabel(req)),
-			slog.String("effect", "#378 the cell was removed during the re-mint resolve; the removal is "+
-				"authoritative and the next fill is a fresh birth — not retried, not re-enqueued"),
-		)
-		return nil
 	}
 	return reseedAfterTerminalPutRefusal(reseedClass(req), reseedTargetLabel(req), cohortLogLabel(req.identity),
 		func() error { return reseedOnce(ctx, deps, req, mode) })
@@ -125,86 +109,6 @@ func reseedTargets(ctx context.Context, deps rePrewarmDeps, reqs []reseedRequest
 		}
 	}
 	return reEnqueue
-}
-
-// reseedFromInputs is #378's entrypoint over the shared core: the reaper holds
-// aging cells' ResolvedKeyInputs (coords + representative identity, NO unit). This
-// reconstructs each unit (restactions self-fetch inside seedOneRestaction; widgets
-// fetched by coords here) and re-mints the SAME key (seedModeReMint). Returns the
-// inputs to RE-ENQUEUE (the unprocessed tail on a ctx cancel). A refused re-mint
-// is terminal (see reseedWithRefusalPolicy) and is not re-enqueued.
-//
-// #378 OWNERSHIP (dev-1218): the reaper selection + the per-fetch C5 sizing land
-// with #378; this seam + core are ready now. An input whose unit is GONE is
-// skipped (the DELETE path reclaims it — not a re-mint).
-func reseedFromInputs(ctx context.Context, deps rePrewarmDeps, inputs []*cache.ResolvedKeyInputs) (reEnqueue []*cache.ResolvedKeyInputs) {
-	for i, in := range inputs {
-		if in == nil {
-			continue
-		}
-		if ctx.Err() != nil {
-			return append(reEnqueue, inputs[i:]...)
-		}
-		engineYieldCheckpoint(ctx)
-		identity := seedTarget{Username: in.RepresentativeUsername, Groups: in.RepresentativeGroups}
-		fetchCtx, cancel := reseedCohortCtx(ctx, deps, identity)
-		req, ok := reseedRequestFromInputs(fetchCtx, identity, in)
-		cancel()
-		if !ok {
-			continue
-		}
-		err := reseedWithRefusalPolicy(ctx, deps, req, seedModeReMint)
-		switch {
-		case err == nil:
-		case ctx.Err() != nil:
-			return append(reEnqueue, inputs[i:]...)
-		default:
-			slog.Warn("prewarm.engine.reseed.target_error",
-				slog.String("subsystem", "cache"),
-				slog.String("mode", seedModeReMint.String()),
-				slog.String("class", in.CacheEntryClass),
-				slog.String("target", in.Namespace+"/"+in.Name),
-				slog.String("err", err.Error()),
-			)
-		}
-	}
-	return reEnqueue
-}
-
-// reseedRequestFromInputs reconstructs a reseed unit from a cell's inputs. A
-// restaction is passed by ObjectReference (seedOneRestaction self-fetches); a
-// widget CR is fetched by coords here (seedOneWidget needs the object in hand).
-// ok=false when the widget unit is gone/unfetchable.
-func reseedRequestFromInputs(cohortCtx context.Context, identity seedTarget, in *cache.ResolvedKeyInputs) (reseedRequest, bool) {
-	gvr := schema.GroupVersionResource{Group: in.Group, Version: in.Version, Resource: in.Resource}
-	apiVersion := in.Version
-	if in.Group != "" {
-		apiVersion = in.Group + "/" + in.Version
-	}
-	ref := templatesv1.ObjectReference{
-		Reference:  templatesv1.Reference{Name: in.Name, Namespace: in.Namespace},
-		APIVersion: apiVersion,
-		Resource:   in.Resource,
-	}
-	if in.CacheEntryClass != "widgets" {
-		return reseedRequest{identity: identity, isWidget: false, ra: ref}, true
-	}
-	got := seedObjectsGetFn(cohortCtx, ref)
-	if got.Err != nil || got.Unstructured == nil {
-		return reseedRequest{}, false
-	}
-	return reseedRequest{
-		identity: identity,
-		isWidget: true,
-		widget: navWidgetEntry{
-			W:          got.Unstructured,
-			GVR:        gvr,
-			PerPage:    in.PerPage,
-			Page:       in.Page,
-			KeyPerPage: in.PerPage,
-			KeyPage:    in.Page,
-		},
-	}, true
 }
 
 func reseedClass(req reseedRequest) string {

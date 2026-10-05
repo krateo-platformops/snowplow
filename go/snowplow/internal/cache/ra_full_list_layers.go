@@ -156,7 +156,7 @@ func (c *ResolvedCacheStore) raLayerConfirmPriorLocked(key string, equalPrior *R
 // raLayerCommitLocked runs right after putCoreLocked stored entry under key. samePrior
 // is non-nil when raLayerEqualPrior found the bytes equal AND that same prior was still
 // resident when the store lock was re-taken (raLayerConfirmPriorLocked). provenanceKnown is true for the
-// ctx-carrying Puts (PutIfGen / ReplaceIfGen / ReplaceIfGenReMint / PutThenRemark): their ctx sink holds
+// ctx-carrying Puts (PutIfGen / ReplaceIfGen / ReplaceIfGenRefresh / PutThenRemark): their ctx sink holds
 // exactly what the stored body sliced. Returns the keys to remark; the caller enqueues
 // them after releasing c.mu (remarkLayerConsumers). Callers hold c.mu.
 func (c *ResolvedCacheStore) raLayerCommitLocked(ctx context.Context, provenanceKnown bool, key string, samePrior, entry *ResolvedEntry) []string {

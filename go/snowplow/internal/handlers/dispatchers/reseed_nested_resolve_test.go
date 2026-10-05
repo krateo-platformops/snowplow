@@ -19,24 +19,26 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// reseed_nested_arm_test.go — #258/#378 arch req#3: the REAL nested-resolve arm.
+// reseed_nested_arm_test.go — #258 arch req#3 / #378: the REAL nested-resolve arm.
 //
-// Drives a genuine seedOneRestaction resolve (real restactions.Resolve, informer-
-// served, hermetic — NOT a stubbed resolver) whose single api stage LISTs
-// configmaps, so the resolve NESTS an apistage content Put (verified: 2 cells — the
-// terminal restactions cell + the apistage LIST content cell). It then pre-ages
-// BOTH cells and runs a seedModeReMint reseed, asserting the TERMINAL cell's BornAt
-// RESETS (ReplaceIfGenReMint) while the resident nested apistage cell's BornAt
-// STAYS AGED — i.e. the fresh-mint reaches ONLY the terminal target Put, never a
-// nested cell consulted during the same resolve. This is the concrete falsifier for
-// the leak the single-setter audit alone cannot see: that seedTerminalPut
-// fires only-for-target during a REAL resolve, with no re-entry for a nested cell.
+// Drives a genuine restactions resolve (real restactions.Resolve, informer-served,
+// hermetic — NOT a stubbed resolver) whose single api stage LISTs configmaps, so
+// the resolve NESTS an apistage content Put (verified: 2 cells — the terminal
+// restactions cell + the apistage LIST content cell).
+//
+// #378: the only BornAt-resetting write is the refresher terminal
+// (cache.ReplaceIfGenRefresh). TestRefresherReMint_TerminalResets_NestedApistageUntouched
+// ages BOTH cells into the lead window by REAL elapse and runs the refresher's
+// resolveAndPopulateL1 on the terminal cell: the TERMINAL cell's BornAt RESETS
+// while the resident nested apistage cell — consulted by the same real resolve —
+// keeps its birth. It replaces the retired seedModeReMint arm
+// (TestSeedOneRestaction_ReMint_TerminalResets_NestedApistageUntouched).
 //
 // NOTE (mechanism, verified): apistage content is INSERT-ON-MISS (apistage.go:599
 // miss-branch PutIfGen; a resident cell is HIT at :585 with NO Put), so on the
-// reseed the resident nested cell is HIT (untouched). The arm therefore proves the
-// nested cell is NOT re-minted (its aged BornAt survives the reseed); there is no
-// nested-REPLACE path by which fresh-mint could even be mis-applied.
+// refresh the resident nested cell is HIT (untouched). The arm proves the nested
+// cell is NOT re-minted; there is no nested-REPLACE path by which the re-mint
+// could even be mis-applied.
 
 var nestedRAGVR = schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
 var nestedCMGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
@@ -162,15 +164,18 @@ func keysByClass(t *testing.T, store *cache.ResolvedCacheStore) map[string]strin
 	return out
 }
 
-// TestSeedOneRestaction_ReMint_TerminalResets_NestedApistageUntouched — arch req#3.
-func TestSeedOneRestaction_ReMint_TerminalResets_NestedApistageUntouched(t *testing.T) {
+// TestRefresherReMint_TerminalResets_NestedApistageUntouched — arch req#3 on the
+// #378 carrier (replaces the seedModeReMint arm).
+func TestRefresherReMint_TerminalResets_NestedApistageUntouched(t *testing.T) {
+	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "60")
+	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "4") // L = min(60, 2) = 2s → window [2s, 4s)
 	buildNestedApistageWatcher(t)
 	ctx := nestedCohortCtx()
 	ref := nestedRARef()
 	store := cache.ResolvedCache()
 
 	// (1) POPULATE via a real resolve: terminal restactions cell + nested apistage
-	// content cell. gvr-discovered never skips and uses the plain Put.
+	// content cell.
 	if err := seedOneRestaction(ctx, "cohort", ref, nestedNS, seedModeGVRDiscovered); err != nil {
 		t.Fatalf("populate seedOneRestaction: %v", err)
 	}
@@ -181,42 +186,37 @@ func TestSeedOneRestaction_ReMint_TerminalResets_NestedApistageUntouched(t *test
 		t.Fatalf("PRECONDITION: the real resolve must produce BOTH a terminal restactions cell and a nested "+
 			"apistage content cell (else the nested arm is vacuous); got classes %v", keys)
 	}
+	term0, _ := store.GetNoTouch(termKey)
+	api0, _ := store.GetNoTouch(apiKey)
 
-	// (2) Pre-age BOTH cells so a reset is observable.
-	past := time.Now().Add(-2 * time.Hour)
-	if !store.SetBornAtForTest(termKey, past) || !store.SetBornAtForTest(apiKey, past) {
-		t.Fatal("SetBornAtForTest failed for a live cell")
-	}
+	// (2) Age BOTH cells into the lead window by real elapse.
+	time.Sleep(2300 * time.Millisecond)
 
-	// (3) RESEED under seedModeReMint — terminal re-mints (ReplaceIfGenReMint); the
+	// (3) The refresher terminal re-resolves the terminal cell for real; the
 	// resident nested apistage cell is consulted (hit), never re-minted.
-	if err := seedOneRestaction(ctx, "cohort", ref, nestedNS, seedModeReMint); err != nil {
-		t.Fatalf("reseed seedOneRestaction: %v", err)
+	if err := resolveAndPopulateL1(context.Background(), *term0.Inputs, nil, nil); err != nil {
+		t.Fatalf("refresh: %v", err)
 	}
-
-	term, ok := store.Get(termKey)
+	term, ok := store.GetNoTouch(termKey)
+	if !ok || term == term0 {
+		t.Fatal("the refresher terminal must have re-written the terminal cell")
+	}
+	api, ok := store.GetNoTouch(apiKey)
 	if !ok {
-		t.Fatal("terminal cell missing after reseed")
+		t.Fatal("nested apistage cell missing after the refresh")
 	}
-	api, ok := store.Get(apiKey)
-	if !ok {
-		t.Fatal("nested apistage cell missing after reseed")
+	if !term.BornAt.After(term0.BornAt) {
+		t.Fatalf("req#3: the TERMINAL cell must RE-MINT (BornAt reset); got %v want > %v", term.BornAt, term0.BornAt)
 	}
-
-	if !term.BornAt.After(past) {
-		t.Fatalf("req#3: the TERMINAL cell must RE-MINT (BornAt reset to fresh); got %v want > %v", term.BornAt, past)
-	}
-	if !api.BornAt.Equal(past) {
-		t.Fatalf("req#3 LEAK: the nested apistage cell's BornAt changed from the aged value under a reseed "+
-			"(%v != %v) — fresh-mint reached a NON-terminal cell. The strategy must apply ONLY to seedOne*'s "+
-			"terminal Put.", api.BornAt, past)
+	if !api.BornAt.Equal(api0.BornAt) {
+		t.Fatalf("req#3 LEAK: the nested apistage cell's BornAt changed under the terminal's re-mint "+
+			"(%v != %v) — the re-mint reached a NON-terminal cell", api.BornAt, api0.BornAt)
 	}
 }
 
 // TestSeedOneRestaction_GVRDiscovered_TerminalInheritsBornAt — the plain-path
 // control at the restactions terminal: a non-reseed mode re-Put INHERITS the
-// terminal cell's BornAt (never resets), so the reset in the arm above is
-// attributable to seedModeReMint, not to the resolve.
+// terminal cell's BornAt (never resets): no seed mode re-mints (#378).
 func TestSeedOneRestaction_GVRDiscovered_TerminalInheritsBornAt(t *testing.T) {
 	buildNestedApistageWatcher(t)
 	ctx := nestedCohortCtx()

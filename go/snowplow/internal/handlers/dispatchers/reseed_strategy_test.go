@@ -15,13 +15,13 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 )
 
-// reseed_strategy_test.go — #258/#378 reseed put-strategy arms at the dispatcher
-// level (the seedOneWidget terminal Put) plus the strategy's own gen-race /
-// single-setter guards. The store-level mechanism (ReplaceIfGenReMint resets,
-// ReplaceIfGen inherits) is proven by cache.TestReMintFreshBornAt_258; these arms
-// prove the WIRING: that seedOneWidget routes its terminal Put through the ONE #394
-// mechanism (seedTerminalGuardFor/seedTerminalPut), that a non-re-mint mode never resets,
-// that a reseed is never age-skipped, and the per-mode refusal policy.
+// reseed_strategy_test.go — #258 reseed put-strategy arms at the dispatcher level
+// (the seedOneWidget terminal Put) plus the gen-race / single-setter guards. The
+// store-level mechanism (only ReplaceIfGenRefresh resets, every other write
+// inherits) is proven by cache.TestIssue378_F2c_OnlyTheRefresherTerminalReMints;
+// these arms prove the WIRING: that seedOneWidget routes its terminal Put through
+// the ONE #394 mechanism (seedTerminalGuardFor/seedTerminalPut), that no seed mode
+// resets BornAt (#378), and the refusal policy.
 
 // reseedWidgetEntry / reseedSeedCtx — the shared widget-seed fixture (apiRef'd
 // widget under a co-bound cohort), matching a1_uaf_seed_ctx_propagation_test.go.
@@ -65,40 +65,10 @@ func reseedWidgetKey(t *testing.T, ctx context.Context, e navWidgetEntry) (strin
 	return key, handle, inputs
 }
 
-// TestSeedOneWidget_ReMint_ResetsBornAt_NoAgeSkip — #378. seedModeReMint re-mints
-// an existing cell: it RESETS BornAt AND is NOT age/liveness-skipped even though
-// the cell is FRESH (TL condition 3 — a reseed is a forced write). RED without the
-// re-mint strategy (a plain re-Put would inherit) or without the no-skip case (the
-// fresh cell would be skipped and BornAt would be unchanged for the wrong reason).
-func TestSeedOneWidget_ReMint_ResetsBornAt_NoAgeSkip(t *testing.T) {
-	a1BuildTwoTenantWatcher(t)
-	stubWidgetResolve(t)
-	e := reseedWidgetEntry()
-	ctx := reseedSeedCtx()
-	key, handle, inputs := reseedWidgetKey(t, ctx, e)
-
-	// Seed a FRESH cell (BornAt in the past but the cell itself young/live). A
-	// keepwarm age-skip keys off BornAt age; re-mint must override it.
-	past := time.Now().Add(-90 * time.Minute)
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"seed":1}`), Inputs: inputs, BornAt: past, CreatedAt: time.Now()})
-
-	if err := seedOneWidget(ctx, e, h1NS, seedModeReMint); err != nil {
-		t.Fatalf("seedOneWidget(seedModeReMint): %v", err)
-	}
-	got, ok := handle.Get(key)
-	if !ok {
-		t.Fatal("re-mint must leave the cell present")
-	}
-	if !got.BornAt.After(past) {
-		t.Fatalf("seedModeReMint must RESET BornAt to a fresh birth; got %v want > %v (a plain re-Put would inherit, "+
-			"or an age-skip would leave it unwritten — both are the defect)", got.BornAt, past)
-	}
-}
-
 // TestSeedOneWidget_GVRDiscovered_GuardedReplaceInheritsBornAt — TL condition 2. A
 // non-re-mint seed mode (gvr-discovered: never skips, #394 PutIfGen) re-Puts an existing cell and
 // INHERITS BornAt — it must NEVER reset the max-age clock. This is the restriction
-// proof's dispatcher half: only seedModeReMint resets.
+// proof's dispatcher half: no seed mode resets (#378: only the refresher terminal).
 func TestSeedOneWidget_GVRDiscovered_GuardedReplaceInheritsBornAt(t *testing.T) {
 	a1BuildTwoTenantWatcher(t)
 	stubWidgetResolve(t)
@@ -150,8 +120,8 @@ func TestSeedOneWidget_RBACShift_InsertsAbsentKeyFresh(t *testing.T) {
 
 // TestSeedTerminalPut_ReseedModes_RefusedOnRemoval — the reseed modes' terminal
 // write is the #394 mechanism: a removal (DELETE) between seedTerminalGuardFor's
-// capture and seedTerminalPut REFUSES the write for BOTH reseed modes (rbacShift →
-// PutIfGen, remint → ReplaceIfGenReMint) and writes nothing (anti-resurrection).
+// capture and seedTerminalPut REFUSES the write for the reseed mode (rbacShift →
+// PutIfGen) and writes nothing (anti-resurrection).
 // CONTROL: boot stays a plain Put and writes.
 func TestSeedTerminalPut_ReseedModes_RefusedOnRemoval(t *testing.T) {
 	a1BuildTwoTenantWatcher(t)
@@ -159,13 +129,13 @@ func TestSeedTerminalPut_ReseedModes_RefusedOnRemoval(t *testing.T) {
 	if store == nil {
 		t.Fatal("precondition: a live resolved cache")
 	}
-	for _, mode := range []seedScopeMode{seedModeRBACShift, seedModeReMint} {
+	for _, mode := range []seedScopeMode{seedModeRBACShift} {
 		t.Run(mode.String(), func(t *testing.T) {
 			k := "reseed-genrace-probe-" + mode.String()
 			store.Put(k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
 			g := seedTerminalGuardFor(mode, store, k)
-			if !g.guarded || g.reMint != (mode == seedModeReMint) {
-				t.Fatalf("%s: guard = %+v, want guarded (reMint only for re-mint)", mode, g)
+			if !g.guarded {
+				t.Fatalf("%s: guard = %+v, want guarded", mode, g)
 			}
 			store.DeleteForTest(k) // a removal lands after capture → the generation moves
 			if seedTerminalPut(context.Background(), store, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":2}`)}, g) {
@@ -188,11 +158,9 @@ func TestSeedTerminalPut_ReseedModes_RefusedOnRemoval(t *testing.T) {
 
 // TestReseedRefusalPolicy_PerMode — the #394 one-shot re-seed applies to the
 // rbacShift mode (a removal mid-resolve is re-filled ONCE, a second refusal is
-// swallowed, never re-enqueued); the remint mode does NOT retry (a refused
-// ReplaceIfGenReMint means the cell was removed: the retry could only refuse again
-// or re-mint an already freshly-born cell). Neither surfaces the refusal as an
-// error (no failure classification, no re-arm of the whole rotated set). RED if
-// the rbacShift retry is removed (calls=1) or if remint retries (calls=2).
+// swallowed, never re-enqueued). The refusal never surfaces as an error (no
+// failure classification, no re-arm of the whole rotated set). RED if the
+// rbacShift retry is removed (calls=1).
 func TestReseedRefusalPolicy_PerMode(t *testing.T) {
 	orig := seedOneWidgetFn
 	t.Cleanup(func() { seedOneWidgetFn = orig })
@@ -203,7 +171,6 @@ func TestReseedRefusalPolicy_PerMode(t *testing.T) {
 		wantCalls int
 	}{
 		{seedModeRBACShift, 2}, // one-shot inline re-seed (#394)
-		{seedModeReMint, 1},    // no retry
 	}
 	for _, tc := range cases {
 		t.Run(tc.mode.String(), func(t *testing.T) {
@@ -247,19 +214,24 @@ func TestReseedRefusalPolicy_PerMode(t *testing.T) {
 	}
 }
 
-// TestReMint_SingleSetterAudit — arch C5 load-bearing invariant: the fresh-mint
-// carrier ReplaceIfGenReMint has EXACTLY ONE production (non-test) caller in the
-// whole module — seedTerminalPut (seed_terminal_put_guard.go), reached only in
-// seedModeReMint. A second caller means freshMint could reach a cell that is not a
-// seed primitive's explicit terminal target, which is exactly the leak the
-// marker-free design relies on not existing.
+// TestReMint_SingleSetterAudit — #378 (re-pointed from the retired seed carrier):
+// the BornAt-resetting write ReplaceIfGenRefresh has EXACTLY ONE production
+// (non-test) caller in the module — the refresher terminal in resolveAndPopulateL1
+// (resolve_populate.go). Inside the store, putCoreLocked is called with a literal
+// `false` freshMint everywhere except that one method, and the retired
+// ReplaceIfGenReMint is gone. A second caller, or a second freshMint=true path,
+// would let a keepwarm / seed / customer write extend the C5 cap.
 func TestReMint_SingleSetterAudit(t *testing.T) {
 	root := filepath.Join("..", "..", "..") // go/snowplow module root
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
 		t.Fatalf("VACUOUS GUARD: module root %s has no go.mod: %v", root, err)
 	}
-	callRe := regexp.MustCompile(`\.ReplaceIfGenReMint\(`)
+	callRe := regexp.MustCompile(`\.ReplaceIfGenRefresh\(`)
+	retiredRe := regexp.MustCompile(`ReplaceIfGenReMint|seedModeReMint|reseedFromInputs`)
+	coreRe := regexp.MustCompile(`c\.putCoreLocked\([^\n]*, ([A-Za-z]+)\)`)
 	callers := map[string]int{}
+	var retired []string
+	freshArgs := map[string]int{}
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -274,6 +246,17 @@ func TestReMint_SingleSetterAudit(t *testing.T) {
 		if n := len(callRe.FindAll(b, -1)); n > 0 {
 			callers[filepath.ToSlash(path)] += n
 		}
+		if retiredRe.Match(b) {
+			for _, line := range strings.Split(string(b), "\n") {
+				// Comments may name the retired carrier (history); code may not.
+				if retiredRe.MatchString(line) && !strings.HasPrefix(strings.TrimSpace(line), "//") {
+					retired = append(retired, filepath.ToSlash(path)+": "+strings.TrimSpace(line))
+				}
+			}
+		}
+		for _, m := range coreRe.FindAllSubmatch(b, -1) {
+			freshArgs[string(m[1])]++
+		}
 		return nil
 	})
 	if err != nil {
@@ -283,9 +266,16 @@ func TestReMint_SingleSetterAudit(t *testing.T) {
 	for _, n := range callers {
 		total += n
 	}
-	want := filepath.ToSlash(filepath.Join(root, "internal", "handlers", "dispatchers", "seed_terminal_put_guard.go"))
+	want := filepath.ToSlash(filepath.Join(root, "internal", "handlers", "dispatchers", "resolve_populate.go"))
 	if total != 1 || callers[want] != 1 {
-		t.Fatalf("ReplaceIfGenReMint must have EXACTLY ONE production caller (seedTerminalPut in %s); "+
-			"found %d call(s) across %v. A second caller breaks the marker-free fresh-mint restriction.", want, total, callers)
+		t.Fatalf("ReplaceIfGenRefresh must have EXACTLY ONE production caller (the refresher terminal in %s); "+
+			"found %d call(s) across %v. A second caller lets a non-refresher write reset BornAt.", want, total, callers)
+	}
+	if len(retired) != 0 {
+		t.Fatalf("the retired seed-path re-mint is referenced by production code: %v", retired)
+	}
+	if freshArgs["freshMint"] != 1 || len(freshArgs) != 2 || freshArgs["false"] == 0 {
+		t.Fatalf("putCoreLocked's freshMint must be a literal false at every call site except ReplaceIfGenRefresh's "+
+			"computed freshMint; found %v", freshArgs)
 	}
 }
