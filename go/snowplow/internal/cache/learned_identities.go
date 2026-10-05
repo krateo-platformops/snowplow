@@ -35,10 +35,8 @@
 package cache
 
 import (
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/pem"
 	"expvar"
 	"sort"
@@ -47,6 +45,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -170,10 +169,12 @@ func LearnedClassKey(username string, groups []string) string {
 }
 
 // LearnedClassLabel is the only form of a learned class that may reach a log
-// line or a debug surface: a sha256 tag of the class key.
+// line or a debug surface: the class key's redact label under the "learned"
+// prefix (#453: HMAC-SHA256 under the per-process key, so it cannot be
+// reversed by hashing a dictionary of tenant usernames). LOG AND DEBUG ONLY:
+// it changes on every restart and is never a cache, memo or SSE key.
 func LearnedClassLabel(username string, groups []string) string {
-	sum := sha256.Sum256([]byte(LearnedClassKey(username, groups)))
-	return "learned:" + hex.EncodeToString(sum[:6])
+	return redact.Prefixed("learned", LearnedClassKey(username, groups))
 }
 
 // LearnedIdentitiesSnapshot returns every live class, newest LastSeen first

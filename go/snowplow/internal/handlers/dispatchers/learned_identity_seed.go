@@ -563,7 +563,9 @@ func enumerateResident(ctx context.Context, deps rePrewarmDeps, withProactive bo
 		return raUnits[i].Namespace+"/"+raUnits[i].Name < raUnits[j].Namespace+"/"+raUnits[j].Name
 	})
 	byLabel := func(ts []seedTarget) []seedTarget {
-		sort.SliceStable(ts, func(i, j int) bool { return cohortLogLabel(ts[i]) < cohortLogLabel(ts[j]) })
+		// #453: order by the exact class key, never by the log label (a redact
+		// label is per-process keyed, so it would reorder the pass per restart).
+		sort.SliceStable(ts, func(i, j int) bool { return learnedKey(ts[i]) < learnedKey(ts[j]) })
 		return ts
 	}
 	out := make([]residentUnit, 0, len(widgetUnits)+len(raUnits))

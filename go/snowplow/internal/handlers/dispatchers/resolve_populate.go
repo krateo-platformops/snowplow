@@ -53,6 +53,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
@@ -397,10 +398,11 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshLogUser(refreshUser, repSource)),
+			slog.String("user", refreshLogUser(refreshUser)),
+			slog.String("rep_source", repSource),
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("stage_err_stage", sampleStage),
-			slog.String("stage_err_sample", sampleErr),
+			slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
 			slog.Bool("suppressed", suppressed),
 			slog.String("effect", "prior good entry kept; TTL is the outer net"+
 				func() string {
@@ -432,7 +434,8 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshLogUser(refreshUser, repSource)),
+			slog.String("user", refreshLogUser(refreshUser)),
+			slog.String("rep_source", repSource),
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
 		)
@@ -467,7 +470,8 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshLogUser(refreshUser, repSource)),
+			slog.String("user", refreshLogUser(refreshUser)),
+			slog.String("rep_source", repSource),
 			slog.String("uaf_reason", reason),
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
 			slog.String("effect", "prior entry kept, not refreshed; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
@@ -565,7 +569,8 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
 		slog.String("handler", inputs.CacheEntryClass),
-		slog.String("user", refreshLogUser(refreshUser, repSource)),
+		slog.String("user", refreshLogUser(refreshUser)),
+		slog.String("rep_source", repSource),
 		slog.Bool("pinned", prePinned),
 	)
 	return nil

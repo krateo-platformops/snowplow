@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // c2TTL pins a small fixture TTL so the age-skip threshold (TTL/4) is a
@@ -468,7 +469,7 @@ func TestC2CohortSummary_LineContent_MixedFixture(t *testing.T) {
 			if err := json.Unmarshal(line, &s); err != nil {
 				continue
 			}
-			if s.Msg == "prewarm.keepwarm.cohort_summary" && bytes.Contains([]byte(s.Identity), []byte(want)) {
+			if s.Msg == "prewarm.keepwarm.cohort_summary" && s.Identity == redact.Group(want) /* #453: the cohort redact label */ {
 				return s, true
 			}
 		}

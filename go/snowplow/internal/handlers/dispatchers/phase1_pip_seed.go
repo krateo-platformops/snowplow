@@ -93,6 +93,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
@@ -682,7 +683,7 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
 	if learned {
-		rctx = withLearnedSeedLabel(rctx, cache.LearnedClassLabel(cohort.Username, cohort.Groups))
+		rctx = withLearnedSeedLabel(rctx, redact.Label(cache.LearnedClassLabel(cohort.Username, cohort.Groups)))
 	}
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
@@ -777,7 +778,7 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 // effectiveTTL logic the serve path uses (resolved.go Get, strict `>` expiry).
 // For the age-skip, the entry's CreatedAt (Put-time-stamped, resolved.go Put)
 // is read directly off the returned live entry — no cache-side accessor needed.
-func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandle, key, class, target, cohortLabel string) bool {
+func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandle, key, class, target string, cohortLabel redact.Label) bool {
 	switch mode {
 	case seedModeBoot:
 		// #132 F4b Lever A — BEFORE the liveness Get: if this EXACT key was
@@ -804,7 +805,7 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 				slog.String("subsystem", "cache"),
 				slog.String("class", class),
 				slog.String("target", target),
-				slog.String("cohort", cohortLabel),
+				slog.String("cohort", cohortLabel.String()),
 				slog.String("effect", "boot-scope Lever A skip: this (widget,cohort) key was resolved-and-"+
 					"declined external earlier THIS boot; re-resolving it every resume pass makes zero forward "+
 					"progress (Put stays declined) — skipping breaks the §3 external-whale loop"),
@@ -834,7 +835,7 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 			slog.String("subsystem", "cache"),
 			slog.String("class", class),
 			slog.String("target", target),
-			slog.String("cohort", cohortLabel),
+			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "boot-scope fresh-skip: live L1 cell under the production key; "+
 				"resolve+Put skipped, target counted as processed (F.4 cost-proportional resume)"),
 		)
@@ -861,7 +862,7 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 				slog.String("subsystem", "cache"),
 				slog.String("class", class),
 				slog.String("target", target),
-				slog.String("cohort", cohortLabel),
+				slog.String("cohort", cohortLabel.String()),
 				slog.Int64("age_ms", time.Since(entry.CreatedAt).Milliseconds()),
 				slog.Int64("threshold_ms", keepwarmAgeSkipThreshold().Milliseconds()),
 				slog.String("effect", "keepwarm age-skip: live cell younger than TTL/4; resolve+Put "+
@@ -890,7 +891,7 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 			slog.String("subsystem", "cache"),
 			slog.String("class", class),
 			slog.String("target", target),
-			slog.String("cohort", cohortLabel),
+			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "#258 the rotated subject's new-sub-gen key is already live (minted after "+
 				"the rotation); resolve+Put skipped"),
 		)
@@ -956,7 +957,7 @@ var seedObjectsGetFn = objects.Get
 // (seedRestactionResolveAndPutProd); only the _test.go falsifier reassigns it.
 var seedRestactionResolveAndPutFn = seedRestactionResolveAndPutProd
 
-func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
+func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
 	// #375 C1 — CR self-dep epoch, taken BEFORE the RESTAction read (same as the
 	// customer handler, restactions.go). The CR is read here on the outer ctx, before
 	// the L1 key is known, and its self-dep is Recorded only AFTER the terminal Put,
@@ -1016,7 +1017,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 			slog.String("subsystem", "cache"),
 			slog.String("class", "restactions"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
-			slog.String("cohort", cohortLabel),
+			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "cohort re-derived first-match BindingUID=\"\" (RBAC deny/err fail-closed); "+
 				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
 		)
@@ -1084,7 +1085,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		slog.Default().Info("phase1.seed.skip.templated_endpointref",
 			slog.String("subsystem", "cache"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
-			slog.String("cohort", cohortLabel),
+			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "RESTAction has a templated api-step endpointRef.name (request-extras-driven "+
 				"endpoint selection, e.g. hub-spoke); the boot seed has no request extras to resolve it → skipping "+
 				"to avoid Putting a truncated body under the no-extras key (#113 §4). Spoke reads are external → "+
@@ -1142,7 +1143,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 			slog.String("subsystem", "cache"),
 			slog.String("class", "restactions"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
-			slog.String("cohort", cohortLabel),
+			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "RESTAction declares a userAccessFilter: its resolved body is narrowed per requester, "+
 				"but the seed cell is keyed per BINDING — a co-bound cohort member would be served the representative's "+
 				"rows. Skipping resolve+Put entirely (1.12.3 A-1); these RAs resolve per request until 1.13.0 folds the "+
@@ -1172,7 +1173,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		snapshot := stageTimingSink.Snapshot()
 		slog.Default().Info("phase1.seed.restaction.timing",
 			slog.String("subsystem", "cache"),
-			slog.String("cohort", cohortLabel),
+			slog.String("cohort", cohortLabel.String()),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
 			slog.Int64("elapsed_ms_total", time.Since(restactionStart).Milliseconds()),
 			slog.Int("stages_total", len(snapshot)),
@@ -1899,7 +1900,7 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string,
 			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("stage_err_stage", stage),
-			slog.String("stage_err_sample", sampleErr),
+			slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
 			slog.String("effect", "seed re-resolve observed a swallowed stage error; declining the Put "+
 				"(keeps any prior good entry; TTL is the outer net) — GTTL-1 backstop, uniform with the refresher"),
 		)
@@ -1935,45 +1936,48 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string,
 }
 
 // seedIdentityLabelFromCtx renders the seeding identity from the cohort ctx
-// (withCohortSeedContext installs WithUserInfo). Username else first group else
-// "anonymous" — mirrors cohortLogLabel's domain for log parity.
+// (withCohortSeedContext installs WithUserInfo) as its redact label: the
+// username's, else the first group's, else redact.Anonymous. That is the same
+// domain as cohortLogLabel, for log parity. #453: never the username or group
+// in clear.
 func seedIdentityLabelFromCtx(ctx context.Context) string {
-	if label, learned := learnedSeedLabelFromCtx(ctx); learned {
-		return label // #262: a learned class is never logged in clear
+	var label redact.Label
+	var learned bool
+	if label, learned = learnedSeedLabelFromCtx(ctx); learned {
+		return label.String() // #262: a learned class is never logged in clear
 	}
 	ui, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		return "anonymous"
+		return redact.Anonymous
 	}
 	if ui.Username != "" {
-		return ui.Username
+		return redact.User(ui.Username)
 	}
 	if len(ui.Groups) > 0 {
-		return "group:" + ui.Groups[0]
+		return redact.Group(ui.Groups[0])
 	}
-	return "anonymous"
+	return redact.Anonymous
 }
 
-// cohortLogLabel renders a cohort into a stable log/metric label. The
-// label is used in structured log fields AND as the expvar map key for
-// the per-cohort counters; it MUST be stable across pod restarts (which
-// EnumerateRBACCohorts's sort ordering guarantees).
+// cohortLogLabel renders a cohort into its log label. It is a LOG LABEL ONLY
+// (#453). It is no expvar key and no cache, memo or sort key, and it changes
+// on every restart (internal/redact's per-process key).
 //
-// User-kind cohort: the canonical Username (e.g. "system:admin",
-// "alice@example.com"). Group-kind cohort: "group:" + the group name.
-// A cohort with neither (defensive — should never happen post-enum)
-// falls back to "anonymous".
-func cohortLogLabel(c seedTarget) string {
+// User-kind cohort: redact.User of the canonical Username. Group-kind cohort:
+// redact.Group of the group name. A learned class (#262): its
+// cache.LearnedClassLabel. A cohort with neither (defensive — should never
+// happen post-enum): redact.Anonymous.
+func cohortLogLabel(c seedTarget) redact.Label {
 	if c.Username != "" && isLearnedSeedTarget(c) {
 		// #262: a learned class is a real username + groups; its label is the
-		// class's sha256 tag (it is also an expvar map key — never in clear).
-		return cache.LearnedClassLabel(c.Username, c.Groups)
+		// class's label, never in clear.
+		return redact.Label(cache.LearnedClassLabel(c.Username, c.Groups))
 	}
 	if c.Username != "" {
-		return c.Username
+		return redact.Label(redact.User(c.Username))
 	}
 	if len(c.Groups) > 0 {
-		return "group:" + c.Groups[0]
+		return redact.Label(redact.Group(c.Groups[0]))
 	}
-	return "anonymous"
+	return redact.Anonymous
 }

@@ -67,6 +67,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -170,7 +171,7 @@ func filterListByRBAC(
 				// namespace; the next same-namespace item retries.
 				log.Warn("informer_dispatch.rbac_filter.evaluate_error",
 					slog.String("subsystem", "cache"),
-					slog.String("user", user.Username),
+					slog.String("user", redact.User(user.Username)),
 					slog.String("gvr", gvr.String()),
 					slog.String("namespace", ns),
 					slog.Any("err", err),
@@ -194,7 +195,7 @@ func filterListByRBAC(
 	}
 	log.Debug("informer_dispatch.rbac_filter",
 		slog.String("subsystem", "cache"),
-		slog.String("user", user.Username),
+		slog.String("user", redact.User(user.Username)),
 		slog.String("gvr", gvr.String()),
 		slog.Int("served", len(items)),
 		slog.Int("kept", len(kept)),
@@ -280,7 +281,7 @@ func filterGetByRBAC(
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
 		log.Warn("informer_dispatch.rbac_get_filter.evaluate_error",
 			slog.String("subsystem", "cache"),
-			slog.String("user", user.Username),
+			slog.String("user", redact.User(user.Username)),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", obj.GetNamespace()),
 			slog.String("name", obj.GetName()),
@@ -295,7 +296,7 @@ func filterGetByRBAC(
 	}
 	log.Debug("informer_dispatch.rbac_get_filter",
 		slog.String("subsystem", "cache"),
-		slog.String("user", user.Username),
+		slog.String("user", redact.User(user.Username)),
 		slog.String("gvr", gvr.String()),
 		slog.String("namespace", obj.GetNamespace()),
 		slog.String("name", obj.GetName()),

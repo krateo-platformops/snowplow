@@ -6,6 +6,7 @@ import (
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // perCallState carries the per-/call timing + observability state that
@@ -46,15 +47,16 @@ func beginPerCall(r *http.Request, handler string) (*perCallState, func()) {
 	}
 	ctx := r.Context()
 	return st, func() {
-		user := ""
+		// #453: the requester as its redact label, never the username.
+		var user redact.Label = redact.Anonymous
 		if ui, err := xcontext.UserInfo(ctx); err == nil {
-			user = ui.Username
+			user = redact.Label(redact.User(ui.Username))
 		}
 		attrs := []any{
 			slog.String("handler", handler),
 			slog.String("path", st.path),
 			slog.String("method", st.method),
-			slog.String("user", user),
+			slog.String("user", user.String()),
 			slog.String("l1_hit", st.l1Hit),
 			slog.String("gvr", st.gvr),
 			slog.Int64("total_ms", time.Since(st.start).Milliseconds()),

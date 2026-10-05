@@ -83,6 +83,7 @@ import (
 	"log/slog"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // errSeedTerminalPutRefused is returned (wrapped) by a seed primitive whose
@@ -244,14 +245,14 @@ func logSeedTerminalPutRefused(class, target string) {
 // own it from here. Any other error from the re-seed is returned unchanged for
 // the caller's normal classification. Never routed through failedSet (see
 // errSeedTerminalPutRefused).
-func reseedAfterTerminalPutRefusal(kind, label, cohort string, reseed func() error) error {
+func reseedAfterTerminalPutRefusal(kind, label string, cohort redact.Label, reseed func() error) error {
 	err := reseed()
 	if errors.Is(err, errSeedTerminalPutRefused) {
 		slog.Default().Info("prewarm.engine.seed.terminal_put_refused_twice",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", kind),
 			slog.String(kind, label),
-			slog.String("target", cohort),
+			slog.String("target", cohort.String()),
 			slog.String("effect", "#394 the one-shot re-seed was refused again (the cell was removed during "+
 				"the re-seed resolve too); leaving the cell alone — not re-enqueued, not a failure"),
 		)

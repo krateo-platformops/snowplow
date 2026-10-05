@@ -13,6 +13,7 @@ import (
 	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -274,7 +275,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 						slog.String("gvr", got.GVR.String()),
 						slog.String("namespace", got.Unstructured.GetNamespace()),
 						slog.String("name", got.Unstructured.GetName()),
-						slog.String("binding_uid_hash", hashUsername(matchedBindingUID)),
+						slog.String("binding_uid_hash", redact.Digest(matchedBindingUID)),
 					)
 				}
 			}

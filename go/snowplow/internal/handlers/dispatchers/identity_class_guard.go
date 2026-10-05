@@ -43,6 +43,7 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // identityClassDrift reports why (username, groups) no longer belongs to the
@@ -282,10 +283,10 @@ func RepresentativeRepickCells() []RepresentativeRepickCell {
 func NoteRepresentativeRepickForTest(outcome string) { noteRepresentativeRepick(outcome) }
 
 // refreshLogUser is the representative as it may appear in a refresher log
-// line: a promoted recent hitter is redacted (#444, #262 redaction rules).
-func refreshLogUser(user, source string) string {
-	if source == repSourceHitter {
-		return "<recent-hitter>"
-	}
-	return user
+// line: always its redact label, whatever its source (#453). Pre-#453 only a
+// promoted recent hitter (#444) was redacted and a recorded or group
+// representative was logged in clear. The source itself is not an identity
+// fact and is logged beside it as rep_source.
+func refreshLogUser(user string) string {
+	return redact.User(user)
 }

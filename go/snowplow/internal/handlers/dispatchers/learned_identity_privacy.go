@@ -25,6 +25,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // learnedRedactionTokens returns the strings a learned class's logs must never
@@ -168,12 +169,12 @@ func learnedRedactingLogger(base *slog.Logger, username string, groups []string)
 // the class's sha256 label, the only form a log line may carry.
 type learnedSeedLabelKey struct{}
 
-func withLearnedSeedLabel(ctx context.Context, label string) context.Context {
+func withLearnedSeedLabel(ctx context.Context, label redact.Label) context.Context {
 	return context.WithValue(ctx, learnedSeedLabelKey{}, label)
 }
 
-func learnedSeedLabelFromCtx(ctx context.Context) (string, bool) {
-	l, ok := ctx.Value(learnedSeedLabelKey{}).(string)
+func learnedSeedLabelFromCtx(ctx context.Context) (redact.Label, bool) {
+	l, ok := ctx.Value(learnedSeedLabelKey{}).(redact.Label)
 	return l, ok && l != ""
 }
 

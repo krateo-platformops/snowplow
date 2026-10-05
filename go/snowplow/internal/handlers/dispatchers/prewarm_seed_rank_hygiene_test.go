@@ -52,6 +52,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // rankObsEvent records one seed in call order with the seeding identity and the
@@ -90,7 +91,7 @@ func installRankObsSeams(t *testing.T, ev *[]rankObsEvent,
 	t.Cleanup(func() { seedOneWidgetFn = prevW })
 
 	prevR := seedOneRestactionFn
-	seedOneRestactionFn = func(ctx context.Context, _ string, ref templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
+	seedOneRestactionFn = func(ctx context.Context, _ redact.Label, ref templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
 		*ev = append(*ev, rankObsEvent{class: "restaction", unit: ref.Namespace + "/" + ref.Name, identity: eIdentityLabel(ctx)})
 		return nil
 	}

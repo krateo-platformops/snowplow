@@ -19,6 +19,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -168,7 +169,7 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 	})
 	if evalErr != nil {
 		log.Error("checkDispatchRBAC: EvaluateRBAC error",
-			slog.String("user", ui.Username),
+			slog.String("user", redact.User(ui.Username)),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),
 			slog.Any("err", evalErr),
@@ -834,8 +835,8 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		// sorted binding ids — never a name or a body). Read off the inputs,
 		// so it costs nothing at warn; "" when no inputs were derived.
 		slog.String("subject_binding_set", sbsOfInputs(inputs)),
-		slog.String("username", username),
-		slog.Any("groups", groups),
+		slog.String("username", redact.User(username)),
+		slog.Any("groups", redact.Groups(groups)),
 		slog.String("handler_kind", handlerKind),
 		slog.String("gvr", fmt.Sprintf("%s/%s, Resource=%s", group, version, resource)),
 		slog.String("namespace", namespace),
@@ -894,7 +895,7 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 	if env.True("DISPATCH_KEY_DIAG_ENABLED") {
 		fmt.Fprintf(os.Stderr,
 			"DISPATCH_KEY_DIAG site=%s key=%s buid=%s user=%s groups=%v handler=%s gvr=%s/%s/%s ns=%s name=%s pp=%d p=%d xlen=%d\n",
-			site, cacheKey, bindingUID, username, groups,
+			site, cacheKey, bindingUID, redact.User(username), redact.Groups(groups),
 			handlerKind, group, version, resource, namespace, name, perPage, page, len(extras),
 		)
 	}

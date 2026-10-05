@@ -25,14 +25,12 @@
 // is swallowed, never propagated. Identity never leaves this package raw: the
 // counters are process-wide scalars (no labels, no identity), and the anomaly
 // log carries only the non-identity coordinate {verb,group,resource,scope-kind}
-// plus a HASHED identity (sha256(username) prefix + canonical groups hash).
+// plus the identity's redact labels (internal/redact, keyed sha256, #453).
 
 package dispatchers
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"expvar"
 	"log/slog"
 	"sync"
@@ -42,6 +40,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 func init() {
@@ -507,17 +506,12 @@ func checkScopeKind(opts rbac.EvaluateOptions) string {
 	}
 }
 
-// hashUsername returns a short sha256 hex prefix of the username. Never the raw
-// username.
-func hashUsername(username string) string {
-	sum := sha256.Sum256([]byte(username))
-	return hex.EncodeToString(sum[:8])
-}
-
 // logShadowAnomaly emits a Debug line for one anomaly. It carries ONLY the
-// non-identity coordinate {verb,group,resource,scope-kind} and a HASHED identity
-// (sha256(username) prefix + the canonical groups hash) — never raw
-// username/groups/name, never a body (the debug-surface rule).
+// non-identity coordinate {verb,group,resource,scope-kind} and the identity's
+// redact labels (#453: keyed, so neither the username nor a small group set can
+// be recovered by dictionary; pre-#453 an unkeyed sha256 prefix and the FNV
+// canonical groups hash) — never raw username/groups/name, never a body (the
+// debug-surface rule).
 func logShadowAnomaly(ctx context.Context, reason string, opts rbac.EvaluateOptions) {
 	log := xcontext.Logger(ctx)
 	log.Debug("v7.shadow_parity anomaly (dark)",
@@ -526,7 +520,7 @@ func logShadowAnomaly(ctx context.Context, reason string, opts rbac.EvaluateOpti
 		slog.String("group", opts.Group),
 		slog.String("resource", opts.Resource),
 		slog.String("scope_kind", checkScopeKind(opts)),
-		slog.String("user_hash", hashUsername(opts.Username)),
-		slog.Uint64("groups_hash", rbac.CanonicalGroupsHash(opts.Groups)),
+		slog.String("user_hash", redact.User(opts.Username)),
+		slog.String("identity", redact.Identity(opts.Username, opts.Groups)),
 	)
 }
