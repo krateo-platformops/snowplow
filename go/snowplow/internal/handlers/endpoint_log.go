@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"log/slog"
-	"net/url"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/snowplow/internal/redact"
@@ -28,13 +27,14 @@ func endpointLogAttr(ep *endpoints.Endpoint) slog.Attr {
 
 // logServerURL is the server URL with any userinfo (user:password@) removed
 // (#487, reviewer-424). An unparseable URL is not logged at all.
+//
+// #499: this used to be url.Parse + `u.User = nil` inline, which is a NO-OP for
+// a schemeless URL — url.Parse reads "u:" of "u:p@host/x" as the scheme, so
+// there is no User to clear and the password round-tripped verbatim into
+// otel_logs. The stripping now lives in redact.URL, shared with the outbound
+// span redactor (#489) so the one invariant has one implementation.
 func logServerURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "<unparseable>"
-	}
-	u.User = nil
-	return u.String()
+	return redact.URL(raw)
 }
 
 // endpointAuthKind names the credential kind an endpoint carries, never the

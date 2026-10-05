@@ -76,3 +76,48 @@ func TestS487_EndpointLogAttrStripsURLUserinfo(t *testing.T) {
 		t.Errorf("an unparseable URL must not be logged, got %q", got)
 	}
 }
+
+// TestS499_EndpointLogAttrStripsUserinfoFromASchemelessURL — #499.
+//
+// TestS487_EndpointLogAttrStripsURLUserinfo above covers only the scheme'd
+// form, which is exactly why the schemeless hole shipped: url.Parse reads the
+// "ops-zq499:" of "ops-zq499:hunter2@host/x" as the SCHEME, so there is no
+// User to clear, and the old `u.User = nil` was a no-op that round-tripped the
+// password verbatim into otel_logs. This drives the REAL log attr, not
+// redact.URL directly, so it fails if endpointLogAttr ever stops routing
+// through the shared sanitiser.
+func TestS499_EndpointLogAttrStripsUserinfoFromASchemelessURL(t *testing.T) {
+	const (
+		user = "ops-zq499"
+		pass = "hunter2-zq499"
+	)
+	for _, raw := range []string{
+		user + ":" + pass + "@api.example/base",                   // schemeless — the #499 leak
+		user + ":" + pass + "@api.example:6443/base",              // schemeless with a port
+		"https://" + user + ":" + pass + "@api.example:6443/base", // scheme'd — must stay fixed
+	} {
+		ep := endpoints.Endpoint{ServerURL: raw}
+		var buf bytes.Buffer
+		slog.New(slog.NewJSONHandler(&buf, nil)).Info("m", endpointLogAttr(&ep))
+		if out := buf.String(); strings.Contains(out, pass) {
+			t.Errorf("ServerURL %q: the password reached the line: %s", raw, out)
+		}
+	}
+}
+
+// TestS499_EndpointLogAttrRedactsQueryValues — a credential in the query of a
+// server URL ("?token=…") is a value, not metadata: the KEY survives so the
+// line still says the URL carried a token, the value never does.
+func TestS499_EndpointLogAttrRedactsQueryValues(t *testing.T) {
+	const secret = "tok-zq499-secret"
+	ep := endpoints.Endpoint{ServerURL: "https://api.example:6443/base?token=" + secret}
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("m", endpointLogAttr(&ep))
+	out := buf.String()
+	if strings.Contains(out, secret) {
+		t.Errorf("the query credential reached the line: %s", out)
+	}
+	if !strings.Contains(out, "token=") {
+		t.Errorf("NON-VACUITY: the query KEY must survive so the line stays diagnostic: %s", out)
+	}
+}
