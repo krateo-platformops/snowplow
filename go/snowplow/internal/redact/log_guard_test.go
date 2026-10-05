@@ -182,6 +182,10 @@ func (s *scanner) clean(e ast.Expr) bool {
 		if id, ok := v.Fun.(*ast.Ident); ok && id.Name == "string" && len(v.Args) == 1 {
 			return s.clean(v.Args[0])
 		}
+		// slog.StringValue / AnyValue of a clean value (an Attr literal's Value).
+		if pkg == "slog" && slogValueCtors[name] && len(v.Args) == 1 {
+			return s.clean(v.Args[0])
+		}
 	case *ast.BinaryExpr: // "x" + redact.User(u)
 		return v.Op == token.ADD && s.clean(v.X) && s.clean(v.Y)
 	}
@@ -257,8 +261,54 @@ func (s *scanner) checkKV(args []ast.Expr) {
 	}
 }
 
+// slogValueCtors build a slog.Value from one argument (#490 review: the Value
+// half of a hand-written slog.Attr{Key, Value} literal).
+var slogValueCtors = map[string]bool{"StringValue": true, "AnyValue": true}
+
+// checkAttrLiteral checks a hand-written slog.Attr{Key: k, Value: v} literal
+// exactly like slog.Any(k, v).
+func (s *scanner) checkAttrLiteral(cl *ast.CompositeLit) {
+	if pkg, name := calleeName(cl.Type); pkg != "slog" || name != "Attr" {
+		return
+	}
+	var keyE, valE ast.Expr
+	for i, e := range cl.Elts {
+		if kv, ok := e.(*ast.KeyValueExpr); ok {
+			if id, ok := kv.Key.(*ast.Ident); ok {
+				switch id.Name {
+				case "Key":
+					keyE = kv.Value
+				case "Value":
+					valE = kv.Value
+				}
+			}
+			continue
+		}
+		switch i { // positional
+		case 0:
+			keyE = e
+		case 1:
+			valE = e
+		}
+	}
+	if valE == nil {
+		return
+	}
+	key := ""
+	if keyE != nil {
+		key, _ = strLit(keyE)
+	}
+	s.checkAttr(cl, key, valE)
+}
+
 func (s *scanner) visitCall(c *ast.CallExpr) {
 	pkg, name := calleeName(c.Fun)
+	if pkg == "slog" && slogValueCtors[name] && len(c.Args) == 1 {
+		if src := s.identityExpr(c.Args[0]); src != "" {
+			s.add(c, "slog.%s reads identity source %s unredacted", name, src)
+		}
+		return
+	}
 	if pkg == "slog" && slogAttrCtors[name] {
 		if len(c.Args) < 2 {
 			return
@@ -396,6 +446,9 @@ func (s *scanner) scanFile(f *ast.File, helpers map[string]bool) {
 				s.visitCall(c)
 				s.checkLabelConversion(c)
 			}
+			if cl, ok := n.(*ast.CompositeLit); ok {
+				s.checkAttrLiteral(cl)
+			}
 			return true
 		})
 	}
@@ -485,6 +538,10 @@ func TestS453_GuardDetectsEveryShape(t *testing.T) {
 		"label laundering":   `x := redact.Label(ui.Username); _ = x`,
 		"stderr lane":        `fmt.Fprintf(os.Stderr, "user=%s groups=%v\n", username, groups)`,
 		"std log":            `log.Printf("user=%s", ui.Username)`,
+		"attr literal key":   `a := slog.Attr{Key: "user", Value: slog.StringValue(u)}; _ = a`,
+		"attr literal pos":   `a := slog.Attr{"who_else", slog.StringValue(ui.Username)}; _ = a`,
+		"string value":       `v := slog.StringValue(ui.Username); _ = v`,
+		"any value groups":   `v := slog.AnyValue(ui.Groups); _ = v`,
 	}
 	for name, stmt := range leaks {
 		src := "package p\nfunc f() {\n" + stmt + "\n}\n"
@@ -504,6 +561,7 @@ func TestS453_GuardDetectsEveryShape(t *testing.T) {
 		"non-log Info":    `x.Info()`,
 		"label convert":   `x := redact.Label(redact.User(u)); _ = x`,
 		"stderr redacted": `fmt.Fprintf(os.Stderr, "user=%s groups=%v\n", redact.User(username), redact.Groups(groups))`,
+		"attr literal ok": `a := slog.Attr{Key: "user", Value: slog.StringValue(redact.User(u))}; _ = a`,
 	}
 	for name, stmt := range cleanShapes {
 		src := "package p\nfunc f() {\n" + stmt + "\n}\n"
@@ -625,6 +683,10 @@ func loggedValues(c *ast.CallExpr) []ast.Expr {
 			if len(c.Args) == 2 {
 				return c.Args[1:]
 			}
+		case "AnyValue": // #490 review: also inside hand-written slog.Attr{Key, Value} literals
+			if len(c.Args) == 1 {
+				return c.Args
+			}
 		case "Group":
 			if len(c.Args) > 1 {
 				return c.Args[1:]
@@ -690,6 +752,27 @@ func opaqueKind(t types.Type, depth int, seen map[types.Type]bool) string {
 	return ""
 }
 
+// isSlogType reports whether t is a log/slog type (Attr, Value, ...) or a
+// pointer/slice/array of one.
+func isSlogType(t types.Type) bool {
+	for {
+		switch u := t.(type) {
+		case *types.Pointer:
+			t = u.Elem()
+			continue
+		case *types.Slice:
+			t = u.Elem()
+			continue
+		case *types.Array:
+			t = u.Elem()
+			continue
+		case *types.Named:
+			return u.Obj().Pkg() != nil && u.Obj().Pkg().Path() == "log/slog"
+		}
+		return false
+	}
+}
+
 func isErrorType(t types.Type) bool {
 	errIface, _ := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
 	return types.Implements(t, errIface)
@@ -702,10 +785,10 @@ func isErrorType(t types.Type) bool {
 // A recover() value (#487: the reviewed exception class) needs no entry. An
 // identifier assigned from recover() in the same function is recognised
 // structurally (recoverObjects).
-var opaqueAllow = map[string]string{
-	"dispatchers/per_call_log.go:beginPerCall:attrs": "a []any of slog.Attr built by slog.String/Int64 constructors " +
-		"(each one checked by the syntactic guard), forwarded with attrs...",
-}
+//
+// It is empty: #490 turned per_call_log's []any into a []slog.Attr emitted
+// with LogAttrs, so its old entry is gone.
+var opaqueAllow = map[string]string{}
 
 // recoverObjects returns the objects a function assigns from recover().
 func recoverObjects(info *types.Info, root ast.Node) map[types.Object]bool {
@@ -764,8 +847,8 @@ func typedScanWith(pkgs []*packages.Package, allow map[string]string) []string {
 						if !ok || tv.Type == nil {
 							continue
 						}
-						if named, ok := tv.Type.(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "log/slog" {
-							continue // an Attr/Value: its own constructor call is checked
+						if isSlogType(tv.Type) {
+							continue // an Attr/Value (or a slice of them): its own constructor call is checked
 						}
 						pos := p.Fset.Position(v.Pos())
 						where := filepath.Base(filepath.Dir(pos.Filename)) + "/" + filepath.Base(pos.Filename)
@@ -868,6 +951,9 @@ func F(ep Endpoint, w []Wrap, m map[string]Rep, u cfg, s Safe, v Valuer, l *slog
 	slog.Debug("v", slog.Any("value", val)) // LEAK
 	slog.Debug("evals", slog.Any("evals", evals)) // LEAK
 	slog.Debug("nested valuer", slog.Any("h", h)) // LEAK
+	slog.Debug("anyvalue kv", "v", slog.AnyValue(dict)) // LEAK
+	l.LogAttrs(nil, slog.LevelDebug, "attr literal", slog.Attr{Key: "dict", Value: slog.AnyValue(val)}) // LEAK
+	l.LogAttrs(nil, slog.LevelDebug, "attrs", []slog.Attr{slog.Int("n", 1)}...) // CLEAN
 	slog.Info("e", slog.Any("safe", s), slog.Any("v", v), "n", s.N) // CLEAN
 	slog.Info("f", slog.Any("err", errors.New("x")), slog.Any("allowed", allowed)) // CLEAN
 	defer func() {
@@ -906,8 +992,8 @@ func F(ep Endpoint, w []Wrap, m map[string]Rep, u cfg, s Safe, v Valuer, l *slog
 			t.Errorf("RED shape not detected at fixture line %d: %s", ln, strings.TrimSpace(lines[ln-1]))
 		}
 	}
-	if len(want) != 9 {
-		t.Fatalf("fixture has %d LEAK markers, want 9", len(want))
+	if len(want) != 11 {
+		t.Fatalf("fixture has %d LEAK markers, want 11", len(want))
 	}
 	// The allow-list is what keeps "allowed" clean: without it, it is a hit.
 	if !strings.Contains(strings.Join(typedScanWith(loadPackages(t, dir), nil), "\n"), "allowed") {

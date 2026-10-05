@@ -387,23 +387,26 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 		)
 	}
 
-	for _, el := range evals {
+	for i := range evals {
+		el := &evals[i]
 		fields := maps.ParsePath(el.Path)
 		if len(fields) == 0 {
 			continue
 		}
 
+		// #490: ValueAttr is a lazy pointer-shaped LogValuer over the
+		// slice element, so at a disabled level it costs nothing.
 		log.Debug("widgetDataTemplate setting nested value",
 			slog.Any("fields", fields),
 			slog.String("path", el.Path),
-			redact.ValueAttr("value", el.Value),
+			redact.ValueAttr("value", &el.Value),
 		)
 
 		err = maps.SetNestedValue(src, fields, el.Value)
 		if err != nil {
 			log.Error("unable to set nested value",
 				slog.Any("fields", fields),
-				redact.ValueAttr("value", el.Value),
+				redact.ValueAttr("value", &el.Value),
 				slog.Any("err", err))
 			return src, err
 		}

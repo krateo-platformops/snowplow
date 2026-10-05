@@ -46,7 +46,7 @@ func TestIssue487_DebugDictLinesCarryNoStageBody(t *testing.T) {
 	if resolved == "" {
 		t.Fatalf("NON-VACUITY: the debug \"resolved api\" line was not captured; %d bytes logged", buf.Len())
 	}
-	if !strings.Contains(resolved, `"secret":{`) || !strings.Contains(resolved, `"sha256":`) {
+	if !strings.Contains(resolved, `"stages":{"secret":"k:`) || !strings.Contains(resolved, `"sha256":`) {
 		t.Fatalf("NON-VACUITY: the line must summarise the stage by id with a digest; got %.200s", resolved)
 	}
 }

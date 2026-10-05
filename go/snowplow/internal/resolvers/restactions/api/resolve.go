@@ -270,8 +270,10 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 	}
 
 	// #487: the base dict is the request extras (client-chosen keys and
-	// values, identity extras included) plus the slice. Log its totals only.
-	log.Debug("base dict for api resolver", redact.DictAttr("dict", dict, nil))
+	// values, identity extras included) plus the slice. Totals and per-entry
+	// {type, bytes, sha256} under key labels only (#490: lazy, zero-cost when
+	// debug is off).
+	log.LogAttrs(ctx, slog.LevelDebug, "base dict for api resolver", redact.DictAttr("dict", dict))
 
 	// Ship F1 (0.30.119): the content-keyed api-stage L1 is active
 	// whenever the resolved-output store is on (ApistageL1Enabled folded

@@ -63,8 +63,11 @@ func TestS453_LabelIsKeyedNotADictionaryHash(t *testing.T) {
 	}
 }
 
-// TestS487_ValueAndDictAttrsNeverRenderAValue: the summaries carry type, size
-// and digest only, through both slog handlers.
+// TestS487_ValueAndDictAttrsNeverRenderAValue: what each lazy LogValuer's
+// LogValue renders, through both slog handlers. It carries {type, bytes,
+// sha256} and key labels only. Neither a value nor a dict key name appears
+// (#490 review: the guard trusts a depth-0 LogValuer, so this arm is what
+// holds its LogValue to redacted fields).
 func TestS487_ValueAndDictAttrsNeverRenderAValue(t *testing.T) {
 	const secret = "zq487-not-a-real-secret" // stands in for a Secret value
 	dict := map[string]any{
@@ -77,15 +80,16 @@ func TestS487_ValueAndDictAttrsNeverRenderAValue(t *testing.T) {
 		"text": func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) },
 	} {
 		var buf bytes.Buffer
-		slog.New(mk(&buf)).Info("m", DictAttr("dict", dict, []string{"secret", "missing"}),
-			ValueAttr("value", dict["secret"]), DictAttr("base", dict, nil))
+		v := dict["secret"]
+		var nilRef *any
+		slog.New(mk(&buf)).Info("m", DictAttr("dict", dict), ValueAttr("value", &v), ValueAttr("nil", nilRef))
 		out := buf.String()
-		for _, leak := range []string{secret, "password", "erin.zq487", "username"} {
+		for _, leak := range []string{secret, "password", "erin.zq487", "username", "slice", `"secret"`, "secret="} {
 			if strings.Contains(out, leak) {
 				t.Errorf("%s: %q reached the line: %s", name, leak, out)
 			}
 		}
-		for _, want := range []string{"sha256", "bytes", "secret", "<absent>", "keys"} {
+		for _, want := range []string{"sha256", "bytes", "keys", "entries", KeyLabel("secret"), KeyLabel("username")} {
 			if !strings.Contains(out, want) {
 				t.Errorf("NON-VACUITY %s: the summary must carry %q: %s", name, want, out)
 			}

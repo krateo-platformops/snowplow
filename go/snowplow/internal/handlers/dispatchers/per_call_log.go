@@ -52,7 +52,9 @@ func beginPerCall(r *http.Request, handler string) (*perCallState, func()) {
 		if ui, err := xcontext.UserInfo(ctx); err == nil {
 			user = redact.Label(redact.User(ui.Username))
 		}
-		attrs := []any{
+		// #490 review: []slog.Attr, not []any, so no raw key/value can be
+		// appended past the guards.
+		attrs := []slog.Attr{
 			slog.String("handler", handler),
 			slog.String("path", st.path),
 			slog.String("method", st.method),
@@ -64,11 +66,11 @@ func beginPerCall(r *http.Request, handler string) (*perCallState, func()) {
 		// OTel log-correlation: since 1.12.4 the trace_id/span_id pair is
 		// attached to EVERY *Context record by the trace-correlation
 		// handler installed in main (log_handler.go), so this record gets
-		// it for free through slog.InfoContext(ctx, ...). The per-site
+		// it for free through slog.LogAttrs(ctx, ...). The per-site
 		// injection that used to live here was the ONLY correlated record
 		// in the process — and INFO, which LOG_LEVEL=warn suppresses — so
 		// production correlation coverage was effectively zero. One site
 		// became all sites; do not re-add it here.
-		slog.InfoContext(ctx, "dispatcher.call.complete", attrs...)
+		slog.LogAttrs(ctx, slog.LevelInfo, "dispatcher.call.complete", attrs...)
 	}
 }
