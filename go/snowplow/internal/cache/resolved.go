@@ -737,6 +737,18 @@ type ResolvedCacheStore struct {
 	remintTotal   atomic.Uint64
 	remintByClass [len(RemintClasses)]atomic.Uint64
 
+	// #354 P3 (E, B3) — warm cells whose key carries a page (Page>0 ||
+	// PerPage>0) or request extras, per identity-bound class, recomputed on the
+	// reaper walk (sizes #477). Index: b3Restactions, b3Widgets, b3RAFullList.
+	warmKeyedPageGauge   [b3Classes]atomic.Uint64
+	warmKeyedExtrasGauge [b3Classes]atomic.Uint64
+
+	// #354 P3 (C) — customer hits on a cell whose invalidation→fresh window is
+	// open (dirty-marked, not yet freshly re-Put), and the max age of such a
+	// serve (ms, windowed like the refresher's p95). Bumped in Get off c.mu.
+	staleServedTotal atomic.Uint64
+	staleServedAge   *windowedQuantile
+
 	// #316 — proactive refreshes ENQUEUED by the read-independent pass (a warm,
 	// approaching-TTL cell handed to the existing refresher). Monotonic counter,
 	// the pass's falsifier readout: non-zero DURING a missed-dirty-mark defect
@@ -1095,6 +1107,8 @@ func newResolvedCache(maxEntries int, maxBytes int64, ttl time.Duration) *Resolv
 		// design-time write-deadline (production OVERWRITES via SetTombstoneTTL).
 		tombstones:   map[string]tombstone{},
 		tombstoneTTL: time.Duration(defaultResolvedCacheTombstoneTTLSeconds) * time.Second,
+		// #354 P3 — max only (no quantile) over ~one OTLP export interval.
+		staleServedAge: newWindowedQuantile(metricExportInterval(), false),
 	}
 }
 
@@ -1263,7 +1277,26 @@ func (c *ResolvedCacheStore) effectiveTTLLocked(entry *ResolvedEntry) time.Durat
 // front and bumps hitTotal — the customer-warmth effects. GetNoTouch is the
 // internal, non-stamping twin.
 func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
-	return c.getCore(key, true)
+	entry, ok := c.getCore(key, true)
+	if ok {
+		// #354 P3 (C) — AFTER c.mu is released (getCore's deferred unlock). Get is
+		// the one funnel every hit_total-counted hit goes through
+		// (TestIssue354_P3_StaleServeNoteCoversEveryCountedHit), so a stale serve
+		// is counted on exactly the hit_total population.
+		c.noteServeWhileDirty(key)
+	}
+	return entry, ok
+}
+
+// noteServeWhileDirty counts a customer hit on a cell whose invalidation→fresh
+// window is open (#354 P3): one sync.Map Load, and nothing else on a clean cell.
+func (c *ResolvedCacheStore) noteServeWhileDirty(key string) {
+	t0, dirty := dirtySince(key)
+	if !dirty {
+		return
+	}
+	c.staleServedTotal.Add(1)
+	c.staleServedAge.observe(float64(time.Since(t0).Milliseconds()))
 }
 
 // GetNoTouch is the INTERNAL read path (#376): identical to Get — same lazy TTL +
@@ -2086,6 +2119,12 @@ type ResolvedCacheStats struct {
 	// defect the pass is catching, zero if the pass is dead.
 	ProactiveRefreshTotal uint64
 
+	// #354 P3 — customer stale serves (C) and the B3 key-shape gauges (E).
+	StaleServedTotal    uint64
+	StaleServedAgeMSMax int64
+	WarmKeyedPage       [b3Classes]uint64
+	WarmKeyedExtras     [b3Classes]uint64
+
 	// Ship E (0.30.116) api-stage counters.
 	ApistageStoreTotal uint64
 	ApistageEvictTotal uint64
@@ -2167,6 +2206,10 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		MaxResidentBytes:             maxResidentBytes,
 		ResidentPinTotal:             c.residentPinTotal.Load(),
 		ResidentDemoteTotal:          c.residentDemoteTotal.Load(),
+		StaleServedTotal:             c.staleServedTotal.Load(),
+		StaleServedAgeMSMax:          c.staleServedAgeMSMax(),
+		WarmKeyedPage:                loadB3(&c.warmKeyedPageGauge),
+		WarmKeyedExtras:              loadB3(&c.warmKeyedExtrasGauge),
 
 		PutRefusedGenerationMovedTotal: c.putRefusedGenerationMovedTotal.Load(),
 
@@ -2364,6 +2407,10 @@ type ResolvedEntryMeta struct {
 	// max_entries the walk would stall every /call for the hold. The Put-side
 	// cost is one hash at the observed 50 Puts/s, taken OFF the lock.
 	ExtrasHash string `json:"extrasHash,omitempty"`
+	// KeyedPage / KeyedExtras (#354 P3 B3) — whether the key folds a page
+	// (Page>0 || PerPage>0) or request extras. Bools only, never the values.
+	KeyedPage   bool `json:"keyedPage,omitempty"`
+	KeyedExtras bool `json:"keyedExtras,omitempty"`
 	// BodySHA256 is the hex SHA-256 of the encoded body. Populated ONLY for a
 	// single-key lookup (/debug/apistage?key_hash=...), never for the full
 	// walk — hashing every body under the store mutex would stall serving at
@@ -2574,6 +2621,8 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 		meta.RBACSubGen = in.RBACSubGen
 		meta.PerPage = in.PerPage
 		meta.Page = in.Page
+		meta.KeyedPage = in.Page > 0 || in.PerPage > 0 // #354 P3 B3
+		meta.KeyedExtras = len(in.Extras) > 0
 		meta.Path = metaPathFromCoords(in.Group, in.Version, in.Resource, in.Namespace, in.Name)
 	}
 	return meta
@@ -2763,6 +2812,8 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	// 1.12.6 C4 (§6.4) — a refresh-suppression marker must not outlive its
 	// key (every eviction path but deleteForDep funnels through here).
 	clearRefreshSuppression(item.key)
+	// #354 P3 — nor an open invalidation→fresh window (ends it evicted).
+	evictDirtyWindow(item.key)
 	// Ship 4a (0.30.198) — debit the correct budget. A pinned entry's bytes
 	// live in the resident region; a transient entry's in curBytes.
 	if item.entry != nil && item.entry.Pinned {
@@ -2895,6 +2946,9 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	// through removeElementLocked; the marker must not outlive its key here
 	// either (TestRefreshTerminal_F6e).
 	clearRefreshSuppression(item.key)
+	// #354 P3 — the DELETE path ends an open invalidation→fresh window too
+	// (evicted); it bypasses removeElementLocked, so it clears it here.
+	evictDirtyWindow(item.key)
 	// Ship 4a (0.30.198) — debit the correct budget (a DELETE can evict a
 	// pinned cell; the resident region is TTL/DELETE-evictable, only LRU-
 	// pressure spares it).
@@ -3017,9 +3071,10 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	refreshBelow := ttlSec / 4 // enqueue a warm cell once past ~3/4 of its TTL
 	suppressedResident := 0
 	warmPastMaxAge := 0
-	warmSeeded := 0      // #376 — resident warm cells that are warm via SeededAtBoot
-	warmLastRead := 0    // #376 — resident warm cells warm via read-within-TTL lastRead, not seeded
-	var oldestWarm int64 // #378 scope gauge
+	warmSeeded := 0                                      // #376 — resident warm cells that are warm via SeededAtBoot
+	warmLastRead := 0                                    // #376 — resident warm cells warm via read-within-TTL lastRead, not seeded
+	var oldestWarm int64                                 // #378 scope gauge
+	var warmKeyedPage, warmKeyedExtras [b3Classes]uint64 // #354 P3 B3
 	var suppressedCandidates, coldCandidates, refreshCandidates []string
 	c.rangeMetadataBatched(reapMaxAgeBatch, func(metas []ResolvedEntryMeta, warms []bool, _ time.Duration) bool {
 		for i := range metas {
@@ -3057,6 +3112,15 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 				warmSeeded++
 			case warm:
 				warmLastRead++
+			}
+			// #354 P3 B3 — two field reads per warm cell on the walk that runs anyway.
+			if b, ok := b3ClassIndex(m.CacheEntryClass); ok && warm {
+				if m.KeyedPage {
+					warmKeyedPage[b]++
+				}
+				if m.KeyedExtras {
+					warmKeyedExtras[b]++
+				}
 			}
 			_, suppressed := RefreshSuppressedReason(m.KeyHash)
 			pastMaxAge := maxAgeSec > 0 && m.LifetimeSeconds > maxAgeSec
@@ -3100,6 +3164,10 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	c.warmSeededGauge.Store(uint64(warmSeeded))        // #376
 	c.warmLastReadGauge.Store(uint64(warmLastRead))    // #376
 	c.oldestWarmBornAgeGauge.Store(uint64(oldestWarm)) // #378
+	for i := range warmKeyedPage {                     // #354 P3 B3
+		c.warmKeyedPageGauge[i].Store(warmKeyedPage[i])
+		c.warmKeyedExtrasGauge[i].Store(warmKeyedExtras[i])
+	}
 
 	reaped := 0
 	for _, key := range suppressedCandidates {
@@ -3665,4 +3733,43 @@ func (c *ResolvedCacheStore) Caps() (maxEntries int, maxBytes int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.maxEntries, c.maxBytes
+}
+
+// #354 P3 B3 — the identity-bound classes the key-shape gauges are kept for, in
+// gauge index order, with the stat suffix each publishes under.
+const (
+	b3Restactions = iota
+	b3Widgets
+	b3RAFullList
+	b3Classes
+)
+
+// b3StatSuffix is the published suffix per B3 index
+// (warm_keyed_{page,extras}_<suffix>).
+var b3StatSuffix = [b3Classes]string{"restactions", "widgets", "ra_full_list"}
+
+func b3ClassIndex(class string) (int, bool) {
+	switch class {
+	case "restactions":
+		return b3Restactions, true
+	case "widgets":
+		return b3Widgets, true
+	case CacheEntryClassRAFullList:
+		return b3RAFullList, true
+	}
+	return 0, false
+}
+
+func loadB3(g *[b3Classes]atomic.Uint64) [b3Classes]uint64 {
+	var out [b3Classes]uint64
+	for i := range g {
+		out[i] = g[i].Load()
+	}
+	return out
+}
+
+// staleServedAgeMSMax is the windowed max age of a stale serve (ms).
+func (c *ResolvedCacheStore) staleServedAgeMSMax() int64 {
+	_, mx := c.staleServedAge.read()
+	return int64(mx)
 }

@@ -443,6 +443,24 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #354 P3: the invalidation→fresh window distribution ---
+	// The one SYNCHRONOUS instrument here: a real histogram, not an observable
+	// mirror. The refresher records each dirty→fresh sample (ms) into it through
+	// the hook installed below (cache cannot import this package). No
+	// attributes: one series per pod. The explicit bounds bracket the 1 s
+	// north-star and the 10 s AC-98.12 SLA. The windowed p95/max gauges ride the
+	// refresher's tagged family (dirty_to_fresh_ms_p95/_max) for /debug/vars
+	// parity and alerting without a histogram query.
+	dirtyToFresh, err := m.Int64Histogram("snowplow_refresher_dirty_to_fresh_ms",
+		metric.WithDescription("Invalidation-to-fresh window of a resident L1 cell (ms): first dirty-mark to the refresher's accepted, un-remarked re-Put (#354)."),
+		metric.WithUnit("ms"),
+		metric.WithExplicitBucketBoundaries(cache.DirtyToFreshBoundsMS...),
+	)
+	if err != nil {
+		return err
+	}
+	cache.SetDirtyToFreshRecorder(func(ms int64) { dirtyToFresh.Record(context.Background(), ms) })
+
 	// --- discovery: SA-discovery client (one counter keyed by stat) ---
 	saDiscovery, err := m.Int64ObservableCounter("snowplow_sa_discovery",
 		metric.WithDescription("SA-discovery client counters, labelled by stat."))
