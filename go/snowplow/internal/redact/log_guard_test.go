@@ -23,6 +23,16 @@ package redact
 // is not an identity, so "group" is deliberately not an identity key and .Group
 // is not an identity selector. ".Groups" (plural) is the identity group set.
 //
+// TYPED HALF (TestS453_NoLoggedValueTypeCarriesIdentityOrCredential, adopted
+// from reviewer-424's #481 probe). A syntactic scan cannot see a struct logged
+// whole: slog.Any("endpoint", ep) renders every exported field of an
+// endpoints.Endpoint (Username, Token, Password, AwsSecretKey) through the JSON
+// handler, and the text handler's %+v renders the json:"-" ClientKeyData too.
+// The typed scan loads the module with go/types and flags every logged value
+// whose static type reaches an identity or credential field through fields,
+// pointers, slices, arrays or maps. A type that renders itself (slog.LogValuer,
+// error) is trusted to its own method.
+//
 // RESIDUAL (tracked in its own issue, not checked here): an err VALUE whose
 // text came from the apiserver or plumbing ('User "x" cannot list ...').
 
@@ -31,11 +41,15 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // identityKeys are attribute keys that name an identity. Their value must be
@@ -508,5 +522,254 @@ func TestS453_GuardDetectsEveryShape(t *testing.T) {
 	helperLeak := "package p\nfunc refreshLogUser(user, source string) string {\n if source == \"x\" { return redact.User(user) }\n return user\n}\n"
 	if got := scanSource(t, helperLeak); len(got) == 0 {
 		t.Error("RED: a registered helper returning a plaintext username was not detected")
+	}
+}
+
+// ---- typed half -------------------------------------------------------------
+
+// sensitiveFieldExact are struct fields whose value is an identity or a
+// credential. Matched on the field name with its first letter upper-cased, so
+// an unexported field (rendered by the text handler's %+v) counts too.
+var sensitiveFieldExact = map[string]bool{
+	// identity
+	"Username": true, "UserName": true, "User": true, "Groups": true,
+	"CommonName": true, "Subjects": true,
+	// credential
+	"Token": true, "Password": true, "ClientKeyData": true,
+	"ClientCertificateData": true, "AwsSecretKey": true, "AwsAccessKey": true,
+	"AccessToken": true, "BearerToken": true, "RefreshToken": true,
+	"PrivateKey": true, "SecretKey": true, "ClientKey": true, "ClientCert": true,
+	"KeyData": true, "CertData": true, "Passphrase": true, "Secret": true,
+}
+
+// sensitiveFieldSuffix catches the families (FooToken, AdminPassword, ...).
+var sensitiveFieldSuffix = []string{"Token", "Password", "SecretKey", "PrivateKey", "KeyData", "CertificateData"}
+
+func sensitiveField(name string) bool {
+	if name == "" || name == "_" {
+		return false
+	}
+	n := strings.ToUpper(name[:1]) + name[1:]
+	if sensitiveFieldExact[n] || strings.HasPrefix(n, "Representative") {
+		return true
+	}
+	for _, s := range sensitiveFieldSuffix {
+		if strings.HasSuffix(n, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// rendersItself reports whether slog renders t through its own method
+// (slog.LogValuer, error) rather than field by field.
+func rendersItself(t types.Type) bool {
+	for _, tt := range []types.Type{t, types.NewPointer(t)} {
+		ms := types.NewMethodSet(tt)
+		for i := 0; i < ms.Len(); i++ {
+			switch ms.At(i).Obj().Name() {
+			case "LogValue", "Error":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sensitivePath returns the field path through which t reaches a sensitive
+// field ("" when none).
+func sensitivePath(t types.Type, depth int, seen map[types.Type]bool) string {
+	if depth > 6 || t == nil || seen[t] {
+		return ""
+	}
+	seen[t] = true
+	if _, isNamed := t.(*types.Named); isNamed && rendersItself(t) {
+		return ""
+	}
+	switch u := t.Underlying().(type) {
+	case *types.Pointer:
+		return sensitivePath(u.Elem(), depth+1, seen)
+	case *types.Slice:
+		return sensitivePath(u.Elem(), depth+1, seen)
+	case *types.Array:
+		return sensitivePath(u.Elem(), depth+1, seen)
+	case *types.Map:
+		if s := sensitivePath(u.Key(), depth+1, seen); s != "" {
+			return s
+		}
+		return sensitivePath(u.Elem(), depth+1, seen)
+	case *types.Struct:
+		for i := 0; i < u.NumFields(); i++ {
+			f := u.Field(i)
+			if sensitiveField(f.Name()) {
+				return f.Name()
+			}
+			if s := sensitivePath(f.Type(), depth+1, seen); s != "" {
+				return f.Name() + "." + s
+			}
+		}
+	}
+	return ""
+}
+
+// loggedValues returns the argument expressions of c that a log or print sink
+// renders (nil when c is not a sink).
+func loggedValues(c *ast.CallExpr) []ast.Expr {
+	pkg, name := calleeName(c.Fun)
+	if pkg == "slog" {
+		switch name {
+		case "Any", "Attr":
+			if len(c.Args) == 2 {
+				return c.Args[1:]
+			}
+		case "Group":
+			if len(c.Args) > 1 {
+				return c.Args[1:]
+			}
+		}
+	}
+	if first, ok := printSinks[pkg+"."+name]; ok {
+		return c.Args[min(first, len(c.Args)):]
+	}
+	if _, isSel := c.Fun.(*ast.SelectorExpr); !isSel {
+		return nil
+	}
+	if msgIdx, ok := logMethods[name]; ok {
+		return c.Args[min(msgIdx+1, len(c.Args)):]
+	}
+	return nil
+}
+
+// typedScan reports every logged value of a production (non-test) file whose
+// static type reaches a sensitive field.
+func typedScan(pkgs []*packages.Package) []string {
+	var hits []string
+	for _, p := range pkgs {
+		for _, f := range p.Syntax {
+			if strings.HasSuffix(p.Fset.Position(f.Pos()).Filename, "_test.go") {
+				continue
+			}
+			ast.Inspect(f, func(n ast.Node) bool {
+				c, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				for _, v := range loggedValues(c) {
+					tv, ok := p.TypesInfo.Types[v]
+					if !ok || tv.Type == nil {
+						continue
+					}
+					if named, ok := tv.Type.(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "log/slog" {
+						continue // an Attr/Value: its own constructor call is checked
+					}
+					if s := sensitivePath(tv.Type, 0, map[types.Type]bool{}); s != "" {
+						pos := p.Fset.Position(v.Pos())
+						hits = append(hits, fmt.Sprintf("%s:%d: logged value of type %s reaches %s",
+							filepath.Base(filepath.Dir(pos.Filename))+"/"+filepath.Base(pos.Filename), pos.Line, tv.Type, s))
+					}
+				}
+				return true
+			})
+		}
+	}
+	sort.Strings(hits)
+	return hits
+}
+
+func loadPackages(t *testing.T, dir string) []*packages.Package {
+	t.Helper()
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
+		Dir:  dir,
+	}
+	pkgs, err := packages.Load(cfg, "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range pkgs {
+		for _, e := range p.Errors {
+			t.Fatalf("load %s: %v", p.PkgPath, e)
+		}
+	}
+	return pkgs
+}
+
+func TestS453_NoLoggedValueTypeCarriesIdentityOrCredential(t *testing.T) {
+	if testing.Short() {
+		t.Skip("type-checks the whole module")
+	}
+	pkgs := loadPackages(t, filepath.Join("..", ".."))
+	if len(pkgs) < 20 {
+		t.Fatalf("NON-VACUITY: only %d packages loaded", len(pkgs))
+	}
+	for _, h := range typedScan(pkgs) {
+		t.Errorf("#453 struct logged whole: %s — log a redacted projection instead", h)
+	}
+}
+
+// TestS453_TypedScanDetectsEveryShape is the typed half's non-vacuity arm, over
+// a throwaway module: each leaking shape is reported, each clean one is not.
+func TestS453_TypedScanDetectsEveryShape(t *testing.T) {
+	dir := t.TempDir()
+	src := `package fixture
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+)
+
+type Endpoint struct {
+	ServerURL     string
+	ClientKeyData string ` + "`json:\"-\"`" + `
+}
+type Wrap struct{ Inner *Endpoint }
+type Rep struct{ RepresentativeUsername string }
+type cfg struct{ username string }
+type Safe struct{ N int; Name string }
+type Valuer struct{ Password string }
+
+func (Valuer) LogValue() slog.Value { return slog.StringValue("redacted") }
+
+func F(ep Endpoint, w []Wrap, m map[string]Rep, u cfg, s Safe, v Valuer, l *slog.Logger) {
+	slog.Debug("a", slog.Any("endpoint", ep)) // LEAK
+	slog.Info("b", "wrapped", w) // LEAK
+	l.With("m", m).Info("c") // LEAK
+	fmt.Fprintf(os.Stderr, "%+v\n", &ep) // LEAK
+	slog.Info("d", slog.Group("g", "u", u)) // LEAK
+	slog.Info("e", slog.Any("safe", s), slog.Any("v", v), "n", s.N) // CLEAN
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module fixture\n\ngo 1.22\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f.go"), []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hits := typedScan(loadPackages(t, dir))
+	lines := strings.Split(src, "\n")
+	want := map[int]bool{}
+	for i, l := range lines {
+		if strings.Contains(l, "// LEAK") {
+			want[i+1] = true
+		}
+	}
+	got := map[int]bool{}
+	for _, h := range hits {
+		var ln int
+		if _, err := fmt.Sscanf(h[strings.Index(h, ".go:")+4:], "%d", &ln); err == nil {
+			got[ln] = true
+		}
+		if !want[ln] {
+			t.Errorf("clean shape flagged: %s", h)
+		}
+	}
+	for ln := range want {
+		if !got[ln] {
+			t.Errorf("RED shape not detected at fixture line %d: %s", ln, strings.TrimSpace(lines[ln-1]))
+		}
+	}
+	if len(want) != 5 {
+		t.Fatalf("fixture has %d LEAK markers, want 5", len(want))
 	}
 }

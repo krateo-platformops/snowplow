@@ -165,7 +165,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 	ep.Debug = r.verbose
 
-	log.Debug("user config succesfully loaded", slog.Any("endpoint", ep))
+	log.Debug("user config succesfully loaded", endpointLogAttr(&ep)) // #453: never the struct
 
 	// #443 — the echo headers say what the apiserver call actually carried.
 	// They are read back from the BUILT outbound URI (not from the inbound

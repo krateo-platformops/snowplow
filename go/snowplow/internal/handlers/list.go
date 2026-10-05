@@ -51,7 +51,7 @@ func List() http.HandlerFunc {
 			return
 		}
 
-		log.Debug("user config succesfully loaded", slog.Any("endpoint", ep))
+		log.Debug("user config succesfully loaded", endpointLogAttr(&ep)) // #453: never the struct
 
 		rc, err := kubeconfig.NewClientConfig(req.Context(), ep)
 		if err != nil {
