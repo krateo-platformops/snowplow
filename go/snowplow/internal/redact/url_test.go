@@ -212,6 +212,15 @@ func TestS499_URLNeverLeaksOverAShapeCorpus(t *testing.T) {
 // URL must SURVIVE. Refusing the URL is not an acceptable answer here —
 // <unparseable> would hide a stripper that had stopped working, which is
 // exactly the state #499 shipped in.
+//
+// The mutation that demonstrates the gap, from the #502 gate (`u.Path = ""`
+// before u.String()): it strips the credential, leaves no "@", and still
+// renders — so the corpus arm stays GREEN while this arm reports
+//
+//	got "https://h:6443"  want "https://h:6443/base"
+//
+// Removing `u.User = nil` is NOT that demonstration: the corpus arm catches
+// that one through its own over-refusal check.
 func TestS499_CredentialShapesAreSTRIPPEDNotRefused(t *testing.T) {
 	const pw = "hunter2-zq499-pw"
 	for _, tc := range []struct{ raw, want string }{

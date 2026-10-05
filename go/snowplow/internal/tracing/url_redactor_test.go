@@ -184,6 +184,15 @@ func TestS489_EveryTracerProviderInThisPackageCarriesTheRedactor(t *testing.T) {
 							"its spans would export url.full with the query in clear (#489)",
 							name, pos.Line, enclosing)
 					}
+				case "WithSpanProcessor":
+					// WithBatcher is sugar for WithSpanProcessor(NewBatchSpanProcessor(exp)),
+					// so a processor registered directly is an exporter the composite-literal
+					// check below can never vet: the exporter is buried inside the processor.
+					// There is no safe form, so this fails unconditionally.
+					registrations++
+					t.Errorf("%s:%d: sdktrace.WithSpanProcessor registers a processor whose exporter "+
+						"the guard cannot inspect — register through newTracerProvider's "+
+						"redactingExporter batcher instead (#489)", name, pos.Line)
 				case "WithBatcher", "WithSyncer":
 					registrations++
 					if len(call.Args) == 0 || !wrapsInRedactingExporter(call.Args[0]) {
@@ -247,7 +256,8 @@ func TestS489_EveryTracerProviderInThisPackageCarriesTheRedactor(t *testing.T) {
 					return true
 				}
 				switch id.Name {
-				case "NewTracerProvider", "WithBatcher", "WithSyncer":
+				case "NewTracerProvider", "WithBatcher", "WithSyncer",
+					"WithSpanProcessor", "NewBatchSpanProcessor", "NewSimpleSpanProcessor":
 					pos := fset.Position(id.Pos())
 					t.Errorf("%s:%d: %q appears outside an `sdktrace.` selector — a dot-import or a "+
 						"function value would route around the provider/exporter guard (#489)",
