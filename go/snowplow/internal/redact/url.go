@@ -50,14 +50,26 @@ func URL(raw string) string {
 		return URLUnparseable
 	}
 
-	// Opaque != "" is the trap above; Scheme == "" with no Host is a relative
-	// URL. Both mean url.Parse did NOT split an authority, so userinfo was
-	// never recognised. A protocol-relative "//user:pw@host/x" DOES get its
-	// authority split, so it needs no re-parse — only the stripping below.
-	schemeless := u.Opaque != "" || (u.Scheme == "" && u.Host == "")
+	// THE TEST IS "DID url.Parse SPLIT AN AUTHORITY", NOT "IS THERE A SCHEME".
+	// Any URL that came back without a Host had no authority parsed out of it,
+	// so its userinfo — if any — is sitting unrecognised in Opaque or Path and
+	// u.User is nil. Keying on `Scheme == "" && Host == ""` instead was the
+	// first fix's own version of the #499 bug: `https:/u:p@host/x` (one slash)
+	// has a scheme AND no host, satisfied neither branch, skipped the re-parse,
+	// and round-tripped the password verbatim. So: Host == "" is the trigger,
+	// whatever the scheme says.
+	//
+	// A protocol-relative "//user:pw@host/x" DOES get its authority split, so
+	// it keeps its Host here and needs only the stripping below.
+	schemeless := u.Opaque != "" || u.Host == ""
 	if schemeless {
 		reparsed, rerr := url.Parse("//" + raw)
-		if rerr != nil || reparsed.Host == "" {
+		// A re-parsed host ending in ":" means the original's own scheme was
+		// swallowed into the authority ("jdbc:mysql://u:p@host/db" →
+		// Host "jdbc:mysql:", with the real userinfo left in Path). The result
+		// would be neither correct nor safe, so it is refused rather than
+		// rendered.
+		if rerr != nil || reparsed.Host == "" || strings.HasSuffix(reparsed.Host, ":") {
 			return URLUnparseable
 		}
 		u = reparsed
@@ -81,15 +93,27 @@ func URL(raw string) string {
 		u.ForceQuery = false
 	}
 
-	// Belt and braces: nothing this function returns may carry an authority
-	// with userinfo in it, whatever shape produced it.
-	if strings.Contains(u.Host, "@") {
-		return URLUnparseable
-	}
-
 	out := u.String()
 	if schemeless {
 		out = strings.TrimPrefix(out, "//")
+	}
+
+	// THE CATCH-ALL, and the one check that does not depend on having reasoned
+	// correctly about url.Parse's shapes. Credentials live before an "@"; query
+	// values (where a token would otherwise hide) are already replaced above.
+	// So nothing this function returns may contain an "@" AT ALL — if one
+	// survived, some shape outwitted the parsing above and the URL is not
+	// rendered. Inspecting u.Host alone was not enough: for an opaque URL the
+	// real "@" ends up in Path, where the old guard never looked.
+	//
+	// The cost is that a URL with a literal "@" in its PATH renders as
+	// unparseable. That is deliberate: a lost diagnostic is cheaper than a
+	// leaked credential, and it keeps the invariant stated as something a test
+	// can assert over any corpus rather than over an enumerated shape list.
+	// "%40" is "@" that survived encoding: "u:p%40host/x" has no literal "@" for
+	// the check above to catch, yet it reads back as the userinfo "u:p".
+	if strings.Contains(out, "@") || strings.Contains(strings.ToUpper(out), "%40") {
+		return URLUnparseable
 	}
 	return out
 }

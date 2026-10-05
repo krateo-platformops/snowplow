@@ -48,6 +48,15 @@ var _ sdktrace.SpanExporter = redactingExporter{}
 // ExportSpans redacts every URL-bearing attribute, then delegates. A span with
 // nothing to redact is passed through UNCHANGED (same pointer), so the
 // off-path cost is one attribute scan and no allocation.
+//
+// The caller's slice is rewritten IN PLACE. That is sound against both SDK
+// processors as of otel/sdk v1.45.0, but by implementation rather than by
+// contract, so it is written down here: the batch processor clears and
+// truncates its buffer unconditionally right after ExportSpans returns
+// (`clear(bsp.batch); bsp.batch = bsp.batch[:0]`, batch_span_processor.go), and
+// the simple processor hands over a freshly allocated one-element slice. If a
+// future SDK retained the slice across calls, this would need to allocate a
+// copy instead — a reader who upgrades the SDK should check that line.
 func (e redactingExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
 	for i, s := range spans {
 		spans[i] = redactSpanURLs(s)

@@ -2,10 +2,12 @@ package tracing
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -124,52 +126,85 @@ func TestS489_ClientSpanNeverCarriesURLUserinfo(t *testing.T) {
 }
 
 // TestS489_EveryTracerProviderInThisPackageCarriesTheRedactor is the
-// structural guard: the redactor only protects spans that go through a
-// provider built by newTracerProvider, so a bare sdktrace.NewTracerProvider
-// anywhere in this package would be an unprotected export path. The helper's
-// own body is the single permitted call site.
+// structural guard: the redactor only protects spans that leave through an
+// exporter wrapped in redactingExporter, so a provider built anywhere else in
+// this package — or an exporter registered bare — is an unprotected export
+// path that would publish url.full with its query in clear.
+//
+// It walks the AST rather than scanning lines. The first version of this guard
+// did scan lines and the reviewer defeated it in one try by breaking the call
+// across two lines ("sdktrace.\n NewTracerProvider("), which it reported as
+// clean. Formatting is not a security boundary; the syntax tree is.
 func TestS489_EveryTracerProviderInThisPackageCarriesTheRedactor(t *testing.T) {
-	entries, err := os.ReadDir(".")
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
 	if err != nil {
 		t.Fatalf("SETUP: %v", err)
 	}
-	found := 0
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		src, err := os.ReadFile(filepath.Clean(name))
-		if err != nil {
-			t.Fatalf("SETUP: %v", err)
-		}
-		for i, line := range strings.Split(string(src), "\n") {
-			// Comments describe these calls (including the rule itself), they do
-			// not make them: scan code only.
-			if strings.HasPrefix(strings.TrimSpace(line), "//") {
-				continue
-			}
-			if strings.Contains(line, "sdktrace.NewTracerProvider(") {
-				found++
-				if name != "tracing.go" {
-					t.Errorf("%s:%d constructs a TracerProvider outside newTracerProvider — "+
-						"its spans would export url.full with the query in clear (#489): %s",
-						name, i+1, strings.TrimSpace(line))
+
+	providers, registrations := 0, 0
+	for _, pkg := range pkgs {
+		for name, file := range pkg.Files {
+			// enclosing function of each node, so a NewTracerProvider call can be
+			// attributed to the helper that is allowed to make it.
+			var fnStack []string
+			ast.Inspect(file, func(n ast.Node) bool {
+				if fn, ok := n.(*ast.FuncDecl); ok {
+					fnStack = append(fnStack, fn.Name.Name)
 				}
-			}
-			// Every exporter registration must go through the redacting wrapper:
-			// a bare WithBatcher(exp)/WithSyncer(exp) is an unprotected export path.
-			for _, reg := range []string{"sdktrace.WithBatcher(", "sdktrace.WithSyncer("} {
-				if strings.Contains(line, reg) && !strings.Contains(line, "redactingExporter{") {
-					t.Errorf("%s:%d registers an exporter without redactingExporter — "+
-						"spans would export url.full with the query in clear (#489): %s",
-						name, i+1, strings.TrimSpace(line))
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
 				}
-			}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				ident, ok := sel.X.(*ast.Ident)
+				if !ok || ident.Name != "sdktrace" {
+					return true
+				}
+				pos := fset.Position(call.Pos())
+				switch sel.Sel.Name {
+				case "NewTracerProvider":
+					providers++
+					enclosing := ""
+					if len(fnStack) > 0 {
+						enclosing = fnStack[len(fnStack)-1]
+					}
+					if enclosing != "newTracerProvider" {
+						t.Errorf("%s:%d: sdktrace.NewTracerProvider called in %q, not in newTracerProvider — "+
+							"its spans would export url.full with the query in clear (#489)",
+							name, pos.Line, enclosing)
+					}
+				case "WithBatcher", "WithSyncer":
+					registrations++
+					if len(call.Args) == 0 || !wrapsInRedactingExporter(call.Args[0]) {
+						t.Errorf("%s:%d: sdktrace.%s registers an exporter that is not wrapped in "+
+							"redactingExporter — spans would export url.full with the query in clear (#489)",
+							name, pos.Line, sel.Sel.Name)
+					}
+				}
+				return true
+			})
 		}
 	}
-	if found == 0 {
-		t.Fatalf("NON-VACUITY: no sdktrace.NewTracerProvider call was found at all — " +
-			"the guard is scanning the wrong thing")
+
+	if providers == 0 || registrations == 0 {
+		t.Fatalf("NON-VACUITY: found %d TracerProvider constructions and %d exporter registrations; "+
+			"the guard is scanning the wrong thing", providers, registrations)
 	}
+}
+
+// wrapsInRedactingExporter reports whether an exporter argument is the
+// redactingExporter composite literal.
+func wrapsInRedactingExporter(arg ast.Expr) bool {
+	lit, ok := arg.(*ast.CompositeLit)
+	if !ok {
+		return false
+	}
+	ident, ok := lit.Type.(*ast.Ident)
+	return ok && ident.Name == "redactingExporter"
 }
