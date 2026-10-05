@@ -15,6 +15,11 @@
 // cross-pod correlator is the cache key_hash, which is deterministic and
 // carries no identity in clear.
 //
+// DATA VALUES (#487): a resolved stage body, a JQ result or a template dict
+// may hold Secret data or per-user rows. It is never logged. ValueAttr /
+// DictAttr log its type, JSON size and keyed digest, and DictAttr adds the
+// caller's spec-defined stage ids.
+//
 // SCOPE: LOG AND DEBUG LABELS ONLY. A label is never a cache key, a memo key, a
 // map key that must survive a restart, or an SSE key, because it changes on
 // every restart. The structural guard (log_guard_test.go) fails when a
@@ -29,6 +34,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
@@ -134,6 +142,54 @@ func Err(err error) string {
 		return ""
 	}
 	return ErrorText(err.Error())
+}
+
+// ValueDigest summarises a data value (a stage body, a JQ result, a template
+// dict) as its JSON size and keyed digest. It is the only form of a value
+// that may reach a log line (#487): the value can hold Secret data or per-user
+// rows. A value JSON cannot encode reports size -1 and a digest of its Go
+// type.
+func ValueDigest(v any) (size int, digest string) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return -1, Digest("unencodable\x00" + fmt.Sprintf("%T", v))
+	}
+	return len(b), Digest("v\x00" + string(b))
+}
+
+// ValueAttr logs a value as {type, bytes, sha256}: never the value.
+func ValueAttr(key string, v any) slog.Attr {
+	n, d := ValueDigest(v)
+	return slog.Group(key,
+		slog.String("type", fmt.Sprintf("%T", v)),
+		slog.Int("bytes", n),
+		slog.String("sha256", d),
+	)
+}
+
+// DictAttr logs a resolve dict as its key count, total size and digest, plus
+// {type, bytes, sha256} for each of ids (the caller's spec-defined stage ids,
+// never keys taken from the dict itself, which may come from the request).
+// It never logs a value.
+func DictAttr(key string, dict map[string]any, ids []string) slog.Attr {
+	n, d := ValueDigest(dict)
+	attrs := []slog.Attr{
+		slog.Int("keys", len(dict)),
+		slog.Int("bytes", n),
+		slog.String("sha256", d),
+	}
+	if len(ids) > 0 {
+		stages := make([]slog.Attr, 0, len(ids))
+		for _, id := range ids {
+			if v, ok := dict[id]; ok {
+				stages = append(stages, ValueAttr(id, v))
+			} else {
+				stages = append(stages, slog.String(id, "<absent>"))
+			}
+		}
+		attrs = append(attrs, slog.Attr{Key: "stages", Value: slog.GroupValue(stages...)})
+	}
+	return slog.Attr{Key: key, Value: slog.GroupValue(attrs...)}
 }
 
 // Label is a value that is already a redact label. A parameter or variable of

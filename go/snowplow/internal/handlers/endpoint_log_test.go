@@ -56,3 +56,23 @@ func TestS453_EndpointLogAttrRendersNoCredential(t *testing.T) {
 		t.Errorf("auth kind for an empty endpoint = %q", got)
 	}
 }
+
+// TestS487_EndpointLogAttrStripsURLUserinfo — reviewer-424 (#487): a server
+// URL carrying userinfo (user:password@host) must not reach the line.
+func TestS487_EndpointLogAttrStripsURLUserinfo(t *testing.T) {
+	ep := endpoints.Endpoint{ServerURL: "https://ops-zq487:hunter2-zq487@api.example:6443/base"}
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("m", endpointLogAttr(&ep))
+	out := buf.String()
+	for _, s := range []string{"hunter2-zq487", "ops-zq487"} {
+		if strings.Contains(out, s) {
+			t.Errorf("userinfo %q reached the line: %s", s, out)
+		}
+	}
+	if !strings.Contains(out, "https://api.example:6443/base") {
+		t.Errorf("NON-VACUITY: the host and path must survive: %s", out)
+	}
+	if got := logServerURL("://bad url"); got != "<unparseable>" {
+		t.Errorf("an unparseable URL must not be logged, got %q", got)
+	}
+}

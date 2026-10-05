@@ -9,12 +9,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jqutil"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 
@@ -61,7 +61,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 	}
 
 	log := xcontext.Logger(ctx)
-	log.Debug("resolved api", slog.Any("dict", dict))
+	// #487: never the dict itself. It holds every stage's response body
+	// (Secret data, per-user rows). Log the spec-defined stage ids, each
+	// stage's size and keyed digest, and the dict's totals.
+	stageIDs := make([]string, 0, len(opts.In.Spec.API))
+	for _, a := range opts.In.Spec.API {
+		if a != nil {
+			stageIDs = append(stageIDs, a.Name)
+		}
+	}
+	log.Debug("resolved api", redact.DictAttr("dict", dict, stageIDs))
 
 	var raw []byte
 	if opts.In.Spec.Filter != nil {

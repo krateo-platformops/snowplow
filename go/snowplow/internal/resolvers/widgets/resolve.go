@@ -11,13 +11,13 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"reflect"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/maps"
 	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
@@ -373,7 +373,19 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 		log.Error("unable to resolve widgetDataTemplate", slog.Any("err", err))
 		return src, err
 	}
-	log.Debug("widgetDataTemplate JQ evaluation results", slog.Any("evals", evals))
+	// #487: JQ eval VALUES are resolved data (stage bodies, per-user rows,
+	// Secret fields a template reads). Log the spec-defined paths and each
+	// value's {type, bytes, sha256}, never the value.
+	if log.Enabled(ctx, slog.LevelDebug) {
+		paths := make([]string, 0, len(evals))
+		for _, el := range evals {
+			paths = append(paths, el.Path)
+		}
+		log.Debug("widgetDataTemplate JQ evaluation results",
+			slog.Int("evals", len(evals)),
+			slog.Any("paths", paths),
+		)
+	}
 
 	for _, el := range evals {
 		fields := maps.ParsePath(el.Path)
@@ -384,16 +396,14 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 		log.Debug("widgetDataTemplate setting nested value",
 			slog.Any("fields", fields),
 			slog.String("path", el.Path),
-			slog.Any("value", el.Value),
-			slog.Any("type", reflect.TypeOf(el.Value)),
+			redact.ValueAttr("value", el.Value),
 		)
 
 		err = maps.SetNestedValue(src, fields, el.Value)
 		if err != nil {
 			log.Error("unable to set nested value",
 				slog.Any("fields", fields),
-				slog.Any("value", el.Value),
-				slog.Any("valueType", reflect.TypeOf(el.Value)),
+				redact.ValueAttr("value", el.Value),
 				slog.Any("err", err))
 			return src, err
 		}
