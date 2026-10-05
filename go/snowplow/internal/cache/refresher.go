@@ -365,6 +365,18 @@ type refresher struct {
 	// it stays expvar-only — M1 is not an OTLP detector.
 	resolveLatencyMu sync.Mutex
 	resolveLatency   *p2Quantile
+
+	// #354 P3 — firstDirtyAt: l1Key → *dirtyStamp, the open invalidation→fresh
+	// window of each RESIDENT dirty-marked key (dirty_window.go). Bounded by the
+	// resident key set: written only on onDirtyMark's resident branch, deleted by
+	// every store removal and by the dequeue that closes the window.
+	dirty      sync.Map
+	dirtyStats *dirtyWindowStats
+
+	// #354 P3 (D) — wall time spent parked in yieldToCustomer, from the first
+	// park to release (a capped exit included), in nanoseconds; published as
+	// parked_ms.
+	parkedNanos atomic.Uint64
 }
 
 var (
@@ -410,6 +422,7 @@ func refresherSingleton() *refresher {
 			handlers:         map[string]RefreshFunc{},
 			dropEvict:        newDropEvictBreaker(RefreshDropEvictMaxPerMinute()),
 			resolveLatency:   newP2Quantile(0.95),
+			dirtyStats:       newDirtyWindowStats(),
 		})
 	})
 	return refresherInstance.Load()
@@ -600,6 +613,10 @@ func (r *refresher) onDirtyMark(l1Key string, triggerGVR schema.GroupVersionReso
 		r.mergeTriggerGVR(l1Key, g)
 	}
 	r.mergeTriggerGVR(l1Key, triggerGVR)
+	// #354 P3 — open the key's invalidation→fresh window (first mark wins). A
+	// #375 remark reaches here through enqueueRemark, so it is a mark too. Not
+	// on the drop branch above: a non-resident key has no cell to be stale.
+	r.markDirty(l1Key, time.Now())
 	// Path 3.2 / 0.30.218 — two-tier dispatch. If the key is a
 	// registered cluster_list cell, route it to the
 	// HIGH-PRIORITY tier; otherwise the normal tier. The
@@ -786,12 +803,21 @@ func (r *refresher) yieldToCustomer(ctx context.Context) {
 	cap := time.NewTimer(refresherYieldMaxParked)
 	defer cap.Stop()
 	parked := false
+	// #354 P3 (D) — accumulate the parked wall time, first park to release,
+	// on every exit (released, capped, ctx cancelled).
+	var parkStart time.Time
+	defer func() {
+		if parked {
+			r.parkedNanos.Add(uint64(time.Since(parkStart)))
+		}
+	}()
 	for customerInFlightLocked() {
 		if !parked {
 			// First park — count it ONCE per yield call (mirrors the
 			// prewarm engine's per-call yieldTotal semantics).
 			r.yieldedTotal.Add(1)
 			parked = true
+			parkStart = time.Now()
 		}
 		select {
 		case <-ctx.Done():
@@ -963,6 +989,11 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		// N3). The rate-floor branch deliberately keeps its GVR because it
 		// re-dispatches the same mark; a suppressed skip does not.
 		r.triggerGVRByKey.LoadAndDelete(key)
+		// #354 P3 — a suppressed skip ends the window unfresh: the cell stays on
+		// its pre-change body until real traffic re-Puts it.
+		if t0, open := r.beginWindow(key); open {
+			r.windowUnfresh(key, t0, unfreshDeclined)
+		}
 		return true
 	}
 	if floor := r.rateFloor(); floor > 0 && ok && entry != nil {
@@ -1010,6 +1041,15 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			}
 		}
 	}
+	// #354 P3 — the window is consumed here, beside the trigger GVR, NOT in the
+	// floored branch above: a floored key keeps its window open, so the floor is
+	// part of the measured time. The stamp stays in the map (in flight) so a
+	// customer hit during the re-resolve still counts as a stale serve.
+	t0, windowOpen := r.beginWindow(key)
+	var outcome *refreshOutcome
+	if windowOpen {
+		rctx, outcome = withRefreshOutcome(rctx, key)
+	}
 	if err := r.processOne(rctx, key, entry, ok); err != nil {
 		r.failedTotal.Add(1)
 		// Poison-pill bound (Part A). NumRequeues is how many times this
@@ -1022,6 +1062,11 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		if q.NumRequeues(key) >= maxRefreshRequeues {
 			q.Forget(key)
 			r.droppedTotal.Add(1)
+			// #354 P3 — the poison-pill bound ends the window (before the
+			// drop-point eviction below, which then finds no stamp to count).
+			if windowOpen {
+				r.windowUnfresh(key, t0, unfreshDropped)
+			}
 			// 1.12.5 / #187 (i) — THE DROP POINT IS THE EVICTION POINT for a
 			// self-object 404.
 			//
@@ -1125,6 +1170,10 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			return true
 		}
 		r.retriedTotal.Add(1)
+		// #354 P3 — a retry keeps the window open from the original mark.
+		if windowOpen {
+			r.windowContinue(key, t0)
+		}
 		// Bounded exponential-backoff retry. The key is NOT Forgotten,
 		// so the rate limiter's NumRequeues climbs and the next delay
 		// doubles (capped at maxDelay).
@@ -1138,7 +1187,30 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	if fromCL {
 		r.clusterListCompletedTotal.Add(1)
 	}
+	if windowOpen {
+		r.settleDequeue(key, t0, ok && entry != nil, outcome)
+	}
 	return true
+}
+
+// settleDequeue classifies a successful (nil-error) dequeue of a dirty key
+// (#354 P3): an accepted, un-remarked re-Put closes the window as a sample; an
+// accepted-and-remarked one keeps it open from the original mark; a refused
+// replace or a missing entry ends it evicted; a return with no Put outcome ends
+// it declined (evicted if the cell left the store meanwhile).
+func (r *refresher) settleDequeue(key string, t0 time.Time, hadEntry bool, o *refreshOutcome) {
+	switch {
+	case !hadEntry:
+		r.windowUnfresh(key, t0, unfreshEvicted)
+	case o != nil && o.accepted.Load() && o.remarked.Load():
+		r.windowUnfresh(key, t0, unfreshRemarked)
+	case o != nil && o.accepted.Load():
+		r.windowFresh(key, t0)
+	case o != nil && o.refused.Load():
+		r.windowUnfresh(key, t0, unfreshEvicted)
+	default:
+		r.windowUnfresh(key, t0, unfreshDeclined)
+	}
 }
 
 // processOne handles a single refresh: dispatch the registered handler
@@ -1221,6 +1293,19 @@ type refresherStats struct {
 	floored           uint64 `stat:"floored"`                                                                                                           // Task #321 (#318-R1a) — rate-floor deferrals
 	queueDepth        int64  `stat:"queue_depth" kind:"gauge" desc:"Live refresher workqueue depth; climbing with stagnant completed = workers stuck."` // 0 before the pool is built
 
+	// #354 P3 — the invalidation→fresh window (dirty_window.go). The unfresh
+	// outcomes are FLATTENED stats on the shared snowplow_refresher{stat}
+	// counter (it carries only `stat`); the #354 driver queries read exactly
+	// these names.
+	parkedMS            uint64 `stat:"parked_ms"`
+	dirtyToFreshSamples uint64 `stat:"dirty_to_fresh_samples"`
+	unfreshRemarked     uint64 `stat:"dirty_ended_unfresh_remarked"`
+	unfreshEvicted      uint64 `stat:"dirty_ended_unfresh_evicted"`
+	unfreshDeclined     uint64 `stat:"dirty_ended_unfresh_declined"`
+	unfreshDropped      uint64 `stat:"dirty_ended_unfresh_dropped"`
+	dirtyToFreshP95MS   int64  `stat:"dirty_to_fresh_ms_p95" kind:"gauge" desc:"p95 of the invalidation-to-fresh window of a resident L1 cell (ms), over roughly the last OTLP export interval; the distribution is the histogram snowplow_refresher_dirty_to_fresh_ms."`
+	dirtyToFreshMaxMS   int64  `stat:"dirty_to_fresh_ms_max" kind:"gauge" desc:"Max invalidation-to-fresh window of a resident L1 cell (ms), over roughly the last OTLP export interval."`
+
 	// Path 3.2 / 0.30.218 — per-tier observability for the two-tier
 	// priority queue. Read by ClusterListRefresherStats for the Path 3.2
 	// falsifiers; not published on expvar or OTLP.
@@ -1235,7 +1320,16 @@ func refresherStatsSnapshot() refresherStats {
 	if r == nil {
 		return refresherStats{}
 	}
+	p95, mx := r.dirtyStats.d2f.read()
 	return refresherStats{
+		parkedMS:             r.parkedNanos.Load() / uint64(time.Millisecond),
+		dirtyToFreshSamples:  r.dirtyStats.samples.Load(),
+		unfreshRemarked:      r.dirtyStats.unfresh[unfreshRemarked].Load(),
+		unfreshEvicted:       r.dirtyStats.unfresh[unfreshEvicted].Load(),
+		unfreshDeclined:      r.dirtyStats.unfresh[unfreshDeclined].Load(),
+		unfreshDropped:       r.dirtyStats.unfresh[unfreshDropped].Load(),
+		dirtyToFreshP95MS:    int64(p95),
+		dirtyToFreshMaxMS:    int64(mx),
 		enqueued:             r.enqueueTotal.Load(),
 		completed:            r.completedTotal.Load(),
 		failed:               r.failedTotal.Load(),
@@ -1323,6 +1417,18 @@ func AddRefresherPoolCounterForTest(stat string, n uint64) bool {
 		r.cappedTotal.Add(n)
 	case "floored":
 		r.flooredTotal.Add(n)
+	case "parked_ms":
+		r.parkedNanos.Add(n * uint64(time.Millisecond))
+	case "dirty_to_fresh_samples":
+		r.dirtyStats.samples.Add(n)
+	case "dirty_ended_unfresh_remarked":
+		r.dirtyStats.unfresh[unfreshRemarked].Add(n)
+	case "dirty_ended_unfresh_evicted":
+		r.dirtyStats.unfresh[unfreshEvicted].Add(n)
+	case "dirty_ended_unfresh_declined":
+		r.dirtyStats.unfresh[unfreshDeclined].Add(n)
+	case "dirty_ended_unfresh_dropped":
+		r.dirtyStats.unfresh[unfreshDropped].Add(n)
 	default:
 		return false
 	}

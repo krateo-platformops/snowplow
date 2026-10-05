@@ -1018,7 +1018,7 @@ func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey
 	if recheck != nil {
 		// After the edge is in place (deferred past the forward insert below), so an
 		// event is then either seen by this re-check or dirty-marks through the edge.
-		defer d.recheckAfterPutRecord(recheck, l1Key, dk)
+		defer d.recheckAfterPutRecord(ctx, recheck, l1Key, dk)
 	}
 	// [C2-A] edge-3 capture tap — at the VERY TOP, BEFORE the forward
 	// LoadOrStore and the idempotent dedup early-return below. An idempotent
@@ -1222,7 +1222,8 @@ func (d *DepTracker) remarkIfDepsMovedFrom(ctx context.Context, l1Key string, bo
 			(*fn)(l1Key)
 		}
 		observeDepGenRemark(l1Key, "nil_sink")
-		d.enqueueRemark(l1Key, nil) // fail-fresh: the one drifted key
+		noteRefreshRemark(ctx, l1Key) // #354 P3: a fail-fresh remark keeps the window open
+		d.enqueueRemark(l1Key, nil)   // fail-fresh: the one drifted key
 		return
 	}
 	s.mu.Lock()
@@ -1258,6 +1259,11 @@ func (d *DepTracker) remarkIfDepsMovedFrom(ctx context.Context, l1Key string, bo
 		s.mu.Unlock()
 		observeDepGenRemark(l1Key, "moved")
 		d.noteMovedRemark(boot)
+		// #354 P3 — a refresher Put built from a moved dep is not fresh: the
+		// window stays open from the original mark (noteRefreshRemark is a no-op
+		// off the refresher's dequeue ctx). Before the enqueue, so the dequeue's
+		// outcome is set when the remark's mark lands.
+		noteRefreshRemark(ctx, l1Key)
 		d.enqueueRemark(l1Key, moved) // once per Put, not per dep
 	}
 }
@@ -1269,7 +1275,7 @@ func (d *DepTracker) remarkIfDepsMovedFrom(ctx context.Context, l1Key string, bo
 // (fix ii), so dk reads as moved since checkedSeq exactly when such an event happened.
 // Then remark l1Key ONCE (putRemarked), carrying dk's GVR. Idempotent with a dirty-mark
 // that does find the edge (an event after the Record): both enqueue the same key.
-func (d *DepTracker) recheckAfterPutRecord(s *depGenSink, l1Key string, dk DepKey) {
+func (d *DepTracker) recheckAfterPutRecord(ctx context.Context, s *depGenSink, l1Key string, dk DepKey) {
 	s.mu.Lock()
 	checked := s.checkedSeq
 	done := s.putRemarked || s.putKey != l1Key
@@ -1287,6 +1293,7 @@ func (d *DepTracker) recheckAfterPutRecord(s *depGenSink, l1Key string, dk DepKe
 	s.mu.Unlock()
 	observeDepGenRemark(l1Key, "moved_after_put")
 	d.noteMovedRemark(boot)
+	noteRefreshRemark(ctx, l1Key) // #354 P3: the refresher's Put is not fresh
 	d.enqueueRemark(l1Key, []schema.GroupVersionResource{dk.GVR})
 }
 

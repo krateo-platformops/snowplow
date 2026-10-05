@@ -94,6 +94,15 @@ func registerRefresherMetrics() {
 		expvar.Publish("snowplow_refresher_suppressed_set_total", refresherStatFunc("suppressed_set"))
 		expvar.Publish("snowplow_refresher_suppressed_skips_total", refresherStatFunc("suppressed_skips"))
 		expvar.Publish("snowplow_refresher_suppressed_keys", refresherStatFunc("suppressed_keys"))
+		// #354 P3 — the invalidation→fresh window (dirty_window.go).
+		expvar.Publish("snowplow_refresher_parked_ms_total", refresherStatFunc("parked_ms"))
+		expvar.Publish("snowplow_refresher_dirty_to_fresh_samples_total", refresherStatFunc("dirty_to_fresh_samples"))
+		expvar.Publish("snowplow_refresher_dirty_ended_unfresh_remarked_total", refresherStatFunc("dirty_ended_unfresh_remarked"))
+		expvar.Publish("snowplow_refresher_dirty_ended_unfresh_evicted_total", refresherStatFunc("dirty_ended_unfresh_evicted"))
+		expvar.Publish("snowplow_refresher_dirty_ended_unfresh_declined_total", refresherStatFunc("dirty_ended_unfresh_declined"))
+		expvar.Publish("snowplow_refresher_dirty_ended_unfresh_dropped_total", refresherStatFunc("dirty_ended_unfresh_dropped"))
+		expvar.Publish("snowplow_refresher_dirty_to_fresh_ms_p95", refresherStatFunc("dirty_to_fresh_ms_p95"))
+		expvar.Publish("snowplow_refresher_dirty_to_fresh_ms_max", refresherStatFunc("dirty_to_fresh_ms_max"))
 
 		// #386 M1 — p95 of the REAL resolve latency (ms). A STANDALONE expvar
 		// scalar, published OUTSIDE the snowplow_refresher_ family ON PURPOSE: that

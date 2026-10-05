@@ -99,7 +99,7 @@ func ResolvedCacheStatsByStat() map[string]int64 {
 // process-global state (1.12.6 C7 N1: the docs and matrix guards must not
 // depend on whether a sibling test left the store published).
 func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
-	return map[string]int64{
+	out := map[string]int64{
 		// occupancy vs its two ceilings
 		"entries":     int64(s.Entries),
 		"bytes":       s.Bytes,
@@ -193,5 +193,18 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		// (snowplow_resolved_cache) and the OTLP RegisterCallback that ranges
 		// ResolvedCacheStatsByStat() (metrics.go) — OTLP-observed by construction.
 		"serve_missed_rotation_atrisk_implicit_group": int64(s.ServeMissedRotationAtriskImplicitGroup),
+		// #354 P3 (C) — customer hits (the hit_total population: one funnel,
+		// ResolvedCacheStore.Get) on a cell whose invalidation→fresh window is open,
+		// and the max age of such a serve over ~one OTLP export interval (ms). The
+		// #354 driver reads them per 1k hits. Scalars: no key, identity or body.
+		"stale_served_total":      int64(s.StaleServedTotal),
+		"stale_served_age_ms_max": s.StaleServedAgeMSMax,
 	}
+	// #354 P3 (E, B3) — warm cells keyed by page / by request extras, per
+	// identity-bound class (GAUGES; denominator warm_seeded + warm_lastread).
+	for i, suffix := range b3StatSuffix {
+		out["warm_keyed_page_"+suffix] = int64(s.WarmKeyedPage[i])
+		out["warm_keyed_extras_"+suffix] = int64(s.WarmKeyedExtras[i])
+	}
+	return out
 }

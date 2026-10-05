@@ -90,6 +90,9 @@ func TestResolvedCacheStatsByStat_ReportsLiveStore(t *testing.T) {
 		"serve_missed_rotation_atrisk_implicit_group",                            // #261 case-2 serve-time detector
 		"evict_max_age_warm_customer_total", "evict_max_age_warm_internal_total", // #378 (P5 trigger)
 		"evict_ttl_warm_customer_total", "oldest_warm_born_age_seconds", "remint_total", // #378
+		"stale_served_total", "stale_served_age_ms_max", // #354 P3 customer stale serves
+		"warm_keyed_page_restactions", "warm_keyed_page_widgets", "warm_keyed_page_ra_full_list", // #354 P3 B3
+		"warm_keyed_extras_restactions", "warm_keyed_extras_widgets", "warm_keyed_extras_ra_full_list",
 	}
 	for _, k := range want {
 		if _, ok := stats[k]; !ok {

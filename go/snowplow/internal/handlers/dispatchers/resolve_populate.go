@@ -550,7 +550,13 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// lead window [maxAge − L, …) the accepted replace resets BornAt under the SAME
 	// key, so a warm cell kept fresh here never reaches the C5 cap under a customer.
 	// The only freshMint=true write (TestReMint_SingleSetterAudit).
-	if !c.ReplaceIfGenRefresh(rctx, key, entry, gen0) {
+	//
+	// #354 P3 — report the terminal write's outcome to the refresher's dequeue
+	// (accepted closes the invalidation→fresh window unless #375 remarked it;
+	// refused ends it evicted). A no-op off the refresher.
+	stored := c.ReplaceIfGenRefresh(rctx, key, entry, gen0)
+	cache.NoteRefreshWrite(rctx, key, stored)
+	if !stored {
 		log.Debug("resolveAndPopulateL1: entry evicted during refresh; not resurrecting (generation moved)",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
