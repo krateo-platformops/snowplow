@@ -146,12 +146,7 @@ func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 		return noop, err
 	}
 
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp,
-			sdktrace.WithBatchTimeout(5*time.Second),
-		),
-		sdktrace.WithResource(res),
-	)
+	tp := newTracerProvider(exp, sdktrace.WithResource(res))
 
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
@@ -160,6 +155,26 @@ func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 	))
 
 	return tp.Shutdown, nil
+}
+
+// newTracerProvider is the ONLY place a TracerProvider is constructed in this
+// package, and it is what guarantees that NO span leaves the process with a
+// credential in a URL attribute: the caller's exporter is always wrapped in
+// redactingExporter (#489). Setup gets the batching pipeline; a falsifier gets
+// the identical pipeline pointed at an in-memory exporter, so the arm exercises
+// the production path rather than a hand-built provider.
+//
+// An exporter registered directly — sdktrace.WithBatcher(exp, …) on a bare
+// sdktrace.NewTracerProvider — would publish url.full with its query in clear.
+// The structural guard in url_redactor_test.go fails if that reappears here.
+func newTracerProvider(exp sdktrace.SpanExporter, opts ...sdktrace.TracerProviderOption) *sdktrace.TracerProvider {
+	return sdktrace.NewTracerProvider(
+		append([]sdktrace.TracerProviderOption{
+			sdktrace.WithBatcher(redactingExporter{exp},
+				sdktrace.WithBatchTimeout(5*time.Second),
+			),
+		}, opts...)...,
+	)
 }
 
 // Enabled reports whether tracing resolves to enabled (OTEL_TRACING_ENABLED,
