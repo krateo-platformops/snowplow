@@ -64,6 +64,7 @@ var security448Scalars = []string{
 var security448Labelled = []string{
 	"snowplow_l1_identity_class_drift_declined_total",
 	"snowplow_l1_representative_repick_total",
+	"snowplow_resolved_cache_remint_total", // #378
 	"snowplow_learned_classes_capacity",
 	"snowplow_learned_classes_capacity_bound",
 }
@@ -135,6 +136,13 @@ func c7Seed448(t *testing.T) c7Want448 {
 		}
 		want[seriesID("snowplow_l1_representative_repick_total", map[string]string{"outcome": outcome})] =
 			repBase[outcome] + int64(21+i)
+	}
+
+	// --- #378 re-mint by class: the full closed set must be on the wire as a
+	// monotonic Sum (values are the live store's; D3 drives distinct counts
+	// through the real refresher terminal: TestIssue378_D3_P1SeriesLeaveTheProcessOnOTLP).
+	for _, c := range cache.ResolvedCacheRemintByClass() {
+		want[seriesID("snowplow_resolved_cache_remint_total", map[string]string{"class": c.Class})] = int64(c.Count)
 	}
 
 	// --- #424 binding-set memo, driven through the real memo against one
@@ -217,6 +225,7 @@ func c7Seed448(t *testing.T) c7Want448 {
 var security448Counters = map[string]bool{
 	"snowplow_l1_identity_class_drift_declined_total": true,
 	"snowplow_l1_representative_repick_total":         true,
+	"snowplow_resolved_cache_remint_total":            true, // #378: the live query reads otel_metrics_sum
 	"snowplow_binding_set_memo_hits":                  true,
 	"snowplow_binding_set_memo_misses":                true,
 	"snowplow_binding_set_memo_refused":               true,
@@ -361,6 +370,7 @@ func TestIssue448_AttributeHygiene_ClosedSetsNoIdentity(t *testing.T) {
 		"outcome": setOf(dispatchers.RepresentativeRepickOutcomes),
 		"stat":    setOf(learnedCapacityStats),
 		"bound":   setOf(learnedBounds),
+		"class":   setOf(cache.RemintClasses[:]), // #378
 	}
 	all := flatten(collectViaRealCallback(t, "deadbeef"))
 	seen := 0
@@ -368,6 +378,7 @@ func TestIssue448_AttributeHygiene_ClosedSetsNoIdentity(t *testing.T) {
 		if !strings.HasPrefix(p.metric, "snowplow_l1_identity_class_drift") &&
 			!strings.HasPrefix(p.metric, "snowplow_l1_representative_repick") &&
 			!strings.HasPrefix(p.metric, "snowplow_binding_set_memo") &&
+			!strings.HasPrefix(p.metric, "snowplow_resolved_cache_remint") &&
 			!strings.HasPrefix(p.metric, "snowplow_learned_") {
 			continue
 		}

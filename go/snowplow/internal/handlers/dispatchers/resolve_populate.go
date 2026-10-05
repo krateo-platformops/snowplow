@@ -546,7 +546,11 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// drops the fresh bytes and does NOT emit the live-refresh signal (L1 did not
 	// change). This closes the resurrection race atomically (was the racy
 	// alive-check above) AND preserves the "evicted → no signal" contract.
-	if !c.ReplaceIfGen(rctx, key, entry, gen0) {
+	// #378 — ReplaceIfGenRefresh is ReplaceIfGen plus the age re-mint: inside the
+	// lead window [maxAge − L, …) the accepted replace resets BornAt under the SAME
+	// key, so a warm cell kept fresh here never reaches the C5 cap under a customer.
+	// The only freshMint=true write (TestReMint_SingleSetterAudit).
+	if !c.ReplaceIfGenRefresh(rctx, key, entry, gen0) {
 		log.Debug("resolveAndPopulateL1: entry evicted during refresh; not resurrecting (generation moved)",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),

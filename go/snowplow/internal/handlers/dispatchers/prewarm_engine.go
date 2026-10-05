@@ -245,12 +245,9 @@ const (
 	// rotation, so a re-armed run reads it instead of re-resolving it
 	// (seedSkipDecision); an absent key is resolved and minted.
 	seedModeRBACShift
-	// seedModeReMint — #378 (dev-1218). Age-triggered re-mint of the SAME key
-	// (sub-gen unchanged): resolve-first, then an atomic gen-guarded REPLACE that
-	// RESETS BornAt (the fresh-mint strategy) so the kept-warm cell's max-age
-	// clock restarts without an evict-then-reinsert cold-nav window. NO skip (the
-	// reaper already selected this cell as past-age — a skip would defeat it).
-	seedModeReMint
+	// #378: there is no seed re-mint mode. The age re-mint is carried by the
+	// refresher terminal (cache.ReplaceIfGenRefresh); the seed-path re-mint
+	// (seedModeReMint / reseedFromInputs) was retired with zero production callers.
 )
 
 // String renders the mode for the seed's completion log (replaces the old
@@ -265,8 +262,6 @@ func (m seedScopeMode) String() string {
 		return "gvr-discovered"
 	case seedModeRBACShift:
 		return "rbac-shift"
-	case seedModeReMint:
-		return "re-mint"
 	default:
 		return "unknown"
 	}

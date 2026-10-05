@@ -136,10 +136,15 @@ Defined in `internal/cache/fallthrough_meter_expvar.go`.
 | `evict_lru_total` | entries evicted because a ceiling was hit — the budget is the binding constraint | **0** on a right-sized pod; climbing = raise the ceiling or the store is oversubscribed |
 | `evict_ttl_total` | entries evicted at `RESOLVED_CACHE_TTL_SECONDS` (3600 s) on `Get` — staleness, the outer net | low; every TTL eviction is a body the pipeline did not refresh in an hour |
 | `evict_max_age_total` | **1.12.6 C5.** entries evicted on `Get` because they were born more than `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS` (86400 s) ago, however many times they were re-Put since | low and steady (≈ one per resident cell per day) |
+| `evict_max_age_warm_customer_total` | **#378 — the owner's P5 trigger.** the subset of `evict_max_age_total` that evicted a WARM cell (`SeededAtBoot`, or read within the TTL) on the CUSTOMER read path (`Get`): a cold navigation of the working set at the C5 cap. Since #378 the refresher terminal re-mints (resets `BornAt` of) a warm cell it refreshes inside the lead window `[maxAge − L, …)`, `L = min(TTL, maxAge/2)`, so a warm cell should never reach the cap under a customer | **0**. Read only on a pod whose `oldest_warm_born_age_seconds` exceeded `maxAge − L` (an exercised pod); on a younger pod a zero is "not exercised", not evidence. **> 0 on an exercised pod = back to the owner (P5)** |
+| `evict_max_age_warm_internal_total` | **#378.** the same warm-cell max-age evict on the INTERNAL read path (`GetNoTouch`: refresher dequeue, seed sweeps) — no customer saw it | low; rising with `remint_total` flat = refreshes are landing after the cap instead of in the window |
+| `evict_ttl_warm_customer_total` | **#378.** the subset of `evict_ttl_total` that evicted a WARM cell under a customer `Get`: a warm cell whose BODY lapsed (no refresh within the TTL) | **0**; non-zero = a warm cell missed its refresh (missed dirty-mark and #316) |
+| `oldest_warm_born_age_seconds` | **#378.** a GAUGE: the oldest `BornAt` age (whole seconds) over the WARM cells of the last reaper walk, 0 if none. The SCOPE of the three detectors above | saw-tooths below `maxAge` once re-mint runs (each re-mint resets the age). Above `maxAge` = warm cells are crossing the cap un-re-minted (read with `warm_past_max_age`) |
+| `remint_total` | **#378.** accepted refresher-terminal writes that RE-MINTED (reset `BornAt` under the same key) because the cell was inside the lead window. The by-class split is the OTLP counter `snowplow_resolved_cache_remint_total{class}` (see the #448 table) | > 0 on any pod older than `maxAge − L` with a warm working set; **0 on an exercised pod = the re-mint is inert (FAIL)** |
 | `evict_no_representative_total` | **#444.** identity-bound cells (restactions / widgets / raFullList) the refresher EVICTED because their recorded representative had drifted out of the key's RBAC class and no in-class replacement was found (neither the canonical group representative nor a recent hitter). The cell refills cold and correct on its next request instead of serving stale until the TTL. Replacement outcomes per source are on `snowplow_l1_representative_repick_total` (`group` / `hitter` / `evicted`) | low; tracks personal (User-subject) RBAC changes on representatives of classes no group representative can stand in for |
 | `evict_delete_total` | entries evicted by invalidation (the dep tracker's DELETE route) — the store-side twin of `snowplow_deps.evict_delete_total` | tracks object deletions |
 | `suppressed_resident` | **#345 / #248.** a GAUGE (current count, up/down — not a total) of resident cells the refresher has permanently refresh-SUPPRESSED (a UAF decline suppresses on first occurrence). #248's own validation signal: the reaper reads it every summary tick and evicts the past-`maxEntryAge` members; the number was previously computed and discarded into the `LOG_LEVEL=warn`-suppressed INFO line. Distinguishes decline-FROZEN cells from never-yet-refreshed ones | **0** in steady state; a persistent non-zero plateau = cells frozen by UAF-decline that only the reaper (past maxEntryAge) or a keying fix will clear — read next to `evict_max_age_total` (the reaper draining them) |
-| `warm_past_max_age` | **#315 C4.** a GAUGE of resident WARM cells (read within TTL or `SeededAtBoot`) that are ALSO past `maxEntryAge`. The read-independent pass deliberately does NOT cold-evict these (evicting a warm cell manufactures a cold nav — C3); it keeps them body-fresh via `proactive_refresh_total` but does not re-mint their key. The AT-RISK population (structural proxy, not a leak count) for the deferred age-triggered re-mint (C5 / #258) | **0** on a fast-roll pod (nothing outlives a day); a non-zero plateau on a long-lived pod = warm cells past the cap awaiting the deferred re-mint — read next to `evict_max_age_total` (the cold ones being reaped) |
+| `warm_past_max_age` | **#315 C4.** a GAUGE of resident WARM cells (read within TTL or `SeededAtBoot`) that are ALSO past `maxEntryAge`. The read-independent pass deliberately does NOT cold-evict these (evicting a warm cell manufactures a cold nav — C3); it keeps them body-fresh via `proactive_refresh_total` and (#378) re-mints their key when a refresh lands inside the lead window, so a cell is counted here only if no refresh was accepted in its window. The AT-RISK population (structural proxy, not a leak count) | **0** on a fast-roll pod (nothing outlives a day); a non-zero plateau on a long-lived pod = warm cells past the cap that no in-window refresh re-minted — read next to `evict_max_age_total` (the cold ones being reaped) |
 | `warm_seeded` | **#376.** a GAUGE of resident WARM cells that are warm because they were `SeededAtBoot` (the boot-prewarm set), recomputed on the same reaper walk as `warm_past_max_age`. Together with `warm_lastread` it decomposes the warm working set by SOURCE so `GetNoTouch`'s effect is observable | holds at the boot-prewarm set on an unbrowsed pod; read next to `warm_lastread` — if the lastRead bucket collapses toward 0 while this holds, internal reads are no longer faking warmth (the #376 fix is working) |
 | `warm_lastread` | **#376.** a GAUGE of resident WARM cells that are warm via a read-within-TTL `lastRead` and are NOT `SeededAtBoot` — i.e. kept warm by a genuine customer Get. Before #376, internal cache reads stamped `lastRead` and inflated this; after #376 (internal callers use `GetNoTouch`) only real customer reads keep a cell here | **collapses toward ~0 on an unbrowsed cluster** post-#376 (nothing but customer traffic keeps a cell in it); a healthy non-zero value on a browsed pod = the genuinely-served working set. A high value with no customer traffic = a regression reintroducing warmth-faking internal reads |
 | `proactive_refresh_total` | **#316.** a monotonic count of proactive refreshes ENQUEUED by the read-independent pass — warm, approaching-TTL cells (`TTLRemaining < TTL/4`) handed to the existing refresher, the read-independent backstop for a MISSED dirty-mark (fresh indexer, enqueue missed; a stale indexer is #244). Scoped to the warm working set, never refresh-everything | climbs steadily on a busy pod (the working set cycling through 3/4-TTL); read next to `snowplow_refresher.completed_total` (the refresher's dedup/rate-floor collapses these enqueues into far fewer re-resolves). A flat **0** on a pod serving traffic = the pass is inert |
@@ -340,10 +345,11 @@ Rules the mirror follows:
 
 - **Closed attributes (F8).** Every attribute comes from a code-defined set:
   `site` ∈ {restactions, widgets, seed, refresher}, `reason` ∈ {binding_set,
-  rbac_subgen, no_identity}, `outcome` ∈ {group, hitter, evicted}, `stat` ∈
+  rbac_subgen, no_identity}, `outcome` ∈ {group, hitter, evicted}, `class` ∈ {restactions, widgets,
+  widgetContent, apistage, raFullList} (#378 re-mint), `stat` ∈
   the learned-capacity inputs, `bound` ∈ {none, memory, engine}. No username,
-  group or Secret name is ever an attribute. The drift and re-pick counters
-  emit their full closed sets (zeros included), so their series sets never grow
+  group or Secret name is ever an attribute. The drift, re-pick and re-mint
+  counters emit their full closed sets (zeros included), so their series sets never grow
   with traffic.
 - **Cache-off.** Same CFG-1 rule as the expvar keys: under `CACHE_ENABLED`
   off, none of these series is registered (absent, not zero).
@@ -354,6 +360,7 @@ Rules the mirror follows:
 |---|---|---|---|
 | `snowplow_l1_identity_class_drift_declined_total{site,reason}` | counter (sum) | L1 Puts / re-Puts the #424 guard declined because the writer's identity no longer belongs to the RBAC class the key was minted for | low, non-zero rate on a cluster with RBAC churn (a grant/revoke landing mid-resolve). `no_identity` should stay 0 |
 | `snowplow_l1_representative_repick_total{outcome}` | counter (sum) | #444 refresher outcomes when a cell's recorded representative drifted out of its RBAC class: `group` (re-picked the canonical group representative), `hitter` (re-picked a recent hitter), `evicted` (no in-class representative; the cell was evicted). The evictions are also `snowplow_resolved_cache{stat=evict_no_representative_total}` (a gauge row, already on OTLP through the `snowplow_resolved_cache` mirror) | low; follows personal (User-subject) RBAC changes on representatives. `evicted` should stay well below `group` + `hitter` |
+| `snowplow_resolved_cache_remint_total{class}` | counter (sum) | **#378.** refresher-terminal re-mints (BornAt resets under the same key, inside the lead window `[maxAge − L, …)`), by `class` ∈ {restactions, widgets, widgetContent, apistage, raFullList} — the full closed set is emitted (zeros included). Their sum is `snowplow_resolved_cache{stat=remint_total}` | > 0 per class with a warm working set once a pod is older than `maxAge − L`; read with `evict_max_age_warm_customer_total` (must stay 0) |
 | `snowplow_binding_set_memo_hits` / `_misses` / `_refused` | counter (sum) | subject binding-set digest memo (#424). The memo shard swaps on every RBAC snapshot publish | hit ratio `hits/(hits+misses)` high once warm. `refused` = 0 (cap 4096 per shard) |
 | `snowplow_binding_set_memo_entries` | gauge | live entries in the current memo shard | ≈ active identities |
 | `snowplow_learned_classes_registered` / `_seeded` / `_unseeded_capacity` / `_nav_only` | gauge | learned identity classes (#262): in the registry, admitted with ≥1 distinct target, left out by the capacity bound, seeded nav-only at boot then dropped | `seeded` ≈ 0 on group-only RBAC clusters (a group-only member is not a distinct target) |
@@ -808,8 +815,8 @@ below passes vacuously when its series is missing, and a counter exported as a
 gauge (or the reverse) lands in the other table, where checks 2-5 would match
 nothing. So run this first. **Pass = zero rows.** Each row names a rolled pod
 (the roster is `snowplow_build_info`, which is always exported) that is missing
-one of the 14 (table, metric) pairs, or that has fewer than the full 4×3 drift
-or 3 repick series. `missing` lists what is absent. Step 0 is the single
+one of the 16 (table, metric) pairs, or that has fewer than the full 4×3 drift,
+3 repick or 5 re-mint class series, or fewer than the 5 #378 P1 store stats. `missing` lists what is absent. Step 0 is the single
 presence gate for every later step, including the three #368 counters step 6
 reads.
 
@@ -838,6 +845,8 @@ WITH
    'sum:snowplow_v7_shadow_wildcard_digest_collision_total',
    'sum:snowplow_v7_shadow_wildcard_digest_observed_total',
    'sum:snowplow_v7_shadow_wildcard_digest_evicted_total',
+   'sum:snowplow_resolved_cache_remint_total',
+   'gauge:snowplow_resolved_cache',
    'gauge:snowplow_learned_classes_registered',
    'gauge:snowplow_learned_classes_seeded',
    'gauge:snowplow_learned_classes_from_secrets',
@@ -845,13 +854,18 @@ WITH
    'gauge:snowplow_learned_clientconfig_secrets'] AS expected
 SELECT r.pod,
        arrayFilter(x -> NOT has(s.present, x), expected) AS missing,
-       s.drift_series, s.repick_series
+       s.drift_series, s.repick_series, s.remint_series, s.p1_stats
 FROM roster AS r
 LEFT JOIN (
   SELECT pod,
          groupUniqArray(concat(tbl, ':', MetricName)) AS present,
          uniqExactIf(toString(Attributes), MetricName = 'snowplow_l1_identity_class_drift_declined_total') AS drift_series,
-         uniqExactIf(toString(Attributes), MetricName = 'snowplow_l1_representative_repick_total') AS repick_series
+         uniqExactIf(toString(Attributes), MetricName = 'snowplow_l1_representative_repick_total') AS repick_series,
+         -- #378 P1: the 5-class re-mint counter and the five store stats.
+         uniqExactIf(toString(Attributes), MetricName = 'snowplow_resolved_cache_remint_total') AS remint_series,
+         uniqExactIf(Attributes['stat'], MetricName = 'snowplow_resolved_cache' AND Attributes['stat'] IN
+           ('evict_max_age_warm_customer_total', 'evict_max_age_warm_internal_total',
+            'evict_ttl_warm_customer_total', 'oldest_warm_born_age_seconds', 'remint_total')) AS p1_stats
   FROM (
     SELECT 'sum' AS tbl, ResourceAttributes['k8s.pod.name'] AS pod, MetricName, Attributes
     FROM otel_metrics_sum
@@ -871,12 +885,15 @@ LEFT JOIN (
 WHERE length(arrayFilter(x -> NOT has(s.present, x), expected)) > 0
    OR s.drift_series < 12
    OR s.repick_series < 3
+   OR s.remint_series < 5
+   OR s.p1_stats < 5
 UNION ALL
 -- An empty roster is a FAILURE row, never a silent pass: no pod has exported
 -- snowplow_build_info since {since} (nothing rolled, wrong {since}, or
 -- metrics export off).
 SELECT concat('NO ROLLED POD since ', toString({since})) AS pod, expected AS missing,
-       toUInt64(0) AS drift_series, toUInt64(0) AS repick_series
+       toUInt64(0) AS drift_series, toUInt64(0) AS repick_series,
+       toUInt64(0) AS remint_series, toUInt64(0) AS p1_stats
 WHERE (SELECT count() FROM roster) = 0
 ```
 

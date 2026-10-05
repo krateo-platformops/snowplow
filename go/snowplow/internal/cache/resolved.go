@@ -717,6 +717,26 @@ type ResolvedCacheStore struct {
 	warmSeededGauge   atomic.Uint64
 	warmLastReadGauge atomic.Uint64
 
+	// #378 — the warm-cell cap detectors. A maxAge / TTL eviction of a WARM cell
+	// (warmLocked: seeded, or read within the TTL) on the CUSTOMER read path is a
+	// cold navigation the working set did not deserve; evictMaxAgeWarmCustomerTotal
+	// is the owner's P5 trigger (non-zero after P1 on an exercised pod = re-mint
+	// did not cover the cell). The internal twin counts the same evict on the
+	// GetNoTouch path (the refresher dequeue / seed sweeps), which no customer saw.
+	// Monotonic; evict_max_age_total / evict_ttl_total are unchanged supersets.
+	evictMaxAgeWarmCustomerTotal atomic.Uint64
+	evictMaxAgeWarmInternalTotal atomic.Uint64
+	evictTTLWarmCustomerTotal    atomic.Uint64
+	// #378 — the SCOPE gauge: the oldest BornAt age (whole seconds) over the
+	// WARM cells of the last reaper walk, 0 when none. A zero detector reading is
+	// evidence only once this exceeds maxEntryAge − remintLead (the window was
+	// exercised on this pod).
+	oldestWarmBornAgeGauge atomic.Uint64
+	// #378 — accepted refresher-terminal writes that RE-MINTED (reset BornAt);
+	// remintByClass splits it over the closed RemintClasses set.
+	remintTotal   atomic.Uint64
+	remintByClass [len(RemintClasses)]atomic.Uint64
+
 	// #316 — proactive refreshes ENQUEUED by the read-independent pass (a warm,
 	// approaching-TTL cell handed to the existing refresher). Monotonic counter,
 	// the pass's falsifier readout: non-zero DURING a missed-dirty-mark defect
@@ -1290,6 +1310,10 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 	// degraded catalog entry self-evicts within the bound. Zero override =
 	// the standard ttl (every healthy entry).
 	if eff := c.effectiveTTLLocked(item.entry); eff > 0 && now.Sub(item.entry.CreatedAt) > eff {
+		// #378 — evaluated on the PRIOR read-recency, before the removal.
+		if touch && c.warmLocked(item, now) {
+			c.evictTTLWarmCustomerTotal.Add(1)
+		}
 		c.removeElementLocked(el)
 		c.evictTTLTotal.Add(1)
 		if touch {
@@ -1305,7 +1329,20 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 	// from-scratch resolve. Counted separately from TTL so the two reasons
 	// for leaving stay distinguishable. KEPT on the GetNoTouch path too (the
 	// internal-read orphan backstop).
+	//
+	// #378 — a WARM cell evicted here is split by reader: on the customer path it
+	// is a cold navigation of the working set (the owner's P5 trigger); on the
+	// GetNoTouch path no customer saw it. The refresher terminal re-mints a cell
+	// it refreshes inside the lead window (ReplaceIfGenRefresh), so a warm cell
+	// reaching this line under a customer is one the re-mint did not cover.
 	if c.maxEntryAge > 0 && !item.entry.BornAt.IsZero() && now.Sub(item.entry.BornAt) > c.maxEntryAge {
+		if c.warmLocked(item, now) {
+			if touch {
+				c.evictMaxAgeWarmCustomerTotal.Add(1)
+			} else {
+				c.evictMaxAgeWarmInternalTotal.Add(1)
+			}
+		}
 		c.removeElementLocked(el)
 		c.evictMaxAgeTotal.Add(1)
 		if touch {
@@ -1501,39 +1538,37 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 	return true
 }
 
-// ReplaceIfGenReMint is the #258/#378 re-mint variant of ReplaceIfGen: a
-// gen-guarded REPLACE of a LIVE cell that RESETS BornAt (a fresh birth). It is the
-// SOLE freshMint=true carrier — ordinary refresh / keepwarm / seed / serve Puts
-// (Put/PutIfGen/ReplaceIfGen pass freshMint=false, hardcoded) can NEVER reset the
-// max-age clock, so the C5 / #259 anchor holds by construction; the single-setter
-// audit is a static grep of ReplaceIfGenReMint callers (expected: exactly one,
-// dispatchers seedTerminalPut in seedModeReMint — TestReMint_SingleSetterAudit).
+// ReplaceIfGenRefresh is the REFRESHER TERMINAL write (#378): ReplaceIfGen —
+// a generation-guarded REPLACE of a LIVE cell that never inserts — plus the
+// age-triggered RE-MINT. If the resident cell's BornAt age is at or past the
+// lead-window start (maxEntryAge − remintLead()), the accepted replace RESETS
+// BornAt (a fresh birth under the SAME key); otherwise it inherits BornAt like
+// every other write. The decision is taken under c.mu from the resident entry,
+// in the same critical section as the generation check and the write, so no
+// other write can move BornAt between the decision and the replace.
 //
-// ARCHITECTURAL INVARIANT (arch C5 condition a — load-bearing): the re-mint TARGET
-// Put MUST be THIS explicit call from the seed primitive's terminal write
-// (seedTerminalPut), via resolve-to-bytes-THEN-Put; it MUST NOT be routed through the resolve pipeline's generic PutIfGen.
-// Nested Puts during a re-mint resolve go through the generic (freshMint=false)
-// methods, so freshMint can never reach a nested cell — that is exactly what makes
-// a key-scoped ctx marker unnecessary (arch dropped it). If a future change routes
-// the target Put through the pipeline, this invariant breaks and a key-scoped
-// fresh-mint marker (or equivalent) must return.
+// WHY THE REFRESHER. The C5 cap stays HARD (owner Q1): Get evicts any cell past
+// maxEntryAge. A cell the refresher keeps body-fresh would otherwise reach the
+// cap under a customer — a cold navigation of a warm cell, every 24h. The
+// refresher terminal is the write that already re-resolves the cell from
+// scratch under its current representative, after every decline gate (stage
+// error, external, UAF, sensitive) and the #424 identity-class guard, and under
+// #375's PUT-THEN-REMARK — so a re-mint here is a from-scratch resolve of the
+// same key with every freshness and isolation guarantee the refresh already
+// carries. No extra resolve is ever spent on a re-mint (F4a).
 //
-// Resolve-FIRST-then-atomic-replace: the old cell keeps serving until this replace
-// lands (no evict, no cold-nav window). Refuses on absent / gen-moved exactly like
-// ReplaceIfGen. The generation moves ONLY on removal (Put / PutIfGen / ReplaceIfGen
-// keep it), so a false return means the cell was REMOVED during the re-mint
-// resolve: it is absent, or a customer already re-filled it with a fresh BornAt.
-// Either way there is nothing left to re-mint, so the caller does NOT retry or
-// re-enqueue (this supersedes arch C5 condition e; see seed_terminal_put_guard.go).
+// SINGLE SETTER. This is the ONLY entry point that passes freshMint=true to
+// putCoreLocked; Put, PutIfGen, ReplaceIfGen, PutThenRemark and the raFullList
+// Puts hardcode false, so keepwarm / seed / gvr-discovered / #258 / customer
+// writes can never extend the cap. TestReMint_SingleSetterAudit pins exactly one
+// production caller: resolveAndPopulateL1's terminal write (resolve_populate.go).
 //
-// #375 (arch C5 condition f): like PutIfGen / ReplaceIfGen, this gen-guarded Put
-// takes the resolve ctx and, on ACCEPT, runs #375's PUT-THEN-REMARK off-lock
-// (remarkIfDepsMoved) against the per-resolve dep-gen sink the seed installed at
-// its resolve entry. ctx is the #375 dep-sink carrier ONLY — it never selects
-// freshMint (the dropped fresh-mint marker stays dropped). #375's arm-9 reflective
-// enumeration of the gen-guarded Put methods covers this one.
-// Returns true iff stored.
-func (c *ResolvedCacheStore) ReplaceIfGenReMint(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+// #375 — like PutIfGen / ReplaceIfGen it takes the resolve ctx and, on ACCEPT,
+// runs remarkIfDepsMoved off-lock: a dep that moved during the re-mint resolve
+// remarks the key, and the follow-up refresh (BornAt age ≈ 0) inherits the new
+// birth. #375's arm-9 reflective enumeration covers this method. Returns true
+// iff stored.
+func (c *ResolvedCacheStore) ReplaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
 		return false
 	}
@@ -1547,15 +1582,24 @@ func (c *ResolvedCacheStore) ReplaceIfGenReMint(ctx context.Context, key string,
 	c.mu.Lock()
 	el, live := c.index[key]
 	if !live || el.Value.(*lruItem).gen != capturedGen {
+		// Absent or gen-moved: refuse exactly like ReplaceIfGen.
 		c.putRefusedGenerationMovedTotal.Add(1)
 		c.mu.Unlock()
 		return false
 	}
+	now := time.Now()
+	freshMint := c.inRemintWindowLocked(el.Value.(*lruItem), now)
+	if freshMint {
+		// A fresh birth NOW (not the caller's CreatedAt, which may have been
+		// stamped earlier): putCoreLocked's freshMint branch keeps entry.BornAt.
+		entry.BornAt = now
+	}
 	clearRefreshSuppression(key)
-	// freshMint=true is INHERENT to the re-mint method (not computed from ctx): a
-	// fresh birth on the same-key REPLACE resets the max-age clock.
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
-	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, true)
+	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, freshMint)
+	if freshMint {
+		c.noteRemintLocked(entry)
+	}
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
 	c.mu.Unlock()
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
@@ -1563,6 +1607,82 @@ func (c *ResolvedCacheStore) ReplaceIfGenReMint(ctx context.Context, key string,
 	// #406 — see PutIfGen.
 	remarkLayerConsumers(layerRemarks)
 	return true
+}
+
+// remintLead is the #378 lead L: how long before the cap the refresher terminal
+// starts re-minting. min(TTL, maxEntryAge/2) — no env knob; it self-adapts to
+// the two bounds already configured. TTL, because a warm cell is refreshed at
+// least once per TTL (dirty-marks, or #316 past 3/4·TTL), so a window one TTL
+// wide contains a refresh of every warm cell; maxEntryAge/2, so no cell is
+// re-minted in the first half of its life.
+func (c *ResolvedCacheStore) remintLead() time.Duration {
+	lead := c.maxEntryAge / 2
+	if c.ttl > 0 && c.ttl < lead {
+		lead = c.ttl
+	}
+	return lead
+}
+
+// inRemintWindowLocked is the #378 freshMint predicate over the RESIDENT item:
+// maxEntryAge enabled, a known birth, and a BornAt age at or past
+// maxEntryAge − remintLead(). Callers hold c.mu.
+func (c *ResolvedCacheStore) inRemintWindowLocked(item *lruItem, now time.Time) bool {
+	if c.maxEntryAge <= 0 || item == nil || item.entry == nil || item.entry.BornAt.IsZero() {
+		return false
+	}
+	return now.Sub(item.entry.BornAt) >= c.maxEntryAge-c.remintLead()
+}
+
+// RemintClasses is the CLOSED class set of snowplow_resolved_cache_remint_total
+// on OTLP (#378): every L1 cell class the refresher re-Puts. A re-mint of a
+// class outside it still counts in remint_total, never as a new series.
+var RemintClasses = [...]string{"restactions", "widgets", CacheEntryClassWidgetContent, CacheEntryClassApistage, CacheEntryClassRAFullList}
+
+// noteRemintLocked counts one accepted re-mint, by class. Callers hold c.mu.
+func (c *ResolvedCacheStore) noteRemintLocked(entry *ResolvedEntry) {
+	c.remintTotal.Add(1)
+	if entry == nil || entry.Inputs == nil {
+		return
+	}
+	for i, class := range RemintClasses {
+		if entry.Inputs.CacheEntryClass == class {
+			c.remintByClass[i].Add(1)
+			return
+		}
+	}
+}
+
+// RemintClassCell is one {class, count} re-mint total.
+type RemintClassCell struct {
+	Class string
+	Count uint64
+}
+
+// ResolvedCacheRemintByClass returns every class of RemintClasses with its live
+// re-mint count from the PUBLISHED store (non-constructing, like
+// ResolvedCacheStatsByStat), zeros included, so the OTLP series set is fixed by
+// construction. Before the store is built every count is 0.
+func ResolvedCacheRemintByClass() []RemintClassCell {
+	out := make([]RemintClassCell, len(RemintClasses))
+	c := resolvedCachePublished.Load()
+	for i, class := range RemintClasses {
+		out[i].Class = class
+		if c != nil {
+			out[i].Count = c.remintByClass[i].Load()
+		}
+	}
+	return out
+}
+
+// warmLocked is THE warm predicate (#315/#316/#378): a cell is WARM iff it is a
+// boot-seed cell, or a customer read it within the store TTL. One definition for
+// the reaper walk, the cold-reap re-validation and the getCore warm-evict
+// detectors, so they cannot drift. Callers hold c.mu (lastRead is written under it).
+func (c *ResolvedCacheStore) warmLocked(item *lruItem, now time.Time) bool {
+	if item == nil || item.entry == nil {
+		return false
+	}
+	return item.entry.SeededAtBoot || (!item.lastRead.IsZero() && c.ttl > 0 && now.Sub(item.lastRead) < c.ttl)
 }
 
 // CaptureGen returns key's current generation, to be threaded into a later
@@ -1673,11 +1793,12 @@ func (c *ResolvedCacheStore) putPreamble(entry *ResolvedEntry) (bytes int64, ext
 // per-key generation (item.gen = gen) in BOTH branches (#189) and dropping any
 // tombstone for key (a live entry supersedes its tombstone). Callers MUST hold
 // c.mu; bytes/extrasHash are from putPreamble.
-// freshMint (#258/#378 re-mint): when true, a replace-in-place Put RESETS BornAt
-// (fresh birth) instead of inheriting the prior entry's BornAt. It is a hardcoded
-// constant per entry point: ReplaceIfGenReMint passes true; Put, PutIfGen and
-// ReplaceIfGen pass false (the ctx marker was dropped, arch C5). Only the re-mint
-// method reaches true (single-setter), so ordinary refresh/keepwarm/seed re-Puts
+// freshMint (#378 re-mint): when true, a replace-in-place Put RESETS BornAt
+// (fresh birth) instead of inheriting the prior entry's BornAt. Only
+// ReplaceIfGenRefresh (the refresher terminal) passes a computed value — true iff
+// the resident cell is inside the lead window, decided under c.mu; Put, PutIfGen,
+// ReplaceIfGen, PutThenRemark and the raFullList Puts hardcode false
+// (single-setter), so keepwarm / seed / gvr-discovered / #258 / customer re-Puts
 // keep inheriting BornAt (the C5 / #259 max-age anchor is intact by construction).
 func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, bytes int64, extrasHash string, gen uint64, freshMint bool) {
 	// #189 — a live entry supersedes any tombstone for its key.
@@ -1729,8 +1850,10 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 			c.curBytes -= old.bytes
 		}
 		// 1.12.6 C5 — the lifetime clock belongs to the KEY, not the bytes:
-		// inherit the prior birth so a re-Put (refresher, keep-warm sweep,
-		// user traffic) extends the TTL but never the max age.
+		// inherit the prior birth so a re-Put (keep-warm sweep, seeds, user
+		// traffic, a refresher re-Put before the #378 lead window) extends the
+		// TTL but never the max age. The one exception is freshMint: the
+		// refresher terminal inside the lead window (ReplaceIfGenRefresh).
 		if !freshMint && old.entry != nil && !old.entry.BornAt.IsZero() {
 			entry.BornAt = old.entry.BornAt
 		}
@@ -1739,9 +1862,9 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		if old.entry != nil && old.entry != entry && entry.recentHitters.Load() == nil {
 			entry.recentHitters.Store(old.entry.recentHitters.Load())
 		}
-		// freshMint re-mint (#258/#378): skip the inherit → entry.BornAt stays the
-		// fresh CreatedAt stamped in putPreamble → the replace-in-place is a FRESH
-		// birth (resets the max-age clock) without evicting first (no cold window).
+		// freshMint re-mint (#378): skip the inherit → entry.BornAt stays the fresh
+		// birth ReplaceIfGenRefresh stamped → the replace-in-place is a FRESH birth
+		// (resets the max-age clock) without evicting first (no cold window).
 		old.entry = entry
 		old.bytes = bytes
 		// #247 — derived from entry, so it is re-stamped with entry. A
@@ -1933,7 +2056,9 @@ type ResolvedCacheStats struct {
 	// #315 C4 — resident WARM cells past maxEntryAge, un-re-minted (see
 	// warmPastMaxAgeGauge). AT-RISK population the cold-evict deliberately keeps
 	// (C3) and #316 keeps body-fresh; off-zero => warm cells outliving the cap
-	// without a from-scratch re-mint (re-mint deferred to C5/#258).
+	// without a from-scratch re-mint (#378: the refresher terminal re-mints in
+	// the lead window, so a warm cell reaches this gauge only if no refresh
+	// landed in its window).
 	WarmPastMaxAge uint64
 
 	// #376 — resident WARM cells split by warmth SOURCE, recomputed on the same
@@ -1945,6 +2070,16 @@ type ResolvedCacheStats struct {
 	// while WarmSeeded holds at the boot-prewarm set. GAUGES, not totals.
 	WarmSeeded   uint64
 	WarmLastRead uint64
+
+	// #378 — warm-cell cap detectors (see evictMaxAgeWarmCustomerTotal). The
+	// customer maxAge one is the owner's P5 trigger.
+	EvictMaxAgeWarmCustomerTotal uint64
+	EvictMaxAgeWarmInternalTotal uint64
+	EvictTTLWarmCustomerTotal    uint64
+	// #378 — GAUGE: oldest BornAt age (s) over warm cells, last reaper walk.
+	OldestWarmBornAgeSeconds uint64
+	// #378 — refresher-terminal re-mints (BornAt resets) accepted.
+	RemintTotal uint64
 
 	// #316 — proactive refreshes enqueued by the read-independent pass (see
 	// proactiveRefreshTotal). Monotonic; non-zero DURING a missed-dirty-mark
@@ -1999,34 +2134,39 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 	maxResidentBytes := c.maxResidentBytes
 	c.mu.Unlock()
 	return ResolvedCacheStats{
-		Entries:                    entries,
-		Bytes:                      bytes,
-		MaxEntries:                 c.maxEntries,
-		MaxBytes:                   c.maxBytes,
-		HitTotal:                   c.hitTotal.Load(),
-		MissTotal:                  c.missTotal.Load(),
-		StoreTotal:                 c.storeTotal.Load(),
-		EvictLRUTotal:              c.evictLRUTotal.Load(),
-		EvictTTLTotal:              c.evictTTLTotal.Load(),
-		EvictMaxAgeTotal:           c.evictMaxAgeTotal.Load(),
-		EvictNoRepresentativeTotal: c.evictNoRepresentativeTotal.Load(),
-		EvictDeleteTotal:           c.evictDeleteTotal.Load(),
-		SuppressedResident:         c.suppressedResidentGauge.Load(),
-		WarmPastMaxAge:             c.warmPastMaxAgeGauge.Load(),
-		WarmSeeded:                 c.warmSeededGauge.Load(),
-		WarmLastRead:               c.warmLastReadGauge.Load(),
-		ProactiveRefreshTotal:      c.proactiveRefreshTotal.Load(),
-		ApistageStoreTotal:         c.apistageStoreTotal.Load(),
-		ApistageEvictTotal:         c.apistageEvictTotal.Load(),
-		WidgetContentStoreTotal:    c.widgetContentStoreTotal.Load(),
-		WidgetContentEvictTotal:    c.widgetContentEvictTotal.Load(),
-		RAFullListStoreTotal:       c.raFullListStoreTotal.Load(),
-		RAFullListEvictTotal:       c.raFullListEvictTotal.Load(),
-		ResidentEntries:            residentEntries,
-		ResidentBytes:              residentBytes,
-		MaxResidentBytes:           maxResidentBytes,
-		ResidentPinTotal:           c.residentPinTotal.Load(),
-		ResidentDemoteTotal:        c.residentDemoteTotal.Load(),
+		Entries:                      entries,
+		Bytes:                        bytes,
+		MaxEntries:                   c.maxEntries,
+		MaxBytes:                     c.maxBytes,
+		HitTotal:                     c.hitTotal.Load(),
+		MissTotal:                    c.missTotal.Load(),
+		StoreTotal:                   c.storeTotal.Load(),
+		EvictLRUTotal:                c.evictLRUTotal.Load(),
+		EvictTTLTotal:                c.evictTTLTotal.Load(),
+		EvictMaxAgeTotal:             c.evictMaxAgeTotal.Load(),
+		EvictNoRepresentativeTotal:   c.evictNoRepresentativeTotal.Load(),
+		EvictDeleteTotal:             c.evictDeleteTotal.Load(),
+		SuppressedResident:           c.suppressedResidentGauge.Load(),
+		WarmPastMaxAge:               c.warmPastMaxAgeGauge.Load(),
+		WarmSeeded:                   c.warmSeededGauge.Load(),
+		WarmLastRead:                 c.warmLastReadGauge.Load(),
+		EvictMaxAgeWarmCustomerTotal: c.evictMaxAgeWarmCustomerTotal.Load(),
+		EvictMaxAgeWarmInternalTotal: c.evictMaxAgeWarmInternalTotal.Load(),
+		EvictTTLWarmCustomerTotal:    c.evictTTLWarmCustomerTotal.Load(),
+		OldestWarmBornAgeSeconds:     c.oldestWarmBornAgeGauge.Load(),
+		RemintTotal:                  c.remintTotal.Load(),
+		ProactiveRefreshTotal:        c.proactiveRefreshTotal.Load(),
+		ApistageStoreTotal:           c.apistageStoreTotal.Load(),
+		ApistageEvictTotal:           c.apistageEvictTotal.Load(),
+		WidgetContentStoreTotal:      c.widgetContentStoreTotal.Load(),
+		WidgetContentEvictTotal:      c.widgetContentEvictTotal.Load(),
+		RAFullListStoreTotal:         c.raFullListStoreTotal.Load(),
+		RAFullListEvictTotal:         c.raFullListEvictTotal.Load(),
+		ResidentEntries:              residentEntries,
+		ResidentBytes:                residentBytes,
+		MaxResidentBytes:             maxResidentBytes,
+		ResidentPinTotal:             c.residentPinTotal.Load(),
+		ResidentDemoteTotal:          c.residentDemoteTotal.Load(),
 
 		PutRefusedGenerationMovedTotal: c.putRefusedGenerationMovedTotal.Load(),
 
@@ -2280,6 +2420,15 @@ func (c *ResolvedCacheStore) RangeMetadata(fn func(ResolvedEntryMeta) bool) {
 // stalls every /call for the walk's duration; this bounds the stall to one
 // batch (numbers: TestIssue1126_C3_FU4 and the developer report).
 func (c *ResolvedCacheStore) RangeMetadataBatched(batch int, fn func(metas []ResolvedEntryMeta, held time.Duration) bool) (snapshotHeld time.Duration) {
+	return c.rangeMetadataBatched(batch, func(metas []ResolvedEntryMeta, _ []bool, held time.Duration) bool {
+		return fn(metas, held)
+	})
+}
+
+// rangeMetadataBatched is RangeMetadataBatched plus, per meta, the warmLocked
+// verdict taken under the same batch hold (#378: one warm predicate for the
+// reaper walk, getCore and the cold-reap re-validation). warms[i] is metas[i]'s.
+func (c *ResolvedCacheStore) rangeMetadataBatched(batch int, fn func(metas []ResolvedEntryMeta, warms []bool, held time.Duration) bool) (snapshotHeld time.Duration) {
 	if c == nil || batch <= 0 {
 		return 0
 	}
@@ -2299,6 +2448,7 @@ func (c *ResolvedCacheStore) RangeMetadataBatched(batch int, fn func(metas []Res
 		chunk := keys[:n]
 		keys = keys[n:]
 		metas := make([]ResolvedEntryMeta, 0, n)
+		warms := make([]bool, 0, n)
 		now := time.Now()
 		t1 := time.Now()
 		c.mu.Lock()
@@ -2307,10 +2457,12 @@ func (c *ResolvedCacheStore) RangeMetadataBatched(batch int, fn func(metas []Res
 			if !ok {
 				continue // evicted since the snapshot
 			}
-			metas = append(metas, c.metaForItemLocked(el.Value.(*lruItem), now))
+			item := el.Value.(*lruItem)
+			metas = append(metas, c.metaForItemLocked(item, now))
+			warms = append(warms, c.warmLocked(item, now))
 		}
 		c.mu.Unlock()
-		if !fn(metas, time.Since(t1)) {
+		if !fn(metas, warms, time.Since(t1)) {
 			return snapshotHeld
 		}
 	}
@@ -2832,8 +2984,15 @@ var proactiveRefreshDisabledForTest atomic.Bool
 //
 // C3 — a WARM cell past maxEntryAge is NEVER reaped (that would manufacture a cold
 // nav); it is counted into warmPastMaxAgeGauge (the AT-RISK detector) and, if
-// approaching TTL, kept body-fresh by the #316 refresh. Its age-triggered key
-// RE-MINT is the deferred C5 sibling of #258.
+// approaching TTL, kept body-fresh by the #316 refresh. #378: the age-triggered
+// RE-MINT is carried by the refresher terminal (ReplaceIfGenRefresh), which resets
+// BornAt on an accepted refresh inside the lead window [maxAge − L, …), so a warm
+// cell the refresher keeps fresh reaches neither this gauge nor the cap.
+//
+// #378 — the walk also publishes oldestWarmBornAgeGauge: the max LifetimeSeconds
+// over WARM cells (0 if none). It is the scope of the warm-evict detectors: a zero
+// evict_max_age_warm_customer_total is evidence only on a pod where this exceeded
+// maxEntryAge − L.
 //
 // SCOPE DISCIPLINE (feedback: customer-over-refresher, refresher-populate-
 // amplification 0.30.185): refresh is scoped to the WARM working set only, NEVER
@@ -2858,10 +3017,11 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	refreshBelow := ttlSec / 4 // enqueue a warm cell once past ~3/4 of its TTL
 	suppressedResident := 0
 	warmPastMaxAge := 0
-	warmSeeded := 0   // #376 — resident warm cells that are warm via SeededAtBoot
-	warmLastRead := 0 // #376 — resident warm cells warm via read-within-TTL lastRead, not seeded
+	warmSeeded := 0      // #376 — resident warm cells that are warm via SeededAtBoot
+	warmLastRead := 0    // #376 — resident warm cells warm via read-within-TTL lastRead, not seeded
+	var oldestWarm int64 // #378 scope gauge
 	var suppressedCandidates, coldCandidates, refreshCandidates []string
-	c.RangeMetadataBatched(reapMaxAgeBatch, func(metas []ResolvedEntryMeta, _ time.Duration) bool {
+	c.rangeMetadataBatched(reapMaxAgeBatch, func(metas []ResolvedEntryMeta, warms []bool, _ time.Duration) bool {
 		for i := range metas {
 			m := metas[i]
 			// WARM = seeded OR read within the store TTL. The lastRead branch is
@@ -2876,7 +3036,13 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 			// knife-edge. Counting such a cell warm is what keeps C3 from cold-
 			// evicting a genuinely-served cell and keeps the C4 gauge honest;
 			// TestIssue315_LastReadWarmPastMaxAge_NotEvicted exercises this exact path.
-			warm := m.SeededAtBoot || (m.LastReadSeconds >= 0 && ttlSec > 0 && m.LastReadSeconds < ttlSec)
+			//
+			// #378 — the verdict is warmLocked, evaluated per item under the batch
+			// hold (the same predicate getCore and reapOneMaxAgeCold use).
+			warm := warms[i]
+			if warm && m.LifetimeSeconds > oldestWarm {
+				oldestWarm = m.LifetimeSeconds
+			}
 			// #376 — decompose the warm set by SOURCE over this same walk. Seeded wins
 			// the split (a cell can be both seeded and recently read; the boot-prewarm
 			// identity is the stable one). The else-branch reaches warmLastRead only
@@ -2905,7 +3071,7 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 			case pastMaxAge && !warm:
 				coldCandidates = append(coldCandidates, m.KeyHash) // #315 cold-evict
 			case pastMaxAge && warm:
-				warmPastMaxAge++ // #315 C4 — kept (C3), re-mint deferred
+				warmPastMaxAge++ // #315 C4 — kept (C3); #378: no refresh re-minted it in its window
 			}
 			// #316 — proactive refresh, orthogonal to the maxAge axis: any WARM,
 			// non-suppressed cell (within OR past maxAge) whose body is approaching
@@ -2931,8 +3097,9 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	})
 	c.suppressedResidentGauge.Store(uint64(suppressedResident))
 	c.warmPastMaxAgeGauge.Store(uint64(warmPastMaxAge))
-	c.warmSeededGauge.Store(uint64(warmSeeded))     // #376
-	c.warmLastReadGauge.Store(uint64(warmLastRead)) // #376
+	c.warmSeededGauge.Store(uint64(warmSeeded))        // #376
+	c.warmLastReadGauge.Store(uint64(warmLastRead))    // #376
+	c.oldestWarmBornAgeGauge.Store(uint64(oldestWarm)) // #378
 
 	reaped := 0
 	for _, key := range suppressedCandidates {
@@ -3043,9 +3210,7 @@ func (c *ResolvedCacheStore) reapOneMaxAgeCold(key string) bool {
 		return false // young / re-validated within cap
 	}
 	// C3 re-validation: a Get between the walk and now stamps lastRead=now → warm.
-	now := time.Now()
-	warm := item.entry.SeededAtBoot || (!item.lastRead.IsZero() && c.ttl > 0 && now.Sub(item.lastRead) < c.ttl)
-	if warm {
+	if c.warmLocked(item, time.Now()) {
 		return false // served/seeded since the walk — NEVER evict a warm cell (C3)
 	}
 	c.removeElementLocked(el)

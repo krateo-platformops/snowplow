@@ -416,8 +416,8 @@ func TestIssue375_Arm8_RefresherReResolveSelfRemark_Bounded(t *testing.T) {
 // ---------------------------------------------------------------------------
 // arm-9 — COVERAGE-ENUM, STRUCTURAL. Reflect over *ResolvedCacheStore at test time:
 // EVERY generation-guarded Put method (name contains "IfGen" — PutIfGen,
-// ReplaceIfGen, PutRAFullListIfGen, and any future one, e.g. #258's
-// ReplaceIfGenReMint) must (1) take a context.Context first (it cannot reach the
+// ReplaceIfGen, PutRAFullListIfGen, ReplaceIfGenRefresh (#378), and any future
+// one) must (1) take a context.Context first (it cannot reach the
 // resolve's sink otherwise) and (2) invoke the dep-gen check on ACCEPT — proven
 // behaviourally by an accepted call on a NIL-sink ctx bumping unguarded_put_total
 // and remarking exactly once. A new gen-guarded Put added unwired goes RED here with
@@ -484,7 +484,7 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 			t.Errorf("#375 arm-9 RED: accepted %s on a NIL-sink ctx remarked %d times, want 1", m.Name, got)
 		}
 	}
-	for _, must := range []string{"PutIfGen", "ReplaceIfGen", "PutRAFullListIfGen", "ReplaceIfGenReMint"} {
+	for _, must := range []string{"PutIfGen", "ReplaceIfGen", "PutRAFullListIfGen", "ReplaceIfGenRefresh"} {
 		found := false
 		for _, n := range covered {
 			found = found || n == must

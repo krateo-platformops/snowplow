@@ -40,8 +40,8 @@
 // after the first-nav latch) a boot-mode Put is a PutIfGen like every other
 // post-readyz mode.
 //
-// #258 / #378 RESEED MODES — the same guard, one mechanism. The two reseed modes
-// are post-readyz seeds like keepwarm / gvr-discovered and write their ONE final
+// #258 RESEED MODE — the same guard, one mechanism. The reseed mode is a
+// post-readyz seed like keepwarm / gvr-discovered and writes its ONE final
 // target cell through this file too; there is no second terminal-Put path:
 //
 //	mode                  terminal write              why
@@ -54,27 +54,17 @@
 //	                                                  this is an INSERT with a fresh
 //	                                                  BornAt (putPreamble) — no
 //	                                                  fresh-mint needed
-//	seedModeReMint        ReplaceIfGenReMint(resCtx)  #378: same-key REPLACE of a
-//	                                                  live cell, resets BornAt
 //
 // Every gen-guarded write passes resCtx, so it is under #375's put-then-remark,
-// and every write (re-mint included) runs after the #424 identity-class guard.
-// seedTerminalPut is the SOLE production caller of ReplaceIfGenReMint (the C5
-// single-setter audit, TestReMint_SingleSetterAudit). The fresh-mint write
-// governs only the primitive's own final Put: nested apistage / RA Puts made
-// during the resolve go through the store's generic freshMint=false methods, so a
-// re-mint can never reach a nested cell (the resolved.go ReplaceIfGenReMint
-// invariant; pinned by the real nested-resolve arm).
+// and every write runs after the #424 identity-class guard. NO seed write resets
+// BornAt (#378): every mode above inherits it on a resident cell; the only
+// re-mint is the refresher terminal's cache.ReplaceIfGenRefresh
+// (TestReMint_SingleSetterAudit).
 //
-// REFUSAL HANDLING per mode. keepwarm / gvr-discovered / rbacShift take the #394
-// one-shot inline re-seed (reseedAfterTerminalPutRefusal): the retry recaptures
-// the generation and PutIfGen can INSERT, so a cell removed mid-resolve is
-// re-filled once. seedModeReMint does NOT retry: a refused ReplaceIfGenReMint
-// means the cell was REMOVED (the generation moves only on removal — Put,
-// PutIfGen and ReplaceIfGen keep it, resolved.go putCoreLocked / CaptureGen), so
-// it is either absent now (the retry's ReplaceIfGenReMint refuses an absent key
-// by definition) or a customer already re-filled it with a fresh BornAt (nothing
-// left to re-mint). A retry can only waste a resolve; the removal is authoritative.
+// REFUSAL HANDLING. keepwarm / gvr-discovered / rbacShift take the #394 one-shot
+// inline re-seed (reseedAfterTerminalPutRefusal): the retry recaptures the
+// generation and PutIfGen can INSERT, so a cell removed mid-resolve is re-filled
+// once.
 package dispatchers
 
 import (
@@ -108,10 +98,6 @@ type seedTerminalGuard struct {
 	// seeding the RA content tail after the first-nav latch, so its Puts can land
 	// post-readyz), otherwise a plain Put plus the #375 remark (PutThenRemark).
 	boot bool
-	// reMint (#378, seedModeReMint only; implies guarded) selects
-	// ReplaceIfGenReMint(gen) over PutIfGen: a same-key REPLACE of a live cell
-	// that resets BornAt. Never set for any other mode.
-	reMint bool
 	// gen is the cell's generation captured at seed entry (CaptureGen).
 	gen uint64
 }
@@ -126,14 +112,10 @@ type seedTerminalGuard struct {
 //     and the Put re-checks cache.IsPhase1Done (#408): see seedTerminalPut.
 //   - seedModeBoot AFTER /readyz (#408): guarded. The boot scope keeps seeding
 //     the RA content tail after the first-nav latch flips /readyz.
-//   - seedModeReMint (#378): guarded + reMint → ReplaceIfGenReMint.
 //   - every other mode (seedModeKeepwarm, seedModeGVRDiscovered,
 //     seedModeRBACShift, and any mode added later): guarded → PutIfGen. Fail
 //     closed — a new mode is post-readyz unless someone argues otherwise here.
 func seedTerminalGuardFor(mode seedScopeMode, handle cacheHandle, key string) seedTerminalGuard {
-	if mode == seedModeReMint {
-		return seedTerminalGuard{guarded: true, reMint: true, gen: handle.CaptureGen(key)}
-	}
 	if mode == seedModeBoot && !cache.IsPhase1Done() {
 		// boot, captured pre-readyz (#323 exemption, #408): capture the generation
 		// NOW, before the resolve, so that a Put landing after /readyz flips can
@@ -147,14 +129,6 @@ func seedTerminalGuardFor(mode seedScopeMode, handle cacheHandle, key string) se
 	// prewarm_engine_boot.go RA tail), so a boot-mode Put can race a served /call
 	// and a removal exactly like keepwarm.
 	return seedTerminalGuard{guarded: true, gen: handle.CaptureGen(key)}
-}
-
-// retriesTerminalPutRefusal reports whether a refused terminal Put in mode takes
-// the #394 one-shot inline re-seed. False only for seedModeReMint (see the file
-// header: a refused re-mint means the cell was removed, and a retry can only
-// refuse again or re-mint an already freshly-born cell).
-func retriesTerminalPutRefusal(mode seedScopeMode) bool {
-	return mode != seedModeReMint
 }
 
 // seedTerminalPut is the ONLY terminal L1 write of the two seed primitives. It
@@ -185,10 +159,6 @@ func seedTerminalPut(ctx context.Context, handle cacheHandle, key string, entry 
 			noteIdentityClassDrift("seed", drift)
 			return false
 		}
-	}
-	if g.reMint {
-		// #378 — the SOLE production ReplaceIfGenReMint call (single-setter audit).
-		return handle.ReplaceIfGenReMint(ctx, key, entry, g.gen)
 	}
 	if g.guarded || (g.boot && cache.IsPhase1Done()) {
 		// Post-readyz (any mode, or a boot unit whose Put crossed the /readyz

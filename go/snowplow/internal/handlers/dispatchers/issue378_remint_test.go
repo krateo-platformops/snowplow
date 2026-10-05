@@ -39,7 +39,10 @@ func TestIssue378_F1_WarmCellsCrossTheCapWithoutAColdNavigation(t *testing.T) {
 // r378RunF1 is the F1 body. inWindow, when set, runs once inside the lead
 // window (the F1-seed parent-SHA driver uses it).
 func r378RunF1(t *testing.T, inWindow func(e *r378Env)) {
-	const ttlS, maxAgeS, m = 8, 12, 8 // L = min(8, 6) = 6s → lead window [6s, 12s)
+	// L = min(8, 6) = 6s → lead window [6s, 12s). Not the brief's ≈8/≈3: the #316
+	// proactive enqueue is TTLRemainingSeconds < TTL/4 in WHOLE seconds, so a
+	// TTL < 4s truncates TTL/4 to 0 and the reaper never refreshes (architect ruling).
+	const ttlS, maxAgeS, m = 8, 12, 8
 	maxAge := time.Duration(maxAgeS) * time.Second
 	e := r378Setup(t, ttlS, maxAgeS, m)
 	e.fill(t)
@@ -135,6 +138,18 @@ func r378RunF1(t *testing.T, inWindow func(e *r378Env)) {
 	}
 	if v, ok := s1["remint_total"]; !ok || v == 0 {
 		t.Errorf("#378 F1 RED: remint_total=%d (published=%v), want > 0", v, ok)
+	}
+	// remint_total{class} > 0 for every F1 class (the OTLP class split; the
+	// nested apistage cell rides along with the RA and is reported).
+	byClass := map[string]uint64{}
+	for _, c := range cache.ResolvedCacheRemintByClass() {
+		byClass[c.Class] = c.Count
+	}
+	t.Logf("F1: remint_total by class %v", byClass)
+	for _, class := range r378Classes {
+		if byClass[class] == 0 {
+			t.Errorf("#378 F1: remint_total{class=%s}=0, want > 0", class)
+		}
 	}
 }
 

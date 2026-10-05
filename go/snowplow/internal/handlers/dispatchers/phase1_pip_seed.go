@@ -771,7 +771,6 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 //     recorded (the S4 fix; F4-C3 boundary).
 //   - seedModeRBACShift (#258): bare liveness on the NEW-sub-gen key — a live
 //     cell there was minted after the rotation, so a re-armed run skips it.
-//   - seedModeReMint (#378): NEVER skip (the cell was selected as past-age).
 //
 // The store's Get is itself the freshness/liveness oracle — it returns
 // (entry, true) iff the entry exists AND is non-expired per the exact
@@ -896,13 +895,6 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 				"the rotation); resolve+Put skipped"),
 		)
 		return true
-	case seedModeReMint:
-		// #378 — a FORCED write; never age/liveness-skipped. The reaper SELECTED
-		// this cell because it is past-age, so a keepwarm-style age-skip (or a
-		// liveness skip: the cell IS live) would defeat the re-mint. Explicit (not
-		// folded into the default) so a future skip added to the default cannot
-		// silently start skipping re-mints.
-		return false
 	default: // seedModeGVRDiscovered — never skip (F4-C3 boundary).
 		return false
 	}
@@ -1039,10 +1031,10 @@ func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templa
 	// decision (its Get may lazily evict an expired cell, which must not count
 	// as a removal DURING this seed) and before the admission + resolve. Post-
 	// readyz modes get CaptureGen → PutIfGen; boot stays a plain Put (#323).
-	// Carried to the tail on resCtx below (seam signature unchanged). #258/#378:
-	// the same guard also carries the reseed modes' write (rbacShift → PutIfGen
-	// INSERT, remint → ReplaceIfGenReMint); it governs ONLY this unit's final
-	// restactions-cell Put, never the nested apistage/RA Puts of the resolve.
+	// Carried to the tail on resCtx below (seam signature unchanged). #258: the
+	// same guard also carries the reseed mode's write (rbacShift → PutIfGen
+	// INSERT); it governs ONLY this unit's final restactions-cell Put, never the
+	// nested apistage/RA Puts of the resolve.
 	terminalGuard := seedTerminalGuardFor(mode, handle, key)
 
 	// #46 / fold 2026-07-03: bound this seed unit's footprint via the ADAPTIVE
@@ -1330,8 +1322,7 @@ func seedRestactionResolveAndPutProd(
 	// #394 — the terminal write goes through seedTerminalPut with the guard
 	// seedOneRestaction captured at seed entry: PutIfGen for the post-readyz
 	// modes (a removal during the resolve refuses the write instead of
-	// resurrecting the cell), ReplaceIfGenReMint for the #378 re-mint, plain Put
-	// for boot (pre-readyz exemption, #323). A refusal wrote nothing, so the
+	// resurrecting the cell), plain Put for boot (pre-readyz exemption, #323). A refusal wrote nothing, so the
 	// resolves counter, the seeded-set Mark and the dep Record below are all
 	// skipped; the engine closure re-seeds once.
 	if !seedTerminalPut(resCtx, handle, key, entry, seedTerminalGuardFromContext(resCtx)) {
@@ -1473,8 +1464,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	}
 	// #394 — capture the terminal-Put guard at seed ENTRY (mirror of
 	// seedOneRestaction): after the skip decision, before the admission and the
-	// resolve. Post-readyz modes → PutIfGen at the terminal Put (remint →
-	// ReplaceIfGenReMint); boot → plain. Governs ONLY the widget-cell Put below —
+	// resolve. Post-readyz modes → PutIfGen at the terminal Put; boot → plain. Governs ONLY the widget-cell Put below —
 	// never the nested apiref/apistage Puts inside widgetsResolveFn (#258 TL cond 1).
 	terminalGuard := seedTerminalGuardFor(mode, handle, key)
 

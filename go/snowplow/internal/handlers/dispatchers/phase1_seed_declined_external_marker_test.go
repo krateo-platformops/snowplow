@@ -95,11 +95,6 @@ func (h *getRecordingHandle) PutIfGen(ctx context.Context, key string, entry *ca
 func (h *getRecordingHandle) PutThenRemark(ctx context.Context, key string, entry *cache.ResolvedEntry) {
 }
 
-// #258 — inert fresh-mint re-seed stub (this handle never warms a cell).
-func (h *getRecordingHandle) ReplaceIfGenReMint(ctx context.Context, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool {
-	return true
-}
-
 // getCount is method-AGNOSTIC: the number of liveness reads (Get + #376 GetNoTouch),
 // so "a liveness read occurred / did not occur" assertions survive the #376 switch
 // of the seed-skip read from Get to GetNoTouch.

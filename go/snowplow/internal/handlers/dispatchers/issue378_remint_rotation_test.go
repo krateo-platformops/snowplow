@@ -32,11 +32,13 @@ import (
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -98,14 +100,15 @@ func r378RotKey(t *testing.T, ctx context.Context) (string, *cache.ResolvedKeyIn
 	return k, in
 }
 
-func r378RefreshDriftTotal() int64 {
-	var n int64
+// r378RefreshDrift returns the refresher-site drift declines by reason.
+func r378RefreshDrift() map[string]int64 {
+	out := map[string]int64{}
 	for _, c := range IdentityClassDriftDeclinedCells() {
 		if c.Site == "refresher" {
-			n += c.Count
+			out[c.Reason] = c.Count
 		}
 	}
-	return n
+	return out
 }
 
 func TestIssue378_F3_ReMintAcrossRotation_KeyAndOutput(t *testing.T) {
@@ -162,7 +165,7 @@ func TestIssue378_F3_ReMintAcrossRotation_KeyAndOutput(t *testing.T) {
 		t.Fatalf("PRE: carol's new-class key K′ must be absent before the #258 reseed")
 	}
 
-	drift0, hitter0 := r378RefreshDriftTotal(), representativeRepickForTest(repSourceHitter)
+	drift0, hitter0 := r378RefreshDrift(), representativeRepickForTest(repSourceHitter)
 	i431UpdateCM(t, e.dyn, r378RotX2) // the in-window refresh trigger
 	if !i444Wait(10*time.Second, func() bool {
 		ent, ok := c.GetNoTouch(K)
@@ -176,10 +179,17 @@ func TestIssue378_F3_ReMintAcrossRotation_KeyAndOutput(t *testing.T) {
 	if !ok {
 		t.Fatalf("#378 F3: K must stay resident under the SAME key across the rotation")
 	}
-	if d := r378RefreshDriftTotal() - drift0; d < 1 {
-		t.Errorf("#378 F3 KEY: the refresher must decline carol's drifted identity (identity_class_drift{refresher} Δ=%d, want ≥1)", d)
+	// A binding ADD naming carol changes her binding set, which identityClassDrift
+	// checks first: the recorded reason is binding_set (architect ruling); a
+	// pure sub-gen rotation is F3b.
+	drift1 := r378RefreshDrift()
+	if d := (drift1["binding_set"] - drift0["binding_set"]) + (drift1["rbac_subgen"] - drift0["rbac_subgen"]); d < 1 {
+		t.Errorf("#378 F3 KEY: the refresher must decline carol's drifted identity (identity_class_drift{refresher,"+
+			"binding_set|rbac_subgen} Δ=%d, want ≥1); all=%v", d, drift1)
 	}
-	t.Logf("F3: refresher drift cells after the rotation: %v", IdentityClassDriftDeclinedCells())
+	if d := drift1["no_identity"] - drift0["no_identity"]; d != 0 {
+		t.Errorf("#378 F3 KEY: unexpected no_identity declines Δ=%d", d)
+	}
 	if d := representativeRepickForTest(repSourceHitter) - hitter0; d < 1 {
 		t.Errorf("#378 F3 KEY: the #444 re-pick of dave (hitter) did not run (Δ=%d)", d)
 	}
@@ -237,3 +247,92 @@ func httptestRecorderServe(e *r378Env, ctx context.Context, q string) r378Rec {
 		httptest.NewRequest(http.MethodGet, q, nil).WithContext(ctx))
 	return r378Rec{code: rec.Code, body: rec.Body.String()}
 }
+
+// TestIssue378_F3b_RoleRulesRotation_SubGenOnly_NoFreshMint — the rotation that
+// changes NO binding set: a rules edit on the Role carol's and dave's shared
+// binding references (#257 onRoleRulesChanged) bumps their RBACSubGen with the
+// binding set unchanged, so K's class is gone for every member. Inside K's lead
+// window the refresher must NOT re-mint K under any drifted representative
+// (identity_class_drift{refresher,rbac_subgen} ≥ 1, K never re-born), and the
+// members are served their CURRENT view under the rotated key — never K's.
+func TestIssue378_F3b_RoleRulesRotation_SubGenOnly_NoFreshMint(t *testing.T) {
+	const ttlS, maxAgeS = 4, 6 // L = 3s → window [3s, 6s)
+	e := r378Setup(t, ttlS, maxAgeS, 0, r378RotObjects()...)
+	// Activate the binding/role deltas that bump per-subject sub-generations.
+	cache.ResetBindingsByGVRIndexForTest()
+	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
+	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, psConfigmapsGVR})
+	carol, dave := psUserCtx(e.a, psCarol), psUserCtx(e.a, psDave)
+	c := cache.ResolvedCache()
+	serve := func(ctx context.Context) string {
+		t.Helper()
+		rec := httptestRecorderServe(e, ctx, r378RotQuery())
+		if rec.code != 200 {
+			t.Fatalf("serve: %d %s", rec.code, psTrunc(rec.body, 300))
+		}
+		return rec.body
+	}
+	K, _ := r378RotKey(t, carol)
+	if b := serve(carol); !strings.Contains(b, psSentinel) {
+		t.Fatalf("SETUP: carol's view must carry x; body=%s", psTrunc(b, 300))
+	}
+	ent0, ok := c.GetNoTouch(K)
+	if !ok {
+		t.Fatalf("SETUP: K must be cached")
+	}
+	serve(dave) // dave joins the hitter pool
+	e.startRefresher(t)
+	r378SleepUntil(ent0.BornAt.Add(time.Duration(maxAgeS)*time.Second/2 + 300*time.Millisecond))
+
+	digest0 := rbac.SubjectBindingSetDigest(psCarol, psGroups(e.a))
+	// The rules edit: target-reader no longer grants configmaps in x.
+	role, err := e.dyn.Resource(r378RolesGVR).Namespace(psTargetNS).Get(context.Background(), "target-reader", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get role: %v", err)
+	}
+	_ = unstructured.SetNestedSlice(role.Object, []any{map[string]any{
+		"verbs": []any{"get", "list"}, "apiGroups": []any{""}, "resources": []any{"secrets"}}}, "rules")
+	if _, err := e.dyn.Resource(r378RolesGVR).Namespace(psTargetNS).Update(context.Background(), role, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("role rules edit: %v", err)
+	}
+	var Kp string
+	if !i444Wait(5*time.Second, func() bool { Kp, _ = r378RotKey(t, carol); return Kp != K }) {
+		t.Fatalf("PRE: carol's key must rotate on the rules edit (#257 sub-gen bump)")
+	}
+	if d := rbac.SubjectBindingSetDigest(psCarol, psGroups(e.a)); d != digest0 {
+		t.Fatalf("PRE: the rules edit must leave carol's binding set unchanged (this arm is the sub-gen-only path)")
+	}
+
+	drift0 := r378RefreshDrift()
+	i431UpdateCM(t, e.dyn, r378RotX2) // the in-window refresh trigger for K
+	if !i444Wait(10*time.Second, func() bool { return r378RefreshDrift()["rbac_subgen"] > drift0["rbac_subgen"] }) {
+		t.Fatalf("#378 F3b KEY: the in-window refresh never declined the sub-gen-drifted representative "+
+			"(identity_class_drift{refresher} %v → %v)", drift0, r378RefreshDrift())
+	}
+	time.Sleep(300 * time.Millisecond) // let the refresh decision settle
+	if d := r378RefreshDrift()["binding_set"] - drift0["binding_set"]; d != 0 {
+		t.Errorf("#378 F3b: the drift must be rbac_subgen only (binding_set Δ=%d)", d)
+	}
+	// ---- KEY ARM: no fresh mint of K under a drifted class ----
+	if ent, ok := c.GetNoTouch(K); ok {
+		if ent.BornAt.After(ent0.BornAt) {
+			t.Errorf("#378 F3b KEY RED: K was RE-MINTED (BornAt %v → %v) after its class rotated away — the re-mint "+
+				"extended a key no member derives any more", ent0.BornAt, ent.BornAt)
+		}
+		if strings.Contains(string(ent.RawJSON), r378RotX2) {
+			t.Errorf("#378 F3b KEY RED: K was re-Put after its class rotated away")
+		}
+	}
+	// ---- OUTPUT ARM: the members get their CURRENT view, never K's ----
+	for name, ctx := range map[string]context.Context{"carol": carol, "dave": dave} {
+		if k, _ := r378RotKey(t, ctx); k == K {
+			t.Fatalf("PRE: %s must derive the rotated key", name)
+		}
+		if b := serve(ctx); strings.Contains(b, psSentinel) || strings.Contains(b, r378RotX2) || strings.Contains(b, r378RotW) {
+			t.Errorf("#378 F3b OUTPUT LEAK: %s (configmaps in x revoked) was served x data or the SA's view; body=%s",
+				name, psTrunc(b, 400))
+		}
+	}
+}
+
+var r378RolesGVR = schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}
