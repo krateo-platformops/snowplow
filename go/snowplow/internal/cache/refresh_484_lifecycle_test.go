@@ -9,6 +9,7 @@ package cache
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -477,20 +478,28 @@ func TestRefresh484_CustomerPath_PublishNeverWaitsOnWedgedSubscriber(t *testing.
 	for i := 0; i < 8; i++ {
 		fullSink(t, keys...) // 8 wedged subscribers with live refresh drains
 	}
-	var worst time.Duration
+	// A blocking send would HANG (the subscribers never read), so the total
+	// bound is the discriminator; the p99 bound catches lock waits behind the
+	// drains. The single worst call is logged, not asserted: under -race in
+	// the full package run one call can absorb a GC pause / descheduling
+	// (observed 118ms once), which is not the producer waiting on a sink.
+	lat := make([]time.Duration, 0, 200*len(keys))
+	start := time.Now()
 	for r := 0; r < 200; r++ {
 		for _, k := range keys {
 			t0 := time.Now()
 			PublishRefresh(k)
-			if d := time.Since(t0); d > worst {
-				worst = d
-			}
+			lat = append(lat, time.Since(t0))
 		}
 	}
-	// Under -race a non-blocking publish is microseconds; a blocked send would
-	// hang the test. 50ms is a generous scheduler-noise ceiling.
-	if worst > 50*time.Millisecond {
-		t.Fatalf("worst PublishRefresh latency %v with wedged subscribers — the producer waited", worst)
+	total := time.Since(start)
+	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+	p99, worst := lat[len(lat)*99/100], lat[len(lat)-1]
+	if total > 5*time.Second {
+		t.Fatalf("%d publishes took %v with wedged subscribers — the producer waited", len(lat), total)
 	}
-	t.Logf("worst PublishRefresh latency with 8 wedged subscribers: %v", worst)
+	if p99 > 10*time.Millisecond {
+		t.Fatalf("p99 PublishRefresh latency %v with wedged subscribers — the producer contends with the drains", p99)
+	}
+	t.Logf("PublishRefresh with 8 wedged subscribers: %d calls in %v, p99 %v, worst %v", len(lat), total, p99, worst)
 }
