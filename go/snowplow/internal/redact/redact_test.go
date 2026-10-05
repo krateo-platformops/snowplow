@@ -1,9 +1,11 @@
 package redact
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -58,6 +60,52 @@ func TestS453_LabelIsKeyedNotADictionaryHash(t *testing.T) {
 		if strings.Contains(User(u), plain) {
 			t.Fatalf("the user label is the unkeyed sha256 of %q", in)
 		}
+	}
+}
+
+// TestS487_ValueAndDictAttrsNeverRenderAValue: what each lazy LogValuer's
+// LogValue renders, through both slog handlers. It carries {type, bytes,
+// sha256} and key labels only. Neither a value nor a dict key name appears
+// (#490 review: the guard trusts a depth-0 LogValuer, so this arm is what
+// holds its LogValue to redacted fields).
+func TestS487_ValueAndDictAttrsNeverRenderAValue(t *testing.T) {
+	const secret = "zq487-not-a-real-secret" // stands in for a Secret value
+	dict := map[string]any{
+		"secret":   map[string]any{"data": map[string]any{"password": secret}},
+		"username": "erin.zq487@tenant.example", // a request-extras key
+		"slice":    map[string]any{"page": 1},
+	}
+	for name, mk := range map[string]func(*bytes.Buffer) slog.Handler{
+		"json": func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) },
+		"text": func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) },
+	} {
+		var buf bytes.Buffer
+		v := dict["secret"]
+		var nilRef *any
+		slog.New(mk(&buf)).Info("m", DictAttr("dict", dict), ValueAttr("value", &v), ValueAttr("nil", nilRef))
+		out := buf.String()
+		for _, leak := range []string{secret, "password", "erin.zq487", "username", "slice", `"secret"`, "secret="} {
+			if strings.Contains(out, leak) {
+				t.Errorf("%s: %q reached the line: %s", name, leak, out)
+			}
+		}
+		for _, want := range []string{"sha256", "bytes", "keys", "entries", KeyLabel("secret"), KeyLabel("username")} {
+			if !strings.Contains(out, want) {
+				t.Errorf("NON-VACUITY %s: the summary must carry %q: %s", name, want, out)
+			}
+		}
+	}
+	n1, d1 := ValueDigest(dict)
+	n2, d2 := ValueDigest(map[string]any{"slice": map[string]any{"page": 1}, "username": "erin.zq487@tenant.example",
+		"secret": map[string]any{"data": map[string]any{"password": secret}}})
+	if n1 != n2 || d1 != d2 || n1 <= 0 {
+		t.Errorf("the digest must be stable for equal values (%d %s vs %d %s)", n1, d1, n2, d2)
+	}
+	if _, d3 := ValueDigest(map[string]any{"secret": "other"}); d3 == d1 {
+		t.Error("different values must digest differently")
+	}
+	if n, _ := ValueDigest(func() {}); n != -1 {
+		t.Errorf("an unencodable value reports size -1, got %d", n)
 	}
 }
 

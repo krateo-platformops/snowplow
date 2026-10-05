@@ -15,6 +15,7 @@ import (
 	"github.com/krateo-platformops/plumbing/jqutil"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 
@@ -61,7 +62,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 	}
 
 	log := xcontext.Logger(ctx)
-	log.Debug("resolved api", slog.Any("dict", dict))
+	// #487: never the dict itself. It holds every stage's response body
+	// (Secret data, per-user rows). The dict is summarised per entry under a
+	// key label, and "stages" maps each spec-defined stage id to its label.
+	// #490: both attrs are lazy pointer-shaped LogValuers, so at a disabled
+	// level this line costs nothing (no encoding, no digest, no allocation).
+	log.LogAttrs(ctx, slog.LevelDebug, "resolved api",
+		redact.DictAttr("dict", dict),
+		slog.Any("stages", stageIDsLog{api: &opts.In.Spec.API}),
+	)
 
 	var raw []byte
 	if opts.In.Spec.Filter != nil {
@@ -101,4 +110,24 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 // annotation set to `true`.
 func isVerbose(o metav1.Object) bool {
 	return o.GetAnnotations()[annotationKeyVerboseAPI] == "true"
+}
+
+// stageIDsLog renders the RESTAction's spec-defined stage ids, each mapped to
+// the redact.KeyLabel its dict entry is logged under (#487/#490). A stage id
+// is a spec name, not data. The type holds one pointer into the CR, so the
+// attr is pointer-shaped and the work runs only when the record is rendered.
+type stageIDsLog struct{ api *[]*templates.API }
+
+// LogValue renders only the stage ids and their labels.
+func (s stageIDsLog) LogValue() slog.Value {
+	if s.api == nil {
+		return slog.GroupValue()
+	}
+	attrs := make([]slog.Attr, 0, len(*s.api))
+	for _, a := range *s.api {
+		if a != nil {
+			attrs = append(attrs, slog.String(a.Name, redact.KeyLabel(a.Name)))
+		}
+	}
+	return slog.GroupValue(attrs...)
 }

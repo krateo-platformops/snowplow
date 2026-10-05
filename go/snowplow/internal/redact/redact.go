@@ -15,6 +15,11 @@
 // cross-pod correlator is the cache key_hash, which is deterministic and
 // carries no identity in clear.
 //
+// DATA VALUES (#487): a resolved stage body, a JQ result or a template dict
+// may hold Secret data or per-user rows. It is never logged. ValueAttr /
+// DictAttr log its type, JSON size and keyed digest, and DictAttr adds the
+// caller's spec-defined stage ids.
+//
 // SCOPE: LOG AND DEBUG LABELS ONLY. A label is never a cache key, a memo key, a
 // map key that must survive a restart, or an SSE key, because it changes on
 // every restart. The structural guard (log_guard_test.go) fails when a
@@ -29,6 +34,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
@@ -135,6 +143,90 @@ func Err(err error) string {
 	}
 	return ErrorText(err.Error())
 }
+
+// ValueDigest summarises a data value (a stage body, a JQ result, a template
+// dict) as its JSON size and keyed digest. It is the only form of a value
+// that may reach a log line (#487): the value can hold Secret data or per-user
+// rows. A value JSON cannot encode reports size -1 and a digest of its Go
+// type.
+func ValueDigest(v any) (size int, digest string) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return -1, Digest("unencodable\x00" + fmt.Sprintf("%T", v))
+	}
+	return len(b), Digest("v\x00" + string(b))
+}
+
+// LAZY BY CONSTRUCTION (#490 review). ValueAttr and DictAttr return
+// slog.Any(key, ref), where ref is a POINTER-SHAPED slog.LogValuer that holds
+// only the reference. slog resolves a LogValuer only when a handler renders
+// the record, so at a disabled level building the attr costs nothing: no JSON
+// encoding, no HMAC, and no allocation. Boxing a single-pointer value into an
+// interface does not allocate. All of the work runs inside LogValue, and
+// LogValue renders only {type, bytes, sha256} and key labels, never a value.
+// The pre-#490 eager form cost 144 ms / 95 MB per op on a 50K-item dict at
+// LOG_LEVEL=warn.
+
+// ValueAttr logs *v as {type, bytes, sha256}: never the value. v is a
+// pointer, typically into the slice the value already lives in, so the attr
+// is pointer-shaped.
+func ValueAttr(key string, v *any) slog.Attr {
+	return slog.Any(key, valueRef{p: v})
+}
+
+type valueRef struct{ p *any }
+
+// LogValue renders only the redacted summary.
+func (r valueRef) LogValue() slog.Value {
+	var v any
+	if r.p != nil {
+		v = *r.p
+	}
+	return valueSummary(v)
+}
+
+func valueSummary(v any) slog.Value {
+	n, d := ValueDigest(v)
+	return slog.GroupValue(
+		slog.String("type", fmt.Sprintf("%T", v)),
+		slog.Int("bytes", n),
+		slog.String("sha256", d),
+	)
+}
+
+// DictAttr logs a resolve dict as its key count, total size and digest, plus
+// {type, bytes, sha256} for each entry under KeyLabel(key). The key name is
+// not logged, because a dict mixes spec-defined stage ids with request-supplied
+// extras keys. A caller that knows which keys are spec-defined can log the
+// mapping id -> KeyLabel(id) beside it (restactions does). Never a value.
+func DictAttr(key string, dict map[string]any) slog.Attr {
+	return slog.Any(key, dictRef(dict))
+}
+
+type dictRef map[string]any
+
+// LogValue renders only the redacted summary.
+func (d dictRef) LogValue() slog.Value {
+	n, dg := ValueDigest(map[string]any(d))
+	keys := make([]string, 0, len(d))
+	for k := range d {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	entries := make([]slog.Attr, 0, len(keys))
+	for _, k := range keys {
+		entries = append(entries, slog.Attr{Key: KeyLabel(k), Value: valueSummary(d[k])})
+	}
+	return slog.GroupValue(
+		slog.Int("keys", len(d)),
+		slog.Int("bytes", n),
+		slog.String("sha256", dg),
+		slog.Attr{Key: "entries", Value: slog.GroupValue(entries...)},
+	)
+}
+
+// KeyLabel is the log label of a dict key ("k:<hex>").
+func KeyLabel(k string) string { return Prefixed("k", k) }
 
 // Label is a value that is already a redact label. A parameter or variable of
 // this type may be logged as is: the structural guard accepts it, and it

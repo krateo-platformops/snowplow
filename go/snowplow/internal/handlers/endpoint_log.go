@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"log/slog"
+	"net/url"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/snowplow/internal/redact"
@@ -20,9 +21,20 @@ func endpointLogAttr(ep *endpoints.Endpoint) slog.Attr {
 	}
 	return slog.Group("endpoint",
 		slog.String("user", redact.User(ep.Username)),
-		slog.String("server_url", ep.ServerURL),
+		slog.String("server_url", logServerURL(ep.ServerURL)),
 		slog.String("auth", endpointAuthKind(ep)),
 	)
+}
+
+// logServerURL is the server URL with any userinfo (user:password@) removed
+// (#487, reviewer-424). An unparseable URL is not logged at all.
+func logServerURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable>"
+	}
+	u.User = nil
+	return u.String()
 }
 
 // endpointAuthKind names the credential kind an endpoint carries, never the
