@@ -49,6 +49,15 @@
 // is clean). Get is the one funnel every hit_total-counted hit goes through, so
 // stale_served_total and hit_total share a denominator by construction.
 //
+// TWO CONSERVATIVE BIASES (both over-report, never under-report):
+//   - only the REFRESHER's terminal write closes a window. A non-refresher
+//     replace of a dirty cell (keep-warm sweep, seed, gvr-discovered, #258
+//     reseed) leaves it open, so a window can outlast the moment a fresh body
+//     actually landed;
+//   - stale_served counts hits on a dirty-marked cell even when its refresh then
+//     proves the content unchanged (an unchanged refresh is accepted, and FRESH —
+//     F6u). It means "served while potentially stale".
+//
 // No identity, key or body reaches any series: the series are scalars.
 
 package cache
