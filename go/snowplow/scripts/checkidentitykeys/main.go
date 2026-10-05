@@ -119,7 +119,7 @@ var storeRegistry = map[string]string{
 	"cache.RotatedSubjectSet.set":                     "no-content (subjects to reseed)",
 	"cache.refreshBroadcaster.subs":                   "no-content (signal-only SSE)",
 	"cache.refreshBroadcaster.keySubs":                "no-content (signal-only SSE; keys derived under each connection's identity)",
-	"cache.refreshBroadcaster.lastEmit":               "no-content",
+	"cache.refreshBroadcaster.windows":                "no-content (per-key coalesce timers; signal-only, #484)",
 	"cache.servedGroupsSet":                           "no-content (discovery groups)",
 	"cache.ResourceWatcher.eagerSet":                  "no-content",
 	"cache.pluralsStore":                              "free+regated (discovery, identity-free)",

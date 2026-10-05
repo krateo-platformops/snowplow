@@ -30,9 +30,12 @@ package handlers
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -45,9 +48,18 @@ import (
 const (
 	// refreshHeartbeatInterval keeps intermediaries from idling the
 	// connection and lets the client detect a dead link. 20s beats the
-	// server IdleTimeout (30s, main.go:905) with margin; the per-connection
-	// SetWriteDeadline(0) defeats the 300s WriteTimeout (main.go:904).
-	refreshHeartbeatInterval = 20 * time.Second
+	// server IdleTimeout (30s, main.go:905) with margin. It is the stream's
+	// liveness contract (cache.RefreshLivenessInterval), shared with the
+	// write deadline below and the broadcaster's pending-drain stall bound.
+	refreshHeartbeatInterval = cache.RefreshLivenessInterval
+
+	// refreshResyncFrame ends a stream the broadcaster force-resynced (#484
+	// overflow rule). The SPA ignores unknown events (refreshSse.ts handles
+	// only `refresh`); what repairs the tab is the stream END that follows,
+	// which the SPA treats as a transport loss and answers with a full
+	// re-validation on reconnect. The named frame makes the cause visible on
+	// the wire.
+	refreshResyncFrame = "event: resync\ndata: pending-overflow\n\n"
 
 	// refreshSubParamMaxBytes caps the decoded ?sub= payload to avoid a
 	// memory-amplification subscribe vector (extras can be large; design §6
@@ -58,6 +70,23 @@ const (
 	// single subscribe. Defence-in-depth alongside the byte cap.
 	refreshSubMaxEntries = 512
 )
+
+// refreshWriteDeadlineNS bounds EVERY frame write (#484); it defaults to the
+// heartbeat interval. It is re-armed before each write, which also defeats
+// the server's 300s WriteTimeout (main.go:904) for a long-lived stream. A
+// client that cannot accept one small frame within a heartbeat interval is
+// not keeping up with the stream's own liveness signal: the write fails, the
+// handler returns, the subscriber is released, and the SPA's transport-loss
+// path (refreshSse.ts scheduleRetry → revalidateArmed) re-fetches every armed
+// widget on reconnect. Before #484 the deadline was CLEARED, so one wedged
+// client parked this goroutine in Write forever and its sink filled. An
+// atomic only so the wedged-client arm can shorten it; production never
+// changes it.
+var refreshWriteDeadlineNS atomic.Int64
+
+func init() { refreshWriteDeadlineNS.Store(int64(refreshHeartbeatInterval)) }
+
+func refreshWriteDeadline() time.Duration { return time.Duration(refreshWriteDeadlineNS.Load()) }
 
 // subRequest is one widget's arm request inside ?sub=. It is the JSON form of
 // dispatchers.SubscriptionCoordinates. Identity is NOT carried here — it
@@ -127,16 +156,33 @@ func Refreshes() http.HandlerFunc {
 			return
 		}
 
-		// (4) SSE headers + defeat the per-connection write deadline so the
-		// 300s WriteTimeout does not kill a long-lived stream (design §3.2,
-		// §6). SetWriteDeadline(zero) clears the deadline for THIS connection
-		// only; Go 1.20+ ResponseController, supported on go 1.25.x (go.mod).
+		// (4) SSE headers + a PER-WRITE deadline (#484, refreshWriteDeadlineNS)
+		// in place of the 300s WriteTimeout (design §3.2, §6). Go 1.20+
+		// ResponseController, supported on go 1.25.x (go.mod).
 		rc := http.NewResponseController(wri)
-		if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		deadlineOK := true
+		if err := rc.SetWriteDeadline(time.Now().Add(refreshWriteDeadline())); err != nil {
 			// Some ResponseWriters (test recorders) don't support deadlines;
-			// that's non-fatal — the stream still works under the test server.
+			// that's non-fatal — the stream still works, and the broadcaster's
+			// stall rule still releases a wedged subscriber's backlog.
+			deadlineOK = false
 			log.Debug("refreshes: SetWriteDeadline unsupported; continuing",
 				slog.String("subsystem", "cache"), slog.Any("err", err))
+		}
+		// writeFrame writes one SSE frame under a fresh write deadline and
+		// flushes it; false means the client is gone (or wedged past the
+		// deadline) and the stream must end.
+		writeFrame := func(frame string) bool {
+			if deadlineOK {
+				_ = rc.SetWriteDeadline(time.Now().Add(refreshWriteDeadline()))
+			}
+			if _, werr := io.WriteString(wri, frame); werr != nil {
+				return false
+			}
+			if ferr := rc.Flush(); ferr != nil && !errors.Is(ferr, http.ErrNotSupported) {
+				return false
+			}
+			return true
 		}
 		wri.Header().Set("Content-Type", "text/event-stream")
 		wri.Header().Set("Cache-Control", "no-cache")
@@ -155,12 +201,13 @@ func Refreshes() http.HandlerFunc {
 		// content-type filter runs → startPlain → headers commit) yet is
 		// invisible to EventSource clients per the spec — byte-neutral to the
 		// consumer, unconditional so the fix holds with or without the wrapper.
-		fmt.Fprint(wri, ": connected\n\n")
-		_ = rc.Flush()
+		if !writeFrame(": connected\n\n") {
+			return
+		}
 
 		// (5) Subscribe + stream until the client disconnects.
-		ch, unsub := cache.SubscribeRefresh(armed)
-		defer unsub()
+		stream := cache.SubscribeRefreshStream(armed)
+		defer stream.Unsub()
 
 		log.Info("refreshes: subscribed",
 			slog.String("subsystem", "cache"),
@@ -171,24 +218,33 @@ func Refreshes() http.HandlerFunc {
 		heartbeat := time.NewTicker(refreshHeartbeatInterval)
 		defer heartbeat.Stop()
 		for {
+			// A force-resync wins over queued keys: its backlog was released,
+			// so the stream must end now for the SPA to re-validate.
+			select {
+			case <-stream.Resync:
+				_ = writeFrame(refreshResyncFrame)
+				return
+			default:
+			}
 			select {
 			case <-req.Context().Done():
 				return // client gone
-			case k, ok := <-ch:
+			case <-stream.Resync:
+				_ = writeFrame(refreshResyncFrame)
+				return
+			case k, ok := <-stream.Keys:
 				if !ok {
 					// Hub closed the channel (disabled mid-stream) — degrade
 					// to idle; the client falls back to its throttle.
 					return
 				}
-				if _, werr := fmt.Fprintf(wri, "event: refresh\ndata: %s\n\n", k); werr != nil {
-					return // client write failed — disconnect
+				if !writeFrame("event: refresh\ndata: " + k + "\n\n") {
+					return // client write failed or exceeded the deadline — disconnect
 				}
-				_ = rc.Flush()
 			case <-heartbeat.C:
-				if _, werr := fmt.Fprint(wri, ": keepalive\n\n"); werr != nil {
+				if !writeFrame(": keepalive\n\n") {
 					return
 				}
-				_ = rc.Flush()
 			}
 		}
 	}
@@ -221,7 +277,9 @@ func refreshWarmupIncomplete() bool {
 // disconnects. Never emits a refresh event (there is no broadcaster).
 func serveIdleSSE(wri http.ResponseWriter, req *http.Request) {
 	rc := http.NewResponseController(wri)
-	_ = rc.SetWriteDeadline(time.Time{})
+	// #484: the same per-write deadline as the armed path (re-armed before
+	// every write), so a wedged client cannot park this goroutine forever.
+	deadlineOK := rc.SetWriteDeadline(time.Now().Add(refreshWriteDeadline())) == nil
 	wri.Header().Set("Content-Type", "text/event-stream")
 	wri.Header().Set("Cache-Control", "no-cache")
 	wri.Header().Set("Connection", "keep-alive")
@@ -245,6 +303,9 @@ func serveIdleSSE(wri http.ResponseWriter, req *http.Request) {
 		case <-req.Context().Done():
 			return
 		case <-heartbeat.C:
+			if deadlineOK {
+				_ = rc.SetWriteDeadline(time.Now().Add(refreshWriteDeadline()))
+			}
 			if _, err := fmt.Fprint(wri, ": keepalive\n\n"); err != nil {
 				return
 			}
