@@ -103,6 +103,40 @@ func widgetContentL1Key(gvr schema.GroupVersionResource, namespace, name string,
 	return cache.ComputeKey(inputs), &inputs
 }
 
+// withWidgetContentPutSinks installs, on a widget-resolve ctx, EVERY
+// observation sink that populateWidgetContentL1 gates the identity-free
+// widgetContent Put on. Each walker site that resolves a widget and then hands
+// the SAME ctx to populateWidgetContentL1 must build its resolve ctx with this
+// helper, so all such sites decline identically (#450):
+//
+//   - StageErrorSink (Ship 0.30.257 #313 Cache-A) — a per-item iterator hard
+//     error left a partial-with-errors shell; do not seed it.
+//   - ExternalTouchedSink (external-no-cache, 2026-06-22) — the resolve touched
+//     a genuine external endpoint, which no informer/dep edge can invalidate.
+//   - UAFTouchedSink (1.12.3 A-1/R-1) — the resolve ran a userAccessFilter
+//     refilter, so the body is narrowed for the resolving identity, and this
+//     cell is identity-FREE and shared. isRBACSensitiveApiRefWidget is meant to
+//     route such widgets away first, but it is a declaration-shaped heuristic
+//     that de-classifies on accessor error; this sink makes the property hold
+//     by observation.
+//   - SensitiveTouchedSink (#398, #440) — the resolve dispatched a read of a
+//     sensitive resource (core v1/secrets, cache.IsSensitiveResource), so the
+//     body may carry Secret data. No resolved-output cell may hold it, and
+//     this one is identity-free and shared.
+//
+// Call sites: phase1Walker.walk (the page-1 resolve, phase1_walk.go) and
+// iterateApiRefPages (the deep-page drain, phase1_walk_pagination.go). Before
+// #450 the drain built its own ctx with only the StageErrorSink, so the
+// external and UAF gates were inert there. Adding a gate to
+// populateWidgetContentL1 means adding its sink HERE.
+func withWidgetContentPutSinks(ctx context.Context) context.Context {
+	ctx, _ = cache.WithStageErrorSink(ctx)
+	ctx, _ = cache.WithExternalTouchedSink(ctx)
+	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
+	ctx, _ = cache.WithUAFTouchedSink(ctx)
+	return ctx
+}
+
 // populateWidgetContentL1 is the F2 walker's free side-effect of
 // widgets.Resolve — Ship G (0.30.16x) §2.3. After the walker resolves a
 // navigation widget under the SA identity, this helper Puts the encoded
