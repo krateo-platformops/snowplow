@@ -295,6 +295,13 @@ func registerPIPMetrics() {
 		// keepwarm c2 (design §4.2) — keepwarm-scope seed targets elided by the
 		// age-skip (live cell younger than TTL/4; resolve+Put skipped). SEED-SCOPED,
 		// keepwarm-only; distinct from fresh_skip (boot, bare-liveness).
+		// #403 — widget seed units skipped before the resolve because the
+		// apiRef'd RA declares a userAccessFilter (each is also counted by
+		// snowplow_widgets_uaf_put_declined_total).
+		expvar.Publish("snowplow_phase1_seed_widget_uaf_preresolve_skip_total", expvar.Func(func() any {
+			return pipSeedWidgetUAFPreResolveSkipTotal.Load()
+		}))
+
 		expvar.Publish("snowplow_phase1_keepwarm_age_skip_total", expvar.Func(func() any {
 			return keepwarmAgeSkipTotal.Load()
 		}))

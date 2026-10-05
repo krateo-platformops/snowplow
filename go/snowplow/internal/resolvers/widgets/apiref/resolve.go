@@ -98,6 +98,40 @@ func bumpUAFSinkIfDeclared(ctx context.Context, ra *templatesv1.RESTAction) {
 	}
 }
 
+// DeclaresUserAccessFilter reports, BEFORE any resolve, that Resolve(ctx,
+// {ApiRef: ref}) is certain to reach bumpUAFSinkIfDeclared with a declaring RA:
+// ref is non-empty (Resolve's early return is not taken), the SAME objects.Get
+// Resolve makes succeeds under ctx (same identity, same RBAC verdict), the CR
+// converts with the SAME convertToRESTAction, and it declares a userAccessFilter
+// stage. #403: the widget boot seed uses it to skip a resolve whose widgets-cell
+// Put the UAF gate would decline for every identity.
+//
+// It answers false whenever it cannot prove the bump — an empty ref, a Get error
+// (denied, missing, not servable), a conversion error — so a false never claims
+// a decline; the caller resolves as before and the post-resolve sink gate still
+// catches any refilter this frame cannot see (a nested RA→RA chain).
+//
+// The read is INFORMER-ONLY (cache.WithInformerOnlyReads): only an informer
+// hit the identity is RBAC-permitted to GET — the exact branch Resolve's own
+// objects.Get serves from — can answer true. A miss / deny / not-servable
+// returns the quiet NotFound-shaped miss instead of an apiserver GET, so the
+// pre-check never adds an apiserver round-trip; the resolve that follows makes
+// the authoritative one exactly as before.
+func DeclaresUserAccessFilter(ctx context.Context, ref templatesv1.ObjectReference) bool {
+	if ref.Name == "" || ref.Namespace == "" {
+		return false
+	}
+	res := objects.Get(cache.WithInformerOnlyReads(ctx), ref)
+	if res.Err != nil || res.Unstructured == nil {
+		return false
+	}
+	ra, err := convertToRESTAction(res.Unstructured.Object)
+	if err != nil {
+		return false
+	}
+	return ra.HasUserAccessFilterStage()
+}
+
 func shouldServeRAFullList(ctx context.Context, perPage, page int) bool {
 	if !IsPaginatedResolve(perPage, page) || !cache.ResolvedCacheEnabled() {
 		return false

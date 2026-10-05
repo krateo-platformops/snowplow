@@ -1477,6 +1477,34 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// never the nested apiref/apistage Puts inside widgetsResolveFn (#258 TL cond 1).
 	terminalGuard := seedTerminalGuardFor(mode, handle, key)
 
+	// #403 — pre-resolve UAF skip, the widget mirror of seedOneRestaction's
+	// declaration skip. When the widget's spec.apiRef RA declares a
+	// userAccessFilter, apiref.Resolve is certain to bump the UAF sink and the
+	// gate below is certain to decline this cell for every identity, so the
+	// resolve would be paid only to be thrown away (908 units per 057 boot).
+	// Route the decision through the SAME widgets-class gate (HasUAF stamped,
+	// nil sink — nothing has resolved yet) so widgets_uaf_put_declined_total
+	// still counts every declined unit. BEFORE enterSeedUnit so a skip never
+	// consumes the #46 admission. See seed_widget_uaf_precheck.go for why it
+	// is non-lossy.
+	if seedWidgetApiRefDeclaresUAFFn(ctx, e.W) {
+		if inputs != nil {
+			inputs.HasUAF = true
+		}
+		if declineWidgetUAFPut(inputs, nil) {
+			pipSeedWidgetUAFPreResolveSkipTotal.Add(1)
+			slog.Default().Info("phase1.seed.skip.user_access_filter",
+				slog.String("subsystem", "cache"),
+				slog.String("class", "widgets"),
+				slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+				slog.String("uaf_reason", uafDeclineDeclared),
+				slog.String("effect", "the widget's apiRef RESTAction declares a userAccessFilter: its widgets cell is "+
+					"declined for every identity, so the resolve is skipped instead of paid and discarded (#403)"),
+			)
+			return nil
+		}
+	}
+
 	// #46: bound this seed unit's footprint (semaphore admission + per-unit
 	// HeapInuse assert), AFTER the identity short-circuit so the customer
 	// /call path is untouched. fold 2026-07-03: enterSeedUnit is now the
