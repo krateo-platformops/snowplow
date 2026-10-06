@@ -34,7 +34,11 @@ package redact
 //     by u.String() or u.Host, a struct field written in one function and logged
 //     in another, and a helper function that RETURNS the field (the callee's
 //     *types.Func object is itself tainted, so `slog.String("h", host(ep))`
-//     fails too).
+//     fails too). Since #533 it also follows the field INTO a callee, by
+//     binding a call ARGUMENT to the callee's PARAMETER object — so
+//     `logHost(call.Endpoint.ServerURL)`, with the log site inside logHost,
+//     fails as well. That is the same hoist as the one above, taken one step
+//     further: out of the function rather than into a local.
 //
 //   - A sanitiser is recognised by its *types.Func OBJECT — package path plus
 //     name — never by the source spelling. An import alias, a dot-import or a
@@ -48,6 +52,14 @@ package redact
 // WHAT IT STILL DOES NOT SEE — stated rather than implied, because claiming
 // more than was built is the failure #503 warns about:
 //
+//   - The RECEIVER of a method call is not bound to the receiver VARIABLE.
+//     #533 added argument binding (see bindArgs) but deliberately stopped short
+//     of the receiver, because tainting a receiver taints every field read off
+//     it. `u.String()` on a tainted u is still caught — callTaint reads the
+//     receiver EXPRESSION — so what is missing is only the shape where a method
+//     logs an unrelated field of a receiver that was itself tainted wholesale.
+//   - A call that SPREADS a multi-value call into a parameter list, f(g()),
+//     binds only parameter index 0. No instance exists in this module.
 //   - Taint is flow-INSENSITIVE. An object assigned a URL anywhere in the
 //     module is tainted at every read of it, so a variable deliberately
 //     overwritten with a clean value before being logged would be a false
@@ -522,11 +534,116 @@ func (g *urlGuard) mark(lhs ast.Expr, label string) bool {
 	case *ast.IndexExpr:
 		return g.mark(v.X, label)
 	}
-	if o == nil || g.taint[o] != "" {
+	return g.markObject(o, label)
+}
+
+// markObject taints an object directly, for the edges that have no assignment
+// target to walk — a call argument binding to its parameter.
+func (g *urlGuard) markObject(o types.Object, label string) bool {
+	if o == nil || label == "" || g.taint[o] != "" {
 		return false
 	}
 	g.taint[o] = label
 	return true
+}
+
+// bindArgs is the ARGUMENT direction — #533.
+//
+// WHAT WAS MISSING. #526 bound taint across AssignStmt, ValueSpec, RangeStmt,
+// SendStmt and ReturnStmt. Every one of those is a value moving INTO a name the
+// scan can already see. A call argument is the one edge that moves a value into
+// a name declared somewhere else, so a URL reaching a log site through a
+// parameter was invisible:
+//
+//	func logHost(host string) { slog.Error("m", slog.String("host", host)) }
+//	logHost(call.Endpoint.ServerURL)   // was NOT reported
+//
+// That is the #485/#500 hoist taken one step further — out of the function
+// rather than into a local — and #533 proved it on the real tree, not on a
+// fixture: an added always-on Error site of this shape left all four guards
+// green.
+//
+// WHY THIS IS THE CHEAP VERSION, and the cost it was weighed against. The
+// expensive, precise analysis is per-CALL-SITE: a parameter would be tainted
+// only on the paths that reach it from a tainted argument, which needs a call
+// graph and a context for each edge. This does none of that. A parameter is a
+// *types.Var — one object per DECLARATION, exactly like the locals the guard
+// already tracks — so binding is one map write into the SAME module-wide map,
+// and the existing fixed point carries it transitively with no new machinery.
+// It is flow-insensitive in precisely the way the rest of the guard already is,
+// which keeps the whole file one mechanism rather than two.
+//
+// WHAT THAT COSTS, stated rather than hoped. If a helper is called once with a
+// URL and elsewhere with something else, its parameter is tainted at EVERY log
+// site that reads it. That is not a false positive in the sense that matters:
+// that parameter CAN hold the URL at that site, and the fix — redact it — is
+// correct for both callers. The genuine false positives are the ones the guard
+// already has in the assignment direction: a parameter deliberately overwritten
+// with a clean value before being logged, and a non-URL value derived from a
+// URL-typed string (propagatesURL cannot tell "the host" from "the scheme").
+// Measured over the real module while this was built: ZERO new hits, and the
+// sanitised floor unchanged at 15.
+//
+// THREE DELIBERATE RESTRICTIONS, each one a cost the extension declined to pay:
+//
+//   - Only a parameter whose TYPE can still BE the URL is bound
+//     (propagatesURL). Handing a struct that CONTAINS a URL to a function does
+//     not taint the parameter: the URL field read inside the callee is SEEDED
+//     directly and is reported on its own, while tainting the struct would
+//     taint every unrelated field read off it. Measured, not assumed — remove
+//     this restriction and the carrier shape in
+//     TestS533_GuardFollowsTheURLIntoACalleesPARAMETER reports c.Name, a field
+//     that holds no URL, as carrying one.
+//
+//     Note what this restriction is NOT. It is not what keeps the #503
+//     back-out from returning; that is kept by the SEED, which binding does not
+//     widen at all. Token, Username and Password are still #453's territory
+//     either way, and this guard still never tells a reader to wrap a bearer
+//     token in redact.URL. Checked on the real module: a deliberate
+//     argument-direction URL leak injected into the very file that produced
+//     those five findings (dispatchers/resolve_populate.go) is reported, and
+//     it is reported ALONE — the five refreshUser sites beside it are not.
+//
+//   - The RECEIVER is not bound. Tainting a receiver variable taints every
+//     field read off it, which is a large false-positive surface for one shape
+//     that callTaint already covers in the direction that matters (a method on
+//     a tainted receiver returns a tainted result).
+//
+//   - A call that spreads a multi-value call into a parameter list,
+//     f(g()), binds only index 0. The shape does not exist in this module and
+//     the under-approximation is the safe direction for a guard that must not
+//     redden on correct code.
+func (g *urlGuard) bindArgs(c *ast.CallExpr) bool {
+	fn := g.funcObject(c)
+	if fn == nil {
+		return false
+	}
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok {
+		return false
+	}
+	params := sig.Params()
+	if params == nil || params.Len() == 0 {
+		return false
+	}
+	changed := false
+	for i, a := range c.Args {
+		idx := i
+		if sig.Variadic() && idx >= params.Len()-1 {
+			idx = params.Len() - 1
+		}
+		if idx >= params.Len() {
+			break
+		}
+		p := params.At(idx)
+		if !propagatesURL(p.Type()) {
+			continue
+		}
+		if l := g.taintedExpr(a); l != "" {
+			changed = g.markObject(p, l) || changed
+		}
+	}
+	return changed
 }
 
 // propagate runs one pass of the taint relation over a declaration and reports
@@ -542,6 +659,12 @@ func (g *urlGuard) propagate(decl ast.Decl) bool {
 	}
 	ast.Inspect(decl, func(n ast.Node) bool {
 		switch s := n.(type) {
+		case *ast.CallExpr:
+			// #533, the ARGUMENT direction: a value handed to a callee reaches
+			// that callee's PARAMETER object. Everything else in this switch
+			// moves a value into a name declared in the same declaration; this
+			// is the one edge that does not.
+			changed = g.bindArgs(s) || changed
 		case *ast.AssignStmt:
 			if len(s.Rhs) == len(s.Lhs) {
 				for i := range s.Rhs {
@@ -597,11 +720,24 @@ func (g *urlGuard) propagate(decl ast.Decl) bool {
 	return changed
 }
 
+// urlScanMaxPasses bounds the fixed point. Measured on the real module (#533):
+// the taint relation closes in 2 passes without argument binding and 4 with it,
+// so the bound is roughly 3x the observed need rather than tuned to it.
+//
+// It is a BOUND, not a budget: reaching it means the relation had not closed and
+// the scan is reporting a PARTIAL taint set — fewer hits than the truth, which
+// reads as health. endpointURLScan therefore returns whether it converged and
+// the module arm fails when it did not, rather than letting a silently truncated
+// analysis pass as a clean one. That is the same failure #533 is about, one
+// level down.
+const urlScanMaxPasses = 12
+
 // endpointURLScan reports every production log site in pkgs that emits a
-// URL-derived value without a sanitiser, and counts the sites that DO go
-// through one (the non-vacuity signal: a scan that stopped recognising the
-// field would report zero of both).
-func endpointURLScan(pkgs []*packages.Package, sanitizers map[string]bool) (hits []string, sanitised int) {
+// URL-derived value without a sanitiser, counts the sites that DO go through one
+// (the non-vacuity signal: a scan that stopped recognising the field would
+// report zero of both), and reports whether the taint relation reached a fixed
+// point within urlScanMaxPasses.
+func endpointURLScan(pkgs []*packages.Package, sanitizers map[string]bool) (hits []string, sanitised int, converged bool) {
 	type decl struct {
 		p *packages.Package
 		f *ast.File
@@ -623,13 +759,14 @@ func endpointURLScan(pkgs []*packages.Package, sanitizers map[string]bool) (hits
 	// Fixed point over the WHOLE module, so a field or a helper tainted in one
 	// package is tainted at a log site in another. Bounded: each pass can only
 	// add to the map, and the bound is generous rather than tuned.
-	for pass := 0; pass < 12; pass++ {
+	for pass := 0; pass < urlScanMaxPasses; pass++ {
 		changed := false
 		for _, d := range decls {
 			g.pkg = d.p
 			changed = g.propagate(d.d) || changed
 		}
 		if !changed {
+			converged = true
 			break
 		}
 	}
@@ -675,7 +812,7 @@ func endpointURLScan(pkgs []*packages.Package, sanitizers map[string]bool) (hits
 		})
 	}
 	sort.Strings(hits)
-	return hits, sanitised
+	return hits, sanitised, converged
 }
 
 // taintedExprIgnoringSanitizers is taintedExpr with the cleansing step removed,
@@ -709,7 +846,12 @@ func TestS503_NoLogSiteEmitsAnEndpointURLWithoutRedactURL(t *testing.T) {
 	if len(pkgs) < 20 {
 		t.Fatalf("NON-VACUITY: only %d packages loaded", len(pkgs))
 	}
-	hits, sanitised := endpointURLScan(pkgs, urlSanitizers)
+	hits, sanitised, converged := endpointURLScan(pkgs, urlSanitizers)
+	if !converged {
+		t.Errorf("NON-VACUITY: the taint relation did not reach a fixed point in %d passes, so this scan "+
+			"saw only PART of the taint set and its hit list is an under-report, not a clean bill of health. "+
+			"Raise urlScanMaxPasses deliberately, after checking the relation still terminates", urlScanMaxPasses)
+	}
 	for _, h := range hits {
 		t.Errorf("#503 endpoint URL logged unredacted: %s — wrap it in redact.URL", h)
 	}
@@ -926,7 +1068,10 @@ func F(ep *endpoints.Endpoint, h *holder, l *slog.Logger) {
 	write("f.go", src)
 
 	sanitizers := map[string]bool{"fixture/redact.URL": true}
-	hits, sanitised := endpointURLScan(loadPackages(t, dir), sanitizers)
+	hits, sanitised, converged := endpointURLScan(loadPackages(t, dir), sanitizers)
+	if !converged {
+		t.Fatalf("the fixture taint relation did not close in %d passes", urlScanMaxPasses)
+	}
 
 	lines := strings.Split(src, "\n")
 	want := map[int]bool{}
@@ -966,7 +1111,7 @@ func F(ep *endpoints.Endpoint, h *holder, l *slog.Logger) {
 	// redact.URL("...") must itself become a hit. Without this, a guard whose
 	// sanitiser matching had silently stopped working would still pass the
 	// assertions above.
-	emptied, _ := endpointURLScan(loadPackages(t, dir), nil)
+	emptied, _, _ := endpointURLScan(loadPackages(t, dir), nil)
 	if len(emptied) <= len(hits) {
 		t.Errorf("NON-VACUITY: emptying the sanitiser set must turn the redacted sites into hits; "+
 			"got %d hits with it and %d without", len(hits), len(emptied))
@@ -1024,7 +1169,7 @@ func F(ep *endpoints.Endpoint) {
 `
 	write("f.go", src)
 
-	hits, _ := endpointURLScan(loadPackages(t, dir), map[string]bool{"fixture/redact.URL": true})
+	hits, _, _ := endpointURLScan(loadPackages(t, dir), map[string]bool{"fixture/redact.URL": true})
 	joined := strings.Join(hits, "\n")
 	if len(hits) != 1 {
 		t.Fatalf("the error-text shapes must NOT be reported and the plain field MUST be: want exactly 1 hit, got %d:\n%s",
@@ -1080,7 +1225,7 @@ func F(ep *endpoints.Endpoint) {
 `
 	write("f.go", src)
 
-	hits, sanitised := endpointURLScan(loadPackages(t, dir), map[string]bool{"fixture/redact.URL": true})
+	hits, sanitised, _ := endpointURLScan(loadPackages(t, dir), map[string]bool{"fixture/redact.URL": true})
 	joined := strings.Join(hits, "\n")
 	if len(hits) != 1 {
 		t.Fatalf("want exactly 1 hit (the impostor), got %d:\n%s", len(hits), joined)
@@ -1090,5 +1235,241 @@ func F(ep *endpoints.Endpoint) {
 	}
 	if sanitised != 1 {
 		t.Errorf("the DOT-IMPORTED real sanitiser must be recognised as one (sanitised=1); got %d", sanitised)
+	}
+}
+
+// TestS533_GuardFollowsTheURLIntoACalleesPARAMETER is the arm for #533: the
+// hoist in the ARGUMENT direction.
+//
+// #526's guard defeated the #485/#500 hoist-into-a-local. It did not defeat the
+// same hoist taken one step further — OUT of the function, into a helper's
+// parameter — because propagate() bound taint across assignments, declarations,
+// ranges, sends and returns, and never across a call's argument list. An
+// independent gate added an always-on Error site of exactly this shape to the
+// real tree and left go build 0, go vet 0 and all four guards GREEN.
+//
+// This arm is a REAL boundary, not an installed end state: reverting bindArgs
+// (the one function #533 adds) turns every LEAK line below into an undetected
+// bypass, which is the mutation recorded in the PR.
+//
+// Each of the five shapes the issue names has its own marked line, so a partial
+// regression — say, parameters bound within a package but not across one —
+// fails on the shape it broke rather than on a single aggregate count.
+func TestS533_GuardFollowsTheURLIntoACalleesPARAMETER(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "fixture")
+	for _, sub := range []string{"", "redact", "endpoints", "sink"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(rel, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("go.mod", "module fixture\n\ngo 1.22\n")
+	write("endpoints/endpoints.go", "package endpoints\n\ntype Endpoint struct{ ServerURL string }\n")
+	write("redact/redact.go", "package redact\n\nfunc URL(raw string) string { return \"clean\" }\n")
+	// SHAPE 4 and SHAPE 5 live in another package, so they also exercise the
+	// assumption cross-package taint rests on: that the *types.Var of a
+	// parameter is the SAME object in the caller's signature view and in the
+	// callee's own Defs, within one packages.Load.
+	sinkSrc := `package sink
+
+import (
+	"log/slog"
+
+	"fixture/redact"
+)
+
+// Pkg holds a value handed in from another package.
+var Pkg string
+
+// LogIt logs its PARAMETER — shape 4, cross-package parameter.
+func LogIt(host string) {
+	slog.Error("cross-package parameter", slog.String("host", host)) // LEAK
+}
+
+// Stash parks its parameter in a package-level var that something else logs.
+func Stash(host string) { Pkg = host }
+
+// LogStashed logs that package-level var — shape 5.
+func LogStashed() {
+	slog.Error("cross-package package var", slog.String("host", Pkg)) // LEAK
+}
+
+// LogClean sanitises its parameter before logging it: binding a parameter must
+// NOT make a callee that redacts its input a hit.
+func LogClean(host string) {
+	slog.Error("sanitised in the callee", slog.String("host", redact.URL(host))) // CLEAN
+}
+`
+	write("sink/sink.go", sinkSrc)
+
+	src := `package fixture
+
+import (
+	"log/slog"
+
+	"fixture/endpoints"
+	ralias "fixture/redact"
+	"fixture/sink"
+)
+
+type rec struct{ host string }
+
+type box struct{ held string }
+
+var pkgHeld string
+
+// logHost is SHAPE 1 — a free function that logs its parameter.
+func logHost(host string) {
+	slog.Error("free-function parameter", slog.String("host", host)) // LEAK
+}
+
+// logHostClean takes the same parameter and sanitises it. Binding must not
+// turn a correct helper red; that is the false-positive direction.
+func logHostClean(host string) {
+	slog.Error("parameter sanitised here", slog.String("host", ralias.URL(host))) // CLEAN
+}
+
+// logHostM is SHAPE 2 — a METHOD that logs its parameter.
+func (r *rec) logHostM(host string) {
+	slog.Error("method parameter", slog.String("host", host)) // LEAK
+}
+
+// stash is SHAPE 3 — the parameter is parked in a struct field and logged by
+// an entirely different function.
+func (b *box) stash(host string) { b.held = host }
+
+func (b *box) emit() {
+	slog.Error("parameter via struct field", slog.String("host", b.held)) // LEAK
+}
+
+// logUnrelated takes a string that NO caller ever feeds a URL. It must stay
+// clean: binding is per-OBJECT, so an unrelated parameter is not collateral.
+func logUnrelated(what string) {
+	slog.Error("an unrelated parameter", slog.String("what", what)) // CLEAN
+}
+
+// takesSanitised is only ever called with redact.URL output.
+func takesSanitised(host string) {
+	slog.Error("only ever handed sanitised input", slog.String("host", host)) // CLEAN
+}
+
+// carrier is handed in WHOLE, with a URL inside it.
+type carrier struct {
+	HostURL string
+	Name    string
+}
+
+// takesCarrier is the arm for the propagatesURL RESTRICTION on parameters.
+// The argument expression is tainted (the composite literal holds the URL), but
+// the parameter's TYPE is a struct, so the parameter is not bound. Its URL field
+// is still a hit — the SEED reaches it directly — while its unrelated Name field
+// stays clean. Drop the restriction and Name becomes a false positive, because
+// tainting a struct taints every field read off it.
+func takesCarrier(c carrier) {
+	slog.Error("the URL field of a carrier", slog.String("host", c.HostURL)) // LEAK
+	slog.Error("an unrelated field of the same carrier", slog.String("name", c.Name)) // CLEAN
+}
+
+func F(ep *endpoints.Endpoint, r *rec, b *box) {
+	logHost(ep.ServerURL)       // shape 1
+	logHostClean(ep.ServerURL)  // the clean counterpart of shape 1
+	r.logHostM(ep.ServerURL)    // shape 2
+	b.stash(ep.ServerURL)       // shape 3
+	b.emit()
+	sink.LogIt(ep.ServerURL)    // shape 4
+	sink.Stash(ep.ServerURL)    // shape 5
+	sink.LogStashed()
+	sink.LogClean(ep.ServerURL) // the clean counterpart, across a package
+
+	logUnrelated("a literal")
+	takesSanitised(ralias.URL(ep.ServerURL))
+	takesCarrier(carrier{HostURL: ep.ServerURL, Name: "n"})
+
+	// The hoist through a local still works — the ASSIGNMENT direction #526
+	// already covered — so this arm cannot pass by having replaced one
+	// mechanism with the other.
+	u := ep.ServerURL
+	slog.Error("the #526 hoist still caught", slog.String("host", u)) // LEAK
+
+	// A parameter handed on to a SECOND callee: binding must be transitive,
+	// because a one-hop rule is defeated by adding a hop.
+	relay(ep.ServerURL)
+
+	pkgHeld = ep.ServerURL
+	slog.Error("a package-level var in THIS package", slog.String("host", pkgHeld)) // LEAK
+}
+
+func relay(host string) { logRelayed(host) }
+
+func logRelayed(host string) {
+	slog.Error("two hops of parameter", slog.String("host", host)) // LEAK
+}
+`
+	write("f.go", src)
+
+	sanitizers := map[string]bool{"fixture/redact.URL": true}
+	hits, _, converged := endpointURLScan(loadPackages(t, dir), sanitizers)
+	if !converged {
+		t.Fatalf("the #533 fixture taint relation did not close in %d passes — a two-hop parameter chain must still reach a fixed point", urlScanMaxPasses)
+	}
+
+	// Marked lines are collected from BOTH files, keyed by file base name, so a
+	// shape detected in the wrong file cannot stand in for one that was missed.
+	type mark struct {
+		file string
+		line int
+	}
+	wantLeak := map[mark]string{}
+	wantClean := map[mark]string{}
+	for _, f := range []struct {
+		name, body string
+	}{{"f.go", src}, {"sink.go", sinkSrc}} {
+		for i, l := range strings.Split(f.body, "\n") {
+			switch {
+			case strings.Contains(l, "// LEAK"):
+				wantLeak[mark{f.name, i + 1}] = strings.TrimSpace(l)
+			case strings.Contains(l, "// CLEAN"):
+				wantClean[mark{f.name, i + 1}] = strings.TrimSpace(l)
+			}
+		}
+	}
+	// An instrument check at BOTH extremes: a marker scan that silently matched
+	// nothing, or everything, would make every assertion below vacuous.
+	if len(wantLeak) != 9 {
+		t.Fatalf("fixture has %d LEAK markers, want 9", len(wantLeak))
+	}
+	if len(wantClean) != 5 {
+		t.Fatalf("fixture has %d CLEAN markers, want 5", len(wantClean))
+	}
+
+	got := map[mark]string{}
+	for _, h := range hits {
+		// "<dir>/<file>.go:<line>: ..."
+		base := h[:strings.Index(h, ":")]
+		base = base[strings.LastIndex(base, "/")+1:]
+		var ln int
+		if _, err := fmt.Sscanf(h[strings.Index(h, ".go:")+4:], "%d", &ln); err != nil {
+			t.Fatalf("cannot read a line number out of a hit — the hit format changed: %s", h)
+		}
+		m := mark{base, ln}
+		got[m] = h
+		if _, ok := wantLeak[m]; !ok {
+			src := wantClean[m]
+			if src == "" {
+				src = "(an UNMARKED line — the fixture did not expect a verdict here at all)"
+			}
+			t.Errorf("CLEAN shape flagged — argument binding is too strict: %s\n  source: %s", h, src)
+		}
+	}
+	for m, l := range wantLeak {
+		if _, ok := got[m]; !ok {
+			t.Errorf("ARGUMENT-DIRECTION BYPASS not detected at %s:%d: %s", m.file, m.line, l)
+		}
 	}
 }
