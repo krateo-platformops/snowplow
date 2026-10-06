@@ -1,5 +1,5 @@
-//go:build unit
-// +build unit
+//go:build integration
+// +build integration
 
 // #282 arm 2 — the security-load-bearing DISCRIMINATING pair, kind-backed
 // (mirrors the #156 apiserver-RBAC family). The property under test: a plain

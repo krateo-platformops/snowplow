@@ -1,10 +1,10 @@
-//go:build unit
-// +build unit
+//go:build integration
+// +build integration
 
 // call_443_kind_test.go — #443 kind-backed arms (design §6), against the real
-// apiserver on kind cluster "krateo", each request made with the CALLER's own
-// x509 (e2e.SignUp), so the apiserver is the authority on RBAC and on what is
-// persisted:
+// apiserver on this process's own kind cluster (krateo-<pid>, #522), each
+// request made with the CALLER's own x509 (e2e.SignUp), so the apiserver is
+// the authority on RBAC and on what is persisted:
 //
 //   - TestS443_Kind_DryRun/b_NothingPersisted: a dry-run create returns 200
 //     with X-Snowplow-Dry-Run: All, then the object does NOT exist.
