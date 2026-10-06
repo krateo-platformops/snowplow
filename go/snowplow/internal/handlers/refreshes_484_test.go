@@ -165,7 +165,39 @@ func awaitArmed(t *testing.T, keys []string, subs int) {
 // awaitHold waits until every stream holds want(k) for every key and returns
 // the cells that never got there.
 func awaitHold(streams []*spaStream, keys []string, gen int, d time.Duration) []string {
-	deadline := time.Now().Add(d)
+	miss, _ := awaitHoldMeasured(streams, keys, gen, d)
+	return miss
+}
+
+// w484HardDeadline is how long awaitHoldMeasured keeps looking after the soft
+// budget expires, before it calls a cell genuinely LOST. Generous on purpose:
+// the question it answers is "did this ever arrive", and a wrong NO there is a
+// false alarm about data loss.
+const w484HardDeadline = 30 * time.Second
+
+// awaitHoldMeasured is awaitHold plus the ELAPSED TIME, and it is the fix for
+// #501.
+//
+// WHY. The #484 fix guarantees EVENTUAL delivery (a per-subscriber pending set),
+// not BOUNDED delivery — nothing in it promises a deadline, and #498 §A says so
+// explicitly. The arms nevertheless asserted a 1 s bound, so on a loaded CI
+// runner they failed about one run in three: three failures on 2026-10-06 alone,
+// on #492, #513 and #516, none of which touches the refresh path, against ZERO
+// reproductions in 17 local runs. Each cost a ~25 minute re-run and produced a
+// "PR run failed" notification for a PR whose code was fine.
+//
+// Widening the budget was the obvious move and the wrong one: the 1 s figure is
+// the only evidence anyone has about real drain latency, and #498 needs exactly
+// that number. So the arm now MEASURES instead of asserting: it returns how long
+// delivery took, the caller logs a late-but-correct delivery, and only a cell
+// that never arrives inside w484HardDeadline is a failure. A genuine loss stays
+// RED; a slow drain becomes a datapoint.
+func awaitHoldMeasured(streams []*spaStream, keys []string, gen int, soft time.Duration) ([]string, time.Duration) {
+	start := time.Now()
+	hard := start.Add(w484HardDeadline)
+	if soft > w484HardDeadline {
+		hard = start.Add(soft)
+	}
 	var miss []string
 	for {
 		miss = miss[:0]
@@ -176,10 +208,35 @@ func awaitHold(streams []*spaStream, keys []string, gen int, d time.Duration) []
 				}
 			}
 		}
-		if len(miss) == 0 || time.Now().After(deadline) {
-			return miss
+		if len(miss) == 0 {
+			return nil, time.Since(start)
+		}
+		if time.Now().After(hard) {
+			return miss, time.Since(start)
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// requireDelivered is the assertion every #484 arm uses: a cell that never
+// arrives is a FAILURE (the defect #484 exists to prevent), while one that
+// arrives after the soft budget is REPORTED, with the latency, and passes.
+//
+// The report is the point. It is the only place the drain latency of a resumed
+// subscriber is observable, and #498 is open on exactly that question.
+func requireDelivered(t *testing.T, streams []*spaStream, keys []string, gen int, soft time.Duration, what string) {
+	t.Helper()
+	miss, took := awaitHoldMeasured(streams, keys, gen, soft)
+	if len(miss) > 0 {
+		_, _, dropped, _ := cache.RefreshBroadcasterCounters()
+		t.Fatalf("%s: %d/%d stream×key cells NEVER rendered v%d within %v "+
+			"(dropped=%d) — this is a genuine LOST UPDATE, not slowness: %v",
+			what, len(miss), len(streams)*len(keys), gen, w484HardDeadline, dropped, miss)
+	}
+	if took > soft {
+		t.Logf("#501 DELIVERY LATENCY: %s delivered all %d cells in %v, over the %v soft budget. "+
+			"Not a failure — the #484 fix guarantees EVENTUAL delivery, not bounded. "+
+			"This figure is the datapoint #498 asks for.", what, len(streams)*len(keys), took, soft)
 	}
 }
 
@@ -205,6 +262,9 @@ func TestRefreshes484_FCoalesce_Wire(t *testing.T) {
 	for i, k := range keys {
 		w484Commit(store, k, names[i], w484Body(k, 1))
 	}
+	// SETUP, not a delivery claim: v1 must be held before the arm can start, and
+	// a slow setup is a broken fixture rather than a latency datapoint. Kept as a
+	// hard bound deliberately (#501).
 	if miss := awaitHold(streams, keys, 1, time.Second); len(miss) > 0 {
 		t.Fatalf("setup: v1 not held within 1s by %v", miss)
 	}
@@ -218,11 +278,11 @@ func TestRefreshes484_FCoalesce_Wire(t *testing.T) {
 		t.Fatalf("precondition: coalesced=%d for the v2 publishes, want %d — the real window did not engage, the arm cannot fail",
 			coal-coal0, w484K)
 	}
-	if miss := awaitHold(streams, keys, 2, time.Second); len(miss) > 0 {
-		t.Fatalf("F-COALESCE(wire) RED: %d/%d stream×key cells still render v1 1s after v2's commit — "+
-			"the coalesced emit was the LAST change and no trailing frame was written: %v",
-			len(miss), w484K*w484M, miss)
-	}
+	// #501 — the claim is that the coalesced emit's LAST change is not LOST, not
+	// that it lands inside a second. A late-but-delivered v2 is reported with its
+	// latency and passes; only a v2 that never arrives is the defect.
+	requireDelivered(t, streams, keys, 2, time.Second,
+		"F-COALESCE(wire): the coalesced emit was the LAST change and no trailing frame was written")
 }
 
 func TestRefreshes484_FDrop_Wire(t *testing.T) {
@@ -291,12 +351,13 @@ func TestRefreshes484_FDrop_Wire(t *testing.T) {
 		w484Commit(store, k, targets[i], w484Body(k, 2))
 	}
 	openGate()
-	if miss := awaitHold(streams, tkeys, 2, time.Second); len(miss) > 0 {
-		_, _, dropped, _ := cache.RefreshBroadcasterCounters()
-		t.Fatalf("F-DROP(wire) RED: %d/%d stream×key cells still render v1 1s after the tab resumed reading "+
-			"(dropped=%d: the full-sink send discarded the LAST change): %v",
-			len(miss), w484K*w484M, dropped, miss)
-	}
+	// #501 — THIS is the arm that failed three times in CI on 2026-10-06 (#492,
+	// #513, #516), every time with dropped=0, i.e. the pending-set path WAS taken
+	// and the content merely had not arrived inside one second. The defect #484
+	// fixes is a LOST last change; slowness is #498's question, so it is measured
+	// and reported rather than asserted.
+	requireDelivered(t, streams, tkeys, 2, time.Second,
+		"F-DROP(wire): the full-sink send discarded the LAST change")
 }
 
 // floodUntilBlocked publishes the fillers until every handler is parked in
@@ -411,16 +472,14 @@ func TestRefreshes484_StallForcesResyncAndReconnectRepairs(t *testing.T) {
 		}
 		re[i].mu.Unlock()
 	}
-	if miss := awaitHold(re, tkeys, 2, time.Second); len(miss) > 0 {
-		t.Fatalf("after resync + reconnect re-validation, %d cells still render v1: %v", len(miss), miss)
-	}
+	requireDelivered(t, re, tkeys, 2, time.Second,
+		"after resync + reconnect re-validation, cells still render v1")
 	// The reconnected subscribers are live: a later commit reaches them.
 	for i, k := range tkeys {
 		w484Commit(store, k, targets[i], w484Body(k, 3))
 	}
-	if miss := awaitHold(re, tkeys, 3, time.Second); len(miss) > 0 {
-		t.Fatalf("reconnected streams are not delivering: %d cells missed v3: %v", len(miss), miss)
-	}
+	requireDelivered(t, re, tkeys, 3, time.Second,
+		"reconnected streams are not delivering: cells missed v3")
 	for _, s := range cache.RefreshSubSnapshotsForTest() {
 		if s.Resynced {
 			t.Fatalf("a reconnected subscriber is marked resynced")
