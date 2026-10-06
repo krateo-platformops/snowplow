@@ -164,8 +164,14 @@ func awaitArmed(t *testing.T, keys []string, subs int) {
 
 // awaitHoldWithin is the one wait loop: it polls until every stream holds
 // want(k) for every key, gives up at hard, and returns both the cells that never
-// got there and how long it took. The two wrappers below differ ONLY in how they
-// choose hard, which is the whole distinction this file turns on.
+// got there and how long it took. The two wrappers below differ only in how they
+// choose hard.
+//
+// Do not over-read that distinction (#521, G5): with the setup site now asking
+// for w484HardDeadline, every LIVE call site resolves to 30 s, so the separation
+// is currently an affordance nobody exercises. It is kept because the two have
+// genuinely different contracts — one honours its argument, one floors it — and
+// collapsing them is what produced F1.
 func awaitHoldWithin(streams []*spaStream, keys []string, gen int, hard time.Duration) ([]string, time.Duration) {
 	start := time.Now()
 	deadline := start.Add(hard)
@@ -212,12 +218,22 @@ func awaitHold(streams []*spaStream, keys []string, gen int, d time.Duration) []
 }
 
 // w484HardDeadline is the point at which a cell that has not arrived is called
-// genuinely LOST, and it is not an arbitrary widening: 30 s is this repo's
-// ENFORCED freshness tier. north-star.md:251 makes >30000 ms the miss threshold
-// and ledger.py:383 sets CONV_TIER_MS = 30000, while north-star.md:276-281
-// records that the "1 s fresh" figure is aspirational and explicitly NOT
-// enforced. So the arms' old 1 s assertion contradicted the repo's own enforced
-// tier; this constant agrees with it.
+// genuinely LOST.
+//
+// WHAT THE TIER CITATION DOES AND DOES NOT ESTABLISH (#521, G2 — stated
+// carefully because the two quantities are easy to conflate). north-star.md:251
+// makes >30000 ms the miss threshold and ledger.py:383 sets CONV_TIER_MS =
+// 30000, while north-star.md:276-281 records the "1 s fresh" figure as
+// aspirational and explicitly NOT enforced. That establishes the load-bearing
+// half: this path is eventually-consistent, and the arms' old 1 s assertion
+// contradicted the repo's own posture.
+//
+// It does NOT license 30 s as the right deadline for THIS arm. convergence_ms is
+// a browser-observed end-to-end settle time after a cluster mutation at 50K
+// compositions x 1000 users (north-star.md:119-124); this arm measures a frame
+// reaching nine in-process cells over loopback. So do not read a 25 s delivery
+// to a single tab as "within spec" — it is not within anything. It is merely
+// below the point where this arm gives up and calls a cell lost.
 const w484HardDeadline = 30 * time.Second
 
 // awaitHoldMeasured is awaitHoldWithin floored at w484HardDeadline, plus the
@@ -246,13 +262,18 @@ const w484HardDeadline = 30 * time.Second
 // discarded. It is a local-debugging aid, not a CI datapoint, and nothing here
 // should be read as preserving one.
 //
-// The tight detector is NOT lost repo-wide: the internal/cache twins still assert
-// 1 s, and they hold up under load — 12/12 PASS under GOMAXPROCS=2 with 12 CPU
-// hogs, FDrop at 0.01-0.02 s and FCoalesce at 0.25-0.27 s against their 1 s
-// bound (measured while gating #521). The split is therefore empirically
-// justified: the in-process twins bound latency tightly where scheduling is
-// controllable, and these wire-level arms assert only what #484 actually
-// promises — that the cell arrives.
+// The tight detector is NOT lost repo-wide, and that is a CODE fact rather than
+// a measurement: the internal/cache twins still assert a 1 s bound. The split is
+// deliberate — the in-process twins bound latency tightly where scheduling is
+// controllable, while these wire-level arms assert only what #484 actually
+// promises, that the cell arrives.
+//
+// An earlier revision of this comment cited specific pass counts and latencies
+// for those twins as the justification (#521, G1). They are not reproduced here:
+// the gate that measured them took them on a loaded shared dev machine, disowned
+// them pending re-measurement, and deleted the logs. A figure whose conditions
+// cannot be stated does not belong in a comment the next engineer will trust.
+// The empirical check and its conditions live in #521's gate record.
 func awaitHoldMeasured(streams []*spaStream, keys []string, gen int, soft time.Duration) ([]string, time.Duration) {
 	hard := w484HardDeadline
 	if soft > hard {
@@ -276,9 +297,21 @@ func requireDelivered(t *testing.T, streams []*spaStream, keys []string, gen int
 	miss, took := awaitHoldMeasured(streams, keys, gen, soft)
 	if len(miss) > 0 {
 		_, _, dropped, _ := cache.RefreshBroadcasterCounters()
+		// resync is load-bearing for reading this failure, not decoration
+		// (#521, G3). w484HardDeadline (30 s) straddles the force-resync hatch
+		// at RefreshLivenessInterval (20 s, refresh_broadcaster.go:153,161), so
+		// a genuinely stalled subscriber is force-resynced BEFORE this fires.
+		// The F-DROP/F-COALESCE client models do not implement the
+		// resync→revalidate contract, so a non-zero count here means the cell
+		// is missing because this fixture ignored a resync frame — NOT because
+		// the update was lost. Print it so the message cannot assert more than
+		// it can support.
+		resync := cache.RefreshBroadcasterStatsSnapshot().PendingOverflowResync
 		t.Fatalf("%s: %d/%d stream×key cells NEVER rendered v%d within %v "+
-			"(dropped=%d) — this is a genuine LOST UPDATE, not slowness: %v",
-			what, len(miss), len(streams)*len(keys), gen, w484HardDeadline, dropped, miss)
+			"(dropped=%d, pending_overflow_resync=%d) — a lost update IF resync=0; "+
+			"if resync>0 the fixture ignored a force-resync frame and this is a "+
+			"FIXTURE gap, not a #484 defect: %v",
+			what, len(miss), len(streams)*len(keys), gen, w484HardDeadline, dropped, resync, miss)
 	}
 	if took > soft {
 		t.Logf("#501 DELIVERY LATENCY: %s delivered all %d cells in %v, over the %v soft budget. "+
