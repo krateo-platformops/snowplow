@@ -125,6 +125,7 @@ var storeRegistry = map[string]string{
 	"cache.pluralsStore":                              "free+regated (discovery, identity-free)",
 	"cache.pluralsKindReverseStore":                   "free+regated (discovery, identity-free)",
 	"cache.identityFreeClasses":                       "no-content (the identity-free class list)",
+	"cache.secretsCacheRetainedDataKeys":              "no-content (#510: Secret data-key NAMES only — the AUTHN informer transform's allow-list; no value, no identity)",
 	"rbac.bindingSetShard.m":                          "snapshot-scoped (exact username + groups)",
 	"rbac.snapshotAuthzShard.m":                       "snapshot-scoped (username + groups FNV64, same username only)",
 	"rbac.requesterProfileShard.m":                    "snapshot-scoped (username + groups FNV64, same username only)",

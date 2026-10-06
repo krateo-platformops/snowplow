@@ -209,6 +209,17 @@ func StartSecretsInformer(ctx context.Context, rc *rest.Config, namespace string
 			// AUTHN_NAMESPACE" scenario.
 			opts.Limit = listPageLimit
 		}),
+		// #510 — reduce every Secret to what this store's consumers
+		// actually read BEFORE it enters the indexer, so no unread
+		// `data` key is resident for the process lifetime. The option
+		// records the transform on the factory; the factory installs
+		// it on the informer in InformerFor, i.e. at the
+		// `factory.Core().V1().Secrets().Informer()` call below —
+		// strictly before factory.Start, which is the boundary
+		// client-go enforces (SetTransform refuses a started
+		// informer). See secrets_transform.go for the traced consumer
+		// set and the retained-key list.
+		informers.WithTransform(transformSecretForCache),
 	)
 
 	gi := factory.Core().V1().Secrets()
