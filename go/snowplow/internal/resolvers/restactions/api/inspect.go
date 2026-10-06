@@ -26,11 +26,19 @@
 //   - EndpointRef != nil (no UAF)  → OMIT (external; not an in-cluster read).
 //   - otherwise (in-cluster GET)   → EMIT one `get` row for the stage's GVR.
 //
-// At inspect time the dict holds ONLY `extras` — the same map the dispatcher
-// would seed it with before the first stage. A stage whose path templates off
-// an UPSTREAM stage's output (not present in the empty dict) cannot be
-// materialized → it is reported as UNRESOLVABLE (a fail-loud non-200 at the
-// handler), never silently dropped.
+// At inspect time the dict holds ONLY `extras`, seeded in the SAME SHAPE the
+// dispatcher uses before the first stage — extras at TOP LEVEL
+// (resolve.go, `dict = maps.DeepCopyJSON(opts.Extras)`), not nested under an
+// "extras" key. #512: this comment used to claim "the same map the dispatcher
+// would seed it with" while the code nested them, so `${ "/api/v1/namespaces/"
+// + .nsName }` — the shape of the real fixture at
+// testdata/widgets/button.extras.apiref.yaml:26 — rendered `.nsName` as null at
+// enumeration time and as the caller's value at dispatch. No templated path had
+// ever rendered a real value through this pass.
+//
+// A stage whose path templates off an UPSTREAM stage's output (not present in
+// the seed dict) cannot be materialized → it is reported as UNRESOLVABLE (a
+// fail-loud non-200 at the handler), never silently dropped.
 
 package api
 
@@ -47,6 +55,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
+
+	"github.com/krateo-platformops/plumbing/maps"
 )
 
 // Resource is one (group, version, resource, namespace, verb) tuple the
@@ -113,9 +123,22 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 	// The inspect dict holds ONLY extras — the seed the dispatcher would
 	// start the first stage with. Upstream stage outputs are deliberately
 	// absent: a stage that needs them is UNRESOLVABLE (reported, not guessed).
+	//
+	// #512 — SHAPE PARITY WITH THE DISPATCHER IS THE POINT. The dispatcher does
+	// `dict = maps.DeepCopyJSON(opts.Extras)` (resolve.go), putting extras at the
+	// TOP LEVEL. This used to do `dict["extras"] = extras`, one level down, so a
+	// template reading `.nsName` saw null here and the caller's value there — the
+	// enumeration was computed against a path the dispatcher would never request.
+	// Same copy helper as the dispatcher, so an extras value cannot be mutated
+	// through the caller's map either.
+	//
+	// NOT seeded, deliberately: the dispatcher's `dict["slice"]` paging block.
+	// /rbac takes no paging parameters, and a read-set is per-RESOURCE, not
+	// per-page — a stage templating off `.slice.*` is therefore UNRESOLVABLE here
+	// rather than silently enumerated against a guessed page.
 	dict := map[string]any{}
 	if extras != nil {
-		dict["extras"] = extras
+		dict = maps.DeepCopyJSON(extras)
 	}
 
 	// Index stages by name so we can walk them in dependency order.
