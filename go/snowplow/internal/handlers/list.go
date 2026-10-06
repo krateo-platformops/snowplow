@@ -75,9 +75,26 @@ func List() http.HandlerFunc {
 		log.Debug("performing discovery", slog.String("category", cat))
 		res, err := cli.Discover(context.Background(), cat)
 		if err != nil {
-			log.Error("discovery failed", slog.Any("err", err))
-			response.InternalError(wri, err)
-			return
+			// #517 — A PARTIAL DISCOVERY IS DEGRADED, NOT FATAL. One stale
+			// aggregated APIService must not break /list for every category:
+			// Discover hands back the healthy groups' resources next to a
+			// *PartialDiscoveryError, so serve those and report the
+			// degradation. Anything else (a transport/auth failure, or a group
+			// failure that left NOTHING healthy) is still a 500 — that is the
+			// whole point of discriminating.
+			pd, partial := dynamic.AsPartialDiscovery(err)
+			if !partial {
+				log.Error("discovery failed", slog.Any("err", err))
+				response.InternalError(wri, err)
+				return
+			}
+			// WARN, because some group/versions genuinely failed: the names are
+			// the actionable datum (they identify the stale APIService), and the
+			// response below is a SHORTER list than the cluster really has.
+			log.Warn("discovery is DEGRADED: serving the healthy API groups only",
+				slog.String("category", cat),
+				slog.Any("failedGroups", pd.FailedGroupVersions()),
+				slog.String("cause", pd.Error()))
 		}
 		log.Debug(fmt.Sprintf("discovery terminated (found: %d)", len(res)))
 
