@@ -736,6 +736,20 @@ type ResolvedCacheStore struct {
 	// remintByClass splits it over the closed RemintClasses set.
 	remintTotal   atomic.Uint64
 	remintByClass [len(RemintClasses)]atomic.Uint64
+	// #496 — in-window refreshes the warmth gate REFUSED to re-mint because the
+	// cell was cold. This exists because remint_total alone cannot answer "is the
+	// gate working": after #496 a zero remint_total is the NORMAL reading on a
+	// lightly-browsed pod (nothing is customer-warm), so zero no longer
+	// distinguishes "the carrier is inert" (the #378 FAIL it used to mean) from
+	// "there was correctly nothing to re-mint". Read as a PAIR:
+	//   remint_total > 0                     → the carrier works
+	//   refused > 0                          → the gate is doing its job, and
+	//                                          those cells are now reclaimable
+	//   both 0 on a pod past maxAge − L      → the window is not being reached
+	//                                          at all (the real inert case)
+	// Monotonic. A cell refused here is left to the reaper's cold-evict, which is
+	// precisely the #259 / #191 bound this issue restored.
+	remintRefusedColdTotal atomic.Uint64
 
 	// #354 P3 (E, B3) — warm cells whose key carries a page (Page>0 ||
 	// PerPage>0) or request extras, per identity-bound class, recomputed on the
@@ -1657,13 +1671,63 @@ func (c *ResolvedCacheStore) remintLead() time.Duration {
 }
 
 // inRemintWindowLocked is the #378 freshMint predicate over the RESIDENT item:
-// maxEntryAge enabled, a known birth, and a BornAt age at or past
-// maxEntryAge − remintLead(). Callers hold c.mu.
+// maxEntryAge enabled, a known birth, a BornAt age at or past
+// maxEntryAge − remintLead(), and (#496) the cell is WARM. Callers hold c.mu.
+//
+// #496 — WHY WARMTH IS PART OF THE PREDICATE. Without it the re-mint extends a
+// COLD cell's max-age clock, and nothing can then reclaim that cell ever: the
+// reaper's cold-evict fires only on `pastMaxAge && !warm` (resolved.go, the
+// walk's `case pastMaxAge && !warm`), and BornAt keeps moving out from under it,
+// while the TTL cannot reclaim it either because the same refresh resets
+// CreatedAt. That silently removed the 24h bound #259 names as the dep-hot
+// orphan's reclamation path, and the #191 terminator with it.
+//
+// WHAT IT COSTS #378, stated correctly — the first version of this comment
+// overclaimed and the #505 gate falsified it. Production has TTL=3600s and
+// maxEntryAge=86400s, so remintLead() = min(TTL, maxAge/2) = TTL exactly and the
+// window [cap−TTL, cap) is exactly one TTL wide. For a cell whose last customer
+// read r lies inside the window, an in-window refresh at t >= r satisfies
+// t−r < TTL, so the cell is warm at that refresh and is re-minted. That ORDER
+// is the whole of the guarantee: it holds for refreshes AT OR AFTER the warming
+// read, NOT for every in-window refresh.
+//
+// The residual the gate therefore accepts: a cell whose in-window refresh lands
+// BEFORE its first read is refused here, and if no further refresh arrives
+// between that read and the cap, the customer takes a max-age cold navigation —
+// which trips #378's own evict_max_age_warm_customer_total. Measured A/B on
+// identical geometry (#505 gate): gated hit=false with that counter 0→1, ungated
+// hit=true with counters flat. Exposure is bounded by the refresh cadence (one
+// refresh interval out of the one-hour window, order 1–5% of in-window first
+// reads, see #479 for the measured per-cell cadence), and it is NOT a regression
+// against what is live: 1.12.36 has no re-mint at all, so today EVERY
+// warm-at-cap cell cold-navigates and this residual is a strict subset.
+//
+// It is the SAME predicate the reaper uses, evaluated under the SAME lock, which
+// is the real repair: before #496 the writer said "extend" about a cell the
+// reaper called "reclaimable", and that disagreement WAS the unreclaimable cell.
+// Now "re-minted" and "not cold-reapable" are one statement and cannot drift.
+//
+// Seeded cells: a REFRESHER re-Put overwrites the entry with SeededAtBoot=false
+// (the field doc on ResolvedEntry.SeededAtBoot), so a boot-seeded cell loses
+// seed warmth at its first refresh and is gated from then on. But a customer
+// read is NOT the only way back — the keepwarm sweep's terminal write hardcodes
+// SeededAtBoot=true (phase1_pip_seed.go, mode-independent), so a keepwarm-scoped
+// cell regains seed warmth with no customer involved and can be re-minted
+// indefinitely. That is the #376 "internal reads must not fake warmth" lesson
+// surviving in this flag; it is tracked separately and NOT closed here.
 func (c *ResolvedCacheStore) inRemintWindowLocked(item *lruItem, now time.Time) bool {
 	if c.maxEntryAge <= 0 || item == nil || item.entry == nil || item.entry.BornAt.IsZero() {
 		return false
 	}
-	return now.Sub(item.entry.BornAt) >= c.maxEntryAge-c.remintLead()
+	if now.Sub(item.entry.BornAt) < c.maxEntryAge-c.remintLead() {
+		return false
+	}
+	// In the window. Re-mint only a WARM cell; a cold one is left reclaimable.
+	if !c.warmLocked(item, now) {
+		c.remintRefusedColdTotal.Add(1)
+		return false
+	}
+	return true
 }
 
 // RemintClasses is the CLOSED class set of snowplow_resolved_cache_remint_total
@@ -2113,6 +2177,11 @@ type ResolvedCacheStats struct {
 	OldestWarmBornAgeSeconds uint64
 	// #378 — refresher-terminal re-mints (BornAt resets) accepted.
 	RemintTotal uint64
+	// #496 — in-window refreshes the warmth gate refused (cold cell). Read as a
+	// PAIR with RemintTotal: after #496 a zero RemintTotal is normal on a pod
+	// with no customer-warm working set, so only both-zero on an exercised pod
+	// means the window is never reached.
+	RemintRefusedColdTotal uint64
 
 	// #316 — proactive refreshes enqueued by the read-independent pass (see
 	// proactiveRefreshTotal). Monotonic; non-zero DURING a missed-dirty-mark
@@ -2194,6 +2263,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		EvictTTLWarmCustomerTotal:    c.evictTTLWarmCustomerTotal.Load(),
 		OldestWarmBornAgeSeconds:     c.oldestWarmBornAgeGauge.Load(),
 		RemintTotal:                  c.remintTotal.Load(),
+		RemintRefusedColdTotal:       c.remintRefusedColdTotal.Load(),
 		ProactiveRefreshTotal:        c.proactiveRefreshTotal.Load(),
 		ApistageStoreTotal:           c.apistageStoreTotal.Load(),
 		ApistageEvictTotal:           c.apistageEvictTotal.Load(),

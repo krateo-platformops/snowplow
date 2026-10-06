@@ -148,6 +148,11 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		// #378 — refresher-terminal writes that re-minted (reset BornAt). By class:
 		// the hand-wired OTLP counter snowplow_resolved_cache_remint_total{class}.
 		"remint_total": int64(s.RemintTotal),
+		// #496 — in-window refreshes the warmth gate REFUSED (the cell was cold, so
+		// it stays reclaimable by the reaper's cold-evict: the #259/#191 bound).
+		// Read as a pair with remint_total — see the field doc on
+		// ResolvedCacheStore.remintRefusedColdTotal for the truth table.
+		"remint_refused_cold_total": int64(s.RemintRefusedColdTotal),
 		// #376 — resident WARM cells split by warmth SOURCE (both GAUGES). warm_seeded
 		// = boot-prewarmed cells; warm_lastread = cells kept warm by a read-within-TTL
 		// lastRead and NOT seeded. Decomposes the warm working set so GetNoTouch's
