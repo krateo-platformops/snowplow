@@ -1682,24 +1682,39 @@ func (c *ResolvedCacheStore) remintLead() time.Duration {
 // CreatedAt. That silently removed the 24h bound #259 names as the dep-hot
 // orphan's reclamation path, and the #191 terminator with it.
 //
-// It costs #378's own goal NOTHING, and that is a measured claim rather than a
-// hopeful one: production has TTL=3600s and maxEntryAge=86400s, so
-// remintLead() = min(TTL, maxAge/2) = TTL exactly, which makes the window
-// [cap−TTL, cap) exactly one TTL wide. For any cell whose last customer read r
-// lies inside that window, every in-window refresh at t satisfies t−r < TTL, so
-// a cell that is warm AT THE CAP is warm at every in-window refresh. The gate
-// therefore cannot suppress a re-mint for the population #378 exists to protect
-// (pop A and pop B of that issue are both warm by construction).
+// WHAT IT COSTS #378, stated correctly — the first version of this comment
+// overclaimed and the #505 gate falsified it. Production has TTL=3600s and
+// maxEntryAge=86400s, so remintLead() = min(TTL, maxAge/2) = TTL exactly and the
+// window [cap−TTL, cap) is exactly one TTL wide. For a cell whose last customer
+// read r lies inside the window, an in-window refresh at t >= r satisfies
+// t−r < TTL, so the cell is warm at that refresh and is re-minted. That ORDER
+// is the whole of the guarantee: it holds for refreshes AT OR AFTER the warming
+// read, NOT for every in-window refresh.
+//
+// The residual the gate therefore accepts: a cell whose in-window refresh lands
+// BEFORE its first read is refused here, and if no further refresh arrives
+// between that read and the cap, the customer takes a max-age cold navigation —
+// which trips #378's own evict_max_age_warm_customer_total. Measured A/B on
+// identical geometry (#505 gate): gated hit=false with that counter 0→1, ungated
+// hit=true with counters flat. Exposure is bounded by the refresh cadence (one
+// refresh interval out of the one-hour window, order 1–5% of in-window first
+// reads, see #479 for the measured per-cell cadence), and it is NOT a regression
+// against what is live: 1.12.36 has no re-mint at all, so today EVERY
+// warm-at-cap cell cold-navigates and this residual is a strict subset.
 //
 // It is the SAME predicate the reaper uses, evaluated under the SAME lock, which
 // is the real repair: before #496 the writer said "extend" about a cell the
 // reaper called "reclaimable", and that disagreement WAS the unreclaimable cell.
 // Now "re-minted" and "not cold-reapable" are one statement and cannot drift.
 //
-// Seeded cells are covered rather than exempt: warmLocked counts SeededAtBoot,
-// but a refresher re-Put overwrites the entry with SeededAtBoot=false (the field
-// doc on ResolvedEntry.SeededAtBoot), so a boot-seeded cell loses seed warmth at
-// its FIRST refresh and is gated from then on unless a customer reads it.
+// Seeded cells: a REFRESHER re-Put overwrites the entry with SeededAtBoot=false
+// (the field doc on ResolvedEntry.SeededAtBoot), so a boot-seeded cell loses
+// seed warmth at its first refresh and is gated from then on. But a customer
+// read is NOT the only way back — the keepwarm sweep's terminal write hardcodes
+// SeededAtBoot=true (phase1_pip_seed.go, mode-independent), so a keepwarm-scoped
+// cell regains seed warmth with no customer involved and can be re-minted
+// indefinitely. That is the #376 "internal reads must not fake warmth" lesson
+// surviving in this flag; it is tracked separately and NOT closed here.
 func (c *ResolvedCacheStore) inRemintWindowLocked(item *lruItem, now time.Time) bool {
 	if c.maxEntryAge <= 0 || item == nil || item.entry == nil || item.entry.BornAt.IsZero() {
 		return false
