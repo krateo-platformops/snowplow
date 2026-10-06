@@ -83,6 +83,21 @@ func h1BuildWatcherWithRA(t *testing.T) dynamic.Interface {
 	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	// #471(b) — the ORDERING is the point. RebuildRBACSnapshotForTest below is
+	// SYNCHRONOUS, but this watcher's INITIAL publish runs on a detached
+	// goroutine (waitAndPublishInitialRBACSnapshot), so without this await the
+	// detached publish can land AFTER the synchronous rebuild and overwrite the
+	// snapshot the arm just built, mid-arm. Awaiting first makes the
+	// synchronous rebuild the last publish, which is what reseed_widening_test.go,
+	// nested_call_falsifier_test.go, learned_identity_262_harness_test.go and
+	// rotated_effective_groups_436_test.go already do.
+	//
+	// The cleanup below is NOT the hazard: it calls rw.Stop() before
+	// PublishRBACSnapshotForTest(nil), and Stop joins the initial publisher via
+	// goroutineWG.Wait (watcher.go), so a late publish cannot outlive it.
+	if err := rw.WaitInitialRBACPublishForTest(5 * time.Second); err != nil {
+		t.Fatalf("WaitInitialRBACPublishForTest: %v", err)
+	}
 	cache.RebuildRBACSnapshotForTest(rw)
 	prev := cache.Global()
 	cache.SetGlobal(rw)

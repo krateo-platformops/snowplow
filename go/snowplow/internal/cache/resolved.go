@@ -3484,6 +3484,28 @@ func resetResolvedCacheForTest() {
 	// tears the singleton down still reports the previous store's stats
 	// through /debug/vars and OTLP.
 	resolvedCachePublished.Store(nil)
+	// #471 — the sliceability memo is a DERIVED INDEX OVER THIS STORE's
+	// content: every entry is a verdict about one (raKey x sliceShape) cell
+	// that lived in the store we just dropped. Leaving it behind leaves a
+	// dangling index — the next first-sight serve of the same raKey finds a
+	// verdict already "known", skips the page-keyed byte-verify, and reports
+	// a hit against a cell that no longer exists. That is the #471 -count
+	// non-idempotence: iteration 1 records the verdict, iteration 2 computes
+	// the same memo key (raKey folds a deterministic fixture BindingUID) and
+	// takes the already-known branch.
+	//
+	// The reverify worker goes with it: its queue holds raKeys whose only
+	// referent is the memo we just replaced, so a drain after the reset would
+	// invalidate entries in the NEW memo on behalf of the old store.
+	//
+	// Folded in HERE rather than left to each caller because a store teardown
+	// that does not drop the index derived from it is not a clean store —
+	// which is also why widgets/apiref could not fix this from the outside:
+	// resetSliceabilityMemoForTest is unexported, so the 30 apiref call sites
+	// had no reachable reset and worked around it with per-test raKeys instead
+	// (powerless at -count>1, where a test's second iteration IS its sibling).
+	resetSliceabilityReverifyWorkerForTest()
+	resetSliceabilityMemoForTest()
 }
 
 // stopResolvedCacheSummaryForTest stops the summary goroutine started by
