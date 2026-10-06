@@ -185,3 +185,95 @@ func TestIssue504_UnknownNamespaceDoesNotMergeWithClusterScoped(t *testing.T) {
 		t.Errorf("#504: the sort must be total over NamespaceUnknown (known first); got %+v", out)
 	}
 }
+
+// TestIssue504_LiteralDiscoveryPathStillEnumeratesCleanly is the ACCEPTANCE arm
+// whose absence let a regression ship (#515 gate F1).
+//
+// Ruling 3's arm only asserted that a COLLAPSED resource becomes unresolvable —
+// a one-directional discriminator. Nothing asserted the other direction: that a
+// LITERAL discovery path keeps working. It did not: skeletonizeTemplatedPath
+// leaves a literal unchanged and the templated() predicate counts an empty
+// segment as non-static, so a literal trailing slash ("/apis/apps/v1/", no jq
+// anywhere) was flagged as a collapsed resource and 422'd a path that answers
+// 200 on main.
+//
+// A guard that can only fail in one direction is not coverage for the other.
+func TestIssue504_LiteralDiscoveryPathStillEnumeratesCleanly(t *testing.T) {
+	withInspectSARESTConfig(t, discovery504(t))
+
+	for _, path := range []string{
+		"/apis/apps/v1",  // bare group discovery, no trailing slash
+		"/apis/apps/v1/", // WITH a trailing slash — the F1 regression shape
+		"/api/v1",        // core discovery
+		"/api/v1/",       // core, trailing slash
+	} {
+		ra := &templates.RESTAction{
+			Spec: templates.RESTActionSpec{
+				API: []*templates.API{{Name: "disco", Path: path}},
+			},
+		}
+		rows, unresolved, err := InspectReadSet(context.Background(), ra, nil)
+		if err != nil {
+			t.Fatalf("path %q: InspectReadSet errored: %v", path, err)
+		}
+		if len(unresolved) != 0 {
+			t.Errorf("#515 F1 REGRESSION: literal discovery path %q must stay RESOLVABLE "+
+				"(it contains no template at all); got unresolved=%+v", path, unresolved)
+		}
+		if len(rows) != 0 {
+			t.Errorf("path %q: a discovery path contributes no read-set rows; got %+v", path, rows)
+		}
+	}
+}
+
+// TestIssue504_PartiallySkippedIteratorKeepsTheRowsThatRendered is the other
+// missing arm (#515 gate F2).
+//
+// An iterator stage expands to one option per element. When one element's path
+// fails to render — a jq error, or a surviving ${...} that the #293 guard
+// refuses — the rows that DID render must survive. Failing the whole stage threw
+// them away: 2 rows + 200 became 0 rows + 422, which is #504's own symptom
+// wearing a different shape.
+//
+// Whether a partially-skipped stage SHOULD fail loud is a fourth ruling nobody
+// has made; this arm pins the pre-#504 behaviour until someone does, so the
+// question cannot be settled silently by a refactor.
+func TestIssue504_PartiallySkippedIteratorKeepsTheRowsThatRendered(t *testing.T) {
+	withInspectSARESTConfig(t, discovery504(t))
+
+	ra := &templates.RESTAction{
+		Spec: templates.RESTActionSpec{
+			API: []*templates.API{
+				{
+					Name: "per-ns",
+					// One element renders cleanly; the other carries a literal
+					// "${" so its rendered path trips the #293 unrendered-template
+					// guard — a NON-emptyInterp skip, which is the class that
+					// used to fail the whole stage.
+					Path: `${ "/apis/apps/v1/namespaces/" + (.) + "/deployments" }`,
+					DependsOn: &templates.Dependency{
+						Iterator: ptrStr(".namespaces"),
+					},
+				},
+			},
+		},
+	}
+	rows, unresolved, err := InspectReadSet(context.Background(), ra,
+		map[string]any{"namespaces": []any{"ns-a", "${ still-a-template }"}})
+	if err != nil {
+		t.Fatalf("InspectReadSet errored: %v", err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("#515 F2: a stage whose other elements rendered must not be failed whole; unresolved=%+v", unresolved)
+	}
+	var got []string
+	for _, r := range rows {
+		if r.Resource == "deployments" {
+			got = append(got, r.Namespace)
+		}
+	}
+	if len(got) != 1 || got[0] != "ns-a" {
+		t.Errorf("#515 F2 REGRESSION: the element that DID render must survive the one that did not; "+
+			"got namespaces %v (rows=%+v)", got, rows)
+	}
+}

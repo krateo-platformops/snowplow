@@ -320,6 +320,17 @@ type ReadSetCoord struct {
 }
 
 func ReadSetSkeleton(path string) ReadSetCoord {
+	// #515 gate F1 — ResourceTemplated MUST NOT fire on a literal path.
+	// skeletonizeTemplatedPath leaves a literal unchanged, and the templated()
+	// predicate below counts an EMPTY segment as non-static — so a literal
+	// trailing slash ("/apis/apps/v1/", no jq anywhere) skeletonized to the same
+	// string as `${ "/apis/apps/v1/" + .kind }` and looked templated. Both are
+	// OK=false, which is right, but flagging the literal one as a COLLAPSED
+	// RESOURCE turned a 200 into a 422 for a path that contains no template at
+	// all. The template and the render genuinely cannot be told apart from the
+	// skeleton alone here; what distinguishes them is whether the author wrote a
+	// template, which only the raw path can say.
+	hasTemplate := strings.Contains(path, "${")
 	skel := skeletonizeTemplatedPath(path)
 	if skel == "" {
 		return ReadSetCoord{}
@@ -361,7 +372,7 @@ func ReadSetSkeleton(path string) ReadSetCoord {
 			}
 			resource := parts[4]
 			if templated(resource) {
-				return ReadSetCoord{ResourceTemplated: true}
+				return ReadSetCoord{ResourceTemplated: hasTemplate}
 			}
 			ns := parts[3]
 			g := schema.GroupVersionResource{Group: group, Version: version, Resource: resource}
@@ -372,7 +383,7 @@ func ReadSetSkeleton(path string) ReadSetCoord {
 		}
 		resource := parts[2]
 		if templated(resource) {
-			return ReadSetCoord{ResourceTemplated: true}
+			return ReadSetCoord{ResourceTemplated: hasTemplate}
 		}
 		return ReadSetCoord{GVR: schema.GroupVersionResource{Group: group, Version: version, Resource: resource}, Name: nameAt(parts, 3), OK: true}
 
@@ -405,7 +416,7 @@ func ReadSetSkeleton(path string) ReadSetCoord {
 			}
 			resource := parts[3]
 			if templated(resource) {
-				return ReadSetCoord{ResourceTemplated: true}
+				return ReadSetCoord{ResourceTemplated: hasTemplate}
 			}
 			ns := parts[2]
 			g := schema.GroupVersionResource{Version: version, Resource: resource}
@@ -416,7 +427,7 @@ func ReadSetSkeleton(path string) ReadSetCoord {
 		}
 		resource := parts[1]
 		if templated(resource) {
-			return ReadSetCoord{ResourceTemplated: true}
+			return ReadSetCoord{ResourceTemplated: hasTemplate}
 		}
 		return ReadSetCoord{GVR: schema.GroupVersionResource{Version: version, Resource: resource}, Name: nameAt(parts, 2), OK: true}
 	}

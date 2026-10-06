@@ -297,6 +297,21 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 
 	for _, sk := range skips {
 		if sk.reason.class != reasonEmptyInterp {
+			// #515 gate F2 — DO NOT DISCARD THE OPTIONS THAT DID ENUMERATE.
+			// An iterator stage expands to one option per element, and one
+			// element's path can fail to render (a jq error, or a surviving
+			// ${...}) while the others render fine. Failing the whole stage then
+			// threw away rows that had enumerated correctly: 2 rows + 200 became
+			// 0 rows + 422 — #504's own symptom on a different shape, and NOT one
+			// of the three rulings.
+			//
+			// Whether a PARTIALLY skipped stage should fail loud (a partial
+			// read-set under-grants) or enumerate what it can is a real question,
+			// but it is a fourth ruling nobody has made. Until then this preserves
+			// pre-#504 behaviour: raise only when nothing enumerated at all.
+			if len(opts) > 0 {
+				continue
+			}
 			return nil, fmt.Errorf("stage path is not enumerable: %s", sk.reason.detail)
 		}
 		co := cache.ReadSetSkeleton(stage.Path)
@@ -375,10 +390,11 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 		// real resource. That is the silent under-grant this file forbids
 		// elsewhere, arriving through the one branch that returns no rows.
 		//
-		// The render cannot distinguish the two; only the template can. A
-		// ResourceTemplated skeleton means the stage HAD a resource segment and
-		// it interpolated away, so the coordinate is undetermined and the stage
-		// must fail loud.
+		// The render cannot distinguish the two, and NEITHER CAN THE SKELETON
+		// (#515 gate F1): a literal trailing slash skeletonizes identically to a
+		// collapsed interpolation. ResourceTemplated therefore requires that the
+		// author actually wrote a template — see ReadSetSkeleton. A literal
+		// /apis/apps/v1/ stays a legitimate discovery path, as it is today.
 		if _, ok := cache.ParseAPIServerDiscoveryPath(path); ok {
 			if co := cache.ReadSetSkeleton(stage.Path); co.ResourceTemplated {
 				return nil, fmt.Errorf("path %q renders as bare discovery but the stage's RESOURCE segment is templated — "+
