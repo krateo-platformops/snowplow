@@ -66,7 +66,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -626,22 +625,68 @@ func (h *controllerHealthHandle) inScope(ns string) bool {
 // design §2.3 Conjunct A: this is a fresh API call (NOT informer-
 // served) so we avoid adding a Pods informer (the data-plane Pods
 // at production scale would blow up cardinality). The LIST is
-// bounded by Deployment.Spec.Selector and ns; ≤ ~50 pods per
-// controller in practice; one LIST per rebuild per controller.
+// bounded by the WHOLE Deployment.Spec.Selector and ns; ≤ ~50 pods
+// per controller in practice; one LIST per rebuild per controller.
 //
 // READ-ONLY — no write verbs. HG-2 discharge.
+//
+// SELECTOR DERIVATION (#509). The whole LabelSelector is folded by
+// metav1.LabelSelectorAsSelector — MatchLabels AND MatchExpressions.
+// The previous labels.SelectorFromSet(Selector.MatchLabels) read only
+// MatchLabels, and apimachinery treats a nil/empty Set as
+// Everything() (pkg/labels/selector.go:943-986), so a Deployment whose
+// spec.selector is expressed only through matchExpressions — valid,
+// and satisfying the required-field constraint — produced an EMPTY
+// selector string, i.e. a LIST of every pod in the namespace whose
+// restarts were then attributed to that one controller.
+//
+// Both failure directions (over-selection, and a truncated page) push
+// the restart figure UP, so the symptom is a false alarm on a
+// detector that reads confidently while measuring the wrong thing.
+// Hence: a selector that would degrade to match-everything reports
+// NOTHING, and a truncated page is logged at Warn so a partial count
+// cannot be mistaken for a healthy one.
 func (h *controllerHealthHandle) podRestartCounts(dep *appsv1.Deployment) (map[string]int, int) {
 	out := map[string]int{}
 	total := 0
 	if h == nil || h.client == nil || dep == nil {
 		return out, total
 	}
-	if dep.Spec.Selector == nil {
+	sel, err := metav1.LabelSelectorAsSelector(dep.Spec.Selector)
+	if err != nil {
+		// An operator this client cannot convert (helpers.go:51-69
+		// returns an error for an unknown one). Reporting nothing is
+		// the only safe answer — degrading to a namespace-wide LIST
+		// IS the defect.
+		slog.Warn("cache.controller_health.pod_selector_invalid",
+			slog.String("subsystem", "cache"),
+			slog.String("ns", dep.Namespace),
+			slog.String("name", dep.Name),
+			slog.Any("err", err),
+			slog.String("consequence", "pod-restart conjunct reports nothing for this controller rather than counting every pod in the namespace"),
+		)
 		return out, total
 	}
-	sel := labels.SelectorFromSet(labels.Set(dep.Spec.Selector.MatchLabels))
+	// LabelSelectorAsSelector maps nil → labels.Nothing() and empty →
+	// labels.Everything(), but BOTH stringify to "" (selector.go:96-104),
+	// and "" on the wire means "every pod in the namespace". The string
+	// form therefore cannot carry Nothing, so the empty string is
+	// refused here instead of being sent. (A Deployment selector is a
+	// required, non-empty field, so this is an anomaly, not a shape we
+	// must serve.)
+	selStr := sel.String()
+	if selStr == "" {
+		slog.Warn("cache.controller_health.pod_selector_empty",
+			slog.String("subsystem", "cache"),
+			slog.String("ns", dep.Namespace),
+			slog.String("name", dep.Name),
+			slog.Bool("selector_nil", dep.Spec.Selector == nil),
+			slog.String("consequence", "pod-restart conjunct reports nothing for this controller rather than counting every pod in the namespace"),
+		)
+		return out, total
+	}
 	pods, err := h.client.CoreV1().Pods(dep.Namespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: sel.String(),
+		LabelSelector: selStr,
 		Limit:         listPageLimit,
 	})
 	if err != nil {
@@ -664,6 +709,23 @@ func (h *controllerHealthHandle) podRestartCounts(dep *appsv1.Deployment) (map[s
 		}
 		out[p.Name] = sum
 		total += sum
+	}
+	// With the selector folded correctly the set is bounded by the
+	// selector itself (≤ ~50 pods per controller), so listPageLimit
+	// (500) is effectively unreachable and a continue walk would be
+	// dead code. If it IS reached, the figure below is partial — and
+	// a partial count that reads as a healthy one is the same
+	// detector failure as over-selection, so say so at Warn.
+	if pods.Continue != "" {
+		slog.Warn("cache.controller_health.pod_list_truncated",
+			slog.String("subsystem", "cache"),
+			slog.String("ns", dep.Namespace),
+			slog.String("name", dep.Name),
+			slog.String("selector", selStr),
+			slog.Int("counted_pods", len(pods.Items)),
+			slog.Int64("page_limit", listPageLimit),
+			slog.String("consequence", "pod-restart total is PARTIAL — restarts on the unlisted pods are invisible and this controller may read healthy while crash-looping"),
+		)
 	}
 	return out, total
 }
