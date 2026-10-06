@@ -126,6 +126,16 @@ func newF6Watcher(t *testing.T, seed ...runtime.Object) {
 	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	// #471(b) — WaitForCacheSync returns when the informers have synced, NOT
+	// when this watcher's initial RBAC snapshot has been published: that runs
+	// on a detached goroutine (waitAndPublishInitialRBACSnapshot). Without the
+	// await, the arm starts against rbacSnap == nil (degrade-to-deny) or has
+	// the publish land mid-arm. #385 added this seam for exactly that and four
+	// dispatchers harnesses plus three in restactions/api already use it; this
+	// one and edge3NewWatcher did not.
+	if err := rw.WaitInitialRBACPublishForTest(5 * time.Second); err != nil {
+		t.Fatalf("WaitInitialRBACPublishForTest: %v", err)
+	}
 
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })

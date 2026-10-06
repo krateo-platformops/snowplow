@@ -314,9 +314,12 @@ func TestRAServe_EmptyFullDoesNotFreeze(t *testing.T) {
 	}
 	ctx := ctxWithUser(t)
 
-	// Unique RA name so this test is self-isolating from the PROCESS-GLOBAL
-	// sliceability memo (not reset by ResetResolvedCacheForTest) — a verdict
-	// recorded by another test for "compositions-panels" must never leak here.
+	// Unique RA name so this test is self-isolating in the PROCESS-GLOBAL
+	// sliceability memo — a verdict recorded by another test for
+	// "compositions-panels" must never leak here. Since #471 the memo is
+	// cleared by ResetResolvedCacheForTest as well (it is a derived index over
+	// the store that call drops), so this is belt-and-braces, not the only
+	// mitigation it used to be.
 	const raName = "compositions-panels-empty-guard"
 
 	// --- Not-synced: first /call resolves EMPTY. ---
