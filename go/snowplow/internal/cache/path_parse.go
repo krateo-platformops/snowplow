@@ -329,13 +329,40 @@ func ReadSetSkeleton(path string) ReadSetCoord {
 	// RESOURCE turned a 200 into a 422 for a path that contains no template at
 	// all. The template and the render genuinely cannot be told apart from the
 	// skeleton alone here; what distinguishes them is whether the author wrote a
-	// template, which only the raw path can say.
+	// template, which only the raw path can say — so this starts from the raw
+	// path and is NARROWED below once a query says where the template landed
+	// (#520).
 	hasTemplate := strings.Contains(path, "${")
 	skel := skeletonizeTemplatedPath(path)
 	if skel == "" {
 		return ReadSetCoord{}
 	}
 	if i := strings.IndexByte(skel, '?'); i >= 0 {
+		// #520 — THE QUERY IS NOT PART OF THE READ COORDINATE, AND THAT INCLUDES
+		// ITS TEMPLATES. hasTemplate above reads the whole raw path, so a template
+		// living only in the QUERY (`${ "/apis/apps/v1/?labelSelector=" + .sel }`)
+		// made the literal coordinate /apis/apps/v1/ look like a COLLAPSED
+		// RESOURCE and 422'd a read the apiserver answers 200 — the #515 F1 class
+		// again, reached by a different route. A constant wrapped string
+		// (`${ "/apis/apps/v1/?x=1" }`) 422'd for the same reason.
+		//
+		// Where each template LANDED is exactly what the skeleton records, so the
+		// query strip answers it: a sentinel before the '?' is a template in the
+		// PATH, and anything after it is query. Deliberately NOT a strip of the
+		// raw path before the Contains above: in the author idiom the whole path
+		// is one wrapped expression (`${ "..." + .v }`), so its `${` sits at index
+		// 0, BEFORE any '?', and a raw strip leaves hasTemplate true for every
+		// renderable shape — it would only "fix" the embedded form, which
+		// jqutil.MaybeQuery cannot render at all (it returns just the contents of
+		// the first `${...}`, discarding the literal context — plumbing
+		// jqutil.go:90-114).
+		//
+		// The fallback stays the raw path when there is NO query, because a
+		// trailing expression vanishes from the skeleton when the wrapped
+		// expression has a single string literal (strings.Join of one element
+		// inserts no sentinel) — which is the whole reason #515 had to consult the
+		// raw path here.
+		hasTemplate = strings.Contains(skel[:i], skeletonSentinel)
 		skel = skel[:i]
 	}
 	// NOT TrimRight'd: a trailing empty segment is the signature of a collapsed

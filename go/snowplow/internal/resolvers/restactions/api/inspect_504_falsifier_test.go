@@ -198,6 +198,10 @@ func TestIssue504_UnknownNamespaceDoesNotMergeWithClusterScoped(t *testing.T) {
 // 200 on main.
 //
 // A guard that can only fail in one direction is not coverage for the other.
+//
+// The shape list below carries no QUERY, which is how #520 — the same mistake
+// reading a string that still had the query attached — survived this arm. The
+// query-bearing shapes live in inspect_520_query_strip_falsifier_test.go.
 func TestIssue504_LiteralDiscoveryPathStillEnumeratesCleanly(t *testing.T) {
 	withInspectSARESTConfig(t, discovery504(t))
 
