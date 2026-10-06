@@ -15,6 +15,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/http/util"
 	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	"sigs.k8s.io/yaml"
 )
@@ -69,6 +70,34 @@ const maxUnstructuredResponseTextBytes = 2048
 //     falsifiers (e),(g)).
 //   - On a 2xx response that converts: (Success envelope, jsonBytes,
 //     contentType, nil).
+//
+// #523 — THE ERROR-TEXT LEAK, AND THE RULE THIS FUNCTION NOW FOLLOWS.
+// `uri` below is built straight off opts.Endpoint.ServerURL, which carries a
+// tenant's credentials in its userinfo and its query. url.Parse,
+// http.NewRequestWithContext and Client.Do all report failure as a
+// *net/url.Error that renders that URI inside its TEXT — so #503's fix (route
+// every ServerURL FIELD read through redact.URL) does not reach it, and the
+// envelope Message built from it is logged at Error (resolve.go:1333), handed to
+// recordItemError as the ErrorKey VALUE, and wrapped into the item error. Three
+// consumers, one credential; redacting at the log site alone would have left the
+// other two.
+//
+// So the redaction happens HERE, where the error is still a *url.Error and the
+// fix can be structural rather than a pattern over prose. THE RULE: every error
+// this function did NOT compose itself from the upstream RESPONSE BODY goes
+// through redact.ErrorURL before it reaches the envelope or the caller. The two
+// that are left bare are the two body-derived ones — the non-2xx body snippet
+// and toJSONBytes' conversion failure — whose text is composed from the body and
+// the content-type and never from the URI. redact.ErrorURL returns an err with
+// no *url.Error in its chain unchanged, so following the rule costs nothing on
+// the paths where there is nothing to redact.
+//
+// KNOWN RESIDUAL at the httpClientForEndpoint site, stated rather than implied:
+// plumbing's parseProxyURL reports a bad ProxyURL as
+// `fmt.Errorf("could not parse: %v", proxyURL)` — free prose with no url.Error
+// to read, so redact.ErrorURL cannot clean it. That is a DIFFERENT field
+// (ProxyURL, not ServerURL) leaking by a different mechanism; it is the #453 /
+// #500 error-prose class and is tracked as #536.
 func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions) (*response.Status, []byte, string, error) {
 	// --- request assembly (transcribed from request.go:36-95) ---
 	uri := strings.TrimSuffix(opts.Endpoint.ServerURL, "/")
@@ -78,7 +107,12 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 
 	u, err := url.Parse(uri)
 	if err != nil {
-		return response.New(http.StatusInternalServerError, err), nil, "", err
+		// #523: url.Error renders `uri` — i.e. the ServerURL — VERBATIM.
+		// A fresh name rather than a reassignment of err: the #503 structural
+		// guard's taint is flow-INSENSITIVE, so an object tainted once stays
+		// tainted and `err = redact.ErrorURL(err)` would read as dirty forever.
+		redErr := redact.ErrorURL(err)
+		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 
 	verb := ptr.Deref(opts.Verb, http.MethodGet)
@@ -107,7 +141,10 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 
 	call, err := http.NewRequestWithContext(ctx, verb, u.String(), body)
 	if err != nil {
-		return response.New(http.StatusInternalServerError, err), nil, "", err
+		// #523: NewRequestWithContext returns url.Parse's *url.Error unwrapped
+		// (net/http request.go), so the URI rides out in its text here too.
+		redErr := redact.ErrorURL(err)
+		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 
 	// Additional headers for AWS Signature 4 algorithm — transcribed
@@ -163,7 +200,12 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	// endpoints_tls.go for the full trace.
 	cli, err := httpClientForEndpoint(ctx, opts.Endpoint, &opts.RequestInfo)
 	if err != nil {
-		werr := fmt.Errorf("unable to create HTTP Client for endpoint: %w", err)
+		// #523: the client builder composes its errors inside plumbing, so what
+		// arrives here is not ours to predict. ErrorURL cleans the chain when it
+		// does hold a *url.Error and returns it untouched when it does not —
+		// see the KNOWN RESIDUAL note on this function for the ProxyURL shape it
+		// cannot reach.
+		werr := redact.ErrorURL(fmt.Errorf("unable to create HTTP Client for endpoint: %w", err))
 		return response.New(http.StatusInternalServerError, werr), nil, "", werr
 	}
 
@@ -184,7 +226,13 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 
 	respo, err := retryCli.Do(call)
 	if err != nil {
-		return response.New(http.StatusInternalServerError, err), nil, "", err
+		// #523: net/http already wraps a transport failure in a *url.Error whose
+		// URL went through its own stripPassword — which replaces the PASSWORD
+		// and keeps the userinfo USERNAME and the entire query, so a ServerURL of
+		// the "https://svc@host/base?token=…" shape still renders its token in
+		// clear. redact.URL removes both.
+		redErr := redact.ErrorURL(err)
+		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 	defer respo.Body.Close()
 
@@ -196,7 +244,10 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	if !statusOK {
 		dat, rerr := io.ReadAll(io.LimitReader(respo.Body, maxUnstructuredResponseTextBytes))
 		if rerr != nil {
-			return response.New(http.StatusInternalServerError, rerr), nil, ct, rerr
+			// #523: a body-read failure is a TRANSPORT error, not the body's own
+			// text — http2 and the proxy path can surface it as a *url.Error.
+			redErr := redact.ErrorURL(rerr)
+			return response.New(http.StatusInternalServerError, redErr), nil, ct, redErr
 		}
 
 		res := &response.Status{}
@@ -211,7 +262,9 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	// request.go:118-120 406 gate DELETED) ---
 	dat, rerr := io.ReadAll(respo.Body)
 	if rerr != nil {
-		return response.New(http.StatusInternalServerError, rerr), nil, ct, rerr
+		// #523: same transport class as the non-2xx read above.
+		redErr := redact.ErrorURL(rerr)
+		return response.New(http.StatusInternalServerError, redErr), nil, ct, redErr
 	}
 
 	jsonBytes, cerr := toJSONBytes(ct, dat)
