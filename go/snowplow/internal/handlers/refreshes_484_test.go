@@ -294,23 +294,34 @@ func awaitHoldMeasured(streams []*spaStream, keys []string, gen int, soft time.D
 // #484 never offered and north-star.md:276-281 marks as unenforced.
 func requireDelivered(t *testing.T, streams []*spaStream, keys []string, gen int, soft time.Duration, what string) {
 	t.Helper()
+	// resync is load-bearing for reading a failure here, not decoration (#521,
+	// G3). w484HardDeadline (30 s) straddles the force-resync hatch at
+	// RefreshLivenessInterval (20 s, refresh_broadcaster.go:153,161), so a
+	// genuinely stalled subscriber is force-resynced BEFORE the wait gives up.
+	// The F-DROP/F-COALESCE client models do not implement the resync→revalidate
+	// contract, so a resync DURING this wait means the cell is missing because
+	// the fixture ignored a resync frame, not because the update was lost.
+	//
+	// It must be a DELTA across the wait, not the absolute counter (#521, G6).
+	// The absolute is per-test — seedPanels calls ResetRefreshBroadcasterForTest
+	// (refreshes_eviction_test.go:100) and every 484 arm seeds first — but two of
+	// this helper's call sites sit inside StallForcesResyncAndReconnectRepairs,
+	// which DELIBERATELY drives the counter to w484M before calling it. Reading
+	// the absolute there would report "fixture gap" for cells belonging to the
+	// freshly RECONNECTED streams, which that test asserts are not resynced —
+	// steering the next reader away from what would most likely be a genuine
+	// delivery failure to reconnected subscribers. Same defect class as G3 and
+	// F1, introduced by the G3 fix itself.
+	resync0 := cache.RefreshBroadcasterStatsSnapshot().PendingOverflowResync
 	miss, took := awaitHoldMeasured(streams, keys, gen, soft)
 	if len(miss) > 0 {
 		_, _, dropped, _ := cache.RefreshBroadcasterCounters()
-		// resync is load-bearing for reading this failure, not decoration
-		// (#521, G3). w484HardDeadline (30 s) straddles the force-resync hatch
-		// at RefreshLivenessInterval (20 s, refresh_broadcaster.go:153,161), so
-		// a genuinely stalled subscriber is force-resynced BEFORE this fires.
-		// The F-DROP/F-COALESCE client models do not implement the
-		// resync→revalidate contract, so a non-zero count here means the cell
-		// is missing because this fixture ignored a resync frame — NOT because
-		// the update was lost. Print it so the message cannot assert more than
-		// it can support.
-		resync := cache.RefreshBroadcasterStatsSnapshot().PendingOverflowResync
+		resync := cache.RefreshBroadcasterStatsSnapshot().PendingOverflowResync - resync0
 		t.Fatalf("%s: %d/%d stream×key cells NEVER rendered v%d within %v "+
-			"(dropped=%d, pending_overflow_resync=%d) — a lost update IF resync=0; "+
-			"if resync>0 the fixture ignored a force-resync frame and this is a "+
-			"FIXTURE gap, not a #484 defect: %v",
+			"(dropped=%d, pending_overflow_resync_during_wait=%d) — a lost update IF "+
+			"that delta is 0; if it is >0 a resync fired during the wait and this "+
+			"fixture ignored the frame, making it a FIXTURE gap rather than a #484 "+
+			"defect: %v",
 			what, len(miss), len(streams)*len(keys), gen, w484HardDeadline, dropped, resync, miss)
 	}
 	if took > soft {
