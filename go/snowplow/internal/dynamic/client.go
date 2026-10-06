@@ -118,14 +118,50 @@ func (uc *unstructuredClient) Discover(ctx context.Context, category string) (al
 			continue
 		}
 
+		// #508 — THE GROUP AND VERSION LIVE ON THE LIST, NOT ON THE RESOURCE.
+		// apimachinery documents APIResource.Group as "the preferred group of
+		// the resource. Empty implies the group of the containing resource
+		// list", and Version identically (types.go:1180-1184). They are
+		// populated only where a resource differs from its containing list —
+		// subresources, e.g. a v1 Scale inside a v1beta1 list. For every
+		// ordinary resource both are EMPTY.
+		//
+		// So reading them directly produced GroupVersionResource{"", "",
+		// <plural>} for essentially every discovered resource, and the one
+		// consumer (handlers/list.go, GET /list?category=…) passes that to
+		// ListObjects → resourceInterfaceFor → mapper.KindFor, which then
+		// resolves by PLURAL ALONE across every group. That is correct only
+		// while a plural is unique cluster-wide: once two CRDs in different
+		// groups share one — which gets MORE likely as a cluster accumulates
+		// CRDs — the mapper resolves by priority or ambiguity rather than by
+		// what was asked for, and /list answers 200 with the wrong kind or
+		// silently without it. No error, no counter, no log says so.
+		gv, gvErr := schema.ParseGroupVersion(list.GroupVersion)
+		if gvErr != nil {
+			// A list whose own GroupVersion does not parse cannot be attributed
+			// to a group: skip it rather than emit a coordinate we cannot stand
+			// behind. (Unreachable from a conformant apiserver.)
+			continue
+		}
+
 		for _, el := range list.APIResources {
 			if !found(el, category) {
 				continue
 			}
 
+			// The per-resource fields WIN when set, which is what they are for
+			// (a subresource whose group/version differs from its list).
+			group, version := el.Group, el.Version
+			if group == "" {
+				group = gv.Group
+			}
+			if version == "" {
+				version = gv.Version
+			}
+
 			all = append(all, schema.GroupVersionResource{
-				Group:    el.Group,
-				Version:  el.Version,
+				Group:    group,
+				Version:  version,
 				Resource: el.Name,
 			})
 		}
