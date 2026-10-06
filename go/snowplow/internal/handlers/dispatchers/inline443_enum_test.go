@@ -128,6 +128,12 @@ var cacheAllow443 = map[string]cacheClass443{
 	"PIPStageTimingSinkFrom": readOnly443, "ParseAPIServerDiscoveryPath": readOnly443,
 	"ParseAPIServerDiscoveryRoot": readOnly443, "ParseAPIServerListDepSkeleton": readOnly443,
 	"ParseAPIServerPathToDep": readOnly443, "ParseAPIServerPathToGVR": readOnly443, "PrewarmEnabled": readOnly443,
+	// #504 — the read-set skeleton sibling and its three-state name. Both are
+	// PURE: a string in, a value out, no cache/informer/dep/refresher state and
+	// nothing that outlives the request. Classified next to the sibling parsers
+	// above (ParseAPIServerListDepSkeleton in particular) because they share the
+	// skeletonizer and differ only in policy.
+	"ReadSetSkeleton": readOnly443, "NameKind.IsSingleObject": readOnly443,
 	"PrewarmIterSerialFromContext": readOnly443, "PrewarmPathFromContext": readOnly443,
 	"RAFullListKeyInputs": readOnly443, "RefreshTriggerGVRFromContext": readOnly443, "RefreshTriggerHas": readOnly443,
 	"ReplayRAFullListSlices": readOnly443, "ResolvedCache": readOnly443, "ResolvedCacheEnabled": readOnly443,
