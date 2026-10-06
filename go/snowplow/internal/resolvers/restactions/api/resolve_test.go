@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,7 +57,17 @@ func TestMain(m *testing.M) {
 	xenv.SetTestMode(true)
 
 	namespace = "demo-system"
-	clusterName = "krateo"
+	// #522: a PER-PROCESS cluster name. kind.Cluster.Create is reuse-if-exists
+	// and Destroy is an unconditional `kind delete cluster --name <name>` with no
+	// ownership check, while testEnv.Run executes Setup BEFORE m.Run — so with a
+	// name shared across packages, ANY invocation of this binary (a -list, or a
+	// -run matching zero tests) created and then destroyed a machine-global
+	// cluster another process was using. Deriving the name from the pid makes
+	// every process name, and therefore delete, only its own cluster. It stays
+	// reapable — krateo-<pid> is collectable once that pid is gone — which keeps
+	// the orphan cleanup the shared name provided by accident and which a random
+	// name would lose.
+	clusterName = fmt.Sprintf("krateo-%d", os.Getpid())
 	testenv = env.New()
 
 	testenv.Setup(
