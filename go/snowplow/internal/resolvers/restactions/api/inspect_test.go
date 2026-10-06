@@ -219,7 +219,14 @@ func TestInspect_ExtrasIteratorStage_EmitsRowPerNamespace(t *testing.T) {
 						// The iterator query must yield a JSON ARRAY (jqutil.ForEach
 						// json.Unmarshals the result into []any); each element is fed
 						// to the path's ${.} per createRequestOption.
-						Iterator: ptrStr(".extras.namespaces"),
+						//
+						// #512 — this read `.extras.namespaces` and passed, because the
+						// implementation nested extras under an "extras" key while the
+						// DISPATCHER seeds them at top level. The arm agreed with the
+						// code and disagreed with production, so it could not catch the
+						// divergence. It now reads the shape a real RESTAction author
+						// writes (and that the dispatcher serves): top level.
+						Iterator: ptrStr(".namespaces"),
 					},
 				},
 			},
@@ -265,9 +272,12 @@ func TestInspect_UAFResourcesFrom_FanOut(t *testing.T) {
 					Name: "comp",
 					Path: "/apis/composition.krateo.io/v1/namespaces/krateo-system/fireworksapps",
 					UserAccessFilter: &templates.UserAccessFilterSpec{
-						Verb:          "watch",
-						Group:         "composition.krateo.io",
-						ResourcesFrom: "[ (.extras.plurals // [])[] ]",
+						Verb:  "watch",
+						Group: "composition.krateo.io",
+						// #512 — was "[ (.extras.plurals // [])[] ]": same nested-shape
+						// assumption as the iterator arm above. Top level is what the
+						// dispatcher seeds and what an author writes.
+						ResourcesFrom: "[ (.plurals // [])[] ]",
 					},
 				},
 			},
