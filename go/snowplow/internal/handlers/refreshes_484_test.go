@@ -162,42 +162,13 @@ func awaitArmed(t *testing.T, keys []string, subs int) {
 	}
 }
 
-// awaitHold waits until every stream holds want(k) for every key and returns
-// the cells that never got there.
-func awaitHold(streams []*spaStream, keys []string, gen int, d time.Duration) []string {
-	miss, _ := awaitHoldMeasured(streams, keys, gen, d)
-	return miss
-}
-
-// w484HardDeadline is how long awaitHoldMeasured keeps looking after the soft
-// budget expires, before it calls a cell genuinely LOST. Generous on purpose:
-// the question it answers is "did this ever arrive", and a wrong NO there is a
-// false alarm about data loss.
-const w484HardDeadline = 30 * time.Second
-
-// awaitHoldMeasured is awaitHold plus the ELAPSED TIME, and it is the fix for
-// #501.
-//
-// WHY. The #484 fix guarantees EVENTUAL delivery (a per-subscriber pending set),
-// not BOUNDED delivery — nothing in it promises a deadline, and #498 §A says so
-// explicitly. The arms nevertheless asserted a 1 s bound, so on a loaded CI
-// runner they failed about one run in three: three failures on 2026-10-06 alone,
-// on #492, #513 and #516, none of which touches the refresh path, against ZERO
-// reproductions in 17 local runs. Each cost a ~25 minute re-run and produced a
-// "PR run failed" notification for a PR whose code was fine.
-//
-// Widening the budget was the obvious move and the wrong one: the 1 s figure is
-// the only evidence anyone has about real drain latency, and #498 needs exactly
-// that number. So the arm now MEASURES instead of asserting: it returns how long
-// delivery took, the caller logs a late-but-correct delivery, and only a cell
-// that never arrives inside w484HardDeadline is a failure. A genuine loss stays
-// RED; a slow drain becomes a datapoint.
-func awaitHoldMeasured(streams []*spaStream, keys []string, gen int, soft time.Duration) ([]string, time.Duration) {
+// awaitHoldWithin is the one wait loop: it polls until every stream holds
+// want(k) for every key, gives up at hard, and returns both the cells that never
+// got there and how long it took. The two wrappers below differ ONLY in how they
+// choose hard, which is the whole distinction this file turns on.
+func awaitHoldWithin(streams []*spaStream, keys []string, gen int, hard time.Duration) ([]string, time.Duration) {
 	start := time.Now()
-	hard := start.Add(w484HardDeadline)
-	if soft > w484HardDeadline {
-		hard = start.Add(soft)
-	}
+	deadline := start.Add(hard)
 	var miss []string
 	for {
 		miss = miss[:0]
@@ -211,19 +182,95 @@ func awaitHoldMeasured(streams []*spaStream, keys []string, gen int, soft time.D
 		if len(miss) == 0 {
 			return nil, time.Since(start)
 		}
-		if time.Now().After(hard) {
+		if time.Now().After(deadline) {
 			return miss, time.Since(start)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
 }
 
-// requireDelivered is the assertion every #484 arm uses: a cell that never
-// arrives is a FAILURE (the defect #484 exists to prevent), while one that
-// arrives after the soft budget is REPORTED, with the latency, and passes.
+// awaitHold waits at most d — a GENUINE hard bound, honoured exactly as passed —
+// and returns the cells that never got there.
 //
-// The report is the point. It is the only place the drain latency of a resumed
-// subscriber is observable, and #498 is open on exactly that question.
+// It must not route through awaitHoldMeasured, which floors its deadline at
+// w484HardDeadline. It used to, and that was a defect found while gating this
+// change (#521, F1): `awaitHold(…, time.Second)` actually waited 30 s and then
+// failed with the words "not held within 1s". The bound the call site asked for
+// did not exist and the message asserted it did, which is the worse half — a
+// wrong duration in a failure message sends the next reader hunting a 1 s
+// regression that was never measured.
+//
+// Note what the fix was NOT: making that site enforce 1 s for real. Its wait is
+// for v1 to reach every stream, which rides the SAME un-paced drain as the
+// delivery under test, so it is load-sensitive for exactly the reasons in
+// awaitHoldMeasured below. Enforcing 1 s there would have reintroduced #501 in
+// the fixture instead of the arm. The false claim was the defect; the duration
+// was right.
+func awaitHold(streams []*spaStream, keys []string, gen int, d time.Duration) []string {
+	miss, _ := awaitHoldWithin(streams, keys, gen, d)
+	return miss
+}
+
+// w484HardDeadline is the point at which a cell that has not arrived is called
+// genuinely LOST, and it is not an arbitrary widening: 30 s is this repo's
+// ENFORCED freshness tier. north-star.md:251 makes >30000 ms the miss threshold
+// and ledger.py:383 sets CONV_TIER_MS = 30000, while north-star.md:276-281
+// records that the "1 s fresh" figure is aspirational and explicitly NOT
+// enforced. So the arms' old 1 s assertion contradicted the repo's own enforced
+// tier; this constant agrees with it.
+const w484HardDeadline = 30 * time.Second
+
+// awaitHoldMeasured is awaitHoldWithin floored at w484HardDeadline, plus the
+// ELAPSED TIME. It is the fix for #501.
+//
+// WHY. The #484 fix guarantees EVENTUAL delivery or an explicit resync, never a
+// deadline. TRACED: internal/cache/refresh_broadcaster.go:40-51 (the pending set
+// is "never dropped"; its overflow rule is a STALL rule that forces a resync "so
+// no key is ever silently lost"), :516-520 (the drain runs un-paced, "as soon as
+// the sink has room"), and :525-569, where the single wall-clock bound
+// (refreshPendingStallBound, :563) bounds a NON-PROGRESSING consumer before
+// resync rather than delivery latency. #498 §A says the same, and was filed by
+// #484's own prior gate rather than by this change's author.
+//
+// The arms nevertheless asserted 1 s, so on a loaded CI runner they failed about
+// one run in three: three failures on #492 (2026-10-05), #513 and #516, none of
+// which touches the refresh path, against ZERO reproductions in 17 local runs.
+// In all three the miss was 3 of 9 cells on a SINGLE stream — a different stream
+// each time — with dropped=0, which is one subscriber's drain goroutine missing a
+// scheduling window: slow drain, not lost update.
+//
+// WHAT THIS DOES AND DOES NOT PRESERVE, stated plainly because an earlier draft
+// of this comment overclaimed it (#521, F2). In CI this is behaviourally a widen
+// to the enforced 30 s tier: the latency below is reported with t.Logf, CI runs
+// without -v (release-pullrequest.yaml:36-38), so on a PASSING run the figure is
+// discarded. It is a local-debugging aid, not a CI datapoint, and nothing here
+// should be read as preserving one.
+//
+// The tight detector is NOT lost repo-wide: the internal/cache twins still assert
+// 1 s, and they hold up under load — 12/12 PASS under GOMAXPROCS=2 with 12 CPU
+// hogs, FDrop at 0.01-0.02 s and FCoalesce at 0.25-0.27 s against their 1 s
+// bound (measured while gating #521). The split is therefore empirically
+// justified: the in-process twins bound latency tightly where scheduling is
+// controllable, and these wire-level arms assert only what #484 actually
+// promises — that the cell arrives.
+func awaitHoldMeasured(streams []*spaStream, keys []string, gen int, soft time.Duration) ([]string, time.Duration) {
+	hard := w484HardDeadline
+	if soft > hard {
+		hard = soft
+	}
+	return awaitHoldWithin(streams, keys, gen, hard)
+}
+
+// requireDelivered is the assertion every #484 arm uses: a cell that never
+// arrives inside the enforced tier is a FAILURE — the defect #484 exists to
+// prevent — while one that arrives later than soft passes, with its latency
+// logged.
+//
+// The log is a convenience, NOT the justification for this helper. CI runs
+// without -v, so on a passing run it is discarded; see awaitHoldMeasured. What
+// makes this the right assertion is that it asserts what #484 promises
+// (arrival) against the tier the repo enforces (30 s), instead of a 1 s deadline
+// #484 never offered and north-star.md:276-281 marks as unenforced.
 func requireDelivered(t *testing.T, streams []*spaStream, keys []string, gen int, soft time.Duration, what string) {
 	t.Helper()
 	miss, took := awaitHoldMeasured(streams, keys, gen, soft)
@@ -235,8 +282,8 @@ func requireDelivered(t *testing.T, streams []*spaStream, keys []string, gen int
 	}
 	if took > soft {
 		t.Logf("#501 DELIVERY LATENCY: %s delivered all %d cells in %v, over the %v soft budget. "+
-			"Not a failure — the #484 fix guarantees EVENTUAL delivery, not bounded. "+
-			"This figure is the datapoint #498 asks for.", what, len(streams)*len(keys), took, soft)
+			"Not a failure — the #484 fix guarantees EVENTUAL delivery, not bounded.",
+			what, len(streams)*len(keys), took, soft)
 	}
 }
 
@@ -262,11 +309,15 @@ func TestRefreshes484_FCoalesce_Wire(t *testing.T) {
 	for i, k := range keys {
 		w484Commit(store, k, names[i], w484Body(k, 1))
 	}
-	// SETUP, not a delivery claim: v1 must be held before the arm can start, and
-	// a slow setup is a broken fixture rather than a latency datapoint. Kept as a
-	// hard bound deliberately (#501).
-	if miss := awaitHold(streams, keys, 1, time.Second); len(miss) > 0 {
-		t.Fatalf("setup: v1 not held within 1s by %v", miss)
+	// SETUP, not a delivery claim: v1 must be held before the arm can start.
+	// Bounded at the enforced tier, not at 1 s — this wait rides the same
+	// un-paced drain as the delivery under test, so a tight bound here would
+	// reintroduce #501 in the fixture (#521, F1). What makes it a fixture check
+	// is that v1 must ARRIVE at all; a slow v1 is not interesting, a missing one
+	// means the wiring is broken and the arm below could not fail.
+	if miss := awaitHold(streams, keys, 1, w484HardDeadline); len(miss) > 0 {
+		t.Fatalf("setup: v1 never held within %v by %v — broken fixture, the arm below cannot fail",
+			w484HardDeadline, miss)
 	}
 
 	time.Sleep(100 * time.Millisecond) // v2 inside the 250 ms window
