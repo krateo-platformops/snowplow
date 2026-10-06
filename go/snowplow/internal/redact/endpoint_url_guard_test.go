@@ -48,6 +48,26 @@ package redact
 // WHAT IT STILL DOES NOT SEE — stated rather than implied, because claiming
 // more than was built is the failure #503 warns about:
 //
+//   - THE ARGUMENT DIRECTION. #533. propagate() binds taint across AssignStmt,
+//     ValueSpec, RangeStmt, SendStmt and ReturnStmt. It does NOT bind a call
+//     ARGUMENT to the callee's PARAMETER, so a URL that reaches a log site
+//     through a parameter is invisible:
+//
+//     func logHost(host string) { slog.Error("m", slog.String("host", host)) }
+//     logHost(call.Endpoint.ServerURL)   // NOT reported
+//
+//     This is the same #485/#500 hoist the guard exists to defeat, hoisted one
+//     step further — out of the function instead of into a local. The guard
+//     defeats it in the ASSIGNMENT direction and not in the ARGUMENT one.
+//     Proven on the real tree, not on a fixture alone: an added always-on Error
+//     site reached through a parameter helper left go build 0, go vet 0 and all
+//     four guards GREEN. Five shapes reproduce it — free-function parameter,
+//     method parameter, parameter to a struct field logged elsewhere,
+//     cross-package parameter, and a parameter stored in a cross-package
+//     package-level var. No live instance exists today: every ServerURL read in
+//     production is enumerated and the only parameter-passing ones are
+//     redact.URL, logServerURL and parsedHostEqualsSelf. The issue that owns
+//     closing it is #533.
 //   - Taint is flow-INSENSITIVE. An object assigned a URL anywhere in the
 //     module is tainted at every read of it, so a variable deliberately
 //     overwritten with a clean value before being logged would be a false
