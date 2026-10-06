@@ -28,7 +28,31 @@ import (
 // for the expansion is the existing bounded errgroup
 // (g.SetLimit(iterParallelism(ctx)), resolve.go) — no new mechanism.
 
+// skippedOption is one request option the #288 dial guard refused, carried with
+// the verdict that refused it. The DISPATCH path throws these away — not dialing
+// is the whole point. The dispatch-free read-set enumeration must see them,
+// because "do not dial this" and "cannot enumerate this" are different
+// questions with different right answers (#504).
+type skippedOption struct {
+	path   string
+	reason skipReason
+}
+
+// createRequestOptions is the DISPATCH entry point and its behaviour is
+// unchanged: it returns the valid options and drops the refused ones into
+// recordMalformedDialSkip. Byte-identical to pre-#504 for every RA, dict, verb
+// and iterator shape — it now delegates to the sibling below and discards the
+// skips, which is exactly what it did inline before.
 func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) (all []httpcall.RequestOptions) {
+	all, _ = createRequestOptionsWithSkips(ctx, log, in, dict)
+	return all
+}
+
+// createRequestOptionsWithSkips is createRequestOptions plus the refused
+// options and their verdicts. Only the inspect pass calls it (#504). The
+// metrics/log side effect (recordMalformedDialSkip) still happens here, exactly
+// once per skip, so the #288/#293 counters read the same from either caller.
+func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) (all []httpcall.RequestOptions, skips []skippedOption) {
 	it := ""
 	if in.DependsOn != nil {
 		it = ptr.Deref(in.DependsOn.Iterator, "")
@@ -41,6 +65,7 @@ func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.A
 			all = append(all, el)
 		} else {
 			recordMalformedDialSkip(log, in.Name, el.Path, sr)
+			skips = append(skips, skippedOption{path: el.Path, reason: sr})
 		}
 		return
 	}
@@ -51,6 +76,7 @@ func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.A
 		el, ok, sr := createRequestOption(in, sa)
 		if !ok {
 			recordMalformedDialSkip(log, in.Name, el.Path, sr)
+			skips = append(skips, skippedOption{path: el.Path, reason: sr})
 			return nil
 		}
 		all = append(all, el)
@@ -70,7 +96,7 @@ func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.A
 		}
 	}
 
-	return all
+	return all, skips
 }
 
 // recordMalformedDialSkip is the SINGLE shared skip path for the #288 guard,

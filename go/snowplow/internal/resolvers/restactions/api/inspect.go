@@ -81,6 +81,27 @@ type Resource struct {
 	// omitempty: read rows omit it, so every existing response stays
 	// byte-identical (design §4).
 	NonReadVerb bool `json:"nonReadVerb,omitempty"`
+
+	// NamespaceUnknown says the stage reads a NAMESPACED resource whose
+	// namespace is not yet determined — the template interpolates it, and at
+	// /rbac time there is no composition instance to interpolate from. That is
+	// the NORMAL case for the endpoint's own caller (core-provider asks before
+	// the first /call), not an anomaly (#504).
+	//
+	// WHY A FIELD RATHER THAN AN EMPTY Namespace. `Namespace` is omitempty and
+	// dedupeSortResources keys on it, so an unknown namespace rendered as "" is
+	// byte-identical to a GENUINELY cluster-scoped row and the two MERGE —
+	// after which nothing downstream can tell "namespaced, scope unknown" from
+	// "cluster-scoped". That distinction is load-bearing for the consumer:
+	// core-provider's live generator (GenerateClusterScoped) ignores per-row
+	// namespace today and grants cluster-wide either way, but its documented
+	// Phase 3 move to Generate maps Namespace=="" to a ClusterRole — so without
+	// this flag the widening would arrive silently, inherited rather than
+	// decided.
+	//
+	// omitempty: a row with a known namespace, and every cluster-scoped row,
+	// omits it — so existing responses stay byte-identical.
+	NamespaceUnknown bool `json:"namespaceUnknown,omitempty"`
 }
 
 // Unresolved names a stage the inspect pass could not enumerate from the
@@ -241,13 +262,70 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 // The rows are deduped by the caller's dedupeSortResources, so the common
 // constant-GVR iterator (every opt the same GVR, differing only by name)
 // collapses to one row.
+// #504 — SKIPPED OPTIONS ARE NOT ABSENT OPTIONS. The #288 dial guard refuses a
+// path whose interpolated namespace/name collapsed to empty, and it is right to:
+// dialing /apis/apps/v1/namespaces//deployments is a malformed request. But
+// inspect shares the plan builder with dispatch, so a refused option used to
+// vanish and the stage reported "produced no request path" — which made GET
+// /rbac answer 422 for EVERY CompositionDefinition carrying spec.apiRef, because
+// core-provider asks before any composition instance exists and therefore every
+// status-projection stage renders with a collapsed namespace. A dial verdict was
+// being consumed as an enumeration verdict.
+//
+// So a skip is classified rather than dropped, by its REASON CLASS:
+//   - reasonEmptyInterp      — a segment interpolated to empty. The GVR is still
+//     determined by the TEMPLATE, so enumerate from the
+//     skeleton (cache.ReadSetSkeleton) and mark what is
+//     genuinely unknown.
+//   - reasonUnrenderedTemplate (#293) and anything else — a surviving ${...}
+//     means the coordinate is NOT determinable; stays
+//     UNRESOLVABLE and fails loud, because a partial
+//     read-set under-grants.
+//
+// The skeleton is read from the stage's TEMPLATE, never from the collapsed
+// render: rendering destroys which segments were interpolated, and that is how a
+// template whose RESOURCE collapsed (/apis/apps/v1/ from
+// `${ "/apis/apps/v1/" + .kind }`) comes back looking like a legitimate bare
+// discovery path. Same reason the two in-tree skeleton analysers exist.
 func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[string]any, log *slog.Logger) ([]Resource, error) {
-	opts := createRequestOptions(context.Background(), log, stage, dict)
-	if len(opts) == 0 {
+	opts, skips := createRequestOptionsWithSkips(context.Background(), log, stage, dict)
+	if len(opts) == 0 && len(skips) == 0 {
 		return nil, fmt.Errorf("stage produced no request path")
 	}
 
 	var rows []Resource
+
+	for _, sk := range skips {
+		if sk.reason.class != reasonEmptyInterp {
+			return nil, fmt.Errorf("stage path is not enumerable: %s", sk.reason.detail)
+		}
+		co := cache.ReadSetSkeleton(stage.Path)
+		if !co.OK {
+			return nil, fmt.Errorf("stage path has no static (group, version, resource) to enumerate: %s", sk.reason.detail)
+		}
+		if err := validateGVR(rc, co.GVR); err != nil {
+			return nil, fmt.Errorf("discovery validation failed for %s: %w", co.GVR.String(), err)
+		}
+		// #504 ruling 2 — the verb comes from the three-state NAME, not from the
+		// rendered path. A by-name read whose name interpolated to empty is still
+		// a by-name read: rendering it yields name=="" and the verb would come
+		// out `list`, which does NOT authorize a by-name GET. That is 200, a
+		// minted Role, and a 403 at the first /call — an under-grant, worse than
+		// the 422 it replaced because it fails at a different layer on a
+		// different day.
+		verb := "list"
+		if co.Name.IsSingleObject() {
+			verb = "get"
+		}
+		rows = append(rows, Resource{
+			Group:            co.GVR.Group,
+			Version:          co.GVR.Version,
+			Resource:         co.GVR.Resource,
+			Namespace:        co.Namespace,
+			NamespaceUnknown: co.NamespaceUnknown,
+			Verb:             verb,
+		})
+	}
 	for _, opt := range opts {
 		path := opt.Path
 
@@ -288,7 +366,24 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 
 		// Bare group-discovery path: resolvable, anonymous-readable catalogue;
 		// contributes no read-set row but is NOT unresolvable.
+		//
+		// #504 ruling 3 — BUT ONLY IF THE TEMPLATE WAS DISCOVERY-SHAPED TOO.
+		// `${ "/apis/apps/v1/" + (.kind // "") }` renders to "/apis/apps/v1/",
+		// which is byte-identical to a genuine bare-discovery path, so this
+		// branch used to swallow it: zero rows, stage counted RESOLVABLE, 200 —
+		// and then a 403 at the first /call when the dispatcher requested the
+		// real resource. That is the silent under-grant this file forbids
+		// elsewhere, arriving through the one branch that returns no rows.
+		//
+		// The render cannot distinguish the two; only the template can. A
+		// ResourceTemplated skeleton means the stage HAD a resource segment and
+		// it interpolated away, so the coordinate is undetermined and the stage
+		// must fail loud.
 		if _, ok := cache.ParseAPIServerDiscoveryPath(path); ok {
+			if co := cache.ReadSetSkeleton(stage.Path); co.ResourceTemplated {
+				return nil, fmt.Errorf("path %q renders as bare discovery but the stage's RESOURCE segment is templated — "+
+					"the read coordinate is undetermined (#504)", path)
+			}
 			continue
 		}
 
@@ -423,16 +518,24 @@ func pluralServed(list *metav1.APIResourceList, plural string) bool {
 }
 
 // dedupeSortResources collapses duplicate rows over the full
-// (group, version, resource, namespace, verb) tuple and sorts the result
-// lexicographically by that tuple — so an unchanged RA yields a byte-identical
+// (group, version, resource, namespace, namespaceUnknown, verb) tuple and sorts
+// the result lexicographically — so an unchanged RA yields a byte-identical
 // response (design §4). name is always "" and is not part of the key.
+//
+// #504: NamespaceUnknown IS part of the key, and must be. It is NOT a function
+// of the other fields — {apps/v1 deployments, ns:"", unknown:true} and a
+// genuinely cluster-scoped {apps/v1 deployments, ns:""} are different claims
+// about what will be read, and collapsing them loses the one bit the consumer
+// needs to decide a scope. Unlike NonReadVerb (a pure function of Verb, carried
+// only so the rebuild does not drop it), this flag can legitimately SPLIT a
+// tuple into two rows.
 func dedupeSortResources(in []Resource) []Resource {
 	seen := make(map[Resource]struct{}, len(in))
 	out := make([]Resource, 0, len(in))
 	for _, r := range in {
 		key := Resource{
 			Group: r.Group, Version: r.Version, Resource: r.Resource,
-			Namespace: r.Namespace, Verb: r.Verb,
+			Namespace: r.Namespace, NamespaceUnknown: r.NamespaceUnknown, Verb: r.Verb,
 			// #179: NonReadVerb is a pure function of Verb, so it never splits a
 			// tuple into two rows; carry it here so dedupe (which rebuilds the
 			// row from this literal) does not drop the flag.
@@ -457,6 +560,13 @@ func dedupeSortResources(in []Resource) []Resource {
 		}
 		if a.Namespace != b.Namespace {
 			return a.Namespace < b.Namespace
+		}
+		// #504 — the sort must be TOTAL over the dedupe key, or two rows that
+		// differ only in NamespaceUnknown order unstably and the
+		// byte-identical-response guarantee (design §4) breaks. known-namespace
+		// (false) sorts before unknown (true).
+		if a.NamespaceUnknown != b.NamespaceUnknown {
+			return !a.NamespaceUnknown
 		}
 		return a.Verb < b.Verb
 	})
