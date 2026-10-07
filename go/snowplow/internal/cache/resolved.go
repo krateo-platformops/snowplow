@@ -249,6 +249,15 @@ type ResolvedEntry struct {
 	// entry with SeededAtBoot=false (the natural zero value), correctly
 	// re-classifying the cell as traffic-warmed once real traffic replaces
 	// the seed. Purely additive: legacy entries default false = "traffic".
+	//
+	// #507 — IT IS ALSO HALF OF warmLocked, which makes it a capability and not
+	// just a label: stamping it true makes a cell test WARM even though no
+	// customer has ever read it. Only the BOOT seed may do that. The
+	// post-readyz seed modes (keepwarm, gvr-discovered, #258 rbac-shift) write
+	// through the same two primitives but carry the RESIDENT cell's flag through
+	// instead of stamping it (dispatchers.seedProvenanceForMode), because the
+	// keepwarm sweep re-Puts resident cells on a cadence and a stamp there
+	// defeated #496's warmth gate indefinitely.
 	SeededAtBoot bool
 
 	// Inputs is the canonical key-input bundle the entry was resolved
@@ -1709,12 +1718,22 @@ func (c *ResolvedCacheStore) remintLead() time.Duration {
 //
 // Seeded cells: a REFRESHER re-Put overwrites the entry with SeededAtBoot=false
 // (the field doc on ResolvedEntry.SeededAtBoot), so a boot-seeded cell loses
-// seed warmth at its first refresh and is gated from then on. But a customer
-// read is NOT the only way back — the keepwarm sweep's terminal write hardcodes
-// SeededAtBoot=true (phase1_pip_seed.go, mode-independent), so a keepwarm-scoped
-// cell regains seed warmth with no customer involved and can be re-minted
-// indefinitely. That is the #376 "internal reads must not fake warmth" lesson
-// surviving in this flag; it is tracked separately and NOT closed here.
+// seed warmth at its first refresh and is gated from then on. A customer read
+// used not to be the only way back: the seed primitives' terminal write
+// hardcoded SeededAtBoot=true mode-INDEPENDENTLY, so the keepwarm sweep (which
+// re-Puts any resident cell whose body is older than TTL/4) handed seed warmth
+// back on its next pass with no customer involved and the cell was re-minted
+// indefinitely — the #376 "internal reads must not fake warmth" lesson surviving
+// in a flag. CLOSED by #507: only a boot-mode seed stamps that flag now; every
+// post-readyz mode carries the resident cell's own value through
+// (dispatchers.seedProvenanceForMode), so this gate's refusal is reachable for
+// the keepwarm-scoped set too.
+//
+// What is still NOT closed here is open #494, the OTHER carrier: putCoreLocked's
+// fresh-INSERT branch stamps lastRead on every non-seeded insert, calling it a
+// customer cold-fill. A background insert is therefore lastRead-warm for one
+// TTL, which this gate reads as warm. Bounded (one TTL, not re-conferred on a
+// replace, which inherits lastRead), unlike the seed-warmth path above.
 func (c *ResolvedCacheStore) inRemintWindowLocked(item *lruItem, now time.Time) bool {
 	if c.maxEntryAge <= 0 || item == nil || item.entry == nil || item.entry.BornAt.IsZero() {
 		return false
