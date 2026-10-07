@@ -79,7 +79,20 @@ package redact
 //     (TestS503_ResolveErrorLogNeverCarriesAServerURLPassword and
 //     TestS503_UnparseableCAWarnNeverCarriesAServerURLPassword), which drive a
 //     credential-bearing ServerURL through the real resolver and the real TLS
-//     client builder.
+//     client builder. The same holds for redact.ErrorURL, added to the sanitiser
+//     set by #523: url_error_test.go covers the function and
+//     errortext_redaction_523_test.go (api) drives it through the real fetch.
+//   - A URL that reaches a sink as a STRING FIELD of a struct is not followed:
+//     propagatesURL stops at an arbitrary struct, so a URL written into one
+//     function's struct field and logged out of it in another is invisible here.
+//     That is not hypothetical — it is the #523 production path itself
+//     (external_fetch.go folds a *url.Error into response.New, and resolve.go
+//     logs the resulting Message), which is why #523 is fixed at its SOURCE and
+//     not by this guard. Following a URL into and out of a dependency type's
+//     field is the full taint pass #500 asks for.
+//     TestS523_ErrorTextIsFollowedButAStructFieldIsNotYet pins it in the failing
+//     direction. A green run of this file is therefore not a proof of
+//     completeness for any fix, #523's included.
 
 import (
 	"fmt"
@@ -106,8 +119,17 @@ import (
 // `User "x"` and `"x-clientconfig"` patterns and nothing else (redact.go:129),
 // so it does not remove a credential from a URL and must not be treated as if
 // it did.
+//
+// redact.ErrorURL (#523) IS here, and it is the only member that is neither a
+// renderer of a URL field nor a one-way digest: it returns error TEXT. It
+// qualifies because its guarantee is structural — it finds each *net/url.Error
+// in the chain by TYPE and re-renders it with URL(e.URL) in place of e.URL, so
+// every URL it emits came out of URL, the member directly above. That guarantee
+// is held up by its own arms in url_error_test.go, which is why registering it
+// is a checked claim rather than a courtesy.
 var urlSanitizers = map[string]bool{
 	"github.com/krateo-platformops/snowplow/internal/redact.URL":         true,
+	"github.com/krateo-platformops/snowplow/internal/redact.ErrorURL":    true,
 	"github.com/krateo-platformops/snowplow/internal/redact.Digest":      true,
 	"github.com/krateo-platformops/snowplow/internal/redact.User":        true,
 	"github.com/krateo-platformops/snowplow/internal/redact.Group":       true,
@@ -217,25 +239,43 @@ func isNetURL(t types.Type) bool {
 // shapes a transform like fmt.Sprintf, strings.TrimSuffix or url.Parse hands
 // back. Those are the #503 class: the field, or the field restated.
 //
-// It deliberately STOPS at an error and at an arbitrary struct, because a URL
-// inside one of those is inside free TEXT that some other package composed.
-// That is a real leak and a separate one. Traced while building this guard:
-// httpFetchAllowingNonJSON (external_fetch.go:74-82) builds `uri` from
+// IT NOW ALSO FOLLOWS AN ERROR (#523). It used to stop there, on the ground that
+// a URL inside an error is inside free TEXT and could not be cleaned without a
+// regex. That ground is gone: redact.ErrorURL cleans it STRUCTURALLY — it finds
+// each *net/url.Error in the chain by type and re-renders it through redact.URL
+// — so an error carrying a URL now has a sanitiser and the guard can demand it.
+// The shape that motivated the change was traced in production:
+// httpFetchAllowingNonJSON (external_fetch.go) builds `uri` from
 // Endpoint.ServerURL and, when url.Parse rejects it, returns
 // response.New(500, err) — and url.Error.Error() renders its URL VERBATIM,
 // credentials and all (probed: `parse "https://u:pa ss@host/...": net/url:
 // invalid control character in URL`). resolve.go then logs that envelope's
-// Message at Error level. Scrubbing a URL out of arbitrary error text is a
-// different design question from redacting a field — it is the #453 error-text
-// residual and the #500 taint-pass gap — so it gets its OWN issue, #523, rather
-// than being quietly folded in here or parked in an allow-list.
+// Message at Error level.
 //
-// TestS503_ErrorTextEmbeddingIsTheDOCUMENTEDGap pins this boundary in the
-// failing direction, so the gap is a tested statement rather than a sentence in
-// a comment that nobody can check.
+// MEASURED COST OF THE WIDENING, on the tree that shipped it: ZERO new hits over
+// the whole module. That zero was checked at both extremes rather than trusted —
+// planting `slog.Error("…", slog.Any("err", err))` on external_fetch.go's
+// url.Parse branch made the module arm RED naming that line, and removing it
+// made it green again. So the zero means "no production site logs a URL-bearing
+// error today", not "the scan went blind".
+//
+// IT STILL STOPS AT AN ARBITRARY STRUCT, and that is exactly why the widening
+// above does NOT by itself catch the #523 production path: that leak reaches the
+// log site as response.Status.Message, a STRING FIELD of a struct the fetch
+// returned, and following a URL into and out of a struct field of a dependency's
+// type is the full taint pass #500 asks for. #523 is fixed at its source for
+// that reason. TestS523_ErrorTextIsFollowedButAStructFieldIsNotYet pins both
+// halves — the new coverage and the remaining gap — in the directions that fail.
 func propagatesURL(t types.Type) bool {
 	if t == nil {
 		return false
+	}
+	// An error is a carrier of URL TEXT, and redact.ErrorURL is its sanitiser.
+	// isErrorType (log_guard_test.go) matches the `error` interface and any
+	// concrete type that implements it, so neither `err error` nor a bare
+	// *url.Error slips past on spelling.
+	if isErrorType(t) {
+		return true
 	}
 	switch u := t.Underlying().(type) {
 	case *types.Basic:
@@ -315,9 +355,11 @@ type urlGuard struct {
 	taint      map[types.Object]string
 	// fnTaint is per RESULT INDEX, not per function. Precision matters here:
 	// httpFetchAllowingNonJSON returns (*response.Status, []byte, string,
-	// error) and only results 0 and 3 carry the URL — both through error text,
-	// which propagatesURL stops. Tainting the whole function instead would
-	// taint `res` and report an error-text leak as if this guard covered it.
+	// error) and only results 0 and 3 carry the URL. Since #523, result 3 (the
+	// error) propagates and result 0 (*response.Status) still does not —
+	// propagatesURL stops at an arbitrary struct. Tainting the whole function
+	// instead would taint `res` too and report a struct-field leak as if this
+	// guard covered it, which it does not (that is #500).
 	fnTaint map[*types.Func]map[int]string
 	pkg     *packages.Package
 }
@@ -936,6 +978,55 @@ func TestS503_RegisteredHelpersReturnOnlySanitisedURLs(t *testing.T) {
 	}
 }
 
+// TestS503_EveryRegisteredSanitizerStillExists checks the OTHER half of the same
+// risk, for the whole set rather than only the module helpers.
+//
+// urlSanitizers is keyed by "<package path>.<Func>" — a STRING. Nothing in Go
+// ties that string to the function it names, so renaming or deleting a
+// sanitiser leaves an entry behind that matches nothing, and the set silently
+// keeps claiming a cleansing step the module no longer has. The existing
+// helper arm catches this for the one module helper; this catches it for
+// redact's own primitives, redact.ErrorURL (#523) included — whose registration
+// is otherwise exercised by no production site today, because #523 is fixed at
+// the error-construction site rather than at a log site, so a typo in its key
+// would go unnoticed until the first log site needed it.
+func TestS503_EveryRegisteredSanitizerStillExists(t *testing.T) {
+	if testing.Short() {
+		t.Skip("type-checks the whole module")
+	}
+	pkgs := loadPackages(t, filepath.Join("..", ".."))
+
+	found := map[string]bool{}
+	for _, p := range pkgs {
+		for _, f := range p.Syntax {
+			if strings.HasSuffix(p.Fset.Position(f.Pos()).Filename, "_test.go") {
+				continue
+			}
+			for _, d := range f.Decls {
+				fd, ok := d.(*ast.FuncDecl)
+				if !ok || fd.Recv != nil {
+					continue
+				}
+				found[p.PkgPath+"."+fd.Name.Name] = true
+			}
+		}
+	}
+	// NON-VACUITY: a package load that returned nothing useful would make every
+	// key "missing" OR, with the check inverted, every key "present". Requiring
+	// a plausible floor of discovered functions distinguishes the two.
+	if len(found) < 200 {
+		t.Fatalf("NON-VACUITY: only %d top-level functions discovered across %d packages; the scan is not seeing "+
+			"the module", len(found), len(pkgs))
+	}
+	for key := range urlSanitizers {
+		if !found[key] {
+			t.Errorf("#503/#523: urlSanitizers names %s, which no longer exists in the module. A stale entry "+
+				"matches nothing and silently keeps claiming a cleansing step that is gone — fix the key or "+
+				"drop it, in the same commit as the rename", key)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // The guard's own non-vacuity arm, over a throwaway module
 // ---------------------------------------------------------------------------
@@ -1118,18 +1209,47 @@ func F(ep *endpoints.Endpoint, h *holder, l *slog.Logger) {
 	}
 }
 
-// TestS503_ErrorTextEmbeddingIsTheDOCUMENTEDGap pins the boundary propagatesURL
-// draws, in the direction that FAILS: a URL that reaches a log site inside an
-// error's TEXT is NOT reported by this guard.
+// TestS523_ErrorTextIsFollowedButAStructFieldIsNotYet REPLACES
+// TestS503_ErrorTextEmbeddingIsTheDOCUMENTEDGap, deliberately and by #523.
 //
-// This is not a wish — it is the shape found in production while building the
-// guard (external_fetch.go:80 → resolve.go:1333, see propagatesURL), and it is
-// asserted here so nobody reads this file as covering it. If a later change
-// teaches the guard to follow error text, this arm goes RED and must be
-// deleted ON PURPOSE, with the issue it closes named. That is the point: the
-// gap cannot be forgotten and cannot be silently claimed as closed. The issue
-// that owns it is #523.
-func TestS503_ErrorTextEmbeddingIsTheDOCUMENTEDGap(t *testing.T) {
+// WHAT CHANGED, AND WHY THE OLD ARM HAD TO GO. That arm asserted, in the failing
+// direction, that a URL reaching a log site inside an error's TEXT is NOT
+// reported here — and it said in so many words that if a later change taught the
+// guard to follow error text, it had to be deleted ON PURPOSE with the issue it
+// closes named. This is that change and this is that issue. #523 added
+// redact.ErrorURL, a STRUCTURAL sanitiser for a URL inside an error (it finds
+// each *net/url.Error in the chain by type and re-renders it through
+// redact.URL), so the reason the boundary sat where it did — "there is no way to
+// clean error text short of a regex" — no longer holds, and propagatesURL now
+// follows an error.
+//
+// EVERY ASSERTION THE OLD ARM MADE STILL STANDS SOMEWHERE:
+//
+//   - "the error VALUE shape is not reported" and "the error TEXT shape is not
+//     reported" are INVERTED here, on purpose: both are now hits. That inversion
+//     IS the fix, and it is asserted rather than assumed.
+//   - "the plain field read IS reported" is kept verbatim below, so the #503
+//     mechanism is still proven live by this fixture.
+//   - the tripwire is kept and RE-POINTED at what is still missing.
+//
+// WHAT IS STILL MISSING, pinned in the failing direction exactly as before: a
+// URL that reaches the sink as a STRING FIELD of a struct a callee returned.
+// That is not a hypothetical — it is the #523 production path itself
+// (external_fetch.go folds the *url.Error into response.New, whose Message field
+// resolve.go then logs), which is why #523 is fixed AT ITS SOURCE and not by
+// this guard. Following a URL into and out of a struct field is the full taint
+// pass #500 asks for, and it is NOT closed here — a green run of this file does
+// not claim it is.
+//
+// The ARGUMENT direction (#533) was the sibling gap when this arm was first
+// written and is now CLOSED, by bindArgs — so it is no longer named here as
+// missing. This arm does not depend on it: the fixture's taint reaches the log
+// sites through fnTaint (parseIt RETURNS a value built from ep.ServerURL, a
+// field read seeded directly off the parameter's type), not through bindArgs
+// binding the argument. Measured, not assumed — reverting bindArgs leaves this
+// arm GREEN and takes only TestS533_GuardFollowsTheURLIntoACalleesPARAMETER
+// RED, which is the right split: each guard fails for its own reason.
+func TestS523_ErrorTextIsFollowedButAStructFieldIsNotYet(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "fixture")
 	for _, sub := range []string{"", "redact", "endpoints"} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
@@ -1144,7 +1264,20 @@ func TestS503_ErrorTextEmbeddingIsTheDOCUMENTEDGap(t *testing.T) {
 	}
 	write("go.mod", "module fixture\n\ngo 1.22\n")
 	write("endpoints/endpoints.go", "package endpoints\n\ntype Endpoint struct{ ServerURL string }\n")
-	write("redact/redact.go", "package redact\n\nfunc URL(raw string) string { return \"clean\" }\n")
+	// The fixture's sanitisers are a DIFFERENT package from the real ones, which
+	// is why the sanitiser set is a parameter: the guard matches the function
+	// OBJECT, so this proves the mechanism without touching the module.
+	write("redact/redact.go", `package redact
+
+func URL(raw string) string { return "clean" }
+
+// ErrorURL stands in for the real structural error sanitiser (#523).
+func ErrorURL(err error) error { return err }
+
+// ErrorText is NOT a URL sanitiser — it stands in for the real one, which
+// rewrites identity patterns only.
+func ErrorText(s string) string { return s }
+`)
 	src := `package fixture
 
 import (
@@ -1152,36 +1285,107 @@ import (
 	"log/slog"
 
 	"fixture/endpoints"
+	ralias "fixture/redact"
 )
+
+// envelope mimics plumbing's response.Status: a plain struct whose string field
+// holds an error's rendered TEXT.
+type envelope struct{ Message string }
 
 // parseIt mimics external_fetch.go: the URL rides out inside an error.
 func parseIt(ep *endpoints.Endpoint) error { return fmt.Errorf("parse %q: bad", ep.ServerURL) }
 
+// envelopeFor mimics response.New(code, err): the error's text is copied into a
+// struct field, and THAT is what the production site logs.
+func envelopeFor(ep *endpoints.Endpoint) *envelope { return &envelope{Message: parseIt(ep).Error()} }
+
 func F(ep *endpoints.Endpoint) {
 	err := parseIt(ep)
-	slog.Error("not reported by this guard", slog.Any("err", err))
-	slog.Error("nor this one", slog.String("error", err.Error()))
 
-	// The SAME field as a string IS reported — so this fixture also proves the
-	// gap is specific to error text, not a hole in the whole mechanism.
-	slog.Error("reported", slog.String("host", ep.ServerURL)) // LEAK
+	slog.Error("an error VALUE", slog.Any("err", err))               // LEAK
+	slog.Error("an error's TEXT", slog.String("error", err.Error())) // LEAK
+
+	// The SAME field as a plain string — the #503 shape, unchanged.
+	slog.Error("the plain field", slog.String("host", ep.ServerURL)) // LEAK
+
+	// ---- clean: the error sanitiser must make both error shapes clean ----
+	slog.Error("sanitised at the site", slog.Any("err", ralias.ErrorURL(err))) // CLEAN
+	clean := ralias.ErrorURL(err)
+	slog.Error("sanitised via a local", slog.Any("err", clean))             // CLEAN
+	slog.Error("sanitised error text", slog.String("error", clean.Error())) // CLEAN
+
+	// ErrorText is NOT the error-URL sanitiser, and registering ErrorURL must
+	// not have widened it by association.
+	slog.Error("not the sanitiser", slog.String("error", ralias.ErrorText(err.Error()))) // LEAK
+
+	// ---- THE REMAINING GAP: the URL reaches the sink as a struct FIELD ----
+	env := envelopeFor(ep)
+	slog.Error("through a struct field", slog.String("error", env.Message)) // GAP
 }
 `
 	write("f.go", src)
 
-	hits, _, _ := endpointURLScan(loadPackages(t, dir), map[string]bool{"fixture/redact.URL": true})
-	joined := strings.Join(hits, "\n")
-	if len(hits) != 1 {
-		t.Fatalf("the error-text shapes must NOT be reported and the plain field MUST be: want exactly 1 hit, got %d:\n%s",
-			len(hits), joined)
+	sanitizers := map[string]bool{"fixture/redact.URL": true, "fixture/redact.ErrorURL": true}
+	hits, sanitised, converged := endpointURLScan(loadPackages(t, dir), sanitizers)
+	// #533's convergence signal, asserted here too: an under-converged scan
+	// under-reports, and this arm's whole job is to say which shapes ARE and are
+	// NOT reported. A fixture that silently stopped closing would read as "the
+	// gap is still open" when it is really "the scan gave up".
+	if !converged {
+		t.Fatalf("the fixture taint relation did not close in %d passes", urlScanMaxPasses)
 	}
-	if !strings.Contains(joined, "ep.ServerURL") {
-		t.Errorf("the one hit must be the plain field read, not an error-text shape; got %s", joined)
+
+	lines := strings.Split(src, "\n")
+	want := map[int]bool{}
+	gap := map[int]bool{}
+	for i, l := range lines {
+		switch {
+		case strings.Contains(l, "// LEAK"):
+			want[i+1] = true
+		case strings.Contains(l, "// GAP"):
+			gap[i+1] = true
+		}
 	}
-	if strings.Contains(joined, "err") {
-		t.Errorf("DOCUMENTED GAP CLOSED UNINTENTIONALLY: this guard now follows a URL through error text (%s). "+
-			"That is a real improvement — but update propagatesURL's comment, name the issue it closes, and "+
-			"delete this arm deliberately rather than leaving the claim ambiguous", joined)
+	if len(want) != 4 || len(gap) != 1 {
+		t.Fatalf("fixture has %d LEAK and %d GAP markers, want 4 and 1", len(want), len(gap))
+	}
+
+	got := map[int]bool{}
+	for _, h := range hits {
+		var ln int
+		if _, err := fmt.Sscanf(h[strings.Index(h, ".go:")+4:], "%d", &ln); err == nil {
+			got[ln] = true
+		}
+		if gap[ln] {
+			t.Errorf("GAP CLOSED UNINTENTIONALLY: this guard now follows a URL out of a STRUCT FIELD (%s). "+
+				"That is a real improvement and it is most of #500 — but say so in propagatesURL's comment, "+
+				"name the issue it closes, and re-point or delete this arm deliberately rather than leaving "+
+				"the claim ambiguous", h)
+			continue
+		}
+		if !want[ln] {
+			t.Errorf("CLEAN shape flagged — the guard is too strict: %s", h)
+		}
+	}
+	for ln := range want {
+		if !got[ln] {
+			t.Errorf("NOT DETECTED at fixture line %d: %s", ln, strings.TrimSpace(lines[ln-1]))
+		}
+	}
+	// NON-VACUITY, the same floor the sibling arms use: the sanitiser set is
+	// what makes the clean shapes clean. The counter measures DIRECT wraps — a
+	// sanitiser call that IS the logged value and whose own argument is tainted
+	// — so only `slog.Any("err", ErrorURL(err))` counts. The two sites that go
+	// through the `clean` local are clean because `clean` is, which is not a
+	// wrap and is deliberately not counted.
+	if sanitised != 1 {
+		t.Errorf("NON-VACUITY: the fixture has 1 directly-wrapped sanitised site (ErrorURL(err)); the scan counted %d",
+			sanitised)
+	}
+	emptied, _, _ := endpointURLScan(loadPackages(t, dir), nil)
+	if len(emptied) <= len(hits) {
+		t.Errorf("NON-VACUITY: emptying the sanitiser set must turn the sanitised sites into hits; "+
+			"got %d hits with it and %d without", len(hits), len(emptied))
 	}
 }
 
