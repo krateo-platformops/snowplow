@@ -75,6 +75,14 @@ func edge3NewWatcher(t *testing.T, seed ...runtime.Object) *dynamicfake.FakeDyna
 	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	// #471(b) — await THIS watcher's initial RBAC publish before installing it
+	// globally; see the same note in newF6Watcher. It matters more here than
+	// there: this constructor registers restactions + compositions list-kinds
+	// that newF6Watcher does not, so an edge3 arm whose publish lands late is
+	// also the arm whose discovery answers differ from its neighbour's.
+	if err := rw.WaitInitialRBACPublishForTest(5 * time.Second); err != nil {
+		t.Fatalf("WaitInitialRBACPublishForTest: %v", err)
+	}
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 	return dyn

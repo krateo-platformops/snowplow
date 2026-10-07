@@ -65,13 +65,21 @@ func TestA1_RAFullList_UAFBypassesCell_ControlServes(t *testing.T) {
 	cache.ResetUAFPutDeclineCountersForTest()
 	t.Cleanup(cache.ResetUAFPutDeclineCountersForTest)
 
-	// DISTINCT coordinates from the other arms in this package. The sliceability
-	// memo is a PROCESS-wide map that ResetResolvedCacheForTest does not clear and
-	// this package cannot reach (resetSliceabilityMemoForTest is unexported to
-	// internal/cache), so an arm that warms a verdict under the shared
-	// "compositions-panels" coordinates leaks a known-sliceable verdict into
-	// TestRAServe_VerifyThenHit's first-sight expectation. Own name, own raKey,
-	// own shape, no cross-test coupling.
+	// DISTINCT coordinates from the other arms in this package: own name, own
+	// raKey, own shape, no cross-test coupling.
+	//
+	// #471 FIXED THE REASON THIS COMMENT USED TO GIVE. The sliceability memo is
+	// a PROCESS-wide map, and it used to survive ResetResolvedCacheForTest with
+	// no reset this package could reach (resetSliceabilityMemoForTest is
+	// unexported to internal/cache). ResetResolvedCacheForTest now clears it —
+	// the memo is a derived index over the store it drops — so the distinct
+	// coordinates are no longer load-bearing against sibling leakage.
+	//
+	// They stay because they are still the cheaper invariant: an arm whose
+	// verdict nobody else can address does not depend on WHERE a reset is
+	// placed. What distinct names never bought was -count>1 safety, where a
+	// test's second iteration IS its own sibling under the same name; that is
+	// what #471 was.
 	const ns, name = "krateo-system", "a1-uaf-panels"
 	panels := panelDict(40)
 	ctx := ctxWithUser(t)
@@ -152,13 +160,21 @@ func TestA1_RAFullList_BypassSurvivesAWarmCell(t *testing.T) {
 	cache.ResetUAFPutDeclineCountersForTest()
 	t.Cleanup(cache.ResetUAFPutDeclineCountersForTest)
 
-	// DISTINCT coordinates from the other arms in this package. The sliceability
-	// memo is a PROCESS-wide map that ResetResolvedCacheForTest does not clear and
-	// this package cannot reach (resetSliceabilityMemoForTest is unexported to
-	// internal/cache), so an arm that warms a verdict under the shared
-	// "compositions-panels" coordinates leaks a known-sliceable verdict into
-	// TestRAServe_VerifyThenHit's first-sight expectation. Own name, own raKey,
-	// own shape, no cross-test coupling.
+	// DISTINCT coordinates from the other arms in this package: own name, own
+	// raKey, own shape, no cross-test coupling.
+	//
+	// #471 FIXED THE REASON THIS COMMENT USED TO GIVE. The sliceability memo is
+	// a PROCESS-wide map, and it used to survive ResetResolvedCacheForTest with
+	// no reset this package could reach (resetSliceabilityMemoForTest is
+	// unexported to internal/cache). ResetResolvedCacheForTest now clears it —
+	// the memo is a derived index over the store it drops — so the distinct
+	// coordinates are no longer load-bearing against sibling leakage.
+	//
+	// They stay because they are still the cheaper invariant: an arm whose
+	// verdict nobody else can address does not depend on WHERE a reset is
+	// placed. What distinct names never bought was -count>1 safety, where a
+	// test's second iteration IS its own sibling under the same name; that is
+	// what #471 was.
 	const ns, name = "krateo-system", "a1-uaf-panels"
 	ctx := ctxWithUser(t)
 	panels := panelDict(40)
