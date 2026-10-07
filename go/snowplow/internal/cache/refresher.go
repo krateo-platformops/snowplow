@@ -1030,12 +1030,31 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// enqueue) carries none and the re-resolve is pre-R1-identical. Done
 	// here (not in the floored-defer branch above) so the GVR survives a
 	// floor deferral and is consumed at the eventual real dispatch.
+	//
+	// "Once per DISPATCH", not once per mark: a FAILED dispatch restores the
+	// set before re-queueing (#544, the retry branch below), so the retried
+	// dispatch consumes it again. The suppressed skip above and the
+	// poison-pill drop below are the two paths that consume it without a
+	// restore, each deliberately — see their own comments.
 	rctx := ctx
+	// #544 — consumedTriggers keeps what this dispatch took out of the map so
+	// the RETRY path below can put it back. The LoadAndDelete is
+	// unconditional, so without a restore a re-queued key re-dispatches with
+	// NO trigger set: apistageContentServe reads refresherDriven=false
+	// (apistage.go:527) and every stage serves its input from the content
+	// cache — including the one whose change triggered the refresh — and the
+	// result is then written through ReplaceIfGenRefresh as if it were a
+	// from-scratch resolve. The slice is READ-ONLY here: a published
+	// triggerGVRSet is immutable (see triggerGVRSet), and both the stamp
+	// helpers and mergeTriggerGVR copy before they append.
+	var consumedTriggers []schema.GroupVersionResource
 	if v, present := r.triggerGVRByKey.LoadAndDelete(key); present {
 		switch tg := v.(type) {
 		case *triggerGVRSet: // #375 B — the merged trigger SET, consumed in full
+			consumedTriggers = tg.gvrs
 			rctx = WithRefreshTriggerGVRs(ctx, tg.gvrs)
 		case schema.GroupVersionResource:
+			consumedTriggers = []schema.GroupVersionResource{tg}
 			if !tg.Empty() {
 				rctx = WithRefreshTriggerGVR(ctx, tg)
 			}
@@ -1173,6 +1192,37 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		// #354 P3 — a retry keeps the window open from the original mark.
 		if windowOpen {
 			r.windowContinue(key, t0)
+		}
+		// #544 — RESTORE the trigger set consumed above, BEFORE the re-queue,
+		// so the retried dispatch force-misses the same content cells this one
+		// would have. A retry means the first attempt FAILED — exactly the
+		// conditions under which the upstream was unhealthy and the inputs are
+		// most likely to have moved — so this is the path that least tolerates
+		// re-resolving from the content cache. It is also what makes the
+		// refresher terminal's safety argument true on this path: the re-mint
+		// is only "a from-scratch resolve with every freshness guarantee the
+		// refresh carries" (resolved.go, WHY THE REFRESHER) if the retry
+		// carries the triggers too, and ReplaceIfGenRefresh resets the birth
+		// stamp either way.
+		//
+		// Through mergeTriggerGVR, NOT a bare Store: a dirty-mark that landed
+		// while processOne was running has already started a FRESH set for
+		// this key (mergeTriggerGVR's LoadOrStore after our LoadAndDelete),
+		// and that newer trigger MUST survive. The CAS-on-immutable-pointer
+		// loop merges into whatever is there now and containsGVR dedups, so
+		// the retry sees exactly {what this dispatch saw} ∪ {anything newer};
+		// a bare Store would clobber the newer mark and re-open this same
+		// defect for it.
+		//
+		// NOT residency-gated (unlike the SetRefreshTriggerMergeHook caller):
+		// the re-queue on the next line is itself unconditional, so gating
+		// only the restore would reproduce the very asymmetry that IS this
+		// defect. No orphan is possible either — the merge is always paired
+		// with the AddRateLimited below, so a queue item always exists to
+		// consume the restored set (the #383 orphan arm's hazard is a mark
+		// merged WITHOUT an enqueue).
+		for _, g := range consumedTriggers {
+			r.mergeTriggerGVR(key, g)
 		}
 		// Bounded exponential-backoff retry. The key is NOT Forgotten,
 		// so the rate limiter's NumRequeues climbs and the next delay
