@@ -51,6 +51,15 @@ type Client interface {
 	Delete(ctx context.Context, name string, opts Options) error
 	FromUnstructured(in map[string]any, out any) error
 	ToUnstructured(in any) (map[string]any, error)
+	// Discover returns the GroupVersionResources in `category`.
+	//
+	// #517 — ON A PARTIAL DISCOVERY IT RETURNS BOTH: the resources of every
+	// HEALTHY group AND a *PartialDiscoveryError naming the group/versions that
+	// failed. That is a DEGRADED result, not a failure: a caller that maps it to
+	// a 5xx makes one stale aggregated APIService break every category again.
+	// Discriminate with AsPartialDiscovery, serve what came back, and report the
+	// degradation. Any other non-nil error is genuinely fatal and the resource
+	// slice is nil.
 	Discover(ctx context.Context, category string) ([]schema.GroupVersionResource, error)
 }
 
@@ -107,12 +116,44 @@ func (uc *unstructuredClient) ToUnstructured(in any) (map[string]any, error) {
 	return uc.converter.ToUnstructured(in)
 }
 
-func (uc *unstructuredClient) Discover(ctx context.Context, category string) (all []schema.GroupVersionResource, err error) {
+func (uc *unstructuredClient) Discover(ctx context.Context, category string) ([]schema.GroupVersionResource, error) {
+	recordDiscoveryCall()
+
 	lists, err := uc.discoveryClient.ServerPreferredResources()
+
+	// #517 — SERVERPREFERREDRESOURCES IS A PARTIAL-RESULT API.
+	// When one group fails it returns every HEALTHY group's resources
+	// ALONGSIDE *discovery.ErrGroupDiscoveryFailed (client-go
+	// discovery/discovery_client.go:597-601; withRetries at :706-720 returns
+	// that pair unchanged after its retries). The previous `if err != nil {
+	// return }` discarded `lists` wholesale, and handlers/list.go turned it
+	// into a 500 — so ONE stale aggregated APIService broke GET /list for
+	// EVERY category. Honour the partial result instead and report the
+	// degradation; see partial_discovery.go for the full reasoning.
+	var degraded *PartialDiscoveryError
 	if err != nil {
-		return
+		failed, isGroupFailure := discovery.GroupDiscoveryFailedErrorGroups(err)
+		switch {
+		case !isGroupFailure:
+			// A genuine transport/auth failure. client-go returns no result at
+			// all for it (withRetries: `return nil, nil, err` at :715-717), so
+			// there is no healthy subset to honour — STILL FATAL, which is
+			// precisely why the discrimination above has to be exact.
+			recordFatalDiscovery(nil)
+			return nil, err
+		case len(lists) == 0:
+			// Every group failed. "Partial" needs a part: honouring this would
+			// serve an EMPTY list with a 200 and call a total discovery outage
+			// healthy — the same under-report shape as the defect, inverted.
+			recordFatalDiscovery(failed)
+			return nil, err
+		default:
+			recordPartialDiscovery(failed)
+			degraded = &PartialDiscoveryError{Groups: failed}
+		}
 	}
 
+	var all []schema.GroupVersionResource
 	for _, list := range lists {
 		if len(list.APIResources) == 0 {
 			continue
@@ -167,7 +208,11 @@ func (uc *unstructuredClient) Discover(ctx context.Context, category string) (al
 		}
 	}
 
-	return
+	if degraded != nil {
+		// The healthy resources AND the degradation: both, on purpose.
+		return all, degraded
+	}
+	return all, nil
 }
 
 func (uc *unstructuredClient) resourceInterfaceFor(opts Options) (dynamic.ResourceInterface, error) {

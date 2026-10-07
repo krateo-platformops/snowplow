@@ -1,9 +1,9 @@
-//go:build unit
-// +build unit
+//go:build integration
+// +build integration
 
 // call_443_inline_kind_test.go — #443 part 2, the inline dry-run resolve on
-// the real apiserver (kind cluster "krateo"), every request made with the
-// caller's own x509 (e2e.SignUp):
+// the real apiserver (this process's own kind cluster, krateo-<pid>, #522),
+// every request made with the caller's own x509 (e2e.SignUp):
 //
 //   - a_ParityGolden Arm A: stored ra-x is updated to S2; the caller raw-reads
 //     it (GET /call?raw=true) and inline-resolves exactly that body. The reply

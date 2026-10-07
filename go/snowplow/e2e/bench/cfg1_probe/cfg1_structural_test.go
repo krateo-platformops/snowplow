@@ -120,6 +120,16 @@ var nonCacheInitPublishers = map[string][]string{
 	// CACHE_ENABLED, so its publisher runs ungated. The measurement COUNTERS
 	// (snowplow_v7_shadow_parity) stay cache-gated in shadow_parity_hook.go.
 	"internal/handlers/dispatchers/shadow_parity_toggle_metrics.go": {"snowplow_v7_shadow_parity_toggle"},
+	// #517 partial-discovery degradation surface: GET /list performs discovery
+	// in EITHER cache mode (cache-off, list.go records an apiserver fallthrough
+	// and goes to the apiserver regardless), so a partial discovery — one stale
+	// aggregated APIService shortening the served list — must stay observable
+	// with the cache off. Gating it on Disabled() would blind the detector in
+	// exactly the configuration where /list ALWAYS hits discovery, and a
+	// detector whose zero reads as health is not a detector. The sibling
+	// SA-discovery family (cached_client_metrics.go) IS a cache-path mechanism
+	// and stays gated. Rationale at partial_discovery.go:42-49.
+	"internal/dynamic/partial_discovery.go": {"snowplow_discovery"},
 }
 
 // legacyHG321Keys are the five names the shell falsifier asserted since

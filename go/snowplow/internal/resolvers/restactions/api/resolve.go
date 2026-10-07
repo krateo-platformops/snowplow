@@ -760,7 +760,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	}
 
 	r.log.Debug("calling api", slog.String("name", id),
-		slog.String("host", call.Endpoint.ServerURL),
+		slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 		slog.String("path", call.Path),
 	)
 
@@ -950,7 +950,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					depth := depthForLog(r.ctx, r.log, dictMu, dict)
 					r.log.Debug("api successfully resolved",
 						slog.String("name", id),
-						slog.String("host", call.Endpoint.ServerURL),
+						slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 						slog.String("path", call.Path),
 						slog.Int("depth", depth),
 						slog.String("dispatch", dispatch),
@@ -977,7 +977,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			depth := depthForLog(r.ctx, r.log, dictMu, dict)
 			r.log.Debug("api successfully resolved",
 				slog.String("name", id),
-				slog.String("host", call.Endpoint.ServerURL),
+				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 				slog.String("path", call.Path),
 				slog.Int("depth", depth),
 				slog.String("dispatch", dispatch),
@@ -1027,7 +1027,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		dispatch := "internal-rest-config"
 		if ierr != nil {
 			r.log.Error("api call response failure", slog.String("name", id),
-				slog.String("host", call.Endpoint.ServerURL),
+				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 				slog.String("path", call.Path),
 				slog.String("dispatch", "internal-rest-config"),
 				// diagnostic for #271 — self-name the SAR-401 root cause. sa_dial
@@ -1067,7 +1067,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		depth := depthForLog(r.ctx, r.log, dictMu, dict)
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
-			slog.String("host", call.Endpoint.ServerURL),
+			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 			slog.String("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
@@ -1115,7 +1115,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		dispatch := "discovery"
 		if derr != nil {
 			r.log.Error("api call response failure", slog.String("name", id),
-				slog.String("host", call.Endpoint.ServerURL),
+				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 				slog.String("path", call.Path),
 				slog.String("dispatch", "discovery"),
 				// diagnostic for #271 (C3 caveat). dispatchViaDiscovery uses the
@@ -1149,7 +1149,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		depth := depthForLog(r.ctx, r.log, dictMu, dict)
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
-			slog.String("host", call.Endpoint.ServerURL),
+			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 			slog.String("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
@@ -1218,7 +1218,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		depth := depthForLog(r.ctx, r.log, dictMu, dict)
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
-			slog.String("host", call.Endpoint.ServerURL),
+			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 			slog.String("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
@@ -1260,14 +1260,14 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if apiCall.UserAccessFilter == nil && cache.ServiceAccountDialFromContext(gctx) && rbac.MustRegateSADial(gctx) {
 		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", call.Path)
 		r.log.Warn("branch-E SA-endpoint dial re-gated and failed closed",
-			slog.String("name", id), slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path))
+			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), slog.String("path", call.Path))
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, msg, msg, itemErr)
 		r.log.Debug("api resolved (branch-E SA-endpoint dial re-gated, fail-closed)",
-			slog.String("name", id), slog.String("host", call.Endpoint.ServerURL),
+			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 			slog.String("path", call.Path),
 			slog.String("dispatch", "branch-e-sa-regate-denied"))
 		return nil
@@ -1322,7 +1322,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 
 	if res.Status == response.StatusFailure {
 		r.log.Error("api call response failure", slog.String("name", id),
-			slog.String("host", call.Endpoint.ServerURL),
+			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 			slog.String("path", call.Path),
 			// diagnostic for #271 — external/owned-fetch site. sa_dial reads
 			// the SAME provenance marker the dial consumes (gctx := sc.gctx,
@@ -1368,7 +1368,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	depth := depthForLog(r.ctx, r.log, dictMu, dict)
 	r.log.Debug("api successfully resolved",
 		slog.String("name", id),
-		slog.String("host", call.Endpoint.ServerURL),
+		slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 		slog.String("path", call.Path),
 		slog.Int("depth", depth),
 	)
@@ -1591,7 +1591,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// collection LIST) and additionally gated on RESOLVER_VERBOSE_WIRE_DUMP
 	// (R1-b: an operator kill-switch, default off). See the worker below.
 	r.log.Debug("resolved endpoint for api call",
-		slog.String("name", id), slog.String("host", ep.ServerURL),
+		slog.String("name", id), slog.String("host", redact.URL(ep.ServerURL)),
 		slog.Bool("uaf", uafActive))
 
 	// Build the per-stage call plan: request options + Ship D.5

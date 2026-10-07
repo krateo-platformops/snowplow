@@ -48,9 +48,11 @@ func TestRAServe_KnownSliceableCellMiss_ExternalTouched_DeclinesPut(t *testing.T
 	// this branch requires (a "" binding declines before ever reaching here).
 	newF6Watcher(t, f6BuildFixture()...)
 
-	// Unique RA name so this test is self-isolating from the PROCESS-GLOBAL
-	// sliceability memo (NOT reset by ResetResolvedCacheForTest) — a verdict
-	// recorded by another test must never leak here, and ours must not leak out.
+	// Unique RA name so this test is self-isolating in the PROCESS-GLOBAL
+	// sliceability memo — a verdict recorded by another test must never leak
+	// here, and ours must not leak out. Since #471 ResetResolvedCacheForTest
+	// clears the memo too (it is a derived index over the store that call
+	// drops), so this is belt-and-braces, not the only mitigation.
 	const raName = "compositions-panels-extmiss"
 
 	// The raKey the serve path derives (seedFullListRAKey → RAFullListKeyInputs

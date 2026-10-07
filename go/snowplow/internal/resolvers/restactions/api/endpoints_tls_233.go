@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // unparseableCADelegationTotal is the monotonic, UNCAPPED count of unparseable-CA
@@ -74,7 +75,7 @@ func warnUnparseableCADelegation(ep *endpoints.Endpoint) {
 	}
 	slog.Warn("endpoints_tls.unparseable_ca_delegated",
 		slog.String("subsystem", "cache"),
-		slog.String("server_url", ep.ServerURL),
+		slog.String("server_url", redact.URL(ep.ServerURL)),
 		slog.String("ca_sha256", fp),
 		slog.String("effect", "CertificateAuthorityData is present and this is the endpoint-owned-CA shape, "+
 			"but it is UNPARSEABLE (neither raw PEM nor (double-)base64 PEM) — delegated to plumbing; if "+
