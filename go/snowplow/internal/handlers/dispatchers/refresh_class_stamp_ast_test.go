@@ -1,6 +1,7 @@
 // refresh_class_stamp_ast_test.go — M16 (coverage-audit): a build-time AST
 // invariant over the dispatcher serve sites. EVERY setRefreshKeyHeader /
-// setRefreshKeyHeaderUnlessExternal call whose `class` argument is a STRING
+// setRefreshKeyHeaderUnlessExternal / setRefreshKeyHeaderIfArmable call whose
+// `class` argument is a STRING
 // LITERAL must stamp a class in the SubscriptionCoordinates.Class allowlist
 // (DeriveSubscriptionKey's switch). A literal outside the allowlist would make
 // the frontend arm a /refreshes subscription under a class DeriveSubscriptionKey
@@ -46,11 +47,15 @@ var refreshClassAllowlist = map[string]struct{}{
 	"raFullList":    {},
 }
 
-// setRefreshKeyHeaderClassArgIndex maps the two stamping helpers to the 0-based
-// index of their `class` string argument.
+// setRefreshKeyHeaderClassArgIndex maps the stamping helpers to the 0-based
+// index of their `class` string argument. A new stamping helper MUST be added
+// here or its serve sites silently leave the invariant's scope (the two cold
+// tails did exactly that when #548 moved them onto setRefreshKeyHeaderIfArmable;
+// the `total` floor below only catches a scanner that matches NOTHING).
 var setRefreshKeyHeaderClassArgIndex = map[string]int{
 	"setRefreshKeyHeader":               2, // (wri, key, class)
 	"setRefreshKeyHeaderUnlessExternal": 2, // (wri, key, class, externalTTL)
+	"setRefreshKeyHeaderIfArmable":      2, // (wri, key, class, armable) — #548
 }
 
 // scanRefreshClassLiterals walks a parsed file and returns every string-literal

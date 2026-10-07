@@ -417,12 +417,16 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		response.InternalError(wri, err)
 		return
 	}
-	// External-widget bounded-TTL cache (Option A, 2026-07-10) — declared
-	// BEFORE the if/else-if Put-gate chain so the cold-Put tail (below) can
-	// read it on ALL paths. Set true ONLY by the external-TTL else-if; every
-	// other branch leaves it false → byte-identical refresh-key header
-	// behavior on the tail for them (C4).
-	servedExternalTTL := false
+	// #548 — the refresh-ARMING fact for the cold tail, declared BEFORE the
+	// if/else-if Put-gate chain so the tail can read it on ALL paths. Set true at
+	// EXACTLY ONE site: beside publishIfSubscribed inside the accepted-PutIfGen
+	// block, because that is the only place this dispatch creates a cell any
+	// publisher can ever announce. Every decline branch below, the external-TTL
+	// Put (which deliberately never publishes — design §6.3, i.e. the pre-#548
+	// servedExternalTTL arming kill this variable subsumes) and the no-branch
+	// fall-through all leave it false, so none of them can tell the browser to
+	// subscribe to a key nothing will ever publish to.
+	refreshArmable := false
 
 	// Ship 0.30.257 (#313) Cache-A — skip the Put on ANY per-item stage
 	// error (symmetric with restactions.go + the refresher gate). The
@@ -501,9 +505,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// isolation rides on the existing BindingUID fold (ComputeKey), NEVER an
 		// identity-free cell (design §4.1).
 		//
-		// ExternalTTL:true persists the C2 marker so the HIT-serve branch and
-		// this branch's cold tail both suppress the refresh-key header (the
-		// arming kill, §6). No BumpExternalSkippedPut here — the Put was ALLOWED.
+		// ExternalTTL:true persists the C2 marker so the HIT-serve branch
+		// suppresses the refresh-key header (the arming kill, §6). On THIS cold
+		// tail the kill is now implied by #548 instead of flagged separately:
+		// refreshArmable is set only beside publishIfSubscribed, and this branch
+		// deliberately does not publish, so it leaves refreshArmable false and the
+		// tail stamps nothing — the same arming kill through one mechanism rather
+		// than two. No BumpExternalSkippedPut here — the Put was ALLOWED.
 		emitDispatchCacheKeyDiag(log, "external_ttl_put", req.Context(),
 			cacheKey, cacheInputs, "widgets",
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
@@ -515,7 +523,6 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			TTLOverride: extTTL,
 			ExternalTTL: true,
 		})
-		servedExternalTTL = true
 		log.Info("Widget touched an external endpoint; caching with bounded external TTL (opt-in annotation)",
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("external_ttl", extTTL.String()),
@@ -602,6 +609,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// SCOPE: widgets only — NOT widgetContent (shared key w/o BindingUID
 			// fold → cross-deliver risk) per refresh_publish.go.
 			publishIfSubscribed(cacheKey)
+
+			// #548 — ARM the browser here, and ONLY here, on the cold path. This
+			// block is the one place a cold widget dispatch stores a cell, so its
+			// key is the only cold-path key a publisher can ever announce: this
+			// publishIfSubscribed now, or the refresher's PublishRefresh on a later
+			// dep-change (which can only replace a cell that EXISTS). Set AFTER the
+			// Put so the fact tracks the write, not the intention.
+			refreshArmable = true
 		}
 	}
 
@@ -610,12 +625,18 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		slog.String("l1", "miss"),
 	)
 
-	// External-widget bounded-TTL cache (Option A, 2026-07-10) — C2 arming
-	// kill on the cold tail. This line serves ALL non-HIT paths (genuine Put,
-	// stage-error decline, external-skip decline, AND the new external-TTL
-	// Put). Suppress the refresh-key header ONLY for the external-TTL Put
-	// (servedExternalTTL==true); every other branch left it false → byte-
-	// identical header behavior for them (C4).
-	setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", servedExternalTTL)
+	// #548 — arm ONLY a response backed by a stored cell. This line serves ALL
+	// non-HIT paths, and before #548 it stamped the header on every one of them:
+	// the eight cache-key-bearing decline branches above (Secret-read,
+	// identity-class drift, UAF, stage error, external touch, undeclared request
+	// extras, the empty-BindingUID fall-through, and a refused PutIfGen) each told
+	// the browser to subscribe to a key with NO cell and NO possible publisher,
+	// and with per-widget live refresh default-ON and no second refresh path the
+	// page then sat frozen at load. The external-TTL C2 arming kill (Option A,
+	// 2026-07-10) was this same fact found one branch at a time; refreshArmable
+	// generalises it to the whole chain. The inert branch was already safe for a
+	// different reason — it mints no key at all (helpers.go dispatchCacheLookupKey)
+	// — and stays so.
+	setRefreshKeyHeaderIfArmable(wri, cacheKey, "widgets", refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }
