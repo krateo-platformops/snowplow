@@ -61,6 +61,13 @@
 // re-mint is the refresher terminal's cache.ReplaceIfGenRefresh
 // (TestReMint_SingleSetterAudit).
 //
+// #507 — AND NO SEED WRITE BUT BOOT'S CONFERS WARMTH. The same way BornAt is the
+// refresher terminal's to move, SeededAtBoot is the BOOT seed's to stamp: it is
+// provenance that also satisfies warmLocked, so a post-readyz mode stamping it
+// manufactures warmth on a cell no customer has read. Each mode above therefore
+// carries the RESIDENT cell's flag through (seedProvenanceForMode, decided at
+// seed entry and carried on the guard); only seedModeBoot writes true.
+//
 // REFUSAL HANDLING. keepwarm / gvr-discovered / rbacShift take the #394 one-shot
 // inline re-seed (reseedAfterTerminalPutRefusal): the retry recaptures the
 // generation and PutIfGen can INSERT, so a cell removed mid-resolve is re-filled
@@ -100,6 +107,78 @@ type seedTerminalGuard struct {
 	boot bool
 	// gen is the cell's generation captured at seed entry (CaptureGen).
 	gen uint64
+	// seededAtBoot (#507) is the ResolvedEntry.SeededAtBoot the terminal write
+	// carries: boot-seed PROVENANCE, decided ONCE at seed entry by
+	// seedProvenanceForMode. It lives on the guard rather than as a constant at
+	// the two seed-cell literals because that flag is ALSO half of THE warm
+	// predicate (resolved.go warmLocked = SeededAtBoot || lastRead-within-TTL),
+	// so hardcoding it true let an internal seed write manufacture warmth on a
+	// cell no customer had ever read. The zero value is false — a test driving
+	// the restaction tail seam with the zero guard writes an UNSEEDED cell, which
+	// is the conservative direction (a cell can only be colder, never warmer).
+	seededAtBoot bool
+}
+
+// seedProvenanceForMode is the SeededAtBoot the terminal write carries (#507).
+//
+// THE DEFECT IT CLOSES. Both seed-cell literals hardcoded `SeededAtBoot: true`,
+// mode-INDEPENDENTLY. That field is provenance ("the boot seed warmed this
+// cell"), but it is also half of warmLocked, and a keepwarm terminal write is
+// accepted on an ALREADY-RESIDENT cell (the sweep re-resolves every
+// keepwarm-scoped cell whose body is older than keepwarmAgeSkipThreshold =
+// TTL/4). So every sweep pass re-stamped warmth onto cells no customer had ever
+// read, and #496's re-mint gate — which refuses to re-mint a COLD in-window cell
+// precisely so the reaper's cold-evict can still reclaim it — never fired for
+// the keepwarm-scoped set: those cells were re-minted indefinitely and the
+// #259/#191 24h bound was gone for them. This is the #376 lesson surviving in a
+// flag: internal READS were stopped from faking warmth via lastRead (that is
+// what GetNoTouch is for), but an internal WRITE could still confer it.
+//
+// THE RULE. Only a BOOT-mode seed IS the boot seed, so only it stamps the
+// provenance. Every other mode (keepwarm, gvr-discovered, #258 rbac-shift)
+// CARRIES THROUGH what the resident cell already holds:
+//
+//   - a genuinely boot-seeded cell that the sweep re-Puts keeps its attribution,
+//     so hits_seed_attributable (l1_lookup_metrics.go) and the warm_seeded gauge
+//     (resolved.go reapPastMaxEntryAge) stay honest;
+//   - a cell that is NOT boot-seeded — because it never was, or because a
+//     refresher re-Put already cleared the flag (putCoreLocked's replace branch
+//     inherits BornAt and recentHitters, never this flag) — cannot be made warm
+//     by an internal write;
+//   - an ABSENT cell carries nothing, so a first fill is false. A keepwarm
+//     re-fill of a cell whose TTL lapsed between sweeps, and every
+//     gvr-discovered / rbac-shift INSERT, is therefore unseeded, and
+//     putCoreLocked's fresh-insert branch stamps lastRead on it (open #494: that
+//     branch calls every non-seeded insert a customer cold-fill). That is ONE
+//     TTL of lastRead warmth rather than the indefinite seed warmth this flag
+//     conferred, so it is strictly narrower than what it replaces — but it is
+//     #494's carrier and #507 does not close it.
+//
+// READ ORDER — GetNoTouch, and BEFORE CaptureGen. GetNoTouch is the #376
+// internal read (no MoveToFront, no lastRead stamp, no hit_total, metric-neutral
+// on the miss side too), so reading the provenance cannot itself fake the warmth
+// this function exists to stop manufacturing. It KEEPS the lazy TTL/maxAge
+// evict, which is exactly why it must run BEFORE handle.CaptureGen: an evicting
+// read bumps the generation (bumpGenTombstoneLocked), and capturing first would
+// make the seed's own PutIfGen refuse itself. Same ordering constraint
+// seedTerminalGuardFor already observes with respect to seedSkipDecision.
+func seedProvenanceForMode(mode seedScopeMode, handle cacheHandle, key string) bool {
+	if mode == seedModeBoot {
+		// The boot seed IS the provenance, pre- and post-readyz alike (the boot scope
+		// keeps seeding the RA content tail after the first-nav latch). A boot-seeded
+		// cell rides seed warmth until real traffic stamps a Get-HIT or a refresher
+		// re-Put clears the flag — the design putCoreLocked's insert branch documents.
+		return true
+	}
+	if handle == nil {
+		// A nil cacheHandle INTERFACE never reaches a seed site in production
+		// (cache-off yields no seed scope at all), and the concrete store's methods
+		// are nil-RECEIVER safe but not nil-interface safe (restactions.go:300). Fail
+		// to the cold direction rather than panic on a hand-built caller.
+		return false
+	}
+	entry, live := handle.GetNoTouch(key)
+	return live && entry != nil && entry.SeededAtBoot
 }
 
 // seedTerminalGuardFor captures the terminal-Put guard for one seed unit. Call
@@ -116,19 +195,24 @@ type seedTerminalGuard struct {
 //     seedModeRBACShift, and any mode added later): guarded → PutIfGen. Fail
 //     closed — a new mode is post-readyz unless someone argues otherwise here.
 func seedTerminalGuardFor(mode seedScopeMode, handle cacheHandle, key string) seedTerminalGuard {
+	// #507 — the carried provenance is read FIRST, with GetNoTouch: that read may
+	// lazily evict a past-TTL/maxAge cell, which MOVES the generation, so taking it
+	// before CaptureGen is what keeps the seed from refusing its own Put. See
+	// seedProvenanceForMode.
+	seeded := seedProvenanceForMode(mode, handle, key)
 	if mode == seedModeBoot && !cache.IsPhase1Done() {
 		// boot, captured pre-readyz (#323 exemption, #408): capture the generation
 		// NOW, before the resolve, so that a Put landing after /readyz flips can
 		// still be gen-guarded against a removal during this resolve. The
 		// pre-readyz Put stays plain and gets the #375 remark.
-		return seedTerminalGuard{boot: true, gen: handle.CaptureGen(key)}
+		return seedTerminalGuard{boot: true, gen: handle.CaptureGen(key), seededAtBoot: seeded}
 	}
 	// Post-readyz: every mode is guarded, including seedModeBoot (#408). The boot
 	// scope seeds the RA content tail in the background after the first-nav
 	// latch flips /readyz (phase1_walk.go engineSeed select → MarkPhase1Done;
 	// prewarm_engine_boot.go RA tail), so a boot-mode Put can race a served /call
 	// and a removal exactly like keepwarm.
-	return seedTerminalGuard{guarded: true, gen: handle.CaptureGen(key)}
+	return seedTerminalGuard{guarded: true, gen: handle.CaptureGen(key), seededAtBoot: seeded}
 }
 
 // seedTerminalPut is the ONLY terminal L1 write of the two seed primitives. It

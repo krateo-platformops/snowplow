@@ -1313,10 +1313,19 @@ func seedRestactionResolveAndPutProd(
 	}
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
+	terminalGuard := seedTerminalGuardFromContext(resCtx)
 	entry := &cache.ResolvedEntry{
-		RawJSON:      encoded,
-		Inputs:       inputs,
-		SeededAtBoot: true, // #130 F3 seed-attribution: this cell was warmed by the boot seed
+		RawJSON: encoded,
+		Inputs:  inputs,
+		// #130 F3 seed-attribution / #507 — PROVENANCE, carried, never manufactured.
+		// This flag also satisfies warmLocked, so the `true` that used to sit here
+		// made every post-readyz seed mode (above all the keepwarm sweep, which
+		// re-Puts any resident cell whose body is older than TTL/4) confer warmth on
+		// a cell no customer had ever read — defeating #496's re-mint gate
+		// indefinitely for the keepwarm-scoped set. The guard decided it once at
+		// seed entry: true for a boot seed, otherwise whatever the resident cell
+		// already holds. See seedProvenanceForMode.
+		SeededAtBoot: terminalGuard.seededAtBoot,
 		TTLOverride:  uafTTLOverrideForEntry(inputs),
 	}
 	// #394 — the terminal write goes through seedTerminalPut with the guard
@@ -1325,7 +1334,7 @@ func seedRestactionResolveAndPutProd(
 	// resurrecting the cell), plain Put for boot (pre-readyz exemption, #323). A refusal wrote nothing, so the
 	// resolves counter, the seeded-set Mark and the dep Record below are all
 	// skipped; the engine closure re-seeds once.
-	if !seedTerminalPut(resCtx, handle, key, entry, seedTerminalGuardFromContext(resCtx)) {
+	if !seedTerminalPut(resCtx, handle, key, entry, terminalGuard) {
 		logSeedTerminalPutRefused("restactions", ref.Namespace+"/"+ref.Name)
 		return fmt.Errorf("restaction %s/%s: %w", ref.Namespace, ref.Name, errSeedTerminalPutRefused)
 	}
@@ -1662,9 +1671,14 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 
 	// scope-waiver:TTLOverride: seedOneWidget — widgets-class boot seed. 1.12.3 A-1/R-1 CORRECTED WAIVER: the pre-1.12.3 text claimed "UAF is a restactions-STAGE contract, so a widget's apiRef-resolved UAF RA warms the restactions cell, never this widgets cell". That was WRONG and it was the R-1 blocker — widgets/resolve.go folds the apiRef'd RA's UAF-refiltered output into status.widgetData, which IS this cell. A refilter-touched widget can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it), so every cell written here is refilter-free and needs no UAF cap.
 	entry := &cache.ResolvedEntry{
-		RawJSON:      encoded,
-		Inputs:       inputs,
-		SeededAtBoot: true, // #130 F3 seed-attribution: this cell was warmed by the boot seed
+		RawJSON: encoded,
+		Inputs:  inputs,
+		// #130 F3 seed-attribution / #507 — PROVENANCE, carried, never manufactured;
+		// the widgets twin of seedOneRestaction's tail. terminalGuard was captured at
+		// seed entry above: true for a boot seed, otherwise the resident cell's own
+		// flag, so an internal sweep write can no longer make a never-read cell test
+		// warm (warmLocked) and ride #378's re-mint past #496's gate.
+		SeededAtBoot: terminalGuard.seededAtBoot,
 	}
 	// #394 — generation-guarded terminal write for the post-readyz modes (plain
 	// for boot); see seedOneRestaction's tail. A refusal skips the counter, the
