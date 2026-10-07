@@ -479,6 +479,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	if cacheInputs != nil {
 		cacheInputs.HasUAF = restactionHasUAFStage(&cr)
 	}
+	// #548 — the refresh-ARMING fact for the cold tail, declared BEFORE the
+	// if/else-if Put-gate chain so the tail can read it on ALL paths. Twin of the
+	// widgets.go declaration. Set true at EXACTLY ONE site: beside
+	// publishIfSubscribed inside the accepted-PutIfGen block, because that is the
+	// only place this dispatch creates a cell any publisher can ever announce.
+	// Every decline branch below and the no-branch fall-through leave it false.
+	refreshArmable := false
 	// THE UAF DECLINE IS FIRST IN THE CHAIN, and the position is load-bearing.
 	// In the widgets twin of this chain the external-TTL branch below also
 	// WRITES (under an opt-in annotation); placing the UAF gate only in front
@@ -622,6 +629,15 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				// evicted entry), announce the fill so the viewer's frame goes fresh
 				// now instead of waiting for the next churn. No-op when unarmed.
 				publishIfSubscribed(cacheKey)
+
+				// #548 — ARM the browser here, and ONLY here, on the cold path.
+				// This block is the one place a cold RESTAction dispatch stores a
+				// cell, so its key is the only cold-path key a publisher can ever
+				// announce: this publishIfSubscribed now, or the refresher's
+				// PublishRefresh on a later dep-change (which can only replace a
+				// cell that EXISTS). Set AFTER the Put so the fact tracks the
+				// write, not the intention.
+				refreshArmable = true
 			}
 		}
 	}
@@ -633,6 +649,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		slog.String("l1", "miss"),
 	)
 
-	setRefreshKeyHeader(wri, cacheKey, "restactions")
+	// #548 — arm ONLY a response backed by a stored cell. This line serves ALL
+	// non-HIT paths, and before #548 it stamped the header on every one of them,
+	// including each cache-key-bearing decline branch above (Secret-read,
+	// identity-class drift, UAF, stage error, external touch, the
+	// empty-BindingUID fall-through, and a refused PutIfGen): the browser
+	// subscribed to a key with NO cell and NO possible publisher and waited
+	// forever. Twin of the widgets.go tail. The inert branch was already safe for
+	// a different reason — it mints no key at all (dispatchCacheLookupKey).
+	setRefreshKeyHeaderIfArmable(wri, cacheKey, "restactions", refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }

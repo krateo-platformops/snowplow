@@ -995,6 +995,37 @@ func setRefreshKeyHeaderUnlessExternal(wri http.ResponseWriter, key, class strin
 	setRefreshKeyHeader(wri, key, class)
 }
 
+// setRefreshKeyHeaderIfArmable is the #548 arming choke point for the two COLD
+// (non-HIT) dispatcher tails. It stamps the refresh-key + class headers EXACTLY
+// like setRefreshKeyHeader, but ONLY when armable is true — i.e. only when this
+// dispatch actually stored a cell under key, so a publisher can announce it.
+//
+// WHY THE POLARITY IS "PROVE IT IS ARMABLE" rather than "exclude the known-bad
+// branches": the browser arms a /refreshes subscription on seeing
+// X-Snowplow-Refresh-Key (refreshSse.ts echoes it verbatim), and there are
+// EXACTLY TWO publishers in the system — publishIfSubscribed on the accepted
+// cold Put (refresh_publish.go) and the refresher's cache.PublishRefresh, which
+// is reached only after ReplaceIfGenRefresh stored (resolve_populate.go) and so
+// can only ever replace a cell that EXISTS. "A cell was stored under this key"
+// is therefore the whole precondition for a subscription that can ever fire, and
+// the caller sets armable at the SAME site that wires the publisher — the two
+// facts cannot drift apart.
+//
+// An enumerate-the-declines predicate would instead have to be re-edited by
+// every future decline branch, and #548 is exactly the bug that a nine-branch
+// Put-gate chain grew while one unconditional stamp sat below it.
+//
+// armable=false stamps NOTHING (equivalent to an empty key, so the key and class
+// headers stay consistent): the frontend never arms, and the response is
+// honestly "not live" instead of falsely live. No class-only stamp — see
+// setRefreshKeyHeader.
+func setRefreshKeyHeaderIfArmable(wri http.ResponseWriter, key, class string, armable bool) {
+	if !armable {
+		return
+	}
+	setRefreshKeyHeader(wri, key, class)
+}
+
 // writeResolvedJSON writes the canonical Content-Type + 200 + payload.
 // We deliberately do NOT log here on errors writing to the wire — a
 // client disconnect mid-write is normal and not actionable.
