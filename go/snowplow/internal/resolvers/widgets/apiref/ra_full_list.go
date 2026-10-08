@@ -376,14 +376,31 @@ func raFullListServe(
 	if known && sliceable {
 		// #443 (e) — an inert (dry-run) resolve reads the cell without
 		// stamping it warm and without joining its representative pool.
-		inert := cache.Inert(ctx)
+		//
+		// #552 — so does every OTHER non-customer driver, and until now only the
+		// dry-run was recognised here. This cell is read on the BACKGROUND
+		// paginated path (the refresher's re-resolve is NOT excluded from the 4a
+		// serve — boot_walk_skip_rafulllist_test.go pins that the exclusion keys
+		// on ScopeBootPrewarmWalk ONLY), so snowplow's own read was taking
+		// c.Get: lastRead stamped, LRU front moved, hit_total bumped,
+		// noteServeWhileDirty tripped → stale_served_total. Identical defect to
+		// the apistage content read, one function away.
+		//
+		// TWO LINES, NOT ONE, and deliberately so: NoteHitter is NOT reached
+		// inside Get — it is a separate call here, which is why fixing the read
+		// primitive alone would NOT have stopped a background driver from
+		// joining the cell's representative pool with the representative
+		// identity it is resolving under (#444). Both lines ask the same
+		// question, so they now consult the same predicate instead of two.
+		internalRead := cache.BackgroundResolveFromContext(ctx) || cache.Inert(ctx)
 		readRA := c.Get
-		if inert {
+		if internalRead {
 			readRA = c.GetNoTouch
 		}
 		if entry, ok := readRA(raKey); ok {
-			// #444 — the requester joins the cell's representative pool.
-			if !inert {
+			// #444 — the requester joins the cell's representative pool. A
+			// background driver is not a requester.
+			if !internalRead {
 				entry.NoteHitter(keyInputs.RepresentativeUsername, keyInputs.RepresentativeGroups)
 			}
 			full, derr := decodeRAFullList(entry.RawJSON)
