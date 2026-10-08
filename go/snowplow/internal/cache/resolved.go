@@ -759,6 +759,26 @@ type ResolvedCacheStore struct {
 	// Monotonic. A cell refused here is left to the reaper's cold-evict, which is
 	// precisely the #259 / #191 bound this issue restored.
 	remintRefusedColdTotal atomic.Uint64
+	// #506/#538 — proactive enqueues the DEADLINE trigger produced that the TTL
+	// trigger would NOT have (deadlineApproaching && !ttlApproaching, see
+	// reapPastMaxEntryAge). The marginal contribution, deliberately, not every
+	// enqueue in the lead window: the latter would mostly re-count TTL-driven work
+	// and so could not answer "is this trigger doing anything".
+	//
+	// Read it WITH remint_total. This counter is the ENQUEUE (an intent); the
+	// re-mint is the EFFECT, several hops later behind the refresher's dedup,
+	// backoff, yield and every decline gate. So:
+	//   this > 0, remint_total rising → the trigger reaches the terminal
+	//   this > 0, remint_total flat   → enqueues are being produced but dropped
+	//                                   or declined before the re-mint; the
+	//                                   refresher's own counters say which
+	//   this == 0 on a pod whose oldest_warm_born_age_seconds has passed
+	//                                   maxEntryAge − remintLead → the trigger is
+	//                                   genuinely inert
+	// Below that scope threshold a zero means only that no cell has entered its
+	// lead window yet, which is NOT health — the same scope rule
+	// oldestWarmBornAgeGauge carries for the warm-evict detectors.
+	remintDeadlineEnqueuedTotal atomic.Uint64
 
 	// #354 P3 (E, B3) — warm cells whose key carries a page (Page>0 ||
 	// PerPage>0) or request extras, per identity-bound class, recomputed on the
@@ -2201,6 +2221,11 @@ type ResolvedCacheStats struct {
 	// with no customer-warm working set, so only both-zero on an exercised pod
 	// means the window is never reached.
 	RemintRefusedColdTotal uint64
+	// #506/#538 — proactive enqueues produced ONLY by the deadline trigger
+	// (not by the TTL one). See the field doc on
+	// ResolvedCacheStore.remintDeadlineEnqueuedTotal for the truth table and
+	// for the scope threshold below which a zero is not health.
+	RemintDeadlineEnqueuedTotal uint64
 
 	// #316 — proactive refreshes enqueued by the read-independent pass (see
 	// proactiveRefreshTotal). Monotonic; non-zero DURING a missed-dirty-mark
@@ -2283,6 +2308,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		OldestWarmBornAgeSeconds:     c.oldestWarmBornAgeGauge.Load(),
 		RemintTotal:                  c.remintTotal.Load(),
 		RemintRefusedColdTotal:       c.remintRefusedColdTotal.Load(),
+		RemintDeadlineEnqueuedTotal:  c.remintDeadlineEnqueuedTotal.Load(),
 		ProactiveRefreshTotal:        c.proactiveRefreshTotal.Load(),
 		ApistageStoreTotal:           c.apistageStoreTotal.Load(),
 		ApistageEvictTotal:           c.apistageEvictTotal.Load(),
@@ -3158,6 +3184,13 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	maxAgeSec := int64(c.maxEntryAge.Seconds())
 	ttlSec := int64(c.ttl.Seconds())
 	refreshBelow := ttlSec / 4 // enqueue a warm cell once past ~3/4 of its TTL
+	// #506/#538 — the deadline trigger's threshold, taken from remintLead() so it
+	// is the SAME instant ReplaceIfGenRefresh's re-mint window opens on. Computed
+	// once here rather than per cell: maxEntryAge and ttl are set at construction
+	// and never mutated, so this needs no lock and must not be re-derived inside
+	// the batch hold.
+	leadSec := int64(c.remintLead().Seconds())
+	deadlineOnly := 0
 	suppressedResident := 0
 	warmPastMaxAge := 0
 	warmSeeded := 0                                      // #376 — resident warm cells that are warm via SeededAtBoot
@@ -3242,8 +3275,70 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 			// (metaForItemLocked uses effectiveTTLLocked); for the non-override cells
 			// that remain, effective == standard, so refreshBelow (standard TTL/4) is
 			// the right threshold.
-			if warm && !suppressed && m.TTLOverrideSeconds == 0 && ttlSec > 0 && m.TTLRemainingSeconds < refreshBelow && !proactiveRefreshDisabledForTest.Load() {
+			//
+			// #506 / #538 — THE DEADLINE-KEYED TRIGGER, and why the TTL one above
+			// cannot stand in for it. That condition watches the BODY clock
+			// (CreatedAt, via TTLRemainingSeconds); nothing watched the BIRTH clock
+			// (BornAt) approaching maxEntryAge. The two come apart in exactly the
+			// case that matters:
+			//
+			//   - #506's residual. The re-mint is refused for a cell that is COLD at
+			//     its in-window refresh. A cell read LATE in the lead window is warm
+			//     from then on, but the TTL trigger only re-fires ~3/4·TTL after the
+			//     last refresh (~45min at TTL=3600s) while the window is one TTL
+			//     wide — so there may be NO further refresh between that read and the
+			//     cap, and the customer eats a max-age cold navigation of a cell that
+			//     was warm when it died. Keying on the deadline puts a refresh near
+			//     the cap, AFTER any late read, where the existing warmth gate then
+			//     accepts the re-mint.
+			//   - #538. A dep-quiet keepwarm cell gets no dirty mark, so no refresher
+			//     terminal ever fires for it and there is no re-mint to reach. Its
+			//     body is kept young by the keepwarm re-Put, so TTLRemaining never
+			//     drops below refreshBelow and the TTL trigger NEVER fires either,
+			//     however close to the cap it gets. This is the only trigger that
+			//     reaches it.
+			//
+			// The threshold is the re-mint lead window itself, maxEntryAge −
+			// remintLead(), so this pass and ReplaceIfGenRefresh's predicate open on
+			// the SAME instant by construction — one derivation, no second constant
+			// to keep in step, and no env knob (remintLead self-adapts to the two
+			// bounds already configured). Enqueuing at the window's start rather than
+			// at the cap leaves a full lead for the refresher's own backoff, yield
+			// and retry budget before the deadline is real.
+			//
+			// ONE DELIBERATE CONSEQUENCE, stated because it is a behaviour change
+			// outside the case above. The old condition carried `ttlSec > 0`, so with
+			// the TTL DISABLED no cell was ever a refresh candidate. That guard now
+			// lives inside ttlApproaching (the TTL path is behaviour-identical), and
+			// the deadline path does not read TTLRemainingSeconds at all — so with
+			// ttl=0 and maxEntryAge set, a warm cell in its lead window is now
+			// enqueued where previously nothing refreshed it. That is the intended
+			// direction: with ttl=0, warmLocked reduces to SeededAtBoot, and a seeded
+			// cell is exactly what inRemintWindowLocked still re-mints, so before this
+			// the boot working set reached the cap with no refresher ever firing for
+			// it. Both maxAgeSec > 0 and leadSec > 0 are checked, so maxEntryAge=0
+			// disables this path entirely rather than dividing by a zero bound.
+			//
+			// Still gated on WARM. Ungating cold cells is #506's OTHER half and is
+			// deliberately NOT done here: a re-mint moves BornAt, and the reaper's
+			// only cold-reclaim handle is `pastMaxAge && !warm`, so re-minting a cold
+			// cell makes it unreclaimable — the #496 defect. That half needs a
+			// reclamation handle that does not exist yet; see the issue.
+			ttlApproaching := ttlSec > 0 && m.TTLRemainingSeconds < refreshBelow
+			deadlineApproaching := maxAgeSec > 0 && leadSec > 0 && m.LifetimeSeconds >= maxAgeSec-leadSec
+			if warm && !suppressed && m.TTLOverrideSeconds == 0 && (ttlApproaching || deadlineApproaching) && !proactiveRefreshDisabledForTest.Load() {
 				refreshCandidates = append(refreshCandidates, m.KeyHash)
+				// The MARGINAL contribution of the deadline trigger: enqueues that
+				// the TTL condition would not have produced. Counting every
+				// deadline-window enqueue instead would mostly re-count TTL-driven
+				// work and could not answer "is this trigger doing anything". It is
+				// POSITIVE during both conditions above — a dep-quiet cell near its
+				// cap has a young body, so ttlApproaching is false there — which is
+				// what keeps it a detector rather than a number whose zero reads as
+				// health.
+				if deadlineApproaching && !ttlApproaching {
+					deadlineOnly++
+				}
 			}
 		}
 		return true // FULL walk
@@ -3253,7 +3348,13 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 	c.warmSeededGauge.Store(uint64(warmSeeded))        // #376
 	c.warmLastReadGauge.Store(uint64(warmLastRead))    // #376
 	c.oldestWarmBornAgeGauge.Store(uint64(oldestWarm)) // #378
-	for i := range warmKeyedPage {                     // #354 P3 B3
+	// #506/#538 — a COUNTER (Add), not a gauge: it measures enqueues produced,
+	// which accumulate across passes. The same cell legitimately contributes once
+	// per pass while it sits in its lead window, because each pass enqueues again.
+	if deadlineOnly > 0 {
+		c.remintDeadlineEnqueuedTotal.Add(uint64(deadlineOnly))
+	}
+	for i := range warmKeyedPage { // #354 P3 B3
 		c.warmKeyedPageGauge[i].Store(warmKeyedPage[i])
 		c.warmKeyedExtrasGauge[i].Store(warmKeyedExtras[i])
 	}
