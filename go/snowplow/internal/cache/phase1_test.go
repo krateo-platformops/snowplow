@@ -39,6 +39,37 @@ var forbiddenSeedResources = map[string]bool{
 	"navmenus":      true,
 }
 
+// requiredSeedMembers names every GVR that MUST be a meta-query seed, as a
+// literal, reading NEITHER restActionGVR nor RBACResourceTypes.
+//
+// That independence is the whole point (#483, #562 gate finding F3): the
+// derived set-equality check cannot detect a source being emptied, because the
+// expectation it builds shrinks along with the seeds. These names do not move
+// when a source does, so a silent loss fails on the specific missing anchor.
+//
+// Duplicating the RBAC list here is intentional, not an oversight. If
+// RBACResourceTypes legitimately changes, this arm reds and must be updated by
+// hand — a deliberate, visible edit to the boot-sequence contract, which is
+// exactly the review that a silently-shrinking budget skips.
+func requiredSeedMembers() []schema.GroupVersionResource {
+	return []schema.GroupVersionResource{
+		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"},
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"},
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"},
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"},
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"},
+	}
+}
+
+func seedSetContains(seeds []schema.GroupVersionResource, want schema.GroupVersionResource) bool {
+	for _, s := range seeds {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestMetaQuerySeeds_IsDerivedFromItsTwoSanctionedSources is the #483
 // structural guard on the seed budget.
 //
@@ -59,8 +90,27 @@ var forbiddenSeedResources = map[string]bool{
 //     a visible change to a sanctioned declaration rather than one more
 //     line in a slice.
 //
-// It also pins the count, so a source that silently loses an entry is
-// caught rather than quietly shrinking the budget to match.
+// WHAT DERIVATION ALONE CANNOT CATCH, and why the second half exists. A
+// derived expectation moves WITH the thing it guards: empty RBACResourceTypes
+// and both `want` and MetaQuerySeeds() shrink together, so set equality still
+// holds and the budget silently collapses 5 -> 1 with this test green. The
+// #562 gate demonstrated exactly that. So the derivation is only half the
+// guard:
+//
+//   - DERIVED set equality catches ADDITIONS — an extra seed fails whatever it
+//     is named, which a name-matching guard cannot do.
+//   - NAMED MEMBERS (requiredSeedMembers) catch SILENT LOSS — if either source
+//     is emptied or loses an entry, the specific missing NAME fails.
+//
+// The two directions need different instruments and neither subsumes the
+// other. The named half is deliberately NOT a count literal: a remembered
+// number rots (#554 is open right now over a floor of 3 guarding five real
+// sites), whereas a missing name says which anchor vanished.
+//
+// Not relying on the incidental backstop: today a cleared RBACResourceTypes
+// also hard-panics NewResourceWatcher via AssertRBACSnapshotWired
+// (rbac_snapshot.go), so the package reds regardless. That is luck, not this
+// arm, and it would evaporate the moment the panic moved.
 func TestMetaQuerySeeds_IsDerivedFromItsTwoSanctionedSources(t *testing.T) {
 	seeds := cache.MetaQuerySeeds()
 
@@ -72,6 +122,23 @@ func TestMetaQuerySeeds_IsDerivedFromItsTwoSanctionedSources(t *testing.T) {
 	}
 	for _, g := range cache.RBACResourceTypes {
 		want[g] = true
+	}
+
+	// ── The silent-loss half: every anchor named by name, independent of both
+	// sources. A source that is emptied or loses an entry fails HERE. ──
+	for _, req := range requiredSeedMembers() {
+		if !seedSetContains(seeds, req) {
+			t.Errorf("#483: sanctioned anchor %v is ABSENT from MetaQuerySeeds(). This check does "+
+				"NOT read restActionGVR or RBACResourceTypes, so it still fails when a SOURCE is "+
+				"emptied or loses an entry — the case the derived set-equality check below cannot "+
+				"see, because `want` shrinks along with the seeds and stays equal. If this anchor "+
+				"was dropped deliberately, that is a boot-sequence change: the walk cannot evaluate "+
+				"an RBAC decision or follow an apiRef edge without these.", req)
+		}
+	}
+	if len(seeds) < len(requiredSeedMembers()) {
+		t.Fatalf("#483: the seed budget (%d) is smaller than the number of named anchors (%d) — "+
+			"the set has lost members: %v", len(seeds), len(requiredSeedMembers()), seeds)
 	}
 
 	if len(seeds) != len(want) {

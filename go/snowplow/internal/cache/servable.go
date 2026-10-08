@@ -1075,14 +1075,26 @@ type gvServedLookup struct {
 // resultFor answers for ONE resource of the group/version this lookup
 // describes.
 //
-// The discriminator is listOK and deliberately NOT byName's nilness: a
-// successful list carrying ZERO APIResources is a definite-absent answer for
-// every resource in it, and a nil-map test would misroute that to the shared
-// verdict (which for a successful list is the zero gvServedResult — UNKNOWN —
-// turning a legitimate retraction into a retain). The zero lookup, which the
-// batch loops read when no discovery client is wired, yields the zero result
-// {false,false,""} — identical to the pre-#483 zero-value map read, and ignored
-// by applyConfirmLocked under haveDisco==false.
+// The discriminator is listOK rather than byName's nilness. To be precise
+// about what that does and does not buy (#562 gate finding F1): the two are
+// EQUIVALENT today on every rung, because groupVersionServed builds byName with
+// make() unconditionally on the success path and make never returns nil. So
+// this is not guarding a live mis-routing bug — a nil-map test would currently
+// answer identically, including for a successful list carrying ZERO
+// APIResources, which must be (and is) definite-absent for every resource in
+// it.
+//
+// It guards a REFACTOR. The moment byName becomes lazily allocated — skipped
+// for an empty list, or built only on first lookup — nilness would start
+// meaning "empty list" as well as "no list", silently routing a
+// successful-but-empty list to the shared verdict, which for a successful list
+// is the zero gvServedResult (UNKNOWN) and would turn a legitimate retraction
+// into a retain. An explicit flag cannot acquire that second meaning.
+//
+// The zero lookup, which the batch loops read when no discovery client is
+// wired, yields the zero result {false,false,""} — identical to the pre-#483
+// zero-value map read, and ignored by applyConfirmLocked under
+// haveDisco==false.
 func (l gvServedLookup) resultFor(resource string) gvServedResult {
 	if !l.listOK {
 		return l.shared
