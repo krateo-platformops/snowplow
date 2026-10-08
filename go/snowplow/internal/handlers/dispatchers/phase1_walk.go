@@ -18,7 +18,7 @@
 //      1 parses each `/call?resource=...&apiVersion=...&name=...&
 //      namespace=...` URL into an ObjectReference and fetches those EXACT
 //      two widget CRs as the navigation roots. The resource names
-//      (`navmenus`, `routesloaders`) appear NOWHERE as Go literals — they
+//      (the former `navmenus` / `routesloaders`) appear NOWHERE as Go literals — they
 //      arrive at runtime from config.json. If the frontend changes its
 //      INIT widget, Phase 1 follows automatically. See phase1_roots.go.
 //   2. Recursively resolve the navigation widget tree under the snowplow
@@ -184,9 +184,17 @@ type navigationRoot struct {
 	GVR  schema.GroupVersionResource
 }
 
-// rootsLister abstracts the cluster-wide LIST of the navigation-root CRs
-// so the no-hardcode falsifier test can substitute an in-memory inventory
-// without a cluster. Production lists BOTH routesloaders and navmenus.
+// rootsLister abstracts the navigation-root fetch so the no-hardcode falsifier
+// test can substitute an in-memory inventory without a cluster.
+//
+// #483 — this comment used to say "Production lists BOTH routesloaders and
+// navmenus", which had been false since 0.30.107 and described a LIST that no
+// longer happens. The sole production implementation is
+// listNavigationRootsFromConfigMap (phase1_roots.go, wired below): it reads the
+// frontend ConfigMap, decodes the `.api.INIT` / `.api.ROUTES_LOADER` `/call`
+// URLs into ObjectReferences and fetches each root BY NAME. It never LISTs a
+// navigation kind, and both of those kinds have since been removed from the
+// platform.
 type rootsLister func(ctx context.Context) ([]navigationRoot, error)
 
 // rootResolver abstracts resolving a single navigation-root CR (and, in
@@ -201,8 +209,10 @@ type rootResolver func(ctx context.Context, root navigationRoot) error
 // cache.Phase1Done.
 //
 // Sequence:
-//   - register the 8 meta-query seeds (routesloaders / navmenus /
-//     restactions / customresourcedefinitions + the 4 RBAC GVRs);
+//   - register the 5 meta-query seeds (restactions + the 4 RBAC GVRs).
+//     #483 removed routesloaders + navmenus; Ship 0 / 0.30.222 had already
+//     removed customresourcedefinitions, so the count this listed (8) was
+//     stale in two directions;
 //   - start the CRD-watch (Part 2) so composition informers spawn as
 //     their CRDs are observed for navigation-discovered groups;
 //   - READ the navigation roots from the frontend ConfigMap (config.json

@@ -259,21 +259,26 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 	// Resolve resource-type existence per group/version. Multiple GVRs
 	// can share a group/version (e.g. several CompositionDefinition
 	// versions) — dedupe so we issue one discovery call per gv.
+	//
+	// #483 — the dedupe is on the CALL, never on the ANSWER. One successful
+	// discovery call returns the group/version's WHOLE resource list, so every
+	// sibling is answered from it BY NAME (resultFor) instead of inheriting
+	// whichever sibling Go's map iteration happened to reach first. Error and
+	// nil-list answers are group/version-WIDE by construction and stay shared —
+	// see gvServedLookup for why that asymmetry is load-bearing. Map presence is
+	// the dedupe set, so no parallel `queried` map is needed.
 	type gvKey = string
-	served := map[gvKey]gvServedResult{}
+	lookups := map[gvKey]gvServedLookup{}
 	if disco != nil {
-		queried := map[gvKey]struct{}{}
 		for _, gvr := range gvrs {
 			if ctx.Err() != nil {
 				return
 			}
 			gv := groupVersionString(gvr)
-			if _, done := queried[gv]; done {
+			if _, done := lookups[gv]; done {
 				continue
 			}
-			queried[gv] = struct{}{}
-			s, known, reason := resourceTypeServed(disco, gvr)
-			served[gv] = gvServedResult{served: s, known: known, reason: reason}
+			lookups[gv] = groupVersionServed(disco, gv)
 		}
 	}
 
@@ -282,7 +287,10 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 	defer rw.mu.Unlock()
 	rw.ensureConfirmMapsLocked()
 	for i, gvr := range gvrs {
-		r := served[groupVersionString(gvr)]
+		// disco == nil ⇒ lookups is empty ⇒ the zero lookup yields the zero
+		// result ({false,false,""}), exactly as the pre-#483 zero-value map read
+		// did; applyConfirmLocked ignores it under haveDisco==false either way.
+		r := lookups[groupVersionString(gvr)].resultFor(gvr.Resource)
 		rw.applyConfirmLocked(gvr, gis[i], disco != nil, r.served, r.known, r.reason, confirmRetractDiscoveryRefresh)
 	}
 }
@@ -341,9 +349,16 @@ func (rw *ResourceWatcher) clearRetainUnknownWarnLocked(gvr schema.GroupVersionR
 //     discovery client, conjunct 4 is degraded-true (resourceTypeConfirmedLocked
 //     returns true) so rw.confirmed is left untouched — identical to the
 //     pre-extraction RefreshDiscovery branch.
-//   - served/known/unknownReason: resourceTypeServed's three-state answer for
-//     gvr's group/version (#217). served && known ⇒ confirm; !served && known ⇒
-//     DEFINITE absent ⇒ retract; !known ⇒ UNKNOWN ⇒ fail-open (retain).
+//
+//   - served/known/unknownReason: discovery's three-state answer for THIS GVR
+//     (#217). served && known ⇒ confirm; !served && known ⇒ DEFINITE absent ⇒
+//     retract; !known ⇒ UNKNOWN ⇒ fail-open (retain).
+//
+//     #483 — the answer is per RESOURCE, not per group/version. A caller
+//     batching several GVRs of one group/version must project the shared
+//     discovery call through gvServedLookup.resultFor(gvr.Resource) and must NOT
+//     hand one sibling's verdict to the others; doing so retracted healthy
+//     resources whose group/version mates were absent.
 func (rw *ResourceWatcher) applyConfirmLocked(
 	gvr schema.GroupVersionResource,
 	gi informers.GenericInformer,
@@ -582,20 +597,24 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 	// Resolve resource-type existence per group/version, deduped — identical
 	// to RefreshDiscovery's dedup loop, run OFF the lock. One discovery call
 	// per distinct gv across the whole set (the cost bound), not per GVR.
-	served := map[string]gvServedResult{}
+	//
+	// #483 — like RefreshDiscovery, the dedupe covers the CALL and not the
+	// ANSWER: each sibling is answered by name out of the shared successful
+	// list. This loop is the second copy of the defect, and the walk-confirm
+	// path reaches it with exactly the multi-version sets (several
+	// CompositionDefinition versions sharing a group/version) the sharing bug
+	// mis-answers, so it needs the same fix and its own arm.
+	lookups := map[string]gvServedLookup{}
 	if disco != nil {
-		queried := map[string]struct{}{}
 		for _, gvr := range gvrs {
 			if ctx != nil && ctx.Err() != nil {
 				return
 			}
 			gv := groupVersionString(gvr)
-			if _, done := queried[gv]; done {
+			if _, done := lookups[gv]; done {
 				continue
 			}
-			queried[gv] = struct{}{}
-			s, known, reason := resourceTypeServed(disco, gvr)
-			served[gv] = gvServedResult{served: s, known: known, reason: reason}
+			lookups[gv] = groupVersionServed(disco, gv)
 		}
 	}
 
@@ -611,7 +630,7 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 		if !stillRegistered {
 			continue
 		}
-		r := served[groupVersionString(gvr)]
+		r := lookups[groupVersionString(gvr)].resultFor(gvr.Resource)
 		rw.applyConfirmLocked(gvr, curGI, disco != nil, r.served, r.known, r.reason, confirmRetractWalkConfirm)
 	}
 }
@@ -913,8 +932,29 @@ func InformerFreshnessSnapshotGlobal() InformerFreshness {
 // RemoveResourceType path (confirmRetractCRDDeleted / _stale_version_pruned),
 // which drops the informer entirely — RefreshDiscovery only ever sees a GVR
 // whose GROUP is still served, where a successful-list omission is authoritative.
+// It is a thin per-resource projection of groupVersionServed (#483): the
+// error/nil-list ladder lives THERE, in one place, so the batch callers that
+// answer many siblings from one call cannot drift from this one. Every caller
+// of this function asks about a single GVR and is unaffected by #483.
 func resourceTypeServed(disco ResourceTypeDiscovery, gvr schema.GroupVersionResource) (served bool, known bool, unknownReason string) {
-	list, err := disco.ServerResourcesForGroupVersion(groupVersionString(gvr))
+	r := groupVersionServed(disco, groupVersionString(gvr)).resultFor(gvr.Resource)
+	return r.served, r.known, r.reason
+}
+
+// groupVersionServed makes ONE discovery call for a whole group/version and
+// returns an answer that can still be read per RESOURCE. It is the single
+// implementation of discovery's error semantics; resourceTypeServed and both
+// batch confirm loops project it.
+//
+// #483 — WHY THE RETURN IS NOT A BARE VERDICT. A successful list enumerates
+// every resource the group/version serves, so it answers each resource
+// independently. Every other outcome answers about the group/version as a
+// whole. Pre-#483 both batch loops cached a bare verdict per group/version
+// taken from ONE representative sibling, so a resource that discovery listed
+// was retracted because a sibling sharing its group/version was not listed.
+// See gvServedLookup for the measured customer impact.
+func groupVersionServed(disco ResourceTypeDiscovery, gv string) gvServedLookup {
+	list, err := disco.ServerResourcesForGroupVersion(gv)
 	if err != nil {
 		// #217 — an AUTHORITATIVE-absent discovery error is NOT uncertainty. A
 		// 404 (NotFound) / 410 (Gone) is the apiserver stating that this
@@ -931,20 +971,37 @@ func resourceTypeServed(disco ResourceTypeDiscovery, gvr schema.GroupVersionReso
 		// bounded retract-then-reconfirm flap, whereas retaining a genuine
 		// removal is unbounded. This mirrors groupAuthoritativelyAbsent treating
 		// a successful ServerGroups response that lacks the group as authoritative.
+		//
+		// #483 — this verdict is correctly GROUP/VERSION-WIDE and every sibling
+		// must inherit it: the apiserver has stated that the whole group/version
+		// is absent, so retracting only one resource would leave the rest
+		// stale-serving exactly the removal this backstop exists to reconcile.
 		if apierrors.IsNotFound(err) || apierrors.IsGone(err) {
-			return false, true, "" // authoritative absent → DEFINITE absent (retract)
+			// authoritative absent → DEFINITE absent (retract), GV-wide
+			return gvServedLookup{shared: gvServedResult{served: false, known: true}}
 		}
-		return false, false, classifyDiscoveryError(err)
+		// Transient → UNKNOWN → retain, GV-wide: we could not ask about ANY
+		// resource in this group/version, so no sibling may be retracted.
+		return gvServedLookup{shared: gvServedResult{
+			served: false, known: false, reason: classifyDiscoveryError(err),
+		}}
 	}
 	if list == nil {
-		return false, false, retainUnknownNilList
+		// UNKNOWN, GV-wide — same reasoning as the transient branch.
+		return gvServedLookup{shared: gvServedResult{
+			served: false, known: false, reason: retainUnknownNilList,
+		}}
 	}
+	// SUCCESSFUL list — the only per-resource outcome. Index the names the call
+	// already returned; resultFor then answers each sibling from this set, so
+	// the per-resource fix costs ZERO extra round-trips. Built from THIS direct
+	// fetch and never from resourceVerbsSnapshot: per unregisterableReason's
+	// note, a 30s-old memoised list must not be what confirms a post-startup CRD.
+	byName := make(map[string]struct{}, len(list.APIResources))
 	for _, r := range list.APIResources {
-		if r.Name == gvr.Resource {
-			return true, true, ""
-		}
+		byName[r.Name] = struct{}{}
 	}
-	return false, true, "" // successful list, resource absent → DEFINITE absent
+	return gvServedLookup{byName: byName, listOK: true}
 }
 
 // classifyDiscoveryError maps a discovery error onto a retain-on-unknown reason
@@ -971,6 +1028,83 @@ type gvServedResult struct {
 	served bool
 	known  bool
 	reason string // retain-on-unknown class when !known; "" when known
+}
+
+// gvServedLookup is ONE discovery call's answer for a whole group/version,
+// projected onto a single resource by resultFor (#483).
+//
+// THE DISTINCTION IT EXISTS TO CARRY. A discovery outcome is one of two kinds:
+//
+//   - a SUCCESSFUL list — it names every resource the group/version serves, so
+//     it answers PER RESOURCE: a listed sibling is served, an unlisted sibling
+//     is definite-absent, each independently of the others. byName holds the
+//     names and listOK is true.
+//   - anything else (NotFound/Gone, a transient error, a nil list) — it says
+//     nothing about any individual resource and everything about the
+//     group/version as a whole, so every sibling shares it VERBATIM. listOK is
+//     false and shared carries the verdict.
+//
+// That asymmetry is the whole correctness argument and it must not be
+// "simplified" in either direction. Making the error paths per-resource would
+// fail OPEN on a real group/version removal whose CRD-DELETE event was missed —
+// RefreshDiscovery is the reconciling backstop for exactly that, so fail-open
+// there means unbounded stale-serve. Making the successful-list path shared is
+// the #483 defect: fail-CLOSED on healthy siblings, i.e. mass retraction.
+//
+// MEASURED (057, 1.12.38, two /debug/vars scrapes 61s apart):
+// informer_confirm_retracted_by_reason.discovery_refresh = 5,182 on a cluster
+// with NO CRD churn, where that counter must be flat at 0. Customer-visible as
+// apiserver_fallthrough_cells.call-generic for
+// composition.krateo.io/v0-1-0 Resource=eventsites = 19
+// (informer-fallthrough-not-servable): `eventsites` does serve v0-1-0, but
+// `meetupsites` shares its group/version and serves only v0-3-0, so whenever
+// the map iteration elected meetupsites as the representative, eventsites
+// inherited "absent" and stopped being servable.
+type gvServedLookup struct {
+	// byName indexes a SUCCESSFUL list's resource names. Meaningful only when
+	// listOK; nil otherwise.
+	byName map[string]struct{}
+	// listOK is the discriminator: true iff the discovery call returned a
+	// non-nil list without error.
+	listOK bool
+	// shared is the group/version-wide verdict every sibling inherits when
+	// listOK is false.
+	shared gvServedResult
+}
+
+// resultFor answers for ONE resource of the group/version this lookup
+// describes.
+//
+// The discriminator is listOK rather than byName's nilness. To be precise
+// about what that does and does not buy (#562 gate finding F1): the two are
+// EQUIVALENT today on every rung, because groupVersionServed builds byName with
+// make() unconditionally on the success path and make never returns nil. So
+// this is not guarding a live mis-routing bug — a nil-map test would currently
+// answer identically, including for a successful list carrying ZERO
+// APIResources, which must be (and is) definite-absent for every resource in
+// it.
+//
+// It guards a REFACTOR. The moment byName becomes lazily allocated — skipped
+// for an empty list, or built only on first lookup — nilness would start
+// meaning "empty list" as well as "no list", silently routing a
+// successful-but-empty list to the shared verdict, which for a successful list
+// is the zero gvServedResult (UNKNOWN) and would turn a legitimate retraction
+// into a retain. An explicit flag cannot acquire that second meaning.
+//
+// The zero lookup, which the batch loops read when no discovery client is
+// wired, yields the zero result {false,false,""} — identical to the pre-#483
+// zero-value map read, and ignored by applyConfirmLocked under
+// haveDisco==false.
+func (l gvServedLookup) resultFor(resource string) gvServedResult {
+	if !l.listOK {
+		return l.shared
+	}
+	if _, present := l.byName[resource]; present {
+		return gvServedResult{served: true, known: true}
+	}
+	// Successful list, this resource absent → DEFINITE absent for THIS resource
+	// only. Its siblings are answered by their own lookup in this same set.
+	return gvServedResult{served: false, known: true}
 }
 
 // groupVersionString renders gvr's group/version the way discovery keys

@@ -967,8 +967,9 @@ func main() {
 						// standalone PREWARM_ENABLED flag was retired.
 						// Distinct from the 0.30.99
 						// PREWARM_REGISTER_ENABLED GVR-walk above: Tag B
-						// resolves the routesloaders navigation roots
-						// under SA identity (discovering GVRs by
+						// resolves the navigation roots the frontend
+						// ConfigMap names, under SA identity
+						// (discovering GVRs by
 						// resolution, not from a configured list) and
 						// BLOCKS readiness on every navigated informer
 						// reaching HasSynced.
@@ -992,7 +993,7 @@ func main() {
 						if cache.PrewarmEnabled() {
 							log.Info("prewarm: Phase 1 startup warmup enabled (implicit-on-cache, #57)",
 								slog.String("subsystem", "cache"),
-								slog.String("hint", "SA-credentialed routesloaders resolution walk + CRD-watch; /readyz gates on Phase1Done"),
+								slog.String("hint", "SA-credentialed navigation-root resolution walk + CRD-watch; /readyz gates on Phase1Done"),
 							)
 							// PHASE1_TIMEOUT_SECONDS bounds the whole walk +
 							// sync barrier. Default 900s — aligned with the
