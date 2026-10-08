@@ -26,50 +26,97 @@ import (
 // Tag B meta-query seed. feedback_no_special_cases.md is a HARD
 // requirement: every business GVR (compositions, panels, the concrete
 // widget resources) is discovered by resolution, never named in code.
-// `routesloaders` is EXEMPT — it is the sanctioned navigation-root
-// anchor, not a business resource.
+//
+// #483 — this name list is a BACKSTOP, not the guard. It only catches
+// resources someone thought to enumerate here, and a re-added seed under
+// a local alias defeats it entirely. The real guard is
+// TestMetaQuerySeeds_IsDerivedFromItsTwoSanctionedSources below, which
+// derives the permitted set instead of matching literals.
 var forbiddenSeedResources = map[string]bool{
-	"compositions": true,
-	"panels":       true,
+	"compositions":  true,
+	"panels":        true,
+	"routesloaders": true,
+	"navmenus":      true,
 }
 
-// TestMetaQuerySeeds_ExactBudget asserts the hardcoded seed set is
-// EXACTLY the 7 declared meta-query anchors and contains no business
-// GVR. A regression that adds a configured widget / composition GVR to
-// the seed list fails here. 0.30.105 raised the budget 7->8 by adding
-// the navmenus navigation root; Ship 0 / 0.30.222 lowered it back to 7
-// by removing customresourcedefinitions (walker-spawned via
-// AddNavigationDiscoveredGroup, no longer a boot primordial).
-func TestMetaQuerySeeds_ExactBudget(t *testing.T) {
+// TestMetaQuerySeeds_IsDerivedFromItsTwoSanctionedSources is the #483
+// structural guard on the seed budget.
+//
+// It does NOT compare against a hand-written list of GVR literals. It
+// RECOMPUTES the permitted set from the only two declarations that carry
+// a chicken-and-egg claim on the walk — restActionGVR (inventory.go) and
+// RBACResourceTypes (watcher.go) — and requires exact set equality with
+// MetaQuerySeeds(). Consequences, which are the point:
+//
+//   - re-adding `navmenus` / `routesloaders` fails here WHATEVER the new
+//     variable is called, because the test never looks at names; a
+//     literal-matching guard is defeated by a local alias, and most of
+//     this repo's guards are name-matching, so this one is deliberately
+//     not.
+//   - adding any OTHER seed fails too, so the guard does not have to
+//     anticipate what gets added next.
+//   - widening the set legitimately means widening its SOURCES, which is
+//     a visible change to a sanctioned declaration rather than one more
+//     line in a slice.
+//
+// It also pins the count, so a source that silently loses an entry is
+// caught rather than quietly shrinking the budget to match.
+func TestMetaQuerySeeds_IsDerivedFromItsTwoSanctionedSources(t *testing.T) {
 	seeds := cache.MetaQuerySeeds()
-	if len(seeds) != 7 {
-		t.Fatalf("meta-query seed budget must be EXACTLY 7 (routesloaders, "+
-			"navmenus, restactions + 4 RBAC); got %d: %v",
-			len(seeds), seeds)
+
+	// Derive, not enumerate. restactions is reconstructed from the SAME
+	// group/version/resource inventory.go declares; RBACResourceTypes is read
+	// straight from the exported declaration.
+	want := map[schema.GroupVersionResource]bool{
+		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}: true,
+	}
+	for _, g := range cache.RBACResourceTypes {
+		want[g] = true
 	}
 
-	want := map[schema.GroupVersionResource]bool{
-		cache.RoutesLoadersGVR(): true,
-		cache.NavMenusGVR():      true,
-		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}:               true,
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               true,
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        true,
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        true,
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: true,
+	if len(seeds) != len(want) {
+		t.Fatalf("#483: meta-query seed budget must be EXACTLY its two sanctioned sources "+
+			"(restactions + the %d RBACResourceTypes = %d); got %d: %v",
+			len(cache.RBACResourceTypes), len(want), len(seeds), seeds)
 	}
+
+	seen := map[schema.GroupVersionResource]bool{}
 	for _, s := range seeds {
 		if !want[s] {
-			t.Errorf("unexpected meta-query seed %v — not one of the 7 sanctioned anchors", s)
+			t.Errorf("#483: %v is a hardcoded meta-query seed but is NOT derivable from "+
+				"restActionGVR or RBACResourceTypes. Every seed must come from a source with a "+
+				"chicken-and-egg claim on the walk. `routesloaders`/`navmenus` were removed "+
+				"because they had none — the walk gets its roots from the frontend ConfigMap "+
+				"(dispatchers/phase1_roots.go), so a navigation kind is NOT a precondition for it. "+
+				"Renaming the variable does not make this pass.", s)
 		}
-		delete(want, s)
-		// No business GVR may ever be a hardcoded seed — those are
-		// discovered by resolving the navigation roots.
+		if seen[s] {
+			t.Errorf("#483: duplicate meta-query seed %v — each seed costs an informer", s)
+		}
+		seen[s] = true
+		// Backstop (see forbiddenSeedResources): a named business/legacy GVR.
 		if forbiddenSeedResources[s.Resource] {
-			t.Errorf("business GVR %v must NOT be a hardcoded seed — discovered by resolution", s)
+			t.Errorf("business or removed-legacy GVR %v must NOT be a hardcoded seed", s)
 		}
 	}
-	if len(want) != 0 {
-		t.Errorf("meta-query seeds missing sanctioned anchors: %v", want)
+	for g := range want {
+		if !seen[g] {
+			t.Errorf("#483: sanctioned anchor %v is MISSING from the seed set — the seeds must be "+
+				"the full union of their sources, not a subset", g)
+		}
+	}
+
+	// The legacy navigation kinds specifically, by group: the routing refactor
+	// emptied widgets.templates.krateo.io of nav roots, and no seed may anchor
+	// an informer there again. This complements the derivation check by naming
+	// the blast radius in the failure message.
+	for _, s := range seeds {
+		if s.Group == "widgets.templates.krateo.io" {
+			t.Errorf("#483: %v seeds an informer in the legacy navigation group "+
+				"widgets.templates.krateo.io. Both nav kinds were removed in the routing refactor "+
+				"(no CRD, zero objects); seeding one registers an informer for a type the "+
+				"apiserver does not serve — a permanent reconnect loop and a readiness tax.", s)
+		}
 	}
 
 	// Ship 0 / 0.30.222 + Ship 0.5 (v6) — the CRD GVR is explicitly
@@ -88,33 +135,13 @@ func TestMetaQuerySeeds_ExactBudget(t *testing.T) {
 	}
 }
 
-// TestRoutesLoadersGVR_IsV1Beta1 pins the routesloaders navigation root
-// to the architect-specified GVR.
-func TestRoutesLoadersGVR_IsV1Beta1(t *testing.T) {
-	got := cache.RoutesLoadersGVR()
-	want := schema.GroupVersionResource{
-		Group:    "widgets.templates.krateo.io",
-		Version:  "v1beta1",
-		Resource: "routesloaders",
-	}
-	if got != want {
-		t.Fatalf("routesloaders navigation-root GVR = %v, want %v", got, want)
-	}
-}
-
-// TestNavMenusGVR_IsV1Beta1 pins the navmenus navigation root (the
-// second entry-point root, 0.30.105) to the frontend-contract GVR.
-func TestNavMenusGVR_IsV1Beta1(t *testing.T) {
-	got := cache.NavMenusGVR()
-	want := schema.GroupVersionResource{
-		Group:    "widgets.templates.krateo.io",
-		Version:  "v1beta1",
-		Resource: "navmenus",
-	}
-	if got != want {
-		t.Fatalf("navmenus navigation-root GVR = %v, want %v", got, want)
-	}
-}
+// #483: TestRoutesLoadersGVR_IsV1Beta1 and TestNavMenusGVR_IsV1Beta1 were
+// DELETED with the accessors they pinned. Both asserted that a seed GVR held a
+// specific group/version/resource — a contract that ends when the seed does.
+// The invariant that replaced them is not "these two GVRs have these values"
+// but "no seed anchors an informer for a removed navigation kind", which
+// TestMetaQuerySeeds_IsDerivedFromItsTwoSanctionedSources enforces by
+// derivation and which no local alias can slip past.
 
 // --- PrewarmEnabled gate (#57 fold: implicit-on-cache) ---------------------
 
@@ -294,12 +321,20 @@ func TestRegisterMetaQuerySeeds_RegistersAndIdempotent(t *testing.T) {
 	})
 
 	first := rw.RegisterMetaQuerySeeds()
-	// The 4 RBAC GVRs are already registered by NewResourceWatcher; the
-	// 3 non-RBAC seeds (routesloaders, navmenus, restactions) are new.
-	// Ship 0 / 0.30.222: customresourcedefinitions was removed (walker-
-	// spawned via AddNavigationDiscoveredGroup); the count dropped from 4 to 3.
-	if first != 3 {
-		t.Fatalf("first RegisterMetaQuerySeeds must register the 3 non-RBAC seeds; got %d", first)
+	// The 4 RBAC GVRs are already registered by NewResourceWatcher; only the
+	// non-RBAC seed (restactions) is new. Ship 0 / 0.30.222 removed
+	// customresourcedefinitions (walker-spawned via
+	// AddNavigationDiscoveredGroup), dropping the count 4->3; #483 removed
+	// routesloaders + navmenus, dropping it 3->1.
+	//
+	// Derived rather than written as `1`, so this does not have to be revisited
+	// when a source legitimately changes: the newly-registered count is
+	// whatever the seed set holds beyond the bootstrap-registered RBAC types.
+	wantNew := len(cache.MetaQuerySeeds()) - len(cache.RBACResourceTypes)
+	if first != wantNew {
+		t.Fatalf("first RegisterMetaQuerySeeds must register the %d non-RBAC seed(s) "+
+			"(the %d RBAC types are bootstrap-registered by NewResourceWatcher); got %d",
+			wantNew, len(cache.RBACResourceTypes), first)
 	}
 	for _, gvr := range cache.MetaQuerySeeds() {
 		if !rw.IsRegistered(gvr) {
@@ -313,14 +348,16 @@ func TestRegisterMetaQuerySeeds_RegistersAndIdempotent(t *testing.T) {
 }
 
 // phase1ListKinds extends rbacListKinds with List-kind registrations for
-// the 4 non-RBAC meta-query seeds plus the lateGVRs used by the
+// the non-RBAC meta-query seed plus the lateGVRs used by the
 // re-snapshot-loop test, so the fake dynamic client can serve their
 // informers' initial LISTs without panicking. The List-kind names are
 // arbitrary — the fake client only needs SOME registered kind.
+//
+// #483: the routesloaders / navmenus entries went with the seeds. The CRD
+// entry is kept deliberately — it is not a seed (Ship 0 removed it) but
+// other tests in this package register that GVR directly.
 func phase1ListKinds() map[schema.GroupVersionResource]string {
 	m := rbacListKinds()
-	m[cache.RoutesLoadersGVR()] = "RoutesLoaderList"
-	m[cache.NavMenusGVR()] = "NavMenuList"
 	m[schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}] = "CustomResourceDefinitionList"
 	m[schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}] = "RESTActionList"
 	for _, g := range lateGVRs() {

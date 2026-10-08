@@ -75,8 +75,11 @@ L3 informer cache  ─▶  L1 resolved-entry cache  ─▶  dispatcher cache
 ## Prewarm (→ [prewarm.md](docs/architecture/prewarm.md))
 
 - Boot seed (`RegisterMetaQuerySeeds`) + a **phase-1 walker that replays frontend navigation**:
-  roots are read from the frontend ConfigMap (`navmenus` INIT + `routesloaders` ROUTES_LOADER, not
-  hardcoded), recursing `status.resourcesRefs` **only where `verb==GET`**.
+  roots are read from the frontend ConfigMap (the `.api.INIT` / `.api.ROUTES_LOADER` `/call` URLs,
+  decoded to ObjectReferences and fetched by name — the root KIND is whatever the ConfigMap says,
+  never hardcoded), recursing `status.resourcesRefs` **only where `verb==GET`**.
+  The seed itself is the 5 meta-query anchors (`restactions` + 4 RBAC); the legacy `navmenus` /
+  `routesloaders` anchors were removed in #483 along with both kinds.
 - Cohort model is **dynamic** — no static cohort list, no lazy cold-fill. The seed is rank-major
   (widget-capable identities first) and class-interleaved (each rank's widgets then its
   RESTActions).

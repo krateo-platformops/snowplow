@@ -72,8 +72,7 @@ func phase1TestWatcher(t *testing.T) *cache.ResourceWatcher {
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:         "RoleBindingList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:         "ClusterRoleList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
-		cache.RoutesLoadersGVR():            "RoutesLoaderList",
-		cache.NavMenusGVR():                 "NavMenuList",
+		navRootFixtureGVR: "RoutesLoaderList",
 		{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}: "CustomResourceDefinitionList",
 		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}: "RESTActionList",
 		gvrReached: "GithubScaffoldingList",
@@ -92,6 +91,22 @@ func phase1TestWatcher(t *testing.T) *cache.ResourceWatcher {
 		time.Sleep(50 * time.Millisecond)
 	})
 	return rw
+}
+
+// navRootFixtureGVR is the GVR these walk tests hand their fake navigation
+// roots under.
+//
+// #483 — it is declared HERE, in the test package, because cache no longer
+// exports a routesloaders GVR: the kind was removed from the platform and its
+// meta-query seed with it. The walk tests still need SOME navigation-root GVR
+// to build a root under, and in production that GVR is whatever the frontend
+// ConfigMap's `/call` URL decodes to (listNavigationRootsFromConfigMap), so any
+// value works here. The historical values are kept verbatim so this is purely a
+// relocation and these tests exercise exactly what they did before.
+var navRootFixtureGVR = schema.GroupVersionResource{
+	Group:    "widgets.templates.krateo.io",
+	Version:  "v1beta1",
+	Resource: "routesloaders",
 }
 
 func routesLoaderCR(ns, name string) *unstructured.Unstructured {

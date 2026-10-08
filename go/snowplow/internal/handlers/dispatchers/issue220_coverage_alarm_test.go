@@ -145,7 +145,9 @@ func (r *covRig) bootPass(t *testing.T, perRoot ...[]string) string {
 		for i := range perRoot {
 			out = append(out, navigationRoot{
 				Root: routesLoaderCR(covNS, "cov-root-"+strconv.Itoa(i)),
-				GVR:  cache.RoutesLoadersGVR(),
+				// #483: cache no longer exports a routesloaders GVR; the walk
+				// tests' shared nav-root fixture (phase1_walk_test.go) replaces it.
+				GVR: navRootFixtureGVR,
 			})
 		}
 		return out, nil

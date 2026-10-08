@@ -9,8 +9,8 @@
 // cold.
 //
 // Tag B closes that cold window with a startup PHASE 1: at boot, before
-// traffic, the TWO navigation roots (the `routesloaders` and `navmenus`
-// widget CRs) are LISTed cluster-wide and every CR is RECURSIVELY
+// traffic, the navigation roots named by the frontend ConfigMap are
+// fetched and every one is RECURSIVELY
 // resolved with the snowplow SERVICE-ACCOUNT identity through the
 // standard widget/RESTAction resolver (0.30.105: the walk recurses
 // Root -> Route -> Page -> Row/Column -> DataGrid/Table leaf via each
@@ -24,22 +24,37 @@
 // arrives once the navigated informers are warm.
 //
 // CRITICAL — feedback_no_special_cases.md: Phase 1 does NOT consult any
-// configured GVR / RESTAction list. The ONLY hardcoded budget is the 7
+// configured GVR / RESTAction list. The ONLY hardcoded budget is the 5
 // meta-query seeds below — bare anchors needed to bootstrap discovery,
 // not per-resource policy. Every BUSINESS GVR (widgets, panels,
-// compositions) is discovered by recursively resolving the two
-// navigation roots.
+// compositions) is discovered by recursively resolving the
+// ConfigMap-named navigation roots.
 //
 // Ship 0 / 0.30.222: the customresourcedefinitions GVR was REMOVED from
 // the seed set. Ship 0.5 / 0.30.223 (v6): the CRD informer is DELETED
 // entirely. Composition GVRs are discovered by one-shot apiserver
 // discovery (cache.DiscoverGroupResources, invoked synchronously from
 // the walker) instead of via an in-process CRD-informer event stream.
-// The 4 RBAC GVRs + restactions + routesloaders + navmenus remain
-// primordial because they have justified chicken-and-egg semantics
-// (walker queries them to start the walk); the CRD GVR has none — by
-// the time the walker encounters a templated path it is already
-// running.
+//
+// #483: the 4 RBAC GVRs + restactions remain primordial because they
+// have justified chicken-and-egg semantics — the walk cannot evaluate
+// an RBAC decision or follow an apiRef edge without them, so they must
+// exist before it starts. `routesloaders` and `navmenus` were REMOVED.
+// This header used to list them as primordial "because the walker
+// queries them to start the walk", and that had been FALSE since
+// 0.30.107: root selection moved to the frontend ConfigMap
+// (listNavigationRootsFromConfigMap, dispatchers/phase1_roots.go),
+// which decodes the `.api.INIT` / `.api.ROUTES_LOADER` `/call` URLs into
+// ObjectReferences and fetches each one by name. A root is reachable
+// whether or not its type was seeded, so neither GVR was ever a
+// precondition for the walk; they were left behind as informer-anchor
+// seeds only. Both kinds were then removed from the platform by the
+// routing refactor (no CRD under any group, zero objects), so the seeds
+// anchored informers for types that do not exist — a permanent
+// reconnect loop, ~4 failed discovery requests/min, 6% of all log
+// volume and a ~45s readiness tax per roll. The CRD GVR's removal had
+// a different reason: it has no chicken-and-egg claim at all, since by
+// the time the walker meets a templated path it is already running.
 //
 // IMPLICIT-ON-CACHE (#57) — PrewarmEnabled() is now implicit under the
 // single CACHE_ENABLED master gate: prewarm runs whenever the cache
@@ -163,61 +178,29 @@ func ResetPhase1DoneForTest() {
 // DiscoverGroupResources (one-shot apiserver discovery, synchronous,
 // invoked from the walker — see discovery_lookup.go).
 
-// routesLoadersGVR is the GVR of the `routesloaders` widget CR.
+// #483: routesLoadersGVR / navMenusGVR and their RoutesLoadersGVR() /
+// NavMenusGVR() accessors were DELETED here, along with their entries in
+// MetaQuerySeeds. They were informer-anchor seeds for the `routesloaders`
+// and `navmenus` widget kinds, which the portal's routing refactor
+// removed from the platform — `helm/portal/templates/menu.sidebar-nav.yaml`
+// records the sidebar as "the SINGLE route source (no RoutesLoader)" and
+// that "BOTH kinds were removed in the routing refactor". No CRD for
+// either kind exists under any group and no objects exist, so the seeds
+// registered informers for types the apiserver does not serve.
 //
-// 0.30.107 — this is NO LONGER a root-SELECTION driver. The navigation
-// roots Phase 1 walks are read from the frontend ConfigMap at runtime
-// (config.json .api.INIT / .api.ROUTES_LOADER — see
-// dispatchers/phase1_roots.go); the resource name `routesloaders` is
-// never a Go literal in that selection path. This GVR remains ONLY as a
-// meta-query INFORMER-ANCHOR seed: the watcher pre-registers an informer
-// for this resource type so that a `/call` to a routesloaders CR can be
-// served from cache rather than the apiserver. It is the informer-warming
-// anchor, not "where navigation starts".
+// They were NOT root-selection drivers and had not been since 0.30.107 —
+// see the package header for that trace. Nothing in the walk depended on
+// them: the only production consumer was MetaQuerySeeds, i.e. informer
+// registration and nothing else.
 //
-// Per feedback_no_special_cases.md: a bare informer-anchor seed for a
-// well-known navigation resource type, not a per-resource carve-out and
-// not a root-selection special-case.
-var routesLoadersGVR = schema.GroupVersionResource{
-	Group:    "widgets.templates.krateo.io",
-	Version:  "v1beta1",
-	Resource: "routesloaders",
-}
-
-// navMenusGVR is the GVR of the `navmenus` widget CR.
-//
-// 0.30.107 — like routesLoadersGVR, this is NO LONGER a root-SELECTION
-// driver: the navigation roots come from the frontend ConfigMap's
-// config.json (.api.INIT). This GVR remains ONLY as a meta-query
-// INFORMER-ANCHOR seed so a `/call` to a navmenus CR can be served from
-// the informer cache. The resource name `navmenus` is never a Go literal
-// in the root-selection path.
-//
-// Per feedback_no_special_cases.md: a bare informer-anchor seed, not a
-// per-resource carve-out.
-var navMenusGVR = schema.GroupVersionResource{
-	Group:    "widgets.templates.krateo.io",
-	Version:  "v1beta1",
-	Resource: "navmenus",
-}
-
-// RoutesLoadersGVR exposes the routesloaders meta-query informer-anchor
-// seed. Read-only accessor. 0.30.107: no longer consumed by the Phase 1
-// root-selection path (roots come from the frontend ConfigMap) — retained
-// for the seed-set and its falsifier test.
-func RoutesLoadersGVR() schema.GroupVersionResource {
-	return routesLoadersGVR
-}
-
-// NavMenusGVR exposes the navmenus meta-query informer-anchor seed.
-// Read-only accessor. 0.30.107: no longer consumed by the Phase 1
-// root-selection path.
-func NavMenusGVR() schema.GroupVersionResource {
-	return navMenusGVR
-}
+// The seed set is now derived from its two sanctioned sources
+// (restActionGVR + RBACResourceTypes), so re-adding a navigation kind
+// cannot slip back in under a local alias —
+// TestMetaQuerySeeds_IsDerivedFromItsTwoSanctionedSources fails on any
+// seed that is not one of those.
 
 // MetaQuerySeeds returns the COMPLETE hardcoded seed budget for Tag B —
-// EXACTLY these 7 GVRs, nothing else (feedback_no_special_cases.md is a
+// EXACTLY these 5 GVRs, nothing else (feedback_no_special_cases.md is a
 // hard requirement here). Every entry is a meta-query INFORMER-ANCHOR
 // seed: the watcher pre-registers an informer for the resource type so a
 // `/call` to one of these can be served from cache. None of them is a
@@ -225,16 +208,22 @@ func NavMenusGVR() schema.GroupVersionResource {
 // ConfigMap (config.json .api.INIT / .api.ROUTES_LOADER; see
 // dispatchers/phase1_roots.go).
 //
-//  1. routesloaders            — informer-anchor for the routesloaders
-//     widget type. 0.30.107: no longer a root-selection literal.
-//  2. navmenus                 — informer-anchor for the navmenus widget
-//     type. 0.30.107: no longer a root-selection literal.
-//  3. restactions              — the restActionGVR anchor (already cited
+// DERIVED, NOT ENUMERATED (#483). The set is the union of its two
+// sanctioned sources and is written that way on purpose: a seed has to
+// come from one of them, so there is no list for a new literal to be
+// appended to. The two sources are the only ones with a chicken-and-egg
+// claim on the walk.
+//
+//  1. restactions              — the restActionGVR anchor (already cited
 //     by inventory.go; the resolver's apiRef edges target it).
-//  4-7. the 4 RBACResourceTypes — roles / rolebindings / clusterroles /
+//     2-5. the 4 RBACResourceTypes — roles / rolebindings / clusterroles /
 //     clusterrolebindings (already bootstrap-registered in
 //     NewResourceWatcher; included here so the seed set is the single
 //     auditable source of truth).
+//
+// #483: `routesloaders` and `navmenus` were entries 1 and 2 until the
+// routing refactor removed both kinds from the platform; see the note
+// above their deleted declarations.
 //
 // Ship 0 / 0.30.222: customresourcedefinitions is NO LONGER a seed
 // (Diego invariant: "no CRD informer if the CRD object itself is not
@@ -245,24 +234,27 @@ func NavMenusGVR() schema.GroupVersionResource {
 //
 // Every BUSINESS GVR — widgets, panels, compositions — is ABSENT from
 // this set by construction. Those are discovered by RESOLVING the
-// ConfigMap-derived navigation roots, never named in code. A test
-// asserts this slice has exactly 7 entries and that none of them is a
-// composition/widget/panel business GVR.
+// ConfigMap-derived navigation roots, never named in code.
+// TestMetaQuerySeeds_IsDerivedFromItsTwoSanctionedSources recomputes this
+// union from restActionGVR + RBACResourceTypes and requires set
+// equality, so any added seed fails whatever it is named.
 func MetaQuerySeeds() []schema.GroupVersionResource {
 	seeds := []schema.GroupVersionResource{
-		routesLoadersGVR,
-		navMenusGVR,
 		restActionGVR,
 	}
 	seeds = append(seeds, RBACResourceTypes...)
 	return seeds
 }
 
-// RegisterMetaQuerySeeds registers an informer for each of the 3
-// non-RBAC meta-query seeds (routesloaders, navmenus, restactions) plus
+// RegisterMetaQuerySeeds registers an informer for the single non-RBAC
+// meta-query seed (restactions) plus
 // re-confirms the 4 RBAC GVRs (already registered by NewResourceWatcher
-// — EnsureResourceType observes added=false for those) — 7 seeds total.
+// — EnsureResourceType observes added=false for those) — 5 seeds total.
 // Idempotent + singleflighted under rw.mu.
+//
+// #483: was 3 non-RBAC / 7 total, until the removed `routesloaders` and
+// `navmenus` anchors stopped registering informers for kinds the
+// apiserver no longer serves.
 //
 // Ship 0 / 0.30.222: the CRD GVR is no longer in this list. Ship 0.5
 // / 0.30.223 (v6): the CRD informer is deleted; composition GVRs are
