@@ -97,7 +97,17 @@ func TestIssue248_MaxAgeReaper(t *testing.T) {
 
 	// NOT-suppressed WARM + old → KEPT (C3). Warm via SeededAtBoot; body FRESH
 	// (CreatedAt=now) so it is past the maxAge cap on the KEY (BornAt 2h) without
-	// being a #316 approaching-TTL refresh candidate — isolating the eviction axis.
+	// being a #316 approaching-TTL refresh candidate.
+	//
+	// ⚠ CORRECTED 2026-10-08 (#506 item 2): this cell IS now a refresh candidate,
+	// via the DEADLINE-keyed trigger. maxEntryAge=60s and the default TTL give
+	// remintLead()=30s, so the birth threshold is 30s and this cell's 7200s
+	// lifetime clears it; measured, the reap moves proactive_refresh_total by 1.
+	// The comment used to claim this isolated the EVICTION axis — it no longer
+	// does. The assertions below are unaffected because they read only the evict
+	// counters, so this is intent drift rather than a break, but a reader must not
+	// treat this fixture as refresh-free. Give it a BornAt inside [0,30s) if the
+	// isolation is ever needed again.
 	warmInputs := widgetInputs(gvrFlexes(), ns, "warmseed")
 	warmKey := ComputeKey(*warmInputs)
 	store.Put(warmKey, &ResolvedEntry{

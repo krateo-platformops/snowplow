@@ -415,6 +415,31 @@ func itoa378(i int) string {
 }
 
 // TestIssue378_F4a_NoAmplification_MultiTick — C3.
+//
+// WHAT THIS ARM DOES AND DOES NOT COVER, since #506 item 2 (2026-10-08).
+//
+// It compares the re-mint write against a window-predicate-forced-false twin
+// through the SAME harness and the SAME reaper. So it measures the RE-MINT
+// WRITE's cost: ReplaceIfGenRefresh rides a refresh that was happening anyway
+// and adds no resolve of its own. That claim is unaffected by #506 item 2 and
+// still binds.
+//
+// It CANNOT see the deadline-keyed trigger. reapPastMaxEntryAge now also enqueues
+// on the BIRTH clock, and that trigger runs in BOTH arms, so its contribution
+// cancels in the comparison. A reader must not take this arm's green as evidence
+// that nothing adds resolves — the trigger deliberately does, which is the #506
+// trade (a rebuild beats a cold navigation). The arm's own geometry reinforces
+// this: TTL=8s/maxAge=12s puts the body threshold (3/4*TTL = 6s) and the birth
+// threshold (maxAge - min(8,6) = 6s) at the SAME instant, so the trigger selects
+// nothing the TTL condition had not already selected.
+//
+// The trigger's own bound — at most one resolve per cell per 24h WINDOW, not per
+// 300s pass — rests on two mechanisms measured here all the same: a successful
+// re-mint moves BornAt out of the window, and the refresher re-Put drops
+// SeededAtBoot while a seeded insert never stamped lastRead, so the cell goes
+// COLD and the warm gate excludes it from every later pass. Measured on the #506
+// item 2 tree: 6,000 cells, 6,000 handler calls, 6,000 real resolves in both
+// arms.
 func TestIssue378_F4a_NoAmplification_MultiTick(t *testing.T) {
 	if testing.Short() {
 		t.Skip("F4a runs two ~12s real-elapse arms")
@@ -438,7 +463,9 @@ func TestIssue378_F4a_NoAmplification_MultiTick(t *testing.T) {
 	}
 	if gotReal != ctlReal {
 		t.Fatalf("#378 F4a RED: the re-mint arm ran %d real resolves vs %d with the window predicate forced false — "+
-			"re-minting must ride refreshes that happen anyway, never add one (0.30.185 amplification)", gotReal, ctlReal)
+			"the re-mint WRITE must ride refreshes that happen anyway, never add one (0.30.185 amplification). "+
+			"Note this compares the write, not the #506 deadline TRIGGER, which runs in both arms and "+
+			"deliberately does add refreshes", gotReal, ctlReal)
 	}
 	bad := 0
 	for _, r := range resets {
