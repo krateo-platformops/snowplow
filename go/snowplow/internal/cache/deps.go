@@ -1693,7 +1693,43 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 	var toEvict, toMark []string
 	classCounts := map[string]int{} // #239: self / list_dep / exact_dep of the marked keys
 	for l1Key, dk := range matched {
-		isSelf := d.isSelfRepresentation(store, l1Key, self)
+		// #564 — isSelfRepresentation is a store.GetNoTouch, i.e. an acquisition of the
+		// customer-facing c.mu, and this loop runs for every resident matched key
+		// on every dep event (~222.9:1 fan-out; 2,222 marks/s measured on 057).
+		// isSelf has exactly TWO consumers, so compute it only when one of them
+		// will actually read it:
+		//
+		//  1. the eviction branch below  — reads it only when state == objAbsent
+		//  2. dirtyMarkClass             — returns dmClassListDep BEFORE reading
+		//                                  isSelf, so it reads it only when
+		//                                  dk.Name != listWildcard
+		//
+		// On 057 the object_event/add_update/list_dep bucket is 99.1% of all
+		// dirty marks, and that is exactly the population both consumers skip —
+		// so ~2,200 mutex acquisitions per second computed a value nothing read.
+		//
+		// The disjunction is load-bearing and must NOT be narrowed to
+		// `state == objAbsent &&`: that form makes dmClassSelf structurally
+		// unreachable for the dominant (present) population, turning a working
+		// #239 detector into a counter whose zero reads as health. Guarded by
+		// TestDirtyMarkProbe_SelfClassStaysReachable, which goes RED under it,
+		// as do TestIssue239_A_ObjectPathAttribution and _B_Discrimination.
+		//
+		// This is behaviour-identical in the loop's OUTPUT: the toEvict/toMark
+		// partition and every classCounts bucket. All eight reachable cells are
+		// pinned by TestDirtyMarkProbe_BehaviourIdentity, including the one cell
+		// where the probe's VALUE differs (a present self-representation entry
+		// reached through a LIST dep: isSelf would be true, and nothing reads
+		// it). The one thing this does change
+		// is a side effect of the skipped read: GetNoTouch also performs the lazy
+		// TTL/maxAge evict, so a skipped cell past its bound is no longer evicted
+		// HERE. That evict is DEFERRED, not lost — every skipped key is enqueued
+		// a few lines below, and the refresher's dequeue read is itself a
+		// GetNoTouch (refresher.go), which performs the same evict with the same
+		// INTERNAL (non-customer) attribution. See #378 for why that attribution
+		// is the part that matters.
+		needSelf := state == objAbsent || dk.Name != listWildcard
+		isSelf := needSelf && d.isSelfRepresentation(store, l1Key, self)
 		if state == objAbsent && isSelf {
 			toEvict = append(toEvict, l1Key) // bucket 1, and ONLY when absent
 			continue
