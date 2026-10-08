@@ -125,8 +125,14 @@ func saCredentialOnContext(ctx context.Context) bool {
 //   - BackgroundResolveFromContext — the dispatch is a BACKGROUND re-resolve.
 //
 // The BackgroundResolve conjunct SCOPES the guard to the design §5 target — the
-// background refresher/prewarm SA-transport re-resolve (both set WithBackgroundResolve:
-// resolve_populate.go, prewarm_engine_boot.go). Post-Part-1 that is the COMPLETE set
+// background refresher/prewarm SA-transport re-resolve. #563: there are THREE
+// such stamps, not two — this comment named resolve_populate.go and
+// prewarm_engine_boot.go and omitted phase1_pip_seed.go (withCohortSeedContext),
+// which has stamped it since #425 and is the one whose cohort identity is
+// !ServesUnnarrowed, i.e. the second case the conjunct actually scopes. All
+// three now set it through cache.WithBackgroundResolveOrigin, which calls
+// WithBackgroundResolve, so this conjunct reads exactly as before.
+// Post-Part-1 that is the COMPLETE set
 // of production contexts carrying an SA credential under a real identity: a LIVE
 // request has no SA cred on the ctx (the attach was removed), and every internal
 // SA-credentialed driver either sets WithBackgroundResolve OR uses a serveUnnarrowed

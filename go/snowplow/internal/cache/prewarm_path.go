@@ -50,11 +50,14 @@ func PrewarmPathFromContext(ctx context.Context) bool {
 // denial. Before #214 each one WARN-logged (546 lines/12h on 057); now the
 // prewarm-path denial is Debug-logged and counted here, keeping the signal
 // without the noise. Serve-path denials are NOT counted here — they stay WARN.
+//
+// #563 — this cell is now one of SIX. RecordRefDenied (background_origin.go) is
+// the single recorder; it keeps this scalar moving for the prewarm-path origin
+// so snowplow_prewarm_ref_denied_total keeps the exact meaning it was published
+// with, and publishes the full {origin} breakdown — including the refresher,
+// the seed, the engine boot and the serve path — as
+// snowplow_ref_denied_by_origin.
 var prewarmRefDenied atomic.Uint64
-
-// RecordPrewarmRefDenied bumps the prewarm resourceRef-denied counter. Called
-// by resourcesrefs.resolveOne when a denial is observed on the prewarm path.
-func RecordPrewarmRefDenied() { prewarmRefDenied.Add(1) }
 
 // PrewarmRefDeniedTotal reads the counter. Pure read; creates nothing.
 func PrewarmRefDeniedTotal() uint64 { return prewarmRefDenied.Load() }
