@@ -92,6 +92,7 @@ func TestResolvedCacheStatsByStat_ReportsLiveStore(t *testing.T) {
 		"evict_ttl_warm_customer_total", "oldest_warm_born_age_seconds", "remint_total", // #378
 		"remint_refused_cold_total",                     // #496 — in-window re-mints the warmth gate refused (cold cell)
 		"remint_deadline_enqueued_total",                // #506/#538 — enqueues ONLY the deadline trigger produced (not the TTL one)
+		"warm_in_lead_window",                           // #506/#538 — the denominator: warm cells inside the lead window
 		"stale_served_total", "stale_served_age_ms_max", // #354 P3 customer stale serves
 		"warm_keyed_page_restactions", "warm_keyed_page_widgets", "warm_keyed_page_ra_full_list", // #354 P3 B3
 		"warm_keyed_extras_restactions", "warm_keyed_extras_widgets", "warm_keyed_extras_ra_full_list",

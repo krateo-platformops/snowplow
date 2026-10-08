@@ -158,6 +158,9 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		// oldest_warm_born_age_seconds scope threshold; see the field doc on
 		// ResolvedCacheStore.remintDeadlineEnqueuedTotal.
 		"remint_deadline_enqueued_total": int64(s.RemintDeadlineEnqueuedTotal),
+		// #506/#538 — the DENOMINATOR (a gauge). eligible > 0 with enqueued == 0 is a
+		// defect; eligible == 0 means unmeasured, not healthy.
+		"warm_in_lead_window": int64(s.WarmInLeadWindow),
 		// #376 — resident WARM cells split by warmth SOURCE (both GAUGES). warm_seeded
 		// = boot-prewarmed cells; warm_lastread = cells kept warm by a read-within-TTL
 		// lastRead and NOT seeded. Decomposes the warm working set so GetNoTouch's
