@@ -621,7 +621,14 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 	// MustRegateSADial go false for the refresher and re-opens the leak. The
 	// drift-guard (the WithInternal* producer census + the sa_regate invariant
 	// table) enforces this; the step-4 refresher arm trips if it is removed.
-	ctx = cache.WithBackgroundResolve(ctx)
+	//
+	// #563 — the origin form NAMES this driver. It calls WithBackgroundResolve,
+	// so the marker every reader above keys on is byte-identical; what it adds
+	// is that a resourceRef denial generated under this ctx is counted as the
+	// REFRESHER's rather than as an anonymous "background" (the 83%-of-the-log
+	// attribution gap). The three origins are censused in
+	// background_origin_census_563_test.go.
+	ctx = cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginRefresher)
 
 	// Ship F1 (0.30.119): an api-stage entry is a CONTENT-keyed K8s call
 	// (gvr, namespace, name-or-empty) — NOT a RESTAction. Its refresh is

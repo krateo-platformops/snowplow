@@ -95,12 +95,18 @@ var cacheAllow443 = map[string]cacheClass443{
 	"GVRFor":     clusterFact443,
 	"KindForGVR": clusterFact443,
 	// --- telemetry ------------------------------------------------------------
-	"BumpRAFullListUAFBypass":                   telemetry443,
-	"BumpUAFTouched":                            telemetry443, // request-scoped UAF-touched sink
-	"RecordApiserverFallthrough":                telemetry443,
-	"RecordClusterListCellColdFallback":         telemetry443,
-	"RecordClusterListCellWarm":                 telemetry443,
-	"RecordPrewarmRefDenied":                    telemetry443,
+	"BumpRAFullListUAFBypass":           telemetry443,
+	"BumpUAFTouched":                    telemetry443, // request-scoped UAF-touched sink
+	"RecordApiserverFallthrough":        telemetry443,
+	"RecordClusterListCellColdFallback": telemetry443,
+	"RecordClusterListCellWarm":         telemetry443,
+	// #563 — RecordRefDenied replaces RecordPrewarmRefDenied at the single
+	// resourceRef-denial call site: one counter keyed by the resolve's driver
+	// (refresher / cohort-seed / prewarm-engine-boot / prewarm-path /
+	// background-unattributed / serve) instead of a prewarm-only scalar. Process
+	// counters only, no cache/informer/dep/refresher state — same class as the
+	// scalar it replaces.
+	"RecordRefDenied":                           telemetry443,
 	"RecordRAFullListServe":                     telemetry443,
 	"RecordResolverPluralsHit":                  telemetry443,
 	"RecordResolverPluralsMiss":                 telemetry443,
@@ -134,7 +140,15 @@ var cacheAllow443 = map[string]cacheClass443{
 	// above (ParseAPIServerListDepSkeleton in particular) because they share the
 	// skeletonizer and differ only in policy.
 	"ReadSetSkeleton": readOnly443, "NameKind.IsSingleObject": readOnly443,
-	"PrewarmIterSerialFromContext": readOnly443, "PrewarmPathFromContext": readOnly443,
+	"PrewarmIterSerialFromContext": readOnly443,
+	// #563 — pure ctx classification (which driver is resolving); reads three
+	// context values and returns a constant string. It SUBSUMES
+	// PrewarmPathFromContext, which was listed here for the resourcesrefs denial
+	// gate and has no resolve-path caller any more: the prewarm-vs-background
+	// question now has one answer, inside the cache package, so the resolver
+	// cannot drift out of half of it again (which is #563 itself). The stale-entry
+	// half of this census is what required removing the row.
+	"RefDenialOrigin":     readOnly443,
 	"RAFullListKeyInputs": readOnly443, "RefreshTriggerGVRFromContext": readOnly443, "RefreshTriggerHas": readOnly443,
 	"ReplayRAFullListSlices": readOnly443, "ResolvedCache": readOnly443, "ResolvedCacheEnabled": readOnly443,
 	"ResolvedCacheStore.CaptureGen": readOnly443, "ResolvedCacheStore.GetNoTouch": readOnly443,

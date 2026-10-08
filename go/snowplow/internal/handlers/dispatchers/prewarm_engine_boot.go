@@ -341,14 +341,20 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 	// cache.WithBackgroundResolve.
 	//
 	// Named in rbac.MustRegateSADial's production-equivalence argument
-	// (sa_regate.go: "both set WithBackgroundResolve: resolve_populate.go,
-	// prewarm_engine_boot.go") as one of the two BackgroundResolve stamps that
-	// scope the #268/#269 Part 2 guard. Here it is belt-and-braces: the
-	// withPhase1SAContext below ALSO makes this ctx ServesUnnarrowed (its
-	// ServeWatcher / canonical-SA identity), so MustRegateSADial is already
-	// false via !ServesUnnarrowed. The load-bearing BackgroundResolve stamp is
-	// resolve_populate.go:496 (the refresher's per-user representative).
-	ctx = cache.WithBackgroundResolve(ctx)
+	// (sa_regate.go: "every one of these sets WithBackgroundResolve:
+	// resolve_populate.go, phase1_pip_seed.go, prewarm_engine_boot.go") as one of
+	// the THREE BackgroundResolve stamps that scope the #268/#269 Part 2 guard
+	// (#563 — the comment said "two" and named two of the three). Here it is
+	// belt-and-braces: the withPhase1SAContext below ALSO makes this ctx
+	// ServesUnnarrowed (its ServeWatcher / canonical-SA identity), so
+	// MustRegateSADial is already false via !ServesUnnarrowed. The load-bearing
+	// BackgroundResolve stamp is the refresher's per-user representative
+	// (resolve_populate.go, resolveOnceProd).
+	//
+	// #563 — the origin form NAMES this driver, so a resourceRef denial on the
+	// engine's own re-walk is attributable. The seed it later calls re-stamps
+	// itself as cohort-seed, so the two do not share a cell.
+	ctx = cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginPrewarmEngineBoot)
 	rctx := withPhase1SAContext(ctx, deps.saEP, deps.saRC)
 
 	// #135 F4b Lever B — SKIP the discovery re-walk on an F.4 deadline-cut RESUME

@@ -707,7 +707,16 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 	// seed's SA-credentialed dials at objects.getFromAPIServer and branch E, not
 	// only branch C. Behaviour-neutral in production: the only caller
 	// (rePrewarmBootScoped → seedScopeYielding) already passes a ctx carrying it.
-	rctx = cache.WithBackgroundResolve(rctx)
+	//
+	// #563 — the origin form NAMES this driver: a resourceRef denial on the
+	// seed's walk is counted as the SEED's instead of being merged with the
+	// refresher's. Two layerings make that work and both are deliberate: it wins
+	// over the WithPrewarmPath this seed ALSO stamps (:1606) by RefDenialOrigin's
+	// ordering, and it wins over the prewarm-engine-boot origin on the inherited
+	// caller ctx because the INNERMOST driver is the one doing the work.
+	// WithBackgroundResolve is still what is set underneath, so the #425 re-gate
+	// argument above is untouched.
+	rctx = cache.WithBackgroundResolveOrigin(rctx, cache.BackgroundOriginCohortSeed)
 	rctx = cache.WithPrewarmIterSerial(rctx)
 	// #42 Option-2 — OVERRIDE the inherited discovery-walk scope with the SEED
 	// scope. rePrewarmBootScoped passes seedScopeYielding the SAME walk-scoped

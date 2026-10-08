@@ -16,6 +16,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -125,21 +126,41 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 			// a real access problem and must stay visible. Log-only — el.Allowed
 			// and the emitted result are untouched, so prewarm and serve stay
 			// byte-identical.
-			if cache.PrewarmPathFromContext(ctx) {
-				cache.RecordPrewarmRefDenied()
-				log.Debug("resource ref action not allowed",
-					slog.String("id", in.ID),
-					slog.String("verb", verb),
-					slog.String("group", gvr.Group),
-					slog.String("resource", gvr.Resource),
-					slog.String("namespace", in.Namespace))
-			} else {
+			//
+			// #563: #214 recognised ONE of the two markers that mean "not a
+			// customer", so the refresher — which stamps WithBackgroundResolve
+			// and never WithPrewarmPath — kept WARNing: 17,578 of 21,283 log
+			// lines (83%) in 161 min on 057, flat at ~109/min, all write verbs.
+			// cache.RefDenialOrigin answers "who is resolving" ONCE: the counter
+			// cell and the log level both come from it, so a background driver
+			// can no longer be de-WARNed without being attributed, nor
+			// attributed without being de-WARNed. Every non-customer origin
+			// Debugs; only the serve origin WARNs.
+			origin := cache.RefDenialOrigin(ctx)
+			cache.RecordRefDenied(origin)
+			if origin == cache.RefDenialOriginServe {
+				// #563 — the one denial that may be a REAL access problem is
+				// also the one that was unactionable: it named the verb, the
+				// resource and the namespace but never WHO was denied. The
+				// identity goes in as its redact label, never in clear (#453);
+				// a ctx with no UserInfo (the fail-closed denial) labels as
+				// anonymous.
+				ui, _ := xcontext.UserInfo(ctx)
 				log.Warn("resource ref action not allowed",
 					slog.String("id", in.ID),
 					slog.String("verb", verb),
 					slog.String("group", gvr.Group),
 					slog.String("resource", gvr.Resource),
-					slog.String("namespace", in.Namespace))
+					slog.String("namespace", in.Namespace),
+					slog.String("user", redact.User(ui.Username)))
+			} else {
+				log.Debug("resource ref action not allowed",
+					slog.String("id", in.ID),
+					slog.String("verb", verb),
+					slog.String("group", gvr.Group),
+					slog.String("resource", gvr.Resource),
+					slog.String("namespace", in.Namespace),
+					slog.String("origin", origin))
 			}
 		}
 

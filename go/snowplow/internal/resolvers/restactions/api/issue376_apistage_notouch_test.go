@@ -24,9 +24,21 @@ func TestIssue376_ApistageContentServe_RefresherReadIsNoTouch(t *testing.T) {
 
 	// REFRESHER path: WithRefreshTriggerGVR for a DIFFERENT GVR → forceContentMiss=false
 	// → the HIT is SERVED, but as an INTERNAL refresher read it must NOT stamp warmth.
+	//
+	// #552 — the ctx now carries WithBackgroundResolve as well, which is what the
+	// PRODUCTION refresher ctx carries: resolveOnceProd stamps the background
+	// marker on every refresher resolve (it is the single refresher resolve entry,
+	// reached from the one refreshFunc closure registered for all five entry
+	// classes), and refresher.go:1059 adds the trigger GVR on top at dequeue. This
+	// fixture previously modelled the refresher with HALF its markers — a trigger
+	// and no background stamp, a shape no production path builds — and that was
+	// the gap #552 lived in: the read primitive was keyed on the trigger, so a
+	// refresher dequeue with no trigger read as a customer. The primitive is now
+	// keyed on background-ness, so the arm has to present the real refresher ctx.
 	otherGVR := schema.GroupVersionResource{Group: "other.krateo.io", Version: "v1", Resource: "others"}
 	h0, m0 := store.Stats().HitTotal, store.Stats().MissTotal
-	_, served, ok := apistageContentServe(cache.WithRefreshTriggerGVR(r1Ctx(), otherGVR), store, r1GetCall(), false)
+	refresherCtx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(r1Ctx()), otherGVR)
+	_, served, ok := apistageContentServe(refresherCtx, store, r1GetCall(), false)
 	if !ok || !served {
 		t.Fatal("refresher-path content HIT must still serve (different-GVR trigger → forceContentMiss=false)")
 	}

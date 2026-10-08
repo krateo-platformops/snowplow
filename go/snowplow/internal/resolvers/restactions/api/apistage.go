@@ -532,11 +532,35 @@ func apistageContentServe(
 	// sibling stage whose GVR is not a trigger) is served-as-input but INTERNAL →
 	// GetNoTouch. A real /call is the serve → Get (the one legitimate #315/#316
 	// warmth stamp).
+	//
+	// #552 — TWO DIFFERENT QUESTIONS, TWO DIFFERENT PREDICATES. The paragraph
+	// above is the intent; until #552 the code asked only one question. Keep them
+	// apart:
+	//
+	//   - forceContentMiss is TRIGGER EQUALITY: does this cell's own GVR appear
+	//     in the refresher's trigger set (R1 §3 content-shield / #375 B). It must
+	//     stay on refresherDriven — keying it on background-ness would force-miss
+	//     every background read, which is #544.
+	//   - the READ PRIMITIVE is BACKGROUND-NESS: is a customer being served. A
+	//     trigger GVR is not that question. A refresher dequeue with no trigger
+	//     (ra_full_list_slice.go sliceability re-verify — the dominant source at
+	//     ≥397,043 accepted submits — resolved.go's proactive pass, deps.go's
+	//     no-hook fallback), the cohort seed and the engine boot re-drive are all
+	//     background and all used to fall through to store.Get, which stamps
+	//     lastRead, moves the LRU front, bumps hit_total AND trips
+	//     noteServeWhileDirty → stale_served_total. That is a background read
+	//     accounted as a customer serve, on the four counters that gate #354.
+	//
+	// cache.BackgroundResolveFromContext is the right predicate because the marker
+	// means exactly this and nothing else: "A customer /call carries NO such
+	// marker" (cache/deps.go), it is the meaning rbac.MustRegateSADial already
+	// depends on under the #268/#269 drift-guard with a producer census behind it,
+	// and it is already classified readOnly443 in the #443 inertness census.
 	readContent := func(k string) (*cache.ResolvedEntry, bool) {
 		switch {
 		case forceContentMiss:
 			return nil, false
-		case refresherDriven || cache.Inert(ctx):
+		case cache.BackgroundResolveFromContext(ctx) || cache.Inert(ctx):
 			// #443 (e) — an inert (dry-run) resolve reads the cell as input
 			// but must not stamp it warm either.
 			return store.GetNoTouch(k)
