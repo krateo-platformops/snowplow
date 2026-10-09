@@ -1,8 +1,16 @@
 // refreshes.go — Ship 1 (live-refresh-coherence, option A).
 //
-// GET /refreshes is the per-subject live-refresh SSE stream (design §3). A
-// browser opens ONE multiplexed EventSource per tab; it arms the widgets it
-// has mounted by sending their resource coordinates (?sub=). When the
+// /refreshes is the per-subject live-refresh SSE stream (design §3). A browser
+// opens ONE multiplexed stream per tab and arms the widgets it has mounted by
+// sending their resource coordinates.
+//
+// TWO TRANSPORTS (#560): GET with the set base64'd into `?sub=`, and POST with
+// the same JSON array in the body. The GET form is kept byte-identical for
+// backward compatibility, but it is structurally dead above ~22 widgets — the
+// URL grows ~361 bytes per widget and the ingress answers 431 before this
+// process sees it. POST has no request-line limit. The client opens the stream
+// with fetch + ReadableStream (NOT EventSource, despite what this comment said
+// before 2026-10-09), so POST needs no transport change on its side. When the
 // refresher commits a fresh L1 entry for an armed key (resolve_populate.go:291
 // -> cache.PublishRefresh), this stream emits `event: refresh\ndata: <l1Key>`.
 // The frontend then refetches /call and reads the freshly-committed L1 as a
@@ -345,14 +353,62 @@ func serveIdleSSE(wri http.ResponseWriter, req *http.Request) {
 // produces are armed (design §5.2). Returns an error only on a malformed or
 // oversized ?sub= payload (a client protocol error), never on a per-entry
 // derivation failure.
-func validateSubscription(req *http.Request) (map[string]struct{}, error) {
+// readSubscriptionPayload returns the subscription coordinate array as JSON
+// bytes, from whichever transport carried it — #560.
+//
+// WHY THERE ARE TWO. The GET form puts the whole set in `?sub=` as base64, so
+// the URL grows ~361 encoded bytes per widget. A 50-widget page produces an
+// 18,098-character URL and the INGRESS answers 431 before the request reaches
+// this process: live refresh is structurally dead above ~22 widgets on an 8 KiB
+// request-line limit, and snowplow never even sees the attempt. Raising that
+// limit is not a fix — it moves the cliff, and a denser page re-breaks it
+// silently.
+//
+// The POST form carries the same array in the BODY, which has no request-line
+// limit and needs no base64 (so the 1.33x encoding inflation disappears too).
+// This is available with no client transport change because the frontend opens
+// the stream with `fetch` + ReadableStream, not EventSource (refreshSse.ts:16-22,
+// :521, :565) — the comment at the top of this file still says "EventSource",
+// which is stale and has already misled one probe of this very defect.
+//
+// GET IS KEPT, BYTE-IDENTICAL. Both transports are accepted so the server can
+// land ahead of the client and roll back independently: nothing about the GET
+// path changes, and a frontend that never switches keeps working exactly as it
+// does today (it just keeps hitting the ingress cliff on dense pages).
+//
+// NOT A NEW ENDPOINT, and not an exposure change. Same path, same semantics,
+// same per-widget coordinate set, same auth (middleware.RefreshAuth), still ZERO
+// apiserver reads. The stream is read-only — it carries l1Keys, never bodies —
+// so there is nothing for a cross-site POST to mutate, and a cross-origin JSON
+// POST requires a CORS preflight, which the equivalent cross-origin GET does
+// not. If anything this form is the harder one to reach.
+func readSubscriptionPayload(req *http.Request) ([]byte, error) {
+	if req.Method == http.MethodPost {
+		// Read at most the cap + 1 byte, so an oversized body is REFUSED rather
+		// than silently truncated into a valid-looking shorter subscription —
+		// a truncated set would arm some widgets and quietly drop the rest,
+		// which is the failure mode the frontend's own MAX_SUB_BYTES cap already
+		// produces and warns about.
+		body, err := io.ReadAll(io.LimitReader(req.Body, int64(refreshSubParamMaxBytes)+1))
+		if err != nil {
+			return nil, fmt.Errorf("cannot read subscription body: %w", err)
+		}
+		if len(body) == 0 {
+			return nil, fmt.Errorf("empty subscription body")
+		}
+		if len(body) > refreshSubParamMaxBytes {
+			return nil, fmt.Errorf("subscription body too large (>%d bytes)", refreshSubParamMaxBytes)
+		}
+		return body, nil
+	}
+
 	raw := req.URL.Query().Get("sub")
 	if raw == "" {
 		return nil, fmt.Errorf("missing 'sub' query parameter")
 	}
 	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
-		// Tolerate URL-safe base64 too (EventSource URLs are query-encoded).
+		// Tolerate URL-safe base64 too (query-encoded URLs).
 		decoded, err = base64.RawURLEncoding.DecodeString(raw)
 		if err != nil {
 			return nil, fmt.Errorf("invalid 'sub' encoding: not base64")
@@ -360,6 +416,14 @@ func validateSubscription(req *http.Request) (map[string]struct{}, error) {
 	}
 	if len(decoded) > refreshSubParamMaxBytes {
 		return nil, fmt.Errorf("'sub' payload too large (%d bytes; max %d)", len(decoded), refreshSubParamMaxBytes)
+	}
+	return decoded, nil
+}
+
+func validateSubscription(req *http.Request) (map[string]struct{}, error) {
+	decoded, err := readSubscriptionPayload(req)
+	if err != nil {
+		return nil, err
 	}
 
 	var reqs []subRequest

@@ -1199,9 +1199,18 @@ func main() {
 	// (fallthrough_assert.go) does not list it. Under CACHE_ENABLED=false or
 	// REFRESH_SSE_ENABLED=false the handler serves a clean idle stream
 	// (transparent fallback, project_cache_off_is_transparent_fallback).
-	mux.Handle("GET /refreshes", chain.Append(
+	refreshesHandler := chain.Append(
 		middleware.RefreshAuth(jwtKeys)).
-		Then(handlers.Refreshes()))
+		Then(handlers.Refreshes())
+	mux.Handle("GET /refreshes", refreshesHandler)
+	// #560 — the SAME handler on POST. The GET form carries the subscription set
+	// in `?sub=`, which grows ~361 bytes per widget: a 50-widget page sends an
+	// 18 KB URL and the ingress returns 431 before snowplow sees it, so live
+	// refresh is structurally dead on dense pages. POST carries the identical
+	// coordinate array in the body, which has no request-line limit. Same path,
+	// same auth, same semantics, still zero apiserver reads — and GET stays
+	// byte-identical so the server can land ahead of the client.
+	mux.Handle("POST /refreshes", refreshesHandler)
 
 	// GET /rbac — RESTAction read-set enumeration for core-provider RBAC
 	// pre-generation (design docs/restaction-rbac-endpoint-design.md). It
