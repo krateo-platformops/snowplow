@@ -971,6 +971,13 @@ func setRefreshKeyHeader(wri http.ResponseWriter, key, class string) {
 	if class != "" {
 		wri.Header().Set(refreshClassHeader, class)
 	}
+	// #560 — the single place snowplow tells a browser "this cell is
+	// subscribable". Counted here so the arm rate can be read against
+	// cache.LiveRefreshArmingStats.SubscribeArrived: widgets arming while
+	// nothing arrives is the signature of subscriptions being rejected
+	// upstream (an 18 KB ?sub= URL answered 431 by the ingress), which this
+	// process cannot otherwise observe at all.
+	cache.BumpRefreshArmStamped()
 }
 
 // setRefreshKeyHeaderUnlessExternal is the external-widget bounded-TTL cache

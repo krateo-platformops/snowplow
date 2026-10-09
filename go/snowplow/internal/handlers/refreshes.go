@@ -114,6 +114,15 @@ func Refreshes() http.HandlerFunc {
 	return func(wri http.ResponseWriter, req *http.Request) {
 		log := xcontext.Logger(req.Context())
 
+		// (0) #560 — count the ARRIVAL first, before every branch below.
+		// The defect this answers is that an 18 KB `?sub=` URL is rejected by
+		// the ingress with 431 and NEVER REACHES THIS LINE, so snowplow could
+		// not distinguish "nobody subscribed" from "every subscriber was
+		// refused upstream". Counting here — ahead of the cache-off branch and
+		// ahead of validation — means an arrival is recorded even when snowplow
+		// itself goes on to refuse it, which is exactly the distinction.
+		cache.BumpRefreshSubscribeArrived()
+
 		// (1) Disabled / cache-off -> clean idle stream (transparent
 		// fallback). No subscription validation, no apiserver touch; the
 		// client gets heartbeats only and falls back to its own throttle.
@@ -132,6 +141,12 @@ func Refreshes() http.HandlerFunc {
 		// (3) Validate + re-derive the requested key-set UNDER THIS subject.
 		armed, derr := validateSubscription(req)
 		if derr != nil {
+			// #560 — an arrival snowplow refused ITSELF. On the measured
+			// deployment this stays 0 while the ingress cliff (~22 widgets) sits
+			// far below snowplow's own cap (~60), and that contrast is the
+			// signal: a rejection here is visible as a 400, a rejection
+			// upstream is visible only as arrivals that never happen.
+			cache.BumpRefreshSubscribeRejected()
 			http.Error(wri, derr.Error(), http.StatusBadRequest)
 			return
 		}
@@ -209,6 +224,13 @@ func Refreshes() http.HandlerFunc {
 		stream := cache.SubscribeRefreshStream(armed)
 		defer stream.Unsub()
 
+		// #560 — the open-stream GAUGE, paired with its decrement so a
+		// disconnect cannot leak it. This is the denominator that makes the arm
+		// counter readable: widgets arming (arm_stamped_total climbing) while
+		// streams_open sits at 0 means no subscription is reaching this process.
+		cache.RefreshStreamOpened()
+		defer cache.RefreshStreamClosed()
+
 		log.Info("refreshes: subscribed",
 			slog.String("subsystem", "cache"),
 			slog.String("user", redact.User(ui.Username)),
@@ -259,6 +281,7 @@ func Refreshes() http.HandlerFunc {
 //   - cache.RBACGen() == 0 — no RBAC snapshot published yet (rbac_snapshot.go);
 //     EvaluateRBAC fails closed until the first publish, so every identity-bound
 //     coord derives the empty/denied key pre-publish.
+//
 // BOTH disjuncts are required: phase1 can complete while the RBAC snapshot is
 // momentarily unpublished (and vice-versa) — either alone leaves
 // DeriveSubscriptionKey unable to produce a real armed key.
