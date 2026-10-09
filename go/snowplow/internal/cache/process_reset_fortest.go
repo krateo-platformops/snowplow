@@ -99,6 +99,12 @@ func ResetCacheProcessStateForTest() error {
 	// exists precisely so those assertions are deterministic — #471.
 	ResetLazyItemsStatsForTest()
 
+	// 5c — #560 live-refresh arming counters. Process-global (the stamp site is
+	// in dispatchers and the arrival site in handlers, so neither owns them), so
+	// a test asserting on the quartet would otherwise read a sibling's
+	// increments. Composed rather than exempted — #471.
+	ResetLiveRefreshArmingStatsForTest()
+
 	// 6 — the publish container, after the incremental rebuild has quiesced.
 	err := WaitRBACRebuildQuiesceForTest(5 * time.Second)
 	PublishRBACSnapshotForTest(nil)
