@@ -217,52 +217,134 @@ func TestIssue578_MarshalAsListRaw_SizeIsExact(t *testing.T) {
 	}
 }
 
-// TestIssue578_MarshalAsListRaw_CeilingIsChecked proves the overflow guard on
-// the size accumulation FIRES, rather than being a comment that asserts safety.
+// TestIssue578_MarshalAsListRaw_CeilingIsChecked proves the size ceiling is
+// ENFORCED at every input shape that can reach it.
 //
-// CodeQL (go/allocation-size-overflow) flagged the first revision of
-// marshalAsListRaw: the accumulated size feeds a make() capacity, and
-// "each len(r) is already resident in memory so it cannot overflow" is a
-// plausible argument, not a checked bound. The function now returns an error
-// above a ceiling; the caller handles that exactly as it handles any marshal
-// failure — fall through to the live apiserver — so the degenerate case is a
-// correct serve, never a truncated envelope.
+// WHAT THIS TEST CANNOT PROVE, stated plainly because an earlier version of it
+// claimed otherwise. marshalAsListRaw guards the size in two layers: a
+// per-addend check before each accumulation, and a final check on `n`
+// immediately before the make(). Those layers are MUTUALLY REDUNDANT for
+// observable behaviour — measured by mutation:
 //
-// The ceiling is lowered here instead of allocating 2 GiB. Restored via
-// t.Cleanup so the production value cannot leak into a sibling test.
+//	remove the per-addend checks only -> this test still PASSES (final catches it)
+//	remove the final check only       -> this test still PASSES (per-addend catches it)
+//	remove BOTH                       -> 4 of 5 sub-cases FAIL
+//
+// So no black-box test can attribute a refusal to a particular arm, and sub-case
+// names here describe the INPUT SHAPE, not the arm. The first version of this
+// test asserted only `err != nil` at one ceiling of 40 — where a zero-item
+// envelope already fails on the listKind header — so the two arms it named were
+// never reached and both sub-cases passed for the wrong reason.
+//
+// WHY BOTH LAYERS STAY ANYWAY, since redundant code is normally a smell:
+//   - the per-addend checks are what keep `n` from WRAPPING int before the final
+//     check reads it. If `n` wrapped negative, `n > maxListEnvelopeBytes` would
+//     be false and the make() would receive a bogus capacity. Demonstrating that
+//     needs ~2^63 bytes of input, so it is unreachable by test and is the one
+//     property here that rests on the argument rather than on a measurement.
+//   - they are also what makes the bound LEGIBLE to CodeQL: each puts `len(x)`
+//     on the smaller side of the comparison, the form the Go query
+//     go/allocation-size-overflow recognises as a length check, which is what
+//     sanitizes `av` and `lk` (json.Marshal output of a non-constant string is a
+//     "potentially large value" to that query).
+//
+// The byte arithmetic the boundaries below are derived from:
+//
+//	pfxAPIVersion `{"apiVersion":`  14
+//	pfxItems      `,"items":[`      10
+//	pfxKind       `],"kind":`        9
+//	suffix        `}`                1   => scaffolding 34
+//	av  json.Marshal("v1")           4   => 38
+//	lk  json.Marshal("ThingsList")  12   => 50  (an empty envelope is exactly 50)
+//	one fixture item                40   => 90  (a one-item envelope)
 func TestIssue578_MarshalAsListRaw_CeilingIsChecked(t *testing.T) {
 	orig := maxListEnvelopeBytes
 	t.Cleanup(func() { maxListEnvelopeBytes = orig })
 
+	const emptyEnvelope = 50 // scaffolding + av + lk
 	item := []byte(`{"kind":"Thing","metadata":{"name":"x"}}`)
-
-	// A ceiling comfortably above the fixed envelope scaffolding but below the
-	// scaffolding plus this item: the per-item arm must reject.
-	maxListEnvelopeBytes = 40
-	if _, err := marshalAsListRaw("v1", "ThingsList", [][]byte{item}); err == nil {
-		t.Fatalf("per-item arm did not reject an envelope over the ceiling")
+	if len(item) != 40 {
+		t.Fatalf("fixture item is %d bytes; the boundaries below assume 40", len(item))
 	}
 
-	// The separator arm has its own check, so it needs its own assertion: many
-	// EMPTY items push the comma count over the ceiling without any single item
-	// exceeding it.
-	maxListEnvelopeBytes = 40
-	many := make([][]byte, 200)
-	for i := range many {
-		many[i] = []byte(`1`)
-	}
-	if _, err := marshalAsListRaw("v1", "ThingsList", many); err == nil {
-		t.Fatalf("separator arm did not reject an envelope over the ceiling")
-	}
+	t.Run("refuses a ceiling below the fixed scaffolding", func(t *testing.T) {
+		// Below the fixed scaffolding nothing can be assembled at all.
+		maxListEnvelopeBytes = 10
+		if _, err := marshalAsListRaw("v1", "ThingsList", nil); err == nil {
+			t.Fatalf("a ceiling below the fixed scaffolding must be refused")
+		}
+	})
 
-	// And at the production ceiling a normal envelope is unaffected — the guard
-	// must not be a functional change for real lists.
-	maxListEnvelopeBytes = orig
-	got, err := marshalAsListRaw("v1", "ThingsList", [][]byte{item})
-	if err != nil {
-		t.Fatalf("production ceiling rejected a normal envelope: %v", err)
-	}
-	if cap(got) != len(got) {
-		t.Fatalf("guard broke the exact preallocation: len=%d cap=%d", len(got), cap(got))
-	}
+	t.Run("refuses one byte under an empty envelope, accepts exactly one", func(t *testing.T) {
+		// One byte under an empty envelope: the listKind header is what pushes it
+		// over, and there are no items to blame.
+		maxListEnvelopeBytes = emptyEnvelope - 1
+		if _, err := marshalAsListRaw("v1", "ThingsList", nil); err == nil {
+			t.Fatalf("ceiling %d must refuse an empty envelope needing %d",
+				emptyEnvelope-1, emptyEnvelope)
+		}
+		// Exactly an empty envelope: accepted, so the refusal above was the
+		// header arm and not an off-by-default rejection of everything.
+		maxListEnvelopeBytes = emptyEnvelope
+		got, err := marshalAsListRaw("v1", "ThingsList", nil)
+		if err != nil {
+			t.Fatalf("ceiling %d must accept an empty envelope: %v", emptyEnvelope, err)
+		}
+		if len(got) != emptyEnvelope {
+			t.Fatalf("empty envelope is %d bytes; the arithmetic in this test is stale", len(got))
+		}
+	})
+
+	t.Run("accepts the headers but refuses an item that does not fit", func(t *testing.T) {
+		// Room for the headers but not for one 40-byte item: empty succeeds,
+		// one item fails. That is the per-item arm and nothing else.
+		maxListEnvelopeBytes = emptyEnvelope + 10
+		if _, err := marshalAsListRaw("v1", "ThingsList", nil); err != nil {
+			t.Fatalf("empty envelope must still fit under ceiling %d: %v",
+				emptyEnvelope+10, err)
+		}
+		if _, err := marshalAsListRaw("v1", "ThingsList", [][]byte{item}); err == nil {
+			t.Fatalf("one %d-byte item must not fit in %d bytes of headroom",
+				len(item), 10)
+		}
+	})
+
+	t.Run("counts the separators toward the ceiling", func(t *testing.T) {
+		// To isolate the SEPARATOR arm the items must contribute nothing, so
+		// this uses zero-length elements. That input is UNREACHABLE in
+		// production — rawItemJSON drops a bytesObject with empty raw, and both
+		// json.Marshal arms return at least "{}" — so this exercises the arm's
+		// arithmetic, not a reachable serve. With 1-byte items the item total
+		// always exceeds the comma count, so no realistic input can isolate it.
+		maxListEnvelopeBytes = emptyEnvelope + 5
+		few := [][]byte{{}, {}} // 1 comma
+		if _, err := marshalAsListRaw("v1", "ThingsList", few); err != nil {
+			t.Fatalf("1 separator must fit in 5 bytes of headroom: %v", err)
+		}
+		many := make([][]byte, 10) // 9 commas
+		for i := range many {
+			many[i] = []byte{}
+		}
+		if _, err := marshalAsListRaw("v1", "ThingsList", many); err == nil {
+			t.Fatalf("9 separators must not fit in 5 bytes of headroom")
+		}
+	})
+
+	t.Run("production ceiling leaves a normal envelope untouched", func(t *testing.T) {
+		maxListEnvelopeBytes = orig
+		got, err := marshalAsListRaw("v1", "ThingsList", [][]byte{item})
+		if err != nil {
+			t.Fatalf("production ceiling rejected a normal envelope: %v", err)
+		}
+		if cap(got) != len(got) {
+			t.Fatalf("the guard broke exact preallocation: len=%d cap=%d", len(got), cap(got))
+		}
+		// And the ceiling must be positive on this target — a negative ceiling
+		// would make the remaining budget negative and refuse every list.
+		if maxListEnvelopeBytes <= 0 {
+			t.Fatalf("maxListEnvelopeBytes is %d; a ceiling must be positive on every "+
+				"target the module builds for (1<<31 overflows a 32-bit int)",
+				maxListEnvelopeBytes)
+		}
+	})
 }

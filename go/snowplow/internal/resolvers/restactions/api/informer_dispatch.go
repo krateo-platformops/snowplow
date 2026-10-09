@@ -237,15 +237,35 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 // The returned buffer is freshly allocated and owned by the caller; the input
 // slices are only read (they alias immutable bytesObject arrays).
 // maxListEnvelopeBytes bounds the assembled envelope so the size arithmetic in
-// marshalAsListRaw is a checked bound rather than an assumed one. 2 GiB is far
-// above any real LIST — the largest observed on krateo-057 is the CRD
-// collection at 9.1 MB / 439 items — so this never fires in production; it
+// marshalAsListRaw is a checked bound rather than an assumed one. 1 GiB is far
+// above any real LIST — the largest observed on krateo-057 is the CRD collection
+// at 9.1 MB / 439 items, so ~110x headroom — and it never fires in production; it
 // exists so the make() capacity below cannot be derived from an overflowed sum.
 //
+// 1<<30 RATHER THAN 1<<31, DELIBERATELY. 1<<31 does not fit in a 32-bit `int`:
+// `var maxListEnvelopeBytes = 1 << 31` fails to COMPILE on GOARCH=386 and
+// GOARCH=arm (verified on both), and any variant that did compile there would
+// hold -2147483648 — making `maxListEnvelopeBytes-n` negative for every n and
+// refusing EVERY list into apiserver fallthrough, which is the exact opposite of
+// what #578 exists to do and would be invisible in the fallthrough counter. A
+// ceiling must be positive on every target the module can be built for. No
+// 32-bit target is built in CI today, so that was latent rather than broken.
+//
 // A var rather than a const ONLY so TestIssue578_MarshalAsListRaw_CeilingIsChecked
-// can lower it and prove the guard fires without allocating 2 GiB. Production
-// code MUST NOT write it.
-var maxListEnvelopeBytes = 1 << 31
+// can lower it and prove EACH ARM of the guard fires without allocating 1 GiB.
+// Production code MUST NOT write it.
+var maxListEnvelopeBytes = 1 << 30
+
+// listEnvelopeTooBig is the single error for every ceiling rejection, so the
+// operator-visible text cannot drift between arms. It reaches the caller's
+// existing `informer_dispatch.list_marshal_failed` WARN, which carries this text
+// — that log line is the detector, because the fallthrough counter records a
+// ceiling rejection under the same ReasonInformerNotServable an unsynced
+// informer uses and so cannot distinguish the two on its own.
+func listEnvelopeTooBig(items int) error {
+	return fmt.Errorf("list envelope exceeds the %d-byte ceiling (%d items)",
+		maxListEnvelopeBytes, items)
+}
 
 func marshalAsListRaw(apiVersion, listKind string, raws [][]byte) ([]byte, error) {
 	// Marshal the two strings rather than quoting them by hand so that any
@@ -276,19 +296,82 @@ func marshalAsListRaw(apiVersion, listKind string, raws [][]byte) ([]byte, error
 	// an error, which the caller already handles by falling through to the live
 	// apiserver (dispatchInformerFallthrough + ReasonInformerNotServable) — a
 	// correct, pre-existing path, never a silent truncation.
-	n := len(pfxAPIVersion) + len(av) + len(pfxItems) + len(pfxKind) + len(lk) + len(suffix)
+	// Exact size: no growth reallocation on the hot path.
+	//
+	// CHECKED, NOT ASSUMED. CodeQL go/allocation-size-overflow flagged this twice:
+	// once with no guard at all, then again with a guard that bounded only the
+	// per-item and separator arms and left the header sum
+	// `len(pfxAPIVersion) + len(av) + len(pfxItems) + len(pfxKind) + len(lk)`
+	// unchecked. `av` and `lk` are json.Marshal output of the apiVersion and the
+	// kind, so their lengths are inputs too — a non-constant string is a
+	// "potentially large value" to that query, which is why it reported two
+	// sources on one expression. A bound that skips a term is not a bound.
+	//
+	// THE SHAPE MATTERS AS MUCH AS THE ARITHMETIC, because it is what makes the
+	// bound legible to the analysis rather than merely true:
+	//
+	//   - each check puts `len(x)` on the SMALLER side of the comparison, the
+	//     form the query recognises as a length check, which sanitizes `av` and
+	//     `lk` themselves on the fall-through;
+	//   - accumulation is `+=`, so the running total is never a bare `a + b`
+	//     expression that the sink detector would treat as overflow-prone;
+	//   - the final `if n > maxListEnvelopeBytes` sits IMMEDIATELY before the
+	//     allocation with NO write to `n` in between, so it provably dominates
+	//     the make() and applies to the same value the make() reads. The query's
+	//     own test suite marks a size that is modified AFTER its upper-bound
+	//     check as still alerting, because the barrier is SSA identity and not
+	//     value reasoning.
+	//
+	// DO NOT ROUTE THESE CHECKS THROUGH A HELPER CLOSURE. An earlier revision did,
+	// and it silenced the alert only by removing every `+` EXPRESSION from the
+	// function — a blind spot in the sink detector, not a sanitizer. A func
+	// literal is its own control-flow region, so a bound proved inside one is
+	// invisible at the allocation site.
+	//
+	// Every addend is the length of a string or slice already resident in memory,
+	// hence >= 0, and each is compared against the REMAINING budget before being
+	// added — so `0 <= n <= maxListEnvelopeBytes` holds on entry to every guard,
+	// which is the precondition that makes `maxListEnvelopeBytes-n` safe.
+	//
+	// An envelope over the ceiling returns an error, which the caller already
+	// handles by falling through to the live apiserver — a correct, pre-existing
+	// path, never a silent truncation.
+	const scaffolding = len(pfxAPIVersion) + len(pfxItems) + len(pfxKind) + len(suffix)
+
+	// Keeps the invariant literally true when a TEST has lowered the ceiling
+	// below the fixed scaffolding. Without it the first guard still refuses (the
+	// remaining budget goes negative, so every addend is rejected), but `n` would
+	// transiently sit above the ceiling.
+	if scaffolding > maxListEnvelopeBytes {
+		return nil, listEnvelopeTooBig(len(raws))
+	}
+	n := scaffolding
+	if len(av) > maxListEnvelopeBytes-n {
+		return nil, listEnvelopeTooBig(len(raws))
+	}
+	n += len(av)
+	if len(lk) > maxListEnvelopeBytes-n {
+		return nil, listEnvelopeTooBig(len(raws))
+	}
+	n += len(lk)
 	if len(raws) > 1 {
-		if len(raws)-1 > maxListEnvelopeBytes-n {
-			return nil, fmt.Errorf("list envelope separators exceed the %d-byte ceiling (%d items)",
-				maxListEnvelopeBytes, len(raws))
+		if len(raws)-1 > maxListEnvelopeBytes-n { // the separating commas
+			return nil, listEnvelopeTooBig(len(raws))
 		}
-		n += len(raws) - 1 // the separating commas
+		n += len(raws) - 1
 	}
 	for _, r := range raws {
 		if len(r) > maxListEnvelopeBytes-n {
-			return nil, fmt.Errorf("list envelope exceeds the %d-byte ceiling", maxListEnvelopeBytes)
+			return nil, listEnvelopeTooBig(len(raws))
 		}
 		n += len(r)
+	}
+
+	// The bound the ALLOCATION itself reads. Implied by the per-addend checks
+	// above, and stated here because a capacity must be bounded at the point of
+	// allocation, by a check nothing writes to `n` after.
+	if n > maxListEnvelopeBytes {
+		return nil, listEnvelopeTooBig(len(raws))
 	}
 
 	buf := make([]byte, 0, n)
