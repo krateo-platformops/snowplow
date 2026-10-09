@@ -576,13 +576,25 @@ func apistageContentServe(
 		// over them, no re-unmarshal. An entry without Items (legacy /
 		// refresh-stored / malformed-at-Put) falls back to the RawJSON
 		// unmarshal path below.
-		if isList && len(entry.Items) > 0 {
-			parsed = parsedListEnvelope{
-				items:      entry.Items,
-				apiVersion: entry.ItemsAPIVersion,
-				kind:       entry.ItemsKind,
+		// #578: materialise on FIRST SERVE. EnsureItems honours a Put-time
+		// Items slice first (so an entry stored by an older binary, or by a
+		// path that still fills it, behaves exactly as before), then a
+		// published memo, and only parses when neither exists. The parse
+		// therefore happens at most once per refresh generation and ONLY for
+		// cells somebody actually reads — where the pre-#578 Put-time parse
+		// ran for every rebuild of every cell, read or not.
+		if isList {
+			if items, av, k, ok := entry.EnsureItems(func(raw []byte) ([]*unstructured.Unstructured, string, string, bool) {
+				p, pOK := parseListEnvelope(gvr, raw)
+				return p.items, p.apiVersion, p.kind, pOK
+			}); ok && len(items) > 0 {
+				parsed = parsedListEnvelope{
+					items:      items,
+					apiVersion: av,
+					kind:       k,
+				}
+				haveParsed = true
 			}
-			haveParsed = true
 		}
 		// Ship 0.30.212 — idempotent re-record on HIT. Required to converge
 		// after rollout for entries Put under an earlier binary (no dep

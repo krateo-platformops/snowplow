@@ -96,6 +96,10 @@ func TestResolvedCacheStatsByStat_ReportsLiveStore(t *testing.T) {
 		"stale_served_total", "stale_served_age_ms_max", // #354 P3 customer stale serves
 		"warm_keyed_page_restactions", "warm_keyed_page_widgets", "warm_keyed_page_ra_full_list", // #354 P3 B3
 		"warm_keyed_extras_restactions", "warm_keyed_extras_widgets", "warm_keyed_extras_ra_full_list",
+		// #578 — lazy LIST-item materialisation, published as a TRIO because no
+		// one of them is readable alone (served/parsed is the reads-per-generation
+		// ratio; eager is the Put-time-Items population).
+		"lazy_items_parsed_total", "lazy_items_served_total", "lazy_items_eager_total",
 	}
 	for _, k := range want {
 		if _, ok := stats[k]; !ok {

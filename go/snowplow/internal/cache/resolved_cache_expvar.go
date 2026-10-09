@@ -174,6 +174,13 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		// catching, zero if the pass is inert. Read next to snowplow_refresher's
 		// completed_total (the refresher's dedup collapses these enqueues).
 		"proactive_refresh_total": int64(s.ProactiveRefreshTotal),
+
+		// #578 — lazy LIST-item materialisation. Published as a TRIO; see the
+		// ResolvedCacheStats field doc for why a single one of these is not
+		// readable on its own.
+		"lazy_items_parsed_total": int64(s.LazyItemsParsedTotal),
+		"lazy_items_served_total": int64(s.LazyItemsServedTotal),
+		"lazy_items_eager_total":  int64(s.LazyItemsEagerTotal),
 		// Ship 4a resident region
 		"resident_entries":      int64(s.ResidentEntries),
 		"resident_bytes":        s.ResidentBytes,

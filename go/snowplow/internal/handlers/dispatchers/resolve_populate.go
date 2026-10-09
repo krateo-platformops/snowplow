@@ -533,13 +533,35 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	//
 	// GET-by-name (Name != "") and malformed-at-Put envelopes return ok=false
 	// and the entry keeps Items=nil — byte-identical fallback to today.
-	if inputs.CacheEntryClass == cache.CacheEntryClassApistage {
-		if items, apiVer, kind, ok := restactionsapi.ParseListEnvelopeForRefresh(inputs, encoded); ok {
-			entry.Items = items
-			entry.ItemsAPIVersion = apiVer
-			entry.ItemsKind = kind
-		}
-	}
+	// #578 — Ship #97's EAGER parse is REMOVED here, and its benefit is kept.
+	//
+	// WHAT SHIP #97 WAS ACTUALLY FIXING: a refresher Put wrote RawJSON only, so
+	// `len(entry.Items) > 0` was false on EVERY subsequent content-Get-hit and
+	// each hit re-ran parseListEnvelope on a customer request goroutine (45% cum
+	// CPU). The defect was the parse running PER HIT, unbounded in the read count.
+	//
+	// WHY REMOVING IT DOES NOT REGRESS THAT: the apistage read path now calls
+	// ResolvedEntry.EnsureItems, which parses on the FIRST hit and publishes the
+	// result on the entry, so every later hit short-circuits exactly as it did
+	// with the eager parse. The parse is bounded at ONE per refresh generation
+	// either way — #97's guarantee — but it is now only paid for cells somebody
+	// reads.
+	//
+	// WHY THAT MATTERS HERE SPECIFICALLY: this is the REFRESHER's Put. Measured on
+	// krateo-057 with the portal idle for 38 minutes, all 3,876 entries had
+	// lastRead 2,300-2,500s while the refresher completed 33.7 refreshes/s — so
+	// this line parsed envelopes continuously for cells with no reader, and
+	// parseListEnvelope was 27.6% of a 30s CPU profile on a pod sitting at 98.75%
+	// of its 4-CPU limit with ZERO users (#578).
+	//
+	// The customer-facing MISS path (apistage.go) still parses eagerly and stores
+	// Items, because that requester needs the parsed form to run the content gate
+	// before it can be served — there the parse is work, not waste.
+	//
+	// Nothing about the ENTRY SHAPE changes for readers: Items=nil is the
+	// documented "no pre-parse" state that EnsureItems resolves, and an entry
+	// written by a pre-#578 binary mid-rollout still carries Items and is honoured
+	// ahead of the lazy memo.
 	// #189 — GENERATION-GUARDED REPLACE. A refresh only ever REPLACES a live
 	// entry; ReplaceIfGen refuses if the key was evicted (before or during the
 	// re-resolve) or moved to a newer generation, so a non-resurrecting refresh

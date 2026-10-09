@@ -207,6 +207,78 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 	return json.Marshal(envelope)
 }
 
+// marshalAsListRaw builds the SAME envelope marshalAsList builds, from
+// per-item JSON the informer indexer already holds — #578.
+//
+// BYTE-IDENTICAL TO marshalAsList, BY CONSTRUCTION. Three properties make that
+// true, and TestIssue578_MarshalAsListRaw_ByteIdenticalToMarshalAsList is the
+// falsifier that keeps them true:
+//
+//  1. KEY ORDER. json.Marshal emits a map's keys in sorted order, so
+//     marshalAsList produces apiVersion, items, kind. This function emits that
+//     same order literally. (Writing them in the "natural" apiVersion/kind/items
+//     order would be semantically identical JSON but NOT byte-identical, and
+//     byte-parity is what makes this change safe to land without re-blessing
+//     every golden.)
+//  2. PER-ITEM BYTES. A bytesObject's `raw` is json.Marshal of the same
+//     Unstructured map that marshalAsList would have marshalled, so each item's
+//     bytes match key-for-key. Integer fidelity survives the comparison because
+//     the decode side uses sigs.k8s.io/json's PreserveInts behaviour rather than
+//     landing every number on float64.
+//  3. STRIPPING. managedFields and the last-applied annotation are removed by
+//     defaultStripUnstructured BEFORE newBytesObject marshals, so the stored
+//     bytes are already in the stripped shape the serve path expects. Nothing is
+//     reintroduced by concatenating them.
+//
+// The empty case still emits `"items":[]` (never null) so a JQ `.items[]`
+// iterator yields an empty stream, matching marshalAsList and the apiserver.
+//
+// The returned buffer is freshly allocated and owned by the caller; the input
+// slices are only read (they alias immutable bytesObject arrays).
+func marshalAsListRaw(apiVersion, listKind string, raws [][]byte) ([]byte, error) {
+	// Marshal the two strings rather than quoting them by hand so that any
+	// character needing escaping is escaped EXACTLY as encoding/json would.
+	av, err := json.Marshal(apiVersion)
+	if err != nil {
+		return nil, err
+	}
+	lk, err := json.Marshal(listKind)
+	if err != nil {
+		return nil, err
+	}
+
+	const (
+		pfxAPIVersion = `{"apiVersion":`
+		pfxItems      = `,"items":[`
+		pfxKind       = `],"kind":`
+		suffix        = `}`
+	)
+
+	// Exact size: no growth reallocation on the hot path.
+	n := len(pfxAPIVersion) + len(av) + len(pfxItems) + len(pfxKind) + len(lk) + len(suffix)
+	for _, r := range raws {
+		n += len(r)
+	}
+	if len(raws) > 1 {
+		n += len(raws) - 1 // the separating commas
+	}
+
+	buf := make([]byte, 0, n)
+	buf = append(buf, pfxAPIVersion...)
+	buf = append(buf, av...)
+	buf = append(buf, pfxItems...)
+	for i, r := range raws {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, r...)
+	}
+	buf = append(buf, pfxKind...)
+	buf = append(buf, lk...)
+	buf = append(buf, suffix...)
+	return buf, nil
+}
+
 // dispatchViaInformer attempts to serve `call` from the informer cache.
 // Returns (rawBytes, true) on success — caller feeds the bytes to
 // `call.ResponseHandler`. Returns (nil, false) for any gate that
@@ -475,6 +547,64 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		// A genuinely-empty-but-synced informer still returns
 		// `servable=true` with an empty slice — that is a real answer
 		// the watcher can vouch for.
+		// #578 — ZERO-DECODE ENVELOPE for the identity-free content
+		// substrate. When this resolve is an api-stage CONTENT resolve the
+		// inline RBAC gate is SKIPPED by design (see the Ship F1 note
+		// below): the entry must store UN-GATED content, so nothing on
+		// this path reads a per-item field. That makes the decoded
+		// map trees pure waste — the envelope is a concatenation of the
+		// per-item JSON the indexer already holds.
+		//
+		// This is a structural discriminant, not a resource carve-out
+		// (feedback_no_special_cases): the predicate is "does this call
+		// need per-item access?", answered by the SAME
+		// ApistageContentResolveFromContext that already decides whether
+		// the gate runs. Every other caller keeps the decoded path below,
+		// unchanged, because filterListByRBAC genuinely reads
+		// it.GetNamespace() per item.
+		//
+		// Measured motivation (krateo-057, portal IDLE 38 min, so this is
+		// refresher cost not serve cost): bytesObject.Decode 28.0% and
+		// parseListEnvelope 27.6% of a 30s CPU profile, 568 MB/s of
+		// allocation, pod pinned at 98.75% of a 4-CPU limit with ZERO
+		// users. #578.
+		if cache.ApistageContentResolveFromContext(ctx) {
+			raws, servable := rw.ListRawServable(gvr, namespace)
+			if !servable {
+				log.Debug("informer_dispatch.fallthrough.list_not_servable",
+					slog.String("gvr", gvr.String()),
+					slog.String("ns", namespace),
+					slog.String("path", call.Path),
+					slog.String("shape", "raw"),
+				)
+				dispatchInformerFallthrough.Add(1)
+				cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
+				return nil, false
+			}
+			raw, err := marshalAsListRaw(apiVersion, listKindForResource(gvr.Resource), raws)
+			if err != nil {
+				log.Warn("informer_dispatch.list_marshal_failed",
+					slog.String("gvr", gvr.String()),
+					slog.String("ns", namespace),
+					slog.String("shape", "raw"),
+					slog.Any("err", err),
+				)
+				dispatchInformerFallthrough.Add(1)
+				cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
+				return nil, false
+			}
+			log.Debug("informer_dispatch.list_served",
+				slog.String("gvr", gvr.String()),
+				slog.String("ns", namespace),
+				slog.String("shape", "raw"),
+				slog.Int("items", len(raws)),
+				slog.Int("bytes", len(raw)),
+			)
+			dispatchInformerListServed.Add(1)
+			dispatchInformerListServedRaw.Add(1)
+			return raw, true
+		}
+
 		items, servable := rw.ListObjectsServable(gvr, namespace)
 		if !servable {
 			log.Debug("informer_dispatch.fallthrough.list_not_servable",

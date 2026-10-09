@@ -1,18 +1,31 @@
 // ship97_refresher_populates_items_test.go — Ship #97 (0.30.214)
-// integration falsifier. Asserts the refresher's resolveAndPopulateL1 Put
-// site at resolve_populate.go:255 populates ResolvedEntry.Items on an
-// apistage-class LIST entry — the load-bearing fix that restores the R3
-// fast-path predicate at apistage.go:487 (`len(entry.Items) > 0`).
+// integration falsifier, RE-EXPRESSED FOR #578.
 //
-// Pre-fix, the Put site wrote RawJSON only (Items: nil) and every
-// subsequent content-Get-hit fell through to gateListEnvelope ->
-// parseListEnvelope on the request goroutine (45% cum CPU at 0.30.212
-// production scale, see ship-97-prefix-falsifier-2026-05-31).
+// WHAT SHIP #97 GUARANTEED, and still guarantees: a content-Get-hit must not
+// re-parse the LIST envelope on the request goroutine on EVERY hit. Pre-#97 the
+// refresher Put wrote RawJSON only, `len(entry.Items) > 0` was false forever,
+// and every hit fell through to gateListEnvelope -> parseListEnvelope (45% cum
+// CPU at 0.30.212 production scale, see ship-97-prefix-falsifier-2026-05-31).
+//
+// WHAT #578 CHANGED: the MECHANISM, not the guarantee. #97 discharged it by
+// parsing eagerly at the refresher Put; #578 discharges it with
+// ResolvedEntry.EnsureItems, which parses on the FIRST serve and publishes the
+// result. The parse is still bounded at one per refresh generation — but it is
+// no longer paid for cells nobody reads, which on an idle krateo-057 was
+// 33.7 re-resolves/s against entries last read 2,300-2,500s earlier
+// (parseListEnvelope 27.6% of CPU, pod at 98.75% of a 4-CPU limit, zero users).
+//
+// So F1 now asserts the refresher Put leaves Items EMPTY, and that
+// materialisation is correct and happens AT MOST ONCE across many serves. The
+// old assertion (Items populated at Put) would pass under a change that
+// reintroduced the #578 defect, which is why it was replaced rather than
+// relaxed.
 //
 // Falsifiers in this file:
 //
-//   F1 — apistage-class LIST refresh populates Items (+ ItemsAPIVersion +
-//        ItemsKind). FAILS pre-fix (Items=nil).
+//   F1 — apistage-class LIST refresh leaves Items empty (#578), and
+//        EnsureItems materialises the same envelope with exactly ONE parse
+//        across 11 serves (#97's guarantee).
 //   F2 — apistage-class GET-by-name refresh leaves Items=nil. Verifies the
 //        helper's Name!="" early-return; GET-by-name still flows via
 //        gateGetEnvelope on read.
@@ -30,7 +43,10 @@ import (
 	"sync"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
 // ship97LISTEnvelope is a well-formed widgets LIST envelope. Same shape
@@ -111,25 +127,70 @@ func TestShip97_F1_ApistageRefreshPopulatesItems(t *testing.T) {
 	if string(entry.RawJSON) != ship97LISTEnvelope {
 		t.Fatalf("F1: RawJSON not refreshed; got %q", entry.RawJSON)
 	}
-	if len(entry.Items) != 3 {
-		t.Fatalf("F1: refresher-Put entry has Items=%v (len=%d), want 3 items. "+
-			"Pre-fix the refresher Put writes RawJSON only; this is the R3 "+
-			"hot-path defect the fix closes (see "+
-			"docs/ship-97-prefix-falsifier-2026-05-31.md).",
-			entry.Items, len(entry.Items))
+	// #578 CONTRACT CHANGE. The refresher Put no longer parses: Items is nil
+	// here BY DESIGN. Ship #97's guarantee was never "Items is populated at
+	// Put" — it was "a content-Get-hit must not re-parse on the request
+	// goroutine on EVERY hit" (45% cum CPU pre-#97). That guarantee now holds
+	// via ResolvedEntry.EnsureItems, which parses on the FIRST serve and
+	// publishes the result, so the parse stays bounded at one per refresh
+	// generation while no longer being paid for cells nobody reads.
+	//
+	// Measured reason for the move (krateo-057, portal idle 38 min): the
+	// refresher completed 33.7 re-resolves/s while every one of 3,876 entries
+	// had lastRead 2,300-2,500s, so this Put site parsed envelopes continuously
+	// for cells with no reader — parseListEnvelope was 27.6% of CPU on a pod at
+	// 98.75% of its 4-CPU limit with ZERO users.
+	if len(entry.Items) != 0 {
+		t.Fatalf("F1/#578: refresher Put must NOT eagerly parse; got Items len=%d. "+
+			"If this is populated again the refresher is paying the parse for "+
+			"unread cells, which is the #578 defect.", len(entry.Items))
 	}
-	if entry.ItemsAPIVersion != "widgets.krateo.io/v1" {
-		t.Fatalf("F1: ItemsAPIVersion=%q want widgets.krateo.io/v1", entry.ItemsAPIVersion)
+
+	// THE GUARANTEE, restated: materialisation must yield the SAME parsed
+	// envelope the eager path produced, and must happen AT MOST ONCE.
+	var parses int
+	items, apiVer, kind, ok := entry.EnsureItems(func(raw []byte) ([]*unstructured.Unstructured, string, string, bool) {
+		parses++
+		its, av, k, pOK := restactionsapi.ParseListEnvelopeForRefresh(inputs, raw)
+		return its, av, k, pOK
+	})
+	if !ok {
+		t.Fatalf("F1/#578: EnsureItems reported ok=false for a well-formed LIST envelope")
 	}
-	if entry.ItemsKind != "WidgetList" {
-		t.Fatalf("F1: ItemsKind=%q want WidgetList", entry.ItemsKind)
+	if len(items) != 3 {
+		t.Fatalf("F1/#578: materialised %d items, want 3", len(items))
 	}
+	if apiVer != "widgets.krateo.io/v1" {
+		t.Fatalf("F1/#578: ItemsAPIVersion=%q want widgets.krateo.io/v1", apiVer)
+	}
+	if kind != "WidgetList" {
+		t.Fatalf("F1/#578: ItemsKind=%q want WidgetList", kind)
+	}
+	if parses != 1 {
+		t.Fatalf("F1/#578: first materialisation ran %d parses, want 1", parses)
+	}
+
+	// Ship #97's ACTUAL invariant: no re-parse on subsequent hits.
+	for i := 0; i < 10; i++ {
+		if _, _, _, ok := entry.EnsureItems(func(raw []byte) ([]*unstructured.Unstructured, string, string, bool) {
+			parses++
+			its, av, k, pOK := restactionsapi.ParseListEnvelopeForRefresh(inputs, raw)
+			return its, av, k, pOK
+		}); !ok {
+			t.Fatalf("F1/#578: repeat EnsureItems %d reported ok=false", i)
+		}
+	}
+	if parses != 1 {
+		t.Fatalf("F1/#578: 11 serves ran %d parses, want 1 — this is Ship #97's "+
+			"guarantee (the parse must never be per-hit) and it has regressed", parses)
+	}
+
 	// And per-item metadata must be intact (the gate reads metadata.name +
 	// metadata.namespace via filterListByRBAC on every Get-hit).
-	for i, it := range entry.Items {
+	for i, it := range items {
 		md, _ := it.Object["metadata"].(map[string]any)
 		if md == nil {
-			t.Fatalf("F1: item[%d] missing metadata after refresh-Put", i)
+			t.Fatalf("F1: item[%d] missing metadata after materialisation", i)
 		}
 		if md["name"] == nil || md["namespace"] == nil {
 			t.Fatalf("F1: item[%d] metadata missing name/namespace: %v", i, md)
