@@ -44,6 +44,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/krateo-platformops/snowplow/internal/rbac"
@@ -66,6 +67,16 @@ const (
 	// that incorporates it is deterministic (F-D7b) yet visibly incomplete
 	// (Projection.WildcardGated == true).
 	AnswerWildcardGated
+	// AnswerWildcardAtoms is the #180 projection of a ClassWildcard: the sorted,
+	// deduplicated set of (group, resource) coordinates R actually grants for the
+	// class's verb, each carrying its OWN namespace answer. It REPLACES the gated
+	// sentinel for this class, which is what makes the digest identity-dependent
+	// and therefore trustworthy enough to share a cell — the thing #561 needs.
+	//
+	// AnswerWildcardGated is deliberately KEPT, not removed: projectClass's
+	// `default:` arm still emits it for an unknown class kind, so a future kind
+	// added without a projection is gated rather than silently shared.
+	AnswerWildcardAtoms
 )
 
 // ClassAnswer is R's projected answer to one AccessClass. Its zero value is a
@@ -77,6 +88,13 @@ type ClassAnswer struct {
 	// ClusterPermit is meaningful for AnswerNamespaceSet: true == ⊤ (permitted in
 	// every namespace via a cluster-wide grant). When true, Namespaces is empty.
 	ClusterPermit bool
+	// Atoms is meaningful for AnswerWildcardAtoms only: the granted coordinates,
+	// already sorted and deduplicated by rbac.GrantedAtoms, each with its own
+	// namespace answer. Empty means R grants NOTHING matching the class — which
+	// is a real answer and must stay distinguishable from the gated sentinel,
+	// because "no grants" may share with another identity that also has none,
+	// while "we could not compute it" may share with nobody.
+	Atoms []rbac.GrantedAtom
 	// Namespaces is meaningful for AnswerNamespaceSet when ClusterPermit is false:
 	// the sorted set of namespaces where R permits the per-object check. Always
 	// sorted and deduplicated (map keys are unique) so the encoding is
@@ -100,6 +118,34 @@ func (a ClassAnswer) canonical() string {
 		}
 		// a.Namespaces is already sorted by projectClass.
 		return "a:nsset\x1f" + strings.Join(a.Namespaces, "\x1f")
+	case AnswerWildcardAtoms:
+		// COUNT-PREFIXED and fully delimited. The count is not decoration: without
+		// it, a set of two atoms and a set of one atom whose fields happen to
+		// contain the delimiter would encode alike. Namespaces are length-prefixed
+		// for the same reason — {a,b} and {a-b} must not collide. \x1f cannot
+		// appear in a group, resource or namespace (DNS-label and API-group
+		// grammars exclude it), so the delimiter itself is unambiguous; the counts
+		// defend the STRUCTURE rather than the tokens.
+		var b strings.Builder
+		b.WriteString("a:wildatoms\x1f")
+		b.WriteString(strconv.Itoa(len(a.Atoms)))
+		for _, at := range a.Atoms {
+			b.WriteString("\x1f")
+			b.WriteString(at.Group)
+			b.WriteString("\x1f")
+			b.WriteString(at.Resource)
+			if at.ClusterPermit {
+				b.WriteString("\x1fTOP")
+				continue
+			}
+			b.WriteString("\x1f")
+			b.WriteString(strconv.Itoa(len(at.Namespaces)))
+			for _, ns := range at.Namespaces {
+				b.WriteString("\x1f")
+				b.WriteString(ns)
+			}
+		}
+		return b.String()
 	case AnswerWildcardGated:
 		return "a:wild\x1fGATED"
 	default:
@@ -240,9 +286,28 @@ func projectClass(r *rbac.RequesterProfile, c AccessClass) ClassAnswer {
 		return ClassAnswer{Kind: AnswerNamespaceSet, Namespaces: nss}
 
 	case ClassWildcard:
-		return ClassAnswer{Kind: AnswerWildcardGated}
+		// #180. The two encoding decisions this arm used to refuse to make are
+		// settled, and the reasoning lives on rbac.GrantedAtoms:
+		//   - class "*" COLLECTS every token the rules name (the literal
+		//     match direction under-counts, and under-counting is the UNSAFE
+		//     direction — distinct concrete grants would collide on the empty
+		//     set and false-share);
+		//   - a CONCRETE class field normalises to the class value (owner
+		//     ruling 2026-10-09), so identities whose rules differ in wording
+		//     but not in effect share one cell;
+		//   - a rule-side "*" is preserved as a literal "*" atom, so grant-all
+		//     never collapses into an enumeration of today's concretes.
+		// The namespace answer is carried PER ATOM because the refilter runs
+		// per-object-namespace: the same resource set over the same namespace
+		// union with the mapping swapped is a DIFFERENT access scope.
+		return ClassAnswer{
+			Kind:  AnswerWildcardAtoms,
+			Atoms: rbac.GrantedAtoms(r, c.Verb, c.Group, c.Resource),
+		}
 
 	default:
+		// An unknown class kind stays GATED. This arm is load-bearing: it is why
+		// adding a class without a projection cannot silently become shareable.
 		return ClassAnswer{Kind: AnswerWildcardGated}
 	}
 }

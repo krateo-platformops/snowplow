@@ -98,9 +98,42 @@ func TestFProjGolden_PerClassAnswers(t *testing.T) {
 			want:  ClassAnswer{Kind: AnswerNamespaceSet},
 		},
 		{
-			name:  "wildcard is gated (not a fabricated permit)",
+			// #180 REPLACED THE GATED SENTINEL for this class. The class pins the
+			// RESOURCE ("deployments") and wildcards the GROUP, so per the owner's
+			// normalisation ruling the resource atom is the class value, while the
+			// group is collected from the rule — which here grants "apps".
+			//
+			// The old expectation (AnswerWildcardGated) is the thing that kept
+			// UAF-backed widgets out of L1 entirely: a constant answer is
+			// identity-INDEPENDENT, so the digest could not tell two requesters
+			// apart and the cell could never be shared (#561).
+			name:  "wildcard is projected as granted atoms, not gated (#180)",
 			r:     listDepCluster,
 			class: AccessClass{Kind: ClassWildcard, Verb: "list", Group: AccessWildcard, Resource: "deployments"},
+			want: ClassAnswer{
+				Kind: AnswerWildcardAtoms,
+				Atoms: []rbac.GrantedAtom{
+					{Group: "apps", Resource: "deployments", ClusterPermit: true},
+				},
+			},
+		},
+		{
+			// A requester with NO grants projects an EMPTY atom set — a real
+			// answer, and deliberately distinct from the gated sentinel. "I grant
+			// nothing" may share a cell with another identity that also grants
+			// nothing; "I could not compute it" may share with nobody.
+			name:  "wildcard with no matching grant is an EMPTY atom set, not gated (#180)",
+			r:     empty,
+			class: AccessClass{Kind: ClassWildcard, Verb: "list", Group: AccessWildcard, Resource: "deployments"},
+			want:  ClassAnswer{Kind: AnswerWildcardAtoms},
+		},
+		{
+			// THE GATE STILL EXISTS and this is the population it now guards: a
+			// class kind with no projection. Without this arm, a future kind added
+			// without a projection would become shareable by omission.
+			name:  "an UNKNOWN class kind is still gated (#180 kept the default arm)",
+			r:     listDepCluster,
+			class: AccessClass{Kind: AccessClassKind(250), Verb: "list", Group: "apps", Resource: "deployments"},
 			want:  ClassAnswer{Kind: AnswerWildcardGated},
 		},
 	}
@@ -327,16 +360,51 @@ func TestNotShareableReasons_Tally(t *testing.T) {
 
 // TestProjection_WildcardGatedFlag asserts the projection flags a wildcard cell.
 func TestProjection_WildcardGatedFlag(t *testing.T) {
+	// #180 INVERTED THIS EXPECTATION DELIBERATELY. It used to assert that a
+	// ClassWildcard gates the projection, which was the whole reason a UAF-backed
+	// widget could never be cached (#561): the gated sentinel is a CONSTANT, so
+	// every identity projected the same value and the digest could not be trusted
+	// to keep two requesters apart. projectClass now enumerates R's granted atoms
+	// for that class, so the answer is identity-DEPENDENT and the gate is no
+	// longer needed for it.
+	//
+	// The test's PURPOSE is unchanged — the gate must still exist and still fire —
+	// so the arms below now pin WHAT gates: an unknown class kind does, a
+	// ClassWildcard does not.
 	dWild := domain([]AccessClass{{Kind: ClassWildcard, Verb: "list", Group: AccessWildcard, Resource: "x"}}, nil)
-	if p := ProjectRequesterProfile(clusterProfile(), dWild); !p.WildcardGated {
-		t.Fatalf("expected WildcardGated=true for a domain with a ClassWildcard")
-	} else if DigestTrustworthy(p) {
-		t.Fatalf("DigestTrustworthy must be false for a wildcard-gated projection")
-	} else if !Shareable(dWild) {
-		// The trap the sharing contract guards: a collection-verb wildcard cell is
-		// Shareable(D)==true yet its digest is NOT trustworthy.
-		t.Fatalf("collection-verb wildcard cell expected Shareable(D)==true (contract trap)")
+	pWild := ProjectRequesterProfile(clusterProfile(), dWild)
+	if pWild.WildcardGated {
+		t.Fatalf("#180: a ClassWildcard must NOT gate the projection any more — it is " +
+			"projected as granted atoms, and leaving it gated is what kept UAF-backed " +
+			"widgets out of L1 entirely (#561)")
 	}
+	if !DigestTrustworthy(pWild) {
+		t.Fatalf("#180: a wildcard projection must now be trustworthy; without that the " +
+			"cell still cannot be shared and #561 is unchanged")
+	}
+	if !Shareable(dWild) {
+		t.Fatalf("collection-verb wildcard cell expected Shareable(D)==true")
+	}
+	// The contract trap the original arm guarded is now CLOSED rather than
+	// documented: Shareable(D) and DigestTrustworthy(P) agree for this class.
+	if got, want := DigestTrustworthy(pWild), Shareable(dWild); got != want {
+		t.Fatalf("#180: shareability and digest-trust must agree for a collection-verb "+
+			"wildcard; got trustworthy=%v shareable=%v", got, want)
+	}
+
+	// THE GATE ITSELF MUST STILL FIRE. An unknown class kind has no projection, so
+	// it stays gated — this is why projectClass keeps its `default:` arm, and it is
+	// what stops a future class kind becoming shareable by omission.
+	dUnknown := domain([]AccessClass{{Kind: AccessClassKind(250), Verb: "list", Group: "g", Resource: "r"}}, nil)
+	pUnknown := ProjectRequesterProfile(clusterProfile(), dUnknown)
+	if !pUnknown.WildcardGated {
+		t.Fatalf("an UNKNOWN class kind must still gate the projection — otherwise a class " +
+			"added without a projection becomes shareable silently")
+	}
+	if DigestTrustworthy(pUnknown) {
+		t.Fatalf("DigestTrustworthy must be false for an unknown-class projection")
+	}
+
 	dNoWild := domain([]AccessClass{{Kind: ClassExact, Verb: "list", Group: "", Resource: "x", Name: ""}}, nil)
 	if p := ProjectRequesterProfile(clusterProfile(), dNoWild); p.WildcardGated {
 		t.Fatalf("expected WildcardGated=false for a domain with no ClassWildcard")
