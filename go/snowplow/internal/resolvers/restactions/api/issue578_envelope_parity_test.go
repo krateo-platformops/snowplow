@@ -216,3 +216,53 @@ func TestIssue578_MarshalAsListRaw_SizeIsExact(t *testing.T) {
 		})
 	}
 }
+
+// TestIssue578_MarshalAsListRaw_CeilingIsChecked proves the overflow guard on
+// the size accumulation FIRES, rather than being a comment that asserts safety.
+//
+// CodeQL (go/allocation-size-overflow) flagged the first revision of
+// marshalAsListRaw: the accumulated size feeds a make() capacity, and
+// "each len(r) is already resident in memory so it cannot overflow" is a
+// plausible argument, not a checked bound. The function now returns an error
+// above a ceiling; the caller handles that exactly as it handles any marshal
+// failure — fall through to the live apiserver — so the degenerate case is a
+// correct serve, never a truncated envelope.
+//
+// The ceiling is lowered here instead of allocating 2 GiB. Restored via
+// t.Cleanup so the production value cannot leak into a sibling test.
+func TestIssue578_MarshalAsListRaw_CeilingIsChecked(t *testing.T) {
+	orig := maxListEnvelopeBytes
+	t.Cleanup(func() { maxListEnvelopeBytes = orig })
+
+	item := []byte(`{"kind":"Thing","metadata":{"name":"x"}}`)
+
+	// A ceiling comfortably above the fixed envelope scaffolding but below the
+	// scaffolding plus this item: the per-item arm must reject.
+	maxListEnvelopeBytes = 40
+	if _, err := marshalAsListRaw("v1", "ThingsList", [][]byte{item}); err == nil {
+		t.Fatalf("per-item arm did not reject an envelope over the ceiling")
+	}
+
+	// The separator arm has its own check, so it needs its own assertion: many
+	// EMPTY items push the comma count over the ceiling without any single item
+	// exceeding it.
+	maxListEnvelopeBytes = 40
+	many := make([][]byte, 200)
+	for i := range many {
+		many[i] = []byte(`1`)
+	}
+	if _, err := marshalAsListRaw("v1", "ThingsList", many); err == nil {
+		t.Fatalf("separator arm did not reject an envelope over the ceiling")
+	}
+
+	// And at the production ceiling a normal envelope is unaffected — the guard
+	// must not be a functional change for real lists.
+	maxListEnvelopeBytes = orig
+	got, err := marshalAsListRaw("v1", "ThingsList", [][]byte{item})
+	if err != nil {
+		t.Fatalf("production ceiling rejected a normal envelope: %v", err)
+	}
+	if cap(got) != len(got) {
+		t.Fatalf("guard broke the exact preallocation: len=%d cap=%d", len(got), cap(got))
+	}
+}

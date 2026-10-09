@@ -41,6 +41,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -235,6 +236,17 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 //
 // The returned buffer is freshly allocated and owned by the caller; the input
 // slices are only read (they alias immutable bytesObject arrays).
+// maxListEnvelopeBytes bounds the assembled envelope so the size arithmetic in
+// marshalAsListRaw is a checked bound rather than an assumed one. 2 GiB is far
+// above any real LIST — the largest observed on krateo-057 is the CRD
+// collection at 9.1 MB / 439 items — so this never fires in production; it
+// exists so the make() capacity below cannot be derived from an overflowed sum.
+//
+// A var rather than a const ONLY so TestIssue578_MarshalAsListRaw_CeilingIsChecked
+// can lower it and prove the guard fires without allocating 2 GiB. Production
+// code MUST NOT write it.
+var maxListEnvelopeBytes = 1 << 31
+
 func marshalAsListRaw(apiVersion, listKind string, raws [][]byte) ([]byte, error) {
 	// Marshal the two strings rather than quoting them by hand so that any
 	// character needing escaping is escaped EXACTLY as encoding/json would.
@@ -255,12 +267,28 @@ func marshalAsListRaw(apiVersion, listKind string, raws [][]byte) ([]byte, error
 	)
 
 	// Exact size: no growth reallocation on the hot path.
+	//
+	// The accumulation is CHECKED, not assumed (CodeQL go/allocation-size-overflow
+	// flagged it on the first revision of this function). Every len(r) is the
+	// length of a slice already resident in memory, so the true sum cannot exceed
+	// the address space — but "cannot in practice" is not a bound, and this value
+	// feeds a make() capacity. An envelope that would exceed the ceiling returns
+	// an error, which the caller already handles by falling through to the live
+	// apiserver (dispatchInformerFallthrough + ReasonInformerNotServable) — a
+	// correct, pre-existing path, never a silent truncation.
 	n := len(pfxAPIVersion) + len(av) + len(pfxItems) + len(pfxKind) + len(lk) + len(suffix)
-	for _, r := range raws {
-		n += len(r)
-	}
 	if len(raws) > 1 {
+		if len(raws)-1 > maxListEnvelopeBytes-n {
+			return nil, fmt.Errorf("list envelope separators exceed the %d-byte ceiling (%d items)",
+				maxListEnvelopeBytes, len(raws))
+		}
 		n += len(raws) - 1 // the separating commas
+	}
+	for _, r := range raws {
+		if len(r) > maxListEnvelopeBytes-n {
+			return nil, fmt.Errorf("list envelope exceeds the %d-byte ceiling", maxListEnvelopeBytes)
+		}
+		n += len(r)
 	}
 
 	buf := make([]byte, 0, n)
