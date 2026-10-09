@@ -150,6 +150,19 @@ func saCredentialOnContext(ctx context.Context) bool {
 // the BackgroundResolve conjunct is a scoping refinement (see above) — it does not
 // change which PRODUCTION paths are re-gated.
 func MustRegateSADial(ctx context.Context) bool {
+	// #574 — an IMPERSONATED dial reads as the ctx identity, so the premise of
+	// this gate is gone. The gate exists because an SA dial is BROADER than the
+	// representative; under impersonation the apiserver evaluates exactly that
+	// representative's rights, which is strictly narrower than the SA's (whose
+	// ClusterRole can already list secrets cluster-wide). Leaving the gate armed
+	// here would make the fix a no-op.
+	//
+	// This is deliberately the FIRST conjunct: it must short-circuit before the
+	// SA-credential check, because an impersonating config IS an SA credential
+	// with an Impersonate header and would otherwise satisfy it.
+	if cache.ImpersonatedDialFromContext(ctx) {
+		return false
+	}
 	return cache.BackgroundResolveFromContext(ctx) &&
 		saCredentialOnContext(ctx) &&
 		!ServesUnnarrowed(ctx)

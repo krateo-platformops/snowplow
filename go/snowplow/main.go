@@ -46,9 +46,12 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	authzv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
@@ -511,6 +514,55 @@ func main() {
 			// COMPOSED, never assigned: a bare assignment would silently drop
 			// any wrapper already on the config.
 			rc.WrapTransport = transport.Wrappers(rc.WrapTransport, cache.ReflectorPathWrapper())
+
+			// #574 — probe ONCE whether the apiserver will accept an impersonated
+			// dial from our ServiceAccount, and record it for the refresher.
+			//
+			// WHY A PROBE AND NOT A TRY/FALL-BACK: the RBAC grant ships in the
+			// installer chart while this code ships in snowplow, and they roll
+			// independently. If the code lands first, every impersonated read 403s
+			// and background refresh stops ENTIRELY — strictly worse than the
+			// partial failure it replaces. Probing once makes the rollout order
+			// irrelevant, and the WARN below makes a missing grant LOUD rather than
+			// silently refreshing nothing (the failure mode that let a comparable
+			// bug run for days elsewhere in this platform).
+			//
+			// Only `users` is probed. `groups` is allowlisted by resourceNames in
+			// the ClusterRole, so a SelfSubjectAccessReview for it would answer for
+			// one group name and not for the set; a cohort whose group is not
+			// allowlisted simply 403s at dial and declines exactly as it does today.
+			cache.SetImpersonationAvailable(func() bool {
+				cs, csErr := kubernetes.NewForConfig(rc)
+				if csErr != nil {
+					log.Warn("cache: #574 impersonation probe could not build a clientset; refresher keeps the SA transport",
+						slog.Any("err", csErr))
+					return false
+				}
+				ssar := &authzv1.SelfSubjectAccessReview{
+					Spec: authzv1.SelfSubjectAccessReviewSpec{
+						ResourceAttributes: &authzv1.ResourceAttributes{
+							Verb: "impersonate", Resource: "users",
+						},
+					},
+				}
+				got, ssarErr := cs.AuthorizationV1().SelfSubjectAccessReviews().
+					Create(cacheCtx, ssar, metav1.CreateOptions{})
+				if ssarErr != nil {
+					log.Warn("cache: #574 impersonation probe failed; refresher keeps the SA transport",
+						slog.Any("err", ssarErr))
+					return false
+				}
+				if !got.Status.Allowed {
+					log.Warn("cache: #574 impersonation NOT granted — the refresher keeps dialling as snowplow's ServiceAccount, "+
+						"so background refreshes for a per-user cohort stay re-gated and continue to fail closed",
+						slog.String("needed", "impersonate on users (and allowlisted groups) in snowplow's ClusterRole"),
+						slog.String("effect", "pre-#574 behaviour; this is a MISSING RBAC GRANT, not a code fault"))
+					return false
+				}
+				log.Info("cache: #574 impersonation granted — the refresher reads as each cell's cohort",
+					slog.String("placeholder", cache.CohortPlaceholderUsername))
+				return true
+			}())
 
 			dynCli, dynErr := dynamic.NewForConfig(rc)
 			if dynErr != nil {
