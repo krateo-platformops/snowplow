@@ -52,6 +52,20 @@ import (
 //	phase1_content_prewarm.go — withContentPrewarmSAContext:  ServesUnnarrowed (ServeWatcher / canonical SA).
 //	resolve_populate.go       — the refresher rctx: a per-user REPRESENTATIVE identity (!ServesUnnarrowed),
 //	                            made safe by WithBackgroundResolve (resolveOnceProd:496). THE load-bearing case.
+//	                            THREE calls since #574, not two, and the third is classified DIFFERENTLY:
+//	                              (1)+(2) the pre-#574 SA transport, re-gated as above — still the default
+//	                                      whenever impersonation is unavailable or there is no cohort identity;
+//	                              (3)     an IMPERSONATING copy of the same SA config, attached together with
+//	                                      cache.WithImpersonatedDial and therefore DELIBERATELY EXEMPT from
+//	                                      MustRegateSADial.
+//	                            The exemption is sound because the re-gate's premise is that an SA dial is
+//	                            BROADER than the ctx identity. Under impersonation the apiserver evaluates
+//	                            exactly that identity — strictly NARROWER than snowplow's SA, whose ClusterRole
+//	                            can already list secrets cluster-wide — so there is no breadth to re-gate. The
+//	                            credential is still snowplow's; only the authorisation subject changes.
+//	                            Pinned by TestIssue574_RegateStandsDownOnImpersonatedDial (this package), whose
+//	                            precondition asserts the SAME ctx IS re-gated without the marker, so the arm
+//	                            cannot pass against a gate that never fires.
 //
 // The func DEFINITIONS live in internal/cache/phase1.go and are NOT call sites (they
 // are subtracted below), so cache/phase1.go is deliberately absent.
@@ -60,7 +74,7 @@ var saProducerAllowlist = map[string]int{
 	"handlers/dispatchers/phase1_walk.go":            2,
 	"handlers/dispatchers/phase1_pip_seed.go":        2,
 	"handlers/dispatchers/phase1_content_prewarm.go": 2,
-	"handlers/dispatchers/resolve_populate.go":       2,
+	"handlers/dispatchers/resolve_populate.go":       3, // #574: +1, the impersonating branch (see above)
 }
 
 // countSAProducerCalls returns the number of WithInternalEndpoint( +
