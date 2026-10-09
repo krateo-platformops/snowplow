@@ -92,6 +92,13 @@ func ResetCacheProcessStateForTest() error {
 	ResetRBACSubGenForTest()
 	ResetPendingSubGenBumpsForTest()
 
+	// 5b — #578 lazy LIST-item materialisation counters. Process-global
+	// (EnsureItems is a method on ResolvedEntry, which has no back-pointer to a
+	// store), so a test that asserts on the trio would otherwise read a sibling
+	// test's increments. Composed here rather than exempted because the hook
+	// exists precisely so those assertions are deterministic — #471.
+	ResetLazyItemsStatsForTest()
+
 	// 6 — the publish container, after the incremental rebuild has quiesced.
 	err := WaitRBACRebuildQuiesceForTest(5 * time.Second)
 	PublishRBACSnapshotForTest(nil)

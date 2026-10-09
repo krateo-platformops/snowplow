@@ -41,6 +41,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -205,6 +206,188 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 		"items":      itemList,
 	}
 	return json.Marshal(envelope)
+}
+
+// marshalAsListRaw builds the SAME envelope marshalAsList builds, from
+// per-item JSON the informer indexer already holds — #578.
+//
+// BYTE-IDENTICAL TO marshalAsList, BY CONSTRUCTION. Three properties make that
+// true, and TestIssue578_MarshalAsListRaw_ByteIdenticalToMarshalAsList is the
+// falsifier that keeps them true:
+//
+//  1. KEY ORDER. json.Marshal emits a map's keys in sorted order, so
+//     marshalAsList produces apiVersion, items, kind. This function emits that
+//     same order literally. (Writing them in the "natural" apiVersion/kind/items
+//     order would be semantically identical JSON but NOT byte-identical, and
+//     byte-parity is what makes this change safe to land without re-blessing
+//     every golden.)
+//  2. PER-ITEM BYTES. A bytesObject's `raw` is json.Marshal of the same
+//     Unstructured map that marshalAsList would have marshalled, so each item's
+//     bytes match key-for-key. Integer fidelity survives the comparison because
+//     the decode side uses sigs.k8s.io/json's PreserveInts behaviour rather than
+//     landing every number on float64.
+//  3. STRIPPING. managedFields and the last-applied annotation are removed by
+//     defaultStripUnstructured BEFORE newBytesObject marshals, so the stored
+//     bytes are already in the stripped shape the serve path expects. Nothing is
+//     reintroduced by concatenating them.
+//
+// The empty case still emits `"items":[]` (never null) so a JQ `.items[]`
+// iterator yields an empty stream, matching marshalAsList and the apiserver.
+//
+// The returned buffer is freshly allocated and owned by the caller; the input
+// slices are only read (they alias immutable bytesObject arrays).
+// maxListEnvelopeBytes bounds the assembled envelope so the size arithmetic in
+// marshalAsListRaw is a checked bound rather than an assumed one. 1 GiB is far
+// above any real LIST — the largest observed on krateo-057 is the CRD collection
+// at 9.1 MB / 439 items, so ~110x headroom — and it never fires in production; it
+// exists so the make() capacity below cannot be derived from an overflowed sum.
+//
+// 1<<30 RATHER THAN 1<<31, DELIBERATELY. 1<<31 does not fit in a 32-bit `int`:
+// `var maxListEnvelopeBytes = 1 << 31` fails to COMPILE on GOARCH=386 and
+// GOARCH=arm (verified on both), and any variant that did compile there would
+// hold -2147483648 — making `maxListEnvelopeBytes-n` negative for every n and
+// refusing EVERY list into apiserver fallthrough, which is the exact opposite of
+// what #578 exists to do and would be invisible in the fallthrough counter. A
+// ceiling must be positive on every target the module can be built for. No
+// 32-bit target is built in CI today, so that was latent rather than broken.
+//
+// A var rather than a const ONLY so TestIssue578_MarshalAsListRaw_CeilingIsChecked
+// can lower it and prove EACH ARM of the guard fires without allocating 1 GiB.
+// Production code MUST NOT write it.
+var maxListEnvelopeBytes = 1 << 30
+
+// listEnvelopeTooBig is the single error for every ceiling rejection, so the
+// operator-visible text cannot drift between arms. It reaches the caller's
+// existing `informer_dispatch.list_marshal_failed` WARN, which carries this text
+// — that log line is the detector, because the fallthrough counter records a
+// ceiling rejection under the same ReasonInformerNotServable an unsynced
+// informer uses and so cannot distinguish the two on its own.
+func listEnvelopeTooBig(items int) error {
+	return fmt.Errorf("list envelope exceeds the %d-byte ceiling (%d items)",
+		maxListEnvelopeBytes, items)
+}
+
+func marshalAsListRaw(apiVersion, listKind string, raws [][]byte) ([]byte, error) {
+	// Marshal the two strings rather than quoting them by hand so that any
+	// character needing escaping is escaped EXACTLY as encoding/json would.
+	av, err := json.Marshal(apiVersion)
+	if err != nil {
+		return nil, err
+	}
+	lk, err := json.Marshal(listKind)
+	if err != nil {
+		return nil, err
+	}
+
+	const (
+		pfxAPIVersion = `{"apiVersion":`
+		pfxItems      = `,"items":[`
+		pfxKind       = `],"kind":`
+		suffix        = `}`
+	)
+
+	// Exact size: no growth reallocation on the hot path.
+	//
+	// The accumulation is CHECKED, not assumed (CodeQL go/allocation-size-overflow
+	// flagged it on the first revision of this function). Every len(r) is the
+	// length of a slice already resident in memory, so the true sum cannot exceed
+	// the address space — but "cannot in practice" is not a bound, and this value
+	// feeds a make() capacity. An envelope that would exceed the ceiling returns
+	// an error, which the caller already handles by falling through to the live
+	// apiserver (dispatchInformerFallthrough + ReasonInformerNotServable) — a
+	// correct, pre-existing path, never a silent truncation.
+	// Exact size: no growth reallocation on the hot path.
+	//
+	// CHECKED, NOT ASSUMED. CodeQL go/allocation-size-overflow flagged this twice:
+	// once with no guard at all, then again with a guard that bounded only the
+	// per-item and separator arms and left the header sum
+	// `len(pfxAPIVersion) + len(av) + len(pfxItems) + len(pfxKind) + len(lk)`
+	// unchecked. `av` and `lk` are json.Marshal output of the apiVersion and the
+	// kind, so their lengths are inputs too — a non-constant string is a
+	// "potentially large value" to that query, which is why it reported two
+	// sources on one expression. A bound that skips a term is not a bound.
+	//
+	// THE SHAPE MATTERS AS MUCH AS THE ARITHMETIC, because it is what makes the
+	// bound legible to the analysis rather than merely true:
+	//
+	//   - each check puts `len(x)` on the SMALLER side of the comparison, the
+	//     form the query recognises as a length check, which sanitizes `av` and
+	//     `lk` themselves on the fall-through;
+	//   - accumulation is `+=`, so the running total is never a bare `a + b`
+	//     expression that the sink detector would treat as overflow-prone;
+	//   - the final `if n > maxListEnvelopeBytes` sits IMMEDIATELY before the
+	//     allocation with NO write to `n` in between, so it provably dominates
+	//     the make() and applies to the same value the make() reads. The query's
+	//     own test suite marks a size that is modified AFTER its upper-bound
+	//     check as still alerting, because the barrier is SSA identity and not
+	//     value reasoning.
+	//
+	// DO NOT ROUTE THESE CHECKS THROUGH A HELPER CLOSURE. An earlier revision did,
+	// and it silenced the alert only by removing every `+` EXPRESSION from the
+	// function — a blind spot in the sink detector, not a sanitizer. A func
+	// literal is its own control-flow region, so a bound proved inside one is
+	// invisible at the allocation site.
+	//
+	// Every addend is the length of a string or slice already resident in memory,
+	// hence >= 0, and each is compared against the REMAINING budget before being
+	// added — so `0 <= n <= maxListEnvelopeBytes` holds on entry to every guard,
+	// which is the precondition that makes `maxListEnvelopeBytes-n` safe.
+	//
+	// An envelope over the ceiling returns an error, which the caller already
+	// handles by falling through to the live apiserver — a correct, pre-existing
+	// path, never a silent truncation.
+	const scaffolding = len(pfxAPIVersion) + len(pfxItems) + len(pfxKind) + len(suffix)
+
+	// Keeps the invariant literally true when a TEST has lowered the ceiling
+	// below the fixed scaffolding. Without it the first guard still refuses (the
+	// remaining budget goes negative, so every addend is rejected), but `n` would
+	// transiently sit above the ceiling.
+	if scaffolding > maxListEnvelopeBytes {
+		return nil, listEnvelopeTooBig(len(raws))
+	}
+	n := scaffolding
+	if len(av) > maxListEnvelopeBytes-n {
+		return nil, listEnvelopeTooBig(len(raws))
+	}
+	n += len(av)
+	if len(lk) > maxListEnvelopeBytes-n {
+		return nil, listEnvelopeTooBig(len(raws))
+	}
+	n += len(lk)
+	if len(raws) > 1 {
+		if len(raws)-1 > maxListEnvelopeBytes-n { // the separating commas
+			return nil, listEnvelopeTooBig(len(raws))
+		}
+		n += len(raws) - 1
+	}
+	for _, r := range raws {
+		if len(r) > maxListEnvelopeBytes-n {
+			return nil, listEnvelopeTooBig(len(raws))
+		}
+		n += len(r)
+	}
+
+	// The bound the ALLOCATION itself reads. Implied by the per-addend checks
+	// above, and stated here because a capacity must be bounded at the point of
+	// allocation, by a check nothing writes to `n` after.
+	if n > maxListEnvelopeBytes {
+		return nil, listEnvelopeTooBig(len(raws))
+	}
+
+	buf := make([]byte, 0, n)
+	buf = append(buf, pfxAPIVersion...)
+	buf = append(buf, av...)
+	buf = append(buf, pfxItems...)
+	for i, r := range raws {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, r...)
+	}
+	buf = append(buf, pfxKind...)
+	buf = append(buf, lk...)
+	buf = append(buf, suffix...)
+	return buf, nil
 }
 
 // dispatchViaInformer attempts to serve `call` from the informer cache.
@@ -475,6 +658,64 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		// A genuinely-empty-but-synced informer still returns
 		// `servable=true` with an empty slice — that is a real answer
 		// the watcher can vouch for.
+		// #578 — ZERO-DECODE ENVELOPE for the identity-free content
+		// substrate. When this resolve is an api-stage CONTENT resolve the
+		// inline RBAC gate is SKIPPED by design (see the Ship F1 note
+		// below): the entry must store UN-GATED content, so nothing on
+		// this path reads a per-item field. That makes the decoded
+		// map trees pure waste — the envelope is a concatenation of the
+		// per-item JSON the indexer already holds.
+		//
+		// This is a structural discriminant, not a resource carve-out
+		// (feedback_no_special_cases): the predicate is "does this call
+		// need per-item access?", answered by the SAME
+		// ApistageContentResolveFromContext that already decides whether
+		// the gate runs. Every other caller keeps the decoded path below,
+		// unchanged, because filterListByRBAC genuinely reads
+		// it.GetNamespace() per item.
+		//
+		// Measured motivation (krateo-057, portal IDLE 38 min, so this is
+		// refresher cost not serve cost): bytesObject.Decode 28.0% and
+		// parseListEnvelope 27.6% of a 30s CPU profile, 568 MB/s of
+		// allocation, pod pinned at 98.75% of a 4-CPU limit with ZERO
+		// users. #578.
+		if cache.ApistageContentResolveFromContext(ctx) {
+			raws, servable := rw.ListRawServable(gvr, namespace)
+			if !servable {
+				log.Debug("informer_dispatch.fallthrough.list_not_servable",
+					slog.String("gvr", gvr.String()),
+					slog.String("ns", namespace),
+					slog.String("path", call.Path),
+					slog.String("shape", "raw"),
+				)
+				dispatchInformerFallthrough.Add(1)
+				cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
+				return nil, false
+			}
+			raw, err := marshalAsListRaw(apiVersion, listKindForResource(gvr.Resource), raws)
+			if err != nil {
+				log.Warn("informer_dispatch.list_marshal_failed",
+					slog.String("gvr", gvr.String()),
+					slog.String("ns", namespace),
+					slog.String("shape", "raw"),
+					slog.Any("err", err),
+				)
+				dispatchInformerFallthrough.Add(1)
+				cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
+				return nil, false
+			}
+			log.Debug("informer_dispatch.list_served",
+				slog.String("gvr", gvr.String()),
+				slog.String("ns", namespace),
+				slog.String("shape", "raw"),
+				slog.Int("items", len(raws)),
+				slog.Int("bytes", len(raw)),
+			)
+			dispatchInformerListServed.Add(1)
+			dispatchInformerListServedRaw.Add(1)
+			return raw, true
+		}
+
 		items, servable := rw.ListObjectsServable(gvr, namespace)
 		if !servable {
 			log.Debug("informer_dispatch.fallthrough.list_not_servable",

@@ -33,6 +33,20 @@ var (
 	// dispatchInformerListServed counts LIST calls answered from the
 	// informer indexer (marshalled into the apiserver LIST envelope).
 	dispatchInformerListServed atomic.Uint64
+	// dispatchInformerListServedRaw counts the SUBSET of
+	// dispatchInformerListServed that took the #578 zero-decode path —
+	// the envelope assembled by concatenating the per-item JSON the
+	// indexer already holds, with no decode and no re-marshal.
+	//
+	// READ IT AS A RATIO, NEVER ALONE. On its own a zero is ambiguous: it
+	// reads the same whether the path is broken or simply never eligible
+	// (no api-stage content resolve has run yet). Against ListServed it is
+	// a real detector — raw/ListServed is the share of LIST serves that
+	// stopped paying the decode -> marshal -> parse round trip, and on a
+	// pod doing refresher work that share collapsing toward 0 means the
+	// eligibility predicate regressed (feedback_a_counter_whose_zero_
+	// reads_as_health_is_not_a_detector).
+	dispatchInformerListServedRaw atomic.Uint64
 	// dispatchInformerGetServed counts GET-by-name calls answered from
 	// the informer indexer.
 	dispatchInformerGetServed atomic.Uint64
@@ -61,6 +75,7 @@ var (
 // aggregation. Exported so tests can assert increments deterministically.
 type DispatchInformerStats struct {
 	ListServed     uint64
+	ListServedRaw  uint64
 	GetServed      uint64
 	Fallthrough    uint64
 	RBACDropped    uint64
@@ -71,6 +86,7 @@ type DispatchInformerStats struct {
 func DispatchInformerStatsSnapshot() DispatchInformerStats {
 	return DispatchInformerStats{
 		ListServed:     dispatchInformerListServed.Load(),
+		ListServedRaw:  dispatchInformerListServedRaw.Load(),
 		GetServed:      dispatchInformerGetServed.Load(),
 		Fallthrough:    dispatchInformerFallthrough.Load(),
 		RBACDropped:    dispatchInformerRBACDropped.Load(),

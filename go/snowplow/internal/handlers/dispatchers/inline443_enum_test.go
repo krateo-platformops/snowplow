@@ -155,6 +155,18 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ResourceWatcher.GetObject": readOnly443, "ResourceWatcher.IsMetadataOnly": readOnly443,
 	"ResourceWatcher.IsPassthrough": readOnly443, "ResourceWatcher.IsServable": readOnly443,
 	"ResourceWatcher.IsSynced": readOnly443, "ResourceWatcher.ListObjectsServable": readOnly443,
+	// #578 — the zero-decode twin of ListObjectsServable: the SAME four-conjunct
+	// servability gate, the same indexer partition, returning the per-item JSON
+	// the indexer already holds instead of decoded maps. Identical class to the
+	// method it mirrors.
+	"ResourceWatcher.ListRawServable": readOnly443,
+	// #578 — memoises a PURE FUNCTION of the entry's own RawJSON (the parsed LIST
+	// items) onto the entry, plus three process counters. It touches NO cache,
+	// informer, dep or refresher state: it cannot resurrect, create, register or
+	// evict anything, and it never changes what a Get returns — only whether the
+	// items had to be re-derived. Classified read-only on that basis; if a future
+	// edit gives it a real side effect this classification must change with it.
+	"ResolvedEntry.EnsureItems":                readOnly443,
 	"ResourceWatcher.ListServableEnvelopeJSON": readOnly443, "ResourceWatcher.ServabilitySnapshotFor": readOnly443,
 	"ResourceWatcher.Snapshot": readOnly443, "ResourceWatcher.WaitForGVRSync": readOnly443,
 	"SecretsCacheNamespace": readOnly443, "SecretsCacheServable": readOnly443, "SecretsSnapshotLoad": readOnly443,

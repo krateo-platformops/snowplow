@@ -287,6 +287,33 @@ type ResolvedEntry struct {
 	ItemsAPIVersion string
 	ItemsKind       string
 
+	// itemsLazy is the #578 LAZY form of the three fields above: the same
+	// pre-parsed envelope, materialised on FIRST SERVE instead of at Put.
+	//
+	// WHY THE TIMING MOVED AGAIN. R3 moved the parse from per-Get-hit to
+	// per-Put because Puts << Gets in steady state. That premise does not
+	// hold for a cell the refresher keeps rebuilding: measured on krateo-057
+	// with the portal IDLE for 38 minutes, every one of 3,876 entries had
+	// lastRead 2,300-2,500s while the refresher completed 33.7 refreshes/s —
+	// so the per-Put parse ran continuously for cells NOBODY read, and
+	// parseListEnvelope was 27.6% of a 30s CPU profile on a pod pinned at
+	// 98.75% of its CPU limit with zero users.
+	//
+	// Lazy is never worse than either placement: nothing is parsed while a
+	// cell goes unread, and a read pays exactly one parse per refresh
+	// generation (the field is only ever written on a fresh entry, so a
+	// rebuilt cell starts empty again and re-materialises on demand).
+	//
+	// ATOMIC POINTER, NOT A MUTEX OR sync.Once. Reads are lock-free on the
+	// serve path. A concurrent double-parse is harmless and deliberately
+	// tolerated: each racer strips and builds its OWN private maps, the CAS
+	// publishes exactly one of them, and EnsureItems returns the PUBLISHED
+	// value to every caller — so the maps every serve aliases are the same
+	// maps, and the loser's trees are simply dropped. That preserves the
+	// invariant the eager path depends on (stripManagedFields runs while the
+	// map is still private, never on a map already aliased by a serve).
+	itemsLazy atomic.Pointer[lazyListItems]
+
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a (commit subsequent to
 	// 1d93d02): the previous `CohortGates atomic.Pointer[CohortGateMemoStore]`
 	// field — Ship GMC / 0.30.174's per-(content-entry × cohort) memo of
@@ -2311,6 +2338,31 @@ type ResolvedCacheStats struct {
 	// defect the pass is catching, zero if the pass is dead.
 	ProactiveRefreshTotal uint64
 
+	// #578 — LAZY LIST-ITEM MATERIALISATION. The apistage LIST content entry's
+	// pre-parsed items are now built on FIRST SERVE (ResolvedEntry.EnsureItems)
+	// rather than at every refresher Put. These three are the falsifier that the
+	// move actually removed work instead of relocating it.
+	//
+	// READ THEM AS A TRIO, NEVER INDIVIDUALLY:
+	//   - Parsed is the real cost. It should track the number of cells READ per
+	//     refresh generation, NOT the refresh rate. Parsed rising in lockstep
+	//     with refresher completions means the lazy memo is buying nothing
+	//     (cells are being rebuilt as fast as they are read).
+	//   - Served is the memo hit — the steady state. Served/Parsed is the
+	//     reads-per-generation ratio, and the whole point of #578 is that it
+	//     exceeds 1.
+	//   - Eager counts entries that still arrived with Put-time Items: the
+	//     customer-facing miss path (which parses because that requester needs
+	//     the gate) and, during a rollout, entries written by a pre-#578 binary.
+	//     A pod whose Eager never falls to the miss rate after a full cache
+	//     generation is still running the old Put path somewhere.
+	//
+	// All three at 0 means no apistage LIST content cell has been served yet —
+	// ambiguous on its own, which is exactly why they publish together.
+	LazyItemsParsedTotal uint64
+	LazyItemsServedTotal uint64
+	LazyItemsEagerTotal  uint64
+
 	// #354 P3 — customer stale serves (C) and the B3 key-shape gauges (E).
 	StaleServedTotal    uint64
 	StaleServedAgeMSMax int64
@@ -2390,6 +2442,9 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		RemintDeadlineEnqueuedTotal:  c.remintDeadlineEnqueuedTotal.Load(),
 		WarmInLeadWindow:             c.warmInLeadWindowGauge.Load(),
 		ProactiveRefreshTotal:        c.proactiveRefreshTotal.Load(),
+		LazyItemsParsedTotal:         lazyItemsParsedTotal.Load(),
+		LazyItemsServedTotal:         lazyItemsServedTotal.Load(),
+		LazyItemsEagerTotal:          lazyItemsEagerTotal.Load(),
 		ApistageStoreTotal:           c.apistageStoreTotal.Load(),
 		ApistageEvictTotal:           c.apistageEvictTotal.Load(),
 		WidgetContentStoreTotal:      c.widgetContentStoreTotal.Load(),
