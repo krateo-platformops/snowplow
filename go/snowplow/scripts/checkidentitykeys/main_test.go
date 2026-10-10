@@ -37,7 +37,22 @@ func TestGate_FlagsRedFixture(t *testing.T) {
 		"R2 internal/app/sites.go:108": "address of an IdentityClass field",
 		"R3 internal/app/sites.go:113": "a second class derivation",
 		"R4 internal/app/sites.go:76":  "reuse key without the class (#432 shape)",
-		"R5 internal/cache/key.go:66":  "unregistered store",
+		"R5 internal/cache/key.go:73":  "unregistered store",
+
+		// #180 — the SECOND dimension category. A scope dimension is a function of
+		// (requester, access domain), so it cannot come from IdentityClassOf and
+		// gets its own branch, writer and derivation. S0/S2/S3 are the analogues
+		// of R0/R2/R3, and these are one site per rule.
+		"S0 internal/cache/key.go:90":  "a scope derivation that cannot see the access domain",
+		"S2 internal/app/sites.go:119": "scope dimension assigned directly",
+		"S2 internal/app/sites.go:125": "scope dimension set in a literal",
+		"S3 internal/app/sites.go:131": "a second scope derivation",
+		// The two scope fixtures are ALSO R1 violations and that is correct, not a
+		// false positive: class "widgets" is identity-bound, so those sites owe an
+		// identity as well as a scope. Asserting them keeps the exact-count arm
+		// honest instead of loosening it.
+		"R1 internal/app/sites.go:120": "scope fixture also hashes identity-bound inputs with no class",
+		"R1 internal/app/sites.go:126": "scope fixture also hashes identity-bound inputs with no class",
 	}
 	for site, what := range mustFlag {
 		if !strings.Contains(s, site+":") {
@@ -49,14 +64,17 @@ func TestGate_FlagsRedFixture(t *testing.T) {
 	// must not be flagged.
 	flagged := 0
 	for _, line := range strings.Split(s, "\n") {
-		if !strings.HasPrefix(line, "R") {
+		// #180 added a SECOND rule family (S*). Counting only "R" would make the
+		// exact-count arm silently blind to every scope finding — the arm would
+		// still pass while proving nothing about the new category.
+		if !strings.HasPrefix(line, "R") && !strings.HasPrefix(line, "S") {
 			continue
 		}
 		flagged++
 		if strings.HasPrefix(line, "R0") {
 			t.Errorf("checker FALSE-flagged an intact source of truth: %s", line)
 		}
-		if n := lineNo(line); n >= 10 && n <= 37 {
+		if n := lineNo(line); n >= 10 && n <= 37 && !strings.Contains(line, "key.go") {
 			t.Errorf("checker FALSE-flagged a well-formed site: %s", line)
 		}
 	}
