@@ -74,7 +74,31 @@ const (
 	computeKey    = "ComputeKey"
 	setIdentity   = "SetIdentity"
 	classOf       = "IdentityClassOf"
+
+	// #180 Phase B — the SECOND dimension category. An identity dimension is a
+	// function of the REQUESTER ALONE, which is why rbac.IdentityClassOf takes
+	// only a jwtutil.UserInfo and why R3 can demand one derivation. A UAF-scope
+	// digest is not: it is a function of (requester, access domain), and the
+	// domain comes from the CR/apiRef chain. It therefore cannot be produced by
+	// IdentityClassOf, and folding it in the identity branch would auto-register
+	// it as an identity dimension (r0 discovers dims from whatever that branch
+	// reads) and then fail R0 because SetIdentity cannot write it.
+	//
+	// So it gets its own branch, its own single writer and its own single
+	// derivation, and S0/S2/S3 below are the exact analogues of R0/R2/R3. The
+	// guard's property is unchanged — every key ingredient has exactly one
+	// source — it is now enforced PER CATEGORY instead of assuming one category
+	// exists.
+	scopeFreePredicate = "IsScopeKeyedClass"
+	scopeType          = "ScopeClass"
+	setScope           = "SetScope"
+	scopeOf            = "ScopeClassOf"
 )
+
+// scopeSources are the scope dimensions' sources of truth. Only ScopeClassOf may
+// call them — the same single-derivation rule classSources gets, for the same
+// reason: a second reader is a second derivation that can drift.
+var scopeSources = []string{"ComputeProjectionDigest"}
 
 // classSources are the class dimensions' sources of truth. Only
 // IdentityClassOf may call them.
@@ -168,6 +192,7 @@ type gate struct {
 	funcs    []*fnInfo
 	byName   map[string][]*fnInfo // free functions and methods by simple name
 	dims     map[string]bool
+	scope    map[string]bool // #180: the SECOND category — (requester, domain) dimensions
 	free     map[string]bool
 	out      []finding
 	builders map[string]bool // functions returning ResolvedKeyInputs that (transitively) call SetIdentity
@@ -195,7 +220,8 @@ func main() {
 }
 
 func load(root string) (*gate, error) {
-	g := &gate{fset: token.NewFileSet(), root: root, byName: map[string][]*fnInfo{}, dims: map[string]bool{}, free: map[string]bool{}, builders: map[string]bool{}}
+	g := &gate{fset: token.NewFileSet(), root: root, byName: map[string][]*fnInfo{}, dims: map[string]bool{},
+		scope: map[string]bool{}, free: map[string]bool{}, builders: map[string]bool{}}
 	err := filepath.Walk(filepath.Join(root, "internal"), func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -254,6 +280,15 @@ func (g *gate) run() {
 	g.r3()
 	g.r4()
 	g.r5()
+	// #180: the scope category is OPTIONAL. Before Phase B lands there is no
+	// scope branch in ComputeKey, g.scope is empty, and these are no-ops — so
+	// this change is inert on today's tree and cannot produce a finding until
+	// the dimension actually exists.
+	if len(g.scope) > 0 {
+		g.s0()
+		g.s2()
+		g.s3()
+	}
 	sort.Slice(g.out, func(i, j int) bool {
 		if g.out[i].rule != g.out[j].rule {
 			return g.out[i].rule < g.out[j].rule
@@ -315,12 +350,38 @@ func (g *gate) r0() {
 		if !ok || !mentions(is.Cond, "CacheEntryClass") {
 			return true
 		}
+		// #180: the SCOPE branch also switches on CacheEntryClass, so it would
+		// otherwise be read as a malformed identity branch — flagged for not
+		// testing IsIdentityFreeClass, and its dimension collected into the
+		// IDENTITY set, which is precisely the conflation this category exists to
+		// avoid. The two branches must be disjoint, and the scope predicate is
+		// what tells them apart.
+		if findCall(is.Cond, scopeFreePredicate) != nil {
+			return true
+		}
 		if findCall(is.Cond, "IsIdentityFreeClass") == nil {
 			g.add(is.Pos(), "R0", "ComputeKey's identity branch must test IsIdentityFreeClass (the single identity-free class list), not a literal class")
 		}
 		ast.Inspect(is.Body, func(m ast.Node) bool {
 			if se, ok := m.(*ast.SelectorExpr); ok && identName(se.X) == param {
 				g.dims[se.Sel.Name] = true
+			}
+			return true
+		})
+		return false
+	})
+	// #180 — the SECOND branch, discovered the same way: whatever ComputeKey
+	// reads inside a branch testing the scope predicate is a scope dimension.
+	// Auto-discovery is deliberate and is the whole reason this works: a
+	// dimension cannot be added to the key without the auditor noticing it.
+	ast.Inspect(ck.decl.Body, func(n ast.Node) bool {
+		is, ok := n.(*ast.IfStmt)
+		if !ok || findCall(is.Cond, scopeFreePredicate) == nil {
+			return true
+		}
+		ast.Inspect(is.Body, func(m ast.Node) bool {
+			if se, ok := m.(*ast.SelectorExpr); ok && identName(se.X) == param {
+				g.scope[se.Sel.Name] = true
 			}
 			return true
 		})
@@ -1028,4 +1089,156 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #180 Phase B — the SCOPE dimension category.
+//
+// S0/S2/S3 are the exact analogues of R0/R2/R3 for a dimension that is a
+// function of (requester, access domain) rather than of the requester alone.
+// There is deliberately no S1 or S4: R1 already proves every identity-bound
+// ComputeKey call goes through SetIdentity, and a scope dimension rides the same
+// ResolvedKeyInputs through the same mint sites, so R1's coverage is unchanged.
+// R4's reuse keys do not carry a scope.
+//
+// WHY A SECOND CATEGORY RATHER THAN A WIDER FIRST ONE. rbac.IdentityClassOf
+// takes a jwtutil.UserInfo and nothing else, and three of its five production
+// callers construct that UserInfo from a bare username + groups
+// (learned_identity_seed, apiref/resolve, identity_class_guard) — they have no
+// access domain in hand at all. Widening its signature would force those callers
+// to supply something they structurally do not have, which is where the next
+// instance of the #423/#432/#435 bug would come from: in the plumbing of the
+// guard meant to prevent it.
+// ─────────────────────────────────────────────────────────────────────────
+
+// s0 asserts the scope category's sources of truth are intact, mirroring r0:
+// SetScope writes every scope dimension ComputeKey folds, and ScopeClassOf
+// derives them from the declared sources.
+func (g *gate) s0() {
+	var ss, sco *fnInfo
+	for _, fi := range g.funcs {
+		switch {
+		case fi.name == setScope && fi.recvType == keyInputsType:
+			ss = fi
+		case fi.name == scopeOf:
+			sco = fi
+		}
+	}
+
+	if ss == nil {
+		g.add(token.NoPos, "S0", "ComputeKey folds scope dimensions %v but ResolvedKeyInputs.%s (the single scope writer) does not exist", sorted(g.scope), setScope)
+		return
+	}
+	wrote := map[string]bool{}
+	ast.Inspect(ss.decl.Body, func(n ast.Node) bool {
+		if as, ok := n.(*ast.AssignStmt); ok {
+			for _, l := range as.Lhs {
+				if se, ok := l.(*ast.SelectorExpr); ok {
+					wrote[se.Sel.Name] = true
+				}
+			}
+		}
+		return true
+	})
+	for _, d := range sorted(g.scope) {
+		if !wrote[d] {
+			g.add(ss.decl.Pos(), "S0", "%s does not write scope dimension %s that ComputeKey folds", setScope, d)
+		}
+	}
+
+	if sco == nil {
+		g.add(token.NoPos, "S0", "%s (the single scope derivation) not found", scopeOf)
+		return
+	}
+	// The derivation must take BOTH inputs. A one-argument ScopeClassOf is the
+	// shape that cannot see the access domain, and it is exactly the mistake
+	// this category exists to make impossible — so it is checked, not assumed.
+	if n := countParams(sco.decl); n < 2 {
+		g.add(sco.decl.Pos(), "S0", "%s takes %d parameter(s); a scope is a function of (requester, access domain) and a derivation that cannot see the domain can only fabricate one", scopeOf, n)
+	}
+	for _, src := range scopeSources {
+		if findCall(sco.decl.Body, src) == nil {
+			g.add(sco.decl.Pos(), "S0", "%s must derive the scope via %s", scopeOf, src)
+		}
+	}
+}
+
+// s2 is r2 for the scope category: nothing but SetScope writes a scope
+// dimension, and nothing outside the owning packages edits a ScopeClass between
+// its derivation and that write.
+func (g *gate) s2() {
+	for _, fi := range g.funcs {
+		if fi.name == setScope || strings.HasSuffix(fi.name, "ForTest") {
+			continue
+		}
+		ast.Inspect(fi.decl.Body, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.AssignStmt:
+				for _, l := range x.Lhs {
+					g.s2Write(fi, l, x.Pos())
+				}
+			case *ast.CompositeLit:
+				// A scope dimension set in a ResolvedKeyInputs literal bypasses
+				// the writer exactly as an identity dimension would.
+				if typeName(x.Type) == keyInputsType {
+					for _, e := range x.Elts {
+						if kv, ok := e.(*ast.KeyValueExpr); ok && g.scope[identName(kv.Key)] {
+							g.add(kv.Pos(), "S2", "%s sets scope dimension %s in a %s literal; only %s may write it", fi.name, identName(kv.Key), keyInputsType, setScope)
+						}
+					}
+				}
+			case *ast.UnaryExpr:
+				// &in.UAFScopeDigest is an unchecked writer, same as for identity.
+				if x.Op == token.AND {
+					if se, ok := x.X.(*ast.SelectorExpr); ok && g.scope[se.Sel.Name] && g.isKeyInputs(fi, se.X) {
+						g.add(x.Pos(), "S2", "%s takes the address of scope dimension %s; a pointer to it is an unchecked writer", fi.name, se.Sel.Name)
+					}
+				}
+			}
+			return true
+		})
+	}
+}
+
+func (g *gate) s2Write(fi *fnInfo, lhs ast.Expr, pos token.Pos) {
+	se, ok := lhs.(*ast.SelectorExpr)
+	if !ok || !g.scope[se.Sel.Name] {
+		return
+	}
+	if g.isKeyInputs(fi, se.X) {
+		g.add(pos, "S2", "%s assigns scope dimension %s directly; only %s may write it", fi.name, se.Sel.Name, setScope)
+	}
+}
+
+// s3 is r3 for the scope category: the scope sources are read ONLY by
+// ScopeClassOf. A second reader is a second derivation that can drift from the
+// first — the failure mode that produced #435 on the identity side.
+func (g *gate) s3() {
+	for _, fi := range g.funcs {
+		if fi.name == scopeOf || strings.HasSuffix(fi.name, "ForTest") {
+			continue
+		}
+		for _, src := range scopeSources {
+			if c := findCall(fi.decl.Body, src); c != nil {
+				g.add(c.Pos(), "S3", "%s derives a scope itself (%s); only %s may — call it instead", fi.name, src, scopeOf)
+			}
+		}
+	}
+}
+
+// countParams counts a declaration's parameters, flattening grouped names
+// (`func f(a, b string)` is two).
+func countParams(fd *ast.FuncDecl) int {
+	if fd.Type.Params == nil {
+		return 0
+	}
+	n := 0
+	for _, f := range fd.Type.Params.List {
+		if len(f.Names) == 0 {
+			n++ // unnamed parameter
+			continue
+		}
+		n += len(f.Names)
+	}
+	return n
 }

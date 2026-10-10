@@ -112,3 +112,21 @@ func badClassAddressOf(ui rbac.UserInfo) *string {
 func badOwnClass(ui rbac.UserInfo) string {
 	return rbac.SubjectBindingSetDigest(ui.Username, ui.Groups) // BAD-R3-own
 }
+
+// BAD (S2): assigns a scope dimension directly; only SetScope may write it.
+func badScopeDirect(name string) string {
+	in := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: name}
+	in.UAFScopeDigest = "forged"
+	return cache.ComputeKey(in)
+}
+
+// BAD (S2): sets a scope dimension in a ResolvedKeyInputs literal.
+func badScopeLiteral(name string) string {
+	in := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: name, UAFScopeDigest: "forged"}
+	return cache.ComputeKey(in)
+}
+
+// BAD (S3): a second scope derivation; only ScopeClassOf may read the sources.
+func badScopeDerivation(profile, domain any) string {
+	return cache.ComputeProjectionDigest(profile, domain)
+}
