@@ -32,3 +32,6 @@ experiments/**
 **/token.txt
 **/*.crt
 **/*.key
+
+# Compiled auditor binary (go build output, not an artifact we ship)
+/go/snowplow/checkidentitykeys
