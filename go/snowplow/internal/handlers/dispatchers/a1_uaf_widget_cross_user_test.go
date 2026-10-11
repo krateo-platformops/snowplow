@@ -186,33 +186,72 @@ func TestR2_UAFCrossUser_WidgetNoSharedCellServe(t *testing.T) {
 			"correctly-narrowed widgetData, not merely denied alice's. body: %s", a1TenantB, bobRec.Body.String())
 	}
 
-	// --- The mechanism: the shared widgets cell was never written. ----------
-	if entry, ok := handle.Get(aliceKey); ok {
-		t.Fatalf("R-1: the shared widgets cell must stay EMPTY when the resolve ran a userAccessFilter refilter; "+
-			"found %q under %q", entry.RawJSON, aliceKey)
+	// --- The mechanism: SEPARATION, not absence. #561. ----------------------
+	//
+	// The widgets class is identity-BOUND, so #561 stopped declining its Put.
+	// The acceptance assertions above are untouched and still pass; what this
+	// half asserts changed from "nothing was cached" to "they do not share a
+	// cell, and each holds its own narrowing".
+	//
+	// THIS IS THE HOT CARRIER (66 widgets apiRef a UAF RA; 298,064 hits vs 365
+	// misses over 5d7h), so it is also the arm that matters most.
+	if aliceKey == bobKey {
+		t.Fatalf("R-1: alice and bob must derive DIFFERENT widgets keys — that separation is what makes caching "+
+			"a UAF-narrowed widgetData safe. Both derived %q.", aliceKey)
 	}
-	if got := cache.WidgetsUAFPutDeclined(); got != 2 {
-		t.Fatalf("R-1: both widget dispatches must have declined their Put through the widgets-class gate; "+
-			"snowplow_widgets_uaf_put_declined_total=%d, want 2", got)
+	aliceEntry, aliceCached := handle.Get(aliceKey)
+	if !aliceCached {
+		t.Fatalf("R-1: alice's own widgets cell must now be POPULATED under %q — an empty cell means the decline "+
+			"is still firing for an identity-bound class.", aliceKey)
+	}
+	if !bytes.Contains(aliceEntry.RawJSON, []byte(a1TenantA)) || bytes.Contains(aliceEntry.RawJSON, []byte(a1TenantB)) {
+		t.Fatalf("R-1: alice's widgets cell must hold HER narrowing (%s and not %s); got %q",
+			a1TenantA, a1TenantB, aliceEntry.RawJSON)
+	}
+	if bobEntry, ok := handle.Get(bobKey); ok && bytes.Contains(bobEntry.RawJSON, []byte(a1TenantA)) {
+		t.Fatalf("R-1 CROSS-TENANT LEAK AT REST: bob's widgets cell under %q holds %q, which his own RBAC denies; "+
+			"body %q", bobKey, a1TenantA, bobEntry.RawJSON)
+	}
+	// The short UAF cap must be stamped on a cell that now holds per-requester
+	// narrowed rows — without it this cell silently inherits the full TTL.
+	if aliceEntry.Inputs == nil || !aliceEntry.Inputs.HasUAF {
+		t.Fatalf("R-1: a refilter-touched widgets cell must carry HasUAF so uafTTLOverrideForEntry stamps the short "+
+			"UAF_RESOLVED_TTL_SECONDS cap; Inputs=%+v", aliceEntry.Inputs)
+	}
+	if got := cache.WidgetsUAFPutDeclined(); got != 0 {
+		t.Fatalf("R-1: the widgets class is identity-BOUND, so #561 must not decline its Put; counter=%d, want 0", got)
 	}
 	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
-		t.Fatalf("R-1: a widgets decline must be counted under the WIDGETS counter, not the restactions one; "+
-			"restactions counter moved to %d", got)
+		t.Fatalf("R-1: the restactions counter must not move on a widgets path; got %d", got)
 	}
 
 	// --- CONTROL: an identical widget whose apiRef RA has NO userAccessFilter
 	// still caches. Without this, a gate that simply stopped caching widgets
 	// wholesale would pass every assertion above. ---------------------------
 	cache.ResetUAFPutDeclineCountersForTest()
+	// #561: alice's cell is now POPULATED by the UAF serve above, so without a
+	// cold key this control would simply HIT that entry and assert against
+	// alice's narrowed body instead of exercising a fresh non-UAF resolve. (It
+	// did exactly that when this arm was first re-pointed.) Clear the store so
+	// the control measures what it was written to measure.
+	cache.ResetResolvedCacheForTest()
+	// Re-derive the handle: the one captured above still points at the store
+	// instance the reset replaced, so reading through it would report the
+	// pre-reset entry (it did, on the first attempt at this fix).
+	ctlKey, ctlHandle, _ := dispatchCacheLookupKey(aliceCtx, "widgets",
+		h1WidgetGVR.Group, h1WidgetGVR.Version, h1WidgetGVR.Resource, h1NS, h1WName, -1, -1, aliceExtras)
+	if ctlHandle == nil {
+		t.Fatalf("control: expected a live widgets cache handle after the reset")
+	}
 	ctlRec := serve(t, aliceCtx, false)
 	if !bytes.Contains(ctlRec.Body.Bytes(), []byte("same-for-everyone")) {
 		t.Fatalf("control: expected the non-UAF widget body; got %s", ctlRec.Body.String())
 	}
-	entry, ok := handle.Get(aliceKey)
+	entry, ok := ctlHandle.Get(ctlKey)
 	if !ok {
 		t.Fatalf("R-1 CONTROL BROKE: a widget whose resolve ran NO refilter was not Put under %q — the gate is "+
 			"over-broad (it has disabled the widgets cache wholesale, which would make every assertion above vacuous)",
-			aliceKey)
+			ctlKey)
 	}
 	if !bytes.Equal(entry.RawJSON, ctlRec.Body.Bytes()) {
 		t.Fatalf("control: the Put'd bytes must equal the served bytes; put=%q served=%q", entry.RawJSON, ctlRec.Body.Bytes())

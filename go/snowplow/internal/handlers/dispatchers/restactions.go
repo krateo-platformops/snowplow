@@ -588,10 +588,25 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, extras)
-		// The UAF gate already ran at the HEAD of this chain — it must precede the
-		// stage-error branch's bounded partial Put, not merely this branch — so
-		// reaching here means the body is NOT per-requester-narrowed. HasUAF was
-		// stamped on cacheInputs there; it is read here only for the TTL override.
+		// #561 — reaching here NO LONGER means the body is un-narrowed.
+		//
+		// It used to: the UAF gate at the head of this chain declined every
+		// narrowed body, so the TTL override below could only ever have been a
+		// no-op on this path. #561 scoped the decline to identity-free classes
+		// and restactions is identity-bound, so a per-requester narrowed body
+		// now reaches this Put by design — safely, because the key folds the
+		// requester's full binding set (#423) and two requesters with divergent
+		// narrowings cannot share it (#588).
+		//
+		// That makes the cap below load-bearing rather than decorative, so the
+		// stamp has to be COMPLETE. The declaration limb was stamped before the
+		// chain (restactionHasUAFStage); the OBSERVED limb is stamped here,
+		// because an RA that declares no userAccessFilter of its own but NESTS
+		// one produces a narrowed body no declaration can see — and without this
+		// the cell would inherit the full store TTL.
+		if cacheInputs != nil && uafTouchedSink.Count() > 0 {
+			cacheInputs.HasUAF = true
+		}
 		{
 			// #189 — generation-guarded write. Refuse (do not resurrect a pre-
 			// delete body) if a DELETE-eviction bumped the key's generation during

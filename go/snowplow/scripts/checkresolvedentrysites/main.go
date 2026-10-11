@@ -23,9 +23,13 @@
 //     neither is FLAGGED — it is a Put that neither participates in the
 //     bounded-TTL discipline nor documents WHY it is exempt. This is exactly
 //     "stamp all sites of a class or carry an explicit inline waiver": the
-//     out-of-scope sites (widgets / widgetContent / raFullList / seedOneWidget
-//     — reasoned out in the R-d-4 SITE MAP) carry the waiver; the in-scope
-//     restactions sites set the field. A future Put site fails the gate
+//     out-of-scope sites (widgetContent / raFullList — reasoned out in the
+//     R-d-4 SITE MAP) carry the waiver; the in-scope sites set the field.
+//     #561 moved widgets and seedOneWidget from the first group to the second:
+//     their waivers rested on the UAF Put-decline, which no longer applies to
+//     an identity-bound class, so those cells now hold per-requester narrowed
+//     rows and take the same cap the restactions sites do. A future Put site
+//     fails the gate
 //     until its author consciously sets the field or writes the waiver.
 //
 //  2. Boot-scope STAMP sites — the readiness-critical boot-prewarm context

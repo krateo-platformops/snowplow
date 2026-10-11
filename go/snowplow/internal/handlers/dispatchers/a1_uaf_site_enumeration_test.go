@@ -23,6 +23,28 @@
 //
 // A waiver is a legitimate answer for the identity-free, pre-refilter substrate
 // classes — but it must state WHY, and an empty reason is rejected.
+//
+// #561 CHANGED WHAT COUNTS AS COVERAGE, and this guard changed with it.
+//
+// Before #561 there was exactly one acceptable disposition for a Put site that
+// could hold a narrowed body: DECLINE it. That is no longer true. For an
+// identity-BOUND class the post-#423 key separates two requesters whose
+// narrowed bodies differ, so the body may be cached — but it is still narrowed
+// per requester, so the cell must not outlive the requester's RBAC: it has to
+// carry the short #118 (d) cap, which means stamping inputs.HasUAF AND passing
+// those inputs to uafTTLOverrideForEntry.
+//
+// So a site is covered when it does ONE of:
+//
+//   DECLINE  — consults the gate (declineUAFPut / declineWidgetUAFPut /
+//              uafDeclineReason, or reads the sink off ctx) and skips the Put;
+//   STAMP+CAP — stamps HasUAF from the UAF signal AND sets TTLOverride from
+//              uafTTLOverrideForEntry. BOTH are required and that conjunction
+//              is the point: widgets.go called uafTTLOverrideForEntry's sibling
+//              helper for months while never stamping HasUAF on this path, so
+//              the cap derived 0 every time and the cell silently inherited the
+//              full store TTL. A guard that accepted either half alone would
+//              have called that site covered.
 
 package dispatchers
 
@@ -51,6 +73,18 @@ var uafGateTokens = []string{
 	"BumpRestactionsUAFPutDeclined(", // ditto
 }
 
+// uafStampTokens and uafCapTokens are the two halves of the STAMP+CAP
+// disposition (#561). Both must appear in the enclosing function: a stamp
+// without a cap derives nothing, and a cap without a stamp always derives 0.
+var uafStampTokens = []string{
+	"HasUAF = true",             // stamped from the observed sink
+	"HasUAF = restactionHasUAF", // stamped from the declaration
+}
+
+var uafCapTokens = []string{
+	"uafTTLOverrideForEntry(",
+}
+
 // uafWaiverPrefix mirrors scripts/checkresolvedentrysites' `scope-waiver:<field>:`
 // convention. The trailing colon separates the marker from the MANDATORY reason.
 const uafWaiverPrefix = "uaf-scope-waiver:"
@@ -65,6 +99,7 @@ type uafPutSite struct {
 	line    int
 	fn      string
 	gated   bool
+	capped  bool   // stamps HasUAF AND sets TTLOverride (the #561 disposition)
 	waiver  string // "" when absent
 	waived  bool
 	waivedE bool // waiver present but reason empty
@@ -90,6 +125,10 @@ func TestA1_EveryResolvedEntryPutSiteIsUAFGatedOrWaived(t *testing.T) {
 		switch {
 		case s.gated:
 			// covered by the gate in its enclosing function
+		case s.capped:
+			// covered by the #561 disposition: the narrowed body is cached
+			// under a key that separates requesters, and capped so it cannot
+			// outlive their RBAC.
 		case s.waivedE:
 			emptyReason = append(emptyReason, s.file+":"+itoaLine(s.line)+" ("+s.fn+")")
 		case s.waived:
@@ -107,14 +146,17 @@ func TestA1_EveryResolvedEntryPutSiteIsUAFGatedOrWaived(t *testing.T) {
 	}
 
 	if len(ungated) > 0 {
-		t.Errorf("A-1/R-1: %d ResolvedEntry Put site(s) neither consult the UAF gate nor carry a `// uaf-scope-waiver: <reason>` annotation:\n  %s\n\n"+
-			"Every L1 cell that can hold a userAccessFilter-narrowed body must decline the Put — the key folds "+
-			"BindingUID (+RBACSubGen), never the per-requester narrowing scope, so two co-bound users collide on one cell.\n"+
+		t.Errorf("A-1/R-1/#561: %d ResolvedEntry Put site(s) do none of: consult the UAF gate, stamp HasUAF AND cap "+
+			"via uafTTLOverrideForEntry, or carry a `// uaf-scope-waiver: <reason>` annotation:\n  %s\n\n"+
+			"Every L1 cell that can hold a userAccessFilter-narrowed body must either DECLINE the Put (identity-free "+
+			"class: one cell is shared by every requester, so a narrowed body in it is read by everyone) or CAP it "+
+			"(identity-bound class: the key folds the requester's binding set, so the body is their own — but it is "+
+			"still narrowed per requester and must not outlive their RBAC).\n"+
 			"THE R-1 LESSON: this is exactly the check that a hand-written list of files failed to make. The widgets "+
 			"class carried the refiltered apiRef output all along (widgets/resolve.go folds it into status.widgetData) "+
 			"and was omitted from the list because the author believed the comment that said it could not.\n"+
-			"Either gate the site (declineUAFPut / declineWidgetUAFPut, or read the sink off ctx) or add the waiver "+
-			"with a reason that survives someone checking it against widgets/resolve.go.",
+			"THE #561 LESSON: a cap derived from an unstamped HasUAF is always 0. Half a disposition is not a "+
+			"disposition — stamp and cap, or decline, or write the waiver.",
 			len(ungated), strings.Join(ungated, "\n  "))
 	}
 }
@@ -173,6 +215,19 @@ func collectUAFPutSites(t *testing.T) []uafPutSite {
 						break
 					}
 				}
+				stamped, capped := false, false
+				for _, tok := range uafStampTokens {
+					if strings.Contains(body, tok) {
+						stamped = true
+						break
+					}
+				}
+				for _, tok := range uafCapTokens {
+					if strings.Contains(body, tok) {
+						capped = true
+						break
+					}
+				}
 				ast.Inspect(fn.Body, func(n ast.Node) bool {
 					lit, ok := n.(*ast.CompositeLit)
 					if !ok || !isResolvedEntryLit(lit.Type) {
@@ -185,6 +240,7 @@ func collectUAFPutSites(t *testing.T) []uafPutSite {
 						line:    pos.Line,
 						fn:      fn.Name.Name,
 						gated:   gated,
+						capped:  stamped && capped,
 						waiver:  reason,
 						waived:  waived,
 						waivedE: waived && strings.TrimSpace(reason) == "",

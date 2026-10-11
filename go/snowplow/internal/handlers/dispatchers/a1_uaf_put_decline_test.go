@@ -111,24 +111,44 @@ func TestA1_Dispatch_UAFDeclinesPut_ControlPuts(t *testing.T) {
 		return rec
 	}
 
-	// --- UAF arm: served, NOT cached. ---
+	// --- UAF arm: served AND cached. #561 inverted this. ---
+	//
+	// This arm used to assert the cell stayed EMPTY, with the stated reason
+	// "that cell is keyed on BindingUID+RBACSubGen only". That premise is no
+	// longer true: #423 added SubjectBindingSet to the identity segment, so two
+	// co-bound users with different per-object narrowings derive DIFFERENT keys
+	// and occupy DIFFERENT cells. restactions is identity-bound, so the Put
+	// proceeds.
+	//
+	// The isolation this arm used to protect is now asserted where it belongs —
+	// on the served bytes, by TestA1_UAFCrossUser_NoSharedCellServe, which drives
+	// two real identities. Here we assert the mechanism that replaced the
+	// decline: the cell IS written, it carries the UAF marker so the short cap
+	// applies, and its dep edge exists so invalidation can reach it.
 	rec := serve(t, true)
 	if rec.Code != 200 {
 		t.Fatalf("arm (a): a UAF RESTAction must still be SERVED normally; got %d body=%s", rec.Code, rec.Body.String())
 	}
 	if len(bytes.TrimSpace(rec.Body.Bytes())) == 0 {
-		t.Fatalf("arm (a): the decline must skip only the cache write — the response body must still carry the resolved result")
+		t.Fatalf("arm (a): the response body must carry the resolved result")
 	}
-	if entry, ok := handle.Get(key); ok {
-		t.Fatalf("arm (a) RED (A-1 LEAK): the dispatch Put'd a UAF-bearing RESTAction under key %q (body %q). "+
-			"That cell is keyed on BindingUID+RBACSubGen only, so a co-bound user with a DIFFERENT per-object "+
-			"narrowing derives the same key and is served these rows verbatim. The Put must be DECLINED.", key, entry.RawJSON)
+	uafEntry, uafCached := handle.Get(key)
+	if !uafCached {
+		t.Fatalf("arm (a) #561: a UAF-bearing RESTAction in an IDENTITY-BOUND class must now be CACHED under %q. "+
+			"An empty cell means the decline is still firing, which is the 10.9x p95 latency cost #561 measured.", key)
 	}
-	if depRecordedFor(key, h1RAGVR, h1NS, h1RAName) {
-		t.Fatalf("arm (a): a declined Put must not record a dep edge — there is no cell for a DELETE/UPDATE to invalidate")
+	if !bytes.Equal(uafEntry.RawJSON, rec.Body.Bytes()) {
+		t.Fatalf("arm (a): the Put'd bytes must equal the served bytes; put=%q served=%q", uafEntry.RawJSON, rec.Body.Bytes())
 	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 1 {
-		t.Fatalf("arm (a): snowplow_restactions_uaf_put_declined_total must tick exactly once per declined Put; got %d", got)
+	if uafEntry.Inputs == nil || !uafEntry.Inputs.HasUAF {
+		t.Fatalf("arm (a): a UAF-bearing cell must carry HasUAF so uafTTLOverrideForEntry stamps the short "+
+			"UAF_RESOLVED_TTL_SECONDS cap instead of the full TTL; Inputs=%+v", uafEntry.Inputs)
+	}
+	if !depRecordedFor(key, h1RAGVR, h1NS, h1RAName) {
+		t.Fatalf("arm (a): a cell that IS written must record its dep edge, or a DELETE/UPDATE can never invalidate it")
+	}
+	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
+		t.Fatalf("arm (a): an identity-bound class must not decline; counter=%d want 0", got)
 	}
 
 	// --- CONTROL arm: the same coordinates WITHOUT the UAF stanza still cache. ---
@@ -147,8 +167,8 @@ func TestA1_Dispatch_UAFDeclinesPut_ControlPuts(t *testing.T) {
 	if !depRecordedFor(key, h1RAGVR, h1NS, h1RAName) {
 		t.Fatalf("arm (a) control: a genuine cold Put must still record the self-dep")
 	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 1 {
-		t.Fatalf("arm (a) control: a NON-UAF Put must not tick the decline counter; total went to %d", got)
+	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
+		t.Fatalf("arm (a) control: nothing in this test may tick the restactions decline counter since #561; got %d", got)
 	}
 }
 
@@ -239,22 +259,41 @@ func TestA1_Seed_UAFSkipsResolveAndPut_ControlSeeds(t *testing.T) {
 		return tailReached
 	}
 
-	if run(t, true) {
-		t.Fatal("arm (b) RED (A-1 LEAK): seedOneRestaction REACHED the resolve+Put tail for a userAccessFilter-bearing " +
-			"RESTAction. The boot seed warms a per-BINDING cell under a cohort REPRESENTATIVE identity, so every " +
-			"co-bound cohort member would be served the representative's per-object narrowing on their first /call. " +
-			"The seed must short-circuit before the resolve.")
+	// #561 INVERTED THIS ARM, and the reasoning is worth stating because the old
+	// text names a real hazard.
+	//
+	// It used to say: the seed warms a per-BINDING cell under a cohort
+	// REPRESENTATIVE identity, so co-bound members would be served the
+	// representative's narrowing. That is only a hazard if the representative
+	// and the member can share a key while deserving different rows. They
+	// cannot, for the same reason the serve path is safe:
+	//
+	//   - the representative is {Username:"", Groups:[g]}, whose SubjectBindingSet
+	//     equals that of a real group-only member — seed/customer key parity,
+	//     pinned by TestKey423_SeedRepresentativeParity;
+	//   - equal binding set ⇒ equal RBAC verdicts (#588's falsifier) ⇒ the
+	//     representative's narrowing IS the member's narrowing;
+	//   - a member holding ANY additional binding derives a DIFFERENT key and
+	//     simply does not reach this cell.
+	//
+	// So the seed must now warm these cells — and should, since not warming them
+	// means a cold resolve on first read for exactly the widgets #561 made
+	// cacheable (measured: 1,814ms p95 uncached vs 166ms cached).
+	if !run(t, true) {
+		t.Fatal("arm (b) #561: seedOneRestaction must now REACH the resolve+Put tail for a UAF-bearing RESTAction " +
+			"in an identity-bound class. Short-circuiting leaves the cell cold, which is the latency cost #561 set " +
+			"out to remove.")
 	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 1 {
-		t.Fatalf("arm (b): the seed skip must route through the SHARED declineUAFPut gate (which is what bumps the counter); got %d ticks, want 1", got)
+	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
+		t.Fatalf("arm (b): the seed must not decline an identity-bound class; got %d ticks, want 0", got)
 	}
 
 	if !run(t, false) {
 		t.Fatal("arm (b) CONTROL BROKE: seedOneRestaction did NOT reach the tail for a NON-UAF RESTAction — the skip " +
 			"is over-broad (it would have disabled the restactions boot seed wholesale, making the arm above vacuous).")
 	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 1 {
-		t.Fatalf("arm (b) control: a NON-UAF seed must not tick the decline counter; total went to %d", got)
+	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
+		t.Fatalf("arm (b) control: nothing here may tick the restactions decline counter since #561; got %d", got)
 	}
 }
 
@@ -317,21 +356,29 @@ func TestA1_Refresher_DeclinesCarriedHasUAF_ControlRefreshes(t *testing.T) {
 		return string(e.RawJSON)
 	}
 
-	if got := refresh(t, true, "uaf-ra"); got != `{"prior":1}` {
-		t.Fatalf("arm (c) RED (A-1): the refresher re-Put a cell whose carried Inputs.HasUAF is TRUE — a UAF body is "+
-			"per-requester-narrowed and the key does not separate co-bound users, so the refresher must DECLINE and "+
-			"keep the prior entry (TTL is the outer net). Entry is now %s, want the untouched prior.", got)
+	// #561 INVERTED THIS ARM. It used to require the refresher to keep the prior
+	// entry, on the premise that "the key does not separate co-bound users".
+	// #423 made that false for an identity-bound class, so the refresher now
+	// re-Puts — which is the whole point: a cell nothing can refresh goes stale
+	// and then costs a full cold resolve on the next read.
+	//
+	// The refresher resolves under the cell's own cohort identity (#576, merged),
+	// so the bytes it writes are narrowed for the same identity the key encodes.
+	if got := refresh(t, true, "uaf-ra"); got != `{"fresh":1}` {
+		t.Fatalf("arm (c) #561: a UAF-bearing cell in an IDENTITY-BOUND class must now be REFRESHED — its key "+
+			"separates co-bound users, so there is nothing to protect by freezing it. Entry is %s, want the fresh "+
+			"bytes.", got)
 	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 1 {
-		t.Fatalf("arm (c): the refresher decline must route through the SHARED declineUAFPut gate; got %d ticks, want 1", got)
+	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
+		t.Fatalf("arm (c): the refresher must not decline an identity-bound cell; got %d ticks, want 0", got)
 	}
 
 	if got := refresh(t, false, "plain-ra"); got != `{"fresh":1}` {
 		t.Fatalf("arm (c) CONTROL BROKE: a NON-UAF cell must still be refreshed; entry is %s, want the fresh bytes "+
 			"(otherwise the decline is over-broad and has disabled the refresher wholesale)", got)
 	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 1 {
-		t.Fatalf("arm (c) control: a NON-UAF re-Put must not tick the decline counter; total went to %d", got)
+	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
+		t.Fatalf("arm (c) control: nothing here may tick the restactions decline counter since #561; got %d", got)
 	}
 }
 
@@ -356,89 +403,96 @@ func TestA1_Refresher_DeclinesCarriedHasUAF_ControlRefreshes(t *testing.T) {
 // counter on (and only on) a decline — the property that makes
 // snowplow_restactions_uaf_put_declined_total unable to drift from the gate.
 func TestA1_DeclineUAFPut_PredicateAndCounter(t *testing.T) {
-	cache.RegisterUAFPutDeclineMetricsForTest()
+	// #561 REWROTE THIS CONTRACT. The gate no longer asks only "is this entry
+	// UAF-bearing?" — it asks "is this entry UAF-bearing AND is its class keyed
+	// WITHOUT identity?".
+	//
+	// WHY. The decline was written against the pre-#423 key, where two users
+	// sharing a first-match binding derived an IDENTICAL key. #423 folds
+	// SubjectBindingSet into the identity segment, which ComputeKey writes iff
+	// !IsIdentityFreeClass. So:
+	//
+	//   identity-BOUND (restactions, widgets) — two requesters whose narrowed
+	//     bodies differ necessarily hold different binding sets, hence different
+	//     keys, hence different cells. No decline needed. Proven by #588's
+	//     falsifier and end-to-end by the two cross-user arms.
+	//
+	//   identity-FREE (widgetContent) — the key folds NO identity, so #423
+	//     separates nothing and ONE cell is shared by EVERY requester. The
+	//     decline is still the only thing standing between a per-requester
+	//     narrowed body and a cross-tenant leak. It STAYS.
+	//
+	// The arms below pin both halves. Deleting either one re-opens a leak or
+	// silently re-disables the cache for the hot carrier.
 	cache.ResetUAFPutDeclineCountersForTest()
 	t.Cleanup(cache.ResetUAFPutDeclineCountersForTest)
+
+	const bound = "restactions"                     // identity-BOUND
+	const free = cache.CacheEntryClassWidgetContent // identity-FREE
+
+	// Sanity: the two class names must actually differ in the property this
+	// whole rule turns on, or every arm below is vacuous.
+	if cache.IsIdentityFreeClass(bound) {
+		t.Fatalf("precondition: %q must be identity-BOUND", bound)
+	}
+	if !cache.IsIdentityFreeClass(free) {
+		t.Fatalf("precondition: %q must be identity-FREE", free)
+	}
 
 	if declineUAFPut(nil, nil) {
 		t.Fatal("declineUAFPut(nil, nil) must be false — no inputs, no sink, no decline")
 	}
-	if declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: "restactions"}, nil) {
+	if declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: bound}, nil) {
 		t.Fatal("a non-UAF entry must NOT be declined — every non-UAF cell caches byte-identically to 1.12.2")
 	}
+
+	// ── IDENTITY-BOUND: no longer declined, on EITHER limb. ──────────────────
+	if declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: bound, HasUAF: true}, nil) {
+		t.Fatal("#561: a UAF-DECLARING entry in an IDENTITY-BOUND class must NOT be declined — the key folds " +
+			"SubjectBindingSet, so two requesters with different narrowings occupy different cells")
+	}
+	_, boundSink := cache.WithUAFTouchedSink(context.Background())
+	boundSink.Bump()
+	if declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: bound}, boundSink) {
+		t.Fatal("#561: an OBSERVED refilter in an IDENTITY-BOUND class must NOT be declined either")
+	}
 	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
-		t.Fatalf("no decline happened yet; counter must still be 0, got %d", got)
+		t.Fatalf("no identity-bound decline may happen; counter=%d want 0", got)
 	}
 
-	// LIMB 1 — the DECLARATION. Available pre-resolve; what lets the seed skip.
-	if !declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: "restactions", HasUAF: true}, nil) {
-		t.Fatal("a UAF-DECLARING entry MUST be declined even with no sink installed")
+	// ── IDENTITY-FREE: still declined, on BOTH limbs. ────────────────────────
+	//
+	// LIMB 1 — the DECLARATION, available pre-resolve.
+	if !declineWidgetUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: free, HasUAF: true}, nil) {
+		t.Fatal("LEAK: a UAF-DECLARING entry in an IDENTITY-FREE class MUST still be declined — its key folds no " +
+			"identity at all, so one cell is shared by every requester and #423 separates nothing")
 	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 1 {
-		t.Fatalf("the counter must tick on the decline itself (one tick per skipped Put); got %d", got)
+	// LIMB 2 — the OBSERVED refilter, with HasUAF false.
+	_, freeSink := cache.WithUAFTouchedSink(context.Background())
+	freeSink.Bump()
+	if !declineWidgetUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: free}, freeSink) {
+		t.Fatal("LEAK: an entry whose resolve OBSERVED a refilter MUST still be declined in an IDENTITY-FREE " +
+			"class even though its own Inputs declare no UAF")
 	}
-
-	// LIMB 2 — the OBSERVED refilter (R-1), CONSUMER SIDE ONLY.
-	//
-	// SCOPE, stated precisely because the first version of this comment overstated
-	// it (and overstated coverage is the R-1 failure class itself): the sink is
-	// HAND-BUMPED here, so what this proves is exactly one implication —
-	//
-	//     Count() > 0  ⇒  the gate declines, even with HasUAF false
-	//
-	// That is the CONSUMER question. It says nothing about the PRODUCER question,
-	// "does anything in production actually make Count() > 0 for a given shape?",
-	// which is where the real coverage lives and where the limbs differ:
-	//
-	//   - WIDGETS CARRIER (R-1): producer coverage is real on this branch —
-	//     apiref.Resolve's declaration bump fires because the apiRef'd RA itself
-	//     declares the filter. Proven end-to-end by
-	//     TestR2_UAFCrossUser_WidgetNoSharedCellServe.
-	//   - NESTED-RA CHAIN (a non-UAF parent whose inner step consumes a UAF
-	//     child): NOT covered on this branch. No production bump fires — the
-	//     declaration bump inspects the PARENT, which declares nothing
-	//     (TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref package).
-	//     Producer coverage arrives with the refilter bump on
-	//     fix/1.12.3-authz-hardening, whose arm is
-	//     TestA4_RefilterBumpsUAFTouchedSink — it drives the real refilter, so
-	//     unlike a seamed dispatch it is actually sensitive to that bump.
-	//
-	// So: this asserts the gate consumes the sink. It does not assert the nested
-	// chain is closed, and must not be cited as if it did.
-	_, sink := cache.WithUAFTouchedSink(context.Background())
-	sink.Bump()
-	if !declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: "restactions" /* HasUAF false */}, sink) {
-		t.Fatal("R-1 consumer side: an entry whose resolve OBSERVED a refilter MUST be declined even though its own " +
-			"Inputs declare no UAF. This is the implication the widgets carrier depends on; whether a given shape " +
-			"actually bumps the sink is the producer question, covered by TestR2_... (widgets, closed here) and " +
-			"TestM1_... (nested chain, closed only once the authz refilter bump merges).")
+	if got := cache.WidgetsUAFPutDeclined(); got != 2 {
+		t.Fatalf("both identity-free declines must tick the widgets-class counter; got %d want 2", got)
 	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 2 {
-		t.Fatalf("the observed-refilter decline must tick the counter too; got %d", got)
+	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
+		t.Fatalf("an identity-free widgetContent decline must NOT tick the restactions counter; got %d", got)
 	}
 
-	// The two limbs are reported distinctly, and neither firing means proceed.
-	if r := uafDeclineReason(&cache.ResolvedKeyInputs{HasUAF: true}, nil); r != uafDeclineDeclared {
+	// ── The two limbs are reported distinctly, and neither firing means proceed.
+	if r := uafDeclineReason(&cache.ResolvedKeyInputs{CacheEntryClass: free, HasUAF: true}, nil); r != uafDeclineDeclared {
 		t.Fatalf("declaration limb must report %q; got %q", uafDeclineDeclared, r)
 	}
-	if r := uafDeclineReason(nil, sink); r != uafDeclineObserved {
+	if r := uafDeclineReason(&cache.ResolvedKeyInputs{CacheEntryClass: free}, freeSink); r != uafDeclineObserved {
 		t.Fatalf("sink limb must report %q; got %q", uafDeclineObserved, r)
 	}
 	if r := uafDeclineReason(nil, nil); r != "" {
 		t.Fatalf("neither limb firing must report \"\" (proceed); got %q", r)
 	}
-
-	// The widgets class routes through the SAME rule but its OWN counter — the
-	// R-1 carrier must be countable separately from the restactions cold path.
-	before := cache.WidgetsUAFPutDeclined()
-	if !declineWidgetUAFPut(nil, sink) {
-		t.Fatal("declineWidgetUAFPut must apply the same rule as declineUAFPut")
-	}
-	if got := cache.WidgetsUAFPutDeclined(); got != before+1 {
-		t.Fatalf("the widgets decline must tick the WIDGETS counter; got %d want %d", got, before+1)
-	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 2 {
-		t.Fatalf("a widgets decline must NOT tick the restactions counter (they are separate classes); got %d", got)
+	if r := uafDeclineReason(&cache.ResolvedKeyInputs{CacheEntryClass: bound, HasUAF: true}, freeSink); r != "" {
+		t.Fatalf("#561: an identity-BOUND class must report \"\" (proceed) on both limbs; got %q", r)
 	}
 
 	// The gate reads HasUAF, which the CR-bearing sites stamp from the ONE

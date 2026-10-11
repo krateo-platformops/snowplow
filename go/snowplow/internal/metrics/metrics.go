@@ -423,11 +423,6 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
-	phase1SeedWidgetUAFSkip, err := m.Int64ObservableCounter("snowplow_phase1_seed_widget_uaf_preresolve_skip_total",
-		metric.WithDescription("#403: widget seed units skipped BEFORE the resolve because the apiRef'd RESTAction declares a userAccessFilter (the widgets cell would be declined for every identity); each is also counted by snowplow_widgets_uaf_put_declined_total."))
-	if err != nil {
-		return err
-	}
 
 	// --- 1.12.6 C7: tag-derived families (crd_discovery, refresh_broadcaster,
 	// refresher). ONE loop: the instrument set, names, kinds and descriptions
@@ -841,7 +836,6 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(phase1SeedFailures, int64(seedFailures))
 		o.ObserveInt64(phase1SeedRBACDeny, int64(seedRBACDeny))
 		o.ObserveInt64(phase1SeedOpFail, int64(seedOpFail))
-		o.ObserveInt64(phase1SeedWidgetUAFSkip, int64(dispatchers.Phase1SeedWidgetUAFPreResolveSkips()))
 
 		// --- SA-discovery ---
 		sa := dynamic.SADiscoveryStatsSnapshot()
@@ -1044,7 +1038,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		shadowWildcardDigestCollision, shadowWildcardDigestObserved, shadowWildcardDigestEvicted,
 		phase1UnitsPlanned, phase1UnitsSeeded, phase1ApiRefPages, phase1EligibleNoContinue,
 		phase1WalkZeroChildren, phase1WalkObservations,
-		phase1SeedResolves, phase1SeedFailures, phase1SeedRBACDeny, phase1SeedOpFail, phase1SeedWidgetUAFSkip,
+		phase1SeedResolves, phase1SeedFailures, phase1SeedRBACDeny, phase1SeedOpFail,
 		saDiscovery, crdSchemaMemo,
 		upstreamControllers, upstreamWebhooks,
 		raFullListServe, bindingsDeltaSkipped,

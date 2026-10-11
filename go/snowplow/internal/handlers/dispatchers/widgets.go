@@ -589,10 +589,35 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// publish run ONLY on an accepted write — a refused PutIfGen stored no
 		// cell, so (same as the declined branches above) there is nothing to
 		// dep-track or announce.
-		// scope-waiver:TTLOverride: widgets-class cell. 1.12.3 A-1/R-1 CORRECTED WAIVER: the pre-1.12.3 text claimed "UAF refilter output only ever lands in a restactions-class cell ... a widgets Put is never the UAF-stale cell". That was WRONG, and it was the R-1 blocker — widgets/resolve.go folds the apiRef'd RA's UAF-refiltered rows into status.widgetData, i.e. into THIS cell, which live measurement showed is the hot carrier (298,064 hits / 365 misses in 5d7h across 66 UAF-backed widgets). A refilter-touched envelope can no longer REACH this Put: the UAFTouchedSink gate at the HEAD of this chain declines it, so every cell written here is refilter-free and needs no UAF cap (uaf_shortttl.go R-d-4 SITE MAP).
+		// #561 WITHDREW THIS SITE'S scope-waiver:TTLOverride annotation and set
+		// the field instead, because the waiver's stated reason is now FALSE.
+		//
+		// It used to read: "A refilter-touched envelope can no longer REACH this
+		// Put: the UAFTouchedSink gate at the HEAD of this chain declines it, so
+		// every cell written here is refilter-free and needs no UAF cap." That
+		// was load-bearing on the blanket decline. #561 scopes the decline to
+		// IDENTITY-FREE classes, and widgets is identity-BOUND — so a
+		// refilter-touched envelope DOES reach this Put now, by design.
+		//
+		// Safe, because the widgets key folds the identity segment, and two
+		// requesters served different narrowed bodies necessarily hold different
+		// binding sets (#423; falsified in #588, and shown end-to-end by the A-1
+		// cross-user arm). They therefore occupy DIFFERENT cells.
+		//
+		// But "different cells" is not "unbounded lifetime": this cell now holds
+		// per-requester narrowed rows, so it takes the SAME short cap the
+		// restactions carrier has always had. HasUAF is stamped from the sink
+		// immediately below, which is what makes uafTTLOverrideForEntry return
+		// UAF_RESOLVED_TTL_SECONDS (300s shipped) instead of 0 — without that
+		// stamp this cell would have silently inherited the full 3600s TTL, which
+		// is precisely the gap this comment used to paper over.
+		if uafTouchedSink.Count() > 0 && cacheInputs != nil {
+			cacheInputs.HasUAF = true
+		}
 		if cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
-			RawJSON: encoded,
-			Inputs:  cacheInputs,
+			RawJSON:     encoded,
+			Inputs:      cacheInputs,
+			TTLOverride: uafTTLOverrideForEntry(cacheInputs),
 		}, cacheGen0) {
 			// 0.30.8: record dep edges. Widget self-dep, apiRef→RestAction
 			// dep, and render-eligible resourcesRefs deps (action-only
