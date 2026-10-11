@@ -478,7 +478,7 @@ refresher ends in exactly one of three states, all counted:
 |---|---|---|
 | **re-Put** | the re-resolve succeeded | `completed_total` |
 | **evict** | the entry's basis is gone or unverifiable: the self-object 404 (§5.1), and since 1.12.6 **every** deterministic failure that exhausts `maxRefreshRequeues` — 403, 500, timeout, parse failure, an apistage content call that is not servable | `self_notfound_evict_total`, `drop_evict_total` |
-| **suppress** | the decline sites in `resolveAndPopulateL1` (stage error, external endpoint, `userAccessFilter` cell, unsupported kind) — the key is marked *refresh-by-traffic-only*, skipped by the refresher without a resolve, and cleared by the next real `Put` or by any eviction | `suppressed_set_total`, `suppressed_skips_total`, `suppressed_keys` |
+| **suppress** | the decline sites in `resolveAndPopulateL1` (stage error, external endpoint, `userAccessFilter` cell on an IDENTITY-FREE class only since #561 — the identity-bound classes are refreshed normally, unsupported kind) — the key is marked *refresh-by-traffic-only*, skipped by the refresher without a resolve, and cleared by the next real `Put` or by any eviction | `suppressed_set_total`, `suppressed_skips_total`, `suppressed_keys` |
 
 Before 1.12.6 the drop point in `processNext` forgot a non-404 key and left the stale body
 resident until the 1 h TTL, and the decline gates re-resolved the same key on every dirty-mark
