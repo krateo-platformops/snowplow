@@ -280,7 +280,19 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		rctx = cache.WithInternalEndpoint(rctx, saEP)
 	}
 	if saRC != nil {
-		rctx = cache.WithInternalRESTConfig(rctx, saRC)
+		// #574 — read as the COHORT, not as snowplow. refreshUser/refreshGroups
+		// is the representative identity installed via WithUserInfo above, so the
+		// transport now matches the identity the cell is keyed to. Returns nil
+		// when the apiserver has not granted impersonation (the startup probe) or
+		// when there is no cohort identity to impersonate, in which case the
+		// pre-#574 SA transport is kept verbatim and rbac.MustRegateSADial still
+		// applies — that fallback is what makes a code-before-RBAC rollout safe.
+		if imp := cache.ImpersonatingRESTConfig(saRC, refreshUser, refreshGroups); imp != nil {
+			rctx = cache.WithInternalRESTConfig(rctx, imp)
+			rctx = cache.WithImpersonatedDial(rctx)
+		} else {
+			rctx = cache.WithInternalRESTConfig(rctx, saRC)
+		}
 	}
 	// WithL1KeyContext threads the L1 key so the resolver's inner-call
 	// recording site re-records dep edges for this refresh.
