@@ -38,6 +38,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	otellog "go.opentelemetry.io/otel/log"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
@@ -188,7 +189,7 @@ func TestIssue462_EveryOTLPSignalCarriesTheCollectorServiceVersion(t *testing.T)
 	_, span := otel.Tracer("issue462").Start(ctx, "issue462")
 	span.End()
 	var rec otellog.Record
-	rec.SetBody(otellog.StringValue("issue462"))
+	rec.SetBody(attribute.StringValue("issue462"))
 	lp.Logger("issue462").Emit(ctx, rec)
 
 	flush, cancel := context.WithTimeout(ctx, 10*time.Second)

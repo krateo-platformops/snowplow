@@ -33,6 +33,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/trace"
@@ -195,7 +196,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	now := time.Now()
 	rec.SetTimestamp(now)
 	rec.SetObservedTimestamp(now)
-	rec.SetBody(log.StringValue(ev.Message))
+	rec.SetBody(attribute.StringValue(ev.Message))
 
 	// Severity from outcome. Success (or unset) => Info; anything else
 	// (failure/denied) => Error.
@@ -215,10 +216,10 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 		groups = ui.Groups
 	}
 
-	attrs := make([]log.KeyValue, 0, 16)
+	attrs := make([]attribute.KeyValue, 0, 16)
 	add := func(k, v string) {
 		if v != "" {
-			attrs = append(attrs, log.String(k, v))
+			attrs = append(attrs, attribute.String(k, v))
 		}
 	}
 	// event.name="audit" — the discriminator every audit row is filtered on.
@@ -239,19 +240,17 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	add("outcome", ev.Outcome)
 
 	if len(groups) > 0 {
-		vals := make([]log.Value, len(groups))
-		for i, r := range groups {
-			vals[i] = log.StringValue(r)
-		}
-		attrs = append(attrs, log.Slice("user.roles", vals...))
+		// v0.21.0: the log API adopted the shared attribute value types, so the
+		// hand-rolled []log.Value is now just a typed string slice.
+		attrs = append(attrs, attribute.StringSlice("user.roles", groups))
 	}
 	if ev.Code != 0 {
-		attrs = append(attrs, log.Int("http.response.status_code", ev.Code))
+		attrs = append(attrs, attribute.Int("http.response.status_code", ev.Code))
 	}
 
 	// Business/session correlation id from W3C baggage — NOT a header.
 	if id := SessionID(ctx); id != "" {
-		attrs = append(attrs, log.String(BaggageSessionKey, id))
+		attrs = append(attrs, attribute.String(BaggageSessionKey, id))
 	}
 
 	// Belt-and-suspenders: the Logs SDK stamps TraceId/SpanId from ctx's
@@ -259,7 +258,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	// them). Only surface the pathological case of an audit event emitted
 	// with no trace context at all, so it is detectable in otel_logs.
 	if sc := trace.SpanContextFromContext(ctx); !sc.IsValid() {
-		attrs = append(attrs, log.Bool("krateo.audit.no_trace_context", true))
+		attrs = append(attrs, attribute.Bool("krateo.audit.no_trace_context", true))
 	}
 
 	rec.AddAttributes(attrs...)
