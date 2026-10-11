@@ -135,6 +135,10 @@ func Refreshes() http.HandlerFunc {
 		// fallback). No subscription validation, no apiserver touch; the
 		// client gets heartbeats only and falls back to its own throttle.
 		if !cache.RefreshSSEEnabled() {
+			// #587 — an idle stream is a HEALTHY outcome, but it leaves
+			// streams_open flat, which before this counter was
+			// indistinguishable from the len(armed)==0 refusal below.
+			cache.BumpRefreshIdleServedCacheOff()
 			serveIdleSSE(wri, req)
 			return
 		}
@@ -172,9 +176,22 @@ func Refreshes() http.HandlerFunc {
 			// all-NotFound/all-denied subscription still gets the correct 400
 			// (the divert cannot mask "armed nothing valid" once warm).
 			if refreshWarmupIncomplete() {
+				// #587 — healthy: connected, and publishes start once warm.
+				// Counted so it is not mistaken for the refusal below, which
+				// produces the SAME arrived/rejected/streams_open reading.
+				cache.BumpRefreshIdleServedWarmup()
 				serveIdleSSE(wri, req)
 				return
 			}
+			// #587 — THE MISSED REFUSAL. This is the blessed C64-1 honest-400:
+			// warm, but nothing the requester asked for is cached or permitted
+			// (on a userAccessFilter-backed page, #561, this is the expected
+			// outcome). It is every bit as much a snowplow-side refusal as the
+			// validateSubscription error above, and before this bump
+			// subscribe_rejected_total read 0 while every subscriber was being
+			// turned away. Measured on 057: six subscribes, all answered 400
+			// here, left the counter at zero.
+			cache.BumpRefreshSubscribeRejected()
 			http.Error(wri, "no valid subscription keys", http.StatusBadRequest)
 			return
 		}
@@ -225,6 +242,10 @@ func Refreshes() http.HandlerFunc {
 		// invisible to EventSource clients per the spec — byte-neutral to the
 		// consumer, unconditional so the fix holds with or without the wrapper.
 		if !writeFrame(": connected\n\n") {
+			// #587 — armed and headers committed, but the client vanished
+			// before the first frame landed. Counted so this does not present
+			// as the same "arrived, nothing happened" shape as a refusal.
+			cache.BumpRefreshConnectWriteFailed()
 			return
 		}
 
