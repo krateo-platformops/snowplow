@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/logtest"
@@ -137,9 +138,9 @@ func TestEmitOTLPRecord(t *testing.T) {
 		t.Errorf("severity = %v, want Info", r.Severity)
 	}
 
-	attrs := map[string]log.Value{}
+	attrs := map[string]attribute.Value{}
 	for _, kv := range r.Attributes {
-		attrs[kv.Key] = kv.Value
+		attrs[string(kv.Key)] = kv.Value
 	}
 	if v, ok := attrs["event.name"]; !ok || v.AsString() != EventName {
 		t.Errorf("event.name = %v, want %q", attrs["event.name"], EventName)
@@ -201,9 +202,9 @@ func TestEmitRecordsSubresource(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("want 1 record, got %d", len(got))
 	}
-	attrs := map[string]log.Value{}
+	attrs := map[string]attribute.Value{}
 	for _, kv := range got[0].Attributes {
-		attrs[kv.Key] = kv.Value
+		attrs[string(kv.Key)] = kv.Value
 	}
 	if v, ok := attrs["k8s.resource.subresource"]; !ok || v.AsString() != "status" {
 		t.Errorf("k8s.resource.subresource = %v (present=%v), want status", attrs["k8s.resource.subresource"], ok)
@@ -220,7 +221,7 @@ func TestEmitRecordsSubresource(t *testing.T) {
 		t.Fatalf("want 1 record, got %d", len(g2))
 	}
 	for _, kv := range g2[0].Attributes {
-		if kv.Key == "k8s.resource.subresource" {
+		if string(kv.Key) == "k8s.resource.subresource" {
 			t.Errorf("whole-object call must omit k8s.resource.subresource, got %v", kv.Value)
 		}
 	}
