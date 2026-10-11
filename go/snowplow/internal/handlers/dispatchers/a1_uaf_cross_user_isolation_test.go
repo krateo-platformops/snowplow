@@ -328,12 +328,38 @@ func TestA1_UAFCrossUser_NoSharedCellServe(t *testing.T) {
 			"correctly-narrowed result, not merely denied alice's. body: %s", a1TenantB, bobRec.Body.String())
 	}
 
-	// --- And the mechanism that achieved it: nothing was cached. -------------
-	if entry, ok := handle.Get(aliceKey); ok {
-		t.Fatalf("A-1: the shared cell must stay EMPTY for a UAF-bearing RESTAction; found %q under %q",
-			entry.RawJSON, aliceKey)
+	// --- And the mechanism that achieved it. --------------------------------
+	//
+	// #561 CHANGED THIS HALF, exactly as this file's header anticipated: "when
+	// v7 folds the UAF scope into the key and re-enables the Put, this arm must
+	// still pass — then proving the KEY separates them rather than that nothing
+	// is cached." The acceptance assertions above are untouched and still pass;
+	// what follows now asserts SEPARATION instead of ABSENCE.
+	//
+	// (The separation comes from #423's SubjectBindingSet fold rather than from
+	// v7's scope digest, but the shape the header called for is the same.)
+	if aliceKey == bobKey {
+		t.Fatalf("A-1: alice and bob must derive DIFFERENT keys — that separation is what makes caching a "+
+			"UAF-narrowed body safe. Both derived %q.", aliceKey)
 	}
-	if got := cache.RestactionsUAFPutDeclined(); got != 2 {
-		t.Fatalf("A-1: both dispatches must have declined their Put through the shared gate; counter=%d, want 2", got)
+	aliceEntry, aliceCached := handle.Get(aliceKey)
+	if !aliceCached {
+		t.Fatalf("A-1: alice's own cell must now be POPULATED under %q — the restactions class is identity-bound, "+
+			"so #561 no longer declines its Put. An empty cell here means the decline is still firing.", aliceKey)
+	}
+	if !bytes.Contains(aliceEntry.RawJSON, []byte(a1TenantA)) || bytes.Contains(aliceEntry.RawJSON, []byte(a1TenantB)) {
+		t.Fatalf("A-1: alice's cell must hold HER narrowing (%s and not %s); got %q",
+			a1TenantA, a1TenantB, aliceEntry.RawJSON)
+	}
+	if bobEntry, ok := handle.Get(bobKey); ok {
+		if bytes.Contains(bobEntry.RawJSON, []byte(a1TenantA)) {
+			t.Fatalf("A-1 CROSS-TENANT LEAK AT REST: bob's cell under %q holds %q, which his own RBAC denies. "+
+				"The two cells are separate but the wrong body was written into his. body: %q",
+				bobKey, a1TenantA, bobEntry.RawJSON)
+		}
+	}
+	// The decline no longer fires for an identity-bound class.
+	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
+		t.Fatalf("A-1: the restactions class is identity-BOUND, so #561 must not decline its Put; counter=%d, want 0", got)
 	}
 }

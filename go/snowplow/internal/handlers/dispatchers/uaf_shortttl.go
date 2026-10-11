@@ -241,7 +241,45 @@ const (
 // below so each class counts its own declines while the RULE stays single-source
 // (#64 anti-shadow-drift).
 func uafDeclineReason(inputs *cache.ResolvedKeyInputs, sink *cache.UAFTouchedSink) string {
-	if inputs != nil && inputs.HasUAF {
+	// #561 — THE DECLINE IS NOW SCOPED TO IDENTITY-FREE CLASSES ONLY.
+	//
+	// The mitigation was written against the PRE-#423 key. Its worked example
+	// (above) is two users who share a first-match binding and therefore derive
+	// an IDENTICAL key. #423 then folded SubjectBindingSet — the digest of every
+	// binding whose subjects match the requester — into the identity segment, and
+	// those two users no longer collide.
+	//
+	// That is only true where the key HAS an identity segment. ComputeKey writes
+	// one iff !IsIdentityFreeClass (resolved.go), so:
+	//
+	//   identity-BOUND (restactions, widgets, raFullList)
+	//       Two requesters served different narrowed bodies necessarily hold
+	//       different binding sets, hence different keys, hence different cells.
+	//       PROVEN two ways: the unit falsifier (#588) finds no pair with an
+	//       equal binding-set digest and divergent verdicts, and the A-1
+	//       end-to-end arm shows bob served his OWN rows with the decline off.
+	//       Sufficient because a userAccessFilter CANNOT narrow on the requester:
+	//       the CRD schema admits only group/resource/resourcesFrom/nameFrom/
+	//       namespaceFrom/verb, where the two *From fields are JQ paths over each
+	//       RETURNED OBJECT. So the narrowing is a pure per-object RBAC verdict,
+	//       and equal verdicts ⇒ byte-identical narrowed bodies.
+	//
+	//   identity-FREE (widgetContent)
+	//       The key folds NO identity by construction, so #423 separates nothing
+	//       and ONE cell is shared by EVERY requester. Caching a per-requester
+	//       narrowed body here is an unconditional cross-tenant leak, and no key
+	//       work short of making the class identity-bound can fix it. The decline
+	//       STAYS, and widget_content.go's waiver remains true.
+	//
+	// (apistage is identity-free too but never reaches here: it stores the
+	// SA-maximal UN-narrowed set and re-gates at serve — apistage.go's #58 note.)
+	//
+	// This is a per-CLASS rule, the same shape ComputeKey itself uses, not a
+	// per-resource switch (feedback_no_special_cases).
+	if inputs == nil || !cache.IsIdentityFreeClass(inputs.CacheEntryClass) {
+		return ""
+	}
+	if inputs.HasUAF {
 		return uafDeclineDeclared
 	}
 	if sink.Count() > 0 { // nil-receiver-safe: no sink installed reads as 0

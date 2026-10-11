@@ -205,15 +205,26 @@ func TestIssue548_Widgets_NoDeclineBranchArms(t *testing.T) {
 			},
 			witness: cache.SensitiveSkippedPutForTest,
 		},
-		{
-			name: "uaf_refilter",
-			why:  "declineWidgetUAFPut — 1.12.3 A-1/R-1, the hot carrier (66 widgets, 298,064 hits/5d7h)",
-			user: h1User,
-			during: func(t *testing.T, ctx context.Context, _ string) {
-				cache.UAFTouchedSinkFromContext(ctx).Bump()
-			},
-			witness: cache.WidgetsUAFPutDeclined,
-		},
+		// #561 REMOVED THE uaf CASE FROM THIS TABLE, and the removal is the
+		// point rather than an omission.
+		//
+		// This table enumerates branches that DECLINE the Put, and asserts none
+		// of them stamps a refresh key — #548's invariant: never arm a key that
+		// nothing stored, or the browser subscribes and waits forever on a cell
+		// no publisher can reach.
+		//
+		// THAT INVARIANT IS UNCHANGED and still enforced for every branch below.
+		// What changed is that a userAccessFilter refilter is no longer a
+		// decline for an IDENTITY-BOUND class: #561 scoped the decline to
+		// identity-free classes, because the post-#423 key separates two
+		// requesters whose narrowed bodies differ. So the UAF case now stores a
+		// cell, and arming it is CORRECT — it would fail here only by asserting
+		// the opposite of the new behaviour.
+		//
+		// The positive half (a UAF-refiltered response IS cached AND armed, so
+		// the stamped key is reachable) is asserted by the cross-user arms in
+		// a1_uaf_cross_user_isolation_test.go and a1_uaf_widget_cross_user_test.go,
+		// which check the cell contents under each requester's own key.
 		{
 			name: "stage_error",
 			why:  "stageErrSink.Count() > 0 — #313 Cache-A partial-with-errors envelope",
@@ -266,15 +277,19 @@ func TestIssue548_Widgets_NoDeclineBranchArms(t *testing.T) {
 		},
 	}
 
-	// Every branch of the production chain must appear above. The chain has nine
-	// arms (eight declines + the external-TTL accepted Put that must not arm);
-	// a tenth added later without an arm here is the #533/#540/#546 shape.
-	if len(branches) != 9 {
-		t.Fatalf("#548: the widgets Put-gate chain has 9 arms (widgets.go: inert, sensitive, identity-class drift, "+
-			"UAF, stage error, external-TTL Put, external skip, undeclared extras, genuine Put — plus the "+
-			"no-branch fall-through) and this table must drive all of them minus drift, which needs the "+
-			"grant-mid-resolve watcher and lives in TestIssue548_Widgets_IdentityClassDrift_DoesNotArm; got %d cases",
-			len(branches))
+	// Every branch of the production chain that CAN DECLINE must appear above.
+	// #561 took the count from 9 to 8: the UAF arm still exists in widgets.go
+	// (the shared gate is deliberately called from every site uniformly, #64
+	// anti-shadow-drift) but can no longer FIRE for the widgets class, which is
+	// identity-bound. An arm that cannot decline has no no-arm case to drive.
+	// A NEW arm added later without a case here is still the #533/#540/#546
+	// shape, which is what this count exists to catch.
+	if len(branches) != 8 {
+		t.Fatalf("#548: the widgets Put-gate chain has 8 REACHABLE decline arms (widgets.go: inert, sensitive, "+
+			"identity-class drift, stage error, external-TTL Put, external skip, undeclared extras, genuine Put — "+
+			"plus the no-branch fall-through; the UAF arm is unreachable for this identity-bound class since #561) "+
+			"and this table must drive all of them minus drift, which needs the grant-mid-resolve watcher and lives "+
+			"in TestIssue548_Widgets_IdentityClassDrift_DoesNotArm; got %d cases", len(branches))
 	}
 
 	for _, b := range branches {
@@ -464,15 +479,26 @@ func TestIssue548_RESTActions_NoDeclineBranchArms(t *testing.T) {
 			},
 			witness: cache.SensitiveSkippedPutForTest,
 		},
-		{
-			name: "uaf_narrowed",
-			why:  "uafDeclineReason — 1.12.3 A-1 per-requester narrowing is not folded into the key",
-			user: h1User,
-			during: func(t *testing.T, ctx context.Context, _ string) {
-				cache.UAFTouchedSinkFromContext(ctx).Bump()
-			},
-			witness: cache.RestactionsUAFPutDeclined,
-		},
+		// #561 REMOVED THE uaf CASE FROM THIS TABLE, and the removal is the
+		// point rather than an omission.
+		//
+		// This table enumerates branches that DECLINE the Put, and asserts none
+		// of them stamps a refresh key — #548's invariant: never arm a key that
+		// nothing stored, or the browser subscribes and waits forever on a cell
+		// no publisher can reach.
+		//
+		// THAT INVARIANT IS UNCHANGED and still enforced for every branch below.
+		// What changed is that a userAccessFilter refilter is no longer a
+		// decline for an IDENTITY-BOUND class: #561 scoped the decline to
+		// identity-free classes, because the post-#423 key separates two
+		// requesters whose narrowed bodies differ. So the UAF case now stores a
+		// cell, and arming it is CORRECT — it would fail here only by asserting
+		// the opposite of the new behaviour.
+		//
+		// The positive half (a UAF-refiltered response IS cached AND armed, so
+		// the stamped key is reachable) is asserted by the cross-user arms in
+		// a1_uaf_cross_user_isolation_test.go and a1_uaf_widget_cross_user_test.go,
+		// which check the cell contents under each requester's own key.
 		{
 			name: "stage_error",
 			why:  "stageErrSink.Count() > 0 — #313 Cache-A partial-with-errors body",
@@ -507,10 +533,11 @@ func TestIssue548_RESTActions_NoDeclineBranchArms(t *testing.T) {
 		},
 	}
 
-	// restactions.go's chain has seven arms (six declines + the genuine Put);
-	// drift is the seventh decline and lives in its own test below, for the same
-	// watcher reason as the widgets twin.
-	if len(branches) != 7 {
+	// restactions.go's chain: #561 took this from 7 to 6 for the same reason as
+	// the widgets twin above — the UAF arm is unreachable for an identity-bound
+	// class, so it has no no-arm case to drive. Drift is still the arm that
+	// lives in its own test below, for the watcher reason.
+	if len(branches) != 6 {
 		t.Fatalf("#548: the restactions Put-gate chain arms must ALL be driven here (minus identity-class drift, "+
 			"which needs the grant-mid-resolve watcher); got %d cases", len(branches))
 	}
