@@ -589,8 +589,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// publish run ONLY on an accepted write — a refused PutIfGen stored no
 		// cell, so (same as the declined branches above) there is nothing to
 		// dep-track or announce.
-		// scope-waiver:TTLOverride: widgets-class cell. #561 REWRITES THIS
-		// WAIVER, which is now FALSE as previously written.
+		// #561 WITHDREW THIS SITE'S scope-waiver:TTLOverride annotation and set
+		// the field instead, because the waiver's stated reason is now FALSE.
 		//
 		// It used to read: "A refilter-touched envelope can no longer REACH this
 		// Put: the UAFTouchedSink gate at the HEAD of this chain declines it, so

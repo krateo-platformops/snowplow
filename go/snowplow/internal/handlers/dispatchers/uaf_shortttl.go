@@ -1,55 +1,157 @@
-// uaf_shortttl.go — the userAccessFilter (UAF) cache posture: the 1.12.3 A-1
-// PUT-DECLINE (current) and the #118 (d) interim short-TTL it supersedes.
+// uaf_shortttl.go — the userAccessFilter (UAF) cache posture: the #561 class
+// rule (current), the 1.12.3 A-1 blanket Put-decline it replaces, and the
+// #118 (d) short-TTL cap that #561 makes load-bearing again.
 //
-// ============================ 1.12.3 — A-1 ==============================
-// SUPERSEDING POSTURE (read this first): as of 1.12.3, NOTHING WHOSE BODY WAS
-// NARROWED BY A userAccessFilter IS CACHED — in any class. Every L1 Put site
-// consults uafDeclineReason below and skips the write; the raFullList cell is
-// bypassed outright at ra_full_list.go. The request is still served normally —
-// 200 with the requester's own correctly-narrowed body; only the cache write is
-// skipped.
+// ============================== #561 ====================================
+// CURRENT POSTURE (read this first). A userAccessFilter narrows a body PER
+// REQUESTER. Whether that body may be cached depends entirely on whether the
+// cache key can tell two requesters apart:
 //
-// TWO SIGNALS, because one was not enough (R-1). The first cut gated on the
-// DECLARATION — "does the RESTAction being dispatched declare a UAF stage?" —
-// and that closed the direct /call on the RA while leaving open the path the
-// portal actually renders. Widgets fold the apiRef'd RA's refiltered rows into
-// their OWN status.widgetData (widgets/resolve.go), and the declaring CR sits
-// several resolver frames below the widget the dispatcher holds, so the
-// declaration predicate saw nothing there. Live measurement settled it: 66
-// widgets apiRef a UAF RA, and the widgets cell served 298,064 hits against 365
-// misses over 5d7h — the cold path was gated and the hot one was not. So the
-// gate now also consults an OBSERVED signal, cache.UAFTouchedSink, bumped where
-// the refilter actually runs and therefore blind to how far away the declaration
-// is. Both are kept: only the declaration exists BEFORE a resolve, which is what
-// lets the boot seed skip a UAF RA's whole fan-out.
+//   IDENTITY-BOUND classes (restactions, widgets, raFullList) — CACHED.
+//       ComputeKey writes an identity segment folding the first-match
+//       BindingUID, the requester's full SubjectBindingSet digest (#423) and
+//       the RBAC sub-generation. Two requesters served DIFFERENT narrowed
+//       bodies necessarily hold different binding sets, so they occupy
+//       different cells. The narrowing a userAccessFilter performs is a pure
+//       per-object RBAC verdict — the CRD schema admits only group / resource /
+//       resourcesFrom / nameFrom / namespaceFrom / verb, and the two *From
+//       fields are JQ paths over each RETURNED object, never over the requester
+//       — so equal binding sets give equal verdicts and byte-identical bodies.
+//       #588's falsifier could not construct a counterexample; the A-1
+//       cross-user arms show it end to end.
 //
-// THE CARRIERS, all now gated: restactions (dispatch, refresher, seed), widgets
-// (dispatch, seed), widgetContent (walker populate), raFullList (bypass).
+//   IDENTITY-FREE classes (widgetContent) — DECLINED, unchanged.
+//       The key folds NO identity by construction, so ONE cell is shared by
+//       EVERY requester and #423 separates nothing. A narrowed body here is an
+//       unconditional cross-tenant leak that no key work short of making the
+//       class identity-bound can fix. (apistage is identity-free too but never
+//       reaches this gate: it stores the SA-maximal UN-narrowed set and re-gates
+//       at serve — apistage.go's #58 note.)
 //
-// WHY the (d) TTL cap was not enough. (d) assumed the exposure was TIME (a
-// user's own view going stale after an out-of-band RBAC change) and capped the
-// window. Both red-teams then reproduced a CROSS-USER exposure that no TTL
-// bounds: the key folds BindingUID + RBACSubGen (helpers.go
-// dispatchCacheLookupKey; Representative* are carried but NOT folded —
-// resolved.go), while a UAF stage narrows the body PER REQUESTER PER OBJECT
-// (refilter.go). Two users sharing the first-match binding for `get restactions`
-// — one CRB granting the group they are both in, divergent per-namespace
-// RoleBindings — derive the IDENTICAL key, and the hit path writes
-// entry.RawJSON verbatim with no re-narrowing (restactions.go). The second user
-// is served the FIRST user's rows immediately, within any TTL. A short TTL
-// shortens a cross-tenant leak; it does not close one.
+// WHAT THE CAP IS FOR, now that these cells exist again. An identity-bound UAF
+// cell holds ONE requester's correctly-narrowed rows, so it cannot leak — but it
+// CAN go stale: the key folds the requester's bindings, not the per-object
+// verdicts a userAccessFilter re-evaluates, so an out-of-band RBAC change makes
+// that requester's own view wrong with nothing to evict it. That is exactly the
+// exposure #118 (d) below caps, and #561 makes it load-bearing again. Every Put
+// site that can write a narrowed body therefore stamps inputs.HasUAF — from the
+// DECLARATION where the RESTAction CR is in hand, and from the OBSERVED sink
+// where it is not (a widget's declaration sits frames below; a nested RA→RA
+// chain has none at the top) — and passes it to uafTTLOverrideForEntry.
 //
-// SCOPE OF THE MITIGATION: exactly the RAs whose output is per-requester
-// narrowed (RESTAction.HasUserAccessFilterStage — the ONE predicate, on the API
-// type, shared by the dispatchers and apiref packages). Every non-UAF RA caches
-// byte-identically to 1.12.2. Cost: a UAF /call re-resolves every time.
+// ================== 1.12.3 — A-1, THE SUPERSEDED POSTURE ================
+// WHAT THIS USED TO SAY, kept because the reasoning is the reason #561 was
+// possible to get wrong twice: "as of 1.12.3, NOTHING WHOSE BODY WAS NARROWED
+// BY A userAccessFilter IS CACHED — in any class."
 //
-// NOT THE FIX, AND DELIBERATELY SO. 1.13.0 replaces this with a UAF-SCOPE
-// DIGEST folded into the cache key (v7) — the requester's effective per-object
-// narrowing scope becomes part of the key, so divergent users get divergent
-// cells and caching is re-enabled for these RAs. The (d) TTL knob below is kept
-// INTACT (it is being chart-plumbed separately) precisely because it becomes
-// load-bearing again the moment v7 re-enables these Puts.
+// That was written against the PRE-#423 key, and its worked example is two users
+// who share a first-match binding and therefore derive an IDENTICAL key: one CRB
+// granting the group they are both in, divergent per-namespace RoleBindings. The
+// hit path writes entry.RawJSON verbatim with no re-narrowing, so the second
+// user was served the first user's rows within any TTL. A short TTL shortens a
+// cross-tenant leak; it does not close one — which is why A-1 declined the Put
+// outright rather than capping it.
+//
+// #423 then folded SubjectBindingSet into the identity segment and those two
+// users stopped colliding. The decline outlived its reason by six months, and
+// the cost was the whole portal: every data grid uncached, therefore
+// unsubscribable, therefore unable to live-refresh — measured at p95 1,814ms
+// uncached against 166ms cached, 44% of calls (#561).
+//
+// TWO SIGNALS, because one was not enough (R-1), and both are still read. The
+// first cut gated on the DECLARATION — "does the RESTAction being dispatched
+// declare a UAF stage?" — and that closed the direct /call on the RA while
+// leaving open the path the portal actually renders. Widgets fold the apiRef'd
+// RA's refiltered rows into their OWN status.widgetData (widgets/resolve.go),
+// and the declaring CR sits several resolver frames below the widget the
+// dispatcher holds, so the declaration predicate saw nothing there. Live
+// measurement settled it: 66 widgets apiRef a UAF RA, and the widgets cell
+// served 298,064 hits against 365 misses over 5d7h. So the gate also consults
+// an OBSERVED signal, cache.UAFTouchedSink, bumped where the refilter actually
+// runs and therefore blind to how far away the declaration is. Since #561 those
+// two signals feed the TTL stamp on the identity-bound classes and the decline
+// on the identity-free one.
+//
+// THE CARRIERS: restactions (dispatch, refresher, seed), widgets (dispatch,
+// seed), widgetContent (walker populate + pagination drain), raFullList
+// (bypassed at raFullListServe — see the RESIDUAL below).
+//
+// RESIDUAL, NOT FIXED HERE (#561 follow-up): raFullListServe still bypasses the
+// whole RAFullList layer for a declaring RA, by its own predicate rather than
+// through this gate. raFullList IS identity-bound and its key folds the same
+// #423 binding-set digest (RAFullListKeyInputs), so the #561 argument applies to
+// it unchanged — but lifting that bypass is a separate change to a separate
+// mechanism and is not in this one.
+//
+// SCOPE: exactly the RAs whose output is per-requester narrowed
+// (RESTAction.HasUserAccessFilterStage — the ONE predicate, on the API type,
+// shared by the dispatchers and apiref packages). Every non-UAF RA is
+// byte-identical to before.
+//
+// R-d-4 SITE MAP — the complete `ResolvedEntry{` Put enumeration and WHY each
+// site is or is not in scope (reasoned, not missed). Since #561 every
+// identity-bound site STAMPS HasUAF and sets TTLOverride; the identity-free
+// widgetContent site still DECLINES.
+//
+// IN SCOPE — the restactions sites:
+//   - restactions.go       — customer dispatch Put. Stamps HasUAF from the
+//                            declaration before the Put chain and from the sink
+//                            at the Put (the nested-RA case).
+//   - resolve_populate.go  — refresher re-Put (CreatedAt-slides on every
+//                            data-plane refresh; the C-118-6 crux site). It has
+//                            no RESTAction CR, so it carries the stored HasUAF
+//                            forward and re-stamps from its own re-resolve sink.
+//   - phase1_pip_seed.go seedOneRestaction — boot-seed Put. #561 removed its
+//                            pre-resolve SKIP (which existed only because the
+//                            Put that followed was certain to be declined) and
+//                            kept the stamp.
+//
+// IN SCOPE SINCE #561 — the widgets sites, which hold the same narrowed rows:
+//   - widgets.go           — customer dispatch Put.
+//   - phase1_pip_seed.go seedOneWidget — boot seed. #561 also deleted the #403
+//                            pre-resolve skip here; the widgets it skipped are
+//                            exactly the composition-data grids whose cold cost
+//                            #561 is about.
+//   Both stamp HasUAF from the SINK, because a widget CR declares no
+//   userAccessFilter of its own.
+//
+// STILL DECLINED — the identity-free sites, which reach the decline by TWO
+// different routes. Worth stating precisely, because an earlier version of this
+// map implied one route and the imprecision is how stale waivers start:
+//   - widget_content.go populateWidgetContentL1 — the shared envelope. It does
+//                            NOT call the shared gate; it reads
+//                            UAFTouchedSinkFromContext INLINE and bumps the
+//                            widget-family counter itself, as the third sibling
+//                            of its stage-error and external-touched gates.
+//                            Reached from both widgetContent Put paths
+//                            (phase1_walk.go, iterateApiRefPages), whose sink
+//                            set comes from the one withWidgetContentPutSinks
+//                            helper (#450). So a change to uafDeclineReason
+//                            does not move this site — mutate the inline gate
+//                            to test it.
+//   - resolve_populate.go, for a widgetContent cell — the refresher re-Put DOES
+//                            route through the shared rule (isWidgetClass →
+//                            declineWidgetUAFPut), so this is the live path on
+//                            which the identity-free carve-out above is
+//                            load-bearing.
+//
+// OUT OF SCOPE BY DESIGN:
+//   - apistage.go / cluster_list.go — CacheEntryClassApistage, keyed by
+//     contentKeyInputs(gvr, ns, name): IDENTITY-FREE shared substrate, the raw
+//     pre-refilter apiserver envelope. Its staleness is DATA-plane (an informer
+//     dirty-mark on the watched GVR invalidates it), NOT RBAC-refilter-output
+//     staleness. It carries NO BindingUID and NO per-user refilter output. Both
+//     already self-stamp the CATALOG_UNSERVABLE data-plane override.
+//   - (partial_result_ttl.go — the bounded-partial writer this map used to list
+//     was RETIRED in 1.12.6 C9; the stage-error branch is a bare decline again.)
+//
+// THE LESSON, recorded twice over so the next reader does not repeat it: a
+// comment of the form "X can no longer REACH this Put" is a stale-waiver smell.
+// It was wrong about which CLASS carries UAF output (the pre-1.12.3 text said
+// widgets never did; widgets/resolve.go says otherwise and it was the hot
+// carrier), and it was wrong about the decline outliving #423. Check such a
+// claim against the code before trusting it, and prefer a stamp that is correct
+// either way to a waiver that rests on a gate.
 //
 // ====================== #118 (d) — the TTL cap ==========================
 // #118 (d) interim short-TTL for userAccessFilter-bearing resolved cells.
@@ -290,30 +392,36 @@ func uafDeclineReason(inputs *cache.ResolvedKeyInputs, sink *cache.UAFTouchedSin
 
 // declineUAFPut is the RESTACTIONS-class gate: report whether the L1 Put for
 // this resolved entry must be SKIPPED because its body is narrowed PER
-// REQUESTER by a dependency the cache key does not fold.
+// REQUESTER and the key it would be stored under cannot separate requesters.
 //
-// ONE RULE, THREE SITES (#64 anti-shadow-drift). The customer dispatch Put
-// (restactions.go), the refresher re-Put (resolve_populate.go) and the boot seed
-// (phase1_pip_seed.go) all route their decision through THIS function, exactly
-// as they all route their TTL override through uafTTLOverrideForEntry. The
-// CR-bearing sites stamp inputs.HasUAF from restactionHasUAFStage; the refresher
-// — which has no CR — reads the HasUAF the original Put carried; and all of them
-// additionally consult the sink, which is what covers a non-UAF RA that NESTS a
-// UAF one. So the sites cannot diverge on what "UAF-bearing" means.
+// SINCE #561 IT RETURNS FALSE FOR EVERY CLASS THIS GATE ACTUALLY SEES on the
+// restactions path, because restactions is identity-bound (uafDeclineReason has
+// the argument). It is deliberately still CALLED from all three sites rather
+// than deleted from them: the gate is class-driven, so a site that one day
+// carries an identity-free class — or a class later moved into
+// identityFreeClasses — is covered without anyone remembering to re-add it.
+// That is the same #64 anti-shadow-drift discipline the single rule exists for.
+//
+// ONE RULE, THREE SITES. The customer dispatch Put (restactions.go), the
+// refresher re-Put (resolve_populate.go) and the boot seed (phase1_pip_seed.go)
+// all route their decision through THIS function, exactly as they all route
+// their TTL override through uafTTLOverrideForEntry. So the sites cannot
+// diverge on what "UAF-bearing" means.
 //
 // THE COUNTER IS BUMPED HERE, not at the call sites: bumping inside the gate
 // makes "the counter ticked" and "a Put was skipped" the same event, so
 // snowplow_restactions_uaf_put_declined_total cannot drift from it. The helper
 // is therefore NOT side-effect-free — call it exactly once per candidate Put, at
-// the decision point.
+// the decision point. Reading zero on it is now the EXPECTED steady state for a
+// restactions workload, not evidence of health
+// (feedback_a_counter_whose_zero_reads_as_health_is_not_a_detector): what the
+// decline rate is read from today is the widgets counter below, which still
+// counts the identity-free widgetContent carrier.
 //
-// NO TOGGLE, by design. This is a confirmed cross-tenant correctness defect, so
-// there is no env flag to switch the leak back on (no flag-parking); the
-// mechanism is instead cleanly REMOVABLE — 1.13.0 deletes these helpers and
-// their call sites when the UAF-scope digest lands in the key (v7).
-//
-// No declaration and no observed refilter → false: byte-identical to 1.12.2 for
-// every non-UAF entry, which is every entry in a deployment with no UAF RA.
+// NO TOGGLE, by design. There is no env flag to switch the posture back (no
+// flag-parking); the mechanism is cleanly REMOVABLE — 1.13.0 deletes these
+// helpers and their call sites when the UAF-scope digest lands in the key (v7)
+// and makes the identity-free classes separable too.
 func declineUAFPut(inputs *cache.ResolvedKeyInputs, sink *cache.UAFTouchedSink) bool {
 	if uafDeclineReason(inputs, sink) == "" {
 		return false
@@ -322,20 +430,30 @@ func declineUAFPut(inputs *cache.ResolvedKeyInputs, sink *cache.UAFTouchedSink) 
 	return true
 }
 
-// declineWidgetUAFPut is the WIDGETS/WIDGETCONTENT-class gate — the R-1 carrier.
+// declineWidgetUAFPut is the WIDGET-FAMILY gate — widgets AND widgetContent.
 // Same rule (uafDeclineReason), separate counter.
 //
-// WHY A SEPARATE COUNTER AND NOT A SHARED ONE: this is the cell the portal
-// actually renders from (66 live widgets apiRef a UAF RA; 298,064 hits vs 365
-// misses over 5d7h), so its decline rate is the number an operator watches to
-// see the real cost of the mitigation. Summing it into the restactions counter
-// would bury a 300K-hit class under a 365-miss one.
+// SINCE #561 THE TWO HALVES OF THAT FAMILY ANSWER DIFFERENTLY, which is the
+// whole point of routing them through one class-driven rule:
+// WIDGETS is identity-BOUND and never declines. The cell is keyed per
+// requester-binding-set, so a narrowed body in it is that requester's own; the
+// Put sites stamp HasUAF instead and cap the cell's warm life.
 //
-// In practice this class declines on uafDeclineObserved: a widget CR declares no
+// WIDGETCONTENT is identity-FREE and still declines on every refilter. One cell
+// serves every requester and its serve-time gate re-derives only
+// resourcesRefs[].allowed — it NEVER narrows status.widgetData — so a narrowed
+// body in it is read by everyone.
+//
+// WHY A SEPARATE COUNTER AND NOT A SHARED ONE: this family is what the portal
+// actually renders from (66 live widgets apiRef a UAF RA; 298,064 hits vs 365
+// misses over 5d7h), so its decline rate is the number an operator watches.
+// Since #561 the number it carries is the identity-free carrier's declines
+// alone, which is now the only population being declined anywhere.
+//
+// In practice the declines fire on uafDeclineObserved: a widget CR declares no
 // userAccessFilter of its own — the declaration lives on the apiRef'd RESTAction
-// several resolver frames below — so the sink is the signal that fires. The
-// declaration limb is still consulted for uniformity and for any future path
-// that stamps HasUAF on a widgets-class ResolvedKeyInputs.
+// several resolver frames below — so the sink is the signal. The declaration
+// limb is still consulted for uniformity.
 func declineWidgetUAFPut(inputs *cache.ResolvedKeyInputs, sink *cache.UAFTouchedSink) bool {
 	if uafDeclineReason(inputs, sink) == "" {
 		return false

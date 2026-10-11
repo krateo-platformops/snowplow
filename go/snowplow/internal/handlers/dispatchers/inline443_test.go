@@ -485,11 +485,23 @@ func TestS443_Inline(t *testing.T) {
 	})
 
 	t.Run("c7_HandlerPutChainAndObserveLiveCaller", func(t *testing.T) {
-		// A userAccessFilter stage: on a STORED resolve the refilter marks the
-		// resolve UAF-touched and the handler Put chain declines it (the UAF
-		// Put-decline counter), and observeLiveCaller registers the caller's
-		// learned identity class (the request carries a JWT with an expiry).
-		// Neither may happen inert.
+		// (g) the handler's L1 Put chain and (h) observeLiveCaller's learned
+		// identity class. Neither may happen on an inert (dry-run) resolve.
+		//
+		// #561 CHANGED THE OBSERVABLE FOR (g), and the new one is the better of
+		// the two. The control used to prove the Put chain had run by watching the
+		// UAF Put-DECLINE counter move: the stage declares a userAccessFilter, the
+		// refilter marked the resolve, and the chain declined. #561 scoped that
+		// decline to identity-free classes, and restactions is identity-bound, so
+		// the counter no longer moves and the old control would be asserting a
+		// behaviour that is now gone.
+		//
+		// The chain is now observed by what it actually does: it PUTS. A stored
+		// resolve of a UAF stage must leave a new L1 cell behind — which is both a
+		// more direct witness that the chain ran AND the #561 behaviour itself
+		// (before #561 this exact resolve left NO cell, which is why every
+		// composition data grid was cold). The inert half is unchanged: inert must
+		// still add no key and learn no identity.
 		f := in443Setup(t)
 		cache.ResetLearnedIdentitiesForTest()
 		t.Cleanup(cache.ResetLearnedIdentitiesForTest)
@@ -509,8 +521,16 @@ func TestS443_Inline(t *testing.T) {
 			t.Fatalf("control: code=%d", rec.Code)
 		}
 		after := takeIn443State(t)
-		if after.uafDeclined == ctl.uafDeclined {
-			t.Errorf("CONTROL: a stored resolve of the UAF stage did not move the UAF Put-decline counter — (g) is not observable")
+		if len(after.l1Keys) <= len(ctl.l1Keys) {
+			t.Errorf("CONTROL: a stored resolve of the userAccessFilter stage left no new L1 cell "+
+				"(%d keys before, %d after) — either the handler Put chain did not run, so (g) is not "+
+				"observable here, or the #561 posture has regressed and narrowed bodies are being "+
+				"declined again for an identity-bound class", len(ctl.l1Keys), len(after.l1Keys))
+		}
+		if after.uafDeclined != ctl.uafDeclined {
+			t.Errorf("the restactions UAF Put-decline fired on an identity-bound class (%d → %d) — #561 scopes "+
+				"the decline to identity-free classes; a decline here means the cell is uncached and "+
+				"unsubscribable again", ctl.uafDeclined, after.uafDeclined)
 		}
 		if after.learned == ctl.learned {
 			t.Errorf("CONTROL: a stored resolve did not register the caller's learned identity — (h) is not observable")

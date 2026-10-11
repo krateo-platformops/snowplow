@@ -454,17 +454,20 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		return nil
 	}
 
-	// 1.12.3 A-1 (SECURITY, cross-tenant) — DECLINE the re-Put for a UAF-bearing
-	// cell, the refresher leg of the shared three-site gate. The refresher has no
-	// RESTAction CR, so it consults the CARRIED inputs.HasUAF the original Put
-	// recorded — the same single-source shape C-118-6 established for the TTL
-	// override. DEFENSIVE SYMMETRY: since 1.12.3 no UAF cell can be created (all
-	// three Put sites decline), so the refresher should never be handed one; but
-	// a residual cell — an entry written by a pre-1.12.3 process image, or a
-	// future path that starts caching UAF output again — must not be REFRESHED
-	// into a longer life. Structurally identical to the external-touched re-Put
-	// gate above: keep whatever entry exists, decline the write, TTL is the outer
-	// net. Byte-identical to 1.12.2 for every non-UAF cell (HasUAF false).
+	// #561 — the refresher leg of the shared gate, now REACHABLE ONLY for an
+	// identity-free class. The pre-#561 text here said the refresher "should
+	// never be handed" a UAF cell because no Put site could create one; that is
+	// no longer true for the identity-bound classes, which cache narrowed bodies
+	// again under keys that separate their requesters (#423/#588). For those this
+	// gate returns "" and the re-Put proceeds — which is the whole point of
+	// #561: a composition-data cell that cannot be refreshed cannot live-refresh,
+	// and cannot be subscribed to at all.
+	//
+	// It still fires for an identity-free cell, where ONE cell is shared by every
+	// requester and a narrowed body in it is an unconditional cross-tenant leak
+	// no key change short of making the class identity-bound can fix. Same shape
+	// as the external-touched re-Put gate above: keep whatever entry exists,
+	// decline the write, TTL is the outer net.
 	if reason := uafDeclineReason(&inputs, uafTouchedSink); reason != "" {
 		// Count under the class the cell actually belongs to, so the widgets
 		// carrier's refresh declines do not get buried in the restactions number.
@@ -513,6 +516,16 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			inputs.CacheEntryClass, inputs.Name, drift, errRepresentativeDriftedMidRefresh)
 	}
 
+	// #561 — carry the UAF fact forward across the re-Put. The refresher builds a
+	// FRESH entry with a zero CreatedAt, so a cell that slides forward on every
+	// data-plane refresh keeps its cap only if HasUAF survives the round trip.
+	// The declaration limb already does (it is stored on the Inputs); the
+	// OBSERVED limb does not, so a nested-UAF cell would quietly lose its cap the
+	// first time the refresher touched it. Stamp it from this re-resolve's own
+	// sink, the same way the dispatch and seed Puts now do.
+	if uafTouchedSink.Count() > 0 {
+		inputs.HasUAF = true
+	}
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &inputs,

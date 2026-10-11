@@ -126,7 +126,12 @@ var cacheAllow443 = map[string]cacheClass443{
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "IdentityClass.String": readOnly443,
 	"Inert": readOnly443, "InformerOnlyReadsFromContext": readOnly443, "InternalEndpointFromContext": readOnly443,
-	"WithInformerOnlyReads":         readOnly443, // #403: ctx builder for the informer-only UAF pre-check read
+	// #561 removed "WithInformerOnlyReads" from this table: it was listed for
+	// #403's informer-only UAF pre-check read, and #561 deleted that pre-check
+	// (the widgets cell it short-circuited is no longer declined, so there is
+	// nothing to skip the resolve for). The ctx builder itself is untouched and
+	// still used by the /refreshes arming path — it is simply no longer reached
+	// from the resolve path this table enumerates.
 	"InternalRESTConfigFromContext": readOnly443, "IsResolverGVRHit": readOnly443, "IsResolverPluralsHit": readOnly443,
 	"IsStructurallyNonSliceable": readOnly443, "L1KeyFromContext": readOnly443, "LayeredSourcesMark": readOnly443,
 	"LayeredSourcesSince": readOnly443, "LiveRBACSnapshot": readOnly443, "NestedCallDepthFromContext": readOnly443,

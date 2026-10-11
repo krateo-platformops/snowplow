@@ -88,53 +88,116 @@ func TestR1_WidgetContentPopulate_DeclinesOnRefilter_ControlPopulates(t *testing
 	}
 }
 
-// TestR1_WidgetSeedGate_DeclinesOnRefilter_ControlSeeds covers the seedOneWidget
-// leg at the level the gate actually operates: the shared widgets-class decision
+// TestR1_WidgetSeedGate_ClassRuleHoldsAtTheSeedCarrier covers the seedOneWidget
+// leg at the level the gate actually operates: the shared widget-family decision
 // over (inputs, sink).
 //
-// WHY NOT AN END-TO-END seedOneWidget DRIVE like the restactions seed arm: that
-// arm works because seedOneRestaction has a resolve+Put TAIL SEAM
-// (seedRestactionResolveAndPutFn) to observe. seedOneWidget has no equivalent
-// seam and calls widgets.Resolve directly, which dials the apiserver — so an
-// end-to-end hermetic drive is not available without adding a production seam
-// purely for the test. The wiring that the gate IS called there is pinned
-// structurally instead, by TestA1_EveryResolvedEntryPutSiteIsUAFGatedOrWaived,
-// which walks the AST and requires seedOneWidget's ResolvedEntry literal to sit
-// in a function that consults the gate. Behaviour here, wiring there.
-func TestR1_WidgetSeedGate_DeclinesOnRefilter_ControlSeeds(t *testing.T) {
+// WHY NOT AN END-TO-END seedOneWidget DRIVE for the predicate: the end-to-end
+// behaviour of that leg is pinned by
+// TestR1_SeedOneWidget_ResolveCtxCarriesTheGatesSink, which drives the real
+// function through the widgetsResolveFn seam. What is left to pin here is the
+// RULE the seed's own inputs shape resolves to, which is a different question
+// and the one #561 changed.
+//
+// #561 TURNED THIS FROM A ONE-SIDED ARM INTO A TWO-SIDED ONE, and the second
+// side is why it was not simply inverted. The widget family spans BOTH sides of
+// the class rule, and the seed carrier's inputs are the shape that makes the
+// distinction concrete:
+//
+//	widgets        — identity-BOUND. The pre-#561 arm asserted the seed MUST
+//	                 decline, on the grounds that a cohort REPRESENTATIVE's
+//	                 narrowing would be read by every co-bound member. The
+//	                 post-#423 key folds the requester's full binding set, and
+//	                 the representative's binding set IS a group-only member's
+//	                 (TestKey423_SeedRepresentativeParity), so the members who
+//	                 share that cell are exactly the members who deserve its
+//	                 rows. A member with any extra binding derives a different
+//	                 key. The seed must NOT decline.
+//
+//	widgetContent  — identity-FREE. One cell, every requester, no identity in
+//	                 the key at all. The seed must STILL decline, and that half
+//	                 of the gate is what keeps the pre-#561 protection where it
+//	                 is still needed.
+//
+// Driving both halves through ONE gate call with only the class differing is the
+// point: it fails if the rule ever stops being per-class — in either direction.
+func TestR1_WidgetSeedGate_ClassRuleHoldsAtTheSeedCarrier(t *testing.T) {
 	cache.RegisterUAFPutDeclineMetricsForTest()
 	cache.ResetUAFPutDeclineCountersForTest()
 	t.Cleanup(cache.ResetUAFPutDeclineCountersForTest)
 
 	// The seed's inputs never carry HasUAF for a widget — the declaration lives
 	// on the apiRef'd RESTAction, frames below. So the OBSERVED limb is the only
-	// one that can fire here, which is exactly the R-1 shape.
-	seedInputs := &cache.ResolvedKeyInputs{
-		CacheEntryClass:        "widgets",
-		Namespace:              h1NS,
-		Name:                   h1WName,
-		BindingUID:             "uid-shared-portal-binding",
-		RepresentativeUsername: a1Alice,
+	// one that can fire here, which is exactly the R-1 shape. Everything else
+	// about these inputs is held constant across the two arms so the CLASS is
+	// the only thing that differs.
+	seedInputs := func(class string) *cache.ResolvedKeyInputs {
+		return &cache.ResolvedKeyInputs{
+			CacheEntryClass:        class,
+			Namespace:              h1NS,
+			Name:                   h1WName,
+			BindingUID:             "uid-shared-portal-binding",
+			SubjectBindingSet:      "digest-of-the-representatives-bindings",
+			RepresentativeUsername: a1Alice,
+		}
+	}
+	marked := func(t *testing.T) *cache.UAFTouchedSink {
+		t.Helper()
+		_, sink := cache.WithUAFTouchedSink(context.Background())
+		sink.Bump() // the apiRef chokepoint marked the widget's resolve
+		return sink
 	}
 
-	_, sink := cache.WithUAFTouchedSink(context.Background())
-	sink.Bump() // the apiRef chokepoint marked the widget's resolve
-	if !declineWidgetUAFPut(seedInputs, sink) {
-		t.Fatal("R-1 RED (widget seed carrier): the boot seed would Put a refilter-narrowed widget envelope under a " +
-			"per-BINDING key held by a cohort REPRESENTATIVE — every co-bound cohort member reads the representative's " +
-			"rows on their first paint. The seed must decline.")
-	}
-	if got := cache.WidgetsUAFPutDeclined(); got != 1 {
-		t.Fatalf("the widget seed decline must tick the widgets-class counter; got %d", got)
-	}
+	t.Run("identity_free_widgetContent_still_declines", func(t *testing.T) {
+		cache.ResetUAFPutDeclineCountersForTest()
+		if !cache.IsIdentityFreeClass(cache.CacheEntryClassWidgetContent) {
+			t.Fatal("PRECONDITION: widgetContent must be identity-free, or this arm is testing the wrong half " +
+				"of the rule and would pass for the wrong reason")
+		}
+		if !declineWidgetUAFPut(seedInputs(cache.CacheEntryClassWidgetContent), marked(t)) {
+			t.Fatal("R-1 RED (identity-free carrier): a refilter-narrowed envelope would be seeded into the " +
+				"IDENTITY-FREE shared content cell, which folds NO identity whatsoever and whose serve-time gate " +
+				"never narrows status.widgetData — EVERY user would be served the resolving identity's rows. " +
+				"#561 scopes the decline by class; it does not remove it.")
+		}
+		if got := cache.WidgetsUAFPutDeclined(); got != 1 {
+			t.Fatalf("the decline must tick the widget-family counter exactly once; got %d", got)
+		}
+	})
 
-	// CONTROL: an identical seed unit whose resolve ran no refilter still seeds.
-	_, cleanSink := cache.WithUAFTouchedSink(context.Background())
-	if declineWidgetUAFPut(seedInputs, cleanSink) {
-		t.Fatal("R-1 CONTROL BROKE: a widget seed whose resolve ran NO refilter must still be Put — otherwise the " +
-			"gate has disabled the widget boot seed wholesale and every cold paint regresses")
-	}
-	if got := cache.WidgetsUAFPutDeclined(); got != 1 {
-		t.Fatalf("control: a non-refiltered seed must not tick the decline counter; total went to %d", got)
-	}
+	t.Run("identity_bound_widgets_no_longer_declines", func(t *testing.T) {
+		cache.ResetUAFPutDeclineCountersForTest()
+		if cache.IsIdentityFreeClass("widgets") {
+			t.Fatal("PRECONDITION: widgets must be identity-BOUND — if it has been moved into identityFreeClasses " +
+				"then #561's whole argument (the key separates requesters) no longer holds for it and the decline " +
+				"must come back, not this assertion")
+		}
+		if declineWidgetUAFPut(seedInputs("widgets"), marked(t)) {
+			t.Fatal("#561 RED: the boot seed declined a refilter-narrowed widget cell. The widgets key folds the " +
+				"requester's full binding set (#423), two members served different narrowings necessarily hold " +
+				"different binding sets, and the cohort representative's binding set is a real group-only " +
+				"member's — so this cell is the cohort's own. Declining it is what left every composition data " +
+				"grid uncached, unsubscribable and cold (p95 1,814ms vs 166ms).")
+		}
+		if got := cache.WidgetsUAFPutDeclined(); got != 0 {
+			t.Fatalf("a seed that was not declined must not tick the counter; got %d", got)
+		}
+	})
+
+	t.Run("control_no_refilter_never_declines_in_either_class", func(t *testing.T) {
+		// Without this, a gate hard-wired to "decline iff identity-free" would
+		// pass both arms above while having stopped reading the sink at all.
+		for _, class := range []string{"widgets", cache.CacheEntryClassWidgetContent} {
+			cache.ResetUAFPutDeclineCountersForTest()
+			_, cleanSink := cache.WithUAFTouchedSink(context.Background())
+			if declineWidgetUAFPut(seedInputs(class), cleanSink) {
+				t.Fatalf("CONTROL BROKE (%s): a widget seed whose resolve ran NO refilter must be Put — the gate "+
+					"has stopped reading the sink and now declines on class alone, which would disable the seed "+
+					"for the whole identity-free layer regardless of content", class)
+			}
+			if got := cache.WidgetsUAFPutDeclined(); got != 0 {
+				t.Fatalf("control (%s): a non-refiltered seed must not tick the decline counter; got %d", class, got)
+			}
+		}
+	})
 }
