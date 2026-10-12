@@ -23,8 +23,19 @@ import (
 
 // TestSeedMemo_NotConsultedOffSeedPath — C-F4-8. The memo lookup in
 // apiref.Resolve is `memo := cache.SeedResolveMemoFromContext(ctx)`; it must be
-// nil for every non-seed ctx so the /call path is provably untouched. A user
-// /call, the discovery walk, and the refresher NEVER install a memo.
+// nil on the REQUEST path so a /call is provably untouched.
+//
+// #598 NARROWED WHAT THIS PROVES, deliberately. The refresher now installs a
+// memo — but it does so inside resolveAndPopulateL1, NOT in
+// WithBackgroundResolve. So the refresher arm below still holds and is still
+// worth keeping: being a background ctx does not by itself grant a memo, and a
+// future caller that stamps WithBackgroundResolve without going through
+// resolveAndPopulateL1 must not silently acquire one.
+//
+// What this file can no longer claim is that the refresher never has a memo.
+// That property moved to dispatchers/issue598_refresh_memo_test.go ARM1, which
+// drives resolveAndPopulateL1 itself — because a test that builds its own ctx
+// cannot see a change to the real builder.
 func TestSeedMemo_NotConsultedOffSeedPath(t *testing.T) {
 	cacheOn(t)
 
@@ -36,11 +47,14 @@ func TestSeedMemo_NotConsultedOffSeedPath(t *testing.T) {
 	if m := cache.SeedResolveMemoFromContext(bootWalkCtx(t)); m != nil {
 		t.Fatal("RED: the discovery-walk ctx carried a seed-resolve memo. C-F4-8.")
 	}
-	// Refresher ctx (WithBackgroundResolve) — no memo.
+	// A BARE background ctx — no memo. #598's memo is installed by
+	// resolveAndPopulateL1, not by WithBackgroundResolve, so this must stay nil:
+	// the stamp alone must never confer a memo.
 	refCtx := cache.WithBackgroundResolve(xcontext.BuildContext(t.Context(),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "admin"})))
 	if m := cache.SeedResolveMemoFromContext(refCtx); m != nil {
-		t.Fatal("RED: the refresher ctx carried a seed-resolve memo. C-F4-8.")
+		t.Fatal("RED: a bare WithBackgroundResolve ctx carried a resolve memo — the background " +
+			"stamp must not confer one; only resolveAndPopulateL1 installs it (#598). C-F4-8.")
 	}
 	// Bare context — no memo.
 	if m := cache.SeedResolveMemoFromContext(context.Background()); m != nil {

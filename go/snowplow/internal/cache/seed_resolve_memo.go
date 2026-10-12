@@ -23,6 +23,15 @@
 //     /call context never carries a memo, so SeedResolveMemoFromContext returns
 //     nil there and the memo is a strict no-op on the request path (C-F4-8).
 //
+//     #598 ADDED A SECOND INSTALLER: the REFRESHER (resolveAndPopulateL1) now
+//     installs a process-held memo of this same type, for the same reason on a
+//     different caller — one dirty-mark burst re-resolves the same RESTAction
+//     once per widget sharing it. The teardown argument above is what that memo
+//     had to answer, and it answers it two ways: a /call still carries no memo
+//     (unchanged, and the load-bearing half), and a stale body is already
+//     refused by the #411 dep-moved check below rather than by teardown. See
+//     dispatchers/refresh_resolve_memo.go.
+//
 //   - RBAC SAFETY (C-F4-4): the memo KEY folds the full RBAC-determining
 //     identity — username + sorted groups, exactly the (Username, Groups) that
 //     internal/resolvers/restactions/api/refilter.go + cluster_list.go +
@@ -332,11 +341,12 @@ func NewSeedResolveMemo(copyFn func(map[string]any) map[string]any) *SeedResolve
 	return &SeedResolveMemo{copyFn: copyFn}
 }
 
-// WithSeedResolveMemo returns a child context carrying memo. Installed ONLY by
-// the seed pass (withCohortSeedContext) — a user /call, the refresher, and the
-// discovery walk never install one, so the memo is a strict no-op off the seed
-// path (C-F4-8). Inert under Disabled(): returns ctx unchanged so a cache-off
-// process carries no memo.
+// WithSeedResolveMemo returns a child context carrying memo. Installed by the
+// seed pass (withCohortSeedContext) and, since #598, by the refresher
+// (resolveAndPopulateL1). A user /call and the discovery walk never install one,
+// so the memo remains a strict no-op on the request path (C-F4-8) — that half of
+// the invariant is unchanged and is the one that matters. Inert under
+// Disabled(): returns ctx unchanged so a cache-off process carries no memo.
 func WithSeedResolveMemo(ctx context.Context, memo *SeedResolveMemo) context.Context {
 	if ctx == nil || memo == nil || Disabled() {
 		return ctx
@@ -346,8 +356,9 @@ func WithSeedResolveMemo(ctx context.Context, memo *SeedResolveMemo) context.Con
 
 // SeedResolveMemoFromContext returns the *SeedResolveMemo installed on ctx, or
 // nil when none is present. A nil return MUST be treated as "no memo — always
-// resolve" (the methods are nil-receiver-safe). Off the seed path this is
-// always nil, which is what makes the memo provably untouched on the /call path.
+// resolve" (the methods are nil-receiver-safe). On the /call and discovery-walk
+// paths this is always nil, which is what makes the memo provably untouched on
+// the request path; since #598 the refresher DOES carry one.
 func SeedResolveMemoFromContext(ctx context.Context) *SeedResolveMemo {
 	if ctx == nil {
 		return nil

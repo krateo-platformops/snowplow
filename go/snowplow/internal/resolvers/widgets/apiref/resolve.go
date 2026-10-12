@@ -275,10 +275,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		return rawExtensionToMap(local.Status)
 	}
 
-	// #130 F4 — per-seed-pass RA-resolve memo. Installed ONLY on the boot-seed
-	// context (cache.WithSeedResolveMemo in withCohortSeedContext); nil (a strict
-	// no-op) on the user /call path, the refresher, and the discovery walk, so
-	// the request path is provably untouched (C-F4-8). The memo collapses the
+	// #130 F4 — the RA-resolve memo. Installed on the boot-seed context
+	// (cache.WithSeedResolveMemo in withCohortSeedContext) and, since #598, on
+	// the refresher's re-resolve context (resolveAndPopulateL1); nil (a strict
+	// no-op) on the user /call path and the discovery walk, so the REQUEST path
+	// is provably untouched (C-F4-8). #598 uses the same mechanism for the same
+	// reason on a different caller: one dirty-mark burst re-resolves the same
+	// RESTAction once per widget sharing it (44 widgets on one RA at the hottest
+	// coordinate on 057). The memo collapses the
 	// ~71 statistics/tag widgets that share a small set of heavy RESTActions
 	// (compositions-list / dashboard-data — ~18s of gojq over the 60K benchapps
 	// array each) to ONE real resolve per distinct (RA, identity, page, extras)
