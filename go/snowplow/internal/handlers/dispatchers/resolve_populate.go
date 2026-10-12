@@ -298,6 +298,20 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// recording site re-records dep edges for this refresh.
 	rctx = cache.WithL1KeyContext(rctx, key)
 
+	// #598 — collapse the duplicate RA resolves inside one dirty-mark burst.
+	// One object event dirties every cell on its coordinate and the refresher
+	// re-resolves each independently; on 057 that is 44 widgets sharing the one
+	// `incident-detail` RESTAction with identical keyExtras, each paying its own
+	// parseListEnvelope. The memo is the existing #130 F4 mechanism, keyed on
+	// (RA, identity, RBAC class, extras, page), so a hit is only ever served to a
+	// caller that would have computed a byte-identical body. Freshness is the
+	// memo's own #411 guard: an entry whose captured deps moved past its Stamp is
+	// a MISS, and a refresh is triggered by exactly such a move, so the burst's
+	// first cell resolves fresh and its siblings hit that fresh entry.
+	// See refresh_resolve_memo.go for why a process-held memo is safe here when
+	// F4 refused one for the seed.
+	rctx = cache.WithSeedResolveMemo(rctx, refreshResolveMemo())
+
 	// Ship 0.30.120 layer (b) — error-aware Put-gate. Install a
 	// stage-error sink on the re-resolve context. The api resolver bumps
 	// it whenever it writes dict[call.ErrorKey] (a swallowed,
