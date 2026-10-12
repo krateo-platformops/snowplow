@@ -615,6 +615,16 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// #354 P3 — report the terminal write's outcome to the refresher's dequeue
 	// (accepted closes the invalidation→fresh window unless #375 remarked it;
 	// refused ends it evicted). A no-op off the refresher.
+	// #604 instrument (refresh_rebuild_identity.go): classify this rebuild as
+	// a no-op or a real change against the entry it is ABOUT to replace, so the
+	// comparison is with what is actually being overwritten rather than with a
+	// snapshot read earlier in this function. GetNoTouch, not Get: this is an
+	// internal read and must not stamp lastRead/hitTotal (it would feed the
+	// self-#316 loop and contaminate warm_lastread). Observation only — nothing
+	// below is gated on the verdict.
+	rebuildPrior, hadRebuildPrior := c.GetNoTouch(key)
+	noteRefreshRebuild(rebuildPrior, hadRebuildPrior, encoded)
+
 	stored := c.ReplaceIfGenRefresh(rctx, key, entry, gen0)
 	cache.NoteRefreshWrite(rctx, key, stored)
 	if !stored {
