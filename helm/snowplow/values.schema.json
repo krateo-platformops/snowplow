@@ -96,6 +96,30 @@
       "description": "Service account configuration.",
       "title": "Service Account"
     },
+    "rbac": {
+      "type": "object",
+      "additionalProperties": false,
+      "title": "RBAC",
+      "description": "#574 \u2014 which cohorts the background refresher may read as. Both lists are EMPTY by default and each renders NO ClusterRole rule when empty: in Kubernetes RBAC an empty resourceNames means EVERY resource of that type, so rendering an empty rule would permit impersonating every group on the cluster. An unlisted cohort is simply not background-refreshed \u2014 it 403s at dial, the cache Put declines as it does today, and the cell expires at TTL and refills on read.",
+      "properties": {
+        "impersonateGroups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "title": "Impersonate groups",
+          "description": "Groups the background refresher may impersonate. NEVER list a privileged group: impersonating a group DOES grant everything it is bound to. Contrast users, which the ClusterRole grants unconditionally because impersonating a user does not inherit that user's groups."
+        },
+        "impersonateServiceAccounts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "title": "Impersonate service accounts",
+          "description": "ServiceAccounts the background refresher may impersonate, for cohorts whose binding subject is a ServiceAccount. A ServiceAccount carries its rights directly, so this escalates exactly as groups do \u2014 allowlist it the same way."
+        }
+      }
+    },
     "podAnnotations": {
       "type": "object",
       "additionalProperties": true,
@@ -232,7 +256,7 @@
           "properties": {
             "cpu": {
               "x-kubernetes-int-or-string": true,
-              "description": "CPU limit — a Kubernetes Quantity: integer cores or a string like \"500m\"/\"1\".",
+              "description": "CPU limit \u2014 a Kubernetes Quantity: integer cores or a string like \"500m\"/\"1\".",
               "title": "CPU"
             },
             "memory": {
@@ -250,7 +274,7 @@
           "properties": {
             "cpu": {
               "x-kubernetes-int-or-string": true,
-              "description": "CPU request — a Kubernetes Quantity: integer cores or a string like \"500m\"/\"1\".",
+              "description": "CPU request \u2014 a Kubernetes Quantity: integer cores or a string like \"500m\"/\"1\".",
               "title": "CPU"
             },
             "memory": {
@@ -538,7 +562,7 @@
         },
         "DEBUG": {
           "type": "string",
-          "description": "DEPRECATED (#163) — a thin alias for LOG_LEVEL=debug, kept only for back-compat. This chart no longer sets it; use LOG_LEVEL instead.",
+          "description": "DEPRECATED (#163) \u2014 a thin alias for LOG_LEVEL=debug, kept only for back-compat. This chart no longer sets it; use LOG_LEVEL instead.",
           "title": "DEBUG (deprecated)"
         },
         "BLIZZARD": {
@@ -583,7 +607,7 @@
         },
         "DEPS_RECONCILE_SAMPLE": {
           "type": "string",
-          "description": "1.12.6 C3 sampled reconcile audit: resident L1 entries sampled per tick and probed against the informer indexer (ABSENT → handed to the dep-event worker). Bounded O(sample) under the store mutex. Unset/unparseable/non-positive falls back to 512.",
+          "description": "1.12.6 C3 sampled reconcile audit: resident L1 entries sampled per tick and probed against the informer indexer (ABSENT \u2192 handed to the dep-event worker). Bounded O(sample) under the store mutex. Unset/unparseable/non-positive falls back to 512.",
           "title": "Deps Reconcile Sample"
         },
         "DEPS_RECONCILE_PERIOD_SECONDS": {
@@ -598,7 +622,7 @@
         },
         "RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS": {
           "type": "string",
-          "description": "1.12.6 bounded L1 entry lifetime (seconds), measured from the FIRST Put under a key and not reset by refresh re-Puts (unlike RESOLVED_CACHE_TTL_SECONDS, which every Put resets). Past it the entry is evicted on Get and re-resolved from scratch — the backstop for a wrong refresh the event pipeline would otherwise keep re-serving. 0 disables.",
+          "description": "1.12.6 bounded L1 entry lifetime (seconds), measured from the FIRST Put under a key and not reset by refresh re-Puts (unlike RESOLVED_CACHE_TTL_SECONDS, which every Put resets). Past it the entry is evicted on Get and re-resolved from scratch \u2014 the backstop for a wrong refresh the event pipeline would otherwise keep re-serving. 0 disables.",
           "title": "Resolved Cache Max Entry Age Seconds"
         },
         "REFRESH_SUPPRESS_AFTER_DECLINES": {
@@ -623,7 +647,7 @@
         },
         "OTEL_EXPORTER_OTLP_ENDPOINT": {
           "type": "string",
-          "description": "OTLP/HTTP collector endpoint. Default http://$(HOST_IP):4318 targets the node-local OTel collector daemonset agent (hostPort 4318), the only OTLP ingest on the platform; $(HOST_IP) is expanded by the Deployment. The collector *deployment* Service has no OTLP receiver — do not point here.",
+          "description": "OTLP/HTTP collector endpoint. Default http://$(HOST_IP):4318 targets the node-local OTel collector daemonset agent (hostPort 4318), the only OTLP ingest on the platform; $(HOST_IP) is expanded by the Deployment. The collector *deployment* Service has no OTLP receiver \u2014 do not point here.",
           "title": "OTEL Exporter OTLP Endpoint"
         },
         "OTEL_TRACES_SAMPLER": {
@@ -633,12 +657,12 @@
         },
         "OTEL_TRACES_SAMPLER_ARG": {
           "type": "string",
-          "description": "Sampling ratio for OTEL_TRACES_SAMPLER (\"0.05\" = 5% of root traces). The SDK default with no sampler is 100% — always set together with OTEL_ENABLED.",
+          "description": "Sampling ratio for OTEL_TRACES_SAMPLER (\"0.05\" = 5% of root traces). The SDK default with no sampler is 100% \u2014 always set together with OTEL_ENABLED.",
           "title": "OTEL Traces Sampler Arg"
         },
         "OTEL_LOGS_ENABLED": {
           "type": "string",
-          "description": "OTLP log export (audit events). Ship \"false\": the collector agent's logs pipeline accepts filelog only, so an OTLP log export has no consumer. Logs stay stdout → filelog.",
+          "description": "OTLP log export (audit events). Ship \"false\": the collector agent's logs pipeline accepts filelog only, so an OTLP log export has no consumer. Logs stay stdout \u2192 filelog.",
           "title": "OTEL Logs Enabled"
         },
         "PRETTY_LOG": {
@@ -696,14 +720,29 @@
     "seedAuthn": {
       "type": "object",
       "additionalProperties": false,
-      "description": "#57 prewarm seed→authn loopback-token artifacts (projected audience=authn SA token + authn ServiceAccount allowlist CR + seed-group ClusterRole/Binding). Default off; enabling requires the authn operator's serviceaccount.authn.krateo.io CRD.",
+      "description": "#57 prewarm seed\u2192authn loopback-token artifacts (projected audience=authn SA token + authn ServiceAccount allowlist CR + seed-group ClusterRole/Binding). Default off; enabling requires the authn operator's serviceaccount.authn.krateo.io CRD.",
       "title": "Seed Authn",
       "properties": {
-        "enabled": { "type": "boolean", "title": "Enabled" },
-        "group": { "type": "string", "title": "Issued Group" },
-        "authnNamespace": { "type": "string", "title": "Authn Namespace" },
-        "tokenAudience": { "type": "string", "title": "Token Audience" },
-        "tokenPath": { "type": "string", "title": "Token Path" }
+        "enabled": {
+          "type": "boolean",
+          "title": "Enabled"
+        },
+        "group": {
+          "type": "string",
+          "title": "Issued Group"
+        },
+        "authnNamespace": {
+          "type": "string",
+          "title": "Authn Namespace"
+        },
+        "tokenAudience": {
+          "type": "string",
+          "title": "Token Audience"
+        },
+        "tokenPath": {
+          "type": "string",
+          "title": "Token Path"
+        }
       }
     },
     "global": {

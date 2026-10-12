@@ -36,3 +36,60 @@ rules:
   - subjectaccessreviews
   verbs:
   - create
+
+# ── #574: impersonation for the background refresher ────────────────────────
+# The refresher re-resolves a cached cell under that cell's COHORT identity but
+# used to dial the apiserver with snowplow's own ServiceAccount. Identity said
+# cohort, transport said snowplow, so rbac.MustRegateSADial had to refuse the
+# dial — ~9,400 refused background refreshes per 6h on krateo-057. The fix is to
+# make the transport carry the cohort too; this rule is what permits it.
+#
+# WITHOUT THIS RULE THE FEATURE IS INERT, NOT BROKEN. snowplow probes
+# `impersonate users` once at startup (SelfSubjectAccessReview) and, when it is
+# not granted, keeps the old SA transport and logs a WARN naming this grant. So
+# the chart and the image roll independently in either order.
+#
+# WHY `users` IS SAFE TO GRANT BROADLY. Impersonating a user does NOT inherit
+# that user's groups — the apiserver uses exactly the groups supplied. Verified
+# on krateo-057 against a User carrying groups:["admins"], where admins is bound
+# to cluster-admin:
+#     --as=admin                     list secrets -> no
+#     --as=admin --as-group=admins   list secrets -> yes
+# It cannot be enumerated either: the target is 1000 users.
+- apiGroups: [""]
+  resources: ["users"]
+  verbs: ["impersonate"]
+
+{{- /*
+  groups / serviceaccounts are ALLOWLISTED, and the allowlist is empty by
+  default. Both carry rights DIRECTLY, so impersonating one grants what it is
+  bound to — unlike the `users` case above, the no-inheritance argument does NOT
+  apply here.
+
+  THE EMPTY LIST MUST EMIT NO RULE AT ALL. In Kubernetes RBAC an absent or empty
+  `resourceNames` means EVERY resource of that type, so rendering the rule with
+  an empty list would grant impersonation of every group — including a
+  cluster-admin-bound one — which is the exact escalation this allowlist exists
+  to prevent. `with` is load-bearing: it skips the block for an empty list.
+
+  A cohort whose group or ServiceAccount is not listed simply 403s at dial, the
+  Put declines exactly as it does today, and the cell expires at TTL and refills
+  on read. That degradation is the accepted cost in the #574 ruling, so the safe
+  default is also the documented one.
+
+  NEVER list a privileged group or ServiceAccount here.
+*/ -}}
+{{- with .Values.rbac.impersonateGroups }}
+- apiGroups: [""]
+  resources: ["groups"]
+  resourceNames:
+    {{- toYaml . | nindent 4 }}
+  verbs: ["impersonate"]
+{{- end }}
+{{- with .Values.rbac.impersonateServiceAccounts }}
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  resourceNames:
+    {{- toYaml . | nindent 4 }}
+  verbs: ["impersonate"]
+{{- end }}
