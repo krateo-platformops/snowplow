@@ -198,6 +198,12 @@ type phase1ExitRecord struct {
 	NavUnitsExpectedDeny       int    `json:"nav_units_expected_deny"`
 	NavUnitsOperationalFailure int    `json:"nav_units_operational_failure"`
 	NavUnitsAborted            int    `json:"nav_units_aborted"`
+	// NavUnitsExternal — #594: how many of NavUnitsTotal are external-backed.
+	// Those units are seeded LAST, so comparing it with NavUnitsAborted says
+	// WHAT a deadline cut actually lost: aborted <= external means the cut fell
+	// only on cells that can never publish; aborted > external means it reached
+	// the internal population.
+	NavUnitsExternal           int    `json:"nav_units_external"`
 	WalkMs                     int64  `json:"walk_ms"`
 	SyncWaitMs                 int64  `json:"sync_wait_ms"`
 	ContentPrewarmMs           int64  `json:"content_prewarm_ms"`
@@ -255,22 +261,31 @@ type bootNavProgress struct {
 	expectedDeny       int // processed units whose seed failed with an RBAC deny
 	operationalFailure int // processed units whose seed failed operationally
 	aborted            int // units left when the pass was cut by its ctx (0 if never cut)
+	// external — #594: how many of `total` are external-backed (their apiRef
+	// RESTAction declares an EndpointRef). Those units are ordered LAST, so this
+	// is what makes the aborted tail READABLE rather than merely asserted: with
+	// aborted <= external the cut fell entirely on units that can never publish,
+	// and with aborted > external it reached the internal population and the
+	// budget is genuinely short. Without this field "the cut loses the least
+	// valuable units" is an unfalsifiable claim about an invisible ordering.
+	external int
 }
 
 var bootNavProgressState bootNavProgress
 
 type navProgressSnapshot struct {
-	armed                                                                 bool
-	passes, total, cohorts, processed, expectedDeny, operational, aborted int
+	armed                                                                           bool
+	passes, total, cohorts, processed, expectedDeny, operational, aborted, external int
 }
 
-func (p *bootNavProgress) arm(total, cohorts int) {
+func (p *bootNavProgress) arm(total, cohorts, external int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.armed = true
 	p.passes++
 	p.total = total
 	p.cohorts = cohorts
+	p.external = external
 	p.processed = 0
 	p.expectedDeny = 0
 	p.operationalFailure = 0
@@ -298,6 +313,7 @@ func (p *bootNavProgress) reset() {
 	defer p.mu.Unlock()
 	p.armed, p.passes, p.total, p.cohorts = false, 0, 0, 0
 	p.processed, p.expectedDeny, p.operationalFailure, p.aborted = 0, 0, 0, 0
+	p.external = 0
 }
 
 func (p *bootNavProgress) cut() {
@@ -313,6 +329,7 @@ func (p *bootNavProgress) snapshot() navProgressSnapshot {
 		armed: p.armed, passes: p.passes, total: p.total, cohorts: p.cohorts,
 		processed: p.processed, expectedDeny: p.expectedDeny,
 		operational: p.operationalFailure, aborted: p.aborted,
+		external: p.external,
 	}
 }
 
@@ -478,6 +495,7 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 			NavUnitsExpectedDeny:       snap.expectedDeny,
 			NavUnitsOperationalFailure: snap.operational,
 			NavUnitsAborted:            snap.aborted,
+			NavUnitsExternal:           snap.external,
 			WalkMs:                     stepMs(steps.walk),
 			SyncWaitMs:                 stepMs(steps.syncWait),
 			ContentPrewarmMs:           stepMs(steps.content),
@@ -520,6 +538,7 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 			slog.Int("nav_units_expected_deny", rec.NavUnitsExpectedDeny),
 			slog.Int("nav_units_operational_failure", rec.NavUnitsOperationalFailure),
 			slog.Int("nav_units_aborted", rec.NavUnitsAborted),
+			slog.Int("nav_units_external", rec.NavUnitsExternal),
 			slog.Int64("walk_ms", rec.WalkMs),
 			slog.Int64("sync_wait_ms", rec.SyncWaitMs),
 			slog.Int64("content_prewarm_ms", rec.ContentPrewarmMs),

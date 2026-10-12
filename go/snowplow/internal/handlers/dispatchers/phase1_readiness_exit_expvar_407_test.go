@@ -48,6 +48,10 @@ var phase1ExitExpvarKeys = []string{
 	"nav_latch_armed", "nav_boot_passes", "nav_units_total", "nav_units_seeded",
 	"nav_units_remaining", "cohorts", "nav_units_expected_deny",
 	"nav_units_operational_failure", "nav_units_aborted",
+	// #594 — the size of the external-backed tail the seed defers. Paired with
+	// nav_units_aborted it says WHAT a deadline cut lost; without it the claim
+	// "the cut lost only units that can never publish" is unfalsifiable.
+	"nav_units_external",
 	"walk_ms", "sync_wait_ms", "content_prewarm_ms", "cluster_list_prewarm_ms", "seed_ms",
 }
 
