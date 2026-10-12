@@ -2153,18 +2153,9 @@ func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, namespac
 // indexer partition identically (the byte-equivalence the resolver
 // pivot's JQ pipeline depends on — `feedback_cache_must_not_constrain_jq.md`).
 func listFromIndexer(gi informers.GenericInformer, namespace string) []*unstructured.Unstructured {
-	store := gi.Informer().GetIndexer()
-	var items []interface{}
-	if namespace == "" {
-		items = store.List()
-	} else {
-		idx, err := store.ByIndex(clientcache.NamespaceIndex, namespace)
-		if err != nil {
-			items = filterByNamespace(store.List(), namespace)
-		} else {
-			items = idx
-		}
-	}
+	// #579: deterministic (namespace, name) order — a LIST rebuilt from
+	// unchanged data must produce identical bytes. See indexer_order.go.
+	items := indexerPartition(gi, namespace)
 
 	out := make([]*unstructured.Unstructured, 0, len(items))
 	for _, it := range items {

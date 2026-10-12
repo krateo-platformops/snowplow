@@ -47,7 +47,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/informers"
-	clientcache "k8s.io/client-go/tools/cache"
 )
 
 // ListRawServable returns gvr's namespace partition as per-item JSON, under
@@ -103,18 +102,9 @@ func (rw *ResourceWatcher) ListRawServable(gvr schema.GroupVersionResource, name
 // populations, and both fail the same way (the item is absent from the list
 // rather than the list failing), so a malformed object never stalls a serve.
 func rawFromIndexer(gi informers.GenericInformer, namespace string) [][]byte {
-	store := gi.Informer().GetIndexer()
-	var items []interface{}
-	if namespace == "" {
-		items = store.List()
-	} else {
-		idx, err := store.ByIndex(clientcache.NamespaceIndex, namespace)
-		if err != nil {
-			items = filterByNamespace(store.List(), namespace)
-		} else {
-			items = idx
-		}
-	}
+	// #579: deterministic (namespace, name) order — a LIST rebuilt from
+	// unchanged data must produce identical bytes. See indexer_order.go.
+	items := indexerPartition(gi, namespace)
 
 	out := make([][]byte, 0, len(items))
 	for _, it := range items {
