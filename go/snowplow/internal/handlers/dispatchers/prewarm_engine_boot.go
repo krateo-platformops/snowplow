@@ -921,6 +921,12 @@ func seedScopeYielding(ctx context.Context,
 		targets []seedTarget
 		learned []seedTarget // #262: learned classes, seeded in their own phase
 		scoped  bool
+		// external — #594 cost class: this widget's apiRef RESTAction declares
+		// an EndpointRef, so its resolve is an HTTP fetch outside the apiserver.
+		// Sorts the unit to the BACK of its identity rank (see
+		// seed_widget_cost_class.go). Stamped once in the precompute pass below,
+		// never recomputed in the comparator.
+		external bool
 	}
 	type restactionSeed struct {
 		ref       templatesv1.ObjectReference
@@ -949,11 +955,32 @@ func seedScopeYielding(ctx context.Context,
 		targets, scoped := targetsFor(e.GVR, true)
 		targets, learnedTargets := splitLearned(targets)
 		lp.note(learnedTargets, true)
-		widgetSeeds = append(widgetSeeds, widgetSeed{e: e, targets: targets, learned: learnedTargets, scoped: scoped})
+		widgetSeeds = append(widgetSeeds, widgetSeed{
+			e: e, targets: targets, learned: learnedTargets, scoped: scoped,
+			// #594 — one informer-only read per harvested widget, here rather
+			// than in the comparator (which would make it O(n log n) reads on
+			// the readiness path).
+			external: seedWidgetIsExternalFn(ctx, e.W),
+		})
 	}
-	// FIRST-NAV WALK ORDER within rank (FIX-E, replaces the A2 count-sort):
-	// ascending NavOrder, ties on ns/name for determinism.
+	// COST CLASS, then FIRST-NAV WALK ORDER, within rank.
+	//
+	// #594: internal-backed units before external-backed ones. An external
+	// unit is an HTTP fetch bounded at 5s on this path whose cell has no dep
+	// edges and can never publish, so if pipGlobalTimeout cuts the pass, the
+	// tail it loses is the one that was never going to live-refresh and whose
+	// bounded TTL would have expired first. Ordering only — the unit set is
+	// unchanged (see seed_widget_cost_class.go).
+	//
+	// FIX-E's first-nav walk order is preserved INSIDE each class: NavOrder
+	// still decides, ties still break on ns/name for determinism. count≠cost
+	// was proven twice (A2 seeded a cheap-but-late widget before the
+	// dashboard's own), and this does not reintroduce a count — `external` is a
+	// structural declaration read off the apiRef'd RESTAction, not a tally.
 	sort.SliceStable(widgetSeeds, func(i, j int) bool {
+		if widgetSeeds[i].external != widgetSeeds[j].external {
+			return !widgetSeeds[i].external
+		}
 		if widgetSeeds[i].e.NavOrder != widgetSeeds[j].e.NavOrder {
 			return widgetSeeds[i].e.NavOrder < widgetSeeds[j].e.NavOrder
 		}
@@ -1371,6 +1398,12 @@ func seedScopeYielding(ctx context.Context,
 		wsNSName  string
 		e         navWidgetEntry
 		target    seedTarget
+		// external — #594 cost class, carried from the widgetSeed so the flat
+		// unit order can key on it. THIS is the list the boot seed executes:
+		// it is rebuilt from widgetSeeds and RE-SORTED below, so a cost-class
+		// key applied only to the widgetSeeds sort above would be silently
+		// discarded here. Both sorts carry it.
+		external bool
 	}
 	flat := make([]seedUnit, 0)
 	for _, ws := range widgetSeeds {
@@ -1389,10 +1422,20 @@ func seedScopeYielding(ctx context.Context,
 				wsNSName:  nsName,
 				e:         ws.e,
 				target:    c,
+				external:  ws.external,
 			})
 		}
 	}
 	sort.SliceStable(flat, func(i, j int) bool {
+		// (0) #594 COST CLASS ASC — internal-backed units first, external-backed
+		// last. The pass below is cut by pipGlobalTimeout mid-list, so this key
+		// decides WHAT A CUT LOSES: units whose cell has no dep edges, can never
+		// publish and carries the bounded external TTL, instead of an arbitrary
+		// suffix of the walk. Ordering only; the set is unchanged, and the
+		// first-nav latch counts the same units in either order.
+		if flat[i].external != flat[j].external {
+			return !flat[i].external
+		}
 		if flat[i].navOrder != flat[j].navOrder {
 			return flat[i].navOrder < flat[j].navOrder // (1) NavOrder ASC
 		}
@@ -1415,10 +1458,15 @@ func seedScopeYielding(ctx context.Context,
 	trackNav := latch != nil && !latch.fired()
 	if trackNav {
 		navCohorts := make(map[string]struct{}, len(ranked))
+		navExternal := 0
 		for i := range flat {
 			navCohorts[identityKey(flat[i].target)] = struct{}{}
+			// #594 — the size of the tail this pass is willing to lose first.
+			if flat[i].external {
+				navExternal++
+			}
 		}
-		bootNavProgressState.arm(navUnitsTotal, len(navCohorts))
+		bootNavProgressState.arm(navUnitsTotal, len(navCohorts), navExternal)
 	}
 	if navWidgetRemaining == 0 {
 		// Provably-empty: no nav-widget units at all (all-tail topology, or the

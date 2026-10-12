@@ -126,12 +126,21 @@ var cacheAllow443 = map[string]cacheClass443{
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "IdentityClass.String": readOnly443,
 	"Inert": readOnly443, "InformerOnlyReadsFromContext": readOnly443, "InternalEndpointFromContext": readOnly443,
-	// #561 removed "WithInformerOnlyReads" from this table: it was listed for
-	// #403's informer-only UAF pre-check read, and #561 deleted that pre-check
-	// (the widgets cell it short-circuited is no longer declined, so there is
-	// nothing to skip the resolve for). The ctx builder itself is untouched and
-	// still used by the /refreshes arming path — it is simply no longer reached
-	// from the resolve path this table enumerates.
+	// #561 removed "WithInformerOnlyReads" from this table when it deleted
+	// #403's informer-only UAF pre-check read. #594 PUTS IT BACK, for a
+	// different read on the same path: apiref.DeclaresExternalEndpoint, the
+	// boot seed's cost-class probe (seed_widget_cost_class.go).
+	//
+	// readOnly443 is the correct class and the classification is the point of
+	// the exercise, so state it rather than assert it: the symbol is a CTX
+	// BUILDER. It returns a derived context and touches no cache, informer, dep
+	// or refresher state, so nothing it does outlives the request — which is
+	// exactly readOnly443's definition. The read it enables is likewise pure:
+	// DeclaresExternalEndpoint does an objects.Get and a type conversion, Puts
+	// nothing, records no dep edge, and its ONLY consumer is a sort key. Under
+	// cache.Inert the probe simply answers false and the seed keeps its
+	// pre-#594 first-nav order, so there is no side effect for the flag to gate.
+	"WithInformerOnlyReads": readOnly443,
 	"InternalRESTConfigFromContext": readOnly443, "IsResolverGVRHit": readOnly443, "IsResolverPluralsHit": readOnly443,
 	"IsStructurallyNonSliceable": readOnly443, "L1KeyFromContext": readOnly443, "LayeredSourcesMark": readOnly443,
 	"LayeredSourcesSince": readOnly443, "LiveRBACSnapshot": readOnly443, "NestedCallDepthFromContext": readOnly443,

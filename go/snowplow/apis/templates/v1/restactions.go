@@ -59,6 +59,45 @@ func (in *RESTAction) HasUserAccessFilterStage() bool {
 	return false
 }
 
+// HasExternalEndpointStage reports that at least one api[] stage dispatches
+// against a named EndpointRef — i.e. an endpoint OUTSIDE the apiserver, reached
+// over HTTP (#594). It is the structural cost class of a resolve, not a
+// property of any particular endpoint: no host, name or resource literal
+// appears here (feedback_no_special_cases).
+//
+// WHY THE SEED CARES. An external stage is the expensive half of the boot seed
+// and the least valuable half to have warm, and both halves of that follow from
+// the same fact — the data does not live in an informer:
+//
+//   - COST. The fetch is a real HTTP round trip, bounded on the readiness path
+//     by externalSeedFetchCtx (RESOLVER_SEED_EXTERNAL_FETCH_TIMEOUT_MS, 5s
+//     default). A slow endpoint spends that whole budget per (widget × cohort)
+//     unit, and seedFailOperational RE-ENQUEUES, so a timeout is paid twice.
+//   - VALUE. An external-backed cell has no dep edges, so nothing can ever
+//     dirty it and no publish can ever fire for it — which is exactly why
+//     setRefreshKeyHeaderUnlessExternal already withholds its refresh-key
+//     header. It also carries the bounded external TTL, so a cell warmed at
+//     boot expires long before most of the units behind it are navigated to.
+//
+// The same "has an endpointRef ⇒ not apiserver-backed" reading is already made
+// structurally in cache/inventory.go, which skips these stages when collecting
+// GVRs to register informers for. This accessor is the typed one derivation the
+// seed consults, so the two cannot drift (#64 anti-shadow-drift).
+//
+// Nil receiver and nil api-step elements are guarded, exactly as the sibling
+// predicate above guards them.
+func (in *RESTAction) HasExternalEndpointStage() bool {
+	if in == nil {
+		return false
+	}
+	for _, step := range in.Spec.API {
+		if step != nil && step.EndpointRef != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // RESTActionList contains a list of RESTAction

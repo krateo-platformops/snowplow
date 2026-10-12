@@ -98,6 +98,46 @@ func bumpUAFSinkIfDeclared(ctx context.Context, ra *templatesv1.RESTAction) {
 	}
 }
 
+// DeclaresExternalEndpoint reports, BEFORE any resolve, that Resolve(ctx, …)
+// for this ref would dispatch at least one api[] stage against a named
+// EndpointRef — an endpoint outside the apiserver, reached over HTTP (#594).
+//
+// It is the boot seed's COST-CLASS probe and NOTHING else: the seed uses it to
+// order external-backed widget units LAST within their identity rank, so that a
+// seed cut short by pipGlobalTimeout loses the units that can never publish and
+// carry the shortest TTL (see RESTAction.HasExternalEndpointStage). It never
+// skips a unit, so an answer that is wrong in either direction costs ordering,
+// never coverage — which is why every failure path below answers false rather
+// than guessing.
+//
+// EXACTNESS. It makes the SAME objects.Get under the SAME ctx and the SAME
+// conversion as Resolve, so it sees exactly the RESTAction Resolve would load.
+// The read is INFORMER-ONLY (cache.WithInformerOnlyReads): this runs once per
+// harvested widget during the seed's precompute pass, and it must not become a
+// burst of apiserver GETs on the readiness path — the very cost it exists to
+// contain. A miss therefore answers false and the unit keeps its ordinary
+// first-nav position.
+//
+// NOT A GATE. Nothing downstream reads this: the resolve, the Put, the dep
+// Record and every counter are untouched. Contrast #403's pre-resolve skip,
+// which used a sibling predicate to DROP units and became load-bearing on a
+// gate that later moved (see the waiver lesson in #591) — ordering cannot,
+// because the full unit set is still attempted whenever the budget allows.
+func DeclaresExternalEndpoint(ctx context.Context, ref templatesv1.ObjectReference) bool {
+	if ref.Name == "" || ref.Namespace == "" {
+		return false
+	}
+	res := objects.Get(cache.WithInformerOnlyReads(ctx), ref)
+	if res.Err != nil || res.Unstructured == nil {
+		return false
+	}
+	ra, err := convertToRESTAction(res.Unstructured.Object)
+	if err != nil {
+		return false
+	}
+	return ra.HasExternalEndpointStage()
+}
+
 func shouldServeRAFullList(ctx context.Context, perPage, page int) bool {
 	if !IsPaginatedResolve(perPage, page) || !cache.ResolvedCacheEnabled() {
 		return false
