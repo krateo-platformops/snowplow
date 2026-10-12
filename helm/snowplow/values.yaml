@@ -64,6 +64,37 @@ serviceAccount:
   annotations: {}
   name: ""
 
+# #574 — which cohorts the BACKGROUND REFRESHER may read as.
+#
+# The refresher re-resolves a cached cell under that cell's cohort identity. It
+# now dials the apiserver as that cohort too, instead of as snowplow's own
+# ServiceAccount, which is STRICTLY LESS privilege than it used before (that SA
+# can already list secrets cluster-wide). `impersonate: users` is granted
+# unconditionally by the ClusterRole and needs nothing here: impersonating a user
+# does not inherit that user's groups, so it cannot escalate, and 1000 users
+# cannot be enumerated anyway.
+#
+# These two lists are the parts that CAN escalate, so they are opt-in.
+#
+# EMPTY MEANS NO RULE IS RENDERED, AND THAT IS THE POINT. In Kubernetes RBAC an
+# empty `resourceNames` means EVERY resource of that type, so a rule rendered
+# from an empty list would permit impersonating every group on the cluster,
+# including one bound to cluster-admin. The template therefore omits the rule
+# entirely rather than rendering it empty.
+#
+# A cohort whose group or ServiceAccount is not listed here is simply not
+# background-refreshed: its dial 403s, the cache Put declines exactly as it does
+# today, and the cell expires at TTL and refills on the next read. That is the
+# accepted degradation in the #574 ruling, not a failure.
+#
+# NEVER list a privileged group or ServiceAccount. Impersonating one grants
+# everything it is bound to.
+rbac:
+  impersonateGroups: []
+  # - developers
+  # - viewers
+  impersonateServiceAccounts: []
+
 podAnnotations: {}
 podLabels: {}
 
