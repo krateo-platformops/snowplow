@@ -738,9 +738,61 @@ func TestIssue608_F3_ForbiddenValidateIsClassifiedNotRelabelled(t *testing.T) {
 	if forbiddenValidate != 1 {
 		t.Errorf("F3: refresh_failed{forbidden,validate} = %d, want 1", forbiddenValidate)
 	}
-	// It still counts and stays visible: the drop point ran (dropped +1).
-	if dropped := capt.find("refresher.refresh_dropped"); len(dropped) != 1 || dropped[0]["non_retryable"] != "true" {
-		t.Errorf("F3: want exactly one refresh_dropped with non_retryable=true, got %v", dropped)
+	// It still counts and stays visible: the drop point ran (dropped +1) — and
+	// did NOT evict (#547 ruling: never evict on a failed refresh).
+	if dropped := capt.find("refresher.refresh_dropped"); len(dropped) != 1 ||
+		dropped[0]["non_retryable"] != "true" || dropped[0]["evicted"] != "false" {
+		t.Errorf("F3: want exactly one refresh_dropped with non_retryable=true evicted=false, got %v", dropped)
+	}
+	if got, ok := e.store.Get(key); !ok || string(got.RawJSON) != f608StaleBody {
+		t.Errorf("F3: a forbidden refresh must leave the cell RESIDENT with its last body (resident=%v) — "+
+			"an eviction is a cold navigation", ok)
+	}
+}
+
+// TestIssue608_F3b_TransientForbiddenKeepsTheCellResidentThenRecovers — a
+// ONE-SHOT 403 on the validate hop (it keeps its StatusError, so it is
+// non-retryable): the drop leaves the cell resident and served, not evicted,
+// and the next dirty mark re-resolves it and is accepted. Under an
+// evict-on-forbidden drop this is a cold navigation after one blip.
+func TestIssue608_F3b_TransientForbiddenKeepsTheCellResidentThenRecovers(t *testing.T) {
+	const user, group = "cohort-f3b", "team-f3b"
+	k := f608Kinds[1]
+	e := f608Setup(t, []string{group}, map[f608Kind][]string{k: {"f3b-panel"}})
+	key := e.seedCell(t, f608CohortInputs(k, "f3b-panel", user, []string{group}))
+
+	capt := &f608LogCapture{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(capt))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// Attempt 1: the CRD hop is refused once.
+	e.srv.forbidCRDForSA.Store(true)
+	_, failed1 := f608Run(t, e, "widgets", []string{key})
+	e.srv.forbidCRDForSA.Store(false)
+
+	dropped := capt.find("refresher.refresh_dropped")
+	got, resident := e.store.Get(key)
+	served := resident && string(got.RawJSON) == f608StaleBody
+	t.Logf("F3b attempt1: failed=+%d dropped=%v resident=%v served_last_body=%v", failed1, dropped, resident, served)
+	if failed1 != 1 {
+		t.Errorf("F3b: attempt 1 refresher.failed=+%d, want 1 (one non-retryable failure, no retries)", failed1)
+	}
+	if len(dropped) != 1 || dropped[0]["non_retryable"] != "true" || dropped[0]["evicted"] != "false" {
+		t.Errorf("F3b: want one refresh_dropped non_retryable=true evicted=false, got %v", dropped)
+	}
+	if !served {
+		t.Fatalf("F3b RED: a single transient 403 removed the cell (resident=%v) — the next navigation is cold", resident)
+	}
+
+	// The next dirty mark: the forbid has cleared, so the re-resolve is accepted.
+	_, failed2 := f608Run(t, e, "widgets", []string{key})
+	t.Logf("F3b attempt2: failed=+%d accepted=%v", failed2, e.accepted(key))
+	if !e.accepted(key) {
+		t.Errorf("F3b: the next dirty mark after a transient 403 must re-resolve and accept the cell")
+	}
+	if failed2 != 0 {
+		t.Errorf("F3b: attempt 2 refresher.failed=+%d, want 0", failed2)
 	}
 }
 
@@ -763,6 +815,29 @@ func TestIssue608_F4_SharedSADiscoveryRefusesAnImpersonatingConfig(t *testing.T)
 	}
 	if got := idynamic.SADiscoveryStatsSnapshot().Builds; got != builds {
 		t.Errorf("F4 RED: an impersonating config paid a discovery build (%d -> %d)", builds, got)
+	}
+	// Each impersonation field ALONE must be caught — a username-only cohort
+	// (the commonest 057 shape) sets nothing but UserName.
+	for name, ic := range map[string]rest.ImpersonationConfig{
+		"username_only": {UserName: "cohort-a"},
+		"groups_only":   {Groups: []string{"team-a"}},
+		"uid_only":      {UID: "uid-a"},
+		"extra_only":    {Extra: map[string][]string{"scopes": {"x"}}},
+	} {
+		one := rest.CopyConfig(base)
+		one.Impersonate = ic
+		if !idynamic.IsImpersonatingConfig(one) {
+			t.Errorf("F4 RED: IsImpersonatingConfig missed a %s impersonating config", name)
+		}
+		if _, err := idynamic.SharedSADiscoveryClient(one); !errors.Is(err, idynamic.ErrImpersonatingConfig) {
+			t.Errorf("F4 RED: SharedSADiscoveryClient accepted a %s impersonating config (err=%v)", name, err)
+		}
+	}
+	if idynamic.IsImpersonatingConfig(base) {
+		t.Errorf("F4: the SA config (no Impersonate) was classified as impersonating")
+	}
+	if got := idynamic.SADiscoveryStatsSnapshot().Builds; got != builds {
+		t.Errorf("F4 RED: a single-field impersonating config paid a discovery build (%d -> %d)", builds, got)
 	}
 	again, err := idynamic.SharedSADiscoveryClient(base)
 	if err != nil || again != first {

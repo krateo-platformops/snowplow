@@ -147,9 +147,9 @@ func ClassifyRefreshError(err error) (class, stage string) {
 // the first attempt (#608 Q2 ruling). A 403 is the apiserver's authorization
 // decision for this identity: the same request is refused again at every
 // backoff step (on 057, 89% of a burst's failures were retries that could not
-// succeed). The drop point then applies the SAME evict-versus-suspend breaker
-// every exhausted failure gets; nothing about the outcome changes except that
-// it arrives without the ~15s of doomed retries.
+// succeed). The drop point does NOT evict it: one 403 is not a determinism
+// proof, and an eviction is a cold navigation (#547 ruling). The entry stays
+// resident and served; the next dirty mark retries it.
 func IsNonRetryableRefreshError(err error) bool {
 	return err != nil && apierrors.IsForbidden(err)
 }

@@ -1082,9 +1082,8 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		// #608 (Q2 ruling) — a NON-RETRYABLE failure (a 403: the apiserver's
 		// authorization decision for this identity, refused identically at
 		// every backoff step) skips the budget and reaches this same drop point
-		// on its first attempt. Everything below — the breaker, evict versus
-		// suspend, the window accounting, the counters — is unchanged; only the
-		// doomed retries are gone.
+		// on its first attempt. The window accounting and the counters are
+		// unchanged, but it is NEVER evicted (see the forbidden branch below).
 		nonRetryable := IsNonRetryableRefreshError(err)
 		if nonRetryable || q.NumRequeues(key) >= maxRefreshRequeues {
 			q.Forget(key)
@@ -1141,6 +1140,32 @@ func (r *refresher) processNext(ctx context.Context) bool {
 					slog.String("effect", "the entry's own object returned a confirmed apiserver 404 "+
 						"on every attempt across the full requeue budget — evicted instead of left "+
 						"resident until TTL (#187)"),
+				)
+				return true
+			}
+			// #608 — A FORBIDDEN DROP NEVER EVICTS. Non-retryable means "do not
+			// burn the requeue budget on it", NOT "the body is unvouchable": a
+			// single 403 is not a determinism proof (a transient authz blip, an
+			// RBAC roll mid-flight, a webhook hiccup on validate/apiref all keep
+			// the StatusError), and evicting on attempt 1 turns it into a cold
+			// navigation — the zero-cold-navigation requirement and the #547
+			// ruling (never evict on a failed refresh) forbid that. The entry
+			// stays RESIDENT and SERVED; Forget above cleared the rate limiter,
+			// so the next dirty mark (or read-triggered refresh) retries it
+			// clean. #547 turns this resident-after-failure state into the
+			// known-stale state. Counted on dropped_total (above) and on
+			// refresh_failed{err_class="forbidden"}.
+			if nonRetryable {
+				slog.Warn("refresher.refresh_dropped",
+					slog.String("subsystem", "cache"),
+					slog.String("key_hash", key),
+					slog.Int("requeues", q.NumRequeues(key)),
+					slog.Bool("non_retryable", true),
+					slog.Bool("cluster_list_tier", fromCL),
+					slog.Bool("evicted", false),
+					slog.String("err", err.Error()),
+					slog.String("effect", "forbidden refresh — not retried and NOT evicted: the entry stays "+
+						"resident and served until the next dirty mark retries it (#608, #547)"),
 				)
 				return true
 			}
