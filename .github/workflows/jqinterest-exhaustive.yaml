@@ -3,36 +3,138 @@
 # per soundness arm, and TestCorpusSubset_IsCurrent, which fails when the
 # committed subset (testdata/corpus_subset.json) no longer covers every stratum.
 # Under -race it does not fit the reusable go-checks' per-package timeout, so it
-# runs here, nightly and on demand, with its own explicit -timeout (this
-# package only).
+# runs here with its own explicit -timeout (this package only).
+#
+# REQUIRABLE: it runs on EVERY pull request, so it never sits pending, and its
+# first step finishes in seconds with a pass when the PR touches none of the
+# watched paths (a rename OUT of a watched path counts too). The watched paths
+# are what the analysis and its emulator depend on (reviewer-603's gates on
+# #665 and #668):
+#   - the package itself (the corpus and its generator live inside it);
+#   - go/snowplow/go.mod and go.sum: the gojq fork's parse and semantics, and
+#     plumbing jqutil;
+#   - internal/support/jq: the module loader and the embedded modules;
+#   - the resolver glue that chain.go and emulate_test.go mirror:
+#     restactions/api handler.go, refilter.go, resolve.go, setup.go,
+#     restactions/restactions.go, and widgets/**;
+#   - this workflow.
+#
+# Nightly: a fresh random fuzz seed (logged; replay it with workflow_dispatch),
+# and a failure opens an issue, or comments on the open one, from a separate
+# least-privilege job, so it never fails silently.
 name: jqinterest-exhaustive
 
 on:
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
+    inputs:
+      seed:
+        description: "JQINTEREST_FUZZ_SEED to replay (a positive integer; empty = 603)"
+        required: false
+        default: ""
   pull_request:
-    paths:
-      - go/snowplow/internal/cache/jqinterest/**
-      - .github/workflows/jqinterest-exhaustive.yaml
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   exhaustive:
+    name: jqinterest exhaustive sweep
     runs-on: ubuntu-latest
     timeout-minutes: 75
-    defaults:
-      run:
-        working-directory: go/snowplow
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      seed: ${{ steps.seed.outputs.seed }}
     steps:
+      - name: Watched paths changed?
+        id: watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "$EVENT: always runs"
+            exit 0
+          fi
+          # Both sides of a rename: moving a file OUT of a watched path counts.
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+          watched='^(go/snowplow/internal/cache/jqinterest/|go/snowplow/go\.(mod|sum)$|go/snowplow/internal/support/jq/|go/snowplow/internal/resolvers/restactions/api/(handler|refilter|resolve|setup)\.go$|go/snowplow/internal/resolvers/restactions/restactions\.go$|go/snowplow/internal/resolvers/widgets/|\.github/workflows/jqinterest-exhaustive\.yaml$)'
+          if hits=$(printf '%s\n' "$files" | grep -E "$watched"); then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "watched paths changed:"
+            printf '  %s\n' "$hits"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no watched path changed: nothing to sweep (pass)"
+          fi
+
       - uses: actions/checkout@v5
+        if: steps.watch.outputs.run == 'true'
+        with:
+          persist-credentials: false
+
       - uses: actions/setup-go@v6
+        if: steps.watch.outputs.run == 'true'
         with:
           go-version-file: go/snowplow/go.mod
+
+      - name: Fuzz seed
+        id: seed
+        if: steps.watch.outputs.run == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_SEED: ${{ github.event.inputs.seed }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            schedule) seed=$(( (RANDOM << 15 | RANDOM) + 1 )) ;;
+            workflow_dispatch) seed="${INPUT_SEED:-603}" ;;
+            *) seed=603 ;;
+          esac
+          case "$seed" in ''|*[!0-9]*|0) echo "::error::seed must be a positive integer, got '$seed'"; exit 1 ;; esac
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+          echo "JQINTEREST_FUZZ_SEED=$seed (replay: workflow_dispatch with seed=$seed)"
+
       - name: Exhaustive jqinterest sweep
+        if: steps.watch.outputs.run == 'true'
+        working-directory: go/snowplow
+        env:
+          JQINTEREST_FUZZ_SEED: ${{ steps.seed.outputs.seed }}
         run: >-
           go test -race -count=1 -v
           -tags=unit,integration,jqinterest_exhaustive
           -timeout 60m ./internal/cache/jqinterest
+
+  report-nightly-failure:
+    name: report nightly jqinterest failure
+    needs: exhaustive
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or comment on the nightly-failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SEED: ${{ needs.exhaustive.outputs.seed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="jqinterest-exhaustive nightly failed"
+          body="The nightly exhaustive jqinterest sweep failed on main at ${GITHUB_SHA}: ${RUN_URL}
+
+          JQINTEREST_FUZZ_SEED=${SEED:-unset}. Replay it with workflow_dispatch (seed=${SEED:-603})."
+          n=$(gh issue list --repo "$REPO" --state open --search "in:title \"$title\"" --json number,title \
+                --jq "[.[] | select(.title == \"$title\")][0].number // empty")
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
