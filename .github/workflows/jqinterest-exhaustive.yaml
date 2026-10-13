@@ -7,19 +7,21 @@
 #
 # REQUIRABLE: it runs on EVERY pull request, so it never sits pending, and its
 # first step finishes in seconds with a pass when the PR touches none of the
-# watched paths. The watched paths are what the analysis and its emulator
-# depend on (reviewer-603's gate on #665):
+# watched paths (a rename OUT of a watched path counts too). The watched paths
+# are what the analysis and its emulator depend on (reviewer-603's gates on
+# #665 and #668):
 #   - the package itself (the corpus and its generator live inside it);
 #   - go/snowplow/go.mod and go.sum: the gojq fork's parse and semantics, and
 #     plumbing jqutil;
 #   - internal/support/jq: the module loader and the embedded modules;
 #   - the resolver glue that chain.go and emulate_test.go mirror:
-#     restactions/api handler.go, refilter.go, resolve.go, and widgets/**;
+#     restactions/api handler.go, refilter.go, resolve.go, setup.go,
+#     restactions/restactions.go, and widgets/**;
 #   - this workflow.
 #
 # Nightly: a fresh random fuzz seed (logged; replay it with workflow_dispatch),
-# and a failure opens an issue, or comments on the open one, so it never fails
-# silently.
+# and a failure opens an issue, or comments on the open one, from a separate
+# least-privilege job, so it never fails silently.
 name: jqinterest-exhaustive
 
 on:
@@ -33,17 +35,18 @@ on:
         default: ""
   pull_request:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   exhaustive:
+    name: jqinterest exhaustive sweep
     runs-on: ubuntu-latest
     timeout-minutes: 75
     permissions:
       contents: read
       pull-requests: read
-      issues: write
+    outputs:
+      seed: ${{ steps.seed.outputs.seed }}
     steps:
       - name: Watched paths changed?
         id: watch
@@ -59,12 +62,13 @@ jobs:
             echo "$EVENT: always runs"
             exit 0
           fi
-          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')
-          watched='^(go/snowplow/internal/cache/jqinterest/|go/snowplow/go\.(mod|sum)$|go/snowplow/internal/support/jq/|go/snowplow/internal/resolvers/restactions/api/(handler|refilter|resolve)\.go$|go/snowplow/internal/resolvers/widgets/|\.github/workflows/jqinterest-exhaustive\.yaml$)'
+          # Both sides of a rename: moving a file OUT of a watched path counts.
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+          watched='^(go/snowplow/internal/cache/jqinterest/|go/snowplow/go\.(mod|sum)$|go/snowplow/internal/support/jq/|go/snowplow/internal/resolvers/restactions/api/(handler|refilter|resolve|setup)\.go$|go/snowplow/internal/resolvers/restactions/restactions\.go$|go/snowplow/internal/resolvers/widgets/|\.github/workflows/jqinterest-exhaustive\.yaml$)'
           if hits=$(printf '%s\n' "$files" | grep -E "$watched"); then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "watched paths changed:"
-            printf '  %s\n' $hits
+            printf '  %s\n' "$hits"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "no watched path changed: nothing to sweep (pass)"
@@ -72,6 +76,8 @@ jobs:
 
       - uses: actions/checkout@v5
         if: steps.watch.outputs.run == 'true'
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v6
         if: steps.watch.outputs.run == 'true'
@@ -105,12 +111,19 @@ jobs:
           -tags=unit,integration,jqinterest_exhaustive
           -timeout 60m ./internal/cache/jqinterest
 
-      - name: Report a nightly failure
-        if: failure() && github.event_name == 'schedule'
+  report-nightly-failure:
+    name: report nightly jqinterest failure
+    needs: exhaustive
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or comment on the nightly-failure issue
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SEED: ${{ steps.seed.outputs.seed }}
+          SEED: ${{ needs.exhaustive.outputs.seed }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
