@@ -231,6 +231,7 @@ func i426PreHashDiff(a, b cache.ResolvedKeyInputs) []string {
 	add("PerPage", a.PerPage, b.PerPage)
 	add("Page", a.Page, b.Page)
 	add("Stage", a.Stage, b.Stage)
+	add("Query", a.Query, b.Query)
 	add("Extras(canonical)", cache.HashExtras(a.Extras), cache.HashExtras(b.Extras))
 	return d
 }

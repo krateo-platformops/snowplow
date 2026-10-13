@@ -530,6 +530,16 @@ type ResolvedKeyInputs struct {
 	// builds the Stage value; ComputeKey only folds it into the hash.
 	Stage string
 
+	// Query — #618. The CANONICAL query string of an apistage content call
+	// (labelSelector / metadata.name|namespace fieldSelector, re-rendered and
+	// sorted by the api package's planListQuery). Empty for every call without
+	// a query and for every non-apistage class. It is content-determining: a
+	// selector LIST and the unselected LIST on the same (gvr, ns) return
+	// different items, so ComputeKey folds it (only when non-empty — see
+	// ComputeKey), and the refresher rebuilds the call path from it so a
+	// re-dispatch re-applies the same selector.
+	Query string
+
 	// HasUAF — #118 (d) interim: true when the resolved cell's RESTAction
 	// declares a userAccessFilter stage. Set by the customer dispatch (which
 	// has the resolved CR in hand) into the cacheInputs before Put, and CARRIED
@@ -1258,6 +1268,18 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	if in.Stage != "" {
 		h.Write([]byte{0x01})
 		h.Write([]byte(in.Stage))
+		h.Write([]byte{0})
+	}
+
+	// Query (#618): folded in ONLY when non-empty, behind its own sentinel
+	// (0x02), exactly like Stage. An empty Query writes nothing, so every key
+	// minted before #618 — and every unselected call's key after it — hashes
+	// byte-identically and resolvedKeyVersion does not move. A selector call
+	// therefore can never share a cell with the unselected call on the same
+	// (gvr, ns, name): the 0x02 byte is in one pre-image and not the other.
+	if in.Query != "" {
+		h.Write([]byte{0x02})
+		h.Write([]byte(in.Query))
 		h.Write([]byte{0})
 	}
 
@@ -2526,7 +2548,12 @@ type ResolvedEntryMeta struct {
 	Name      string `json:"name"`
 	// Stage is the apistage per-stage discriminator (itself a hash of the
 	// stage id + filter + dependsOn-output) — opaque, not content.
-	Stage               string `json:"stage,omitempty"`
+	Stage string `json:"stage,omitempty"`
+	// QueryHash (#618) is the hex SHA-256 prefix of the canonical query a
+	// selector content cell is keyed by — present so two cells on the same
+	// coordinates are told apart. The query itself is NOT emitted: a selector
+	// value is template-authored and may embed a subject name.
+	QueryHash           string `json:"queryHash,omitempty"`
 	AgeSeconds          int64  `json:"ageSeconds"`
 	TTLRemainingSeconds int64  `json:"ttlRemainingSeconds"`
 	// LifetimeSeconds is now − BornAt: the age of the KEY, measured from the
@@ -2863,6 +2890,10 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 		meta.Namespace = in.Namespace
 		meta.Name = in.Name
 		meta.Stage = in.Stage
+		if in.Query != "" {
+			sum := sha256.Sum256([]byte(in.Query))
+			meta.QueryHash = hex.EncodeToString(sum[:8])
+		}
 		// #247 — the remaining ComputeKey inputs, all O(1) reads off the
 		// Inputs record already dereferenced here. With these the row carries
 		// every ComputeKey component except the class-constant

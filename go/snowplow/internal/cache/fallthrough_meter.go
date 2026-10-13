@@ -197,6 +197,14 @@ const (
 	ReasonInformerSensitive      FallthroughReason = "informer-fallthrough-sensitive"
 	ReasonInformerRepresentation FallthroughReason = "informer-fallthrough-representation"
 
+	// #618 — the call's query string carries a param the informer cannot
+	// reproduce exactly (limit/continue, resourceVersion, watch, a field
+	// selector other than metadata.name / namespaced metadata.namespace, an
+	// unparseable selector, any query on a GET-by-name, an unknown param). The
+	// apiserver answers with the query intact; the per-param reason is on
+	// snowplow_list_query_total. Closed-enum count: 24 + 1 = 25.
+	ReasonInformerListQuery FallthroughReason = "informer-fallthrough-list-query"
+
 	// Ship D.5 / 0.30.152 — cluster-list-when-allowed iterator collapse.
 	// ReasonClusterListDispatch is a diagnostic (NOT a fall-through) counter
 	// recording that a stage's iterator fan-out was successfully collapsed

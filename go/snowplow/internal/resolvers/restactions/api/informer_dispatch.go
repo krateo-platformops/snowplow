@@ -548,6 +548,19 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		return nil, false
 	}
 
+	// Gate 5c (#618): the query string. ParseAPIServerPathToDep discarded it;
+	// it is classified here so that NOTHING is silently dropped. A query the
+	// informer can reproduce exactly (labelSelector, metadata.name /
+	// namespaced metadata.namespace fieldSelector) is applied to the items
+	// below; anything else goes to the apiserver with the query intact.
+	query := planListQuery(call.Path, name == "", namespace != "")
+	if !query.applicable {
+		recordListQuery(query)
+		dispatchInformerFallthrough.Add(1)
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerListQuery, gvr.String())
+		return nil, false
+	}
+
 	// Gate 6: informer registered + synced. If the GVR is not yet
 	// registered, fire EnsureResourceType (sub-microsecond singleflight
 	// when already registered; lazy registration when not) so a
@@ -692,6 +705,15 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 				cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
 				return nil, false
 			}
+			// #618: apply the selector over the stored per-item JSON, decoding
+			// only each item's metadata — the envelope stays zero-decode.
+			raws, ok := query.filterRaw(raws)
+			if !ok {
+				dispatchInformerFallthrough.Add(1)
+				cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
+				return nil, false
+			}
+			recordListQuery(query)
 			raw, err := marshalAsListRaw(apiVersion, listKindForResource(gvr.Resource), raws)
 			if err != nil {
 				log.Warn("informer_dispatch.list_marshal_failed",
@@ -729,6 +751,18 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			// HasSynced).
 			cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
 			return nil, false
+		}
+
+		// #618: apply the selector the call carried (a no-op without one).
+		if !query.empty() {
+			kept := make([]*unstructured.Unstructured, 0, len(items))
+			for _, it := range items {
+				if it != nil && query.matches(it.GetName(), it.GetNamespace(), it.GetLabels()) {
+					kept = append(kept, it)
+				}
+			}
+			items = kept
+			recordListQuery(query)
 		}
 
 		// Tag 0.30.100: post-LIST per-item RBAC filter. The informer
