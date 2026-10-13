@@ -1174,7 +1174,7 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		return m.Int64ObservableGauge(name, metric.WithDescription(desc))
 	}
 	planned, err := gauge("snowplow_prewarm_pass_units_planned",
-		"Units the LAST pass of this kind planned to seed (base units its loops attempt + the admitted learned units), by kind. #643.")
+		"Units the LAST pass of this kind planned to seed (base units its loops attempt + the admitted learned units), by kind. A pass cut before the learned-class bound decides reports an UPPER BOUND (every learned unit, admitted or not). #643.")
 	if err != nil {
 		return err
 	}
@@ -1224,12 +1224,12 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		return err
 	}
 	extFetch, err := m.Int64ObservableCounter("snowplow_external_fetch_total",
-		metric.WithDescription("External (non-apiserver) fetches issued by the RESTAction resolver, by origin {background, request}. background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
+		metric.WithDescription("LOGICAL external (non-apiserver) fetches issued by the RESTAction resolver, one per stage call, by origin {background, request}; retries inside plumbing's RetryClient are NOT counted, so this does not compare 1:1 with a server-side attempt log (ClickHouse query_log). background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
 	if err != nil {
 		return err
 	}
 	extAbandoned, err := m.Int64ObservableCounter("snowplow_external_fetch_abandoned_total",
-		metric.WithDescription("External fetches whose caller's ctx was done before the response was read (the boot-readiness bound, a cut scope, a client that left), by origin. The server may still be executing each one. #643."))
+		metric.WithDescription("LOGICAL external fetches whose caller's ctx was done before the response was read (the boot-readiness bound, a cut scope, a client that left), by origin; RetryClient attempts are not counted separately. The server may still be executing each one. #643."))
 	if err != nil {
 		return err
 	}

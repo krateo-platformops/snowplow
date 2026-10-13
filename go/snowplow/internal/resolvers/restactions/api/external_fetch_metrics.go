@@ -18,6 +18,19 @@
 //     response body was read (the 5s bound, a cut scope, a client that left).
 //     The server may still be executing the request.
 //
+// LOGICAL FETCHES, NOT HTTP ATTEMPTS. Both counters count one per external
+// stage call (dispatchOneCall). plumbing's RetryClient (http/util/retry.go) can
+// send up to CLIENT_MAX_RETRIES+1 HTTP attempts per logical fetch on a network
+// error, a 5xx or a 429 — and ClickHouse answers TOO_MANY_SIMULTANEOUS_QUERIES
+// with a 5xx. Retries inside the RetryClient are NOT counted, so these do not
+// compare 1:1 with a server-side attempt count such as ClickHouse query_log.
+//
+// KNOWN LIMIT: origin comes from cache.RefDenialOrigin, which defaults to
+// "serve" for a ctx with no marker. A background goroutine that carries no
+// background/prewarm marker therefore counts as origin=request. Every
+// production background driver stamps one (the #563 census), and F9 pins the
+// engine paths at request-delta 0.
+//
 // CLOSED LABEL SET: origin ∈ {background, request}, both pre-populated. Hand-
 // wired onto OTLP in metrics.go (there is no expvar->OTLP bridge).
 

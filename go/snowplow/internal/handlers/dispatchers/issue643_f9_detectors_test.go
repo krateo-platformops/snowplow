@@ -112,8 +112,22 @@ func TestIssue643_F9_DetectorsReadTheDefect(t *testing.T) {
 	if req1 != req0 {
 		t.Fatalf("snowplow_external_fetch_total{origin=request} moved by %d with no /call — the origin split is wrong", req1-req0)
 	}
-	if got := h643PassCount(string(scopeKindGVRDiscovered), prewarmPassOutcomeComplete); got != 2 {
-		t.Fatalf("pass_total{gvr-discovered,complete} = %d, want 2", got)
+	// Every pass this arm ran had an hour's budget and finished its plan: each
+	// must read outcome=complete with done == planned. This pins the outcome
+	// rule's second clause (plannedSet && done < planned → cut) against
+	// misreporting a COMPLETE pass as cut, for every kind run here.
+	for kind, want := range map[prewarmScopeKind]uint64{
+		scopeKindBoot: 1, scopeKindGVRDiscovered: 2, scopeKindKeepwarm: 1,
+	} {
+		if got := h643PassCount(string(kind), prewarmPassOutcomeComplete); got != want {
+			t.Fatalf("pass_total{%s,complete} = %d, want %d", kind, got, want)
+		}
+		if got := h643PassCount(string(kind), prewarmPassOutcomeCut); got != 0 {
+			t.Fatalf("pass_total{%s,cut} = %d, want 0 (every pass finished)", kind, got)
+		}
+		if l := h643Last(t, string(kind)); l.Planned == 0 || l.Done != l.Planned {
+			t.Fatalf("%s last pass planned=%d done=%d, want done == planned > 0", kind, l.Planned, l.Done)
+		}
 	}
 	// Positive controls: no background kind has the skip yet.
 	for _, k := range []prewarmScopeKind{scopeKindGVRDiscovered, scopeKindKeepwarm} {
