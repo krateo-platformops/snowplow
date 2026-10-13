@@ -57,6 +57,10 @@ type ClusterListCellRoster struct {
 type ClusterListCellEntry struct {
 	APICall *templates.API
 	GVR     schema.GroupVersionResource
+	// Query is the canonical query of the stage's path (#602/#618) — the cell
+	// is keyed and populated with it, so a selector stage warms ITS cell, not
+	// the unselected one.
+	Query string
 }
 
 // EnumerateClusterListCells walks every RESTAction in restActions and
@@ -127,11 +131,11 @@ func EnumerateClusterListCells(
 			if apiCall == nil {
 				continue
 			}
-			gvr, ok := extractClusterListGVRFromStage(apiCall)
+			gvr, query, ok := extractClusterListTargetFromStage(apiCall)
 			if !ok {
 				continue
 			}
-			key := gvr.String()
+			key := gvr.String() + "?" + query
 			if seenGVR[key] {
 				continue
 			}
@@ -139,6 +143,7 @@ func EnumerateClusterListCells(
 			roster.Cells = append(roster.Cells, ClusterListCellEntry{
 				APICall: apiCall,
 				GVR:     gvr,
+				Query:   query,
 			})
 		}
 	}
@@ -177,6 +182,27 @@ func EnumerateClusterListCells(
 // against — always cluster-scope (buildClusterListCall strips any
 // namespace segment from the source path).
 func extractClusterListGVRFromStage(apiCall *templates.API) (schema.GroupVersionResource, bool) {
+	gvr, _, ok := extractClusterListTargetFromStage(apiCall)
+	return gvr, ok
+}
+
+// extractClusterListTargetFromStage is extractClusterListGVRFromStage plus the
+// stage path's canonical query as a CLUSTER-scope call would carry it (#602). A
+// query the informer cannot reproduce on a cluster path is not a pre-warmable
+// cell: the stage is skipped (its per-NS calls reach the apiserver intact).
+func extractClusterListTargetFromStage(apiCall *templates.API) (schema.GroupVersionResource, string, bool) {
+	gvr, ok := extractClusterListGVRFromStagePath(apiCall)
+	if !ok {
+		return schema.GroupVersionResource{}, "", false
+	}
+	q := planListQuery(strings.TrimSpace(apiCall.Path), true, false)
+	if !q.applicable {
+		return schema.GroupVersionResource{}, "", false
+	}
+	return gvr, q.canon, true
+}
+
+func extractClusterListGVRFromStagePath(apiCall *templates.API) (schema.GroupVersionResource, bool) {
 	if apiCall == nil {
 		return schema.GroupVersionResource{}, false
 	}
@@ -294,7 +320,7 @@ func PrewarmClusterListCells(
 			if gctx.Err() != nil {
 				return gctx.Err()
 			}
-			contentKey := cache.ComputeKey(contentKeyInputs(cell.GVR, "", ""))
+			contentKey := cache.ComputeKey(contentKeyInputsQ(cell.GVR, "", "", cell.Query))
 			// If the cell is already warm (from a prior boot's
 			// refresher OR from a concurrent populate), skip.
 			// #376 — GetNoTouch: this is a PREWARM already-warm probe (not a customer
@@ -312,7 +338,7 @@ func PrewarmClusterListCells(
 				return nil
 			}
 			// Build the cluster-scope call.
-			clusterCall := buildClusterListCall(cell.APICall, ep, cell.GVR)
+			clusterCall := buildClusterListCallQ(cell.APICall, ep, cell.GVR, cell.Query)
 
 			if populateClusterListCellSync(gctx, log, cell.APICall, cell.GVR, contentKey, clusterCall, apistageStore) {
 				mu.Lock()

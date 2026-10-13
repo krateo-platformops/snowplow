@@ -63,6 +63,16 @@ import (
 // apistage class. They are omitted entirely rather than threaded-and-
 // ignored so the content nature of the key is explicit at the call site.
 func contentKeyInputs(gvr schema.GroupVersionResource, namespace, name string) cache.ResolvedKeyInputs {
+	return contentKeyInputsQ(gvr, namespace, name, "")
+}
+
+// contentKeyInputsQ is contentKeyInputs for a call that carries a query string
+// (#618). query is the CANONICAL form planListQuery produced — never the raw
+// call query — so two spellings of the same selector share a cell, and a
+// selector call never shares the unselected call's cell (ComputeKey folds a
+// non-empty Query behind its own sentinel). The (gvr, ns, name) tuple alone
+// does NOT identify a K8s LIST once it carries a selector.
+func contentKeyInputsQ(gvr schema.GroupVersionResource, namespace, name, query string) cache.ResolvedKeyInputs {
 	return cache.ResolvedKeyInputs{
 		CacheEntryClass: cache.CacheEntryClassApistage,
 		Group:           gvr.Group,
@@ -70,6 +80,7 @@ func contentKeyInputs(gvr schema.GroupVersionResource, namespace, name string) c
 		Resource:        gvr.Resource,
 		Namespace:       namespace,
 		Name:            name,
+		Query:           query,
 	}
 }
 
@@ -485,8 +496,19 @@ func apistageContentServe(
 	if !parseOK {
 		return nil, false, false
 	}
-	contentKey := cache.ComputeKey(contentKeyInputs(gvr, ns, name))
 	isList := name == ""
+	// #618 — classify the query BEFORE any cell is read or written. A query
+	// the informer cannot reproduce exactly is not a content unit: return
+	// ok=false so the caller dispatches to the apiserver with the query
+	// intact. Reading a cell first would serve this call the unselected (or a
+	// differently-selected) list, which is the defect.
+	query := planListQuery(call.Path, isList, ns != "")
+	if !query.applicable {
+		recordListQuery(query)
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerListQuery, gvr.String())
+		return nil, false, false
+	}
+	contentKey := cache.ComputeKey(contentKeyInputsQ(gvr, ns, name, query.canon))
 
 	// Step 2 — content Get / un-gated dispatch + Put.
 	//
@@ -570,6 +592,9 @@ func apistageContentServe(
 	}
 	if entry, hit := readContent(contentKey); hit && entry != nil {
 		hitObserved = true // Ship 0.30.193 C3 — observed cache hit.
+		// #618 — a HIT serves this call's selector from its own cell; the MISS
+		// branch counts through dispatchViaInformer instead.
+		recordListQuery(query)
 		envelope = entry.RawJSON
 		entryRef = entry
 		// R3: a LIST entry stored with pre-parsed Items — gate directly
@@ -679,7 +704,7 @@ func apistageContentServe(
 		// scope-waiver:TTLOverride: apistage identity-free content substrate — sets its OWN data-plane CATALOG_UNSERVABLE TTLOverride CONDITIONALLY on newEntry below (not a keyed literal element); NOT the UAF-cap class (no BindingUID / no per-user refilter output) — uaf_shortttl.go R-d-4 SITE MAP.
 		newEntry := &cache.ResolvedEntry{
 			RawJSON: dispatched,
-			Inputs:  ptrTo(contentKeyInputs(gvr, ns, name)),
+			Inputs:  ptrTo(contentKeyInputsQ(gvr, ns, name, query.canon)),
 		}
 		// R1 Layer 2 (#36): bounded-staleness backstop. If this content
 		// entry is being stored while its GVR informer is NOT servable
@@ -869,7 +894,9 @@ func RefreshContentEntry(ctx context.Context, inputs cache.ResolvedKeyInputs) ([
 		Version:  inputs.Version,
 		Resource: inputs.Resource,
 	}
-	path := apiserverPathFor(gvr, inputs.Namespace, inputs.Name)
+	// #618 — re-apply the cell's selector: the refreshed body must be the
+	// same SELECTED list the cell was keyed for, never the unselected one.
+	path := withQuery(apiserverPathFor(gvr, inputs.Namespace, inputs.Name), inputs.Query)
 	call := httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{
 			Path: path,

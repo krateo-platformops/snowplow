@@ -388,6 +388,20 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		return nil, false, nil
 	}
 
+	// Gate 4a (#618): the query string. The parse above discarded it, and
+	// this dispatcher used to LIST with bare ListOptions — a selector stage
+	// on the SA/refresher path got the unselected list. A query whose
+	// semantics are exact (labelSelector, metadata.name / namespaced
+	// metadata.namespace fieldSelector) is handed to the live LIST below as
+	// ListOptions; anything else is NOT this dispatcher's to answer
+	// (served=false), the same contract as the subresource gate above: the
+	// later branches dispatch the path with its query intact.
+	query := planListQuery(call.Path, name == "", namespace != "")
+	if !query.applicable {
+		recordListQuery(query)
+		return nil, false, nil
+	}
+
 	// Per-user RBAC re-gate decision (defensive authorization). Reaching here means
 	// the SA *rest.Config is on the ctx — post-#268/#269 Part 1 that is an internal
 	// driver (Phase-1 walk / background refresher / prewarm re-resolve), never a live
@@ -546,13 +560,26 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 	// the SA LIST. The downstream userAccessFilter refilter (if any) runs
 	// identically on either envelope. No per-user path reaches here (scope
 	// gate above), so there is no cross-user serve.
+	//
+	// #618: a selector LIST is served from the informer too, filtered with the
+	// SAME predicate the request path uses (listQuery.matches) — only the
+	// exact subset reaches here (gate 4a refused the rest). Bypassing this
+	// branch would put selector stages back on live paged LISTs for the boot
+	// walk and every SA-path refresh, which is what #121 1a removed.
 	if rw, haveRW := cache.ServeWatcherFromContext(ctx); haveRW {
+		var keep func(*unstructured.Unstructured) bool
+		if !query.empty() {
+			keep = func(u *unstructured.Unstructured) bool {
+				return query.matches(u.GetName(), u.GetNamespace(), u.GetLabels())
+			}
+		}
 		// Bounded per-GVR sync-wait (returns immediately when already synced —
 		// the common boot case), then the SAME four-conjunct IsServable gate
 		// ListObjectsServable enforces. Both must hold to serve from cache.
 		synced := rw.WaitForGVRSync(ctx, gvr, internalDispatchServeSyncWait)
 		if synced && rw.IsServable(gvr) {
-			if served, ok := rw.ListServableEnvelopeJSON(gvr, namespace); ok {
+			if served, ok := rw.ListServableEnvelopeJSONWhere(gvr, namespace, keep); ok {
+				recordListQuery(query) // applied in process (no-op without a query)
 				xcontext.Logger(ctx).Info("internal_dispatch.list.informer_served",
 					slog.String("subsystem", "cache"),
 					slog.String("gvr", gvr.String()),
@@ -582,7 +609,13 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 
 	listStart := time.Now()
 	resultList := &unstructured.UnstructuredList{}
-	opts := metav1.ListOptions{Limit: internalDispatchListPageLimit}
+	opts := metav1.ListOptions{
+		Limit: internalDispatchListPageLimit,
+		// #618: the call's own selectors, canonicalised (empty without one).
+		// Applied by the APISERVER here, so not counted as in_process.
+		LabelSelector: query.labelStr,
+		FieldSelector: query.fieldStr,
+	}
 	pages := 0
 	totalItems := 0
 	for {

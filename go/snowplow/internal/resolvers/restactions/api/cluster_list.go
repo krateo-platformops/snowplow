@@ -71,6 +71,15 @@ func goMaxProcs() int { return runtime.GOMAXPROCS(0) }
 // map[string]any — well inside the 10ms budget.
 const shapeCheckSlowThreshold = 10 * time.Millisecond
 
+// clusterListCollapseEnabled — CURRENT STATE: ON (true), since Ship 0.30.216.
+// The collapse is LIVE in production. Since #602 it carries the stage's
+// canonical query (labelSelector / metadata.name fieldSelector) on the
+// collapsed call and in the cell key, and DECLINES (per-NS fallback, each
+// element's query intact) when the elements disagree on the query or carry one
+// the informer cannot reproduce. Everything below is history, oldest first.
+//
+// # History
+//
 // clusterListCollapseEnabled is the Ship S.1-re sequencing gate. The cluster-list
 // iterator collapse is CORRECT but NOT yet refresher-safe: activated unconditionally
 // (0.30.205) it ran the full-payload dispatch+unmarshal under the L1 refresher every
@@ -207,7 +216,10 @@ func attemptClusterListCollapse(
 	}
 
 	// Gate 4: derive the target GVR from the first iterator element.
-	gvr, derivedOK := deriveTargetGVRForClusterList(ctx, log, apiCall, dict)
+	// #602/#618 — the derivation also yields the CANONICAL query every element
+	// carries; a heterogeneous or not-in-process-applicable query declines
+	// here, so the per-NS path keeps each element's query intact.
+	gvr, query, derivedOK := deriveClusterListTarget(ctx, log, apiCall, dict)
 	if !derivedOK {
 		log.Debug("cluster_list.gate_deny.gvr_derivation_failed",
 			slog.String("subsystem", "cache"),
@@ -250,7 +262,7 @@ func attemptClusterListCollapse(
 	}
 
 	// All five gates passed. Build the cluster-scope call.
-	clusterCall := buildClusterListCall(apiCall, ep, gvr)
+	clusterCall := buildClusterListCallQ(apiCall, ep, gvr, query)
 
 	// Path 3.2 / 0.30.218 — CELL-WARM FAST-PATH.
 	//
@@ -279,7 +291,7 @@ func attemptClusterListCollapse(
 	// The next customer of the same cell hits the populated cell from
 	// the refresher's async work — warmth improves monotonically without
 	// any customer ever paying raw decode.
-	contentKey := cache.ComputeKey(contentKeyInputs(gvr, "", ""))
+	contentKey := cache.ComputeKey(contentKeyInputsQ(gvr, "", "", query))
 	// #376 — this is the collapse-DECISION warmth probe, NOT the serve (the real serve is
 	// apistageContentServe, which stamps on a customer /call). A decision-probe must never
 	// stamp — on the customer OR the refresher path — so GetNoTouch unconditional; the
@@ -436,8 +448,12 @@ func populateClusterListCellSync(
 	// uaf-scope-waiver: PRE-refilter substrate, structurally incapable of carrying narrowed rows. This cell holds the RAW apiserver LIST envelope keyed by contentKeyInputs(gvr, ns, name) with NO identity fold; the userAccessFilter runs LATER, on the way out, and its output lands in the identity-bound restactions/widgets cells (all gated). Caching the un-narrowed substrate is what makes the per-request refilter cheap — gating it here would be wrong-cell and would defeat the layer for zero isolation gain.
 	// scope-waiver:TTLOverride: cluster-list identity-free content substrate — sets its OWN data-plane CATALOG_UNSERVABLE TTLOverride CONDITIONALLY on newEntry below (not a keyed literal element); NOT the UAF-cap class (no BindingUID / no per-user refilter output) — uaf_shortttl.go R-d-4 SITE MAP.
 	newEntry := &cache.ResolvedEntry{
-		RawJSON:         rawEnvelope,
-		Inputs:          ptrTo(contentKeyInputs(gvr, "", "")),
+		RawJSON: rawEnvelope,
+		// #602/#618 — the cell's Inputs carry the canonical query the cluster
+		// call was built with, so the refresher's rebuilt path
+		// (RefreshContentEntry) re-applies the same selector. Derived from the
+		// call itself, the single source both the key and the body came from.
+		Inputs:          ptrTo(contentKeyInputsQ(gvr, "", "", planListQuery(clusterCall.Path, true, false).canon)),
 		Items:           parsed.items,
 		ItemsAPIVersion: parsed.apiVersion,
 		ItemsKind:       parsed.kind,
@@ -691,12 +707,30 @@ func deriveTargetGVRForClusterList(
 	apiCall *templates.API,
 	dict map[string]any,
 ) (schema.GroupVersionResource, bool) {
+	gvr, _, ok := deriveClusterListTarget(ctx, log, apiCall, dict)
+	return gvr, ok
+}
+
+// deriveClusterListTarget is deriveTargetGVRForClusterList plus the query
+// (#602/#618). Every element must carry the SAME canonical query, and that
+// query must be applicable in process on the CLUSTER-scope path the collapse
+// issues (planListQuery with namespaced=false — so a metadata.namespace field
+// selector declines, see list_query.go). Any divergence or fall-through
+// declines the collapse: the per-NS iterator then dispatches each element with
+// its own query intact. Before #602 the collapse rebuilt the path from the GVR
+// alone and silently discarded the selector.
+func deriveClusterListTarget(
+	ctx context.Context,
+	log *slog.Logger,
+	apiCall *templates.API,
+	dict map[string]any,
+) (schema.GroupVersionResource, string, bool) {
 	if apiCall.DependsOn == nil || apiCall.DependsOn.Iterator == nil {
-		return schema.GroupVersionResource{}, false
+		return schema.GroupVersionResource{}, "", false
 	}
 	iter := *apiCall.DependsOn.Iterator
 	if iter == "" {
-		return schema.GroupVersionResource{}, false
+		return schema.GroupVersionResource{}, "", false
 	}
 
 	// Walk ALL elements (no early-exit, no sampling cap). Element 0 sets the
@@ -704,6 +738,7 @@ func deriveTargetGVRForClusterList(
 	// ns-scoped-LIST shape. Once a divergence is seen the decision is false and
 	// the remaining elements are drained without further work.
 	var ref schema.GroupVersionResource
+	var refQuery string
 	have := false
 	diverged := false
 	probeErr := jqutil.ForEach(ctx, jqutil.EvalOptions{
@@ -714,18 +749,20 @@ func deriveTargetGVRForClusterList(
 		if diverged {
 			return nil
 		}
-		gvr, ok := gvrForClusterListElement(apiCall.Path, sa)
+		gvr, query, ok := clusterListElementTarget(apiCall.Path, sa)
 		if !ok {
-			// cluster-scope / by-name / empty / jq|parse error → collapse-unsafe.
+			// cluster-scope / by-name / empty / jq|parse error / a query the
+			// cluster call cannot carry → collapse-unsafe.
 			diverged = true
 			return nil
 		}
 		if !have {
-			ref, have = gvr, true
+			ref, refQuery, have = gvr, query, true
 			return nil
 		}
-		if gvr != ref {
-			// A different GVR across elements — a heterogeneous iterator. #351.
+		if gvr != ref || query != refQuery {
+			// A different GVR (#351) or a different selector (#602) across
+			// elements — one cluster LIST cannot answer them all.
 			diverged = true
 		}
 		return nil
@@ -737,9 +774,9 @@ func deriveTargetGVRForClusterList(
 			slog.Bool("diverged", diverged),
 			slog.Any("err", probeErr),
 		)
-		return schema.GroupVersionResource{}, false
+		return schema.GroupVersionResource{}, "", false
 	}
-	return ref, true
+	return ref, refQuery, true
 }
 
 // gvrForClusterListElement resolves apiCall.Path against ONE iterator element
@@ -753,19 +790,31 @@ func deriveTargetGVRForClusterList(
 // a jq error fails safe to no-collapse. The ns==""/name!="" guards are keyed on
 // the parsed path SHAPE, never resource/name literals (feedback_no_special_cases).
 func gvrForClusterListElement(pathTmpl string, element any) (schema.GroupVersionResource, bool) {
+	gvr, _, ok := clusterListElementTarget(pathTmpl, element)
+	return gvr, ok
+}
+
+// clusterListElementTarget is gvrForClusterListElement plus the element's
+// canonical query as the CLUSTER-scope call would carry it (#602). ok=false
+// when that query cannot be applied in process on a cluster path.
+func clusterListElementTarget(pathTmpl string, element any) (schema.GroupVersionResource, string, bool) {
 	resolvedPath, jqErr := evalJQE(pathTmpl, element)
 	if jqErr != nil {
 		bumpNondialJQError(nondialClusterListGVRProbe)
-		return schema.GroupVersionResource{}, false
+		return schema.GroupVersionResource{}, "", false
 	}
 	if resolvedPath == "" || strings.Contains(resolvedPath, "${") {
-		return schema.GroupVersionResource{}, false
+		return schema.GroupVersionResource{}, "", false
 	}
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(resolvedPath)
 	if !parseOK || ns == "" || name != "" {
-		return schema.GroupVersionResource{}, false
+		return schema.GroupVersionResource{}, "", false
 	}
-	return gvr, true
+	q := planListQuery(resolvedPath, true, false)
+	if !q.applicable {
+		return schema.GroupVersionResource{}, "", false
+	}
+	return gvr, q.canon, true
 }
 
 // buildClusterListCall constructs the single cluster-scoped LIST
@@ -785,10 +834,22 @@ func buildClusterListCall(
 	ep endpoints.Endpoint,
 	gvr schema.GroupVersionResource,
 ) httpcall.RequestOptions {
+	return buildClusterListCallQ(apiCall, ep, gvr, "")
+}
+
+// buildClusterListCallQ is buildClusterListCall carrying a canonical query
+// (#602): the collapsed call keeps the selector every element carried instead
+// of rebuilding a bare GVR path.
+func buildClusterListCallQ(
+	apiCall *templates.API,
+	ep endpoints.Endpoint,
+	gvr schema.GroupVersionResource,
+	query string,
+) httpcall.RequestOptions {
 	_ = ep // endpoint is wired by the worker loop's per-call assignment;
 	// the cluster-list helper just constructs the call shape.
 
-	path := clusterScopePathFor(gvr)
+	path := withQuery(clusterScopePathFor(gvr), query)
 	out := httpcall.RequestOptions{}
 	out.Path = path
 	out.Verb = ptr.To(http.MethodGet)

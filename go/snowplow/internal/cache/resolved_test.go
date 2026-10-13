@@ -107,6 +107,7 @@ func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 		{"Page", func(in *ResolvedKeyInputs) { in.Page = 2 }},
 		{"Extras", func(in *ResolvedKeyInputs) { in.Extras = map[string]any{"k": "w"} }},
 		{"Stage", func(in *ResolvedKeyInputs) { in.Stage = "stage\x1fcompositions\x1f\x1f" }},
+		{"Query", func(in *ResolvedKeyInputs) { in.Query = "labelSelector=env%3Dprod" }},
 	}
 	baseKey := ComputeKey(base)
 	for _, m := range mutators {

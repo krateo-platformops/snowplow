@@ -1106,7 +1106,34 @@ func registerInstruments(m metric.Meter, build string) error {
 	if cache.Disabled() {
 		return nil
 	}
+	if err := registerListQueryInstrument(m); err != nil {
+		return err
+	}
 	return registerSecurityInstruments(m)
+}
+
+// registerListQueryInstrument hand-wires #618's list-query outcome counter onto
+// OTLP (no expvar->OTLP bridge). It reads restactionsapi.ListQueryOutcomeSnapshot,
+// the same accessor the snowplow_list_query_total expvar closure reads, so the
+// two surfaces cannot diverge. Both attributes come from a closed, code-defined
+// enum: outcome {in_process, fallthrough} and reason (selector, or the
+// fall-through reason) — never from request data. Registered only when the cache
+// is on (CFG-1: the expvar key is published from a Disabled()-gated init).
+func registerListQueryInstrument(m metric.Meter) error {
+	listQuery, err := m.Int64ObservableCounter(
+		"snowplow_list_query_total",
+		metric.WithDescription("Informer-servable calls that carried a query string, by outcome {in_process, fallthrough} and bounded reason. in_process/selector: a labelSelector and/or metadata.name (or namespaced metadata.namespace) fieldSelector was applied to the informer's items. fallthrough/<reason>: the call went to the apiserver with its query intact (pagination, resource_version, watch, unsupported_field, namespace_field_cluster_path, invalid_selector, repeated_param, query_on_get, unknown_param, malformed_query). Calls without a query are not counted. #618."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, s := range restactionsapi.ListQueryOutcomeSnapshot() {
+			o.ObserveInt64(listQuery, int64(s.Count), metric.WithAttributes(
+				attribute.String("outcome", s.Outcome), attribute.String("reason", s.Reason)))
+		}
+		return nil
+	}, listQuery)
+	return err
 }
 
 // learnedCapacityStats is the CLOSED set of numeric inputs of the last

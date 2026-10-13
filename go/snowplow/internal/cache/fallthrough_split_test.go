@@ -114,6 +114,7 @@ var splitCases = []splitCase{
 	{ReasonRawRead, false, "#443 raw=true skips the resolver and issues a live apiserver GET as the caller"},
 	{ReasonInformerSensitive, false, "#398: a sensitive resource is never informed — always a live apiserver read"},
 	{ReasonInformerRepresentation, false, "#398: a non-default representation is only the apiserver's to produce"},
+	{ReasonInformerListQuery, false, "#618: a query the informer cannot reproduce goes to the apiserver intact"},
 }
 
 // TestFallthroughSplit_RoutingCellsAndTotals is F4.
@@ -226,9 +227,10 @@ func TestFallthroughSplit_TableCoversEveryReason(t *testing.T) {
 		ReasonResolverPluralsHit, ReasonResolverPluralsMiss,
 		ReasonRawRead,                                         // #443
 		ReasonInformerSensitive, ReasonInformerRepresentation, // #398
+		ReasonInformerListQuery, // #618
 	}
-	if len(allReasons) != 24 {
-		t.Fatalf("closed enum size = %d; design §3.2 states 21, plus #443's raw-read and #398's sensitive + representation = 24 — update both this list and the "+
+	if len(allReasons) != 25 {
+		t.Fatalf("closed enum size = %d; design §3.2 states 21, plus #443's raw-read, #398's sensitive + representation and #618's list-query = 25 — update both this list and the "+
 			"cardinality arithmetic if a reason was added", len(allReasons))
 	}
 
