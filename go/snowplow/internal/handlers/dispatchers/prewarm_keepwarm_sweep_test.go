@@ -201,8 +201,8 @@ func TestKeepwarmSweep_WidgetCapablePrefix_SeedsAllCapableNotWidgetless(t *testi
 	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
 
 	prevTGVR := restActionTargetGVRFn
-	restActionTargetGVRFn = func(_ context.Context, _ templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
-		return eFanoutRAGVR, true // bulk-ra LISTs eFanoutRAGVR (M's bucket)
+	restActionTargetGVRFn = func(_ context.Context, _ templatesv1.ObjectReference) (schema.GroupVersionResource, string) {
+		return eFanoutRAGVR, raTargetFound // bulk-ra LISTs eFanoutRAGVR (M's bucket)
 	}
 	t.Cleanup(func() { restActionTargetGVRFn = prevTGVR })
 

@@ -1172,6 +1172,38 @@ func rootsReadRESTConfig(rc *rest.Config) *rest.Config {
 //     cache.ClientConfigFor instead of rebuilding a client from saEP
 //     through kubeconfig.NewClientConfig.
 //
+// withSAIdentityContext is the IDENTITY part of withPhase1SAContext: the SA
+// UserConfig, the canonical SA UserInfo, the internal endpoint and the internal
+// REST config — exactly what objects.Get needs to serve an informer object
+// under the SA (filterGetByRBAC) or fall through to the apiserver with the SA's
+// credentials. It installs none of the walk/seed machinery (serve watcher,
+// fallthrough scope, seed loopback token).
+//
+// #647: the resident enumeration (enumerateResident — the RBAC-shift reseed,
+// the learned-class seed, the #258 rotated-target filter) uses it for the
+// RESTAction target-GVR lookup only. That lookup is identity-free discovery
+// ("which GVR does this RESTAction gate its LIST on"), the same read the boot
+// precompute makes under withPhase1SAContext; without an identity the
+// fail-closed RBAC filter refused every RESTAction and every RA unit was
+// dropped. It never wraps a per-user serve.
+func withSAIdentityContext(ctx context.Context, saEP endpoints.Endpoint, saRC *rest.Config) context.Context {
+	opts := []xcontext.WithContextFunc{
+		xcontext.WithUserConfig(saEP),
+		xcontext.WithLogger(slog.Default()),
+	}
+	// The CANONICAL SA username: derived from the JWT `sub` claim of the
+	// projected SA token saEP already carries. Without it (token absent /
+	// malformed) Phase 1 still runs — it is best-effort warmup — but the
+	// RBAC evaluator then has no SA subject to match; that degraded case
+	// is logged at the call site (resolveNavigationRoot / the lister).
+	if u, ok := phase1SAUsername(saEP.Token); ok {
+		opts = append(opts, xcontext.WithUserInfo(jwtutil.UserInfo{Username: u}))
+	}
+	rctx := xcontext.BuildContext(ctx, opts...)
+	rctx = cache.WithInternalEndpoint(rctx, &saEP)
+	return cache.WithInternalRESTConfig(rctx, saRC)
+}
+
 // withPhase1SAContext builds the SA-credentialed context Phase 1
 // resolution runs under. It is the SINGLE place the SA identity +
 // internal-dispatch markers are installed, shared by the navigation-root
@@ -1197,21 +1229,7 @@ func rootsReadRESTConfig(rc *rest.Config) *rest.Config {
 //     (the LOAD-BEARING 0.30.103 fix — the SA's raw-PEM CA cannot survive
 //     the base64/cert-only kubeconfig path).
 func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *rest.Config) context.Context {
-	opts := []xcontext.WithContextFunc{
-		xcontext.WithUserConfig(saEP),
-		xcontext.WithLogger(slog.Default()),
-	}
-	// The CANONICAL SA username: derived from the JWT `sub` claim of the
-	// projected SA token saEP already carries. Without it (token absent /
-	// malformed) Phase 1 still runs — it is best-effort warmup — but the
-	// RBAC evaluator then has no SA subject to match; that degraded case
-	// is logged at the call site (resolveNavigationRoot / the lister).
-	if u, ok := phase1SAUsername(saEP.Token); ok {
-		opts = append(opts, xcontext.WithUserInfo(jwtutil.UserInfo{Username: u}))
-	}
-	rctx := xcontext.BuildContext(ctx, opts...)
-	rctx = cache.WithInternalEndpoint(rctx, &saEP)
-	rctx = cache.WithInternalRESTConfig(rctx, saRC)
+	rctx := withSAIdentityContext(ctx, saEP, saRC)
 	// #121 1a — attach the shared watcher so the internal-dispatch LIST path
 	// (dispatchViaInternalRESTConfig) can serve a servable GVR's LIST from the
 	// synced informer indexer instead of a live 27.5s/60K paged apiserver LIST

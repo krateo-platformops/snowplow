@@ -190,16 +190,16 @@ func TestP0_RestActionTargetGVR_RequiresSACredentialedCtx(t *testing.T) {
 
 	// (a) BARE ctx — the P0 regression: objects.Get fail-closes on missing
 	// identity → restActionTargetGVR returns (zero,false).
-	if gvr, ok := restActionTargetGVR(context.Background(), ref); ok {
-		t.Fatalf("REGRESSION: bare ctx derived a target GVR %v — expected (zero,false) "+
-			"(credential-less objects.Get must fail-close)", gvr)
+	if gvr, miss := restActionTargetGVR(context.Background(), ref); miss != residentDropGetFailed {
+		t.Fatalf("REGRESSION: bare ctx derived target GVR %v (miss=%q) — expected (zero, %q) "+
+			"(credential-less objects.Get must fail-close)", gvr, miss, residentDropGetFailed)
 	}
 
 	// (b) SA-credentialed ctx — the FIX: objects.Get serves the RA →
 	// restActionTargetGVR returns the compositions target GVR.
 	rctx := saCtxForTest(context.Background())
-	gvr, ok := restActionTargetGVR(rctx, ref)
-	if !ok {
+	gvr, miss := restActionTargetGVR(rctx, ref)
+	if miss != raTargetFound {
 		t.Fatal("FIX BROKEN: SA-credentialed ctx did not derive a target GVR — "+
 			"objects.Get should serve the RA under SA identity")
 	}

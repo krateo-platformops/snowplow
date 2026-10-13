@@ -568,6 +568,13 @@ func enumerateResident(ctx context.Context, deps rePrewarmDeps, withProactive bo
 		sort.SliceStable(ts, func(i, j int) bool { return learnedKey(ts[i]) < learnedKey(ts[j]) })
 		return ts
 	}
+	// #647: the RESTAction target-GVR lookup is identity-free discovery ("which
+	// GVR does this RESTAction gate its LIST on") and must run under the SA —
+	// the same identity the boot precompute uses (withPhase1SAContext). The
+	// engine scope ctx carries no identity, so objects.Get's fail-closed RBAC
+	// filter refused every RESTAction and every RA unit was dropped. The SA ctx
+	// wraps ONLY this lookup; yields, cuts and every seed keep the engine ctx.
+	raCtx := withSAIdentityContext(ctx, deps.saEP, deps.saRC)
 	out := make([]residentUnit, 0, len(widgetUnits)+len(raUnits))
 	for _, e := range widgetUnits {
 		if ctx.Err() != nil {
@@ -582,8 +589,9 @@ func enumerateResident(ctx context.Context, deps rePrewarmDeps, withProactive bo
 			return out
 		}
 		engineYieldCheckpoint(ctx)
-		targetGVR, ok := restActionTargetGVRFn(ctx, ref)
-		if !ok {
+		targetGVR, miss := restActionTargetGVRFn(raCtx, ref)
+		if miss != raTargetFound {
+			recordResidentUnitDropped(miss)
 			continue
 		}
 		_, h := harvested[ref.Namespace+"/"+ref.Name]

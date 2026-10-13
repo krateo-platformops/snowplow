@@ -127,6 +127,9 @@ type l262Opts struct {
 	secrets      []*corev1.Secret
 	widgets      int // nav widgets (default 3)
 	ras          int // RESTActions (default 2)
+	// extraObjs are added to the dynamic fake as-is (#647: the RESTAction
+	// objects and the snowplow SA binding the real target-GVR lookup reads).
+	extraObjs []runtime.Object
 }
 
 func l262Binding(name, kind, subject string) *rbacv1.ClusterRoleBinding {
@@ -201,6 +204,7 @@ func l262Setup(t *testing.T, o l262Opts) *l262Env {
 	for _, u := range o.extraUsers {
 		objs = append(objs, l262ExtraRB(u))
 	}
+	objs = append(objs, o.extraObjs...)
 	env := &l262Env{}
 	env.dyn = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objs...)
 	wctx, wcancel := context.WithCancel(context.Background())
@@ -397,8 +401,8 @@ func l262Stubs(t *testing.T, o l262StubOpts) {
 			}},
 		}
 	}
-	restActionTargetGVRFn = func(_ context.Context, _ templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
-		return l262TargetGVR, true
+	restActionTargetGVRFn = func(_ context.Context, _ templatesv1.ObjectReference) (schema.GroupVersionResource, string) {
+		return l262TargetGVR, raTargetFound
 	}
 	if o.raCost() > 0 {
 		seedRestactionResolveAndPutFn = func(

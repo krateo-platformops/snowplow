@@ -457,8 +457,8 @@ func TestBootRace_ReWalk_SeedsCorrectlyScopedCohort(t *testing.T) {
 	// the target GVR the compositions-panels RA LISTs — this is exactly what
 	// rePrewarmBoot does per cohort (restActionTargetGVR under rctx).
 	rctx := saCtxForTest(context.Background())
-	targetGVR, ok := restActionTargetGVR(rctx, ref)
-	if !ok {
+	targetGVR, miss := restActionTargetGVR(rctx, ref)
+	if miss != raTargetFound {
 		t.Fatalf("re-walk scoping: SA-credentialed target GVR derivation failed — objects.Get serve path")
 	}
 	if targetGVR.Group != "composition.krateo.io" || targetGVR.Resource != "compositions" {
