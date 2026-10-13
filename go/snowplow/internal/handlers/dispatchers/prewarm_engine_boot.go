@@ -77,6 +77,9 @@ type rePrewarmDeps struct {
 // adds scopeKindGVRDiscovered dispatch.
 func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewarmScope) error {
 	return func(ctx context.Context, s prewarmScope) error {
+		// #574 — name the scope on every resolve under it, so a re-gate log line
+		// can say "keepwarm" vs "boot" rather than just "cohort-seed".
+		ctx = cache.WithPrewarmScope(ctx, string(s.kind))
 		switch s.kind {
 		case scopeKindBoot:
 			// seedModeBoot engages the F.4 fresh-skip so a deadline-cut boot
