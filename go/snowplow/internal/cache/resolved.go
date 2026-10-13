@@ -1467,7 +1467,11 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 	// was not servable) takes precedence over the store's standard ttl, so a
 	// degraded catalog entry self-evicts within the bound. Zero override =
 	// the standard ttl (every healthy entry).
-	if eff := c.effectiveTTLLocked(item.entry); eff > 0 && now.Sub(item.entry.CreatedAt) > eff {
+	// #643 — both lazy bounds are ONE predicate (itemExpiredLocked), shared
+	// with PutSeqOf, so "is this cell live" cannot drift between the read
+	// path and the served-cell identity check.
+	pastTTL, pastMaxAge := c.itemExpiredLocked(item, now)
+	if pastTTL {
 		// #378 — evaluated on the PRIOR read-recency, before the removal.
 		if touch && c.warmLocked(item, now) {
 			c.evictTTLWarmCustomerTotal.Add(1)
@@ -1493,7 +1497,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 	// GetNoTouch path no customer saw it. The refresher terminal re-mints a cell
 	// it refreshes inside the lead window (ReplaceIfGenRefresh), so a warm cell
 	// reaching this line under a customer is one the re-mint did not cover.
-	if c.maxEntryAge > 0 && !item.entry.BornAt.IsZero() && now.Sub(item.entry.BornAt) > c.maxEntryAge {
+	if pastMaxAge {
 		if c.warmLocked(item, now) {
 			if touch {
 				c.evictMaxAgeWarmCustomerTotal.Add(1)

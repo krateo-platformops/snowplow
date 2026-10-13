@@ -30,3 +30,37 @@ func TestIssue643_DeclinedExternalMarksGaugeReachesOTLP(t *testing.T) {
 		t.Fatalf("snowplow_prewarm_declined_external_marks = %d, want 2 (3 marked, 1 retired)", pts[0].value)
 	}
 }
+
+// TestIssue643_DeclinedExternalRetiredReachesOTLP — the retire-reason breakdown
+// reaches OTLP with every closed-set cell pre-populated, and a retire moves its
+// own cell. Driven through the real cache record path; RED without the wiring.
+func TestIssue643_DeclinedExternalRetiredReachesOTLP(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	cache.ResetDeclinedExternalRetiredForTest()
+	t.Cleanup(cache.ResetDeclinedExternalRetiredForTest)
+	find := func() map[string]int64 {
+		out := map[string]int64{}
+		for _, p := range pointsFor(flatten(collectViaRealCallback(t, "deadbeef")), "snowplow_prewarm_declined_external_retired_total") {
+			out[p.attrs["reason"]] = p.value
+		}
+		return out
+	}
+	before := find()
+	for _, r := range cache.DeclinedExternalRetiredReasons {
+		if _, ok := before[r]; !ok {
+			t.Fatalf("no snowplow_prewarm_declined_external_retired_total{reason=%s} series — every closed cell must be pre-populated (metrics.go wiring missing?)", r)
+		}
+	}
+	if len(before) != len(cache.DeclinedExternalRetiredReasons) {
+		t.Fatalf("%d reason series, want exactly the closed set of %d", len(before), len(cache.DeclinedExternalRetiredReasons))
+	}
+	cache.RecordDeclinedExternalRetired(cache.DeclinedExternalRetiredRAUnreadable, 3)
+	cache.RecordDeclinedExternalRetired("not-a-reason", 5) // dropped: the set cannot grow from data
+	after := find()
+	if got := after[cache.DeclinedExternalRetiredRAUnreadable] - before[cache.DeclinedExternalRetiredRAUnreadable]; got != 3 {
+		t.Fatalf("retired_total{ra_unreadable} moved by %d, want 3", got)
+	}
+	if _, ok := after["not-a-reason"]; ok {
+		t.Fatal("a reason outside the closed set became a series")
+	}
+}

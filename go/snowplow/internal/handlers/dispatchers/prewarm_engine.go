@@ -451,7 +451,9 @@ func (e *prewarmEngine) summarizeDeclinedExternalSet(key, reason string) {
 // it (#643 PR-B: background passes need boot's marks). Concurrency-safe.
 func (e *prewarmEngine) clearDeclinedExternalSet(key, reason string) {
 	e.summarizeDeclinedExternalSet(key, reason)
-	cache.EngineDeclinedExternalSet().Reset()
+	set := cache.EngineDeclinedExternalSet()
+	cache.RecordDeclinedExternalRetired(cache.DeclinedExternalRetiredConfigRedrive, int(set.Len()))
+	set.Reset()
 }
 
 // bootConvergenceStateForKey returns the engine-lived #105 boot-convergence

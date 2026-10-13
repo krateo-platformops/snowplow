@@ -85,7 +85,90 @@ func unmarkDeclinedExternalOnPut(key string, entry *ResolvedEntry) {
 	if entry != nil && entry.ExternalTTL {
 		return
 	}
-	EngineDeclinedExternalSet().Unmark(key)
+	if EngineDeclinedExternalSet().Unmark(key) {
+		RecordDeclinedExternalRetired(DeclinedExternalRetiredPutUnmark, 1)
+	}
+}
+
+// The retire reasons — a CLOSED set, one per retire rule, every cell
+// pre-populated so a 0 is a reading. After a roll, the way this change can fail
+// silently is marks retiring every pass (skips stay low, dials stay high); this
+// breakdown names which rule is doing it.
+const (
+	DeclinedExternalRetiredNilMark               = "nil_mark"
+	DeclinedExternalRetiredServedCellChanged     = "served_cell_changed"
+	DeclinedExternalRetiredDepsMoved             = "deps_moved"
+	DeclinedExternalRetiredRAUnreadAtMark        = "ra_unread_at_mark"
+	DeclinedExternalRetiredRAUnreadable          = "ra_unreadable"
+	DeclinedExternalRetiredRAChanged             = "ra_changed"
+	DeclinedExternalRetiredEndpointSecretChanged = "endpoint_secret_changed"
+	DeclinedExternalRetiredPutUnmark             = "put_unmark"
+	DeclinedExternalRetiredGone                  = "gone"
+	DeclinedExternalRetiredConfigRedrive         = "config_redrive"
+)
+
+// DeclinedExternalRetiredReasons is the closed reason set, in emit order.
+var DeclinedExternalRetiredReasons = []string{
+	DeclinedExternalRetiredNilMark,
+	DeclinedExternalRetiredServedCellChanged,
+	DeclinedExternalRetiredDepsMoved,
+	DeclinedExternalRetiredRAUnreadAtMark,
+	DeclinedExternalRetiredRAUnreadable,
+	DeclinedExternalRetiredRAChanged,
+	DeclinedExternalRetiredEndpointSecretChanged,
+	DeclinedExternalRetiredPutUnmark,
+	DeclinedExternalRetiredGone,
+	DeclinedExternalRetiredConfigRedrive,
+}
+
+var (
+	declinedRetiredMu sync.Mutex
+	declinedRetired   = newDeclinedRetired()
+)
+
+func newDeclinedRetired() map[string]uint64 {
+	m := make(map[string]uint64, len(DeclinedExternalRetiredReasons))
+	for _, r := range DeclinedExternalRetiredReasons {
+		m[r] = 0
+	}
+	return m
+}
+
+// RecordDeclinedExternalRetired counts n marks retired for reason. A reason
+// outside the closed set is dropped (the set cannot grow from data).
+func RecordDeclinedExternalRetired(reason string, n int) {
+	if n <= 0 {
+		return
+	}
+	declinedRetiredMu.Lock()
+	if _, ok := declinedRetired[reason]; ok {
+		declinedRetired[reason] += uint64(n)
+	}
+	declinedRetiredMu.Unlock()
+}
+
+// DeclinedExternalRetiredCount is one {reason} cell.
+type DeclinedExternalRetiredCount struct {
+	Reason string
+	Count  uint64
+}
+
+// DeclinedExternalRetiredSnapshot returns every reason cell, zeros included.
+func DeclinedExternalRetiredSnapshot() []DeclinedExternalRetiredCount {
+	declinedRetiredMu.Lock()
+	defer declinedRetiredMu.Unlock()
+	out := make([]DeclinedExternalRetiredCount, 0, len(DeclinedExternalRetiredReasons))
+	for _, r := range DeclinedExternalRetiredReasons {
+		out = append(out, DeclinedExternalRetiredCount{Reason: r, Count: declinedRetired[r]})
+	}
+	return out
+}
+
+// ResetDeclinedExternalRetiredForTest zeroes the breakdown. Tests only.
+func ResetDeclinedExternalRetiredForTest() {
+	declinedRetiredMu.Lock()
+	declinedRetired = newDeclinedRetired()
+	declinedRetiredMu.Unlock()
 }
 
 // DepsMovedSince reports whether any of deps saw a dep event after stamp —
@@ -139,5 +222,12 @@ func init() {
 	}
 	expvar.Publish("snowplow_prewarm_declined_external_marks", expvar.Func(func() any {
 		return EngineDeclinedExternalSet().Len()
+	}))
+	expvar.Publish("snowplow_prewarm_declined_external_retired_total", expvar.Func(func() any {
+		m := map[string]uint64{}
+		for _, c := range DeclinedExternalRetiredSnapshot() {
+			m[c.Reason] = c.Count
+		}
+		return m
 	}))
 }

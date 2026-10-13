@@ -23,7 +23,21 @@
 //   - the deps the resolve captured, against its entry stamp (d4: external
 //     dispatch can be data-dependent).
 // Put-unmark (a) and GONE (c) retire marks on the cache side
-// (cache/declined_external_engine.go).
+// (cache/declined_external_engine.go). Every retire is counted by reason on
+// snowplow_prewarm_declined_external_retired_total.
+//
+// KNOWN, DOCUMENTED LIMITS (architect-ch review, #656):
+//   - A widget unit's mark does not fold in the WIDGET's own uid/RV. Moot today:
+//     the seed resolves the harvester's first-write-wins copy, so a widget edit
+//     is not seen by the seed at all, and a customer /call Put of the edited
+//     widget retires the mark via Put-unmark. Revisit if the harvester ever
+//     refreshes its copies.
+//   - endpointRef Secrets outside the Secrets informer's namespace
+//     (cache.SecretsCacheNamespace), and templated endpointRef names, are not
+//     tracked: a change to one does not retire the mark through rule (b).
+//   - The served-cell coverage map is exact DepKey equality. A mismatch between
+//     what a cell covers and what the resolve recorded only leaves that dep to
+//     d4 — re-dials during a stale window at worst, never a cold cell.
 
 package dispatchers
 
@@ -180,34 +194,34 @@ func markDeclinedExternal(resCtx context.Context, key string) {
 // False on any change or failed read: the caller retires the mark and resolves.
 func declinedExternalMarkHolds(ctx context.Context, m *cache.DeclinedExternalMark) (bool, string) {
 	if m == nil {
-		return false, "nil_mark"
+		return false, cache.DeclinedExternalRetiredNilMark
 	}
 	// A cached input re-Put or gone: the resolve decided from a body that is no
 	// longer the cell's (the refresh of a stale cell lands here).
 	if servedCellsChangedFn(m.Served) {
-		return false, "served_cell_changed"
+		return false, cache.DeclinedExternalRetiredServedCellChanged
 	}
 	// d4 for the deps read directly (not through a served cell — those are
 	// judged by the cell above, so a stale cell does not re-dial every pass).
 	if len(m.Deps) > 0 && depsMovedFn(m.Deps, m.Stamp, m.Served) {
-		return false, "deps_moved"
+		return false, cache.DeclinedExternalRetiredDepsMoved
 	}
 	if m.RA.Name != "" {
 		if m.RAUID == "" && m.RAResourceVersion == "" {
-			return false, "ra_unread_at_mark"
+			return false, cache.DeclinedExternalRetiredRAUnreadAtMark
 		}
 		ra, ok := readRAForMark(ctx, raObjectRef(m.RA.Namespace, m.RA.Name))
 		if !ok {
-			return false, "ra_unreadable"
+			return false, cache.DeclinedExternalRetiredRAUnreadable
 		}
 		if string(ra.GetUID()) != m.RAUID || ra.GetResourceVersion() != m.RAResourceVersion {
-			return false, "ra_changed"
+			return false, cache.DeclinedExternalRetiredRAChanged
 		}
 	}
 	for _, s := range m.Secrets {
 		rv, ok := secretResourceVersion(s.Name)
 		if !ok || rv != s.ResourceVersion {
-			return false, "endpoint_secret_changed"
+			return false, cache.DeclinedExternalRetiredEndpointSecretChanged
 		}
 	}
 	return true, ""
@@ -223,7 +237,9 @@ func declinedExternalSkip(ctx context.Context, key, class, target string, cohort
 		return false
 	}
 	if holds, reason := declinedExternalMarkHolds(ctx, m); !holds {
-		set.Unmark(key)
+		if set.Unmark(key) {
+			cache.RecordDeclinedExternalRetired(reason, 1)
+		}
 		slog.Default().Debug("phase1.seed.declined_external.retired",
 			slog.String("subsystem", "cache"),
 			slog.String("class", class),

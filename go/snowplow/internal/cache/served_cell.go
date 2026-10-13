@@ -35,6 +35,7 @@ package cache
 import (
 	"context"
 	"sync/atomic"
+	"time"
 )
 
 // storePutSeq issues L1 Put identities. Never reused.
@@ -49,7 +50,11 @@ type ServedCell struct {
 }
 
 // PutSeqOf returns key's current Put identity, or ok=false when the key holds
-// no live entry. A pure read: no eviction, no recency, no hit accounting.
+// no LIVE entry — absent, or past its effective TTL or max entry age by the
+// SAME predicate the read path applies (itemExpiredLocked). Expiry is lazy, so
+// an expired cell nobody read is still indexed: it must read as gone here or a
+// mark served from it would outlive it. A pure read: no eviction, no recency,
+// no hit accounting.
 func (c *ResolvedCacheStore) PutSeqOf(key string) (uint64, bool) {
 	if c == nil || key == "" {
 		return 0, false
@@ -60,7 +65,25 @@ func (c *ResolvedCacheStore) PutSeqOf(key string) (uint64, bool) {
 	if !ok {
 		return 0, false
 	}
-	return el.Value.(*lruItem).putSeq, true
+	item := el.Value.(*lruItem)
+	if pastTTL, pastMaxAge := c.itemExpiredLocked(item, time.Now()); pastTTL || pastMaxAge {
+		return 0, false
+	}
+	return item.putSeq, true
+}
+
+// itemExpiredLocked is THE liveness predicate for an indexed cell: past its
+// effective TTL (per-entry TTLOverride, else the store TTL) measured from
+// CreatedAt, or past the max entry age measured from BornAt. Used by getCore
+// (which then evicts) and PutSeqOf (which only reports). Caller holds c.mu.
+func (c *ResolvedCacheStore) itemExpiredLocked(item *lruItem, now time.Time) (pastTTL, pastMaxAge bool) {
+	if eff := c.effectiveTTLLocked(item.entry); eff > 0 && now.Sub(item.entry.CreatedAt) > eff {
+		pastTTL = true
+	}
+	if c.maxEntryAge > 0 && !item.entry.BornAt.IsZero() && now.Sub(item.entry.BornAt) > c.maxEntryAge {
+		pastMaxAge = true
+	}
+	return pastTTL, pastMaxAge
 }
 
 // ServeCell is THE L1 body read for the resolve path (#643). It reads the
