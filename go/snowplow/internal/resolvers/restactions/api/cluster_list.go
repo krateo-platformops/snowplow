@@ -50,12 +50,12 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
-	"github.com/krateo-platformops/plumbing/jqutil"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -743,32 +743,32 @@ func deriveClusterListTarget(
 	var refQuery string
 	have := false
 	diverged := false
-	probeErr := jqutil.ForEach(ctx, jqutil.EvalOptions{
-		Query:   iter,
-		Unquote: true,
-		Data:    dict,
-	}, func(sa any) error {
+	// #638 — the SAME iterator contract the dispatch plan uses
+	// (createRequestOptionsWithSkips): array form and stream form, sanitized
+	// runtime errors. A probe that read the iterator differently from the
+	// dispatch would decide the collapse for a different element set.
+	elems, probeErr := jqsupport.IterateValues(ctx, iter, dict, nil)
+	for _, sa := range elems {
 		if diverged {
-			return nil
+			break
 		}
 		gvr, query, ok := clusterListElementTarget(apiCall.Path, sa)
 		if !ok {
 			// cluster-scope / by-name / empty / jq|parse error / a query the
 			// cluster call cannot carry → collapse-unsafe.
 			diverged = true
-			return nil
+			continue
 		}
 		if !have {
 			ref, refQuery, have = gvr, query, true
-			return nil
+			continue
 		}
 		if gvr != ref || query != refQuery {
 			// A different GVR (#351) or a different selector (#602) across
 			// elements — one cluster LIST cannot answer them all.
 			diverged = true
 		}
-		return nil
-	})
+	}
 	if probeErr != nil || !have || diverged {
 		log.Debug("cluster_list.gvr_probe.declined",
 			slog.String("subsystem", "cache"),

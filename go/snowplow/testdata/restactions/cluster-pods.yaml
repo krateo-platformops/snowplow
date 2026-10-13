@@ -9,7 +9,7 @@ spec:
   api:
   - name: namespaces
     path: "/api/v1/namespaces?limit=10"
-    filter: "[.items[] | .metadata.name]"
+    filter: "[.namespaces.items[] | .metadata.name]"
     continueOnError: true
     errorKey: namespacesError
   - name: pods
@@ -19,4 +19,4 @@ spec:
       name: namespaces
       iterator: .[]
     path: ${ "/api/v1/namespaces/" + (.) + "/pods" }
-    filter: "[.items[] | .metadata | {name: .name, namespace: .namespace, uid: .uid}]"
+    filter: "[.pods.items[] | .metadata | {name: .name, namespace: .namespace, uid: .uid}]"

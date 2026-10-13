@@ -11,7 +11,7 @@ spec:
     continueOnError: true
     errorKey: podsError
     path: "/api/v1/namespaces/kube-system/pods"
-    filter: "[.items[] | .metadata.name]"
+    filter: "[.pods.items[] | .metadata.name]"
   - name: get
     continueOnError: true
     errorKey: getError
@@ -19,4 +19,4 @@ spec:
       name: pods
       iterator: .[]
     path: ${ "/api/v1/namespaces/kube-system/pods/" + (.) }
-    filter: ".metadata | {name: .name, namespace: .namespace, uid: .uid}"
+    filter: ".get.metadata | {name: .name, namespace: .namespace, uid: .uid}"

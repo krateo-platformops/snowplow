@@ -57,15 +57,15 @@ func createResourceReferencesFromTemplate(ctx context.Context, in *templatesv1.R
 
 	all = []templatesv1.ResourceRef{}
 
-	action := func(sa any) error {
-		el := createResourceRef(in, sa)
-		all = append(all, el)
-		return nil
+	// #638 — the shared iterator contract (jqsupport.IterateValues): the
+	// pre-#638 element semantics, except that a single null or no value is an
+	// empty expansion, and a runtime error carries no value preview (the log
+	// line below used to print response bytes).
+	var elems []any
+	elems, err = jqsupport.IterateValues(ctx, q, ds, nil)
+	for _, sa := range elems {
+		all = append(all, createResourceRef(in, sa))
 	}
-
-	err = jqutil.ForEach(context.TODO(), jqutil.EvalOptions{
-		Query: q, Unquote: true, Data: ds,
-	}, action)
 	if err != nil {
 		log := xcontext.Logger(ctx)
 		if jqsupport.IsBenignNilIteration(err) {
@@ -107,7 +107,11 @@ func evalJQ(q string, ds any) string {
 			ModuleLoader: jqsupport.ModuleLoader(),
 		})
 	if err != nil {
-		out = err.Error()
+		// #638 — the error text lands in the ref's id/name/namespace fields,
+		// which are served and logged: keep the class, never the value preview
+		// gojq renders. (Surfacing the error instead of a garbage field is
+		// #651 (a).)
+		out = jqsupport.SanitizeError(err).Error()
 	}
 
 	return out

@@ -218,31 +218,26 @@ func TestRESTAction(t *testing.T) {
 		// B (hermetify) falsifier arm — decisive "zero live egress" proof. The
 		// three formerly-live RAs dispatch a KNOWN number of api-steps to the
 		// fixture server:
-		//   typicode: /users (1) + /todos × first-3-users (3)           = 4
-		//   github:   /runs (1)                                         = 1
+		//   typicode: /users (1) + /todos × first-3-.biz-users (3)      = 4
+		//   github:   /runs (1) + /runs/{id}/timing × 2 runs (2)        = 3
 		//   httpbin:  /get (1) + /post (1)                              = 2
-		//                                                          total = 7
-		// github fires ONLY its /runs collection step, NOT the /runs/{id}/timing
-		// children: the resolver wraps each step's decoded body under pig[stepName]
-		// before running that step's jq filter (handler.go jsonHandlerCore), so the
-		// `all` step filter `.workflow_runs | map(…)` evaluates `.workflow_runs`
-		// against the WRAPPER object `{all: {…}}` → null → the filter errors
-		// non-fatally (logged, body left raw) → the dependent `jobs` iterator
-		// `.all | sort_by(.created_at)` then runs over the raw github_runs OBJECT's
-		// values → `.created_at` on a number → iterator yields nothing → 0 timing
-		// dispatches. This is a PRE-EXISTING resolver semantic, identical whether
-		// the step resolves against live github or the local fixture (the fixture
-		// body is byte-shaped like github's real /runs response), so it is NOT a
-		// hermetify artefact and NOT in scope to "fix" here. The honest full-
-		// hermetic dispatch count is therefore 7, not the pre-flight projection of
-		// 9 (which wrongly assumed the step filters resolve).
+		//                                                          total = 9
+		// #638: the step filters are written against the WRAPPED stage scope
+		// (pig = {<stepName>: body}, handler.go jsonHandlerCore) — `.users | …`,
+		// `.all.workflow_runs | …`, `.jobs | …`. Until #638 these fixtures carried
+		// the pre-#129 UNWRAPPED form, every one of which errored; the error was
+		// only logged and the RAW body passed through (typicode then iterated the
+		// unfiltered users, github's iterator walked the raw runs object and
+		// yielded nothing — the old "7"). #638 makes a filter error fail the
+		// stage, so the fixtures now use the form the resolver actually evaluates
+		// and the count is the real full dispatch: 9.
 		// If those requests reached the LOCAL fixture server (not the internet),
-		// its hit counter is >= 7. A live-dispatch regression (Secret URL not
+		// its hit counter is >= 9. A live-dispatch regression (Secret URL not
 		// overridden) leaves the counter at 0 → this arm FAILS. This is the
 		// design's counter-based alternative to running under `unshare -n`
 		// (kind needs docker egress, so full network isolation is impractical).
 		Assess("Hermetic — all live dispatch served locally", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			fixtureSrv.assertServedAtLeast(t, 7)
+			fixtureSrv.assertServedAtLeast(t, 9)
 			return ctx
 		}).
 		Feature()

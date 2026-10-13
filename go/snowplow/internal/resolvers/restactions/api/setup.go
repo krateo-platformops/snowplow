@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -44,15 +46,28 @@ type skippedOption struct {
 // and iterator shape — it now delegates to the sibling below and discards the
 // skips, which is exactly what it did inline before.
 func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) (all []httpcall.RequestOptions) {
-	all, _ = createRequestOptionsWithSkips(ctx, log, in, dict)
+	all, _, _ = createRequestOptionsWithSkips(ctx, log, in, dict)
 	return all
+}
+
+// createRequestOptionsChecked is createRequestOptions plus the iterator's
+// compile/eval error (#638). The resolve stage loop calls it: a non-benign
+// iterator error is a STAGE error (stage-error sink bumped so no L1 Put
+// accepts the partial/empty plan, outcome Error, dict[errorKey] written),
+// never a log line the stage silently continues past.
+func createRequestOptionsChecked(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) ([]httpcall.RequestOptions, error) {
+	all, _, iterErr := createRequestOptionsWithSkips(ctx, log, in, dict)
+	return all, iterErr
 }
 
 // createRequestOptionsWithSkips is createRequestOptions plus the refused
 // options and their verdicts. Only the inspect pass calls it (#504). The
 // metrics/log side effect (recordMalformedDialSkip) still happens here, exactly
 // once per skip, so the #288/#293 counters read the same from either caller.
-func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) (all []httpcall.RequestOptions, skips []skippedOption) {
+//
+// iterErr (#638) is the iterator's compile/eval error: nil for a non-iterator
+// stage and for a benign nil-upstream iteration (IsBenignNilIteration).
+func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) (all []httpcall.RequestOptions, skips []skippedOption, iterErr error) {
 	it := ""
 	if in.DependsOn != nil {
 		it = ptr.Deref(in.DependsOn.Iterator, "")
@@ -72,31 +87,45 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 
 	all = []httpcall.RequestOptions{}
 
-	action := func(sa any) error {
-		el, ok, sr := createRequestOption(in, sa)
-		if !ok {
-			recordMalformedDialSkip(log, in.Name, el.Path, sr)
-			skips = append(skips, skippedOption{path: el.Path, reason: sr})
-			return nil
-		}
-		all = append(all, el)
-		return nil
-	}
-
-	err := jqutil.ForEach(ctx, jqutil.EvalOptions{Query: it, Unquote: true, Data: dict}, action)
+	// #638 — the iterator is evaluated by jqsupport.IterateValues: EXACTLY the
+	// pre-#638 jqutil.ForEach element semantics (one array → its elements; a
+	// single null or no value → the C-3 empty plan), with runtime errors
+	// returned with the value preview REMOVED. Anything else (a non-array, or
+	// jq's stream form) is an error the stage now FAILS with; pre-#638 it was
+	// logged and the stage silently dispatched nothing.
+	elems, err := jqsupport.IterateValues(ctx, it, dict, nil)
 	if err != nil {
-		if jqsupport.IsBenignNilIteration(err) {
+		if errors.Is(err, jqsupport.ErrIteratorNoValue) {
+			// The iterator read a null or no value: the upstream produced
+			// nothing. Same empty plan as pre-#638 (which logged it at ERROR
+			// as "must return a JSON array"); benign — DEBUG.
+			log.Debug("iterator yielded no items (null or no value)", slog.String("query", it))
+		} else if jqsupport.IsBenignNilIteration(err) {
 			// Iterator walked a null/absent upstream value → zero request
 			// options; the stage continues exactly as the empty-iterator case
 			// (C-3). Data-dependent and benign — DEBUG, not the ERROR that would
 			// flood the WARN-floor firehose on a healthy cluster.
 			log.Debug("iterator yielded no items (nil upstream)", slog.String("query", it), slog.Any("err", err))
 		} else {
+			// err is query-derived (parse/compile) or a sanitized runtime
+			// error: no response bytes reach the log or the stage error.
 			log.Error("unable to execute iterator", slog.String("query", it), slog.Any("err", err))
+			iterErr = fmt.Errorf("iterator %q failed: %w", it, err)
 		}
+		return all, skips, iterErr
 	}
 
-	return all, skips
+	for _, sa := range elems {
+		el, ok, sr := createRequestOption(in, sa)
+		if !ok {
+			recordMalformedDialSkip(log, in.Name, el.Path, sr)
+			skips = append(skips, skippedOption{path: el.Path, reason: sr})
+			continue
+		}
+		all = append(all, el)
+	}
+
+	return all, skips, iterErr
 }
 
 // recordMalformedDialSkip is the SINGLE shared skip path for the #288 guard,
@@ -294,7 +323,11 @@ func evalJQE(q string, ds any) (string, error) {
 			ModuleLoader: jqsupport.ModuleLoader(),
 		})
 	if err != nil {
-		return "", err
+		// #638 — a runtime error carries a preview of the evaluated value (the
+		// upstream response); the skip reasons and stage errors built from it
+		// are logged. Sanitize: query-derived errors pass, runtime errors keep
+		// only their class.
+		return "", jqsupport.SanitizeError(err)
 	}
 	return out, nil
 }

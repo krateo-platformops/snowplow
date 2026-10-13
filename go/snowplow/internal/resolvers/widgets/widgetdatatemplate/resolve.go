@@ -54,7 +54,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) (res []EvalResult, err er
 				ModuleLoader: jqsupport.ModuleLoader(),
 			})
 			if err != nil {
-				return res, err
+				// #638: logged by the widget resolver — no value preview.
+				return res, jqsupport.SanitizeError(err)
 			}
 		}
 

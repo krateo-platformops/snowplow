@@ -23,7 +23,7 @@ spec:
     endpointRef:
       name: typicode-endpoint
       namespace: demo-system
-    filter: map(select(.email | endswith(".biz")))
+    filter: .users | map(select(.email | endswith(".biz")))
   - name: todos
     dependsOn: 
       name: users
