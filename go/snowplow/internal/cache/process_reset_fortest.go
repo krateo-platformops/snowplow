@@ -117,6 +117,12 @@ func ResetCacheProcessStateForTest() error {
 	ResetEngineDeclinedExternalSetForTest()
 	ResetDeclinedExternalRetiredForTest()
 
+	// 5d″ — #677 the refresher's known-declined (re-gate deny) set, keyed by L1
+	// keys, and its counters. Process-global, so a test's marks would otherwise
+	// make a sibling test's refresher skip its cells. Composed rather than
+	// exempted — #471.
+	ResetRegateDeclinedForTest()
+
 	// 5e — #608 impersonation capability: the per-principal verdict memo, the
 	// installed reviewer and the counters/probe answers. Process-global, so a
 	// test asserting on the counters or relying on a fresh memo would otherwise

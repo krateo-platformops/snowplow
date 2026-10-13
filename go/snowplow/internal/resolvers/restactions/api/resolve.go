@@ -1075,6 +1075,11 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
 			}
 			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
+			// #677 — same site, same item as the stage-error bump above: a
+			// per-identity re-gate deny also bumps the refresher's
+			// RegateDenySink (absent on every other path), so the refresher
+			// can tell "every stage error was a correct deny" exactly.
+			noteRegateDenyStageError(r.ctx, ierr)
 			dispatch = "internal-rest-config-error"
 		} else {
 			// internal-rest-config dispatch result is in memory — feed

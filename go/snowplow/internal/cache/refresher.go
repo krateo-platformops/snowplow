@@ -1615,3 +1615,12 @@ func RefreshFuncForTest(handlerKind string) RefreshFunc {
 func enqueueRefreshForTest(l1Key string) {
 	refresherSingleton().enqueue(l1Key)
 }
+
+// DirtyMarkForTest delivers ONE plain dirty mark for l1Key through the
+// refresher's production dirty-mark hook (onDirtyMark): residency decision,
+// trigger merge, the #354/#547 dirty window, and the enqueue — exactly what a
+// dep event does. TEST-ONLY (#677 arms in the dispatchers package); production
+// code MUST NOT call it.
+func DirtyMarkForTest(l1Key string) {
+	refresherSingleton().onDirtyMark(l1Key, schema.GroupVersionResource{}, nil)
+}
