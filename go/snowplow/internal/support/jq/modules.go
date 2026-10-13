@@ -1,7 +1,10 @@
 // Package jq provides the shared gojq module loader used across snowplow's
 // resolvers. ModuleLoader builds (once) a layered loader over two sources: the
-// built-in modules embedded in this package (modules/**.jq — e.g. `health`,
-// the normalized health/usage aggregation semantics) and, optionally, operator
+// built-in modules embedded in this package (the files the //go:embed line
+// below names — today modules/*.jq, e.g. `health`, the normalized health/usage
+// aggregation semantics; that pattern does NOT descend into subdirectories, so
+// a nested built-in directory needs its own pattern on that line, which
+// TestIssue639_EveryModuleSourceIsEmbedded enforces) and, optionally, operator
 // modules from the directory named by the JQ_MODULES_PATH env var. jq
 // expressions in RESTActions and widgets can import common helper modules with
 // zero deployment configuration.

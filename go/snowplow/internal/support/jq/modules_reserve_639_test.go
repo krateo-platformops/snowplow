@@ -254,3 +254,103 @@ func contains(xs []string, s string) bool {
 	}
 	return false
 }
+
+// TestIssue639_EscapingModuleName_RefusedEvenWhenTargetExists — the path guard
+// (filepath.IsLocal) must refuse a name that leaves the modules directory even
+// when the escape TARGET EXISTS; "not found" alone cannot see the guard. Covers
+// `../<existing>` and an absolute name. Ported from reviewer-619's arm RA.
+func TestIssue639_EscapingModuleName_RefusedEvenWhenTargetExists(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "mods")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "escape.jq"), []byte(`def pwn: "ESCAPED";`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l := newLayeredModuleLoader(builtinModulesFS, builtinRoot, dir)
+
+	got, err := s639Eval(t, l, `include "../escape"; pwn`, nil)
+	if err == nil || got == "ESCAPED" {
+		t.Fatalf("../escape resolved to a file outside the modules dir (got %v)", got)
+	}
+	if !strings.Contains(err.Error(), "invalid module name") {
+		t.Errorf("../escape: want 'invalid module name', got %v", err)
+	}
+
+	abs := filepath.Join(parent, "escape")
+	if _, err := l.LoadModule(abs); err == nil || !strings.Contains(err.Error(), "invalid module name") {
+		t.Errorf("absolute module name %q not refused: %v", abs, err)
+	}
+}
+
+// TestIssue639_UnreadableCustomModule_FailsWithReadError — a custom module
+// that exists but cannot be read (a directory named like a module; no read
+// permission) fails the importing filter with "unable to read", never "not
+// found" and never a fallback. Ported from reviewer-619's arm RB.
+func TestIssue639_UnreadableCustomModule_FailsWithReadError(t *testing.T) {
+	dir := t.TempDir()
+	l := newLayeredModuleLoader(builtinModulesFS, builtinRoot, dir)
+
+	t.Run("directory named like a module", func(t *testing.T) {
+		if err := os.MkdirAll(filepath.Join(dir, "s639dir.jq"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s639Eval(t, l, `include "s639dir"; .`, nil)
+		if err == nil || strings.Contains(err.Error(), "not found") || !strings.Contains(err.Error(), "unable to read") {
+			t.Fatalf("a directory module did not fail closed with its read error: %v", err)
+		}
+	})
+
+	t.Run("no read permission", func(t *testing.T) {
+		p := filepath.Join(dir, "s639locked.jq")
+		if err := os.WriteFile(p, []byte(`def f: 1;`), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		if _, rerr := os.ReadFile(p); rerr == nil {
+			t.Skip("this user can read a 0000 file (root); the directory case above still covers the read-error branch")
+		}
+		_, err := s639Eval(t, l, `include "s639locked"; f`, nil)
+		if err == nil || strings.Contains(err.Error(), "not found") || !strings.Contains(err.Error(), "unable to read") {
+			t.Fatalf("unreadable module did not fail closed with its read error: %v", err)
+		}
+	})
+}
+
+// TestIssue639_EveryModuleSourceIsEmbedded — `//go:embed modules/*.jq` does
+// NOT descend into subdirectories, so a nested built-in directory added under
+// modules/ without its own embed pattern would silently be neither embedded nor
+// RESERVED. Walk the SOURCE tree on disk and require every .jq file to be in
+// the embedded FS and in the reserved set: a missing embed line fails here.
+func TestIssue639_EveryModuleSourceIsEmbedded(t *testing.T) {
+	var onDisk []string
+	err := filepath.WalkDir(builtinRoot, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(p, ".jq") {
+			onDisk = append(onDisk, filepath.ToSlash(p))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk source %s/: %v", builtinRoot, err)
+	}
+	if len(onDisk) == 0 {
+		t.Fatalf("no .jq sources under %s/ — the arm walked the wrong directory", builtinRoot)
+	}
+	reserved := map[string]bool{}
+	for _, n := range BuiltinModuleNames() {
+		reserved[n] = true
+	}
+	for _, p := range onDisk {
+		if _, err := fs.Stat(builtinModulesFS, p); err != nil {
+			t.Errorf("source %s is NOT embedded — add its directory to the //go:embed line in modules.go: %v", p, err)
+			continue
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(p, builtinRoot+"/"), ".jq")
+		if !reserved[name] {
+			t.Errorf("embedded module %q is not in the reserved set", name)
+		}
+	}
+}
