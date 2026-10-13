@@ -105,9 +105,11 @@
         "impersonateGroups": {
           "type": "array",
           "uniqueItems": true,
+          "maxItems": 1024,
           "items": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 253,
             "not": {
               "anyOf": [
                 {
@@ -120,7 +122,13 @@
                   "pattern": "^system:"
                 }
               ]
-            }
+            },
+            "x-kubernetes-validations": [
+              {
+                "rule": "self != '*' && !self.startsWith('system:')",
+                "message": "must not be * or a built-in system: group (#631)"
+              }
+            ]
           },
           "title": "Impersonate groups",
           "description": "Groups the background refresher may impersonate. NEVER list a privileged group: impersonating a group DOES grant everything it is bound to. Rejected: * and every built-in system: group (system:masters, system:authenticated, system:unauthenticated, system:serviceaccounts, system:serviceaccounts:<ns>, system:nodes, ...), since each is a cluster-wide population far broader than any cohort (#631). A cohort with any group NOT listed here is refreshed over snowplow's ServiceAccount with the re-gate instead of as the cohort (#608), never left stale. Contrast users, which the ClusterRole grants unconditionally because impersonating a user does not inherit that user's groups."
@@ -128,9 +136,11 @@
         "impersonateServiceAccounts": {
           "type": "array",
           "uniqueItems": true,
+          "maxItems": 1024,
           "items": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 253,
             "not": {
               "enum": [
                 "*"

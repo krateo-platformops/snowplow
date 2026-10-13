@@ -2,6 +2,8 @@ package cache
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -178,5 +180,40 @@ func TestIssue631_ChartSchemaAcceptsOrdinaryGroups(t *testing.T) {
 		if _, ok := impersonateRules(cr)["groups"]; !ok {
 			t.Fatalf("rbac.impersonateGroups=%s rendered no groups rule\n%s", v, out)
 		}
+	}
+}
+
+// #657: both allowlists are bounded (maxItems 1024, items maxLength 253). The
+// bounds exist so core-provider's crdgen output fits the apiserver's CEL cost
+// budget (internal/chartcrd). helm must enforce the same bounds, so a values
+// file helm accepts is one the CRD also accepts.
+func TestIssue657_ChartSchemaBoundsTheAllowlists(t *testing.T) {
+	list := func(n int) string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("cohort-%d", i)
+		}
+		b, _ := json.Marshal(out)
+		return string(b)
+	}
+	for _, f := range []string{"impersonateGroups", "impersonateServiceAccounts"} {
+		t.Run(f, func(t *testing.T) {
+			if _, out, err := renderSnowplowClusterRole(t, "--set-json", "rbac."+f+"="+list(1024)); err != nil {
+				t.Fatalf("1024 entries (= maxItems) rejected: %v\n%s", err, out)
+			}
+			if _, out, err := renderSnowplowClusterRole(t, "--set-json", "rbac."+f+"="+list(1025)); err == nil {
+				t.Fatal("1025 entries (> maxItems) rendered")
+			} else {
+				assertSchemaRejectedValue(t, f+" x1025", out)
+			}
+			if _, out, err := renderSnowplowClusterRole(t, "--set-json", "rbac."+f+`=["`+strings.Repeat("a", 253)+`"]`); err != nil {
+				t.Fatalf("a 253-char name (= maxLength) rejected: %v\n%s", err, out)
+			}
+			if _, out, err := renderSnowplowClusterRole(t, "--set-json", "rbac."+f+`=["`+strings.Repeat("a", 254)+`"]`); err == nil {
+				t.Fatal("a 254-char name (> maxLength) rendered")
+			} else {
+				assertSchemaRejectedValue(t, f+" 254-char name", out)
+			}
+		})
 	}
 }

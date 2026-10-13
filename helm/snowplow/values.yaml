@@ -96,6 +96,9 @@ serviceAccount:
 # population far broader than any one cohort (#631).
 # impersonateServiceAccounts holds NAMES only: the rule is in a ClusterRole, so a
 # name matches a ServiceAccount of that name in every namespace.
+# Each list holds at most 1024 names, each at most 253 characters (#657). On
+# Krateo the schema is compiled into a CRD whose CEL rules the apiserver
+# cost-checks, and an unbounded list makes that CRD uninstallable.
 rbac:
   impersonateGroups: []
   # - developers
