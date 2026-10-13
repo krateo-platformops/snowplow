@@ -13,6 +13,7 @@ import (
 	"github.com/itchyny/gojq"
 	"github.com/krateo-platformops/plumbing/jqutil"
 
+	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
@@ -305,7 +306,10 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 			tracked = &c.RA.Stages[i]
 		}
 	}
-	envelope := map[string]any{"apiVersion": "v1", "kind": "List", "items": deepCopy(items)}
+	// The served envelope, from the SAME definition production uses (E6,
+	// internal/listenvelope; pinned over every production constructor by
+	// restactions/api envelope_e6_test.go, #674).
+	envelope := listenvelope.New("v1", "List", deepCopy(items).([]any))
 	trackedCall := func() string {
 		v, e := runStageCall(tracked, envelope, env, dict, true)
 		if e != "" {

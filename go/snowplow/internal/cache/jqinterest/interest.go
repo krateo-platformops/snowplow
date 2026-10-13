@@ -439,6 +439,14 @@ func dedupGuards(gs []KeyGuard) []KeyGuard {
 // E6: nothing else is in an informer-served envelope) onto item reads. The
 // envelope's apiVersion and kind are constant for a GVR; the items array's
 // kind and length are membership (ADD/DELETE always mark).
+//
+// E6 is load-bearing here: the `.[]`, whole and kind/shape rules below are
+// sound ONLY if the served envelope has exactly these three keys. It is
+// defined once in internal/listenvelope and pinned, over every constructor
+// that serves one, by internal/resolvers/restactions/api/envelope_e6_test.go
+// (#674). Change E6 there, not here. A live apiserver LIST (branch C,
+// dispatchViaInternalRESTConfig) carries list metadata and is NOT E6: it is
+// the fall-through class that the #603 §2.4 runtime fallback reads as All.
 func toItemReads(r Read) ([]Read, bool) {
 	p := r.Path
 	if len(p) == 0 {
@@ -450,7 +458,8 @@ func toItemReads(r Read) ([]Read, bool) {
 	first := p[0]
 	if first.Any {
 		// `.[]` over the envelope: its values are apiVersion, kind (constant)
-		// and items.
+		// and items, and nothing else by E6 (listenvelope.Keys, pinned by
+		// restactions/api envelope_e6_test.go, #674).
 		if mutated(mutEnvelopeIterDropped) {
 			return nil, true
 		}

@@ -53,6 +53,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -200,12 +201,7 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 			itemList = append(itemList, it.Object)
 		}
 	}
-	envelope := map[string]any{
-		"apiVersion": apiVersion,
-		"kind":       listKind,
-		"items":      itemList,
-	}
-	return json.Marshal(envelope)
+	return json.Marshal(listenvelope.New(apiVersion, listKind, itemList)) // E6 (#674): envelope_e6_test.go
 }
 
 // marshalAsListRaw builds the SAME envelope marshalAsList builds, from
