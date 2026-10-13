@@ -3940,6 +3940,33 @@ func UAFResolvedTTL() time.Duration {
 	return time.Duration(s) * time.Second
 }
 
+// UAFTTLOverrideForEntry returns the short UAF TTLOverride to stamp on a
+// resolved entry, or 0 (no override → standard TTL) when either the knob is
+// disabled (UAF_RESOLVED_TTL_SECONDS unset/0) OR the entry is not UAF-bearing
+// (inputs.HasUAF false / inputs nil).
+//
+// THE SINGLE DERIVATION, and it lives here rather than in dispatchers because
+// #592 gave it a THIRD caller in a package that cannot import dispatchers. It
+// reads nothing but this package's own UAFResolvedTTL() and inputs.HasUAF, so
+// the dispatchers-side uafTTLOverrideForEntry is now a thin delegate and the
+// raFullList store Puts derive the identical cap from the identical rule. A
+// second copy would be exactly the #64 anti-shadow-drift hazard the one shared
+// HasUserAccessFilterStage predicate already exists to avoid — and the cap is
+// load-bearing since #561, so a drifted copy is a real staleness window, not a
+// cosmetic divergence.
+//
+// Called at EVERY Put site that can write a narrowed body (customer dispatch,
+// refresher re-Put, boot seed, raFullList serve) so the cap is derived
+// identically regardless of which path writes the cell (C-118-6).
+// effectiveTTLLocked already honours the SHORTER of the override and the store
+// TTL, so this only ever TIGHTENS the bound.
+func UAFTTLOverrideForEntry(inputs *ResolvedKeyInputs) time.Duration {
+	if inputs == nil || !inputs.HasUAF {
+		return 0
+	}
+	return UAFResolvedTTL()
+}
+
 // ResolvedCacheTTL returns the effective standard resolved-cache entry TTL —
 // the SAME value newResolvedCache is constructed with (RESOLVED_CACHE_TTL_SECONDS
 // env, default defaultResolvedCacheTTLSeconds=3600s). Exported so the #102 c1
