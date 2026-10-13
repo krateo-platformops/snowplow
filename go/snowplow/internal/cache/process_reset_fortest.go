@@ -111,6 +111,13 @@ func ResetCacheProcessStateForTest() error {
 	// rather than exempted — #471.
 	ResetRefreshFailedByClassForTest()
 
+	// 5e — #608 impersonation capability: the per-principal verdict memo, the
+	// installed reviewer and the counters/probe answers. Process-global, so a
+	// test asserting on the counters or relying on a fresh memo would otherwise
+	// inherit a sibling's reviewer and verdicts. Composed rather than exempted —
+	// #471.
+	ResetImpersonationCapabilityForTest()
+
 	// 6 — the publish container, after the incremental rebuild has quiesced.
 	err := WaitRBACRebuildQuiesceForTest(5 * time.Second)
 	PublishRBACSnapshotForTest(nil)
