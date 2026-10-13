@@ -101,6 +101,7 @@ func TestResolvedCacheStatsByStat_ReportsLiveStore(t *testing.T) {
 		"known_stale_served_suppressed_total", "known_stale_served_not_servable_total",
 		"known_stale_resident", "known_stale_read_through_total",
 		"known_stale_revalidation_fresh_total", "known_stale_revalidation_failed_total",
+		"known_stale_revalidation_skipped_total",
 		"warm_keyed_page_restactions", "warm_keyed_page_widgets", "warm_keyed_page_ra_full_list", // #354 P3 B3
 		"warm_keyed_extras_restactions", "warm_keyed_extras_widgets", "warm_keyed_extras_ra_full_list",
 		// #578 — lazy LIST-item materialisation, published as a TRIO because no

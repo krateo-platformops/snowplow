@@ -40,10 +40,28 @@
 //	    read retries; once the cohort can resolve again, the next read heals.
 //	F6  coordinator — the revalidation runs on a detached, deadline-bounded ctx
 //	    carrying the requester's identity and never blocks the response.
-//	F7  owner ruling 3 / coordinator — a known-stale identity-free widgetContent
-//	    cell is READ THROUGH, and the fall-through never writes the shared cell.
+//	F7  owner ruling (#547 comment 6141782784, question a) — a known-stale
+//	    SHARED identity-free widget shell is SERVED instantly (counted) and
+//	    revalidated in the BACKGROUND by the refresher under its own identity —
+//	    never read through, never resolved under the requester, never written
+//	    from a per-requester resolve. It heals once the refresher can resolve.
+//	F9  team ruling (b) — a known-stale cell whose key is suppressed for a
+//	    structurally-permanent reason starts NO demand revalidation; the skip
+//	    is counted on known_stale_revalidation_skipped_total.
+//	F3c architect R1 — the content arm at the production boundary, in the
+//	    composition-detail shape: GET /call → the widget's apiRef RA stage
+//	    `found` (a cluster LIST of compositions) through the REAL api-stage
+//	    resolver and its identity-free content cell. The content refresh is not
+//	    servable across the budget; a cohort's next resolve must READ THROUGH
+//	    (new condition), never build its widget cell from the stale substrate.
+//	    F3b at the same level: that read-through refill ENDS the known-stale
+//	    state, so the next cohort's resolve HITs the fresh content cell.
+//	F8  architect B1 — an accepted Put of a fresh body by ANY carrier (here a
+//	    seed-style PutThenRemark) whose resolve began after the mark ends the
+//	    known-stale state: the next Get counts nothing and starts no demand. A
+//	    Put whose resolve began BEFORE the mark does not.
 //
-// The apistage content arm (F3) lives with the content reader:
+// The apistage content arm at the reader (F3) lives with the reader:
 // internal/resolvers/restactions/api/issue547_content_read_through_test.go.
 package dispatchers
 
@@ -61,9 +79,13 @@ import (
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/plumbing/ptr"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -74,6 +96,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/rest"
 )
 
 var (
@@ -115,6 +138,9 @@ type k547Harness struct {
 	// failCustomer makes the CUSTOMER-shaped resolve of the changed composition
 	// fail too (F5: a real failure for the cohort, not an identity mismatch).
 	failCustomer atomic.Bool
+	// allowBackground lifts the background-identity injection (F7: the
+	// refresher's own identity recovers, so its background revalidation heals).
+	allowBackground atomic.Bool
 
 	mu sync.Mutex
 	// block, when set, parks a customer-shaped resolve of the changed composition
@@ -122,6 +148,11 @@ type k547Harness struct {
 	// release unparks it. seen records what that resolve's ctx carried.
 	block   *k547Block
 	widgetU *unstructured.Unstructured
+
+	// contentMode (F3c): the widget's data comes from its apiRef RA stage
+	// `found` — a cluster LIST of compositions resolved by the REAL api-stage
+	// resolver through its identity-free content cell — instead of a direct read.
+	contentMode bool
 }
 
 type k547Block struct {
@@ -268,7 +299,7 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 			h.custCalls.Add(1)
 		}
 	}
-	if bg {
+	if bg && !h.allowBackground.Load() {
 		switch h.mode {
 		case k547DenyBackground:
 			return nil, apierrors.NewForbidden(schema.GroupResource{Group: k547CompGVR.Group, Resource: k547CompGVR.Resource},
@@ -300,17 +331,63 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 			}
 		}
 	}
-	u, err := h.dyn.Resource(k547CompGVR).Namespace(ns).Get(context.Background(), name, metav1.GetOptions{})
-	if err != nil {
-		return nil, err
+	var conds []any
+	if h.contentMode {
+		var found bool
+		conds, found = h.resolveFoundStage(ctx, ns, name)
+		if !found {
+			return nil, fmt.Errorf("composition %s/%s not in the found stage", ns, name)
+		}
+	} else {
+		u, err := h.dyn.Resource(k547CompGVR).Namespace(ns).Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if l1 := cache.L1KeyFromContext(ctx); l1 != "" {
+			cache.Deps().Record(ctx, l1, k547CompGVR, ns, name)
+		}
+		conds, _, _ = unstructured.NestedSlice(u.Object, "status", "conditions")
 	}
-	if l1 := cache.L1KeyFromContext(ctx); l1 != "" {
-		cache.Deps().Record(ctx, l1, k547CompGVR, ns, name)
-	}
-	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
 	out := opts.In.DeepCopy()
 	out.Object["status"] = map[string]any{"widgetData": map[string]any{"conditions": conds}}
 	return out, nil
+}
+
+// resolveFoundStage runs the composition-detail RA's `found` stage — GET the
+// cluster LIST of compositions — through the REAL api-stage resolver (content
+// cell, per-requester gate, innerCall dep edge on the widget key the caller
+// threaded) and returns the named composition's conditions.
+func (h *k547Harness) resolveFoundStage(ctx context.Context, ns, name string) ([]any, bool) {
+	rw := cache.Global()
+	rctx := cache.WithServeWatcher(ctx, rw)
+	// The K8s call is served from the synced informer; 127.0.0.1:1 fails fast if
+	// anything ever dials it.
+	rctx = cache.WithInternalEndpoint(rctx, &endpoints.Endpoint{ServerURL: "http://127.0.0.1:1"})
+	dict := restactionsapi.Resolve(rctx, restactionsapi.ResolveOptions{
+		RC:      &rest.Config{Host: "http://127.0.0.1:1"},
+		Watcher: rw,
+		Items: []*templates.API{{
+			Name: "found",
+			Path: "/apis/" + k547CompGVR.Group + "/" + k547CompGVR.Version + "/" + k547CompGVR.Resource,
+			Verb: ptr.To("GET"),
+		}},
+	})
+	var items []any
+	switch v := dict["found"].(type) {
+	case map[string]any:
+		items, _ = v["items"].([]any)
+	case []any:
+		items = v
+	}
+	for _, it := range items {
+		m, _ := it.(map[string]any)
+		md, _ := m["metadata"].(map[string]any)
+		if md["name"] == name && md["namespace"] == ns {
+			conds, _, _ := unstructured.NestedSlice(m, "status", "conditions")
+			return conds, true
+		}
+	}
+	return nil, false
 }
 
 func k547ReqCtx(k int) context.Context {
@@ -680,10 +757,10 @@ func TestIssue547_F6_RevalidationIsDetachedBoundedAndNeverBlocksTheResponse(t *t
 	}
 }
 
-// F7 — owner ruling 3 + coordinator: a known-stale IDENTITY-FREE widgetContent
-// cell is READ THROUGH (never served stale), and the fall-through result is
-// never written into the shared cell under the requester's identity.
-func TestIssue547_F7_KnownStaleWidgetContentIsReadThroughAndNeverOverwritten(t *testing.T) {
+// F7 — owner ruling (question a): a known-stale SHARED identity-free widget
+// shell is served instantly and revalidated in the background, never read
+// through and never resolved under the requester.
+func TestIssue547_F7_KnownStaleSharedShellIsServedAndRevalidatedInTheBackground(t *testing.T) {
 	h := newK547Harness(t, k547DenyBackground)
 	ctx := k547ReqCtx(0)
 	contentKey, handle, inputs := dispatchWidgetContentKey(ctx,
@@ -699,37 +776,234 @@ func TestIssue547_F7_KnownStaleWidgetContentIsReadThroughAndNeverOverwritten(t *
 	handle.Put(contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
 	cache.Deps().Record(context.Background(), contentKey, k547CompGVR, k547CompNS, fmt.Sprintf("comp-%d", k547Changed))
 	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
-		t.Fatalf("PRECONDITION: the shared content cell must serve before the UPDATE (code=%d reason=%q)", code, r)
+		t.Fatalf("PRECONDITION: the shared shell must serve before the UPDATE (code=%d reason=%q)", code, r)
 	}
 
 	d0 := k547Stat("dirty_ended_unfresh_dropped")
 	h.update(k547Changed, "v1")
-	if !k547WaitFor(t, 30*time.Second, "content cell dropped", func() bool { return k547Stat("dirty_ended_unfresh_dropped") > d0 }) {
-		t.Fatalf("PRECONDITION: the content cell's background refresh never reached the drop point")
+	if !k547WaitFor(t, 30*time.Second, "shell dropped", func() bool { return k547Stat("dirty_ended_unfresh_dropped") > d0 }) {
+		t.Fatalf("PRECONDITION: the shell's background refresh never reached the drop point")
+	}
+	k547WaitFor(t, 5*time.Second, "queue drained", func() bool { return k547Stat("queue_depth") == 0 })
+	if _, _, ks := cache.KnownStale(contentKey); !ks {
+		t.Fatalf("PRECONDITION: the shell is not known-stale after the drop")
 	}
 
+	// Each cohort is SERVED the shell instantly — no read-through, no resolve
+	// under the requester — and the serve is counted.
+	ks0, _ := k547KnownStaleServed()
+	c0 := h.custCalls.Load()
+	bg0 := h.bgCalls.Load()
+	d1 := k547Stat("dirty_ended_unfresh_dropped")
 	for k := range k547Cohorts {
 		r, code := h.get(k, k547Changed)
-		if code != 200 || r != "v1" {
-			t.Fatalf("F7 RED (k=%d): GET served %q (code %d), want v1 read through — a known-stale identity-free "+
-				"content cell was served stale", k, r, code)
+		if code != 200 || r != "v0" {
+			t.Fatalf("F7 RED (k=%d): GET served %q (code %d), want the shared shell v0 served instantly — a known-stale "+
+				"shared shell must not be read through (owner ruling, question a)", k, r, code)
 		}
 	}
-	e, ok := handle.GetNoTouch(contentKey)
-	if !ok {
-		t.Fatalf("F7: the shared content cell was evicted — read-through must not delete")
+	if got := h.custCalls.Load() - c0; got != 0 {
+		t.Fatalf("F7 RED: %d resolve(s) ran under the requester's identity — the shared shell must be revalidated "+
+			"by the refresher, never read through or resolved per requester", got)
 	}
-	if got := k547Reason(e.RawJSON); got != "v0" {
-		t.Fatalf("F7: the shared content cell now holds %q — the per-requester fall-through result was written into "+
-			"the identity-free cell", got)
-	}
-	if e.Inputs == nil || e.Inputs.RepresentativeUsername != "" || len(e.Inputs.RepresentativeGroups) != 0 ||
-		e.Inputs.CacheEntryClass != cache.CacheEntryClassWidgetContent {
-		t.Fatalf("F7: the shared content cell's inputs changed identity: %+v", e.Inputs)
+	if ks, _ := k547KnownStaleServed(); ks-ks0 != int64(len(k547Cohorts)) {
+		t.Fatalf("F7: known_stale_served_total moved %d, want %d (every serve of the known-stale shell)", ks-ks0, len(k547Cohorts))
 	}
 	for k := range k547Cohorts {
-		if r, ok := h.residentReason(h.key(k, k547Changed)); !ok || r != "v1" {
-			t.Fatalf("F7 (k=%d): the fall-through must land in the cohort's OWN per-cohort cell (ok=%v reason=%q)", k, ok, r)
+		if _, ok := cache.ResolvedCache().GetNoTouch(h.key(k, k547Changed)); ok {
+			t.Fatalf("F7 (k=%d): a per-cohort cell was filled — the request fell through instead of serving the shell", k)
 		}
+	}
+	// ...and the serve handed the shell to the refresher (background identity).
+	if !k547WaitFor(t, 10*time.Second, "background revalidation", func() bool { return h.bgCalls.Load() > bg0 }) {
+		t.Fatalf("F7 RED: serving the known-stale shell started no background revalidation")
+	}
+
+	// The refresher's identity recovers: the next serve's background
+	// revalidation heals the shell, still identity-free.
+	if !k547WaitFor(t, 30*time.Second, "failed background revalidation settled", func() bool {
+		return k547Stat("dirty_ended_unfresh_dropped") > d1
+	}) {
+		t.Fatalf("F7: the failed background revalidation never settled")
+	}
+	h.allowBackground.Store(true)
+	if r, _ := h.get(1, k547Changed); r != "v0" && r != "v1" {
+		t.Fatalf("F7: GET served %q", r)
+	}
+	if !k547WaitFor(t, 10*time.Second, "shell healed", func() bool {
+		e, ok := handle.GetNoTouch(contentKey)
+		return ok && k547Reason(e.RawJSON) == "v1"
+	}) {
+		t.Fatalf("F7: the shared shell never healed once the refresher identity could resolve")
+	}
+	if _, _, ks := cache.KnownStale(contentKey); ks {
+		t.Fatalf("F7: the healed shell is still known-stale")
+	}
+	e, _ := handle.GetNoTouch(contentKey)
+	if e.Inputs == nil || e.Inputs.RepresentativeUsername != "" || len(e.Inputs.RepresentativeGroups) != 0 ||
+		e.Inputs.CacheEntryClass != cache.CacheEntryClassWidgetContent {
+		t.Fatalf("F7: the shared shell's inputs changed identity: %+v", e.Inputs)
+	}
+	if got := h.custCalls.Load() - c0; got != 0 {
+		t.Fatalf("F7: %d resolve(s) ran under a requester's identity", got)
+	}
+	if r, code := h.get(0, k547Changed); code != 200 || r != "v1" {
+		t.Fatalf("F7: after healing GET served %q (code %d), want v1", r, code)
+	}
+}
+
+// F9 — team ruling (b): a structurally-permanent suppression starts no demand
+// revalidation; the skip is counted.
+func TestIssue547_F9_StructurallyPermanentSuppressionSkipsDemandRevalidation(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	h.warm()
+	h.driveChangedToKnownStale("v1")
+	key := h.key(0, k547Changed)
+	if !cache.NoteRefreshDecline(key, "uaf", true) {
+		t.Fatalf("PRECONDITION: the key did not become suppressed")
+	}
+	sk0 := cache.ResolvedCacheStatsByStat()["known_stale_revalidation_skipped_total"]
+	c0 := h.custCalls.Load()
+	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
+		t.Fatalf("F9: GET served %q (code %d), want the cached v0", r, code)
+	}
+	time.Sleep(200 * time.Millisecond) // a demand, if any, would have started by now
+	if got := h.custCalls.Load() - c0; got != 0 {
+		t.Fatalf("F9 RED: a suppressed (uaf) key started %d demand revalidation(s) — its cold path declines the "+
+			"Put by the same gate, so it can never succeed", got)
+	}
+	if d := cache.ResolvedCacheStatsByStat()["known_stale_revalidation_skipped_total"] - sk0; d != 1 {
+		t.Fatalf("F9 RED: known_stale_revalidation_skipped_total moved %d, want 1", d)
+	}
+	// An unsuppressed cohort still revalidates on demand.
+	if r, _ := h.get(1, k547Changed); r != "v0" {
+		t.Fatalf("F9: cohort 1 GET#1 served %q, want v0", r)
+	}
+	if !k547WaitFor(t, 5*time.Second, "cohort 1 healed", func() bool { r, _ := h.residentReason(h.key(1, k547Changed)); return r == "v1" }) {
+		t.Fatalf("F9: the unsuppressed cohort did not revalidate on demand")
+	}
+}
+
+// F3c + F3b (architect R1) — the content arm at the production boundary.
+func TestIssue547_F3c_KnownStaleFoundListIsReadThroughAtTheCallBoundary(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	h.contentMode = true
+	// The identity-free content cell's refresh is NOT SERVABLE across the whole
+	// budget — the typed error the production content refresh returns while the
+	// informer is pre-sync / metadata-only (the "flip to not-servable").
+	cache.RegisterRefreshFunc(cache.CacheEntryClassApistage, func(context.Context, string, cache.ResolvedKeyInputs) error {
+		return cache.ErrContentNotServable
+	})
+
+	// Warm K=2 cohorts on compositions m=0 and m=2: their resolves fill the shared
+	// `found` content cell. The m=1 cells stay cold, so the next read of m=1 is
+	// a resolve that READS the content cell — where a stale substrate would be
+	// baked into a new widget cell.
+	for k := range k547Cohorts {
+		for _, m := range []int{0, 2} {
+			if r, code := h.get(k, m); code != 200 || r != "v0" {
+				t.Fatalf("warm (k=%d,m=%d): code=%d reason=%q", k, m, code, r)
+			}
+		}
+	}
+	var contentKey string
+	n := 0
+	cache.ResolvedCache().RangeMetadata(func(m cache.ResolvedEntryMeta) bool {
+		if m.CacheEntryClass == cache.CacheEntryClassApistage {
+			contentKey = m.KeyHash
+			n++
+		}
+		return true
+	})
+	if n != 1 {
+		t.Fatalf("PRECONDITION: %d apistage content cells after warm, want exactly the one `found` cluster LIST", n)
+	}
+
+	h.update(k547Changed, "v1")
+	if !k547WaitFor(t, 30*time.Second, "content cell dropped not-servable", func() bool {
+		return k547Stat("dirty_ended_unfresh_dropped") > 0 && cache.ResolvedCacheStatsByStat()["known_stale_resident"] > 0
+	}) {
+		t.Fatalf("PRECONDITION: the content refresh never reached the drop point")
+	}
+	k547WaitFor(t, 30*time.Second, "content cell known-stale", func() bool {
+		_, r, ok := cache.KnownStale(contentKey)
+		return ok && r == "not_servable"
+	})
+
+	rt0 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]
+	r, code := h.get(0, k547Changed)
+	if code != 200 || r != "v1" {
+		t.Fatalf("F3c RED: cohort 0's resolve of comp-1 served %q (code %d), want v1 READ THROUGH — the widget "+
+			"cell was built from the stale `found` content cell (#547)", r, code)
+	}
+	if rr, ok := h.residentReason(h.key(0, k547Changed)); !ok || rr != "v1" {
+		t.Fatalf("F3c: cohort 0's widget cell holds %q (ok=%v) — a widget cell was Put from the stale substrate", rr, ok)
+	}
+	rt1 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]
+	if rt1 <= rt0 {
+		t.Fatalf("F3c: the read did not go through the known-stale content cell (read_through %d -> %d)", rt0, rt1)
+	}
+
+	// F3b — the read-through refill began after the mark: the content cell is
+	// fresh, so the NEXT cohort's resolve HITs it (no further read-through).
+	if _, _, ks := cache.KnownStale(contentKey); ks {
+		t.Fatalf("F3b RED: the `found` content cell is still known-stale after a post-mark read-through refill — " +
+			"every later read would read through (B1)")
+	}
+	if r, code := h.get(1, k547Changed); code != 200 || r != "v1" {
+		t.Fatalf("F3b: cohort 1 served %q (code %d), want v1", r, code)
+	}
+	if rt2 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]; rt2 != rt1 {
+		t.Fatalf("F3b: cohort 1's resolve read through again (read_through %d -> %d) — the fresh cell must HIT", rt1, rt2)
+	}
+}
+
+// F8 (architect B1) — an accepted Put of a fresh body whose resolve began after
+// the mark ends the known-stale state, whatever carrier wrote it.
+func TestIssue547_F8_AFreshAcceptedPutByAnyCarrierEndsKnownStale(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	h.warm()
+	epochBefore := cache.DepGenEpochNow()
+	h.driveChangedToKnownStale("v1")
+	key := h.key(0, k547Changed)
+	store := cache.ResolvedCache()
+	e, ok := store.GetNoTouch(key)
+	if !ok {
+		t.Fatalf("PRECONDITION: cell not resident")
+	}
+	if _, _, ks := cache.KnownStale(key); !ks {
+		t.Fatalf("PRECONDITION: cell not known-stale")
+	}
+
+	// A Put whose resolve began BEFORE the mark proves nothing: still known-stale.
+	pre := cache.WithL1KeyContextFromEpoch(context.Background(), key, epochBefore)
+	store.PutThenRemark(pre, key, &cache.ResolvedEntry{RawJSON: e.RawJSON, Inputs: e.Inputs})
+	if _, _, ks := cache.KnownStale(key); !ks {
+		t.Fatalf("F8: a Put whose resolve began BEFORE the mark ended the known-stale state — it carries the pre-change body")
+	}
+
+	// A seed-style Put of a fresh body whose resolve began after the mark.
+	var obj map[string]any
+	if err := json.Unmarshal(e.RawJSON, &obj); err != nil {
+		t.Fatal(err)
+	}
+	obj["status"] = map[string]any{"widgetData": map[string]any{"conditions": []any{
+		map[string]any{"type": "Ready", "status": "True", "reason": "v1"}}}}
+	fresh, _ := json.Marshal(obj)
+	post := cache.WithL1KeyContext(context.Background(), key)
+	store.PutThenRemark(post, key, &cache.ResolvedEntry{RawJSON: fresh, Inputs: e.Inputs})
+
+	ks0, _ := k547KnownStaleServed()
+	c0 := h.custCalls.Load()
+	if r, code := h.get(0, k547Changed); code != 200 || r != "v1" {
+		t.Fatalf("F8: GET served %q (code %d), want the fresh v1", r, code)
+	}
+	time.Sleep(100 * time.Millisecond) // a demand, if any, would have started by now
+	if ks, _ := k547KnownStaleServed(); ks != ks0 {
+		t.Fatalf("F8 RED: known_stale_served_total moved %d -> %d on a FRESH body — the detector counts a false "+
+			"positive because no carrier but the refresher/demand ends the state (B1)", ks0, ks)
+	}
+	if got := h.custCalls.Load() - c0; got != 0 {
+		t.Fatalf("F8 RED: the GET of a fresh cell started %d redundant demand revalidation(s)", got)
 	}
 }
