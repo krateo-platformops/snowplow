@@ -1398,6 +1398,20 @@ func installSeedLoopbackToken(ctx context.Context) context.Context {
 
 func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester, navHarvester *navWidgetHarvester, pagCollector *apiRefPaginationCollector) error {
 	rctx := withPhase1SAContext(ctx, saEP, saRC)
+	// #643 PR-B2 (architect ruling (b)) — the pre-engine phase1 boot walk
+	// carries the SAME engine-wide declined-external set as every engine scope,
+	// so it marks the external widgets it resolves (observed touch only) and
+	// the engine's boot re-walk, seconds later and still before Ready, replays
+	// them instead of re-dialling. I-6 holds: this is a prewarm root, never a
+	// /call or the refresher. Inert under Disabled().
+	rctx = cache.WithSeedDeclinedExternalSet(rctx, cache.EngineDeclinedExternalSet())
+	// #214 / #643 PR-B2 — mark this prewarm ROOT as a prewarm walk. Without it
+	// the phase1 walk carried no marker at all, so cache.RefDenialOrigin read it
+	// as a customer: its resourceRef denials WARNed as serve and its external
+	// fetches counted as external_fetch_total{origin=request,driver=serve}.
+	// It now attributes to driver=prewarm-path, beside the content prewarm —
+	// both run exactly once per process, before Ready.
+	rctx = cache.WithPrewarmPath(rctx)
 
 	// Ship 0.30.232: type-safe construction via newPhase1Walker. rc is now
 	// a REQUIRED positional parameter — the compiler enforces every
@@ -1596,10 +1610,39 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// resurrecting) if a DELETE lands during this keep-warm / gvr-discovered
 	// re-resolve. Cheap + nil-safe; used only on the post-readyz guarded path.
 	wcGen0 := cache.ResolvedCache().CaptureGen(wcKey)
+
+	// #643 PR-B2 — the walk consults the engine-wide declined-external set under
+	// the key it Puts under (wcKey). A held mark whose facts still hold — the
+	// live widget's uid+RV among them — means this widget's last walk resolve
+	// touched an external endpoint, so its content Put is declined and a
+	// re-resolve only re-dials. The skip REPLAYS the recorded walk output: the
+	// children are recorded and descended exactly as after a resolve, so
+	// discovery and the harvest (taken above, from `in`) are unchanged. No
+	// pagination job: pages > 1 of an external-touched apiRef are declined too.
+	// See walk_declined_external.go.
+	if walkDeclinedExternalSkipEnabled && wcKey != "" {
+		if replay, ok := walkDeclinedExternalReplay(ctx, wcKey, in, depth); ok {
+			if replay.errored {
+				// A LEAF whose external resolve errored: the error path made no
+				// populate, no children and no descent — neither does the replay.
+				return nil
+			}
+			return w.descendChildren(ctx, gvr, in, depth, replay.children)
+		}
+	}
+	// The walked widget's identity as read live, BEFORE the resolve mutates
+	// `in` (status only; captured first anyway) — folded into the walk mark.
+	walkUID, walkRV := string(in.GetUID()), in.GetResourceVersion()
+
 	resolveCtx := ctx
 	if wcKey != "" {
 		resolveCtx = cache.WithL1KeyContext(ctx, wcKey)
 	}
+	// #643 PR-B2 — name the walked widget and its apiRef RESTAction on the
+	// resolve ctx so a declined-external mark records what it retires on.
+	// (Before withWidgetContentPutSinks below: #450 pins that helper as the LAST
+	// assignment ahead of the populate.)
+	resolveCtx = withDeclineUnit(resolveCtx, walkDeclineUnit(gvr, in))
 	// Install EVERY sink populateWidgetContentL1 (below) gates the identity-free
 	// widgetContent Put on — stage-error (#313 Cache-A), external-touched
 	// (external-no-cache 2026-06-22), sensitive-touched (#398) and UAF-touched
@@ -1638,6 +1681,9 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		if depth == 0 {
 			return err
 		}
+		// #643 PR-B2 ruling (c): an external-touched resolve that errored is
+		// marked only on a structural LEAF (replayed as this same error path).
+		walkMarkDeclinedExternal(resolveCtx, wcKey, in, walkUID, walkRV, nil, true)
 		log.Warn("phase1.walk.child_resolve_failed",
 			slog.String("subsystem", "cache"),
 			slog.Int("depth", depth),
@@ -1711,6 +1757,21 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 
 	// Read status.resourcesRefs.items[] — the child widget endpoints.
 	children := extractResourcesRefsItems(res.Object)
+
+	// #643 PR-B2 — mark on an OBSERVED external touch only, recording the
+	// children so a later walk can replay this node's discovery.
+	walkMarkDeclinedExternal(resolveCtx, wcKey, in, walkUID, walkRV, children, false)
+
+	return w.descendChildren(ctx, gvr, in, depth, children)
+}
+
+// descendChildren is the post-resolve half of walk: record the node's children
+// (recordWalkChildren + the children_observed line) and descend into each.
+// Shared by a resolve and a #643 PR-B2 declined-external replay, so the two
+// cannot drift — discovery after a skip is byte-for-byte discovery after a
+// resolve.
+func (w *phase1Walker) descendChildren(ctx context.Context, gvr schema.GroupVersionResource, in *unstructured.Unstructured, depth int, children []navChildRef) error {
+	log := slog.Default()
 
 	// Gate 1 (0.30.201-diag) — record the boot children-count for THIS
 	// walked widget so the navmenu's boot-walk children-count is

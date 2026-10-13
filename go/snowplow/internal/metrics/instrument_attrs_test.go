@@ -213,6 +213,11 @@ var closedAttributeKeys = map[string]struct{}{
 	// by metrics_643_prewarm_pass_otlp_test.go; origin is {background, request}
 	// on the external-fetch counters.
 	"kind": {}, "origin": {},
+	// #643 PR-B2 — driver on the external-fetch counters: the closed
+	// cache.RefDenialOrigins set {refresher, cohort-seed, prewarm-engine-boot,
+	// prewarm-path, background-unattributed, serve}, pinned by
+	// metrics_643_prewarm_pass_otlp_test.go and the dispatchers #563 census.
+	"driver": {},
 }
 
 // neverAnAttribute lists the three expvar keys whose VALUES carry

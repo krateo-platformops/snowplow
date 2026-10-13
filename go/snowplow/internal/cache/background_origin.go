@@ -65,6 +65,20 @@ const (
 	RefDenialOriginServe = "serve"
 )
 
+// RefDenialOrigins is the CLOSED set RefDenialOrigin can return, in emit order.
+// Every per-origin breakdown (the denial counter below, #643's external-fetch
+// {driver} label) pre-populates exactly these cells, so a 0 is a reading. A new
+// origin constant must be added here; the dispatchers census
+// (background_origin_census_563_test.go) fails when one is not.
+var RefDenialOrigins = []string{
+	BackgroundOriginRefresher,
+	BackgroundOriginCohortSeed,
+	BackgroundOriginPrewarmEngineBoot,
+	RefDenialOriginPrewarmPath,
+	RefDenialOriginBackgroundUnattributed,
+	RefDenialOriginServe,
+}
+
 type ctxKeyBackgroundOriginType struct{}
 
 var ctxKeyBackgroundOrigin = ctxKeyBackgroundOriginType{}

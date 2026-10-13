@@ -31,7 +31,9 @@
 //     the seed resolves the harvester's first-write-wins copy, so a widget edit
 //     is not seen by the seed at all, and a customer /call Put of the edited
 //     widget retires the mark via Put-unmark. Revisit if the harvester ever
-//     refreshes its copies.
+//     refreshes its copies. The DISCOVERY WALK's marks (#643 PR-B2,
+//     walk_declined_external.go) do fold the widget's uid/RV: the walk re-reads
+//     the live widget every walk and replays its recorded children.
 //   - endpointRef Secrets outside the Secrets informer's namespace
 //     (cache.SecretsCacheNamespace), and templated endpointRef names, are not
 //     tracked: a change to one does not retire the mark through rule (b).

@@ -24,10 +24,57 @@ package dispatchers
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
+
+// TestIssue643_PRB2_EveryOriginConstantHasADriverCell — the #643 PR-B2 census
+// arm: snowplow_external_fetch_total{driver} is cache.RefDenialOrigin's closed
+// set, pre-populated. A NEW origin constant added to cache/background_origin.go
+// without a place in cache.RefDenialOrigins would be folded into the
+// background-unattributed driver cell (and the denial cell) silently, so the
+// const block is READ from source and every value must be in the list AND have
+// a pre-populated driver cell. Untagged, like the census below.
+func TestIssue643_PRB2_EveryOriginConstantHasADriverCell(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "cache", "background_origin.go"))
+	if err != nil {
+		t.Fatalf("cannot read cache/background_origin.go: %v", err)
+	}
+	re := regexp.MustCompile(`(?m)^\s*((?:BackgroundOrigin|RefDenialOrigin)\w+)\s*=\s*"([^"]+)"`)
+	consts := map[string]string{}
+	for _, m := range re.FindAllStringSubmatch(string(b), -1) {
+		consts[m[1]] = m[2]
+	}
+	if len(consts) < 6 {
+		t.Fatalf("census found %d origin constants (%v) — the scan is broken and cannot fail", len(consts), consts)
+	}
+	listed := map[string]bool{}
+	for _, d := range cache.RefDenialOrigins {
+		listed[d] = true
+	}
+	cells := map[string]bool{}
+	for _, c := range restactionsapi.ExternalFetchByDriverSnapshot() {
+		cells[c.Driver] = true
+	}
+	for name, v := range consts {
+		if !listed[v] {
+			t.Errorf("#643 PR-B2: origin constant cache.%s=%q is not in cache.RefDenialOrigins — add it, or its "+
+				"external fetches are counted as background-unattributed", name, v)
+		}
+		if !cells[v] {
+			t.Errorf("#643 PR-B2: origin %q has no pre-populated external_fetch_total{driver} cell", v)
+		}
+	}
+	if len(cells) != len(cache.RefDenialOrigins) {
+		t.Errorf("#643 PR-B2: %d driver cells, %d closed origins — the label set must be exactly the closed set",
+			len(cells), len(cache.RefDenialOrigins))
+	}
+}
 
 // backgroundOriginProducers is the COMPLETE, verified set of production call
 // sites that mark a ctx as a background resolve, keyed by path relative to

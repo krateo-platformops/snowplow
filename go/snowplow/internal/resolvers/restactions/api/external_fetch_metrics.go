@@ -33,6 +33,18 @@
 //
 // CLOSED LABEL SET: origin ∈ {background, request}, both pre-populated. Hand-
 // wired onto OTLP in metrics.go (there is no expvar->OTLP bridge).
+//
+// #643 PR-B2 — THE driver LABEL. origin says "customer or not"; it cannot say
+// WHICH background resolver dialled, and after the 1.12.46 roll ~60/min stayed
+// in the background cell with the seed already skipping. driver is
+// cache.RefDenialOrigin(ctx), the existing closed classifier: refresher,
+// cohort-seed, prewarm-engine-boot (the discovery walk — rePrewarmBootScoped
+// stamps it before withPhase1SAContext), prewarm-path (the content prewarm),
+// background-unattributed, serve. Every cell is pre-populated. On OTLP each
+// series carries BOTH labels (driver determines origin: serve → request, every
+// other driver → background), so sum-by-origin reads exactly what origin alone
+// read before. On expvar the {origin} maps are unchanged and the {driver} maps
+// are published under their own keys (…_by_driver_total).
 
 package api
 
@@ -71,12 +83,80 @@ func externalFetchOrigin(ctx context.Context) string {
 }
 
 // recordExternalFetch counts one external fetch about to be issued.
-func recordExternalFetch(ctx context.Context) { countExternalFetch(externalFetchOrigin(ctx)) }
+func recordExternalFetch(ctx context.Context) {
+	d := cache.RefDenialOrigin(ctx)
+	countExternalFetch(originForDriver(d))
+	externalFetchByDriver.add(d)
+}
 
 // recordExternalFetchAbandoned counts one fetch whose caller gave up before the
 // response was read: fetchErr != nil while the fetch ctx is done.
 func recordExternalFetchAbandoned(ctx context.Context) {
-	countExternalFetchAbandoned(externalFetchOrigin(ctx))
+	d := cache.RefDenialOrigin(ctx)
+	countExternalFetchAbandoned(originForDriver(d))
+	externalFetchAbandonedByDriver.add(d)
+}
+
+// originForDriver is the {origin} cell a driver belongs to — the same split
+// externalFetchOrigin makes, so the two labels can never disagree on a series.
+func originForDriver(driver string) string {
+	if driver == cache.RefDenialOriginServe {
+		return ExternalFetchOriginRequest
+	}
+	return ExternalFetchOriginBackground
+}
+
+// driverCounter is one counter per closed driver value, every cell present from
+// construction. A value outside the closed set folds into
+// background-unattributed (as RecordRefDenied does): the label set cannot grow
+// from data.
+type driverCounter map[string]*atomic.Uint64
+
+func newDriverCounter() driverCounter {
+	m := make(driverCounter, len(cache.RefDenialOrigins))
+	for _, d := range cache.RefDenialOrigins {
+		m[d] = new(atomic.Uint64)
+	}
+	return m
+}
+
+func (m driverCounter) add(driver string) {
+	c, ok := m[driver]
+	if !ok {
+		c = m[cache.RefDenialOriginBackgroundUnattributed]
+	}
+	c.Add(1)
+}
+
+func (m driverCounter) snapshot() []ExternalFetchDriverCount {
+	out := make([]ExternalFetchDriverCount, 0, len(cache.RefDenialOrigins))
+	for _, d := range cache.RefDenialOrigins {
+		out = append(out, ExternalFetchDriverCount{Driver: d, Origin: originForDriver(d), Count: m[d].Load()})
+	}
+	return out
+}
+
+var (
+	externalFetchByDriver          = newDriverCounter()
+	externalFetchAbandonedByDriver = newDriverCounter()
+)
+
+// ExternalFetchDriverCount is one {driver} cell, with the origin it rolls up to.
+type ExternalFetchDriverCount struct {
+	Driver string
+	Origin string
+	Count  uint64
+}
+
+// ExternalFetchByDriverSnapshot returns snowplow_external_fetch_total by driver,
+// every closed cell included, in cache.RefDenialOrigins order.
+func ExternalFetchByDriverSnapshot() []ExternalFetchDriverCount {
+	return externalFetchByDriver.snapshot()
+}
+
+// ExternalFetchAbandonedByDriverSnapshot is the abandoned counter by driver.
+func ExternalFetchAbandonedByDriverSnapshot() []ExternalFetchDriverCount {
+	return externalFetchAbandonedByDriver.snapshot()
 }
 
 func countExternalFetch(origin string) {
@@ -124,12 +204,20 @@ func ExternalFetchAbandonedSnapshot() []ExternalFetchCount {
 // background ctx, so no production file stamps a background origin outside a
 // real driver (the #563 census). Production MUST NOT use it.
 func RecordExternalFetchForTest(background bool) {
-	origin := ExternalFetchOriginRequest
+	driver := cache.RefDenialOriginServe
 	if background {
-		origin = ExternalFetchOriginBackground
+		driver = cache.RefDenialOriginBackgroundUnattributed
 	}
-	countExternalFetch(origin)
-	countExternalFetchAbandoned(origin)
+	RecordExternalFetchDriverForTest(driver)
+}
+
+// RecordExternalFetchDriverForTest bumps both counters under the given driver
+// (and the origin it rolls up to). Tests only — the #643 PR-B2 OTLP arm.
+func RecordExternalFetchDriverForTest(driver string) {
+	countExternalFetch(originForDriver(driver))
+	countExternalFetchAbandoned(originForDriver(driver))
+	externalFetchByDriver.add(driver)
+	externalFetchAbandonedByDriver.add(driver)
 }
 
 var externalFetchExpvarOnce sync.Once
@@ -147,6 +235,12 @@ func init() {
 		expvar.Publish("snowplow_external_fetch_abandoned_total", expvar.Func(func() any {
 			return externalFetchMap(ExternalFetchAbandonedSnapshot())
 		}))
+		expvar.Publish("snowplow_external_fetch_by_driver_total", expvar.Func(func() any {
+			return externalFetchDriverMap(ExternalFetchByDriverSnapshot())
+		}))
+		expvar.Publish("snowplow_external_fetch_abandoned_by_driver_total", expvar.Func(func() any {
+			return externalFetchDriverMap(ExternalFetchAbandonedByDriverSnapshot())
+		}))
 	})
 }
 
@@ -154,6 +248,14 @@ func externalFetchMap(s []ExternalFetchCount) map[string]uint64 {
 	m := make(map[string]uint64, len(s))
 	for _, c := range s {
 		m[c.Origin] = c.Count
+	}
+	return m
+}
+
+func externalFetchDriverMap(s []ExternalFetchDriverCount) map[string]uint64 {
+	m := make(map[string]uint64, len(s))
+	for _, c := range s {
+		m[c.Driver] = c.Count
 	}
 	return m
 }

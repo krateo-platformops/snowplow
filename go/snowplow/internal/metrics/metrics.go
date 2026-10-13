@@ -1242,12 +1242,12 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		return err
 	}
 	extFetch, err := m.Int64ObservableCounter("snowplow_external_fetch_total",
-		metric.WithDescription("LOGICAL external (non-apiserver) fetches issued by the RESTAction resolver, one per stage call, by origin {background, request}; retries inside plumbing's RetryClient are NOT counted, so this does not compare 1:1 with a server-side attempt log (ClickHouse query_log). background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
+		metric.WithDescription("LOGICAL external (non-apiserver) fetches issued by the RESTAction resolver, one per stage call, by origin {background, request} and driver (the resolver that dialled: refresher, cohort-seed, prewarm-engine-boot = the discovery walk, prewarm-path = the content prewarm, background-unattributed, serve); retries inside plumbing's RetryClient are NOT counted, so this does not compare 1:1 with a server-side attempt log (ClickHouse query_log). background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
 	if err != nil {
 		return err
 	}
 	extAbandoned, err := m.Int64ObservableCounter("snowplow_external_fetch_abandoned_total",
-		metric.WithDescription("LOGICAL external fetches whose caller's ctx was done before the response was read (the boot-readiness bound, a cut scope, a client that left), by origin; RetryClient attempts are not counted separately. The server may still be executing each one. #643."))
+		metric.WithDescription("LOGICAL external fetches whose caller's ctx was done before the response was read (the boot-readiness bound, a cut scope, a client that left), by origin and driver (same closed sets as snowplow_external_fetch_total); RetryClient attempts are not counted separately. The server may still be executing each one. #643."))
 	if err != nil {
 		return err
 	}
@@ -1257,7 +1257,7 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		return err
 	}
 	declinedRetired, err := m.Int64ObservableCounter("snowplow_prewarm_declined_external_retired_total",
-		metric.WithDescription("Declined-external marks retired, by reason (closed set): nil_mark, served_cell_changed, deps_moved, ra_unread_at_mark, ra_unreadable, ra_changed, endpoint_secret_changed (re-checked at a skip consult), put_unmark (an L1 Put of the key), gone (the widget or RESTAction was deleted), config_redrive (a config-vars redrive cleared the set). A reason climbing with skip_declined_external_total staying low means marks retire every pass and the re-dials are back (#643)."))
+		metric.WithDescription("Declined-external marks retired, by reason (closed set): nil_mark, served_cell_changed, deps_moved, ra_unread_at_mark, ra_unreadable, ra_changed, endpoint_secret_changed (re-checked at a skip consult), put_unmark (an L1 Put of the key), gone (the widget or RESTAction was deleted), config_redrive (a config-vars redrive cleared the set), widget_changed (the discovery walk re-read the walked widget at another uid/resourceVersion, #643 PR-B2). A reason climbing with skip_declined_external_total staying low means marks retire every pass and the re-dials are back (#643)."))
 	if err != nil {
 		return err
 	}
@@ -1266,7 +1266,19 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	walkSkip, err := m.Int64ObservableCounter("snowplow_prewarm_walk_skip_declined_external_total",
+		metric.WithDescription("Discovery-walk widget resolves skipped because the widget's last walk resolve touched an external endpoint and the declined-external mark still holds; the walk replayed the recorded children instead (#643 PR-B2). POSITIVE CONTROL: must read > 0 after the first walk on a pod with external widgets, or the walk skip never fired."))
+	if err != nil {
+		return err
+	}
+	walkUnmarkable, err := m.Int64ObservableCounter("snowplow_prewarm_walk_errored_unmarkable_total",
+		metric.WithDescription("Discovery-walk resolves that touched an external endpoint and then errored on a widget that DECLARES children (spec.resourcesRefs items or spec.resourcesRefsTemplate): not marked, so a later walk can still discover the subtree, and re-dialled on every walk (#643 PR-B2 ruling (c)). Its rate is that residual re-dial load."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		o.ObserveInt64(walkSkip, int64(dispatchers.WalkSkipDeclinedExternalTotal()))
+		o.ObserveInt64(walkUnmarkable, int64(dispatchers.WalkErroredUnmarkableTotal()))
 		o.ObserveInt64(gvrEpoch, int64(dispatchers.GVRDiscoveryEpoch()))
 		o.ObserveInt64(declinedMarks, cache.EngineDeclinedExternalSet().Len())
 		for _, c := range cache.DeclinedExternalRetiredSnapshot() {
@@ -1296,15 +1308,20 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		for _, c := range dispatchers.PrewarmSkipResumeDoneSnapshot() {
 			o.ObserveInt64(skipResume, int64(c.Count), kindAttr(c.Kind))
 		}
-		for _, c := range restactionsapi.ExternalFetchSnapshot() {
-			o.ObserveInt64(extFetch, int64(c.Count), metric.WithAttributes(attribute.String("origin", c.Origin)))
+		// #643 PR-B2 — one series per {origin, driver}: driver determines
+		// origin, so sum-by-origin is the pre-B2 {origin} reading unchanged.
+		for _, c := range restactionsapi.ExternalFetchByDriverSnapshot() {
+			o.ObserveInt64(extFetch, int64(c.Count), metric.WithAttributes(
+				attribute.String("origin", c.Origin), attribute.String("driver", c.Driver)))
 		}
-		for _, c := range restactionsapi.ExternalFetchAbandonedSnapshot() {
-			o.ObserveInt64(extAbandoned, int64(c.Count), metric.WithAttributes(attribute.String("origin", c.Origin)))
+		for _, c := range restactionsapi.ExternalFetchAbandonedByDriverSnapshot() {
+			o.ObserveInt64(extAbandoned, int64(c.Count), metric.WithAttributes(
+				attribute.String("origin", c.Origin), attribute.String("driver", c.Driver)))
 		}
 		return nil
 	}, passTotal, planned, done, budget, elapsed, rWidgetUnits, rWidgetUS, rRAUnits, rRAUS,
-		skipDeclined, skipResume, extFetch, extAbandoned, declinedMarks, declinedRetired, gvrEpoch)
+		skipDeclined, skipResume, extFetch, extAbandoned, declinedMarks, declinedRetired, gvrEpoch,
+		walkSkip, walkUnmarkable)
 	return err
 }
 
