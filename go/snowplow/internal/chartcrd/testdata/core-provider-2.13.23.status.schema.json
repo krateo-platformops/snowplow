@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "observedGeneration": {
+      "type": "integer",
+      "description": "The .metadata.generation this status was produced from. The cdc writes it on every successful reconcile (unstructured-runtime SetObservedGeneration), but a structural CRD schema PRUNES fields it does not declare — so while this was missing, the write was silently stripped by the apiserver on every reconcile and the field read as permanently absent. Anything using it as a health signal therefore saw a false stall forever."
+    },
+    "helmChartUrl": {
+      "type": "string",
+      "description": "URL of the helm chart deployed"
+    },
+    "helmChartVersion": {
+      "type": "string",
+      "description": "Version of the helm chart deployed"
+    },
+	"digest": {
+	  "type": "string",
+    "description": "Digest of the current managed resources",
+	  "default": ""
+	},
+	"previousDigest": {
+	  "type": "string",
+    "description": "Digest of the previous managed resources",
+	  "default": ""
+	},
+    "managed": {
+      "type": "array",
+      "description": "List of the managed resources installed by the helm chart",
+      "items": {
+        "type": "object",
+        "properties": {
+          "apiVersion": {
+            "type": "string",
+            "description": "API version of the managed resource"
+          },
+          "resource": {
+            "type": "string",
+            "description": "Kind of the managed resource"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name of the managed resource"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Namespace of the managed resource"
+          },
+		  "path": {
+            "type": "string",
+            "description": "Path of the managed resource, you can use this path to ask the API server for the resource"
+          }
+        }
+      }
+    }
+  }
+}
