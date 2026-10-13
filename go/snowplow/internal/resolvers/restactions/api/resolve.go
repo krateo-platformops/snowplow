@@ -1280,6 +1280,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		return nil
 	}
 	cache.ExternalTouchedSinkFromContext(gctx).Bump()
+	// #643 PR-A — count the fetch at the same site that marks the touch, by
+	// origin (background driver vs customer /call).
+	recordExternalFetch(gctx)
 	// Boot-readiness external-fetch wall-clock bound (external_seed_bound.go).
 	// The Bump() STAYS before the wrap so a timed-out fetch still records the
 	// external touch → the L1 Put is still declined → uniform with the
@@ -1292,6 +1295,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	fctx, fcancel := externalSeedFetchCtx(gctx)
 	defer fcancel()
 	res, jsonBytes, _, fetchErr := httpFetchAllowingNonJSON(fctx, call)
+	if fetchErr != nil && fctx.Err() != nil {
+		// #643 PR-A — the caller's ctx was done before the response was read
+		// (the boot-readiness bound, a cut scope, a client that left). Counted,
+		// not acted on: the error still flows through the shaping below.
+		recordExternalFetchAbandoned(gctx)
+	}
 	if fetchErr != nil {
 		// A non-nil go error mirrors httpcall.Do's response.New(500, err)
 		// transport/build faults. res already carries the same 500 Failure
