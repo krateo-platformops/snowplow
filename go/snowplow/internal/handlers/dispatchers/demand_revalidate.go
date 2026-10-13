@@ -26,6 +26,10 @@
 //   - FAILURE (owner ruling 1): no Put → the slot is released, the cell stays
 //     resident, served and counted; the next read or change retries. Never an
 //     eviction.
+//   - SUPPRESSED (team ruling (b)): a key suppressed for a structurally-
+//     permanent reason (external endpoint, UAF, unsupported kind, sensitive
+//     resource) is NOT revalidated — the cold path would decline its Put by the
+//     same gate — and the skip is counted (ClaimDemandRevalidation).
 //
 // The re-entered handler skips both L1 lookups (it must resolve, not hit), the
 // customer-in-flight mark (no customer is waiting on it) and the live-caller

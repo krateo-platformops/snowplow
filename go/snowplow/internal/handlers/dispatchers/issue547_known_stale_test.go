@@ -226,6 +226,13 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "k547-reader"},
 		})
 	}
+	// The refresher's own identity for identity-free cells (the SA named by
+	// phase1RealSAToken's `sub`) holds the same read grant.
+	seed = append(seed, &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "k547-sa", UID: types.UID("uid-547-sa")},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: "snowplow", Namespace: "krateo-system"}},
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "k547-reader"},
+	})
 	for m := 0; m < k547M; m++ {
 		seed = append(seed, k547Composition(m, "v0"))
 	}
@@ -272,8 +279,16 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 
 	// The production RefreshFunc body, for the per-cohort class and the
 	// identity-free widget content class.
+	// The SA transport the production RefreshFunc closes over, against a fake
+	// apiserver that serves discovery and the widget CR. Without it every
+	// background refresh fails at the re-fetch of the widget CR ("user *Endpoint
+	// not found") BEFORE reaching the injected seam, and an identity-free shell
+	// could never heal (F7).
+	srv := k547APIServer(t, h)
+	saEP := &endpoints.Endpoint{ServerURL: srv.URL, Token: phase1RealSAToken}
+	saRC := &rest.Config{Host: srv.URL}
 	refresh := func(ctx context.Context, _ string, in cache.ResolvedKeyInputs) error {
-		return resolveAndPopulateL1(ctx, in, nil, nil)
+		return resolveAndPopulateL1(ctx, in, saEP, saRC)
 	}
 	cache.RegisterRefreshFunc("widgets", refresh)
 	cache.RegisterRefreshFunc(cache.CacheEntryClassWidgetContent, refresh)
@@ -281,6 +296,40 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 	cache.StartRefresher(rctx)
 	t.Cleanup(func() { rcancel(); cache.ResetRefresherForTest() })
 	return h
+}
+
+// k547APIServer is a fake apiserver for the refresher's SA transport: discovery
+// for the widget group and a GET of the widget CR.
+func k547APIServer(t *testing.T, h *k547Harness) *httptest.Server {
+	t.Helper()
+	gv := k547WidgetGVR.Group + "/" + k547WidgetGVR.Version
+	objectPath := "/apis/" + gv + "/namespaces/" + k547WNS + "/" + k547WidgetGVR.Resource + "/" + k547WName
+	writeJSON := func(w http.ResponseWriter, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case objectPath:
+			writeJSON(w, h.widgetU.Object)
+		case "/api":
+			writeJSON(w, &metav1.APIVersions{TypeMeta: metav1.TypeMeta{Kind: "APIVersions"}, Versions: []string{"v1"}})
+		case "/api/v1":
+			writeJSON(w, &metav1.APIResourceList{TypeMeta: metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"}, GroupVersion: "v1"})
+		case "/apis":
+			gvd := metav1.GroupVersionForDiscovery{GroupVersion: gv, Version: k547WidgetGVR.Version}
+			writeJSON(w, &metav1.APIGroupList{TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
+				Groups: []metav1.APIGroup{{Name: k547WidgetGVR.Group, Versions: []metav1.GroupVersionForDiscovery{gvd}, PreferredVersion: gvd}}})
+		case "/apis/" + gv:
+			writeJSON(w, &metav1.APIResourceList{TypeMeta: metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"}, GroupVersion: gv,
+				APIResources: []metav1.APIResource{{Name: k547WidgetGVR.Resource, SingularName: "table", Namespaced: true, Kind: "Table",
+					Verbs: metav1.Verbs{"get", "list", "watch"}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 // resolve is the shared widgetsResolveFn seam. It reads the composition named
@@ -793,7 +842,6 @@ func TestIssue547_F7_KnownStaleSharedShellIsServedAndRevalidatedInTheBackground(
 	// under the requester — and the serve is counted.
 	ks0, _ := k547KnownStaleServed()
 	c0 := h.custCalls.Load()
-	bg0 := h.bgCalls.Load()
 	d1 := k547Stat("dirty_ended_unfresh_dropped")
 	for k := range k547Cohorts {
 		r, code := h.get(k, k547Changed)
@@ -814,10 +862,18 @@ func TestIssue547_F7_KnownStaleSharedShellIsServedAndRevalidatedInTheBackground(
 			t.Fatalf("F7 (k=%d): a per-cohort cell was filled — the request fell through instead of serving the shell", k)
 		}
 	}
-	// ...and the serve handed the shell to the refresher (background identity).
-	if !k547WaitFor(t, 10*time.Second, "background revalidation", func() bool { return h.bgCalls.Load() > bg0 }) {
-		t.Fatalf("F7 RED: serving the known-stale shell started no background revalidation")
+	// ...and the serve handed the shell to the refresher: a background
+	// re-resolve under the refresher's identity, which still fails here and so
+	// reaches the drop point again (the shell stays served, known-stale).
+	if !k547WaitFor(t, 30*time.Second, "background revalidation dropped", func() bool {
+		return k547Stat("dirty_ended_unfresh_dropped") > d1
+	}) {
+		t.Fatalf("F7 RED: serving the known-stale shell started no background revalidation (dropped stays %d)", d1)
 	}
+	if _, _, ks := cache.KnownStale(contentKey); !ks {
+		t.Fatalf("F7: a FAILED background revalidation ended the known-stale state")
+	}
+	h.allowBackground.Store(true)
 
 	// The refresher's identity recovers: the next serve's background
 	// revalidation heals the shell, still identity-free.

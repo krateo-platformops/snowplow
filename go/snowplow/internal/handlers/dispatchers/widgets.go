@@ -209,18 +209,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, keyExtras)
-		// #547 (owner ruling 3) — a KNOWN-STALE identity-free shell is READ
-		// THROUGH, never served: this request falls through to its OWN
-		// per-cohort cell below, which it resolves and fills under its own
-		// identity. The shared shell is never written from that resolve (it has
-		// no Put here); the informer's next change re-enqueues its refresh.
 		if contentHandle != nil {
-			var entry *cache.ResolvedEntry
-			ok := false
-			if !cache.KnownStaleReadThrough(contentKey) { // else: a MISS
-				entry, ok = contentHandle.Get(contentKey)
-			}
-			if ok {
+			if entry, ok := contentHandle.Get(contentKey); ok {
 				if gated, served := gateWidgetEnvelope(req.Context(), entry.RawJSON); served {
 					cache.RecordApiserverFallthrough(req.Context(),
 						cache.ReasonWidgetContentHit, got.GVR.String())
@@ -229,6 +219,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					pcs.l1Hit = "content-hit"
 					setRefreshKeyHeader(wri, contentKey, "widgetContent")
 					writeResolvedJSON(wri, gated)
+					// #547 (owner ruling) — a KNOWN-STALE shared shell is SERVED
+					// instantly (counted in the Get funnel) and revalidated in the
+					// background by the refresher under its identity-free (SA)
+					// identity — never under this requester, never read through.
+					cache.RevalidateKnownStaleInBackground(contentKey)
 					log.Info("Widget successfully resolved",
 						slog.String("duration", util.ETA(start)),
 						slog.String("l1", "content-hit"),

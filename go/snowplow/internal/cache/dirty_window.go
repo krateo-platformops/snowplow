@@ -95,6 +95,11 @@ type dirtyStamp struct {
 	// accepted re-Put: the body is KNOWN-STALE since t0. It survives later marks
 	// and later in-flight dequeues; only a fresh Put or an eviction clears it.
 	stale knownStaleReason
+	// seq (#547) is the dep-event sequence at the LATEST mark of this window. An
+	// accepted Put whose resolve began at or after it (its #375 sink startSeq)
+	// read the post-mark state, so it closes a known-stale window whatever
+	// carrier wrote it (closeKnownStaleOnPut).
+	seq uint64
 }
 
 // unfreshReason indexes the closed set of unfresh outcomes.
@@ -145,16 +150,23 @@ func (r *refresher) markDirty(key string, now time.Time) {
 	if key == "" {
 		return
 	}
+	seq := depEventSeq.Load()
 	for {
-		cur, loaded := r.dirty.LoadOrStore(key, &dirtyStamp{t0: now})
+		cur, loaded := r.dirty.LoadOrStore(key, &dirtyStamp{t0: now, seq: seq})
 		if !loaded {
 			return
 		}
 		s := cur.(*dirtyStamp)
-		if !s.inflight || !s.next.IsZero() {
+		// First mark wins t0; #547 — the LATEST mark's seq is kept, so a Put whose
+		// resolve predates a later mark never closes the window.
+		next := &dirtyStamp{t0: s.t0, inflight: s.inflight, next: s.next, stale: s.stale, seq: seq}
+		if s.inflight && s.next.IsZero() {
+			next.next = now
+		}
+		if s.seq >= seq && (!s.inflight || !s.next.IsZero()) {
 			return
 		}
-		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: now, stale: s.stale}) {
+		if r.dirty.CompareAndSwap(key, cur, next) {
 			return
 		}
 	}
@@ -169,7 +181,7 @@ func (r *refresher) beginWindow(key string) (t0 time.Time, open bool) {
 			return time.Time{}, false
 		}
 		s := cur.(*dirtyStamp)
-		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, stale: s.stale}) {
+		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, stale: s.stale, seq: s.seq}) {
 			return s.t0, true
 		}
 	}
@@ -195,14 +207,14 @@ func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool, stale 
 		var next any
 		switch {
 		case keepOpen:
-			next = &dirtyStamp{t0: t0, stale: s.stale}
+			next = &dirtyStamp{t0: t0, stale: s.stale, seq: s.seq}
 		case stale != knownStaleNone:
 			// #547 — the mark outlives the failed refresh. A mark that landed
 			// during it (s.next) is already re-queued by the workqueue, and the
 			// body has been stale since the EARLIER t0, so t0 is kept.
-			next = &dirtyStamp{t0: t0, stale: stale}
+			next = &dirtyStamp{t0: t0, stale: stale, seq: s.seq}
 		case !s.next.IsZero():
-			next = &dirtyStamp{t0: s.next}
+			next = &dirtyStamp{t0: s.next, seq: s.seq}
 		default:
 			if r.dirty.CompareAndDelete(key, cur) {
 				return false

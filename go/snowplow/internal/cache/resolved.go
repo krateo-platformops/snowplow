@@ -1601,6 +1601,7 @@ func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entr
 		return
 	}
 	c.putPlain(ctx, true, key, entry)
+	closeKnownStaleOnPut(ctx, key) // #547 — see PutIfGen (a boot / seed re-Put of a fresh body)
 	Deps().remarkIfDepsMovedFrom(ctx, key, true)
 }
 
@@ -1642,8 +1643,10 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 	// #547 — a demand revalidation re-runs the customer cold path, whose terminal
 	// write is THIS Put: report it to the revalidation's outcome sink (a no-op on
 	// any ctx without one, and for any key but the revalidated one). BEFORE the
-	// remark below, so a remark reads as remarked, not as fresh.
+	// remark below, so a remark reads as remarked, not as fresh. And close a
+	// KNOWN-STALE window this post-mark resolve has made fresh.
 	NoteRefreshWrite(ctx, key, true)
+	closeKnownStaleOnPut(ctx, key)
 	// #375 (option c) — ACCEPTED gen-guarded Put: after RELEASING c.mu (EnqueueRefresh
 	// must never run under the store lock), PUT-THEN-REMARK — remark this key once if any
 	// dep the resolve recorded moved since resolve entry (lastBumpSeq>startSeq), or if the
@@ -1689,6 +1692,7 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
 	c.mu.Unlock()
+	closeKnownStaleOnPut(ctx, key) // #547 — see PutIfGen
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
@@ -2415,6 +2419,7 @@ type ResolvedCacheStats struct {
 	KnownStaleReadThroughTotal   uint64
 	KnownStaleRevalidationFresh  uint64
 	KnownStaleRevalidationFailed uint64
+	KnownStaleRevalidationSkip   uint64
 	WarmKeyedPage                [b3Classes]uint64
 	WarmKeyedExtras              [b3Classes]uint64
 
@@ -2512,6 +2517,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		KnownStaleReadThroughTotal:   knownStaleReadThroughTotal.Load(),
 		KnownStaleRevalidationFresh:  knownStaleRevalidationFresh.Load(),
 		KnownStaleRevalidationFailed: knownStaleRevalidationFail.Load(),
+		KnownStaleRevalidationSkip:   knownStaleRevalidationSkip.Load(),
 		WarmKeyedPage:                loadB3(&c.warmKeyedPageGauge),
 		WarmKeyedExtras:              loadB3(&c.warmKeyedExtrasGauge),
 

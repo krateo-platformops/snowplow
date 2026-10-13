@@ -27,10 +27,16 @@
 //     keeps being served and counted, the slot is released, and the next read or
 //     change retries. Never an eviction.
 //
-//   - READ THROUGH (substrate cells). An identity-free content cell (apistage
-//     content, the widgetContent shell) and the identity-bound RAFullList are
-//     read AS INPUT by other resolves; a stale input would be baked into a new,
-//     fresh-looking cell. A known-stale substrate cell is therefore never served:
+//   - REVALIDATE IN THE BACKGROUND (the identity-free widget SHELL, owner
+//     ruling): the shell is a SERVED body, so it is served instantly like a
+//     per-cohort cell, and its revalidation is handed to the refresher under the
+//     refresher's own identity for identity-free cells (RevalidateKnownStaleIn-
+//     Background) — never resolved under the requester, never read through.
+//
+//   - READ THROUGH (substrate cells). An apistage content cell and the
+//     identity-bound RAFullList are read AS INPUT by other resolves; a stale
+//     input would be baked into a new, fresh-looking cell. A known-stale
+//     substrate cell is therefore never served:
 //     the reader treats it as a MISS and takes its existing fall-through (owner
 //     ruling 3: one apiserver call per read while the informer is not servable).
 //     Counted on known_stale_read_through_total.
@@ -82,6 +88,12 @@ var (
 	knownStaleReadThroughTotal  atomic.Uint64
 	knownStaleRevalidationFresh atomic.Uint64
 	knownStaleRevalidationFail  atomic.Uint64
+	// knownStaleRevalidationSkip counts reads of a known-stale cell whose key is
+	// SUPPRESSED for a structurally-permanent reason (external endpoint, UAF,
+	// unsupported kind, sensitive resource): the requester's cold path declines
+	// the Put by the same gate, so a revalidation could never succeed — it is
+	// skipped and counted instead (team ruling (b), #547).
+	knownStaleRevalidationSkip atomic.Uint64
 )
 
 // knownStaleStamp returns key's stamp when it is known-stale.
@@ -111,8 +123,8 @@ func KnownStale(key string) (t0 time.Time, reason string, ok bool) {
 	return s.t0, s.stale.String(), true
 }
 
-// KnownStaleReadThrough is the substrate readers' gate (apistage content, the
-// widgetContent shell, the RAFullList): true means key is known-stale and the
+// KnownStaleReadThrough is the substrate readers' gate (apistage content and
+// the RAFullList; never the served widget shell): true means key is known-stale and the
 // reader must take its MISS fall-through instead of reading the cell. Counted.
 func KnownStaleReadThrough(key string) bool {
 	if _, ok := knownStaleStamp(key); !ok {
@@ -176,13 +188,69 @@ type ctxKeyDemandRevalidationType struct{}
 var ctxKeyDemandRevalidation = ctxKeyDemandRevalidationType{}
 
 // ClaimDemandRevalidation claims key's single revalidation slot for the stale
-// generation t0. false: one is already in flight.
+// generation t0. false: one is already in flight, or — team ruling (b) — the key
+// is suppressed for a structurally-permanent reason, so no revalidation can
+// succeed: that skip is counted (known_stale_revalidation_skipped_total).
 func ClaimDemandRevalidation(key string, t0 time.Time) bool {
 	if key == "" {
 		return false
 	}
+	if _, suppressed := RefreshSuppressedReason(key); suppressed {
+		knownStaleRevalidationSkip.Add(1)
+		return false
+	}
 	_, loaded := demandInflight.LoadOrStore(key, t0)
 	return !loaded
+}
+
+// bgRevalidationInflight holds the one queued background revalidation per
+// identity-free key (RevalidateKnownStaleInBackground); released when the
+// refresher's dequeue of that key settles.
+var bgRevalidationInflight sync.Map
+
+// RevalidateKnownStaleInBackground is the identity-free twin of the demand
+// revalidation (owner ruling, #547): a known-stale SHARED widget shell is SERVED
+// instantly and revalidated in the background by the refresher, under the
+// refresher's own identity for identity-free cells (the SA) — never under the
+// requester, whose identity is not the cell's. One queued revalidation per key;
+// a structurally-permanent suppression skips it (counted). Never blocks.
+func RevalidateKnownStaleInBackground(key string) {
+	t0, _, ok := KnownStale(key)
+	if !ok {
+		return
+	}
+	if _, suppressed := RefreshSuppressedReason(key); suppressed {
+		knownStaleRevalidationSkip.Add(1)
+		return
+	}
+	// KnownStale already proved a refresher exists (the stamp lives on it); Peek,
+	// never construct one on a serve path (the C1 N1 off-path lesson).
+	r := refresherPeek()
+	if r == nil {
+		return
+	}
+	if _, loaded := bgRevalidationInflight.LoadOrStore(key, t0); loaded {
+		return
+	}
+	if _, isCL := r.clusterListKeys.Load(key); isCL {
+		r.enqueueClusterList(key)
+	} else {
+		r.enqueue(key)
+	}
+}
+
+// settleBackgroundRevalidation releases key's background revalidation slot and
+// counts its outcome (fresh: the key is no longer known-stale). Called by the
+// refresher once a dequeue of key has settled.
+func settleBackgroundRevalidation(key string) {
+	if _, held := bgRevalidationInflight.LoadAndDelete(key); !held {
+		return
+	}
+	if _, _, still := KnownStale(key); still {
+		knownStaleRevalidationFail.Add(1)
+		return
+	}
+	knownStaleRevalidationFresh.Add(1)
 }
 
 // DemandRevalidationFromContext reports whether ctx is a demand revalidation
@@ -214,9 +282,10 @@ func DemandRevalidationDeadline() time.Duration {
 // BeginDemandRevalidation marks ctx as the demand revalidation of key (claimed
 // with ClaimDemandRevalidation for t0) and installs the write-outcome sink the
 // customer Put reports into (PutIfGen → NoteRefreshWrite). settle MUST be called
-// once the revalidation returns: it releases the slot and, on an accepted
-// un-remarked write, closes the known-stale window as fresh. It reports whether
-// the cell is fresh.
+// once the revalidation returns: it releases the slot and counts the outcome.
+// The window itself is closed by the write, through the same rule as any other
+// accepted Put (closeKnownStaleOnPut). It reports whether the write was accepted
+// un-remarked.
 func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (context.Context, func() bool) {
 	ctx, o := withRefreshOutcome(ctx, key)
 	ctx = context.WithValue(ctx, ctxKeyDemandRevalidation, key)
@@ -226,7 +295,6 @@ func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (con
 		once.Do(func() {
 			demandInflight.CompareAndDelete(key, t0)
 			if o.accepted.Load() && !o.remarked.Load() {
-				closeKnownStaleFresh(key, t0)
 				knownStaleRevalidationFresh.Add(1)
 				fresh = true
 				return
@@ -237,13 +305,23 @@ func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (con
 	}
 }
 
-// closeKnownStaleFresh ends key's known-stale window t0 after an accepted demand
-// write: the same close (and dirty→fresh sample) a refresher re-Put makes. A
-// stamp that is in flight is left to its dequeue; a stamp re-opened for another
-// t0 is not this generation's.
-func closeKnownStaleFresh(key string, t0 time.Time) {
+// closeKnownStaleOnPut ends key's KNOWN-STALE window on an ACCEPTED Put whose
+// resolve began at or after the window's latest mark (#547): that body was read
+// from the post-mark state, so the cell is fresh, whichever carrier wrote it — a
+// demand revalidation, a substrate read-through refill (apistage content MISS,
+// the RAFullList live resolve), a seed or keep-warm re-Put. ctx must carry the
+// resolve's #375 dep-gen sink (its startSeq is the resolve-entry epoch); a Put
+// with no sink proves nothing and closes nothing. An IN-FLIGHT stamp is left to
+// its refresher dequeue, which settles it. Called before the Put's #375 remark:
+// a dep that moved during the resolve then re-opens a fresh window through the
+// ordinary mark. Records the dirty→fresh sample, like a refresher re-Put.
+func closeKnownStaleOnPut(ctx context.Context, key string) {
 	r := refresherPeek()
-	if r == nil {
+	if r == nil || key == "" {
+		return
+	}
+	start, ok := DepGenStartSeqFromContext(ctx)
+	if !ok {
 		return
 	}
 	for {
@@ -252,11 +330,11 @@ func closeKnownStaleFresh(key string, t0 time.Time) {
 			return
 		}
 		s := cur.(*dirtyStamp)
-		if s.stale == knownStaleNone || s.inflight || !s.t0.Equal(t0) {
+		if s.stale == knownStaleNone || s.inflight || start < s.seq {
 			return
 		}
 		if r.dirty.CompareAndDelete(key, cur) {
-			r.sampleFresh(t0)
+			r.sampleFresh(s.t0)
 			return
 		}
 	}
@@ -284,5 +362,7 @@ func resetKnownStaleForTest() {
 	knownStaleReadThroughTotal.Store(0)
 	knownStaleRevalidationFresh.Store(0)
 	knownStaleRevalidationFail.Store(0)
+	knownStaleRevalidationSkip.Store(0)
 	demandInflight.Range(func(k, _ any) bool { demandInflight.Delete(k); return true })
+	bgRevalidationInflight.Range(func(k, _ any) bool { bgRevalidationInflight.Delete(k); return true })
 }

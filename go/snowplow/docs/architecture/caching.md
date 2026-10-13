@@ -481,8 +481,12 @@ refresher ends in exactly one of three states, all counted:
 | **known-stale** (#547) | the refresh ended without an accepted re-Put: a decline (stage error, empty full, external / UAF / sensitive gate), a drop after `maxRefreshRequeues` (403, 500, timeout, parse failure, an apistage content call that is not servable), a suppressed skip | `dirty_ended_unfresh_{declined,dropped}`; served: `known_stale_served_total{reason}` |
 
 **Known-stale.** The cell stays resident and its dirty stamp (`dirty_window.go`) is NOT erased: it
-is converted to `{t0, stale: reason}` and stays until an accepted re-Put closes it (the refresher,
-or a demand revalidation) or the cell leaves the store. Before #547 the stamp was deleted there,
+is converted to `{t0, stale: reason, seq}` and stays until an accepted write closes it or the cell
+leaves the store. ANY accepted write whose resolve began at or after the window's latest mark
+closes it — the refresher, a demand revalidation, a substrate read-through refill, a seed or
+keep-warm re-Put (`closeKnownStaleOnPut`: the resolve's #375 `startSeq` against the stamp's
+`seq`) — unless a refresh is in flight, whose dequeue settles it. A Put whose resolve began
+before the mark carries the pre-change body and closes nothing. Before #547 the stamp was deleted there,
 so the cell looked exactly like a fresh one — every reload was a hit on a body the system knew
 was stale, nothing re-validated it short of a later event or the TTL, and `stale_served_total`
 went blind at the moment the user started seeing stale data (#547 trace). The serve path
@@ -496,10 +500,18 @@ went blind at the moment the user started seeing stale data (#547 trace). The se
   requester's identity and own credential (the read known to work), bounded by the server's write
   deadline, never blocking the response (`dispatchers/demand_revalidate.go`). Its accepted
   write closes the window and publishes over SSE. If it fails, the body keeps being served and
-  counted and the next read or change retries — never an eviction (owner ruling, #547);
-- a **resolve input** (an apistage content cell, the widgetContent shell, a RAFullList) is READ
-  THROUGH: the reader takes its existing MISS fall-through (one apiserver call per read while the
-  informer is not servable, owner ruling) so a stale substrate is never baked into a new cell.
+  counted and the next read or change retries — never an eviction (owner ruling, #547). A key
+  suppressed for a structurally-permanent reason (external, UAF, unsupported, sensitive) starts
+  NO demand revalidation — its cold path declines the Put by the same gate — and the skip is
+  counted (`known_stale_revalidation_skipped_total`, team ruling);
+- the **shared, identity-free widget shell** (widgetContent) is a SERVED body too: it is served
+  instantly and counted like a per-cohort cell, and revalidated in the BACKGROUND by the
+  refresher under its own identity for identity-free cells — never read through, never resolved
+  under the requester (owner ruling, #547 comment 6141782784);
+- a **resolve input** (an apistage content cell, a RAFullList) is READ THROUGH: the reader takes
+  its existing MISS fall-through (one apiserver call per read while the informer is not servable,
+  owner ruling) so a stale substrate is never baked into a new cell. That refill is an accepted
+  post-mark write, so it ends the known-stale state and the next read is a plain hit.
 
 **Retired by #547:** `REFRESH_DROP_EVICT_MAX_PER_MINUTE` (the drop-point eviction breaker: over
 budget it kept the stale body resident and served as if fresh — 80 % of the live drop points —
@@ -518,8 +530,9 @@ The arms are `cache/refresh_terminal_test.go` (F5a/F5b: dropped entries stay res
 known-stale; F6m: a stage-error decline never suppresses; F6s: the permanent suppression and its
 known-stale skip), `dispatchers/issue1126_c4_terminal_e2e_test.go` (rows 3/4/6/9 through the
 production `resolveAndPopulateL1`), and the #547 falsifiers
-`dispatchers/issue547_known_stale_test.go` (F1/F2/F4–F7, the production GET-by-name `/call`
-driven from an informer UPDATE through the refresher to the next `Get`) and
+`dispatchers/issue547_known_stale_test.go` (F1/F2/F4–F9 and F3c/F3b, the production GET-by-name
+`/call` driven from an informer UPDATE through the refresher to the next `Get`; F3c in the
+composition-detail shape, K=2 × M=3) and
 `restactions/api/issue547_content_read_through_test.go` (F3).
 
 ---

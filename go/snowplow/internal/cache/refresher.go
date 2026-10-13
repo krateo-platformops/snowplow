@@ -902,6 +902,10 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	} else {
 		defer r.queue.Done(key)
 	}
+	// #547 — a background revalidation of a known-stale shared shell settles with
+	// this dequeue (runs before Done, after every branch below has settled the
+	// window).
+	defer settleBackgroundRevalidation(key)
 
 	// Customer-priority cooperative yield (Ship #98). Mirrors prewarm
 	// engine's yield-before-scope pattern (prewarm_engine.go:275). The

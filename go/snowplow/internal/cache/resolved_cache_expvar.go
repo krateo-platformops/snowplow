@@ -234,6 +234,9 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		"known_stale_read_through_total":        int64(s.KnownStaleReadThroughTotal),
 		"known_stale_revalidation_fresh_total":  int64(s.KnownStaleRevalidationFresh),
 		"known_stale_revalidation_failed_total": int64(s.KnownStaleRevalidationFailed),
+		// team ruling (b): a structurally-permanent suppression skips the
+		// revalidation (it could never succeed); the skip is counted here.
+		"known_stale_revalidation_skipped_total": int64(s.KnownStaleRevalidationSkip),
 	}
 	for i, reason := range KnownStaleReasons {
 		out["known_stale_served_"+reason+"_total"] = int64(s.KnownStaleServed[i])
