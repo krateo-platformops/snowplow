@@ -94,7 +94,8 @@ func TestIssue1126_N9_RedProbe_C4AlertCountersRideSnowplowRefresher(t *testing.T
 	if len(exports) == 0 {
 		t.Fatal("NOTHING was exported: no OTLP request reached the receiver")
 	}
-	for _, stat := range []string{"drop_evict_suspended", "suppressed_skips"} {
+	// #547 retired drop_evict_suspended with the drop-point breaker.
+	for _, stat := range []string{"suppressed_skips"} {
 		if _, found := c4FindSumByStat(exports, "snowplow_refresher", stat); !found {
 			t.Errorf("RED: snowplow_refresher{stat=%q} is absent from the OTLP export — the C4 alert counter is "+
 				"expvar-only and cannot be alerted on from ClickStack (arch N9). Exported stat labels: %v",

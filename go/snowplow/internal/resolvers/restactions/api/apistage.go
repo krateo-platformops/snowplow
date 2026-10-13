@@ -556,9 +556,18 @@ func apistageContentServe(
 	// marker" (cache/deps.go), it is the meaning rbac.MustRegateSADial already
 	// depends on under the #268/#269 drift-guard with a producer census behind it,
 	// and it is already classified readOnly443 in the #443 inertness census.
+	//
+	// #547 (owner ruling 3) — a KNOWN-STALE content cell (a refresh of it ended
+	// without an accepted re-Put) is READ THROUGH for EVERY reader, customer or
+	// background: it is a resolve INPUT, and serving it would bake a stale
+	// substrate into a fresh-looking widget/RA cell. The MISS fall-through below
+	// is the one K8s call per read the owner accepted while the informer is not
+	// servable; the informer's re-fire refreshes the cell.
 	readContent := func(k string) (*cache.ResolvedEntry, bool) {
 		switch {
 		case forceContentMiss:
+			return nil, false
+		case cache.KnownStaleReadThrough(k):
 			return nil, false
 		case cache.BackgroundResolveFromContext(ctx) || cache.Inert(ctx):
 			// #443 (e) — an inert (dry-run) resolve reads the cell as input

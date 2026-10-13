@@ -191,8 +191,9 @@ func TestIssue216_DegradedConfirmed404_ForgetsHarvestAndStopsSeedReplay(t *testi
 
 // TestIssue216_DropPointNon404_DoesNotForgetHarvest is the NEGATIVE CONTROL for
 // the 404-only gate (feedback_arm_that_cannot_fail_is_not_coverage): a
-// deterministic NON-404 failure (500) evicts L1 at the C4 drop point behind the
-// breaker, but must NEVER fire notifyObjectGone — the harvester KEEPS the copy.
+// deterministic NON-404 failure (500) reaches the drop point — since #547 the
+// cell stays resident and KNOWN-STALE (1.12.6 C4 evicted it there) — and must
+// NEVER fire notifyObjectGone — the harvester KEEPS the copy.
 // Over-forget on a transient outage is NOT safe (unlike #279's over-mark): it
 // would empty the warm set for every entry that comes up for refresh during an
 // apiserver blip. Without this arm the positive test's "confirmed-404 forgets"
@@ -203,9 +204,6 @@ func TestIssue216_DropPointNon404_DoesNotForgetHarvest(t *testing.T) {
 	zeroCustomerInFlight()
 
 	i187RefresherEnv(t)
-	// Breaker ON (default): a deterministic non-404 across the budget evicts at the
-	// C4 drop point — so this arm tests "evicted-but-not-forgotten", not "not evicted".
-	t.Setenv("REFRESH_DROP_EVICT_MAX_PER_MINUTE", "64")
 	srv := newI187APIServer(t, http.StatusInternalServerError) // 500 — NOT a confirmed deletion
 
 	buildFixCWatcher(t)
@@ -252,20 +250,23 @@ func TestIssue216_DropPointNon404_DoesNotForgetHarvest(t *testing.T) {
 	saRC := &rest.Config{Host: srv.URL}
 	invocations := i187RunRefreshCycle(t, in, key, saEP, saRC, store)
 
-	// PRECONDITION — the 500 DID evict L1 at the drop point (arm is not vacuous).
-	if _, ok := store.Get(key); ok {
-		t.Fatalf("negative-control precondition: a 500 across the budget did NOT evict at the C4 drop "+
-			"point (%d invocations, %d GETs) — cannot test whether a non-deletion eviction forgets",
+	// PRECONDITION — the 500 DID reach the drop point (arm is not vacuous): the
+	// whole budget was spent against the apiserver.
+	if invocations < i187MaxRequeues+1 {
+		t.Fatalf("negative-control precondition: only %d invocations (%d GETs) — the drop point was not reached",
 			invocations, srv.objectGets.Load())
+	}
+	if _, ok := store.GetNoTouch(key); !ok {
+		t.Fatalf("#547: a 500 across the budget EVICTED the cell — a non-404 drop leaves it resident, known-stale")
 	}
 	// It took the DROP-POINT route, not the confirmed-404 self-gone route.
 	if got := cache.Deps().Stats().EvictSelfGoneTotal; got != beforeSelfGone {
 		t.Fatalf("negative-control: a 500 moved evict_self_gone_total (%d -> %d) — a non-404 must never "+
 			"take the confirmed-deletion route", beforeSelfGone, got)
 	}
-	// THE NEGATIVE CONTROL: a non-404 eviction must NOT forget the harvested copy.
+	// THE NEGATIVE CONTROL: a non-404 drop must NOT forget the harvested copy.
 	if !f6bHarvestedStillHolds(nav, i187GVR(), i187NS, i187Name) {
-		t.Fatalf("RED (#216 over-forget): a 500 drop-point eviction FORGOT the harvested copy of %s/%s. "+
+		t.Fatalf("RED (#216 over-forget): a 500 drop point FORGOT the harvested copy of %s/%s. "+
 			"Only a CONFIRMED 404 may forget — a transient apiserver error would empty the warm set "+
 			"during an outage.", i187NS, i187Name)
 	}

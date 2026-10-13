@@ -1377,13 +1377,17 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 
 // noteServeWhileDirty counts a customer hit on a cell whose invalidation→fresh
 // window is open (#354 P3): one sync.Map Load, and nothing else on a clean cell.
+// #547 — a hit on a KNOWN-STALE stamp (a refresh of this window already ended
+// without a Put) is also counted on known_stale_served_total{reason}: the hit
+// delivers a body the system knows is stale.
 func (c *ResolvedCacheStore) noteServeWhileDirty(key string) {
-	t0, dirty := dirtySince(key)
+	s, dirty := dirtyStampFor(key)
 	if !dirty {
 		return
 	}
 	c.staleServedTotal.Add(1)
-	c.staleServedAge.observe(float64(time.Since(t0).Milliseconds()))
+	c.staleServedAge.observe(float64(time.Since(s.t0).Milliseconds()))
+	noteKnownStaleServe(s)
 }
 
 // GetNoTouch is the INTERNAL read path (#376): identical to Get — same lazy TTL +
@@ -1596,6 +1600,7 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 		// now — the eviction is authoritative; drop the stale body on the floor.
 		c.putRefusedGenerationMovedTotal.Add(1)
 		c.mu.Unlock()
+		NoteRefreshWrite(ctx, key, false) // #547: a demand revalidation's outcome
 		return false
 	}
 	// Committing a real Put: clear the refresh-suppression marker (a real Put is
@@ -1606,6 +1611,11 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
 	c.mu.Unlock()
+	// #547 — a demand revalidation re-runs the customer cold path, whose terminal
+	// write is THIS Put: report it to the revalidation's outcome sink (a no-op on
+	// any ctx without one, and for any key but the revalidated one). BEFORE the
+	// remark below, so a remark reads as remarked, not as fresh.
+	NoteRefreshWrite(ctx, key, true)
 	// #375 (option c) — ACCEPTED gen-guarded Put: after RELEASING c.mu (EnqueueRefresh
 	// must never run under the store lock), PUT-THEN-REMARK — remark this key once if any
 	// dep the resolve recorded moved since resolve entry (lastBumpSeq>startSeq), or if the
@@ -2366,8 +2376,17 @@ type ResolvedCacheStats struct {
 	// #354 P3 — customer stale serves (C) and the B3 key-shape gauges (E).
 	StaleServedTotal    uint64
 	StaleServedAgeMSMax int64
-	WarmKeyedPage       [b3Classes]uint64
-	WarmKeyedExtras     [b3Classes]uint64
+	// #547 — customer hits that delivered a KNOWN-STALE body (per reason of the
+	// closed set, KnownStaleReasons order), the cells currently known-stale, the
+	// substrate reads that went through instead, and the demand revalidations by
+	// outcome (known_stale.go).
+	KnownStaleServed             [knownStaleReasons - 1]uint64
+	KnownStaleResident           uint64
+	KnownStaleReadThroughTotal   uint64
+	KnownStaleRevalidationFresh  uint64
+	KnownStaleRevalidationFailed uint64
+	WarmKeyedPage                [b3Classes]uint64
+	WarmKeyedExtras              [b3Classes]uint64
 
 	// Ship E (0.30.116) api-stage counters.
 	ApistageStoreTotal uint64
@@ -2458,6 +2477,11 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		ResidentDemoteTotal:          c.residentDemoteTotal.Load(),
 		StaleServedTotal:             c.staleServedTotal.Load(),
 		StaleServedAgeMSMax:          c.staleServedAgeMSMax(),
+		KnownStaleServed:             loadKnownStaleServed(),
+		KnownStaleResident:           knownStaleResident(),
+		KnownStaleReadThroughTotal:   knownStaleReadThroughTotal.Load(),
+		KnownStaleRevalidationFresh:  knownStaleRevalidationFresh.Load(),
+		KnownStaleRevalidationFailed: knownStaleRevalidationFail.Load(),
 		WarmKeyedPage:                loadB3(&c.warmKeyedPageGauge),
 		WarmKeyedExtras:              loadB3(&c.warmKeyedExtrasGauge),
 

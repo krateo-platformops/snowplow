@@ -161,11 +161,6 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	i187RefresherEnv(t)
-	// RED-FIRST PIN (removed by the fix, which retires the knob): on 9c233de9
-	// the drop point EVICTS while the breaker has budget; "0" selects its
-	// suspended branch — the 80% live path (drop_evict_suspended 4,017 vs
-	// drop_evict 1,021 on 057) that leaves the stale body resident and served.
-	t.Setenv("REFRESH_DROP_EVICT_MAX_PER_MINUTE", "0")
 	cache.ResetResolvedCacheForTest()
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 	cache.ResetDepsForTest()

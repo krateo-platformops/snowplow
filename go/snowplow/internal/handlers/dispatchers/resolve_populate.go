@@ -380,12 +380,10 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// kind" case is the typed ErrRefreshUnsupported above.
 		//
 		// 1.12.6 C4 (§6.1, architect N6): this must not be a "forget the key
-		// and keep the entry" outcome. A genuinely transient pre-sync window
-		// clears well inside K=REFRESH_SUPPRESS_AFTER_DECLINES dequeues and is
-		// unaffected; an RA whose full is PERMANENTLY empty would otherwise
-		// re-resolve on every dirty-mark forever — the #191 shape — so after K
-		// consecutive declines the key becomes refresh-by-traffic-only until
-		// the next real Put, like every other decline site.
+		// and keep the entry" outcome. #547 — it is not: the dequeue's window
+		// ends KNOWN-STALE (refresher settleDequeue), so the cell is retried on
+		// the next read (demand, under the requester) or the next change. Not a
+		// structurally permanent decline, so never suppressed.
 		cache.NoteRefreshDecline(key, "empty_full", false)
 		return nil
 	}
@@ -412,15 +410,23 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// inline so a decline can be attributed without a cross-grep
 		// against the resolver's error lines (which cost two traces).
 		sampleStage, sampleErr := stageErrSink.Sample()
-		// 1.12.6 C4 (§6.2 row 6, #191) — an inner stage that fails under the
-		// SA identity (an exportJwt loopback, a per-user RBAC denial) fails
-		// the same way on EVERY refresh; pre-1.12.6 this key re-resolved
-		// every ~3 min forever (956 WARNs from 23 keys in 4.5 h on
-		// krateo-057). After K consecutive declines the key is SUPPRESSED:
-		// refresh-by-traffic-only, cleared by the next real Put. The body is
-		// still correct — real user traffic is what writes it.
+		// #547 — an inner stage that fails under the background identity (a
+		// refresher-only 403, an exportJwt loopback) ends the dequeue's window
+		// KNOWN-STALE: the cell keeps serving its pre-change body, every hit on
+		// it is counted (known_stale_served_total{reason=declined}), and the
+		// next read revalidates it under the REQUESTER, whose read is the one
+		// known to work. 1.12.6 C4 suppressed the key after K consecutive
+		// declines (REFRESH_SUPPRESS_AFTER_DECLINES) and left it frozen; that
+		// knob is retired. The #191 WARN storm is bounded instead by logging at
+		// WARN once per stale generation: a decline of a cell that is ALREADY
+		// known-stale is DEBUG (the counter carries the rate).
 		suppressed := cache.NoteRefreshDecline(key, "stage_error", false)
-		log.Warn("resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
+		_, _, alreadyKnownStale := cache.KnownStale(key)
+		declineLevel := slog.LevelWarn
+		if alreadyKnownStale {
+			declineLevel = slog.LevelDebug
+		}
+		log.Log(rctx, declineLevel, "resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
@@ -430,13 +436,8 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("stage_err_stage", sampleStage),
 			slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
 			slog.Bool("suppressed", suppressed),
-			slog.String("effect", "prior good entry kept; TTL is the outer net"+
-				func() string {
-					if suppressed {
-						return "; key now refresh-by-traffic-only (no further refresh WARNs until a real Put)"
-					}
-					return ""
-				}()),
+			slog.String("effect", "prior entry kept and marked KNOWN-STALE: served and counted, revalidated "+
+				"on the next read under the requester, re-enqueued by the next change (#547)"),
 		)
 		cache.BumpRefresherSkippedStageError()
 		return nil

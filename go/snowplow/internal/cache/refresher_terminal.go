@@ -1,45 +1,43 @@
-// refresher_terminal.go — 1.12.6 C4: terminal semantics for every refresh
-// outcome (design-1.12.6-event-hardening §6).
+// refresher_terminal.go — 1.12.6 C4 (design-1.12.6-event-hardening §6), as
+// amended by #547: terminal semantics for every refresh outcome.
 //
-// THE RULE. No refresh outcome may end in "forget the key and keep the
-// entry". Every path ends in exactly one of:
+// THE RULE. No refresh outcome may end in "forget the key and keep the entry".
+// Every path ends in exactly one of:
 //
-//   - re-Put    fresh bytes stored (the success path, unchanged);
-//   - evict     the entry's basis is gone or unverifiable — the self-object
-//     404 (1.12.5) and, from 1.12.6, EVERY deterministic failure
-//     that exhausts the requeue budget (403 / 500 / timeout /
-//     parse failure / apistage not-servable), behind the breaker
-//     below;
-//   - suppress  the key is explicitly marked refresh-by-traffic-only,
-//     counted, and cleared by the next real Put.
+//   - re-Put        fresh bytes stored (the success path, unchanged);
+//   - evict         the entry's basis is GONE — the self-object 404 at the
+//     drop point (1.12.5) and every store removal;
+//   - known-stale   (#547) the refresh ended without an accepted re-Put — a
+//     decline, a drop after the requeue budget, a suppressed
+//     skip. The cell stays resident and its stamp stays
+//     (dirty_window.go): the serve path counts every hit on it
+//     and revalidates it on demand under the requester
+//     (known_stale.go); a substrate reader reads through it.
 //
-// Before 1.12.6 the drop point (processNext) Forgot a non-404 key and left the
-// stale body resident until TTL, and the three decline gates in
-// resolveAndPopulateL1 re-resolved the same key every ~3 min forever (#191:
-// 956 WARNs from 23 keys in 4.5 h).
+// RETIRED BY #547 (owner ruling, #547 comment 6140460857):
 //
-// THE BREAKER (§6.3). An apiserver outage fails every refresh; after the
-// budget every dirty-marked key reaches the drop point, and evicting them all
-// is a cold-cache storm on top of an outage. REFRESH_DROP_EVICT_MAX_PER_MINUTE
-// (default "64") is a token bucket on drop-point evictions: over budget the
-// key keeps today's drop-to-TTL, refresh_drop_evict_suspended_total ticks and
-// ONE WARN per suspension window names the suspected outage. "0" disables
-// drop-eviction for non-404 failures entirely (today's behaviour byte-for-
-// byte). The breaker is NOT a rate limit: it is the discriminator between a
-// correctness regime (a handful of deterministic failures — evicting is right)
-// and an availability regime (a mass failure — evicting would turn a stale
-// portal into a broken one).
+//   - REFRESH_DROP_EVICT_MAX_PER_MINUTE and its breaker. 1.12.6 evicted a
+//     non-404 deterministic failure at the drop point while the breaker had
+//     budget and, over budget, kept today's drop-to-TTL — the stale body
+//     resident and SERVED as fresh. On 057 80% of the drop points took that
+//     branch (#547 trace). An eviction is a cold navigation and forget-as-fresh
+//     is the defect, so both give way to known-stale; there is no budget left to
+//     tune.
+//   - REFRESH_SUPPRESS_AFTER_DECLINES (K consecutive stage-error / empty-full
+//     declines before suppression). A transient decline is now KNOWN-STALE and
+//     retried on the next read (demand, under the requester) or change (the
+//     informer re-enqueues it) — self-adapting, no K.
 //
-// SUPPRESSION (§6.4, #191). A per-key marker held HERE (package state), never
-// on the resident *ResolvedEntry (Get returns the live pointer; mutating it is
-// a data race). Set at each decline site after K consecutive declines
-// (REFRESH_SUPPRESS_AFTER_DECLINES, default "3"; the structurally-permanent
-// declines — external endpoint, UAF cell, unsupported handler kind — use K=1).
-// Consulted in processNext right after the entry Get and before the rate
-// floor: a suppressed key is Forgotten and skipped — no resolve, no WARN.
-// Cleared by ResolvedCacheStore.Put (a real Put is by definition the "next
-// real Put" the suppression waits for) and by every store eviction, so the
-// marker cannot outlive its key.
+// SUPPRESSION (§6.4, #191) remains for the STRUCTURALLY PERMANENT declines only
+// — external endpoint, UAF cell, sensitive resource, unsupported handler kind —
+// which no retry of the background refresh can ever turn into a Put. A per-key
+// marker held HERE (package state), never on the resident *ResolvedEntry (Get
+// returns the live pointer; mutating it is a data race). Consulted in
+// processNext right after the entry Get and before the rate floor: a suppressed
+// key is Forgotten and skipped (and its window marked known-stale, reason
+// suppressed). Cleared by every accepted Put (a real Put is the "next real Put"
+// the suppression waits for) and by every store eviction, so the marker cannot
+// outlive its key. A demand revalidation is not gated by it.
 //
 // Package-level rather than on the refresher struct so that the store's Put /
 // eviction path can clear a marker WITHOUT constructing the refresher
@@ -49,23 +47,8 @@ package cache
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"sync"
 	"sync/atomic"
-	"time"
-)
-
-const (
-	// envRefreshDropEvictMaxPerMinute — the drop-point eviction breaker.
-	// String-typed (installer plumbing is string-only); unset/unparseable →
-	// default; "0" disables drop-eviction for non-404 failures.
-	envRefreshDropEvictMaxPerMinute     = "REFRESH_DROP_EVICT_MAX_PER_MINUTE"
-	defaultRefreshDropEvictMaxPerMinute = 64
-
-	// envRefreshSuppressAfterDeclines — consecutive stage-error declines of
-	// one key before it is marked refresh-by-traffic-only.
-	envRefreshSuppressAfterDeclines     = "REFRESH_SUPPRESS_AFTER_DECLINES"
-	defaultRefreshSuppressAfterDeclines = 3
 )
 
 // ErrRefreshUnsupported — item 4 row 4: the resolver seam has no handler for
@@ -81,104 +64,11 @@ var ErrRefreshUnsupported = errors.New("refresh unsupported for this entry kind"
 // the drop point like any other deterministic failure.
 var ErrContentNotServable = errors.New("apistage content call not servable")
 
-// RefreshDropEvictMaxPerMinute returns the breaker budget; 0 = drop-eviction
-// disabled for non-404 failures.
-func RefreshDropEvictMaxPerMinute() int {
-	n := intFromEnv(envRefreshDropEvictMaxPerMinute, defaultRefreshDropEvictMaxPerMinute)
-	if n < 0 {
-		return defaultRefreshDropEvictMaxPerMinute
-	}
-	return n
-}
-
-// RefreshSuppressAfterDeclines returns K, the consecutive-decline threshold
-// for the stage-error suppression; never below 1.
-func RefreshSuppressAfterDeclines() int {
-	n := intFromEnv(envRefreshSuppressAfterDeclines, defaultRefreshSuppressAfterDeclines)
-	if n < 1 {
-		return defaultRefreshSuppressAfterDeclines
-	}
-	return n
-}
-
-// dropEvictBreaker is a token bucket: capacity == refill-per-minute == the
-// knob. One token per drop-point eviction; refill is continuous.
-type dropEvictBreaker struct {
-	mu        sync.Mutex
-	tokens    float64
-	last      time.Time
-	perMinute int
-	suspended bool // inside a suspension window (one WARN per window)
-	nowFn     func() time.Time
-}
-
-// The breaker's three counters are PACKAGE-level atomics, not fields of the
-// breaker, so RefreshTerminalStatsSnapshot can read them without touching
-// refresherInstance. Reading the singleton pointer from a telemetry scrape
-// was a data race (architect B1: the pointer is published inside
-// refresherInit.Do on the first enqueue, and nothing ordered a concurrent
-// /debug/vars or OTLP read against that write — three races under
-// -race -count=20). The breaker is a process singleton, so process-scoped
-// counters are semantically identical, and the snapshot still constructs
-// nothing (the C1 N1 lesson: a stats read must never build the singleton).
-var (
-	dropEvictTotal          atomic.Uint64 // refresh_drop_evict_total (non-404 drop-point evictions)
-	dropEvictSuspendedTotal atomic.Uint64 // refresh_drop_evict_suspended_total
-	dropEvictWarnTotal      atomic.Uint64 // suspension-window WARNs emitted (one per window)
-)
-
-func newDropEvictBreaker(perMinute int) *dropEvictBreaker {
-	b := &dropEvictBreaker{perMinute: perMinute, nowFn: time.Now}
-	b.tokens = float64(perMinute)
-	b.last = b.nowFn()
-	return b
-}
-
-// allow consumes one token when available. It returns (allowed, firstSuspend):
-// firstSuspend is true exactly once per suspension window — the caller emits
-// the WARN then, and the window closes the next time a token is granted.
-func (b *dropEvictBreaker) allow() (allowed bool, firstSuspend bool) {
-	if b.perMinute <= 0 {
-		return false, false
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := b.nowFn()
-	elapsed := now.Sub(b.last).Minutes()
-	if elapsed > 0 {
-		b.tokens += elapsed * float64(b.perMinute)
-		if b.tokens > float64(b.perMinute) {
-			b.tokens = float64(b.perMinute)
-		}
-		b.last = now
-	}
-	if b.tokens >= 1 {
-		b.tokens--
-		b.suspended = false
-		dropEvictTotal.Add(1)
-		return true, false
-	}
-	dropEvictSuspendedTotal.Add(1)
-	if !b.suspended {
-		b.suspended = true
-		dropEvictWarnTotal.Add(1)
-		return false, true
-	}
-	return false, false
-}
-
 // --- suppression ---------------------------------------------------------
-
-type suppressState struct {
-	reason   string
-	declines int
-}
 
 var (
 	// refreshSuppressed: l1Key -> reason. Presence == suppressed.
 	refreshSuppressed sync.Map
-	// refreshDeclines: l1Key -> *suppressState (consecutive-decline counter).
-	refreshDeclines sync.Map
 
 	refreshSuppressedSetTotal   atomic.Uint64 // keys marked suppressed
 	refreshSuppressedSkipsTotal atomic.Uint64 // dequeues skipped because suppressed
@@ -186,11 +76,12 @@ var (
 )
 
 // NoteRefreshDecline records one decline of l1Key at a refresh decline site.
-// permanent == true marks the key immediately (structurally permanent
-// declines: external endpoint, UAF cell, unsupported kind); otherwise the key
-// is marked after REFRESH_SUPPRESS_AFTER_DECLINES consecutive declines. It
-// returns true when the key is (now) suppressed. Idempotent for an already
-// suppressed key.
+// permanent == true marks the key suppressed (the structurally permanent
+// declines: external endpoint, UAF cell, sensitive resource, unsupported kind).
+// A non-permanent decline (stage error, empty full) never suppresses since #547:
+// the dequeue's window ends KNOWN-STALE and the cell is retried on the next read
+// or change. It returns true when the key is (now) suppressed. Idempotent for an
+// already suppressed key.
 func NoteRefreshDecline(l1Key, reason string, permanent bool) bool {
 	if l1Key == "" {
 		return false
@@ -199,20 +90,12 @@ func NoteRefreshDecline(l1Key, reason string, permanent bool) bool {
 	if _, already := refreshSuppressed.Load(l1Key); already {
 		return true
 	}
-	v, _ := refreshDeclines.LoadOrStore(l1Key, &suppressState{})
-	st := v.(*suppressState)
-	// The per-key decline counter is only ever touched by the refresher
-	// worker that dequeued this key (one dequeue in flight per key, the
-	// workqueue's contract), so a plain increment is race-free.
-	st.declines++
-	st.reason = reason
-	if permanent || st.declines >= RefreshSuppressAfterDeclines() {
-		refreshSuppressed.Store(l1Key, reason)
-		refreshDeclines.Delete(l1Key)
-		refreshSuppressedSetTotal.Add(1)
-		return true
+	if !permanent {
+		return false
 	}
-	return false
+	refreshSuppressed.Store(l1Key, reason)
+	refreshSuppressedSetTotal.Add(1)
+	return true
 }
 
 // RefreshSuppressedReason reports whether l1Key is suppressed and why.
@@ -224,37 +107,29 @@ func RefreshSuppressedReason(l1Key string) (string, bool) {
 	return v.(string), true
 }
 
-// clearRefreshSuppression forgets both the marker and the consecutive-decline
-// counter for l1Key. Called by the store on every Put (the "next real Put")
+// clearRefreshSuppression forgets the marker for l1Key. Called by the store on every Put (the "next real Put")
 // and on every eviction (the marker must not outlive its key). Cheap: two
 // sync.Map deletes, no allocation.
 func clearRefreshSuppression(l1Key string) {
 	refreshSuppressed.Delete(l1Key)
-	refreshDeclines.Delete(l1Key)
 }
 
 // resetRefreshTerminalForTest clears the suppression state and counters.
 // Called from resetRefresherForTest.
 func resetRefreshTerminalForTest() {
 	refreshSuppressed.Range(func(k, _ any) bool { refreshSuppressed.Delete(k); return true })
-	refreshDeclines.Range(func(k, _ any) bool { refreshDeclines.Delete(k); return true })
 	refreshSuppressedSetTotal.Store(0)
 	refreshSuppressedSkipsTotal.Store(0)
 	refreshDeclineNotedTotal.Store(0)
-	dropEvictTotal.Store(0)
-	dropEvictSuspendedTotal.Store(0)
-	dropEvictWarnTotal.Store(0)
+	resetKnownStaleForTest()
 }
 
 // AddRefreshTerminalCountersForTest moves the C4 counters through their
-// production atomics (no breaker, no refresher built) and marks
-// suppressedKeys synthetic keys refresh-by-traffic-only, so a cross-package
-// arm can prove the OTLP mirror reads the LIVE counters rather than
-// constants. Production callers MUST NOT use this; pair with
-// ResetRefreshTerminalForTest in t.Cleanup.
-func AddRefreshTerminalCountersForTest(dropEvict, dropEvictSuspended, suppressedSet, suppressedSkips uint64, suppressedKeys int) {
-	dropEvictTotal.Add(dropEvict)
-	dropEvictSuspendedTotal.Add(dropEvictSuspended)
+// production atomics (no refresher built) and marks suppressedKeys synthetic
+// keys refresh-by-traffic-only, so a cross-package arm can prove the OTLP mirror
+// reads the LIVE counters rather than constants. Production callers MUST NOT use
+// this; pair with ResetRefreshTerminalForTest in t.Cleanup.
+func AddRefreshTerminalCountersForTest(suppressedSet, suppressedSkips uint64, suppressedKeys int) {
 	refreshSuppressedSetTotal.Add(suppressedSet)
 	refreshSuppressedSkipsTotal.Add(suppressedSkips)
 	for i := 0; i < suppressedKeys; i++ {
@@ -269,51 +144,28 @@ func ResetRefreshTerminalForTest() { resetRefreshTerminalForTest() }
 // RefreshTerminalStats is the read-only snapshot of the C4 counters (expvar
 // + OTLP + tests).
 type RefreshTerminalStats struct {
-	// 1.12.6 C7: tagged like refresherStats — the four counters ride the
-	// shared snowplow_refresher instrument, suppressed_keys is a gauge of
-	// its own. `stat:"-"` fields are configuration echoes or diagnostics
-	// read by the arms only.
-	DropEvictTotal          uint64 `stat:"drop_evict"`           // non-404 drop-point evictions performed
-	DropEvictSuspendedTotal uint64 `stat:"drop_evict_suspended"` // drop-point evictions refused by the breaker
-	DropEvictSuspendWarns   uint64 `stat:"-"`                    // suspension windows entered (one WARN each); arms only
-	DropEvictMaxPerMinute   int    `stat:"-"`                    // configuration echo (REFRESH_DROP_EVICT_MAX_PER_MINUTE)
-	SuppressedSetTotal      uint64 `stat:"suppressed_set"`
-	SuppressedSkipsTotal    uint64 `stat:"suppressed_skips"`
-	DeclineNotedTotal       uint64 `stat:"-"` // arms only
-	SuppressedKeys          int    `stat:"suppressed_keys" kind:"gauge" desc:"Live count of L1 keys marked refresh-by-traffic-only after repeated declines (1.12.6 #191); bounded by the store."`
-	SuppressAfterDeclines   int    `stat:"-"` // configuration echo (REFRESH_SUPPRESS_AFTER_DECLINES)
+	// 1.12.6 C7: tagged like refresherStats — the counters ride the shared
+	// snowplow_refresher instrument, suppressed_keys is a gauge of its own.
+	// `stat:"-"` fields are diagnostics read by the arms only. #547 retired the
+	// drop-point breaker's drop_evict / drop_evict_suspended counters with the
+	// breaker itself.
+	SuppressedSetTotal   uint64 `stat:"suppressed_set"`
+	SuppressedSkipsTotal uint64 `stat:"suppressed_skips"`
+	DeclineNotedTotal    uint64 `stat:"-"` // arms only
+	SuppressedKeys       int    `stat:"suppressed_keys" kind:"gauge" desc:"Live count of L1 keys marked refresh-by-traffic-only after a structurally permanent decline (1.12.6 #191, #547); bounded by the store."`
 }
 
 // RefreshTerminalStatsSnapshot reads the counters. It does NOT construct the
 // refresher singleton and it does NOT read refresherInstance at all (B1):
-// every counter it reports is a package-level atomic, so a /debug/vars
-// scrape or an OTLP collection racing the singleton's first construction is
-// an ordinary atomic load. With no refresher yet (cache-off, or before the
-// first enqueue) the breaker counters read zero.
+// every counter it reports is a package-level atomic, so a /debug/vars scrape
+// or an OTLP collection racing the singleton's first construction is an
+// ordinary atomic load.
 func RefreshTerminalStatsSnapshot() RefreshTerminalStats {
 	s := RefreshTerminalStats{
-		DropEvictTotal:          dropEvictTotal.Load(),
-		DropEvictSuspendedTotal: dropEvictSuspendedTotal.Load(),
-		DropEvictSuspendWarns:   dropEvictWarnTotal.Load(),
-		DropEvictMaxPerMinute:   RefreshDropEvictMaxPerMinute(),
-		SuppressedSetTotal:      refreshSuppressedSetTotal.Load(),
-		SuppressedSkipsTotal:    refreshSuppressedSkipsTotal.Load(),
-		DeclineNotedTotal:       refreshDeclineNotedTotal.Load(),
-		SuppressAfterDeclines:   RefreshSuppressAfterDeclines(),
+		SuppressedSetTotal:   refreshSuppressedSetTotal.Load(),
+		SuppressedSkipsTotal: refreshSuppressedSkipsTotal.Load(),
+		DeclineNotedTotal:    refreshDeclineNotedTotal.Load(),
 	}
 	refreshSuppressed.Range(func(_, _ any) bool { s.SuppressedKeys++; return true })
 	return s
-}
-
-// warnDropEvictSuspended is the one-per-window WARN.
-func warnDropEvictSuspended(key string, perMinute int, fromCL bool) {
-	slog.Warn("refresher.drop_evict_suspended",
-		slog.String("subsystem", "cache"),
-		slog.String("key_hash", key),
-		slog.Int("max_per_minute", perMinute),
-		slog.Bool("cluster_list_tier", fromCL),
-		slog.String("effect", "more deterministic refresh failures than the breaker budget in one minute — "+
-			"a mass failure (apiserver outage?) rather than a few dead objects; over-budget keys keep "+
-			"today's drop-to-TTL and stay SERVED instead of being evicted into a cold-cache storm"),
-	)
 }
