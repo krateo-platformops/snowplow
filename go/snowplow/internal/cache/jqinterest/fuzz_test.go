@@ -35,12 +35,14 @@ import (
 // JQINTEREST_FUZZ_SEED (default 603).
 
 type fuzzStats struct {
-	mu                                 sync.Mutex
-	chains, narrowed, member           int
-	trials, eqTrials, neTrials, neDiff int
-	memberTrials, emulations           int
-	okRuns, fallbackRuns               int
-	failures                           []string
+	mu                                   sync.Mutex
+	chains, narrowed, member             int
+	trials, eqTrials, neTrials, neDiff   int
+	memberTrials, emulations             int
+	absentMemberTrials, extrasCollisions int
+	nearMissTrials                       int
+	okRuns, fallbackRuns                 int
+	failures                             []string
 }
 
 func (st *fuzzStats) fail(s string) {
@@ -70,6 +72,23 @@ func fuzzEnvelope(g *gen) emuEnv {
 	}
 	if g.r.Intn(2) == 0 {
 		env.perPage, env.page = 1+g.r.Intn(5), 1+g.r.Intn(2)
+	}
+	return env
+}
+
+// chainEnvelope is fuzzEnvelope plus, one trial in eight, a request extras
+// key equal to the tracked stage's name. resolve.go newResolveRun seeds the
+// dict with the extras at top level, so jsonHandlerCore ACCUMULATES the
+// stage's response after the seed: [seed, response] (review finding 3).
+func chainEnvelope(g *gen, c Chain, st *fuzzStats) emuEnv {
+	env := fuzzEnvelope(g)
+	if g.r.Intn(8) == 0 {
+		env.extras[c.Tracked] = g.value(1)
+		if st != nil {
+			st.mu.Lock()
+			st.extrasCollisions++
+			st.mu.Unlock()
+		}
 	}
 	return env
 }
@@ -108,7 +127,7 @@ func fuzzChain(nc namedChain, seed int64, trials int, st *fuzzStats) bool {
 	found := false
 	// Read-set trials: UPDATE one item.
 	for t := 0; t < trials; t++ {
-		env := fuzzEnvelope(g)
+		env := chainEnvelope(g, nc.chain, st)
 		n := 1 + r.Intn(4)
 		items := make([]any, n)
 		for i := range items {
@@ -155,11 +174,44 @@ func fuzzChain(nc namedChain, seed int64, trials int, st *fuzzStats) bool {
 		return found
 	}
 	// Membership trials: a non-member ADD / DELETE / UPDATE.
+	// A non-member must fail EVERY disjunct, so every key path of every
+	// disjunct gets a value no constant can equal. That value is either a
+	// fresh string or, where A1 allows it, an ABSENT key: no label at all,
+	// or a cluster-scoped object with no namespace. An absent key reads as
+	// null, so it is used only when no guard can compare equal to null:
+	// - no guard's literal value set contains null;
+	// - in that trial every vocabulary key missing from the extras gets a
+	//   fresh string, so an extras-derived constant is not null either.
+	nullable := false
+	for _, d := range in.Membership.Disjuncts {
+		for _, k := range d {
+			for _, v := range k.Values {
+				if v == nil {
+					nullable = true
+				}
+			}
+		}
+	}
+	absentAllowed := func(keys []string) bool {
+		if len(keys) == 0 || keys[0] == "metadata" && len(keys) == 1 {
+			return false // metadata itself is always an object (A1)
+		}
+		return !(len(keys) == 2 && keys[0] == "metadata" && keys[1] == "name") // every object has a name
+	}
+	absentTrial := false
 	setKeys := func(it map[string]any) {
-		for _, k := range in.Membership.Keys {
+		for _, p := range in.Membership.Paths() {
 			var keys []string
-			for _, s := range k.Path {
+			for _, s := range p {
 				keys = append(keys, s.Key)
+			}
+			if absentTrial && !nullable && absentAllowed(keys) && r.Intn(2) == 0 {
+				if len(keys) == 3 && keys[0] == "metadata" && (keys[1] == "labels" || keys[1] == "annotations") && r.Intn(2) == 0 {
+					deletePath(it, keys[:2]) // no labels/annotations map at all
+				} else {
+					deletePath(it, keys)
+				}
+				continue
 			}
 			if r.Intn(5) == 0 && len(keys) > 1 && keys[0] != "metadata" {
 				// a non-member whose key path does not even resolve. Never
@@ -169,15 +221,67 @@ func fuzzChain(nc namedChain, seed int64, trials int, st *fuzzStats) bool {
 				// only once the mutable-UAF variants let it past the
 				// userAccessFilter: the corpus's own namespaceFrom
 				// (.metadata.namespace) errors on it and denies the item.
-				setPath(it, keys[:len(keys)-1], g.value(2))
+				// The parent must NOT be an object: a random object can
+				// hold the key with a matching value, which made "non-members"
+				// that were really members (found by the opt-key arm).
+				v := g.value(2)
+				if _, isObj := v.(map[string]any); isObj || v == nil {
+					v = []any{g.value(2)}
+				}
+				setPath(it, keys[:len(keys)-1], v)
 			} else {
 				setPath(it, keys, g.freshString())
 			}
 		}
 	}
+	// nonMember sets an item's keys so that it fails every disjunct. When
+	// every guard is literal, the oracle can decide membership. Half the time
+	// it then builds a NEAR miss: some key paths take a guard's literal value,
+	// for example name == "a" but namespace != "ns2". It keeps the near miss
+	// only if the claimed DNF still calls the item a non-member. That is the
+	// object a flat AND of two separate selects would wrongly skip (review
+	// finding 4).
+	_, literalDNF := claimedMember(in.Membership, map[string]any{})
+	nonMember := func(it map[string]any) {
+		setKeys(it)
+		if !literalDNF || r.Intn(2) == 0 {
+			return
+		}
+		near := deepCopy(it).(map[string]any)
+		for _, d := range in.Membership.Disjuncts {
+			for _, k := range d {
+				if r.Intn(2) == 0 {
+					var keys []string
+					for _, s := range k.Path {
+						keys = append(keys, s.Key)
+					}
+					setPath(near, keys, deepCopy(k.Values[r.Intn(len(k.Values))]))
+				}
+			}
+		}
+		if m, _ := claimedMember(in.Membership, near); !m {
+			for kk := range it {
+				delete(it, kk)
+			}
+			for kk, v := range near {
+				it[kk] = v
+			}
+			st.mu.Lock()
+			st.nearMissTrials++
+			st.mu.Unlock()
+		}
+	}
 	// Membership is the rarer, higher-stakes claim: five times the trials.
 	for t := 0; t < 5*trials; t++ {
-		env := fuzzEnvelope(g)
+		env := chainEnvelope(g, nc.chain, st)
+		absentTrial = r.Intn(3) == 0
+		if absentTrial {
+			for _, k := range g.v.keys {
+				if _, ok := env.extras[k]; !ok {
+					env.extras[k] = g.freshString()
+				}
+			}
+		}
 		var items []any
 		for i := r.Intn(4); i >= 0; i-- {
 			it := g.item()
@@ -188,7 +292,7 @@ func fuzzChain(nc namedChain, seed int64, trials int, st *fuzzStats) bool {
 			items = append(items, it)
 		}
 		nm := g.item()
-		setKeys(nm)
+		nonMember(nm)
 		pos := r.Intn(len(items) + 1)
 		withNM := append(append(append([]any{}, items[:pos]...), nm), items[pos:]...)
 		var before, after []any
@@ -200,13 +304,16 @@ func fuzzChain(nc namedChain, seed int64, trials int, st *fuzzStats) bool {
 			before, after, bDesc, aDesc = withNM, items, nm, "absent"
 		default: // UPDATE of a non-member, anything but its key
 			nm2 := g.mutate(nm, in.Reads)
-			setKeys(nm2)
+			nonMember(nm2)
 			after = append(append(append([]any{}, items[:pos]...), nm2), items[pos:]...)
 			before, bDesc, aDesc = withNM, nm, nm2
 		}
 		a, b := emulate(nc.chain, before, env), emulate(nc.chain, after, env)
 		st.mu.Lock()
 		st.memberTrials++
+		if absentTrial && !nullable {
+			st.absentMemberTrials++
+		}
 		st.emulations += 2
 		st.mu.Unlock()
 		if (okOutcome(a) || okOutcome(b)) && !sameOutcome(a, b) {
@@ -278,6 +385,11 @@ func TestF14_DifferentialFuzz_PortalCorpus(t *testing.T) {
 	t.Logf("F14: read-set trials=%d (projection-equal %d, projection-changed %d of which output-changed %d), membership trials=%d, emulations=%d",
 		st.trials, st.eqTrials, st.neTrials, st.neDiff, st.memberTrials, st.emulations)
 	t.Logf("F14: read-set emulations that resolved OK=%d, that hit the stage-filter-error fallback=%d", st.okRuns, st.fallbackRuns)
+	t.Logf("F14: membership trials whose non-member has an ABSENT key (no label / no namespace)=%d, near-miss non-members (some guards matched)=%d; trials with an extras key equal to the tracked stage=%d",
+		st.absentMemberTrials, st.nearMissTrials, st.extrasCollisions)
+	if st.absentMemberTrials == 0 || st.extrasCollisions == 0 {
+		t.Errorf("vacuous fuzz: absent-key non-member trials=%d, extras/stage collisions=%d", st.absentMemberTrials, st.extrasCollisions)
+	}
 	for _, f := range st.failures {
 		t.Errorf("%s", f)
 	}

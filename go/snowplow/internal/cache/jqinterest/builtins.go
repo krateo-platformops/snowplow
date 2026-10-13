@@ -84,7 +84,11 @@ func (s *state) builtin(f *gojq.Func, in *abs, e *env, protected bool) *abs {
 	case name == "has" && n == 1:
 		k := arg(0)
 		s.nonTotal("has", in, k)
-		s.consumeShape(in, opOther)
+		if mutated(mutHasAsKind) {
+			s.consumeKind(in, opOther)
+		} else {
+			s.consumeShape(in, opOther)
+		}
 		s.consumeWhole(k, opOther)
 		return withCU(derived("has", in, k), cu)
 	case name == "select" && n == 1:
@@ -225,7 +229,7 @@ func (s *state) selectFn(p *gojq.Query, in *abs, e *env) *abs {
 				c := s.eval(conj[i], g, e)
 				s.consumeKind(c, opTruth)
 			}
-			s.guards = append(s.guards, keys...)
+			s.guards = append(s.guards, keys)
 			return g
 		}
 	}
@@ -272,12 +276,45 @@ func (s *state) keyConjunct(q *gojq.Query, in *abs, inst int, e *env) (KeyGuard,
 		// the key navigation itself could raise an error on a non-member
 		return rollback()
 	}
-	s.consumeWhole(ref, opEq)
+	if !mutated(mutKeyNotRead) {
+		s.consumeWhole(ref, opEq)
+	}
 	return KeyGuard{
 		Path:        s.elemRel(ref.path),
 		ConstClass:  cst.constClassOf().String(),
 		ConstSource: constSource(cst),
+		Values:      literalValues(cst),
 	}, true
+}
+
+// literalValues returns every value a constant can take when each of its
+// alternatives is a literal (a stream such as ("a", "b") is a union), and nil
+// otherwise.
+func literalValues(a *abs) []any {
+	var out []any
+	var walk func(x *abs) bool
+	walk = func(x *abs) bool {
+		switch x.k {
+		case aConst:
+			if !x.hasLit || x.cc != ccLiteral {
+				return false
+			}
+			out = append(out, x.lit)
+			return true
+		case aUnion:
+			for _, y := range x.alts {
+				if !walk(y) {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	}
+	if !walk(a) || len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func constSource(a *abs) string {

@@ -23,6 +23,12 @@ const (
 	mutCatchNotStrict      = "catch-not-strict"      // try/catch does not upgrade to whole reads
 	mutUAFExcluded         = "uaf-excluded"          // the UAF namespaceFrom/nameFrom reads are dropped
 	mutUAFNameFromExcluded = "uaf-namefrom-excluded" // only the UAF nameFrom read is dropped (name-specific verbs)
+	mutBuiltinVarsFirst    = "builtin-vars-first"    // $ENV is answered as the built-in before a user binding of $ENV
+	mutPigConstWins        = "pig-const-wins"        // a stage named extras/slice is shadowed by the constant (handler.go does the opposite)
+	mutNoExtrasSeed        = "no-extras-seed"        // dict[stage] is never pre-seeded by an extras key with the stage's name
+	mutKeyFlatAND          = "key-flat-and"          // guards from separate selects are read as ONE conjunction
+	mutKeyNotRead          = "key-not-read"          // the key field of a select guard is not recorded in the read set (R2)
+	mutHasAsKind           = "has-as-kind"           // has(k) observes only the kind of its input (R5)
 	mutRRTNotStrict        = "rrt-not-strict"        // resourcesRefs fields not analysed strictly
 	mutOtherStagesSkip     = "other-stages-skipped"  // other stages' templates reading the list are ignored
 	mutDelExclParent       = "del-excl-parent"       // del(.a.b) excludes .a (too wide)

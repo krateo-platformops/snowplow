@@ -23,12 +23,23 @@
 // (chain.go, which mirrors the resolver glue it cites), axiom A1 (an
 // informer-served list item is a Kubernetes object: a JSON object whose
 // metadata is an object and whose labels/annotations are string maps), and
-// the runtime fallbacks the design (§2.4) puts in PR-2: a runtime JQ error, an
-// apiserver fall-through and a replayed edge all degrade the edge to All. The
-// differential fuzz (fuzz_test.go) checks the theorem on the portal corpus.
+// the runtime fallbacks the design (§2.4) puts in PR-2. Each of these degrades
+// the edge to All:
+//   - a runtime JQ error: a stage filter (raw passthrough), a widget
+//     widgetDataTemplate, or a resourcesRefsTemplate ITERATOR. The iterator
+//     error is a hard widget error whose status.error can carry value
+//     previews, so the fallback must cover that path too;
+//   - an apiserver fall-through;
+//   - a replayed edge.
+//
+// Request extras whose key equals a stage name are modelled in the analysis
+// itself (chain.go: dict[stage] pre-seeded, then accumulated), so they need
+// no runtime rule. The differential fuzz (fuzz_test.go) checks the theorem on
+// the portal corpus.
 package jqinterest
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -57,9 +68,31 @@ type Interest struct {
 	MembershipBlockers []string
 }
 
-// Membership is the proven membership-key shape.
+// Membership is the proven membership-key shape, in disjunctive normal form:
+// an object can affect the cell only if, for SOME disjunct, it satisfies
+// EVERY guard in it. One select contributes one disjunct (the AND of its
+// leading key conjuncts). Two separate selects contribute two disjuncts: an
+// object that passes either one is a member.
 type Membership struct {
-	Keys []KeyGuard
+	Disjuncts [][]KeyGuard
+}
+
+// Paths lists every key path in any disjunct (deduplicated, sorted). An
+// object whose values on all of these paths are unchanged keeps its
+// membership.
+func (m *Membership) Paths() []Path {
+	seen := map[string]bool{}
+	var out []Path
+	for _, d := range m.Disjuncts {
+		for _, k := range d {
+			if s := k.Path.String(); !seen[s] {
+				seen[s] = true
+				out = append(out, k.Path)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
+	return out
 }
 
 // KeyGuard is one `select(.path == constant)` that admits only the cell's own
@@ -71,10 +104,29 @@ type KeyGuard struct {
 	ConstClass string
 	// ConstSource is a printable description of the constant.
 	ConstSource string
+	// Values, when non-nil, is the complete set of values the constant can
+	// take. It is set when every alternative is a literal, for example the
+	// stream ("a", "b"): the guard then admits an object whose key is any of
+	// them. When it is nil, the value comes from the cell constants at run
+	// time (ConstClass extras) and ConstSource describes where.
+	Values []any
 }
 
 func (k KeyGuard) String() string {
+	if k.Values != nil {
+		return fmt.Sprintf("%s in %s", k.Path, valuesString(k.Values))
+	}
 	return fmt.Sprintf("%s == <%s:%s>", k.Path, k.ConstClass, k.ConstSource)
+}
+
+func valuesString(vs []any) string {
+	parts := make([]string, len(vs))
+	for i, v := range vs {
+		b, _ := json.Marshal(v)
+		parts[i] = string(b)
+	}
+	sort.Strings(parts)
+	return "{" + strings.Join(parts, ", ") + "}"
 }
 
 func (in Interest) String() string {
@@ -87,11 +139,7 @@ func (in Interest) String() string {
 	}
 	s := "reads{" + strings.Join(parts, "; ") + "}"
 	if in.Membership != nil {
-		ks := make([]string, len(in.Membership.Keys))
-		for i, k := range in.Membership.Keys {
-			ks[i] = k.String()
-		}
-		s += " member{" + strings.Join(ks, " AND ") + "}"
+		s += " member{" + in.Membership.String() + "}"
 	}
 	return s
 }
@@ -142,12 +190,65 @@ func (s *state) interest() Interest {
 	out := Interest{Reads: normalizeReads(items)}
 	if len(s.guards) > 0 {
 		if len(s.violations) == 0 {
-			out.Membership = &Membership{Keys: dedupGuards(s.guards)}
+			out.Membership = &Membership{Disjuncts: dedupDisjuncts(s.guards)}
 		} else {
 			out.MembershipBlockers = append([]string(nil), s.violations...)
 		}
 	}
 	return out
+}
+
+func (m *Membership) String() string {
+	ds := make([]string, len(m.Disjuncts))
+	for i, d := range m.Disjuncts {
+		ks := make([]string, len(d))
+		for j, k := range d {
+			ks[j] = k.String()
+		}
+		ds[i] = "(" + strings.Join(ks, " AND ") + ")"
+	}
+	return strings.Join(ds, " OR ")
+}
+
+// dedupDisjuncts normalises each disjunct and drops repeats (the same select
+// used twice is one disjunct). Under mutKeyFlatAND every guard of every
+// select is merged into ONE conjunction. That is the over-narrowing that
+// finding 4 of the #603 PR-1 review describes.
+func dedupDisjuncts(ds [][]KeyGuard) [][]KeyGuard {
+	if mutated(mutKeyFlatAND) {
+		var flat []KeyGuard
+		for _, d := range ds {
+			flat = append(flat, d...)
+		}
+		ds = [][]KeyGuard{flat}
+	}
+	seen := map[string]bool{}
+	var out [][]KeyGuard
+	var keys []string
+	for _, d := range ds {
+		g := dedupGuards(d)
+		parts := make([]string, len(g))
+		for i, k := range g {
+			parts[i] = k.String()
+		}
+		key := strings.Join(parts, " AND ")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, g)
+		keys = append(keys, key)
+	}
+	idx := make([]int, len(out))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.Slice(idx, func(i, j int) bool { return keys[idx[i]] < keys[idx[j]] })
+	sorted := make([][]KeyGuard, len(out))
+	for i, j := range idx {
+		sorted[i] = out[j]
+	}
+	return sorted
 }
 
 func dedupGuards(gs []KeyGuard) []KeyGuard {

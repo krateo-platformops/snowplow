@@ -48,7 +48,7 @@ type state struct {
 
 	listPath   Path // the tracked list, relative to the tracked root
 	violations []string
-	guards     []KeyGuard
+	guards     [][]KeyGuard // one conjunction per select (DNF)
 	nextInst   int
 	loader     gojq.ModuleLoader
 	stack      []*gojq.FuncDef
@@ -910,20 +910,25 @@ func (s *state) evalObject(o *gojq.Object, in *abs, e *env) *abs {
 	return withCU(obj, cu)
 }
 
+// lookupVar resolves $name in gojq's order (compiler.go compileFunc): a
+// user binding (`as $x`, a `$x` function parameter, a destructured key)
+// first, then the built-in. A user may rebind a built-in name, and the
+// binding wins. The krateo-platformops/gojq fork has no $__loc__, so an
+// unbound $__loc__ is a compile error, and it gets no special case here.
 func (s *state) lookupVar(name string, in *abs, e *env) *abs {
-	switch name {
-	case "$__loc__":
-		return withCU(literal(map[string]any{"file": "<stdin>", "line": 1}, "$__loc__"), anyCU(in))
-	case "$ENV":
+	if name == "$ENV" && mutated(mutBuiltinVarsFirst) {
+		return withCU(literal(map[string]any{}, "$ENV"), anyCU(in))
+	}
+	if v, ok := e.lookupVar(name); ok {
+		return withCU(v, anyCU(in))
+	}
+	if name == "$ENV" {
 		// No environ loader is installed anywhere in snowplow
 		// (jqvalue.go / plumbing jqutil): $ENV is the constant {}.
 		return withCU(literal(map[string]any{}, "$ENV"), anyCU(in))
 	}
-	v, ok := e.lookupVar(name)
-	if !ok {
-		top("unbound variable %s", name)
-	}
-	return withCU(v, anyCU(in))
+	top("unbound variable %s", name)
+	return nil
 }
 
 func (s *state) bindPattern(p *gojq.Pattern, v, in *abs, ne *env) {

@@ -130,29 +130,51 @@ func (s *state) chain(c Chain) {
 		s.uaf--
 	}
 
-	// The stage filter's input (handler.go jsonHandlerCore): {extras?,
-	// <stage>: envelope, slice?}.
+	// The stage filter's input (handler.go jsonHandlerCore) is built in this
+	// order: pig["extras"] (when there are extras), then pig[<stage>] =
+	// envelope, then pig["slice"] (when the dict has a slice). So a stage
+	// named "extras" sees its OWN response under .extras, and a stage named
+	// "slice" sees the response OR the slice, depending on whether the
+	// request is paginated.
 	pig := &abs{k: aObj, fields: map[string]*abs{
-		tracked.Name: root,
-		"extras":     constOf(ccExtras, "extras"),
-		"slice":      constOf(ccExtras, "slice"),
+		"extras": constOf(ccExtras, "extras"),
+		"slice":  constOf(ccExtras, "slice"),
 	}}
+	pig.fields[tracked.Name] = root
+	if tracked.Name == "slice" {
+		pig.fields["slice"] = union(root, constOf(ccExtras, "slice"))
+	}
+	if mutated(mutPigConstWins) && (tracked.Name == "extras" || tracked.Name == "slice") {
+		pig.fields[tracked.Name] = constOf(ccExtras, tracked.Name)
+	}
 	out := root
 	if tracked.Filter != nil {
 		out = s.eval(mustParse(*tracked.Filter), pig, e)
 	}
-	// Accumulation into dict[stage] (handler.go): a single call stores the
-	// value; an iterator fan-out appends further calls' values, splicing a
-	// filter-produced array. The other calls are other edges (constant here).
-	dictS := out
+	// Accumulation into dict[stage] (handler.go jsonHandlerCore merge):
+	// - when dict[stage] is unset, the call stores its value;
+	// - when dict[stage] is set, the value is appended, and a filter-produced
+	//   array is spliced in.
+	// dict[stage] can already be set for two reasons:
+	// - an iterator fan-out's earlier calls (other edges: constant here);
+	// - the request extras, or the slice. resolve.go newResolveRun seeds the
+	//   dict with the extras at TOP level, and the extras keys are chosen by
+	//   the client, so ANY stage name can collide. The seed is already in the
+	//   cell key, so it is a constant.
+	// Because of the second reason, the accumulated shape is always possible.
+	seed := constOf(ccExtras, "extras-seed")
 	if tracked.DependsOn != "" {
-		acc := &abs{k: aArr, elem: union(constOf(ccOther, "other-calls"), out)}
-		if tracked.Filter != nil {
-			sp := s.iterate(out, true)
-			acc.elem = union(acc.elem, stripCU(sp))
-			acc.elemCU = acc.elemCU || anyCU(sp) || out.k == aArr && out.elemCU
-		}
-		dictS = union(out, acc)
+		seed = union(seed, constOf(ccOther, "other-calls"))
+	}
+	acc := &abs{k: aArr, elem: union(seed, out)}
+	if tracked.Filter != nil {
+		sp := s.iterate(out, true)
+		acc.elem = union(acc.elem, stripCU(sp))
+		acc.elemCU = acc.elemCU || anyCU(sp) || out.k == aArr && out.elemCU
+	}
+	dictS := union(out, acc)
+	if mutated(mutNoExtrasSeed) && tracked.DependsOn == "" {
+		dictS = out
 	}
 	// The resolver dict (resolve.go newResolveRun): request extras + slice +
 	// every stage's output under its name.

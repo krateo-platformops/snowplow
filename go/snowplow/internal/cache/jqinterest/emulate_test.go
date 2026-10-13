@@ -419,8 +419,16 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 	for _, rr := range c.Widget.ResourcesRefs {
 		var elems []any
 		if q, ok := MaybeQuery(rr.Iterator); ok && q != "" {
-			_ = jqutil.ForEach(context.Background(), jqutil.EvalOptions{Query: q, Unquote: true, Data: ds},
-				func(a any) error { elems = append(elems, a); return nil })
+			// An iterator error is a HARD widget error. The widget's
+			// status.error can carry value previews, so the cell depends on
+			// whatever the error message embeds. PR-2's runtime rule
+			// "widget JQ error → interest 0" covers it. A body built this way
+			// is never narrowed, so it is a fallback here and is not compared
+			// (it was swallowed before the #603 PR-1 review).
+			if err := jqutil.ForEach(context.Background(), jqutil.EvalOptions{Query: q, Unquote: true, Data: ds},
+				func(a any) error { elems = append(elems, a); return nil }); err != nil {
+				return emuOutcome{fallback: "resourcesRefsTemplate iterator error"}
+			}
 		} else {
 			elems = []any{ds}
 		}

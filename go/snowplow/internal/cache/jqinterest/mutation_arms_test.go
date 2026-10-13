@@ -81,13 +81,37 @@ func soundnessArms() []arm {
 			oneStage(`[.s.items[] | select(.spec.k.v == "x")]`, "")},
 		{"F3b-agg: an aggregate over non-members blocks membership", mutKeyNoAggregation,
 			oneStage(`{a: [.s.items[] | select(.metadata.name == "x")], n: ([.s.items[] | 1] | length)}`, "")},
+		// #603 PR-1 review (reviewer-603) findings 1-5.
+		{"A1: a user binding of $ENV shadows the built-in", mutBuiltinVarsFirst,
+			oneStage(`[.s.items[] | .spec.secret] as $ENV | $ENV`, "")},
+		{"A2: a $ENV function parameter shadows the built-in", mutBuiltinVarsFirst,
+			oneStage(`def f($ENV): $ENV; [.s.items[] | f(.spec.secret)]`, "")},
+		{"A4: a stage named extras keeps its own response under .extras", mutPigConstWins,
+			Chain{RA: RESTAction{Stages: []Stage{{Name: "extras", Filter: strp(`[.extras.items[] | .spec.secret]`)}}}, Tracked: "extras"}},
+		{"A5: a stage named slice sees its response when the request is not paginated", mutPigConstWins,
+			Chain{RA: RESTAction{Stages: []Stage{{Name: "slice", Filter: strp(`[.slice.items[] | .spec.secret]`)}}}, Tracked: "slice"}},
+		{"A6: an extras key equal to the stage name pre-seeds dict[stage]: [seed, response]", mutNoExtrasSeed,
+			oneStage("", `.s | if type == "array" then .[1].items[0].spec.secret else "n" end`)},
+		{"M4: two selects are two disjuncts, not one AND", mutKeyFlatAND,
+			oneStage(`[.s.items[] | select(.metadata.name == "a")] + [.s.items[] | select(.metadata.namespace == "ns2")]`, "")},
+		{"R2: the key field of a select guard is read", mutKeyNotRead,
+			oneStage(`[.s.items[] | select(.metadata.name == "a") | .spec.v]`, "")},
+		{"R5: has(k) observes the key set, not only the kind", mutHasAsKind,
+			oneStage(`[.s.items[] | .spec | has("x")]`, "")},
 	}
 }
 
 // armWitness: per mutation, one UPDATE the random search rarely builds; it
 // joins the search as a fixed trial.
 func armWitness() map[string]*[2]map[string]any {
-	return map[string]*[2]map[string]any{mutSortByAsNav: sortWitness()}
+	return map[string]*[2]map[string]any{
+		mutSortByAsNav: sortWitness(),
+		// reviewer-603's R2 witness: the name a -> b moves the object out of
+		// select(.metadata.name == "a").
+		mutKeyNotRead: {advItem("a", "ns1", map[string]any{"v": "1"}), advItem("b", "ns1", map[string]any{"v": "1"})},
+		// reviewer-603's R5 witness: adding key x flips has("x").
+		mutHasAsKind: {advItem("a", "ns1", map[string]any{"v": "1"}), advItem("a", "ns1", map[string]any{"v": "1", "x": 1.0})},
+	}
 }
 
 // sortWitness: two elements; raising the first one's sort key past the

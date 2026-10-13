@@ -205,7 +205,7 @@ func fuzzPair(p cellPair, seed int64, trials int, st *pairStats) bool {
 	r := rand.New(rand.NewSource(seed))
 	g := &gen{r: r, v: mergeVocab(chainVocab(p.a.chain), chainVocab(p.b.chain))}
 	for t := 0; t < trials; t++ {
-		env := fuzzEnvelope(g)
+		env := chainEnvelope(g, p.a.chain, nil)
 		n := 1 + r.Intn(4)
 		items := make([]any, n)
 		for i := range items {
