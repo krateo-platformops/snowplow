@@ -559,7 +559,7 @@ func sourceNegativeArms() []namedChain {
 }
 
 func allSourceChains(t *testing.T) []namedChain {
-	_, chains := loadCorpus(t)
+	_, chains := corpusForRun(t)
 	chains = append(chains, uafVariants(chains)...)
 	for _, a := range soundnessArms() {
 		chains = append(chains, namedChain{name: a.name, chain: a.chain})

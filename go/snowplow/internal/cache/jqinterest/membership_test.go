@@ -180,7 +180,7 @@ func TestKeyGuard_EveryClaimedGuardIsDecidable(t *testing.T) {
 	}
 	// The contract over everything the package analyses: corpus chains,
 	// mutable-UAF variants, and every arm.
-	_, chains := loadCorpus(t)
+	_, chains := corpusForRun(t)
 	chains = append(chains, uafVariants(chains)...)
 	for _, a := range soundnessArms() {
 		chains = append(chains, namedChain{name: a.name, chain: a.chain})
