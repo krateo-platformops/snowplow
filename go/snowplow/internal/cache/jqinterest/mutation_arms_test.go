@@ -109,12 +109,27 @@ func soundnessArms() []arm {
 func armWitness() map[string]*[2]map[string]any {
 	return map[string]*[2]map[string]any{
 		mutSortByAsNav: sortWitness(),
+		// #663: the random search needs ~750 trials to flip one element's
+		// truthiness with its kind unchanged; the default budget is 500.
+		// false -> true keeps every kind and the length, and changes
+		// `// empty` and select(.).
+		mutAltNoTruth:    truthWitness(),
+		mutSelectNoTruth: truthWitness(),
 		// reviewer-603's R2 witness: the name a -> b moves the object out of
 		// select(.metadata.name == "a").
 		mutKeyNotRead: {advItem("a", "ns1", map[string]any{"v": "1"}), advItem("b", "ns1", map[string]any{"v": "1"})},
 		// reviewer-603's R5 witness: adding key x flips has("x").
 		mutHasAsKind: {advItem("a", "ns1", map[string]any{"v": "1"}), advItem("a", "ns1", map[string]any{"v": "1", "x": 1.0})},
 	}
+}
+
+// truthWitness: one list element turns from false to true.
+func truthWitness() *[2]map[string]any {
+	mk := func(v bool) map[string]any {
+		return map[string]any{"metadata": map[string]any{"name": "o", "namespace": "ns1"},
+			"spec": map[string]any{"list": []any{v}}}
+	}
+	return &[2]map[string]any{mk(false), mk(true)}
 }
 
 // sortWitness: two elements; raising the first one's sort key past the
@@ -176,8 +191,6 @@ func witnessCounterexample(a arm) bool {
 	x, y := emulate(a.chain, []any{before}, emuEnv{identity: 1}), emulate(a.chain, []any{after}, emuEnv{identity: 1})
 	return (okOutcome(x) || okOutcome(y)) && !sameOutcome(x, y)
 }
-
-const armTrials = 2000
 
 func TestSoundnessArms_GreenWithEveryRule(t *testing.T) {
 	for i, a := range soundnessArms() {

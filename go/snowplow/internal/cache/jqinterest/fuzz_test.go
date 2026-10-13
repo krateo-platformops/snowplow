@@ -3,6 +3,7 @@ package jqinterest
 import (
 	"bytes"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"os"
 	"runtime"
@@ -353,6 +354,16 @@ func envInt(name string, def int) int {
 	return def
 }
 
+// chainSeed derives a chain's fuzz seed from its NAME, not its position: a
+// chain gets the same trials in the whole corpus and in the stratified
+// subset, so a counterexample the exhaustive run finds on a pinned chain is
+// found by the subset run too (#663).
+func chainSeed(seed int64, name string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	return seed*1_000_003 + int64(h.Sum64()>>1)
+}
+
 func runFuzz(chains []namedChain, seed int64, trials int) *fuzzStats {
 	st := &fuzzStats{}
 	work := make(chan int)
@@ -362,7 +373,7 @@ func runFuzz(chains []namedChain, seed int64, trials int) *fuzzStats {
 		go func() {
 			defer wg.Done()
 			for i := range work {
-				fuzzChain(chains[i], seed*1_000_003+int64(i), trials, st)
+				fuzzChain(chains[i], chainSeed(seed, chains[i].name), trials, st)
 			}
 		}()
 	}
@@ -376,12 +387,13 @@ func runFuzz(chains []namedChain, seed int64, trials int) *fuzzStats {
 
 // TestF14_DifferentialFuzz_PortalCorpus is F14 over the portal corpus.
 func TestF14_DifferentialFuzz_PortalCorpus(t *testing.T) {
-	_, chains := loadCorpus(t)
+	_, chains := corpusForRun(t)
 	trials := envInt("JQINTEREST_FUZZ_TRIALS", 6)
 	seed := int64(envInt("JQINTEREST_FUZZ_SEED", 603))
 	if m := os.Getenv("JQINTEREST_MUTATION"); m != "" {
-		// RED-first evidence on the WHOLE corpus: run with one analysis rule
-		// switched off (see mutation.go); this test must then fail.
+		// RED-first evidence: run with one analysis rule switched off (see
+		// mutation.go); this test must then fail. On the stratified subset by
+		// default; on the WHOLE corpus with -tags jqinterest_exhaustive.
 		testMutations = map[string]bool{m: true}
 		defer func() { testMutations = nil }()
 		t.Logf("MUTATION %q is ON: this run must find a counterexample", m)

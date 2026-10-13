@@ -145,6 +145,48 @@ func sharedListPairs(chains []namedChain) (pairs []cellPair, lists int) {
 	return pairs, lists
 }
 
+// sharedListPrefixes: for every shared list, its members up to the last
+// one sharedListPairs pairs (in its name order). A subset that keeps them
+// yields exactly the same pairs as the whole corpus: every member it adds
+// sorts after them and, as the whole corpus already shows, pairs with none
+// of the earlier members inside the per-list budget (#663).
+func sharedListPrefixes(chains []namedChain) []string {
+	groups := map[string][]namedChain{}
+	var order []string
+	for _, nc := range chains {
+		if len(nc.chain.RA.Stages) == 0 || !narrowedListChain(nc.chain) {
+			continue
+		}
+		k := fmt.Sprintf("%p#%s", &nc.chain.RA.Stages[0], nc.chain.Tracked)
+		if _, ok := groups[k]; !ok {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], nc)
+	}
+	var out []string
+	for _, k := range order {
+		g := groups[k]
+		sort.Slice(g, func(i, j int) bool { return g[i].name < g[j].name })
+		n, last := 0, -1
+		for i := 0; i < len(g) && n < maxPairsPerList; i++ {
+			ri := Analyze(g[i].chain, jqsupport.ModuleLoader()).String()
+			for j := i + 1; j < len(g) && n < maxPairsPerList; j++ {
+				if Analyze(g[j].chain, jqsupport.ModuleLoader()).String() == ri {
+					continue
+				}
+				n++
+				if j > last {
+					last = j
+				}
+			}
+		}
+		for i := 0; i <= last; i++ {
+			out = append(out, g[i].name)
+		}
+	}
+	return out
+}
+
 func mergeVocab(a, b vocab) vocab {
 	var v vocab
 	seenC, seenK, seenS := map[string]bool{}, map[string]bool{}, map[string]bool{}
@@ -269,7 +311,7 @@ func runPairFuzz(pairs []cellPair, seed int64, trials int) *pairStats {
 		go func() {
 			defer wg.Done()
 			for i := range work {
-				fuzzPair(pairs[i], seed*2_000_003+int64(i), trials, st)
+				fuzzPair(pairs[i], chainSeed(seed*2+1, pairs[i].name), trials, st)
 			}
 		}()
 	}

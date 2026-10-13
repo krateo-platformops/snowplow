@@ -1,0 +1,38 @@
+# The exhaustive internal/cache/jqinterest sweep (#663): the whole portal corpus
+# (not the stratified subset the per-PR `checks / test` runs), 2000 fuzz trials
+# per soundness arm, and TestCorpusSubset_IsCurrent, which fails when the
+# committed subset (testdata/corpus_subset.json) no longer covers every stratum.
+# Under -race it does not fit the reusable go-checks' per-package timeout, so it
+# runs here, nightly and on demand, with its own explicit -timeout (this
+# package only).
+name: jqinterest-exhaustive
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - go/snowplow/internal/cache/jqinterest/**
+      - .github/workflows/jqinterest-exhaustive.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  exhaustive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: go/snowplow
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go/snowplow/go.mod
+      - name: Exhaustive jqinterest sweep
+        run: >-
+          go test -race -count=1 -v
+          -tags=unit,integration,jqinterest_exhaustive
+          -timeout 60m ./internal/cache/jqinterest
