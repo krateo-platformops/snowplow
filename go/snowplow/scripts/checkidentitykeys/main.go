@@ -123,6 +123,7 @@ var identityBoundReuseKeys = []struct{ method, recvFrom string }{
 var storeRegistry = map[string]string{
 	"cache.ResolvedCacheStore.index":                  "class-keyed (identity-free classes re-gated: widgetContent→gateWidgetEnvelope, apistage→gateContentEnvelope)",
 	"cache.ResolvedCacheStore.tombstones":             "no-content",
+	"cache.impCapMemoT.entries":                       "no-content (#608 impersonate verdict per principal for snowplow's OWN credential; cleared per RBACGen)",
 	"cache.SeedResolveMemo.m":                         "class-keyed (R4)",
 	"cache.seedMemoValue.Body":                        "class-keyed (the value of SeedResolveMemo, R4)",
 	"cache.sliceabilityMemo.verdicts":                 "no-content (verdict per raKey × shape; raKey class-keyed)",
