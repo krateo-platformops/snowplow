@@ -45,6 +45,14 @@
 //	    revalidated in the BACKGROUND by the refresher under its own identity —
 //	    never read through, never resolved under the requester, never written
 //	    from a per-requester resolve. It heals once the refresher can resolve.
+//	F10 reviewer-625 — the RESTAction handler's demand-revalidation trigger:
+//	    GET-by-name /call of the composition RESTAction, K=2 × M=3. A known-stale
+//	    RA cell is served, then revalidated under the requester; the next GET
+//	    carries the new condition.
+//	F11 reviewer-625 — the RAFullList read-through: the widget's page comes
+//	    from the REAL apiref.Resolve of the composition-list RESTAction. A
+//	    known-stale full list is read through, never Go-sliced into a new
+//	    widget cell.
 //	F9  team ruling (b) — a known-stale cell whose key is suppressed for a
 //	    structurally-permanent reason starts NO demand revalidation; the skip
 //	    is counted on known_stale_revalidation_skipped_total.
@@ -85,8 +93,10 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -102,6 +112,7 @@ import (
 var (
 	k547CompGVR   = schema.GroupVersionResource{Group: "composition.krateo.io", Version: "v1-2-2", Resource: "fireworksapps"}
 	k547WidgetGVR = schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "tables"}
+	k547RAGVR     = schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
 )
 
 const (
@@ -110,6 +121,7 @@ const (
 	k547WName   = "list-composition-detail-conditions"
 	k547M       = 3
 	k547Changed = 1 // the composition the portal write UPDATEs
+	k547RAName  = "composition-list"
 )
 
 // k547Cohorts are the K=2 cohorts: different users on different bindings, so
@@ -153,6 +165,11 @@ type k547Harness struct {
 	// `found` — a cluster LIST of compositions resolved by the REAL api-stage
 	// resolver through its identity-free content cell — instead of a direct read.
 	contentMode bool
+
+	// apiRefMode (F11): the widget's data comes from the REAL apiref.Resolve of
+	// the composition-list RESTAction at a page (PerPage=k547M, Page=1), so the
+	// request is served by the page-independent RAFullList cell (Go-sliced).
+	apiRefMode bool
 }
 
 type k547Block struct {
@@ -204,6 +221,7 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 	listKinds := map[schema.GroupVersionResource]string{
 		k547CompGVR:                    "FireworksAppList",
 		k547WidgetGVR:                  "TableList",
+		k547RAGVR:                      "RESTActionList",
 		rbacGVR("clusterrolebindings"): "ClusterRoleBindingList",
 		rbacGVR("clusterroles"):        "ClusterRoleList",
 		rbacGVR("rolebindings"):        "RoleBindingList",
@@ -214,10 +232,11 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 	seed := []runtime.Object{
 		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "k547-reader"}, Rules: []rbacv1.PolicyRule{{
 			Verbs:     []string{"get", "list"},
-			APIGroups: []string{k547CompGVR.Group, k547WidgetGVR.Group},
-			Resources: []string{k547CompGVR.Resource, k547WidgetGVR.Resource},
+			APIGroups: []string{k547CompGVR.Group, k547WidgetGVR.Group, k547RAGVR.Group},
+			Resources: []string{k547CompGVR.Resource, k547WidgetGVR.Resource, k547RAGVR.Resource},
 		}}},
 		k547Widget(),
+		k547RA(),
 	}
 	for _, c := range k547Cohorts {
 		seed = append(seed, &rbacv1.ClusterRoleBinding{
@@ -243,7 +262,7 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 		wcancel()
 		t.Fatalf("NewResourceWatcher: %v", err)
 	}
-	for _, gvr := range []schema.GroupVersionResource{k547CompGVR, k547WidgetGVR} {
+	for _, gvr := range []schema.GroupVersionResource{k547CompGVR, k547WidgetGVR, k547RAGVR} {
 		_, syncCh := rw.EnsureResourceType(gvr)
 		select {
 		case <-syncCh:
@@ -271,11 +290,15 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 
 	h := &k547Harness{t: t, dyn: dyn, mode: mode, widgetU: k547Widget()}
 	r1 := setFetchObjectForTest(func(req *http.Request) objects.Result {
+		if req.URL.Query().Get("resource") == k547RAGVR.Resource {
+			return objects.Result{GVR: k547RAGVR, Unstructured: k547RA()}
+		}
 		return objects.Result{GVR: k547WidgetGVR, Unstructured: h.widgetU.DeepCopy()}
 	})
 	r2 := setCheckDispatchRBACForTest(func(context.Context, schema.GroupVersionResource, string) bool { return true })
 	r3 := setWidgetsResolveForTest(h.resolve)
-	t.Cleanup(func() { r3(); r2(); r1() })
+	r4 := setRestactionsResolveForTest(h.resolveRESTAction)
+	t.Cleanup(func() { r4(); r3(); r2(); r1() })
 
 	// The production RefreshFunc body, for the per-cohort class and the
 	// identity-free widget content class.
@@ -332,6 +355,113 @@ func k547APIServer(t *testing.T, h *k547Harness) *httptest.Server {
 	return srv
 }
 
+// k547RASliceJQ lists the compositions cluster-wide, sorted, as ONE top-level
+// array (the Ship-4a sliceable shape the RAFullList cell is Go-sliced from).
+const k547RASliceJQ = `
+{
+  comps: (
+    ((.comps.items // []) | map({ns: .metadata.namespace, name: .metadata.name, conditions: .status.conditions})) as $items
+    | ($items | sort_by(.ns + "/" + .name)) as $sorted
+    | (.slice.offset  // 0)                 as $offset
+    | (.slice.perPage // ($sorted | length)) as $perPage
+    | [ $sorted | length as $len | range($offset; $offset + $perPage) | select(. < $len) | $sorted[.] ]
+  )
+}
+`
+
+// k547RA is the composition-list RESTAction: one api stage LISTing the
+// compositions cluster-wide, filtered into the sliceable shape.
+func k547RA() *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": k547RAGVR.Group + "/" + k547RAGVR.Version,
+		"kind":       "RESTAction",
+		"metadata":   map[string]any{"name": k547RAName, "namespace": k547WNS},
+		"spec": map[string]any{
+			"api": []any{map[string]any{
+				"name": "comps", "verb": "GET",
+				"path": "/apis/" + k547CompGVR.Group + "/" + k547CompGVR.Version + "/" + k547CompGVR.Resource,
+			}},
+			"filter": k547RASliceJQ,
+		},
+	}}
+}
+
+// resolveViaApiRef is F11's widget data source: the REAL apiref.Resolve of the
+// composition-list RESTAction at a page, which serves the page from (or fills)
+// the identity-bound RAFullList cell. Returns composition ns/name's conditions.
+func (h *k547Harness) resolveViaApiRef(ctx context.Context, ns, name string) ([]any, bool) {
+	rctx := cache.WithServeWatcher(ctx, cache.Global())
+	rctx = cache.WithInternalEndpoint(rctx, &endpoints.Endpoint{ServerURL: "http://127.0.0.1:1"})
+	out, err := apiref.Resolve(rctx, apiref.ResolveOptions{
+		RC: &rest.Config{Host: "http://127.0.0.1:1"},
+		ApiRef: templates.ObjectReference{
+			Reference:  templates.Reference{Name: k547RAName, Namespace: k547WNS},
+			Resource:   k547RAGVR.Resource,
+			APIVersion: k547RAGVR.Group + "/" + k547RAGVR.Version,
+		},
+		PerPage: k547M, Page: 1,
+	})
+	if err != nil {
+		h.t.Logf("apiref.Resolve: %v", err)
+		return nil, false
+	}
+	items, _ := out["comps"].([]any)
+	for _, it := range items {
+		m, _ := it.(map[string]any)
+		if m["name"] == name && m["ns"] == ns {
+			conds, _ := m["conditions"].([]any)
+			return conds, true
+		}
+	}
+	return nil, false
+}
+
+// resolveRESTAction is the restactionsResolveFn seam (F10): it reads the
+// composition named by the extras LIVE, records the inner-call dep edge on the
+// L1 key being filled, and renders its conditions into the RA status.
+func (h *k547Harness) resolveRESTAction(ctx context.Context, opts restactions.ResolveOptions) (*templates.RESTAction, error) {
+	name, _ := opts.Extras["name"].(string)
+	ns, _ := opts.Extras["namespace"].(string)
+	if name == fmt.Sprintf("comp-%d", k547Changed) && !cache.BackgroundResolveFromContext(ctx) {
+		h.custCalls.Add(1)
+	}
+	u, err := h.dyn.Resource(k547CompGVR).Namespace(ns).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if l1 := cache.L1KeyFromContext(ctx); l1 != "" {
+		cache.Deps().Record(ctx, l1, k547CompGVR, ns, name)
+	}
+	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	raw, _ := json.Marshal(map[string]any{"conditions": conds})
+	out := opts.In.DeepCopy()
+	out.Status = &runtime.RawExtension{Raw: raw}
+	return out, nil
+}
+
+// getRA issues the production GET-by-name /call for the RESTAction, cohort k,
+// composition m, and returns the rendered condition reason and status code.
+func (h *k547Harness) getRA(k, m int) (string, int) {
+	h.t.Helper()
+	ex, _ := json.Marshal(k547Extras(m))
+	u := "/call?apiVersion=" + url.QueryEscape(k547RAGVR.Group+"/"+k547RAGVR.Version) +
+		"&resource=" + k547RAGVR.Resource + "&name=" + k547RAName + "&namespace=" + k547WNS +
+		"&extras=" + url.QueryEscape(string(ex))
+	rec := httptest.NewRecorder()
+	RESTAction().ServeHTTP(rec, httptest.NewRequest("GET", u, nil).WithContext(k547ReqCtx(k)))
+	var obj map[string]any
+	if json.Unmarshal(rec.Body.Bytes(), &obj) != nil {
+		return "", rec.Code
+	}
+	conds, _, _ := unstructured.NestedSlice(obj, "status", "conditions")
+	if len(conds) == 0 {
+		return "", rec.Code
+	}
+	c, _ := conds[0].(map[string]any)
+	r, _ := c["reason"].(string)
+	return r, rec.Code
+}
+
 // resolve is the shared widgetsResolveFn seam. It reads the composition named
 // by the extras LIVE, records the inner-call dep edge on the L1 key being
 // filled (resolve.go's innerCall edge, on whatever key the caller threaded),
@@ -381,7 +511,13 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 		}
 	}
 	var conds []any
-	if h.contentMode {
+	if h.apiRefMode {
+		var found bool
+		conds, found = h.resolveViaApiRef(ctx, ns, name)
+		if !found {
+			return nil, fmt.Errorf("composition %s/%s not in the apiRef full list", ns, name)
+		}
+	} else if h.contentMode {
 		var found bool
 		conds, found = h.resolveFoundStage(ctx, ns, name)
 		if !found {
@@ -1061,5 +1197,128 @@ func TestIssue547_F8_AFreshAcceptedPutByAnyCarrierEndsKnownStale(t *testing.T) {
 	}
 	if got := h.custCalls.Load() - c0; got != 0 {
 		t.Fatalf("F8 RED: the GET of a fresh cell started %d redundant demand revalidation(s)", got)
+	}
+}
+
+// k547RefresherDenied is the refresher-only failure injected at the RefreshFunc
+// seam for a class whose top-level resolve the harness does not fake (F10, F11).
+func k547RefresherDenied(context.Context, string, cache.ResolvedKeyInputs) error {
+	return apierrors.NewForbidden(schema.GroupResource{Group: k547CompGVR.Group, Resource: k547CompGVR.Resource},
+		"", errors.New("refresher identity denied (injected at the RefreshFunc seam)"))
+}
+
+// F10 (reviewer-625) — the RESTAction class's demand-revalidation trigger at the
+// production boundary: GET-by-name /call of the composition RESTAction, K=2 × M=3.
+// The background refresh of the changed composition's RA cells fails across the
+// budget; the next GET serves the cached body and revalidates it on demand
+// under the requester, so the GET after it carries the new condition.
+func TestIssue547_F10_KnownStaleRESTActionIsRevalidatedOnDemandAtTheCallBoundary(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	cache.RegisterRefreshFunc("restactions", k547RefresherDenied)
+	for k := range k547Cohorts {
+		for m := 0; m < k547M; m++ {
+			if r, code := h.getRA(k, m); code != 200 || r != "v0" {
+				t.Fatalf("warm (k=%d,m=%d): code=%d reason=%q, want 200 v0", k, m, code, r)
+			}
+		}
+	}
+	d0 := k547Stat("dirty_ended_unfresh_dropped")
+	h.update(k547Changed, "v1")
+	if !k547WaitFor(t, 30*time.Second, "RA cells dropped", func() bool {
+		return k547Stat("dirty_ended_unfresh_dropped")-d0 >= int64(len(k547Cohorts))
+	}) {
+		t.Fatalf("PRECONDITION: the RA cells' background refreshes never reached the drop point (dropped +%d)",
+			k547Stat("dirty_ended_unfresh_dropped")-d0)
+	}
+	k547WaitFor(t, 5*time.Second, "queue drained", func() bool { return k547Stat("queue_depth") == 0 })
+
+	ks0, _ := k547KnownStaleServed()
+	f0 := cache.ResolvedCacheStatsByStat()["known_stale_revalidation_fresh_total"]
+	for k := range k547Cohorts {
+		if r, code := h.getRA(k, k547Changed); code != 200 || r != "v0" {
+			t.Fatalf("F10 (k=%d) GET#1: code=%d reason=%q, want 200 serving the cached RA body v0 — never a cold "+
+				"navigation", k, code, r)
+		}
+		if !k547WaitFor(t, 5*time.Second, "RA demand revalidation", func() bool {
+			return cache.ResolvedCacheStatsByStat()["known_stale_revalidation_fresh_total"]-f0 >= int64(k+1)
+		}) {
+			t.Fatalf("F10 RED (k=%d): serving a KNOWN-STALE RESTAction cell started no demand revalidation under the "+
+				"requester (revalidation_fresh +%d) — the restactions handler's trigger is missing (#547)",
+				k, cache.ResolvedCacheStatsByStat()["known_stale_revalidation_fresh_total"]-f0)
+		}
+		if r, code := h.getRA(k, k547Changed); code != 200 || r != "v1" {
+			t.Fatalf("F10 RED (k=%d) GET#2: code=%d reason=%q, want v1 after the demand revalidation", k, code, r)
+		}
+	}
+	if ks, _ := k547KnownStaleServed(); ks-ks0 != int64(len(k547Cohorts)) {
+		t.Fatalf("F10: known_stale_served_total moved %d, want %d (one stale serve per cohort)", ks-ks0, len(k547Cohorts))
+	}
+	for k := range k547Cohorts {
+		for m := 0; m < k547M; m++ {
+			if m == k547Changed {
+				continue
+			}
+			if r, code := h.getRA(k, m); code != 200 || r != "v0" {
+				t.Fatalf("F10: untouched RA cell (k=%d,m=%d) changed: code=%d reason=%q", k, m, code, r)
+			}
+		}
+	}
+}
+
+// F11 (reviewer-625) — the RAFullList read-through at the production boundary:
+// GET-by-name /call of the Conditions widget whose data is a PAGE of the
+// composition-list RESTAction, served by the REAL apiref.Resolve from the
+// identity-bound RAFullList cell. K=2 cohorts warm M=0 and M=2, which fills each
+// cohort's full-list cell. The cell's background refresh fails across the
+// budget, so it is KNOWN-STALE. Each cohort's first read of M=1 (a cold widget
+// cell) must READ THROUGH the stale full list, never Go-slice it into a new,
+// fresh-looking widget cell.
+func TestIssue547_F11_KnownStaleRAFullListIsReadThroughAtTheCallBoundary(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	h.apiRefMode = true
+	cache.RegisterRefreshFunc(cache.CacheEntryClassRAFullList, k547RefresherDenied)
+	for k := range k547Cohorts {
+		for _, m := range []int{0, 2} {
+			if r, code := h.get(k, m); code != 200 || r != "v0" {
+				t.Fatalf("warm (k=%d,m=%d): code=%d reason=%q", k, m, code, r)
+			}
+		}
+	}
+	var raKeys []string
+	cache.ResolvedCache().RangeMetadata(func(m cache.ResolvedEntryMeta) bool {
+		if m.CacheEntryClass == cache.CacheEntryClassRAFullList {
+			raKeys = append(raKeys, m.KeyHash)
+		}
+		return true
+	})
+	if len(raKeys) != len(k547Cohorts) {
+		t.Fatalf("PRECONDITION: %d RAFullList cells after warm, want one per cohort (%d)", len(raKeys), len(k547Cohorts))
+	}
+
+	h.update(k547Changed, "v1")
+	if !k547WaitFor(t, 30*time.Second, "full-list cells known-stale", func() bool {
+		for _, k := range raKeys {
+			if _, _, ks := cache.KnownStale(k); !ks {
+				return false
+			}
+		}
+		return true
+	}) {
+		t.Fatalf("PRECONDITION: the RAFullList cells never became known-stale")
+	}
+	k547WaitFor(t, 5*time.Second, "queue drained", func() bool { return k547Stat("queue_depth") == 0 })
+
+	for k := range k547Cohorts {
+		rt0 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]
+		if r, code := h.get(k, k547Changed); code != 200 || r != "v1" {
+			t.Fatalf("F11 RED (k=%d): GET served %q (code %d), want v1 READ THROUGH — the widget page was Go-sliced "+
+				"from a KNOWN-STALE RAFullList cell (#547)", k, r, code)
+		}
+		if rr, ok := h.residentReason(h.key(k, k547Changed)); !ok || rr != "v1" {
+			t.Fatalf("F11 (k=%d): the widget cell holds %q (ok=%v) — a widget cell was Put from the stale full list", k, rr, ok)
+		}
+		if rt := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]; rt <= rt0 {
+			t.Fatalf("F11 RED (k=%d): the read did not go through the known-stale full list (read_through %d -> %d)", k, rt0, rt)
+		}
 	}
 }
