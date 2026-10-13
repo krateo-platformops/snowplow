@@ -541,6 +541,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			TTLOverride: extTTL,
 			ExternalTTL: true,
 		})
+		// #547 — the plain Put is ctx-less, but this resolve's ctx carries the
+		// dep-gen sink: an external widget whose RA also reads K8s is dirty-marked
+		// through its inner-call edge, so a post-mark re-Put must end KNOWN-STALE.
+		cache.CloseKnownStaleAfterPut(ctx, cacheKey)
 		log.Info("Widget touched an external endpoint; caching with bounded external TTL (opt-in annotation)",
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("external_ttl", extTTL.String()),
