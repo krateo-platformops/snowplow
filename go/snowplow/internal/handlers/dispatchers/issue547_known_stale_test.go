@@ -53,6 +53,13 @@
 //	    from the REAL apiref.Resolve of the composition-list RESTAction. A
 //	    known-stale full list is read through, never Go-sliced into a new
 //	    widget cell.
+//	F12 reviewer-625 N3 — team ruling (b) on the shared shell's background path:
+//	    a permanently-suppressed known-stale shell is served but enqueues
+//	    nothing; the skip is counted.
+//	F13 reviewer-625 addendum — an opt-in external-TTL widget whose resolve also
+//	    reads K8s is dirty-marked like any other; its accepted re-Put (the plain
+//	    external-TTL Put) must end the known-stale state, or every read starts
+//	    another external refetch until the TTL.
 //	F9  team ruling (b) — a known-stale cell whose key is suppressed for a
 //	    structurally-permanent reason starts NO demand revalidation; the skip
 //	    is counted on known_stale_revalidation_skipped_total.
@@ -170,6 +177,13 @@ type k547Harness struct {
 	// the composition-list RESTAction at a page (PerPage=k547M, Page=1), so the
 	// request is served by the page-independent RAFullList cell (Go-sliced).
 	apiRefMode bool
+
+	// external (F13): every resolve also touches a genuine external endpoint
+	// (the ExternalTouchedSink is bumped), so an opted-in widget takes the
+	// external-TTL Put branch. The resolve still reads Kubernetes and records
+	// the inner-call dep edge on the widget L1 key — the traced live shape: an
+	// external widget whose RESTAction also reads K8s IS dirty-marked.
+	external atomic.Bool
 }
 
 type k547Block struct {
@@ -299,15 +313,27 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 	r3 := setWidgetsResolveForTest(h.resolve)
 	r4 := setRestactionsResolveForTest(h.resolveRESTAction)
 	t.Cleanup(func() { r4(); r3(); r2(); r1() })
+	// Registered AFTER the seam restore, so it runs BEFORE it (LIFO): a detached
+	// demand revalidation re-enters ServeHTTP through these seams and holds its
+	// slot until the handler returns, so restoring them under it is a data race
+	// on the next arm (reviewer-625 C2: F10 flaked 1/41 under -race). Bounded.
+	t.Cleanup(func() {
+		for end := time.Now().Add(10 * time.Second); cache.DemandRevalidationsInFlight() > 0; time.Sleep(5 * time.Millisecond) {
+			if time.Now().After(end) {
+				t.Errorf("cleanup: %d demand revalidation(s) still in flight after 10s", cache.DemandRevalidationsInFlight())
+				return
+			}
+		}
+	})
 
 	// The production RefreshFunc body, for the per-cohort class and the
 	// identity-free widget content class.
 	// The SA transport the production RefreshFunc closes over, against a fake
-	// apiserver that serves discovery and the widget CR. Without it every
-	// background refresh fails at the re-fetch of the widget CR ("user *Endpoint
-	// not found") BEFORE reaching the injected seam, and an identity-free shell
-	// could never heal (F7).
-	srv := k547APIServer(t, h)
+	// apiserver that answers discovery (the widget CR re-fetch itself is served
+	// from the synced informer). Without it every background refresh fails at
+	// the re-fetch ("user *Endpoint not found") BEFORE reaching the injected
+	// seam, and an identity-free shell could never heal (F7).
+	srv := k547APIServer(t)
 	saEP := &endpoints.Endpoint{ServerURL: srv.URL, Token: phase1RealSAToken}
 	saRC := &rest.Config{Host: srv.URL}
 	refresh := func(ctx context.Context, _ string, in cache.ResolvedKeyInputs) error {
@@ -322,19 +348,17 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 }
 
 // k547APIServer is a fake apiserver for the refresher's SA transport: discovery
-// for the widget group and a GET of the widget CR.
-func k547APIServer(t *testing.T, h *k547Harness) *httptest.Server {
+// for the widget group only. Every object read is served from the informers; an
+// object path 404s, which would surface as a self-gone eviction in the arms.
+func k547APIServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	gv := k547WidgetGVR.Group + "/" + k547WidgetGVR.Version
-	objectPath := "/apis/" + gv + "/namespaces/" + k547WNS + "/" + k547WidgetGVR.Resource + "/" + k547WName
 	writeJSON := func(w http.ResponseWriter, v any) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(v)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case objectPath:
-			writeJSON(w, h.widgetU.Object)
 		case "/api":
 			writeJSON(w, &metav1.APIVersions{TypeMeta: metav1.TypeMeta{Kind: "APIVersions"}, Versions: []string{"v1"}})
 		case "/api/v1":
@@ -509,6 +533,9 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 				<-b.release
 			}
 		}
+	}
+	if h.external.Load() {
+		cache.ExternalTouchedSinkFromContext(ctx).Bump()
 	}
 	var conds []any
 	if h.apiRefMode {
@@ -803,6 +830,12 @@ func TestIssue547_F1_DropLeavesCellKnownStaleAndTheNextReadHeals(t *testing.T) {
 	h := newK547Harness(t, k547DenyBackground)
 	h.warm()
 	h.driveChangedToKnownStale("v1")
+	// The drop must come from the INJECTED refresher-only denial at the shared
+	// resolve seam, not from an earlier failure (the pre-7b20dabc harness failed
+	// at the CR re-fetch and never reached it).
+	if h.bgCalls.Load() == 0 {
+		t.Fatalf("PRECONDITION: the background refresh never reached the injected seam (bgCalls=0)")
+	}
 	ks0, _ := k547KnownStaleServed()
 	dropped0 := k547KnownStaleServedReason("dropped")
 
@@ -1321,4 +1354,113 @@ func TestIssue547_F11_KnownStaleRAFullListIsReadThroughAtTheCallBoundary(t *test
 			t.Fatalf("F11 RED (k=%d): the read did not go through the known-stale full list (read_through %d -> %d)", k, rt0, rt)
 		}
 	}
+}
+
+// F12 (reviewer-625 N3) — team ruling (b) on the SHARED SHELL's background path:
+// a known-stale shell whose key is suppressed for a structurally-permanent
+// reason is still served instantly (counted), but its serve hands NOTHING to the
+// refresher; the skip is counted.
+func TestIssue547_F12_PermanentSuppressionSkipsTheShellBackgroundRevalidation(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	ctx := k547ReqCtx(0)
+	contentKey, handle, inputs := dispatchWidgetContentKey(ctx,
+		k547WidgetGVR.Group, k547WidgetGVR.Version, k547WidgetGVR.Resource, k547WNS, k547WName, -1, -1,
+		effectiveKeyExtras(ctx, h.widgetU.Object, k547Extras(k547Changed)))
+	if handle == nil || contentKey == "" {
+		t.Fatalf("PRECONDITION: no widgetContent key")
+	}
+	shell := k547Widget()
+	shell.Object["status"] = map[string]any{"widgetData": map[string]any{"conditions": []any{
+		map[string]any{"type": "Ready", "status": "True", "reason": "v0"}}}}
+	raw, _ := json.Marshal(shell.Object)
+	handle.Put(contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
+	cache.Deps().Record(context.Background(), contentKey, k547CompGVR, k547CompNS, fmt.Sprintf("comp-%d", k547Changed))
+
+	d0 := k547Stat("dirty_ended_unfresh_dropped")
+	h.update(k547Changed, "v1")
+	if !k547WaitFor(t, 30*time.Second, "shell dropped", func() bool { return k547Stat("dirty_ended_unfresh_dropped") > d0 }) {
+		t.Fatalf("PRECONDITION: the shell's background refresh never reached the drop point")
+	}
+	k547WaitFor(t, 5*time.Second, "queue drained", func() bool { return k547Stat("queue_depth") == 0 })
+	if _, _, ks := cache.KnownStale(contentKey); !ks {
+		t.Fatalf("PRECONDITION: the shell is not known-stale after the drop")
+	}
+	if !cache.NoteRefreshDecline(contentKey, "external", true) {
+		t.Fatalf("PRECONDITION: the shell key did not become suppressed")
+	}
+
+	sk0 := cache.ResolvedCacheStatsByStat()["known_stale_revalidation_skipped_total"]
+	enq0 := k547Stat("enqueue")
+	ks0, _ := k547KnownStaleServed()
+	for k := range k547Cohorts {
+		if r, code := h.get(k, k547Changed); code != 200 || r != "v0" {
+			t.Fatalf("F12 (k=%d): GET served %q (code %d), want the suppressed shell served instantly (v0)", k, r, code)
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // an enqueue, if any, would have landed by now
+	if d := k547Stat("enqueue") - enq0; d != 0 {
+		t.Fatalf("F12 RED: serving a permanently-suppressed known-stale shell enqueued %d background revalidation(s) — "+
+			"it can never succeed (team ruling b)", d)
+	}
+	if d := cache.ResolvedCacheStatsByStat()["known_stale_revalidation_skipped_total"] - sk0; d != int64(len(k547Cohorts)) {
+		t.Fatalf("F12 RED: known_stale_revalidation_skipped_total moved %d, want %d (one per serve)", d, len(k547Cohorts))
+	}
+	if ks, _ := k547KnownStaleServed(); ks-ks0 != int64(len(k547Cohorts)) {
+		t.Fatalf("F12: known_stale_served_total moved %d, want %d", ks-ks0, len(k547Cohorts))
+	}
+}
+
+// F13 (reviewer-625 addendum) — the external-TTL widget Put closes KNOWN-STALE.
+func TestIssue547_F13_ExternalTTLWidgetRePutEndsKnownStale(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	h.external.Store(true)
+	h.widgetU.SetAnnotations(map[string]string{externalCacheTTLAnnotation: "300"})
+	key := h.key(0, k547Changed)
+	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
+		t.Fatalf("warm: code=%d reason=%q", code, r)
+	}
+	e, ok := cache.ResolvedCache().GetNoTouch(key)
+	if !ok || !e.ExternalTTL {
+		t.Fatalf("PRECONDITION: the warm GET must have taken the external-TTL Put (resident=%v)", ok)
+	}
+
+	d0 := k547Stat("dirty_ended_unfresh_dropped")
+	h.update(k547Changed, "v1")
+	if !k547WaitFor(t, 30*time.Second, "external cell dropped", func() bool {
+		return k547Stat("dirty_ended_unfresh_dropped") > d0
+	}) {
+		t.Fatalf("PRECONDITION: the external widget cell was never dirty-marked and dropped — the K8s dep edge the " +
+			"resolve recorded on its L1 key did not mark it")
+	}
+	k547WaitFor(t, 5*time.Second, "queue drained", func() bool { return k547Stat("queue_depth") == 0 })
+	if _, _, ks := cache.KnownStale(key); !ks {
+		t.Fatalf("PRECONDITION: the external widget cell is not known-stale after the drop")
+	}
+
+	// GET#1 serves v0 and revalidates on demand; that re-run takes the external
+	// branch again and re-Puts v1 through the plain external-TTL Put.
+	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
+		t.Fatalf("F13 GET#1: code=%d reason=%q, want the cached v0", code, r)
+	}
+	if !k547WaitFor(t, 5*time.Second, "external re-Put", func() bool { r, _ := h.residentReason(key); return r == "v1" }) {
+		t.Fatalf("PRECONDITION: the demand revalidation never re-Put the external cell")
+	}
+	k547WaitFor(t, 5*time.Second, "demand settled", func() bool { return cache.DemandRevalidationsInFlight() == 0 })
+	if _, _, ks := cache.KnownStale(key); ks {
+		t.Fatalf("F13 RED: the external-TTL re-Put of a fresh body left the cell KNOWN-STALE — the ctx-less plain Put " +
+			"never closes the stamp, so every read starts another external refetch until the TTL (#547 B1)")
+	}
+	ks0, _ := k547KnownStaleServed()
+	c1 := h.custCalls.Load()
+	if r, code := h.get(0, k547Changed); code != 200 || r != "v1" {
+		t.Fatalf("F13 GET#2: code=%d reason=%q, want v1", code, r)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if d := h.custCalls.Load() - c1; d != 0 {
+		t.Fatalf("F13 RED: GET#2 of the fresh external cell started %d more external refetch(es)", d)
+	}
+	if ks, _ := k547KnownStaleServed(); ks != ks0 {
+		t.Fatalf("F13 RED: GET#2 counted a known-stale serve on a fresh body")
+	}
+
 }

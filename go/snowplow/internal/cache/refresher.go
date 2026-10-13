@@ -1172,6 +1172,9 @@ func (r *refresher) processNext(ctx context.Context) bool {
 				slog.Int("requeues", maxRefreshRequeues),
 				slog.Bool("non_retryable", nonRetryable),
 				slog.Bool("cluster_list_tier", fromCL),
+				// #547 — a non-404 drop never evicts (the self-404 drop above logs
+				// self_object_gone_evicted with its own evicted outcome).
+				slog.Bool("evicted", false),
 				slog.String("known_stale_reason", func() string {
 					if errors.Is(err, ErrContentNotServable) {
 						return knownStaleNotServable.String()

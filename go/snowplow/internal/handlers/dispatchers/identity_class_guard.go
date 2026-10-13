@@ -175,8 +175,10 @@ func identityClassDriftCtx(ctx context.Context, inputs *cache.ResolvedKeyInputs)
 // errRepresentativeDriftedMidRefresh is returned when the representative's RBAC
 // class moved DURING a refresh re-resolve (#444). The body is not written; the
 // error is retryable, so the refresher requeues the key and the next attempt
-// re-picks an in-class representative (repickRepresentative) or evicts. A spent
-// requeue budget drops → evicts at the drop point. Never a suppress-to-TTL.
+// re-picks an in-class representative (repickRepresentative). A spent requeue
+// budget drops the key at the drop point, where the cell stays resident and
+// KNOWN-STALE (#547): served, counted and revalidated on the next read. Never
+// evicted, never a suppress-to-TTL.
 var errRepresentativeDriftedMidRefresh = errors.New("representative's RBAC class moved during the re-resolve")
 
 // Where the refresher's representative came from (#444).

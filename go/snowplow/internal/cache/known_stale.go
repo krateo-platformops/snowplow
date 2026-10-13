@@ -253,6 +253,15 @@ func settleBackgroundRevalidation(key string) {
 	knownStaleRevalidationFresh.Add(1)
 }
 
+// DemandRevalidationsInFlight is the number of demand revalidations currently
+// claimed (each one holds its key's slot until its settle runs, after the
+// re-entered handler has returned). Bounded by the known-stale key set.
+func DemandRevalidationsInFlight() int {
+	n := 0
+	demandInflight.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
 // DemandRevalidationFromContext reports whether ctx is a demand revalidation
 // (the re-entered customer cold path), and of which key.
 func DemandRevalidationFromContext(ctx context.Context) (string, bool) {

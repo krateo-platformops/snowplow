@@ -532,8 +532,8 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// #424 — TOCTOU re-check: an RBAC change on the representative that landed
 	// during the re-resolve makes the fresh bytes another class's. Never write
 	// them. #444 — nor suppress: return a retryable error, so the refresher
-	// requeues and the next attempt re-picks an in-class representative (or
-	// evicts); a spent budget drops → evicts at the drop point.
+	// requeues and the next attempt re-picks an in-class representative; a spent
+	// budget drops at the drop point, leaving the cell KNOWN-STALE (#547).
 	if drift := identityClassDrift(ctx, &inputs, refreshUser, refreshGroups); drift != "" {
 		noteIdentityClassDrift("refresher", drift)
 		return fmt.Errorf("resolveAndPopulateL1 %s/%s (%s): %w",
