@@ -480,6 +480,21 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #608: refresher impersonation capability (one counter keyed by stat)
+	// and the startup probe's kind-wide answers (one gauge keyed by resource).
+	// impersonation_fallback_sa is non-zero while a cohort's group is NOT
+	// allowlisted — it reads the defect's condition, not a health zero.
+	impersonation, err := m.Int64ObservableCounter("snowplow_impersonation",
+		metric.WithDescription("Refresher impersonation capability counters (#608), labelled by stat: impersonation_permitted, impersonation_fallback_sa, impersonation_capability_check_error, reviews, memo_*."))
+	if err != nil {
+		return err
+	}
+	impersonationProbe, err := m.Int64ObservableGauge("snowplow_impersonation_probe",
+		metric.WithDescription("Startup impersonation probe (#608): 1 when snowplow may impersonate every name of the resource, else 0; labelled by stat (users, groups_all_names, serviceaccounts_all_names)."))
+	if err != nil {
+		return err
+	}
+
 	// --- upstream health: aggregate controller + webhook gauges ---
 	upstreamControllers, err := m.Int64ObservableGauge("snowplow_upstream_controllers",
 		metric.WithDescription("Auto-discovered upstream controllers, labelled by health (healthy/unhealthy)."))
@@ -887,6 +902,16 @@ func registerInstruments(m metric.Meter, build string) error {
 				metric.WithAttributes(attribute.String("stat", stat)))
 		}
 
+		// --- #608 impersonation capability ---
+		for stat, v := range cache.ImpersonationCapabilityStats() {
+			o.ObserveInt64(impersonation, int64(v),
+				metric.WithAttributes(attribute.String("stat", stat)))
+		}
+		for res, v := range cache.ImpersonationProbeResult() {
+			o.ObserveInt64(impersonationProbe, v,
+				metric.WithAttributes(attribute.String("stat", res)))
+		}
+
 		// --- upstream controller / webhook health ---
 		ctrlHealthy, ctrlUnhealthy, whTotal, whFail := cache.UpstreamHealthSnapshot()
 		o.ObserveInt64(upstreamControllers, ctrlHealthy,
@@ -1070,7 +1095,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		phase1UnitsPlanned, phase1UnitsSeeded, phase1ApiRefPages, phase1EligibleNoContinue,
 		phase1WalkZeroChildren, phase1WalkObservations,
 		phase1SeedResolves, phase1SeedFailures, phase1SeedRBACDeny, phase1SeedOpFail,
-		saDiscovery, crdSchemaMemo, refreshFailedByClass,
+		saDiscovery, crdSchemaMemo, refreshFailedByClass, impersonation, impersonationProbe,
 		upstreamControllers, upstreamWebhooks,
 		raFullListServe, bindingsDeltaSkipped,
 		// --- 1.12.4 ---

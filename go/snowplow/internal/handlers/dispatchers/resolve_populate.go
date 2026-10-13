@@ -287,7 +287,16 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// when there is no cohort identity to impersonate, in which case the
 		// pre-#574 SA transport is kept verbatim and rbac.MustRegateSADial still
 		// applies — that fallback is what makes a code-before-RBAC rollout safe.
-		if imp := cache.ImpersonatingRESTConfig(saRC, refreshUser, refreshGroups); imp != nil {
+		//
+		// #608 — and nil when the apiserver would refuse ANY principal on the dial.
+		// The startup probe only answers for `users`; a cohort also carries its
+		// groups, which the chart allowlists by name. Dialling a refused group is
+		// a certain 403 that leaves the cell stale until TTL (26,462 on 057), so
+		// the capability is checked per principal (memoized, invalidated by the
+		// RBAC snapshot generation) and a refused cohort takes the SAME re-gated
+		// SA branch below — no impersonated-dial marker, so the re-gate and the
+		// UAF refilter apply exactly as before #574.
+		if imp := cache.PermittedImpersonatingRESTConfig(rctx, saRC, refreshUser, refreshGroups); imp != nil {
 			rctx = cache.WithInternalRESTConfig(rctx, imp)
 			rctx = cache.WithImpersonatedDial(rctx)
 		} else {

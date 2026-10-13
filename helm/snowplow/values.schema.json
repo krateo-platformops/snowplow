@@ -100,23 +100,38 @@
       "type": "object",
       "additionalProperties": false,
       "title": "RBAC",
-      "description": "#574 \u2014 which cohorts the background refresher may read as. Both lists are EMPTY by default and each renders NO ClusterRole rule when empty: in Kubernetes RBAC an empty resourceNames means EVERY resource of that type, so rendering an empty rule would permit impersonating every group on the cluster. An unlisted cohort is simply not background-refreshed \u2014 it 403s at dial, the cache Put declines as it does today, and the cell expires at TTL and refills on read.",
+      "description": "#574 \u2014 which cohorts the background refresher may read as. Both lists are EMPTY by default and each renders NO ClusterRole rule when empty: in Kubernetes RBAC an empty resourceNames means EVERY resource of that type, so rendering an empty rule would permit impersonating every group on the cluster. An unlisted cohort is not impersonated: snowplow checks each cohort's principals with a SelfSubjectAccessReview before dialling (#608) and refreshes it over its own ServiceAccount with the re-gate instead.",
       "properties": {
         "impersonateGroups": {
           "type": "array",
+          "uniqueItems": true,
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1,
+            "not": {
+              "enum": [
+                "system:masters",
+                "*"
+              ]
+            }
           },
           "title": "Impersonate groups",
-          "description": "Groups the background refresher may impersonate. NEVER list a privileged group: impersonating a group DOES grant everything it is bound to. Contrast users, which the ClusterRole grants unconditionally because impersonating a user does not inherit that user's groups."
+          "description": "Groups the background refresher may impersonate. NEVER list a privileged group: impersonating a group DOES grant everything it is bound to (system:masters and * are rejected). A cohort with any group NOT listed here is refreshed over snowplow's ServiceAccount with the re-gate instead of as the cohort (#608), never left stale. Contrast users, which the ClusterRole grants unconditionally because impersonating a user does not inherit that user's groups."
         },
         "impersonateServiceAccounts": {
           "type": "array",
+          "uniqueItems": true,
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1,
+            "not": {
+              "enum": [
+                "*"
+              ]
+            }
           },
           "title": "Impersonate service accounts",
-          "description": "ServiceAccounts the background refresher may impersonate, for cohorts whose binding subject is a ServiceAccount. A ServiceAccount carries its rights directly, so this escalates exactly as groups do \u2014 allowlist it the same way."
+          "description": "ServiceAccount NAMES the background refresher may impersonate, for cohorts whose binding subject is a ServiceAccount. A ServiceAccount carries its rights directly, so this escalates exactly as groups do \u2014 allowlist it the same way. The rule lives in a ClusterRole, so a listed name matches a ServiceAccount of that name in EVERY namespace."
         }
       }
     },
