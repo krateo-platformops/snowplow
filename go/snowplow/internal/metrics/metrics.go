@@ -662,6 +662,15 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
+	// #479 1b / #603 PR-0 — the same dirty-marks split by the ENTRY CLASS of the
+	// marked key (restactions/widgets/widgetContent/apistage/raFullList, plus
+	// unknown and the unregistered guard). Closed label set; Σ == dirty_mark_total.
+	dirtyMarkByEntryClass, err := m.Int64ObservableCounter(
+		"snowplow_deps_dirty_mark_by_entry_class_total",
+		metric.WithDescription("Dirty-marks by the entry class of the marked key (restactions/widgets/widgetContent/apistage/raFullList; unknown = class not learned; unregistered = guard, alert on > 0). Their sum equals snowplow_deps{stat=dirty_mark_total}."))
+	if err != nil {
+		return err
+	}
 
 	// --- informer servability, the leading indicator for the
 	// informer-fallthrough-not-synced cell.
@@ -974,6 +983,10 @@ func registerInstruments(m metric.Meter, build string) error {
 		}
 		o.ObserveInt64(dirtyMarkEvents, int64(cache.DirtyMarkEventsTotal()))
 		o.ObserveInt64(dirtyMarkUnattributed, int64(cache.DirtyMarkUnattributedTotal()))
+		for class, n := range cache.DirtyMarkByEntryClassSnapshot() {
+			o.ObserveInt64(dirtyMarkByEntryClass, int64(n),
+				metric.WithAttributes(attribute.String("class", class)))
+		}
 		for source, n := range cache.DirtyMarkSubmitSourceSnapshot() {
 			o.ObserveInt64(dirtyMarkSubmits, int64(n),
 				metric.WithAttributes(attribute.String("source", source)))
@@ -1081,6 +1094,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		storeFactoryDivergenceAge,
 		// --- #239: dirty-mark attribution ---
 		dirtyMarkAttributed, dirtyMarkEvents, dirtyMarkSubmits, dirtyMarkUnattributed,
+		// --- #479 1b / #603 PR-0 ---
+		dirtyMarkByEntryClass,
 	}, derivedObservables...)...)
 	if err != nil {
 		return err

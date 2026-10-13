@@ -686,6 +686,33 @@ func observeDepGenRemark(l1Key, reason string) {
 type depSet struct {
 	deps  sync.Map // map[DepKey]struct{}
 	count atomic.Int64
+	// class is the key's CacheEntryClass (#479 1b / #603 PR-0), learned from
+	// the store: by a try-lock peek when this depSet is created and by the
+	// store's class note on every accepted store of the key. A key's class is
+	// folded into the key hash (ComputeKey), so it can never change for a key —
+	// a stale depSet pointer on a forward edge still names the right class.
+	// Holds a dmEntryClassIndex; 0 (the zero value) = not learned (yet), and
+	// the mark is then attributed "unknown".
+	classIdx atomic.Uint32
+}
+
+// entryClassIdx returns the learned class index, or the unknown index when not
+// learned. Nil-safe.
+func (ds *depSet) entryClassIdx() uint32 {
+	if ds == nil {
+		return dmEntryClassUnknownIdx
+	}
+	return ds.classIdx.Load()
+}
+
+// setEntryClass records a raw CacheEntryClass ("" is ignored: never unlearn).
+func (ds *depSet) setEntryClass(class string) {
+	if ds == nil || class == "" {
+		return
+	}
+	if idx := dmEntryClassIndex(class); ds.classIdx.Load() != idx {
+		ds.classIdx.Store(idx)
+	}
 }
 
 // captureSlot holds the STACK of OPEN capture buffers for one l1Key (issue
@@ -710,6 +737,13 @@ type DepTracker struct {
 	forward sync.Map
 	// reverse: l1Key -> *depSet
 	reverse sync.Map
+
+	// #603 PR-0 — create-time class peeks (tryPeekEntryClass) attempted, and
+	// those that learned a class. Test-visible only (no expvar/OTLP): they pin
+	// that the peek, which takes the customer-facing c.mu, runs once per NEW
+	// depSet and not once per refresh (#564).
+	classPeekAttempts atomic.Uint64
+	classPeekLearned  atomic.Uint64
 
 	// captures is the edge-3 serve-seam dep-capture registry (issue #277 + the
 	// C2 carrier): l1Key -> *captureSlot. recordInternal taps every OPEN buffer
@@ -924,6 +958,17 @@ func (d *DepTracker) SetStore(s *ResolvedCacheStore) {
 	// single production call site is resolved.go's, with a real store.
 	if s != nil {
 		s.setDepStripHook(d.RemoveL1Key)
+		s.setEntryClassHook(d.noteEntryClass)
+	}
+}
+
+// noteEntryClass is the store's class note (#479 1b / #603 PR-0): record the
+// class of a just-stored key on its depSet, when the key has edges. Lock-free
+// (one sync.Map Load); called under the store mutex, so it must never call
+// back into the store.
+func (d *DepTracker) noteEntryClass(l1Key, class string) {
+	if dsI, ok := d.reverse.Load(l1Key); ok {
+		dsI.(*depSet).setEntryClass(class)
 	}
 }
 
@@ -1076,10 +1121,27 @@ func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey
 	d.recordTotal.Add(1)
 
 	// Reverse: l1Key -> *depSet[DepKey]
-	dsI, _ := d.reverse.LoadOrStore(l1Key, &depSet{})
+	dsI, loadedDS := d.reverse.LoadOrStore(l1Key, &depSet{})
 	ds := dsI.(*depSet)
 	if _, loaded := ds.deps.LoadOrStore(dk, struct{}{}); !loaded {
 		ds.count.Add(1)
+	}
+	// #479 1b / #603 PR-0 — carry the key's depSet on the forward edge, so the
+	// mark loop reads the entry class off the edge it already ranges. A CAS from
+	// the placeholder only: if RemoveL1Key dropped the edge in between, nothing
+	// is resurrected. A depSet created HERE learns the class from a resident
+	// entry (content cells record AFTER their Put, so no class note reached
+	// them); a busy store lock just defers that to the next store's note.
+	ks.keys.CompareAndSwap(l1Key, struct{}{}, ds)
+	if !loadedDS {
+		d.storeMu.RLock()
+		store := d.store
+		d.storeMu.RUnlock()
+		d.classPeekAttempts.Add(1)
+		if class := store.tryPeekEntryClass(l1Key); class != "" {
+			d.classPeekLearned.Add(1)
+			ds.setEntryClass(class)
+		}
 	}
 }
 
@@ -1677,7 +1739,7 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 	// handler (R1). A resolve that recorded any of this coordinate's buckets and has
 	// not yet done its accepted Put will see lastBumpSeq > startSeq and self-remark.
 	d.bumpCoordinateGen(gvr, namespace, name)
-	matched := d.collectMatchesWithDep(gvr, namespace, name)
+	matched := d.collectMatchesForMark(gvr, namespace, name)
 	if len(matched) == 0 {
 		return 0, 0
 	}
@@ -1692,7 +1754,9 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 
 	var toEvict, toMark []string
 	classCounts := map[string]int{} // #239: self / list_dep / exact_dep of the marked keys
-	for l1Key, dk := range matched {
+	// #479 1b / #603 PR-0: entry class of the marked keys, read off the edge.
+	var entryClasses dmEntryClassCounts
+	for l1Key, m := range matched {
 		// #564 — isSelfRepresentation is a store.GetNoTouch, i.e. an acquisition of the
 		// customer-facing c.mu, and this loop runs for every resident matched key
 		// on every dep event (~222.9:1 fan-out; 2,222 marks/s measured on 057).
@@ -1728,14 +1792,15 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 		// GetNoTouch (refresher.go), which performs the same evict with the same
 		// INTERNAL (non-customer) attribution. See #378 for why that attribution
 		// is the part that matters.
-		needSelf := state == objAbsent || dk.Name != listWildcard
+		needSelf := state == objAbsent || !m.listOnly
 		isSelf := needSelf && d.isSelfRepresentation(store, l1Key, self)
 		if state == objAbsent && isSelf {
 			toEvict = append(toEvict, l1Key) // bucket 1, and ONLY when absent
 			continue
 		}
 		toMark = append(toMark, l1Key) // buckets 2 + 3, and self-when-present
-		classCounts[dirtyMarkClass(dk, isSelf)]++
+		classCounts[dirtyMarkClassFor(m.listOnly, isSelf)]++
+		entryClasses[m.ds.entryClassIdx()]++
 	}
 
 	// 1.12.7 observability — an UNKNOWN_DEGRADED verdict structurally cannot
@@ -1756,7 +1821,7 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 	}
 	if n := len(toMark); n > 0 {
 		// #239 — single writer of dirtyMarkTotal + the {path,cause,class} buckets.
-		d.recordDirtyMarks(dmPathObject, dirtyMarkCauseForState(state), classCounts, gvr)
+		d.recordDirtyMarks(dmPathObject, dirtyMarkCauseForState(state), classCounts, &entryClasses, gvr)
 		if state != objAbsent {
 			// enqueueUpdateTotal is retained as the pre-0.30.110 falsifier
 			// name for ADD/UPDATE-driven refresh enqueues.
@@ -1952,16 +2017,25 @@ func (d *DepTracker) dirtyMarkResourceType(eventType string, gvr schema.GroupVer
 
 	marked := 0
 	classCounts := map[string]int{} // #239: list_dep vs exact_dep (type deps have no self class)
+	// #479 1b / #603 PR-0 — entry class from the key's depSet (reverse index,
+	// lock-free). The type path is rare (CRD lifecycle), so a Load per key here
+	// costs nothing that matters and needs no forward-edge plumbing.
+	var entryClasses dmEntryClassCounts
 	for l1Key, dk := range matched {
 		if enqueue != nil {
 			enqueue(l1Key, gvr)
 		}
 		classCounts[dirtyMarkClass(dk, false)]++
+		var ds *depSet
+		if dsI, ok := d.reverse.Load(l1Key); ok {
+			ds = dsI.(*depSet)
+		}
+		entryClasses[ds.entryClassIdx()]++
 		marked++
 	}
 	if marked > 0 {
 		// #239 — single writer of dirtyMarkTotal + the {path,cause,class} buckets.
-		d.recordDirtyMarks(dmPathType, dirtyMarkCauseForEventType(eventType), classCounts, gvr)
+		d.recordDirtyMarks(dmPathType, dirtyMarkCauseForEventType(eventType), classCounts, &entryClasses, gvr)
 	}
 	slog.Info("cache_event.consumed",
 		slog.String("subsystem", "cache"),
@@ -2030,34 +2104,84 @@ func (d *DepTracker) collectMatches(gvr schema.GroupVersionResource, namespace, 
 // classification sees the most specific dependency form.
 func (d *DepTracker) collectMatchesWithDep(gvr schema.GroupVersionResource, namespace, name string) map[string]DepKey {
 	out := map[string]DepKey{}
-	addAll := func(dk DepKey) {
+	d.rangeMatchBuckets(gvr, namespace, name, func(dk DepKey, l1 string, _ any) {
+		prev, seen := out[l1]
+		// Exact (Name != listWildcard) beats wildcard; once an
+		// exact match is recorded it is never downgraded.
+		if !seen || (prev.Name == listWildcard && dk.Name != listWildcard) {
+			out[l1] = dk
+		}
+	})
+	return out
+}
+
+// depMatch is one dirty-mark candidate as the OnObjectEvent mark loop needs
+// it: whether it matched ONLY through list-wildcard buckets (the one property
+// of the matched DepKey the loop reads — collectMatchesWithDep's exact-beats-
+// wildcard precedence reduces to an AND here), plus the key's reverse depSet
+// as carried on the forward edge, which holds the key's entry class (#479 1b /
+// #603 PR-0). ds may be nil (an edge whose depSet was not yet swapped in); the
+// class then reads "unknown".
+type depMatch struct {
+	listOnly bool
+	ds       *depSet
+}
+
+// collectMatchesForMark is collectMatchesWithDep for the OnObjectEvent mark
+// loop: same buckets, same precedence, and it also carries each key's depSet
+// off the forward edge it already ranges, so the entry class costs no store
+// read and no extra index lookup on the 99.66%-of-marks path. The value is
+// 16 bytes instead of an 80-byte DepKey: the map this allocates per event is
+// population-sized (#603), so its footprint is the cost that matters.
+func (d *DepTracker) collectMatchesForMark(gvr schema.GroupVersionResource, namespace, name string) map[string]depMatch {
+	out := map[string]depMatch{}
+	d.rangeMatchBuckets(gvr, namespace, name, func(dk DepKey, l1 string, v any) {
+		isList := dk.Name == listWildcard
+		prev, seen := out[l1]
+		if !seen {
+			ds, _ := v.(*depSet)
+			out[l1] = depMatch{listOnly: isList, ds: ds}
+			return
+		}
+		changed := false
+		if prev.listOnly && !isList {
+			// Exact beats wildcard; never downgraded once exact.
+			prev.listOnly, changed = false, true
+		}
+		if prev.ds == nil {
+			if ds, ok := v.(*depSet); ok {
+				prev.ds, changed = ds, true
+			}
+		}
+		if changed {
+			out[l1] = prev
+		}
+	})
+	return out
+}
+
+// rangeMatchBuckets calls fn for every (bucket, l1Key, edge value) across the
+// four bucket forms a coordinate matches, EXACT buckets first so a caller's
+// exact-beats-wildcard precedence check sees them before the wildcards.
+func (d *DepTracker) rangeMatchBuckets(gvr schema.GroupVersionResource, namespace, name string, fn func(dk DepKey, l1 string, v any)) {
+	visit := func(dk DepKey) {
 		ksI, ok := d.forward.Load(dk)
 		if !ok {
 			return
 		}
-		ks := ksI.(*keySet)
-		ks.keys.Range(func(k, _ any) bool {
-			l1 := k.(string)
-			prev, seen := out[l1]
-			// Exact (Name != listWildcard) beats wildcard; once an
-			// exact match is recorded it is never downgraded.
-			if !seen || (prev.Name == listWildcard && dk.Name != listWildcard) {
-				out[l1] = dk
-			}
+		ksI.(*keySet).keys.Range(func(k, v any) bool {
+			fn(dk, k.(string), v)
 			return true
 		})
 	}
-	// Exact buckets first so they win the precedence check; wildcard
-	// buckets only fill in keys not already matched exactly.
-	addAll(DepKey{GVR: gvr, Namespace: namespace, Name: name})
+	visit(DepKey{GVR: gvr, Namespace: namespace, Name: name})
 	if namespace != "" {
-		addAll(DepKey{GVR: gvr, Namespace: "", Name: name})
+		visit(DepKey{GVR: gvr, Namespace: "", Name: name})
 	}
-	addAll(DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
+	visit(DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
 	if namespace != "" {
-		addAll(DepKey{GVR: gvr, Namespace: "", Name: listWildcard})
+		visit(DepKey{GVR: gvr, Namespace: "", Name: listWildcard})
 	}
-	return out
 }
 
 // runEvictionBatch drops each self-representation L1 key from the store
