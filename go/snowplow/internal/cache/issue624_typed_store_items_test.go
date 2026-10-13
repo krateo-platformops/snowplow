@@ -387,3 +387,55 @@ func TestIssue624_UnrenderableSlot_FailsClosedAndCounts(t *testing.T) {
 		t.Fatalf("expvar cells lack the get|%s cell: %v", gvr, m)
 	}
 }
+
+// TestIssue624_PartialObjectMetadataWithTypeMeta_FailsClosed pins the
+// explicit `case *metav1.PartialObjectMetadata` arm of
+// storeItemToUnstructured. The fixture above carries NO TypeMeta, so it is
+// rejected even without that arm (the generic runtime.Object arm cannot
+// recover a kind for it from the client-go scheme). A metadata-only
+// informer delivers PartialObjectMetadata WITH TypeMeta set — either its own
+// (meta.k8s.io/v1 PartialObjectMetadata) or the watched kind's — and for
+// that shape the generic arm WOULD render a spec-less object as the whole
+// one. Only the explicit arm stops it, so this arm goes RED if it is removed.
+func TestIssue624_PartialObjectMetadataWithTypeMeta_FailsClosed(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "example.krateo.io", Version: "v1", Resource: "widgets624tm"}
+	for name, tm := range map[string]metav1.TypeMeta{
+		"meta-typemeta": {APIVersion: "meta.k8s.io/v1", Kind: "PartialObjectMetadata"},
+		"kind-typemeta": {APIVersion: "example.krateo.io/v1", Kind: "Widget624"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := &metav1.PartialObjectMetadata{TypeMeta: tm, ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: "ns"}}
+
+			// The converter itself, both renderings.
+			if u, ok := storeItemToUnstructured(p); ok {
+				t.Fatalf("storeItemToUnstructured RENDERED a PartialObjectMetadata (%s): %v", name, u.Object)
+			}
+			if b, ok := storeItemJSON(p); ok {
+				t.Fatalf("storeItemJSON RENDERED a PartialObjectMetadata (%s): %s", name, b)
+			}
+
+			// The three serve sites, through a real indexer-backed watcher.
+			rw, idx, stop := newIndexerBackedWatcher(t, gvr)
+			defer stop()
+			good := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "example.krateo.io/v1", "kind": "Widget624",
+				"metadata": map[string]any{"name": "good", "namespace": "ns"},
+			}}
+			if err := idx.Add(good); err != nil {
+				t.Fatal(err)
+			}
+			if err := idx.Add(p); err != nil {
+				t.Fatal(err)
+			}
+			if items, ok := rw.ListObjectsServable(gvr, "ns"); ok || items != nil {
+				t.Fatalf("decoded: served=%v items=%d — a PartialObjectMetadata slot must fail the list CLOSED", ok, len(items))
+			}
+			if raws, ok := rw.ListRawServable(gvr, ""); ok || raws != nil {
+				t.Fatalf("raw: served=%v items=%d — a PartialObjectMetadata slot must fail the list CLOSED", ok, len(raws))
+			}
+			if got, hit := rw.GetObject(gvr, "ns", "bad"); hit {
+				t.Fatalf("GetObject of a PartialObjectMetadata slot must miss, got %v", got.Object)
+			}
+		})
+	}
+}
