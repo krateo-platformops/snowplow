@@ -85,6 +85,11 @@ var resolveOnceFn = resolveOnceProd
 // call's NotFound is the dirty-mark class and never produces this.
 var errSelfObjectGone = cache.ErrSelfObjectGone
 
+// errRefetchNilObject is a re-fetch that returned neither an object nor a
+// status. #630: staged as refetch so it is attributable; the text stays the
+// pre-#630 "re-fetch <res>/<name>: nil object".
+var errRefetchNilObject = errors.New("nil object")
+
 // resolveAndPopulateL1 is the single resolve-and-store path. It:
 //
 //  1. computes the canonical L1 key from inputs (must equal the key the
@@ -724,18 +729,39 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 	}
 	got := objects.Get(ctx, ref)
 	if got.Err != nil {
-		// 1.12.5 / #187 (i) — PRESERVE the 404. Pre-1.12.5 every re-fetch
-		// error was flattened to a string here, so resolveAndPopulateL1
-		// could not tell "this CR was deleted" from "the apiserver hiccuped"
-		// and treated both as retryable: five requeues, then refresh_dropped
-		// with the stale body still resident until the 1h TTL. Wrapping the
-		// definite 404 in errSelfObjectGone lets the caller EVICT instead.
+		// #630 — KEEP THE STATUS. objects.Get reports the apiserver's answer
+		// as a plumbing *response.Status (Code + Reason + Message), which is
+		// not an error; until #630 it was flattened to a string here, so the
+		// refresher's classifier read a 403 on this hop as
+		// err_class=unclassified stage=none, retried it through the whole
+		// budget, and the drop point evicted it — the one forbidden path that
+		// still made a cold navigation after #608/#619. statusErrFromResponse
+		// lifts it back into an *apierrors.StatusError (the same repair the
+		// Phase-1 seed path uses) and the ResolveStageError names the hop, so
+		// it classifies as forbidden/refetch, a 404 as not_found/refetch, and
+		// so on. The message text is unchanged ("re-fetch <res>/<name>: <msg>").
+		refetchErr := cache.WrapResolveStage(cache.ResolveStageRefetch,
+			fmt.Sprintf("re-fetch %s/%s", inputs.Resource, inputs.Name),
+			statusErrFromResponse(got.Err))
 		//
-		// TWO BOUNDS, both load-bearing:
+		// WHAT EACH CLASS DOES WITH IT (the refresher decides, not this site):
 		//
-		//  - ONLY a definite 404. A 403 (RBAC blip), a 500, a timeout and a
-		//    parse failure all keep today's requeue — an apiserver hiccup
-		//    must never evict a slice of L1 at once.
+		//  - a 403 is NON-RETRYABLE (#608 Q2, cache.IsNonRetryableRefreshError):
+		//    the same identity is refused identically at every backoff step, so
+		//    it reaches the drop point on its FIRST attempt — and a forbidden
+		//    drop NEVER evicts (#619): the cell stays resident and served until
+		//    the next dirty mark retries it (#547 makes that KNOWN-STALE).
+		//  - a 500, a timeout and a parse failure keep the requeue; they are
+		//    retried through the budget and are never a deletion.
+		//  - a definite 404 is the only deletion (1.12.5 / #187 (i)): wrapped in
+		//    errSelfObjectGone so the drop point EVICTS it once the budget has
+		//    re-confirmed it, instead of leaving a deleted CR's body resident.
+		//
+		// TWO BOUNDS on the 404, both load-bearing:
+		//
+		//  - ONLY a definite 404. Every other status, a 403 included, is never
+		//    a deletion — an apiserver hiccup must never evict a slice of L1
+		//    at once.
 		//  - NEVER the informer-only miss. Under cache.WithInformerOnlyReads
 		//    objects.Get SYNTHESISES a NotFound rather than reaching the
 		//    apiserver (objects/get.go informerOnlyMiss), so its 404 means
@@ -760,21 +786,20 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 		// gone, so it would have blocked a CORRECT eviction and stranded those
 		// entries to TTL. See the BCRD arm.
 		//
-		// The REQUEUE BUDGET is the bound for every case: nothing is evicted
-		// until the 404 has repeated across maxRefreshRequeues (~15.5s of backoff
-		// at the defaults), so a CRD re-registration that clears inside it is
-		// safe, and a type absent for longer than that has genuinely taken its
+		// The REQUEUE BUDGET is the bound for the 404: nothing is evicted until
+		// it has repeated across maxRefreshRequeues (~15.5s of backoff at the
+		// defaults), so a CRD re-registration that clears inside it is safe,
+		// and a type absent for longer than that has genuinely taken its
 		// objects with it.
 		if got.Err.Code == http.StatusNotFound &&
 			!cache.InformerOnlyReadsFromContext(ctx) {
-			return nil, fmt.Errorf("re-fetch %s/%s: %s: %w",
-				inputs.Resource, inputs.Name, got.Err.Message, errSelfObjectGone)
+			return nil, fmt.Errorf("%w: %w", refetchErr, errSelfObjectGone)
 		}
-		return nil, fmt.Errorf("re-fetch %s/%s: %s",
-			inputs.Resource, inputs.Name, got.Err.Message)
+		return nil, refetchErr
 	}
 	if got.Unstructured == nil {
-		return nil, fmt.Errorf("re-fetch %s/%s: nil object", inputs.Resource, inputs.Name)
+		return nil, cache.WrapResolveStage(cache.ResolveStageRefetch,
+			fmt.Sprintf("re-fetch %s/%s", inputs.Resource, inputs.Name), errRefetchNilObject)
 	}
 
 	switch inputs.CacheEntryClass {

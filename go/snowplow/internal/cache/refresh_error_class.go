@@ -37,15 +37,18 @@ const (
 	ResolveStageWidgetData    = "widget_data"
 	ResolveStageResourcesRefs = "resources_refs"
 	ResolveStageValidate      = "validate"
+	// ResolveStageRefetch is the refresher's re-fetch of the cell's OWN CR
+	// (objects.Get in resolveOnceProd), before any resolver runs (#630).
+	ResolveStageRefetch = "refetch"
 	// ResolveStageNone is the stage of an error that did not come out of a
-	// staged resolve (a re-fetch failure, an encode failure, a decline).
+	// staged hop (an encode failure, a decline, a TOCTOU drift).
 	ResolveStageNone = "none"
 )
 
 // refreshStages is the closed stage set, in counter-index order.
 var refreshStages = [...]string{
 	ResolveStageNone, ResolveStageApiRef, ResolveStageWidgetData,
-	ResolveStageResourcesRefs, ResolveStageValidate,
+	ResolveStageResourcesRefs, ResolveStageValidate, ResolveStageRefetch,
 }
 
 // Refresh failure classes. Closed set — a new class is a code change, never a

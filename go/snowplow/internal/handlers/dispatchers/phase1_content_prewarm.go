@@ -411,7 +411,8 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference, authnNS string) (int, error) {
 	got := objects.Get(rctx, ref)
 	if got.Err != nil {
-		return 0, fmt.Errorf("fetch RESTAction %s/%s: %s", ref.Namespace, ref.Name, got.Err.Message)
+		// #630 — keep the apiserver status typed; the text is unchanged.
+		return 0, fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResponse(got.Err))
 	}
 	if got.Unstructured == nil {
 		return 0, fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)
