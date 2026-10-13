@@ -519,6 +519,9 @@ func (s *state) evalQ(q *gojq.Query, in *abs, e *env) *abs {
 			s.consumeKind(l, opTruth)
 		}
 		r := s.eval(q.Right, in, e)
+		if c := altDefault(l, r, anyCU(in)); c != nil {
+			return c
+		}
 		return union(l, withCU(r, anyCU(in)))
 	case gojq.OpAnd, gojq.OpOr:
 		l := s.eval(q.Left, in, e)

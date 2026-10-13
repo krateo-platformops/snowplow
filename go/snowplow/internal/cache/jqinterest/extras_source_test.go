@@ -238,6 +238,11 @@ func checkSources(nc namedChain, seed int64, trials int, st *sourceStats) {
 	g := &gen{r: r, v: chainVocab(nc.chain)}
 	for t := 0; t < trials; t++ {
 		env := sourceEnv(g, nc.chain)
+		if edges := defaultEdgeExtras(); t < len(edges) {
+			// The `//` edge cases first: missing, null, false, empty and
+			// mixed streams, an error part-way.
+			env.extras = deepCopy(edges[t]).(map[string]any)
+		}
 		var items []any
 		for i := r.Intn(3); i >= 0; i-- {
 			it := g.item()
@@ -334,6 +339,8 @@ func sourcePositiveArms() []namedChain {
 		{"src: stage input nested stream .extras.sel[].name", oneStage(`.extras.sel as $s | [.s.items[] | select(.metadata.name == $s[].name)]`, "")},
 		{"src: stage input .slice.page", oneStage(`.slice.page as $p | [.s.items[] | select(.metadata.generation == $p)]`, "")},
 		{"src: stage input through a user function", oneStage(`def n: .extras.name; n as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
+		{"src: stage input .extras.name // \"\" (the portal shape)", oneStage(`(.extras.name // "") as $n | (.extras.namespace // "") as $ns | [.s.items[]? | select(.metadata.name == $n and .metadata.namespace == $ns)]`, "")},
+		{"src: stage input stream with a default", oneStage(`.extras.names as $ns | [.s.items[] | select(.metadata.name == ($ns[] // "d"))]`, "")},
 		{"src: stage input under a try (?)", oneStage(`.extras.names as $ns | [.s.items[] | select(.metadata.name == ($ns[]?))]`, "")},
 	}
 }
@@ -359,7 +366,18 @@ func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
 		{RootStageInput, `.extras as $e | $e.name`, true, `stage_input:."extras"."name"`},
 		{RootStageInput, `.extras | {name} | .name`, true, `stage_input:."extras"."name"`}, // the field IS .extras.name
 		{RootStageInput, `.extras | {name}`, false, ""},
-		{RootStageInput, `.extras.name // ""`, false, ""},
+		{RootStageInput, `.extras.name // ""`, true, `stage_input:."extras"."name" // ""`},
+		{RootStageInput, `.extras.names[] // "d"`, true, `stage_input:."extras"."names"[] // "d"`},
+		{RootStageInput, `.extras.sel[].name // "d"`, true, `stage_input:."extras"."sel"[]."name" // "d"`},
+		{RootStageInput, `.extras.name // null`, true, `stage_input:."extras"."name" // null`},
+		{RootStageInput, `.extras.name // false`, true, `stage_input:."extras"."name" // false`},
+		{RootStageInput, `.extras.name // 0`, true, `stage_input:."extras"."name" // 0`},
+		{RootStageInput, `.extras.name // .extras.other`, false, ""},
+		{RootStageInput, `(.extras.name // "") // "y"`, false, ""},
+		{RootStageInput, `(.extras // {}) | .name`, false, ""},
+		{RootStageInput, `(.extras.sel // "") | .name`, false, ""},
+		{RootRADict, `.name // "x"`, true, `ra_dict:."name" // "x"`},
+		{RootRADict, `.names[] // "x"`, true, `ra_dict:."names"[] // "x"`},
 		{RootStageInput, `.s`, false, ""},
 		{RootRADict, `.name`, true, `ra_dict:."name"`},
 		{RootRADict, `.names[]`, true, `ra_dict:."names"[]`},
@@ -370,6 +388,7 @@ func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
 		{RootWidgetDS, `.name`, true, `widget_ds:."name"`},
 		{RootWidgetDS, `.names[]`, true, `widget_ds:."names"[]`},
 		{RootWidgetDS, `.slice.page`, true, `widget_ds:."slice"."page"`},
+		{RootWidgetDS, `.names[] // 0`, true, `widget_ds:."names"[] // 0`},
 		{RootWidgetDS, `.s`, false, ""}, // chain 0: the dict's stage field
 		{RootWidgetDS, `.x`, false, ""}, // chain 1: the built object's field
 	}
@@ -397,7 +416,7 @@ func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
 			t.Fatalf("chain %d: roots not seen", ci)
 		}
 		abstract := map[ExtrasRoot]*abs{RootStageInput: pig, RootRADict: dict, RootWidgetDS: ds}
-		compared := 0
+		compared, edgeCompared := 0, 0
 		for _, p := range probes {
 			hasNav, wantSrc := navOn(ci, p)
 			s := newState(jqsupport.ModuleLoader())
@@ -423,8 +442,12 @@ func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
 			}
 			r := rand.New(rand.NewSource(int64(633 + ci)))
 			g := &gen{r: r, v: vocab{keys: []string{"name", "names", "sel", "page", "nope"}}}
-			for trial := 0; trial < 80; trial++ {
+			edges := defaultEdgeExtras()
+			for trial := 0; trial < len(edges)+80; trial++ {
 				env := sourceEnv(g, c)
+				if trial < len(edges) {
+					env.extras = deepCopy(edges[trial]).(map[string]any)
+				}
 				roots := map[ExtrasRoot]any{}
 				env.probe = func(kind, query string, data any) {
 					if query == "" {
@@ -462,12 +485,39 @@ func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
 					break
 				}
 				compared++
+				if trial < len(edges) && src.HasDefault {
+					edgeCompared++
+				}
 			}
 		}
+		if edgeCompared == 0 {
+			t.Errorf("chain %d: no default source compared on the edge cases", ci)
+		}
+		t.Logf("chain %d: %d default-source evaluations on the edge cases (missing, null, false, empty stream, mixed falsy/truthy, partial error)", ci, edgeCompared)
 		if compared == 0 {
 			t.Errorf("chain %d: vacuous, no root evaluation compared", ci)
 		}
 		t.Logf("chain %d: %d source evaluations compared with gojq", ci, compared)
+	}
+}
+
+// defaultEdgeExtras: the request extras that make `//` interesting: a
+// missing key, null, false, an empty stream, a stream mixing falsy and
+// truthy values, an all-falsy stream, an error part-way through a stream,
+// an iteration error, the empty string (truthy in jq), object values.
+func defaultEdgeExtras() []map[string]any {
+	return []map[string]any{
+		{},
+		{"name": nil, "names": nil, "sel": nil},
+		{"name": false, "names": false, "sel": false},
+		{"name": "a", "names": []any{}, "sel": []any{}},
+		{"name": "a", "names": []any{nil, false, "a", false, "b"}, "sel": []any{map[string]any{"name": nil}, map[string]any{"name": "a"}, map[string]any{"name": false}}},
+		{"names": []any{nil, false}, "sel": []any{map[string]any{"name": false}, map[string]any{}}},
+		{"sel": []any{map[string]any{"name": "a"}, "x", map[string]any{"name": "b"}}},
+		{"sel": []any{"x", map[string]any{"name": "b"}}},
+		{"name": "n", "names": "str", "sel": map[string]any{"b": map[string]any{"name": "y"}, "a": map[string]any{"name": false}}},
+		{"name": "", "names": []any{""}},
+		{"names": map[string]any{"b": "y", "a": false}},
 	}
 }
 
@@ -478,7 +528,9 @@ func sourceNegativeArms() []namedChain {
 		{"neg: union (\"zzz\", $n)", oneStage(`.extras.name as $n | [.s.items[] | select(.metadata.name == ("zzz", $n))]`, "")},
 		{"neg: object {app: $n}", oneStage(`.extras.name as $n | [.s.items[] | select(.metadata.labels == {app: $n})]`, "")},
 		{"neg: two extras paths ($e.a, $e.b)", oneStage(`.extras as $e | [.s.items[] | select(.metadata.name == ($e.a, $e.b))]`, "")},
-		{"neg: default .extras.name // \"\"", oneStage(`(.extras.name // "") as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
+		{"neg: alternative of two chains .a // .b", oneStage(`(.extras.name // .extras.other) as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
+		{"neg: a default of a default", oneStage(`((.extras.name // "") // "y") as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
+		{"neg: navigation after a default", oneStage(`((.extras.o // {}) | .name) as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
 		{"neg: first($ns[])", oneStage(`.extras.names as $ns | [.s.items[] | select(.metadata.name == first($ns[]))]`, "")},
 		{"neg: $n | select(. != \"\")", oneStage(`.extras.name as $n | [.s.items[] | select(.metadata.name == ($n | select(. != "")))]`, "")},
 		{"neg: $ns[0]", oneStage(`.extras.names as $ns | [.s.items[] | select(.metadata.name == $ns[0])]`, "")},
@@ -602,22 +654,36 @@ func assertBlocked(t *testing.T, prog string) {
 // must catch it: the program also compares with "zzz", which the source
 // .extras.name does not yield.
 func TestIssue633_UnionDecidableMutationIsRed(t *testing.T) {
-	c := namedChain{"union under " + mutUnionDecidable, oneStage(`.extras.name as $n | [.s.items[] | select(.metadata.name == ("zzz", $n))]`, "")}
+	sourceMutationIsRed(t, mutUnionDecidable, `.extras.name as $n | [.s.items[] | select(.metadata.name == ("zzz", $n))]`)
+}
+
+// TestIssue633_AltAsNavMutationIsRed: the named mutation reads
+// `.extras.name // ""` as .extras.name, dropping the default. The source
+// arm must catch it: with the name missing, null or false the program
+// compares with "", which the chain alone does not yield.
+func TestIssue633_AltAsNavMutationIsRed(t *testing.T) {
+	sourceMutationIsRed(t, mutAltAsNav, `(.extras.name // "") as $n | [.s.items[] | select(.metadata.name == $n)]`)
+	sourceMutationIsRed(t, mutAltAsNav, `.extras.names as $ns | [.s.items[] | select(.metadata.name == ($ns[] // "d"))]`)
+}
+
+func sourceMutationIsRed(t *testing.T, mutation, prog string) {
+	t.Helper()
+	c := namedChain{prog + " under " + mutation, oneStage(prog, "")}
 	green := &sourceStats{}
 	checkSources(c, 6332, 200, green)
 	if len(green.failures) > 0 {
 		t.Fatalf("without the mutation: %v", green.failures)
 	}
-	testMutations = map[string]bool{mutUnionDecidable: true}
+	testMutations = map[string]bool{mutation: true}
 	in := Analyze(c.chain, jqsupport.ModuleLoader())
 	red := &sourceStats{}
 	checkSources(c, 6332, 200, red)
 	testMutations = nil
 	if in.Membership == nil {
-		t.Fatalf("the mutation must make the union Decidable (a claimed membership): %s %v", in, in.MembershipBlockers)
+		t.Fatalf("under %s the guard must be claimed Decidable: %s %v", mutation, in, in.MembershipBlockers)
 	}
 	if len(red.failures) == 0 {
-		t.Fatalf("mutation %q went UNDETECTED by the source arm (%d comparisons)", mutUnionDecidable, red.compared)
+		t.Fatalf("mutation %q went UNDETECTED by the source arm (%d comparisons)", mutation, red.compared)
 	}
-	t.Logf("RED under %s: %s", mutUnionDecidable, red.failures[0])
+	t.Logf("RED under %s: %s", mutation, red.failures[0])
 }

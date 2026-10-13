@@ -134,10 +134,11 @@ type KeyGuard struct {
 	// Extras, when non-nil, is how PR-2 computes an extras constant: the
 	// constant is exactly the value (or, for a stream, every value) at
 	// Extras.Path of the root Extras.Root (#633). It is set only when the
-	// constant is ONE navigation chain from that root. Anything else that
-	// involves the extras (a union such as ("zzz", $n), an object such as
-	// {app: $n}, a value derived from them such as $n + "-x" or
-	// .extras.name // "") leaves it nil, and the guard is not Decidable.
+	// constant is ONE navigation chain from that root, optionally followed by
+	// `// <literal>` (Extras.HasDefault). Anything else that involves the
+	// extras (a union such as ("zzz", $n), an object such as {app: $n}, a
+	// value derived from them such as $n + "-x", first($ns[]), or
+	// .a // .b) leaves it nil, and the guard is not Decidable.
 	Extras *ExtrasSource
 }
 
@@ -174,57 +175,97 @@ const (
 // ExtrasSource is a structured extras constant: navigate Root along Path.
 // Path holds object keys and, when Stream is set, at least one [] step (every
 // element of an array, every value of an object).
+//
+// With HasDefault, the constant is `<chain> // Default` (Default a literal):
+// jq's alternative operator yields the chain's truthy values (neither null
+// nor false), or Default when the chain yields none.
 type ExtrasSource struct {
-	Root   ExtrasRoot
-	Path   Path
-	Stream bool
+	Root       ExtrasRoot
+	Path       Path
+	Stream     bool
+	HasDefault bool
+	Default    any
 }
 
-func (x ExtrasSource) String() string { return string(x.Root) + ":" + x.Path.String() }
+func (x ExtrasSource) String() string {
+	s := string(x.Root) + ":" + x.Path.String()
+	if x.HasDefault {
+		b, _ := json.Marshal(x.Default)
+		s += " // " + string(b)
+	}
+	return s
+}
 
 // Eval computes the constant on the cell's real root, with jq's semantics:
 // .k on null is null, a missing key is null, [] yields every array element
-// or object value. The result is every value the program compares the key
-// with (exactly one for a non-stream source).
+// or object value, in order. The result is every value the program compares
+// the key with (exactly one for a non-stream source without a default).
 //
 // An error means jq raises on this root: the program either fails or, under
 // a try, compares with a prefix of the stream. PR-2 must then treat the
-// guard as undecidable for this cell (the edge reads everything).
+// guard as undecidable for this cell (the edge reads everything). This holds
+// with a default too: the gojq the resolver runs (krateo-platformops/gojq
+// v0.13.0) does NOT absorb an error raised on the left of `//` (pinned by
+// TestExtrasSource_RootsNavigateLikeJQ against that gojq).
 func (x ExtrasSource) Eval(root any) ([]any, error) {
-	cur := []any{root}
-	for _, st := range x.Path {
-		var next []any
-		for _, v := range cur {
-			if st.Any {
-				switch t := v.(type) {
-				case []any:
-					next = append(next, t...)
-				case map[string]any:
-					keys := make([]string, 0, len(t))
-					for k := range t {
-						keys = append(keys, k)
-					}
-					sort.Strings(keys)
-					for _, k := range keys {
-						next = append(next, t[k])
-					}
-				default:
-					return nil, fmt.Errorf("cannot iterate over %T", v)
-				}
-				continue
-			}
-			switch t := v.(type) {
-			case nil:
-				next = append(next, nil)
-			case map[string]any:
-				next = append(next, t[st.Key])
-			default:
-				return nil, fmt.Errorf("cannot index %T with %q", v, st.Key)
-			}
-		}
-		cur = next
+	var out []any
+	if err := navEach(root, x.Path, func(v any) { out = append(out, v) }); err != nil {
+		return nil, err
 	}
-	return cur, nil
+	if !x.HasDefault {
+		return out, nil
+	}
+	var truthy []any
+	for _, v := range out {
+		if v != nil && v != false {
+			truthy = append(truthy, v)
+		}
+	}
+	if len(truthy) == 0 {
+		return []any{x.Default}, nil
+	}
+	return truthy, nil
+}
+
+// navEach yields, depth first and in jq's order, every value at path, and
+// stops at the first error (as jq does).
+func navEach(v any, path Path, emit func(any)) error {
+	if len(path) == 0 {
+		emit(v)
+		return nil
+	}
+	st := path[0]
+	if st.Any {
+		switch t := v.(type) {
+		case []any:
+			for _, e := range t {
+				if err := navEach(e, path[1:], emit); err != nil {
+					return err
+				}
+			}
+			return nil
+		case map[string]any:
+			keys := make([]string, 0, len(t))
+			for k := range t {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				if err := navEach(t[k], path[1:], emit); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return fmt.Errorf("cannot iterate over %T", v)
+	}
+	switch t := v.(type) {
+	case nil:
+		return navEach(nil, path[1:], emit)
+	case map[string]any:
+		return navEach(t[st.Key], path[1:], emit)
+	}
+	return fmt.Errorf("cannot index %T with %q", v, st.Key)
 }
 
 func (k KeyGuard) String() string {

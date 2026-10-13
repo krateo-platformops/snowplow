@@ -110,10 +110,32 @@ func extrasAt(root ExtrasRoot, src string, path ...Step) *abs {
 
 // navStep extends a structured source by one navigation step (nil stays nil).
 func navStep(n *ExtrasSource, st Step) *ExtrasSource {
-	if n == nil {
+	if n == nil || n.HasDefault {
+		// (a // d).k is not a navigation of a: the default would be lost.
 		return nil
 	}
 	return &ExtrasSource{Root: n.Root, Path: n.Path.with(st), Stream: n.Stream || st.Any}
+}
+
+// altDefault is `l // r` when l is one extras navigation chain (without a
+// default) and r a literal: a structured source with a default (#633), which
+// is exactly evaluable. nil otherwise (the caller keeps the union).
+// mutAltAsNav reads `//` as plain navigation: the default is dropped.
+func altDefault(l, r *abs, inCU bool) *abs {
+	if l.k != aConst || l.cc != ccExtras || l.nav == nil || l.nav.HasDefault {
+		return nil
+	}
+	if r.k != aConst || r.cc != ccLiteral || !r.hasLit {
+		return nil
+	}
+	c := constOf(ccExtras, l.src+" // "+r.src)
+	n := *l.nav
+	n.Path = append(Path{}, l.nav.Path...)
+	if !mutated(mutAltAsNav) {
+		n.HasDefault, n.Default = true, r.lit
+	}
+	c.nav = &n
+	return withCU(withCU(c, l.cu), r.cu || inCU)
 }
 
 // extrasSourceOf returns the structured source of a key constant: set only
