@@ -105,6 +105,12 @@ func ResetCacheProcessStateForTest() error {
 	// increments. Composed rather than exempted — #471.
 	ResetLiveRefreshArmingStatsForTest()
 
+	// 5d — #608 refresh failures by (err_class, stage). Process-global (the
+	// refresher pool is reset per test but these are not on it), so a test
+	// asserting on a class count would read a sibling's failures. Composed
+	// rather than exempted — #471.
+	ResetRefreshFailedByClassForTest()
+
 	// 6 — the publish container, after the incremental rebuild has quiesced.
 	err := WaitRBACRebuildQuiesceForTest(5 * time.Second)
 	PublishRBACSnapshotForTest(nil)

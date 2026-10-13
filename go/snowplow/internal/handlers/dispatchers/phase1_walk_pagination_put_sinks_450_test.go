@@ -53,7 +53,6 @@ package dispatchers
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -72,7 +71,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	rbacv1 "k8s.io/api/rbac/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -540,11 +538,12 @@ func TestIssue450_DrainWidgetContentPut_DeclinesOnSecretRead(t *testing.T) {
 				out, err := widgets.Resolve(ctx, opts) // REAL resolve
 				resolveErr = err
 				// Swallow ONLY the tail crdschema.ValidateObjectStatus failure
-				// (Resolve wraps it as a 400 StatusError). Anything else, e.g.
-				// an apiRef failure, propagates and the drain declines on it, as
-				// in production. The control would then fail loudly.
-				var se *apierrors.StatusError
-				if err != nil && errors.As(err, &se) && se.ErrStatus.Code == http.StatusBadRequest {
+				// (Resolve tags it with the validate stage — #608; before #608
+				// every validator error was relabelled a 400, which is what this
+				// matched). Anything else, e.g. an apiRef failure, propagates and
+				// the drain declines on it, as in production. The control would
+				// then fail loudly.
+				if err != nil && cache.ResolveStageOf(err) == cache.ResolveStageValidate {
 					return out, nil
 				}
 				return out, err

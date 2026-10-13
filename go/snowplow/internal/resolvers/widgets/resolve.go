@@ -9,6 +9,7 @@ package widgets
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -177,7 +178,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	if err != nil {
 		log.Error("unable to resolve api reference", slog.Any("err", err))
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
-		return opts.In, err
+		return opts.In, cache.WrapResolveStage(cache.ResolveStageApiRef, "resolve apiRef "+stageObject(opts.In), err)
 	}
 
 	// Ship H7 (0.30.161): re-inject the pagination triple into the
@@ -206,7 +207,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	if err != nil {
 		log.Error("unable to resolve widget data", slog.Any("err", err))
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
-		return opts.In, err
+		return opts.In, cache.WrapResolveStage(cache.ResolveStageWidgetData, "resolve widgetData "+stageObject(opts.In), err)
 	}
 
 	err = maps.SetNestedField(opts.In.Object, widgetData, "status", widgetDataKey)
@@ -239,7 +240,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	phaseResRefsMs = time.Since(resRefsStart).Milliseconds()
 	if err != nil {
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
-		return opts.In, err
+		return opts.In, cache.WrapResolveStage(cache.ResolveStageResourcesRefs, "resolve resourcesRefs "+stageObject(opts.In), err)
 	}
 
 	if tot := len(resourcesRefsResults); tot > 0 {
@@ -283,16 +284,37 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	phaseValidateMs = time.Since(validateStart).Milliseconds()
 	if err != nil {
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
-		return opts.In, &apierrors.StatusError{
-			ErrStatus: metav1.Status{
-				Status:  metav1.StatusFailure,
-				Code:    http.StatusBadRequest,
-				Reason:  metav1.StatusReasonBadRequest,
-				Message: err.Error(),
-			}}
+		// #608 — ONLY a genuine schema-validation failure is a 400. Before this,
+		// EVERY validator error was relabelled as one, so a 403 on the discovery
+		// hop in front of the CRD GET (client-go text: "unknown") reached the
+		// refresher as `400 unknown` and nothing could tell what failed. Every
+		// other error keeps its own status through the chain (errors.As still
+		// reaches a 403/404/5xx), and the stage prefix names the hop and the
+		// object.
+		var invalid *crdschema.InvalidStatusError
+		if errors.As(err, &invalid) {
+			err = &apierrors.StatusError{
+				ErrStatus: metav1.Status{
+					Status:  metav1.StatusFailure,
+					Code:    http.StatusBadRequest,
+					Reason:  metav1.StatusReasonBadRequest,
+					Message: err.Error(),
+				}}
+		}
+		return opts.In, cache.WrapResolveStage(cache.ResolveStageValidate, "validate status "+stageObject(opts.In), err)
 	}
 
 	return opts.In, nil
+}
+
+// stageObject names the widget a failing stage was resolving: its GVK and
+// namespace/name. The stage-error prefix carries it so a failure line always
+// says which object, not just which hop (#608).
+func stageObject(w *Widget) string {
+	if w == nil {
+		return "<nil>"
+	}
+	return w.GroupVersionKind().String() + " " + w.GetNamespace() + "/" + w.GetName()
 }
 
 func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, error) {

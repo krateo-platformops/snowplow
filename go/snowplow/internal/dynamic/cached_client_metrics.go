@@ -65,6 +65,10 @@ func registerSADiscoveryMetrics() {
 		expvar.Publish("snowplow_sa_discovery_fallbacks_total", expvar.Func(func() any {
 			return SADiscoveryStatsSnapshot().Fallbacks
 		}))
+		// #608 — an impersonating config handed to the SA singleton (refused).
+		expvar.Publish("snowplow_sa_discovery_impersonated_rejected_total", expvar.Func(func() any {
+			return SADiscoveryStatsSnapshot().ImpersonatedRejected
+		}))
 	})
 }
 

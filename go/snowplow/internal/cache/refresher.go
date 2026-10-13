@@ -1078,7 +1078,14 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		// same key starts clean) and DROP it — no AddRateLimited. The
 		// entry stays in L1, stale, until its TTL purges it; a later
 		// informer event can re-enqueue it fresh.
-		if q.NumRequeues(key) >= maxRefreshRequeues {
+		//
+		// #608 (Q2 ruling) — a NON-RETRYABLE failure (a 403: the apiserver's
+		// authorization decision for this identity, refused identically at
+		// every backoff step) skips the budget and reaches this same drop point
+		// on its first attempt. The window accounting and the counters are
+		// unchanged, but it is NEVER evicted (see the forbidden branch below).
+		nonRetryable := IsNonRetryableRefreshError(err)
+		if nonRetryable || q.NumRequeues(key) >= maxRefreshRequeues {
 			q.Forget(key)
 			r.droppedTotal.Add(1)
 			// #354 P3 — the poison-pill bound ends the window (before the
@@ -1136,6 +1143,32 @@ func (r *refresher) processNext(ctx context.Context) bool {
 				)
 				return true
 			}
+			// #608 — A FORBIDDEN DROP NEVER EVICTS. Non-retryable means "do not
+			// burn the requeue budget on it", NOT "the body is unvouchable": a
+			// single 403 is not a determinism proof (a transient authz blip, an
+			// RBAC roll mid-flight, a webhook hiccup on validate/apiref all keep
+			// the StatusError), and evicting on attempt 1 turns it into a cold
+			// navigation — the zero-cold-navigation requirement and the #547
+			// ruling (never evict on a failed refresh) forbid that. The entry
+			// stays RESIDENT and SERVED; Forget above cleared the rate limiter,
+			// so the next dirty mark (or read-triggered refresh) retries it
+			// clean. #547 turns this resident-after-failure state into the
+			// known-stale state. Counted on dropped_total (above) and on
+			// refresh_failed{err_class="forbidden"}.
+			if nonRetryable {
+				slog.Warn("refresher.refresh_dropped",
+					slog.String("subsystem", "cache"),
+					slog.String("key_hash", key),
+					slog.Int("requeues", q.NumRequeues(key)),
+					slog.Bool("non_retryable", true),
+					slog.Bool("cluster_list_tier", fromCL),
+					slog.Bool("evicted", false),
+					slog.String("err", err.Error()),
+					slog.String("effect", "forbidden refresh — not retried and NOT evicted: the entry stays "+
+						"resident and served until the next dirty mark retries it (#608, #547)"),
+				)
+				return true
+			}
 			// 1.12.6 C4 (§6.2 row 3, §6.3) — EVERY OTHER deterministic failure
 			// (403 / 500 / timeout / parse failure / apistage not-servable) that
 			// exhausts the same budget is now EVICTED at the same drop point,
@@ -1167,6 +1200,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 						slog.String("subsystem", "cache"),
 						slog.String("key_hash", key),
 						slog.Int("requeues", maxRefreshRequeues),
+						slog.Bool("non_retryable", nonRetryable),
 						slog.Bool("cluster_list_tier", fromCL),
 						slog.Bool("evicted", evicted),
 						slog.String("err", err.Error()),
@@ -1182,6 +1216,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.Int("requeues", maxRefreshRequeues),
+				slog.Bool("non_retryable", nonRetryable),
 				slog.Bool("cluster_list_tier", fromCL),
 				slog.String("effect", "deterministic refresh failure — key dropped to TTL outer-net, not retried "+
 					"(drop-point eviction disabled or suspended by the breaker)"),
@@ -1307,11 +1342,18 @@ func (r *refresher) processOne(ctx context.Context, key string, entry *ResolvedE
 	err := fn(ctx, key, *entry.Inputs)
 	r.recordResolveLatency(time.Since(resolveStart))
 	if err != nil {
+		// #608 — a closed-set class and the failing stage, so a failure is
+		// never read as the bare text `unknown` again.
+		errClass, stage := ClassifyRefreshError(err)
+		recordRefreshFailedClass(errClass, stage)
 		slog.Warn("refresher.refresh_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("handler_kind", entry.Inputs.CacheEntryClass),
 			slog.String("key_hash", key),
 			slog.Int("requeues", r.queue.NumRequeues(key)),
+			slog.String("err_class", errClass),
+			slog.String("stage", stage),
+			slog.Bool("non_retryable", IsNonRetryableRefreshError(err)),
 			slog.Any("err", err),
 		)
 		return err

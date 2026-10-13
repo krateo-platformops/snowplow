@@ -174,7 +174,11 @@ var cacheAllow443 = map[string]cacheClass443{
 	// question now has one answer, inside the cache package, so the resolver
 	// cannot drift out of half of it again (which is #563 itself). The stale-entry
 	// half of this census is what required removing the row.
-	"RefDenialOrigin":     readOnly443,
+	"RefDenialOrigin": readOnly443,
+	// #608 — the validator's transport pick reads the set-once process SA
+	// *rest.Config (an RLock + pointer read, no state written), and the stage
+	// wrap only builds an error value. Neither outlives the request.
+	"ProcessSARestConfig": readOnly443, "WrapResolveStage": readOnly443,
 	"RAFullListKeyInputs": readOnly443, "RefreshTriggerGVRFromContext": readOnly443, "RefreshTriggerHas": readOnly443,
 	"ReplayRAFullListSlices": readOnly443, "ResolvedCache": readOnly443, "ResolvedCacheEnabled": readOnly443,
 	"ResolvedCacheStore.CaptureGen": readOnly443, "ResolvedCacheStore.GetNoTouch": readOnly443,

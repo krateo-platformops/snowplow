@@ -10,11 +10,13 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	xenv "github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
 
@@ -140,7 +142,10 @@ func TestResolve_ValidateError_WrapsAs400StatusError(t *testing.T) {
 	// widgetData is kept; resourcesRefsTemplate absent ⇒ no refs.
 	stubApiRef(t, map[string]any{}, nil)
 	validateMsg := "status.widgetData.label: Invalid value: must be a string"
-	stubValidate(t, errors.New(validateMsg))
+	// #608 — only a GENUINE schema-validation failure (crdschema marks it
+	// InvalidStatusError) is a 400; TestResolve_ValidateHopError_KeepsItsStatus
+	// pins that every other validator error keeps its own status.
+	stubValidate(t, &crdschema.InvalidStatusError{Err: errors.New(validateMsg)})
 
 	w := baseWidget()
 	got, err := Resolve(hermeticCtx(t), ResolveOptions{In: w})
@@ -170,6 +175,29 @@ func TestResolve_ValidateError_WrapsAs400StatusError(t *testing.T) {
 	require.NoError(t, e)
 	require.True(t, ok, "status.widgetData must be written before validation runs")
 	assert.Equal(t, "static-base", wd["label"])
+}
+
+// TestResolve_ValidateHopError_KeepsItsStatus — #608. A 403 from the
+// validator's apiserver hop (on 057: the discovery GET /api in front of the CRD
+// GET, whose message client-go reports as the literal "unknown") must NOT be
+// relabelled a 400. It keeps Code 403 through the chain, and the error names
+// the stage and the widget.
+func TestResolve_ValidateHopError_KeepsItsStatus(t *testing.T) {
+	stubApiRef(t, map[string]any{}, nil)
+	forbidden := apierrors.NewGenericServerResponse(http.StatusForbidden, "get",
+		schema.GroupResource{}, "", "unknown", 0, false)
+	stubValidate(t, forbidden)
+
+	w := baseWidget()
+	_, err := Resolve(hermeticCtx(t), ResolveOptions{In: w})
+	require.Error(t, err)
+
+	var se *apierrors.StatusError
+	require.True(t, errors.As(err, &se))
+	assert.Equal(t, int32(http.StatusForbidden), se.ErrStatus.Code, "a validator-hop 403 must stay a 403")
+	assert.True(t, apierrors.IsForbidden(err))
+	assert.Equal(t, cache.ResolveStageValidate, cache.ResolveStageOf(err))
+	assert.Contains(t, err.Error(), "validate status "+w.GroupVersionKind().String())
 }
 
 // TestResolve_ValidateOK_ReturnsNilNoStatusError — the happy path: validate
