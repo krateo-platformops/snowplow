@@ -459,7 +459,7 @@ def snapshot_counters(snapshot: dict) -> dict:
     """
     wanted = [
         (K_DEPS, ["evict_delete_total", "evict_self_gone_total",
-                  "evict_drop_point_total", "delete_worker_panics_total",
+                  "delete_worker_panics_total",
                   "dropped_cap", "reconcile_divergence_total",
                   "reconcile_sampled_total", "reconcile_ticks_total",
                   "events_submitted_total", "dep_event_queue_depth"]),
@@ -705,9 +705,8 @@ def stage_a_rows(expect_n: int = 1) -> list[Row]:
         Row("A3", "NOT the refresher self-404 leg",
             f"{D}.evict_self_gone_total", "0",
             _eq(f"{D}.evict_self_gone_total", 0)),
-        Row("A4", "NOT the C4 drop point",
-            f"{D}.evict_drop_point_total", "0",
-            _eq(f"{D}.evict_drop_point_total", 0)),
+        # (A4 "NOT the C4 drop point" retired with snowplow_deps.evict_drop_point_total:
+        # #547 removed the non-404 drop-point eviction, so that route no longer exists.)
         Row("A5", "C10 published the eviction frame",
             f"{B}.evict_published", f"+{expect_n}",
             _eq(f"{B}.evict_published", expect_n)),
@@ -1349,8 +1348,8 @@ def stage_counters_after(ctx: dict) -> dict:
     # PER-KEY CHANNEL, step 3: the eviction must have removed THIS entry.
     #
     # The global evict counters say an eviction happened; they cannot say it was ours, for the
-    # same reason store_total cannot — evict_drop_point_total was already 1 at rest on an idle
-    # 057. A Count of 0 for the armed key is the per-key fact, and it is the one that closes
+    # same reason store_total cannot — on 1.12.6 evict_drop_point_total (retired by #547) was
+    # already 1 at rest on an idle 057. A Count of 0 for the armed key is the per-key fact, and it is the one that closes
     # the loop: the object we deleted is the object whose entry left the store.
     insp_after = read_apistage_key(portal, ctx["token"], ctx["refresh_key"], reqlog)
     evicted = insp_after.get("count") == 0

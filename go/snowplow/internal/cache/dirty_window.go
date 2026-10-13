@@ -24,6 +24,20 @@
 // A retried error and a rate-floor deferral keep the window open: both are part
 // of the time a customer waits for the fresh body.
 //
+// #547 — KNOWN-STALE. A declined or dropped window (and the suppressed skip,
+// which is a decline) is counted as before, but its stamp is NOT deleted: it is
+// converted to {t0, stale: <reason>} and stays until an accepted re-Put closes
+// it (windowFresh, or an accepted demand revalidation) or the cell leaves the
+// store (evictDirtyWindow). Before #547 the stamp was erased there
+// (CompareAndDelete), so the cell looked exactly like a fresh one: every reload
+// was a hit on a body the system knew was stale, nothing re-validated it short
+// of a later informer event or the TTL, and stale_served_total went blind at the
+// very moment the user started seeing stale data. The serve path reads the
+// reason (known_stale.go): an identity-bound cell is served (zero cold
+// navigation) and revalidated on demand under the requester; an identity-free
+// substrate cell is read through. Only evicted ends a window without a fresh
+// body, because then there is no body left to be stale.
+//
 // THE STAMP. firstDirtyAt (refresher.dirty) maps l1Key → *dirtyStamp, an
 // IMMUTABLE value replaced by CompareAndSwap. A mark LoadOrStores, so the first
 // mark wins. The dequeue does NOT delete it: it flips it to inflight, so a
@@ -77,6 +91,15 @@ type dirtyStamp struct {
 	t0       time.Time // the first mark of the window (monotonic)
 	inflight bool      // a dequeue is re-resolving the key now
 	next     time.Time // a mark that landed during the in-flight re-resolve (zero = none)
+	// stale (#547) is non-zero once a refresh of this window ENDED without an
+	// accepted re-Put: the body is KNOWN-STALE since t0. It survives later marks
+	// and later in-flight dequeues; only a fresh Put or an eviction clears it.
+	stale knownStaleReason
+	// seq (#547) is the dep-event sequence at the LATEST mark of this window. An
+	// accepted Put whose resolve began at or after it (its #375 sink startSeq)
+	// read the post-mark state, so it closes a known-stale window whatever
+	// carrier wrote it (closeKnownStaleOnPut).
+	seq uint64
 }
 
 // unfreshReason indexes the closed set of unfresh outcomes.
@@ -127,16 +150,23 @@ func (r *refresher) markDirty(key string, now time.Time) {
 	if key == "" {
 		return
 	}
+	seq := depEventSeq.Load()
 	for {
-		cur, loaded := r.dirty.LoadOrStore(key, &dirtyStamp{t0: now})
+		cur, loaded := r.dirty.LoadOrStore(key, &dirtyStamp{t0: now, seq: seq})
 		if !loaded {
 			return
 		}
 		s := cur.(*dirtyStamp)
-		if !s.inflight || !s.next.IsZero() {
+		// First mark wins t0; #547 — the LATEST mark's seq is kept, so a Put whose
+		// resolve predates a later mark never closes the window.
+		next := &dirtyStamp{t0: s.t0, inflight: s.inflight, next: s.next, stale: s.stale, seq: seq}
+		if s.inflight && s.next.IsZero() {
+			next.next = now
+		}
+		if s.seq >= seq && (!s.inflight || !s.next.IsZero()) {
 			return
 		}
-		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: now}) {
+		if r.dirty.CompareAndSwap(key, cur, next) {
 			return
 		}
 	}
@@ -151,16 +181,18 @@ func (r *refresher) beginWindow(key string) (t0 time.Time, open bool) {
 			return time.Time{}, false
 		}
 		s := cur.(*dirtyStamp)
-		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next}) {
+		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, stale: s.stale, seq: s.seq}) {
 			return s.t0, true
 		}
 	}
 }
 
-// settleWindow closes (keepOpen=false) or re-opens (keepOpen=true, the earliest
-// mark kept) key's in-flight window. gone reports that the stamp was removed by
-// an eviction during the dequeue.
-func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool) (gone bool) {
+// settleWindow closes (keepOpen=false, stale=none) or re-opens (keepOpen=true,
+// the earliest mark kept) key's in-flight window, or — #547 — marks it
+// KNOWN-STALE (stale != none: the refresh ended without an accepted re-Put, the
+// earliest mark kept). gone reports that the stamp was removed by an eviction
+// during the dequeue.
+func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool, stale knownStaleReason) (gone bool) {
 	for {
 		cur, ok := r.dirty.Load(key)
 		if !ok {
@@ -175,9 +207,14 @@ func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool) (gone 
 		var next any
 		switch {
 		case keepOpen:
-			next = &dirtyStamp{t0: t0}
+			next = &dirtyStamp{t0: t0, stale: s.stale, seq: s.seq}
+		case stale != knownStaleNone:
+			// #547 — the mark outlives the failed refresh. A mark that landed
+			// during it (s.next) is already re-queued by the workqueue, and the
+			// body has been stale since the EARLIER t0, so t0 is kept.
+			next = &dirtyStamp{t0: t0, stale: stale, seq: s.seq}
 		case !s.next.IsZero():
-			next = &dirtyStamp{t0: s.next}
+			next = &dirtyStamp{t0: s.next, seq: s.seq}
 		default:
 			if r.dirty.CompareAndDelete(key, cur) {
 				return false
@@ -192,7 +229,12 @@ func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool) (gone 
 
 // windowFresh closes the window with a sample of now − t0.
 func (r *refresher) windowFresh(key string, t0 time.Time) {
-	r.settleWindow(key, t0, false)
+	r.settleWindow(key, t0, false, knownStaleNone)
+	r.sampleFresh(t0)
+}
+
+// sampleFresh records one dirty→fresh sample of now − t0.
+func (r *refresher) sampleFresh(t0 time.Time) {
 	ms := time.Since(t0).Milliseconds()
 	if ms < 0 {
 		ms = 0
@@ -204,10 +246,23 @@ func (r *refresher) windowFresh(key string, t0 time.Time) {
 	}
 }
 
-// windowUnfresh ends (or, for remarked, keeps open) the window and counts the
-// reason; a window an eviction removed mid-dequeue counts as evicted.
-func (r *refresher) windowUnfresh(key string, t0 time.Time, reason unfreshReason) {
-	if r.settleWindow(key, t0, reason == unfreshRemarked) {
+// windowUnfresh ends (evicted), keeps open (remarked) or — #547 — marks
+// KNOWN-STALE (declined / dropped) the window and counts the reason; a window an
+// eviction removed mid-dequeue counts as evicted. ks names the known-stale
+// reason for declined / dropped (knownStaleNone derives it from reason).
+func (r *refresher) windowUnfresh(key string, t0 time.Time, reason unfreshReason, ks knownStaleReason) {
+	if ks == knownStaleNone {
+		switch reason {
+		case unfreshDeclined:
+			ks = knownStaleDeclined
+		case unfreshDropped:
+			ks = knownStaleDropped
+		}
+	}
+	if reason == unfreshRemarked || reason == unfreshEvicted {
+		ks = knownStaleNone
+	}
+	if r.settleWindow(key, t0, reason == unfreshRemarked, ks) {
 		reason = unfreshEvicted
 	}
 	r.dirtyStats.unfresh[reason].Add(1)
@@ -215,7 +270,7 @@ func (r *refresher) windowUnfresh(key string, t0 time.Time, reason unfreshReason
 
 // windowContinue keeps the window open from t0 (a retried error).
 func (r *refresher) windowContinue(key string, t0 time.Time) {
-	if r.settleWindow(key, t0, true) {
+	if r.settleWindow(key, t0, true, knownStaleNone) {
 		r.dirtyStats.unfresh[unfreshEvicted].Add(1)
 	}
 }
@@ -232,7 +287,10 @@ func evictDirtyWindow(key string) {
 	if !ok {
 		return
 	}
-	if s := cur.(*dirtyStamp); !s.inflight {
+	// #547 — a KNOWN-STALE stamp's window was already counted when its refresh
+	// ended (declined / dropped); its eviction ends the known-stale state, not a
+	// second window.
+	if s := cur.(*dirtyStamp); !s.inflight && s.stale == knownStaleNone {
 		r.dirtyStats.unfresh[unfreshEvicted].Add(1)
 	}
 }
@@ -248,6 +306,20 @@ func dirtySince(key string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return v.(*dirtyStamp).t0, true
+}
+
+// dirtyStampFor returns key's open window stamp (the stale-serve probe, #547:
+// with its known-stale reason).
+func dirtyStampFor(key string) (*dirtyStamp, bool) {
+	r := refresherPeek()
+	if r == nil {
+		return nil, false
+	}
+	v, ok := r.dirty.Load(key)
+	if !ok {
+		return nil, false
+	}
+	return v.(*dirtyStamp), true
 }
 
 // DirtyWindowsOpenForTest counts the open windows (F6d). TEST-ONLY.

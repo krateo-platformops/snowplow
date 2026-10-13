@@ -189,16 +189,15 @@ func RefresherSnapshot() (enqueued, completed, failed, retried, dropped,
 }
 
 // RefresherTerminalSnapshot returns the 1.12.6 C4 terminal-semantics
-// counters (drop-point evictions, breaker suspensions, #191 suppression)
-// for the OTLP mirror — the same numbers snowplow_refresher_drop_evict_total,
-// _drop_evict_suspended_total, _suppressed_set_total, _suppressed_skips_total
-// and _suppressed_keys publish on expvar. Reads package-level atomics only
-// (never the refresher singleton): safe before StartRefresher and on
-// cache-off, where every value is zero. suppressedKeys is a live count (a
-// gauge), the other four are monotonic.
-func RefresherTerminalSnapshot() (dropEvict, dropEvictSuspended, suppressedSet, suppressedSkips uint64, suppressedKeys int64) {
+// counters (#191 suppression; #547 retired the drop-point breaker's) for the
+// OTLP mirror — the same numbers snowplow_refresher_suppressed_set_total,
+// _suppressed_skips_total and _suppressed_keys publish on expvar. Reads
+// package-level atomics only (never the refresher singleton): safe before
+// StartRefresher and on cache-off, where every value is zero. suppressedKeys is
+// a live count (a gauge), the other two are monotonic.
+func RefresherTerminalSnapshot() (suppressedSet, suppressedSkips uint64, suppressedKeys int64) {
 	ts := RefreshTerminalStatsSnapshot()
-	return ts.DropEvictTotal, ts.DropEvictSuspendedTotal, ts.SuppressedSetTotal, ts.SuppressedSkipsTotal, int64(ts.SuppressedKeys)
+	return ts.SuppressedSetTotal, ts.SuppressedSkipsTotal, int64(ts.SuppressedKeys)
 }
 
 // UpstreamHealthSnapshot collapses the per-controller controller-health

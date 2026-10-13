@@ -294,8 +294,8 @@ func TestC7_Wiring_DistinctValuesReachEveryDerivedStat(t *testing.T) {
 	t.Cleanup(resetRefresherForTest)
 	ResetRefreshTerminalForTest()
 	t.Cleanup(ResetRefreshTerminalForTest)
-	AddRefreshTerminalCountersForTest(301, 302, 303, 304, 5)
-	terminal := map[string]int64{"drop_evict": 301, "drop_evict_suspended": 302, "suppressed_set": 303, "suppressed_skips": 304, "suppressed_keys": 5}
+	AddRefreshTerminalCountersForTest(303, 304, 5)
+	terminal := map[string]int64{"suppressed_set": 303, "suppressed_skips": 304, "suppressed_keys": 5}
 	wantR := map[string]int64{}
 	for i, s := range refresherStatSpecs() {
 		if w, ok := terminal[s.Stat]; ok {

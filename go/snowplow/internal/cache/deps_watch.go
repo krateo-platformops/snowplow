@@ -306,9 +306,9 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 			slog.String("effect", "informer not authoritative for this GVR for the whole requeue budget — "+
 				"dirty-marking dependents so the refresher decides against the apiserver "+
 				"(404 ⇒ evict at the drop point). Non-zero here means an informer is not recovering."),
-			slog.String("hint", "the 404 leg of that refresh resolves in seconds; a 403/500/timeout on it stays "+
-				"bounded by RESOLVED_CACHE_TTL_SECONDS (3600 s) until 1.12.6 C4 extends drop-point eviction "+
-				"to non-404 deterministic failures"),
+			slog.String("hint", "the 404 leg of that refresh evicts at the drop point; a 403/500/timeout on it "+
+				"leaves the cell resident and KNOWN-STALE (#547): served, counted on known_stale_served_total "+
+				"and revalidated on the next read"),
 		)
 		Deps().OnObjectEvent(k.gvr, k.namespace, k.name, objUnknownDegraded)
 		return

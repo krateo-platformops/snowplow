@@ -300,8 +300,17 @@ func TestIssue354_P3_F6_WindowKxM_GetByName(t *testing.T) {
 	if d := p3StoreStat("stale_served_total") - stale2; d != 0 {
 		t.Fatalf("F6: a GET after the Put must not count as stale (Δ=%d)", d)
 	}
-	if d := p3RefStat("dirty_to_fresh_samples") - s0; d != int64(len(keys)) {
-		t.Fatalf("F6: dirty_to_fresh_samples Δ=%d, want %d (one per window); unfresh=%v", d, len(keys), p3Unfresh())
+	// One sample per window, never two. #547: a window whose refresh DECLINED is
+	// no longer erased — it stays KNOWN-STALE and ends with a sample when an
+	// accepted post-mark Put lands (here: the substrate content cells the
+	// configmap change also marked, refilled by the GETs' read-through). So the
+	// conservation law is: every window ends fresh (one sample) or is still
+	// known-stale — the 12 cells' windows plus each declined one, exactly once.
+	declined := p3Unfresh()["declined"]
+	stillKnownStale := p3StoreStat("known_stale_resident")
+	if d := p3RefStat("dirty_to_fresh_samples") - s0; d+stillKnownStale != int64(len(keys))+declined || d < int64(len(keys)) {
+		t.Fatalf("F6: dirty_to_fresh_samples Δ=%d + known_stale_resident %d, want %d + declined %d (one per window); unfresh=%v",
+			d, stillKnownStale, len(keys), declined, p3Unfresh())
 	}
 	if p3RefStat("dirty_to_fresh_ms_p95") <= 0 {
 		t.Fatalf("F6: dirty_to_fresh_ms_p95 must be > 0 after %d samples", len(keys))

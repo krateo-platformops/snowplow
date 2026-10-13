@@ -107,8 +107,8 @@ var cacheAllow443 = map[string]cacheClass443{
 	// classified above, so an inert resolve may run them: it changes nothing an
 	// inert ctx must not change, and the Put they inform refuses under Inert
 	// anyway.
-	"UAFTouchedSinkFromContext": telemetry443,
-	"UAFTouchedSink.Count":      telemetry443,
+	"UAFTouchedSinkFromContext":         telemetry443,
+	"UAFTouchedSink.Count":              telemetry443,
 	"RecordApiserverFallthrough":        telemetry443,
 	"RecordClusterListCellColdFallback": telemetry443,
 	"RecordClusterListCellWarm":         telemetry443,
@@ -118,8 +118,13 @@ var cacheAllow443 = map[string]cacheClass443{
 	// background-unattributed / serve) instead of a prewarm-only scalar. Process
 	// counters only, no cache/informer/dep/refresher state — same class as the
 	// scalar it replaces.
-	"RecordRefDenied":                           telemetry443,
-	"RecordRAFullListServe":                     telemetry443,
+	"RecordRefDenied":       telemetry443,
+	"RecordRAFullListServe": telemetry443,
+	// #547 — the known-stale substrate gate: a read of the refresher's stamp map
+	// plus a process counter (known_stale_read_through_total). It decides a
+	// read-through (a MISS), which an inert resolve must take too; it writes no
+	// cache, informer, dep or refresher state.
+	"KnownStaleReadThrough":                     telemetry443,
 	"RecordResolverPluralsHit":                  telemetry443,
 	"RecordResolverPluralsMiss":                 telemetry443,
 	"PIPStageTimingSink.AccumulateContentServe": telemetry443,
@@ -152,7 +157,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	// nothing, records no dep edge, and its ONLY consumer is a sort key. Under
 	// cache.Inert the probe simply answers false and the seed keeps its
 	// pre-#594 first-nav order, so there is no side effect for the flag to gate.
-	"WithInformerOnlyReads": readOnly443,
+	"WithInformerOnlyReads":         readOnly443,
 	"InternalRESTConfigFromContext": readOnly443, "IsResolverGVRHit": readOnly443, "IsResolverPluralsHit": readOnly443,
 	"IsStructurallyNonSliceable": readOnly443, "L1KeyFromContext": readOnly443, "LayeredSourcesMark": readOnly443,
 	"LayeredSourcesSince": readOnly443, "LiveRBACSnapshot": readOnly443, "NestedCallDepthFromContext": readOnly443,

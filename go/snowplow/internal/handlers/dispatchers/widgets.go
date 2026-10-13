@@ -62,12 +62,20 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	pcs, pcEmit := beginPerCall(req, "widgets")
 	defer pcEmit()
 
-	// Ship 1 — customer-priority signal (see restactions.go). Marks this
-	// /call as in-flight so the prewarm engine yields its background
-	// re-seed work for the dispatch's duration.
-	defer markCustomerInFlight()()
-	// #262 S2 — see restactions.go.
-	observeLiveCaller(req)
+	// #547 — a demand revalidation re-enters this handler on a detached copy of
+	// a request that was already served (demand_revalidate.go): no customer is
+	// waiting on it and its caller was already observed.
+	demand := isDemandRevalidation(req)
+	if demand {
+		pcs.l1Hit = "revalidate"
+	} else {
+		// Ship 1 — customer-priority signal (see restactions.go). Marks this
+		// /call as in-flight so the prewarm engine yields its background
+		// re-seed work for the dispatch's duration.
+		defer markCustomerInFlight()()
+		// #262 S2 — see restactions.go.
+		observeLiveCaller(req)
+	}
 
 	extras, err := util.ParseExtras(req)
 	if err != nil {
@@ -194,7 +202,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// straight through to the per-cohort `widgets` L1 lookup below
 	// (dispatchCacheLookupKey), which is RBAC-narrowed at resolve under
 	// each cohort's own identity → no shared cell, no leak.
-	if !isRBACSensitiveApiRefWidget(got.Unstructured.Object) {
+	//
+	// #547 — a demand revalidation resolves; it never reads a cell.
+	if !demand && !isRBACSensitiveApiRefWidget(got.Unstructured.Object) {
 		contentKey, contentHandle, _ := dispatchWidgetContentKey(req.Context(),
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
@@ -209,6 +219,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					pcs.l1Hit = "content-hit"
 					setRefreshKeyHeader(wri, contentKey, "widgetContent")
 					writeResolvedJSON(wri, gated)
+					// #547 (owner ruling) — a KNOWN-STALE shared shell is SERVED
+					// instantly (counted in the Get funnel) and revalidated in the
+					// background by the refresher under its identity-free (SA)
+					// identity — never under this requester, never read through.
+					cache.RevalidateKnownStaleInBackground(contentKey)
 					log.Info("Widget successfully resolved",
 						slog.String("duration", util.ETA(start)),
 						slog.String("l1", "content-hit"),
@@ -250,7 +265,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// shared "" cell to a different ""-deriving identity (cross-identity read of
 	// a cell resolved under someone else's narrowing). Sibling of FIX-C's
 	// populate-side skip; uniform predicate (serveFromCacheEligible, helpers.go).
-	if cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
+	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
@@ -268,6 +283,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// byte-identical header behavior when the feature is off (C4).
 			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
 			writeResolvedJSON(wri, entry.RawJSON)
+			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
+			// revalidate it on demand under this requester, detached.
+			revalidateKnownStale(r, req, cacheKey)
 			log.Info("Widget successfully resolved",
 				slog.String("duration", util.ETA(start)),
 				slog.String("l1", "hit"),
@@ -523,6 +541,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			TTLOverride: extTTL,
 			ExternalTTL: true,
 		})
+		// #547 — the plain Put is ctx-less, but this resolve's ctx carries the
+		// dep-gen sink: an external widget whose RA also reads K8s is dirty-marked
+		// through its inner-call edge, so a post-mark re-Put must end KNOWN-STALE.
+		cache.CloseKnownStaleAfterPut(ctx, cacheKey)
 		log.Info("Widget touched an external endpoint; caching with bounded external TTL (opt-in annotation)",
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("external_ttl", extTTL.String()),

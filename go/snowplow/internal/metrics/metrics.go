@@ -1229,6 +1229,19 @@ func registerSecurityInstruments(m metric.Meter) error {
 		return err
 	}
 
+	// --- #547: customer hits that delivered a KNOWN-STALE body (a cell whose
+	// latest dirty mark was not closed by an accepted re-Put), per reason of the
+	// closed set (cache.KnownStaleReasons), zeros included. Hand-wired: there is
+	// no expvar->OTLP bridge. It is bumped by the very hits that deliver the
+	// stale body, so it cannot read 0 while a user reloads a frozen card; the
+	// sum is snowplow_resolved_cache{stat=known_stale_served_total}. ---
+	knownStaleServed, err := m.Int64ObservableCounter(
+		"snowplow_resolved_cache_known_stale_served_total",
+		metric.WithDescription("Customer L1 hits that delivered a KNOWN-STALE body - its latest dirty mark ended without an accepted re-Put - by reason {declined, dropped, suppressed, not_servable}. Each such hit also starts (or joins) a demand revalidation under the requester. Healthy = flat; a rise names cells the refresher could not refresh (#547)."))
+	if err != nil {
+		return err
+	}
+
 	// --- #424: subject binding-set digest memo ---
 	bsHits, err := m.Int64ObservableCounter("snowplow_binding_set_memo_hits",
 		metric.WithDescription("Subject binding-set digest memo hits (#424). Hit ratio = hits / (hits + misses)."))
@@ -1312,6 +1325,10 @@ func registerSecurityInstruments(m metric.Meter) error {
 		for _, c := range cache.ResolvedCacheRemintByClass() {
 			o.ObserveInt64(remint, int64(c.Count), metric.WithAttributes(attribute.String("class", c.Class)))
 		}
+		byReason := cache.KnownStaleServedByReason()
+		for _, reason := range cache.KnownStaleReasons {
+			o.ObserveInt64(knownStaleServed, int64(byReason[reason]), metric.WithAttributes(attribute.String("reason", reason)))
+		}
 
 		hits, misses, refused, entries := rbac.BindingSetMemoSnapshot()
 		o.ObserveInt64(bsHits, int64(hits))
@@ -1344,7 +1361,7 @@ func registerSecurityInstruments(m metric.Meter) error {
 			}
 		}
 		return nil
-	}, driftDeclined, repick, remint, bsHits, bsMisses, bsRefused, bsEntries,
+	}, driftDeclined, repick, remint, knownStaleServed, bsHits, bsMisses, bsRefused, bsEntries,
 		lRegistered, lSeeded, lUnseeded, lNavOnly, lFromSecrets, lUnparseable, lClientconfig,
 		lCapacity, lBound)
 	return err

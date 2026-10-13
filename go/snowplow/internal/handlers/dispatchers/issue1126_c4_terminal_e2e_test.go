@@ -10,27 +10,24 @@
 // the decline sites in resolveAndPopulateL1, so the GREEN drivers for rows
 // 3/4/6/9 live here.
 //
-// ARMS (§6.2 outcome-table rows)
+// ARMS (§6.2 outcome-table rows, as amended by #547 — the drop-point
+// eviction, its REFRESH_DROP_EVICT_MAX_PER_MINUTE breaker and the
+// REFRESH_SUPPRESS_AFTER_DECLINES threshold are retired; a refresh that ends
+// without a Put leaves the cell resident and KNOWN-STALE)
 //
 //	F4   row 3 — a 500 from the entry's own object across the whole budget:
-//	     EVICTED at the drop point (default breaker), counted on
-//	     drop_evict_total, NEVER on self_notfound_evict; the budget is spent
-//	     first (6 invocations). RED on main: entry resident (drop-to-TTL).
-//	F6   row 6 (#191) — three consecutive stage-error declines through the
-//	     REAL loop → the key is suppressed; the 4th dequeue does not resolve;
-//	     one real Put clears it and the 5th dequeue resolves again.
-//	     RED on main: the 4th dequeue resolves (the WARN storm).
-//	F6n  row 6, the empty-full site (architect N6) — the seam returns
-//	     (nil, nil) three times → suppressed with reason "empty_full"; the
-//	     4th dequeue does not resolve; ONE decline does NOT suppress (a
-//	     transient pre-sync window clears inside K). RED on main: the 4th
-//	     dequeue resolves (the site was "skip-to-TTL forever").
+//	     the budget is spent (6 invocations), the entry stays RESIDENT and
+//	     known-stale, NEVER counted on self_notfound_evict / evict_self_gone.
+//	F6   row 6 (#191) — stage-error declines through the REAL loop never
+//	     suppress: every dequeue resolves (retry on change), the prior body
+//	     stays resident.
+//	F6n  row 6, the empty-full site (architect N6) — the (nil, nil) decline
+//	     never suppresses either.
 //	F6u  row 4 — the seam reports ErrRefreshUnsupported → suppressed on the
-//	     FIRST occurrence, not requeued (1 invocation, no refresh_dropped).
+//	     FIRST occurrence (structurally permanent), not requeued.
 //	F7   row 9 — an apistage CONTENT entry whose call is not pivot-servable
 //	     (no global watcher): the typed ErrContentNotServable enters the
-//	     budget and the entry is EVICTED at the drop point. RED on main:
-//	     (nil, nil) skip-to-TTL, entry resident after ONE invocation.
+//	     budget and the entry stays RESIDENT (read through while known-stale).
 package dispatchers
 
 import (
@@ -75,43 +72,26 @@ func i1126WaitFor(t *testing.T, d time.Duration, what string, cond func() bool) 
 	t.Fatalf("timeout waiting for %s", what)
 }
 
-func TestIssue1126_C4_F4_DeterministicNon404IsEvictedAtTheDropPoint(t *testing.T) {
+func TestIssue1126_C4_F4_DeterministicNon404StaysResidentAtTheDropPoint(t *testing.T) {
 	i187RefresherEnv(t)
-	t.Setenv("REFRESH_DROP_EVICT_MAX_PER_MINUTE", "64") // the default, pinned explicitly
 	srv := newI187APIServer(t, http.StatusInternalServerError)
 	store, _, key, saEP, saRC := i187Fixture(t, srv, true)
 
-	// Own loop rather than i187RunRefreshCycle: the breaker counters live on
-	// the refresher singleton, which that helper resets before returning.
 	invocations, stop := i1126Loop(t, "widgets", saEP, saRC)
 	defer stop()
 	cache.EnqueueRefresh(key)
 	i1126WaitFor(t, 25*time.Second, "budget spent", func() bool { return invocations.Load() >= i187MaxRequeues+1 })
-	i1126WaitFor(t, 5*time.Second, "drop point", func() bool { _, ok := store.Get(key); return !ok })
+	i1126WaitFor(t, 5*time.Second, "drop point", func() bool { return cache.RefresherStatsByStat()["dropped"] >= 1 })
 
-	if _, ok := store.Get(key); ok {
-		t.Fatalf("F4 RED: entry still resident after %d attempts on a deterministic 500 — "+
-			"1.12.6 §6.2 row 3: a failure that exhausts the budget EVICTS (no forget-and-keep)", invocations.Load())
+	if _, ok := store.Get(key); !ok {
+		t.Fatalf("F4: entry EVICTED after %d attempts on a deterministic 500 — #547: a non-404 failure "+
+			"is not a deletion; the cell stays resident (zero cold navigations)", invocations.Load())
 	}
 	if invocations.Load() != i187MaxRequeues+1 {
-		t.Fatalf("F4: %d invocations, want %d — the budget must be spent BEFORE the eviction "+
-			"(a transient that clears inside it never gets there)", invocations.Load(), i187MaxRequeues+1)
-	}
-	st := cache.RefreshTerminalStatsSnapshot()
-	if st.DropEvictTotal != 1 {
-		t.Fatalf("F4: drop_evict_total = %d, want 1", st.DropEvictTotal)
+		t.Fatalf("F4: %d invocations, want %d — the whole budget is spent", invocations.Load(), i187MaxRequeues+1)
 	}
 	if got := cache.RefresherSelfNotFoundEvictTotal(); got != 0 {
 		t.Fatalf("F4: self_notfound_evict_total = %d, want 0 — a 500 must never be counted as a deletion", got)
-	}
-	// PM condition 1: the drop-point eviction has its OWN tracker counter.
-	// evict_self_gone_total keeps meaning "confirmed 404" so an apiserver
-	// outage (drop-point evictions climbing) cannot read as mass deletion.
-	// Map lookup rather than a typed field so the arm compiles — and reads
-	// zero — against a tree without the counter.
-	if got := cache.DepsStatsByStat()["evict_drop_point_total"]; got != 1 {
-		t.Fatalf("F4: evict_drop_point_total = %d, want 1 — the drop-point eviction must go through the "+
-			"tracker (dep edges cleared) and be counted on its own stat", got)
 	}
 	if got := cache.Deps().Stats().EvictSelfGoneTotal; got != 0 {
 		t.Fatalf("F4: evict_self_gone_total = %d, want 0 — a 500 is not a confirmed 404", got)
@@ -121,14 +101,13 @@ func TestIssue1126_C4_F4_DeterministicNon404IsEvictedAtTheDropPoint(t *testing.T
 	}
 }
 
-func TestIssue1126_C4_F6_StageErrorDeclinesSuppressThenPutResumes(t *testing.T) {
+func TestIssue1126_C4_F6_StageErrorDeclinesNeverSuppress(t *testing.T) {
 	i187RefresherEnv(t)
-	t.Setenv("REFRESH_SUPPRESS_AFTER_DECLINES", "3")
 	srv := newI187APIServer(t, http.StatusOK) // never reached: the seam replaces resolveOnceProd
-	store, inputs, key, saEP, saRC := i187Fixture(t, srv, true)
+	store, _, key, saEP, saRC := i187Fixture(t, srv, true)
 
-	// The seam models a stage that fails under the SA identity on EVERY
-	// refresh (the exportJwt loopback of #191): bytes come back, the sink
+	// The seam models a stage that fails under the background identity on
+	// EVERY refresh (the exportJwt loopback of #191): bytes come back, the sink
 	// records one stage error, and resolveAndPopulateL1 declines the Put.
 	var resolves atomic.Int64
 	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
@@ -138,53 +117,30 @@ func TestIssue1126_C4_F6_StageErrorDeclinesSuppressThenPutResumes(t *testing.T) 
 	})
 	t.Cleanup(restore)
 
-	invocations, stop := i1126Loop(t, "widgets", saEP, saRC)
+	_, stop := i1126Loop(t, "widgets", saEP, saRC)
 	defer stop()
 
-	for i := int64(1); i <= 3; i++ {
+	// #547: every change retries — no K, no suppression; the prior body stays.
+	for i := int64(1); i <= 4; i++ {
 		cache.EnqueueRefresh(key)
 		i1126WaitFor(t, 5*time.Second, fmt.Sprintf("decline %d", i), func() bool { return resolves.Load() >= i })
 		if e, ok := store.Get(key); !ok || string(e.RawJSON) == `{"children":[]}` {
-			t.Fatalf("F6: decline %d must keep the prior good body resident (ok=%v)", i, ok)
+			t.Fatalf("F6: decline %d must keep the prior body resident (ok=%v)", i, ok)
 		}
 	}
-
-	// 4th dequeue: skipped without a resolve. BEHAVIOUR FIRST — wait for
-	// either outcome, then assert the count, so the RED transcript on a tree
-	// without the mechanism is the #191 symptom (a 4th resolve), not a
-	// marker-API answer.
-	before := cache.RefreshTerminalStatsSnapshot().SuppressedSkipsTotal
-	cache.EnqueueRefresh(key)
-	i1126WaitFor(t, 5*time.Second, "4th dequeue settled (skipped or resolved)", func() bool {
-		return cache.RefreshTerminalStatsSnapshot().SuppressedSkipsTotal > before || resolves.Load() >= 4
-	})
-	time.Sleep(50 * time.Millisecond)
-	if resolves.Load() != 3 || invocations.Load() != 3 {
-		t.Fatalf("F6 RED: a suppressed key was resolved again (resolves=%d handler=%d, want 3/3) — "+
-			"pre-1.12.6 this key re-resolved every dirty-mark forever (#191)", resolves.Load(), invocations.Load())
+	if reason, ok := cache.RefreshSuppressedReason(key); ok {
+		t.Fatalf("F6: a stage-error decline suppressed the key (reason=%q) — #547 retired "+
+			"REFRESH_SUPPRESS_AFTER_DECLINES; a known-stale cell is retried on read or change", reason)
 	}
-	if reason, ok := cache.RefreshSuppressedReason(key); !ok || reason != "stage_error" {
-		t.Fatalf("F6: key not marked suppressed after 3 consecutive stage-error declines (reason=%q ok=%v)", reason, ok)
-	}
-
-	// One real Put (a user /call storing fresh bytes) clears the marker → the
-	// 5th dequeue resolves again.
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"children":["fresh"]}`), Inputs: &inputs})
-	if _, still := cache.RefreshSuppressedReason(key); still {
-		t.Fatalf("F6 RED: the marker survived a real Put — suppress-and-never-recover")
-	}
-	cache.EnqueueRefresh(key)
-	i1126WaitFor(t, 5*time.Second, "resolve after Put", func() bool { return resolves.Load() >= 4 })
 }
 
-// F6n — architect N6: the (nil, nil) "empty full" decline site in
-// resolveAndPopulateL1 joins the suppression mechanism. One decline must NOT
-// suppress (a pre-sync window is transient); K=3 consecutive ones must.
-func TestIssue1126_C4_F6n_EmptyFullDeclinesSuppressAfterKNotAfterOne(t *testing.T) {
+// F6n — architect N6: the (nil, nil) "empty full" decline site never
+// suppresses since #547 (a transient pre-sync window and a permanent empty full
+// both stay retried on read or change).
+func TestIssue1126_C4_F6n_EmptyFullDeclinesNeverSuppress(t *testing.T) {
 	i187RefresherEnv(t)
-	t.Setenv("REFRESH_SUPPRESS_AFTER_DECLINES", "3")
 	srv := newI187APIServer(t, http.StatusOK) // never reached: the seam replaces resolveOnceProd
-	store, inputs, key, saEP, saRC := i187Fixture(t, srv, true)
+	store, _, key, saEP, saRC := i187Fixture(t, srv, true)
 
 	var resolves atomic.Int64
 	restore := setResolveOnceForTest(func(_ context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
@@ -199,48 +155,18 @@ func TestIssue1126_C4_F6n_EmptyFullDeclinesSuppressAfterKNotAfterOne(t *testing.
 	}
 	origBody := string(orig.RawJSON)
 
-	invocations, stop := i1126Loop(t, "widgets", saEP, saRC)
+	_, stop := i1126Loop(t, "widgets", saEP, saRC)
 	defer stop()
-
-	// ONE decline: resident, NOT suppressed, and the next dequeue resolves.
-	cache.EnqueueRefresh(key)
-	i1126WaitFor(t, 5*time.Second, "decline 1", func() bool { return resolves.Load() >= 1 })
-	time.Sleep(50 * time.Millisecond)
-	if _, ok := store.Get(key); !ok {
-		t.Fatal("F6n: one empty-full decline must keep the prior good body resident")
+	for i := int64(1); i <= 4; i++ {
+		cache.EnqueueRefresh(key)
+		i1126WaitFor(t, 5*time.Second, fmt.Sprintf("decline %d", i), func() bool { return resolves.Load() >= i })
+	}
+	if e, ok := store.Get(key); !ok || string(e.RawJSON) != origBody {
+		t.Fatalf("F6n: after 4 declines the prior body must still be resident (ok=%v)", ok)
 	}
 	if reason, ok := cache.RefreshSuppressedReason(key); ok {
-		t.Fatalf("F6n: ONE empty-full decline suppressed the key (reason=%q) — a transient pre-sync window must clear inside K", reason)
+		t.Fatalf("F6n: an empty-full decline suppressed the key (reason=%q) — #547: never", reason)
 	}
-	cache.EnqueueRefresh(key)
-	i1126WaitFor(t, 5*time.Second, "decline 2 (not suppressed after one)", func() bool { return resolves.Load() >= 2 })
-
-	// Third decline reaches K=3.
-	cache.EnqueueRefresh(key)
-	i1126WaitFor(t, 5*time.Second, "decline 3", func() bool { return resolves.Load() >= 3 })
-	if e, ok := store.Get(key); !ok || string(e.RawJSON) != origBody {
-		t.Fatalf("F6n: after 3 declines the prior good body must still be resident (ok=%v)", ok)
-	}
-
-	// 4th dequeue: BEHAVIOUR FIRST — skipped without a resolve.
-	before := cache.RefreshTerminalStatsSnapshot().SuppressedSkipsTotal
-	cache.EnqueueRefresh(key)
-	i1126WaitFor(t, 5*time.Second, "4th dequeue settled (skipped or resolved)", func() bool {
-		return cache.RefreshTerminalStatsSnapshot().SuppressedSkipsTotal > before || resolves.Load() >= 4
-	})
-	time.Sleep(50 * time.Millisecond)
-	if resolves.Load() != 3 || invocations.Load() != 3 {
-		t.Fatalf("F6n RED: an empty-full key was resolved again after K declines (resolves=%d handler=%d, want 3/3) — "+
-			"the (nil, nil) site was skip-to-TTL forever (#191 shape)", resolves.Load(), invocations.Load())
-	}
-	if reason, ok := cache.RefreshSuppressedReason(key); !ok || reason != "empty_full" {
-		t.Fatalf("F6n: suppression reason = (%q, %v), want (\"empty_full\", true)", reason, ok)
-	}
-
-	// A real Put clears it and the next dequeue resolves again.
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"children":["fresh"]}`), Inputs: &inputs})
-	cache.EnqueueRefresh(key)
-	i1126WaitFor(t, 5*time.Second, "resolve after Put", func() bool { return resolves.Load() >= 4 })
 }
 
 func TestIssue1126_C4_F6u_UnsupportedKindSuppressesOnFirstOccurrence(t *testing.T) {
@@ -278,9 +204,8 @@ func TestIssue1126_C4_F6u_UnsupportedKindSuppressesOnFirstOccurrence(t *testing.
 	}
 }
 
-func TestIssue1126_C4_F7_ApistageNotServableIsEvictedAtTheDropPoint(t *testing.T) {
+func TestIssue1126_C4_F7_ApistageNotServableStaysResidentAtTheDropPoint(t *testing.T) {
 	i187RefresherEnv(t)
-	t.Setenv("REFRESH_DROP_EVICT_MAX_PER_MINUTE", "64")
 	srv := newI187APIServer(t, http.StatusOK)
 	store, _, _, saEP, saRC := i187Fixture(t, srv, true)
 
@@ -310,15 +235,12 @@ func TestIssue1126_C4_F7_ApistageNotServableIsEvictedAtTheDropPoint(t *testing.T
 	defer stop()
 	cache.EnqueueRefresh(key)
 	i1126WaitFor(t, 25*time.Second, "budget spent", func() bool { return invocations.Load() >= i187MaxRequeues+1 })
-	i1126WaitFor(t, 5*time.Second, "drop point", func() bool { _, ok := store.Get(key); return !ok })
-	if _, ok := store.Get(key); ok {
-		t.Fatalf("F7 RED: apistage entry still resident after %d not-servable refreshes — the one carrier with a "+
-			"single layer must reach the drop point like every other class", invocations.Load())
+	i1126WaitFor(t, 5*time.Second, "drop point", func() bool { return cache.RefresherStatsByStat()["dropped"] >= 1 })
+	if _, ok := store.GetNoTouch(key); !ok {
+		t.Fatalf("F7: apistage entry EVICTED after %d not-servable refreshes — #547: it stays resident "+
+			"(and is read through while known-stale)", invocations.Load())
 	}
 	if invocations.Load() != i187MaxRequeues+1 {
 		t.Fatalf("F7: %d invocations, want %d", invocations.Load(), i187MaxRequeues+1)
-	}
-	if st := cache.RefreshTerminalStatsSnapshot(); st.DropEvictTotal != 1 {
-		t.Fatalf("F7: drop_evict_total = %d, want 1", st.DropEvictTotal)
 	}
 }

@@ -427,25 +427,13 @@ env:
   # reconcile_divergence_total > 0. Raise the sample for a tighter bound.
   DEPS_RECONCILE_SAMPLE: "512"
   DEPS_RECONCILE_PERIOD_SECONDS: "30"
-  # 1.12.6 C4 — terminal refresh semantics (docs/architecture/caching.md §5.3).
-  # A background refresh that fails DETERMINISTICALLY across the whole requeue
-  # budget (403 / 500 / timeout / parse failure / not-servable content call)
-  # now EVICTS the stale entry at the drop point instead of leaving it resident
-  # until the 3600s TTL. This is the breaker on that eviction: a token bucket,
-  # NOT a rate limit — it separates "a few dead objects" (evict, correct) from
-  # "an apiserver outage" (every key fails; evicting them all would turn a stale
-  # portal into a broken one). Over budget the key keeps the 1.12.5 drop-to-TTL
-  # and ONE WARN per window (refresher.drop_evict_suspended) names the outage.
-  # "0" disables drop-point eviction for non-404 failures — 1.12.5 byte-for-byte.
-  # The self-object 404 route (1.12.5, #187) is not subject to it.
-  REFRESH_DROP_EVICT_MAX_PER_MINUTE: "64"
-  # 1.12.6 C4 — consecutive stage-error refresh declines of one key before it
-  # is marked refresh-by-traffic-only: no further re-resolves or WARNs until a
-  # real Put (user traffic) or an eviction clears the marker (#191: 956 WARNs
-  # from 23 keys in 4.5h, every one the same deterministic exportJwt 401 under
-  # the SA identity). Permanent declines (external endpoint, userAccessFilter
-  # cell, unsupported kind) suppress on the FIRST occurrence. Minimum 1.
-  REFRESH_SUPPRESS_AFTER_DECLINES: "3"
+  # #547 — REFRESH_DROP_EVICT_MAX_PER_MINUTE and REFRESH_SUPPRESS_AFTER_DECLINES
+  # are RETIRED (owner ruling, #547): a refresh that ends without an accepted
+  # re-Put now leaves the cell resident and KNOWN-STALE — served and counted
+  # (snowplow_resolved_cache_known_stale_served_total), revalidated on the next
+  # read under the requester and re-enqueued by the next change. There is no
+  # drop-point eviction to budget and no decline threshold to tune; the process
+  # ignores both variables if an older values file still sets them.
   # 1.12.6 item 7 — PROVISIONAL (chosen without production data; re-tune later).
   # A DELETE-semantics eviction (informer DELETE, confirmed self-404) now
   # publishes a `refresh` frame to every /refreshes subscriber armed for the

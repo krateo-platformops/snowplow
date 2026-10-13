@@ -349,12 +349,6 @@ type refresher struct {
 	// has actually exited (Get returned shutdown).
 	workersWG sync.WaitGroup
 
-	// 1.12.6 C4 (§6.3) — the drop-point eviction breaker. See
-	// refresher_terminal.go. Constructed with the singleton from
-	// REFRESH_DROP_EVICT_MAX_PER_MINUTE; perMinute 0 means "never evict a
-	// non-404 deterministic failure" (today's drop-to-TTL, byte-for-byte).
-	dropEvict *dropEvictBreaker
-
 	// #386 M1 — streaming p95 of the REAL resolve latency: the registered
 	// re-resolve+Put handler fn() in processOne, timed ONLY on the ok=true path
 	// AFTER yieldToCustomer returns (so the dequeue, the customer-priority park,
@@ -420,7 +414,6 @@ func refresherSingleton() *refresher {
 			queue:            workqueue.NewTypedRateLimitingQueue[string](rl),
 			clusterListQueue: workqueue.NewTypedRateLimitingQueue[string](clRL),
 			handlers:         map[string]RefreshFunc{},
-			dropEvict:        newDropEvictBreaker(RefreshDropEvictMaxPerMinute()),
 			resolveLatency:   newP2Quantile(0.95),
 			dirtyStats:       newDirtyWindowStats(),
 		})
@@ -909,6 +902,10 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	} else {
 		defer r.queue.Done(key)
 	}
+	// #547 — a background revalidation of a known-stale shared shell settles with
+	// this dequeue (runs before Done, after every branch below has settled the
+	// window).
+	defer settleBackgroundRevalidation(key)
 
 	// Customer-priority cooperative yield (Ship #98). Mirrors prewarm
 	// engine's yield-before-scope pattern (prewarm_engine.go:275). The
@@ -989,10 +986,14 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		// N3). The rate-floor branch deliberately keeps its GVR because it
 		// re-dispatches the same mark; a suppressed skip does not.
 		r.triggerGVRByKey.LoadAndDelete(key)
-		// #354 P3 — a suppressed skip ends the window unfresh: the cell stays on
-		// its pre-change body until real traffic re-Puts it.
+		// #354 P3 — a suppressed skip ends the window unfresh. #547 — and leaves
+		// the cell KNOWN-STALE (reason suppressed): the next customer read serves
+		// it, counted. A structurally-permanent suppression starts no demand or
+		// background revalidation (team ruling (b), known_stale.go): the cold path
+		// would decline the Put by the same gate. The cell stays until the next
+		// real Put, an eviction or its TTL (the accepted residual).
 		if t0, open := r.beginWindow(key); open {
-			r.windowUnfresh(key, t0, unfreshDeclined)
+			r.windowUnfresh(key, t0, unfreshDeclined, knownStaleSuppressed)
 		}
 		return true
 	}
@@ -1075,23 +1076,36 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		// exact key has already been AddRateLimited. Once it exceeds the
 		// cap the failure is treated as deterministic: Forget the key
 		// (clear the rate limiter so a FUTURE genuine dirty-mark of the
-		// same key starts clean) and DROP it — no AddRateLimited. The
-		// entry stays in L1, stale, until its TTL purges it; a later
-		// informer event can re-enqueue it fresh.
+		// same key starts clean) and DROP it — no AddRateLimited. #547 —
+		// the entry stays in L1 KNOWN-STALE (never forgotten as fresh):
+		// the next customer read revalidates it on demand, the next
+		// informer event re-enqueues it.
 		//
 		// #608 (Q2 ruling) — a NON-RETRYABLE failure (a 403: the apiserver's
 		// authorization decision for this identity, refused identically at
 		// every backoff step) skips the budget and reaches this same drop point
-		// on its first attempt. The window accounting and the counters are
-		// unchanged, but it is NEVER evicted (see the forbidden branch below).
+		// on its first attempt, where it is never evicted either (#547).
 		nonRetryable := IsNonRetryableRefreshError(err)
 		if nonRetryable || q.NumRequeues(key) >= maxRefreshRequeues {
 			q.Forget(key)
 			r.droppedTotal.Add(1)
-			// #354 P3 — the poison-pill bound ends the window (before the
-			// drop-point eviction below, which then finds no stamp to count).
+			// #354 P3 — the poison-pill bound ends the window. #547 — as
+			// KNOWN-STALE, not erased, unless the self-404 eviction below is about
+			// to remove the cell itself (then the window ends with it, exactly as
+			// before, and the eviction finds no stamp to count twice).
 			if windowOpen {
-				r.windowUnfresh(key, t0, unfreshDropped)
+				switch {
+				case errors.Is(err, ErrSelfObjectGone):
+					if r.settleWindow(key, t0, false, knownStaleNone) {
+						r.dirtyStats.unfresh[unfreshEvicted].Add(1)
+					} else {
+						r.dirtyStats.unfresh[unfreshDropped].Add(1)
+					}
+				case errors.Is(err, ErrContentNotServable):
+					r.windowUnfresh(key, t0, unfreshDropped, knownStaleNotServable)
+				default:
+					r.windowUnfresh(key, t0, unfreshDropped, knownStaleDropped)
+				}
 			}
 			// 1.12.5 / #187 (i) — THE DROP POINT IS THE EVICTION POINT for a
 			// self-object 404.
@@ -1143,83 +1157,35 @@ func (r *refresher) processNext(ctx context.Context) bool {
 				)
 				return true
 			}
-			// #608 — A FORBIDDEN DROP NEVER EVICTS. Non-retryable means "do not
-			// burn the requeue budget on it", NOT "the body is unvouchable": a
-			// single 403 is not a determinism proof (a transient authz blip, an
-			// RBAC roll mid-flight, a webhook hiccup on validate/apiref all keep
-			// the StatusError), and evicting on attempt 1 turns it into a cold
-			// navigation — the zero-cold-navigation requirement and the #547
-			// ruling (never evict on a failed refresh) forbid that. The entry
-			// stays RESIDENT and SERVED; Forget above cleared the rate limiter,
-			// so the next dirty mark (or read-triggered refresh) retries it
-			// clean. #547 turns this resident-after-failure state into the
-			// known-stale state. Counted on dropped_total (above) and on
-			// refresh_failed{err_class="forbidden"}.
-			if nonRetryable {
-				slog.Warn("refresher.refresh_dropped",
-					slog.String("subsystem", "cache"),
-					slog.String("key_hash", key),
-					slog.Int("requeues", q.NumRequeues(key)),
-					slog.Bool("non_retryable", true),
-					slog.Bool("cluster_list_tier", fromCL),
-					slog.Bool("evicted", false),
-					slog.String("err", err.Error()),
-					slog.String("effect", "forbidden refresh — not retried and NOT evicted: the entry stays "+
-						"resident and served until the next dirty mark retries it (#608, #547)"),
-				)
-				return true
-			}
-			// 1.12.6 C4 (§6.2 row 3, §6.3) — EVERY OTHER deterministic failure
-			// (403 / 500 / timeout / parse failure / apistage not-servable) that
-			// exhausts the same budget is now EVICTED at the same drop point,
-			// behind the breaker. A body whose basis cannot be re-resolved
-			// cannot be vouched for; "forget the key and keep the entry" is the
-			// one outcome the rule forbids. The bound is the SAME budget (~15.5 s
-			// of backoff at the defaults), so an apiserver blip that clears
-			// inside it never reaches this line.
-			//
-			// THE BREAKER is what makes this safe under an outage: over
-			// REFRESH_DROP_EVICT_MAX_PER_MINUTE the key keeps today's
-			// drop-to-TTL (entry resident and SERVED), the suspended counter
-			// ticks and one WARN per suspension window names the suspected
-			// outage. Budget "0" disables this branch entirely (byte-for-byte
-			// 1.12.5 for non-404 failures). Eviction routes through the dep
-			// tracker's EvictDropPoint — the same store.deleteForDep + RemoveL1Key
-			// pair the 404 route uses (deleteForDep is what bumps the STORE's
-			// evict_delete_total under snowplow_resolved_cache and clears the
-			// suppression marker; RemoveL1Key drops the dep edges) — counted on
-			// evict_drop_point_total so NEITHER evict_delete_total (the
-			// informer-DELETE-only H1 discriminator) NOR evict_self_gone_total
-			// (the confirmed-404 signal) moves for a non-404 eviction. During an
-			// apiserver outage this is the counter that climbs, alongside
-			// snowplow_refresher_drop_evict_suspended_total.
-			if r.dropEvict != nil {
-				if allowed, firstSuspend := r.dropEvict.allow(); allowed {
-					evicted := Deps().EvictDropPoint(key)
-					slog.Warn("refresher.refresh_dropped",
-						slog.String("subsystem", "cache"),
-						slog.String("key_hash", key),
-						slog.Int("requeues", maxRefreshRequeues),
-						slog.Bool("non_retryable", nonRetryable),
-						slog.Bool("cluster_list_tier", fromCL),
-						slog.Bool("evicted", evicted),
-						slog.String("err", err.Error()),
-						slog.String("effect", "deterministic refresh failure — entry EVICTED (was: dropped to TTL outer-net); "+
-							"a body whose basis cannot be re-resolved cannot be vouched for (1.12.6 C4)"),
-					)
-					return true
-				} else if firstSuspend {
-					warnDropEvictSuspended(key, r.dropEvict.perMinute, fromCL)
-				}
-			}
+			// #547 — EVERY OTHER deterministic failure (403 / 500 / timeout /
+			// parse failure / apistage not-servable) that exhausts the budget
+			// keeps the cell RESIDENT and KNOWN-STALE (the window above). 1.12.6
+			// C4 evicted it here behind a per-minute breaker
+			// (REFRESH_DROP_EVICT_MAX_PER_MINUTE) and, over budget, left it
+			// resident and SERVED as if fresh ("dropped to TTL outer-net") — 80%
+			// of the live drop points (#547 trace). Both are retired: an eviction
+			// is a cold navigation (owner ruling 1, #547: never evict for this),
+			// and forget-as-fresh is the defect. The known-stale cell is served,
+			// counted, and revalidated by the next read under the requester or
+			// re-enqueued by the next change. Self-adapting: no budget to tune.
 			slog.Warn("refresher.refresh_dropped",
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.Int("requeues", maxRefreshRequeues),
 				slog.Bool("non_retryable", nonRetryable),
 				slog.Bool("cluster_list_tier", fromCL),
-				slog.String("effect", "deterministic refresh failure — key dropped to TTL outer-net, not retried "+
-					"(drop-point eviction disabled or suspended by the breaker)"),
+				// #547 — a non-404 drop never evicts (the self-404 drop above logs
+				// self_object_gone_evicted with its own evicted outcome).
+				slog.Bool("evicted", false),
+				slog.String("known_stale_reason", func() string {
+					if errors.Is(err, ErrContentNotServable) {
+						return knownStaleNotServable.String()
+					}
+					return knownStaleDropped.String()
+				}()),
+				slog.String("effect", "deterministic refresh failure — not retried by the background loop; cell kept "+
+					"resident as KNOWN-STALE: the next read serves it and revalidates it under the requester, "+
+					"the next change re-enqueues it (#547)"),
 			)
 			return true
 		}
@@ -1286,15 +1252,16 @@ func (r *refresher) processNext(ctx context.Context) bool {
 func (r *refresher) settleDequeue(key string, t0 time.Time, hadEntry bool, o *refreshOutcome) {
 	switch {
 	case !hadEntry:
-		r.windowUnfresh(key, t0, unfreshEvicted)
+		r.windowUnfresh(key, t0, unfreshEvicted, knownStaleNone)
 	case o != nil && o.accepted.Load() && o.remarked.Load():
-		r.windowUnfresh(key, t0, unfreshRemarked)
+		r.windowUnfresh(key, t0, unfreshRemarked, knownStaleNone)
 	case o != nil && o.accepted.Load():
 		r.windowFresh(key, t0)
 	case o != nil && o.refused.Load():
-		r.windowUnfresh(key, t0, unfreshEvicted)
+		r.windowUnfresh(key, t0, unfreshEvicted, knownStaleNone)
 	default:
-		r.windowUnfresh(key, t0, unfreshDeclined)
+		// #547 — no Put outcome: the cell keeps its pre-change body, KNOWN-STALE.
+		r.windowUnfresh(key, t0, unfreshDeclined, knownStaleDeclined)
 	}
 }
 

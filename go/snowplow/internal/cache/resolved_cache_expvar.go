@@ -219,6 +219,27 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		// #354 driver reads them per 1k hits. Scalars: no key, identity or body.
 		"stale_served_total":      int64(s.StaleServedTotal),
 		"stale_served_age_ms_max": s.StaleServedAgeMSMax,
+		// #547 — the KNOWN-STALE detector (known_stale.go). served_total counts
+		// the customer hits that delivered a body whose latest dirty mark was NOT
+		// closed by an accepted re-Put; it is bumped by those very hits, so it
+		// cannot read zero while a frozen card is being reloaded. Flattened per
+		// reason of the closed set (KnownStaleReasons) beside the sum, like the
+		// refresher's dirty_ended_unfresh_<reason>; the reason-labelled OTLP
+		// counter is snowplow_resolved_cache_known_stale_served_total{reason}.
+		// resident is a GAUGE. read_through counts substrate reads that took the
+		// MISS fall-through instead of the stale cell; revalidation_{fresh,failed}
+		// the demand revalidations by outcome.
+		"known_stale_served_total":              int64(sumKnownStale(s.KnownStaleServed)),
+		"known_stale_resident":                  int64(s.KnownStaleResident),
+		"known_stale_read_through_total":        int64(s.KnownStaleReadThroughTotal),
+		"known_stale_revalidation_fresh_total":  int64(s.KnownStaleRevalidationFresh),
+		"known_stale_revalidation_failed_total": int64(s.KnownStaleRevalidationFailed),
+		// team ruling (b): a structurally-permanent suppression skips the
+		// revalidation (it could never succeed); the skip is counted here.
+		"known_stale_revalidation_skipped_total": int64(s.KnownStaleRevalidationSkip),
+	}
+	for i, reason := range KnownStaleReasons {
+		out["known_stale_served_"+reason+"_total"] = int64(s.KnownStaleServed[i])
 	}
 	// #354 P3 (E, B3) — warm cells keyed by page / by request extras, per
 	// identity-bound class (GAUGES; denominator warm_seeded + warm_lastread).
@@ -227,4 +248,12 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		out["warm_keyed_extras_"+suffix] = int64(s.WarmKeyedExtras[i])
 	}
 	return out
+}
+
+func sumKnownStale(v [knownStaleReasons - 1]uint64) uint64 {
+	var n uint64
+	for _, x := range v {
+		n += x
+	}
+	return n
 }

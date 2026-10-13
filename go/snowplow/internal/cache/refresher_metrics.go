@@ -89,8 +89,6 @@ func registerRefresherMetrics() {
 		expvar.Publish("snowplow_refresher_yielded_total", refresherStatFunc("yielded"))
 		expvar.Publish("snowplow_refresher_capped_total", refresherStatFunc("capped"))
 		expvar.Publish("snowplow_refresher_floored_total", refresherStatFunc("floored"))
-		expvar.Publish("snowplow_refresher_drop_evict_total", refresherStatFunc("drop_evict"))
-		expvar.Publish("snowplow_refresher_drop_evict_suspended_total", refresherStatFunc("drop_evict_suspended"))
 		expvar.Publish("snowplow_refresher_suppressed_set_total", refresherStatFunc("suppressed_set"))
 		expvar.Publish("snowplow_refresher_suppressed_skips_total", refresherStatFunc("suppressed_skips"))
 		expvar.Publish("snowplow_refresher_suppressed_keys", refresherStatFunc("suppressed_keys"))

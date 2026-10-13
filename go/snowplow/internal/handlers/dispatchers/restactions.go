@@ -90,11 +90,19 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// the prewarm engine yields its background re-seed work for the
 	// duration of the dispatch (feedback_customer_priority_over_refresher).
 	// Cheap atomic; deferred decrement covers every return path.
-	defer markCustomerInFlight()()
-	// #262 S2 — record the caller's identity class (in memory) so a class no
-	// clientconfig Secret describes is still seeded. At the ServeHTTP entry,
-	// never in the key-mint path the seeds also run through.
-	observeLiveCaller(req)
+	//
+	// #547 — not for a demand revalidation: it re-enters this handler on a
+	// detached copy of a request that was already served (demand_revalidate.go).
+	demand := isDemandRevalidation(req)
+	if demand {
+		pcs.l1Hit = "revalidate"
+	} else {
+		defer markCustomerInFlight()()
+		// #262 S2 — record the caller's identity class (in memory) so a class no
+		// clientconfig Secret describes is still seeded. At the ServeHTTP entry,
+		// never in the key-mint path the seeds also run through.
+		observeLiveCaller(req)
+	}
 
 	extras, err := util.ParseExtras(req)
 	if err != nil {
@@ -230,7 +238,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// to the shared empty-identity row → treat as a CACHE MISS, fall through to
 	// a direct resolve under THIS request's identity; never serve the shared ""
 	// cell to a different ""-deriving identity. See serveFromCacheEligible.
-	if cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
+	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
@@ -281,6 +289,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
 			writeResolvedJSON(wri, entry.RawJSON)
+			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
+			// revalidate it on demand under this requester, detached.
+			revalidateKnownStale(r, req, cacheKey)
 			log.Info("RESTAction successfully resolved",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),

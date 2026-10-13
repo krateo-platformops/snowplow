@@ -74,7 +74,7 @@ func TestIssue203_CacheOff_TelemetryReadConstructsNoRefresher(t *testing.T) {
 	_, _ = ClusterListRefresherStats()
 	_ = DepsStatsByStat()
 	_, _, _, _, _, _, _, _, _, _, _, _ = RefresherSnapshot()
-	_, _, _, _, _ = RefresherTerminalSnapshot()
+	_, _, _ = RefresherTerminalSnapshot()
 	rec := httptest.NewRecorder()
 	expvar.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/vars", nil))
 
