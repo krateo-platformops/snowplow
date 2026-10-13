@@ -82,13 +82,17 @@ serviceAccount:
 # including one bound to cluster-admin. The template therefore omits the rule
 # entirely rather than rendering it empty.
 #
-# A cohort whose group or ServiceAccount is not listed here is simply not
-# background-refreshed: its dial 403s, the cache Put declines exactly as it does
-# today, and the cell expires at TTL and refills on the next read. That is the
-# accepted degradation in the #574 ruling, not a failure.
+# A cohort whose group or ServiceAccount is not listed here is NOT impersonated:
+# snowplow asks the apiserver (a SelfSubjectAccessReview per principal, memoized
+# until RBAC changes) before dialling, and refreshes that cohort over its own
+# ServiceAccount with the re-gate instead (#608). It is still refreshed, just not
+# AS the cohort; snowplow_impersonation{stat=impersonation_fallback_sa} counts it.
+# List a cohort's groups here to have it refreshed as itself.
 #
 # NEVER list a privileged group or ServiceAccount. Impersonating one grants
-# everything it is bound to.
+# everything it is bound to. The schema rejects system:masters and "*".
+# impersonateServiceAccounts holds NAMES only: the rule is in a ClusterRole, so a
+# name matches a ServiceAccount of that name in every namespace.
 rbac:
   impersonateGroups: []
   # - developers

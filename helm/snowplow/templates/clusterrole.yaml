@@ -47,7 +47,8 @@ rules:
 # WITHOUT THIS RULE THE FEATURE IS INERT, NOT BROKEN. snowplow probes
 # `impersonate users` once at startup (SelfSubjectAccessReview) and, when it is
 # not granted, keeps the old SA transport and logs a WARN naming this grant. So
-# the chart and the image roll independently in either order.
+# the chart and the image roll independently in either order. (#608: groups and
+# serviceaccounts are then checked per cohort before every first dial.)
 #
 # WHY `users` IS SAFE TO GRANT BROADLY. Impersonating a user does NOT inherit
 # that user's groups — the apiserver uses exactly the groups supplied. Verified
@@ -72,10 +73,10 @@ rules:
   cluster-admin-bound one — which is the exact escalation this allowlist exists
   to prevent. `with` is load-bearing: it skips the block for an empty list.
 
-  A cohort whose group or ServiceAccount is not listed simply 403s at dial, the
-  Put declines exactly as it does today, and the cell expires at TTL and refills
-  on read. That degradation is the accepted cost in the #574 ruling, so the safe
-  default is also the documented one.
+  A cohort whose group or ServiceAccount is not listed is not impersonated:
+  snowplow SelfSubjectAccessReviews each principal before dialling and refreshes
+  that cohort over its own ServiceAccount with the re-gate instead (#608). So the
+  safe default costs "refreshed as snowplow, re-gated", never a certain 403.
 
   NEVER list a privileged group or ServiceAccount here.
 */ -}}

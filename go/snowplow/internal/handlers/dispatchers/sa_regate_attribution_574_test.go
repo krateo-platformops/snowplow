@@ -593,7 +593,25 @@ func TestIssue574SAR_A1b_GateStoodDown_SARResultStillNotRePut(t *testing.T) {
 	sar574Watcher(t, []*unstructured.Unstructured{ra}, true, []rbacv1.PolicyRule{sar574CreateSAR})
 	srv := newSAR574Server(t, nil)
 	cache.SetImpersonationAvailable(true)
-	t.Cleanup(func() { cache.SetImpersonationAvailable(false) })
+	// #608 (PR #620): impersonation is used only for a cohort the apiserver
+	// would accept, as answered by the capability reviewer that main.go
+	// installs alongside SetImpersonationAvailable. Without one, the check
+	// errors and the refresher keeps the re-gated SA transport, so the gate
+	// would NOT stand down and this arm would measure nothing. The reviewer
+	// permits exactly this cohort (the representative user and its one group).
+	cache.SetImpersonationReviewer(func(_ context.Context, resource, _, name string) (bool, error) {
+		switch resource {
+		case cache.ImpersonateResourceUsers:
+			return name == sar574Rep, nil
+		case cache.ImpersonateResourceGroups:
+			return name == "tenant-a", nil
+		}
+		return false, nil
+	})
+	t.Cleanup(func() {
+		cache.SetImpersonationAvailable(false)
+		cache.ResetImpersonationCapabilityForTest()
+	})
 
 	got := sar574Refresh(t, context.Background(), srv, "ns1", "sar574-review-put", http.MethodPost, sar574SARPath)
 

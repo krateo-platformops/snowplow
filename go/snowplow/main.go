@@ -46,12 +46,9 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
-	authzv1 "k8s.io/api/authorization/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
@@ -527,40 +524,60 @@ func main() {
 			// silently refreshing nothing (the failure mode that let a comparable
 			// bug run for days elsewhere in this platform).
 			//
-			// Only `users` is probed. `groups` is allowlisted by resourceNames in
-			// the ClusterRole, so a SelfSubjectAccessReview for it would answer for
-			// one group name and not for the set; a cohort whose group is not
-			// allowlisted simply 403s at dial and declines exactly as it does today.
+			// #608 — `users` alone decides whether impersonation is on at all, but a
+			// cohort's dial also carries its GROUPS (and a ServiceAccount username
+			// is authorised as `serviceaccounts`). Those are allowlisted by
+			// resourceNames, so no single review answers for every cohort: the
+			// refresher asks per principal (cache.PermittedImpersonatingRESTConfig,
+			// memoized, invalidated by the RBAC snapshot generation) and a cohort
+			// with a refused principal keeps the re-gated SA transport. The probe
+			// still asks the kind-wide question for groups and serviceaccounts so the
+			// startup log and snowplow_impersonation_probe say truthfully whether
+			// grouped cohorts can be impersonated at all, instead of "granted" on
+			// the strength of `users` alone (the 1.12.43 state on 057).
 			cache.SetImpersonationAvailable(func() bool {
-				cs, csErr := kubernetes.NewForConfig(rc)
-				if csErr != nil {
+				reviewer, revErr := cache.NewSSARImpersonationReviewer(rc)
+				if revErr != nil {
 					log.Warn("cache: #574 impersonation probe could not build a clientset; refresher keeps the SA transport",
-						slog.Any("err", csErr))
+						slog.Any("err", revErr))
 					return false
 				}
-				ssar := &authzv1.SelfSubjectAccessReview{
-					Spec: authzv1.SelfSubjectAccessReviewSpec{
-						ResourceAttributes: &authzv1.ResourceAttributes{
-							Verb: "impersonate", Resource: "users",
-						},
-					},
-				}
-				got, ssarErr := cs.AuthorizationV1().SelfSubjectAccessReviews().
-					Create(cacheCtx, ssar, metav1.CreateOptions{})
+				usersOK, ssarErr := reviewer(cacheCtx, cache.ImpersonateResourceUsers, "", "")
 				if ssarErr != nil {
 					log.Warn("cache: #574 impersonation probe failed; refresher keeps the SA transport",
 						slog.Any("err", ssarErr))
 					return false
 				}
-				if !got.Status.Allowed {
+				if !usersOK {
 					log.Warn("cache: #574 impersonation NOT granted — the refresher keeps dialling as snowplow's ServiceAccount, "+
 						"so background refreshes for a per-user cohort stay re-gated and continue to fail closed",
 						slog.String("needed", "impersonate on users (and allowlisted groups) in snowplow's ClusterRole"),
 						slog.String("effect", "pre-#574 behaviour; this is a MISSING RBAC GRANT, not a code fault"))
 					return false
 				}
-				log.Info("cache: #574 impersonation granted — the refresher reads as each cell's cohort",
-					slog.String("placeholder", cache.CohortPlaceholderUsername))
+				// Installed only once users is granted: with impersonation off the
+				// per-cohort check is never reached.
+				cache.SetImpersonationReviewer(reviewer)
+				groupsAll, gErr := reviewer(cacheCtx, cache.ImpersonateResourceGroups, "", "")
+				sasAll, sErr := reviewer(cacheCtx, cache.ImpersonateResourceServiceAccounts, "", "")
+				cache.SetImpersonationProbeResult(true, gErr == nil && groupsAll, sErr == nil && sasAll)
+				switch {
+				case gErr != nil || sErr != nil:
+					log.Warn("cache: #574 impersonation granted for users; the groups/serviceaccounts probe FAILED — "+
+						"each cohort is checked on its first refresh and falls back to the re-gated SA transport if refused",
+						slog.Any("groups_err", gErr), slog.Any("serviceaccounts_err", sErr))
+				case !groupsAll:
+					log.Warn("cache: #574 impersonation granted for users only — groups are NOT granted for every name. "+
+						"A cohort whose groups are not all in rbac.impersonateGroups is refreshed over snowplow's ServiceAccount "+
+						"with the re-gate instead of as the cohort (#608); read snowplow_impersonation{stat=impersonation_fallback_sa}",
+						slog.String("placeholder", cache.CohortPlaceholderUsername),
+						slog.Bool("serviceaccounts_all_names", sasAll),
+						slog.String("needed", "the cohorts' groups in the chart value rbac.impersonateGroups"))
+				default:
+					log.Info("cache: #574 impersonation granted for users and every group — the refresher reads as each cell's cohort",
+						slog.String("placeholder", cache.CohortPlaceholderUsername),
+						slog.Bool("serviceaccounts_all_names", sasAll))
+				}
 				return true
 			}())
 
@@ -1303,6 +1320,8 @@ func main() {
 	// publish-seq key is: a `0` must read as "no rotation", never as "not
 	// instrumented".
 	cache.RegisterRBACSubGenExpvar()
+	// #608 — impersonation capability counters and the startup probe's answers.
+	cache.RegisterImpersonationCapabilityExpvar()
 	// #247 — the companion pair: how many (Cluster)RoleBinding UPDATE events
 	// rotated keys for nothing. onBindingUpdate bumps every subject on every
 	// UPDATE with no old-vs-new comparison, and a watch re-establishment

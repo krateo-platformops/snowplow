@@ -37,6 +37,20 @@
 //	    replacing the singleton or paying a build.
 //	F5  the DATA read (the object fall-through) still carries the cohort's
 //	    Impersonate-User — the fix must not quietly undo #574.
+//	F5g the same with GROUP cohorts whose groups the apiserver permits
+//	    (K=3 x M=4 = 12 cells, none in the informer): 12/12 accepted, every
+//	    data read carries the cohort's Impersonate-User + Impersonate-Group,
+//	    none goes out as the bare SA, and the CRD hop is still never
+//	    impersonated.
+//
+// IMPERSONATION CAPABILITY (#608 b, PR #620). Before impersonating, the
+// refresher asks a SelfSubjectAccessReview whether snowplow may impersonate
+// every principal of the cohort. The fake apiserver answers those reviews from
+// the SAME policy table it enforces on the Impersonate-* headers
+// (f608APIServer.permitted), and f608Setup installs the production reviewer
+// (cache.NewSSARImpersonationReviewer over the SA rc), so the fixture can never
+// say "impersonation available" while answering the capability question
+// differently from the wire.
 package dispatchers
 
 import (
@@ -46,6 +60,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -60,6 +75,7 @@ import (
 	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
+	authzv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -68,6 +84,7 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8sscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 )
 
@@ -119,25 +136,54 @@ func (r f608Req) isDiscovery() bool {
 //   - no Impersonate-* header (snowplow itself): everything is served —
 //     discovery, the CRDs, the widget objects. forbidCRDForSA flips the CRD
 //     GET to a 403 for F3.
-//   - Impersonate-User system:serviceaccount:* or any Impersonate-Group not in
-//     allowGroups: 403 application/json Status on EVERY path (057 grants
-//     `impersonate` on users only — the refusal precedes routing).
+//   - Impersonate-User system:serviceaccount:* or any Impersonate-Group not
+//     permitted (allowGroups): 403 application/json Status on EVERY path (057
+//     grants `impersonate` on users only — the refusal precedes routing).
+//   - POST selfsubjectaccessreviews (snowplow's own credential): answered from
+//     the same policy table (permitted), so the #620 capability check and the
+//     wire can never disagree.
 //   - any other impersonation (a username-only cohort): accepted; the cohort
 //     may read discovery and the widget objects but NOT the CRDs, exactly a
 //     tenant's RBAC.
 type f608APIServer struct {
 	*httptest.Server
-	allowGroups    map[string]bool
 	forbidCRDForSA atomic.Bool
 
-	mu      sync.Mutex
-	reqs    []f608Req
-	objects map[string]map[string]any // object path -> body
+	mu            sync.Mutex
+	allowedGroups map[string]bool
+	reqs          []f608Req
+	objects       map[string]map[string]any // object path -> body
+}
+
+// allowGroups permits impersonating the named groups (the chart's
+// `impersonate groups` resourceNames allowlist). Empty by default, as on 057.
+func (s *f608APIServer) allowGroups(groups ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, g := range groups {
+		s.allowedGroups[g] = true
+	}
+}
+
+// permitted is the ONE impersonation policy table: the header check and the
+// SelfSubjectAccessReview answer both read it. An empty name is the kind-wide
+// question ("every name of this resource").
+func (s *f608APIServer) permitted(resource, name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch resource {
+	case cache.ImpersonateResourceUsers:
+		return true // `impersonate users`, no resourceNames
+	case cache.ImpersonateResourceGroups:
+		return name != "" && s.allowedGroups[name]
+	default:
+		return false // serviceaccounts: not granted on 057
+	}
 }
 
 func newF608APIServer(t *testing.T) *f608APIServer {
 	t.Helper()
-	s := &f608APIServer{allowGroups: map[string]bool{}, objects: map[string]map[string]any{}}
+	s := &f608APIServer{allowedGroups: map[string]bool{}, objects: map[string]map[string]any{}}
 
 	writeJSON := func(w http.ResponseWriter, code int, v any) {
 		w.Header().Set("Content-Type", "application/json")
@@ -166,9 +212,12 @@ func newF608APIServer(t *testing.T) *f608APIServer {
 		s.mu.Unlock()
 
 		if req.impersonated() {
-			refused := strings.HasPrefix(req.user, "system:serviceaccount:")
+			refused := !s.permitted(cache.ImpersonateResourceUsers, req.user)
+			if strings.HasPrefix(req.user, "system:serviceaccount:") {
+				refused = !s.permitted(cache.ImpersonateResourceServiceAccounts, req.user)
+			}
 			for _, g := range req.groups {
-				if !s.allowGroups[g] {
+				if !s.permitted(cache.ImpersonateResourceGroups, g) {
 					refused = true
 				}
 			}
@@ -185,6 +234,22 @@ func newF608APIServer(t *testing.T) *f608APIServer {
 		} else if req.isCRD() && s.forbidCRDForSA.Load() {
 			forbid(w, fmt.Sprintf("customresourcedefinitions.apiextensions.k8s.io is forbidden: "+
 				"User %q cannot get resource \"customresourcedefinitions\"", f608SAUser))
+			return
+		}
+
+		if r.Method == http.MethodPost && r.URL.Path == "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" {
+			// client-go sends built-in kinds as protobuf; decode whatever it sent.
+			var review authzv1.SelfSubjectAccessReview
+			body, _ := io.ReadAll(r.Body)
+			if _, _, err := k8sscheme.Codecs.UniversalDeserializer().Decode(body, nil, &review); err != nil {
+				t.Errorf("fake apiserver: undecodable SelfSubjectAccessReview (Content-Type %q): %v",
+					r.Header.Get("Content-Type"), err)
+			}
+			ra := review.Spec.ResourceAttributes
+			review.APIVersion, review.Kind = "authorization.k8s.io/v1", "SelfSubjectAccessReview"
+			review.Status.Allowed = ra != nil && ra.Verb == "impersonate" && ra.Group == "" &&
+				s.permitted(ra.Resource, ra.Name)
+			writeJSON(w, http.StatusCreated, &review)
 			return
 		}
 
@@ -322,8 +387,11 @@ type f608Env struct {
 // f608Setup builds the 057-shaped world: a real ResourceWatcher over a fake
 // dynamic client carrying the RBAC (each cohort group may get/list both
 // widget kinds) and the informer-served widgets, a process SA rc installed the
-// way main.go installs it, and impersonation granted the way the #574 probe
-// records it.
+// way main.go installs it, impersonation granted the way the #574 probe
+// records it, and the #608 capability reviewer main installs next to it (a
+// SelfSubjectAccessReview over the SA rc, answered by the fake apiserver from
+// its own policy table: users yes, groups only when allowGroups lists them,
+// serviceaccounts never).
 func f608Setup(t *testing.T, cohortGroups []string, informerWidgets map[f608Kind][]string) *f608Env {
 	t.Helper()
 	i187RefresherEnv(t)
@@ -414,6 +482,18 @@ func f608Setup(t *testing.T, cohortGroups []string, informerWidgets map[f608Kind
 	// and hands the SAME pointer to RegisterRefreshHandlers.
 	cache.SetProcessSARestConfig(env.saRC)
 	t.Cleanup(cache.ResetProcessSARestConfigForTest)
+
+	// main.go pairs SetImpersonationAvailable(true) with the SSAR reviewer.
+	// Without it the capability check errors and every cohort falls back to
+	// the SA transport — a fixture that never impersonates at all.
+	reviewer, err := cache.NewSSARImpersonationReviewer(env.saRC)
+	if err != nil {
+		t.Fatalf("setup: NewSSARImpersonationReviewer: %v", err)
+	}
+	// Reset first so each arm's capability counters are its own.
+	cache.ResetImpersonationCapabilityForTest()
+	cache.SetImpersonationReviewer(reviewer)
+	t.Cleanup(cache.ResetImpersonationCapabilityForTest)
 
 	// The plural store is warm, as on 057 (99.47% hit): it is permanent per
 	// process and was filled by an SA-transport read long before.
@@ -609,6 +689,95 @@ func TestIssue608_F5_DataReadsStayCohortScoped(t *testing.T) {
 	if !e.accepted(key) {
 		t.Errorf("F5 RED: the cohort's refresh was not accepted — its CRD-schema check ran as the cohort, " +
 			"which (like any tenant) may not read CRDs")
+	}
+}
+
+// TestIssue608_F5g_PermittedGroupCohortDataReadsStayCohortScoped — F5 for
+// GROUP cohorts whose groups the apiserver permits. The capability check says
+// yes, so every data read must still go out as the cohort (#574), while the
+// CRD hop stays on the SA transport (#619).
+func TestIssue608_F5g_PermittedGroupCohortDataReadsStayCohortScoped(t *testing.T) {
+	cohorts := []struct {
+		user  string
+		group string
+	}{{"cohort-a", "team-a"}, {"cohort-b", "team-b"}, {"cohort-c", "team-c"}}
+	widgets := map[f608Kind][]string{
+		f608Kinds[0]: {"f5g-button-1", "f5g-button-2"},
+		f608Kinds[1]: {"f5g-panel-1", "f5g-panel-2"},
+	}
+	var groups []string
+	groupOf := map[string]string{}
+	for _, c := range cohorts {
+		groups = append(groups, c.group)
+		groupOf[c.user] = c.group
+	}
+	// No informer widgets: every read falls through to the apiserver, so the
+	// identity each data read carries is visible on the wire.
+	e := f608Setup(t, groups, nil)
+	e.srv.allowGroups(groups...)
+
+	dataPaths := map[string]bool{}
+	for k, names := range widgets {
+		for _, n := range names {
+			e.srv.addObject(f608Widget(k, n), k, n)
+			dataPaths[fmt.Sprintf("/apis/%s/%s/namespaces/%s/%s/%s", f608Group, f608Version, f608NS, k.resource, n)] = true
+		}
+	}
+	var keys []string
+	for _, c := range cohorts {
+		for k, names := range widgets {
+			for _, n := range names {
+				keys = append(keys, e.seedCell(t, f608CohortInputs(k, n, c.user, []string{c.group})))
+			}
+		}
+	}
+	if len(keys) != 12 {
+		t.Fatalf("setup: %d cells, want K=3 x M=4 = 12", len(keys))
+	}
+
+	_, failed := f608Run(t, e, "widgets", keys)
+
+	accepted := 0
+	for _, k := range keys {
+		if e.accepted(k) {
+			accepted++
+		}
+	}
+	var dataAsCohort, dataAsSA, dataMismatched, crdImp int
+	for _, r := range e.srv.requests() {
+		switch {
+		case dataPaths[r.path] && !r.impersonated():
+			dataAsSA++
+		case dataPaths[r.path]:
+			if g, ok := groupOf[r.user]; ok && len(r.groups) == 1 && r.groups[0] == g {
+				dataAsCohort++
+			} else {
+				dataMismatched++
+			}
+		case r.impersonated() && r.isCRD():
+			crdImp++
+		}
+	}
+	stats := cache.ImpersonationCapabilityStats()
+	t.Logf("F5g: accepted=%d/12 refresher.failed=+%d data_as_cohort=%d data_as_sa=%d data_mismatched=%d impersonated_crd_gets=%d capability=%v",
+		accepted, failed, dataAsCohort, dataAsSA, dataMismatched, crdImp, stats)
+	if stats["impersonation_fallback_sa"] != 0 || stats["impersonation_capability_check_error"] != 0 {
+		t.Errorf("F5g: permitted cohorts fell back to the SA (fallback_sa=%d check_error=%d), want 0, 0",
+			stats["impersonation_fallback_sa"], stats["impersonation_capability_check_error"])
+	}
+
+	if accepted != len(keys) {
+		t.Errorf("F5g: %d/%d cells accepted a re-Put, want all", accepted, len(keys))
+	}
+	if failed != 0 {
+		t.Errorf("F5g: refresher.failed rose by %d, want 0", failed)
+	}
+	if dataAsCohort < len(keys) || dataAsSA != 0 || dataMismatched != 0 {
+		t.Errorf("F5g: permitted group cohorts must read data as themselves (#574): as_cohort=%d (want >= %d) "+
+			"as_sa=%d mismatched=%d (want 0, 0)", dataAsCohort, len(keys), dataAsSA, dataMismatched)
+	}
+	if crdImp != 0 {
+		t.Errorf("F5g: %d CRD-schema GETs were impersonated, want 0 (#619)", crdImp)
 	}
 }
 
