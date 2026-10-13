@@ -90,7 +90,10 @@ serviceAccount:
 # List a cohort's groups here to have it refreshed as itself.
 #
 # NEVER list a privileged group or ServiceAccount. Impersonating one grants
-# everything it is bound to. The schema rejects system:masters and "*".
+# everything it is bound to. The schema rejects "*" and, in impersonateGroups,
+# every built-in "system:" group (system:masters, system:authenticated,
+# system:serviceaccounts[:<ns>], system:nodes, ...): each is a cluster-wide
+# population far broader than any one cohort (#631).
 # impersonateServiceAccounts holds NAMES only: the rule is in a ClusterRole, so a
 # name matches a ServiceAccount of that name in every namespace.
 rbac:
