@@ -125,6 +125,14 @@ func altDefault(l, r *abs, inCU bool) *abs {
 	if l.k != aConst || l.cc != ccExtras || l.nav == nil || l.nav.HasDefault {
 		return nil
 	}
+	if l.nav.Stream && !mutated(mutStreamDefault) {
+		// A stream source does not say WHERE the iteration happened: in
+		// ($ns[] // "d") the default applies once to the whole stream, but
+		// in ($ns[] | . // "d"), $ns[] as $x | $x // "d", or an outer
+		// .extras.names[] as $x, it applies to each element, and an element
+		// that is null or false compares with "d" (#644 gate). Refused.
+		return nil
+	}
 	if r.k != aConst || r.cc != ccLiteral || !r.hasLit {
 		return nil
 	}

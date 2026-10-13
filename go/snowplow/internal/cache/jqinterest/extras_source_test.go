@@ -340,7 +340,7 @@ func sourcePositiveArms() []namedChain {
 		{"src: stage input .slice.page", oneStage(`.slice.page as $p | [.s.items[] | select(.metadata.generation == $p)]`, "")},
 		{"src: stage input through a user function", oneStage(`def n: .extras.name; n as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
 		{"src: stage input .extras.name // \"\" (the portal shape)", oneStage(`(.extras.name // "") as $n | (.extras.namespace // "") as $ns | [.s.items[]? | select(.metadata.name == $n and .metadata.namespace == $ns)]`, "")},
-		{"src: stage input stream with a default", oneStage(`.extras.names as $ns | [.s.items[] | select(.metadata.name == ($ns[] // "d"))]`, "")},
+		{"src: stage input nested chain with a default", oneStage(`(.extras.o.name // "d") as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
 		{"src: stage input under a try (?)", oneStage(`.extras.names as $ns | [.s.items[] | select(.metadata.name == ($ns[]?))]`, "")},
 	}
 }
@@ -367,8 +367,9 @@ func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
 		{RootStageInput, `.extras | {name} | .name`, true, `stage_input:."extras"."name"`}, // the field IS .extras.name
 		{RootStageInput, `.extras | {name}`, false, ""},
 		{RootStageInput, `.extras.name // ""`, true, `stage_input:."extras"."name" // ""`},
-		{RootStageInput, `.extras.names[] // "d"`, true, `stage_input:."extras"."names"[] // "d"`},
-		{RootStageInput, `.extras.sel[].name // "d"`, true, `stage_input:."extras"."sel"[]."name" // "d"`},
+		{RootStageInput, `.extras.o.name // "d"`, true, `stage_input:."extras"."o"."name" // "d"`},
+		{RootStageInput, `.extras.names[] // "d"`, false, ""}, // a stream with a default is refused (#644 gate)
+		{RootStageInput, `.extras.sel[].name // "d"`, false, ""},
 		{RootStageInput, `.extras.name // null`, true, `stage_input:."extras"."name" // null`},
 		{RootStageInput, `.extras.name // false`, true, `stage_input:."extras"."name" // false`},
 		{RootStageInput, `.extras.name // 0`, true, `stage_input:."extras"."name" // 0`},
@@ -377,7 +378,7 @@ func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
 		{RootStageInput, `(.extras // {}) | .name`, false, ""},
 		{RootStageInput, `(.extras.sel // "") | .name`, false, ""},
 		{RootRADict, `.name // "x"`, true, `ra_dict:."name" // "x"`},
-		{RootRADict, `.names[] // "x"`, true, `ra_dict:."names"[] // "x"`},
+		{RootRADict, `.names[] // "x"`, false, ""},
 		{RootStageInput, `.s`, false, ""},
 		{RootRADict, `.name`, true, `ra_dict:."name"`},
 		{RootRADict, `.names[]`, true, `ra_dict:."names"[]`},
@@ -388,7 +389,8 @@ func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
 		{RootWidgetDS, `.name`, true, `widget_ds:."name"`},
 		{RootWidgetDS, `.names[]`, true, `widget_ds:."names"[]`},
 		{RootWidgetDS, `.slice.page`, true, `widget_ds:."slice"."page"`},
-		{RootWidgetDS, `.names[] // 0`, true, `widget_ds:."names"[] // 0`},
+		{RootWidgetDS, `.name // 0`, true, `widget_ds:."name" // 0`},
+		{RootWidgetDS, `.names[] // 0`, false, ""},
 		{RootWidgetDS, `.s`, false, ""}, // chain 0: the dict's stage field
 		{RootWidgetDS, `.x`, false, ""}, // chain 1: the built object's field
 	}
@@ -441,7 +443,7 @@ func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
 				t.Fatal(err)
 			}
 			r := rand.New(rand.NewSource(int64(633 + ci)))
-			g := &gen{r: r, v: vocab{keys: []string{"name", "names", "sel", "page", "nope"}}}
+			g := &gen{r: r, v: vocab{keys: []string{"name", "names", "sel", "page", "nope", "o"}}}
 			edges := defaultEdgeExtras()
 			for trial := 0; trial < len(edges)+80; trial++ {
 				env := sourceEnv(g, c)
@@ -518,7 +520,15 @@ func defaultEdgeExtras() []map[string]any {
 		{"name": "n", "names": "str", "sel": map[string]any{"b": map[string]any{"name": "y"}, "a": map[string]any{"name": false}}},
 		{"name": "", "names": []any{""}},
 		{"names": map[string]any{"b": "y", "a": false}},
+		{"o": map[string]any{"name": false}},
+		{"o": map[string]any{"name": "x"}},
+		{"o": "str"},
+		{"o": nil, "name": 0.0},
 	}
+}
+
+func gateSel(c string) string {
+	return `[.s.items[] | select(.metadata.name == (` + c + `))]`
 }
 
 // sourceNegativeArms: constants that involve the extras but are NOT one
@@ -528,6 +538,14 @@ func sourceNegativeArms() []namedChain {
 		{"neg: union (\"zzz\", $n)", oneStage(`.extras.name as $n | [.s.items[] | select(.metadata.name == ("zzz", $n))]`, "")},
 		{"neg: object {app: $n}", oneStage(`.extras.name as $n | [.s.items[] | select(.metadata.labels == {app: $n})]`, "")},
 		{"neg: two extras paths ($e.a, $e.b)", oneStage(`.extras as $e | [.s.items[] | select(.metadata.name == ($e.a, $e.b))]`, "")},
+		// A stream with a default: where the iteration happened is not in the
+		// source, so a per-element // is indistinguishable (#644 gate).
+		{"neg: stream default ($ns[] // \"d\")", oneStage(`.extras.names as $ns | `+gateSel(`$ns[] // "d"`), "")},
+		{"neg: per-element // via pipe", oneStage(`.extras.names as $ns | `+gateSel(`$ns[] | . // "d"`), "")},
+		{"neg: per-element // via as", oneStage(`.extras.names as $ns | `+gateSel(`$ns[] as $x | $x // "d"`), "")},
+		{"neg: outer extras iteration then //", oneStage(`[.extras.names[] as $x | .s.items[] | select(.metadata.name == ($x // "d"))]`, "")},
+		{"neg: per-element field //", oneStage(`.extras.sel as $s | `+gateSel(`$s[] | .name // "d"`), "")},
+		{"neg: per-element // via def", oneStage(`def f: . // "d"; .extras.names as $ns | `+gateSel(`$ns[] | f`), "")},
 		{"neg: alternative of two chains .a // .b", oneStage(`(.extras.name // .extras.other) as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
 		{"neg: a default of a default", oneStage(`((.extras.name // "") // "y") as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
 		{"neg: navigation after a default", oneStage(`((.extras.o // {}) | .name) as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
@@ -663,7 +681,24 @@ func TestIssue633_UnionDecidableMutationIsRed(t *testing.T) {
 // compares with "", which the chain alone does not yield.
 func TestIssue633_AltAsNavMutationIsRed(t *testing.T) {
 	sourceMutationIsRed(t, mutAltAsNav, `(.extras.name // "") as $n | [.s.items[] | select(.metadata.name == $n)]`)
-	sourceMutationIsRed(t, mutAltAsNav, `.extras.names as $ns | [.s.items[] | select(.metadata.name == ($ns[] // "d"))]`)
+	sourceMutationIsRed(t, mutAltAsNav, `(.extras.o.name // "d") as $n | [.s.items[] | select(.metadata.name == $n)]`)
+}
+
+// TestIssue633_StreamDefaultMutationIsRed (#644 gate): the named mutation
+// takes `//` after a stream source as a stream-level default. Applied per
+// element, names=[null,false,"a",false,"b"] compares with {"a","b","d"},
+// while the stream-level source yields {"a","b"}: "d" is a member the claim
+// would skip.
+func TestIssue633_StreamDefaultMutationIsRed(t *testing.T) {
+	for _, prog := range []string{
+		`.extras.names as $ns | ` + gateSel(`$ns[] | . // "d"`),
+		`.extras.names as $ns | ` + gateSel(`$ns[] as $x | $x // "d"`),
+		`[.extras.names[] as $x | .s.items[] | select(.metadata.name == ($x // "d"))]`,
+		`.extras.sel as $s | ` + gateSel(`$s[] | .name // "d"`),
+		`def f: . // "d"; .extras.names as $ns | ` + gateSel(`$ns[] | f`),
+	} {
+		sourceMutationIsRed(t, mutStreamDefault, prog)
+	}
 }
 
 func sourceMutationIsRed(t *testing.T, mutation, prog string) {
