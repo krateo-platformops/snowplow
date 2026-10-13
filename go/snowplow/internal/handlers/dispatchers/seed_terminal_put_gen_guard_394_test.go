@@ -194,8 +194,8 @@ func s394RunLoop(t *testing.T, mode seedScopeMode) {
 			CollapsedBindings: c.CollapsedBindings,
 		}}
 	}
-	restActionTargetGVRFn = func(_ context.Context, _ templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
-		return s394RATargetGVR, true
+	restActionTargetGVRFn = func(_ context.Context, _ templatesv1.ObjectReference) (schema.GroupVersionResource, string) {
+		return s394RATargetGVR, raTargetFound
 	}
 	if err := seedScopeYielding(context.Background(), []templatesv1.ObjectReference{s394RARef()},
 		[]navWidgetEntry{s394WidgetEntry()}, endpoints.Endpoint{}, nil, h1NS, mode); err != nil {

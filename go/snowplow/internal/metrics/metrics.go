@@ -538,6 +538,18 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #647: RESTAction units the resident enumeration (RBAC-shift reseed,
+	// learned-class seed, #258 rotated filter) DROPPED for want of a target GVR.
+	// Hand-wired twin of expvar snowplow_prewarm_resident_units_dropped_total.
+	// The full closed reason set is emitted (zeros included). get_failed is the
+	// #647 signature (one per RESTAction per run while the lookup had no
+	// identity) and is 0 when healthy; no_static_target is expected and stable.
+	residentUnitsDropped, err := m.Int64ObservableCounter("snowplow_prewarm_resident_units_dropped_total",
+		metric.WithDescription("RESTAction units the resident enumeration dropped (reseeded for nobody), by reason=get_failed|decode_failed|no_static_target; get_failed and decode_failed should be 0. #647."))
+	if err != nil {
+		return err
+	}
+
 	// ===== 1.12.4 (design §3.3) — the instrument gap =====
 	//
 	// Everything below already existed as a live counter inside the
@@ -1094,6 +1106,10 @@ func registerInstruments(m metric.Meter, build string) error {
 			o.ObserveInt64(unrenderableStoreItems, int64(c.Count), metric.WithAttributes(
 				attribute.String("site", c.Site), attribute.String("gvr", c.GVR)))
 		}
+		for _, c := range dispatchers.ResidentUnitsDroppedCells() {
+			o.ObserveInt64(residentUnitsDropped, int64(c.Count), metric.WithAttributes(
+				attribute.String("reason", c.Reason)))
+		}
 		return nil
 	}, append([]metric.Observable{
 		fallthroughTotal, assertionViolations, rbacPublishSeq,
@@ -1115,6 +1131,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		raFullListServe, bindingsDeltaSkipped,
 		// --- #624 ---
 		unrenderableStoreItems,
+		// --- #647 ---
+		residentUnitsDropped,
 		// --- 1.12.4 ---
 		uafRestactionsDeclined, uafWidgetsDeclined, uafRAFullListCached,
 		dispatchL1Cells, seedAttributableHits,

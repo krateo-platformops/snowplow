@@ -207,11 +207,11 @@ func TestF3bR2_NavOrderFlatSeedOrder(t *testing.T) {
 	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
 
 	prevTGVR := restActionTargetGVRFn
-	restActionTargetGVRFn = func(_ context.Context, ref templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
+	restActionTargetGVRFn = func(_ context.Context, ref templatesv1.ObjectReference) (schema.GroupVersionResource, string) {
 		if ref.Name == "cheap-ra" {
-			return eCheapRAGVR, true
+			return eCheapRAGVR, raTargetFound
 		}
-		return eFanoutRAGVR, true
+		return eFanoutRAGVR, raTargetFound
 	}
 	t.Cleanup(func() { restActionTargetGVRFn = prevTGVR })
 

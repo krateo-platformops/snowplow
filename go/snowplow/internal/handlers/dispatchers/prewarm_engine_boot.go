@@ -1000,8 +1000,8 @@ func seedScopeYielding(ctx context.Context,
 			return ctx.Err()
 		}
 		engineYieldCheckpoint(ctx)
-		targetGVR, haveTarget := restActionTargetGVRFn(ctx, ref)
-		targets, scoped := targetsFor(targetGVR, haveTarget)
+		targetGVR, miss := restActionTargetGVRFn(ctx, ref)
+		targets, scoped := targetsFor(targetGVR, miss == raTargetFound)
 		targets, learnedTargets := splitLearned(targets)
 		lp.note(learnedTargets, false)
 		restactionSeeds = append(restactionSeeds, restactionSeed{
@@ -1669,22 +1669,26 @@ func unionRefsForTest(harvested []templatesv1.ObjectReference,
 // userAccessFilter (verb/group/resource) — the no-special-case signal of
 // what GVR the RA gates LIST on (e.g. compositions-panels' RA has
 // userAccessFilter:{group:composition.krateo.io, resource:compositions}).
-// Returns (gvr, true) when a static {group, resource} is declared on any
-// api stanza; (zero, false) for a runtime-discovered target
-// (ResourcesFrom — no static literal) or no userAccessFilter (the caller
-// falls back to the global cohort set).
+// Returns (gvr, raTargetFound) when a static {group, resource} is declared on
+// any api stanza. Otherwise the second value names WHY there is no target, from
+// the closed set the resident enumeration counts its drops by (#647):
+// residentDropGetFailed (objects.Get refused or failed — e.g. no identity on
+// ctx, which filterGetByRBAC fails closed on), residentDropDecodeFailed (the
+// object is not a RESTAction shape), residentDropNoStaticTarget (a
+// runtime-discovered target — ResourcesFrom, no static literal — or no
+// userAccessFilter at all).
 //
 // The version is left "" — the BindingsByGVR index keys on {group,
 // resource} (RBAC rules carry no version), so the version is irrelevant
 // to cohort scoping.
-func restActionTargetGVR(ctx context.Context, ref templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
+func restActionTargetGVR(ctx context.Context, ref templatesv1.ObjectReference) (schema.GroupVersionResource, string) {
 	got := objects.Get(ctx, ref)
 	if got.Err != nil || got.Unstructured == nil {
-		return schema.GroupVersionResource{}, false
+		return schema.GroupVersionResource{}, residentDropGetFailed
 	}
 	var cr templatesv1.RESTAction
 	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); err != nil {
-		return schema.GroupVersionResource{}, false
+		return schema.GroupVersionResource{}, residentDropDecodeFailed
 	}
 	// Pick the first api stanza declaring a static userAccessFilter
 	// resource. Multiple stanzas would each have their own target; the
@@ -1706,7 +1710,7 @@ func restActionTargetGVR(ctx context.Context, ref templatesv1.ObjectReference) (
 		return schema.GroupVersionResource{
 			Group:    a.UserAccessFilter.Group,
 			Resource: a.UserAccessFilter.Resource,
-		}, true
+		}, raTargetFound
 	}
-	return schema.GroupVersionResource{}, false
+	return schema.GroupVersionResource{}, residentDropNoStaticTarget
 }

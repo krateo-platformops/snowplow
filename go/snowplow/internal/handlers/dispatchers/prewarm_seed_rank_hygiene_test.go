@@ -78,8 +78,11 @@ func installRankObsSeams(t *testing.T, ev *[]rankObsEvent,
 	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
 
 	prevTGVR := restActionTargetGVRFn
-	restActionTargetGVRFn = func(_ context.Context, ref templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
-		return raTargetGVR(ref)
+	restActionTargetGVRFn = func(_ context.Context, ref templatesv1.ObjectReference) (schema.GroupVersionResource, string) {
+		if g, ok := raTargetGVR(ref); ok {
+			return g, raTargetFound
+		}
+		return schema.GroupVersionResource{}, residentDropNoStaticTarget
 	}
 	t.Cleanup(func() { restActionTargetGVRFn = prevTGVR })
 
