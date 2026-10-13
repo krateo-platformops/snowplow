@@ -191,6 +191,8 @@ func enqueueBootReDrive(reason string) {
 	// here (it AddRateLimited's inside processScope and keeps the set) — only a
 	// genuine config change clears.
 	prewarmEngineSingleton().clearDeclinedExternalSet(bootScope.key(), "config-vars-redrive")
+	// #643 PR-C — a new topology also invalidates the gvr-discovered resume set.
+	prewarmEngineSingleton().clearPassDoneSet(prewarmScope{kind: scopeKindGVRDiscovered}.key())
 	// #105 — a config-vars redrive is a NEW TOPOLOGY: also clear the engine-lived
 	// boot-convergence state so the redrive re-arms with empty seeded/failed sets
 	// and a zeroed no-progress counter. A target given up under the OLD topology

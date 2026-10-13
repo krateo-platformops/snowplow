@@ -900,7 +900,25 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 				"the rotation); resolve+Put skipped"),
 		)
 		return true
-	default: // seedModeGVRDiscovered — never skip (F4-C3 boundary).
+	default: // seedModeGVRDiscovered
+		// F4-C3: every cacheable cell is re-resolved after the newest discovered
+		// GVR is registered. #643 PR-C — the ONLY skip here is the resume: a unit
+		// an earlier attempt of this scope re-Put in THIS discovery epoch, whose
+		// cell is still exactly that Put and whose inputs have not moved since
+		// (prewarm_pass_resume.go). Its edges to every GVR up to now are already
+		// recorded, so the skip cannot drop one.
+		if passDoneSkip(ctx, handle, key) {
+			bumpPrewarmSkipResumeDone(ctx)
+			slog.Default().Debug("phase1.seed.resume_skip",
+				slog.String("subsystem", "cache"),
+				slog.String("class", class),
+				slog.String("target", target),
+				slog.String("cohort", cohortLabel.String()),
+				slog.String("effect", "#643 resume: re-Put by an earlier attempt of this gvr-discovered scope in "+
+					"the current discovery epoch; the cell is unchanged and clean — not redone"),
+			)
+			return true
+		}
 		return false
 	}
 }
@@ -955,6 +973,9 @@ var seedObjectsGetFn = objects.Get
 var seedRestactionResolveAndPutFn = seedRestactionResolveAndPutProd
 
 func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
+	// #643 PR-C — the discovery epoch at this unit's RESOLVE START (before any
+	// read), carried to its terminal Put (no resume set on ctx → no-op).
+	ctx = withResolveStartEpoch(ctx)
 	// #375 C1 — CR self-dep epoch, taken BEFORE the RESTAction read (same as the
 	// customer handler, restactions.go). The CR is read here on the outer ctx, before
 	// the L1 key is known, and its self-dep is Recorded only AFTER the terminal Put,
@@ -1311,6 +1332,9 @@ func seedRestactionResolveAndPutProd(
 	// didn't run"). Wired here + at seedOneWidget's success Put so the counter
 	// again means "seed units resolved+Put".
 	pipBindingSetSeedResolvesTotal.Add(1)
+	// #643 PR-C — an accepted terminal Put: a gvr-discovered resume may skip
+	// this unit while the cell stays exactly this Put (no-op off that scope).
+	markPassDone(resCtx, key, entry)
 	// #105 seeded-set: a genuine Put is the primary "warm target reached this
 	// boot" event — record it (same site as the resolves counter, §As-built).
 	// Keyed on the full per-cohort `key`, so a genuinely-new cohort reaching this
@@ -1359,6 +1383,9 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	if e.W == nil {
 		return nil
 	}
+	// #643 PR-C — the discovery epoch at this unit's RESOLVE START (before any
+	// read), carried to its terminal Put (no resume set on ctx → no-op).
+	ctx = withResolveStartEpoch(ctx)
 
 	// inline-extras design P §5 / MUST-FIX #1 — PIP-seed key parity at the
 	// per-cohort widget cell. The dispatcher keys this cell on the UNION of
@@ -1673,6 +1700,8 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// a seed UNIT resolved+written; wired so snowplow_phase1_bindingset_seed_resolves_total
 	// again means "seed units resolved+Put" (was dead-at-0 post-fold).
 	pipBindingSetSeedResolvesTotal.Add(1)
+	// #643 PR-C — see seedRestactionResolveAndPutProd.
+	markPassDone(resCtx, key, entry)
 	// #105 seeded-set — mirror of seedOneRestaction: record this genuine widget
 	// Put into the boot-convergence seeded SET (keyed on the full per-cohort key).
 	cache.BootSeededSetFromContext(ctx).Mark(key)

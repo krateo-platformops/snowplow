@@ -282,8 +282,10 @@ func bumpPrewarmSkipDeclinedExternal(ctx context.Context) {
 	bumpPrewarmKindCounter(ctx, prewarmSkipDeclinedExternal)
 }
 
-// prewarmSkipResumeDone has no bump site until #643 PR-C (the resume
-// done-set); the counter is published first so its zero is a reading.
+// bumpPrewarmSkipResumeDone counts one resume (pass-done) skip — #643 PR-C.
+func bumpPrewarmSkipResumeDone(ctx context.Context) {
+	bumpPrewarmKindCounter(ctx, prewarmSkipResumeDone)
+}
 
 func bumpPrewarmKindCounter(ctx context.Context, m map[string]uint64) {
 	kind, ok := cache.PrewarmScopeFromContext(ctx)
