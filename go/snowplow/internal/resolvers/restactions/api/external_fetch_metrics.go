@@ -71,18 +71,24 @@ func externalFetchOrigin(ctx context.Context) string {
 }
 
 // recordExternalFetch counts one external fetch about to be issued.
-func recordExternalFetch(ctx context.Context) {
-	if externalFetchOrigin(ctx) == ExternalFetchOriginBackground {
+func recordExternalFetch(ctx context.Context) { countExternalFetch(externalFetchOrigin(ctx)) }
+
+// recordExternalFetchAbandoned counts one fetch whose caller gave up before the
+// response was read: fetchErr != nil while the fetch ctx is done.
+func recordExternalFetchAbandoned(ctx context.Context) {
+	countExternalFetchAbandoned(externalFetchOrigin(ctx))
+}
+
+func countExternalFetch(origin string) {
+	if origin == ExternalFetchOriginBackground {
 		externalFetchBackground.Add(1)
 		return
 	}
 	externalFetchRequest.Add(1)
 }
 
-// recordExternalFetchAbandoned counts one fetch whose caller gave up before the
-// response was read: fetchErr != nil while the fetch ctx is done.
-func recordExternalFetchAbandoned(ctx context.Context) {
-	if externalFetchOrigin(ctx) == ExternalFetchOriginBackground {
+func countExternalFetchAbandoned(origin string) {
+	if origin == ExternalFetchOriginBackground {
 		externalFetchAbandonedBackground.Add(1)
 		return
 	}
@@ -113,15 +119,17 @@ func ExternalFetchAbandonedSnapshot() []ExternalFetchCount {
 	}
 }
 
-// RecordExternalFetchForTest bumps both counters for origin's ctx shape — the
-// OTLP falsifier's way to move a real series. Production MUST NOT use it.
+// RecordExternalFetchForTest bumps both counters under the given origin — the
+// OTLP falsifier's way to move a real series. It takes the origin, not a
+// background ctx, so no production file stamps a background origin outside a
+// real driver (the #563 census). Production MUST NOT use it.
 func RecordExternalFetchForTest(background bool) {
-	ctx := context.Background()
+	origin := ExternalFetchOriginRequest
 	if background {
-		ctx = cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginCohortSeed)
+		origin = ExternalFetchOriginBackground
 	}
-	recordExternalFetch(ctx)
-	recordExternalFetchAbandoned(ctx)
+	countExternalFetch(origin)
+	countExternalFetchAbandoned(origin)
 }
 
 var externalFetchExpvarOnce sync.Once

@@ -744,36 +744,30 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// last-pass planned/done/budget/elapsed gauges). The outcome is computed once
 	// here and reused by the log lines below so the counter and the log agree.
 	outcome := recordPrewarmPass(string(s.kind), err, passStats, budget, passElapsed)
-	passAttrs := []any{
-		slog.String("kind", string(s.kind)),
-		slog.String("outcome", outcome),
-		slog.Int64("planned", passStats.planned.Load()),
-		slog.Int64("done", passStats.done.Load()),
-		slog.Int64("budget_ms", budget.Milliseconds()),
-		slog.Int64("elapsed_ms", passElapsed.Milliseconds()),
-	}
 
 	switch {
 	case err == nil && outcome == prewarmPassOutcomeComplete:
 		// Info, not Warn: a completion is work, not a failure. The shipped signal
 		// is snowplow_prewarm_pass_total{outcome=complete}.
-		slog.Info("prewarm.pass.complete",
-			append([]any{slog.String("subsystem", "cache"), slog.String("scope", s.key())}, passAttrs...)...)
+		logPrewarmPass(slog.LevelInfo, "prewarm.pass.complete", s, outcome, passStats, budget, passElapsed)
 	case err == nil:
 		// A handler that re-enqueues itself on a cut (rbac-shift, learned-class)
 		// returns nil, so scope_incomplete below never fires for it. Without this
 		// line its cut passes would be invisible in the shipped logs.
-		slog.Warn("prewarm.pass.cut",
-			append([]any{slog.String("subsystem", "cache"), slog.String("scope", s.key())}, passAttrs...)...)
+		logPrewarmPass(slog.LevelWarn, "prewarm.pass.cut", s, outcome, passStats, budget, passElapsed)
 	}
 
 	if err != nil {
 		slog.Warn("prewarm.engine.scope_incomplete",
-			append([]any{
-				slog.String("subsystem", "cache"),
-				slog.String("scope", s.key()),
-				slog.Any("err", err),
-			}, passAttrs...)...,
+			slog.String("subsystem", "cache"),
+			slog.String("scope", s.key()),
+			slog.Any("err", err),
+			slog.String("kind", string(s.kind)),
+			slog.String("outcome", outcome),
+			slog.Int64("planned", passStats.plannedN()),
+			slog.Int64("done", passStats.doneN()),
+			slog.Int64("budget_ms", budget.Milliseconds()),
+			slog.Int64("elapsed_ms", passElapsed.Milliseconds()),
 		)
 		// F.4 engine-owned failure-requeue. Only while the process ctx is
 		// alive — on shutdown the scope error is the ctx cancel itself and a

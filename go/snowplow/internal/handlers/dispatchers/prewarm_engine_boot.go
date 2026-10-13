@@ -740,8 +740,8 @@ func seedScopeYielding(ctx context.Context,
 			// #643 PR-A — the pass's plan and progress on the shipped (Warn) line;
 			// before this they were Info-only and invisible in otel_logs.
 			slog.String("kind", passKind),
-			slog.Int64("planned", passStats.planned.Load()),
-			slog.Int64("done", passStats.done.Load()),
+			slog.Int64("planned", passStats.plannedN()),
+			slog.Int64("done", passStats.doneN()),
 			slog.Int64("budget_ms", passBudgetMS),
 			slog.String("effect", "seed cut off by ctx cancel/deadline (boot budget / pipCohortTimeout / "+
 				"shutdown); background best-effort — remaining targets fall back to per-user resolve at /call time"),

@@ -35,6 +35,7 @@ package dispatchers
 import (
 	"context"
 	"expvar"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -104,6 +105,22 @@ func (p *prewarmPassStats) addPlanned(n int) {
 	}
 	p.plannedSet.Store(true)
 	p.planned.Add(int64(n))
+}
+
+// plannedN / doneN read the counters nil-safely (a seed run outside the engine
+// carries no stats).
+func (p *prewarmPassStats) plannedN() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.planned.Load()
+}
+
+func (p *prewarmPassStats) doneN() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.done.Load()
 }
 
 func (p *prewarmPassStats) unitDone() {
@@ -199,6 +216,21 @@ func knownPrewarmPassKind(kind string) bool {
 		}
 	}
 	return false
+}
+
+// logPrewarmPass emits one finished-pass line with the pass's plan, progress,
+// budget and wall time — the shipped (Warn) form of what was Info-only before.
+func logPrewarmPass(level slog.Level, msg string, s prewarmScope, outcome string, p *prewarmPassStats, budget, elapsed time.Duration) {
+	slog.Default().Log(context.Background(), level, msg,
+		slog.String("subsystem", "cache"),
+		slog.String("scope", s.key()),
+		slog.String("kind", string(s.kind)),
+		slog.String("outcome", outcome),
+		slog.Int64("planned", p.plannedN()),
+		slog.Int64("done", p.doneN()),
+		slog.Int64("budget_ms", budget.Milliseconds()),
+		slog.Int64("elapsed_ms", elapsed.Milliseconds()),
+	)
 }
 
 // prewarmPassOutcome classifies a finished pass. A pass is CUT when its handler
