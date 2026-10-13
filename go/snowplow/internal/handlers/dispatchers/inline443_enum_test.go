@@ -193,7 +193,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	// items had to be re-derived. Classified read-only on that basis; if a future
 	// edit gives it a real side effect this classification must change with it.
 	"ResolvedEntry.EnsureItems":                readOnly443,
-	"ResourceWatcher.ListServableEnvelopeJSON": readOnly443, "ResourceWatcher.ServabilitySnapshotFor": readOnly443,
+	"ResourceWatcher.ListServableEnvelopeJSONWhere": readOnly443, /* #618: ListServableEnvelopeJSON + a pure read-only predicate */ "ResourceWatcher.ServabilitySnapshotFor": readOnly443,
 	"ResourceWatcher.Snapshot": readOnly443, "ResourceWatcher.WaitForGVRSync": readOnly443,
 	"SecretsCacheNamespace": readOnly443, "SecretsCacheServable": readOnly443, "SecretsSnapshotLoad": readOnly443,
 	"SeedResolveMemo.Key": readOnly443, "SeedResolveMemo.LoadLayered": readOnly443,
