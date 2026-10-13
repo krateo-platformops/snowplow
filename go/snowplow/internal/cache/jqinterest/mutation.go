@@ -39,4 +39,12 @@ const (
 	mutUnionDecidable      = "union-decidable"       // a union key constant gets its first extras alternative's source (#633)
 	mutAltAsNav            = "alt-as-nav"            // `<extras chain> // <literal>` is read as the chain alone: the default is dropped (#633)
 	mutStreamDefault       = "stream-default"        // a stream extras source takes a // default as stream-level, even when // runs per element (#644 gate)
+
+	// toItemReads / itemExcl: mapping a read of the list ENVELOPE onto item
+	// reads (#666). Each drops or narrows exactly one rule.
+	mutItemsWholeDropped    = "items-whole-dropped"    // a whole .items read yields no item read (reviewer-603's R4)
+	mutEnvelopeWholeDropped = "envelope-whole-dropped" // a whole read of the envelope yields no item read
+	mutEnvelopeIterDropped  = "envelope-iter-dropped"  // a read under `.[]` of the envelope (which reaches items) yields no item read
+	mutItemsElemDropped     = "items-elem-dropped"     // a read under .items[] yields no item read
+	mutItemExclMisapplied   = "item-excl-misapplied"   // an envelope exclusion (del(.kind)) is applied to every item
 )

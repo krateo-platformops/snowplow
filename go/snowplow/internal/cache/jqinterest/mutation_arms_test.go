@@ -101,6 +101,22 @@ func soundnessArms() []arm {
 		// reviewer-603 re-gate (C1).
 		{"N4: a key constant with a non-literal alternative has no literal value set", mutLiteralValuesSkip,
 			oneStage(`.extras.name as $n | [.s.items[] | select(.metadata.name == ("zzz", $n))]`, "")},
+		// #666: every rule of toItemReads / itemExcl that maps a read of the
+		// list envelope onto item reads, each with a fixed witness (an
+		// UPDATE of a field the output carries) so it is RED by construction,
+		// not by which chains a seed reaches.
+		{"R4: a whole .items read (stage filter) observes every item whole", mutItemsWholeDropped,
+			oneStage(`.s.items | tojson`, "")},
+		{"R4b: a whole .items read (spec.filter) observes every item whole", mutItemsWholeDropped,
+			oneStage("", `.s.items`)},
+		{"E-whole: a whole read of the envelope observes every item whole", mutEnvelopeWholeDropped,
+			oneStage(`.s | tojson`, "")},
+		{"E-iter: .[] of the envelope reaches .items", mutEnvelopeIterDropped,
+			oneStage(`[.s[]] | tojson`, "")},
+		{"E-elem: a read under .items[] is an item read", mutItemsElemDropped,
+			oneStage(`[.s.items[] | .spec.secret]`, "")},
+		{"E-excl: an envelope exclusion (del(.kind)) is not an item exclusion", mutItemExclMisapplied,
+			oneStage(`.s | del(.kind) | tojson`, "")},
 	}
 }
 
@@ -120,7 +136,25 @@ func armWitness() map[string]*[2]map[string]any {
 		mutKeyNotRead: {advItem("a", "ns1", map[string]any{"v": "1"}), advItem("b", "ns1", map[string]any{"v": "1"})},
 		// reviewer-603's R5 witness: adding key x flips has("x").
 		mutHasAsKind: {advItem("a", "ns1", map[string]any{"v": "1"}), advItem("a", "ns1", map[string]any{"v": "1", "x": 1.0})},
+		// #666 (reviewer-603's R4 witness): spec.secret a -> b changes an
+		// output that carries the whole item.
+		mutItemsWholeDropped:    secretWitness(),
+		mutEnvelopeWholeDropped: secretWitness(),
+		mutEnvelopeIterDropped:  secretWitness(),
+		mutItemsElemDropped:     secretWitness(),
+		// the item's own kind changes; the envelope's kind is what del() drops.
+		mutItemExclMisapplied: {advItem("a", "ns1", map[string]any{"v": "1"}), withKind(advItem("a", "ns1", map[string]any{"v": "1"}), "Other")},
 	}
+}
+
+// secretWitness: spec.secret a -> b.
+func secretWitness() *[2]map[string]any {
+	return &[2]map[string]any{advItem("a", "ns1", map[string]any{"secret": "a"}), advItem("a", "ns1", map[string]any{"secret": "b"})}
+}
+
+func withKind(it map[string]any, kind string) map[string]any {
+	it["kind"] = kind
+	return it
 }
 
 // truthWitness: one list element turns from false to true.

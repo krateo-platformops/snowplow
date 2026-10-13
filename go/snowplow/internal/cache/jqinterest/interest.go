@@ -442,7 +442,7 @@ func dedupGuards(gs []KeyGuard) []KeyGuard {
 func toItemReads(r Read) ([]Read, bool) {
 	p := r.Path
 	if len(p) == 0 {
-		if r.Mode != ModeWhole {
+		if r.Mode != ModeWhole || mutated(mutEnvelopeWholeDropped) {
 			return nil, true
 		}
 		return []Read{{Path: Path{}, Mode: ModeWhole, Excl: itemExcl(r.Excl, true)}}, true
@@ -451,6 +451,9 @@ func toItemReads(r Read) ([]Read, bool) {
 	if first.Any {
 		// `.[]` over the envelope: its values are apiVersion, kind (constant)
 		// and items.
+		if mutated(mutEnvelopeIterDropped) {
+			return nil, true
+		}
 		rr := r
 		rr.Path = append(Path{{Key: "items"}}, p[1:]...)
 		return toItemReads(rr)
@@ -463,13 +466,16 @@ func toItemReads(r Read) ([]Read, bool) {
 		return nil, false
 	}
 	if len(p) == 1 {
-		if r.Mode != ModeWhole {
+		if r.Mode != ModeWhole || mutated(mutItemsWholeDropped) {
 			return nil, true
 		}
 		return []Read{{Path: Path{}, Mode: ModeWhole, Excl: itemExcl(r.Excl, false)}}, true
 	}
 	if !p[1].Any {
 		// `.items.foo` is an error on an array: only the array's kind matters.
+		return nil, true
+	}
+	if mutated(mutItemsElemDropped) {
 		return nil, true
 	}
 	return []Read{{Path: append(Path{}, p[2:]...), Mode: r.Mode, Excl: r.Excl}}, true
@@ -482,6 +488,11 @@ func itemExcl(excl []Path, fromEnvelope bool) []Path {
 		q := e
 		if fromEnvelope {
 			if len(q) == 0 || q[0].Any || q[0].Key != "items" {
+				if mutated(mutItemExclMisapplied) && len(q) > 0 && !q[0].Any {
+					// an envelope exclusion (del(.kind)) misread as the
+					// same exclusion on every item
+					out = append(out, q)
+				}
 				continue
 			}
 			q = q[1:]
