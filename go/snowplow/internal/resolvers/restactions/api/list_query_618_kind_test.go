@@ -51,6 +51,23 @@ func TestIssue618_Kind_InformerParityWithRealApiserver(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// #634: the namespace names are fixed (the query table below names
+			// them), so a previous -count iteration's — or a crashed earlier
+			// run's — namespace may still be terminating. Creating objects in it
+			// is then forbidden. Wait for it to be gone before re-creating it,
+			// and on cleanup wait for our own delete to finish, so the next
+			// iteration starts from no namespace at all.
+			for _, ns := range nss {
+				q618WaitNamespaceGone(ctx, t, cs, ns, false)
+			}
+			t.Cleanup(func() {
+				for _, ns := range nss {
+					_ = cs.CoreV1().Namespaces().Delete(context.Background(), ns, metav1.DeleteOptions{})
+				}
+				for _, ns := range nss {
+					q618WaitNamespaceGone(context.Background(), t, cs, ns, true)
+				}
+			})
 			for _, ns := range nss {
 				_, err := cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{})
 				if err != nil && !apierrors.IsAlreadyExists(err) {
@@ -68,11 +85,6 @@ func TestIssue618_Kind_InformerParityWithRealApiserver(t *testing.T) {
 					}
 				}
 			}
-			t.Cleanup(func() {
-				for _, ns := range nss {
-					_ = cs.CoreV1().Namespaces().Delete(context.Background(), ns, metav1.DeleteOptions{})
-				}
-			})
 
 			t.Setenv("CACHE_ENABLED", "true")
 			t.Setenv("RESOLVED_CACHE_ENABLED", "true")
@@ -193,6 +205,34 @@ func TestIssue618_Kind_InformerParityWithRealApiserver(t *testing.T) {
 		}).Feature()
 
 	testenv.Test(t, f)
+}
+
+// q618WaitNamespaceGone blocks until namespace ns does not exist (#634).
+// With mustBeGone=false (setup), a namespace that exists and is NOT being
+// deleted is left alone and the call returns at once (setup reuses it, as
+// before); only a terminating one is waited out. With mustBeGone=true
+// (cleanup, after our Delete), any remaining namespace is waited out. A namespace that outlives the deadline fails
+// the test: proceeding would reproduce the "being terminated" flake with a
+// less obvious message.
+func q618WaitNamespaceGone(ctx context.Context, t *testing.T, cs kubernetes.Interface, ns string, mustBeGone bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		got, err := cs.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("get namespace %s: %v", ns, err)
+		}
+		if !mustBeGone && got.DeletionTimestamp == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("namespace %s still present (phase=%s) after 2m; the next iteration would hit 'being terminated'", ns, got.Status.Phase)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // q618KindNames returns "<ns>/<name>" for items in the test namespaces.
