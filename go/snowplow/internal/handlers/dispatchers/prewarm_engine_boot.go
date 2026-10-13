@@ -721,6 +721,15 @@ func seedScopeYielding(ctx context.Context,
 	// log-only — the seed is background, an abort is never fatal.
 	start := time.Now()
 	targetsProcessed := 0
+	// #643 PR-A — the engine's per-pass accounting (nil outside the engine; the
+	// methods are nil-safe). passBudgetMS is the scope deadline's distance at
+	// seed start, 0 when the ctx carries none.
+	passStats := prewarmPassStatsFromContext(ctx)
+	passKind, _ := cache.PrewarmScopeFromContext(ctx)
+	var passBudgetMS int64
+	if dl, ok := ctx.Deadline(); ok {
+		passBudgetMS = time.Until(dl).Milliseconds()
+	}
 	emitSeedAbort := func(phase string, cause error) {
 		log.Warn("prewarm.seed.abort",
 			slog.String("subsystem", "cache"),
@@ -728,6 +737,12 @@ func seedScopeYielding(ctx context.Context,
 			slog.Any("cause", cause),
 			slog.Int("targets_processed", targetsProcessed),
 			slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+			// #643 PR-A — the pass's plan and progress on the shipped (Warn) line;
+			// before this they were Info-only and invisible in otel_logs.
+			slog.String("kind", passKind),
+			slog.Int64("planned", passStats.planned.Load()),
+			slog.Int64("done", passStats.done.Load()),
+			slog.Int64("budget_ms", passBudgetMS),
 			slog.String("effect", "seed cut off by ctx cancel/deadline (boot budget / pipCohortTimeout / "+
 				"shutdown); background best-effort — remaining targets fall back to per-user resolve at /call time"),
 		)
@@ -1185,6 +1200,7 @@ func seedScopeYielding(ctx context.Context,
 			classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
 		}
 		targetsProcessed++
+		passStats.unitDone() // #643 PR-A — resolved or skipped, the unit is done
 		cohortAttempted++
 		return false
 	}
@@ -1212,6 +1228,7 @@ func seedScopeYielding(ctx context.Context,
 			classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c), err)
 		}
 		targetsProcessed++
+		passStats.unitDone() // #643 PR-A — resolved or skipped, the unit is done
 		cohortAttempted++
 		return false
 	}
@@ -1296,6 +1313,65 @@ func seedScopeYielding(ctx context.Context,
 		}
 	}
 
+	// #643 PR-A — declare the pass's unit plan BEFORE the first unit runs: the
+	// base units this mode's loops will attempt plus every learned unit the
+	// wrapper emitted (trimmed to the admitted classes once the learned bound
+	// decides, below). Observation only — nothing reads it to decide.
+	learnedUnitsTotal := 0
+	for _, n := range lp.wUnits {
+		learnedUnitsTotal += n
+	}
+	for _, n := range lp.rUnits {
+		learnedUnitsTotal += n
+	}
+	if mode == seedModeKeepwarm {
+		capable := make(map[string]struct{}, len(ranked))
+		for ri := range ranked {
+			if ranked[ri].widgetMax == 0 {
+				break // the keepwarm sweep's own loop bound (below)
+			}
+			capable[ranked[ri].key] = struct{}{}
+		}
+		kwPlanned := 0
+		for _, ws := range widgetSeeds {
+			for _, c := range ws.targets {
+				if _, ok := capable[identityKey(c)]; ok {
+					kwPlanned++
+				}
+			}
+		}
+		for _, rs := range restactionSeeds {
+			for _, c := range rs.targets {
+				if _, ok := capable[identityKey(c)]; ok {
+					kwPlanned++
+				}
+			}
+		}
+		passStats.addPlanned(kwPlanned + learnedUnitsTotal)
+	} else {
+		passStats.addPlanned(baseWidgetUnits + baseRAUnits + learnedUnitsTotal)
+	}
+	// trimLearnedPlan removes from the plan the learned units the capacity bound
+	// did not admit. widgetKeys / raKeys are the classes whose widget / RA units
+	// this pass will seed.
+	trimLearnedPlan := func(widgetKeys, raKeys map[string]struct{}) {
+		admitted := 0
+		for k := range widgetKeys {
+			admitted += lp.wUnits[k]
+		}
+		for k := range raKeys {
+			admitted += lp.rUnits[k]
+		}
+		passStats.addPlanned(admitted - learnedUnitsTotal)
+	}
+	keySet := func(keys []string) map[string]struct{} {
+		m := make(map[string]struct{}, len(keys))
+		for _, k := range keys {
+			m[k] = struct{}{}
+		}
+		return m
+	}
+
 	if mode == seedModeKeepwarm {
 		// ── keepwarm: UNCHANGED rank-major loop (arch ruling B). ──
 		// The keepwarm sweep set is the WIDGET-CAPABLE PREFIX of `ranked` (every
@@ -1364,6 +1440,8 @@ func seedScopeYielding(ctx context.Context,
 		// widgets then its RESTActions (a capacity cut always leaves whole classes).
 		kwDecision := lp.decide(baseWidgetUnits, baseRAUnits, 0, false)
 		noteLearnedPhase("keepwarm", kwDecision.order)
+		kwKeys := keySet(kwDecision.order)
+		trimLearnedPlan(kwKeys, kwKeys)
 		for _, k := range kwDecision.order {
 			if seedLearnedWidgetsFor(k) || seedLearnedRAsFor(k) {
 				return ctx.Err()
@@ -1559,6 +1637,11 @@ func seedScopeYielding(ctx context.Context,
 	// snowplow_learned_classes_nav_only.
 	raDecision := lp.decide(baseWidgetUnits, baseRAUnits, 0, false)
 	noteLearnedPhase("ra", raDecision.order)
+	learnedWidgetKeys := keySet(raDecision.order)
+	for k := range seededPre {
+		learnedWidgetKeys[k] = struct{}{}
+	}
+	trimLearnedPlan(learnedWidgetKeys, keySet(raDecision.order))
 	for _, k := range raDecision.order {
 		if _, done := seededPre[k]; done {
 			continue

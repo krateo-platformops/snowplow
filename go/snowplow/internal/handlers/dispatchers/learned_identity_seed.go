@@ -184,11 +184,15 @@ func measuredSeedUnit(ctx context.Context, isWidget bool, do func(context.Contex
 	start := seedClock()
 	err := do(context.WithValue(ctx, seedUnitMarkerKey{}, m))
 	if m.Load() {
+		d := seedClock().Sub(start)
 		if isWidget {
-			widgetUnitCost.add(seedClock().Sub(start))
+			widgetUnitCost.add(d)
 		} else {
-			raUnitCost.add(seedClock().Sub(start))
+			raUnitCost.add(d)
 		}
+		// #643 PR-A — the same measurement, per pass, so t_unit can be read per
+		// scope kind (the process-wide means above mix every kind).
+		prewarmPassStatsFromContext(ctx).addResolved(isWidget, d)
 	}
 	return err
 }

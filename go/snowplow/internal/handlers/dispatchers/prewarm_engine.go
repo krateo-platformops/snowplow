@@ -693,7 +693,13 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// test seam over prewarmScopeTimeout (same pattern as seedCohortFn) so
 	// the straddle falsifier can shrink the budget without a live cluster;
 	// production ALWAYS uses prewarmScopeTimeout (8m, unchanged).
-	scopeCtx, scopeCancel := context.WithTimeout(ctx, prewarmScopeTimeoutFn(s))
+	budget := prewarmScopeTimeoutFn(s)
+	scopeCtx, scopeCancel := context.WithTimeout(ctx, budget)
+	// #643 PR-A — per-pass unit accounting, installed for EVERY scope kind. The
+	// seed / reseed loops write planned+done into it; it is read below, after
+	// the handler returns, to publish the pass detectors. Observation only.
+	passStats := &prewarmPassStats{}
+	scopeCtx = withPrewarmPassStats(scopeCtx, passStats)
 	// #105 — the boot-convergence state handle (nil off the boot path), captured
 	// here so the err==nil teardown branch can read reEnqueuedLastPass and clear
 	// only on a GENUINE completion (see below).
@@ -729,15 +735,45 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 		// reset it to 0 so a genuine topology change re-walks. Boot scope ONLY.
 		scopeCtx = cache.WithBootResumeAttempt(scopeCtx, e.queue.NumRequeues(s))
 	}
+	passStart := time.Now()
 	err := e.scopeHandler(scopeCtx, s)
 	scopeCancel()
+	passElapsed := time.Since(passStart)
 	e.processedTotal.Add(1)
+	// #643 PR-A — publish the pass detectors (pass_total{kind,outcome} + the
+	// last-pass planned/done/budget/elapsed gauges). The outcome is computed once
+	// here and reused by the log lines below so the counter and the log agree.
+	outcome := recordPrewarmPass(string(s.kind), err, passStats, budget, passElapsed)
+	passAttrs := []any{
+		slog.String("kind", string(s.kind)),
+		slog.String("outcome", outcome),
+		slog.Int64("planned", passStats.planned.Load()),
+		slog.Int64("done", passStats.done.Load()),
+		slog.Int64("budget_ms", budget.Milliseconds()),
+		slog.Int64("elapsed_ms", passElapsed.Milliseconds()),
+	}
+
+	switch {
+	case err == nil && outcome == prewarmPassOutcomeComplete:
+		// Info, not Warn: a completion is work, not a failure. The shipped signal
+		// is snowplow_prewarm_pass_total{outcome=complete}.
+		slog.Info("prewarm.pass.complete",
+			append([]any{slog.String("subsystem", "cache"), slog.String("scope", s.key())}, passAttrs...)...)
+	case err == nil:
+		// A handler that re-enqueues itself on a cut (rbac-shift, learned-class)
+		// returns nil, so scope_incomplete below never fires for it. Without this
+		// line its cut passes would be invisible in the shipped logs.
+		slog.Warn("prewarm.pass.cut",
+			append([]any{slog.String("subsystem", "cache"), slog.String("scope", s.key())}, passAttrs...)...)
+	}
 
 	if err != nil {
 		slog.Warn("prewarm.engine.scope_incomplete",
-			slog.String("subsystem", "cache"),
-			slog.String("scope", s.key()),
-			slog.Any("err", err),
+			append([]any{
+				slog.String("subsystem", "cache"),
+				slog.String("scope", s.key()),
+				slog.Any("err", err),
+			}, passAttrs...)...,
 		)
 		// F.4 engine-owned failure-requeue. Only while the process ctx is
 		// alive — on shutdown the scope error is the ctx cancel itself and a

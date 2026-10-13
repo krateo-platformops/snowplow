@@ -88,6 +88,11 @@ func reseedWithRefusalPolicy(ctx context.Context, deps rePrewarmDeps, req reseed
 // refused terminal Put is handled inline by reseedWithRefusalPolicy (one-shot
 // re-seed) and is never part of the returned set.
 func reseedTargets(ctx context.Context, deps rePrewarmDeps, reqs []reseedRequest) (reEnqueue []reseedRequest) {
+	// #643 PR-A — the pass's unit plan and progress (nil-safe outside the
+	// engine). A target counts as done once it is attempted and not handed back
+	// for re-enqueue, whether it seeded or failed operationally.
+	passStats := prewarmPassStatsFromContext(ctx)
+	passStats.addPlanned(len(reqs))
 	for i := range reqs {
 		if ctx.Err() != nil {
 			return append(reEnqueue, reqs[i:]...)
@@ -96,9 +101,11 @@ func reseedTargets(ctx context.Context, deps rePrewarmDeps, reqs []reseedRequest
 		err := reseedWithRefusalPolicy(ctx, deps, reqs[i], seedModeRBACShift)
 		switch {
 		case err == nil:
+			passStats.unitDone()
 		case ctx.Err() != nil:
 			return append(reEnqueue, reqs[i:]...)
 		default:
+			passStats.unitDone()
 			slog.Warn("prewarm.engine.reseed.target_error",
 				slog.String("subsystem", "cache"),
 				slog.String("mode", seedModeRBACShift.String()),

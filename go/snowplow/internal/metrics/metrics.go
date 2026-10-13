@@ -1151,7 +1151,123 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerListQueryInstrument(m); err != nil {
 		return err
 	}
+	if err := registerPrewarmPassInstruments(m); err != nil {
+		return err
+	}
 	return registerSecurityInstruments(m)
+}
+
+// registerPrewarmPassInstruments hand-wires #643's background-pass detectors
+// onto OTLP (no expvar->OTLP bridge). Each instrument reads the typed accessor
+// its expvar closure reads, so the two surfaces cannot diverge. Attributes are
+// closed, code-defined enums only: kind (the prewarm scope kinds), outcome
+// {complete, cut} and origin {background, request} — never a GVR, an object
+// name or a key. Registered only when the cache is on (CFG-1: the expvar keys
+// are published from Disabled()-gated inits).
+func registerPrewarmPassInstruments(m metric.Meter) error {
+	passTotal, err := m.Int64ObservableCounter("snowplow_prewarm_pass_total",
+		metric.WithDescription("Prewarm-engine passes processed, by kind {boot, gvr-discovered, keepwarm, rbac-shift, learned-class} and outcome {complete, cut}. cut = the handler returned an error (the engine requeues it) or the pass declared a unit plan and did not get through it. A gvr-discovered cut rate that never falls is the #643 loop."))
+	if err != nil {
+		return err
+	}
+	gauge := func(name, desc string) (metric.Int64ObservableGauge, error) {
+		return m.Int64ObservableGauge(name, metric.WithDescription(desc))
+	}
+	planned, err := gauge("snowplow_prewarm_pass_units_planned",
+		"Units the LAST pass of this kind planned to seed (base units its loops attempt + the admitted learned units), by kind. #643.")
+	if err != nil {
+		return err
+	}
+	done, err := gauge("snowplow_prewarm_pass_units_done",
+		"Units the LAST pass of this kind got through (resolved + every skip), by kind. planned - done > 0 is the work the pass's budget did not cover. #643.")
+	if err != nil {
+		return err
+	}
+	budget, err := gauge("snowplow_prewarm_pass_budget_ms",
+		"Wall-clock budget of the LAST pass of this kind (the per-scope timeout), by kind. #643.")
+	if err != nil {
+		return err
+	}
+	elapsed, err := gauge("snowplow_prewarm_pass_elapsed_ms",
+		"Wall-clock time of the LAST pass of this kind, by kind. #643.")
+	if err != nil {
+		return err
+	}
+	rWidgetUnits, err := gauge("snowplow_prewarm_pass_resolved_widget_units",
+		"Widget units the LAST pass of this kind really resolved (skips excluded), by kind. Per-unit widget cost = resolved_widget_us / resolved_widget_units. #643.")
+	if err != nil {
+		return err
+	}
+	rWidgetUS, err := gauge("snowplow_prewarm_pass_resolved_widget_us",
+		"Summed wall cost in microseconds of the widget units the LAST pass of this kind resolved, by kind. #643.")
+	if err != nil {
+		return err
+	}
+	rRAUnits, err := gauge("snowplow_prewarm_pass_resolved_ra_units",
+		"RESTAction units the LAST pass of this kind really resolved (skips excluded), by kind. Per-unit RA cost = resolved_ra_us / resolved_ra_units. #643.")
+	if err != nil {
+		return err
+	}
+	rRAUS, err := gauge("snowplow_prewarm_pass_resolved_ra_us",
+		"Summed wall cost in microseconds of the RESTAction units the LAST pass of this kind resolved, by kind. #643.")
+	if err != nil {
+		return err
+	}
+	skipDeclined, err := m.Int64ObservableCounter("snowplow_prewarm_skip_declined_external_total",
+		metric.WithDescription("Seed units skipped because the same key was already resolved and declined for an external touch, by kind. POSITIVE CONTROL for the #643 declined-external skip: must read > 0 for every kind the skip covers, or the skip never fired."))
+	if err != nil {
+		return err
+	}
+	skipResume, err := m.Int64ObservableCounter("snowplow_prewarm_skip_resume_done_total",
+		metric.WithDescription("Seed units skipped on a resumed pass because an earlier attempt of the same scope already re-resolved them at the current discovery epoch, by kind. POSITIVE CONTROL for the #643 resume skip."))
+	if err != nil {
+		return err
+	}
+	extFetch, err := m.Int64ObservableCounter("snowplow_external_fetch_total",
+		metric.WithDescription("External (non-apiserver) fetches issued by the RESTAction resolver, by origin {background, request}. background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
+	if err != nil {
+		return err
+	}
+	extAbandoned, err := m.Int64ObservableCounter("snowplow_external_fetch_abandoned_total",
+		metric.WithDescription("External fetches whose caller's ctx was done before the response was read (the boot-readiness bound, a cut scope, a client that left), by origin. The server may still be executing each one. #643."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		kindAttr := func(kind string) metric.ObserveOption {
+			return metric.WithAttributes(attribute.String("kind", kind))
+		}
+		for _, c := range dispatchers.PrewarmPassTotalSnapshot() {
+			o.ObserveInt64(passTotal, int64(c.Count), metric.WithAttributes(
+				attribute.String("kind", c.Kind), attribute.String("outcome", c.Outcome)))
+		}
+		for _, l := range dispatchers.PrewarmPassLastSnapshot() {
+			a := kindAttr(l.Kind)
+			o.ObserveInt64(planned, l.Planned, a)
+			o.ObserveInt64(done, l.Done, a)
+			o.ObserveInt64(budget, l.BudgetMS, a)
+			o.ObserveInt64(elapsed, l.ElapsedMS, a)
+			o.ObserveInt64(rWidgetUnits, l.ResolvedWidgetUnits, a)
+			o.ObserveInt64(rWidgetUS, l.ResolvedWidgetUS, a)
+			o.ObserveInt64(rRAUnits, l.ResolvedRAUnits, a)
+			o.ObserveInt64(rRAUS, l.ResolvedRAUS, a)
+		}
+		for _, c := range dispatchers.PrewarmSkipDeclinedExternalSnapshot() {
+			o.ObserveInt64(skipDeclined, int64(c.Count), kindAttr(c.Kind))
+		}
+		for _, c := range dispatchers.PrewarmSkipResumeDoneSnapshot() {
+			o.ObserveInt64(skipResume, int64(c.Count), kindAttr(c.Kind))
+		}
+		for _, c := range restactionsapi.ExternalFetchSnapshot() {
+			o.ObserveInt64(extFetch, int64(c.Count), metric.WithAttributes(attribute.String("origin", c.Origin)))
+		}
+		for _, c := range restactionsapi.ExternalFetchAbandonedSnapshot() {
+			o.ObserveInt64(extAbandoned, int64(c.Count), metric.WithAttributes(attribute.String("origin", c.Origin)))
+		}
+		return nil
+	}, passTotal, planned, done, budget, elapsed, rWidgetUnits, rWidgetUS, rRAUnits, rRAUS,
+		skipDeclined, skipResume, extFetch, extAbandoned)
+	return err
 }
 
 // registerListQueryInstrument hand-wires #618's list-query outcome counter onto

@@ -801,6 +801,8 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 		// false). C-F4B-1/-2/-3.
 		if cache.SeedDeclinedExternalSetFromContext(ctx).Marked(key) {
 			pipSeedFreshSkipTotal.Add(1)
+			// #643 PR-A — the positive control, counted per scope kind (boot here).
+			bumpPrewarmSkipDeclinedExternal(ctx)
 			// #105 seeded-set: a declined-external key is intentionally cold (no Put)
 			// but was RESOLVED-and-reached this boot — for the boot-convergence signal
 			// it is NOT re-attemptable progress, and it is NOT a failing target either.
