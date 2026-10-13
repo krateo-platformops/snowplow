@@ -9,8 +9,8 @@ package dispatchers
 //
 // The cell is aged past the store's max entry age through SetBornAtForTest (the
 // same lazy bound getCore applies), with no read in between. The liveness
-// predicate is one helper shared by getCore and PutSeqOf (itemExpiredLocked);
-// the mutation run that made PutSeqOf ignore it is recorded in the PR.
+// predicate is one helper shared by getCore and CellPutSeq (itemExpiredLocked);
+// the mutation run that made CellPutSeq ignore it is recorded in the PR.
 //
 // Not t.Parallel(): reassigns package vars.
 
@@ -59,8 +59,8 @@ func TestIssue643_F3e_ExpiredServedCell_RetiresTheMark(t *testing.T) {
 	if !cache.ResolvedCache().SetBornAtForTest(cellKey, time.Now().Add(-48*time.Hour)) {
 		t.Fatal("precondition: could not age the list cell")
 	}
-	if _, live := cache.ResolvedCache().PutSeqOf(cellKey); live {
-		t.Error("PutSeqOf reports an expired cell as live — the mark would outlive its input")
+	if _, live := cache.ResolvedCache().CellPutSeq(cellKey); live {
+		t.Error("CellPutSeq reports an expired cell as live — the mark would outlive its input")
 	}
 
 	r0 := h643RetiredCount(cache.DeclinedExternalRetiredServedCellChanged)

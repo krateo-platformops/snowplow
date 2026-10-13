@@ -49,13 +49,13 @@ type ServedCell struct {
 	Covers []DepKey
 }
 
-// PutSeqOf returns key's current Put identity, or ok=false when the key holds
+// CellPutSeq returns key's current Put identity, or ok=false when the key holds
 // no LIVE entry — absent, or past its effective TTL or max entry age by the
 // SAME predicate the read path applies (itemExpiredLocked). Expiry is lazy, so
 // an expired cell nobody read is still indexed: it must read as gone here or a
 // mark served from it would outlive it. A pure read: no eviction, no recency,
 // no hit accounting.
-func (c *ResolvedCacheStore) PutSeqOf(key string) (uint64, bool) {
+func (c *ResolvedCacheStore) CellPutSeq(key string) (uint64, bool) {
 	if c == nil || key == "" {
 		return 0, false
 	}
@@ -75,7 +75,7 @@ func (c *ResolvedCacheStore) PutSeqOf(key string) (uint64, bool) {
 // itemExpiredLocked is THE liveness predicate for an indexed cell: past its
 // effective TTL (per-entry TTLOverride, else the store TTL) measured from
 // CreatedAt, or past the max entry age measured from BornAt. Used by getCore
-// (which then evicts) and PutSeqOf (which only reports). Caller holds c.mu.
+// (which then evicts) and CellPutSeq (which only reports). Caller holds c.mu.
 func (c *ResolvedCacheStore) itemExpiredLocked(item *lruItem, now time.Time) (pastTTL, pastMaxAge bool) {
 	if eff := c.effectiveTTLLocked(item.entry); eff > 0 && now.Sub(item.entry.CreatedAt) > eff {
 		pastTTL = true
@@ -98,7 +98,7 @@ func ServeCell(ctx context.Context, c *ResolvedCacheStore, key string, touch boo
 	if c == nil {
 		return nil, false
 	}
-	seq, live := c.PutSeqOf(key)
+	seq, live := c.CellPutSeq(key)
 	var entry *ResolvedEntry
 	var hit bool
 	if touch {
@@ -145,7 +145,7 @@ func ServedCellsChanged(served []ServedCell) bool {
 	}
 	c := ResolvedCache()
 	for _, sc := range served {
-		seq, ok := c.PutSeqOf(sc.Key)
+		seq, ok := c.CellPutSeq(sc.Key)
 		if !ok || seq != sc.PutSeq {
 			return true
 		}

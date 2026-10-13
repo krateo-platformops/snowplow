@@ -244,11 +244,11 @@ func h643F3d(t *testing.T, how h643F3dHow, mutate func()) (dialsB, dialsC, putC 
 		if fn == nil {
 			t.Fatal("no apistage RefreshFunc registered")
 		}
-		seq0, _ := cache.ResolvedCache().PutSeqOf(cellKey)
+		seq0, _ := cache.ResolvedCache().CellPutSeq(cellKey)
 		if err := fn(context.Background(), cellKey, cellInputs); err != nil {
 			t.Fatalf("the real apistage refresh of the list cell failed: %v", err)
 		}
-		if seq1, ok := cache.ResolvedCache().PutSeqOf(cellKey); !ok || seq1 == seq0 {
+		if seq1, ok := cache.ResolvedCache().CellPutSeq(cellKey); !ok || seq1 == seq0 {
 			t.Fatalf("precondition: the refresh did not re-Put the list cell (putSeq %d → %d, live=%v)", seq0, seq1, ok)
 		}
 	case h643F3dEvict:

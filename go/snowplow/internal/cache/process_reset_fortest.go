@@ -111,6 +111,12 @@ func ResetCacheProcessStateForTest() error {
 	// rather than exempted — #471.
 	ResetRefreshFailedByClassForTest()
 
+	// 5d′ — #643 the engine-wide declined-external set (marks keyed by L1 keys)
+	// and its retire-reason breakdown. Process-global, so a test's marks would
+	// otherwise skip a sibling test's units. Composed rather than exempted — #471.
+	ResetEngineDeclinedExternalSetForTest()
+	ResetDeclinedExternalRetiredForTest()
+
 	// 5e — #608 impersonation capability: the per-principal verdict memo, the
 	// installed reviewer and the counters/probe answers. Process-global, so a
 	// test asserting on the counters or relying on a fresh memo would otherwise

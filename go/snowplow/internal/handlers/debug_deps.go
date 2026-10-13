@@ -164,7 +164,7 @@ func depsKeyViewFor(keyHash string) depsKeyView {
 	view.ExternalTTL = entry.ExternalTTL
 	// #643 — the cell's Put identity (metadata only): a declined-external mark
 	// that served this cell retires when it moves.
-	if seq, ok := cache.ResolvedCache().PutSeqOf(keyHash); ok {
+	if seq, ok := cache.ResolvedCache().CellPutSeq(keyHash); ok {
 		view.PutSeq = seq
 	}
 	// #643 — whether this key is held in the engine-wide declined-external set

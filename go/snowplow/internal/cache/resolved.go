@@ -1468,7 +1468,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 	// degraded catalog entry self-evicts within the bound. Zero override =
 	// the standard ttl (every healthy entry).
 	// #643 — both lazy bounds are ONE predicate (itemExpiredLocked), shared
-	// with PutSeqOf, so "is this cell live" cannot drift between the read
+	// with CellPutSeq, so "is this cell live" cannot drift between the read
 	// path and the served-cell identity check.
 	pastTTL, pastMaxAge := c.itemExpiredLocked(item, now)
 	if pastTTL {
