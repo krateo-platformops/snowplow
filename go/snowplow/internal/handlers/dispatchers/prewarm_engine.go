@@ -288,14 +288,12 @@ type prewarmScope struct {
 //
 // KEY DERIVATION (RC-2 PM gate):
 //   - scopeKindBoot: "boot" — single key, all boot enqueues coalesce.
-//   - scopeKindGVRDiscovered: "gvr-discovered|<group>/<version>/<resource>"
-//     — two enqueues for the same GVR coalesce; two enqueues for
-//     different GVRs are DISTINCT and both run. Uses schema.GVR.String()
-//     for stable formatting ("<group>/<version>/<resource>").
+//   - scopeKindGVRDiscovered: "gvr-discovered" — #643 PR-C: ONE key. The pass
+//     ignores its GVR (it re-runs the whole seed), so N discovered GVRs fold
+//     into one pending pass; the discovery epoch, not the item, records that
+//     new edges are needed. The hook enqueues a payload-free item (the queue
+//     dedups on the item itself), so this key and the item agree.
 func (s prewarmScope) key() string {
-	if s.kind == scopeKindGVRDiscovered {
-		return string(s.kind) + "|" + s.gvr.String()
-	}
 	return string(s.kind)
 }
 
@@ -359,6 +357,15 @@ type prewarmEngine struct {
 	processedTotal atomic.Uint64
 	yieldTotal     atomic.Uint64 // engine yields to a customer call
 	requeuedTotal  atomic.Uint64 // F.4 — scopes engine-requeued after an error (AddRateLimited)
+
+	// #643 PR-C — the gvr-discovered discovery epoch (bumped by the hook before
+	// it enqueues), the GVRs discovered since the last pass (log only), and the
+	// engine-lived resume sets per scope key (prewarm_pass_resume.go).
+	gvrEpoch     atomic.Uint64
+	gvrPendingMu sync.Mutex
+	gvrPending   map[string]struct{}
+	passDoneMu   sync.Mutex
+	passDone     map[string]*passDoneSet
 }
 
 var (
@@ -684,6 +691,27 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// declined instead of re-dialling it for every cohort. A /call and the
 	// refresher never carry it (I-6).
 	scopeCtx = cache.WithSeedDeclinedExternalSet(scopeCtx, e.declinedExternalSetFor(s.key()))
+	// #643 PR-C — the gvr-discovered resume set (engine-lived per scope key,
+	// reused across requeues), and the epoch the pass began under: a clean pass
+	// clears the set only if no GVR was discovered while it ran.
+	var passEpochAtStart uint64
+	var passDone *passDoneSet
+	var passDoneBefore uint64
+	if s.kind == scopeKindGVRDiscovered {
+		passEpochAtStart = e.gvrEpoch.Load()
+		passDone = e.passDoneSetFor(s.key())
+		passDoneBefore = passDone.marksTotal()
+		scopeCtx = withPassDoneSet(scopeCtx, passDone)
+		// The GVRs this coalesced pass answers — log only (on no key/label).
+		n, gvrs := e.drainDiscoveredGVRs()
+		slog.Info("prewarm.engine.gvr_discovered.pass",
+			slog.String("subsystem", "cache"),
+			slog.Uint64("epoch", passEpochAtStart),
+			slog.Int("gvrs_since_last_pass", n),
+			slog.Any("gvrs", gvrs),
+			slog.Int("resume_records", e.passDoneSetFor(s.key()).len()),
+		)
+	}
 	if s.kind == scopeKindBoot {
 		// #105 — install the ENGINE-LIVED boot-convergence state for the boot scope
 		// onto scopeCtx. Its BootSeededSet is reachable at the two seed success
@@ -745,12 +773,30 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 		// after ShutDown anyway, but skipping keeps the counter honest and
 		// avoids a spurious scope_requeued line at teardown).
 		if ctx.Err() == nil {
+			// #643 PR-C (C4) — the coalesced gvr-discovered item's backoff resets
+			// on PROGRESS: an attempt that made ≥1 accepted resume mark (an
+			// accepted Put of a fresh resolve — a new unit OR a redo of a record
+			// that went stale, e.g. after a mid-pass GVR discovery; resume SKIPS
+			// make no mark) retries at the limiter's base delay. Only an attempt
+			// with zero marks lets NumRequeues — the exponential backoff — grow
+			// (genuine overload). The boot-only attempt counter (#135 Lever B) is
+			// not affected: it is installed for boot scopes only.
+			progress, newDone := false, uint64(0)
+			if passDone != nil {
+				newDone = passDone.marksTotal() - passDoneBefore
+				if newDone > 0 {
+					progress = true
+					e.queue.Forget(s)
+				}
+			}
 			e.queue.AddRateLimited(s)
 			e.requeuedTotal.Add(1)
 			slog.Info("prewarm.engine.scope_requeued",
 				slog.String("subsystem", "cache"),
 				slog.String("scope", s.key()),
 				slog.Int("attempt", e.queue.NumRequeues(s)),
+				slog.Bool("progress", progress),
+				slog.Uint64("new_done", newDone),
 				slog.Any("err", err),
 				slog.String("effect", "engine-owned resume: cut/failed scope re-enqueued with "+
 					"rate-limited backoff (F.4); a boot deadline-cut resumes as a continuation chunk, "+
@@ -762,6 +808,13 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 		// so a later transient failure starts from zero backoff, not the tail
 		// of an old streak).
 		e.queue.Forget(s)
+		// #643 PR-C — a gvr-discovered pass that completed with the epoch
+		// unchanged covered every GVR up to now: drop its resume set. If a GVR
+		// arrived meanwhile, keep it (its records are stale against the new
+		// epoch, and the coalesced re-run redoes every unit anyway).
+		if s.kind == scopeKindGVRDiscovered && e.gvrEpoch.Load() == passEpochAtStart {
+			e.clearPassDoneSet(s.key())
+		}
 		// #643 PR-B — boot completion no longer tears the declined-external set
 		// down: keepwarm / gvr-discovered / rbac-shift passes need boot's marks.
 		// Summarise it (boot scope only, once per completion).

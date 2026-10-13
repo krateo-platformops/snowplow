@@ -132,6 +132,7 @@ var storeRegistry = map[string]string{
 	"cache.raLayerIndex.byWidget":                     "no-content (content versions)",
 	"cache.BootSeededSet.m":                           "no-content",
 	"cache.SeedDeclinedExternalSet.m":                 "no-content",
+	"dispatchers.passDoneSet.m":                       "class-keyed (#643 PR-C resume record per full dispatchCacheLookupKey; the value holds the pointer of the entry this pass Put under that SAME key, compared by identity only and never served)",
 	"cache.bindingsByGVRIndex.byGVR":                  "no-content (identity-free binding index)",
 	"cache.bindingsByGVRIndex.wildcard":               "no-content (identity-free binding index)",
 	"cache.bindingsByGVRIndex.byRole":                 "no-content (identity-free binding index)",

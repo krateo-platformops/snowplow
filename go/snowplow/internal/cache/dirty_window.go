@@ -322,6 +322,26 @@ func dirtyStampFor(key string) (*dirtyStamp, bool) {
 	return v.(*dirtyStamp), true
 }
 
+// InputsMovedSincePut is THE single predicate for "an input of this cell moved
+// and no accepted re-Put has carried it in yet" (#643 PR-C: a resumed
+// gvr-discovered pass never skips such a cell). It is true in BOTH states that
+// mean it:
+//   - an OPEN invalidation→fresh window (a dep event dirty-marked the cell and
+//     its refresh has not ended), and
+//   - KNOWN-STALE (#547): the refresh ended WITHOUT a Put — declined (a stage
+//     error, "declining to overwrite good entry") or dropped — so the stored
+//     pointer is unchanged while its inputs moved.
+//
+// Both live on the same stamp, which only an accepted re-Put (or the cell's
+// removal) clears. Read-only.
+func InputsMovedSincePut(key string) bool {
+	// The stamp exists exactly while a window is open (stale == none) OR the
+	// cell is known-stale (stale == a reason); only an accepted re-Put or the
+	// cell's removal clears it. So "a stamp exists" is the whole predicate.
+	s, ok := dirtyStampFor(key)
+	return ok && s != nil
+}
+
 // DirtyWindowsOpenForTest counts the open windows (F6d). TEST-ONLY.
 func DirtyWindowsOpenForTest() int {
 	r := refresherPeek()

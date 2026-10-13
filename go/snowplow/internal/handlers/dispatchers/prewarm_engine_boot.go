@@ -86,7 +86,7 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 			// chunk's continuation skips already-live cells (all ranks).
 			return rePrewarmBoot(ctx, deps, seedModeBoot)
 		case scopeKindGVRDiscovered:
-			return rePrewarmGVRDiscovered(ctx, deps, s.gvr)
+			return rePrewarmGVRDiscovered(ctx, deps)
 		case scopeKindKeepwarm:
 			// keepwarm c2 — the TTL-cadenced widget-capable-cohort keep-warm sweep.
 			return rePrewarmKeepwarm(ctx, deps)
@@ -130,12 +130,7 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 // Per task-194-ship-2-stage-2-empirical-trace-2026-06-04.md §5.2
 // commit-4.
 func registerEngineGVRDiscoveredHook(e *prewarmEngine) {
-	cache.RegisterGVRDiscoveredHook(func(gvr schema.GroupVersionResource) {
-		e.enqueueScope(prewarmScope{
-			kind: scopeKindGVRDiscovered,
-			gvr:  gvr,
-		})
-	})
+	cache.RegisterGVRDiscoveredHook(e.onGVRDiscovered)
 }
 
 // registerHarvesterGoneForgetHook subscribes BOTH Phase-1 harvesters to the
@@ -221,27 +216,28 @@ func registerHarvesterGoneForgetHook(deps rePrewarmDeps) {
 // between cohorts via engineYieldCheckpoint). Each rePrewarmBoot is
 // bounded by ctx + the engine-side timeouts; the per-cohort
 // seedCohort timeout (pipCohortTimeout) caps individual stalls.
-func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps, gvr schema.GroupVersionResource) error {
+func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps) error {
+	// #643 PR-C — ONE coalesced pass answers every GVR discovered since the last
+	// one (processScope logs them: prewarm.engine.gvr_discovered.pass). The seed
+	// re-resolves every cacheable cell so the new GVRs' dep edges are recorded
+	// (F4-C3). It skips only (a) declined-external keys (PR-B) and (b) on a
+	// resumed attempt, units an earlier attempt re-Put in THIS discovery epoch
+	// whose cell is still that Put and clean (prewarm_pass_resume.go) — both
+	// leave no cacheable cell without the new edges.
 	slog.Info("prewarm.engine.gvr_discovered.start",
 		slog.String("subsystem", "cache"),
-		slog.String("gvr", gvr.String()),
-		slog.String("note", "Ship 2 Stage 2 — re-walk under cohort identities so iterator-empty short-circuit (resolve.go:377-381) no longer skips dep recording for this GVR"),
+		slog.String("note", "Ship 2 Stage 2 — re-walk under cohort identities so iterator-empty short-circuit (resolve.go:377-381) no longer skips dep recording for the discovered GVRs"),
 	)
-	// seedModeGVRDiscovered: NO skip — gvr-discovered must RE-RESOLVE already-warm
-	// cells so the dep edge against the newly-registered GVR is recorded (the S4
-	// fix); any skip would reintroduce the defect (F4-C3 boundary).
 	err := rePrewarmGVRDiscoveredSeed(ctx, deps)
 	if err != nil {
 		slog.Warn("prewarm.engine.gvr_discovered.incomplete",
 			slog.String("subsystem", "cache"),
-			slog.String("gvr", gvr.String()),
 			slog.Any("err", err),
 		)
 		return err
 	}
 	slog.Info("prewarm.engine.gvr_discovered.complete",
 		slog.String("subsystem", "cache"),
-		slog.String("gvr", gvr.String()),
 	)
 	return nil
 }

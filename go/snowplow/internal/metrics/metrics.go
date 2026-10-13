@@ -1261,7 +1261,13 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	gvrEpoch, err := m.Int64ObservableGauge("snowplow_gvr_discovery_epoch",
+		metric.WithDescription("The prewarm engine's GVR-discovery epoch: bumped once per GVR discovered after boot (#643). Every discovery folds into ONE pending gvr-discovered pass; a resumed attempt of that pass skips only units re-Put in the current epoch, so a rising epoch invalidates every resume record."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		o.ObserveInt64(gvrEpoch, int64(dispatchers.GVRDiscoveryEpoch()))
 		o.ObserveInt64(declinedMarks, cache.EngineDeclinedExternalSet().Len())
 		for _, c := range cache.DeclinedExternalRetiredSnapshot() {
 			o.ObserveInt64(declinedRetired, int64(c.Count), metric.WithAttributes(attribute.String("reason", c.Reason)))
@@ -1298,7 +1304,7 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		}
 		return nil
 	}, passTotal, planned, done, budget, elapsed, rWidgetUnits, rWidgetUS, rRAUnits, rRAUS,
-		skipDeclined, skipResume, extFetch, extAbandoned, declinedMarks, declinedRetired)
+		skipDeclined, skipResume, extFetch, extAbandoned, declinedMarks, declinedRetired, gvrEpoch)
 	return err
 }
 

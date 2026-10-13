@@ -257,14 +257,15 @@ func TestScopeKindGVRDiscovered_KeyDistinctFromBoot(t *testing.T) {
 
 // TestScopeKindGVRDiscovered_KeyFormat pins the key format so callers
 // reading the engine's pending map by key string have a stable
-// contract. Documented in the prewarmScope.key() comment.
+// contract. Documented in the prewarmScope.key() comment. #643 PR-C: ONE key
+// for every discovered GVR (the coalesced pass).
 func TestScopeKindGVRDiscovered_KeyFormat(t *testing.T) {
 	gvr := schema.GroupVersionResource{
 		Group:    "composition.krateo.io",
 		Version:  "v1",
 		Resource: "compositions",
 	}
-	want := "gvr-discovered|composition.krateo.io/v1, Resource=compositions"
+	want := "gvr-discovered"
 	got := prewarmScope{kind: scopeKindGVRDiscovered, gvr: gvr}.key()
 	if got != want {
 		t.Fatalf("key format drift:\n  want: %q\n  got:  %q", want, got)

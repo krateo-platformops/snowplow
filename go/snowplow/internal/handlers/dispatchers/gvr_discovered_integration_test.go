@@ -98,19 +98,23 @@ func TestGVRDiscoveredIntegration_HookFiresEngineEnqueue(t *testing.T) {
 	if s.kind != scopeKindGVRDiscovered {
 		t.Fatalf("expected scopeKindGVRDiscovered, got %q", s.kind)
 	}
-	if s.gvr != gvr {
-		t.Fatalf("scope.gvr mismatch:\n  want: %+v\n  got:  %+v", gvr, s.gvr)
+	// #643 PR-C — the item is PAYLOAD-FREE (one coalesced pass answers every
+	// discovered GVR); the discovery is recorded as an epoch bump instead.
+	if s != (prewarmScope{kind: scopeKindGVRDiscovered}) {
+		t.Fatalf("expected the payload-free coalesced item, got %+v", s)
+	}
+	if got := e.gvrEpoch.Load(); got != 1 {
+		t.Fatalf("expected discovery epoch 1 after one discovery, got %d", got)
 	}
 }
 
-// TestGVRDiscoveredIntegration_DistinctGVRs_AllProcessed asserts that
-// firing the hook for N distinct GVRs results in N separate engine
-// scopes — the per-GVR dedup key correctly distinguishes them.
-//
-// EMPIRICAL PRODUCTION SCENARIO: install-burst of N CompositionDefinitions
-// in a 60s window (§5.3 R2 quantification). Each CRD shipping registers
-// a distinct GVR; the engine MUST process all N re-prewarms (not
-// silently coalesce or drop).
+// TestGVRDiscoveredIntegration_DistinctGVRs_AllProcessed — #643 PR-C FLIP.
+// It used to assert N distinct GVRs → N separate scopes. Every one of those
+// passes ignored its GVR and re-ran the whole seed, so on 057 51 GVRs meant 51
+// identical full passes and a queue that never drained. Now N distinct GVRs
+// fold into ONE pending pass (nothing is dropped: the discovery epoch records
+// all N, and the one pass re-resolves every cacheable cell after all of them
+// are registered — F4 drives it end to end on the real worker).
 func TestGVRDiscoveredIntegration_DistinctGVRs_AllProcessed(t *testing.T) {
 	cache.ResetGVRDiscoveredHooksForTest()
 	defer cache.ResetGVRDiscoveredHooksForTest()
@@ -128,23 +132,15 @@ func TestGVRDiscoveredIntegration_DistinctGVRs_AllProcessed(t *testing.T) {
 		cache.NotifyGVRDiscoveredForReprewarmTest(gvr)
 	}
 
-	if e.pendingLenForTest() != len(gvrs) {
-		t.Fatalf("expected %d pending scopes (one per distinct GVR), got %d", len(gvrs), e.pendingLenForTest())
+	if e.pendingLenForTest() != 1 {
+		t.Fatalf("expected ONE coalesced pending pass for %d distinct GVRs, got %d", len(gvrs), e.pendingLenForTest())
 	}
-
-	// Drain and verify each scope carries one of the GVRs.
-	got := map[schema.GroupVersionResource]struct{}{}
-	for i := 0; i < len(gvrs); i++ {
-		s, ok := e.drainScopeForTest()
-		if !ok {
-			t.Fatalf("expected %d scopes, got only %d", len(gvrs), i)
-		}
-		got[s.gvr] = struct{}{}
+	if got := e.gvrEpoch.Load(); got != uint64(len(gvrs)) {
+		t.Fatalf("expected discovery epoch %d (every discovery recorded), got %d", len(gvrs), got)
 	}
-	for _, gvr := range gvrs {
-		if _, ok := got[gvr]; !ok {
-			t.Fatalf("missing GVR from dequeued set: %v (got %v)", gvr, got)
-		}
+	n, logged := e.drainDiscoveredGVRs()
+	if n != len(gvrs) || len(logged) != len(gvrs) {
+		t.Fatalf("expected all %d GVRs noted for the pass log, got n=%d list=%v", len(gvrs), n, logged)
 	}
 }
 
@@ -185,8 +181,12 @@ func TestGVRDiscoveredIntegration_HookHandlerNonBlocking(t *testing.T) {
 		t.Fatalf("hook fire loop blocked beyond 2s — back-pressure detected (pending=%d)", e.pendingLenForTest())
 	}
 
-	if e.pendingLenForTest() != 200 {
-		t.Fatalf("expected 200 pending after 200 distinct GVRs, got %d", e.pendingLenForTest())
+	// #643 PR-C — 200 distinct GVRs coalesce into ONE pending pass.
+	if e.pendingLenForTest() != 1 {
+		t.Fatalf("expected 1 coalesced pending pass after 200 distinct GVRs, got %d", e.pendingLenForTest())
+	}
+	if got := e.gvrEpoch.Load(); got != 200 {
+		t.Fatalf("expected discovery epoch 200, got %d", got)
 	}
 }
 
@@ -285,8 +285,13 @@ func TestGVRDiscoveredIntegration_WorkerProcessesScope(t *testing.T) {
 	if ranScopes[0].kind != scopeKindGVRDiscovered {
 		t.Fatalf("handler got wrong scope kind: %q", ranScopes[0].kind)
 	}
-	if ranScopes[0].gvr != gvr {
-		t.Fatalf("handler got wrong GVR:\n  want: %+v\n  got:  %+v", gvr, ranScopes[0].gvr)
+	// #643 PR-C — the handler receives the payload-free coalesced item; the
+	// GVR is recorded on the epoch and the pass log, not carried on the item.
+	if ranScopes[0] != (prewarmScope{kind: scopeKindGVRDiscovered}) {
+		t.Fatalf("handler got %+v, want the payload-free coalesced item", ranScopes[0])
+	}
+	if e.gvrEpoch.Load() != 1 {
+		t.Fatalf("discovery of %v did not bump the epoch", gvr)
 	}
 }
 
