@@ -72,7 +72,12 @@ import (
 // version drifts from this constant, `TestUserConfigMirror_PlumbingVersionPin`
 // fails and the operator must re-audit upstream
 // `server/use/userconfig.go` line-by-line before bumping this string.
-const PinnedPlumbingVersion = "v1.14.2"
+//
+// v1.14.2 → v1.15.1 (#657, for crdgen): re-audited by `diff -r` of the two
+// module trees. server/, endpoints/ and jwtutil/ are byte-identical, and the
+// only non-crdgen changes are helm/getter/cache and helm/utils, which
+// snowplow does not import.
+const PinnedPlumbingVersion = "v1.15.1"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
