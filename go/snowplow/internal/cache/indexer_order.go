@@ -104,13 +104,13 @@ func sortIndexerSlots(items []interface{}) {
 
 // indexerSlotKey extracts the sort key from an indexer slot.
 //
-// Both slot types carry it: *bytesObject embeds metav1.ObjectMeta precisely so
-// it satisfies the full metav1.Object interface (bytesobject.go FINDING 2), and
-// *unstructured.Unstructured implements it directly. So ok=false means the slot
-// is NEITHER — and such a slot is already dropped from the output by both
-// renderers (rawItemJSON accepts only those two types; decodeBytesObject the
-// same). A slot that cannot be rendered cannot influence the emitted bytes,
-// which is why a missing key is not a determinism hole.
+// Every renderable slot type carries it. *bytesObject embeds metav1.ObjectMeta
+// precisely so that it satisfies the full metav1.Object interface (bytesobject.go
+// FINDING 2). *unstructured.Unstructured and the typed kinds (e.g. *rbacv1.Role)
+// implement it directly. ok=false therefore means the slot is not a Kubernetes
+// object at all. The shared converter (store_item.go) cannot render such a slot,
+// so since #624 the whole read fails closed and no bytes are emitted. That is
+// why a missing key is not a determinism hole.
 func indexerSlotKey(it interface{}) (namespace, name string, ok bool) {
 	if o, isMeta := it.(metav1.Object); isMeta && o != nil {
 		return o.GetNamespace(), o.GetName(), true

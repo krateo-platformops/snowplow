@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -157,10 +158,15 @@ func TestIssue578_StoredRawIsByteIdenticalToReMarshalledDecode(t *testing.T) {
 
 // TestIssue578_RawItemJSON_HandlesBothIndexerShapes — an indexer slot holds a
 // *bytesObject for virtually every GVR (Ship H5: streaming unless excepted),
-// but can hold a plain *unstructured.Unstructured for the typed-RBAC exception
-// and for a newBytesObject marshal failure. Both must render, and both must
-// render to the SAME bytes the decoded path would have produced, so the
-// fallback is a cost difference and never a correctness difference.
+// and a plain *unstructured.Unstructured after a newBytesObject marshal
+// failure. Both must render, and both must render to the SAME bytes the
+// decoded path would have produced, so the fallback is a cost difference and
+// never a correctness difference.
+//
+// #624: this test used to say the typed-RBAC exception stores Unstructured.
+// It does not — it stores *rbacv1 typed objects — and that false premise is
+// how every RBAC LIST shipped empty. The typed shape is now pinned here too
+// (and, end to end against the apiserver, in issue624_typed_store_items_test.go).
 func TestIssue578_RawItemJSON_HandlesBothIndexerShapes(t *testing.T) {
 	obj := map[string]any{
 		"apiVersion": "v1",
@@ -178,7 +184,7 @@ func TestIssue578_RawItemJSON_HandlesBothIndexerShapes(t *testing.T) {
 		t.Fatalf("newBytesObject: %v", err)
 	}
 
-	gotBytes, ok := rawItemJSON(bo)
+	gotBytes, ok := storeItemJSON(bo)
 	if !ok {
 		t.Fatalf("bytesObject arm must render")
 	}
@@ -186,7 +192,7 @@ func TestIssue578_RawItemJSON_HandlesBothIndexerShapes(t *testing.T) {
 		t.Fatalf("bytesObject arm drifted\n want %s\n  got %s", want, gotBytes)
 	}
 
-	gotUns, ok := rawItemJSON(&unstructured.Unstructured{Object: obj})
+	gotUns, ok := storeItemJSON(&unstructured.Unstructured{Object: obj})
 	if !ok {
 		t.Fatalf("Unstructured fallback arm must render")
 	}
@@ -194,17 +200,20 @@ func TestIssue578_RawItemJSON_HandlesBothIndexerShapes(t *testing.T) {
 		t.Fatalf("Unstructured fallback drifted\n want %s\n  got %s", want, gotUns)
 	}
 
-	// Degenerate slots are DROPPED, matching listFromIndexer's behaviour of
-	// dropping an item it cannot convert — a bad object must never fail the
-	// whole list.
+	// Degenerate slots are NOT renderable. #624 changed what the CALLER does
+	// with that verdict: rawFromIndexer used to skip the slot (a shorter list
+	// served as the truth); it now fails the whole read closed so the
+	// dispatch falls through to the apiserver. The caller behaviour is
+	// asserted in issue624_typed_store_items_test.go; this pins the verdict.
 	for name, in := range map[string]interface{}{
-		"nil bytesObject":  (*bytesObject)(nil),
-		"nil Unstructured": (*unstructured.Unstructured)(nil),
-		"unrelated type":   struct{ X int }{1},
-		"empty raw":        &bytesObject{},
+		"nil bytesObject":       (*bytesObject)(nil),
+		"nil Unstructured":      (*unstructured.Unstructured)(nil),
+		"unrelated type":        struct{ X int }{1},
+		"empty raw":             &bytesObject{},
+		"metadata-only partial": &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Name: "p"}},
 	} {
-		if _, ok := rawItemJSON(in); ok {
-			t.Fatalf("%s must be dropped, not rendered", name)
+		if _, ok := storeItemJSON(in); ok {
+			t.Fatalf("%s must not render", name)
 		}
 	}
 }

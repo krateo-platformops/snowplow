@@ -200,6 +200,7 @@ Defined in `internal/cache/bindings_by_gvr_metrics.go`.
 | `snowplow_ra_full_list_memo` | per-(RA × sliceShape) sliceability verdict snapshot | diagnostic for the RAFullList failure modes |
 | `snowplow_sliceability_reverify` | async sliceability-reverify worker counters | evidence the stuck-false reverify path is firing (informer event → re-verify) |
 | `snowplow_bindings_by_gvr_delta_skipped_non_typed` | `uint64` — delta-event objects neither typed nor convertible, and DROPPED | **0**. Non-zero = the bindings-by-GVR index is drifting until the next boot rebuild (a silent-data-staleness canary) |
+| `snowplow_informer_unrenderable_store_items_total` / `_cells` (**#624**; OTLP twin `snowplow_informer_unrenderable_store_items_total{site,gvr}`, hand-wired) | `uint64` total, plus a `"site\|gvr"` map, with `site` = `list_decoded` / `list_raw` / `get`. Counts informer serve reads that were failed **CLOSED** (served=false, so the read fell through to the apiserver) because a store slot could not be rendered by the shared converter (`store_item.go`) | **0**. Non-zero = a store holds a shape that the serve paths cannot render, for example a new typed transform or a metadata-only slot. The reads stay correct, because they go to the apiserver, but the cache is bypassed for that GVR. Before #624 these slots were silently DROPPED, which is how every RBAC LIST served `items: []`. Zero is health only alongside a non-zero served-LIST count for the same GVR |
 
 ### Prewarm — boot warm-up completion + walk coverage
 

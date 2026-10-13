@@ -160,6 +160,7 @@ var storeRegistry = map[string]string{
 	"cache.storeDivergentLostDelete":                  "no-content (counters)",
 	"cache.storeDivergentLostAdd":                     "no-content (counters)",
 	"cache.storeDivergentUIDMismatch":                 "no-content (counters)",
+	"cache.unrenderableStoreItemCells":                "no-content (#624: fail-closed counters keyed site|gvr)",
 	"cache.storeVerifySkipByReason":                   "no-content (counters)",
 	"api.internalClientCache":                         "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
 	"api.discoveryClientCache":                        "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",

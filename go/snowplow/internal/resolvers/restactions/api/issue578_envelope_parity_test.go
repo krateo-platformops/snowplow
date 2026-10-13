@@ -312,7 +312,8 @@ func TestIssue578_MarshalAsListRaw_CeilingIsChecked(t *testing.T) {
 	t.Run("counts the separators toward the ceiling", func(t *testing.T) {
 		// To isolate the SEPARATOR arm the items must contribute nothing, so
 		// this uses zero-length elements. That input is UNREACHABLE in
-		// production — rawItemJSON drops a bytesObject with empty raw, and both
+		// production — a bytesObject with empty raw fails the read closed (#624,
+		// storeItemJSON), and every json.Marshal arm returns at least "{}"; both
 		// json.Marshal arms return at least "{}" — so this exercises the arm's
 		// arithmetic, not a reachable serve. With 1-byte items the item total
 		// always exceeds the comma count, so no realistic input can isolate it.

@@ -502,6 +502,17 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #624: informer serve reads failed CLOSED on an unrenderable store slot ---
+	// Hand-wired twin of the expvar pair snowplow_informer_unrenderable_store_items_
+	// {total,cells} (no expvar->OTLP bridge). One series per (site, gvr) cell plus
+	// nothing when healthy: a non-zero value means a store holds a shape the serve
+	// paths cannot render and every such read fell through to the apiserver.
+	unrenderableStoreItems, err := m.Int64ObservableCounter("snowplow_informer_unrenderable_store_items_total",
+		metric.WithDescription("Informer serve reads (site=list_decoded|list_raw|get) failed CLOSED to the apiserver because a store slot could not be rendered, by gvr; should be 0. #624."))
+	if err != nil {
+		return err
+	}
+
 	// ===== 1.12.4 (design §3.3) — the instrument gap =====
 	//
 	// Everything below already existed as a live counter inside the
@@ -1023,6 +1034,10 @@ func registerInstruments(m metric.Meter, build string) error {
 				metric.WithAttributes(attribute.String("outcome", outcome)))
 		}
 		o.ObserveInt64(bindingsDeltaSkipped, int64(cache.BindingsIndexDeltaSkippedNonTyped()))
+		for _, c := range cache.UnrenderableStoreItemsSnapshot() {
+			o.ObserveInt64(unrenderableStoreItems, int64(c.Count), metric.WithAttributes(
+				attribute.String("site", c.Site), attribute.String("gvr", c.GVR)))
+		}
 		return nil
 	}, append([]metric.Observable{
 		fallthroughTotal, assertionViolations, rbacPublishSeq,
@@ -1042,6 +1057,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		saDiscovery, crdSchemaMemo,
 		upstreamControllers, upstreamWebhooks,
 		raFullListServe, bindingsDeltaSkipped,
+		// --- #624 ---
+		unrenderableStoreItems,
 		// --- 1.12.4 ---
 		uafRestactionsDeclined, uafWidgetsDeclined, uafRAFullListCached,
 		dispatchL1Cells, seedAttributableHits,

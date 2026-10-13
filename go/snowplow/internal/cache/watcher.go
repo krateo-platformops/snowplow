@@ -2081,14 +2081,16 @@ func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace,
 		return nil, false
 	}
 
-	// Ship H1 — decode-on-access (FINDING 1, cast site 1/5). The
-	// indexer value may be a *bytesObject (composition group, the
-	// GC-lean representation) or a plain *unstructured.Unstructured
-	// (every other GVR, and the CACHE_ENABLED=false path).
-	// decodeBytesObject handles both; a bytesObject is decoded to a
-	// fresh Unstructured, never silently dropped.
-	uns, ok := decodeBytesObject(obj)
+	// #624 — render through the ONE serve converter (store_item.go). The
+	// slot may be a *bytesObject (the streaming default), a plain
+	// *unstructured.Unstructured, or a TYPED object (the four RBAC GVRs'
+	// typed transform). Before #624 a typed slot missed here, so every
+	// RBAC GET fell through and was mis-recorded as a 404 miss. An
+	// unrenderable slot still misses (the apiserver answers) but is now
+	// COUNTED, never silent.
+	uns, ok := storeItemToUnstructured(obj)
 	if !ok {
+		recordUnrenderableStoreItem(unrenderableSiteGet, gvr, newUnrenderableStoreItemError(obj))
 		return nil, false
 	}
 	return uns, true
@@ -2144,7 +2146,14 @@ func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, namespac
 	if !ok {
 		return nil
 	}
-	return listFromIndexer(gi, namespace)
+	items, err := listFromIndexer(gi, namespace)
+	if err != nil {
+		// #624 fail-closed: never a partial list. nil is the same answer an
+		// unregistered GVR gets.
+		recordUnrenderableStoreItem(unrenderableSiteListDecoded, gvr, err)
+		return nil
+	}
+	return items
 }
 
 // listFromIndexer materializes the namespace-scoped slice for an
@@ -2152,22 +2161,26 @@ func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, namespac
 // Shared by ListObjects and ListObjectsServable so both render the
 // indexer partition identically (the byte-equivalence the resolver
 // pivot's JQ pipeline depends on — `feedback_cache_must_not_constrain_jq.md`).
-func listFromIndexer(gi informers.GenericInformer, namespace string) []*unstructured.Unstructured {
+//
+// #624 — FAIL CLOSED. Every slot renders through storeItemToUnstructured
+// (bytesObject, Unstructured, or a typed object). A slot that cannot be
+// rendered fails the WHOLE read with a non-nil error; the caller must not
+// serve. Skipping it would hand back a shorter list as if it were the
+// truth — exactly how every RBAC LIST came back `items: []` before #624.
+func listFromIndexer(gi informers.GenericInformer, namespace string) ([]*unstructured.Unstructured, error) {
 	// #579: deterministic (namespace, name) order — a LIST rebuilt from
 	// unchanged data must produce identical bytes. See indexer_order.go.
 	items := indexerPartition(gi, namespace)
 
 	out := make([]*unstructured.Unstructured, 0, len(items))
 	for _, it := range items {
-		// Ship H1 — decode-on-access (FINDING 1, cast site 2/5).
-		// Shared by ListObjects + ListObjectsServable. A bytesObject
-		// is decoded to a fresh Unstructured; a missed conversion
-		// here would silently shrink every composition list.
-		if uns, ok := decodeBytesObject(it); ok {
-			out = append(out, uns)
+		uns, ok := storeItemToUnstructured(it)
+		if !ok {
+			return nil, newUnrenderableStoreItemError(it)
 		}
+		out = append(out, uns)
 	}
-	return out
+	return out, nil
 }
 
 // ListObjectsServable returns (items, true) only when the watcher can
@@ -2224,7 +2237,14 @@ func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, 
 	if !rw.assertServeRequiresServableLocked(gvr, "ListObjectsServable") {
 		return nil, false
 	}
-	return listFromIndexer(gi, namespace), true
+	items, err := listFromIndexer(gi, namespace)
+	if err != nil {
+		// #624: an unrenderable slot means the watcher cannot vouch for
+		// the list — fall through, counted.
+		recordUnrenderableStoreItem(unrenderableSiteListDecoded, gvr, err)
+		return nil, false
+	}
+	return items, true
 }
 
 // ListServableEnvelopeJSON serves gvr's namespace-scoped (or cluster-wide
