@@ -17,6 +17,11 @@ import (
 )
 
 func TestIssue624_UnrenderableStoreItemsReachOTLP(t *testing.T) {
+	// #636: the cells are process-global. Without this, iteration 2 of
+	// -count>1 finds iteration 1's cell and the isolation check below fails.
+	cache.ResetUnrenderableStoreItemsForTest()
+	t.Cleanup(cache.ResetUnrenderableStoreItemsForTest)
+
 	gvr := schema.GroupVersionResource{Group: "otlp624.krateo.io", Version: "v1", Resource: "things"}
 	find := func() (int64, bool) {
 		for _, p := range pointsFor(flatten(collectViaRealCallback(t, "deadbeef")), "snowplow_informer_unrenderable_store_items_total") {

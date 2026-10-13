@@ -223,6 +223,15 @@ func RecordUnrenderableStoreItemForTest(site string, gvr schema.GroupVersionReso
 	recordUnrenderableStoreItem(site, gvr, &unrenderableStoreItemError{goType: "test"})
 }
 
+// ResetUnrenderableStoreItemsForTest zeroes the grand total and drops every
+// (site, gvr) cell, so an arm that asserts a cell is ABSENT before it records
+// is repeatable at -count>1 (#636). Composed into
+// ResetCacheProcessStateForTest (#471). Never called in production.
+func ResetUnrenderableStoreItemsForTest() {
+	unrenderableStoreItemsTotal.Store(0)
+	unrenderableStoreItemCells.Clear()
+}
+
 var unrenderableStoreItemsExpvarOnce sync.Once
 
 func init() {
