@@ -696,11 +696,11 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// clears the set only if no GVR was discovered while it ran.
 	var passEpochAtStart uint64
 	var passDone *passDoneSet
-	passDoneBefore := 0
+	var passDoneBefore uint64
 	if s.kind == scopeKindGVRDiscovered {
 		passEpochAtStart = e.gvrEpoch.Load()
 		passDone = e.passDoneSetFor(s.key())
-		passDoneBefore = passDone.len()
+		passDoneBefore = passDone.marksTotal()
 		scopeCtx = withPassDoneSet(scopeCtx, passDone)
 		// The GVRs this coalesced pass answers — log only (on no key/label).
 		n, gvrs := e.drainDiscoveredGVRs()
@@ -774,15 +774,16 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 		// avoids a spurious scope_requeued line at teardown).
 		if ctx.Err() == nil {
 			// #643 PR-C (C4) — the coalesced gvr-discovered item's backoff resets
-			// on PROGRESS: an attempt that re-Put ≥1 unit it had not done before
-			// (new resume records; skips and redone units do not count) retries at
-			// the limiter's base delay. Only an attempt with zero new records lets
-			// NumRequeues — the exponential backoff — grow (genuine overload). The
-			// boot-only attempt counter (#135 Lever B) is not affected: it is
-			// installed for boot scopes only.
-			progress, newDone := false, 0
+			// on PROGRESS: an attempt that made ≥1 accepted resume mark (an
+			// accepted Put of a fresh resolve — a new unit OR a redo of a record
+			// that went stale, e.g. after a mid-pass GVR discovery; resume SKIPS
+			// make no mark) retries at the limiter's base delay. Only an attempt
+			// with zero marks lets NumRequeues — the exponential backoff — grow
+			// (genuine overload). The boot-only attempt counter (#135 Lever B) is
+			// not affected: it is installed for boot scopes only.
+			progress, newDone := false, uint64(0)
 			if passDone != nil {
-				newDone = passDone.len() - passDoneBefore
+				newDone = passDone.marksTotal() - passDoneBefore
 				if newDone > 0 {
 					progress = true
 					e.queue.Forget(s)
@@ -795,7 +796,7 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 				slog.String("scope", s.key()),
 				slog.Int("attempt", e.queue.NumRequeues(s)),
 				slog.Bool("progress", progress),
-				slog.Int("new_done", newDone),
+				slog.Uint64("new_done", newDone),
 				slog.Any("err", err),
 				slog.String("effect", "engine-owned resume: cut/failed scope re-enqueued with "+
 					"rate-limited backoff (F.4); a boot deadline-cut resumes as a continuation chunk, "+

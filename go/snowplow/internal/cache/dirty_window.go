@@ -335,13 +335,11 @@ func dirtyStampFor(key string) (*dirtyStamp, bool) {
 // Both live on the same stamp, which only an accepted re-Put (or the cell's
 // removal) clears. Read-only.
 func InputsMovedSincePut(key string) bool {
+	// The stamp exists exactly while a window is open (stale == none) OR the
+	// cell is known-stale (stale == a reason); only an accepted re-Put or the
+	// cell's removal clears it. So "a stamp exists" is the whole predicate.
 	s, ok := dirtyStampFor(key)
-	if !ok || s == nil {
-		return false
-	}
-	openWindow := s.stale == knownStaleNone
-	knownStale := s.stale != knownStaleNone
-	return openWindow || knownStale
+	return ok && s != nil
 }
 
 // DirtyWindowsOpenForTest counts the open windows (F6d). TEST-ONLY.

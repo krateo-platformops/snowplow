@@ -67,6 +67,7 @@ type passDoneSet struct {
 	epoch *atomic.Uint64
 	mu    sync.Mutex
 	m     map[string]passDoneRecord
+	marks uint64 // monotonic accepted marks (C4 progress measure)
 }
 
 func newPassDoneSet(epoch *atomic.Uint64) *passDoneSet {
@@ -86,7 +87,21 @@ func (s *passDoneSet) mark(key string, epoch uint64, entry *cache.ResolvedEntry,
 	}
 	s.mu.Lock()
 	s.m[key] = passDoneRecord{epoch: epoch, entry: entry, putSeq: putSeq}
+	s.marks++
 	s.mu.Unlock()
+}
+
+// marksTotal is the monotonic count of accepted marks — a new key OR a
+// replaced (redone) record. Every mark is an accepted Put of a fresh resolve,
+// so its delta across an attempt is that attempt's PROGRESS (C4): a redo of a
+// stale record is progress even though it adds no key.
+func (s *passDoneSet) marksTotal() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.marks
 }
 
 func (s *passDoneSet) lookup(key string) (passDoneRecord, bool) {
