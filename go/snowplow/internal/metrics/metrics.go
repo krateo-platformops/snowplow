@@ -463,6 +463,16 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #608: refresh failures by closed-set (err_class, stage). Outside the
+	// C7 snowplow_refresher_ family (that prefix is reserved for tag-derived
+	// stats). Alert on err_class="unclassified" > 0 and on
+	// err_class="forbidden",stage="validate" > 0 — the #608 signature.
+	refreshFailedByClass, err := m.Int64ObservableCounter("snowplow_refresh_failed",
+		metric.WithDescription("Background refresh failures by closed-set err_class and resolve stage (#608)."))
+	if err != nil {
+		return err
+	}
+
 	// --- discovery: compiled-CRD-schema memo (one counter keyed by stat) ---
 	crdSchemaMemo, err := m.Int64ObservableCounter("snowplow_crd_schema_memo",
 		metric.WithDescription("Compiled-CRD-schema memo counters, labelled by stat."))
@@ -843,9 +853,17 @@ func registerInstruments(m metric.Meter, build string) error {
 			"builds":        sa.Builds,
 			"invalidations": sa.Invalidations,
 			"fallbacks":     sa.Fallbacks,
+			// #608 — an impersonating config refused by the SA singleton.
+			"impersonated_rejected": sa.ImpersonatedRejected,
 		} {
 			o.ObserveInt64(saDiscovery, int64(v),
 				metric.WithAttributes(attribute.String("stat", stat)))
+		}
+
+		// --- #608: refresh failures by (err_class, stage) ---
+		for _, c := range cache.RefreshFailedByClassSnapshot() {
+			o.ObserveInt64(refreshFailedByClass, int64(c.N), metric.WithAttributes(
+				attribute.String("err_class", c.Class), attribute.String("stage", c.Stage)))
 		}
 
 		// --- CRD-schema memo ---
@@ -1039,7 +1057,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		phase1UnitsPlanned, phase1UnitsSeeded, phase1ApiRefPages, phase1EligibleNoContinue,
 		phase1WalkZeroChildren, phase1WalkObservations,
 		phase1SeedResolves, phase1SeedFailures, phase1SeedRBACDeny, phase1SeedOpFail,
-		saDiscovery, crdSchemaMemo,
+		saDiscovery, crdSchemaMemo, refreshFailedByClass,
 		upstreamControllers, upstreamWebhooks,
 		raFullListServe, bindingsDeltaSkipped,
 		// --- 1.12.4 ---

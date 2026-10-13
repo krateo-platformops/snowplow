@@ -114,6 +114,19 @@ func registerRefresherMetrics() {
 		expvar.Publish("snowplow_resolve_latency_p95_ms", expvar.Func(func() any {
 			return RefresherP95ResolveMS()
 		}))
+
+		// #608 — refresh failures split by the closed (err_class, stage) set,
+		// keyed "<err_class>/<stage>". Outside the C7-tagged snowplow_refresher_
+		// family on purpose (that prefix is reserved for tag-derived stats);
+		// mirrored to OTLP as snowplow_refresh_failed{err_class,stage}. During
+		// the #608 defect it would have read forbidden/validate ≈ 50,189.
+		expvar.Publish("snowplow_refresh_failed_by_class", expvar.Func(func() any {
+			out := map[string]uint64{}
+			for _, c := range RefreshFailedByClassSnapshot() {
+				out[c.Class+"/"+c.Stage] = c.N
+			}
+			return out
+		}))
 	})
 }
 

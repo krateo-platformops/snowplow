@@ -33,9 +33,42 @@ var crdGVR = runtimeschema.GroupVersionResource{
 	Resource: "customresourcedefinitions",
 }
 
+// InvalidStatusError marks a GENUINE schema-validation failure: the object's
+// status.widgetData does not conform to its CRD's schema. It is the only
+// validator outcome widgets.Resolve reports as a 400 BadRequest; every other
+// error (a 403/404/5xx from the apiserver hops in front of it, a CRD whose
+// schema cannot be compiled) keeps its own identity (#608). Error() is the
+// inner text verbatim, so the customer-facing message is unchanged.
+type InvalidStatusError struct{ Err error }
+
+func (e *InvalidStatusError) Error() string { return e.Err.Error() }
+func (e *InvalidStatusError) Unwrap() error { return e.Err }
+
+// schemaRESTConfig picks the transport for the validator's apiserver hops.
+//
+// #608 — THE CRD SCHEMA IS A SYSTEM READ. It is identity-free cluster metadata,
+// the same for every user, so it is always read as snowplow: the process SA
+// *rest.Config main.go installs once at startup (cache.SetProcessSARestConfig).
+// The caller's rc is NOT consulted when that is set — whatever a caller puts on
+// ctx or in ResolveOptions.RC, a system read can never be routed through an
+// identity transport. That is the defect this closes: since #574 the refresher
+// passed its cohort-IMPERSONATED config here, 057 refused the impersonation on
+// the discovery hop in front of the CRD GET (403, reported by client-go as the
+// literal "unknown"), and ~50K refreshes failed.
+//
+// The caller's rc is used ONLY when no process SA rc is installed (cache off,
+// out-of-cluster, unit tests) — the unchanged pre-#608 fallback.
+func schemaRESTConfig(callerRC *rest.Config) *rest.Config {
+	if sa := cache.ProcessSARestConfig(); sa != nil {
+		return sa
+	}
+	return callerRC
+}
+
 func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]any) error {
 	gv := dynamic.GroupVersion(obj)
 	gvk := gv.WithKind(dynamic.GetKind(obj))
+	rc = schemaRESTConfig(rc)
 
 	// Ship 2 (production-aim cleanup 2026-06-01) — resolve the
 	// composition GVR through cache.GVRFor. The builtin scheme arm
@@ -52,7 +85,7 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 	}
 	gvr, err := cache.GVRFor(ctx, gvk, rc)
 	if err != nil {
-		return err
+		return fmt.Errorf("plural for %s: %w", gvk.String(), err)
 	}
 
 	widgetData, ok, err := unstructured.NestedMap(obj, "status", widgetDataKey)
@@ -90,7 +123,7 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 	// memo hit NEVER bypasses the fail-closed NotFound path (never-change-
 	// output: a widgetData-absent object returns NotFound on hit AND miss).
 	if crv, hit := lookupCRDSchema(gvr); hit {
-		return validateCustomResource(crv, widgetData)
+		return invalidStatus(validateCustomResource(crv, widgetData))
 	}
 
 	// MISS — snapshot the memo generation BEFORE the CRD GET below. If a CRD
@@ -139,12 +172,13 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 			return err
 		}
 	}
-	crdObj, err := cli.Get(ctx, fmt.Sprintf("%s.%s", gvr.Resource, gvr.Group), dynamic.Options{
+	crdName := fmt.Sprintf("%s.%s", gvr.Resource, gvr.Group)
+	crdObj, err := cli.Get(ctx, crdName, dynamic.Options{
 		GVR:       crdGVR,
 		Namespace: "",
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("crd schema %s: %w", crdName, err)
 	}
 	var crd map[string]any
 	if crdObj != nil {
@@ -161,9 +195,18 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 	// dynamic/cached_client.go:176).
 	crv, err := compileCRDSchemaFn(crd, gvr.Version)
 	if err != nil {
-		return err
+		return fmt.Errorf("compile crd schema %s: %w", crdName, err)
 	}
 	storeCRDSchema(gvr, crv, gen)
 
-	return validateCustomResource(crv, widgetData)
+	return invalidStatus(validateCustomResource(crv, widgetData))
+}
+
+// invalidStatus marks a validateCustomResource failure as the genuine schema
+// violation it is; nil stays nil.
+func invalidStatus(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &InvalidStatusError{Err: err}
 }

@@ -39,10 +39,43 @@ package cache
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	"k8s.io/client-go/rest"
 )
+
+// transportIdentity memoises the ServiceAccount username a base config's
+// bearer token authenticates as, keyed by the token string, so the JWT is
+// decoded once per token rather than once per refresh.
+type transportIdentity struct {
+	token string
+	user  string
+}
+
+var lastTransportIdentity atomic.Pointer[transportIdentity]
+
+// transportUsername returns the `system:serviceaccount:<ns>:<name>` username
+// the base config dials as, read from its bearer token's `sub` claim (the
+// same claim phase1SAUsername reads from the SA endpoint's token), or "" when
+// the config carries no ServiceAccount JWT. "" never matches a username, so an
+// unreadable token keeps the pre-#608 behaviour exactly.
+func transportUsername(base *rest.Config) string {
+	if base == nil || base.BearerToken == "" {
+		return ""
+	}
+	if ti := lastTransportIdentity.Load(); ti != nil && ti.token == base.BearerToken {
+		return ti.user
+	}
+	user := ""
+	if ui, err := jwtutil.ExtractUserInfo(base.BearerToken); err == nil &&
+		strings.HasPrefix(ui.Username, "system:serviceaccount:") {
+		user = ui.Username
+	}
+	lastTransportIdentity.Store(&transportIdentity{token: base.BearerToken, user: user})
+	return user
+}
 
 // CohortPlaceholderUsername stands in for a cohort whose binding subject is a
 // GROUP and which therefore has no username of its own
@@ -133,6 +166,15 @@ func ImpersonatingRESTConfig(base *rest.Config, username string, groups []string
 		return nil
 	}
 	if username == "" && len(groups) == 0 {
+		return nil
+	}
+	// #608 — NEVER IMPERSONATE YOURSELF. An identity-free cell is refreshed
+	// under snowplow's own ServiceAccount identity (resolve_populate.go), and
+	// asking the apiserver to impersonate the very principal that is dialling
+	// can only LOSE rights: on krateo-057 `impersonate` is granted on users
+	// only, so every such request was refused outright. The transport already
+	// IS that identity, so the plain SA config is exactly right.
+	if username != "" && username == transportUsername(base) {
 		return nil
 	}
 	user := username

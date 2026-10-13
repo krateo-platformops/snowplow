@@ -582,24 +582,29 @@ func TestIssue608_F5_DataReadsStayCohortScoped(t *testing.T) {
 	f608Run(t, e, "widgets", []string{key})
 
 	objPath := fmt.Sprintf("/apis/%s/%s/namespaces/%s/%s/f5-button", f608Group, f608Version, f608NS, k.resource)
-	var dataAsCohort, dataAsSA, metaImp int
+	// Discovery is NOT counted against the fix here: the data read's own
+	// per-call client resolves its GVR with discovery under the cohort's
+	// identity (every authenticated principal may read discovery), and that
+	// belongs to the cohort-scoped data read. The CRD GET is the validator's
+	// alone, so it must never be impersonated.
+	var dataAsCohort, dataAsSA, crdImp int
 	for _, r := range e.srv.requests() {
 		switch {
 		case r.path == objPath && r.user == user:
 			dataAsCohort++
 		case r.path == objPath:
 			dataAsSA++
-		case r.impersonated() && (r.isCRD() || r.isDiscovery()):
-			metaImp++
+		case r.impersonated() && r.isCRD():
+			crdImp++
 		}
 	}
-	t.Logf("F5: accepted=%v data_as_cohort=%d data_as_sa=%d impersonated_meta=%d", e.accepted(key), dataAsCohort, dataAsSA, metaImp)
+	t.Logf("F5: accepted=%v data_as_cohort=%d data_as_sa=%d impersonated_crd_gets=%d", e.accepted(key), dataAsCohort, dataAsSA, crdImp)
 	if dataAsCohort == 0 || dataAsSA != 0 {
 		t.Errorf("F5: the object fall-through must carry Impersonate-User=%s (got %d as cohort, %d as SA) — "+
 			"#574's guarantee that background DATA reads are cohort-scoped", user, dataAsCohort, dataAsSA)
 	}
-	if metaImp != 0 {
-		t.Errorf("F5 RED: %d discovery/CRD requests were impersonated, want 0", metaImp)
+	if crdImp != 0 {
+		t.Errorf("F5 RED: %d CRD-schema GETs were impersonated, want 0", crdImp)
 	}
 	if !e.accepted(key) {
 		t.Errorf("F5 RED: the cohort's refresh was not accepted — its CRD-schema check ran as the cohort, " +
@@ -697,6 +702,8 @@ func TestIssue608_F3_ForbiddenValidateIsClassifiedNotRelabelled(t *testing.T) {
 	}
 
 	// The refresher record: err_class + stage, closed set.
+	cache.ResetRefreshFailedByClassForTest()
+	t.Cleanup(cache.ResetRefreshFailedByClassForTest)
 	capt := &f608LogCapture{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(capt))
@@ -720,6 +727,20 @@ func TestIssue608_F3_ForbiddenValidateIsClassifiedNotRelabelled(t *testing.T) {
 	// Q2 ruling: a deterministic 403 is not retried through the 5-requeue budget.
 	if len(recs) != 1 {
 		t.Errorf("F3 RED: a forbidden refresh was attempted %d times, want 1 (non-retryable, Q2)", len(recs))
+	}
+	// Detector: snowplow_refresh_failed{err_class="forbidden",stage="validate"}.
+	var forbiddenValidate uint64
+	for _, c := range cache.RefreshFailedByClassSnapshot() {
+		if c.Class == cache.RefreshErrForbidden && c.Stage == cache.ResolveStageValidate {
+			forbiddenValidate = c.N
+		}
+	}
+	if forbiddenValidate != 1 {
+		t.Errorf("F3: refresh_failed{forbidden,validate} = %d, want 1", forbiddenValidate)
+	}
+	// It still counts and stays visible: the drop point ran (dropped +1).
+	if dropped := capt.find("refresher.refresh_dropped"); len(dropped) != 1 || dropped[0]["non_retryable"] != "true" {
+		t.Errorf("F3: want exactly one refresh_dropped with non_retryable=true, got %v", dropped)
 	}
 }
 
@@ -746,5 +767,10 @@ func TestIssue608_F4_SharedSADiscoveryRefusesAnImpersonatingConfig(t *testing.T)
 	again, err := idynamic.SharedSADiscoveryClient(base)
 	if err != nil || again != first {
 		t.Errorf("F4 RED: the SA singleton was replaced by the impersonating call (err=%v)", err)
+	}
+	// Detector: the refusal is COUNTED (snowplow_sa_discovery{stat=
+	// "impersonated_rejected"}), so it reads non-zero during the defect.
+	if got := idynamic.SADiscoveryStatsSnapshot().ImpersonatedRejected; got == 0 {
+		t.Errorf("F4: impersonated_rejected = 0 after a refused impersonating config — the detector cannot see the defect")
 	}
 }

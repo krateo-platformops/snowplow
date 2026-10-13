@@ -75,6 +75,7 @@
 package dynamic
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -106,10 +107,15 @@ import (
 //     keeping the seed counters co-located). A non-zero value is the
 //     post-deploy signal that the caching win is silently evaporating back to
 //     per-call discovery downloads.
+//   - saDiscoveryImpersonatedRejected: #608 — bumped every time a caller hands
+//     SharedSADiscoveryClient an IMPERSONATING config, which it refuses. Zero
+//     in a healthy process; on krateo-057 1.12.43 it would have read ~50,403
+//     (one per refresh that rebuilt the singleton around a cohort's config).
 var (
-	saDiscoveryBuilds        atomic.Uint64
-	saDiscoveryInvalidations atomic.Uint64
-	saDiscoveryFallbacks     atomic.Uint64
+	saDiscoveryBuilds               atomic.Uint64
+	saDiscoveryInvalidations        atomic.Uint64
+	saDiscoveryFallbacks            atomic.Uint64
+	saDiscoveryImpersonatedRejected atomic.Uint64
 )
 
 // SADiscoveryStats is a read-only snapshot of the SA-discovery singleton
@@ -117,9 +123,10 @@ var (
 // the metrics test. Mirrors schema.CRDSchemaMemoStats / the refresher snapshot
 // shape.
 type SADiscoveryStats struct {
-	Builds        uint64
-	Invalidations uint64
-	Fallbacks     uint64
+	Builds               uint64
+	Invalidations        uint64
+	Fallbacks            uint64
+	ImpersonatedRejected uint64
 }
 
 // SADiscoveryStatsSnapshot returns the current SA-discovery counters. Exported
@@ -127,9 +134,10 @@ type SADiscoveryStats struct {
 // time and the metrics test asserts monotonic transitions through it.
 func SADiscoveryStatsSnapshot() SADiscoveryStats {
 	return SADiscoveryStats{
-		Builds:        saDiscoveryBuilds.Load(),
-		Invalidations: saDiscoveryInvalidations.Load(),
-		Fallbacks:     saDiscoveryFallbacks.Load(),
+		Builds:               saDiscoveryBuilds.Load(),
+		Invalidations:        saDiscoveryInvalidations.Load(),
+		Fallbacks:            saDiscoveryFallbacks.Load(),
+		ImpersonatedRejected: saDiscoveryImpersonatedRejected.Load(),
 	}
 }
 
@@ -177,11 +185,21 @@ var (
 // back to dynamic.NewClient(rc) (transparent fallback, never worse than
 // today).
 //
+// #608 — THE INVARIANT IS ENFORCED, NOT DOCUMENTED. An IMPERSONATING rc is
+// refused with ErrImpersonatingConfig and counted, and the singleton is left
+// exactly as it was. Before this guard the refresher's per-refresh cohort
+// config (a fresh rest.CopyConfig every time) rebuilt the "SA" singleton on
+// every memo miss — 50,403 rebuilds and 50,189 refused GET /api on 057.
+//
 // Goroutine-safe.
 func SharedSADiscoveryClient(rc *rest.Config) (Client, error) {
 	if rc == nil {
 		saDiscoveryFallbacks.Add(1) // caller falls back to per-call dynamic.NewClient
 		return nil, fmt.Errorf("dynamic.SharedSADiscoveryClient: nil *rest.Config")
+	}
+	if IsImpersonatingConfig(rc) {
+		saDiscoveryImpersonatedRejected.Add(1)
+		return nil, ErrImpersonatingConfig
 	}
 
 	// Fast path: warm singleton for this rc identity.
@@ -212,6 +230,22 @@ func SharedSADiscoveryClient(rc *rest.Config) (Client, error) {
 	}
 	saDiscoveryInstance = st
 	return st.client, nil
+}
+
+// ErrImpersonatingConfig is returned by SharedSADiscoveryClient for a config
+// that impersonates another identity: the singleton serves identity-free
+// cluster metadata and is only ever built from snowplow's own SA transport.
+var ErrImpersonatingConfig = errors.New("dynamic.SharedSADiscoveryClient: refusing an impersonating *rest.Config " +
+	"(the SA discovery singleton serves identity-free cluster metadata; #608)")
+
+// IsImpersonatingConfig reports whether rc asks the apiserver to act as
+// another identity.
+func IsImpersonatingConfig(rc *rest.Config) bool {
+	if rc == nil {
+		return false
+	}
+	imp := rc.Impersonate
+	return imp.UserName != "" || imp.UID != "" || len(imp.Groups) > 0 || len(imp.Extra) > 0
 }
 
 // discoveryClientForConfigFn is the package-private indirection that lets
