@@ -511,7 +511,27 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 // passed by pointer) — its ClusterList* fields are written here exactly as
 // before. Returns tmp (possibly empty for C-3).
 func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
-	tmp := createRequestOptions(r.ctx, r.log, apiCall, r.dict)
+	tmp, iterErr := createRequestOptionsChecked(r.ctx, r.log, apiCall, r.dict)
+	if iterErr != nil {
+		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
+		// used to be logged only: the stage ran a partial-or-empty plan and the
+		// result was cacheable (no sink bump). Now it is the same stage-error
+		// triad every other stage failure takes — dict[errorKey] accumulates
+		// the message, the stage-error sink is bumped so every L1 Put declines,
+		// and the stage outcome is Error — and nothing is dispatched (dict[id]
+		// stays unset). Downstream stages still run (#313 C-A: no truncation).
+		// Runs on the stage-loop goroutine before any worker exists, so dict
+		// needs no lock.
+		msg := iterErr.Error()
+		r.log.Error("stage iterator failed; stage not dispatched",
+			slog.String("name", id),
+			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
+			slog.String("restaction_name", r.opts.RESTActionName))
+		accumulateErrorKey(r.dict, ptr.Deref(apiCall.ErrorKey, "error"), msg)
+		r.stageErrSink.Bump(id, msg)
+		r.outcomes.fail(id, StageReasonError)
+		return nil
+	}
 	if len(tmp) == 0 {
 		// C-3 (a normal "continue" condition): an iterator stage evaluated to
 		// zero items, so there is nothing to call. Benign and per-resolve —
@@ -736,6 +756,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// outputs + a synthetic slice). Exposed to the step filter as the
 		// reserved sibling key pig["extras"]. Shared reference: gojq COW fork.
 		extras: r.opts.Extras,
+		// #638 — the owning RESTAction, for the stage-filter failure line.
+		raNamespace: r.opts.RESTActionNamespace,
+		raName:      r.opts.RESTActionName,
 	}
 	inner := jsonHandler(gctx, hOpts)
 	innerBytesFn := jsonHandlerBytes(gctx, hOpts)

@@ -25,7 +25,7 @@ spec:
     path: "/repos/krateoplatformops/snowplow/actions/runs?per_page=2"
     headers:
       - "Accept: application/vnd.github+json"
-    filter: ".workflow_runs |  map({workflow_id, id, display_title, status, conclusion, created_at, user: .triggering_actor.login})"
+    filter: ".all.workflow_runs |  map({workflow_id, id, display_title, status, conclusion, created_at, user: .triggering_actor.login})"
   - name: jobs
     endpointRef:
       name: github-endpoint
@@ -36,5 +36,5 @@ spec:
     path: ${ "/repos/krateoplatformops/snowplow/actions/runs/" + (.id|tostring) + "/timing" }
     headers:
       - "Accept: application/vnd.github+json"
-    filter: ".billable |= with_entries({key, value: {jobs: .value.jobs}})"
+    filter: ".jobs | .billable |= with_entries({key, value: {jobs: .value.jobs}})"
 

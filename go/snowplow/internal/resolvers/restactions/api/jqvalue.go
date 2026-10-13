@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 
 	"github.com/itchyny/gojq"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
 // jqCompileCount counts CompileJQ invocations (every gojq.Parse+Compile pair
@@ -137,8 +138,13 @@ func EvalValueCompiled(ctx context.Context, code *gojq.Code, data any) (value an
 		}
 		// A yielded error-value is a jq runtime error — matches
 		// jqutil.go:46-48 (return "", err).
+		//
+		// #638 — SANITIZED: gojq renders a preview of the failing VALUE (the
+		// response being filtered) into most runtime errors; every caller logs
+		// or surfaces this error (stage filter → errorKey, UAF refilter Warn).
+		// Only the error class and the jq types survive.
 		if rerr, isErr := v.(error); isErr {
-			return nil, false, rerr
+			return nil, false, jqsupport.SanitizeError(rerr)
 		}
 		if count == 0 {
 			first = v

@@ -51,6 +51,10 @@ type jsonHandlerOptions struct {
 	// gojq is the krateo-platformops COW fork, so the filter cannot mutate the input
 	// (mirrors the existing pig["slice"] shared-map pattern).
 	extras map[string]any
+	// raNamespace/raName name the owning RESTAction on the #638 stage-filter
+	// failure line (log attribution only; never part of the filter input).
+	raNamespace string
+	raName      string
 }
 
 // jsonHandler is the HTTP-body-shaped entry point — the form
@@ -103,9 +107,23 @@ func jsonHandlerValue(ctx context.Context, opts jsonHandlerOptions) func(any) er
 func jsonHandlerBytesApply(ctx context.Context, opts jsonHandlerOptions, dat []byte) error {
 	var tmp any
 	if err := json.Unmarshal(dat, &tmp); err != nil {
-		return err
+		return safeDecodeError(err)
 	}
 	return jsonHandlerCore(ctx, opts, tmp)
+}
+
+// safeDecodeError renders a response-decode failure without response bytes
+// (#638). encoding/json's SyntaxError quotes the offending character of the
+// BODY ("invalid character 's' after top-level value"); the error is logged and
+// written to the stage's errorKey. Keep the class and the byte offset only.
+func safeDecodeError(err error) error {
+	var se *json.SyntaxError
+	if errors.As(err, &se) {
+		return fmt.Errorf("response is not valid JSON: syntax error at byte offset %d", se.Offset)
+	}
+	// Anything else (decoding into `any` cannot raise a type error) is
+	// reported by class only — UnmarshalTypeError.Value would quote the body.
+	return fmt.Errorf("response is not valid JSON (%T)", err)
 }
 
 // jsonHandlerCore is the post-decode logic: wrap the decoded value under
@@ -161,10 +179,22 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 			// json.Unmarshal errors -> return err -> stage fails.
 			return err
 		case err != nil:
-			// Parse/compile/runtime gojq-error. Current: log.Error, tmp
-			// unchanged, stage continues. (jqutil.Eval err branch.)
-			log.Error("unable to evaluate JQ filter",
+			// #638 — a parse/compile/runtime gojq error FAILS the stage. It
+			// used to be logged and the stage continued with tmp = the RAW,
+			// unfiltered response: wrong data (the projection or narrowing
+			// the filter performs was skipped), served AND cacheable (no
+			// stage-error sink bump, so every L1 Put accepted it). Returning
+			// the error routes it through the caller's recordItemError at
+			// every feed site — the stage-error sink is bumped (the Put
+			// declines), the stage outcome is Error, dict[errorKey] carries
+			// the message, ContinueOnError is honoured — and dict[key] is
+			// never written, so the raw body cannot reach the output.
+			log.Error("stage filter failed; stage response not merged",
+				slog.String("stage", opts.key),
+				slog.String("restaction_namespace", opts.raNamespace),
+				slog.String("restaction_name", opts.raName),
 				slog.String("filter", q), slog.Any("error", err))
+			return fmt.Errorf("jq filter %q failed: %w", q, err)
 		case !ok:
 			// Zero-yield (jq `empty`). Current: jqutil.Eval returns "",
 			// json.Unmarshal("") errors -> return err -> stage fails.

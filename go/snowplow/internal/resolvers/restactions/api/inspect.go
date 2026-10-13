@@ -288,7 +288,10 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 // `${ "/apis/apps/v1/" + .kind }`) comes back looking like a legitimate bare
 // discovery path. Same reason the two in-tree skeleton analysers exist.
 func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[string]any, log *slog.Logger) ([]Resource, error) {
-	opts, skips := createRequestOptionsWithSkips(context.Background(), log, stage, dict)
+	// The iterator error (#638) is not consumed here: inspect is a
+	// dispatch-free read-set enumeration, unchanged — an errored iterator
+	// enumerates what it enumerated, exactly as before.
+	opts, skips, _ := createRequestOptionsWithSkips(context.Background(), log, stage, dict)
 	if len(opts) == 0 && len(skips) == 0 {
 		return nil, fmt.Errorf("stage produced no request path")
 	}

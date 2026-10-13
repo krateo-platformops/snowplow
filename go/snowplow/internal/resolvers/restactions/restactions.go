@@ -80,7 +80,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 			ModuleLoader: jqsupport.ModuleLoader(),
 		})
 		if err != nil {
-			return opts.In, fmt.Errorf("unable to resolve filter: %w", err)
+			return opts.In, fmt.Errorf("unable to resolve filter: %w", jqsupport.SanitizeError(err))
 		}
 
 		raw = []byte(s)

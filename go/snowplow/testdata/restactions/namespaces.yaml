@@ -9,7 +9,7 @@ spec:
   api:
   - name: namespaces
     path: "/api/v1/namespaces?limit=15"
-    filter: "[.items[] | .metadata.name]"
+    filter: "[.namespaces.items[] | .metadata.name]"
     continueOnError: true
     errorKey: namespacesError
  

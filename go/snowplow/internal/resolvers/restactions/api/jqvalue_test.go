@@ -281,19 +281,18 @@ func TestSite1_HandlerFilter_TruthTable(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "parse error -> log + stage CONTINUES, tmp unchanged",
+			// #638: a parse error used to log and CONTINUE with the RAW input
+			// (tmp unchanged) — the unfiltered body was served and cacheable.
+			name:    "parse error -> stage FAILS (#638, no raw pass-through)",
 			filter:  ".result |",
 			input:   map[string]any{"foo": "bar"},
-			wantErr: false,
-			// tmp unchanged: out[key] is the wrapped original input.
-			wantOut: `{"foo":"bar"}`,
+			wantErr: true,
 		},
 		{
-			name:    "runtime error -> log + stage CONTINUES, tmp unchanged",
+			name:    "runtime error -> stage FAILS (#638, no raw pass-through)",
 			filter:  ".result.foo.bar",
 			input:   map[string]any{"foo": 5.0},
-			wantErr: false,
-			wantOut: `{"foo":5}`,
+			wantErr: true,
 		},
 	}
 	for _, tc := range cases {
