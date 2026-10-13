@@ -33,12 +33,15 @@
 // holds raw bytes, and this path is general rather than a carve-out
 // (feedback_no_special_cases).
 //
-// THE FALLBACK IS NOT A SPECIAL CASE. An indexer slot can hold a plain
-// *unstructured.Unstructured in two situations: the typed-RBAC exception, and a
-// newBytesObject marshal failure (the transform stores the Unstructured rather
-// than stalling the informer). rawItemJSON marshals that one item on the spot,
-// so the result is complete and correct for every GVR uniformly — the fast path
-// is simply free when the bytes are already there.
+// THE FALLBACK IS NOT A SPECIAL CASE. A slot that is not a *bytesObject is one
+// of two things. For the typed-RBAC exception it is a TYPED *rbacv1 object: the
+// typed transform converts the Unstructured. Before #624 this was wrongly
+// described as Unstructured, and every such slot was dropped. After a
+// newBytesObject marshal failure it is a plain *unstructured.Unstructured. In
+// both cases storeItemJSON (store_item.go) renders that one item through the
+// same converter the decoded branch uses. The result is complete and correct
+// for every GVR uniformly, and the fast path costs nothing when the bytes are
+// already there. A slot that nothing can render fails the read closed.
 package cache
 
 import (
@@ -90,57 +93,39 @@ func (rw *ResourceWatcher) ListRawServable(gvr schema.GroupVersionResource, name
 	if !rw.assertServeRequiresServableLocked(gvr, "ListRawServable") {
 		return nil, false
 	}
-	return rawFromIndexer(gi, namespace), true
+	raws, err := rawFromIndexer(gi, namespace)
+	if err != nil {
+		// #624: fail closed, counted — never a shorter list served as true.
+		recordUnrenderableStoreItem(unrenderableSiteListRaw, gvr, err)
+		return nil, false
+	}
+	return raws, true
 }
 
 // rawFromIndexer mirrors listFromIndexer's partition selection EXACTLY — same
 // namespace index, same ByIndex-error fallback to a filtered full List — and
 // differs only in what it extracts per item.
 //
-// DROP PARITY: listFromIndexer drops an item decodeBytesObject cannot convert;
-// this drops an item rawItemJSON cannot render. Both are "should never happen"
-// populations, and both fail the same way (the item is absent from the list
-// rather than the list failing), so a malformed object never stalls a serve.
-func rawFromIndexer(gi informers.GenericInformer, namespace string) [][]byte {
+// FAIL-CLOSED PARITY (#624): listFromIndexer fails the whole read on a slot
+// storeItemToUnstructured cannot render; this fails it on a slot
+// storeItemJSON cannot render — the same population, since storeItemJSON
+// renders every non-bytes slot THROUGH storeItemToUnstructured. Before #624
+// both silently skipped such a slot, and the typed-RBAC slots were all of
+// them.
+func rawFromIndexer(gi informers.GenericInformer, namespace string) ([][]byte, error) {
 	// #579: deterministic (namespace, name) order — a LIST rebuilt from
 	// unchanged data must produce identical bytes. See indexer_order.go.
 	items := indexerPartition(gi, namespace)
 
 	out := make([][]byte, 0, len(items))
 	for _, it := range items {
-		if b, ok := rawItemJSON(it); ok {
-			out = append(out, b)
+		b, ok := storeItemJSON(it)
+		if !ok {
+			return nil, newUnrenderableStoreItemError(it)
 		}
+		out = append(out, b)
 	}
-	return out
-}
-
-// rawItemJSON renders one indexer slot as JSON.
-//
-// The *bytesObject arm is the whole point: it returns the stored array with no
-// decode, no marshal and no allocation. The *unstructured.Unstructured arm
-// covers the typed-RBAC streaming exception and the newBytesObject
-// marshal-failure fallback; it costs one marshal for that one item, which is
-// what the pre-#578 path paid for EVERY item.
-func rawItemJSON(obj interface{}) ([]byte, bool) {
-	switch v := obj.(type) {
-	case *bytesObject:
-		if v == nil || len(v.raw) == 0 {
-			return nil, false
-		}
-		return v.raw, true
-	case *unstructured.Unstructured:
-		if v == nil {
-			return nil, false
-		}
-		b, err := json.Marshal(v.Object)
-		if err != nil {
-			return nil, false
-		}
-		return b, true
-	default:
-		return nil, false
-	}
+	return out, nil
 }
 
 // rawFromUnstructured marshals an already-decoded list, for the passthrough
