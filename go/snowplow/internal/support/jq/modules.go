@@ -48,7 +48,10 @@ const (
 )
 
 var (
-	//go:embed modules/*.jq
+	// A module name may contain '/': `include "krateo/architecture/v1"`
+	// loads modules/krateo/architecture/v1.jq. A `*.jq` pattern does not
+	// descend into subdirectories, so each nested directory is listed.
+	//go:embed modules/*.jq modules/krateo/architecture/*.jq
 	builtinModulesFS embed.FS
 
 	once         sync.Once

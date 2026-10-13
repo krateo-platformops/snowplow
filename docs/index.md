@@ -72,6 +72,7 @@ operating: [install on Kind](../go/snowplow/howto/install.md),
 [operating runbook](../go/snowplow/howto/operating.md),
 [export](../go/snowplow/howto/export.md),
 [health-aggregation](../go/snowplow/howto/health-aggregation.md),
+[architecture-module](../go/snowplow/howto/architecture-module.md),
 [audit-correlation](../go/snowplow/howto/audit-correlation.md),
 [developer-guide](../go/snowplow/howto/developer-guide.md) (superseded by
 CONTRIBUTING for the build flow).
