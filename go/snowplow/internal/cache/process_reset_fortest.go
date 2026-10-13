@@ -118,6 +118,13 @@ func ResetCacheProcessStateForTest() error {
 	// #471.
 	ResetImpersonationCapabilityForTest()
 
+	// 5f — #624 unrenderable-store-item counters (grand total + per-(site,gvr)
+	// cells). Process-global (recorded from list_raw.go and watcher.go, owned
+	// by neither), so the OTLP arm's "no cell before any record" check read a
+	// previous -count iteration's cell (#636). Composed rather than exempted —
+	// #471.
+	ResetUnrenderableStoreItemsForTest()
+
 	// 6 — the publish container, after the incremental rebuild has quiesced.
 	err := WaitRBACRebuildQuiesceForTest(5 * time.Second)
 	PublishRBACSnapshotForTest(nil)
