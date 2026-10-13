@@ -120,8 +120,63 @@ func TestIssue608_ChartSchemaRejectsPrivilegedOrEmptyNames(t *testing.T) {
 		if err == nil {
 			t.Fatalf("rbac.impersonateGroups=%s rendered; the schema must reject it\n%s", v, out)
 		}
-		if !strings.Contains(out, "values don't meet the specifications of the schema") {
-			t.Fatalf("rbac.impersonateGroups=%s failed for a reason other than the schema: %s", v, out)
+		assertSchemaRejectedValue(t, "rbac.impersonateGroups="+v, out)
+	}
+}
+
+// assertSchemaRejectedValue: helm failed because the VALUE broke the schema —
+// not because the schema itself is invalid. An invalid schema (e.g. a regex
+// helm's RE2 validator cannot compile) fails every render with the same
+// "values don't meet the specifications" banner, which would turn every reject
+// arm green for the wrong reason (#631: a `(?!system:)` lookahead did exactly that).
+func assertSchemaRejectedValue(t *testing.T, what, out string) {
+	t.Helper()
+	if !strings.Contains(out, "values don't meet the specifications of the schema") {
+		t.Fatalf("%s failed for a reason other than the schema: %s", what, out)
+	}
+	if strings.Contains(out, "not valid against metaschema") {
+		t.Fatalf("%s failed because values.schema.json itself is invalid, not because the value was rejected: %s", what, out)
+	}
+}
+
+// #631: every built-in `system:` group is a broad population (all authenticated
+// callers, all ServiceAccounts, all nodes, the RBAC bypass group). Impersonating
+// any of them hands the background refresher rights far beyond any one cohort, so
+// the schema refuses the whole prefix. One arm per value, so a schema that only
+// enumerates a few names fails on the first one it forgot.
+func TestIssue631_ChartSchemaRejectsSystemPrefixedGroups(t *testing.T) {
+	for _, g := range []string{
+		"system:authenticated",
+		"system:unauthenticated",
+		"system:serviceaccounts",
+		"system:serviceaccounts:krateo-system",
+		"system:nodes",
+		"system:masters",
+		"system:", // the bare prefix
+	} {
+		t.Run(g, func(t *testing.T) {
+			// Listed after an allowed group: the reject must be per item,
+			// not "the list's first entry".
+			v := `["devs","` + g + `"]`
+			_, out, err := renderSnowplowClusterRole(t, "--set-json", "rbac.impersonateGroups="+v)
+			if err == nil {
+				t.Fatalf("rbac.impersonateGroups=%s rendered; the schema must reject the system: prefix\n%s", v, out)
+			}
+			assertSchemaRejectedValue(t, "rbac.impersonateGroups="+v, out)
+		})
+	}
+}
+
+// #631 positive control: the prefix reject must not catch ordinary groups,
+// including ones that merely CONTAIN "system:" past the start, or differ in case.
+func TestIssue631_ChartSchemaAcceptsOrdinaryGroups(t *testing.T) {
+	for _, v := range []string{`["devs"]`, `["devs","team:system:ops","System:Ops"]`} {
+		cr, out, err := renderSnowplowClusterRole(t, "--set-json", "rbac.impersonateGroups="+v)
+		if err != nil {
+			t.Fatalf("rbac.impersonateGroups=%s was rejected; only the system: prefix is refused: %v\n%s", v, err, out)
+		}
+		if _, ok := impersonateRules(cr)["groups"]; !ok {
+			t.Fatalf("rbac.impersonateGroups=%s rendered no groups rule\n%s", v, out)
 		}
 	}
 }
