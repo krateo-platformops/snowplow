@@ -37,7 +37,9 @@
 // key is Forgotten and skipped (and its window marked known-stale, reason
 // suppressed). Cleared by every accepted Put (a real Put is the "next real Put"
 // the suppression waits for) and by every store eviction, so the marker cannot
-// outlive its key. A demand revalidation is not gated by it.
+// outlive its key. Since #547 (team ruling (b)) it also gates the demand and
+// background revalidations of a known-stale cell: the skip is counted on
+// known_stale_revalidation_skipped_total.
 //
 // Package-level rather than on the refresher struct so that the store's Put /
 // eviction path can clear a marker WITHOUT constructing the refresher

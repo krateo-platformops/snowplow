@@ -484,7 +484,8 @@ refresher ends in exactly one of three states, all counted:
 is converted to `{t0, stale: reason, seq}` and stays until an accepted write closes it or the cell
 leaves the store. ANY accepted write whose resolve began at or after the window's latest mark
 closes it — the refresher, a demand revalidation, a substrate read-through refill, a seed or
-keep-warm re-Put (`closeKnownStaleOnPut`: the resolve's #375 `startSeq` against the stamp's
+keep-warm re-Put, the external-TTL widget Put (an external widget whose RESTAction also reads
+Kubernetes carries the inner-call dep edge, so it is marked too) (`closeKnownStaleOnPut`: the resolve's #375 `startSeq` against the stamp's
 `seq`) — unless a refresh is in flight, whose dequeue settles it. A Put whose resolve began
 before the mark carries the pre-change body and closes nothing. Before #547 the stamp was deleted there,
 so the cell looked exactly like a fresh one — every reload was a hit on a body the system knew
@@ -524,7 +525,10 @@ cell on an identity-free class, sensitive resource, unsupported kind): marked on
 occurrence, skipped by the refresher without a resolve (the window ends known-stale, reason
 `suppressed`), cleared by the next real `Put` or any eviction. The marker is package state in
 `refresher_terminal.go`, never a field on the resident entry (`Get` hands out the live pointer;
-mutating it is a data race). A demand revalidation is not gated by it.
+mutating it is a data race). A suppressed key starts no demand or background revalidation either
+(team ruling, #547): its cold path would decline the Put by the same gate. **Residual, accepted:**
+a permanently-suppressed known-stale cell keeps serving its stale body (counted) until the next real
+Put, an eviction or its TTL.
 
 The arms are `cache/refresh_terminal_test.go` (F5a/F5b: dropped entries stay resident, served and
 known-stale; F6m: a stage-error decline never suppresses; F6s: the permanent suppression and its

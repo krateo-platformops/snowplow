@@ -988,8 +988,10 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		r.triggerGVRByKey.LoadAndDelete(key)
 		// #354 P3 — a suppressed skip ends the window unfresh. #547 — and leaves
 		// the cell KNOWN-STALE (reason suppressed): the next customer read serves
-		// it and revalidates it on demand under the requester, which suppression
-		// does not gate (a demand is not the background decline loop).
+		// it, counted. A structurally-permanent suppression starts no demand or
+		// background revalidation (team ruling (b), known_stale.go): the cold path
+		// would decline the Put by the same gate. The cell stays until the next
+		// real Put, an eviction or its TTL (the accepted residual).
 		if t0, open := r.beginWindow(key); open {
 			r.windowUnfresh(key, t0, unfreshDeclined, knownStaleSuppressed)
 		}
