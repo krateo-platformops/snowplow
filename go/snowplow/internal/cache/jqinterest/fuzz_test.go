@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -235,27 +236,47 @@ func fuzzChain(nc namedChain, seed int64, trials int, st *fuzzStats) bool {
 		}
 	}
 	// nonMember sets an item's keys so that it fails every disjunct. When
-	// every guard is literal, the oracle can decide membership. Half the time
-	// it then builds a NEAR miss: some key paths take a guard's literal value,
-	// for example name == "a" but namespace != "ns2". It keeps the near miss
-	// only if the claimed DNF still calls the item a non-member. That is the
-	// object a flat AND of two separate selects would wrongly skip (review
-	// finding 4).
+	// every guard has a literal value set, the oracle (claimedMember) can
+	// decide membership. Half the time the generator then builds a CLAIMED
+	// non-member from adversarial key values, so that the claim itself, and
+	// not only fresh strings, is tested. Each key path takes one of:
+	//  - a guard's literal value. This yields an object matching only some
+	//    guards, or only one disjunct, the object a flat AND of two selects
+	//    would wrongly skip (review finding 4);
+	//  - a value of the request extras. If the analysis dropped an extras
+	//    alternative from Values, this is a real member that the claim calls
+	//    a non-member (re-gate N4);
+	//  - a string from the programs that the guard does not list.
+	// The candidate is kept only when the claimed DNF calls it a non-member.
 	_, literalDNF := claimedMember(in.Membership, map[string]any{})
-	nonMember := func(it map[string]any) {
+	nonMember := func(it map[string]any, env emuEnv) {
 		setKeys(it)
 		if !literalDNF || r.Intn(2) == 0 {
 			return
 		}
+		var extrasVals []any
+		for _, v := range env.extras {
+			extrasVals = append(extrasVals, v)
+		}
+		sort.Slice(extrasVals, func(i, j int) bool { return fmt.Sprint(extrasVals[i]) < fmt.Sprint(extrasVals[j]) })
 		near := deepCopy(it).(map[string]any)
 		for _, d := range in.Membership.Disjuncts {
 			for _, k := range d {
-				if r.Intn(2) == 0 {
-					var keys []string
-					for _, s := range k.Path {
-						keys = append(keys, s.Key)
-					}
+				var keys []string
+				for _, s := range k.Path {
+					keys = append(keys, s.Key)
+				}
+				switch r.Intn(4) {
+				case 0:
 					setPath(near, keys, deepCopy(k.Values[r.Intn(len(k.Values))]))
+				case 1:
+					if len(extrasVals) > 0 {
+						setPath(near, keys, deepCopy(extrasVals[r.Intn(len(extrasVals))]))
+					}
+				case 2:
+					if len(g.v.strs) > 0 {
+						setPath(near, keys, g.pick(g.v.strs))
+					}
 				}
 			}
 		}
@@ -292,7 +313,7 @@ func fuzzChain(nc namedChain, seed int64, trials int, st *fuzzStats) bool {
 			items = append(items, it)
 		}
 		nm := g.item()
-		nonMember(nm)
+		nonMember(nm, env)
 		pos := r.Intn(len(items) + 1)
 		withNM := append(append(append([]any{}, items[:pos]...), nm), items[pos:]...)
 		var before, after []any
@@ -304,7 +325,7 @@ func fuzzChain(nc namedChain, seed int64, trials int, st *fuzzStats) bool {
 			before, after, bDesc, aDesc = withNM, items, nm, "absent"
 		default: // UPDATE of a non-member, anything but its key
 			nm2 := g.mutate(nm, in.Reads)
-			nonMember(nm2)
+			nonMember(nm2, env)
 			after = append(append(append([]any{}, items[:pos]...), nm2), items[pos:]...)
 			before, bDesc, aDesc = withNM, nm, nm2
 		}
@@ -385,7 +406,7 @@ func TestF14_DifferentialFuzz_PortalCorpus(t *testing.T) {
 	t.Logf("F14: read-set trials=%d (projection-equal %d, projection-changed %d of which output-changed %d), membership trials=%d, emulations=%d",
 		st.trials, st.eqTrials, st.neTrials, st.neDiff, st.memberTrials, st.emulations)
 	t.Logf("F14: read-set emulations that resolved OK=%d, that hit the stage-filter-error fallback=%d", st.okRuns, st.fallbackRuns)
-	t.Logf("F14: membership trials whose non-member has an ABSENT key (no label / no namespace)=%d, near-miss non-members (some guards matched)=%d; trials with an extras key equal to the tracked stage=%d",
+	t.Logf("F14: membership trials whose non-member has an ABSENT key (no label / no namespace)=%d, oracle-built claimed non-members (guard / extras / program values)=%d; trials with an extras key equal to the tracked stage=%d",
 		st.absentMemberTrials, st.nearMissTrials, st.extrasCollisions)
 	if st.absentMemberTrials == 0 || st.extrasCollisions == 0 {
 		t.Errorf("vacuous fuzz: absent-key non-member trials=%d, extras/stage collisions=%d", st.absentMemberTrials, st.extrasCollisions)

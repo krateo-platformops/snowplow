@@ -105,11 +105,26 @@ type KeyGuard struct {
 	// ConstSource is a printable description of the constant.
 	ConstSource string
 	// Values, when non-nil, is the complete set of values the constant can
-	// take. It is set when every alternative is a literal, for example the
-	// stream ("a", "b"): the guard then admits an object whose key is any of
-	// them. When it is nil, the value comes from the cell constants at run
-	// time (ConstClass extras) and ConstSource describes where.
+	// take. It is set when every alternative folds to a literal: the stream
+	// ("a", "b"), or the object {"app": "x"}. The guard then admits an object
+	// whose key equals any of them.
+	//
+	// When Values is nil, ConstClass is ALWAYS "extras": the constant is
+	// computed from the request extras (already in the cell key), and PR-2
+	// evaluates ConstSource's expression against them at record time.
+	// interest() enforces this: a guard that is neither literal-folded nor
+	// extras-derived (an array literal, another stage's data) makes the whole
+	// membership unknown. The claim is then dropped and recorded in
+	// MembershipBlockers, never narrowed. See Decidable.
 	Values []any
+}
+
+// Decidable reports whether PR-2 can decide this guard for an object: by
+// Values, or by evaluating an extras-derived constant. Every guard of a
+// claimed Membership is Decidable (interest() enforces it, and
+// TestKeyGuard_EveryClaimedGuardIsDecidable pins it).
+func (k KeyGuard) Decidable() bool {
+	return k.Values != nil || k.ConstClass == ccExtras.String()
 }
 
 func (k KeyGuard) String() string {
@@ -189,10 +204,23 @@ func (s *state) interest() Interest {
 	}
 	out := Interest{Reads: normalizeReads(items)}
 	if len(s.guards) > 0 {
-		if len(s.violations) == 0 {
-			out.Membership = &Membership{Disjuncts: dedupDisjuncts(s.guards)}
-		} else {
+		var undecidable []string
+		for _, d := range s.guards {
+			for _, k := range d {
+				if !k.Decidable() {
+					undecidable = append(undecidable, "undecidable key constant: "+k.String())
+				}
+			}
+		}
+		switch {
+		case len(s.violations) > 0:
 			out.MembershipBlockers = append([]string(nil), s.violations...)
+		case len(undecidable) > 0:
+			// One undecidable disjunct makes membership unknown: an
+			// object it admits could not be told apart from a non-member.
+			out.MembershipBlockers = undecidable
+		default:
+			out.Membership = &Membership{Disjuncts: dedupDisjuncts(s.guards)}
 		}
 	}
 	return out

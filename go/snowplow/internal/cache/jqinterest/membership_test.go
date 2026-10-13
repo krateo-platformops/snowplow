@@ -3,6 +3,7 @@ package jqinterest
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
@@ -133,4 +134,74 @@ func TestMembership_ReviewerShapes(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestKeyGuard_EveryClaimedGuardIsDecidable pins the KeyGuard contract
+// (re-gate C2): every guard of a claimed Membership is Decidable. Its
+// literal value set is known, or its constant is extras-derived. A constant
+// object folds into Values. A guard that is neither (an array literal) drops
+// the whole claim into MembershipBlockers.
+func TestKeyGuard_EveryClaimedGuardIsDecidable(t *testing.T) {
+	obj := Analyze(oneStage(`[.s.items[] | select(.metadata.labels == {"app": "x"})]`, ""), jqsupport.ModuleLoader())
+	if obj.Membership == nil {
+		t.Fatalf("constant-object guard: no membership: %s", obj)
+	}
+	k := obj.Membership.Disjuncts[0][0]
+	if k.ConstClass != "literal" || len(k.Values) != 1 || !jsonEqual(k.Values[0], map[string]any{"app": "x"}) {
+		t.Errorf(`labels == {"app":"x"} must fold into Values: %s (class %s)`, k, k.ConstClass)
+	}
+	for _, it := range []struct {
+		labels map[string]any
+		member bool
+	}{{map[string]any{"app": "x"}, true}, {map[string]any{"app": "y"}, false}, {map[string]any{"app": "x", "b": "c"}, false}} {
+		item := map[string]any{"metadata": map[string]any{"name": "o", "namespace": "ns1", "labels": it.labels}}
+		if m, known := claimedMember(obj.Membership, item); !known || m != it.member {
+			t.Errorf("labels %v: claimed member=%v known=%v, want %v", it.labels, m, known, it.member)
+		}
+	}
+	// Constants that are literal-class but do not fold: an array literal,
+	// and a literal computed by a builtin. Both are bound outside the select,
+	// so the guard is recognised, and then refused as undecidable.
+	for _, prog := range []string{
+		`["a"] as $c | [.s.items[] | select(.metadata.name == $c)]`,
+		`("A" | ascii_downcase) as $c | [.s.items[] | select(.metadata.name == $c)]`,
+	} {
+		in := Analyze(oneStage(prog, ""), jqsupport.ModuleLoader())
+		if in.Membership != nil {
+			t.Errorf("%s: an undecidable guard must not claim membership: %s", prog, in)
+		}
+		blocked := false
+		for _, b := range in.MembershipBlockers {
+			blocked = blocked || strings.HasPrefix(b, "undecidable key constant")
+		}
+		if !blocked {
+			t.Errorf("%s: the refusal must be recorded as an undecidable-constant blocker: %v (%s)", prog, in.MembershipBlockers, in)
+		}
+	}
+	// The contract over everything the package analyses: corpus chains,
+	// mutable-UAF variants, and every arm.
+	_, chains := loadCorpus(t)
+	chains = append(chains, uafVariants(chains)...)
+	for _, a := range soundnessArms() {
+		chains = append(chains, namedChain{name: a.name, chain: a.chain})
+	}
+	claims := 0
+	for _, nc := range chains {
+		in := Analyze(nc.chain, jqsupport.ModuleLoader())
+		if in.Membership == nil {
+			continue
+		}
+		claims++
+		for _, d := range in.Membership.Disjuncts {
+			for _, k := range d {
+				if !k.Decidable() {
+					t.Errorf("%s: claimed guard is not decidable: %s (class %s)", nc.name, k, k.ConstClass)
+				}
+			}
+		}
+	}
+	if claims == 0 {
+		t.Fatal("no membership claims checked")
+	}
+	t.Logf("membership claims checked: %d, every guard decidable", claims)
 }

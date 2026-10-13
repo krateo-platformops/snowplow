@@ -98,6 +98,9 @@ func soundnessArms() []arm {
 			oneStage(`[.s.items[] | select(.metadata.name == "a") | .spec.v]`, "")},
 		{"R5: has(k) observes the key set, not only the kind", mutHasAsKind,
 			oneStage(`[.s.items[] | .spec | has("x")]`, "")},
+		// reviewer-603 re-gate (C1).
+		{"N4: a key constant with a non-literal alternative has no literal value set", mutLiteralValuesSkip,
+			oneStage(`.extras.name as $n | [.s.items[] | select(.metadata.name == ("zzz", $n))]`, "")},
 	}
 }
 
@@ -129,7 +132,35 @@ func sortWitness() *[2]map[string]any {
 
 // witnessCounterexample reports whether the arm's witness UPDATE keeps the
 // projection while changing the output.
+type memberWitnessCase struct {
+	env           emuEnv
+	before, after map[string]any
+}
+
+// memberWitness: per mutation, an object that the claimed membership must
+// not call a non-member, the extras that make it a member, and an UPDATE of
+// it. The witness fires when the oracle claims a non-member and the UPDATE
+// changes the real output.
+func memberWitness() map[string]memberWitnessCase {
+	return map[string]memberWitnessCase{
+		// re-gate N4: name == ("zzz", $n) with extras.name = "a" admits "a".
+		mutLiteralValuesSkip: {emuEnv{identity: 1, extras: map[string]any{"name": "a"}},
+			advItem("a", "ns1", map[string]any{"v": "1"}), advItem("a", "ns1", map[string]any{"v": "2"})},
+	}
+}
+
 func witnessCounterexample(a arm) bool {
+	if mw, ok := memberWitness()[a.mutation]; ok {
+		in := Analyze(a.chain, jqsupport.ModuleLoader())
+		if in.Membership != nil {
+			if m, known := claimedMember(in.Membership, mw.before); known && !m {
+				x, y := emulate(a.chain, []any{mw.before}, mw.env), emulate(a.chain, []any{mw.after}, mw.env)
+				if (okOutcome(x) || okOutcome(y)) && !sameOutcome(x, y) {
+					return true
+				}
+			}
+		}
+	}
 	w := armWitness()[a.mutation]
 	if w == nil {
 		return false

@@ -288,8 +288,13 @@ func (s *state) keyConjunct(q *gojq.Query, in *abs, inst int, e *env) (KeyGuard,
 }
 
 // literalValues returns every value a constant can take when each of its
-// alternatives is a literal (a stream such as ("a", "b") is a union), and nil
-// otherwise.
+// alternatives folds to a literal, and nil otherwise. A stream such as
+// ("a", "b") is a union, and a constant object such as {"app": "x"} folds
+// when each of its fields folds to exactly one literal. A single alternative
+// that does not fold (an extras value, an array, another stage's data) makes
+// the whole set unknown. Skipping that alternative would drop a value the
+// guard admits, so its objects would be wrongly called non-members (the
+// re-gate's N4).
 func literalValues(a *abs) []any {
 	var out []any
 	var walk func(x *abs) bool
@@ -297,10 +302,16 @@ func literalValues(a *abs) []any {
 		switch x.k {
 		case aConst:
 			if !x.hasLit || x.cc != ccLiteral {
-				return false
+				return mutated(mutLiteralValuesSkip)
 			}
 			out = append(out, x.lit)
 			return true
+		case aObj:
+			if v, ok := foldObject(x); ok {
+				out = append(out, v)
+				return true
+			}
+			return mutated(mutLiteralValuesSkip)
 		case aUnion:
 			for _, y := range x.alts {
 				if !walk(y) {
@@ -309,12 +320,36 @@ func literalValues(a *abs) []any {
 			}
 			return true
 		}
-		return false
+		return mutated(mutLiteralValuesSkip)
 	}
 	if !walk(a) || len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// foldObject folds a constant object whose fields are each exactly one
+// literal (no computed keys) into its value.
+func foldObject(x *abs) (map[string]any, bool) {
+	if x.k != aObj || x.rest != nil {
+		return nil, false
+	}
+	m := make(map[string]any, len(x.fields))
+	for k, f := range x.fields {
+		switch {
+		case f.k == aConst && f.hasLit && f.cc == ccLiteral:
+			m[k] = f.lit
+		case f.k == aObj:
+			v, ok := foldObject(f)
+			if !ok {
+				return nil, false
+			}
+			m[k] = v
+		default:
+			return nil, false
+		}
+	}
+	return m, true
 }
 
 func constSource(a *abs) string {

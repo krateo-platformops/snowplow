@@ -29,6 +29,7 @@ const (
 	mutKeyFlatAND          = "key-flat-and"          // guards from separate selects are read as ONE conjunction
 	mutKeyNotRead          = "key-not-read"          // the key field of a select guard is not recorded in the read set (R2)
 	mutHasAsKind           = "has-as-kind"           // has(k) observes only the kind of its input (R5)
+	mutLiteralValuesSkip   = "literal-values-skip"   // a key constant's non-literal alternative is SKIPPED instead of making Values unknown (N4)
 	mutRRTNotStrict        = "rrt-not-strict"        // resourcesRefs fields not analysed strictly
 	mutOtherStagesSkip     = "other-stages-skipped"  // other stages' templates reading the list are ignored
 	mutDelExclParent       = "del-excl-parent"       // del(.a.b) excludes .a (too wide)
