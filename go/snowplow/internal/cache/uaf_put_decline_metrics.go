@@ -59,11 +59,23 @@ var (
 	// THREE Put sites through the ONE shared helper (dispatchers.declineUAFPut):
 	// the customer dispatch Put, the refresher re-Put, and the boot seed.
 	restactionsUAFPutDeclinedTotal atomic.Uint64
-	// raFullListUAFBypassTotal counts raFullList serve-path entries bypassed
-	// because the apiRef'd RESTAction declares a userAccessFilter stage — the
-	// apiRef path then resolves per request instead of serving (or populating)
-	// the per-binding shared cell.
-	raFullListUAFBypassTotal atomic.Uint64
+	// raFullListUAFCachedTotal counts raFullList cells STORED carrying a
+	// userAccessFilter-narrowed body (ACCEPTED writes only — a generation-refused
+	// PutIfGen stored nothing and must not count).
+	//
+	// #592 REPLACED snowplow_ra_full_list_uaf_bypass_total WITH THIS, and the
+	// replacement is the point rather than a rename. The old counter measured the
+	// 1.12.3 bypass; removing the bypass would have pinned it at 0 forever, and a
+	// counter whose zero reads as health is not a detector — an operator reading
+	// "0 bypasses" could not tell "the bypass is gone" from "the bypass never
+	// fired". Inverting it to count what the change ENABLES keeps the signal
+	// non-vacuous: 0 here, with UAF RESTActions live, means the carrier is not
+	// caching and #592 has regressed.
+	//
+	// It is also the acceptance number. On 057, 31 RESTActions declare a
+	// userAccessFilter and 35,328 bypasses were recorded in the window that
+	// motivated this; after the roll this counter should move in their place.
+	raFullListUAFCachedTotal atomic.Uint64
 	// widgetsUAFPutDeclinedTotal counts widgets-class (and widgetContent-class)
 	// Puts declined because the resolve OBSERVED a userAccessFilter refilter —
 	// the R-1 carrier. A separate counter from the restactions one because it is
@@ -82,11 +94,13 @@ func BumpRestactionsUAFPutDeclined() { restactionsUAFPutDeclinedTotal.Add(1) }
 // Put-decline count.
 func RestactionsUAFPutDeclined() uint64 { return restactionsUAFPutDeclinedTotal.Load() }
 
-// BumpRAFullListUAFBypass increments the raFullList UAF bypass counter.
-func BumpRAFullListUAFBypass() { raFullListUAFBypassTotal.Add(1) }
+// BumpRAFullListUAFCached increments the raFullList UAF-cached counter. Called
+// from the two raFullList store Puts on an ACCEPTED write of a HasUAF cell.
+func BumpRAFullListUAFCached() { raFullListUAFCachedTotal.Add(1) }
 
-// RAFullListUAFBypass returns the process-wide raFullList UAF bypass count.
-func RAFullListUAFBypass() uint64 { return raFullListUAFBypassTotal.Load() }
+// RAFullListUAFCached returns the process-wide count of raFullList cells stored
+// with a userAccessFilter-narrowed body.
+func RAFullListUAFCached() uint64 { return raFullListUAFCachedTotal.Load() }
 
 // BumpWidgetsUAFPutDeclined increments the widgets/widgetContent UAF
 // Put-decline counter (the R-1 carrier). Called only from the shared decline
@@ -102,7 +116,7 @@ func WidgetsUAFPutDeclined() uint64 { return widgetsUAFPutDeclinedTotal.Load() }
 // did. Production callers MUST NOT use this.
 func ResetUAFPutDeclineCountersForTest() {
 	restactionsUAFPutDeclinedTotal.Store(0)
-	raFullListUAFBypassTotal.Store(0)
+	raFullListUAFCachedTotal.Store(0)
 	widgetsUAFPutDeclinedTotal.Store(0)
 }
 
@@ -126,8 +140,8 @@ func registerUAFPutDeclineMetrics() {
 		expvar.Publish("snowplow_restactions_uaf_put_declined_total", expvar.Func(func() any {
 			return RestactionsUAFPutDeclined()
 		}))
-		expvar.Publish("snowplow_ra_full_list_uaf_bypass_total", expvar.Func(func() any {
-			return RAFullListUAFBypass()
+		expvar.Publish("snowplow_ra_full_list_uaf_cached_total", expvar.Func(func() any {
+			return RAFullListUAFCached()
 		}))
 		expvar.Publish("snowplow_widgets_uaf_put_declined_total", expvar.Func(func() any {
 			return WidgetsUAFPutDeclined()

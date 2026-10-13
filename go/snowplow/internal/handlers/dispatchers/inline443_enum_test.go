@@ -95,8 +95,20 @@ var cacheAllow443 = map[string]cacheClass443{
 	"GVRFor":     clusterFact443,
 	"KindForGVR": clusterFact443,
 	// --- telemetry ------------------------------------------------------------
-	"BumpRAFullListUAFBypass":           telemetry443,
-	"BumpUAFTouched":                    telemetry443, // request-scoped UAF-touched sink
+	// #592 — BumpRAFullListUAFBypass was REMOVED from this map rather than
+	// renamed. It used to be called from apiref's bypass, on the resolve path.
+	// Its replacement (BumpRAFullListUAFCached) is called from INSIDE the two
+	// raFullList store Puts, so it is no longer reached from this path at all and
+	// a renamed entry would have been flagged stale — correctly.
+	"BumpUAFTouched": telemetry443, // request-scoped UAF-touched sink
+	// #592 — the OBSERVED limb of the raFullList UAF stamp reads the sink that
+	// BumpUAFTouched writes. Both are pure reads (nil-receiver-safe, no store,
+	// informer, dep or refresher state), strictly weaker than the bump already
+	// classified above, so an inert resolve may run them: it changes nothing an
+	// inert ctx must not change, and the Put they inform refuses under Inert
+	// anyway.
+	"UAFTouchedSinkFromContext": telemetry443,
+	"UAFTouchedSink.Count":      telemetry443,
 	"RecordApiserverFallthrough":        telemetry443,
 	"RecordClusterListCellColdFallback": telemetry443,
 	"RecordClusterListCellWarm":         telemetry443,

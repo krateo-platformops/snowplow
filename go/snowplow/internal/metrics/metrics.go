@@ -527,9 +527,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
-	uafRAFullListBypass, err := m.Int64ObservableCounter(
-		"snowplow_ra_full_list_uaf_bypass_total",
-		metric.WithDescription("raFullList serves that bypassed the UAF-narrowed cache path (A-1 mitigation)."))
+	uafRAFullListCached, err := m.Int64ObservableCounter(
+		"snowplow_ra_full_list_uaf_cached_total",
+		metric.WithDescription("raFullList cells stored holding a userAccessFilter-narrowed body (#592; replaces snowplow_ra_full_list_uaf_bypass_total, which #592 pinned at zero)."))
 	if err != nil {
 		return err
 	}
@@ -898,7 +898,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- 1.12.4: A-1 UAF Put declines ---
 		o.ObserveInt64(uafRestactionsDeclined, int64(cache.RestactionsUAFPutDeclined()))
 		o.ObserveInt64(uafWidgetsDeclined, int64(cache.WidgetsUAFPutDeclined()))
-		o.ObserveInt64(uafRAFullListBypass, int64(cache.RAFullListUAFBypass()))
+		o.ObserveInt64(uafRAFullListCached, int64(cache.RAFullListUAFCached()))
 
 		// --- 1.12.4: the two cell families, capped ---
 		//
@@ -1043,7 +1043,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		upstreamControllers, upstreamWebhooks,
 		raFullListServe, bindingsDeltaSkipped,
 		// --- 1.12.4 ---
-		uafRestactionsDeclined, uafWidgetsDeclined, uafRAFullListBypass,
+		uafRestactionsDeclined, uafWidgetsDeclined, uafRAFullListCached,
 		dispatchL1Cells, seedAttributableHits,
 		// --- #386 M3 (PR2) ---
 		customerResolveInflight,

@@ -275,32 +275,37 @@ func raFullListServe(
 		return nil, false, nil // cache off — fall back
 	}
 
-	// 1.12.3 A-1 (SECURITY, cross-tenant) — BYPASS the whole RAFullList layer for
-	// a RESTAction that declares a userAccessFilter stage. The cell this path
-	// serves AND populates holds the RA's full resolve output, UAF refilter
-	// INCLUDED, under a key that folds the RA-CR's first-match BindingUID ALONE
-	// (seedFullListRAKey → RAFullListKeyInputs — at the time no RBACSubGen, which
-	// #435 has since folded in; still no UAF scope). So two co-bound users with divergent
-	// per-object narrowings key onto ONE cell and the second is served the first
-	// one's rows — the same defect the three restactions Put sites now decline,
-	// with fewer defences in front of it.
+	// #592 — THE 1.12.3 A-1 BYPASS WAS REMOVED HERE. It used to refuse this whole
+	// layer (served=false) for a RESTAction declaring a userAccessFilter, before
+	// deriving a key, on this reasoning: the cell holds the RA's full resolve
+	// output with the UAF refilter INCLUDED, under a key folding "the RA-CR's
+	// first-match BindingUID ALONE", so two co-bound users with divergent
+	// per-object narrowings keyed onto ONE cell and the second was served the
+	// first one's rows.
 	//
-	// Returning served=false is the ESTABLISHED fall-back contract of this
-	// function (identical to the not-sliceable and no-identity exits above and
-	// below): apiref.Resolve falls straight through to the page-keyed
-	// resolveRA(ctx, PerPage, Page) under the REQUEST'S OWN identity, so the
-	// caller still gets a correct, freshly-narrowed page. Placed FIRST, before
-	// the key derivation and the sliceability memo, so a UAF RA touches neither
-	// the cell nor the verdict store on either the serve or the populate side —
-	// there is nothing left to leak from. The predicate is the one shared
-	// RESTAction.HasUserAccessFilterStage (nil-receiver-safe), the same call the
-	// dispatchers' declineUAFPut gate stamps HasUAF from.
+	// That stopped being the key. seedFullListRAKey below builds the inputs via
+	// RAFullListKeyInputs, which calls SetIdentity with the FULL IdentityClass —
+	// the #423 SubjectBindingSet digest and the #435 sub-generation, not the
+	// BindingUID alone — and CacheEntryClassRAFullList is not in
+	// identityFreeClasses, so ComputeKey writes that identity segment. raFullList
+	// folds exactly the material restactions and widgets fold, and #561 already
+	// shipped and measured this same argument on those two classes (see
+	// dispatchers/uaf_shortttl.go for the full statement, and #588 for the
+	// falsifier: a userAccessFilter cannot narrow on the REQUESTER — the CRD
+	// admits only group/resource/resourcesFrom/nameFrom/namespaceFrom/verb and
+	// the two *From fields are JQ paths over each RETURNED object — so equal
+	// binding sets give equal verdicts and byte-identical bodies).
 	//
-	// 1.13.0 removes this bypass when the UAF-scope digest lands in the key (v7).
-	if ra.HasUserAccessFilterStage() {
-		cache.BumpRAFullListUAFBypass()
-		return nil, false, nil
-	}
+	// #561 named raFullList identity-bound and no-longer-declined, but it fixed
+	// the shared Put-decline GATE; this was a SECOND, EARLIER mechanism reading
+	// the declaration predicate directly, and it outlived the gate by one release.
+	//
+	// WHAT REPLACES IT is not nothing: the cell cannot leak (two requesters
+	// deserving different rows hold different keys) but it CAN go stale, because
+	// the key folds the requester's bindings and not the per-object verdicts the
+	// refilter re-evaluates. That is what the #118 (d) short cap bounds, so
+	// HasUAF is stamped below and both tail Puts derive UAFTTLOverrideForEntry
+	// from it — the identical treatment every other identity-bound carrier gets.
 
 	// Ship 0.30.242 H.c-layered Phase 2b (§3.3 raFullList row) + #42 G2-A: the
 	// RAFullList cell keys on the RA-CR's GET-permit first-match BindingUID,
@@ -319,6 +324,36 @@ func raFullListServe(
 	keyInputs, raKey, ok := seedFullListRAKey(ctx, gvr, namespace, name, extras)
 	if !ok {
 		return nil, false, nil
+	}
+
+	// #592 / #118 (d) — the DECLARED limb of the UAF stamp. Set here, on the
+	// inputs BOTH tail Puts write, so the cell this path populates carries the
+	// short cap. HasUAF is deliberately NOT folded into ComputeKey (resolved.go),
+	// so stamping it after seedFullListRAKey leaves raKey byte-identical to what
+	// the FIX-G seed pre-check and raKeyClassCurrent derive from the same
+	// function — the key-parity those three share is load-bearing and this must
+	// not perturb it.
+	//
+	// The OBSERVED limb is stamped per-Put below, from the UAFTouchedSink delta
+	// across the unpaginated resolve: an RA that declares no userAccessFilter of
+	// its own but NESTS one produces a narrowed body this declaration cannot see
+	// (R-1: two signals, because one was not enough). A DELTA rather than a
+	// Count() > 0 test because this ctx's sink may be INHERITED from the widget
+	// resolve above and already carry that resolve's own refilters — reading the
+	// absolute count would stamp cells this path's resolve never narrowed.
+	keyInputs.HasUAF = ra.HasUserAccessFilterStage()
+	uafSink := cache.UAFTouchedSinkFromContext(ctx)
+	uafBefore := int64(0)
+	if uafSink != nil {
+		uafBefore = uafSink.Count()
+	}
+	// stampObservedUAF folds the observed limb into keyInputs immediately before a
+	// Put. Idempotent and monotonic (it only ever sets the flag), so the two Put
+	// sites cannot disagree about the cell they write.
+	stampObservedUAF := func() {
+		if uafSink != nil && uafSink.Count() > uafBefore {
+			keyInputs.HasUAF = true
+		}
 	}
 
 	// #323 — capture the raKey cell's generation ONCE here, BEFORE either
@@ -481,6 +516,10 @@ func raFullListServe(
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
+		// #592 — observed limb, immediately before the write (the unpaginated
+		// resolve that built `full` has run by now, so a nested refilter has
+		// bumped the sink).
+		stampObservedUAF()
 		if c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0) {
 			// #375 C3 — under fullCtx (the Put's sink; it chains to the widget sink, which
 			// still receives the dep), so an RA edit in [Put-check, Record) is re-checked.
@@ -634,6 +673,8 @@ func raFullListServe(
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sGo, true, nil
 	}
+	// #592 — observed limb, twin of the repopulate branch above.
+	stampObservedUAF()
 	c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0)
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
 	return sGo, true, nil

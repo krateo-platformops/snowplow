@@ -62,13 +62,63 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 	}
 	pin := int64(len(encoded)) >= raFullListPinBytesThreshold()
 	in := inputs // copy onto the heap for the entry
-	// uaf-scope-waiver: UNREACHABLE for a refilter-narrowed body. The only caller is apiref.raFullListServe, which bypasses this whole layer (returns served=false) for a RESTAction declaring a userAccessFilter BEFORE it derives the key — so no refilter output can arrive here. Falsified by TestA1_RAFullList_UAFBypassesCell_ControlServes (no cell under the derived raKey) and the warm-cell ordering arm.
-	// scope-waiver:TTLOverride: raFullList-class cell — 1.12.3 A-1 CORRECTED WAIVER. The pre-1.12.3 text claimed UAF refilter output "lands in the per-page restactions cell, never here"; that was WRONG (this cell holds the apiRef'd RA's own full resolve output, UAF stage included, keyed on BindingUID ALONE — no RBACSubGen). A UAF-bearing RA can no longer REACH this Put: raFullListServe bypasses the whole layer for it (ra_full_list.go), so every cell written here is non-UAF and needs no UAF cap. Pinned/TTL governed by the 4a resident-budget path. Revisit when 1.13.0 folds the UAF scope into the key (uaf_shortttl.go R-d-4 SITE MAP, "THE FOURTH SITE").
+	// #592 — BOTH PRIOR WAIVERS HERE WERE WITHDRAWN, because both rested on the
+	// raFullListServe bypass that #592 removed. They read "UNREACHABLE for a
+	// refilter-narrowed body ... the only caller bypasses this whole layer for a
+	// RESTAction declaring a userAccessFilter BEFORE it derives the key" and
+	// "every cell written here is non-UAF and needs no UAF cap". A narrowed body
+	// now reaches this Put BY DESIGN, so neither sentence is true any more. (This
+	// is the third time a waiver outlived the gate it cited — #561 withdrew the
+	// widgets.go and seedOneWidget pair for the same reason. Grep the waivers
+	// citing a gate before scoping it.)
+	//
+	// WHAT MAKES IT SAFE is not the bypass but the key: raFullList is
+	// identity-BOUND (not in identityFreeClasses), and RAFullListKeyInputs folds
+	// the #423 SubjectBindingSet digest + #435 sub-gen via SetIdentity, so two
+	// requesters owed different narrowings occupy different cells (#588, and the
+	// #561 argument this class was named in but not reached by).
+	//
+	// WHAT IS STILL EXPOSED is staleness, not leakage: the key folds the
+	// requester's bindings, not the per-object verdicts the refilter re-evaluates,
+	// so an out-of-band RBAC change makes that requester's OWN view wrong with
+	// nothing to evict it. UAFTTLOverrideForEntry caps exactly that window, from
+	// the HasUAF the caller stamps (declared + observed limbs, ra_full_list.go).
+	// It returns 0 for a non-UAF cell, so every non-UAF raFullList cell keeps the
+	// standard TTL and the 4a resident-budget pin path is unchanged.
+	//
+	// uaf-scope-waiver: CAPPED HERE, STAMPED BY THE CALLER — the one disposition
+	// TestA1_EveryResolvedEntryPutSiteIsUAFGatedOrWaived cannot see, because it
+	// matches at FUNCTION granularity and this is the first Put site whose two
+	// halves sit either side of a package boundary. The cap is local and
+	// unconditional (UAFTTLOverrideForEntry immediately below); the stamp is
+	// apiref.raFullListServe's, which sets inputs.HasUAF from the declaration on
+	// the RA it holds and from the UAFTouchedSink delta across its resolve — a
+	// frame this package cannot reach and the guard cannot follow.
+	//
+	// WHY THIS IS NOT THE WAIVER SHAPE #592 JUST WITHDREW TWICE. Those asserted
+	// "unreachable, because a gate elsewhere refuses" — a claim about someone
+	// else's control flow, which went silently false the moment that gate was
+	// removed. This asserts "the cap is here and the stamp is the caller's", and
+	// it is backed by a live arm rather than by structure: deleting the caller's
+	// stamp turns TestA1_RAFullList_UAFCrossUser_NoSharedCellServe RED on the
+	// TTLOverride assertion (mutation 2 of the #592 falsifier), and making the
+	// observed limb inert turns the ObservedUAFLimb arm RED (mutation 8). A
+	// waiver whose failure mode is covered by a test that fails cannot rot
+	// quietly; one that reasons about a gate can.
+	//
+	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — see the paragraphs above.
 	c.Put(key, &ResolvedEntry{
-		RawJSON: encoded,
-		Inputs:  &in,
-		Pinned:  pin,
+		RawJSON:     encoded,
+		Inputs:      &in,
+		Pinned:      pin,
+		TTLOverride: UAFTTLOverrideForEntry(&in),
 	})
+	// #592 acceptance signal — counted AFTER the write, so it measures cells that
+	// exist rather than Puts attempted. Put is unconditional, so every HasUAF cell
+	// reaching here is stored.
+	if in.HasUAF {
+		BumpRAFullListUAFCached()
+	}
 	return encoded, pin
 }
 
@@ -97,13 +147,35 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, key string,
 	}
 	pin := int64(len(encoded)) >= raFullListPinBytesThreshold()
 	in := inputs // copy onto the heap for the entry
-	// uaf-scope-waiver: UNREACHABLE for a refilter-narrowed body — twin of PutRAFullList above. The only caller is apiref.raFullListServe, which bypasses this whole layer (returns served=false) for a RESTAction declaring a userAccessFilter BEFORE it derives the key, so no refilter output can arrive here. The #323 generation guard does not change the UAF-scope reasoning — it is the same identity-free cell as PutRAFullList (uaf_shortttl.go R-d-4 SITE MAP).
-	// scope-waiver:TTLOverride: raFullList-class cell — identical class + reasoning to PutRAFullList above (a UAF-bearing RA can no longer reach this Put; raFullListServe bypasses the whole layer for it before deriving the key), uaf_shortttl.go R-d-4 SITE MAP "THE FOURTH SITE".
-	return c.PutIfGen(ctx, key, &ResolvedEntry{
-		RawJSON: encoded,
-		Inputs:  &in,
-		Pinned:  pin,
+	// #592 — twin of PutRAFullList above: both prior waivers withdrawn, same
+	// reason (they cited the removed bypass), same cap from the same single
+	// derivation. The #323 generation guard is orthogonal to the UAF scope — it
+	// governs WHETHER this write lands, not what the body is narrowed by.
+	//
+	// Note the prior waiver also called this "the same identity-free cell as
+	// PutRAFullList". That was wrong twice over: raFullList is identity-BOUND
+	// (ComputeKey writes its identity segment), and being identity-bound is
+	// precisely why the body may be cached at all.
+	//
+	// CAPPED HERE, STAMPED BY THE CALLER — twin of PutRAFullList above; see its
+	// waiver for why this shape is not the one #592 withdrew. Same single caller
+	// (apiref.raFullListServe), same two stamp limbs, same arms holding it up.
+	//
+	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — twin of PutRAFullList above.
+	stored := c.PutIfGen(ctx, key, &ResolvedEntry{
+		RawJSON:     encoded,
+		Inputs:      &in,
+		Pinned:      pin,
+		TTLOverride: UAFTTLOverrideForEntry(&in),
 	}, capturedGen)
+	// #592 acceptance signal — gated on `stored`, NOT on reaching the Put: a
+	// generation-REFUSED write (a DELETE-eviction bumped the gen during the
+	// resolve) stored no cell, and counting it would report cached UAF bodies
+	// that do not exist.
+	if stored && in.HasUAF {
+		BumpRAFullListUAFCached()
+	}
+	return stored
 }
 
 // #323 — PutRAFullListPinned (an explicit-pin RAFullList re-Put) was REMOVED

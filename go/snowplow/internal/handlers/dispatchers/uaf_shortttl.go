@@ -73,15 +73,31 @@
 // on the identity-free one.
 //
 // THE CARRIERS: restactions (dispatch, refresher, seed), widgets (dispatch,
-// seed), widgetContent (walker populate + pagination drain), raFullList
-// (bypassed at raFullListServe — see the RESIDUAL below).
+// seed), widgetContent (walker populate + pagination drain), raFullList (serve
+// + populate at raFullListServe — #592).
 //
-// RESIDUAL, NOT FIXED HERE (#561 follow-up): raFullListServe still bypasses the
-// whole RAFullList layer for a declaring RA, by its own predicate rather than
-// through this gate. raFullList IS identity-bound and its key folds the same
-// #423 binding-set digest (RAFullListKeyInputs), so the #561 argument applies to
-// it unchanged — but lifting that bypass is a separate change to a separate
-// mechanism and is not in this one.
+// #592 CLOSED THE RESIDUAL #561 LEFT HERE. This paragraph used to read: "raFull-
+// ListServe still bypasses the whole RAFullList layer for a declaring RA, by its
+// own predicate rather than through this gate ... lifting that bypass is a
+// separate change to a separate mechanism and is not in this one." It was the
+// right scoping call for #561 and the wrong thing to leave standing for a
+// release: the bypass was a SECOND mechanism implementing a posture this file
+// had already retired, so the class rule above said "raFullList — CACHED" while
+// the carrier refused every UAF RA before deriving a key.
+//
+// That cost the 4a accelerator on exactly the population #561 is about. A
+// UAF-backed paginated grid never pinned a full list, so every page was a fresh
+// unpaginated resolve, its first paint was cold (against the zero-cold-
+// navigations requirement), and seedRAFullListForWidget was a no-op for it —
+// while #561 had just re-enabled that seed path for the same widgets. Measured
+// on 057: 31 RESTActions declare a userAccessFilter, 35,328 bypasses.
+//
+// raFullList now takes the identical treatment as every other identity-bound
+// carrier: the cell is cached, the serve path stamps HasUAF (declared limb from
+// the RA in hand, observed limb from the UAFTouchedSink delta across the
+// unpaginated resolve), and both store Puts derive the cap from
+// cache.UAFTTLOverrideForEntry — which is now THE single derivation, since the
+// cache package cannot import this one.
 //
 // SCOPE: exactly the RAs whose output is per-requester narrowed
 // (RESTAction.HasUserAccessFilterStage — the ONE predicate, on the API type,
@@ -210,15 +226,31 @@
 //                            is pure waste); the tail keeps a defensive decline
 //                            so driving the seam directly cannot write one.
 //
-// THE FOURTH SITE (1.12.3, previously mis-waived): the raFullList cell
-// (ra_full_list_store.go PutRAFullList, written from
-// apiref's raFullListServe). The pre-1.12.3 waiver text claimed UAF refilter
-// output "lands in the per-page restactions cell, never here". That was WRONG:
-// raFullListServe caches the apiRef'd RA's OWN full resolve output, UAF stage
-// included, under a cell keyed on BindingUID ALONE (no RBACSubGen) — strictly
-// weaker separation than the restactions cell. It is now bypassed for a
-// UAF-bearing RA at raFullListServe, so neither the serve nor the populate side
-// is reachable and the store-side waivers are correct again by construction.
+// THE FOURTH SITE (1.12.3, mis-waived twice, now IN SCOPE): the raFullList cell
+// (ra_full_list_store.go PutRAFullList / PutRAFullListIfGen, written from
+// apiref's raFullListServe).
+//
+// ITS WAIVER HISTORY IS THE CAUTIONARY TALE OF THIS FILE, so both wrong versions
+// are kept:
+//
+//  1. Pre-1.12.3 it claimed UAF refilter output "lands in the per-page
+//     restactions cell, never here". FALSE — raFullListServe caches the apiRef'd
+//     RA's OWN full resolve output, UAF stage included.
+//  2. 1.12.3 replaced that with "a UAF-bearing RA can no longer REACH this Put:
+//     raFullListServe bypasses the whole layer for it, so every cell written here
+//     is non-UAF". True when written, and FALSE the moment #592 removed the
+//     bypass — a waiver load-bearing on a gate someone else would later remove.
+//
+// Both were WITHDRAWN, not re-worded. The Puts are in scope: they stamp the cap
+// from UAFTTLOverrideForEntry like every other identity-bound site. What makes
+// the cell safe is its KEY (identity-bound, folding the #423 binding-set digest
+// and the #435 sub-gen), not any gate in front of it — which is the only form of
+// this argument that cannot go stale when a gate moves.
+//
+// THE LESSON, twin of the R-1 one below: before scoping away a gate, grep the
+// waivers that CITE it. #561 found two (widgets.go, seedOneWidget) and withdrew
+// them; #592 found these two, which #561's grep had no reason to reach because
+// the bypass it rested on was not the gate #561 was touching.
 //
 // OUT OF SCOPE BY DESIGN (the PM's open apistage question, resolved by tracing):
 //   - apistage.go:607 / cluster_list.go:417 — CacheEntryClassApistage, keyed by
@@ -472,16 +504,14 @@ func isWidgetClass(class string) bool {
 	return class == "widgets" || class == cache.CacheEntryClassWidgetContent
 }
 
-// uafTTLOverrideForEntry returns the short UAF TTLOverride to stamp on a
-// resolved entry, or 0 (no override → standard TTL) when either the knob is
-// disabled (UAF_RESOLVED_TTL_SECONDS unset/0) OR the entry is not UAF-bearing
-// (inputs.HasUAF false / inputs nil). Called at BOTH Put sites (customer +
-// refresher) so the cap is derived identically regardless of which path writes
-// the cell (C-118-6). effectiveTTLLocked already honours the SHORTER of the
-// override and the store TTL, so this only ever TIGHTENS the bound.
+// uafTTLOverrideForEntry is the package-local alias for cache.UAFTTLOverrideForEntry,
+// which is THE derivation. #592 gave the rule a third caller — the raFullList
+// store Puts, in package cache, which cannot import dispatchers — so the body
+// moved there and this became a delegate rather than being duplicated (#64
+// anti-shadow-drift, the same reason restactionHasUAFStage above is an alias
+// rather than a second copy of the predicate). Kept as a name so the ~dozen call
+// sites in this package read unchanged and so a reader of a Put site does not
+// have to cross a package boundary to see what caps it.
 func uafTTLOverrideForEntry(inputs *cache.ResolvedKeyInputs) time.Duration {
-	if inputs == nil || !inputs.HasUAF {
-		return 0
-	}
-	return cache.UAFResolvedTTL()
+	return cache.UAFTTLOverrideForEntry(inputs)
 }

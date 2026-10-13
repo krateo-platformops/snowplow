@@ -83,6 +83,17 @@ var uafStampTokens = []string{
 
 var uafCapTokens = []string{
 	"uafTTLOverrideForEntry(",
+	// #592 moved THE derivation into package cache (cache.UAFTTLOverrideForEntry)
+	// because the raFullList store Puts are a third caller in a package that
+	// cannot import this one; the dispatchers-side name above is now a delegate.
+	// Both spellings are the same rule, so both count as a cap.
+	//
+	// This does NOT by itself dispose of those two raFullList sites: they cap
+	// here but are stamped by apiref.raFullListServe, a frame away, so they carry
+	// an explicit `uaf-scope-waiver:` naming the caller and the arms that hold
+	// it. The token is listed so a FUTURE in-package site using the cache-side
+	// name is recognised as capped rather than silently reading as ungated.
+	"UAFTTLOverrideForEntry(",
 }
 
 // uafWaiverPrefix mirrors scripts/checkresolvedentrysites' `scope-waiver:<field>:`

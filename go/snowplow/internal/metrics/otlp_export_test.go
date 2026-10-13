@@ -246,9 +246,9 @@ func TestF1_AllThreeUAFCountersExport(t *testing.T) {
 	cache.BumpRestactionsUAFPutDeclined()
 	cache.BumpWidgetsUAFPutDeclined()
 	cache.BumpWidgetsUAFPutDeclined()
-	cache.BumpRAFullListUAFBypass()
-	cache.BumpRAFullListUAFBypass()
-	cache.BumpRAFullListUAFBypass()
+	cache.BumpRAFullListUAFCached()
+	cache.BumpRAFullListUAFCached()
+	cache.BumpRAFullListUAFCached()
 
 	flushCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -260,7 +260,7 @@ func TestF1_AllThreeUAFCountersExport(t *testing.T) {
 	for name, want := range map[string]int64{
 		"snowplow_restactions_uaf_put_declined_total": 1,
 		"snowplow_widgets_uaf_put_declined_total":     2,
-		"snowplow_ra_full_list_uaf_bypass_total":      3,
+		"snowplow_ra_full_list_uaf_cached_total":      3,
 	} {
 		got, _, found := findSum(exports, name)
 		if !found {
