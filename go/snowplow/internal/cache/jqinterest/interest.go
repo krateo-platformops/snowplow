@@ -146,7 +146,7 @@ type KeyGuard struct {
 // of a claimed Membership is Decidable (interest() enforces it, and
 // TestKeyGuard_EveryClaimedGuardIsDecidable pins it).
 func (k KeyGuard) Decidable() bool {
-	return k.Values != nil || k.ConstClass == ccExtras.String()
+	return k.Values != nil || (k.ConstClass == ccExtras.String() && k.Extras != nil)
 }
 
 // ExtrasRoot names the value an extras source is navigated from. A source
@@ -302,7 +302,7 @@ func (s *state) interest() Interest {
 		}
 		items = append(items, conv...)
 	}
-	out := Interest{Reads: normalizeReads(items)}
+	out := Interest{Reads: normalizeReads(items), sites: s.sites}
 	if len(s.guards) > 0 {
 		var undecidable []string
 		for _, d := range s.guards {

@@ -322,10 +322,11 @@ func checkSources(nc namedChain, seed int64, trials int, st *sourceStats) {
 // sourcePositiveArms: chains whose guard IS a single extras navigation
 // chain, one per root and shape, so the source arm is never vacuous.
 func sourcePositiveArms() []namedChain {
-	ds := oneStage("", `{list: [.s.items[]]}`)
-	ds.Widget = &Widget{DataTemplates: []string{`${ .name as $n | [.list[] | select(.metadata.name == $n)] }`}}
-	dsConst := oneStage("", `{x: 1}`)
-	dsConst.Widget = &Widget{DataTemplates: []string{`${ .x }`}}
+	// Only stage-filter guards: today no guard in spec.filter or a widget
+	// template is recognised at all, because every list element that reaches
+	// them is a union with the value an extras key equal to the stage's name
+	// pre-seeds (chain.go dictS). The ra_dict and widget_ds roots are checked
+	// against jq directly instead (TestExtrasSource_RootsNavigateLikeJQ).
 	return []namedChain{
 		{"src: stage input .extras.name via $n", oneStage(`.extras.name as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
 		{"src: stage input .extras via $e, then .name", oneStage(`.extras as $e | [.s.items[] | select(.metadata.name == $e.name)]`, "")},
@@ -334,9 +335,139 @@ func sourcePositiveArms() []namedChain {
 		{"src: stage input .slice.page", oneStage(`.slice.page as $p | [.s.items[] | select(.metadata.generation == $p)]`, "")},
 		{"src: stage input through a user function", oneStage(`def n: .extras.name; n as $n | [.s.items[] | select(.metadata.name == $n)]`, "")},
 		{"src: stage input under a try (?)", oneStage(`.extras.names as $ns | [.s.items[] | select(.metadata.name == ($ns[]?))]`, "")},
-		{"src: RESTAction dict .name", oneStage("", `.name as $n | [.s.items[] | select(.metadata.name == $n)]`)},
-		{"src: RESTAction dict stream .names[]", oneStage("", `.names as $ns | {l: [.s.items[] | select(.metadata.namespace == $ns[])]}`)},
-		{"src: widget data source .name", ds},
+	}
+}
+
+// TestExtrasSource_RootsNavigateLikeJQ checks the three roots' sources
+// without a guard: a program run abstractly on the analysis's own root
+// (stage input, RESTAction dict, widget data source) yields a structured
+// source exactly when it is one navigation chain from the extras, and that
+// source, evaluated on the emulator's REAL root, yields what real gojq
+// yields for the program on it (errors included).
+func TestExtrasSource_RootsNavigateLikeJQ(t *testing.T) {
+	type probe struct {
+		root    ExtrasRoot
+		prog    string
+		hasNav  bool
+		wantSrc string
+	}
+	probes := []probe{
+		{RootStageInput, `.extras.name`, true, `stage_input:."extras"."name"`},
+		{RootStageInput, `.extras.names[]`, true, `stage_input:."extras"."names"[]`},
+		{RootStageInput, `.extras.sel[].name`, true, `stage_input:."extras"."sel"[]."name"`},
+		{RootStageInput, `.slice.page`, true, `stage_input:."slice"."page"`},
+		{RootStageInput, `.extras as $e | $e.name`, true, `stage_input:."extras"."name"`},
+		{RootStageInput, `.extras | {name} | .name`, true, `stage_input:."extras"."name"`}, // the field IS .extras.name
+		{RootStageInput, `.extras | {name}`, false, ""},
+		{RootStageInput, `.extras.name // ""`, false, ""},
+		{RootStageInput, `.s`, false, ""},
+		{RootRADict, `.name`, true, `ra_dict:."name"`},
+		{RootRADict, `.names[]`, true, `ra_dict:."names"[]`},
+		{RootRADict, `.slice.perPage`, true, `ra_dict:."slice"."perPage"`},
+		{RootRADict, `.nope.deeper`, true, `ra_dict:."nope"."deeper"`},
+		{RootRADict, `.s`, false, ""},
+		{RootRADict, `first(.names[])`, false, ""},
+		{RootWidgetDS, `.name`, true, `widget_ds:."name"`},
+		{RootWidgetDS, `.names[]`, true, `widget_ds:."names"[]`},
+		{RootWidgetDS, `.slice.page`, true, `widget_ds:."slice"."page"`},
+		{RootWidgetDS, `.s`, false, ""}, // chain 0: the dict's stage field
+		{RootWidgetDS, `.x`, false, ""}, // chain 1: the built object's field
+	}
+	// Chain 1's data source has no stage field and chain 0's has no x: there
+	// .s and .x are the data source's own extras values.
+	navOn := func(ci int, p probe) (bool, string) {
+		switch {
+		case p.root == RootWidgetDS && p.prog == `.s` && ci == 1:
+			return true, `widget_ds:."s"`
+		case p.root == RootWidgetDS && p.prog == `.x` && ci == 0:
+			return true, `widget_ds:."x"`
+		}
+		return p.hasNav, p.wantSrc
+	}
+	for ci, c := range []Chain{
+		oneStage(`{l: [.s.items[]]}`, ""),       // raOut is the dict itself
+		oneStage(`{l: [.s.items[]]}`, `{x: 1}`), // raOut is a built object
+	} {
+		c.Widget = &Widget{DataTemplates: []string{"${ .x }"}}
+		var pig, dict, ds *abs
+		testRootsHook = func(p, d, w *abs) { pig, dict, ds = p, d, w }
+		Analyze(c, jqsupport.ModuleLoader())
+		testRootsHook = nil
+		if pig == nil || dict == nil || ds == nil {
+			t.Fatalf("chain %d: roots not seen", ci)
+		}
+		abstract := map[ExtrasRoot]*abs{RootStageInput: pig, RootRADict: dict, RootWidgetDS: ds}
+		compared := 0
+		for _, p := range probes {
+			hasNav, wantSrc := navOn(ci, p)
+			s := newState(jqsupport.ModuleLoader())
+			var v *abs
+			func() {
+				defer func() { _ = recover() }()
+				v = s.eval(mustParse(p.prog), abstract[p.root], newEnv(nil))
+			}()
+			src := (*ExtrasSource)(nil)
+			if v != nil {
+				src = extrasSourceOf(v)
+			}
+			if (src != nil) != hasNav || src != nil && src.String() != wantSrc {
+				t.Errorf("chain %d %s %s: source %v, want %q (value %s)", ci, p.root, p.prog, src, wantSrc, v.sig())
+				continue
+			}
+			if src == nil {
+				continue
+			}
+			code, err := compileCached(p.prog, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := rand.New(rand.NewSource(int64(633 + ci)))
+			g := &gen{r: r, v: vocab{keys: []string{"name", "names", "sel", "page", "nope"}}}
+			for trial := 0; trial < 80; trial++ {
+				env := sourceEnv(g, c)
+				roots := map[ExtrasRoot]any{}
+				env.probe = func(kind, query string, data any) {
+					if query == "" {
+						if _, ok := roots[ExtrasRoot(kind)]; !ok {
+							roots[ExtrasRoot(kind)] = deepCopy(data)
+						}
+					}
+				}
+				emulate(c, []any{g.item()}, env)
+				root, ok := roots[p.root]
+				if !ok {
+					continue
+				}
+				var real []any
+				var realErr error
+				iter := code.Run(root)
+				for {
+					x, ok := iter.Next()
+					if !ok {
+						break
+					}
+					if e, isErr := x.(error); isErr {
+						realErr = e
+						break
+					}
+					real = append(real, x)
+				}
+				got, gotErr := src.Eval(root)
+				if (realErr != nil) != (gotErr != nil) {
+					t.Errorf("chain %d %s %s: jq error %v, Eval error %v (root %v)", ci, p.root, p.prog, realErr, gotErr, root)
+					break
+				}
+				if realErr == nil && canon(real) != canon(got) {
+					t.Errorf("chain %d %s %s: jq yields %s, Eval yields %s", ci, p.root, p.prog, canon(real), canon(got))
+					break
+				}
+				compared++
+			}
+		}
+		if compared == 0 {
+			t.Errorf("chain %d: vacuous, no root evaluation compared", ci)
+		}
+		t.Logf("chain %d: %d source evaluations compared with gojq", ci, compared)
 	}
 }
 
