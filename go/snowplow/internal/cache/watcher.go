@@ -2256,9 +2256,27 @@ func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, 
 // falsifier). No per-GVR carve-out — uniform over every servable GVR
 // (feedback_no_special_cases).
 func (rw *ResourceWatcher) ListServableEnvelopeJSON(gvr schema.GroupVersionResource, namespace string) ([]byte, bool) {
+	return rw.ListServableEnvelopeJSONWhere(gvr, namespace, nil)
+}
+
+// ListServableEnvelopeJSONWhere is ListServableEnvelopeJSON over only the items
+// keep admits (#618: the caller's labelSelector / metadata.name|namespace
+// fieldSelector, applied with the same predicate the request path uses). A nil
+// keep admits every item, byte-identical to ListServableEnvelopeJSON. The
+// predicate only reads the shared items; it must not mutate them.
+func (rw *ResourceWatcher) ListServableEnvelopeJSONWhere(gvr schema.GroupVersionResource, namespace string, keep func(*unstructured.Unstructured) bool) ([]byte, bool) {
 	items, ok := rw.ListObjectsServable(gvr, namespace)
 	if !ok {
 		return nil, false
+	}
+	if keep != nil {
+		kept := make([]*unstructured.Unstructured, 0, len(items))
+		for _, it := range items {
+			if it != nil && keep(it) {
+				kept = append(kept, it)
+			}
+		}
+		items = kept
 	}
 	list := &unstructured.UnstructuredList{}
 	// Synthesize the collection envelope from the items' own GVK. Every

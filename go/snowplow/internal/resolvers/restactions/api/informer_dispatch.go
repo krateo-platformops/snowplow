@@ -709,8 +709,10 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			// only each item's metadata — the envelope stays zero-decode.
 			raws, ok := query.filterRaw(raws)
 			if !ok {
+				// A stored item whose metadata cannot be decoded for the
+				// selector — attributed to the query, never to servability.
 				dispatchInformerFallthrough.Add(1)
-				cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
+				cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerListQuery, gvr.String())
 				return nil, false
 			}
 			recordListQuery(query)

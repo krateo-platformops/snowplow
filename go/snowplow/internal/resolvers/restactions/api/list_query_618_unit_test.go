@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
@@ -75,6 +76,46 @@ func TestIssue618_PlanListQuery_Table(t *testing.T) {
 			t.Errorf("%s: got applicable=%v reason=%q canon=%q; want %v %q %q",
 				tc.path, q.applicable, q.reason, q.canon, tc.applicable, tc.reason, tc.canon)
 		}
+	}
+}
+
+// TestIssue602_PrewarmCanonEqualsCollapseCanon pins that the prewarm roster and
+// the collapse plan the SAME canonical query for the same literal stage path,
+// so a prewarmed cell is the cell the collapse later reads.
+func TestIssue602_PrewarmCanonEqualsCollapseCanon(t *testing.T) {
+	for _, q := range []string{
+		"",
+		"?labelSelector=env%3Dprod",
+		"?labelSelector=" + url.QueryEscape("tier,env in (prod,dev)"),
+		"?fieldSelector=" + url.QueryEscape("metadata.name==x") + "&labelSelector=a",
+	} {
+		path := q618NSPath("team-a") + q
+		stage := &templates.API{Name: "s", Path: path}
+		gvr, prewarmCanon, ok := extractClusterListTargetFromStage(stage)
+		if !ok {
+			t.Fatalf("%s: prewarm did not enumerate it", path)
+		}
+		cgvr, collapseCanon, cok := clusterListElementTarget(path, nil)
+		if !cok || cgvr != gvr {
+			t.Fatalf("%s: collapse target = %v ok=%v, prewarm %v", path, cgvr, cok, gvr)
+		}
+		if prewarmCanon != collapseCanon {
+			t.Fatalf("#602 %s: prewarm canon %q != collapse canon %q — the prewarmed cell is not the one the collapse reads",
+				path, prewarmCanon, collapseCanon)
+		}
+		pk := cache.ComputeKey(contentKeyInputsQ(gvr, "", "", prewarmCanon))
+		ck := cache.ComputeKey(contentKeyInputsQ(cgvr, "", "", collapseCanon))
+		if pk != ck {
+			t.Fatalf("#602 %s: prewarm and collapse cell keys differ", path)
+		}
+	}
+	// A metadata.namespace selector is neither prewarmed nor collapsed.
+	ns := q618NSPath("team-a") + "?fieldSelector=metadata.namespace%3Dteam-a"
+	if _, _, ok := extractClusterListTargetFromStage(&templates.API{Name: "s", Path: ns}); ok {
+		t.Fatalf("prewarm must skip %s", ns)
+	}
+	if _, _, ok := clusterListElementTarget(ns, nil); ok {
+		t.Fatalf("collapse must decline %s", ns)
 	}
 }
 

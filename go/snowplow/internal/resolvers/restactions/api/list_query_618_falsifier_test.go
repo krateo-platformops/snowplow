@@ -692,3 +692,45 @@ func TestIssue618_InternalDispatch_HandsSelectorsToTheLiveList(t *testing.T) {
 		})
 	}
 }
+
+// TestIssue618_InternalDispatch_InformerBranchFiltersSelectors: with a serve
+// watcher on ctx (the Phase-1 walk / SA refresh, #121 1a) a selector LIST is
+// served from the informer — zero live requests — and filtered to exactly the
+// hand-written set. Pre-fix it was served UNFILTERED.
+func TestIssue618_InternalDispatch_InformerBranchFiltersSelectors(t *testing.T) {
+	resetInternalClientCacheForTest()
+	t.Cleanup(resetInternalClientCacheForTest)
+	rw := newQ618Watcher(t)
+
+	var mu sync.Mutex
+	live := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		live++
+		mu.Unlock()
+		http.Error(w, "the informer branch should have served this", http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+	rc := &rest.Config{Host: srv.URL, BearerToken: "fake-sa", TLSClientConfig: rest.TLSClientConfig{CAData: pemEncodeCert(srv.Certificate())}}
+	ctx := cache.WithServeWatcher(cache.WithInternalRESTConfig(context.Background(), rc), rw)
+
+	for _, tc := range q618Served {
+		t.Run(tc.name, func(t *testing.T) {
+			mu.Lock()
+			live = 0
+			mu.Unlock()
+			raw, ok, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, tc.path))
+			if err != nil || !ok {
+				t.Fatalf("%s: served=%v err=%v", tc.path, ok, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if live != 0 {
+				t.Fatalf("#618 %s: %d live LIST(s) — the selector bypassed the #121 1a informer branch", tc.path, live)
+			}
+			if got := namesInEnvelopeBytes(t, raw); !eqNames(got, tc.want) {
+				t.Fatalf("RED #618 %s: informer branch served %v, want %v", tc.path, got, tc.want)
+			}
+		})
+	}
+}
