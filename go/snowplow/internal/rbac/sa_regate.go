@@ -145,6 +145,26 @@ func saCredentialOnContext(ctx context.Context) bool {
 //   - background, genuine SA / identity-free (serveUnnarrowed)   → false → legitimate
 //     un-gated SA serve unchanged.
 //
+// WHAT THE GATE PROTECTS (rationale corrected for #574, 2026-10-13).
+//   - The gate exists because the SA transport can READ more than the ctx
+//     identity. What it fetches could be tenant data the cohort may not see, and
+//     it would then be cached under the cohort's key. So the gate protects READS
+//     of tenant data that are cached under the ctx identity's key.
+//   - It does NOT say every refused dial would have leaked something. A create
+//     of a SubjectAccessReview reads no tenant data, and the gate still refuses
+//     it on the background path; that is ~770 WARNs / 49 min on krateo-057.
+//     The owner ruled (2026-10-13, #574) NOT to exempt it. On its own, an
+//     exemption changes nothing a user sees: branch E marks every dial
+//     external, so the refresher declines the re-Put either way. The arm
+//     TestIssue574SAR_A1b_GateStoodDown_SARResultStillNotRePut pins this.
+//   - The refusal WARNs carry the sa_regate_* attributes (origin, trigger,
+//     prewarm scope) and key_hash (sa_regate_attribution.go), so the population can be attributed before anything is
+//     changed.
+//   - #615: the impersonation stand-down below trusts a ctx-wide marker, but
+//     the branch-E ENDPOINT dial is not impersonated. Under that marker a
+//     non-UAF branch-E dial is NOT gated and reads with SA breadth. Today only
+//     the external-touched Put decline keeps the result out of L1.
+//
 // One predicate, no per-resource carve-outs (feedback_no_special_cases).
 // NOTE (arch-268 to bless): the design stated `saCredentialOnCtx && !serveUnnarrowed`;
 // the BackgroundResolve conjunct is a scoping refinement (see above) — it does not

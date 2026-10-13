@@ -1259,8 +1259,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	//     false → the legitimate un-gated SA serve is unchanged.
 	if apiCall.UserAccessFilter == nil && cache.ServiceAccountDialFromContext(gctx) && rbac.MustRegateSADial(gctx) {
 		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", call.Path)
+		// #574 — attribute the refusal to its driver (refresher trigger/trigger-less,
+		// cohort seed + prewarm scope, prewarm, live) and to the cell it was
+		// populating (key_hash), from stamps the ctx already carries.
 		r.log.Warn("branch-E SA-endpoint dial re-gated and failed closed",
-			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), slog.String("path", call.Path))
+			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), slog.String("path", call.Path),
+			slog.String("sa_regate_origin", rbac.SARegateOrigin(gctx)),
+			slog.String("sa_regate_trigger", rbac.SARegateTrigger(gctx)),
+			slog.String("sa_regate_scope", rbac.SARegateScope(gctx)),
+			slog.String("key_hash", rbac.SARegateKeyHash(gctx)))
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)

@@ -190,3 +190,35 @@ func init() {
 		return RefDeniedByOriginSnapshot()
 	}))
 }
+
+// ── #574: the prewarm-engine scope a background resolve runs under ──────────
+//
+// The origin above says WHICH driver is resolving (refresher, cohort-seed,
+// prewarm-engine-boot). For the seed it cannot say WHY. The same cohort seed
+// runs for the boot pass, a newly discovered GVR, the keep-warm sweep, an RBAC
+// shift and a learned identity class. #574 needs that split to attribute the SA
+// re-gate refusals: a keep-warm sweep re-seeding cells is a different
+// population from a boot pass. The engine stamps the kind of scope it dequeued
+// once, in the scope handler, and every resolve under it inherits the stamp.
+
+type ctxKeyPrewarmScopeType struct{}
+
+var ctxKeyPrewarmScope = ctxKeyPrewarmScopeType{}
+
+// WithPrewarmScope records the prewarm-engine scope kind (boot, gvr-discovered,
+// keepwarm, rbac-shift, learned-class) on ctx. Attribution only: no gate reads it.
+func WithPrewarmScope(ctx context.Context, kind string) context.Context {
+	if ctx == nil || kind == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyPrewarmScope, kind)
+}
+
+// PrewarmScopeFromContext returns the prewarm-engine scope kind stamped on ctx.
+func PrewarmScopeFromContext(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	s, _ := ctx.Value(ctxKeyPrewarmScope).(string)
+	return s, s != ""
+}

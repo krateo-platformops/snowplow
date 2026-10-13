@@ -285,11 +285,17 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// where we apply the SAME per-user gate the informer branch uses (filterGetByRBAC)
 	// and FAIL CLOSED on deny. No per-resource carve-outs (feedback_no_special_cases).
 	if rbac.MustRegateSADial(ctx) && !filterGetByRBAC(ctx, res.GVR, uns) {
+		// #574 — attribute the refusal to its driver and cell (see
+		// rbac/sa_regate_attribution.go).
 		log.Warn("objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", res.GVR.String()),
 			slog.String("namespace", ref.Namespace),
 			slog.String("name", ref.Name),
+			slog.String("sa_regate_origin", rbac.SARegateOrigin(ctx)),
+			slog.String("sa_regate_trigger", rbac.SARegateTrigger(ctx)),
+			slog.String("sa_regate_scope", rbac.SARegateScope(ctx)),
+			slog.String("key_hash", rbac.SARegateKeyHash(ctx)),
 		)
 		res.Unstructured = nil
 		res.Err = response.New(http.StatusForbidden,
