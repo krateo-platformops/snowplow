@@ -327,9 +327,9 @@ is safe, and a lost event is recoverable by the next enqueue for the same coordi
 is not authoritative: the coordinate is requeued with backoff on the refresher's
 `maxRefreshRequeues` budget and, on exhaustion, degraded to a dirty-mark so the refresher's
 re-fetch decides against the apiserver (a definite 404 takes the self-gone route and evicts at
-the drop point — seconds; since 1.12.6 C4 a 403, a 500, a timeout or a parse failure also
-evicts there after the budget, behind the `REFRESH_DROP_EVICT_MAX_PER_MINUTE` breaker, and only
-a suspended breaker leaves the body bounded by `RESOLVED_CACHE_TTL_SECONDS`, 3600 s). It never means
+the drop point — seconds; since #547 a 403, a 500, a timeout or a parse failure leaves the cell
+resident and KNOWN-STALE after the budget: served and counted, revalidated on the next read under
+the requester, re-enqueued by the next change — §5.3). It never means
 "keep forever", and it never evicts by itself — that is what keeps a schema-relist teardown window
 from evicting a whole GVR. The probe reads the watcher directly and never calls
 `EnsureResourceType`, so it is not the inert `IsRegistered` conjunct 1.12.5 removed (different
@@ -469,48 +469,58 @@ up as `reconcile_divergence_total > 0` (alertable) and that entries which keep b
 stranded entry can be served. Raise `DEPS_RECONCILE_SAMPLE` for a tighter bound (O(sample)
 under the store mutex per tick). Full arithmetic next to the counter rows in observability.md.
 
-### 5.3 Terminal refresh semantics (1.12.6, #191)
+### 5.3 Terminal refresh semantics (1.12.6, #191; amended by #547)
 
 **No refresh outcome may end in "forget the key and keep the entry".** Every path through the
 refresher ends in exactly one of three states, all counted:
 
 | Outcome | When | Counter |
 |---|---|---|
-| **re-Put** | the re-resolve succeeded | `completed_total` |
-| **evict** | the entry's basis is gone or unverifiable: the self-object 404 (§5.1), and since 1.12.6 **every** deterministic failure that exhausts `maxRefreshRequeues` — 403, 500, timeout, parse failure, an apistage content call that is not servable | `self_notfound_evict_total`, `drop_evict_total` |
-| **suppress** | the decline sites in `resolveAndPopulateL1` (stage error, external endpoint, `userAccessFilter` cell on an IDENTITY-FREE class only since #561 — the identity-bound classes are refreshed normally, unsupported kind) — the key is marked *refresh-by-traffic-only*, skipped by the refresher without a resolve, and cleared by the next real `Put` or by any eviction | `suppressed_set_total`, `suppressed_skips_total`, `suppressed_keys` |
+| **re-Put** | the re-resolve succeeded | `completed_total`, `dirty_to_fresh_samples` |
+| **evict** | the entry's basis is GONE: the self-object 404 (§5.1) at the drop point, and every store removal | `self_notfound_evict_total` |
+| **known-stale** (#547) | the refresh ended without an accepted re-Put: a decline (stage error, empty full, external / UAF / sensitive gate), a drop after `maxRefreshRequeues` (403, 500, timeout, parse failure, an apistage content call that is not servable), a suppressed skip | `dirty_ended_unfresh_{declined,dropped}`; served: `known_stale_served_total{reason}` |
 
-Before 1.12.6 the drop point in `processNext` forgot a non-404 key and left the stale body
-resident until the 1 h TTL, and the decline gates re-resolved the same key on every dirty-mark
-forever — #191 was 956 WARNs from 23 keys in 4.5 h, every one a deterministic `exportJwt`
-401 under the SA identity.
+**Known-stale.** The cell stays resident and its dirty stamp (`dirty_window.go`) is NOT erased: it
+is converted to `{t0, stale: reason}` and stays until an accepted re-Put closes it (the refresher,
+or a demand revalidation) or the cell leaves the store. Before #547 the stamp was deleted there,
+so the cell looked exactly like a fresh one — every reload was a hit on a body the system knew
+was stale, nothing re-validated it short of a later event or the TTL, and `stale_served_total`
+went blind at the moment the user started seeing stale data (#547 trace). The serve path
+(`known_stale.go`) then splits by the READER's role:
 
-**The breaker (`REFRESH_DROP_EVICT_MAX_PER_MINUTE`, default `"64"`).** Evicting is right for a
-handful of dead objects and wrong for a mass failure: an apiserver outage fails every refresh,
-so after the budget every dirty-marked key reaches the drop point, and evicting them all turns a
-stale portal into a broken one on top of the outage. The knob is a token bucket on drop-point
-evictions, **not a rate limit** — it is the discriminator between the correctness regime (a few
-deterministic failures, evict) and the availability regime (a mass failure, keep serving).
-Over budget the key keeps the pre-1.12.6 drop-to-TTL, `drop_evict_suspended_total` ticks and
-**one** WARN per suspension window (`refresher.drop_evict_suspended`) names the suspected
-outage. `"0"` disables drop-point eviction for non-404 failures entirely — byte-identical to
-1.12.5 — and is the kill switch. The self-object 404 route is not subject to the breaker.
+- a **top-level customer serve** of an identity-bound cell (widgets, restactions) still serves the
+  body — zero cold navigations — counts it (`known_stale_served_total{reason=declined|dropped|
+  suppressed|not_servable}`, bumped by the very hits that deliver the stale body, so it cannot
+  read zero during the defect) and starts ONE singleflighted **demand revalidation** per
+  (key, t0): the handler re-runs its own cold path on a detached copy of the request, under the
+  requester's identity and own credential (the read known to work), bounded by the server's write
+  deadline, never blocking the response (`dispatchers/demand_revalidate.go`). Its accepted
+  write closes the window and publishes over SSE. If it fails, the body keeps being served and
+  counted and the next read or change retries — never an eviction (owner ruling, #547);
+- a **resolve input** (an apistage content cell, the widgetContent shell, a RAFullList) is READ
+  THROUGH: the reader takes its existing MISS fall-through (one apiserver call per read while the
+  informer is not servable, owner ruling) so a stale substrate is never baked into a new cell.
 
-**Suppression (`REFRESH_SUPPRESS_AFTER_DECLINES`, default `"3"`).** A stage-error decline is
-suppressed after K consecutive declines of the same key; the structurally permanent declines
-(external endpoint, UAF cell, unsupported kind) suppress on the first. The marker is package
-state in `refresher_terminal.go`, never a field on the resident entry (`Get` hands out the live
-pointer; mutating it is a data race), so `Put` and every eviction path can clear it without
-constructing the refresher. A suppressed entry is still served and still correct — real user
-traffic is what writes it; `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS` (§3.4) bounds how long it can
-live without one.
+**Retired by #547:** `REFRESH_DROP_EVICT_MAX_PER_MINUTE` (the drop-point eviction breaker: over
+budget it kept the stale body resident and served as if fresh — 80 % of the live drop points —
+and under budget it evicted, a cold navigation) and `REFRESH_SUPPRESS_AFTER_DECLINES` (a
+non-permanent decline is now known-stale and retried on read or change; no K). Both were
+replaced by a state that adapts by itself; there is no knob left to tune.
 
-The arms are `cache/refresh_terminal_test.go` (F5a/F5b are the two-regime pin: three failures
-under the default budget all evict with the breaker idle; six failures under budget `"1"` evict
-one and keep five resident **and served** — an unbounded evict passes the first and fails the
-second, a never-evict the reverse) and
-`dispatchers/issue1126_c4_terminal_e2e_test.go` (rows 3/4/6/9 driven through the production
-`resolveAndPopulateL1`).
+**Suppression** remains for the STRUCTURALLY PERMANENT declines only (external endpoint, UAF
+cell on an identity-free class, sensitive resource, unsupported kind): marked on the first
+occurrence, skipped by the refresher without a resolve (the window ends known-stale, reason
+`suppressed`), cleared by the next real `Put` or any eviction. The marker is package state in
+`refresher_terminal.go`, never a field on the resident entry (`Get` hands out the live pointer;
+mutating it is a data race). A demand revalidation is not gated by it.
+
+The arms are `cache/refresh_terminal_test.go` (F5a/F5b: dropped entries stay resident, served and
+known-stale; F6m: a stage-error decline never suppresses; F6s: the permanent suppression and its
+known-stale skip), `dispatchers/issue1126_c4_terminal_e2e_test.go` (rows 3/4/6/9 through the
+production `resolveAndPopulateL1`), and the #547 falsifiers
+`dispatchers/issue547_known_stale_test.go` (F1/F2/F4–F7, the production GET-by-name `/call`
+driven from an informer UPDATE through the refresher to the next `Get`) and
+`restactions/api/issue547_content_read_through_test.go` (F3).
 
 ---
 
@@ -575,10 +585,11 @@ and the SPA's recovery are OPEN rows owned by the chart review checklist and fro
 - **Stale content past dirty-mark.** Dirty-marking only *enqueues* a refresher re-resolve; until
   the refresher runs, a hit serves the prior bytes (stale-while-revalidate by design). A wedged
   or back-pressured refresher leaves stale content until TTL.
-- **Breaker suspension during an outage.** While `refresher.drop_evict_suspended` is firing,
-  keys past the budget keep the old drop-to-TTL and serve stale until a later dirty-mark or the
-  max entry age; that is the intended availability posture, not a stuck refresher. A steadily
-  climbing `drop_evict_suspended_total` with a healthy apiserver means the budget is too low.
+- **Known-stale cells (#547).** A refresh that ends without an accepted re-Put leaves the cell
+  KNOWN-STALE. `snowplow_resolved_cache_known_stale_served_total{reason}` counts every customer
+  hit that delivered such a body; a steady climb names cells neither the background refresh nor
+  the demand revalidation under the requester can refresh (`revalidation_failed_total`). During
+  an apiserver outage this is the counter that climbs — the cells keep being served, never evicted.
 - **Dep-record cap drop.** Past the cap, new dep edges are dropped silently and a one-shot WARN
   (`deps.cache.cap_reached`) fires; affected entries then rely on TTL rather than event-driven
   invalidation.
@@ -602,7 +613,7 @@ and the SPA's recovery are OPEN rows owned by the chart review checklist and fro
 | Retired-flag audit | `internal/cache/retired_flags.go` | `AuditRetiredFlags` |
 | L1 store, keys, dedup, TTL overrides | `internal/cache/resolved.go` | `ComputeKey`, `canonicaliseExtras`, `ResolvedKeyInputs` (`BindingUID`, `RBACSubGen`, `HasUAF`), `resolvedKeyVersion="v6"`, entry classes, `Get`, `Put` |
 | RBAC sub-generation | `internal/cache/rbac_subgen.go`, `rbac_subgen_pending.go` | `RBACSubGenForSubject`, publish-deferred bumps |
-| Terminal refresh semantics (breaker, suppression) | `internal/cache/refresher_terminal.go` | `dropEvictBreaker`, `NoteRefreshDecline`, `RefreshTerminalStatsSnapshot`; consulted in `refresher.go` `processNext` |
+| Terminal refresh semantics (known-stale, suppression) | `internal/cache/refresher_terminal.go`, `dirty_window.go`, `known_stale.go`; `internal/handlers/dispatchers/demand_revalidate.go` | `NoteRefreshDecline`, `RefreshTerminalStatsSnapshot`, `KnownStale`, `KnownStaleReadThrough`, `BeginDemandRevalidation`; consulted in `refresher.go` `processNext` and the `Get` funnel |
 | Tag-derived stats families (1.12.6 C7) | `internal/cache/stats_by_tag.go`, `internal/cache/stats_families.go` | `StatSpec`, `StatFamily`, `TaggedStatFamilies`; `stat`/`kind`/`desc` tags on `CRDDiscoveryStats`, `RefreshBroadcasterStats`, `refresherStats`, `RefreshTerminalStats` drive expvar, the OTLP mirror (`internal/metrics/metrics.go` `newDerivedFamilies`) and the parity arms |
 | Invalidation | `internal/cache/deps.go`, `deps_watch.go` | `Record`, `RecordList`, `OnObjectEvent` (state-derived; `OnAdd`/`OnUpdate`/`OnDelete` are shims), `isSelfRepresentation`; bridge: `depEventHandlers` → `submitDepEvent` → `probeObjectState` |
 | External Put-gate | `internal/cache/external_touched_sink.go` | `WithExternalTouchedSink` |

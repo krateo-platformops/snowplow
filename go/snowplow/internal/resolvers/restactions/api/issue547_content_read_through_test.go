@@ -107,9 +107,6 @@ func TestIssue547_F3_KnownStaleContentCellIsReadThroughNeverServedStale(t *testi
 	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
-	// RED-FIRST PIN (removed by the fix, which retires the knob): "0" selects the
-	// drop point's suspended branch on 9c233de9 — the stale body stays resident.
-	t.Setenv("REFRESH_DROP_EVICT_MAX_PER_MINUTE", "0")
 	dyn := newK547ContentWatcher(t)
 	store := cache.ResolvedCache()
 	if store == nil {

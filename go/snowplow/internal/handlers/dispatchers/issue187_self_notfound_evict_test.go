@@ -421,15 +421,12 @@ func TestIssue187_B2E2E_RefresherSelfNotFoundEvictsThroughTheRealLoop(t *testing
 
 // --- B500 / B403 — a transient is never a DELETION ---------------------------
 //
-// 1.12.6 C4 (§6.2 row 3) MODIFIED this arm deliberately. In 1.12.5 a 500/403
-// across the whole budget left the entry resident (drop-to-TTL); from 1.12.6
-// a deterministic non-404 failure is EVICTED at the drop point behind the
-// breaker (TestIssue1126_C4_F4). What this arm still pins, and must keep
-// pinning: (1) a 500/403 is NEVER classified as a deletion — the self-gone
-// route (errors.Is on the sentinel, counted on self_notfound_evict) stays
-// 404-only; (2) with the kill switch REFRESH_DROP_EVICT_MAX_PER_MINUTE="0"
-// the 1.12.5 behaviour is byte-for-byte unchanged: the budget is spent and
-// the entry SURVIVES.
+// What this arm pins: (1) a 500/403 is NEVER classified as a deletion — the
+// self-gone route (errors.Is on the sentinel, counted on self_notfound_evict)
+// stays 404-only; (2) the budget is spent and the entry SURVIVES. #547 made (2)
+// unconditional: 1.12.6 C4's drop-point eviction (and its
+// REFRESH_DROP_EVICT_MAX_PER_MINUTE kill switch) is retired, a non-404 drop
+// leaves the cell resident and KNOWN-STALE.
 func TestIssue187_B2Bound_TransientApiserverErrorDoesNotEvict(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -440,7 +437,6 @@ func TestIssue187_B2Bound_TransientApiserverErrorDoesNotEvict(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			i187RefresherEnv(t)
-			t.Setenv("REFRESH_DROP_EVICT_MAX_PER_MINUTE", "0") // C4 kill switch: 1.12.5 semantics
 			srv := newI187APIServer(t, tc.code)
 			store, inputs, key, saEP, saRC := i187Fixture(t, srv, true)
 
@@ -454,13 +450,12 @@ func TestIssue187_B2Bound_TransientApiserverErrorDoesNotEvict(t *testing.T) {
 					"404 may ever reach the self-gone eviction", tc.name, tc.code)
 			}
 
-			// Then the whole loop under the kill switch: the budget is spent and
-			// the entry SURVIVES (drop-to-TTL, exactly as 1.12.5).
+			// Then the whole loop: the budget is spent and the entry SURVIVES.
 			invocations := i187RunRefreshCycle(t, inputs, key, saEP, saRC, store)
 			if _, ok := store.Get(key); !ok {
-				t.Fatalf("#187 bound %s: the entry was EVICTED after %d attempts on a %d with "+
-					"REFRESH_DROP_EVICT_MAX_PER_MINUTE=0. The kill switch must restore the 1.12.5 "+
-					"drop-to-TTL byte-for-byte.", tc.name, invocations, tc.code)
+				t.Fatalf("#187 bound %s: the entry was EVICTED after %d attempts on a %d — a "+
+					"transient is never a deletion (#547: the cell stays resident, known-stale)",
+					tc.name, invocations, tc.code)
 			}
 			if got := cache.Deps().Stats().EvictSelfGoneTotal; got != 0 {
 				t.Fatalf("#187 bound %s: evict_self_gone_total = %d, want 0", tc.name, got)
@@ -516,20 +511,16 @@ func TestIssue187_B2Bound_NotFoundWordingWithoutTheSentinelDoesNotEvict(t *testi
 	})
 	t.Cleanup(restore)
 
-	// 1.12.6 C4 MODIFIED this arm deliberately: a resolve error that stays
-	// deterministic across the budget now EVICTS at the drop point (row 3,
-	// breaker-bounded) — but on the C4 route, never on the 404 route. The
-	// structural claim this arm pins is unchanged: the SELF-GONE gate keys on
-	// the wrapped sentinel (errors.Is), never on error text, so an inner
-	// call's NotFound wording can never be counted as a deletion of the
-	// parent. Under the kill switch the entry survives exactly as in 1.12.5.
-	t.Setenv("REFRESH_DROP_EVICT_MAX_PER_MINUTE", "0")
+	// The structural claim this arm pins: the SELF-GONE gate keys on the
+	// wrapped sentinel (errors.Is), never on error text, so an inner call's
+	// NotFound wording can never be counted as a deletion of the parent. Since
+	// #547 the entry also survives the drop point unconditionally (resident,
+	// known-stale; the 1.12.6 C4 drop-point eviction is retired).
 	invocations := i187RunRefreshCycle(t, inputs, key, saEP, saRC, store)
 
 	if _, ok := store.Get(key); !ok {
 		t.Fatalf("#187 BSTR: the entry was evicted after %d attempts on an INNER call's "+
-			"NotFound with the C4 kill switch on. Only the drop-point route may evict a "+
-			"non-sentinel failure, and it is disabled here.", invocations)
+			"NotFound — a non-sentinel failure is never a deletion (#547)", invocations)
 	}
 	if got := cache.Deps().Stats().EvictSelfGoneTotal; got != 0 {
 		t.Fatalf("#187 BSTR: evict_self_gone_total = %d, want 0", got)

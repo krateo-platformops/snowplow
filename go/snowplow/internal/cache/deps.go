@@ -838,17 +838,11 @@ type DepTracker struct {
 	// non-empty: a degraded verdict naming a coordinate nothing depends on
 	// cost nothing, and counting it would bury the cases that did.
 	onObjectEventDegradedNoEvict atomic.Uint64
-	// 1.12.6 C4: evictions at the refresher drop point after a deterministic
-	// NON-404 failure (403/500/timeout/parse/not-servable) exhausted the
-	// requeue budget under the breaker (EvictDropPoint). Kept apart from
-	// evictSelfGoneTotal on purpose: that counter's documented meaning is
-	// "the object is confirmed gone", and during an apiserver outage — the
-	// incident the breaker exists for — a folded number would read as "CRs
-	// are being deleted". One counter, one meaning (PM verify, Track B).
-	evictDropPointTotal atomic.Uint64
-	dirtyMarkTotal      atomic.Uint64 // dirty-marks (OnAdd/OnUpdate + OnDelete non-self)
-	enqueueUpdateTotal  atomic.Uint64 // refresh enqueues triggered by OnUpdate
-	removeL1Total       atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
+	// (#547 retired evictDropPointTotal with the drop-point eviction itself: a
+	// non-404 deterministic failure now leaves the cell KNOWN-STALE.)
+	dirtyMarkTotal     atomic.Uint64 // dirty-marks (OnAdd/OnUpdate + OnDelete non-self)
+	enqueueUpdateTotal atomic.Uint64 // refresh enqueues triggered by OnUpdate
+	removeL1Total      atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
 
 	// #239 dirty-mark attribution: the {path,cause,class} distribution, per-
 	// submit-source counts, fan-out denominator and /debug/vars-only GVR
@@ -2261,10 +2255,10 @@ var publishEvictionFn = PublishEviction
 // Returns true iff an entry was actually removed from the store, so the
 // caller can log exactly once per genuine eviction.
 //
-// 404 ONLY. The 1.12.6 C4 drop point — a deterministic NON-404 failure that
-// exhausted the same budget under the breaker — takes EvictDropPoint, the
-// same mechanism on its own counter, so evict_self_gone_total keeps meaning
-// "the object is confirmed gone" even during an apiserver outage.
+// 404 ONLY. A deterministic NON-404 failure that exhausts the same budget is
+// not a deletion: since #547 it leaves the cell resident and KNOWN-STALE
+// (1.12.6 C4's EvictDropPoint is retired), so evict_self_gone_total keeps
+// meaning "the object is confirmed gone".
 func (d *DepTracker) EvictSelfGone(l1Key string, gone *ResolvedKeyInputs) bool {
 	// #216 — fire the object-level gone-forget from the coordinate the CALLER holds.
 	// EvictSelfGone has exactly one production caller (refresher.go, the drop-point
@@ -2276,7 +2270,7 @@ func (d *DepTracker) EvictSelfGone(l1Key string, gone *ResolvedKeyInputs) bool {
 	// harvested copies must be dropped (notifyObjectGone / gone_forget_hook.go), or
 	// the next seed pass re-Puts the deleted object's content for the pod's life. This
 	// is idempotent (the double-forget arm proves it) and confirmed-404-only (ONLY
-	// here, NEVER EvictDropPoint — a 403 / 500 / timeout is not a deletion), so it can
+	// here — a 403 / 500 / timeout is not a deletion), so it can
 	// never wrongly forget a live object. Sourcing the coordinate from the caller (not
 	// a store peek) means the forget no longer depends on the entry still being
 	// resident, so the LRU/TTL pre-eviction race is ELIMINATED. nil / empty → skip.
@@ -2295,27 +2289,13 @@ func (d *DepTracker) EvictSelfGone(l1Key string, gone *ResolvedKeyInputs) bool {
 	// armed frontend. Gated on evictSelfEntry==true (the publish is about the
 	// CELL / subscriber, unlike the object-level forget above). Same hook and lock
 	// discipline as runEvictionBatch (c.mu released inside deleteForDep, d.storeMu
-	// released inside evictSelfEntry). Deliberately in THIS arm and not in
-	// evictSelfEntry: EvictDropPoint shares the body for a NON-404 failure (403 /
-	// 500 / timeout under the breaker), which is not a deletion — publishing it
-	// would tell every armed tab its widgets were deleted during an apiserver
-	// outage (S1d pins it silent).
+	// released inside evictSelfEntry). Deliberately in THIS arm: only a confirmed
+	// 404 is a deletion worth telling every armed tab about.
 	publishEvictionFn(l1Key)
 	return true
 }
 
-// EvictDropPoint is EvictSelfGone for the 1.12.6 C4 drop point: the entry's
-// refresh failed deterministically for a NON-404 reason (403 / 500 / timeout
-// / parse / not-servable) across the whole requeue budget and the breaker
-// granted a token. Same store delete, same dep-edge cleanup, same "true iff
-// an entry was removed" contract — counted on evict_drop_point_total so
-// neither evict_delete_total (the H1 discriminator) nor
-// evict_self_gone_total (the confirmed-404 signal) moves for it.
-func (d *DepTracker) EvictDropPoint(l1Key string) bool {
-	return d.evictSelfEntry(l1Key, &d.evictDropPointTotal)
-}
-
-// evictSelfEntry is the shared body of EvictSelfGone / EvictDropPoint. It
+// evictSelfEntry is the body of EvictSelfGone. It
 // deletes the entry through store.deleteForDep (which also bumps the STORE's
 // evict_delete_total under snowplow_resolved_cache, clears the C4 suppression
 // marker and — 1.12.7 F6a — strips the key's dep records under the same hold),
@@ -2393,16 +2373,15 @@ type DepStats struct {
 	// Coordinates is the distinct-dependency-coordinate count (#239). Read it
 	// against TotalRecords — the RATIO is the fan-out multiplier and neither
 	// number means anything alone.
-	Coordinates         int64
-	RecordTotal         uint64
-	RecordDroppedCap    uint64
-	RecordDroppedNoKey  uint64 // O15: empty-l1Key Record*/WithL1KeyContext
-	EvictDeleteTotal    uint64 // self-representation evictions from an informer DELETE only
-	EvictSelfGoneTotal  uint64 // 1.12.5 #187: evictions from a confirmed self-object 404
-	EvictDropPointTotal uint64 // 1.12.6 C4: evictions at the drop point after a NON-404 deterministic failure (breaker-granted)
-	DirtyMarkTotal      uint64 // dirty-marks (ADD/UPDATE + DELETE non-self)
-	EnqueueUpdateTotal  uint64
-	RemoveL1Total       uint64
+	Coordinates        int64
+	RecordTotal        uint64
+	RecordDroppedCap   uint64
+	RecordDroppedNoKey uint64 // O15: empty-l1Key Record*/WithL1KeyContext
+	EvictDeleteTotal   uint64 // self-representation evictions from an informer DELETE only
+	EvictSelfGoneTotal uint64 // 1.12.5 #187: evictions from a confirmed self-object 404
+	DirtyMarkTotal     uint64 // dirty-marks (ADD/UPDATE + DELETE non-self)
+	EnqueueUpdateTotal uint64
+	RemoveL1Total      uint64
 	// 1.12.7: degraded verdicts that reached dependents and evicted nothing.
 	OnObjectEventDegradedNoEvict uint64
 	// #375 (B): accepted gen-guarded Puts whose resolve ctx carried NO dep-gen sink
@@ -2426,7 +2405,6 @@ func (d *DepTracker) Stats() DepStats {
 		RecordDroppedNoKey:           d.recordDroppedNoKey.Load(),
 		EvictDeleteTotal:             d.evictDeleteTotal.Load(),
 		EvictSelfGoneTotal:           d.evictSelfGoneTotal.Load(),
-		EvictDropPointTotal:          d.evictDropPointTotal.Load(),
 		DirtyMarkTotal:               d.dirtyMarkTotal.Load(),
 		EnqueueUpdateTotal:           d.enqueueUpdateTotal.Load(),
 		OnObjectEventDegradedNoEvict: d.onObjectEventDegradedNoEvict.Load(),

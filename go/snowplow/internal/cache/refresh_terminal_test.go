@@ -9,29 +9,28 @@
 // frame under test (the handler is what fails; the decision under test is
 // what the refresher does with the failure).
 //
-// ARMS
+// ARMS (#547 amended the drop point and the decline suppression)
 //
-//	F5a   few deterministic failures (3 keys, budget 64) → ALL evicted at the
-//	      drop point, breaker never engaged (suspended == 0). RED on main: the
-//	      entries survive (drop-to-TTL).
-//	F5b   mass failure (budget "1", 6 keys) → the first evicts, the rest are
-//	      SUSPENDED: resident AND SERVED, suspended_total == 5, exactly ONE
-//	      suspension WARN. Assertion is on the served state, never on the
-//	      arithmetic. An unbounded evict passes F5a and FAILS this arm; a
-//	      never-evict passes this arm and fails F5a.
-//	KILL  budget "0" → 1.12.5 byte-for-byte: dropped, resident.
-//	F6m   the suppression mechanism end-to-end: K consecutive declines noted
-//	      by the handler → the (K+1)th dequeue does NOT invoke the handler;
-//	      one real Put → the next dequeue DOES. RED on main: every dequeue
-//	      resolves forever (#191).
+//	F5a   few deterministic failures across the whole requeue budget -> every
+//	      entry stays RESIDENT and KNOWN-STALE (reason dropped), never evicted
+//	      and never forgotten as fresh. RED on 9c233de9: evicted (breaker
+//	      budget) or the stamp erased (suspended / budget 0).
+//	F5b   mass failure (6 keys) -> all resident, all served, all known-stale:
+//	      no eviction storm and no breaker to engage (REFRESH_DROP_EVICT_MAX_
+//	      PER_MINUTE is retired).
+//	F6m   a stage-error decline (non-permanent) NEVER suppresses: every dirty
+//	      mark re-resolves (retry on change) and the cell is known-stale
+//	      (reason declined). RED on 9c233de9: suppressed after K=3.
+//	F6s   a structurally-permanent decline suppresses; the next mark is
+//	      skipped without a resolve, the window ends known-stale (reason
+//	      suppressed) and the trigger GVR is consumed (architect N3); one real
+//	      Put clears the marker.
 //	F6p   permanent declines (external / UAF / unsupported) suppress on the
-//	      FIRST occurrence.
+//	      FIRST occurrence; a non-permanent one never does.
 //	F6e   an eviction clears the marker (it cannot outlive its key).
 //	B1    a stats read (the expvar / OTLP scrape) racing the FIRST
 //	      construction of the refresher singleton is race-free and never
-//	      constructs the singleton itself. RED on 6ee779d under -race: the
-//	      snapshot read refresherInstance unsynchronised against
-//	      refresherInit.Do's store.
+//	      constructs the singleton itself.
 //
 // ORDER OF ASSERTIONS. Every arm asserts the BEHAVIOUR first (was the
 // handler invoked? is the entry resident?) and consults the marker /
@@ -82,20 +81,6 @@ func terminalFixture(t *testing.T, n int) (*ResolvedCacheStore, []string) {
 	return c, keys
 }
 
-func terminalRun(t *testing.T, c *ResolvedCacheStore, keys []string, handler RefreshFunc, until func() bool) {
-	t.Helper()
-	RegisterRefreshFunc("widgets", handler)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	StartRefresher(ctx)
-	for _, k := range keys {
-		enqueueRefreshForTest(k)
-	}
-	waitFor(t, 10*time.Second, "refresh loop settled", until)
-	cancel()
-	resetRefresherForTestKeepTerminalCounters()
-}
-
 // resetRefresherForTestKeepTerminalCounters drains the pool but leaves the
 // breaker counters readable for the assertions that follow.
 func resetRefresherForTestKeepTerminalCounters() {
@@ -113,118 +98,88 @@ func resetRefresherForTestKeepTerminalCounters() {
 	}
 }
 
-func TestRefreshTerminal_F5a_FewDeterministicFailuresAreEvicted(t *testing.T) {
+// terminalMark dirty-marks keys through the refresher's real hook (onDirtyMark:
+// trigger merge + window open + enqueue), so each dequeue runs inside a window.
+func terminalMark(keys []string) {
+	gvr := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "flexes"}
+	for _, k := range keys {
+		refresherSingleton().onDirtyMark(k, gvr, nil)
+	}
+}
+
+func terminalRunMarked(t *testing.T, keys []string, handler RefreshFunc, until func() bool) {
+	t.Helper()
+	RegisterRefreshFunc("widgets", handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartRefresher(ctx)
+	terminalMark(keys)
+	waitFor(t, 10*time.Second, "refresh loop settled", until)
+	cancel()
+	resetRefresherForTestKeepTerminalCounters()
+}
+
+func TestRefreshTerminal_F5a_DeterministicFailuresLeaveEntriesKnownStale(t *testing.T) {
 	terminalEnv(t)
-	t.Setenv(envRefreshDropEvictMaxPerMinute, "64")
 	c, keys := terminalFixture(t, 3)
 
 	var attempts atomic.Int32
-	terminalRun(t, c, keys, func(context.Context, string, ResolvedKeyInputs) error {
+	terminalRunMarked(t, keys, func(context.Context, string, ResolvedKeyInputs) error {
 		attempts.Add(1)
 		return errors.New("deterministic 500 — never succeeds")
-	}, func() bool {
-		for _, k := range keys {
-			if _, ok := c.Get(k); ok {
-				return false
-			}
-		}
-		return true
-	})
+	}, func() bool { return refresherSingleton().droppedTotal.Load() >= uint64(len(keys)) })
 
 	for _, k := range keys {
-		if _, ok := c.Get(k); ok {
-			t.Fatalf("F5a RED: entry %s survived a deterministic failure across the whole requeue "+
-				"budget — the drop point must EVICT (rule: no outcome may end in forget-and-keep)", k[:8])
+		e, ok := c.GetNoTouch(k)
+		if !ok {
+			t.Fatalf("F5a: entry %s EVICTED at the drop point — #547: a non-404 failure is not a deletion; "+
+				"the cell stays resident (zero cold navigations)", k[:8])
+		}
+		if string(e.RawJSON) != `{"body":"old"}` {
+			t.Fatalf("F5a: the dropped entry's body changed")
+		}
+		if _, reason, ok := KnownStale(k); !ok || reason != "dropped" {
+			t.Fatalf("F5a RED: entry %s is resident but NOT known-stale after its refresh was dropped "+
+				"(ok=%v reason=%q) — forget-as-fresh, the #547 defect", k[:8], ok, reason)
 		}
 	}
-	st := RefreshTerminalStatsSnapshot()
-	if st.DropEvictTotal != uint64(len(keys)) {
-		t.Fatalf("F5a: drop_evict_total = %d, want %d", st.DropEvictTotal, len(keys))
-	}
-	if st.DropEvictSuspendedTotal != 0 || st.DropEvictSuspendWarns != 0 {
-		t.Fatalf("F5a: breaker engaged for %d keys (suspended=%d warns=%d) — a handful of failures "+
-			"is the CORRECTNESS regime, the breaker must stay idle", len(keys), st.DropEvictSuspendedTotal, st.DropEvictSuspendWarns)
-	}
-	// Each key spent its full budget before the eviction: 1 initial + maxRefreshRequeues.
+	// Each key spent its full budget: 1 initial + maxRefreshRequeues.
 	if want := int32(len(keys) * (1 + maxRefreshRequeues)); attempts.Load() != want {
-		t.Fatalf("F5a: attempts = %d, want %d (full budget per key, then evict)", attempts.Load(), want)
+		t.Fatalf("F5a: attempts = %d, want %d (full budget per key)", attempts.Load(), want)
 	}
 	if got := RefresherSelfNotFoundEvictTotal(); got != 0 {
-		t.Fatalf("F5a: self_notfound_evict_total = %d, want 0 — the C4 route must not be counted as the 404 route", got)
+		t.Fatalf("F5a: self_notfound_evict_total = %d, want 0 — a 500 is not a confirmed 404", got)
 	}
 }
 
-func TestRefreshTerminal_F5b_MassFailureIsSuspendedAndStillServed(t *testing.T) {
+func TestRefreshTerminal_F5b_MassFailureStaysResidentServedAndKnownStale(t *testing.T) {
 	terminalEnv(t)
-	// Drive the regime by LOWERING the knob, not by generating 129 keys: the
-	// arm is independent of the default and survives a re-tune.
-	t.Setenv(envRefreshDropEvictMaxPerMinute, "1")
 	const n = 6
 	c, keys := terminalFixture(t, n)
+	served0 := ResolvedCacheStatsByStat()["known_stale_served_dropped_total"]
 
-	var attempts atomic.Int32
-	terminalRun(t, c, keys, func(context.Context, string, ResolvedKeyInputs) error {
-		attempts.Add(1)
+	terminalRunMarked(t, keys, func(context.Context, string, ResolvedKeyInputs) error {
 		return errors.New("mass failure — apiserver down")
-	}, func() bool {
-		// settled == every key has spent its budget (1 + maxRefreshRequeues each)
-		return attempts.Load() >= int32(n*(1+maxRefreshRequeues)) &&
-			refresherSingleton().droppedTotal.Load() >= n
-	})
+	}, func() bool { return refresherSingleton().droppedTotal.Load() >= n })
 
-	resident := 0
 	for _, k := range keys {
-		if e, ok := c.Get(k); ok {
-			resident++
-			if string(e.RawJSON) != `{"body":"old"}` {
-				t.Fatalf("F5b: a suspended entry's body changed")
-			}
+		e, ok := c.Get(k) // a customer serve: it must still be served
+		if !ok || string(e.RawJSON) != `{"body":"old"}` {
+			t.Fatalf("F5b: a mass failure must leave every entry resident AND served (ok=%v)", ok)
+		}
+		if _, _, ks := KnownStale(k); !ks {
+			t.Fatalf("F5b: entry %s served but not known-stale", k[:8])
 		}
 	}
-	st := RefreshTerminalStatsSnapshot()
-	// Budget 1/min: exactly ONE eviction is allowed inside the window; the
-	// other n-1 must stay resident AND served.
-	if resident != n-1 {
-		t.Fatalf("F5b RED: %d of %d entries resident after a mass failure with budget 1/min; want %d "+
-			"— an unbounded drop-point evict turns a stale portal into a broken one during an outage",
-			resident, n, n-1)
-	}
-	if st.DropEvictTotal != 1 {
-		t.Fatalf("F5b: drop_evict_total = %d, want 1", st.DropEvictTotal)
-	}
-	if st.DropEvictSuspendedTotal != n-1 {
-		t.Fatalf("F5b: drop_evict_suspended_total = %d, want %d", st.DropEvictSuspendedTotal, n-1)
-	}
-	if st.DropEvictSuspendWarns != 1 {
-		t.Fatalf("F5b: suspension WARNs = %d, want exactly 1 per window", st.DropEvictSuspendWarns)
+	if got := ResolvedCacheStatsByStat()["known_stale_served_dropped_total"] - served0; got != n {
+		t.Fatalf("F5b: known_stale_served_dropped_total moved %d, want %d (one per customer serve above)", got, n)
 	}
 }
 
-func TestRefreshTerminal_KillSwitch_ZeroRestoresDropToTTL(t *testing.T) {
+// F6m — a non-permanent (stage-error) decline never suppresses since #547:
+// every change retries, and the cell is known-stale meanwhile.
+func TestRefreshTerminal_F6m_StageErrorDeclinesNeverSuppressAndStayKnownStale(t *testing.T) {
 	terminalEnv(t)
-	t.Setenv(envRefreshDropEvictMaxPerMinute, "0")
-	c, keys := terminalFixture(t, 2)
-
-	terminalRun(t, c, keys, func(context.Context, string, ResolvedKeyInputs) error {
-		return errors.New("deterministic failure")
-	}, func() bool { return refresherSingleton().droppedTotal.Load() >= 2 })
-
-	for _, k := range keys {
-		if _, ok := c.Get(k); !ok {
-			t.Fatalf("KILL: entry %s evicted with REFRESH_DROP_EVICT_MAX_PER_MINUTE=0 — the kill switch "+
-				"must restore the 1.12.5 drop-to-TTL byte-for-byte", k[:8])
-		}
-	}
-	st := RefreshTerminalStatsSnapshot()
-	if st.DropEvictTotal != 0 || st.DropEvictSuspendedTotal != 0 || st.DropEvictSuspendWarns != 0 {
-		t.Fatalf("KILL: breaker counters moved (%+v) with the knob at 0", st)
-	}
-}
-
-// F6m — suppression mechanism end-to-end through the real loop.
-func TestRefreshTerminal_F6m_SuppressAfterKDeclinesAndClearOnPut(t *testing.T) {
-	terminalEnv(t)
-	t.Setenv(envRefreshSuppressAfterDeclines, "3")
 	c, keys := terminalFixture(t, 1)
 	key := keys[0]
 
@@ -240,50 +195,70 @@ func TestRefreshTerminal_F6m_SuppressAfterKDeclinesAndClearOnPut(t *testing.T) {
 	defer cancel()
 	StartRefresher(ctx)
 
-	// K=3 declines.
-	for i := 1; i <= 3; i++ {
-		enqueueRefreshForTest(key)
+	for i := 1; i <= 4; i++ {
+		terminalMark(keys)
 		want := int32(i)
 		waitFor(t, 5*time.Second, "handler invoked", func() bool { return invocations.Load() >= want })
 	}
-	// Architect N3: a dirty-mark GVR recorded at enqueue must be CONSUMED by
-	// a suppressed skip, not left to force-miss an arbitrarily later dequeue.
-	// Stored before the enqueue so the worker cannot outrun the store.
-	n3GVR := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "flexes"}
-	refresherPeek().triggerGVRByKey.Store(key, n3GVR)
+	waitFor(t, 5*time.Second, "window settled known-stale", func() bool {
+		_, r, ok := KnownStale(key)
+		return ok && r == "declined"
+	})
+	if _, ok := RefreshSuppressedReason(key); ok {
+		t.Fatalf("F6m: a non-permanent decline suppressed the key — #547 retired REFRESH_SUPPRESS_AFTER_DECLINES")
+	}
+	if _, ok := c.GetNoTouch(key); !ok {
+		t.Fatalf("F6m: a decline evicted the entry")
+	}
+	cancel()
+	resetRefresherForTestKeepTerminalCounters()
+}
 
-	// The (K+1)th dequeue must NOT invoke the handler. BEHAVIOUR FIRST: wait
-	// for either outcome (the skip was counted, or the handler ran a 4th
-	// time) and then assert on the invocation count — on a tree without the
-	// mechanism this reads "handler invoked 4 times" (#191), not "marker API
-	// returned false".
-	enqueueRefreshForTest(key)
-	waitFor(t, 5*time.Second, "4th dequeue settled (skipped or resolved)", func() bool {
-		return RefreshTerminalStatsSnapshot().SuppressedSkipsTotal >= 1 || invocations.Load() >= 4
+// F6s — the structurally-permanent suppression end-to-end through the real loop.
+func TestRefreshTerminal_F6s_PermanentDeclineSuppressesSkipEndsKnownStale(t *testing.T) {
+	terminalEnv(t)
+	c, keys := terminalFixture(t, 1)
+	key := keys[0]
+
+	var invocations atomic.Int32
+	RegisterRefreshFunc("widgets", func(_ context.Context, k string, _ ResolvedKeyInputs) error {
+		invocations.Add(1)
+		NoteRefreshDecline(k, "uaf", true)
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartRefresher(ctx)
+
+	terminalMark(keys)
+	waitFor(t, 5*time.Second, "handler invoked", func() bool { return invocations.Load() >= 1 })
+	waitFor(t, 5*time.Second, "first window settled", func() bool { _, _, ok := KnownStale(key); return ok })
+
+	// Architect N3: a dirty-mark GVR recorded at enqueue must be CONSUMED by a
+	// suppressed skip. terminalMark merges it before the enqueue.
+	terminalMark(keys)
+	waitFor(t, 5*time.Second, "2nd dequeue settled (skipped or resolved)", func() bool {
+		return RefreshTerminalStatsSnapshot().SuppressedSkipsTotal >= 1 || invocations.Load() >= 2
 	})
 	time.Sleep(50 * time.Millisecond)
-	if invocations.Load() != 3 {
-		t.Fatalf("F6m RED: handler invoked %d times; a suppressed key must be skipped without a resolve (#191)", invocations.Load())
+	if invocations.Load() != 1 {
+		t.Fatalf("F6s: handler invoked %d times; a suppressed key must be skipped without a resolve (#191)", invocations.Load())
 	}
-	if _, ok := c.Get(key); !ok {
-		t.Fatalf("F6m: suppression must keep the entry resident (refresh-by-traffic-only), it was evicted")
-	}
-	if reason, ok := RefreshSuppressedReason(key); !ok || reason != "stage_error" {
-		t.Fatalf("F6m: key not marked suppressed after 3 consecutive declines (reason=%q ok=%v)", reason, ok)
+	if _, r, ok := KnownStale(key); !ok || r != "suppressed" {
+		t.Fatalf("F6s: a suppressed skip must leave the cell known-stale (reason suppressed), got ok=%v reason=%q", ok, r)
 	}
 	if v, present := refresherPeek().triggerGVRByKey.Load(key); present {
-		t.Fatalf("F6m RED (N3): the suppressed skip left the trigger GVR %v in triggerGVRByKey — "+
-			"it would force-miss whatever dequeue first runs after the next real Put", v)
+		t.Fatalf("F6s (N3): the suppressed skip left the trigger GVR %v in triggerGVRByKey", v)
 	}
 
 	// One real Put clears the marker → the next dequeue resolves again.
-	e, _ := c.Get(key)
+	e, _ := c.GetNoTouch(key)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"traffic"}`), Inputs: e.Inputs})
 	if _, still := RefreshSuppressedReason(key); still {
-		t.Fatalf("F6m RED: marker survived a real Put — suppress-and-never-recover")
+		t.Fatalf("F6s: marker survived a real Put — suppress-and-never-recover")
 	}
-	enqueueRefreshForTest(key)
-	waitFor(t, 5*time.Second, "handler resumes after Put", func() bool { return invocations.Load() >= 4 })
+	terminalMark(keys)
+	waitFor(t, 5*time.Second, "handler resumes after Put", func() bool { return invocations.Load() >= 2 })
 	cancel()
 	resetRefresherForTestKeepTerminalCounters()
 }
@@ -318,8 +293,8 @@ func TestRefreshTerminal_B1_SnapshotRacesFirstConstructionWithoutConstructing(t 
 	}()
 	close(start)
 	wg.Wait()
-	if st.SuppressAfterDeclines != RefreshSuppressAfterDeclines() {
-		t.Fatalf("snapshot = %+v, knob = %d", st, RefreshSuppressAfterDeclines())
+	if st.SuppressedKeys < 0 {
+		t.Fatalf("snapshot = %+v", st)
 	}
 
 	// And in isolation: a read on a clean process must not construct.
@@ -332,7 +307,6 @@ func TestRefreshTerminal_B1_SnapshotRacesFirstConstructionWithoutConstructing(t 
 
 // F6p — structurally permanent declines suppress on the FIRST occurrence.
 func TestRefreshTerminal_F6p_PermanentDeclinesSuppressImmediately(t *testing.T) {
-	t.Setenv(envRefreshSuppressAfterDeclines, "3")
 	resetRefreshTerminalForTest()
 	t.Cleanup(resetRefreshTerminalForTest)
 	for _, reason := range []string{"external_touched", "uaf", "unsupported_kind"} {
@@ -344,15 +318,14 @@ func TestRefreshTerminal_F6p_PermanentDeclinesSuppressImmediately(t *testing.T) 
 			t.Fatalf("F6p: reason = %q, want %q", got, reason)
 		}
 	}
-	// A non-permanent decline needs K.
-	if NoteRefreshDecline("k-stage", "stage_error", false) || NoteRefreshDecline("k-stage", "stage_error", false) {
-		t.Fatalf("F6p: stage_error suppressed before K=3 declines")
+	// #547 — a non-permanent decline never suppresses (no K).
+	for i := 0; i < 5; i++ {
+		if NoteRefreshDecline("k-stage", "stage_error", false) {
+			t.Fatalf("F6p: stage_error suppressed at decline %d — REFRESH_SUPPRESS_AFTER_DECLINES is retired", i+1)
+		}
 	}
-	if !NoteRefreshDecline("k-stage", "stage_error", false) {
-		t.Fatalf("F6p: stage_error not suppressed at the 3rd decline")
-	}
-	if st := RefreshTerminalStatsSnapshot(); st.SuppressedKeys != 4 || st.SuppressedSetTotal != 4 {
-		t.Fatalf("F6p: stats = %+v, want 4 suppressed keys", st)
+	if st := RefreshTerminalStatsSnapshot(); st.SuppressedKeys != 3 || st.SuppressedSetTotal != 3 {
+		t.Fatalf("F6p: stats = %+v, want 3 suppressed keys", st)
 	}
 }
 

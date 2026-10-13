@@ -107,8 +107,8 @@ func TestC7_OTLP_EveryDerivedStatLeavesTheProcess(t *testing.T) {
 
 	cache.ResetRefresherForTest()
 	t.Cleanup(cache.ResetRefresherForTest)
-	cache.AddRefreshTerminalCountersForTest(3001, 3002, 3003, 3004, 7)
-	wantR := map[string]int64{"drop_evict": 3001, "drop_evict_suspended": 3002, "suppressed_set": 3003, "suppressed_skips": 3004, "suppressed_keys": 7}
+	cache.AddRefreshTerminalCountersForTest(3003, 3004, 7)
+	wantR := map[string]int64{"suppressed_set": 3003, "suppressed_skips": 3004, "suppressed_keys": 7}
 	for i, s := range fams[2].Specs {
 		if _, ok := wantR[s.Stat]; ok || s.Kind == "gauge" {
 			continue // queue_depth is a live Len(): presence only

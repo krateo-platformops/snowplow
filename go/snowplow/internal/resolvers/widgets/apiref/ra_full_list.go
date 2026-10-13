@@ -432,6 +432,13 @@ func raFullListServe(
 		if internalRead {
 			readRA = c.GetNoTouch
 		}
+		// #547 — a KNOWN-STALE full list is a resolve INPUT: read it through
+		// (a MISS here; the fall-through below resolves the RA live), never
+		// Go-slice it into a fresh-looking widget cell. Checked BEFORE the read
+		// so the cell is not counted as served.
+		if cache.KnownStaleReadThrough(raKey) {
+			readRA = func(string) (*cache.ResolvedEntry, bool) { return nil, false }
+		}
 		if entry, ok := readRA(raKey); ok {
 			// #444 — the requester joins the cell's representative pool. A
 			// background driver is not a requester.

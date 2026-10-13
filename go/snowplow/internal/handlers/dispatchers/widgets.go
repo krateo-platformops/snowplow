@@ -62,12 +62,20 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	pcs, pcEmit := beginPerCall(req, "widgets")
 	defer pcEmit()
 
-	// Ship 1 — customer-priority signal (see restactions.go). Marks this
-	// /call as in-flight so the prewarm engine yields its background
-	// re-seed work for the dispatch's duration.
-	defer markCustomerInFlight()()
-	// #262 S2 — see restactions.go.
-	observeLiveCaller(req)
+	// #547 — a demand revalidation re-enters this handler on a detached copy of
+	// a request that was already served (demand_revalidate.go): no customer is
+	// waiting on it and its caller was already observed.
+	demand := isDemandRevalidation(req)
+	if demand {
+		pcs.l1Hit = "revalidate"
+	} else {
+		// Ship 1 — customer-priority signal (see restactions.go). Marks this
+		// /call as in-flight so the prewarm engine yields its background
+		// re-seed work for the dispatch's duration.
+		defer markCustomerInFlight()()
+		// #262 S2 — see restactions.go.
+		observeLiveCaller(req)
+	}
 
 	extras, err := util.ParseExtras(req)
 	if err != nil {
@@ -194,13 +202,25 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// straight through to the per-cohort `widgets` L1 lookup below
 	// (dispatchCacheLookupKey), which is RBAC-narrowed at resolve under
 	// each cohort's own identity → no shared cell, no leak.
-	if !isRBACSensitiveApiRefWidget(got.Unstructured.Object) {
+	//
+	// #547 — a demand revalidation resolves; it never reads a cell.
+	if !demand && !isRBACSensitiveApiRefWidget(got.Unstructured.Object) {
 		contentKey, contentHandle, _ := dispatchWidgetContentKey(req.Context(),
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, keyExtras)
+		// #547 (owner ruling 3) — a KNOWN-STALE identity-free shell is READ
+		// THROUGH, never served: this request falls through to its OWN
+		// per-cohort cell below, which it resolves and fills under its own
+		// identity. The shared shell is never written from that resolve (it has
+		// no Put here); the informer's next change re-enqueues its refresh.
 		if contentHandle != nil {
-			if entry, ok := contentHandle.Get(contentKey); ok {
+			var entry *cache.ResolvedEntry
+			ok := false
+			if !cache.KnownStaleReadThrough(contentKey) { // else: a MISS
+				entry, ok = contentHandle.Get(contentKey)
+			}
+			if ok {
 				if gated, served := gateWidgetEnvelope(req.Context(), entry.RawJSON); served {
 					cache.RecordApiserverFallthrough(req.Context(),
 						cache.ReasonWidgetContentHit, got.GVR.String())
@@ -250,7 +270,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// shared "" cell to a different ""-deriving identity (cross-identity read of
 	// a cell resolved under someone else's narrowing). Sibling of FIX-C's
 	// populate-side skip; uniform predicate (serveFromCacheEligible, helpers.go).
-	if cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
+	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
@@ -268,6 +288,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// byte-identical header behavior when the feature is off (C4).
 			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
 			writeResolvedJSON(wri, entry.RawJSON)
+			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
+			// revalidate it on demand under this requester, detached.
+			revalidateKnownStale(r, req, cacheKey)
 			log.Info("Widget successfully resolved",
 				slog.String("duration", util.ETA(start)),
 				slog.String("l1", "hit"),

@@ -149,26 +149,20 @@ func TestRefreshEviction_S1d_TTLAndLRU_Silent(t *testing.T) {
 	})
 
 	t.Run("drop-point-non404-silent", func(t *testing.T) {
-		// 1.12.6 C4 (Track B) shares EvictSelfGone's body with EvictDropPoint:
-		// a deterministic NON-404 refresh failure (403 / 500 / timeout) that
-		// exhausts the requeue budget is evicted at the drop point behind
-		// the breaker. That is NOT a confirmed deletion — during an apiserver
-		// outage it fires for every entry that comes up for refresh — so it
-		// must never publish: an armed tab told "your widgets were deleted"
-		// would refetch into the same outage. Drives the REAL breaker route
-		// (the refresher loop, the same shape as Track B's B3b/F4 arms with
-		// a 500 instead of ErrSelfObjectGone) with an armed subscriber.
-		//
-		// RED discipline: main will already contain Track B when this lands,
-		// so this arm is not RED on main; it is RED on the variant that
-		// publishes from the shared body evictSelfEntry instead of the
-		// EvictSelfGone arm (probe P12 in the dev report).
+		// A deterministic NON-404 refresh failure (403 / 500 / timeout) that
+		// exhausts the requeue budget is NOT a confirmed deletion — during an
+		// apiserver outage it fires for every entry that comes up for refresh —
+		// so it must never publish: an armed tab told "your widgets were
+		// deleted" would refetch into the same outage. 1.12.6 C4 evicted it
+		// silently behind a breaker; #547 retired that eviction: the entry
+		// stays RESIDENT and KNOWN-STALE, and the drop point still publishes
+		// nothing. Drives the REAL drop route (the refresher loop, a 500
+		// instead of ErrSelfObjectGone) with an armed subscriber.
 		withRefreshLayer(t)
 		t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 		t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
 		t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
 		t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
-		t.Setenv("REFRESH_DROP_EVICT_MAX_PER_MINUTE", "64") // the default, pinned: the breaker grants
 		resetRefresherForTest()
 		defer resetRefresherForTest()
 		defer withCleanDepWatch(t)()
@@ -187,7 +181,6 @@ func TestRefreshEviction_S1d_TTLAndLRU_Silent(t *testing.T) {
 
 		ch, unsub := SubscribeRefresh(map[string]struct{}{key: {}})
 		defer unsub()
-		beforeDropPoint := DepsStatsByStat()["evict_drop_point_total"]
 		beforeSelfGone := Deps().Stats().EvictSelfGoneTotal
 
 		var attempts atomic.Int64
@@ -199,31 +192,34 @@ func TestRefreshEviction_S1d_TTLAndLRU_Silent(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		StartRefresher(ctx)
-		EnqueueRefresh(key)
+		refresherSingleton().onDirtyMark(key, gvr, nil)
 
 		deadline := time.Now().Add(20 * time.Second)
 		for time.Now().Before(deadline) {
-			if _, ok := store.Get(key); !ok && attempts.Load() > maxRefreshRequeues {
+			if refresherSingleton().droppedTotal.Load() >= 1 {
 				break
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
-		if _, ok := store.Get(key); ok {
-			t.Fatalf("S1d precondition: after %d non-404 failures the entry is still resident — the drop point did not evict", attempts.Load())
+		if attempts.Load() <= maxRefreshRequeues {
+			t.Fatalf("S1d precondition: only %d attempts — the budget was not spent", attempts.Load())
 		}
-		if got := DepsStatsByStat()["evict_drop_point_total"]; got != beforeDropPoint+1 {
-			t.Fatalf("S1d precondition: evict_drop_point_total=%d want %d — the eviction did not route through EvictDropPoint", got, beforeDropPoint+1)
+		if _, ok := store.GetNoTouch(key); !ok {
+			t.Fatalf("S1d: after %d non-404 failures the entry was EVICTED — #547: it stays resident, known-stale", attempts.Load())
+		}
+		if _, _, ok := KnownStale(key); !ok {
+			t.Fatalf("S1d: the dropped entry is not known-stale")
 		}
 		if got := Deps().Stats().EvictSelfGoneTotal; got != beforeSelfGone {
 			t.Fatalf("S1d precondition: evict_self_gone_total moved (%d -> %d) for a 500", beforeSelfGone, got)
 		}
 		if got, ok := drainOne(t, ch, 500*time.Millisecond); ok {
-			t.Fatalf("S1d RED: a NON-404 drop-point eviction published %q to an armed subscriber — "+
-				"the publish must live in the EvictSelfGone (confirmed 404) arm, never in the shared "+
-				"evictSelfEntry body: an apiserver outage would tell every armed tab its widgets were deleted", got)
+			t.Fatalf("S1d RED: a NON-404 drop point published %q to an armed subscriber — "+
+				"only a confirmed 404 (EvictSelfGone) may: an apiserver outage would tell every armed tab "+
+				"its widgets were deleted", got)
 		}
 		if st := RefreshBroadcasterStatsSnapshot(); st.EvictPublished != 0 || st.Delivered != 0 {
-			t.Fatalf("S1d RED: evict_published=%d delivered=%d after a drop-point eviction, want 0/0", st.EvictPublished, st.Delivered)
+			t.Fatalf("S1d RED: evict_published=%d delivered=%d after a non-404 drop, want 0/0", st.EvictPublished, st.Delivered)
 		}
 	})
 }

@@ -344,9 +344,17 @@ of the transport. Failing fast also shows the not-found state in ~0 s instead of
 
 **TTL, LRU and max-age evictions stay silent, and clients must not expect frames from them.**
 Those are capacity or freshness decisions about snowplow's cache, not facts about the data: the
-object still exists and the body the browser holds is still valid. The same holds for the
-non-404 drop-point eviction behind the refresh breaker (new in 1.12.6 Track B), which drops an
-entry without any evidence the object is gone. Only the two DELETE-semantics sites publish; that third site (`EvictDropPoint`) is pinned silent by snowplow's S1d drop-point test.
+object still exists and the body the browser holds is still valid. A refresh that fails
+deterministically for a NON-404 reason is not a deletion either: since #547 it evicts nothing
+(the 1.12.6 drop-point eviction is retired) and publishes nothing — the cell stays resident and
+KNOWN-STALE, pinned silent by snowplow's S1d drop-point test. Only the two DELETE-semantics sites
+publish an eviction.
+
+**A known-stale cell heals on the next read (#547).** When any client reads a known-stale cell
+(its last refresh failed), snowplow serves the cached body and revalidates it in the background
+under that reader's identity. If the revalidation is accepted, every tab armed for the key
+receives an ordinary `refresh` frame — the same frame a refresher re-Put sends — so a mounted page
+updates without a reload. Nothing new to handle on the client: refetch on `refresh` as usual.
 
 ---
 

@@ -1,6 +1,8 @@
 // otlp_export_c4_test.go — 1.12.6 C4 follow-up (arch N9), the value arm:
 // every C4 terminal-semantics counter is mirrored to OTLP and the mirror
-// reads the LIVE counters. Four monotonic counters ride snowplow_refresher
+// reads the LIVE counters. #547 retired the drop-point breaker and its
+// drop_evict / drop_evict_suspended counters. The two remaining monotonic
+// counters ride snowplow_refresher
 // under their own stat label (the expvar names minus the prefix/suffix);
 // the live count of suppressed keys is a gauge of its own,
 // snowplow_refresher_suppressed_keys, because it drops on Put and eviction
@@ -40,7 +42,7 @@ func c4FindGauge(exports []capturedExport, name string) (val int64, found bool) 
 	return 0, false
 }
 
-func TestIssue1126_N9_AllFiveC4RefresherCountersExport(t *testing.T) {
+func TestIssue1126_N9_AllC4RefresherCountersExport(t *testing.T) {
 	rcv := newOTLPReceiver(t)
 	t.Setenv("OTEL_ENABLED", "true")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", rcv.srv.URL)
@@ -48,10 +50,9 @@ func TestIssue1126_N9_AllFiveC4RefresherCountersExport(t *testing.T) {
 
 	cache.ResetRefreshTerminalForTest()
 	t.Cleanup(cache.ResetRefreshTerminalForTest)
-	// drop_evict=1 suspended=2 suppressed_set=3 suppressed_skips=4 keys=5
-	cache.AddRefreshTerminalCountersForTest(1, 2, 3, 4, 5)
-	if ts := cache.RefreshTerminalStatsSnapshot(); ts.DropEvictTotal != 1 || ts.DropEvictSuspendedTotal != 2 ||
-		ts.SuppressedSetTotal != 3 || ts.SuppressedSkipsTotal != 4 || ts.SuppressedKeys != 5 {
+	// suppressed_set=3 suppressed_skips=4 keys=5
+	cache.AddRefreshTerminalCountersForTest(3, 4, 5)
+	if ts := cache.RefreshTerminalStatsSnapshot(); ts.SuppressedSetTotal != 3 || ts.SuppressedSkipsTotal != 4 || ts.SuppressedKeys != 5 {
 		t.Fatalf("setup: the counters themselves did not move (%+v) — the arm would test nothing", ts)
 	}
 
@@ -71,10 +72,8 @@ func TestIssue1126_N9_AllFiveC4RefresherCountersExport(t *testing.T) {
 	}
 
 	for stat, want := range map[string]int64{
-		"drop_evict":           1,
-		"drop_evict_suspended": 2,
-		"suppressed_set":       3,
-		"suppressed_skips":     4,
+		"suppressed_set":   3,
+		"suppressed_skips": 4,
 	} {
 		got, found := c4FindSumByStat(exports, "snowplow_refresher", stat)
 		if !found {

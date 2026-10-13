@@ -202,18 +202,15 @@ func TestRefresher_ErrorRetriesThenForgets(t *testing.T) {
 // the retry loop stops, droppedTotal ticks, and the entry stays in L1
 // (TTL outer-net) rather than being resurrected or evicted.
 //
-// 1.12.6 C4 (§6.2 row 3): with the drop-point eviction ENABLED (the
-// default, REFRESH_DROP_EVICT_MAX_PER_MINUTE=64) a deterministic failure now
-// EVICTS at the drop point — that is TestRefreshTerminal_F5a. This arm pins
-// the kill switch: with the knob at "0" the 1.12.5 behaviour is byte-for-
-// byte unchanged (dropped to TTL, entry resident).
+// #547: the dropped entry stays resident and KNOWN-STALE (1.12.6 C4's
+// drop-point eviction and its REFRESH_DROP_EVICT_MAX_PER_MINUTE breaker are
+// retired) — TestRefreshTerminal_F5a pins the known-stale stamp.
 func TestRefresher_PoisonPillDroppedAfterCap(t *testing.T) {
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// Tight backoff so the cap is reached fast.
 	t.Setenv(envRefresherBaseDelayMS, "5")
 	t.Setenv(envRefresherMaxDelayMS, "20")
-	t.Setenv(envRefreshDropEvictMaxPerMinute, "0") // kill switch: pre-1.12.6 drop-to-TTL
 	resetRefresherForTest()
 
 	c := ResolvedCache()
