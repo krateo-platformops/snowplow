@@ -952,7 +952,12 @@ func resolveRAFullListForRefresh(ctx context.Context, got objects.Result, inputs
 // CR, returning encoded output. Mirrors the widgetsHandler.ServeHTTP
 // resolve+encode path.
 func resolveWidgetForRefresh(ctx context.Context, got objects.Result, inputs cache.ResolvedKeyInputs, authnNS string) ([]byte, error) {
-	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
+	// #547 — through widgetsResolveFn, the SAME seam the customer handler
+	// resolves through (dispatch_seams.go; production default widgets.Resolve, so
+	// the compiled path is byte-identical). One resolve seam for both callers is
+	// what lets a falsifier inject a failure that only the BACKGROUND identity
+	// sees (cache.BackgroundResolveFromContext) and drive the real refresher.
+	res, err := widgetsResolveFn(ctx, widgets.ResolveOptions{
 		In: got.Unstructured,
 		// Ship 0.30.230 fix-at-root: RC threaded from ctx. The
 		// refresher's resolveAndPopulateL1 (resolve_populate.go:191)
