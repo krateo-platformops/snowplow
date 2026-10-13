@@ -121,8 +121,10 @@ func ResolveNestedCall(
 	// Step 2 — fetch the referenced CR under ctx's identity.
 	got := objects.Get(ctx, ref)
 	if got.Err != nil {
-		return nil, fmt.Errorf("nested resolve: fetch %s/%s: %s",
-			ref.Resource, ref.Name, got.Err.Message)
+		// #630 — keep the apiserver status typed (403 stays IsForbidden), the
+		// same repair as the refresher's re-fetch; the text is unchanged.
+		return nil, fmt.Errorf("nested resolve: fetch %s/%s: %w",
+			ref.Resource, ref.Name, statusErrFromResponse(got.Err))
 	}
 	if got.Unstructured == nil {
 		return nil, fmt.Errorf("nested resolve: fetch %s/%s: nil object",

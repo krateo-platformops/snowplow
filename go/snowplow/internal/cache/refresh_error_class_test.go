@@ -45,6 +45,13 @@ func TestIssue608_ClassifyRefreshError(t *testing.T) {
 		{"no kind match", wrap(ResolveStageValidate, &meta.NoKindMatchError{GroupKind: schema.GroupKind{Kind: "K"}}), RefreshErrDiscovery, ResolveStageValidate, false},
 		{"unstaged plain", errors.New("encode failed"), RefreshErrUnclassified, ResolveStageNone, false},
 		{"401", apierrors.NewUnauthorized("no"), RefreshErrUnauthorized, ResolveStageNone, false},
+		// #630 — the re-fetch of the cell's own CR is its own stage, and a 403
+		// on it is forbidden + non-retryable like every other 403.
+		{"403 at refetch", fmt.Errorf("resolveAndPopulateL1 widgets/x: %w",
+			WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x", apierrors.NewForbidden(schema.GroupResource{Resource: "flexes"}, "x", errors.New("no")))),
+			RefreshErrForbidden, ResolveStageRefetch, true},
+		{"404 at refetch", WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x",
+			apierrors.NewNotFound(schema.GroupResource{Resource: "flexes"}, "x")), RefreshErrNotFound, ResolveStageRefetch, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, s := ClassifyRefreshError(tc.err)
@@ -65,11 +72,17 @@ func TestIssue608_RefreshFailedByClass_ClosedSet(t *testing.T) {
 	t.Cleanup(ResetRefreshFailedByClassForTest)
 	recordRefreshFailedClass(RefreshErrForbidden, ResolveStageValidate)
 	recordRefreshFailedClass("made-up", "made-up")
+	// #630 — refetch is IN the closed set (its own series, not folded into
+	// none), and its spelling is the literal the dispatchers arm asserts.
+	if ResolveStageRefetch != "refetch" {
+		t.Fatalf("ResolveStageRefetch = %q, want \"refetch\"", ResolveStageRefetch)
+	}
+	recordRefreshFailedClass(RefreshErrForbidden, ResolveStageRefetch)
 	got := map[string]uint64{}
 	for _, c := range RefreshFailedByClassSnapshot() {
 		got[c.Class+"/"+c.Stage] = c.N
 	}
-	want := map[string]uint64{"forbidden/validate": 1, "unclassified/none": 1}
+	want := map[string]uint64{"forbidden/validate": 1, "unclassified/none": 1, "forbidden/refetch": 1}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("by-class snapshot = %v, want %v", got, want)
 	}
