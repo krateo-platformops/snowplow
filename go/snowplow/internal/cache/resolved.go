@@ -682,6 +682,12 @@ type ResolvedCacheStore struct {
 	// has claimed. See stripDepEdges.
 	depStrip atomic.Pointer[depStripFn]
 
+	// entryClassNote tells the wired dep tracker each stored key's
+	// CacheEntryClass, so a dirty-mark can be attributed to its entry class
+	// from the dep edge itself, with no store read on the mark path (#479 1b /
+	// #603 PR-0). nil until DepTracker.SetStore installs it.
+	entryClassNote atomic.Pointer[entryClassFn]
+
 	// LRU eviction order: front = most-recently-used.
 	order *list.List
 	// layers — #406: the raKey <-> widget consumer index (ra_full_list_layers.go).
@@ -2121,6 +2127,7 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		c.order.MoveToFront(el)
 		c.storeTotal.Add(1)
 		c.bumpClassStoreLocked(apistage, widgetContent, raFullList)
+		c.noteEntryClassLocked(key, entry)
 		c.evictUntilUnderCapsLocked()
 		return
 	}
@@ -2149,6 +2156,7 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 	}
 	c.storeTotal.Add(1)
 	c.bumpClassStoreLocked(apistage, widgetContent, raFullList)
+	c.noteEntryClassLocked(key, entry)
 
 	c.evictUntilUnderCapsLocked()
 }
@@ -3142,6 +3150,61 @@ func (c *ResolvedCacheStore) stripDepEdges(l1Key string) {
 		}
 	}
 	Deps().RemoveL1Key(l1Key)
+}
+
+// entryClassFn tells the dep tracker the CacheEntryClass of a key the store
+// just stored (#479 1b / #603 PR-0). The production value is
+// DepTracker.noteEntryClass, installed by DepTracker.SetStore.
+type entryClassFn func(l1Key, class string)
+
+// setEntryClassHook installs the class note putCoreLocked calls on every
+// accepted store. Nil clears. Unlike the strip there is no singleton fallback:
+// the note feeds a COUNTER's label, so an unwired store only leaves marks
+// attributed "unknown" — it can never change what is marked or kept.
+func (c *ResolvedCacheStore) setEntryClassHook(fn entryClassFn) {
+	if c == nil {
+		return
+	}
+	if fn == nil {
+		c.entryClassNote.Store(nil)
+		return
+	}
+	c.entryClassNote.Store(&fn)
+}
+
+// noteEntryClassLocked forwards the stored entry's class to the class hook.
+// Runs under c.mu (like the strip); the hook is lock-free (one sync.Map Load).
+func (c *ResolvedCacheStore) noteEntryClassLocked(key string, entry *ResolvedEntry) {
+	if entry == nil || entry.Inputs == nil || entry.Inputs.CacheEntryClass == "" {
+		return
+	}
+	if fn := c.entryClassNote.Load(); fn != nil && *fn != nil {
+		(*fn)(key, entry.Inputs.CacheEntryClass)
+	}
+}
+
+// tryPeekEntryClass returns the resident entry's CacheEntryClass under key, or
+// "" when the key is not resident, carries no Inputs, or c.mu is busy.
+//
+// A PURE PEEK: no lazy evict, no touch, no hit/miss accounting — it mutates
+// nothing. It TRY-locks, never blocks: the dep tracker calls it from
+// recordInternal, and a Record must never wait on (or self-deadlock against)
+// the customer-facing store mutex for the sake of a counter label. A busy lock
+// leaves the class unlearned until the next accepted store of the key, whose
+// class note fills it (#479 1b / #603 PR-0).
+func (c *ResolvedCacheStore) tryPeekEntryClass(key string) string {
+	if c == nil || !c.mu.TryLock() {
+		return ""
+	}
+	defer c.mu.Unlock()
+	el, ok := c.index[key]
+	if !ok {
+		return ""
+	}
+	if e := el.Value.(*lruItem).entry; e != nil && e.Inputs != nil {
+		return e.Inputs.CacheEntryClass
+	}
+	return ""
 }
 
 // deleteForDep removes the entry under key, returning true if a live

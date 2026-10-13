@@ -81,9 +81,66 @@ type dmAttribution struct {
 	events       atomic.Uint64 // events (object or type) that dirty-marked >=1
 	unattributed atomic.Uint64 // guard: a class combo not pre-registered; must stay 0
 
+	// #479 1b / #603 PR-0 — the same marks again, split by the ENTRY CLASS of
+	// the marked key (restactions | widgets | widgetContent | apistage |
+	// raFullList | unknown | unregistered). Closed and pre-registered like
+	// byBucket; Σ byEntryClass == dirtyMarkTotal by construction (same writer,
+	// counted over the same marked keys).
+	// Indexed by dmEntryClassIndex; labels in dmEntryClassLabels.
+	byEntryClass [dmEntryClassN]atomic.Uint64
+
 	gvrMu sync.Mutex
 	gvr   map[string]uint64 // /debug/vars-only drill-down, capped at dmGVRCap
 }
+
+// Entry-class label values beyond the CacheEntryClass set (RemintClasses).
+const (
+	// dmEntryClassUnknown — no class was learned for the marked key: it has
+	// not been stored since its edges were created (or not yet seen by the
+	// try-lock peek), or the tracker has no wired store.
+	dmEntryClassUnknown = "unknown"
+	// dmEntryClassUnregistered — a stored entry whose CacheEntryClass is not
+	// in RemintClasses: a class nobody registered here. Guard; must read 0.
+	dmEntryClassUnregistered = "unregistered"
+
+	// dmEntryClassN is the size of the closed label set: unknown, every
+	// RemintClasses value, unregistered.
+	dmEntryClassN = len(RemintClasses) + 2
+	// dmEntryClassUnknownIdx is 0 ON PURPOSE: it is the zero value of an
+	// unlearned depSet's class index.
+	dmEntryClassUnknownIdx      = 0
+	dmEntryClassUnregisteredIdx = uint32(dmEntryClassN - 1)
+)
+
+// dmEntryClassLabels maps a class index to its label (the OTLP / expvar value).
+var dmEntryClassLabels = func() [dmEntryClassN]string {
+	var out [dmEntryClassN]string
+	out[dmEntryClassUnknownIdx] = dmEntryClassUnknown
+	for i, c := range RemintClasses {
+		out[i+1] = c
+	}
+	out[dmEntryClassUnregisteredIdx] = dmEntryClassUnregistered
+	return out
+}()
+
+// dmEntryClassIndex folds a raw CacheEntryClass into the closed label set's
+// index: "" is unknown, a RemintClasses value is itself, anything else is
+// unregistered. Runs at store time (per accepted Put), never per mark.
+func dmEntryClassIndex(raw string) uint32 {
+	if raw == "" {
+		return dmEntryClassUnknownIdx
+	}
+	for i, c := range RemintClasses {
+		if raw == c {
+			return uint32(i + 1)
+		}
+	}
+	return dmEntryClassUnregisteredIdx
+}
+
+// dmEntryClassCounts is the per-event by-entry-class tally a mark loop fills
+// (a fixed array: no map hashing on the per-mark path).
+type dmEntryClassCounts [dmEntryClassN]int
 
 // dmValidBuckets is the EXACT set of {path,cause,class} combos the classifier
 // can emit. Pre-registering exactly these keeps every increment lock-free and
@@ -162,7 +219,11 @@ func dirtyMarkCauseForEventType(eventType string) string {
 // by construction. counts maps class -> number of L1 keys dirty-marked under
 // (path, cause). It also bumps the fan-out event denominator (once per event
 // that marked >=1) and the /debug/vars GVR drill-down.
-func (d *DepTracker) recordDirtyMarks(path, cause string, counts map[string]int, gvr schema.GroupVersionResource) {
+//
+// entryClasses tallies the SAME marked keys by entry-class index (#479 1b), so
+// Σ by_entry_class == dirtyMarkTotal holds whenever the caller counted the same
+// keys — which the falsifier pins.
+func (d *DepTracker) recordDirtyMarks(path, cause string, counts map[string]int, entryClasses *dmEntryClassCounts, gvr schema.GroupVersionResource) {
 	if d == nil {
 		return
 	}
@@ -182,6 +243,13 @@ func (d *DepTracker) recordDirtyMarks(path, cause string, counts map[string]int,
 		return
 	}
 	d.dirtyMarkTotal.Add(uint64(total))
+	if entryClasses != nil {
+		for i, n := range entryClasses {
+			if n > 0 {
+				d.dmAttr.byEntryClass[i].Add(uint64(n))
+			}
+		}
+	}
 	d.dmAttr.events.Add(1)
 	d.dmAttr.addGVR(gvr.String(), total)
 }
@@ -213,7 +281,13 @@ func (d *DepTracker) recordSubmitSource(source string) {
 // self-representation entry (its cached OUTPUT is the object itself) is broken
 // out from an ordinary exact GET-dependent.
 func dirtyMarkClass(dk DepKey, isSelf bool) string {
-	if dk.Name == listWildcard {
+	return dirtyMarkClassFor(dk.Name == listWildcard, isSelf)
+}
+
+// dirtyMarkClassFor is dirtyMarkClass on the one DepKey property it reads:
+// whether the key matched only through a list wildcard (#603 PR-0 depMatch).
+func dirtyMarkClassFor(listOnly, isSelf bool) string {
+	if listOnly {
 		return dmClassListDep
 	}
 	if isSelf {
@@ -241,6 +315,17 @@ func (d *DepTracker) dirtyMarkAttributionSnapshot() []DirtyMarkBucket {
 		}
 		return out[i].Class < out[j].Class
 	})
+	return out
+}
+
+func (d *DepTracker) dirtyMarkByEntryClassSnapshot() map[string]uint64 {
+	if d == nil || d.dmAttr == nil {
+		return nil
+	}
+	out := make(map[string]uint64, dmEntryClassN)
+	for i := range d.dmAttr.byEntryClass {
+		out[dmEntryClassLabels[i]] = d.dmAttr.byEntryClass[i].Load()
+	}
 	return out
 }
 
@@ -288,6 +373,13 @@ func (d *DepTracker) dirtyMarkGVRSnapshot() map[string]uint64 {
 // dirty-marks (OTLP + /debug/vars). #239.
 func DirtyMarkAttributionSnapshot() []DirtyMarkBucket { return Deps().dirtyMarkAttributionSnapshot() }
 
+// DirtyMarkByEntryClassSnapshot returns dirty-marks split by the entry class of
+// the marked key (OTLP snowplow_deps_dirty_mark_by_entry_class_total and the
+// /debug/vars "by_entry_class" view). #479 1b / #603 PR-0. Σ == dirty_mark_total.
+func DirtyMarkByEntryClassSnapshot() map[string]uint64 {
+	return Deps().dirtyMarkByEntryClassSnapshot()
+}
+
 // DirtyMarkSubmitSourceSnapshot returns the pre-dedup per-source submit counts.
 func DirtyMarkSubmitSourceSnapshot() map[string]uint64 { return Deps().dirtyMarkSubmitSourceSnapshot() }
 
@@ -307,10 +399,11 @@ func DirtyMarkGVRSnapshot() map[string]uint64 { return Deps().dirtyMarkGVRSnapsh
 // sources, the fan-out denominator and the unattributed guard.
 func DirtyMarkAttributionExpvar() any {
 	return map[string]any{
-		"by_bucket":     DirtyMarkAttributionSnapshot(),
-		"submit_source": DirtyMarkSubmitSourceSnapshot(),
-		"events_total":  DirtyMarkEventsTotal(),
-		"unattributed":  DirtyMarkUnattributedTotal(),
-		"by_gvr":        DirtyMarkGVRSnapshot(),
+		"by_bucket":      DirtyMarkAttributionSnapshot(),
+		"by_entry_class": DirtyMarkByEntryClassSnapshot(),
+		"submit_source":  DirtyMarkSubmitSourceSnapshot(),
+		"events_total":   DirtyMarkEventsTotal(),
+		"unattributed":   DirtyMarkUnattributedTotal(),
+		"by_gvr":         DirtyMarkGVRSnapshot(),
 	}
 }
