@@ -1,9 +1,10 @@
 package jqinterest
 
 import (
-	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // absKind classifies an abstract value. The abstract value of a jq expression
@@ -136,6 +137,9 @@ func union(xs ...*abs) *abs {
 	return &abs{k: aUnion, alts: alts}
 }
 
+// uniqSig numbers the signatures of values too deep to compare.
+var uniqSig atomic.Uint64
+
 // sig is a structural signature used to de-duplicate union alternatives.
 func (a *abs) sig() string {
 	var b strings.Builder
@@ -145,8 +149,11 @@ func (a *abs) sig() string {
 
 func (a *abs) writeSig(b *strings.Builder, depth int) {
 	if depth > 12 {
-		// Too deep to compare structurally: never treat as a duplicate.
-		fmt.Fprintf(b, "&%p", a)
+		// Too deep to compare structurally: never treat as a duplicate. A
+		// fresh token per signature (not the pointer: nothing here prints a
+		// value, and #453's log guard flags any %p of an opaque value).
+		b.WriteString("&")
+		b.WriteString(strconv.FormatUint(uniqSig.Add(1), 36))
 		return
 	}
 	if a.cu {
