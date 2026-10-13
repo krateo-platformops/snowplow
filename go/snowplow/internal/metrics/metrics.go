@@ -1251,7 +1251,21 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	declinedMarks, err := m.Int64ObservableGauge("snowplow_prewarm_declined_external_marks",
+		metric.WithDescription("Keys currently held in the engine-wide declined-external set (#643): (unit, cohort) keys whose seed resolve touched an external endpoint, skipped by every background pass until the mark retires itself (an L1 Put of the key, a RESTAction / endpointRef Secret change, GONE, a captured dep moving, or a served input cell being re-Put). Process-lived; its growth over a long run is the reading."))
+	if err != nil {
+		return err
+	}
+	declinedRetired, err := m.Int64ObservableCounter("snowplow_prewarm_declined_external_retired_total",
+		metric.WithDescription("Declined-external marks retired, by reason (closed set): nil_mark, served_cell_changed, deps_moved, ra_unread_at_mark, ra_unreadable, ra_changed, endpoint_secret_changed (re-checked at a skip consult), put_unmark (an L1 Put of the key), gone (the widget or RESTAction was deleted), config_redrive (a config-vars redrive cleared the set). A reason climbing with skip_declined_external_total staying low means marks retire every pass and the re-dials are back (#643)."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		o.ObserveInt64(declinedMarks, cache.EngineDeclinedExternalSet().Len())
+		for _, c := range cache.DeclinedExternalRetiredSnapshot() {
+			o.ObserveInt64(declinedRetired, int64(c.Count), metric.WithAttributes(attribute.String("reason", c.Reason)))
+		}
 		kindAttr := func(kind string) metric.ObserveOption {
 			return metric.WithAttributes(attribute.String("kind", kind))
 		}
@@ -1284,7 +1298,7 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		}
 		return nil
 	}, passTotal, planned, done, budget, elapsed, rWidgetUnits, rWidgetUS, rRAUnits, rRAUS,
-		skipDeclined, skipResume, extFetch, extAbandoned)
+		skipDeclined, skipResume, extFetch, extAbandoned, declinedMarks, declinedRetired)
 	return err
 }
 

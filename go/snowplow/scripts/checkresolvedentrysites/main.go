@@ -116,6 +116,22 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Site-class 3 only, over explicit package patterns (the gate's own
+	// discrimination fixture: `-servecell-only ./testdata/servecell`).
+	if os.Args[1] == "-servecell-only" {
+		findings, probes, err := checkServeCellSites(".", os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: servecell: %v\n", err)
+			os.Exit(2)
+		}
+		if len(findings) > 0 {
+			reportServeFindings(findings)
+			os.Exit(1)
+		}
+		fmt.Printf("OK: no unrouted L1 store read; %d serve-probe site(s).\n", probes)
+		return
+	}
+
 	fset := token.NewFileSet()
 	var entryFindings []entryFinding
 	var scanned, entrySites, bootScopeStamps int
@@ -197,12 +213,39 @@ func main() {
 		fmt.Fprintf(os.Stderr, "       is intentional, consciously lower bootScopeStampFloor in this checker with a note.\n")
 	}
 
+	// Site-class 3 (#643): the resolve path's L1 body reads, typed. Runs when a
+	// scanned root is the production `internal` tree.
+	serveProbes, serveScoped := 0, false
+	for _, root := range os.Args[1:] {
+		if filepath.Base(filepath.Clean(root)) != "internal" {
+			continue
+		}
+		serveScoped = true
+		var patterns []string
+		for _, p := range serveCellScope {
+			patterns = append(patterns, "./"+filepath.ToSlash(filepath.Join(root, strings.TrimPrefix(p, "./internal/"))))
+		}
+		findings, probes, err := checkServeCellSites(".", patterns)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: servecell: %v\n", err)
+			os.Exit(2)
+		}
+		serveProbes += probes
+		if len(findings) > 0 {
+			failed = true
+			reportServeFindings(findings)
+		}
+	}
+
 	if failed {
 		os.Exit(1)
 	}
 
 	fmt.Printf("OK: %d ResolvedEntry Put site(s) all set %s or carry a waiver; %d boot-scope stamp site(s) (floor %d); %d files scanned.\n",
 		entrySites, enforcedEntryField, bootScopeStamps, bootScopeStampFloor, scanned)
+	if serveScoped {
+		fmt.Printf("OK: every resolve-path L1 body read routes through cache.ServeCell; %d serve-probe site(s).\n", serveProbes)
+	}
 }
 
 // checkFile parses one Go file and returns:

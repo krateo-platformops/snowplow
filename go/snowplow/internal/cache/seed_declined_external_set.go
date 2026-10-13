@@ -28,14 +28,18 @@
 // StageErrorSink / ExternalTouchedSink (the established per-seed-pass /
 // per-resolve sink idiom):
 //
-//   - CORRECTNESS / TEARDOWN: the set is installed by the boot scope
-//     (withCohortSeedContext, boot-scope only) and lives ONLY for that boot
-//     scope's context. It is torn down when the boot scope's context goes away,
-//     so it can never make a later boot, a keepwarm sweep, or a user /call skip a
-//     resolve. A user /call context never carries a set, so
-//     SeedDeclinedExternalSetFromContext returns nil there and Marked() is always
-//     false on the request path — the /call path re-resolves the external widget
-//     fresh, unaffected (C-F4B-3).
+//   - LIFETIME (#643 PR-B — SUPERSEDES the original per-boot-scope teardown):
+//     there is ONE engine-wide, process-lived set (EngineDeclinedExternalSet,
+//     declined_external_engine.go), installed by the engine's processScope on
+//     EVERY scope kind (boot, gvr-discovered, keepwarm, rbac-shift,
+//     learned-class) and no longer torn down when boot completes — background
+//     passes need boot's marks, and their absence is what made every pass
+//     re-dial every external key. A config-vars redrive still clears it. Its
+//     marks retire themselves when the fact they recorded stops holding.
+//     REQUEST HALF of C-F4B-3, unchanged (I-6): a user /call context and the
+//     refresher never carry a set, so SeedDeclinedExternalSetFromContext returns
+//     nil there and Marked() is always false on the request path — the /call
+//     path re-resolves the external widget fresh, unaffected.
 //
 //   - KEY = THE FULL dispatchCacheLookupKey (C-F4B-2): the marker is keyed by the
 //     EXACT `key` the Put/Get pair uses — the cohort-identity-folding
@@ -48,8 +52,8 @@
 //     marker-key correctness cannot drift from Put-key correctness
 //     (feedback_consultation_mutation_is_not_key_correctness).
 //
-// TOGGLE (C-F4B / C-F4-8 pattern): the set is only ever installed on the boot
-// seed context, which only exists when the boot seed runs, which only runs under
+// TOGGLE (C-F4B / C-F4-8 pattern): the set is only ever installed on an engine
+// scope context, which only exists when the prewarm engine runs, which only runs under
 // ResolvedCacheEnabled() / the prewarm gate. A cache-off process never installs a
 // set → SeedDeclinedExternalSetFromContext is nil everywhere → zero behavior
 // change. WithSeedDeclinedExternalSet additionally no-ops the install under
@@ -60,6 +64,9 @@ package cache
 import (
 	"context"
 	"sync"
+	"sync/atomic"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // ctxKeySeedDeclinedExternalSetType is the typed empty-struct context key for
@@ -79,24 +86,119 @@ var ctxKeySeedDeclinedExternalSet = ctxKeySeedDeclinedExternalSetType{}
 // so cohort identity is encoded in the key — a marker set by cohort A can never
 // suppress cohort B's first resolve of the same widget (C-F4B-2).
 type SeedDeclinedExternalSet struct {
-	m sync.Map // key string -> struct{} (membership only; value is irrelevant)
+	// key string -> *DeclinedExternalMark (#643: the facts the mark was taken
+	// under, which Marked's caller re-checks; an empty mark from the plain Mark
+	// carries none).
+	m sync.Map
 
-	marks   uint64
-	mu      sync.Mutex // guards marks (diagnostic counter only)
+	marks uint64
+	mu    sync.Mutex // guards marks (diagnostic counter only)
+
+	// size is the number of keys currently held (#643: the
+	// snowplow_prewarm_declined_external_marks gauge — the set is engine-wide
+	// and process-lived, so its growth must be a reading).
+	size atomic.Int64
 }
 
-// Mark records key as resolved-and-declined-external for this boot scope.
+// Mark records key as resolved-and-declined-external with no recorded facts.
 // nil-receiver-safe (no-op) so an uninstalled call site never marks. Idempotent:
 // a second Mark of the same key is a harmless no-op (LoadOrStore).
 func (s *SeedDeclinedExternalSet) Mark(key string) {
+	s.MarkWith(key, &DeclinedExternalMark{})
+}
+
+// MarkWith records key with the facts it was taken under (#643). A re-mark of a
+// held key REPLACES its facts (the newer resolve's RA version, deps and stamp
+// are the ones that hold now) without counting a new distinct key.
+func (s *SeedDeclinedExternalSet) MarkWith(key string, mark *DeclinedExternalMark) {
 	if s == nil || key == "" {
 		return
 	}
-	if _, loaded := s.m.LoadOrStore(key, struct{}{}); !loaded {
+	if mark == nil {
+		mark = &DeclinedExternalMark{}
+	}
+	if _, loaded := s.m.Swap(key, mark); !loaded {
+		s.size.Add(1)
 		s.mu.Lock()
 		s.marks++
 		s.mu.Unlock()
 	}
+}
+
+// Lookup returns the mark held for key (#643). nil-receiver-safe.
+func (s *SeedDeclinedExternalSet) Lookup(key string) (*DeclinedExternalMark, bool) {
+	if s == nil || key == "" {
+		return nil, false
+	}
+	v, ok := s.m.Load(key)
+	if !ok {
+		return nil, false
+	}
+	m, _ := v.(*DeclinedExternalMark)
+	if m == nil {
+		m = &DeclinedExternalMark{}
+	}
+	return m, true
+}
+
+// Unmark retires key's mark. Reports whether a mark was held. nil-receiver-safe.
+func (s *SeedDeclinedExternalSet) Unmark(key string) bool {
+	if s == nil || key == "" {
+		return false
+	}
+	if _, loaded := s.m.LoadAndDelete(key); loaded {
+		s.size.Add(-1)
+		return true
+	}
+	return false
+}
+
+// Len is the number of keys currently marked. nil-receiver-safe.
+func (s *SeedDeclinedExternalSet) Len() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.size.Load()
+}
+
+// Reset drops every mark and zeroes the cumulative distinct-mark count (a
+// config-vars redrive starts a new topology; tests). nil-receiver-safe.
+func (s *SeedDeclinedExternalSet) Reset() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.marks = 0
+	s.mu.Unlock()
+	s.m.Range(func(k, _ any) bool {
+		if _, loaded := s.m.LoadAndDelete(k); loaded {
+			s.size.Add(-1)
+		}
+		return true
+	})
+}
+
+// ForgetCoordinate retires every mark taken for the widget or RESTAction at
+// (gvr, namespace, name) — the #643 GONE retire rule. Returns how many it
+// dropped. A Range over the set: GONE is rare and the set is small.
+func (s *SeedDeclinedExternalSet) ForgetCoordinate(gvr schema.GroupVersionResource, namespace, name string) int {
+	if s == nil {
+		return 0
+	}
+	coord := DepKey{GVR: gvr, Namespace: namespace, Name: name}
+	n := 0
+	s.m.Range(func(k, v any) bool {
+		m, _ := v.(*DeclinedExternalMark)
+		if m == nil || (m.Widget != coord && m.RA != coord) {
+			return true
+		}
+		if _, loaded := s.m.LoadAndDelete(k); loaded {
+			s.size.Add(-1)
+			n++
+		}
+		return true
+	})
+	return n
 }
 
 // Marked reports whether key was already resolved-and-declined-external this
@@ -128,10 +230,10 @@ func NewSeedDeclinedExternalSet() *SeedDeclinedExternalSet {
 }
 
 // WithSeedDeclinedExternalSet returns a child context carrying set. Installed
-// ONLY by the boot seed pass (withCohortSeedContext, boot-scope only) — a user
-// /call, the refresher, the keepwarm sweep, and the discovery walk never install
-// one, so the set is a strict no-op off the boot seed path (C-F4B-3). Inert
-// under Disabled(): returns ctx unchanged so a cache-off process carries no set.
+// ONLY by the prewarm engine's processScope, on every scope kind (#643) — a user
+// /call and the refresher never install one, so the set is a strict no-op on the
+// request path (C-F4B-3's request half, I-6). Inert under Disabled(): returns
+// ctx unchanged so a cache-off process carries no set.
 func WithSeedDeclinedExternalSet(ctx context.Context, set *SeedDeclinedExternalSet) context.Context {
 	if ctx == nil || set == nil || Disabled() {
 		return ctx
@@ -142,8 +244,8 @@ func WithSeedDeclinedExternalSet(ctx context.Context, set *SeedDeclinedExternalS
 // SeedDeclinedExternalSetFromContext returns the *SeedDeclinedExternalSet
 // installed on ctx, or nil when none is present. A nil return MUST be treated as
 // "no set — never skip on this account" (the methods are nil-receiver-safe). Off
-// the boot seed path this is always nil, which is what makes the marker provably
-// untouched on the /call path and the keepwarm path.
+// the engine's scope contexts this is always nil, which is what makes the marker
+// provably untouched on the /call path and the refresher path.
 func SeedDeclinedExternalSetFromContext(ctx context.Context) *SeedDeclinedExternalSet {
 	if ctx == nil {
 		return nil

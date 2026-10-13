@@ -128,8 +128,10 @@ func TestSeedPrimitives_InstallErrorSinks(t *testing.T) {
 	for _, want := range []string{
 		"cache.WithStageErrorSink(resCtx)",
 		"cache.WithExternalTouchedSink(resCtx)",
-		"declineSeedPutOnError(ctx, \"restactions\"",
-		"declineSeedPutOnError(ctx, \"widgets\"",
+		// #643 PR-B: the decline runs on resCtx — it reads the resolve's
+		// captured deps + entry stamp for the declined-external mark.
+		"declineSeedPutOnError(resCtx, \"restactions\"",
+		"declineSeedPutOnError(resCtx, \"widgets\"",
 	} {
 		if strings.Count(s, want) < 1 {
 			t.Fatalf("GTTL-1 wiring: expected %q in the shared seed primitives (the Put-gate must be installed on the resolve ctx + gated); not found", want)

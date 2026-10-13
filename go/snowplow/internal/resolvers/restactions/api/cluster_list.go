@@ -296,6 +296,7 @@ func attemptClusterListCollapse(
 	// apistageContentServe, which stamps on a customer /call). A decision-probe must never
 	// stamp — on the customer OR the refresher path — so GetNoTouch unconditional; the
 	// cell is still FOUND (warmth recognized), just not re-stamped ahead of the serve.
+	//serve-probe: collapse-decision warmth probe — the body is served later by apistageContentServe (via cache.ServeCell)
 	if entry, hit := apistageStore.GetNoTouch(contentKey); hit && entry != nil {
 		// CELL WARM. Customer keeps the cluster-scope call; the worker
 		// loop's apistageContentServe will Get-hit on this entry and
@@ -374,6 +375,7 @@ func populateClusterListCellSync(
 	// #376 — populateClusterListCellSync is a POPULATE worker (customer-cold-miss async
 	// populate or boot prewarm), NEVER a customer serve; this belt-and-braces warmth
 	// re-check must not stamp. GetNoTouch unconditional.
+	//serve-probe: populate worker's already-warm re-check; returns a bool, serves no body
 	if entry, hit := apistageStore.GetNoTouch(contentKey); hit && entry != nil {
 		return true
 	}

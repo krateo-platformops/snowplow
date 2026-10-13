@@ -4,7 +4,14 @@ package dispatchers
 // defect. Driven on the shared #643 harness (real engine, real seed, real
 // apiref/restactions resolve, an httptest external endpoint that counts dials).
 //
-// On main (and with PR-A, which changes no behaviour) a background pass
+// #643 PR-B FLIP. These arms recorded the RED baseline in PR-A (on that base a
+// background pass re-dialled every external key, a gvr-discovered pass on a
+// tight budget was cut, the skip controls read 0). With the engine-wide
+// declined-external skip they read their TARGETS instead: background passes
+// dial 0, the cut pass completes, the positive controls read K×M per pass.
+// The PR-A RED readings are in PR #649's evidence.
+//
+// Originally: on main (and with PR-A, which changes no behaviour) a background pass
 // re-dials every external cell for every cohort, a slow external fetch is
 // abandoned at the boot-readiness bound, and a gvr-discovered pass whose budget
 // is shorter than its work is cut with planned > done. F9 asserts that each
@@ -93,21 +100,19 @@ func TestIssue643_F9_DetectorsReadTheDefect(t *testing.T) {
 		t.Fatalf("after boot: %d internal + %d external widget cells warm, want %d + 0", internalWarm, externalWarm, K*N)
 	}
 
-	// THE DEFECT, read by the detectors: every background pass dials every
-	// external key again, for every cohort.
+	// TARGET (#643 PR-B): background passes dial 0 — boot met every key.
 	for i, s := range []prewarmScope{
 		{kind: scopeKindGVRDiscovered, gvr: h643WidgetGVR},
 		{kind: scopeKindGVRDiscovered, gvr: h643RAGVR},
 		{kind: scopeKindKeepwarm},
 	} {
-		if d := env.pass(s); d != wantDials {
-			t.Fatalf("background pass %d (%s) dialled %d times, want %d — the RED baseline is every pass re-dials every external key",
-				i, s.kind, d, wantDials)
+		if d := env.pass(s); d != 0 {
+			t.Fatalf("background pass %d (%s) dialled %d times, want 0 (the #643 target)", i, s.kind, d)
 		}
 	}
 	bg1, req1, _ := h643ExternalCounts()
-	if got := bg1 - bg0; got != uint64(4*wantDials) {
-		t.Fatalf("snowplow_external_fetch_total{origin=background} moved by %d over boot + 3 background passes, want %d (it must count every dial the endpoint saw)", got, 4*wantDials)
+	if got := bg1 - bg0; got != uint64(wantDials) {
+		t.Fatalf("snowplow_external_fetch_total{origin=background} moved by %d over boot + 3 background passes, want %d (boot's dials only)", got, wantDials)
 	}
 	if req1 != req0 {
 		t.Fatalf("snowplow_external_fetch_total{origin=request} moved by %d with no /call — the origin split is wrong", req1-req0)
@@ -129,15 +134,15 @@ func TestIssue643_F9_DetectorsReadTheDefect(t *testing.T) {
 			t.Fatalf("%s last pass planned=%d done=%d, want done == planned > 0", kind, l.Planned, l.Done)
 		}
 	}
-	// Positive controls: no background kind has the skip yet.
-	for _, k := range []prewarmScopeKind{scopeKindGVRDiscovered, scopeKindKeepwarm} {
-		if n := h643SkipDeclined(string(k)); n != 0 {
-			t.Fatalf("skip_declined_external_total{%s} = %d on main; the skip does not exist for this kind yet", k, n)
+	// Positive controls (#643 PR-B): the skip fired K×M times on each background pass.
+	for k, passes := range map[prewarmScopeKind]int{scopeKindGVRDiscovered: 2, scopeKindKeepwarm: 1} {
+		if n := h643SkipDeclined(string(k)); n != uint64(passes*K*M) {
+			t.Fatalf("skip_declined_external_total{%s} = %d, want %d (K×M per pass)", k, n, passes*K*M)
 		}
 	}
 	for _, c := range PrewarmSkipResumeDoneSnapshot() {
 		if c.Count != 0 {
-			t.Fatalf("skip_resume_done_total{%s} = %d; the resume skip does not exist yet", c.Kind, c.Count)
+			t.Fatalf("skip_resume_done_total{%s} = %d; the resume skip does not exist yet (PR-C)", c.Kind, c.Count)
 		}
 	}
 }
@@ -174,19 +179,23 @@ func TestIssue643_F9_CutAndAbandonDetectors(t *testing.T) {
 	boot := h643Last(t, string(scopeKindBoot))
 	budget := time.Duration(boot.ElapsedMS*2/3) * time.Millisecond
 	budgets[scopeKindGVRDiscovered] = budget
-	env.pass(prewarmScope{kind: scopeKindGVRDiscovered, gvr: h643WidgetGVR})
-	if got := h643PassCount(string(scopeKindGVRDiscovered), prewarmPassOutcomeCut) - cut0; got != 1 {
-		t.Fatalf("pass_total{gvr-discovered,cut} moved by %d, want 1 (the pass's external tail outlasts its %v budget)", got, budget)
+	// TARGET (#643 PR-B): the abandoned tail is skipped, so the pass that was
+	// cut on this budget in PR-A's RED reading now completes with 0 dials.
+	if d := env.pass(prewarmScope{kind: scopeKindGVRDiscovered, gvr: h643WidgetGVR}); d != 0 {
+		t.Fatalf("gvr-discovered re-dialled %d abandoned external fetches, want 0", d)
+	}
+	if got := h643PassCount(string(scopeKindGVRDiscovered), prewarmPassOutcomeCut) - cut0; got != 0 {
+		t.Fatalf("pass_total{gvr-discovered,cut} moved by %d, want 0 (the #643 target on a %v budget)", got, budget)
 	}
 	l := h643Last(t, string(scopeKindGVRDiscovered))
-	if l.Planned <= l.Done {
-		t.Fatalf("cut gvr-discovered pass: planned=%d done=%d, want planned > done", l.Planned, l.Done)
+	if l.Planned != l.Done {
+		t.Fatalf("gvr-discovered pass: planned=%d done=%d, want done == planned", l.Planned, l.Done)
 	}
 	if l.Planned != int64(K*(M+N)) {
 		t.Fatalf("gvr-discovered planned=%d, want %d (K×(M+N), declared before the first unit)", l.Planned, K*(M+N))
 	}
-	if l.BudgetMS != budget.Milliseconds() || l.ElapsedMS < budget.Milliseconds() {
-		t.Fatalf("gvr-discovered budget_ms=%d elapsed_ms=%d, want %d and >= it", l.BudgetMS, l.ElapsedMS, budget.Milliseconds())
+	if l.BudgetMS != budget.Milliseconds() || l.ElapsedMS >= budget.Milliseconds() {
+		t.Fatalf("gvr-discovered budget_ms=%d elapsed_ms=%d, want %d and elapsed under it", l.BudgetMS, l.ElapsedMS, budget.Milliseconds())
 	}
 	if l.ResolvedWidgetUnits == 0 || l.ResolvedWidgetUS == 0 {
 		t.Fatalf("gvr-discovered resolved_widget_units=%d resolved_widget_us=%d; the per-unit cost inputs must be non-zero", l.ResolvedWidgetUnits, l.ResolvedWidgetUS)

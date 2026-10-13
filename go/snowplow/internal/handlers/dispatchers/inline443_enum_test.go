@@ -78,8 +78,12 @@ var cacheAllow443 = map[string]cacheClass443{
 	// the decline is never hidden by the flag; only its counter is gated.
 	"DeclineSensitivePut": gatedInCache443,
 	// --- side-effecting, gated at the (listed) caller -----------------------
-	"ResolvedCacheStore.Get":                      gatedAtCaller443, // warmth stamp → GetNoTouch under the flag
-	"ResolvedEntry.NoteHitter":                    gatedAtCaller443, // representative pool
+	// #643 — the resolve path's ONE L1 body read (it replaced the direct
+	// ResolvedCacheStore.Get): touch=true is the warmth-stamping Get, which each
+	// caller turns into touch=false under the flag; the served-cell note inside
+	// it is itself gated on cache.Inert (NoteServedCell).
+	"ServeCell":                gatedAtCaller443,
+	"ResolvedEntry.NoteHitter": gatedAtCaller443, // representative pool
 	"ResolvedCacheStore.ForgetRAFullListConsumer": gatedAtCaller443,
 	"AddNavigationDiscoveredGroup":                gatedAtCaller443,
 	"BumpExternalSkippedPut":                      gatedAtCaller443, // a Put-decline counter: no decline without a Put
@@ -201,8 +205,8 @@ var cacheAllow443 = map[string]cacheClass443{
 	// evict anything, and it never changes what a Get returns — only whether the
 	// items had to be re-derived. Classified read-only on that basis; if a future
 	// edit gives it a real side effect this classification must change with it.
-	"ResolvedEntry.EnsureItems":                readOnly443,
-	"ResourceWatcher.ListServableEnvelopeJSONWhere": readOnly443, /* #618: ListServableEnvelopeJSON + a pure read-only predicate */ "ResourceWatcher.ServabilitySnapshotFor": readOnly443,
+	"ResolvedEntry.EnsureItems":                     readOnly443,
+	"ResourceWatcher.ListServableEnvelopeJSONWhere": readOnly443 /* #618: ListServableEnvelopeJSON + a pure read-only predicate */, "ResourceWatcher.ServabilitySnapshotFor": readOnly443,
 	"ResourceWatcher.Snapshot": readOnly443, "ResourceWatcher.WaitForGVRSync": readOnly443,
 	"SecretsCacheNamespace": readOnly443, "SecretsCacheServable": readOnly443, "SecretsSnapshotLoad": readOnly443,
 	"SeedResolveMemo.Key": readOnly443, "SeedResolveMemo.LoadLayered": readOnly443,
@@ -222,8 +226,8 @@ var cacheAllow443 = map[string]cacheClass443{
 // callerAllow443: for each gatedAtCaller symbol, the "<file>:<func>" sites
 // allowed to use it. Each listed function must contain a cache.Inert check.
 var callerAllow443 = map[string][]string{
-	"ResolvedCacheStore.Get":                      {"apistage.go:apistageContentServe", "ra_full_list.go:raFullListServe"},
-	"ResolvedEntry.NoteHitter":                    {"ra_full_list.go:raFullListServe"},
+	"ServeCell":                {"apistage.go:apistageContentServe", "ra_full_list.go:raFullListServe"},
+	"ResolvedEntry.NoteHitter": {"ra_full_list.go:raFullListServe"},
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},
 	"BumpExternalSkippedPut":                      {"ra_full_list.go:raFullListServe"},

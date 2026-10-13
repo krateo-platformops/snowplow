@@ -428,9 +428,10 @@ func raFullListServe(
 		// identity it is resolving under (#444). Both lines ask the same
 		// question, so they now consult the same predicate instead of two.
 		internalRead := cache.BackgroundResolveFromContext(ctx) || cache.Inert(ctx)
-		readRA := c.Get
-		if internalRead {
-			readRA = c.GetNoTouch
+		// #643 — through cache.ServeCell: the served raKey cell, and the backing
+		// edges it stands for, are noted on the resolve's sink.
+		readRA := func(k string) (*cache.ResolvedEntry, bool) {
+			return cache.ServeCell(ctx, c, k, !internalRead, cache.Deps().EdgesUnder(k)...)
 		}
 		// #547 — a KNOWN-STALE full list is a resolve INPUT: read it through
 		// (a MISS here; the fall-through below resolves the RA live), never

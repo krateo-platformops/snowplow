@@ -83,6 +83,11 @@ func RegisterGoneForgetHook(fn func(gvr schema.GroupVersionResource, namespace, 
 // mutex, then releases before invoking, so the critical section never spans a
 // user-supplied callback.
 func notifyObjectGone(gvr schema.GroupVersionResource, namespace, name string) {
+	// #643 retire rule (c) — a deleted widget / RESTAction drops its
+	// declined-external marks. Before the hooks, and whether or not any is
+	// registered: the set is cache-owned.
+	RecordDeclinedExternalRetired(DeclinedExternalRetiredGone,
+		EngineDeclinedExternalSet().ForgetCoordinate(gvr, namespace, name))
 	goneForgetHooks.mu.Lock()
 	if len(goneForgetHooks.hooks) == 0 {
 		goneForgetHooks.mu.Unlock()

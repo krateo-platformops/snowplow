@@ -127,6 +127,39 @@ type h643Opts struct {
 	external int // M external widgets, 2 external stages each
 	slow     int // of the M external widgets, how many hit a stalled path
 	internal int // N internal widgets (their RA has no api stage)
+	// extra are hand-built units (PR-B arms): a widget, its RESTAction's api[]
+	// stages verbatim, and whether the arm counts it as external.
+	extra []h643Extra
+	// things seeds n objects of h643ThingsGVR (an internal list an iterator
+	// stage can range over), readable by every cohort.
+	things int
+}
+
+// h643Extra is one hand-built (widget, RESTAction) unit.
+type h643Extra struct {
+	widget, ra string
+	external   bool
+	api        []any
+}
+
+// h643ThingsGVR is an internal (apiserver) list the iterator arms range over.
+var h643ThingsGVR = schema.GroupVersionResource{Group: "core.krateo.io", Version: "v1", Resource: "h643things"}
+
+// h643Thing builds one h643things object.
+func h643Thing(name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": h643ThingsGVR.Group + "/" + h643ThingsGVR.Version,
+		"kind":       "H643Thing",
+		"metadata":   map[string]any{"name": name, "namespace": h643NS},
+	}}
+}
+
+// h643ExtStage is an api[] stage dispatched through the external endpointRef.
+func h643ExtStage(name, path string) map[string]any {
+	return map[string]any{
+		"name": name, "path": path, "verb": "GET",
+		"endpointRef": map[string]any{"name": h643ExtSecret, "namespace": h643AuthnNS},
+	}
 }
 
 type h643Env struct {
@@ -134,6 +167,7 @@ type h643Env struct {
 	ep       *h643Endpoint
 	rw       *cache.ResourceWatcher
 	kube     *kubefake.Clientset
+	dyn      *dynamicfake.FakeDynamicClient
 	deps     rePrewarmDeps
 	engine   *prewarmEngine
 	widgets  []navWidgetEntry
@@ -214,6 +248,7 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 	listKinds := map[schema.GroupVersionResource]string{
 		h643RAGVR:     "RESTActionList",
 		h643WidgetGVR: "PanelList",
+		h643ThingsGVR: "H643ThingList",
 		crbGVR:        "ClusterRoleBindingList",
 		crGVR:         "ClusterRoleList",
 		rbGVR:         "RoleBindingList",
@@ -224,8 +259,8 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 			ObjectMeta: metav1.ObjectMeta{Name: "h643-reader"},
 			Rules: []rbacv1.PolicyRule{{
 				Verbs:     []string{"get", "list"},
-				APIGroups: []string{h643RAGVR.Group, h643WidgetGVR.Group},
-				Resources: []string{h643RAGVR.Resource, h643WidgetGVR.Resource},
+				APIGroups: []string{h643RAGVR.Group, h643WidgetGVR.Group, h643ThingsGVR.Group},
+				Resources: []string{h643RAGVR.Resource, h643WidgetGVR.Resource, h643ThingsGVR.Resource},
 			}},
 		},
 	}
@@ -247,6 +282,21 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 		navHarv.harvestNavWidget(w, h643WidgetGVR, -1, -1, -1, -1)
 		env.external[h643NS+"/"+wName] = external
 	}
+	for _, x := range o.extra {
+		objs = append(objs, &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": h643RAGVR.Group + "/" + h643RAGVR.Version,
+			"kind":       "RESTAction",
+			"metadata":   map[string]any{"name": x.ra, "namespace": h643NS, "uid": "uid-" + x.ra, "resourceVersion": "1"},
+			"spec":       map[string]any{"api": x.api},
+		}})
+		w := h643Widget(x.widget, x.ra)
+		objs = append(objs, w)
+		navHarv.harvestNavWidget(w, h643WidgetGVR, -1, -1, -1, -1)
+		env.external[h643NS+"/"+x.widget] = x.external
+	}
+	for i := 0; i < o.things; i++ {
+		objs = append(objs, h643Thing("thing-"+itoaLine(i)))
+	}
 	for i := 0; i < o.internal; i++ {
 		add("int-w"+itoaLine(i), "int-ra"+itoaLine(i), false)
 	}
@@ -260,6 +310,7 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 	}
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objs...)
+	env.dyn = dyn
 	wctx, wcancel := context.WithCancel(context.Background())
 	rw, err := cache.NewResourceWatcher(wctx, dyn)
 	if err != nil {
@@ -288,7 +339,7 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 		cache.PublishRBACSnapshotForTest(nil)
 	})
 	// Serve the RESTActions from the informer (objects.Get never dials).
-	for _, g := range []schema.GroupVersionResource{h643RAGVR, h643WidgetGVR} {
+	for _, g := range []schema.GroupVersionResource{h643RAGVR, h643WidgetGVR, h643ThingsGVR} {
 		if added, syncCh := rw.EnsureResourceType(g); added {
 			select {
 			case <-syncCh:
@@ -331,7 +382,7 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h643WidgetGVR, h643RAGVR})
+	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h643WidgetGVR, h643RAGVR, h643ThingsGVR})
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	env.rw = rw
 
@@ -398,12 +449,20 @@ func (env *h643Env) pass(s prewarmScope) int {
 	env.t.Helper()
 	before := env.ep.total()
 	env.engine.enqueueScope(s)
-	got, shutdown := env.engine.queue.Get()
-	if shutdown {
-		env.t.Fatalf("queue shut down")
-	}
-	if got != s {
-		env.t.Fatalf("dequeued %+v, want %+v (a stale item is on the queue)", got, s)
+	var got prewarmScope
+	for {
+		var shutdown bool
+		got, shutdown = env.engine.queue.Get()
+		if shutdown {
+			env.t.Fatalf("queue shut down")
+		}
+		if got == s {
+			break
+		}
+		// A cut pass's rate-limited requeue (or a #105 tail re-enqueue) that
+		// landed since: not the pass the arm asked for — discard it.
+		env.engine.queue.Forget(got)
+		env.engine.queue.Done(got)
 	}
 	env.engine.processScope(context.Background(), got)
 	// A cut pass AddRateLimited-requeues itself; drop it so the next pass the arm
