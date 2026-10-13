@@ -49,6 +49,7 @@ type state struct {
 	listPath   Path // the tracked list, relative to the tracked root
 	violations []string
 	guards     [][]KeyGuard // one conjunction per select (DNF)
+	sites      []extrasSite // every recognised guard with an extras source
 	nextInst   int
 	loader     gojq.ModuleLoader
 	stack      []*gojq.FuncDef
@@ -232,6 +233,14 @@ func (s *state) navKey(a *abs, key string, protected bool) *abs {
 				return withCU(f, x.cu)
 			}
 			if x.rest != nil {
+				if x.nav != nil && x.rest.isConst() && x.rest.constClassOf() == ccExtras {
+					// x IS an extras root (the RESTAction dict, the widget
+					// data source) and key is none of its known fields: the
+					// value is the root's own value at key, null if absent.
+					c := constOf(ccExtras, string(x.nav.Root)+"."+key)
+					c.nav = navStep(x.nav, Step{Key: key})
+					return withCU(c, x.cu)
+				}
 				return withCU(union(x.rest, literal(nil, "null")), x.cu)
 			}
 			return withCU(literal(nil, "null"), x.cu)
@@ -246,6 +255,7 @@ func (s *state) navKey(a *abs, key string, protected bool) *abs {
 				}
 			}
 			c := constOf(x.cc, x.src+"."+key)
+			c.nav = navStep(x.nav, Step{Key: key})
 			return withCU(c, x.cu)
 		}
 		return withCU(absOpaque, x.cu)
@@ -339,6 +349,7 @@ func (s *state) iterate(a *abs, protected bool) *abs {
 			return withCU(union(vals...), x.cu)
 		case aConst:
 			c := constOf(x.cc, x.src+"[]")
+			c.nav = navStep(x.nav, Step{Any: true})
 			return withCU(c, x.cu)
 		}
 		return withCU(absOpaque, x.cu)
@@ -508,6 +519,9 @@ func (s *state) evalQ(q *gojq.Query, in *abs, e *env) *abs {
 			s.consumeKind(l, opTruth)
 		}
 		r := s.eval(q.Right, in, e)
+		if c := altDefault(l, r, anyCU(in)); c != nil {
+			return c
+		}
 		return union(l, withCU(r, anyCU(in)))
 	case gojq.OpAnd, gojq.OpOr:
 		l := s.eval(q.Left, in, e)
@@ -990,7 +1004,9 @@ func (s *state) evalFunc(f *gojq.Func, in *abs, e *env, protected bool) *abs {
 	if strings.Contains(f.Name, "::") {
 		top("unresolved module function %s/%d", f.Name, len(f.Args))
 	}
-	return s.builtin(f, in, e, protected)
+	// A builtin's result is never the navigated extras value itself: first,
+	// limit and select keep only some of it, del changes it (#633).
+	return stripNav(s.builtin(f, in, e, protected))
 }
 
 func (s *state) callUser(uf *userFunc, args []*gojq.Query, in *abs, caller *env) *abs {

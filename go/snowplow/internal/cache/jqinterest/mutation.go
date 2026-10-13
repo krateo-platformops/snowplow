@@ -36,4 +36,7 @@ const (
 	mutKeyNoTotality       = "key-no-totality"       // membership ignores errors on non-members
 	mutStrictNoReceiver    = "strict-no-receiver"    // strict analysis does not observe a navigation's receiver
 	mutKeyNoAggregation    = "key-no-aggregation"    // membership ignores aggregation over non-members
+	mutUnionDecidable      = "union-decidable"       // a union key constant gets its first extras alternative's source (#633)
+	mutAltAsNav            = "alt-as-nav"            // `<extras chain> // <literal>` is read as the chain alone: the default is dropped (#633)
+	mutStreamDefault       = "stream-default"        // a stream extras source takes a // default as stream-level, even when // runs per element (#644 gate)
 )

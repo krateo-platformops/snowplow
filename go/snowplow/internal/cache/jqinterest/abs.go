@@ -71,6 +71,12 @@ type abs struct {
 	hasLit bool
 	src    string // printable source of the constant (membership provenance)
 
+	// nav (aConst of class extras, or an aObj that IS an extras root): the
+	// value is exactly what nav.Path yields on the real nav.Root (#633). Only
+	// navigation (.k, .[]) and variable binding keep it; every other
+	// operation, builtin, union member or constructed value drops it.
+	nav *ExtrasSource
+
 	// aObj
 	fields map[string]*abs
 	rest   *abs
@@ -94,6 +100,128 @@ var (
 )
 
 func constOf(cc constClass, src string) *abs { return &abs{k: aConst, cc: cc, src: src} }
+
+// extrasAt is the extras constant at path of root: a structured source.
+func extrasAt(root ExtrasRoot, src string, path ...Step) *abs {
+	c := constOf(ccExtras, src)
+	c.nav = &ExtrasSource{Root: root, Path: append(Path{}, path...)}
+	return c
+}
+
+// navStep extends a structured source by one navigation step (nil stays nil).
+func navStep(n *ExtrasSource, st Step) *ExtrasSource {
+	if n == nil || n.HasDefault {
+		// (a // d).k is not a navigation of a: the default would be lost.
+		return nil
+	}
+	return &ExtrasSource{Root: n.Root, Path: n.Path.with(st), Stream: n.Stream || st.Any}
+}
+
+// altDefault is `l // r` when l is one extras navigation chain (without a
+// default) and r a literal: a structured source with a default (#633), which
+// is exactly evaluable. nil otherwise (the caller keeps the union).
+// mutAltAsNav reads `//` as plain navigation: the default is dropped.
+func altDefault(l, r *abs, inCU bool) *abs {
+	if l.k != aConst || l.cc != ccExtras || l.nav == nil || l.nav.HasDefault {
+		return nil
+	}
+	if l.nav.Stream && !mutated(mutStreamDefault) {
+		// A stream source does not say WHERE the iteration happened: in
+		// ($ns[] // "d") the default applies once to the whole stream, but
+		// in ($ns[] | . // "d"), $ns[] as $x | $x // "d", or an outer
+		// .extras.names[] as $x, it applies to each element, and an element
+		// that is null or false compares with "d" (#644 gate). Refused.
+		return nil
+	}
+	if r.k != aConst || r.cc != ccLiteral || !r.hasLit {
+		return nil
+	}
+	c := constOf(ccExtras, l.src+" // "+r.src)
+	n := *l.nav
+	n.Path = append(Path{}, l.nav.Path...)
+	if !mutated(mutAltAsNav) {
+		n.HasDefault, n.Default = true, r.lit
+	}
+	c.nav = &n
+	return withCU(withCU(c, l.cu), r.cu || inCU)
+}
+
+// extrasSourceOf returns the structured source of a key constant: set only
+// when the constant is ONE extras navigation chain (#633). A union, an
+// object, an array or anything computed has none, so its guard is not
+// Decidable. mutUnionDecidable takes a union's first extras alternative.
+func extrasSourceOf(a *abs) *ExtrasSource {
+	if a.k == aUnion && mutated(mutUnionDecidable) {
+		for _, x := range a.alts {
+			if src := extrasSourceOf(x); src != nil {
+				return src
+			}
+		}
+	}
+	if a.k != aConst || a.cc != ccExtras || a.nav == nil {
+		return nil
+	}
+	c := *a.nav
+	c.Path = append(Path{}, a.nav.Path...)
+	return &c
+}
+
+// stripNav drops every structured source in a: the value went through an
+// operation whose result is not the navigated value itself (a builtin such
+// as first, select, limit or del).
+func stripNav(a *abs) *abs {
+	if a == nil || !a.hasNav() {
+		return a
+	}
+	switch a.k {
+	case aConst:
+		c := *a
+		c.nav = nil
+		return &c
+	case aObj:
+		c := &abs{k: aObj, fields: make(map[string]*abs, len(a.fields)), rest: stripNav(a.rest), cu: a.cu}
+		for k, f := range a.fields {
+			c.fields[k] = stripNav(f)
+		}
+		return c
+	case aArr:
+		return &abs{k: aArr, elem: stripNav(a.elem), elemCU: a.elemCU, cu: a.cu}
+	case aUnion:
+		out := make([]*abs, len(a.alts))
+		for i, x := range a.alts {
+			out[i] = stripNav(x)
+		}
+		return union(out...)
+	}
+	return a
+}
+
+func (a *abs) hasNav() bool {
+	if a == nil {
+		return false
+	}
+	if a.nav != nil {
+		return true
+	}
+	switch a.k {
+	case aObj:
+		for _, f := range a.fields {
+			if f.hasNav() {
+				return true
+			}
+		}
+		return a.rest.hasNav()
+	case aArr:
+		return a.elem.hasNav()
+	case aUnion:
+		for _, x := range a.alts {
+			if x.hasNav() {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func literal(v any, src string) *abs {
 	return &abs{k: aConst, cc: ccLiteral, lit: v, hasLit: true, src: src}
@@ -170,6 +298,12 @@ func (a *abs) writeSig(b *strings.Builder, depth int) {
 			b.WriteString("=")
 			b.WriteString(a.src)
 		}
+		if a.nav != nil {
+			// Two extras constants with different sources are different
+			// values: ($e.a, $e.b) must stay a union of two (#633).
+			b.WriteString("@")
+			b.WriteString(a.nav.String())
+		}
 	case aRef:
 		b.WriteString("R")
 		b.WriteString(a.path.String())
@@ -185,6 +319,10 @@ func (a *abs) writeSig(b *strings.Builder, depth int) {
 	case aOpaque:
 		b.WriteString("O")
 	case aObj:
+		if a.nav != nil {
+			b.WriteString("@")
+			b.WriteString(a.nav.String())
+		}
 		b.WriteString("{")
 		keys := make([]string, 0, len(a.fields))
 		for k := range a.fields {

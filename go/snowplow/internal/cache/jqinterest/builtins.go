@@ -264,11 +264,12 @@ func (s *state) keyConjunct(q *gojq.Query, in *abs, inst int, e *env) (KeyGuard,
 	rPure := s.readCount == rcR
 	isKeyRef := func(a *abs) bool { return a.k == aRef && a.inst == inst && !a.guarded && s.isElementPath(a.path) }
 	var ref, cst *abs
+	var cstQ *gojq.Query
 	switch {
 	case isKeyRef(l) && rPure && r.isConst():
-		ref, cst = l, r
+		ref, cst, cstQ = l, r, q.Right
 	case isKeyRef(r) && lPure && l.isConst():
-		ref, cst = r, l
+		ref, cst, cstQ = r, l, q.Left
 	default:
 		return rollback()
 	}
@@ -279,12 +280,20 @@ func (s *state) keyConjunct(q *gojq.Query, in *abs, inst int, e *env) (KeyGuard,
 	if !mutated(mutKeyNotRead) {
 		s.consumeWhole(ref, opEq)
 	}
-	return KeyGuard{
+	g := KeyGuard{
 		Path:        s.elemRel(ref.path),
 		ConstClass:  cst.constClassOf().String(),
 		ConstSource: constSource(cst),
 		Values:      literalValues(cst),
-	}, true
+	}
+	if g.Values == nil {
+		if src := extrasSourceOf(cst); src != nil {
+			g.Extras = src
+			g.ConstSource = src.String()
+			s.sites = append(s.sites, extrasSite{q: cstQ, src: *src})
+		}
+	}
+	return g, true
 }
 
 // literalValues returns every value a constant can take when each of its

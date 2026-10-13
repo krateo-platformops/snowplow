@@ -82,6 +82,10 @@ func MaybeQuery(s string) (string, bool) {
 	return s, false
 }
 
+// testRootsHook, when set (tests only), sees the abstract extras roots of a
+// widget chain: the stage input, the RESTAction dict, the data source.
+var testRootsHook func(pig, dict, ds *abs)
+
 // Analyze derives the interest of one list edge.
 func Analyze(c Chain, loader gojq.ModuleLoader) Interest {
 	s := newState(loader)
@@ -137,8 +141,8 @@ func (s *state) chain(c Chain) {
 	// "slice" sees the response OR the slice, depending on whether the
 	// request is paginated.
 	pig := &abs{k: aObj, fields: map[string]*abs{
-		"extras": constOf(ccExtras, "extras"),
-		"slice":  constOf(ccExtras, "slice"),
+		"extras": extrasAt(RootStageInput, "extras", Step{Key: "extras"}),
+		"slice":  extrasAt(RootStageInput, "slice", Step{Key: "slice"}),
 	}}
 	pig.fields[tracked.Name] = root
 	if tracked.Name == "slice" {
@@ -178,7 +182,10 @@ func (s *state) chain(c Chain) {
 	}
 	// The resolver dict (resolve.go newResolveRun): request extras + slice +
 	// every stage's output under its name.
-	dict := &abs{k: aObj, fields: map[string]*abs{tracked.Name: dictS}, rest: constOf(ccExtras, "dict")}
+	// It IS the RootRADict root: a key that is no stage's name reads the
+	// root's own value (navKey), a structured extras source.
+	dict := &abs{k: aObj, fields: map[string]*abs{tracked.Name: dictS}, rest: constOf(ccExtras, "dict"),
+		nav: &ExtrasSource{Root: RootRADict}}
 	for name := range others {
 		dict.fields[name] = constOf(ccOther, name)
 	}
@@ -191,7 +198,7 @@ func (s *state) chain(c Chain) {
 		if st.Name == tracked.Name || mutated(mutOtherStagesSkip) {
 			continue
 		}
-		in := &abs{k: aObj, fields: dict.fields, rest: dict.rest}
+		in := &abs{k: aObj, fields: dict.fields, rest: dict.rest, nav: dict.nav}
 		var tin *abs = in
 		if st.DependsOn != "" && st.Iterator != "" {
 			it := s.eval(mustParse(st.Iterator), in, e)
@@ -235,14 +242,17 @@ func (s *state) chain(c Chain) {
 		if raOut.rest != nil {
 			rest = union(raOut.rest, rest)
 		}
-		ds = &abs{k: aObj, fields: raOut.fields, rest: rest, cu: raOut.cu}
+		ds = &abs{k: aObj, fields: raOut.fields, rest: rest, cu: raOut.cu, nav: &ExtrasSource{Root: RootWidgetDS}}
 	case raOut.isConst():
-		ds = constOf(ccExtras, "ds")
+		ds = extrasAt(RootWidgetDS, "ds")
 	default:
 		// Not a known object: observe it whole; the data source is opaque.
 		s.consumeWhole(raOut, opOther)
 		s.nonTotal("widget data source", raOut)
 		ds = absOpaque
+	}
+	if testRootsHook != nil {
+		testRootsHook(pig, dict, ds)
 	}
 	for _, expr := range c.Widget.DataTemplates {
 		if q, ok := MaybeQuery(expr); ok {
