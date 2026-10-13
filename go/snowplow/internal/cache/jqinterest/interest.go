@@ -66,6 +66,18 @@ type Interest struct {
 	// guard was seen but something else observed non-members (diagnostic,
 	// bounded).
 	MembershipBlockers []string
+
+	// sites: every key guard that carries an extras source, with the AST
+	// node of the constant the program compares with. Tests use it to check
+	// the source against the value the program really compares with
+	// (TestExtrasSource_EvaluatesToTheComparedValue). Not part of the result.
+	sites []extrasSite
+}
+
+// extrasSite ties an extras source to the constant's AST node.
+type extrasSite struct {
+	q   *gojq.Query
+	src ExtrasSource
 }
 
 // Membership is the proven membership-key shape, in disjunctive normal form:
@@ -109,22 +121,110 @@ type KeyGuard struct {
 	// ("a", "b"), or the object {"app": "x"}. The guard then admits an object
 	// whose key equals any of them.
 	//
-	// When Values is nil, ConstClass is ALWAYS "extras": the constant is
-	// computed from the request extras (already in the cell key), and PR-2
-	// evaluates ConstSource's expression against them at record time.
-	// interest() enforces this: a guard that is neither literal-folded nor
-	// extras-derived (an array literal, another stage's data) makes the whole
-	// membership unknown. The claim is then dropped and recorded in
-	// MembershipBlockers, never narrowed. See Decidable.
+	// When Values is nil in a claimed Membership, Extras is set: the constant
+	// is one navigation chain from the request extras (already in the cell
+	// key), and PR-2 evaluates Extras on the cell's real root at record time.
+	// interest() enforces this: a guard that is neither literal-folded nor a
+	// structured extras source (an array literal, another stage's data, a
+	// union or an object mixing extras with anything, a value computed from
+	// the extras) makes the whole membership unknown. The claim is then
+	// dropped and recorded in MembershipBlockers, never narrowed. See
+	// Decidable.
 	Values []any
+	// Extras, when non-nil, is how PR-2 computes an extras constant: the
+	// constant is exactly the value (or, for a stream, every value) at
+	// Extras.Path of the root Extras.Root (#633). It is set only when the
+	// constant is ONE navigation chain from that root. Anything else that
+	// involves the extras (a union such as ("zzz", $n), an object such as
+	// {app: $n}, a value derived from them such as $n + "-x" or
+	// .extras.name // "") leaves it nil, and the guard is not Decidable.
+	Extras *ExtrasSource
 }
 
 // Decidable reports whether PR-2 can decide this guard for an object: by
-// Values, or by evaluating an extras-derived constant. Every guard of a
-// claimed Membership is Decidable (interest() enforces it, and
+// Values, or by evaluating Extras against the cell's real root. Every guard
+// of a claimed Membership is Decidable (interest() enforces it, and
 // TestKeyGuard_EveryClaimedGuardIsDecidable pins it).
 func (k KeyGuard) Decidable() bool {
 	return k.Values != nil || k.ConstClass == ccExtras.String()
+}
+
+// ExtrasRoot names the value an extras source is navigated from. A source
+// never starts at a stage's output, only at the request extras or the slice,
+// so each root is a per-cell constant as far as a source can reach.
+type ExtrasRoot string
+
+const (
+	// RootStageInput is the tracked stage filter's input
+	// {"extras": <extras>, <stage>: <response>, "slice": <slice>}
+	// (handler.go jsonHandlerCore). A source from it starts at .extras or
+	// .slice.
+	RootStageInput ExtrasRoot = "stage_input"
+	// RootRADict is the resolver dict that spec.filter and the other stages
+	// read (resolve.go newResolveRun): the request extras and the slice at top
+	// level, plus every stage's output under its name. A source from it never
+	// starts at a stage name.
+	RootRADict ExtrasRoot = "ra_dict"
+	// RootWidgetDS is the widget data source (widgets/resolve.go): the
+	// RESTAction output, then the slice and the extras for the keys it does
+	// not have. A source from it never starts at a key the output has.
+	RootWidgetDS ExtrasRoot = "widget_ds"
+)
+
+// ExtrasSource is a structured extras constant: navigate Root along Path.
+// Path holds object keys and, when Stream is set, at least one [] step (every
+// element of an array, every value of an object).
+type ExtrasSource struct {
+	Root   ExtrasRoot
+	Path   Path
+	Stream bool
+}
+
+func (x ExtrasSource) String() string { return string(x.Root) + ":" + x.Path.String() }
+
+// Eval computes the constant on the cell's real root, with jq's semantics:
+// .k on null is null, a missing key is null, [] yields every array element
+// or object value. The result is every value the program compares the key
+// with (exactly one for a non-stream source).
+//
+// An error means jq raises on this root: the program either fails or, under
+// a try, compares with a prefix of the stream. PR-2 must then treat the
+// guard as undecidable for this cell (the edge reads everything).
+func (x ExtrasSource) Eval(root any) ([]any, error) {
+	cur := []any{root}
+	for _, st := range x.Path {
+		var next []any
+		for _, v := range cur {
+			if st.Any {
+				switch t := v.(type) {
+				case []any:
+					next = append(next, t...)
+				case map[string]any:
+					keys := make([]string, 0, len(t))
+					for k := range t {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					for _, k := range keys {
+						next = append(next, t[k])
+					}
+				default:
+					return nil, fmt.Errorf("cannot iterate over %T", v)
+				}
+				continue
+			}
+			switch t := v.(type) {
+			case nil:
+				next = append(next, nil)
+			case map[string]any:
+				next = append(next, t[st.Key])
+			default:
+				return nil, fmt.Errorf("cannot index %T with %q", v, st.Key)
+			}
+		}
+		cur = next
+	}
+	return cur, nil
 }
 
 func (k KeyGuard) String() string {
@@ -369,10 +469,17 @@ func newState(loader gojq.ModuleLoader) *state {
 	return &state{listPath: Path{{Key: "items"}}, loader: loader}
 }
 
+// testParseHook, when set (tests only), sees every program the analysis
+// parses, with the AST it analyses.
+var testParseHook func(src string, q *gojq.Query)
+
 func mustParse(src string) *gojq.Query {
 	q, err := gojq.Parse(src)
 	if err != nil {
 		top("parse error: %v", err)
+	}
+	if testParseHook != nil {
+		testParseHook(src, q)
 	}
 	return q
 }

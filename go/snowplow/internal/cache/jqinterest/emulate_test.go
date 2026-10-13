@@ -30,6 +30,22 @@ type emuEnv struct {
 	// fanOutFirst: for an iterator-driven tracked stage, whether the tracked
 	// call's output is accumulated before or after another call's.
 	fanOutFirst bool
+	// probe, when set, sees every jq program the resolve runs, with the data
+	// it runs on, and the three extras roots (kinds stage_input, ra_dict and
+	// widget_ds, with query ""). Only the #633 source arm sets it.
+	probe func(kind, query string, data any)
+}
+
+func (e emuEnv) see(kind, query string, data any) {
+	if e.probe != nil {
+		e.probe(kind, query, data)
+	}
+}
+
+func (e emuEnv) seeTemplate(tmpl string, data any) {
+	if q, ok := MaybeQuery(tmpl); ok {
+		e.see("template", q, data)
+	}
 }
 
 // emuOutcome is the cell's observable result.
@@ -247,6 +263,8 @@ func runStageCall(st *Stage, envelope map[string]any, env emuEnv, dict map[strin
 	if st.Filter == nil {
 		return envelope, ""
 	}
+	env.see(string(RootStageInput), "", pig)
+	env.see("stage_filter", *st.Filter, pig)
 	v, ok, err := evalValue(*st.Filter, pig)
 	switch {
 	case errors.Is(err, errMulti):
@@ -329,6 +347,7 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 		elems := []any{dict}
 		if st.DependsOn != "" && st.Iterator != "" {
 			elems = nil
+			env.see("iterator", st.Iterator, dict)
 			err := jqutil.ForEach(context.Background(), jqutil.EvalOptions{Query: st.Iterator, Unquote: true, Data: dict},
 				func(a any) error { elems = append(elems, a); return nil })
 			if err != nil {
@@ -336,6 +355,11 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 			}
 		}
 		for _, el := range elems {
+			env.seeTemplate(st.Path, el)
+			env.seeTemplate(st.Payload, el)
+			for _, h := range st.Headers {
+				env.seeTemplate(h, el)
+			}
 			path, err := renderTemplate(st.Path, el)
 			if err != nil {
 				errRecords = append(errRecords, "path:"+err.Error())
@@ -354,6 +378,7 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 				payload += "|" + hv
 			}
 			if st.UAF != nil && st.UAF.ResourcesFrom != "" {
+				env.see("resources_from", st.UAF.ResourcesFrom, dict)
 				v, _, err := evalValue(st.UAF.ResourcesFrom, dict)
 				b, _ := json.Marshal(v)
 				payload += "|res:" + string(b)
@@ -368,6 +393,10 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 	}
 	if len(errRecords) > 0 {
 		dict["__stage_errors"] = strings.Join(errRecords, "\n")
+	}
+	env.see(string(RootRADict), "", dict)
+	if c.RA.Filter != nil {
+		env.see("ra_filter", *c.RA.Filter, dict)
 	}
 	var raw string
 	if c.RA.Filter != nil {
@@ -400,6 +429,7 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 			ds[k] = deepCopy(v)
 		}
 	}
+	env.see(string(RootWidgetDS), "", ds)
 	out := map[string]any{}
 	var data []any
 	for _, expr := range c.Widget.DataTemplates {
@@ -408,6 +438,7 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 			data = append(data, expr)
 			continue
 		}
+		env.see("widget_template", q, ds)
 		s, err := jqutil.Eval(context.Background(), jqutil.EvalOptions{Query: q, Data: ds, ModuleLoader: jqsupport.ModuleLoader()})
 		if err != nil {
 			return emuOutcome{err: "widgetDataTemplate: " + err.Error()}
@@ -425,6 +456,7 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 			// "widget JQ error → interest 0" covers it. A body built this way
 			// is never narrowed, so it is a fallback here and is not compared
 			// (it was swallowed before the #603 PR-1 review).
+			env.see("rrt_iterator", q, ds)
 			if err := jqutil.ForEach(context.Background(), jqutil.EvalOptions{Query: q, Unquote: true, Data: ds},
 				func(a any) error { elems = append(elems, a); return nil }); err != nil {
 				return emuOutcome{fallback: "resourcesRefsTemplate iterator error"}
@@ -440,6 +472,7 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 					ref = append(ref, q)
 					continue
 				}
+				env.see("rrt_field", q, el)
 				s, err := jqutil.Eval(context.Background(), jqutil.EvalOptions{Query: q, Unquote: true, Data: el, ModuleLoader: jqsupport.ModuleLoader()})
 				if err != nil {
 					s = err.Error()

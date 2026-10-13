@@ -36,4 +36,5 @@ const (
 	mutKeyNoTotality       = "key-no-totality"       // membership ignores errors on non-members
 	mutStrictNoReceiver    = "strict-no-receiver"    // strict analysis does not observe a navigation's receiver
 	mutKeyNoAggregation    = "key-no-aggregation"    // membership ignores aggregation over non-members
+	mutUnionDecidable      = "union-decidable"       // a union key constant gets its first extras alternative's source (#633)
 )
