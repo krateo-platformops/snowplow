@@ -693,22 +693,18 @@ func seedScopeYielding(ctx context.Context,
 		)
 	}()
 
-	// #132 F4b Lever A — the boot-scope "resolved-but-declined-external" marker set
-	// is ENGINE-LIVED, NOT newed here. A boot RESUME is a FRESH seedScopeYielding
-	// call (AddRateLimited requeue → processScope → rePrewarmBoot →
-	// rePrewarmBootScoped → seedScopeYielding), so newing the set here would start
-	// it empty every resume pass and the §3 whale loop (a CROSS-PASS defect) would
-	// never break — the 2dc46ae inert-rework the arch caught. Instead the engine
-	// holds one set per boot-scope-key, created once and REUSED across the scope's
-	// requeues, installed onto ctx in processScope (prewarm_engine.go), cleared on
-	// genuine boot completion + config-vars redrive. seedSkipDecision +
-	// declineSeedPutOnError read/write it via cache.SeedDeclinedExternalSetFromContext;
-	// it is nil off the boot path (keepwarm/gvr-discovered/cache-off never carry
-	// one → strict no-op). The phase1.seed.declined_external.summary line is
-	// intentionally NOT emitted here per-pass (that would report a partial
-	// per-seedScopeYielding-pass count); it is emitted ONCE at teardown in
-	// clearDeclinedExternalSet, reading the WHOLE-BOOT cumulative Marks() off the
-	// engine-lived set (R4 cross-pass counter semantics).
+	// #132 F4b Lever A / #643 PR-B — the "resolved-but-declined-external" marker
+	// set is ENGINE-WIDE and process-lived, NOT newed here: a resume (or any later
+	// background pass) is a FRESH seedScopeYielding call, so a pass-lived set would
+	// start empty every pass and the cross-pass re-dial loop would never break
+	// (the 2dc46ae inert-rework the arch caught). processScope installs the one
+	// set (cache.EngineDeclinedExternalSet) on every scope kind; a config-vars
+	// redrive clears it; its marks retire themselves (declined_external_mark.go).
+	// seedSkipDecision + declineSeedPutOnError read/write it via
+	// cache.SeedDeclinedExternalSetFromContext; it is nil on /call and the
+	// refresher (I-6). The phase1.seed.declined_external.summary line is not
+	// emitted per pass; it is emitted on boot completion and before a redrive
+	// clear (R4 cross-pass counter semantics).
 
 	// CTX-CANCEL ABORT OBSERVABILITY (fold 2026-07-03, §4.3b — migrated from the
 	// deleted seedCohort's 0.30.191 Fix-C `phase1.cohort.abort` reporter). The

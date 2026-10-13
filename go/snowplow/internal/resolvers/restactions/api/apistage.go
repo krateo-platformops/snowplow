@@ -594,9 +594,11 @@ func apistageContentServe(
 		case cache.BackgroundResolveFromContext(ctx) || cache.Inert(ctx):
 			// #443 (e) — an inert (dry-run) resolve reads the cell as input
 			// but must not stamp it warm either.
-			return store.GetNoTouch(k)
+			// #643 — through ServeCell: the served cell (and the dep it stands
+			// for) is noted on the resolve's sink.
+			return cache.ServeCell(ctx, store, k, false, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
 		default:
-			return store.Get(k)
+			return cache.ServeCell(ctx, store, k, true, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
 		}
 	}
 	if entry, hit := readContent(contentKey); hit && entry != nil {

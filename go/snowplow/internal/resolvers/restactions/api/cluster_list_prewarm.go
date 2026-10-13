@@ -328,6 +328,7 @@ func PrewarmClusterListCells(
 			// else the populate sweep fakes #315/#316 warmth on the content set and
 			// contaminates the warm_lastread gauge. Output-neutral: (existing, hit) is
 			// identical, only the warmth perturbation is dropped.
+			//serve-probe: prewarm populate's already-warm skip; serves no body to a resolve
 			if existing, hit := apistageStore.GetNoTouch(contentKey); hit && existing != nil {
 				mu.Lock()
 				popOK++

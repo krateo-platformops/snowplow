@@ -1251,7 +1251,13 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	declinedMarks, err := m.Int64ObservableGauge("snowplow_prewarm_declined_external_marks",
+		metric.WithDescription("Keys currently held in the engine-wide declined-external set (#643): (unit, cohort) keys whose seed resolve touched an external endpoint, skipped by every background pass until the mark retires itself (an L1 Put of the key, a RESTAction / endpointRef Secret change, GONE, a captured dep moving, or a served input cell being re-Put). Process-lived; its growth over a long run is the reading."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		o.ObserveInt64(declinedMarks, cache.EngineDeclinedExternalSet().Len())
 		kindAttr := func(kind string) metric.ObserveOption {
 			return metric.WithAttributes(attribute.String("kind", kind))
 		}
@@ -1284,7 +1290,7 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		}
 		return nil
 	}, passTotal, planned, done, budget, elapsed, rWidgetUnits, rWidgetUS, rRAUnits, rRAUS,
-		skipDeclined, skipResume, extFetch, extAbandoned)
+		skipDeclined, skipResume, extFetch, extAbandoned, declinedMarks)
 	return err
 }
 

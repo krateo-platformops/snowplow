@@ -181,9 +181,10 @@ func configVarsDataChanged(oldObj, newObj interface{}) bool {
 func enqueueBootReDrive(reason string) {
 	configVarsEnqueuedTotal.Add(1)
 	bootScope := prewarmScope{kind: scopeKindBoot}
-	// #132 F4b Lever A — a config-vars redrive is a NEW TOPOLOGY (the frontend
-	// config.json / nav set changed). CLEAR the engine-lived declined-external
-	// marker set for the boot scope so the redrive re-resolves each external
+	// #132 F4b Lever A / #643 — a config-vars redrive is a NEW TOPOLOGY (the frontend
+	// config.json / nav set changed). CLEAR the engine-wide declined-external
+	// marker set (kept deliberately by #643: a rare event, and the conservative
+	// answer to "can a config change alter external-ness?") so the redrive re-resolves each external
 	// whale ONCE under the new nav set, rather than staying suppressed across the
 	// topology change (a stale suppression would leave a now-navigable external
 	// widget cold-forever). A plain F.4 deadline-cut requeue does NOT come through

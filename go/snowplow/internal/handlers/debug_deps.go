@@ -66,6 +66,10 @@ type depsKeyView struct {
 	ExternalTTL     bool   `json:"externalTTL,omitempty"`
 	BodySha256      string `json:"bodySha256,omitempty"`
 	HasBackingEdge  bool   `json:"hasBackingEdge"`
+	// #643 — Put identity of the resident cell, and whether the key is held in
+	// the engine-wide declined-external set. Metadata only.
+	PutSeq                 uint64 `json:"putSeq,omitempty"`
+	DeclinedExternalMarked bool   `json:"declinedExternalMarked,omitempty"`
 }
 
 // depsFilterSample is one flagged entry in a ?filter response.
@@ -158,6 +162,14 @@ func depsKeyViewFor(keyHash string) depsKeyView {
 	}
 	view.Pinned = entry.Pinned
 	view.ExternalTTL = entry.ExternalTTL
+	// #643 — the cell's Put identity (metadata only): a declined-external mark
+	// that served this cell retires when it moves.
+	if seq, ok := cache.ResolvedCache().PutSeqOf(keyHash); ok {
+		view.PutSeq = seq
+	}
+	// #643 — whether this key is held in the engine-wide declined-external set
+	// (metadata only; never the mark's content).
+	view.DeclinedExternalMarked = cache.EngineDeclinedExternalSet().Marked(keyHash)
 	if entry.TTLOverride > 0 {
 		view.TTLOverrideSecs = int64(entry.TTLOverride.Seconds())
 	}

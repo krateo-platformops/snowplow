@@ -588,6 +588,10 @@ type depGenSink struct {
 	// fast path, NoteRAFullListSlice), captured by the SeedResolveMemo for its hit
 	// siblings (LayeredSourcesMark / LayeredSourcesSince).
 	layered []layeredSource
+	// served — #643: the L1 cells this resolve SERVED a body from (ServeCell),
+	// each with its Put identity and the deps it covers. A declined-external
+	// mark folds them in: the mark retires when a served cell is re-Put or gone.
+	served []ServedCell
 }
 
 // addDepLocked appends dk unless already present. Caller holds s.mu.

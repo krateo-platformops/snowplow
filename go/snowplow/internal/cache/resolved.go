@@ -945,6 +945,12 @@ type lruItem struct {
 	key   string
 	entry *ResolvedEntry
 	bytes int64
+	// putSeq — #643: this cell's Put identity, from one process-wide monotonic
+	// sequence, re-stamped by EVERY accepted Put (both putCoreLocked branches).
+	// A served-cell note records it; a later Put (or the cell's removal) makes
+	// it differ, which is how a declined-external mark learns the input it was
+	// taken from was re-Put.
+	putSeq uint64
 	// extrasHash is HashExtras(entry.Inputs.Extras), computed ONCE per Put
 	// (off the lock) and projected O(1) by metaForItemLocked (#247
 	// instrument). It is derived state about THIS item's entry and must be
@@ -2083,6 +2089,10 @@ func (c *ResolvedCacheStore) putPreamble(entry *ResolvedEntry) (bytes int64, ext
 func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, bytes int64, extrasHash string, gen uint64, freshMint bool) {
 	// #189 — a live entry supersedes any tombstone for its key.
 	delete(c.tombstones, key)
+	// #643 retire rule (a) — a Put proves the key cacheable: drop its
+	// declined-external mark (not for an ExternalTTL entry). Every Put variant
+	// reaches this chokepoint, so no Put site can forget it.
+	unmarkDeclinedExternalOnPut(key, entry)
 
 	apistage := isApistageEntry(entry)
 	widgetContent := isWidgetContentEntry(entry)
@@ -2153,6 +2163,7 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		// to the old extras identity.
 		old.extrasHash = extrasHash
 		old.gen = gen
+		old.putSeq = storePutSeq.Add(1) // #643 — a replace-in-place is a new Put identity
 		if entry.Pinned {
 			c.curResidentBytes += bytes
 			c.residentEntries++
@@ -2168,7 +2179,7 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		return
 	}
 
-	item := &lruItem{key: key, entry: entry, bytes: bytes, extrasHash: extrasHash, gen: gen}
+	item := &lruItem{key: key, entry: entry, bytes: bytes, extrasHash: extrasHash, gen: gen, putSeq: storePutSeq.Add(1)}
 	// #315/#316 — read-recency on a FRESH insert. A non-seeded insert is a
 	// customer COLD-FILL (Get-MISS → populate → serve): the customer DID read it,
 	// but via a MISS, so without this a cold-filled cell would carry lastRead=zero
@@ -3930,6 +3941,9 @@ func stopResolvedCacheSummaryForTest() {
 // Production code MUST NOT call it.
 func ResetResolvedCacheForTest() {
 	resetResolvedCacheForTest()
+	// #643 — the engine-wide declined-external set is process-lived and keyed
+	// by L1 keys: a fresh store must not inherit marks for keys it never held.
+	ResetEngineDeclinedExternalSetForTest()
 }
 
 // ReapPastMaxEntryAgeForTest runs ONE read-independent maintenance pass (the #248/
