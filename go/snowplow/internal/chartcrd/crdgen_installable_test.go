@@ -34,14 +34,18 @@ import (
 // the CEL, the refusal would disappear and this test would fail. It would not
 // pass for no reason.
 
-// TestIssue657_CrdgenCompilesChartSchema: the chart, as committed, compiles to
-// a CRD that the apiserver's validator accepts.
+// TestIssue657_CrdgenCompilesChartSchema: each chart, as committed, compiles
+// to a CRD that the apiserver's validator accepts. compositiondefinition.yaml
+// installs only helm/snowplow through core-provider. helm/snowplow-crds is
+// checked too, so that installing it the same way stays possible.
 func TestIssue657_CrdgenCompilesChartSchema(t *testing.T) {
-	schema := readFile(t, chartSchemaPath)
-	requireNoCoreProviderRewrite(t, schema)
-	if _, err := generate(t, schema); err != nil {
-		t.Fatalf("crdgen (core-provider %s) refuses helm/snowplow/values.schema.json, so the chart cannot be installed on Krateo (#657):\n%v",
-			coreProviderVersion, err)
+	for _, p := range []string{chartSchemaPath, crdsChartSchemaPath} {
+		schema := readFile(t, p)
+		requireNoCoreProviderRewrite(t, schema)
+		if _, err := generate(t, schema); err != nil {
+			t.Errorf("crdgen (core-provider %s) refuses %s, so the chart cannot be installed on Krateo (#657):\n%v",
+				coreProviderVersion, p, err)
+		}
 	}
 }
 
@@ -169,6 +173,10 @@ func TestIssue657_RuleCostMargin(t *testing.T) {
 	}
 	for _, f := range celItemFields {
 		arr := rbacField(t, crd, f)
+		if arr.MaxItems == nil {
+			t.Errorf("spec.rbac.%s has no maxItems: its item rules run an unbounded number of times", f)
+			continue
+		}
 		var internal apiextensions.JSONSchemaProps
 		if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(arr.Items.Schema, &internal, nil); err != nil {
 			t.Fatal(err)

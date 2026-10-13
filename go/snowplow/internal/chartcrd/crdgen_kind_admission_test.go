@@ -183,16 +183,19 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 	for _, f := range celItemFields {
 		t.Run("bounds/"+f, func(t *testing.T) {
 			arr := rbacField(t, crd, f)
-			max := int(*arr.MaxItems)
-			full := make([]string, max)
+			if arr.MaxItems == nil || arr.Items.Schema.MaxLength == nil {
+				t.Fatalf("spec.rbac.%s is not bounded in the CRD (maxItems and items.maxLength are both required, #657)", f)
+			}
+			n := int(*arr.MaxItems)
+			full := make([]string, n)
 			for i := range full {
 				full[i] = fmt.Sprintf("cohort-%d", i)
 			}
 			if err := apply(f, full); err != nil {
-				t.Fatalf("%d items (= maxItems) refused: %v", max, err)
+				t.Fatalf("%d items (= maxItems) refused: %v", n, err)
 			}
 			if err := apply(f, append(full, "one-more")); err == nil || !strings.Contains(err.Error(), "Too many") {
-				t.Fatalf("%d items (> maxItems) not refused for size: %v", max+1, err)
+				t.Fatalf("%d items (> maxItems) not refused for size: %v", n+1, err)
 			}
 			long := strings.Repeat("a", int(*arr.Items.Schema.MaxLength)+1)
 			if err := apply(f, []string{long}); err == nil || !strings.Contains(err.Error(), "Too long") {

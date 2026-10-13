@@ -16,8 +16,9 @@ import (
 
 const (
 	// The chart this guard protects, from go/snowplow/internal/chartcrd.
-	chartSchemaPath = "../../../../helm/snowplow/values.schema.json"
-	goModPath       = "../../go.mod"
+	chartSchemaPath     = "../../../../helm/snowplow/values.schema.json"
+	goModPath           = "../../go.mod"
+	crdsChartSchemaPath = "../../../../helm/snowplow-crds/values.schema.json"
 
 	// core-provider 2.13.23 is the version installer 0.3.419 deploys. It
 	// requires plumbing v1.15.1, and plumbing/crdgen at that version is what
