@@ -60,6 +60,13 @@ func newOTLPReceiver(t *testing.T) *otlpReceiver {
 	t.Helper()
 	r := &otlpReceiver{}
 	r.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// #596: be path-faithful like the collector's otlp receiver, which
+		// serves only /v1/{traces,metrics,logs}. A receiver that accepts any
+		// path cannot see an exporter posting to "/" (the traces defect).
+		if req.URL.Path != "/v1/metrics" {
+			http.NotFound(w, req)
+			return
+		}
 		var body io.Reader = req.Body
 		// The exporter gzips by default; decode it the way the collector does.
 		if req.Header.Get("Content-Encoding") == "gzip" {

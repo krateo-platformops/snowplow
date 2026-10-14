@@ -125,7 +125,7 @@ func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 	// var is set so a bare host:port or a full URL both resolve.
 	opts := []otlptracehttp.Option{}
 	if ep := env.String(EnvOTLPEndpoint, ""); ep != "" {
-		opts = append(opts, otlptracehttp.WithEndpointURL(ep))
+		opts = append(opts, otlptracehttp.WithEndpointURL(otelresource.SignalEndpointURL(ep, otelresource.TracesPath)))
 	}
 
 	exp, err := otlptracehttp.New(ctx, opts...)

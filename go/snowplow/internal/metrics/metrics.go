@@ -123,7 +123,7 @@ func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 
 	opts := []otlpmetrichttp.Option{}
 	if ep := env.String(EnvOTLPEndpoint, ""); ep != "" {
-		opts = append(opts, otlpmetrichttp.WithEndpointURL(ep))
+		opts = append(opts, otlpmetrichttp.WithEndpointURL(otelresource.SignalEndpointURL(ep, otelresource.MetricsPath)))
 	}
 
 	exp, err := otlpmetrichttp.New(ctx, opts...)

@@ -36,6 +36,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/logging"
 	"github.com/krateo-platformops/snowplow/internal/metrics"
+	"github.com/krateo-platformops/snowplow/internal/otelresource"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
@@ -379,6 +380,10 @@ func main() {
 	// coexists with all three. The deferred shutdowns flush the batch
 	// span/metric pipelines on graceful exit; they are no-ops when disabled.
 	otelCtx := context.Background()
+	// #596: OTel's default error handler uses log.Print, which slog.SetDefault
+	// above turns into an INFO record that LOG_LEVEL=warn drops. Installed
+	// before any exporter exists so no export failure can be swallowed.
+	otelresource.InstallErrorHandler(log)
 	traceShutdown, err := tracing.Setup(otelCtx, build)
 	if err != nil {
 		log.Error("otel tracing setup failed", slog.Any("err", err))
