@@ -76,7 +76,8 @@ type StageFailure struct {
 // caller that maps errors.As(*apierrors.StatusError) to an HTTP answer (the
 // widget and RESTAction /call handlers) and every classifier that reads
 // apierrors.Is* (the refresher, the seed) sees the upstream code and reason.
-// The message names the RESTAction and the stage, then the upstream message.
+// The message names the RESTAction and the stage, then the canonical message
+// (canonicalStageMessage) — never the upstream's own text.
 func (f *StageFailure) StatusError(raNamespace, raName string) *apierrors.StatusError {
 	if f == nil {
 		return nil

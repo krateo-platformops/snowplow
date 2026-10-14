@@ -1063,7 +1063,16 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if raw, served, ierr := dispatchViaInternalRESTConfig(gctx, call); served || ierr != nil {
 		dispatch := "internal-rest-config"
 		if ierr != nil {
-			r.log.Error("api call response failure", slog.String("name", id),
+			// #711 — an expected per-identity re-gate deny (classified by its
+			// type) logs at WARN once per cell generation, DEBUG after; every
+			// other failure stays at ERROR. predial_total{denied} counts each.
+			failLevel := slog.LevelError
+			if isRegateDenied(ierr) {
+				failLevel = expectedDenyLevel(r.ctx, call.Path)
+			}
+			r.log.Log(r.ctx, failLevel, "api call response failure", slog.String("name", id),
+				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
+				slog.String("restaction_name", r.opts.RESTActionName),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 				slog.String("path", call.Path),
 				slog.String("dispatch", "internal-rest-config"),
@@ -1162,6 +1171,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		dispatch := "discovery"
 		if derr != nil {
 			r.log.Error("api call response failure", slog.String("name", id),
+				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
+				slog.String("restaction_name", r.opts.RESTActionName),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 				slog.String("path", call.Path),
 				slog.String("dispatch", "discovery"),
@@ -1385,6 +1396,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 
 	if res.Status == response.StatusFailure {
 		r.log.Error("api call response failure", slog.String("name", id),
+			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
+			slog.String("restaction_name", r.opts.RESTActionName),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
 			slog.String("path", call.Path),
 			// diagnostic for #271 — external/owned-fetch site. sa_dial reads
