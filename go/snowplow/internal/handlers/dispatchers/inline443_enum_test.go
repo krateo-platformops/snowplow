@@ -214,10 +214,12 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ServiceAccountDialFromContext": readOnly443, "SliceShapeHash": readOnly443,
 	"SliceabilityShapeKnownNegative": readOnly443, "StageErrorSink.Bump": readOnly443,
 	"StageErrorSinkFromContext": readOnly443, "WithApistageContentResolve": readOnly443,
-	// #677: the re-gate-deny sibling of StageErrorSink — a per-resolve counter on
-	// a ctx-carried sink (nil, a no-op, off the refresher). Same classification.
-	"RegateDenySink.Bump": readOnly443, "RegateDenySinkFromContext": readOnly443,
-	"WithContentDepGenSink": readOnly443, "WithInternalEndpoint": readOnly443,
+	// #681: the per-identity forbidden sibling of StageErrorSink — per-resolve
+	// counters on a ctx-carried sink (nil, a no-op, where none is installed).
+	// Same classification as StageErrorSink.Bump.
+	"PerIdentityForbiddenSink.BumpStage": readOnly443, "PerIdentityForbiddenSink.BumpExternal": readOnly443,
+	"PerIdentityForbiddenSinkFromContext": readOnly443,
+	"WithContentDepGenSink":               readOnly443, "WithInternalEndpoint": readOnly443,
 	"WithInternalRESTConfig": readOnly443, "WithL1KeyContextFromEpoch": readOnly443,
 	"WithNestedCallDepth": readOnly443, "WithNestedResolveAncestor": readOnly443, "WithServiceAccountDial": readOnly443,
 	// #398 (#440): a pure GVR classifier and the request-scoped sensitive-touched sink.

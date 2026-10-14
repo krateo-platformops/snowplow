@@ -573,6 +573,11 @@ type ResolvedKeyInputs struct {
 	// → notifyRBACShift) re-seeds the rotated subjects' resident cohorts under
 	// their new sub-gen. UNLIKE HasUAF this IS folded into ComputeKey →
 	// resolvedKeyVersion (v4→v5→v6 across (c) and (c)-v2).
+	//
+	// #682 — RBACSubGenForSubject also adds the process-wide boot-window epoch
+	// (rbac_subgen_epoch.go). That is a term of THIS existing dimension, not a
+	// new identity input: no key-format change, no resolvedKeyVersion bump, and
+	// identity-free classes (which do not fold RBACSubGen) never rotate on it.
 	RBACSubGen uint64
 
 	// AtRiskClass — #261 serve-time-detector MARK-AT-MINT. Computed by
@@ -2097,9 +2102,6 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 	// declined-external mark (not for an ExternalTTL entry). Every Put variant
 	// reaches this chokepoint, so no Put site can forget it.
 	unmarkDeclinedExternalOnPut(key, entry)
-	// #677 retire rule (d) — the same chokepoint retires the refresher's
-	// known-declined (re-gate deny) mark: a Put proves the cell writable again.
-	unmarkRegateDeclinedOnPut(key)
 
 	apistage := isApistageEntry(entry)
 	widgetContent := isWidgetContentEntry(entry)
@@ -3149,8 +3151,6 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	// 1.12.6 C4 (§6.4) — a refresh-suppression marker must not outlive its
 	// key (every eviction path but deleteForDep funnels through here).
 	clearRefreshSuppression(item.key)
-	// #677 rule (e) — nor a known-declined mark.
-	forgetRegateDeclinedOnEvict(item.key)
 	// #354 P3 — nor an open invalidation→fresh window (ends it evicted).
 	evictDirtyWindow(item.key)
 	// Ship 4a (0.30.198) — debit the correct budget. A pinned entry's bytes
@@ -3340,8 +3340,6 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	// through removeElementLocked; the marker must not outlive its key here
 	// either (TestRefreshTerminal_F6e).
 	clearRefreshSuppression(item.key)
-	// #677 rule (e) — nor a known-declined mark.
-	forgetRegateDeclinedOnEvict(item.key)
 	// #354 P3 — the DELETE path ends an open invalidation→fresh window too
 	// (evicted); it bypasses removeElementLocked, so it clears it here.
 	evictDirtyWindow(item.key)

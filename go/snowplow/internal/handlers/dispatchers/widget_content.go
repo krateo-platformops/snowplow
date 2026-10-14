@@ -134,6 +134,9 @@ func withWidgetContentPutSinks(ctx context.Context) context.Context {
 	ctx, _ = cache.WithExternalTouchedSink(ctx)
 	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
 	ctx, _ = cache.WithUAFTouchedSink(ctx)
+	// #681 C2 — so the walk's declined-external mark and the gate below read
+	// the ONE genuine-external count.
+	ctx, _ = cache.WithPerIdentityForbiddenSink(ctx)
 	return ctx
 }
 
@@ -323,7 +326,7 @@ func populateWidgetContentL1(
 	// F2 walker installs the external-touched sink on resolveCtx
 	// (phase1_walk.go); recordWidgetDeps is ALSO skipped on this declined path
 	// (the return below) — there is no entry to dep-track.
-	if extSink := cache.ExternalTouchedSinkFromContext(ctx); extSink.Count() > 0 {
+	if extSink := cache.ExternalTouchedSinkFromContext(ctx); cache.GenuineExternal(extSink, cache.PerIdentityForbiddenSinkFromContext(ctx)) > 0 {
 		cache.BumpExternalSkippedPut()
 		log.Debug("widget_content.populate.skip_external_touched",
 			slog.String("subsystem", "cache"),

@@ -72,6 +72,13 @@ func BindingsIndexDeltaSkippedNonTyped() uint64 {
 func (idx *bindingsByGVRIndex) deltaActive() bool {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
+	if !idx.built {
+		// #682 — note the pre-build RBAC event UNDER the read lock: the build
+		// holds the write lock, so either this note lands before the build
+		// reads it, or the build has already set built and this hook takes the
+		// normal delta path.
+		notePreBuildRBACEvent()
+	}
 	return idx.built
 }
 

@@ -1074,12 +1074,17 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
-			// #677 — same site, same item as the stage-error bump above: a
-			// per-identity re-gate deny also bumps the refresher's
-			// RegateDenySink (absent on every other path), so the refresher
-			// can tell "every stage error was a correct deny" exactly.
-			noteRegateDenyStageError(r.ctx, ierr)
+			if isRegateDenied(ierr) {
+				// #681 F1 — a per-identity re-gate deny. Recorded as the ONE
+				// identity-free canonical body (per_identity_forbidden.go) and
+				// counted on the per-identity forbidden sink at the same site,
+				// for the same item, as the stage-error bump.
+				msg := ierr.Error()
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalForbiddenBody(msg), msg, itemErr)
+				notePerIdentityForbidden(r.ctx, false)
+			} else {
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
+			}
 			dispatch = "internal-rest-config-error"
 		} else {
 			// internal-rest-config dispatch result is in memory — feed
@@ -1394,11 +1399,24 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if len(asMap) > 0 {
 			accumVal = asMap
 		}
+		bumpMsg := res.Message
+		// #681 F2 — the apiserver's typed 403 Forbidden on the requester's OWN
+		// dial of an apiserver read: a per-identity forbidden. Its message names
+		// the requester, so it is replaced by the identity-free canonical body
+		// before it enters the result (S1), and counted on the per-identity
+		// forbidden sink (stage + external: this dial bumped the external sink).
+		ownDenied, isOwnDenied := classifyOwnDialForbidden(gctx, apiCall, call, res)
+		if isOwnDenied {
+			accumVal, bumpMsg = canonicalForbiddenBody(ownDenied), ownDenied
+		}
 		var itemErr error
 		if !call.ContinueOnError {
-			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, res.Message)
+			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, bumpMsg)
 		}
-		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, res.Message, itemErr)
+		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
+		if isOwnDenied {
+			notePerIdentityForbidden(r.ctx, true)
+		}
 		// Fall through to the success-log line (preserves
 		// pre-0.30.95 behaviour where the
 		// "successfully resolved" line emitted on every

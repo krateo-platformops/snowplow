@@ -45,7 +45,7 @@ func TestSeedPutGate_DeclinesOnStageError_NotOnEmptyResult(t *testing.T) {
 	_, emptyStage := cache.WithStageErrorSink(ctx)
 	_, emptyExt := cache.WithExternalTouchedSink(ctx)
 	before := pipSeedSkippedStageErrorTotal.Load()
-	if declineSeedPutOnError(ctx, "widgets", "krateo/empty-ok", "key/empty-ok", emptyStage, emptyExt) {
+	if declineSeedPutOnError(ctx, "widgets", "krateo/empty-ok", "key/empty-ok", emptyStage, emptyExt, nil) {
 		t.Fatal("GTTL-1 control VIOLATED: declined a Put with NO stage error — the gate keys on emptiness, not error presence (a 0-composition user would lose their cell)")
 	}
 	if got := pipSeedSkippedStageErrorTotal.Load(); got != before {
@@ -58,7 +58,7 @@ func TestSeedPutGate_DeclinesOnStageError_NotOnEmptyResult(t *testing.T) {
 	_, extSink := cache.WithExternalTouchedSink(ctx)
 	stageSink.Bump("exportJwt-loopback", "401 no per-user JWT in background seed")
 	before = pipSeedSkippedStageErrorTotal.Load()
-	if !declineSeedPutOnError(ctx, "widgets", "krateo/dashboard-flex", "key/dashboard-flex", stageSink, extSink) {
+	if !declineSeedPutOnError(ctx, "widgets", "krateo/dashboard-flex", "key/dashboard-flex", stageSink, extSink, nil) {
 		t.Fatal("GTTL-1 ARM-BACKSTOP VIOLATED: did NOT decline the Put despite a stage error — the sweep would blind-re-Put degraded bytes over the good warm entry")
 	}
 	if got := pipSeedSkippedStageErrorTotal.Load(); got != before+1 {
@@ -78,7 +78,7 @@ func TestSeedPutGate_DeclinesOnExternalTouch(t *testing.T) {
 	extSink.Bump() // resolver touched a genuine external endpoint
 
 	before := pipSeedSkippedStageErrorTotal.Load()
-	if !declineSeedPutOnError(ctx, "restactions", "krateo/ext-ra", "key/ext-ra", stageSink, extSink) {
+	if !declineSeedPutOnError(ctx, "restactions", "krateo/ext-ra", "key/ext-ra", stageSink, extSink, nil) {
 		t.Fatal("GTTL-1: did NOT decline the Put despite an external touch — external bytes have no dep edge to invalidate them")
 	}
 	if got := pipSeedSkippedStageErrorTotal.Load(); got != before+1 {
@@ -101,14 +101,14 @@ func TestSeedPutGate_VerdictFlipsSolelyOnSinkCount(t *testing.T) {
 
 	_, unbumped := cache.WithStageErrorSink(ctx)
 	_, ext := cache.WithExternalTouchedSink(ctx)
-	if declineSeedPutOnError(ctx, "widgets", "krateo/w", "key/w", unbumped, ext) {
+	if declineSeedPutOnError(ctx, "widgets", "krateo/w", "key/w", unbumped, ext, nil) {
 		t.Fatal("unbumped sink must NOT decline")
 	}
 
 	_, bumped := cache.WithStageErrorSink(ctx)
 	_, ext2 := cache.WithExternalTouchedSink(ctx)
 	bumped.Bump("stage", "err")
-	if !declineSeedPutOnError(ctx, "widgets", "krateo/w", "key/w", bumped, ext2) {
+	if !declineSeedPutOnError(ctx, "widgets", "krateo/w", "key/w", bumped, ext2, nil) {
 		t.Fatal("mutation guard: a bumped stage sink MUST decline — if this returns false the gate has regressed to blind-Put (the GTTL-1 defect)")
 	}
 }
