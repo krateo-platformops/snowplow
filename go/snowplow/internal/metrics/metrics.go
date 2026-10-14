@@ -1204,6 +1204,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerListQueryInstrument(m); err != nil {
 		return err
 	}
+	if err := registerContentFillInstruments(m); err != nil {
+		return err
+	}
 	if err := registerPrewarmPassInstruments(m); err != nil {
 		return err
 	}
@@ -1425,6 +1428,81 @@ func registerListQueryInstrument(m metric.Meter) error {
 		return nil
 	}, listQuery)
 	return err
+}
+
+// registerContentFillInstruments hand-wires #710's apistage content-fill
+// series onto OTLP (no expvar->OTLP bridge). The observables read
+// restactionsapi.ContentFillStatsSnapshot, the accessor the expvar closures
+// read, so the surfaces cannot diverge. The only attribute is `reason`, a
+// closed code-defined set {absent, known_stale, refresh_forced}; the by-GVR
+// and by-RA tables stay expvar-only (data-derived keys). The duration is a
+// synchronous histogram fed through the api package's recorder hook (api
+// cannot import this package). Registered only when the cache is on (CFG-1).
+func registerContentFillInstruments(m metric.Meter) error {
+	total, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_total",
+		metric.WithDescription("Apistage content fills started (a reader took the content-cell MISS branch: whole-list envelope build + decode + Put), by reason {absent, known_stale, refresh_forced}. #710."))
+	if err != nil {
+		return err
+	}
+	dup, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_duplicate_total",
+		metric.WithDescription("Content fills started while another fill of the SAME content key was already in flight (the herd), by reason. ≈0 once fills are coalesced. #710."))
+	if err != nil {
+		return err
+	}
+	bytesTotal, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_bytes_total",
+		metric.WithDescription("Raw list-envelope bytes produced by content fills, by reason. #710."),
+		metric.WithUnit("By"))
+	if err != nil {
+		return err
+	}
+	notServable, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_not_servable_total",
+		metric.WithDescription("Content fills whose dispatch the informer could not serve (no bytes; the call falls through). #710."))
+	if err != nil {
+		return err
+	}
+	inflight, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_inflight",
+		metric.WithDescription("Content fills in flight now. #710."))
+	if err != nil {
+		return err
+	}
+	inflightBytes, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_inflight_bytes",
+		metric.WithDescription("Raw envelope bytes held by the content fills in flight now. #710."),
+		metric.WithUnit("By"))
+	if err != nil {
+		return err
+	}
+	duration, err := m.Int64Histogram("snowplow_apistage_content_fill_duration_ms",
+		metric.WithDescription("One apistage content fill (ms): dispatch start to the end of its parse and Put. #710 (PR-2's predicted admission wait)."),
+		metric.WithUnit("ms"),
+		metric.WithExplicitBucketBoundaries(int64sToFloat64s(restactionsapi.ContentFillDurationBoundsMS)...),
+	)
+	if err != nil {
+		return err
+	}
+	restactionsapi.SetContentFillDurationRecorder(func(ms int64) { duration.Record(context.Background(), ms) })
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		s := restactionsapi.ContentFillStatsSnapshot()
+		for _, r := range restactionsapi.ContentFillReasons() {
+			attrs := metric.WithAttributes(attribute.String("reason", r))
+			o.ObserveInt64(total, int64(s.Total[r]), attrs)
+			o.ObserveInt64(dup, int64(s.Duplicate[r]), attrs)
+			o.ObserveInt64(bytesTotal, int64(s.Bytes[r]), attrs)
+		}
+		o.ObserveInt64(notServable, int64(s.NotServable))
+		o.ObserveInt64(inflight, s.Inflight)
+		o.ObserveInt64(inflightBytes, s.InflightBytes)
+		return nil
+	}, total, dup, bytesTotal, notServable, inflight, inflightBytes)
+	return err
+}
+
+// int64sToFloat64s converts histogram bounds to the OTel bucket type.
+func int64sToFloat64s(in []int64) []float64 {
+	out := make([]float64, len(in))
+	for i, v := range in {
+		out[i] = float64(v)
+	}
+	return out
 }
 
 // learnedCapacityStats is the CLOSED set of numeric inputs of the last
