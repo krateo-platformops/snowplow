@@ -123,6 +123,36 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     f483 = os.environ.get("FAKE_483", "")          # "", pass, wide
     if a[:3] == ["get", "crd", "alerts.observability.krateo.io"]:
         sys.exit(0 if f483 in ("pass", "wide") else 1)
+    if a[:2] == ["get", "pods"] and "app.kubernetes.io/name=snowplow" in a and "json" in a:
+        # snowplow's own pod: optionally OOM-restarted between the before/after
+        # records (FAKE_RESTART_DURING_MEASURE=1).
+        cnt = os.path.join(STATE, "snowplow_pod_reads")
+        n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+        open(cnt, "w").write(str(n + 1))
+        restarted = os.environ.get("FAKE_RESTART_DURING_MEASURE") == "1" and n >= 1
+        cs = {"name": "snowplow", "ready": True, "restartCount": 1 if restarted else 0,
+              "lastState": ({"terminated": {"reason": "OOMKilled", "exitCode": 137,
+                                            "finishedAt": "2026-10-14T15:04:53Z"}}
+                            if restarted else {})}
+        print(json.dumps({"items": [{"metadata": {"name": "snowplow-abc"},
+                                     "spec": {"containers": [{"resources": {"limits": {"memory": "8Gi"}}}]},
+                                     "status": {"containerStatuses": [cs]}}]}))
+        sys.exit(0)
+    if a[:2] == ["top", "pod"]:
+        print("snowplow-abc 120m 650Mi"); sys.exit(0)
+    if a[:1] == ["cp"] and any("mem606" in x for x in a):
+        dest = a[-1]
+        os.makedirs(dest, exist_ok=True)
+        open(os.path.join(dest, "heap-01-150000-ready.pb.gz"), "wb").write(b"\\x1f\\x8bfake")
+        sys.exit(0)
+    if a[:1] == ["logs"] and any("mem606" in x for x in a):
+        print(json.dumps({"kind": "mem", "t": 1.0, "readyz": 200, "vars_status": 200,
+                          "heap_inuse_mb": 1392.8, "sys_mb": 1551.9}))
+        print(json.dumps({"kind": "heap_profile", "t": 1.0, "profile": "heap-01-150000-ready.pb.gz",
+                          "bytes": 152190, "at": "ready"}))
+        print(json.dumps({"kind": "mem", "t": 16.0, "readyz": 200, "vars_status": 200,
+                          "heap_inuse_mb": 3789.4, "sys_mb": 6741.5}))
+        sys.exit(0)
     if a[:1] == ["get"] and "json" in a:
         what = a[1]
         if what == "crd":
@@ -240,6 +270,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print("pod/load606-0"); sys.exit(0)
         if what == "pods" and "job-name=fresh606" in a:
             print("pod/fresh606-0"); sys.exit(0)
+        if what == "pods" and "job-name=mem606" in a:
+            print("pod/mem606-0"); sys.exit(0)
         if what == "configmap" and "frontend-config-vars" in a:
             init = os.environ.get("FAKE_INIT", "/call?resource=layouts&apiVersion="
                                   "widgets.templates.krateo.io/v1beta1&name=app-shell"

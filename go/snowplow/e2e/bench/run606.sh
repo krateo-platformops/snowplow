@@ -69,6 +69,11 @@ PLATFORM_TIMEOUT_S="${PLATFORM_TIMEOUT_S:-2700}"
 FRONTEND_CONFIGMAP="${FRONTEND_CONFIGMAP:-frontend-config-vars}"
 PREFLIGHT_TIMEOUT_S="${PREFLIGHT_TIMEOUT_S:-300}"
 PREFLIGHT_POLL_S="${PREFLIGHT_POLL_S:-3}"
+SNOWPLOW_POD_SELECTOR="${SNOWPLOW_POD_SELECTOR:-app.kubernetes.io/name=snowplow}"
+TOP_POLL_S="${TOP_POLL_S:-15}"
+# Extra /debug/vars key prefixes mem606 records every sample (e.g. the #710
+# PR-0 fill counters, once they exist). Space-separated; empty by default.
+MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES:-}"
 PLATFORM_POLL_S="${PLATFORM_POLL_S:-60}"
 OUT="${OUT:-/tmp/snowplow-runs/606/${RUN_NAME}}"
 
@@ -116,6 +121,7 @@ CLUSTER_CREATED=0
 teardown() {
   local rc=$?
   trap - EXIT
+  declare -F stop_top_loop >/dev/null && stop_top_loop
   if [[ "$CLUSTER_CREATED" == "1" ]]; then
     # On ANY failure, snapshot the cluster BEFORE it is deleted (shakedown #2
     # tore down with nothing captured). Best effort: it never blocks teardown.
@@ -318,10 +324,41 @@ s_measure() {
       --fresh-rates $CHURN_RATES --fresh-samples "$FRESH_SAMPLES" \
       --fresh-gap-s "$FRESH_GAP_S" --fresh-delay-s "$THINK_S" \
       --namespaces "$NAMESPACES" \
+      --mem-duration-s "$(( DRIVE_S + 3600 ))" \
+      $(for x in $MEM_VARS_PREFIXES; do printf -- '--mem-vars-prefix %s ' "$x"; done) \
       > "$OUT/loadgen-job.yaml"
+  # snowplow's restart state BEFORE measure (the verdict compares after/before:
+  # any restart or OOM during measure makes the run INVALID, with its reason).
+  snowplow_pod_record before
+  # Standard memory capture (#710): kubectl top every TOP_POLL_S from here,
+  # plus the in-cluster mem606 Job (memstats + heap profiles, metadata only).
+  start_top_loop
   run "${K[@]}" apply -f "$OUT/loadgen-job.yaml"
   run "${K[@]}" -n bench-loadgen wait job/load606 job/fresh606 --for=condition=Complete \
       --timeout="$(( DRIVE_S + 3600 ))s"
+}
+snowplow_pod_record() {
+  local phase="$1"
+  if [[ "$DRY" == "1" ]]; then log "DRY: snowplow pod record ($phase)"; return 0; fi
+  "${K[@]}" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
+    | python3 -m bench.load606 pod-record --phase "$phase" > "$OUT/pod-$phase.jsonl" \
+    || log "could not record the snowplow pod ($phase); the verdict will say restart state unknown"
+  log "snowplow pod ($phase): $(cat "$OUT/pod-$phase.jsonl" 2>/dev/null | cut -c1-240)"
+}
+TOP_PID=""
+start_top_loop() {
+  if [[ "$DRY" == "1" ]]; then log "DRY: kubectl top loop -> $OUT/top.log"; return 0; fi
+  ( while true; do
+      printf '%s ' "$(date -u +%H:%M:%S)"
+      "${K[@]}" -n krateo-system top pod -l "$SNOWPLOW_POD_SELECTOR" --no-headers 2>&1 | tr -s ' ' | tr '\n' ' '
+      echo
+      sleep "$TOP_POLL_S"
+    done ) >> "$OUT/top.log" 2>&1 &
+  TOP_PID=$!
+}
+stop_top_loop() {
+  [[ -n "${TOP_PID:-}" ]] && kill "$TOP_PID" 2>/dev/null || true
+  TOP_PID=""
 }
 s_collect() {
   local p
@@ -335,12 +372,22 @@ s_collect() {
   for p in $("${K[@]}" -n bench-loadgen get pods -l job-name=fresh606 -o name); do
     "${K[@]}" -n bench-loadgen logs "$p" > "$OUT/fresh-${p#pod/}.jsonl"
   done
+  snowplow_pod_record after
+  declare -F stop_top_loop >/dev/null && stop_top_loop
+  # mem606: its memstats trajectory (logs) and heap profiles (files in /out).
+  for p in $("${K[@]}" -n bench-loadgen get pods -l job-name=mem606 -o name); do
+    "${K[@]}" -n bench-loadgen logs "$p" > "$OUT/mem-${p#pod/}.jsonl" || true
+    mkdir -p "$OUT/heap"
+    "${K[@]}" -n bench-loadgen cp "${p#pod/}:/out" "$OUT/heap" >/dev/null 2>&1 \
+      || log "could not copy heap profiles from ${p#pod/}"
+  done
   "${K[@]}" -n krateo-system logs deploy/snowplow --tail=-1 > "$OUT/snowplow.log" || true
   "${K[@]}" top nodes > "$OUT/top-nodes.txt" || true
 }
 s_evaluate() {
   shopt -s nullglob
-  local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl)
+  local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
+               "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl)
   if [[ "$DRY" == "1" ]]; then log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>}"; return 0; fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.

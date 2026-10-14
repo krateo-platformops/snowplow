@@ -196,6 +196,64 @@ spec:
 """
 
 
+def render_mem(*, snowplow_url: str, authn_url: str, user: str, password: str,
+               duration_s: float, interval_s: float = 15.0,
+               profile_every_s: float = 120.0,
+               vars_prefixes: tuple[str, ...] = ()) -> str:
+    """mem606: the standard memory capture for every run (#710) — memstats
+    every interval_s and heap profiles at Ready / under load / after any
+    restart, kept in the pod's /out until the collect step copies them.
+    METADATA ONLY. Uses the load606 ConfigMap that render() creates."""
+    script = f"""set -eu
+exec python3 -u /opt/load606/load606.py memwatch \\
+  --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
+  --user {json.dumps(user)} --password {json.dumps(password)} \\
+  --duration-s {duration_s:g} --interval-s {interval_s:g} \\
+  --profile-every-s {profile_every_s:g} --out-dir /out --out /dev/stdout{"".join(f" --vars-prefix {json.dumps(x)}" for x in vars_prefixes)}
+"""
+    return f"""\
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mem606
+  namespace: bench-loadgen
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mem606
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        bench.krateo.io/pool: loadgen
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: loadgen
+        effect: NoSchedule
+      containers:
+      - name: mem
+        image: {IMAGE}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+{_indent(script, 10)}
+        volumeMounts:
+        - name: src
+          mountPath: /opt/load606
+        - name: out
+          mountPath: /out
+      volumes:
+      - name: src
+        configMap:
+          name: load606
+      - name: out
+        emptyDir: {{}}
+"""
+
+
 def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str,
                  rates: list[str], samples: int, gap_s: float, probe_name: str,
                  namespaces: int, comp_group: str, comp_version: str,
@@ -220,7 +278,7 @@ exec python3 -u /opt/load606/load606.py fresh --mutator incluster \\
   --group {comp_group} --version {comp_version} --plural {comp_plural} \\
   --probe-name {probe_name} --rates {rate_args} --samples {samples} \\
   --gap-s {gap_s} --poll-ms {poll_ms} --churn-namespaces {namespaces} \\
-  --out /dev/stdout
+  --wait-for-load --out /dev/stdout
 """
     return f"""\
 ---
@@ -319,6 +377,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fresh-samples", type=int, default=60)
     p.add_argument("--fresh-gap-s", type=float, default=5.0)
     p.add_argument("--fresh-delay-s", type=float, default=60.0)
+    p.add_argument("--mem-vars-prefix", action="append", default=None,
+                   help="extra /debug/vars key prefixes for mem606 (repeatable)")
+    p.add_argument("--mem-duration-s", type=float, default=0.0,
+                   help=">0 also renders the mem606 memory/heap sampler Job")
     p.add_argument("--probe-name", default="bench-app-01-01")
     p.add_argument("--namespaces", type=int, default=50)
     p.add_argument("--comp-group", default="composition.krateo.io")
@@ -337,6 +399,12 @@ def main(argv: list[str] | None = None) -> int:
                             authn_url=a.authn_url, password=a.password,
                             init=a.init, frontend_ns=a.frontend_ns,
                             builders_ns=a.builders_ns))
+    if a.mem_duration_s > 0:
+        sys.stdout.write(render_mem(
+            snowplow_url=a.snowplow_url, authn_url=a.authn_url,
+            user=a.preflight_user, password=a.password,
+            duration_s=a.mem_duration_s,
+            vars_prefixes=tuple(a.mem_vars_prefix or ())))
     if a.fresh_rates:
         sys.stdout.write(render_fresh(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,

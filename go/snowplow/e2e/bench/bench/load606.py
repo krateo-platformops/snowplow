@@ -454,6 +454,19 @@ def first_load(client: HttpClient, token: str, portal: Portal, *,
     return shell, routes, content
 
 
+def first_load_failed(shell: WalkResult, routes: list, content: WalkResult | None) -> bool:
+    """A first load FAILED (and must be retried) when the user did not get a
+    working portal: no routes (no shell / no menu), or any transport failure
+    (status 0: refused, reset, timeout) in the shell or the first page. A
+    product 5xx inside the page is a finding, not a failed arrival."""
+    if not routes:
+        return True
+    for w in (shell, content):
+        if w is not None and w.statuses.get("0"):
+            return True
+    return False
+
+
 # ─── Driver ─────────────────────────────────────────────────────────────────
 
 
@@ -474,6 +487,7 @@ class Driver:
                  nav_workers: int = 128, call_workers: int = 512,
                  per_user_parallel: int = 6, seed: int = 606,
                  sink: Callable[[dict], None] | None = None,
+                 retry_base_s: float = 5.0, retry_cap_s: float = 120.0,
                  clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep):
         self.client = client
@@ -491,14 +505,22 @@ class Driver:
         self.visits: dict[tuple[str, str], int] = {}
         self.routes: dict[str, list[dict]] = {}
         self.busy: set[str] = set()
+        self.attempts: dict[str, int] = {}
+        self.not_before: dict[str, float] = {}
+        self.retry_base_s = retry_base_s
+        self.retry_cap_s = retry_cap_s
         self.lock = threading.Lock()
         self.results: list[NavResult] = []
 
     def _record(self, user, page, kind, started, due, w: WalkResult,
-                extra: WalkResult | None = None, routes: int | None = None):
+                extra: WalkResult | None = None, routes: int | None = None,
+                failed: bool = False, attempt: int | None = None):
         with self.lock:
-            visit = self.visits.get((user, page), 0) + 1
-            self.visits[(user, page)] = visit
+            if failed:
+                visit = 0               # a failed first load is not a visit
+            else:
+                visit = self.visits.get((user, page), 0) + 1
+                self.visits[(user, page)] = visit
         parts = [w] + ([extra] if extra else [])
         res = NavResult(
             user=user, page=page, visit=visit, start=started,
@@ -513,6 +535,10 @@ class Driver:
         rec = {"kind": "nav", "nav": kind, **asdict(res)}
         if routes is not None:
             rec["routes"] = routes
+        if failed:
+            rec["first_load_failed"] = True
+        if attempt is not None:
+            rec["attempt"] = attempt
         self.sink(rec)
 
     def _nav(self, user: str, due: float) -> None:
@@ -523,11 +549,24 @@ class Driver:
                 shell, routes, content = first_load(
                     self.client, tok, self.portal, pool=self.call_pool,
                     per_user_parallel=self.per_user_parallel)
+                failed = first_load_failed(shell, routes, content)
                 with self.lock:
-                    self.routes[user] = routes
+                    attempt = self.attempts.get(user, 0) + 1
+                    self.attempts[user] = attempt
+                    if failed:
+                        # NOT first-loaded: retry with capped exponential
+                        # backoff, so the arrival burst is REPLAYED once
+                        # snowplow is back (run 7: users whose first load died
+                        # with snowplow never arrived again).
+                        self.not_before[user] = self.clock() + min(
+                            self.retry_cap_s, self.retry_base_s * (2 ** (attempt - 1)))
+                    else:
+                        self.routes[user] = routes
+                        self.not_before.pop(user, None)
                 page = routes[0]["path"] if routes else "(no-route)"
                 self._record(user, page, "first_load", started, due, shell,
-                             content, routes=len(routes))
+                             content, routes=len(routes), failed=failed,
+                             attempt=attempt)
                 return
             routes = self.routes[user]
             if not routes:
@@ -554,6 +593,10 @@ class Driver:
             for u, t in list(nxt.items()):
                 if t > now:
                     continue
+                nb = self.not_before.get(u)
+                if nb is not None and nb > now:
+                    nxt[u] = nb                 # backing off after a failed first load
+                    continue
                 with self.lock:
                     if u in self.busy:          # a person finishes one navigation first
                         continue
@@ -577,6 +620,8 @@ def freshness_probe(client: HttpClient, token: str, path: str,
                     poll_ms: int = 100, budget_s: float = 30.0,
                     gap_s: float = 5.0, label: str = "list_dep",
                     sink: Callable[[dict], None] | None = None,
+                    healthy: Callable[[], bool] | None = None,
+                    pause_poll_s: float = 5.0, max_pause_s: float = 3600.0,
                     clock: Callable[[], float] = time.time,
                     sleep: Callable[[float], None] = time.sleep) -> list[dict]:
     """Mutate → poll until the marker is visible. One record per sample.
@@ -586,10 +631,23 @@ def freshness_probe(client: HttpClient, token: str, path: str,
     driver's own network hop. A sample that never converges records
     latency_ms=None and converged=False; the verdict fails on it (it is not
     dropped). The poll interval bounds resolution: report it with the result.
+
+    `healthy()` (snowplow /readyz): before each sample the probe PAUSES while
+    snowplow is not Ready (a `fresh_pause` record says for how long), and a
+    sample during which snowplow stopped being Ready is marked
+    valid=False — run 7 recorded 30-second "unconverged" samples against a
+    dead snowplow, which measure the outage, not freshness.
     """
     sink = sink or (lambda rec: None)
+    healthy = healthy or (lambda: True)
     out = []
     for i in range(samples):
+        if not healthy():
+            p0 = clock()
+            while not healthy() and clock() - p0 < max_pause_s:
+                sleep(pause_poll_s)
+            sink({"kind": "fresh_pause", "label": label, "t": p0,
+                  "paused_s": round(clock() - p0, 1), "recovered": healthy()})
         marker = f"fresh-{label}-{int(clock() * 1000)}-{i}"
         if not mutate(marker):
             rec = {"kind": "fresh", "label": label, "marker": marker,
@@ -611,10 +669,50 @@ def freshness_probe(client: HttpClient, token: str, path: str,
         rec = {"kind": "fresh", "label": label, "marker": marker,
                "converged": lat is not None, "latency_ms": lat,
                "polls": polls, "poll_ms": poll_ms, "t": t0}
+        if not healthy():
+            rec["valid"] = False
+            rec["invalid_reason"] = "snowplow not Ready (/readyz) during the sample"
         out.append(rec)
         sink(rec)
         sleep(gap_s)
     return out
+
+
+def wait_for_customer_load(client: HttpClient, token: str, *, min_delta: int = 100,
+                           poll_s: float = 5.0, max_wait_s: float = 1800.0,
+                           clock: Callable[[], float] = time.time,
+                           sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Block until the load driver's navigations are reaching snowplow.
+
+    The signal is snowplow's own L1 lookup counter (hit + miss) rising by
+    `min_delta` from this probe's first reading. It is only a START gate (the
+    refresher also adds lookups, #552, so it is never used as a measurement).
+    Returns {started, waited_s, delta}; started=False after max_wait_s.
+    """
+    def total():
+        v = read_vars(client, token)
+        if not v:
+            return None
+        s = summarize_vars(v)
+        if s["l1_hit"] is None:
+            return None
+        return s["l1_hit"] + s["l1_miss"]
+    t0 = clock()
+    base = None
+    while clock() - t0 < max_wait_s:
+        cur = total()
+        if cur is not None:
+            if base is None:
+                base = cur
+            elif cur - base >= min_delta:
+                return {"started": True, "waited_s": round(clock() - t0, 1),
+                        "delta": cur - base}
+        sleep(poll_s)
+    return {"started": False, "waited_s": round(clock() - t0, 1), "delta": None}
+
+
+def readyz(client: HttpClient) -> bool:
+    return client.get("/readyz", None).status == 200
 
 
 class ChurnDriver:
@@ -802,6 +900,69 @@ def login_report(curves: list[dict]) -> dict | None:
             "finding": "authn: per-login latency (x509 CSR issued per login) is a user-facing number"}
 
 
+def restart_check(pods: list[dict] | None) -> dict | None:
+    """INVALID when snowplow restarted during the measurement.
+
+    `pods` are `snowplow_pod` records taken before and after measure (restart
+    count + lastState per container). None = not provided (unit callers):
+    no check. Provided but incomplete = INVALID (unknown is not "no restart").
+    """
+    if pods is None:
+        return None
+    before = next((p for p in pods if p.get("phase") == "before"), None)
+    after = next((p for p in pods if p.get("phase") == "after"), None)
+    if before is None or after is None:
+        return {"check": "snowplow.restarts_during_measure", "value": None,
+                "bar": "== 0", "result": "FAIL",
+                "why": "restart state unknown (missing before/after pod record)"}
+    if after.get("pod") != before.get("pod"):
+        return {"check": "snowplow.restarts_during_measure", "value": None,
+                "bar": "== 0", "result": "FAIL",
+                "why": f"snowplow pod REPLACED during measure: {before.get('pod')} -> {after.get('pod')}"}
+    delta = (after.get("restarts") or 0) - (before.get("restarts") or 0)
+    if delta > 0:
+        ls = (after.get("last_state") or {}).get("terminated") or {}
+        return {"check": "snowplow.restarts_during_measure", "value": delta,
+                "bar": "== 0", "result": "FAIL",
+                "why": f"snowplow restarted {delta}x during measure: last {ls.get('reason')} "
+                       f"(exit {ls.get('exitCode')}) at {ls.get('finishedAt')}"}
+    return {"check": "snowplow.restarts_during_measure", "value": 0, "bar": "== 0",
+            "result": "PASS"}
+
+
+def pod_record(pod_list: dict, phase: str) -> dict:
+    """`kubectl get pods -l <snowplow> -o json` → one `snowplow_pod` record."""
+    items = pod_list.get("items") or []
+    if not items:
+        return {"kind": "snowplow_pod", "phase": phase, "pod": None, "restarts": None,
+                "last_state": None, "t": time.time()}
+    p = items[0]
+    cs = ((p.get("status") or {}).get("containerStatuses") or [{}])[0]
+    return {"kind": "snowplow_pod", "phase": phase,
+            "pod": (p.get("metadata") or {}).get("name"),
+            "restarts": cs.get("restartCount", 0),
+            "ready": cs.get("ready"),
+            "last_state": cs.get("lastState") or {},
+            "limits": (((p.get("spec") or {}).get("containers") or [{}])[0]
+                       .get("resources") or {}).get("limits"),
+            "t": time.time()}
+
+
+def memory_report(mem: list[dict]) -> dict | None:
+    """Summary of the memwatch trajectory (metadata only)."""
+    rows = [m for m in mem if m.get("kind") == "mem" and m.get("heap_inuse_mb") is not None]
+    if not rows:
+        return None
+    heap = [m["heap_inuse_mb"] for m in rows]
+    sysm = [m.get("sys_mb") for m in rows if m.get("sys_mb") is not None]
+    first_ready = next((m for m in rows if m.get("readyz") == 200), None)
+    return {"samples": len(rows),
+            "heap_inuse_mb_at_first_ready": (first_ready or {}).get("heap_inuse_mb"),
+            "heap_inuse_mb_max": max(heap), "sys_mb_max": max(sysm) if sysm else None,
+            "not_ready_samples": sum(1 for m in mem if m.get("kind") == "mem" and m.get("readyz") != 200),
+            "heap_profiles": [m.get("profile") for m in mem if m.get("kind") == "heap_profile"]}
+
+
 def _check(name, value, op, bar, checks):
     if value is None:
         checks.append({"check": name, "value": None, "bar": bar,
@@ -815,7 +976,9 @@ def _check(name, value, op, bar, checks):
 def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              *, thresholds: dict | None = None,
              login_curves: list[dict] | None = None,
-             preflights: list[dict] | None = None) -> dict:
+             preflights: list[dict] | None = None,
+             snowplow_pods: list[dict] | None = None,
+             mem: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -850,7 +1013,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
                        "value": None, "bar": f"<= {th['fresh_p95_ms']}",
                        "result": "FAIL", "why": "no samples at the gate churn rate"})
     for label in labels:
-        rows = [f for f in fresh if f.get("label") == label]
+        # A sample taken while snowplow was not Ready measures the outage, not
+        # freshness: it is excluded from the gate and counted in the report.
+        rows = [f for f in fresh if f.get("label") == label and f.get("valid") is not False]
         lat = [f["latency_ms"] for f in rows if f.get("converged")]
         unconverged = sum(1 for f in rows if not f.get("converged"))
         if "@" in label and label not in gate_labels:
@@ -903,6 +1068,15 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         "login": login_report(login_curves or []),
         "preflight": (preflights or [None])[-1],
     }
+
+    restart = restart_check(snowplow_pods)
+    if restart is not None:
+        validity.append(restart)
+    report["snowplow_pod"] = snowplow_pods
+    report["memory"] = memory_report(mem or [])
+    report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
+    fv = [f for f in fresh if f.get("valid") is False]
+    report["fresh_invalid_samples"] = len(fv)
 
     if any(c["result"] == "FAIL" for c in validity):
         verdict = "INVALID"
@@ -1358,6 +1532,12 @@ def _cmd_fresh(a) -> int:
                != (a.namespace, a.probe_name)]
     path = call_path("templates.krateo.io", "v1", "restactions",
                      FRESH_RA_NAME, a.ra_namespace)
+    # Start only once the driver's navigations reach snowplow (run 7's first
+    # samples ran during the login phase, with no read load at all).
+    if a.wait_for_load:
+        gate = wait_for_customer_load(client, token, min_delta=a.load_min_delta,
+                                      max_wait_s=a.load_max_wait_s)
+        sink({"kind": "fresh_start_gate", **gate})
     rates = a.rates if a.rates else [a.churn_rate]
     for rate in rates:
         rate = float(rate)
@@ -1369,9 +1549,112 @@ def _cmd_fresh(a) -> int:
         freshness_probe(
             client, token, path, lambda m: patch(a.namespace, a.probe_name, m),
             samples=a.samples, poll_ms=a.poll_ms, gap_s=a.gap_s,
-            label=label, sink=sink)
+            label=label, sink=sink, healthy=lambda: readyz(client))
         if churn:
             sink({"kind": "churn", "label": label, **churn.stop()})
+    return 0
+
+
+_MEM_FIELDS = (("HeapAlloc", "heap_alloc_mb"), ("HeapInuse", "heap_inuse_mb"),
+               ("HeapIdle", "heap_idle_mb"), ("HeapReleased", "heap_released_mb"),
+               ("HeapSys", "heap_sys_mb"), ("Sys", "sys_mb"), ("NextGC", "next_gc_mb"),
+               ("StackInuse", "stack_inuse_mb"))
+
+
+def mem_sample(client: HttpClient, token: str | None,
+               extra_prefixes: tuple[str, ...] = ()) -> dict:
+    """One memory sample: /readyz + /debug/vars memstats and a few counters,
+    plus every expvar whose name starts with one of `extra_prefixes` (e.g. the
+    #710 PR-0 fill counters — heap profiles cannot carry pprof labels, so the
+    per-GVR / fill-reason attribution has to come from expvar during the
+    burst). METADATA ONLY — never cache bodies."""
+    rec = {"kind": "mem", "t": time.time(),
+           "readyz": client.get("/readyz", None).status}
+    r = client.get("/debug/vars", token)
+    rec["vars_status"] = r.status
+    if r.status == 200:
+        try:
+            v = json.loads(r.body)
+        except ValueError:
+            return rec
+        m = v.get("memstats") or {}
+        for k, out in _MEM_FIELDS:
+            if k in m:
+                rec[out] = round(m[k] / 1048576, 1)
+        rec["num_gc"] = m.get("NumGC")
+        rec["heap_objects"] = m.get("HeapObjects")
+        rec["customer_resolve_inflight"] = v.get("snowplow_customer_resolve_inflight")
+        rec["refresher_queue_depth"] = v.get("snowplow_refresher_queue_depth")
+        rc = v.get("snowplow_resolved_cache") or {}
+        rec["cache_entries"], rec["cache_bytes"] = rc.get("entries"), rc.get("bytes")
+        rec["prewarm_complete"] = v.get("snowplow_prewarm_complete")
+        if extra_prefixes:
+            rec["extra"] = {k: v[k] for k in sorted(v) if k.startswith(tuple(extra_prefixes))}
+    return rec
+
+
+def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: float,
+             interval_s: float = 15.0, profile_every_s: float = 120.0,
+             out_dir: str = "/out", sink: Callable[[dict], None] = print,
+             extra_prefixes: tuple[str, ...] = (),
+             clock: Callable[[], float] = time.time,
+             sleep: Callable[[float], None] = time.sleep) -> int:
+    """The standard run-time memory capture (run 7 → #710): a memstats sample
+    every `interval_s`, and a heap profile (/debug/pprof/heap) at the FIRST
+    Ready, every `profile_every_s` while Ready, and at every not-Ready → Ready
+    transition (a restart). Profiles are written to out_dir; their names are
+    emitted as `heap_profile` records."""
+    os.makedirs(out_dir, exist_ok=True)
+    token = None
+    end = clock() + duration_s
+    was_ready = False
+    last_prof = None
+    n = 0
+    while clock() < end:
+        if token is None:
+            try:
+                token = login_fn()
+            except Exception as e:  # noqa: BLE001
+                sink({"kind": "mem", "t": clock(), "login_error": type(e).__name__})
+        rec = mem_sample(client, token, extra_prefixes)
+        rec["t"] = clock()
+        if rec.get("vars_status") == 401:
+            token = None
+        sink(rec)
+        ready = rec.get("readyz") == 200
+        if ready and token and (not was_ready or last_prof is None
+                                or clock() - last_prof >= profile_every_s):
+            r = client.get("/debug/pprof/heap", token)
+            if r.status == 200 and r.body:
+                n += 1
+                name = f"heap-{n:02d}-{time.strftime('%H%M%S', time.gmtime(clock()))}" \
+                       f"{'-ready' if not was_ready else ''}.pb.gz"
+                with open(os.path.join(out_dir, name), "wb") as fh:
+                    fh.write(r.body)
+                sink({"kind": "heap_profile", "t": clock(), "profile": name,
+                      "bytes": len(r.body), "at": "ready" if not was_ready else "load"})
+                last_prof = clock()
+        was_ready = ready
+        sleep(interval_s)
+    with open(os.path.join(out_dir, "done"), "w") as fh:
+        fh.write("1")
+    return n
+
+
+def _cmd_memwatch(a) -> int:
+    client = HttpClient(a.snowplow_url)
+    sink = _jsonl_sink(a.out)
+    memwatch(client, lambda: login(a.authn_url, a.user, a.password),
+             duration_s=a.duration_s, interval_s=a.interval_s,
+             profile_every_s=a.profile_every_s, out_dir=a.out_dir, sink=sink,
+             extra_prefixes=tuple(a.vars_prefix or ()))
+    # Stay up so the collect step can copy the profiles out (kubectl cp).
+    time.sleep(a.linger_s)
+    return 0
+
+
+def _cmd_pod_record(a) -> int:
+    print(json.dumps(pod_record(json.loads(sys.stdin.read() or "{}"), a.phase)))
     return 0
 
 
@@ -1385,7 +1668,9 @@ def _cmd_evaluate(a) -> int:
                  and not r.get("unreadable")), key=lambda r: r.get("t", 0))
     result = evaluate(navs, fresh, vs,
                       login_curves=[r for r in recs if r.get("kind") == "login_curve"],
-                      preflights=[r for r in recs if r.get("kind") == "preflight"])
+                      preflights=[r for r in recs if r.get("kind") == "preflight"],
+                      snowplow_pods=[r for r in recs if r.get("kind") == "snowplow_pod"],
+                      mem=[r for r in recs if r.get("kind") in ("mem", "heap_profile")])
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3}[result["verdict"]]
 
@@ -1430,6 +1715,10 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--samples", type=int, default=60)
     f.add_argument("--poll-ms", type=int, default=100)
     f.add_argument("--gap-s", type=float, default=5.0)
+    f.add_argument("--wait-for-load", action="store_true",
+                   help="start only after the driver's navigations reach snowplow")
+    f.add_argument("--load-min-delta", type=int, default=100)
+    f.add_argument("--load-max-wait-s", type=float, default=1800.0)
     f.add_argument("--churn-rate", type=float, default=0.0)
     f.add_argument("--churn-namespaces", type=int, default=50)
     f.add_argument("--churn-per-ns", type=int, default=20)
@@ -1452,6 +1741,23 @@ def main(argv: list[str] | None = None) -> int:
     pc.set_defaults(func=_cmd_portal_config)
     ps = sub.add_parser("preflight-summary", help="preflight JSONL on stdin -> summary")
     ps.set_defaults(func=_cmd_preflight_summary)
+    mw = sub.add_parser("memwatch", help="in-cluster memstats + heap profile sampler")
+    mw.add_argument("--snowplow-url", required=True)
+    mw.add_argument("--authn-url", required=True)
+    mw.add_argument("--user", required=True)
+    mw.add_argument("--password", required=True)
+    mw.add_argument("--duration-s", type=float, required=True)
+    mw.add_argument("--interval-s", type=float, default=15.0)
+    mw.add_argument("--profile-every-s", type=float, default=120.0)
+    mw.add_argument("--out-dir", default="/out")
+    mw.add_argument("--linger-s", type=float, default=3600.0)
+    mw.add_argument("--vars-prefix", action="append", default=None,
+                    help="also capture every expvar starting with this prefix (repeatable)")
+    mw.add_argument("--out", default="/dev/stdout")
+    mw.set_defaults(func=_cmd_memwatch)
+    pr = sub.add_parser("pod-record", help="kubectl get pods -o json on stdin -> snowplow_pod record")
+    pr.add_argument("--phase", required=True, choices=["before", "after"])
+    pr.set_defaults(func=_cmd_pod_record)
     e = sub.add_parser("evaluate")
     e.add_argument("inputs", nargs="+")
     e.set_defaults(func=_cmd_evaluate)
