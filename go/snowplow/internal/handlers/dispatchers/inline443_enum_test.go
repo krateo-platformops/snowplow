@@ -142,7 +142,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ClientConfigFor": readOnly443, "ComputeKey": readOnly443, "DepGenEpochNow": readOnly443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
-	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.Count": readOnly443,
+	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "IdentityClass.String": readOnly443,
@@ -226,6 +226,17 @@ var cacheAllow443 = map[string]cacheClass443{
 	"IsSensitiveResource": readOnly443, "SensitiveTouchedSink.Bump": readOnly443,
 	"SensitiveTouchedSink.Count": readOnly443, "SensitiveTouchedSinkFromContext": readOnly443,
 	"WithSensitiveTouchedSink": readOnly443,
+	// #684 — the raFullList cell's own #681 Put gate. WithChildPutGateSinks is a
+	// ctx builder installing request-scoped sinks (their bumps forward to the
+	// enclosing request-scoped sinks only); DenialOnly / GenuineExternal /
+	// StageErrorSink.Count are pure reads of them. None touches cache, informer,
+	// dep or refresher state. (ExternalTouchedSink.Count left the resolve path:
+	// GenuineExternal now reads it inside the cache package.)
+	"WithChildPutGateSinks": readOnly443, "DenialOnly": readOnly443,
+	"GenuineExternal": readOnly443, "StageErrorSink.Count": readOnly443,
+	// The denial-only Put counter: a process counter, reached only after a
+	// PutRAFullListIfGen that STORED (which refuses under the flag).
+	"RecordDenialOnlyPut": telemetry443,
 }
 
 // callerAllow443: for each gatedAtCaller symbol, the "<file>:<func>" sites
