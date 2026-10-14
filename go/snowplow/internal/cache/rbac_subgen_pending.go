@@ -35,6 +35,15 @@
 // ALWAYS flushed by a publish sequenced AFTER its record — the happens-after
 // invariant holds regardless of the record-vs-rebuild interleave.
 //
+// #703 (security) — ORDER IS NOT CONTENT. "Published after the record" is not
+// "built after the change": a snapshot read from the indexers BEFORE an event
+// and Stored after it used to flush that event's bump. The rebuild now TAKES
+// the pending set before its indexer read and flushes only that set (see
+// takePendingSubGenBumps), so the invariant is the content one: a key
+// rotation is never published before a snapshot whose CONTENT includes the
+// change that caused it. A record that misses the take rotates one rebuild
+// late.
+//
 // PER-SUBJECT / NO-CHURN: the flushed set is exactly {subjects whose
 // bindings/roles changed in this rebuild batch} — never global. A 50K install
 // storm creating tenant-X bindings flushes only tenant-X subjects per rebuild,
@@ -56,6 +65,17 @@ import (
 // it to block the rebuild goroutine in the window, injects an in-window
 // request, then releases — making the race deterministic instead of flaky.
 var rebuildBarrierForTest atomic.Pointer[func()]
+
+// rebuildPostTakeHookForTest / rebuildPreStoreHookForTest (#703), when
+// non-nil, run inside rebuildRBACSnapshot right after the pending sub-gen
+// set is taken (before the indexer read) and right before the Store (after
+// the snapshot is built). TEST-ONLY: one atomic load each in production. The
+// #703 arms park a rebuild at either point to place an RBAC event exactly
+// there.
+var (
+	rebuildPostTakeHookForTest atomic.Pointer[func(takenSubGenBumps)]
+	rebuildPreStoreHookForTest atomic.Pointer[func()]
+)
 
 // SetRebuildBarrierForTest installs (fn != nil) or clears (fn == nil) the
 // rebuild barrier callback. TEST-ONLY.
@@ -124,21 +144,85 @@ func recordPendingSubGenBumps(subjects []subjectKey, source subGenBumpSource) {
 // only via a subsequent Load that also sees the new snapshot. See the file
 // header for the full happens-after argument.
 func flushPendingSubGenBumps() {
+	bumpTakenSubGens(takePendingSubGenBumps())
+}
+
+// takenSubGenBumps is a drained pending set: subjects and their source masks.
+type takenSubGenBumps struct {
+	subjects []subjectKey
+	masks    []subGenBumpSource
+}
+
+// takePendingSubGenBumps drains the pending set. rebuildRBACSnapshot calls it
+// BEFORE it reads the RBAC indexers and bumps exactly the result after its
+// Store (#703).
+//
+// WHY BEFORE THE READ. The informer runs, for every RBAC event, in this order
+// (rbacSnapshotEventHandlers, rbac_snapshot.go; client-go updates the store
+// before it calls a handler):
+//
+//	(1) the object is written to the indexer;
+//	(2) scheduleRBACRebuild marks dirty (and maybe spawns the writer);
+//	(3) the delta hook records the subject (recordPendingSubGenBumps), which
+//	    marks dirty again.
+//
+// So a record visible to this take had its indexer write happen before the
+// take, and therefore before this rebuild's indexer read: the snapshot built
+// below CONTAINS every change whose bump it flushes. A record that lands
+// after the take stays pending. Its object may or may not be in this
+// snapshot; either way its (2)/(3) dirty mark makes the writer loop run
+// another rebuild, whose take sees the record and whose read follows (1).
+// That subject rotates one rebuild late, which is the safe side (old-key
+// cells for one more rebuild), never a rotation published ahead of the
+// content that caused it.
+//
+// The pre-#703 code drained at the flush, after the Store: a record landing
+// between the read and the flush was rotated against a snapshot built without
+// its change. On a revoke, that pairs the new key with the pre-revoke grant,
+// and the cell cached under it survives the next publish until TTL.
+func takePendingSubGenBumps() takenSubGenBumps {
 	pendingSubGenBumps.mu.Lock()
+	defer pendingSubGenBumps.mu.Unlock()
 	if len(pendingSubGenBumps.set) == 0 {
-		pendingSubGenBumps.mu.Unlock()
-		return
+		return takenSubGenBumps{}
 	}
-	drained := make([]subjectKey, 0, len(pendingSubGenBumps.set))
-	masks := make([]subGenBumpSource, 0, len(pendingSubGenBumps.set))
+	t := takenSubGenBumps{
+		subjects: make([]subjectKey, 0, len(pendingSubGenBumps.set)),
+		masks:    make([]subGenBumpSource, 0, len(pendingSubGenBumps.set)),
+	}
 	for s, m := range pendingSubGenBumps.set {
-		drained = append(drained, s)
-		masks = append(masks, m)
+		t.subjects = append(t.subjects, s)
+		t.masks = append(t.masks, m)
 	}
 	// Clear by reallocating — cheaper than deleting each key and lets the old
 	// backing map be GC'd once the drained slice is done with the keys.
 	pendingSubGenBumps.set = map[subjectKey]subGenBumpSource{}
+	return t
+}
+
+// restorePendingSubGenBumps puts a taken set back (ORing masks with anything
+// recorded since) and re-marks dirty, for a rebuild that took a set but did
+// not reach its flush. Without it a panicking rebuild would lose the bumps it
+// had taken.
+func restorePendingSubGenBumps(t takenSubGenBumps) {
+	if len(t.subjects) == 0 {
+		return
+	}
+	pendingSubGenBumps.mu.Lock()
+	for i, s := range t.subjects {
+		pendingSubGenBumps.set[s] |= t.masks[i]
+	}
 	pendingSubGenBumps.mu.Unlock()
+	rbacRebuildDirty.Store(true)
+}
+
+// bumpTakenSubGens bumps and announces a taken set. Called from
+// rebuildRBACSnapshot after rbacSnap.Store, on the same goroutine.
+func bumpTakenSubGens(t takenSubGenBumps) {
+	if len(t.subjects) == 0 {
+		return
+	}
+	drained, masks := t.subjects, t.masks
 
 	// #260: attribute each subject's bump to its recorded source(s), counted
 	// HERE at flush — the SAME (subject, publish) dedup point as bumps_total,
