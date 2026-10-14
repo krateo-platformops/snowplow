@@ -47,4 +47,7 @@ const (
 	mutEnvelopeIterDropped  = "envelope-iter-dropped"  // a read under `.[]` of the envelope (which reaches items) yields no item read
 	mutItemsElemDropped     = "items-elem-dropped"     // a read under .items[] yields no item read
 	mutItemExclMisapplied   = "item-excl-misapplied"   // an envelope exclusion (del(.kind)) is applied to every item
+
+	// #683: the tracked stage's path query.
+	mutSelectorPathsDropped = "selector-paths-dropped" // an applied labelSelector's label keys are not in the read set
 )

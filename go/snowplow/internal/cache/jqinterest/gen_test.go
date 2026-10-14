@@ -3,9 +3,12 @@ package jqinterest
 import (
 	"fmt"
 	"math/rand"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 // Random Kubernetes-shaped data biased towards what a chain's programs touch:
@@ -86,9 +89,51 @@ func chainVocab(c Chain) vocab {
 			}
 		}
 	}
+	// #683: a tracked path's labelSelector names label keys and values that
+	// no JQ program spells. Without them the generator would almost never
+	// build an object the selector admits, or an UPDATE that moves one in or
+	// out of the selected list.
+	for _, st := range c.RA.Stages {
+		for _, r := range selectorVocab(st.Path) {
+			ch := []string{"metadata", "labels", r.Key()}
+			if key := strings.Join(ch, "."); !seenC[key] {
+				seenC[key] = true
+				v.chains = append(v.chains, ch)
+			}
+			for _, x := range r.Values().List() {
+				if !seenS[x] {
+					seenS[x] = true
+					v.strs = append(v.strs, x)
+				}
+			}
+		}
+	}
 	sort.Strings(v.keys)
 	sort.Strings(v.strs)
 	return v
+}
+
+// selectorVocab is every requirement of every labelSelector on a literal path.
+func selectorVocab(p string) labels.Requirements {
+	if _, isTemplate := MaybeQuery(p); isTemplate {
+		return nil
+	}
+	i := strings.IndexByte(p, '?')
+	if i < 0 {
+		return nil
+	}
+	vals, err := url.ParseQuery(p[i+1:])
+	if err != nil {
+		return nil
+	}
+	var out labels.Requirements
+	for _, s := range vals["labelSelector"] {
+		if sel, err := labels.Parse(s); err == nil {
+			reqs, _ := sel.Requirements()
+			out = append(out, reqs...)
+		}
+	}
+	return out
 }
 
 var (
