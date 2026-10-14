@@ -309,7 +309,13 @@ func emulate(c Chain, items []any, env emuEnv) emuOutcome {
 	// The served envelope, from the SAME definition production uses (E6,
 	// internal/listenvelope; pinned over every production constructor by
 	// restactions/api envelope_e6_test.go, #674).
-	envelope := listenvelope.New("v1", "List", deepCopy(items).([]any))
+	// #683: the tracked call's query string, applied as the resolver
+	// applies it (planListQuery).
+	selected, fb := emuApplyListQuery(tracked, items, dict)
+	if fb != "" {
+		return failOutcome(fb)
+	}
+	envelope := listenvelope.New("v1", "List", deepCopy(selected).([]any))
 	trackedCall := func() string {
 		v, e := runStageCall(tracked, envelope, env, dict, true)
 		if e != "" {

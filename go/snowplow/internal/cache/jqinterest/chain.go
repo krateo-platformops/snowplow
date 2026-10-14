@@ -105,6 +105,8 @@ func (s *state) chain(c Chain) {
 	if tracked == nil {
 		top("tracked stage %q not in the RESTAction", c.Tracked)
 	}
+	// #683: the path's applied labelSelector decides membership on labels.
+	s.selectorReads(tracked)
 	root := &abs{k: aRef, path: Path{}}
 	e := newEnv(nil)
 
