@@ -40,6 +40,25 @@ type errFakeAddFailed struct{}
 
 func (errFakeAddFailed) Error() string { return "fake add failed" }
 
+// isolateHandlerExtensionsForTest empties the registry for the calling arm
+// and RESTORES the package's init()-registered extensions afterwards. The
+// arms used to clean up with ResetHandlerExtensionsForTest, which left the
+// registry EMPTY for every later test in the package: every watcher built
+// after this file ran had no typed-RBAC snapshot handlers, so RBAC events
+// never scheduled a rebuild or recorded a sub-gen bump (found by #703's arms,
+// which drive exactly that path).
+func isolateHandlerExtensionsForTest(t *testing.T) {
+	t.Helper()
+	saved := HandlerExtensionsSnapshot()
+	ResetHandlerExtensionsForTest()
+	t.Cleanup(func() {
+		ResetHandlerExtensionsForTest()
+		for _, ext := range saved {
+			RegisterHandlerExtension(ext)
+		}
+	})
+}
+
 // dummyHandlers returns a stub event-handler set the fake informer can
 // accept.
 func dummyHandlers(_ *ResourceWatcher, _ schema.GroupVersionResource) clientcache.ResourceEventHandler {
@@ -47,8 +66,7 @@ func dummyHandlers(_ *ResourceWatcher, _ schema.GroupVersionResource) clientcach
 }
 
 func TestRegisterHandlerExtension_Registers(t *testing.T) {
-	ResetHandlerExtensionsForTest()
-	t.Cleanup(ResetHandlerExtensionsForTest)
+	isolateHandlerExtensionsForTest(t)
 
 	gvrA := schema.GroupVersionResource{Group: "a", Version: "v1", Resource: "as"}
 
@@ -68,8 +86,7 @@ func TestRegisterHandlerExtension_Registers(t *testing.T) {
 }
 
 func TestRegisterHandlerExtension_DuplicateNamePanics(t *testing.T) {
-	ResetHandlerExtensionsForTest()
-	t.Cleanup(ResetHandlerExtensionsForTest)
+	isolateHandlerExtensionsForTest(t)
 
 	gvr := schema.GroupVersionResource{Group: "a", Version: "v1", Resource: "as"}
 
@@ -92,8 +109,7 @@ func TestRegisterHandlerExtension_DuplicateNamePanics(t *testing.T) {
 }
 
 func TestRegisterHandlerExtension_EmptyNamePanics(t *testing.T) {
-	ResetHandlerExtensionsForTest()
-	t.Cleanup(ResetHandlerExtensionsForTest)
+	isolateHandlerExtensionsForTest(t)
 
 	defer func() {
 		if r := recover(); r == nil {
@@ -108,8 +124,7 @@ func TestRegisterHandlerExtension_EmptyNamePanics(t *testing.T) {
 }
 
 func TestRegisterHandlerExtension_NilPredicatePanics(t *testing.T) {
-	ResetHandlerExtensionsForTest()
-	t.Cleanup(ResetHandlerExtensionsForTest)
+	isolateHandlerExtensionsForTest(t)
 
 	defer func() {
 		if r := recover(); r == nil {
@@ -124,8 +139,7 @@ func TestRegisterHandlerExtension_NilPredicatePanics(t *testing.T) {
 }
 
 func TestRegisterHandlerExtension_NilHandlersPanics(t *testing.T) {
-	ResetHandlerExtensionsForTest()
-	t.Cleanup(ResetHandlerExtensionsForTest)
+	isolateHandlerExtensionsForTest(t)
 
 	defer func() {
 		if r := recover(); r == nil {
@@ -143,8 +157,7 @@ func TestRegisterHandlerExtension_NilHandlersPanics(t *testing.T) {
 // extensions whose predicate matches the GVR fire, and that the per-name
 // counter increments by exactly 1 per attach.
 func TestAttachMatchingHandlerExtensions_PredicateMatching(t *testing.T) {
-	ResetHandlerExtensionsForTest()
-	t.Cleanup(ResetHandlerExtensionsForTest)
+	isolateHandlerExtensionsForTest(t)
 
 	gvrA := schema.GroupVersionResource{Group: "a", Version: "v1", Resource: "as"}
 	gvrB := schema.GroupVersionResource{Group: "b", Version: "v1", Resource: "bs"}
@@ -202,8 +215,7 @@ func TestAttachMatchingHandlerExtensions_PredicateMatching(t *testing.T) {
 // — an attach call against an empty registry must succeed with zero
 // attachments and no panic.
 func TestAttachMatchingHandlerExtensions_EmptyRegistry(t *testing.T) {
-	ResetHandlerExtensionsForTest()
-	t.Cleanup(ResetHandlerExtensionsForTest)
+	isolateHandlerExtensionsForTest(t)
 
 	gvr := schema.GroupVersionResource{Group: "a", Version: "v1", Resource: "as"}
 	att := &fakeAttacher{}
@@ -217,8 +229,7 @@ func TestAttachMatchingHandlerExtensions_EmptyRegistry(t *testing.T) {
 // verifies the contract: only successful AddEventHandler returns tick the
 // counter.
 func TestAttachMatchingHandlerExtensions_AttachFailureDoesNotIncrementCounter(t *testing.T) {
-	ResetHandlerExtensionsForTest()
-	t.Cleanup(ResetHandlerExtensionsForTest)
+	isolateHandlerExtensionsForTest(t)
 
 	gvr := schema.GroupVersionResource{Group: "a", Version: "v1", Resource: "as"}
 
@@ -244,8 +255,7 @@ func TestAttachMatchingHandlerExtensions_AttachFailureDoesNotIncrementCounter(t 
 // registry simultaneously. The counter sum must equal the call count
 // (no lost updates).
 func TestRegisterHandlerExtension_ConcurrentAttach(t *testing.T) {
-	ResetHandlerExtensionsForTest()
-	t.Cleanup(ResetHandlerExtensionsForTest)
+	isolateHandlerExtensionsForTest(t)
 
 	gvr := schema.GroupVersionResource{Group: "race", Version: "v1", Resource: "rs"}
 	RegisterHandlerExtension(HandlerExtension{

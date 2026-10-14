@@ -516,6 +516,22 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		(*b)()
 	}
 
+	// #703 (security) — TAKE the pending sub-gen bumps BEFORE reading the
+	// indexers; flush exactly this set after the Store, below. See
+	// takePendingSubGenBumps for the interleaving argument. If this rebuild
+	// does not reach its flush (a panic, the wraparound refusal), the set is
+	// put back and dirty re-marked, so no bump is lost.
+	taken := takePendingSubGenBumps()
+	flushed := false
+	defer func() {
+		if !flushed {
+			restorePendingSubGenBumps(taken)
+		}
+	}()
+	if h := rebuildPostTakeHookForTest.Load(); h != nil {
+		(*h)(taken) // #703 arm (b): after the take, before the indexer read
+	}
+
 	snap := &RBACSnapshot{
 		RoleBindingsByNS:   map[string][]*rbacv1.RoleBinding{},
 		ClusterRolesByName: map[string]*rbacv1.ClusterRole{},
@@ -603,6 +619,9 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 	// after the slice/map fields are stable means a reader that observes
 	// snap via Snapshot() sees a fully-formed snapshot, indexes and all.
 	rebuildSubjectIndexes(snap)
+	if h := rebuildPreStoreHookForTest.Load(); h != nil {
+		(*h)() // #703 arm (a): the snapshot is built, not yet Stored
+	}
 
 	// Ship 0.30.242 H.c-layered (Phase 2 step 2a) — atomic publish-seq
 	// stamp BEFORE rbacSnap.Store. Pre-ship the writer order was
@@ -649,7 +668,14 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 	// the Store is a release, the reader's Load an acquire, and this bump is
 	// sequenced-after the Store on this goroutine. This closes the
 	// bump-vs-publish race (c) v1 left open (design §GAP-2 / rbac_subgen_pending.go).
-	flushPendingSubGenBumps()
+	//
+	// #703 — ONLY the set taken before the indexer read. Ordering alone was
+	// not enough: a bump recorded after this snapshot's indexer read, but
+	// before this flush, used to be drained here too, rotating the key
+	// against a snapshot whose CONTENT predates the change. Later records
+	// stay pending for the re-armed rebuild, whose read follows them.
+	flushed = true
+	bumpTakenSubGens(taken)
 
 	slog.Debug("cache.rbac.snapshot.published",
 		slog.String("subsystem", "cache"),
