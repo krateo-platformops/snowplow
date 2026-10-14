@@ -13,5 +13,7 @@ import (
 // informers use the classic List+Watch path the fakes implement.
 func TestMain(m *testing.M) {
 	os.Setenv("KUBE_FEATURE_WatchListClient", "false")
-	os.Exit(m.Run())
+	// #708 — fail the run if any test left the handler-extension registry
+	// different from what init() registered (handler_registry_guard_test.go).
+	os.Exit(runWithHandlerRegistryGuard(m))
 }
