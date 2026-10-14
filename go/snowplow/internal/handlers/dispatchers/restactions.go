@@ -1,6 +1,7 @@
 package dispatchers
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )
@@ -460,6 +462,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.String("name", cr.GetName()),
 			slog.String("namespace", cr.GetNamespace()),
 			slog.Any("err", err))
+		// #709 — a stage that failed without continueOnError is reported with
+		// its upstream status (restactions.Resolve returns it typed), as the
+		// widget handler already does for an apiRef error: a 404 stays a 404.
+		var statusErr *apierrors.StatusError
+		if errors.As(err, &statusErr) {
+			response.Encode(wri, response.New(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))
+			return
+		}
 		response.InternalError(wri, err)
 		return
 	}

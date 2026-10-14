@@ -437,7 +437,10 @@ resourcesRefs deps (`recordWidgetDeps`) — and `cache.PublishRefresh` signals
    informer-pivot, internal-rest-config), a stage whose body fails to decode /
    jq-filter records the error into `errorKey` (or surfaces it per
    `continueOnError`) and returns `nil` for that item — remaining items and
-   downstream stages still run (the #313 Option C-A contract).
+   downstream stages still run (the #313 Option C-A contract). When the
+   RESTAction's filter then cannot produce a value, the first stage that
+   failed without `continueOnError` is the answer, with its upstream status
+   (#709) — never a JSON-decode 500.
 9. **In-process resolves are explicitly RBAC-gated.** Every `resolve: true`
    nested resolve passes `checkDispatchRBAC` before resolving — the in-process
    path must reconstruct the RBAC enforcement the HTTP edge would have

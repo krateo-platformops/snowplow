@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -250,12 +251,7 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 			return response.New(http.StatusInternalServerError, redErr), nil, ct, redErr
 		}
 
-		res := &response.Status{}
-		if jerr := json.Unmarshal(dat, res); jerr != nil {
-			res = response.New(respo.StatusCode, fmt.Errorf("%s", string(dat)))
-			return res, nil, ct, nil
-		}
-		return res, nil, ct, nil
+		return nonOKStatus(respo.StatusCode, dat), nil, ct, nil
 	}
 
 	// --- 2xx body: detect + convert (the new, snowplow-owned step;
@@ -265,6 +261,12 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		// #523: same transport class as the non-2xx read above.
 		redErr := redact.ErrorURL(rerr)
 		return response.New(http.StatusInternalServerError, redErr), nil, ct, redErr
+	}
+
+	// #709 — an empty 2xx body is "no content" (a 204, an accepted write):
+	// the stage's value is JSON null, not a decode failure.
+	if len(bytes.TrimSpace(dat)) == 0 {
+		return response.New(http.StatusOK, nil), []byte("null"), ct, nil
 	}
 
 	jsonBytes, cerr := toJSONBytes(ct, dat)
@@ -279,6 +281,46 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	}
 
 	return response.New(http.StatusOK, nil), jsonBytes, ct, nil
+}
+
+// nonOKStatus shapes a non-2xx response into the Failure envelope the
+// caller records under the stage's errorKey.
+//
+// A body that decodes as a Status keeps its own code, reason and message — the
+// apiserver's 404 names the missing object. #709: two shapes used to lose the
+// upstream answer, and both now keep the HTTP status code:
+//   - an EMPTY body: the decode failed and the envelope message was "", so a
+//     404 reported nothing about what was missing. It now says what the
+//     upstream answered (code + status text; never the URL, which can carry
+//     credentials — #523).
+//   - a JSON body that is NOT a Status (an external API's {"message": …}):
+//     it decoded "successfully" into a Status with no code and no "Failure",
+//     so the caller took it for a SUCCESS and fed a nil body onward, which
+//     failed as a JSON decode error. Code and Failure now come from the
+//     response itself. The reason is left as the body gave it (none): a
+//     reason is the upstream's claim, and a 403 without reason=Forbidden is
+//     not the apiserver's per-identity denial (#681 F2, a rate limit).
+func nonOKStatus(code int, dat []byte) *response.Status {
+	if len(bytes.TrimSpace(dat)) == 0 {
+		return response.New(code, fmt.Errorf("upstream answered %d %s with an empty body", code, http.StatusText(code)))
+	}
+	res := &response.Status{}
+	if jerr := json.Unmarshal(dat, res); jerr != nil {
+		return response.New(code, fmt.Errorf("%s", string(dat)))
+	}
+	if res.Code == 0 {
+		res.Code = code
+	}
+	if res.Status != response.StatusFailure {
+		res.Status = response.StatusFailure
+	}
+	if res.Kind == "" {
+		res.Kind, res.APIVersion = "Status", "v1"
+	}
+	if res.Message == "" {
+		res.Message = string(dat)
+	}
+	return res
 }
 
 // toJSONBytes returns JSON bytes for a 2xx external body, converting from

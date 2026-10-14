@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -163,6 +164,11 @@ func jsonHandlerValue(ctx context.Context, opts jsonHandlerOptions) func(any) er
 // (in-memory []byte path).
 func jsonHandlerBytesApply(ctx context.Context, opts jsonHandlerOptions, dat []byte) error {
 	var tmp any
+	// #709 — an empty successful body is "no content": the stage's value is
+	// JSON null, on every dispatch path (the external fetch says the same).
+	if len(bytes.TrimSpace(dat)) == 0 {
+		return jsonHandlerCore(ctx, opts, nil)
+	}
 	if err := json.Unmarshal(dat, &tmp); err != nil {
 		return safeDecodeError(err)
 	}

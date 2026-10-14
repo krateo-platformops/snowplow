@@ -182,6 +182,9 @@ func psBuildWatcher(t *testing.T, a psArm, extra ...runtime.Object) *dynamicfake
 		// #443 inline arms: a GVR that is never informed in steady state, so
 		// an arm can prove an inert resolve does not register it.
 		in443PodsGVR: "PodList",
+		// #709: a stage GET of a CRD lazily registers its informer; the
+		// fake must be able to LIST it (empty — the CRD is absent).
+		{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}: "CustomResourceDefinitionList",
 	}
 
 	seed := []runtime.Object{

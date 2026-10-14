@@ -202,6 +202,31 @@ structure either way; a JSON body is passed through unchanged (byte-identical).
 This lets a `RESTAction` consume e.g. a Helm repo `index.yaml`. See
 [ADR 0006](../docs/adr/0006-snowplow-owned-external-fetch.md).
 
+An **empty** successful body (a `204`, an accepted write) means "no content":
+the stage's value is `null`, and it is not an error.
+
+## When a stage fails
+
+A failing stage never stops the stages after it. Its error is recorded under
+its `errorKey` (default `error`): the upstream's `Status` (`code`, `reason`,
+`message`) when it answered one, otherwise a message. A non-2xx answer always
+keeps its HTTP code, even with an empty body or a body that is not a `Status`.
+
+What `continueOnError` changes is what happens when the top-level `filter`
+**cannot produce a value**: it yields nothing (jq `empty`), or it fails because
+it read the stage that has no data.
+
+| | the filter yields a value | the filter yields nothing or fails |
+|---|---|---|
+| a stage **without** `continueOnError` failed | `200`, the error under `errorKey` | the **first** such stage's upstream status: a `404` stays a `404` (`reason: NotFound`), with a message that names the RESTAction, the stage and the missing resource |
+| no such stage failed | `200` | yields nothing: `200`, `status: null`. Fails: `500` with the filter error |
+
+The same answer reaches a widget whose `apiRef` is that RESTAction. An error
+answer is never cached. Its message is built from the status code and the
+stage's own request (resource, namespace, name), never from the upstream's
+text, which can name the requester. The upstream's full text stays under the
+stage's `errorKey` and in the logs.
+
 ## jq templating of `path`, `payload` and `headers`
 
 A stage's `path`, `payload` and each `headers` entry may embed a **jq template**

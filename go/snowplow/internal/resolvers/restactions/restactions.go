@@ -42,7 +42,7 @@ type ResolveOptions struct {
 }
 
 func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, error) {
-	dict := api.Resolve(ctx, api.ResolveOptions{
+	dict, failure := api.ResolveWithFailure(ctx, api.ResolveOptions{
 		RC:      opts.SArc,
 		AuthnNS: opts.AuthnNS,
 		Verbose: isVerbose(opts.In),
@@ -80,7 +80,29 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 			ModuleLoader: jqsupport.ModuleLoader(),
 		})
 		if err != nil {
+			// #709 — when a stage without continueOnError failed, the filter
+			// error is its consequence (it read the stage that has no
+			// value): report the stage's upstream status, not the jq error.
+			if failure != nil {
+				log.Debug("restaction filter failed after a stage failure",
+					slog.String("stage", failure.Stage), slog.Any("err", jqsupport.SanitizeError(err)))
+				return opts.In, failure.StatusError(opts.In.GetNamespace(), opts.In.GetName())
+			}
 			return opts.In, fmt.Errorf("unable to resolve filter: %w", jqsupport.SanitizeError(err))
+		}
+		if s == "" {
+			// #709 — the filter produced no value (jq `empty`). jqutil.Eval
+			// returns "" only then, and "" is not JSON: it used to become the
+			// status and fail every reader with `unexpected end of JSON input`.
+			//   - a stage without continueOnError failed: that failure is why
+			//     there is no value, so it is the answer — the upstream code,
+			//     reason and message (a 404 stays a 404);
+			//   - otherwise no value is a legitimate result: the status is
+			//     JSON null.
+			if failure != nil {
+				return opts.In, failure.StatusError(opts.In.GetNamespace(), opts.In.GetName())
+			}
+			s = "null"
 		}
 
 		raw = []byte(s)
