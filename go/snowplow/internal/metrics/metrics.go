@@ -185,6 +185,14 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
+	// --- cache: #687 RBAC rebuild post-release pickups ---
+	rbacRebuildPickups, err := m.Int64ObservableCounter(
+		"snowplow_rbac_rebuild_post_release_pickups_total",
+		metric.WithDescription("RBAC snapshot rebuilds the #687 post-release re-check picked up: an RBAC event set dirty while the rebuild loop still held its slot, the scheduler returned, and the loop re-acquired the slot to publish it. Before #687 each of these waited for the next RBAC event (a revoke could stay unpublished)."),
+	)
+	if err != nil {
+		return err
+	}
 
 	// --- cache: per-subject RBAC sub-generation (#247) ---
 	// rbacPublishSeq above is GLOBAL — one bump per snapshot publish, one link
@@ -821,6 +829,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(assertionViolations, int64(cache.AssertionViolationsTotal()),
 			metric.WithAttributes(attribute.String("check", "read_paths_scoped")))
 		o.ObserveInt64(rbacPublishSeq, int64(cache.RBACGen()))
+		o.ObserveInt64(rbacRebuildPickups, int64(cache.RBACRebuildPostReleasePickups()))
 		o.ObserveInt64(rbacSubGenBumps, int64(cache.RBACSubGenBumpsTotal()))
 		o.ObserveInt64(rbacSubGenSubjects, int64(cache.RBACSubGenSubjectsTracked()))
 		// #260 change-4 — RBAC sub-gen churn attribution (re-establishment {gvr},
@@ -1112,7 +1121,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		}
 		return nil
 	}, append([]metric.Observable{
-		fallthroughTotal, assertionViolations, rbacPublishSeq,
+		fallthroughTotal, assertionViolations, rbacPublishSeq, rbacRebuildPickups,
 		rbacSubGenBumps, rbacSubGenSubjects,
 		// --- #260 change-4 ---
 		rbacReestablished, rbacWatchError, rbacBumpsBySource, rbacRoleNoop, rbacRoleSemanticNoop, rbacBindingUidChanged,
