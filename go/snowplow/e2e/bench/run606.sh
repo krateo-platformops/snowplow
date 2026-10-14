@@ -37,8 +37,19 @@ esac
 PROJECT="${PROJECT:-operations-dev-krateo-io}"
 ZONE="${ZONE:-europe-west4-a}"
 TTL_HOURS="${TTL_HOURS:-8}"
-INSTALLER_VERSION="${INSTALLER_VERSION:?set INSTALLER_VERSION (read the live 057 helm release, do not copy it from notes)}"
 INSTALLER_CHART="${INSTALLER_CHART:-oci://ghcr.io/krateo-platformops/charts/installer}"
+# Installer source: the published OCI chart (INSTALLER_VERSION), OR a LOCAL
+# chart — either an existing chart dir (INSTALLER_CHART_DIR=<repo>/chart) or
+# one built here from a branch (INSTALLER_GIT_REF, e.g. fix/482-alert-crd-gate
+# for installer#483). A local chart is preflighted against the #483 pin
+# assertions BEFORE any cluster exists; a wrong branch refuses for free.
+INSTALLER_GIT_REF="${INSTALLER_GIT_REF:-}"
+INSTALLER_CHART_DIR="${INSTALLER_CHART_DIR:-}"
+INSTALLER_LOCAL_VERSION="${INSTALLER_LOCAL_VERSION:-0.0.0-pr483}"
+VERIFY483="${VERIFY483:-0}"
+if [[ -z "$INSTALLER_GIT_REF" && -z "$INSTALLER_CHART_DIR" ]]; then
+  INSTALLER_VERSION="${INSTALLER_VERSION:?set INSTALLER_VERSION (read the live 057 helm release, do not copy it from notes), or INSTALLER_GIT_REF / INSTALLER_CHART_DIR for a local chart}"
+fi
 SNOWPLOW_TAG="${SNOWPLOW_TAG:?set SNOWPLOW_TAG (the image under test)}"
 SCALE="${SCALE:-50000}"
 USERS="${USERS:-1000}"
@@ -123,6 +134,26 @@ teardown() {
 trap teardown EXIT
 trap 'exit 130' INT TERM HUP
 
+s_source() {
+  if [[ -n "$INSTALLER_GIT_REF" && -z "$INSTALLER_CHART_DIR" ]]; then
+    if [[ "$DRY" == "1" ]]; then
+      log "DRY: python3 -m bench.installer_src prepare --ref $INSTALLER_GIT_REF --dest $OUT/installer-src --version $INSTALLER_LOCAL_VERSION"
+      return 0
+    fi
+    rm -rf "$OUT/installer-src"
+    run python3 -m bench.installer_src prepare --ref "$INSTALLER_GIT_REF" \
+        --dest "$OUT/installer-src" --version "$INSTALLER_LOCAL_VERSION"
+    INSTALLER_CHART_DIR="$OUT/installer-src/chart"
+  fi
+  if [[ -n "$INSTALLER_CHART_DIR" ]]; then
+    # Local, read-only: runs in dry mode too.
+    python3 -m bench.installer_src preflight --chart-dir "$INSTALLER_CHART_DIR" \
+        --out "$OUT/installer-preflight.json"
+    log "installer source: LOCAL chart $INSTALLER_CHART_DIR (preflight OK)"
+  else
+    log "installer source: $INSTALLER_CHART --version $INSTALLER_VERSION"
+  fi
+}
 s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
 s_up() {
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
@@ -161,9 +192,21 @@ componentValues:
       value: snowplow
       effect: NoSchedule
 EOF
-  run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
+  local src
+  if [[ -n "$INSTALLER_CHART_DIR" ]]; then
+    src=("$INSTALLER_CHART_DIR")
+  else
+    src=("$INSTALLER_CHART" --version "$INSTALLER_VERSION")
+  fi
+  run "${H[@]}" install installer "${src[@]}" \
       -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" \
       --wait --timeout 15m
+}
+s_verify483() {
+  # installer#483 acceptance. Items 1-4 gate (a FAIL aborts the run with
+  # diagnostics before teardown); item 5 is recorded only.
+  run python3 -m bench.diag606 verify483 --kubeconfig "$KCFG" --context "$KCTX" \
+      --out "$OUT/verify483.json"
 }
 s_wait_platform() {
   # Polled, not a blind wait: prints which components are Ready (and why the
@@ -251,10 +294,12 @@ s_evaluate() {
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID) -> $OUT/verdict.json"
 }
 
+step source    s_source
 step reap      s_reap
 step up        s_up
 step install   s_install
 step platform  s_wait_platform
+if [[ "$VERIFY483" == "1" ]]; then step verify483 s_verify483; fi
 step env       s_env
 step data      s_data
 step reboot    s_reboot

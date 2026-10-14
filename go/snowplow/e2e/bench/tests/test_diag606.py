@@ -100,7 +100,10 @@ def test_wait_installer_polls_until_ready_and_logs_each_poll():
     diag606._leaf_summaries = leaf
     try:
         assert diag606.wait_installer(k, timeout_s=100, interval_s=0, log=log,
+                                      allow=(), required=(),
                                       clock=lambda: 0, sleep=sleep)
     finally:
         diag606._leaf_summaries = orig
-    assert len(seen) == 3 and "components ready 1/1" in seen[-1]
+    polls = [m for m in seen if "CRs ready" in m]
+    assert len(polls) == 3 and "CRs ready 1/1" in polls[-1]
+    assert seen[-1].startswith("[platform] verdict READY")

@@ -106,29 +106,83 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             open(os.path.join(STATE, "marker"), "w").write(kv.split("=", 1)[1])
         sys.exit(0)
     ready = os.environ.get("FAKE_INSTALLER_READY", "1") == "1"
-    def cr(kind, name, ok, reason="Available", msg=""):
+    kog = os.environ.get("FAKE_KOG", "0") == "1"           # run-3 private-registry 401
+    kog_reason = os.environ.get("FAKE_KOG_REASON", "response status code 401: unauthorized")
+    extra = os.environ.get("FAKE_EXTRA_NOT_READY", "0") == "1"
+    def cr(kind, name, ok, reason="Available", msg="", synced=True, smsg=""):
         return {"kind": kind, "metadata": {"name": name, "namespace": "krateo-system"},
                 "status": {"conditions": [{"type": "Ready", "status": "True" if ok else "False",
                                            "reason": reason, "message": msg},
-                                          {"type": "Synced", "status": "True"}]}}
+                                          {"type": "Synced", "status": "True" if synced else "False",
+                                           "reason": "ReconcileSuccess" if synced else "ReconcileError",
+                                           "message": smsg}]}}
     def items(xs):
         print(json.dumps({"items": xs})); sys.exit(0)
+    f483 = os.environ.get("FAKE_483", "")          # "", pass, wide
+    if a[:3] == ["get", "crd", "alerts.observability.krateo.io"]:
+        sys.exit(0 if f483 in ("pass", "wide") else 1)
     if a[:1] == ["get"] and "json" in a:
         what = a[1]
         if what == "crd":
+            kinds = [("installers", "Installer"), ("authns", "Authn"), ("snowplows", "Snowplow"),
+                     ("frontends", "Frontend"), ("portals", "Portal")]
+            if f483:
+                kinds += [("alertprovidercrds", "AlertProviderCrds"),
+                          ("krateoobservabilities", "KrateoObservability")]
+            if f483 == "wide":
+                kinds.append(("alertproviders", "AlertProvider"))
             items([{"spec": {"group": "composition.krateo.io",
-                             "names": {"plural": p, "kind": k}}}
-                   for p, k in (("installers", "Installer"), ("authns", "Authn"),
-                                ("snowplows", "Snowplow"))])
+                             "names": {"plural": p, "kind": k}}} for p, k in kinds])
+        if what.startswith("alertprovidercrds."):
+            items([cr("AlertProviderCrds", "alert-provider-crd", True)])
+        if what.startswith("krateoobservabilities."):
+            items([cr("KrateoObservability", "krateo-observability", True)])
+        if what.startswith("alertproviders."):
+            items([cr("AlertProvider", "alert-provider", True)])
+        if what.startswith("alerts.observability"):
+            items([{"metadata": {"name": "sre-pod-crashloop", "namespace": "krateo-system"}}])
         if what.startswith("installers."):
-            items([cr("Installer", "installer", ready, "Creating" if not ready else "Available")])
+            kids = []
+            if not ready:
+                kids.append("authns/krateo-system/authn")
+            if kog:
+                kids.append("compositiondefinitions/krateo-system/github-provider-kog")
+            if extra:
+                kids.append("compositiondefinitions/krateo-system/oasgen-provider")
+            msg = (f"{len(kids)} of 41 managed children are not ready: " + ", ".join(kids)) if kids else ""
+            items([cr("Installer", "installer", not kids,
+                      "Creating" if kids else "Available", msg)])
         if what.startswith("authns."):
             items([cr("Authn", "authn", ready, "ReconcileError",
                       "helm install failed: token=" + os.environ.get("FAKE_TOKVAL", ""))])
         if what.startswith("snowplows."):
             items([cr("Snowplow", "snowplow", ready)])
+        if what.startswith("frontends."):
+            items([cr("Frontend", "frontend", True)])
+        if what.startswith("portals."):
+            items([cr("Portal", "portal", True)])
         if what.startswith("compositiondefinitions."):
-            items([cr("CompositionDefinition", "authn", True)])
+            cds = [cr("CompositionDefinition", "authn", True)]
+            if f483:
+                cds.append(cr("CompositionDefinition", "alert-provider-crd", True))
+            if f483 == "wide":
+                cds.append(cr("CompositionDefinition", "alert-provider", True))
+            if kog:
+                cds.append(cr("CompositionDefinition", "github-provider-kog", False, "Creating", "",
+                              synced=False, smsg=(
+                                  "observe failed: error getting chart info: failed to get chart "
+                                  "after 5 attempts: failed to get chart: failed to get "
+                                  "oci://ghcr.io/krateo-blueprints/charts/github-provider-kog: failed "
+                                  "to resolve reference ghcr.io/krateo-blueprints/charts/"
+                                  "github-provider-kog:0.3.2: HEAD \\"https://ghcr.io/v2/krateo-"
+                                  "blueprints/charts/github-provider-kog/manifests/0.3.2\\": GET "
+                                  "\\"https://ghcr.io/token?scope=repository%3Akrateo-blueprints%2F"
+                                  "charts%2Fgithub-provider-kog%3Apull&service=ghcr.io\\": "
+                                  + kog_reason)))
+            if extra:
+                cds.append(cr("CompositionDefinition", "oasgen-provider", False, "Creating",
+                              "chart fetch timeout"))
+            items(cds)
         if what == "pods":
             items([{"metadata": {"name": "ok-0", "namespace": "krateo-system"},
                     "spec": {"nodeName": "n1"}, "status": {"phase": "Running",
@@ -358,7 +412,7 @@ def test_failure_path_writes_redacted_diagnostics_before_teardown(harness):
     assert p.returncode != 0
     # progress shows the stuck component and its reason
     assert "[platform] installer Ready=False" in out
-    assert "NOT ready: authn(ReconcileError" in out
+    assert "NOT READY: authns/krateo-system/authn(ReconcileError" in out
     assert "TIMEOUT" in out
 
     diag = tmp / "out" / "diagnostics"

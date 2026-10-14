@@ -32,7 +32,11 @@ import time
 from typing import Callable
 
 __all__ = ["redact", "summarize_conditions", "pod_summary", "failing_pods",
-           "installer_progress", "Kube", "collect", "wait_installer", "main"]
+           "installer_progress", "Kube", "collect", "wait_installer",
+           "evaluate483", "verify483", "chart_inspector_errors",
+           "platform_state", "platform_line", "parse_not_ready_children",
+           "allow_list_from_env", "DEFAULT_ALLOW_NOT_READY", "REQUIRED_READY",
+           "main"]
 
 COMP_GROUP = "composition.krateo.io"
 LOG_TAIL = 200
@@ -73,15 +77,255 @@ def redact(text: str, extra: tuple[str, ...] = ()) -> str:
 # ─── pure summaries ─────────────────────────────────────────────────────────
 
 
-def summarize_conditions(obj: dict) -> dict:
+def summarize_conditions(obj: dict, resource: str | None = None) -> dict:
+    """One object's readiness, in TWO shapes (both documented in README.txt):
+
+    - flattened:  .Ready.status / .Ready.reason / .Ready.message (and .Synced)
+    - raw:        .status.conditions[] exactly as the API returned them, so a
+                  query written against the API shape also works on the bundle
+                  (the installer session's `.status.conditions[]` query
+                  silently matched nothing against the flattened-only shape).
+    `id` is <resource>/<namespace>/<name>, the form the Installer CR's
+    Ready.message uses to name its not-ready children.
+    """
     md = obj.get("metadata") or {}
     conds = ((obj.get("status") or {}).get("conditions")) or []
     out = {"kind": obj.get("kind"), "namespace": md.get("namespace"),
            "name": md.get("name")}
+    if resource:
+        out["id"] = f"{resource}/{md.get('namespace')}/{md.get('name')}"
+    raw = []
     for c in conds:
+        # VERBATIM (run 3's chart-inspector error was cut at 500 chars, just
+        # before the part that names the missing CRD); the cap only guards
+        # against a pathological multi-MB message.
+        cc = dict(c)
+        cc["message"] = (c.get("message") or "")[:20000]
+        raw.append(cc)
         if c.get("type") in ("Ready", "Synced"):
             out[c["type"]] = {"status": c.get("status"), "reason": c.get("reason"),
-                              "message": (c.get("message") or "")[:500]}
+                              "message": cc["message"]}
+    out["status"] = {"conditions": raw}
+    return out
+
+
+BUNDLE_README = """\
+#606 bench diagnostics bundle — FILE SHAPES (all JSON is redacted; no Secrets)
+
+Readiness objects (composition-crs.json .installer[] / .components[],
+compositiondefinitions.json [], focus-483.json .components.*.*) carry BOTH:
+  flattened   .Ready.status  .Ready.reason  .Ready.message   (same for .Synced)
+  raw         .status.conditions[]   exactly as the API returned them
+  plus        .kind .namespace .name and .id = <resource>/<namespace>/<name>
+              (the form the Installer CR's Ready.message uses for children)
+
+Example queries (jq):
+  jq -r '.components[] | select(.Ready.status!="True") | .id' composition-crs.json
+  jq -r '.components[] | select(any(.status.conditions[]; .type=="Synced" and .status=="False")) | .id' composition-crs.json
+  jq -r '.[] | select(.Synced.status=="False") | "\\(.id): \\(.Synced.message)"' compositiondefinitions.json
+  jq -r '.installer[0].Ready.message' composition-crs.json
+
+Other files:
+  installer-cr.json            raw Installer CR(s) (the API object, unflattened)
+  platform-state.json          ok, installer_message, CR/CD tallies, required_ready,
+                               allowed_not_ready (allow-listed, reason matched),
+                               unexpected_not_ready, allow_list
+  progress.txt                 the one-line platform summary
+  chart-inspector-errors.txt   every condition message mentioning chart-inspector, VERBATIM
+  focus-483.json               alert_crd_present + CD/CR summaries of alert-provider-crd,
+                               alert-provider, krateo-observability
+  pods.json / pods-failing.json  phase, node, unschedulable message; per container:
+                               ready, restarts, waiting, terminated, last_reason, last_exit, image
+  events.json                  last 1000 events, oldest first: time,type,reason,object,count,message
+  pvcs.json  nodes.json  helm-list.json
+  logs/<ns>__<pod>__<container>__{current,previous}.log   last 200 lines, failing pods only
+"""
+
+
+# ─── platform readiness: BOTH layers + an explicit allow-list ───────────────
+
+# Known, expected and unrelated to the component under test: the bench is
+# credential-free by ruling (2026-10-14), and github-provider-kog's chart lives
+# in the PRIVATE ghcr.io/krateo-blueprints registry. Allowed ONLY for this
+# exact child AND only while its failure carries this reason; the same child
+# failing for any other reason, or any other child failing, fails the run.
+# Override with BENCH_ALLOW_NOT_READY="id=reason-substring;id=…" (";"-separated).
+# The reason substring is taken from run 3's REAL Synced message:
+#   "... failed to resolve reference ghcr.io/krateo-blueprints/charts/
+#    github-provider-kog:0.3.2: HEAD ...: GET \"https://ghcr.io/token?...\":
+#    response status code 401: unauthorized"
+DEFAULT_ALLOW_NOT_READY = (
+    ("compositiondefinitions/krateo-system/github-provider-kog",
+     "response status code 401"),
+)
+# The 50K measurement needs these component CRs Ready (by name).
+REQUIRED_READY = ("snowplow", "frontend", "authn", "portal")
+
+_CHILDREN_RX = re.compile(r"managed children are not ready:\s*(.+)$", re.S)
+
+
+def allow_list_from_env(env=os.environ) -> tuple[tuple[str, str], ...]:
+    raw = env.get("BENCH_ALLOW_NOT_READY")
+    if raw is None:
+        return DEFAULT_ALLOW_NOT_READY
+    out = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if part:
+            ident, _, reason = part.partition("=")
+            out.append((ident.strip(), reason.strip()))
+    return tuple(out)
+
+
+def parse_not_ready_children(message: str) -> list[str]:
+    """Child ids named by the Installer CR's Ready.message, e.g.
+    '2 of 41 managed children are not ready: compositiondefinitions/ns/a, x/ns/b'."""
+    m = _CHILDREN_RX.search(message or "")
+    if not m:
+        return []
+    return [c.strip().rstrip(".") for c in m.group(1).split(",") if c.strip()]
+
+
+def _messages(s: dict | None) -> str:
+    return "\n".join((c.get("message") or "") for c in
+                     ((s or {}).get("status") or {}).get("conditions") or [])
+
+
+def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
+                   allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY) -> dict:
+    """Readiness across BOTH layers (CompositionDefinitions and component CRs).
+
+    ok ⇔ an Installer CR exists, every not-ready child is on the allow-list
+    WITH its expected reason, and every `required` component CR is Ready.
+    """
+    inst = installer[0] if installer else {}
+    inst_msg = (inst.get("Ready") or {}).get("message") or ""
+    by_id = {s.get("id"): s for s in leaves + cds if s.get("id")}
+    not_ready = set(parse_not_ready_children(inst_msg))
+    not_ready |= {s["id"] for s in leaves + cds
+                  if s.get("id") and _cond(s, "Ready") != "True"}
+    allow_map = dict(allow)
+    allowed, unexpected = [], []
+    for ident in sorted(not_ready):
+        s = by_id.get(ident)
+        want = allow_map.get(ident)
+        msgs = _messages(s)
+        if want is not None and s is not None and want.lower() in msgs.lower():
+            allowed.append({"id": ident, "expected_reason": want,
+                            "message": msgs[:2000]})
+        else:
+            unexpected.append({"id": ident,
+                               "why": ("not on the allow-list" if want is None else
+                                       "allow-listed, but the expected reason "
+                                       f"{want!r} is not in its conditions"),
+                               "reason": (s or {}).get("Ready", {}).get("reason"),
+                               "message": msgs[:2000]})
+    by_name = {s.get("name"): s for s in leaves}
+    req = {n: _cond(by_name.get(n), "Ready") == "True" for n in required}
+    ok = bool(installer) and not unexpected and all(req.values())
+    return {"ok": ok, "installer_ready": _cond(inst, "Ready"),
+            "installer_message": inst_msg,
+            "components_ready": f"{sum(_cond(s, 'Ready') == 'True' for s in leaves)}/{len(leaves)}",
+            "definitions_ready": f"{sum(_cond(s, 'Ready') == 'True' for s in cds)}/{len(cds)}",
+            "required_ready": req, "allowed_not_ready": allowed,
+            "unexpected_not_ready": unexpected,
+            "allow_list": [{"id": i, "expected_reason": r} for i, r in allow]}
+
+
+def platform_line(st: dict) -> str:
+    line = (f"installer Ready={st['installer_ready'] or 'absent'} "
+            f"msg={st['installer_message'][:300]!r}; CRs ready {st['components_ready']}; "
+            f"CDs ready {st['definitions_ready']}; required "
+            + ",".join(f"{n}={'ok' if v else 'NO'}" for n, v in st["required_ready"].items()))
+    if st["allowed_not_ready"]:
+        line += "; ALLOWED(known): " + ", ".join(
+            f"{a['id']}[{a['expected_reason']}]" for a in st["allowed_not_ready"])
+    if st["unexpected_not_ready"]:
+        line += "; NOT READY: " + ", ".join(
+            f"{u['id']}({u['reason']}: {u['message'][:120]})" for u in st["unexpected_not_ready"])
+    return line
+
+
+# ─── #483 (installer#482: Alert CRD gate) ───────────────────────────────────
+
+ALERT_CRD = "alerts.observability.krateo.io"
+FOCUS_COMPONENTS = ("alert-provider-crd", "alert-provider", "krateo-observability")
+
+
+def _cond(s: dict | None, t: str) -> str | None:
+    return ((s or {}).get(t) or {}).get("status")
+
+
+def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
+                alert_crd_present: bool, alerts: list[dict], *,
+                allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY) -> dict:
+    """Pure: the run-4 assertions, narrowed to the component under test.
+
+    Items 1-4 gate; item 5 is recorded only; item 6 gates that no child
+    OUTSIDE the allow-list is not-ready (both layers), so the allow-list can
+    excuse only the known-unrelated github-provider-kog 401.
+    """
+    by_name = {s.get("name"): s for s in leaves}
+    cd_names = {s.get("name") for s in cds}
+    obs = by_name.get("krateo-observability")
+    st = platform_state(installer, leaves, cds, allow, required)
+    checks = [
+        {"item": 1, "check": "KrateoObservability/krateo-observability Ready=True and Synced=True",
+         "pass": (obs is not None and _cond(obs, "Ready") == "True"
+                  and _cond(obs, "Synced") == "True"),
+         "detail": {"ready": _cond(obs, "Ready"), "synced": _cond(obs, "Synced"),
+                    "kind": (obs or {}).get("kind")}},
+        {"item": 2, "check": f"crd {ALERT_CRD} present",
+         "pass": bool(alert_crd_present)},
+        {"item": 3, "check": "alert-provider-crd in CompositionDefinitions",
+         "pass": "alert-provider-crd" in cd_names},
+        {"item": 4, "check": "alert-provider ABSENT (present = gate too wide)",
+         "pass": "alert-provider" not in cd_names and "alert-provider" not in by_name,
+         "detail": {"in_cds": "alert-provider" in cd_names,
+                    "as_component": "alert-provider" in by_name}},
+        {"item": 6, "check": "no not-ready child outside the allow-list (CDs + CRs)",
+         "pass": not st["unexpected_not_ready"],
+         "detail": {"unexpected": st["unexpected_not_ready"]}},
+    ]
+    alert_rows = [{"name": (a.get("metadata") or {}).get("name"),
+                   "namespace": (a.get("metadata") or {}).get("namespace"),
+                   "has_status": bool(a.get("status"))} for a in alerts]
+    names = {r["name"] for r in alert_rows}
+    info = {"item": 5, "check": "default Alert CRs exist with no status (recorded, not gating)",
+            "sre_pod_crashloop_present": "sre-pod-crashloop" in names,
+            "alerts": alert_rows,
+            "as_expected": ("sre-pod-crashloop" in names
+                            and not any(r["has_status"] for r in alert_rows))}
+    return {"verdict": "PASS" if all(c["pass"] for c in checks) else "FAIL",
+            "checks": checks, "recorded": info,
+            "known_unrelated_allowed": st["allowed_not_ready"],
+            "allow_list": st["allow_list"],
+            "installer_message": st["installer_message"]}
+
+
+def _alert_crd_present(k: "Kube") -> bool:
+    rc, _, _ = k.kubectl("get", "crd", ALERT_CRD, "-o", "name")
+    return rc == 0
+
+
+def verify483(k: "Kube", allow=None, required=REQUIRED_READY) -> dict:
+    allow = allow_list_from_env() if allow is None else allow
+    inst, leaves = _leaf_summaries(k)
+    cds = _cd_summaries(k)
+    present = _alert_crd_present(k)
+    alerts = k.items(ALERT_CRD, "-A") if present else []
+    return evaluate483(inst, leaves, cds, present, alerts,
+                       allow=allow, required=required)
+
+
+def chart_inspector_errors(summaries: list[dict]) -> list[str]:
+    out = []
+    for s in summaries:
+        for t in ("Ready", "Synced"):
+            msg = (s.get(t) or {}).get("message") or ""
+            if "chart-inspector" in msg:
+                out.append(f"{s.get('kind')}/{s.get('namespace')}/{s.get('name')} "
+                           f"{t}={(s.get(t) or {}).get('status')}:\n{msg}\n")
     return out
 
 
@@ -184,10 +428,14 @@ class Kube:
 
 
 def _leaf_summaries(k: Kube, skip_installer=True) -> tuple[list[dict], list[dict]]:
+    """(installer CRs, platform component CRs). Objects in bench-* namespaces
+    are bench DATA (the 50K held compositions), never platform children."""
     inst, leaves = [], []
     for kind in k.composition_kinds():
-        objs = k.items(kind, "-A")
-        sums = [summarize_conditions(o) for o in objs[:MAX_ITEMS_PER_KIND]]
+        resource = kind.split(".", 1)[0]
+        objs = [o for o in k.items(kind, "-A")
+                if not ((o.get("metadata") or {}).get("namespace") or "").startswith("bench-")]
+        sums = [summarize_conditions(o, resource) for o in objs[:MAX_ITEMS_PER_KIND]]
         if kind.startswith("installers."):
             inst.extend(sums)
         else:
@@ -195,15 +443,30 @@ def _leaf_summaries(k: Kube, skip_installer=True) -> tuple[list[dict], list[dict
     return inst, leaves
 
 
+def _cd_summaries(k: Kube) -> list[dict]:
+    return [summarize_conditions(o, "compositiondefinitions")
+            for o in k.items("compositiondefinitions.core.krateo.io", "-A")]
+
+
 def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
+                   allow=None, required=REQUIRED_READY,
                    log: Callable[[str], None] = print,
                    clock=time.monotonic, sleep=time.sleep) -> bool:
+    """Poll until every child (CDs + CRs) is Ready except the allow-listed
+    known-unrelated ones, and every `required` component is Ready."""
+    allow = allow_list_from_env() if allow is None else allow
+    log("[platform] allow-list (known, unrelated): "
+        + (", ".join(f"{i}[{r}]" for i, r in allow) or "(empty)"))
     deadline = clock() + timeout_s
     while True:
         inst, leaves = _leaf_summaries(k)
-        ok, line = installer_progress(inst, leaves)
-        log(f"[platform] {line}")
-        if ok:
+        st = platform_state(inst, leaves, _cd_summaries(k), allow, required)
+        log(f"[platform] {platform_line(st)}")
+        if st["ok"]:
+            log("[platform] verdict READY"
+                + (" (with allow-listed known-unrelated: "
+                   + ", ".join(a["id"] for a in st["allowed_not_ready"]) + ")"
+                   if st["allowed_not_ready"] else ""))
             return True
         if clock() >= deadline:
             log(f"[platform] TIMEOUT after {timeout_s:.0f}s")
@@ -231,17 +494,38 @@ def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
         except Exception as e:  # noqa: BLE001
             w(name + ".error.txt", f"{type(e).__name__}: {e}")
 
+    cd_box: list[dict] = []
+
+    def readme():
+        w("README.txt", BUNDLE_README)
+
+    def cds():
+        sums = _cd_summaries(k)
+        cd_box.extend(sums)
+        w("compositiondefinitions.json", sums)
+
     def installer_and_leaves():
         inst_raw = k.items(f"installers.{COMP_GROUP}", "-A")
         w("installer-cr.json", inst_raw)
         inst, leaves = _leaf_summaries(k)
         w("composition-crs.json", {"installer": inst, "components": leaves})
-        ok, line = installer_progress(inst, leaves)
-        w("progress.txt", line + "\n")
+        st = platform_state(inst, leaves, cd_box, allow_list_from_env())
+        w("platform-state.json", st)
+        w("progress.txt", platform_line(st) + "\n")
 
-    def cds():
-        w("compositiondefinitions.json",
-          [summarize_conditions(o) for o in k.items("compositiondefinitions.core.krateo.io", "-A")])
+    def focus():
+        # Run-4 focus: the chart-inspector error VERBATIM, and how far the
+        # #482/#483 Alert-CRD chain got (did alert-provider-crd reach Ready?).
+        inst, leaves = _leaf_summaries(k)
+        errs = chart_inspector_errors(inst + leaves + cd_box)
+        w("chart-inspector-errors.txt", "\n".join(errs) or "(none)\n")
+        by_leaf = {s.get("name"): s for s in leaves}
+        by_cd = {s.get("name"): s for s in cd_box}
+        w("focus-483.json", {
+            "alert_crd_present": _alert_crd_present(k),
+            "components": {n: {"composition_definition": by_cd.get(n),
+                               "component_cr": by_leaf.get(n)}
+                           for n in FOCUS_COMPONENTS}})
 
     pods_box: list[dict] = []
 
@@ -297,7 +581,9 @@ def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
                     w(f"logs/{p['namespace']}__{p['name']}__{c['name']}__{tag}.log",
                       out if rc == 0 else f"rc={rc} {err}")
 
-    for name, fn in (("installer", installer_and_leaves), ("cds", cds), ("pods", pods),
+    for name, fn in (("readme", readme), ("cds", cds),
+                     ("installer", installer_and_leaves),
+                     ("focus", focus), ("pods", pods),
                      ("events", events), ("pvcs", pvcs), ("nodes", nodes),
                      ("helm", helm_list), ("logs", logs)):
         safe(name, fn)
@@ -311,7 +597,7 @@ def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m bench.diag606")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("wait-installer", "collect"):
+    for name in ("wait-installer", "collect", "verify483"):
         s = sub.add_parser(name)
         s.add_argument("--kubeconfig", required=True)
         s.add_argument("--context", required=True)
@@ -320,10 +606,30 @@ def main(argv=None) -> int:
             s.add_argument("--interval-s", type=float, default=60)
         else:
             s.add_argument("--out", required=True)
+        if name == "collect":
             s.add_argument("--redact", action="append", default=[],
                            help="extra literal to redact (repeatable)")
     a = p.parse_args(argv)
     k = Kube(a.kubeconfig, a.context)
+    if a.cmd == "verify483":
+        res = verify483(k)
+        with open(a.out, "w") as fh:
+            fh.write(redact(json.dumps(res, indent=2, default=str)))
+        for c in res["checks"]:
+            print(f"[verify483] ({c['item']}) {'PASS' if c['pass'] else 'FAIL'} "
+                  f"{c['check']}", flush=True)
+        r = res["recorded"]
+        print(f"[verify483] (5) RECORDED sre-pod-crashloop present="
+              f"{r['sre_pod_crashloop_present']} as_expected={r['as_expected']} "
+              f"alerts={len(r['alerts'])}", flush=True)
+        print("[verify483] allow-list (known, unrelated): "
+              + ", ".join(f"{a['id']}[{a['expected_reason']}]" for a in res["allow_list"]),
+              flush=True)
+        for a in res["known_unrelated_allowed"]:
+            print(f"[verify483] KNOWN-UNRELATED not ready (allowed): {a['id']} "
+                  f"reason matched {a['expected_reason']!r}", flush=True)
+        print(f"[verify483] verdict {res['verdict']}", flush=True)
+        return 0 if res["verdict"] == "PASS" else 1
     if a.cmd == "wait-installer":
         return 0 if wait_installer(k, timeout_s=a.timeout_s,
                                    interval_s=a.interval_s,
