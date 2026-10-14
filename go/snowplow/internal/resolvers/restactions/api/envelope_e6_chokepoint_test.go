@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // The E6 behavioural chokepoint (#674, reviewer-603's gate on #676). Every
@@ -84,10 +86,13 @@ func e6ChokepointExit(code int) int {
 }
 
 // TestE6_ChokepointCatchesAFourthKey: the chokepoint itself. An E6 envelope
-// passes; one carrying list metadata is a violation. The violation it plants
+// passes. A live-List envelope (list metadata) is NORMALISED to E6 before the
+// stage sees it (#676 C2(a)), so it passes too. A key the normalisation does
+// not recognise reaches the check and is a violation. The violation it plants
 // is removed again, so the run's TestMain verdict is not affected by it.
 func TestE6_ChokepointCatchesAFourthKey(t *testing.T) {
-	opts := jsonHandlerOptions{key: "s", out: map[string]any{}, dict: map[string]any{}, k8sList: true}
+	gvr := schema.GroupVersionResource{Group: "g", Version: "v1", Resource: "things"}
+	opts := jsonHandlerOptions{key: "s", out: map[string]any{}, dict: map[string]any{}, k8sList: true, listGVR: gvr}
 	before, vBefore := e6ChokepointSnapshot()
 	if err := jsonHandlerCore(context.Background(), opts, listenvelope.For("g", "v1", "things", []any{})); err != nil {
 		t.Fatal(err)
@@ -98,26 +103,44 @@ func TestE6_ChokepointCatchesAFourthKey(t *testing.T) {
 			before, after, len(vBefore), len(vAfter))
 	}
 
+	// A live apiserver List (the fall-through): normalised, so no violation,
+	// and the stage receives exactly E6.
+	live := map[string]any{"apiVersion": "g/v1", "kind": "ThingList",
+		"metadata": map[string]any{"resourceVersion": "7", "continue": ""}, "items": []any{}}
+	opts.out = map[string]any{}
+	if err := jsonHandlerCore(context.Background(), opts, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, v := e6ChokepointSnapshot(); len(v) != len(vAfter) {
+		t.Fatalf("a live List was not normalised before the stage: %v", v[len(vAfter):])
+	}
+	got, _ := json.Marshal(opts.out["s"])
+	want, _ := json.Marshal(listenvelope.For("g", "v1", "things", []any{}))
+	if string(got) != string(want) {
+		t.Fatalf("the stage received %s, want the E6 envelope %s", got, want)
+	}
+
 	bad := listenvelope.For("g", "v1", "things", []any{})
-	bad["metadata"] = map[string]any{"resourceVersion": "7"}
+	bad["foo"] = "bar" // not a Kubernetes List key: left in place, caught
 	if err := jsonHandlerCore(context.Background(), opts, bad); err != nil {
 		t.Fatal(err)
 	}
 	_, vBad := e6ChokepointSnapshot()
 	if len(vBad) != len(vAfter)+1 {
-		t.Fatalf("a list envelope with metadata was not caught by the chokepoint (violations %d -> %d)", len(vAfter), len(vBad))
+		t.Fatalf("a list envelope with an extra key was not caught by the chokepoint (violations %d -> %d)", len(vAfter), len(vBad))
 	}
 	t.Logf("caught: %s", vBad[len(vBad)-1])
 	e6Choke.mu.Lock()
 	e6Choke.violations = e6Choke.violations[:len(vAfter)]
 	e6Choke.mu.Unlock()
 
-	// A non-LIST call is not checked.
+	// A non-LIST call is neither normalised nor checked.
+	n0, _ := e6ChokepointSnapshot()
 	opts.k8sList = false
 	if err := jsonHandlerCore(context.Background(), opts, bad); err != nil {
 		t.Fatal(err)
 	}
-	if n, v := e6ChokepointSnapshot(); n != after+1 || len(v) != len(vAfter) {
-		t.Fatalf("a non-LIST call was checked: checked %d, violations %d", n, len(v))
+	if n, v := e6ChokepointSnapshot(); n != n0 || len(v) != len(vAfter) {
+		t.Fatalf("a non-LIST call was checked: checked %d -> %d, violations %d", n0, n, len(v))
 	}
 }

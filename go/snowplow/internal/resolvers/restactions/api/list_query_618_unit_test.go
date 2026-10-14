@@ -255,7 +255,7 @@ func TestIssue618_ListQueryCounter_InProcessVsFallthrough(t *testing.T) {
 func TestIssue618_EveryServeSiteClassifiesTheQuery(t *testing.T) {
 	notServing := map[string]string{
 		"callWantsWireDump":                  "wire-dump verbosity decision only",
-		"isK8sListPath":                      "E6 chokepoint flag only (#674): is the response a list envelope; serves and keys nothing",
+		"k8sListGVR":                         "E6 normalisation flag only (#674): is the response a list envelope, of which GVR; serves and keys nothing",
 		"dispatchOneCall":                    "sensitive-resource check only (cache.IsSensitiveResource); no serve",
 		"runStage":                           "dep-edge record — a selector LIST depends on the same (gvr, ns) list edge (over-approximation is safe)",
 		"gateContentEnvelope":                "gates an envelope apistageContentServe already classified and keyed",

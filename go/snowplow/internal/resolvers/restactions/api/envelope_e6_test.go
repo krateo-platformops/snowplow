@@ -75,6 +75,7 @@ var e6Registry = map[string]e6Class{
 	"api.marshalAsList":                   e6Builder,
 	"api.marshalAsListRaw":                e6Builder,
 	"api.dispatchViaInternalRESTConfig":   e6Builder, // branch C live LIST, normalised (#676)
+	"api.normaliseListEnvelope":           e6Builder, // jsonHandlerCore: every GET LIST incl. the fall-through (#676 C2(a))
 	"cache.ListServableEnvelopeJSONWhere": e6Builder, // branch C informer serve (#676)
 	"api.parseListEnvelope":               e6Decoder,
 	"api.validateClusterListShape":        e6Decoder,
@@ -214,6 +215,14 @@ func e6Table(t *testing.T) []e6Row {
 					t.Fatal("not served")
 				}
 				return v
+			}},
+		{"jsonHandlerCore normalisation of a live apiserver List (the httpcall.Do fall-through)",
+			[]string{"api.normaliseListEnvelope"}, func(t *testing.T) any {
+				var live map[string]any
+				if err := json.Unmarshal(stored, &live); err != nil {
+					t.Fatal(err)
+				}
+				return normaliseListEnvelope(f1WidgetsGVR, live)
 			}},
 		// Branch C's informer serve lives in internal/cache (reviewer-603,
 		// #676). Its empty result used to drop apiVersion/kind.

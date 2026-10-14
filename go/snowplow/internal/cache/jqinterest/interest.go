@@ -444,9 +444,10 @@ func dedupGuards(gs []KeyGuard) []KeyGuard {
 // sound ONLY if the served envelope has exactly these three keys. It is
 // defined once in internal/listenvelope and pinned, over every constructor
 // that serves one, by internal/resolvers/restactions/api/envelope_e6_test.go
-// (#674). Change E6 there, not here. A live apiserver LIST (branch C,
-// dispatchViaInternalRESTConfig) carries list metadata and is NOT E6: it is
-// the fall-through class that the #603 §2.4 runtime fallback reads as All.
+// (#674). Change E6 there, not here. It holds on every path: branch C's live
+// LIST and the httpcall.Do apiserver fall-through are normalised to it
+// (#676), so §2.4 keeps only the E7 reason for reading a fall-through edge
+// as All.
 func toItemReads(r Read) ([]Read, bool) {
 	p := r.Path
 	if len(p) == 0 {

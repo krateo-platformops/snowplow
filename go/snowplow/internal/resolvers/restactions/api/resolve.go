@@ -745,6 +745,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// gates). Pre-Ship-K passed only `pig` (per-stage scope) →
 	// resourcesFrom returned [] → 0-count regression on the
 	// multi-stage compositions-list RA.
+	listGVR, listOK := k8sListGVR(call.Path)
 	hOpts := jsonHandlerOptions{
 		key:         id,
 		out:         dict,
@@ -762,7 +763,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// #674 — the E6 chokepoint applies to Kubernetes collection LISTs.
 		// A collection LIST is a GET; a POST to a collection path (a create, a
 		// SubjectAccessReview) answers with an object, not a list envelope.
-		k8sList: ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet && isK8sListPath(call.Path),
+		k8sList: ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet && listOK,
+		listGVR: listGVR,
 	}
 	inner := jsonHandler(gctx, hOpts)
 	innerBytesFn := jsonHandlerBytes(gctx, hOpts)
@@ -2126,9 +2128,10 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 // cluster_list.go). The function is intentionally deleted rather than
 // parked — feedback_no_park_broken_behind_flag.
 
-// isK8sListPath reports whether path is a Kubernetes collection LIST: an
-// apiserver path that names no object (#674, the E6 chokepoint).
-func isK8sListPath(path string) bool {
-	_, _, name, ok := cache.ParseAPIServerPathToDep(path)
-	return ok && name == ""
+// k8sListGVR reports whether path is a Kubernetes collection LIST (an
+// apiserver path that names no object), and of which GVR (#674: the E6
+// normalisation and chokepoint).
+func k8sListGVR(path string) (schema.GroupVersionResource, bool) {
+	gvr, _, name, ok := cache.ParseAPIServerPathToDep(path)
+	return gvr, ok && name == ""
 }
