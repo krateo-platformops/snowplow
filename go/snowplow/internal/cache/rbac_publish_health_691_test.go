@@ -70,7 +70,34 @@ func TestIssue691_S1_AlwaysPanickingRebuild_AgeGrows_SeqFlat(t *testing.T) {
 }
 
 func TestIssue691_S2_QuietCluster_AgeZero_PublishAgeGrows(t *testing.T) {
+	// PRE (#691 S2 flake, root-caused by a stack trace of every schedule and
+	// publish under a CPU burner, https://github.com/krateo-platformops/snowplow/pull/692#issuecomment-6169101317):
+	// the watcher's own boot work must be over before "quiet" is measured, and
+	// waiting for it is FATAL on timeout so a real background publisher would
+	// still turn this arm RED. Two boot sources publish:
+	//   - the one-time INITIAL PUBLISH goroutine (waitAndPublishInitialRBACSnapshot,
+	//     under the writer slot). This is the publish that landed inside the
+	//     window (1/100 RED); waitRebuildQuiet did not wait for it because it
+	//     had not taken the slot yet. rw.WaitRBACQuiescentForTest does.
+	//   - the initial-LIST ADDs, each of which schedules a rebuild when it
+	//     reaches the snapshot handler (delivered on the handler's own
+	//     goroutine). Waited on by event: the seed is 2 objects, so 2
+	//     delivered initial-list ADDs.
+	var initialAdds atomic.Int32
+	countInitialAdd := func() { initialAdds.Add(1) }
+	rbacInitialListAddDeliveredHookForTest.Store(&countInitialAdd)
+	t.Cleanup(func() { rbacInitialListAddDeliveredHookForTest.Store(nil) })
 	rw := newSnapshotTestWatcher(t, mkRB("ns-a", "viewer-bind", userSub("alice")), mkR("ns-a", "viewer-bind-role"))
+	if err := rw.WaitRBACQuiescentForTest(10 * time.Second); err != nil {
+		t.Fatalf("PRE: %v", err)
+	}
+	addsDeadline := time.Now().Add(10 * time.Second)
+	for initialAdds.Load() < 2 {
+		if time.Now().After(addsDeadline) {
+			t.Fatalf("PRE: only %d of the 2 seeded objects' initial-list ADDs reached the snapshot handler", initialAdds.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
 	waitRebuildQuiet(t)
 	// The realistic quiet state: the LAST event was rebuilt and published,
 	// then nothing more happens.
