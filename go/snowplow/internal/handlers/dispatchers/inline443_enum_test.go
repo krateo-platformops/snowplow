@@ -191,6 +191,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	"RAFullListKeyInputs": readOnly443, "RefreshTriggerGVRFromContext": readOnly443, "RefreshTriggerHas": readOnly443,
 	"ReplayRAFullListSlices": readOnly443, "ResolvedCache": readOnly443, "ResolvedCacheEnabled": readOnly443,
 	"ResolvedCacheStore.CaptureGen": readOnly443, "ResolvedCacheStore.GetNoTouch": readOnly443,
+	// #711 — the expected-deny log dedupe asks whether the cell's key is
+	// resident: an index lookup under c.mu, no LRU touch, no warmth stamp. An
+	// inert resolve never reaches it (expectedDenyLevel returns first).
+	"ResolvedCacheStore.Has":    readOnly443,
 	"ResourceWatcher.GetObject": readOnly443, "ResourceWatcher.IsMetadataOnly": readOnly443,
 	"ResourceWatcher.IsPassthrough": readOnly443, "ResourceWatcher.IsServable": readOnly443,
 	"ResourceWatcher.IsSynced": readOnly443, "ResourceWatcher.ListObjectsServable": readOnly443,
