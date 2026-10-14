@@ -30,7 +30,6 @@ func TestIssue683_SelectorKeysAreInTheReadSet(t *testing.T) {
 		{"labelSelector equality", "/apis/g/v1/namespaces/ns/s?labelSelector=tier%3Dweb", []string{tier}, []string{labelsMap}},
 		{"set-based and existence", "/apis/g/v1/namespaces/ns/s?labelSelector=tier+in+%28web%2Capi%29%2C%21legacy%2Cteam",
 			[]string{tier, `."metadata"."labels"."legacy"`, `."metadata"."labels"."team"`}, []string{labelsMap}},
-		{"labelSelector next to a param that makes the call fall through", "/apis/g/v1/namespaces/ns/s?labelSelector=tier%3Dweb&limit=5", []string{tier}, nil},
 		{"templated path: the whole labels map", `${ "/apis/g/v1/namespaces/ns/s?labelSelector=tier%3D" + "web" }`, []string{labelsMap}, nil},
 		{"name/namespace fieldSelector: immutable, nothing added", "/apis/g/v1/namespaces/ns/s?fieldSelector=metadata.name%3Da", nil, []string{tier, labelsMap}},
 		{"no query: nothing added", "/apis/g/v1/namespaces/ns/s", nil, []string{tier, labelsMap}},

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
@@ -94,13 +95,12 @@ func chainVocab(c Chain) vocab {
 	// build an object the selector admits, or an UPDATE that moves one in or
 	// out of the selected list.
 	for _, st := range c.RA.Stages {
-		for _, r := range selectorVocab(st.Path) {
-			ch := []string{"metadata", "labels", r.Key()}
-			if key := strings.Join(ch, "."); !seenC[key] {
+		for _, sv := range selectorVocab(st.Path) {
+			if key := strings.Join(sv.chain, "."); !seenC[key] {
 				seenC[key] = true
-				v.chains = append(v.chains, ch)
+				v.chains = append(v.chains, sv.chain)
 			}
-			for _, x := range r.Values().List() {
+			for _, x := range sv.values {
 				if !seenS[x] {
 					seenS[x] = true
 					v.strs = append(v.strs, x)
@@ -113,8 +113,16 @@ func chainVocab(c Chain) vocab {
 	return v
 }
 
-// selectorVocab is every requirement of every labelSelector on a literal path.
-func selectorVocab(p string) labels.Requirements {
+// selectorTerm is one selector requirement: the item path it reads and the
+// values it compares with.
+type selectorTerm struct {
+	chain  []string
+	values []string
+}
+
+// selectorVocab is every requirement of every labelSelector and fieldSelector
+// on a literal path, whether the informer applies it or the apiserver does.
+func selectorVocab(p string) []selectorTerm {
 	if _, isTemplate := MaybeQuery(p); isTemplate {
 		return nil
 	}
@@ -126,11 +134,20 @@ func selectorVocab(p string) labels.Requirements {
 	if err != nil {
 		return nil
 	}
-	var out labels.Requirements
+	var out []selectorTerm
 	for _, s := range vals["labelSelector"] {
 		if sel, err := labels.Parse(s); err == nil {
 			reqs, _ := sel.Requirements()
-			out = append(out, reqs...)
+			for _, r := range reqs {
+				out = append(out, selectorTerm{[]string{"metadata", "labels", r.Key()}, r.Values().List()})
+			}
+		}
+	}
+	for _, s := range vals["fieldSelector"] {
+		if sel, err := fields.ParseSelector(s); err == nil {
+			for _, r := range sel.Requirements() {
+				out = append(out, selectorTerm{strings.Split(r.Field, "."), []string{r.Value}})
+			}
 		}
 	}
 	return out

@@ -44,21 +44,20 @@ package api
 
 import (
 	"encoding/json"
-	"net/url"
-	"sort"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
+
+	"github.com/krateo-platformops/snowplow/internal/apicall"
 )
 
 const (
-	listQueryParamLabelSelector = "labelSelector"
-	listQueryParamFieldSelector = "fieldSelector"
+	listQueryParamLabelSelector = apicall.ParamLabelSelector
+	listQueryParamFieldSelector = apicall.ParamFieldSelector
 
-	fieldMetadataName      = "metadata.name"
-	fieldMetadataNamespace = "metadata.namespace"
+	fieldMetadataName      = apicall.FieldMetadataName
+	fieldMetadataNamespace = apicall.FieldMetadataNamespace
 )
 
 // listQuery is a call's query string, classified. The zero value is "no
@@ -100,122 +99,28 @@ func splitPathQuery(p string) (path, rawQuery string, hasQuery bool) {
 // isList is true for a collection read (ParseAPIServerPathToDep returned
 // name==""); namespaced is true when the path is namespace-scoped (it returned
 // ns!=""). It is a pure function of its inputs, so every site that keys or
-// serves a call derives the same answer.
+// serves a call derives the same answer. The classification itself is
+// internal/apicall PlanQuery, shared with the jqinterest analysis (#683
+// follow-up), so the analysis and the resolver cannot disagree on which
+// queries are applied in process.
 func planListQuery(p string, isList, namespaced bool) listQuery {
-	_, raw, _ := splitPathQuery(p)
-	if raw == "" {
-		return listQuery{applicable: true}
+	q := apicall.PlanQuery(p, isList, namespaced)
+	return listQuery{
+		canon:      q.Canon,
+		applicable: q.Applicable,
+		reason:     q.Reason,
+		label:      q.Label,
+		field:      q.Field,
+		labelStr:   q.LabelStr,
+		fieldStr:   q.FieldStr,
 	}
-	vals, err := url.ParseQuery(raw)
-	if err != nil {
-		return listQuery{reason: listQueryReasonMalformed}
-	}
-	if len(vals) == 0 {
-		// e.g. "?&" — no param at all, nothing to apply or drop.
-		return listQuery{applicable: true}
-	}
-	if !isList {
-		// A GET-by-name has no selector semantics to reproduce; whatever it
-		// carries is the apiserver's to interpret.
-		return listQuery{reason: listQueryReasonQueryOnGet}
-	}
-
-	// Classify every param BEFORE applying any, so the fall-through reason is
-	// deterministic whatever the param order. A param the informer cannot
-	// reproduce wins over a supported one: the whole call falls through.
-	keys := make([]string, 0, len(vals))
-	for k := range vals {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		if len(vals[k]) != 1 {
-			return listQuery{reason: listQueryReasonRepeatedParam}
-		}
-		switch k {
-		case listQueryParamLabelSelector, listQueryParamFieldSelector:
-		case "limit", "continue":
-			return listQuery{reason: listQueryReasonPagination}
-		case "resourceVersion", "resourceVersionMatch":
-			return listQuery{reason: listQueryReasonResourceVersion}
-		case "watch", "allowWatchBookmarks", "sendInitialEvents":
-			return listQuery{reason: listQueryReasonWatch}
-		default:
-			return listQuery{reason: listQueryReasonUnknownParam}
-		}
-	}
-
-	q := listQuery{applicable: true, reason: listQueryReasonSelector}
-	canon := url.Values{}
-	if v, ok := vals[listQueryParamLabelSelector]; ok {
-		sel, err := labels.Parse(v[0])
-		if err != nil {
-			return listQuery{reason: listQueryReasonInvalidSelector}
-		}
-		if !sel.Empty() {
-			q.label = sel
-			q.labelStr = sel.String()
-			canon.Set(listQueryParamLabelSelector, q.labelStr)
-		}
-	}
-	if v, ok := vals[listQueryParamFieldSelector]; ok {
-		sel, err := fields.ParseSelector(v[0])
-		if err != nil {
-			return listQuery{reason: listQueryReasonInvalidSelector}
-		}
-		reqs := sel.Requirements()
-		terms := make([]string, 0, len(reqs))
-		for _, r := range reqs {
-			switch r.Field {
-			case fieldMetadataName:
-			case fieldMetadataNamespace:
-				if !namespaced {
-					return listQuery{reason: listQueryReasonNamespaceFieldClusterPath}
-				}
-			default:
-				return listQuery{reason: listQueryReasonUnsupportedField}
-			}
-			op := "="
-			switch r.Operator {
-			case selection.Equals, selection.DoubleEquals:
-			case selection.NotEquals:
-				op = "!="
-			default:
-				// fields.ParseSelector only produces =, == and !=; anything
-				// else is not a shape we can vouch for.
-				return listQuery{reason: listQueryReasonInvalidSelector}
-			}
-			terms = append(terms, r.Field+op+fields.EscapeValue(r.Value))
-		}
-		if len(terms) > 0 {
-			sort.Strings(terms)
-			q.field = sel
-			q.fieldStr = strings.Join(terms, ",")
-			canon.Set(listQueryParamFieldSelector, q.fieldStr)
-		}
-	}
-	q.canon = canon.Encode() // url.Values.Encode sorts by key
-	if q.canon == "" {
-		// Only empty selectors: semantically the unselected list.
-		return listQuery{applicable: true}
-	}
-	return q
 }
 
 // matches reports whether an object with these coordinates and labels is in
 // the selected set, using the field set the apiserver builds for an object
 // (generic.ObjectMetaFieldsSet: metadata.name, plus metadata.namespace).
 func (q listQuery) matches(name, namespace string, lbls map[string]string) bool {
-	if q.label != nil && !q.label.Matches(labels.Set(lbls)) {
-		return false
-	}
-	if q.field != nil && !q.field.Matches(fields.Set{
-		fieldMetadataName:      name,
-		fieldMetadataNamespace: namespace,
-	}) {
-		return false
-	}
-	return true
+	return apicall.Query{Label: q.label, Field: q.field}.Matches(name, namespace, lbls)
 }
 
 // itemMeta is the slice of an object the selectors read. Decoding only this
