@@ -53,6 +53,10 @@ var ctxKeyStageErrorSink = ctxKeyStageErrorSinkType{}
 type StageErrorSink struct {
 	count  atomic.Int64
 	sample atomic.Pointer[stageErrSample]
+	// parent is the enclosing resolve's sink when this is a CHILD sink
+	// (WithChildPutGateSinks, #684); every bump is forwarded to it. nil for a
+	// sink installed by WithStageErrorSink.
+	parent *StageErrorSink
 }
 
 type stageErrSample struct {
@@ -67,11 +71,14 @@ func (s *StageErrorSink) Bump(stage, err string) {
 	if s == nil {
 		return
 	}
-	s.count.Add(1)
-	// First-sample-wins via CAS from nil. Subsequent bumps leave the
-	// first sample intact (it's the most causally-relevant for the
-	// decline — later stages may fail as a consequence).
-	s.sample.CompareAndSwap(nil, &stageErrSample{stage: stage, err: err})
+	smp := &stageErrSample{stage: stage, err: err}
+	for cur := s; cur != nil; cur = cur.parent {
+		cur.count.Add(1)
+		// First-sample-wins via CAS from nil. Subsequent bumps leave the
+		// first sample intact (it's the most causally-relevant for the
+		// decline — later stages may fail as a consequence).
+		cur.sample.CompareAndSwap(nil, smp)
+	}
 }
 
 // Count returns the number of stage errors recorded. nil-receiver-safe

@@ -387,6 +387,15 @@ func raFullListServe(
 	// remarks raKey instead of leaving it stale (the widget's re-resolve would
 	// fast-path and slice the stale cell). With no enclosing sink (a nil-sink drift,
 	// already detected at the Put) fall back to an epoch taken now.
+	// #684 — the full list's OWN Put-gate sinks (stage error, per-identity
+	// forbidden, external touch), installed on ctx so BOTH resolves below (the
+	// unpaginated full under fullCtx and the first-sight page under ctx) bump
+	// them, and every bump still reaches the enclosing widget's sinks. The cell
+	// is gated by the SAME #681 predicates every other Put site uses
+	// (cache.DenialOnly, cache.GenuineExternal) over what THIS path resolved —
+	// never over counts the enclosing /call recorded before it got here.
+	ctx, gate := cache.WithChildPutGateSinks(ctx)
+
 	raEpoch, haveEpoch := cache.DepGenStartSeqFromContext(ctx)
 	if !haveEpoch {
 		raEpoch = cache.DepGenEpochNow()
@@ -503,7 +512,9 @@ func raFullListServe(
 		// DECLINE the re-Put + the dep Record (external data has no informer
 		// edge to invalidate the cell). Load-bearing surface #4 — without this
 		// the external aggregate would be cached + served stale across pages.
-		if extSink := cache.ExternalTouchedSinkFromContext(fullCtx); extSink.Count() > 0 {
+		// #684 — GenuineExternal (#681 C2): the requester's own-credential
+		// apiserver 403 is not an external touch.
+		if cache.GenuineExternal(gate.External, gate.Forbidden) > 0 {
 			if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
 				cache.BumpExternalSkippedPut()
 			}
@@ -520,7 +531,9 @@ func raFullListServe(
 		// #424 — the requester's RBAC class must still be the one raKey was
 		// minted for; a change mid-resolve makes `full` another class's body.
 		// Serve the slice (correct for this requester), never write it.
-		if cache.DeclineSensitivePut(fullCtx) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+		// #684 — a stage error that is not a per-identity forbidden declines.
+		if cache.DeclineSensitivePut(fullCtx) || raFullListStageDecline(ctx, gate) ||
+			!raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
@@ -529,6 +542,7 @@ func raFullListServe(
 		// bumped the sink).
 		stampObservedUAF()
 		if c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0) {
+			noteRAFullListDenialOnlyPut(gate)
 			// #375 C3 — under fullCtx (the Put's sink; it chains to the widget sink, which
 			// still receives the dep), so an RA edit in [Put-check, Record) is re-checked.
 			cache.Deps().Record(fullCtx, raKey, gvr, namespace, name)
@@ -579,8 +593,9 @@ func raFullListServe(
 	// NO dep edge, and Put NO cell — external data has no informer edge to
 	// invalidate it, so caching it would serve it stale across pages/widgets
 	// (the exact defect this proposal kills). Checked AFTER both resolves so
-	// the sink reflects either one touching the external fetch.
-	if extSink := cache.ExternalTouchedSinkFromContext(fullCtx); extSink.Count() > 0 {
+	// the sink reflects either one touching the external fetch (#684: both
+	// resolve under the gate sinks; GenuineExternal per #681 C2).
+	if cache.GenuineExternal(gate.External, gate.Forbidden) > 0 {
 		if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
 			cache.BumpExternalSkippedPut()
 		}
@@ -677,15 +692,50 @@ func raFullListServe(
 	// self-dep Record above (the Lever-C memo wiring) stands either way.
 	// #424 — same identity-class re-check as the repopulate branch.
 	// #398 — a full list built from a sensitive read is never cached.
-	if cache.DeclineSensitivePut(fullCtx) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+	// #684 — nor one with a stage error that is not a per-identity forbidden.
+	if cache.DeclineSensitivePut(fullCtx) || raFullListStageDecline(ctx, gate) ||
+		!raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sGo, true, nil
 	}
 	// #592 — observed limb, twin of the repopulate branch above.
 	stampObservedUAF()
-	c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0)
+	if c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0) {
+		noteRAFullListDenialOnlyPut(gate)
+	}
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
 	return sGo, true, nil
+}
+
+// raFullListStageErrorDeclined counts raFullList cell writes declined by the
+// #681 stage-error gate (#684): a stage error that is not a per-identity
+// forbidden (cache.DenialOnly false).
+var raFullListStageErrorDeclined atomic.Uint64
+
+// RAFullListStageErrorDeclinedForTest reads the counter.
+func RAFullListStageErrorDeclinedForTest() uint64 { return raFullListStageErrorDeclined.Load() }
+
+// raFullListStageDecline is the #681 stage-error gate on the full-list cell,
+// over the full list's own sinks (#684): any stage error declines unless
+// EVERY one was a per-identity forbidden (cache.DenialOnly — the one predicate
+// every Put site shares). The denial-only body is already identity-free: the
+// resolver records F1 and F2 as the canonical forbidden body.
+func raFullListStageDecline(ctx context.Context, g cache.PutGateSinks) bool {
+	if g.Stage.Count() == 0 || cache.DenialOnly(g.Stage, g.Forbidden, g.External, cache.CacheEntryClassRAFullList) {
+		return false
+	}
+	if !cache.Inert(ctx) { // #443 — dry-run traffic is not a decline
+		raFullListStageErrorDeclined.Add(1)
+	}
+	return true
+}
+
+// noteRAFullListDenialOnlyPut counts a STORED full-list cell that carried
+// stage errors (the gate admitted it, so they were all per-identity forbidden).
+func noteRAFullListDenialOnlyPut(g cache.PutGateSinks) {
+	if g.Stage.Count() > 0 {
+		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteRAFullList)
+	}
 }
 
 // raKeyClassDriftDeclined counts raFullList cell writes declined because the
