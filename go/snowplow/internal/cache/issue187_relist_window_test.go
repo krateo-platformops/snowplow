@@ -51,6 +51,7 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 const (
@@ -69,7 +70,7 @@ func b5GVR() schema.GroupVersionResource {
 // b5Watcher builds a ResourceWatcher over a fake dynamic client whose
 // informers actually Run and sync, registers the target GVR, and wires the CRD
 // meta-GVR syncCh so the lifecycle handlers pass the R1 post-sync gate.
-func b5Watcher(t *testing.T) *ResourceWatcher {
+func b5Watcher(t *testing.T, holdRelistUntil <-chan struct{}) *ResourceWatcher {
 	t.Helper()
 
 	sch := k8sruntime.NewScheme()
@@ -83,6 +84,11 @@ func b5Watcher(t *testing.T) *ResourceWatcher {
 		b5GVR(): "ButtonList",
 	}
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds)
+	if holdRelistUntil != nil {
+		// Installed BEFORE any informer runs: the fake's reactor chain is
+		// not safe to modify while a reflector lists through it.
+		b5HoldRelistList(dyn, holdRelistUntil)
+	}
 
 	rw, err := NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
@@ -119,6 +125,30 @@ func b5Watcher(t *testing.T) *ResourceWatcher {
 	SetGlobal(rw)
 	t.Cleanup(func() { SetGlobal(nil) })
 	return rw
+}
+
+// b5HoldRelistList makes the relisted informer's LIST wait until release is
+// closed (#664). The arm models a delete landing INSIDE the teardown window:
+// the pre-sync dirty-mark re-resolves while the object still exists, the
+// delete lands, and only then does the fresh informer LIST (without it) and
+// sync. Under CPU contention a starved refresher worker could dequeue the
+// entry only AFTER the fresh informer had synced and the post-sync mark had
+// coalesced onto the same queued key. Then the arm's ONE re-resolve played
+// the "object still here" step after the fresh LIST, a sequence that cannot
+// happen in production (the object is gone from that LIST). Holding the LIST
+// until that step completes pins the modelled order. The first LIST (the
+// running informer's, already synced by b5Watcher) is not held.
+func b5HoldRelistList(dyn *dynamicfake.FakeDynamicClient, release <-chan struct{}) {
+	var lists atomic.Int64
+	dyn.PrependReactor("list", b5Plural, func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+		if lists.Add(1) > 1 {
+			select {
+			case <-release:
+			case <-time.After(time.Minute): // never deadlock the arm; the assertions below report it
+			}
+		}
+		return false, nil, nil // fall through to the tracker
+	})
 }
 
 // b5DriveRelist fires the real CRD lifecycle handlers: first an ADD at the
@@ -174,7 +204,8 @@ func TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry(t *testing.T) {
 	}
 	Deps().SetStore(store)
 
-	rw := b5Watcher(t)
+	firstResolved := make(chan struct{})
+	rw := b5Watcher(t, firstResolved)
 
 	inputs := &ResolvedKeyInputs{
 		CacheEntryClass: "widgets",
@@ -202,6 +233,7 @@ func TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry(t *testing.T) {
 			// survives with a fresh body. THE DELETE LANDS NOW.
 			store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"still-here"}`), Inputs: inputs})
 			objectGone.Store(true)
+			close(firstResolved) // the fresh informer may LIST now (b5HoldRelistList)
 			return nil
 		}
 		if objectGone.Load() {
@@ -222,7 +254,10 @@ func TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry(t *testing.T) {
 
 	// The whole point: no DELETE is ever delivered for the object, so the
 	// post-sync dirty-mark is the only trigger that can reach this entry.
-	deadline := time.Now().Add(30 * time.Second)
+	// Event-driven: returns as soon as the entry is gone (ms when idle); the
+	// deadline is a backstop for a starved refresher, not a timing budget
+	// (#664).
+	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
 		if _, alive := store.Get(key); !alive {
 			break
@@ -278,7 +313,7 @@ func TestIssue187_B5b_RelistDoesNotEvictALiveObject(t *testing.T) {
 	}
 	Deps().SetStore(store)
 
-	rw := b5Watcher(t)
+	rw := b5Watcher(t, nil)
 
 	inputs := &ResolvedKeyInputs{
 		CacheEntryClass: "widgets",
@@ -306,8 +341,9 @@ func TestIssue187_B5b_RelistDoesNotEvictALiveObject(t *testing.T) {
 	b5DriveRelist(t, rw)
 
 	// Wait for the post-sync re-fire to have happened, then give the refresher
-	// room to do whatever it is going to do.
-	deadline := time.Now().Add(30 * time.Second)
+	// room to do whatever it is going to do. Event-driven; the deadline is a
+	// backstop for a starved bridge (#664).
+	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
 		if CRDDiscoveryStatsSnapshot().RelistDirtyMarkPostSync >= 1 {
 			break

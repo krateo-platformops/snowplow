@@ -529,6 +529,17 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 	}
 	rbacSnap.Store(snap)
 
+	// #686 — a bindings-index build requested before the first publish was
+	// deferred, not marked built over nothing. Run it over a COMPLETE
+	// snapshot only: an event-driven rebuild during the initial LIST can
+	// publish a partial one (a RoleBinding before its Role), and building
+	// over it would skip that binding for good. So: once this watcher's
+	// initial publish has returned, or from the initial publish itself
+	// (waitAndPublishInitialRBACSnapshot).
+	if rbacInitialPublishReturned(rw) {
+		buildPendingBindingsIndex()
+	}
+
 	// #118 (c)-v2 GAP-2 — flush the deferred per-subject sub-gen bumps at the
 	// publish barrier, sequenced AFTER rbacSnap.Store. Any request that
 	// observes a bumped sub-gen (new resolved key) is thereby guaranteed to
@@ -1108,6 +1119,47 @@ func (rw *ResourceWatcher) WaitInitialRBACPublishForTest(timeout time.Duration) 
 	}
 }
 
+// WaitRBACQuiescentForTest blocks until THIS watcher's initial publish has
+// returned AND no asynchronous snapshot rebuild is in flight
+// (scheduleRBACRebuild's writer slot free). After it, the
+// published snapshot moves only when the test itself publishes or mutates
+// RBAC objects. A harness that then rebuilds synchronously and starts
+// counting memo hits or sub-gen bumps can no longer have a late async publish
+// swap the memo shard or bump a subject under it (#655, #686). TEST-ONLY.
+func (rw *ResourceWatcher) WaitRBACQuiescentForTest(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if err := rw.WaitInitialRBACPublishForTest(timeout); err != nil {
+		return err
+	}
+	for rbacRebuildLock.Load() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("cache: RBAC snapshot rebuild still in flight after %s (dirty=%v)",
+				timeout, rbacRebuildDirty.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A dirty bit left set with the writer slot FREE has no goroutine to
+	// clear it (scheduleRBACRebuild can lose a wakeup between the loop's
+	// final dirty check and the slot release). The caller's synchronous
+	// rebuild publishes the current state either way.
+	return nil
+}
+
+// rbacInitialPublishReturned reports whether rw's initial-publish goroutine
+// has returned (its done channel closed). A watcher without that goroutine
+// (nil channel) counts as published.
+func rbacInitialPublishReturned(rw *ResourceWatcher) bool {
+	if rw == nil || rw.rbacInitialPublishDone == nil {
+		return true
+	}
+	select {
+	case <-rw.rbacInitialPublishDone:
+		return true
+	default:
+		return false
+	}
+}
+
 // waitAndPublishInitialRBACSnapshot is the initial-publish goroutine
 // spawned by NewResourceWatcher (Ship B / AC-B.9). It blocks until all
 // 4 RBAC syncCh channels close — the "Servable" signal that the
@@ -1165,6 +1217,9 @@ func waitAndPublishInitialRBACSnapshot(rw *ResourceWatcher) {
 	// All 4 informers are synced — publish the initial snapshot
 	// synchronously so the very next EvaluateRBAC call sees it.
 	rebuildRBACSnapshot(rw)
+	// #686 — the first COMPLETE snapshot: run a bindings-index build that
+	// was requested before any snapshot existed.
+	buildPendingBindingsIndex()
 	slog.Info("cache.rbac.snapshot.initial_publish_done",
 		slog.String("subsystem", "cache"),
 		slog.String("hint", "first typed-RBAC snapshot is live; "+

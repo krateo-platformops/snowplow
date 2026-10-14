@@ -69,7 +69,9 @@
 package cache
 
 import (
+	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -175,6 +177,13 @@ type bindingsByGVRIndex struct {
 	navigated map[groupResource]struct{}
 
 	built bool
+
+	// pendingNavigated (#686): a build requested while no RBAC snapshot was
+	// published yet. The index stays UNBUILT (built=false) rather than
+	// claiming to be built over nothing: a "built" empty byRole makes every
+	// later role edit bump no subject. The first snapshot publish runs the
+	// build (buildPendingBindingsIndex). nil when no build is pending.
+	pendingNavigated []schema.GroupVersionResource
 }
 
 // bindingsIndexSingleton is the process-wide index. Lazily constructed.
@@ -437,9 +446,21 @@ func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
 	}
 
 	if snap == nil {
-		idx.built = true
+		// #686 — refuse to call an index BUILT over no snapshot: byRole
+		// would stay empty and every later role-rule edit would bump no
+		// subject (onRoleRulesChanged finds no referencing binding). Stay
+		// unbuilt (callers keep the pre-build fallbacks) and let the first
+		// publish build it.
+		idx.built = false
+		idx.pendingNavigated = append([]schema.GroupVersionResource(nil), navigatedGVRs...)
+		bindingsIndexDeferredTotal.Add(1)
+		slog.Warn("cache.bindings_by_gvr.build_deferred_no_snapshot",
+			slog.String("subsystem", "cache"),
+			slog.Int("navigated", len(navigatedGVRs)),
+			slog.String("effect", "index left unbuilt; the first RBAC snapshot publish builds it (#686)"))
 		return 0
 	}
+	idx.pendingNavigated = nil
 
 	enrolled := 0
 	for _, crb := range snap.ClusterRoleBindings {
@@ -632,4 +653,26 @@ func ResetBindingsByGVRIndexForTest() {
 	idx.navigated = map[groupResource]struct{}{}
 	idx.roleRefUnresolved = map[bindingID]struct{}{}
 	idx.built = false
+	idx.pendingNavigated = nil
+}
+
+// bindingsIndexDeferredTotal counts builds deferred because no RBAC snapshot
+// was published yet (#686).
+var bindingsIndexDeferredTotal atomic.Uint64
+
+// BindingsIndexDeferredTotalForTest reads bindingsIndexDeferredTotal.
+func BindingsIndexDeferredTotalForTest() uint64 { return bindingsIndexDeferredTotal.Load() }
+
+// buildPendingBindingsIndex runs a build deferred by BuildBindingsByGVRIndex
+// on a nil snapshot (#686). Called right after a snapshot is published.
+func buildPendingBindingsIndex() {
+	idx := bindingsByGVRSingleton()
+	idx.mu.RLock()
+	pending := idx.pendingNavigated
+	built := idx.built
+	idx.mu.RUnlock()
+	if pending == nil || built {
+		return
+	}
+	BuildBindingsByGVRIndex(pending)
 }
