@@ -12,7 +12,9 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +32,31 @@ import (
 	metadatafake "k8s.io/client-go/metadata/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
+
+// verificationRowsDiagForTest names every verification row with what the
+// gauge reads for it, so a non-zero gauge in a failure says WHICH GVRs and
+// WHY instead of only how many.
+func verificationRowsDiagForTest() string {
+	rows := verificationRows()
+	var b strings.Builder
+	rw := Global()
+	fmt.Fprintf(&b, "%d rows, global watcher %p:", len(rows), rw)
+	for gvr, row := range rows {
+		registered, synced, servable := false, false, false
+		if rw != nil {
+			rw.mu.RLock()
+			if gi, ok := rw.informers[gvr]; ok && gi != nil {
+				registered = true
+				synced = gi.Informer().HasSynced()
+				_, servable = rw.servableLocked(gvr)
+			}
+			rw.mu.RUnlock()
+		}
+		fmt.Fprintf(&b, " [%s registered=%v synced=%v servable=%v decorated=%v age=%s]",
+			gvr, registered, synced, servable, row.decorated, time.Since(row.epoch).Round(time.Millisecond))
+	}
+	return b.String()
+}
 
 // --- the recording metadata client ----------------------------------------
 
@@ -98,6 +125,78 @@ func (r *recordingResource) List(ctx context.Context, opts metav1.ListOptions) (
 // --- the stale-store fixture ----------------------------------------------
 
 var repairGVR = schema.GroupVersionResource{Group: "widgets.krateo.io", Version: "v1beta1", Resource: "panels"}
+
+// silentWatchSlowCRBList, when non-zero, delays every clusterrolebindings
+// LIST the fixture's WATCHER makes (see
+// TestSilentWatchCluster_GaugesStartFromSyncedInformers).
+var silentWatchSlowCRBList time.Duration
+
+// slowListDynamic delays LISTs of one GVR. It wraps the client the watcher is
+// given rather than adding a fake reactor: the fake holds one lock across its
+// whole reactor chain, so a sleeping reactor would stall every other LIST too
+// and the delay would land on the wrong informer.
+type slowListDynamic struct {
+	dynamic.Interface
+	gvr   schema.GroupVersionResource
+	delay time.Duration
+}
+
+func (c slowListDynamic) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	r := c.Interface.Resource(gvr)
+	if gvr != c.gvr {
+		return r
+	}
+	return slowListResource{NamespaceableResourceInterface: r, delay: c.delay}
+}
+
+type slowListResource struct {
+	dynamic.NamespaceableResourceInterface
+	delay time.Duration
+}
+
+func (r slowListResource) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	time.Sleep(r.delay)
+	return r.NamespaceableResourceInterface.List(ctx, opts)
+}
+
+func (r slowListResource) Namespace(ns string) dynamic.ResourceInterface {
+	return slowListNSResource{ResourceInterface: r.NamespaceableResourceInterface.Namespace(ns), delay: r.delay}
+}
+
+type slowListNSResource struct {
+	dynamic.ResourceInterface
+	delay time.Duration
+}
+
+func (r slowListNSResource) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	time.Sleep(r.delay)
+	return r.ResourceInterface.List(ctx, opts)
+}
+
+// TestSilentWatchCluster_GaugesStartFromSyncedInformers — #699. The B-5 arm
+// asserts store_gvrs_unverifiable == 0 on the PROCESS-WIDE gauges, which
+// count the fixture's four eager RBAC informers too. NewResourceWatcher does
+// not wait for them, so under load one was still in its initial LIST when the
+// arm read the gauge (clusterrolebindings, 8ms after registration: gauge 1).
+// The fixture must hand an arm only informers that have all synced.
+// A slowed clusterrolebindings LIST makes that window certain: RED without
+// the fixture's WaitForCacheSync (gauge 1, by reason retracted), GREEN with
+// it.
+func TestSilentWatchCluster_GaugesStartFromSyncedInformers(t *testing.T) {
+	c3Setup(t)
+	resetVerificationForArm(t)
+	silentWatchSlowCRBList = time.Second
+	t.Cleanup(func() { silentWatchSlowCRBList = 0 })
+
+	rw, _ := silentWatchCluster(t, panelObj("demo", "panel-a", "1", "uid-a"))
+	// As B-5 does: with no metadata client every row reads "unreachable",
+	// which would mask the reason this arm is about.
+	attachMetaClient(t, rw, partialMeta("demo", "panel-a", "1", "uid-a"))
+	if _, unverifiable, _, _, byReason := storeVerificationGauges(); unverifiable != 0 {
+		t.Fatalf("store_gvrs_unverifiable = %d straight out of the fixture, want 0 (by reason: %v; %s)",
+			unverifiable, byReason, verificationRowsDiagForTest())
+	}
+}
 
 // silentWatchCluster builds a ResourceWatcher over a fake dynamic client whose
 // WATCH never delivers an event.
@@ -169,7 +268,15 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	// the defect they exist to catch.
 	AddNavigationDiscoveredGroup(repairGVR.Group)
 
-	rw, err := NewResourceWatcher(context.Background(), dyn)
+	// #699 arm seam: an eager RBAC informer still in its initial LIST when the
+	// fixture returns, the shape CPU contention gives one. Off for every other
+	// caller.
+	var watcherClient dynamic.Interface = dyn
+	if d := silentWatchSlowCRBList; d > 0 {
+		watcherClient = slowListDynamic{Interface: dyn, delay: d,
+			gvr: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}}
+	}
+	rw, err := NewResourceWatcher(context.Background(), watcherClient)
 	if err != nil || rw == nil {
 		t.Fatalf("NewResourceWatcher: %v (rw=%v)", err, rw)
 	}
@@ -182,6 +289,16 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	case <-syncCh:
 	case <-time.After(verifyBound):
 		t.Fatalf("informer for %s did not sync", repairGVR)
+	}
+	// #699 — NewResourceWatcher registers the four typed-RBAC informers
+	// eagerly but does not wait for them, and each one has a verification row.
+	// The arms read the PROCESS-WIDE verification gauges, so an RBAC informer
+	// still in its initial LIST is (truthfully) counted unverifiable: under
+	// load, clusterrolebindings was seen unsynced 8ms after registration and
+	// the gauge read 1. Every informer the fixture registered must have synced
+	// before an arm asserts on the gauges.
+	if err := rw.WaitForCacheSync(context.Background(), verifyBound); err != nil {
+		t.Fatalf("precondition: the fixture's informers did not all sync: %v", err)
 	}
 	// Populates lastSyncRV, which is the resourceVersion the forced LIST must
 	// carry. With no discovery client, conjunct 4 is degraded-true and the
@@ -415,12 +532,12 @@ func TestStoreVerification_DeadlineForcesFullGVRPass(t *testing.T) {
 	if lu, ld, la, um := divergenceCounts(verifySiteForced); lu+ld+la+um != 0 {
 		t.Errorf("a matching store reported divergences: %d/%d/%d/%d", lu, ld, la, um)
 	}
-	unverified, unverifiable, _, maxAge, _ := storeVerificationGauges()
+	unverified, unverifiable, _, maxAge, byReason := storeVerificationGauges()
 	if unverified != 0 {
 		t.Errorf("store_gvrs_unverified = %d after a completed pass, want 0", unverified)
 	}
 	if unverifiable != 0 {
-		t.Errorf("store_gvrs_unverifiable = %d, want 0", unverifiable)
+		t.Errorf("store_gvrs_unverifiable = %d, want 0 (by reason: %v; %s)", unverifiable, byReason, verificationRowsDiagForTest())
 	}
 	if maxAge <= 0 || time.Duration(maxAge)*time.Second > maxVerificationAge() {
 		t.Errorf("store_verification_max_age_seconds = %v; want >0 and within the deadline", maxAge)

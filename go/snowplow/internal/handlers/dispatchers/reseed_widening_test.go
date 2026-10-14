@@ -94,6 +94,25 @@ var (
 // through the informer path.
 func s258BuildWatcher(t *testing.T, extraUsers ...string) (dynamic.Interface, *cache.ResourceWatcher) {
 	t.Helper()
+	// #696 — the published RBAC snapshot is process-global, and the async
+	// rebuild goroutine (scheduleRBACRebuild) is detached by design: it is not
+	// joined by rw.Stop. A rebuild still in flight for an EARLIER test's
+	// stopped watcher absorbs this test's schedule (the single writer slot is
+	// held), then republishes the stopped watcher's snapshot over this one's,
+	// without carol's binding, so her widgets key derives an empty BindingUID.
+	// Seen as the "live widgets key with non-empty BindingUID" precondition
+	// failing in whole-package runs only. #471's quiesce waits that rebuild
+	// out before this watcher exists (the earlier watcher is already stopped
+	// by its cleanup, so nothing can schedule another).
+	//
+	// Not the full ResetCacheProcessStateForTest: it also zeroes the snapshot
+	// PublishSeq, and the rbac package's authz and requester-profile memos are
+	// keyed by that seq, so the next test's snapshots reuse the previous
+	// test's seq numbers and hit its memoised verdicts (seen: carol's seed key
+	// carrying the previous test's BindingUID).
+	if err := cache.WaitRBACRebuildQuiesceForTest(10 * time.Second); err != nil {
+		t.Fatalf("precondition: an earlier test's RBAC rebuild is still in flight: %v", err)
+	}
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
