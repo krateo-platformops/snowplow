@@ -102,7 +102,7 @@ func Setup(ctx context.Context, build string) (*sdklog.LoggerProvider, ShutdownF
 	// resolve — same contract as the trace exporter.
 	opts := []otlploghttp.Option{}
 	if ep := env.String(EnvOTLPEndpoint, ""); ep != "" {
-		opts = append(opts, otlploghttp.WithEndpointURL(ep))
+		opts = append(opts, otlploghttp.WithEndpointURL(otelresource.SignalEndpointURL(ep, otelresource.LogsPath)))
 	}
 
 	exp, err := otlploghttp.New(ctx, opts...)
