@@ -345,34 +345,136 @@ func scheduleRBACRebuild(rw *ResourceWatcher) {
 		return
 	}
 
-	go func() {
-		defer rbacRebuildLock.Store(false)
-		// Panic-recovering: a rebuild that crashes must not poison the
-		// writer slot for the rest of the process. Recover, log loudly,
-		// and re-mark dirty so the NEXT event re-acquires and retries.
-		defer func() {
-			if r := recover(); r != nil {
-				rbacRebuildDirty.Store(true)
-				slog.Error("cache.rbac.snapshot.rebuild_panic",
-					slog.String("subsystem", "cache"),
-					slog.Any("recovered", r),
-					slog.String("stack", string(debug.Stack())),
-				)
-			}
-		}()
+	go runRBACRebuildLoop(rw)
+}
 
-		// Loop until dirty is false on a fresh check AFTER a rebuild.
-		// Each iteration clears dirty BEFORE rebuilding so events arriving
-		// MID-rebuild re-flip it and force another iteration. (Clearing
-		// AFTER would lose those events.)
-		for {
-			rbacRebuildDirty.Store(false)
-			rebuildRBACSnapshot(rw)
-			if !rbacRebuildDirty.Load() {
-				return
-			}
+// runRBACRebuildLoop is the single writer. It holds the slot (rbacRebuildLock)
+// whenever it rebuilds, so at most one rebuild ever runs.
+//
+// #687 (security) — NO LOST WAKEUP. A scheduler sets dirty and, if the CAS
+// fails, RETURNS, trusting the slot holder to see dirty. The pre-#687 loop
+// decided "dirty is false, exit" and only THEN released the slot (a deferred
+// Store): an event landing in between set dirty, failed the CAS against the
+// still-held slot, and returned — and the loop exited anyway. Nobody rebuilt
+// until the NEXT RBAC event, so a revoke could stay unpublished and the revoked
+// subject kept access in-process.
+//
+// Now the slot is released FIRST and dirty is re-checked AFTER the release:
+//   - a scheduler whose CAS failed did so while the slot was held, i.e. before
+//     this release, so its dirty Store is visible to the re-check below;
+//   - if dirty is set, the loop re-acquires with a CAS. If that CAS fails,
+//     another scheduler took the slot after the release and IT drains dirty;
+//     either way exactly one goroutine owns the work, and no rebuild runs
+//     outside the slot.
+//
+// A panicking rebuild re-marks dirty (as before) and is picked up by the same
+// re-check, after a bounded backoff (rbacRebuildPanicBackoff) so a rebuild
+// that panics deterministically cannot spin.
+func runRBACRebuildLoop(rw *ResourceWatcher) {
+	panicBackoff := time.Duration(0)
+	for {
+		if drainRBACRebuild(rw) {
+			panicBackoff = nextRBACRebuildPanicBackoff(panicBackoff)
+		} else {
+			panicBackoff = 0
+		}
+		if h := rbacRebuildExitHookForTest.Load(); h != nil {
+			(*h)() // the #687 window: after the final dirty check, before the release
+		}
+		rbacRebuildLock.Store(false)
+		if h := rbacRebuildPostReleaseHookForTest.Load(); h != nil {
+			(*h)() // after the release, before the re-check. Tests only.
+		}
+		if !rbacRebuildDirty.Load() {
+			return
+		}
+		if panicBackoff > 0 {
+			time.Sleep(panicBackoff)
+		}
+		if !rbacRebuildLock.CompareAndSwap(false, true) {
+			return // another scheduler owns the slot and will see dirty
+		}
+		rbacRebuildPostReleasePickups.Add(1)
+	}
+}
+
+// publishRBACSnapshotUnderSlot is the SYNCHRONOUS form of scheduleRBACRebuild:
+// it marks dirty, waits for the writer slot, and runs the rebuild loop on the
+// calling goroutine, returning once a snapshot covering every event up to the
+// call has been published and the slot released. While it waits, the current
+// slot holder sees the dirty mark and drains it; the loop it then runs still
+// rebuilds at least once, so the caller's publish is never older than its call.
+func publishRBACSnapshotUnderSlot(rw *ResourceWatcher) {
+	rbacRebuildDirty.Store(true)
+	for !rbacRebuildLock.CompareAndSwap(false, true) {
+		time.Sleep(time.Millisecond)
+	}
+	runRBACRebuildLoop(rw)
+}
+
+// drainRBACRebuild rebuilds until dirty is false on a fresh check after a
+// rebuild. Each iteration clears dirty BEFORE rebuilding so events arriving
+// MID-rebuild re-flip it and force another iteration (clearing AFTER would
+// lose them). Returns true when a rebuild panicked: the panic is recovered,
+// logged loudly and dirty is re-marked so the caller retries.
+func drainRBACRebuild(rw *ResourceWatcher) (panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicked = true
+			rbacRebuildDirty.Store(true)
+			slog.Error("cache.rbac.snapshot.rebuild_panic",
+				slog.String("subsystem", "cache"),
+				slog.Any("recovered", r),
+				slog.String("stack", string(debug.Stack())),
+			)
 		}
 	}()
+	for {
+		rbacRebuildDirty.Store(false)
+		rebuildRBACSnapshot(rw)
+		if !rbacRebuildDirty.Load() {
+			return false
+		}
+	}
+}
+
+// nextRBACRebuildPanicBackoff doubles from 10ms up to 5s: a rebuild that
+// panics on every attempt retries without spinning, and one success resets it.
+func nextRBACRebuildPanicBackoff(cur time.Duration) time.Duration {
+	if cur <= 0 {
+		return 10 * time.Millisecond
+	}
+	if cur >= 5*time.Second {
+		return 5 * time.Second
+	}
+	return cur * 2
+}
+
+// rbacRebuildPostReleasePickups counts the rebuilds the #687 post-release
+// re-check picked up: a scheduler set dirty while the slot was still held and
+// returned, and the loop re-acquired the slot to publish it. Before #687 each
+// of these would have waited for the next RBAC event.
+var rbacRebuildPostReleasePickups atomic.Uint64
+
+// RBACRebuildPostReleasePickups returns the #687 pickup count.
+func RBACRebuildPostReleasePickups() uint64 { return rbacRebuildPostReleasePickups.Load() }
+
+// rbacRebuildExitHookForTest, when non-nil, runs between the rebuild loop's
+// final dirty check and the writer-slot release — the #687 window. Tests only.
+var rbacRebuildExitHookForTest atomic.Pointer[func()]
+
+// rbacRebuildPostReleaseHookForTest, when non-nil, runs right after the loop
+// releases the slot and before its re-check of dirty. Tests only (#687).
+var rbacRebuildPostReleaseHookForTest atomic.Pointer[func()]
+
+// SetRBACRebuildExitHookForTest installs (or, with nil, removes) the #687
+// exit hook. Tests only.
+func SetRBACRebuildExitHookForTest(fn func()) {
+	if fn == nil {
+		rbacRebuildExitHookForTest.Store(nil)
+		return
+	}
+	rbacRebuildExitHookForTest.Store(&fn)
 }
 
 // rebuildRBACSnapshot walks the 4 RBAC indexers once each and publishes
@@ -1216,7 +1318,13 @@ func waitAndPublishInitialRBACSnapshot(rw *ResourceWatcher) {
 
 	// All 4 informers are synced — publish the initial snapshot
 	// synchronously so the very next EvaluateRBAC call sees it.
-	rebuildRBACSnapshot(rw)
+	//
+	// #687 — UNDER THE WRITER SLOT. This used to call rebuildRBACSnapshot
+	// directly, outside the slot, so it could run concurrently with an
+	// event-driven rebuild; whichever stored LAST won, and an initial publish
+	// that read the indexers earlier could overwrite a newer snapshot that
+	// already carried a revoke.
+	publishRBACSnapshotUnderSlot(rw)
 	// #686 — the first COMPLETE snapshot: run a bindings-index build that
 	// was requested before any snapshot existed.
 	buildPendingBindingsIndex()

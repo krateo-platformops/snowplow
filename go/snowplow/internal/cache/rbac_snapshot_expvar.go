@@ -54,5 +54,9 @@ func RegisterRBACSnapshotExpvar() {
 		expvar.Publish("snowplow_rbac_publish_seq", expvar.Func(func() any {
 			return RBACGen()
 		}))
+		// #687 — rebuilds the post-release re-check picked up.
+		expvar.Publish("snowplow_rbac_rebuild_post_release_pickups_total", expvar.Func(func() any {
+			return RBACRebuildPostReleasePickups()
+		}))
 	})
 }
