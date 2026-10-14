@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime/pprof"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -579,11 +580,15 @@ func apistageContentServe(
 	// substrate into a fresh-looking widget/RA cell. The MISS fall-through below
 	// is the one K8s call per read the owner accepted while the informer is not
 	// servable; the informer's re-fire refreshes the cell.
+	// #710 — which case sent this reader into the fill (apistage_fill_metrics.go).
+	fillReason := contentFillAbsent
 	readContent := func(k string) (*cache.ResolvedEntry, bool) {
 		switch {
 		case forceContentMiss:
+			fillReason = contentFillRefreshForced
 			return nil, false
 		case cache.KnownStaleReadThrough(k):
+			fillReason = contentFillKnownStale
 			return nil, false
 		case cache.BackgroundResolveFromContext(ctx) || cache.Inert(ctx):
 			// #443 (e) — an inert (dry-run) resolve reads the cell as input
@@ -698,12 +703,24 @@ func apistageContentServe(
 		// Block-scoped shadow: the child sink covers exactly this MISS branch's read → Put
 		// → Record; the gate below keeps the caller's ctx.
 		ctx := cache.WithContentDepGenSink(ctx, gvr, ns, name)
-		dispatched, dispatchedOK := dispatchViaInformerFn(
-			cache.WithApistageContentResolve(ctx), call)
+		// #710 — count the fill and hold its envelope bytes in flight until
+		// this serve returns; the dispatch and the parse run under pprof
+		// labels so a CPU profile names the GVR, reason and RESTAction.
+		fill := beginContentFill(ctx, contentKey, gvr.String(), ns, isList, fillReason)
+		defer fill.end()
+		fillLabels := fill.pprofLabels()
+		var dispatched []byte
+		var dispatchedOK bool
+		pprof.Do(ctx, fillLabels, func(ctx context.Context) {
+			dispatched, dispatchedOK = dispatchViaInformerFn(
+				cache.WithApistageContentResolve(ctx), call)
+		})
 		if !dispatchedOK {
 			// Not pivot-servable — the content layer cannot serve it.
+			fill.notServable()
 			return nil, false, false
 		}
+		fill.dispatched(dispatched)
 		envelope = dispatched
 		// uaf-scope-waiver: PRE-refilter substrate, same reasoning as cluster_list.go — the raw per-K8s-call envelope, identity-free by key, narrowed only downstream on the way to the requester. Never holds refilter output.
 		// scope-waiver:TTLOverride: apistage identity-free content substrate — sets its OWN data-plane CATALOG_UNSERVABLE TTLOverride CONDITIONALLY on newEntry below (not a keyed literal element); NOT the UAF-cap class (no BindingUID / no per-user refilter output) — uaf_shortttl.go R-d-4 SITE MAP.
@@ -728,7 +745,13 @@ func apistageContentServe(
 		// re-unmarshal. A malformed envelope (parseOK=false) stores
 		// RawJSON only — the gate then takes the unmarshal fallback.
 		if isList {
-			if p, parseOK := parseListEnvelope(gvr, dispatched); parseOK {
+			var p parsedListEnvelope
+			var parseOK bool
+			pprof.Do(ctx, fillLabels, func(context.Context) {
+				p, parseOK = parseListEnvelope(gvr, dispatched)
+			})
+			if parseOK {
+				fill.parsed(len(p.items))
 				newEntry.Items = p.items
 				newEntry.ItemsAPIVersion = p.apiVersion
 				newEntry.ItemsKind = p.kind

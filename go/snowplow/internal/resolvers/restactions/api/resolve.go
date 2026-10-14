@@ -915,7 +915,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// content), and the UAF refilter still runs downstream. Only a
 			// STORED UAF stage is served un-narrowed for the refilter alone.
 			uafContent := apiCall.UserAccessFilter != nil && r.opts.Provenance != ProvenanceCallerSupplied
-			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call, uafContent); ok {
+			// #710 — the owning RESTAction and stage name the content fill.
+			fillCtx := withContentFillOwner(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, id)
+			if gatedVal, served, ok := apistageContentServe(fillCtx, r.apistageStore, call, uafContent); ok {
 				if served {
 					// Ship 0.30.128 P-CORE-2: the gated envelope is
 					// already a decoded structured value — feed it
