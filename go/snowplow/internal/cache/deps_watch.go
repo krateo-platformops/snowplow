@@ -89,6 +89,12 @@ type depWatchCounters struct {
 	addPropagated     atomic.Uint64 // ADD events that passed the gate and were enqueued
 	addNilSyncCh      atomic.Uint64 // ADD events seen with a nil syncCh (O14)
 	eventsSubmitted   atomic.Uint64 // coordinates enqueued (all three handlers)
+	// #688: initial-LIST ADDs delivered after syncCh closed, dropped on
+	// isInInitialList (a subset of addDroppedPreSync); and live ADDs
+	// delivered while syncCh was still open, propagated (a subset of
+	// addPropagated).
+	addInitialListPastSync atomic.Uint64
+	addLivePreSyncCh       atomic.Uint64
 
 	// workerPanics — events whose processing panicked. Each one is a
 	// SINGLE lost action (the worker survives and processes the next
@@ -373,40 +379,109 @@ func (w *depWatch) stopWorker() {
 // All three handlers ENQUEUE THE COORDINATE and return. The only per-type
 // difference left is the ADD pre-sync gate (design §3.4 point 1), which must
 // stay ADD-only and at the handler.
+//
+// This is the plain-func view for callers that drive the handlers directly.
+// It carries no isInInitialList, so its ADD keeps the syncCh gate. The
+// informer registration uses depEventHandler, whose ADD is gated on
+// client-go's isInInitialList (#688).
+func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) clientcache.ResourceEventHandlerFuncs {
+	return rw.depEventHandler(gvr).funcs
+}
+
 // depAddDeliveryHookForTest, when non-nil, runs at the TOP of every dep ADD
-// delivery the informer makes (before any gate), and the func it returns runs
-// when that delivery has been fully handled. TEST-ONLY: production leaves it
-// nil and pays a single atomic load. The #688 arm uses it to hold the
-// handler's initial-LIST replay until the store-level syncCh has closed —
-// the lag client-go's per-handler processorListener can have under load —
-// so the late-replay window is deterministic instead of contention-bound.
+// delivery (before any gate), and the func it returns runs when that delivery
+// has been fully handled. TEST-ONLY: production leaves it nil and pays a
+// single atomic load. The #688 arm uses it to hold the handler's initial-LIST
+// replay until the store-level syncCh has closed (the lag client-go's
+// per-handler processorListener has under load), so the late-replay window
+// is deterministic instead of contention-bound.
 var depAddDeliveryHookForTest atomic.Pointer[func(gvr schema.GroupVersionResource) func()]
 
-func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) clientcache.ResourceEventHandlerFuncs {
+// depEventHandler is the handler set the informer registration installs. It
+// implements clientcache.ResourceEventHandler itself (not through
+// ResourceEventHandlerFuncs, whose OnAdd discards the flag) so the ADD gate
+// sees isInInitialList.
+//
+// #688 — WHY THE FLAG AND NOT ONLY syncCh. syncCh[gvr] closes when the
+// INFORMER's HasSynced flips: the initial LIST has been popped into the
+// store. client-go delivers to each handler through that handler's own
+// processorListener goroutine, so this handler can still be replaying the
+// initial LIST after syncCh has closed; the syncCh gate then reads a replayed
+// ADD as live, which stamps the freshness clock and dirty-marks dependents
+// of an object that did not change, at boot and on every relist. The flag is
+// set per notification by client-go (DeltaFIFO's "not yet synced" at pop
+// time, and true for the replay a handler added to a running informer
+// receives), so it is exact whatever the delivery lag. A relist through
+// RemoveResourceType + EnsureResourceType builds a fresh informer whose LIST
+// is again initial; a reflector relist on a LIVE informer is not initial, so
+// an object that appeared during a watch gap still propagates as an ADD.
+// The same flag already gates #685's RBAC pre-build note
+// (rbacSnapshotHandler.OnAdd, rbac_subgen_epoch.go).
+//
+// The converse window has the same root. syncCh closes on a 50ms poll of
+// HasSynced, so a LIVE ADD the handler receives after the store synced but
+// before the poll closed syncCh was dropped as "pre-sync": a lost
+// dirty-mark, and a freshness clock that never heard the event. With the
+// flag as the gate it propagates.
+//
+// So for informer deliveries the flag alone decides; syncCh is only read to
+// attribute: add_initial_list_past_sync counts replayed ADDs that syncCh
+// would have admitted, add_live_pre_syncch counts live ADDs it would have
+// dropped. Both are delivery timing, not faults. Initial-list drops still
+// count in add_dropped_pre_sync. A plain-func caller (depEventHandlers)
+// carries no flag and keeps the syncCh gate, including O14's nil-syncCh
+// fail-safe.
+type depEventHandler struct {
+	funcs clientcache.ResourceEventHandlerFuncs
+	add   func(obj interface{}, isInInitialList, fromInformer bool)
+}
+
+func (h depEventHandler) OnAdd(obj interface{}, isInInitialList bool) {
+	h.add(obj, isInInitialList, true)
+}
+func (h depEventHandler) OnUpdate(oldObj, newObj interface{}) { h.funcs.OnUpdate(oldObj, newObj) }
+func (h depEventHandler) OnDelete(obj interface{})            { h.funcs.OnDelete(obj) }
+
+func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depEventHandler {
 	w := depWatchSingleton()
 	w.watcher.Store(rw)
 	// Ship 0.30.233 — pre-compute the CRD-meta-GVR predicate once per
 	// handler-set construction, NOT per-event.
 	crdSideEffect := IsCRDGVR(gvr)
-	return clientcache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			if h := depAddDeliveryHookForTest.Load(); h != nil {
-				defer (*h)(gvr)()
-			}
-			if !rw.addEventPostSync(gvr, w) {
+	add := func(obj interface{}, isInInitialList, fromInformer bool) {
+		if h := depAddDeliveryHookForTest.Load(); h != nil {
+			defer (*h)(gvr)()
+		}
+		if fromInformer {
+			// #688 — client-go's flag is the gate. syncCh is read only to
+			// attribute the two windows it used to get wrong.
+			present, closed := rw.syncChState(gvr)
+			if isInInitialList {
 				w.counters.addDroppedPreSync.Add(1)
+				if present && closed {
+					w.counters.addInitialListPastSync.Add(1)
+				}
 				return
 			}
-			ns, name := metaNSName(obj)
-			w.counters.addPropagated.Add(1)
-			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
-			// Ship 0.30.233 — CRD-ADD discovery side-effect, off the informer
-			// processor goroutine. See crd_discovery_side_effect.go.
-			if crdSideEffect {
-				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleAdd)
+			if present && !closed {
+				w.counters.addLivePreSyncCh.Add(1)
 			}
-		},
+		} else if !rw.addEventPostSync(gvr, w) {
+			w.counters.addDroppedPreSync.Add(1)
+			return
+		}
+		ns, name := metaNSName(obj)
+		w.counters.addPropagated.Add(1)
+		rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
+		w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
+		// Ship 0.30.233 — CRD-ADD discovery side-effect, off the informer
+		// processor goroutine. See crd_discovery_side_effect.go.
+		if crdSideEffect {
+			crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleAdd)
+		}
+	}
+	return depEventHandler{add: add, funcs: clientcache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) { add(obj, false, false) },
 		UpdateFunc: func(_, newObj interface{}) {
 			ns, name := metaNSName(newObj)
 			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
@@ -432,7 +507,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleDelete)
 			}
 		},
-	}
+	}}
 }
 
 // probeObjectState is the tri-state probe the dep-event worker derives its
@@ -514,6 +589,23 @@ func (rw *ResourceWatcher) addEventPostSync(gvr schema.GroupVersionResource, w *
 	}
 }
 
+// syncChState reports whether gvr has a syncCh and whether it is closed. No
+// side effect (unlike addEventPostSync, which counts and warns on nil).
+func (rw *ResourceWatcher) syncChState(gvr schema.GroupVersionResource) (present, closed bool) {
+	rw.mu.RLock()
+	ch := rw.syncCh[gvr]
+	rw.mu.RUnlock()
+	if ch == nil {
+		return false, false
+	}
+	select {
+	case <-ch:
+		return true, true
+	default:
+		return true, false
+	}
+}
+
 // DepWatchStats is a read-only snapshot of the bridge counters. Consumed by
 // the resolved_cache.summary log, snowplow_deps (expvar + OTLP) and the
 // falsifier arms.
@@ -522,6 +614,13 @@ type DepWatchStats struct {
 	AddPropagated     uint64
 	AddNilSyncCh      uint64
 	EventsSubmitted   uint64
+	// AddInitialListPastSync (#688) is the subset of AddDroppedPreSync that
+	// syncCh alone would have admitted: initial-LIST replay the handler
+	// received after the store had synced. AddLivePreSyncCh is the subset of
+	// AddPropagated that syncCh alone would have dropped: live ADDs received
+	// before the 50ms poll closed syncCh.
+	AddInitialListPastSync uint64
+	AddLivePreSyncCh       uint64
 
 	// DeleteWorkerPanics is the 1.12.5 H1 signature (kept under its 1.12.5
 	// name — the worker is now the unified dep-event worker): non-zero means
@@ -548,16 +647,18 @@ func DepWatchStatsSnapshot() DepWatchStats {
 		depth = q.Len()
 	}
 	return DepWatchStats{
-		AddDroppedPreSync:    w.counters.addDroppedPreSync.Load(),
-		AddPropagated:        w.counters.addPropagated.Load(),
-		AddNilSyncCh:         w.counters.addNilSyncCh.Load(),
-		EventsSubmitted:      w.counters.eventsSubmitted.Load(),
-		DeleteWorkerPanics:   w.counters.workerPanics.Load(),
-		DeleteQueueDepth:     depth,
-		ProbeExists:          w.counters.probeExists.Load(),
-		ProbeAbsent:          w.counters.probeAbsent.Load(),
-		ProbeUnknown:         w.counters.probeUnknown.Load(),
-		ProbeUnknownDegraded: w.counters.probeUnknownDegraded.Load(),
+		AddDroppedPreSync:      w.counters.addDroppedPreSync.Load(),
+		AddPropagated:          w.counters.addPropagated.Load(),
+		AddNilSyncCh:           w.counters.addNilSyncCh.Load(),
+		EventsSubmitted:        w.counters.eventsSubmitted.Load(),
+		AddInitialListPastSync: w.counters.addInitialListPastSync.Load(),
+		AddLivePreSyncCh:       w.counters.addLivePreSyncCh.Load(),
+		DeleteWorkerPanics:     w.counters.workerPanics.Load(),
+		DeleteQueueDepth:       depth,
+		ProbeExists:            w.counters.probeExists.Load(),
+		ProbeAbsent:            w.counters.probeAbsent.Load(),
+		ProbeUnknown:           w.counters.probeUnknown.Load(),
+		ProbeUnknownDegraded:   w.counters.probeUnknownDegraded.Load(),
 	}
 }
 

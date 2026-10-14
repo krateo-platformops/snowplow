@@ -661,9 +661,10 @@ type ServableGVRStatus struct {
 	// successful relist) and never published.
 	//
 	// LastEventAgeSeconds is the time since the bridge last delivered ANY
-	// POST-SYNC event for this GVR. The stamp sits AFTER the pre-sync gate
-	// (noteInformerEvent runs only when addEventPostSync returns true), so the
-	// initial LIST replay never stamps it.
+	// LIVE event for this GVR. The stamp sits AFTER the ADD gate, which drops
+	// every initial-LIST ADD on client-go's isInInitialList however late the
+	// handler receives it (#688; the old syncCh-only gate let a late replay
+	// stamp it), so the initial LIST replay never stamps it.
 	//
 	// -1 (#249) is NOT a dead-watch signal on its own: it reads identically for
 	// a healthy GVR with nothing to deliver and one whose watch died before

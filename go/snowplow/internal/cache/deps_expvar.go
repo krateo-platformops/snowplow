@@ -155,6 +155,13 @@ func DepsStatsByStat() map[string]int64 {
 		"add_propagated":       int64(w.AddPropagated),
 		"add_dropped_pre_sync": int64(w.AddDroppedPreSync),
 		"add_nil_syncch":       int64(w.AddNilSyncCh),
+		// #688: initial-LIST replay the handler received after syncCh had
+		// closed, dropped on client-go's isInInitialList (a subset of
+		// add_dropped_pre_sync). add_live_pre_syncch: live ADDs received
+		// before the 50ms poll closed syncCh, propagated (a subset of
+		// add_propagated). Non-zero is delivery timing, not a fault.
+		"add_initial_list_past_sync": int64(w.AddInitialListPastSync),
+		"add_live_pre_syncch":        int64(w.AddLivePreSyncCh),
 
 		// --- the informer bridge: the unified dep-event worker (1.12.6 C1) ---
 		// events_submitted_total counts coordinates enqueued by all three

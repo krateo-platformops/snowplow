@@ -136,6 +136,7 @@ func issue688Drain() {
 
 type issue688Reading struct {
 	addPropagated   uint64
+	pastSyncDropped uint64
 	eventsSubmitted uint64
 	dirtyMarks      uint64
 	stamp           int64
@@ -145,6 +146,7 @@ func issue688Read(rw *ResourceWatcher, gvr schema.GroupVersionResource) issue688
 	s := DepWatchStatsSnapshot()
 	return issue688Reading{
 		addPropagated:   s.AddPropagated,
+		pastSyncDropped: s.AddInitialListPastSync,
 		eventsSubmitted: s.EventsSubmitted,
 		dirtyMarks:      Deps().Stats().DirtyMarkTotal,
 		stamp:           rw.lastEventUnixNano(gvr),
@@ -154,7 +156,7 @@ func issue688Read(rw *ResourceWatcher, gvr schema.GroupVersionResource) issue688
 // issue688Watcher builds a watcher over a fake cluster already holding
 // issue688InitialCount objects of gvr. The GVR is NOT registered yet: the arm
 // installs its barrier first, then registers.
-func issue688Watcher(t *testing.T, gvr schema.GroupVersionResource) (*ResourceWatcher, *dynamicfake.FakeDynamicClient) {
+func issue688Watcher(t *testing.T, gvr schema.GroupVersionResource) (*ResourceWatcher, *dynamicfake.FakeDynamicClient, *watchGate) {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	sch := k8sruntime.NewScheme()
@@ -186,7 +188,7 @@ func issue688Watcher(t *testing.T, gvr schema.GroupVersionResource) (*ResourceWa
 		rw.Stop()
 		time.Sleep(50 * time.Millisecond)
 	})
-	return rw, dyn
+	return rw, dyn, gate
 }
 
 func issue688Register(t *testing.T, rw *ResourceWatcher, gvr schema.GroupVersionResource) {
@@ -235,7 +237,7 @@ func issue688Arm(t *testing.T, standalone bool) {
 	store.Put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), Inputs: widgetInputs(gvr, issue688NS, "")})
 	d.RecordList(context.Background(), l1Key, gvr, issue688NS)
 
-	rw, dyn := issue688Watcher(t, gvr)
+	rw, dyn, _ := issue688Watcher(t, gvr)
 	deliveries := installIssue688Barrier(t, rw)
 
 	// --- boot: the initial LIST replay, every delivery held past syncCh ---
@@ -252,6 +254,12 @@ func issue688Arm(t *testing.T, standalone bool) {
 	}
 	if got := after.dirtyMarks - before.dirtyMarks; got != 0 {
 		t.Errorf("#688 boot: %d dirty-marks on dependents of objects that did not change, want 0", got)
+	}
+	// Every replayed ADD reached the post-sync side of syncCh (the barrier
+	// worked) and was dropped on isInInitialList, so the arm exercised the
+	// #688 window rather than passing on the old syncCh gate.
+	if got := after.pastSyncDropped - before.pastSyncDropped; got != issue688InitialCount {
+		t.Errorf("#688 boot: add_initial_list_past_sync moved %d, want %d", got, issue688InitialCount)
 	}
 	if after.stamp != 0 {
 		t.Errorf("#688 boot: freshness clock stamped %s ago with no live event ever delivered, want never (0)",
@@ -299,6 +307,9 @@ func issue688Arm(t *testing.T, standalone bool) {
 	if got := afterRelist.dirtyMarks - beforeRelist.dirtyMarks; got != 0 {
 		t.Errorf("#688 relist: %d dirty-marks from the re-LIST replay, want 0", got)
 	}
+	if got := afterRelist.pastSyncDropped - beforeRelist.pastSyncDropped; got != uint64(relisted) {
+		t.Errorf("#688 relist: add_initial_list_past_sync moved %d, want %d", got, relisted)
+	}
 	if afterRelist.stamp != beforeRelist.stamp {
 		t.Errorf("#688 relist: the re-LIST replay moved the freshness clock (%d → %d); only a live event may", beforeRelist.stamp, afterRelist.stamp)
 	}
@@ -306,4 +317,98 @@ func issue688Arm(t *testing.T, standalone bool) {
 	late := deliveries.late
 	deliveries.mu.Unlock()
 	t.Logf("deliveries held past syncCh: %d (boot %d + live 1 + relist %d)", late, issue688InitialCount, relisted)
+}
+
+// TestIssue688_LiveAddBeforeSyncChClosesIsNotDropped is the converse window
+// of the same root. syncCh closes on a 50ms poll of the informer's
+// HasSynced, so a LIVE ADD the handler receives after the store has synced
+// but before that poll closes syncCh was dropped as "pre-sync": its
+// dependents were never dirty-marked and the freshness clock never heard it.
+// syncChCloseHoldForTest holds the close, making the interval certain.
+func TestIssue688_LiveAddBeforeSyncChClosesIsNotDropped(t *testing.T) {
+	defer withCleanDepWatch(t)()
+	gvr := issue688GVR()
+	ResetNavigationDiscoveredGroupsForTest()
+	t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
+	AddNavigationDiscoveredGroup(gvr.Group)
+
+	store := newResolvedCache(100, 1<<20, time.Hour)
+	d := Deps()
+	d.SetStore(store)
+	const l1Key = "L1_issue688_paragraph_list_live"
+	store.Put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), Inputs: widgetInputs(gvr, issue688NS, "")})
+	d.RecordList(context.Background(), l1Key, gvr, issue688NS)
+
+	rw, dyn, gate := issue688Watcher(t, gvr)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	hold := func() { <-release }
+	syncChCloseHoldForTest.Store(&hold)
+	// A defer, not a t.Cleanup: withCleanDepWatch's deferred stop joins the
+	// watcher's goroutines, including every held sync-watcher, and deferred
+	// calls run before cleanups. This one is deferred later, so it runs
+	// first, on a pass and on a t.Fatalf alike.
+	defer func() {
+		syncChCloseHoldForTest.Store(nil)
+		releaseAll()
+	}()
+
+	before := issue688Read(rw, gvr)
+	beforeStats := DepWatchStatsSnapshot()
+	_, syncCh := rw.EnsureResourceType(gvr)
+	deadline := time.Now().Add(harnessWaitBound)
+	for {
+		rw.mu.RLock()
+		gi := rw.informers[gvr]
+		rw.mu.RUnlock()
+		if gi != nil && gi.Informer().HasSynced() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("store for %s did not sync within %s", gvr, harnessWaitBound)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	gate.wait(t, gvr, harnessWaitBound)
+	issue688Drain() // the initial replay is fully handled before the live ADD
+	afterReplay := issue688Read(rw, gvr)
+
+	createObj(t, rw, dyn, gvr, issue688NS, "p-live-early", "p-live-early")
+	propagated := false
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if DepWatchStatsSnapshot().AddPropagated > afterReplay.addPropagated {
+			propagated = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	issue688Drain()
+	select {
+	case <-syncCh:
+		t.Fatalf("precondition: syncCh closed while held; the arm did not exercise the window")
+	default:
+	}
+	after := issue688Read(rw, gvr)
+	afterStats := DepWatchStatsSnapshot()
+
+	if afterReplay.addPropagated != before.addPropagated || afterReplay.stamp != 0 {
+		t.Errorf("the initial replay propagated %d ADDs / stamped %d, want 0 / 0",
+			afterReplay.addPropagated-before.addPropagated, afterReplay.stamp)
+	}
+	if !propagated {
+		t.Fatalf("#688 converse: a live ADD received after the store synced, before syncCh closed, was dropped as pre-sync (add_dropped_pre_sync %d → %d)",
+			beforeStats.AddDroppedPreSync, afterStats.AddDroppedPreSync)
+	}
+	if got := afterStats.AddLivePreSyncCh - beforeStats.AddLivePreSyncCh; got != 1 {
+		t.Errorf("add_live_pre_syncch moved %d, want 1", got)
+	}
+	if after.stamp == 0 {
+		t.Errorf("the live ADD did not stamp the freshness clock")
+	}
+	if after.dirtyMarks <= afterReplay.dirtyMarks {
+		t.Errorf("the live ADD did not dirty-mark the list dependent (dirty_mark_total %d → %d)", afterReplay.dirtyMarks, after.dirtyMarks)
+	}
+	releaseAll()
 }
