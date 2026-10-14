@@ -171,6 +171,35 @@ func TestACO14_NilSyncChDrops(t *testing.T) {
 	}
 }
 
+// TestACO14_NilSyncChDetectedOnTheInformerPath — O14 on the handler the
+// informer registration actually installs (depEventHandler, #688/#694). The
+// flag gates there, so a nil syncCh no longer drops a live ADD; the
+// detector must still count and WARN, or add_nil_syncch reads 0 by
+// construction and a skipped allocation goes unseen.
+func TestACO14_NilSyncChDetectedOnTheInformerPath(t *testing.T) {
+	cleanup := withCleanDepWatch(t)
+	defer cleanup()
+
+	gvr := gvrCompositions()
+	rw := newGateWatcher()
+	// Deliberately DO NOT populate rw.syncCh[gvr] — it is nil.
+	h := rw.depEventHandler(gvr)
+
+	h.OnAdd(unstructuredObj(gvr, "bench-ns-01", "live"), false)
+	h.OnAdd(unstructuredObj(gvr, "bench-ns-01", "replayed"), true)
+
+	s := DepWatchStatsSnapshot()
+	if s.AddNilSyncCh != 2 {
+		t.Fatalf("AC-O14 informer path: addNilSyncCh=%d want 2 (both ADDs saw nil syncCh)", s.AddNilSyncCh)
+	}
+	if s.AddPropagated != 1 {
+		t.Fatalf("AC-O14 informer path: addPropagated=%d want 1 (the live ADD is gated on the flag, not dropped)", s.AddPropagated)
+	}
+	if s.AddDroppedPreSync != 1 {
+		t.Fatalf("AC-O14 informer path: addDroppedPreSync=%d want 1 (the initial-list ADD)", s.AddDroppedPreSync)
+	}
+}
+
 // --- R3 — DeleteFunc dispatches OnDelete on the worker goroutine -------------
 
 func TestR3_DeleteFuncDispatchesViaWorker(t *testing.T) {

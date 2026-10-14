@@ -1031,7 +1031,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// interface used by metaNSName. ADD post-sync gate, UPDATE
 	// dirty-mark, DELETE classify+evict-via-worker are byte-identical
 	// to the full-informer path.
-	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandlers(gvr)); regErr != nil {
+	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandler(gvr)); regErr != nil {
 		slog.Warn("cache.deps.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
@@ -1559,7 +1559,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// UPDATE complete in O(deps-for-this-tuple); DELETE classification
 	// is likewise cheap and the eviction burst is handed to the R3
 	// worker so it never blocks the processor.
-	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandlers(gvr)); regErr != nil {
+	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandler(gvr)); regErr != nil {
 		slog.Warn("cache.deps.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
@@ -1835,6 +1835,13 @@ func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResour
 	forgetStoreVerification(gvr)
 }
 
+// syncChCloseHoldForTest, when non-nil, runs in waitInformerSync just before
+// it closes a sync channel. TEST-ONLY: production leaves it nil and pays a
+// single atomic load per registration. The #688 live-ADD arm holds the close
+// so that "the store has synced but syncCh is still open" (up to one 50ms
+// poll in production) is certain instead of probable.
+var syncChCloseHoldForTest atomic.Pointer[func()]
+
 // waitInformerSync polls the informer's HasSynced predicate and
 // closes ch when it returns true OR stopCh is closed. Polled at
 // 50ms — same cadence client-go uses internally (cache.WaitForCacheSync
@@ -1848,6 +1855,9 @@ func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResour
 // fall back to the apiserver path).
 func waitInformerSync(hasSynced func() bool, ch chan struct{}, stopCh <-chan struct{}) {
 	defer func() {
+		if h := syncChCloseHoldForTest.Load(); h != nil {
+			(*h)()
+		}
 		select {
 		case <-ch:
 			// Already closed (e.g., constructor's bulk-sync path).
