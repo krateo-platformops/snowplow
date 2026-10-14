@@ -88,6 +88,9 @@ func notifyObjectGone(gvr schema.GroupVersionResource, namespace, name string) {
 	// registered: the set is cache-owned.
 	RecordDeclinedExternalRetired(DeclinedExternalRetiredGone,
 		EngineDeclinedExternalSet().ForgetCoordinate(gvr, namespace, name))
+	// #677 rule (c) — and every refresher known-declined mark that recorded the
+	// coordinate as a definition.
+	forgetRegateDeclinedCoordinate(gvr, namespace, name)
 	goneForgetHooks.mu.Lock()
 	if len(goneForgetHooks.hooks) == 0 {
 		goneForgetHooks.mu.Unlock()

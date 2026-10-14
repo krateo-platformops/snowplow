@@ -121,6 +121,24 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 
 	key := cache.ComputeKey(inputs)
 
+	// #677 — KNOWN-DECLINED consult (refresher only: this function is the
+	// refresher's handler and nothing else calls it). A cell whose last
+	// re-resolve declined ONLY on correct per-identity re-gate denies cannot be
+	// Put until RBAC is republished, its definition changes or is deleted, or a
+	// Put lands; until then re-resolving it is pure waste (~117/min of SA GETs
+	// and full RESTAction resolves for one cohort's ConfigMap on krateo-057).
+	// Returning without a Put ends the dequeue KNOWN-STALE exactly as the
+	// decline did (#547, refresher.settleDequeue), so the cell is served,
+	// counted and revalidated on read under the requester.
+	if regateDeclinedSkip(key) {
+		log.Debug("resolveAndPopulateL1: known-declined (per-identity re-gate deny); skipping the re-resolve",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("handler", inputs.CacheEntryClass),
+		)
+		return nil
+	}
+
 	// #189 — capture the key's generation BEFORE the re-resolve. If a DELETE-
 	// eviction lands during the (possibly long) re-resolve, the tail write below
 	// is refused via PutIfGen rather than resurrecting the pre-delete body. This
@@ -336,6 +354,9 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// overwrite the prior good entry. The sink is request-path-inert:
 	// only the refresher installs it, so a cold dispatch is unaffected.
 	rctx, stageErrSink := cache.WithStageErrorSink(rctx)
+	// #677 — the re-gate-deny sibling of the stage-error sink: bumped at the same
+	// site, for the same item, when a stage error is a per-identity re-gate deny.
+	rctx, regateDenySink := cache.WithRegateDenySink(rctx)
 	// External-no-cache (proposal 2026-06-22) — defense-in-depth. The
 	// refresher only ever re-Puts already-cached keys, and external RAs never
 	// get cached in the first place (the request-path Put-gates decline them),
@@ -355,6 +376,9 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// Inputs never carry HasUAF because the declaration lives on the apiRef'd RA.
 	rctx, uafTouchedSink := cache.WithUAFTouchedSink(rctx)
 
+	// #677 — the RBAC publish sequence BEFORE the resolve: a known-declined mark
+	// records this value, so a publish that lands mid-resolve retires it.
+	rbacGen0 := cache.RBACGen()
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
 		// 1.12.5 / #187 (i) — a self-object 404 is NOT evicted here. It is
@@ -435,6 +459,11 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// WARN once per stale generation: a decline of a cell that is ALREADY
 		// known-stale is DEBUG (the counter carries the rate).
 		suppressed := cache.NoteRefreshDecline(key, "stage_error", false)
+		// #677 — every stage error a correct per-identity re-gate deny, and no
+		// external touch: the decline is deterministic until RBAC, the
+		// definition, a deletion or a Put changes it. Mark it known-declined.
+		regateDeclinedMarkIfAllDenies(key, &inputs, rbacGen0,
+			stageErrSink.Count(), regateDenySink.Count(), extTouchedSink.Count())
 		_, _, alreadyKnownStale := cache.KnownStale(key)
 		declineLevel := slog.LevelWarn
 		if alreadyKnownStale {

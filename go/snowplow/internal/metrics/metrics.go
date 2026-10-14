@@ -1172,7 +1172,58 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerPrewarmPassInstruments(m); err != nil {
 		return err
 	}
+	if err := registerRegateDeclinedInstruments(m); err != nil {
+		return err
+	}
 	return registerSecurityInstruments(m)
+}
+
+// registerRegateDeclinedInstruments hand-wires #677's two detectors onto OTLP
+// (no expvar->OTLP bridge). Each instrument reads the typed accessor its expvar
+// closure reads, so the surfaces cannot diverge. Attributes are closed,
+// code-defined enums only: reason (the retire rules) and outcome {allowed,
+// denied, scope_fallback} — never a GVR, an object name, an identity or a key.
+// Registered only when the cache is on (CFG-1: the expvar keys are published
+// from Disabled()-gated inits).
+func registerRegateDeclinedInstruments(m metric.Meter) error {
+	marks, err := m.Int64ObservableGauge("snowplow_refresher_regate_declined_marks",
+		metric.WithDescription("Refresher cells currently held KNOWN-DECLINED (#677): their last re-resolve declined only on correct per-identity re-gate denies, so the refresher skips them until the RBAC snapshot is republished, their definition (own CR / apiRef RESTAction) changes or is deleted, they are Put, or they are evicted."))
+	if err != nil {
+		return err
+	}
+	set, err := m.Int64ObservableCounter("snowplow_refresher_regate_declined_set_total",
+		metric.WithDescription("Known-declined marks taken by the refresher (#677)."))
+	if err != nil {
+		return err
+	}
+	skip, err := m.Int64ObservableCounter("snowplow_refresher_regate_declined_skip_total",
+		metric.WithDescription("Refresher re-resolves skipped on a held known-declined mark (#677). POSITIVE CONTROL: on a cluster with correctly denied cohorts this must read > 0, or the deterministic re-dial is back."))
+	if err != nil {
+		return err
+	}
+	retired, err := m.Int64ObservableCounter("snowplow_refresher_regate_declined_retired_total",
+		metric.WithDescription("Known-declined marks retired, by reason (closed set): nil_mark, rbac_published (the RBAC snapshot was republished), definition_unreadable, definition_changed, put_unmark (an accepted L1 Put), gone (a definition object was deleted), evicted (the cell left the store). A reason climbing with skip_total staying low names the rule that keeps re-arming the re-dials (#677)."))
+	if err != nil {
+		return err
+	}
+	predial, err := m.Int64ObservableCounter("snowplow_internal_dispatch_predial_total",
+		metric.WithDescription("Branch C per-identity GET-by-name authorizations decided BEFORE the SA dial (#677), by outcome: allowed (dialled), denied (typed re-gate Forbidden, no dial), scope_fallback (empty namespace on a GVR not known to be cluster-scoped: decided after the fetch, as before #677)."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		o.ObserveInt64(marks, cache.RegateDeclinedLen())
+		o.ObserveInt64(set, int64(cache.RegateDeclinedSetTotal()))
+		o.ObserveInt64(skip, int64(cache.RegateDeclinedSkipTotal()))
+		for _, c := range cache.RegateDeclinedRetiredSnapshot() {
+			o.ObserveInt64(retired, int64(c.Count), metric.WithAttributes(attribute.String("reason", c.Reason)))
+		}
+		for _, c := range restactionsapi.PreDialSnapshot() {
+			o.ObserveInt64(predial, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Outcome)))
+		}
+		return nil
+	}, marks, set, skip, retired, predial)
+	return err
 }
 
 // registerPrewarmPassInstruments hand-wires #643's background-pass detectors

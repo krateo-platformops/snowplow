@@ -234,14 +234,28 @@ func filterGetByRBAC(
 	gvr schema.GroupVersionResource,
 	obj *unstructured.Unstructured,
 ) bool {
-	log := xcontext.Logger(ctx)
-
 	if obj == nil {
 		// Defensive: a nil object cannot be vouched for. The GET branch
 		// only reaches here on an indexer HIT (obj non-nil), but the
 		// helper must not trust that invariant blindly — fail closed.
 		return false
 	}
+	return authorizeGetByRBAC(ctx, gvr, obj.GetNamespace(), obj.GetName())
+}
+
+// authorizeGetByRBAC is the ONE `get` evaluation for a single object
+// coordinate (#677). filterGetByRBAC calls it with the fetched object's own
+// namespace/name; branch C's pre-dial step (internal_dispatch.go) calls it
+// with the REF's namespace/name before any SA dial, so both checks share the
+// identity source (xcontext.UserInfo), the verb, the GVR, the snapshot read
+// (rbac.EvaluateRBAC) and every fail-closed path. Same return contract as
+// filterGetByRBAC.
+func authorizeGetByRBAC(
+	ctx context.Context,
+	gvr schema.GroupVersionResource,
+	namespace, name string,
+) bool {
+	log := xcontext.Logger(ctx)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
@@ -251,8 +265,8 @@ func filterGetByRBAC(
 		log.Warn("informer_dispatch.rbac_get_filter.no_identity",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
-			slog.String("namespace", obj.GetNamespace()),
-			slog.String("name", obj.GetName()),
+			slog.String("namespace", namespace),
+			slog.String("name", name),
 			slog.Any("err", err),
 			slog.String("action", "fallthrough_to_apiserver"),
 		)
@@ -271,8 +285,8 @@ func filterGetByRBAC(
 		Verb:      "get",
 		Group:     gvr.Group,
 		Resource:  gvr.Resource,
-		Namespace: obj.GetNamespace(),
-		Name:      obj.GetName(),
+		Namespace: namespace,
+		Name:      name,
 		// Ship L1 (0.30.252): per-item caller discards
 		// matchedBindingUID — skip the CRB/RB stable-sort.
 		SkipBindingUID: true,
@@ -283,8 +297,8 @@ func filterGetByRBAC(
 			slog.String("subsystem", "cache"),
 			slog.String("user", redact.User(user.Username)),
 			slog.String("gvr", gvr.String()),
-			slog.String("namespace", obj.GetNamespace()),
-			slog.String("name", obj.GetName()),
+			slog.String("namespace", namespace),
+			slog.String("name", name),
 			slog.Any("err", err),
 			slog.String("action", "fallthrough_to_apiserver"),
 		)
@@ -298,8 +312,8 @@ func filterGetByRBAC(
 		slog.String("subsystem", "cache"),
 		slog.String("user", redact.User(user.Username)),
 		slog.String("gvr", gvr.String()),
-		slog.String("namespace", obj.GetNamespace()),
-		slog.String("name", obj.GetName()),
+		slog.String("namespace", namespace),
+		slog.String("name", name),
 		slog.Bool("allowed", allowed),
 	)
 	return allowed

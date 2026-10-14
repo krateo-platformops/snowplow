@@ -59,6 +59,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	restactionsapi677 "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -460,8 +461,11 @@ func TestSeed425_DeniedRepresentative_NotCachedForGroup(t *testing.T) {
 				t.Fatalf("PRE: group-only carol must be denied configmaps in ns %s", s425NSAllowed)
 			}
 			cr := s425RA(tc.path)
+			denied0 := s425PreDialDenied()
 			_, cell := s425Seed(t, seedTarget{Groups: []string{s425Group}}, cr, saSrv.URL)
-			if saDials.Load() == 0 {
+			// #677: a denied GET-by-name is now decided BEFORE the SA dial, so
+			// branch C running shows as a pre-dial deny instead of a dial.
+			if saDials.Load() == 0 && s425PreDialDenied() == denied0 {
 				t.Fatalf("PRE (non-vacuity): the seed never fetched through the SA credential (branch C did not run)")
 			}
 			t.Logf("seed: saDials=%d cellStored=%v cellHasSentinel=%v", saDials.Load(), cell != nil, s425Has(cell, s425SentinelY))
@@ -640,10 +644,12 @@ func TestRefresher427_TenantSARepresentative_Narrowed(t *testing.T) {
 		return resolveRestActionForRefresh(ctx, objects.Result{GVR: h1RAGVR, Unstructured: cr.DeepCopy()}, in, s425AuthnNS)
 	})
 	defer restore()
+	denied0 := s425PreDialDenied()
 	if err := resolveAndPopulateL1(context.Background(), *inputs, saEP, saRC); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	if saDials.Load() == 0 {
+	// #677: a denied GET-by-name is decided before the SA dial (see above).
+	if saDials.Load() == 0 && s425PreDialDenied() == denied0 {
 		t.Fatalf("PRE (non-vacuity): the refresh never fetched through the SA credential (branch C did not run)")
 	}
 	if e, ok := cache.ResolvedCache().Get(key); ok && s425Has(e.RawJSON, s425SentinelY) {
@@ -709,4 +715,14 @@ func TestSAIdentity427_FailsClosedWithoutMatchingCredential(t *testing.T) {
 			}
 		}
 	}
+}
+
+// s425PreDialDenied reads branch C's pre-dial deny counter (#677).
+func s425PreDialDenied() uint64 {
+	for _, c := range restactionsapi677.PreDialSnapshot() {
+		if c.Outcome == "denied" {
+			return c.Count
+		}
+	}
+	return 0
 }

@@ -127,7 +127,6 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sdynamic "k8s.io/client-go/dynamic"
@@ -428,6 +427,38 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 
 	// Served path. Two shapes — GET-by-name and LIST (name=="").
 	if name != "" {
+		// #677 — AUTHORIZE BEFORE THE DIAL. A `get` grant depends only on
+		// (identity, verb, GVR, namespace, name), never on the object's
+		// content, so the per-identity verdict is known before the SA client
+		// fetches anything. authorizeGetByRBAC is the SAME evaluation the
+		// post-fetch re-gate below runs (filterGetByRBAC delegates to it), with
+		// the REF's coordinates. A deny returns the same typed Forbidden the
+		// post-fetch deny returns, with NO SA dial: on krateo-057 a correctly
+		// denied cohort re-dialled one ConfigMap ~117/min, fetched only to be
+		// thrown away. The RC1 fall-through is unchanged. A namespaced GVR
+		// whose ref carries no namespace is never authorized cluster-wide here:
+		// it falls back to the post-fetch path (preDialAuthzNamespace).
+		//
+		// INTENDED BEHAVIOUR CHANGE: a denied GET of an object that does NOT
+		// exist is now a 403 instead of the apiserver's 404 — the apiserver's
+		// own authorize-before-lookup order.
+		//
+		// The LIST shape below is unchanged (its narrowing is per item).
+		if !serveUnnarrowed {
+			if preNS, ok := preDialAuthzNamespace(gvr, namespace); ok {
+				if !authorizeGetByRBAC(ctx, gvr, preNS, name) {
+					if internalDispatchRBACSnapshotUnpublished() {
+						// RC1 guard (same as the post-fetch deny below).
+						return nil, false, nil
+					}
+					recordPreDial(preDialDenied)
+					return nil, false, newRegateForbidden(gvr, namespace, name)
+				}
+				recordPreDial(preDialAllowed)
+			} else {
+				recordPreDial(preDialScopeFallback)
+			}
+		}
 		obj, getErr := nri.Get(ctx, name, metav1.GetOptions{})
 		if getErr != nil {
 			return nil, false, getErr
@@ -435,8 +466,10 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// Per-user RBAC re-gate on the GET-by-name (defensive authorization).
 		// obj is already the *unstructured.Unstructured client-go decoded;
 		// filterGetByRBAC evaluates `get` for the ctx identity against the
-		// object's own namespace/name — the SAME helper branch B uses.
-		if !serveUnnarrowed && !filterGetByRBAC(ctx, gvr, obj) {
+		// object's own namespace/name — the SAME helper branch B uses. KEPT
+		// after #677's pre-dial step: it judges the object the apiserver
+		// actually returned, not the ref.
+		if !serveUnnarrowed && !postFetchRegateFn(ctx, gvr, obj) {
 			if internalDispatchRBACSnapshotUnpublished() {
 				// RC1 guard: the deny coincides with an unpublished RBAC
 				// snapshot — fall through to the per-user apiserver path
@@ -448,8 +481,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 			// records it as an internal-rest-config-error, honouring
 			// ContinueOnError). This is the leak fix: a denied per-user read
 			// is no longer served under the SA identity.
-			return nil, false, apierrors.NewForbidden(gvr.GroupResource(), name,
-				fmt.Errorf("user not authorized to get %s/%s", namespace, name))
+			return nil, false, newRegateForbidden(gvr, namespace, name)
 		}
 		raw, mErr := json.Marshal(obj.Object)
 		if mErr != nil {
