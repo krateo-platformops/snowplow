@@ -78,7 +78,8 @@ def assert_no_external_children() -> dict:
 
 
 def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
-             probe_batch: int = 50, hold_probe_wait_s: float = 60) -> dict:
+             probe_batch: int = 50, hold_probe_wait_s: float = 60,
+             login: bool = True) -> dict:
     if scale % namespaces:
         raise ValueError("scale must divide evenly across namespaces")
     per_ns = scale // namespaces
@@ -112,11 +113,18 @@ def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
         raise RuntimeError(f"RBAC apply failed: {err[:300]}")
     proof["rbac_shape"] = rbac_model.identity_classes(model)
 
-    logged_in, _ = lifecycle.create_synthetic_users(
-        1, users, groups_for=functools.partial(rbac_model.user_groups, m=model))
-    proof["users_logged_in"] = logged_in
-    if logged_in < users:
-        raise RuntimeError(f"only {logged_in}/{users} users logged in")
+    count, _ = lifecycle.create_synthetic_users(
+        1, users, groups_for=functools.partial(rbac_model.user_groups, m=model),
+        login=login)
+    if login:
+        proof["users_logged_in"] = count
+        if count < users:
+            raise RuntimeError(f"only {count}/{users} users logged in")
+    else:
+        proof["users_registered"] = count
+        proof["logins"] = "deferred-to-in-cluster-driver"
+        if count < users:
+            raise RuntimeError(f"only {count}/{users} users registered")
 
     rc, _, err = cluster.kubectl(
         "apply", "--server-side", "-f", "-",
@@ -137,6 +145,9 @@ def add_parsers(sub) -> None:
     p.add_argument("--users", type=int, default=1000)
     p.add_argument("--hold-probe-wait-s", type=float, default=60,
                    help="wait after the probe batch before checking the hold")
+    p.add_argument("--no-login", action="store_true",
+                   help="register users only; the in-cluster driver logs them in "
+                        "(in-cluster endpoint mode: authn is not reachable from here)")
     p.add_argument("--out", required=True)
 
     def _run(a):
@@ -144,7 +155,8 @@ def add_parsers(sub) -> None:
         _gke_context_guard()
         proof = generate(scale=a.scale, namespaces=a.namespaces, users=a.users,
                          probe_batch=min(50, a.scale // a.namespaces),
-                         hold_probe_wait_s=a.hold_probe_wait_s)
+                         hold_probe_wait_s=a.hold_probe_wait_s,
+                         login=not a.no_login)
         with open(a.out, "w") as fh:
             json.dump(proof, fh, indent=2, default=str)
         print(json.dumps(proof, indent=2, default=str))

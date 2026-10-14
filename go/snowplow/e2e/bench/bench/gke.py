@@ -352,12 +352,88 @@ def resolve_endpoints(svc_list: dict) -> dict[str, str]:
         for env, pred in _ENDPOINT_SERVICES:
             if env not in found and pred(name):
                 found[env] = f"http://{host}:{ports[0].get('port')}"
-    missing = [env for env, _ in _ENDPOINT_SERVICES if env not in found]
+    missing = [env for env, _ in _ENDPOINT_SERVICES
+               if env not in found and env in REQUIRED_ENDPOINTS]
     if missing:
         raise RuntimeError(
             f"no LoadBalancer endpoint yet for {missing}; wait for the "
             f"Services to get an external IP, then retry")
     return found
+
+
+# Only these are needed by the bench (the HTTP driver and the freshness probe
+# talk to authn + snowplow; FRONTEND_URL is informational).
+REQUIRED_ENDPOINTS = ("SNOWPLOW_URL", "AUTHN_URL")
+
+
+def _svc_for(svc_list: dict, env: str) -> dict | None:
+    pred = dict(_ENDPOINT_SERVICES)[env]
+    for item in svc_list.get("items", []):
+        if pred(item.get("metadata", {}).get("name", "")):
+            return item
+    return None
+
+
+def resolve_incluster(svc_list: dict, namespace: str = "krateo-system") -> dict[str, str]:
+    """In-cluster Service DNS for every endpoint, ports from the Service objects.
+
+    For anything that runs IN the cluster (the load driver and the freshness
+    probe Jobs): needs no external IP at all, so LoadBalancer provisioning
+    (run 5: GCE refused forwarding rules, IN_USE_ADDRESSES quota 14 global)
+    cannot block the bench.
+    """
+    out, missing = {}, []
+    for env, _ in _ENDPOINT_SERVICES:
+        svc = _svc_for(svc_list, env)
+        ports = ((svc or {}).get("spec") or {}).get("ports") or []
+        if not svc or not ports:
+            if env in REQUIRED_ENDPOINTS:
+                missing.append(env)
+            continue
+        name = svc["metadata"]["name"]
+        ns = svc["metadata"].get("namespace") or namespace
+        out[env] = f"http://{name}.{ns}.svc:{ports[0].get('port')}"
+    if missing:
+        raise RuntimeError(f"no Service found for {missing} in {namespace}")
+    return out
+
+
+def lb_progress(svc_list: dict, events: list[dict] | None = None) -> tuple[dict, list[str], list[str]]:
+    """External-mode readiness: (found endpoints, pending lines, fatal lines).
+
+    fatal: a required Service that is NOT type LoadBalancer — it will never
+    get an external IP, so waiting is pointless. pending: LoadBalancer with no
+    ingress yet, annotated with the latest SyncLoadBalancerFailed event.
+    """
+    found, pending, fatal = {}, [], []
+    last_err = {}
+    for e in events or []:
+        io = e.get("involvedObject") or {}
+        if io.get("kind") == "Service" and e.get("reason") == "SyncLoadBalancerFailed":
+            last_err[io.get("name")] = (e.get("message") or "")[-200:]
+    for env, _ in _ENDPOINT_SERVICES:
+        svc = _svc_for(svc_list, env)
+        req = env in REQUIRED_ENDPOINTS
+        if svc is None:
+            (fatal if req else pending).append(f"{env}: no Service")
+            continue
+        name = svc["metadata"]["name"]
+        typ = (svc.get("spec") or {}).get("type", "ClusterIP")
+        ingress = ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+        port = ((svc.get("spec") or {}).get("ports") or [{}])[0].get("port")
+        if ingress and (ingress[0].get("ip") or ingress[0].get("hostname")):
+            found[env] = f"http://{ingress[0].get('ip') or ingress[0].get('hostname')}:{port}"
+        elif typ != "LoadBalancer":
+            if req:
+                fatal.append(f"{env}: Service {name} is type {typ}; it will never get "
+                             f"an external IP (use ENDPOINT_MODE=incluster)")
+        else:
+            msg = f"{env}: Service {name} LoadBalancer pending"
+            if name in last_err:
+                msg += f" (last error: {last_err[name]})"
+            if req:
+                pending.append(msg)
+    return found, pending, fatal
 
 
 # ─── In-cluster dead-man switch ─────────────────────────────────────────────
@@ -562,15 +638,59 @@ def cmd_gke_reap(a) -> int:
 
 
 def cmd_gke_env(a) -> int:
+    """Print the endpoint exports. Mode (stated on stderr AND exported):
+
+    incluster (default)  Service DNS (<svc>.<ns>.svc:<port>) for the in-cluster
+                         Jobs (load driver + freshness probe). No external IP
+                         needed; immediate.
+    external             LoadBalancer IPs, for anything run on the operator's
+                         machine. Bounded wait (--wait-s), progress every
+                         --interval-s with the latest SyncLoadBalancerFailed
+                         reason; a required Service that is not type
+                         LoadBalancer fails at once with a clear message.
+    """
     spec = default_spec(a.name, project=a.project, zone=a.zone)
-    rc, out = execute(["kubectl", f"--kubeconfig={spec.kubeconfig}",
-                       f"--context={kube_context(spec)}", "get", "svc",
-                       "-n", "krateo-system", "-o", "json"], dry_run=False,
-                      log=lambda m: sys.stderr.write(m + "\n"))
-    if rc != 0:
-        return rc
-    for k, v in resolve_endpoints(json.loads(out)).items():
+    err = lambda m: sys.stderr.write(m + "\n")  # noqa: E731
+    base = ["kubectl", f"--kubeconfig={spec.kubeconfig}",
+            f"--context={kube_context(spec)}"]
+
+    def get(*args):
+        rc, out = execute(base + list(args), dry_run=False, log=lambda m: None)
+        if rc != 0:
+            raise RuntimeError(f"kubectl {' '.join(args)} failed (rc={rc})")
+        return json.loads(out or "{}")
+
+    mode = a.mode
+    err(f"[env] endpoint mode: {mode}")
+    try:
+        if mode == "incluster":
+            eps = resolve_incluster(get("get", "svc", "-n", "krateo-system", "-o", "json"))
+        else:
+            deadline = time.monotonic() + a.wait_s
+            while True:
+                svcs = get("get", "svc", "-n", "krateo-system", "-o", "json")
+                try:
+                    events = get("get", "events", "-n", "krateo-system",
+                                 "-o", "json").get("items", [])
+                except RuntimeError:
+                    events = []
+                eps, pending, fatal = lb_progress(svcs, events)
+                if fatal:
+                    raise RuntimeError("; ".join(fatal))
+                if not pending:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"no LoadBalancer IP after {a.wait_s:.0f}s: " + "; ".join(pending))
+                err("[env] waiting for LoadBalancer IPs: " + "; ".join(pending))
+                time.sleep(a.interval_s)
+    except RuntimeError as e:
+        err(f"[env] FAILED ({mode}): {e}")
+        return 3
+    for k, v in eps.items():
+        err(f"[env] {k}={v}")
         print(f"export {k}={v}")
+    print(f"export BENCH_ENDPOINT_MODE={mode}")
     print(f"export KUBECONFIG={spec.kubeconfig}")
     print(f"export BENCH_GKE_CONTEXT={kube_context(spec)}")
     return 0
@@ -607,6 +727,9 @@ def add_parsers(sub) -> None:
     env = sub.add_parser("gke-env", help="#606: print SNOWPLOW_URL/AUTHN_URL/"
                                          "FRONTEND_URL exports for a bench cluster")
     common(env)
+    env.add_argument("--mode", choices=["incluster", "external"], default="incluster")
+    env.add_argument("--wait-s", type=float, default=600)
+    env.add_argument("--interval-s", type=float, default=15)
     env.set_defaults(func=cmd_gke_env)
 
 

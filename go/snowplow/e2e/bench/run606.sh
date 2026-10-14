@@ -61,6 +61,10 @@ CHURN_RATES="${CHURN_RATES:-1 10 50}"
 FRESH_SAMPLES="${FRESH_SAMPLES:-60}"
 FRESH_GAP_S="${FRESH_GAP_S:-5}"
 HOLD_PROBE_WAIT_S="${HOLD_PROBE_WAIT_S:-60}"
+ENDPOINT_MODE="${ENDPOINT_MODE:-incluster}"
+ENDPOINT_WAIT_S="${ENDPOINT_WAIT_S:-600}"
+ENDPOINT_POLL_S="${ENDPOINT_POLL_S:-15}"
+REQUIRED_DEPLOYMENTS="${REQUIRED_DEPLOYMENTS:-snowplow frontend authn}"
 PLATFORM_TIMEOUT_S="${PLATFORM_TIMEOUT_S:-2700}"
 PLATFORM_POLL_S="${PLATFORM_POLL_S:-60}"
 OUT="${OUT:-/tmp/snowplow-runs/606/${RUN_NAME}}"
@@ -205,17 +209,29 @@ s_wait_platform() {
   run python3 -m bench.diag606 wait-installer --kubeconfig "$KCFG" \
       --context "$KCTX" --timeout-s "$PLATFORM_TIMEOUT_S" \
       --interval-s "$PLATFORM_POLL_S"
-  run "${K[@]}" -n krateo-system rollout status deploy/snowplow --timeout=30m
+  # NEVER wait on the umbrella Installer being Ready: on a credential-free
+  # bench it never is (github-provider-kog stays 401, installer#484). Wait on
+  # the specific components the bench uses: their Deployments Available and
+  # their Services present (checked by the env step).
+  run "${K[@]}" -n krateo-system wait --for=condition=Available \
+      $(printf 'deploy/%s ' $REQUIRED_DEPLOYMENTS) --timeout=30m
   # Record WHERE snowplow runs: a pod outside the dedicated pool shares CPU.
   run "${K[@]}" -n krateo-system get pods -l app.kubernetes.io/name=snowplow \
       -o wide | tee -a "$OUT/snowplow-placement.txt" || true
 }
 s_env() {
+  # ENDPOINT_MODE=incluster (default): Service DNS for the in-cluster Jobs —
+  # every step that talks HTTP to snowplow/authn runs in-cluster, so no
+  # external IP is needed (run 5: LBs pending, IN_USE_ADDRESSES quota).
+  # ENDPOINT_MODE=external: LoadBalancer IPs with a bounded, reporting wait.
+  log "endpoint mode: $ENDPOINT_MODE"
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.gke gke-env --name $RUN_NAME > $OUT/env.sh"
-    printf 'export SNOWPLOW_URL=http://dry:8081 AUTHN_URL=http://dry:8082 FRONTEND_URL=http://dry:8080\n' > "$OUT/env.sh"
+    log "DRY: python3 -m bench.gke gke-env --name $RUN_NAME --mode $ENDPOINT_MODE > $OUT/env.sh"
+    printf 'export SNOWPLOW_URL=http://snowplow.krateo-system.svc:8081 AUTHN_URL=http://authn.krateo-system.svc:8082\n' > "$OUT/env.sh"
   else
-    python3 -m bench.gke gke-env --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" > "$OUT/env.sh"
+    python3 -m bench.gke gke-env --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
+        --mode "$ENDPOINT_MODE" --wait-s "$ENDPOINT_WAIT_S" \
+        --interval-s "$ENDPOINT_POLL_S" > "$OUT/env.sh"
   fi
   # shellcheck disable=SC1091
   source "$OUT/env.sh"
@@ -223,9 +239,13 @@ s_env() {
   export KUBECONFIG="$KCFG" BENCH_GKE_CONTEXT="$KCTX" EXPECTED_IMAGE_TAG="$SNOWPLOW_TAG"
 }
 s_data() {
+  # Data stamping is kubectl-only. User LOGINS need authn over HTTP: in
+  # in-cluster mode they are deferred to the in-cluster driver.
+  local login=()
+  [[ "$ENDPOINT_MODE" == "incluster" ]] && login=(--no-login)
   run python3 -m bench data606 --scale "$SCALE" --users "$USERS" \
       --namespaces "$NAMESPACES" --hold-probe-wait-s "$HOLD_PROBE_WAIT_S" \
-      --out "$OUT/data-proof.json"
+      --out "$OUT/data-proof.json" ${login[@]+"${login[@]}"}
 }
 s_reboot() {
   # Cold start at 50K: restart once the data exists, time Ready (#594/#637).
@@ -238,29 +258,25 @@ s_measure() {
   # collect step reads it back with `kubectl logs`. The page roots are the
   # harness's known page widgets; drive's preflight refuses if any is not 200
   # on this portal version.
+  # Both Jobs run IN-CLUSTER on the loadgen pool and reach snowplow/authn by
+  # the endpoints the env step resolved (Service DNS in incluster mode):
+  #   load606   the 1000-user driver;
+  #   fresh606  the list_dep freshness probe, stepping CHURN_RATES (labels
+  #             list_dep@<rate>; the verdict gates at 10/s, reports the rest),
+  #             mutating through the Kubernetes API with its own SA.
+  # shellcheck disable=SC2086
   python3 -m bench.load606_job --users "$USERS" --shards 1 \
       --think-s "$THINK_S" --duration-s "$DRIVE_S" \
       --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" --password "$PW" \
       --page "dashboard=3=/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=pages&name=dashboard-page&namespace=krateo-system" \
       --page "compositions=2=/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=pages&name=compositions-page&namespace=krateo-system" \
+      --fresh-rates $CHURN_RATES --fresh-samples "$FRESH_SAMPLES" \
+      --fresh-gap-s "$FRESH_GAP_S" --fresh-delay-s "$THINK_S" \
+      --namespaces "$NAMESPACES" \
       > "$OUT/loadgen-job.yaml"
   run "${K[@]}" apply -f "$OUT/loadgen-job.yaml"
-  # Let every user's FIRST navigation land before freshness is sampled.
-  run sleep "$THINK_S"
-  # Freshness under load, one churn step at a time, from this machine.
-  local r
-  for r in $CHURN_RATES; do
-    run python3 -m bench.load606 fresh --snowplow-url "$SNOWPLOW_URL" \
-        --authn-url "$AUTHN_URL" --user scaleuser-0001 --password "$PW" \
-        --kubeconfig "$KCFG" --context "$KCTX" --version v1-2-2 \
-        --plural githubscaffoldingwithcompositionpages \
-        --probe-name bench-app-01-01 --churn-rate "$r" \
-        --samples "$FRESH_SAMPLES" --gap-s "$FRESH_GAP_S" \
-        --churn-namespaces "$NAMESPACES" \
-        --out "$OUT/fresh-churn-${r}.jsonl"
-  done
-  run "${K[@]}" -n bench-loadgen wait job/load606 --for=condition=Complete \
-      --timeout="$(( DRIVE_S + 1800 ))s"
+  run "${K[@]}" -n bench-loadgen wait job/load606 job/fresh606 --for=condition=Complete \
+      --timeout="$(( DRIVE_S + 3600 ))s"
 }
 s_collect() {
   local p
@@ -271,12 +287,15 @@ s_collect() {
   for p in $("${K[@]}" -n bench-loadgen get pods -l job-name=load606 -o name); do
     "${K[@]}" -n bench-loadgen logs "$p" > "$OUT/nav-${p#pod/}.jsonl"
   done
+  for p in $("${K[@]}" -n bench-loadgen get pods -l job-name=fresh606 -o name); do
+    "${K[@]}" -n bench-loadgen logs "$p" > "$OUT/fresh-${p#pod/}.jsonl"
+  done
   "${K[@]}" -n krateo-system logs deploy/snowplow --tail=-1 > "$OUT/snowplow.log" || true
   "${K[@]}" top nodes > "$OUT/top-nodes.txt" || true
 }
 s_evaluate() {
   shopt -s nullglob
-  local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-churn-*.jsonl)
+  local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl)
   if [[ "$DRY" == "1" ]]; then log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>}"; return 0; fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.

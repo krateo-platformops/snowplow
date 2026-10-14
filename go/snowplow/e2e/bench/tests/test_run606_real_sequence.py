@@ -84,10 +84,12 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
 
 FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     raw = sys.argv[1:]
-    kc = os.environ.get("KUBECONFIG"); ctx = None; a = []
-    for x in raw:
+    kc = os.environ.get("KUBECONFIG"); ctx = None; a = []; ns = None
+    it = iter(raw)
+    for x in it:
         if x.startswith("--kubeconfig="): kc = x.split("=", 1)[1]
         elif x.startswith("--context="): ctx = x.split("=", 1)[1]
+        elif x in ("-n", "--namespace"): ns = next(it, None)   # anywhere, like kubectl
         else: a.append(x)
     resolved = ctx
     if resolved is None:
@@ -193,9 +195,16 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                         "state": {"waiting": {"reason": "CrashLoopBackOff"}},
                         "lastState": {"terminated": {"reason": "Error", "exitCode": 1}}}]}}])
         if what == "events":
-            items([{"lastTimestamp": "2026-10-14T08:10:00Z", "type": "Warning",
-                    "reason": "BackOff", "involvedObject": {"kind": "Pod", "namespace": "krateo-system", "name": "crash-0"},
-                    "message": "Back-off restarting failed container"}])
+            ev = [{"lastTimestamp": "2026-10-14T08:10:00Z", "type": "Warning",
+                   "reason": "BackOff", "involvedObject": {"kind": "Pod", "namespace": "krateo-system", "name": "crash-0"},
+                   "message": "Back-off restarting failed container"}]
+            if os.environ.get("FAKE_SVC") == "pending":
+                ev.append({"lastTimestamp": "2026-10-14T11:17:53Z", "type": "Warning",
+                           "reason": "SyncLoadBalancerFailed",
+                           "involvedObject": {"kind": "Service", "namespace": "krateo-system", "name": "snowplow"},
+                           "message": "Error syncing load balancer: googleapi: Error 403: QUOTA_EXCEEDED - "
+                                      "Quota 'IN_USE_ADDRESSES' exceeded.  Limit: 14.0 globally."})
+            items(ev)
         if what in ("pvc", "nodes"):
             items([])
     if a[:1] == ["logs"] and "crash-0" in a:
@@ -217,13 +226,28 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print("\\n".join(f"bench-ns-01 bench-app-01-0{i} 1m" for i in range(1, 5)))
             sys.exit(0)
         if what == "svc":
-            def svc(n): return {"metadata": {"name": n}, "spec": {"ports": [{"port": int(port)}]},
-                                "status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}
-            print(json.dumps({"items": [svc("snowplow"), svc("authn"),
-                                        svc("frontend-krateo-frontend")]}))
+            mode = os.environ.get("FAKE_SVC", "lb")     # lb | clusterip | pending
+            ports = {"snowplow": 8081, "authn": 8082, "frontend": 8080}
+            def svc(n):
+                typ = "ClusterIP" if mode == "clusterip" else "LoadBalancer"
+                ing = [{"ip": "127.0.0.1"}] if mode == "lb" else []
+                return {"metadata": {"name": n, "namespace": "krateo-system"},
+                        "spec": {"type": typ, "ports": [{"port": ports[n]}]},
+                        "status": {"loadBalancer": {"ingress": ing}}}
+            print(json.dumps({"items": [svc("snowplow"), svc("authn"), svc("frontend")]}))
             sys.exit(0)
         if what == "pods" and "job-name=load606" in a:
             print("pod/load606-0"); sys.exit(0)
+        if what == "pods" and "job-name=fresh606" in a:
+            print("pod/fresh606-0"); sys.exit(0)
+        sys.exit(0)
+    if a[:1] == ["logs"] and any("fresh606" in x for x in a):
+        print("fresh: starting")                       # stderr-ish noise, skipped
+        for rate in os.environ.get("FAKE_FRESH_RATES", "1 10 50").split():
+            for i in range(2):
+                print(json.dumps({"kind": "fresh", "label": f"list_dep@{rate}",
+                                  "converged": True, "latency_ms": 120 + i,
+                                  "polls": 2, "poll_ms": 100}))
         sys.exit(0)
     if a[:1] == ["logs"] and any("load606" in x for x in a):
         for v in (1, 2):
@@ -374,15 +398,22 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     # the ambient kubeconfig is untouched
     assert hashlib.sha256(ambient.read_bytes()).hexdigest() == before
 
-    # the in-cluster harness steps really ran (data606 + freshness + verdict)
-    assert any(c["tool"] == "kubectl" and c["argv"][-1:] != [] and
-               "snowplow-bench/fresh-marker=" in c["argv"][-1] for c in calls)
+    # the harness steps really ran (data606, both in-cluster Jobs, verdict)
     proof = json.loads((tmp / "out" / "data-proof.json").read_text())
-    assert proof["users_logged_in"] == 2 and proof["compositions"] == 4
+    assert proof["compositions"] == 4
+    assert proof["logins"] == "deferred-to-in-cluster-driver"
     fresh = [json.loads(l) for l in
-             (tmp / "out" / "fresh-churn-1.jsonl").read_text().splitlines()]
-    assert any(r.get("kind") == "fresh" and r.get("converged") for r in fresh)
-    assert (tmp / "out" / "verdict.json").exists()
+             (tmp / "out" / "fresh-fresh606-0.jsonl").read_text().splitlines()
+             if l.startswith("{")]
+    assert {r["label"] for r in fresh} == {"list_dep@1", "list_dep@10", "list_dep@50"}
+    navs = [json.loads(l) for l in
+            (tmp / "out" / "nav-load606-0.jsonl").read_text().splitlines()]
+    assert [n["visit"] for n in navs] == [1, 2]                 # collected from the Job
+    verdict = json.loads((tmp / "out" / "verdict.json").read_text())
+    assert verdict["report"]["navs"] == 2
+    gated = [c["check"] for c in verdict["checks"] if c["check"].startswith("fresh_p95")]
+    assert gated == ["fresh_p95_ms[list_dep@10]"]          # ruling: gate at 10/s
+    assert set(verdict["report"]["fresh_curve_report_only"]) == {"list_dep@1", "list_dep@50"}
 
     # teardown went through the label-checked path and deleted THIS cluster
     gcl = [c["argv"] for c in calls if c["tool"] == "gcloud"]
@@ -393,7 +424,6 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     # the synthetic users' password never reaches a log
     assert SCALEUSER_PASSWORD not in out
     assert SCALEUSER_PASSWORD not in (tmp / "out" / "run.log").read_text()
-    assert "<redacted>" in (tmp / "out" / "run.log").read_text()
 
 
 def test_gke_entrypoint_never_imports_the_context_guard():
@@ -414,8 +444,11 @@ def test_dry_run_log_redacts_password(tmp_path):
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
                        capture_output=True, text=True, timeout=120)
     assert p.returncode == 0, p.stderr
+    # The password is only ever written into the in-cluster Job manifest (a
+    # file), never into a logged command; any log line that did carry it would
+    # be redacted by log(). The property that matters: it is in NO log.
     assert SCALEUSER_PASSWORD not in p.stderr + p.stdout
-    assert "--password <redacted>" in p.stderr
+    assert SCALEUSER_PASSWORD not in (tmp_path / "out" / "run.log").read_text()
 
 
 def test_failure_path_writes_redacted_diagnostics_before_teardown(harness):

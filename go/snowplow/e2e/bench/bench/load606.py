@@ -38,6 +38,7 @@ import concurrent.futures
 import gzip
 import json
 import math
+import os
 import random
 import sys
 import threading
@@ -572,10 +573,26 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     _check("zero_cold_navs.navs_over_cold_bar", over if navs else None, "<=", 0,
            checks)
 
-    for label in sorted({f.get("label", "?") for f in fresh}):
+    # Ruling 2026-10-14: freshness GATES at the 10 events/s churn step; the
+    # other rates (1, 50) are REPORTED as the curve. Labels are
+    # "list_dep@<rate>"; a label without "@" (single-rate run) gates.
+    gate_labels = set(th.get("fresh_gate_labels", ("list_dep@10",)))
+    curve = {}
+    labels = sorted({f.get("label", "?") for f in fresh})
+    rated = [l for l in labels if "@" in l]
+    if rated and not (gate_labels & set(rated)):
+        checks.append({"check": f"fresh_p95_ms[{'/'.join(sorted(gate_labels))}]",
+                       "value": None, "bar": f"<= {th['fresh_p95_ms']}",
+                       "result": "FAIL", "why": "no samples at the gate churn rate"})
+    for label in labels:
         rows = [f for f in fresh if f.get("label") == label]
         lat = [f["latency_ms"] for f in rows if f.get("converged")]
         unconverged = sum(1 for f in rows if not f.get("converged"))
+        if "@" in label and label not in gate_labels:
+            curve[label] = {"samples": len(rows), "unconverged": unconverged,
+                            "p50_ms": pct(lat, 50), "p95_ms": pct(lat, 95),
+                            "max_ms": max(lat) if lat else None}
+            continue
         if unconverged:
             # A sample that never converged is the worst latency there is; it
             # fails the bar rather than leaving the percentile.
@@ -615,6 +632,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         "refresher_queue_depth_last": q[-1] if q else None,
         "server_dirty_to_fresh_p95_ms_max_window": max(p95s) if p95s else None,
         "server_dirty_to_fresh_p95_ms_median_window": pct(p95s, 50),
+        "fresh_curve_report_only": curve,
     }
 
     if any(c["result"] == "FAIL" for c in validity):
@@ -780,39 +798,89 @@ def _cmd_drive(a) -> int:
     return 0
 
 
+_SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+
+def incluster_annotate(group: str, version: str, plural: str, ns: str,
+                       name: str, value: str, *, sa_dir: str = _SA_DIR,
+                       api: str = "https://kubernetes.default.svc",
+                       timeout: float = 30) -> bool:
+    """Merge-patch the freshness annotation through the Kubernetes API using
+    the pod's ServiceAccount (the fresh606 Job). No kubectl, no kubeconfig."""
+    import ssl
+    try:
+        with open(os.path.join(sa_dir, "token")) as fh:
+            tok = fh.read().strip()
+        ctx = ssl.create_default_context(cafile=os.path.join(sa_dir, "ca.crt"))
+        body = json.dumps({"metadata": {"annotations": {FRESH_ANNOTATION: value}}}).encode()
+        req = urllib.request.Request(
+            f"{api}/apis/{group}/{version}/namespaces/{ns}/{plural}/{name}",
+            data=body, method="PATCH",
+            headers={"Authorization": "Bearer " + tok,
+                     "Content-Type": "application/merge-patch+json"})
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            return 200 <= r.status < 300
+    except Exception:  # noqa: BLE001 — a failed mutate is recorded, not raised
+        return False
+
+
 def _cmd_fresh(a) -> int:
-    """Freshness probe, optionally under background churn (operator side)."""
-    if "krateo-057" in a.context:
-        print("refusing: krateo-057 is never a bench target (#606)",
-              file=sys.stderr)
-        return 3
+    """Freshness probe at one or more churn rates (labels list_dep@<rate>).
+
+    --mutator kubectl    operator machine; explicit --kubeconfig/--context.
+    --mutator incluster  inside the fresh606 Job; Kubernetes API via the
+                         pod's ServiceAccount.
+    """
+    if a.mutator == "kubectl":
+        if not a.kubeconfig or not a.context:
+            print("--mutator kubectl needs --kubeconfig and --context", file=sys.stderr)
+            return 2
+        if "krateo-057" in a.context:
+            print("refusing: krateo-057 is never a bench target (#606)", file=sys.stderr)
+            return 3
+
+        def patch(ns, name, value):
+            return kubectl_annotate(a.kubeconfig, a.context, f"{a.plural}.{a.group}",
+                                    ns, name, value)
+    else:
+        def patch(ns, name, value):
+            return incluster_annotate(a.group, a.version, a.plural, ns, name, value)
+
     client = HttpClient(a.snowplow_url)
-    token = login(a.authn_url, a.user, a.password)
-    res = f"{a.plural}.{a.group}"
+    token = None
+    for attempt in range(5):
+        try:
+            token = login(a.authn_url, a.user, a.password)
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"fresh: login attempt {attempt + 1} failed: {e}", file=sys.stderr)
+            time.sleep(2 * (attempt + 1))
+    if token is None:
+        return 2
     sink = _jsonl_sink(a.out)
-    churn = None
-    if a.churn_rate > 0:
-        # The probe object is excluded: churn writes the same annotation key
-        # and would overwrite the probe's marker before it is observed.
-        targets = [(f"bench-ns-{n:02d}", f"{a.name_prefix}{n:02d}-{k:02d}")
-                   for n in range(1, a.churn_namespaces + 1)
-                   for k in range(1, a.churn_per_ns + 1)
-                   if (f"bench-ns-{n:02d}", f"{a.name_prefix}{n:02d}-{k:02d}")
-                   != (a.namespace, a.probe_name)]
-        churn = ChurnDriver(
-            targets, a.churn_rate,
-            lambda t, m: kubectl_annotate(a.kubeconfig, a.context, res, t[0],
-                                          t[1], m)).start()
+    # The probe object is excluded from churn: churn writes the same
+    # annotation key and would overwrite the probe's marker.
+    targets = [(f"bench-ns-{n:02d}", f"{a.name_prefix}{n:02d}-{k:02d}")
+               for n in range(1, a.churn_namespaces + 1)
+               for k in range(1, a.churn_per_ns + 1)
+               if (f"bench-ns-{n:02d}", f"{a.name_prefix}{n:02d}-{k:02d}")
+               != (a.namespace, a.probe_name)]
     path = call_path("templates.krateo.io", "v1", "restactions",
                      FRESH_RA_NAME, a.ra_namespace)
-    freshness_probe(
-        client, token, path,
-        lambda m: kubectl_annotate(a.kubeconfig, a.context, res, a.namespace,
-                                   a.probe_name, m),
-        samples=a.samples, poll_ms=a.poll_ms, gap_s=a.gap_s,
-        label="list_dep", sink=sink)
-    if churn:
-        sink({"kind": "churn", **churn.stop()})
+    rates = a.rates if a.rates else [a.churn_rate]
+    for rate in rates:
+        rate = float(rate)
+        label = f"list_dep@{rate:g}"
+        churn = None
+        if rate > 0:
+            churn = ChurnDriver(targets, rate,
+                                lambda t, m: patch(t[0], t[1], m)).start()
+        freshness_probe(
+            client, token, path, lambda m: patch(a.namespace, a.probe_name, m),
+            samples=a.samples, poll_ms=a.poll_ms, gap_s=a.gap_s,
+            label=label, sink=sink)
+        if churn:
+            sink({"kind": "churn", "label": label, **churn.stop()})
     return 0
 
 
@@ -853,8 +921,11 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--authn-url", required=True)
     f.add_argument("--user", required=True)
     f.add_argument("--password", required=True)
-    f.add_argument("--kubeconfig", required=True)
-    f.add_argument("--context", required=True)
+    f.add_argument("--kubeconfig", default=None)
+    f.add_argument("--context", default=None)
+    f.add_argument("--mutator", choices=["kubectl", "incluster"], default="kubectl")
+    f.add_argument("--rates", nargs="*", default=None,
+                   help="churn rates to step through (overrides --churn-rate)")
     f.add_argument("--group", default="composition.krateo.io")
     f.add_argument("--version", required=True)
     f.add_argument("--plural", required=True)

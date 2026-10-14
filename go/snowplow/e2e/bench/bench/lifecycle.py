@@ -1406,7 +1406,7 @@ def _scaleuser_password():
     return SCALEUSER_PASSWORD
 
 
-def create_synthetic_users(start, end, groups_for=None):
+def create_synthetic_users(start, end, groups_for=None, login=True):
     """Register scale users via authn and login to create clientconfig secrets.
 
     `groups_for(i) -> list[str]` sets user i's authn groups. None keeps the
@@ -1474,6 +1474,12 @@ spec:
             log(f"    Batch {batch_start}-{batch_end} failed: {err[:200]}")
 
     log(f"  Registered {registered}/{total} users")
+    if not login:
+        # #606 in-cluster mode: authn has no address reachable from this
+        # machine; the in-cluster load driver logs every user in itself (and
+        # refuses a partial population). Returns the REGISTERED count.
+        log("  Logins deferred to the in-cluster driver")
+        return registered, {}
     time.sleep(5)
 
     user_tokens = {}

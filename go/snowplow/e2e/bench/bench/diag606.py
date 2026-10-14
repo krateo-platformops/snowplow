@@ -138,6 +138,7 @@ Other files:
                                ready, restarts, waiting, terminated, last_reason, last_exit, image
   events.json                  last 1000 events, oldest first: time,type,reason,object,count,message
   pvcs.json  nodes.json  helm-list.json
+  services.json                namespace, name, type, ports, lb_ingress (empty = LB pending)
   logs/<ns>__<pod>__<container>__{current,previous}.log   last 200 lines, failing pods only
 
 Method notes (learned the hard way; read before changing how the bench installs):
@@ -153,6 +154,12 @@ Method notes (learned the hard way; read before changing how the bench installs)
     no chart-inspector error anywhere, the install still could not converge. Judge
     progress by the Installer CR's Ready.message children and the CR/CD tallies in
     platform-state.json, never by the absence of an error.
+  * The umbrella Installer is NEVER Ready on a credential-free bench (github-provider-kog
+    stays 401 on the private krateo-blueprints registry, installer#484). No bench step
+    waits on it; run606 waits on the snowplow/frontend/authn Deployments instead.
+  * External LoadBalancer IPs are not needed (run 5: IN_USE_ADDRESSES quota, 14 global,
+    left snowplow/frontend LBs pending). The load driver and the freshness probe run
+    in-cluster against Service DNS (ENDPOINT_MODE=incluster, the default).
 """
 
 
@@ -575,6 +582,17 @@ def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
                                      .get("requests") or {}).get("storage")}
                         for p in k.items("pvc", "-A")])
 
+    def services():
+        # run 5: snowplow/frontend LBs were pending (IN_USE_ADDRESSES quota)
+        # and the bundle could only show it through events.
+        w("services.json", [{
+            "namespace": (s.get("metadata") or {}).get("namespace"),
+            "name": (s.get("metadata") or {}).get("name"),
+            "type": (s.get("spec") or {}).get("type"),
+            "ports": [p.get("port") for p in (s.get("spec") or {}).get("ports") or []],
+            "lb_ingress": ((s.get("status") or {}).get("loadBalancer") or {}).get("ingress")}
+            for s in k.items("svc", "-A")])
+
     def nodes():
         w("nodes.json", [{"name": (n.get("metadata") or {}).get("name"),
                           "labels": {kk: vv for kk, vv in ((n.get("metadata") or {}).get("labels") or {}).items()
@@ -604,7 +622,8 @@ def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
     for name, fn in (("readme", readme), ("cds", cds),
                      ("installer", installer_and_leaves),
                      ("focus", focus), ("pods", pods),
-                     ("events", events), ("pvcs", pvcs), ("nodes", nodes),
+                     ("events", events), ("pvcs", pvcs), ("services", services),
+                     ("nodes", nodes),
                      ("helm", helm_list), ("logs", logs)):
         safe(name, fn)
     log(f"[diagnostics] {len(written)} files -> {out_dir}")
