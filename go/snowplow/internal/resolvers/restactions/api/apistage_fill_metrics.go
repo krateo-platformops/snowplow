@@ -26,6 +26,13 @@
 //     content key was already in flight — the herd, measured directly. With
 //     the duplicates, total/(total-duplicate) is parses per in-flight group;
 //   - _bytes_total{reason}     raw envelope bytes the fills produced;
+//   - _joined_total{reason}    (#710 PR-1) readers that JOINED an in-flight
+//     fill of their content key instead of filling (apistage_fill_flight.go);
+//   - _join_refused_total{reason} readers that found a flight but did not join
+//     it because the cell's coordinate moved after the flight started (the
+//     epoch-at-entry rule): they lead the next flight, so they are also fills
+//     and duplicates;
+//   - _join_waiting            gauge: joiners waiting on a flight right now;
 //   - _not_servable_total      fills whose dispatch was not pivot-servable
 //     (no bytes; the caller falls through);
 //   - _inflight, _inflight_bytes            gauges, right now;
@@ -126,6 +133,9 @@ var (
 	contentFillDuplicate   [contentFillReasons]atomic.Uint64
 	contentFillBytes       [contentFillReasons]atomic.Uint64
 	contentFillNotServable atomic.Uint64
+	contentFillJoined      [contentFillReasons]atomic.Uint64
+	contentFillJoinRefused [contentFillReasons]atomic.Uint64
+	contentFillJoinWaiting atomic.Int64
 
 	contentFillInflight          atomic.Int64
 	contentFillInflightBytes     atomic.Int64
@@ -158,6 +168,7 @@ var (
 type ContentFillGVRStats struct {
 	Fills      uint64 `json:"fills"`
 	Duplicates uint64 `json:"duplicates"`
+	Joined     uint64 `json:"joined"`
 	Bytes      uint64 `json:"bytes"`
 	Items      uint64 `json:"items_total"`
 	MaxBytes   uint64 `json:"max_bytes"`
@@ -366,6 +377,20 @@ func (f *contentFill) end() {
 	f.log()
 }
 
+// noteContentFillJoined counts one reader that joined an in-flight fill.
+func noteContentFillJoined(reason contentFillReason, gvr string) {
+	contentFillJoined[reason].Add(1)
+	contentFillMu.Lock()
+	contentFillGVRRow(gvr).Joined++
+	contentFillMu.Unlock()
+}
+
+// noteContentFillJoinRefused counts one reader that found a flight it may not
+// join (the coordinate moved after the flight started).
+func noteContentFillJoinRefused(reason contentFillReason) {
+	contentFillJoinRefused[reason].Add(1)
+}
+
 // contentFillGVRRow returns gvr's row, creating it. Caller holds contentFillMu.
 func contentFillGVRRow(gvr string) *ContentFillGVRStats {
 	g := contentFillByGVRMap[gvr]
@@ -438,6 +463,9 @@ type ContentFillStats struct {
 	Total             map[string]uint64
 	Duplicate         map[string]uint64
 	Bytes             map[string]uint64
+	Joined            map[string]uint64
+	JoinRefused       map[string]uint64
+	JoinWaiting       int64
 	NotServable       uint64
 	Inflight          int64
 	InflightBytes     int64
@@ -455,6 +483,9 @@ func ContentFillStatsSnapshot() ContentFillStats {
 		Total:             make(map[string]uint64, contentFillReasons),
 		Duplicate:         make(map[string]uint64, contentFillReasons),
 		Bytes:             make(map[string]uint64, contentFillReasons),
+		Joined:            make(map[string]uint64, contentFillReasons),
+		JoinRefused:       make(map[string]uint64, contentFillReasons),
+		JoinWaiting:       contentFillJoinWaiting.Load(),
 		NotServable:       contentFillNotServable.Load(),
 		Inflight:          contentFillInflight.Load(),
 		InflightBytes:     contentFillInflightBytes.Load(),
@@ -466,6 +497,8 @@ func ContentFillStatsSnapshot() ContentFillStats {
 		s.Total[r.String()] = contentFillTotal[r].Load()
 		s.Duplicate[r.String()] = contentFillDuplicate[r].Load()
 		s.Bytes[r.String()] = contentFillBytes[r].Load()
+		s.Joined[r.String()] = contentFillJoined[r].Load()
+		s.JoinRefused[r.String()] = contentFillJoinRefused[r].Load()
 	}
 	contentFillMu.Lock()
 	s.ByGVR = make(map[string]ContentFillGVRStats, len(contentFillByGVRMap))
@@ -514,7 +547,10 @@ func ResetContentFillStatsForTest() {
 		contentFillTotal[r].Store(0)
 		contentFillDuplicate[r].Store(0)
 		contentFillBytes[r].Store(0)
+		contentFillJoined[r].Store(0)
+		contentFillJoinRefused[r].Store(0)
 	}
+	contentFillJoinWaiting.Store(0)
 	contentFillNotServable.Store(0)
 	contentFillInflight.Store(0)
 	contentFillInflightBytes.Store(0)
@@ -545,6 +581,22 @@ func AddContentFillForTest(reason string, n, d, b uint64) bool {
 			contentFillTotal[i].Add(n)
 			contentFillDuplicate[i].Add(d)
 			contentFillBytes[i].Add(b)
+			return true
+		}
+	}
+	return false
+}
+
+// AddContentFillJoinForTest moves the single-flight series (#710 PR-1) through
+// their production atomics: j joined and r join-refused readers of reason, and
+// w to the waiting gauge. false: not a reason of the set. Production MUST NOT
+// use it.
+func AddContentFillJoinForTest(reason string, j, r uint64, w int64) bool {
+	for i, name := range contentFillReasonNames {
+		if name == reason {
+			contentFillJoined[i].Add(j)
+			contentFillJoinRefused[i].Add(r)
+			contentFillJoinWaiting.Add(w)
 			return true
 		}
 	}
@@ -582,6 +634,15 @@ func registerContentFillExpvar() {
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_bytes_total", expvar.Func(func() any {
 			return ContentFillStatsSnapshot().Bytes
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_joined_total", expvar.Func(func() any {
+			return ContentFillStatsSnapshot().Joined
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_join_refused_total", expvar.Func(func() any {
+			return ContentFillStatsSnapshot().JoinRefused
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_join_waiting", expvar.Func(func() any {
+			return contentFillJoinWaiting.Load()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_not_servable_total", expvar.Func(func() any {
 			return contentFillNotServable.Load()

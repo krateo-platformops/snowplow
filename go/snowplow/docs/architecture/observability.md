@@ -214,8 +214,11 @@ Defined in `internal/resolvers/restactions/api/apistage_fill_metrics.go`. A **fi
 | expvar | meaning | healthy range |
 |---|---|---|
 | `snowplow_apistage_content_fill_total` | map `reason` → fills started | tracks cold first loads and dirty lists; read it with the duplicates |
-| `snowplow_apistage_content_fill_duplicate_total` | map `reason` → fills started while another fill of the **same** content key was already in flight: the herd, counted directly | ≈0 once fills are coalesced (#710 PR-1). On main, 64 concurrent readers of one known-stale list give 63 |
+| `snowplow_apistage_content_fill_duplicate_total` | map `reason` → fills started while another fill of the **same** content key was already in flight: the herd, counted directly | **= `join_refused_total`** since #710 PR-1 coalesced fills: a duplicate now happens only when the epoch rule refuses a join. Before PR-1, 64 concurrent readers of one known-stale list gave 63; after, 0 |
 | `snowplow_apistage_content_fill_bytes_total` | map `reason` → raw envelope bytes produced | the memory driver; decoded trees are about 10× this |
+| `snowplow_apistage_content_fill_joined_total` (**#710 PR-1**) | map `reason` → readers that **joined** an in-flight fill of their content key instead of filling (single-flight, `apistage_fill_flight.go`) | under a burst, ≈ readers − fills. The share joined / (joined + fills) is the coalescing win |
+| `snowplow_apistage_content_fill_join_refused_total` (**#710 PR-1**) | map `reason` → readers that found an in-flight fill but did **not** join it: the cell's coordinate moved after the flight started (epoch-at-entry rule, so nobody gets a body older than its own fill would). They lead the next flight, so each is also a fill and a duplicate | low; tracks writes to a list during its fill |
+| `snowplow_apistage_content_fill_join_waiting` (**#710 PR-1**) | gauge: readers waiting on an in-flight fill now | transient; returns to 0 |
 | `snowplow_apistage_content_fill_not_servable_total` | `uint64`, fills whose dispatch the informer could not serve (no bytes; the call falls through) | low |
 | `snowplow_apistage_content_fill_inflight` / `_inflight_bytes` | gauges: fills and raw bytes in flight **now**. A fill's bytes are held from the envelope's build to the end of its serve | bounded by the admission ceiling once #710 PR-2 lands |
 | `snowplow_apistage_content_fill_inflight_peak` / `_inflight_bytes_peak` | high-water marks since boot, so a poll cannot miss a burst | the burst's real peak |

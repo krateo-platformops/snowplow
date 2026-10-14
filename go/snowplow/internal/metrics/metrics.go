@@ -1455,6 +1455,21 @@ func registerContentFillInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	joined, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_joined_total",
+		metric.WithDescription("Readers that joined an in-flight content fill of their key instead of filling (single-flight), by reason. #710 PR-1."))
+	if err != nil {
+		return err
+	}
+	joinRefused, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_join_refused_total",
+		metric.WithDescription("Readers that found an in-flight fill of their key but did not join it because the cell's coordinate moved after the flight started (epoch-at-entry rule); they lead the next flight. By reason. #710 PR-1."))
+	if err != nil {
+		return err
+	}
+	joinWaiting, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_join_waiting",
+		metric.WithDescription("Readers waiting on an in-flight content fill now. #710 PR-1."))
+	if err != nil {
+		return err
+	}
 	notServable, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_not_servable_total",
 		metric.WithDescription("Content fills whose dispatch the informer could not serve (no bytes; the call falls through). #710."))
 	if err != nil {
@@ -1487,12 +1502,15 @@ func registerContentFillInstruments(m metric.Meter) error {
 			o.ObserveInt64(total, int64(s.Total[r]), attrs)
 			o.ObserveInt64(dup, int64(s.Duplicate[r]), attrs)
 			o.ObserveInt64(bytesTotal, int64(s.Bytes[r]), attrs)
+			o.ObserveInt64(joined, int64(s.Joined[r]), attrs)
+			o.ObserveInt64(joinRefused, int64(s.JoinRefused[r]), attrs)
 		}
 		o.ObserveInt64(notServable, int64(s.NotServable))
 		o.ObserveInt64(inflight, s.Inflight)
 		o.ObserveInt64(inflightBytes, s.InflightBytes)
+		o.ObserveInt64(joinWaiting, s.JoinWaiting)
 		return nil
-	}, total, dup, bytesTotal, notServable, inflight, inflightBytes)
+	}, total, dup, bytesTotal, joined, joinRefused, joinWaiting, notServable, inflight, inflightBytes)
 	return err
 }
 

@@ -7,11 +7,15 @@
 // §1 predicts for the 50K OOM (every arriving reader re-fills the same list).
 //
 // No dispatch barrier here: the readers arrive as fast as goroutines start,
-// so the counts are what main does under a real burst, not a staged one. The
-// arm asserts only what holds under any interleaving of a release-together
-// burst (duplicates occurred, more than one envelope was in flight at once,
-// and everything was released) and LOGS the peaks: those are the RED numbers
-// PR-1 (single-flight) and PR-2 (admission) must move.
+// so the counts are what the code does under a real burst, not a staged one.
+//
+// PR-0 measured main here (-race): 200 fills, 199 duplicates, 113 envelopes in
+// flight at once (102 MB raw), HeapInuse 25 → 1,089 MiB. PR-1 (single-flight)
+// asserts the herd is gone: no duplicate fill (no event moves the coordinate
+// during the burst, so nobody may refuse a join), one envelope in flight at a
+// time, and every reader joined or hit. More than one fill is allowed only for
+// a reader that missed the cell just before the flight's Put and found no
+// flight just after it — a sequential refill, never a concurrent one.
 package api
 
 import (
@@ -87,20 +91,22 @@ func TestContentFill710_Integration_5KItems200Readers_KnownStaleBurst(t *testing
 	fills := s.Total["known_stale"] + s.Total["absent"]
 	dups := s.Duplicate["known_stale"] + s.Duplicate["absent"]
 	env := envLen.Load()
-	t.Logf("#710 burst (main): %d items, envelope %d B; %d readers in %s → fills=%v duplicates=%v "+
+	joined := s.Joined["known_stale"] + s.Joined["absent"]
+	t.Logf("#710 burst (PR-1): %d items, envelope %d B; %d readers in %s → fills=%v joined=%v duplicates=%v "+
 		"inflight_peak=%d inflight_bytes_peak=%d (%.1f envelopes); HeapInuse %d → peak %d MiB",
-		items, env, readers, elapsed, s.Total, s.Duplicate,
+		items, env, readers, elapsed, s.Total, s.Joined, s.Duplicate,
 		s.InflightPeak, s.InflightBytesPeak, float64(s.InflightBytesPeak)/float64(max(env, 1)),
 		base.HeapInuse>>20, peakHeap.Load()>>20)
 
 	if s.Total["known_stale"] == 0 {
 		t.Fatalf("no reader read the known-stale cell through: fills=%v", s.Total)
 	}
-	if dups == 0 || s.InflightPeak < 2 {
-		t.Fatalf("a release-together burst of %d readers on one known-stale list produced no concurrent duplicate fill "+
-			"(fills=%d duplicates=%d inflight_peak=%d) — the herd the arm exists to measure did not happen", readers, fills, dups, s.InflightPeak)
+	if dups != 0 || s.InflightPeak != 1 || s.InflightBytesPeak != env {
+		t.Fatalf("herd RED: %d readers of one known-stale list → fills=%d duplicates=%d inflight_peak=%d inflight_bytes_peak=%d "+
+			"— concurrent fills of one content key were not coalesced (PR-0 main: 200/199/113 envelopes)",
+			readers, fills, dups, s.InflightPeak, s.InflightBytesPeak)
 	}
-	if s.InflightBytesPeak < 2*env {
-		t.Fatalf("inflight_bytes_peak = %d, want ≥ 2 envelopes (%d B) with %d fills in flight at once", s.InflightBytesPeak, 2*env, s.InflightPeak)
+	if joined == 0 {
+		t.Fatalf("no reader joined the flight (fills=%d) — the burst did not overlap the fill", fills)
 	}
 }

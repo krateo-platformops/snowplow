@@ -1368,6 +1368,18 @@ func containsGVR(gs []schema.GroupVersionResource, g schema.GroupVersionResource
 
 // depMovedSince reports whether dk saw a dep event after seq: its bucket's lastBumpSeq,
 // or the GVR floor when no bucket exists (fix ii, conservative).
+// ContentCoordinateMovedSince reports whether a content cell's own coordinate
+// (gvr, namespace, name; name "" = the LIST) had a dep event after seq — the
+// same "moved" test the #375 Put-check applies, a cold coordinate checked
+// against its GVR floor. #710 PR-1: a reader may join an in-flight content fill
+// that started at seq only when this is false.
+func ContentCoordinateMovedSince(gvr schema.GroupVersionResource, namespace, name string, seq uint64) bool {
+	if name == "" {
+		name = listWildcard
+	}
+	return Deps().depMovedSince(DepKey{GVR: gvr, Namespace: namespace, Name: name}, seq)
+}
+
 func (d *DepTracker) depMovedSince(dk DepKey, seq uint64) bool {
 	if ksI, ok := d.forward.Load(dk); ok {
 		return ksI.(*keySet).lastBumpSeq.Load() > seq

@@ -921,9 +921,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// content), and the UAF refilter still runs downstream. Only a
 			// STORED UAF stage is served un-narrowed for the refilter alone.
 			uafContent := apiCall.UserAccessFilter != nil && r.opts.Provenance != ProvenanceCallerSupplied
-			// #710 — the owning RESTAction and stage name the content fill.
-			fillCtx := withContentFillOwner(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, id)
-			if gatedVal, served, ok := apistageContentServe(fillCtx, r.apistageStore, call, uafContent); ok {
+			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call, uafContent); ok {
 				if served {
 					// Ship 0.30.128 P-CORE-2: the gated envelope is
 					// already a decoded structured value — feed it
@@ -1727,6 +1725,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	if isSA {
 		gctx = cache.WithServiceAccountDial(gctx)
 	}
+	// #710 — the owning RESTAction and stage name a content fill (pprof labels,
+	// by_ra). Once per stage, not per call: a content HIT pays nothing for it.
+	gctx = withContentFillOwner(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, id)
 	g.SetLimit(iterParallelism(r.ctx))
 
 	// Ship 0.30.257 (#313) — per-item error slots (design §2.1 / §3.2).
