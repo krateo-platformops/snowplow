@@ -71,9 +71,12 @@ PREFLIGHT_TIMEOUT_S="${PREFLIGHT_TIMEOUT_S:-300}"
 PREFLIGHT_POLL_S="${PREFLIGHT_POLL_S:-3}"
 SNOWPLOW_POD_SELECTOR="${SNOWPLOW_POD_SELECTOR:-app.kubernetes.io/name=snowplow}"
 TOP_POLL_S="${TOP_POLL_S:-15}"
-# Extra /debug/vars key prefixes mem606 records every sample (e.g. the #710
-# PR-0 fill counters, once they exist). Space-separated; empty by default.
-MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES:-}"
+# Extra /debug/vars key prefixes mem606 records verbatim every sample.
+# Default = the #710 PR-0 fill counters (fill_total/fill_bytes_total by reason,
+# fill_inflight(_bytes), fill_duplicate_total, fill_by_gvr), the resolved cache
+# and the informer dispatch shape — the attribution heap profiles cannot carry.
+# Space-separated; set it to "" to record none.
+MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-snowplow_apistage_content_fill snowplow_resolved_cache snowplow_informer_dispatch_shape}"
 PLATFORM_POLL_S="${PLATFORM_POLL_S:-60}"
 OUT="${OUT:-/tmp/snowplow-runs/606/${RUN_NAME}}"
 

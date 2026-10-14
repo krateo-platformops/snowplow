@@ -1588,6 +1588,8 @@ def mem_sample(client: HttpClient, token: str | None,
         rc = v.get("snowplow_resolved_cache") or {}
         rec["cache_entries"], rec["cache_bytes"] = rc.get("entries"), rc.get("bytes")
         rec["prewarm_complete"] = v.get("snowplow_prewarm_complete")
+        hit, miss = _sum_l1(v.get("snowplow_dispatch_l1_lookups"))
+        rec["l1_lookups"] = (hit + miss) if hit is not None else None
         if extra_prefixes:
             rec["extra"] = {k: v[k] for k in sorted(v) if k.startswith(tuple(extra_prefixes))}
     return rec
@@ -1597,6 +1599,8 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
              interval_s: float = 15.0, profile_every_s: float = 120.0,
              out_dir: str = "/out", sink: Callable[[dict], None] = print,
              extra_prefixes: tuple[str, ...] = (),
+             burst_interval_s: float = 5.0, burst_window_s: float = 60.0,
+             load_min_delta: int = 100,
              clock: Callable[[], float] = time.time,
              sleep: Callable[[float], None] = time.sleep) -> int:
     """The standard run-time memory capture (run 7 → #710): a memstats sample
@@ -1607,6 +1611,12 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
     os.makedirs(out_dir, exist_ok=True)
     token = None
     end = clock() + duration_s
+    # Burst resolution (#710: heap went 0.6 -> 6.35 GB in 16 s, so 15 s
+    # samples see at most one point inside it): sample every burst_interval_s
+    # until the load is seen (L1 lookups +load_min_delta from the first
+    # reading) and for burst_window_s after that, then every interval_s.
+    l1_base = None
+    burst_until = None
     was_ready = False
     last_prof = None
     n = 0
@@ -1620,6 +1630,15 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
         rec["t"] = clock()
         if rec.get("vars_status") == 401:
             token = None
+        l1 = rec.get("l1_lookups")
+        if l1 is not None:
+            if l1_base is None:
+                l1_base = l1
+            elif burst_until is None and l1 - l1_base >= load_min_delta:
+                burst_until = clock() + burst_window_s
+                rec["load_detected"] = True
+        fast = burst_until is None or clock() < burst_until
+        rec["interval_s"] = burst_interval_s if fast else interval_s
         sink(rec)
         ready = rec.get("readyz") == 200
         if ready and token and (not was_ready or last_prof is None
@@ -1635,7 +1654,7 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
                       "bytes": len(r.body), "at": "ready" if not was_ready else "load"})
                 last_prof = clock()
         was_ready = ready
-        sleep(interval_s)
+        sleep(rec["interval_s"])
     with open(os.path.join(out_dir, "done"), "w") as fh:
         fh.write("1")
     return n
