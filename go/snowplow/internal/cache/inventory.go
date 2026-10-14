@@ -27,6 +27,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+
+	"github.com/krateo-platformops/snowplow/internal/apicall"
 )
 
 // restActionGVR is the GroupVersionResource of the RESTAction custom
@@ -249,87 +251,9 @@ func ParseAPIServerPathToGVR(path string) (schema.GroupVersionResource, bool) {
 // Sibling of ParseAPIServerPathToGVR; shares the ${...}-rejection +
 // trailing-slash logic.
 func ParseAPIServerPathToDep(path string) (gvr schema.GroupVersionResource, namespace, name string, ok bool) {
-	// Strip query string.
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
-	// Strip trailing slash.
-	path = strings.TrimRight(path, "/")
-
-	// Reject paths with unresolved JQ template fragments.
-	if strings.Contains(path, "${") {
-		return schema.GroupVersionResource{}, "", "", false
-	}
-
-	switch {
-	case strings.HasPrefix(path, "/api/"):
-		// /api/<version>/<resource>[/...]
-		rest := strings.TrimPrefix(path, "/api/")
-		parts := strings.Split(rest, "/")
-		if len(parts) < 2 {
-			return schema.GroupVersionResource{}, "", "", false
-		}
-		version := parts[0]
-		// Namespaced form: /api/v1/namespaces/<ns>/<resource>[/<name>[/<subresource>...]]
-		if parts[1] == "namespaces" && len(parts) >= 4 {
-			ns := parts[2]
-			resource := parts[3]
-			objName := ""
-			if len(parts) >= 5 {
-				objName = parts[4]
-			}
-			return schema.GroupVersionResource{
-				Version:  version,
-				Resource: resource,
-			}, ns, objName, true
-		}
-		// Cluster-scoped form: /api/v1/<resource>[/<name>[/<subresource>...]]
-		resource := parts[1]
-		objName := ""
-		if len(parts) >= 3 {
-			objName = parts[2]
-		}
-		return schema.GroupVersionResource{
-			Version:  version,
-			Resource: resource,
-		}, "", objName, true
-
-	case strings.HasPrefix(path, "/apis/"):
-		// /apis/<group>/<version>/<resource>[/...]
-		// or:  /apis/<group>/<version>/namespaces/<ns>/<resource>[/...]
-		rest := strings.TrimPrefix(path, "/apis/")
-		parts := strings.Split(rest, "/")
-		if len(parts) < 3 {
-			return schema.GroupVersionResource{}, "", "", false
-		}
-		group := parts[0]
-		version := parts[1]
-		if parts[2] == "namespaces" && len(parts) >= 5 {
-			ns := parts[3]
-			resource := parts[4]
-			objName := ""
-			if len(parts) >= 6 {
-				objName = parts[5]
-			}
-			return schema.GroupVersionResource{
-				Group:    group,
-				Version:  version,
-				Resource: resource,
-			}, ns, objName, true
-		}
-		resource := parts[2]
-		objName := ""
-		if len(parts) >= 4 {
-			objName = parts[3]
-		}
-		return schema.GroupVersionResource{
-			Group:    group,
-			Version:  version,
-			Resource: resource,
-		}, "", objName, true
-	}
-
-	return schema.GroupVersionResource{}, "", "", false
+	// The single definition lives in internal/apicall, so the jqinterest
+	// analysis (#603) reads the same shape the resolver serves (#683).
+	return apicall.ParsePath(path)
 }
 
 // ParseAPIServerDiscoveryPath recognises a BARE group-discovery

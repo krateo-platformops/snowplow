@@ -28,6 +28,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/krateo-platformops/snowplow/internal/apicall"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
@@ -35,32 +36,23 @@ const (
 	listQueryOutcomeInProcess   = "in_process"
 	listQueryOutcomeFallthrough = "fallthrough"
 
-	listQueryReasonSelector                  = "selector"
-	listQueryReasonMalformed                 = "malformed_query"
-	listQueryReasonQueryOnGet                = "query_on_get"
-	listQueryReasonRepeatedParam             = "repeated_param"
-	listQueryReasonPagination                = "pagination"
-	listQueryReasonResourceVersion           = "resource_version"
-	listQueryReasonWatch                     = "watch"
-	listQueryReasonUnknownParam              = "unknown_param"
-	listQueryReasonInvalidSelector           = "invalid_selector"
-	listQueryReasonUnsupportedField          = "unsupported_field"
-	listQueryReasonNamespaceFieldClusterPath = "namespace_field_cluster_path"
+	listQueryReasonSelector                  = apicall.ReasonSelector
+	listQueryReasonMalformed                 = apicall.ReasonMalformed
+	listQueryReasonQueryOnGet                = apicall.ReasonQueryOnGet
+	listQueryReasonRepeatedParam             = apicall.ReasonRepeatedParam
+	listQueryReasonPagination                = apicall.ReasonPagination
+	listQueryReasonResourceVersion           = apicall.ReasonResourceVersion
+	listQueryReasonWatch                     = apicall.ReasonWatch
+	listQueryReasonUnknownParam              = apicall.ReasonUnknownParam
+	listQueryReasonInvalidSelector           = apicall.ReasonInvalidSelector
+	listQueryReasonUnsupportedField          = apicall.ReasonUnsupportedField
+	listQueryReasonNamespaceFieldClusterPath = apicall.ReasonNamespaceFieldClusterPath
 )
 
 // listQueryFallthroughReasons is the closed fall-through reason set.
-var listQueryFallthroughReasons = []string{
-	listQueryReasonMalformed,
-	listQueryReasonQueryOnGet,
-	listQueryReasonRepeatedParam,
-	listQueryReasonPagination,
-	listQueryReasonResourceVersion,
-	listQueryReasonWatch,
-	listQueryReasonUnknownParam,
-	listQueryReasonInvalidSelector,
-	listQueryReasonUnsupportedField,
-	listQueryReasonNamespaceFieldClusterPath,
-}
+// It is defined once, in internal/apicall, next to the classifier that emits
+// these reasons.
+var listQueryFallthroughReasons = apicall.FallthroughReasons()
 
 var (
 	listQueryInProcess   atomic.Uint64
