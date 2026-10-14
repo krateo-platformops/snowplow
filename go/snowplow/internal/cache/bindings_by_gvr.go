@@ -430,13 +430,15 @@ func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
 	// until the deferral is recorded, then runs it.
 	snap := rbacSnap.Load()
 
-	// #682 — the FIRST false→true transition of built rotates every
-	// per-identity key once if an RBAC event landed between the first publish
-	// and this build (rbac_subgen_epoch.go). Later rebuilds never do: built
-	// never returns to false outside tests.
-	if !idx.built {
-		defer rotateIfRBACEventSeenPreBuild()
-	}
+	// #682: the FIRST false→true transition of built rotates every
+	// per-identity key once, if an RBAC event landed between the first
+	// publish and this build (rbac_subgen_epoch.go). Registered below, on the
+	// REAL build path only. A build DEFERRED over a nil snapshot (#686) is
+	// not a transition: built stays false, and the note must survive until
+	// the real first build (buildPendingBindingsIndex) consumes it. Rotating
+	// at each deferral was a per-pass global rotation (reviewer-small, #689
+	// gate on main 57e48a5e: #685's E3 RED 20/20).
+	wasBuilt := idx.built
 
 	// Reset to a clean state (idempotent rebuild).
 	idx.byGVR = map[groupResource]map[bindingID]struct{}{}
@@ -467,6 +469,9 @@ func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
 		return 0
 	}
 	idx.pendingNavigated = nil
+	if !wasBuilt {
+		defer rotateIfRBACEventSeenPreBuild() // runs before the Unlock (LIFO)
+	}
 
 	enrolled := 0
 	for _, crb := range snap.ClusterRoleBindings {

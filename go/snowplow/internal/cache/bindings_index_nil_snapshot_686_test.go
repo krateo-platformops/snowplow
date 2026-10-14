@@ -88,6 +88,40 @@ func TestIssue686_BindingsIndexBuildOnNilSnapshotIsDeferred(t *testing.T) {
 	}
 }
 
+// TestIssue686_DeferredFirstBuildRotatesTheEpochExactlyOnce reconciles #686
+// with #685 (#682's one-shot boot-window rotation). A pre-build RBAC edit
+// whose note is taken while the snapshot is still nil (the publish seq is
+// stamped before rbacSnap.Store) must rotate the epoch exactly once: at the
+// REAL first build (the deferred one), never at a deferral, never again
+// later. Rotating at the deferral turned #685's E3 into a per-pass global
+// rotation (reviewer-small, #689 gate on main 57e48a5e).
+func TestIssue686_DeferredFirstBuildRotatesTheEpochExactlyOnce(t *testing.T) {
+	reset682(t)
+	rbacSnap.Store(nil) // the window: publish seq stamped, snapshot not stored yet
+	BumpRBACGenForTest()
+	roleHandler682.OnUpdate(role682(noRule682), role682(cmRule682)) // a pre-build edit: the note
+	nav := []schema.GroupVersionResource{{Group: "", Version: "v1", Resource: "configmaps"}}
+	for i := 0; i < 3; i++ {
+		BuildBindingsByGVRIndex(nav) // deferred: no snapshot
+		if got := RBACSubGenEpoch(); got != 0 {
+			t.Fatalf("deferral %d rotated the epoch to %d: a deferral is not the first build", i, got)
+		}
+	}
+	rbacSnap.Store(&RBACSnapshot{})
+	buildPendingBindingsIndex() // the first publish runs the deferred build
+	if !BindingsByGVRIndexBuilt() {
+		t.Fatal("the deferred build did not run at the first publish")
+	}
+	if got := RBACSubGenEpoch(); got != 1 {
+		t.Fatalf("epoch=%d after the deferred first build, want exactly 1 (#682 boot-window rotation)", got)
+	}
+	BuildBindingsByGVRIndex(nav)
+	buildPendingBindingsIndex()
+	if got := RBACSubGenEpoch(); got != 1 {
+		t.Fatalf("epoch=%d after a later rebuild, want 1: later builds never rotate", got)
+	}
+}
+
 // TestIssue686_GVRDiscoveredWhileDeferredIsNotLost is reviewer-small's
 // falsifier from the #689 gate. A GVR discovered (AddNavigatedGVR) while the
 // index build is DEFERRED must survive the deferred build. That build resets
