@@ -240,8 +240,18 @@ func TestContentFill710_AbsentFillCountsBytesAndItemsAndAHitMovesNothing(t *test
 	if !ok {
 		t.Fatalf("by_gvr has no row for %s: %v", r1FsaGVR, s.ByGVR)
 	}
-	if g != (ContentFillGVRStats{Fills: 1, Bytes: want, Items: n, MaxBytes: want, MaxItems: n}) {
+	if g.Fills != 1 || g.Duplicates != 0 || g.Bytes != want || g.Items != n || g.MaxBytes != want || g.MaxItems != n {
 		t.Fatalf("by_gvr[%s] = %+v, want fills=1 bytes=%d items=%d", r1FsaGVR, g, want, n)
+	}
+	// One timed fill: the histogram, the GVR's EWMA (seeded by its first
+	// sample) and max all hold that one duration.
+	if s.Duration.Count != 1 || s.Duration.Buckets[len(s.Duration.Buckets)-1] != 1 ||
+		g.DurationMSEWMA != float64(s.Duration.MaxMS) || g.DurationMSMax != s.Duration.MaxMS {
+		t.Fatalf("duration: histogram %+v, by_gvr ewma=%v max=%d — want one sample everywhere", s.Duration, g.DurationMSEWMA, g.DurationMSMax)
+	}
+	// A direct serve carries no owning RESTAction.
+	if ra := s.ByRA[contentFillUnattributedRA]; ra != (ContentFillRAStats{Fills: 1, Bytes: want, MaxItems: n}) || len(s.ByRA) != 1 {
+		t.Fatalf("by_ra = %+v, want one %s row {fills=1 bytes=%d max_items=%d}", s.ByRA, contentFillUnattributedRA, want, n)
 	}
 
 	// A second read is a content HIT: no fill.
@@ -360,6 +370,12 @@ func TestContentFill710_KnownStaleHerd_64Readers_63Duplicates(t *testing.T) {
 	if g := s.ByGVR[r1FsaGVR.String()]; g.Fills != readers || g.Duplicates != readers-1 {
 		t.Fatalf("by_gvr = %+v, want fills=%d duplicates=%d", g, readers, readers-1)
 	}
+	if ra := s.ByRA[contentFillUnattributedRA]; ra.Fills != readers || ra.Duplicates != readers-1 {
+		t.Fatalf("by_ra = %+v, want fills=%d duplicates=%d", s.ByRA, readers, readers-1)
+	}
+	if s.Duration.Count != readers {
+		t.Fatalf("fill_duration_ms count = %d, want one sample per fill (%d)", s.Duration.Count, readers)
+	}
 	fill710RequireIdle(t, s)
 	t.Logf("#710 baseline: %d readers → fills=%d duplicates=%d inflight_peak=%d inflight_bytes_peak=%d (envelope %d B)",
 		readers, s.Total["known_stale"], s.Duplicate["known_stale"], s.InflightPeak, s.InflightBytesPeak, envLen.Load())
@@ -394,8 +410,13 @@ func TestContentFill710_DispatchCarriesPprofLabelsAndResolveThreadsTheRA(t *test
 			t.Fatalf("pprof label %s = %q, want %q (all: %v)", k, got[k], v, got)
 		}
 	}
-	if s := ContentFillStatsSnapshot(); s.Total["absent"] != 1 {
+	s := ContentFillStatsSnapshot()
+	if s.Total["absent"] != 1 {
 		t.Fatalf("the Resolve did not go through the fill: %v", s.Total)
+	}
+	// "which RA" on /debug/vars, not only in a profile.
+	if ra := s.ByRA["default/f1-widget-restaction"]; ra.Fills != 1 || ra.Bytes == 0 || len(s.ByRA) != 1 {
+		t.Fatalf("by_ra = %+v, want one default/f1-widget-restaction row with fills=1 and bytes", s.ByRA)
 	}
 }
 
@@ -410,7 +431,7 @@ func TestContentFill710_LogLineIsRateLimitedAndCarriesNoIdentityOrObjectName(t *
 	var buf bytes.Buffer
 	var bufMu sync.Mutex
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&lockedWriter{w: &buf, mu: &bufMu}, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&lockedWriter{w: &buf, mu: &bufMu}, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	getCall := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
@@ -428,10 +449,12 @@ func TestContentFill710_LogLineIsRateLimitedAndCarriesNoIdentityOrObjectName(t *
 	out := buf.String()
 	bufMu.Unlock()
 	var lines []map[string]any
+	var raw []string
 	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
 		var m map[string]any
 		if json.Unmarshal([]byte(l), &m) == nil && m["msg"] == "apistage.content_fill" {
 			lines = append(lines, m)
+			raw = append(raw, l)
 		}
 	}
 	if len(lines) != 1 {
@@ -448,11 +471,32 @@ func TestContentFill710_LogLineIsRateLimitedAndCarriesNoIdentityOrObjectName(t *
 			t.Fatalf("log line lacks %s: %v", k, l)
 		}
 	}
-	if strings.Contains(out, r1User) || strings.Contains(out, "fsa-00001") {
-		t.Fatalf("the fill log names the requester or the object:\n%s", out)
+	if strings.Contains(raw[0], r1User) || strings.Contains(raw[0], "fsa-00001") {
+		t.Fatalf("the fill log names the requester or the object:\n%s", raw[0])
 	}
 	if got := contentFillLogSuppressed.Load(); got != 1 {
 		t.Fatalf("suppressed = %d after the second fill, want 1", got)
+	}
+
+	// Above Debug (the chart's LOG_LEVEL=warn) the line is not built at all:
+	// no line, and nothing counted as suppressed.
+	buf2 := &bytes.Buffer{}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&lockedWriter{w: buf2, mu: &bufMu}, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	contentFillLogLast.Store(0)
+	contentFillLogSuppressed.Store(0)
+	for _, obj := range []string{"fsa-00002", "fsa-00000"} {
+		c := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
+			Path: "/apis/composition.krateo.io/v1/namespaces/" + r1Ns + "/fullstackapps/" + obj,
+			Verb: ptr.To(http.MethodGet),
+		}}
+		if _, _, ok := apistageContentServe(ctx, store, c, false); !ok {
+			t.Fatalf("read of %s not content-servable", c.Path)
+		}
+	}
+	bufMu.Lock()
+	defer bufMu.Unlock()
+	if strings.Contains(buf2.String(), "apistage.content_fill") || contentFillLogSuppressed.Load() != 0 {
+		t.Fatalf("at warn level the fill logged or counted a suppression: %q suppressed=%d", buf2.String(), contentFillLogSuppressed.Load())
 	}
 }
 
@@ -520,5 +564,19 @@ func TestContentFill710_ExpvarKeysReadTheLiveCounters(t *testing.T) {
 	row, _ := read("snowplow_apistage_content_fill_by_gvr").(map[string]any)[r1FsaGVR.String()].(map[string]any)
 	if row["fills"] != float64(1) || row["items_total"] != float64(2) || row["bytes"] != bytesAbsent {
 		t.Fatalf("snowplow_apistage_content_fill_by_gvr[%s] = %v", r1FsaGVR, row)
+	}
+	for _, k := range []string{"duration_ms_ewma", "duration_ms_max"} {
+		if _, ok := row[k]; !ok {
+			t.Fatalf("snowplow_apistage_content_fill_by_gvr row lacks %s: %v", k, row)
+		}
+	}
+	raRow, _ := read("snowplow_apistage_content_fill_by_ra").(map[string]any)[contentFillUnattributedRA].(map[string]any)
+	if raRow["fills"] != float64(1) || raRow["bytes"] != bytesAbsent || raRow["max_items"] != float64(2) {
+		t.Fatalf("snowplow_apistage_content_fill_by_ra[%s] = %v", contentFillUnattributedRA, raRow)
+	}
+	dur, _ := read("snowplow_apistage_content_fill_duration_ms").(map[string]any)
+	buckets, _ := dur["buckets"].(map[string]any)
+	if dur["count"] != float64(1) || buckets["le_inf"] != float64(1) || len(buckets) != len(ContentFillDurationBoundsMS)+1 {
+		t.Fatalf("snowplow_apistage_content_fill_duration_ms = %v, want count=1 over %d cumulative buckets", dur, len(ContentFillDurationBoundsMS)+1)
 	}
 }

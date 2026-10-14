@@ -800,6 +800,8 @@ func apistageContentServe(
 				slog.String("effect", "#189 DELETE-eviction during resolve — not resurrecting; request still served from the fresh resolve, cache fill skipped"),
 			)
 		}
+		// #710 — the fill's duration: dispatch start to parse + Put done.
+		fill.done()
 	}
 
 	// Step 3 — the per-user RBAC gate (skipped on the F2 prewarm path).
