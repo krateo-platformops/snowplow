@@ -56,6 +56,32 @@ type DeclinedExternalMark struct {
 	// Served are the cached L1 cells the resolve read inputs from, with their
 	// Put identity (served_cell.go). The deps they cover are judged by them.
 	Served []ServedCell
+
+	// #643 PR-B2 — the discovery walk's facts. The walk resolve is also the
+	// DISCOVERY step, so its mark records the walk's output (the node's child
+	// refs) for the walk to REPLAY on a skip, and the walked widget's own
+	// uid + resourceVersion, which the walk compares against the live widget it
+	// re-reads on every walk (a resourcesRefs / resourcesRefsTemplate edit must
+	// retire the mark, or a changed child set would be replayed stale).
+	//
+	// WalkRecorded is false on a mark no walk took (the seed's): the walk
+	// cannot replay it and resolves instead. WalkErrored records a resolve that
+	// errored on a LEAF widget (it declares no children): the replay is the
+	// error path — no populate, no children, no descent.
+	WalkRecorded          bool
+	WalkErrored           bool
+	WalkChildren          []WalkChildRef
+	WidgetUID             string
+	WidgetResourceVersion string
+}
+
+// WalkChildRef is one recorded status.resourcesRefs.items[] child of a walked
+// widget — the fields the walk's descent reads.
+type WalkChildRef struct {
+	ID      string
+	Path    string
+	Verb    string
+	Allowed bool
 }
 
 // SecretVersion is one endpointRef Secret's name and resourceVersion.
@@ -105,6 +131,9 @@ const (
 	DeclinedExternalRetiredPutUnmark             = "put_unmark"
 	DeclinedExternalRetiredGone                  = "gone"
 	DeclinedExternalRetiredConfigRedrive         = "config_redrive"
+	// DeclinedExternalRetiredWidgetChanged — #643 PR-B2: the walked widget's
+	// uid or resourceVersion differs from the one its walk mark recorded.
+	DeclinedExternalRetiredWidgetChanged = "widget_changed"
 )
 
 // DeclinedExternalRetiredReasons is the closed reason set, in emit order.
@@ -119,6 +148,7 @@ var DeclinedExternalRetiredReasons = []string{
 	DeclinedExternalRetiredPutUnmark,
 	DeclinedExternalRetiredGone,
 	DeclinedExternalRetiredConfigRedrive,
+	DeclinedExternalRetiredWidgetChanged,
 }
 
 var (

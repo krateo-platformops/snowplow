@@ -230,7 +230,8 @@ func NewSeedDeclinedExternalSet() *SeedDeclinedExternalSet {
 }
 
 // WithSeedDeclinedExternalSet returns a child context carrying set. Installed
-// ONLY by the prewarm engine's processScope, on every scope kind (#643) — a user
+// ONLY by the prewarm engine's processScope, on every scope kind (#643), and by
+// the pre-engine phase1 boot walk (#643 PR-B2, resolveNavigationRoot) — a user
 // /call and the refresher never install one, so the set is a strict no-op on the
 // request path (C-F4B-3's request half, I-6). Inert under Disabled(): returns
 // ctx unchanged so a cache-off process carries no set.

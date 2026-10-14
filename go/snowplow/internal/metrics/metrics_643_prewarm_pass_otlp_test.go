@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
@@ -77,12 +78,21 @@ func TestIssue643_PrewarmPassDetectorsReachOTLP(t *testing.T) {
 func TestIssue643_ExternalFetchCountersReachOTLP(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	before := flatten(collectViaRealCallback(t, "deadbeef"))
+	// #643 PR-B2 — each series carries {origin, driver}; the {origin} reading is
+	// the sum over that origin's driver series.
 	read := func(all []point, name, origin string) int64 {
-		v, ok := find643(all, name, map[string]string{"origin": origin})
-		if !ok {
+		var sum int64
+		n := 0
+		for _, p := range pointsFor(all, name) {
+			if p.attrs["origin"] == origin {
+				sum += p.value
+				n++
+			}
+		}
+		if n == 0 {
 			t.Fatalf("no %s{origin=%s} series — metrics.go wiring missing (cells are pre-populated)", name, origin)
 		}
-		return v
+		return sum
 	}
 	bgF, rqF := read(before, "snowplow_external_fetch_total", "background"), read(before, "snowplow_external_fetch_total", "request")
 	bgA, rqA := read(before, "snowplow_external_fetch_abandoned_total", "background"), read(before, "snowplow_external_fetch_abandoned_total", "request")
@@ -103,5 +113,68 @@ func TestIssue643_ExternalFetchCountersReachOTLP(t *testing.T) {
 	}
 	if got := read(all, "snowplow_external_fetch_abandoned_total", "request") - rqA; got != 1 {
 		t.Errorf("external_fetch_abandoned_total{request} delta = %d; want 1", got)
+	}
+}
+
+// TestIssue643_PRB2_ExternalFetchDriverReachesOTLP — #643 PR-B2 W5 OTLP arm:
+// every closed driver cell is a series before any fetch (a 0 is a reading),
+// each carries the origin it rolls up to, and a fetch under one driver moves
+// exactly that series on both counters.
+func TestIssue643_PRB2_ExternalFetchDriverReachesOTLP(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	wantOrigin := func(d string) string {
+		if d == cache.RefDenialOriginServe {
+			return "request"
+		}
+		return "background"
+	}
+	before := flatten(collectViaRealCallback(t, "deadbeef"))
+	for _, name := range []string{"snowplow_external_fetch_total", "snowplow_external_fetch_abandoned_total"} {
+		for _, d := range cache.RefDenialOrigins {
+			if _, ok := find643(before, name, map[string]string{"origin": wantOrigin(d), "driver": d}); !ok {
+				t.Fatalf("no %s{origin=%s,driver=%s} series before any fetch — every closed driver cell must be pre-populated",
+					name, wantOrigin(d), d)
+			}
+		}
+		if got := len(pointsFor(before, name)); got != len(cache.RefDenialOrigins) {
+			t.Fatalf("%s has %d series, want exactly %d (one per closed driver)", name, got, len(cache.RefDenialOrigins))
+		}
+	}
+	for _, d := range cache.RefDenialOrigins {
+		restactionsapi.RecordExternalFetchDriverForTest(d)
+		after := flatten(collectViaRealCallback(t, "deadbeef"))
+		for _, name := range []string{"snowplow_external_fetch_total", "snowplow_external_fetch_abandoned_total"} {
+			for _, e := range cache.RefDenialOrigins {
+				b, _ := find643(before, name, map[string]string{"origin": wantOrigin(e), "driver": e})
+				a, _ := find643(after, name, map[string]string{"origin": wantOrigin(e), "driver": e})
+				want := int64(0)
+				if e == d {
+					want = 1
+				}
+				if a-b != want {
+					t.Errorf("a fetch under driver=%s moved %s{driver=%s} by %d, want %d", d, name, e, a-b, want)
+				}
+			}
+		}
+		before = after
+	}
+}
+
+// TestIssue643_PRB2_WalkCountersReachOTLP — the walk positive control and the
+// unmarkable counter are OTLP series (hand-wired; no expvar bridge).
+func TestIssue643_PRB2_WalkCountersReachOTLP(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	all := flatten(collectViaRealCallback(t, "deadbeef"))
+	for _, name := range []string{"snowplow_prewarm_walk_skip_declined_external_total", "snowplow_prewarm_walk_errored_unmarkable_total"} {
+		v, ok := find643(all, name, map[string]string{})
+		if !ok {
+			t.Fatalf("no %s series — metrics.go wiring missing", name)
+		}
+		if want := map[string]uint64{
+			"snowplow_prewarm_walk_skip_declined_external_total": dispatchers.WalkSkipDeclinedExternalTotal(),
+			"snowplow_prewarm_walk_errored_unmarkable_total":     dispatchers.WalkErroredUnmarkableTotal(),
+		}[name]; uint64(v) != want {
+			t.Fatalf("%s = %d on OTLP, %d in process", name, v, want)
+		}
 	}
 }

@@ -29,15 +29,18 @@ package dispatchers
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	corev1 "k8s.io/api/core/v1"
@@ -72,6 +75,17 @@ type h643Endpoint struct {
 	mu    sync.Mutex
 	dials map[string]int
 	stall time.Duration // applied to every path containing "/slow/"
+	// discovery (#643 PR-B2): also answer as the apiserver for the widget
+	// GVR's discovery and its CRD, so the REAL widgets.Resolve the discovery
+	// walk calls can run its CRD-status validation hermetically. Off for the
+	// PR-A..C arms, which never walk.
+	discovery atomic.Bool
+	// stringRows (#643 PR-B2 ruling (c) arms): answer /ext/ rows with a STRING
+	// value instead of the default number — the external DATA that decides
+	// whether a widget's widgetDataTemplate output validates (the 057
+	// float-into-string shape), so a walk resolve errors or succeeds with no
+	// change to the widget.
+	stringRows atomic.Bool
 }
 
 // total counts the EXTERNAL dials (paths under /ext/). The same server also
@@ -107,6 +121,14 @@ func newH643Endpoint(t *testing.T) *h643Endpoint {
 		h.dials[r.URL.Path]++
 		stall := h.stall
 		h.mu.Unlock()
+		if h.discovery.Load() && h643ServeDiscovery(w, r.URL.Path) {
+			return
+		}
+		if h.stringRows.Load() && strings.HasPrefix(r.URL.Path, "/ext/") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"rows":[{"v":"ok"}],"path":"` + r.URL.Path + `"}`))
+			return
+		}
 		if stall > 0 && strings.Contains(r.URL.Path, "/slow/") {
 			select {
 			case <-time.After(stall):
@@ -133,6 +155,15 @@ type h643Opts struct {
 	// things seeds n objects of h643ThingsGVR (an internal list an iterator
 	// stage can range over), readable by every cohort.
 	things int
+	// objs are extra raw objects (#643 PR-B2: the walk's widget tree and its
+	// RESTActions). Unlike extra they are NOT pre-harvested: the discovery
+	// walk is what finds them.
+	objs []*unstructured.Unstructured
+	// typed are extra typed objects (an RBAC binding for the walk's SA).
+	typed []runtime.Object
+	// walk turns on the endpoint's discovery + CRD answers (h643ServeDiscovery)
+	// and resets the process-wide plural store / CRD-schema memo around the arm.
+	walk bool
 }
 
 // h643Extra is one hand-built (widget, RESTAction) unit.
@@ -206,9 +237,81 @@ func h643Widget(name, raName string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": h643WidgetGVR.Group + "/" + h643WidgetGVR.Version,
 		"kind":       "Panel",
-		"metadata":   map[string]any{"name": name, "namespace": h643NS},
-		"spec":       map[string]any{"apiRef": map[string]any{"name": raName, "namespace": h643NS}},
+		"metadata":   map[string]any{"name": name, "namespace": h643NS, "uid": "uid-" + name, "resourceVersion": "1"},
+		"spec": map[string]any{
+			"apiRef": map[string]any{"name": raName, "namespace": h643NS},
+			// The CRD-status validation the walk's REAL widgets.Resolve runs
+			// (h643ServeDiscovery) needs a widgetData; the seed's seam ignores it.
+			"widgetData": map[string]any{"title": name},
+		},
 	}}
+}
+
+// h643ServeDiscovery answers the discovery + CRD requests the real
+// widgets.Resolve makes (KindForGVR for a child ref, GVRFor + the CRD GET for
+// the status validation) for the panels GVR. Reports whether it answered.
+func h643ServeDiscovery(w http.ResponseWriter, path string) bool {
+	g, v := h643WidgetGVR.Group, h643WidgetGVR.Version
+	writeJSON := func(obj any) bool {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(obj)
+		return true
+	}
+	gvd := func(g, v string) metav1.GroupVersionForDiscovery {
+		return metav1.GroupVersionForDiscovery{GroupVersion: g + "/" + v, Version: v}
+	}
+	switch path {
+	case "/api":
+		return writeJSON(&metav1.APIVersions{TypeMeta: metav1.TypeMeta{Kind: "APIVersions"}, Versions: []string{"v1"}})
+	case "/api/v1":
+		return writeJSON(&metav1.APIResourceList{TypeMeta: metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"}, GroupVersion: "v1"})
+	case "/apis":
+		return writeJSON(&metav1.APIGroupList{
+			TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
+			Groups: []metav1.APIGroup{
+				{Name: g, Versions: []metav1.GroupVersionForDiscovery{gvd(g, v)}, PreferredVersion: gvd(g, v)},
+				{Name: "apiextensions.k8s.io", Versions: []metav1.GroupVersionForDiscovery{gvd("apiextensions.k8s.io", "v1")},
+					PreferredVersion: gvd("apiextensions.k8s.io", "v1")},
+			},
+		})
+	case "/apis/" + g + "/" + v:
+		return writeJSON(&metav1.APIResourceList{
+			TypeMeta: metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"}, GroupVersion: g + "/" + v,
+			APIResources: []metav1.APIResource{{Name: h643WidgetGVR.Resource, SingularName: "panel", Namespaced: true,
+				Kind: "Panel", Verbs: metav1.Verbs{"get", "list", "watch"}}},
+		})
+	case "/apis/apiextensions.k8s.io/v1":
+		return writeJSON(&metav1.APIResourceList{
+			TypeMeta: metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"}, GroupVersion: "apiextensions.k8s.io/v1",
+			APIResources: []metav1.APIResource{{Name: "customresourcedefinitions", SingularName: "customresourcedefinition",
+				Kind: "CustomResourceDefinition", Verbs: metav1.Verbs{"get", "list", "watch"}}},
+		})
+	case "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/" + h643WidgetGVR.Resource + "." + g:
+		return writeJSON(map[string]any{
+			"apiVersion": "apiextensions.k8s.io/v1",
+			"kind":       "CustomResourceDefinition",
+			"metadata":   map[string]any{"name": h643WidgetGVR.Resource + "." + g},
+			"spec": map[string]any{
+				"group": g,
+				"names": map[string]any{"kind": "Panel", "plural": h643WidgetGVR.Resource, "singular": "panel"},
+				"scope": "Namespaced",
+				"versions": []any{map[string]any{
+					"name": v, "served": true, "storage": true,
+					"schema": map[string]any{"openAPIV3Schema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{"spec": map[string]any{
+							"type": "object",
+							"properties": map[string]any{"widgetData": map[string]any{
+								"type":       "object",
+								"properties": map[string]any{"title": map[string]any{"type": "string"}},
+							}},
+						}},
+					}},
+				}},
+			},
+		})
+	}
+	return false
 }
 
 // h643Setup builds the fixture. Arms that use it reassign package vars, so they
@@ -238,6 +341,13 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 	t.Cleanup(resetPrewarmPassStatsForTest)
 
 	env := &h643Env{t: t, ep: newH643Endpoint(t), external: map[string]bool{}}
+	if o.walk {
+		env.ep.discovery.Store(true)
+		cache.ResetPluralsStoreForTest()
+		t.Cleanup(cache.ResetPluralsStoreForTest)
+		crdschema.InvalidateCRDSchemaMemo()
+		t.Cleanup(crdschema.InvalidateCRDSchemaMemo)
+	}
 
 	crbGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}
 	crGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}
@@ -294,6 +404,10 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 		navHarv.harvestNavWidget(w, h643WidgetGVR, -1, -1, -1, -1)
 		env.external[h643NS+"/"+x.widget] = x.external
 	}
+	for _, obj := range o.objs {
+		objs = append(objs, obj)
+	}
+	objs = append(objs, o.typed...)
 	for i := 0; i < o.things; i++ {
 		objs = append(objs, h643Thing("thing-"+itoaLine(i)))
 	}

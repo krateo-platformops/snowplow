@@ -576,13 +576,16 @@ func TestF4bLeverA_EveryScopeKindCarriesTheEngineSet(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────────
 // ARM (grep, C-F4B-3's request half / I-6) — the ONLY WithSeedDeclinedExternalSet
-// install in prod dispatcher code is processScope's (prewarm_engine.go), which
-// every engine scope kind passes through. No /call dispatch path and no
-// refresher path installs one, so a request can never skip a resolve on the
-// marker's account.
+// installs in prod dispatcher code are processScope's (prewarm_engine.go), which
+// every engine scope kind passes through, and — #643 PR-B2 architect ruling (b)
+// — resolveNavigationRoot's (phase1_walk.go), the pre-engine phase1 boot walk,
+// a prewarm ROOT. No /call dispatch path and no refresher path installs one, so
+// a request can never skip a resolve on the marker's account.
 func TestF4bLeverA_NoInstallOnRequestPath(t *testing.T) {
-	// Every prod .go in the package: WithSeedDeclinedExternalSet must appear ONLY
-	// in prewarm_engine.go (processScope).
+	allowed := map[string]string{
+		"prewarm_engine.go": "func (e *prewarmEngine) processScope(",
+		"phase1_walk.go":    "func resolveNavigationRoot(",
+	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("readdir: %v", err)
@@ -603,12 +606,24 @@ func TestF4bLeverA_NoInstallOnRequestPath(t *testing.T) {
 			continue
 		}
 		installSites += n
-		if name != "prewarm_engine.go" {
-			t.Fatalf("I-6 VIOLATED: cache.WithSeedDeclinedExternalSet install found in %s — the set must be installed ONLY by the engine's processScope (prewarm_engine.go), never on a /call or refresher path", name)
+		fn, ok := allowed[name]
+		if !ok || n != 1 {
+			t.Fatalf("I-6 VIOLATED: cache.WithSeedDeclinedExternalSet install found in %s (%d) — the set must be installed ONLY by the engine's processScope (prewarm_engine.go) and the phase1 boot walk root (phase1_walk.go resolveNavigationRoot), never on a /call or refresher path", name, n)
+		}
+		i := strings.Index(s, fn)
+		if i < 0 {
+			t.Fatalf("I-6 guard: %s no longer defines %s — move the allowlist entry", name, fn)
+		}
+		body := s[i:]
+		if j := strings.Index(body[1:], "\nfunc "); j >= 0 {
+			body = body[:j+1]
+		}
+		if !strings.Contains(body, "cache.WithSeedDeclinedExternalSet(") {
+			t.Fatalf("I-6 VIOLATED: the install in %s is outside %s", name, fn)
 		}
 	}
-	if installSites != 1 {
-		t.Fatalf("expected exactly ONE WithSeedDeclinedExternalSet install site (processScope); found %d", installSites)
+	if installSites != 2 {
+		t.Fatalf("expected exactly TWO WithSeedDeclinedExternalSet install sites (processScope, resolveNavigationRoot); found %d", installSites)
 	}
 }
 
