@@ -238,6 +238,10 @@ type resolveRun struct {
 	// caller-supplied (inline) resolve.
 	outcomes      *StageOutcomes
 	pipTimingSink *cache.PIPStageTimingSink // nil on the request path (PIP-seed-only)
+	// failure (#709) is the first stage, in topological order, that failed
+	// without continueOnError. Written only by the orchestrator goroutine
+	// between stages (runStage after g.Wait), never by a worker.
+	failure *StageFailure
 }
 
 // newResolveRun builds the per-call resolveRun. user is already resolved by
@@ -358,7 +362,9 @@ func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string
 	r.stageErrSink.Bump(id, bumpMsg)
 	r.outcomes.fail(id, stageReasonOf(accumVal))
 	if itemErr != nil {
-		itemErrs[i] = itemErr
+		// #709 — keep the status this item recorded, so a resolve whose
+		// RESTAction filter cannot produce a value reports it (stage_failure.go).
+		itemErrs[i] = newStageItemFailure(id, accumVal, itemErr)
 	}
 }
 
@@ -1833,6 +1839,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		r.log.Debug("api stage had per-item errors (continuing)",
 			slog.String("name", id), slog.Any("err", joined))
 	}
+	if r.failure == nil {
+		r.failure = firstStageFailure(itemErrs, sc.calls)
+	}
 
 	// Ship 0.30.235 — the pre-0.30.235 post-g.Wait()
 	// applyUserAccessFilter call was DELETED; UAF now runs per-worker
@@ -1855,15 +1864,26 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 }
 
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
+	dict, _ := ResolveWithFailure(ctx, opts)
+	return dict
+}
+
+// ResolveWithFailure is Resolve plus the first stage, in topological order,
+// that failed WITHOUT continueOnError (#709): its name and the upstream status
+// it recorded, or nil. The dict is exactly what Resolve returns — the failed
+// stage's error is still under its errorKey and later stages still ran
+// (#313 C-A). The failure is for the caller to report when the RESTAction's
+// output cannot be produced; restactions.Resolve is that caller.
+func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]any, *StageFailure) {
 	if len(opts.Items) == 0 {
-		return map[string]any{}
+		return map[string]any{}, nil
 	}
 
 	if opts.RC == nil {
 		var err error
 		opts.RC, err = inClusterConfigFn()
 		if err != nil {
-			return map[string]any{}
+			return map[string]any{}, nil
 		}
 	}
 
@@ -1882,14 +1902,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		log.Error("unable to fetch user info from context", slog.Any("err", err))
-		return map[string]any{}
+		return map[string]any{}, nil
 	}
 
 	// Sort API by Depends
 	names, err := topologicalSort(opts.Items)
 	if err != nil {
 		log.Error("unable to sorted api by deps", slog.Any("error", err))
-		return map[string]any{}
+		return map[string]any{}, nil
 	}
 	log.Debug("sorted api by deps", slog.Any("names", names))
 
@@ -1924,7 +1944,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			// A truncating exit: this stage failed (its own item errors, if
 			// any, already carry a more specific reason).
 			r.outcomes.fail(id, StageReasonError)
-			return r.dict
+			// #709 — a truncating exit is a failure of this stage whatever its
+			// continueOnError says. Reported by class only: the endpoint error
+			// can name the requester's clientconfig Secret, so its text stays
+			// in the log line runStage already wrote. A caller cancellation is
+			// not a stage failure.
+			if r.failure == nil && r.ctx.Err() == nil {
+				r.failure = &StageFailure{Stage: id, Code: http.StatusInternalServerError,
+					Reason: string(response.StatusReasonInternalError), Message: "the stage could not be executed"}
+			}
+			return r.dict, r.failure
 		}
 	}
 
@@ -1942,7 +1971,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// per-serve O(nodes) full-tree traversal (perf win).
 	//delete(dict, "slice")
 
-	return r.dict
+	return r.dict, r.failure
 }
 
 // discoverGroupResourcesFn is the package-private indirection over
