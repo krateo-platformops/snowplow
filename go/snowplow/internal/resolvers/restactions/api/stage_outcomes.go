@@ -161,16 +161,18 @@ func (s *StageOutcomes) HeaderValue() string {
 
 // stageReasonOf maps an accumulated per-item error value to a reason code.
 // Only machine fields are read (reason / code); the message never leaves.
+//
+// #714 — the CODE decides, not a reason: a recorded reason can be an
+// upstream's claim (a 500 calling itself "Forbidden"). The one reason read is
+// StageNotExecuted, which only snowplow writes (the #443 dry-run refusal, which
+// has no code).
 func stageReasonOf(v any) string {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return StageReasonError
 	}
-	if r, _ := m["reason"].(string); r != "" {
-		switch r {
-		case StageReasonNotExecuted, StageReasonForbidden, StageReasonNotFound, StageReasonUnauthorized:
-			return r
-		}
+	if r, _ := m["reason"].(string); r == StageReasonNotExecuted {
+		return r
 	}
 	switch code := toInt(m["code"]); code {
 	case 401:
