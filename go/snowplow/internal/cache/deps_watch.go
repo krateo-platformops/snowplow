@@ -428,9 +428,10 @@ var depAddDeliveryHookForTest atomic.Pointer[func(gvr schema.GroupVersionResourc
 // attribute: add_initial_list_past_sync counts replayed ADDs that syncCh
 // would have admitted, add_live_pre_syncch counts live ADDs it would have
 // dropped. Both are delivery timing, not faults. Initial-list drops still
-// count in add_dropped_pre_sync. A plain-func caller (depEventHandlers)
-// carries no flag and keeps the syncCh gate, including O14's nil-syncCh
-// fail-safe.
+// count in add_dropped_pre_sync. A nil syncCh on this path is still counted
+// in add_nil_syncch with the one-shot WARN (O14 detection), but no longer
+// gates. A plain-func caller (depEventHandlers) carries no flag and keeps
+// the syncCh gate, including O14's nil-syncCh fail-safe drop.
 type depEventHandler struct {
 	funcs clientcache.ResourceEventHandlerFuncs
 	add   func(obj interface{}, isInInitialList, fromInformer bool)
@@ -456,6 +457,14 @@ func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depE
 			// #688 — client-go's flag is the gate. syncCh is read only to
 			// attribute the two windows it used to get wrong.
 			present, closed := rw.syncChState(gvr)
+			if !present {
+				// O14 detection only: the flag gates, so the ADD is not
+				// dropped for a missing syncCh, but the missing allocation
+				// is still a registration defect worth surfacing.
+				w.noteNilSyncCh(gvr, "informer ADD with a nil syncCh — a registration path bypassed the syncCh "+
+					"allocation (or the event outlived its GVR's teardown). The ADD is gated on isInInitialList "+
+					"and is not affected; the registration is the defect.")
+			}
 			if isInInitialList {
 				w.counters.addDroppedPreSync.Add(1)
 				if present && closed {
@@ -561,6 +570,22 @@ func (rw *ResourceWatcher) probeObjectState(gvr schema.GroupVersionResource, nam
 //	select { case <-syncCh: <closed→post-sync> default: <open→pre-sync> }
 //
 // idiom — a closed channel always selects, an open one never does.
+// noteNilSyncCh is O14's detector: count, and WARN once per process. A
+// registered GVR always has a syncCh, so a nil one at ADD time means a
+// registration path skipped the allocation (or the event outlived its
+// GVR's teardown). Shared by both ADD paths so the detector is live on the
+// path production registers, not only on the plain-func view (#694 review).
+func (w *depWatch) noteNilSyncCh(gvr schema.GroupVersionResource, hint string) {
+	w.counters.addNilSyncCh.Add(1)
+	if w.nilSyncWarned.CompareAndSwap(false, true) {
+		slog.Warn("deps.add_nil_syncch",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("hint", hint),
+		)
+	}
+}
+
 func (rw *ResourceWatcher) addEventPostSync(gvr schema.GroupVersionResource, w *depWatch) bool {
 	rw.mu.RLock()
 	ch := rw.syncCh[gvr]
@@ -569,15 +594,8 @@ func (rw *ResourceWatcher) addEventPostSync(gvr schema.GroupVersionResource, w *
 	if ch == nil {
 		// O14: nil syncCh — a registration path skipped the allocation.
 		// Fail safe: drop (never propagate, never block). One-shot WARN.
-		w.counters.addNilSyncCh.Add(1)
-		if w.nilSyncWarned.CompareAndSwap(false, true) {
-			slog.Warn("deps.add_nil_syncch",
-				slog.String("subsystem", "cache"),
-				slog.String("gvr", gvr.String()),
-				slog.String("hint", "AddFunc fired with a nil syncCh — treating ADD as pre-sync (drop). "+
-					"A registration path bypassed the syncCh allocation; dep dirty-marks for this GVR are degraded to TTL."),
-			)
-		}
+		w.noteNilSyncCh(gvr, "AddFunc fired with a nil syncCh — treating ADD as pre-sync (drop). "+
+			"A registration path bypassed the syncCh allocation; dep dirty-marks for this GVR are degraded to TTL.")
 		return false
 	}
 
