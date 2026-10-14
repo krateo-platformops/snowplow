@@ -163,3 +163,17 @@ def add_parsers(sub) -> None:
         return 0
 
     p.set_defaults(func=_run)
+
+    q = sub.add_parser("data606-preflight-user", help="#606: register the ONE preflight "
+                                              "user (scaleuser-0000), no login")
+
+    def _one(a):
+        from bench.cli import _gke_context_guard
+        _gke_context_guard()
+        n, _ = lifecycle.create_synthetic_users(
+            0, 0, groups_for=lambda i: ["devs", rbac_model.team_group(1)], login=False)
+        if n != 1:
+            raise RuntimeError("preflight user not registered")
+        return 0
+
+    q.set_defaults(func=_one)

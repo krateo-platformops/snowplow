@@ -66,6 +66,9 @@ ENDPOINT_WAIT_S="${ENDPOINT_WAIT_S:-600}"
 ENDPOINT_POLL_S="${ENDPOINT_POLL_S:-15}"
 REQUIRED_DEPLOYMENTS="${REQUIRED_DEPLOYMENTS:-snowplow frontend authn}"
 PLATFORM_TIMEOUT_S="${PLATFORM_TIMEOUT_S:-2700}"
+FRONTEND_CONFIGMAP="${FRONTEND_CONFIGMAP:-frontend-config-vars}"
+PREFLIGHT_TIMEOUT_S="${PREFLIGHT_TIMEOUT_S:-300}"
+PREFLIGHT_POLL_S="${PREFLIGHT_POLL_S:-3}"
 PLATFORM_POLL_S="${PLATFORM_POLL_S:-60}"
 OUT="${OUT:-/tmp/snowplow-runs/606/${RUN_NAME}}"
 
@@ -238,6 +241,48 @@ s_env() {
   # gke-env re-exports these; re-assert the pin regardless of what it printed.
   export KUBECONFIG="$KCFG" BENCH_GKE_CONTEXT="$KCTX" EXPECTED_IMAGE_TAG="$SNOWPLOW_TAG"
 }
+s_preflight() {
+  # SECONDS-scale, right after env and BEFORE stamping or any login burst
+  # (run 6 discovered stale page roots 54 minutes in). The boot root is the
+  # frontend's own config.json INIT — never a hard-coded page name.
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: read frontend-config-vars config.json -> PORTAL_INIT; preflight606 Job"
+    export PORTAL_INIT="/call?resource=layouts&apiVersion=widgets.templates.krateo.io/v1beta1&name=app-shell&namespace=krateo-system"
+    export PORTAL_FRONTEND_NS=krateo-system PORTAL_BUILDERS_NS=krateo-system
+    return 0
+  fi
+  "${K[@]}" -n krateo-system get configmap "$FRONTEND_CONFIGMAP" \
+      -o 'jsonpath={.data.config\.json}' > "$OUT/frontend-config.json"
+  python3 -m bench.load606 portal-config < "$OUT/frontend-config.json" > "$OUT/portal.env"
+  # shellcheck disable=SC1091
+  source "$OUT/portal.env"
+  log "portal boot root (config.json INIT): $PORTAL_INIT"
+  run python3 -m bench data606-preflight-user >&2
+  python3 -m bench.load606_job --preflight-only --snowplow-url "$SNOWPLOW_URL" \
+      --authn-url "$AUTHN_URL" --password "$PW" --init "$PORTAL_INIT" \
+      --frontend-ns "$PORTAL_FRONTEND_NS" --builders-ns "$PORTAL_BUILDERS_NS" \
+      > "$OUT/preflight-job.yaml"
+  run "${K[@]}" apply -f "$OUT/preflight-job.yaml"
+  local deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S )) ok="" failed=""
+  while (( $(date +%s) < deadline )); do
+    ok="$("${K[@]}" -n bench-loadgen get job preflight606 -o 'jsonpath={.status.succeeded}' 2>/dev/null || true)"
+    failed="$("${K[@]}" -n bench-loadgen get job preflight606 -o 'jsonpath={.status.failed}' 2>/dev/null || true)"
+    [[ -n "$ok" && "$ok" != "0" ]] && break
+    [[ -n "$failed" && "$failed" != "0" ]] && break
+    sleep "$PREFLIGHT_POLL_S"
+  done
+  "${K[@]}" -n bench-loadgen logs job/preflight606 > "$OUT/preflight.jsonl" 2>&1 || true
+  python3 -m bench.load606 preflight-summary < "$OUT/preflight.jsonl" >&2 || true
+  if [[ -n "$failed" && "$failed" != "0" ]]; then
+    log "PREFLIGHT REFUSED (config error: unserved type / 404) — see $OUT/preflight.jsonl"
+    return 1
+  fi
+  if [[ -z "$ok" || "$ok" == "0" ]]; then
+    log "PREFLIGHT did not finish within ${PREFLIGHT_TIMEOUT_S}s"
+    return 1
+  fi
+  log "preflight OK (product errors, if any, are recorded, not fatal)"
+}
 s_data() {
   # Data stamping is kubectl-only. User LOGINS need authn over HTTP: in
   # in-cluster mode they are deferred to the in-cluster driver.
@@ -268,8 +313,8 @@ s_measure() {
   python3 -m bench.load606_job --users "$USERS" --shards 1 \
       --think-s "$THINK_S" --duration-s "$DRIVE_S" \
       --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" --password "$PW" \
-      --page "dashboard=3=/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=pages&name=dashboard-page&namespace=krateo-system" \
-      --page "compositions=2=/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=pages&name=compositions-page&namespace=krateo-system" \
+      --init "$PORTAL_INIT" --frontend-ns "$PORTAL_FRONTEND_NS" \
+      --builders-ns "$PORTAL_BUILDERS_NS" \
       --fresh-rates $CHURN_RATES --fresh-samples "$FRESH_SAMPLES" \
       --fresh-gap-s "$FRESH_GAP_S" --fresh-delay-s "$THINK_S" \
       --namespaces "$NAMESPACES" \
@@ -295,7 +340,7 @@ s_collect() {
 }
 s_evaluate() {
   shopt -s nullglob
-  local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl)
+  local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl)
   if [[ "$DRY" == "1" ]]; then log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>}"; return 0; fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
@@ -311,6 +356,7 @@ step install   s_install
 step platform  s_wait_platform
 if [[ "$VERIFY483" == "1" ]]; then step verify483 s_verify483; fi
 step env       s_env
+step preflight s_preflight
 step data      s_data
 step reboot    s_reboot
 step measure   s_measure

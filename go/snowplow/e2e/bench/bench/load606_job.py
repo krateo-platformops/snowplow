@@ -44,14 +44,16 @@ def _indent(text: str, n: int) -> str:
 
 def render(*, users: int, shards: int, think_s: float, duration_s: float,
            snowplow_url: str, authn_url: str, password: str,
-           pages: list[str], src: str | None = None) -> str:
-    if not pages:
-        raise ValueError("at least one --page is required")
+           init: str, frontend_ns: str = "krateo-system",
+           builders_ns: str = "krateo-system", src: str | None = None) -> str:
+    if not init.startswith("/call"):
+        raise ValueError("init must be the frontend config.json api.INIT /call path")
     src = LOAD606_SRC.read_text() if src is None else src
     ranges = shard_ranges(users, shards)
     # Shell case over JOB_COMPLETION_INDEX → this pod's user range.
     case = "\n".join(f"  {i}) S={a}; E={b};;" for i, (a, b) in enumerate(ranges))
-    page_args = " ".join(f"--page {json.dumps(p)}" for p in pages)
+    portal_args = (f"--init {json.dumps(init)} --frontend-ns {json.dumps(frontend_ns)} "
+                   f"--builders-ns {json.dumps(builders_ns)}")
     script = f"""set -eu
 case "$JOB_COMPLETION_INDEX" in
 {case}
@@ -62,7 +64,7 @@ exec python3 -u /opt/load606/load606.py drive \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --password {json.dumps(password)} --user-start "$S" --user-end "$E" \\
   --think-s {think_s} --duration-s {duration_s} --vars-interval "$VARS" \\
-  {page_args} --out /dev/stdout
+  {portal_args} --out /dev/stdout
 """
     return f"""\
 apiVersion: v1
@@ -115,6 +117,75 @@ spec:
           requests:
             cpu: "3"
             memory: 4Gi
+        volumeMounts:
+        - name: src
+          mountPath: /opt/load606
+      volumes:
+      - name: src
+        configMap:
+          name: load606
+"""
+
+
+def render_preflight(*, snowplow_url: str, authn_url: str, user: str,
+                     password: str, init: str, frontend_ns: str,
+                     builders_ns: str, src: str | None = None) -> str:
+    """Namespace + ConfigMap + the preflight606 Job: one user, seconds-scale
+    (`load606 preflight --full-walk`). Exit 2 = refused (config error: an
+    unserved type or a 404 on INIT or a menu route); product 5xx are recorded
+    in its JSON line, never a refusal."""
+    src = LOAD606_SRC.read_text() if src is None else src
+    script = f"""set -eu
+exec python3 -u /opt/load606/load606.py preflight \\
+  --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
+  --user {json.dumps(user)} --password {json.dumps(password)} \\
+  --init {json.dumps(init)} --frontend-ns {json.dumps(frontend_ns)} \\
+  --builders-ns {json.dumps(builders_ns)} --full-walk
+"""
+    return f"""\
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bench-loadgen
+  labels:
+    app: scaletest
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: load606
+  namespace: bench-loadgen
+data:
+  load606.py: |
+{_indent(src, 4)}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: preflight606
+  namespace: bench-loadgen
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: preflight606
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        bench.krateo.io/pool: loadgen
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: loadgen
+        effect: NoSchedule
+      containers:
+      - name: preflight
+        image: {IMAGE}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+{_indent(script, 10)}
         volumeMounts:
         - name: src
           mountPath: /opt/load606
@@ -236,7 +307,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--snowplow-url", required=True)
     p.add_argument("--authn-url", required=True)
     p.add_argument("--password", required=True)
-    p.add_argument("--page", action="append", required=True)
+    p.add_argument("--init", required=True)
+    p.add_argument("--frontend-ns", default="krateo-system")
+    p.add_argument("--builders-ns", default="krateo-system")
+    p.add_argument("--preflight-only", action="store_true",
+                   help="render ONLY the preflight Job (+ namespace/configmap)")
+    p.add_argument("--preflight-user", default="scaleuser-0000")
     # Optional in-cluster freshness Job (fresh606), same manifest.
     p.add_argument("--fresh-rates", nargs="*", default=None)
     p.add_argument("--fresh-user", default="scaleuser-0001")
@@ -249,11 +325,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--comp-version", default="v1-2-2")
     p.add_argument("--comp-plural", default="githubscaffoldingwithcompositionpages")
     a = p.parse_args(argv)
+    if a.preflight_only:
+        sys.stdout.write(render_preflight(
+            snowplow_url=a.snowplow_url, authn_url=a.authn_url,
+            user=a.preflight_user, password=a.password, init=a.init,
+            frontend_ns=a.frontend_ns, builders_ns=a.builders_ns))
+        return 0
     sys.stdout.write(render(users=a.users, shards=a.shards, think_s=a.think_s,
                             duration_s=a.duration_s,
                             snowplow_url=a.snowplow_url,
                             authn_url=a.authn_url, password=a.password,
-                            pages=a.page))
+                            init=a.init, frontend_ns=a.frontend_ns,
+                            builders_ns=a.builders_ns))
     if a.fresh_rates:
         sys.stdout.write(render_fresh(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,

@@ -40,10 +40,12 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Iterable
@@ -196,16 +198,168 @@ class NavResult:
     error_samples: list = field(default_factory=list)
 
 
-def walk_page(client: HttpClient, token: str, root: str, *,
-              pool: concurrent.futures.Executor, per_user_parallel: int = 6,
-              max_depth: int = 8, max_calls: int = 2000):
-    """Walk one page tree. Returns (wall_ms, calls, errors, bytes, slowest,
-    error_samples)."""
-    seen = {root}
-    level = [root]
+def _allowed_ref_paths(doc) -> dict[str, str]:
+    """id -> /call path for every GET + allowed, not-yet-rendered ref."""
+    if not isinstance(doc, dict):
+        return {}
+    items = (((doc.get("status") or {}).get("resourcesRefs") or {})
+             .get("items") or [])
+    out = {}
+    for it in items:
+        if not isinstance(it, dict) or not it.get("id"):
+            continue
+        if (it.get("verb") or "GET").upper() != "GET" or not it.get("allowed"):
+            continue
+        if it.get("rendered"):
+            continue
+        p = it.get("path") or ""
+        if p.startswith("/call"):
+            out[it["id"]] = p
+    return out
+
+
+# ─── What the SPA actually fetches (frontend ui/src, read 2026-10-14) ───────
+#
+# A widget's children are fetched ONLY when a container RENDERS them, i.e. when
+# a render slot in widgetData names their resourceRefId and RefChild /
+# WidgetRenderer mounts it (components/RefChild/RefChild.tsx:60-64). A
+# `resourcesRefs` entry that no slot names is NOT fetched. Slots by kind:
+#   Flex/Col/Row/Form/ButtonGroup/Steps/Filters/List/PageHeader/Card body:
+#       widgetData.items[].resourceRefId           (Flex.tsx:15, Col.tsx:23,
+#       Row.tsx:64, Form.tsx:584, ButtonGroup.tsx:27, Steps.tsx:21,
+#       Filters.tsx:54, List.tsx:50, PageHeader.tsx:75, Card.tsx:211)
+#   Card: also cover, extraRefId, footer[].resourceRefId (Card.tsx:34-54)
+#   Table: dataSource[][].resourceRefId per rendered cell (Table.tsx:168-236)
+#   Layout: header, content, footer, sider.resourceRefId, effects[]
+#       (Layout.tsx:20-23, 41-47, 74)
+#   Tabs: ONLY the active tab — antd mounts an inactive pane on first
+#       activation; default = first item (Tabs.tsx:18-45)
+# NOT fetched on render:
+#   Menu: its items only REGISTER routes (Menu.tsx:35-43); a route's page is
+#       fetched when the route is visited (WidgetPage.tsx:41, 90).
+#   widgetActions / actions (openDrawer, navigate, rest): on click only
+#       (Drawer.tsx:94, Modal.tsx:84 render the target when opened).
+
+_LAYOUT_SLOTS = ("header", "content", "footer")
+_NEVER_EAGER_KEYS = ("widgetActions", "actions")
+
+
+def _collect_ref_ids(node, out: list) -> None:
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in _NEVER_EAGER_KEYS:
+                continue
+            if k in ("resourceRefId", "extraRefId", "cover") and isinstance(v, str):
+                out.append(v)
+            else:
+                _collect_ref_ids(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _collect_ref_ids(v, out)
+
+
+def eager_refs(doc) -> list[str]:
+    """The /call paths the SPA fetches when it RENDERS this widget."""
+    if not isinstance(doc, dict):
+        return []
+    kind = doc.get("kind")
+    wd = (doc.get("status") or {}).get("widgetData") or {}
+    paths = _allowed_ref_paths(doc)
+    if kind == "Menu":
+        return []
+    ids: list[str] = []
+    if kind == "Layout":
+        ids += [wd.get(k) for k in _LAYOUT_SLOTS if isinstance(wd.get(k), str)]
+        sider = wd.get("sider")
+        if isinstance(sider, dict) and isinstance(sider.get("resourceRefId"), str):
+            ids.append(sider["resourceRefId"])
+        ids += [e for e in (wd.get("effects") or []) if isinstance(e, str)]
+    elif kind == "Tabs":
+        items = wd.get("items") or []
+        if items and isinstance(items[0], dict) and items[0].get("resourceRefId"):
+            ids.append(items[0]["resourceRefId"])
+    else:
+        _collect_ref_ids(wd, ids)
+    seen, out = set(), []
+    for i in ids:
+        p = paths.get(i)
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+_TEMPLATE = re.compile(r"\{[^}]+\}")
+
+
+def _route_slug(path: str) -> str:
+    """navModel.ts routeSlug: drop {param} segments + leading '/', '/'→'-'."""
+    s = re.sub(r"/?\{[^}]+\}", "", path or "").lstrip("/").replace("/", "-")
+    return s or "home"
+
+
+def menu_routes(menu_doc, frontend_ns: str) -> list[dict]:
+    """Routes the sidebar Menu registers, in menu order (navModel.ts:56-78).
+
+    content endpoint: the item's resourceRefId → that ref's path; else the
+    convention flexes/page-<slug> in item.namespace or FRONTEND_NAMESPACE.
+    An item whose resourceRefId was DENIED is not a visible route (RBAC gate,
+    navModel.ts isNavEntryAllowed). Templated paths ({param}) cannot be
+    navigated without a value and are returned with templated=True.
+    """
+    wd = ((menu_doc or {}).get("status") or {}).get("widgetData") or {}
+    paths = _allowed_ref_paths(menu_doc)
+    out = []
+    items = sorted((i for i in (wd.get("items") or []) if isinstance(i, dict)),
+                   key=lambda i: i.get("order", 0))
+    for it in items:
+        if it.get("type") == "divider" or not it.get("path"):
+            continue
+        ref = it.get("resourceRefId")
+        if ref:
+            if ref not in paths:
+                continue                       # denied / dangling → not visible
+            endpoint = paths[ref]
+        else:
+            ns = it.get("namespace") if it.get("namespace") is not None else frontend_ns
+            endpoint = ("/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1"
+                        f"&resource=flexes&name=page-{it.get('page') or _route_slug(it['path'])}"
+                        f"&namespace={ns}")
+        out.append({"path": it["path"], "endpoint": endpoint,
+                    "templated": bool(_TEMPLATE.search(it["path"]))})
+    return out
+
+
+@dataclass
+class WalkResult:
+    wall_ms: float
+    calls: int
+    errors: int
+    bytes: int
+    slowest_ms: float
+    samples: list
+    statuses: dict
+    docs: dict            # path -> parsed doc (only when keep_docs)
+
+
+def walk(client: HttpClient, token: str, roots: list[str], *,
+         pool: concurrent.futures.Executor, children=eager_refs,
+         inject: dict | None = None, per_user_parallel: int = 6,
+         max_depth: int = 12, max_calls: int = 5000,
+         keep_docs: bool = False) -> WalkResult:
+    """Fetch like the SPA: level by level (a child is requested only after its
+    parent arrived), at most `per_user_parallel` in flight (a browser's
+    per-host limit). `children(doc)` decides what a rendered widget fetches;
+    `inject[path]` adds requests the app makes once `path` arrived (e.g. the
+    Layout's HeaderChrome → header-context, Shell.tsx:26-33)."""
+    inject = inject or {}
+    seen = set(roots)
+    level = list(roots)
     calls = errors = nbytes = 0
     slowest = 0.0
     samples: list[str] = []
+    statuses: dict[str, int] = {}
+    docs: dict[str, dict] = {}
     t0 = time.perf_counter()
     depth = 0
     while level and depth <= max_depth and calls < max_calls:
@@ -217,49 +371,114 @@ def walk_page(client: HttpClient, token: str, root: str, *,
                 calls += 1
                 slowest = max(slowest, resp.ms)
                 nbytes += len(resp.body)
+                key = str(resp.status)
+                statuses[key] = statuses.get(key, 0) + 1
+                for extra in inject.get(path, ()):
+                    if extra not in seen:
+                        seen.add(extra)
+                        nxt.append(extra)
                 if resp.status != 200:
                     errors += 1
                     if len(samples) < 5:
-                        samples.append(f"{resp.status} {path[:160]} {resp.error}")
+                        samples.append(f"{resp.status} {path[:160]} "
+                                       f"{(resp.body or b'')[:240].decode('utf-8', 'replace') or resp.error}")
                     continue
                 try:
                     doc = json.loads(resp.body or b"null")
                 except ValueError:
                     continue
-                for ref in extract_refs(doc):
+                if keep_docs:
+                    docs[path] = doc
+                for ref in children(doc):
                     if ref not in seen:
                         seen.add(ref)
                         nxt.append(ref)
         level = nxt
         depth += 1
-    wall = (time.perf_counter() - t0) * 1000
-    return wall, calls, errors, nbytes, slowest, samples
+    return WalkResult(round((time.perf_counter() - t0) * 1000, 1), calls, errors,
+                      nbytes, round(slowest, 1), samples, statuses, docs)
+
+
+def walk_page(client: HttpClient, token: str, root: str, *,
+              pool: concurrent.futures.Executor, per_user_parallel: int = 6,
+              max_depth: int = 8, max_calls: int = 2000):
+    """The FULL CLOSURE walk: every allowed ref, recursively. NOT a navigation
+    (it fetches everything the sidebar menu can reach — 590 calls / 8.4 MB on
+    run 6). Kept only for the separately-labelled `full_walk` report metric.
+    Returns (wall_ms, calls, errors, bytes, slowest, error_samples)."""
+    r = walk(client, token, [root], pool=pool, children=extract_refs,
+             per_user_parallel=per_user_parallel, max_depth=max_depth,
+             max_calls=max_calls)
+    return r.wall_ms, r.calls, r.errors, r.bytes, r.slowest_ms, r.samples
+
+
+@dataclass
+class Portal:
+    """The portal's boot description, from the frontend's config.json."""
+    init: str                     # api.INIT (the app-shell Layout)
+    frontend_ns: str = "krateo-system"     # params.FRONTEND_NAMESPACE
+    builders_ns: str | None = "krateo-system"   # api.BUILDERS_NAMESPACE
+
+    def header_context(self) -> str:
+        """Shell.tsx:28-29 — derived from INIT's namespace."""
+        qs = urllib.parse.parse_qs(self.init.split("?", 1)[1] if "?" in self.init else "")
+        ns = (qs.get("namespace") or ["krateo-system"])[0]
+        return ("/call?resource=flexes&apiVersion=widgets.templates.krateo.io/v1beta1"
+                f"&name=header-context&namespace={ns}")
+
+    def builders_list(self) -> str | None:
+        """clusterBuilders.ts:4-6,116-122 — one /list read per sign-in."""
+        return f"/list?category=builders&ns={self.builders_ns}" if self.builders_ns else None
+
+
+def first_load(client: HttpClient, token: str, portal: Portal, *,
+               pool, per_user_parallel: int = 6) -> tuple[WalkResult, list[dict], WalkResult | None]:
+    """(i) First load after sign-in:
+      INIT Layout (Shell.tsx:92) + its eager slots; the Layout's header slot
+      falls back to HeaderChrome → header-context (Shell.tsx:26-33, Layout.tsx:41);
+      the Builders /list read (Shell.tsx:81-85); the sidebar Menu registers
+      routes, then `/` redirects to the FIRST route (Menu.tsx:45-50), whose
+      content page is fetched with its eager tree (WidgetPage.tsx:41, 90).
+    Returns (shell walk, the user's routes, first route's content walk)."""
+    roots = [portal.init] + ([portal.builders_list()] if portal.builders_list() else [])
+    shell = walk(client, token, roots, pool=pool,
+                 inject={portal.init: [portal.header_context()]},
+                 per_user_parallel=per_user_parallel, keep_docs=True)
+    menu = next((d for d in shell.docs.values()
+                 if isinstance(d, dict) and d.get("kind") == "Menu"), None)
+    routes = [r for r in menu_routes(menu, portal.frontend_ns) if not r["templated"]]
+    content = None
+    if routes:
+        content = walk(client, token, [routes[0]["endpoint"]], pool=pool,
+                       per_user_parallel=per_user_parallel)
+    return shell, routes, content
 
 
 # ─── Driver ─────────────────────────────────────────────────────────────────
 
 
 class Driver:
-    """Open-loop virtual-user scheduler.
+    """Open-loop virtual-user scheduler over the SPA navigation model.
 
-    `pages` is [(name, root_path, weight)]. Each user's next navigation time
-    is drawn from an exponential think time; the scheduler dispatches due
-    navigations into a bounded nav pool and records how late each one started.
+    A user's FIRST navigation is the first load (shell + Builders read +
+    redirect to the first menu route). Every later navigation is a ROUTE CLICK:
+    only that route's content tree, since the shell stays mounted
+    (Shell.tsx:61-69: "only the content swaps on navigation"). Routes come
+    from the user's OWN sidebar menu (RBAC-filtered by snowplow). Think time
+    is exponential; scheduling lag is recorded.
     """
 
     def __init__(self, client: HttpClient, tokens: dict[str, str],
-                 pages: list[tuple[str, str, float]], *,
+                 portal: Portal, *,
                  think_s: float = 60.0, duration_s: float = 1800.0,
                  nav_workers: int = 128, call_workers: int = 512,
                  per_user_parallel: int = 6, seed: int = 606,
                  sink: Callable[[dict], None] | None = None,
                  clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep):
-        if not pages:
-            raise ValueError("no pages to navigate")
         self.client = client
         self.tokens = tokens
-        self.pages = pages
+        self.portal = portal
         self.think_s = think_s
         self.duration_s = duration_s
         self.nav_pool = concurrent.futures.ThreadPoolExecutor(nav_workers)
@@ -270,51 +489,76 @@ class Driver:
         self.clock = clock
         self.sleep = sleep
         self.visits: dict[tuple[str, str], int] = {}
+        self.routes: dict[str, list[dict]] = {}
+        self.busy: set[str] = set()
         self.lock = threading.Lock()
         self.results: list[NavResult] = []
 
-    def _pick_page(self):
-        total = sum(w for _, _, w in self.pages)
-        x = self.rng.uniform(0, total)
-        for name, root, w in self.pages:
-            x -= w
-            if x <= 0:
-                return name, root
-        return self.pages[-1][0], self.pages[-1][1]
-
-    def _nav(self, user: str, page: str, root: str, due: float) -> None:
-        started = self.clock()
+    def _record(self, user, page, kind, started, due, w: WalkResult,
+                extra: WalkResult | None = None, routes: int | None = None):
         with self.lock:
             visit = self.visits.get((user, page), 0) + 1
             self.visits[(user, page)] = visit
-        wall, calls, errors, nbytes, slowest, samples = walk_page(
-            self.client, self.tokens[user], root, pool=self.call_pool,
-            per_user_parallel=self.per_user_parallel)
-        res = NavResult(user=user, page=page, visit=visit, start=started,
-                        wall_ms=round(wall, 1), calls=calls, errors=errors,
-                        bytes=nbytes, slowest_call_ms=round(slowest, 1),
-                        sched_lag_ms=round(max(0.0, started - due) * 1000, 1),
-                        error_samples=samples)
+        parts = [w] + ([extra] if extra else [])
+        res = NavResult(
+            user=user, page=page, visit=visit, start=started,
+            wall_ms=round(sum(p.wall_ms for p in parts), 1),
+            calls=sum(p.calls for p in parts), errors=sum(p.errors for p in parts),
+            bytes=sum(p.bytes for p in parts),
+            slowest_call_ms=max(p.slowest_ms for p in parts),
+            sched_lag_ms=round(max(0.0, started - due) * 1000, 1),
+            error_samples=sum((p.samples for p in parts), [])[:5])
         with self.lock:
             self.results.append(res)
-        self.sink({"kind": "nav", **asdict(res)})
+        rec = {"kind": "nav", "nav": kind, **asdict(res)}
+        if routes is not None:
+            rec["routes"] = routes
+        self.sink(rec)
+
+    def _nav(self, user: str, due: float) -> None:
+        started = self.clock()
+        tok = self.tokens[user]
+        try:
+            if user not in self.routes:
+                shell, routes, content = first_load(
+                    self.client, tok, self.portal, pool=self.call_pool,
+                    per_user_parallel=self.per_user_parallel)
+                with self.lock:
+                    self.routes[user] = routes
+                page = routes[0]["path"] if routes else "(no-route)"
+                self._record(user, page, "first_load", started, due, shell,
+                             content, routes=len(routes))
+                return
+            routes = self.routes[user]
+            if not routes:
+                return
+            r = self.rng.choice(routes)
+            w = walk(self.client, tok, [r["endpoint"]], pool=self.call_pool,
+                     per_user_parallel=self.per_user_parallel)
+            self._record(user, r["path"], "route", started, due, w)
+        finally:
+            with self.lock:
+                self.busy.discard(user)
 
     def run(self) -> list[NavResult]:
         t_start = self.clock()
         end = t_start + self.duration_s
-        # First navigation of every user is spread over one think period so
-        # 1000 users do not all log in at the same instant.
-        nxt = {u: t_start + self.rng.uniform(0, self.think_s)
-               for u in self.tokens}
+        # First loads are spread over one think period so 1000 users do not
+        # all arrive at the same instant.
+        nxt = {u: t_start + self.rng.uniform(0, self.think_s) for u in self.tokens}
         futures = []
         while True:
             now = self.clock()
             if now >= end:
                 break
-            due = [(t, u) for u, t in nxt.items() if t <= now]
-            for t, u in due:
-                page, root = self._pick_page()
-                futures.append(self.nav_pool.submit(self._nav, u, page, root, t))
+            for u, t in list(nxt.items()):
+                if t > now:
+                    continue
+                with self.lock:
+                    if u in self.busy:          # a person finishes one navigation first
+                        continue
+                    self.busy.add(u)
+                futures.append(self.nav_pool.submit(self._nav, u, t))
                 nxt[u] = t + self.rng.expovariate(1.0 / self.think_s)
             soonest = min(nxt.values())
             self.sleep(max(0.0, min(0.05, soonest - self.clock())))
@@ -539,6 +783,25 @@ def economics(first: dict, last: dict, customer_calls: int) -> dict:
 # ─── Verdict ────────────────────────────────────────────────────────────────
 
 
+def login_report(curves: list[dict]) -> dict | None:
+    """Summary of the adaptive-login records. AUTHN FINDING, not snowplow's:
+    each login issues an x509 certificate (CSR) — run 6 measured ~3.2 s per
+    login, a user-facing sign-in latency."""
+    if not curves:
+        return None
+    rows = [r for c in curves for r in c.get("curve", [])]
+    base = next((r for r in rows if r.get("phase") == "baseline"), {})
+    meds = [r["median_ms"] for r in rows if r.get("median_ms") is not None]
+    return {"users": sum(c.get("users", 0) for c in curves),
+            "failed": sum(c.get("failed", 0) for c in curves),
+            "baseline_single_login_ms": base.get("median_ms"),
+            "median_login_ms": pct(meds, 50),
+            "max_concurrency": max((r.get("concurrency", 1) for r in rows), default=1),
+            "total_batch_wall_s": round(sum(r.get("batch_wall_ms") or 0 for r in rows) / 1000, 1),
+            "curve": rows,
+            "finding": "authn: per-login latency (x509 CSR issued per login) is a user-facing number"}
+
+
 def _check(name, value, op, bar, checks):
     if value is None:
         checks.append({"check": name, "value": None, "bar": bar,
@@ -550,7 +813,9 @@ def _check(name, value, op, bar, checks):
 
 
 def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
-             *, thresholds: dict | None = None) -> dict:
+             *, thresholds: dict | None = None,
+             login_curves: list[dict] | None = None,
+             preflights: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -633,6 +898,10 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         "server_dirty_to_fresh_p95_ms_max_window": max(p95s) if p95s else None,
         "server_dirty_to_fresh_p95_ms_median_window": pct(p95s, 50),
         "fresh_curve_report_only": curve,
+        "nav_kinds": {k: sum(1 for n in navs if n.get("nav") == k)
+                      for k in sorted({n.get("nav") for n in navs if n.get("nav")})},
+        "login": login_report(login_curves or []),
+        "preflight": (preflights or [None])[-1],
     }
 
     if any(c["result"] == "FAIL" for c in validity):
@@ -736,46 +1005,268 @@ def _read_jsonl(path: str) -> list[dict]:
     return out
 
 
-def _parse_pages(specs: list[str]) -> list[tuple[str, str, float]]:
-    """`name=weight=/call?...` → (name, path, weight)."""
-    out = []
-    for s in specs:
-        name, weight, path = s.split("=", 2)
-        if not path.startswith("/call"):
-            raise ValueError(f"page root must be a /call path: {s}")
-        out.append((name, path, float(weight)))
+def classify(resp: "Response") -> str:
+    """ok | config (a request the cluster cannot serve: 404, or snowplow's
+    'no matches for <GVR>' for an unserved type — run 6) | forbidden |
+    product (any other non-2xx: a FINDING, recorded, never a tooling stop)."""
+    if 200 <= resp.status < 300:
+        return "ok"
+    body = (resp.body or b"")[:2000].decode("utf-8", "replace")
+    if resp.status == 404 or "no matches for" in body:
+        return "config"
+    if resp.status == 403:
+        return "forbidden"
+    return "product"
+
+
+def adaptive_login(users: list[str], login_fn: Callable[[str], str], *,
+                   start: int = 2, cmax: int = 64, baseline_n: int = 3,
+                   grow_below: float = 1.25, shrink_above: float = 1.6,
+                   rounds: int = 3, progress_every: int = 50,
+                   log: Callable[[str], None] = lambda m: print(m, file=sys.stderr, flush=True),
+                   clock: Callable[[], float] = time.perf_counter):
+    """Log every user in, with SELF-ADAPTING concurrency.
+
+    Baseline = median of `baseline_n` serial logins. Then batches of size c:
+    the batch's median per-login latency vs the baseline decides the next c —
+    double while it stays below grow_below×baseline, halve on any error or
+    above shrink_above×baseline, hold in between. Failed users are retried in
+    later rounds. Progress every `progress_every` users. Returns
+    (tokens, curve, failed): `curve` is the latency/concurrency record the
+    report keeps (authn issues an x509 certificate per login — run 6 measured
+    ~3.2s each — which is itself a finding for authn).
+    """
+    tokens: dict[str, str] = {}
+    curve: list[dict] = []
+    errors_seen: dict[str, str] = {}
+
+    def one(u):
+        t0 = clock()
+        try:
+            tok = login_fn(u)
+            return u, tok, (clock() - t0) * 1000, None
+        except Exception as e:  # noqa: BLE001
+            return u, None, (clock() - t0) * 1000, f"{type(e).__name__}: {e}"
+
+    pending = list(users)
+    base_lat = []
+    for u in pending[:baseline_n]:
+        u, tok, ms, err = one(u)
+        if tok:
+            tokens[u] = tok
+            base_lat.append(ms)
+        else:
+            errors_seen[u] = err or "?"
+    baseline = pct(base_lat, 50) or 1.0
+    curve.append({"phase": "baseline", "concurrency": 1, "n": len(base_lat),
+                  "median_ms": round(baseline, 1), "errors": len(pending[:baseline_n]) - len(base_lat)})
+    log(f"[login] baseline {baseline:.0f} ms/login (serial, n={len(base_lat)})")
+    pending = [u for u in users if u not in tokens]
+    c = max(1, start)
+    last_mark = 0
+    for rnd in range(rounds):
+        failed: list[str] = []
+        i = 0
+        with concurrent.futures.ThreadPoolExecutor(cmax) as pool:
+            while i < len(pending):
+                batch = pending[i:i + c]
+                i += len(batch)
+                t0 = clock()
+                res = list(pool.map(one, batch))
+                wall = (clock() - t0) * 1000
+                lats = [ms for _, tok, ms, _ in res if tok]
+                errs = 0
+                for u, tok, ms, err in res:
+                    if tok:
+                        tokens[u] = tok
+                    else:
+                        errs += 1
+                        failed.append(u)
+                        errors_seen[u] = err or "?"
+                med = pct(lats, 50)
+                curve.append({"phase": f"round{rnd + 1}", "concurrency": c,
+                              "n": len(batch), "errors": errs,
+                              "median_ms": round(med, 1) if med else None,
+                              "p95_ms": round(pct(lats, 95), 1) if lats else None,
+                              "batch_wall_ms": round(wall, 1),
+                              "ratio_to_baseline": round(med / baseline, 2) if med else None})
+                if errs or (med is not None and med > shrink_above * baseline):
+                    c = max(1, c // 2)
+                elif med is not None and med <= grow_below * baseline:
+                    c = min(cmax, c * 2)
+                done = len(tokens)
+                if done // progress_every > last_mark // progress_every or done == len(users):
+                    log(f"[login] {done}/{len(users)} logged in; concurrency {c}; "
+                        f"batch median {med or 0:.0f} ms ({(med or 0) / baseline:.2f}x baseline); "
+                        f"errors this batch {errs}")
+                    last_mark = done
+        pending = failed
+        if not pending:
+            break
+        c = max(1, c // 2)
+        log(f"[login] retry round {rnd + 2}: {len(pending)} users")
+    return tokens, curve, pending
+
+
+def portal_from_config_json(text: str) -> dict:
+    """The frontend's config.json (ConfigMap frontend-config-vars) →
+    {init, frontend_ns, builders_ns}. The boot root is api.INIT
+    (ConfigContext.tsx:10, Shell.tsx:92) — never a hard-coded page name."""
+    cfg = json.loads(text)
+    api, params = cfg.get("api") or {}, cfg.get("params") or {}
+    init = api.get("INIT") or ""
+    if not init.startswith("/call"):
+        raise ValueError(f"config.json api.INIT is not a /call path: {init!r}")
+    return {"init": init,
+            "frontend_ns": params.get("FRONTEND_NAMESPACE") or "krateo-system",
+            "builders_ns": api.get("BUILDERS_NAMESPACE") or ""}
+
+
+def _cmd_portal_config(a) -> int:
+    p = portal_from_config_json(sys.stdin.read())
+    import shlex
+    print(f"export PORTAL_INIT={shlex.quote(p['init'])}")
+    print(f"export PORTAL_FRONTEND_NS={shlex.quote(p['frontend_ns'])}")
+    print(f"export PORTAL_BUILDERS_NS={shlex.quote(p['builders_ns'])}")
+    return 0
+
+
+def _cmd_preflight_summary(a) -> int:
+    rec = None
+    for line in sys.stdin:
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("kind") == "preflight":
+                rec = r
+    if rec is None:
+        print("[preflight] no result line", flush=True)
+        return 1
+    print(f"[preflight] ok={rec.get('ok')} init_status={rec.get('init_status')} "
+          f"routes={len(rec.get('routes') or [])} login_ms={rec.get('login_ms')}", flush=True)
+    fl = rec.get("first_load_shell")
+    if fl:
+        print(f"[preflight] first-load shell: {fl.get('calls')} calls, "
+              f"{fl.get('wall_ms')} ms, statuses {fl.get('statuses')}", flush=True)
+    for x in rec.get("refused") or []:
+        print(f"[preflight] REFUSED {x.get('path')} -> {x.get('status')}: "
+              f"{(x.get('body') or '')[:200]}", flush=True)
+    for x in rec.get("product_errors") or []:
+        print(f"[preflight] PRODUCT ERROR (recorded, not fatal) {x.get('path')} -> "
+              f"{x.get('status')}: {(x.get('body') or '')[:200]}", flush=True)
+    fw = rec.get("full_walk_report_only")
+    if fw:
+        print(f"[preflight] full closure walk (report-only, NOT a navigation): "
+              f"{fw.get('calls')} calls, {fw.get('bytes')} bytes, {fw.get('wall_ms')} ms",
+              flush=True)
+    return 0 if rec.get("ok") else 2
+
+
+def _portal_from_args(a) -> "Portal":
+    return Portal(init=a.init, frontend_ns=a.frontend_ns,
+                  builders_ns=a.builders_ns or None)
+
+
+def preflight(client: HttpClient, token: str, portal: "Portal", *,
+              full_walk: bool = False, per_user_parallel: int = 6) -> dict:
+    """Seconds-scale check BEFORE stamping data or mass logins.
+
+    Refuses (ok=False) on a CONFIG error: INIT or a menu route's content page
+    is 404 or an unserved type. A product 5xx / 403 is RECORDED and does not
+    refuse. Also records the navigation shape (first-load calls, routes) and,
+    with full_walk, the closure-walk size as a separately labelled metric.
+    """
+    out: dict = {"kind": "preflight", "init": portal.init, "refused": [],
+                 "product_errors": [], "forbidden": [], "routes": []}
+    with concurrent.futures.ThreadPoolExecutor(per_user_parallel) as pool:
+        r = client.get(portal.init, token)
+        cls = classify(r)
+        out["init_status"] = r.status
+        if cls != "ok":
+            body = (r.body or b"")[:400].decode("utf-8", "replace")
+            (out["refused"] if cls == "config" else out["product_errors"]).append(
+                {"path": portal.init, "status": r.status, "body": body})
+            out["ok"] = not out["refused"]
+            return out
+        shell, routes, content = first_load(client, token, portal, pool=pool,
+                                            per_user_parallel=per_user_parallel)
+        out["first_load_shell"] = {"calls": shell.calls, "errors": shell.errors,
+                                   "wall_ms": shell.wall_ms, "statuses": shell.statuses}
+        if not routes:
+            out["refused"].append({"path": "(sidebar menu)", "status": None,
+                                   "body": "the shell rendered no sidebar Menu with routes"})
+        for rt in routes:
+            rr = client.get(rt["endpoint"], token)
+            c = classify(rr)
+            row = {"path": rt["path"], "endpoint": rt["endpoint"], "status": rr.status}
+            out["routes"].append(row)
+            if c == "config":
+                out["refused"].append({**row, "body": (rr.body or b"")[:400].decode("utf-8", "replace")})
+            elif c == "product":
+                out["product_errors"].append({**row, "body": (rr.body or b"")[:400].decode("utf-8", "replace")})
+            elif c == "forbidden":
+                out["forbidden"].append(row)
+        if full_walk:
+            wall, calls, errs, nbytes, slowest, samples = walk_page(
+                client, token, portal.init, pool=pool, max_depth=12, max_calls=5000)
+            out["full_walk_report_only"] = {"calls": calls, "errors": errs,
+                                            "bytes": nbytes, "wall_ms": round(wall, 1)}
+    out["ok"] = not out["refused"]
     return out
+
+
+def _cmd_preflight(a) -> int:
+    client = HttpClient(a.snowplow_url)
+    t0 = time.perf_counter()
+    try:
+        tok = login(a.authn_url, a.user, a.password)
+    except Exception as e:  # noqa: BLE001
+        print(json.dumps({"kind": "preflight", "ok": False,
+                          "refused": [{"path": "/basic/login", "status": None,
+                                       "body": f"{type(e).__name__}: {e}"}]}), flush=True)
+        return 2
+    login_ms = (time.perf_counter() - t0) * 1000
+    res = preflight(client, tok, _portal_from_args(a), full_walk=a.full_walk)
+    res["login_ms"] = round(login_ms, 1)
+    print(json.dumps(res, default=str), flush=True)
+    if not res["ok"]:
+        print("preflight REFUSED: " + "; ".join(
+            f"{x['path']} -> {x['status']}" for x in res["refused"]), file=sys.stderr, flush=True)
+        return 2
+    return 0
 
 
 def _cmd_drive(a) -> int:
     client = HttpClient(a.snowplow_url)
+    portal = _portal_from_args(a)
     users = [f"{a.user_prefix}{i:04d}" for i in range(a.user_start, a.user_end + 1)]
-    tokens = {}
-    for u in users:
-        for attempt in range(3):
-            try:
-                tokens[u] = login(a.authn_url, u, a.password)
-                break
-            except Exception as e:  # noqa: BLE001
-                if attempt == 2:
-                    print(f"login failed for {u}: {e}", file=sys.stderr)
-                time.sleep(1 + attempt)
-    if len(tokens) < len(users):
+    sink = _jsonl_sink(a.out)
+    # Guard in seconds, BEFORE the login burst: the first user's INIT must be
+    # servable (the run606 preflight already checked; this keeps `drive`
+    # standalone-safe — run 6 spent 54 min logging in before discovering it).
+    try:
+        tok0 = login(a.authn_url, users[0], a.password)
+    except Exception as e:  # noqa: BLE001
+        print(f"first login failed: {e}", file=sys.stderr)
+        return 2
+    r0 = client.get(portal.init, tok0)
+    if classify(r0) == "config":
+        print(f"INIT {portal.init} -> {r0.status}: not servable on this cluster; refusing",
+              file=sys.stderr)
+        return 2
+    tokens, curve, failed = adaptive_login(
+        users[1:], lambda u: login(a.authn_url, u, a.password))
+    tokens[users[0]] = tok0
+    sink({"kind": "login_curve", "users": len(users), "failed": len(failed),
+          "curve": curve})
+    if failed:
         print(f"only {len(tokens)}/{len(users)} users logged in; refusing a "
               f"partial population", file=sys.stderr)
         return 2
-    pages = _parse_pages(a.page)
-    sink = _jsonl_sink(a.out)
-    # Preflight: every root must answer 200 for the first user, else the page
-    # names are stale for this portal version and the whole run would measure
-    # error pages.
     probe_user = users[0]
-    for name, root, _ in pages:
-        r = client.get(root, tokens[probe_user])
-        if r.status != 200:
-            print(f"page root {name} → HTTP {r.status} {r.error}; fix --page",
-                  file=sys.stderr)
-            return 2
     stop = threading.Event()
 
     def _sampler():
@@ -789,7 +1280,7 @@ def _cmd_drive(a) -> int:
     if a.vars_interval > 0:
         th = threading.Thread(target=_sampler, daemon=True)
         th.start()
-    Driver(client, tokens, pages, think_s=a.think_s, duration_s=a.duration_s,
+    Driver(client, tokens, portal, think_s=a.think_s, duration_s=a.duration_s,
            nav_workers=a.nav_workers, call_workers=a.call_workers,
            sink=sink).run()
     stop.set()
@@ -892,7 +1383,9 @@ def _cmd_evaluate(a) -> int:
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     vs = sorted((r for r in recs if r.get("kind") == "vars"
                  and not r.get("unreadable")), key=lambda r: r.get("t", 0))
-    result = evaluate(navs, fresh, vs)
+    result = evaluate(navs, fresh, vs,
+                      login_curves=[r for r in recs if r.get("kind") == "login_curve"],
+                      preflights=[r for r in recs if r.get("kind") == "preflight"])
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3}[result["verdict"]]
 
@@ -907,8 +1400,10 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--user-prefix", default="scaleuser-")
     d.add_argument("--user-start", type=int, default=1)
     d.add_argument("--user-end", type=int, default=1000)
-    d.add_argument("--page", action="append", required=True,
-                   help="name=weight=/call?... (repeatable)")
+    d.add_argument("--init", required=True,
+                   help="the frontend config.json api.INIT (the app-shell Layout)")
+    d.add_argument("--frontend-ns", default="krateo-system")
+    d.add_argument("--builders-ns", default="krateo-system")
     d.add_argument("--think-s", type=float, default=60.0)
     d.add_argument("--duration-s", type=float, default=1800.0)
     d.add_argument("--nav-workers", type=int, default=128)
@@ -941,6 +1436,22 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--name-prefix", default="bench-app-")
     f.add_argument("--out", required=True)
     f.set_defaults(func=_cmd_fresh)
+    pf = sub.add_parser("preflight")
+    pf.add_argument("--snowplow-url", required=True)
+    pf.add_argument("--authn-url", required=True)
+    pf.add_argument("--user", required=True)
+    pf.add_argument("--password", required=True)
+    pf.add_argument("--init", required=True)
+    pf.add_argument("--frontend-ns", default="krateo-system")
+    pf.add_argument("--builders-ns", default="krateo-system")
+    pf.add_argument("--full-walk", action="store_true",
+                    help="also record the closure walk (report-only metric)")
+    pf.set_defaults(func=_cmd_preflight)
+    pc = sub.add_parser("portal-config",
+                        help="config.json on stdin -> PORTAL_* shell exports")
+    pc.set_defaults(func=_cmd_portal_config)
+    ps = sub.add_parser("preflight-summary", help="preflight JSONL on stdin -> summary")
+    ps.set_defaults(func=_cmd_preflight_summary)
     e = sub.add_parser("evaluate")
     e.add_argument("inputs", nargs="+")
     e.set_defaults(func=_cmd_evaluate)

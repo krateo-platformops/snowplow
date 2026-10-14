@@ -240,6 +240,35 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print("pod/load606-0"); sys.exit(0)
         if what == "pods" and "job-name=fresh606" in a:
             print("pod/fresh606-0"); sys.exit(0)
+        if what == "configmap" and "frontend-config-vars" in a:
+            init = os.environ.get("FAKE_INIT", "/call?resource=layouts&apiVersion="
+                                  "widgets.templates.krateo.io/v1beta1&name=app-shell"
+                                  "&namespace=krateo-system")
+            print(json.dumps({"api": {"INIT": init, "BUILDERS_NAMESPACE": "krateo-system"},
+                              "params": {"FRONTEND_NAMESPACE": "krateo-system"}}))
+            sys.exit(0)
+        if what == "job" and "preflight606" in a:
+            refused = os.environ.get("FAKE_PREFLIGHT", "ok") == "refused"
+            if any(x.endswith("{.status.succeeded}") for x in a):
+                print("" if refused else "1"); sys.exit(0)
+            if any(x.endswith("{.status.failed}") for x in a):
+                print("1" if refused else ""); sys.exit(0)
+        sys.exit(0)
+    if a[:1] == ["logs"] and any("preflight606" in x for x in a):
+        if os.environ.get("FAKE_PREFLIGHT", "ok") == "refused":
+            print(json.dumps({"kind": "preflight", "ok": False, "init_status": 200,
+                              "routes": [], "refused": [{"path": "/dashboard", "status": 500,
+                              "body": "no matches for widgets.templates.krateo.io/v1beta1, Resource=pages"}],
+                              "product_errors": []}))
+            print("preflight REFUSED: /dashboard -> 500", file=sys.stderr)
+        else:
+            print(json.dumps({"kind": "preflight", "ok": True, "init_status": 200,
+                              "routes": [{"path": "/dashboard", "status": 200}],
+                              "refused": [], "product_errors": [
+                                  {"path": "/agents/new", "status": 500,
+                                   "body": "unexpected end of JSON input"}],
+                              "full_walk_report_only": {"calls": 590, "bytes": 8429613,
+                                                        "wall_ms": 17644}}))
         sys.exit(0)
     if a[:1] == ["logs"] and any("fresh606" in x for x in a):
         print("fresh: starting")                       # stderr-ish noise, skipped

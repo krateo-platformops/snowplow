@@ -339,20 +339,8 @@ def test_walk_page_walks_levels_dedupes_and_counts_errors():
     assert calls == 4 and errors == 1 and samples and "500" in samples[0]
 
 
-def test_driver_numbers_visits_per_user_and_page():
-    tree = {"/call?p": {}}
-    recs = []
-    d = load606.Driver(_FakeClient(tree), {"u1": "t", "u2": "t"},
-                       [("p", "/call?p", 1.0)], think_s=0.05, duration_s=0.6,
-                       nav_workers=4, call_workers=4, sink=recs.append)
-    d.run()
-    by_user = {}
-    for r in recs:
-        by_user.setdefault(r["user"], []).append(r["visit"])
-    assert set(by_user) == {"u1", "u2"}
-    for visits in by_user.values():
-        assert sorted(visits) == list(range(1, len(visits) + 1))
-        assert len(visits) >= 2
+# The Driver's navigation model (first load vs route click) is covered in
+# tests/test_navmodel.py against a fake portal tree.
 
 
 def test_http_client_round_trip_with_gzip():
@@ -548,7 +536,8 @@ def test_loadgen_job_renders_pinned_to_loadgen_pool_with_source():
     src = load606_job.LOAD606_SRC.read_text()
     m = load606_job.render(users=1000, shards=2, think_s=60, duration_s=1800,
                            snowplow_url="http://s:8081", authn_url="http://a:8082",
-                           password="pw", pages=["d=1=/call?x&y=1"])
+                           password="pw",
+                           init="/call?resource=layouts&name=app-shell&x=1")
     ns, cm, job = list(yaml.safe_load_all(m))
     assert cm["data"]["load606.py"].rstrip("\n") == src.rstrip("\n")
     spec = job["spec"]["template"]["spec"]
@@ -557,7 +546,8 @@ def test_loadgen_job_renders_pinned_to_loadgen_pool_with_source():
     assert job["spec"]["completionMode"] == "Indexed"
     script = spec["containers"][0]["args"][0]
     assert "0) S=1; E=500;;" in script and "1) S=501; E=1000;;" in script
-    assert '--page "d=1=/call?x&y=1"' in script
+    assert '--init "/call?resource=layouts&name=app-shell&x=1"' in script
+    assert "--page" not in script            # no hard-coded page roots any more
 
 
 # ─── run606.sh: go gate + teardown ──────────────────────────────────────────
