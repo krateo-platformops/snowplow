@@ -760,7 +760,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		raNamespace: r.opts.RESTActionNamespace,
 		raName:      r.opts.RESTActionName,
 		// #674 — the E6 chokepoint applies to Kubernetes collection LISTs.
-		k8sList: isK8sListPath(call.Path),
+		// A collection LIST is a GET; a POST to a collection path (a create, a
+		// SubjectAccessReview) answers with an object, not a list envelope.
+		k8sList: ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet && isK8sListPath(call.Path),
 	}
 	inner := jsonHandler(gctx, hOpts)
 	innerBytesFn := jsonHandlerBytes(gctx, hOpts)
