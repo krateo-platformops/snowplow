@@ -10,16 +10,31 @@
 // rotated no key, so a per-identity cell minted in that window could keep being
 // served under the pre-edit grant.
 //
-// THE FIX. deltaActive notes, under the index's read lock, that an RBAC event
-// arrived while the index was not built — only once a snapshot has been
-// published (RBACGen() > 0): the informers' initial-list ADDs land before the
-// first publish, and no per-identity cell can exist before it (EvaluateRBAC
-// denies without a snapshot and a "" BindingUID is never cached). The FIRST
-// false→true transition of the index's built flag (BuildBindingsByGVRIndex,
-// under the index's write lock) reads-and-clears that note and, if it was set,
-// bumps ONE process-wide epoch that RBACSubGenForSubject adds to every identity's
-// sum. Later rebuilds never bump: built never returns to false in production, so
-// the note can only be taken before the first build.
+// THE FIX. The RBAC informer handler (newRBACSnapshotHandler) notes, under the
+// index's read lock, that an RBAC change the key can ONLY see through the
+// sub-gen arrived while the index was not built:
+//
+//   - a Role / ClusterRole ADD that is NOT part of the informer's initial list
+//     (isInInitialList), a Role / ClusterRole DELETE, or a Role / ClusterRole
+//     UPDATE whose rules changed (policyRulesEqual — the #257 predicate);
+//   - a binding UPDATE whose roleRef changed.
+//
+// Binding ADD / DELETE and binding subject / uid edits are NOT noted: they
+// change the requester's SubjectBindingSet digest, so they already rotate the
+// key with no sub-gen bump. And nothing is noted before the first publish
+// (RBACGen() == 0): no per-identity cell can exist before it (EvaluateRBAC
+// denies without a snapshot and a "" BindingUID is never cached).
+//
+// The initial list is excluded by isInInitialList, NOT by the publish sequence:
+// informer handlers run asynchronously to HasSynced, so initial-list ADDs can
+// still be delivered after the first publish.
+//
+// The FIRST false→true transition of the index's built flag
+// (BuildBindingsByGVRIndex, under the index's write lock) reads-and-clears that
+// note and, if it was set, bumps ONE process-wide epoch that
+// RBACSubGenForSubject adds to every identity's sum. Later rebuilds never bump:
+// built never returns to false in production, so the note can only be taken
+// before the first build.
 //
 // WHY A GLOBAL TERM IN THE SUM IS SOUND. RBACSubGenForSubject is a sum of
 // counters that are each monotone non-decreasing (per-subject counters only ever
@@ -40,6 +55,8 @@ package cache
 import (
 	"expvar"
 	"sync/atomic"
+
+	clientcache "k8s.io/client-go/tools/cache"
 )
 
 var (
@@ -56,6 +73,65 @@ func notePreBuildRBACEvent() {
 	if RBACGen() > 0 {
 		rbacEventSeenPreBuild.Store(true)
 	}
+}
+
+// rbacSnapshotHandler wraps the RBAC snapshot handler set so the #682 note sees
+// isInInitialList (a plain ResourceEventHandlerFuncs drops it) and the event's
+// semantic shape. Every event is still delivered to the wrapped funcs unchanged.
+type rbacSnapshotHandler struct {
+	funcs     clientcache.ResourceEventHandlerFuncs
+	isBinding bool
+}
+
+func newRBACSnapshotHandler(funcs clientcache.ResourceEventHandlerFuncs, isBinding bool) rbacSnapshotHandler {
+	return rbacSnapshotHandler{funcs: funcs, isBinding: isBinding}
+}
+
+func (h rbacSnapshotHandler) OnAdd(obj interface{}, isInInitialList bool) {
+	if !h.isBinding && !isInInitialList {
+		bindingsByGVRSingleton().notePreBuildIfNotBuilt()
+	}
+	h.funcs.OnAdd(obj, isInInitialList)
+}
+
+func (h rbacSnapshotHandler) OnUpdate(oldObj, newObj interface{}) {
+	if preBuildUpdateRotates(h.isBinding, oldObj, newObj) {
+		bindingsByGVRSingleton().notePreBuildIfNotBuilt()
+	}
+	h.funcs.OnUpdate(oldObj, newObj)
+}
+
+func (h rbacSnapshotHandler) OnDelete(obj interface{}) {
+	if !h.isBinding {
+		bindingsByGVRSingleton().notePreBuildIfNotBuilt()
+	}
+	h.funcs.OnDelete(obj)
+}
+
+// preBuildUpdateRotates reports whether an UPDATE changes something only the
+// sub-gen can carry: a role's rules, or a binding's roleRef. An event that
+// cannot be normalised is treated as a change (doubt rotates).
+func preBuildUpdateRotates(isBinding bool, oldObj, newObj interface{}) bool {
+	if isBinding {
+		if o, ok := asCRB(oldObj); ok {
+			if n, ok := asCRB(newObj); ok {
+				return o.RoleRef != n.RoleRef
+			}
+			return true
+		}
+		if o, ok := asRB(oldObj); ok {
+			if n, ok := asRB(newObj); ok {
+				return o.RoleRef != n.RoleRef
+			}
+			return true
+		}
+		return true
+	}
+	o, n := roleSideOf(oldObj), roleSideOf(newObj)
+	if o.kind == "" || n.kind == "" || o.kind != n.kind {
+		return true
+	}
+	return !policyRulesEqual(o.rules, n.rules)
 }
 
 // rotateIfRBACEventSeenPreBuild is called by BuildBindingsByGVRIndex under the
