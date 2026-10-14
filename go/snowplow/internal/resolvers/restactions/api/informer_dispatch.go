@@ -159,18 +159,11 @@ func readerFromBytes(b []byte) io.ReadCloser {
 //
 // Per `feedback_no_special_cases.md`: the rule is `upper(Resource[0]) +
 // Resource[1:] + "List"` for every GVR. No switch arms.
+//
+// The rule lives in listenvelope.KindFor (#674), shared with internal/cache's
+// informer envelope, so every path names the same GVR's list identically.
 func listKindForResource(resource string) string {
-	if resource == "" {
-		return "List"
-	}
-	// ASCII-uppercase the first byte; K8s resource names are
-	// guaranteed lowercase ASCII per the CRD naming spec
-	// (kubernetes.io/docs/concepts/overview/working-with-objects/names/).
-	first := resource[0]
-	if first >= 'a' && first <= 'z' {
-		first -= 'a' - 'A'
-	}
-	return string(first) + resource[1:] + "List"
+	return listenvelope.KindFor(resource)
 }
 
 // marshalAsList produces the apiserver-shaped LIST envelope:

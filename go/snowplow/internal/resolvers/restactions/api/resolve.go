@@ -759,6 +759,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// #638 — the owning RESTAction, for the stage-filter failure line.
 		raNamespace: r.opts.RESTActionNamespace,
 		raName:      r.opts.RESTActionName,
+		// #674 — the E6 chokepoint applies to Kubernetes collection LISTs.
+		k8sList: isK8sListPath(call.Path),
 	}
 	inner := jsonHandler(gctx, hOpts)
 	innerBytesFn := jsonHandlerBytes(gctx, hOpts)
@@ -2121,3 +2123,10 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 // materialisation sites (stripManagedFields in apistage.go /
 // cluster_list.go). The function is intentionally deleted rather than
 // parked — feedback_no_park_broken_behind_flag.
+
+// isK8sListPath reports whether path is a Kubernetes collection LIST: an
+// apiserver path that names no object (#674, the E6 chokepoint).
+func isK8sListPath(path string) bool {
+	_, _, name, ok := cache.ParseAPIServerPathToDep(path)
+	return ok && name == ""
+}

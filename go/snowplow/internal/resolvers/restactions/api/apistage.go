@@ -396,10 +396,7 @@ func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw [
 // "group/version" otherwise — the apiserver convention marshalAsList
 // expects.
 func apiVersionForGVR(gvr schema.GroupVersionResource) string {
-	if gvr.Group == "" {
-		return gvr.Version
-	}
-	return gvr.Group + "/" + gvr.Version
+	return listenvelope.APIVersionFor(gvr.Group, gvr.Version) // shared with internal/cache (#674)
 }
 
 // callPathVerb adapts an httpcall.RequestOptions to the narrow interface

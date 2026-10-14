@@ -33,9 +33,42 @@ func Keys() []string { return []string{APIVersion, Items, Kind} }
 // empty list (`"items": []`, never null, so `.items[]` yields an empty
 // stream, as the apiserver does).
 func New(apiVersion, kind string, items []any) map[string]any {
+	if items == nil {
+		items = []any{}
+	}
 	return map[string]any{
 		APIVersion: apiVersion,
 		Kind:       kind,
 		Items:      items,
 	}
+}
+
+// For builds the envelope of a LIST of gvr with the apiVersion and kind
+// synthesized from the GVR, so every path serves the same envelope for the
+// same GVR whatever its items are (an empty list included).
+func For(group, version, resource string, items []any) map[string]any {
+	return New(APIVersionFor(group, version), KindFor(resource), items)
+}
+
+// APIVersionFor is the apiserver convention: "v" for the core group, "g/v"
+// otherwise.
+func APIVersionFor(group, version string) string {
+	if group == "" {
+		return version
+	}
+	return group + "/" + version
+}
+
+// KindFor is the LIST kind snowplow synthesizes from the resource: the
+// resource with its first ASCII letter upper-cased, plus "List" (PM
+// 2026-05-15, DEV-Q2), or "List" for an empty resource.
+func KindFor(resource string) string {
+	if resource == "" {
+		return "List"
+	}
+	first := resource[0]
+	if first >= 'a' && first <= 'z' {
+		first -= 'a' - 'A'
+	}
+	return string(first) + resource[1:] + "List"
 }

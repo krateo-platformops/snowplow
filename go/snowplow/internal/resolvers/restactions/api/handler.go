@@ -55,7 +55,21 @@ type jsonHandlerOptions struct {
 	// failure line (log attribution only; never part of the filter input).
 	raNamespace string
 	raName      string
+	// k8sList: this call is a Kubernetes collection LIST (an apiserver path
+	// with no object name). Its response is a list envelope, and E6 holds
+	// for it: see stageEnvelopeCheck.
+	k8sList bool
 }
+
+// stageEnvelopeCheck is the E6 behavioural chokepoint (#603 §1, #674): every
+// Kubernetes LIST envelope reaches a stage through jsonHandlerCore, whatever
+// built it (informer, content cache, cluster-list collapse, branch C,
+// httpcall.Do). Nil in production. This package's tests set it
+// (envelope_e6_chokepoint_test.go) to assert the envelope's keys are a
+// subset of listenvelope.Keys(), so a builder the AST scan cannot see (a
+// constant key, a split literal, a converter from another package) is
+// still caught when any dispatch test runs it.
+var stageEnvelopeCheck func(opts jsonHandlerOptions, tmp any)
 
 // jsonHandler is the HTTP-body-shaped entry point — the form
 // httpcall.Do's ResponseHandler contract requires. It io.ReadAll's the
@@ -144,6 +158,9 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 	// the filter input (same contract as pig["slice"]).
 	if len(opts.extras) > 0 {
 		pig["extras"] = opts.extras
+	}
+	if opts.k8sList && stageEnvelopeCheck != nil {
+		stageEnvelopeCheck(opts, tmp)
 	}
 	pig[opts.key] = tmp
 	if si, ok := opts.out["slice"]; ok {

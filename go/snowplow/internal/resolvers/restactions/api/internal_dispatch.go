@@ -18,9 +18,9 @@
 //   ListWatch used by the informer factory since R4/H2a). Per-page
 //   limit = listPageLimit (500) — matches every other LIST in snowplow
 //   and client-go's defaultPageSize. The walk accumulates items into a
-//   single *unstructured.UnstructuredList; the served bytes go through
-//   the SAME `list.UnstructuredContent()` marshal as the pre-0.30.250
-//   path so JQ downstream is byte-equivalent
+//   single *unstructured.UnstructuredList; the served bytes are the E6
+//   envelope (listenvelope.For, #674), the same one the request path and
+//   the informer branch serve, so JQ downstream sees one shape
 //   (feedback_cache_must_not_constrain_jq.md).
 //
 //   Behaviour-neutral for the no-internal-config branch (still served by
@@ -126,6 +126,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -787,15 +788,22 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		resultList.Items = narrowed
 	}
 
-	// CRITICAL — marshal resultList.UnstructuredContent(), NOT
-	// resultList.Object. UnstructuredContent() shallow-copies the
-	// envelope scalars (the page-1 Object map without its `items` key)
-	// AND folds the accumulated typed Items slice back into an `items`
-	// array — the exact apiserver LIST shape (apiVersion / kind /
-	// metadata / items) the JQ pipeline expects, byte-equivalent to the
-	// pre-0.30.250 unpaginated path and to httpcall.Do
-	// (feedback_cache_must_not_constrain_jq.md).
-	raw, mErr := json.Marshal(resultList.UnstructuredContent())
+	// E6 (#603 §1, #674) — NORMALISE to the envelope every other path
+	// serves: exactly {apiVersion, kind, items}, apiVersion/kind synthesized
+	// from the GVR (listenvelope.For), byte-identical to the request path's
+	// marshalAsList and to the informer branch above for the same items. The
+	// live list's metadata (resourceVersion; continue and remainingItemCount
+	// were already cleared) is DROPPED: the request path never carries it,
+	// so no JQ can depend on it, and keeping it made a branch-C re-resolve
+	// differ from the request path by resourceVersion alone (spurious #612
+	// "changed" verdicts) and broke the E6 invariant the #603 read-set
+	// analysis rests on (reviewer-603, #676). Pinned by
+	// TestE6_BranchCLiveListMatchesTheRequestPath (envelope_e6_test.go).
+	itemList := make([]any, 0, len(resultList.Items))
+	for i := range resultList.Items {
+		itemList = append(itemList, resultList.Items[i].Object)
+	}
+	raw, mErr := json.Marshal(listenvelope.For(gvr.Group, gvr.Version, gvr.Resource, itemList))
 	if mErr != nil {
 		return nil, false, mErr
 	}

@@ -245,7 +245,8 @@ func TestInternalRESTConfigDispatch_TrustsClusterCA(t *testing.T) {
 		t.Fatal("FIX BROKEN: expected the apiserver-path GET to be served via " +
 			"the internal *rest.Config dispatcher")
 	}
-	if !strings.Contains(string(raw), "NamespaceList") {
+	// The E6 envelope (#674/#676): the request path's list kind for the GVR.
+	if !strings.Contains(string(raw), `"kind":"NamespacesList"`) {
 		t.Fatalf("FIX BROKEN: served body is not the apiserver LIST envelope: %q",
 			string(raw))
 	}
