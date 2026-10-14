@@ -27,6 +27,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -141,6 +142,29 @@ func i703Setup(t *testing.T, carolBound bool) (*ResourceWatcher, dynamic.Interfa
 	t.Cleanup(func() { SetGlobal(nil) })
 	if err := rw.WaitRBACQuiescentForTest(10 * time.Second); err != nil {
 		t.Fatal(err)
+	}
+	// The fake cluster delivers a create only to a WATCH already registered,
+	// and nothing here waits for the eager RBAC informers' watches (the arms'
+	// events would be lost and no rebuild would ever run). Create probe
+	// bindings until one reaches a published snapshot: from then on the
+	// clusterrolebindings watch is live. Before the bindings index is built,
+	// so no sub-gen bump is recorded.
+	for i := 0; ; i++ {
+		probe := fmt.Sprintf("watch-probe-%d", i)
+		i703CreateCRB(t, dyn, probe, probe)
+		deadline := time.Now().Add(200 * time.Millisecond)
+		live := false
+		for !live && time.Now().Before(deadline) {
+			publishRBACSnapshotUnderSlot(rw)
+			live = i703SnapGrants(probe)
+			time.Sleep(5 * time.Millisecond)
+		}
+		if live {
+			break
+		}
+		if i >= 100 {
+			t.Fatal("precondition: the clusterrolebindings watch never delivered a create")
+		}
 	}
 	if carolBound {
 		i703CreateCRB(t, dyn, "grant-carol", i703User)
