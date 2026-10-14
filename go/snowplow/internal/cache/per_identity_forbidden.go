@@ -31,7 +31,8 @@
 // is not an external touch.
 //
 // WHERE IT IS READ. DenialOnly is the ONE Put predicate for the /call RA and
-// widget gates, the refresher and the cohort seed; GenuineExternal is the ONE
+// widget gates, the refresher, the cohort seed and (#684) the apiref raFullList
+// full-list cell (over its own child sinks, WithChildPutGateSinks); GenuineExternal is the ONE
 // external count for those gates AND for every declined-external (DES) mark site
 // (#656 seed / engine, #680 walk).
 //
@@ -63,20 +64,23 @@ var ctxKeyPerIdentityForbiddenSink = ctxKeyPerIdentityForbiddenSinkType{}
 type PerIdentityForbiddenSink struct {
 	stage    atomic.Int64
 	external atomic.Int64
+	// parent is the enclosing resolve's sink when this is a CHILD sink
+	// (WithChildPutGateSinks, #684); every bump is forwarded to it.
+	parent *PerIdentityForbiddenSink
 }
 
 // BumpStage records one per-identity forbidden stage error (F1 or F2).
 func (s *PerIdentityForbiddenSink) BumpStage() {
-	if s != nil {
-		s.stage.Add(1)
+	for cur := s; cur != nil; cur = cur.parent {
+		cur.stage.Add(1)
 	}
 }
 
 // BumpExternal records that a per-identity forbidden (F2) dial was the one that
 // bumped the ExternalTouchedSink.
 func (s *PerIdentityForbiddenSink) BumpExternal() {
-	if s != nil {
-		s.external.Add(1)
+	for cur := s; cur != nil; cur = cur.parent {
+		cur.external.Add(1)
 	}
 }
 
@@ -116,6 +120,39 @@ func PerIdentityForbiddenSinkFromContext(ctx context.Context) *PerIdentityForbid
 	return s
 }
 
+// PutGateSinks is a NESTED resolve's own view of the three #681 Put-gate
+// signals: stage errors, per-identity forbiddens and external touches.
+type PutGateSinks struct {
+	Stage     *StageErrorSink
+	Forbidden *PerIdentityForbiddenSink
+	External  *ExternalTouchedSink
+}
+
+// WithChildPutGateSinks installs a CHILD stage-error, per-identity forbidden
+// and external-touched sink on ctx (#684). A nested resolve that Puts its own
+// cell (the apiref raFullList full list) gates that Put on what IT resolved,
+// not on whatever the enclosing /call had already recorded: an unrelated
+// failing widget stage must not decline the full-list cell, and the full list
+// must not be admitted on the strength of the enclosing counts either.
+//
+// Each child FORWARDS every bump to the sink already on ctx (if any), so the
+// enclosing Put site still observes everything resolved beneath it — exactly
+// the chaining SensitiveTouchedSink has (#398).
+func WithChildPutGateSinks(ctx context.Context) (context.Context, PutGateSinks) {
+	g := PutGateSinks{
+		Stage:     &StageErrorSink{parent: StageErrorSinkFromContext(ctx)},
+		Forbidden: &PerIdentityForbiddenSink{parent: PerIdentityForbiddenSinkFromContext(ctx)},
+		External:  &ExternalTouchedSink{parent: ExternalTouchedSinkFromContext(ctx)},
+	}
+	if ctx == nil {
+		return ctx, g
+	}
+	ctx = context.WithValue(ctx, ctxKeyStageErrorSink, g.Stage)
+	ctx = context.WithValue(ctx, ctxKeyPerIdentityForbiddenSink, g.Forbidden)
+	ctx = context.WithValue(ctx, ctxKeyExternalTouchedSink, g.External)
+	return ctx, g
+}
+
 // GenuineExternal is the external-touch count with the own-credential apiserver
 // 403s (F2) removed — the ONE definition every Put gate and every
 // declined-external mark site uses (#681 C2). Never negative.
@@ -144,11 +181,14 @@ const (
 	DenialOnlyPutSiteCallWidget = "call_widget"
 	DenialOnlyPutSiteRefresher  = "refresher"
 	DenialOnlyPutSiteSeed       = "seed"
+	// #684 — the apiref paginated full-list (raFullList) cell.
+	DenialOnlyPutSiteRAFullList = "ra_full_list"
 )
 
 // DenialOnlyPutSites is the closed site set, in emit order.
 var DenialOnlyPutSites = []string{
 	DenialOnlyPutSiteCallRA, DenialOnlyPutSiteCallWidget, DenialOnlyPutSiteRefresher, DenialOnlyPutSiteSeed,
+	DenialOnlyPutSiteRAFullList,
 }
 
 var (

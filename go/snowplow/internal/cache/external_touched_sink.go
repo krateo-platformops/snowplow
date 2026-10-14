@@ -52,15 +52,17 @@ var ctxKeyExternalTouchedSink = ctxKeyExternalTouchedSinkType{}
 // errgroup workers of a multi-stage resolve, so all access is atomic.
 type ExternalTouchedSink struct {
 	count atomic.Int64
+	// parent is the enclosing resolve's sink when this is a CHILD sink
+	// (WithChildPutGateSinks, #684); every bump is forwarded to it.
+	parent *ExternalTouchedSink
 }
 
 // Bump records one external-fetch touch. nil-receiver-safe so the bump site
 // can call it unconditionally even when no sink is installed on ctx.
 func (s *ExternalTouchedSink) Bump() {
-	if s == nil {
-		return
+	for cur := s; cur != nil; cur = cur.parent {
+		cur.count.Add(1)
 	}
-	s.count.Add(1)
 }
 
 // Count returns the number of external-fetch touches recorded.
