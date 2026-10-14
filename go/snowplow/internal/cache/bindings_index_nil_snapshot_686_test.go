@@ -87,3 +87,58 @@ func TestIssue686_BindingsIndexBuildOnNilSnapshotIsDeferred(t *testing.T) {
 		t.Fatalf("the deferred navigated set was not cleared after the build: %v", pending)
 	}
 }
+
+// TestIssue686_GVRDiscoveredWhileDeferredIsNotLost is reviewer-small's
+// falsifier from the #689 gate. A GVR discovered (AddNavigatedGVR) while the
+// index build is DEFERRED must survive the deferred build. That build resets
+// navigated to its own set. Without carrying the GVR into pendingNavigated,
+// no binding granting it would ever be enrolled: byGVR stays empty and its
+// narrow cohorts are skipped forever. RED on 9ad0ea55, 10/10.
+func TestIssue686_GVRDiscoveredWhileDeferredIsNotLost(t *testing.T) {
+	deadline := time.Now().Add(time.Minute)
+	for rbacRebuildLock.Load() || rbacRebuildDirty.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("an RBAC snapshot rebuild is still in flight after 1m")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	prev := rbacSnap.Load()
+	rbacSnap.Store(nil)
+	t.Cleanup(func() { rbacSnap.Store(prev) })
+	ResetBindingsByGVRIndexForTest()
+	t.Cleanup(ResetBindingsByGVRIndexForTest)
+
+	BuildBindingsByGVRIndex([]schema.GroupVersionResource{{Group: "", Version: "v1", Resource: "configmaps"}})
+	if BindingsByGVRIndexBuilt() {
+		t.Fatal("precondition: the build over a nil snapshot must be deferred")
+	}
+	panels := schema.GroupVersionResource{Group: "widgets.example.io", Version: "v1", Resource: "panels"}
+	AddNavigatedGVR(panels) // discovered while the build is deferred
+
+	role := &rbacv1.Role{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "panel-reader"},
+		Rules:      []rbacv1.PolicyRule{{APIGroups: []string{"widgets.example.io"}, Resources: []string{"panels"}, Verbs: []string{"get", "list"}}},
+	}
+	rb := &rbacv1.RoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "panel-reader-bind", UID: "rb-686-panels"},
+		Subjects:   []rbacv1.Subject{{Kind: "User", APIGroup: "rbac.authorization.k8s.io", Name: "u-686"}},
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "panel-reader"},
+	}
+	rw := newSnapshotTestWatcher(t, role, rb)
+	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if !BindingsByGVRIndexBuilt() {
+		t.Fatal("the first publish did not run the deferred build")
+	}
+	idx := bindingsByGVRSingleton()
+	idx.mu.RLock()
+	_, navigated := idx.navigated[grFromGVR(panels)]
+	enrolled := len(idx.byGVR[grFromGVR(panels)])
+	idx.mu.RUnlock()
+	if !navigated || enrolled == 0 {
+		t.Fatalf("#686: the GVR discovered while the build was deferred was lost: navigated=%v byGVR[panels]=%d", navigated, enrolled)
+	}
+}

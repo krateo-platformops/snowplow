@@ -419,10 +419,16 @@ func (idx *bindingsByGVRIndex) unrolLocked(id bindingID, rk string) {
 // Returns the number of bindings enrolled (CRB + RB resolved).
 func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
 	idx := bindingsByGVRSingleton()
-	snap := rbacSnap.Load()
 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	// #686 (reviewer-small's #689 gate): load the snapshot UNDER idx.mu. A
+	// publish landing between an unlocked Load (nil) and this Lock would run
+	// buildPendingBindingsIndex while pendingNavigated is still unset, and
+	// the deferral recorded below would then wait for the NEXT publish. Under
+	// the lock, the publisher's buildPendingBindingsIndex blocks on its RLock
+	// until the deferral is recorded, then runs it.
+	snap := rbacSnap.Load()
 
 	// #682 — the FIRST false→true transition of built rotates every
 	// per-identity key once if an RBAC event landed between the first publish
@@ -558,6 +564,14 @@ func AddNavigatedGVR(gvr schema.GroupVersionResource) {
 		return
 	}
 	idx.navigated[gr] = struct{}{}
+	// #686 (reviewer-small's #689 gate): while a build is DEFERRED (no
+	// snapshot yet), the deferred build will RESET navigated to its own set.
+	// Carry the discovered GVR into that set, or it is lost for good: no
+	// binding would ever be enrolled under it, and its narrow cohorts would
+	// be skipped forever.
+	if !idx.built && idx.pendingNavigated != nil {
+		idx.pendingNavigated = append(idx.pendingNavigated, gvr)
+	}
 
 	snap := rbacSnap.Load()
 	if snap == nil {
