@@ -1,6 +1,8 @@
-"""Bench run 4: install the installer from a LOCAL chart (installer#483 branch
-fix/482-alert-crd-gate), preflight the branch before any cluster exists, and
-assert the #483 outcome (verify483) before the 50K measurement.
+"""Bench run 5: install the RELEASED installer (0.3.425, #483 merged) the
+ordinary OCI way, preflight the registry chart (resolves + carries the #483
+pins) before any cluster exists, and assert the #483 outcome (verify483,
+headline item 4) before the 50K measurement. Local-chart mode is refused:
+it cannot work for this installer (run 4; self-bootstrap.yaml:215).
 
 Uses the fake gcloud/kubectl/helm harness from test_run606_real_sequence.
 """
@@ -36,10 +38,13 @@ def _chart(tmp_path, *, feature="portal", obs_deps=("alert-provider-crd",),
     return chart
 
 
-def _env483(env, chart):
+def _env483(env, chart=None):
+    """OCI-version mode (run 5). `chart` is accepted and ignored for callers
+    written against the run-4 local-chart signature."""
     env = dict(env)
-    env.pop("INSTALLER_VERSION", None)
-    env.update(INSTALLER_CHART_DIR=str(chart), VERIFY483="1")
+    for k in ("INSTALLER_CHART_DIR", "INSTALLER_GIT_REF"):
+        env.pop(k, None)
+    env.update(INSTALLER_VERSION="0.3.425", VERIFY483="1")
     return env
 
 
@@ -112,7 +117,8 @@ def test_chart_inspector_error_is_kept_verbatim():
     assert len(errs) == 1 and long_msg in errs[0]
 
 
-# ─── run606.sh end to end (fake tools) ──────────────────────────────────────
+
+# ─── run606.sh end to end (fake tools), OCI-version mode ────────────────────
 
 
 def _run(env):
@@ -120,61 +126,123 @@ def _run(env):
                           capture_output=True, text=True, timeout=300)
 
 
-def test_local_chart_run_passes_verify483_and_continues_to_measurement(harness):
+def test_oci_run_passes_verify483_headline_first_and_continues(harness):
     env, state, ambient, tmp = harness
-    chart = _chart(tmp)
-    env = _env483(env, chart)
+    env = _env483(env)
     env["FAKE_483"] = "pass"
     env["FAKE_KOG"] = "1"         # run 3's private-registry 401 — known, unrelated
     p = _run(env)
     out = p.stdout + p.stderr
     assert p.returncode == 0, out[-3000:]
-    assert "installer source: LOCAL chart" in out
+    assert "registry preflight OK, #483 pins present" in out
     # both layers read: the Installer's Ready.message names the CD child
     assert "1 of 41 managed children are not ready" in out
     assert ("ALLOWED(known): compositiondefinitions/krateo-system/github-provider-kog"
             "[response status code 401]") in out
     assert "[platform] verdict READY (with allow-listed known-unrelated" in out
+    # HEADLINE: item 4 printed FIRST among the verify483 result lines
+    vlines = [ln for ln in out.splitlines() if ln.startswith("[verify483]")]
+    assert vlines[0] == "[verify483] HEADLINE (4) PASS alert-provider ABSENT (present = gate too wide)"
+    assert vlines[1].startswith("[verify483] (4) PASS")
     v = json.loads((tmp / "out" / "verify483.json").read_text())
-    assert v["verdict"] == "PASS"
+    assert v["verdict"] == "PASS" and v["headline"]["result"] == "PASS"
+    assert v["checks"][0]["item"] == 4
+    assert sorted(c["item"] for c in v["checks"]) == [1, 2, 3, 4, 6]
     assert [a["id"] for a in v["known_unrelated_allowed"]] == [
         "compositiondefinitions/krateo-system/github-provider-kog"]
-    assert "[verify483] KNOWN-UNRELATED not ready (allowed)" in out
     assert v["recorded"]["sre_pod_crashloop_present"] is True
     assert "[verify483] (5) RECORDED" in out
     # it went on into the measurement
     assert "=== step data ===" in p.stderr and "=== step measure ===" in p.stderr
-    helm_install = [c["argv"] for c in _calls(state)
-                    if c["tool"] == "helm" and "install" in c["argv"]]
-    assert len(helm_install) == 1
-    assert str(chart) in helm_install[0] and "--version" not in helm_install[0]
+    helm = [c["argv"] for c in _calls(state) if c["tool"] == "helm"]
+    assert helm[0][:2] == ["show", "chart"] and "0.3.425" in helm[0]
+    install = [a for a in helm if "install" in a]
+    assert len(install) == 1
+    assert "oci://ghcr.io/krateo-platformops/charts/installer" in install[0]
+    assert install[0][install[0].index("--version") + 1] == "0.3.425"
     pre = json.loads((tmp / "out" / "installer-preflight.json").read_text())
-    assert pre["ok"]
+    assert pre["ok"] and pre["resolved_version"] == "0.3.425"
+    assert pre["requirements"]
 
 
-def test_wrong_branch_refuses_before_any_cloud_call(harness):
+@pytest.mark.parametrize("envkv,needle", [
+    ({"FAKE_PINS": "bad"}, "alert-provider-crd.feature"),
+    ({"FAKE_CHART_MISSING": "1"}, "helm show chart"),
+])
+def test_registry_preflight_refuses_before_any_cluster_call(harness, envkv, needle):
     env, state, ambient, tmp = harness
-    env = _env483(env, _chart(tmp, feature="specialistAgents"))
+    env = _env483(env)
+    env.update(envkv)
     p = _run(env)
     assert p.returncode != 0
-    assert "installer preflight REFUSED" in p.stderr
-    assert not [c for c in _calls(state) if c["tool"] in ("gcloud", "kubectl", "helm")]
+    assert "installer registry preflight REFUSED" in p.stderr and needle in p.stderr
+    calls = _calls(state)
+    assert not [c for c in calls if c["tool"] in ("gcloud", "kubectl")]
+    assert all(c["argv"][:1] in (["show"], ["pull"]) for c in calls if c["tool"] == "helm")
     assert "teardown" not in p.stderr
+
+
+def test_pins_are_only_required_with_verify483(harness):
+    env, state, ambient, tmp = harness
+    env = _env483(env)
+    env["VERIFY483"] = "0"
+    env["FAKE_PINS"] = "bad"           # an older installer: fine without VERIFY483
+    p = _run(env)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-2000:]
+    assert "=== step verify483 ===" not in p.stderr
+
+
+@pytest.mark.parametrize("var", ["INSTALLER_GIT_REF", "INSTALLER_CHART_DIR"])
+def test_local_chart_mode_is_refused(harness, var):
+    env, state, ambient, tmp = harness
+    env = _env483(env)
+    env[var] = "fix/482-alert-crd-gate" if var == "INSTALLER_GIT_REF" else str(tmp)
+    p = _run(env)
+    assert p.returncode == 2
+    assert "self-bootstrap.yaml:215" in p.stderr
+    assert not _calls(state)
 
 
 def test_gate_too_wide_fails_verify483_with_diagnostics_and_teardown(harness):
     env, state, ambient, tmp = harness
-    env = _env483(env, _chart(tmp))
+    env = _env483(env)
     env["FAKE_483"] = "wide"
     p = _run(env)
     out = p.stdout + p.stderr
     assert p.returncode != 0
-    assert "[verify483] (4) FAIL alert-provider ABSENT" in out
+    assert "[verify483] HEADLINE (4) FAIL alert-provider ABSENT" in out
     assert "=== step data ===" not in p.stderr          # no measurement
     diag = tmp / "out" / "diagnostics"
     assert (diag / "focus-483.json").exists()
     assert (diag / "chart-inspector-errors.txt").exists()
+    readme = (diag / "README.txt").read_text()
+    assert "self-bootstrap.yaml:215" in readme and "chart-inspector clean" in readme
     focus = json.loads((diag / "focus-483.json").read_text())
     assert focus["components"]["alert-provider-crd"]["component_cr"]["Ready"]["status"] == "True"
     gcl = [c["argv"][:4] for c in _calls(state) if c["tool"] == "gcloud"]
     assert ["container", "clusters", "delete", RUN_NAME] in gcl
+
+
+def test_oci_preflight_unit(tmp_path):
+    """oci_preflight against a fake `helm` runner (no subprocess)."""
+    import types
+
+    def runner(argv, **kw):
+        if argv[:3] == ["helm", "show", "chart"]:
+            return types.SimpleNamespace(returncode=0, stdout="version: 0.3.425\n", stderr="")
+        if argv[:2] == ["helm", "pull"]:
+            d = argv[argv.index("-d") + 1]
+            src = _chart(tmp_path, version="0.3.425")
+            import shutil
+            shutil.copytree(src, f"{d}/installer")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(argv)
+    res = installer_src.oci_preflight("oci://x/installer", "0.3.425",
+                                      str(tmp_path / "pulled"), run=runner)
+    assert res["ok"], res
+
+    def wrong_version(argv, **kw):
+        return types.SimpleNamespace(returncode=0, stdout="version: 0.3.424\n", stderr="")
+    res = installer_src.oci_preflight("oci://x/installer", "0.3.425",
+                                      str(tmp_path / "p2"), run=wrong_version)
+    assert not res["ok"] and "resolved version" in res["failures"][0]

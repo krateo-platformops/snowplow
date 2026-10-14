@@ -239,6 +239,27 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
     kc = a[a.index("--kubeconfig") + 1] if "--kubeconfig" in a else os.environ.get("KUBECONFIG")
     ctx = a[a.index("--kube-context") + 1] if "--kube-context" in a else None
     record("helm", kc, ctx)
+    ver = a[a.index("--version") + 1] if "--version" in a else "0"
+    if a[:2] == ["show", "chart"]:
+        if os.environ.get("FAKE_CHART_MISSING") == "1":
+            print("Error: not found", file=sys.stderr); sys.exit(1)
+        print(f"apiVersion: v2\\nname: installer\\nversion: {ver}"); sys.exit(0)
+    if a[:1] == ["pull"]:
+        d = os.path.join(a[a.index("-d") + 1], "installer")
+        os.makedirs(os.path.join(d, "files"), exist_ok=True)
+        os.makedirs(os.path.join(d, "charts"), exist_ok=True)
+        open(os.path.join(d, "charts", "core-provider-2.13.24.tgz"), "w").write("x")
+        open(os.path.join(d, "Chart.yaml"), "w").write(json.dumps({
+            "apiVersion": "v2", "name": "installer", "version": ver,
+            "dependencies": [{"name": "core-provider", "version": "2.13.24"}]}))
+        good = os.environ.get("FAKE_PINS", "good") == "good"
+        open(os.path.join(d, "files", "component-pins.yaml"), "w").write(json.dumps({
+            "components": [
+                {"name": "alert-provider-crd", "feature": "portal" if good else "specialistAgents"},
+                {"name": "alert-provider", "feature": "specialistAgents"},
+                {"name": "krateo-observability", "feature": "portal",
+                 "deps": ["clickhouse-operator"] + (["alert-provider-crd"] if good else [])}]}))
+        sys.exit(0)
     if "list" in a:
         print(json.dumps([{"name": "installer", "namespace": "krateo-system",
                            "status": "deployed", "chart": "installer-0.3.422"}]))

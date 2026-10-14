@@ -1,6 +1,17 @@
-"""#606 installer source for the bench: the published OCI chart, or a LOCAL
-chart built from an installer git branch (run 4: installer#483, branch
-fix/482-alert-crd-gate, unreleased).
+"""#606 installer source checks for the bench.
+
+oci-preflight  THE install path (run 5+): the published OCI chart must
+               resolve, and its pinned components must satisfy the #483 gate.
+
+LOCAL-CHART MODE CANNOT WORK for this installer (run 4, 2026-10-14): the
+installer's own self-CompositionDefinition resolves its chart from the
+registry at .Chart.Version (templates/self-bootstrap.yaml:215), and the cdc
+ServiceAccount / CR version are derived from .Chart.Version too
+(self-bootstrap.yaml:71-72, ordered-teardown.yaml:30). A locally stamped
+version (0.0.0-pr483) does not exist in the registry, so the install can
+never converge. run606.sh therefore refuses INSTALLER_GIT_REF /
+INSTALLER_CHART_DIR; `prepare` / `preflight` stay only as building blocks
+(oci-preflight reuses `preflight` on the pulled chart).
 
 STDLIB + PyYAML only, no bench imports (it runs before any cluster exists).
 
@@ -88,6 +99,45 @@ def preflight(chart_dir: str, requirements=PR483_REQUIREMENTS) -> dict:
             "ok": not fails, "failures": fails}
 
 
+def oci_preflight(chart_ref: str, version: str, workdir: str,
+                  requirements=PR483_REQUIREMENTS, run=subprocess.run) -> dict:
+    """Registry preflight for the ORDINARY install path (run 5+).
+
+    1. `helm show chart <ref> --version <v>` must resolve (published, pullable);
+    2. the pulled chart's files/component-pins.yaml must satisfy `requirements`
+       (default: the #483 gate — alert-provider-crd.feature == portal,
+       krateo-observability.deps contains alert-provider-crd).
+    Read-only (ghcr only); runs before any cluster exists.
+    """
+    res: dict = {"chart": chart_ref, "version": version, "ok": False, "failures": []}
+    show = run(["helm", "show", "chart", chart_ref, "--version", version],
+               capture_output=True, text=True)
+    if show.returncode != 0:
+        res["failures"].append(f"helm show chart {chart_ref} --version {version} "
+                               f"failed: {(show.stderr or '').strip()[:300]}")
+        return res
+    meta = yaml.safe_load(show.stdout or "") or {}
+    res["resolved_version"] = meta.get("version")
+    if str(meta.get("version")) != str(version):
+        res["failures"].append(f"resolved version {meta.get('version')!r} != {version!r}")
+        return res
+    os.makedirs(workdir, exist_ok=True)
+    pull = run(["helm", "pull", chart_ref, "--version", version, "--untar",
+                "-d", workdir], capture_output=True, text=True)
+    if pull.returncode != 0:
+        res["failures"].append(f"helm pull failed: {(pull.stderr or '').strip()[:300]}")
+        return res
+    sub = [d for d in os.listdir(workdir) if os.path.isdir(os.path.join(workdir, d))]
+    if len(sub) != 1:
+        res["failures"].append(f"unexpected pull layout in {workdir}: {sub}")
+        return res
+    inner = preflight(os.path.join(workdir, sub[0]), requirements)
+    res["failures"] += inner["failures"]
+    res["requirements"] = inner["requirements"]
+    res["ok"] = not res["failures"]
+    return res
+
+
 def prepare(ref: str, dest: str, version: str, repo: str = INSTALLER_REPO,
             run=subprocess.run) -> str:
     """Clone + stamp + vendor. Returns the chart directory."""
@@ -117,6 +167,13 @@ def main(argv=None) -> int:
     pr.add_argument("--dest", required=True)
     pr.add_argument("--version", required=True)
     pr.add_argument("--repo", default=INSTALLER_REPO)
+    op = sub.add_parser("oci-preflight")
+    op.add_argument("--chart", required=True)
+    op.add_argument("--version", required=True)
+    op.add_argument("--workdir", required=True)
+    op.add_argument("--out", default=None)
+    op.add_argument("--no-pins", action="store_true",
+                    help="only check the chart resolves (no #483 pin assertions)")
     pf = sub.add_parser("preflight")
     pf.add_argument("--chart-dir", required=True)
     pf.add_argument("--require-pin", action="append", default=None,
@@ -125,6 +182,18 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     if a.cmd == "prepare":
         print(prepare(a.ref, a.dest, a.version, a.repo))
+        return 0
+    if a.cmd == "oci-preflight":
+        res = oci_preflight(a.chart, a.version, a.workdir,
+                            () if a.no_pins else PR483_REQUIREMENTS)
+        if a.out:
+            with open(a.out, "w") as fh:
+                json.dump(res, fh, indent=2)
+        print(json.dumps(res, indent=2), file=sys.stderr)
+        if not res["ok"]:
+            print("installer registry preflight REFUSED: " + "; ".join(res["failures"]),
+                  file=sys.stderr)
+            return 2
         return 0
     reqs = ([_parse_req(r) for r in a.require_pin] if a.require_pin
             else PR483_REQUIREMENTS)

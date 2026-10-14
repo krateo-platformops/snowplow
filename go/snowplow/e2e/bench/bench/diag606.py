@@ -139,6 +139,20 @@ Other files:
   events.json                  last 1000 events, oldest first: time,type,reason,object,count,message
   pvcs.json  nodes.json  helm-list.json
   logs/<ns>__<pod>__<container>__{current,previous}.log   last 200 lines, failing pods only
+
+Method notes (learned the hard way; read before changing how the bench installs):
+  * LOCAL-CHART INSTALLS CANNOT WORK for this installer (run 4, 2026-10-14). The
+    installer's self-CompositionDefinition pulls its OWN chart from the registry at
+    .Chart.Version (installer chart templates/self-bootstrap.yaml:215), and the cdc
+    ServiceAccount and CR version are derived from .Chart.Version as well
+    (self-bootstrap.yaml:71, :72; ordered-teardown.yaml:30). A locally stamped
+    version (e.g. 0.0.0-pr483) does not exist in the registry, so the install never
+    converges. Fixes must be merged and RELEASED, then installed by INSTALLER_VERSION;
+    run606.sh refuses INSTALLER_GIT_REF / INSTALLER_CHART_DIR.
+  * "chart-inspector clean" is NOT evidence an install is progressing (run 4): with
+    no chart-inspector error anywhere, the install still could not converge. Judge
+    progress by the Installer CR's Ready.message children and the CR/CD tallies in
+    platform-state.json, never by the absence of an error.
 """
 
 
@@ -296,7 +310,13 @@ def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
             "alerts": alert_rows,
             "as_expected": ("sre-pod-crashloop" in names
                             and not any(r["has_status"] for r in alert_rows))}
+    # Item 4 is the HEADLINE (run 5): the #483 gate must install the CRD
+    # without pulling in alert-provider. It is listed first everywhere.
+    checks.sort(key=lambda c: (c["item"] != 4, c["item"]))
+    headline = next(c for c in checks if c["item"] == 4)
     return {"verdict": "PASS" if all(c["pass"] for c in checks) else "FAIL",
+            "headline": {"item": 4, "check": headline["check"],
+                         "result": "PASS" if headline["pass"] else "FAIL"},
             "checks": checks, "recorded": info,
             "known_unrelated_allowed": st["allowed_not_ready"],
             "allow_list": st["allow_list"],
@@ -615,6 +635,8 @@ def main(argv=None) -> int:
         res = verify483(k)
         with open(a.out, "w") as fh:
             fh.write(redact(json.dumps(res, indent=2, default=str)))
+        h = res["headline"]
+        print(f"[verify483] HEADLINE (4) {h['result']} {h['check']}", flush=True)
         for c in res["checks"]:
             print(f"[verify483] ({c['item']}) {'PASS' if c['pass'] else 'FAIL'} "
                   f"{c['check']}", flush=True)
@@ -628,7 +650,8 @@ def main(argv=None) -> int:
         for a in res["known_unrelated_allowed"]:
             print(f"[verify483] KNOWN-UNRELATED not ready (allowed): {a['id']} "
                   f"reason matched {a['expected_reason']!r}", flush=True)
-        print(f"[verify483] verdict {res['verdict']}", flush=True)
+        print(f"[verify483] verdict {res['verdict']} "
+              f"(headline: alert-provider ABSENT = {h['result']})", flush=True)
         return 0 if res["verdict"] == "PASS" else 1
     if a.cmd == "wait-installer":
         return 0 if wait_installer(k, timeout_s=a.timeout_s,
