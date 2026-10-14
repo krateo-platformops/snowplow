@@ -286,8 +286,10 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 // nonOKStatus shapes a non-2xx response into the Failure envelope the
 // caller records under the stage's errorKey.
 //
-// A body that decodes as a Status keeps its own code, reason and message — the
-// apiserver's 404 names the missing object. #709: two shapes used to lose the
+// A body that decodes as a Status keeps its message — the apiserver's 404 names
+// the missing object. Its code is always the HTTP status line's, and its reason
+// survives only if it agrees with that code (#714, upstream_status.go). #709:
+// two shapes used to lose the
 // upstream answer, and both now keep the HTTP status code:
 //   - an EMPTY body: the decode failed and the envelope message was "", so a
 //     404 reported nothing about what was missing. It now says what the
@@ -308,9 +310,11 @@ func nonOKStatus(code int, dat []byte) *response.Status {
 	if jerr := json.Unmarshal(dat, res); jerr != nil {
 		return response.New(code, fmt.Errorf("%s", string(dat)))
 	}
-	if res.Code == 0 {
-		res.Code = code
-	}
+	// #714 — the status line is the truth: a body cannot claim another code,
+	// and a claimed reason survives only if it agrees with the code
+	// (upstream_status.go).
+	res.Code = code
+	res.Reason = response.StatusReason(trustedReason(string(res.Reason), code))
 	if res.Status != response.StatusFailure {
 		res.Status = response.StatusFailure
 	}
