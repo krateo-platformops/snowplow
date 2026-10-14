@@ -974,7 +974,10 @@ func init() {
 		Name:      "rbac.snapshot_writer",
 		Predicate: isTypedRBACGVR,
 		Handlers: func(rw *ResourceWatcher, gvr schema.GroupVersionResource) clientcache.ResourceEventHandler {
-			handlers := rw.rbacSnapshotEventHandlers(gvr)
+			// #682 — wrapped so the pre-build note sees isInInitialList and
+			// the event's semantic shape (rbac_subgen_epoch.go).
+			handlers := newRBACSnapshotHandler(rw.rbacSnapshotEventHandlers(gvr),
+				gvr == clusterRoleBindingsTypedGVR || gvr == roleBindingsTypedGVR)
 			// markRBACSnapshotWired records that at least one typed-RBAC
 			// informer was wired with the snapshot event handler — the
 			// pre-condition AssertRBACSnapshotWired enforces at boot.

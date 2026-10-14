@@ -135,7 +135,10 @@ func walkMarkDeclinedExternal(resCtx context.Context, key string, in *unstructur
 	if set == nil {
 		return
 	}
-	if cache.ExternalTouchedSinkFromContext(resCtx).Count() == 0 {
+	// #681 C2 — the ONE external count: an own-credential apiserver 403 (F2)
+	// is not a genuine external touch.
+	if cache.GenuineExternal(cache.ExternalTouchedSinkFromContext(resCtx),
+		cache.PerIdentityForbiddenSinkFromContext(resCtx)) == 0 {
 		return // observed touch only (I-5)
 	}
 	if errored && !walkErroredMarkableFn(in) {

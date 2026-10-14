@@ -351,6 +351,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// partial-with-errors widget envelope is SERVED but MUST NOT be cached
 	// in the per-cohort `widgets` L1 — gated on sink.Count()==0 below.
 	ctx, stageErrSink := cache.WithStageErrorSink(ctx)
+	// #681 — per-identity forbidden sink (see restactions.go).
+	ctx, forbiddenSink := cache.WithPerIdentityForbiddenSink(ctx)
 	// External-no-cache (proposal 2026-06-22) — install the external-touched
 	// sink. A widget's apiRef RESTAction (and any nested resolve) runs under
 	// THIS ctx; the api resolver bumps the sink when it reaches the live
@@ -496,7 +498,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("uaf_reason", uafDeclineObserved),
 			slog.String("effect", "envelope served (200) narrowed for THIS requester; not persisted — the widgets cell is keyed per BINDING, so a co-bound user would be served these rows verbatim (1.12.3 A-1/R-1; 1.13.0 folds the UAF scope into the key)"),
 		)
-	} else if stageErrSink.Count() > 0 {
+	} else if stageErrSink.Count() > 0 && !cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, "widgets") {
+		// #681 — a denial-only envelope is cached below (twin of restactions.go).
 		// A bare decline, twin of restactions.go: the partial envelope is
 		// SERVED (written below) and not persisted. 1.12.6 C9 retired the D
 		// bounded-partial Put that used to sit here (PARTIAL_RESULT_TTL_SECONDS).
@@ -504,7 +507,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
 		)
-	} else if extTTL := externalCacheTTLFromAnnotations(got.Unstructured); extTouchedSink.Count() > 0 && extTTL > 0 &&
+	} else if extTTL := externalCacheTTLFromAnnotations(got.Unstructured); cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 && extTTL > 0 &&
 		cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
 		// External-widget bounded-TTL cache (Option A, 2026-07-10) — the
 		// widget's resolve touched a genuine external endpoint AND the widget
@@ -550,7 +553,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("external_ttl", extTTL.String()),
 			slog.String("effect", "body served (200) + persisted under the per-binding widgets key with TTLOverride; served from L1 for <=TTL then re-fetched live; NO dep-Record, NO publish, NO /refreshes arm"),
 		)
-	} else if extTouchedSink.Count() > 0 {
+	} else if cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 {
+		// #681 C2: an own-credential apiserver 403 is not an external touch.
 		// External-no-cache (proposal 2026-06-22) — the widget's resolve
 		// touched a genuine external endpoint (e.g. an external apiRef RA) and
 		// did NOT opt in (default OFF). Serve the envelope but DECLINE the Put +
@@ -641,6 +645,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			Inputs:      cacheInputs,
 			TTLOverride: uafTTLOverrideForEntry(cacheInputs),
 		}, cacheGen0) {
+			if stageErrSink.Count() > 0 {
+				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallWidget) // #681
+			}
 			// 0.30.8: record dep edges. Widget self-dep, apiRef→RestAction
 			// dep, and render-eligible resourcesRefs deps (action-only
 			// refs filtered out per Revision 14). Edge type 3 (inner K8s

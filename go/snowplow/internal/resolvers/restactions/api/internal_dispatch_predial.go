@@ -11,9 +11,9 @@
 //     scope lookup that fails falls back to the post-fetch path.
 //   - newRegateForbidden / isRegateDenied: a per-identity re-gate deny is a
 //     *apierrors.StatusError Forbidden (byte-identical message to the pre-#677
-//     post-fetch deny) wrapped in a marker type, so resolve.go can tell the
-//     refresher's #677 known-declined mark "this stage error was a re-gate
-//     deny" without parsing text.
+//     post-fetch deny, the #681 canonical identity-free text) wrapped in a
+//     marker type, so resolve.go classifies it as a per-identity forbidden (F1)
+//     without parsing text.
 //   - snowplow_internal_dispatch_predial_total{outcome}: a closed set.
 
 package api
@@ -69,7 +69,8 @@ type regateDeniedError struct{ status *apierrors.StatusError }
 func (e *regateDeniedError) Error() string { return e.status.Error() }
 func (e *regateDeniedError) Unwrap() error { return e.status }
 
-// newRegateForbidden builds the deny both branch C deny points return.
+// newRegateForbidden builds the deny both branch C deny points return. Its text
+// IS the #681 canonical identity-free message (canonicalForbiddenMessage).
 func newRegateForbidden(gvr schema.GroupVersionResource, namespace, name string) error {
 	return &regateDeniedError{status: apierrors.NewForbidden(gvr.GroupResource(), name,
 		fmt.Errorf("user not authorized to get %s/%s", namespace, name))}
@@ -79,15 +80,6 @@ func newRegateForbidden(gvr schema.GroupVersionResource, namespace, name string)
 func isRegateDenied(err error) bool {
 	var e *regateDeniedError
 	return errors.As(err, &e)
-}
-
-// noteRegateDenyStageError is called by resolve.go at the SAME site, for the
-// same item, as its stage-error sink bump: when the item's error is a re-gate
-// deny it bumps the refresher's RegateDenySink (nil on every other path).
-func noteRegateDenyStageError(ctx context.Context, err error) {
-	if isRegateDenied(err) {
-		cache.RegateDenySinkFromContext(ctx).Bump()
-	}
 }
 
 // --- snowplow_internal_dispatch_predial_total{outcome} -----------------------

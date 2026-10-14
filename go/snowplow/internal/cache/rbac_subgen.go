@@ -210,7 +210,9 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 // subject {Kind:"ServiceAccount",Name:<name>,Namespace:<ns>} so a binding whose
 // subject is that SA (which onBinding* recorded as an SA subjectKey) bumps it.
 func RBACSubGenForSubject(username string, groups []string) uint64 {
-	var sum uint64
+	// #682 — the process-wide boot-window epoch is one more monotone term of
+	// the sum (rbac_subgen_epoch.go explains why that cannot collide).
+	sum := rbacSubGenEpoch.Load()
 	if username != "" {
 		if ns, name, ok := parseServiceAccountUsername(username); ok {
 			// The identity is a ServiceAccount: fold the SA subject counter (the
@@ -284,4 +286,5 @@ func ResetRBACSubGenForTest() {
 	})
 	rbacSubGenBumps.Store(0)
 	rbacSubGenSubjects.Store(0)
+	resetRBACSubGenEpochForTest()
 }

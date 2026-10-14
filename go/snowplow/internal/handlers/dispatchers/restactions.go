@@ -395,6 +395,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// 0.30.257, so this is the first request-path consumer; the resolver's
 	// bump sites already existed.
 	ctx, stageErrSink := cache.WithStageErrorSink(ctx)
+	// #681 — the per-identity forbidden sink, sibling of the stage-error sink:
+	// a result whose ONLY stage errors are per-identity forbidden is cached
+	// (cache.DenialOnly), and an own-credential apiserver 403 is not an
+	// external touch (cache.GenuineExternal).
+	ctx, forbiddenSink := cache.WithPerIdentityForbiddenSink(ctx)
 	// External-no-cache (proposal 2026-06-22) — install the external-touched
 	// sink on the resolve ctx. The api resolver bumps it whenever a stage
 	// reaches the live external fetch (httpFetchAllowingNonJSON); the Put-gate
@@ -554,7 +559,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
 			slog.String("effect", "body served (200) narrowed for THIS requester; not persisted — a co-bound user would key onto the same cell and be served these rows (1.12.3 A-1; 1.13.0 folds the UAF scope into the key)"),
 		)
-	} else if stageErrSink.Count() > 0 {
+	} else if stageErrSink.Count() > 0 && !cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, "restactions") {
+		// #681 — a result whose ONLY stage errors are per-identity forbidden
+		// (cache.DenialOnly) is NOT declined here: it is correct and
+		// deterministic for this requester's binding-set class, carries the
+		// identity-free canonical error body, and is cached below.
+		//
 		// A bare decline: the partial body is SERVED (written below) and not
 		// persisted, so a transient item failure self-heals on the next
 		// resolve. 1.12.6 C9 retired the D bounded-partial Put that used to
@@ -569,9 +579,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
 		)
-	} else if extTouchedSink.Count() > 0 {
+	} else if cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 {
 		// External-no-cache (proposal 2026-06-22) — the resolve touched a
 		// genuine external endpoint (no informer/dep edge to invalidate it).
+		// #681 C2: an own-credential apiserver 403 is not one.
 		// Serve the body (already encoded above) but DECLINE the Put so every
 		// /call re-fetches the external API live (fresh). Declining the Put
 		// also declines the self-dep Record below — an external RA never
@@ -632,6 +643,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// during the resolve) stored no cell, so — exactly like the declined
 			// branches above (1.12.3 A-1) — there is nothing to dep-track and
 			// nothing to announce.
+			if putStored && stageErrSink.Count() > 0 {
+				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallRA) // #681
+			}
 			if putStored {
 				// 0.30.8: record the self-dep so a DELETE on this RestAction
 				// CR evicts the cached entry, and an UPDATE re-resolves it.

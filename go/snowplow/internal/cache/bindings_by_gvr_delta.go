@@ -75,6 +75,18 @@ func (idx *bindingsByGVRIndex) deltaActive() bool {
 	return idx.built
 }
 
+// notePreBuildIfNotBuilt takes the #682 pre-build note UNDER the index read
+// lock: the first build holds the write lock, so either the note lands before
+// the build reads it, or the build has already set built and the event takes
+// the normal delta path (#257 rotation).
+func (idx *bindingsByGVRIndex) notePreBuildIfNotBuilt() {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if !idx.built {
+		notePreBuildRBACEvent()
+	}
+}
+
 // asCRB / asRB / asRole normalise an informer event object to the typed
 // RBAC pointer: a direct type-assert on the happy path, else the
 // defensive convertUnstructured* fallback (the same fallback

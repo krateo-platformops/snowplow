@@ -415,6 +415,14 @@ func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
+	// #682 — the FIRST false→true transition of built rotates every
+	// per-identity key once if an RBAC event landed between the first publish
+	// and this build (rbac_subgen_epoch.go). Later rebuilds never do: built
+	// never returns to false outside tests.
+	if !idx.built {
+		defer rotateIfRBACEventSeenPreBuild()
+	}
+
 	// Reset to a clean state (idempotent rebuild).
 	idx.byGVR = map[groupResource]map[bindingID]struct{}{}
 	idx.wildcard = map[bindingID]struct{}{}

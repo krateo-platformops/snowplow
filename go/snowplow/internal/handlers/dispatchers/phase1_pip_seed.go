@@ -1189,6 +1189,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templa
 	// → still Put). Uniform across boot + sweep (feedback_no_special_cases).
 	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
 	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
+	resCtx, _ = cache.WithPerIdentityForbiddenSink(resCtx) // #681 — read by the seam tail from resCtx
 	// #398 — sensitive-resource sink: a resolve that dispatched a core
 	// v1/secrets read must not be persisted by any resolved-output Put.
 	resCtx, _ = cache.WithSensitiveTouchedSink(resCtx)
@@ -1264,7 +1265,7 @@ func seedRestactionResolveAndPutProd(
 	// #643 PR-B — resCtx, not ctx: the decline's mark reads the resolve's
 	// captured deps + entry stamp and the decline unit off it. resCtx inherits
 	// everything the decline otherwise reads off ctx (identity, the set).
-	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, stageErrSink, extTouchedSink) {
+	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, stageErrSink, extTouchedSink, cache.PerIdentityForbiddenSinkFromContext(resCtx)) {
 		return nil
 	}
 
@@ -1555,6 +1556,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// so the keepwarm sweep never blind-re-Puts degraded bytes over a warm cell.
 	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
 	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
+	resCtx, forbiddenSink := cache.WithPerIdentityForbiddenSink(resCtx) // #681
 	// #398 — sensitive-resource sink: a resolve that dispatched a core
 	// v1/secrets read must not be persisted by any resolved-output Put.
 	resCtx, _ = cache.WithSensitiveTouchedSink(resCtx)
@@ -1641,7 +1643,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// #102 GTTL-1: decline the Put (best-effort, return nil) on a stage error
 	// or external touch — keeps any prior good entry; TTL is the outer net.
 	// #643 PR-B — resCtx (deps, stamp, decline unit); see seedRestactionResolveAndPutProd.
-	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, stageErrSink, extTouchedSink) {
+	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, stageErrSink, extTouchedSink, forbiddenSink) {
 		return nil
 	}
 
@@ -1899,7 +1901,12 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 // The identity for the log is read from ctx (withCohortSeedContext installs
 // WithUserInfo) so both primitives share one helper without threading a label.
 func declineSeedPutOnError(ctx context.Context, class, target, key string,
-	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink) bool {
+	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink,
+	forbiddenSink *cache.PerIdentityForbiddenSink) bool {
+
+	// #681 C2 — the ONE external count: an own-credential apiserver 403 (F2) is
+	// not a genuine external touch, at the mark AND at the decline.
+	genuineExternal := cache.GenuineExternal(extTouchedSink, forbiddenSink)
 
 	// #643 PR-B (brief §1(c) as amended, #643 comment 6150618043) — mark on an
 	// OBSERVED external touch, whichever branch declines. A fetch abandoned at
@@ -1907,8 +1914,14 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string,
 	// the stage-error branch first left exactly those fetches — the bulk of the
 	// 057 ClickHouse load — unmarked and re-dialled every pass. A stage error
 	// with no external touch never marks (it is transient and is retried).
-	if extTouchedSink.Count() > 0 {
+	if genuineExternal > 0 {
 		markDeclinedExternal(ctx, key)
+	}
+	// #681 G — a result whose ONLY stage errors are per-identity forbidden is
+	// seeded (shared DenialOnly predicate): first visit warm.
+	if stageErrSink.Count() > 0 && cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, class) {
+		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteSeed)
+		return false
 	}
 	if stageErrSink.Count() > 0 {
 		pipSeedSkippedStageErrorTotal.Add(1)
@@ -1930,7 +1943,7 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string,
 		)
 		return true
 	}
-	if extTouchedSink.Count() > 0 {
+	if genuineExternal > 0 {
 		pipSeedSkippedStageErrorTotal.Add(1)
 		cache.BumpExternalSkippedPut()
 		// #132 F4b Lever A / #643 — the declined-external mark for this EXACT key

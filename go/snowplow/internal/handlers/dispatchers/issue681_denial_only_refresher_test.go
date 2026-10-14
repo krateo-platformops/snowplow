@@ -1,33 +1,26 @@
 package dispatchers
 
-// issue677_regate_declined_test.go — #677 (2): the refresher's KNOWN-DECLINED
-// mark, driven through the REAL refresher pool -> resolveAndPopulateL1 ->
-// resolveOnceProd -> restactions.Resolve -> branch C against an httptest
-// apiserver that counts every SA dial, with the RBAC verdict from a REAL
-// in-process RBAC snapshot.
+// issue681_denial_only_refresher_test.go — #681 on the REFRESHER path, driven
+// through the REAL refresher pool -> resolveAndPopulateL1 -> resolveOnceProd ->
+// restactions.Resolve -> branch C against an httptest apiserver that counts
+// every SA dial, with the RBAC verdict from a REAL in-process RBAC snapshot.
+// (The harness was #677's; #681 obsoletes its known-declined mark.)
 //
-// The cell: a "restactions" cell for RESTAction ra677 whose two stages GET a
+// The cell: a "restactions" cell for RESTAction ra677 whose stages GET a
 // ConfigMap the representative may NOT read (team-b/catalog) and one it may
-// (team-a/other) — the 057 shape: one correctly denied step in an RA whose other
-// steps keep it dirty.
+// (team-a/other) — the 057 shape.
 //
 // ARMS
-//   R1  mark + skip: the first dequeue resolves (0 SA dials for the denied
-//       ConfigMap — #677 (1) — 1 for the allowed one), declines, marks, and ends
-//       KNOWN-STALE. The next dequeue does NOT re-resolve (0 dials, skip +1) and
-//       the cell is still known-stale (#547 bookkeeping intact).
-//   R2  GRANT: a Role RULE edit (no binding change, so no subject sub-gen move)
-//       grants the ConfigMap. The next dequeue re-resolves and PUTS; the mark
-//       retires as rbac_published; the cell is no longer known-stale.
-//   R2m mutation: without the publish-seq retire the same grant leaves the cell
-//       skipped and stale (RED).
-//   R3  definition change: an edit of the RESTAction retires the mark
-//       (definition_changed) and the next dequeue re-resolves.
-//   R4  never consulted outside the refresher: the #547 demand revalidation
-//       claim is not blocked by a mark; and a static census pins the consult's
-//       only call site to resolveAndPopulateL1.
-//   R5  mixed: a denied step plus a step that fails for another reason never
-//       marks; the predicate refuses an external touch.
+//   R1  (H1/H8) a refresh whose ONLY stage error is the per-identity re-gate
+//       deny (F1) is RE-PUT: the body changes, the #547 window closes FRESH (not
+//       known-stale), denial_only_put_total{refresher} moves, and the denied
+//       object is never SA-dialled (#677 (1)).
+//   R2  (H4) GRANT: a Role RULE edit grants the ConfigMap; the next dirty mark
+//       re-resolves and Puts the fuller body.
+//   R5  (H2/H8) mixed: a denial plus a 404 is NOT Put and the window ends
+//       KNOWN-STALE(declined), exactly as before #681.
+//   H10 census: every dispatchers Put gate that reads a StageErrorSink count
+//       goes through cache.DenialOnly (no gate site can be missed).
 
 import (
 	"context"
@@ -39,7 +32,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -155,11 +147,10 @@ func i677Setup(t *testing.T, ra *unstructured.Unstructured) *i677Env {
 	cache.ResetResolvedCacheForTest()
 	cache.ResetDepsForTest()
 	cache.ResetRefresherForTest()
-	cache.ResetRegateDeclinedForTest()
+	cache.ResetDenialOnlyPutForTest()
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 	t.Cleanup(cache.ResetDepsForTest)
 	t.Cleanup(cache.ResetRefresherForTest)
-	t.Cleanup(cache.ResetRegateDeclinedForTest)
 
 	e := &i677Env{byPath: map[string]*atomic.Int64{}, missing: map[string]bool{}}
 	for _, p := range []string{
@@ -268,15 +259,6 @@ func (e *i677Env) body(t *testing.T) string {
 	return string(got.RawJSON)
 }
 
-func i677Retired(reason string) uint64 {
-	for _, c := range cache.RegateDeclinedRetiredSnapshot() {
-		if c.Reason == reason {
-			return c.Count
-		}
-	}
-	return 0
-}
-
 const (
 	i677Denied  = "/api/v1/namespaces/team-b/configmaps/catalog"
 	i677Allowed = "/api/v1/namespaces/team-a/configmaps/other"
@@ -285,47 +267,6 @@ const (
 
 func i677DefaultRA() *unstructured.Unstructured {
 	return i677RAObject(i677Stage("catalog", i677Denied), i677Stage("ok", i677Allowed))
-}
-
-// markedAndSkipping runs R1 and returns the env with the cell marked.
-func i677MarkedAndSkipping(t *testing.T) *i677Env {
-	t.Helper()
-	e := i677Setup(t, i677DefaultRA())
-
-	e.cycle(t)
-	if d := e.pathDials(i677Denied); d != 0 {
-		t.Fatalf("R1: the denied ConfigMap was SA-dialled %d time(s) — #677 (1) must decide the deny before the dial", d)
-	}
-	if d := e.pathDials(i677Allowed); d != 1 {
-		t.Fatalf("R1 precondition: the allowed stage dialled %d, want 1 (the resolve did not run?)", d)
-	}
-	if e.body(t) != `{"prior":true}` {
-		t.Fatalf("R1: a re-gate-denied refresh overwrote the prior body: %s", e.body(t))
-	}
-	if _, ok := cache.LookupRegateDeclined(e.key); !ok {
-		t.Fatal("R1 RED: a refresh whose only stage error was a re-gate deny did not mark the key known-declined")
-	}
-	if _, reason, ok := cache.KnownStale(e.key); !ok || reason != "declined" {
-		t.Fatalf("R1: after the declined refresh the cell must be KNOWN-STALE(declined); got ok=%v reason=%q", ok, reason)
-	}
-
-	dials0 := e.dials.Load()
-	skip0 := cache.RegateDeclinedSkipTotal()
-	e.cycle(t)
-	if d := e.dials.Load() - dials0; d != 0 {
-		t.Fatalf("R1 RED: the marked cell was re-resolved (%d SA dials) on the next dirty mark — the deterministic re-dial is back", d)
-	}
-	if got := cache.RegateDeclinedSkipTotal() - skip0; got != 1 {
-		t.Fatalf("R1: skip_total moved by %d, want 1", got)
-	}
-	if _, reason, ok := cache.KnownStale(e.key); !ok || reason != "declined" {
-		t.Fatalf("R1: a skipped dequeue must still end KNOWN-STALE (#547); got ok=%v reason=%q", ok, reason)
-	}
-	return e
-}
-
-func TestIssue677_R1_MarkAndSkip_StaysKnownStale(t *testing.T) {
-	i677MarkedAndSkipping(t)
 }
 
 // grant edits the team-b Role's RULES (not a binding) to grant the ConfigMap,
@@ -354,148 +295,123 @@ func (e *i677Env) grant(t *testing.T) {
 	})
 }
 
-func TestIssue677_R2_GrantRetiresTheMark_NextCyclePuts(t *testing.T) {
-	e := i677MarkedAndSkipping(t)
-	e.grant(t)
 
-	d0 := e.pathDials(i677Denied)
+func i681DenialPuts(site string) uint64 {
+	for _, c := range cache.DenialOnlyPutSnapshot() {
+		if c.Site == site {
+			return c.Count
+		}
+	}
+	return 0
+}
+
+func TestIssue681_R1_DenialOnlyRefresh_IsPut_WindowClosesFresh(t *testing.T) {
+	e := i677Setup(t, i677DefaultRA())
 	e.cycle(t)
-	if e.pathDials(i677Denied)-d0 != 1 {
-		t.Fatalf("R2 RED: after the grant the next cycle did not re-resolve (catalog dials %d) — a mark outlived a permission change", e.pathDials(i677Denied)-d0)
+	if d := e.pathDials(i677Denied); d != 0 {
+		t.Fatalf("R1: the denied ConfigMap was SA-dialled %d time(s)", d)
+	}
+	if d := e.pathDials(i677Allowed); d != 1 {
+		t.Fatalf("R1 precondition: the allowed stage dialled %d, want 1", d)
 	}
 	if e.body(t) == `{"prior":true}` {
-		t.Fatal("R2 RED: after the grant the next cycle did not Put the fresh body")
+		t.Fatal("R1 RED: a refresh whose only stage error was a per-identity re-gate deny was declined — the cell never refreshes")
 	}
-	if _, ok := cache.LookupRegateDeclined(e.key); ok {
-		t.Fatal("R2: the mark is still held after the grant")
-	}
-	if got := i677Retired(cache.RegateDeclinedRetiredRBACPublished); got != 1 {
-		t.Fatalf("R2: retired_total{rbac_published} = %d, want 1", got)
+	if strings.Contains(e.body(t), i677Rep) {
+		t.Fatalf("R1: the refreshed body names the representative: %s", e.body(t))
 	}
 	if _, _, stale := cache.KnownStale(e.key); stale {
-		t.Fatal("R2: the accepted Put did not close the known-stale window")
+		t.Fatal("R1 (H8): the accepted re-Put left the window KNOWN-STALE")
+	}
+	if got := i681DenialPuts(cache.DenialOnlyPutSiteRefresher); got != 1 {
+		t.Fatalf("denial_only_put_total{refresher} = %d, want 1", got)
 	}
 }
 
-func TestIssue677_R2m_Mutation_NoPublishSeqRetire_StaysStale(t *testing.T) {
-	prev := regateDeclinedRBACMovedFn
-	regateDeclinedRBACMovedFn = func(*cache.RegateDeclinedMark) bool { return false }
-	t.Cleanup(func() { regateDeclinedRBACMovedFn = prev })
-
-	e := i677MarkedAndSkipping(t)
+func TestIssue681_R2_GrantRotates_NextRefreshPutsFuller(t *testing.T) {
+	e := i677Setup(t, i677DefaultRA())
+	e.cycle(t)
+	denied := e.body(t)
 	e.grant(t)
-	d0 := e.dials.Load()
+	d0 := e.pathDials(i677Denied)
 	e.cycle(t)
-	if e.dials.Load() != d0 || e.body(t) != `{"prior":true}` {
-		t.Fatalf("mutation: without the publish-seq retire the grant was still picked up (dials %d, body %s) — R2 cannot see its defect",
-			e.dials.Load()-d0, e.body(t))
+	if e.pathDials(i677Denied)-d0 != 1 || e.body(t) == denied {
+		t.Fatalf("R2 RED: after the grant the next refresh did not read the ConfigMap and re-Put the fuller body (dials %d)",
+			e.pathDials(i677Denied)-d0)
 	}
-	t.Log("R2m RED as required: without the RBAC publish-seq retire the cell stays skipped and stale after a grant")
 }
 
-func TestIssue677_R3_DefinitionChangeRetires(t *testing.T) {
-	e := i677MarkedAndSkipping(t)
-	// Baseline BEFORE the edit: the edit is itself a dep event, so the
-	// refresher may retire + re-resolve (and re-mark under the new version)
-	// before the explicit cycle below runs.
-	d0 := e.pathDials(i677Allowed)
-	ra := i677DefaultRA()
-	ra.SetResourceVersion("2")
-	ra.Object["spec"].(map[string]any)["marker"] = "edited"
-	if _, err := e.dyn.Resource(restActionGVR).Namespace(i677NS).Update(context.Background(), ra, metav1.UpdateOptions{}); err != nil {
-		t.Fatalf("ra update: %v", err)
-	}
-	i1126WaitFor(t, 10*time.Second, "informer sees the RA edit", func() bool {
-		obj, ok := cache.Global().GetObject(restActionGVR, i677NS, i677RA)
-		return ok && obj.GetResourceVersion() != "1"
-	})
+func TestIssue681_R5_MixedDenialAndOtherError_Declined_KnownStale(t *testing.T) {
+	e := i677Setup(t, i677RAObject(i677Stage("catalog", i677Denied), i677Stage("ghost", i677Ghost)))
 	e.cycle(t)
-	if e.pathDials(i677Allowed)-d0 < 1 {
-		t.Fatal("R3 RED: after the RESTAction changed the cell was never re-resolved — the mark outlived its definition")
+	if e.pathDials(i677Ghost) != 1 {
+		t.Fatalf("precondition: the 404 stage dialled %d", e.pathDials(i677Ghost))
 	}
-	if got := i677Retired(cache.RegateDeclinedRetiredDefinitionChanged); got != 1 {
-		t.Fatalf("R3: retired_total{definition_changed} = %d, want 1", got)
+	if e.body(t) != `{"prior":true}` {
+		t.Fatalf("R5 RED: a denial + 404 refresh was Put: %s", e.body(t))
 	}
-}
-
-// R4 — the demand revalidation (#547, under the REQUESTER) is not blocked by a
-// mark: a mark gates only the refresher's own re-resolve.
-func TestIssue677_R4_DemandRevalidationNotBlockedByMark(t *testing.T) {
-	e := i677MarkedAndSkipping(t)
-	t0, _, ok := cache.KnownStale(e.key)
-	if !ok {
-		t.Fatal("precondition: cell not known-stale")
-	}
-	if !cache.ClaimDemandRevalidation(e.key, t0) {
-		t.Fatal("R4: a known-declined mark blocked the requester's demand revalidation")
+	if _, reason, ok := cache.KnownStale(e.key); !ok || reason != "declined" {
+		t.Fatalf("R5 (H8): the declined refresh must end KNOWN-STALE(declined); got ok=%v reason=%q", ok, reason)
 	}
 }
 
-// R4 census — the consult has exactly ONE production call site, inside
-// resolveAndPopulateL1 (the refresher handler), and the cache-side lookup is
-// reached only through it. A new caller (a /call path, the seed) fails here.
-func TestIssue677_R4_ConsultCensus_RefresherOnly(t *testing.T) {
-	root := "../.."
-	type site struct{ file, fn string }
-	var consult, lookup []site
-	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
-			return err
+// H10 — every function in this package (non-test) that reads a stage-error
+// sink count as a Put gate also calls cache.DenialOnly. The identity-free
+// widget-content gate (widget_content.go, `sink`) is excluded by construction:
+// it never holds a per-identity denial (DenialOnly is false for that class).
+func TestIssue681_H10_EveryStageErrorPutGateUsesDenialOnly(t *testing.T) {
+	ents, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var offenders []string
+	checked := 0
+	for _, de := range ents {
+		n := de.Name()
+		if de.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
 		}
-		fs := token.NewFileSet()
-		f, perr := parser.ParseFile(fs, p, nil, 0)
-		if perr != nil {
-			return perr
+		f, err := parser.ParseFile(token.NewFileSet(), n, nil, 0)
+		if err != nil {
+			t.Fatal(err)
 		}
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
 			if !ok || fd.Body == nil {
 				continue
 			}
+			readsStage, usesDenialOnly := false, false
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				ce, ok := n.(*ast.CallExpr)
 				if !ok {
 					return true
 				}
-				switch fn := ce.Fun.(type) {
-				case *ast.Ident:
-					if fn.Name == "regateDeclinedSkip" {
-						consult = append(consult, site{filepath.Base(p), fd.Name.Name})
+				sel, ok := ce.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				if id, ok := sel.X.(*ast.Ident); ok {
+					if id.Name == "stageErrSink" && sel.Sel.Name == "Count" {
+						readsStage = true
 					}
-				case *ast.SelectorExpr:
-					if fn.Sel.Name == "LookupRegateDeclined" {
-						lookup = append(lookup, site{filepath.Base(p), fd.Name.Name})
+					if id.Name == "cache" && sel.Sel.Name == "DenialOnly" {
+						usesDenialOnly = true
 					}
 				}
 				return true
 			})
+			if readsStage {
+				checked++
+				if !usesDenialOnly {
+					offenders = append(offenders, n+":"+fd.Name.Name)
+				}
+			}
 		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	if len(consult) != 1 || consult[0] != (site{"resolve_populate.go", "resolveAndPopulateL1"}) {
-		t.Fatalf("regateDeclinedSkip call sites = %v, want exactly resolve_populate.go:resolveAndPopulateL1", consult)
+	if checked < 4 {
+		t.Fatalf("census found %d gate functions, want >= 4 (restactions, widgets, refresher, seed) — the scan is not seeing them", checked)
 	}
-	if len(lookup) != 1 || lookup[0] != (site{"regate_declined_mark.go", "regateDeclinedSkip"}) {
-		t.Fatalf("cache.LookupRegateDeclined call sites = %v, want exactly regate_declined_mark.go:regateDeclinedSkip", lookup)
-	}
-}
-
-func TestIssue677_R5_MixedErrorsNeverMark_ExternalNeverMarks(t *testing.T) {
-	e := i677Setup(t, i677RAObject(i677Stage("catalog", i677Denied), i677Stage("ghost", i677Ghost)))
-	e.cycle(t)
-	if e.pathDials(i677Ghost) != 1 {
-		t.Fatalf("precondition: the 404 stage dialled %d", e.pathDials(i677Ghost))
-	}
-	if _, ok := cache.LookupRegateDeclined(e.key); ok {
-		t.Fatal("R5 RED: a refresh with a re-gate deny AND another stage error was marked — only an all-deny decline is deterministic")
-	}
-	if regateDeclinedMarkIfAllDenies(e.key, &e.inputs, cache.RBACGen(), 1, 1, 1) {
-		t.Fatal("R5: the mark predicate accepted a resolve that touched an external endpoint")
-	}
-	if regateDeclinedMarkIfAllDenies(e.key, &e.inputs, cache.RBACGen(), 0, 0, 0) {
-		t.Fatal("R5: the mark predicate accepted a resolve with no stage error")
+	if len(offenders) > 0 {
+		t.Fatalf("H10: stage-error Put gates that bypass cache.DenialOnly: %v", offenders)
 	}
 }

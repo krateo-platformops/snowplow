@@ -172,7 +172,7 @@ func declineExternalOnce(ctx context.Context, class, target, key string) bool {
 	_, stageSink := cache.WithStageErrorSink(ctx)
 	_, extSink := cache.WithExternalTouchedSink(ctx)
 	extSink.Bump() // the resolve touched a genuine external endpoint
-	return declineSeedPutOnError(ctx, class, target, key, stageSink, extSink)
+	return declineSeedPutOnError(ctx, class, target, key, stageSink, extSink, nil)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -775,7 +775,7 @@ func TestF4bLeverA_StageErrorDoesNotMark_OnlyExternal(t *testing.T) {
 	_, stageSink := cache.WithStageErrorSink(bootCtx)
 	_, extSink := cache.WithExternalTouchedSink(bootCtx)
 	stageSink.Bump("exportJwt-loopback", "401 transient no per-user JWT")
-	if !declineSeedPutOnError(bootCtx, "widgets", widget, key, stageSink, extSink) {
+	if !declineSeedPutOnError(bootCtx, "widgets", widget, key, stageSink, extSink, nil) {
 		t.Fatal("setup: a stage-error resolve must still decline the Put (GTTL-1)")
 	}
 	if got := cache.SeedDeclinedExternalSetFromContext(bootCtx).Marks(); got != 0 {
@@ -800,7 +800,7 @@ func TestF4bLeverA_StageErrorDoesNotMark_OnlyExternal(t *testing.T) {
 	_, extSink2 := cache.WithExternalTouchedSink(bootCtx)
 	stageSink2.Bump("obs-query", "context deadline exceeded")
 	extSink2.Bump()
-	if !declineSeedPutOnError(bootCtx, "widgets", widget, mixKey, stageSink2, extSink2) {
+	if !declineSeedPutOnError(bootCtx, "widgets", widget, mixKey, stageSink2, extSink2, nil) {
 		t.Fatal("setup: a stage-error + external resolve must decline the Put")
 	}
 	if !cache.SeedDeclinedExternalSetFromContext(bootCtx).Marked(mixKey) {
