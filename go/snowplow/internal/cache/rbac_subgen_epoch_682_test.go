@@ -62,6 +62,13 @@ func reset682(t *testing.T) {
 	}
 	reset()
 	t.Cleanup(reset)
+	// #686: BuildBindingsByGVRIndex over a NIL snapshot is deferred, not a
+	// build. These arms model builds that run after a publish, so they run
+	// over a published (empty) snapshot. Setup only; every assertion is
+	// unchanged. A test that needs its own snapshot (E4) stores it over this.
+	prev := rbacSnap.Load()
+	rbacSnap.Store(&RBACSnapshot{})
+	t.Cleanup(func() { rbacSnap.Store(prev) })
 }
 
 func role682(rules ...rbacv1.PolicyRule) *rbacv1.Role {

@@ -484,10 +484,14 @@ func i411Unstructured(t *testing.T, obj any) *unstructured.Unstructured {
 }
 
 // i411WaitFor polls cond until true or the deadline (the RBAC snapshot
-// republishes asynchronously off the informer).
+// republishes asynchronously off the informer). #673: the wait is
+// event-driven (it returns the moment cond holds, in ms when idle); the
+// deadline is only a backstop for a starved informer. A fixed 5s failed the
+// SETUP on a loaded CI runner before the #432 assertion ever ran. The
+// assertion itself is unchanged.
 func i411WaitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(time.Minute)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return

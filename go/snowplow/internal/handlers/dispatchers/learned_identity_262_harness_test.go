@@ -39,6 +39,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/testsupport/fakewatch"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -110,6 +111,7 @@ var (
 // the resident units.
 type l262Env struct {
 	dyn     *dynamicfake.FakeDynamicClient
+	watches *fakewatch.Barrier // #660: established watches on dyn
 	rw      *cache.ResourceWatcher
 	kube    *kubefake.Clientset
 	widgets []navWidgetEntry
@@ -207,6 +209,7 @@ func l262Setup(t *testing.T, o l262Opts) *l262Env {
 	objs = append(objs, o.extraObjs...)
 	env := &l262Env{}
 	env.dyn = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objs...)
+	env.watches = fakewatch.Install(env.dyn)
 	wctx, wcancel := context.WithCancel(context.Background())
 	rw, err := cache.NewResourceWatcher(wctx, env.dyn)
 	if err != nil {

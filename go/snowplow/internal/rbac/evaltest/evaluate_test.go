@@ -15,6 +15,7 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/testsupport/fakewatch"
 
 	authv1 "k8s.io/api/authorization/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -64,6 +65,15 @@ func newTestWatcher(t *testing.T, seed ...runtime.Object) {
 	}
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, rbacListKinds(), seed...)
+	watches := fakewatch.Install(dyn)
+
+	// #655: the bindings-by-GVR index is process-global. A test that built
+	// it (the sub-gen arms) left it BUILT, so this test's binding ADDs ran
+	// as delta hooks and bumped sub-gens asynchronously (TestA1 read alice
+	// and bob on either side of a bump: alice=3 bob=2). Every test through
+	// this harness starts and ends with it unbuilt.
+	cache.ResetBindingsByGVRIndexForTest()
+	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 
 	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
@@ -85,6 +95,14 @@ func newTestWatcher(t *testing.T, seed ...runtime.Object) {
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 
+	// #655 / #686: settle BEFORE the synchronous publish below. Every RBAC
+	// watch is established (no test mutation can be lost in the fake's
+	// list/watch gap), the async initial publish has returned, and no
+	// rebuild is in flight. Without it a LATE async publish swapped the
+	// memo shard under a test counting hits (B6 got 9 of 10, F3 got 0,
+	// L2Fix 2 misses).
+	settleRBACHarness(t, rw, watches)
+
 	// Deterministically publish the typed RBAC snapshot before returning.
 	// NewResourceWatcher publishes the FIRST snapshot from an ASYNC goroutine
 	// (waitAndPublishInitialRBACSnapshot) that races WaitForCacheSync's
@@ -98,6 +116,22 @@ func newTestWatcher(t *testing.T, seed ...runtime.Object) {
 	// can reintroduce the race. Idempotent + synchronous; production's async
 	// publish path is unchanged (this is a test-only seam).
 	cache.RebuildRBACSnapshotForTest(rw)
+	// The sub-gen baseline is the settled state: bumps caused by this
+	// watcher's own initial publish are not part of any test's story.
+	cache.ResetRBACSubGenForTest()
+}
+
+// settleRBACHarness waits until the RBAC watcher is quiet: every RBAC watch
+// established on the fake, the initial publish returned, no rebuild in
+// flight. Event-driven, with a generous deadline (#655, #686).
+func settleRBACHarness(t *testing.T, rw *cache.ResourceWatcher, watches *fakewatch.Barrier) {
+	t.Helper()
+	if err := watches.WaitFor(time.Minute, "roles", "rolebindings", "clusterroles", "clusterrolebindings"); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if err := rw.WaitRBACQuiescentForTest(time.Minute); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
 }
 
 func clusterRole(name string, rules ...rbacv1.PolicyRule) *rbacv1.ClusterRole {

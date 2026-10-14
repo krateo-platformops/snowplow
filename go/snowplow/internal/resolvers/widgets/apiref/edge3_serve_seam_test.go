@@ -35,6 +35,7 @@ import (
 	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/testsupport/fakewatch"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -64,6 +65,7 @@ func edge3NewWatcher(t *testing.T, seed ...runtime.Object) *dynamicfake.FakeDyna
 	listKinds[edge3BackingGVR()] = "CompositionList" // apps.krateo.io/v1 compositions
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds, seed...)
+	watches := fakewatch.Install(dyn)
 	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
 		t.Fatalf("NewResourceWatcher: %v", err)
@@ -82,6 +84,16 @@ func edge3NewWatcher(t *testing.T, seed ...runtime.Object) *dynamicfake.FakeDyna
 	// also the arm whose discovery answers differ from its neighbour's.
 	if err := rw.WaitInitialRBACPublishForTest(5 * time.Second); err != nil {
 		t.Fatalf("WaitInitialRBACPublishForTest: %v", err)
+	}
+	// #673: an arm that then edits RBAC through dyn (the #411 x #424
+	// cross-class arms) must not lose the edit in the fake's list/watch gap.
+	// Wait for every RBAC watch to be established, and for the snapshot
+	// writer to be idle. Event-driven, generous deadline.
+	if err := watches.WaitFor(time.Minute, "roles", "rolebindings", "clusterroles", "clusterrolebindings"); err != nil {
+		t.Fatalf("edge3NewWatcher: %v", err)
+	}
+	if err := rw.WaitRBACQuiescentForTest(time.Minute); err != nil {
+		t.Fatalf("edge3NewWatcher: %v", err)
 	}
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })

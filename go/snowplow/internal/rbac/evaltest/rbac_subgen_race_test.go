@@ -46,6 +46,7 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/testsupport/fakewatch"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -82,6 +83,7 @@ func newSubgenHarness(t *testing.T, navigated []schema.GroupVersionResource, see
 		t.Fatalf("rbacv1.AddToScheme: %v", err)
 	}
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, rbacListKinds(), seed...)
+	watches := fakewatch.Install(dyn)
 
 	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
@@ -97,6 +99,20 @@ func newSubgenHarness(t *testing.T, navigated []schema.GroupVersionResource, see
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 
+	// #686: the index below must be built over the PUBLISHED snapshot. The
+	// first publish is asynchronous (waitAndPublishInitialRBACSnapshot) and
+	// WaitForCacheSync does not wait for it. Building first left built=true
+	// over a nil snapshot with an empty byRole, so the role edit bumped no
+	// one (mode 1), or EvaluateRBAC ran before any snapshot and denied
+	// (mode 2). A role edit landing in the fake's list/watch gap was lost
+	// outright ("the edit never reached the snapshot"). Settle, publish
+	// synchronously, and assert the snapshot is live.
+	settleRBACHarness(t, rw, watches)
+	cache.RebuildRBACSnapshotForTest(rw)
+	if cache.LiveRBACSnapshot() == nil {
+		t.Fatalf("harness: no RBAC snapshot published after settle + synchronous rebuild")
+	}
+
 	// Fresh per-subject counters + pending set + no stale barrier, so arm
 	// order can't leak state.
 	cache.ResetRBACSubGenForTest()
@@ -106,6 +122,7 @@ func newSubgenHarness(t *testing.T, navigated []schema.GroupVersionResource, see
 		cache.SetRebuildBarrierForTest(nil)
 		cache.ResetPendingSubGenBumpsForTest()
 		cache.ResetRBACSubGenForTest()
+		cache.ResetBindingsByGVRIndexForTest() // #655: never leave it built for the next test
 	})
 
 	// Build the BindingsByGVR index over the navigated GVRs — required for the

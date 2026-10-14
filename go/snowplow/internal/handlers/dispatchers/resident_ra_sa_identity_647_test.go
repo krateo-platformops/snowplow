@@ -319,13 +319,32 @@ func TestS647_ResidentDropCounterByReason(t *testing.T) {
 		"metadata": map[string]any{"name": "l262-ra-0", "namespace": h1NS},
 		"spec":     map[string]any{"api": []any{map[string]any{"name": "x", "path": "/api/v1/namespaces"}}},
 	}}
+	// #660: the RA the poll watches must be the one Updated. env.ras is the
+	// harvested set in NO fixed order, so env.ras[0] was l262-ra-1 in about 1
+	// run in 5 under load: the poll then waited on an object nobody changed,
+	// and no deadline could save it (measured: observed within ms, or never
+	// within 90s). Also wait for the RESTAction watch to be established on
+	// the fake, so the Update cannot fall into its list/watch gap.
+	targetIdx := -1
+	for i, ref := range env.ras {
+		if ref.Namespace == h1NS && ref.Name == "l262-ra-0" {
+			targetIdx = i
+		}
+	}
+	if targetIdx < 0 {
+		t.Fatalf("fixture: no harvested RESTAction %s/l262-ra-0 in %v", h1NS, env.ras)
+	}
+	target := env.ras[targetIdx]
+	if err := env.watches.WaitFor(time.Minute, h1RAGVR.Resource); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := env.dyn.Resource(h1RAGVR).Namespace(h1NS).Update(context.Background(), noTarget, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(time.Minute) // event-driven; generous only for a starved informer
 	for {
 		saCtx := withSAIdentityContext(context.Background(), env.deps.saEP, env.deps.saRC)
-		if _, miss := restActionTargetGVR(saCtx, env.ras[0]); miss == residentDropNoStaticTarget {
+		if _, miss := restActionTargetGVR(saCtx, target); miss == residentDropNoStaticTarget {
 			break
 		}
 		if time.Now().After(deadline) {
