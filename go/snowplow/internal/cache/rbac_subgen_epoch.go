@@ -92,7 +92,20 @@ func (h rbacSnapshotHandler) OnAdd(obj interface{}, isInInitialList bool) {
 		bindingsByGVRSingleton().notePreBuildIfNotBuilt()
 	}
 	h.funcs.OnAdd(obj, isInInitialList)
+	if isInInitialList {
+		if hook := rbacInitialListAddDeliveredHookForTest.Load(); hook != nil {
+			(*hook)()
+		}
+	}
 }
+
+// rbacInitialListAddDeliveredHookForTest, when non-nil, runs after the RBAC
+// snapshot handler has fully handled an initial-LIST ADD. TEST-ONLY: one
+// atomic load per initial-list ADD in production. client-go delivers to each
+// handler on its own goroutine, so a test that needs "this watcher's initial
+// LIST has reached the snapshot handler" (no rebuild still to be scheduled by
+// it) waits on this event rather than on time (#691 S2).
+var rbacInitialListAddDeliveredHookForTest atomic.Pointer[func()]
 
 func (h rbacSnapshotHandler) OnUpdate(oldObj, newObj interface{}) {
 	if preBuildUpdateRotates(h.isBinding, oldObj, newObj) {

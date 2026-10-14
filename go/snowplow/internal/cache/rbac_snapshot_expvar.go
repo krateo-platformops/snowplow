@@ -54,6 +54,16 @@ func RegisterRBACSnapshotExpvar() {
 		expvar.Publish("snowplow_rbac_publish_seq", expvar.Func(func() any {
 			return RBACGen()
 		}))
+		// #691 — the stuck-rebuild detectors.
+		expvar.Publish("snowplow_rbac_rebuild_panics_total", expvar.Func(func() any {
+			return RBACRebuildPanicsTotal()
+		}))
+		expvar.Publish("snowplow_rbac_unpublished_event_age_seconds", expvar.Func(func() any {
+			return RBACUnpublishedEventAge().Seconds()
+		}))
+		expvar.Publish("snowplow_rbac_last_successful_publish_age_seconds", expvar.Func(func() any {
+			return RBACLastPublishAge().Seconds()
+		}))
 		// #687 — rebuilds the post-release re-check picked up.
 		expvar.Publish("snowplow_rbac_rebuild_post_release_pickups_total", expvar.Func(func() any {
 			return RBACRebuildPostReleasePickups()

@@ -363,6 +363,21 @@ change. No arm pins it (see the matrix); alert on the rule.
 | `snowplow_rbac_binding_semantic_noop_updates_total` (`internal/cache/rbac_binding_noop_counters.go`) | `uint64` — UPDATE events whose subject set (order-insensitive multiset of Kind/Name/Namespace) and roleRef (+ binding namespace) were both unchanged, at the same `metadata.uid`, at any `resourceVersion`. A SUPERSET of the key above (a uid-changed UPDATE is counted by `snowplow_rbac_binding_uid_changed_updates_total` instead, #260). **Since #253 this is exactly the set of binding UPDATEs that record NO sub-generation bump** — the skip and this counter share one predicate (`bindingUpdateSemanticallyUnchanged`) | climbing on label/annotation churn and relists is healthy: each increment is a key rotation #253 avoided. To confirm the skip in production, read it against the `binding_update` bucket of `snowplow_rbac_subgen_bumps_by_source_total` (which must not move for these events), **never** against `snowplow_rbac_subgen_bumps_total`, which also moves on binding ADD/DELETE, the role path (#257) and ServiceAccount churn |
 | `snowplow_authz_memo_hits` / `_misses` / `_swaps` / `_refused` / `_entries` (`internal/rbac/snapshot_authz_memo.go` via `RegisterAuthzMemoExpvar`) | memo hit/miss, generation shard swaps, cap-breach refusals, live entry count | hit rate ≥0.85 warm; swaps bump on snapshot generation change; refused low |
 | `snowplow_authz_memo_deny_uncached_total` | `uint64` — denies (never cached, by design) | informational; should be > 0 and rising on a live cluster — a flat 0 with denied traffic would suggest the PERMITS-only rule regressed |
+| `snowplow_rbac_rebuild_post_release_pickups_total` (expvar + OTLP, **#687**) | `uint64` — snapshot rebuilds the post-release re-check picked up: an RBAC event set dirty while the rebuild loop still held its slot, its scheduler returned, and the loop re-acquired the slot to publish it. Before #687 each of these waited for the NEXT RBAC event (a revoke could stay unpublished) | low and rising with RBAC churn; informational |
+
+#### RBAC publish health — "is a revoke stuck unpublished?" (#691)
+
+A rebuild that panics on every attempt (since #687 it is retried on a 10ms→5s backoff) never
+republishes: every later revoke stays unpublished and in-process authorization (`EvaluateRBAC`, the
+UAF refilter, the sub-gen key rotation) keeps the revoked grant. `snowplow_rbac_publish_seq` simply
+stops moving, which also happens on a QUIET cluster — so these three tell *stuck* apart from *quiet*.
+All three are on `/debug/vars` and hand-wired OTLP, unlabelled.
+
+| metric | meaning | healthy / alert |
+|---|---|---|
+| `snowplow_rbac_unpublished_event_age_seconds` (gauge) | age of the OLDEST RBAC event not yet reflected in a completed snapshot rebuild; **0 when everything seen has been rebuilt**. Stamped by `scheduleRBACRebuild`, moved into the running rebuild when it starts (an event arriving mid-rebuild keeps its own newer stamp), cleared when that rebuild completes, put back when it panics | **0** on a healthy or quiet pod (a rebuild takes milliseconds to seconds). **PAGE (security): `> 60` for 5m** — an RBAC change has been pending for over a minute |
+| `snowplow_rbac_rebuild_panics_total` (counter) | recovered panics of the snapshot rebuild; each leaves the previous snapshot in force | **0**. **WARN: `increase(…[10m]) > 0`** |
+| `snowplow_rbac_last_successful_publish_age_seconds` (gauge) | seconds since the last successful publish; 0 before the first | context only — it grows on a quiet cluster too. **Not an alert on its own**; read it next to the unpublished-event age (stuck = both growing; quiet = this growing, the other 0) |
 
 ### Security / verification counters on OTLP (#448)
 
