@@ -373,6 +373,15 @@ func (w *depWatch) stopWorker() {
 // All three handlers ENQUEUE THE COORDINATE and return. The only per-type
 // difference left is the ADD pre-sync gate (design §3.4 point 1), which must
 // stay ADD-only and at the handler.
+// depAddDeliveryHookForTest, when non-nil, runs at the TOP of every dep ADD
+// delivery the informer makes (before any gate), and the func it returns runs
+// when that delivery has been fully handled. TEST-ONLY: production leaves it
+// nil and pays a single atomic load. The #688 arm uses it to hold the
+// handler's initial-LIST replay until the store-level syncCh has closed —
+// the lag client-go's per-handler processorListener can have under load —
+// so the late-replay window is deterministic instead of contention-bound.
+var depAddDeliveryHookForTest atomic.Pointer[func(gvr schema.GroupVersionResource) func()]
+
 func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) clientcache.ResourceEventHandlerFuncs {
 	w := depWatchSingleton()
 	w.watcher.Store(rw)
@@ -381,6 +390,9 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 	crdSideEffect := IsCRDGVR(gvr)
 	return clientcache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
+			if h := depAddDeliveryHookForTest.Load(); h != nil {
+				defer (*h)(gvr)()
+			}
 			if !rw.addEventPostSync(gvr, w) {
 				w.counters.addDroppedPreSync.Add(1)
 				return
