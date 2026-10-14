@@ -333,6 +333,9 @@ func RBACSnapshotForTest() *RBACSnapshot {
 // — handler returns immediately. The actual indexer walk runs on the
 // detached rebuild goroutine.
 func scheduleRBACRebuild(rw *ResourceWatcher) {
+	// #691 — stamp the oldest unpublished event BEFORE marking dirty, so a
+	// rebuild that consumes the dirty mark also takes the stamp.
+	noteRBACEventPending()
 	// Mark dirty FIRST. If a rebuild is already in flight, it will see
 	// this bit on its post-rebuild re-check and loop again.
 	rbacRebuildDirty.Store(true)
@@ -421,6 +424,7 @@ func drainRBACRebuild(rw *ResourceWatcher) (panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			panicked = true
+			rebuildPanicked() // #691: counted; its events stay pending
 			rbacRebuildDirty.Store(true)
 			slog.Error("cache.rbac.snapshot.rebuild_panic",
 				slog.String("subsystem", "cache"),
@@ -431,7 +435,9 @@ func drainRBACRebuild(rw *ResourceWatcher) (panicked bool) {
 	}()
 	for {
 		rbacRebuildDirty.Store(false)
+		takePendingForRebuild() // #691
 		rebuildRBACSnapshot(rw)
+		rebuildCompleted() // #691
 		if !rbacRebuildDirty.Load() {
 			return false
 		}
@@ -649,6 +655,7 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		return
 	}
 	rbacSnap.Store(snap)
+	notePublished() // #691
 
 	// #686 — a bindings-index build requested before the first publish was
 	// deferred, not marked built over nothing. Run it over a COMPLETE

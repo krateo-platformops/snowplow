@@ -117,6 +117,11 @@ func ResetCacheProcessStateForTest() error {
 	ResetEngineDeclinedExternalSetForTest()
 	ResetDeclinedExternalRetiredForTest()
 
+	// 5d‴ — #691 the stuck-rebuild detector state (pending / in-flight event
+	// stamps, the panic counter). Process-global. Composed rather than
+	// exempted — #471.
+	ResetRBACPublishHealthForTest()
+
 	// 5d″ — #681 the denial-only Put counter (process-global). Composed rather
 	// than exempted — #471.
 	ResetDenialOnlyPutForTest()

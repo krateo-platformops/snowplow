@@ -185,6 +185,28 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
+	// --- cache: #691 stuck-rebuild detectors ---
+	rbacRebuildPanics, err := m.Int64ObservableCounter(
+		"snowplow_rbac_rebuild_panics_total",
+		metric.WithDescription("Recovered panics of the RBAC snapshot rebuild (#691). Each one leaves the previous snapshot in force; a rebuild that panics on every attempt never publishes again. Warn on any increase."),
+	)
+	if err != nil {
+		return err
+	}
+	rbacUnpublishedAge, err := m.Float64ObservableGauge(
+		"snowplow_rbac_unpublished_event_age_seconds",
+		metric.WithDescription("Age in seconds of the OLDEST RBAC event not yet reflected in a completed snapshot rebuild; 0 when everything seen has been rebuilt (#691). > 0 and growing = a STUCK rebuild (revokes unpublished, in-process access kept); 0 = healthy or quiet. Page when > 60 for 5m."),
+	)
+	if err != nil {
+		return err
+	}
+	rbacPublishAge, err := m.Float64ObservableGauge(
+		"snowplow_rbac_last_successful_publish_age_seconds",
+		metric.WithDescription("Seconds since the last successful RBAC snapshot publish; 0 before the first (#691). Context only: it also grows on a quiet cluster, so it is not an alert on its own."),
+	)
+	if err != nil {
+		return err
+	}
 	// --- cache: #687 RBAC rebuild post-release pickups ---
 	rbacRebuildPickups, err := m.Int64ObservableCounter(
 		"snowplow_rbac_rebuild_post_release_pickups_total",
@@ -830,6 +852,9 @@ func registerInstruments(m metric.Meter, build string) error {
 			metric.WithAttributes(attribute.String("check", "read_paths_scoped")))
 		o.ObserveInt64(rbacPublishSeq, int64(cache.RBACGen()))
 		o.ObserveInt64(rbacRebuildPickups, int64(cache.RBACRebuildPostReleasePickups()))
+		o.ObserveInt64(rbacRebuildPanics, int64(cache.RBACRebuildPanicsTotal()))
+		o.ObserveFloat64(rbacUnpublishedAge, cache.RBACUnpublishedEventAge().Seconds())
+		o.ObserveFloat64(rbacPublishAge, cache.RBACLastPublishAge().Seconds())
 		o.ObserveInt64(rbacSubGenBumps, int64(cache.RBACSubGenBumpsTotal()))
 		o.ObserveInt64(rbacSubGenSubjects, int64(cache.RBACSubGenSubjectsTracked()))
 		// #260 change-4 — RBAC sub-gen churn attribution (re-establishment {gvr},
@@ -1122,6 +1147,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		return nil
 	}, append([]metric.Observable{
 		fallthroughTotal, assertionViolations, rbacPublishSeq, rbacRebuildPickups,
+		rbacRebuildPanics, rbacUnpublishedAge, rbacPublishAge,
 		rbacSubGenBumps, rbacSubGenSubjects,
 		// --- #260 change-4 ---
 		rbacReestablished, rbacWatchError, rbacBumpsBySource, rbacRoleNoop, rbacRoleSemanticNoop, rbacBindingUidChanged,
