@@ -117,7 +117,30 @@ func soundnessArms() []arm {
 			oneStage(`[.s.items[] | .spec.secret]`, "")},
 		{"E-excl: an envelope exclusion (del(.kind)) is not an item exclusion", mutItemExclMisapplied,
 			oneStage(`.s | del(.kind) | tojson`, "")},
+		// #683: the tracked stage's path query. An applied labelSelector lets an
+		// UPDATE of a label move an object in or out of the list.
+		{"S683: an applied labelSelector's label is read (literal path)", mutSelectorPathsDropped,
+			selectorStage("/apis/g/v1/namespaces/ns/s?labelSelector=tier%3Dweb", `[.s.items[] | .metadata.name]`)},
+		{"S683b: a templated path's selector: the whole labels map is read", mutSelectorPathsDropped,
+			selectorStage(`${ "/apis/g/v1/namespaces/ns/s?labelSelector=" + "tier%3Dweb" }`, `[.s.items[] | .metadata.name]`)},
 	}
+}
+
+// selectorStage is oneStage whose tracked LIST path carries a query.
+func selectorStage(path, filter string) Chain {
+	c := oneStage(filter, "")
+	c.RA.Stages[0].Path = path
+	return c
+}
+
+// tierWitness: the object's tier label web -> db; nothing else changes.
+func tierWitness() *[2]map[string]any {
+	mk := func(tier string) map[string]any {
+		it := advItem("a", "ns", map[string]any{"v": "1"})
+		it["metadata"].(map[string]any)["labels"] = map[string]any{"tier": tier}
+		return it
+	}
+	return &[2]map[string]any{mk("web"), mk("db")}
 }
 
 // armWitness: per mutation, one UPDATE the random search rarely builds; it
@@ -144,6 +167,9 @@ func armWitness() map[string]*[2]map[string]any {
 		mutItemsElemDropped:     secretWitness(),
 		// the item's own kind changes; the envelope's kind is what del() drops.
 		mutItemExclMisapplied: {advItem("a", "ns1", map[string]any{"v": "1"}), withKind(advItem("a", "ns1", map[string]any{"v": "1"}), "Other")},
+		// #683 (reviewer-603's witness): tier web -> db moves the object out
+		// of ?labelSelector=tier=web, so the served list and the output change.
+		mutSelectorPathsDropped: tierWitness(),
 	}
 }
 

@@ -23,8 +23,11 @@ type UAF struct {
 
 // Stage is one RESTAction spec.api entry.
 type Stage struct {
-	Name      string
-	Path      string   // template: "${ jq }" or literal (setup.go evalJQE)
+	Name string
+	// Path is a template ("${ jq }") or a literal (setup.go evalJQE). It can
+	// carry a query: the tracked stage's labelSelector selects the served
+	// list (#628), so its label keys are in the read set (selector.go, #683).
+	Path      string
 	Payload   string   // template
 	Headers   []string // templates
 	DependsOn string
@@ -105,6 +108,8 @@ func (s *state) chain(c Chain) {
 	if tracked == nil {
 		top("tracked stage %q not in the RESTAction", c.Tracked)
 	}
+	// #683: the path's applied labelSelector decides membership on labels.
+	s.selectorReads(tracked)
 	root := &abs{k: aRef, path: Path{}}
 	e := newEnv(nil)
 

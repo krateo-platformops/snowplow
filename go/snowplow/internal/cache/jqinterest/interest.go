@@ -20,7 +20,8 @@
 //
 // SOUNDNESS rests on: the abstract interpretation rules (analyze.go,
 // builtins.go), the shape-carrying projection (path.go), the chain model
-// (chain.go, which mirrors the resolver glue it cites), axiom A1 (an
+// (chain.go, which mirrors the resolver glue it cites, including the
+// tracked path's labelSelector: selector.go, #683), axiom A1 (an
 // informer-served list item is a Kubernetes object: a JSON object whose
 // metadata is an object and whose labels/annotations are string maps), and
 // the runtime fallbacks the design (§2.4) puts in PR-2. Each of these degrades
