@@ -43,6 +43,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -285,11 +286,7 @@ func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstru
 			itemList = append(itemList, it.Object)
 		}
 	}
-	return map[string]any{
-		"apiVersion": apiVersion,
-		"kind":       listKind,
-		"items":      itemList,
-	}
+	return listenvelope.New(apiVersion, listKind, itemList) // E6 (#674): envelope_e6_test.go
 }
 
 // gateListEnvelope unmarshals a LIST envelope, runs filterListByRBAC over
@@ -399,10 +396,7 @@ func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw [
 // "group/version" otherwise — the apiserver convention marshalAsList
 // expects.
 func apiVersionForGVR(gvr schema.GroupVersionResource) string {
-	if gvr.Group == "" {
-		return gvr.Version
-	}
-	return gvr.Group + "/" + gvr.Version
+	return listenvelope.APIVersionFor(gvr.Group, gvr.Version) // shared with internal/cache (#674)
 }
 
 // callPathVerb adapts an httpcall.RequestOptions to the narrow interface
@@ -869,12 +863,7 @@ func serveParsedListEnvelope(parsed parsedListEnvelope) (any, bool) {
 			items = append(items, it.Object)
 		}
 	}
-	envelope := map[string]any{
-		"apiVersion": parsed.apiVersion,
-		"kind":       parsed.kind,
-		"items":      items,
-	}
-	return envelope, true
+	return listenvelope.New(parsed.apiVersion, parsed.kind, items), true // E6 (#674): envelope_e6_test.go
 }
 
 // ptrTo returns a pointer to v — a local generic helper so the content

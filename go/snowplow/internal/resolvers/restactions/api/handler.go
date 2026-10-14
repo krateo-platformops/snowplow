@@ -11,7 +11,9 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // jsonHandlerOptions plumbs per-stage knobs into jsonHandlerCore.
@@ -55,6 +57,61 @@ type jsonHandlerOptions struct {
 	// failure line (log attribution only; never part of the filter input).
 	raNamespace string
 	raName      string
+	// k8sList: this call is a Kubernetes collection LIST (a GET on an
+	// apiserver path with no object name) of listGVR. Its response is a list
+	// envelope: jsonHandlerCore normalises it to E6 (normaliseListEnvelope)
+	// and stageEnvelopeCheck checks what the stage receives.
+	k8sList bool
+	listGVR schema.GroupVersionResource
+}
+
+// stageEnvelopeCheck is the E6 behavioural chokepoint (#603 §1, #674): every
+// Kubernetes LIST envelope reaches a stage through jsonHandlerCore, whatever
+// built it (informer, content cache, cluster-list collapse, branch C, or the
+// httpcall.Do apiserver fall-through). It is called on the envelope the
+// stage RECEIVES, after normaliseListEnvelope, so E6 holds on every path,
+// fall-through included (#676 C2(a)). Nil in production. This package's tests
+// set it (envelope_e6_chokepoint_test.go) to assert the keys are a subset of
+// listenvelope.Keys(). A key normaliseListEnvelope does not recognise (any
+// beyond apiVersion/kind/metadata/items) is left in place and caught here.
+var stageEnvelopeCheck func(opts jsonHandlerOptions, tmp any)
+
+// normaliseListEnvelope gives a Kubernetes LIST response the E6 envelope
+// (#603 §1, #674, reviewer-603's #676 C2(a)): exactly {apiVersion, kind,
+// items}, with apiVersion/kind synthesized from the GVR exactly as the
+// informer and content paths build them (listenvelope.For). The list-level
+// metadata (resourceVersion, continue, remainingItemCount) of a live
+// apiserver List, which the httpcall.Do fall-through hands back, is dropped.
+// The informer and content paths never carried it, so no RESTAction can rely
+// on a list-level .metadata read.
+//
+// Only an envelope of exactly the Kubernetes List shape is rewritten: keys
+// within {apiVersion, kind, metadata, items}, with items an array. Anything
+// else (a Status error, a non-Kubernetes response on an apiserver-shaped
+// path) is returned unchanged. An envelope that is already E6 for this GVR is
+// returned as is, with no copy.
+func normaliseListEnvelope(gvr schema.GroupVersionResource, tmp any) any {
+	m, ok := tmp.(map[string]any)
+	if !ok {
+		return tmp
+	}
+	items, ok := m[listenvelope.Items].([]any)
+	if !ok {
+		return tmp
+	}
+	for k := range m {
+		switch k {
+		case listenvelope.APIVersion, listenvelope.Kind, listenvelope.Items, "metadata":
+		default:
+			return tmp
+		}
+	}
+	av := listenvelope.APIVersionFor(gvr.Group, gvr.Version)
+	kind := listenvelope.KindFor(gvr.Resource)
+	if _, hasMeta := m["metadata"]; !hasMeta && m[listenvelope.APIVersion] == av && m[listenvelope.Kind] == kind {
+		return tmp
+	}
+	return listenvelope.New(av, kind, items)
 }
 
 // jsonHandler is the HTTP-body-shaped entry point — the form
@@ -144,6 +201,13 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 	// the filter input (same contract as pig["slice"]).
 	if len(opts.extras) > 0 {
 		pig["extras"] = opts.extras
+	}
+	if opts.k8sList {
+		// E6 on every path, the apiserver fall-through included (#676 C2(a)).
+		tmp = normaliseListEnvelope(opts.listGVR, tmp)
+		if stageEnvelopeCheck != nil {
+			stageEnvelopeCheck(opts, tmp)
+		}
 	}
 	pig[opts.key] = tmp
 	if si, ok := opts.out["slice"]; ok {

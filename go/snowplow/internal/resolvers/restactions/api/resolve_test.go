@@ -96,7 +96,9 @@ func TestMain(m *testing.M) {
 		envfuncs.DestroyCluster(clusterName),
 	)
 
-	os.Exit(testenv.Run(m))
+	// #674 — fail the run when the E6 chokepoint saw a list envelope with a
+	// key beyond {apiVersion, kind, items} (envelope_e6_chokepoint_test.go).
+	os.Exit(e6ChokepointExit(testenv.Run(m)))
 }
 
 func TestResolveAPI(t *testing.T) {

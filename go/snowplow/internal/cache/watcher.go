@@ -21,6 +21,8 @@ import (
 	"k8s.io/client-go/metadata/metadatainformer"
 	"k8s.io/client-go/rest"
 	clientcache "k8s.io/client-go/tools/cache"
+
+	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 )
 
 // listPageLimit is the chunk size used by every informer LIST call.
@@ -2255,25 +2257,15 @@ func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, 
 // (nil, false) otherwise, signalling the caller to fall through to the live
 // apiserver LIST (never worse).
 //
-// ENVELOPE PARITY (the byte-parity contract): the returned bytes are
-// json.Marshal of an unstructured.UnstructuredList's UnstructuredContent() —
-// the EXACT marshal path the live internal-dispatch LIST uses
-// (internal_dispatch.go), so the {apiVersion, kind, metadata, items} shape
-// and the per-item bytes are identical. The List-level apiVersion/kind are
-// synthesized from the items' own GroupVersionKind (`<Kind>List`), matching
-// the apiserver's collection-kind convention. Two DELIBERATE differences
-// from a fresh live LIST, both provably JQ-invariant for the composition-
-// list consumers and both matching what the live path ALREADY does:
-//   - metadata.resourceVersion is empty. A cached snapshot has no single
-//     live collection RV, and the live paged path pins page-1's RV but the
-//     downstream composition-list JQ reads only `.items[]` (never the
-//     list-level RV). Leaving it empty is the honest, drift-free choice.
-//   - metadata.continue is empty and remainingItemCount is nil — identical
-//     to the live path, which clears both on the accumulated list.
-//
-// The dev's byte-parity golden asserts items-equality + envelope-shape-
-// equality against a live LIST modulo these two fields (see the 1a
-// falsifier). No per-GVR carve-out — uniform over every servable GVR
+// ENVELOPE (E6, #674): the returned bytes are json.Marshal of
+// listenvelope.For(gvr, items): exactly {apiVersion, kind, items}, with
+// apiVersion/kind synthesized from the GVR — the SAME envelope the request
+// path serves (marshalAsList) and the one the live internal-dispatch LIST is
+// normalised to (internal_dispatch.go). No list-level metadata: a cached
+// snapshot has no single collection resourceVersion, and the request path
+// never carries one, so no JQ can depend on it. Pinned by
+// internal/resolvers/restactions/api/envelope_e6_test.go and the 1a
+// falsifier. No per-GVR carve-out — uniform over every servable GVR
 // (feedback_no_special_cases).
 func (rw *ResourceWatcher) ListServableEnvelopeJSON(gvr schema.GroupVersionResource, namespace string) ([]byte, bool) {
 	return rw.ListServableEnvelopeJSONWhere(gvr, namespace, nil)
@@ -2298,30 +2290,22 @@ func (rw *ResourceWatcher) ListServableEnvelopeJSONWhere(gvr schema.GroupVersion
 		}
 		items = kept
 	}
-	list := &unstructured.UnstructuredList{}
-	// Synthesize the collection envelope from the items' own GVK. Every
-	// informer item carries its singular apiVersion/kind; the LIST kind is
-	// the apiserver convention `<Kind>List`. When the set is empty we cannot
-	// read a per-item GVK — fall back to the GVR's group/version and a
-	// resource-derived kind is not available, so leave the envelope kind
-	// empty (the live empty-LIST path likewise carries only whatever the
-	// apiserver returned; the composition-list JQ reads `.items[]`, which is
-	// an empty array here — shape-correct).
-	list.Items = make([]unstructured.Unstructured, 0, len(items))
+	// E6 (#603 §1, #674): the served envelope is exactly {apiVersion, kind,
+	// items}, built by listenvelope with apiVersion/kind synthesized from the
+	// GVR — byte-identical to the request path's marshalAsList for the same
+	// GVR and items. It used to take them from the first item's GVK and to
+	// OMIT both on an empty result, so a selector that matched nothing
+	// served {items} alone: an UPDATE moving the only selected object out of
+	// the selector flipped the key set (reviewer-603, #676). Pinned by
+	// internal/resolvers/restactions/api/envelope_e6_test.go.
+	itemList := make([]any, 0, len(items))
 	for _, it := range items {
 		if it == nil {
 			continue
 		}
-		list.Items = append(list.Items, *it)
+		itemList = append(itemList, it.Object)
 	}
-	if len(list.Items) > 0 {
-		gvk := list.Items[0].GroupVersionKind()
-		if gvk.Kind != "" {
-			list.SetAPIVersion(gvk.GroupVersion().String())
-			list.SetKind(gvk.Kind + "List")
-		}
-	}
-	raw, err := json.Marshal(list.UnstructuredContent())
+	raw, err := json.Marshal(listenvelope.For(gvr.Group, gvr.Version, gvr.Resource, itemList))
 	if err != nil {
 		return nil, false
 	}

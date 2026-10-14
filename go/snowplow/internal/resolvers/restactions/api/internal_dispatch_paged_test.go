@@ -318,34 +318,29 @@ func TestInternalRESTConfigDispatch_PagedList_FullWalk(t *testing.T) {
 		}
 	}
 
-	// FALSIFIER-C — envelope shape MUST be apiserver LIST. apiVersion +
-	// kind from the GVR; resourceVersion from PAGE 1's metadata (NOT
-	// last-write-wins). continue MUST be empty (we've accumulated all
-	// pages; the served list is fully materialised).
+	// FALSIFIER-C — the served envelope is the E6 envelope (#603 §1, #674):
+	// exactly {apiVersion, kind, items}, apiVersion/kind synthesized from the
+	// GVR exactly as the request path's marshalAsList does. Since #676 the
+	// live list's metadata is DROPPED, not copied from page 1: the request
+	// path never carries list metadata, and page 1's continue token or
+	// resourceVersion leaking in would break E6 (and made a branch-C
+	// re-resolve differ from the request path by resourceVersion alone).
 	if envelope.APIVersion != "composition.krateo.io/v1-2-2" {
 		t.Fatalf("FALSIFIER-C FAIL: served apiVersion=%q, expected the "+
-			"GVR's apiVersion from page 1", envelope.APIVersion)
+			"GVR's apiVersion", envelope.APIVersion)
 	}
-	if envelope.Kind != "GitHubScaffoldingWithCompositionPagesList" {
-		t.Fatalf("FALSIFIER-C FAIL: served kind=%q, expected the GVR's "+
-			"list kind from page 1", envelope.Kind)
+	if want := listKindForResource("githubscaffoldingwithcompositionpages"); envelope.Kind != want {
+		t.Fatalf("FALSIFIER-C FAIL: served kind=%q, expected the request "+
+			"path's list kind %q", envelope.Kind, want)
 	}
-	if envelope.Metadata.ResourceVersion != "1000" {
-		t.Fatalf("FALSIFIER-C FAIL: served resourceVersion=%q, expected "+
-			"\"1000\" (page 1's RV). A last-write-wins implementation "+
-			"would report page %d's RV instead.",
-			envelope.Metadata.ResourceVersion, expectedPages-1)
+	var keys map[string]any
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("FALSIFIER-C: %v", err)
 	}
-	if envelope.Metadata.Continue != "" {
-		// page 1 emits continue="1"; if we accidentally copy it onto
-		// resultList.Object then the served envelope would also have
-		// continue="1" — the JQ pipeline would misinterpret the list
-		// as partial. Verify we omit it.
-		t.Fatalf("FALSIFIER-C FAIL: served metadata.continue=%q is "+
-			"non-empty. The paged walk should accumulate pages and emit "+
-			"a fully-materialised list (continue=\"\"). Page 1's "+
-			"continue token leaked into the served envelope.",
-			envelope.Metadata.Continue)
+	if _, has := keys["metadata"]; has || len(keys) != 3 {
+		t.Fatalf("FALSIFIER-C FAIL: served envelope keys %v; want exactly "+
+			"{apiVersion, kind, items} (no list metadata: page 1's "+
+			"resourceVersion/continue must not leak, #676)", keys)
 	}
 
 	// FALSIFIER-D — the DEBUG-level slog falsifier event MUST fire ONCE,

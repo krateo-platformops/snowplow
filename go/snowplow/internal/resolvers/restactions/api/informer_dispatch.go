@@ -53,6 +53,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -158,18 +159,11 @@ func readerFromBytes(b []byte) io.ReadCloser {
 //
 // Per `feedback_no_special_cases.md`: the rule is `upper(Resource[0]) +
 // Resource[1:] + "List"` for every GVR. No switch arms.
+//
+// The rule lives in listenvelope.KindFor (#674), shared with internal/cache's
+// informer envelope, so every path names the same GVR's list identically.
 func listKindForResource(resource string) string {
-	if resource == "" {
-		return "List"
-	}
-	// ASCII-uppercase the first byte; K8s resource names are
-	// guaranteed lowercase ASCII per the CRD naming spec
-	// (kubernetes.io/docs/concepts/overview/working-with-objects/names/).
-	first := resource[0]
-	if first >= 'a' && first <= 'z' {
-		first -= 'a' - 'A'
-	}
-	return string(first) + resource[1:] + "List"
+	return listenvelope.KindFor(resource)
 }
 
 // marshalAsList produces the apiserver-shaped LIST envelope:
@@ -200,12 +194,7 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 			itemList = append(itemList, it.Object)
 		}
 	}
-	envelope := map[string]any{
-		"apiVersion": apiVersion,
-		"kind":       listKind,
-		"items":      itemList,
-	}
-	return json.Marshal(envelope)
+	return json.Marshal(listenvelope.New(apiVersion, listKind, itemList)) // E6 (#674): envelope_e6_test.go
 }
 
 // marshalAsListRaw builds the SAME envelope marshalAsList builds, from
