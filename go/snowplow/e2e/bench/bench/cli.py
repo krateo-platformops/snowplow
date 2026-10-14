@@ -1005,6 +1005,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # of the cluster's — which is precisely how the 1.12.5 claim came to rest on a manual call.
     from bench import s6browser
     s6browser.add_parsers(sub)
+    # #606: data generation on the bench cluster. The cluster lifecycle
+    # (gke-up/down/reap/env) is NOT here: it lives behind
+    # `python -m bench.gke`, outside this entrypoint's kube-context guard.
+    from bench import data606
+    data606.add_parsers(sub)
 
     return p
 

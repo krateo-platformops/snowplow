@@ -63,13 +63,39 @@ CANONICAL_GKE_CONTEXT = "gke_neon-481711_us-central1-a_cluster-1"
 ENV_GKE_CONTEXT = "BENCH_GKE_CONTEXT"
 
 
+# Clusters the bench must NEVER drive, whatever BENCH_GKE_CONTEXT says.
+# krateo-057 is demo-reserved (owner ruling 2026-10-13, #606): the 50K bench
+# runs on a temporary dedicated cluster instead. Matched against the cluster
+# segment of a gcloud context name (gke_<project>_<location>_<cluster>), so a
+# kubeconfig alias that merely CONTAINS the string elsewhere is not caught —
+# and a context whose cluster IS 057 is caught however the alias is spelled
+# after the last underscore.
+FORBIDDEN_BENCH_CLUSTERS = ("krateo-057",)
+
+
+def forbidden_context(ctx: str) -> bool:
+    """True when `ctx` names a cluster the bench must never drive."""
+    ctx = (ctx or "").strip()
+    cluster_part = ctx.rsplit("_", 1)[-1]
+    return any(cluster_part == f or ctx == f for f in FORBIDDEN_BENCH_CLUSTERS)
+
+
 def canonical_gke_context() -> str:
     """The GKE context every bench kubectl/helm/client call pins.
 
     Returns $BENCH_GKE_CONTEXT when set and non-empty, else the
-    CANONICAL_GKE_CONTEXT fallback.
+    CANONICAL_GKE_CONTEXT fallback. Exits 3 when that context names a
+    forbidden cluster (krateo-057) — every pinned kubectl/helm/client call
+    resolves its context here, so this is the one place that can refuse them all.
     """
-    return os.environ.get(ENV_GKE_CONTEXT, "").strip() or CANONICAL_GKE_CONTEXT
+    ctx = os.environ.get(ENV_GKE_CONTEXT, "").strip() or CANONICAL_GKE_CONTEXT
+    if forbidden_context(ctx):
+        sys.stderr.write(
+            f"bench: refusing context {ctx!r} — {FORBIDDEN_BENCH_CLUSTERS} is "
+            f"demo-reserved and never a bench target (#606). Use a temporary "
+            f"cluster from `python -m bench gke-up`.\n")
+        sys.exit(3)
+    return ctx
 
 
 def gke_context_guard(allow_non_gke: bool | None = None) -> None:
@@ -112,6 +138,11 @@ def gke_context_guard(allow_non_gke: bool | None = None) -> None:
         # the caller; we do not want module import to die on a transient.
         return
     ctx = (proc.stdout.decode() or "").strip()
+    if forbidden_context(ctx):
+        sys.stderr.write(
+            f"bench: GKE context guard FAIL — current-context={ctx!r} is a "
+            f"forbidden bench target {FORBIDDEN_BENCH_CLUSTERS} (#606).\n")
+        sys.exit(3)
     want = canonical_gke_context()
     if ctx != want:
         sys.stderr.write(

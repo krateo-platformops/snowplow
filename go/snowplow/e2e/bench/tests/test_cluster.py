@@ -204,7 +204,10 @@ def test_kubectl_no_inject_when_env_bypass_set(monkeypatch, with_env):
 # BENCH_ALLOW_NON_GKE=1, which removes pinning entirely and would let a
 # `helm upgrade` land on whatever current-context happens to name.
 
-_OVERRIDE_CTX = "gke_operations-dev-krateo-io_europe-west3-a_krateo-057"
+# A #606 temporary bench cluster. This used to name krateo-057, which is now
+# refused outright (demo-reserved, owner ruling 2026-10-13; see test_606.py).
+_OVERRIDE_CTX = ("gke_operations-dev-krateo-io_europe-west4-a_"
+                 "snowplow-bench-1014-1200")
 
 
 def _fake_run_factory(seen, stdout=b""):

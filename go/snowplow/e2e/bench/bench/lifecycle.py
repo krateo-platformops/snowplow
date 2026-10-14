@@ -1402,11 +1402,17 @@ def _scaleuser_name(i):
 
 def _scaleuser_password():
     """Fixed password for all scale users (test-only, not security-sensitive)."""
-    return "ScaleTest2026!"
+    from bench.load606 import SCALEUSER_PASSWORD
+    return SCALEUSER_PASSWORD
 
 
-def create_synthetic_users(start, end):
+def create_synthetic_users(start, end, groups_for=None):
     """Register scale users via authn and login to create clientconfig secrets.
+
+    `groups_for(i) -> list[str]` sets user i's authn groups. None keeps the
+    historical single-group shape (every user in `devs`); the #606 bench
+    passes `functools.partial(rbac_model.user_groups, m=model)` so the 1000
+    users span realistic team bindings instead of one binding class.
 
     For each user scaleuser-{start:04d} through scaleuser-{end:04d}:
       1. Create a kubernetes.io/basic-auth Secret holding the password
@@ -1427,6 +1433,8 @@ def create_synthetic_users(start, end):
         docs = []
         for i in range(batch_start, batch_end + 1):
             name = _scaleuser_name(i)
+            groups = list(groups_for(i)) if groups_for else ["devs"]
+            groups_yaml = "\n".join(f"    - {g}" for g in groups)
             docs.append(f"""\
 apiVersion: v1
 kind: Secret
@@ -1451,7 +1459,7 @@ spec:
   displayName: "Scale User {i:04d}"
   avatarURL: https://i.pravatar.cc/256?img={(i % 70) + 1}
   groups:
-    - devs
+{groups_yaml}
   passwordRef:
     namespace: {PHASE7_AUTHN_NS}
     name: {name}-password
