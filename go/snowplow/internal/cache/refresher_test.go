@@ -95,7 +95,17 @@ func TestRefresher_HandlerInvokedOnEnqueue(t *testing.T) {
 	StartRefresher(ctx)
 
 	enqueueRefreshForTest(key)
-	waitFor(t, 2*time.Second, "handler invoked", func() bool { return called.Load() == 1 })
+	// Event-driven (reviewer-603's #676 whole-module run saw completedTotal=0
+	// under load): the handler bumps `called` INSIDE the refresh, but
+	// processNext counts completedTotal only AFTER the handler returns, so
+	// reading the counter the instant `called` flips raced the worker. Wait
+	// for both. The minute is a backstop for a starved worker, not a budget.
+	waitFor(t, time.Minute, "handler invoked and the refresh counted complete", func() bool {
+		return called.Load() == 1 && refresherSingleton().completedTotal.Load() == 1
+	})
+	if got := called.Load(); got != 1 {
+		t.Errorf("handler invoked %d times, want exactly 1", got)
+	}
 	if got := refresherSingleton().completedTotal.Load(); got != 1 {
 		t.Errorf("completedTotal=%d want 1", got)
 	}
