@@ -122,6 +122,21 @@ def test_pod_restart_count_alone_is_a_restart():
     assert all(c["result"] == "FAIL" for c in checks)
 
 
+def test_restart_count_only_uses_finished_at_for_the_peak_before():
+    import datetime as dt
+    t_oom = dt.datetime(2026, 10, 15, 10, 0, 0, tzinfo=dt.timezone.utc).timestamp()
+    pods = [{**PODS[0]}, {**PODS[1], "restarts": 1,
+                         "last_state": {"terminated": {"reason": "OOMKilled", "exitCode": 137,
+                                                       "finishedAt": "2026-10-15T10:00:00Z"}}}]
+    mem = [_mem(t_oom - 30, 6900, 7700), _mem(t_oom - 10, 7800, 8000)]   # no sample after it
+    tops = [{"kind": "top", "t": t_oom - 5, "rss_bytes": int(7.95 * GIB)}]
+    rep, _ = load606.run8_report(_navs(), mem, tops, pods)
+    r = rep["restart"]
+    assert r["t"] == t_oom
+    assert r["peak_heap_inuse_mb_before"] == 7800 and r["peak_sys_mb_before"] == 8000
+    assert r["peak_rss_bytes_before"] == int(7.95 * GIB)
+
+
 def test_monotonic_series_is_not_a_restart():
     mem = [{**_mem(100, **{K["stale_overdue"]: 1}), "num_gc": 10},
            {**_mem(160, **{K["stale_overdue"]: 4}), "num_gc": 40}]

@@ -1176,6 +1176,16 @@ def detect_restart(mem: list[dict], pods: list[dict] | None) -> dict | None:
             ls = (after.get("last_state") or {}).get("terminated") or {}
             signals.append({"t": ls.get("finishedAt"), "signal": "pod restartCount",
                             "reason": ls.get("reason"), "exit_code": ls.get("exitCode")})
+            if t_first is None and ls.get("finishedAt"):
+                # restartCount is the ONLY signal (e.g. no sample landed after
+                # the restart): the termination time is the restart time, so
+                # the "peak before the restart" fields are still computed.
+                import datetime as _dt
+                try:
+                    t_first = _dt.datetime.fromisoformat(
+                        str(ls["finishedAt"]).replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    pass
     if not signals:
         return None
     return {"t": t_first, "signals": signals}
