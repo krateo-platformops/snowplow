@@ -265,6 +265,7 @@ func TestIssue618_EveryServeSiteClassifiesTheQuery(t *testing.T) {
 		"extractClusterListGVRFromStagePath": "GVR shape half of extractClusterListTargetFromStage, which classifies",
 		"classifyOwnDialForbidden":           "#681: classifies an apiserver 403 and builds its identity-free error text from (gvr, ns, name); serves and keys nothing",
 		"canonicalStageMessage":              "#709: formats a failed stage's error text from (code, gvr, ns, name) only — never a key, never a served data body; TestIssue709_CanonicalStageMessage_CarriesNoQuery pins that no query reaches it",
+		"isAccessReviewPath":                 "#615: classifies a POST path as an access-review create (group, resource, no name) to decide a branch-E dial's identity (impersonate or fail closed); a query makes it false; serves and keys nothing",
 	}
 	fset := token.NewFileSet()
 	files, err := filepath.Glob("*.go")

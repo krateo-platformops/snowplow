@@ -286,6 +286,10 @@ func TestFalsifier302_PayloadJQError_SkipsDial(t *testing.T) {
 // be a garbage HEADER value (e.g. Authorization). Assert SKIP + jq_header_error
 // counter + that the ONLY dialed request carries the intended Authorization, not
 // an error string; a valid-header control still dials.
+// garbage302ProbeHeader is the control's header: one the stage owns on an
+// SA-endpoint dial.
+const garbage302ProbeHeader = "X-Krateo-Probe"
+
 func TestFalsifier302_HeaderJQError_SkipsDial(t *testing.T) {
 	garbage293FailFast(t)
 
@@ -294,7 +298,7 @@ func TestFalsifier302_HeaderJQError_SkipsDial(t *testing.T) {
 	var dials []dialRec
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		dials = append(dials, dialRec{r.RequestURI, r.Header.Get("Authorization")})
+		dials = append(dials, dialRec{r.RequestURI, r.Header.Get(garbage302ProbeHeader)})
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -316,11 +320,14 @@ func TestFalsifier302_HeaderJQError_SkipsDial(t *testing.T) {
 		ErrorKey:        ptr.To("errHdr"),
 	}
 	// Control: a VALID literal header MUST still dial, carrying its real value.
+	// The dial is to the ctx internal (ServiceAccount) endpoint, where a stage
+	// may not set Authorization or Impersonate-* at all (#725 — they are
+	// dropped), so the control uses a neutral header the stage does own.
 	okHeader := &templates.API{
 		Name:            "header_ok_control",
 		Path:            "/good-hdr",
 		Verb:            ptr.To(http.MethodGet),
-		Headers:         []string{"Authorization: Bearer literal-token"},
+		Headers:         []string{garbage302ProbeHeader + ": literal-token"},
 		ContinueOnError: ptr.To(true),
 		ErrorKey:        ptr.To("errOkHdr"),
 	}
@@ -341,10 +348,10 @@ func TestFalsifier302_HeaderJQError_SkipsDial(t *testing.T) {
 	if len(got) != 1 || got[0].path != "/good-hdr" {
 		t.Fatalf("#302 header (RED pre-fix): expected exactly ONE dial (the valid-header control /good-hdr); got %+v — a header jq-error must SKIP the dial, never dial a request carrying a swallowed jq error as a header value", got)
 	}
-	// SECURITY: the one dialed request carries the intended Authorization, never
+	// SECURITY: the one dialed request carries the intended header value, never
 	// an error string — a garbage-header dial can never leak onto the wire.
-	if got[0].auth != "Bearer literal-token" {
-		t.Fatalf("#302 header SECURITY: the dialed request's Authorization must be the intended value, never a jq-error string; got %q", got[0].auth)
+	if got[0].auth != "literal-token" {
+		t.Fatalf("#302 header SECURITY: the dialed request's %s must be the intended value, never a jq-error string; got %q", garbage302ProbeHeader, got[0].auth)
 	}
 	if d := MalformedDialSkippedByReason(reasonJQHeaderError) - beforeHeader; d != 1 {
 		t.Fatalf("#302 header: the header-jq-error skip must bump the %q per-reason metric by 1; got delta %d", reasonJQHeaderError, d)

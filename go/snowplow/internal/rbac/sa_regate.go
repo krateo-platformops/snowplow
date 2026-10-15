@@ -160,10 +160,12 @@ func saCredentialOnContext(ctx context.Context) bool {
 //   - The refusal WARNs carry the sa_regate_* attributes (origin, trigger,
 //     prewarm scope) and key_hash (sa_regate_attribution.go), so the population can be attributed before anything is
 //     changed.
-//   - #615: the impersonation stand-down below trusts a ctx-wide marker, but
-//     the branch-E ENDPOINT dial is not impersonated. Under that marker a
-//     non-UAF branch-E dial is NOT gated and reads with SA breadth. Today only
-//     the external-touched Put decline keeps the result out of L1.
+//   - #615: the impersonation stand-down below trusts a ctx-wide marker, so
+//     EVERY dial it lets through must itself impersonate. The *rest.Config
+//     transport does (resolve_populate.go); the branch-E SA-ENDPOINT dial
+//     carries the same impersonation since #615
+//     (restactions/api/branche_impersonation.go), and with the marker set but
+//     no impersonating config it fails closed instead of dialing as the SA.
 //
 // One predicate, no per-resource carve-outs (feedback_no_special_cases).
 // NOTE (arch-268 to bless): the design stated `saCredentialOnCtx && !serveUnnarrowed`;

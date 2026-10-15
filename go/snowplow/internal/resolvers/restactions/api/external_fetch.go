@@ -16,6 +16,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/http/util"
 	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	"sigs.k8s.io/yaml"
@@ -174,6 +175,11 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		// transport — no bespoke X-Krateo-Correlation-Id header here.
 	}
 
+	// #615 / #725 — on a dial of snowplow's own ServiceAccount endpoint, only
+	// snowplow decides who that credential acts as and what it is: a stage's
+	// Impersonate-* and Authorization headers are dropped
+	// (branche_impersonation.go). Other dials keep their headers.
+	saDial := cache.ServiceAccountDialFromContext(ctx)
 	if len(opts.Headers) > 0 {
 		for _, el := range opts.Headers {
 			idx := strings.Index(el, ":")
@@ -181,6 +187,9 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 				continue
 			}
 			key := el[:idx]
+			if saDial && isSADialControlledHeader(key) {
+				continue
+			}
 			val := strings.TrimSpace(el[idx+1:])
 			call.Header.Set(key, val)
 		}
@@ -221,6 +230,16 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	// byte-identical. The existing shortid X-Krateo-TraceId header set
 	// above is UNTOUCHED — both correlation ids ride the same request.
 	cli.Transport = tracing.WrapTransport(cli.Transport)
+	// #615 — a non-UAF SA-endpoint dial under the impersonated-dial marker reads
+	// as the cohort (branche_impersonation.go). No-op for every other dial.
+	cli.Transport = impersonateEndpointTransport(ctx, cli.Transport)
+	// #721 gate F1 — on an SA-endpoint dial every request, each redirect hop
+	// included, must go to the first request's host: the pin is the OUTERMOST
+	// layer, so a hop elsewhere is refused before the SA bearer or any
+	// Impersonate-* header is added.
+	if saDial {
+		cli.Transport = pinSADialHost(u, cli.Transport)
+	}
 
 	// REUSED verbatim: retry wrapper.
 	retryCli := util.NewRetryClient(cli)

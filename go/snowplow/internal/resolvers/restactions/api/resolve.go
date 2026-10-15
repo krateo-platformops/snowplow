@@ -1324,8 +1324,22 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	//     false) → dials the per-user endpoint unchanged.
 	//   - A genuine SA / identity-free refresh (serveUnnarrowed) → mustRegateSADial
 	//     false → the legitimate un-gated SA serve is unchanged.
-	if apiCall.UserAccessFilter == nil && cache.ServiceAccountDialFromContext(gctx) && rbac.MustRegateSADial(gctx) {
+	//   - #615: under the #574 impersonated-dial marker MustRegateSADial stands
+	//     down, so this SA-endpoint dial must itself read as the cohort, or not
+	//     happen: branchEDecide (branche_impersonation.go) impersonates it, or
+	//     fails it closed here (no impersonating config, a host other than that
+	//     apiserver, or a write).
+	saEndpointDial := apiCall.UserAccessFilter == nil && cache.ServiceAccountDialFromContext(gctx)
+	var branchEImp rest.ImpersonationConfig
+	branchE, branchEReason := branchEUnmarked, ""
+	if saEndpointDial {
+		branchEImp, branchE, branchEReason = branchEDecide(gctx, call)
+	}
+	if saEndpointDial && (rbac.MustRegateSADial(gctx) || branchE == branchEFailClosed) {
 		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", call.Path)
+		if branchE == branchEFailClosed {
+			msg = fmt.Sprintf("branch-E SA-endpoint dial refused under impersonation: %s (%s, #615)", branchEReason, call.Path)
+		}
 		// #574 — attribute the refusal to its driver (refresher trigger/trigger-less,
 		// cohort seed + prewarm scope, prewarm, live) and to the cell it was
 		// populating (key_hash), from stamps the ctx already carries.
@@ -1361,6 +1375,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// path.
 	fctx, fcancel := externalSeedFetchCtx(gctx)
 	defer fcancel()
+	if branchE == branchEImpersonate {
+		fctx = withEndpointImpersonation(fctx, branchEImp)
+	}
 	res, jsonBytes, _, fetchErr := httpFetchAllowingNonJSON(fctx, call)
 	if fetchErr != nil && fctx.Err() != nil {
 		// #643 PR-A — the caller's ctx was done before the response was read
