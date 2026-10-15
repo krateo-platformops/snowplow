@@ -10,7 +10,7 @@
 //
 // Ported VERBATIM from composition-dynamic-controller/internal/authn (an
 // internal/ package, not cross-module importable) — the established cdc→authn
-// pattern. Self-contained: stdlib only.
+// pattern. Self-contained: stdlib plus internal/credhttp (#723/#724).
 //
 // Token() reads the projected SA token fresh on every cache miss (projected
 // tokens rotate on disk), exchanges it for a JWT, and caches the JWT until
@@ -28,6 +28,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 // DefaultTokenPath is the conventional mount path of the projected
@@ -62,9 +64,11 @@ func New(server, tokenPath string) *Client {
 		tokenPath = DefaultTokenPath
 	}
 	return &Client{
-		server:     server,
-		tokenPath:  tokenPath,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		server:    server,
+		tokenPath: tokenPath,
+		// #723/#724: this client presents snowplow's projected SA token; it
+		// never follows a redirect (a same-host redirect would re-send it).
+		httpClient: credhttp.Client(&http.Client{Timeout: 30 * time.Second}),
 		now:        time.Now,
 	}
 }

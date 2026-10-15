@@ -254,7 +254,7 @@ func TestResolveStageEndpoint_UAF_SAAcquireFailure_FailClosedButResponds(t *test
 		},
 	}
 
-	ep, _, action := r.resolveStageEndpoint("compositions", apiCall, true /*uafActive*/)
+	ep, _, _, action := r.resolveStageEndpoint("compositions", apiCall, true /*uafActive*/)
 
 	if acquireCalls.Load() != 1 {
 		t.Fatalf("SA-endpoint acquire must be attempted exactly once via the seam, got %d", acquireCalls.Load())
@@ -304,7 +304,12 @@ func TestResolveStageEndpoint_UAF_SAAcquireSuccess_Proceeds(t *testing.T) {
 		UserAccessFilter: &templates.UserAccessFilterSpec{Verb: "list", Group: "composition.krateo.io", Resource: "compositions"},
 	}
 
-	ep, isSA, action := r.resolveStageEndpoint("compositions", apiCall, true)
+	ep, isSA, held, action := r.resolveStageEndpoint("compositions", apiCall, true)
+	// #723/#724: the SA endpoint is a held credential, so runStage marks the
+	// dial and its client never follows a redirect.
+	if !held {
+		t.Fatalf("#723: a UAF (SA-endpoint) stage must report held=true")
+	}
 	if action != stageProceed {
 		t.Fatalf("control: a successful SA acquire must return stageProceed; got %v", action)
 	}

@@ -6,8 +6,8 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
-	"github.com/krateo-platformops/plumbing/kubeconfig"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	authv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -68,11 +68,11 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 // rest.Config from the user endpoint, then a real clientset). Adds zero
 // production surface: the indirection is a single func-var deref.
 var sarClientsetForEndpoint = func(ctx context.Context, ep endpoints.Endpoint) (kubernetes.Interface, error) {
-	rc, err := kubeconfig.NewClientConfig(ctx, ep)
+	rc, err := credhttp.NewClientConfig(ctx, ep)
 	if err != nil {
 		return nil, err
 	}
-	return kubernetes.NewForConfig(rc)
+	return credhttp.Kubernetes(rc)
 }
 
 // userCanViaSAR is the upstream cache=off correctness baseline. It

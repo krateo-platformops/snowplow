@@ -304,11 +304,11 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 //     not the apiserver's per-identity denial (#681 F2, a rate limit).
 func nonOKStatus(code int, dat []byte) *response.Status {
 	if len(bytes.TrimSpace(dat)) == 0 {
-		return response.New(code, fmt.Errorf("upstream answered %d %s with an empty body", code, http.StatusText(code)))
+		return failureStatus(code, fmt.Errorf("upstream answered %d %s with an empty body", code, http.StatusText(code)))
 	}
 	res := &response.Status{}
 	if jerr := json.Unmarshal(dat, res); jerr != nil {
-		return response.New(code, fmt.Errorf("%s", string(dat)))
+		return failureStatus(code, fmt.Errorf("%s", string(dat)))
 	}
 	// #714 — the status line is the truth: a body cannot claim another code,
 	// and a claimed reason survives only if it agrees with the code
@@ -399,4 +399,16 @@ func isYAMLContentType(contentType string) bool {
 func isJSONObjectOrArray(b []byte) bool {
 	s := strings.TrimLeft(string(b), " \t\r\n")
 	return strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[")
+}
+
+// failureStatus is response.New for a non-2xx answer, always a Failure.
+// plumbing's response.New marks every code it does not list (a 3xx, 429, 502,
+// 504, ...) as SUCCESS, so a refused redirect (#723/#724: the credentialed
+// client hands back the 3xx itself) with an HTML or empty body would have been
+// taken for a success and fed a nil body onward. The code stays the status
+// line's; the reason stays whatever response.New derives from that code.
+func failureStatus(code int, err error) *response.Status {
+	res := response.New(code, err)
+	res.Status = response.StatusFailure
+	return res
 }

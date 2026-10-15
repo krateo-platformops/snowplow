@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -456,7 +457,7 @@ func buildSecretsClient(rc *rest.Config) (kubernetes.Interface, error) {
 	if rc == nil {
 		return nil, fmt.Errorf("StartSecretsInformer: rest.Config is nil and no test client set")
 	}
-	return kubernetes.NewForConfig(rc)
+	return credhttp.Kubernetes(rc)
 }
 
 // secretsTestClient holds an injectable fake clientset for tests.

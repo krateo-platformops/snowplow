@@ -41,6 +41,7 @@ import (
 
 	"log/slog"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -153,7 +154,7 @@ var discoveryClientBuilder = func(rc *rest.Config) (discovery.DiscoveryInterface
 	if rc == nil {
 		return nil, fmt.Errorf("nil *rest.Config")
 	}
-	return discovery.NewDiscoveryClientForConfig(rc)
+	return credhttp.Discovery(rc)
 }
 
 // discoverGroupSingleflight ensures that concurrent

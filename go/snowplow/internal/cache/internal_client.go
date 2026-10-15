@@ -58,7 +58,7 @@ import (
 	"context"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
-	"github.com/krateo-platformops/plumbing/kubeconfig"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"k8s.io/client-go/rest"
 )
 
@@ -94,5 +94,5 @@ func ClientConfigFor(ctx context.Context, ep endpoints.Endpoint) (*rest.Config, 
 		// the diagnosable outcome. A future internal driver passing the
 		// wrong type is caught by the falsifier test in this package.
 	}
-	return kubeconfig.NewClientConfig(ctx, ep)
+	return credhttp.NewClientConfig(ctx, ep)
 }

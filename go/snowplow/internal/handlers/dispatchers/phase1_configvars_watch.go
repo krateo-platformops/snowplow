@@ -43,6 +43,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -117,7 +118,7 @@ func buildConfigVarsWatchClient(rc *rest.Config) (kubernetes.Interface, error) {
 	if cli := configVarsWatchClientForTest.Load(); cli != nil && *cli != nil {
 		return *cli, nil
 	}
-	return kubernetes.NewForConfig(rc)
+	return credhttp.Kubernetes(rc)
 }
 
 // matchesConfigVars reports whether an informer event object IS the config-vars

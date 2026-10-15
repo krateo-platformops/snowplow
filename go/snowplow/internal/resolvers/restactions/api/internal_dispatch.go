@@ -126,6 +126,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -204,7 +205,7 @@ func internalClientFor(rc *rest.Config) (k8sdynamic.Interface, error) {
 	if cli, ok := internalClientCache[rc]; ok {
 		return cli, nil
 	}
-	cli, err := k8sdynamic.NewForConfig(rc)
+	cli, err := credhttp.Dynamic(rc)
 	if err != nil {
 		return nil, err
 	}

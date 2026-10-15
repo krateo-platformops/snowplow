@@ -58,11 +58,11 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"golang.org/x/sync/singleflight"
 
 	authzv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
@@ -107,7 +107,7 @@ func NewSSARImpersonationReviewer(rc *rest.Config) (ImpersonationReviewFunc, err
 	if rc == nil {
 		return nil, errors.New("nil rest.Config")
 	}
-	cs, err := kubernetes.NewForConfig(rc)
+	cs, err := credhttp.Kubernetes(rc)
 	if err != nil {
 		return nil, err
 	}

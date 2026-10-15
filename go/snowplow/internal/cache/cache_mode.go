@@ -55,8 +55,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -291,7 +291,7 @@ func DiscoverMetadataOnlyAnnotations(ctx context.Context, cfg *rest.Config) {
 			slog.String("reason", "nil rest.Config — annotation discovery skipped, seed-only routing"))
 		return
 	}
-	clientset, err := apiextensionsclientset.NewForConfig(cfg)
+	clientset, err := credhttp.APIExtensions(cfg)
 	if err != nil {
 		slog.Warn("cache.discover_metadata_only.client_construct_failed",
 			slog.String("subsystem", "cache"),

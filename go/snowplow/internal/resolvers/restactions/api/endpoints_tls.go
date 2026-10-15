@@ -11,6 +11,7 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"k8s.io/client-go/transport"
 )
@@ -83,6 +84,31 @@ import (
 // share connections instead of building a fresh transport per request
 // the way plumbing does.
 func httpClientForEndpoint(ctx context.Context, ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, error) {
+	cli, err := buildEndpointClient(ctx, ep, ri)
+	if err != nil {
+		return cli, err
+	}
+	// #723/#724 — a dial that presents a credential snowplow holds (the SA
+	// endpoint, marked by cache.WithServiceAccountDial, or any held credential,
+	// marked by credhttp.WithHeldCredential: the per-user clientconfig) NEVER
+	// follows a redirect. Both the bearer and the #615 Impersonate-* headers are
+	// added by RoundTrippers on EVERY hop, so Go's cross-domain header stripping
+	// never protects them; and a followed redirect's body would be accepted as
+	// the object. credhttp.Client refuses at CheckRedirect (the caller sees the
+	// 3xx with its own code) and at the transport (no hop reaches the network).
+	// A named endpointRef carries the third party's OWN credential and keeps
+	// net/http's default redirect behaviour.
+	if credhttp.HeldCredential(ctx) || cache.ServiceAccountDialFromContext(ctx) {
+		cli = credhttp.Client(cli)
+	}
+	return cli, nil
+}
+
+// buildEndpointClient builds the client for ep. It is the ONLY site in the
+// module allowed to build an endpoint client without credhttp (the structural
+// guard in internal/credhttp names it), because its single caller,
+// httpClientForEndpoint, applies credhttp.Client by provenance.
+func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, error) {
 	if !endpointNeedsOwnedCAClient(ep) {
 		return httpcall.HTTPClientForEndpoint(ep, ri)
 	}

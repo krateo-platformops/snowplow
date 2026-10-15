@@ -838,7 +838,7 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("hint", "predicate matched metadata-only routing but metaClient is nil — falling back to dynamic full informer; OOM risk at 50K scale"),
-			slog.String("remediation", "main.go must call ResourceWatcher.SetMetadataClient(metadata.NewForConfig(rc)) at startup"),
+			slog.String("remediation", "main.go must call ResourceWatcher.SetMetadataClient(credhttp.Metadata(rc)) at startup"),
 		)
 	}
 
