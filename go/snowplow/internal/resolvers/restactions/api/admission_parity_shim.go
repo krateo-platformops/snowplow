@@ -25,6 +25,14 @@ func IsBackgroundNestedTreeForTest(ctx context.Context) bool {
 	return isBackgroundNestedTree(ctx)
 }
 
+// IsBackgroundContentFillForTest exposes the content-fill admission gate's
+// classification (#710 PR-2a, aligned in #720) so the same driver-level arms
+// assert each background driver's REAL ctx is background at BOTH memory
+// gates. TEST-ONLY.
+func IsBackgroundContentFillForTest(ctx context.Context) bool {
+	return contentFillClassOf(ctx) == fillClassBackground
+}
+
 // AdmissionCeilingForTest exposes this package's admissionCeiling() for the
 // cross-package parity test. TEST-ONLY.
 func AdmissionCeilingForTest() (ceiling int64, unlimited bool) {

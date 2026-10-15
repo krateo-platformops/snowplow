@@ -159,11 +159,14 @@ var driverCtxArms720 = map[string]func(t *testing.T) []context.Context{
 }
 
 // TestIssue720_EveryBackgroundDriverCtxIsBackground — each driver's REAL ctx
-// is classified BACKGROUND by the nested-resolve gate. RED if a driver's
-// marker is removed (it would bypass the memory ceiling as a customer).
+// is classified BACKGROUND by BOTH memory gates: the nested-resolve gate (#720)
+// and the content-fill admission gate (#710 PR-2a). RED if a driver's marker
+// is removed, or if the two gates' classifiers drift apart (a driver
+// background at one gate and a bypassing "customer" at the other).
 func TestIssue720_EveryBackgroundDriverCtxIsBackground(t *testing.T) {
-	if restactionsapi.IsBackgroundNestedTreeForTest(driverRoot720()) {
-		t.Fatal("PRECONDITION: an unmarked root must classify as CUSTOMER, else every arm below is vacuous")
+	if restactionsapi.IsBackgroundNestedTreeForTest(driverRoot720()) ||
+		restactionsapi.IsBackgroundContentFillForTest(driverRoot720()) {
+		t.Fatal("PRECONDITION: an unmarked root must classify as CUSTOMER at both gates, else every arm below is vacuous")
 	}
 	names := make([]string, 0, len(driverCtxArms720))
 	for n := range driverCtxArms720 {
@@ -177,6 +180,11 @@ func TestIssue720_EveryBackgroundDriverCtxIsBackground(t *testing.T) {
 					t.Errorf("#720: driver %s ctx #%d classifies as CUSTOMER (RefDenialOrigin=%q) — its nested "+
 						"trees would bypass the nested-resolve memory ceiling; mark it background",
 						name, i, cache.RefDenialOrigin(ctx))
+				}
+				if !restactionsapi.IsBackgroundContentFillForTest(ctx) {
+					t.Errorf("#720: driver %s ctx #%d is a CUSTOMER at the content-fill admission gate "+
+						"(RefDenialOrigin=%q) — its content fills would bypass that memory cap; the two gates "+
+						"must classify drivers identically", name, i, cache.RefDenialOrigin(ctx))
 				}
 			}
 		})
