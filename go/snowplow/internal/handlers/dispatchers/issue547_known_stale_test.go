@@ -1042,16 +1042,18 @@ func TestIssue547_F7_KnownStaleSharedShellIsServedAndRevalidatedInTheBackground(
 	if _, _, ks := cache.KnownStale(contentKey); !ks {
 		t.Fatalf("F7: a FAILED background revalidation ended the known-stale state")
 	}
-	h.allowBackground.Store(true)
-
 	// The refresher's identity recovers: the next serve's background
-	// revalidation heals the shell, still identity-free.
-	if !k547WaitFor(t, 30*time.Second, "failed background revalidation settled", func() bool {
-		return k547Stat("dirty_ended_unfresh_dropped") > d1
-	}) {
-		t.Fatalf("F7: the failed background revalidation never settled")
-	}
+	// revalidation heals the shell, still identity-free. Every serve above may
+	// have started its own revalidation (the slot is released per dequeue), and
+	// one still running read the deny before the flip: wait until every
+	// revalidation started before the flip has settled (#734), so the serve
+	// below claims a slot of its own and its resolve runs after the flip.
 	h.allowBackground.Store(true)
+	if !k547WaitFor(t, 30*time.Second, "background revalidations settled", func() bool {
+		return cache.BackgroundRevalidationsInFlight() == 0
+	}) {
+		t.Fatalf("F7: a background revalidation started before the refresher identity recovered never settled")
+	}
 	if r, _ := h.get(1, k547Changed); r != "v0" && r != "v1" {
 		t.Fatalf("F7: GET served %q", r)
 	}
