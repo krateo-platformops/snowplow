@@ -45,17 +45,24 @@ type k734Seen struct {
 // k734KnownStaleCell makes one resident widgets cell KNOWN-STALE (dropped) through
 // the real loop, then returns the running refresher's controls: ok flips the
 // handler to an accepted terminal write; during, when set, runs inside the
-// handler after the resolve began and before the Put.
+// handler after the resolve began and before the Put. The pool runs ONE worker,
+// so k734Drain — a dequeue of a second, barrier key — returns only once every
+// earlier dequeue has fully returned, settle included.
 func k734KnownStaleCell(t *testing.T) (c *ResolvedCacheStore, key string, ok *atomic.Bool,
 	during *atomic.Pointer[func()], seen chan k734Seen) {
 	t.Helper()
 	terminalEnv(t)
-	c, keys := terminalFixture(t, 1)
-	key = keys[0]
+	c, keys := terminalFixture(t, 2)
+	key, k734Barrier = keys[0], keys[1]
+	k734BarrierHit = make(chan struct{}, 1)
 	ok = new(atomic.Bool)
 	during = new(atomic.Pointer[func()])
 	seen = make(chan k734Seen, 4)
 	RegisterRefreshFunc("widgets", func(ctx context.Context, k string, in ResolvedKeyInputs) error {
+		if k == k734Barrier {
+			k734BarrierHit <- struct{}{}
+			return nil
+		}
 		if !ok.Load() {
 			return errors.New("deterministic 500 — the refresher identity cannot resolve")
 		}
@@ -87,12 +94,29 @@ func k734KnownStaleCell(t *testing.T) (c *ResolvedCacheStore, key string, ok *at
 		resetRefresherForTestKeepTerminalCounters()
 	})
 	StartRefresher(ctx)
-	terminalMark(keys)
+	terminalMark([]string{key})
 	waitFor(t, 10*time.Second, "the cell's refresh dropped", func() bool { return refresherSingleton().droppedTotal.Load() >= 1 })
 	if _, reason, ks := KnownStale(key); !ks || reason != "dropped" {
 		t.Fatalf("PRECONDITION: the cell is not known-stale (dropped) after its refresh was dropped (ks=%v reason=%q)", ks, reason)
 	}
 	return c, key, ok, during, seen
+}
+
+var (
+	k734Barrier    string
+	k734BarrierHit chan struct{}
+)
+
+// k734Drain dequeues the barrier key behind every earlier dequeue (one worker)
+// and returns once its handler ran: every earlier processNext has returned.
+func k734Drain(t *testing.T) {
+	t.Helper()
+	terminalMark([]string{k734Barrier})
+	select {
+	case <-k734BarrierHit:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the barrier dequeue never ran")
+	}
 }
 
 func k734Await(t *testing.T, seen chan k734Seen) k734Seen {
@@ -130,9 +154,12 @@ func TestIssue734_K1_AcceptedRePutEndsKnownStaleBeforeTheDequeueSettles(t *testi
 		t.Fatalf("K1 RED: a substrate reader would read the freshly re-Put cell through as a MISS (#734)")
 	}
 
-	waitFor(t, 10*time.Second, "the dequeue settled", func() bool {
-		return refresherSingleton().completedTotal.Load() > completed0
-	})
+	// processNext counts completed_total BEFORE settleDequeue: wait on the barrier
+	// dequeue, which runs only after this one has fully returned (#734 gate flake).
+	k734Drain(t)
+	if refresherSingleton().completedTotal.Load() <= completed0 {
+		t.Fatalf("K1: the accepted re-Put's dequeue did not complete")
+	}
 	if _, _, ks := KnownStale(key); ks {
 		t.Fatalf("K1: the cell is known-stale after its accepted re-Put settled")
 	}
