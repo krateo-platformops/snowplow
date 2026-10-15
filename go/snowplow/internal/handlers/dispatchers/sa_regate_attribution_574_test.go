@@ -62,7 +62,7 @@ const (
 	sar574PodPath   = "/api/v1/namespaces/ns1/pods/p1/status"
 )
 
-type sar574Req struct{ method, path, auth string }
+type sar574Req struct{ method, path, auth, impUser string }
 
 // sar574Server is a hermetic apiserver stand-in. It records every request and
 // answers the access-review POSTs, a pod subresource, a platform-template RA,
@@ -79,7 +79,7 @@ func newSAR574Server(t *testing.T, objs map[string]any) *sar574Server {
 	s := &sar574Server{objs: objs}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
-		s.reqs = append(s.reqs, sar574Req{r.Method, r.URL.Path, r.Header.Get("Authorization")})
+		s.reqs = append(s.reqs, sar574Req{r.Method, r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("Impersonate-User")})
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		if doc, ok := discoveryDoc574(r.URL.Path); ok {
@@ -116,6 +116,19 @@ func (s *sar574Server) saw(method, path string) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// impersonatedAs returns the Impersonate-User of the first (method, path)
+// request, or "" when it was not dialed or not impersonated.
+func (s *sar574Server) impersonatedAs(method, path string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.reqs {
+		if r.method == method && r.path == path {
+			return r.impUser
+		}
+	}
+	return ""
 }
 
 func (s *sar574Server) dump() string {
@@ -581,8 +594,12 @@ func TestIssue574SAR_B4_AttributionAcrossDrivers(t *testing.T) {
 // dialed at branch E. Branch E bumps the external-touched sink, and
 // resolveAndPopulateL1 declines the re-Put on it. The cell keeps its prior body.
 //
-// This also exhibits #615. The dial carries the plain SA bearer: the endpoint
-// transport does not impersonate even though the gate trusted the marker.
+// This used to exhibit #615: the dial carried the plain SA bearer with no
+// Impersonate-* header, because the endpoint transport did not impersonate even
+// though the gate trusted the marker. Since #615 the dial carries the cohort's
+// Impersonate-* headers (its Authorization is still the SA's own credential —
+// that is how impersonation works); the arm pinning it is
+// TestIssue615_RefresherBranchEDial_IsImpersonated.
 //
 // If this arm goes red because the cell now carries the decision, a branch-E
 // result became cacheable. Before accepting that, review (i) keying: the SAR
@@ -626,6 +643,13 @@ func TestIssue574SAR_A1b_GateStoodDown_SARResultStillNotRePut(t *testing.T) {
 		t.Fatalf("A1b: expected the re-Put to be declined by the external-touched gate (external_skip_delta>0); "+
 			"got external_skip_delta=%d stage_err_skip_delta=%d", got.extSkipDelta, got.stageErrDelta)
 	}
-	t.Logf("A1b MEASURED: SAR dialed=true (auth is SA bearer: %v, #615), cell re-Put=false, decline=external_touched (delta %d)",
-		got.dialAuth == "Bearer "+sar574SAToken, got.extSkipDelta)
+	// #615 — the gate stood down on the impersonated-dial marker, so the dial
+	// must itself read as the cohort: the SA's own credential WITH the cohort's
+	// Impersonate-User, never the plain SA.
+	if imp := srv.impersonatedAs(http.MethodPost, sar574SARPath); imp != sar574Rep {
+		t.Fatalf("#615 RED: the branch-E SAR dial under the impersonated-dial marker went out as Impersonate-User=%q, "+
+			"want the cohort %q (an un-gated plain-SA read).\n  wire:%s", imp, sar574Rep, srv.dump())
+	}
+	t.Logf("A1b MEASURED: SAR dialed=true as the cohort (SA credential: %v, Impersonate-User=%q), cell re-Put=false, decline=external_touched (delta %d)",
+		got.dialAuth == "Bearer "+sar574SAToken, sar574Rep, got.extSkipDelta)
 }

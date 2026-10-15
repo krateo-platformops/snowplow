@@ -164,7 +164,11 @@ var cacheAllow443 = map[string]cacheClass443{
 	// nothing, records no dep edge, and its ONLY consumer is a sort key. Under
 	// cache.Inert the probe simply answers false and the seed keeps its
 	// pre-#594 first-nav order, so there is no side effect for the flag to gate.
-	"WithInformerOnlyReads":         readOnly443,
+	"WithInformerOnlyReads": readOnly443,
+	// #615 — branch E reads the #574 impersonated-dial marker to decide whether
+	// its SA-endpoint dial must impersonate the cohort: a ctx value read, no
+	// state written. An inert (live, inline) resolve never carries the marker.
+	"ImpersonatedDialFromContext":   readOnly443,
 	"InternalRESTConfigFromContext": readOnly443, "IsResolverGVRHit": readOnly443, "IsResolverPluralsHit": readOnly443,
 	"IsStructurallyNonSliceable": readOnly443, "L1KeyFromContext": readOnly443, "LayeredSourcesMark": readOnly443,
 	"LayeredSourcesSince": readOnly443, "LiveRBACSnapshot": readOnly443, "NestedCallDepthFromContext": readOnly443,
