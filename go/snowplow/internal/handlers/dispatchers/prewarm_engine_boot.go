@@ -298,6 +298,17 @@ func bootShouldWalk(attempt, harvestedCount int) bool {
 	return attempt == 0 || harvestedCount == 0
 }
 
+// engineBootRewalkCtx builds the prewarm engine's boot-scope contexts: ctx
+// names the driver (BackgroundOriginPrewarmEngineBoot, #563) and rctx is the
+// SA-credentialed re-walk ctx derived from it. Both are BACKGROUND for the
+// nested-resolve admission gate (#720). A named builder so the driver-level
+// arm (nested_bound_driver_ctx_720_test.go) classifies the REAL production
+// ctx: removing the marker here turns that arm RED.
+func engineBootRewalkCtx(ctx context.Context, deps rePrewarmDeps) (context.Context, context.Context) {
+	ctx = cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginPrewarmEngineBoot)
+	return ctx, withPhase1SAContext(ctx, deps.saEP, deps.saRC)
+}
+
 func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScopeMode) error {
 	log := slog.Default()
 	start := time.Now()
@@ -330,14 +341,13 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 	// harvestApiRef + harvestNavWidget re-fire over the now-populated
 	// dynamic navmenu children.
 	// BOOT-RACE-TOLERANT (shape A §2.4 D3): mark the re-drive ctx as a
-	// background resolve so the self-heal re-walk YIELDS memory + the C5
-	// cold-fan-out admission race to live customer /call traffic (complements
-	// engineYieldCheckpoint's between-cohort yield). A config-vars-driven
-	// re-drive can fire long after Ready — while customers are actively
-	// navigating — so it must not contend with them at the aggregate OOM
-	// bound (the 1.5.28 adaptive aggregate). 1 line, ctx-only, no behaviour
-	// change to accounting (background differs only at admission). See
-	// cache.WithBackgroundResolve.
+	// background resolve so the self-heal re-walk's nested trees WAIT under the
+	// cold-fan-out admission ceiling (#720: only background waits there;
+	// customer trees never wait but count, so they squeeze this re-walk) —
+	// complements engineYieldCheckpoint's between-cohort yield. A
+	// config-vars-driven re-drive can fire long after Ready, while customers
+	// are actively navigating. ctx-only, no change to accounting. See
+	// cache.WithBackgroundResolve and engineBootRewalkCtx.
 	//
 	// Named in rbac.MustRegateSADial's production-equivalence argument
 	// (sa_regate.go: "every one of these sets WithBackgroundResolve:
@@ -353,8 +363,7 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 	// #563 — the origin form NAMES this driver, so a resourceRef denial on the
 	// engine's own re-walk is attributable. The seed it later calls re-stamps
 	// itself as cohort-seed, so the two do not share a cell.
-	ctx = cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginPrewarmEngineBoot)
-	rctx := withPhase1SAContext(ctx, deps.saEP, deps.saRC)
+	ctx, rctx := engineBootRewalkCtx(ctx, deps)
 
 	// #135 F4b Lever B — SKIP the discovery re-walk on an F.4 deadline-cut RESUME
 	// pass. The navWidgetHarvester + contentPrewarmHarvester are process-lived,

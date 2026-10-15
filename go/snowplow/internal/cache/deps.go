@@ -324,16 +324,13 @@ type ctxKeyBackgroundResolveType struct{}
 
 var ctxKeyBackgroundResolve = ctxKeyBackgroundResolveType{}
 
-// WithBackgroundResolve marks ctx as a background (non-customer) resolve. Used
-// by the aggregate cold-fan-out admission gate (nested_resolve_bound.go, C5)
-// to give a CUSTOMER /call ABSOLUTE priority: a background tree YIELDS the
-// admission race to any waiting/arriving customer tree (customer-preferring
-// acquire) and never gets an honest-503 terminal (it has no browser deadline —
-// it waits, ctx-bounded by its own ctx). It is NOT a per-tree RBAC/behaviour
-// change: a background tree, ONCE ADMITTED, weighs against the aggregate
-// exactly like a customer tree (the OOM floor is preserved — background differs
-// only at admission, never in accounting). This is a code-internal signal, not
-// an operator knob.
+// WithBackgroundResolve marks ctx as a background (non-customer) resolve. The
+// aggregate cold-fan-out admission gate (nested_resolve_bound.go) reads it
+// through RefDenialOrigin (#720): a BACKGROUND tree is the only kind that waits
+// under the memory ceiling, bounded by its own ctx; a CUSTOMER tree never waits
+// (owner ruling "No one waits in queue"). Both kinds weigh against the
+// aggregate identically once in flight, so customer trees squeeze background.
+// This is a code-internal signal, not an operator knob.
 func WithBackgroundResolve(ctx context.Context) context.Context {
 	if ctx == nil {
 		return ctx

@@ -15,6 +15,16 @@
 // customer-path behavior: they are never called from production code.
 package api
 
+import "context"
+
+// IsBackgroundNestedTreeForTest exposes the nested-resolve gate's driver
+// classification (#720) so the dispatchers driver-level arms can assert that
+// each background driver's REAL production ctx is classified BACKGROUND (it
+// waits under the ceiling), never CUSTOMER (it would bypass it). TEST-ONLY.
+func IsBackgroundNestedTreeForTest(ctx context.Context) bool {
+	return isBackgroundNestedTree(ctx)
+}
+
 // AdmissionCeilingForTest exposes this package's admissionCeiling() for the
 // cross-package parity test. TEST-ONLY.
 func AdmissionCeilingForTest() (ceiling int64, unlimited bool) {

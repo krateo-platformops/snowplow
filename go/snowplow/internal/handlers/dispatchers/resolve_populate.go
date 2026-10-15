@@ -700,6 +700,14 @@ func isIdentityFreeClass(class string) bool {
 // ctx's identity) and dispatches the matching resolver, returning the
 // encoded output byte-identical to the request-path encode
 // (encodeResolvedJSON — same encoder settings as a cold dispatch).
+// refresherResolveCtx stamps the refresher's driver origin (see the comment in
+// resolveOnceProd for why it is load-bearing). A named builder so the #720
+// driver-level arm (nested_bound_driver_ctx_720_test.go) classifies the REAL
+// production refresher ctx as background for the nested-resolve gate.
+func refresherResolveCtx(ctx context.Context) context.Context {
+	return cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginRefresher)
+}
+
 func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byte, error) {
 	authnNS := env.String("AUTHN_NAMESPACE", "")
 
@@ -726,7 +734,7 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 	// REFRESHER's rather than as an anonymous "background" (the 83%-of-the-log
 	// attribution gap). The three origins are censused in
 	// background_origin_census_563_test.go.
-	ctx = cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginRefresher)
+	ctx = refresherResolveCtx(ctx)
 
 	// Ship F1 (0.30.119): an api-stage entry is a CONTENT-keyed K8s call
 	// (gvr, namespace, name-or-empty) — NOT a RESTAction. Its refresh is

@@ -1288,6 +1288,25 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	// the pod still serves. The token install is what lets the 3b
 	// self-loopback bearer-append (resolve.go) fire on the seed path.
 	rctx = installSeedLoopbackToken(rctx)
+	// #720 — every phase-1 SA context is a PREWARM context: its callers are the
+	// boot discovery walk, the post-Ready apiRef pagination drain and its
+	// re-collection pass, the nav-root lister and the prewarm engine's re-walk.
+	// None is a customer /call. Stamp WithPrewarmPath HERE, once, so a root
+	// built through this builder cannot classify as a customer:
+	//   - the nested-resolve admission gate (nested_resolve_bound.go) lets a
+	//     customer tree bypass the memory ceiling; before this stamp the
+	//     pagination drain (a context.Background() root, phase1_walk.go's drain
+	//     goroutine → drainApiRefPaginationJobs) carried no marker and its
+	//     page-N widget resolves bypassed the cap as "customers";
+	//   - #563 attribution: WithPrewarmPath is the marker of "a prewarm walk,
+	//     not a served request". The drain resolves the SAME walk's page-N
+	//     jobs, so it belongs in the walk's prewarm-path cell, not in serve
+	//     (and not in a background origin, which would also opt it into the
+	//     refresher's #268/#269 re-gate semantics it does not need: this ctx
+	//     is the SA identity, ServesUnnarrowed). A caller that names a
+	//     background origin (the engine re-walk) keeps it: RefDenialOrigin
+	//     reads the origin first.
+	rctx = cache.WithPrewarmPath(rctx)
 	return rctx
 }
 
@@ -1405,13 +1424,14 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 	// them instead of re-dialling. I-6 holds: this is a prewarm root, never a
 	// /call or the refresher. Inert under Disabled().
 	rctx = cache.WithSeedDeclinedExternalSet(rctx, cache.EngineDeclinedExternalSet())
-	// #214 / #643 PR-B2 — mark this prewarm ROOT as a prewarm walk. Without it
-	// the phase1 walk carried no marker at all, so cache.RefDenialOrigin read it
-	// as a customer: its resourceRef denials WARNed as serve and its external
-	// fetches counted as external_fetch_total{origin=request,driver=serve}.
-	// It now attributes to driver=prewarm-path, beside the content prewarm —
-	// both run exactly once per process, before Ready.
-	rctx = cache.WithPrewarmPath(rctx)
+	// #214 / #643 PR-B2 — this prewarm ROOT is marked as a prewarm walk: before
+	// that the phase1 walk carried no marker at all, so cache.RefDenialOrigin
+	// read it as a customer (its resourceRef denials WARNed as serve and its
+	// external fetches counted as driver=serve). #720 moved the
+	// cache.WithPrewarmPath stamp into withPhase1SAContext above, so every
+	// phase-1 SA root (this walk, the pagination drain, its re-collection, the
+	// engine re-walk) carries it from ONE place; the driver-level arm
+	// (nested_bound_driver_ctx_720_test.go) goes RED if it is removed there.
 
 	// Ship 0.30.232: type-safe construction via newPhase1Walker. rc is now
 	// a REQUIRED positional parameter — the compiler enforces every

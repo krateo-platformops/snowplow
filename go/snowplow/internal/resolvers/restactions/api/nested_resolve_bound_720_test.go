@@ -230,7 +230,7 @@ func TestIssue720_N3_EveryBackgroundDriverWaits(t *testing.T) {
 		"refresher":       cache.WithBackgroundResolveOrigin(root(), cache.BackgroundOriginRefresher),
 		"cohort_seed":     cache.WithBackgroundResolveOrigin(root(), cache.BackgroundOriginCohortSeed),
 		"prewarm_engine":  cache.WithBackgroundResolveOrigin(root(), cache.BackgroundOriginPrewarmEngineBoot),
-		"content_prewarm": cache.WithApistagePrewarm(root()),
+		"content_prewarm": cache.WithPrewarmPath(cache.WithApistagePrewarm(root())), // as withContentPrewarmSAContext stamps it
 		"boot_walk":       cache.WithPrewarmPath(root()),
 	}
 	if isBackgroundNestedTree(custTreeCtx()) {

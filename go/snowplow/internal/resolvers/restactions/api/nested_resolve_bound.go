@@ -219,18 +219,21 @@ func admissionCeiling() (ceiling int64, unlimited bool) {
 
 // isBackgroundNestedTree classifies an outermost tree for the gate. BACKGROUND
 // is any non-customer driver: the refresher, the prewarm engine and the cohort
-// seed (WithBackgroundResolve / WithBackgroundResolveOrigin), the content
-// prewarm (WithApistagePrewarm) and the phase-1 boot walk, whose only marker is
-// WithPrewarmPath (#214: "this resolve is a prewarm walk, not a served
-// request"). A customer /call carries none of them. The "who is resolving"
+// seed (WithBackgroundResolve / WithBackgroundResolveOrigin), and every prewarm
+// root marked WithPrewarmPath (#214: "this resolve is a prewarm walk, not a
+// served request"): the content prewarm, and every phase-1 SA ctx (the boot
+// walk, the post-Ready pagination drain, its re-collection, the nav lister).
+// A customer /call carries none of them. The "who is resolving"
 // question has ONE answer in the cache package (#563): cache.RefDenialOrigin
 // returns RefDenialOriginServe only for a customer, and every other origin
-// (background origin, prewarm path, unattributed background) is not one. The
-// content-prewarm marker is kept beside it, as the gate read it before. The
-// classification is by driver, never by resource.
+// (background origin, prewarm path, unattributed background) is not one. That
+// is the ONLY rule, so each driver's marker is load-bearing and a driver
+// without one is caught (the driver arms and the resolve-entry census in
+// dispatchers/nested_bound_driver_ctx_720_test.go). The content prewarm is
+// covered by its WithPrewarmPath stamp. The classification is by driver,
+// never by resource.
 func isBackgroundNestedTree(ctx context.Context) bool {
-	return cache.RefDenialOrigin(ctx) != cache.RefDenialOriginServe ||
-		cache.ApistagePrewarmFromContext(ctx)
+	return cache.RefDenialOrigin(ctx) != cache.RefDenialOriginServe
 }
 
 // enterNestedResolveUnit is the aggregate cold-fan-out admission gate, applied

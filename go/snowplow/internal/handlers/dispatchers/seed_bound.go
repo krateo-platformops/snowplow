@@ -210,9 +210,9 @@ func enterSeedUnit(ctx context.Context, label string) (release func(), err error
 		est = currentEstUnit(ceiling, unlimited)
 		fits := b.inFlightWeight+est <= ceiling
 		// The seed is BACKGROUND (no browser deadline); there is no customer on
-		// THIS gate (the customer /call path never routes here), so there is no
-		// C5 waiting-customer priority to honour — a simpler admit rule than the
-		// nested bound. Guaranteed progress via the inFlightCount==0 escape.
+		// THIS gate (the customer /call path never routes here). Same admit rule
+		// as the nested bound's background trees (#720). Guaranteed progress via
+		// the inFlightCount==0 escape.
 		if unlimited || b.inFlightCount == 0 || fits {
 			admitCeiling = ceiling
 			admitUnlimited = unlimited
