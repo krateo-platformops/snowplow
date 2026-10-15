@@ -692,6 +692,9 @@ type cacheHandle interface {
 	// carriers. Never refuses; re-marks the key once if a dep recorded on ctx's
 	// dep-gen sink moved since the resolve began.
 	PutThenRemark(ctx context.Context, key string, entry *cache.ResolvedEntry)
+	// #547/#734 — the external-TTL widget's plain Put: exactly Put, plus ending a
+	// KNOWN-STALE state in the write's own critical section (ctx's dep-gen sink).
+	PutEndingKnownStale(ctx context.Context, key string, entry *cache.ResolvedEntry)
 	// #378 — no seed write re-mints: the only BornAt-resetting write is the
 	// refresher terminal's ReplaceIfGenRefresh (resolve_populate.go), which uses
 	// the concrete store, not this handle.

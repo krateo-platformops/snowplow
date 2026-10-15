@@ -1558,6 +1558,20 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	c.putPlain(context.Background(), false, key, entry)
 }
 
+// PutEndingKnownStale is Put for the carrier that is a PLAIN store write by
+// design but runs inside a resolve whose ctx carries the #375 dep-gen sink: the
+// external-TTL widget Put (widgets.go). That cell records no dep edge of its own,
+// but an external widget whose RESTAction also reads Kubernetes gets the
+// inner-call edge on its L1 key, so it IS dirty-marked and can go KNOWN-STALE;
+// without this its re-Put never ends the state and every read starts another
+// external refetch until the TTL (reviewer-625, #547). The write is exactly Put's
+// (generation preserved, unknown provenance for the #406 layer index); ctx only
+// ends the known-stale state, inside the same critical section as the write
+// (#734).
+func (c *ResolvedCacheStore) PutEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) {
+	c.putPlain(ctx, false, key, entry)
+}
+
 func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool, key string, entry *ResolvedEntry) {
 	if c == nil || entry == nil {
 		return

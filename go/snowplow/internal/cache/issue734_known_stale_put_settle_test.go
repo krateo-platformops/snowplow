@@ -167,3 +167,59 @@ func TestIssue734_K2_AMarkDuringTheResolveKeepsTheCellKnownStaleThroughThePut(t 
 			"body was read from a state the mark superseded, and nothing may report it fresh")
 	}
 }
+
+// K4 — the external-TTL widget's plain Put (PutEndingKnownStale) ends a
+// known-stale state at rest inside the write's own critical section: a reader
+// that observes the new body never observes the state still open. Before #734
+// the end ran after the Put's unlock (CloseKnownStaleAfterPut), a microsecond
+// window this arm samples across many rounds.
+func TestIssue734_K4_ExternalTTLPlainPutEndsKnownStaleInTheWritesCriticalSection(t *testing.T) {
+	cleanup := withCleanRefresher(t, 1, 0)
+	t.Cleanup(cleanup)
+	resetRefresherForTest()
+	c := ResolvedCache()
+	if c == nil {
+		t.Fatal("resolved cache disabled")
+	}
+	r := refresherSingleton()
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Group: "widgets.templates.krateo.io",
+		Version: "v1beta1", Resource: "flexes", Namespace: "ns", Name: "ext"}
+	key := ComputeKey(inputs)
+
+	const rounds = 2000
+	torn := 0
+	for i := 0; i < rounds; i++ {
+		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"old"}`), Inputs: &inputs})
+		r.dirty.Store(key, &dirtyStamp{t0: time.Now(), stale: knownStaleDropped, seq: depEventSeq.Load()})
+		ctx := WithL1KeyContext(context.Background(), key) // the resolve began after the mark
+		saw := make(chan bool, 1)
+		spinning := make(chan struct{})
+		go func() {
+			first := true
+			for {
+				e, ok := c.GetNoTouch(key)
+				if ok && string(e.RawJSON) == `{"body":"new"}` {
+					_, _, ks := KnownStale(key)
+					saw <- ks
+					return
+				}
+				if first {
+					first = false
+					close(spinning) // the reader is hot before the write starts
+				}
+			}
+		}()
+		<-spinning
+		c.PutEndingKnownStale(ctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &inputs})
+		if <-saw {
+			torn++
+		}
+		if _, _, ks := KnownStale(key); ks {
+			t.Fatalf("K4: the external-TTL re-Put did not end the known-stale state at all (round %d)", i)
+		}
+	}
+	if torn != 0 {
+		t.Fatalf("K4 RED: in %d of %d rounds a reader saw the external-TTL re-Put's NEW body while the cell still read "+
+			"known-stale — the state ended after the write's critical section (#734)", torn, rounds)
+	}
+}

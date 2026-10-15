@@ -323,20 +323,6 @@ func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (con
 	}
 }
 
-// CloseKnownStaleAfterPut is endKnownStaleOnPut for a Put carrier that is a
-// PLAIN, ctx-less store write by design but runs inside a resolve whose ctx
-// carries the #375 dep-gen sink: the external-TTL widget Put (widgets.go). That
-// cell records no dep edge of its own, but an external widget whose RESTAction
-// also reads Kubernetes gets the inner-call edge on its L1 key, so it IS
-// dirty-marked and can go KNOWN-STALE; without this its re-Put never closes the
-// stamp and every read starts another external refetch until the TTL
-// (reviewer-625, #547). Call it right after the accepted Put.
-func CloseKnownStaleAfterPut(ctx context.Context, key string) {
-	if t0, sample := endKnownStaleOnPut(ctx, key); sample {
-		sampleFreshAfterPut(t0)
-	}
-}
-
 // endKnownStaleOnPut ends key's KNOWN-STALE state on an ACCEPTED Put whose
 // resolve began at or after the window's latest mark (#547): that body was read
 // from the post-mark state, so the cell is fresh, whichever carrier wrote it — a
