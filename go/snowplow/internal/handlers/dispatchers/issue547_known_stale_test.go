@@ -188,6 +188,10 @@ type k547Harness struct {
 	// changed composition touch an external endpoint, so their Put is declined
 	// (N < 0: every one). Background resolves are untouched.
 	customerExternal atomic.Int32
+	// gateSeen (#710 D2-19b/c): the gate class every resolve of the changed
+	// composition would get — recorded at the shared seam.
+	gateMu   sync.Mutex
+	gateSeen []k547GateSeen
 }
 
 type k547Block struct {
@@ -483,6 +487,19 @@ func (h *k547Harness) resolveRESTAction(ctx context.Context, opts restactions.Re
 	return out, nil
 }
 
+// k547GateSeen is one resolve's gate classification.
+type k547GateSeen struct {
+	bg, demand, triggered bool
+	fill                  string
+	nestedBg              bool
+}
+
+func (h *k547Harness) gates() []k547GateSeen {
+	h.gateMu.Lock()
+	defer h.gateMu.Unlock()
+	return append([]k547GateSeen(nil), h.gateSeen...)
+}
+
 // maybeCustomerExternal consumes one customerExternal decline (or every one,
 // when negative) by touching the resolve's external sink.
 func (h *k547Harness) maybeCustomerExternal(ctx context.Context) {
@@ -574,6 +591,15 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 	}
 	if changed && !bg {
 		h.maybeCustomerExternal(ctx)
+	}
+	if changed {
+		_, demandRev := cache.DemandRevalidationFromContext(ctx)
+		h.gateMu.Lock()
+		h.gateSeen = append(h.gateSeen, k547GateSeen{bg: bg, demand: demandRev,
+			triggered: cache.CustomerTriggeredRefreshFromContext(ctx),
+			fill:      restactionsapi.ContentFillClassForTest(ctx),
+			nestedBg:  restactionsapi.NestedResolveBackgroundForTest(ctx)})
+		h.gateMu.Unlock()
 	}
 	var conds []any
 	if h.apiRefMode {

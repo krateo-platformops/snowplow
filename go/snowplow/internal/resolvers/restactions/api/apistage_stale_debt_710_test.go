@@ -23,6 +23,10 @@
 //     failure, #547), retries on backoff, is counted overdue once past 10 s,
 //     and pushes the fresh body once it recovers.
 //   - D2-3d the compare-and-evict never evicts a NEWER entry.
+//   - D2-19 at zero headroom with a background ticket queued, a debt's
+//     dependent re-resolve (refresher origin) dispatches its second, cold
+//     content input at once: customer-triggered refresh bypasses, checked
+//     before the origin rule.
 //   - D2-16 a tab that arms after the replacement was published still gets
 //     its refresh, at arm time (the owed-push mark); D2-16b also when the
 //     replacement was evicted before the arm.
@@ -34,6 +38,8 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,6 +47,7 @@ import (
 
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"k8s.io/utils/ptr"
 )
 
 // d2Fixture is a known-stale LIST content cell (fsa-00000 is stale in it,
@@ -55,8 +62,12 @@ type d2Fixture struct {
 	// decrementing; negative = always.
 	declineRe atomic.Bool
 	failReN   atomic.Int32
-	sinksMu   sync.Mutex
-	sinks     map[string]*cache.StaleServeSink
+	// secondInput (D2-19): the dependent re-resolve also reads a second, COLD
+	// content input, under the refresher origin resolveOnceProd stamps.
+	secondInput  atomic.Bool
+	secondFilled atomic.Bool
+	sinksMu      sync.Mutex
+	sinks        map[string]*cache.StaleServeSink
 }
 
 func newD2Fixture(t *testing.T) *d2Fixture {
@@ -74,7 +85,7 @@ func newD2Fixture(t *testing.T) *d2Fixture {
 	t.Cleanup(cache.ResetRefreshBroadcasterForTest)
 	f.contentKey = fill710MakeKnownStale(t, dyn, f.store)
 	// The dependent re-resolve (resolveAndPopulateL1's shape): re-Put, publish.
-	cache.RegisterRefreshFunc("restactions", func(_ context.Context, key string, in cache.ResolvedKeyInputs) error {
+	cache.RegisterRefreshFunc("restactions", func(ctx context.Context, key string, in cache.ResolvedKeyInputs) error {
 		f.rereso.Add(1)
 		if n := f.failReN.Load(); n != 0 {
 			if n > 0 {
@@ -84,6 +95,13 @@ func newD2Fixture(t *testing.T) *d2Fixture {
 		}
 		if f.declineRe.Load() {
 			return nil // completed, Put declined
+		}
+		if f.secondInput.Load() {
+			rctx := cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginRefresher)
+			if _, _, ok, err := apistageContentServe(rctx, f.store, d2SecondCall(), false); err != nil || !ok {
+				return fmt.Errorf("second content input: ok=%v err=%v", ok, err)
+			}
+			f.secondFilled.Store(true)
 		}
 		f.store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":true}`), Inputs: &in})
 		cache.PublishRefresh(key)
@@ -557,5 +575,48 @@ func TestStale710_D2_3d_TheCompareAndEvictNeverEvictsANewerEntry(t *testing.T) {
 	cur, _ := store.GetNoTouch("dep-3d")
 	if store.EvictStaleDerived("dep-3d", cur) {
 		t.Fatalf("D2-3d: a non-stale-derived entry was evicted")
+	}
+}
+
+// d2SecondCall is a second, cold content input: a single-object GET on the
+// same informer (its own content key).
+func d2SecondCall() httpcall.RequestOptions {
+	return httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
+		Path: "/apis/composition.krateo.io/v1/namespaces/" + r1Ns + "/fullstackapps/fsa-00001",
+		Verb: ptr.To(http.MethodGet),
+	}}
+}
+
+// D2-19 — at ZERO headroom (the gate held by a background fill) with a
+// background ticket QUEUED, a committed dependent's re-resolve — under the
+// refresher origin, as resolveOnceProd stamps it — reads a second, cold
+// content input. That fill must dispatch at once (customer-triggered refresh
+// bypasses, checked BEFORE the origin rule), so the push lands.
+// Mutation → RED: the customer-triggered check placed after the origin rule
+// in contentFillClassOf (the second fill queues behind the held gate).
+func TestStale710_D2_19_ADependentReResolveDispatchesItsColdContentInputAtZeroHeadroom(t *testing.T) {
+	f := newD2Fixture(t)
+	f.secondInput.Store(true)
+	fill710SeamCeiling(t, 1)
+	holder, _, err := admitContentFillForTest(context.Background(), "d2-19/v1, Resource=held", 1, fillClassBackground)
+	if err != nil {
+		t.Fatalf("admit holder: %v", err)
+	}
+	t.Cleanup(holder)
+	queued := make(chan struct{})
+	go func() {
+		defer close(queued)
+		if rel, _, err := admitContentFillForTest(context.Background(), "d2-19/v1, Resource=queued", 1, fillClassBackground); err == nil {
+			rel()
+		}
+	}()
+	t.Cleanup(func() { holder(); <-queued })
+	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-19": {}})
+	defer unsub()
+	f.customer(t, "dep-19")
+	f.storeAndCommit("dep-19")
+	d2Push(t, ch, "dep-19", 5*time.Second)
+	if !f.secondFilled.Load() {
+		t.Fatalf("D2-19 RED: the push landed without the second content input being filled")
 	}
 }

@@ -395,7 +395,7 @@ func replaceStaleDependent(sink *cache.StaleServeSink) {
 		if !ok || before == nil || !before.StaleDerived {
 			break // evicted (the refetch fills) or already replaced by another writer
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), cache.DemandRevalidationDeadline())
+		ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(context.Background()), cache.DemandRevalidationDeadline())
 		err := cache.RunRefreshNow(ctx, l1Key)
 		cancel()
 		if err == nil || errors.Is(err, cache.ErrRefreshNowNoHandler) {

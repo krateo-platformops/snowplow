@@ -232,9 +232,21 @@ func admissionCeiling() (ceiling int64, unlimited bool) {
 // dispatchers/nested_bound_driver_ctx_720_test.go). The content prewarm is
 // covered by its WithPrewarmPath stamp. The classification is by driver,
 // never by resource.
+//
+// #710 PR-2b — EXCEPT customer-triggered refresh work (a D2 debt's dependent
+// re-resolve, a #547 demand revalidation): it runs under the refresher origin
+// but a customer is waiting on it, so it is a customer tree. Checked FIRST,
+// before the origin rule.
 func isBackgroundNestedTree(ctx context.Context) bool {
+	if cache.CustomerTriggeredRefreshFromContext(ctx) {
+		return false
+	}
 	return cache.RefDenialOrigin(ctx) != cache.RefDenialOriginServe
 }
+
+// NestedResolveBackgroundForTest exposes the nested gate's class to
+// cross-package arms. Production MUST NOT use it.
+func NestedResolveBackgroundForTest(ctx context.Context) bool { return isBackgroundNestedTree(ctx) }
 
 // enterNestedResolveUnit is the aggregate cold-fan-out admission gate, applied
 // as a lifecycle bracket at the OUTERMOST nested resolve. The caller MUST gate

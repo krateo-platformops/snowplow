@@ -123,12 +123,22 @@ func contentFillClassOf(ctx context.Context) fillAdmissionClass {
 	if contentDebtRefillFromContext(ctx) {
 		return fillClassDebt
 	}
+	// #710 PR-2b — customer-triggered refresh work (a debt's dependent
+	// re-resolve, a #547 demand revalidation) bypasses like the debt refill.
+	// Checked BEFORE the origin / refresh-trigger rule below, which it carries.
+	if cache.CustomerTriggeredRefreshFromContext(ctx) {
+		return fillClassDebt
+	}
 	if _, refresher := cache.RefreshTriggerGVRFromContext(ctx); refresher ||
 		cache.RefDenialOrigin(ctx) != cache.RefDenialOriginServe || cache.ApistagePrewarmFromContext(ctx) {
 		return fillClassBackground
 	}
 	return fillClassCustomer
 }
+
+// ContentFillClassForTest exposes contentFillClassOf's verdict ("background",
+// "customer", "debt") to cross-package arms. Production MUST NOT use it.
+func ContentFillClassForTest(ctx context.Context) string { return contentFillClassOf(ctx).String() }
 
 const (
 	// contentFillExpansionSeed is the decode expansion used for a GVR until its
