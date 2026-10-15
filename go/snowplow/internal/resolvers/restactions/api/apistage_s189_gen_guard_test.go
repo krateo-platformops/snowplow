@@ -58,7 +58,7 @@ func TestApistageContentServe_S189_ResolveRacingDelete_RefusedNotResurrected(t *
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, served, ok := apistageContentServe(ctx, store, call, false)
+	_, served, ok, _ := apistageContentServe(ctx, store, call, false)
 	if !ok {
 		t.Fatalf("#189 apistage A5: apistageContentServe ok=false; setup broken (served=%v)", served)
 	}

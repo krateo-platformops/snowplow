@@ -1498,14 +1498,16 @@ func registerContentFillInstruments(m metric.Meter) error {
 	// #710 PR-2a — the memory admission gate. `class` is the closed admission
 	// class set {background, customer}.
 	admWait, err := m.Int64Histogram("snowplow_apistage_content_fill_admission_wait_ms",
-		metric.WithDescription("One content-fill flight's wait for memory admission under the shared AdmissionCeiling (ms). #710 PR-2a."),
+		metric.WithDescription("One content-fill flight's wait for memory admission under the shared AdmissionCeiling (ms), by the class it admitted at {background, customer}. #710 PR-2a."),
 		metric.WithUnit("ms"),
 		metric.WithExplicitBucketBoundaries(int64sToFloat64s(restactionsapi.ContentFillDurationBoundsMS)...),
 	)
 	if err != nil {
 		return err
 	}
-	restactionsapi.SetContentFillAdmissionWaitRecorder(func(ms int64) { admWait.Record(context.Background(), ms) })
+	restactionsapi.SetContentFillAdmissionWaitRecorder(func(ms int64, class string) {
+		admWait.Record(context.Background(), ms, metric.WithAttributes(attribute.String("class", class)))
+	})
 	admQueued, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_admission_queued",
 		metric.WithDescription("Content-fill flights waiting for memory admission now, by class. #710 PR-2a."))
 	if err != nil {

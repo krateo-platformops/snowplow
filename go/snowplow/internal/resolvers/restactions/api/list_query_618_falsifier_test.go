@@ -349,7 +349,7 @@ func TestIssue618_ApistageContentServe_ServedQueriesMatch(t *testing.T) {
 	// queries mapping to one cell make the HIT pass serve the wrong set.
 	for pass := 0; pass < 2; pass++ {
 		for _, tc := range q618Served {
-			v, served, ok := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, tc.path), false)
+			v, served, ok, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, tc.path), false)
 			if !ok || !served {
 				t.Fatalf("pass %d %s: content layer must serve an exact selector; ok=%v served=%v", pass, tc.path, ok, served)
 			}
@@ -367,13 +367,13 @@ func TestIssue618_ApistageContentServe_UnsupportedQueriesNeverTouchACell(t *test
 	// Warm the unselected cells first: a fall-through query must not be served
 	// from them either.
 	for _, p := range []string{q618ClusterPath, q618NSPath("team-a")} {
-		if _, _, ok := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, p), false); !ok {
+		if _, _, ok, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, p), false); !ok {
 			t.Fatalf("precondition: warm %s", p)
 		}
 	}
 	before := store.Stats().StoreTotal
 	for _, tc := range q618Fallthrough {
-		v, served, ok := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, tc.path), false)
+		v, served, ok, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, tc.path), false)
 		if ok {
 			t.Fatalf("RED #618 %s: the content layer claimed this call (served=%v, items %v); it must return "+
 				"ok=false so the apiserver answers with the query intact", tc.path, served, namesIn(v))

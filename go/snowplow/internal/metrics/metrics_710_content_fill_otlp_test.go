@@ -148,7 +148,7 @@ func TestIssue710_ContentFillAdmissionSeriesReachOTLP(t *testing.T) {
 		}
 	}
 	restactionsapi.AddContentFillAdmissionForTest(classes[0], 0, 0, 9999)
-	restactionsapi.RecordContentFillAdmissionWaitForTest(42)
+	restactionsapi.RecordContentFillAdmissionWaitForTest(classes[1], 42)
 
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {

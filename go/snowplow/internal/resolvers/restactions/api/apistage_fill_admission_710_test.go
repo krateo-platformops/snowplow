@@ -77,7 +77,7 @@ func TestContentFill710_ADM1_ConcurrentWeightNeverExceedsCeiling_AllComplete(t *
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			release, err := admitContentFill(context.Background(), "adm1.example/v1, Resource=things", raw, fillClassCustomer)
+			release, _, err := admitContentFillForTest(context.Background(), "adm1.example/v1, Resource=things", raw, fillClassCustomer)
 			if err != nil {
 				t.Errorf("fill %d not admitted: %v", i, err)
 				return
@@ -105,7 +105,7 @@ func TestContentFill710_ADM1_ConcurrentWeightNeverExceedsCeiling_AllComplete(t *
 	}
 
 	// The escape: a single fill heavier than the whole ceiling still runs alone.
-	release, err := admitContentFill(context.Background(), "adm1.example/v1, Resource=huge", 100*ceiling, fillClassCustomer)
+	release, _, err := admitContentFillForTest(context.Background(), "adm1.example/v1, Resource=huge", 100*ceiling, fillClassCustomer)
 	if err != nil {
 		t.Fatalf("F-ADM1: a fill heavier than the ceiling on an EMPTY gate was not admitted (no guaranteed progress): %v", err)
 	}
@@ -123,7 +123,7 @@ func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionWithin2x(t *tes
 	restore := cache.SetAdmissionRuntimeSeamsForTest(func() int64 { return 1 << 40 }, live.Load)
 	t.Cleanup(restore)
 
-	release, err := admitContentFill(context.Background(), gvr, raw, fillClassCustomer)
+	release, _, err := admitContentFillForTest(context.Background(), gvr, raw, fillClassCustomer)
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionWithin2x(t *tes
 	if got < realRatio/2 || got > realRatio*2 {
 		t.Fatalf("F-ADM2 RED: after one measured fill the expansion is %.2f, want within 2× of the real %.1f (seed %.0f)", got, realRatio, contentFillExpansionSeed)
 	}
-	release2, err := admitContentFill(context.Background(), gvr, raw, fillClassCustomer)
+	release2, _, err := admitContentFillForTest(context.Background(), gvr, raw, fillClassCustomer)
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionWithin2x(t *tes
 
 	// A sample spoiled by GC (live heap fell) is ignored, never calibrates to 0.
 	before := ContentFillAdmissionStatsSnapshot().Expansion[gvr]
-	release3, _ := admitContentFill(context.Background(), gvr, raw, fillClassCustomer)
+	release3, _, _ := admitContentFillForTest(context.Background(), gvr, raw, fillClassCustomer)
 	live.Add(-int64(raw))
 	release3()
 	if after := ContentFillAdmissionStatsSnapshot().Expansion[gvr]; after != before {
@@ -166,14 +166,15 @@ func TestContentFill710_ADM_BackgroundNeverAdmitsAheadOfAWaitingCustomer(t *test
 	w := int64(float64(unit) * contentFillExpansionSeed)
 	fill710SeamCeiling(t, 2*w+w/2) // holder (1) + background (1) fits; holder + customer (2) does not
 
-	holder, err := admitContentFill(context.Background(), gvr, unit, fillClassBackground)
+	holder, _, err := admitContentFillForTest(context.Background(), gvr, unit, fillClassBackground)
 	if err != nil {
 		t.Fatalf("admit holder: %v", err)
 	}
+	t.Cleanup(holder)
 	order := make(chan string, 2)
 	admit := func(name string, raw int64, class fillAdmissionClass) {
 		go func() {
-			release, err := admitContentFill(context.Background(), gvr, raw, class)
+			release, _, err := admitContentFillForTest(context.Background(), gvr, raw, class)
 			if err != nil {
 				order <- name + ":err"
 				return
@@ -290,16 +291,22 @@ func TestContentFill710_ADM1_RealPath_DistinctListsStayUnderCeiling(t *testing.T
 	store := cache.ResolvedCache()
 	fill710Admission(t)
 
-	// Learn one envelope's size, then size the ceiling for two fills at the seed.
+	// Learn one envelope's size and the GVR's calibration, then size the ceiling for 2.5 fills.
 	envLen := fill710SpyDispatch(t, nil, nil, nil)
-	if _, _, ok := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
+	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
 		t.Fatalf("PRECONDITION: list 0 not content-servable")
 	}
 	store.DeleteForTest(cache.ComputeKey(contentKeyInputs(r1FsaGVR, fill710NS(0), "")))
-	ResetContentFillStatsForTest()
-	weight := int64(float64(envLen.Load()) * contentFillExpansionSeed)
+	// The gate keeps what that fill taught it (bytes per item, expansion): the
+	// cold lists below are predicted from it.
+	exp := ContentFillAdmissionStatsSnapshot().Expansion[r1FsaGVR.String()]
+	if exp == 0 {
+		exp = contentFillExpansionSeed // the sample was spoiled (GC): still on the seed
+	}
+	weight := int64(float64(envLen.Load()) * exp)
 	ceiling := 2*weight + weight/2
 	fill710SeamCeiling(t, ceiling)
+	contentFillAdmissionInflightWeightPeak.Store(0) // the learning fill ran on the seed
 
 	var wg sync.WaitGroup
 	var served atomic.Int64
@@ -309,7 +316,7 @@ func TestContentFill710_ADM1_RealPath_DistinctListsStayUnderCeiling(t *testing.T
 		go func(n int) {
 			defer wg.Done()
 			<-start
-			if _, s, ok := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false); ok && s {
+			if _, s, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false); ok && s {
 				served.Add(1)
 			}
 		}(n)
@@ -326,7 +333,7 @@ func TestContentFill710_ADM1_RealPath_DistinctListsStayUnderCeiling(t *testing.T
 		t.Fatalf("F-ADM1 RED (real path): admitted weight peaked at %d over the ceiling %d (%d per fill)", hw, ceiling, weight)
 	}
 	t.Logf("#710 PR-2a: %d distinct lists, envelope %d B, weight %d, ceiling %d → admitted-weight peak %d, wait p_max %d ms",
-		lists, envLen.Load(), weight, ceiling, contentFillAdmissionInflightWeightPeak.Load(), ContentFillAdmissionStatsSnapshot().Wait.MaxMS)
+		lists, envLen.Load(), weight, ceiling, contentFillAdmissionInflightWeightPeak.Load(), ContentFillAdmissionStatsSnapshot().Wait["customer"].MaxMS)
 }
 
 // TestContentFill710_D1_ResolveRecordsA503StageErrorNoFallThrough drives D1
@@ -337,7 +344,7 @@ func TestContentFill710_D1_ResolveRecordsA503StageErrorNoFallThrough(t *testing.
 	fill710Admission(t)
 	store.SetTombstoneTTL(300 * time.Millisecond)
 	fill710SeamCeiling(t, 1)
-	holder, err := admitContentFill(context.Background(), "d1/v1, Resource=held", 1, fillClassCustomer)
+	holder, _, err := admitContentFillForTest(context.Background(), "d1/v1, Resource=held", 1, fillClassCustomer)
 	if err != nil {
 		t.Fatalf("admit holder: %v", err)
 	}
@@ -375,7 +382,7 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 	fill710SeamCeiling(t, 1)
 
 	// Something else holds the gate for longer than the deadline.
-	holder, err := admitContentFill(context.Background(), "d1/v1, Resource=held", 1, fillClassCustomer)
+	holder, _, err := admitContentFillForTest(context.Background(), "d1/v1, Resource=held", 1, fillClassCustomer)
 	if err != nil {
 		t.Fatalf("admit holder: %v", err)
 	}
@@ -396,7 +403,7 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 	results := make(chan out, 3)
 	for i := 0; i < 3; i++ {
 		go func() {
-			_, s, ok, err := apistageContentServeE(r1Ctx(), store, fill710NSListCall(0), false)
+			_, s, ok, err := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false)
 			results <- out{ok, s, err}
 		}()
 	}
@@ -413,11 +420,13 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 			t.Fatalf("D1: a reader is still waiting past the deadline")
 		}
 	}
-	if d := dispatches.Load(); d != 1 {
-		t.Fatalf("dispatches = %d, want 1 (one flight, two joiners)", d)
+	if d := dispatches.Load(); d != 0 {
+		t.Fatalf("dispatches = %d, want 0: admission is taken BEFORE the dispatch, so a never-admitted flight builds no envelope", d)
 	}
-	if got := ContentFillAdmissionStatsSnapshot().Timeout["customer"]; got != 1 {
-		t.Fatalf("admission_timeout_total{customer} = %d, want 1", got)
+	// Two flights: the first, and the one its live joiners started rather than
+	// inherit a deadline that was not theirs (one leads it, one joins it).
+	if got := ContentFillAdmissionStatsSnapshot().Timeout["customer"]; got != 2 {
+		t.Fatalf("admission_timeout_total{customer} = %d, want 2", got)
 	}
 	if _, ok := store.GetNoTouch(cache.ComputeKey(contentKeyInputs(r1FsaGVR, fill710NS(0), ""))); ok {
 		t.Fatalf("D1: a never-admitted flight stored a cell")

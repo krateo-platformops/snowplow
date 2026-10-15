@@ -71,7 +71,7 @@ func TestContentFill710_Integration_5KItems200Readers_KnownStaleBurst(t *testing
 		go func() {
 			defer wg.Done()
 			<-start
-			if _, served, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+			if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 				notServed.Add(1)
 			}
 		}()

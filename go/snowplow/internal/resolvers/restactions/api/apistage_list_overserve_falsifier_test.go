@@ -168,7 +168,7 @@ func TestFalsifier58_UAF_EndToEnd_NarrowsToUAFScope(t *testing.T) {
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
 		Path: "/api/v1/namespaces", Verb: ptr.To(http.MethodGet),
 	}}
-	v, served, ok := apistageContentServe(ctx, store, call, true /*uafActive*/)
+	v, served, ok, _ := apistageContentServe(ctx, store, call, true /*uafActive*/)
 	if !ok || !served {
 		t.Fatalf("UAF serve: expected served=true (full set passes through); ok=%v served=%v", ok, served)
 	}
@@ -239,7 +239,7 @@ func servedWidgetNamespaces(t *testing.T, user jwtutil.UserInfo) (nss []string, 
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
 		Path: "/apis/widgets.krateo.io/v1/widgets", Verb: ptr.To(http.MethodGet),
 	}}
-	v, servedOK, ok := apistageContentServe(ctx, store, call, false /*no-UAF*/)
+	v, servedOK, ok, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
 	if !ok {
 		t.Fatalf("apistageContentServe ok=false")
 	}
@@ -313,7 +313,7 @@ func TestFalsifier58_GetByName_StaysGated(t *testing.T) {
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
 		Path: "/apis/widgets.krateo.io/v1/namespaces/team-c/widgets/w-team-c", Verb: ptr.To(http.MethodGet),
 	}}
-	_, served, ok := apistageContentServe(ctx, store, call, false /*no-UAF*/)
+	_, served, ok, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
 	if !ok {
 		t.Fatalf("GET serve: ok=false")
 	}
@@ -368,7 +368,7 @@ func TestFalsifier58_UAF_GetByName_PassesThroughForRefilter(t *testing.T) {
 	// uafActive=true → the GET extension must PASS THROUGH (served=true, object
 	// returned), NOT fail-closed via filterGetByRBAC. The refilter narrows
 	// downstream by the UAF rule (out of this serve's scope).
-	v, served, ok := apistageContentServe(ctx, store, call, true /*uafActive*/)
+	v, served, ok, _ := apistageContentServe(ctx, store, call, true /*uafActive*/)
 	if !ok || !served {
 		t.Fatalf("#58 UAF-GET extension: a UAF GET-by-name must PASS THROUGH (served=true) for the "+
 			"downstream refilter; got ok=%v served=%v. Without the gateContentEnvelope UAF branch, "+
@@ -382,7 +382,7 @@ func TestFalsifier58_UAF_GetByName_PassesThroughForRefilter(t *testing.T) {
 
 	// CONTRAST (no-UAF): the SAME GET, uafActive=false, must FAIL CLOSED (the
 	// user lacks raw get) — the GET extension only loosens the UAF path.
-	_, servedNoUAF, okNoUAF := apistageContentServe(ctx, store, call, false /*no-UAF*/)
+	_, servedNoUAF, okNoUAF, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
 	if !okNoUAF {
 		t.Fatalf("no-UAF GET serve: ok=false")
 	}

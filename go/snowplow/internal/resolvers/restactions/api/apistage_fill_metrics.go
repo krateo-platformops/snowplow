@@ -151,9 +151,11 @@ var (
 	contentFillByRAMap  = map[string]*ContentFillRAStats{}
 
 	// contentFillDurHist is one fill's duration; contentFillAdmWaitHist (#710
-	// PR-2a) one flight's wait for memory admission.
+	// PR-2a) one flight's wait for memory admission, by the class it admitted at.
 	contentFillDurHist     = newMSHistogram()
-	contentFillAdmWaitHist = newMSHistogram()
+	contentFillAdmWaitHist = [fillAdmissionClasses]*msHistogram{newMSHistogram(), newMSHistogram()}
+	// contentFillAdmWaitRecorder is the admission-wait OTLP hook (class-labelled).
+	contentFillAdmWaitRecorder atomic.Pointer[func(ms int64, class string)]
 
 	// #710 PR-2a — the content-fill admission gate (apistage_fill_admission.go).
 	contentFillAdmissionQueued         [fillAdmissionClasses]atomic.Int64
@@ -181,6 +183,10 @@ type ContentFillGVRStats struct {
 	// EWMA and max.
 	DurationMSEWMA float64 `json:"duration_ms_ewma"`
 	DurationMSMax  int64   `json:"duration_ms_max"`
+	// #710 PR-2a — the admission gate's calibrated decode expansion (0 = still
+	// on the seed) and its weight-prediction accuracy (exact / predicted raw).
+	DecodeExpansion float64 `json:"decode_expansion"`
+	PredictRatio    float64 `json:"admission_predict_ratio"`
 }
 
 // ContentFillRAStats is one RESTAction's row of _by_ra. Guarded by
@@ -282,11 +288,25 @@ func (h *msHistogram) reset() {
 func SetContentFillDurationRecorder(fn func(ms int64)) { contentFillDurHist.setRecorder(fn) }
 
 // SetContentFillAdmissionWaitRecorder installs the admission-wait OTLP
-// histogram hook (#710 PR-2a). nil uninstalls it.
-func SetContentFillAdmissionWaitRecorder(fn func(ms int64)) { contentFillAdmWaitHist.setRecorder(fn) }
+// histogram hook (#710 PR-2a), labelled by class. nil uninstalls it.
+func SetContentFillAdmissionWaitRecorder(fn func(ms int64, class string)) {
+	if fn == nil {
+		contentFillAdmWaitRecorder.Store(nil)
+		return
+	}
+	contentFillAdmWaitRecorder.Store(&fn)
+}
 
 // recordContentFillAdmissionWait folds one flight's admission wait.
-func recordContentFillAdmissionWait(ms int64) { contentFillAdmWaitHist.record(ms) }
+func recordContentFillAdmissionWait(class fillAdmissionClass, ms int64) {
+	if class >= fillAdmissionClasses {
+		class = fillClassBackground
+	}
+	contentFillAdmWaitHist[class].record(ms)
+	if rec := contentFillAdmWaitRecorder.Load(); rec != nil {
+		(*rec)(max(ms, 0), class.String())
+	}
+}
 
 // contentFillOwner names the RESTAction and stage a content call belongs to,
 // for the fill's pprof labels, _by_ra and log line. Neither carries identity:
@@ -573,6 +593,14 @@ func ContentFillStatsSnapshot() ContentFillStats {
 	for gvr, g := range contentFillByGVRMap {
 		s.ByGVR[gvr] = *g
 	}
+	contentFillMu.Unlock()
+	// #710 PR-2a — the admission gate's per-GVR calibration, beside the fills.
+	expansion, ratio := contentFillCalibrationSnapshot()
+	for gvr, row := range s.ByGVR {
+		row.DecodeExpansion, row.PredictRatio = expansion[gvr], ratio[gvr]
+		s.ByGVR[gvr] = row
+	}
+	contentFillMu.Lock()
 	s.ByRA = make(map[string]ContentFillRAStats, len(contentFillByRAMap))
 	for ra, r := range contentFillByRAMap {
 		s.ByRA[ra] = *r
@@ -589,8 +617,9 @@ type ContentFillAdmissionStats struct {
 	Queued         map[string]int64
 	Timeout        map[string]uint64
 	InflightWeight int64
-	Wait           ContentFillDurationStats
+	Wait           map[string]ContentFillDurationStats
 	Expansion      map[string]float64
+	PredictRatio   map[string]float64
 }
 
 // ContentFillAdmissionStatsSnapshot returns every class of the closed set.
@@ -599,12 +628,13 @@ func ContentFillAdmissionStatsSnapshot() ContentFillAdmissionStats {
 		Queued:         make(map[string]int64, fillAdmissionClasses),
 		Timeout:        make(map[string]uint64, fillAdmissionClasses),
 		InflightWeight: contentFillAdmissionInflightWeight.Load(),
-		Wait:           contentFillAdmWaitHist.snapshot(),
-		Expansion:      contentFillExpansionSnapshot(),
+		Wait:           make(map[string]ContentFillDurationStats, fillAdmissionClasses),
 	}
+	s.Expansion, s.PredictRatio = contentFillCalibrationSnapshot()
 	for c := fillAdmissionClass(0); c < fillAdmissionClasses; c++ {
 		s.Queued[c.String()] = contentFillAdmissionQueued[c].Load()
 		s.Timeout[c.String()] = contentFillAdmissionTimeout[c].Load()
+		s.Wait[c.String()] = contentFillAdmWaitHist[c].snapshot()
 	}
 	return s
 }
@@ -626,11 +656,14 @@ func ResetContentFillStatsForTest() {
 	contentFillInflightPeak.Store(0)
 	contentFillInflightBytesPeak.Store(0)
 	contentFillDurHist.reset()
-	contentFillAdmWaitHist.reset()
+	for _, h := range contentFillAdmWaitHist {
+		h.reset()
+	}
 	for c := range contentFillAdmissionTimeout {
 		contentFillAdmissionTimeout[c].Store(0)
 	}
 	resetContentFillGateForTest()
+	resetContentFlightsForTest()
 	contentFillLogLast.Store(0)
 	contentFillLogSuppressed.Store(0)
 	contentFillMu.Lock()
@@ -689,7 +722,15 @@ func AddContentFillAdmissionForTest(class string, q int64, n uint64, w int64) bo
 
 // RecordContentFillAdmissionWaitForTest records one admission wait through
 // the production histogram path. Production MUST NOT use it.
-func RecordContentFillAdmissionWaitForTest(ms int64) { recordContentFillAdmissionWait(ms) }
+func RecordContentFillAdmissionWaitForTest(class string, ms int64) bool {
+	for i, name := range fillAdmissionClassNames {
+		if name == class {
+			recordContentFillAdmissionWait(fillAdmissionClass(i), ms)
+			return true
+		}
+	}
+	return false
+}
 
 // AddContentFillInflightForTest moves the in-flight gauges through their
 // production atomics. Production MUST NOT use it.
@@ -751,7 +792,11 @@ func registerContentFillExpvar() {
 			return contentFillDurHist.expvarValue()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_admission_wait_ms", expvar.Func(func() any {
-			return contentFillAdmWaitHist.expvarValue()
+			out := make(map[string]any, fillAdmissionClasses)
+			for c := fillAdmissionClass(0); c < fillAdmissionClasses; c++ {
+				out[c.String()] = contentFillAdmWaitHist[c].expvarValue()
+			}
+			return out
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_admission_queued", expvar.Func(func() any {
 			return ContentFillAdmissionStatsSnapshot().Queued
@@ -764,9 +809,6 @@ func registerContentFillExpvar() {
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_admission_inflight_weight_peak", expvar.Func(func() any {
 			return contentFillAdmissionInflightWeightPeak.Load()
-		}))
-		expvar.Publish("snowplow_apistage_content_fill_admission_expansion", expvar.Func(func() any {
-			return contentFillExpansionSnapshot()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_by_gvr", expvar.Func(func() any {
 			return ContentFillStatsSnapshot().ByGVR

@@ -74,9 +74,12 @@ type contentFlightResult struct {
 type contentFlight struct {
 	key      string
 	startSeq uint64
-	done     chan struct{}
-	once     sync.Once
-	res      contentFlightResult
+	// ticket (#710 PR-2a) is the flight's place in the memory-admission gate;
+	// its class is the max over the flight's participants.
+	ticket *fillTicket
+	done   chan struct{}
+	once   sync.Once
+	res    contentFlightResult
 }
 
 var (
@@ -95,7 +98,7 @@ var (
 func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason) (flight *contentFlight, fillCtx context.Context, lead bool) {
 	fillCtx = cache.WithContentDepGenSink(ctx, gvr, namespace, name)
 	startSeq, _ := cache.DepGenStartSeqFromContext(fillCtx)
-	flight, lead = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason)
+	flight, lead = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason, contentFillClassOf(ctx))
 	return flight, fillCtx, lead
 }
 
@@ -103,17 +106,20 @@ func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersion
 // LEADS it. startSeq is the leader-to-be's content-sink entry seq; it is used
 // only when the reader leads. (gvr, namespace, name) is the cell's own
 // coordinate (name "" = LIST).
-func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason) (*contentFlight, bool) {
+func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, class fillAdmissionClass) (*contentFlight, bool) {
 	contentFlightsMu.Lock()
 	defer contentFlightsMu.Unlock()
 	if cur := contentFlights[key]; cur != nil {
 		if !cache.ContentCoordinateMovedSince(gvr, namespace, name, cur.startSeq) {
 			noteContentFillJoined(reason, gvr.String())
+			// #710 PR-2a — a joiner of a higher class promotes a queued flight, or
+			// coalescing would let a customer wait at background priority.
+			theContentFillGate().promote(cur.ticket, class)
 			return cur, false
 		}
 		noteContentFillJoinRefused(reason)
 	}
-	f := &contentFlight{key: key, startSeq: startSeq, done: make(chan struct{})}
+	f := &contentFlight{key: key, startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class)}
 	contentFlights[key] = f
 	return f, true
 }
@@ -151,6 +157,14 @@ func (f *contentFlight) wait(ctx context.Context) (contentFlightResult, bool) {
 // deadline — so the joiners never inherit the leader's cancellation.
 func detachedFillContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), cache.DemandRevalidationDeadline())
+}
+
+// resetContentFlightsForTest forgets every current flight, so a flight an
+// earlier, failed arm abandoned cannot be joined by the next one. Test-only.
+func resetContentFlightsForTest() {
+	contentFlightsMu.Lock()
+	contentFlights = map[string]*contentFlight{}
+	contentFlightsMu.Unlock()
 }
 
 // ContentFlightsInFlightForTest reports how many content keys have a current

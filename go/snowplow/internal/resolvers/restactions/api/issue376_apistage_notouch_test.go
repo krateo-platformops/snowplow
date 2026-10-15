@@ -38,7 +38,7 @@ func TestIssue376_ApistageContentServe_RefresherReadIsNoTouch(t *testing.T) {
 	otherGVR := schema.GroupVersionResource{Group: "other.krateo.io", Version: "v1", Resource: "others"}
 	h0, m0 := store.Stats().HitTotal, store.Stats().MissTotal
 	refresherCtx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(r1Ctx()), otherGVR)
-	_, served, ok := apistageContentServe(refresherCtx, store, r1GetCall(), false)
+	_, served, ok, _ := apistageContentServe(refresherCtx, store, r1GetCall(), false)
 	if !ok || !served {
 		t.Fatal("refresher-path content HIT must still serve (different-GVR trigger → forceContentMiss=false)")
 	}
@@ -47,7 +47,7 @@ func TestIssue376_ApistageContentServe_RefresherReadIsNoTouch(t *testing.T) {
 	}
 
 	// CUSTOMER path (no refresh marker): the SERVE stamps hit_total.
-	_, servedC, okC := apistageContentServe(r1Ctx(), store, r1GetCall(), false)
+	_, servedC, okC, _ := apistageContentServe(r1Ctx(), store, r1GetCall(), false)
 	if !okC || !servedC {
 		t.Fatal("customer content HIT must serve")
 	}

@@ -50,6 +50,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/informers"
+	clientcache "k8s.io/client-go/tools/cache"
 )
 
 // ListRawServable returns gvr's namespace partition as per-item JSON, under
@@ -100,6 +101,32 @@ func (rw *ResourceWatcher) ListRawServable(gvr schema.GroupVersionResource, name
 		return nil, false
 	}
 	return raws, true
+}
+
+// PartitionLen returns how many objects gvr's namespace partition holds
+// ("" = cluster-wide), under ListRawServable's servability contract, without
+// rendering, copying or sorting them — index keys only. #710 PR-2a: the
+// content-fill admission gate predicts a cold LIST's envelope size from it
+// before the dispatch builds the envelope. false = unknown (not servable).
+func (rw *ResourceWatcher) PartitionLen(gvr schema.GroupVersionResource, namespace string) (int, bool) {
+	if rw == nil || rw.mode == modePassthrough {
+		return 0, false
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	gi, ok := rw.servableLocked(gvr)
+	if !ok {
+		return 0, false
+	}
+	store := gi.Informer().GetIndexer()
+	if namespace == "" {
+		return len(store.ListKeys()), true
+	}
+	keys, err := store.IndexKeys(clientcache.NamespaceIndex, namespace)
+	if err != nil {
+		return 0, false
+	}
+	return len(keys), true
 }
 
 // rawFromIndexer mirrors listFromIndexer's partition selection EXACTLY — same

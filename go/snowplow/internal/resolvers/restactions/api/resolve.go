@@ -932,7 +932,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// content), and the UAF refilter still runs downstream. Only a
 			// STORED UAF stage is served un-narrowed for the refilter alone.
 			uafContent := apiCall.UserAccessFilter != nil && r.opts.Provenance != ProvenanceCallerSupplied
-			gatedVal, served, ok, cerr := apistageContentServeE(gctx, r.apistageStore, call, uafContent)
+			gatedVal, served, ok, cerr := apistageContentServe(gctx, r.apistageStore, call, uafContent)
 			if cerr != nil {
 				// #710 PR-2a (D1) — the call's content fill was not admitted under
 				// the memory ceiling before its deadline: an honest per-item stage

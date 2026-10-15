@@ -146,7 +146,9 @@ var cacheAllow443 = map[string]cacheClass443{
 	// #710 PR-2a — the content-fill admission gate reads the shared ceiling and
 	// live-heap sampler (runtime reads, no cache state).
 	"AdmissionCeiling": readOnly443, "AdmissionLiveHeapSample": readOnly443,
-	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
+	// The admission predictor's partition count: index keys under rw.mu read.
+	"ResourceWatcher.PartitionLen": readOnly443,
+	"DepGenStartSeqFromContext":    readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
 	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
@@ -256,7 +258,7 @@ var cacheAllow443 = map[string]cacheClass443{
 // callerAllow443: for each gatedAtCaller symbol, the "<file>:<func>" sites
 // allowed to use it. Each listed function must contain a cache.Inert check.
 var callerAllow443 = map[string][]string{
-	"ServeCell":                {"apistage.go:apistageContentServeE", "ra_full_list.go:raFullListServe"},
+	"ServeCell":                {"apistage.go:apistageContentServeAttempt", "ra_full_list.go:raFullListServe"},
 	"ResolvedEntry.NoteHitter": {"ra_full_list.go:raFullListServe"},
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},

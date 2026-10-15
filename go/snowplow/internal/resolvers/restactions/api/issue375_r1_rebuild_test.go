@@ -78,7 +78,7 @@ func TestIssue375_R1_MidRebuildGVR_FallsThroughNeverServesInformer(t *testing.T)
 				"(%d bytes) — the type-level bump fires before sync, so R1 needs every such read to fall "+
 				"through to the apiserver", len(raw))
 		}
-		if _, served, ok := apistageContentServe(ctx, cache.ResolvedCache(), call, false); ok || served {
+		if _, served, ok, _ := apistageContentServe(ctx, cache.ResolvedCache(), call, false); ok || served {
 			t.Fatalf("#375 R1 RED: the content serve answered (ok=%v served=%v) for a mid-rebuild GVR", ok, served)
 		}
 		time.Sleep(5 * time.Millisecond)
