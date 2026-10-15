@@ -285,7 +285,9 @@ def test_run_collects_memory_and_restart_state(harness):
     p = _run(env)
     assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
     out = tmp / "out"
-    assert (out / "top.log").exists()
+    assert (out / "top.jsonl").exists()
+    tops = [json.loads(l) for l in (out / "top.jsonl").read_text().splitlines() if l.strip()]
+    assert tops and tops[0]["kind"] == "top" and "650Mi" in tops[0]["raw"]
     assert (out / "heap" / "heap-01-150000-ready.pb.gz").exists()
     assert (out / "pod-before.jsonl").exists() and (out / "pod-after.jsonl").exists()
     v = json.loads((out / "verdict.json").read_text())

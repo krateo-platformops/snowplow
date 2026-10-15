@@ -299,6 +299,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                               "refused": [], "product_errors": [
                                   {"path": "/agents/new", "status": 500,
                                    "body": "unexpected end of JSON input"}],
+                              "composite_routes": ["/observability", "/compositions"],
                               "full_walk_report_only": {"calls": 590, "bytes": 8429613,
                                                         "wall_ms": 17644}}))
         sys.exit(0)

@@ -340,6 +340,7 @@ class WalkResult:
     samples: list
     statuses: dict
     docs: dict            # path -> parsed doc (only when keep_docs)
+    depth: int = 0        # levels of the tree actually fetched (1 = root only)
 
 
 def walk(client: HttpClient, token: str, roots: list[str], *,
@@ -396,7 +397,7 @@ def walk(client: HttpClient, token: str, roots: list[str], *,
         level = nxt
         depth += 1
     return WalkResult(round((time.perf_counter() - t0) * 1000, 1), calls, errors,
-                      nbytes, round(slowest, 1), samples, statuses, docs)
+                      nbytes, round(slowest, 1), samples, statuses, docs, depth)
 
 
 def walk_page(client: HttpClient, token: str, root: str, *,
@@ -488,11 +489,24 @@ class Driver:
                  per_user_parallel: int = 6, seed: int = 606,
                  sink: Callable[[dict], None] | None = None,
                  retry_base_s: float = 5.0, retry_cap_s: float = 120.0,
+                 composite_routes: list[str] | None = None,
+                 burst_users: list[str] | None = None,
+                 burst_at_s: float | None = None,
                  clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep):
         self.client = client
         self.tokens = tokens
         self.portal = portal
+        # COLD COMPOSITE-PAGE BURST (#710 ruling 3 / #720): a reserved cohort
+        # that does NOTHING until burst_at_s, then all of them deep-link to a
+        # composite page at the same instant: each one's first-ever load of
+        # the shell AND of a nested widget tree.
+        self.composite_routes = list(composite_routes or [])
+        self.burst_users = [u for u in (burst_users or []) if u in tokens]
+        self.burst_at_s = burst_at_s
+        self.burst_pending: set[str] = set(self.burst_users)
+        if self.burst_users:
+            nav_workers = max(nav_workers, len(self.burst_users) + 64)
         self.think_s = think_s
         self.duration_s = duration_s
         self.nav_pool = concurrent.futures.ThreadPoolExecutor(nav_workers)
@@ -545,6 +559,9 @@ class Driver:
         started = self.clock()
         tok = self.tokens[user]
         try:
+            if user in self.burst_pending:
+                self._composite_first_load(user, tok, started, due)
+                return
             if user not in self.routes:
                 shell, routes, content = first_load(
                     self.client, tok, self.portal, pool=self.call_pool,
@@ -579,12 +596,41 @@ class Driver:
             with self.lock:
                 self.busy.discard(user)
 
+    def _composite_first_load(self, user: str, tok: str, started: float, due: float) -> None:
+        """Shell + a deep link straight to a composite page (no redirect to
+        the first route): the user's first-ever load of a nested tree."""
+        portal = self.portal
+        roots = [portal.init] + ([portal.builders_list()] if portal.builders_list() else [])
+        shell = walk(self.client, tok, roots, pool=self.call_pool,
+                     inject={portal.init: [portal.header_context()]},
+                     per_user_parallel=self.per_user_parallel, keep_docs=True)
+        menu = next((d for d in shell.docs.values()
+                     if isinstance(d, dict) and d.get("kind") == "Menu"), None)
+        routes = [r for r in menu_routes(menu, portal.frontend_ns) if not r["templated"]]
+        by_path = {r["path"]: r for r in routes}
+        target = next((by_path[p] for p in self.composite_routes if p in by_path), None)
+        content = None
+        if target is not None:
+            content = walk(self.client, tok, [target["endpoint"]], pool=self.call_pool,
+                           per_user_parallel=self.per_user_parallel)
+        failed = first_load_failed(shell, routes, content) or target is None
+        with self.lock:
+            self.burst_pending.discard(user)
+            if not failed:
+                self.routes[user] = routes          # joins normal navigation
+        page = target["path"] if target else "(no-composite-route)"
+        self._record(user, page, "composite_first_load", started, due, shell, content,
+                     routes=len(routes), failed=failed)
+
     def run(self) -> list[NavResult]:
         t_start = self.clock()
         end = t_start + self.duration_s
         # First loads are spread over one think period so 1000 users do not
         # all arrive at the same instant.
         nxt = {u: t_start + self.rng.uniform(0, self.think_s) for u in self.tokens}
+        if self.burst_users and self.burst_at_s is not None:
+            for u in self.burst_users:            # all at the SAME instant
+                nxt[u] = t_start + self.burst_at_s
         futures = []
         while True:
             now = self.clock()
@@ -963,6 +1009,247 @@ def memory_report(mem: list[dict]) -> dict | None:
             "heap_profiles": [m.get("profile") for m in mem if m.get("kind") == "heap_profile"]}
 
 
+# ─── Run 8 (#710 rulings, issuecomment-6187374111) ─────────────────────────
+#
+# Key names as given by architect-ch from the CODE (PR #719 @ 7d8cb8de and
+# main eb055b77), not notes. #719's rework, #720 and PR-2b are NOT BUILT yet:
+# a key that no sample carries is "not exposed" and FAILS — it never reads as
+# a pass. Every check names its key and the snowplow build it was read from.
+RUN8_KEYS = {
+    "fill_over_ceiling": "snowplow_apistage_content_fill_admission_over_ceiling_bytes",
+    "fill_over_ceiling_peak": "snowplow_apistage_content_fill_admission_over_ceiling_bytes_peak",
+    "nested_over_ceiling": "snowplow_nested_resolve_admission_over_ceiling_bytes",
+    "nested_over_ceiling_peak": "snowplow_nested_resolve_admission_over_ceiling_bytes_peak",
+    "stale_to_push": "snowplow_apistage_stale_to_push_ms",
+    "stale_overdue": "snowplow_apistage_stale_overdue_total",
+    "admission_wait": "snowplow_apistage_content_fill_admission_wait_ms",
+    "dirty_to_fresh_p95": "snowplow_refresher_dirty_to_fresh_ms_p95",
+    "dirty_to_fresh_max": "snowplow_refresher_dirty_to_fresh_ms_max",
+    "build_info": "snowplow_build_info",
+}
+# The /debug/vars prefixes memwatch must capture so every key above is seen
+# (also used as run606's MEM_VARS_PREFIXES default).
+RUN8_VARS_PREFIXES = (
+    "snowplow_apistage_content_fill",     # PR-0 family + #719 admission_*
+    "snowplow_nested_resolve_",           # #720 nested gate
+    "snowplow_apistage_stale_",           # PR-2b stale_to_push / overdue / debt
+    "snowplow_refresher_dirty_to_fresh",  # windowed gauges: poll the whole run
+    "snowplow_resolved_cache",
+    "snowplow_informer_dispatch_shape",
+    "snowplow_build_info",
+)
+STALE_TO_PUSH_P95_BAR_MS = 3000
+STALE_TO_PUSH_MAX_BAR_MS = 10000
+STALE_TO_PUSH_GOAL_MS = 1000
+BURST_WINDOW_S = 120.0
+
+
+def _hist_cum(h: dict, bound_ms: int) -> int | None:
+    b = (h or {}).get("buckets") or {}
+    v = b.get(f"le_{bound_ms}")
+    return int(v) if v is not None else None
+
+
+def hist_fraction_le(h: dict, bound_ms: int) -> float | None:
+    """Fraction of observations <= bound (cumulative buckets)."""
+    count = (h or {}).get("count") or 0
+    cum = _hist_cum(h, bound_ms)
+    if not count or cum is None:
+        return None
+    return round(cum / count, 4)
+
+
+def hist_p95_bound(h: dict) -> str | None:
+    """The bucket bound the p95 falls under: "<= 2500", or "> 10000"."""
+    count = (h or {}).get("count") or 0
+    b = (h or {}).get("buckets") or {}
+    if not count:
+        return None
+    bounds = sorted(int(k[3:]) for k in b if k.startswith("le_") and k[3:].isdigit())
+    for x in bounds:
+        if b[f"le_{x}"] >= 0.95 * count:
+            return f"<= {x}"
+    return f"> {bounds[-1]}" if bounds else None
+
+
+def _parse_quantity(q) -> int | None:
+    if q is None:
+        return None
+    q = str(q)
+    units = {"Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4,
+             "K": 1000, "M": 1000 ** 2, "G": 1000 ** 3}
+    for u, m in units.items():
+        if q.endswith(u):
+            try:
+                return int(float(q[:-len(u)]) * m)
+            except ValueError:
+                return None
+    try:
+        return int(q)
+    except ValueError:
+        return None
+
+
+def _extra_values(mem: list[dict], key: str, t0=None, t1=None) -> list:
+    out = []
+    for m in mem:
+        if m.get("kind") != "mem" or key not in (m.get("extra") or {}):
+            continue
+        t = m.get("t") or 0
+        if t0 is not None and not (t0 <= t < t1):
+            continue
+        out.append(m["extra"][key])
+    return out
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _window_peaks(mem, tops, t0, t1) -> dict:
+    ms = [m for m in mem if m.get("kind") == "mem" and t0 <= (m.get("t") or 0) < t1]
+    ts = [t for t in tops if t0 <= (t.get("t") or 0) < t1]
+    heap = [m["heap_inuse_mb"] for m in ms if m.get("heap_inuse_mb") is not None]
+    sysm = [m["sys_mb"] for m in ms if m.get("sys_mb") is not None]
+    rss = [t["rss_bytes"] for t in ts if t.get("rss_bytes") is not None]
+    out = {"samples": len(ms), "heap_inuse_mb_peak": max(heap) if heap else None,
+           "sys_mb_peak": max(sysm) if sysm else None,
+           "rss_bytes_peak": max(rss) if rss else None}
+    for gate in ("fill", "nested"):
+        vals = [_num(v) for k in (f"{gate}_over_ceiling", f"{gate}_over_ceiling_peak")
+                for v in _extra_values(mem, RUN8_KEYS[k], t0, t1)]
+        vals = [v for v in vals if v is not None]
+        out[f"{gate}_over_ceiling_bytes_peak"] = max(vals) if vals else None
+    return out
+
+
+def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
+                pods: list[dict] | None) -> tuple[dict, list[dict]]:
+    """(report, checks). Checks: PASS / FAIL / INCONCLUSIVE."""
+    checks: list[dict] = []
+    builds = [m["extra"].get(RUN8_KEYS["build_info"]) for m in mem
+              if m.get("kind") == "mem" and RUN8_KEYS["build_info"] in (m.get("extra") or {})]
+    build = builds[-1] if builds else None
+
+    def chk(name, key, value, bar, result, why=None):
+        c = {"check": name, "key": key, "value": value, "bar": bar,
+             "result": result, "build": build}
+        if why:
+            c["why"] = why
+        checks.append(c)
+
+    # ── memory under the two bursts ──────────────────────────────────────
+    limit = None
+    for pr in pods or []:
+        limit = _parse_quantity(((pr.get("limits") or {}).get("memory"))) or limit
+    windows = {}
+    for kind, label in (("first_load", "first_load_burst"),
+                        ("composite_first_load", "composite_page_burst")):
+        starts = [n["start"] for n in navs if n.get("nav") == kind]
+        if not starts:
+            windows[label] = None
+            continue
+        t0 = min(starts)
+        w = _window_peaks(mem, tops, t0, t0 + BURST_WINDOW_S)
+        w["window"] = [t0, t0 + BURST_WINDOW_S]
+        w["navs"] = sum(1 for n in navs if n.get("nav") == kind
+                        and t0 <= n["start"] < t0 + BURST_WINDOW_S)
+        windows[label] = w
+    overall = _window_peaks(mem, tops, float("-inf"), float("inf"))
+    peak_rss = overall["rss_bytes_peak"]
+    peak_sys = overall["sys_mb_peak"] * 1048576 if overall["sys_mb_peak"] else None
+    risk = {"limit_bytes": limit,
+            "peak_rss_bytes": peak_rss,
+            "peak_rss_share_of_limit": round(peak_rss / limit, 3) if peak_rss and limit else None,
+            "peak_go_sys_bytes": peak_sys,
+            "peak_go_sys_share_of_limit": round(peak_sys / limit, 3) if peak_sys and limit else None,
+            "peak_heap_inuse_mb": overall["heap_inuse_mb_peak"],
+            "windows": windows,
+            "note": "Diego decides the accepted memory risk from these shares (#710 ruling 2)."}
+    if windows.get("composite_page_burst") is None:
+        chk("run8.composite_page_burst_ran", None, None, "ran", "FAIL",
+            "no composite_first_load navigation recorded")
+    if windows.get("first_load_burst") is None:
+        chk("run8.first_load_burst_ran", None, None, "ran", "FAIL",
+            "no first_load navigation recorded")
+    for gate, k in (("content_fill", "fill"), ("nested_resolve", "nested")):
+        key = RUN8_KEYS[f"{k}_over_ceiling"]
+        seen = _extra_values(mem, key) + _extra_values(mem, RUN8_KEYS[f"{k}_over_ceiling_peak"])
+        if not seen:
+            chk(f"run8.{gate}.over_ceiling_bytes", key, None, "exposed", "FAIL", "not exposed")
+        else:
+            vals = [w.get(f"{k}_over_ceiling_bytes_peak") for w in windows.values() if w]
+            chk(f"run8.{gate}.over_ceiling_bytes", key, max([v for v in vals if v is not None], default=None),
+                "reported (decision: Diego)", "PASS")
+
+    # ── stale_to_push (D2): p95 <= 3 s, max <= 10 s; gap to the 1 s goal ──
+    key = RUN8_KEYS["stale_to_push"]
+    hs = _extra_values(mem, key)
+    h = hs[-1] if hs else None
+    stp = None
+    if h is None:
+        chk("run8.stale_to_push.p95", key, None, f"<= {STALE_TO_PUSH_P95_BAR_MS}", "FAIL", "not exposed")
+        chk("run8.stale_to_push.max", key, None, f"<= {STALE_TO_PUSH_MAX_BAR_MS}", "FAIL", "not exposed")
+    else:
+        f2500, f5000, f1000 = (hist_fraction_le(h, 2500), hist_fraction_le(h, 5000),
+                               hist_fraction_le(h, 1000))
+        p95 = hist_p95_bound(h)
+        stp = {"count": h.get("count"), "p95_bucket": p95, "max_ms": h.get("max_ms"),
+               "fraction_le_1000": f1000, "fraction_le_2500": f2500,
+               "gap_to_1s_goal": (None if f1000 is None else
+                                  f"{round((1 - f1000) * 100, 1)}% of pushes slower than 1 s")}
+        if not h.get("count"):
+            chk("run8.stale_to_push.p95", key, None, f"<= {STALE_TO_PUSH_P95_BAR_MS}",
+                "INCONCLUSIVE", "no stale pushes observed")
+        elif f2500 is not None and f2500 >= 0.95:
+            chk("run8.stale_to_push.p95", key, p95, f"<= {STALE_TO_PUSH_P95_BAR_MS}", "PASS")
+        elif f5000 is not None and f5000 >= 0.95:
+            chk("run8.stale_to_push.p95", key, p95, f"<= {STALE_TO_PUSH_P95_BAR_MS}", "INCONCLUSIVE",
+                "p95 <= 5000 (bucket), INCONCLUSIVE vs 3 s")
+        else:
+            chk("run8.stale_to_push.p95", key, p95, f"<= {STALE_TO_PUSH_P95_BAR_MS}", "FAIL")
+        mx = h.get("max_ms")
+        chk("run8.stale_to_push.max", key, mx, f"<= {STALE_TO_PUSH_MAX_BAR_MS}",
+            "PASS" if mx is not None and mx <= STALE_TO_PUSH_MAX_BAR_MS else "FAIL")
+
+    # ── stale_overdue_total ──────────────────────────────────────────────
+    key = RUN8_KEYS["stale_overdue"]
+    vals = [_num(v) for v in _extra_values(mem, key)]
+    vals = [v for v in vals if v is not None]
+    overdue = (vals[-1] - vals[0]) if len(vals) >= 2 else (vals[0] if vals else None)
+    chk("run8.stale_overdue_total", key, overdue, "reported",
+        "FAIL" if not vals else "PASS", None if vals else "not exposed")
+
+    # ── background admission wait (and customer: users never queue) ──────
+    key = RUN8_KEYS["admission_wait"]
+    ws = _extra_values(mem, key)
+    wait = None
+    if not ws:
+        chk("run8.admission_wait_ms.background", key, None, "reported", "FAIL", "not exposed")
+    else:
+        last = ws[-1] if isinstance(ws[-1], dict) else {}
+        wait = {cls: {"count": hh.get("count"), "p95_bucket": hist_p95_bound(hh),
+                      "max_ms": hh.get("max_ms")} for cls, hh in last.items()
+                if isinstance(hh, dict)}
+        chk("run8.admission_wait_ms.background", key, wait.get("background"), "reported",
+            "PASS" if "background" in wait else "FAIL",
+            None if "background" in wait else "no background class in the map")
+
+    # ── refresher dirty_to_fresh (windowed gauges: max over the whole run) ─
+    d2f = {}
+    for k in ("dirty_to_fresh_p95", "dirty_to_fresh_max"):
+        key = RUN8_KEYS[k]
+        vals = [_num(v) for v in _extra_values(mem, key)]
+        vals = [v for v in vals if v is not None]
+        d2f[k + "_max_over_samples"] = max(vals) if vals else None
+        if not vals:
+            chk(f"run8.refresher.{k}", key, None, "reported", "FAIL", "not exposed")
+    report = {"memory_risk": risk, "stale_to_push": stp, "stale_overdue_delta": overdue,
+              "admission_wait_ms": wait, "refresher_dirty_to_fresh": d2f, "build": build,
+              "keys": RUN8_KEYS}
+    return report, checks
+
+
 def _check(name, value, op, bar, checks):
     if value is None:
         checks.append({"check": name, "value": None, "bar": bar,
@@ -978,7 +1265,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              login_curves: list[dict] | None = None,
              preflights: list[dict] | None = None,
              snowplow_pods: list[dict] | None = None,
-             mem: list[dict] | None = None) -> dict:
+             mem: list[dict] | None = None,
+             tops: list[dict] | None = None,
+             run8: bool = False) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -1078,10 +1367,18 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     fv = [f for f in fresh if f.get("valid") is False]
     report["fresh_invalid_samples"] = len(fv)
 
+    if run8:
+        r8, r8_checks = run8_report(navs, mem or [], tops or [], snowplow_pods)
+        report["run8"] = r8
+        checks.extend(r8_checks)
+
     if any(c["result"] == "FAIL" for c in validity):
         verdict = "INVALID"
     elif any(c["result"] == "FAIL" for c in checks):
         verdict = "FAIL"
+    elif any(c["result"] == "INCONCLUSIVE" for c in checks):
+        # e.g. stale_to_push p95 lands in the le_5000 bucket: cannot claim <= 3 s.
+        verdict = "INCONCLUSIVE"
     else:
         verdict = "PASS"
     return {"verdict": verdict, "checks": checks, "validity": validity,
@@ -1305,6 +1602,21 @@ def _cmd_portal_config(a) -> int:
     return 0
 
 
+def _cmd_preflight_composite(a) -> int:
+    """preflight JSONL on stdin -> the composite route paths, one per line."""
+    for line in sys.stdin:
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("kind") == "preflight":
+                for path in r.get("composite_routes") or []:
+                    print(path)
+    return 0
+
+
 def _cmd_preflight_summary(a) -> int:
     rec = None
     for line in sys.stdin:
@@ -1331,6 +1643,8 @@ def _cmd_preflight_summary(a) -> int:
     for x in rec.get("product_errors") or []:
         print(f"[preflight] PRODUCT ERROR (recorded, not fatal) {x.get('path')} -> "
               f"{x.get('status')}: {(x.get('body') or '')[:200]}", flush=True)
+    print(f"[preflight] composite pages (nested trees, for the cold burst): "
+          f"{rec.get('composite_routes') or 'NONE'}", flush=True)
     fw = rec.get("full_walk_report_only")
     if fw:
         print(f"[preflight] full closure walk (report-only, NOT a navigation): "
@@ -1342,6 +1656,17 @@ def _cmd_preflight_summary(a) -> int:
 def _portal_from_args(a) -> "Portal":
     return Portal(init=a.init, frontend_ns=a.frontend_ns,
                   builders_ns=a.builders_ns or None)
+
+
+def composite_routes(rows: list[dict], *, min_depth: int = 3, top: int = 3) -> list[str]:
+    """Composite pages = menu routes whose eagerly-rendered tree is NESTED
+    (page → container → widgets: depth >= min_depth), ranked by how many
+    widgets the first render fetches. Derived from the live menu at
+    preflight (#710 ruling 3: run 8 must include a cold composite-page burst;
+    the nested-resolve gate no longer queues customers)."""
+    comp = [r for r in rows if (r.get("tree_depth") or 0) >= min_depth and not r.get("tree_errors")]
+    comp.sort(key=lambda r: (-(r.get("tree_calls") or 0), r["path"]))
+    return [r["path"] for r in comp[:top]]
 
 
 def preflight(client: HttpClient, token: str, portal: "Portal", *,
@@ -1376,6 +1701,11 @@ def preflight(client: HttpClient, token: str, portal: "Portal", *,
             rr = client.get(rt["endpoint"], token)
             c = classify(rr)
             row = {"path": rt["path"], "endpoint": rt["endpoint"], "status": rr.status}
+            if c == "ok":
+                tree = walk(client, token, [rt["endpoint"]], pool=pool,
+                            per_user_parallel=per_user_parallel)
+                row.update({"tree_calls": tree.calls, "tree_depth": tree.depth,
+                            "tree_bytes": tree.bytes, "tree_errors": tree.errors})
             out["routes"].append(row)
             if c == "config":
                 out["refused"].append({**row, "body": (rr.body or b"")[:400].decode("utf-8", "replace")})
@@ -1383,6 +1713,7 @@ def preflight(client: HttpClient, token: str, portal: "Portal", *,
                 out["product_errors"].append({**row, "body": (rr.body or b"")[:400].decode("utf-8", "replace")})
             elif c == "forbidden":
                 out["forbidden"].append(row)
+        out["composite_routes"] = composite_routes(out["routes"])
         if full_walk:
             wall, calls, errs, nbytes, slowest, samples = walk_page(
                 client, token, portal.init, pool=pool, max_depth=12, max_calls=5000)
@@ -1454,9 +1785,15 @@ def _cmd_drive(a) -> int:
     if a.vars_interval > 0:
         th = threading.Thread(target=_sampler, daemon=True)
         th.start()
+    burst_users = users[-a.burst_users:] if a.burst_users > 0 else []
+    if burst_users and not a.composite_route:
+        print("composite burst requested but no --composite-route (none found at "
+              "preflight): the burst records FAILED navigations", file=sys.stderr)
     Driver(client, tokens, portal, think_s=a.think_s, duration_s=a.duration_s,
            nav_workers=a.nav_workers, call_workers=a.call_workers,
-           sink=sink).run()
+           sink=sink, composite_routes=a.composite_route or [],
+           burst_users=burst_users,
+           burst_at_s=a.burst_at_s if burst_users else None).run()
     stop.set()
     if th:
         th.join(timeout=a.vars_interval + 30)
@@ -1685,13 +2022,19 @@ def _cmd_evaluate(a) -> int:
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     vs = sorted((r for r in recs if r.get("kind") == "vars"
                  and not r.get("unreadable")), key=lambda r: r.get("t", 0))
-    result = evaluate(navs, fresh, vs,
+    tops = []
+    for r in recs:
+        if r.get("kind") == "top":
+            parts = (r.get("raw") or "").split()
+            r["rss_bytes"] = _parse_quantity(parts[2]) if len(parts) >= 3 else None
+            tops.append(r)
+    result = evaluate(navs, fresh, vs, tops=tops, run8=a.run8,
                       login_curves=[r for r in recs if r.get("kind") == "login_curve"],
                       preflights=[r for r in recs if r.get("kind") == "preflight"],
                       snowplow_pods=[r for r in recs if r.get("kind") == "snowplow_pod"],
                       mem=[r for r in recs if r.get("kind") in ("mem", "heap_profile")])
     print(json.dumps(result, indent=2, default=str))
-    return {"PASS": 0, "FAIL": 1, "INVALID": 3}[result["verdict"]]
+    return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1704,6 +2047,12 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--user-prefix", default="scaleuser-")
     d.add_argument("--user-start", type=int, default=1)
     d.add_argument("--user-end", type=int, default=1000)
+    d.add_argument("--composite-route", action="append", default=None,
+                   help="composite page path (from preflight; repeatable, ranked)")
+    d.add_argument("--burst-users", type=int, default=0,
+                   help="reserve the LAST N users for the cold composite-page burst")
+    d.add_argument("--burst-at-s", type=float, default=600.0,
+                   help="seconds after the drive starts when the burst cohort arrives together")
     d.add_argument("--init", required=True,
                    help="the frontend config.json api.INIT (the app-shell Layout)")
     d.add_argument("--frontend-ns", default="krateo-system")
@@ -1760,6 +2109,8 @@ def main(argv: list[str] | None = None) -> int:
     pc.set_defaults(func=_cmd_portal_config)
     ps = sub.add_parser("preflight-summary", help="preflight JSONL on stdin -> summary")
     ps.set_defaults(func=_cmd_preflight_summary)
+    pcx = sub.add_parser("preflight-composite", help="preflight JSONL on stdin -> composite routes")
+    pcx.set_defaults(func=_cmd_preflight_composite)
     mw = sub.add_parser("memwatch", help="in-cluster memstats + heap profile sampler")
     mw.add_argument("--snowplow-url", required=True)
     mw.add_argument("--authn-url", required=True)
@@ -1779,6 +2130,8 @@ def main(argv: list[str] | None = None) -> int:
     pr.set_defaults(func=_cmd_pod_record)
     e = sub.add_parser("evaluate")
     e.add_argument("inputs", nargs="+")
+    e.add_argument("--run8", action="store_true",
+                   help="add the #710 run-8 memory-risk / stale_to_push report and checks")
     e.set_defaults(func=_cmd_evaluate)
     a = p.parse_args(argv)
     return int(a.func(a))

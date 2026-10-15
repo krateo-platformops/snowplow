@@ -45,7 +45,9 @@ def _indent(text: str, n: int) -> str:
 def render(*, users: int, shards: int, think_s: float, duration_s: float,
            snowplow_url: str, authn_url: str, password: str,
            init: str, frontend_ns: str = "krateo-system",
-           builders_ns: str = "krateo-system", src: str | None = None) -> str:
+           builders_ns: str = "krateo-system", src: str | None = None,
+           composite_routes: list[str] | tuple = (), burst_users: int = 0,
+           burst_at_s: float = 600.0) -> str:
     if not init.startswith("/call"):
         raise ValueError("init must be the frontend config.json api.INIT /call path")
     src = LOAD606_SRC.read_text() if src is None else src
@@ -54,17 +56,25 @@ def render(*, users: int, shards: int, think_s: float, duration_s: float,
     case = "\n".join(f"  {i}) S={a}; E={b};;" for i, (a, b) in enumerate(ranges))
     portal_args = (f"--init {json.dumps(init)} --frontend-ns {json.dumps(frontend_ns)} "
                    f"--builders-ns {json.dumps(builders_ns)}")
+    # Cold composite-page burst (#710 ruling 3): the last N users of the
+    # LAST shard arrive together at burst_at_s, each deep-linking to one of
+    # the composite routes the preflight derived from the live menu.
+    burst_args = ""
+    if burst_users > 0:
+        burst_args = (f" --burst-users \"$BURST\" --burst-at-s {burst_at_s:g}"
+                      + "".join(f" --composite-route {json.dumps(r)}" for r in composite_routes))
     script = f"""set -eu
 case "$JOB_COMPLETION_INDEX" in
 {case}
   *) echo "bad index" >&2; exit 2;;
 esac
 VARS=0; [ "$JOB_COMPLETION_INDEX" = "0" ] && VARS=15
+BURST=0; [ "$JOB_COMPLETION_INDEX" = "{shards - 1}" ] && BURST={burst_users}
 exec python3 -u /opt/load606/load606.py drive \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --password {json.dumps(password)} --user-start "$S" --user-end "$E" \\
   --think-s {think_s} --duration-s {duration_s} --vars-interval "$VARS" \\
-  {portal_args} --out /dev/stdout
+  {portal_args}{burst_args} --out /dev/stdout
 """
     return f"""\
 apiVersion: v1
@@ -366,6 +376,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--authn-url", required=True)
     p.add_argument("--password", required=True)
     p.add_argument("--init", required=True)
+    p.add_argument("--composite-route", action="append", default=None)
+    p.add_argument("--burst-users", type=int, default=0)
+    p.add_argument("--burst-at-s", type=float, default=600.0)
     p.add_argument("--frontend-ns", default="krateo-system")
     p.add_argument("--builders-ns", default="krateo-system")
     p.add_argument("--preflight-only", action="store_true",
@@ -398,7 +411,9 @@ def main(argv: list[str] | None = None) -> int:
                             snowplow_url=a.snowplow_url,
                             authn_url=a.authn_url, password=a.password,
                             init=a.init, frontend_ns=a.frontend_ns,
-                            builders_ns=a.builders_ns))
+                            builders_ns=a.builders_ns,
+                            composite_routes=a.composite_route or [],
+                            burst_users=a.burst_users, burst_at_s=a.burst_at_s))
     if a.mem_duration_s > 0:
         sys.stdout.write(render_mem(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,

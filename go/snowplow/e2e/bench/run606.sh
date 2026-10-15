@@ -76,7 +76,15 @@ TOP_POLL_S="${TOP_POLL_S:-15}"
 # fill_inflight(_bytes), fill_duplicate_total, fill_by_gvr), the resolved cache
 # and the informer dispatch shape — the attribution heap profiles cannot carry.
 # Space-separated; set it to "" to record none.
-MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-snowplow_apistage_content_fill snowplow_resolved_cache snowplow_informer_dispatch_shape}"
+MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-snowplow_apistage_content_fill snowplow_nested_resolve_ snowplow_apistage_stale_ snowplow_refresher_dirty_to_fresh snowplow_resolved_cache snowplow_informer_dispatch_shape snowplow_build_info}"
+# Run 8 (#710 issuecomment-6187374111): a COLD COMPOSITE-PAGE BURST — the last
+# COMPOSITE_BURST_USERS users stay idle, then all arrive together at
+# COMPOSITE_BURST_AT_S, each deep-linking to a composite page (nested widget
+# tree) the preflight derived from the live menu. 0 disables.
+COMPOSITE_BURST_USERS="${COMPOSITE_BURST_USERS:-200}"
+COMPOSITE_BURST_AT_S="${COMPOSITE_BURST_AT_S:-$(( DRIVE_S / 2 ))}"
+RUN8_REPORT="${RUN8_REPORT:-1}"
+COMPOSITE_ROUTES=()
 PLATFORM_POLL_S="${PLATFORM_POLL_S:-60}"
 OUT="${OUT:-/tmp/snowplow-runs/606/${RUN_NAME}}"
 
@@ -291,6 +299,13 @@ s_preflight() {
     return 1
   fi
   log "preflight OK (product errors, if any, are recorded, not fatal)"
+  local r
+  while IFS= read -r r; do [[ -n "$r" ]] && COMPOSITE_ROUTES+=("$r"); done \
+    < <(python3 -m bench.load606 preflight-composite < "$OUT/preflight.jsonl")
+  if (( COMPOSITE_BURST_USERS > 0 )) && (( ${#COMPOSITE_ROUTES[@]} == 0 )); then
+    log "WARNING: no composite page found in the live menu: the composite burst will record FAILED navigations"
+  fi
+  log "composite pages for the cold burst: ${COMPOSITE_ROUTES[*]:-NONE}"
 }
 s_data() {
   # Data stamping is kubectl-only. User LOGINS need authn over HTTP: in
@@ -329,6 +344,8 @@ s_measure() {
       --namespaces "$NAMESPACES" \
       --mem-duration-s "$(( DRIVE_S + 3600 ))" \
       $(for x in $MEM_VARS_PREFIXES; do printf -- '--mem-vars-prefix %s ' "$x"; done) \
+      --burst-users "$COMPOSITE_BURST_USERS" --burst-at-s "$COMPOSITE_BURST_AT_S" \
+      ${COMPOSITE_ROUTES[@]+$(printf -- '--composite-route %q ' "${COMPOSITE_ROUTES[@]}")} \
       > "$OUT/loadgen-job.yaml"
   # snowplow's restart state BEFORE measure (the verdict compares after/before:
   # any restart or OOM during measure makes the run INVALID, with its reason).
@@ -352,11 +369,10 @@ TOP_PID=""
 start_top_loop() {
   if [[ "$DRY" == "1" ]]; then log "DRY: kubectl top loop -> $OUT/top.log"; return 0; fi
   ( while true; do
-      printf '%s ' "$(date -u +%H:%M:%S)"
-      "${K[@]}" -n krateo-system top pod -l "$SNOWPLOW_POD_SELECTOR" --no-headers 2>&1 | tr -s ' ' | tr '\n' ' '
-      echo
+      line="$("${K[@]}" -n krateo-system top pod -l "$SNOWPLOW_POD_SELECTOR" --no-headers 2>&1 | tr -s ' ' | tr '\n' ' ' | tr -d '"\\')"
+      printf '{"kind":"top","t":%s,"raw":"%s"}\n' "$(date +%s)" "$line"
       sleep "$TOP_POLL_S"
-    done ) >> "$OUT/top.log" 2>&1 &
+    done ) >> "$OUT/top.jsonl" 2>&1 &
   TOP_PID=$!
 }
 stop_top_loop() {
@@ -390,13 +406,15 @@ s_collect() {
 s_evaluate() {
   shopt -s nullglob
   local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
-               "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl)
+               "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl)
   if [[ "$DRY" == "1" ]]; then log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>}"; return 0; fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
   local vrc=0
-  python3 -m bench.load606 evaluate "${files[@]}" > "$OUT/verdict.json" || vrc=$?
-  log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID) -> $OUT/verdict.json"
+  local r8=()
+  [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
+  python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} > "$OUT/verdict.json" || vrc=$?
+  log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
 }
 
 step source    s_source

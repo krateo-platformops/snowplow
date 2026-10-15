@@ -45,9 +45,11 @@ def test_memwatch_samples_fast_through_the_burst_then_slows(tmp_path):
 
 
 def test_run606_records_the_710_counters_by_default():
+    """The default capture covers every run-8 key family (load606.RUN8_VARS_PREFIXES)."""
     src = (BENCH_DIR / "run606.sh").read_text()
-    assert ('MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-snowplow_apistage_content_fill '
-            'snowplow_resolved_cache snowplow_informer_dispatch_shape}"') in src
+    line = next(l for l in src.splitlines() if l.startswith('MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-'))
+    defaults = line.split("-", 1)[1].rstrip('}"').split()
+    assert set(load606.RUN8_VARS_PREFIXES) <= set(defaults)
 
 
 def test_mem_job_carries_the_default_prefixes(harness):
