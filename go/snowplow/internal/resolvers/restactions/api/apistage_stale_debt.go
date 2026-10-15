@@ -211,7 +211,9 @@ func serveStaleWithDebt(ctx context.Context, sink *cache.StaleServeSink, store *
 	if !ok {
 		return nil, false
 	}
-	entry, hit := cache.ServeCell(ctx, store, k, true, dep)
+	// Metric-neutral read: the response may still be withdrawn at the write
+	// point; CommitStaleServe counts it as the request's hit (through Get).
+	entry, hit := cache.ServeCell(ctx, store, k, false, dep)
 	if !hit || entry == nil {
 		return nil, false
 	}
@@ -280,6 +282,16 @@ func runStaleDebt(d *staleDebt) {
 // staleDebtRefillOnce runs one refill attempt through the ordinary content
 // fill at the debt class and reports whether it satisfied the debt.
 func staleDebtRefillOnce(d *staleDebt) bool {
+	if g := staleRefillHoldForTest.Load(); g != nil {
+		staleDebtStopMu.Lock()
+		stop := staleDebtStop
+		staleDebtStopMu.Unlock()
+		select {
+		case <-*g:
+		case <-stop:
+			return false
+		}
+	}
 	staleDebtsMu.Lock()
 	mark := d.markSeq
 	staleDebtsMu.Unlock()
@@ -664,6 +676,25 @@ func RegisterStaleExpvarForTest() { registerStaleExpvar() }
 // the refresher, the store or the broadcaster those goroutines use. Production
 // MUST NOT use it.
 func WaitStaleDebtsForTest() { staleDebtWG.Wait() }
+
+// staleRefillHoldForTest, when set, parks every debt refill attempt until the
+// channel closes (HoldStaleDebtRefillsForTest). Nil in production.
+var staleRefillHoldForTest atomic.Pointer[chan struct{}]
+
+// HoldStaleDebtRefillsForTest parks every debt refill until the returned
+// release runs, so a cross-package arm can keep a content cell known-stale
+// across a whole request (D2-15b). Production MUST NOT use it.
+func HoldStaleDebtRefillsForTest() (release func()) {
+	ch := make(chan struct{})
+	staleRefillHoldForTest.Store(&ch)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			staleRefillHoldForTest.Store(nil)
+			close(ch)
+		})
+	}
+}
 
 // AddStaleServeForTest moves the stale-serve and overdue counters and records
 // one stale_to_push sample through their production paths, so a cross-package

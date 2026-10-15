@@ -160,9 +160,28 @@ func TestIssue710_D2_15b_TheReRunNeverReEntersD2EvenWhenItIsDeclinedToo(t *testi
 	h, contentKey := k710KnownStaleFound(t)
 	writes := k710Writes(t)
 	h.customerExternal.Store(-1) // every customer resolve declines, the re-run included
+	// The content stays KNOWN-STALE through the whole request (the debt's refill
+	// is parked), so a re-run with D2 still enabled WOULD be served stale again.
+	release := restactionsapi.HoldStaleDebtRefillsForTest()
+	t.Cleanup(release)
 	s0 := restactionsapi.StaleServeStatsSnapshot()
-	r, code := h.getRA(0, k547Changed)
-	k710AssertFreshWithdrawn(t, "D2-15b", r, code, contentKey, s0.ServeTotal, s0.WithdrawnUnarmable, writes(), false)
+	type res struct {
+		r    string
+		code int
+	}
+	done := make(chan res, 1)
+	go func() { r, code := h.getRA(0, k547Changed); done <- res{r, code} }()
+	var got res
+	select {
+	case got = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("D2-15b RED: the withdrawn GET did not return — its re-run re-entered D2 and withdrew again")
+	}
+	if d := restactionsapi.StaleServeStatsSnapshot().ServeTotal - s0.ServeTotal; d != 1 {
+		t.Fatalf("D2-15b RED: %d stale decisions for one GET with the content still known-stale — the re-run re-entered D2", d)
+	}
+	release()
+	k710AssertFreshWithdrawn(t, "D2-15b", got.r, got.code, contentKey, s0.ServeTotal, s0.WithdrawnUnarmable, writes(), false)
 }
 
 func TestIssue710_D2_15c_ANestedStaleServeUnderADeclinedWidgetIsNeverWritten(t *testing.T) {
@@ -276,6 +295,12 @@ func TestIssue710_D2_15d_AWithdrawnServeIsCountedOnceAndNothingIsWrittenBeforeTh
 				rerunSaw = append(rerunSaw, "header "+hk+" set before the re-run")
 			}
 		}
+		// Determinism: the re-run sees the content state the baseline GET sees
+		// (refilled), so the comparison isolates what the re-run COUNTS.
+		k547WaitFor(t, 10*time.Second, "debt cleared before the re-run", func() bool {
+			_, _, ks := cache.KnownStale(contentKey)
+			return !ks && restactionsapi.StaleServeStatsSnapshot().DebtOpen == 0
+		})
 	}
 	t.Cleanup(func() { staleRerunHookForTest = prev })
 
