@@ -22,6 +22,7 @@ import (
 	"net/http"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
@@ -34,11 +35,26 @@ func staleWritePoint(h http.Handler, wri http.ResponseWriter, req *http.Request,
 	}
 	if !armable {
 		api.WithdrawStaleServe(sink)
+		// Nothing has been written yet (the header and body follow this point);
+		// the one header the first pass may have set describes the discarded
+		// pass, so it goes — the re-run sets its own.
+		wri.Header().Del(util.HeaderStageOutcomes)
+		if f := staleRerunHookForTest; f != nil {
+			f(wri)
+		}
 		h.ServeHTTP(wri, req.WithContext(cache.WithStaleServeDisabled(req.Context())))
 		return true
 	}
 	api.CommitStaleServe(sink)
 	return false
+}
+
+// isStaleRerun reports whether req is a withdrawn stale serve's re-run. The
+// dispatchers treat it like a demand revalidation (no L1 read, no second
+// customer-in-flight mark or live-caller observation, its own per-call
+// l1_hit), so the one customer request is counted once.
+func isStaleRerun(req *http.Request) bool {
+	return cache.StaleServeDisabled(req.Context())
 }
 
 // staleHitWritePoint keeps the invariant on a HIT of a stale-derived cell (a
@@ -49,6 +65,10 @@ func staleHitWritePoint(key string, entry *cache.ResolvedEntry) {
 		cache.MarkStaleOwed(key)
 	}
 }
+
+// staleRerunHookForTest observes the ResponseWriter at the moment of the
+// re-run (D2-15d: nothing may have been written to it yet). Nil in production.
+var staleRerunHookForTest func(wri http.ResponseWriter)
 
 // staleWriteHookForTest observes every customer body write that could be
 // stale-derived (D2-17's invariant sweep). Nil in production.

@@ -95,9 +95,17 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	//
 	// #547 — not for a demand revalidation: it re-enters this handler on a
 	// detached copy of a request that was already served (demand_revalidate.go).
-	demand := isDemandRevalidation(req)
+	//
+	// #710 PR-2b — nor for a withdrawn stale serve's re-run (stale_write_point.go):
+	// the same customer request re-entering, already marked and observed, which
+	// must resolve rather than read a cell (the first pass already counted its
+	// L1 lookup). Its per-call record carries l1_hit="stale_rerun".
+	demand := isDemandRevalidation(req) || isStaleRerun(req)
 	if demand {
 		pcs.l1Hit = "revalidate"
+		if isStaleRerun(req) {
+			pcs.l1Hit = "stale_rerun"
+		}
 	} else {
 		defer markCustomerInFlight()()
 		// #262 S2 — record the caller's identity class (in memory) so a class no

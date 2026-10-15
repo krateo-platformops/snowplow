@@ -17,6 +17,12 @@
 //     outermost dispatcher saw StaleDerived).
 //     Mutation → RED: a sink not inherited by nested resolves (e.g. the nested
 //     resolve re-scopes to its own sink).
+//   - D2-15d one customer GET through the withdraw + re-run path is counted
+//     ONCE: the L1 lookup counters move exactly as much as a plain cold GET's
+//     (the re-run resolves, it never reads the cell), and nothing was written to
+//     the ResponseWriter (no header, no WriteHeader, no body) before the re-run.
+//     Mutation → RED: no re-run marker (the re-run reads the cell / counts its
+//     lookup again).
 //   - D2-17  invariant sweep: every stale-derived body written in these
 //     scenarios had an accepted Put + the armed header + an owed-push mark.
 //     Mutation → RED: CommitStaleServe skipped (no owed mark) or a stale body
@@ -25,11 +31,16 @@ package dispatchers
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
@@ -198,5 +209,106 @@ func TestIssue710_D2_17_EveryStaleWriteHasAnAcceptedPutAnArmedHeaderAndAnOwedMar
 	}
 	if nStale == 0 {
 		t.Fatalf("D2-17: no stale-derived write observed — the sweep is vacuous")
+	}
+}
+
+// k710Writer records whether anything reached the wire.
+type k710Writer struct {
+	h           http.Header
+	wroteHeader bool
+	code        int
+	body        []byte
+}
+
+func (w *k710Writer) Header() http.Header { return w.h }
+func (w *k710Writer) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.wroteHeader, w.code = true, code
+	}
+}
+func (w *k710Writer) Write(b []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	w.body = append(w.body, b...)
+	return len(b), nil
+}
+
+// k710GetRA is getRA through a recording writer.
+func k710GetRA(h *k547Harness, k, m int) (string, *k710Writer) {
+	ex, _ := json.Marshal(k547Extras(m))
+	u := "/call?apiVersion=" + url.QueryEscape(k547RAGVR.Group+"/"+k547RAGVR.Version) +
+		"&resource=" + k547RAGVR.Resource + "&name=" + k547RAName + "&namespace=" + k547WNS +
+		"&extras=" + url.QueryEscape(string(ex))
+	w := &k710Writer{h: http.Header{}}
+	RESTAction().ServeHTTP(w, httptest.NewRequest("GET", u, nil).WithContext(k547ReqCtx(k)))
+	var obj struct {
+		Status struct {
+			Conditions []struct {
+				Reason string `json:"reason"`
+			} `json:"conditions"`
+		} `json:"status"`
+	}
+	if json.Unmarshal(w.body, &obj) != nil || len(obj.Status.Conditions) == 0 {
+		return "", w
+	}
+	return obj.Status.Conditions[0].Reason, w
+}
+
+func k710Lookups() (hit, miss int64) {
+	st := cache.ResolvedCacheStatsByStat()
+	return st["hit_total"], st["miss_total"]
+}
+
+func TestIssue710_D2_15d_AWithdrawnServeIsCountedOnceAndNothingIsWrittenBeforeTheReRun(t *testing.T) {
+	h, contentKey := k710KnownStaleFound(t)
+	var rerunSaw []string
+	prev := staleRerunHookForTest
+	staleRerunHookForTest = func(wri http.ResponseWriter) {
+		w, ok := wri.(*k710Writer)
+		if !ok {
+			rerunSaw = append(rerunSaw, "not the arm's writer")
+			return
+		}
+		if w.wroteHeader || len(w.body) > 0 {
+			rerunSaw = append(rerunSaw, "status/body written before the re-run")
+		}
+		for _, hk := range []string{refreshKeyHeader, refreshClassHeader, util.HeaderStageOutcomes} {
+			if w.h.Get(hk) != "" {
+				rerunSaw = append(rerunSaw, "header "+hk+" set before the re-run")
+			}
+		}
+	}
+	t.Cleanup(func() { staleRerunHookForTest = prev })
+
+	h.customerExternal.Store(1)
+	wd0 := restactionsapi.StaleServeStatsSnapshot().WithdrawnUnarmable
+	h0, m0 := k710Lookups()
+	r, w := k710GetRA(h, 0, k547Changed)
+	h1, m1 := k710Lookups()
+	if r != "v1" || w.code != http.StatusOK {
+		t.Fatalf("D2-15d: the withdrawn GET served %q (code %d), want fresh v1", r, w.code)
+	}
+	if len(rerunSaw) != 0 {
+		t.Fatalf("D2-15d RED: the ResponseWriter was not pristine at the re-run: %v", rerunSaw)
+	}
+	if st := restactionsapi.StaleServeStatsSnapshot(); st.WithdrawnUnarmable-wd0 != 1 {
+		t.Fatalf("PRECONDITION: the GET did not take the withdraw + re-run path (%+v)", st)
+	}
+	// Baseline: the same request shape, plain cold (no stale serve, no decline),
+	// once the content debt has cleared.
+	if !k547WaitFor(t, 10*time.Second, "debt cleared", func() bool {
+		_, _, ks := cache.KnownStale(contentKey)
+		return !ks && restactionsapi.StaleServeStatsSnapshot().DebtOpen == 0
+	}) {
+		t.Fatalf("PRECONDITION: the content debt never cleared")
+	}
+	h2, m2 := k710Lookups()
+	if r, _ := k710GetRA(h, 1, k547Changed); r != "v1" {
+		t.Fatalf("baseline cold GET served %q, want v1", r)
+	}
+	h3, m3 := k710Lookups()
+	t.Logf("lookups: withdrawn GET hit+%d miss+%d; plain cold GET hit+%d miss+%d", h1-h0, m1-m0, h3-h2, m3-m2)
+	if (h1-h0)+(m1-m0) != (h3-h2)+(m3-m2) || m1-m0 != m3-m2 {
+		t.Fatalf("D2-15d RED: the withdrawn GET moved the L1 lookup counters by hit+%d miss+%d, a plain cold GET by "+
+			"hit+%d miss+%d — the re-run counted a second request", h1-h0, m1-m0, h3-h2, m3-m2)
 	}
 }

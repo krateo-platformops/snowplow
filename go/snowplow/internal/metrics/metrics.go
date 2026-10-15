@@ -1662,7 +1662,12 @@ func registerStaleServeInstruments(m metric.Meter) error {
 		return err
 	}
 	unresolved, err := m.Int64ObservableCounter("snowplow_apistage_stale_dependent_unresolved_total",
-		metric.WithDescription("Debt-lane re-resolves of a stale-served customer cell that did not replace it; the stale-derived cell is evicted so the pushed refetch is a fresh fill. #710 PR-2b."))
+		metric.WithDescription("Debt-lane re-resolves of a stale-served customer cell that completed but whose Put was declined; the stale-derived cell is evicted so the pushed refetch is a fresh fill. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	replaceRetries, err := m.Int64ObservableCounter("snowplow_apistage_stale_replace_retries_total",
+		metric.WithDescription("Failed re-resolves of a stale-served customer cell, retried on backoff; the cell is kept (never evicted on failure). #710 PR-2b."))
 	if err != nil {
 		return err
 	}
@@ -1700,8 +1705,9 @@ func registerStaleServeInstruments(m metric.Meter) error {
 		o.ObserveInt64(owedOpen, int64(s.Owed.Open))
 		o.ObserveInt64(owedDropped, int64(s.Owed.Dropped))
 		o.ObserveInt64(owedArm, int64(s.Owed.ArmEmits))
+		o.ObserveInt64(replaceRetries, int64(s.ReplaceRetries))
 		return nil
-	}, serveTotal, debtOpen, oldest, retries, overdue, pushes, unarmed, unresolved, withdrawn, owedOpen, owedDropped, owedArm)
+	}, serveTotal, debtOpen, oldest, retries, overdue, pushes, unarmed, unresolved, withdrawn, owedOpen, owedDropped, owedArm, replaceRetries)
 	return err
 }
 
