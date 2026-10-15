@@ -1123,6 +1123,64 @@ def _window_peaks(mem, tops, t0, t1) -> dict:
     return out
 
 
+def _cumulative_points(sample: dict) -> dict:
+    """Every cumulative-since-boot number in one mem sample: memstats NumGC,
+    each captured *_total / *_peak scalar, map sums of *_total maps, and each
+    histogram's count. A pod restart resets all of them."""
+    out = {}
+    if sample.get("num_gc") is not None:
+        out["memstats.NumGC"] = sample["num_gc"]
+    for k, v in (sample.get("extra") or {}).items():
+        if isinstance(v, dict) and "count" in v and "buckets" in v:
+            out[k + ".count"] = v.get("count") or 0
+        elif k.endswith(("_total", "_peak")):
+            if _num(v) is not None:
+                out[k] = v
+            elif isinstance(v, dict):
+                vals = [x for x in v.values() if _num(x) is not None]
+                if vals:
+                    out[k + ".sum"] = sum(vals)
+        elif isinstance(v, dict) and k == RUN8_KEYS["admission_wait"]:
+            for cls, hh in v.items():
+                if isinstance(hh, dict) and "count" in hh:
+                    out[f"{k}.{cls}.count"] = hh.get("count") or 0
+    return out
+
+
+def detect_restart(mem: list[dict], pods: list[dict] | None) -> dict | None:
+    """A snowplow restart during the run, from ANY of: a drop in a cumulative
+    counter between consecutive samples, a change of build_info, or the pod's
+    restartCount. Returns {t, signals, ...} or None."""
+    signals, t_first = [], None
+    rows = sorted((m for m in mem if m.get("kind") == "mem" and m.get("vars_status", 200) == 200),
+                  key=lambda m: m.get("t") or 0)
+    prev, prev_build = None, None
+    for m in rows:
+        cur = _cumulative_points(m)
+        if prev is not None:
+            drops = [k for k, v in cur.items() if k in prev and v < prev[k]]
+            if drops:
+                signals.append({"t": m.get("t"), "signal": "counter reset",
+                                "keys": sorted(drops)[:8]})
+                t_first = t_first if t_first is not None else m.get("t")
+        build = (m.get("extra") or {}).get(RUN8_KEYS["build_info"])
+        if build is not None and prev_build is not None and build != prev_build:
+            signals.append({"t": m.get("t"), "signal": "build_info changed"})
+            t_first = t_first if t_first is not None else m.get("t")
+        prev = cur or prev
+        prev_build = build if build is not None else prev_build
+    if pods:
+        before = next((x for x in pods if x.get("phase") == "before"), None)
+        after = next((x for x in pods if x.get("phase") == "after"), None)
+        if before and after and (after.get("restarts") or 0) > (before.get("restarts") or 0):
+            ls = (after.get("last_state") or {}).get("terminated") or {}
+            signals.append({"t": ls.get("finishedAt"), "signal": "pod restartCount",
+                            "reason": ls.get("reason"), "exit_code": ls.get("exitCode")})
+    if not signals:
+        return None
+    return {"t": t_first, "signals": signals}
+
+
 def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
                 pods: list[dict] | None) -> tuple[dict, list[dict]]:
     """(report, checks). Checks: PASS / FAIL / INCONCLUSIVE."""
@@ -1198,9 +1256,17 @@ def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
                "fraction_le_1000": f1000, "fraction_le_2500": f2500,
                "gap_to_1s_goal": (None if f1000 is None else
                                   f"{round((1 - f1000) * 100, 1)}% of pushes slower than 1 s")}
+        f3000 = hist_fraction_le(h, STALE_TO_PUSH_P95_BAR_MS)
+        stp["fraction_le_3000"] = f3000
         if not h.get("count"):
             chk("run8.stale_to_push.p95", key, None, f"<= {STALE_TO_PUSH_P95_BAR_MS}",
                 "INCONCLUSIVE", "no stale pushes observed")
+        elif f3000 is not None:
+            # 2b's bounds are exactly 1000/3000/10000 (architect-ch): with a
+            # le_3000 bucket the bar is DECIDABLE.
+            chk("run8.stale_to_push.p95", key, p95, f"<= {STALE_TO_PUSH_P95_BAR_MS}",
+                "PASS" if f3000 >= 0.95 else "FAIL",
+                f"fraction <= 3000 ms = {f3000}")
         elif f2500 is not None and f2500 >= 0.95:
             chk("run8.stale_to_push.p95", key, p95, f"<= {STALE_TO_PUSH_P95_BAR_MS}", "PASS")
         elif f5000 is not None and f5000 >= 0.95:
@@ -1244,7 +1310,35 @@ def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
         d2f[k + "_max_over_samples"] = max(vals) if vals else None
         if not vals:
             chk(f"run8.refresher.{k}", key, None, "reported", "FAIL", "not exposed")
+    # A restart RESETS every cumulative-since-boot key (histograms, *_total,
+    # *_peak): a last-sample read would report only the post-restart tail and
+    # could PASS. An OOMKill is the run-8 HEADLINE result, so every run-8
+    # check becomes RESTARTED → FAIL, with the restart and the pre-restart peak.
+    restart = detect_restart(mem, pods)
+    if restart is not None:
+        t_r = restart["t"]
+        before = [m for m in mem if m.get("kind") == "mem" and t_r is not None
+                  and (m.get("t") or 0) < t_r]
+        heap_b = [m["heap_inuse_mb"] for m in before if m.get("heap_inuse_mb") is not None]
+        sys_b = [m["sys_mb"] for m in before if m.get("sys_mb") is not None]
+        rss_b = [t["rss_bytes"] for t in tops if t_r is not None and (t.get("t") or 0) < t_r
+                 and t.get("rss_bytes") is not None]
+        restart["peak_heap_inuse_mb_before"] = max(heap_b) if heap_b else None
+        restart["peak_sys_mb_before"] = max(sys_b) if sys_b else None
+        restart["peak_rss_bytes_before"] = max(rss_b) if rss_b else None
+        if restart["peak_rss_bytes_before"] and limit:
+            restart["peak_rss_share_of_limit_before"] = round(restart["peak_rss_bytes_before"] / limit, 3)
+        for c in checks:
+            if c["result"] != "FAIL":
+                c["result"] = "FAIL"
+            c["why"] = ("RESTARTED: snowplow restarted during the run; cumulative counters "
+                        "reset, so this reading covers only part of the run"
+                        + (f" ({c['why']})" if c.get("why") and not c["why"].startswith("RESTARTED") else ""))
+        checks.insert(0, {"check": "run8.no_restart", "key": None, "value": restart["signals"],
+                          "bar": "no restart", "result": "FAIL", "build": build,
+                          "why": "RESTARTED — the OOMKill/restart is the run-8 headline result"})
     report = {"memory_risk": risk, "stale_to_push": stp, "stale_overdue_delta": overdue,
+              "restart": restart,
               "admission_wait_ms": wait, "refresher_dirty_to_fresh": d2f, "build": build,
               "keys": RUN8_KEYS}
     return report, checks
