@@ -52,6 +52,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"expvar"
 	"log/slog"
 	"net/http"
@@ -170,9 +171,18 @@ type staleDebt struct {
 	overdue    bool
 }
 
+// staleReplace is one committed dependent whose replace is in flight (it may
+// be retrying a failed re-resolve); the overdue scanner reads it.
+type staleReplace struct {
+	key      string
+	servedAt time.Time
+	overdue  bool
+}
+
 var (
-	staleDebtsMu sync.Mutex
-	staleDebts   = map[string]*staleDebt{}
+	staleDebtsMu   sync.Mutex
+	staleDebts     = map[string]*staleDebt{}
+	staleReplacing = map[*cache.StaleServeSink]*staleReplace{}
 )
 
 // staleServeEligible reports whether ctx's resolve may be served stale: a
@@ -338,26 +348,60 @@ func goReplaceStaleDependent(sink *cache.StaleServeSink) {
 }
 
 // replaceStaleDependent re-resolves one committed dependent cell at once and
-// publishes its /refreshes signal. A cell the re-resolve did not replace is
-// evicted (compare-and-evict), so the refetch is a fresh fill rather than a
-// hit on the same stale body. A tab that arms after this publish is served
-// by the owed-push mark at arm time (cache.SubscribeRefreshStream).
+// publishes its /refreshes signal. Why a re-resolve did not replace the cell
+// decides what happens to it (architect ruling, #710 PR-2b):
+//
+//   - it COMPLETED but its Put was DECLINED (stage error, external / UAF /
+//     sensitive / ext-TTL, or no handler for the class): the stale-derived cell
+//     is compare-and-evicted, so the pushed refetch is a miss that fills from
+//     the now-fresh content rather than a hit on the same stale body;
+//   - it FAILED (transport, timeout, ctx, a resolve error): the cell is KEPT
+//     (#547: a failed revalidation keeps serving, never evicts) and the replace
+//     retries on #690's backoff, non-droppable; past 10 s it is counted
+//     overdue once (scanStaleOverdue).
+//
+// A tab that arms after this publish is served by the owed-push mark at arm
+// time (cache.SubscribeRefreshStream).
 func replaceStaleDependent(sink *cache.StaleServeSink) {
 	l1Key := sink.L1Key()
-	store := cache.ResolvedCache()
-	if store == nil {
-		return
-	}
-	//serve-probe: D2 replace — identity of the dependent cell (pointer compare), serves no body
-	before, _ := store.GetNoTouch(l1Key)
-	ctx, cancel := context.WithTimeout(context.Background(), cache.DemandRevalidationDeadline())
-	err := cache.RunRefreshNow(ctx, l1Key)
-	cancel()
-	//serve-probe: D2 replace — was the dependent cell replaced (pointer compare), serves no body
-	after, _ := store.GetNoTouch(l1Key)
-	if err != nil || (after != nil && after == before) {
-		staleDependentUnresolved.Add(1)
-		store.EvictStaleDerived(l1Key, after)
+	staleDebtsMu.Lock()
+	staleReplacing[sink] = &staleReplace{key: l1Key, servedAt: sink.ServedAt()}
+	staleDebtsMu.Unlock()
+	defer func() {
+		staleDebtsMu.Lock()
+		delete(staleReplacing, sink)
+		staleDebtsMu.Unlock()
+	}()
+	backoff := staleDebtBackoffMin
+	for {
+		store := cache.ResolvedCache()
+		if store == nil {
+			return
+		}
+		//serve-probe: D2 replace — identity + StaleDerived of the dependent cell, serves no body
+		before, ok := store.GetNoTouch(l1Key)
+		if !ok || before == nil || !before.StaleDerived {
+			break // evicted (the refetch fills) or already replaced by another writer
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), cache.DemandRevalidationDeadline())
+		err := cache.RunRefreshNow(ctx, l1Key)
+		cancel()
+		if err == nil || errors.Is(err, cache.ErrRefreshNowNoHandler) {
+			//serve-probe: D2 replace — was the dependent cell replaced (pointer compare), serves no body
+			if after, _ := store.GetNoTouch(l1Key); after == before {
+				staleDependentUnresolved.Add(1)
+				store.EvictStaleDerived(l1Key, before)
+			}
+			break
+		}
+		if errors.Is(err, cache.ErrRefreshNowNoEntry) {
+			break // evicted between the read and the re-resolve
+		}
+		staleReplaceRetries.Add(1)
+		if !staleDebtSleep(backoff) {
+			return // quiesced (test reset only)
+		}
+		backoff = min(2*backoff, staleDebtBackoffMax)
 	}
 	if cache.HasRefreshSubscriber(l1Key) {
 		stalePushTotal.Add(1)
@@ -402,8 +446,29 @@ func scanStaleOverdue() {
 			newly = append(newly, d)
 		}
 	}
+	var newlyRe []*staleReplace
+	for _, r := range staleReplacing {
+		if r.servedAt.IsZero() {
+			continue
+		}
+		age := now.Sub(r.servedAt).Milliseconds()
+		oldest = max(oldest, age)
+		if !r.overdue && age >= staleMaxMS {
+			r.overdue = true
+			newlyRe = append(newlyRe, r)
+		}
+	}
 	staleDebtOldestAge.Store(oldest)
 	staleDebtsMu.Unlock()
+	for _, r := range newlyRe {
+		staleOverdueTotal.Add(1)
+		slog.Warn("apistage.stale_replace_overdue",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", r.key),
+			slog.Int64("age_ms", now.Sub(r.servedAt).Milliseconds()),
+			slog.String("effect", "a stale-served customer cell has not been replaced within the 10 s bar; its re-resolve keeps failing and is retried (the cell is kept, never evicted on failure)"),
+		)
+	}
 	for _, d := range newly {
 		staleOverdueTotal.Add(1)
 		slog.Warn("apistage.stale_debt_overdue",
@@ -428,11 +493,13 @@ var (
 	stalePushTotal           atomic.Uint64
 	stalePushUnarmed         atomic.Uint64
 	staleDependentUnresolved atomic.Uint64
+	// staleReplaceRetries counts failed dependent re-resolves retried.
+	staleReplaceRetries atomic.Uint64
 	// staleServeWithdrawnUnarmable is stale_serve_withdrawn_total{reason=
 	// "unarmable"}: a stale serve whose Put was declined, re-run fresh.
 	staleServeWithdrawnUnarmable atomic.Uint64
-	staleServeAgeHist        = newMSHistogramBounds(StaleToPushBoundsMS)
-	staleToPushHist          = newMSHistogramBounds(StaleToPushBoundsMS)
+	staleServeAgeHist            = newMSHistogramBounds(StaleToPushBoundsMS)
+	staleToPushHist              = newMSHistogramBounds(StaleToPushBoundsMS)
 
 	// staleDebtWG joins every debt goroutine (tests wait it out).
 	staleDebtWG sync.WaitGroup
@@ -472,6 +539,7 @@ func quiesceStaleDebts() {
 	staleDebtWG.Wait()
 	staleDebtsMu.Lock()
 	staleDebts = map[string]*staleDebt{}
+	staleReplacing = map[*cache.StaleServeSink]*staleReplace{}
 	staleDebtsMu.Unlock()
 	staleDebtOpen.Store(0)
 	staleDebtStopMu.Lock()
@@ -493,12 +561,15 @@ type StaleServeStats struct {
 	DependentUnresolved uint64
 	// WithdrawnUnarmable is stale_serve_withdrawn_total{reason="unarmable"}.
 	WithdrawnUnarmable uint64
+	// ReplaceRetries is stale_replace_retries_total: failed dependent
+	// re-resolves retried (the cell kept, never evicted on failure).
+	ReplaceRetries uint64
 	// Owed is the owed-push mark family (cache.StaleOwedStats): open marks,
 	// marks dropped by the L1-capacity bound (a guarantee failure, expected
 	// 0), pushes emitted at arm time, marks cleared by a delivered publish.
 	Owed     cache.StaleOwedStats
 	ServeAge ContentFillDurationStats
-	ToPush              ContentFillDurationStats
+	ToPush   ContentFillDurationStats
 }
 
 // StaleServeStatsSnapshot returns the family's state.
@@ -513,6 +584,7 @@ func StaleServeStatsSnapshot() StaleServeStats {
 		PushUnarmed:         stalePushUnarmed.Load(),
 		DependentUnresolved: staleDependentUnresolved.Load(),
 		WithdrawnUnarmable:  staleServeWithdrawnUnarmable.Load(),
+		ReplaceRetries:      staleReplaceRetries.Load(),
 		Owed:                cache.StaleOwedStatsSnapshot(),
 		ServeAge:            staleServeAgeHist.snapshot(),
 		ToPush:              staleToPushHist.snapshot(),
@@ -565,6 +637,9 @@ func registerStaleExpvar() {
 		expvar.Publish("snowplow_apistage_stale_dependent_unresolved_total", expvar.Func(func() any {
 			return staleDependentUnresolved.Load()
 		}))
+		expvar.Publish("snowplow_apistage_stale_replace_retries_total", expvar.Func(func() any {
+			return staleReplaceRetries.Load()
+		}))
 		expvar.Publish("snowplow_apistage_stale_serve_withdrawn_total", expvar.Func(func() any {
 			return map[string]uint64{"unarmable": staleServeWithdrawnUnarmable.Load()}
 		}))
@@ -606,6 +681,7 @@ func ResetStaleServeForTest() {
 	quiesceStaleDebts()
 	cache.ResetStaleOwedForTest()
 	staleServeWithdrawnUnarmable.Store(0)
+	staleReplaceRetries.Store(0)
 	staleServeTotal.Store(0)
 	staleDebtOpen.Store(0)
 	staleDebtRetries.Store(0)

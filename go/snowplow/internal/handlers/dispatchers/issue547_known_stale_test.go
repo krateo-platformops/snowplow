@@ -348,9 +348,11 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 	rctx, rcancel := context.WithCancel(context.Background())
 	cache.StartRefresher(rctx)
 	t.Cleanup(func() { rcancel(); cache.ResetRefresherForTest() })
-	// #710 PR-2b — registered LAST so it runs FIRST: a D2 debt's goroutines
-	// (refill, push delivery) finish before the refresher and store go away.
-	t.Cleanup(restactionsapi.WaitStaleDebtsForTest)
+	// #710 PR-2b — each arm starts from a zeroed D2 family (counters, debts,
+	// owed marks); registered LAST so it runs FIRST: the D2 goroutines (refill,
+	// replace) are stopped and joined before the refresher and store go away.
+	restactionsapi.ResetStaleServeForTest()
+	t.Cleanup(restactionsapi.ResetStaleServeForTest)
 	return h
 }
 

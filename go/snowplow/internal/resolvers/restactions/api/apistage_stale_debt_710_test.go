@@ -19,6 +19,10 @@
 //   - D2-12 a debt overdue past 10 s is counted once.
 //   - D2-18 a substrate fill (re-scoped L1 key) under an armable resolve
 //     reads through: no stale body is baked into an intermediate cell.
+//   - D2-3c a FAILED dependent re-resolve keeps the cell (never evicted on
+//     failure, #547), retries on backoff, is counted overdue once past 10 s,
+//     and pushes the fresh body once it recovers.
+//   - D2-3d the compare-and-evict never evicts a NEWER entry.
 //   - D2-16 a tab that arms after the replacement was published still gets
 //     its refresh, at arm time (the owed-push mark); D2-16b also when the
 //     replacement was evicted before the arm.
@@ -46,9 +50,13 @@ type d2Fixture struct {
 	contentKey string
 	rereso     atomic.Int64
 	unsubs     []func()
-	failRe     atomic.Bool
-	sinksMu    sync.Mutex
-	sinks      map[string]*cache.StaleServeSink
+	// declineRe: the dependent re-resolve COMPLETES but stores nothing (a
+	// declined Put). failReN: it FAILS (a transport error) while non-zero,
+	// decrementing; negative = always.
+	declineRe atomic.Bool
+	failReN   atomic.Int32
+	sinksMu   sync.Mutex
+	sinks     map[string]*cache.StaleServeSink
 }
 
 func newD2Fixture(t *testing.T) *d2Fixture {
@@ -68,8 +76,14 @@ func newD2Fixture(t *testing.T) *d2Fixture {
 	// The dependent re-resolve (resolveAndPopulateL1's shape): re-Put, publish.
 	cache.RegisterRefreshFunc("restactions", func(_ context.Context, key string, in cache.ResolvedKeyInputs) error {
 		f.rereso.Add(1)
-		if f.failRe.Load() {
-			return errors.New("re-resolve declined")
+		if n := f.failReN.Load(); n != 0 {
+			if n > 0 {
+				f.failReN.Add(-1)
+			}
+			return errors.New("re-resolve transport failure (injected)")
+		}
+		if f.declineRe.Load() {
+			return nil // completed, Put declined
 		}
 		f.store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":true}`), Inputs: &in})
 		cache.PublishRefresh(key)
@@ -183,7 +197,7 @@ func TestStale710_D2_2_FillCommitPushesTheArmedDependent(t *testing.T) {
 
 func TestStale710_D2_3_PushSurvivesAReResolveThatDoesNotPut(t *testing.T) {
 	f := newD2Fixture(t)
-	f.failRe.Store(true)
+	f.declineRe.Store(true)
 	keys, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-3": {}})
 	defer unsub()
 	f.customer(t, "dep-3")
@@ -469,7 +483,7 @@ func TestStale710_D2_16b_ALateArmAfterTheReplacementWasEvictedStillGetsTheRefres
 // Mutation → RED: drop the EvictStaleDerived call.
 func TestStale710_D2_3b_AnUnreplacedStaleDerivedCellIsEvictedSoTheRefetchIsFresh(t *testing.T) {
 	f := newD2Fixture(t)
-	f.failRe.Store(true)
+	f.declineRe.Store(true)
 	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-3b": {}})
 	defer unsub()
 	f.customer(t, "dep-3b")
@@ -480,5 +494,68 @@ func TestStale710_D2_3b_AnUnreplacedStaleDerivedCellIsEvictedSoTheRefetchIsFresh
 	}
 	if st := StaleServeStatsSnapshot(); st.DependentUnresolved != 1 {
 		t.Fatalf("D2-3b: dependent_unresolved=%d, want 1", st.DependentUnresolved)
+	}
+}
+
+// D2-3c — a FAILED dependent re-resolve (transport error) keeps the
+// stale-derived cell resident (#547: never evict on failure), retries on
+// #690's backoff, counts overdue once past 10 s (seamed clock), and once it
+// recovers pushes the FRESH body.
+// Mutation → RED: evict on failure too (treat err != nil like a decline).
+func TestStale710_D2_3c_AFailedReplaceKeepsTheCellRetriesAndPushesOnRecovery(t *testing.T) {
+	f := newD2Fixture(t)
+	f.failReN.Store(-1)
+	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-3c": {}})
+	defer unsub()
+	f.customer(t, "dep-3c")
+	f.storeAndCommit("dep-3c")
+	if !fill710WaitFor(10*time.Second, func() bool { return StaleServeStatsSnapshot().ReplaceRetries >= 2 }) {
+		t.Fatalf("D2-3c: the failed replace was not retried (%+v)", StaleServeStatsSnapshot())
+	}
+	e, ok := f.store.GetNoTouch("dep-3c")
+	if !ok || !e.StaleDerived {
+		t.Fatalf("D2-3c RED: a FAILED re-resolve evicted the cell (resident=%v) — #547: a failed revalidation keeps serving, never evicts", ok)
+	}
+	ov0 := StaleServeStatsSnapshot().OverdueTotal
+	base := time.Now()
+	setStaleClockForTest(func() time.Time { return base.Add(11 * time.Second) })
+	t.Cleanup(func() { setStaleClockForTest(nil) })
+	if !fill710WaitFor(5*time.Second, func() bool { return StaleServeStatsSnapshot().OverdueTotal > ov0 }) {
+		t.Fatalf("D2-3c: a replace failing past 10 s was not counted overdue (%+v)", StaleServeStatsSnapshot())
+	}
+	time.Sleep(600 * time.Millisecond) // more scans: still exactly once
+	if d := StaleServeStatsSnapshot().OverdueTotal - ov0; d != 1 {
+		t.Fatalf("D2-3c: overdue counted %d times for one failing replace, want once", d)
+	}
+	f.failReN.Store(0) // recovery
+	d2Push(t, ch, "dep-3c", 10*time.Second)
+	e, ok = f.store.GetNoTouch("dep-3c")
+	if !ok || e.StaleDerived || string(e.RawJSON) != `{"fresh":true}` {
+		t.Fatalf("D2-3c: after recovery the cell is resident=%v staleDerived=%v — want the fresh replacement", ok, ok && e.StaleDerived)
+	}
+	if st := StaleServeStatsSnapshot(); st.DependentUnresolved != 0 {
+		t.Fatalf("D2-3c: dependent_unresolved=%d, want 0 (a failure is not a decline)", st.DependentUnresolved)
+	}
+}
+
+// D2-3d — EvictStaleDerived is compare-and-evict: it never removes a NEWER
+// entry than the one the replace decided on.
+// Mutation → RED: evict by key without the identity check.
+func TestStale710_D2_3d_TheCompareAndEvictNeverEvictsANewerEntry(t *testing.T) {
+	store := newD2Fixture(t).store
+	in := &cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Namespace: "d2", Name: "dep-3d"}
+	store.Put("dep-3d", &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":false}`), Inputs: in, StaleDerived: true})
+	old, _ := store.GetNoTouch("dep-3d")
+	store.Put("dep-3d", &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":true}`), Inputs: in})
+	t.Cleanup(func() { store.DeleteForTest("dep-3d") })
+	if store.EvictStaleDerived("dep-3d", old) {
+		t.Fatalf("D2-3d RED: the compare-and-evict removed a newer entry")
+	}
+	if e, ok := store.GetNoTouch("dep-3d"); !ok || string(e.RawJSON) != `{"fresh":true}` {
+		t.Fatalf("D2-3d: the newer entry is gone (resident=%v)", ok)
+	}
+	cur, _ := store.GetNoTouch("dep-3d")
+	if store.EvictStaleDerived("dep-3d", cur) {
+		t.Fatalf("D2-3d: a non-stale-derived entry was evicted")
 	}
 }

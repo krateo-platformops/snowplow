@@ -65,9 +65,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #547 — a demand revalidation re-enters this handler on a detached copy of
 	// a request that was already served (demand_revalidate.go): no customer is
 	// waiting on it and its caller was already observed.
-	demand := isDemandRevalidation(req)
+	// #710 PR-2b — likewise a withdrawn stale serve's re-run (see restactions.go).
+	demand := isDemandRevalidation(req) || isStaleRerun(req)
 	if demand {
 		pcs.l1Hit = "revalidate"
+		if isStaleRerun(req) {
+			pcs.l1Hit = "stale_rerun"
+		}
 	} else {
 		// Ship 1 — customer-priority signal (see restactions.go). Marks this
 		// /call as in-flight so the prewarm engine yields its background
