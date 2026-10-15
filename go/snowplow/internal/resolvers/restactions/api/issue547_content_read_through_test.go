@@ -156,7 +156,7 @@ func TestIssue547_F3_KnownStaleContentCellIsReadThroughNeverServedStale(t *testi
 		{"background", cache.WithBackgroundResolve(r1Ctx())},
 	}
 	for _, r := range reads {
-		v, served, ok := apistageContentServe(r.ctx, store, r1GetCall(), false)
+		v, served, ok, _ := apistageContentServe(r.ctx, store, r1GetCall(), false)
 		if !ok || !served {
 			t.Fatalf("%s: the read was not served (ok=%v served=%v)", r.name, ok, served)
 		}

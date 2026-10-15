@@ -1495,6 +1495,62 @@ func registerContentFillInstruments(m metric.Meter) error {
 		return err
 	}
 	restactionsapi.SetContentFillDurationRecorder(func(ms int64) { duration.Record(context.Background(), ms) })
+	// #710 PR-2a — the memory admission gate. `class` is the closed admission
+	// class set {background, customer}.
+	admWait, err := m.Int64Histogram("snowplow_apistage_content_fill_admission_wait_ms",
+		metric.WithDescription("One content-fill flight's wait for memory admission under the shared AdmissionCeiling (ms), by the class it admitted at {background, customer}. #710 PR-2a."),
+		metric.WithUnit("ms"),
+		metric.WithExplicitBucketBoundaries(int64sToFloat64s(restactionsapi.ContentFillDurationBoundsMS)...),
+	)
+	if err != nil {
+		return err
+	}
+	restactionsapi.SetContentFillAdmissionWaitRecorder(func(ms int64, class string) {
+		admWait.Record(context.Background(), ms, metric.WithAttributes(attribute.String("class", class)))
+	})
+	admQueued, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_admission_queued",
+		metric.WithDescription("Content-fill flights waiting for memory admission now, by class (only background queues: users never wait). #710 PR-2a."))
+	if err != nil {
+		return err
+	}
+	admTimeout, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_admission_timeout_total",
+		metric.WithDescription("Background content-fill flights not admitted before the write deadline (their refresher/prewarm readers get a 503 stage error and the cell keeps serving; D1). Customer and debt fills never queue. By class. #710 PR-2a."))
+	if err != nil {
+		return err
+	}
+	admWeight, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_admission_inflight_weight",
+		metric.WithDescription("Estimated bytes (raw envelope × calibrated decode expansion) of the content fills admitted now. #710 PR-2a."),
+		metric.WithUnit("By"))
+	if err != nil {
+		return err
+	}
+	admOver, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_admission_over_ceiling_bytes",
+		metric.WithDescription("How far the admitted content-fill weight sits past the shared ceiling now: customer and debt fills never queue (owner ruling: no one waits in queue) but still count, so this is the excursion they cause. The early warning for the accepted memory residual (#710 ruling 2); 0 when they fit."),
+		metric.WithUnit("By"))
+	if err != nil {
+		return err
+	}
+	admOverPeak, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_admission_over_ceiling_bytes_peak",
+		metric.WithDescription("High-water mark of snowplow_apistage_content_fill_admission_over_ceiling_bytes since boot. #710."),
+		metric.WithUnit("By"))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		a := restactionsapi.ContentFillAdmissionStatsSnapshot()
+		for _, c := range restactionsapi.ContentFillAdmissionClasses() {
+			attrs := metric.WithAttributes(attribute.String("class", c))
+			o.ObserveInt64(admQueued, a.Queued[c], attrs)
+			o.ObserveInt64(admTimeout, int64(a.Timeout[c]), attrs)
+		}
+		o.ObserveInt64(admWeight, a.InflightWeight)
+		o.ObserveInt64(admOver, a.OverCeiling)
+		o.ObserveInt64(admOverPeak, a.OverCeilingPk)
+		return nil
+	}, admQueued, admTimeout, admWeight, admOver, admOverPeak)
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		s := restactionsapi.ContentFillStatsSnapshot()
 		for _, r := range restactionsapi.ContentFillReasons() {

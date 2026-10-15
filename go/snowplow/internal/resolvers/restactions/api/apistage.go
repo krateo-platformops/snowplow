@@ -34,6 +34,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -452,12 +453,43 @@ func (c callPathVerb) GetVerb() string {
 // downstream — the two narrowings DIVERGE for real UAF steps (verb/resource/
 // namespace-source differ), so applying raw RBAC to a UAF step would wrongly
 // strip the UAF-intended scope (the Diego/arch UAF verdict).
+//
+// #710 PR-2a — err is non-nil only when the call's content fill could not be
+// admitted under the memory ceiling before its deadline
+// (ErrContentFillAdmissionTimeout, D1): the caller records a stage error. It
+// must NOT fall through to another dispatch branch, which would rebuild the
+// whole list the gate refused.
+//
+// A JOINER of a flight that was never admitted, whose own ctx is still alive,
+// does not inherit that failure — someone else's deadline produced it. It makes
+// one more attempt: a hit if the pressure cleared and a cell landed, else a
+// flight of its own (or a fresh one it joins), under its own budget.
 func apistageContentServe(
 	ctx context.Context,
 	store *cache.ResolvedCacheStore,
 	call httpcall.RequestOptions,
 	uafActive bool,
-) (value any, served bool, ok bool) {
+) (value any, served bool, ok bool, err error) {
+	value, served, ok, err = apistageContentServeAttempt(ctx, store, call, uafActive, true)
+	if errors.Is(err, errInheritedAdmissionTimeout) {
+		value, served, ok, err = apistageContentServeAttempt(ctx, store, call, uafActive, false)
+	}
+	return value, served, ok, err
+}
+
+// errInheritedAdmissionTimeout is a joiner's signal to retry (never returned
+// from apistageContentServe).
+var errInheritedAdmissionTimeout = errors.New("apistage content fill: joined flight was not admitted")
+
+// apistageContentServeAttempt is one attempt of apistageContentServe.
+// mayRetry lets a joiner of a never-admitted flight ask for a second attempt.
+func apistageContentServeAttempt(
+	ctx context.Context,
+	store *cache.ResolvedCacheStore,
+	call httpcall.RequestOptions,
+	uafActive bool,
+	mayRetry bool,
+) (value any, served bool, ok bool, err error) {
 	log := xcontext.Logger(ctx)
 
 	// Ship 0.30.193 Checkpoint 3 — per-call apistageContentServe
@@ -485,11 +517,11 @@ func apistageContentServe(
 	// same shape dispatchViaInformer can serve. A write verb or a
 	// non-apiserver path is not a content unit.
 	if ptr.Deref(call.Verb, http.MethodGet) != http.MethodGet {
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path)
 	if !parseOK {
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	isList := name == ""
 	// #618 — classify the query BEFORE any cell is read or written. A query
@@ -501,7 +533,7 @@ func apistageContentServe(
 	if !query.applicable {
 		recordListQuery(query)
 		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerListQuery, gvr.String())
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	contentKey := cache.ComputeKey(contentKeyInputsQ(gvr, ns, name, query.canon))
 
@@ -696,10 +728,19 @@ func apistageContentServe(
 		// and shared parsed items through this reader's own gate below, exactly as a
 		// content HIT serves entry.Items.
 		res, ok := flight.wait(ctx)
+		if res.err != nil {
+			// #710 PR-2a (D1) — the flight was never admitted. Its leader's
+			// deadline, not this reader's: while this reader's own request is
+			// alive it tries once more (apistageContentServe); else it errors.
+			if mayRetry && ctx.Err() == nil {
+				return nil, false, false, errInheritedAdmissionTimeout
+			}
+			return nil, false, true, res.err
+		}
 		if !ok {
 			// The flight was not servable (its leader fell through too), or this
 			// reader's own ctx ended while it waited.
-			return nil, false, false
+			return nil, false, false, nil
 		}
 		envelope, parsed, haveParsed = res.envelope, res.parsed, res.haveParsed
 		if res.stored {
@@ -742,6 +783,25 @@ func apistageContentServe(
 		fill := beginContentFill(ctx, contentKey, gvr.String(), ns, isList, fillReason)
 		defer fill.end()
 		fillLabels := fill.pprofLabels()
+		// #710 PR-2a — memory admission for this flight (apistage_fill_admission.go),
+		// BEFORE the dispatch builds the envelope: a queued flight holds a ticket,
+		// never a parked envelope. It waits with a PREDICTED weight (the resident
+		// cell's raw size, else the partition's item count × the GVR's bytes per
+		// item, …), bounded by the detached fill ctx (the write deadline), while
+		// the fills in flight would exceed the shared ceiling. Joiners pay nothing.
+		gate := theContentFillGate()
+		if aerr := gate.admit(ctx, flight.ticket, gvr.String(), predictFillRaw(store, contentKey, gvr, ns, isList)); aerr != nil {
+			// D1 — never admitted before the deadline: this reader and every
+			// joiner error. Nothing is dispatched, stored or served stale.
+			flight.complete(contentFlightResult{err: aerr})
+			return nil, false, true, aerr
+		}
+		admitted := true
+		defer func() {
+			if admitted {
+				gate.release(flight.ticket, false) // an early exit: nothing decoded
+			}
+		}()
 		var dispatched []byte
 		var dispatchedOK bool
 		pprof.Do(ctx, fillLabels, func(ctx context.Context) {
@@ -751,9 +811,11 @@ func apistageContentServe(
 		if !dispatchedOK {
 			// Not pivot-servable — the content layer cannot serve it.
 			fill.notServable()
-			return nil, false, false
+			return nil, false, false, nil
 		}
 		fill.dispatched(dispatched)
+		// The exact size is known: the held weight becomes exact, in place.
+		gate.reconcile(flight.ticket, int64(len(dispatched)))
 		envelope = dispatched
 		// uaf-scope-waiver: PRE-refilter substrate, same reasoning as cluster_list.go — the raw per-K8s-call envelope, identity-free by key, narrowed only downstream on the way to the requester. Never holds refilter output.
 		// scope-waiver:TTLOverride: apistage identity-free content substrate — sets its OWN data-plane CATALOG_UNSERVABLE TTLOverride CONDITIONALLY on newEntry below (not a keyed literal element); NOT the UAF-cap class (no BindingUID / no per-user refilter output) — uaf_shortttl.go R-d-4 SITE MAP.
@@ -785,6 +847,7 @@ func apistageContentServe(
 			})
 			if parseOK {
 				fill.parsed(len(p.items))
+				gate.noteItems(gvr.String(), int64(len(dispatched)), len(p.items))
 				newEntry.Items = p.items
 				newEntry.ItemsAPIVersion = p.apiVersion
 				newEntry.ItemsKind = p.kind
@@ -835,6 +898,10 @@ func apistageContentServe(
 		}
 		// #710 — the fill's duration: dispatch start to parse + Put done.
 		fill.done()
+		// #710 PR-2a — the decoded tree is stored (live heap the ceiling reads) or
+		// dropped: release the admission, calibrating this GVR's expansion.
+		gate.release(flight.ticket, true)
+		admitted = false
 		// #710 PR-1 — hand the result to the joiners now: the envelope and the
 		// parsed items are immutable from here on.
 		flight.complete(contentFlightResult{
@@ -852,7 +919,7 @@ func apistageContentServe(
 		// Prewarm: no requester — populate the content entry only, do not
 		// gate or feed dict[id]. served=false tells the caller not to use
 		// the bytes (the prewarm resolve discards dict).
-		return nil, false, true
+		return nil, false, true, nil
 	}
 	// R3: a LIST with pre-parsed items gates unmarshal-free; everything
 	// else (GET-by-name, or a LIST whose envelope failed to pre-parse)
@@ -901,9 +968,9 @@ func apistageContentServe(
 	}
 	if !gateOK {
 		// Fail-closed — no identity / GET denied. Fall through to apiserver.
-		return nil, false, true
+		return nil, false, true, nil
 	}
-	return gated, true, true
+	return gated, true, true, nil
 }
 
 // serveParsedListEnvelope returns the cell's pre-parsed list items as

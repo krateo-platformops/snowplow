@@ -116,7 +116,7 @@ func TestContentFill710_SF1_KnownStaleHerd_64Readers_OneFlight(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			v, served, ok := apistageContentServe(fill710CtxAs(users[i]), store, fill710ListCall(), false)
+			v, served, ok, _ := apistageContentServe(fill710CtxAs(users[i]), store, fill710ListCall(), false)
 			out[i] = fill710Served{v, served, ok}
 		}(i)
 	}
@@ -203,7 +203,7 @@ func TestContentFill710_SF2_ReaderWithNewerEpochDoesNotJoinOlderFlight(t *testin
 	serve := func() chan fill710Served {
 		ch := make(chan fill710Served, 1)
 		go func() {
-			v, served, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+			v, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 			ch <- fill710Served{v, served, ok}
 		}()
 		return ch
@@ -312,7 +312,7 @@ func TestContentFill710_SF3_CancelledLeaderDoesNotFailJoiners(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			v, served, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+			v, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 			out[i] = fill710Served{v, served, ok}
 		}(i)
 	}
@@ -320,7 +320,7 @@ func TestContentFill710_SF3_CancelledLeaderDoesNotFailJoiners(t *testing.T) {
 	quitterCtx, quit := context.WithCancel(r1Ctx())
 	quitter := make(chan fill710Served, 1)
 	go func() {
-		v, served, ok := apistageContentServe(quitterCtx, store, fill710ListCall(), false)
+		v, served, ok, _ := apistageContentServe(quitterCtx, store, fill710ListCall(), false)
 		quitter <- fill710Served{v, served, ok}
 	}()
 	if !fill710WaitFor(10*time.Second, func() bool { return ContentFillStatsSnapshot().JoinWaiting == joiners+1 }) {

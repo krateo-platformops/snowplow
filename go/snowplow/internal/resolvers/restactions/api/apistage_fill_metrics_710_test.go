@@ -163,7 +163,7 @@ func fill710MakeKnownStale(t *testing.T, dyn dynamic.Interface, store *cache.Res
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
 	cache.ResetRefresherForTest()
 
-	if _, served, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("PRECONDITION: the cold LIST read was not served (ok=%v served=%v)", ok, served)
 	}
 	key := fill710ListKey()
@@ -208,7 +208,7 @@ func TestContentFill710_AbsentFillCountsBytesAndItemsAndAHitMovesNothing(t *test
 	fill710Reset(t)
 	envLen := fill710SpyDispatch(t, nil, nil, nil)
 
-	if _, served, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("cold read not served (ok=%v served=%v)", ok, served)
 	}
 	s := ContentFillStatsSnapshot()
@@ -248,7 +248,7 @@ func TestContentFill710_AbsentFillCountsBytesAndItemsAndAHitMovesNothing(t *test
 	}
 
 	// A second read is a content HIT: no fill.
-	if _, served, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("second read not served")
 	}
 	if s2 := ContentFillStatsSnapshot(); s2.Total["absent"] != 1 || s2.ByGVR[r1FsaGVR.String()].Fills != 1 {
@@ -259,13 +259,13 @@ func TestContentFill710_AbsentFillCountsBytesAndItemsAndAHitMovesNothing(t *test
 func TestContentFill710_RefreshForcedReason(t *testing.T) {
 	newFill710Watcher(t, 3)
 	store := cache.ResolvedCache()
-	if _, served, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("cold read not served")
 	}
 	fill710Reset(t)
 
 	ctx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(r1Ctx()), r1FsaGVR)
-	if _, _, ok := apistageContentServe(ctx, store, fill710ListCall(), false); !ok {
+	if _, _, ok, _ := apistageContentServe(ctx, store, fill710ListCall(), false); !ok {
 		t.Fatalf("refresh re-resolve not content-servable")
 	}
 	s := ContentFillStatsSnapshot()
@@ -286,7 +286,7 @@ func TestContentFill710_NotServableCountsNoBytes(t *testing.T) {
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	dispatchViaInformerFn = func(context.Context, httpcall.RequestOptions) ([]byte, bool) { return nil, false }
 
-	if _, _, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); ok {
+	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); ok {
 		t.Fatalf("a not-servable dispatch must return ok=false")
 	}
 	s := ContentFillStatsSnapshot()
@@ -358,7 +358,7 @@ func TestContentFill710_LogLineIsRateLimitedAndCarriesNoIdentityOrObjectName(t *
 	}}
 	ctx := withContentFillOwner(r1Ctx(), "ra-ns", "ra-name", "stage-a")
 	for _, call := range []httpcall.RequestOptions{fill710ListCall(), getCall} {
-		if _, _, ok := apistageContentServe(ctx, store, call, false); !ok {
+		if _, _, ok, _ := apistageContentServe(ctx, store, call, false); !ok {
 			t.Fatalf("read of %s not content-servable", call.Path)
 		}
 	}
@@ -407,7 +407,7 @@ func TestContentFill710_LogLineIsRateLimitedAndCarriesNoIdentityOrObjectName(t *
 			Path: "/apis/composition.krateo.io/v1/namespaces/" + r1Ns + "/fullstackapps/" + obj,
 			Verb: ptr.To(http.MethodGet),
 		}}
-		if _, _, ok := apistageContentServe(ctx, store, c, false); !ok {
+		if _, _, ok, _ := apistageContentServe(ctx, store, c, false); !ok {
 			t.Fatalf("read of %s not content-servable", c.Path)
 		}
 	}
@@ -437,7 +437,7 @@ func TestContentFill710_ExpvarKeysReadTheLiveCounters(t *testing.T) {
 	store := cache.ResolvedCache()
 	fill710Reset(t)
 	RegisterContentFillExpvarForTest()
-	if _, _, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok {
+	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok {
 		t.Fatalf("cold read not content-servable")
 	}
 	s := ContentFillStatsSnapshot()

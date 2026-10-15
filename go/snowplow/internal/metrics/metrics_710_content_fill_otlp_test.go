@@ -125,3 +125,76 @@ func TestIssue710_ContentFillSeriesReachOTLP(t *testing.T) {
 		t.Fatalf("expvar histogram count %d != OTLP %d — the surfaces diverged", d.Count, hist.Count)
 	}
 }
+
+// TestIssue710_ContentFillAdmissionSeriesReachOTLP — #710 PR-2a: the admission
+// gate's series reach OTLP from the real registration with live values; the
+// only attribute is the closed `class`.
+func TestIssue710_ContentFillAdmissionSeriesReachOTLP(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	restactionsapi.ResetContentFillStatsForTest()
+	t.Cleanup(restactionsapi.ResetContentFillStatsForTest)
+	t.Cleanup(func() { restactionsapi.SetContentFillAdmissionWaitRecorder(nil) })
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	if err := registerInstruments(mp.Meter(meterName), "deadbeef"); err != nil {
+		t.Fatalf("registerInstruments: %v", err)
+	}
+	classes := restactionsapi.ContentFillAdmissionClasses()
+	for i, c := range classes {
+		if !restactionsapi.AddContentFillAdmissionForTest(c, int64(3+i), uint64(5+i), 0) {
+			t.Fatalf("AddContentFillAdmissionForTest(%q): not a class of the set", c)
+		}
+	}
+	restactionsapi.AddContentFillAdmissionForTest(classes[0], 0, 0, 9999)
+	restactionsapi.RecordContentFillAdmissionWaitForTest(classes[1], 42)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	all := flatten(rm)
+	for name, base := range map[string]int64{
+		"snowplow_apistage_content_fill_admission_queued":        3,
+		"snowplow_apistage_content_fill_admission_timeout_total": 5,
+	} {
+		pts := pointsFor(all, name)
+		if len(pts) != len(classes) {
+			t.Fatalf("%s: %d series, want one per class (%d)", name, len(pts), len(classes))
+		}
+		for _, p := range pts {
+			idx := -1
+			for i, c := range classes {
+				if p.attrs["class"] == c {
+					idx = i
+				}
+			}
+			if idx < 0 || len(p.attrs) != 1 {
+				t.Fatalf("%s: attributes %v, want exactly a closed-set class", name, p.attrs)
+			}
+			if p.value != base+int64(idx) {
+				t.Fatalf("%s{class=%s} = %d, want %d", name, classes[idx], p.value, base+int64(idx))
+			}
+		}
+	}
+	if pts := pointsFor(all, "snowplow_apistage_content_fill_admission_inflight_weight"); len(pts) != 1 || pts[0].value != 9999 {
+		t.Fatalf("admission_inflight_weight = %+v, want one point of 9999", pts)
+	}
+	for _, name := range []string{"snowplow_apistage_content_fill_admission_over_ceiling_bytes", "snowplow_apistage_content_fill_admission_over_ceiling_bytes_peak"} {
+		if pts := pointsFor(all, name); len(pts) != 1 || len(pts[0].attrs) != 0 {
+			t.Fatalf("%s = %+v, want one attribute-free point", name, pts)
+		}
+	}
+	var count uint64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if h, ok := m.Data.(metricdata.Histogram[int64]); ok && m.Name == "snowplow_apistage_content_fill_admission_wait_ms" && len(h.DataPoints) == 1 {
+				count = h.DataPoints[0].Count
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("admission_wait_ms histogram count = %d, want 1", count)
+	}
+}
