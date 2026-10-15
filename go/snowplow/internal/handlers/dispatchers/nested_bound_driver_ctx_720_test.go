@@ -18,10 +18,22 @@ package dispatchers
 // depends on turns its arm RED.
 //
 // The census below closes the other half: every production call site of a
-// resolver entry in this package is classified (customer, nested, seam, or the
-// background driver arm that proves it). A NEW resolve call site — a new
-// background root — fails the census until it is classified, and a background
-// classification must name a driver arm that exists in driverCtxArms720.
+// resolver entry in the WHOLE MODULE is classified (customer, nested, seam,
+// chain, or the background driver arm that proves it). A NEW resolve call site
+// — a new background root, in any package — fails the census until it is
+// classified, and a background classification must name a driver arm that
+// exists in driverCtxArms720.
+//
+// #728 — the census used to scan only this package and to recognise a call by
+// the package IDENTIFIER (restactions / widgets). A root added in another
+// package, through apiref.Resolve or api.Resolve, or through an import alias,
+// went unseen and classified CUSTOMER at run time, bypassing the nested cap.
+// It now walks every non-test .go file of the module and recognises a call by
+// the callee's IMPORT PATH (resolverEntries728). Widening the census was chosen
+// over a required origin argument at the resolve entry: the latter changes
+// every resolver signature and every nested in-resolve call for a coverage gap
+// a test closes, and the census already proves each background driver's ctx
+// through its driver arm.
 //
 // UNTAGGED on purpose (like the #563 / #268 censuses): it runs in ordinary CI.
 
@@ -191,15 +203,24 @@ func TestIssue720_EveryBackgroundDriverCtxIsBackground(t *testing.T) {
 	}
 }
 
-// resolveEntryClass720 classifies one production resolve call site.
+// resolveEntryClass720 classifies one production resolve call site. A site in
+// this package is keyed "<file>:<owner>"; a site elsewhere in the module is keyed
+// by its module-relative path, "internal/…/<file>:<owner>".
 //   - "customer"     — a /call handler: bypasses the gate by owner ruling;
 //   - "nested"       — inside a resolve already in progress: inherits its
 //     caller's ctx and classification (the gate admits only at depth 0);
+//   - "chain"        — a resolver package calling the next resolver of the
+//     same in-progress resolve (widgets → apiref → restactions → api); legal
+//     ONLY for a site under internal/resolvers/;
 //   - "seam"         — the definition of a resolve seam (var fooFn = ...);
 //   - "bg:<driver>[,<driver>]" — a background driver (or several sharing the
 //     site); each <driver> must be a key of driverCtxArms720, whose arm proves
 //     the ctx is classified background.
 var resolveEntryClass720 = map[string]string{
+	// --- the resolver chain: one in-progress resolve calling the next layer ---
+	"internal/resolvers/widgets/resolve.go:resolveApiRef":   "chain",
+	"internal/resolvers/widgets/apiref/resolve.go:Resolve":  "chain",
+	"internal/resolvers/restactions/restactions.go:Resolve": "chain",
 	// --- customer /call handlers: bypass the gate by owner ruling ---
 	"restactions.go:restActionHandler.ServeHTTP": "customer",
 	"widgets.go:widgetsHandler.ServeHTTP":        "customer",
@@ -218,6 +239,9 @@ var resolveEntryClass720 = map[string]string{
 	// --- cohort seed (boot engine + keep-warm reseed) ---
 	"phase1_pip_seed.go:seedOneWidget":                   "bg:cohort_seed",
 	"phase1_pip_seed.go:seedRestactionResolveAndPutProd": "bg:cohort_seed",
+	// #728 — found by the import-path match (apiref.Resolve): the RAFullList
+	// pin, called by seedOneWidget with its seed resolve ctx.
+	"phase1_pip_seed.go:seedRAFullListForWidget": "bg:cohort_seed",
 	// --- discovery walk: the phase-1 boot walk (resolveNavigationRoot) and the
 	// engine's boot re-walk (engineBootRewalkCtx) ---
 	"phase1_walk.go:phase1Walker.walk": "bg:boot_walk,engine_boot",
@@ -228,8 +252,8 @@ var resolveEntryClass720 = map[string]string{
 	"phase1_walk_pagination_jobs.go:recollectPendingApiRefPaginationJobs": "bg:pagination_drain",
 }
 
-// resolveEntryIdents720 are the resolver entries a resolve call site is
-// recognised by: the resolver packages' Resolve, and this package's seams.
+// resolveEntryIdents720 are this package's resolve seams, recognised by name
+// (they are package-local identifiers).
 var resolveEntryIdents720 = map[string]bool{
 	"restactionsResolveFn":    true,
 	"widgetsResolveFn":        true,
@@ -237,36 +261,86 @@ var resolveEntryIdents720 = map[string]bool{
 	"resolveOnceFn":           true,
 }
 
-// TestIssue720_ResolveEntryCensus — every production call site of a resolver
-// entry in this package is classified. A new site (e.g. a new background root
-// that resolves under an unmarked ctx) fails here until it is classified; a
-// "bg:" class must name a driver arm that exists.
-func TestIssue720_ResolveEntryCensus(t *testing.T) {
+// resolverEntries728 are the exported resolver entries, recognised by the
+// callee's IMPORT PATH so an import alias cannot hide a call (#728).
+var resolverEntries728 = map[string]map[string]bool{
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions":     {"Resolve": true},
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets":         {"Resolve": true},
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref":  {"Resolve": true},
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api": {"Resolve": true, "ResolveWithFailure": true},
+}
+
+// moduleRoot728 is the go/snowplow module root, relative to this package.
+const moduleRoot728 = "../../.."
+
+// dispatchersDir728 is this package, module-relative.
+const dispatchersDir728 = "internal/handlers/dispatchers"
+
+// scanResolveSites728 walks every non-test .go file under root and returns the
+// resolve call sites, keyed as resolveEntryClass720 keys them.
+func scanResolveSites728(t *testing.T, root string) map[string]bool {
+	t.Helper()
 	fset := token.NewFileSet()
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read package dir: %v", err)
-	}
 	found := map[string]bool{}
-	for _, e := range entries {
-		fn := e.Name()
-		if e.IsDir() || !strings.HasSuffix(fn, ".go") || strings.HasSuffix(fn, "_test.go") {
-			continue
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-		f, perr := parser.ParseFile(fset, filepath.Join(".", fn), nil, 0)
+		if d.IsDir() {
+			switch d.Name() {
+			case "testdata", "vendor", "node_modules", ".git":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return rerr
+		}
+		rel = filepath.ToSlash(rel)
+		f, perr := parser.ParseFile(fset, path, nil, parser.ImportsOnly|parser.ParseComments)
 		if perr != nil {
-			t.Fatalf("parse %s: %v", fn, perr)
+			return perr
 		}
+		// Map each local package name of a resolver import to its import path.
+		aliases := map[string]string{}
+		for _, im := range f.Imports {
+			ip := strings.Trim(im.Path.Value, `"`)
+			if _, ok := resolverEntries728[ip]; !ok {
+				continue
+			}
+			name := ip[strings.LastIndex(ip, "/")+1:]
+			if im.Name != nil {
+				name = im.Name.Name
+			}
+			aliases[name] = ip
+		}
+		inDispatchers := filepath.ToSlash(filepath.Dir(rel)) == dispatchersDir728
+		if len(aliases) == 0 && !inDispatchers {
+			return nil
+		}
+		f, perr = parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return perr
+		}
+		key := rel
+		if inDispatchers {
+			key = filepath.Base(rel)
+		}
+		isCall := func(n ast.Node) bool { return containsResolveCall728(n, aliases, inDispatchers) }
 		for _, decl := range f.Decls {
-			var owner string
-			var body ast.Node
 			switch d := decl.(type) {
 			case *ast.FuncDecl:
-				owner = d.Name.Name
+				owner := d.Name.Name
 				if d.Recv != nil && len(d.Recv.List) == 1 {
 					owner = recvName720(d.Recv.List[0].Type) + "." + owner
 				}
-				body = d
+				if isCall(d) {
+					found[key+":"+owner] = true
+				}
 			case *ast.GenDecl:
 				for _, spec := range d.Specs {
 					vs, ok := spec.(*ast.ValueSpec)
@@ -274,22 +348,44 @@ func TestIssue720_ResolveEntryCensus(t *testing.T) {
 						continue
 					}
 					for i, n := range vs.Names {
-						if i < len(vs.Values) && containsResolveCall720(vs.Values[i]) {
-							found[fn+":var "+n.Name] = true
+						if i < len(vs.Values) && isCall(vs.Values[i]) {
+							found[key+":var "+n.Name] = true
 						}
 					}
 				}
-				continue
-			default:
-				continue
-			}
-			if containsResolveCall720(body) {
-				found[fn+":"+owner] = true
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
 	}
+	return found
+}
+
+// TestIssue720_ResolveEntryCensus — every production call site of a resolver
+// entry in the module is classified (#720, widened by #728). A new site (e.g. a
+// new background root that resolves under an unmarked ctx, in ANY package)
+// fails here until it is classified; a "bg:" class must name a driver arm that
+// exists; "chain" is legal only inside the resolver packages.
+func TestIssue720_ResolveEntryCensus(t *testing.T) {
+	checkResolveCensus728(t, scanResolveSites728(t, moduleRoot728))
+}
+
+// checkResolveCensus728 checks found against resolveEntryClass720.
+func checkResolveCensus728(t *testing.T, found map[string]bool) {
+	t.Helper()
 	if len(found) < 5 {
 		t.Fatalf("census found only %d resolve call sites (%v) — the scan is broken and cannot fail", len(found), found)
+	}
+	outside := 0
+	for s := range found {
+		if strings.HasPrefix(s, "internal/") {
+			outside++
+		}
+	}
+	if outside == 0 {
+		t.Fatalf("census found no resolve call site outside %s — the module-wide scan is broken (#728)", dispatchersDir728)
 	}
 	sites := make([]string, 0, len(found))
 	for s := range found {
@@ -300,8 +396,8 @@ func TestIssue720_ResolveEntryCensus(t *testing.T) {
 		class, ok := resolveEntryClass720[s]
 		if !ok {
 			t.Errorf("#720 census: resolve call site %s is not classified in resolveEntryClass720 — say whether it "+
-				"is a customer, nested, a seam, or a background driver (bg:<arm>) with a driver arm proving its ctx "+
-				"is classified background by the nested-resolve gate", s)
+				"is a customer, nested, chain, a seam, or a background driver (bg:<arm>) with a driver arm proving "+
+				"its ctx is classified background by the nested-resolve gate", s)
 			continue
 		}
 		if drvs, isBG := strings.CutPrefix(class, "bg:"); isBG {
@@ -309,6 +405,12 @@ func TestIssue720_ResolveEntryCensus(t *testing.T) {
 				if _, ok := driverCtxArms720[drv]; !ok {
 					t.Errorf("#720 census: %s is classified %q but driverCtxArms720 has no %q arm", s, class, drv)
 				}
+			}
+		} else if class == "chain" {
+			if !strings.HasPrefix(s, "internal/resolvers/") {
+				t.Errorf("#728 census: %s is classified \"chain\" but is not inside internal/resolvers/ — only a "+
+					"resolver calling the next layer of the same resolve may be chain; a root elsewhere must be "+
+					"customer or a proven background driver", s)
 			}
 		} else if class != "customer" && class != "nested" && class != "seam" {
 			t.Errorf("#720 census: %s has unknown class %q", s, class)
@@ -333,7 +435,10 @@ func recvName720(e ast.Expr) string {
 	return "?"
 }
 
-func containsResolveCall720(n ast.Node) bool {
+// containsResolveCall728 reports whether n calls a resolver entry: an exported
+// entry through any local name of its import (aliases), or — in this package —
+// one of the resolve seams.
+func containsResolveCall728(n ast.Node, aliases map[string]string, seams bool) bool {
 	hit := false
 	ast.Inspect(n, func(n ast.Node) bool {
 		if hit {
@@ -345,13 +450,14 @@ func containsResolveCall720(n ast.Node) bool {
 		}
 		switch fun := call.Fun.(type) {
 		case *ast.Ident:
-			if resolveEntryIdents720[fun.Name] {
+			if seams && resolveEntryIdents720[fun.Name] {
 				hit = true
 			}
 		case *ast.SelectorExpr:
-			if pkg, ok := fun.X.(*ast.Ident); ok && fun.Sel.Name == "Resolve" &&
-				(pkg.Name == "restactions" || pkg.Name == "widgets") {
-				hit = true
+			if pkg, ok := fun.X.(*ast.Ident); ok {
+				if ip, ok := aliases[pkg.Name]; ok && resolverEntries728[ip][fun.Sel.Name] {
+					hit = true
+				}
 			}
 		}
 		return true
