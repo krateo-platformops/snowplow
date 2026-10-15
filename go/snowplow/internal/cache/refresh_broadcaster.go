@@ -219,6 +219,21 @@ func refreshEvictionBucket() (rate.Limit, int) {
 	return rate.Limit(r), b
 }
 
+// refreshEvictionClock is the eviction bucket's clock. Production reads
+// time.Now; a seam ONLY so a test can hold the time still while it publishes
+// (#707: the pacing arm asserted wall-clock refill against the publisher's
+// speed, and a loaded runner refilled tokens mid-burst). Production never
+// sets it.
+var refreshEvictionClock atomic.Pointer[func() time.Time]
+
+// refreshEvictionNow is the bucket's "now".
+func refreshEvictionNow() time.Time {
+	if f := refreshEvictionClock.Load(); f != nil {
+		return (*f)()
+	}
+	return time.Now()
+}
+
 // refreshSub is one SSE connection's sink. ch is buffered; a full channel
 // DEFERS on both paths (#484: the refresher path used to drop) — the producer
 // never blocks on a slow consumer. keys is the set of l1Keys this connection
@@ -652,7 +667,7 @@ func (s *refreshSub) offerEviction(l1Key string) {
 	}
 	// While a backlog is draining every new key joins the queue (FIFO
 	// fairness; the drain goroutine is the only token consumer then).
-	if !s.draining && s.limiter.Allow() {
+	if !s.draining && s.limiter.AllowN(refreshEvictionNow(), 1) {
 		select {
 		case s.ch <- l1Key:
 			refreshDeliveredTotal.Add(1)
@@ -710,7 +725,8 @@ func (s *refreshSub) drainEvictions() {
 			s.pmu.Unlock()
 			return
 		}
-		delay := s.limiter.Reserve().Delay()
+		now := refreshEvictionNow()
+		delay := s.limiter.ReserveN(now, 1).DelayFrom(now)
 		s.pmu.Unlock()
 
 		if !s.sleepOrDone(delay) {

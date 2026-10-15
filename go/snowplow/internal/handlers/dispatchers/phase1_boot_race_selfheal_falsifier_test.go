@@ -96,6 +96,7 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 	// The typed clientset backing the REAL ConfigMap informer. Start EMPTY —
 	// config-vars is WITHHELD (the boot race).
 	kc := kfake.NewSimpleClientset()
+	watchOpened := configMapWatchOpened(kc)
 	restore := SetConfigVarsWatchClientForTest(kc)
 	t.Cleanup(restore)
 
@@ -146,6 +147,9 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
 	StartConfigVarsWatch(watchCtx, nil, bootRaceNamespace)
+	// Every Create below must land after the WATCH is live: the fake tracker
+	// drops writes made between the informer's LIST and WATCH (#702).
+	awaitConfigMapWatch(t, watchOpened)
 
 	// ── ARM 1 (t0): the race is LOST. config-vars withheld, authn unreachable.
 	// The token exchange must fail (SeedLoopbackTokenErrTotal climbs), and the
