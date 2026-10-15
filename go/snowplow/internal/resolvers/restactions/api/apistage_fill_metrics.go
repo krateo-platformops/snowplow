@@ -165,6 +165,9 @@ var (
 	// high-water mark since boot: it must never exceed the ceiling except by
 	// the inFlight == 0 escape of a single fill.
 	contentFillAdmissionInflightWeightPeak atomic.Int64
+	// contentFillAdmittedCount mirrors the gate's admitted-flight count for
+	// lock-free reads (tests check every dispatch runs for an admitted flight).
+	contentFillAdmittedCount atomic.Int64
 
 	contentFillLogLast       atomic.Int64 // unix nanos of the last emitted line
 	contentFillLogSuppressed atomic.Uint64

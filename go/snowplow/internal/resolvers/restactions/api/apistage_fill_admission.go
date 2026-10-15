@@ -307,6 +307,7 @@ func (g *contentFillGate) admit(ctx context.Context, t *fillTicket, gvr string, 
 			t.admitted = true
 			g.inFlightWeight += t.weight
 			g.inFlightCount++
+			contentFillAdmittedCount.Store(int64(g.inFlightCount))
 			contentFillAdmissionInflightWeight.Store(g.inFlightWeight)
 			storeMax(&contentFillAdmissionInflightWeightPeak, g.inFlightWeight)
 			class := t.class
@@ -383,6 +384,7 @@ func (g *contentFillGate) release(t *fillTicket, calibrate bool) {
 	}
 	g.inFlightWeight = max(g.inFlightWeight-t.weight, 0)
 	g.inFlightCount = max(g.inFlightCount-1, 0)
+	contentFillAdmittedCount.Store(int64(g.inFlightCount))
 	contentFillAdmissionInflightWeight.Store(g.inFlightWeight)
 	g.cond.Broadcast()
 }
@@ -436,6 +438,7 @@ func resetContentFillGateForTest() {
 		contentFillAdmissionQueued[i].Store(0)
 	}
 	contentFillAdmissionInflightWeight.Store(0)
+	contentFillAdmittedCount.Store(0)
 	contentFillAdmissionInflightWeightPeak.Store(0)
 }
 
