@@ -58,6 +58,21 @@ func fill710Goroutines(t *testing.T) *sync.WaitGroup {
 
 // fill710SeamCeiling makes AdmissionCeiling() return exactly ceiling (live heap
 // constant): limit L, live 0, reserve L/8 → ceiling = L − L/8.
+// fill710SyncBudget is how long a large fixture may wait for its informer:
+// the test's remaining time less a reporting margin, or 10 min with no deadline.
+func fill710SyncBudget(t *testing.T) time.Duration {
+	t.Helper()
+	const margin = 30 * time.Second
+	dl, ok := t.Deadline()
+	if !ok {
+		return 10 * time.Minute
+	}
+	if left := time.Until(dl) - margin; left > margin {
+		return left
+	}
+	return margin
+}
+
 func fill710SeamCeiling(t *testing.T, ceiling int64) {
 	t.Helper()
 	limit := ceiling * 8 / 7
@@ -314,15 +329,21 @@ func newFill710MultiNSWatcher(t *testing.T, nsCount, perNS int) {
 		t.Fatalf("NewResourceWatcher: %v", err)
 	}
 	t.Cleanup(rw.Stop)
+	// The initial LIST of 120K objects under -race can take longer than any
+	// fixed wait (#710: a fixed 20 s flaked 2/3 on main). Bound the wait by the
+	// test's own deadline instead, keeping a margin so a genuine hang still
+	// reports this message rather than the package-timeout panic.
+	budget := fill710SyncBudget(t)
+	t0 := time.Now()
 	_, syncCh := rw.EnsureResourceType(r1FsaGVR)
 	select {
 	case <-syncCh:
-	case <-time.After(20 * time.Second):
-		t.Fatalf("fsa informer did not sync")
+	case <-time.After(budget):
+		t.Fatalf("fsa informer did not sync (waited %s)", time.Since(t0).Round(time.Second))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	if err := rw.WaitForCacheSync(ctx, 20*time.Second); err != nil {
+	if err := rw.WaitForCacheSync(ctx, budget); err != nil {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
 	waitOwnRBACPublish(t, rw)
