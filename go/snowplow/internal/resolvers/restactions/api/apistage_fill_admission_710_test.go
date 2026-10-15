@@ -45,6 +45,17 @@ func fill710Admission(t *testing.T) {
 	t.Cleanup(cache.ResetAdmissionRuntimeSeamsForTest)
 }
 
+// fill710Goroutines returns a WaitGroup the arm's gate goroutines join; the
+// test waits for them AFTER its own later-registered cleanups (holder release,
+// ctx cancel) and BEFORE fill710Admission's reset, so a goroutine of this arm
+// can never touch the gauges of the next.
+func fill710Goroutines(t *testing.T) *sync.WaitGroup {
+	t.Helper()
+	wg := &sync.WaitGroup{}
+	t.Cleanup(wg.Wait)
+	return wg
+}
+
 // fill710SeamCeiling makes AdmissionCeiling() return exactly ceiling (live heap
 // constant): limit L, live 0, reserve L/8 → ceiling = L − L/8.
 func fill710SeamCeiling(t *testing.T, ceiling int64) {
@@ -77,7 +88,7 @@ func TestContentFill710_ADM1_ConcurrentWeightNeverExceedsCeiling_AllComplete(t *
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			release, _, err := admitContentFillForTest(context.Background(), "adm1.example/v1, Resource=things", raw, fillClassCustomer)
+			release, _, err := admitContentFillForTest(context.Background(), "adm1.example/v1, Resource=things", raw, fillClassBackground)
 			if err != nil {
 				t.Errorf("fill %d not admitted: %v", i, err)
 				return
@@ -105,7 +116,7 @@ func TestContentFill710_ADM1_ConcurrentWeightNeverExceedsCeiling_AllComplete(t *
 	}
 
 	// The escape: a single fill heavier than the whole ceiling still runs alone.
-	release, _, err := admitContentFillForTest(context.Background(), "adm1.example/v1, Resource=huge", 100*ceiling, fillClassCustomer)
+	release, _, err := admitContentFillForTest(context.Background(), "adm1.example/v1, Resource=huge", 100*ceiling, fillClassBackground)
 	if err != nil {
 		t.Fatalf("F-ADM1: a fill heavier than the ceiling on an EMPTY gate was not admitted (no guaranteed progress): %v", err)
 	}
@@ -156,25 +167,78 @@ func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionWithin2x(t *tes
 	}
 }
 
-// TestContentFill710_ADM_BackgroundNeverAdmitsAheadOfAWaitingCustomer: a
-// background fill that WOULD fit still waits while a customer fill is waiting,
-// and the customer admits first. Deterministic: weights, not wake-up races.
-func TestContentFill710_ADM_BackgroundNeverAdmitsAheadOfAWaitingCustomer(t *testing.T) {
+// TestContentFill710_ADM_CustomerBypassesTheCapEvenWithBackgroundQueuedFirst:
+// users never queue. At zero headroom, with a background flight holding the
+// gate AND a background ticket queued FIRST, a customer fill is admitted at
+// once (counted: the weight goes over the ceiling, and over_ceiling_bytes
+// says by how much), while the background ticket stays queued. Mutation
+// "the customer goes through the cap" → it waits behind the background queue.
+func TestContentFill710_ADM_CustomerBypassesTheCapEvenWithBackgroundQueuedFirst(t *testing.T) {
 	fill710Admission(t)
-	const gvr = "prio/v1, Resource=a"
+	wg := fill710Goroutines(t)
+	const gvr = "bypass/v1, Resource=a"
+	fill710SeamCeiling(t, 1)
+	holder, _, err := admitContentFillForTest(context.Background(), gvr, 1000, fillClassBackground)
+	if err != nil {
+		t.Fatalf("admit holder: %v", err)
+	}
+	t.Cleanup(holder)
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	t.Cleanup(bgCancel)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if release, _, err := admitContentFillForTest(bgCtx, gvr, 1000, fillClassBackground); err == nil {
+			release()
+		}
+	}()
+	if !fill710WaitFor(5*time.Second, func() bool { return ContentFillAdmissionStatsSnapshot().Queued["background"] == 1 }) {
+		t.Fatalf("PRECONDITION: the background ticket did not queue")
+	}
+
+	cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	t0 := time.Now()
+	release, _, err := admitContentFillForTest(cctx, gvr, 1000, fillClassCustomer)
+	if err != nil {
+		t.Fatalf("bypass RED: a customer fill was not admitted (%v after %s) — a user waited behind the background queue", err, time.Since(t0))
+	}
+	defer release()
+	if d := time.Since(t0); d > time.Second {
+		t.Fatalf("bypass RED: the customer fill waited %s", d)
+	}
+	s := ContentFillAdmissionStatsSnapshot()
+	if s.Queued["background"] != 1 || s.Queued["customer"] != 0 {
+		t.Fatalf("queued %v: the background ticket must still wait, no customer ever queues", s.Queued)
+	}
+	if s.OverCeiling <= 0 || s.OverCeilingPk < s.OverCeiling {
+		t.Fatalf("over_ceiling_bytes = %d (peak %d): the bypass excursion past the ceiling is not reported", s.OverCeiling, s.OverCeilingPk)
+	}
+	if w := s.Wait["customer"]; w.Count != 1 || w.MaxMS != 0 {
+		t.Fatalf("admission_wait_ms{customer} = %+v, want one sample of 0 ms", w)
+	}
+}
+
+// TestContentFill710_ADM_BackgroundQueueIsFIFO: two background tickets queued
+// behind a holder admit in enqueue order.
+func TestContentFill710_ADM_BackgroundQueueIsFIFO(t *testing.T) {
+	fill710Admission(t)
+	wg := fill710Goroutines(t)
+	const gvr = "fifo/v1, Resource=a"
 	unit := int64(1000)
 	w := int64(float64(unit) * contentFillExpansionSeed)
-	fill710SeamCeiling(t, 2*w+w/2) // holder (1) + background (1) fits; holder + customer (2) does not
-
+	fill710SeamCeiling(t, w+w/2) // one at a time
 	holder, _, err := admitContentFillForTest(context.Background(), gvr, unit, fillClassBackground)
 	if err != nil {
 		t.Fatalf("admit holder: %v", err)
 	}
 	t.Cleanup(holder)
 	order := make(chan string, 2)
-	admit := func(name string, raw int64, class fillAdmissionClass) {
+	admit := func(name string) {
+		wg.Add(1)
 		go func() {
-			release, _, err := admitContentFillForTest(context.Background(), gvr, raw, class)
+			defer wg.Done()
+			release, _, err := admitContentFillForTest(context.Background(), gvr, unit, fillClassBackground)
 			if err != nil {
 				order <- name + ":err"
 				return
@@ -184,22 +248,17 @@ func TestContentFill710_ADM_BackgroundNeverAdmitsAheadOfAWaitingCustomer(t *test
 			release()
 		}()
 	}
-	admit("customer", 2*unit, fillClassCustomer)
-	if !fill710WaitFor(5*time.Second, func() bool { return ContentFillAdmissionStatsSnapshot().Queued["customer"] == 1 }) {
-		t.Fatalf("PRECONDITION: the customer fill did not queue")
+	admit("first")
+	if !fill710WaitFor(5*time.Second, func() bool { return ContentFillAdmissionStatsSnapshot().Queued["background"] == 1 }) {
+		t.Fatalf("PRECONDITION: the first ticket did not queue")
 	}
-	admit("background", unit, fillClassBackground)
-	select {
-	case got := <-order:
-		t.Fatalf("priority RED: %q admitted while a customer read-through was waiting — a background fill must never admit ahead of a waiting customer", got)
-	case <-time.After(100 * time.Millisecond):
-	}
-	if q := ContentFillAdmissionStatsSnapshot().Queued["background"]; q != 1 {
-		t.Fatalf("the background fill is not queued (queued=%d)", q)
+	admit("second")
+	if !fill710WaitFor(5*time.Second, func() bool { return ContentFillAdmissionStatsSnapshot().Queued["background"] == 2 }) {
+		t.Fatalf("PRECONDITION: the second ticket did not queue")
 	}
 	holder()
-	if first, second := <-order, <-order; first != "customer" || second != "background" {
-		t.Fatalf("admission order %s, %s; want customer, background", first, second)
+	if first, second := <-order, <-order; first != "first" || second != "second" {
+		t.Fatalf("background admission order %s, %s; want first, second (FIFO)", first, second)
 	}
 }
 
@@ -273,6 +332,12 @@ func newFill710MultiNSWatcher(t *testing.T, nsCount, perNS int) {
 
 func fill710NS(n int) string { return fmt.Sprintf("fill710-ns-%02d", n) }
 
+// fill710BgCtx is a background reader: a refresher re-resolve forcing the
+// fsa content cells (refresh_forced) — the only class the cap queues.
+func fill710BgCtx() context.Context {
+	return cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(r1Ctx()), r1FsaGVR)
+}
+
 func fill710NSListCall(n int) httpcall.RequestOptions {
 	return httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
 		Path: "/apis/composition.krateo.io/v1/namespaces/" + fill710NS(n) + "/fullstackapps",
@@ -316,7 +381,7 @@ func TestContentFill710_ADM1_RealPath_DistinctListsStayUnderCeiling(t *testing.T
 		go func(n int) {
 			defer wg.Done()
 			<-start
-			if _, s, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false); ok && s {
+			if _, s, ok, _ := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(n), false); ok && s {
 				served.Add(1)
 			}
 		}(n)
@@ -344,14 +409,15 @@ func TestContentFill710_D1_ResolveRecordsA503StageErrorNoFallThrough(t *testing.
 	fill710Admission(t)
 	store.SetTombstoneTTL(300 * time.Millisecond)
 	fill710SeamCeiling(t, 1)
-	holder, _, err := admitContentFillForTest(context.Background(), "d1/v1, Resource=held", 1, fillClassCustomer)
+	holder, _, err := admitContentFillForTest(context.Background(), "d1/v1, Resource=held", 1, fillClassBackground)
 	if err != nil {
 		t.Fatalf("admit holder: %v", err)
 	}
 	t.Cleanup(holder)
 	before := cache.FallthroughTotal()
 
-	dict := f1ResolveAs(t, f1BroadUser, f1ListStage("widgets"))
+	// A BACKGROUND resolve (the refresher's): only background ever queues.
+	_, _, dict := f1ResolveWithStageSink(t, f1BroadUser, f1ListStage("widgets"), true)
 	got := fmt.Sprintf("%v", dict)
 	if _, served := dict["widgets"].([]any); served {
 		t.Fatalf("D1 RED: the stage was served past a refused admission: %s", got)
@@ -362,8 +428,8 @@ func TestContentFill710_D1_ResolveRecordsA503StageErrorNoFallThrough(t *testing.
 	if after := cache.FallthroughTotal(); after != before {
 		t.Fatalf("D1 RED: the refused call fell through to the apiserver (fallthrough %v → %v)", before, after)
 	}
-	if got := ContentFillAdmissionStatsSnapshot().Timeout["customer"]; got != 1 {
-		t.Fatalf("admission_timeout_total{customer} = %d, want 1", got)
+	if got := ContentFillAdmissionStatsSnapshot().Timeout["background"]; got != 1 {
+		t.Fatalf("admission_timeout_total{background} = %d, want 1", got)
 	}
 	// The #709 stage failure the item error becomes reports 503, not 500.
 	f := newStageItemFailure("widgets", ErrContentFillAdmissionTimeout.Error(),
@@ -382,7 +448,7 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 	fill710SeamCeiling(t, 1)
 
 	// Something else holds the gate for longer than the deadline.
-	holder, _, err := admitContentFillForTest(context.Background(), "d1/v1, Resource=held", 1, fillClassCustomer)
+	holder, _, err := admitContentFillForTest(context.Background(), "d1/v1, Resource=held", 1, fillClassBackground)
 	if err != nil {
 		t.Fatalf("admit holder: %v", err)
 	}
@@ -403,7 +469,7 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 	results := make(chan out, 3)
 	for i := 0; i < 3; i++ {
 		go func() {
-			_, s, ok, err := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false)
+			_, s, ok, err := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(0), false)
 			results <- out{ok, s, err}
 		}()
 	}
@@ -425,10 +491,40 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 	}
 	// Two flights: the first, and the one its live joiners started rather than
 	// inherit a deadline that was not theirs (one leads it, one joins it).
-	if got := ContentFillAdmissionStatsSnapshot().Timeout["customer"]; got != 2 {
-		t.Fatalf("admission_timeout_total{customer} = %d, want 2", got)
+	if got := ContentFillAdmissionStatsSnapshot().Timeout["background"]; got != 2 {
+		t.Fatalf("admission_timeout_total{background} = %d, want 2", got)
 	}
 	if _, ok := store.GetNoTouch(cache.ComputeKey(contentKeyInputs(r1FsaGVR, fill710NS(0), ""))); ok {
 		t.Fatalf("D1: a never-admitted flight stored a cell")
+	}
+}
+
+// TestContentFill710_D1_ACustomerNeverGetsTheAdmissionTimeout: at zero
+// headroom with the gate held, a customer read whose own request expires
+// soon is dispatched and served at once — never ErrContentFillAdmissionTimeout.
+// Mutation "the customer waits in the cap" → RED.
+func TestContentFill710_D1_ACustomerNeverGetsTheAdmissionTimeout(t *testing.T) {
+	newFill710MultiNSWatcher(t, 1, 5)
+	store := cache.ResolvedCache()
+	fill710Admission(t)
+	store.SetTombstoneTTL(300 * time.Millisecond)
+	fill710SeamCeiling(t, 1)
+	holder, _, err := admitContentFillForTest(context.Background(), "d1c/v1, Resource=held", 1, fillClassBackground)
+	if err != nil {
+		t.Fatalf("admit holder: %v", err)
+	}
+	t.Cleanup(holder)
+
+	ctx, cancel := context.WithTimeout(r1Ctx(), 500*time.Millisecond)
+	defer cancel()
+	_, s, ok, err := apistageContentServe(ctx, store, fill710NSListCall(0), false)
+	if err != nil {
+		t.Fatalf("D1 RED: a customer read got %v — users never queue, so no customer may receive the admission timeout", err)
+	}
+	if !ok || !s {
+		t.Fatalf("a customer read at zero headroom was not served (ok=%v served=%v)", ok, s)
+	}
+	if got := ContentFillAdmissionStatsSnapshot().Timeout["customer"]; got != 0 {
+		t.Fatalf("admission_timeout_total{customer} = %d, want 0", got)
 	}
 }

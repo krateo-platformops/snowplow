@@ -181,6 +181,11 @@ func TestIssue710_ContentFillAdmissionSeriesReachOTLP(t *testing.T) {
 	if pts := pointsFor(all, "snowplow_apistage_content_fill_admission_inflight_weight"); len(pts) != 1 || pts[0].value != 9999 {
 		t.Fatalf("admission_inflight_weight = %+v, want one point of 9999", pts)
 	}
+	for _, name := range []string{"snowplow_apistage_content_fill_admission_over_ceiling_bytes", "snowplow_apistage_content_fill_admission_over_ceiling_bytes_peak"} {
+		if pts := pointsFor(all, name); len(pts) != 1 || len(pts[0].attrs) != 0 {
+			t.Fatalf("%s = %+v, want one attribute-free point", name, pts)
+		}
+	}
 	var count uint64
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {

@@ -11,10 +11,10 @@
 //
 // C1 (deadlock-safety): this gate has its OWN mutex, cond and counters; it
 // shares only the ceiling calc. LOCK ORDER: nested → fill, never fill →
-// nested. A customer tree holding a nested-resolve admission may wait here for
-// one of its content fills; a fill leader NEVER enters the nested gate (nor the
-// seed gate) while it holds or waits for a fill admission, so the two gates
-// cannot wait on each other.
+// nested. A tree holding a nested-resolve admission may reach this gate for one
+// of its content fills; a fill leader NEVER enters the nested gate (nor the seed
+// gate) while it holds or waits for a fill admission, so the two gates cannot
+// wait on each other.
 //
 // WHO PAYS, AND WHEN. Admission is taken per FLIGHT, by its leader, BEFORE the
 // dispatch builds the envelope: a flight that waits holds nothing but a ticket,
@@ -37,24 +37,30 @@
 // it — and a symmetric average would ratchet down on the shrunken samples. A
 // sample ≤ 0 is ignored; samples are clamped to [1, contentFillExpansionMax].
 //
-// NEVER DROPS. A flight that does not fit QUEUES; an empty gate always admits
-// (guaranteed progress). The wait is bounded by the leader's detached fill
-// ctx — the server write deadline. Past it the flight fails with
-// ErrContentFillAdmissionTimeout (a 503, D1): its readers get a stage error,
-// nothing is stored, nothing is served stale, nothing falls through to an
-// apiserver LIST. A JOINER of a flight that failed this way, whose own request
-// is still alive, starts a new flight rather than inherit someone else's
-// deadline.
+// USERS NEVER QUEUE (owner ruling 2026-10-15, #710 design revision 3: "No one
+// waits in queue"). A flight led or joined by a CUSTOMER (#710 PR-2b: or a
+// debt refill) BYPASSES the cap: it is admitted at once — its weight and count
+// join the in-flight totals, so active users squeeze background harder — and
+// never waits. How far that pushes the weight past the ceiling is
+// admission_over_ceiling_bytes (+ _peak): the early warning for the accepted
+// memory residual (ruling 2: decided on bench run 8). A customer that JOINS a
+// queued background flight PROMOTES it to its class, which admits it at once —
+// the waiting leader wakes already admitted — or coalescing would make a user
+// wait in the background queue.
 //
-// PRIORITY. Strict by class, FIFO within a class by enqueue order: a flight
-// admits only when no queued flight has a higher class, or the same class and
-// an earlier ticket — on every admit path, the empty-gate escape included.
-// customer read-through > background (refresher re-resolve, prewarm). A
-// flight's class is the MAX over its participants: a customer that joins a
-// queued background flight PROMOTES it (keeping its enqueue order), or
-// coalescing would bypass the priority. No aging (C5's rule in the nested
-// bound); background starvation is visible on admission_wait_ms{class}.
-// #710 PR-2b adds the debt class above customer.
+// ONLY BACKGROUND QUEUES (refresher re-resolve, refresh_forced, prewarm), FIFO
+// by enqueue order. It admits while the weight fits, or the gate is empty
+// (guaranteed progress: an in-flight bypass flight is a non-empty gate that
+// will release). It never drops; its wait is bounded by the leader's detached
+// fill ctx — the server write deadline. Past it the flight fails with
+// ErrContentFillAdmissionTimeout (a 503, D1): its readers — background ones —
+// get a stage error, the refresh Put is declined, the existing cell keeps
+// serving, nothing is stored, nothing falls through to an apiserver LIST. No
+// customer request can receive it, save one race: a customer that joins
+// between that timeout and the flight's completion — its own request alive, it
+// starts a new (bypass) flight rather than inherit someone else's deadline. No
+// aging; background starvation is visible on admission_wait_ms{class} and, as
+// freshness lag, on snowplow_refresher_dirty_to_fresh_ms.
 //
 // TRANSPARENT when GOMEMLIMIT is unset (AdmissionCeiling's unlimited): admit at
 // once; release still calibrates.
@@ -242,14 +248,16 @@ func predictFillRaw(store *cache.ResolvedCacheStore, key string, gvr schema.Grou
 	return predictContentFillRaw(gvr.String(), resident, items, ok)
 }
 
-// bestLocked reports whether t heads the queue: no queued ticket has a higher
-// class, or the same class and an earlier enqueue. Caller holds g.mu.
+// bypassesCap reports whether a class dispatches at once, never queueing:
+// every class above background (customer; #710 PR-2b adds debt). Owner ruling
+// 2026-10-15: "No one waits in queue".
+func bypassesCap(c fillAdmissionClass) bool { return c > fillClassBackground }
+
+// bestLocked reports whether background ticket t heads the queue: FIFO by
+// enqueue order. Only background tickets ever queue. Caller holds g.mu.
 func (g *contentFillGate) bestLocked(t *fillTicket) bool {
 	for u := range g.queue {
-		if u == t {
-			continue
-		}
-		if u.class > t.class || (u.class == t.class && u.seq < t.seq) {
+		if u != t && u.seq < t.seq {
 			return false
 		}
 	}
@@ -265,8 +273,34 @@ func (g *contentFillGate) dequeueLocked(t *fillTicket) {
 	}
 }
 
+// accountLocked admits t: its weight and count join the in-flight totals.
+// Caller holds g.mu.
+func (g *contentFillGate) accountLocked(t *fillTicket) {
+	g.dequeueLocked(t)
+	t.admitted = true
+	g.inFlightWeight += t.weight
+	g.inFlightCount++
+	g.publishLocked()
+}
+
+// publishLocked mirrors the in-flight totals to the gauges, including how far
+// bypass flights pushed the weight past the ceiling. Caller holds g.mu.
+func (g *contentFillGate) publishLocked() {
+	contentFillAdmittedCount.Store(int64(g.inFlightCount))
+	contentFillAdmissionInflightWeight.Store(g.inFlightWeight)
+	storeMax(&contentFillAdmissionInflightWeightPeak, g.inFlightWeight)
+	over := int64(0)
+	if ceiling, unlimited := cache.AdmissionCeiling(); !unlimited {
+		over = max(g.inFlightWeight-ceiling, 0)
+	}
+	contentFillAdmissionOverCeiling.Store(over)
+	storeMax(&contentFillAdmissionOverCeilingPeak, over)
+}
+
 // promote raises a flight's class to c (a participant of a higher class
-// joined it), keeping its enqueue order. A queued ticket is re-ordered at once.
+// joined it). A QUEUED background flight promoted to a bypass class is
+// admitted at once — its waiting leader wakes already admitted — or a user
+// joining it would wait in the background queue.
 func (g *contentFillGate) promote(t *fillTicket, c fillAdmissionClass) {
 	if t == nil {
 		return
@@ -279,13 +313,18 @@ func (g *contentFillGate) promote(t *fillTicket, c fillAdmissionClass) {
 	if t.queued {
 		contentFillAdmissionQueued[t.class].Add(-1)
 		contentFillAdmissionQueued[c].Add(1)
-		g.cond.Broadcast()
 	}
 	t.class = c
+	if t.queued && bypassesCap(c) {
+		g.accountLocked(t) // dequeues and broadcasts: the leader returns admitted
+	}
 }
 
-// admit waits (bounded by ctx) until t's flight, weighing predictedRaw ×
-// expansion, may run. On ctx expiry it returns ErrContentFillAdmissionTimeout.
+// admit lets t's flight, weighing predictedRaw × expansion, run. A bypass
+// class (customer and above) is accounted and returns at once — it counts
+// against the cap, squeezing background, but never waits. A background flight
+// queues FIFO until it fits (or the gate is empty), bounded by ctx; on ctx
+// expiry it returns ErrContentFillAdmissionTimeout.
 func (g *contentFillGate) admit(ctx context.Context, t *fillTicket, gvr string, predictedRaw int64) error {
 	t0 := time.Now()
 	g.mu.Lock()
@@ -293,6 +332,14 @@ func (g *contentFillGate) admit(ctx context.Context, t *fillTicket, gvr string, 
 	t.predicted = predictedRaw
 	t.raw = predictedRaw
 	t.weight = int64(float64(predictedRaw) * g.expansionLocked(gvr))
+	if bypassesCap(t.class) {
+		g.accountLocked(t)
+		class := t.class
+		g.mu.Unlock()
+		recordContentFillAdmissionWait(class, 0)
+		t.liveAtAdm = cache.AdmissionLiveHeapSample()
+		return nil
+	}
 	g.nextSeq++
 	t.seq = g.nextSeq
 	t.enqueued = t0
@@ -300,24 +347,18 @@ func (g *contentFillGate) admit(ctx context.Context, t *fillTicket, gvr string, 
 	g.queue[t] = struct{}{}
 	contentFillAdmissionQueued[t.class].Add(1)
 	for {
+		if t.admitted {
+			// A bypass participant joined and promoted this flight.
+			break
+		}
 		ceiling, unlimited := cache.AdmissionCeiling()
 		fits := g.inFlightWeight+t.weight <= ceiling
 		if (unlimited || g.inFlightCount == 0 || fits) && g.bestLocked(t) {
-			g.dequeueLocked(t)
-			t.admitted = true
-			g.inFlightWeight += t.weight
-			g.inFlightCount++
-			contentFillAdmittedCount.Store(int64(g.inFlightCount))
-			contentFillAdmissionInflightWeight.Store(g.inFlightWeight)
-			storeMax(&contentFillAdmissionInflightWeightPeak, g.inFlightWeight)
-			class := t.class
-			g.mu.Unlock()
-			recordContentFillAdmissionWait(class, time.Since(t0).Milliseconds())
-			t.liveAtAdm = cache.AdmissionLiveHeapSample()
-			return nil
+			g.accountLocked(t)
+			break
 		}
 		g.waitLocked(ctx)
-		if ctx.Err() != nil {
+		if !t.admitted && ctx.Err() != nil {
 			g.dequeueLocked(t)
 			class := t.class
 			g.mu.Unlock()
@@ -326,6 +367,11 @@ func (g *contentFillGate) admit(ctx context.Context, t *fillTicket, gvr string, 
 			return ErrContentFillAdmissionTimeout
 		}
 	}
+	class := t.class
+	g.mu.Unlock()
+	recordContentFillAdmissionWait(class, time.Since(t0).Milliseconds())
+	t.liveAtAdm = cache.AdmissionLiveHeapSample()
+	return nil
 }
 
 // reconcile replaces an admitted flight's predicted weight with the exact one,
@@ -339,8 +385,7 @@ func (g *contentFillGate) reconcile(t *fillTicket, exactRaw int64) {
 	w := int64(float64(exactRaw) * g.expansionLocked(t.gvr))
 	g.inFlightWeight = max(g.inFlightWeight+w-t.weight, 0)
 	t.weight, t.raw = w, exactRaw
-	contentFillAdmissionInflightWeight.Store(g.inFlightWeight)
-	storeMax(&contentFillAdmissionInflightWeightPeak, g.inFlightWeight)
+	g.publishLocked()
 	if t.predicted > 0 {
 		r := float64(exactRaw) / float64(t.predicted)
 		if cur, ok := g.predictRatio[t.gvr]; ok {
@@ -384,8 +429,7 @@ func (g *contentFillGate) release(t *fillTicket, calibrate bool) {
 	}
 	g.inFlightWeight = max(g.inFlightWeight-t.weight, 0)
 	g.inFlightCount = max(g.inFlightCount-1, 0)
-	contentFillAdmittedCount.Store(int64(g.inFlightCount))
-	contentFillAdmissionInflightWeight.Store(g.inFlightWeight)
+	g.publishLocked()
 	g.cond.Broadcast()
 }
 
@@ -439,6 +483,8 @@ func resetContentFillGateForTest() {
 	}
 	contentFillAdmissionInflightWeight.Store(0)
 	contentFillAdmittedCount.Store(0)
+	contentFillAdmissionOverCeiling.Store(0)
+	contentFillAdmissionOverCeilingPeak.Store(0)
 	contentFillAdmissionInflightWeightPeak.Store(0)
 }
 

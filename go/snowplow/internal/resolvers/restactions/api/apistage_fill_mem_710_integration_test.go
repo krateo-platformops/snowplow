@@ -89,6 +89,11 @@ func fill710HeapObjects() int64 {
 // of heap/objects (live + unswept garbage) over the start, and how many
 // readers were served.
 func fill710RefreshBurst(store *cache.ResolvedCacheStore, lists, readers int) (liveGrowth, objGrowth, served int64) {
+	return fill710Burst(store, lists, readers, fill710BgCtx)
+}
+
+// fill710Burst is fill710RefreshBurst with the readers' ctx given.
+func fill710Burst(store *cache.ResolvedCacheStore, lists, readers int, ctxFn func() context.Context) (liveGrowth, objGrowth, served int64) {
 	runtime.GC()
 	runtime.GC()
 	base, baseLive := fill710HeapObjects(), fill710HeapLive()
@@ -118,8 +123,7 @@ func fill710RefreshBurst(store *cache.ResolvedCacheStore, lists, readers int) (l
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			ctx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(r1Ctx()), r1FsaGVR)
-			if _, s, o, _ := apistageContentServe(ctx, store, fill710NSListCall(i%lists), false); o && s {
+			if _, s, o, _ := apistageContentServe(ctxFn(), store, fill710NSListCall(i%lists), false); o && s {
 				ok.Add(1)
 			}
 		}(i)
@@ -262,5 +266,82 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 	}
 	if ungated <= bound {
 		t.Fatalf("PRECONDITION: the ungated burst stayed within the bound too (+%d MiB ≤ %d MiB) — the arm does not discriminate", ungated>>20, bound>>20)
+	}
+}
+
+// TestContentFill710_FMEM_CustomerFirstLoadBurst_ReportOnly: users never queue
+// (owner ruling), so a burst of CUSTOMER first loads across K distinct cold
+// lists bypasses the cap. That memory risk is ACCEPTED (ruling 2: decided on
+// bench run 8); this arm REPORTS it — live-heap growth and
+// admission_over_ceiling_bytes_peak — and asserts only the ruling itself:
+// every customer flight is admitted with no wait, and a background flight
+// queued before the burst stays queued through it (active users squeeze
+// background).
+func TestContentFill710_FMEM_CustomerFirstLoadBurst_ReportOnly(t *testing.T) {
+	const (
+		lists   = 24
+		perNS   = 5000
+		readers = 240
+	)
+	newFill710MultiNSWatcher(t, lists, perNS)
+	store := cache.ResolvedCache()
+	fill710Admission(t)
+	wg := fill710Goroutines(t)
+	envLen := fill710SpyDispatch(t, nil, nil, nil)
+	// One cold fill to learn the envelope size, then every list cold again.
+	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
+		t.Fatalf("PRECONDITION: list 0 not content-servable")
+	}
+	store.DeleteForTest(cache.ComputeKey(contentKeyInputs(r1FsaGVR, fill710NS(0), "")))
+	env := envLen.Load()
+	seedFill := int64(float64(env) * contentFillExpansionSeed)
+	runtime.GC()
+	runtime.GC()
+	limit := (fill710HeapObjects() + seedFill + seedFill/2) * 8 / 7
+	prevLimit := debug.SetMemoryLimit(limit)
+	t.Cleanup(func() { debug.SetMemoryLimit(prevLimit) })
+	ResetContentFillStatsForTest()
+	restore := cache.SetAdmissionRuntimeSeamsForTest(func() int64 { return limit }, fill710HeapObjects)
+	t.Cleanup(restore)
+	ceiling0, _ := cache.AdmissionCeiling()
+
+	// A background flight holds the WHOLE ceiling and another waits behind it
+	// (its weight is the ceiling, so it reports no excursion by itself).
+	held := ceiling0/int64(contentFillExpansionSeed) + 1
+	holder, _, err := admitContentFillForTest(context.Background(), "burst/v1, Resource=held", held, fillClassBackground)
+	if err != nil {
+		t.Fatalf("admit holder: %v", err)
+	}
+	t.Cleanup(holder)
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	t.Cleanup(bgCancel)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if release, _, err := admitContentFillForTest(bgCtx, "burst/v1, Resource=queued", held, fillClassBackground); err == nil {
+			release()
+		}
+	}()
+	if !fill710WaitFor(10*time.Second, func() bool { return ContentFillAdmissionStatsSnapshot().Queued["background"] == 1 }) {
+		t.Fatalf("PRECONDITION: the background ticket did not queue")
+	}
+
+	live, obj, served := fill710Burst(store, lists, readers, r1Ctx)
+	adm := ContentFillAdmissionStatsSnapshot()
+	t.Logf("#710 PR-2a customer first-load burst (REPORT ONLY — accepted risk, bench run 8 decides): %d cold lists × %d items (envelope %d B), %d customer readers, soft limit %d MiB, starting ceiling %d MiB. "+
+		"live-heap growth +%d MiB (heap/objects +%d); admission_over_ceiling_bytes_peak %d MiB; admitted-weight peak %d MiB; customer admission wait max %d ms (%d samples); background queued through it: %d",
+		lists, perNS, env, readers, limit>>20, ceiling0>>20, live>>20, obj>>20, adm.OverCeilingPk>>20,
+		contentFillAdmissionInflightWeightPeak.Load()>>20, adm.Wait["customer"].MaxMS, adm.Wait["customer"].Count, adm.Queued["background"])
+	if served != readers {
+		t.Fatalf("customer burst: %d of %d readers served", served, readers)
+	}
+	if w := adm.Wait["customer"]; w.Count == 0 || w.MaxMS != 0 {
+		t.Fatalf("a customer flight waited for admission (%+v) — users never queue", w)
+	}
+	if q := adm.Queued; q["background"] != 1 || q["customer"] != 0 {
+		t.Fatalf("queued %v after the burst: the background ticket must still wait, no customer ever queues", q)
+	}
+	if adm.OverCeilingPk <= 0 {
+		t.Fatalf("PRECONDITION: the burst never pushed the admitted weight past the ceiling — the report shows nothing")
 	}
 }

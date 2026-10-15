@@ -168,6 +168,11 @@ var (
 	// contentFillAdmittedCount mirrors the gate's admitted-flight count for
 	// lock-free reads (tests check every dispatch runs for an admitted flight).
 	contentFillAdmittedCount atomic.Int64
+	// contentFillAdmissionOverCeiling (+ _Peak) is how far bypass flights (users
+	// never queue) pushed the admitted weight past the ceiling: the early
+	// warning for the accepted memory residual (owner ruling 2, #710).
+	contentFillAdmissionOverCeiling     atomic.Int64
+	contentFillAdmissionOverCeilingPeak atomic.Int64
 
 	contentFillLogLast       atomic.Int64 // unix nanos of the last emitted line
 	contentFillLogSuppressed atomic.Uint64
@@ -620,6 +625,8 @@ type ContentFillAdmissionStats struct {
 	Queued         map[string]int64
 	Timeout        map[string]uint64
 	InflightWeight int64
+	OverCeiling    int64
+	OverCeilingPk  int64
 	Wait           map[string]ContentFillDurationStats
 	Expansion      map[string]float64
 	PredictRatio   map[string]float64
@@ -631,6 +638,8 @@ func ContentFillAdmissionStatsSnapshot() ContentFillAdmissionStats {
 		Queued:         make(map[string]int64, fillAdmissionClasses),
 		Timeout:        make(map[string]uint64, fillAdmissionClasses),
 		InflightWeight: contentFillAdmissionInflightWeight.Load(),
+		OverCeiling:    contentFillAdmissionOverCeiling.Load(),
+		OverCeilingPk:  contentFillAdmissionOverCeilingPeak.Load(),
 		Wait:           make(map[string]ContentFillDurationStats, fillAdmissionClasses),
 	}
 	s.Expansion, s.PredictRatio = contentFillCalibrationSnapshot()
@@ -809,6 +818,12 @@ func registerContentFillExpvar() {
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_admission_inflight_weight", expvar.Func(func() any {
 			return contentFillAdmissionInflightWeight.Load()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_admission_over_ceiling_bytes", expvar.Func(func() any {
+			return contentFillAdmissionOverCeiling.Load()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_admission_over_ceiling_bytes_peak", expvar.Func(func() any {
+			return contentFillAdmissionOverCeilingPeak.Load()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_admission_inflight_weight_peak", expvar.Func(func() any {
 			return contentFillAdmissionInflightWeightPeak.Load()
