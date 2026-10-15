@@ -689,20 +689,53 @@ func apistageContentServe(
 			slog.Bool("preparsed", haveParsed),
 			slog.String("key_hash", contentKey),
 		)
+	} else if flight, fillCtx, lead := enterContentFlight(ctx, contentKey, gvr, ns, name, fillReason); !lead {
+		// MISS, JOINER (#710 PR-1, apistage_fill_flight.go) — an in-flight fill of
+		// this key started after this reader's coordinate last moved, so its body is
+		// as fresh as this reader's own fill would be. Serve the flight's envelope
+		// and shared parsed items through this reader's own gate below, exactly as a
+		// content HIT serves entry.Items.
+		res, ok := flight.wait(ctx)
+		if !ok {
+			// The flight was not servable (its leader fell through too), or this
+			// reader's own ctx ended while it waited.
+			return nil, false, false
+		}
+		envelope, parsed, haveParsed = res.envelope, res.parsed, res.haveParsed
+		if res.stored {
+			// The dep edge the leader Recorded on its accepted Put, on THIS reader's
+			// resolve sink, so its own cell's Put-check sees the coordinate (#375).
+			if isList {
+				cache.Deps().RecordList(ctx, contentKey, gvr, ns)
+			} else {
+				cache.Deps().Record(ctx, contentKey, gvr, ns, name)
+			}
+			entryRef = res.entry
+		}
 	} else {
-		// MISS — dispatch UN-GATED so the stored envelope is identity-free.
+		// MISS, LEADER — dispatch UN-GATED so the stored envelope is identity-free.
+		// #710 PR-1 — every exit publishes the flight's outcome to its joiners (a
+		// zero result = not servable); the success path publishes the result right
+		// after the Put, before this reader's own gate.
+		defer flight.complete(contentFlightResult{})
+		// #710 PR-1 — the fill runs DETACHED from this reader's cancellation, bounded
+		// by the server write deadline: a leader whose request goes away cannot fail
+		// the readers that joined its flight.
+		fillCtx, cancel := detachedFillContext(fillCtx)
+		defer cancel()
 		// #189 — capture the content key's generation BEFORE the dispatch/resolve
 		// so the tail PutIfGen refuses (rather than resurrecting a pre-delete
 		// body) if the underlying object is DELETE-evicted during the resolve.
 		contentGen0 := store.CaptureGen(contentKey)
-		// #375 (A) — the content cell's OWN resolve entry: install a CHILD dep-gen sink
-		// BEFORE the data read below, pre-declaring the cell's own coordinate (its dep is
-		// Recorded only AFTER the accepted Put, #189). The tail PutIfGen then remarks the
-		// content key iff its own coordinate churned in [read, Put]; Records made under the
-		// child still propagate to the outer resolve's sink.
+		// #375 (A) — the content cell's OWN resolve entry: fillCtx carries the CHILD
+		// dep-gen sink enterContentFlight installed BEFORE the data read below,
+		// pre-declaring the cell's own coordinate (its dep is Recorded only AFTER the
+		// accepted Put, #189). The tail PutIfGen then remarks the content key iff its
+		// own coordinate churned in [read, Put]; Records made under the child still
+		// propagate to the outer resolve's sink.
 		// Block-scoped shadow: the child sink covers exactly this MISS branch's read → Put
 		// → Record; the gate below keeps the caller's ctx.
-		ctx := cache.WithContentDepGenSink(ctx, gvr, ns, name)
+		ctx := fillCtx
 		// #710 — count the fill and hold its envelope bytes in flight until
 		// this serve returns; the dispatch and the parse run under pprof
 		// labels so a CPU profile names the GVR, reason and RESTAction.
@@ -802,6 +835,16 @@ func apistageContentServe(
 		}
 		// #710 — the fill's duration: dispatch start to parse + Put done.
 		fill.done()
+		// #710 PR-1 — hand the result to the joiners now: the envelope and the
+		// parsed items are immutable from here on.
+		flight.complete(contentFlightResult{
+			ok:         true,
+			envelope:   envelope,
+			parsed:     parsed,
+			haveParsed: haveParsed,
+			stored:     entryRef != nil,
+			entry:      entryRef,
+		})
 	}
 
 	// Step 3 — the per-user RBAC gate (skipped on the F2 prewarm path).

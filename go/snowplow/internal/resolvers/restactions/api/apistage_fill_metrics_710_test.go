@@ -6,13 +6,6 @@
 //     and item count; a second read is a hit and moves nothing.
 //   - REFRESH_FORCED: a refresher re-resolve whose trigger is the cell's GVR.
 //   - NOT_SERVABLE: a dispatch the informer cannot serve.
-//   - KNOWN_STALE HERD (PR-1's falsifier baseline): one LIST cell made
-//     known-stale for real (an informer UPDATE dirty-marks it, its content
-//     refresh is not servable across the whole budget, the drop leaves the
-//     stamp), then 64 concurrent readers. On main nothing coalesces, so all 64
-//     fill and fill_duplicate_total{known_stale} == 63. A barrier in the
-//     dispatch seam holds every fill in flight until all 64 have started, so
-//     the count is exact, not a race.
 //   - PPROF + RA: the dispatch runs under the fill's labels, and a Resolve
 //     threads its RESTAction and stage to them.
 //   - LOG: one line per interval, with no requester and no object name.
@@ -304,81 +297,6 @@ func TestContentFill710_NotServableCountsNoBytes(t *testing.T) {
 		t.Fatalf("by_gvr = %+v, want fills=1 and no bytes/items", g)
 	}
 	fill710RequireIdle(t, s)
-}
-
-// TestContentFill710_KnownStaleHerd_64Readers_63Duplicates is PR-1's
-// falsifier baseline: on main, 64 concurrent readers of one known-stale LIST
-// each run their own fill. PR-1 (single-flight per content key and epoch)
-// turns this into 1 fill and 0 duplicates.
-func TestContentFill710_KnownStaleHerd_64Readers_63Duplicates(t *testing.T) {
-	const readers = 64
-	dyn := newFill710Watcher(t, 50)
-	store := cache.ResolvedCache()
-	fill710Reset(t)
-	fill710MakeKnownStale(t, dyn, store)
-
-	gate := make(chan struct{})
-	var arrived atomic.Int64
-	envLen := fill710SpyDispatch(t, gate, &arrived, nil)
-
-	var wg sync.WaitGroup
-	errs := make(chan string, readers)
-	for i := 0; i < readers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, served, ok := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
-				errs <- fmt.Sprintf("ok=%v served=%v", ok, served)
-			}
-		}()
-	}
-	// Every reader must reach the dispatch before any fill completes; a reader
-	// that served from the cell would never arrive.
-	for end := time.Now().Add(20 * time.Second); arrived.Load() < readers; time.Sleep(time.Millisecond) {
-		if time.Now().After(end) {
-			close(gate)
-			wg.Wait()
-			t.Fatalf("only %d of %d readers entered the fill — the rest did not read the known-stale cell through", arrived.Load(), readers)
-		}
-	}
-	if s := ContentFillStatsSnapshot(); s.Inflight != readers {
-		close(gate)
-		wg.Wait()
-		t.Fatalf("fill_inflight = %d with every reader held in the dispatch, want %d", s.Inflight, readers)
-	}
-	close(gate)
-	wg.Wait()
-	close(errs)
-	for e := range errs {
-		t.Fatalf("a reader was not served: %s", e)
-	}
-
-	s := ContentFillStatsSnapshot()
-	if s.Total["known_stale"] != readers || s.Total["absent"] != 0 || s.Total["refresh_forced"] != 0 {
-		t.Fatalf("fill_total = %v, want known_stale=%d only", s.Total, readers)
-	}
-	if s.Duplicate["known_stale"] != readers-1 {
-		t.Fatalf("fill_duplicate_total[known_stale] = %d, want %d: %d concurrent fills of one content key, one of them first",
-			s.Duplicate["known_stale"], readers-1, readers)
-	}
-	if s.InflightPeak != readers {
-		t.Fatalf("fill_inflight_peak = %d, want %d", s.InflightPeak, readers)
-	}
-	if want := uint64(readers) * uint64(envLen.Load()); s.Bytes["known_stale"] != want {
-		t.Fatalf("fill_bytes_total[known_stale] = %d, want %d (%d envelopes of %d bytes)", s.Bytes["known_stale"], want, readers, envLen.Load())
-	}
-	if g := s.ByGVR[r1FsaGVR.String()]; g.Fills != readers || g.Duplicates != readers-1 {
-		t.Fatalf("by_gvr = %+v, want fills=%d duplicates=%d", g, readers, readers-1)
-	}
-	if ra := s.ByRA[contentFillUnattributedRA]; ra.Fills != readers || ra.Duplicates != readers-1 {
-		t.Fatalf("by_ra = %+v, want fills=%d duplicates=%d", s.ByRA, readers, readers-1)
-	}
-	if s.Duration.Count != readers {
-		t.Fatalf("fill_duration_ms count = %d, want one sample per fill (%d)", s.Duration.Count, readers)
-	}
-	fill710RequireIdle(t, s)
-	t.Logf("#710 baseline: %d readers → fills=%d duplicates=%d inflight_peak=%d inflight_bytes_peak=%d (envelope %d B)",
-		readers, s.Total["known_stale"], s.Duplicate["known_stale"], s.InflightPeak, s.InflightBytesPeak, envLen.Load())
 }
 
 // TestContentFill710_DispatchCarriesPprofLabelsAndResolveThreadsTheRA drives a

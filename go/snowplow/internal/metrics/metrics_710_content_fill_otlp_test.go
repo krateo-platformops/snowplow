@@ -32,15 +32,19 @@ func TestIssue710_ContentFillSeriesReachOTLP(t *testing.T) {
 	}
 
 	reasons := restactionsapi.ContentFillReasons()
-	type want struct{ total, dup, bytes int64 }
+	type want struct{ total, dup, bytes, joined, refused int64 }
 	wants := map[string]want{}
 	for i, r := range reasons {
-		w := want{total: int64(10 + i), dup: int64(1 + i), bytes: int64(1000 * (i + 1))}
+		w := want{total: int64(10 + i), dup: int64(1 + i), bytes: int64(1000 * (i + 1)), joined: int64(100 + i), refused: int64(20 + i)}
 		if !restactionsapi.AddContentFillForTest(r, uint64(w.total), uint64(w.dup), uint64(w.bytes)) {
 			t.Fatalf("AddContentFillForTest(%q): not a reason of the set", r)
 		}
+		if !restactionsapi.AddContentFillJoinForTest(r, uint64(w.joined), uint64(w.refused), 0) {
+			t.Fatalf("AddContentFillJoinForTest(%q): not a reason of the set", r)
+		}
 		wants[r] = w
 	}
+	restactionsapi.AddContentFillJoinForTest(reasons[0], 0, 0, 7)
 	restactionsapi.AddContentFillInflightForTest(3, 4242)
 	restactionsapi.RecordContentFillDurationForTest(7)
 	restactionsapi.RecordContentFillDurationForTest(700)
@@ -62,6 +66,8 @@ func TestIssue710_ContentFillSeriesReachOTLP(t *testing.T) {
 		{"snowplow_apistage_content_fill_total", func(w want) int64 { return w.total }},
 		{"snowplow_apistage_content_fill_duplicate_total", func(w want) int64 { return w.dup }},
 		{"snowplow_apistage_content_fill_bytes_total", func(w want) int64 { return w.bytes }},
+		{"snowplow_apistage_content_fill_joined_total", func(w want) int64 { return w.joined }},
+		{"snowplow_apistage_content_fill_join_refused_total", func(w want) int64 { return w.refused }},
 	} {
 		pts := pointsFor(all, c.name)
 		if len(pts) != len(reasons) {
@@ -81,6 +87,7 @@ func TestIssue710_ContentFillSeriesReachOTLP(t *testing.T) {
 		"snowplow_apistage_content_fill_not_servable_total": 0,
 		"snowplow_apistage_content_fill_inflight":           3,
 		"snowplow_apistage_content_fill_inflight_bytes":     4242,
+		"snowplow_apistage_content_fill_join_waiting":       7,
 	} {
 		pts := pointsFor(all, name)
 		if len(pts) != 1 || pts[0].value != w || len(pts[0].attrs) != 0 {

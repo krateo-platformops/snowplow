@@ -140,6 +140,9 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ApistageL1Enabled": readOnly443, "ApistagePrewarmFromContext": readOnly443,
 	"BackgroundResolveFromContext": readOnly443, "CatalogUnservableTTL": readOnly443,
 	"ClientConfigFor": readOnly443, "ComputeKey": readOnly443, "DepGenEpochNow": readOnly443,
+	// #710 PR-1 — the single-flight join check (a load of the #375 bucket/floor
+	// seq) and the detached fill's deadline (a read of the store's window).
+	"ContentCoordinateMovedSince": readOnly443, "DemandRevalidationDeadline": readOnly443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
 	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,
