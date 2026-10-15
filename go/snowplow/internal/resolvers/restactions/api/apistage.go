@@ -452,12 +452,29 @@ func (c callPathVerb) GetVerb() string {
 // downstream — the two narrowings DIVERGE for real UAF steps (verb/resource/
 // namespace-source differ), so applying raw RBAC to a UAF step would wrongly
 // strip the UAF-intended scope (the Diego/arch UAF verdict).
+//
+// #710 PR-2a — err is non-nil only when the call's content fill could not be
+// admitted under the memory ceiling before its deadline
+// (ErrContentFillAdmissionTimeout, D1): the caller records a stage error. It
+// must NOT fall through to another dispatch branch, which would rebuild the
+// whole list the gate refused.
 func apistageContentServe(
 	ctx context.Context,
 	store *cache.ResolvedCacheStore,
 	call httpcall.RequestOptions,
 	uafActive bool,
 ) (value any, served bool, ok bool) {
+	value, served, ok, _ = apistageContentServeE(ctx, store, call, uafActive)
+	return value, served, ok
+}
+
+// apistageContentServeE is apistageContentServe with the admission error.
+func apistageContentServeE(
+	ctx context.Context,
+	store *cache.ResolvedCacheStore,
+	call httpcall.RequestOptions,
+	uafActive bool,
+) (value any, served bool, ok bool, err error) {
 	log := xcontext.Logger(ctx)
 
 	// Ship 0.30.193 Checkpoint 3 — per-call apistageContentServe
@@ -485,11 +502,11 @@ func apistageContentServe(
 	// same shape dispatchViaInformer can serve. A write verb or a
 	// non-apiserver path is not a content unit.
 	if ptr.Deref(call.Verb, http.MethodGet) != http.MethodGet {
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path)
 	if !parseOK {
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	isList := name == ""
 	// #618 — classify the query BEFORE any cell is read or written. A query
@@ -501,7 +518,7 @@ func apistageContentServe(
 	if !query.applicable {
 		recordListQuery(query)
 		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerListQuery, gvr.String())
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	contentKey := cache.ComputeKey(contentKeyInputsQ(gvr, ns, name, query.canon))
 
@@ -696,10 +713,15 @@ func apistageContentServe(
 		// and shared parsed items through this reader's own gate below, exactly as a
 		// content HIT serves entry.Items.
 		res, ok := flight.wait(ctx)
+		if res.err != nil {
+			// #710 PR-2a (D1) — the flight was never admitted: this reader errors
+			// with it.
+			return nil, false, true, res.err
+		}
 		if !ok {
 			// The flight was not servable (its leader fell through too), or this
 			// reader's own ctx ended while it waited.
-			return nil, false, false
+			return nil, false, false, nil
 		}
 		envelope, parsed, haveParsed = res.envelope, res.parsed, res.haveParsed
 		if res.stored {
@@ -751,9 +773,22 @@ func apistageContentServe(
 		if !dispatchedOK {
 			// Not pivot-servable — the content layer cannot serve it.
 			fill.notServable()
-			return nil, false, false
+			return nil, false, false, nil
 		}
 		fill.dispatched(dispatched)
+		// #710 PR-2a — memory admission for this flight (apistage_fill_admission.go):
+		// the envelope's exact size is known now, the decode has not started. It
+		// queues (bounded by the detached fill ctx: the write deadline) while the
+		// aggregate estimated weight of the fills in flight would exceed the shared
+		// ceiling. Released right after the Put below; joiners pay nothing.
+		release, aerr := admitContentFill(ctx, gvr.String(), int64(len(dispatched)), contentFillClassOf(ctx))
+		if aerr != nil {
+			// D1 — never admitted before the deadline: this reader and every
+			// joiner error. Nothing is decoded, stored or served stale.
+			flight.complete(contentFlightResult{err: aerr})
+			return nil, false, true, aerr
+		}
+		defer release()
 		envelope = dispatched
 		// uaf-scope-waiver: PRE-refilter substrate, same reasoning as cluster_list.go — the raw per-K8s-call envelope, identity-free by key, narrowed only downstream on the way to the requester. Never holds refilter output.
 		// scope-waiver:TTLOverride: apistage identity-free content substrate — sets its OWN data-plane CATALOG_UNSERVABLE TTLOverride CONDITIONALLY on newEntry below (not a keyed literal element); NOT the UAF-cap class (no BindingUID / no per-user refilter output) — uaf_shortttl.go R-d-4 SITE MAP.
@@ -835,6 +870,9 @@ func apistageContentServe(
 		}
 		// #710 — the fill's duration: dispatch start to parse + Put done.
 		fill.done()
+		// #710 PR-2a — the decoded tree is stored (live heap the ceiling reads) or
+		// dropped: release the admission, calibrating this GVR's expansion.
+		release()
 		// #710 PR-1 — hand the result to the joiners now: the envelope and the
 		// parsed items are immutable from here on.
 		flight.complete(contentFlightResult{
@@ -852,7 +890,7 @@ func apistageContentServe(
 		// Prewarm: no requester — populate the content entry only, do not
 		// gate or feed dict[id]. served=false tells the caller not to use
 		// the bytes (the prewarm resolve discards dict).
-		return nil, false, true
+		return nil, false, true, nil
 	}
 	// R3: a LIST with pre-parsed items gates unmarshal-free; everything
 	// else (GET-by-name, or a LIST whose envelope failed to pre-parse)
@@ -901,9 +939,9 @@ func apistageContentServe(
 	}
 	if !gateOK {
 		// Fail-closed — no identity / GET denied. Fall through to apiserver.
-		return nil, false, true
+		return nil, false, true, nil
 	}
-	return gated, true, true
+	return gated, true, true, nil
 }
 
 // serveParsedListEnvelope returns the cell's pre-parsed list items as

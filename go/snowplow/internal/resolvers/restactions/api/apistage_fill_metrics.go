@@ -150,15 +150,19 @@ var (
 	contentFillByGVRMap = map[string]*ContentFillGVRStats{}
 	contentFillByRAMap  = map[string]*ContentFillRAStats{}
 
-	// contentFillDurBuckets[i] counts fills with bounds[i-1] < duration ≤
-	// bounds[i]; the last slot is +Inf.
-	contentFillDurBuckets = make([]atomic.Uint64, len(ContentFillDurationBoundsMS)+1)
-	contentFillDurCount   atomic.Uint64
-	contentFillDurSumMS   atomic.Uint64
-	contentFillDurMaxMS   atomic.Int64
+	// contentFillDurHist is one fill's duration; contentFillAdmWaitHist (#710
+	// PR-2a) one flight's wait for memory admission.
+	contentFillDurHist     = newMSHistogram()
+	contentFillAdmWaitHist = newMSHistogram()
 
-	// contentFillDurRecorder is the OTLP histogram hook metrics installs.
-	contentFillDurRecorder atomic.Pointer[func(ms int64)]
+	// #710 PR-2a — the content-fill admission gate (apistage_fill_admission.go).
+	contentFillAdmissionQueued         [fillAdmissionClasses]atomic.Int64
+	contentFillAdmissionTimeout        [fillAdmissionClasses]atomic.Uint64
+	contentFillAdmissionInflightWeight atomic.Int64
+	// contentFillAdmissionInflightWeightPeak is the admitted weight's
+	// high-water mark since boot: it must never exceed the ceiling except by
+	// the inFlight == 0 escape of a single fill.
+	contentFillAdmissionInflightWeightPeak atomic.Int64
 
 	contentFillLogLast       atomic.Int64 // unix nanos of the last emitted line
 	contentFillLogSuppressed atomic.Uint64
@@ -198,15 +202,91 @@ type ContentFillDurationStats struct {
 	MaxMS   int64
 }
 
-// SetContentFillDurationRecorder installs the OTLP histogram hook (this
-// package cannot import metrics). nil uninstalls it.
-func SetContentFillDurationRecorder(fn func(ms int64)) {
+// msHistogram is a fixed-bound millisecond histogram over
+// ContentFillDurationBoundsMS with an optional OTLP hook. Lock-free.
+type msHistogram struct {
+	// buckets[i] counts samples with bounds[i-1] < ms ≤ bounds[i]; the last
+	// slot is +Inf.
+	buckets  []atomic.Uint64
+	count    atomic.Uint64
+	sumMS    atomic.Uint64
+	maxMS    atomic.Int64
+	recorder atomic.Pointer[func(ms int64)]
+}
+
+func newMSHistogram() *msHistogram {
+	return &msHistogram{buckets: make([]atomic.Uint64, len(ContentFillDurationBoundsMS)+1)}
+}
+
+func (h *msHistogram) record(ms int64) {
+	ms = max(ms, 0)
+	i := 0
+	for i < len(ContentFillDurationBoundsMS) && ms > ContentFillDurationBoundsMS[i] {
+		i++
+	}
+	h.buckets[i].Add(1)
+	h.count.Add(1)
+	h.sumMS.Add(uint64(ms))
+	storeMax(&h.maxMS, ms)
+	if rec := h.recorder.Load(); rec != nil {
+		(*rec)(ms)
+	}
+}
+
+func (h *msHistogram) setRecorder(fn func(ms int64)) {
 	if fn == nil {
-		contentFillDurRecorder.Store(nil)
+		h.recorder.Store(nil)
 		return
 	}
-	contentFillDurRecorder.Store(&fn)
+	h.recorder.Store(&fn)
 }
+
+func (h *msHistogram) snapshot() ContentFillDurationStats {
+	d := ContentFillDurationStats{
+		Buckets: make([]uint64, len(h.buckets)),
+		Count:   h.count.Load(),
+		SumMS:   h.sumMS.Load(),
+		MaxMS:   h.maxMS.Load(),
+	}
+	var cum uint64
+	for i := range h.buckets {
+		cum += h.buckets[i].Load()
+		d.Buckets[i] = cum
+	}
+	return d
+}
+
+// expvarValue renders the histogram for /debug/vars: cumulative le_<bound>
+// buckets plus le_inf, count, sum_ms and max_ms.
+func (h *msHistogram) expvarValue() map[string]any {
+	d := h.snapshot()
+	buckets := make(map[string]uint64, len(d.Buckets))
+	for i, b := range ContentFillDurationBoundsMS {
+		buckets["le_"+strconv.FormatInt(b, 10)] = d.Buckets[i]
+	}
+	buckets["le_inf"] = d.Buckets[len(d.Buckets)-1]
+	return map[string]any{"buckets": buckets, "count": d.Count, "sum_ms": d.SumMS, "max_ms": d.MaxMS}
+}
+
+func (h *msHistogram) reset() {
+	for i := range h.buckets {
+		h.buckets[i].Store(0)
+	}
+	h.count.Store(0)
+	h.sumMS.Store(0)
+	h.maxMS.Store(0)
+}
+
+// SetContentFillDurationRecorder installs the fill-duration OTLP histogram
+// hook (this package cannot import metrics). nil uninstalls it.
+func SetContentFillDurationRecorder(fn func(ms int64)) { contentFillDurHist.setRecorder(fn) }
+
+// SetContentFillAdmissionWaitRecorder installs the admission-wait OTLP
+// histogram hook (#710 PR-2a). nil uninstalls it.
+func SetContentFillAdmissionWaitRecorder(fn func(ms int64)) { contentFillAdmWaitHist.setRecorder(fn) }
+
+// recordContentFillAdmissionWait folds one flight's admission wait.
+func recordContentFillAdmissionWait(ms int64) { contentFillAdmWaitHist.record(ms) }
 
 // contentFillOwner names the RESTAction and stage a content call belongs to,
 // for the fill's pprof labels, _by_ra and log line. Neither carries identity:
@@ -336,19 +416,7 @@ func (f *contentFill) done() {
 
 // recordContentFillDuration folds one fill duration into the histogram and
 // the OTLP hook.
-func recordContentFillDuration(ms int64) {
-	i := 0
-	for i < len(ContentFillDurationBoundsMS) && ms > ContentFillDurationBoundsMS[i] {
-		i++
-	}
-	contentFillDurBuckets[i].Add(1)
-	contentFillDurCount.Add(1)
-	contentFillDurSumMS.Add(uint64(ms))
-	storeMax(&contentFillDurMaxMS, ms)
-	if rec := contentFillDurRecorder.Load(); rec != nil {
-		(*rec)(ms)
-	}
-}
+func recordContentFillDuration(ms int64) { contentFillDurHist.record(ms) }
 
 // end closes the fill: releases its in-flight share, folds its size into the
 // GVR and RA rows and emits the rate-limited log line.
@@ -491,7 +559,7 @@ func ContentFillStatsSnapshot() ContentFillStats {
 		InflightBytes:     contentFillInflightBytes.Load(),
 		InflightPeak:      contentFillInflightPeak.Load(),
 		InflightBytesPeak: contentFillInflightBytesPeak.Load(),
-		Duration:          contentFillDurationSnapshot(),
+		Duration:          contentFillDurHist.snapshot(),
 	}
 	for r := contentFillReason(0); r < contentFillReasons; r++ {
 		s.Total[r.String()] = contentFillTotal[r].Load()
@@ -513,31 +581,32 @@ func ContentFillStatsSnapshot() ContentFillStats {
 	return s
 }
 
-func contentFillDurationSnapshot() ContentFillDurationStats {
-	d := ContentFillDurationStats{
-		Buckets: make([]uint64, len(contentFillDurBuckets)),
-		Count:   contentFillDurCount.Load(),
-		SumMS:   contentFillDurSumMS.Load(),
-		MaxMS:   contentFillDurMaxMS.Load(),
-	}
-	var cum uint64
-	for i := range contentFillDurBuckets {
-		cum += contentFillDurBuckets[i].Load()
-		d.Buckets[i] = cum
-	}
-	return d
+// ContentFillAdmissionStats is the #710 PR-2a admission gate's state: waiters
+// and timeouts by class (the closed ContentFillAdmissionClasses set), the
+// in-flight estimated weight, the wait histogram and the calibrated decode
+// expansion per GVR.
+type ContentFillAdmissionStats struct {
+	Queued         map[string]int64
+	Timeout        map[string]uint64
+	InflightWeight int64
+	Wait           ContentFillDurationStats
+	Expansion      map[string]float64
 }
 
-// contentFillDurationExpvar renders the histogram for /debug/vars: cumulative
-// le_<bound> buckets plus le_inf, count, sum_ms and max_ms.
-func contentFillDurationExpvar() map[string]any {
-	d := contentFillDurationSnapshot()
-	buckets := make(map[string]uint64, len(d.Buckets))
-	for i, b := range ContentFillDurationBoundsMS {
-		buckets["le_"+strconv.FormatInt(b, 10)] = d.Buckets[i]
+// ContentFillAdmissionStatsSnapshot returns every class of the closed set.
+func ContentFillAdmissionStatsSnapshot() ContentFillAdmissionStats {
+	s := ContentFillAdmissionStats{
+		Queued:         make(map[string]int64, fillAdmissionClasses),
+		Timeout:        make(map[string]uint64, fillAdmissionClasses),
+		InflightWeight: contentFillAdmissionInflightWeight.Load(),
+		Wait:           contentFillAdmWaitHist.snapshot(),
+		Expansion:      contentFillExpansionSnapshot(),
 	}
-	buckets["le_inf"] = d.Buckets[len(d.Buckets)-1]
-	return map[string]any{"buckets": buckets, "count": d.Count, "sum_ms": d.SumMS, "max_ms": d.MaxMS}
+	for c := fillAdmissionClass(0); c < fillAdmissionClasses; c++ {
+		s.Queued[c.String()] = contentFillAdmissionQueued[c].Load()
+		s.Timeout[c.String()] = contentFillAdmissionTimeout[c].Load()
+	}
+	return s
 }
 
 // ResetContentFillStatsForTest zeroes every counter, gauge, peak and table. It
@@ -556,12 +625,12 @@ func ResetContentFillStatsForTest() {
 	contentFillInflightBytes.Store(0)
 	contentFillInflightPeak.Store(0)
 	contentFillInflightBytesPeak.Store(0)
-	for i := range contentFillDurBuckets {
-		contentFillDurBuckets[i].Store(0)
+	contentFillDurHist.reset()
+	contentFillAdmWaitHist.reset()
+	for c := range contentFillAdmissionTimeout {
+		contentFillAdmissionTimeout[c].Store(0)
 	}
-	contentFillDurCount.Store(0)
-	contentFillDurSumMS.Store(0)
-	contentFillDurMaxMS.Store(0)
+	resetContentFillGateForTest()
 	contentFillLogLast.Store(0)
 	contentFillLogSuppressed.Store(0)
 	contentFillMu.Lock()
@@ -602,6 +671,25 @@ func AddContentFillJoinForTest(reason string, j, r uint64, w int64) bool {
 	}
 	return false
 }
+
+// AddContentFillAdmissionForTest moves the admission series of class (#710
+// PR-2a) through their production atomics: q queued, n timeouts, w to the
+// in-flight weight. false: not a class of the set. Production MUST NOT use it.
+func AddContentFillAdmissionForTest(class string, q int64, n uint64, w int64) bool {
+	for i, name := range fillAdmissionClassNames {
+		if name == class {
+			contentFillAdmissionQueued[i].Add(q)
+			contentFillAdmissionTimeout[i].Add(n)
+			contentFillAdmissionInflightWeight.Add(w)
+			return true
+		}
+	}
+	return false
+}
+
+// RecordContentFillAdmissionWaitForTest records one admission wait through
+// the production histogram path. Production MUST NOT use it.
+func RecordContentFillAdmissionWaitForTest(ms int64) { recordContentFillAdmissionWait(ms) }
 
 // AddContentFillInflightForTest moves the in-flight gauges through their
 // production atomics. Production MUST NOT use it.
@@ -660,7 +748,25 @@ func registerContentFillExpvar() {
 			return contentFillInflightBytesPeak.Load()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_duration_ms", expvar.Func(func() any {
-			return contentFillDurationExpvar()
+			return contentFillDurHist.expvarValue()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_admission_wait_ms", expvar.Func(func() any {
+			return contentFillAdmWaitHist.expvarValue()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_admission_queued", expvar.Func(func() any {
+			return ContentFillAdmissionStatsSnapshot().Queued
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_admission_timeout_total", expvar.Func(func() any {
+			return ContentFillAdmissionStatsSnapshot().Timeout
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_admission_inflight_weight", expvar.Func(func() any {
+			return contentFillAdmissionInflightWeight.Load()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_admission_inflight_weight_peak", expvar.Func(func() any {
+			return contentFillAdmissionInflightWeightPeak.Load()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_admission_expansion", expvar.Func(func() any {
+			return contentFillExpansionSnapshot()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_by_gvr", expvar.Func(func() any {
 			return ContentFillStatsSnapshot().ByGVR

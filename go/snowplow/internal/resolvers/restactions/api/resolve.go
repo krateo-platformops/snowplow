@@ -932,7 +932,23 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// content), and the UAF refilter still runs downstream. Only a
 			// STORED UAF stage is served un-narrowed for the refilter alone.
 			uafContent := apiCall.UserAccessFilter != nil && r.opts.Provenance != ProvenanceCallerSupplied
-			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call, uafContent); ok {
+			gatedVal, served, ok, cerr := apistageContentServeE(gctx, r.apistageStore, call, uafContent)
+			if cerr != nil {
+				// #710 PR-2a (D1) — the call's content fill was not admitted under
+				// the memory ceiling before its deadline: an honest per-item stage
+				// error, never a fall-through that would rebuild the refused list.
+				r.log.Error("apistage content fill not admitted",
+					slog.String("name", id),
+					slog.String("path", call.Path),
+					slog.String("error", cerr.Error()))
+				var itemErr error
+				if !call.ContinueOnError {
+					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, cerr)
+				}
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, cerr.Error(), cerr.Error(), itemErr)
+				return nil
+			}
+			if ok {
 				if served {
 					// Ship 0.30.128 P-CORE-2: the gated envelope is
 					// already a decoded structured value — feed it

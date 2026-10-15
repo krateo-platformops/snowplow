@@ -143,6 +143,9 @@ var cacheAllow443 = map[string]cacheClass443{
 	// #710 PR-1 — the single-flight join check (a load of the #375 bucket/floor
 	// seq) and the detached fill's deadline (a read of the store's window).
 	"ContentCoordinateMovedSince": readOnly443, "DemandRevalidationDeadline": readOnly443,
+	// #710 PR-2a — the content-fill admission gate reads the shared ceiling and
+	// live-heap sampler (runtime reads, no cache state).
+	"AdmissionCeiling": readOnly443, "AdmissionLiveHeapSample": readOnly443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
 	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,
@@ -253,7 +256,7 @@ var cacheAllow443 = map[string]cacheClass443{
 // callerAllow443: for each gatedAtCaller symbol, the "<file>:<func>" sites
 // allowed to use it. Each listed function must contain a cache.Inert check.
 var callerAllow443 = map[string][]string{
-	"ServeCell":                {"apistage.go:apistageContentServe", "ra_full_list.go:raFullListServe"},
+	"ServeCell":                {"apistage.go:apistageContentServeE", "ra_full_list.go:raFullListServe"},
 	"ResolvedEntry.NoteHitter": {"ra_full_list.go:raFullListServe"},
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},
@@ -265,6 +268,7 @@ var callerAllow443 = map[string][]string{
 var goAllow443 = map[string]bool{
 	"cluster_list.go:populateClusterListCellAsync":      true,  // (d): returns before the detached populate under the flag
 	"nested_resolve_bound.go:waitForReleaseOrCtx":       false, // cond.Broadcast on ctx.Done: no cache access
+	"apistage_fill_admission.go:waitLocked":             false, // #710 PR-2a: cond.Broadcast on ctx.Done: no cache access
 	"informer_dispatch_metrics.go:startDispatchSummary": false, // once-per-process summary log ticker
 	"informer_serve.go:startObjectsGetSummary":          false, // once-per-process summary log ticker
 }

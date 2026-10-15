@@ -65,6 +65,9 @@ type contentFlightResult struct {
 	// stored cell. A joiner Records its dep only then, as the leader does (#189).
 	stored bool
 	entry  *cache.ResolvedEntry
+	// err (#710 PR-2a) is the flight's admission failure: every reader in it
+	// errors with it (D1).
+	err error
 }
 
 // contentFlight is one in-flight fill of one content key.

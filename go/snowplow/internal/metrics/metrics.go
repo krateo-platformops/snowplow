@@ -1495,6 +1495,46 @@ func registerContentFillInstruments(m metric.Meter) error {
 		return err
 	}
 	restactionsapi.SetContentFillDurationRecorder(func(ms int64) { duration.Record(context.Background(), ms) })
+	// #710 PR-2a — the memory admission gate. `class` is the closed admission
+	// class set {background, customer}.
+	admWait, err := m.Int64Histogram("snowplow_apistage_content_fill_admission_wait_ms",
+		metric.WithDescription("One content-fill flight's wait for memory admission under the shared AdmissionCeiling (ms). #710 PR-2a."),
+		metric.WithUnit("ms"),
+		metric.WithExplicitBucketBoundaries(int64sToFloat64s(restactionsapi.ContentFillDurationBoundsMS)...),
+	)
+	if err != nil {
+		return err
+	}
+	restactionsapi.SetContentFillAdmissionWaitRecorder(func(ms int64) { admWait.Record(context.Background(), ms) })
+	admQueued, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_admission_queued",
+		metric.WithDescription("Content-fill flights waiting for memory admission now, by class. #710 PR-2a."))
+	if err != nil {
+		return err
+	}
+	admTimeout, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_admission_timeout_total",
+		metric.WithDescription("Content-fill flights not admitted before the write deadline (the readers get a 503 stage error; D1), by class. Alert on > 0. #710 PR-2a."))
+	if err != nil {
+		return err
+	}
+	admWeight, err := m.Int64ObservableGauge("snowplow_apistage_content_fill_admission_inflight_weight",
+		metric.WithDescription("Estimated bytes (raw envelope × calibrated decode expansion) of the content fills admitted now. #710 PR-2a."),
+		metric.WithUnit("By"))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		a := restactionsapi.ContentFillAdmissionStatsSnapshot()
+		for _, c := range restactionsapi.ContentFillAdmissionClasses() {
+			attrs := metric.WithAttributes(attribute.String("class", c))
+			o.ObserveInt64(admQueued, a.Queued[c], attrs)
+			o.ObserveInt64(admTimeout, int64(a.Timeout[c]), attrs)
+		}
+		o.ObserveInt64(admWeight, a.InflightWeight)
+		return nil
+	}, admQueued, admTimeout, admWeight)
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		s := restactionsapi.ContentFillStatsSnapshot()
 		for _, r := range restactionsapi.ContentFillReasons() {
