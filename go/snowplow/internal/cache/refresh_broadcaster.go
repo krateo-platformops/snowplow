@@ -463,12 +463,15 @@ func PublishRefresh(l1Key string) {
 // blocking send.
 func (h *refreshBroadcaster) fanoutRefresh(l1Key string) {
 	h.mu.RLock()
+	offered := 0
 	for _, s := range h.keySubs[l1Key] {
 		fanoutVisitsForTest.Add(1)
 		s.offerRefresh(l1Key)
+		offered++
 	}
 	h.mu.RUnlock()
 	refreshPublishedTotal.Add(1)
+	noteRefreshFanout(l1Key, offered) // #710 PR-2b — the owed push reached a tab
 }
 
 // offerRefresh hands one committed key to this subscriber: straight into the
@@ -823,6 +826,20 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 		h.armLocked(s, k)
 	}
 	h.mu.Unlock()
+	// #710 PR-2b — /refreshes has no replay: a stale-derived body whose
+	// replacement was published before this tab armed is announced NOW, to
+	// this subscriber (a spurious emit costs one refetch).
+	for k := range armedKeys {
+		if !staleOwedReady(k) {
+			continue
+		}
+		h.mu.RLock()
+		s.offerRefresh(k)
+		h.mu.RUnlock()
+		if clearStaleOwed(k) {
+			staleOwedArmEmits.Add(1)
+		}
+	}
 
 	var once sync.Once
 	unsub := func() {

@@ -233,6 +233,38 @@ Defined in `internal/resolvers/restactions/api/apistage_fill_metrics.go`. A **fi
 
 CPU profiles carry the pprof labels `apistage_fill_gvr`, `apistage_fill_reason` and `apistage_fill_ra` on the fill's dispatch and parse. Heap profiles do not record labels. The Debug line `apistage.content_fill` is rate-limited to 1/s and carries a `suppressed` count. It never names the object or the requester.
 
+### Apistage stale serve (D2): show stale, refill at once, push (#710 PR-2b)
+Defined in `internal/resolvers/restactions/api/apistage_stale_debt.go`, with the write point in `internal/handlers/dispatchers/stale_write_point.go` and the owed-push marks in `internal/cache/stale_serve.go`. Owner ruling: a customer read inside an **armable** resolve (restactions, widgets) that finds its identity-free content cell **known-stale** (#547) is served that cell **at once**. In the same locked step, the content key opens (or joins) a **debt**:
+- an immediate refill at the `debt` admission class, which never queues;
+- the refill is non-droppable: on failure it retries with backoff (10 ms doubling to 5 s) until a fill whose epoch is at or after the stale mark commits;
+- on commit, each **committed** dependent customer cell is re-resolved at once through its refresh handler, outside the refresher queue, and its `/refreshes` signal is published. A cell the re-resolve did not replace is evicted (compare-and-evict), so the pushed refetch is a fresh fill.
+
+**The write-point guarantee** (Diego: "serving stale data is correct only if the updated value will be served later in few seconds"). Whether a response can be corrected is exactly known only at the dispatcher's write point, after the whole Put-gate chain:
+- **accepted Put** (the refresh header is armed): the dependent is *committed*. Its key gets an **owed-push mark**, and the stale body is written;
+- **declined Put** (stage error, external, UAF, sensitive, ext-TTL, a refused `PutIfGen`): the dependent is *withdrawn*. The stale body is **never written**: the request re-runs once with D2 disabled (its content reads read through, never queued) and serves that fresh body.
+
+`/refreshes` has no replay. The owed mark therefore carries the push to a tab that arms **after** the replacement was published: on arm, a key whose mark is set and whose cell is no longer stale-derived (replaced **or evicted**) gets `event: refresh` at once. The mark is cleared when a refresh reaches an armed tab. It survives the cell's eviction, and the set is bounded by the L1 store's own entry budget (oldest dropped first).
+
+Substrate fills (a nested resolve that re-scopes the L1 key, such as the RAFullList) are out of the sink's scope and read through, so a stale body is never baked into a cell that later resolves read as input. Non-armable readers (no push path) keep #547's read-through. The bar is `stale_to_push` p95 ≤ 3 s and max ≤ 10 s, with 1 s as the target. Every series below is on expvar and on OTLP, and only `stale_serve_total{reason}` and `stale_serve_withdrawn_total{reason}` are labelled.
+
+| expvar | meaning | healthy range |
+|---|---|---|
+| `snowplow_apistage_stale_serve_total` | map `reason` (`known_stale`) → customer reads served a known-stale content cell at once | the stale-serve share of hits, reported by the bench |
+| `snowplow_apistage_stale_to_push_ms` | histogram (cumulative `le_*`, with buckets at exactly **1000 / 3000 / 10000**, plus `count`, `sum_ms`, `max_ms`): stale serve → the replacement's publish to an armed tab | **p95 ≤ 3000, max ≤ 10000**, target 1000 |
+| `snowplow_apistage_stale_serve_age_ms` | histogram: the age of the body served stale (since its known-stale window opened) | diagnostic |
+| `snowplow_apistage_stale_debt_open` / `_debt_oldest_age_ms` | gauges: open debts and the age of the oldest | **0** at rest; back to 0 within 10 s after a burst |
+| `snowplow_apistage_stale_debt_retries_total` | failed refill attempts retried | low |
+| `snowplow_apistage_stale_overdue_total` | debts open past 10 s, counted **once** each, with one WARN `apistage.stale_debt_overdue` (metadata only). The debt stays open; there is no breaker | **0**. Alert on rate > 0 |
+| `snowplow_apistage_stale_serve_withdrawn_total` | map `reason` (`unarmable`) → stale serves withdrawn at the write point because the Put was declined; the response re-ran fresh | low; each costs one extra resolve |
+| `snowplow_apistage_stale_push_total` | replacement publishes that found an armed tab | ≈ committed stale-served dependents |
+| `snowplow_apistage_stale_push_unarmed_total` | replacement publishes that found no armed tab yet; the owed mark announces the key when a tab arms | informational, **not** a guarantee failure (a tab that never arms has nobody looking at stale data) |
+| `snowplow_apistage_stale_owed_open` | gauge: keys written stale whose fresh value has not yet reached an armed tab | small; drains as tabs arm |
+| `snowplow_apistage_stale_owed_arm_emits_total` | refresh events emitted at `/refreshes` arm time for a key whose replacement was published before the tab armed | tracks `stale_push_unarmed_total` |
+| `snowplow_apistage_stale_owed_dropped_total` | owed marks dropped by the L1-capacity bound before reaching a tab: **a guarantee failure** | **0**. A bench gate |
+| `snowplow_apistage_stale_dependent_unresolved_total` | debt-lane re-resolves that did not replace the cell; the stale-derived cell is evicted and the push still goes out | low |
+
+The customer cell a stale serve fed is stored with `ResolvedEntry.StaleDerived` (metadata only). A HIT on such a cell before its replacement lands is armed and refreshes the key's owed mark.
+
 ### Prewarm — boot warm-up completion + walk coverage
 
 | expvar | meaning | healthy range |

@@ -2476,6 +2476,7 @@ func resetDepsForTest() {
 // cross-package test cannot leak the DELETE-eviction worker goroutine
 // or stale bridge counters into the next case.
 func ResetDepsForTest() {
+	quiesceStaleServeForTest() // #710 PR-2b — D2 debts read Deps()
 	// Order is load-bearing (1.12.6 item 7 gate + #206, -race at -count=3):
 	//  1. stop + JOIN the resolved_cache.summary goroutine FIRST. It is a
 	//     PURE READER that starts no workers, and each tick reads THREE

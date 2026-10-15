@@ -260,6 +260,13 @@ type ResolvedEntry struct {
 	// defeated #496's warmth gate indefinitely.
 	SeededAtBoot bool
 
+	// StaleDerived (#710 PR-2b, metadata only) marks a customer cell whose
+	// resolve was served at least one KNOWN-STALE content cell as input (the
+	// D2 stale serve: "show then replace", owner ruling 1). Its debt refill
+	// re-resolves and replaces it, pushing the armed tab; a re-Put by any path
+	// starts a fresh entry without the flag.
+	StaleDerived bool
+
 	// Inputs is the canonical key-input bundle the entry was resolved
 	// from. The refresher uses it to drive a re-resolve when an
 	// UPDATE/PATCH event fires for any of this entry's dep tuples.
@@ -3738,6 +3745,27 @@ func (c *ResolvedCacheStore) EvictUnrefreshable(key string, want *ResolvedEntry)
 	return true
 }
 
+// EvictStaleDerived is the #710 PR-2b terminal state for a STALE-DERIVED
+// customer cell whose dependent re-resolve did not replace it after its
+// content debt cleared. Kept, every refetch the push triggers would hit the
+// same stale body (the hit path serves it), breaking "the updated value will
+// be served in a few seconds"; evicted, the refetch is a miss — a fresh fill.
+// Same compare-and-evict discipline as EvictUnrefreshable: only if the live
+// entry is still `want`, via removeElementLocked (never evict_delete_total).
+func (c *ResolvedCacheStore) EvictStaleDerived(key string, want *ResolvedEntry) bool {
+	if c == nil || want == nil || !want.StaleDerived {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.index[key]
+	if !ok || el.Value.(*lruItem).entry != want {
+		return false
+	}
+	c.removeElementLocked(el)
+	return true
+}
+
 // reapOneMaxAgeSuppressed re-validates under c.mu — the entry may have been read,
 // re-Put, or un-suppressed (a customer /call re-Put clears the marker) since the
 // walk — that key is still resident, still suppressed, and still past maxEntryAge,
@@ -3923,6 +3951,9 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 // a clean cache. Exported only via the *_test.go shim — production
 // code MUST NOT call this.
 func resetResolvedCacheForTest() {
+	// #710 PR-2b — stop + join the D2 debt goroutines first: they outlive their
+	// request and read this singleton (and Deps()).
+	quiesceStaleServeForTest()
 	// #206 — stop + JOIN the summary goroutine before clearing the
 	// singleton, so it cannot read c.Stats()/Deps() during or after the
 	// reset (mirrors ResetDepsForTest's join-before-write ordering). Also

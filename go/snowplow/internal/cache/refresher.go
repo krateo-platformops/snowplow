@@ -1582,6 +1582,7 @@ func resetRefresherForTest() {
 // for cross-package tests (e.g. internal/handlers/dispatchers' Ship C
 // falsifier). Production code MUST NOT call it.
 func ResetRefresherForTest() {
+	quiesceStaleServeForTest() // #710 PR-2b — D2 debts run refresh handlers
 	resetRefresherForTest()
 }
 

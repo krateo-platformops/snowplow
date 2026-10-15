@@ -88,11 +88,14 @@ type fillAdmissionClass uint8
 const (
 	fillClassBackground fillAdmissionClass = iota
 	fillClassCustomer
+	// fillClassDebt (#710 PR-2b) is a stale-served customer's refill: it
+	// bypasses the cap like a customer and is never dropped.
+	fillClassDebt
 	fillAdmissionClasses
 )
 
 // fillAdmissionClassNames is the closed `class` attribute set, in class order.
-var fillAdmissionClassNames = [fillAdmissionClasses]string{"background", "customer"}
+var fillAdmissionClassNames = [fillAdmissionClasses]string{"background", "customer", "debt"}
 
 func (c fillAdmissionClass) String() string {
 	if c >= fillAdmissionClasses {
@@ -117,6 +120,9 @@ func ContentFillAdmissionClasses() []string { return fillAdmissionClassNames[:] 
 // content fills bypassed this cap as customers. The two gates can no longer
 // disagree on a driver.
 func contentFillClassOf(ctx context.Context) fillAdmissionClass {
+	if contentDebtRefillFromContext(ctx) {
+		return fillClassDebt
+	}
 	if _, refresher := cache.RefreshTriggerGVRFromContext(ctx); refresher ||
 		cache.RefDenialOrigin(ctx) != cache.RefDenialOriginServe || cache.ApistagePrewarmFromContext(ctx) {
 		return fillClassBackground
