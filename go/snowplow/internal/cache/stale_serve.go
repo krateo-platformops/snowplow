@@ -43,14 +43,19 @@ type StaleServeSink struct {
 	l1Key string
 	class string
 	mu    sync.Mutex
-	// served is the content keys this resolve was served stale.
-	served []string
+	// served is the content cells this resolve was served stale. Their reads
+	// were metric-neutral; Commit counts them as the request's hits.
+	served []staleServedRef
 	// state is the dependent's write-point outcome; replaceOnCommit records a
 	// content debt that cleared before the dispatcher committed (its Put comes
 	// after the response is encoded, which can be after a fast refill).
 	state           staleSinkState
 	replaceOnCommit bool
 	servedAt        time.Time
+}
+
+type staleServedRef struct {
+	key string
 }
 
 type staleSinkState uint8
@@ -132,13 +137,15 @@ func (s *StaleServeSink) Class() string {
 	return s.class
 }
 
-// Note records that this resolve was served contentKey stale. Nil-safe.
+// Note records that this resolve was served contentKey stale. The read itself
+// was metric-neutral (a stale serve may still be withdrawn at the write point,
+// and a withdrawn pass must not count): Commit counts it. Nil-safe.
 func (s *StaleServeSink) Note(contentKey string) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	s.served = append(s.served, contentKey)
+	s.served = append(s.served, staleServedRef{key: contentKey})
 	s.mu.Unlock()
 }
 
@@ -191,8 +198,19 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 	}
 	s.state = staleSinkCommitted
 	replaceNow = s.replaceOnCommit
+	served := append([]staleServedRef(nil), s.served...)
 	s.mu.Unlock()
 	MarkStaleOwed(s.l1Key)
+	// The stale bodies are now written: count their reads as this request's
+	// hits, exactly once (a withdrawn pass never reaches here), through the one
+	// customer hit funnel — Get (hit_total, LRU warmth, the #354/#547
+	// serve-while-dirty note; TestIssue354_P3_StaleServeNoteCoversEveryCountedHit).
+	if c := ResolvedCache(); c != nil {
+		for _, r := range served {
+			//serve-probe: counts a committed stale serve's deferred hit; the body was already served
+			c.Get(r.key)
+		}
+	}
 	return replaceNow
 }
 
