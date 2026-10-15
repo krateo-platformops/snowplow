@@ -81,6 +81,30 @@ func WithStaleServeDisabled(ctx context.Context) context.Context {
 	return context.WithValue(ctx, ctxKeyStaleServeOff, true)
 }
 
+// WithCustomerTriggeredRefresh marks ctx as refresh work a CUSTOMER started
+// and is waiting on — a D2 debt's dependent re-resolve, a #547 demand
+// revalidation. It runs through the refresher's resolve (which stamps the
+// refresher origin, so every rule keyed on that origin would class it as
+// background and queue it under pressure), but the owner ruling puts it "at
+// top priority, ahead of all background work": the content-fill gate and the
+// nested-resolve gate check this marker FIRST, before the origin rule.
+func WithCustomerTriggeredRefresh(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxKeyCustomerTriggeredRefresh, true)
+}
+
+// CustomerTriggeredRefreshFromContext reports WithCustomerTriggeredRefresh.
+func CustomerTriggeredRefreshFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(ctxKeyCustomerTriggeredRefresh).(bool)
+	return v
+}
+
+type ctxKeyCustomerTriggeredRefreshType struct{}
+
+var ctxKeyCustomerTriggeredRefresh = ctxKeyCustomerTriggeredRefreshType{}
+
 // StaleServeDisabled reports whether ctx is a withdrawn serve's re-run.
 func StaleServeDisabled(ctx context.Context) bool {
 	if ctx == nil {

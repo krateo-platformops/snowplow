@@ -157,6 +157,9 @@ var cacheAllow443 = map[string]cacheClass443{
 	"StaleServeSinkFromContext": readOnly443, "StaleServeSink.L1Key": readOnly443,
 	"StaleServeSink.ServedAt": readOnly443, "KnownStaleMark": readOnly443,
 	"HasRefreshSubscriber": readOnly443, "StaleOwedStatsSnapshot": readOnly443,
+	// #710 PR-2b — the customer-triggered-refresh marker: a ctx value (set by the debt
+	// lane on its own detached ctx, read by the two admission classifiers).
+	"CustomerTriggeredRefreshFromContext": readOnly443, "WithCustomerTriggeredRefresh": readOnly443,
 	"StaleServeSink.Note": unreachableInert443, "StaleServeSink.NoteServedAt": unreachableInert443,
 	"StaleServeSink.Commit": unreachableInert443, "StaleServeSink.Withdraw": unreachableInert443,
 	"StaleServeSink.DebtCleared": unreachableInert443, "ResolvedCacheStore.EvictStaleDerived": unreachableInert443,

@@ -23,6 +23,13 @@
 //     the ResponseWriter (no header, no WriteHeader, no body) before the re-run.
 //     Mutation → RED: no re-run marker (the re-run reads the cell / counts its
 //     lookup again).
+//   - D2-19b a #547 demand revalidation (a user's hit on a known-stale
+//     identity-bound cell) resolves at the bypass class at BOTH gates.
+//   - D2-19c a D2 debt's dependent re-resolve runs through the production
+//     refresh func (resolveOnceProd stamps the refresher origin) and still
+//     resolves at the bypass class at the content gate and as a CUSTOMER tree
+//     at the nested gate; a plain refresher resolve stays background (control).
+//     Mutation → RED: the customer-triggered check after the origin rule.
 //   - D2-17  invariant sweep: every stale-derived body written in these
 //     scenarios had an accepted Put + the armed header + an owed-push mark.
 //     Mutation → RED: CommitStaleServe skipped (no owed mark) or a stale body
@@ -336,4 +343,69 @@ func TestIssue710_D2_15d_AWithdrawnServeIsCountedOnceAndNothingIsWrittenBeforeTh
 		t.Fatalf("D2-15d RED: the withdrawn GET moved the L1 lookup counters by hit+%d miss+%d, a plain cold GET by "+
 			"hit+%d miss+%d — the re-run counted a second request", h1-h0, m1-m0, h3-h2, m3-m2)
 	}
+}
+
+func TestIssue710_D2_19b_ADemandRevalidationBypassesBothGates(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	h.warm()
+	h.driveChangedToKnownStale("v1")
+	if r, code := h.get(0, k547Changed); code != 200 {
+		t.Fatalf("D2-19b: GET code %d (served %q)", code, r)
+	}
+	var seen []k547GateSeen
+	if !k547WaitFor(t, 10*time.Second, "demand revalidation resolved", func() bool {
+		seen = nil
+		for _, g := range h.gates() {
+			if g.demand {
+				seen = append(seen, g)
+			}
+		}
+		return len(seen) > 0
+	}) {
+		t.Fatalf("PRECONDITION: no demand revalidation resolve observed (%+v)", h.gates())
+	}
+	for _, g := range seen {
+		if !g.triggered || g.fill == "background" || g.nestedBg {
+			t.Fatalf("D2-19b RED: a demand revalidation resolved at %+v — a customer is waiting on it: it must bypass "+
+				"the content gate and be a customer tree at the nested gate", g)
+		}
+	}
+}
+
+func TestIssue710_D2_19c_ADebtDependentReResolveBypassesBothGatesAheadOfTheOriginRule(t *testing.T) {
+	h, _ := k710KnownStaleFound(t)
+	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
+		t.Fatalf("D2-19c: cohort 0 served %q (code %d), want the stale v0", r, code)
+	}
+	if !k547WaitFor(t, 10*time.Second, "widget replaced", func() bool {
+		rr, ok := h.residentReason(h.key(0, k547Changed))
+		return ok && rr == "v1"
+	}) {
+		t.Fatalf("PRECONDITION: the stale-derived widget cell was never replaced")
+	}
+	var dep, plain []k547GateSeen
+	for _, g := range h.gates() {
+		switch {
+		case g.bg && g.triggered:
+			dep = append(dep, g)
+		case g.bg:
+			plain = append(plain, g)
+		}
+	}
+	if len(dep) == 0 {
+		t.Fatalf("PRECONDITION: no debt-lane dependent re-resolve observed (%+v)", h.gates())
+	}
+	for _, g := range dep {
+		if g.fill != "debt" || g.nestedBg {
+			t.Fatalf("D2-19c RED: the dependent re-resolve (refresher origin + customer-triggered) classed fill=%q nestedBg=%v — "+
+				"want the bypass class at the content gate and a customer tree at the nested gate", g.fill, g.nestedBg)
+		}
+	}
+	// Control: a resolve under the refresher origin WITHOUT the marker stays
+	// background at both gates.
+	ctl := cache.WithBackgroundResolveOrigin(context.Background(), cache.BackgroundOriginRefresher)
+	if c := restactionsapi.ContentFillClassForTest(ctl); c != "background" || !restactionsapi.NestedResolveBackgroundForTest(ctl) {
+		t.Fatalf("D2-19c control: a plain refresher ctx classed fill=%q — the bypass leaked to background work", c)
+	}
+	_ = plain
 }

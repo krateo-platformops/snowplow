@@ -247,6 +247,8 @@ Defined in `internal/resolvers/restactions/api/apistage_stale_debt.go`, with the
 
 `/refreshes` has no replay. The owed mark therefore carries the push to a tab that arms **after** the replacement was published: on arm, a key whose mark is set and whose cell is no longer stale-derived (replaced **or evicted**) gets `event: refresh` at once. The mark is cleared when a refresh reaches an armed tab. It survives the cell's eviction, and the set is bounded by the L1 store's own entry budget (oldest dropped first).
 
+**Customer-triggered refresh is never queued.** A debt's dependent re-resolve runs through the refresher's resolve, which stamps the refresher origin, and a #547 demand revalidation is started by a user's hit. Both carry `cache.WithCustomerTriggeredRefresh`, which the content-fill gate (bypass class, labelled `debt`) and the nested-resolve gate (a customer tree) check **before** the origin rule. Every content input of the re-resolve is therefore dispatched at once, ahead of background work.
+
 Substrate fills (a nested resolve that re-scopes the L1 key, such as the RAFullList) are out of the sink's scope and read through, so a stale body is never baked into a cell that later resolves read as input. Non-armable readers (no push path) keep #547's read-through. The bar is `stale_to_push` p95 ≤ 3 s and max ≤ 10 s, with 1 s as the target. Every series below is on expvar and on OTLP, and only `stale_serve_total{reason}` and `stale_serve_withdrawn_total{reason}` are labelled.
 
 | expvar | meaning | healthy range |
