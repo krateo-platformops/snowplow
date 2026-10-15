@@ -89,9 +89,13 @@ const mib = int64(1024 * 1024)
 // occupy() its footprint, hold, vacate(), release. Returns completed count and
 // the count of ctx/admission errors. estUnit is pinned via calibration seed so
 // the gate's weight == the model's perTreeFootprint (deterministic).
+//
+// #720: the trees are BACKGROUND (refresher-marked). Since customer trees
+// never wait, the byte ceiling is a background-only property; the customer
+// side is covered by the N1/N2/N4 arms in nested_resolve_bound_720_test.go.
 func runAggregateTrees(t *testing.T, h *headroomModel, n int, hold time.Duration) (completed, errored int32) {
 	t.Helper()
-	ctx := cache.WithNestedCallDepth(context.Background(), 0)
+	ctx := bgTreeCtx()
 	var done, errs int32
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -126,6 +130,10 @@ func pinEstUnit(w int64) {
 // must keep the SAMPLED peak live heap under limit − reserve = 7 GiB throughout.
 // Assert: (1) peak modeled live heap < limit − reserve (BYTE bound, not a count
 // cap); (2) all N trees complete (bounded event still happens — no dropped tree).
+//
+// #720 N3 (background bounded): the trees are BACKGROUND, the only kind the
+// gate still bounds. Mutation "no gate for background" (admit every background
+// tree at once) → peak breaches → RED.
 func TestAggC1_ByteCeilingHeld_GREEN(t *testing.T) {
 	resetNestedResolveBoundForTest()
 	t.Cleanup(resetNestedResolveBoundForTest)
@@ -196,6 +204,8 @@ func TestAggC1_ByteCeilingBreached_RED(t *testing.T) {
 // TestAggC1_ProgressWhenTight admits UNCONDITIONALLY when inFlight==0 even if a
 // single tree "won't fit" (headroom < estUnit) — the anti-deadlock invariant.
 // Live heap pinned already above the limit; a lone tree must STILL be admitted.
+// #720: driven by a BACKGROUND tree, the only kind that can wait (a customer
+// tree is admitted whatever the headroom, see N1).
 func TestAggC1_ProgressWhenTight(t *testing.T) {
 	resetNestedResolveBoundForTest()
 	t.Cleanup(resetNestedResolveBoundForTest)
@@ -210,7 +220,7 @@ func TestAggC1_ProgressWhenTight(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		release, err := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
+		release, err := enterNestedResolveUnit(bgTreeCtx())
 		if err == nil {
 			release()
 		}
@@ -224,12 +234,15 @@ func TestAggC1_ProgressWhenTight(t *testing.T) {
 	}
 }
 
-// TestAggC3_FallThroughHonest503 is the C3 fall-through arm: headroom pinned low
-// + one tree ALREADY in flight (so inFlight>0, the unconditional-admit escape
-// does not apply) + the second tree's ctx deadline expires while blocked → it
-// returns the ctx error (honest 503-class terminal), NOT empty/raw content, NOT
-// a dropped resolve. The caller (resolve_inprocess.go) propagates this err so
-// the outer /call surfaces a 503.
+// TestAggC3_FallThroughHonest503 is the C3 fall-through arm, rewritten for a
+// BACKGROUND tree (#720): headroom pinned low + one tree ALREADY in flight (so
+// inFlight>0, the unconditional-admit escape does not apply) + the second
+// background tree's ctx deadline expires while blocked → it returns the ctx
+// error, NOT empty/raw content, NOT a dropped resolve. The caller
+// (resolve_inprocess.go) propagates this err; for a background re-resolve that
+// means nothing is Put and the existing cell keeps being served. A CUSTOMER
+// tree never reaches this path: it never waits and never gets this error
+// (TestIssue720_N1_CustomerNeverWaits).
 func TestAggC3_FallThroughHonest503(t *testing.T) {
 	resetNestedResolveBoundForTest()
 	t.Cleanup(resetNestedResolveBoundForTest)
@@ -244,17 +257,17 @@ func TestAggC3_FallThroughHonest503(t *testing.T) {
 
 	// Tree 1: admit and HOLD (occupies 900 MiB → ceiling = 1024 − 128 = 896 MiB,
 	// so a second 900 MiB tree cannot fit while tree 1 is in flight).
-	rel1, err1 := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
+	rel1, err1 := enterNestedResolveUnit(bgTreeCtx())
 	if err1 != nil {
 		t.Fatalf("C3 setup: tree 1 admission failed: %v", err1)
 	}
 	h.occupy()
 	defer func() { h.vacate(); rel1() }()
 
-	// Tree 2: short ctx deadline; inFlight==1 so it does NOT get the
-	// unconditional escape → it BLOCKS on insufficient headroom → ctx expires →
-	// honest error.
-	ctx2, cancel := context.WithTimeout(cache.WithNestedCallDepth(context.Background(), 0), 150*time.Millisecond)
+	// Tree 2 (BACKGROUND): short ctx deadline; inFlight==1 so it does NOT get
+	// the unconditional escape → it BLOCKS on insufficient headroom → ctx
+	// expires → honest error.
+	ctx2, cancel := context.WithTimeout(bgTreeCtx(), 150*time.Millisecond)
 	defer cancel()
 	start := time.Now()
 	rel2, err2 := enterNestedResolveUnit(ctx2)
@@ -321,103 +334,6 @@ func TestAggCostProportional_WarmNotGated(t *testing.T) {
 		if isOutermostNestedResolve(cache.WithNestedCallDepth(context.Background(), d)) {
 			t.Fatalf("depth %d must NOT be gated (inner resolves inherit the one admission)", d)
 		}
-	}
-}
-
-// TestAggC5_CustomerPriority_BackgroundYields is the C5 arm. Under pinned-low
-// headroom with a BACKGROUND tree in flight (so inFlight>0, no unconditional
-// escape), assert:
-//   (a) an arriving CUSTOMER tree is admitted AHEAD of a queued BACKGROUND tree
-//       (customer preference — the no-new-background-ahead-of-a-waiting-customer
-//       rule), AND
-//   (b) background trees still COUNT toward the aggregate (peak sampled live
-//       heap stays < GOMEMLIMIT − reserve — no OOM introduced by background).
-// RED = background not yielding (customer waits behind background → customer
-// admitted LAST) OR background not counting (peak breaches → OOM from background).
-func TestAggC5_CustomerPriority_BackgroundYields(t *testing.T) {
-	resetNestedResolveBoundForTest()
-	t.Cleanup(resetNestedResolveBoundForTest)
-
-	// 8 GiB limit, reserve 1 GiB → ceiling ~7 GiB. Pin base HIGH (6.5 GiB) so
-	// that with one 512 MiB tree in flight, headroom cannot fit a second — a
-	// second tree of EITHER kind must WAIT, forcing the priority contention.
-	// base 6400 MiB: base+1tree = 6912 < ceiling 7168 (one tree fits, sits
-	// under); base+2trees = 7424 > ceiling (a SECOND concurrent tree would
-	// breach). So peak < ceiling proves only ONE tree was ever concurrent =
-	// the second yielded/waited (both accounting AND priority under test).
-	h := &headroomModel{
-		limit:            8 * 1024 * mib,
-		base:             6400 * mib,
-		perTreeFootprint: 512 * mib,
-	}
-	setRuntimeSeamsForTest(h.limitFn, h.liveFn)
-	pinEstUnit(h.perTreeFootprint)
-
-	bgCtx := cache.WithBackgroundResolve(cache.WithNestedCallDepth(context.Background(), 0))
-	custCtx := cache.WithNestedCallDepth(context.Background(), 0) // no background marker
-
-	// Tree 1 (BACKGROUND): inFlight==0 → unconditional admit; occupy → headroom
-	// now tight, a second tree cannot fit until tree 1 releases.
-	rel1, err1 := enterNestedResolveUnit(bgCtx)
-	if err1 != nil {
-		t.Fatalf("C5 setup: background tree 1 admission failed: %v", err1)
-	}
-	h.occupy()
-
-	var order []string
-	var orderMu sync.Mutex
-	record := func(who string) { orderMu.Lock(); order = append(order, who); orderMu.Unlock() }
-
-	// Tree 2 (BACKGROUND) queues FIRST; Tree 3 (CUSTOMER) arrives after. When
-	// tree 1 releases the single freed slot, the customer must win it even
-	// though the background tree queued earlier.
-	bgAdmitted := make(chan struct{})
-	go func() {
-		rel, err := enterNestedResolveUnit(bgCtx)
-		if err == nil {
-			record("background")
-			rel()
-		}
-		close(bgAdmitted)
-	}()
-	time.Sleep(80 * time.Millisecond) // let bg reach its wait state
-
-	custAdmitted := make(chan struct{})
-	go func() {
-		rel, err := enterNestedResolveUnit(custCtx)
-		if err == nil {
-			record("customer")
-			rel()
-		}
-		close(custAdmitted)
-	}()
-	time.Sleep(80 * time.Millisecond) // let customer register its waiting-mark
-
-	h.vacate()
-	rel1() // free one slot → customer must take it ahead of the queued background
-
-	select {
-	case <-custAdmitted:
-	case <-time.After(3 * time.Second):
-		t.Fatal("C5: customer tree never admitted — starved behind background (yield failed)")
-	}
-	select {
-	case <-bgAdmitted:
-	case <-time.After(3 * time.Second):
-		t.Fatal("C5: background tree never completed")
-	}
-
-	orderMu.Lock()
-	defer orderMu.Unlock()
-	if len(order) != 2 || order[0] != "customer" {
-		t.Fatalf("C5 CUSTOMER-PRIORITY FAIL: admission order = %v, want customer FIRST "+
-			"(background must yield the freed slot to the waiting customer)", order)
-	}
-	reserve := h.limit / reserveFractionDen * reserveFractionNum
-	ceiling := h.limit - reserve
-	if h.peak() >= ceiling {
-		t.Fatalf("C5 COUNTS-WHILE-IN-FLIGHT FAIL: peak %d MiB >= ceiling %d MiB — a background "+
-			"tree did not weigh against the aggregate (OOM floor defeated)", h.peak()/mib, ceiling/mib)
 	}
 }
 
@@ -506,7 +422,10 @@ func TestAggNoGoroutineLeak_CtxWatcher(t *testing.T) {
 		// ctx → B's ctx NEVER fires; its watcher can only exit via close(stop).
 		bDone := make(chan struct{})
 		go func() {
-			relB, errB := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
+			// #720: B is BACKGROUND — the only kind that waits, so the only
+			// kind that spawns a ctx watcher. A stays a customer tree, which
+			// counts and so holds B back.
+			relB, errB := enterNestedResolveUnit(bgTreeCtx())
 			if errB == nil {
 				h.occupy()
 				h.vacate()

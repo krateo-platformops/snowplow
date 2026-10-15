@@ -14,15 +14,32 @@
 //   - At each OUTERMOST nested resolve (depth-0), sample headroom =
 //     GOMEMLIMIT(debug.SetMemoryLimit(-1)) − liveHeap(/memory/classes/heap/objects:bytes
 //     via runtime/metrics — a cheap sample, no ReadMemStats stop-the-world).
-//   - Admit the (N+1)th tree IFF inFlightWeight + estUnit <= headroom − reserve.
+//   - A CUSTOMER tree NEVER WAITS (#720, owner ruling 2026-10-15, "No one
+//     waits in queue" → "Remove it too"): it adds its estUnit to
+//     inFlightWeight/inFlightCount and proceeds at once, whatever the
+//     headroom. It still COUNTS, so while customer trees are in flight the
+//     background trees are squeezed harder. How far customer trees push the
+//     in-flight weight past the ceiling is published as
+//     snowplow_nested_resolve_admission_over_ceiling_bytes (+ _peak), the
+//     early warning for the risk the owner accepted (see below).
+//   - A BACKGROUND tree (refresher, prewarm, seed, boot walk) is admitted IFF
+//     inFlightWeight + estUnit <= headroom − reserve.
 //   - inFlight == 0 ⇒ ADMIT UNCONDITIONALLY (anti-deadlock: a tree already in
 //     flight holds the live footprint and WILL release; blocking the only tree
 //     forever is a deadlock — mirrors the #78 clamp). Guaranteed progress.
-//   - Otherwise SERIALIZE: wait (ctx-bounded) until an in-flight tree releases
-//     and re-check. On ctx cancel/deadline the caller surfaces an HONEST error
-//     (the outer /call returns a 503-class error, NOT empty/raw content) — the
-//     Q4 SERIALIZE→honest-503 posture. The bound BLOCKS, never DROPS: every
-//     admitted tree resolves fully + content-correct, just later.
+//   - Otherwise a background tree SERIALIZES: it waits (bounded by its own
+//     ctx) until an in-flight tree releases and re-checks. On ctx
+//     cancel/deadline it returns the ctx error; the background re-resolve fails
+//     and the existing cell keeps being served. The bound BLOCKS background,
+//     never DROPS: every admitted tree resolves fully + content-correct, just
+//     later. No customer request can receive this admission error.
+//
+// ⚠ ACCEPTED RISK (#720, owner decision): customer bypass RE-EXPOSES the
+// 1.5.27 OOMKill shape. A burst of cold composite pages fans out many
+// concurrent outermost customer trees; none waits, so their aggregate
+// footprint is no longer bounded by this gate. The owner accepted that subject
+// to bench run 8 (#606), which must include a cold composite-page burst and
+// report the peak heap and the peak of over_ceiling_bytes.
 //
 // PLACEMENT — OUTERMOST nested-resolve ONLY (depth-0), AFTER the apistage
 // cache-hit serve. A warm apistage/L1 hit is served before nestedCallResolver
@@ -117,17 +134,18 @@ func prodLiveHeapBytes() int64 {
 }
 
 // aggregateBound is the process-wide admission gate. inFlightWeight is the sum
-// of the estUnit weights of currently-admitted outermost trees; cond wakes
-// waiters on each release so they re-check headroom. waitingCustomers counts
-// CUSTOMER trees currently blocked on the gate — a BACKGROUND tree will NOT
-// admit ahead of a waiting customer (C5 no-new-background-ahead-of-a-waiting-
-// customer rule → customer /call has absolute admission priority).
+// of the estUnit weights of currently-admitted outermost trees, customer AND
+// background; cond wakes background waiters on each release so they re-check
+// headroom. customerWeight is the part of inFlightWeight that customer trees
+// hold: it is what the over-ceiling gauge attributes the excess to (#720).
+// No customer ever waits on cond, so the old waitingCustomers yield (C5) is
+// gone: there is never a waiting customer to yield to.
 type aggregateBound struct {
-	mu               sync.Mutex
-	cond             *sync.Cond
-	inFlightWeight   int64
-	inFlightCount    int
-	waitingCustomers int
+	mu             sync.Mutex
+	cond           *sync.Cond
+	inFlightWeight int64
+	inFlightCount  int
+	customerWeight int64
 }
 
 var (
@@ -199,102 +217,85 @@ func admissionCeiling() (ceiling int64, unlimited bool) {
 	return ceiling, false
 }
 
+// isBackgroundNestedTree classifies an outermost tree for the gate. BACKGROUND
+// is any non-customer driver: the refresher, the prewarm engine and the cohort
+// seed (WithBackgroundResolve / WithBackgroundResolveOrigin), and every prewarm
+// root marked WithPrewarmPath (#214: "this resolve is a prewarm walk, not a
+// served request"): the content prewarm, and every phase-1 SA ctx (the boot
+// walk, the post-Ready pagination drain, its re-collection, the nav lister).
+// A customer /call carries none of them. The "who is resolving"
+// question has ONE answer in the cache package (#563): cache.RefDenialOrigin
+// returns RefDenialOriginServe only for a customer, and every other origin
+// (background origin, prewarm path, unattributed background) is not one. That
+// is the ONLY rule, so each driver's marker is load-bearing and a driver
+// without one is caught (the driver arms and the resolve-entry census in
+// dispatchers/nested_bound_driver_ctx_720_test.go). The content prewarm is
+// covered by its WithPrewarmPath stamp. The classification is by driver,
+// never by resource.
+func isBackgroundNestedTree(ctx context.Context) bool {
+	return cache.RefDenialOrigin(ctx) != cache.RefDenialOriginServe
+}
+
 // enterNestedResolveUnit is the aggregate cold-fan-out admission gate, applied
 // as a lifecycle bracket at the OUTERMOST nested resolve. The caller MUST gate
 // it on the depth-0 condition (isOutermostNestedResolve) so the whole subtree
 // holds exactly ONE admission — inner recursive resolves (depth>0) do NOT
-// re-enter. `background` (from cache.BackgroundResolveFromContext) marks a
-// refresher/prewarm tree; a customer /call is background=false.
+// re-enter.
 //
-// Admission (shape A, recompute-per-admission) + C5 customer priority:
-//   - unlimited GOMEMLIMIT ⇒ transparent: admit immediately, release is a no-op.
-//   - inFlightCount == 0 ⇒ admit unconditionally (guaranteed-progress /
-//     anti-deadlock: the only tree runs ALONE even if it "won't fit").
-//   - a CUSTOMER tree admits iff inFlightWeight + estUnit <= ceiling; while it
-//     waits it increments waitingCustomers so background trees yield to it.
-//   - a BACKGROUND tree admits iff (inFlightWeight + estUnit <= ceiling) AND
-//     waitingCustomers == 0 — it NEVER admits ahead of a waiting customer
-//     (C5 no-new-background-ahead rule → customer absolute priority). A
-//     background tree has no browser deadline: it waits ctx-bounded by its OWN
-//     ctx and never gets an honest-503 terminal from the gate (only its own
-//     ctx cancellation ends its wait).
-//   - either kind, if it cannot admit, WAITS (ctx-bounded) on a release, then
-//     re-checks. On ctx cancel/deadline → return the ctx error (the caller
-//     surfaces an honest 503-class error, never empty/raw content).
+// Admission (#720, "users never queue"):
+//   - a CUSTOMER tree NEVER WAITS and never returns an error: it adds estUnit
+//     to inFlightWeight/inFlightCount (and customerWeight), refreshes the
+//     over-ceiling gauge, and proceeds. Its ctx is not consulted: a near-expired
+//     customer ctx is the resolve's business, never an admission 503.
+//   - a BACKGROUND tree admits iff unlimited GOMEMLIMIT (transparent) ||
+//     inFlightCount == 0 (guaranteed progress / anti-deadlock: the only tree
+//     runs ALONE even if it "won't fit") || inFlightWeight + estUnit <= ceiling.
+//     Otherwise it WAITS, bounded by its OWN ctx, on a release and re-checks;
+//     on ctx cancel/deadline it returns the ctx error (the background re-resolve
+//     fails, nothing is Put, the existing cell keeps being served).
 //
-// COUNTS-WHILE-IN-FLIGHT (C5 load-bearing): once ADMITTED, a background tree
-// weighs against inFlightWeight/inFlightCount EXACTLY like a customer tree — the
-// OOM floor is identical for both; background differs ONLY at admission, never
-// in accounting.
+// COUNTS-WHILE-IN-FLIGHT (load-bearing): customer and background trees weigh
+// against inFlightWeight/inFlightCount identically. A customer tree in flight
+// is a non-empty gate that will release, so a background tree behind it waits
+// for room (squeezed) without deadlocking.
 //
-// On admission, inFlightWeight += estUnit, inFlightCount++, and a live-heap
-// sample is taken; release() re-samples, calibrates the per-tree weight
-// (one-shot), decrements, and broadcasts to wake waiters.
+// On admission a live-heap sample is taken; release() re-samples, calibrates
+// the per-tree weight (one-shot), decrements, refreshes the over-ceiling gauge
+// and broadcasts to wake background waiters.
 func enterNestedResolveUnit(ctx context.Context) (release func(), err error) {
 	b := theBound()
 	est := currentNestedEstUnit()
-	// BACKGROUND = the refresher (WithBackgroundResolve) OR any prewarm/SA
-	// content-population pass (WithApistagePrewarm) — both are non-customer and
-	// yield to a waiting customer /call. A customer /call carries neither.
-	background := cache.BackgroundResolveFromContext(ctx) || cache.ApistagePrewarmFromContext(ctx)
+	background := isBackgroundNestedTree(ctx)
 
 	b.mu.Lock()
-	countedWaiting := false
-	// unwait clears a customer's waiting-mark on any exit from the wait loop and
-	// broadcasts so a background tree that was yielding to this waiter re-checks
-	// (esp. the ctx-error exit of the last waiting customer, which frees no
-	// capacity but lifts the yield). b.mu is held by the caller.
-	unwait := func() {
-		if countedWaiting {
-			b.waitingCustomers--
-			if b.waitingCustomers < 0 {
-				b.waitingCustomers = 0
+	if !background {
+		// Customer bypass: account and go. Never waits, never errors.
+		b.inFlightWeight += est
+		b.inFlightCount++
+		b.customerWeight += est
+		b.observeOverCeilingLocked()
+		b.mu.Unlock()
+	} else {
+		for {
+			ceiling, unlimited := admissionCeiling()
+			fits := b.inFlightWeight+est <= ceiling
+			if unlimited || b.inFlightCount == 0 || fits {
+				b.inFlightWeight += est
+				b.inFlightCount++
+				b.observeOverCeilingLocked()
+				b.mu.Unlock()
+				break
 			}
-			countedWaiting = false
-			b.cond.Broadcast()
+			if werr := b.waitForReleaseOrCtx(ctx); werr != nil {
+				b.mu.Unlock()
+				return nil, werr
+			}
+			if cerr := ctx.Err(); cerr != nil {
+				b.mu.Unlock()
+				return nil, cerr
+			}
+			// woken (release or ctx) — loop re-checks ceiling + ctx.
 		}
-	}
-	for {
-		ceiling, unlimited := admissionCeiling()
-		fits := b.inFlightWeight+est <= ceiling
-		// C5 priority: a BACKGROUND tree yields to a waiting customer on EVERY
-		// admit path — including the inFlightCount==0 escape (else a background
-		// tree winning the b.mu race for a just-freed slot would jump the queue
-		// ahead of the waiting customer). A CUSTOMER keeps the unconditional
-		// escapes (transparent / empty-gate progress / fits).
-		//   customer  : admit iff unlimited || inFlightCount==0 || fits
-		//   background: admit iff waitingCustomers==0 AND (unlimited ||
-		//               inFlightCount==0 || fits)
-		// The empty-gate (inFlightCount==0) admit preserves guaranteed progress:
-		// if NO customer is waiting, a lone background tree still runs (and a
-		// waiting customer, being a customer, always gets the empty gate first).
-		baseAdmit := unlimited || b.inFlightCount == 0 || fits
-		admit := baseAdmit && (!background || b.waitingCustomers == 0)
-		if admit {
-			unwait()
-			b.inFlightWeight += est
-			b.inFlightCount++
-			b.mu.Unlock()
-			break
-		}
-		// Cannot admit → wait. A CUSTOMER marks itself waiting so background
-		// trees yield to it (decremented on any exit via unwait). A background
-		// tree does NOT mark (it must never make another background tree yield).
-		if !background && !countedWaiting {
-			b.waitingCustomers++
-			countedWaiting = true
-		}
-		if werr := b.waitForReleaseOrCtx(ctx); werr != nil {
-			unwait()
-			b.mu.Unlock()
-			return nil, werr
-		}
-		if cerr := ctx.Err(); cerr != nil {
-			unwait()
-			b.mu.Unlock()
-			return nil, cerr
-		}
-		// woken (release or ctx) — loop re-checks ceiling + priority + ctx.
 	}
 
 	before := liveHeapFn()
@@ -318,9 +319,39 @@ func enterNestedResolveUnit(ctx context.Context) (release func(), err error) {
 		if b.inFlightCount < 0 {
 			b.inFlightCount = 0
 		}
+		if !background {
+			b.customerWeight -= est
+			if b.customerWeight < 0 {
+				b.customerWeight = 0
+			}
+		}
+		b.observeOverCeilingLocked()
 		b.cond.Broadcast()
 		b.mu.Unlock()
 	}, nil
+}
+
+// observeOverCeilingLocked refreshes the #720 over-ceiling gauge from a fresh
+// ceiling sample: the in-flight weight past the ceiling the gate admits by,
+// capped at the weight customer trees hold — background trees never admit past
+// the ceiling except alone (the empty-gate escape), so the excess that customer
+// bypass causes is min(customerWeight, inFlightWeight − ceiling). 0 when
+// GOMEMLIMIT is unlimited, when no customer tree is in flight, or when the
+// customer trees fit. b.mu is held by the caller.
+func (b *aggregateBound) observeOverCeilingLocked() {
+	var over int64
+	if b.customerWeight > 0 {
+		if ceiling, unlimited := admissionCeiling(); !unlimited {
+			over = b.inFlightWeight - ceiling
+			if over > b.customerWeight {
+				over = b.customerWeight
+			}
+			if over < 0 {
+				over = 0
+			}
+		}
+	}
+	recordNestedOverCeiling(over)
 }
 
 // waitForReleaseOrCtx blocks on b.cond until a release Broadcasts OR ctx is
@@ -370,6 +401,7 @@ func resetNestedResolveBoundForTest() {
 	estUnitMu.Unlock()
 	runtimeLimitFn = prodRuntimeMemoryLimit
 	liveHeapFn = prodLiveHeapBytes
+	resetNestedOverCeilingForTest()
 }
 
 // setRuntimeSeamsForTest injects deterministic GOMEMLIMIT + live-heap samplers

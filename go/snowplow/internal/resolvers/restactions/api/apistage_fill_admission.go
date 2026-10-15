@@ -107,9 +107,18 @@ func ContentFillAdmissionClasses() []string { return fillAdmissionClassNames[:] 
 // contentFillClassOf classifies a reader: a refresher re-resolve, a prewarm or
 // any other background resolve is background; everything else is a customer
 // read-through.
+//
+// #720: "any other background resolve" is the cache package's single answer
+// to who is resolving, cache.RefDenialOrigin != serve — the SAME rule the
+// nested-resolve gate uses (nested_resolve_bound.go isBackgroundNestedTree).
+// It covers every WithBackgroundResolve* driver AND the WithPrewarmPath roots
+// (the phase-1 boot walk, the post-Ready apiRef pagination drain and its
+// re-collection), which BackgroundResolveFromContext alone missed, so their
+// content fills bypassed this cap as customers. The two gates can no longer
+// disagree on a driver.
 func contentFillClassOf(ctx context.Context) fillAdmissionClass {
 	if _, refresher := cache.RefreshTriggerGVRFromContext(ctx); refresher ||
-		cache.BackgroundResolveFromContext(ctx) || cache.ApistagePrewarmFromContext(ctx) {
+		cache.RefDenialOrigin(ctx) != cache.RefDenialOriginServe || cache.ApistagePrewarmFromContext(ctx) {
 		return fillClassBackground
 	}
 	return fillClassCustomer

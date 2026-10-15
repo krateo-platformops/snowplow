@@ -2,8 +2,9 @@
 // resourceRef-denial attribution keyed on it.
 //
 // WHY AN ORIGIN AT ALL. WithBackgroundResolve (deps.go) answers "is this a
-// customer?" — one bit, which is all the C5 admission gate and
-// rbac.MustRegateSADial need. It has THREE production producers (the refresher
+// customer?" — one bit, which is all rbac.MustRegateSADial needs. (The
+// nested-resolve admission gate reads RefDenialOrigin below instead, #720, so
+// the WithPrewarmPath roots count as background there too.) It has THREE production producers (the refresher
 // resolve_populate.go, the per-cohort seed phase1_pip_seed.go, the prewarm
 // engine boot re-drive prewarm_engine_boot.go), and the question #563 asks is
 // not "customer?" but "WHICH of them is generating this": 83% of the 057 log
@@ -12,8 +13,8 @@
 // close that gap, so the origin rides the same stamp.
 //
 // It REFINES the marker, never replaces it: WithBackgroundResolveOrigin calls
-// WithBackgroundResolve, so every existing reader (the aggregate admission
-// gate, MustRegateSADial's #268/#269 conjunct) sees exactly what it saw before.
+// WithBackgroundResolve, so every existing reader (MustRegateSADial's
+// #268/#269 conjunct) sees exactly what it saw before.
 //
 // WHY THE CLASSIFIER IS ONE FUNCTION. The log LEVEL of a denial and the counter
 // CELL it lands in are the same question asked twice; #214 answered it in the
