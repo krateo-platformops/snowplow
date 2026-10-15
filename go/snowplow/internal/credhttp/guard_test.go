@@ -118,8 +118,14 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 			parent = stack[len(stack)-1]
 		}
 		stack = append(stack, n)
-		if fd, ok := n.(*ast.FuncDecl); ok {
-			fn = fd.Name.Name
+		// The enclosing func is reset at every top-level declaration, so a
+		// package-level reference after a func is never attributed to it
+		// (an exemption keyed on that func would otherwise cover it).
+		if _, top := parent.(*ast.File); top {
+			fn = ""
+			if fd, ok := n.(*ast.FuncDecl); ok {
+				fn = fd.Name.Name
+			}
 		}
 		switch x := n.(type) {
 		case *ast.CallExpr:
@@ -139,6 +145,12 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 			// zero-value (or copied) client that never passed through credhttp.
 			if name, ok := httpClientType(x.Type, imports); ok {
 				out = append(out, ref{rel, fn, "field http." + name, fset.Position(x.Pos())})
+			}
+		case *ast.TypeSpec:
+			// #729: `type C http.Client` / `type C = http.Client` renames the
+			// type, so new(C), `var c C` and C{} would escape every shape above.
+			if name, ok := httpClientType(x.Type, imports); ok {
+				out = append(out, ref{rel, fn, "type http." + name, fset.Position(x.Pos())})
 			}
 		case *ast.SelectorExpr:
 			id, ok := x.X.(*ast.Ident)
@@ -265,6 +277,10 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 		"zeroVar":    `import "net/http"; func f() { var c http.Client; _ = c }`,
 		"zeroField":  `import "net/http"; type T struct{ c http.Client }`,
 		"aliasedNet": `import nh "net/http"; var c nh.Client`,
+		"zeroParam":  `import "net/http"; func f(c http.Client) {}`,
+		"embedded":   `import "net/http"; type T struct{ http.Client }`,
+		"typeDef":    `import "net/http"; type C http.Client`,
+		"typeAlias":  `import "net/http"; type C = http.Transport`,
 		"apiext":     `import apiext "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"; func f() { apiext.NewForConfig(nil) }`,
 	}
 	for name, body := range cases {
@@ -275,6 +291,18 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 		}
 		if got := scanFile(fset, f, "x.go"); len(got) == 0 {
 			t.Errorf("%s: guard did not flag %q", name, body)
+		}
+	}
+	// A package-level reference after a func is not attributed to that func,
+	// so an exemption keyed on the func cannot cover it.
+	{
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, "x.go", "package p\nimport \"net/http\"\nfunc buildEndpointClient() {}\nvar c = &http.Client{}\n", parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := scanFile(fset, f, "x.go"); len(got) != 1 || got[0].fn != "" {
+			t.Errorf("package-level literal after a func: want fn \"\", got %+v", got)
 		}
 	}
 	// And it must NOT flag the hardened forms.
