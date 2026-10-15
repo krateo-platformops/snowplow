@@ -61,9 +61,9 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/rest"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
@@ -234,7 +234,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				//       create in cluster config" wrap) is preserved
 				//       and tested by
 				//       TestUserConfig_ByteEquivalence_CacheMiss.
-				sarc, ierr := rest.InClusterConfig()
+				sarc, ierr := credhttp.InClusterConfig()
 				if ierr != nil {
 					response.InternalError(wri, fmt.Errorf("unable to create in cluster config: %w", ierr))
 					return

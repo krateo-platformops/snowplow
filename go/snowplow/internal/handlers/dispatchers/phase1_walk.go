@@ -98,6 +98,7 @@ import (
 	"github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
@@ -105,7 +106,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
-	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
 
@@ -371,7 +371,7 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	// (rest.CopyConfig) before tuning so the shared rc — which also backs the
 	// informer factory, metadata, discovery, config-vars-watch, secrets and
 	// controller-health clients — keeps its throttling untouched.
-	dynCli, dynErr := k8sdynamic.NewForConfig(rootsReadRESTConfig(rc))
+	dynCli, dynErr := credhttp.Dynamic(rootsReadRESTConfig(rc))
 	if dynErr != nil {
 		log.Error("phase1.warmup.no_dyn_client",
 			slog.String("subsystem", "cache"),

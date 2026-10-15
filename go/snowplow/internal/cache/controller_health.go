@@ -62,6 +62,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -772,7 +773,7 @@ func buildControllerHealthClient(rc *rest.Config) (kubernetes.Interface, error) 
 	if rc == nil {
 		return nil, fmt.Errorf("StartControllerHealthInformer: rest.Config is nil and no test client set")
 	}
-	return kubernetes.NewForConfig(rc)
+	return credhttp.Kubernetes(rc)
 }
 
 // SetControllerHealthClientForTest injects a fake clientset for unit

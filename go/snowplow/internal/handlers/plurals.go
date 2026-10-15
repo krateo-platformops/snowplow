@@ -10,11 +10,11 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	snowplowcache "github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/rest"
 )
 
 // Plurals returns the /api-info/names handler. Ship 1 / 0.30.225
@@ -68,7 +68,7 @@ func (r *pluralsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	start := time.Now()
 
-	rc, err := rest.InClusterConfig()
+	rc, err := credhttp.InClusterConfig()
 	if err != nil {
 		log.Error("unable to load in-cluster rest config",
 			slog.String("gvk", gvk.String()), slog.Any("err", err))

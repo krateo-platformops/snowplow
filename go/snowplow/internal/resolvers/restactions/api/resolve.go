@@ -32,6 +32,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
@@ -395,7 +396,14 @@ const (
 //   - non-UAF + resolveOne err → log; return (zero, stageReturn)
 //     (R-2: the resolve truncates — the orchestrator returns r.dict).
 //   - success → return (ep, stageProceed).
-func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, bool, stageAction) {
+//
+// held (#723/#724) reports whether the resolved endpoint presents a credential
+// snowplow holds and attaches itself — the SA endpoint, or the per-user
+// `<user>-clientconfig` resolved for a nil ref — as opposed to a named
+// endpointRef carrying a third party's OWN credential. runStage marks the
+// dispatch ctx with credhttp.WithHeldCredential on it, and the dial site then
+// builds a client that never follows a redirect. Provenance, never shape.
+func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, bool, bool, stageAction) {
 	if uafActive && r.opts.Provenance == ProvenanceCallerSupplied {
 		// #443 part 2 — an inline (caller-vouched) draft's UAF stage dials the
 		// CALLER's own clientconfig, never the ServiceAccount: isSA=false, so
@@ -405,9 +413,10 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		if err != nil {
 			r.log.Error("userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
 				slog.String("name", id), slog.Any("error", err))
-			return endpoints.Endpoint{}, false, stageReturn
+			return endpoints.Endpoint{}, false, false, stageReturn
 		}
-		return resolved, isSA, stageProceed
+		// nil ref: the caller's own clientconfig, which snowplow holds.
+		return resolved, isSA, true, stageProceed
 	}
 	if uafActive {
 		saEP, saErr := serviceAccountEndpointFn()
@@ -420,11 +429,11 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 			// bearer token to a SA-marked stage). Returning
 			// an empty result for this stage and continuing.
 			r.dict[id] = map[string]any{"items": []any{}}
-			return endpoints.Endpoint{}, false, stageContinue
+			return endpoints.Endpoint{}, false, false, stageContinue
 		}
 		// The UAF stage dials the SA endpoint → isSAEndpoint=true (provenance): the
 		// dial site threads the SA token FILE (#267).
-		return *saEP, true, stageProceed
+		return *saEP, true, true, stageProceed
 	}
 	// #113 — template endpointRef.name through the SAME jq/extras evaluator that
 	// already renders this stage's path/payload/headers (evalJQ over r.dict, the
@@ -442,15 +451,17 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		// failure (R-2 stageReturn) — the Secret is never dialed.
 		r.log.Error("templated endpoint reference refused",
 			slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", guardErr))
-		return endpoints.Endpoint{}, false, stageReturn
+		return endpoints.Endpoint{}, false, false, stageReturn
 	}
 	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref, templated)
 	if err != nil {
 		r.log.Error("unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
-		return endpoints.Endpoint{}, false, stageReturn
+		return endpoints.Endpoint{}, false, false, stageReturn
 	}
-	return resolved, isSA, stageProceed
+	// A nil ref resolved to the ctx-carried SA endpoint (isSA) or the per-user
+	// clientconfig: both are held. A named ref carries its own credential.
+	return resolved, isSA, isSA || ref == nil, stageProceed
 }
 
 // evalEndpointRef renders a templated endpointRef.name (#113). For a nil ref or
@@ -1567,7 +1578,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// #57 (C-b): the user-bearer-token append moved to AFTER endpoint
 	// resolution (was before) so the self-loopback arm can compare the
 	// RESOLVED endpoint host against the configured self-host.
-	ep, isSA, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
+	ep, isSA, heldCred, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
 	switch epAction {
 	case stageContinue:
 		recordStageTiming()
@@ -1724,6 +1735,11 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// ctx value — g's Done channel (errgroup cancellation) is preserved.
 	if isSA {
 		gctx = cache.WithServiceAccountDial(gctx)
+	}
+	// #723/#724 — the stage dials a credential snowplow holds (SA or the
+	// per-user clientconfig): the dial site's client never follows a redirect.
+	if heldCred {
+		gctx = credhttp.WithHeldCredential(gctx)
 	}
 	// #710 — the owning RESTAction and stage name a content fill (pprof labels,
 	// by_ra). Once per stage, not per call: a content HIT pays nothing for it.
@@ -2022,7 +2038,7 @@ func SetServiceAccountEndpointForTest(fn func() (*endpoints.Endpoint, error)) fu
 // resolve has no RC (a nested in-process resolve on a live request). Out of
 // cluster it fails and the resolve is empty; SetInClusterConfigForTest lets a
 // hermetic arm (#443 e4) run nested stages against a fake apiserver.
-var inClusterConfigFn = rest.InClusterConfig
+var inClusterConfigFn = credhttp.InClusterConfig
 
 // SetInClusterConfigForTest swaps inClusterConfigFn and returns a restore
 // func. TEST-ONLY: production code MUST NOT call it.

@@ -71,6 +71,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -271,7 +272,7 @@ func streamingRESTClient(rc *rest.Config) (*rest.RESTClient, error) {
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-	return rest.RESTClientFor(cfg)
+	return credhttp.RESTClient(cfg)
 }
 
 // streamingList issues the paged LIST for gvr and streams every page's

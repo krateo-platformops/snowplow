@@ -29,6 +29,7 @@ import (
 	"sync"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"k8s.io/client-go/rest"
 )
 
@@ -181,7 +182,7 @@ func ServiceAccountRESTConfig() (*rest.Config, error) {
 // without this seam. Production code path is unchanged; the variable
 // is initialized once to the real function and is only reassigned by
 // test code wrapped in the resetSARestConfigForTest contract.
-var inClusterConfigFn = rest.InClusterConfig
+var inClusterConfigFn = credhttp.InClusterConfig
 
 // resetSAEndpointForTest clears the singleton so each test sees a
 // fresh state. Exported via the _test.go shim only; production code

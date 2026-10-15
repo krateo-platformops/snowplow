@@ -76,6 +76,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
@@ -117,7 +118,7 @@ func discoveryClientFor(rc *rest.Config) (discovery.DiscoveryInterface, error) {
 	if cli, ok := discoveryClientCache[rc]; ok {
 		return cli, nil
 	}
-	cli, err := discovery.NewDiscoveryClientForConfig(rc)
+	cli, err := credhttp.Discovery(rc)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -16,12 +17,12 @@ import (
 )
 
 func NewClient(rc *rest.Config) (Client, error) {
-	dynamicClient, err := dynamic.NewForConfig(rc)
+	dynamicClient, err := credhttp.Dynamic(rc)
 	if err != nil {
 		return nil, err
 	}
 
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(rc)
+	discoveryClient, err := credhttp.Discovery(rc)
 	if err != nil {
 		return nil, err
 	}

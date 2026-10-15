@@ -30,6 +30,7 @@ import (
 	_ "github.com/krateo-platformops/snowplow/docs"
 	"github.com/krateo-platformops/snowplow/internal/authn"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
@@ -48,10 +49,6 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/metadata"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 )
 
@@ -499,7 +496,7 @@ func main() {
 
 	var cacheWatcher *cache.ResourceWatcher
 	if !cache.Disabled() {
-		rc, rcErr := rest.InClusterConfig()
+		rc, rcErr := credhttp.InClusterConfig()
 		if rcErr != nil {
 			log.Warn("cache: rest.InClusterConfig failed; staying on apiserver branch",
 				slog.Any("err", rcErr))
@@ -586,7 +583,7 @@ func main() {
 				return true
 			}())
 
-			dynCli, dynErr := dynamic.NewForConfig(rc)
+			dynCli, dynErr := credhttp.Dynamic(rc)
 			if dynErr != nil {
 				log.Warn("cache: dynamic.NewForConfig failed; staying on apiserver branch",
 					slog.Any("err", dynErr))
@@ -655,7 +652,7 @@ func main() {
 					// emits `cache.lazy_register.metadata_only_unwired`
 					// for every Composition GVR touch (loud SRE signal
 					// without crash-looping the pod).
-					metaCli, metaErr := metadata.NewForConfig(rc)
+					metaCli, metaErr := credhttp.Metadata(rc)
 					if metaErr != nil {
 						log.Warn("cache: metadata.NewForConfig failed; metadata-only routing offline (full-informer fallback)",
 							slog.Any("err", metaErr))
@@ -681,7 +678,7 @@ func main() {
 					// defaults to true (the pivot keeps its pre-0.30.98
 					// HasSynced-only behaviour). The S4 fix is degraded
 					// but not crash-looping — a loud WARN flags it.
-					discoCli, discoErr := discovery.NewDiscoveryClientForConfig(rc)
+					discoCli, discoErr := credhttp.Discovery(rc)
 					if discoErr != nil {
 						log.Warn("cache: discovery.NewDiscoveryClientForConfig failed; resource-type confirmation offline (S4 gate degrades to HasSynced-only)",
 							slog.Any("err", discoErr))
@@ -1128,13 +1125,13 @@ func main() {
 		// running outside a cluster for unit tests), we fall back to
 		// the pre-0.30.71 nil-watcher shape — consumers nil-check
 		// cache.Global() and take their own apiserver branch.
-		rc, rcErr := rest.InClusterConfig()
+		rc, rcErr := credhttp.InClusterConfig()
 		if rcErr != nil {
 			log.Info("cache: rest.InClusterConfig unavailable in disabled mode; watcher will be nil",
 				slog.Any("err", rcErr))
 			_, _ = cache.NewResourceWatcher(cacheCtx, nil)
 		} else {
-			dynCli, dynErr := dynamic.NewForConfig(rc)
+			dynCli, dynErr := credhttp.Dynamic(rc)
 			if dynErr != nil {
 				log.Warn("cache: dynamic.NewForConfig failed in disabled mode; watcher will be nil",
 					slog.Any("err", dynErr))

@@ -80,10 +80,10 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/discovery"
 	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 )
@@ -257,7 +257,7 @@ func IsImpersonatingConfig(rc *rest.Config) bool {
 // inClusterConfigFn (sa_client.go:184) and discoveryClientBuilder
 // (cache/discovery_lookup.go:150).
 var discoveryClientForConfigFn = func(rc *rest.Config) (discovery.DiscoveryInterface, error) {
-	return discovery.NewDiscoveryClientForConfig(rc)
+	return credhttp.Discovery(rc)
 }
 
 // buildSADiscoveryState constructs the cached client + mapper. Mirrors
@@ -267,7 +267,7 @@ var discoveryClientForConfigFn = func(rc *rest.Config) (discovery.DiscoveryInter
 // DeferredDiscoveryRESTMapper NewClient builds — we cache the BUILT
 // mapper, we do not skip it.
 func buildSADiscoveryState(rc *rest.Config) (*saDiscoveryState, error) {
-	dynamicClient, err := dynamic.NewForConfig(rc)
+	dynamicClient, err := credhttp.Dynamic(rc)
 	if err != nil {
 		return nil, fmt.Errorf("dynamic.SharedSADiscoveryClient: NewForConfig: %w", err)
 	}

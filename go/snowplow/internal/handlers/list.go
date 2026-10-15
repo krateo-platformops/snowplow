@@ -10,8 +10,8 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
-	"github.com/krateo-platformops/plumbing/kubeconfig"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -53,7 +53,7 @@ func List() http.HandlerFunc {
 
 		log.Debug("user config succesfully loaded", endpointLogAttr(&ep)) // #453: never the struct
 
-		rc, err := kubeconfig.NewClientConfig(req.Context(), ep)
+		rc, err := credhttp.NewClientConfig(req.Context(), ep)
 		if err != nil {
 			log.Error("unable to create user client config", slog.Any("err", err))
 			response.InternalError(wri, err)

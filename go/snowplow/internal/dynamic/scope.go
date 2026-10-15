@@ -29,9 +29,9 @@ package dynamic
 import (
 	"fmt"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/discovery"
 	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
@@ -119,7 +119,7 @@ func ScopeResolverForConfig(rc *rest.Config) (func(schema.GroupVersionResource) 
 	if rc == nil {
 		return nil, fmt.Errorf("dynamic.ScopeResolverForConfig: nil *rest.Config")
 	}
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(rc)
+	discoveryClient, err := credhttp.Discovery(rc)
 	if err != nil {
 		return nil, fmt.Errorf("dynamic.ScopeResolverForConfig: NewDiscoveryClientForConfig: %w", err)
 	}
