@@ -161,11 +161,16 @@ func (r *resolveRun) maybeResolveInProcess(
 	// across ALL concurrent outermost trees process-wide (the per-tree #78 bound
 	// missed the concurrent-tree page fan-out → 8Gi OOM). Transparent when
 	// GOMEMLIMIT is unset. See nested_resolve_bound.go.
+	//
+	// #720 (owner ruling, "No one waits in queue"): only BACKGROUND trees wait
+	// on the bound. A customer tree is admitted at once and counts toward the
+	// in-flight weight; it never gets berr.
 	if isOutermostNestedResolve(gctx) {
 		release, berr := enterNestedResolveUnit(gctx)
 		if berr != nil {
-			// ctx cancelled while blocked on the bound — surface as a resolve
-			// error (routed like an HTTP dispatch error by the caller).
+			// A BACKGROUND tree's ctx ended while it waited on the bound —
+			// surface as a resolve error (routed like an HTTP dispatch error by
+			// the caller); the background re-resolve fails and Puts nothing.
 			return nil, false, berr
 		}
 		defer release()

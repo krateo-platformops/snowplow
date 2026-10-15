@@ -1207,6 +1207,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerContentFillInstruments(m); err != nil {
 		return err
 	}
+	if err := registerNestedResolveAdmissionInstruments(m); err != nil {
+		return err
+	}
 	if err := registerPrewarmPassInstruments(m); err != nil {
 		return err
 	}
@@ -1567,6 +1570,34 @@ func registerContentFillInstruments(m metric.Meter) error {
 		o.ObserveInt64(joinWaiting, s.JoinWaiting)
 		return nil
 	}, total, dup, bytesTotal, joined, joinRefused, joinWaiting, notServable, inflight, inflightBytes)
+	return err
+}
+
+// registerNestedResolveAdmissionInstruments hand-wires #720's nested-resolve
+// over-ceiling gauges onto OTLP (no expvar->OTLP bridge). The callback reads
+// restactionsapi.NestedResolveAdmissionStatsSnapshot, the accessor the expvar
+// closures read, so the surfaces cannot diverge. No attributes. Registered only
+// when the cache is on (CFG-1: the expvar keys are published from a
+// Disabled()-gated init).
+func registerNestedResolveAdmissionInstruments(m metric.Meter) error {
+	over, err := m.Int64ObservableGauge("snowplow_nested_resolve_admission_over_ceiling_bytes",
+		metric.WithDescription("How far CUSTOMER nested-resolve trees, which never wait on the nested-resolve admission gate, push its in-flight weight past the ceiling it admits background trees by (bytes, now). 0 while customer trees fit. The early warning for the 1.5.27 OOMKill shape re-exposed by owner decision. #720."),
+		metric.WithUnit("By"))
+	if err != nil {
+		return err
+	}
+	peak, err := m.Int64ObservableGauge("snowplow_nested_resolve_admission_over_ceiling_bytes_peak",
+		metric.WithDescription("High-water mark since boot of snowplow_nested_resolve_admission_over_ceiling_bytes, so a burst shorter than the export interval is not missed. #720."),
+		metric.WithUnit("By"))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		s := restactionsapi.NestedResolveAdmissionStatsSnapshot()
+		o.ObserveInt64(over, s.OverCeilingBytes)
+		o.ObserveInt64(peak, s.OverCeilingBytesPeak)
+		return nil
+	}, over, peak)
 	return err
 }
 

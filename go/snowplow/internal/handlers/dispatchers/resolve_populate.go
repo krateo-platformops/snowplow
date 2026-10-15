@@ -703,12 +703,12 @@ func isIdentityFreeClass(class string) bool {
 func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byte, error) {
 	authnNS := env.String("AUTHN_NAMESPACE", "")
 
-	// C5 (aggregate OOM bound): the refresher is BACKGROUND — its nested-resolve
-	// trees must YIELD the aggregate admission gate to a customer /call (which
-	// has a browser deadline; the refresher does not). Mark the ctx so
-	// enterNestedResolveUnit de-prioritises this tree behind waiting customers
-	// (it still COUNTS toward the aggregate once admitted — the OOM floor is
-	// preserved). Covers BOTH the content-refresh and RA/widget-refresh branches
+	// Aggregate OOM bound (#720): the refresher is BACKGROUND — its nested-resolve
+	// trees are the ones the aggregate admission gate bounds. A customer /call
+	// never waits on that gate (owner ruling, "No one waits in queue") but its
+	// weight counts, so the refresher's trees are squeezed while customers are
+	// active. Mark the ctx so enterNestedResolveUnit classifies this tree as
+	// background. Covers BOTH the content-refresh and RA/widget-refresh branches
 	// below (this is the single refresher resolve entry).
 	//
 	// LOAD-BEARING for rbac.MustRegateSADial (#268/#269 Part 2 drift-guard):

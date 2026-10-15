@@ -1,10 +1,10 @@
 // admission_parity_shim.go — TEST-ONLY exported shims for the cross-package
 // ceiling drift-guard parity test (#64 parallel-copy backstop, fold 2026-07-03).
 //
-// WHY A SEPARATE FILE: nested_resolve_bound.go is kept BYTE-IDENTICAL to base
-// (the deliberate C1 choice — the customer nested path is untouched and NOT
-// rewired to call cache.AdmissionCeiling). So these exported wrappers live here,
-// leaving that file's diff-vs-base empty. They expose this package's private
+// WHY A SEPARATE FILE: nested_resolve_bound.go keeps its OWN ceiling calc (the
+// deliberate C1 choice — it is NOT rewired to call cache.AdmissionCeiling; #720
+// changed who waits on that gate, not the calc). So these exported wrappers
+// live here, outside the gate file. They expose this package's private
 // admissionCeiling() + its runtime seams so a test in a package that imports
 // BOTH `api` and `cache` (dispatchers) can inject the SAME (GOMEMLIMIT,
 // liveHeap) into both arithmetics and assert byte-identical ceilings — the
