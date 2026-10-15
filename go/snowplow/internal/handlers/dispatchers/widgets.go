@@ -282,6 +282,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// never fire. entry.ExternalTTL is false for every normal entry →
 			// byte-identical header behavior when the feature is off (C4).
 			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
+			staleHitWritePoint(cacheKey, entry) // #710 PR-2b
+			noteStaleWrite(cacheKey, entry.StaleDerived, !entry.ExternalTTL)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
 			// revalidate it on demand under this requester, detached.
@@ -323,9 +325,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// flows through into the inner resolver — Edge type 3 correctly
 	// records against the widget L1 key because the widget cache entry
 	// depends on every K8s object its underlying RestActions touch.
+	var staleSink *cache.StaleServeSink
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContextFromEpoch(ctx, cacheKey, depEpoch, cache.DepKey{
 			GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
+		// #710 PR-2b — armable response: its resolve may be served a known-stale
+		// content cell at once (D2); see restactions.go.
+		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "widgets")
 	}
 	// #83 Option A — seed THIS top-level widget as an ancestor of the
 	// nested-resolve descent BEFORE resolving (symmetric with restactions.go).
@@ -641,9 +647,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			cacheInputs.HasUAF = true
 		}
 		if cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
-			RawJSON:     encoded,
-			Inputs:      cacheInputs,
-			TTLOverride: uafTTLOverrideForEntry(cacheInputs),
+			RawJSON:      encoded,
+			Inputs:       cacheInputs,
+			TTLOverride:  uafTTLOverrideForEntry(cacheInputs),
+			StaleDerived: staleSink.StaleDerived(), // #710 PR-2b
 		}, cacheGen0) {
 			if stageErrSink.Count() > 0 {
 				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallWidget) // #681
@@ -691,6 +698,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// generalises it to the whole chain. The inert branch was already safe for a
 	// different reason — it mints no key at all (helpers.go dispatchCacheLookupKey)
 	// — and stays so.
+	// #710 PR-2b — a stale-derived body is written only behind an accepted Put
+	// + the armed header (+ an owed-push mark); otherwise re-run fresh.
+	if staleWritePoint(r, wri, req, staleSink, refreshArmable) {
+		return
+	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "widgets", refreshArmable)
+	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }
