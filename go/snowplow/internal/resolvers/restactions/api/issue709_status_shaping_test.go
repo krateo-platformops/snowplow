@@ -148,7 +148,7 @@ func TestIssue709_CanonicalStageMessage_CarriesNoQuery(t *testing.T) {
 		for _, code := range codes {
 			for _, verb := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
 				call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{Path: p + q, Verb: ptr.To(verb)}}
-				msg := canonicalStageMessage(code, call)
+				msg := canonicalStageMessage(code, call) + " " + canonicalRedirectMessage(302, call)
 				for _, bad := range []string{"?", "SNTQ", "labelSelector", "fieldSelector", "limit=", "continue="} {
 					if strings.Contains(msg, bad) {
 						t.Fatalf("canonicalStageMessage(%d, %s %s) carries query text %q: %q", code, verb, p+q, bad, msg)
