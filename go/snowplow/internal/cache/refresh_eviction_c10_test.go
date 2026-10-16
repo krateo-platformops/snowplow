@@ -188,7 +188,7 @@ func TestRefreshEviction_S10_LockFreeAtPublish(t *testing.T) {
 	defer unsub()
 	putSelf(store, d, "L1_s10_a", gvr, "ns", "a")
 	putSelf(store, d, "L1_s10_b", gvr, "ns", "b")
-	d.OnDelete(gvr, "ns", "a")        // runEvictionBatch route
+	d.OnDelete(gvr, "ns", "a")             // runEvictionBatch route
 	if !d.EvictSelfGone("L1_s10_b", nil) { // self-404 route
 		t.Fatalf("S10: EvictSelfGone reported no eviction")
 	}
@@ -347,6 +347,32 @@ func readAll(ch <-chan string, n int, d time.Duration) (order []string, first ti
 	return order, first
 }
 
+// holdEvictionClock707 holds the eviction bucket's clock at "now" until the
+// returned release is called; after it the bucket reads the real clock again,
+// which is never earlier, so the limiter's time stays monotonic.
+//
+// #707: the pacing arm below asserted that the publisher outruns a 100/s
+// wall-clock refill. On a loaded runner the drain goroutine emptied the backlog
+// between two offers, the next offer found a refilled token and was delivered
+// at once, and evict_deferred fell below n-5 (53 of 60 in CI; reproduced
+// deterministically with a 2ms delay per eviction). With the clock held for the
+// publish phase no token can refill mid-burst, whatever the runner's speed.
+func holdEvictionClock707(t *testing.T) (release func()) {
+	t.Helper()
+	t0 := time.Now()
+	var held atomic.Bool
+	held.Store(true)
+	clock := func() time.Time {
+		if held.Load() {
+			return t0
+		}
+		return time.Now()
+	}
+	refreshEvictionClock.Store(&clock)
+	t.Cleanup(func() { refreshEvictionClock.Store(nil) })
+	return func() { held.Store(false) }
+}
+
 func TestRefreshEviction_Pace_DeferredNeverDroppedDedup(t *testing.T) {
 	t.Setenv(envRefreshEvictionPublishRatePerSecond, "100")
 	t.Setenv(envRefreshEvictionPublishBurst, "5")
@@ -363,13 +389,26 @@ func TestRefreshEviction_Pace_DeferredNeverDroppedDedup(t *testing.T) {
 		putSelf(store, d, fmt.Sprintf("L1_pace_%02d", i), gvr, "ns", fmt.Sprintf("o%02d", i))
 	}
 	// One tick: n DELETE evictions, then the SAME first key evicted again
-	// three times while it is still deferred-or-delivered.
+	// three times while it is still deferred-or-delivered. The bucket's clock
+	// is held for the tick (#707), so "one tick" is exact on any runner.
+	release := holdEvictionClock707(t)
 	for i := 0; i < n; i++ {
 		d.OnDelete(gvr, "ns", fmt.Sprintf("o%02d", i))
 	}
 	for r := 0; r < 3; r++ {
 		putSelf(store, d, "L1_pace_59", gvr, "ns", "o59")
 		d.OnDelete(gvr, "ns", "o59")
+	}
+	release() // the drain then paces the backlog out on the real clock
+
+	// With the clock held the count is exact (#707): keys 00..04 take the
+	// burst, keys 05..59 are deferred, and key 59 is still pending through its
+	// three re-evictions (the drain cannot reach it while time is held), so the
+	// dedup'd pending set defers it ONCE. A re-eviction that re-queues a
+	// pending key would add one per repeat.
+	if snaps := RefreshSubSnapshotsForTest(); len(snaps) != 1 || snaps[0].EvictDeferred != n-5 {
+		t.Fatalf("pace RED: this subscriber deferred %+v, want exactly %d (burst 5 of %d, re-evictions of a "+
+			"pending key dedup'd)", snaps, n-5, n)
 	}
 
 	st := RefreshBroadcasterStatsSnapshot()

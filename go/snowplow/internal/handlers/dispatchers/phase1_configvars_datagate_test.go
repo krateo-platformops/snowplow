@@ -30,13 +30,54 @@ package dispatchers
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 	kfake "k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
+
+// configMapWatchOpened returns a channel closed once the informer's ConfigMap
+// WATCH is registered with kc's object tracker (#702). The fake tracker has no
+// resourceVersion replay: an object written after the informer's LIST but
+// before its WATCH registers is never delivered, so a Delete+Create there is
+// either missed outright or folded into the next relist as an UPDATE of
+// identical Data (gated, skipped). A real apiserver replays from the LIST's
+// resourceVersion; the harness must instead wait for this signal before it
+// writes. The reactor performs the registration itself, so the close happens
+// after the watcher is live, never before.
+func configMapWatchOpened(kc *kfake.Clientset) <-chan struct{} {
+	opened := make(chan struct{})
+	var once sync.Once
+	kc.PrependWatchReactor("configmaps", func(action ktesting.Action) (bool, watch.Interface, error) {
+		var opts metav1.ListOptions
+		if wa, ok := action.(ktesting.WatchActionImpl); ok {
+			opts = wa.ListOptions
+		}
+		w, err := kc.Tracker().Watch(action.GetResource(), action.GetNamespace(), opts)
+		if err != nil {
+			return false, nil, err
+		}
+		once.Do(func() { close(opened) })
+		return true, w, nil
+	})
+	return opened
+}
+
+// awaitConfigMapWatch blocks until configMapWatchOpened fires, failing the test
+// if the informer never opens its WATCH.
+func awaitConfigMapWatch(t *testing.T, opened <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-opened:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("setup: the config-vars informer never opened its ConfigMap WATCH")
+	}
+}
 
 // waitForCount polls until getter() reaches want (or the deadline), returning
 // the final value. Lets the REAL informer deliver the event asynchronously.
@@ -83,6 +124,7 @@ func startCVGateInformer(t *testing.T, initial *corev1.ConfigMap) *kfake.Clients
 	t.Setenv(frontendConfigConfigMapEnv, bootRaceConfigMapName)
 
 	kc := kfake.NewSimpleClientset(initial)
+	watchOpened := configMapWatchOpened(kc)
 	restore := SetConfigVarsWatchClientForTest(kc)
 	t.Cleanup(restore)
 
@@ -94,6 +136,9 @@ func startCVGateInformer(t *testing.T, initial *corev1.ConfigMap) *kfake.Clients
 	if got := waitForCount(ConfigVarsEnqueuedTotal, 1, 5*time.Second); got != 1 {
 		t.Fatalf("setup: initial config-vars ADD did not fire exactly once (Enqueued=%d)", got)
 	}
+	// The initial ADD comes from the LIST; the arms' writes must land after
+	// the WATCH is live or the fake tracker drops them (#702).
+	awaitConfigMapWatch(t, watchOpened)
 	return kc
 }
 
