@@ -218,6 +218,10 @@ var closedAttributeKeys = map[string]struct{}{
 	// prewarm-path, background-unattributed, serve}, pinned by
 	// metrics_643_prewarm_pass_otlp_test.go and the dispatchers #563 census.
 	"driver": {},
+	// #740 — slot on the absorbed-read rerun counter: the closed
+	// cache.KnownStaleRevalidationSlots set {background, demand}, pinned by
+	// issue740_known_stale_rerun_otlp_test.go.
+	"slot": {},
 }
 
 // neverAnAttribute lists the three expvar keys whose VALUES carry

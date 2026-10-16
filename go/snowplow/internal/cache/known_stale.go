@@ -94,7 +94,101 @@ var (
 	// the Put by the same gate, so a revalidation could never succeed — it is
 	// skipped and counted instead (team ruling (b), #547).
 	knownStaleRevalidationSkip atomic.Uint64
+	// knownStaleRevalidationRerun counts the reruns an ABSORBED read earned
+	// (#740), per slot of the closed set KnownStaleRevalidationSlots.
+	knownStaleRevalidationRerun [revalSlotKinds]atomic.Uint64
 )
+
+// revalSlotKind indexes the two revalidation slots (#740).
+type revalSlotKind uint8
+
+const (
+	revalSlotBackground revalSlotKind = iota
+	revalSlotDemand
+	revalSlotKinds
+)
+
+// KnownStaleRevalidationSlots is the CLOSED `slot` attribute set of
+// snowplow_resolved_cache_known_stale_revalidation_rerun_total, in
+// revalSlotKind order.
+var KnownStaleRevalidationSlots = []string{"background", "demand"}
+
+// KnownStaleRevalidationRerunBySlot returns the rerun counter per slot of the
+// closed set (0 when never ticked).
+func KnownStaleRevalidationRerunBySlot() map[string]uint64 {
+	out := make(map[string]uint64, len(KnownStaleRevalidationSlots))
+	for i, name := range KnownStaleRevalidationSlots {
+		out[name] = knownStaleRevalidationRerun[i].Load()
+	}
+	return out
+}
+
+// loadKnownStaleRevalidationRerun reads the rerun counters in slot order.
+func loadKnownStaleRevalidationRerun() (out [revalSlotKinds]uint64) {
+	for i := range out {
+		out[i] = knownStaleRevalidationRerun[i].Load()
+	}
+	return out
+}
+
+// revalSlot is one key's revalidation slot, held from the claim until the
+// attempt settles. A read that finds it held is ABSORBED into that attempt and
+// arms rerun (#740, architect ruling): the attempt may have read its inputs
+// before the state that reader needs (the trace: it read the refresher
+// identity's deny just before the identity recovered), and with no new change
+// event nothing else would retry before the NEXT read, which on a low-traffic
+// cell is unbounded. One rerun per settle with an absorbed read: driven by
+// reads, never self-looping, no timer, no knob.
+type revalSlot struct {
+	mu       sync.Mutex
+	rerun    bool // a read was absorbed into the attempt in flight
+	released bool // the slot left the map; an absorber claims a fresh one
+}
+
+// claimRevalSlot claims key's slot in m, or, when one is held, arms its rerun:
+// the read is absorbed. true: claimed (the caller starts the attempt).
+func claimRevalSlot(m *sync.Map, key string) bool {
+	for {
+		v, loaded := m.LoadOrStore(key, &revalSlot{})
+		if !loaded {
+			return true
+		}
+		s := v.(*revalSlot)
+		s.mu.Lock()
+		if s.released {
+			// Settled between the Load and the lock: the slot is gone, so this
+			// read starts an attempt of its own rather than arming a dead slot.
+			s.mu.Unlock()
+			continue
+		}
+		s.rerun = true
+		s.mu.Unlock()
+		return false
+	}
+}
+
+// settleRevalSlot ends one attempt on key's slot in m. rerun: a read was absorbed
+// into it and key is still known-stale, so the flag is cleared, the slot STAYS
+// claimed (a read during the rerun arms it again) and the caller re-runs at
+// once. Otherwise the slot is released. held: there was a slot to settle.
+func settleRevalSlot(m *sync.Map, key string) (held, rerun bool) {
+	v, ok := m.Load(key)
+	if !ok {
+		return false, false
+	}
+	s := v.(*revalSlot)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rerun {
+		if _, _, still := KnownStale(key); still {
+			s.rerun = false
+			return true, true
+		}
+	}
+	s.released = true
+	m.CompareAndDelete(key, s)
+	return true, false
+}
 
 // knownStaleStamp returns key's stamp when it is known-stale.
 func knownStaleStamp(key string) (*dirtyStamp, bool) {
@@ -179,8 +273,8 @@ func KnownStaleServedByReason() map[string]uint64 {
 
 // --- demand revalidation --------------------------------------------------
 
-// demandInflight holds the one in-flight demand revalidation per key (value:
-// the t0 it revalidates). Bounded by the known-stale key set.
+// demandInflight holds the one in-flight demand revalidation per key (value: its
+// *revalSlot). Bounded by the known-stale key set.
 var demandInflight sync.Map
 
 type ctxKeyDemandRevalidationType struct{}
@@ -188,9 +282,10 @@ type ctxKeyDemandRevalidationType struct{}
 var ctxKeyDemandRevalidation = ctxKeyDemandRevalidationType{}
 
 // ClaimDemandRevalidation claims key's single revalidation slot for the stale
-// generation t0. false: one is already in flight, or — team ruling (b) — the key
-// is suppressed for a structurally-permanent reason, so no revalidation can
-// succeed: that skip is counted (known_stale_revalidation_skipped_total).
+// generation t0. false: one is already in flight — this read is absorbed into it
+// and earns it one rerun (#740) — or, team ruling (b), the key is suppressed for
+// a structurally-permanent reason, so no revalidation can succeed: that skip is
+// counted (known_stale_revalidation_skipped_total).
 func ClaimDemandRevalidation(key string, t0 time.Time) bool {
 	if key == "" {
 		return false
@@ -199,8 +294,7 @@ func ClaimDemandRevalidation(key string, t0 time.Time) bool {
 		knownStaleRevalidationSkip.Add(1)
 		return false
 	}
-	_, loaded := demandInflight.LoadOrStore(key, t0)
-	return !loaded
+	return claimRevalSlot(&demandInflight, key)
 }
 
 // bgRevalidationInflight holds the one queued background revalidation per
@@ -213,9 +307,10 @@ var bgRevalidationInflight sync.Map
 // instantly and revalidated in the background by the refresher, under the
 // refresher's own identity for identity-free cells (the SA) — never under the
 // requester, whose identity is not the cell's. One queued revalidation per key;
-// a structurally-permanent suppression skips it (counted). Never blocks.
+// a read that finds it queued is absorbed and earns it one rerun (#740); a
+// structurally-permanent suppression skips it (counted). Never blocks.
 func RevalidateKnownStaleInBackground(key string) {
-	t0, _, ok := KnownStale(key)
+	_, _, ok := KnownStale(key)
 	if !ok {
 		return
 	}
@@ -229,9 +324,14 @@ func RevalidateKnownStaleInBackground(key string) {
 	if r == nil {
 		return
 	}
-	if _, loaded := bgRevalidationInflight.LoadOrStore(key, t0); loaded {
+	if !claimRevalSlot(&bgRevalidationInflight, key) {
 		return
 	}
+	r.enqueueRevalidation(key)
+}
+
+// enqueueRevalidation queues key's background revalidation on its own tier.
+func (r *refresher) enqueueRevalidation(key string) {
 	if _, isCL := r.clusterListKeys.Load(key); isCL {
 		r.enqueueClusterList(key)
 	} else {
@@ -239,18 +339,29 @@ func RevalidateKnownStaleInBackground(key string) {
 	}
 }
 
-// settleBackgroundRevalidation releases key's background revalidation slot and
-// counts its outcome (fresh: the key is no longer known-stale). Called by the
-// refresher once a dequeue of key has settled.
+// settleBackgroundRevalidation settles key's background revalidation slot and
+// counts the attempt's outcome (fresh: the key is no longer known-stale). Called
+// by the refresher once a dequeue of key has settled. A read absorbed into the
+// attempt while the key is still known-stale earns one rerun (#740): the slot
+// stays claimed and the key is re-queued at once — the workqueue re-adds it
+// after this dequeue's Done.
 func settleBackgroundRevalidation(key string) {
-	if _, held := bgRevalidationInflight.LoadAndDelete(key); !held {
+	held, rerun := settleRevalSlot(&bgRevalidationInflight, key)
+	if !held {
 		return
 	}
 	if _, _, still := KnownStale(key); still {
 		knownStaleRevalidationFail.Add(1)
+	} else {
+		knownStaleRevalidationFresh.Add(1)
+	}
+	if !rerun {
 		return
 	}
-	knownStaleRevalidationFresh.Add(1)
+	knownStaleRevalidationRerun[revalSlotBackground].Add(1)
+	if r := refresherPeek(); r != nil {
+		r.enqueueRevalidation(key)
+	}
 }
 
 // DemandRevalidationsInFlight is the number of demand revalidations currently
@@ -297,29 +408,35 @@ func DemandRevalidationDeadline() time.Duration {
 	return time.Duration(defaultResolvedCacheTombstoneTTLSeconds) * time.Second
 }
 
-// BeginDemandRevalidation marks ctx as the demand revalidation of key (claimed
-// with ClaimDemandRevalidation for t0) and installs the write-outcome sink the
-// customer Put reports into (PutIfGen → NoteRefreshWrite). settle MUST be called
-// once the revalidation returns: it releases the slot and counts the outcome.
-// The window itself is closed by the write, through the same rule as any other
-// accepted Put (endKnownStaleOnPut). It reports whether the write was accepted
-// un-remarked.
-func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (context.Context, func() bool) {
+// BeginDemandRevalidation marks ctx as one demand revalidation attempt of key
+// (its slot claimed with ClaimDemandRevalidation for t0) and installs the
+// write-outcome sink the customer Put reports into (PutIfGen → NoteRefreshWrite).
+// settle MUST be called once the attempt returns: it counts the outcome and
+// settles the slot. The window itself is closed by the write, through the same
+// rule as any other accepted Put (endKnownStaleOnPut). fresh reports whether
+// the write was accepted un-remarked. rerun (#740): a read was absorbed into this
+// attempt and key is still known-stale — the slot STAYS claimed and the caller
+// runs one more attempt at once, beginning it with another
+// BeginDemandRevalidation; otherwise the slot is released.
+func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (context.Context, func() (fresh, rerun bool)) {
 	ctx, o := withRefreshOutcome(ctx, key)
 	ctx = context.WithValue(ctx, ctxKeyDemandRevalidation, key)
 	var once sync.Once
-	var fresh bool
-	return ctx, func() bool {
+	var fresh, rerun bool
+	return ctx, func() (bool, bool) {
 		once.Do(func() {
-			demandInflight.CompareAndDelete(key, t0)
 			if o.accepted.Load() && !o.remarked.Load() {
 				knownStaleRevalidationFresh.Add(1)
 				fresh = true
-				return
+			} else {
+				knownStaleRevalidationFail.Add(1)
 			}
-			knownStaleRevalidationFail.Add(1)
+			_, rerun = settleRevalSlot(&demandInflight, key)
+			if rerun {
+				knownStaleRevalidationRerun[revalSlotDemand].Add(1)
+			}
 		})
-		return fresh
+		return fresh, rerun
 	}
 }
 
@@ -396,6 +513,20 @@ func AddKnownStaleServedForTest(reason string, n uint64) bool {
 	return false
 }
 
+// AddKnownStaleRevalidationRerunForTest moves the rerun counter of one slot of
+// the closed set through its production atomic, so a cross-package arm can
+// prove the OTLP mirror reads the LIVE counter. false: not a slot of the set.
+// Production callers MUST NOT use this.
+func AddKnownStaleRevalidationRerunForTest(slot string, n uint64) bool {
+	for i, name := range KnownStaleRevalidationSlots {
+		if name == slot {
+			knownStaleRevalidationRerun[i].Add(n)
+			return true
+		}
+	}
+	return false
+}
+
 // resetKnownStaleForTest clears the package counters and slots.
 func resetKnownStaleForTest() {
 	for i := range knownStaleServed {
@@ -405,6 +536,9 @@ func resetKnownStaleForTest() {
 	knownStaleRevalidationFresh.Store(0)
 	knownStaleRevalidationFail.Store(0)
 	knownStaleRevalidationSkip.Store(0)
+	for i := range knownStaleRevalidationRerun {
+		knownStaleRevalidationRerun[i].Store(0)
+	}
 	demandInflight.Range(func(k, _ any) bool { demandInflight.Delete(k); return true })
 	bgRevalidationInflight.Range(func(k, _ any) bool { bgRevalidationInflight.Delete(k); return true })
 }

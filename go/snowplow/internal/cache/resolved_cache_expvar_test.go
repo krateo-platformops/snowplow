@@ -102,6 +102,8 @@ func TestResolvedCacheStatsByStat_ReportsLiveStore(t *testing.T) {
 		"known_stale_resident", "known_stale_read_through_total",
 		"known_stale_revalidation_fresh_total", "known_stale_revalidation_failed_total",
 		"known_stale_revalidation_skipped_total",
+		// #740 — reruns an absorbed read earned, per slot of the closed set.
+		"known_stale_revalidation_rerun_background_total", "known_stale_revalidation_rerun_demand_total",
 		"warm_keyed_page_restactions", "warm_keyed_page_widgets", "warm_keyed_page_ra_full_list", // #354 P3 B3
 		"warm_keyed_extras_restactions", "warm_keyed_extras_widgets", "warm_keyed_extras_ra_full_list",
 		// #578 — lazy LIST-item materialisation, published as a TRIO because no
