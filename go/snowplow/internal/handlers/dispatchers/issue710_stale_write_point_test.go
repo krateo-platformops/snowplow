@@ -30,6 +30,11 @@
 //     resolves at the bypass class at the content gate and as a CUSTOMER tree
 //     at the nested gate; a plain refresher resolve stays background (control).
 //     Mutation → RED: the customer-triggered check after the origin rule.
+//   - D2-15e (architect F1) an EXTERNAL-TTL widget whose RA reads a known-
+//     stale content cell: the stale-derived body is never stored (the external
+//     Put is never armed); the response and the resident cell are fresh; and
+//     when the re-run is declined (a stage error) no stale cell is left behind.
+//     Mutation → RED: the external branch Puts regardless.
 //   - D2-17  invariant sweep: every stale-derived body written in these
 //     scenarios had an accepted Put + the armed header + an owed-push mark.
 //     Mutation → RED: CommitStaleServe skipped (no owed mark) or a stale body
@@ -56,6 +61,41 @@ type k710Write struct {
 	key                 string
 	staleDerived, armed bool
 	owed                bool
+}
+
+// k710Puts records every customer-dispatcher Put attempt (site, stale-derived).
+func k710Puts(t *testing.T) func() []k710Put {
+	t.Helper()
+	var mu sync.Mutex
+	var got []k710Put
+	prev := stalePutHookForTest
+	stalePutHookForTest = func(key, site string, staleDerived bool) {
+		mu.Lock()
+		got = append(got, k710Put{key: key, site: site, staleDerived: staleDerived})
+		mu.Unlock()
+	}
+	t.Cleanup(func() { stalePutHookForTest = prev })
+	return func() []k710Put {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]k710Put(nil), got...)
+	}
+}
+
+type k710Put struct {
+	key, site    string
+	staleDerived bool
+}
+
+// k710WriteNoStaleOutsidePutIfGen is the F1 invariant: a stale-derived body is
+// only ever offered to the armable PutIfGen.
+func k710WriteNoStaleOutsidePutIfGen(t *testing.T, arm string, puts []k710Put) {
+	t.Helper()
+	for _, p := range puts {
+		if p.staleDerived && p.site != "putifgen" {
+			t.Fatalf("%s RED: a stale-derived body was stored at %q — only the armable PutIfGen may ever store one", arm, p.site)
+		}
+	}
 }
 
 // k710Writes installs the D2-17 write-point observer.
@@ -205,15 +245,22 @@ func TestIssue710_D2_15c_ANestedStaleServeUnderADeclinedWidgetIsNeverWritten(t *
 func TestIssue710_D2_17_EveryStaleWriteHasAnAcceptedPutAnArmedHeaderAndAnOwedMark(t *testing.T) {
 	h, _ := k710KnownStaleFound(t)
 	writes := k710Writes(t)
+	puts := k710Puts(t)
+	// The debt refill is PARKED across both requests, so the content stays
+	// KNOWN-STALE and the declined pass below really carries a stale body: a
+	// write point that let it through unarmed must turn THIS sweep RED (S11).
+	release := restactionsapi.HoldStaleDebtRefillsForTest()
+	t.Cleanup(release)
 	// A committed stale serve (widget, cohort 0) …
 	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
 		t.Fatalf("D2-17: cohort 0 served %q (code %d), want the stale v0 shown at once", r, code)
 	}
-	// … a declined one (RA, cohort 1) …
+	// … a declined one (RA, cohort 1). Its response is checked AFTER the sweep,
+	// so a stale write the write point let through is named by the sweep's own
+	// invariant, not by this request's body …
 	h.customerExternal.Store(1)
-	if r, code := h.getRA(1, k547Changed); code != 200 || r != "v1" {
-		t.Fatalf("D2-17: cohort 1's declined RA served %q (code %d), want fresh v1", r, code)
-	}
+	r1, code1 := h.getRA(1, k547Changed)
+	release()
 	// … and the replace converging.
 	k547WaitFor(t, 10*time.Second, "widget replaced", func() bool {
 		rr, ok := h.residentReason(h.key(0, k547Changed))
@@ -235,6 +282,10 @@ func TestIssue710_D2_17_EveryStaleWriteHasAnAcceptedPutAnArmedHeaderAndAnOwedMar
 	}
 	if nStale == 0 {
 		t.Fatalf("D2-17: no stale-derived write observed — the sweep is vacuous")
+	}
+	k710WriteNoStaleOutsidePutIfGen(t, "D2-17", puts())
+	if code1 != 200 || r1 != "v1" {
+		t.Fatalf("D2-17: cohort 1's declined RA served %q (code %d), want fresh v1", r1, code1)
 	}
 }
 
@@ -408,4 +459,51 @@ func TestIssue710_D2_19c_ADebtDependentReResolveBypassesBothGatesAheadOfTheOrigi
 		t.Fatalf("D2-19c control: a plain refresher ctx classed fill=%q — the bypass leaked to background work", c)
 	}
 	_ = plain
+}
+
+func k710ExternalStaleFound(t *testing.T) *k547Harness {
+	t.Helper()
+	h, _ := k710KnownStaleFound(t)
+	h.widgetU.SetAnnotations(map[string]string{externalCacheTTLAnnotation: "300"})
+	h.external.Store(true) // every resolve of the widget touches a genuine external endpoint
+	return h
+}
+
+func TestIssue710_D2_15e_AnExternalTTLWidgetNeverStoresAStaleDerivedBody(t *testing.T) {
+	h := k710ExternalStaleFound(t)
+	puts := k710Puts(t)
+	s0 := restactionsapi.StaleServeStatsSnapshot()
+	r, code := h.get(0, k547Changed)
+	if code != 200 || r != "v1" {
+		t.Fatalf("D2-15e: served %q (code %d), want the FRESH v1 — an external-TTL response can never be pushed", r, code)
+	}
+	st := restactionsapi.StaleServeStatsSnapshot()
+	if st.ServeTotal-s0.ServeTotal != 1 || st.WithdrawnUnarmable-s0.WithdrawnUnarmable != 1 {
+		t.Fatalf("PRECONDITION: the first pass must have been served stale and withdrawn (serve %d, withdrawn %d)",
+			st.ServeTotal-s0.ServeTotal, st.WithdrawnUnarmable-s0.WithdrawnUnarmable)
+	}
+	k710WriteNoStaleOutsidePutIfGen(t, "D2-15e", puts())
+	e, ok := cache.ResolvedCache().GetNoTouch(h.key(0, k547Changed))
+	if !ok || !e.ExternalTTL || e.StaleDerived {
+		t.Fatalf("D2-15e: the resident cell is resident=%v externalTTL=%v staleDerived=%v — want the re-run's fresh external-TTL cell",
+			ok, ok && e.ExternalTTL, ok && e.StaleDerived)
+	}
+	if rr, _ := h.residentReason(h.key(0, k547Changed)); rr != "v1" {
+		t.Fatalf("D2-15e RED: the resident cell holds %q, want v1", rr)
+	}
+}
+
+func TestIssue710_D2_15e_ADeclinedReRunLeavesNoStaleExternalCellBehind(t *testing.T) {
+	h := k710ExternalStaleFound(t)
+	h.stageErrOnRerun.Store(true)
+	puts := k710Puts(t)
+	r, code := h.get(0, k547Changed)
+	if code != 200 || r != "v1" {
+		t.Fatalf("D2-15e(b): served %q (code %d), want the fresh v1 (the re-run's body, partial or not, is fresh)", r, code)
+	}
+	k710WriteNoStaleOutsidePutIfGen(t, "D2-15e(b)", puts())
+	if rr, ok := h.residentReason(h.key(0, k547Changed)); ok && rr == "v0" {
+		t.Fatalf("D2-15e(b) RED: a STALE external-TTL cell (v0) is resident after a withdrawn serve whose re-run was declined — " +
+			"stale baked into a fresh-looking cell for up to the external TTL")
+	}
 }

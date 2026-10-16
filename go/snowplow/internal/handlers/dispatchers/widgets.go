@@ -548,16 +548,28 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, keyExtras)
-		// #547 — a plain Put, but this resolve's ctx carries the dep-gen sink: an
-		// external widget whose RA also reads K8s is dirty-marked through its
-		// inner-call edge, so a post-mark re-Put must end KNOWN-STALE — in the
-		// write's own critical section (#734).
-		cacheHandle.PutEndingKnownStale(ctx, cacheKey, &cache.ResolvedEntry{
-			RawJSON:     encoded,
-			Inputs:      cacheInputs,
-			TTLOverride: extTTL,
-			ExternalTTL: true,
-		})
+		// #710 PR-2b (architect F1) — NO customer-dispatcher Put site may store a
+		// stale-derived body except the armable PutIfGen below. This one is never
+		// armed (external data has no push path), and storing a stale-derived
+		// body here would bake stale into a fresh-looking cell for up to extTTL
+		// and end its known-stale state. On a stale-derived pass the write point
+		// withdraws instead: the D2-disabled re-run reaches this branch with the
+		// fresh body and stores THAT.
+		if staleSink.StaleDerived() {
+			noteCustomerPut(cacheKey, "external_ttl_skipped_stale", false)
+		} else {
+			noteCustomerPut(cacheKey, "external_ttl", staleSink.StaleDerived())
+			// #547 — a plain Put, but this resolve's ctx carries the dep-gen sink: an
+			// external widget whose RA also reads K8s is dirty-marked through its
+			// inner-call edge, so a post-mark re-Put must end KNOWN-STALE — in the
+			// write's own critical section (#734).
+			cacheHandle.PutEndingKnownStale(ctx, cacheKey, &cache.ResolvedEntry{
+				RawJSON:     encoded,
+				Inputs:      cacheInputs,
+				TTLOverride: extTTL,
+				ExternalTTL: true,
+			})
+		}
 		log.Info("Widget touched an external endpoint; caching with bounded external TTL (opt-in annotation)",
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("external_ttl", extTTL.String()),
@@ -650,6 +662,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if uafTouchedSink.Count() > 0 && cacheInputs != nil {
 			cacheInputs.HasUAF = true
 		}
+		noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
 		if cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
 			RawJSON:      encoded,
 			Inputs:       cacheInputs,

@@ -243,6 +243,7 @@ Defined in `internal/resolvers/restactions/api/apistage_stale_debt.go`, with the
 
 **The write-point guarantee** (Diego: "serving stale data is correct only if the updated value will be served later in few seconds"). Whether a response can be corrected is exactly known only at the dispatcher's write point, after the whole Put-gate chain:
 - **accepted Put** (the refresh header is armed): the dependent is *committed*. Its key gets an **owed-push mark**, and the stale body is written;
+- **No other Put site may store a stale-derived body.** The widgets external-TTL Put is never armed, so on a stale-derived pass it stores nothing (it would bake stale into a fresh-looking cell for up to the TTL); the re-run stores the fresh body.
 - **declined Put** (stage error, external, UAF, sensitive, ext-TTL, a refused `PutIfGen`): the dependent is *withdrawn*. The stale body is **never written**: the request re-runs once with D2 disabled (its content reads read through, never queued) and serves that fresh body. The re-run is counted as the same request: like a demand revalidation it skips the L1 lookups, the customer-in-flight mark and the live-caller observation, and its `dispatcher.call.complete` record carries `l1_hit="stale_rerun"`.
 
 `/refreshes` has no replay. The owed mark therefore carries the push to a tab that arms **after** the replacement was published: on arm, a key whose mark is set and whose cell is no longer stale-derived (replaced **or evicted**) gets `event: refresh` at once. The mark is cleared when a refresh reaches an armed tab. It survives the cell's eviction, and the set is bounded by the L1 store's own entry budget (oldest dropped first).
@@ -254,7 +255,7 @@ Substrate fills (a nested resolve that re-scopes the L1 key, such as the RAFullL
 | expvar | meaning | healthy range |
 |---|---|---|
 | `snowplow_apistage_stale_serve_total` | map `reason` (`known_stale`) → customer reads served a known-stale content cell at once | the stale-serve share of hits, reported by the bench |
-| `snowplow_apistage_stale_to_push_ms` | histogram (cumulative `le_*`, with buckets at exactly **1000 / 3000 / 10000**, plus `count`, `sum_ms`, `max_ms`): stale serve → the replacement's publish to an armed tab | **p95 ≤ 3000, max ≤ 10000**, target 1000 |
+| `snowplow_apistage_stale_to_push_ms` | histogram (cumulative `le_*`, with buckets at exactly **1000 / 3000 / 10000**, plus `count`, `sum_ms`, `max_ms`): stale serve → the correction reaching the tab: the replacement's publish to an armed tab, **or** (a tab that armed later) the owed-push emit at arm time, measured from the earliest stale serve still owed. Late arms are the slowest corrections and are included | **p95 ≤ 3000, max ≤ 10000**, target 1000 |
 | `snowplow_apistage_stale_serve_age_ms` | histogram: the age of the body served stale (since its known-stale window opened) | diagnostic |
 | `snowplow_apistage_stale_debt_open` / `_debt_oldest_age_ms` | gauges: open debts and the age of the oldest | **0** at rest; back to 0 within 10 s after a burst |
 | `snowplow_apistage_stale_debt_retries_total` | failed refill attempts retried | low |

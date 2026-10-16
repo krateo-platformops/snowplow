@@ -164,8 +164,9 @@ var cacheAllow443 = map[string]cacheClass443{
 	"StaleServeSink.Commit": unreachableInert443, "StaleServeSink.Withdraw": unreachableInert443,
 	"StaleServeSink.DebtCleared": unreachableInert443, "ResolvedCacheStore.EvictStaleDerived": unreachableInert443,
 	"RunRefreshNow": unreachableInert443, "PublishRefresh": unreachableInert443,
-	// Package init wiring of the test-reset quiesce; no resolve reaches it.
-	"RegisterStaleServeQuiesce": unreachableInert443,
+	// Package init wiring (the test-reset quiesce; the #710 F2 arm-time
+	// stale_to_push recorder); no resolve reaches it.
+	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
 	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,

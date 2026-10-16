@@ -434,8 +434,13 @@ func serveParsedListEnvelopeValue(p parsedListEnvelope) any {
 // debt clears and the replacement is published to nobody. A tab that arms 12 s
 // later (seamed clock) must still get `event: refresh` for the key within 1 s
 // of the arm, and the owed mark is then cleared.
-// Mutation → RED: no owed mark (Commit without MarkStaleOwed), or no emit at
-// arm (SubscribeRefreshStream's owed loop removed).
+// F2 (architect): the arm-time delivery is a correction like any other — the
+// tab showed the stale body until it — so stale_to_push records it (emit −
+// servedAt), and the late arm's ≥12 s lands in the histogram (count +1, max ≥
+// 12000 ms). A publish-time-only record would drop the slowest corrections.
+// Mutation → RED: no owed mark (Commit without MarkStaleOwed), no emit at arm
+// (SubscribeRefreshStream's owed loop removed), or no stale_to_push record at
+// the arm-time emit.
 func TestStale710_D2_16_ALateArmStillGetsTheRefresh(t *testing.T) {
 	f := newD2Fixture(t)
 	f.customer(t, "dep-16")
@@ -451,6 +456,10 @@ func TestStale710_D2_16_ALateArmStillGetsTheRefresh(t *testing.T) {
 		t.Fatalf("PRECONDITION: the replacement must have been published to no tab, leaving the push owed (unarmed=%d owed=%v)",
 			st.PushUnarmed, cache.StaleOwed("dep-16"))
 	}
+	tp0 := StaleServeStatsSnapshot().ToPush
+	if tp0.Count != 0 {
+		t.Fatalf("PRECONDITION: stale_to_push recorded %d sample(s) for a publish that reached no tab", tp0.Count)
+	}
 	base := time.Now()
 	setStaleClockForTest(func() time.Time { return base.Add(12 * time.Second) })
 	t.Cleanup(func() { setStaleClockForTest(nil) })
@@ -460,8 +469,13 @@ func TestStale710_D2_16_ALateArmStillGetsTheRefresh(t *testing.T) {
 	if cache.StaleOwed("dep-16") {
 		t.Fatalf("D2-16: the owed mark survived its arm-time delivery")
 	}
-	if st := StaleServeStatsSnapshot(); st.Owed.ArmEmits != 1 || st.Owed.Dropped != 0 {
+	st := StaleServeStatsSnapshot()
+	if st.Owed.ArmEmits != 1 || st.Owed.Dropped != 0 {
 		t.Fatalf("D2-16: owed arm_emits=%d dropped=%d, want 1/0", st.Owed.ArmEmits, st.Owed.Dropped)
+	}
+	if st.ToPush.Count != tp0.Count+1 || st.ToPush.MaxMS < 12000 {
+		t.Fatalf("D2-16 RED (F2): the arm-time correction must be recorded on stale_to_push (count %d→%d, max %d ms, want +1 and ≥ 12000)",
+			tp0.Count, st.ToPush.Count, st.ToPush.MaxMS)
 	}
 }
 

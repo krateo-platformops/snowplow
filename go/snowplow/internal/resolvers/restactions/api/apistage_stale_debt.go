@@ -522,7 +522,14 @@ var (
 	staleDebtStop   = make(chan struct{})
 )
 
-func init() { cache.RegisterStaleServeQuiesce(quiesceStaleDebts) }
+func init() {
+	cache.RegisterStaleServeQuiesce(quiesceStaleDebts)
+	// #710 F2 — an owed push delivered at ARM time is a correction too: record
+	// its stale_to_push, so late-arming tabs are not dropped from p95/max.
+	cache.SetStaleOwedArmRecorder(func(servedAt time.Time) {
+		staleToPushHist.record(staleNow().Sub(servedAt).Milliseconds())
+	})
+}
 
 // staleDebtSleep waits d; false when the debts are being quiesced.
 func staleDebtSleep(d time.Duration) bool {
