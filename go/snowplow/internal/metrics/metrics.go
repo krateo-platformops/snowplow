@@ -1674,6 +1674,18 @@ func registerSecurityInstruments(m metric.Meter) error {
 		return err
 	}
 
+	// --- #740: reruns an ABSORBED read earned — a read that found the key's
+	// revalidation slot held while the cell was still known-stale arms one more
+	// attempt — per slot of the closed set (cache.KnownStaleRevalidationSlots),
+	// zeros included. Hand-wired (no expvar->OTLP bridge); the expvar twins are
+	// snowplow_resolved_cache{stat=known_stale_revalidation_rerun_<slot>_total}. ---
+	knownStaleRerun, err := m.Int64ObservableCounter(
+		"snowplow_resolved_cache_known_stale_revalidation_rerun_total",
+		metric.WithDescription("Known-stale revalidation reruns earned by a read absorbed into an attempt already in flight (that attempt may have read its inputs before the state the reader needs), by slot {background, demand}. One per settle with an absorbed read; never self-looping. #740."))
+	if err != nil {
+		return err
+	}
+
 	// --- #424: subject binding-set digest memo ---
 	bsHits, err := m.Int64ObservableCounter("snowplow_binding_set_memo_hits",
 		metric.WithDescription("Subject binding-set digest memo hits (#424). Hit ratio = hits / (hits + misses)."))
@@ -1761,6 +1773,10 @@ func registerSecurityInstruments(m metric.Meter) error {
 		for _, reason := range cache.KnownStaleReasons {
 			o.ObserveInt64(knownStaleServed, int64(byReason[reason]), metric.WithAttributes(attribute.String("reason", reason)))
 		}
+		bySlot := cache.KnownStaleRevalidationRerunBySlot()
+		for _, slot := range cache.KnownStaleRevalidationSlots {
+			o.ObserveInt64(knownStaleRerun, int64(bySlot[slot]), metric.WithAttributes(attribute.String("slot", slot)))
+		}
 
 		hits, misses, refused, entries := rbac.BindingSetMemoSnapshot()
 		o.ObserveInt64(bsHits, int64(hits))
@@ -1793,7 +1809,7 @@ func registerSecurityInstruments(m metric.Meter) error {
 			}
 		}
 		return nil
-	}, driftDeclined, repick, remint, knownStaleServed, bsHits, bsMisses, bsRefused, bsEntries,
+	}, driftDeclined, repick, remint, knownStaleServed, knownStaleRerun, bsHits, bsMisses, bsRefused, bsEntries,
 		lRegistered, lSeeded, lUnseeded, lNavOnly, lFromSecrets, lUnparseable, lClientconfig,
 		lCapacity, lBound)
 	return err
