@@ -5,11 +5,11 @@ package chartcrd
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/testsupport/kindguard"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -55,7 +55,9 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 	// A per-process name: kind's Create reuses an existing cluster of the same
 	// name and Destroy deletes unconditionally, so a shared name could destroy
 	// a cluster another process is using (#522).
-	clusterName := fmt.Sprintf("krateo-%d", os.Getpid())
+	clusterName := kindguard.ClusterName() // krateo-sptest-<pid>: per-process (#522), marked as ours (#742)
+	// #742 — reap orphaned krateo-<pid> clusters; delete this one on SIGINT/SIGTERM.
+	kindguard.Prepare(clusterName)
 	provider := kind.NewCluster(clusterName).WithOpts(kind.WithImage(kindNodeImage))
 	cctx, ccancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer ccancel()
@@ -69,6 +71,7 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 		if err := provider.Destroy(dctx); err != nil {
 			t.Logf("destroy kind cluster %s: %v", clusterName, err)
 		}
+		kindguard.Release()
 	})
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {

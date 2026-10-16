@@ -31,13 +31,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/testsupport/kindguard"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -290,7 +290,9 @@ func TestIssue624_Kind_RBACServeParityWithRealApiserver(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 
 	ctx := context.Background()
-	clusterName := fmt.Sprintf("krateo-%d", os.Getpid())
+	clusterName := kindguard.ClusterName() // krateo-sptest-<pid>: per-process (#522), marked as ours (#742)
+	// #742 — reap orphaned krateo-<pid> clusters; delete this one on SIGINT/SIGTERM.
+	kindguard.Prepare(clusterName)
 	provider := kind.NewProvider().WithName(clusterName)
 	cctx, ccancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer ccancel()
@@ -304,6 +306,7 @@ func TestIssue624_Kind_RBACServeParityWithRealApiserver(t *testing.T) {
 		if err := provider.Destroy(dctx); err != nil {
 			t.Logf("destroy kind cluster %s: %v", clusterName, err)
 		}
+		kindguard.Release()
 	})
 
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
