@@ -55,7 +55,7 @@ func forbidden(pkgPath, name string) bool {
 		return name == "NewClientConfig"
 	case "net/http":
 		switch name {
-		case "DefaultClient", "Get", "Head", "Post", "PostForm":
+		case "DefaultClient", "DefaultTransport", "Get", "Head", "Post", "PostForm":
 			return true
 		}
 	case "sigs.k8s.io/controller-runtime", "sigs.k8s.io/controller-runtime/pkg/client",
@@ -66,6 +66,20 @@ func forbidden(pkgPath, name string) bool {
 }
 
 var forConfigRe = regexp.MustCompile(`^New.*ForConfig`)
+
+// httpClientType reports whether e is the NON-pointer type net/http.Client or
+// net/http.Transport, and which.
+func httpClientType(e ast.Expr, imports map[string]string) (string, bool) {
+	sel, ok := e.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	if !ok || imports[id.Name] != "net/http" || (sel.Sel.Name != "Client" && sel.Sel.Name != "Transport") {
+		return "", false
+	}
+	return sel.Sel.Name, true
+}
 
 // allowed: (module-relative file, enclosing func, reference) → reason.
 // "http.Client{}" stands for a composite literal of net/http.Client.
@@ -104,10 +118,40 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 			parent = stack[len(stack)-1]
 		}
 		stack = append(stack, n)
-		if fd, ok := n.(*ast.FuncDecl); ok {
-			fn = fd.Name.Name
+		// The enclosing func is reset at every top-level declaration, so a
+		// package-level reference after a func is never attributed to it
+		// (an exemption keyed on that func would otherwise cover it).
+		if _, top := parent.(*ast.File); top {
+			fn = ""
+			if fd, ok := n.(*ast.FuncDecl); ok {
+				fn = fd.Name.Name
+			}
 		}
 		switch x := n.(type) {
+		case *ast.CallExpr:
+			// #729: new(http.Client) / new(http.Transport) is a zero-value client.
+			if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "new" && len(x.Args) == 1 {
+				if name, ok := httpClientType(x.Args[0], imports); ok {
+					out = append(out, ref{rel, fn, "new(http." + name + ")", fset.Position(x.Pos())})
+				}
+			}
+		case *ast.ValueSpec:
+			// #729: `var c http.Client` (no value) is a zero-value client.
+			if name, ok := httpClientType(x.Type, imports); ok && len(x.Values) == 0 {
+				out = append(out, ref{rel, fn, "var http." + name, fset.Position(x.Pos())})
+			}
+		case *ast.Field:
+			// #729: a by-value http.Client/Transport field or parameter is a
+			// zero-value (or copied) client that never passed through credhttp.
+			if name, ok := httpClientType(x.Type, imports); ok {
+				out = append(out, ref{rel, fn, "field http." + name, fset.Position(x.Pos())})
+			}
+		case *ast.TypeSpec:
+			// #729: `type C http.Client` / `type C = http.Client` renames the
+			// type, so new(C), `var c C` and C{} would escape every shape above.
+			if name, ok := httpClientType(x.Type, imports); ok {
+				out = append(out, ref{rel, fn, "type http." + name, fset.Position(x.Pos())})
+			}
 		case *ast.SelectorExpr:
 			id, ok := x.X.(*ast.Ident)
 			if !ok || id.Obj != nil {
@@ -227,6 +271,16 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 		"literal":    `import "net/http"; var c = &http.Client{}`,
 		"transportL": `import "net/http"; var c = &http.Transport{}`,
 		"default":    `import "net/http"; var c = http.DefaultClient`,
+		"defaultRT":  `import "net/http"; var rt = http.DefaultTransport`,
+		"newClient":  `import "net/http"; var c = new(http.Client)`,
+		"newRT":      `import "net/http"; var c = new(http.Transport)`,
+		"zeroVar":    `import "net/http"; func f() { var c http.Client; _ = c }`,
+		"zeroField":  `import "net/http"; type T struct{ c http.Client }`,
+		"aliasedNet": `import nh "net/http"; var c nh.Client`,
+		"zeroParam":  `import "net/http"; func f(c http.Client) {}`,
+		"embedded":   `import "net/http"; type T struct{ http.Client }`,
+		"typeDef":    `import "net/http"; type C http.Client`,
+		"typeAlias":  `import "net/http"; type C = http.Transport`,
 		"apiext":     `import apiext "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"; func f() { apiext.NewForConfig(nil) }`,
 	}
 	for name, body := range cases {
@@ -239,8 +293,20 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 			t.Errorf("%s: guard did not flag %q", name, body)
 		}
 	}
+	// A package-level reference after a func is not attributed to that func,
+	// so an exemption keyed on the func cannot cover it.
+	{
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, "x.go", "package p\nimport \"net/http\"\nfunc buildEndpointClient() {}\nvar c = &http.Client{}\n", parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := scanFile(fset, f, "x.go"); len(got) != 1 || got[0].fn != "" {
+			t.Errorf("package-level literal after a func: want fn \"\", got %+v", got)
+		}
+	}
 	// And it must NOT flag the hardened forms.
-	ok := `import ("net/http"; "github.com/krateo-platformops/snowplow/internal/credhttp"); var c = credhttp.Client(&http.Client{})`
+	ok := `import ("net/http"; "github.com/krateo-platformops/snowplow/internal/credhttp"); var c = credhttp.Client(&http.Client{}); type T struct{ h *http.Client }; func g(h *http.Client) {}; var p *http.Client`
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "x.go", "package p\n"+ok+"\n", parser.SkipObjectResolution)
 	if err != nil {

@@ -70,6 +70,9 @@ type StageFailure struct {
 	Code    int
 	Reason  string
 	Message string
+
+	// redirect is the upstream's 3xx when Code was mapped to 502 (#729).
+	redirect int
 }
 
 // StatusError renders the failure as a typed apiserver status, so every
@@ -121,6 +124,16 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 	if f.Code == 0 {
 		f.Code = http.StatusInternalServerError
 	}
+	// #729 — a 3xx is not an answer a client can act on. A credentialed dial
+	// never follows a redirect (#723/#724, internal/credhttp), so a stage that
+	// got one failed because the upstream misbehaved (or is an attack): report
+	// 502 Bad Gateway, never a bare 302 with no Location. The 3xx itself stays
+	// in the canonical message and under the stage's errorKey.
+	if f.Code >= 300 && f.Code < 400 {
+		f.redirect = f.Code
+		f.Code = http.StatusBadGateway
+		f.Reason = ""
+	}
 	if f.Reason == "" {
 		f.Reason = string(response.New(f.Code, nil).Reason)
 	}
@@ -130,7 +143,19 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 // canonicalStageMessage is the identity-free message for a stage that failed
 // with code on call: built from the code and the call's own coordinates only.
 func canonicalStageMessage(code int, call httpcall.RequestOptions) string {
-	answered := fmt.Sprintf("upstream answered %d %s", code, http.StatusText(code))
+	return stageMessage(code, fmt.Sprintf("upstream answered %d %s", code, http.StatusText(code)), call)
+}
+
+// canonicalRedirectMessage is canonicalStageMessage for a stage whose
+// upstream answered a redirect (#729): reported as 502, it names the 3xx.
+func canonicalRedirectMessage(redirect int, call httpcall.RequestOptions) string {
+	return stageMessage(http.StatusBadGateway,
+		fmt.Sprintf("upstream answered %d %s, a redirect snowplow does not follow", redirect, http.StatusText(redirect)), call)
+}
+
+// stageMessage builds the identity-free message from code, the "answered"
+// clause and the call's own coordinates.
+func stageMessage(code int, answered string, call httpcall.RequestOptions) string {
 	gvr, ns, name, ok := cache.ParseAPIServerPathToDep(call.Path)
 	if !ok {
 		return answered
@@ -196,7 +221,11 @@ func firstStageFailure(itemErrs []error, calls []httpcall.RequestOptions) *Stage
 			if i < len(calls) {
 				call = calls[i]
 			}
-			f.Message = canonicalStageMessage(f.Code, call)
+			if f.redirect != 0 {
+				f.Message = canonicalRedirectMessage(f.redirect, call)
+			} else {
+				f.Message = canonicalStageMessage(f.Code, call)
+			}
 			return &f
 		}
 	}
