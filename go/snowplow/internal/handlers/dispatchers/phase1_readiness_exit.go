@@ -22,6 +22,15 @@
 //  3. The detector `snowplow_phase1_deadline_released_total` (expvar here + the
 //     OTLP Int64ObservableCounter hand-wired in internal/metrics/metrics.go):
 //     0 or 1 per process, 1 iff outcome == "deadline". Healthy = 0.
+//  5. (#736) `snowplow_phase1_readiness_exit_total{outcome}`: one series per
+//     outcome of the CLOSED set Phase1ReadinessExitOutcomes, 1 for the outcome
+//     this process's readiness was released by and 0 for every other (expvar
+//     map + the OTLP Int64ObservableCounter hand-wired in metrics.go). Set in
+//     the same sync.Once as the line. The #397 detector is deadline-only and the
+//     F5 backstop counter carries no outcome; this names EVERY release, so an
+//     alert on any outcome other than latch sees a Ready-degraded or
+//     nothing-to-warm boot — including none-configured and seed_returned,
+//     which move no other counter.
 //  4. (#407) The SAME record as the expvar map `snowplow_phase1_readiness_exit`,
 //     set once, inside the same sync.Once that emits the line, from the same
 //     phase1ExitRecord value the line is built from. The line is INFO on a
@@ -88,6 +97,14 @@ const (
 	phase1ExitNoneConfigured = "none-configured"
 )
 
+// Phase1ReadinessExitOutcomes is the CLOSED `outcome` set of
+// snowplow_phase1_readiness_exit_total (#736), in a fixed order. A guard test
+// pins it to the phase1Exit* constants.
+var Phase1ReadinessExitOutcomes = []string{
+	phase1ExitLatch, phase1ExitDeadline, phase1ExitBootError, phase1ExitSeedPanic,
+	phase1ExitSeedReturned, phase1ExitBootAborted, phase1ExitNoneConfigured,
+}
+
 // Boot-abort causes (#401): the `abort_cause` attribute of a boot_aborted exit
 // and the readyz.backstop.fired `reason`. A closed, code-defined set.
 const (
@@ -133,6 +150,10 @@ var (
 	// phase1ExitRecSets counts stores of phase1ExitRec, so a test can assert
 	// the record is set exactly once per process.
 	phase1ExitRecSets atomic.Int64
+
+	// phase1ExitByOutcome is the #736 per-outcome release record, indexed like
+	// Phase1ReadinessExitOutcomes: 1 at the outcome that released readiness.
+	phase1ExitByOutcome [7]atomic.Int64
 )
 
 func init() { registerPhase1ReadinessExitMetrics() }
@@ -145,6 +166,9 @@ func registerPhase1ReadinessExitMetrics() {
 	phase1ExitMetricsOnce.Do(func() {
 		expvar.Publish("snowplow_phase1_deadline_released_total", &phase1DeadlineReleased)
 		expvar.Publish("snowplow_phase1_readiness_exit", expvar.Func(phase1ReadinessExitExpvar))
+		expvar.Publish("snowplow_phase1_readiness_exit_total", expvar.Func(func() any {
+			return Phase1ReadinessExitByOutcome()
+		}))
 	})
 }
 
@@ -237,6 +261,26 @@ func Phase1ReadinessExitTimings() (t Phase1ExitTimings, ok bool) {
 		ElapsedMs: r.ElapsedMs, WalkMs: r.WalkMs, SyncWaitMs: r.SyncWaitMs,
 		ContentPrewarmMs: r.ContentPrewarmMs, ClusterListPrewarmMs: r.ClusterListPrewarmMs, SeedMs: r.SeedMs,
 	}, true
+}
+
+// Phase1ReadinessExitByOutcome is the #736 record: every outcome of the closed
+// set, 1 for the one that released this process's readiness, 0 otherwise (all
+// 0 before the exit). The expvar value and the OTLP callback both read it.
+func Phase1ReadinessExitByOutcome() map[string]int64 {
+	m := make(map[string]int64, len(Phase1ReadinessExitOutcomes))
+	for i, o := range Phase1ReadinessExitOutcomes {
+		m[o] = phase1ExitByOutcome[i].Load()
+	}
+	return m
+}
+
+func notePhase1ExitOutcome(outcome string) {
+	for i, o := range Phase1ReadinessExitOutcomes {
+		if o == outcome {
+			phase1ExitByOutcome[i].Store(1)
+			return
+		}
+	}
 }
 
 // Phase1DeadlineReleasedTotal is the OTLP accessor for the #397 detector.
@@ -470,6 +514,7 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 			deadlineCause, abortCause = "", cause
 		}
 		phase1ExitOutcome.Store(outcome)
+		notePhase1ExitOutcome(outcome) // #736
 		phase1Stage.Store(phase1StageReadinessReleased)
 		if outcome == phase1ExitDeadline {
 			phase1DeadlineReleased.Set(1)
@@ -576,6 +621,9 @@ func resetPhase1ReadinessExitForTest() {
 	phase1DeadlineReleased.Set(0)
 	phase1ExitRec.Store(nil)
 	phase1ExitRecSets.Store(0)
+	for i := range phase1ExitByOutcome {
+		phase1ExitByOutcome[i].Store(0)
+	}
 	bootNavProgressState.reset()
 }
 
