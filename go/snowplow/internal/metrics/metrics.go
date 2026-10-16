@@ -679,6 +679,19 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// --- #736: WHICH outcome released readiness, by outcome (the closed set
+	// dispatchers.Phase1ReadinessExitOutcomes). 1 at the releasing outcome, 0
+	// at every other. The F5 backstop counter has no outcome and the #397
+	// detector is deadline-only; none-configured and seed_returned moved
+	// nothing. Alert on any outcome other than latch (none-configured only
+	// matters with the cache on).
+	phase1ExitByOutcome, err := m.Int64ObservableCounter(
+		"snowplow_phase1_readiness_exit_total",
+		metric.WithDescription("Which outcome released this process's /readyz, by outcome {latch, deadline, boot_error, seed_panic, seed_returned, boot_aborted, none-configured}: 1 at the releasing outcome, 0 elsewhere. Healthy = latch. Any other outcome = a Ready-degraded or nothing-to-warm boot — alert. #736."))
+	if err != nil {
+		return err
+	}
+
 	// --- L1 store occupancy + lifetime, keyed by stat. Computed by
 	// Stats() every N seconds since forever and emitted only into an
 	// INFO line the production LOG_LEVEL=warn discards.
@@ -1042,6 +1055,11 @@ func registerInstruments(m metric.Meter, build string) error {
 		o.ObserveInt64(readyzBackstop, dispatchers.ReadinessBackstopFired())
 		// --- #397: phase-1 deadline-release detector ---
 		o.ObserveInt64(phase1DeadlineReleased, dispatchers.Phase1DeadlineReleasedTotal())
+		// --- #736: the releasing outcome, by outcome (closed set) ---
+		byOutcome := dispatchers.Phase1ReadinessExitByOutcome()
+		for _, oc := range dispatchers.Phase1ReadinessExitOutcomes {
+			o.ObserveInt64(phase1ExitByOutcome, byOutcome[oc], metric.WithAttributes(attribute.String("outcome", oc)))
+		}
 
 		// --- 1.12.4: L1 store occupancy + lifetime ---
 		for stat, v := range cache.ResolvedCacheStatsByStat() {
@@ -1174,7 +1192,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- #386 M3 (PR2) ---
 		customerResolveInflight,
 		fallthroughCells, diagnosticTotal, diagnosticCells, seriesTruncated,
-		readyzBackstop, phase1DeadlineReleased, resolvedCache, informerServable, buildInfo,
+		readyzBackstop, phase1DeadlineReleased, phase1ExitByOutcome, resolvedCache, informerServable, buildInfo,
 		// --- 1.12.5 ---
 		depsStats, informerFreshness,
 		// --- #233 ---
