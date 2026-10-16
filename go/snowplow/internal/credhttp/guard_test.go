@@ -97,15 +97,18 @@ type ref struct {
 
 func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 	imports := map[string]string{} // local name → path
+	var out []ref
 	for _, im := range f.Imports {
 		p, _ := strconv.Unquote(im.Path.Value)
+		if im.Name != nil && im.Name.Name == "." && dotImportForbidden(p) {
+			out = append(out, ref{rel, "import", "dot import of " + p, fset.Position(im.Pos())})
+		}
 		name := p[strings.LastIndex(p, "/")+1:]
 		if im.Name != nil {
 			name = im.Name.Name
 		}
 		imports[name] = p
 	}
-	var out []ref
 	var fn string
 	var stack []ast.Node
 	ast.Inspect(f, func(n ast.Node) bool {
@@ -186,6 +189,22 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 		return true
 	})
 	return out
+}
+
+// dotImportForbidden reports whether a dot import of pkgPath must be refused
+// outright (#735). A dot import makes the package's names unqualified (import
+// . "net/http"; &Client{}), and the guard matches by package selector, so it
+// would see nothing. Every package family forbidden() covers is refused whole.
+func dotImportForbidden(pkgPath string) bool {
+	switch {
+	case pkgPath == "net/http",
+		strings.HasPrefix(pkgPath, "k8s.io/client-go/"),
+		strings.HasPrefix(pkgPath, "k8s.io/apiextensions-apiserver/pkg/client/"),
+		strings.HasPrefix(pkgPath, "github.com/krateo-platformops/plumbing/"),
+		strings.HasPrefix(pkgPath, "sigs.k8s.io/controller-runtime"):
+		return true
+	}
+	return false
 }
 
 func moduleRoot(t *testing.T) string {
@@ -282,6 +301,10 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 		"typeDef":    `import "net/http"; type C http.Client`,
 		"typeAlias":  `import "net/http"; type C = http.Transport`,
 		"apiext":     `import apiext "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"; func f() { apiext.NewForConfig(nil) }`,
+		// #735 — a dot import hides every selector; it is refused outright.
+		"dotHTTP":     `import . "net/http"; var c = &Client{}`,
+		"dotClientGo": `import . "k8s.io/client-go/dynamic"; func f() { NewForConfig(nil) }`,
+		"dotPlumbing": `import . "github.com/krateo-platformops/plumbing/http/request"; func f() { HTTPClientForEndpoint(nil, nil) }`,
 	}
 	for name, body := range cases {
 		fset := token.NewFileSet()
