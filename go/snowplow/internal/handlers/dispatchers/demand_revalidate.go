@@ -26,6 +26,10 @@
 //   - FAILURE (owner ruling 1): no Put → the slot is released, the cell stays
 //     resident, served and counted; the next read or change retries. Never an
 //     eviction.
+//   - ABSORBED READ (#740): a read that finds the slot held earns the attempt
+//     in flight ONE rerun if it settles still known-stale (it may have read its
+//     inputs before the state that reader needs). The slot stays claimed across
+//     the rerun; with no absorbed read the first settle releases it.
 //   - SUPPRESSED (team ruling (b)): a key suppressed for a structurally-
 //     permanent reason (external endpoint, UAF, unsupported kind, sensitive
 //     resource) is NOT revalidated — the cold path would decline its Put by the
@@ -41,6 +45,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -63,33 +68,47 @@ func revalidateKnownStale(h http.Handler, req *http.Request, key string) {
 	if !ok || !cache.ClaimDemandRevalidation(key, t0) {
 		return
 	}
+	go func() {
+		// #740 — a read absorbed into an attempt (its ClaimDemandRevalidation
+		// found this slot held) earns one more attempt while the cell is still
+		// known-stale; the slot stays claimed across it. Driven by reads: with
+		// no absorbed read the first settle releases the slot.
+		for demandRevalidateOnce(h, req, key, t0, reason) {
+		}
+	}()
+}
+
+// demandRevalidateOnce runs one demand revalidation attempt of key on a
+// detached, bounded copy of req and settles it. It reports whether the slot
+// asks for a rerun (#740).
+func demandRevalidateOnce(h http.Handler, req *http.Request, key string, t0 time.Time, reason string) (rerun bool) {
 	// #710 PR-2b — a customer started it and is looking at the stale body: its
 	// content and nested fills bypass like a debt's (top priority, never queued
-	// behind background work), ahead of any origin rule.
+	// behind background work), ahead of any origin rule. #740 — stamped on EVERY
+	// attempt, the absorbed-read reruns included.
 	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(context.WithoutCancel(req.Context())), cache.DemandRevalidationDeadline())
+	defer cancel()
 	ctx, settle := cache.BeginDemandRevalidation(ctx, key, t0)
-	r2 := req.Clone(ctx)
-	go func() {
-		defer cancel()
-		fresh := false
-		defer func() {
-			if p := recover(); p != nil {
-				xcontext.Logger(ctx).Error("demand revalidation panicked; cell stays known-stale",
-					slog.String("subsystem", "cache"),
-					slog.String("key_hash", key),
-					slog.Any("panic", p),
-				)
-			}
-			fresh = settle()
-			xcontext.Logger(ctx).Debug("demand revalidation settled",
+	defer func() {
+		if p := recover(); p != nil {
+			xcontext.Logger(ctx).Error("demand revalidation panicked; cell stays known-stale",
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
-				slog.String("known_stale_reason", reason),
-				slog.Bool("fresh", fresh),
+				slog.Any("panic", p),
 			)
-		}()
-		h.ServeHTTP(&discardResponseWriter{}, r2)
+		}
+		var fresh bool
+		fresh, rerun = settle()
+		xcontext.Logger(ctx).Debug("demand revalidation settled",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("known_stale_reason", reason),
+			slog.Bool("fresh", fresh),
+			slog.Bool("rerun", rerun),
+		)
 	}()
+	h.ServeHTTP(&discardResponseWriter{}, req.Clone(ctx))
+	return false
 }
 
 // discardResponseWriter swallows the re-entered handler's response: the

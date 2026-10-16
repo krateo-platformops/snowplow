@@ -241,6 +241,13 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 	for i, reason := range KnownStaleReasons {
 		out["known_stale_served_"+reason+"_total"] = int64(s.KnownStaleServed[i])
 	}
+	// #740 — reruns an ABSORBED read earned (a read that found the revalidation
+	// slot held while the cell was still known-stale), per slot of the closed set;
+	// the slot-labelled OTLP counter is
+	// snowplow_resolved_cache_known_stale_revalidation_rerun_total{slot}.
+	for i, slot := range KnownStaleRevalidationSlots {
+		out["known_stale_revalidation_rerun_"+slot+"_total"] = int64(s.KnownStaleRevalidationRerun[i])
+	}
 	// #354 P3 (E, B3) — warm cells keyed by page / by request extras, per
 	// identity-bound class (GAUGES; denominator warm_seeded + warm_lastread).
 	for i, suffix := range b3StatSuffix {

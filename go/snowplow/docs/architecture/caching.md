@@ -505,6 +505,10 @@ went blind at the moment the user started seeing stale data (#547 trace). The se
   suppressed for a structurally-permanent reason (external, UAF, unsupported, sensitive) starts
   NO demand revalidation — its cold path declines the Put by the same gate — and the skip is
   counted (`known_stale_revalidation_skipped_total`, team ruling);
+  a read that finds a revalidation slot (background or demand) already held is ABSORBED into that
+  attempt and earns it ONE rerun if it settles still known-stale — the slot stays claimed across the
+  rerun, so a read during it arms one more; without an absorbed read the slot is released
+  (`known_stale_revalidation_rerun_total{slot}`, #740);
 - the **shared, identity-free widget shell** (widgetContent) is a SERVED body too: it is served
   instantly and counted like a per-cohort cell, and revalidated in the BACKGROUND by the
   refresher under its own identity for identity-free cells — never read through, never resolved

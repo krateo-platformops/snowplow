@@ -160,6 +160,11 @@ type k547Harness struct {
 	// allowBackground lifts the background-identity injection (F7: the
 	// refresher's own identity recovers, so its background revalidation heals).
 	allowBackground atomic.Bool
+	// onDoomed (#740), when set, runs inside a resolve of the changed composition
+	// AFTER it has read an injected failure (the background deny, or
+	// failCustomer) and BEFORE it returns it: an arm parks the attempt there, so
+	// the failure it already read outlives a recovery that lands meanwhile.
+	onDoomed atomic.Pointer[func(bg bool)]
 
 	mu sync.Mutex
 	// block, when set, parks a customer-shaped resolve of the changed composition
@@ -559,6 +564,9 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 		}
 	}
 	if bg && !h.allowBackground.Load() {
+		if fn := h.onDoomed.Load(); fn != nil && changed {
+			(*fn)(true)
+		}
 		switch h.mode {
 		case k547DenyBackground:
 			return nil, apierrors.NewForbidden(schema.GroupResource{Group: k547CompGVR.Group, Resource: k547CompGVR.Resource},
@@ -570,6 +578,9 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 		}
 	} else if changed {
 		if h.failCustomer.Load() {
+			if fn := h.onDoomed.Load(); fn != nil {
+				(*fn)(false)
+			}
 			return nil, apierrors.NewForbidden(schema.GroupResource{Group: k547CompGVR.Group, Resource: k547CompGVR.Resource},
 				name, errors.New("cohort genuinely denied (injected, F5)"))
 		}
