@@ -852,9 +852,7 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 		h.mu.RLock()
 		s.offerRefresh(k)
 		h.mu.RUnlock()
-		if clearStaleOwed(k) {
-			staleOwedArmEmits.Add(1)
-		}
+		noteStaleOwedArmEmit(k)
 	}
 
 	var once sync.Once

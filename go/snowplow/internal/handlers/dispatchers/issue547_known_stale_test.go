@@ -188,6 +188,10 @@ type k547Harness struct {
 	// changed composition touch an external endpoint, so their Put is declined
 	// (N < 0: every one). Background resolves are untouched.
 	customerExternal atomic.Int32
+	// stageErrOnRerun (#710 D2-15e variant): a withdrawn stale serve's RE-RUN
+	// (cache.StaleServeDisabled) gets a per-item stage error, so its Put is
+	// declined.
+	stageErrOnRerun atomic.Bool
 	// gateSeen (#710 D2-19b/c): the gate class every resolve of the changed
 	// composition would get — recorded at the shared seam.
 	gateMu   sync.Mutex
@@ -591,6 +595,11 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 	}
 	if changed && !bg {
 		h.maybeCustomerExternal(ctx)
+		if h.stageErrOnRerun.Load() && cache.StaleServeDisabled(ctx) {
+			if es := cache.StageErrorSinkFromContext(ctx); es != nil {
+				es.Bump("getComposition", "injected on the D2 re-run (#710 D2-15e)")
+			}
+		}
 	}
 	if changed {
 		_, demandRev := cache.DemandRevalidationFromContext(ctx)

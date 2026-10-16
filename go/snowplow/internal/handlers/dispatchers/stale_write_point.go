@@ -20,6 +20,7 @@ package dispatchers
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
@@ -62,13 +63,25 @@ func isStaleRerun(req *http.Request) bool {
 // needs the key's owed-push mark.
 func staleHitWritePoint(key string, entry *cache.ResolvedEntry) {
 	if entry != nil && entry.StaleDerived {
-		cache.MarkStaleOwed(key)
+		cache.MarkStaleOwed(key, time.Now())
 	}
 }
 
 // staleRerunHookForTest observes the ResponseWriter at the moment of the
 // re-run (D2-15d: nothing may have been written to it yet). Nil in production.
 var staleRerunHookForTest func(wri http.ResponseWriter)
+
+// stalePutHookForTest observes every customer-dispatcher L1 Put attempt
+// (#710 F1): its site and whether the body is stale-derived. The invariant
+// the D2 arms sweep: a stale-derived body is only ever offered to the
+// armable PutIfGen ("putifgen"). Nil in production.
+var stalePutHookForTest func(key, site string, staleDerived bool)
+
+func noteCustomerPut(key, site string, staleDerived bool) {
+	if f := stalePutHookForTest; f != nil {
+		f(key, site, staleDerived)
+	}
+}
 
 // staleWriteHookForTest observes every customer body write that could be
 // stale-derived (D2-17's invariant sweep). Nil in production.

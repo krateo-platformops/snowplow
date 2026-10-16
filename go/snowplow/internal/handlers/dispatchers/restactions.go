@@ -659,6 +659,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// #189 — generation-guarded write. Refuse (do not resurrect a pre-
 			// delete body) if a DELETE-eviction bumped the key's generation during
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
+			noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
 			putStored := cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
 				RawJSON:      encoded,
 				Inputs:       cacheInputs,
