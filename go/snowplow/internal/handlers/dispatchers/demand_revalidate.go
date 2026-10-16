@@ -63,7 +63,10 @@ func revalidateKnownStale(h http.Handler, req *http.Request, key string) {
 	if !ok || !cache.ClaimDemandRevalidation(key, t0) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), cache.DemandRevalidationDeadline())
+	// #710 PR-2b — a customer started it and is looking at the stale body: its
+	// content and nested fills bypass like a debt's (top priority, never queued
+	// behind background work), ahead of any origin rule.
+	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(context.WithoutCancel(req.Context())), cache.DemandRevalidationDeadline())
 	ctx, settle := cache.BeginDemandRevalidation(ctx, key, t0)
 	r2 := req.Clone(ctx)
 	go func() {

@@ -99,6 +99,11 @@ func ResetCacheProcessStateForTest() error {
 	// exists precisely so those assertions are deterministic — #471.
 	ResetLazyItemsStatsForTest()
 
+	// 5b2 — #710 PR-2b owed-push marks: process-global (keyed by L1 keys a
+	// stale-derived body was written under), so a fresh store must not inherit
+	// a sibling's marks or counters. Composed — #471.
+	ResetStaleOwedForTest()
+
 	// 5c — #560 live-refresh arming counters. Process-global (the stamp site is
 	// in dispatchers and the arrival site in handlers, so neither owns them), so
 	// a test asserting on the quartet would otherwise read a sibling's

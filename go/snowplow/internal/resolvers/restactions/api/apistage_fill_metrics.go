@@ -153,7 +153,7 @@ var (
 	// contentFillDurHist is one fill's duration; contentFillAdmWaitHist (#710
 	// PR-2a) one flight's wait for memory admission, by the class it admitted at.
 	contentFillDurHist     = newMSHistogram()
-	contentFillAdmWaitHist = [fillAdmissionClasses]*msHistogram{newMSHistogram(), newMSHistogram()}
+	contentFillAdmWaitHist = [fillAdmissionClasses]*msHistogram{newMSHistogram(), newMSHistogram(), newMSHistogram()}
 	// contentFillAdmWaitRecorder is the admission-wait OTLP hook (class-labelled).
 	contentFillAdmWaitRecorder atomic.Pointer[func(ms int64, class string)]
 
@@ -217,8 +217,10 @@ type ContentFillDurationStats struct {
 }
 
 // msHistogram is a fixed-bound millisecond histogram over
-// ContentFillDurationBoundsMS with an optional OTLP hook. Lock-free.
+// ContentFillDurationBoundsMS (or its own bounds) with an optional OTLP hook.
+// Lock-free.
 type msHistogram struct {
+	bounds []int64
 	// buckets[i] counts samples with bounds[i-1] < ms ≤ bounds[i]; the last
 	// slot is +Inf.
 	buckets  []atomic.Uint64
@@ -228,14 +230,16 @@ type msHistogram struct {
 	recorder atomic.Pointer[func(ms int64)]
 }
 
-func newMSHistogram() *msHistogram {
-	return &msHistogram{buckets: make([]atomic.Uint64, len(ContentFillDurationBoundsMS)+1)}
+func newMSHistogram() *msHistogram { return newMSHistogramBounds(ContentFillDurationBoundsMS) }
+
+func newMSHistogramBounds(bounds []int64) *msHistogram {
+	return &msHistogram{bounds: bounds, buckets: make([]atomic.Uint64, len(bounds)+1)}
 }
 
 func (h *msHistogram) record(ms int64) {
 	ms = max(ms, 0)
 	i := 0
-	for i < len(ContentFillDurationBoundsMS) && ms > ContentFillDurationBoundsMS[i] {
+	for i < len(h.bounds) && ms > h.bounds[i] {
 		i++
 	}
 	h.buckets[i].Add(1)
@@ -275,7 +279,7 @@ func (h *msHistogram) snapshot() ContentFillDurationStats {
 func (h *msHistogram) expvarValue() map[string]any {
 	d := h.snapshot()
 	buckets := make(map[string]uint64, len(d.Buckets))
-	for i, b := range ContentFillDurationBoundsMS {
+	for i, b := range h.bounds {
 		buckets["le_"+strconv.FormatInt(b, 10)] = d.Buckets[i]
 	}
 	buckets["le_inf"] = d.Buckets[len(d.Buckets)-1]

@@ -126,6 +126,68 @@ func TestIssue710_ContentFillSeriesReachOTLP(t *testing.T) {
 	}
 }
 
+// TestIssue710_StaleServeSeriesReachOTLP — #710 PR-2b: the D2 family reaches
+// OTLP from the real registration with live values, and stale_to_push_ms has
+// bucket bounds at exactly 1000, 3000 and 10000 ms (the owner bar is p95 ≤ 3 s,
+// max ≤ 10 s, target 1 s: decidable from the histogram).
+func TestIssue710_StaleServeSeriesReachOTLP(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	restactionsapi.ResetStaleServeForTest()
+	t.Cleanup(restactionsapi.ResetStaleServeForTest)
+	t.Cleanup(func() { restactionsapi.SetStaleToPushRecorder(nil) })
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	if err := registerInstruments(mp.Meter(meterName), "deadbeef"); err != nil {
+		t.Fatalf("registerInstruments: %v", err)
+	}
+	restactionsapi.AddStaleServeForTest(4, 1, 2500)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	all := flatten(rm)
+	pts := pointsFor(all, "snowplow_apistage_stale_serve_total")
+	if len(pts) != 1 || pts[0].value != 4 || pts[0].attrs["reason"] != "known_stale" || len(pts[0].attrs) != 1 {
+		t.Fatalf("stale_serve_total = %+v, want one {reason=known_stale} point of 4", pts)
+	}
+	if pts := pointsFor(all, "snowplow_apistage_stale_overdue_total"); len(pts) != 1 || pts[0].value != 1 {
+		t.Fatalf("stale_overdue_total = %+v, want 1", pts)
+	}
+	for _, name := range []string{"snowplow_apistage_stale_debt_open", "snowplow_apistage_stale_debt_oldest_age_ms", "snowplow_apistage_stale_debt_retries_total",
+		"snowplow_apistage_stale_push_total", "snowplow_apistage_stale_push_unarmed_total", "snowplow_apistage_stale_dependent_unresolved_total",
+		"snowplow_apistage_stale_owed_open", "snowplow_apistage_stale_owed_dropped_total", "snowplow_apistage_stale_owed_arm_emits_total"} {
+		if pts := pointsFor(all, name); len(pts) != 1 {
+			t.Fatalf("%s: %d points, want 1", name, len(pts))
+		}
+	}
+	if pts := pointsFor(all, "snowplow_apistage_stale_serve_withdrawn_total"); len(pts) != 1 || pts[0].attrs["reason"] != "unarmable" || len(pts[0].attrs) != 1 {
+		t.Fatalf("stale_serve_withdrawn_total = %+v, want one {reason=unarmable} point", pts)
+	}
+	var hist *metricdata.HistogramDataPoint[int64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if h, ok := m.Data.(metricdata.Histogram[int64]); ok && m.Name == "snowplow_apistage_stale_to_push_ms" && len(h.DataPoints) == 1 {
+				hist = &h.DataPoints[0]
+			}
+		}
+	}
+	if hist == nil || hist.Count != 1 || hist.Sum != 2500 {
+		t.Fatalf("stale_to_push_ms histogram = %+v, want one sample of 2500", hist)
+	}
+	have := map[float64]bool{}
+	for _, b := range hist.Bounds {
+		have[b] = true
+	}
+	for _, b := range []float64{1000, 3000, 10000} {
+		if !have[b] {
+			t.Fatalf("stale_to_push_ms bounds %v lack %v — the owner bar would not be decidable from the histogram", hist.Bounds, b)
+		}
+	}
+}
+
 // TestIssue710_ContentFillAdmissionSeriesReachOTLP — #710 PR-2a: the admission
 // gate's series reach OTLP from the real registration with live values; the
 // only attribute is the closed `class`.

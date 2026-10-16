@@ -575,6 +575,11 @@ func apistageContentServeAttempt(
 	// single last-write GVR.
 	_, refresherDriven := cache.RefreshTriggerGVRFromContext(ctx)
 	forceContentMiss := refresherDriven && cache.RefreshTriggerHas(ctx, gvr)
+	// #710 PR-2b — a debt's refill always re-dispatches (it exists because the
+	// cell is known-stale).
+	if contentDebtRefillFromContext(ctx) {
+		forceContentMiss = true
+	}
 	// #376 — the content cell is stamped ONLY by a true customer serve. On
 	// forceContentMiss the entry is discarded + re-dispatched fresh anyway → skip the
 	// read entirely (no stamp, no wasted Get). Any OTHER refresher re-resolve read (a
@@ -615,6 +620,17 @@ func apistageContentServeAttempt(
 	// #710 — which case sent this reader into the fill (apistage_fill_metrics.go).
 	fillReason := contentFillAbsent
 	readContent := func(k string) (*cache.ResolvedEntry, bool) {
+		// #710 PR-2b (D2, owner ruling "show then replace") — an ARMABLE customer
+		// read of a KNOWN-STALE cell is served the cell at once and opens (or
+		// joins) its debt: an immediate refill at top priority, then a push to
+		// this customer's cell (apistage_stale_debt.go). Decided, read and
+		// registered in one critical section. Any other reader falls through to
+		// #547's read-through below.
+		if sink, ok := staleServeEligible(ctx); ok && !forceContentMiss {
+			if e, served := serveStaleWithDebt(ctx, sink, store, k, call, gvr.String(), cache.DepKey{GVR: gvr, Namespace: ns, Name: name}); served {
+				return e, true
+			}
+		}
 		switch {
 		case forceContentMiss:
 			fillReason = contentFillRefreshForced
@@ -753,6 +769,7 @@ func apistageContentServeAttempt(
 			}
 			entryRef = res.entry
 		}
+		noteFillOutcome(ctx, res.stored, flight.startSeq)
 	} else {
 		// MISS, LEADER — dispatch UN-GATED so the stored envelope is identity-free.
 		// #710 PR-1 — every exit publishes the flight's outcome to its joiners (a
@@ -904,6 +921,7 @@ func apistageContentServeAttempt(
 		admitted = false
 		// #710 PR-1 — hand the result to the joiners now: the envelope and the
 		// parsed items are immutable from here on.
+		noteFillOutcome(ctx, entryRef != nil, flight.startSeq)
 		flight.complete(contentFlightResult{
 			ok:         true,
 			envelope:   envelope,
@@ -914,8 +932,9 @@ func apistageContentServeAttempt(
 		})
 	}
 
-	// Step 3 — the per-user RBAC gate (skipped on the F2 prewarm path).
-	if cache.ApistagePrewarmFromContext(ctx) {
+	// Step 3 — the per-user RBAC gate (skipped on the F2 prewarm path, and on a
+	// #710 PR-2b debt refill: neither has a requester).
+	if cache.ApistagePrewarmFromContext(ctx) || contentDebtRefillFromContext(ctx) {
 		// Prewarm: no requester — populate the content entry only, do not
 		// gate or feed dict[id]. served=false tells the caller not to use
 		// the bytes (the prewarm resolve discards dict).
