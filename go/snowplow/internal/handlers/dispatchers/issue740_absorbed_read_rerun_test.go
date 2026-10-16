@@ -22,6 +22,9 @@
 //	    then it stops.
 //	K4  the demand slot (identity-bound cell, ClaimDemandRevalidation): K1's
 //	    shape under the requester → heals; rerun{demand} +1.
+//	K6  a HEALED attempt earns no rerun, at both slots: one serve absorbed into
+//	    an attempt that succeeds → rerun unchanged, the slot released, no second
+//	    attempt (architect-ch's gate: the still-known-stale check had no arm).
 //
 // K5 (the rerun bypasses the admission cap) lands with PR-2b's customer-
 // triggered marker, which is not on main yet (ruling: "whichever lands second").
@@ -82,6 +85,20 @@ type k740Park struct {
 }
 
 func k740ParkDoomed(h *k547Harness, wantBG bool, parks int) *k740Park {
+	p, fn := k740NewPark(wantBG, parks)
+	h.onDoomed.Store(&fn)
+	return p
+}
+
+// k740ParkHealing parks the n-th HEALING attempt (one that read no injected
+// failure and will succeed) of the given kind (K6).
+func k740ParkHealing(h *k547Harness, wantBG bool, parks int) *k740Park {
+	p, fn := k740NewPark(wantBG, parks)
+	h.onHealing.Store(&fn)
+	return p
+}
+
+func k740NewPark(wantBG bool, parks int) (*k740Park, func(bg bool)) {
 	p := &k740Park{}
 	for i := 0; i < parks; i++ {
 		p.entered = append(p.entered, make(chan struct{}))
@@ -96,8 +113,7 @@ func k740ParkDoomed(h *k547Harness, wantBG bool, parks int) *k740Park {
 			<-p.release[i]
 		}
 	}
-	h.onDoomed.Store(&fn)
-	return p
+	return p, fn
 }
 
 func (p *k740Park) await(t *testing.T, i int) {
@@ -228,4 +244,62 @@ func TestIssue740_K4_TheDemandSlotRerunsAnAbsorbedRead(t *testing.T) {
 	if !k547WaitFor(t, 10*time.Second, "demand slot released", func() bool { return cache.DemandRevalidationsInFlight() == 0 }) {
 		t.Fatalf("K4: the demand slot was never released")
 	}
+}
+
+func TestIssue740_K6_AHealedAttemptEarnsNoRerunAtEitherSlot(t *testing.T) {
+	t.Run("background", func(t *testing.T) {
+		h := newK547Harness(t, k547DenyBackground)
+		contentKey, handle := k740Shell(t, h)
+		h.allowBackground.Store(true) // the attempt below will succeed
+		park := k740ParkHealing(h, true, 1)
+		rr0 := k740Rerun("background")
+		bg0 := h.bgCalls.Load()
+
+		cache.RevalidateKnownStaleInBackground(contentKey)
+		park.await(t, 0)      // the healing attempt is in flight
+		h.get(1, k547Changed) // absorbed into it: arms rerun
+		close(park.release[0])
+
+		k740WaitSlotReleased(t, "K6/background")
+		if e, ok := handle.GetNoTouch(contentKey); !ok || k547Reason(e.RawJSON) != "v1" {
+			t.Fatalf("K6/background: the healing attempt did not heal the shell")
+		}
+		if got := k740Rerun("background") - rr0; got != 0 {
+			t.Fatalf("K6/background RED: known_stale_revalidation_rerun{background} moved %d, want 0 — an attempt "+
+				"that HEALED the cell earned a rerun for its absorbed read (the still-known-stale check is gone)", got)
+		}
+		if got := h.bgCalls.Load() - bg0; got != 1 {
+			t.Fatalf("K6/background RED: %d background attempts, want exactly 1 — a second dequeue ran for a cell "+
+				"the first attempt had already healed", got)
+		}
+	})
+	t.Run("demand", func(t *testing.T) {
+		h := newK547Harness(t, k547DenyBackground)
+		h.warm()
+		h.driveChangedToKnownStale("v1")
+		key := h.key(0, k547Changed)
+		park := k740ParkHealing(h, false, 1)
+		rr0 := k740Rerun("demand")
+		c0 := h.custCalls.Load()
+
+		h.get(0, k547Changed) // a known-stale hit: starts the demand attempt, which will succeed
+		park.await(t, 0)
+		h.get(0, k547Changed) // absorbed into it: arms rerun
+		close(park.release[0])
+
+		if !k547WaitFor(t, 10*time.Second, "demand slot released", func() bool { return cache.DemandRevalidationsInFlight() == 0 }) {
+			t.Fatalf("K6/demand: the demand slot was never released")
+		}
+		if r, _ := h.residentReason(key); r != "v1" {
+			t.Fatalf("K6/demand: the healing attempt did not heal the cell (reason %q)", r)
+		}
+		if got := k740Rerun("demand") - rr0; got != 0 {
+			t.Fatalf("K6/demand RED: known_stale_revalidation_rerun{demand} moved %d, want 0 — an attempt that "+
+				"HEALED the cell earned a rerun for its absorbed read", got)
+		}
+		if got := h.custCalls.Load() - c0; got != 1 {
+			t.Fatalf("K6/demand RED: %d customer-shaped resolves, want exactly 1 — a second attempt ran for a cell "+
+				"the first attempt had already healed", got)
+		}
+	})
 }
