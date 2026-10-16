@@ -152,8 +152,9 @@ var (
 	phase1ExitRecSets atomic.Int64
 
 	// phase1ExitByOutcome is the #736 per-outcome release record, indexed like
-	// Phase1ReadinessExitOutcomes: 1 at the outcome that released readiness.
-	phase1ExitByOutcome [7]atomic.Int64
+	// Phase1ReadinessExitOutcomes (sized from it: one source of truth): 1 at the
+	// outcome that released readiness.
+	phase1ExitByOutcome = make([]atomic.Int64, len(Phase1ReadinessExitOutcomes))
 )
 
 func init() { registerPhase1ReadinessExitMetrics() }

@@ -163,3 +163,43 @@ func TestIssue736_TheOutcomeSetIsExactlyThePhase1ExitConstants(t *testing.T) {
 		t.Fatalf("#736: Phase1ReadinessExitOutcomes = %v, the phase1Exit* constants are %v — every outcome needs its series", got, consts)
 	}
 }
+
+// 0/1 PER PROCESS (architect, #748 gate): the record is set inside the exit's
+// sync.Once, so later exit attempts — a latch firing and a seed exit, then a
+// no-seed flip — change nothing: exactly ONE outcome reads 1 (the first,
+// deadline), and the series sum to 1. Adapted from architect-ch's scratch
+// TestGate736_SecondExitAttemptChangesNothing.
+// Mutation → RED: classify + note BEFORE phase1ExitOnce.Do (the record moved
+// outside the once) — the series then read deadline=1 latch=1
+// none-configured=1.
+func TestIssue736_LaterExitAttemptsChangeNothingOneOutcomePerProcess(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	resetExitWorld(t)
+	_ = captureExitLogs(t)
+
+	recordPhase1SeedExit(context.DeadlineExceeded, context.DeadlineExceeded, context.DeadlineExceeded, false, time.Second, noPhase1StepTimings())
+	ensureFirstNavLatch().fire("segment-complete", 1, 1, "", -1, 0)
+	recordPhase1SeedExit(nil, nil, nil, false, time.Second, noPhase1StepTimings())
+	RecordPhase1ReadinessExitNoSeed()
+
+	by := Phase1ReadinessExitByOutcome()
+	var sum int64
+	for _, v := range by {
+		sum += v
+	}
+	if sum != 1 || by[phase1ExitDeadline] != 1 {
+		t.Fatalf("#736 RED: after three exit attempts the series read %v (sum %d) — want exactly deadline=1: "+
+			"the record is 0/1 per process, set once at the FIRST exit", by, sum)
+	}
+	if got := Phase1ReadinessExitOutcome(); got != phase1ExitDeadline {
+		t.Fatalf("the recorded outcome moved to %q after the first exit", got)
+	}
+}
+
+// The record and the closed set have the same length (one source of truth).
+func TestIssue736_TheRecordIsSizedByTheOutcomeSet(t *testing.T) {
+	if len(phase1ExitByOutcome) != len(Phase1ReadinessExitOutcomes) {
+		t.Fatalf("phase1ExitByOutcome has %d slots for %d outcomes", len(phase1ExitByOutcome), len(Phase1ReadinessExitOutcomes))
+	}
+}
