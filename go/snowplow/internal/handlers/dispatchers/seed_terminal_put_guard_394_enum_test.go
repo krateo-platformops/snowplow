@@ -242,6 +242,9 @@ func (h *s394RecordingHandle) CaptureGen(string) uint64         { return h.gen }
 func (h *s394RecordingHandle) PutThenRemark(context.Context, string, *cache.ResolvedEntry) {
 	h.putThenRemarks++
 }
+func (h *s394RecordingHandle) PutEndingKnownStale(_ context.Context, k string, e *cache.ResolvedEntry) {
+	h.Put(k, e)
+}
 func (h *s394RecordingHandle) PutIfGen(_ context.Context, _ string, _ *cache.ResolvedEntry, g uint64) bool {
 	h.putIfGens++
 	h.lastCapturedGenInPut = g

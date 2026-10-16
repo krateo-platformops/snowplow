@@ -114,6 +114,11 @@ func (h *getRecordingHandle) PutIfGen(ctx context.Context, key string, entry *ca
 func (h *getRecordingHandle) PutThenRemark(ctx context.Context, key string, entry *cache.ResolvedEntry) {
 }
 
+// #734 — the external-TTL plain Put; inert like Put.
+func (h *getRecordingHandle) PutEndingKnownStale(ctx context.Context, key string, entry *cache.ResolvedEntry) {
+	h.Put(key, entry)
+}
+
 // getCount is method-AGNOSTIC: the number of liveness reads (Get + #376 GetNoTouch),
 // so "a liveness read occurred / did not occur" assertions survive the #376 switch
 // of the seed-skip read from Get to GetNoTouch.

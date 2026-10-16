@@ -98,7 +98,7 @@ type dirtyStamp struct {
 	// seq (#547) is the dep-event sequence at the LATEST mark of this window. An
 	// accepted Put whose resolve began at or after it (its #375 sink startSeq)
 	// read the post-mark state, so it closes a known-stale window whatever
-	// carrier wrote it (closeKnownStaleOnPut).
+	// carrier wrote it (endKnownStaleOnPut).
 	seq uint64
 }
 

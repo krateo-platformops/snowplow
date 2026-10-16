@@ -262,6 +262,15 @@ func DemandRevalidationsInFlight() int {
 	return n
 }
 
+// BackgroundRevalidationsInFlight is the number of background revalidations
+// currently queued or running (each holds its key's slot until the refresher's
+// dequeue of that key settles). Bounded by the known-stale key set.
+func BackgroundRevalidationsInFlight() int {
+	n := 0
+	bgRevalidationInflight.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
 // DemandRevalidationFromContext reports whether ctx is a demand revalidation
 // (the re-entered customer cold path), and of which key.
 func DemandRevalidationFromContext(ctx context.Context) (string, bool) {
@@ -293,7 +302,7 @@ func DemandRevalidationDeadline() time.Duration {
 // customer Put reports into (PutIfGen → NoteRefreshWrite). settle MUST be called
 // once the revalidation returns: it releases the slot and counts the outcome.
 // The window itself is closed by the write, through the same rule as any other
-// accepted Put (closeKnownStaleOnPut). It reports whether the write was accepted
+// accepted Put (endKnownStaleOnPut). It reports whether the write was accepted
 // un-remarked.
 func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (context.Context, func() bool) {
 	ctx, o := withRefreshOutcome(ctx, key)
@@ -314,48 +323,62 @@ func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (con
 	}
 }
 
-// CloseKnownStaleAfterPut is closeKnownStaleOnPut for a Put carrier that is a
-// PLAIN, ctx-less store write by design but runs inside a resolve whose ctx
-// carries the #375 dep-gen sink: the external-TTL widget Put (widgets.go). That
-// cell records no dep edge of its own, but an external widget whose RESTAction
-// also reads Kubernetes gets the inner-call edge on its L1 key, so it IS
-// dirty-marked and can go KNOWN-STALE; without this its re-Put never closes the
-// stamp and every read starts another external refetch until the TTL
-// (reviewer-625, #547). Call it right after the accepted Put.
-func CloseKnownStaleAfterPut(ctx context.Context, key string) { closeKnownStaleOnPut(ctx, key) }
-
-// closeKnownStaleOnPut ends key's KNOWN-STALE window on an ACCEPTED Put whose
+// endKnownStaleOnPut ends key's KNOWN-STALE state on an ACCEPTED Put whose
 // resolve began at or after the window's latest mark (#547): that body was read
 // from the post-mark state, so the cell is fresh, whichever carrier wrote it — a
 // demand revalidation, a substrate read-through refill (apistage content MISS,
-// the RAFullList live resolve), a seed or keep-warm re-Put. ctx must carry the
-// resolve's #375 dep-gen sink (its startSeq is the resolve-entry epoch); a Put
-// with no sink proves nothing and closes nothing. An IN-FLIGHT stamp is left to
-// its refresher dequeue, which settles it. Called before the Put's #375 remark:
-// a dep that moved during the resolve then re-opens a fresh window through the
-// ordinary mark. Records the dirty→fresh sample, like a refresher re-Put.
-func closeKnownStaleOnPut(ctx context.Context, key string) {
+// the RAFullList live resolve), a seed or keep-warm re-Put, the refresher's own
+// terminal re-Put. ctx must carry the resolve's #375 dep-gen sink (its startSeq
+// is the resolve-entry epoch); a Put with no sink proves nothing and ends
+// nothing. The store's Put methods call it INSIDE the critical section that
+// publishes the body (#734), so a reader that sees the new body also sees the
+// state ended: before #734 an in-flight stamp kept its flag until the refresher
+// dequeue settled, and a reader in that gap counted a known-stale serve of the
+// fresh body, started a demand revalidation of it, or read a fresh substrate
+// cell through as a MISS. Only sync.Map operations: safe under c.mu.
+//
+// A stamp at rest is closed: the window ends, and sample reports the t0 whose
+// dirty→fresh sample the caller records once c.mu is released. An IN-FLIGHT
+// stamp keeps its window: only the known-stale flag ends, and the refresher
+// dequeue still classifies and samples the window by its own outcome. Called
+// before the Put's #375 remark: a dep that moved during the resolve then
+// re-opens a fresh window through the ordinary mark.
+func endKnownStaleOnPut(ctx context.Context, key string) (t0 time.Time, sample bool) {
 	r := refresherPeek()
 	if r == nil || key == "" {
-		return
+		return time.Time{}, false
 	}
 	start, ok := DepGenStartSeqFromContext(ctx)
 	if !ok {
-		return
+		return time.Time{}, false
 	}
 	for {
 		cur, ok := r.dirty.Load(key)
 		if !ok {
-			return
+			return time.Time{}, false
 		}
 		s := cur.(*dirtyStamp)
-		if s.stale == knownStaleNone || s.inflight || start < s.seq {
-			return
+		if s.stale == knownStaleNone || start < s.seq {
+			return time.Time{}, false
+		}
+		if s.inflight {
+			if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, seq: s.seq}) {
+				return time.Time{}, false
+			}
+			continue
 		}
 		if r.dirty.CompareAndDelete(key, cur) {
-			r.sampleFresh(s.t0)
-			return
+			return s.t0, true
 		}
+	}
+}
+
+// sampleFreshAfterPut records the dirty→fresh sample of a window an accepted Put
+// closed (endKnownStaleOnPut). Called after c.mu is released: the sample feeds
+// the OTLP histogram hook.
+func sampleFreshAfterPut(t0 time.Time) {
+	if r := refresherPeek(); r != nil {
+		r.sampleFresh(t0)
 	}
 }
 

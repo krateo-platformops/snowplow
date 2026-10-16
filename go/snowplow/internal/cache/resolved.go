@@ -1558,6 +1558,20 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	c.putPlain(context.Background(), false, key, entry)
 }
 
+// PutEndingKnownStale is Put for the carrier that is a PLAIN store write by
+// design but runs inside a resolve whose ctx carries the #375 dep-gen sink: the
+// external-TTL widget Put (widgets.go). That cell records no dep edge of its own,
+// but an external widget whose RESTAction also reads Kubernetes gets the
+// inner-call edge on its L1 key, so it IS dirty-marked and can go KNOWN-STALE;
+// without this its re-Put never ends the state and every read starts another
+// external refetch until the TTL (reviewer-625, #547). The write is exactly Put's
+// (generation preserved, unknown provenance for the #406 layer index); ctx only
+// ends the known-stale state, inside the same critical section as the write
+// (#734).
+func (c *ResolvedCacheStore) PutEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) {
+	c.putPlain(ctx, false, key, entry)
+}
+
 func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool, key string, entry *ResolvedEntry) {
 	if c == nil || entry == nil {
 		return
@@ -1584,7 +1598,11 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key), false)
 	layerRemarks := c.raLayerCommitLocked(ctx, provenanceKnown, key, samePrior, entry)
+	ksT0, ksSample := endKnownStaleOnPut(ctx, key) // #547/#734 — see PutIfGen (no sink on a plain Put: a no-op)
 	c.mu.Unlock()
+	if ksSample {
+		sampleFreshAfterPut(ksT0)
+	}
 	remarkLayerConsumers(layerRemarks)
 }
 
@@ -1615,8 +1633,7 @@ func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entr
 	if Inert(ctx) {
 		return
 	}
-	c.putPlain(ctx, true, key, entry)
-	closeKnownStaleOnPut(ctx, key) // #547 — see PutIfGen (a boot / seed re-Put of a fresh body)
+	c.putPlain(ctx, true, key, entry) // #547 — ends a known-stale state in-lock (a boot / seed re-Put of a fresh body)
 	Deps().remarkIfDepsMovedFrom(ctx, key, true)
 }
 
@@ -1654,14 +1671,19 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
+	// #547 — end a KNOWN-STALE state this post-mark resolve has made fresh. #734 —
+	// in the critical section that publishes the body, so no reader sees the fresh
+	// body still flagged known-stale (endKnownStaleOnPut).
+	ksT0, ksSample := endKnownStaleOnPut(ctx, key)
 	c.mu.Unlock()
+	if ksSample {
+		sampleFreshAfterPut(ksT0)
+	}
 	// #547 — a demand revalidation re-runs the customer cold path, whose terminal
 	// write is THIS Put: report it to the revalidation's outcome sink (a no-op on
 	// any ctx without one, and for any key but the revalidated one). BEFORE the
-	// remark below, so a remark reads as remarked, not as fresh. And close a
-	// KNOWN-STALE window this post-mark resolve has made fresh.
+	// remark below, so a remark reads as remarked, not as fresh.
 	NoteRefreshWrite(ctx, key, true)
-	closeKnownStaleOnPut(ctx, key)
 	// #375 (option c) — ACCEPTED gen-guarded Put: after RELEASING c.mu (EnqueueRefresh
 	// must never run under the store lock), PUT-THEN-REMARK — remark this key once if any
 	// dep the resolve recorded moved since resolve entry (lastBumpSeq>startSeq), or if the
@@ -1706,8 +1728,11 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
+	ksT0, ksSample := endKnownStaleOnPut(ctx, key) // #547/#734 — see PutIfGen
 	c.mu.Unlock()
-	closeKnownStaleOnPut(ctx, key) // #547 — see PutIfGen
+	if ksSample {
+		sampleFreshAfterPut(ksT0)
+	}
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
@@ -1794,7 +1819,14 @@ func (c *ResolvedCacheStore) ReplaceIfGenRefresh(ctx context.Context, key string
 		c.noteRemintLocked(entry)
 	}
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
+	// #734 — the refresher's own terminal re-Put ends a known-stale state too (its
+	// dequeue stamp is in flight: the flag ends here, the window is still settled
+	// and sampled by the dequeue). See PutIfGen.
+	ksT0, ksSample := endKnownStaleOnPut(ctx, key)
 	c.mu.Unlock()
+	if ksSample {
+		sampleFreshAfterPut(ksT0)
+	}
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
