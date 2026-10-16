@@ -165,6 +165,10 @@ type k547Harness struct {
 	// failCustomer) and BEFORE it returns it: an arm parks the attempt there, so
 	// the failure it already read outlives a recovery that lands meanwhile.
 	onDoomed atomic.Pointer[func(bg bool)]
+	// onHealing (#740 K6), when set, runs inside a resolve of the changed
+	// composition that has read NO injected failure (it will succeed), before
+	// it reads the composition: an arm parks a healing attempt there.
+	onHealing atomic.Pointer[func(bg bool)]
 
 	mu sync.Mutex
 	// block, when set, parks a customer-shaped resolve of the changed composition
@@ -527,6 +531,9 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 			}
 			return nil, apierrors.NewForbidden(schema.GroupResource{Group: k547CompGVR.Group, Resource: k547CompGVR.Resource},
 				name, errors.New("cohort genuinely denied (injected, F5)"))
+		}
+		if fn := h.onHealing.Load(); fn != nil {
+			(*fn)(bg)
 		}
 		h.mu.Lock()
 		b := h.block
