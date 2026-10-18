@@ -303,3 +303,43 @@ func TestIssue740_K6_AHealedAttemptEarnsNoRerunAtEitherSlot(t *testing.T) {
 		}
 	})
 }
+
+// K7 (#740 x #744, architect-ch) — a demand RERUN is customer-triggered at BOTH
+// admission gates, exactly like the first attempt (D2-19b): a customer is
+// waiting on it. The first attempt is doomed and returns before the resolve
+// seam records its class, so every demand resolve recorded here is the rerun's.
+func TestIssue740_K7_ADemandRerunIsCustomerTriggeredAtBothGates(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	h.warm()
+	h.driveChangedToKnownStale("v1")
+	key := h.key(0, k547Changed)
+	h.failCustomer.Store(true)
+	park := k740ParkDoomed(h, false, 1)
+	rr0 := k740Rerun("demand")
+
+	h.get(0, k547Changed) // starts the doomed demand attempt
+	park.await(t, 0)
+	h.failCustomer.Store(false)
+	h.get(0, k547Changed) // absorbed: arms the rerun
+	close(park.release[0])
+
+	if !k547WaitFor(t, 10*time.Second, "cell healed by the rerun", func() bool { r, _ := h.residentReason(key); return r == "v1" }) {
+		t.Fatalf("PRECONDITION: the demand rerun never healed the cell")
+	}
+	if got := k740Rerun("demand") - rr0; got != 1 {
+		t.Fatalf("PRECONDITION: rerun{demand} moved %d, want 1", got)
+	}
+	var seen []k547GateSeen
+	for _, g := range h.gates() {
+		if g.demand {
+			seen = append(seen, g)
+		}
+	}
+	if len(seen) != 1 {
+		t.Fatalf("PRECONDITION: %d demand resolves recorded, want exactly the rerun's (%+v)", len(seen), seen)
+	}
+	if g := seen[0]; !g.triggered || g.fill != "debt" || g.nestedBg {
+		t.Fatalf("K7 RED: the demand RERUN resolved at %+v — a customer is waiting on it: like the first attempt it "+
+			"must be customer-triggered, fill at the bypass (debt) class and be a customer tree at the nested gate", g)
+	}
+}
