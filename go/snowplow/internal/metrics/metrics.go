@@ -1210,6 +1210,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerNestedResolveAdmissionInstruments(m); err != nil {
 		return err
 	}
+	if err := registerStaleServeInstruments(m); err != nil {
+		return err
+	}
 	if err := registerPrewarmPassInstruments(m); err != nil {
 		return err
 	}
@@ -1598,6 +1601,113 @@ func registerNestedResolveAdmissionInstruments(m metric.Meter) error {
 		o.ObserveInt64(peak, s.OverCeilingBytesPeak)
 		return nil
 	}, over, peak)
+	return err
+}
+
+// registerStaleServeInstruments hand-wires #710 PR-2b's D2 stale-serve family
+// onto OTLP (no expvar->OTLP bridge). The observables read
+// restactionsapi.StaleServeStatsSnapshot; the two histograms are synchronous,
+// fed through the api package's recorder hooks. The only attribute is the
+// closed reason {known_stale}. Registered only when the cache is on (CFG-1).
+func registerStaleServeInstruments(m metric.Meter) error {
+	serveTotal, err := m.Int64ObservableCounter("snowplow_apistage_stale_serve_total",
+		metric.WithDescription("Customer reads served a KNOWN-STALE identity-free content cell at once under an armable resolve (D2, owner ruling: show then replace), by reason {known_stale}. Each opens or joins the cell's debt: an immediate refill, then a push to the customer cell. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	toPush, err := m.Int64Histogram("snowplow_apistage_stale_to_push_ms",
+		metric.WithDescription("Stale serve → the /refreshes push of the dependent customer cell (ms). The owner bar: p95 ≤ 3000, max ≤ 10000, target 1000. #710 PR-2b."),
+		metric.WithUnit("ms"),
+		metric.WithExplicitBucketBoundaries(int64sToFloat64s(restactionsapi.StaleToPushBoundsMS)...))
+	if err != nil {
+		return err
+	}
+	restactionsapi.SetStaleToPushRecorder(func(ms int64) { toPush.Record(context.Background(), ms) })
+	serveAge, err := m.Int64Histogram("snowplow_apistage_stale_serve_age_ms",
+		metric.WithDescription("Age of the content body a stale serve delivered: since the content cell's known-stale window opened (ms). #710 PR-2b."),
+		metric.WithUnit("ms"),
+		metric.WithExplicitBucketBoundaries(int64sToFloat64s(restactionsapi.StaleToPushBoundsMS)...))
+	if err != nil {
+		return err
+	}
+	restactionsapi.SetStaleServeAgeRecorder(func(ms int64) { serveAge.Record(context.Background(), ms) })
+	debtOpen, err := m.Int64ObservableGauge("snowplow_apistage_stale_debt_open",
+		metric.WithDescription("Open stale-serve debts (content cells served stale whose refill has not committed). 0 when healthy; growing = the guarantee failing. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	oldest, err := m.Int64ObservableGauge("snowplow_apistage_stale_debt_oldest_age_ms",
+		metric.WithDescription("Age of the oldest open stale-serve debt (ms). #710 PR-2b."), metric.WithUnit("ms"))
+	if err != nil {
+		return err
+	}
+	retries, err := m.Int64ObservableCounter("snowplow_apistage_stale_debt_retries_total",
+		metric.WithDescription("Failed debt refill attempts retried (non-droppable, #690 backoff). #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	overdue, err := m.Int64ObservableCounter("snowplow_apistage_stale_overdue_total",
+		metric.WithDescription("Stale-serve debts that stayed open past the 10 s bar, counted once each. Alert on rate > 0. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	pushes, err := m.Int64ObservableCounter("snowplow_apistage_stale_push_total",
+		metric.WithDescription("/refreshes pushes delivered to stale-served customer cells after their debt cleared. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	unarmed, err := m.Int64ObservableCounter("snowplow_apistage_stale_push_unarmed_total",
+		metric.WithDescription("Replacement publishes of a stale-served customer cell that found no armed tab yet; the owed-push mark announces it when a tab arms. Informational, not a guarantee failure. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	unresolved, err := m.Int64ObservableCounter("snowplow_apistage_stale_dependent_unresolved_total",
+		metric.WithDescription("Debt-lane re-resolves of a stale-served customer cell that completed but whose Put was declined; the stale-derived cell is evicted so the pushed refetch is a fresh fill. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	replaceRetries, err := m.Int64ObservableCounter("snowplow_apistage_stale_replace_retries_total",
+		metric.WithDescription("Failed re-resolves of a stale-served customer cell, retried on backoff; the cell is kept (never evicted on failure). #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	withdrawn, err := m.Int64ObservableCounter("snowplow_apistage_stale_serve_withdrawn_total",
+		metric.WithDescription("Stale serves withdrawn at the write point because the response's Put was declined (no push could reach it): the stale body was never written and the resolve re-ran fresh. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	owedOpen, err := m.Int64ObservableGauge("snowplow_apistage_stale_owed_open",
+		metric.WithDescription("Keys a stale-derived body was written under whose fresh value has not yet reached an armed tab. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	owedDropped, err := m.Int64ObservableCounter("snowplow_apistage_stale_owed_dropped_total",
+		metric.WithDescription("Owed-push marks dropped by the L1-capacity bound before reaching a tab: a guarantee failure, expected 0 (a bench gate). #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	owedArm, err := m.Int64ObservableCounter("snowplow_apistage_stale_owed_arm_emits_total",
+		metric.WithDescription("Refresh events emitted at /refreshes arm time for a key whose replacement was published before the tab armed. #710 PR-2b."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		s := restactionsapi.StaleServeStatsSnapshot()
+		o.ObserveInt64(serveTotal, int64(s.ServeTotal), metric.WithAttributes(attribute.String("reason", "known_stale")))
+		o.ObserveInt64(debtOpen, s.DebtOpen)
+		o.ObserveInt64(oldest, s.DebtOldestAgeMS)
+		o.ObserveInt64(retries, int64(s.DebtRetries))
+		o.ObserveInt64(overdue, int64(s.OverdueTotal))
+		o.ObserveInt64(pushes, int64(s.PushTotal))
+		o.ObserveInt64(unarmed, int64(s.PushUnarmed))
+		o.ObserveInt64(unresolved, int64(s.DependentUnresolved))
+		o.ObserveInt64(withdrawn, int64(s.WithdrawnUnarmable), metric.WithAttributes(attribute.String("reason", "unarmable")))
+		o.ObserveInt64(owedOpen, int64(s.Owed.Open))
+		o.ObserveInt64(owedDropped, int64(s.Owed.Dropped))
+		o.ObserveInt64(owedArm, int64(s.Owed.ArmEmits))
+		o.ObserveInt64(replaceRetries, int64(s.ReplaceRetries))
+		return nil
+	}, serveTotal, debtOpen, oldest, retries, overdue, pushes, unarmed, unresolved, withdrawn, owedOpen, owedDropped, owedArm, replaceRetries)
 	return err
 }
 

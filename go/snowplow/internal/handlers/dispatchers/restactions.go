@@ -95,9 +95,17 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	//
 	// #547 — not for a demand revalidation: it re-enters this handler on a
 	// detached copy of a request that was already served (demand_revalidate.go).
-	demand := isDemandRevalidation(req)
+	//
+	// #710 PR-2b — nor for a withdrawn stale serve's re-run (stale_write_point.go):
+	// the same customer request re-entering, already marked and observed, which
+	// must resolve rather than read a cell (the first pass already counted its
+	// L1 lookup). Its per-call record carries l1_hit="stale_rerun".
+	demand := isDemandRevalidation(req) || isStaleRerun(req)
 	if demand {
 		pcs.l1Hit = "revalidate"
+		if isStaleRerun(req) {
+			pcs.l1Hit = "stale_rerun"
+		}
 	} else {
 		defer markCustomerInFlight()()
 		// #262 S2 — record the caller's identity class (in memory) so a class no
@@ -290,6 +298,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
+			staleHitWritePoint(cacheKey, entry) // #710 PR-2b
+			noteStaleWrite(cacheKey, entry.StaleDerived, true)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
 			// revalidate it on demand under this requester, detached.
@@ -352,9 +362,15 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// Empty cacheKey (L1 disabled, RBAC-skipped) is a no-op inside
 	// WithL1KeyContext — the resolver sees an empty key and skips
 	// recording.
+	var staleSink *cache.StaleServeSink
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContextFromEpoch(ctx, cacheKey, depEpoch, cache.DepKey{
 			GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
+		// #710 PR-2b — this response is armable when its cell is stored, so its
+		// resolve may be served a KNOWN-STALE content cell at once (D2, "show then
+		// replace"); the sink carries the fact to the Put below (StaleDerived) and
+		// the content layer's debt pushes this key once the fresh value lands.
+		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "restactions")
 	}
 	// #83 Option A — seed THIS top-level RESTAction as an ancestor of the
 	// nested-resolve descent BEFORE resolving. The #79 cycle-stop
@@ -643,10 +659,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// #189 — generation-guarded write. Refuse (do not resurrect a pre-
 			// delete body) if a DELETE-eviction bumped the key's generation during
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
+			noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
 			putStored := cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
-				RawJSON:     encoded,
-				Inputs:      cacheInputs,
-				TTLOverride: uafTTLOverrideForEntry(cacheInputs),
+				RawJSON:      encoded,
+				Inputs:       cacheInputs,
+				TTLOverride:  uafTTLOverrideForEntry(cacheInputs),
+				StaleDerived: staleSink.StaleDerived(), // #710 PR-2b
 			}, cacheGen0)
 			// #189 — the dep Record + the /refreshes publish run ONLY on an
 			// accepted write. A refused PutIfGen (a DELETE-eviction bumped the gen
@@ -707,6 +725,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// subscribed to a key with NO cell and NO possible publisher and waited
 	// forever. Twin of the widgets.go tail. The inert branch was already safe for
 	// a different reason — it mints no key at all (dispatchCacheLookupKey).
+	// #710 PR-2b — a stale-derived body is written only behind an accepted Put
+	// + the armed header (+ an owed-push mark); otherwise re-run fresh.
+	if staleWritePoint(r, wri, req, staleSink, refreshArmable) {
+		return
+	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "restactions", refreshArmable)
+	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }

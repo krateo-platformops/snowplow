@@ -148,7 +148,26 @@ var cacheAllow443 = map[string]cacheClass443{
 	"AdmissionCeiling": readOnly443, "AdmissionLiveHeapSample": readOnly443,
 	// The admission predictor's partition count: index keys under rw.mu read.
 	"ResourceWatcher.PartitionLen": readOnly443,
-	"DepGenStartSeqFromContext":    readOnly443, "DepTracker.BeginCapture": readOnly443,
+	// #710 PR-2b — the D2 stale serve. The sink and the mark are request-scoped
+	// reads; Note/NoteServedAt write only the request's own sink, after
+	// serveStaleWithDebt's cache.Inert check. Commit/Withdraw (the write point)
+	// act only on a sink that check let note a stale serve (StaleDerived is
+	// false under the flag). The debt goroutines' DebtCleared / publish /
+	// re-resolve / evict run only for a debt that check let open.
+	"StaleServeSinkFromContext": readOnly443, "StaleServeSink.L1Key": readOnly443,
+	"StaleServeSink.ServedAt": readOnly443, "KnownStaleMark": readOnly443,
+	"HasRefreshSubscriber": readOnly443, "StaleOwedStatsSnapshot": readOnly443,
+	// #710 PR-2b — the customer-triggered-refresh marker: a ctx value (set by the debt
+	// lane on its own detached ctx, read by the two admission classifiers).
+	"CustomerTriggeredRefreshFromContext": readOnly443, "WithCustomerTriggeredRefresh": readOnly443,
+	"StaleServeSink.Note": unreachableInert443, "StaleServeSink.NoteServedAt": unreachableInert443,
+	"StaleServeSink.Commit": unreachableInert443, "StaleServeSink.Withdraw": unreachableInert443,
+	"StaleServeSink.DebtCleared": unreachableInert443, "ResolvedCacheStore.EvictStaleDerived": unreachableInert443,
+	"RunRefreshNow": unreachableInert443, "PublishRefresh": unreachableInert443,
+	// Package init wiring (the test-reset quiesce; the #710 F2 arm-time
+	// stale_to_push recorder); no resolve reaches it.
+	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,
+	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
 	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
@@ -258,7 +277,7 @@ var cacheAllow443 = map[string]cacheClass443{
 // callerAllow443: for each gatedAtCaller symbol, the "<file>:<func>" sites
 // allowed to use it. Each listed function must contain a cache.Inert check.
 var callerAllow443 = map[string][]string{
-	"ServeCell":                {"apistage.go:apistageContentServeAttempt", "ra_full_list.go:raFullListServe"},
+	"ServeCell":                {"apistage.go:apistageContentServeAttempt", "apistage_stale_debt.go:serveStaleWithDebt", "ra_full_list.go:raFullListServe"},
 	"ResolvedEntry.NoteHitter": {"ra_full_list.go:raFullListServe"},
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},
@@ -271,6 +290,9 @@ var goAllow443 = map[string]bool{
 	"cluster_list.go:populateClusterListCellAsync":      true,  // (d): returns before the detached populate under the flag
 	"nested_resolve_bound.go:waitForReleaseOrCtx":       false, // cond.Broadcast on ctx.Done: no cache access
 	"apistage_fill_admission.go:waitLocked":             false, // #710 PR-2a: cond.Broadcast on ctx.Done: no cache access
+	"apistage_stale_debt.go:serveStaleWithDebt":         true,  // #710 PR-2b: starts a debt's refill only past its cache.Inert check
+	"apistage_stale_debt.go:goReplaceStaleDependent":    false, // #710 PR-2b: a committed dependent's replace + push; only past serveStaleWithDebt's Inert check
+	"apistage_stale_debt.go:ensureStaleOverdueScanner":  false, // #710 PR-2b: once-per-process overdue ticker (counters + one WARN)
 	"informer_dispatch_metrics.go:startDispatchSummary": false, // once-per-process summary log ticker
 	"informer_serve.go:startObjectsGetSummary":          false, // once-per-process summary log ticker
 }

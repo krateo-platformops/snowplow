@@ -184,6 +184,18 @@ type k547Harness struct {
 	// the inner-call dep edge on the widget L1 key — the traced live shape: an
 	// external widget whose RESTAction also reads K8s IS dirty-marked.
 	external atomic.Bool
+	// customerExternal (#710 D2-15*): the next N CUSTOMER resolves of the
+	// changed composition touch an external endpoint, so their Put is declined
+	// (N < 0: every one). Background resolves are untouched.
+	customerExternal atomic.Int32
+	// stageErrOnRerun (#710 D2-15e variant): a withdrawn stale serve's RE-RUN
+	// (cache.StaleServeDisabled) gets a per-item stage error, so its Put is
+	// declined.
+	stageErrOnRerun atomic.Bool
+	// gateSeen (#710 D2-19b/c): the gate class every resolve of the changed
+	// composition would get — recorded at the shared seam.
+	gateMu   sync.Mutex
+	gateSeen []k547GateSeen
 }
 
 type k547Block struct {
@@ -344,6 +356,11 @@ func newK547Harness(t *testing.T, mode k547Mode) *k547Harness {
 	rctx, rcancel := context.WithCancel(context.Background())
 	cache.StartRefresher(rctx)
 	t.Cleanup(func() { rcancel(); cache.ResetRefresherForTest() })
+	// #710 PR-2b — each arm starts from a zeroed D2 family (counters, debts,
+	// owed marks); registered LAST so it runs FIRST: the D2 goroutines (refill,
+	// replace) are stopped and joined before the refresher and store go away.
+	restactionsapi.ResetStaleServeForTest()
+	t.Cleanup(restactionsapi.ResetStaleServeForTest)
 	return h
 }
 
@@ -448,19 +465,58 @@ func (h *k547Harness) resolveRESTAction(ctx context.Context, opts restactions.Re
 	ns, _ := opts.Extras["namespace"].(string)
 	if name == fmt.Sprintf("comp-%d", k547Changed) && !cache.BackgroundResolveFromContext(ctx) {
 		h.custCalls.Add(1)
+		h.maybeCustomerExternal(ctx)
 	}
-	u, err := h.dyn.Resource(k547CompGVR).Namespace(ns).Get(context.Background(), name, metav1.GetOptions{})
-	if err != nil {
-		return nil, err
+	var conds []any
+	if h.contentMode {
+		// #710 D2-15 — the RA's own `found` stage, through the real api-stage
+		// resolver (content cell, D2 decision) under the RA dispatcher's ctx.
+		var found bool
+		if conds, found = h.resolveFoundStage(ctx, ns, name); !found {
+			return nil, fmt.Errorf("composition %s/%s not in the found stage", ns, name)
+		}
+	} else {
+		u, err := h.dyn.Resource(k547CompGVR).Namespace(ns).Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if l1 := cache.L1KeyFromContext(ctx); l1 != "" {
+			cache.Deps().Record(ctx, l1, k547CompGVR, ns, name)
+		}
+		conds, _, _ = unstructured.NestedSlice(u.Object, "status", "conditions")
 	}
-	if l1 := cache.L1KeyFromContext(ctx); l1 != "" {
-		cache.Deps().Record(ctx, l1, k547CompGVR, ns, name)
-	}
-	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
 	raw, _ := json.Marshal(map[string]any{"conditions": conds})
 	out := opts.In.DeepCopy()
 	out.Status = &runtime.RawExtension{Raw: raw}
 	return out, nil
+}
+
+// k547GateSeen is one resolve's gate classification.
+type k547GateSeen struct {
+	bg, demand, triggered bool
+	fill                  string
+	nestedBg              bool
+}
+
+func (h *k547Harness) gates() []k547GateSeen {
+	h.gateMu.Lock()
+	defer h.gateMu.Unlock()
+	return append([]k547GateSeen(nil), h.gateSeen...)
+}
+
+// maybeCustomerExternal consumes one customerExternal decline (or every one,
+// when negative) by touching the resolve's external sink.
+func (h *k547Harness) maybeCustomerExternal(ctx context.Context) {
+	for {
+		n := h.customerExternal.Load()
+		if n == 0 {
+			return
+		}
+		if n < 0 || h.customerExternal.CompareAndSwap(n, n-1) {
+			cache.ExternalTouchedSinkFromContext(ctx).Bump()
+			return
+		}
+	}
 }
 
 // getRA issues the production GET-by-name /call for the RESTAction, cohort k,
@@ -536,6 +592,23 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 	}
 	if h.external.Load() {
 		cache.ExternalTouchedSinkFromContext(ctx).Bump()
+	}
+	if changed && !bg {
+		h.maybeCustomerExternal(ctx)
+		if h.stageErrOnRerun.Load() && cache.StaleServeDisabled(ctx) {
+			if es := cache.StageErrorSinkFromContext(ctx); es != nil {
+				es.Bump("getComposition", "injected on the D2 re-run (#710 D2-15e)")
+			}
+		}
+	}
+	if changed {
+		_, demandRev := cache.DemandRevalidationFromContext(ctx)
+		h.gateMu.Lock()
+		h.gateSeen = append(h.gateSeen, k547GateSeen{bg: bg, demand: demandRev,
+			triggered: cache.CustomerTriggeredRefreshFromContext(ctx),
+			fill:      restactionsapi.ContentFillClassForTest(ctx),
+			nestedBg:  restactionsapi.NestedResolveBackgroundForTest(ctx)})
+		h.gateMu.Unlock()
 	}
 	var conds []any
 	if h.apiRefMode {
@@ -1112,7 +1185,7 @@ func TestIssue547_F9_StructurallyPermanentSuppressionSkipsDemandRevalidation(t *
 }
 
 // F3c + F3b (architect R1) — the content arm at the production boundary.
-func TestIssue547_F3c_KnownStaleFoundListIsReadThroughAtTheCallBoundary(t *testing.T) {
+func TestIssue547_F3c_KnownStaleFoundListIsShownThenReplaced(t *testing.T) {
 	h := newK547Harness(t, k547DenyBackground)
 	h.contentMode = true
 	// The identity-free content cell's refresh is NOT SERVABLE across the whole
@@ -1157,31 +1230,50 @@ func TestIssue547_F3c_KnownStaleFoundListIsReadThroughAtTheCallBoundary(t *testi
 		return ok && r == "not_servable"
 	})
 
+	// #710 PR-2b — owner ruling 1 (issuecomment-6187374111, "Yes, show then
+	// replace") supersedes #547's read-through for an ARMABLE customer resolve:
+	// the widget is served at once from the known-stale `found` cell, the cell's
+	// debt refills it at once, and the stale-derived widget cell is re-resolved
+	// and replaced. The debt lane re-resolves the widget cell through the
+	// production refresh handler, so background resolves are allowed from here.
+	h.allowBackground.Store(true)
 	rt0 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]
+	ss0 := restactionsapi.StaleServeStatsSnapshot().ServeTotal
 	r, code := h.get(0, k547Changed)
-	if code != 200 || r != "v1" {
-		t.Fatalf("F3c RED: cohort 0's resolve of comp-1 served %q (code %d), want v1 READ THROUGH — the widget "+
-			"cell was built from the stale `found` content cell (#547)", r, code)
+	if code != 200 || r != "v0" {
+		t.Fatalf("F3c (D2) RED: cohort 0's resolve of comp-1 served %q (code %d), want the STALE v0 at once — an armable "+
+			"customer read of a known-stale content cell is shown, then replaced (#710 ruling 1)", r, code)
 	}
-	if rr, ok := h.residentReason(h.key(0, k547Changed)); !ok || rr != "v1" {
-		t.Fatalf("F3c: cohort 0's widget cell holds %q (ok=%v) — a widget cell was Put from the stale substrate", rr, ok)
+	if d := restactionsapi.StaleServeStatsSnapshot().ServeTotal - ss0; d < 1 {
+		t.Fatalf("F3c (D2): stale_serve_total moved %d, want ≥ 1", d)
 	}
-	rt1 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]
-	if rt1 <= rt0 {
-		t.Fatalf("F3c: the read did not go through the known-stale content cell (read_through %d -> %d)", rt0, rt1)
+	if rt1 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]; rt1 != rt0 {
+		t.Fatalf("F3c (D2): the armable read went through the known-stale cell (read_through %d -> %d) instead of being served stale", rt0, rt1)
+	}
+	// Replace: the debt refilled the content cell and its lane re-resolved the
+	// stale-derived widget cell to v1.
+	if !k547WaitFor(t, 10*time.Second, "stale-derived widget cell replaced", func() bool {
+		rr, ok := h.residentReason(h.key(0, k547Changed))
+		return ok && rr == "v1"
+	}) {
+		rr, _ := h.residentReason(h.key(0, k547Changed))
+		t.Fatalf("F3c (D2) RED: cohort 0's widget cell still holds %q 10 s after the stale serve — the debt never replaced it (%+v)",
+			rr, restactionsapi.StaleServeStatsSnapshot())
 	}
 
-	// F3b — the read-through refill began after the mark: the content cell is
-	// fresh, so the NEXT cohort's resolve HITs it (no further read-through).
+	// F3b — the debt's refill began after the mark: the content cell is fresh,
+	// so the NEXT cohort's resolve HITs it (neither stale nor read through).
 	if _, _, ks := cache.KnownStale(contentKey); ks {
-		t.Fatalf("F3b RED: the `found` content cell is still known-stale after a post-mark read-through refill — " +
-			"every later read would read through (B1)")
+		t.Fatalf("F3b RED: the `found` content cell is still known-stale after its debt cleared — " +
+			"every later read would be served stale or read through (B1)")
 	}
+	rt2 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]
+	ss2 := restactionsapi.StaleServeStatsSnapshot().ServeTotal
 	if r, code := h.get(1, k547Changed); code != 200 || r != "v1" {
 		t.Fatalf("F3b: cohort 1 served %q (code %d), want v1", r, code)
 	}
-	if rt2 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]; rt2 != rt1 {
-		t.Fatalf("F3b: cohort 1's resolve read through again (read_through %d -> %d) — the fresh cell must HIT", rt1, rt2)
+	if rt3, ss3 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"], restactionsapi.StaleServeStatsSnapshot().ServeTotal; rt3 != rt2 || ss3 != ss2 {
+		t.Fatalf("F3b: cohort 1's resolve read through (%d -> %d) or was served stale (%d -> %d) — the fresh cell must HIT", rt2, rt3, ss2, ss3)
 	}
 }
 
@@ -1343,8 +1435,13 @@ func TestIssue547_F11_KnownStaleRAFullListIsReadThroughAtTheCallBoundary(t *test
 	}
 	k547WaitFor(t, 5*time.Second, "queue drained", func() bool { return k547Stat("queue_depth") == 0 })
 
+	// #710 PR-2b — the full-list fill re-scopes the L1 key to the RAFullList
+	// (a SUBSTRATE cell, read as input by every later page and by a D2 debt's
+	// dependent re-resolve), so it is out of the widget's stale-serve scope:
+	// it reads through and D2 never fires here (D2-15).
 	for k := range k547Cohorts {
 		rt0 := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]
+		ss0 := restactionsapi.StaleServeStatsSnapshot().ServeTotal
 		if r, code := h.get(k, k547Changed); code != 200 || r != "v1" {
 			t.Fatalf("F11 RED (k=%d): GET served %q (code %d), want v1 READ THROUGH — the widget page was Go-sliced "+
 				"from a KNOWN-STALE RAFullList cell (#547)", k, r, code)
@@ -1354,6 +1451,10 @@ func TestIssue547_F11_KnownStaleRAFullListIsReadThroughAtTheCallBoundary(t *test
 		}
 		if rt := cache.ResolvedCacheStatsByStat()["known_stale_read_through_total"]; rt <= rt0 {
 			t.Fatalf("F11 RED (k=%d): the read did not go through the known-stale full list (read_through %d -> %d)", k, rt0, rt)
+		}
+		if d := restactionsapi.StaleServeStatsSnapshot().ServeTotal - ss0; d != 0 {
+			t.Fatalf("F11 (k=%d): the full-list fill was served stale %d time(s) — a stale body baked into the substrate "+
+				"RAFullList would be read back as fresh by every later page (D2-15)", k, d)
 		}
 	}
 }
