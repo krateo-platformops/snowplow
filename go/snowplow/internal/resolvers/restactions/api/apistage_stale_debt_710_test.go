@@ -1124,3 +1124,54 @@ func TestStale710_D2_1b_ARefillThatWinsTheRaceStillReplacesAtCommit(t *testing.T
 		t.Fatalf("D2-1b RED: a dependent committed after its debt cleared was not replaced (resident=%v)", ok)
 	}
 }
+
+// V8d — A2 for D2 (architect-ch, #753): a refill REFUSED every time (the
+// generation keeps moving: a transient failure) whose dependents have no
+// viewer gets ONE immediate retry, then its next transient wake parks the
+// debt — it never loops on the <= 5 s transient backoff for nobody.
+// Mutation → RED: transient retries ungated (the engine's A2 gate).
+func TestStale710_V8d_ARefusedRefillNobodyViewsStopsAfterOneImmediateRetry(t *testing.T) {
+	f := newD2Fixture(t)
+	clock := cache.NewStaleRetryManualClockForTest()
+	cache.SetStaleRetryClockForTest(clock)
+	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
+	var refills atomic.Int64
+	orig := dispatchViaInformerFn
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+		if contentDebtRefillFromContext(ctx) {
+			refills.Add(1)
+			// Every refill's generation moves mid-fill and the cell stays
+			// resident: its Put is always refused (#189).
+			prior, _ := f.store.GetNoTouch(f.contentKey)
+			f.store.DeleteForTest(f.contentKey)
+			f.store.Put(f.contentKey, prior)
+		}
+		return orig(ctx, call)
+	}
+	t.Cleanup(func() { dispatchViaInformerFn = orig })
+	f.customer(t, "dep-v8d")
+	f.storeAndCommit("dep-v8d") // committed, no tab armed
+	var p []time.Duration
+	if !fill710WaitFor(10*time.Second, func() bool { p = clock.Pending(); return len(p) == 1 }) {
+		t.Fatalf("V8d: the first retry was never scheduled (%+v)", StaleServeStatsSnapshot())
+	}
+	if p[0] != 0 {
+		t.Fatalf("V8d: the refused refill's first retry waits %v, want at once (transient)", p[0])
+	}
+	clock.FireNext() // the one immediate, ungated retry: refused again
+	if !fill710WaitFor(10*time.Second, func() bool { p = clock.Pending(); return len(p) == 1 }) {
+		t.Fatalf("V8d: the next transient retry was never scheduled")
+	}
+	r0 := refills.Load()
+	clock.FireNext() // the next transient wake: nobody views a dependent
+	if refills.Load() != r0 || len(clock.Pending()) != 0 {
+		t.Fatalf("V8d RED: a refused refill nobody views kept retrying (refills +%d, pending %v) — only its first, "+
+			"immediate retry is ungated", refills.Load()-r0, clock.Pending())
+	}
+	if n := refills.Load(); n != 2 {
+		t.Fatalf("V8d: %d refill dispatches, want 2 (the first attempt + its one immediate retry)", n)
+	}
+	if st := StaleServeStatsSnapshot(); st.DebtParked != 1 || st.DebtOpen != 0 {
+		t.Fatalf("V8d: open=%d parked=%d, want 0/1 — the debt is PARKED", st.DebtOpen, st.DebtParked)
+	}
+}
