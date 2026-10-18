@@ -109,6 +109,11 @@ type StaleRetrySpec struct {
 	// PARKED meanwhile (architect ruling). Called under the engine lock: they
 	// must not call back into the engine.
 	Park, Resume func()
+	// Evicted, if set, runs when the chain ends because its cell left the store:
+	// a D2 debt whose content cell was evicted is retired then (PR-B review,
+	// the same rule as an abandoned chain's). Called under the engine lock: it
+	// must not call back into the engine.
+	Evicted func()
 }
 
 type staleRetryChain struct {
@@ -260,8 +265,7 @@ func (c *staleRetryChain) wake(gated bool) {
 	stale, resident := c.spec.StillStale()
 	switch {
 	case !resident:
-		c.endLocked()
-		staleRetryAbandonedEvict.Add(1)
+		c.evictedLocked()
 		staleRetryMu.Unlock()
 		return
 	case !stale:
@@ -300,7 +304,8 @@ func (c *staleRetryChain) run(spec StaleRetrySpec) {
 	}
 	if stale, resident := c.spec.StillStale(); !stale || !resident {
 		if !resident {
-			staleRetryAbandonedEvict.Add(1)
+			c.evictedLocked()
+			return
 		}
 		c.endLocked()
 		return
@@ -382,10 +387,20 @@ func staleRetryRecheck(key string) {
 	stale, resident := c.spec.StillStale()
 	switch {
 	case !resident:
-		staleRetryAbandonedEvict.Add(1)
-		c.endLocked()
+		c.evictedLocked()
 	case !stale:
 		c.endLocked()
+	}
+}
+
+// evictedLocked ends c because its cell left the store (counted
+// abandoned{evicted}) and runs its Evicted hook.
+func (c *staleRetryChain) evictedLocked() {
+	staleRetryAbandonedEvict.Add(1)
+	evicted := c.spec.Evicted
+	c.endLocked()
+	if evicted != nil {
+		evicted()
 	}
 }
 
@@ -423,6 +438,10 @@ func noteStaleRetryArm(armed map[string]struct{}) {
 // still needs it) or ends it.
 func (c *staleRetryChain) resumeLocked() bool {
 	if stale, resident := c.spec.StillStale(); !stale || !resident {
+		if !resident {
+			c.evictedLocked()
+			return false
+		}
 		c.endLocked()
 		return false
 	}

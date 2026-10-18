@@ -220,9 +220,15 @@ func TestStaleRetry_E_AnEvictedCellEndsItsChain(t *testing.T) {
 	st := SubscribeRefreshStream(map[string]struct{}{key: {}})
 	defer st.Unsub()
 	p := &retryProbe{out: StaleRetryGenuine, stale: true, resident: false}
-	StaleRetryFailed(key, StaleRetryGenuine, 0, p.spec(clock, key, "a"))
+	evictedHook := 0
+	spec := p.spec(clock, key, "a")
+	spec.Evicted = func() { evictedHook++ }
+	StaleRetryFailed(key, StaleRetryGenuine, 0, spec)
 	fireOne(t, clock)
 	open, _ := StaleRetryChainOpenForTest(key)
+	if evictedHook != 1 {
+		t.Fatalf("E: the Evicted hook ran %d times, want 1", evictedHook)
+	}
 	if p.n() != 0 || StaleRetryStatsSnapshot().AbandonedEvicted != 1 || len(clock.Pending()) != 0 || open {
 		t.Fatalf("E: attempts %d (want 0), abandoned{evicted} %d (want 1), pending %d (want 0), open %v",
 			p.n(), StaleRetryStatsSnapshot().AbandonedEvicted, len(clock.Pending()), open)
