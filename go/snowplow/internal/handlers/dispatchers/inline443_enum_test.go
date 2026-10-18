@@ -164,6 +164,11 @@ var cacheAllow443 = map[string]cacheClass443{
 	"StaleServeSink.Commit": unreachableInert443, "StaleServeSink.Withdraw": unreachableInert443,
 	"StaleServeSink.DebtCleared": unreachableInert443, "ResolvedCacheStore.EvictStaleDerived": unreachableInert443,
 	"RunRefreshNow": unreachableInert443, "PublishRefresh": unreachableInert443,
+	// #740 PR-B — a failed debt refill / dependent replace joins the viewer-gated
+	// retry chain: only for a debt serveStaleWithDebt's cache.Inert check let open,
+	// or a dependent a committed (non-inert) write point handed over. The wait is
+	// the test quiesce's join (quiesceStaleDebts), never on a resolve.
+	"StaleRetryFailed": unreachableInert443, "WaitStaleRetryForTest": unreachableInert443,
 	// Package init wiring (the test-reset quiesce; the #710 F2 arm-time
 	// stale_to_push recorder); no resolve reaches it.
 	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,

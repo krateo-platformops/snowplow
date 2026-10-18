@@ -23,12 +23,15 @@
 //
 // THE DEBT (G1). One per content key, opened by its first stale serve. Its
 // refill runs at once at the DEBT class (it bypasses the admission cap like a
-// customer) through the ordinary single-flight fill, and is NON-DROPPABLE: a
-// failed attempt retries on #690's backoff (10 ms doubling to a 5 s cap),
-// counted, until a fill whose epoch is at or after the debt's mark commits
-// (its #375 sink startSeq ≥ the known-stale mark seq — the same rule that
-// closes the known-stale window, closeKnownStaleOnPut). Only then does the
-// debt clear.
+// customer) through the ordinary single-flight fill. It clears when a fill
+// whose epoch is at or after the debt's mark commits (its #375 sink startSeq ≥
+// the known-stale mark seq — the same rule that ends the known-stale state,
+// endKnownStaleOnPut). #740 (owner ruling, architect Q2): a FAILED refill
+// joins the content cell's viewer-gated retry chain (cache/stale_retry.go) —
+// a refused fill (the generation moved, or a newer mark) is TRANSIENT and
+// retried at once, anything else is GENUINE and retried at 1 s doubling to
+// 60 s, ONLY while an armed /refreshes tab views a dependent; with nobody
+// viewing it the debt stays open (still overdue-counted) and an arm resumes it.
 //
 // THE PUSH (G2). On clear, each dependent customer key is re-resolved at once
 // through its class's refresh handler (cache.RunRefreshNow — outside the
@@ -73,12 +76,6 @@ const staleMaxMS = 10_000
 // exactly 1000 (the target), 3000 (the p95 bar) and 10000 (the max bar), so
 // the bench can decide the bar from /debug/vars.
 var StaleToPushBoundsMS = []int64{100, 250, 500, 1000, 2000, 3000, 5000, 10000, 30000}
-
-// staleDebtBackoffMin / Max: #690's retry backoff.
-const (
-	staleDebtBackoffMin = 10 * time.Millisecond
-	staleDebtBackoffMax = 5 * time.Second
-)
 
 // staleClock is the debt clock (seamed in tests; read by debt goroutines, so
 // atomic).
@@ -261,27 +258,66 @@ func contentRefillCall(call httpcall.RequestOptions) httpcall.RequestOptions {
 
 // --- the refill (G1) ----------------------------------------------------------
 
-// runStaleDebt refills d until a fill whose epoch is at or after d's mark
-// commits, then clears d and delivers its pushes. Non-droppable.
+// runStaleDebt runs d's first refill at once; on success it clears d and
+// delivers its pushes, on failure it hands d to the content cell's viewer-gated
+// retry chain (#740).
 func runStaleDebt(d *staleDebt) {
 	defer staleDebtWG.Done()
-	backoff := staleDebtBackoffMin
-	for {
-		if staleDebtRefillOnce(d) {
-			clearStaleDebt(d)
-			return
-		}
-		staleDebtRetries.Add(1)
-		if !staleDebtSleep(backoff) {
-			return // quiesced (test reset only)
-		}
-		backoff = min(2*backoff, staleDebtBackoffMax)
+	start := time.Now()
+	ok, kind := staleDebtRefillOnce(d)
+	if ok {
+		clearStaleDebt(d)
+		return
+	}
+	if kind == cache.StaleRetryFresh {
+		return // quiesced (test reset only)
+	}
+	staleDebtRetries.Add(1)
+	cache.StaleRetryFailed(d.contentKey, kind, time.Since(start), debtRetrySpec(d))
+}
+
+// debtRetrySpec is d's chain: each attempt is one refill (clearing d on
+// success); its viewers are d's dependents' armed keys; it lasts while d is
+// still the content key's open debt.
+func debtRetrySpec(d *staleDebt) cache.StaleRetrySpec {
+	return cache.StaleRetrySpec{
+		Source: cache.StaleRetryDebt,
+		Attempt: func(context.Context) cache.StaleRetryOutcome {
+			ok, kind := staleDebtRefillOnce(d)
+			if ok {
+				clearStaleDebt(d)
+				return cache.StaleRetryFresh
+			}
+			if kind == cache.StaleRetryFresh {
+				return cache.StaleRetryFresh // quiesced
+			}
+			staleDebtRetries.Add(1)
+			return kind
+		},
+		Dependents: func() []string {
+			staleDebtsMu.Lock()
+			defer staleDebtsMu.Unlock()
+			keys := make([]string, 0, len(d.dependents))
+			for sink := range d.dependents {
+				keys = append(keys, sink.L1Key())
+			}
+			return keys
+		},
+		StillStale: func() (bool, bool) {
+			staleDebtsMu.Lock()
+			defer staleDebtsMu.Unlock()
+			return staleDebts[d.contentKey] == d, true
+		},
 	}
 }
 
 // staleDebtRefillOnce runs one refill attempt through the ordinary content
-// fill at the debt class and reports whether it satisfied the debt.
-func staleDebtRefillOnce(d *staleDebt) bool {
+// fill at the debt class and reports whether it satisfied the debt and, if
+// not, the failure's kind (#740 Q4): a fill that completed but was REFUSED (the
+// generation moved) or committed under an older mark than the debt's is
+// TRANSIENT — a newer change exists, retry at once; anything else is GENUINE.
+// StaleRetryFresh with ok=false: quiesced (test reset only).
+func staleDebtRefillOnce(d *staleDebt) (bool, cache.StaleRetryOutcome) {
 	if g := staleRefillHoldForTest.Load(); g != nil {
 		staleDebtStopMu.Lock()
 		stop := staleDebtStop
@@ -289,7 +325,7 @@ func staleDebtRefillOnce(d *staleDebt) bool {
 		select {
 		case <-*g:
 		case <-stop:
-			return false
+			return false, cache.StaleRetryFresh
 		}
 	}
 	staleDebtsMu.Lock()
@@ -300,12 +336,18 @@ func staleDebtRefillOnce(d *staleDebt) bool {
 	ctx, out := withFillOutcome(withContentDebtRefill(ctx))
 	store := cache.ResolvedCache()
 	if store == nil {
-		return false
+		return false, cache.StaleRetryGenuine
 	}
 	_, _, _, err := apistageContentServe(ctx, store, d.call, false)
 	out.mu.Lock()
 	defer out.mu.Unlock()
-	return err == nil && out.set && out.stored && out.startSeq >= mark
+	switch {
+	case err == nil && out.set && out.stored && out.startSeq >= mark:
+		return true, cache.StaleRetryFresh
+	case err == nil && out.set:
+		return false, cache.StaleRetryTransient
+	}
+	return false, cache.StaleRetryGenuine
 }
 
 // clearStaleDebt retires d (if it is still the key's debt) and replaces every
@@ -314,10 +356,13 @@ func staleDebtRefillOnce(d *staleDebt) bool {
 // was never written stale and owes nothing.
 func clearStaleDebt(d *staleDebt) {
 	staleDebtsMu.Lock()
-	if staleDebts[d.contentKey] == d {
-		delete(staleDebts, d.contentKey)
-		staleDebtOpen.Add(-1)
+	if staleDebts[d.contentKey] != d {
+		// Already retired (a concurrent clear, or a test quiesce dropped it).
+		staleDebtsMu.Unlock()
+		return
 	}
+	delete(staleDebts, d.contentKey)
+	staleDebtOpen.Add(-1)
 	sinks := make([]*cache.StaleServeSink, 0, len(d.dependents))
 	for sink := range d.dependents {
 		sinks = append(sinks, sink)
@@ -369,8 +414,10 @@ func goReplaceStaleDependent(sink *cache.StaleServeSink) {
 //     the now-fresh content rather than a hit on the same stale body;
 //   - it FAILED (transport, timeout, ctx, a resolve error): the cell is KEPT
 //     (#547: a failed revalidation keeps serving, never evicts) and the replace
-//     retries on #690's backoff, non-droppable; past 10 s it is counted
-//     overdue once (scanStaleOverdue).
+//     joins the dependent cell's viewer-gated retry chain (#740): 1 s doubling
+//     to 60 s while its tab is armed; past 10 s it is counted overdue once
+//     (scanStaleOverdue); with nobody viewing it the chain is abandoned and an
+//     arm resumes it.
 //
 // A tab that arms after this publish is served by the owed-push mark at arm
 // time (cache.SubscribeRefreshStream).
@@ -379,42 +426,78 @@ func replaceStaleDependent(sink *cache.StaleServeSink) {
 	staleDebtsMu.Lock()
 	staleReplacing[sink] = &staleReplace{key: l1Key, servedAt: sink.ServedAt()}
 	staleDebtsMu.Unlock()
-	defer func() {
-		staleDebtsMu.Lock()
-		delete(staleReplacing, sink)
-		staleDebtsMu.Unlock()
-	}()
-	backoff := staleDebtBackoffMin
-	for {
-		store := cache.ResolvedCache()
-		if store == nil {
-			return
-		}
-		//serve-probe: D2 replace — identity + StaleDerived of the dependent cell, serves no body
-		before, ok := store.GetNoTouch(l1Key)
-		if !ok || before == nil || !before.StaleDerived {
-			break // evicted (the refetch fills) or already replaced by another writer
-		}
-		ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(context.Background()), cache.DemandRevalidationDeadline())
-		err := cache.RunRefreshNow(ctx, l1Key)
-		cancel()
-		if err == nil || errors.Is(err, cache.ErrRefreshNowNoHandler) {
-			//serve-probe: D2 replace — was the dependent cell replaced (pointer compare), serves no body
-			if after, _ := store.GetNoTouch(l1Key); after == before {
-				staleDependentUnresolved.Add(1)
-				store.EvictStaleDerived(l1Key, before)
-			}
-			break
-		}
-		if errors.Is(err, cache.ErrRefreshNowNoEntry) {
-			break // evicted between the read and the re-resolve
-		}
+	start := time.Now()
+	if !replaceStaleDependentOnce(sink) {
+		// #740 — a FAILED re-resolve keeps the cell and joins the dependent
+		// cell's viewer-gated retry chain; it stays in staleReplacing (overdue
+		// scan) until the chain lets go of it.
 		staleReplaceRetries.Add(1)
-		if !staleDebtSleep(backoff) {
-			return // quiesced (test reset only)
-		}
-		backoff = min(2*backoff, staleDebtBackoffMax)
+		cache.StaleRetryFailed(l1Key, cache.StaleRetryGenuine, time.Since(start), replaceRetrySpec(sink))
+		return
 	}
+	finishStaleReplace(sink)
+}
+
+// replaceRetrySpec is a failed dependent replace's chain: each attempt is one
+// re-resolve (publishing on success); its viewer is the dependent cell's own
+// armed key; letting go of it ends the overdue tracking.
+func replaceRetrySpec(sink *cache.StaleServeSink) cache.StaleRetrySpec {
+	l1Key := sink.L1Key()
+	return cache.StaleRetrySpec{
+		Source: cache.StaleRetryDebt,
+		Attempt: func(context.Context) cache.StaleRetryOutcome {
+			if !replaceStaleDependentOnce(sink) {
+				staleReplaceRetries.Add(1)
+				return cache.StaleRetryGenuine
+			}
+			finishStaleReplace(sink)
+			return cache.StaleRetryFresh
+		},
+		Dependents: func() []string { return []string{l1Key} },
+		StillStale: func() (bool, bool) { return true, true }, // the attempt itself sees a replaced / evicted cell
+		Release: func() {
+			staleDebtsMu.Lock()
+			delete(staleReplacing, sink)
+			staleDebtsMu.Unlock()
+		},
+	}
+}
+
+// replaceStaleDependentOnce runs one replace of sink's dependent cell and
+// reports whether it is done: replaced, already replaced or evicted, or
+// completed with a declined Put (compare-and-evicted). false: it FAILED.
+func replaceStaleDependentOnce(sink *cache.StaleServeSink) bool {
+	l1Key := sink.L1Key()
+	store := cache.ResolvedCache()
+	if store == nil {
+		return true
+	}
+	//serve-probe: D2 replace — identity + StaleDerived of the dependent cell, serves no body
+	before, ok := store.GetNoTouch(l1Key)
+	if !ok || before == nil || !before.StaleDerived {
+		return true // evicted (the refetch fills) or already replaced by another writer
+	}
+	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(context.Background()), cache.DemandRevalidationDeadline())
+	err := cache.RunRefreshNow(ctx, l1Key)
+	cancel()
+	if err == nil || errors.Is(err, cache.ErrRefreshNowNoHandler) {
+		//serve-probe: D2 replace — was the dependent cell replaced (pointer compare), serves no body
+		if after, _ := store.GetNoTouch(l1Key); after == before {
+			staleDependentUnresolved.Add(1)
+			store.EvictStaleDerived(l1Key, before)
+		}
+		return true
+	}
+	return errors.Is(err, cache.ErrRefreshNowNoEntry) // evicted between the read and the re-resolve
+}
+
+// finishStaleReplace publishes a done replace's /refreshes signal and stops its
+// overdue tracking.
+func finishStaleReplace(sink *cache.StaleServeSink) {
+	l1Key := sink.L1Key()
+	staleDebtsMu.Lock()
+	delete(staleReplacing, sink)
+	staleDebtsMu.Unlock()
 	if cache.HasRefreshSubscriber(l1Key) {
 		stalePushTotal.Add(1)
 		staleToPushHist.record(staleNow().Sub(sink.ServedAt()).Milliseconds())
@@ -531,21 +614,6 @@ func init() {
 	})
 }
 
-// staleDebtSleep waits d; false when the debts are being quiesced.
-func staleDebtSleep(d time.Duration) bool {
-	staleDebtStopMu.Lock()
-	stop := staleDebtStop
-	staleDebtStopMu.Unlock()
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return true
-	case <-stop:
-		return false
-	}
-}
-
 // quiesceStaleDebts stops every debt goroutine at its next wait, joins them,
 // and drops the open debts. It is the cache's registered D2 quiesce, run ONLY
 // by the test resets of the store, refresher and deps singletons (a process
@@ -555,6 +623,10 @@ func quiesceStaleDebts() {
 	staleDebtStopMu.Lock()
 	close(staleDebtStop)
 	staleDebtStopMu.Unlock()
+	// #740 — a viewer-gated retry attempt (a refill or a replace) runs on the
+	// engine, not on staleDebtWG: join it first, so it cannot start a D2
+	// goroutine after the join below.
+	cache.WaitStaleRetryForTest()
 	staleDebtWG.Wait()
 	staleDebtsMu.Lock()
 	staleDebts = map[string]*staleDebt{}
