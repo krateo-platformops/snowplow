@@ -297,12 +297,20 @@ func TestStale710_D2_18_ASubstrateFillUnderAnArmableResolveReadsThrough(t *testi
 func TestStale710_D2_6_ATransientRefillFailureRetriesAtOnceAndTheDebtClears(t *testing.T) {
 	f := newD2Fixture(t)
 	var first atomic.Bool
+	var refills atomic.Int64
 	orig := dispatchViaInformerFn
 	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		if contentDebtRefillFromContext(ctx) && first.CompareAndSwap(false, true) {
-			// The debt's first refill flight: the content cell is DELETE-evicted
-			// mid-fill, so its generation-guarded Put is refused (#189).
-			f.store.DeleteForTest(f.contentKey)
+		if contentDebtRefillFromContext(ctx) {
+			refills.Add(1)
+			if first.CompareAndSwap(false, true) {
+				// The debt's first refill flight: the content cell's generation
+				// moves mid-fill (a DELETE-eviction, then the same stale body put
+				// back, so the cell stays resident), so its generation-guarded Put
+				// is refused (#189) — a TRANSIENT failure.
+				prior, _ := f.store.GetNoTouch(f.contentKey)
+				f.store.DeleteForTest(f.contentKey)
+				f.store.Put(f.contentKey, prior)
+			}
 		}
 		return orig(ctx, call)
 	}
@@ -325,6 +333,9 @@ func TestStale710_D2_6_ATransientRefillFailureRetriesAtOnceAndTheDebtClears(t *t
 	}
 	if r := StaleServeStatsSnapshot().DebtRetries; r < 1 {
 		t.Fatalf("D2-6: retries=%d, want ≥ 1", r)
+	}
+	if n := refills.Load(); n != 2 {
+		t.Fatalf("D2-6: %d refill dispatches, want 2 (the refused one + its immediate retry, which cleared the debt)", n)
 	}
 	if _, _, ok := cache.KnownStale(f.contentKey); ok {
 		t.Fatalf("D2-6 RED: the debt cleared without a committed refill — the cell is still known-stale")
@@ -994,6 +1005,42 @@ func TestStale710_D2_20c_AFillBeforeTheMarkDoesNotRetire(t *testing.T) {
 	retireStaleDebtOnFill(f.contentKey, d.markSeq)
 	if st := StaleServeStatsSnapshot(); st.DebtParked != 0 || st.DebtOpen != 0 {
 		t.Fatalf("D2-20c: a fill at the mark did not retire the debt (%+v)", st)
+	}
+	// G1 (dev-710) — a direct call: no Put, so no store event re-checks the
+	// chain; only R1's own StaleRetryEnd can have ended it.
+	if open, _ := cache.StaleRetryChainOpenForTest(f.contentKey); open {
+		t.Fatalf("D2-20c RED: the retired debt's retry chain is still held — R1 must end it, not wait for a store event")
+	}
+}
+
+// D2-20d — PR-B review (made required): a PARKED debt whose content cell is
+// EVICTED (and never refreshed again) is retired at the eviction — the same
+// rule as an abandoned chain's — through the G2 bridge: open and parked 0, the
+// chain gone (abandoned{evicted}), the dependent replaced.
+// Mutation → RED: no Evicted hook on the debt's chain.
+func TestStale710_D2_20d_AParkedDebtWhoseContentIsEvictedIsRetired(t *testing.T) {
+	f := newD2Fixture(t)
+	_, heal, _ := d2Parked(t, f, "dep-20d")
+	heal()
+	e0 := cache.StaleRetryStatsSnapshot().AbandonedEvicted
+	f.store.DeleteForTest(f.contentKey) // the content cell is evicted
+	if !fill710WaitFor(10*time.Second, func() bool {
+		st := StaleServeStatsSnapshot()
+		return st.DebtOpen == 0 && st.DebtParked == 0
+	}) {
+		t.Fatalf("D2-20d RED: a parked debt outlived its evicted content cell (%+v) — it would linger forever", StaleServeStatsSnapshot())
+	}
+	if open, _ := cache.StaleRetryChainOpenForTest(f.contentKey); open {
+		t.Fatalf("D2-20d: the evicted content's chain is still held")
+	}
+	if got := cache.StaleRetryStatsSnapshot().AbandonedEvicted - e0; got != 1 {
+		t.Fatalf("D2-20d: abandoned{evicted} moved %d, want 1", got)
+	}
+	if !fill710WaitFor(10*time.Second, func() bool {
+		e, ok := f.store.GetNoTouch("dep-20d")
+		return ok && !e.StaleDerived
+	}) {
+		t.Fatalf("D2-20d: the dependent was not replaced by the G2 bridge")
 	}
 }
 

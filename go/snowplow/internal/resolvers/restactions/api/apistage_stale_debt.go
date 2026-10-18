@@ -26,12 +26,18 @@
 // customer) through the ordinary single-flight fill. It clears when a fill
 // whose epoch is at or after the debt's mark commits (its #375 sink startSeq ≥
 // the known-stale mark seq — the same rule that ends the known-stale state,
-// endKnownStaleOnPut). #740 (owner ruling, architect Q2): a FAILED refill
+// endKnownStaleOnPut) — and (#740 R1) ANY accepted fill of the content at or
+// after that mark retires it, whoever made it (its own refill, the refresher,
+// a customer read-through). #740 (owner ruling, architect Q2): a FAILED refill
 // joins the content cell's viewer-gated retry chain (cache/stale_retry.go) —
 // a refused fill (the generation moved, or a newer mark) is TRANSIENT and
 // retried at once, anything else is GENUINE and retried at 1 s doubling to
-// 60 s, ONLY while an armed /refreshes tab views a dependent; with nobody
-// viewing it the debt stays open (still overdue-counted) and an arm resumes it.
+// 60 s, ONLY while an armed /refreshes tab views a dependent. With nobody
+// viewing it the debt is PARKED (architect ruling): the cell is kept and
+// served, the record stays, its timer and overdue clock stop, and it is not in
+// stale_debt_open (stale_debt_parked counts it). An arm of a dependent or a new
+// stale serve joining it resumes it and restarts its overdue clock; an
+// eviction of its content cell retires it.
 //
 // THE PUSH (G2). On clear, each dependent customer key is re-resolved at once
 // through its class's refresh handler (cache.RunRefreshNow — outside the
@@ -325,9 +331,17 @@ func debtRetrySpec(d *staleDebt) cache.StaleRetrySpec {
 		},
 		StillStale: func() (bool, bool) {
 			staleDebtsMu.Lock()
-			defer staleDebtsMu.Unlock()
-			return staleDebts[d.contentKey] == d, true
+			open := staleDebts[d.contentKey] == d
+			staleDebtsMu.Unlock()
+			store := cache.ResolvedCache()
+			return open, store != nil && store.Has(d.contentKey)
 		},
+		// The content cell left the store (evicted, never refreshed again): the
+		// stale body the debt stood for is gone, so the debt is retired through
+		// the G2 bridge — its dependents re-resolve, filling the content fresh
+		// (PR-B review: a parked debt must not linger on an evicted cell). Runs
+		// under the engine lock: clearStaleDebt never calls the engine.
+		Evicted: func() { clearStaleDebt(d) },
 		Park: func() {
 			staleDebtsMu.Lock()
 			defer staleDebtsMu.Unlock()
