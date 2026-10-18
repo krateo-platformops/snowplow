@@ -124,6 +124,8 @@ var resetExemptions = map[string]resetExemption{
 	"ResetRefreshTerminalForTest": {exemptWrapper, "shim over resetRefreshTerminalForTest, composed via resetRefresherForTest"},
 	"ResetRefreshBroadcasterForTest": {exemptWrapper,
 		"shim over resetRefreshBroadcasterForTest, itself exempt as unmeasured"},
+	"ResetStaleRetryForTest": {exemptWrapper,
+		"#740 shim over resetStaleRetryForTest, composed via resetResolvedCacheForTest -> quiesceStaleServeForTest"},
 
 	// --- counters, log-once ledgers, published gauges ----------------------
 	"ResetBindingNoopCountersForTest":             {exemptCounter, "binding noop/update totals"},

@@ -854,18 +854,25 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 		h.mu.RUnlock()
 		noteStaleOwedArmEmit(k)
 	}
+	// #740 — an arm of a dependent resumes an abandoned stale-retry chain with an
+	// immediate attempt: the cell has a viewer again.
+	noteStaleRetryArm(armedKeys)
 
 	var once sync.Once
 	unsub := func() {
 		once.Do(func() {
 			h.mu.Lock()
+			disarmed := make(map[string]struct{}, len(s.keys))
 			if _, ok := h.subs[s.id]; ok {
 				for k := range s.keys {
+					disarmed[k] = struct{}{}
 					h.disarmLocked(s, k)
 				}
 				delete(h.subs, s.id)
 			}
 			h.mu.Unlock()
+			// #740 — eager cancellation: a chain left with no viewer stops its timer.
+			noteStaleRetryDisarm(disarmed)
 			s.close()
 			// Do NOT close s.ch — a publisher may hold the RLock and be
 			// mid-send under a concurrent publish. The handler stops reading

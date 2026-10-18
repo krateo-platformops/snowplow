@@ -487,7 +487,13 @@ func RegisterStaleServeQuiesce(f func()) { staleServeQuiesce.Store(&f) }
 
 // quiesceStaleServeForTest runs the registered D2 stop-and-join, if any.
 func quiesceStaleServeForTest() {
+	// #740 — the viewer-gated chains outlive their request too (a pending wake
+	// reads these singletons). Stop them first so no new attempt starts; the D2
+	// quiesce then unblocks and joins the attempts already running (they may be
+	// parked on its stop channel) before it joins its own goroutines.
+	stopStaleRetryChainsForTest()
 	if f := staleServeQuiesce.Load(); f != nil {
 		(*f)()
 	}
+	resetStaleRetryForTest()
 }

@@ -270,6 +270,17 @@ Substrate fills (a nested resolve that re-scopes the L1 key, such as the RAFullL
 | `snowplow_apistage_stale_owed_dropped_total` | owed marks dropped by the L1-capacity bound before reaching a tab: **a guarantee failure** | **0**. A bench gate |
 | `snowplow_apistage_stale_dependent_unresolved_total` | debt-lane re-resolves that completed but whose Put was declined; the stale-derived cell is evicted and the push still goes out | low |
 
+**Viewer-gated retry (#740).** After a known-stale cell's refresh fails, it keeps being served (#547). It is retried **only while a `/refreshes` tab views it**: an armed key in its dependent set, which is the cell itself for the #547 slots and the dependents' keys for a D2 debt. There is one chain per cell. A refused Put (the generation moved) is *transient* and retried at once, then on #690's 10 ms → 5 s backoff. Every other failure is *genuine* and backs off from max(1 s, the failed attempt's own duration), doubling to a 60 s cap. A suppressed key opens no chain. When nobody views the cell, the chain is abandoned; an arm resumes it with an immediate attempt. Every series below is on expvar and on OTLP; the labels are closed sets.
+
+| expvar | meaning | healthy range |
+|---|---|---|
+| `snowplow_stale_retry_total` | map `kind` (`transient`, `genuine`) → `source` (`background`, `demand`, `debt`) → retries scheduled | low; tracks failing upstreams that someone is viewing |
+| `snowplow_stale_retry_chains_active` | gauge: cells with a chain scheduled or running | **0** at rest |
+| `snowplow_stale_retry_viewers` | gauge: armed dependent keys across the active chains | ≈ the tabs looking at failing cells |
+| `snowplow_stale_retry_abandoned_total` | map `reason` (`no_viewer`, `evicted`) → chains stopped | informational: nobody was looking |
+| `snowplow_stale_retry_resumed_total` | abandoned chains resumed by an arm | informational |
+| `snowplow_stale_retry_backoff_ms` | gauge: the longest pending wait | **60000** sustained = a persistent upstream failure someone is viewing; alert |
+
 The customer cell a stale serve fed is stored with `ResolvedEntry.StaleDerived` (metadata only). A HIT on such a cell before its replacement lands is armed and refreshes the key's owed mark.
 
 ### Prewarm — boot warm-up completion + walk coverage

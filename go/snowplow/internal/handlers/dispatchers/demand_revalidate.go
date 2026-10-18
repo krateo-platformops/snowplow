@@ -45,6 +45,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -65,23 +66,159 @@ func revalidateKnownStale(h http.Handler, req *http.Request, key string) {
 		return
 	}
 	t0, reason, ok := cache.KnownStale(key)
-	if !ok || !cache.ClaimDemandRevalidation(key, t0) {
+	if !ok {
 		return
 	}
-	go func() {
-		// #740 — a read absorbed into an attempt (its ClaimDemandRevalidation
-		// found this slot held) earns one more attempt while the cell is still
-		// known-stale; the slot stays claimed across it. Driven by reads: with
-		// no absorbed read the first settle releases the slot.
-		for demandRevalidateOnce(h, req, key, t0, reason) {
+	if !cache.ClaimDemandRevalidation(key, t0) {
+		// Absorbed into the attempt in flight (or skipped as suppressed): the
+		// newest same-key request becomes the template its rerun and any
+		// viewer-gated retry run (#740 Q3).
+		if _, held := cache.DemandSlotDone(key); held {
+			setDemandTemplate(key, req)
 		}
+		return
+	}
+	tpl := setDemandTemplate(key, req)
+	go func() {
+		res := runDemandRevalidation(h, tpl, key, t0, reason)
+		demandAfterSettle(h, key, reason, res)
 	}()
 }
 
+// demandRun is one demand revalidation's final settle and its last attempt's
+// duration.
+type demandRun struct {
+	cache.DemandSettle
+	dur time.Duration
+}
+
+// runDemandRevalidation runs key's demand revalidation on its claimed slot: one
+// attempt, then — #740 — one more for each read absorbed into the attempt in
+// flight while the cell is still known-stale (the slot stays claimed across
+// them). Driven by reads: with no absorbed read the first settle releases the
+// slot. Each attempt runs the NEWEST same-key request (Q3).
+func runDemandRevalidation(h http.Handler, tpl *demandTemplate, key string, t0 time.Time, reason string) demandRun {
+	for {
+		start := time.Now()
+		s := demandRevalidateOnce(h, currentDemandTemplate(key, tpl), key, t0, reason)
+		if !s.Rerun {
+			return demandRun{DemandSettle: s, dur: time.Since(start)}
+		}
+	}
+}
+
+// demandAfterSettle opens or joins key's viewer-gated chain when its demand
+// revalidation settled still known-stale (#740): refused ⇒ transient, anything
+// else ⇒ genuine (Q4); a suppressed key opens no chain. Otherwise it drops the
+// request template, unless a chain still holds it.
+func demandAfterSettle(h http.Handler, key, reason string, res demandRun) {
+	if stale, resident := cache.KnownStaleRetryState(key); !res.Fresh && stale && resident {
+		kind := cache.StaleRetryGenuine
+		if res.Refused {
+			kind = cache.StaleRetryTransient
+		}
+		cache.StaleRetryFailed(key, kind, res.dur, demandRetrySpec(h, key, reason))
+		return
+	}
+	if !cache.StaleRetryChainOpen(key) {
+		demandTemplates.Delete(key)
+	}
+}
+
+// demandRetrySpec is key's viewer-gated chain on the demand slot. Each attempt
+// claims the slot and runs the newest template; if an attempt is already in
+// flight it waits for that one (it was absorbed, so that attempt reruns). With
+// no template left (abandoned, then nobody read the cell again) there is
+// nothing to retry under: the chain ends, and the next read starts over.
+func demandRetrySpec(h http.Handler, key, reason string) cache.StaleRetrySpec {
+	return cache.StaleRetrySpec{
+		Source: cache.StaleRetryDemand,
+		Attempt: func(ctx context.Context) cache.StaleRetryOutcome {
+			t0, _, ok := cache.KnownStale(key)
+			tpl := loadDemandTemplate(key)
+			if !ok || tpl == nil {
+				return cache.StaleRetryFresh
+			}
+			if !cache.ClaimDemandRevalidation(key, t0) {
+				if done, held := cache.DemandSlotDone(key); held {
+					ctx, cancel := context.WithTimeout(ctx, cache.DemandRevalidationDeadline())
+					defer cancel()
+					select {
+					case <-done:
+					case <-ctx.Done():
+					}
+				}
+				if stale, _ := cache.KnownStaleRetryState(key); stale {
+					return cache.StaleRetryGenuine
+				}
+				return cache.StaleRetryFresh
+			}
+			res := runDemandRevalidation(h, tpl, key, t0, reason)
+			switch {
+			case res.Fresh:
+				return cache.StaleRetryFresh
+			case res.Refused:
+				return cache.StaleRetryTransient
+			}
+			return cache.StaleRetryGenuine
+		},
+		Dependents: func() []string { return []string{key} },
+		StillStale: func() (bool, bool) {
+			stale, resident := cache.KnownStaleRetryState(key)
+			return stale && loadDemandTemplate(key) != nil, resident
+		},
+		Release: func() { demandTemplates.Delete(key) },
+	}
+}
+
+// demandTemplate is the newest same-key request a demand revalidation of key
+// runs (#740 Q3): a detached clone (the response it belonged to is long
+// written), replaced on each claim and absorbed read, dropped when the slot is
+// released with no chain left or when the chain stops holding it. Same key only
+// by construction: the map is keyed by the cell's L1 key, which folds the
+// identity inputs. An expired credential in it surfaces as a genuine failure;
+// it is never minted or extended — the next read replaces it.
+type demandTemplate struct {
+	mu  sync.Mutex
+	req *http.Request
+}
+
+var demandTemplates sync.Map // L1 key → *demandTemplate
+
+func setDemandTemplate(key string, req *http.Request) *demandTemplate {
+	clone := req.Clone(context.WithoutCancel(req.Context()))
+	v, _ := demandTemplates.LoadOrStore(key, &demandTemplate{})
+	t := v.(*demandTemplate)
+	t.mu.Lock()
+	t.req = clone
+	t.mu.Unlock()
+	return t
+}
+
+func loadDemandTemplate(key string) *demandTemplate {
+	v, ok := demandTemplates.Load(key)
+	if !ok {
+		return nil
+	}
+	return v.(*demandTemplate)
+}
+
+// currentDemandTemplate is the newest request for key: the shared template if
+// one is registered, else own's.
+func currentDemandTemplate(key string, own *demandTemplate) *http.Request {
+	t := loadDemandTemplate(key)
+	if t == nil {
+		t = own
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.req
+}
+
 // demandRevalidateOnce runs one demand revalidation attempt of key on a
-// detached, bounded copy of req and settles it. It reports whether the slot
-// asks for a rerun (#740).
-func demandRevalidateOnce(h http.Handler, req *http.Request, key string, t0 time.Time, reason string) (rerun bool) {
+// detached, bounded copy of req and settles it (#740: the settle reports a
+// rerun and a refused Put).
+func demandRevalidateOnce(h http.Handler, req *http.Request, key string, t0 time.Time, reason string) (s cache.DemandSettle) {
 	// #710 PR-2b — a customer started it and is looking at the stale body: its
 	// content and nested fills bypass like a debt's (top priority, never queued
 	// behind background work), ahead of any origin rule. #740 — stamped on EVERY
@@ -97,18 +234,17 @@ func demandRevalidateOnce(h http.Handler, req *http.Request, key string, t0 time
 				slog.Any("panic", p),
 			)
 		}
-		var fresh bool
-		fresh, rerun = settle()
+		s = settle()
 		xcontext.Logger(ctx).Debug("demand revalidation settled",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("known_stale_reason", reason),
-			slog.Bool("fresh", fresh),
-			slog.Bool("rerun", rerun),
+			slog.Bool("fresh", s.Fresh),
+			slog.Bool("rerun", s.Rerun),
 		)
 	}()
 	h.ServeHTTP(&discardResponseWriter{}, req.Clone(ctx))
-	return false
+	return s
 }
 
 // discardResponseWriter swallows the re-entered handler's response: the
