@@ -21,6 +21,7 @@ import (
 	xenv "github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/snowplow/apis"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/testsupport/kindguard"
 	serializer "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"sigs.k8s.io/e2e-framework/klient/decoder"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
@@ -58,7 +59,9 @@ func TestMain(m *testing.M) {
 	// reapable — krateo-<pid> is collectable once that pid is gone — which keeps
 	// the orphan cleanup the shared name provided by accident and which a random
 	// name would lose.
-	clusterName = fmt.Sprintf("krateo-%d", os.Getpid())
+	clusterName = kindguard.ClusterName() // krateo-sptest-<pid>: per-process (#522), marked as ours (#742)
+	// #742 — reap orphaned krateo-<pid> clusters; delete this one on SIGINT/SIGTERM.
+	kindguard.Prepare(clusterName)
 	testenv = env.New()
 
 	testenv.Setup(
