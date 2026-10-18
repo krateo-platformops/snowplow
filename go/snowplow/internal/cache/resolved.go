@@ -2479,8 +2479,10 @@ type ResolvedCacheStats struct {
 	KnownStaleRevalidationFresh  uint64
 	KnownStaleRevalidationFailed uint64
 	KnownStaleRevalidationSkip   uint64
-	WarmKeyedPage                [b3Classes]uint64
-	WarmKeyedExtras              [b3Classes]uint64
+	// #740 — reruns an absorbed read earned, per slot (KnownStaleRevalidationSlots order).
+	KnownStaleRevalidationRerun [revalSlotKinds]uint64
+	WarmKeyedPage               [b3Classes]uint64
+	WarmKeyedExtras             [b3Classes]uint64
 
 	// Ship E (0.30.116) api-stage counters.
 	ApistageStoreTotal uint64
@@ -2577,6 +2579,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		KnownStaleRevalidationFresh:  knownStaleRevalidationFresh.Load(),
 		KnownStaleRevalidationFailed: knownStaleRevalidationFail.Load(),
 		KnownStaleRevalidationSkip:   knownStaleRevalidationSkip.Load(),
+		KnownStaleRevalidationRerun:  loadKnownStaleRevalidationRerun(),
 		WarmKeyedPage:                loadB3(&c.warmKeyedPageGauge),
 		WarmKeyedExtras:              loadB3(&c.warmKeyedExtrasGauge),
 
