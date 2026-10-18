@@ -104,6 +104,11 @@ type StaleRetrySpec struct {
 	// the chain that needed it (#740 Q3). Called under the engine lock: it must
 	// not call back into the engine.
 	Release func()
+	// Park / Resume, if set, run when the chain is abandoned (nobody views the
+	// cell) and when it is resumed (an arm, or StaleRetryResume): a D2 debt is
+	// PARKED meanwhile (architect ruling). Called under the engine lock: they
+	// must not call back into the engine.
+	Park, Resume func()
 }
 
 type staleRetryChain struct {
@@ -122,6 +127,10 @@ var (
 	staleRetryMu     sync.Mutex
 	staleRetryChains = map[string]*staleRetryChain{}
 	staleRetryWG     sync.WaitGroup
+	// staleRetryKeys mirrors staleRetryChains' keys for the lock-free probe the
+	// store's write and evict paths make (noteStaleRetryCellChanged) — they run
+	// under the store lock, which a chain's StillStale takes.
+	staleRetryKeys sync.Map
 
 	staleRetryTotal          [2][staleRetrySources]atomic.Uint64 // [kind-1][source]
 	staleRetryAbandonedNoV   atomic.Uint64
@@ -189,6 +198,7 @@ func StaleRetryFailed(key string, kind StaleRetryOutcome, dur time.Duration, spe
 	if c == nil {
 		c = &staleRetryChain{key: key}
 		staleRetryChains[key] = c
+		staleRetryKeys.Store(key, struct{}{})
 	}
 	c.spec = spec
 	c.scheduleLocked(kind, dur)
@@ -313,6 +323,9 @@ func (c *staleRetryChain) abandonLocked() {
 		c.timer = nil
 	}
 	c.abandoned = true
+	if c.spec.Park != nil {
+		c.spec.Park()
+	}
 	if c.spec.Release != nil {
 		c.spec.Release()
 	}
@@ -326,11 +339,63 @@ func (c *staleRetryChain) endLocked() {
 	}
 	if staleRetryChains[c.key] == c {
 		delete(staleRetryChains, c.key)
+		staleRetryKeys.Delete(c.key)
 	}
 	if c.spec.Release != nil {
 		c.spec.Release()
 	}
 	c.spec = StaleRetrySpec{}
+}
+
+// noteStaleRetryCellChanged is called where a cell's known-stale state ends (an
+// accepted Put, a fresh refresher settle) or the cell leaves the store: a chain
+// on key re-checks its cell, so one whose cell healed or left ends even when
+// nobody re-arms it. That bounds the chain set by the known-stale set with no
+// knob (PR-A review): an ABANDONED chain is otherwise revisited only on an arm.
+// Called under the store lock, so it only probes a sync.Map and hands the
+// re-check to its own goroutine.
+func noteStaleRetryCellChanged(key string) {
+	if _, ok := staleRetryKeys.Load(key); !ok {
+		return
+	}
+	staleRetryWG.Add(1)
+	go func() {
+		defer staleRetryWG.Done()
+		staleRetryRecheck(key)
+	}()
+}
+
+// staleRetryRecheck ends key's chain if its cell no longer needs it (healed:
+// another carrier's write; or evicted). A running attempt re-checks on its own.
+func staleRetryRecheck(key string) {
+	staleRetryMu.Lock()
+	defer staleRetryMu.Unlock()
+	c := staleRetryChains[key]
+	if c == nil || c.running {
+		return
+	}
+	stale, resident := c.spec.StillStale()
+	switch {
+	case !resident:
+		staleRetryAbandonedEvict.Add(1)
+		c.endLocked()
+	case !stale:
+		c.endLocked()
+	}
+}
+
+// StaleRetryAbandonedForTest is the number of abandoned chains held. Production
+// MUST NOT use it.
+func StaleRetryAbandonedForTest() int {
+	staleRetryMu.Lock()
+	defer staleRetryMu.Unlock()
+	n := 0
+	for _, c := range staleRetryChains {
+		if c.abandoned {
+			n++
+		}
+	}
+	return n
 }
 
 // noteStaleRetryArm resumes, with an immediate attempt, every abandoned chain
@@ -345,15 +410,49 @@ func noteStaleRetryArm(armed map[string]struct{}) {
 		if !c.abandoned || c.running || !c.dependsOnAny(armed) {
 			continue
 		}
-		if stale, resident := c.spec.StillStale(); !stale || !resident {
-			c.endLocked()
-			continue
-		}
-		c.abandoned = false
-		c.step = 0 // a new viewer: the schedule starts over
-		c.lastStep = 0
-		staleRetryResumedTotal.Add(1)
-		c.timer = staleRetryAfter(0, func() { c.wake(StaleRetryGenuine, true) })
+		c.resumeLocked()
+	}
+}
+
+// resumeLocked restarts an abandoned chain with an immediate attempt (its cell
+// still needs it) or ends it.
+func (c *staleRetryChain) resumeLocked() bool {
+	if stale, resident := c.spec.StillStale(); !stale || !resident {
+		c.endLocked()
+		return false
+	}
+	c.abandoned = false
+	c.step = 0 // a new viewer: the schedule starts over
+	c.lastStep = 0
+	staleRetryResumedTotal.Add(1)
+	if c.spec.Resume != nil {
+		c.spec.Resume()
+	}
+	c.timer = staleRetryAfter(0, func() { c.wake(StaleRetryGenuine, true) })
+	return true
+}
+
+// StaleRetryResume resumes key's ABANDONED chain with an immediate attempt —
+// a new reason to retry other than an arm (a D2 stale serve joining a parked
+// debt). false: no abandoned chain on key, or its cell no longer needs it.
+func StaleRetryResume(key string) bool {
+	staleRetryMu.Lock()
+	defer staleRetryMu.Unlock()
+	c := staleRetryChains[key]
+	if c == nil || !c.abandoned || c.running {
+		return false
+	}
+	return c.resumeLocked()
+}
+
+// StaleRetryEnd ends key's chain, scheduled or abandoned (its cell was healed by
+// a carrier the chain's spec cannot see, e.g. a D2 debt retired by another
+// fill). A running attempt finishes and finds the chain gone.
+func StaleRetryEnd(key string) {
+	staleRetryMu.Lock()
+	defer staleRetryMu.Unlock()
+	if c := staleRetryChains[key]; c != nil {
+		c.endLocked()
 	}
 }
 
@@ -489,6 +588,7 @@ func stopStaleRetryChainsForTest() {
 		}
 	}
 	staleRetryChains = map[string]*staleRetryChain{}
+	staleRetryKeys.Range(func(k, _ any) bool { staleRetryKeys.Delete(k); return true })
 	staleRetryMu.Unlock()
 }
 

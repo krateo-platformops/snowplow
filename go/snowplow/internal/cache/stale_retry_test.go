@@ -242,3 +242,33 @@ func TestStaleRetry_T_AJoinMakesTheNewestSpecTheTemplate(t *testing.T) {
 		t.Fatalf("T RED: the retry ran template %v, want the newest (second)", p.tags)
 	}
 }
+
+// R — StaleRetryResume restarts an abandoned chain at once and runs its Park /
+// Resume hooks; StaleRetryEnd ends a pending chain with no further wake.
+func TestStaleRetry_R_ResumeAndEndOnRequest(t *testing.T) {
+	clock := retryEngineSetup(t)
+	const key = "k-r"
+	p := &retryProbe{out: StaleRetryGenuine, stale: true, resident: true}
+	var parks, resumes int
+	spec := p.spec(clock, key, "a")
+	spec.Park = func() { parks++ }
+	spec.Resume = func() { resumes++ }
+	StaleRetryFailed(key, StaleRetryGenuine, 0, spec)
+	if StaleRetryResume(key) {
+		t.Fatalf("R: a scheduled (not abandoned) chain was resumed")
+	}
+	fireOne(t, clock) // no viewer: abandoned (parked)
+	if parks != 1 {
+		t.Fatalf("R: Park ran %d times on abandon, want 1", parks)
+	}
+	if !StaleRetryResume(key) || resumes != 1 {
+		t.Fatalf("R RED: StaleRetryResume did not resume the abandoned chain (resumes %d)", resumes)
+	}
+	if got := fireOne(t, clock); got != 0 {
+		t.Fatalf("R: the resumed attempt waits %v, want at once", got)
+	}
+	StaleRetryEnd(key)
+	if open, _ := StaleRetryChainOpenForTest(key); open || len(clock.Pending()) != 0 {
+		t.Fatalf("R RED: StaleRetryEnd left the chain (pending %v)", clock.Pending())
+	}
+}

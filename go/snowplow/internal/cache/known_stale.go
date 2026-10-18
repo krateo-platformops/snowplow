@@ -566,11 +566,13 @@ func endKnownStaleOnPut(ctx context.Context, key string) (t0 time.Time, sample b
 		}
 		if s.inflight {
 			if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, seq: s.seq}) {
+				noteStaleRetryCellChanged(key) // #740 — a healed cell's chain ends
 				return time.Time{}, false
 			}
 			continue
 		}
 		if r.dirty.CompareAndDelete(key, cur) {
+			noteStaleRetryCellChanged(key) // #740 — a healed cell's chain ends
 			return s.t0, true
 		}
 	}

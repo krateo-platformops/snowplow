@@ -283,6 +283,7 @@ func evictDirtyWindow(key string) {
 	if r == nil {
 		return
 	}
+	noteStaleRetryCellChanged(key) // #740 — a chain on a removed cell ends
 	cur, ok := r.dirty.LoadAndDelete(key)
 	if !ok {
 		return

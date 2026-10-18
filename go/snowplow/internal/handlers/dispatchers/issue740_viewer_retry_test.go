@@ -273,3 +273,56 @@ func TestIssue740_S5b_AKeySuppressedMidChainEndsIt(t *testing.T) {
 			open, clock.Pending(), h.custCalls.Load()-c0)
 	}
 }
+
+// S6 — bounded state (PR-A review): an ABANDONED chain is retired when its cell
+// heals through another carrier (here a change-driven refresher refresh), with
+// nobody re-arming it — the chain set never outgrows the known-stale set.
+func TestIssue740_S6_AnAbandonedChainEndsWhenTheCellHealsElsewhere(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	clock := k740Clock(t)
+	contentKey, handle := k740Shell(t, h)
+	cache.RevalidateKnownStaleInBackground(contentKey)
+	k740AwaitWake(t, clock, "first retry scheduled")
+	clock.FireNext() // nobody views it: abandoned
+	if cache.StaleRetryAbandonedForTest() != 1 {
+		t.Fatalf("PRECONDITION: %d abandoned chains, want 1", cache.StaleRetryAbandonedForTest())
+	}
+
+	h.allowBackground.Store(true)
+	h.update(k547Changed, "v2") // the next change heals the shell through the refresher
+	if !k547WaitFor(t, 10*time.Second, "shell healed", func() bool {
+		e, ok := handle.GetNoTouch(contentKey)
+		return ok && k547Reason(e.RawJSON) == "v2"
+	}) {
+		t.Fatalf("PRECONDITION: the change-driven refresh never healed the shell")
+	}
+	if !k547WaitFor(t, 5*time.Second, "abandoned chain retired", func() bool {
+		open, _ := cache.StaleRetryChainOpenForTest(contentKey)
+		return !open && cache.StaleRetryAbandonedForTest() == 0
+	}) {
+		t.Fatalf("S6 RED: the abandoned chain outlived its healed cell (abandoned=%d) — with nobody re-arming it, "+
+			"it would be held forever", cache.StaleRetryAbandonedForTest())
+	}
+}
+
+// S6b — the same when the cell is EVICTED: the chain ends, counted
+// abandoned{evicted}.
+func TestIssue740_S6b_AnAbandonedChainEndsWhenTheCellIsEvicted(t *testing.T) {
+	h := newK547Harness(t, k547DenyBackground)
+	clock := k740Clock(t)
+	contentKey, _ := k740Shell(t, h)
+	cache.RevalidateKnownStaleInBackground(contentKey)
+	k740AwaitWake(t, clock, "first retry scheduled")
+	clock.FireNext() // abandoned
+	e0 := cache.StaleRetryStatsSnapshot().AbandonedEvicted
+	cache.ResolvedCache().DeleteForTest(contentKey)
+	if !k547WaitFor(t, 5*time.Second, "abandoned chain retired", func() bool {
+		open, _ := cache.StaleRetryChainOpenForTest(contentKey)
+		return !open && cache.StaleRetryAbandonedForTest() == 0
+	}) {
+		t.Fatalf("S6b RED: the abandoned chain outlived its evicted cell (abandoned=%d)", cache.StaleRetryAbandonedForTest())
+	}
+	if got := cache.StaleRetryStatsSnapshot().AbandonedEvicted - e0; got != 1 {
+		t.Fatalf("S6b: abandoned{evicted} moved %d, want 1", got)
+	}
+}
