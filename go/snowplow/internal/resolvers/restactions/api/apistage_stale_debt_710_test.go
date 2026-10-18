@@ -178,6 +178,11 @@ func d2Push(t *testing.T, ch <-chan string, want string, d time.Duration) {
 
 func TestStale710_D2_1_KnownStaleArmableHitIsServedStaleAndItsDebtFills(t *testing.T) {
 	f := newD2Fixture(t)
+	// #754 — the debt's refill runs AT ONCE (owner ruling: never queued), so on a
+	// loaded machine it can commit before the debt_open read below: park it on
+	// the seam until the open-state assertions have run (as D2-15b does).
+	release := HoldStaleDebtRefillsForTest()
+	t.Cleanup(release)
 	v, sink := f.customer(t, "dep-1")
 	if got := fill710ManagedOf(t, v, "fsa-00000"); got != r1StaleManaged {
 		t.Fatalf("D2-1: served %d managed, want the STALE %d (show then replace)", got, r1StaleManaged)
@@ -189,6 +194,7 @@ func TestStale710_D2_1_KnownStaleArmableHitIsServedStaleAndItsDebtFills(t *testi
 		t.Fatalf("D2-1: stale_serve_total=%d debt_open=%d, want 1/1", s.ServeTotal, s.DebtOpen)
 	}
 	f.putDependent("dep-1")
+	release()
 	d2WaitDebtsClosed(t)
 	if _, _, ok := cache.KnownStale(f.contentKey); ok {
 		t.Fatalf("D2-1 RED: the debt closed but the content cell is still known-stale")
@@ -1049,5 +1055,25 @@ func TestStale710_D2_3e_AReplaceChainStopsWhenAnotherWriterReplacedTheCell(t *te
 	}
 	if e, ok := f.store.GetNoTouch("dep-3e"); !ok || string(e.RawJSON) != `{"newer":true}` {
 		t.Fatalf("D2-3e: the newer entry was touched (resident=%v)", ok)
+	}
+}
+
+// D2-1b — #754, the product side of D2-1's race: the refill commits BEFORE the
+// dependent reaches its write point (the debt closes while the sink is still
+// pending). The dependent's Commit must still replace the stale-derived cell
+// and push its armed tab.
+func TestStale710_D2_1b_ARefillThatWinsTheRaceStillReplacesAtCommit(t *testing.T) {
+	f := newD2Fixture(t)
+	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-1b": {}})
+	defer unsub()
+	f.customer(t, "dep-1b")
+	d2WaitDebtsClosed(t) // the refill won: the debt closed before the write point
+	if _, _, ok := cache.KnownStale(f.contentKey); ok {
+		t.Fatalf("PRECONDITION: the content is still known-stale after the debt closed")
+	}
+	f.storeAndCommit("dep-1b") // the dependent's write point, after the debt cleared
+	d2Push(t, ch, "dep-1b", 10*time.Second)
+	if e, ok := f.store.GetNoTouch("dep-1b"); !ok || e.StaleDerived || string(e.RawJSON) != `{"fresh":true}` {
+		t.Fatalf("D2-1b RED: a dependent committed after its debt cleared was not replaced (resident=%v)", ok)
 	}
 }
