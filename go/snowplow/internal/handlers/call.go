@@ -25,6 +25,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
@@ -196,7 +197,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// Ship D (0.30.141) — F-1: handlers.Call() is the dispatcher's
 	// fallthrough lane for GVR groups not in the
 	// dispatchers.All() map (every "raw apiserver passthrough" /call).
-	// Record BEFORE request.Do so a panicking plumbing call still
+	// Record BEFORE the dial so a panicking plumbing call still
 	// counts (AC-D.3 ordering).
 	//
 	// #443 — a raw read (raw=true) of a restactions / widgets object is a
@@ -207,7 +208,11 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		reason = cache.ReasonRawRead
 	}
 	cache.RecordApiserverFallthrough(req.Context(), reason, "")
-	rt := request.Do(req.Context(), callOpts)
+	// #726 — the dial presents the CALLER's clientconfig credential, which
+	// snowplow holds on their behalf: credhttp.Do is request.Do with a client
+	// that never follows a redirect (a token-auth clientconfig's bearer is
+	// re-added on every hop), and a refused 3xx is surfaced with its own code.
+	rt := credhttp.Do(req.Context(), callOpts)
 
 	// Audit correlation: every WRITE through /call emits a
 	// normalized AuditEvent carrying the request correlation id (see
@@ -356,7 +361,7 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 	// create) has no subresource target and is rejected. The by-name verbs
 	// already require a non-empty name in both branches above, so a valid
 	// subresource request always has a name to hang it on. RBAC is unchanged:
-	// the request carries the USER's credentials to request.Do, so the
+	// the request carries the USER's credentials to the dial, so the
 	// apiserver enforces the DISTINCT subresource RBAC verb natively (a plain
 	// grant on the resource does NOT authorize its <subresource>).
 	//
