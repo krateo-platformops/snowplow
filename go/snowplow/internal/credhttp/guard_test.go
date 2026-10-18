@@ -87,7 +87,6 @@ var allowed = map[[3]string]string{
 	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "request.HTTPClientForEndpoint"}: "endpoint client; its single caller httpClientForEndpoint applies credhttp.Client by provenance (SA dial / held credential). A named endpointRef carries its own credential and keeps the default redirect behaviour.",
 	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "transport.New"}:                 "same as above",
 	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "http.Client{}"}:                 "same as above",
-	{"internal/handlers/call.go", "ServeHTTP", "request.Do"}:                                                        "RESIDUAL #726: the /call raw passthrough dials the caller's own clientconfig through plumbing's request.Do, which builds its client internally (no CheckRedirect seam). Tracked in its own issue.",
 }
 
 type ref struct {
