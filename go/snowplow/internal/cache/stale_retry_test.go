@@ -272,3 +272,24 @@ func TestStaleRetry_R_ResumeAndEndOnRequest(t *testing.T) {
 		t.Fatalf("R RED: StaleRetryEnd left the chain (pending %v)", clock.Pending())
 	}
 }
+
+// V7b — A2: only a transient refusal's FIRST, immediate retry skips the viewer
+// gate; the next transient retry with nobody viewing abandons the chain — no
+// endless <= 5 s loop for nobody.
+func TestStaleRetry_V7b_TransientRetriesAreViewerGatedAfterTheFirst(t *testing.T) {
+	clock := retryEngineSetup(t)
+	const key = "k-v7b"
+	p := &retryProbe{out: StaleRetryTransient, stale: true, resident: true}
+	StaleRetryFailed(key, StaleRetryTransient, 0, p.spec(clock, key, "a")) // nobody armed
+	if got := fireOne(t, clock); got != 0 || p.n() != 1 {
+		t.Fatalf("V7b: the first transient retry waited %v / ran %d times, want at once / 1", got, p.n())
+	}
+	fireOne(t, clock) // the second (10 ms) transient wake: nobody views it
+	if p.n() != 1 || len(clock.Pending()) != 0 {
+		t.Fatalf("V7b RED: a transient retry ran with no viewer (attempts %d, pending %v) — only the first, immediate "+
+			"one is ungated", p.n(), clock.Pending())
+	}
+	if open, abandoned := StaleRetryChainOpenForTest(key); !open || !abandoned {
+		t.Fatalf("V7b: the chain is not abandoned (open=%v abandoned=%v)", open, abandoned)
+	}
+}

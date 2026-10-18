@@ -233,7 +233,12 @@ func (c *staleRetryChain) scheduleLocked(kind StaleRetryOutcome, dur time.Durati
 	}
 	c.abandoned = false
 	c.lastStep = d
-	c.timer = staleRetryAfter(d, func() { c.wake(kind, false) })
+	// #740 A2 — EVERY retry is viewer-gated except a transient refusal's first,
+	// immediate one (a newer change exists: one at-once retry is the cheap,
+	// correct answer); otherwise sustained refusals with nobody viewing would
+	// loop on the <= 5 s transient backoff forever.
+	gated := !(kind == StaleRetryTransient && d == 0)
+	c.timer = staleRetryAfter(d, func() { c.wake(gated) })
 }
 
 func nextTransientStep(cur time.Duration) time.Duration {
@@ -243,9 +248,9 @@ func nextTransientStep(cur time.Duration) time.Duration {
 	return min(2*cur, staleRetryTransientMax)
 }
 
-// wake runs one retry of c, unless the cell no longer needs it or, for a
-// genuine retry not forced by an arm, nobody is viewing it.
-func (c *staleRetryChain) wake(kind StaleRetryOutcome, resumed bool) {
+// wake runs one retry of c, unless the cell no longer needs it or — gated —
+// nobody is viewing it.
+func (c *staleRetryChain) wake(gated bool) {
 	staleRetryMu.Lock()
 	if staleRetryChains[c.key] != c || c.abandoned || c.running {
 		staleRetryMu.Unlock()
@@ -263,7 +268,7 @@ func (c *staleRetryChain) wake(kind StaleRetryOutcome, resumed bool) {
 		c.endLocked() // healed by another carrier
 		staleRetryMu.Unlock()
 		return
-	case kind == StaleRetryGenuine && !resumed && !c.viewedLocked():
+	case gated && !c.viewedLocked():
 		c.abandonLocked()
 		staleRetryAbandonedNoV.Add(1)
 		staleRetryMu.Unlock()
@@ -428,7 +433,7 @@ func (c *staleRetryChain) resumeLocked() bool {
 	if c.spec.Resume != nil {
 		c.spec.Resume()
 	}
-	c.timer = staleRetryAfter(0, func() { c.wake(StaleRetryGenuine, true) })
+	c.timer = staleRetryAfter(0, func() { c.wake(false) }) // an arm or a join: the viewer is here
 	return true
 }
 

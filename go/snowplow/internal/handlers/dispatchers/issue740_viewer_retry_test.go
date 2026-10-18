@@ -39,12 +39,18 @@ func k740Clock(t *testing.T) *cache.StaleRetryManualClock {
 // k740View arms key on a real /refreshes connection; the returned func closes it.
 func k740View(t *testing.T, key string) func() {
 	t.Helper()
+	return k740ViewStream(t, key).Unsub
+}
+
+// k740ViewStream is k740View returning the connection (its Keys channel).
+func k740ViewStream(t *testing.T, key string) cache.RefreshStream {
+	t.Helper()
 	st := cache.SubscribeRefreshStream(map[string]struct{}{key: {}})
 	if !cache.HasRefreshSubscriber(key) {
 		t.Fatalf("PRECONDITION: the /refreshes layer did not arm the key")
 	}
 	t.Cleanup(st.Unsub)
-	return st.Unsub
+	return st
 }
 
 // k740AwaitWake waits until exactly one wake is pending (the slot's settle runs
@@ -66,7 +72,7 @@ func TestIssue740_S1_AViewedShellRetriesOnTheBackoffAndHeals(t *testing.T) {
 	h := newK547Harness(t, k547DenyBackground)
 	clock := k740Clock(t)
 	contentKey, handle := k740Shell(t, h)
-	k740View(t, contentKey)
+	view := k740ViewStream(t, contentKey)
 	g0 := k740RetryTotal(cache.StaleRetryGenuine, cache.StaleRetryBackground)
 
 	cache.RevalidateKnownStaleInBackground(contentKey) // the first attempt: denied
@@ -77,11 +83,28 @@ func TestIssue740_S1_AViewedShellRetriesOnTheBackoffAndHeals(t *testing.T) {
 	if d := k740AwaitWake(t, clock, "second retry scheduled"); d != 2*time.Second {
 		t.Fatalf("S1 RED: the second retry waits %v, want 2 s (doubling)", d)
 	}
+	for drained := false; !drained; { // the earlier serves' pushes, if any
+		select {
+		case <-view.Keys:
+		default:
+			drained = true
+		}
+	}
 	h.allowBackground.Store(true) // the refresher identity recovers
 	clock.FireNext()              // retry #2: heals
 
 	if e, ok := handle.GetNoTouch(contentKey); !ok || k547Reason(e.RawJSON) != "v1" {
 		t.Fatalf("S1: the viewed shell did not heal on the retry after recovery")
+	}
+	// A3 — the viewer is told: event: refresh for the healed key within 1 s of
+	// the healing commit.
+	select {
+	case k := <-view.Keys:
+		if k != contentKey {
+			t.Fatalf("S1: the viewer was pushed %q, want the healed shell's key", k)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("S1 RED: the viewer got no event: refresh within 1 s of the healing commit")
 	}
 	if open, _ := cache.StaleRetryChainOpenForTest(contentKey); open || len(clock.Pending()) != 0 {
 		t.Fatalf("S1: the chain did not end on the fresh commit (pending %v)", clock.Pending())
