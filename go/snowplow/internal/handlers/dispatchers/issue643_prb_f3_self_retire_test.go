@@ -302,3 +302,20 @@ func TestIssue643_F3d_Mutation_NoDepsCheck_StaysCold(t *testing.T) {
 	}
 	t.Logf("F3d mutation (no d4) RED as required: iter-w Put %d of %d", put, h643K)
 }
+
+// #749 — the F3d deletes land after a FORCED list/watch gap (every watch
+// registers with the fake tracker 2 s late, outside the reactor lock, so the
+// writes are not serialized behind it). Without h643Setup's watch barrier the
+// two deletes are lost (the tracker never replays them) and the arm times out
+// waiting for the emptied list — the flake, made deterministic. With it the
+// setup returns only once the watch is established, and the arm is green.
+// Mutation → RED: drop the barrier wait in h643Setup.
+func TestIssue749_F3dSurvivesAForcedLateWatch(t *testing.T) {
+	prev := h643WatchDelayForTest
+	h643WatchDelayForTest = 2 * time.Second
+	t.Cleanup(func() { h643WatchDelayForTest = prev })
+	dialsB, dialsC, put := h643F3d(t, h643F3dRefresh, nil)
+	if dialsB != 0 || dialsC != 0 || put != h643K {
+		t.Fatalf("#749: under a forced late watch F3d read dialsB=%d dialsC=%d put=%d/%d, want 0/0/%d", dialsB, dialsC, put, h643K, h643K)
+	}
+}

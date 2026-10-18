@@ -59,6 +59,68 @@ func Install(dyn *dynamicfake.FakeDynamicClient) *Barrier {
 	return b
 }
 
+// InstallDelayed is Install with the tracker registration of every watch
+// deferred by d — the list/watch gap, FORCED, to prove a harness depends on
+// the barrier (#749). The reactor returns a proxy at once, so the fake's
+// reactor lock is released and writes proceed during the gap (a sleep inside
+// the reactor would hold that lock and serialize them, proving nothing). The
+// proxy registers with the tracker after d, counts the watch on the barrier
+// at that moment, and forwards its events; an event in the gap is lost
+// exactly as in a real race. Tests only.
+func InstallDelayed(dyn *dynamicfake.FakeDynamicClient, d time.Duration) *Barrier {
+	b := &Barrier{n: map[string]int{}, ready: make(chan struct{})}
+	tracker := dyn.Tracker()
+	dyn.PrependWatchReactor("*", func(a k8stesting.Action) (bool, watch.Interface, error) {
+		gvr, ns := a.GetResource(), a.GetNamespace()
+		p := &delayedWatch{out: make(chan watch.Event), stop: make(chan struct{})}
+		go func() {
+			defer close(p.out)
+			select {
+			case <-time.After(d):
+			case <-p.stop:
+				return
+			}
+			w, err := tracker.Watch(gvr, ns)
+			if err != nil {
+				return
+			}
+			defer w.Stop()
+			b.mu.Lock()
+			b.n[gvr.Resource]++
+			close(b.ready)
+			b.ready = make(chan struct{})
+			b.mu.Unlock()
+			for {
+				select {
+				case ev, ok := <-w.ResultChan():
+					if !ok {
+						return
+					}
+					select {
+					case p.out <- ev:
+					case <-p.stop:
+						return
+					}
+				case <-p.stop:
+					return
+				}
+			}
+		}()
+		return true, p, nil
+	})
+	return b
+}
+
+// delayedWatch is InstallDelayed's proxy watch.Interface.
+type delayedWatch struct {
+	out  chan watch.Event
+	stop chan struct{}
+	once sync.Once
+}
+
+func (p *delayedWatch) Stop()                          { p.once.Do(func() { close(p.stop) }) }
+func (p *delayedWatch) ResultChan() <-chan watch.Event { return p.out }
+
 // Wait blocks until each resource has at least one established watch, or
 // ctx is done.
 func (b *Barrier) Wait(ctx context.Context, resources ...string) error {

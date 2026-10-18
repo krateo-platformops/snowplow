@@ -43,6 +43,7 @@ import (
 	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
+	"github.com/krateo-platformops/snowplow/internal/testsupport/fakewatch"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -194,11 +195,14 @@ func h643ExtStage(name, path string) map[string]any {
 }
 
 type h643Env struct {
-	t        *testing.T
-	ep       *h643Endpoint
-	rw       *cache.ResourceWatcher
-	kube     *kubefake.Clientset
-	dyn      *dynamicfake.FakeDynamicClient
+	t    *testing.T
+	ep   *h643Endpoint
+	rw   *cache.ResourceWatcher
+	kube *kubefake.Clientset
+	dyn  *dynamicfake.FakeDynamicClient
+	// watches (#749) is the fakewatch barrier: setup returns only once the
+	// informers the arms mutate through dyn have an ESTABLISHED watch.
+	watches  *fakewatch.Barrier
 	deps     rePrewarmDeps
 	engine   *prewarmEngine
 	widgets  []navWidgetEntry
@@ -316,6 +320,12 @@ func h643ServeDiscovery(w http.ResponseWriter, path string) bool {
 
 // h643Setup builds the fixture. Arms that use it reassign package vars, so they
 // are not t.Parallel().
+// h643WatchDelayForTest, when set, forces the list/watch gap: every watch
+// registers with the fake tracker only after this delay (fakewatch.
+// InstallDelayed). #749's arm sets it to prove the setup's barrier is what
+// keeps a write from being lost.
+var h643WatchDelayForTest time.Duration
+
 func h643Setup(t *testing.T, o h643Opts) *h643Env {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
@@ -425,6 +435,15 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objs...)
 	env.dyn = dyn
+	// #749 — WaitForCacheSync turns true after the initial LIST, which can be
+	// BEFORE the informer's WATCH reaches the fake tracker; the tracker does not
+	// replay from a resourceVersion, so a write in that gap is lost for good
+	// (#660/#702/#689). The barrier below closes it.
+	if h643WatchDelayForTest > 0 {
+		env.watches = fakewatch.InstallDelayed(dyn, h643WatchDelayForTest)
+	} else {
+		env.watches = fakewatch.Install(dyn)
+	}
 	wctx, wcancel := context.WithCancel(context.Background())
 	rw, err := cache.NewResourceWatcher(wctx, dyn)
 	if err != nil {
@@ -468,6 +487,13 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
+	}
+	// #749 — every resource the arms mutate through dyn has an established
+	// watch before any arm writes (event-driven, bounded by the watch delay a
+	// test forces, never a fixed sleep).
+	if err := env.watches.WaitFor(10*time.Second+h643WatchDelayForTest,
+		h643RAGVR.Resource, h643WidgetGVR.Resource, h643ThingsGVR.Resource); err != nil {
+		t.Fatalf("#749: %v", err)
 	}
 	// The endpointRef Secret, served by the production Secrets informer over a
 	// fake clientset (FromInformerSecret — no apiserver Secret GET).
