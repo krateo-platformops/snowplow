@@ -169,6 +169,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// or a dependent a committed (non-inert) write point handed over. The wait is
 	// the test quiesce's join (quiesceStaleDebts), never on a resolve.
 	"StaleRetryFailed": unreachableInert443, "WaitStaleRetryForTest": unreachableInert443,
+	// #740 PR-B review — a stale serve joining a PARKED debt resumes its chain
+	// (past serveStaleWithDebt's cache.Inert check); an accepted content fill
+	// retires a debt (R1) — an inert resolve's Put is never accepted (#443 (a)).
+	"StaleRetryResume": unreachableInert443, "StaleRetryEnd": unreachableInert443,
 	// Package init wiring (the test-reset quiesce; the #710 F2 arm-time
 	// stale_to_push recorder); no resolve reaches it.
 	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,

@@ -290,11 +290,11 @@ func TestStale710_D2_18_ASubstrateFillUnderAnArmableResolveReadsThrough(t *testi
 
 func TestStale710_D2_6_ATransientRefillFailureRetriesAtOnceAndTheDebtClears(t *testing.T) {
 	f := newD2Fixture(t)
-	var calls atomic.Int64
+	var first atomic.Bool
 	orig := dispatchViaInformerFn
 	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		if calls.Add(1) == 1 {
-			// The first refill's flight: the content cell is DELETE-evicted
+		if contentDebtRefillFromContext(ctx) && first.CompareAndSwap(false, true) {
+			// The debt's first refill flight: the content cell is DELETE-evicted
 			// mid-fill, so its generation-guarded Put is refused (#189).
 			f.store.DeleteForTest(f.contentKey)
 		}
@@ -642,8 +642,8 @@ func TestStale710_V8a_AGenuinelyFailingDebtNobodyViewsIsAbandoned(t *testing.T) 
 	if got := cache.StaleRetryStatsSnapshot().AbandonedNoViewer - a0; got != 1 {
 		t.Fatalf("V8a: stale_retry_abandoned_total{no_viewer} moved %d, want 1", got)
 	}
-	if StaleServeStatsSnapshot().DebtOpen != 1 {
-		t.Fatalf("V8a: the abandoned debt must stay open (#547: served stale until a viewer resumes it)")
+	if st := StaleServeStatsSnapshot(); st.DebtOpen != 0 || st.DebtParked != 1 {
+		t.Fatalf("V8a: debt_open=%d parked=%d, want 0/1 — the abandoned debt is PARKED (kept, served stale, not overdue)", st.DebtOpen, st.DebtParked)
 	}
 	dispatchViaInformerFn = orig
 	f.putDependent("dep-v8a-viewer") // unrelated arm: not a dependent, resumes nothing
@@ -789,8 +789,265 @@ func TestStale710_V8c_AFailingDebtStopsWhenItsLastViewerLeaves(t *testing.T) {
 	if calls.Load() != c0 {
 		t.Fatalf("V8c RED: a refill dispatched after the last viewer left")
 	}
-	if StaleServeStatsSnapshot().DebtOpen != 1 {
-		t.Fatalf("V8c: the abandoned debt must stay open (served stale until a viewer resumes it)")
+	if st := StaleServeStatsSnapshot(); st.DebtOpen != 0 || st.DebtParked != 1 {
+		t.Fatalf("V8c: debt_open=%d parked=%d, want 0/1 — the abandoned debt is PARKED", st.DebtOpen, st.DebtParked)
 	}
 	dispatchViaInformerFn = orig
+}
+
+// --- #740 PR-B review: parked debts, R1 retirement, the replace chain ---------
+
+// d2Parked opens a debt whose refill keeps failing, with one committed but
+// UNARMED dependent, and parks it (its first retry finds no viewer). It returns
+// the manual engine clock, a switch that heals the upstream and the seamed debt
+// clock's base.
+func d2Parked(t *testing.T, f *d2Fixture, dep string) (*cache.StaleRetryManualClock, func(), *atomic.Int64) {
+	t.Helper()
+	clock := cache.NewStaleRetryManualClockForTest()
+	cache.SetStaleRetryClockForTest(clock)
+	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
+	var debtNow atomic.Int64
+	debtNow.Store(time.Now().UnixNano())
+	setStaleClockForTest(func() time.Time { return time.Unix(0, debtNow.Load()) })
+	t.Cleanup(func() { setStaleClockForTest(nil) })
+	var fail atomic.Bool
+	fail.Store(true)
+	orig := dispatchViaInformerFn
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+		if fail.Load() {
+			return nil, false
+		}
+		return orig(ctx, call)
+	}
+	t.Cleanup(func() { dispatchViaInformerFn = orig })
+	f.customer(t, dep)
+	f.storeAndCommit(dep)
+	if !fill710WaitFor(10*time.Second, func() bool { return len(clock.Pending()) == 1 }) {
+		t.Fatalf("PRECONDITION: the first retry was never scheduled (%+v)", StaleServeStatsSnapshot())
+	}
+	clock.FireNext() // nobody views a dependent: parked
+	if st := StaleServeStatsSnapshot(); st.DebtParked != 1 || st.DebtOpen != 0 {
+		t.Fatalf("PRECONDITION: debt_open=%d parked=%d, want 0/1", st.DebtOpen, st.DebtParked)
+	}
+	return clock, func() { fail.Store(false) }, &debtNow
+}
+
+// D2-12b — a PARKED debt is not overdue: past 10 s with nobody viewing it,
+// stale_overdue_total does not move and the oldest-age gauge reads 0.
+// Mutation → RED: the overdue scan ignores parked.
+func TestStale710_D2_12b_AParkedDebtIsNotOverdue(t *testing.T) {
+	f := newD2Fixture(t)
+	_, heal, debtNow := d2Parked(t, f, "dep-12b")
+	ov0 := StaleServeStatsSnapshot().OverdueTotal
+	debtNow.Add(int64(30 * time.Second))
+	scanStaleOverdue()
+	if st := StaleServeStatsSnapshot(); st.OverdueTotal != ov0 || st.DebtOldestAgeMS != 0 {
+		t.Fatalf("D2-12b RED: a parked debt read overdue (+%d) / oldest_age=%d — nobody views it, its clock is stopped",
+			st.OverdueTotal-ov0, st.DebtOldestAgeMS)
+	}
+	heal()
+}
+
+// D2-12c — a resume (a dependent's arm) RESTARTS the overdue clock: overdue at
+// resume+10 s, not at the resume.
+func TestStale710_D2_12c_AResumeRestartsTheOverdueClock(t *testing.T) {
+	f := newD2Fixture(t)
+	_, heal, debtNow := d2Parked(t, f, "dep-12c")
+	ov0 := StaleServeStatsSnapshot().OverdueTotal
+	debtNow.Add(int64(20 * time.Second)) // parked for 20 s
+	_, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-12c": {}})
+	defer unsub()
+	if st := StaleServeStatsSnapshot(); st.DebtOpen != 1 || st.DebtParked != 0 {
+		t.Fatalf("D2-12c: the arm did not resume the parked debt (open=%d parked=%d)", st.DebtOpen, st.DebtParked)
+	}
+	debtNow.Add(int64(5 * time.Second))
+	scanStaleOverdue()
+	if got := StaleServeStatsSnapshot().OverdueTotal - ov0; got != 0 {
+		t.Fatalf("D2-12c RED: overdue +%d at resume+5 s — the clock must restart at the resume, not count the parked time", got)
+	}
+	debtNow.Add(int64(6 * time.Second))
+	scanStaleOverdue()
+	if got := StaleServeStatsSnapshot().OverdueTotal - ov0; got != 1 {
+		t.Fatalf("D2-12c: overdue +%d at resume+11 s, want 1", got)
+	}
+	heal()
+}
+
+// D2-12d — a new stale serve JOINING a parked debt resumes it: an immediate
+// attempt, resumed_total +1.
+func TestStale710_D2_12d_AJoinResumesAParkedDebt(t *testing.T) {
+	f := newD2Fixture(t)
+	clock, heal, _ := d2Parked(t, f, "dep-12d")
+	r0 := cache.StaleRetryStatsSnapshot().Resumed
+	f.customer(t, "dep-12d-2") // another stale serve joins the debt
+	if got := cache.StaleRetryStatsSnapshot().Resumed - r0; got != 1 {
+		t.Fatalf("D2-12d RED: a stale serve joining the parked debt did not resume it (resumed +%d)", got)
+	}
+	if p := clock.Pending(); len(p) != 1 || p[0] != 0 {
+		t.Fatalf("D2-12d: the resume scheduled %v, want one immediate attempt", p)
+	}
+	if st := StaleServeStatsSnapshot(); st.DebtOpen != 1 || st.DebtParked != 0 {
+		t.Fatalf("D2-12d: open=%d parked=%d after the resume, want 1/0", st.DebtOpen, st.DebtParked)
+	}
+	heal()
+	clock.FireNext()
+	d2WaitDebtsClosed(t)
+}
+
+// D2-12e — overdue counts once per VIEWED episode: two episodes past 10 s → +2.
+func TestStale710_D2_12e_TwoViewedEpisodesAreOverdueTwice(t *testing.T) {
+	f := newD2Fixture(t)
+	_, heal, debtNow := d2Parked(t, f, "dep-12e")
+	ov0 := StaleServeStatsSnapshot().OverdueTotal
+	for ep := 1; ep <= 2; ep++ {
+		_, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-12e": {}}) // viewed: resumed
+		debtNow.Add(int64(11 * time.Second))
+		scanStaleOverdue()
+		scanStaleOverdue()
+		if got := StaleServeStatsSnapshot().OverdueTotal - ov0; got != uint64(ep) {
+			t.Fatalf("D2-12e: overdue +%d after viewed episode %d, want %d (once per episode)", got, ep, ep)
+		}
+		unsub() // the viewer leaves: parked again
+		if st := StaleServeStatsSnapshot(); st.DebtParked != 1 {
+			t.Fatalf("D2-12e: episode %d's end did not park the debt (parked=%d)", ep, st.DebtParked)
+		}
+	}
+	heal()
+}
+
+// D2-20 — R1: a REFRESHER fill of the content (refresh-forced) retires a
+// parked debt through the G2 bridge: open, parked and oldest_age all 0, the
+// chain ends, and a dependent tab arming afterwards gets its refresh (the
+// owed-push mark).
+// Mutations → RED: own-refill-only retirement; startSeq ignored (D2-20c).
+func TestStale710_D2_20_ARefresherFillRetiresAParkedDebt(t *testing.T) {
+	f := newD2Fixture(t)
+	_, heal, _ := d2Parked(t, f, "dep-20")
+	heal()
+	rctx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolveOrigin(r1Ctx(), cache.BackgroundOriginRefresher), r1FsaGVR)
+	if _, _, ok, err := apistageContentServe(rctx, f.store, fill710ListCall(), false); err != nil || !ok {
+		t.Fatalf("PRECONDITION: the refresher fill failed: ok=%v err=%v", ok, err)
+	}
+	d2RequireRetired(t, f, "D2-20", "dep-20")
+}
+
+// D2-20b — R1 via a customer READ-THROUGH (a non-armable read).
+func TestStale710_D2_20b_AReadThroughRetiresAParkedDebt(t *testing.T) {
+	f := newD2Fixture(t)
+	_, heal, _ := d2Parked(t, f, "dep-20b")
+	heal()
+	if _, _, ok, err := apistageContentServe(r1Ctx(), f.store, fill710ListCall(), false); err != nil || !ok {
+		t.Fatalf("PRECONDITION: the read-through failed: ok=%v err=%v", ok, err)
+	}
+	d2RequireRetired(t, f, "D2-20b", "dep-20b")
+}
+
+func d2RequireRetired(t *testing.T, f *d2Fixture, arm, dep string) {
+	t.Helper()
+	if !fill710WaitFor(10*time.Second, func() bool {
+		st := StaleServeStatsSnapshot()
+		return st.DebtOpen == 0 && st.DebtParked == 0
+	}) {
+		t.Fatalf("%s RED: the debt survived an accepted fill of its content (%+v) — R1: any accepted fill at or after "+
+			"its mark retires it", arm, StaleServeStatsSnapshot())
+	}
+	scanStaleOverdue()
+	if st := StaleServeStatsSnapshot(); st.DebtOldestAgeMS != 0 {
+		t.Fatalf("%s: oldest_age=%d after the retire, want 0", arm, st.DebtOldestAgeMS)
+	}
+	if open, _ := cache.StaleRetryChainOpenForTest(f.contentKey); open {
+		t.Fatalf("%s: the retired debt's chain is still held", arm)
+	}
+	if !fill710WaitFor(10*time.Second, func() bool {
+		e, ok := f.store.GetNoTouch(dep)
+		return ok && !e.StaleDerived
+	}) {
+		t.Fatalf("%s: the dependent was not replaced by the G2 bridge", arm)
+	}
+	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{dep: {}})
+	defer unsub()
+	d2Push(t, ch, dep, 10*time.Second)
+}
+
+// D2-20c — R1's epoch rule: a fill whose epoch is BEFORE the debt's mark does
+// not retire it; one at the mark does.
+func TestStale710_D2_20c_AFillBeforeTheMarkDoesNotRetire(t *testing.T) {
+	f := newD2Fixture(t)
+	_, heal, _ := d2Parked(t, f, "dep-20c")
+	defer heal()
+	staleDebtsMu.Lock()
+	d := staleDebts[f.contentKey]
+	staleDebtsMu.Unlock()
+	if d == nil || d.markSeq == 0 {
+		t.Fatalf("PRECONDITION: no parked debt with a mark")
+	}
+	retireStaleDebtOnFill(f.contentKey, d.markSeq-1)
+	if st := StaleServeStatsSnapshot(); st.DebtParked != 1 {
+		t.Fatalf("D2-20c RED: a fill that began before the mark retired the debt (%+v)", st)
+	}
+	retireStaleDebtOnFill(f.contentKey, d.markSeq)
+	if st := StaleServeStatsSnapshot(); st.DebtParked != 0 || st.DebtOpen != 0 {
+		t.Fatalf("D2-20c: a fill at the mark did not retire the debt (%+v)", st)
+	}
+}
+
+// D2-3c(b) — dev-710: a failed replace with NO viewer: its first retry finds
+// nobody — no re-resolve, no pending wake, the chain abandoned, the cell kept
+// resident and stale-derived.
+func TestStale710_D2_3cb_AFailedReplaceNobodyViewsIsAbandoned(t *testing.T) {
+	f := newD2Fixture(t)
+	clock := cache.NewStaleRetryManualClockForTest()
+	cache.SetStaleRetryClockForTest(clock)
+	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
+	f.failReN.Store(-1)
+	f.customer(t, "dep-3cb")
+	f.storeAndCommit("dep-3cb") // no tab
+	if !fill710WaitFor(10*time.Second, func() bool { return len(clock.Pending()) == 1 }) {
+		t.Fatalf("D2-3c(b): the first replace retry was never scheduled")
+	}
+	r0 := f.rereso.Load()
+	clock.FireNext()
+	if f.rereso.Load() != r0 || len(clock.Pending()) != 0 {
+		t.Fatalf("D2-3c(b) RED: a replace nobody views was retried (re-resolves +%d, pending %v)", f.rereso.Load()-r0, clock.Pending())
+	}
+	if open, abandoned := cache.StaleRetryChainOpenForTest("dep-3cb"); !open || !abandoned {
+		t.Fatalf("D2-3c(b): the replace chain is not abandoned (open=%v abandoned=%v)", open, abandoned)
+	}
+	if e, ok := f.store.GetNoTouch("dep-3cb"); !ok || !e.StaleDerived {
+		t.Fatalf("D2-3c(b): the cell must stay resident and stale-derived (#547, never evicted on failure)")
+	}
+}
+
+// D2-3e — the replace chain's StillStale is a REAL check: another writer
+// replaces the dependent mid-chain → the chain stops with no further attempt
+// (no re-resolve, no publish) and the newer entry is untouched.
+// Mutation → RED: StillStale always true (the attempt runs and publishes).
+func TestStale710_D2_3e_AReplaceChainStopsWhenAnotherWriterReplacedTheCell(t *testing.T) {
+	f := newD2Fixture(t)
+	clock := cache.NewStaleRetryManualClockForTest()
+	cache.SetStaleRetryClockForTest(clock)
+	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
+	f.failReN.Store(-1)
+	_, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-3e": {}})
+	defer unsub()
+	f.customer(t, "dep-3e")
+	f.storeAndCommit("dep-3e")
+	if !fill710WaitFor(10*time.Second, func() bool { return len(clock.Pending()) == 1 }) {
+		t.Fatalf("D2-3e: the first replace retry was never scheduled")
+	}
+	newer := &cache.ResolvedEntry{RawJSON: []byte(`{"newer":true}`),
+		Inputs: &cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Namespace: "d2", Name: "dep-3e"}}
+	f.store.Put("dep-3e", newer) // another writer replaced the stale-derived cell
+	r0, p0 := f.rereso.Load(), StaleServeStatsSnapshot().PushTotal
+	clock.FireNext()
+	if f.rereso.Load() != r0 || StaleServeStatsSnapshot().PushTotal != p0 || len(clock.Pending()) != 0 {
+		t.Fatalf("D2-3e RED: the replace chain ran on after another writer replaced the cell (re-resolves +%d, pushes +%d, pending %v)",
+			f.rereso.Load()-r0, StaleServeStatsSnapshot().PushTotal-p0, clock.Pending())
+	}
+	if open, _ := cache.StaleRetryChainOpenForTest("dep-3e"); open {
+		t.Fatalf("D2-3e: the replace chain is still held")
+	}
+	if e, ok := f.store.GetNoTouch("dep-3e"); !ok || string(e.RawJSON) != `{"newer":true}` {
+		t.Fatalf("D2-3e: the newer entry was touched (resident=%v)", ok)
+	}
 }

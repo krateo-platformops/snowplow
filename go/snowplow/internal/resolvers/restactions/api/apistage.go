@@ -922,6 +922,10 @@ func apistageContentServeAttempt(
 		// #710 PR-1 — hand the result to the joiners now: the envelope and the
 		// parsed items are immutable from here on.
 		noteFillOutcome(ctx, entryRef != nil, flight.startSeq)
+		if entryRef != nil {
+			// #740 R1 — ANY accepted fill at or after a debt's mark retires it.
+			retireStaleDebtOnFill(contentKey, flight.startSeq)
+		}
 		flight.complete(contentFlightResult{
 			ok:         true,
 			envelope:   envelope,

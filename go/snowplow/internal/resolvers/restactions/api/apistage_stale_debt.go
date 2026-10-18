@@ -163,9 +163,18 @@ type staleDebt struct {
 	gvr        string
 	call       httpcall.RequestOptions
 	markSeq    uint64
+	// opened starts the overdue clock of the current VIEWED episode: the first
+	// stale serve, then each resume (architect ruling, #740).
 	opened     time.Time
 	dependents map[*cache.StaleServeSink]staleDependent
 	overdue    bool
+	// parked (#740): its refill chain was abandoned because nobody views a
+	// dependent. The cell is kept and served, the record stays, and the overdue
+	// clock stops; an arm of a dependent or a new stale serve joining it resumes
+	// it. resumedAt is the latest resume: a resumed debt's stale_to_push is
+	// measured from it.
+	parked    bool
+	resumedAt time.Time
 }
 
 // staleReplace is one committed dependent whose replace is in flight (it may
@@ -203,7 +212,15 @@ func serveStaleWithDebt(ctx context.Context, sink *cache.StaleServeSink, store *
 		return nil, false // a dry run never opens a debt
 	}
 	staleDebtsMu.Lock()
-	defer staleDebtsMu.Unlock()
+	var resume string
+	defer func() {
+		staleDebtsMu.Unlock()
+		if resume != "" {
+			// #740 — a new stale serve joining a PARKED debt is a new reason to
+			// retry: resume its chain with an immediate attempt.
+			cache.StaleRetryResume(resume)
+		}
+	}()
 	seq, t0, ok := cache.KnownStaleMark(k)
 	if !ok {
 		return nil, false
@@ -235,6 +252,9 @@ func serveStaleWithDebt(ctx context.Context, sink *cache.StaleServeSink, store *
 	} else if seq > d.markSeq {
 		// A later mark: the refill must now start at or after it.
 		d.markSeq = seq
+	}
+	if d.parked {
+		resume = k
 	}
 	if _, dup := d.dependents[sink]; !dup {
 		d.dependents[sink] = staleDependent{servedAt: now}
@@ -308,7 +328,45 @@ func debtRetrySpec(d *staleDebt) cache.StaleRetrySpec {
 			defer staleDebtsMu.Unlock()
 			return staleDebts[d.contentKey] == d, true
 		},
+		Park: func() {
+			staleDebtsMu.Lock()
+			defer staleDebtsMu.Unlock()
+			if staleDebts[d.contentKey] == d && !d.parked {
+				d.parked = true
+				staleDebtOpen.Add(-1)
+				staleDebtParked.Add(1)
+			}
+		},
+		Resume: func() {
+			staleDebtsMu.Lock()
+			defer staleDebtsMu.Unlock()
+			if staleDebts[d.contentKey] == d && d.parked {
+				now := staleNow()
+				d.parked = false
+				d.opened, d.overdue, d.resumedAt = now, false, now // a new viewed episode
+				staleDebtParked.Add(-1)
+				staleDebtOpen.Add(1)
+			}
+		},
 	}
+}
+
+// retireStaleDebtOnFill is R1 (#740, architect ruling): ANY accepted fill of
+// content key k whose epoch is at or after k's debt's mark retires the debt —
+// its own refill, the refresher's forced fill, a customer read-through —
+// through the same G2 bridge as its own commit (replace the dependents and
+// publish), parked or not, and ends its retry chain. Called at the leader's
+// accepted Put; a fill that started before the mark proves nothing.
+func retireStaleDebtOnFill(k string, startSeq uint64) {
+	staleDebtsMu.Lock()
+	d := staleDebts[k]
+	retire := d != nil && startSeq >= d.markSeq
+	staleDebtsMu.Unlock()
+	if !retire {
+		return
+	}
+	clearStaleDebt(d)
+	cache.StaleRetryEnd(k)
 }
 
 // staleDebtRefillOnce runs one refill attempt through the ordinary content
@@ -362,7 +420,12 @@ func clearStaleDebt(d *staleDebt) {
 		return
 	}
 	delete(staleDebts, d.contentKey)
-	staleDebtOpen.Add(-1)
+	if d.parked {
+		staleDebtParked.Add(-1)
+	} else {
+		staleDebtOpen.Add(-1)
+	}
+	resumedAt := d.resumedAt
 	sinks := make([]*cache.StaleServeSink, 0, len(d.dependents))
 	for sink := range d.dependents {
 		sinks = append(sinks, sink)
@@ -370,7 +433,7 @@ func clearStaleDebt(d *staleDebt) {
 	staleDebtsMu.Unlock()
 	for _, sink := range sinks {
 		if sink.DebtCleared() {
-			goReplaceStaleDependent(sink)
+			goReplaceStaleDependent(sink, resumedAt)
 		}
 	}
 }
@@ -381,7 +444,7 @@ func clearStaleDebt(d *staleDebt) {
 // cleared, replaces the cell now. Call it before writing the body.
 func CommitStaleServe(sink *cache.StaleServeSink) {
 	if sink.Commit() {
-		goReplaceStaleDependent(sink)
+		goReplaceStaleDependent(sink, time.Time{})
 	}
 }
 
@@ -396,11 +459,14 @@ func WithdrawStaleServe(sink *cache.StaleServeSink) {
 	}
 }
 
-func goReplaceStaleDependent(sink *cache.StaleServeSink) {
+// goReplaceStaleDependent replaces sink's cell on its own goroutine. from, when
+// later than the serve, is the resume a parked debt cleared after: its
+// stale_to_push is measured from there (architect ruling, #740).
+func goReplaceStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 	staleDebtWG.Add(1)
 	go func() {
 		defer staleDebtWG.Done()
-		replaceStaleDependent(sink)
+		replaceStaleDependent(sink, from)
 	}()
 }
 
@@ -421,7 +487,7 @@ func goReplaceStaleDependent(sink *cache.StaleServeSink) {
 //
 // A tab that arms after this publish is served by the owed-push mark at arm
 // time (cache.SubscribeRefreshStream).
-func replaceStaleDependent(sink *cache.StaleServeSink) {
+func replaceStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 	l1Key := sink.L1Key()
 	staleDebtsMu.Lock()
 	staleReplacing[sink] = &staleReplace{key: l1Key, servedAt: sink.ServedAt()}
@@ -432,16 +498,16 @@ func replaceStaleDependent(sink *cache.StaleServeSink) {
 		// cell's viewer-gated retry chain; it stays in staleReplacing (overdue
 		// scan) until the chain lets go of it.
 		staleReplaceRetries.Add(1)
-		cache.StaleRetryFailed(l1Key, cache.StaleRetryGenuine, time.Since(start), replaceRetrySpec(sink))
+		cache.StaleRetryFailed(l1Key, cache.StaleRetryGenuine, time.Since(start), replaceRetrySpec(sink, from))
 		return
 	}
-	finishStaleReplace(sink)
+	finishStaleReplace(sink, from)
 }
 
 // replaceRetrySpec is a failed dependent replace's chain: each attempt is one
 // re-resolve (publishing on success); its viewer is the dependent cell's own
 // armed key; letting go of it ends the overdue tracking.
-func replaceRetrySpec(sink *cache.StaleServeSink) cache.StaleRetrySpec {
+func replaceRetrySpec(sink *cache.StaleServeSink, from time.Time) cache.StaleRetrySpec {
 	l1Key := sink.L1Key()
 	return cache.StaleRetrySpec{
 		Source: cache.StaleRetryDebt,
@@ -450,11 +516,22 @@ func replaceRetrySpec(sink *cache.StaleServeSink) cache.StaleRetrySpec {
 				staleReplaceRetries.Add(1)
 				return cache.StaleRetryGenuine
 			}
-			finishStaleReplace(sink)
+			finishStaleReplace(sink, from)
 			return cache.StaleRetryFresh
 		},
 		Dependents: func() []string { return []string{l1Key} },
-		StillStale: func() (bool, bool) { return true, true }, // the attempt itself sees a replaced / evicted cell
+		// The chain lasts while the dependent cell is still the stale-derived
+		// body: once another writer replaced it (or it left the store) there is
+		// nothing to replace, and the newer entry is never touched (#740).
+		StillStale: func() (bool, bool) {
+			store := cache.ResolvedCache()
+			if store == nil {
+				return false, false
+			}
+			//serve-probe: D2 replace chain — is the dependent cell still stale-derived, serves no body
+			e, ok := store.GetNoTouch(l1Key)
+			return ok && e != nil && e.StaleDerived, ok
+		},
 		Release: func() {
 			staleDebtsMu.Lock()
 			delete(staleReplacing, sink)
@@ -493,14 +570,17 @@ func replaceStaleDependentOnce(sink *cache.StaleServeSink) bool {
 
 // finishStaleReplace publishes a done replace's /refreshes signal and stops its
 // overdue tracking.
-func finishStaleReplace(sink *cache.StaleServeSink) {
+func finishStaleReplace(sink *cache.StaleServeSink, from time.Time) {
 	l1Key := sink.L1Key()
 	staleDebtsMu.Lock()
 	delete(staleReplacing, sink)
 	staleDebtsMu.Unlock()
+	if from.Before(sink.ServedAt()) {
+		from = sink.ServedAt()
+	}
 	if cache.HasRefreshSubscriber(l1Key) {
 		stalePushTotal.Add(1)
-		staleToPushHist.record(staleNow().Sub(sink.ServedAt()).Milliseconds())
+		staleToPushHist.record(staleNow().Sub(from).Milliseconds())
 	} else {
 		// Not armed yet: the owed-push mark announces it when the tab arms.
 		stalePushUnarmed.Add(1)
@@ -534,6 +614,9 @@ func scanStaleOverdue() {
 	var oldest int64
 	var newly []*staleDebt
 	for _, d := range staleDebts {
+		if d.parked {
+			continue // #740 — parked: nobody views it, its overdue clock is stopped
+		}
 		age := now.Sub(d.opened).Milliseconds()
 		oldest = max(oldest, age)
 		if !d.overdue && age >= staleMaxMS {
@@ -580,8 +663,11 @@ func scanStaleOverdue() {
 // --- metrics (G3) -------------------------------------------------------------
 
 var (
-	staleServeTotal          atomic.Uint64
-	staleDebtOpen            atomic.Int64
+	staleServeTotal atomic.Uint64
+	staleDebtOpen   atomic.Int64
+	// staleDebtParked (#740): debts whose refill chain is parked (nobody views a
+	// dependent). Not an alert.
+	staleDebtParked          atomic.Int64
 	staleDebtRetries         atomic.Uint64
 	staleOverdueTotal        atomic.Uint64
 	staleDebtOldestAge       atomic.Int64
@@ -633,6 +719,7 @@ func quiesceStaleDebts() {
 	staleReplacing = map[*cache.StaleServeSink]*staleReplace{}
 	staleDebtsMu.Unlock()
 	staleDebtOpen.Store(0)
+	staleDebtParked.Store(0)
 	staleDebtStopMu.Lock()
 	staleDebtStop = make(chan struct{})
 	staleDebtStopMu.Unlock()
@@ -642,8 +729,10 @@ func quiesceStaleDebts() {
 // keys and the OTLP callback.
 type StaleServeStats struct {
 	// ServeTotal is stale_serve_total{reason="known_stale"} (the closed set).
-	ServeTotal          uint64
+	ServeTotal uint64
+	// DebtOpen counts ACTIVE debts only; parked ones are DebtParked (#740).
 	DebtOpen            int64
+	DebtParked          int64
 	DebtRetries         uint64
 	OverdueTotal        uint64
 	DebtOldestAgeMS     int64
@@ -668,6 +757,7 @@ func StaleServeStatsSnapshot() StaleServeStats {
 	return StaleServeStats{
 		ServeTotal:          staleServeTotal.Load(),
 		DebtOpen:            staleDebtOpen.Load(),
+		DebtParked:          staleDebtParked.Load(),
 		DebtRetries:         staleDebtRetries.Load(),
 		OverdueTotal:        staleOverdueTotal.Load(),
 		DebtOldestAgeMS:     staleDebtOldestAge.Load(),
@@ -709,6 +799,9 @@ func registerStaleExpvar() {
 		}))
 		expvar.Publish("snowplow_apistage_stale_debt_open", expvar.Func(func() any {
 			return staleDebtOpen.Load()
+		}))
+		expvar.Publish("snowplow_apistage_stale_debt_parked", expvar.Func(func() any {
+			return staleDebtParked.Load()
 		}))
 		expvar.Publish("snowplow_apistage_stale_debt_retries_total", expvar.Func(func() any {
 			return staleDebtRetries.Load()
@@ -794,6 +887,7 @@ func ResetStaleServeForTest() {
 	staleReplaceRetries.Store(0)
 	staleServeTotal.Store(0)
 	staleDebtOpen.Store(0)
+	staleDebtParked.Store(0)
 	staleDebtRetries.Store(0)
 	staleOverdueTotal.Store(0)
 	staleDebtOldestAge.Store(0)
