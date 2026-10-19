@@ -140,9 +140,20 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
               "lastState": ({"terminated": {"reason": "OOMKilled", "exitCode": 137,
                                             "finishedAt": "2026-10-14T15:04:53Z"}}
                             if restarted else {})}
-        print(json.dumps({"items": [{"metadata": {"name": "snowplow-abc"},
-                                     "spec": {"containers": [{"resources": {"limits": {"memory": "8Gi"}}}]},
-                                     "status": {"containerStatuses": [cs]}}]}))
+        pods = [{"metadata": {"name": "snowplow-abc"},
+                 "spec": {"containers": [{"resources": {"limits": {"memory": "8Gi"}}}]},
+                 "status": {"containerStatuses": [cs]}}]
+        # FAKE_TERMINATING_READS=N: the first N reads also list the old
+        # ReplicaSet's Terminating pod (old digest) FIRST; -1 = it never goes.
+        tr = int(os.environ.get("FAKE_TERMINATING_READS", "0"))
+        if tr < 0 or n < tr:
+            old = {"name": "snowplow", "ready": False, "restartCount": 0,
+                   "imageID": "ghcr.io/krateo-platformops/snowplow@sha256:" + "ee" * 32}
+            pods.insert(0, {"metadata": {"name": "snowplow-old",
+                                         "deletionTimestamp": "2026-10-19T08:00:00Z"},
+                            "spec": {"containers": [{}]},
+                            "status": {"containerStatuses": [old]}})
+        print(json.dumps({"items": pods}))
         sys.exit(0)
     if a[:2] == ["top", "pod"]:
         print("snowplow-abc 120m 650Mi"); sys.exit(0)

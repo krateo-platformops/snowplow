@@ -355,3 +355,89 @@ def test_a_restart_turns_the_new_q234_checks_into_restarted_fails():
                  "run8.740.parked_vs_overdue"):
         c = next(x for x in checks if x["check"] == name)
         assert c["result"] == "FAIL" and c["why"].startswith("RESTARTED")
+
+
+# ─── reviewer-small on 2cd1827f: Terminating leftovers, missing max_ms ──────
+
+
+def _old_and_new():
+    old = _pod("snowplow-old", f"ghcr.io/x/snowplow@{OTHER_DIGEST}", terminating=True)
+    new = _pod("snowplow-new", f"ghcr.io/x/snowplow@{D}")
+    for p in (old, new):
+        p["status"]["containerStatuses"][0]["restartCount"] = 0
+    return old, new
+
+
+def test_pod_record_skips_a_terminating_old_pod_that_sorts_first():
+    """items[0] is the old ReplicaSet's Terminating pod (old digest): the
+    before-record must be the live pod, so the run is NOT INVALID."""
+    old, new = _old_and_new()
+    gate = load606.image_digest_gate({"items": [old, new]}, D)
+    before = load606.pod_record({"items": [old, new]}, "before")
+    after = load606.pod_record({"items": [new]}, "after")
+    assert before["pod"] == "snowplow-new" and before["digest"] == D
+    r = load606.evaluate([], [], [], snowplow_pods=[before, after],
+                         expected_digest=D, image_digests=[gate])
+    v = {c["check"]: c for c in r["validity"]}
+    assert v["snowplow.image_digest"]["result"] == "PASS"
+    assert v["snowplow.restarts_during_measure"]["result"] == "PASS"
+
+
+def test_pod_record_with_only_terminating_pods_is_unknown_not_a_pass():
+    old, new = _old_and_new()
+    rec = load606.pod_record({"items": [old]}, "before")
+    assert rec["pod"] is None and rec["terminating_only"]
+    after = load606.pod_record({"items": [new]}, "after")
+    assert load606.restart_check([rec, after])["result"] == "FAIL"
+
+
+def test_gate_with_require_settled_is_unsettled_while_a_leftover_remains():
+    old, new = _old_and_new()
+    rec = load606.image_digest_gate({"items": [old, new]}, D, require_settled=True)
+    assert rec["result"] == "UNSETTLED" and rec["terminating"] == ["snowplow-old"]
+    assert load606.image_digest_gate({"items": [new]}, D, require_settled=True)["result"] == "MATCH"
+
+
+def test_run606_waits_for_the_terminating_leftover_then_is_not_invalid(harness):
+    env, state, ambient, tmp = harness
+    env = _env483(env)
+    env.update(FAKE_483="pass", FAKE_KOG="1", PREFLIGHT_POLL_S="0.1",
+               FAKE_TERMINATING_READS="2", DIGEST_POLL_S="0.1", DIGEST_SETTLE_S="30")
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
+                       capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+    assert "waiting for Terminating snowplow pod(s) to go (snowplow-old)" in p.stderr
+    assert f"image digest MATCH: every live snowplow pod runs {FAKE_DIGEST}" in p.stderr
+    v = json.loads((tmp / "out" / "verdict.json").read_text())
+    val = {c["check"]: c for c in v["validity"]}
+    assert val["snowplow.image_digest"]["result"] == "PASS"
+    assert val["snowplow.restarts_during_measure"]["result"] == "PASS"
+    assert v["report"]["image_digest"]["gate"][0]["terminating"] == []
+
+
+def test_run606_leftover_that_never_clears_fails_clearly_before_load(harness):
+    env, state, ambient, tmp = harness
+    env = _env483(env)
+    env.update(FAKE_483="pass", FAKE_KOG="1", PREFLIGHT_POLL_S="0.1",
+               FAKE_TERMINATING_READS="-1", DIGEST_POLL_S="0.1", DIGEST_SETTLE_S="1")
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
+                       capture_output=True, text=True, timeout=300)
+    assert p.returncode != 0
+    assert "a snowplow pod is still Terminating after 1s" in p.stderr
+    assert "FAILED: rollout leftovers did not clear; no load is applied" in p.stderr
+    assert "=== step measure ===" not in p.stderr
+    rec = json.loads((tmp / "out" / "image-digest.jsonl").read_text())
+    assert rec["result"] == "UNSETTLED" and rec["terminating"] == ["snowplow-old"]
+    gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
+    assert gcl[-1] == ["container", "clusters", "delete"]
+
+
+@pytest.mark.parametrize("max_ms", ["absent", None])
+def test_stale_to_push_with_pushes_but_no_max_fails_the_max_bar(max_ms):
+    h = H2b(100, 100, 0)
+    if max_ms == "absent":
+        del h["max_ms"]
+    else:
+        h["max_ms"] = max_ms
+    _, c = _checks(**{K["stale_to_push"]: h})
+    assert c["run8.stale_to_push.max"]["result"] == "FAIL"

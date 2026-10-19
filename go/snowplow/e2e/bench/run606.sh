@@ -61,6 +61,10 @@ if [[ ! "$EXPECTED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "refusing: EXPECTED_IMAGE_DIGEST must be sha256:<64 lowercase hex>, got '${EXPECTED_IMAGE_DIGEST}'" >&2
   exit 2
 fi
+# Bound on waiting for the old ReplicaSet's Terminating pod to go before the
+# digest gate judges (10x the default 30 s termination grace period).
+DIGEST_SETTLE_S="${DIGEST_SETTLE_S:-300}"
+DIGEST_POLL_S="${DIGEST_POLL_S:-5}"
 SCALE="${SCALE:-50000}"
 USERS="${USERS:-1000}"
 NAMESPACES="${NAMESPACES:-50}"
@@ -345,10 +349,25 @@ s_digest() {
     log "DRY: snowplow pods imageID == $EXPECTED_IMAGE_DIGEST (else VOID)"
     return 0
   fi
-  local rc=0
-  "${K[@]}" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
-    | python3 -m bench.load606 digest-gate --expected "$EXPECTED_IMAGE_DIGEST" \
-    > "$OUT/image-digest.jsonl" || rc=$?
+  # `rollout status` returns once the old ReplicaSet reports 0 replicas, while
+  # its pod may still be Terminating: wait (bounded) until no snowplow pod has
+  # a deletionTimestamp, so neither this gate nor the before-record can read
+  # a leftover. A leftover that never clears fails the step, by name.
+  local rc deadline=$(( $(date +%s) + DIGEST_SETTLE_S ))
+  while true; do
+    rc=0
+    "${K[@]}" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
+      | python3 -m bench.load606 digest-gate --expected "$EXPECTED_IMAGE_DIGEST" \
+          --require-settled > "$OUT/image-digest.jsonl" || rc=$?
+    (( rc == 4 )) || break
+    if (( $(date +%s) >= deadline )); then
+      log "digest gate: a snowplow pod is still Terminating after ${DIGEST_SETTLE_S}s: $(cut -c1-600 "$OUT/image-digest.jsonl")"
+      log "FAILED: rollout leftovers did not clear; no load is applied"
+      return 1
+    fi
+    log "digest gate: waiting for Terminating snowplow pod(s) to go ($(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["terminating"]))' < "$OUT/image-digest.jsonl"))"
+    sleep "$DIGEST_POLL_S"
+  done
   log "image digest gate: $(cut -c1-600 "$OUT/image-digest.jsonl" 2>/dev/null)"
   if (( rc != 0 )); then
     log "VOID: a snowplow pod does not run ${EXPECTED_IMAGE_DIGEST} (gate exit ${rc}); no load is applied"

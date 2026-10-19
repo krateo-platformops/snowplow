@@ -982,7 +982,14 @@ def pod_record(pod_list: dict, phase: str) -> dict:
     if not items:
         return {"kind": "snowplow_pod", "phase": phase, "pod": None, "restarts": None,
                 "last_state": None, "t": time.time()}
-    p = items[0]
+    # The live pod, never a Terminating rollout leftover (deletionTimestamp
+    # set): right after the reboot the old ReplicaSet's pod can still sort
+    # first, and recording it would read as a replaced pod on another digest.
+    live = [p for p in items if not (p.get("metadata") or {}).get("deletionTimestamp")]
+    if not live:
+        return {"kind": "snowplow_pod", "phase": phase, "pod": None, "restarts": None,
+                "last_state": None, "terminating_only": True, "t": time.time()}
+    p = live[0]
     cs = ((p.get("status") or {}).get("containerStatuses") or [{}])[0]
     return {"kind": "snowplow_pod", "phase": phase,
             "pod": (p.get("metadata") or {}).get("name"),
@@ -1010,7 +1017,7 @@ def image_digest_of(image_id: str | None) -> str | None:
     return tail if DIGEST_RE.match(tail) else None
 
 
-def image_digest_gate(pod_list: dict, expected: str) -> dict:
+def image_digest_gate(pod_list: dict, expected: str, require_settled: bool = False) -> dict:
     """`kubectl get pods -l <snowplow> -o json` → one `image_digest` record.
 
     MATCH only when the expected digest is well formed, at least one live
@@ -1044,10 +1051,17 @@ def image_digest_gate(pod_list: dict, expected: str) -> dict:
             rec["pods"].append(row)
             if not terminating and d != expected:
                 bad.append(f"{meta.get('name')}/{cs.get('name')}: {d or 'no digest'}")
+    leftovers = sorted({r["pod"] for r in rec["pods"] if r["terminating"]})
+    rec["terminating"] = leftovers
     if live == 0:
         rec["why"] = "no live snowplow pod"
     elif bad:
         rec["why"] = "digest mismatch: " + "; ".join(bad)
+    elif leftovers and require_settled:
+        # Not a verdict yet: the old ReplicaSet's pod is still Terminating
+        # (`rollout status` returns before it is gone). run606 waits, bounded.
+        rec["result"] = "UNSETTLED"
+        rec["why"] = "still Terminating: " + ", ".join(leftovers)
     else:
         rec["result"] = "MATCH"
     return rec
@@ -2486,9 +2500,10 @@ def _cmd_pod_record(a) -> int:
 
 
 def _cmd_digest_gate(a) -> int:
-    rec = image_digest_gate(json.loads(sys.stdin.read() or "{}"), a.expected)
+    rec = image_digest_gate(json.loads(sys.stdin.read() or "{}"), a.expected,
+                            require_settled=a.require_settled)
     print(json.dumps(rec))
-    return 0 if rec["result"] == "MATCH" else 3
+    return {"MATCH": 0, "UNSETTLED": 4}.get(rec["result"], 3)
 
 
 def _cmd_check_prefixes(a) -> int:
@@ -2619,6 +2634,8 @@ def main(argv: list[str] | None = None) -> int:
     dg = sub.add_parser("digest-gate",
                         help="kubectl get pods -o json on stdin -> image_digest record; exit 3 = VOID")
     dg.add_argument("--expected", required=True, help="sha256:<64 hex>")
+    dg.add_argument("--require-settled", action="store_true",
+                    help="exit 4 (UNSETTLED) while any snowplow pod is still Terminating")
     dg.set_defaults(func=_cmd_digest_gate)
     cp = sub.add_parser("check-prefixes", help="exit 2 unless the prefixes capture every RUN8_KEYS value")
     cp.add_argument("prefixes", nargs="*")
