@@ -56,7 +56,9 @@ const uafNullSkipStageCap = 1024
 
 // uafNullSkipOtherKey is the overflow row for stages beyond the cap. Its
 // skipping_now is the latest folded evaluation's: per-stage state past the cap
-// is exactly what the cap gives up.
+// is exactly what the cap gives up. So the skipping-stages gauge UNDERCOUNTS by
+// design once anything folds: every folded stage together counts as at most 1.
+// The total stays exact.
 const uafNullSkipOtherKey = "__other__"
 
 // UAFNullSkipRow is one stage's row of the by-stage map.
