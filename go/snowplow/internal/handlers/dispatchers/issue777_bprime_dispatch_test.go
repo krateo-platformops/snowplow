@@ -121,6 +121,57 @@ func TestB777_B1_ExemptWidgetCachesAndASecondRequestHits(t *testing.T) {
 	}
 }
 
+// B11 — an exempt PARENT (the app-shell shape: static widgetData + static
+// resourcesRefs to child widgets, no keyExtras) changes nothing about its
+// children. A child is its own /call, built from the static ref (no extras ride
+// the path — B7), keyed by ITS OWN declared keys over whatever extras the client
+// sends it. So the child's key is the same before and after the parent's exempt
+// Put, ignores the page's route params, and still partitions on what the child
+// declares.
+func TestB777_B11_ExemptParentLeavesChildKeysUnchanged(t *testing.T) {
+	h1BuildWatcher(t)
+	ctx := h1ReqCtx(h1User)
+	childCR := h1WidgetUnstructured(map[string]any{
+		"widgetData":         map[string]any{},
+		"keyExtras":          []any{"projects"},
+		"widgetDataTemplate": []any{map[string]any{"forPath": "p", "expression": "${ .projects }"}},
+	})
+	childKey := func(extras map[string]any) string {
+		k, _, _ := dispatchCacheLookupKey(ctx, "widgets", h1WidgetGVR.Group, h1WidgetGVR.Version, h1WidgetGVR.Resource,
+			h1NS, "child-777", -1, -1, effectiveKeyExtras(ctx, childCR.Object, extras))
+		if k == "" {
+			t.Fatal("PRECONDITION B11: no child key derived")
+		}
+		return k
+	}
+	page := map[string]any{"projects": "p1", "namespace": "team-a", "name": "comp-1"}
+	before := childKey(page)
+
+	parent := map[string]any{
+		"widgetData": map[string]any{"hasSider": true, "sider": map[string]any{"resourceRefId": "child-777"}},
+		"resourcesRefs": map[string]any{"items": []any{map[string]any{
+			"id": "child-777", "apiVersion": h1WidgetGVR.Group + "/" + h1WidgetGVR.Version,
+			"resource": h1WidgetGVR.Resource, "namespace": h1NS, "name": "child-777", "verb": "GET",
+		}}},
+	}
+	r := b777Serve(t, parent, page, true)
+	if r.persisted == nil || r.exemptDelta != 1 {
+		t.Fatalf("PRECONDITION B11: the app-shell-shaped parent must be exempt and Put (stored=%v exempt +%d)", r.persisted != nil, r.exemptDelta)
+	}
+	if bytes.Contains(r.persisted, []byte("comp-1")) || bytes.Contains(r.persisted, []byte("team-a")) {
+		t.Fatalf("B11: the exempt parent's stored body carries the page's route params: %s", r.persisted)
+	}
+	if after := childKey(page); after != before {
+		t.Fatalf("#777 B11 RED: the child's key moved after the parent's exempt Put (%q → %q)", before, after)
+	}
+	if other := childKey(map[string]any{"projects": "p1", "namespace": "team-b", "name": "comp-2"}); other != before {
+		t.Fatalf("B11: the child's key moved with undeclared route params (%q vs %q)", other, before)
+	}
+	if childKey(map[string]any{"projects": "p2"}) == before {
+		t.Fatal("B11: the child's declared key (projects) no longer partitions its cell")
+	}
+}
+
 // B2–B6 (and B7, B8) — which widgets the exemption reaches.
 func TestB777_B2toB8_QuarantineStillAppliesWhereTheBodyCanReadExtras(t *testing.T) {
 	h1BuildWatcher(t)

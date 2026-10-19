@@ -87,11 +87,32 @@ func TestB777_Predicate(t *testing.T) {
 
 // b777Chrome are the chrome widgets (b′) exists for, copied field-for-field from
 // krateo-platformops/portal-platformops helm/portal/templates
-// (flex.header-context.yaml, tag.tenant-chip.yaml), Helm values rendered with
-// their defaults. Their spec keys are exactly {keyExtras, widgetData,
-// resourcesRefs}.
+// (flex.header-context.yaml, tag.tenant-chip.yaml, layout.app-shell.yaml), Helm
+// values rendered with their defaults. Their top-level spec keys match 057's
+// live CRs (read-only, key names only, by team-lead on 2026-10-19):
+// header-context and tenant-chip {keyExtras, resourcesRefs, widgetData};
+// app-shell {resourcesRefs, widgetData} — the shell Layout renders the page
+// outlet, so it receives every page's route params, and (b′) is its only fix
+// (frontend#492 deliberately does not scope it).
 func b777Chrome() map[string]map[string]any {
 	return map[string]map[string]any{
+		"app-shell": {
+			"apiVersion": "widgets.templates.krateo.io/v1beta1", "kind": "Layout",
+			"metadata": map[string]any{"name": "app-shell", "namespace": "krateo-system"},
+			"spec": map[string]any{
+				"widgetData": map[string]any{
+					"hasSider": true,
+					"sider":    map[string]any{"resourceRefId": "sider-content", "theme": "light", "width": int64(236)},
+					"effects":  []any{"app-theme"},
+				},
+				"resourcesRefs": map[string]any{"items": []any{
+					map[string]any{"id": "sider-content", "apiVersion": "widgets.templates.krateo.io/v1beta1",
+						"name": "sider-content", "namespace": "krateo-system", "resource": "flexes", "verb": "GET"},
+					map[string]any{"id": "app-theme", "apiVersion": "widgets.templates.krateo.io/v1beta1",
+						"name": "app-theme", "namespace": "krateo-system", "resource": "themes", "verb": "GET"},
+				}},
+			},
+		},
 		"header-context": {
 			"apiVersion": "widgets.templates.krateo.io/v1beta1", "kind": "Flex",
 			"metadata": map[string]any{"name": "header-context", "namespace": "krateo-system"},
@@ -212,6 +233,12 @@ func TestB777_B7_StaticResourcesRefsAreExtrasIndependent(t *testing.T) {
 	base := b777Render(t, cr, map[string]any{})
 	if !strings.Contains(base, `"resourcesRefs"`) || !strings.Contains(base, `"ns-a"`) {
 		t.Fatalf("PRECONDITION B7: the static ref did not resolve, so the arm compares nothing: %s", base)
+	}
+	// The child's /call path is built from the static ref alone: no extras ride
+	// it, so the child's own request (and its own declared-keys cache key) is
+	// whatever the client sends it, unaffected by the parent.
+	if !strings.Contains(base, `/call?`) || strings.Contains(base, "extras") {
+		t.Fatalf("B7: the child /call path must exist and carry no extras: %s", base)
 	}
 	for _, ex := range []map[string]any{{"name": "other"}, {"namespace": "team-b", "id": "ns-b"}} {
 		if got := b777Render(t, cr, ex); got != base {

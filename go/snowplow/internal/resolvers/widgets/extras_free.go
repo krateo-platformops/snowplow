@@ -36,9 +36,11 @@ import "github.com/krateo-platformops/plumbing/maps"
 //   - keyExtras: declares which extras partition the cache key; it is read only
 //     by the key derivation, never by the resolve.
 //
-// The live chrome widgets this exemption exists for (header-context,
-// tenant-chip, krateo-platformops/portal helm/portal/templates) carry exactly
-// these three fields. Read by tests; never mutated.
+// The live chrome widgets this exemption exists for carry exactly these fields
+// (057, read-only, top-level key names, 2026-10-19; they match the portal
+// chart): header-context and tenant-chip {keyExtras, resourcesRefs,
+// widgetData}; app-shell and page-demoday-header-b2da9489 {resourcesRefs,
+// widgetData}. Read by tests; never mutated.
 var ExtrasFreeSpecFields = map[string]struct{}{
 	widgetDataKey:    {},
 	resourcesRefsKey: {},
