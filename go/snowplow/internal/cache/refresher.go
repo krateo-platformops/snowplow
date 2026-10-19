@@ -905,7 +905,8 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// #547 — a background revalidation of a known-stale shared shell settles with
 	// this dequeue (runs before Done, after every branch below has settled the
 	// window).
-	defer settleBackgroundRevalidation(key)
+	var attemptDur time.Duration // #740: the failed attempt's own duration floors its backoff
+	defer func() { settleBackgroundRevalidation(key, attemptDur) }()
 
 	// Customer-priority cooperative yield (Ship #98). Mirrors prewarm
 	// engine's yield-before-scope pattern (prewarm_engine.go:275). The
@@ -1070,7 +1071,17 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	if windowOpen {
 		rctx, outcome = withRefreshOutcome(rctx, key)
 	}
-	if err := r.processOne(rctx, key, entry, ok); err != nil {
+	// #740 K5 — a dequeue that IS a known-stale shell's background revalidation
+	// (its slot is held: a customer serve, an absorbed read's rerun, or a viewed
+	// chain's retry asked for it) is refresh work a customer is waiting on: it
+	// bypasses the admission cap at both gates, like the demand revalidation.
+	if _, held := bgRevalidationInflight.Load(key); held {
+		rctx = WithCustomerTriggeredRefresh(rctx)
+	}
+	attemptStart := time.Now()
+	err := r.processOne(rctx, key, entry, ok)
+	attemptDur = time.Since(attemptStart)
+	if err != nil {
 		r.failedTotal.Add(1)
 		// Poison-pill bound (Part A). NumRequeues is how many times this
 		// exact key has already been AddRateLimited. Once it exceeds the

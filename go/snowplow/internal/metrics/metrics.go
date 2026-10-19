@@ -1231,6 +1231,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerStaleServeInstruments(m); err != nil {
 		return err
 	}
+	if err := registerStaleRetryInstruments(m); err != nil {
+		return err
+	}
 	if err := registerPrewarmPassInstruments(m); err != nil {
 		return err
 	}
@@ -1619,6 +1622,63 @@ func registerNestedResolveAdmissionInstruments(m metric.Meter) error {
 		o.ObserveInt64(peak, s.OverCeilingBytesPeak)
 		return nil
 	}, over, peak)
+	return err
+}
+
+// registerStaleRetryInstruments hand-wires #740's viewer-gated retry engine onto
+// OTLP (no expvar->OTLP bridge). The callback reads cache.StaleRetryStatsSnapshot,
+// the accessor the expvar closures read, so the surfaces cannot diverge. Labels
+// are closed: kind {transient, genuine}, source {background, demand, debt},
+// reason {no_viewer, evicted}; every cell of each set is emitted, zeros
+// included. Registered only when the cache is on (CFG-1).
+func registerStaleRetryInstruments(m metric.Meter) error {
+	retries, err := m.Int64ObservableCounter("snowplow_stale_retry_total",
+		metric.WithDescription("Viewer-gated retries scheduled for a known-stale cell after a failed refresh, by kind {transient: the Put was refused (a newer change exists) — retried at once; genuine: 1 s doubling to 60 s, only while a /refreshes tab views the cell} and source {background, demand, debt}. #740."))
+	if err != nil {
+		return err
+	}
+	chains, err := m.Int64ObservableGauge("snowplow_stale_retry_chains_active",
+		metric.WithDescription("Known-stale cells with a retry chain scheduled or running (one per cell; abandoned chains excluded). #740."))
+	if err != nil {
+		return err
+	}
+	viewers, err := m.Int64ObservableGauge("snowplow_stale_retry_viewers",
+		metric.WithDescription("Armed /refreshes dependent keys across the active retry chains: someone is looking at a stale cell whose refresh keeps failing. #740."))
+	if err != nil {
+		return err
+	}
+	abandoned, err := m.Int64ObservableCounter("snowplow_stale_retry_abandoned_total",
+		metric.WithDescription("Retry chains stopped, by reason {no_viewer: nobody views the cell — it stays known-stale and served, and an arm resumes it; evicted: the cell left the store}. #740."))
+	if err != nil {
+		return err
+	}
+	resumed, err := m.Int64ObservableCounter("snowplow_stale_retry_resumed_total",
+		metric.WithDescription("Abandoned retry chains resumed, with an immediate attempt, because a /refreshes tab armed the cell. #740."))
+	if err != nil {
+		return err
+	}
+	backoff, err := m.Int64ObservableGauge("snowplow_stale_retry_backoff_ms",
+		metric.WithDescription("The longest retry wait currently pending (ms). Sitting at 60000 is a persistent upstream failure that someone is looking at. #740."),
+		metric.WithUnit("ms"))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		s := cache.StaleRetryStatsSnapshot()
+		for k, kind := range cache.StaleRetryKinds {
+			for src, source := range cache.StaleRetrySources {
+				o.ObserveInt64(retries, int64(s.Retries[k][src]), metric.WithAttributes(
+					attribute.String("kind", kind), attribute.String("source", source)))
+			}
+		}
+		o.ObserveInt64(chains, s.ChainsActive)
+		o.ObserveInt64(viewers, s.Viewers)
+		o.ObserveInt64(abandoned, int64(s.AbandonedNoViewer), metric.WithAttributes(attribute.String("reason", "no_viewer")))
+		o.ObserveInt64(abandoned, int64(s.AbandonedEvicted), metric.WithAttributes(attribute.String("reason", "evicted")))
+		o.ObserveInt64(resumed, int64(s.Resumed))
+		o.ObserveInt64(backoff, s.BackoffMS)
+		return nil
+	}, retries, chains, viewers, abandoned, resumed, backoff)
 	return err
 }
 

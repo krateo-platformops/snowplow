@@ -143,13 +143,27 @@ type revalSlot struct {
 	mu       sync.Mutex
 	rerun    bool // a read was absorbed into the attempt in flight
 	released bool // the slot left the map; an absorber claims a fresh one
+	// done is closed when the slot is released (#740): a stale-retry attempt
+	// that joined an attempt in flight waits on it.
+	done chan struct{}
+}
+
+func newRevalSlot() *revalSlot { return &revalSlot{done: make(chan struct{})} }
+
+// revalSlotDone returns the done channel of key's slot in m, if one is held.
+func revalSlotDone(m *sync.Map, key string) (<-chan struct{}, bool) {
+	v, ok := m.Load(key)
+	if !ok {
+		return nil, false
+	}
+	return v.(*revalSlot).done, true
 }
 
 // claimRevalSlot claims key's slot in m, or, when one is held, arms its rerun:
 // the read is absorbed. true: claimed (the caller starts the attempt).
 func claimRevalSlot(m *sync.Map, key string) bool {
 	for {
-		v, loaded := m.LoadOrStore(key, &revalSlot{})
+		v, loaded := m.LoadOrStore(key, newRevalSlot())
 		if !loaded {
 			return true
 		}
@@ -187,6 +201,7 @@ func settleRevalSlot(m *sync.Map, key string) (held, rerun bool) {
 	}
 	s.released = true
 	m.CompareAndDelete(key, s)
+	close(s.done)
 	return true, false
 }
 
@@ -330,6 +345,52 @@ func RevalidateKnownStaleInBackground(key string) {
 	r.enqueueRevalidation(key)
 }
 
+// backgroundRetrySpec is key's viewer-gated chain on the background slot: each
+// attempt claims the slot (or, when one is in flight, joins it as an absorbed
+// read would), queues the refresher revalidation and waits for the slot to be
+// released. Its viewer is the shell's own armed key.
+func backgroundRetrySpec(key string) StaleRetrySpec {
+	return StaleRetrySpec{
+		Source: StaleRetryBackground,
+		Attempt: func(ctx context.Context) StaleRetryOutcome {
+			r := refresherPeek()
+			if r == nil {
+				return StaleRetryGenuine
+			}
+			if claimRevalSlot(&bgRevalidationInflight, key) {
+				r.enqueueRevalidation(key)
+			}
+			if done, ok := revalSlotDone(&bgRevalidationInflight, key); ok {
+				ctx, cancel := context.WithTimeout(ctx, DemandRevalidationDeadline())
+				defer cancel()
+				select {
+				case <-done:
+				case <-ctx.Done():
+				}
+			}
+			if _, _, still := KnownStale(key); still {
+				return StaleRetryGenuine
+			}
+			return StaleRetryFresh
+		},
+		Dependents: func() []string { return []string{key} },
+		StillStale: func() (bool, bool) { return knownStaleRetryState(key) },
+	}
+}
+
+// knownStaleRetryState is a #547 cell's chain predicate: still known-stale and
+// not suppressed (stale), and resident.
+func knownStaleRetryState(key string) (stale, resident bool) {
+	if c := ResolvedCache(); c == nil || !c.Has(key) {
+		return false, false
+	}
+	if _, suppressed := RefreshSuppressedReason(key); suppressed {
+		return false, true
+	}
+	_, _, ks := KnownStale(key)
+	return ks, true
+}
+
 // enqueueRevalidation queues key's background revalidation on its own tier.
 func (r *refresher) enqueueRevalidation(key string) {
 	if _, isCL := r.clusterListKeys.Load(key); isCL {
@@ -345,17 +406,27 @@ func (r *refresher) enqueueRevalidation(key string) {
 // attempt while the key is still known-stale earns one rerun (#740): the slot
 // stays claimed and the key is re-queued at once — the workqueue re-adds it
 // after this dequeue's Done.
-func settleBackgroundRevalidation(key string) {
+func settleBackgroundRevalidation(key string, dur time.Duration) {
 	held, rerun := settleRevalSlot(&bgRevalidationInflight, key)
 	if !held {
 		return
 	}
-	if _, _, still := KnownStale(key); still {
+	_, _, still := KnownStale(key)
+	if still {
 		knownStaleRevalidationFail.Add(1)
 	} else {
 		knownStaleRevalidationFresh.Add(1)
 	}
 	if !rerun {
+		if still {
+			// #740 — a revalidation that settled still known-stale (and earned no
+			// rerun) opens or joins the cell's viewer-gated chain. A refused
+			// replace ends the window evicted, so a still-known-stale settle is
+			// always a genuine failure (Q4); a suppressed key opens no chain.
+			if _, suppressed := RefreshSuppressedReason(key); !suppressed {
+				StaleRetryFailed(key, StaleRetryGenuine, dur, backgroundRetrySpec(key))
+			}
+		}
 		return
 	}
 	knownStaleRevalidationRerun[revalSlotBackground].Add(1)
@@ -418,27 +489,42 @@ func DemandRevalidationDeadline() time.Duration {
 // attempt and key is still known-stale — the slot STAYS claimed and the caller
 // runs one more attempt at once, beginning it with another
 // BeginDemandRevalidation; otherwise the slot is released.
-func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (context.Context, func() (fresh, rerun bool)) {
+func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (context.Context, func() DemandSettle) {
 	ctx, o := withRefreshOutcome(ctx, key)
 	ctx = context.WithValue(ctx, ctxKeyDemandRevalidation, key)
 	var once sync.Once
-	var fresh, rerun bool
-	return ctx, func() (bool, bool) {
+	var out DemandSettle
+	return ctx, func() DemandSettle {
 		once.Do(func() {
 			if o.accepted.Load() && !o.remarked.Load() {
 				knownStaleRevalidationFresh.Add(1)
-				fresh = true
+				out.Fresh = true
 			} else {
 				knownStaleRevalidationFail.Add(1)
 			}
-			_, rerun = settleRevalSlot(&demandInflight, key)
-			if rerun {
+			out.Refused = o.refused.Load()
+			_, out.Rerun = settleRevalSlot(&demandInflight, key)
+			if out.Rerun {
 				knownStaleRevalidationRerun[revalSlotDemand].Add(1)
 			}
 		})
-		return fresh, rerun
+		return out
 	}
 }
+
+// DemandSettle is one demand attempt's settle: Fresh (an accepted, un-remarked
+// write), Rerun (#740: an absorbed read earned one more attempt; the slot stays
+// claimed) and Refused (the Put was refused because the generation moved: a
+// TRANSIENT failure for the viewer-gated chain, Q4).
+type DemandSettle struct{ Fresh, Rerun, Refused bool }
+
+// DemandSlotDone returns the done channel of key's demand slot, if one is held:
+// a stale-retry attempt that found the slot held waits on it (#740).
+func DemandSlotDone(key string) (<-chan struct{}, bool) { return revalSlotDone(&demandInflight, key) }
+
+// KnownStaleRetryState is the #547 cells' viewer-gated chain predicate (#740):
+// still known-stale and not suppressed, and resident.
+func KnownStaleRetryState(key string) (stale, resident bool) { return knownStaleRetryState(key) }
 
 // endKnownStaleOnPut ends key's KNOWN-STALE state on an ACCEPTED Put whose
 // resolve began at or after the window's latest mark (#547): that body was read
@@ -480,11 +566,13 @@ func endKnownStaleOnPut(ctx context.Context, key string) (t0 time.Time, sample b
 		}
 		if s.inflight {
 			if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, seq: s.seq}) {
+				noteStaleRetryCellChanged(key) // #740 — a healed cell's chain ends
 				return time.Time{}, false
 			}
 			continue
 		}
 		if r.dirty.CompareAndDelete(key, cur) {
+			noteStaleRetryCellChanged(key) // #740 — a healed cell's chain ends
 			return s.t0, true
 		}
 	}

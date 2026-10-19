@@ -169,6 +169,10 @@ type k547Harness struct {
 	// composition that has read NO injected failure (it will succeed), before
 	// it reads the composition: an arm parks a healing attempt there.
 	onHealing atomic.Pointer[func(bg bool)]
+	// custGate (#740 Q3), when set, decides a CUSTOMER-shaped resolve of the
+	// changed composition from its ctx (e.g. an expired credential carried by
+	// the request): a non-nil error fails it (after onDoomed, like failCustomer).
+	custGate atomic.Pointer[func(ctx context.Context) error]
 
 	mu sync.Mutex
 	// block, when set, parks a customer-shaped resolve of the changed composition
@@ -581,6 +585,14 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 			}
 		}
 	} else if changed {
+		if g := h.custGate.Load(); g != nil && !bg {
+			if err := (*g)(ctx); err != nil {
+				if fn := h.onDoomed.Load(); fn != nil {
+					(*fn)(false)
+				}
+				return nil, err
+			}
+		}
 		if h.failCustomer.Load() {
 			if fn := h.onDoomed.Load(); fn != nil {
 				(*fn)(false)
