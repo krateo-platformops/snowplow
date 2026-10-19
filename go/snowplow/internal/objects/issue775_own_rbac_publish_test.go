@@ -14,12 +14,16 @@ package objects
 // 401. The aborted line is the failing test's OWN watcher: its publish had not
 // run even when the test's cleanup stopped it.
 //
-// ARM
+// ARMS
 //   P1  this watcher's initial publish is PARKED at the rebuild barrier (the
 //       exact point between "RBAC informers synced" and "snapshot stored"),
 //       and released only when the harness says it is waiting for that
 //       publish. A harness that GETs without waiting runs inside the window
 //       every time; one that waits cannot.
+//   P2  a neighbour's late publish (a foreign snapshot that grants nobody,
+//       #385's shape) lands AFTER this watcher's own initial publish has
+//       returned. The harness's synchronous rebuild from its own watcher must
+//       make the live snapshot its own again before the GET.
 
 import (
 	"sync"
@@ -68,5 +72,34 @@ func TestIssue775_P1_GroupGrantWaitsForItsOwnRBACPublish(t *testing.T) {
 	}
 	if s := ObjectsGetStatsSnapshot(); s.InformerServed != 1 {
 		t.Fatalf("#775: InformerServed want 1; got %d", s.InformerServed)
+	}
+}
+
+func TestIssue775_P2_GroupGrantOwnsTheLiveSnapshotAfterANeighboursLatePublish(t *testing.T) {
+	if rbacNarrowBaseline {
+		t.Skip("group-grant assertion is Tag-0.30.101 only")
+	}
+	resetServeCounters()
+	landed := false
+	ownRBACPublishLandedHook = func() {
+		foreign := &cache.RBACSnapshot{PublishSeq: 1 << 40}
+		cache.RebuildSubjectIndexesForTest(foreign) // empty indexes: grants nobody
+		cache.PublishRBACSnapshotForTest(foreign)
+		landed = true
+	}
+	t.Cleanup(func() { ownRBACPublishLandedHook = nil })
+
+	newGroupGrantWatcher(t)
+	if !landed {
+		t.Fatal("#775 P2 precondition: the neighbour's snapshot never landed — the harness did not reach its post-publish step")
+	}
+
+	res := Get(ctxWithUser("alice", "devs"), serveTestRef(authorizedNS, "obj-authorized"))
+	if res.Unstructured == nil {
+		t.Fatalf("#775 P2 RED: a neighbour's snapshot published after this watcher's own is still live at the GET — "+
+			"the group grant reads as denied and the GET falls through (Err=%v)", res.Err)
+	}
+	if s := ObjectsGetStatsSnapshot(); s.InformerServed != 1 {
+		t.Fatalf("#775 P2: InformerServed want 1; got %d", s.InformerServed)
 	}
 }
