@@ -1015,8 +1015,9 @@ func TestStale710_D2_20c_AFillBeforeTheMarkDoesNotRetire(t *testing.T) {
 
 // D2-20d — PR-B review (made required): a PARKED debt whose content cell is
 // EVICTED (and never refreshed again) is retired at the eviction — the same
-// rule as an abandoned chain's — through the G2 bridge: open and parked 0, the
-// chain gone (abandoned{evicted}), the dependent replaced.
+// rule as an abandoned chain's: open and parked 0, the chain gone
+// (abandoned{evicted}), the stale-derived dependent compare-and-evicted (#755,
+// D2-20e has the rest).
 // Mutation → RED: no Evicted hook on the debt's chain.
 func TestStale710_D2_20d_AParkedDebtWhoseContentIsEvictedIsRetired(t *testing.T) {
 	f := newD2Fixture(t)
@@ -1036,11 +1037,132 @@ func TestStale710_D2_20d_AParkedDebtWhoseContentIsEvictedIsRetired(t *testing.T)
 	if got := cache.StaleRetryStatsSnapshot().AbandonedEvicted - e0; got != 1 {
 		t.Fatalf("D2-20d: abandoned{evicted} moved %d, want 1", got)
 	}
+	if _, ok := f.store.GetNoTouch("dep-20d"); ok {
+		t.Fatalf("D2-20d: the parked debt's stale-derived dependent is still resident (#755: compare-and-evict)")
+	}
+}
+
+// d2ParkedN is d2Parked with several committed dependents and no tab: the
+// refill fails (the upstream is down until heal), the first retry finds
+// nobody, the debt is parked. dispatches counts the content fills tried.
+func d2ParkedN(t *testing.T, f *d2Fixture, deps ...string) (heal func(), dispatches *atomic.Int64) {
+	t.Helper()
+	clock := cache.NewStaleRetryManualClockForTest()
+	cache.SetStaleRetryClockForTest(clock)
+	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
+	var fail atomic.Bool
+	fail.Store(true)
+	dispatches = &atomic.Int64{}
+	orig := dispatchViaInformerFn
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+		dispatches.Add(1)
+		if fail.Load() {
+			return nil, false
+		}
+		return orig(ctx, call)
+	}
+	t.Cleanup(func() { dispatchViaInformerFn = orig })
+	for _, dep := range deps {
+		f.customer(t, dep)
+		f.storeAndCommit(dep)
+	}
+	if !fill710WaitFor(10*time.Second, func() bool { return len(clock.Pending()) == 1 }) {
+		t.Fatalf("PRECONDITION: the first retry was never scheduled (%+v)", StaleServeStatsSnapshot())
+	}
+	clock.FireNext() // nobody views a dependent: parked
+	if st := StaleServeStatsSnapshot(); st.DebtParked != 1 || st.DebtOpen != 0 {
+		t.Fatalf("PRECONDITION: debt_open=%d parked=%d, want 0/1", st.DebtOpen, st.DebtParked)
+	}
+	return func() { fail.Store(false) }, dispatches
+}
+
+// D2-20e — #755 (architect ruling): a PARKED debt whose content cell is
+// evicted is retired WITHOUT re-resolving for nobody: zero dependent
+// re-resolves and zero content fills; each still stale-derived dependent is
+// compare-and-evicted and a newer entry is untouched; the debt and its chain
+// are gone; a tab arming later still gets event: refresh (the owed mark), and
+// its refetch is fresh.
+// Mutation → RED: the G2 bridge runs for a parked debt too.
+func TestStale710_D2_20e_AParkedDebtsEvictedContentEvictsItsDependentsWithoutReResolving(t *testing.T) {
+	f := newD2Fixture(t)
+	heal, dispatches := d2ParkedN(t, f, "dep-20e-a", "dep-20e-b")
+	newer := &cache.ResolvedEntry{RawJSON: []byte(`{"newer":true}`),
+		Inputs: &cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Namespace: "d2", Name: "dep-20e-b"}}
+	f.store.Put("dep-20e-b", newer) // another writer replaced dependent b
+	r0, n0 := f.rereso.Load(), dispatches.Load()
+	f.store.DeleteForTest(f.contentKey) // the content cell is evicted
 	if !fill710WaitFor(10*time.Second, func() bool {
-		e, ok := f.store.GetNoTouch("dep-20d")
-		return ok && !e.StaleDerived
+		st := StaleServeStatsSnapshot()
+		return st.DebtOpen == 0 && st.DebtParked == 0
 	}) {
-		t.Fatalf("D2-20d: the dependent was not replaced by the G2 bridge")
+		t.Fatalf("D2-20e: the parked debt outlived its evicted content cell (%+v)", StaleServeStatsSnapshot())
+	}
+	// Join everything the retire could have started (a bridge's replaces run on
+	// staleDebtWG; a chain recheck on the engine's group).
+	cache.WaitStaleRetryForTest()
+	staleDebtWG.Wait()
+	if dr, dn := f.rereso.Load()-r0, dispatches.Load()-n0; dr != 0 || dn != 0 {
+		t.Fatalf("D2-20e RED: a parked debt's eviction worked for nobody (dependent re-resolves +%d, content fills +%d)", dr, dn)
+	}
+	if open, _ := cache.StaleRetryChainOpenForTest(f.contentKey); open {
+		t.Fatalf("D2-20e: the evicted content's chain is still held")
+	}
+	if _, ok := f.store.GetNoTouch("dep-20e-a"); ok {
+		t.Fatalf("D2-20e: the stale-derived dependent is still resident (compare-and-evict)")
+	}
+	if e, ok := f.store.GetNoTouch("dep-20e-b"); !ok || e != newer {
+		t.Fatalf("D2-20e: the newer entry was touched (resident=%v)", ok)
+	}
+	heal()
+	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-20e-a": {}})
+	defer unsub()
+	d2Push(t, ch, "dep-20e-a", 10*time.Second) // the owed mark, at arm time
+	// The refetch under the viewer is an ordinary fill: fresh, no new debt.
+	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-20e-a"), "dep-20e-a", "restactions")
+	if _, served, ok, err := apistageContentServe(ctx, f.store, fill710ListCall(), false); err != nil || !ok || !served {
+		t.Fatalf("D2-20e: the refetch was not served: ok=%v served=%v err=%v", ok, served, err)
+	}
+	if sink.StaleDerived() {
+		t.Fatalf("D2-20e: the refetch was served stale, not a fresh fill")
+	}
+	if st := StaleServeStatsSnapshot(); st.DebtOpen != 0 || st.DebtParked != 0 {
+		t.Fatalf("D2-20e: the refetch opened a debt (%+v)", st)
+	}
+}
+
+// D2-20f — #755: an ACTIVE (viewed) debt whose content cell is evicted keeps
+// the G2 bridge — someone is waiting: its dependent is re-resolved and pushed.
+// Mutation → RED: compare-and-evict for every debt, parked or not.
+func TestStale710_D2_20f_AnActiveDebtsEvictedContentStillReResolvesItsDependent(t *testing.T) {
+	f := newD2Fixture(t)
+	clock := cache.NewStaleRetryManualClockForTest()
+	cache.SetStaleRetryClockForTest(clock)
+	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
+	orig := dispatchViaInformerFn
+	dispatchViaInformerFn = func(context.Context, httpcall.RequestOptions) ([]byte, bool) { return nil, false }
+	t.Cleanup(func() { dispatchViaInformerFn = orig })
+	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-20f": {}})
+	defer unsub()
+	f.customer(t, "dep-20f")
+	f.storeAndCommit("dep-20f") // viewed: the chain is scheduled, not parked
+	if !fill710WaitFor(10*time.Second, func() bool { return len(clock.Pending()) == 1 }) {
+		t.Fatalf("PRECONDITION: the first retry was never scheduled (%+v)", StaleServeStatsSnapshot())
+	}
+	if st := StaleServeStatsSnapshot(); st.DebtOpen != 1 || st.DebtParked != 0 {
+		t.Fatalf("PRECONDITION: debt_open=%d parked=%d, want 1/0", st.DebtOpen, st.DebtParked)
+	}
+	dispatchViaInformerFn = orig
+	r0 := f.rereso.Load()
+	f.store.DeleteForTest(f.contentKey) // the content cell is evicted
+	if !fill710WaitFor(10*time.Second, func() bool { return StaleServeStatsSnapshot().DebtOpen == 0 }) {
+		t.Fatalf("D2-20f: the active debt outlived its evicted content cell (%+v)", StaleServeStatsSnapshot())
+	}
+	d2Push(t, ch, "dep-20f", 10*time.Second)
+	if f.rereso.Load()-r0 != 1 {
+		t.Fatalf("D2-20f RED: the viewed dependent was not re-resolved (+%d)", f.rereso.Load()-r0)
+	}
+	if e, ok := f.store.GetNoTouch("dep-20f"); !ok || e.StaleDerived {
+		t.Fatalf("D2-20f RED: the viewed dependent was not replaced (resident=%v)", ok)
 	}
 }
 
