@@ -1222,6 +1222,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerListQueryInstrument(m); err != nil {
 		return err
 	}
+	if err := registerUAFNullSkipInstruments(m); err != nil {
+		return err
+	}
 	if err := registerContentFillInstruments(m); err != nil {
 		return err
 	}
@@ -1513,6 +1516,31 @@ func registerListQueryInstrument(m metric.Meter) error {
 		}
 		return nil
 	}, listQuery)
+	return err
+}
+
+// registerUAFNullSkipInstruments hand-wires #778's userAccessFilter null-skip
+// counter onto OTLP (no expvar->OTLP bridge). Both read the accessors the
+// expvar closures read, so the surfaces cannot diverge. NO attributes: the
+// by-stage map names RESTActions, which the closed attribute-key set admits
+// nowhere, so it stays expvar-only (JWT-gated /debug/vars) — the content-fill
+// _by_ra split. Registered only when the cache is on (CFG-1).
+func registerUAFNullSkipInstruments(m metric.Meter) error {
+	total, err := m.Int64ObservableCounter("snowplow_uaf_resources_null_skipped_total",
+		metric.WithDescription("userAccessFilter stage evaluations whose resourcesFrom yielded at least one null element, skipped like \"\" (#767): an all-null set denies every item, and the answer is cached. Transient while an input has no resource yet (a CompositionDefinition not reconciled); permanent for a typo'd path. Which stage: /debug/vars snowplow_uaf_resources_null_skipped_by_stage. #778."))
+	if err != nil {
+		return err
+	}
+	stages, err := m.Int64ObservableGauge("snowplow_uaf_resources_null_skipping_stages",
+		metric.WithDescription("RESTAction stages whose LATEST userAccessFilter resourcesFrom evaluation skipped a null element: each is serving a deny-all now. A stage whose input reconciles drops out; one that stays is likely a typo'd path. /debug/vars snowplow_uaf_resources_null_skipped_by_stage (skipping_now) names it. #778."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		o.ObserveInt64(total, int64(restactionsapi.UAFNullSkippedTotal()))
+		o.ObserveInt64(stages, int64(restactionsapi.UAFNullSkippingStages()))
+		return nil
+	}, total, stages)
 	return err
 }
 

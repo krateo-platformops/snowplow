@@ -692,9 +692,14 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 // closed as unresolved (#651: a stage error, never cached).
 //
 // The skip logs at DEBUG once per stage with the expression and the stage
-// name only, so a typo'd path that yields null stays findable.
+// name only, so a typo'd path that yields null stays findable. Every
+// evaluation is also recorded (#778: snowplow_uaf_resources_null_skip*), so the
+// stages skipping NOW are visible at the shipped LOG_LEVEL=warn.
 func resolveRefilterUAFResources(ctx context.Context, log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec, dict map[string]any) ([]string, bool) {
 	out, ok, nulls := uafResourceSet(ctx, log, uaf, dict, true)
+	if uaf.ResourcesFrom != "" {
+		recordUAFResourcesEvaluated(ctx, stageName, ok && nulls > 0)
+	}
 	if ok && nulls > 0 {
 		log.Debug("userAccessFilter: ResourcesFrom yielded null element(s); skipped (no resource to grant against)",
 			slog.String("api", stageName),
