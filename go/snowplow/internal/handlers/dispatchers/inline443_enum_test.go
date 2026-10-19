@@ -84,6 +84,9 @@ var cacheAllow443 = map[string]cacheClass443{
 	// #398 decline: always returns true on a sensitive read (inert or not), so
 	// the decline is never hidden by the flag; only its counter is gated.
 	"DeclineSensitivePut": gatedInCache443,
+	// #765 — the stamp-gated refresher read: GetNoTouch (no warmth), and the
+	// served-cell note only for an accepted cell, under its own cache.Inert check.
+	"ServeCellIf": gatedInCache443,
 	// --- side-effecting, gated at the (listed) caller -----------------------
 	// #643 — the resolve path's ONE L1 body read (it replaced the direct
 	// ResolvedCacheStore.Get): touch=true is the warmth-stamping Get, which each
@@ -149,7 +152,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ClientConfigFor": readOnly443, "ComputeKey": readOnly443, "DepGenEpochNow": readOnly443,
 	// #710 PR-1 — the single-flight join check (a load of the #375 bucket/floor
 	// seq) and the detached fill's deadline (a read of the store's window).
-	"ContentCoordinateMovedSince": readOnly443, "DemandRevalidationDeadline": readOnly443,
+	"ContentCoordinateMovedSince": readOnly443,
+	// #765 — the content stamp: pure seq reads/compares.
+	"ContentStampCovers": readOnly443, "RefreshTriggerAsOf": readOnly443,
+	"DemandRevalidationDeadline": readOnly443,
 	// #710 PR-2a — the content-fill admission gate reads the shared ceiling and
 	// live-heap sampler (runtime reads, no cache state).
 	"AdmissionCeiling": readOnly443, "AdmissionLiveHeapSample": readOnly443,

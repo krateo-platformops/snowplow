@@ -112,6 +112,34 @@ func ServeCell(ctx context.Context, c *ResolvedCacheStore, key string, touch boo
 	return entry, hit
 }
 
+// ServeCellIf is ServeCell for an INTERNAL reader that serves the cell only
+// when accept approves the entry it read (#765: a refresher re-resolve reuses a
+// content cell only when its content stamp covers the refresh's triggers). It
+// reads with GetNoTouch (no recency, no hit accounting — #376/#552), reads the
+// Put identity BEFORE the body exactly as ServeCell does, and notes the cell on
+// ctx's dep-gen sink (#643) ONLY when it is served: a cell read and rejected
+// served nothing, so it must not be folded into a declined-external mark.
+//
+// hit reports whether a body was read; served whether it was accepted (and
+// noted). A dry-run (cache.Inert) read notes nothing, as NoteServedCell.
+func ServeCellIf(ctx context.Context, c *ResolvedCacheStore, key string, accept func(*ResolvedEntry) bool, covers ...DepKey) (entry *ResolvedEntry, hit, served bool) {
+	if c == nil {
+		return nil, false, false
+	}
+	seq, live := c.CellPutSeq(key)
+	entry, hit = c.GetNoTouch(key)
+	if !hit || entry == nil {
+		return nil, false, false
+	}
+	if accept != nil && !accept(entry) {
+		return entry, true, false
+	}
+	if live && !Inert(ctx) {
+		NoteServedCell(ctx, key, seq, covers...)
+	}
+	return entry, true, true
+}
+
 // NoteServedCell appends one served cell to ctx's dep-gen sink and its
 // ancestors (whose bodies embed this one). No sink → no-op.
 func NoteServedCell(ctx context.Context, key string, putSeq uint64, covers ...DepKey) {

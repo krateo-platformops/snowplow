@@ -33,6 +33,12 @@
 //     epoch-at-entry rule): they lead the next flight, so they are also fills
 //     and duplicates;
 //   - _join_waiting            gauge: joiners waiting on a flight right now;
+//   - _refresh_reused_total    (#765) refresher reads whose trigger set held
+//     the cell's GVR but whose stored cell's content stamp covered every
+//     trigger: served from the cell, NO fill (each one a re-fill avoided);
+//   - _refresh_coalesced_total (#765) background refresher readers that joined
+//     their key's PENDING flight instead of starting a concurrent fill of the
+//     same list (each one a concurrent re-fill avoided);
 //   - _not_servable_total      fills whose dispatch was not pivot-servable
 //     (no bytes; the caller falls through);
 //   - _inflight, _inflight_bytes            gauges, right now;
@@ -136,6 +142,9 @@ var (
 	contentFillJoined      [contentFillReasons]atomic.Uint64
 	contentFillJoinRefused [contentFillReasons]atomic.Uint64
 	contentFillJoinWaiting atomic.Int64
+	// #765 — re-fills the content stamp avoided.
+	contentFillRefreshReused    atomic.Uint64
+	contentFillRefreshCoalesced atomic.Uint64
 
 	contentFillInflight          atomic.Int64
 	contentFillInflightBytes     atomic.Int64
@@ -183,10 +192,14 @@ type ContentFillGVRStats struct {
 	Fills      uint64 `json:"fills"`
 	Duplicates uint64 `json:"duplicates"`
 	Joined     uint64 `json:"joined"`
-	Bytes      uint64 `json:"bytes"`
-	Items      uint64 `json:"items_total"`
-	MaxBytes   uint64 `json:"max_bytes"`
-	MaxItems   uint64 `json:"max_items"`
+	// #765 — refresher reads served from the stamped cell / joined to the
+	// pending flight instead of filling.
+	RefreshReused    uint64 `json:"refresh_reused"`
+	RefreshCoalesced uint64 `json:"refresh_coalesced"`
+	Bytes            uint64 `json:"bytes"`
+	Items            uint64 `json:"items_total"`
+	MaxBytes         uint64 `json:"max_bytes"`
+	MaxItems         uint64 `json:"max_items"`
 	// One fill's duration (dispatch start to the end of its parse and Put):
 	// EWMA and max.
 	DurationMSEWMA float64 `json:"duration_ms_ewma"`
@@ -485,6 +498,24 @@ func noteContentFillJoined(reason contentFillReason, gvr string) {
 	contentFillMu.Unlock()
 }
 
+// noteContentRefreshReused counts one stamp-gated refresher read served from
+// the stored cell because its stamp covered every trigger (#765).
+func noteContentRefreshReused(gvr string) {
+	contentFillRefreshReused.Add(1)
+	contentFillMu.Lock()
+	contentFillGVRRow(gvr).RefreshReused++
+	contentFillMu.Unlock()
+}
+
+// noteContentRefreshCoalesced counts one background stamp-gated refresher
+// reader that joined its key's pending flight (#765).
+func noteContentRefreshCoalesced(gvr string) {
+	contentFillRefreshCoalesced.Add(1)
+	contentFillMu.Lock()
+	contentFillGVRRow(gvr).RefreshCoalesced++
+	contentFillMu.Unlock()
+}
+
 // noteContentFillJoinRefused counts one reader that found a flight it may not
 // join (the coordinate moved after the flight started).
 func noteContentFillJoinRefused(reason contentFillReason) {
@@ -566,6 +597,8 @@ type ContentFillStats struct {
 	Joined            map[string]uint64
 	JoinRefused       map[string]uint64
 	JoinWaiting       int64
+	RefreshReused     uint64 // #765
+	RefreshCoalesced  uint64 // #765
 	NotServable       uint64
 	Inflight          int64
 	InflightBytes     int64
@@ -586,6 +619,8 @@ func ContentFillStatsSnapshot() ContentFillStats {
 		Joined:            make(map[string]uint64, contentFillReasons),
 		JoinRefused:       make(map[string]uint64, contentFillReasons),
 		JoinWaiting:       contentFillJoinWaiting.Load(),
+		RefreshReused:     contentFillRefreshReused.Load(),
+		RefreshCoalesced:  contentFillRefreshCoalesced.Load(),
 		NotServable:       contentFillNotServable.Load(),
 		Inflight:          contentFillInflight.Load(),
 		InflightBytes:     contentFillInflightBytes.Load(),
@@ -666,6 +701,8 @@ func ResetContentFillStatsForTest() {
 		contentFillJoinRefused[r].Store(0)
 	}
 	contentFillJoinWaiting.Store(0)
+	contentFillRefreshReused.Store(0)
+	contentFillRefreshCoalesced.Store(0)
 	contentFillNotServable.Store(0)
 	contentFillInflight.Store(0)
 	contentFillInflightBytes.Store(0)
@@ -788,6 +825,12 @@ func registerContentFillExpvar() {
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_join_waiting", expvar.Func(func() any {
 			return contentFillJoinWaiting.Load()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_refresh_reused_total", expvar.Func(func() any {
+			return contentFillRefreshReused.Load()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_refresh_coalesced_total", expvar.Func(func() any {
+			return contentFillRefreshCoalesced.Load()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_not_servable_total", expvar.Func(func() any {
 			return contentFillNotServable.Load()

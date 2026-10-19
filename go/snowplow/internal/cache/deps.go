@@ -788,6 +788,14 @@ type DepTracker struct {
 	// that ever produced a dep event (not a per-coordinate map).
 	gvrLastBump sync.Map
 
+	// gvrLastTypeBump — #765: the depEventSeq of the LAST type-level event on the GVR
+	// (bumpResourceTypeGen: available / removed / schema relisted / store repaired),
+	// gvr -> *atomic.Uint64. A listOnly type event stamps only the GVR's LIST buckets,
+	// so a GET content cell's own bucket cannot show it; ContentStampCovers checks this
+	// too, so a type event since a content cell's read always re-fills it. Bounded by the
+	// GVRs that ever produced a type event.
+	gvrLastTypeBump sync.Map
+
 	// totalRecords is the global record count — bounded by maxRecords.
 	totalRecords atomic.Int64
 	maxRecords   int64
@@ -1232,6 +1240,8 @@ func (d *DepTracker) bumpResourceTypeGen(gvr schema.GroupVersionResource, listOn
 	fireDepBumpHook("after_add")
 	fI, _ := d.gvrLastBump.LoadOrStore(gvr, new(atomic.Uint64))
 	storeMaxSeq(fI.(*atomic.Uint64), s)
+	tI, _ := d.gvrLastTypeBump.LoadOrStore(gvr, new(atomic.Uint64)) // #765
+	storeMaxSeq(tI.(*atomic.Uint64), s)
 	d.forward.Range(func(k, v any) bool {
 		dk := k.(DepKey)
 		if dk.GVR == gvr && (!listOnly || dk.Name == listWildcard) {

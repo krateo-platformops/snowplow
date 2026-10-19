@@ -89,6 +89,12 @@ func fill710HeapObjects() int64 {
 // of heap/objects (live + unswept garbage) over the start, and how many
 // readers were served.
 func fill710RefreshBurst(store *cache.ResolvedCacheStore, lists, readers int) (liveGrowth, objGrowth, served int64) {
+	// #765 — a refresher re-fills a resident cell only when a change landed after
+	// its read (the content stamp). The burst is the refresh of every list after
+	// one change to each, so each list is re-filled, as before #765.
+	for n := 0; n < lists; n++ {
+		cache.BumpCoordinateForTest(r1FsaGVR, fill710NS(n), "fsa-00000")
+	}
 	return fill710Burst(store, lists, readers, fill710BgCtx)
 }
 

@@ -574,11 +574,19 @@ func apistageContentServeAttempt(
 	// GVR that marked or remarked the key before this dequeue), not equality with a
 	// single last-write GVR.
 	_, refresherDriven := cache.RefreshTriggerGVRFromContext(ctx)
-	forceContentMiss := refresherDriven && cache.RefreshTriggerHas(ctx, gvr)
 	// #710 PR-2b — a debt's refill always re-dispatches (it exists because the
 	// cell is known-stale).
-	if contentDebtRefillFromContext(ctx) {
-		forceContentMiss = true
+	forceContentMiss := contentDebtRefillFromContext(ctx)
+	// #765 option A — the content stamp. A refresher re-resolve whose trigger set
+	// holds this cell's GVR no longer discards the cell unconditionally: it re-fills
+	// only when the cell's read may be OLDER than a trigger it consumed
+	// (cache.ContentStampCovers against cache.RefreshTriggerAsOf), and otherwise
+	// reuses it. N dependents refreshed after one change share one re-fill. The R1
+	// shield's guarantee — a refreshed cell is never built from a snapshot older
+	// than the change that triggered it — is exactly the stamp check.
+	var stamp contentStampGate
+	if !forceContentMiss && refresherDriven && cache.RefreshTriggerHas(ctx, gvr) {
+		stamp = contentStampGate{on: true, need: cache.RefreshTriggerAsOf(ctx)}
 	}
 	// #376 — the content cell is stamped ONLY by a true customer serve. On
 	// forceContentMiss the entry is discarded + re-dispatched fresh anyway → skip the
@@ -626,7 +634,7 @@ func apistageContentServeAttempt(
 		// this customer's cell (apistage_stale_debt.go). Decided, read and
 		// registered in one critical section. Any other reader falls through to
 		// #547's read-through below.
-		if sink, ok := staleServeEligible(ctx); ok && !forceContentMiss {
+		if sink, ok := staleServeEligible(ctx); ok && !forceContentMiss && !stamp.on {
 			if e, served := serveStaleWithDebt(ctx, sink, store, k, call, gvr.String(), cache.DepKey{GVR: gvr, Namespace: ns, Name: name}); served {
 				return e, true
 			}
@@ -638,6 +646,23 @@ func apistageContentServeAttempt(
 		case cache.KnownStaleReadThrough(k):
 			fillReason = contentFillKnownStale
 			return nil, false
+		case stamp.on:
+			// #765 — a refresher read is never a customer serve: no warmth stamp
+			// (#376/#552). Through cache.ServeCellIf (the #643 served-cell
+			// path): the cell is served — and noted — only if its content stamp
+			// covers the refresh's triggers.
+			e, hit, served := cache.ServeCellIf(ctx, store, k, func(e *cache.ResolvedEntry) bool {
+				return cache.ContentStampCovers(gvr, ns, name, e.ContentAsOf, stamp.need)
+			}, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			if !hit {
+				return nil, false
+			}
+			if !served {
+				fillReason = contentFillRefreshForced
+				return nil, false
+			}
+			noteContentRefreshReused(gvr.String())
+			return e, true
 		case cache.BackgroundResolveFromContext(ctx) || cache.Inert(ctx):
 			// #443 (e) — an inert (dry-run) resolve reads the cell as input
 			// but must not stamp it warm either.
@@ -737,7 +762,7 @@ func apistageContentServeAttempt(
 			slog.Bool("preparsed", haveParsed),
 			slog.String("key_hash", contentKey),
 		)
-	} else if flight, fillCtx, lead := enterContentFlight(ctx, contentKey, gvr, ns, name, fillReason); !lead {
+	} else if flight, fillCtx, lead := enterContentFlight(ctx, contentKey, gvr, ns, name, fillReason, stamp); !lead {
 		// MISS, JOINER (#710 PR-1, apistage_fill_flight.go) — an in-flight fill of
 		// this key started after this reader's coordinate last moved, so its body is
 		// as fresh as this reader's own fill would be. Serve the flight's envelope
@@ -834,11 +859,21 @@ func apistageContentServeAttempt(
 		// The exact size is known: the held weight becomes exact, in place.
 		gate.reconcile(flight.ticket, int64(len(dispatched)))
 		envelope = dispatched
+		// #765 — the content stamp: this cell is fresh as of the flight's entry
+		// seq, captured (WithContentDepGenSink) before the data read above. A
+		// snapshot stored while the informer is not servable may be degraded
+		// (R1 Layer 2): it stays unstamped (0), so a refresher always re-fills it.
+		servable := cache.Global().IsServable(gvr)
+		var contentAsOf uint64
+		if servable {
+			contentAsOf = flight.startSeq
+		}
 		// uaf-scope-waiver: PRE-refilter substrate, same reasoning as cluster_list.go — the raw per-K8s-call envelope, identity-free by key, narrowed only downstream on the way to the requester. Never holds refilter output.
 		// scope-waiver:TTLOverride: apistage identity-free content substrate — sets its OWN data-plane CATALOG_UNSERVABLE TTLOverride CONDITIONALLY on newEntry below (not a keyed literal element); NOT the UAF-cap class (no BindingUID / no per-user refilter output) — uaf_shortttl.go R-d-4 SITE MAP.
 		newEntry := &cache.ResolvedEntry{
-			RawJSON: dispatched,
-			Inputs:  ptrTo(contentKeyInputsQ(gvr, ns, name, query.canon)),
+			RawJSON:     dispatched,
+			Inputs:      ptrTo(contentKeyInputsQ(gvr, ns, name, query.canon)),
+			ContentAsOf: contentAsOf,
 		}
 		// R1 Layer 2 (#36): bounded-staleness backstop. If this content
 		// entry is being stored while its GVR informer is NOT servable
@@ -849,7 +884,7 @@ func apistageContentServeAttempt(
 		// even if a dirty-mark / refresh-ordering gap is missed. Uniform
 		// over every GVR (no path/resource special-case — feedback_no_special_cases);
 		// disabled (TTLOverride stays 0 → standard TTL) when the env is unset.
-		if ttl := cache.CatalogUnservableTTL(); ttl > 0 && !cache.Global().IsServable(gvr) {
+		if ttl := cache.CatalogUnservableTTL(); ttl > 0 && !servable {
 			newEntry.TTLOverride = ttl
 		}
 		// R3: parse the LIST envelope ONCE and attach the items to the

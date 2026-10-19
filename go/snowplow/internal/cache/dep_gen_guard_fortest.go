@@ -80,3 +80,12 @@ func DepGenSinkForTest(ctx context.Context) (startSeq uint64, deps []DepKey, ok 
 
 // ResetUnguardedPutTotalForTest zeroes the #375 detector on the Deps() singleton.
 func ResetUnguardedPutTotalForTest() { Deps().unguardedPutTotal.Store(0) }
+
+// BumpCoordinateForTest advances the dep-event generation of one coordinate
+// exactly as a real post-indexer object event does (bumpCoordinateGen), WITHOUT
+// the dirty-mark fan-out: a content cell read before it is then older than "a
+// change", so a refresher re-resolve re-fills it (#765 content stamp). For arms
+// that need N refresh re-fills of resident cells and do not care what changed.
+func BumpCoordinateForTest(gvr schema.GroupVersionResource, namespace, name string) {
+	Deps().bumpCoordinateGen(gvr, namespace, name)
+}
