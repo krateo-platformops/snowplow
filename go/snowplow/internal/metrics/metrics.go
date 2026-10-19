@@ -1710,12 +1710,17 @@ func registerStaleServeInstruments(m metric.Meter) error {
 	}
 	restactionsapi.SetStaleServeAgeRecorder(func(ms int64) { serveAge.Record(context.Background(), ms) })
 	debtOpen, err := m.Int64ObservableGauge("snowplow_apistage_stale_debt_open",
-		metric.WithDescription("Open stale-serve debts (content cells served stale whose refill has not committed). 0 when healthy; growing = the guarantee failing. #710 PR-2b."))
+		metric.WithDescription("Open ACTIVE stale-serve debts (content cells served stale whose refill has not committed and someone views); parked debts are snowplow_apistage_stale_debt_parked. 0 when healthy; growing = the guarantee failing. #710 PR-2b, #740."))
+	if err != nil {
+		return err
+	}
+	debtParked, err := m.Int64ObservableGauge("snowplow_apistage_stale_debt_parked",
+		metric.WithDescription("D2 debts PARKED: their refill keeps failing and no /refreshes tab views a dependent, so they are not retried (the cell is kept and served); an arm of a dependent or a new stale serve resumes them. Not an alert: nobody is looking. #740."))
 	if err != nil {
 		return err
 	}
 	oldest, err := m.Int64ObservableGauge("snowplow_apistage_stale_debt_oldest_age_ms",
-		metric.WithDescription("Age of the oldest open stale-serve debt (ms). #710 PR-2b."), metric.WithUnit("ms"))
+		metric.WithDescription("Age of the oldest ACTIVE stale-serve debt (ms), measured from its current viewed episode (parked debts excluded). #710 PR-2b, #740."), metric.WithUnit("ms"))
 	if err != nil {
 		return err
 	}
@@ -1773,6 +1778,7 @@ func registerStaleServeInstruments(m metric.Meter) error {
 		s := restactionsapi.StaleServeStatsSnapshot()
 		o.ObserveInt64(serveTotal, int64(s.ServeTotal), metric.WithAttributes(attribute.String("reason", "known_stale")))
 		o.ObserveInt64(debtOpen, s.DebtOpen)
+		o.ObserveInt64(debtParked, s.DebtParked)
 		o.ObserveInt64(oldest, s.DebtOldestAgeMS)
 		o.ObserveInt64(retries, int64(s.DebtRetries))
 		o.ObserveInt64(overdue, int64(s.OverdueTotal))
@@ -1785,7 +1791,7 @@ func registerStaleServeInstruments(m metric.Meter) error {
 		o.ObserveInt64(owedArm, int64(s.Owed.ArmEmits))
 		o.ObserveInt64(replaceRetries, int64(s.ReplaceRetries))
 		return nil
-	}, serveTotal, debtOpen, oldest, retries, overdue, pushes, unarmed, unresolved, withdrawn, owedOpen, owedDropped, owedArm, replaceRetries)
+	}, serveTotal, debtOpen, debtParked, oldest, retries, overdue, pushes, unarmed, unresolved, withdrawn, owedOpen, owedDropped, owedArm, replaceRetries)
 	return err
 }
 
