@@ -41,20 +41,21 @@ func TestIssue638_TemplateFieldRender_NoResponseBytes(t *testing.T) {
 			Namespace:  "${ .secret[] }",
 		},
 	}}
+	// #651 (a) — a failing field now FAILS the template (no ref carries error
+	// text any more), so the #638 property moves to the returned error: it is
+	// served as status.error and logged, and must carry the class only.
 	refs, err := Resolve(ctx, items, ds)
-	if err != nil {
-		t.Fatalf("Resolve errored: %v", err)
+	if err == nil {
+		t.Fatalf("Resolve did not fail on failing field expressions: refs=%+v", refs)
 	}
-	if len(refs) != 1 {
-		t.Fatalf("expected 1 ref, got %d", len(refs))
+	if len(refs) != 0 {
+		t.Errorf("a failing template emitted refs: %+v", refs)
 	}
-	for field, v := range map[string]string{"id": refs[0].ID, "name": refs[0].Name, "namespace": refs[0].Namespace} {
-		if strings.Contains(v, s638Sentinel) {
-			t.Errorf("ref %s carries response bytes: %q", field, v)
-		}
-		if !strings.Contains(v, "jq runtime error") {
-			t.Errorf("ref %s = %q: the arm did not exercise a runtime error", field, v)
-		}
+	if strings.Contains(err.Error(), s638Sentinel) {
+		t.Errorf("the field error carries response bytes: %v", err)
+	}
+	if !strings.Contains(err.Error(), "jq runtime error") {
+		t.Errorf("field error = %v: the arm did not exercise a runtime error", err)
 	}
 
 	// Iterator: a runtime error over the value — returned and logged.

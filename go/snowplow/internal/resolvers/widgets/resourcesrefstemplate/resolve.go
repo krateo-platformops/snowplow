@@ -7,6 +7,7 @@ package resourcesrefstemplate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -49,10 +50,11 @@ func createResourceReferencesFromTemplate(ctx context.Context, in *templatesv1.R
 		// the template. Not a fault; fires per-template — DEBUG, not WARN.
 		log.Debug("bad or empty iterator", slog.String("iterator", it))
 
-		all = make([]templatesv1.ResourceRef, 0, 1)
-		el := createResourceRef(in, ds)
-		all = append(all, el)
-		return
+		el, err := createResourceRef(ctx, in, ds)
+		if err != nil {
+			return nil, err
+		}
+		return []templatesv1.ResourceRef{el}, nil
 	}
 
 	all = []templatesv1.ResourceRef{}
@@ -60,11 +62,18 @@ func createResourceReferencesFromTemplate(ctx context.Context, in *templatesv1.R
 	// #638 — the shared iterator contract (jqsupport.IterateValues): the
 	// pre-#638 element semantics, except that a single null or no value is an
 	// empty expansion, and a runtime error carries no value preview (the log
-	// line below used to print response bytes).
+	// line below used to print response bytes). #651 — with the module loader,
+	// like every other resolve-path jq surface.
 	var elems []any
-	elems, err = jqsupport.IterateValues(ctx, q, ds, nil)
+	elems, err = jqsupport.IterateValues(ctx, q, ds, jqsupport.ModuleLoader())
 	for _, sa := range elems {
-		all = append(all, createResourceRef(in, sa))
+		el, ferr := createResourceRef(ctx, in, sa)
+		if ferr != nil {
+			// #651 — a failing field fails the WHOLE template: no partial
+			// expansion is ever handed to resourcesrefs.Resolve.
+			return nil, ferr
+		}
+		all = append(all, el)
 	}
 	if err != nil {
 		log := xcontext.Logger(ctx)
@@ -81,25 +90,40 @@ func createResourceReferencesFromTemplate(ctx context.Context, in *templatesv1.R
 	return
 }
 
-func createResourceRef(in *templatesv1.ResourceRefTemplate, ds any) (out templatesv1.ResourceRef) {
-	out.ID = evalJQ(in.Template.ID, ds)
+// createResourceRef renders one ref from the template. #651 (a) — a field
+// expression that fails returns the error: the template fails, never a ref
+// carrying error text in its fields (the pre-#651 swallow, the same one
+// #293/#302/#341 removed from the RESTAction path render).
+func createResourceRef(ctx context.Context, in *templatesv1.ResourceRefTemplate, ds any) (out templatesv1.ResourceRef, err error) {
 	out.Verb = in.Template.Verb
-
-	out.APIVersion = evalJQ(in.Template.APIVersion, ds)
-	out.Name = evalJQ(in.Template.Name, ds)
-	out.Namespace = evalJQ(in.Template.Namespace, ds)
-	out.Resource = evalJQ(in.Template.Resource, ds)
-
-	return
+	for _, f := range []struct {
+		name string
+		q    string
+		dst  *string
+	}{
+		{"id", in.Template.ID, &out.ID},
+		{"apiVersion", in.Template.APIVersion, &out.APIVersion},
+		{"name", in.Template.Name, &out.Name},
+		{"namespace", in.Template.Namespace, &out.Namespace},
+		{"resource", in.Template.Resource, &out.Resource},
+	} {
+		if *f.dst, err = evalJQE(ctx, f.q, ds); err != nil {
+			return templatesv1.ResourceRef{}, fmt.Errorf("resourcesRefsTemplate %s: %w", f.name, err)
+		}
+	}
+	return out, nil
 }
 
-func evalJQ(q string, ds any) string {
+// evalJQE renders one template field: a non-jq literal as is, a jq expression
+// as its unquoted result. #638 — the error carries the class, never the value
+// preview gojq renders (it is served as status.error and logged).
+func evalJQE(ctx context.Context, q string, ds any) (string, error) {
 	q, ok := jqutil.MaybeQuery(q)
 	if !ok {
-		return q
+		return q, nil
 	}
 
-	out, err := jqutil.Eval(context.TODO(),
+	out, err := jqutil.Eval(ctx,
 		jqutil.EvalOptions{
 			Query:        q,
 			Unquote:      true,
@@ -107,12 +131,7 @@ func evalJQ(q string, ds any) string {
 			ModuleLoader: jqsupport.ModuleLoader(),
 		})
 	if err != nil {
-		// #638 — the error text lands in the ref's id/name/namespace fields,
-		// which are served and logged: keep the class, never the value preview
-		// gojq renders. (Surfacing the error instead of a garbage field is
-		// #651 (a).)
-		out = jqsupport.SanitizeError(err).Error()
+		return "", jqsupport.SanitizeError(err)
 	}
-
-	return out
+	return out, nil
 }

@@ -143,7 +143,15 @@ type refilterResult struct {
 	Kept              int
 	Dropped           int
 	EvaluateRBACCalls int
+	// ResourcesUnresolved (#651): resourcesFrom did not resolve to a resource
+	// set, so every item was dropped (fail-closed). The empty answer is served,
+	// but it is a stage failure, not "no resources": the caller records it.
+	ResourcesUnresolved bool
 }
+
+// uafResourcesUnresolvedMsg is the stage-error text for ResourcesUnresolved: a
+// fixed class, never the expression's value (it reaches the decline log).
+const uafResourcesUnresolvedMsg = "userAccessFilter: resourcesFrom did not resolve to a set of resource names; every item dropped (fail-closed)"
 
 // applyUserAccessFilter is the entrypoint the resolver calls when an
 // API stage declares userAccessFilter. It mutates dict[apiCall.Name]
@@ -227,6 +235,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 			slog.String("api", apiCall.Name),
 		)
 		_ = setRefilteredEmpty(dict, apiCall.Name)
+		res.ResourcesUnresolved = true
 		return res
 	}
 
@@ -861,6 +870,7 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 			slog.String("api", stageName),
 		)
 		_ = setRefilteredEmpty(pig, stageName)
+		res.ResourcesUnresolved = true
 		return res
 	}
 
