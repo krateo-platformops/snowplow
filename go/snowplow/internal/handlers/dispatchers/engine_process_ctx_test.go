@@ -5,7 +5,6 @@
 package dispatchers
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -25,7 +24,7 @@ func TestEngineWorker_NilProcessCtxLogsErrorOnce(t *testing.T) {
 
 	// Capture slog output via a buffered handler. Replace the default
 	// logger and restore after the test.
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := slog.Default()
 	defer slog.SetDefault(prev)
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
@@ -74,7 +73,7 @@ func TestEngineWorker_SetEngineProcessContextSuppressesNilFallback(t *testing.T)
 	ResetEngineProcessCtxForTest()
 	defer ResetEngineProcessCtxForTest()
 
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := slog.Default()
 	defer slog.SetDefault(prev)
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
@@ -104,7 +103,7 @@ func TestEngineWorker_ResetEngineProcessCtxForTestResetsOnceGate(t *testing.T) {
 	quiesceDefaultSummaryForTest(t) // #221: two TextHandler default-slog captures (buf1/buf2) — quiesce the summary goroutine for the whole func
 	// First nil-fire cycle.
 	ResetEngineProcessCtxForTest()
-	var buf1 bytes.Buffer
+	var buf1 syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf1, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
@@ -117,7 +116,7 @@ func TestEngineWorker_ResetEngineProcessCtxForTestResetsOnceGate(t *testing.T) {
 
 	// Reset + second nil-fire cycle MUST fire again.
 	ResetEngineProcessCtxForTest()
-	var buf2 bytes.Buffer
+	var buf2 syncBuffer
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf2, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	})))

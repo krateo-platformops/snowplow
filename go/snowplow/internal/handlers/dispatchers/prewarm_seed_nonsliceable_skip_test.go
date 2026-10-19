@@ -127,6 +127,14 @@ func buildFixBWatcher(t *testing.T, ras ...*unstructured.Unstructured) {
 		wcancel()
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	// #392 — join this watcher's RBAC initial-publish goroutine (it logs
+	// initial_publish_done through the DEFAULT slog logger) before the test
+	// captures that logger, so its line cannot land in the capture window.
+	if err := rw.WaitInitialRBACPublishForTest(5 * time.Second); err != nil {
+		rw.Stop()
+		wcancel()
+		t.Fatalf("WaitInitialRBACPublishForTest: %v", err)
+	}
 	cache.RebuildRBACSnapshotForTest(rw)
 	prev := cache.Global()
 	cache.SetGlobal(rw)
@@ -214,6 +222,14 @@ func buildDivergentBindingWatcher(t *testing.T, ras ...*unstructured.Unstructure
 		wcancel()
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	// #392 — join this watcher's RBAC initial-publish goroutine (it logs
+	// initial_publish_done through the DEFAULT slog logger) before the test
+	// captures that logger, so its line cannot land in the capture window.
+	if err := rw.WaitInitialRBACPublishForTest(5 * time.Second); err != nil {
+		rw.Stop()
+		wcancel()
+		t.Fatalf("WaitInitialRBACPublishForTest: %v", err)
+	}
 	cache.RebuildRBACSnapshotForTest(rw)
 	prev := cache.Global()
 	cache.SetGlobal(rw)
@@ -250,7 +266,7 @@ func TestFixB_SeedSkipsKnownNonSliceable(t *testing.T) {
 	ctx := fixBCtxUser()
 
 	// Capture logs to detect the FIX-B skip line.
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(prevDefault) })
@@ -311,7 +327,7 @@ func TestFixG_SeedSkipsPerKeyNonPermanentNegative(t *testing.T) {
 	buildDivergentBindingWatcher(t, perKeyRA, unrecRA)
 	ctx := divergentCtxUser() // userD: RA-CR first-match ≠ widget first-match
 
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(prevDefault) })

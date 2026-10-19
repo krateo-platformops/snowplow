@@ -15,7 +15,6 @@
 package dispatchers
 
 import (
-	"bytes"
 	"encoding/json"
 	"expvar"
 	"log/slog"
@@ -52,7 +51,7 @@ func TestF367_ArmR_InitFromEnvContract(t *testing.T) {
 	// Unparseable NON-EMPTY values fail-safe OFF AND emit one WARN naming the value
 	// (so a typo'd opt-in is not silent, #367 cond. 5); empty/unset stays SILENT.
 	// Capture slog to assert the WARN behaviour.
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

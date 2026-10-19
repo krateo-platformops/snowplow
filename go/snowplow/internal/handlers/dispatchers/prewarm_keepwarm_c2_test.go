@@ -84,7 +84,7 @@ func TestC2AgeSkip_YoungSkipped_OldReResolved(t *testing.T) {
 		t.Fatalf("C2-C3 setup: granted cohort must derive a real non-empty-binding key; key=%q inputs=%+v", key, inputs)
 	}
 
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -439,7 +439,7 @@ func TestC2CohortSummary_LineContent_MixedFixture(t *testing.T) {
 	}
 	t.Cleanup(func() { seedOneWidgetFn = prevW })
 
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

@@ -181,7 +181,7 @@ func TestFixC_SeedOneWidget_SkipsEmptyBinding(t *testing.T) {
 	buildFixCWatcher(t)
 	e := fixCWidgetEntry()
 
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(prevDefault) })
