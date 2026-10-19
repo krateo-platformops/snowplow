@@ -201,7 +201,7 @@ def test_default_capture_prefixes_cover_every_run8_key():
     assert load606.prefixes_missing(load606.RUN8_VARS_PREFIXES) == []
     assert "snowplow_stale_retry_viewers" in load606.prefixes_missing(
         [p for p in load606.RUN8_VARS_PREFIXES if p != "snowplow_stale_retry_"])
-    assert load606.prefixes_missing([]) == sorted(set(K.values()))
+    assert load606.prefixes_missing([]) == sorted(set(K.values()) | set(load606.RUN9_KEYS.values()))
 
 
 # ─── 3. Q2–Q4 gates: the bars are the rulings, and both sides of each bar ──
@@ -340,9 +340,12 @@ def test_q4_retry_deltas_and_the_viewer_gate_lead():
     assert q4["retry_total_delta"]["genuine"]["demand"] == 3
     assert q4["retry_abandoned_delta"] == {"no_viewer": 3, "evicted": 1}
     vg = q4["viewer_gate"]
-    assert vg["genuine_retries_with_no_viewer_either_side"] == 1 and vg["first_such_t"] == 115
-    assert "LEAD" in vg["note"]
-    # a lead, never a verdict
+    # stale_retry_total counts SCHEDULED retries (stale_retry.go:227-231); a
+    # wake with no viewer is abandoned. Reported as scheduled vs abandoned,
+    # never as "retries run without a viewer" (run 8's misreading).
+    assert vg["genuine_retries_scheduled"] == 3 and vg["abandoned_no_viewer"] == 3
+    assert vg["abandoned_evicted"] == 1 and vg["viewers_max"] == 1
+    assert "SCHEDULED" in vg["note"] and "suspect" not in json.dumps(vg)
     assert not [c for c in checks if c["check"].startswith("run8.740") and c["result"] == "FAIL"]
 
 

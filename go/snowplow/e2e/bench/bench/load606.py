@@ -121,6 +121,20 @@ class Response:
     body: bytes
     ms: float
     error: str = ""
+    # (X-Snowplow-Refresh-Key, X-Snowplow-Refresh-Class) when snowplow keyed
+    # the /call response — what the SPA arms its /refreshes stream with.
+    refresh: tuple | None = None
+
+
+REFRESH_HEADER_KEY = "X-Snowplow-Refresh-Key"
+REFRESH_HEADER_CLASS = "X-Snowplow-Refresh-Class"
+REFRESH_CLASSES = ("widgets", "widgetContent", "restactions")
+
+
+def _refresh_headers(headers) -> tuple | None:
+    key = headers.get(REFRESH_HEADER_KEY) if headers else None
+    cls = headers.get(REFRESH_HEADER_CLASS) if headers else None
+    return (key, cls) if key and cls in REFRESH_CLASSES else None
 
 
 class HttpClient:
@@ -138,13 +152,304 @@ class HttpClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 raw = r.read()
                 return Response(r.status, _decode(raw, r.headers),
-                                (time.perf_counter() - t0) * 1000)
+                                (time.perf_counter() - t0) * 1000,
+                                refresh=_refresh_headers(r.headers))
         except urllib.error.HTTPError as e:
             return Response(e.code, b"", (time.perf_counter() - t0) * 1000,
                             f"http {e.code}")
         except Exception as e:  # noqa: BLE001 — every failure is a sample
             return Response(0, b"", (time.perf_counter() - t0) * 1000,
                             f"{type(e).__name__}: {e}")
+
+
+# ─── /refreshes viewers (#764) ──────────────────────────────────────────────
+#
+# The portal arms ONE multiplexed /refreshes stream per tab over every widget
+# it rendered, and refetches a widget's /call when a `refresh` frame carries
+# its key (frontend ui/src/hooks/refreshSse.ts; snowplow
+# docs/howto-frontend-live-refresh-sse.md). Without it, snowplow's #710
+# stale-then-push path and #740 viewer-gated retries have no viewer and never
+# run (run 8: stale_retry_viewers 0 in all 351 samples). The bench mirrors the
+# SPA's protocol, not its own:
+#   - coordinates from the widget's own /call query + the verbatim
+#     X-Snowplow-Refresh-Class (refreshSse.ts buildRefreshCoords);
+#   - POST /refreshes with the JSON coordinate array, Bearer auth; GET
+#     ?sub=<base64url> when the server answers 404/405 (refreshSse.ts open());
+#   - <= 512 coordinates per stream (MAX_WIDGETS);
+#   - on `event: refresh`, refetch the matching widget(s): leading edge, one
+#     trailing catch-up per 5 s window (REFRESH_THROTTLE_MS), at most 6
+#     refetches in flight per tab (MAX_INFLIGHT_REFETCH);
+#   - reconnect with capped, jittered backoff 1 s .. 30 s.
+# SIZING: one stream (one reader thread) per virtual user = 1000 concurrent
+# streams for the 1000-user run, i.e. one tab per user, the production shape.
+# Threads are created with a 512 KiB stack (VIEWER_STACK_BYTES): ~1000
+# threads fit easily in the driver pod (3 CPU / 4Gi); they are idle in a
+# socket read between frames (keepalive every 20 s).
+
+REFRESH_MAX_COORDS = 512
+REFRESH_THROTTLE_S = 5.0
+REFRESH_MAX_INFLIGHT = 6
+REFRESH_BACKOFF_BASE_S = 1.0
+REFRESH_BACKOFF_MAX_S = 30.0
+VIEWER_STACK_BYTES = 512 * 1024
+
+
+def refresh_coords(path: str, cls: str) -> dict | None:
+    """A widget's subscription coordinates from the /call query it was fetched
+    with (refreshSse.ts buildRefreshCoords). None when they can't form one."""
+    if cls not in REFRESH_CLASSES or not path.startswith("/call?"):
+        return None
+    q = urllib.parse.parse_qs(path.split("?", 1)[1])
+    api = (q.get("apiVersion") or [""])[0]
+    resource = (q.get("resource") or [""])[0]
+    name = (q.get("name") or [""])[0]
+    if not api or not resource or not name:
+        return None
+    group, _, version = api.rpartition("/")
+    coords = {"class": cls, "group": group, "version": version, "resource": resource,
+              "namespace": (q.get("namespace") or [""])[0], "name": name}
+    for k in ("page", "perPage"):
+        v = (q.get(k) or [None])[0]
+        if v is not None:
+            try:
+                coords[k] = int(v)
+            except ValueError:
+                pass
+    extras = (q.get("extras") or [None])[0]
+    if extras:
+        try:
+            coords["extras"] = json.loads(extras)
+        except ValueError:
+            pass
+    return coords
+
+
+def _b64url(s: str) -> str:
+    return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
+
+
+def parse_sse(lines: Iterable[str]):
+    """Yield (event, data) per SSE block; comments (`: keepalive`) skipped."""
+    event, data = None, []
+    for raw in lines:
+        line = raw.rstrip("\r\n")
+        if line == "":
+            if event is not None or data:
+                yield event, "\n".join(data) if data else None
+            event, data = None, []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:"):
+            data.append(line[5:][1:] if line[5:6] == " " else line[5:])
+
+
+class RefreshStream:
+    """One tab's /refreshes stream: a reader thread that calls
+    on_refresh(key, t) per `refresh` frame, reconnecting until close()."""
+
+    def __init__(self, base_url: str, token: str, coords: list[dict],
+                 on_refresh: Callable[[str, float], None], *,
+                 on_state: Callable[[str, dict], None] | None = None,
+                 clock: Callable[[], float] = time.time):
+        self.base = base_url.rstrip("/")
+        self.token = token
+        self.coords = coords[:REFRESH_MAX_COORDS]
+        self.truncated = max(0, len(coords) - REFRESH_MAX_COORDS)
+        self.on_refresh = on_refresh
+        self.on_state = on_state or (lambda s, d: None)
+        self.clock = clock
+        self.closed = threading.Event()
+        self._resp = None
+        self._lock = threading.Lock()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> "RefreshStream":
+        self.thread.start()
+        return self
+
+    def _open(self):
+        hdrs = {"Authorization": "Bearer " + self.token, "Accept": "text/event-stream"}
+        body = json.dumps(self.coords).encode()
+        req = urllib.request.Request(self.base + "/refreshes", data=body, method="POST",
+                                     headers=dict(hdrs, **{"Content-Type": "application/json"}))
+        try:
+            return urllib.request.urlopen(req, timeout=90)
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 405):
+                raise
+        sub = _b64url(json.dumps(self.coords))
+        return urllib.request.urlopen(
+            urllib.request.Request(f"{self.base}/refreshes?sub={sub}", headers=hdrs), timeout=90)
+
+    def _loop(self):
+        attempt = 0
+        while not self.closed.is_set():
+            try:
+                resp = self._open()
+                with self._lock:
+                    if self.closed.is_set():
+                        resp.close()
+                        return
+                    self._resp = resp
+                attempt = 0
+                self.on_state("open", {"coords": len(self.coords), "truncated": self.truncated})
+                lines = (b.decode("utf-8", "replace") for b in resp)
+                for event, data in parse_sse(lines):
+                    if event == "refresh" and data:
+                        self.on_refresh(data, self.clock())
+                if self.closed.is_set():
+                    return
+                self.on_state("eof", {})
+            except Exception as e:  # noqa: BLE001 — a dropped stream reconnects
+                if self.closed.is_set():
+                    return
+                self.on_state("error", {"error": f"{type(e).__name__}: {e}"[:200]})
+            attempt += 1
+            delay = min(REFRESH_BACKOFF_MAX_S, REFRESH_BACKOFF_BASE_S * 2 ** (attempt - 1))
+            self.closed.wait(delay * random.uniform(0.75, 1.25))
+
+    def close(self):
+        self.closed.set()
+        with self._lock:
+            r, self._resp = self._resp, None
+        if r is not None:
+            try:
+                r.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+class ViewerHub:
+    """Every virtual user's open tab: the widgets of the shell plus the
+    current page are armed on that user's single stream; a `refresh` frame
+    refetches the widget like the SPA does (throttled, capped in flight) and
+    records one `push_refetch` sample."""
+
+    def __init__(self, client: HttpClient, pool: concurrent.futures.Executor,
+                 sink: Callable[[dict], None], *,
+                 stream_factory=RefreshStream,
+                 throttle_s: float = REFRESH_THROTTLE_S,
+                 max_inflight: int = REFRESH_MAX_INFLIGHT,
+                 clock: Callable[[], float] = time.time):
+        self.client = client
+        self.pool = pool
+        self.sink = sink
+        self.stream_factory = stream_factory
+        self.throttle_s = throttle_s
+        self.max_inflight = max_inflight
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.streams: dict[str, RefreshStream] = {}
+        self.paths: dict[str, dict[str, list[str]]] = {}     # user -> key -> paths
+        self.tokens: dict[str, str] = {}
+        self.window: dict[tuple, dict] = {}                   # (user, path) -> {until, pending}
+        self.inflight: dict[str, int] = {}
+        self.queue: dict[str, list] = {}
+        self.stats = {"streams_opened": 0, "frames": 0, "frames_unmatched": 0,
+                      "refetches": 0, "deferred": 0}
+
+    def view(self, user: str, token: str, entries: list[dict]) -> None:
+        """The user's tab now shows exactly `entries`: re-arm (one stream)."""
+        by_key: dict[str, list[str]] = {}
+        coords, seen = [], set()
+        for e in entries:
+            by_key.setdefault(e["key"], [])
+            if e["path"] not in by_key[e["key"]]:
+                by_key[e["key"]].append(e["path"])
+            c = json.dumps(e["coords"], sort_keys=True)
+            if c not in seen:
+                seen.add(c)
+                coords.append(e["coords"])
+        with self.lock:
+            old = self.streams.pop(user, None)
+            self.paths[user] = by_key
+            self.tokens[user] = token
+        if old is not None:
+            old.close()
+        if not coords:
+            return
+        s = self.stream_factory(self.client.base, token, coords,
+                                lambda key, t, u=user: self.on_refresh(u, key, t),
+                                on_state=lambda st, d, u=user: self._state(u, st, d))
+        with self.lock:
+            self.streams[user] = s
+            self.stats["streams_opened"] += 1
+        s.start()
+
+    def _state(self, user, state, detail):
+        if state != "open":
+            self.sink({"kind": "viewer", "user": user, "state": state, "t": self.clock(), **detail})
+
+    def on_refresh(self, user: str, key: str, t_event: float) -> None:
+        with self.lock:
+            self.stats["frames"] += 1
+            paths = list((self.paths.get(user) or {}).get(key, []))
+            if not paths:
+                self.stats["frames_unmatched"] += 1
+        for p in paths:
+            self._schedule(user, key, p, t_event)
+
+    def _schedule(self, user, key, path, t_event):
+        now = self.clock()
+        with self.lock:
+            w = self.window.get((user, path))
+            if w and now < w["until"]:
+                w["pending"] = (key, t_event)        # one trailing catch-up
+                self.stats["deferred"] += 1
+                return
+            self.window[(user, path)] = {"until": now + self.throttle_s, "pending": None}
+            if self.inflight.get(user, 0) >= self.max_inflight:
+                self.queue.setdefault(user, []).append((key, path, t_event))
+                return
+            self.inflight[user] = self.inflight.get(user, 0) + 1
+        self.pool.submit(self._refetch, user, key, path, t_event)
+
+    def _refetch(self, user, key, path, t_event):
+        try:
+            t_start = self.clock()
+            r = self.client.get(path, self.tokens.get(user))
+            # key is a cache-key hash: a prefix is enough to correlate, and no
+            # body or identity is recorded.
+            self.sink({"kind": "push_refetch", "user": user, "key": key[:16], "path": path[:200],
+                       "t_event": t_event,
+                       "start_lag_ms": round(max(0.0, t_start - t_event) * 1000, 1),
+                       "wall_ms": round(r.ms, 1), "status": r.status})
+            with self.lock:
+                self.stats["refetches"] += 1
+        finally:
+            nxt = None
+            with self.lock:
+                self.inflight[user] = max(0, self.inflight.get(user, 1) - 1)
+                q = self.queue.get(user)
+                if q:
+                    nxt = q.pop(0)
+                    self.inflight[user] += 1
+            if nxt is not None:
+                self.pool.submit(self._refetch, user, *nxt)
+
+    def flush_trailing(self) -> None:
+        """Fire the trailing catch-up of every window that has expired."""
+        now = self.clock()
+        due = []
+        with self.lock:
+            for (u, p), w in list(self.window.items()):
+                if now >= w["until"]:
+                    del self.window[(u, p)]
+                    if w["pending"]:
+                        due.append((u, p, w["pending"]))
+        for u, p, (key, t_event) in due:
+            self._schedule(u, key, p, t_event)
+
+    def close_all(self) -> dict:
+        with self.lock:
+            streams = list(self.streams.values())
+            self.streams.clear()
+        for s in streams:
+            s.close()
+        return dict(self.stats)
 
 
 def login(authn_url: str, user: str, password: str, timeout: float = 30) -> str:
@@ -341,6 +646,9 @@ class WalkResult:
     statuses: dict
     docs: dict            # path -> parsed doc (only when keep_docs)
     depth: int = 0        # levels of the tree actually fetched (1 = root only)
+    # The widgets a viewer would arm: [{"path", "key", "coords"}] for every
+    # 200 response that carried the refresh headers (#764).
+    armed: list = field(default_factory=list)
 
 
 def walk(client: HttpClient, token: str, roots: list[str], *,
@@ -361,6 +669,7 @@ def walk(client: HttpClient, token: str, roots: list[str], *,
     samples: list[str] = []
     statuses: dict[str, int] = {}
     docs: dict[str, dict] = {}
+    armed: list[dict] = []
     t0 = time.perf_counter()
     depth = 0
     while level and depth <= max_depth and calls < max_calls:
@@ -384,6 +693,11 @@ def walk(client: HttpClient, token: str, roots: list[str], *,
                         samples.append(f"{resp.status} {path[:160]} "
                                        f"{(resp.body or b'')[:240].decode('utf-8', 'replace') or resp.error}")
                     continue
+                ref = getattr(resp, "refresh", None)
+                if ref:
+                    coords = refresh_coords(path, ref[1])
+                    if coords is not None:
+                        armed.append({"path": path, "key": ref[0], "coords": coords})
                 try:
                     doc = json.loads(resp.body or b"null")
                 except ValueError:
@@ -397,7 +711,7 @@ def walk(client: HttpClient, token: str, roots: list[str], *,
         level = nxt
         depth += 1
     return WalkResult(round((time.perf_counter() - t0) * 1000, 1), calls, errors,
-                      nbytes, round(slowest, 1), samples, statuses, docs, depth)
+                      nbytes, round(slowest, 1), samples, statuses, docs, depth, armed)
 
 
 def walk_page(client: HttpClient, token: str, root: str, *,
@@ -492,6 +806,8 @@ class Driver:
                  composite_routes: list[str] | None = None,
                  burst_users: list[str] | None = None,
                  burst_at_s: float | None = None,
+                 viewers: bool = False,
+                 viewer_factory=None,
                  clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep):
         self.client = client
@@ -525,6 +841,12 @@ class Driver:
         self.retry_cap_s = retry_cap_s
         self.lock = threading.Lock()
         self.results: list[NavResult] = []
+        # #764: each user's tab arms /refreshes over the shell + current page.
+        self.shell_armed: dict[str, list] = {}
+        self.viewers = None
+        if viewers:
+            self.viewers = (viewer_factory or ViewerHub)(client, self.call_pool, self.sink,
+                                                        clock=clock)
 
     def _record(self, user, page, kind, started, due, w: WalkResult,
                 extra: WalkResult | None = None, routes: int | None = None,
@@ -580,6 +902,9 @@ class Driver:
                     else:
                         self.routes[user] = routes
                         self.not_before.pop(user, None)
+                        self.shell_armed[user] = shell.armed
+                if not failed and self.viewers is not None:
+                    self.viewers.view(user, tok, shell.armed + (content.armed if content else []))
                 page = routes[0]["path"] if routes else "(no-route)"
                 self._record(user, page, "first_load", started, due, shell,
                              content, routes=len(routes), failed=failed,
@@ -591,6 +916,8 @@ class Driver:
             r = self.rng.choice(routes)
             w = walk(self.client, tok, [r["endpoint"]], pool=self.call_pool,
                      per_user_parallel=self.per_user_parallel)
+            if self.viewers is not None:
+                self.viewers.view(user, tok, self.shell_armed.get(user, []) + w.armed)
             self._record(user, r["path"], "route", started, due, w)
         finally:
             with self.lock:
@@ -618,6 +945,9 @@ class Driver:
             self.burst_pending.discard(user)
             if not failed:
                 self.routes[user] = routes          # joins normal navigation
+                self.shell_armed[user] = shell.armed
+        if not failed and self.viewers is not None:
+            self.viewers.view(user, tok, shell.armed + (content.armed if content else []))
         page = target["path"] if target else "(no-composite-route)"
         self._record(user, page, "composite_first_load", started, due, shell, content,
                      routes=len(routes), failed=failed)
@@ -649,10 +979,14 @@ class Driver:
                     self.busy.add(u)
                 futures.append(self.nav_pool.submit(self._nav, u, t))
                 nxt[u] = t + self.rng.expovariate(1.0 / self.think_s)
+            if self.viewers is not None:
+                self.viewers.flush_trailing()
             soonest = min(nxt.values())
             self.sleep(max(0.0, min(0.05, soonest - self.clock())))
         for f in futures:
             f.result()
+        if self.viewers is not None:
+            self.sink({"kind": "viewer_stats", "t": self.clock(), **self.viewers.close_all()})
         self.nav_pool.shutdown(wait=True)
         self.call_pool.shutdown(wait=True)
         return self.results
@@ -668,6 +1002,7 @@ def freshness_probe(client: HttpClient, token: str, path: str,
                     sink: Callable[[dict], None] | None = None,
                     healthy: Callable[[], bool] | None = None,
                     pause_poll_s: float = 5.0, max_pause_s: float = 3600.0,
+                    push_since: Callable[[float], float | None] | None = None,
                     clock: Callable[[], float] = time.time,
                     sleep: Callable[[float], None] = time.sleep) -> list[dict]:
     """Mutate → poll until the marker is visible. One record per sample.
@@ -715,6 +1050,13 @@ def freshness_probe(client: HttpClient, token: str, path: str,
         rec = {"kind": "fresh", "label": label, "marker": marker,
                "converged": lat is not None, "latency_ms": lat,
                "polls": polls, "poll_ms": poll_ms, "t": t0}
+        if push_since is not None:
+            # #764: the probe's tab is ARMED on its cell; push_ms is mutate →
+            # the first `refresh` frame for the cell (what the SPA reacts to).
+            tp = push_since(t0)
+            rec["armed"] = True
+            rec["push_ms"] = (round((tp - t0) * 1000, 1)
+                              if tp is not None and tp - t0 <= budget_s else None)
         if not healthy():
             rec["valid"] = False
             rec["invalid_reason"] = "snowplow not Ready (/readyz) during the sample"
@@ -1165,7 +1507,8 @@ RUN8_VARS_PREFIXES = (
     "snowplow_apistage_content_fill",     # PR-0 family + #719 admission_*
     "snowplow_nested_resolve_",           # #720 nested gate
     "snowplow_apistage_stale_",           # PR-2b stale_to_push / overdue / debt
-    "snowplow_refresher_dirty_to_fresh",  # windowed gauges: poll the whole run
+    "snowplow_refresher_",                # dirty_to_fresh windowed gauges + run-9 counters
+    "snowplow_deps_dirty_mark_",          # run 9 (#765): marks per event
     "snowplow_resolved_cache",
     "snowplow_informer_dispatch_shape",
     "snowplow_build_info",
@@ -1184,10 +1527,27 @@ BYPASS_TIMEOUT_BAR = 0
 BURST_WINDOW_S = 120.0
 
 
+# Run 9 (#765 spec, issuecomment-6266045747): what run 8 could not measure —
+# dirty marks per event, the refresher's own throughput counters, and fills
+# by reason. Names checked against the 1.12.50 /debug/vars
+# (tests/fixtures/debug_vars_keys_1.12.50.json).
+RUN9_KEYS = {
+    "dirty_mark": "snowplow_deps_dirty_mark_attribution",   # by_entry_class, events_total, …
+    "enqueue": "snowplow_refresher_enqueue_total",
+    "completed": "snowplow_refresher_completed_total",
+    "floored": "snowplow_refresher_floored_total",
+    "queue_depth": "snowplow_refresher_queue_depth",
+    "remarked": "snowplow_refresher_dirty_ended_unfresh_remarked_total",
+    "d2f_samples": "snowplow_refresher_dirty_to_fresh_samples_total",
+    "fills_by_reason": "snowplow_apistage_content_fill_total",  # {absent, known_stale, refresh_forced}
+}
+
+
 def prefixes_missing(prefixes) -> list[str]:
-    """The RUN8_KEYS values no prefix in `prefixes` captures."""
+    """The RUN8_KEYS / RUN9_KEYS values no prefix in `prefixes` captures."""
     ps = tuple(p for p in prefixes if p)
-    return sorted(k for k in set(RUN8_KEYS.values()) if not ps or not k.startswith(ps))
+    need = set(RUN8_KEYS.values()) | set(RUN9_KEYS.values())
+    return sorted(k for k in need if not ps or not k.startswith(ps))
 
 
 def _hist_cum(h: dict, bound_ms: int) -> int | None:
@@ -1532,32 +1892,110 @@ def _q4_retry(mem: list[dict], chk, overdue_vals: list) -> dict:
             chk(f"run8.740.{k}", key, None, "reported", "FAIL", "not exposed")
             continue
         out[k + "_delta"] = _map_delta(s)
-    # Viewer gate, as far as 5–15 s samples can see it: an interval in which
-    # GENUINE retries rose while BOTH bounding samples show zero viewers is a
-    # LEAD to read in the logs — never a verdict (a chain can open, retry
-    # with a viewer and end between two samples).
-    rows = sorted((m for m in mem if m.get("kind") == "mem"
-                   and RUN8_KEYS["retry_total"] in (m.get("extra") or {})
-                   and RUN8_KEYS["retry_viewers"] in (m.get("extra") or {})),
-                  key=lambda m: m.get("t") or 0)
-
-    def genuine(m):
-        g = (m["extra"][RUN8_KEYS["retry_total"]] or {}).get("genuine") or {}
-        return sum(v for v in g.values() if _num(v) is not None)
-
-    suspect = [b.get("t") for a, b in zip(rows, rows[1:])
-               if genuine(b) > genuine(a)
-               and not _num(a["extra"][RUN8_KEYS["retry_viewers"]])
-               and not _num(b["extra"][RUN8_KEYS["retry_viewers"]])]
-    out["viewer_gate"] = {"intervals": max(len(rows) - 1, 0),
-                          "genuine_retries_with_no_viewer_either_side": len(suspect),
-                          "first_such_t": suspect[0] if suspect else None,
-                          "note": "a LEAD for the logs, not a verdict (sampling)"}
+    # Viewer gate. snowplow_stale_retry_total counts retries SCHEDULED
+    # (stale_retry.go:227-231, scheduleLocked), not attempts run; each wake
+    # re-checks for a viewer and ABANDONS the chain when there is none
+    # (stale_retry.go:258-262, abandoned_total{no_viewer}). So "retries rose
+    # while no viewer was sampled" is NOT evidence of retries run without a
+    # viewer (run 8's 84 "suspect intervals" were exactly that misreading).
+    # What /debug/vars can show is scheduled vs abandoned; an attempt run
+    # without a viewer is only visible in the logs.
+    sched = (out.get("retry_total_delta") or {}).get("genuine") or {}
+    aband = out.get("retry_abandoned_delta") or {}
+    n_sched = sum(v for v in sched.values() if _num(v) is not None) if sched else None
+    out["viewer_gate"] = {
+        "genuine_retries_scheduled": n_sched,
+        "abandoned_no_viewer": aband.get("no_viewer"),
+        "abandoned_evicted": aband.get("evicted"),
+        "viewers_max": (out.get("retry_viewers") or {}).get("max"),
+        "note": ("stale_retry_total counts retries SCHEDULED, not run; a wake with no "
+                 "viewer is abandoned (abandoned_total{no_viewer}). An attempt run "
+                 "without a viewer is not observable here: read the snowplow logs.")}
     parked = (out.get("debt_parked") or {}).get("max")
     chk("run8.740.parked_vs_overdue", RUN8_KEYS["debt_parked"],
         {"parked_max": parked, "overdue_total": out["stale_overdue_total_last"]},
         "reported (parked is NOT overdue; overdue gated separately)",
         "PASS" if parked is not None else "FAIL", None if parked is not None else "not exposed")
+    return out
+
+
+def _run9_refresh(mem: list[dict], chk) -> dict:
+    """Run 9 (#765): dirty marks per event, refresher throughput and fills by
+    reason over the measured window (first → last sample). Report-only; a key
+    no sample carries is "not exposed" and FAILS."""
+    out = {}
+    rows = sorted((m for m in mem if m.get("kind") == "mem"), key=lambda m: m.get("t") or 0)
+    dt = (rows[-1]["t"] - rows[0]["t"]) if len(rows) >= 2 else None
+    key = RUN9_KEYS["dirty_mark"]
+    dm = [v for v in _series(mem, key) if isinstance(v, dict)]
+    if not dm:
+        chk("run9.dirty_marks_per_event", key, None, "reported", "FAIL", "not exposed")
+    else:
+        ev = _first_last_delta([_num(v.get("events_total")) for v in dm])
+        cls = _map_delta([v.get("by_entry_class") or {} for v in dm])
+        marks = sum(x for x in cls.values() if _num(x) is not None) if cls else None
+        per = (round(marks / ev["delta"], 2) if ev["delta"] and marks is not None else None)
+        out["dirty_marks"] = {"events_delta": ev["delta"], "marks_delta": marks,
+                              "marks_per_event": per,
+                              "marks_per_event_by_class": (
+                                  {c: round(n / ev["delta"], 3) for c, n in cls.items()}
+                                  if ev["delta"] else None),
+                              "submit_source_delta": _map_delta(
+                                  [v.get("submit_source") or {} for v in dm])}
+        chk("run9.dirty_marks_per_event", key, per, "reported (no bar)", "PASS",
+            None if per is not None else "no dirty-mark events between samples")
+    thr = {}
+    for k in ("enqueue", "completed", "floored", "remarked", "d2f_samples"):
+        key = RUN9_KEYS[k]
+        vals = [_num(v) for v in _series(mem, key)]
+        if not [v for v in vals if v is not None]:
+            chk(f"run9.refresher.{k}", key, None, "reported", "FAIL", "not exposed")
+            continue
+        d = _first_last_delta(vals)
+        thr[k] = dict(d, per_s=round(d["delta"] / dt, 3) if d["delta"] is not None and dt else None)
+    out["refresher"] = thr
+    key = RUN9_KEYS["queue_depth"]
+    q = [v for v in (_num(x) for x in _series(mem, key)) if v is not None]
+    if not q:
+        q = [v for v in (_num(m.get("refresher_queue_depth")) for m in rows) if v is not None]
+    if not q:
+        chk("run9.refresher.queue_depth", key, None, "reported", "FAIL", "not exposed")
+    else:
+        out["queue_depth"] = {"p50": pct(q, 50), "p90": pct(q, 90), "max": max(q)}
+    key = RUN9_KEYS["fills_by_reason"]
+    fr = _series(mem, key)
+    if not [v for v in fr if isinstance(v, dict)]:
+        chk("run9.fills_by_reason", key, None, "reported", "FAIL", "not exposed")
+    else:
+        out["fills_by_reason_delta"] = _map_delta(fr)
+    return out
+
+
+# Checks that only mean something once a viewer existed and a stale serve
+# happened (#764). Without that, a PASS there is "never ran", not "healthy".
+EXERCISE_DEPENDENT_CHECKS = ("run8.stale_to_push.p95", "run8.stale_to_push.max",
+                             "run8.stale_push_unarmed_total", "run8.stale_overdue_total",
+                             "run8.740.parked_vs_overdue")
+
+
+def _exercised_710_740(q2: dict, q4: dict, chk, checks: list[dict]) -> dict:
+    """Did the #710 stale-then-push and #740 viewer paths run at all? If not,
+    every dependent PASS becomes INCONCLUSIVE (a FAIL stays a FAIL)."""
+    viewers = (q4.get("retry_viewers") or {}).get("max")
+    serves = (q2.get("apistage_stale_serve_total") or {}).get("last")
+    ok = bool(viewers) or bool(serves)
+    out = {"viewers_max": viewers, "stale_serve_total_last": serves, "exercised": ok}
+    if not ok:
+        why = ("NOT EXERCISED (#764): no /refreshes viewer (stale_retry_viewers never > 0) "
+               "and no stale serve (apistage_stale_serve_total 0) — this PASS would mean "
+               "'never ran'")
+        for c in checks:
+            if c["check"] in EXERCISE_DEPENDENT_CHECKS and c["result"] == "PASS":
+                c["result"] = "INCONCLUSIVE"
+                c["why"] = why + (f" ({c['why']})" if c.get("why") else "")
+    chk("run8.710_740_exercised", RUN8_KEYS["retry_viewers"], out, "a viewer and a stale serve",
+        "PASS" if ok else "INCONCLUSIVE",
+        None if ok else "no viewer and no stale serve during the run (#764)")
     return out
 
 
@@ -1675,6 +2113,8 @@ def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
     q2 = _q2_stale(mem, chk)
     q3 = _q3_admission(mem, chk)
     q4 = _q4_retry(mem, chk, ov_vals)
+    exercised = _exercised_710_740(q2, q4, chk, checks)
+    run9 = _run9_refresh(mem, chk)
 
     # ── background admission wait (and customer: users never queue) ──────
     key = RUN8_KEYS["admission_wait"]
@@ -1730,10 +2170,37 @@ def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
     report = {"memory_risk": risk, "stale_to_push": stp, "stale_overdue_delta": overdue,
               "stale_overdue_last": ov_vals[-1] if ov_vals else None,
               "q2_stale": q2, "q3_users_never_queue": q3, "q4_retry_740": q4,
+              "exercised_710_740": exercised, "run9_refresh": run9,
               "restart": restart,
               "admission_wait_ms": wait, "refresher_dirty_to_fresh": d2f, "build": build,
               "keys": RUN8_KEYS}
     return report, checks
+
+
+def push_report(fresh: list[dict]) -> dict:
+    """Per label, the ARMED probe's mutate → `refresh` frame time (#764).
+    Report-only: the #710 bar is snowplow's own stale_to_push histogram."""
+    out = {}
+    for label in sorted({f.get("label", "?") for f in fresh if f.get("armed")}):
+        rows = [f for f in fresh if f.get("label") == label and f.get("armed")
+                and f.get("valid") is not False]
+        push = [f["push_ms"] for f in rows if f.get("push_ms") is not None]
+        out[label] = {"samples": len(rows), "pushed": len(push),
+                      "no_push_within_budget": len(rows) - len(push),
+                      "p50_ms": pct(push, 50), "p95_ms": pct(push, 95),
+                      "max_ms": max(push) if push else None}
+    return out
+
+
+def push_refetch_report(rows: list[dict]) -> dict | None:
+    """The driver's viewers: refetches triggered by `refresh` frames (#764)."""
+    if not rows:
+        return None
+    ok = [r for r in rows if r.get("status") == 200]
+    return {"refetches": len(rows), "non_200": len(rows) - len(ok),
+            "users": len({r.get("user") for r in rows}),
+            "wall_p95_ms": pct([r.get("wall_ms") for r in ok], 95),
+            "start_lag_p95_ms": pct([r.get("start_lag_ms") for r in rows], 95)}
 
 
 def _check(name, value, op, bar, checks):
@@ -1755,7 +2222,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              tops: list[dict] | None = None,
              run8: bool = False,
              expected_digest: str | None = None,
-             image_digests: list[dict] | None = None) -> dict:
+             image_digests: list[dict] | None = None,
+             push_refetches: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -1840,6 +2308,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         "server_dirty_to_fresh_p95_ms_max_window": max(p95s) if p95s else None,
         "server_dirty_to_fresh_p95_ms_median_window": pct(p95s, 50),
         "fresh_curve_report_only": curve,
+        "fresh_push_report_only": push_report(fresh),
+        "push_refetch_report_only": push_refetch_report(push_refetches or []),
         "nav_kinds": {k: sum(1 for n in navs if n.get("nav") == k)
                       for k in sorted({n.get("nav") for n in navs if n.get("nav")})},
         "login": login_report(login_curves or []),
@@ -2281,11 +2751,19 @@ def _cmd_drive(a) -> int:
     if burst_users and not a.composite_route:
         print("composite burst requested but no --composite-route (none found at "
               "preflight): the burst records FAILED navigations", file=sys.stderr)
+    viewers = not a.no_viewers
+    if viewers:
+        # one reader thread per user's /refreshes stream (#764 sizing)
+        threading.stack_size(VIEWER_STACK_BYTES)
+    sink({"kind": "viewer_config", "enabled": viewers, "users": len(tokens),
+          "max_coords": REFRESH_MAX_COORDS, "throttle_s": REFRESH_THROTTLE_S,
+          "max_inflight_per_user": REFRESH_MAX_INFLIGHT})
     Driver(client, tokens, portal, think_s=a.think_s, duration_s=a.duration_s,
            nav_workers=a.nav_workers, call_workers=a.call_workers,
            sink=sink, composite_routes=a.composite_route or [],
            burst_users=burst_users,
-           burst_at_s=a.burst_at_s if burst_users else None).run()
+           burst_at_s=a.burst_at_s if burst_users else None,
+           viewers=viewers).run()
     stop.set()
     if th:
         th.join(timeout=a.vars_interval + 30)
@@ -2361,6 +2839,10 @@ def _cmd_fresh(a) -> int:
                != (a.namespace, a.probe_name)]
     path = call_path("templates.krateo.io", "v1", "restactions",
                      FRESH_RA_NAME, a.ra_namespace)
+    push_since = None
+    stream = None
+    if not a.no_viewer:
+        push_since, stream = arm_probe_viewer(client, token, path, sink)
     # Start only once the driver's navigations reach snowplow (run 7's first
     # samples ran during the login phase, with no read load at all).
     if a.wait_for_load:
@@ -2378,10 +2860,45 @@ def _cmd_fresh(a) -> int:
         freshness_probe(
             client, token, path, lambda m: patch(a.namespace, a.probe_name, m),
             samples=a.samples, poll_ms=a.poll_ms, gap_s=a.gap_s,
-            label=label, sink=sink, healthy=lambda: readyz(client))
+            label=label, sink=sink, healthy=lambda: readyz(client),
+            push_since=push_since)
         if churn:
             sink({"kind": "churn", "label": label, **churn.stop()})
+    if stream is not None:
+        stream.close()
     return 0
+
+
+def arm_probe_viewer(client: HttpClient, token: str, path: str, sink,
+                     stream_factory=RefreshStream):
+    """Arm a /refreshes viewer on the probe cell, like the SPA would after
+    rendering it. Returns (push_since, stream); (None, None) when snowplow did
+    not stamp the refresh headers (then nothing can be armed — recorded)."""
+    r = client.get(path, token)
+    ref = r.refresh
+    coords = refresh_coords(path, ref[1]) if ref else None
+    if coords is None:
+        sink({"kind": "fresh_viewer", "armed": False, "status": r.status,
+              "why": "no X-Snowplow-Refresh-Key/Class on the probe's /call"})
+        return None, None
+    key = ref[0]
+    events: list[float] = []
+    lock = threading.Lock()
+
+    def on_refresh(k, t):
+        if k == key:
+            with lock:
+                events.append(t)
+
+    def push_since(t0):
+        with lock:
+            return next((t for t in events if t >= t0), None)
+
+    stream = stream_factory(client.base, token, [coords], on_refresh,
+                            on_state=lambda st, d: sink({"kind": "fresh_viewer", "state": st,
+                                                         "t": time.time(), **d})).start()
+    sink({"kind": "fresh_viewer", "armed": True, "class": ref[1]})
+    return push_since, stream
 
 
 _MEM_FIELDS = (("HeapAlloc", "heap_alloc_mb"), ("HeapInuse", "heap_inuse_mb"),
@@ -2542,7 +3059,8 @@ def _cmd_evaluate(a) -> int:
                       snowplow_pods=[r for r in recs if r.get("kind") == "snowplow_pod"],
                       mem=[r for r in recs if r.get("kind") in ("mem", "heap_profile")],
                       expected_digest=a.expect_digest,
-                      image_digests=[r for r in recs if r.get("kind") == "image_digest"])
+                      image_digests=[r for r in recs if r.get("kind") == "image_digest"],
+                      push_refetches=[r for r in recs if r.get("kind") == "push_refetch"])
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
@@ -2572,6 +3090,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--nav-workers", type=int, default=128)
     d.add_argument("--call-workers", type=int, default=512)
     d.add_argument("--vars-interval", type=float, default=15.0)
+    d.add_argument("--no-viewers", action="store_true",
+                   help="do NOT open /refreshes viewers (#764: then #710/#740 cannot run)")
     d.add_argument("--out", required=True)
     d.set_defaults(func=_cmd_drive)
     f = sub.add_parser("fresh")
@@ -2601,6 +3121,8 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--churn-namespaces", type=int, default=50)
     f.add_argument("--churn-per-ns", type=int, default=20)
     f.add_argument("--name-prefix", default="bench-app-")
+    f.add_argument("--no-viewer", action="store_true",
+                   help="do NOT arm a /refreshes viewer on the probe cell (#764)")
     f.add_argument("--out", required=True)
     f.set_defaults(func=_cmd_fresh)
     pf = sub.add_parser("preflight")

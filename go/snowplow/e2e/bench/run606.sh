@@ -65,6 +65,11 @@ fi
 # digest gate judges (10x the default 30 s termination grace period).
 DIGEST_SETTLE_S="${DIGEST_SETTLE_S:-300}"
 DIGEST_POLL_S="${DIGEST_POLL_S:-5}"
+# Bound on each kubectl read in the collect step (it also runs from the
+# teardown trap after a failed measure, #763).
+COLLECT_TIMEOUT_S="${COLLECT_TIMEOUT_S:-300}"
+MEASURE_STARTED=0
+COLLECTED=0
 SCALE="${SCALE:-50000}"
 USERS="${USERS:-1000}"
 NAMESPACES="${NAMESPACES:-50}"
@@ -98,6 +103,14 @@ MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-$(python3 -m bench.load606 prefixes)}"
 COMPOSITE_BURST_USERS="${COMPOSITE_BURST_USERS:-200}"
 COMPOSITE_BURST_AT_S="${COMPOSITE_BURST_AT_S:-$(( DRIVE_S / 2 ))}"
 RUN8_REPORT="${RUN8_REPORT:-1}"
+# #764: every virtual user keeps ONE /refreshes stream armed over the widgets
+# of its shell + current page (the SPA's per-tab stream), and refetches a
+# widget on its `refresh` frame; fresh606 arms one on the probe cell. Without
+# viewers the #710 stale-then-push and #740 viewer paths never run (run 8).
+# Sizing: USERS concurrent streams (1000 = one tab per user), one 512 KiB-stack
+# reader thread each in the driver pod. VIEWERS=0 turns them off (then the
+# run-8 report marks those checks NOT EXERCISED).
+VIEWERS="${VIEWERS:-1}"
 if [[ "$RUN8_REPORT" == "1" ]]; then
   # shellcheck disable=SC2086
   python3 -m bench.load606 check-prefixes $MEM_VARS_PREFIXES \
@@ -156,6 +169,15 @@ teardown() {
     # On ANY failure, snapshot the cluster BEFORE it is deleted (shakedown #2
     # tore down with nothing captured). Best effort: it never blocks teardown.
     if [[ "$rc" != "0" ]]; then
+      # #763: once measure has started, ANY failure first collects the run's
+      # own results (job logs — running Jobs too —, heap profiles, the
+      # after-record, snowplow logs) and computes a verdict over whatever was
+      # collected. Run 8 lost the driver log, the heap profiles and the
+      # snowplow logs this way.
+      if [[ "${MEASURE_STARTED:-0}" == "1" && "${COLLECTED:-0}" != "1" ]]; then
+        log "measure FAILED or interrupted (exit ${rc}): collecting partial results before teardown"
+        ( set +e; s_collect; s_evaluate ) || log "partial collect/evaluate failed (continuing to teardown)"
+      fi
       if [[ "$DRY" == "1" ]]; then
         log "DRY: python3 -m bench.diag606 collect --out $OUT/diagnostics"
       elif [[ -s "$KCFG" ]]; then
@@ -400,6 +422,7 @@ s_measure() {
       $(for x in $MEM_VARS_PREFIXES; do printf -- '--mem-vars-prefix %s ' "$x"; done) \
       --burst-users "$COMPOSITE_BURST_USERS" --burst-at-s "$COMPOSITE_BURST_AT_S" \
       ${COMPOSITE_ROUTES[@]+$(printf -- '--composite-route %q ' "${COMPOSITE_ROUTES[@]}")} \
+      $([[ "$VIEWERS" == "1" ]] || printf -- '--no-viewers') \
       > "$OUT/loadgen-job.yaml"
   # snowplow's restart state BEFORE measure (the verdict compares after/before:
   # any restart or OOM during measure makes the run INVALID, with its reason).
@@ -407,9 +430,14 @@ s_measure() {
   # Standard memory capture (#710): kubectl top every TOP_POLL_S from here,
   # plus the in-cluster mem606 Job (memstats + heap profiles, metadata only).
   start_top_loop
+  MEASURE_STARTED=1
   run "${K[@]}" apply -f "$OUT/loadgen-job.yaml"
-  run "${K[@]}" -n bench-loadgen wait job/load606 job/fresh606 --for=condition=Complete \
-      --timeout="$(( DRIVE_S + 3600 ))s"
+  if ! run "${K[@]}" -n bench-loadgen wait job/load606 job/fresh606 --for=condition=Complete \
+      --timeout="$(( DRIVE_S + 3600 ))s"; then
+    # The teardown trap collects what exists before the cluster goes (#763).
+    log "measure FAILED: load606/fresh606 not Complete within $(( DRIVE_S + 3600 ))s"
+    return 1
+  fi
 }
 snowplow_pod_record() {
   local phase="$1"
@@ -439,23 +467,35 @@ s_collect() {
     log "DRY: kubectl logs <each load606 pod> > $OUT/nav-<pod>.jsonl"
     return 0
   fi
-  for p in $("${K[@]}" -n bench-loadgen get pods -l job-name=load606 -o name); do
-    "${K[@]}" -n bench-loadgen logs "$p" > "$OUT/nav-${p#pod/}.jsonl"
+  # Every piece is best effort and bounded: this also runs from the teardown
+  # trap after a failed measure (#763), where Jobs may still be Running
+  # (`kubectl logs` / `cp` work on a running pod) and any one read may fail.
+  local KR=("${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
+  for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=load606 -o name); do
+    "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/nav-${p#pod/}.jsonl" \
+      || log "could not read the driver log from ${p#pod/}"
   done
-  for p in $("${K[@]}" -n bench-loadgen get pods -l job-name=fresh606 -o name); do
-    "${K[@]}" -n bench-loadgen logs "$p" > "$OUT/fresh-${p#pod/}.jsonl"
+  for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=fresh606 -o name); do
+    "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/fresh-${p#pod/}.jsonl" \
+      || log "could not read the fresh606 log from ${p#pod/}"
   done
   snowplow_pod_record after
   declare -F stop_top_loop >/dev/null && stop_top_loop
   # mem606: its memstats trajectory (logs) and heap profiles (files in /out).
-  for p in $("${K[@]}" -n bench-loadgen get pods -l job-name=mem606 -o name); do
-    "${K[@]}" -n bench-loadgen logs "$p" > "$OUT/mem-${p#pod/}.jsonl" || true
+  for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=mem606 -o name); do
+    "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/mem-${p#pod/}.jsonl" \
+      || log "could not read the mem606 log from ${p#pod/}"
     mkdir -p "$OUT/heap"
-    "${K[@]}" -n bench-loadgen cp "${p#pod/}:/out" "$OUT/heap" >/dev/null 2>&1 \
+    "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out" "$OUT/heap" >/dev/null 2>&1 \
       || log "could not copy heap profiles from ${p#pod/}"
   done
-  "${K[@]}" -n krateo-system logs deploy/snowplow --tail=-1 > "$OUT/snowplow.log" || true
-  "${K[@]}" top nodes > "$OUT/top-nodes.txt" || true
+  "${KR[@]}" -n krateo-system logs deploy/snowplow --tail=-1 > "$OUT/snowplow.log" \
+    || log "could not read the snowplow log"
+  "${KR[@]}" -n krateo-system logs deploy/snowplow --previous --tail=-1 > "$OUT/snowplow-previous.log" 2>/dev/null \
+    || rm -f "$OUT/snowplow-previous.log"
+  "${KR[@]}" top nodes > "$OUT/top-nodes.txt" || true
+  COLLECTED=1
+  log "collected: $(cd "$OUT" && ls nav-*.jsonl fresh-*.jsonl mem-*.jsonl pod-after.jsonl snowplow.log 2>/dev/null | tr '\n' ' ')heap=$(ls "$OUT/heap" 2>/dev/null | wc -l | tr -d ' ')"
 }
 s_evaluate() {
   shopt -s nullglob

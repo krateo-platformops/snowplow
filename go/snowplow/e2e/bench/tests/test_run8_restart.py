@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 
 from bench import load606
-from tests.test_run8 import PODS, _mem, _navs
+from tests.test_run8 import PODS, _mem, _navs, q234
 
 K = load606.RUN8_KEYS
 GIB = 1024 ** 3
@@ -32,7 +32,7 @@ def H3(counts: dict, max_ms: int):
 
 
 def _p95(hist):
-    rep, checks = load606.run8_report(_navs(), [_mem(150, **{K["stale_to_push"]: hist})], [], PODS)
+    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234(**{K["stale_to_push"]: hist}))], [], PODS)
     return {c["check"]: c for c in checks}["run8.stale_to_push.p95"], rep
 
 
@@ -94,7 +94,7 @@ def test_counter_drop_mid_run_marks_every_run8_check_restarted_fail():
 def test_the_tail_alone_would_have_passed():
     """Guard for the test above: without the reset, the last sample PASSes —
     which is exactly the false pass the restart check prevents."""
-    tail_only = [_mem(200, 700, 1500, **{K["stale_to_push"]: H3({1000: 20}, 400)})]
+    tail_only = [_mem(200, 700, 1500, **q234(**{K["stale_to_push"]: H3({1000: 20}, 400)}))]
     rep, checks = load606.run8_report(_navs(), tail_only, [], PODS)
     c = {x["check"]: x for x in checks}
     assert c["run8.stale_to_push.p95"]["result"] == "PASS"

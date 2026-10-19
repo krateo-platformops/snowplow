@@ -47,7 +47,7 @@ def render(*, users: int, shards: int, think_s: float, duration_s: float,
            init: str, frontend_ns: str = "krateo-system",
            builders_ns: str = "krateo-system", src: str | None = None,
            composite_routes: list[str] | tuple = (), burst_users: int = 0,
-           burst_at_s: float = 600.0) -> str:
+           burst_at_s: float = 600.0, viewers: bool = True) -> str:
     if not init.startswith("/call"):
         raise ValueError("init must be the frontend config.json api.INIT /call path")
     src = LOAD606_SRC.read_text() if src is None else src
@@ -74,7 +74,7 @@ exec python3 -u /opt/load606/load606.py drive \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --password {json.dumps(password)} --user-start "$S" --user-end "$E" \\
   --think-s {think_s} --duration-s {duration_s} --vars-interval "$VARS" \\
-  {portal_args}{burst_args} --out /dev/stdout
+  {portal_args}{burst_args}{"" if viewers else " --no-viewers"} --out /dev/stdout
 """
     return f"""\
 apiVersion: v1
@@ -268,7 +268,7 @@ def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str,
                  rates: list[str], samples: int, gap_s: float, probe_name: str,
                  namespaces: int, comp_group: str, comp_version: str,
                  comp_plural: str, poll_ms: int = 100,
-                 delay_s: float = 0) -> str:
+                 delay_s: float = 0, viewer: bool = True) -> str:
     """The freshness probe as an in-cluster Job (fresh606) on the loadgen pool.
 
     It talks to snowplow/authn by Service DNS (no external IP needed) and
@@ -288,7 +288,7 @@ exec python3 -u /opt/load606/load606.py fresh --mutator incluster \\
   --group {comp_group} --version {comp_version} --plural {comp_plural} \\
   --probe-name {probe_name} --rates {rate_args} --samples {samples} \\
   --gap-s {gap_s} --poll-ms {poll_ms} --churn-namespaces {namespaces} \\
-  --wait-for-load --out /dev/stdout
+  --wait-for-load{"" if viewer else " --no-viewer"} --out /dev/stdout
 """
     return f"""\
 ---
@@ -399,6 +399,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--comp-group", default="composition.krateo.io")
     p.add_argument("--comp-version", default="v1-2-2")
     p.add_argument("--comp-plural", default="githubscaffoldingwithcompositionpages")
+    p.add_argument("--no-viewers", action="store_true",
+                   help="driver and probe open NO /refreshes viewers (#764)")
     a = p.parse_args(argv)
     if a.preflight_only:
         sys.stdout.write(render_preflight(
@@ -413,7 +415,8 @@ def main(argv: list[str] | None = None) -> int:
                             init=a.init, frontend_ns=a.frontend_ns,
                             builders_ns=a.builders_ns,
                             composite_routes=a.composite_route or [],
-                            burst_users=a.burst_users, burst_at_s=a.burst_at_s))
+                            burst_users=a.burst_users, burst_at_s=a.burst_at_s,
+                            viewers=not a.no_viewers))
     if a.mem_duration_s > 0:
         sys.stdout.write(render_mem(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,
@@ -427,7 +430,8 @@ def main(argv: list[str] | None = None) -> int:
             samples=a.fresh_samples, gap_s=a.fresh_gap_s,
             probe_name=a.probe_name, namespaces=a.namespaces,
             comp_group=a.comp_group, comp_version=a.comp_version,
-            comp_plural=a.comp_plural, delay_s=a.fresh_delay_s))
+            comp_plural=a.comp_plural, delay_s=a.fresh_delay_s,
+            viewer=not a.no_viewers))
     return 0
 
 

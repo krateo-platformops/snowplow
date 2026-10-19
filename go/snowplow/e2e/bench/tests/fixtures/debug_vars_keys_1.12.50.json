@@ -156,6 +156,26 @@
    "version": "str"
   },
   "snowplow_customer_resolve_inflight": "number",
+  "snowplow_deps_dirty_mark_attribution": {
+   "by_bucket": "list",
+   "by_entry_class": {
+    "apistage": "number",
+    "raFullList": "number",
+    "restactions": "number",
+    "unknown": "number",
+    "unregistered": "number",
+    "widgetContent": "number",
+    "widgets": "number"
+   },
+   "by_gvr": {},
+   "events_total": "number",
+   "submit_source": {
+    "reconcile": "number",
+    "relist_bridge": "number",
+    "watch": "number"
+   },
+   "unattributed": "number"
+  },
   "snowplow_informer_dispatch_shape": {
    "fallthrough": "number",
    "get_served": "number",
@@ -166,9 +186,33 @@
   },
   "snowplow_nested_resolve_admission_over_ceiling_bytes": "number",
   "snowplow_nested_resolve_admission_over_ceiling_bytes_peak": "number",
+  "snowplow_refresher_capped_total": "number",
+  "snowplow_refresher_completed_total": "number",
+  "snowplow_refresher_dirty_ended_unfresh_declined_total": "number",
+  "snowplow_refresher_dirty_ended_unfresh_dropped_total": "number",
+  "snowplow_refresher_dirty_ended_unfresh_evicted_total": "number",
+  "snowplow_refresher_dirty_ended_unfresh_remarked_total": "number",
   "snowplow_refresher_dirty_to_fresh_ms_max": "number",
   "snowplow_refresher_dirty_to_fresh_ms_p95": "number",
   "snowplow_refresher_dirty_to_fresh_samples_total": "number",
+  "snowplow_refresher_dropped_total": "number",
+  "snowplow_refresher_enqueue_total": "number",
+  "snowplow_refresher_failed_total": "number",
+  "snowplow_refresher_floored_total": "number",
+  "snowplow_refresher_parked_ms_total": "number",
+  "snowplow_refresher_queue_depth": "number",
+  "snowplow_refresher_residency_cheapen": {
+   "enqueue_dropped_non_resident": "number",
+   "pickup_noop_no_park": "number"
+  },
+  "snowplow_refresher_retried_total": "number",
+  "snowplow_refresher_skipped_no_entry_total": "number",
+  "snowplow_refresher_skipped_no_handler_total": "number",
+  "snowplow_refresher_skipped_stage_error_total": "number",
+  "snowplow_refresher_suppressed_keys": "number",
+  "snowplow_refresher_suppressed_set_total": "number",
+  "snowplow_refresher_suppressed_skips_total": "number",
+  "snowplow_refresher_yielded_total": "number",
   "snowplow_resolved_cache": {},
   "snowplow_resolved_cache_denial_only_put_total": {
    "call_ra": "number",

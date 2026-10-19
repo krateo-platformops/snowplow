@@ -93,6 +93,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if x.startswith("--kubeconfig="): kc = x.split("=", 1)[1]
         elif x.startswith("--context="): ctx = x.split("=", 1)[1]
         elif x in ("-n", "--namespace"): ns = next(it, None)   # anywhere, like kubectl
+        elif x.startswith("--request-timeout="): pass          # global flag, anywhere
         else: a.append(x)
     resolved = ctx
     if resolved is None:
@@ -334,6 +335,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                               "visit": v, "wall_ms": 50, "calls": 3, "errors": 0,
                               "sched_lag_ms": 1}))
         sys.exit(0)
+    if a[:1] == ["wait"] and "job/fresh606" in a and os.environ.get("FAKE_WAIT_FAIL") == "1":
+        print("error: timed out waiting for the condition on jobs/fresh606", file=sys.stderr)
+        sys.exit(1)
+    if a[:1] == ["logs"] and "deploy/snowplow" in a and "--previous" not in a:
+        print("snowplow log line"); sys.exit(0)
     sys.exit(0)   # apply / wait / rollout / version / scale / top / logs
     """)
 

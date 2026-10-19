@@ -19,6 +19,7 @@ from tests.test_run606_pr483 import _env483
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401
 
 K = load606.RUN8_KEYS
+K9 = load606.RUN9_KEYS
 GIB = 1024 ** 3
 
 
@@ -130,11 +131,17 @@ def q234(**over):
         K["admission_weight"]: 10, K["admission_weight_peak"]: 99,
         K["customer_inflight"]: 7,
         K["debt_open"]: 1, K["debt_parked"]: 3, K["debt_oldest_age"]: 900,
-        K["debt_retries"]: 5,
+        K["debt_retries"]: 5, K["stale_overdue"]: 0,
         K["retry_total"]: {"transient": {"background": 0, "demand": 1, "debt": 0},
                            "genuine": {"background": 0, "demand": 2, "debt": 1}},
         K["retry_chains"]: 1, K["retry_viewers"]: 1, K["retry_backoff"]: 2000,
         K["retry_abandoned"]: {"no_viewer": 2, "evicted": 0}, K["retry_resumed"]: 1,
+        # run 9 (#765)
+        K9["dirty_mark"]: {"by_entry_class": {"apistage": 30, "restactions": 10, "widgets": 5},
+                           "events_total": 10, "submit_source": {"watch": 10}},
+        K9["enqueue"]: 100, K9["completed"]: 90, K9["floored"]: 3, K9["remarked"]: 2,
+        K9["queue_depth"]: 7, K9["d2f_samples"]: 50,
+        K9["fills_by_reason"]: {"absent": 5, "known_stale": 0, "refresh_forced": 20},
     }
     base.update(over)
     return base
@@ -201,7 +208,7 @@ def test_full_report_memory_risk_and_gates():
     (H({}, 0), "INCONCLUSIVE", "PASS"),                              # no pushes observed
 ])
 def test_stale_to_push_bucket_rules(hist, p95, mx):
-    mem = [_mem(150, **{K["stale_to_push"]: hist})]
+    mem = [_mem(150, **q234(**{K["stale_to_push"]: hist}))]
     rep, checks = load606.run8_report(_navs(), mem, [], PODS)
     res = {c["check"]: c for c in checks}
     assert res["run8.stale_to_push.p95"]["result"] == p95
