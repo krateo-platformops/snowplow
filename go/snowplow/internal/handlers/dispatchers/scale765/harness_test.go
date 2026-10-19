@@ -1246,13 +1246,19 @@ type s765Report struct {
 	RefresherDonePerSec float64          `json:"refresher_completed_per_sec"`
 	QueueDepth          s765Dist         `json:"queue_depth"`
 
-	FillsByReason              map[string]uint64  `json:"fills_by_reason"`
-	FillsPerSecByReason        map[string]float64 `json:"fills_per_sec_by_reason"`
-	BenchFillsPerSec           float64            `json:"bench_list_fills_per_sec"`
-	BenchFillsPerEvent         float64            `json:"bench_list_fills_per_event"`
-	BenchFillEWMAms            float64            `json:"bench_list_fill_ewma_ms"`
-	BenchFillMaxMS             int64              `json:"bench_list_fill_max_ms"`
-	BenchFillConcurrency       s765Dist           `json:"bench_list_forced_fills_in_flight"`
+	FillsByReason        map[string]uint64  `json:"fills_by_reason"`
+	FillsPerSecByReason  map[string]float64 `json:"fills_per_sec_by_reason"`
+	BenchFillsPerSec     float64            `json:"bench_list_fills_per_sec"`
+	BenchFillsPerEvent   float64            `json:"bench_list_fills_per_event"`
+	BenchFillEWMAms      float64            `json:"bench_list_fill_ewma_ms"`
+	BenchFillMaxMS       int64              `json:"bench_list_fill_max_ms"`
+	BenchFillConcurrency s765Dist           `json:"bench_list_forced_fills_in_flight"`
+	// Refresher worker utilisation (architect-623 on option A: workers parked on
+	// an in-flight or queued fill cannot use the CPU A frees). The share of
+	// worker-samples per state, from the goroutine profile once a second.
+	RefresherWorkerShare       map[string]float64 `json:"refresher_worker_state_share"`
+	RefresherWorkersMean       float64            `json:"refresher_workers_seen_mean"`
+	FillWaitersMean            float64            `json:"stage_goroutines_waiting_on_fill_mean"`
 	FillsByRA                  map[string]uint64  `json:"fills_by_ra"`
 	DashboardFillsPerBenchFill float64            `json:"dashboard_data_fills_per_bench_fill"`
 	FillsByGVRPerSec           map[string]float64 `json:"fills_by_gvr_per_sec"`
@@ -1504,6 +1510,8 @@ func (h *s765H) run(p s765Point) s765Report {
 	// under pprof labels), every 100 ms. A runtime fact, not a snowplow counter:
 	// option A's claim (≤ 1 fill in flight per edge, not ≈ N) is read here.
 	var conc []float64
+	workerStates := map[string]int{}
+	var workerSamples, tickN, fillWaiters int
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1522,6 +1530,19 @@ func (h *s765H) run(p s765Point) s765Report {
 			smu.Lock()
 			conc = append(conc, float64(n))
 			smu.Unlock()
+			if tickN++; tickN%10 == 0 { // once a second: the worker states
+				ws := s765RefresherWorkerStates()
+				smu.Lock()
+				for k, v := range ws {
+					if k == "fill_waiters" {
+						fillWaiters += v
+						continue
+					}
+					workerStates[k] += v
+				}
+				workerSamples++
+				smu.Unlock()
+			}
 		}
 	}()
 
@@ -1592,6 +1613,18 @@ func (h *s765H) run(p s765Point) s765Report {
 	smu.Lock()
 	rep.QueueDepth = s765Summarize(depth)
 	rep.BenchFillConcurrency = s765Summarize(conc)
+	rep.RefresherWorkerShare = map[string]float64{}
+	total := 0
+	for _, v := range workerStates {
+		total += v
+	}
+	for k, v := range workerStates {
+		rep.RefresherWorkerShare[k] = float64(v) / float64(total)
+	}
+	if workerSamples > 0 {
+		rep.RefresherWorkersMean = float64(total) / float64(workerSamples)
+		rep.FillWaitersMean = float64(fillWaiters) / float64(workerSamples)
+	}
 	rep.CustomerQueuedMax, rep.DebtQueuedMax = custQ, debtQ
 	smu.Unlock()
 
@@ -1770,6 +1803,72 @@ func (h *s765H) differential() s765DiffReport {
 		}
 	}
 	return rep
+}
+
+// s765RefresherWorkerStates classifies every refresher worker goroutine (its
+// stack holds cache.(*refresher).processNext) from a debug=2 goroutine dump:
+//   - idle: parked in the workqueue's Get (no work queued);
+//   - waiting_fill: blocked inside the api-stage content fill machinery (a
+//     flight it joined, a pending flight, the fill admission gate);
+//   - working: running or runnable (on CPU, or ready for it);
+//   - blocked_other: any other wait (locks, channels, sleeps).
+//
+// A runtime fact, read the same way on every build.
+func s765RefresherWorkerStates() map[string]int {
+	var buf bytes.Buffer
+	if err := pprof.Lookup("goroutine").WriteTo(&buf, 2); err != nil {
+		return nil
+	}
+	out := map[string]int{}
+	for _, g := range strings.Split(buf.String(), "\n\n") {
+		if !strings.Contains(g, "cache.(*refresher).processNext") {
+			// A resolve's stages run on child goroutines (the worker itself
+			// then shows as blocked in runStage): count, separately, every
+			// stage goroutine parked on a content fill it did not lead
+			// (a joined or pending flight, or the admission gate). In the
+			// harness's steady state these are almost all refresher work
+			// (customers hit their cells); reported as fill_waiters.
+			hdr := g
+			if i := strings.IndexByte(g, '\n'); i >= 0 {
+				hdr = g[:i]
+			}
+			if !strings.Contains(hdr, "[running]") && !strings.Contains(hdr, "[runnable]") &&
+				strings.Contains(g, "dispatchOneCall") &&
+				(strings.Contains(g, "contentFlight") || strings.Contains(g, "contentFillGate") ||
+					strings.Contains(g, "apistage_fill_flight.go") || strings.Contains(g, "apistage_fill_admission.go")) {
+				out["fill_waiters"]++
+			}
+			continue
+		}
+		hdr := g
+		if i := strings.IndexByte(g, '\n'); i >= 0 {
+			hdr = g[:i]
+		}
+		switch {
+		case strings.Contains(g, "workqueue") && strings.Contains(g, ".Get("):
+			out["idle"]++
+		case strings.Contains(hdr, "[running]") || strings.Contains(hdr, "[runnable]"):
+			out["working"]++
+		case strings.Contains(g, "contentFlight") || strings.Contains(g, "contentFillGate") ||
+			strings.Contains(g, "apistage_fill_flight.go") || strings.Contains(g, "apistage_fill_admission.go"):
+			out["waiting_fill"]++
+		default:
+			// Name the innermost snowplow frame it is blocked under, so a
+			// reader can tell a rate-floor or yield park from a lock.
+			where := "unknown"
+			for _, l := range strings.Split(g, "\n")[1:] {
+				if strings.HasPrefix(l, "github.com/krateo-platformops/snowplow/internal/") {
+					where = strings.TrimPrefix(l, "github.com/krateo-platformops/snowplow/internal/")
+					if i := strings.IndexByte(where, '('); i > 0 && strings.HasSuffix(where, ")") {
+						where = where[:strings.LastIndexByte(where, '(')]
+					}
+					break
+				}
+			}
+			out["blocked_other:"+where]++
+		}
+	}
+	return out
 }
 
 // s765BenchListFillsInFlight counts the goroutines inside a refresh_forced fill
