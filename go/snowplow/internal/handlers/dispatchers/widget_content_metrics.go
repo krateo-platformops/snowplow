@@ -71,6 +71,25 @@ func bumpWidgetSkippedUndeclaredExtrasPut() {
 	widgetSkippedUndeclaredExtrasPutTotal.Add(1)
 }
 
+// widgetUndeclaredExtrasExemptTotal counts requests that carried undeclared,
+// non-identity extras and were NOT quarantined because the widget has no
+// extras-reading spec surface (#777 b′, widgets.WidgetReadsNoRequestExtras).
+// Its share next to widgetSkippedUndeclaredExtrasPutTotal is the fraction of
+// would-be F6 declines the exemption turned into Puts.
+var widgetUndeclaredExtrasExemptTotal atomic.Uint64
+
+func bumpWidgetUndeclaredExtrasExempt() {
+	widgetUndeclaredExtrasExemptTotal.Add(1)
+}
+
+// WidgetUndeclaredExtrasExemptTotal is the typed accessor the expvar closure
+// and the OTLP instrument both read.
+func WidgetUndeclaredExtrasExemptTotal() uint64 { return widgetUndeclaredExtrasExemptTotal.Load() }
+
+// AddWidgetUndeclaredExtrasExemptForTest moves the exemption counter so the
+// OTLP wiring can be asserted from the metrics package. Production MUST NOT use it.
+func AddWidgetUndeclaredExtrasExemptForTest(n uint64) { widgetUndeclaredExtrasExemptTotal.Add(n) }
+
 // widgetContentMetricsOnce guards expvar.Publish against the double-
 // publish panic (mirrors phase1WalkMetricsOnce).
 var widgetContentMetricsOnce sync.Once
@@ -97,6 +116,9 @@ func registerWidgetContentMetrics() {
 		}))
 		expvar.Publish("snowplow_widget_skipped_undeclared_extras_put_total", expvar.Func(func() any {
 			return widgetSkippedUndeclaredExtrasPutTotal.Load()
+		}))
+		expvar.Publish("snowplow_widget_undeclared_extras_exempt_total", expvar.Func(func() any {
+			return WidgetUndeclaredExtrasExemptTotal()
 		}))
 	})
 }

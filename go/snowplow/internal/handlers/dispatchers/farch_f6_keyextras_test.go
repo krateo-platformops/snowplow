@@ -399,7 +399,13 @@ func TestFARCH_F6_6_SelfQuarantine_UndeclaredExtrasDeclinePut(t *testing.T) {
 	)
 	ctxA := f6CtxUser("userA")
 	ctxB := f6CtxUser("userB")
-	cr := map[string]any{"spec": map[string]any{}} // undeclared, no keyExtras
+	// Undeclared (no keyExtras), and its widgetDataTemplate reads extras.foo —
+	// the consumer this arm's premise names. A spec with NO extras-reading
+	// surface is exempt from the quarantine since #777 b′ (its body cannot
+	// depend on foo), so the fixture must carry the reader to exercise F6-6.
+	cr := map[string]any{"spec": map[string]any{
+		"widgetDataTemplate": []any{map[string]any{"forPath": "echoedFoo", "expression": "${ .foo }"}},
+	}}
 
 	// userA carries a polluting request extra; userB is clean.
 	extrasA := map[string]any{"foo": "evil"}
@@ -605,6 +611,12 @@ func TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt(t *testing.T) {
 // reopens. Discriminates the exemption from an over-broad "allow everything".
 func TestFARCH_F6_7b_GenuinelyUndeclaredStillDeclines(t *testing.T) {
 	cr := declaredKeyExtrasCR("name", "namespace")
+	// A route-consuming widget READS what it declares: give it the template (a
+	// bare keyExtras-only spec has no extras-reading surface and is exempt from
+	// the quarantine since #777 b′).
+	cr["spec"].(map[string]any)["widgetDataTemplate"] = []any{
+		map[string]any{"forPath": "title", "expression": "${ .namespace + \"/\" + .name }"},
+	}
 	// Identity keys exempt, declared keys fine — but foo is a genuinely-undeclared
 	// non-identity body-affecting key → MUST still decline.
 	req := map[string]any{"name": "demo-1", "namespace": "team-a", "username": "cyberjoker", "foo": "evil"}

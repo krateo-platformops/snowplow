@@ -534,6 +534,18 @@ func requestExtrasFullyDeclared(cr map[string]any, requestExtras map[string]any)
 		if _, ok := identityDimensionKeys[k]; ok {
 			continue // A2/A6 identity axis — folder handles it, never shared-cell pollution
 		}
+		// #777 b′ — an undeclared request extra can only shape the body through
+		// an extras-reading spec surface (apiRef, widgetDataTemplate,
+		// resourcesRefsTemplate). A widget with none of them renders the same
+		// bytes whatever extras arrive, so its body is safe in the declared-only
+		// cell: the key is unchanged (filterDeclaredKeyExtras already drops these
+		// keys). Decided here, at the first undeclared key, so the exemption
+		// counter moves only when it changed the outcome — the same population
+		// the decline counter would otherwise have counted.
+		if widgets.WidgetReadsNoRequestExtras(cr) {
+			bumpWidgetUndeclaredExtrasExempt()
+			return true
+		}
 		return false // a genuinely-undeclared body-affecting request extra → quarantine
 	}
 	return true

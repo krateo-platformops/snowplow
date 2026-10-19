@@ -196,6 +196,7 @@ Defined in `internal/handlers/dispatchers/l1_lookup_metrics.go`.
 | `snowplow_dispatch_l1_lookups` | `map["<handlerKind>\|<gvr>"→{"hit_total","miss_total"}]`; handlerKind ∈ {restactions, widgets, widgetContent} | high hit ratio on a warm pod. Sustained low hit ratio = prewarm not covering the served mix |
 | `snowplow_widget_content_skipped_rbac_sensitive_total` / `snowplow_widget_content_skipped_empty_shell_total` (`widget_content_metrics.go`) | widgetContent fast-path skip counters (RBAC-sensitive widget; empty-shell decline) | informational — attribute content-cell misses |
 | `snowplow_widget_skipped_undeclared_extras_put_total` | Puts quarantined by the F6 undeclared-request-extras allowlist | non-zero means a client sends extras the widget author has not declared in `spec.keyExtras` |
+| `snowplow_widget_undeclared_extras_exempt_total` (expvar + OTLP) | Requests carrying undeclared, non-identity extras that were Put anyway because the widget has no extras-reading spec surface (no apiRef / widgetDataTemplate / resourcesRefsTemplate; #777 b′) | informational: its share next to the skipped counter is the fraction of would-be F6 declines the exemption cached |
 
 ### RAFullList serve path — the cheap Go-slice serve for big LISTs
 Defined in `internal/cache/bindings_by_gvr_metrics.go`.
