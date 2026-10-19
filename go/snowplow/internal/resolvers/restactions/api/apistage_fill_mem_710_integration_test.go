@@ -40,6 +40,10 @@
 // gate admitting 2× its ceiling measured 60–67 MiB against a correct gate's
 // 50–72 MiB. That class is owned by the deterministic ADM1 arms
 // (apistage_fill_admission_710_test.go), where a `<= 2*ceiling` mutation is RED.
+//
+// STOP RULE (architect-623, #780): if a CORRECT gate ever exceeds ~4.5 fills
+// of allocate-black excess (the gated-worst log line), the heap check becomes
+// log-only. The bound (fmemAllocateBlackFills) is never widened again.
 package api
 
 import (
