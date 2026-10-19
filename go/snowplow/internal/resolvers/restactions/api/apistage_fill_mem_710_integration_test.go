@@ -30,6 +30,16 @@
 // replaces, which stays in heap/objects until the next sweep), and serve every
 // reader. The ungated burst exceeds that bound: that is the RED on main. The
 // background wait p95/max is reported (R7: strict priority, no aging).
+//
+// WHAT THIS ARM CAN AND CANNOT SEE (#780). F-MEM is a COARSE real-heap
+// backstop: it catches the defect class that multiplies the live heap —
+// admit-all, queued flights parking their envelopes, no gate at all.
+// Over-admission by about 2× or less is NOT resolvable on this heap: the GC
+// counts everything allocated during a mark phase as live, and under the
+// integration TestMain's pacing one mark phase absorbs up to ~2.5 fills, so a
+// gate admitting 2× its ceiling measured 60–67 MiB against a correct gate's
+// 50–72 MiB. That class is owned by the deterministic ADM1 arms
+// (apistage_fill_admission_710_test.go), where a `<= 2*ceiling` mutation is RED.
 package api
 
 import (
@@ -143,6 +153,25 @@ func fill710Burst(store *cache.ResolvedCacheStore, lists, readers int, ctxFn fun
 	return hiLive.Load() - baseLive, hi.Load() - base, ok.Load()
 }
 
+// fmemAllocateBlackFills is how many fills' worth of allocations (oneFillAlloc,
+// measured in isolation before the bursts) the heap bound allows on top of the
+// starting ceiling and one fill: the GC counts what is allocated during its mark
+// phase as live (allocate-black), and how many fills one mark phase absorbs
+// depends on the GC's pacing, not on the gate. A FIXED design constant read
+// from data, never from the run (a bound built from the run's own GC data moves
+// with the defect — #719). Measured on main e6bee57b (#780, issuecomment
+// 6278532568), 24 lists × 5,000, 240 readers:
+//
+//   - a CORRECT gate's excess over ceiling0 + oneFill: ≤ 2.5 fills (worst
+//     pacing: -tags unit,integration, 7–9 GC cycles per burst; 0.65–2.5);
+//   - the guarded defect class: admit-all ≥ 9.7 fills, ungated ≥ 10.
+//
+// 5 leaves ≈ 2.5 fills of margin above a correct gate and ≈ 4.7 below the
+// defect. If a Go or GC change closes that gap, the ungated precondition
+// (ungated ≥ bound + 2 × oneFillAlloc) goes RED rather than letting the arm
+// pass vacuously.
+const fmemAllocateBlackFills = 5
+
 func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T) {
 	const (
 		lists   = 24
@@ -207,21 +236,17 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 		t.Fatalf("PRECONDITION: the ungated burst served %d of %d", servedU, readers)
 	}
 
-	// GATED, calibration back to the seed for every run. /gc/heap/live counts
-	// everything allocated during a mark phase as live for that cycle
-	// (allocate-black); on this heap a cycle can be long enough to absorb several
-	// sequential fills (measured: the high runs are the runs with the fewest,
-	// longest cycles). So the heap bound is held by the BEST of gatedRuns runs —
-	// the gate's bound is a floor every run can reach — while the structural
-	// checks (no dispatch for an unadmitted flight, envelope bytes) hold for
-	// EVERY run.
-	const gatedRuns = 5
+	// GATED, calibration back to the seed for every run. EVERY run must hold the
+	// heap bound and the structural checks (no dispatch for an unadmitted flight,
+	// envelope bytes): the bound already allows fmemAllocateBlackFills fills of
+	// allocate-black slack, so no best-of is needed to absorb GC pacing (#780).
+	const gatedRuns = 3
 	restore = cache.SetAdmissionRuntimeSeamsForTest(func() int64 { return limit }, fill710HeapObjects)
 	t.Cleanup(restore)
 	runtime.GC()
 	ceiling0, _ := cache.AdmissionCeiling()
 	var runs []int64
-	gated, gatedObj := int64(1<<62), int64(0)
+	gated, gatedObj := int64(0), int64(0)
 	var adm ContentFillAdmissionStats
 	var st ContentFillStats
 	var envPeak int64
@@ -236,27 +261,28 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 		adm, st = ContentFillAdmissionStatsSnapshot(), ContentFillStatsSnapshot()
 		envPeak = max(envPeak, st.InflightBytesPeak)
 		runs = append(runs, g>>20)
-		if g < gated {
+		if g > gated {
 			gated, gatedObj = g, gObj
 		}
 	}
 	exp := adm.Expansion[r1FsaGVR.String()]
 	// The bound: the live heap grows by at most the starting ceiling plus one
-	// fill (both fixed before the bursts) plus one fill's ALLOCATIONS: the GC
-	// counts everything allocated during its mark phase as live for that cycle
-	// (allocate-black), so a fill that runs while a cycle marks this large heap
-	// reads as live in full — envelope, decode garbage and tree. Measured on
-	// /gc/heap/allocs, which does not depend on when GC runs.
-	bound := ceiling0 + oneFill + oneFillAlloc
+	// fill (both fixed before the bursts) plus fmemAllocateBlackFills fills'
+	// ALLOCATIONS: the GC counts everything allocated during its mark phase as
+	// live for that cycle (allocate-black), so the fills that run while a cycle
+	// marks this large heap read as live in full — envelope, decode garbage and
+	// tree. oneFillAlloc is measured on /gc/heap/allocs, which does not depend on
+	// when GC runs.
+	bound := ceiling0 + oneFill + fmemAllocateBlackFills*oneFillAlloc
 	// Queued flights hold tickets, not envelopes: the envelope bytes in flight
 	// (built at the dispatch, held to the end of the serve) never exceed the
 	// flights the ceiling admits at once, plus the leader still gating its own
 	// reply while the next flight runs, plus the empty-gate escape.
 	envBound := (ceiling0/max(oneFill, 1) + 2) * env
 	t.Logf("#710 PR-2a F-MEM: %d resident lists × %d items (envelope %d B), %d refresh-forced readers, soft limit %d MiB. "+
-		"UNGATED live-heap growth +%d MiB (heap/objects +%d); GATED best of %d runs +%d MiB (heap/objects +%d; all runs %v MiB) (starting ceiling %d MiB + one fill %d MiB + its allocations %d MiB, measured in isolation; gate expansion %.1f×; bound %d MiB); unadmitted dispatches peak %d; "+
+		"UNGATED live-heap growth +%d MiB (heap/objects +%d); GATED worst of %d runs +%d MiB (heap/objects +%d; all runs %v MiB) (starting ceiling %d MiB + one fill %d MiB + %d × its allocations %d MiB, measured in isolation; gate expansion %.1f×; bound %d MiB); unadmitted dispatches peak %d; "+
 		"envelope bytes in flight peak %d (%.1f envelopes, bound %d); admitted-weight peak %d MiB; K / (ceiling / one fill) = %.1f; background admission wait p95 ≤ %d ms, max %d ms",
-		lists, perNS, env, readers, limit>>20, ungated>>20, ungatedObj>>20, gatedRuns, gated>>20, gatedObj>>20, runs, ceiling0>>20, oneFill>>20, oneFillAlloc>>20, exp, bound>>20, unadmittedPeak.Load(),
+		lists, perNS, env, readers, limit>>20, ungated>>20, ungatedObj>>20, gatedRuns, gated>>20, gatedObj>>20, runs, ceiling0>>20, oneFill>>20, fmemAllocateBlackFills, oneFillAlloc>>20, exp, bound>>20, unadmittedPeak.Load(),
 		envPeak, float64(envPeak)/float64(max(env, 1)), envBound,
 		contentFillAdmissionInflightWeightPeak.Load()>>20, float64(lists)/(float64(ceiling0)/float64(max(oneFill, 1))),
 		fill710P95(adm.Wait["background"]), adm.Wait["background"].MaxMS)
@@ -268,10 +294,15 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 			envPeak, float64(envPeak)/float64(max(env, 1)), envBound)
 	}
 	if gated > bound {
-		t.Fatalf("F-MEM RED: the best gated run's live heap grew %d MiB, past the starting ceiling + one fill + its allocations (%d MiB)", gated>>20, bound>>20)
+		t.Fatalf("F-MEM RED: a gated run's live heap grew %d MiB (runs %v MiB), past the starting ceiling + one fill + %d × its allocations (%d MiB)",
+			gated>>20, runs, fmemAllocateBlackFills, bound>>20)
 	}
-	if ungated <= bound {
-		t.Fatalf("PRECONDITION: the ungated burst stayed within the bound too (+%d MiB ≤ %d MiB) — the arm does not discriminate", ungated>>20, bound>>20)
+	// Vacuity is loud: the defect class must clear the bound with margin, or
+	// the bound no longer separates a correct gate from no gate (#780).
+	if margin := bound + 2*oneFillAlloc; ungated < margin {
+		t.Fatalf("PRECONDITION: the ungated burst grew +%d MiB, under bound + 2 × one fill's allocations (%d MiB) — "+
+			"the gap between a correct gate and no gate has closed, so the arm cannot discriminate; re-measure fmemAllocateBlackFills",
+			ungated>>20, margin>>20)
 	}
 }
 
