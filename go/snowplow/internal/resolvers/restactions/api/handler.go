@@ -245,10 +245,16 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 		// With no stage filter the merge below writes tmp, so tmp must be what
 		// the refilter left — never the raw service-account response.
 		tmp = pig[opts.key]
-		// #651 — an unresolved resource set keeps that fail-closed empty
-		// answer, but it is a stage failure, not "no resources".
-		if rf.ResourcesUnresolved && opts.stageFailed != nil {
-			opts.stageFailed(uafResourcesUnresolvedMsg)
+		// #651 / #760 — an unresolved resource set or a missing requester
+		// keeps that fail-closed empty answer, but it is a stage failure, not
+		// "no resources".
+		if opts.stageFailed != nil {
+			switch {
+			case rf.UserInfoMissing:
+				opts.stageFailed(uafUserInfoMissingMsg)
+			case rf.ResourcesUnresolved:
+				opts.stageFailed(uafResourcesUnresolvedMsg)
+			}
 		}
 	}
 

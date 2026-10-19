@@ -147,7 +147,18 @@ type refilterResult struct {
 	// set, so every item was dropped (fail-closed). The empty answer is served,
 	// but it is a stage failure, not "no resources": the caller records it.
 	ResourcesUnresolved bool
+	// UserInfoMissing (#760): no requester on ctx, so every item was dropped
+	// (fail-closed). Like ResourcesUnresolved, a stage failure the caller
+	// records, not an answer.
+	UserInfoMissing bool
 }
+
+// uafUserInfoMissingMsg / uafSAEndpointUnavailableMsg are the #760 stage-error
+// texts: fixed classes, never an error's own text (they reach the decline log).
+const (
+	uafUserInfoMissingMsg       = "userAccessFilter: no requester identity on the resolve; every item dropped (fail-closed)"
+	uafSAEndpointUnavailableMsg = "userAccessFilter: the service-account endpoint could not be acquired; the stage is served empty (fail-closed)"
+)
 
 // uafResourcesUnresolvedMsg is the stage-error text for ResourcesUnresolved: a
 // fixed class, never the expression's value (it reaches the decline log).
@@ -219,6 +230,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		// Replace with empty result set. Conservative-deny per
 		// security model.
 		_ = setRefilteredEmpty(dict, apiCall.Name)
+		res.UserInfoMissing = true
 		return res
 	}
 
@@ -898,6 +910,7 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 			slog.Any("err", err),
 		)
 		_ = setRefilteredEmpty(pig, stageName)
+		res.UserInfoMissing = true
 		return res
 	}
 
