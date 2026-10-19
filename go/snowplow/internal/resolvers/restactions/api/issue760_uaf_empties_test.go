@@ -185,3 +185,56 @@ func TestIssue760_LegitimateEmptyAndAllDenied_StayCacheable(t *testing.T) {
 		t.Fatalf("an all-denied list reported %d stage failures, want 0", failed)
 	}
 }
+
+// TestIssue760_ComposesWithTheNullElementSkip — #760 on top of #767: a
+// resourcesFrom that yields only null (an input not resolved yet) is skipped,
+// denies quietly and stays cacheable; the two #760 failures still record the
+// stage error whatever resourcesFrom yields, because each fires before the
+// resource set is evaluated.
+func TestIssue760_ComposesWithTheNullElementSkip(t *testing.T) {
+	srv := newA760Server(t)
+	newRefilterTestWatcher(t) // RBAC installed, no grants for anyone
+	nullOnly := func(path string) []*templates.API {
+		st := a760Stages(path)
+		st[0].UserAccessFilter.Resource = ""
+		st[0].UserAccessFilter.ResourcesFrom = "[ null ]"
+		return st
+	}
+
+	t.Run("null_only_set_denies_quietly", func(t *testing.T) {
+		a760SAEndpoint(t, &endpoints.Endpoint{ServerURL: srv.URL, Token: "sa-760"}, nil)
+		dict, sink := a760Resolve(srv.URL, "u760-nogrant", nullOnly("/list"))
+		if got := a760Items(t, dict); got != "[]" {
+			t.Fatalf("items=%s, want [] (an empty resource set denies every item)", got)
+		}
+		if sink.Count() != 0 {
+			st, msg := sink.Sample()
+			t.Fatalf("a [null]-only resource set was marked a stage error (%s: %s) — #767 makes it a quiet deny", st, msg)
+		}
+	})
+	t.Run("sa_unavailable_still_a_stage_error", func(t *testing.T) {
+		a760SAEndpoint(t, nil, errors.New("sa token file unreadable (injected)"))
+		dict, sink := a760Resolve(srv.URL, "u760-a", nullOnly("/list"))
+		if got := a760Items(t, dict); got != "[]" {
+			t.Errorf("items=%s, want []", got)
+		}
+		if sink.Count() == 0 {
+			t.Fatalf("SA-endpoint acquire failure with a [null] resource set recorded no stage error")
+		}
+	})
+	t.Run("missing_userinfo_still_a_stage_failure", func(t *testing.T) {
+		var failed []string
+		out := map[string]any{}
+		h := jsonHandlerBytes(context.Background(), jsonHandlerOptions{
+			key: "stage", out: out, dict: out, apiCallName: "stage",
+			uaf:         &templates.UserAccessFilterSpec{Verb: "list", Group: "example.test", ResourcesFrom: "[ null ]"},
+			stageFailed: func(msg string) { failed = append(failed, msg) },
+		})
+		if err := h([]byte(`{"items":[{"metadata":{"name":"x","namespace":"ns-a"}}]}`)); err != nil {
+			t.Fatalf("handler: %v", err)
+		}
+		if len(failed) != 1 || failed[0] != uafUserInfoMissingMsg {
+			t.Fatalf("stage failures = %q, want exactly the missing-UserInfo one", failed)
+		}
+	})
+}
