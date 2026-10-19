@@ -648,19 +648,18 @@ func apistageContentServeAttempt(
 			return nil, false
 		case stamp.on:
 			// #765 — a refresher read is never a customer serve: no warmth stamp
-			// (#376/#552). The cell is reused only if its stamp covers the
-			// triggers; it is noted served (#643, as ServeCell does) only then.
-			putSeq, live := store.CellPutSeq(k)
-			e, hit := store.GetNoTouch(k)
-			if !hit || e == nil {
+			// (#376/#552). Through cache.ServeCellIf (the #643 served-cell
+			// path): the cell is served — and noted — only if its content stamp
+			// covers the refresh's triggers.
+			e, hit, served := cache.ServeCellIf(ctx, store, k, func(e *cache.ResolvedEntry) bool {
+				return cache.ContentStampCovers(gvr, ns, name, e.ContentAsOf, stamp.need)
+			}, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			if !hit {
 				return nil, false
 			}
-			if !cache.ContentStampCovers(gvr, ns, name, e.ContentAsOf, stamp.need) {
+			if !served {
 				fillReason = contentFillRefreshForced
 				return nil, false
-			}
-			if live {
-				cache.NoteServedCell(ctx, k, putSeq, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
 			}
 			noteContentRefreshReused(gvr.String())
 			return e, true
