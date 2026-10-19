@@ -131,14 +131,15 @@ func TestNarrow765_R7_ServedButFailedUAFStageDoesNotNarrow(t *testing.T) {
 // tainting would let that edge narrow. New error sites keep landing (#651,
 // #760); a missing edge must read RED, not green (#533).
 func TestNarrow765_R6_EveryStageErrorSiteTaintsTheNarrowing(t *testing.T) {
-	// TYPE-BASED, not textual: every call of the method
-	// (*cache.StageErrorSink).Bump in this package's production files,
-	// whatever identifier, field, alias or closure it is reached through.
-	// LIMIT (documented): a bump reached INDIRECTLY — the method passed as a
-	// func value (sink.Bump as an argument) or a call from another package on
-	// this resolve's sink — is not a call expression here and is not seen;
-	// the guard also counts the sites (>= 4) so a refactor that moves the
-	// bumps out of reach reads RED rather than vacuously green.
+	// TYPE-BASED, not textual. A "bump" is any call of a method named Bump
+	// whose receiver is *cache.StageErrorSink OR an INTERFACE that
+	// *cache.StageErrorSink implements (a bump through an interface value —
+	// architect-623's probe on #784), reached through any identifier, field,
+	// alias or closure. A Bump SELECTED without being called (a method value,
+	// `f := sink.Bump`) is forbidden outright: the call it later makes is not
+	// visible here. LIMIT (documented): a bump made by ANOTHER package on this
+	// resolve's sink is not seen; the site count (>= 4) keeps a refactor that
+	// moves the bumps out of reach from reading vacuously green.
 	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 		packages.NeedTypes | packages.NeedTypesInfo, Tests: false}
 	pkgs, err := packages.Load(cfg, ".")
@@ -146,13 +147,21 @@ func TestNarrow765_R6_EveryStageErrorSiteTaintsTheNarrowing(t *testing.T) {
 		t.Fatalf("load package: %v %v", err, pkgs)
 	}
 	pkg := pkgs[0]
-	isBump := func(e ast.Expr) bool {
-		call, ok := e.(*ast.CallExpr)
-		if !ok {
-			return false
+	var sinkPtr types.Type
+	for _, imp := range pkg.Types.Imports() {
+		if strings.HasSuffix(imp.Path(), "/internal/cache") {
+			if obj := imp.Scope().Lookup("StageErrorSink"); obj != nil {
+				sinkPtr = types.NewPointer(obj.Type())
+			}
 		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "Bump" {
+	}
+	if sinkPtr == nil {
+		t.Fatalf("R6: cache.StageErrorSink not found among the package's imports")
+	}
+	// isBumpSel: the selector names a Bump method on the sink, or on an
+	// interface the sink satisfies.
+	isBumpSel := func(sel *ast.SelectorExpr) bool {
+		if sel.Sel.Name != "Bump" {
 			return false
 		}
 		fn, ok := pkg.TypesInfo.Uses[sel.Sel].(*types.Func)
@@ -163,7 +172,43 @@ func TestNarrow765_R6_EveryStageErrorSiteTaintsTheNarrowing(t *testing.T) {
 		if !ok || sig.Recv() == nil {
 			return false
 		}
-		return strings.HasSuffix(types.TypeString(sig.Recv().Type(), nil), "internal/cache.StageErrorSink")
+		recv := sig.Recv().Type()
+		if types.Identical(recv, sinkPtr) {
+			return true
+		}
+		if iface, ok := recv.Underlying().(*types.Interface); ok {
+			return types.Implements(sinkPtr, iface)
+		}
+		return false
+	}
+	isBump := func(e ast.Expr) bool {
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		return ok && isBumpSel(sel)
+	}
+	// Every Bump selector must be the callee of a call (no method values).
+	selectors, callees := 0, 0
+	for _, f := range pkg.Syntax {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.SelectorExpr:
+				if isBumpSel(x) {
+					selectors++
+				}
+			case *ast.CallExpr:
+				if sel, ok := x.Fun.(*ast.SelectorExpr); ok && isBumpSel(sel) {
+					callees++
+				}
+			}
+			return true
+		})
+	}
+	if selectors != callees {
+		t.Errorf("R6 RED: %d Bump selections but only %d are called directly: a method value (f := sink.Bump) "+
+			"hides the bump from the taint rule", selectors, callees)
 	}
 	isTaint := func(st ast.Stmt) bool {
 		es, ok := st.(*ast.ExprStmt)

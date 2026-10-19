@@ -316,6 +316,9 @@ func ListNarrowAuditSamples() uint64 {
 // This is one process's view since its start. The gate spans pod restarts
 // and replicas: read it from OTLP, summing each series' last cumulative
 // value per (pod, start time) — see metrics.go registerListNarrowInstruments.
+// A dying pod's last unexported interval is lost from the counters, so the gate
+// ALSO requires zero deps.list_narrow.would_change WARN lines in ClickHouse over
+// the window (every would_change logs one at the moment of the verdict).
 type ListNarrowGate struct {
 	WouldAvoidMarks    uint64  `json:"would_avoid_marks"`
 	AvoidOnlyRefreshes uint64  `json:"avoid_only_refreshes"`

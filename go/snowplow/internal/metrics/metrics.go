@@ -1298,6 +1298,14 @@ func registerUndeclaredExtrasExemptInstrument(m metric.Meter) error {
 // therefore sums, per (pod, StartTimeUnix), the LAST value of each series,
 // never a sum across exports and never one pod's /debug/vars (which forgets
 // everything before its own start).
+//
+// A DYING POD LOSES ITS LAST INTERVAL. Whatever a pod counted after its last
+// successful export (up to one export interval, or more on an unclean exit)
+// never reaches OTLP, so a would_change counted there is invisible to the
+// counter sum. Every would_change is ALSO a WARN log line
+// (deps.list_narrow.would_change, written at the moment of the verdict, with
+// the key hash and the two digests), so the gate ALSO requires ZERO such lines
+// in ClickHouse otel_logs over the same window. Both must be zero.
 func registerListNarrowInstruments(m metric.Meter) error {
 	decisions, err := m.Int64ObservableCounter("snowplow_deps_list_narrow_total",
 		metric.WithDescription("SHADOW (#603/#765): every list_dep dirty mark of an object event, classified by whether enforcing the JQ read-set narrowing would have skipped it. outcome=avoided reason=unread_field is a WOULD-AVOID (the UPDATE changed no field the cell can observe); outcome=kept by reason (read_field, membership, interest_all, interest_pending, registry_late, undecided, no_mask, degraded). Every mark is still made: nothing is skipped. Their sum equals the object-path list_dep dirty marks."))
