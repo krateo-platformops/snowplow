@@ -95,6 +95,38 @@ func TestScale765_H0Calibration(t *testing.T) {
 	}
 }
 
+// TestScale765_Point is one run of a PAIRED comparison (paired_ab.sh): the same
+// population and one point (SCALE765_MODE, default annotation; SCALE765_RATE,
+// default 10), its report written as SCALE765_LABEL.json. The driver runs this
+// binary, built once per tree (main + harness, and each fix's branch + the same
+// harness), alternating, and paired_summary.py compares them by ratios.
+func TestScale765_Point(t *testing.T) {
+	label := os.Getenv("SCALE765_LABEL")
+	if label == "" {
+		t.Fatalf("SCALE765_LABEL is required (paired_ab.sh sets it)")
+	}
+	mode := s765Mode(os.Getenv("SCALE765_MODE"))
+	if mode == "" {
+		mode = s765Annotation
+	}
+	if mode != s765Annotation && mode != s765Status {
+		t.Fatalf("SCALE765_MODE: %q", mode)
+	}
+	rate := 10.0
+	if v := os.Getenv("SCALE765_RATE"); v != "" {
+		r, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			t.Fatalf("SCALE765_RATE: %v", err)
+		}
+		rate = r
+	}
+	s765RefuseBusyHost(t)
+	h := s765Setup(t, s765Full())
+	s765Emit(t, label+"-populate", h.populate())
+	rep := h.run(s765FullPoint(t, mode, rate))
+	s765Emit(t, label, rep)
+}
+
 // TestScale765_H0Matrix runs main at every point SCALE765_POINTS names
 // ("mode:rate,..."; default: both modes at 1, 10 and 50/s), one harness, the
 // points in order, each followed by a bounded drain.
