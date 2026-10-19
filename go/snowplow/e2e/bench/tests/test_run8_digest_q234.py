@@ -432,6 +432,29 @@ def test_run606_leftover_that_never_clears_fails_clearly_before_load(harness):
     assert gcl[-1] == ["container", "clusters", "delete"]
 
 
+def test_wrong_digest_with_a_terminating_leftover_is_void_not_unsettled():
+    """reviewer-small F5: the mismatch is decided before the settle wait."""
+    old, _ = _old_and_new()
+    wrong = _pod("snowplow-new", f"ghcr.io/x/snowplow@{OTHER_DIGEST}")
+    rec = load606.image_digest_gate({"items": [old, wrong]}, D, require_settled=True)
+    assert rec["result"] == "VOID" and "digest mismatch" in rec["why"]
+    body = json.dumps({"items": [old, wrong]})
+    p = subprocess.run(["python3", "-m", "bench.load606", "digest-gate", "--expected", D,
+                        "--require-settled"], input=body, cwd=BENCH_DIR,
+                       capture_output=True, text=True)
+    assert p.returncode == 3                       # VOID, not 4 (UNSETTLED)
+
+
+@pytest.mark.parametrize("before_live,after_live", [(False, False), (False, True), (True, False)])
+def test_restart_check_fails_when_any_record_has_no_live_pod(before_live, after_live):
+    """#758: neither record live used to PASS with value 0."""
+    old, new = _old_and_new()
+    b = load606.pod_record({"items": [old, new] if before_live else [old]}, "before")
+    a = load606.pod_record({"items": [new] if after_live else [old]}, "after")
+    c = load606.restart_check([b, a])
+    assert c["result"] == "FAIL" and "no live snowplow pod" in c["why"]
+
+
 @pytest.mark.parametrize("max_ms", ["absent", None])
 def test_stale_to_push_with_pushes_but_no_max_fails_the_max_bar(max_ms):
     h = H2b(100, 100, 0)

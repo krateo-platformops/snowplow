@@ -961,6 +961,13 @@ def restart_check(pods: list[dict] | None) -> dict | None:
         return {"check": "snowplow.restarts_during_measure", "value": None,
                 "bar": "== 0", "result": "FAIL",
                 "why": "restart state unknown (missing before/after pod record)"}
+    if before.get("pod") is None or after.get("pod") is None:
+        # #758: a record with no live pod (none, or only Terminating ones) is
+        # unknown on EITHER side — two such records are not "same pod, 0".
+        return {"check": "snowplow.restarts_during_measure", "value": None,
+                "bar": "== 0", "result": "FAIL",
+                "why": "restart state unknown (no live snowplow pod in the "
+                       f"{'before' if before.get('pod') is None else 'after'} record)"}
     if after.get("pod") != before.get("pod"):
         return {"check": "snowplow.restarts_during_measure", "value": None,
                 "bar": "== 0", "result": "FAIL",
