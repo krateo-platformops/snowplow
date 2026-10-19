@@ -991,7 +991,88 @@ def pod_record(pod_list: dict, phase: str) -> dict:
             "last_state": cs.get("lastState") or {},
             "limits": (((p.get("spec") or {}).get("containers") or [{}])[0]
                        .get("resources") or {}).get("limits"),
+            "image_id": cs.get("imageID"),
+            "digest": image_digest_of(cs.get("imageID")),
             "t": time.time()}
+
+
+# ─── image digest gate (run 8: a pod on any other digest makes the run VOID) ─
+
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def image_digest_of(image_id: str | None) -> str | None:
+    """`ghcr.io/x/snowplow@sha256:<hex>` (or `docker-pullable://…@sha256:…`)
+    → `sha256:<hex>`; None when the status carries no pulled digest."""
+    if not image_id:
+        return None
+    tail = str(image_id).rsplit("@", 1)[-1]
+    return tail if DIGEST_RE.match(tail) else None
+
+
+def image_digest_gate(pod_list: dict, expected: str) -> dict:
+    """`kubectl get pods -l <snowplow> -o json` → one `image_digest` record.
+
+    MATCH only when the expected digest is well formed, at least one live
+    snowplow pod exists, and EVERY container status of EVERY live pod reports
+    exactly that digest (read from status.containerStatuses[].imageID — what
+    the kubelet pulled, not the tag the spec asked for). Anything else —
+    a different digest, an empty imageID, no pods — is VOID. Pods already
+    terminating (deletionTimestamp set: the rollout's leftovers) are recorded
+    but not judged.
+    """
+    rec = {"kind": "image_digest", "expected": expected, "t": time.time(),
+           "pods": [], "result": "VOID", "why": None}
+    if not DIGEST_RE.match(expected or ""):
+        rec["why"] = "expected digest is not sha256:<64 hex>"
+        return rec
+    live = 0
+    bad = []
+    for p in pod_list.get("items") or []:
+        meta = p.get("metadata") or {}
+        terminating = bool(meta.get("deletionTimestamp"))
+        statuses = (p.get("status") or {}).get("containerStatuses") or []
+        if not terminating:
+            live += 1
+            if not statuses:
+                bad.append(f"{meta.get('name')}: no container status")
+        for cs in statuses:
+            d = image_digest_of(cs.get("imageID"))
+            row = {"pod": meta.get("name"), "container": cs.get("name"),
+                   "image": cs.get("image"), "image_id": cs.get("imageID"),
+                   "digest": d, "terminating": terminating, "match": d == expected}
+            rec["pods"].append(row)
+            if not terminating and d != expected:
+                bad.append(f"{meta.get('name')}/{cs.get('name')}: {d or 'no digest'}")
+    if live == 0:
+        rec["why"] = "no live snowplow pod"
+    elif bad:
+        rec["why"] = "digest mismatch: " + "; ".join(bad)
+    else:
+        rec["result"] = "MATCH"
+    return rec
+
+
+def digest_check(expected: str | None, gates: list[dict],
+                 pods: list[dict] | None) -> dict | None:
+    """Validity check over the gate record(s) and the before/after pod records.
+    None when no digest is expected (unit callers)."""
+    if not expected:
+        return None
+    c = {"check": "snowplow.image_digest", "bar": f"== {expected}"}
+    seen = [g for g in gates if g.get("kind") == "image_digest"]
+    if not seen:
+        return dict(c, value=None, result="FAIL",
+                    why="VOID: no image-digest gate record (the gate did not run)")
+    if any(g.get("result") != "MATCH" or g.get("expected") != expected for g in seen):
+        bad = next(g for g in seen if g.get("result") != "MATCH" or g.get("expected") != expected)
+        return dict(c, value=[r.get("digest") for r in bad.get("pods") or []], result="FAIL",
+                    why=f"VOID: {bad.get('why') or 'gate expected a different digest'}")
+    for pr in pods or []:
+        if pr.get("pod") is not None and pr.get("digest") != expected:
+            return dict(c, value=pr.get("digest"), result="FAIL",
+                        why=f"VOID: snowplow pod ({pr.get('phase')}) runs {pr.get('digest')}")
+    return dict(c, value=expected, result="PASS")
 
 
 def memory_report(mem: list[dict]) -> dict | None:
@@ -1026,9 +1107,39 @@ RUN8_KEYS = {
     "dirty_to_fresh_p95": "snowplow_refresher_dirty_to_fresh_ms_p95",
     "dirty_to_fresh_max": "snowplow_refresher_dirty_to_fresh_ms_max",
     "build_info": "snowplow_build_info",
+    # Q2 — stale serves and their pushes (#710 PR-2b). Names and shapes
+    # checked against the /debug/vars the 1.12.50 tree (e47cd719) serves:
+    # tests/fixtures/debug_vars_keys_1.12.50.json.
+    "stale_serve": "snowplow_apistage_stale_serve_total",            # {"known_stale": n}
+    "stale_serve_age": "snowplow_apistage_stale_serve_age_ms",       # histogram
+    "stale_push": "snowplow_apistage_stale_push_total",
+    "stale_push_unarmed": "snowplow_apistage_stale_push_unarmed_total",
+    "stale_withdrawn": "snowplow_apistage_stale_serve_withdrawn_total",  # {"unarmable": n}
+    "resolved_cache": "snowplow_resolved_cache",                     # stat -> value map
+    # Q3 — users never queue: per-class admission (background/customer/debt).
+    "admission_queued": "snowplow_apistage_content_fill_admission_queued",        # class -> gauge
+    "admission_timeout": "snowplow_apistage_content_fill_admission_timeout_total",  # class -> n
+    "admission_weight": "snowplow_apistage_content_fill_admission_inflight_weight",
+    "admission_weight_peak": "snowplow_apistage_content_fill_admission_inflight_weight_peak",
+    "customer_inflight": "snowplow_customer_resolve_inflight",
+    # Q4 — #740 viewer-gated retries and parked debt.
+    "debt_open": "snowplow_apistage_stale_debt_open",
+    "debt_parked": "snowplow_apistage_stale_debt_parked",
+    "debt_oldest_age": "snowplow_apistage_stale_debt_oldest_age_ms",
+    "debt_retries": "snowplow_apistage_stale_debt_retries_total",
+    "retry_total": "snowplow_stale_retry_total",                 # kind -> source -> n
+    "retry_chains": "snowplow_stale_retry_chains_active",
+    "retry_viewers": "snowplow_stale_retry_viewers",
+    "retry_backoff": "snowplow_stale_retry_backoff_ms",
+    "retry_abandoned": "snowplow_stale_retry_abandoned_total",   # {"no_viewer", "evicted"}
+    "retry_resumed": "snowplow_stale_retry_resumed_total",
 }
-# The /debug/vars prefixes memwatch must capture so every key above is seen
-# (also used as run606's MEM_VARS_PREFIXES default).
+# Members of the snowplow_resolved_cache map the Q2 report reads.
+RUN8_RESOLVED_CACHE_STATS = ("hit_total", "stale_served_total", "stale_served_age_ms_max",
+                             "known_stale_served_total")
+# The /debug/vars prefixes memwatch must capture so every key above is seen.
+# run606's MEM_VARS_PREFIXES default IS this tuple (printed by `prefixes`), and
+# `check-prefixes` refuses a run-8 run whose prefixes miss any RUN8_KEYS value.
 RUN8_VARS_PREFIXES = (
     "snowplow_apistage_content_fill",     # PR-0 family + #719 admission_*
     "snowplow_nested_resolve_",           # #720 nested gate
@@ -1037,11 +1148,25 @@ RUN8_VARS_PREFIXES = (
     "snowplow_resolved_cache",
     "snowplow_informer_dispatch_shape",
     "snowplow_build_info",
+    "snowplow_customer_resolve_inflight",  # Q3
+    "snowplow_stale_retry_",               # Q4 (#740)
 )
+# Bars: the #710 / #740 rulings, written here — never derived from the
+# instrument under test.
 STALE_TO_PUSH_P95_BAR_MS = 3000
 STALE_TO_PUSH_MAX_BAR_MS = 10000
 STALE_TO_PUSH_GOAL_MS = 1000
+STALE_PUSH_UNARMED_BAR = 0
+STALE_OVERDUE_BAR = 0
+BYPASS_QUEUED_BAR = 0
+BYPASS_TIMEOUT_BAR = 0
 BURST_WINDOW_S = 120.0
+
+
+def prefixes_missing(prefixes) -> list[str]:
+    """The RUN8_KEYS values no prefix in `prefixes` captures."""
+    ps = tuple(p for p in prefixes if p)
+    return sorted(k for k in set(RUN8_KEYS.values()) if not ps or not k.startswith(ps))
 
 
 def _hist_cum(h: dict, bound_ms: int) -> int | None:
@@ -1191,6 +1316,230 @@ def detect_restart(mem: list[dict], pods: list[dict] | None) -> dict | None:
     return {"t": t_first, "signals": signals}
 
 
+def _series(mem: list[dict], key: str) -> list:
+    """The values of one captured expvar, in sample-time order."""
+    rows = sorted((m for m in mem if m.get("kind") == "mem" and key in (m.get("extra") or {})),
+                  key=lambda m: m.get("t") or 0)
+    return [m["extra"][key] for m in rows]
+
+
+def _member(v, name):
+    return _num(v.get(name)) if isinstance(v, dict) else None
+
+
+def _first_last_delta(vals: list) -> dict:
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return {"first": None, "last": None, "delta": None}
+    return {"first": vals[0], "last": vals[-1],
+            "delta": vals[-1] - vals[0] if len(vals) >= 2 else None}
+
+
+def _max(vals):
+    vals = [v for v in vals if v is not None]
+    return max(vals) if vals else None
+
+
+def _map_delta(series: list) -> dict:
+    """Per-member first→last delta of a flat (or kind→source nested) count map."""
+    out = {}
+    maps = [s for s in series if isinstance(s, dict)]
+    if not maps:
+        return out
+    first, last = maps[0], maps[-1]
+    for k, v in last.items():
+        if isinstance(v, dict):
+            out[k] = _map_delta([first.get(k) or {}, v]) if len(maps) >= 2 else dict(v)
+        elif _num(v) is not None:
+            out[k] = v - (_num(first.get(k)) or 0) if len(maps) >= 2 else v
+    return out
+
+
+def _q2_stale(mem: list[dict], chk) -> dict:
+    """Q2 — stale serves: share of customer hits and age (resolved cache), the
+    apistage stale-serve/push family; push_unarmed is GATED at 0."""
+    out = {}
+    key = RUN8_KEYS["resolved_cache"]
+    rc = [v for v in _series(mem, key) if isinstance(v, dict)]
+    missing = [s for s in RUN8_RESOLVED_CACHE_STATS if not any(s in v for v in rc)]
+    if missing:
+        chk("run8.stale_served.share_of_hits", key, None, "reported", "FAIL",
+            "not exposed: " + ", ".join(missing))
+    else:
+        hit = _first_last_delta([_member(v, "hit_total") for v in rc])
+        ss = _first_last_delta([_member(v, "stale_served_total") for v in rc])
+        share = (round(ss["delta"] / hit["delta"], 4)
+                 if hit["delta"] and ss["delta"] is not None else None)
+        reasons = sorted({k for v in rc for k in v
+                          if k.startswith("known_stale_served_") and k.endswith("_total")
+                          and k != "known_stale_served_total"})
+        out["resolved_cache"] = {
+            "hit_total_delta": hit["delta"], "stale_served_total_delta": ss["delta"],
+            "stale_served_share_of_hits": share,
+            # windowed (~one OTLP interval) gauge: the max over every sample
+            "stale_served_age_ms_max": _max([_member(v, "stale_served_age_ms_max") for v in rc]),
+            "known_stale_served_total_delta":
+                _first_last_delta([_member(v, "known_stale_served_total") for v in rc])["delta"],
+            "known_stale_served_by_reason_delta":
+                {r: _first_last_delta([_member(v, r) for v in rc])["delta"] for r in reasons}}
+        chk("run8.stale_served.share_of_hits", key, share, "reported (no bar)", "PASS",
+            None if share is not None else "no customer hits between samples")
+    for name, k, member in (("apistage_stale_serve", "stale_serve", "known_stale"),
+                            ("apistage_stale_push", "stale_push", None),
+                            ("apistage_stale_withdrawn", "stale_withdrawn", "unarmable")):
+        key = RUN8_KEYS[k]
+        s = _series(mem, key)
+        vals = [_member(v, member) if member else _num(v) for v in s]
+        if not [v for v in vals if v is not None]:
+            chk(f"run8.{name}_total", key, None, "reported", "FAIL", "not exposed")
+            continue
+        out[name + "_total"] = _first_last_delta(vals)
+        chk(f"run8.{name}_total", key, out[name + "_total"]["delta"], "reported", "PASS")
+    key = RUN8_KEYS["stale_serve_age"]
+    hs = [h for h in _series(mem, key) if isinstance(h, dict)]
+    if not hs:
+        chk("run8.stale_serve_age_ms", key, None, "reported", "FAIL", "not exposed")
+    else:
+        out["stale_serve_age_ms"] = {"count": hs[-1].get("count"),
+                                     "p95_bucket": hist_p95_bound(hs[-1]),
+                                     "max_ms": hs[-1].get("max_ms")}
+        chk("run8.stale_serve_age_ms", key, out["stale_serve_age_ms"], "reported", "PASS")
+    key = RUN8_KEYS["stale_push_unarmed"]
+    vals = [v for v in (_num(x) for x in _series(mem, key)) if v is not None]
+    if not vals:
+        chk("run8.stale_push_unarmed_total", key, None, f"== {STALE_PUSH_UNARMED_BAR}",
+            "FAIL", "not exposed")
+    else:
+        out["stale_push_unarmed_total"] = vals[-1]
+        chk("run8.stale_push_unarmed_total", key, vals[-1], f"== {STALE_PUSH_UNARMED_BAR}",
+            "PASS" if vals[-1] <= STALE_PUSH_UNARMED_BAR else "FAIL",
+            "a stale serve pushed with no armed subscriber: the user is never told")
+    return out
+
+
+_BYPASS = ("customer", "debt")
+
+
+def _q3_admission(mem: list[dict], chk) -> dict:
+    """Q3 — users never queue. Per class (background/customer/debt), all from
+    /debug/vars maps: queued (gauge), timeouts, admissions (wait-histogram
+    count: a bypass flight records one 0 ms wait at admit)."""
+    out = {}
+    kq, kt, kw = (RUN8_KEYS["admission_queued"], RUN8_KEYS["admission_timeout"],
+                  RUN8_KEYS["admission_wait"])
+    qs = [v for v in _series(mem, kq) if isinstance(v, dict)]
+    ts = [v for v in _series(mem, kt) if isinstance(v, dict)]
+    ws = [v for v in _series(mem, kw) if isinstance(v, dict)]
+    note = ("structural: a bypass class is admitted before it can enqueue, so 0 is the "
+            "expected reading, not a detection; the user-side evidence is nav latency")
+    if not qs or not all(c in qs[-1] for c in _BYPASS):
+        chk("run8.users_never_queue.queued", kq, None, f"== {BYPASS_QUEUED_BAR}", "FAIL",
+            "not exposed")
+    else:
+        mx = {c: _max([_member(q, c) for q in qs]) for c in ("background",) + _BYPASS}
+        out["queued_max"] = mx
+        bad = any((mx[c] or 0) > BYPASS_QUEUED_BAR for c in _BYPASS)
+        chk("run8.users_never_queue.queued", kq, {c: mx[c] for c in _BYPASS},
+            f"== {BYPASS_QUEUED_BAR}", "FAIL" if bad else "PASS", note)
+    if not ts or not all(c in ts[-1] for c in _BYPASS):
+        chk("run8.users_never_queue.timeout", kt, None, f"== {BYPASS_TIMEOUT_BAR}", "FAIL",
+            "not exposed")
+    else:
+        last = {c: _member(ts[-1], c) for c in ("background",) + _BYPASS}
+        out["timeout_total"] = last
+        bad = any((last[c] or 0) > BYPASS_TIMEOUT_BAR for c in _BYPASS)
+        chk("run8.users_never_queue.timeout", kt, {c: last[c] for c in _BYPASS},
+            f"== {BYPASS_TIMEOUT_BAR}", "FAIL" if bad else "PASS", note)
+    if ws:
+        last = ws[-1]
+        adm = {c: (last.get(c) or {}).get("count") for c in ("background",) + _BYPASS}
+        bg = last.get("background") or {}
+        lowest = _hist_cum(bg, 10)
+        out["bypass_vs_throttled"] = {
+            "customer_bypass_admissions": adm["customer"],
+            "debt_bypass_admissions": adm["debt"],
+            "background_admissions": adm["background"],
+            # background flights that waited past the lowest bucket (10 ms)
+            "background_waited_over_10ms": (bg.get("count") - lowest
+                                            if bg.get("count") is not None and lowest is not None
+                                            else None),
+            "background_timeouts": (out.get("timeout_total") or {}).get("background"),
+            "per_class_wait": {c: {"count": (last.get(c) or {}).get("count"),
+                                   "p95_bucket": hist_p95_bound(last.get(c) or {}),
+                                   "max_ms": (last.get(c) or {}).get("max_ms")}
+                               for c in ("background",) + _BYPASS},
+            "note": ("a customer/debt max_ms > 0 is a queued background flight a user "
+                     "joined (promoted, admitted at once), timed from the leader's start")}
+        chk("run8.admission.bypass_vs_throttled", kw, out["bypass_vs_throttled"],
+            "reported (no bar)", "PASS")
+    for k in ("customer_inflight", "admission_weight", "admission_weight_peak"):
+        key = RUN8_KEYS[k]
+        vals = [_num(v) for v in _series(mem, key)]
+        if k == "customer_inflight":
+            vals += [_num(m.get("customer_resolve_inflight")) for m in mem
+                     if m.get("kind") == "mem"]
+        out[k + "_max"] = _max(vals)
+        if out[k + "_max"] is None:
+            chk(f"run8.{k}", key, None, "reported", "FAIL", "not exposed")
+    return out
+
+
+def _q4_retry(mem: list[dict], chk, overdue_vals: list) -> dict:
+    """Q4 — #740: debts parked (nobody viewing) vs overdue (viewed, late), and
+    the viewer-gated retry engine. overdue is gated by the caller."""
+    out = {"stale_overdue_total_last": overdue_vals[-1] if overdue_vals else None}
+    for k in ("debt_open", "debt_parked", "debt_oldest_age", "retry_chains",
+              "retry_viewers", "retry_backoff"):
+        key = RUN8_KEYS[k]
+        vals = [_num(v) for v in _series(mem, key)]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            chk(f"run8.740.{k}", key, None, "reported", "FAIL", "not exposed")
+            continue
+        out[k] = {"max": max(vals), "last": vals[-1]}
+    for k in ("debt_retries", "retry_resumed"):
+        key = RUN8_KEYS[k]
+        vals = [_num(v) for v in _series(mem, key)]
+        if not [v for v in vals if v is not None]:
+            chk(f"run8.740.{k}", key, None, "reported", "FAIL", "not exposed")
+            continue
+        out[k] = _first_last_delta(vals)
+    for k in ("retry_total", "retry_abandoned"):
+        key = RUN8_KEYS[k]
+        s = _series(mem, key)
+        if not [v for v in s if isinstance(v, dict)]:
+            chk(f"run8.740.{k}", key, None, "reported", "FAIL", "not exposed")
+            continue
+        out[k + "_delta"] = _map_delta(s)
+    # Viewer gate, as far as 5–15 s samples can see it: an interval in which
+    # GENUINE retries rose while BOTH bounding samples show zero viewers is a
+    # LEAD to read in the logs — never a verdict (a chain can open, retry
+    # with a viewer and end between two samples).
+    rows = sorted((m for m in mem if m.get("kind") == "mem"
+                   and RUN8_KEYS["retry_total"] in (m.get("extra") or {})
+                   and RUN8_KEYS["retry_viewers"] in (m.get("extra") or {})),
+                  key=lambda m: m.get("t") or 0)
+
+    def genuine(m):
+        g = (m["extra"][RUN8_KEYS["retry_total"]] or {}).get("genuine") or {}
+        return sum(v for v in g.values() if _num(v) is not None)
+
+    suspect = [b.get("t") for a, b in zip(rows, rows[1:])
+               if genuine(b) > genuine(a)
+               and not _num(a["extra"][RUN8_KEYS["retry_viewers"]])
+               and not _num(b["extra"][RUN8_KEYS["retry_viewers"]])]
+    out["viewer_gate"] = {"intervals": max(len(rows) - 1, 0),
+                          "genuine_retries_with_no_viewer_either_side": len(suspect),
+                          "first_such_t": suspect[0] if suspect else None,
+                          "note": "a LEAD for the logs, not a verdict (sampling)"}
+    parked = (out.get("debt_parked") or {}).get("max")
+    chk("run8.740.parked_vs_overdue", RUN8_KEYS["debt_parked"],
+        {"parked_max": parked, "overdue_total": out["stale_overdue_total_last"]},
+        "reported (parked is NOT overdue; overdue gated separately)",
+        "PASS" if parked is not None else "FAIL", None if parked is not None else "not exposed")
+    return out
+
+
 def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
                 pods: list[dict] | None) -> tuple[dict, list[dict]]:
     """(report, checks). Checks: PASS / FAIL / INCONCLUSIVE."""
@@ -1288,13 +1637,23 @@ def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
         chk("run8.stale_to_push.max", key, mx, f"<= {STALE_TO_PUSH_MAX_BAR_MS}",
             "PASS" if mx is not None and mx <= STALE_TO_PUSH_MAX_BAR_MS else "FAIL")
 
-    # ── stale_overdue_total ──────────────────────────────────────────────
+    # ── stale_overdue_total: GATED at 0 (#740: parked debt is NOT overdue) ─
+    # Read as the absolute last value — cumulative since the pre-measure
+    # reboot, so it is stricter than the in-run delta (also reported).
     key = RUN8_KEYS["stale_overdue"]
-    vals = [_num(v) for v in _extra_values(mem, key)]
-    vals = [v for v in vals if v is not None]
-    overdue = (vals[-1] - vals[0]) if len(vals) >= 2 else (vals[0] if vals else None)
-    chk("run8.stale_overdue_total", key, overdue, "reported",
-        "FAIL" if not vals else "PASS", None if vals else "not exposed")
+    ov_vals = [_num(v) for v in _series(mem, key)]
+    ov_vals = [v for v in ov_vals if v is not None]
+    overdue = (ov_vals[-1] - ov_vals[0]) if len(ov_vals) >= 2 else (ov_vals[0] if ov_vals else None)
+    if not ov_vals:
+        chk("run8.stale_overdue_total", key, None, f"== {STALE_OVERDUE_BAR}", "FAIL", "not exposed")
+    else:
+        chk("run8.stale_overdue_total", key, ov_vals[-1], f"== {STALE_OVERDUE_BAR}",
+            "PASS" if ov_vals[-1] <= STALE_OVERDUE_BAR else "FAIL",
+            f"since the reboot; in-run delta {overdue}")
+
+    q2 = _q2_stale(mem, chk)
+    q3 = _q3_admission(mem, chk)
+    q4 = _q4_retry(mem, chk, ov_vals)
 
     # ── background admission wait (and customer: users never queue) ──────
     key = RUN8_KEYS["admission_wait"]
@@ -1348,6 +1707,8 @@ def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
                           "bar": "no restart", "result": "FAIL", "build": build,
                           "why": "RESTARTED — the OOMKill/restart is the run-8 headline result"})
     report = {"memory_risk": risk, "stale_to_push": stp, "stale_overdue_delta": overdue,
+              "stale_overdue_last": ov_vals[-1] if ov_vals else None,
+              "q2_stale": q2, "q3_users_never_queue": q3, "q4_retry_740": q4,
               "restart": restart,
               "admission_wait_ms": wait, "refresher_dirty_to_fresh": d2f, "build": build,
               "keys": RUN8_KEYS}
@@ -1371,7 +1732,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              snowplow_pods: list[dict] | None = None,
              mem: list[dict] | None = None,
              tops: list[dict] | None = None,
-             run8: bool = False) -> dict:
+             run8: bool = False,
+             expected_digest: str | None = None,
+             image_digests: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -1465,6 +1828,10 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     restart = restart_check(snowplow_pods)
     if restart is not None:
         validity.append(restart)
+    dig = digest_check(expected_digest, image_digests or [], snowplow_pods)
+    if dig is not None:
+        validity.append(dig)
+    report["image_digest"] = {"expected": expected_digest, "gate": image_digests or None}
     report["snowplow_pod"] = snowplow_pods
     report["memory"] = memory_report(mem or [])
     report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
@@ -2118,6 +2485,21 @@ def _cmd_pod_record(a) -> int:
     return 0
 
 
+def _cmd_digest_gate(a) -> int:
+    rec = image_digest_gate(json.loads(sys.stdin.read() or "{}"), a.expected)
+    print(json.dumps(rec))
+    return 0 if rec["result"] == "MATCH" else 3
+
+
+def _cmd_check_prefixes(a) -> int:
+    missing = prefixes_missing(a.prefixes)
+    if missing:
+        print("run-8 keys no MEM_VARS_PREFIXES entry captures: " + " ".join(missing),
+              file=sys.stderr)
+        return 2
+    return 0
+
+
 def _cmd_evaluate(a) -> int:
     recs = []
     for p in a.inputs:
@@ -2136,7 +2518,9 @@ def _cmd_evaluate(a) -> int:
                       login_curves=[r for r in recs if r.get("kind") == "login_curve"],
                       preflights=[r for r in recs if r.get("kind") == "preflight"],
                       snowplow_pods=[r for r in recs if r.get("kind") == "snowplow_pod"],
-                      mem=[r for r in recs if r.get("kind") in ("mem", "heap_profile")])
+                      mem=[r for r in recs if r.get("kind") in ("mem", "heap_profile")],
+                      expected_digest=a.expect_digest,
+                      image_digests=[r for r in recs if r.get("kind") == "image_digest"])
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
@@ -2232,8 +2616,19 @@ def main(argv: list[str] | None = None) -> int:
     pr = sub.add_parser("pod-record", help="kubectl get pods -o json on stdin -> snowplow_pod record")
     pr.add_argument("--phase", required=True, choices=["before", "after"])
     pr.set_defaults(func=_cmd_pod_record)
+    dg = sub.add_parser("digest-gate",
+                        help="kubectl get pods -o json on stdin -> image_digest record; exit 3 = VOID")
+    dg.add_argument("--expected", required=True, help="sha256:<64 hex>")
+    dg.set_defaults(func=_cmd_digest_gate)
+    cp = sub.add_parser("check-prefixes", help="exit 2 unless the prefixes capture every RUN8_KEYS value")
+    cp.add_argument("prefixes", nargs="*")
+    cp.set_defaults(func=_cmd_check_prefixes)
+    vp = sub.add_parser("prefixes", help="print RUN8_VARS_PREFIXES (run606's default)")
+    vp.set_defaults(func=lambda a: print(" ".join(RUN8_VARS_PREFIXES)) or 0)
     e = sub.add_parser("evaluate")
     e.add_argument("inputs", nargs="+")
+    e.add_argument("--expect-digest", default=None,
+                   help="INVALID (VOID) unless the image-digest gate and pod records show this digest")
     e.add_argument("--run8", action="store_true",
                    help="add the #710 run-8 memory-risk / stale_to_push report and checks")
     e.set_defaults(func=_cmd_evaluate)

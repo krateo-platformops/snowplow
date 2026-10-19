@@ -52,6 +52,15 @@ INSTALLER_VERSION="${INSTALLER_VERSION:?set INSTALLER_VERSION (read the live 057
 # verify483 step runs after the platform step.
 VERIFY483="${VERIFY483:-0}"
 SNOWPLOW_TAG="${SNOWPLOW_TAG:?set SNOWPLOW_TAG (the image under test)}"
+# The registry digest of SNOWPLOW_TAG. After the reboot and BEFORE any load,
+# every live snowplow pod's status.containerStatuses[].imageID must carry
+# exactly this digest, or the run is VOID (aborted, torn down). Read it from
+# the registry for the tag under test; never copy it from notes.
+EXPECTED_IMAGE_DIGEST="${EXPECTED_IMAGE_DIGEST:?set EXPECTED_IMAGE_DIGEST=sha256:<64 hex> (the registry digest of SNOWPLOW_TAG)}"
+if [[ ! "$EXPECTED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "refusing: EXPECTED_IMAGE_DIGEST must be sha256:<64 lowercase hex>, got '${EXPECTED_IMAGE_DIGEST}'" >&2
+  exit 2
+fi
 SCALE="${SCALE:-50000}"
 USERS="${USERS:-1000}"
 NAMESPACES="${NAMESPACES:-50}"
@@ -72,11 +81,12 @@ PREFLIGHT_POLL_S="${PREFLIGHT_POLL_S:-3}"
 SNOWPLOW_POD_SELECTOR="${SNOWPLOW_POD_SELECTOR:-app.kubernetes.io/name=snowplow}"
 TOP_POLL_S="${TOP_POLL_S:-15}"
 # Extra /debug/vars key prefixes mem606 records verbatim every sample.
-# Default = the #710 PR-0 fill counters (fill_total/fill_bytes_total by reason,
-# fill_inflight(_bytes), fill_duplicate_total, fill_by_gvr), the resolved cache
-# and the informer dispatch shape — the attribution heap profiles cannot carry.
-# Space-separated; set it to "" to record none.
-MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-snowplow_apistage_content_fill snowplow_nested_resolve_ snowplow_apistage_stale_ snowplow_refresher_dirty_to_fresh snowplow_resolved_cache snowplow_informer_dispatch_shape snowplow_build_info}"
+# Default = load606.RUN8_VARS_PREFIXES (single source): the #710 PR-0 fill and
+# admission counters, the nested gate, the stale serve/push/debt family, the
+# #740 retry engine, the resolved cache, customer in-flight, dispatch shape and
+# build_info. Space-separated. With RUN8_REPORT=1 a value that misses any
+# run-8 key is refused below, before any cloud call.
+MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-$(python3 -m bench.load606 prefixes)}"
 # Run 8 (#710 issuecomment-6187374111): a COLD COMPOSITE-PAGE BURST — the last
 # COMPOSITE_BURST_USERS users stay idle, then all arrive together at
 # COMPOSITE_BURST_AT_S, each deep-linking to a composite page (nested widget
@@ -84,6 +94,11 @@ MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-snowplow_apistage_content_fill snowplow_n
 COMPOSITE_BURST_USERS="${COMPOSITE_BURST_USERS:-200}"
 COMPOSITE_BURST_AT_S="${COMPOSITE_BURST_AT_S:-$(( DRIVE_S / 2 ))}"
 RUN8_REPORT="${RUN8_REPORT:-1}"
+if [[ "$RUN8_REPORT" == "1" ]]; then
+  # shellcheck disable=SC2086
+  python3 -m bench.load606 check-prefixes $MEM_VARS_PREFIXES \
+    || { echo "refusing: MEM_VARS_PREFIXES does not capture every run-8 key" >&2; exit 2; }
+fi
 COMPOSITE_ROUTES=()
 PLATFORM_POLL_S="${PLATFORM_POLL_S:-60}"
 OUT="${OUT:-/tmp/snowplow-runs/606/${RUN_NAME}}"
@@ -321,6 +336,26 @@ s_reboot() {
   run "${K[@]}" -n krateo-system rollout restart deploy/snowplow
   run "${K[@]}" -n krateo-system rollout status deploy/snowplow --timeout=45m
 }
+s_digest() {
+  # VOID gate (run 8): after the reboot, before any load. Reads what the
+  # kubelet PULLED (status.containerStatuses[].imageID) for every live
+  # snowplow pod; the record (expected, every pod's imageID and digest) is
+  # kept in $OUT/image-digest.jsonl and fed to the verdict.
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: snowplow pods imageID == $EXPECTED_IMAGE_DIGEST (else VOID)"
+    return 0
+  fi
+  local rc=0
+  "${K[@]}" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
+    | python3 -m bench.load606 digest-gate --expected "$EXPECTED_IMAGE_DIGEST" \
+    > "$OUT/image-digest.jsonl" || rc=$?
+  log "image digest gate: $(cut -c1-600 "$OUT/image-digest.jsonl" 2>/dev/null)"
+  if (( rc != 0 )); then
+    log "VOID: a snowplow pod does not run ${EXPECTED_IMAGE_DIGEST} (gate exit ${rc}); no load is applied"
+    return 1
+  fi
+  log "image digest MATCH: every live snowplow pod runs ${EXPECTED_IMAGE_DIGEST}"
+}
 s_measure() {
   # Load: in-cluster on the tainted loadgen pool, one Indexed-Job pod per
   # shard. Each pod streams its JSONL to stdout (per nav, flushed) and the
@@ -406,14 +441,16 @@ s_collect() {
 s_evaluate() {
   shopt -s nullglob
   local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
-               "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl)
+               "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
+               "$OUT"/image-digest.jsonl)
   if [[ "$DRY" == "1" ]]; then log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>}"; return 0; fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
   local vrc=0
   local r8=()
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
-  python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} > "$OUT/verdict.json" || vrc=$?
+  python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
+      --expect-digest "$EXPECTED_IMAGE_DIGEST" > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
 }
 
@@ -427,6 +464,7 @@ step env       s_env
 step preflight s_preflight
 step data      s_data
 step reboot    s_reboot
+step digest    s_digest
 step measure   s_measure
 step collect   s_collect
 step evaluate  s_evaluate

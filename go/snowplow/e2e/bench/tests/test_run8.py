@@ -115,6 +115,31 @@ def _navs():
                 "wall_ms": 200, "errors": 0, "calls": 9} for _ in range(3)])
 
 
+def q234(**over):
+    """Every Q2–Q4 key, shaped as the 1.12.50 /debug/vars serves it, healthy."""
+    base = {
+        K["stale_serve"]: {"known_stale": 40}, K["stale_push"]: 38,
+        K["stale_push_unarmed"]: 0, K["stale_withdrawn"]: {"unarmable": 2},
+        K["stale_serve_age"]: H({500: 30, 2500: 10}, 2100),
+        K["resolved_cache"]: {"hit_total": 10_000, "stale_served_total": 40,
+                              "stale_served_age_ms_max": 2100,
+                              "known_stale_served_total": 3,
+                              "known_stale_served_declined_total": 3},
+        K["admission_queued"]: {"background": 4, "customer": 0, "debt": 0},
+        K["admission_timeout"]: {"background": 1, "customer": 0, "debt": 0},
+        K["admission_weight"]: 10, K["admission_weight_peak"]: 99,
+        K["customer_inflight"]: 7,
+        K["debt_open"]: 1, K["debt_parked"]: 3, K["debt_oldest_age"]: 900,
+        K["debt_retries"]: 5,
+        K["retry_total"]: {"transient": {"background": 0, "demand": 1, "debt": 0},
+                           "genuine": {"background": 0, "demand": 2, "debt": 1}},
+        K["retry_chains"]: 1, K["retry_viewers"]: 1, K["retry_backoff"]: 2000,
+        K["retry_abandoned"]: {"no_viewer": 2, "evicted": 0}, K["retry_resumed"]: 1,
+    }
+    base.update(over)
+    return base
+
+
 PODS = [{"kind": "snowplow_pod", "phase": "before", "pod": "s", "restarts": 0,
          "limits": {"memory": "8Gi"}},
         {"kind": "snowplow_pod", "phase": "after", "pod": "s", "restarts": 0,
@@ -142,9 +167,9 @@ def test_full_report_memory_risk_and_gates():
                                    K["nested_over_ceiling"]: 0, K["nested_over_ceiling_peak"]: 0,
                                    K["dirty_to_fresh_p95"]: 2600, K["dirty_to_fresh_max"]: 7000,
                                    K["stale_overdue"]: 6}),
-           _mem(1010, 6100, 7100, **{K["nested_over_ceiling_peak"]: 2_000_000_000,
-                                    K["stale_to_push"]: stp, K["admission_wait"]: wait,
-                                    K["stale_overdue"]: 9})]
+           _mem(1010, 6100, 7100, **q234(**{K["nested_over_ceiling_peak"]: 2_000_000_000,
+                                            K["stale_to_push"]: stp, K["admission_wait"]: wait,
+                                            K["stale_overdue"]: 9}))]
     tops = [{"kind": "top", "t": 125, "rss_bytes": int(5.5 * GIB)},
             {"kind": "top", "t": 1020, "rss_bytes": int(7.2 * GIB)}]
     rep, checks = load606.run8_report(_navs(), mem, tops, PODS)
@@ -162,7 +187,11 @@ def test_full_report_memory_risk_and_gates():
     assert rep["stale_overdue_delta"] == 5
     assert rep["admission_wait_ms"]["background"]["p95_bucket"] == "<= 1000"
     assert rep["refresher_dirty_to_fresh"]["dirty_to_fresh_max_max_over_samples"] == 7000
-    assert not [c for c in checks if c["result"] == "FAIL"]
+    # Ruling (#740): overdue is GATED at 0 — this fixture's 9 overdue debts
+    # are the one FAIL; every other check passes.
+    failed = {c["check"]: c for c in checks if c["result"] == "FAIL"}
+    assert set(failed) == {"run8.stale_overdue_total"}
+    assert failed["run8.stale_overdue_total"]["value"] == 9 and rep["stale_overdue_last"] == 9
 
 
 @pytest.mark.parametrize("hist,p95,mx", [
@@ -182,10 +211,10 @@ def test_stale_to_push_bucket_rules(hist, p95, mx):
 
 
 def test_inconclusive_stale_to_push_makes_the_verdict_inconclusive():
-    full = {K["fill_over_ceiling"]: 0, K["nested_over_ceiling"]: 0, K["stale_overdue"]: 0,
-            K["admission_wait"]: {"background": H({10: 1}, 5)},
-            K["dirty_to_fresh_p95"]: 1, K["dirty_to_fresh_max"]: 2,
-            K["stale_to_push"]: H({2500: 90, 5000: 10}, 4800)}
+    full = q234(**{K["fill_over_ceiling"]: 0, K["nested_over_ceiling"]: 0, K["stale_overdue"]: 0,
+                   K["admission_wait"]: {"background": H({10: 1}, 5)},
+                   K["dirty_to_fresh_p95"]: 1, K["dirty_to_fresh_max"]: 2,
+                   K["stale_to_push"]: H({2500: 90, 5000: 10}, 4800)})
     navs = [{"kind": "nav", "nav": "first_load", "user": "u", "page": "p", "start": 100.0,
              "visit": 1, "wall_ms": 100, "calls": 3, "errors": 0, "sched_lag_ms": 1}]
     navs += [{"kind": "nav", "nav": "composite_first_load", "user": "v", "page": "q",

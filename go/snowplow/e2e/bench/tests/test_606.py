@@ -556,7 +556,8 @@ def test_loadgen_job_renders_pinned_to_loadgen_pool_with_source():
 def _run606(tmp_path, **env):
     base = dict(os.environ, HOME=str(tmp_path), OUT=str(tmp_path / "out"),
                 RUN_NAME="snowplow-bench-1014-1200", INSTALLER_VERSION="0.0.0",
-                SNOWPLOW_TAG="0.0.0", THINK_S="0", PYTHONPATH=str(BENCH_DIR))
+                SNOWPLOW_TAG="0.0.0", THINK_S="0", PYTHONPATH=str(BENCH_DIR),
+                EXPECTED_IMAGE_DIGEST="sha256:" + "ab" * 32)
     base.pop("BENCH_606_GO", None)
     base.update(env)
     return subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=base,

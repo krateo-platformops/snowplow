@@ -1,0 +1,271 @@
+{
+ "keys": {
+  "snowplow_apistage_content_fill_admission_inflight_weight": "number",
+  "snowplow_apistage_content_fill_admission_inflight_weight_peak": "number",
+  "snowplow_apistage_content_fill_admission_over_ceiling_bytes": "number",
+  "snowplow_apistage_content_fill_admission_over_ceiling_bytes_peak": "number",
+  "snowplow_apistage_content_fill_admission_queued": {
+   "background": "number",
+   "customer": "number",
+   "debt": "number"
+  },
+  "snowplow_apistage_content_fill_admission_timeout_total": {
+   "background": "number",
+   "customer": "number",
+   "debt": "number"
+  },
+  "snowplow_apistage_content_fill_admission_wait_ms": {
+   "background": {
+    "histogram": [
+     "le_10",
+     "le_50",
+     "le_100",
+     "le_250",
+     "le_500",
+     "le_1000",
+     "le_2500",
+     "le_5000",
+     "le_10000",
+     "le_inf"
+    ]
+   },
+   "customer": {
+    "histogram": [
+     "le_10",
+     "le_50",
+     "le_100",
+     "le_250",
+     "le_500",
+     "le_1000",
+     "le_2500",
+     "le_5000",
+     "le_10000",
+     "le_inf"
+    ]
+   },
+   "debt": {
+    "histogram": [
+     "le_10",
+     "le_50",
+     "le_100",
+     "le_250",
+     "le_500",
+     "le_1000",
+     "le_2500",
+     "le_5000",
+     "le_10000",
+     "le_inf"
+    ]
+   }
+  },
+  "snowplow_apistage_content_fill_by_gvr": {},
+  "snowplow_apistage_content_fill_by_ra": {},
+  "snowplow_apistage_content_fill_bytes_total": {
+   "absent": "number",
+   "known_stale": "number",
+   "refresh_forced": "number"
+  },
+  "snowplow_apistage_content_fill_duplicate_total": {
+   "absent": "number",
+   "known_stale": "number",
+   "refresh_forced": "number"
+  },
+  "snowplow_apistage_content_fill_duration_ms": {
+   "histogram": [
+    "le_10",
+    "le_50",
+    "le_100",
+    "le_250",
+    "le_500",
+    "le_1000",
+    "le_2500",
+    "le_5000",
+    "le_10000",
+    "le_inf"
+   ]
+  },
+  "snowplow_apistage_content_fill_inflight": "number",
+  "snowplow_apistage_content_fill_inflight_bytes": "number",
+  "snowplow_apistage_content_fill_inflight_bytes_peak": "number",
+  "snowplow_apistage_content_fill_inflight_peak": "number",
+  "snowplow_apistage_content_fill_join_refused_total": {
+   "absent": "number",
+   "known_stale": "number",
+   "refresh_forced": "number"
+  },
+  "snowplow_apistage_content_fill_join_waiting": "number",
+  "snowplow_apistage_content_fill_joined_total": {
+   "absent": "number",
+   "known_stale": "number",
+   "refresh_forced": "number"
+  },
+  "snowplow_apistage_content_fill_not_servable_total": "number",
+  "snowplow_apistage_content_fill_total": {
+   "absent": "number",
+   "known_stale": "number",
+   "refresh_forced": "number"
+  },
+  "snowplow_apistage_stale_debt_oldest_age_ms": "number",
+  "snowplow_apistage_stale_debt_open": "number",
+  "snowplow_apistage_stale_debt_parked": "number",
+  "snowplow_apistage_stale_debt_retries_total": "number",
+  "snowplow_apistage_stale_dependent_unresolved_total": "number",
+  "snowplow_apistage_stale_overdue_total": "number",
+  "snowplow_apistage_stale_owed_arm_emits_total": "number",
+  "snowplow_apistage_stale_owed_dropped_total": "number",
+  "snowplow_apistage_stale_owed_open": "number",
+  "snowplow_apistage_stale_push_total": "number",
+  "snowplow_apistage_stale_push_unarmed_total": "number",
+  "snowplow_apistage_stale_replace_retries_total": "number",
+  "snowplow_apistage_stale_serve_age_ms": {
+   "histogram": [
+    "le_100",
+    "le_250",
+    "le_500",
+    "le_1000",
+    "le_2000",
+    "le_3000",
+    "le_5000",
+    "le_10000",
+    "le_30000",
+    "le_inf"
+   ]
+  },
+  "snowplow_apistage_stale_serve_total": {
+   "known_stale": "number"
+  },
+  "snowplow_apistage_stale_serve_withdrawn_total": {
+   "unarmable": "number"
+  },
+  "snowplow_apistage_stale_to_push_ms": {
+   "histogram": [
+    "le_100",
+    "le_250",
+    "le_500",
+    "le_1000",
+    "le_2000",
+    "le_3000",
+    "le_5000",
+    "le_10000",
+    "le_30000",
+    "le_inf"
+   ]
+  },
+  "snowplow_build_info": {
+   "value": "number",
+   "version": "str"
+  },
+  "snowplow_customer_resolve_inflight": "number",
+  "snowplow_informer_dispatch_shape": {
+   "fallthrough": "number",
+   "get_served": "number",
+   "list_served": "number",
+   "list_served_raw": "number",
+   "rbac_dropped": "number",
+   "sync_wait_served": "number"
+  },
+  "snowplow_nested_resolve_admission_over_ceiling_bytes": "number",
+  "snowplow_nested_resolve_admission_over_ceiling_bytes_peak": "number",
+  "snowplow_refresher_dirty_to_fresh_ms_max": "number",
+  "snowplow_refresher_dirty_to_fresh_ms_p95": "number",
+  "snowplow_refresher_dirty_to_fresh_samples_total": "number",
+  "snowplow_resolved_cache": {},
+  "snowplow_resolved_cache_denial_only_put_total": {
+   "call_ra": "number",
+   "call_widget": "number",
+   "ra_full_list": "number",
+   "refresher": "number",
+   "seed": "number"
+  },
+  "snowplow_resolved_cache_hits_seed_attributable": "number",
+  "snowplow_stale_retry_abandoned_total": {
+   "evicted": "number",
+   "no_viewer": "number"
+  },
+  "snowplow_stale_retry_backoff_ms": "number",
+  "snowplow_stale_retry_chains_active": "number",
+  "snowplow_stale_retry_resumed_total": "number",
+  "snowplow_stale_retry_total": {
+   "genuine": {
+    "background": "number",
+    "debt": "number",
+    "demand": "number"
+   },
+   "transient": {
+    "background": "number",
+    "debt": "number",
+    "demand": "number"
+   }
+  },
+  "snowplow_stale_retry_viewers": "number"
+ },
+ "notes": {
+  "snowplow_build_info": "registered in main() (main.go:1362), not at init: added from build_info_expvar.go:62-68",
+  "snowplow_resolved_cache": "empty map until the store is built; members from resolvedCacheStatsByStatOf(zero value)"
+ },
+ "resolved_cache_members": [
+  "apistage_evict_total",
+  "apistage_store_total",
+  "bytes",
+  "entries",
+  "evict_delete_total",
+  "evict_lru_total",
+  "evict_max_age_total",
+  "evict_max_age_warm_customer_total",
+  "evict_max_age_warm_internal_total",
+  "evict_no_representative_total",
+  "evict_ttl_total",
+  "evict_ttl_warm_customer_total",
+  "hit_total",
+  "known_stale_read_through_total",
+  "known_stale_resident",
+  "known_stale_revalidation_failed_total",
+  "known_stale_revalidation_fresh_total",
+  "known_stale_revalidation_rerun_background_total",
+  "known_stale_revalidation_rerun_demand_total",
+  "known_stale_revalidation_skipped_total",
+  "known_stale_served_declined_total",
+  "known_stale_served_dropped_total",
+  "known_stale_served_not_servable_total",
+  "known_stale_served_suppressed_total",
+  "known_stale_served_total",
+  "lazy_items_eager_total",
+  "lazy_items_parsed_total",
+  "lazy_items_served_total",
+  "max_bytes",
+  "max_entries",
+  "max_resident_bytes",
+  "miss_total",
+  "oldest_warm_born_age_seconds",
+  "proactive_refresh_total",
+  "put_refused_generation_moved_total",
+  "ra_full_list_evict_total",
+  "ra_full_list_store_total",
+  "remint_deadline_enqueued_total",
+  "remint_refused_cold_total",
+  "remint_total",
+  "resident_bytes",
+  "resident_demote_total",
+  "resident_entries",
+  "resident_pin_total",
+  "serve_missed_rotation_atrisk_implicit_group",
+  "serve_missed_rotation_atrisk_roleref_unresolved",
+  "stale_served_age_ms_max",
+  "stale_served_total",
+  "store_total",
+  "suppressed_resident",
+  "warm_in_lead_window",
+  "warm_keyed_extras_ra_full_list",
+  "warm_keyed_extras_restactions",
+  "warm_keyed_extras_widgets",
+  "warm_keyed_page_ra_full_list",
+  "warm_keyed_page_restactions",
+  "warm_keyed_page_widgets",
+  "warm_lastread",
+  "warm_past_max_age",
+  "warm_seeded",
+  "widget_content_evict_total",
+  "widget_content_store_total"
+ ],
+ "source": "expvar.Handler() output of the snowplow main package at tag 1.12.50 (commit e47cd719cf6db0fab360c6e0bac95713db32cd76, image digest sha256:ebf3fa1a795e53406cf3cf40ccad1a62aacf2ecfff957acebad135bea33095c4), CACHE_ENABLED=true, init-time registrations; names and shapes only, no values."
+}

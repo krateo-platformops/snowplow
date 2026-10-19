@@ -48,8 +48,12 @@ def test_run606_records_the_710_counters_by_default():
     """The default capture covers every run-8 key family (load606.RUN8_VARS_PREFIXES)."""
     src = (BENCH_DIR / "run606.sh").read_text()
     line = next(l for l in src.splitlines() if l.startswith('MEM_VARS_PREFIXES="${MEM_VARS_PREFIXES-'))
-    defaults = line.split("-", 1)[1].rstrip('}"').split()
-    assert set(load606.RUN8_VARS_PREFIXES) <= set(defaults)
+    # the default is load606's own tuple, printed by `prefixes` (single source)
+    assert "$(python3 -m bench.load606 prefixes)" in line
+    p = subprocess.run(["python3", "-m", "bench.load606", "prefixes"], cwd=BENCH_DIR,
+                       capture_output=True, text=True)
+    assert p.stdout.split() == list(load606.RUN8_VARS_PREFIXES)
+    assert load606.prefixes_missing(p.stdout.split()) == []
 
 
 def test_mem_job_carries_the_default_prefixes(harness):

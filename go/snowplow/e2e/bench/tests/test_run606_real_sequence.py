@@ -44,6 +44,9 @@ PROJECT = "operations-dev-krateo-io"
 ZONE = "europe-west4-a"
 KCTX = f"gke_{PROJECT}_{ZONE}_{RUN_NAME}"
 AMBIENT_CTX = "kind-krateo-4388"
+# The digest the fake snowplow pod runs and the run expects (a test value).
+FAKE_DIGEST = "sha256:" + "ab" * 32
+OTHER_DIGEST = "sha256:" + "cd" * 32
 
 _COMMON = textwrap.dedent("""\
     import json, os, sys, time
@@ -129,8 +132,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         cnt = os.path.join(STATE, "snowplow_pod_reads")
         n = int(open(cnt).read()) if os.path.exists(cnt) else 0
         open(cnt, "w").write(str(n + 1))
-        restarted = os.environ.get("FAKE_RESTART_DURING_MEASURE") == "1" and n >= 1
+        # read 0 = the digest gate, 1 = the before record, 2+ = after
+        restarted = os.environ.get("FAKE_RESTART_DURING_MEASURE") == "1" and n >= 2
         cs = {"name": "snowplow", "ready": True, "restartCount": 1 if restarted else 0,
+              "image": "ghcr.io/krateo-platformops/snowplow:1.12.50",
+              "imageID": "ghcr.io/krateo-platformops/snowplow@" + os.environ["FAKE_IMAGE_DIGEST"],
               "lastState": ({"terminated": {"reason": "OOMKilled", "exitCode": 137,
                                             "finishedAt": "2026-10-14T15:04:53Z"}}
                             if restarted else {})}
@@ -416,6 +422,7 @@ def harness(tmp_path):
         "PYTHONPATH": str(BENCH_DIR),
         "RUN_NAME": RUN_NAME, "INSTALLER_VERSION": "0.3.422",
         "SNOWPLOW_TAG": "1.12.46", "OUT": str(tmp_path / "out"),
+        "EXPECTED_IMAGE_DIGEST": FAKE_DIGEST, "FAKE_IMAGE_DIGEST": FAKE_DIGEST,
         "SCALE": "4", "NAMESPACES": "2", "USERS": "2",
         "THINK_S": "0", "DRIVE_S": "1", "CHURN_RATES": "1",
         "FRESH_SAMPLES": "2", "FRESH_GAP_S": "0", "HOLD_PROBE_WAIT_S": "0",
@@ -502,7 +509,7 @@ def test_dry_run_log_redacts_password(tmp_path):
     env = dict(os.environ, HOME=str(tmp_path), OUT=str(tmp_path / "out"),
                RUN_NAME=RUN_NAME, INSTALLER_VERSION="0.3.422",
                SNOWPLOW_TAG="1.12.46", THINK_S="0", BENCH_606_DRY_RUN="1",
-               PYTHONPATH=str(BENCH_DIR))
+               EXPECTED_IMAGE_DIGEST=FAKE_DIGEST, PYTHONPATH=str(BENCH_DIR))
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
                        capture_output=True, text=True, timeout=120)
     assert p.returncode == 0, p.stderr
