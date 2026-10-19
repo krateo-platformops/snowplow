@@ -286,15 +286,17 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 		envPeak, float64(envPeak)/float64(max(env, 1)), envBound,
 		contentFillAdmissionInflightWeightPeak.Load()>>20, float64(lists)/(float64(ceiling0)/float64(max(oneFill, 1))),
 		fill710P95(adm.Wait["background"]), adm.Wait["background"].MaxMS)
+	// Every check reports (Errorf, not Fatalf), so a defect shows each one it
+	// breaks: admit-all must read RED on the heap AND on the envelopes (#780).
 	if u := unadmittedPeak.Load(); u > 0 {
-		t.Fatalf("F-MEM RED: %d dispatches ran for flights the gate had not admitted — a queued flight built its envelope outside the ceiling", u)
+		t.Errorf("F-MEM RED: %d dispatches ran for flights the gate had not admitted — a queued flight built its envelope outside the ceiling", u)
 	}
 	if envPeak > envBound {
-		t.Fatalf("F-MEM RED: %d envelope bytes were in flight at once (%.1f envelopes, bound %d B) — queued flights are holding parked envelopes outside the ceiling",
+		t.Errorf("F-MEM RED: %d envelope bytes were in flight at once (%.1f envelopes, bound %d B) — queued flights are holding parked envelopes outside the ceiling",
 			envPeak, float64(envPeak)/float64(max(env, 1)), envBound)
 	}
 	if gated > bound {
-		t.Fatalf("F-MEM RED: a gated run's live heap grew %d MiB (runs %v MiB), past the starting ceiling + one fill + %d × its allocations (%d MiB)",
+		t.Errorf("F-MEM RED: a gated run's live heap grew %d MiB (runs %v MiB), past the starting ceiling + one fill + %d × its allocations (%d MiB)",
 			gated>>20, runs, fmemAllocateBlackFills, bound>>20)
 	}
 	// Vacuity is loud: the defect class must clear the bound with margin, or
