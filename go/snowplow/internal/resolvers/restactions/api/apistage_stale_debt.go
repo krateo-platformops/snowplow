@@ -464,25 +464,46 @@ func retireStaleDebt(d *staleDebt, contentEvicted bool) {
 			continue
 		}
 		if evict {
-			evictStaleDependent(sink)
+			evictStaleDependent(sink, resumedAt)
 			continue
 		}
 		goReplaceStaleDependent(sink, resumedAt)
 	}
 }
 
+// staleParkedEvictHookForTest runs just before a parked retire evicts a
+// dependent cell (D2-20g: a tab arms in that window). nil in production.
+var staleParkedEvictHookForTest func(l1Key string)
+
 // evictStaleDependent compare-and-evicts sink's cell if it is still the
-// stale-derived body (#755).
-func evictStaleDependent(sink *cache.StaleServeSink) {
+// stale-derived body (#755), then publishes, exactly as D2-3b's evict does: a
+// tab that armed while the cell was still stale-derived found no owed push to
+// emit, so this publish is its refresh (an unarmed key keeps its owed mark).
+func evictStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 	store := cache.ResolvedCache()
 	if store == nil {
 		return
 	}
 	l1Key := sink.L1Key()
 	//serve-probe: D2 parked retire — is the dependent cell still stale-derived, serves no body
-	if e, ok := store.GetNoTouch(l1Key); ok && e != nil && e.StaleDerived {
-		store.EvictStaleDerived(l1Key, e)
+	e, ok := store.GetNoTouch(l1Key)
+	if ok && e != nil && !e.StaleDerived {
+		return // replaced by a writer, which published
 	}
+	if ok && e != nil {
+		if staleParkedEvictHookForTest != nil {
+			staleParkedEvictHookForTest(l1Key)
+		}
+		if !store.EvictStaleDerived(l1Key, e) {
+			//serve-probe: D2 parked retire — did a writer replace the cell in between, serves no body
+			if _, still := store.GetNoTouch(l1Key); still {
+				return // a writer replaced it in between, and published
+			}
+		}
+	}
+	// Evicted now, or already gone (an LRU eviction publishes nothing, and a
+	// tab may have armed while the cell was still stale-derived).
+	finishStaleReplace(sink, from)
 }
 
 // CommitStaleServe is the dispatcher's write-point outcome for a stale-derived

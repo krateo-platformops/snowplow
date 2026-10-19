@@ -47,6 +47,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1047,6 +1049,13 @@ func TestStale710_D2_20d_AParkedDebtWhoseContentIsEvictedIsRetired(t *testing.T)
 // nobody, the debt is parked. dispatches counts the content fills tried.
 func d2ParkedN(t *testing.T, f *d2Fixture, deps ...string) (heal func(), dispatches *atomic.Int64) {
 	t.Helper()
+	return d2ParkedPending(t, f, deps, nil)
+}
+
+// d2ParkedPending is d2ParkedN with pending dependents too: served stale and
+// registered on the debt, held before their write point (no Commit).
+func d2ParkedPending(t *testing.T, f *d2Fixture, deps, pending []string) (heal func(), dispatches *atomic.Int64) {
+	t.Helper()
 	clock := cache.NewStaleRetryManualClockForTest()
 	cache.SetStaleRetryClockForTest(clock)
 	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
@@ -1065,6 +1074,9 @@ func d2ParkedN(t *testing.T, f *d2Fixture, deps ...string) (heal func(), dispatc
 	for _, dep := range deps {
 		f.customer(t, dep)
 		f.storeAndCommit(dep)
+	}
+	for _, dep := range pending {
+		f.customer(t, dep)
 	}
 	if !fill710WaitFor(10*time.Second, func() bool { return len(clock.Pending()) == 1 }) {
 		t.Fatalf("PRECONDITION: the first retry was never scheduled (%+v)", StaleServeStatsSnapshot())
@@ -1163,6 +1175,100 @@ func TestStale710_D2_20f_AnActiveDebtsEvictedContentStillReResolvesItsDependent(
 	}
 	if e, ok := f.store.GetNoTouch("dep-20f"); !ok || e.StaleDerived {
 		t.Fatalf("D2-20f RED: the viewed dependent was not replaced (resident=%v)", ok)
+	}
+}
+
+// D2-20g — #755 (architect gate): a tab that arms a dependent WHILE a parked
+// retire is evicting it still gets its refresh. Its arm-time owed check ran
+// while the cell was still stale-derived (no emit), and its arm then waits on
+// the retry engine the retire holds; the evict's own publish is its push.
+// Ordered, not timed: the hook (under the engine lock, before the evict) waits
+// until the arming goroutine is parked in noteStaleRetryArm — past its owed
+// check.
+// Mutation → RED: the parked retire evicts without publishing.
+func TestStale710_D2_20g_ATabArmingDuringAParkedRetiresEvictStillGetsItsPush(t *testing.T) {
+	f := newD2Fixture(t)
+	heal, _ := d2ParkedN(t, f, "dep-20g")
+	defer heal()
+	got := make(chan string, 1)
+	unsubs := make(chan func(), 1)
+	t.Cleanup(func() {
+		select {
+		case u := <-unsubs:
+			u()
+		default:
+		}
+	})
+	staleParkedEvictHookForTest = func(k string) {
+		if k != "dep-20g" {
+			return
+		}
+		go func() {
+			ch, unsub := cache.SubscribeRefresh(map[string]struct{}{k: {}})
+			unsubs <- unsub
+			select {
+			case key := <-ch:
+				got <- key
+			case <-time.After(10 * time.Second):
+			}
+		}()
+		if !fill710WaitFor(5*time.Second, func() bool { return d2GoroutineIn("cache.noteStaleRetryArm(") }) {
+			t.Errorf("PRECONDITION: the arming tab never reached the retry engine past its owed check")
+		}
+	}
+	t.Cleanup(func() { staleParkedEvictHookForTest = nil })
+	f.store.DeleteForTest(f.contentKey) // the content cell is evicted: the parked retire runs
+	select {
+	case key := <-got:
+		if key != "dep-20g" {
+			t.Fatalf("D2-20g: pushed %q, want dep-20g", key)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("D2-20g RED: a tab that armed during the parked retire's evict was never pushed — stranded on the stale body (%+v)", StaleServeStatsSnapshot())
+	}
+	if _, ok := f.store.GetNoTouch("dep-20g"); ok {
+		t.Fatalf("D2-20g: the dependent was not evicted")
+	}
+}
+
+// d2GoroutineIn reports whether any goroutine's stack has a frame containing
+// frame (an ordering probe for a goroutine blocked inside a call).
+func d2GoroutineIn(frame string) bool {
+	buf := make([]byte, 1<<20)
+	return strings.Contains(string(buf[:runtime.Stack(buf, true)]), frame)
+}
+
+// D2-20h — #755 (architect gate): a PENDING dependent of a parked debt (a
+// customer held at its write point when the content was evicted) keeps the
+// replace at its Commit: the committed one is compare-and-evicted, the pending
+// one, once it commits under its armed tab, is re-resolved, replaced and pushed.
+// Mutation → RED: the parked retire evicts before (without) DebtCleared.
+func TestStale710_D2_20h_APendingDependentOfAParkedDebtIsReplacedAtItsCommit(t *testing.T) {
+	f := newD2Fixture(t)
+	heal, _ := d2ParkedPending(t, f, []string{"dep-20h-a"}, []string{"dep-20h-b"})
+	heal()
+	f.store.DeleteForTest(f.contentKey) // the content cell is evicted
+	if !fill710WaitFor(10*time.Second, func() bool {
+		st := StaleServeStatsSnapshot()
+		return st.DebtOpen == 0 && st.DebtParked == 0
+	}) {
+		t.Fatalf("D2-20h: the parked debt outlived its evicted content cell (%+v)", StaleServeStatsSnapshot())
+	}
+	cache.WaitStaleRetryForTest()
+	staleDebtWG.Wait()
+	if _, ok := f.store.GetNoTouch("dep-20h-a"); ok {
+		t.Fatalf("D2-20h: the committed dependent was not evicted")
+	}
+	r0 := f.rereso.Load()
+	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-20h-b": {}})
+	defer unsub()
+	f.storeAndCommit("dep-20h-b") // the held customer reaches its write point
+	d2Push(t, ch, "dep-20h-b", 10*time.Second)
+	if f.rereso.Load()-r0 != 1 {
+		t.Fatalf("D2-20h RED: the pending dependent was not re-resolved at its Commit (+%d)", f.rereso.Load()-r0)
+	}
+	if e, ok := f.store.GetNoTouch("dep-20h-b"); !ok || e.StaleDerived {
+		t.Fatalf("D2-20h RED: the pending dependent was not replaced (resident=%v)", ok)
 	}
 }
 
