@@ -1246,7 +1246,27 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerListNarrowInstruments(m); err != nil {
 		return err
 	}
+	if err := registerUndeclaredExtrasExemptInstrument(m); err != nil {
+		return err
+	}
 	return registerSecurityInstruments(m)
+}
+
+// registerUndeclaredExtrasExemptInstrument hand-wires #777 b′'s exemption
+// counter onto OTLP (no expvar->OTLP bridge): it reads the typed accessor its
+// expvar closure reads. No attributes. Registered only when the cache is on
+// (CFG-1: the expvar key is published from a Disabled()-gated init).
+func registerUndeclaredExtrasExemptInstrument(m metric.Meter) error {
+	exempt, err := m.Int64ObservableCounter("snowplow_widget_undeclared_extras_exempt_total",
+		metric.WithDescription("Widget requests that carried undeclared, non-identity extras and were cached anyway because the widget has no extras-reading spec surface (no apiRef, widgetDataTemplate or resourcesRefsTemplate; #777 b′). Without the exemption each would have been an F6 undeclared-extras decline."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		o.ObserveInt64(exempt, int64(dispatchers.WidgetUndeclaredExtrasExemptTotal()))
+		return nil
+	}, exempt)
+	return err
 }
 
 // registerListNarrowInstruments hand-wires the #603 PR-2 / #765 option B
