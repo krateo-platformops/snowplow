@@ -15,6 +15,8 @@ package api
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -85,6 +87,50 @@ func TestNarrow765_R4_SpecFilterIsPartOfTheChain(t *testing.T) {
 	got := cache.ListInterestStateForTest(key, dk765())
 	if !strings.HasPrefix(got, "narrowed:") {
 		t.Fatalf("R4 RED: spec.filter reads only metadata.name of a whole-items stage; the chain must narrow, got %q", got)
+	}
+}
+
+// R6 — STRUCTURAL: every stage-error sink bump in this package taints the
+// resolve's narrowing. A stage error can put partial or fail-closed data into
+// the output while its calls still read as informer-served (#651's
+// served-but-failed stage), so an error site that bumps the sink without
+// tainting would let that edge narrow. New error sites keep landing (#651,
+// #760); a missing edge must read RED, not green (#533).
+func TestNarrow765_R6_EveryStageErrorSiteTaintsTheNarrowing(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sites := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(string(b), "\n")
+		for i, l := range lines {
+			if !strings.Contains(l, "stageErrSink.Bump(") {
+				continue
+			}
+			sites++
+			prev := ""
+			for j := i - 1; j >= 0; j-- {
+				if p := strings.TrimSpace(lines[j]); p != "" && !strings.HasPrefix(p, "//") {
+					prev = p
+					break
+				}
+			}
+			if !strings.HasPrefix(prev, "r.taintNarrow()") {
+				t.Errorf("R6 RED: %s:%d bumps the stage-error sink without r.taintNarrow() right before it: "+
+					"an errored resolve could narrow its list edges", f, i+1)
+			}
+		}
+	}
+	if sites < 4 {
+		t.Fatalf("R6: found %d sink bump sites, want >= 4 (the guard is scanning the wrong files)", sites)
 	}
 }
 

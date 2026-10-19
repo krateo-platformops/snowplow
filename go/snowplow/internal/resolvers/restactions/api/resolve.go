@@ -444,6 +444,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 			// (No stage outcome: outcomes are recorded only for a
 			// caller-supplied resolve, whose UAF stage dials the caller's
 			// endpoint above and never reaches this branch.)
+			r.taintNarrow() // #603 PR-2 — a failed stage narrows nothing
 			r.stageErrSink.Bump(id, uafSAEndpointUnavailableMsg)
 			return endpoints.Endpoint{}, false, false, stageContinue
 		}
@@ -806,6 +807,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// r.outcomes is nil for a nested stored resolve, so it never marks a
 		// caller's stage by name.
 		stageFailed: func(msg string) {
+			r.taintNarrow() // #603 PR-2 — a served-but-failed stage narrows nothing
 			r.stageErrSink.Bump(id, msg)
 			r.outcomes.fail(id, StageReasonError)
 		},
