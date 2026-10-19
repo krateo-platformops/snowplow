@@ -111,6 +111,24 @@ RUN8_REPORT="${RUN8_REPORT:-1}"
 # reader thread each in the driver pod. VIEWERS=0 turns them off (then the
 # run-8 report marks those checks NOT EXERCISED).
 VIEWERS="${VIEWERS:-1}"
+# Run 9 (#765 spec): fresh606 churn MODES as separate labelled phases at every
+# CHURN_RATES step: "annotation" (run 8's churn) and "status" (a condition in
+# .status.conditions written through the status subresource). 10/s gates in
+# each mode. FRESH_MODES=annotation reproduces run 8's probe exactly.
+FRESH_MODES="${FRESH_MODES:-annotation status}"
+for m in $FRESH_MODES; do
+  case "$m" in annotation|status) ;; *) echo "refusing: FRESH_MODES has unknown mode '$m'" >&2; exit 2 ;; esac
+done
+# The measure wait is DERIVED from the work it waits for. Run 8 waited a fixed
+# DRIVE_S+3600 = 5400 s while fresh606 needed up to 3 rates x 60 samples x
+# (30 s budget + gap) ~ 6300 s once samples stopped converging: the probe was
+# still at list_dep@50 30/60 when the wait expired. Worst case per sample is
+# the 30 s convergence budget plus the gap; plus the start delay and a margin.
+FRESH_BUDGET_S=30
+n_modes=$(echo $FRESH_MODES | wc -w | tr -d ' ')
+n_rates=$(echo $CHURN_RATES | wc -w | tr -d ' ')
+FRESH_EST_S=$(( ${THINK_S%.*} + n_modes * n_rates * FRESH_SAMPLES * (FRESH_BUDGET_S + ${FRESH_GAP_S%.*}) ))
+MEASURE_WAIT_S="${MEASURE_WAIT_S:-$(( (FRESH_EST_S > DRIVE_S ? FRESH_EST_S : DRIVE_S) + 1800 ))}"
 if [[ "$RUN8_REPORT" == "1" ]]; then
   # shellcheck disable=SC2086
   python3 -m bench.load606 check-prefixes $MEM_VARS_PREFIXES \
@@ -355,7 +373,8 @@ s_data() {
   [[ "$ENDPOINT_MODE" == "incluster" ]] && login=(--no-login)
   run python3 -m bench data606 --scale "$SCALE" --users "$USERS" \
       --namespaces "$NAMESPACES" --hold-probe-wait-s "$HOLD_PROBE_WAIT_S" \
-      --out "$OUT/data-proof.json" ${login[@]+"${login[@]}"}
+      --out "$OUT/data-proof.json" ${login[@]+"${login[@]}"} \
+      $([[ "$FRESH_MODES" == "annotation" ]] || printf -- '--fresh-modes %s' "$FRESH_MODES")
 }
 s_reboot() {
   # Cold start at 50K: restart once the data exists, time Ready (#594/#637).
@@ -418,7 +437,8 @@ s_measure() {
       --fresh-rates $CHURN_RATES --fresh-samples "$FRESH_SAMPLES" \
       --fresh-gap-s "$FRESH_GAP_S" --fresh-delay-s "$THINK_S" \
       --namespaces "$NAMESPACES" \
-      --mem-duration-s "$(( DRIVE_S + 3600 ))" \
+      --mem-duration-s "$MEASURE_WAIT_S" \
+      $([[ "$FRESH_MODES" == "annotation" ]] || printf -- '--fresh-modes %s' "$FRESH_MODES") \
       $(for x in $MEM_VARS_PREFIXES; do printf -- '--mem-vars-prefix %s ' "$x"; done) \
       --burst-users "$COMPOSITE_BURST_USERS" --burst-at-s "$COMPOSITE_BURST_AT_S" \
       ${COMPOSITE_ROUTES[@]+$(printf -- '--composite-route %q ' "${COMPOSITE_ROUTES[@]}")} \
@@ -433,9 +453,9 @@ s_measure() {
   MEASURE_STARTED=1
   run "${K[@]}" apply -f "$OUT/loadgen-job.yaml"
   if ! run "${K[@]}" -n bench-loadgen wait job/load606 job/fresh606 --for=condition=Complete \
-      --timeout="$(( DRIVE_S + 3600 ))s"; then
+      --timeout="${MEASURE_WAIT_S}s"; then
     # The teardown trap collects what exists before the cluster goes (#763).
-    log "measure FAILED: load606/fresh606 not Complete within $(( DRIVE_S + 3600 ))s"
+    log "measure FAILED: load606/fresh606 not Complete within ${MEASURE_WAIT_S}s"
     return 1
   fi
 }

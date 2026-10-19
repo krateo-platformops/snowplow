@@ -2249,14 +2249,22 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     # Ruling 2026-10-14: freshness GATES at the 10 events/s churn step; the
     # other rates (1, 50) are REPORTED as the curve. Labels are
     # "list_dep@<rate>"; a label without "@" (single-rate run) gates.
+    # Run 9: one label family per churn MODE ("list_dep" = annotation churn,
+    # "list_dep_status" = status-condition churn); the 10/s step gates in
+    # EVERY mode present. An annotation-only run gates exactly as before.
     gate_labels = set(th.get("fresh_gate_labels", ("list_dep@10",)))
     curve = {}
     labels = sorted({f.get("label", "?") for f in fresh})
     rated = [l for l in labels if "@" in l]
-    if rated and not (gate_labels & set(rated)):
-        checks.append({"check": f"fresh_p95_ms[{'/'.join(sorted(gate_labels))}]",
-                       "value": None, "bar": f"<= {th['fresh_p95_ms']}",
-                       "result": "FAIL", "why": "no samples at the gate churn rate"})
+    gate_rate = th.get("fresh_gate_rate", "10")
+    modes = sorted({l.split("@", 1)[0] for l in rated})
+    gate_labels |= {f"{m}@{gate_rate}" for m in modes if m != "list_dep"}
+    for m in modes:
+        want = {g for g in gate_labels if g.split("@", 1)[0] == m}
+        if not (want & set(rated)):
+            checks.append({"check": f"fresh_p95_ms[{'/'.join(sorted(want))}]",
+                           "value": None, "bar": f"<= {th['fresh_p95_ms']}",
+                           "result": "FAIL", "why": "no samples at the gate churn rate"})
     for label in labels:
         # A sample taken while snowplow was not Ready measures the outage, not
         # freshness: it is excluded from the gate and counted in the report.
@@ -2308,6 +2316,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         "server_dirty_to_fresh_p95_ms_max_window": max(p95s) if p95s else None,
         "server_dirty_to_fresh_p95_ms_median_window": pct(p95s, 50),
         "fresh_curve_report_only": curve,
+        # churn modes present ("list_dep" = annotation, "list_dep_status" =
+        # status condition); each gates at its own @10 label
+        "fresh_modes": modes,
         "fresh_push_report_only": push_report(fresh),
         "push_refetch_report_only": push_refetch_report(push_refetches or []),
         "nav_kinds": {k: sum(1 for n in navs if n.get("nav") == k)
@@ -2380,6 +2391,115 @@ spec:
     path: "{path}"
     filter: '{jq}'
 """
+
+
+# ─── Status-condition churn (run 9, #765 spec issuecomment-6266045747) ─────
+#
+# Run 8 churned annotations only. Production changes are mostly status
+# (controllers flipping conditions), and Diego's C decision depends on how
+# status churn performs. The status mode writes the marker into a condition of
+# .status.conditions THROUGH THE STATUS SUBRESOURCE (as a controller does) and
+# polls a sibling RESTAction that projects that condition, so the marker lives
+# in the field the mode churns, exactly like architect-623's in-process
+# harness. The compositions are not reconciled (data606 holds their
+# controller), so nothing else rewrites the condition.
+FRESH_STATUS_TYPE = "SnowplowBenchFresh"
+FRESH_STATUS_RA_NAME = "bench-fresh-listdep-status"
+FRESH_MODES = ("annotation", "status")
+FRESH_MODE_LABEL = {"annotation": "list_dep", "status": "list_dep_status"}
+
+
+def list_dep_status_fixture_yaml(ns: str, group: str, version: str, plural: str,
+                                 ra_ns: str = "bench-ns-01") -> str:
+    """The status-mode twin of list_dep_fixture_yaml: same LIST (same
+    list_dep edge), projecting the SnowplowBenchFresh condition's message."""
+    path = f"/apis/{group}/{version}/namespaces/{ns}/{plural}"
+    jq = ('[.comps.items[] | {name: .metadata.name, marker: '
+          f'([(.status.conditions // [])[] | select(.type == "{FRESH_STATUS_TYPE}") '
+          '| .message][0] // "")}]')
+    return f"""\
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: {FRESH_STATUS_RA_NAME}
+  namespace: {ra_ns}
+  labels:
+    app: scaletest
+spec:
+  api:
+  - name: comps
+    path: "{path}"
+    filter: '{jq}'
+"""
+
+
+def with_fresh_condition(obj: dict, value: str, now: str) -> dict:
+    """`obj` with its SnowplowBenchFresh condition set to `value`, FLIPPING
+    the condition status (True <-> False) like a controller transition; every
+    other condition is kept as is."""
+    obj = json.loads(json.dumps(obj))
+    status = obj.setdefault("status", {}) or {}
+    obj["status"] = status
+    conds = [c for c in (status.get("conditions") or []) if isinstance(c, dict)]
+    prev = next((c for c in conds if c.get("type") == FRESH_STATUS_TYPE), None)
+    new = {"type": FRESH_STATUS_TYPE,
+           "status": "False" if (prev or {}).get("status") == "True" else "True",
+           "reason": "BenchChurn", "message": value, "lastTransitionTime": now}
+    status["conditions"] = [c for c in conds if c.get("type") != FRESH_STATUS_TYPE] + [new]
+    return obj
+
+
+def incluster_status_condition(group: str, version: str, plural: str, ns: str,
+                               name: str, value: str, *, sa_dir: str | None = None,
+                               api: str = "https://kubernetes.default.svc",
+                               timeout: float = 30, attempts: int = 3) -> bool:
+    """GET the object, set the SnowplowBenchFresh condition, PUT it to the
+    /status subresource with its resourceVersion (409 → re-read, retry)."""
+    import ssl
+    sa_dir = sa_dir or _SA_DIR
+    try:
+        with open(os.path.join(sa_dir, "token")) as fh:
+            tok = fh.read().strip()
+        ctx = ssl.create_default_context(cafile=os.path.join(sa_dir, "ca.crt"))
+        url = f"{api}/apis/{group}/{version}/namespaces/{ns}/{plural}/{name}"
+        hdr = {"Authorization": "Bearer " + tok}
+        for _ in range(attempts):
+            with urllib.request.urlopen(urllib.request.Request(url, headers=hdr),
+                                        timeout=timeout, context=ctx) as r:
+                obj = json.loads(r.read())
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            body = json.dumps(with_fresh_condition(obj, value, now)).encode()
+            req = urllib.request.Request(url + "/status", data=body, method="PUT",
+                                         headers=dict(hdr, **{"Content-Type": "application/json"}))
+            try:
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                    return 200 <= r.status < 300
+            except urllib.error.HTTPError as e:
+                if e.code != 409:
+                    return False
+        return False
+    except Exception:  # noqa: BLE001 — a failed mutate is recorded, not raised
+        return False
+
+
+def kubectl_status_condition(kubeconfig: str, context: str, resource: str, ns: str,
+                             name: str, value: str, timeout: int = 30) -> bool:
+    """Operator-side twin: `kubectl get -o json` + `kubectl replace
+    --subresource=status`, explicit kubeconfig + context."""
+    import subprocess
+    base = ["kubectl", f"--kubeconfig={kubeconfig}", f"--context={context}", "-n", ns]
+    try:
+        g = subprocess.run(base + ["get", resource, name, "-o", "json"],
+                           capture_output=True, timeout=timeout)
+        if g.returncode != 0:
+            return False
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        body = json.dumps(with_fresh_condition(json.loads(g.stdout), value, now))
+        r = subprocess.run(base + ["replace", "--subresource=status", "-f", "-"],
+                           input=body.encode(), capture_output=True, timeout=timeout)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def call_path(group: str, version: str, plural: str, name: str, ns: str) -> str:
@@ -2814,9 +2934,17 @@ def _cmd_fresh(a) -> int:
         def patch(ns, name, value):
             return kubectl_annotate(a.kubeconfig, a.context, f"{a.plural}.{a.group}",
                                     ns, name, value)
+
+        def patch_status(ns, name, value):
+            return kubectl_status_condition(a.kubeconfig, a.context, f"{a.plural}.{a.group}",
+                                            ns, name, value)
     else:
         def patch(ns, name, value):
             return incluster_annotate(a.group, a.version, a.plural, ns, name, value)
+
+        def patch_status(ns, name, value):
+            return incluster_status_condition(a.group, a.version, a.plural, ns, name, value)
+    mutators = {"annotation": patch, "status": patch_status}
 
     client = HttpClient(a.snowplow_url)
     token = None
@@ -2839,10 +2967,16 @@ def _cmd_fresh(a) -> int:
                != (a.namespace, a.probe_name)]
     path = call_path("templates.krateo.io", "v1", "restactions",
                      FRESH_RA_NAME, a.ra_namespace)
+    # Run 9: churn MODES as separate labelled phases, annotation first. An
+    # annotation-only run is unchanged: same path, labels, order and records.
+    modes = list(a.modes or ["annotation"])
+    paths = {"annotation": path,
+             "status": call_path("templates.krateo.io", "v1", "restactions",
+                                 FRESH_STATUS_RA_NAME, a.ra_namespace)}
     push_since = None
     stream = None
     if not a.no_viewer:
-        push_since, stream = arm_probe_viewer(client, token, path, sink)
+        push_since, stream = arm_probe_viewer(client, token, paths[modes[0]], sink)
     # Start only once the driver's navigations reach snowplow (run 7's first
     # samples ran during the login phase, with no read load at all).
     if a.wait_for_load:
@@ -2850,23 +2984,49 @@ def _cmd_fresh(a) -> int:
                                       max_wait_s=a.load_max_wait_s)
         sink({"kind": "fresh_start_gate", **gate})
     rates = a.rates if a.rates else [a.churn_rate]
-    for rate in rates:
-        rate = float(rate)
-        label = f"list_dep@{rate:g}"
-        churn = None
-        if rate > 0:
-            churn = ChurnDriver(targets, rate,
-                                lambda t, m: patch(t[0], t[1], m)).start()
-        freshness_probe(
-            client, token, path, lambda m: patch(a.namespace, a.probe_name, m),
-            samples=a.samples, poll_ms=a.poll_ms, gap_s=a.gap_s,
-            label=label, sink=sink, healthy=lambda: readyz(client),
-            push_since=push_since)
-        if churn:
-            sink({"kind": "churn", "label": label, **churn.stop()})
+    fresh_phases(client, token, sink, modes=modes, rates=rates, mutators=mutators,
+                 paths=paths, targets=targets, probe=(a.namespace, a.probe_name),
+                 samples=a.samples, poll_ms=a.poll_ms, gap_s=a.gap_s,
+                 viewer=not a.no_viewer, push_since=push_since, stream=stream)
+    return 0
+
+
+def fresh_phases(client, token, sink, *, modes, rates, mutators, paths, targets, probe,
+                 samples, poll_ms, gap_s, viewer, push_since=None, stream=None,
+                 probe_fn=None, churn_factory=None, arm=None, healthy=None):
+    """Every (mode, rate) phase in order: modes outer, rates inner. Labels are
+    "list_dep@<rate>" (annotation, unchanged from run 8) and
+    "list_dep_status@<rate>" (status). The probe and the churn of a phase use
+    that mode's mutator; the probe polls that mode's RESTAction. The viewer
+    for the first mode is armed by the caller (before the start gate, as in
+    run 8); each later mode re-arms on its own path."""
+    probe_fn = probe_fn or freshness_probe
+    churn_factory = churn_factory or ChurnDriver
+    arm = arm or arm_probe_viewer
+    healthy = healthy or (lambda: readyz(client))
+    for i, mode in enumerate(modes):
+        mut = mutators[mode]
+        if i > 0 and viewer:
+            if stream is not None:
+                stream.close()
+            push_since, stream = arm(client, token, paths[mode], sink)
+        for rate in rates:
+            rate = float(rate)
+            label = f"{FRESH_MODE_LABEL[mode]}@{rate:g}"
+            churn = None
+            if rate > 0:
+                churn = churn_factory(targets, rate,
+                                      lambda t, m, mut=mut: mut(t[0], t[1], m)).start()
+            probe_fn(
+                client, token, paths[mode],
+                lambda m, mut=mut: mut(probe[0], probe[1], m),
+                samples=samples, poll_ms=poll_ms, gap_s=gap_s,
+                label=label, sink=sink, healthy=healthy,
+                push_since=push_since)
+            if churn:
+                sink({"kind": "churn", "label": label, **churn.stop()})
     if stream is not None:
         stream.close()
-    return 0
 
 
 def arm_probe_viewer(client: HttpClient, token: str, path: str, sink,
@@ -3121,6 +3281,8 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--churn-namespaces", type=int, default=50)
     f.add_argument("--churn-per-ns", type=int, default=20)
     f.add_argument("--name-prefix", default="bench-app-")
+    f.add_argument("--modes", nargs="*", choices=list(FRESH_MODES), default=None,
+                   help="churn modes as separate phases (default: annotation only)")
     f.add_argument("--no-viewer", action="store_true",
                    help="do NOT arm a /refreshes viewer on the probe cell (#764)")
     f.add_argument("--out", required=True)

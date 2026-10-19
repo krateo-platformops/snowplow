@@ -1,0 +1,80 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fresh606
+  namespace: bench-loadgen
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bench-fresh606-patch
+  labels:
+    app: scaletest
+rules:
+- apiGroups: ["composition.krateo.io"]
+  resources: ["githubscaffoldingwithcompositionpages"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bench-fresh606-patch
+  labels:
+    app: scaletest
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bench-fresh606-patch
+subjects:
+- kind: ServiceAccount
+  name: fresh606
+  namespace: bench-loadgen
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fresh606
+  namespace: bench-loadgen
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: fresh606
+    spec:
+      serviceAccountName: fresh606
+      restartPolicy: Never
+      nodeSelector:
+        bench.krateo.io/pool: loadgen
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: loadgen
+        effect: NoSchedule
+      containers:
+      - name: fresh
+        image: python:3.12-slim
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          sleep 60
+          exec python3 -u /opt/load606/load606.py fresh --mutator incluster \
+            --snowplow-url "http://snowplow.krateo-system.svc:8081" --authn-url "http://authn.krateo-system.svc:8082" \
+            --user "scaleuser-0001" --password "PW" \
+            --group composition.krateo.io --version v1-2-2 --plural githubscaffoldingwithcompositionpages \
+            --probe-name bench-app-01-01 --rates 1 10 50 --samples 60 \
+            --gap-s 5.0 --poll-ms 100 --churn-namespaces 50 \
+            --wait-for-load --out /dev/stdout
+        resources:
+          requests:
+            cpu: "1"
+            memory: 1Gi
+        volumeMounts:
+        - name: src
+          mountPath: /opt/load606
+      volumes:
+      - name: src
+        configMap:
+          name: load606

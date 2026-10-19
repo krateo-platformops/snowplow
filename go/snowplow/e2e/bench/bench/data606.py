@@ -34,7 +34,7 @@ import json
 import time
 
 from bench import cluster, lifecycle, rbac_model
-from bench.load606 import list_dep_fixture_yaml
+from bench.load606 import list_dep_fixture_yaml, list_dep_status_fixture_yaml
 
 __all__ = ["hold_composition_controller", "assert_no_external_children",
            "generate", "add_parsers"]
@@ -79,7 +79,7 @@ def assert_no_external_children() -> dict:
 
 def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
              probe_batch: int = 50, hold_probe_wait_s: float = 60,
-             login: bool = True) -> dict:
+             login: bool = True, fresh_modes: tuple = ("annotation",)) -> dict:
     if scale % namespaces:
         raise ValueError("scale must divide evenly across namespaces")
     per_ns = scale // namespaces
@@ -133,6 +133,17 @@ def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
         timeout_secs=60)
     if rc != 0:
         raise RuntimeError(f"freshness fixture apply failed: {err[:300]}")
+    if "status" in fresh_modes:
+        # Run 9: the status-mode probe RA, applied only when status churn runs
+        # (an annotation-only run carries exactly the run-8 fixture set).
+        rc, _, err = cluster.kubectl(
+            "apply", "--server-side", "-f", "-",
+            input_data=list_dep_status_fixture_yaml(
+                "bench-ns-01", cluster.COMP_GVR, COMP_VERSION, cluster.COMP_RES),
+            timeout_secs=60)
+        if rc != 0:
+            raise RuntimeError(f"status freshness fixture apply failed: {err[:300]}")
+        proof["fresh_modes"] = list(fresh_modes)
     proof["elapsed_s"] = round(time.time() - t0, 1)
     return proof
 
@@ -149,6 +160,8 @@ def add_parsers(sub) -> None:
                    help="register users only; the in-cluster driver logs them in "
                         "(in-cluster endpoint mode: authn is not reachable from here)")
     p.add_argument("--out", required=True)
+    p.add_argument("--fresh-modes", nargs="*", default=None,
+                   help="freshness churn modes; 'status' also applies the status probe RA")
 
     def _run(a):
         from bench.cli import _gke_context_guard
@@ -156,7 +169,8 @@ def add_parsers(sub) -> None:
         proof = generate(scale=a.scale, namespaces=a.namespaces, users=a.users,
                          probe_batch=min(50, a.scale // a.namespaces),
                          hold_probe_wait_s=a.hold_probe_wait_s,
-                         login=not a.no_login)
+                         login=not a.no_login,
+                         fresh_modes=tuple(a.fresh_modes or ("annotation",)))
         with open(a.out, "w") as fh:
             json.dump(proof, fh, indent=2, default=str)
         print(json.dumps(proof, indent=2, default=str))

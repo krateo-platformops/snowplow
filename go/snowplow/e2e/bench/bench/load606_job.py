@@ -268,7 +268,8 @@ def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str,
                  rates: list[str], samples: int, gap_s: float, probe_name: str,
                  namespaces: int, comp_group: str, comp_version: str,
                  comp_plural: str, poll_ms: int = 100,
-                 delay_s: float = 0, viewer: bool = True) -> str:
+                 delay_s: float = 0, viewer: bool = True,
+                 modes: list[str] | tuple = ("annotation",)) -> str:
     """The freshness probe as an in-cluster Job (fresh606) on the loadgen pool.
 
     It talks to snowplow/authn by Service DNS (no external IP needed) and
@@ -278,6 +279,16 @@ def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str,
     render() creates; apply both in one manifest.
     """
     rate_args = " ".join(str(r) for r in rates)
+    modes = list(modes or ("annotation",))
+    # An annotation-only probe renders exactly as before (run 8); status
+    # churn (run 9) adds the phases and the /status write permission.
+    mode_args = "" if modes == ["annotation"] else " --modes " + " ".join(modes)
+    status_rule = ""
+    if "status" in modes:
+        status_rule = f"""
+- apiGroups: ["{comp_group}"]
+  resources: ["{comp_plural}/status"]
+  verbs: ["get", "update"]"""
     # The delay lets every virtual user's FIRST navigation land before
     # freshness is sampled (the load Job starts at the same time).
     script = f"""set -eu
@@ -288,7 +299,7 @@ exec python3 -u /opt/load606/load606.py fresh --mutator incluster \\
   --group {comp_group} --version {comp_version} --plural {comp_plural} \\
   --probe-name {probe_name} --rates {rate_args} --samples {samples} \\
   --gap-s {gap_s} --poll-ms {poll_ms} --churn-namespaces {namespaces} \\
-  --wait-for-load{"" if viewer else " --no-viewer"} --out /dev/stdout
+  --wait-for-load{"" if viewer else " --no-viewer"}{mode_args} --out /dev/stdout
 """
     return f"""\
 ---
@@ -307,7 +318,7 @@ metadata:
 rules:
 - apiGroups: ["{comp_group}"]
   resources: ["{comp_plural}"]
-  verbs: ["get", "patch"]
+  verbs: ["get", "patch"]{status_rule}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -399,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--comp-group", default="composition.krateo.io")
     p.add_argument("--comp-version", default="v1-2-2")
     p.add_argument("--comp-plural", default="githubscaffoldingwithcompositionpages")
+    p.add_argument("--fresh-modes", nargs="*", default=None,
+                   help="fresh606 churn modes: annotation and/or status (run 9)")
     p.add_argument("--no-viewers", action="store_true",
                    help="driver and probe open NO /refreshes viewers (#764)")
     a = p.parse_args(argv)
@@ -431,7 +444,8 @@ def main(argv: list[str] | None = None) -> int:
             probe_name=a.probe_name, namespaces=a.namespaces,
             comp_group=a.comp_group, comp_version=a.comp_version,
             comp_plural=a.comp_plural, delay_s=a.fresh_delay_s,
-            viewer=not a.no_viewers))
+            viewer=not a.no_viewers,
+            modes=tuple(a.fresh_modes or ("annotation",))))
     return 0
 
 

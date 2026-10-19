@@ -1,0 +1,12 @@
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: bench-fresh-listdep
+  namespace: bench-ns-01
+  labels:
+    app: scaletest
+spec:
+  api:
+  - name: comps
+    path: "/apis/composition.krateo.io/v1-2-2/namespaces/bench-ns-01/githubscaffoldingwithcompositionpages"
+    filter: '[.comps.items[] | {name: .metadata.name, marker: (.metadata.annotations["snowplow-bench/fresh-marker"] // "")}]'
