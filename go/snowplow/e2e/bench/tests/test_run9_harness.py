@@ -28,7 +28,7 @@ from bench import load606, load606_job
 from tests.test_navmodel import INIT, PORTAL, Fake, P
 from tests.test_run606_pr483 import _env483
 from tests.test_run606_real_sequence import BENCH_DIR, _calls, harness  # noqa: F401
-from tests.test_run8 import PODS, _mem, _navs, q234
+from tests.test_run8 import DELIV, PODS, _mem, _navs, q234
 
 K = load606.RUN8_KEYS
 K9 = load606.RUN9_KEYS
@@ -344,13 +344,54 @@ def test_no_viewer_and_no_stale_serve_makes_dependent_passes_inconclusive():
         assert c[name]["result"] == "INCONCLUSIVE" and "NOT EXERCISED" in c[name]["why"], name
 
 
+_NO = {"fresh": [], "push_refetches": [], "viewer_stats": []}
+
+
+@pytest.mark.parametrize("serves,deliv,missing", [
+    # P1 (reviewer-small): stale serves, but no client ever received a frame
+    (40, _NO, ["no client /refreshes stream", "no refresh frame",
+               "no armed probe sample received a push"]),
+    # P2: client delivery evidence, but snowplow never served stale
+    (0, DELIV, ["no stale serve"]),
+    # streams opened, frames = 0 (an SSE path that buffers)
+    (40, {"fresh": DELIV["fresh"], "push_refetches": [],
+          "viewer_stats": [{"kind": "viewer_stats", "streams_opened": 1000, "frames": 0}]},
+     ["no refresh frame"]),
+    # frames reached the driver, but the armed probe never saw a push
+    (40, {"fresh": [{"kind": "fresh", "label": "list_dep@10", "armed": True, "push_ms": None}],
+          "push_refetches": DELIV["push_refetches"], "viewer_stats": DELIV["viewer_stats"]},
+     ["no armed probe sample received a push"]),
+])
+def test_exercised_needs_a_stale_serve_and_client_observed_delivery(serves, deliv, missing):
+    base = q234(**{K["stale_serve"]: {"known_stale": serves},
+                   K["retry_viewers"]: 9})          # server-side viewers never count
+    rep, checks = load606.run8_report(_navs(), [_mem(150, **base)], [], PODS, **deliv)
+    c = {x["check"]: x for x in checks}
+    ex = rep["exercised_710_740"]
+    assert ex["exercised"] is False and c["run8.710_740_exercised"]["result"] == "INCONCLUSIVE"
+    for m in missing:
+        assert any(x.startswith(m) for x in ex["missing"]), (m, ex["missing"])
+    assert c["run8.stale_overdue_total"]["result"] == "INCONCLUSIVE"
+    assert c["run8.stale_push_unarmed_total"]["result"] == "INCONCLUSIVE"
+
+
+def test_exercised_with_serves_and_full_client_delivery():
+    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234(**{K["retry_viewers"]: 0}))],
+                                      [], PODS, **DELIV)
+    ex = rep["exercised_710_740"]
+    assert ex["exercised"] is True and ex["missing"] == []
+    assert (ex["streams_opened"], ex["frames"], ex["push_refetches"], ex["probe_push_samples"]) \
+        == (3, 5, 1, 1)
+    assert {x["check"]: x for x in checks}["run8.710_740_exercised"]["result"] == "PASS"
+
+
 def test_a_real_failure_stays_a_failure_when_unexercised():
     _, c = _unexercised(**{K["stale_overdue"]: 1})
     assert c["run8.stale_overdue_total"]["result"] == "FAIL"
 
 
 def test_a_viewer_makes_the_checks_count():
-    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234())], [], PODS)
+    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234())], [], PODS, **DELIV)
     c = {x["check"]: x for x in checks}
     assert rep["exercised_710_740"]["exercised"] is True
     assert c["run8.710_740_exercised"]["result"] == "PASS"
@@ -371,7 +412,7 @@ def test_run9_marks_per_event_and_refresher_rates():
                 K9["enqueue"]: 1450, K9["completed"]: 1350, K9["floored"]: 9,
                 K9["queue_depth"]: 700,
                 K9["fills_by_reason"]: {"absent": 12, "known_stale": 1, "refresh_forced": 2100}})
-    rep, _ = load606.run8_report(_navs(), [_mem(100, **a), _mem(200, **b)], [], PODS)
+    rep, _ = load606.run8_report(_navs(), [_mem(100, **a), _mem(200, **b)], [], PODS, **DELIV)
     r9 = rep["run9_refresh"]
     assert r9["dirty_marks"]["events_delta"] == 100
     assert r9["dirty_marks"]["marks_per_event"] == 49.0         # (4700 + 200) / 100
@@ -385,7 +426,7 @@ def test_run9_marks_per_event_and_refresher_rates():
 def test_every_run9_key_missing_is_not_exposed_and_fails(name):
     full = q234()
     del full[K9[name]]
-    rep, checks = load606.run8_report(_navs(), [_mem(150, **full)], [], PODS)
+    rep, checks = load606.run8_report(_navs(), [_mem(150, **full)], [], PODS, **DELIV)
     if name == "queue_depth":
         # the top-level sample field is the fallback; absent too here → FAIL
         pass

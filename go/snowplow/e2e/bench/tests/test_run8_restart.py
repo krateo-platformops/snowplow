@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 
 from bench import load606
-from tests.test_run8 import PODS, _mem, _navs, q234
+from tests.test_run8 import DELIV, PODS, _mem, _navs, q234
 
 K = load606.RUN8_KEYS
 GIB = 1024 ** 3
@@ -32,7 +32,7 @@ def H3(counts: dict, max_ms: int):
 
 
 def _p95(hist):
-    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234(**{K["stale_to_push"]: hist}))], [], PODS)
+    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234(**{K["stale_to_push"]: hist}))], [], PODS, **DELIV)
     return {c["check"]: c for c in checks}["run8.stale_to_push.p95"], rep
 
 
@@ -78,7 +78,7 @@ def _series_with_reset():
 def test_counter_drop_mid_run_marks_every_run8_check_restarted_fail():
     tops = [{"kind": "top", "t": 131, "rss_bytes": int(7.9 * GIB)},
             {"kind": "top", "t": 201, "rss_bytes": int(0.8 * GIB)}]
-    rep, checks = load606.run8_report(_navs(), _series_with_reset(), tops, PODS)
+    rep, checks = load606.run8_report(_navs(), _series_with_reset(), tops, PODS, **DELIV)
     assert checks[0]["check"] == "run8.no_restart" and checks[0]["result"] == "FAIL"
     assert all(c["result"] == "FAIL" for c in checks)
     assert all(c["why"].startswith("RESTARTED") for c in checks)
@@ -95,7 +95,7 @@ def test_the_tail_alone_would_have_passed():
     """Guard for the test above: without the reset, the last sample PASSes —
     which is exactly the false pass the restart check prevents."""
     tail_only = [_mem(200, 700, 1500, **q234(**{K["stale_to_push"]: H3({1000: 20}, 400)}))]
-    rep, checks = load606.run8_report(_navs(), tail_only, [], PODS)
+    rep, checks = load606.run8_report(_navs(), tail_only, [], PODS, **DELIV)
     c = {x["check"]: x for x in checks}
     assert c["run8.stale_to_push.p95"]["result"] == "PASS"
     assert rep["restart"] is None
@@ -108,7 +108,7 @@ def test_the_tail_alone_would_have_passed():
     lambda: [_mem(100), {**_mem(160), "extra": {K["build_info"]: {"commit": "other"}}}],
 ])
 def test_other_restart_signals(make):
-    rep, checks = load606.run8_report(_navs(), make(), [], PODS)
+    rep, checks = load606.run8_report(_navs(), make(), [], PODS, **DELIV)
     assert rep["restart"] is not None and checks[0]["check"] == "run8.no_restart"
 
 
@@ -116,7 +116,7 @@ def test_pod_restart_count_alone_is_a_restart():
     pods = [{**PODS[0]}, {**PODS[1], "restarts": 1,
                          "last_state": {"terminated": {"reason": "OOMKilled", "exitCode": 137,
                                                        "finishedAt": "2026-10-15T10:00:00Z"}}}]
-    rep, checks = load606.run8_report(_navs(), [_mem(100)], [], pods)
+    rep, checks = load606.run8_report(_navs(), [_mem(100)], [], pods, **DELIV)
     sig = rep["restart"]["signals"][-1]
     assert sig["signal"] == "pod restartCount" and sig["reason"] == "OOMKilled"
     assert all(c["result"] == "FAIL" for c in checks)
@@ -130,7 +130,7 @@ def test_restart_count_only_uses_finished_at_for_the_peak_before():
                                                        "finishedAt": "2026-10-15T10:00:00Z"}}}]
     mem = [_mem(t_oom - 30, 6900, 7700), _mem(t_oom - 10, 7800, 8000)]   # no sample after it
     tops = [{"kind": "top", "t": t_oom - 5, "rss_bytes": int(7.95 * GIB)}]
-    rep, _ = load606.run8_report(_navs(), mem, tops, pods)
+    rep, _ = load606.run8_report(_navs(), mem, tops, pods, **DELIV)
     r = rep["restart"]
     assert r["t"] == t_oom
     assert r["peak_heap_inuse_mb_before"] == 7800 and r["peak_sys_mb_before"] == 8000
@@ -140,5 +140,5 @@ def test_restart_count_only_uses_finished_at_for_the_peak_before():
 def test_monotonic_series_is_not_a_restart():
     mem = [{**_mem(100, **{K["stale_overdue"]: 1}), "num_gc": 10},
            {**_mem(160, **{K["stale_overdue"]: 4}), "num_gc": 40}]
-    rep, _ = load606.run8_report(_navs(), mem, [], PODS)
+    rep, _ = load606.run8_report(_navs(), mem, [], PODS, **DELIV)
     assert rep["restart"] is None

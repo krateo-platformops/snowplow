@@ -36,7 +36,11 @@ case "$RUN_NAME" in
 esac
 PROJECT="${PROJECT:-operations-dev-krateo-io}"
 ZONE="${ZONE:-europe-west4-a}"
-TTL_HOURS="${TTL_HOURS:-8}"
+# The cluster's TTL (the self-destruct CronJob and gke-reap read it). The
+# whole run's worst case must fit inside it, or the run is refused before any
+# cloud call (see the budget below). 11 h holds run 9's default plan (two
+# churn modes x 3 rates x 60 samples) with every bounded wait at its maximum.
+TTL_HOURS="${TTL_HOURS:-11}"
 INSTALLER_CHART="${INSTALLER_CHART:-oci://ghcr.io/krateo-platformops/charts/installer}"
 # Installer source: ONLY the published OCI chart (INSTALLER_VERSION).
 # Local-chart mode cannot work for this installer (run 4): its self-CD pulls
@@ -119,20 +123,53 @@ FRESH_MODES="${FRESH_MODES:-annotation status}"
 for m in $FRESH_MODES; do
   case "$m" in annotation|status) ;; *) echo "refusing: FRESH_MODES has unknown mode '$m'" >&2; exit 2 ;; esac
 done
-# The measure wait is DERIVED from the work it waits for. Run 8 waited a fixed
-# DRIVE_S+3600 = 5400 s while fresh606 needed up to 3 rates x 60 samples x
-# (30 s budget + gap) ~ 6300 s once samples stopped converging: the probe was
-# still at list_dep@50 30/60 when the wait expired. Worst case per sample is
-# the 30 s convergence budget plus the gap; plus the start delay and a margin.
-FRESH_BUDGET_S=30
+# The measure wait is DERIVED from the work it waits for, and fresh606 is
+# itself BOUNDED to that work (reviewer-small (d)): each (mode, rate) phase
+# gets samples x (30 s budget + gap) x 1.25 of wall clock and stops there,
+# recorded (load606.fresh_phase_budget_s). Run 8 waited a fixed DRIVE_S+3600
+# = 5400 s while fresh606 needed up to 3 x 60 x 35 s ~ 6300 s: the wait
+# expired at list_dep@50 30/60.
+FRESH_BUDGET_S=30                 # load606.FRESH_BUDGET_S
+FRESH_LOAD_WAIT_MAX_S=1800        # fresh --load-max-wait-s default (start gate)
+FRESH_LAST_SAMPLE_OVERRUN_S=60    # the phase's last sample: mutate + last poll overrun
+DRIVER_LOGIN_BUDGET_S=900         # adaptive logins before the driver's DRIVE_S
 n_modes=$(echo $FRESH_MODES | wc -w | tr -d ' ')
 n_rates=$(echo $CHURN_RATES | wc -w | tr -d ' ')
-FRESH_EST_S=$(( ${THINK_S%.*} + n_modes * n_rates * FRESH_SAMPLES * (FRESH_BUDGET_S + ${FRESH_GAP_S%.*}) ))
-MEASURE_WAIT_S="${MEASURE_WAIT_S:-$(( (FRESH_EST_S > DRIVE_S ? FRESH_EST_S : DRIVE_S) + 1800 ))}"
+FRESH_PHASE_S=$(( FRESH_SAMPLES * (FRESH_BUDGET_S + ${FRESH_GAP_S%.*}) * 5 / 4 ))
+FRESH_EST_S=$(( ${THINK_S%.*} + FRESH_LOAD_WAIT_MAX_S
+                + n_modes * n_rates * (FRESH_PHASE_S + FRESH_LAST_SAMPLE_OVERRUN_S) ))
+DRIVER_EST_S=$(( ${DRIVE_S%.*} + DRIVER_LOGIN_BUDGET_S ))
+MEASURE_WAIT_S="${MEASURE_WAIT_S:-$(( (FRESH_EST_S > DRIVER_EST_S ? FRESH_EST_S : DRIVER_EST_S) + 600 ))}"
+# Every other bounded step (seconds). Each one is ENFORCED where it runs.
+UP_BUDGET_S="${UP_BUDGET_S:-1800}"            # reap + gke-up (+ node pools)
+INSTALL_TIMEOUT_S="${INSTALL_TIMEOUT_S:-900}"  # helm install --wait --timeout
+DEPLOY_WAIT_S="${DEPLOY_WAIT_S:-1800}"        # snowplow/frontend/authn Available
+DATA_TIMEOUT_S="${DATA_TIMEOUT_S:-2400}"      # data606 (run 8: 1041 s)
+ROLLOUT_TIMEOUT_S="${ROLLOUT_TIMEOUT_S:-2700}" # reboot: rollout status
+COLLECT_CAP_S="${COLLECT_CAP_S:-1800}"        # collect + evaluate, all reads together
+DIAG_CAP_S="${DIAG_CAP_S:-900}"               # diag606 snapshot on failure
+DOWN_BUDGET_S="${DOWN_BUDGET_S:-900}"         # gke-down
+TTL_MARGIN_S="${TTL_MARGIN_S:-1800}"
 if [[ "$RUN8_REPORT" == "1" ]]; then
   # shellcheck disable=SC2086
   python3 -m bench.load606 check-prefixes $MEM_VARS_PREFIXES \
     || { echo "refusing: MEM_VARS_PREFIXES does not capture every run-8 key" >&2; exit 2; }
+fi
+# TTL budget (reviewer-small (d)): the whole run's worst case, every bounded
+# step at its maximum, must fit inside the cluster's TTL minus a margin, or
+# the TTL reaper could delete the cluster mid-measure (or a hung step could
+# outlive it). Refused here, before any cloud call.
+RUN_BUDGET_S=$(( UP_BUDGET_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
+                 + ENDPOINT_WAIT_S + PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
+                 + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
+                 + COLLECT_CAP_S + DIAG_CAP_S + DOWN_BUDGET_S ))
+TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
+budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + env ${ENDPOINT_WAIT_S} + preflight ${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + diag ${DIAG_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
+  echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
+  echo "  budget: ${budget_line}" >&2
+  echo "  needs TTL_HOURS >= $(( (RUN_BUDGET_S + TTL_MARGIN_S + 3599) / 3600 )), or fewer FRESH_SAMPLES / CHURN_RATES / FRESH_MODES" >&2
+  exit 2
 fi
 COMPOSITE_ROUTES=()
 PLATFORM_POLL_S="${PLATFORM_POLL_S:-60}"
@@ -178,9 +215,58 @@ step() {
   "$@"
 }
 
+# bounded <seconds> cmd...: run cmd, TERM it after <seconds> (portable: macOS
+# has no `timeout`). Output and exit status are cmd's own (143 if killed).
+bounded() {
+  local secs="$1"; shift
+  "$@" &
+  local pid=$!
+  ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  local dog=$!
+  local rc=0
+  wait "$pid" || rc=$?
+  kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null || true
+  return "$rc"
+}
+# capped <seconds> <label> cmd...: run cmd in the background under ONE
+# wall-clock cap; stop early on the cap or when teardown was signalled.
+TD_SIGNALED=0
+CAPPED_PID=""
+capped() {
+  local secs="$1" label="$2"; shift 2
+  ( set +e; "$@" ) &
+  CAPPED_PID=$!
+  local waited=0
+  while kill -0 "$CAPPED_PID" 2>/dev/null; do
+    if (( waited >= secs )) || [[ "$TD_SIGNALED" == "1" ]]; then
+      log "${label}: stopped after ${waited}s ($([[ "$TD_SIGNALED" == "1" ]] && echo 'signal during teardown' || echo "cap ${secs}s reached")); continuing to teardown"
+      pkill -TERM -P "$CAPPED_PID" 2>/dev/null || true
+      kill -TERM "$CAPPED_PID" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  wait "$CAPPED_PID" 2>/dev/null || true
+  CAPPED_PID=""
+}
+on_teardown_signal() {
+  # A signal DURING teardown must never skip gke-down (reviewer-small (a)):
+  # it only cuts the collect/diagnostics short.
+  TD_SIGNALED=1
+  log "signal during teardown: collect/diagnostics cut short; the cluster is still deleted"
+  if [[ -n "$CAPPED_PID" ]]; then
+    pkill -TERM -P "$CAPPED_PID" 2>/dev/null || true
+    kill -TERM "$CAPPED_PID" 2>/dev/null || true
+  fi
+}
+
 CLUSTER_CREATED=0
 teardown() {
   local rc=$?
+  # FIRST: no signal may abort teardown from here on (the run's INT/TERM/HUP
+  # trap is `exit 130`, which inside teardown would skip gke-down).
+  trap on_teardown_signal INT TERM HUP
   trap - EXIT
   declare -F stop_top_loop >/dev/null && stop_top_loop
   if [[ "$CLUSTER_CREATED" == "1" ]]; then
@@ -194,15 +280,16 @@ teardown() {
       # snowplow logs this way.
       if [[ "${MEASURE_STARTED:-0}" == "1" && "${COLLECTED:-0}" != "1" ]]; then
         log "measure FAILED or interrupted (exit ${rc}): collecting partial results before teardown"
-        ( set +e; s_collect; s_evaluate ) || log "partial collect/evaluate failed (continuing to teardown)"
+        capped "$COLLECT_CAP_S" "partial collect" collect_and_evaluate
       fi
       if [[ "$DRY" == "1" ]]; then
         log "DRY: python3 -m bench.diag606 collect --out $OUT/diagnostics"
+      elif [[ "$TD_SIGNALED" == "1" ]]; then
+        log "signalled: skipping diagnostics, deleting the cluster now"
       elif [[ -s "$KCFG" ]]; then
         log "=== diagnostics before teardown -> $OUT/diagnostics ==="
-        python3 -m bench.diag606 collect --kubeconfig "$KCFG" --context "$KCTX" \
-            --out "$OUT/diagnostics" --redact "$PW" \
-          || log "diagnostics collection failed (continuing to teardown)"
+        capped "$DIAG_CAP_S" "diagnostics" python3 -m bench.diag606 collect \
+            --kubeconfig "$KCFG" --context "$KCTX" --out "$OUT/diagnostics" --redact "$PW"
       else
         log "no kubeconfig yet; no diagnostics to collect"
       fi
@@ -237,7 +324,7 @@ s_source() {
 s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
 s_up() {
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
-  run python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
+  run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
       --zone "$ZONE" --ttl-hours "$TTL_HOURS" $YES
   run "${K[@]}" version
 }
@@ -274,7 +361,7 @@ componentValues:
 EOF
   run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
       -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" \
-      --wait --timeout 15m
+      --wait --timeout "${INSTALL_TIMEOUT_S}s"
 }
 s_verify483() {
   # installer#483 acceptance. Items 1-4 gate (a FAIL aborts the run with
@@ -293,7 +380,7 @@ s_wait_platform() {
   # the specific components the bench uses: their Deployments Available and
   # their Services present (checked by the env step).
   run "${K[@]}" -n krateo-system wait --for=condition=Available \
-      $(printf 'deploy/%s ' $REQUIRED_DEPLOYMENTS) --timeout=30m
+      $(printf 'deploy/%s ' $REQUIRED_DEPLOYMENTS) --timeout="${DEPLOY_WAIT_S}s"
   # Record WHERE snowplow runs: a pod outside the dedicated pool shares CPU.
   run "${K[@]}" -n krateo-system get pods -l app.kubernetes.io/name=snowplow \
       -o wide | tee -a "$OUT/snowplow-placement.txt" || true
@@ -371,7 +458,7 @@ s_data() {
   # in-cluster mode they are deferred to the in-cluster driver.
   local login=()
   [[ "$ENDPOINT_MODE" == "incluster" ]] && login=(--no-login)
-  run python3 -m bench data606 --scale "$SCALE" --users "$USERS" \
+  run bounded "$DATA_TIMEOUT_S" python3 -m bench data606 --scale "$SCALE" --users "$USERS" \
       --namespaces "$NAMESPACES" --hold-probe-wait-s "$HOLD_PROBE_WAIT_S" \
       --out "$OUT/data-proof.json" ${login[@]+"${login[@]}"} \
       $([[ "$FRESH_MODES" == "annotation" ]] || printf -- '--fresh-modes %s' "$FRESH_MODES")
@@ -379,7 +466,7 @@ s_data() {
 s_reboot() {
   # Cold start at 50K: restart once the data exists, time Ready (#594/#637).
   run "${K[@]}" -n krateo-system rollout restart deploy/snowplow
-  run "${K[@]}" -n krateo-system rollout status deploy/snowplow --timeout=45m
+  run "${K[@]}" -n krateo-system rollout status deploy/snowplow --timeout="${ROLLOUT_TIMEOUT_S}s"
 }
 s_digest() {
   # VOID gate (run 8): after the reboot, before any load. Reads what the
@@ -462,7 +549,8 @@ s_measure() {
 snowplow_pod_record() {
   local phase="$1"
   if [[ "$DRY" == "1" ]]; then log "DRY: snowplow pod record ($phase)"; return 0; fi
-  "${K[@]}" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
+  bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
+      -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
     | python3 -m bench.load606 pod-record --phase "$phase" > "$OUT/pod-$phase.jsonl" \
     || log "could not record the snowplow pod ($phase); the verdict will say restart state unknown"
   log "snowplow pod ($phase): $(cat "$OUT/pod-$phase.jsonl" 2>/dev/null | cut -c1-240)"
@@ -490,7 +578,10 @@ s_collect() {
   # Every piece is best effort and bounded: this also runs from the teardown
   # trap after a failed measure (#763), where Jobs may still be Running
   # (`kubectl logs` / `cp` work on a running pod) and any one read may fail.
-  local KR=("${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
+  # Each read: --request-timeout AND an outer wall-clock bound, because
+  # --request-timeout does not bound an open exec stream (`kubectl cp`). The
+  # whole collect + evaluate runs under ONE cap (COLLECT_CAP_S, see `capped`).
+  local KR=(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=load606 -o name); do
     "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/nav-${p#pod/}.jsonl" \
       || log "could not read the driver log from ${p#pod/}"
@@ -517,6 +608,7 @@ s_collect() {
   COLLECTED=1
   log "collected: $(cd "$OUT" && ls nav-*.jsonl fresh-*.jsonl mem-*.jsonl pod-after.jsonl snowplow.log 2>/dev/null | tr '\n' ' ')heap=$(ls "$OUT/heap" 2>/dev/null | wc -l | tr -d ' ')"
 }
+collect_and_evaluate() { s_collect; s_evaluate; }
 s_evaluate() {
   shopt -s nullglob
   local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
@@ -533,6 +625,7 @@ s_evaluate() {
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
 }
 
+log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus ${TTL_MARGIN_S} s"
 step source    s_source
 step reap      s_reap
 step up        s_up
@@ -545,6 +638,6 @@ step data      s_data
 step reboot    s_reboot
 step digest    s_digest
 step measure   s_measure
-step collect   s_collect
+step collect   capped "$COLLECT_CAP_S" "collect" s_collect
 step evaluate  s_evaluate
 log "run complete: $OUT"

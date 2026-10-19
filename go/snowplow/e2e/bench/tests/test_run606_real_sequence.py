@@ -330,6 +330,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                                   "polls": 2, "poll_ms": 100}))
         sys.exit(0)
     if a[:1] == ["logs"] and any("load606" in x for x in a):
+        time.sleep(float(os.environ.get("FAKE_SLOW_LOGS", "0")))   # a slow / hung read
         for v in (1, 2):
             print(json.dumps({"kind": "nav", "user": "scaleuser-0001", "page": "p",
                               "visit": v, "wall_ms": 50, "calls": 3, "errors": 0,

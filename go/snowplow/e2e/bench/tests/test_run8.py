@@ -147,6 +147,13 @@ def q234(**over):
     return base
 
 
+# Client-observed delivery of #710 pushes (#764): a viewer stream got frames,
+# they triggered refetches, and the armed probe saw a push.
+DELIV = {"fresh": [{"kind": "fresh", "label": "list_dep@10", "armed": True, "push_ms": 800.0}],
+         "push_refetches": [{"kind": "push_refetch", "user": "u", "status": 200, "wall_ms": 20}],
+         "viewer_stats": [{"kind": "viewer_stats", "streams_opened": 3, "frames": 5}]}
+
+
 PODS = [{"kind": "snowplow_pod", "phase": "before", "pod": "s", "restarts": 0,
          "limits": {"memory": "8Gi"}},
         {"kind": "snowplow_pod", "phase": "after", "pod": "s", "restarts": 0,
@@ -154,7 +161,7 @@ PODS = [{"kind": "snowplow_pod", "phase": "before", "pod": "s", "restarts": 0,
 
 
 def test_every_missing_key_is_not_exposed_and_fails():
-    rep, checks = load606.run8_report(_navs(), [_mem(150), _mem(1050)], [], PODS)
+    rep, checks = load606.run8_report(_navs(), [_mem(150), _mem(1050)], [], PODS, **DELIV)
     failed = {c["check"]: c for c in checks if c["result"] == "FAIL"}
     for name in ("run8.content_fill.over_ceiling_bytes", "run8.nested_resolve.over_ceiling_bytes",
                  "run8.stale_to_push.p95", "run8.stale_to_push.max", "run8.stale_overdue_total",
@@ -179,7 +186,7 @@ def test_full_report_memory_risk_and_gates():
                                             K["stale_overdue"]: 9}))]
     tops = [{"kind": "top", "t": 125, "rss_bytes": int(5.5 * GIB)},
             {"kind": "top", "t": 1020, "rss_bytes": int(7.2 * GIB)}]
-    rep, checks = load606.run8_report(_navs(), mem, tops, PODS)
+    rep, checks = load606.run8_report(_navs(), mem, tops, PODS, **DELIV)
     risk = rep["memory_risk"]
     assert risk["limit_bytes"] == 8 * GIB
     assert risk["peak_rss_share_of_limit"] == 0.9                   # 7.2 / 8
@@ -209,7 +216,7 @@ def test_full_report_memory_risk_and_gates():
 ])
 def test_stale_to_push_bucket_rules(hist, p95, mx):
     mem = [_mem(150, **q234(**{K["stale_to_push"]: hist}))]
-    rep, checks = load606.run8_report(_navs(), mem, [], PODS)
+    rep, checks = load606.run8_report(_navs(), mem, [], PODS, **DELIV)
     res = {c["check"]: c for c in checks}
     assert res["run8.stale_to_push.p95"]["result"] == p95
     if p95 == "INCONCLUSIVE" and hist["count"]:
@@ -228,10 +235,11 @@ def test_inconclusive_stale_to_push_makes_the_verdict_inconclusive():
               "start": 500.0, "visit": 1, "wall_ms": 100, "calls": 3, "errors": 0, "sched_lag_ms": 1}]
     navs += [{"kind": "nav", "nav": "route", "user": "u", "page": "p", "start": 200.0 + i,
               "visit": 2, "wall_ms": 100, "calls": 3, "errors": 0, "sched_lag_ms": 1} for i in range(300)]
-    fresh = [{"kind": "fresh", "label": "list_dep@10", "converged": True, "latency_ms": 100}
-             for _ in range(40)]
+    fresh = [{"kind": "fresh", "label": "list_dep@10", "converged": True, "latency_ms": 100,
+              "armed": True, "push_ms": 300.0} for _ in range(40)]
     r = load606.evaluate(navs, fresh, [], snowplow_pods=PODS, mem=[_mem(150, **full)],
-                         tops=[], run8=True)
+                         tops=[], run8=True, push_refetches=DELIV["push_refetches"],
+                         viewer_stats=DELIV["viewer_stats"])
     assert r["verdict"] == "INCONCLUSIVE", [c for c in r["checks"] if c["result"] != "PASS"]
 
 

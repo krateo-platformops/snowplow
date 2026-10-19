@@ -273,10 +273,11 @@ def test_run606_default_runs_both_modes_and_derives_the_wait(harness):
     job = (tmp / "out" / "loadgen-job.yaml").read_text()
     assert "--modes annotation status" in job
     assert "githubscaffoldingwithcompositionpages/status" in job
-    # 0 delay + 2 modes x 1 rate x 2 samples x (30 s + 0 gap) = 120 → +1800
+    # 0 delay + 1800 load-gate max + 2 modes x 1 rate x (2 x 30 s x 1.25 + 60 s overrun)
+    #   = 2070 s; the driver needs 1 + 900; wait = 2070 + 600
     waits = [c["argv"] for c in _calls(state) if c["tool"] == "kubectl" and "wait" in c["argv"]
              and "job/fresh606" in c["argv"]]
-    assert waits and "--timeout=1920s" in waits[0]
+    assert waits and "--timeout=2670s" in waits[0]
 
 
 def test_run606_annotation_only_renders_the_run8_probe(harness):

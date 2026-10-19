@@ -23,7 +23,7 @@ from bench import load606
 from tests.test_run606_pr483 import _env483
 from tests.test_run606_real_sequence import (  # noqa: F401
     BENCH_DIR, FAKE_DIGEST, OTHER_DIGEST, _calls, harness)
-from tests.test_run8 import PODS, H, _mem, _navs, q234
+from tests.test_run8 import DELIV, PODS, H, _mem, _navs, q234
 
 K = load606.RUN8_KEYS
 FIXTURE = Path(__file__).parent / "fixtures" / "debug_vars_keys_1.12.50.json"
@@ -214,7 +214,7 @@ def test_bars_are_the_rulings_not_instrument_readings():
 
 
 def _checks(**over):
-    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234(**over))], [], PODS)
+    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234(**over))], [], PODS, **DELIV)
     return rep, {c["check"]: c for c in checks}
 
 
@@ -276,7 +276,7 @@ Q234_KEYS = sorted(set(q234()) - {K["customer_inflight"]})
 def test_every_q234_key_missing_is_not_exposed_and_fails(key):
     full = q234()
     del full[key]
-    rep, checks = load606.run8_report(_navs(), [_mem(150, **full)], [], PODS)
+    rep, checks = load606.run8_report(_navs(), [_mem(150, **full)], [], PODS, **DELIV)
     bad = [c for c in checks if c["result"] == "FAIL" and c.get("key") == key]
     assert bad and all("not exposed" in c["why"] for c in bad), (key, checks)
 
@@ -285,10 +285,10 @@ def test_customer_inflight_falls_back_to_the_top_level_reading():
     full = q234()
     del full[K["customer_inflight"]]
     m = _mem(150, **full)
-    rep, checks = load606.run8_report(_navs(), [m], [], PODS)
+    rep, checks = load606.run8_report(_navs(), [m], [], PODS, **DELIV)
     assert any(c["check"] == "run8.customer_inflight" and c["result"] == "FAIL" for c in checks)
     m["customer_resolve_inflight"] = 12
-    rep, checks = load606.run8_report(_navs(), [m], [], PODS)
+    rep, checks = load606.run8_report(_navs(), [m], [], PODS, **DELIV)
     assert rep["q3_users_never_queue"]["customer_inflight_max"] == 12
     assert not any(c["check"] == "run8.customer_inflight" for c in checks)
 
@@ -304,7 +304,7 @@ def test_q2_stale_served_share_and_age():
     mem = [_mem(100, **q234(**{K["resolved_cache"]: rc0, K["stale_serve"]: {"known_stale": 1}})),
            _mem(200, **q234(**{K["resolved_cache"]: rc1, K["stale_serve"]: {"known_stale": 31},
                               K["stale_withdrawn"]: {"unarmable": 9}}))]
-    rep, checks = load606.run8_report(_navs(), mem, [], PODS)
+    rep, checks = load606.run8_report(_navs(), mem, [], PODS, **DELIV)
     q2 = rep["q2_stale"]
     assert q2["resolved_cache"]["stale_served_share_of_hits"] == 0.05      # 500 / 10000
     assert q2["resolved_cache"]["stale_served_age_ms_max"] == 900           # max over samples
@@ -335,7 +335,7 @@ def test_q4_retry_deltas_and_the_viewer_gate_lead():
            _mem(110, **q234(**{K["retry_total"]: rt(2), K["retry_viewers"]: 0})),
            _mem(115, **q234(**{K["retry_total"]: rt(4), K["retry_viewers"]: 0,      # nobody
                               K["retry_abandoned"]: {"no_viewer": 5, "evicted": 1}}))]
-    rep, checks = load606.run8_report(_navs(), mem, [], PODS)
+    rep, checks = load606.run8_report(_navs(), mem, [], PODS, **DELIV)
     q4 = rep["q4_retry_740"]
     assert q4["retry_total_delta"]["genuine"]["demand"] == 3
     assert q4["retry_abandoned_delta"] == {"no_viewer": 3, "evicted": 1}
@@ -353,7 +353,7 @@ def test_a_restart_turns_the_new_q234_checks_into_restarted_fails():
     pods = [dict(PODS[0]), dict(PODS[1], restarts=1,
                                 last_state={"terminated": {"reason": "OOMKilled", "exitCode": 137,
                                                            "finishedAt": "2026-10-19T08:00:00Z"}})]
-    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234())], [], pods)
+    rep, checks = load606.run8_report(_navs(), [_mem(150, **q234())], [], pods, **DELIV)
     for name in ("run8.stale_push_unarmed_total", "run8.users_never_queue.queued",
                  "run8.740.parked_vs_overdue"):
         c = next(x for x in checks if x["check"] == name)

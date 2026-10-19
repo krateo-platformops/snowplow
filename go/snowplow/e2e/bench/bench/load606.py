@@ -1003,6 +1003,7 @@ def freshness_probe(client: HttpClient, token: str, path: str,
                     healthy: Callable[[], bool] | None = None,
                     pause_poll_s: float = 5.0, max_pause_s: float = 3600.0,
                     push_since: Callable[[float], float | None] | None = None,
+                    deadline: float | None = None,
                     clock: Callable[[], float] = time.time,
                     sleep: Callable[[float], None] = time.sleep) -> list[dict]:
     """Mutate → poll until the marker is visible. One record per sample.
@@ -1023,6 +1024,13 @@ def freshness_probe(client: HttpClient, token: str, path: str,
     healthy = healthy or (lambda: True)
     out = []
     for i in range(samples):
+        if deadline is not None and clock() >= deadline:
+            # The phase's wall-clock share is spent (slow mutates or polls):
+            # stop HERE, recorded, so the whole probe stays inside the bound
+            # run606's measure wait and the TTL budget are computed from.
+            sink({"kind": "fresh_truncated", "label": label, "done": i, "of": samples,
+                  "t": clock()})
+            break
         if not healthy():
             p0 = clock()
             while not healthy() and clock() - p0 < max_pause_s:
@@ -1978,29 +1986,61 @@ EXERCISE_DEPENDENT_CHECKS = ("run8.stale_to_push.p95", "run8.stale_to_push.max",
                              "run8.740.parked_vs_overdue")
 
 
-def _exercised_710_740(q2: dict, q4: dict, chk, checks: list[dict]) -> dict:
-    """Did the #710 stale-then-push and #740 viewer paths run at all? If not,
-    every dependent PASS becomes INCONCLUSIVE (a FAIL stays a FAIL)."""
-    viewers = (q4.get("retry_viewers") or {}).get("max")
+def client_delivery(fresh: list[dict] | None, push_refetches: list[dict] | None,
+                    viewer_stats: list[dict] | None) -> dict:
+    """What the CLIENTS observed of #710's push path (#764): streams opened,
+    `refresh` frames received, refetches they triggered, and armed probe
+    samples whose push arrived (push_ms set). Server counters are not used:
+    snowplow_stale_retry_viewers counts viewers on FAILING retry chains only,
+    so it reads 0 in a healthy run with 1000 armed tabs."""
+    vs = viewer_stats or []
+    pr = push_refetches or []
+    fr = [f for f in (fresh or []) if f.get("armed")]
+    return {"streams_opened": sum(int(v.get("streams_opened") or 0) for v in vs),
+            "frames": sum(int(v.get("frames") or 0) for v in vs),
+            "push_refetches": len(pr),
+            "probe_armed_samples": len(fr),
+            "probe_push_samples": sum(1 for f in fr if f.get("push_ms") is not None)}
+
+
+def _exercised_710_740(q2: dict, q4: dict, chk, checks: list[dict],
+                       delivery: dict) -> dict:
+    """Did the #710 stale-then-push path run END TO END? Exercised requires
+    BOTH a stale serve (snowplow's apistage_stale_serve_total) AND client-
+    observed delivery: viewers opened streams, `refresh` frames reached them
+    and triggered refetches, and the armed probe saw pushes. Anything less
+    turns every dependent PASS into INCONCLUSIVE (a FAIL stays a FAIL)."""
     serves = (q2.get("apistage_stale_serve_total") or {}).get("last")
-    ok = bool(viewers) or bool(serves)
-    out = {"viewers_max": viewers, "stale_serve_total_last": serves, "exercised": ok}
+    missing = []
+    if not serves:
+        missing.append("no stale serve (apistage_stale_serve_total 0)")
+    if not delivery["streams_opened"]:
+        missing.append("no client /refreshes stream")
+    if not (delivery["frames"] and delivery["push_refetches"]):
+        missing.append("no refresh frame reached a client (viewer_stats.frames / push_refetch)")
+    if not delivery["probe_push_samples"]:
+        missing.append("no armed probe sample received a push (push_ms)")
+    ok = not missing
+    out = {"stale_serve_total_last": serves, **delivery,
+           "server_retry_viewers_max": (q4.get("retry_viewers") or {}).get("max"),
+           "exercised": ok, "missing": missing}
     if not ok:
-        why = ("NOT EXERCISED (#764): no /refreshes viewer (stale_retry_viewers never > 0) "
-               "and no stale serve (apistage_stale_serve_total 0) — this PASS would mean "
-               "'never ran'")
+        why = ("NOT EXERCISED (#764): " + "; ".join(missing)
+               + " — this PASS would mean 'never ran'")
         for c in checks:
             if c["check"] in EXERCISE_DEPENDENT_CHECKS and c["result"] == "PASS":
                 c["result"] = "INCONCLUSIVE"
                 c["why"] = why + (f" ({c['why']})" if c.get("why") else "")
-    chk("run8.710_740_exercised", RUN8_KEYS["retry_viewers"], out, "a viewer and a stale serve",
-        "PASS" if ok else "INCONCLUSIVE",
-        None if ok else "no viewer and no stale serve during the run (#764)")
+    chk("run8.710_740_exercised", RUN8_KEYS["stale_serve"], out,
+        "a stale serve AND client-observed delivery",
+        "PASS" if ok else "INCONCLUSIVE", None if ok else "; ".join(missing))
     return out
 
 
 def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
-                pods: list[dict] | None) -> tuple[dict, list[dict]]:
+                pods: list[dict] | None, *, fresh: list[dict] | None = None,
+                push_refetches: list[dict] | None = None,
+                viewer_stats: list[dict] | None = None) -> tuple[dict, list[dict]]:
     """(report, checks). Checks: PASS / FAIL / INCONCLUSIVE."""
     checks: list[dict] = []
     builds = [m["extra"].get(RUN8_KEYS["build_info"]) for m in mem
@@ -2113,7 +2153,8 @@ def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
     q2 = _q2_stale(mem, chk)
     q3 = _q3_admission(mem, chk)
     q4 = _q4_retry(mem, chk, ov_vals)
-    exercised = _exercised_710_740(q2, q4, chk, checks)
+    exercised = _exercised_710_740(q2, q4, chk, checks,
+                                   client_delivery(fresh, push_refetches, viewer_stats))
     run9 = _run9_refresh(mem, chk)
 
     # ── background admission wait (and customer: users never queue) ──────
@@ -2223,7 +2264,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              run8: bool = False,
              expected_digest: str | None = None,
              image_digests: list[dict] | None = None,
-             push_refetches: list[dict] | None = None) -> dict:
+             push_refetches: list[dict] | None = None,
+             viewer_stats: list[dict] | None = None,
+             fresh_truncated: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -2321,6 +2364,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         "fresh_modes": modes,
         "fresh_push_report_only": push_report(fresh),
         "push_refetch_report_only": push_refetch_report(push_refetches or []),
+        "fresh_truncated": fresh_truncated or [],
         "nav_kinds": {k: sum(1 for n in navs if n.get("nav") == k)
                       for k in sorted({n.get("nav") for n in navs if n.get("nav")})},
         "login": login_report(login_curves or []),
@@ -2341,7 +2385,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["fresh_invalid_samples"] = len(fv)
 
     if run8:
-        r8, r8_checks = run8_report(navs, mem or [], tops or [], snowplow_pods)
+        r8, r8_checks = run8_report(navs, mem or [], tops or [], snowplow_pods,
+                                    fresh=fresh, push_refetches=push_refetches,
+                                    viewer_stats=viewer_stats)
         report["run8"] = r8
         checks.extend(r8_checks)
 
@@ -2991,9 +3037,22 @@ def _cmd_fresh(a) -> int:
     return 0
 
 
+FRESH_BUDGET_S = 30.0        # freshness_probe's per-sample convergence budget
+FRESH_PHASE_SLACK = 1.25     # phase share = samples x (budget + gap) x slack
+
+
+def fresh_phase_budget_s(samples: int, gap_s: float) -> float:
+    """A phase's wall-clock share: every sample at its full convergence
+    budget plus the gap, +25 % for mutate / last-poll overrun. A phase that
+    needs more is truncated (recorded) instead of overrunning the bounds the
+    measure wait and the TTL budget are computed from (reviewer-small (d))."""
+    return samples * (FRESH_BUDGET_S + gap_s) * FRESH_PHASE_SLACK
+
+
 def fresh_phases(client, token, sink, *, modes, rates, mutators, paths, targets, probe,
                  samples, poll_ms, gap_s, viewer, push_since=None, stream=None,
-                 probe_fn=None, churn_factory=None, arm=None, healthy=None):
+                 probe_fn=None, churn_factory=None, arm=None, healthy=None,
+                 clock: Callable[[], float] = time.time):
     """Every (mode, rate) phase in order: modes outer, rates inner. Labels are
     "list_dep@<rate>" (annotation, unchanged from run 8) and
     "list_dep_status@<rate>" (status). The probe and the churn of a phase use
@@ -3022,7 +3081,8 @@ def fresh_phases(client, token, sink, *, modes, rates, mutators, paths, targets,
                 lambda m, mut=mut: mut(probe[0], probe[1], m),
                 samples=samples, poll_ms=poll_ms, gap_s=gap_s,
                 label=label, sink=sink, healthy=healthy,
-                push_since=push_since)
+                push_since=push_since,
+                deadline=clock() + fresh_phase_budget_s(samples, gap_s))
             if churn:
                 sink({"kind": "churn", "label": label, **churn.stop()})
     if stream is not None:
@@ -3220,7 +3280,9 @@ def _cmd_evaluate(a) -> int:
                       mem=[r for r in recs if r.get("kind") in ("mem", "heap_profile")],
                       expected_digest=a.expect_digest,
                       image_digests=[r for r in recs if r.get("kind") == "image_digest"],
-                      push_refetches=[r for r in recs if r.get("kind") == "push_refetch"])
+                      push_refetches=[r for r in recs if r.get("kind") == "push_refetch"],
+                      viewer_stats=[r for r in recs if r.get("kind") == "viewer_stats"],
+                      fresh_truncated=[r for r in recs if r.get("kind") == "fresh_truncated"])
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
