@@ -168,7 +168,7 @@ func fill710Burst(store *cache.ResolvedCacheStore, lists, readers int, ctxFn fun
 //
 // 5 leaves ≈ 2.5 fills of margin above a correct gate and ≈ 4.7 below the
 // defect. If a Go or GC change closes that gap, the ungated precondition
-// (ungated ≥ bound + 2 × oneFillAlloc) goes RED rather than letting the arm
+// (ungated ≥ bound + 1 × oneFillAlloc) goes RED rather than letting the arm
 // pass vacuously.
 const fmemAllocateBlackFills = 5
 
@@ -299,12 +299,19 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 		t.Errorf("F-MEM RED: a gated run's live heap grew %d MiB (runs %v MiB), past the starting ceiling + one fill + %d × its allocations (%d MiB)",
 			gated>>20, runs, fmemAllocateBlackFills, bound>>20)
 	}
-	// Vacuity is loud: the defect class must clear the bound with margin, or
-	// the bound no longer separates a correct gate from no gate (#780).
-	if margin := bound + 2*oneFillAlloc; ungated < margin {
-		t.Fatalf("PRECONDITION: the ungated burst grew +%d MiB, under bound + 2 × one fill's allocations (%d MiB) — "+
+	// Vacuity is loud: the defect class must clear the bound by a full fill's
+	// allocations, or the bound no longer separates a correct gate from no gate
+	// (#780). +1×, not +2×: at +2× the precondition sat inside the ungated
+	// burst's own low tail (133 MiB against 126) and would flake itself
+	// (architect-623). The margin is logged on every run so drift shows before
+	// it bites.
+	need := bound + oneFillAlloc
+	t.Logf("#780 F-MEM precondition margin: ungated +%d MiB − (bound %d MiB + one fill's allocations %d MiB) = %+d MiB",
+		ungated>>20, bound>>20, oneFillAlloc>>20, (ungated-need)>>20)
+	if ungated < need {
+		t.Fatalf("PRECONDITION: the ungated burst grew +%d MiB, under bound + one fill's allocations (%d MiB) — "+
 			"the gap between a correct gate and no gate has closed, so the arm cannot discriminate; re-measure fmemAllocateBlackFills",
-			ungated>>20, margin>>20)
+			ungated>>20, need>>20)
 	}
 }
 
