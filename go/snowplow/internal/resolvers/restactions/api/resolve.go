@@ -429,6 +429,13 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 			// bearer token to a SA-marked stage). Returning
 			// an empty result for this stage and continuing.
 			r.dict[id] = map[string]any{"items": []any{}}
+			// #760 — that empty is a stage FAILURE (typically a transient
+			// token-file read), not "no resources": the sink bump every L1 Put
+			// gate declines on. A fixed class, never the acquire error's text.
+			// (No stage outcome: outcomes are recorded only for a
+			// caller-supplied resolve, whose UAF stage dials the caller's
+			// endpoint above and never reaches this branch.)
+			r.stageErrSink.Bump(id, uafSAEndpointUnavailableMsg)
 			return endpoints.Endpoint{}, false, false, stageContinue
 		}
 		// The UAF stage dials the SA endpoint → isSAEndpoint=true (provenance): the
