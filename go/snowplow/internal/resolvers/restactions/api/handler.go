@@ -64,6 +64,12 @@ type jsonHandlerOptions struct {
 	// and stageEnvelopeCheck checks what the stage receives.
 	k8sList bool
 	listGVR schema.GroupVersionResource
+	// stageFailed records a failure of this stage that is still SERVED (#651:
+	// a userAccessFilter whose resource set did not resolve keeps its
+	// fail-closed empty answer): the stage-error sink bump every L1 Put gate
+	// declines on, and the Error stage outcome. Set by the resolver for its
+	// own stage; nil-safe.
+	stageFailed func(msg string)
 }
 
 // stageEnvelopeCheck is the E6 behavioural chokepoint (#603 §1, #674): every
@@ -239,6 +245,11 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 		// With no stage filter the merge below writes tmp, so tmp must be what
 		// the refilter left — never the raw service-account response.
 		tmp = pig[opts.key]
+		// #651 — an unresolved resource set keeps that fail-closed empty
+		// answer, but it is a stage failure, not "no resources".
+		if rf.ResourcesUnresolved && opts.stageFailed != nil {
+			opts.stageFailed(uafResourcesUnresolvedMsg)
+		}
 	}
 
 	if opts.filter != nil {

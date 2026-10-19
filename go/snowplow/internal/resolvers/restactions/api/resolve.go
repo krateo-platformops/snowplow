@@ -782,6 +782,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// SubjectAccessReview) answers with an object, not a list envelope.
 		k8sList: ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet && listOK,
 		listGVR: listGVR,
+		// #651 — a served-but-failed stage (an unresolved userAccessFilter
+		// resource set) takes the same sink bump + Error outcome as every other
+		// stage failure (recordItemError), against THIS resolve's own stage:
+		// r.outcomes is nil for a nested stored resolve, so it never marks a
+		// caller's stage by name.
+		stageFailed: func(msg string) {
+			r.stageErrSink.Bump(id, msg)
+			r.outcomes.fail(id, StageReasonError)
+		},
 	}
 	inner := jsonHandler(gctx, hOpts)
 	innerBytesFn := jsonHandlerBytes(gctx, hOpts)
