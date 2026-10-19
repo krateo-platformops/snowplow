@@ -164,6 +164,7 @@ func newRBACNarrowServeWatcher(t *testing.T) *cache.ResourceWatcher {
 	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync (RBAC informers): %v", err)
 	}
+	waitOwnRBACPublish(t, rw)
 
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
@@ -283,6 +284,23 @@ func TestGet_RBACNarrowing_GroupGrant(t *testing.T) {
 		t.Skip("group-grant assertion is Tag-0.30.101 only")
 	}
 	resetServeCounters()
+	newGroupGrantWatcher(t)
+
+	// User "alice" is in group "devs".
+	res := Get(ctxWithUser("alice", "devs"), serveTestRef(authorizedNS, "obj-authorized"))
+	if res.Unstructured == nil {
+		t.Fatalf("group-grant GET: expected informer-served object; got nil (Err=%v)", res.Err)
+	}
+	if s := ObjectsGetStatsSnapshot(); s.InformerServed != 1 {
+		t.Fatalf("group-grant GET: InformerServed want 1; got %d", s.InformerServed)
+	}
+}
+
+// newGroupGrantWatcher builds TestGet_RBACNarrowing_GroupGrant's watcher: the
+// authorized object plus a RoleBinding that grants `get` to the GROUP "devs"
+// only, synced and installed as the global watcher.
+func newGroupGrantWatcher(t *testing.T) *cache.ResourceWatcher {
+	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	// #57: pivot implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 
@@ -321,15 +339,8 @@ func TestGet_RBACNarrowing_GroupGrant(t *testing.T) {
 	if err := rw.WaitForCacheSync(ctx2, 5*time.Second); err != nil {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
-
-	// User "alice" is in group "devs".
-	res := Get(ctxWithUser("alice", "devs"), serveTestRef(authorizedNS, "obj-authorized"))
-	if res.Unstructured == nil {
-		t.Fatalf("group-grant GET: expected informer-served object; got nil (Err=%v)", res.Err)
-	}
-	if s := ObjectsGetStatsSnapshot(); s.InformerServed != 1 {
-		t.Fatalf("group-grant GET: InformerServed want 1; got %d", s.InformerServed)
-	}
+	return rw
 }
