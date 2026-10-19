@@ -1531,14 +1531,14 @@ func registerUAFNullSkipInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
-	stages, err := m.Int64ObservableGauge("snowplow_uaf_resources_null_skipped_stages",
-		metric.WithDescription("Distinct RESTAction stages whose userAccessFilter resourcesFrom has skipped a null element since boot. Non-zero for long is a stage serving a deny-all; /debug/vars snowplow_uaf_resources_null_skipped_by_stage names it. #778."))
+	stages, err := m.Int64ObservableGauge("snowplow_uaf_resources_null_skipping_stages",
+		metric.WithDescription("RESTAction stages whose LATEST userAccessFilter resourcesFrom evaluation skipped a null element: each is serving a deny-all now. A stage whose input reconciles drops out; one that stays is likely a typo'd path. /debug/vars snowplow_uaf_resources_null_skipped_by_stage (skipping_now) names it. #778."))
 	if err != nil {
 		return err
 	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		o.ObserveInt64(total, int64(restactionsapi.UAFNullSkippedTotal()))
-		o.ObserveInt64(stages, int64(restactionsapi.UAFNullSkippedStages()))
+		o.ObserveInt64(stages, int64(restactionsapi.UAFNullSkippingStages()))
 		return nil
 	}, total, stages)
 	return err
