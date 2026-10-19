@@ -1,0 +1,35 @@
+# scale765 freshness probes (#765 scale harness).
+#
+# bench-fresh-listdep: byte for byte what the #606 bench applies, the output of
+# e2e/bench/bench/load606.py list_dep_fixture_yaml("bench-ns-01",
+# "composition.krateo.io", "v1-2-2", "githubscaffoldingwithcompositionpages")
+# @ ada083f2. The annotation-mode probe.
+#
+# bench-fresh-listdep-status: HARNESS-DEFINED (the bench never had a status
+# probe). The same namespaced LIST stage, projecting the Ready condition's
+# message instead of the annotation, for the status churn mode.
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: bench-fresh-listdep
+  namespace: bench-ns-01
+  labels:
+    app: scaletest
+spec:
+  api:
+  - name: comps
+    path: "/apis/composition.krateo.io/v1-2-2/namespaces/bench-ns-01/githubscaffoldingwithcompositionpages"
+    filter: '[.comps.items[] | {name: .metadata.name, marker: (.metadata.annotations["snowplow-bench/fresh-marker"] // "")}]'
+---
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: bench-fresh-listdep-status
+  namespace: bench-ns-01
+  labels:
+    app: scaletest
+spec:
+  api:
+  - name: comps
+    path: "/apis/composition.krateo.io/v1-2-2/namespaces/bench-ns-01/githubscaffoldingwithcompositionpages"
+    filter: '[.comps.items[] | {name: .metadata.name, marker: ([(.status.conditions // [])[] | select(.type == "Ready") | .message] | first // "")}]'

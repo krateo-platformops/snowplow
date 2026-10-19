@@ -1,0 +1,1241 @@
+# scale765 portal fixture (#765 scale harness): GENERATED, do not edit.
+# Source: krateo-platformops/portal @ cc7241fb2089568dfee8d83b79c1649f55587bdb (the
+# internal/cache/jqinterest/testdata/portal_corpus.json commit), rendered with
+#   helm template portal helm/portal --namespace krateo-system
+# (Chart version placeholder 0.0.0-dev603, default values; release namespace
+# krateo-system as on run 8, whose content_fill_by_ra keys are krateo-system/...).
+# Contents: the RESTActions dashboard-data and compositions-list, every widget
+# whose spec.apiRef names one of them (27), and the portal's devs RBAC
+# (templates/rbac.cyberjoker-rbac.yaml: the Roles/RoleBindings/ClusterRoles/
+# ClusterRoleBindings named devs-*; the cyberjoker Secret and User are omitted).
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: compositions-list
+  namespace: krateo-system
+spec:
+  api:
+  - continueOnError: true
+    errorKey: crdsError
+    filter: '[.crds.items[]? | select(.status.resource != null and .status.apiVersion != null) | {plural: .status.resource, version: (.status.apiVersion | split("/")[1])}] | unique'
+    name: crds
+    path: /apis/core.krateo.io/v1alpha1/compositiondefinitions
+    userAccessFilter:
+      group: core.krateo.io
+      namespaceFrom: .metadata.namespace
+      resource: compositiondefinitions
+      verb: list
+    verb: GET
+  - continueOnError: true
+    dependsOn:
+      iterator: .crds
+      name: crds
+    errorKey: allCompositionsError
+    filter: "[.allCompositions.items[]?\n | {uid: .metadata.uid, name: .metadata.name, ns: .metadata.namespace, ts: .metadata.creationTimestamp, kind: .kind, av: .apiVersion, conditions: (.status.conditions // []), wh: .status.workloadHealthy, whMsg: (.status.healthMessage // \"\"), platform: ((((.metadata.labels // {})[\"krateo.io/composition-name\"]) == \"installer\") or (((.metadata.labels // {})[\"krateo.io/composition-definition-name\"]) == \"installer\"))}]\n"
+    name: allCompositions
+    path: ${ "/apis/composition.krateo.io/" + (.version) + "/" + (.plural) }
+    userAccessFilter:
+      group: composition.krateo.io
+      namespaceFrom: .metadata.namespace
+      resourcesFrom: '[ (.crds // [])[] | .plural ]'
+      verb: list
+    verb: GET
+  filter: "(((.projects // \"\") | split(\",\") | map(select(. != \"\"))) as $projSel\n | ((.project // .namespace) // \"\") as $proj\n | if ($projSel | length) > 0 then $projSel elif $proj != \"\" then [$proj] else [] end) as $projects\n| (.status // \"all\") as $status | (.scope // \"workloads\") as $scope | ((.q // \"\") | ascii_downcase) as $q | now as $now | ((.allCompositions // []) | map(select(($projects | length) == 0 or (([.ns] - $projects) | length == 0))) | map(. + ((.conditions // []) as $c | (any($c[]?; .type == \"Ready\" and .status == \"True\")) as $ready | (any($c[]?; .type == \"Ready\" and .status == \"False\")) as $notready | (any($c[]?; .type == \"Synced\" and .status == \"False\")) as $unsynced | ($ready and (.wh == false)) as $degraded | {conditions: ((.conditions // []) + (if .wh == false then [{type: \"Workload\", status: \"False\", reason: \"Unhealthy\", message: (.whMsg // \"\")}] else [] end)), state: (if $notready then \"failed\" elif $degraded then \"degraded\" elif $ready then \"healthy\" else \"pending\" end), railState: (if $notready then \"failed\" elif $degraded then \"degraded\" elif $ready and ($unsynced | not) then \"healthy\" elif $ready and $unsynced then \"drift\" else \"pending\" end), healthPercent: (if $notready then 20 elif $degraded then 50 elif $ready and ($unsynced | not) then 100 elif $ready and $unsynced then 50 else 50 end)}))) as $all | $all as $dated | ($dated | map(select(if $scope == \"all\" then true elif $scope == \"platform\" then .platform else (.platform | not) end))) as $scoped | {\n    list: $all,\n    filtered: ($scoped | map(select((if $status == \"drift\" then (.railState == \"drift\") else ($status == \"all\" or .state == $status) end) and ($q == \"\" or ((.name // \"\") | ascii_downcase | contains($q)) or ((.kind // \"\") | ascii_downcase | contains($q)))))),\n    counts: {all: ($scoped | length), healthy: ($scoped | map(select(.state == \"healthy\")) | length), drift: ($scoped | map(select(.railState == \"drift\")) | length), pending: ($scoped | map(select(.state == \"pending\")) | length), degraded: ($scoped | map(select(.state == \"degraded\")) | length), failed: ($scoped | map(select(.state == \"failed\")) | length)},\n    scopeCounts: {workloads: ($dated | map(select(.platform | not)) | length), platform: ($dated | map(select(.platform)) | length), all: ($dated | length)},\n    scope: $scope,\n    status: $status,\n    q: ((.q // \"\") | tostring),\n    projects: ((.projects // \"\") | tostring)\n  }\n"
+---
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: dashboard-data
+  namespace: krateo-system
+spec:
+  api:
+  - continueOnError: true
+    errorKey: crdsError
+    filter: '[.crds.items[] | select(.spec.group == "composition.krateo.io") | {plural: .status.acceptedNames.plural, version: ((([.spec.versions[] | select(.served and .storage)])[0]) // (([.spec.versions[] | select(.served)])[0])).name}]'
+    name: crds
+    path: /apis/apiextensions.k8s.io/v1/customresourcedefinitions
+    verb: GET
+  - continueOnError: true
+    dependsOn:
+      iterator: .crds
+      name: crds
+    errorKey: allCompositionsError
+    filter: "[.allCompositions.items[]?\n | {uid: .metadata.uid, name: .metadata.name, ns: .metadata.namespace, ts: .metadata.creationTimestamp, kind: .kind, av: .apiVersion, conditions: (.status.conditions // [])}]\n"
+    name: allCompositions
+    path: ${ "/apis/composition.krateo.io/" + (.version) + "/" + (.plural) }
+    userAccessFilter:
+      group: composition.krateo.io
+      namespaceFrom: .metadata.namespace
+      resourcesFrom: '[ (.crds // [])[] | .plural ]'
+      verb: list
+    verb: GET
+  filter: "((.range) // \"24h\") as $range | (if $range == \"24h\" then 86400 elif $range == \"7d\" then 604800 elif $range == \"30d\" then 2592000 else 0 end) as $window | (now - $window) as $cutoff | {\n    range: $range,\n    list: [ (.allCompositions // [])[] | select($window == 0 or (((.ts // \"\") | (fromdateiso8601? // 0)) >= $cutoff)) ]\n  }\n"
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Card
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: obs-by-kind-card
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - status
+  resourcesRefs:
+    items:
+    - apiVersion: widgets.templates.krateo.io/v1beta1
+      id: obs-by-kind-list
+      name: obs-by-kind-list
+      namespace: krateo-system
+      resource: listies
+      verb: GET
+  widgetData:
+    extra: ''
+    items:
+    - resourceRefId: obs-by-kind-list
+    title: Compositions by kind
+    titleVariant: eyebrow
+    variant: outlined
+  widgetDataTemplate:
+  - expression: ${ (([ (.list // [])[].kind ] | unique | length) | tostring) + " kinds" }
+    forPath: extra
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Card
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: obs-by-namespace-card
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - status
+  resourcesRefs:
+    items:
+    - apiVersion: widgets.templates.krateo.io/v1beta1
+      id: obs-by-namespace-list
+      name: obs-by-namespace-list
+      namespace: krateo-system
+      resource: listies
+      verb: GET
+  widgetData:
+    extra: ''
+    items:
+    - resourceRefId: obs-by-namespace-list
+    title: Compositions by project
+    titleVariant: eyebrow
+    variant: outlined
+  widgetDataTemplate:
+  - expression: ${ (([ (.list // [])[].ns ] | unique | length) | tostring) + " projects" }
+    forPath: extra
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Card
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: status-card
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items:
+    - apiVersion: widgets.templates.krateo.io/v1beta1
+      id: dashboard-conditions
+      name: dashboard-conditions
+      namespace: krateo-system
+      resource: listies
+      verb: GET
+  widgetData:
+    extra: ''
+    items:
+    - resourceRefId: dashboard-conditions
+    title: Condition coverage
+    titleVariant: eyebrow
+    variant: outlined
+  widgetDataTemplate:
+  - expression: ${ ((.list // []) | length | tostring) + " total" }
+    forPath: extra
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Card
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: throughput-card
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: dashboard-data
+    namespace: krateo-system
+  keyExtras:
+  - range
+  resourcesRefs:
+    items:
+    - apiVersion: widgets.templates.krateo.io/v1beta1
+      id: throughput-chart
+      name: throughput-chart
+      namespace: krateo-system
+      resource: linecharts
+      verb: GET
+  widgetData:
+    extra: "per day \xB7 last 14 days"
+    items:
+    - resourceRefId: throughput-chart
+    live: false
+    title: Compositions created
+    titleVariant: eyebrow
+    variant: outlined
+  widgetDataTemplate:
+  - expression: "${ (.range // \"24h\") as $x | (if $x==\"24h\" then \"per hour \xB7 last 24 hours\" elif $x==\"7d\" then \"per day \xB7 last 7 days\" elif $x==\"30d\" then \"per day \xB7 last 30 days\" else \"per day \xB7 all time\" end) }"
+    forPath: extra
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: LineChart
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: throughput-chart
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: dashboard-data
+    namespace: krateo-system
+  keyExtras:
+  - range
+  resourcesRefs:
+    items: []
+  widgetData:
+    area: true
+    axis:
+      x:
+        tickCount: 6
+      y:
+        tickCount: 4
+    colorField: series
+    colorMap:
+      Created: cyan
+    data: []
+    height: 150
+    legend: false
+    point: true
+    scale:
+      y:
+        domainMin: 0
+        nice: true
+        tickCount: 4
+        zero: true
+    shapeField: smooth
+    watch: []
+    xField: t
+    xTimeUnit: hour
+    yField: v
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: '${ . as $r | ($r.range // "all") as $range | (if $range=="24h" then {n:24,step:3600} elif $range=="7d" then {n:8,step:86400} elif $range=="30d" then {n:31,step:86400} else {n:15,step:86400} end) as $cfg | (now|floor) as $now | ($now - ($now % $cfg.step)) as $end | (reduce ($r.list[]?) as $it ({}; (($it.ts // "") | (fromdateiso8601? // null)) as $e | if ($e|type) != "number" then . else ($e - ($e % $cfg.step)) as $b | .[($b|tostring)] = ((.[($b|tostring)] // 0) + 1) end)) as $counts | [ range(0; $cfg.n) | ($end - (. * $cfg.step)) as $b | { t: $b, series: "Created", v: ($counts[($b|tostring)] // 0) } ] | reverse }'
+    forPath: data
+  - expression: ${ if (.range // "all")=="24h" then "hour" else "day" end }
+    forPath: xTimeUnit
+  - expression: '${ . as $r | ($r.range // "all") as $range | (if $range=="24h" then {n:24,step:3600} elif $range=="7d" then {n:8,step:86400} elif $range=="30d" then {n:31,step:86400} else {n:15,step:86400} end) as $cfg | (now|floor) as $now | ($now - ($now % $cfg.step)) as $end | (reduce ($r.list[]?) as $it ({}; (($it.ts // "") | (fromdateiso8601? // null)) as $e | if ($e|type) != "number" then . else ($e - ($e % $cfg.step)) as $b | .[($b|tostring)] = ((.[($b|tostring)] // 0) + 1) end)) as $counts | ([ range(0; $cfg.n) | ($end - (. * $cfg.step)) as $b | { t: $b, v: ($counts[($b|tostring)] // 0) } ] | reverse) as $d | ($d | max_by(.v)) as $peak | [ {type:"point", data:[{t:$peak.t, v:$peak.v}], encode:{x:"t", y:"v"}, scale:{color:{type:"identity"}}, style:{fill:"#F2A33C", stroke:"#070C12", lineWidth:2, r:6}, size:9, tooltip:false} ] }'
+    forPath: annotations
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Listy
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: compositions-scope-chips
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - from
+  - projects
+  - q
+  - range
+  - scope
+  - status
+  - to
+  - namespace
+  resourcesRefs:
+    items: []
+  widgetData:
+    dataSource: []
+    itemTemplate:
+      navigateTo: '{route}'
+      primaryText: '{label}'
+      rowVariant: chip
+  widgetDataTemplate:
+  - expression: '${ ((.scope // "workloads") | tostring) as $sel | (.scopeCounts // {}) as $counts | ((.status // "") | tostring) as $status | ((.q // "") | tostring) as $q | ((.projects // "") | tostring) as $projects | ((if $status != "" then ("&status=" + ($status | @uri)) else "" end) + (if $q != "" then ("&q=" + ($q | @uri)) else "" end) + (if $projects != "" then ("&projects=" + ($projects | @uri)) else "" end)) as $carry | [{key: "workloads", label: "My workloads"}, {key: "platform", label: "Platform"}, {key: "all", label: "Everything"}] | map({label: .label, count: ($counts[.key] // 0), active: (.key == $sel), route: ("/compositions?scope=" + .key + $carry)}) }'
+    forPath: dataSource
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Listy
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: compositions-status-chips
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - from
+  - projects
+  - q
+  - range
+  - scope
+  - status
+  - to
+  - namespace
+  resourcesRefs:
+    items: []
+  widgetData:
+    dataSource: []
+    itemTemplate:
+      navigateTo: '{route}'
+      primaryText: '{label}'
+      rowVariant: chip
+  widgetDataTemplate:
+  - expression: '${ ((.status // "all") | tostring) as $sel | (.counts // {}) as $counts | ((.q // "") | tostring) as $q | ((.projects // "") | tostring) as $projects | ((.scope // "") | tostring) as $scope | ((if $q != "" then ("&q=" + ($q | @uri)) else "" end) + (if $projects != "" then ("&projects=" + ($projects | @uri)) else "" end) + (if $scope != "" then ("&scope=" + ($scope | @uri)) else "" end)) as $carry | [{key: "all", label: "All"}, {key: "healthy", label: "Healthy"}, {key: "drift", label: "Drift"}, {key: "pending", label: "Pending"}, {key: "degraded", label: "Degraded"}, {key: "failed", label: "Failed"}] | map({label: .label, count: ($counts[.key] // 0), active: (.key == $sel), route: ("/compositions?status=" + .key + $carry)}) }'
+    forPath: dataSource
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Listy
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: dashboard-conditions
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    dataSource: []
+    itemTemplate:
+      bar:
+        color:
+          value: cyan
+        label: '{label}'
+        percent: '{percent}'
+        variant: line
+      navigateTo: '{route}'
+      primaryText: '{type}'
+  widgetDataTemplate:
+  - expression: '${ (.list // []) as $l | ([ $l[].conditions[]?.type ] | unique) as $types | [ $types[] | . as $t | ([ $l[] | select(any(.conditions[]?; .type == $t and .status == "True")) ] | length) as $tc | ([ $l[] | select(any(.conditions[]?; .type == $t)) ] | length) as $n | { type: $t, percent: (if $n > 0 then ($tc * 100 / $n | floor) else 0 end), label: (($tc | tostring) + "/" + ($n | tostring)), route: (if $t == "Ready" then "/compositions?status=failed" else "" end) } ] }'
+    forPath: dataSource
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Listy
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: obs-by-kind-list
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    dataSource: []
+    itemLayout: horizontal
+    itemTemplate:
+      bar:
+        color:
+          value: cyan
+        label: '{count}'
+        percent: '{percent}'
+        variant: line
+      navigateTo: '{route}'
+      primaryText: '{kind}'
+    split: false
+  widgetDataTemplate:
+  - expression: "${ (.list // []) | group_by(.kind) | map({ kind: (.[0].kind // \"\u2014\"), n: length }) | (([ .[].n ] | max) // 0) as $mx | sort_by(-.n) | .[0:10] | map({ kind: .kind, count: (.n | tostring), percent: (if $mx > 0 then (.n * 100 / $mx | floor) else 0 end), route: (if .kind == \"\u2014\" then \"\" else (\"/compositions?q=\" + .kind) end) }) }"
+    forPath: dataSource
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Listy
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: obs-by-namespace-list
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    dataSource: []
+    itemLayout: horizontal
+    itemTemplate:
+      bar:
+        color:
+          value: violet
+        label: '{count}'
+        percent: '{percent}'
+        variant: line
+      navigateTo: /compositions/{ns}
+      primaryText: '{ns}'
+    split: false
+  widgetDataTemplate:
+  - expression: "${ (.list // []) | group_by(.ns) | map({ ns: (.[0].ns // \"\u2014\"), n: length }) | (([ .[].n ] | max) // 0) as $mx | sort_by(-.n) | .[0:10] | map({ ns: .ns, count: (.n | tostring), percent: (if $mx > 0 then (.n * 100 / $mx | floor) else 0 end) }) }"
+    forPath: dataSource
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Listy
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: onboarding-empty
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  resourcesRefs:
+    items: []
+  widgetData:
+    bordered: true
+    dataSource: []
+    grid:
+      column: 4
+      gutter: 16
+      lg: 4
+      md: 2
+      sm: 2
+      xs: 1
+    header: "Welcome to Krateo \u2014 what do you want to build?"
+    hideWhenEmpty: true
+    itemTemplate:
+      cardCta: Start
+      color:
+        default: cyan
+        value: '{color}'
+      description: '{description}'
+      icon: '{icon}'
+      iconVariant: tile
+      navigateTo: '{navigateTo}'
+      primaryText: '{name}'
+      rowVariant: card
+  widgetDataTemplate:
+  - expression: "${ if ((.list | type) == \"array\") and ((.list | length) == 0) then\n     [\n       { name: \"Help me choose\", icon: \"fa-wand-magic-sparkles\", color: \"orange\",\n         description: \"Not sure where to start? Ask Autopilot to guide you.\",\n         navigateTo: (\"/marketplace?ask=\" + (\"Show me around and help me choose a blueprint to deploy.\" | @uri)) },\n       { name: \"Databases\", icon: \"fa-database\", color: \"cyan\",\n         description: \"Provision managed databases and data stores.\",\n         navigateTo: (\"/marketplace?q=database&ask=\" + (\"I want to set up a database \u2014 which blueprint fits?\" | @uri)) },\n       { name: \"Networking\", icon: \"fa-network-wired\", color: \"cyan\",\n         description: \"Set up networks, load balancers and connectivity.\",\n         navigateTo: (\"/marketplace?q=network&ask=\" + (\"I want to configure networking \u2014 what are my options?\" | @uri)) },\n       { name: \"Observability\", icon: \"fa-chart-line\", color: \"cyan\",\n         description: \"Add metrics, logs and dashboards to your estate.\",\n         navigateTo: (\"/marketplace?q=observability&ask=\" + (\"I want to add observability \u2014 which blueprint should I use?\" | @uri)) }\n     ]\n   else [] end }"
+    forPath: dataSource
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Listy
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: rail-list
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    dataSource: []
+    itemLayout: horizontal
+    itemTemplate:
+      bar:
+        color:
+          map:
+            degraded: orange
+            drift: violet
+            failed: red
+            healthy: green
+            pending: orange
+          value: '{railState}'
+        label: '{healthPercent}%'
+        percent: '{healthPercent}'
+        variant: rail
+      navigateTo: /compositions/{ns}/{name}
+      primaryText: '{name}'
+      subPrimaryText: '{ns}'
+    split: false
+  widgetDataTemplate:
+  - expression: ${ (.list // []) | sort_by(if .railState == "healthy" then 1 else 0 end) | .[0:12] }
+    forPath: dataSource
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: PageHeader
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: dashboard-page-header
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: dashboard-data
+    namespace: krateo-system
+  keyExtras:
+  - range
+  resourcesRefs:
+    items:
+    - apiVersion: widgets.templates.krateo.io/v1beta1
+      id: new-composition
+      name: new-composition
+      namespace: krateo-system
+      resource: buttons
+      verb: GET
+  widgetData:
+    allowedResources:
+    - buttons
+    items:
+    - resourceRefId: new-composition
+    subtitle: Here's what's happening across your platform
+    title: Good {localTimeOfDay}, {displayName}
+  widgetDataTemplate:
+  - expression: ${ "Here's what's happening across your platform" + ({"24h":" in the last 24 hours","7d":" this week","30d":" this month","all":""}[.range // "all"]) }
+    forPath: subtitle
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Paragraph
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: delta-cap-compositions
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: dashboard-data
+    namespace: krateo-system
+  keyExtras:
+  - range
+  resourcesRefs:
+    items: []
+  widgetData:
+    text: past 7d
+    type: secondary
+  widgetDataTemplate:
+  - expression: ${ {"24h":"past 24h","7d":"past 7d","30d":"past 30d","all":"all time"}[.range // "all"] }
+    forPath: text
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Statistic
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: obs-stat-kinds
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    title: Composition kinds
+    value: 0
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ [ (.list // [])[].kind ] | unique | length }
+    forPath: value
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Statistic
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: obs-stat-pending
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    title: Pending
+    value: 0
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ ([.list[]|select((.conditions//[])|(any(.type=="Ready" and (.status=="True" or .status=="False"))|not))]|length) }
+    forPath: value
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Statistic
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: obs-stat-projects
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    title: Active projects
+    value: 0
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ [ (.list // [])[].ns ] | unique | length }
+    forPath: value
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Statistic
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: obs-stat-total
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    title: Total compositions
+    value: 0
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ .list | length }
+    forPath: value
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Statistic
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: stat-compositions
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    title: Compositions
+    value: 0
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ .list | length }
+    forPath: value
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Statistic
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: stat-failed
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    title: Failed
+    value: 0
+    valueStyle:
+      color: var(--error-color)
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ [.list[] | select(.state == "failed")] | length }
+    forPath: value
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Statistic
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: stat-healthy
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    title: Healthy
+    value: 0
+    valueStyle:
+      color: var(--green-color)
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ [.list[] | select(.state == "healthy")] | length }
+    forPath: value
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Statistic
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: stat-reconciles
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    title: Pending
+    value: 0
+    valueStyle:
+      color: var(--warning-color)
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ [.list[] | select(.state == "pending")] | length }
+    forPath: value
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Table
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: compositions-table
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  - namespace
+  resourcesRefs:
+    items: []
+  widgetData:
+    allowedResources: []
+    bordered: false
+    columns:
+    - title: Name
+      valueKey: name
+    - title: Type
+      valueKey: kind
+    - title: Namespace
+      valueKey: ns
+    - title: Status
+      valueKey: status
+    - title: Reconcile
+      valueKey: reconcile
+    - title: Created
+      valueKey: age
+    dataSource: []
+    fitContent: true
+    rowNavigateTo: /compositions/{ns}/{name}
+    size: small
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ (if .slice then (.filtered[.slice.offset : (.slice.offset + .slice.perPage)]) else .filtered end) as $rows | [ $rows[] | [ {valueKey:"name",kind:"jsonSchemaType",type:"string",stringValue:.name}, {valueKey:"kind",kind:"jsonSchemaType",type:"string",stringValue:.kind}, {valueKey:"ns",kind:"jsonSchemaType",type:"string",stringValue:.ns}, {valueKey:"status",kind:"conditions",stringValue:(((.conditions // []) | sort_by([(if .type=="Ready" then 0 elif .type=="Synced" then 1 else 2 end), .type]) | map({type:(if .status=="True" then .type elif .status=="False" then (if .type=="Workload" then "Unhealthy" else ("Not" + .type) end) else (.type + "Unknown") end), status:.status, color:(if .status=="True" then "green" elif .status=="False" then "red" else "gray" end)})) | tojson)}, {valueKey:"reconcile",kind:"tag",stringValue:( .railState | if .=="healthy" then "Converged" elif .=="failed" then "Failed" elif .=="drift" then "Drift" elif .=="degraded" then "Degraded" else "Pending" end),color:( .railState | if .=="healthy" then "green" elif .=="failed" then "red" elif .=="drift" then "violet" elif .=="degraded" then "orange" else "orange" end )}, {valueKey:"age",kind:"jsonSchemaType",type:"string",stringValue:.ts,format:"relative"} ] ] }'
+    forPath: dataSource
+  - expression: '${ { total: (.filtered | length), pageSize: (.slice.perPage // 50), current: (.slice.page // 1) } }'
+    forPath: pagination
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Tag
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: delta-tag-compositions
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: dashboard-data
+    namespace: krateo-system
+  keyExtras:
+  - range
+  resourcesRefs:
+    items: []
+  widgetData:
+    color: gray
+    label: 0 total
+    style:
+      fontSize: 13px
+      fontWeight: 700
+      lineHeight: 18px
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ ((.list | length) | tostring) + (if (.range // "all") == "all" then " total" else " new" end) }
+    forPath: label
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Tag
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: delta-tag-failed
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    color: red
+    label: 0%
+    style:
+      fontSize: 13px
+      fontWeight: 700
+      lineHeight: 18px
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ (if (.list|length)>0 then ((([.list[]|select(.state == "failed")]|length)*100/(.list|length))|floor) else 0 end | tostring) + "%" }
+    forPath: label
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Tag
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: delta-tag-healthy
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    color: green
+    label: 0%
+    style:
+      fontSize: 13px
+      fontWeight: 700
+      lineHeight: 18px
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ (if (.list|length)>0 then ((([.list[]|select(.state == "healthy")]|length)*100/(.list|length))|floor) else 0 end | tostring) + "%" }
+    forPath: label
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Tag
+metadata:
+  annotations:
+    krateo.io/verbose: 'true'
+  name: delta-tag-reconciles
+  namespace: krateo-system
+spec:
+  apiRef:
+    name: compositions-list
+    namespace: krateo-system
+  keyExtras:
+  - projects
+  - q
+  - scope
+  - status
+  resourcesRefs:
+    items: []
+  widgetData:
+    color: orange
+    label: 0%
+    style:
+      fontSize: 13px
+      fontWeight: 700
+      lineHeight: 18px
+    watch: []
+  widgetDataTemplate:
+  - expression: '${ [ .list[] | { apiVersion: .av, kind: .kind } ] | unique }'
+    forPath: watch
+  - expression: ${ (if (.list|length)>0 then ((([.list[]|select((.conditions//[])|(any(.type=="Ready" and (.status=="True" or .status=="False"))|not))]|length)*100/(.list|length))|floor) else 0 end | tostring) + "%" }
+    forPath: label
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: devs-get-list-any-customresourcedefinition-in-cluster
+rules:
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: devs-list-any-namespace-in-cluster
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - namespaces
+  verbs:
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: devs-get-list-any-customresourcedefinition-in-cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: devs-get-list-any-customresourcedefinition-in-cluster
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: devs-list-any-namespace-in-cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: devs-list-any-namespace-in-cluster
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-create-get-list-any-composition-in-demo-namespace
+  namespace: demo-system
+rules:
+- apiGroups:
+  - composition.krateo.io
+  resources:
+  - '*'
+  verbs:
+  - create
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-get-any-configmap-in-demo-namespace
+  namespace: demo-system
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - configmaps
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-get-list-any-compositiondefinitions-in-demo-namespace
+  namespace: demo-system
+rules:
+- apiGroups:
+  - core.krateo.io
+  resources:
+  - compositiondefinitions
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-get-list-any-restaction-in-demo-namespace
+  namespace: demo-system
+rules:
+- apiGroups:
+  - templates.krateo.io
+  resources:
+  - restactions
+  verbs:
+  - list
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-get-list-any-widget-in-demo-namespace
+  namespace: demo-system
+rules:
+- apiGroups:
+  - widgets.templates.krateo.io
+  resources:
+  - '*'
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-patch-any-composition-in-demo-namespace
+  namespace: demo-system
+rules:
+- apiGroups:
+  - composition.krateo.io
+  resources:
+  - '*'
+  verbs:
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-get-any-restaction-in-krateo-namespace
+  namespace: krateo-system
+rules:
+- apiGroups:
+  - templates.krateo.io
+  resources:
+  - restactions
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-get-list-any-template-in-krateo-namespace
+  namespace: krateo-system
+rules:
+- apiGroups:
+  - widgets.templates.krateo.io
+  resources:
+  - '*'
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-create-get-list-any-composition-in-demo-namespace
+  namespace: demo-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devs-create-get-list-any-composition-in-demo-namespace
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-get-any-configmap-in-demo-namespace
+  namespace: demo-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devs-get-any-configmap-in-demo-namespace
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-get-list-any-compositiondefinitions-in-demo-namespace
+  namespace: demo-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devs-get-list-any-compositiondefinitions-in-demo-namespace
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-get-list-any-restaction-in-demo-namespace
+  namespace: demo-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devs-get-list-any-restaction-in-demo-namespace
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-get-list-any-widget-in-demo-namespace
+  namespace: demo-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devs-get-list-any-widget-in-demo-namespace
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-patch-any-composition-in-demo-namespace
+  namespace: demo-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devs-patch-any-composition-in-demo-namespace
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-get-any-restaction-in-krateo-namespace
+  namespace: krateo-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devs-get-any-restaction-in-krateo-namespace
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-get-list-any-template-in-krateo-namespace
+  namespace: krateo-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devs-get-list-any-template-in-krateo-namespace
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: devs

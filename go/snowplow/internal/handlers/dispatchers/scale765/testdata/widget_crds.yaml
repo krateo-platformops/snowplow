@@ -1,0 +1,2981 @@
+# scale765 widget CRDs (#765 scale harness): copied verbatim, do not edit.
+# Source: krateo frontend helm/frontend-crds/templates/<Kind>.crd.yaml, one per widget kind
+# the portal fixture uses. sha256 of each source file:
+#   Card.crd.yaml 50057c634c9da5210dbbbd5485bbe27b608593796ed9e36b41e3cda3121851fd
+#   LineChart.crd.yaml c53b90601cdf154072bc33ac20c65a223f635b01bb3325039f9b551de4a22a3e
+#   Listy.crd.yaml e56cfd9356620a6b996c5fd25848e4805d1f410bd6464c0d786c661a8fa6170f
+#   PageHeader.crd.yaml 326f924700082d656d4afc1cdcad4510201806cb9b3a0f82c282280594c91a9c
+#   Paragraph.crd.yaml 95bab69595f22861b06b0fba1394af5fb67721190cef8b9cea74ba7d25daa4fb
+#   Statistic.crd.yaml 80121a9693d7bb17ddcbbc322ab9ed8da9bd5a5586925c9cb270aff167ae5729
+#   Table.crd.yaml c28cd6e222b0811d711f47c1783558e71268e0f4bb4f35b3512a02b43ac15281
+#   Tag.crd.yaml ee656b636c141b540681a1a546d9550d3f868114b5cfd5be7d24be8baaaf1982
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: cards.widgets.templates.krateo.io
+spec:
+  group: widgets.templates.krateo.io
+  names:
+    categories:
+      - widgets
+      - krateo
+    kind: Card
+    listKind: CardList
+    plural: cards
+    singular: card
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+      name: v1beta1
+      schema:
+        openAPIV3Schema:
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              properties:
+                apiRef:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
+                resourcesRefs:
+                  properties:
+                    items:
+                      items:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          slice:
+                            properties:
+                              continue:
+                                type: boolean
+                              offset:
+                                format: int32
+                                type: integer
+                              page:
+                                format: int32
+                                type: integer
+                              perPage:
+                                format: int32
+                                type: integer
+                            required:
+                              - page
+                              - perPage
+                            type: object
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        required:
+                          - id
+                        type: object
+                      type: array
+                    slice:
+                      properties:
+                        continue:
+                          type: boolean
+                        offset:
+                          format: int32
+                          type: integer
+                        page:
+                          format: int32
+                          type: integer
+                        perPage:
+                          format: int32
+                          type: integer
+                      required:
+                        - page
+                        - perPage
+                      type: object
+                  required:
+                    - items
+                  type: object
+                resourcesRefsTemplate:
+                  items:
+                    properties:
+                      iterator:
+                        type: string
+                      template:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        type: object
+                    type: object
+                  type: array
+                widgetData:
+                  description: The properties Card renders. Where Card wraps an antd component these are antd's own prop names, so antd's documentation for that component describes them.
+                  properties:
+                    allowedResources:
+                      description: the resource plurals this container may hold as children. Typed loosely on purpose — the per-widget enums drifted and enforced nothing; containment is checked by the chart lint (design rule X5) against the real widget registry.
+                      items:
+                        type: string
+                      type: array
+                    anchorId:
+                      description: renders this panel with a DOM id so an in-page `[text](#anchorId)` link (e.g. a summary/table-of-contents Markdown widget) scrolls to it
+                      type: string
+                    clickActionId:
+                      description: the id of the action to be executed when the panel is clicked
+                      type: string
+                    cover:
+                      description: resourceRefId of a widget rendered as the antd Card cover
+                      type: string
+                    extra:
+                      description: antd Card extra — content shown top-right of the card header (renamed from `headerRight`)
+                      type: string
+                    extraRefId:
+                      description: resourceRefId of a widget (e.g. a Button) rendered top-right of the card header — a real, independently-actioned slot with its own icon/size/navigation, distinct from the plain-text `extra`. Mirrors the `cover`/`footer` widget slots; renders a nested WidgetRenderer, so it does NOT make the whole card the click target the way `extra` + `clickActionId` does.
+                      type: string
+                    extraStatus:
+                      description: 'colour token: antd Badge status for `extraVariant: badge`; antd Tag color for `extraVariant: tag`'
+                      enum:
+                        - success
+                        - processing
+                        - warning
+                        - error
+                        - default
+                        - green
+                        - gold
+                        - red
+                        - blue
+                        - violet
+                      type: string
+                    extraVariant:
+                      description: 'how `extra` renders top-right: `text` (default, plain), `badge` (glow dot + uppercase mono, for CONVERGED/DRIFT/DEGRADED), or `tag` (soft antd Tag pill — for Up to date / status labels)'
+                      enum:
+                        - text
+                        - badge
+                        - tag
+                      type: string
+                    footer:
+                      description: footer section of the panel containing additional items
+                      items:
+                        properties:
+                          resourceRefId:
+                            description: the identifier of the k8s custom resource that should be represented, usually a widget
+                            type: string
+                        required:
+                          - resourceRefId
+                        type: object
+                      type: array
+                    headerLeft:
+                      description: optional text to be displayed under the title, on the left side of the Card
+                      type: string
+                    icon:
+                      description: icon displayed in the panel header
+                      properties:
+                        color:
+                          description: color of the icon
+                          type: string
+                        name:
+                          description: 'name of the icon to display (font awesome icon name eg: `fa-inbox`)'
+                          type: string
+                      required:
+                        - name
+                      type: object
+                    items:
+                      description: list of resource references to display as main content in the panel
+                      items:
+                        properties:
+                          resourceRefId:
+                            description: the identifier of the k8s custom resource that should be represented, usually a widget
+                            type: string
+                        required:
+                          - resourceRefId
+                        type: object
+                      type: array
+                    legend:
+                      description: 'optional legend key shown top-right of the card header (e.g. the reconciliation-rail actual/drift/target swatches): each item is a small colour swatch + label'
+                      items:
+                        properties:
+                          color:
+                            description: swatch colour (palette name, e.g. cyan / magenta / amber)
+                            type: string
+                          label:
+                            description: swatch label (e.g. actual / drift / target)
+                            type: string
+                        required:
+                          - color
+                          - label
+                        type: object
+                      type: array
+                    live:
+                      description: show a pulsing "Live" badge next to the card title (for cards backed by a live/SSE feed)
+                      type: boolean
+                    size:
+                      description: antd Card size
+                      enum:
+                        - default
+                        - small
+                      type: string
+                    tags:
+                      description: list of string tags to be displayed in the footer
+                      items:
+                        type: string
+                      type: array
+                    title:
+                      description: text to be displayed as the panel title
+                      type: string
+                    titleVariant:
+                      description: how the panel title is rendered. 'heading' (default) = readable card heading (marketplace tiles, detail headers). 'eyebrow' = small mono uppercase letter-spaced muted caption (flight-deck section/panel labels).
+                      enum:
+                        - heading
+                        - eyebrow
+                      type: string
+                    tooltip:
+                      description: optional tooltip text shown on the top right side of the card to provide additional context
+                      type: string
+                    variant:
+                      description: antd Card variant
+                      enum:
+                        - outlined
+                        - borderless
+                      type: string
+                    watch:
+                      description: 'live-refresh watch: involvedObject(s) this widget is tied to (see src/schemas/watch.schema.json). A matching k8s event refetches the widget.'
+                      items:
+                        properties:
+                          apiVersion:
+                            description: group/version, e.g. composition.krateo.io/v1alpha1
+                            type: string
+                          kind:
+                            description: e.g. DemoClaim
+                            type: string
+                          name:
+                            description: a specific object; omit to match any object of this kind ("GVR-level")
+                            type: string
+                          namespace:
+                            description: scope to a namespace; omit to match any
+                            type: string
+                        required:
+                          - apiVersion
+                          - kind
+                        type: object
+                      type: array
+                    widgetActions:
+                      description: the Krateo event actions of the widget (renamed from `actions`, which collides with antd Card.actions)
+                      properties:
+                        navigate:
+                          description: client-side navigation actions
+                          items:
+                            properties:
+                              id:
+                                description: unique identifier for the action
+                                type: string
+                              loading:
+                                description: Whether this action shows an in-flight indicator while it runs.
+                                properties:
+                                  display:
+                                    description: Show the in-flight indicator. Set false to run the action without one.
+                                    type: boolean
+                                required:
+                                  - display
+                                type: object
+                              path:
+                                description: the identifier of the route to navigate to
+                                type: string
+                              requireConfirmation:
+                                description: whether user confirmation is required before navigating
+                                type: boolean
+                              resourceRefId:
+                                description: the identifier of the k8s custom resource that should be represented
+                                type: string
+                              type:
+                                description: type of navigation action
+                                enum:
+                                  - navigate
+                                type: string
+                            required:
+                              - id
+                              - type
+                            type: object
+                          type: array
+                        openDrawer:
+                          description: actions to open side drawer components
+                          items:
+                            properties:
+                              id:
+                                description: unique identifier for the drawer action
+                                type: string
+                              loading:
+                                description: Whether this action shows an in-flight indicator while it runs.
+                                properties:
+                                  display:
+                                    description: Show the in-flight indicator. Set false to run the action without one.
+                                    type: boolean
+                                required:
+                                  - display
+                                type: object
+                              requireConfirmation:
+                                description: whether user confirmation is required before opening
+                                type: boolean
+                              resourceRefId:
+                                description: the identifier of the k8s custom resource that should be represented
+                                type: string
+                              size:
+                                description: drawer size to be displayed
+                                enum:
+                                  - default
+                                  - large
+                                type: string
+                              title:
+                                description: title shown in the drawer header
+                                type: string
+                              type:
+                                description: type of drawer action
+                                enum:
+                                  - openDrawer
+                                type: string
+                            required:
+                              - id
+                              - resourceRefId
+                              - type
+                            type: object
+                          type: array
+                        openModal:
+                          description: actions to open modal dialog components
+                          items:
+                            properties:
+                              customWidth:
+                                description: the custom width of the value, which should be used by setting the 'custom' value inside the 'size' property
+                                type: string
+                              id:
+                                description: unique identifier for the modal action
+                                type: string
+                              loading:
+                                description: Whether this action shows an in-flight indicator while it runs.
+                                properties:
+                                  display:
+                                    description: Show the in-flight indicator. Set false to run the action without one.
+                                    type: boolean
+                                required:
+                                  - display
+                                type: object
+                              requireConfirmation:
+                                description: whether user confirmation is required before opening
+                                type: boolean
+                              resourceRefId:
+                                description: the identifier of the k8s custom resource that should be represented
+                                type: string
+                              size:
+                                description: sets the Modal size, 'default' is 520px, 'large' is 80% of the screen width, 'fullscreen' is 100% of the screen width, 'custom' should be used with the 'customWidth' property
+                                enum:
+                                  - default
+                                  - large
+                                  - fullscreen
+                                  - custom
+                                type: string
+                              title:
+                                description: title shown in the modal header
+                                type: string
+                              type:
+                                description: type of modal action
+                                enum:
+                                  - openModal
+                                type: string
+                            required:
+                              - id
+                              - resourceRefId
+                              - type
+                            type: object
+                          type: array
+                        rest:
+                          description: rest api call actions triggered by the widget
+                          items:
+                            properties:
+                              errorMessage:
+                                description: a message that will be displayed inside a toast in case of error
+                                type: string
+                              fanOutPath:
+                                description: 'name of an ARRAY field in the submitted values: the action fans out into ONE ordered write per element (for each write, that field is replaced by the single element before payload/payloadToOverride interpolation). The whole set is gated behind ONE aggregated blast-radius confirm and dispatched sequentially with stop-on-first-error and per-item results (W0-4 applySet semantics); onEventNavigateTo is not supported on a fan-out action'
+                                type: string
+                              headers:
+                                description: 'array of headers as strings, format ''key: value'''
+                                items:
+                                  type: string
+                                type: array
+                              id:
+                                description: unique identifier for the action
+                                type: string
+                              loading:
+                                description: Whether this action shows an in-flight indicator while it runs.
+                                properties:
+                                  display:
+                                    description: Show the in-flight indicator. Set false to run the action without one.
+                                    type: boolean
+                                required:
+                                  - display
+                                type: object
+                              onEventNavigateTo:
+                                description: conditional navigation triggered by a specific event
+                                properties:
+                                  eventReason:
+                                    description: identifier of the awaited event reason
+                                    type: string
+                                  loadingMessage:
+                                    description: message to display while waiting for the event
+                                    type: string
+                                  reloadRoutes:
+                                    description: Re-fetch the route table before navigating. Set it when the action creates its own destination — publishing a new page, for example — so the route exists by the time the navigation happens.
+                                    type: boolean
+                                  timeout:
+                                    default: 50
+                                    description: the timeout in seconds to wait for the event
+                                    format: int32
+                                    type: integer
+                                  url:
+                                    description: url to navigate to when the event is received
+                                    type: string
+                                required:
+                                  - eventReason
+                                  - url
+                                type: object
+                              onSuccessNavigateTo:
+                                description: url to navigate to after successful execution
+                                type: string
+                              ops:
+                                description: 'ordered list of DISTINCT writes applied as ONE gated set (e.g. one Form submit creating a Role AND its RoleBinding): each op resolves its OWN resourceRefId (verb + path + payload base) and builds its OWN payload/payloadToOverride against the SAME submitted values. The whole set is gated behind ONE aggregated blast-radius confirm and dispatched sequentially with stop-on-first-error and per-item results (W0-4 applySet semantics). Mutually exclusive with fanOutPath; onEventNavigateTo is not supported on a multi-op action. The action''s own top-level payload/payloadToOverride are IGNORED when ops is present and its top-level resourceRefId is ignored for dispatch (it must still name a valid resource ref — point it at the first op''s)'
+                                items:
+                                  properties:
+                                    payload:
+                                      description: static payload sent with this op's request
+                                      type: object
+                                      x-kubernetes-preserve-unknown-fields: true
+                                    payloadToOverride:
+                                      description: list of this op's payload fields to override dynamically (values interpolate against the same submitted values as every other op)
+                                      items:
+                                        properties:
+                                          name:
+                                            description: name of the field to override
+                                            type: string
+                                          value:
+                                            description: value to use for overriding the field
+                                            type: string
+                                        required:
+                                          - name
+                                          - value
+                                        type: object
+                                      type: array
+                                    resourceRefId:
+                                      description: 'the identifier of the resource ref this op targets: its verb (must be mutating), path and payload base'
+                                      type: string
+                                  required:
+                                    - resourceRefId
+                                  type: object
+                                type: array
+                              payload:
+                                description: static payload sent with the request
+                                type: object
+                                x-kubernetes-preserve-unknown-fields: true
+                              payloadToOverride:
+                                description: list of payload fields to override dynamically
+                                items:
+                                  properties:
+                                    name:
+                                      description: name of the field to override
+                                      type: string
+                                    value:
+                                      description: value to use for overriding the field
+                                      type: string
+                                  required:
+                                    - name
+                                    - value
+                                  type: object
+                                type: array
+                              requireConfirmation:
+                                description: whether user confirmation is required before triggering the action
+                                type: boolean
+                              resourceRefId:
+                                description: the identifier of the k8s custom resource that should be represented
+                                type: string
+                              successMessage:
+                                description: a message that will be displayed inside a toast in case of success
+                                type: string
+                              type:
+                                description: type of action to execute
+                                enum:
+                                  - rest
+                                type: string
+                            required:
+                              - headers
+                              - id
+                              - resourceRefId
+                              - type
+                            type: object
+                          type: array
+                      type: object
+                  required:
+                    - items
+                  type: object
+                widgetDataTemplate:
+                  items:
+                    properties:
+                      expression:
+                        type: string
+                      forPath:
+                        type: string
+                    type: object
+                  type: array
+                identityContext:
+                  items:
+                    enum:
+                      - username
+                      - groups
+                    type: string
+                  type: array
+                keyExtras:
+                  description: 'F6 (snowplow#130): the request-extras keys (route params / URL query folded into ?extras=) whose values this widget''s resolution depends on. Only declared keys partition the widget cache cell. Absent/empty = the widget does not vary by any request extra (chrome/layout default).'
+                  items:
+                    type: string
+                  type: array
+                freshness:
+                  description: 'Opt-in staleness indicator: when true the widget shows the stale/refreshing dot overlay (exception states only). Absent/false = no badge ever (the default; healthy widgets stay unmarked).'
+                  type: boolean
+              required:
+                - resourcesRefs
+                - widgetData
+              type: object
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: linecharts.widgets.templates.krateo.io
+spec:
+  group: widgets.templates.krateo.io
+  names:
+    categories:
+      - widgets
+      - krateo
+    kind: LineChart
+    listKind: LineChartList
+    plural: linecharts
+    singular: linechart
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+      name: v1beta1
+      schema:
+        openAPIV3Schema:
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              properties:
+                apiRef:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
+                resourcesRefs:
+                  properties:
+                    items:
+                      items:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          slice:
+                            properties:
+                              continue:
+                                type: boolean
+                              offset:
+                                format: int32
+                                type: integer
+                              page:
+                                format: int32
+                                type: integer
+                              perPage:
+                                format: int32
+                                type: integer
+                            required:
+                              - page
+                              - perPage
+                            type: object
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        required:
+                          - id
+                        type: object
+                      type: array
+                    slice:
+                      properties:
+                        continue:
+                          type: boolean
+                        offset:
+                          format: int32
+                          type: integer
+                        page:
+                          format: int32
+                          type: integer
+                        perPage:
+                          format: int32
+                          type: integer
+                      required:
+                        - page
+                        - perPage
+                      type: object
+                  required:
+                    - items
+                  type: object
+                resourcesRefsTemplate:
+                  items:
+                    properties:
+                      iterator:
+                        type: string
+                      template:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        type: object
+                    type: object
+                  type: array
+                widgetData:
+                  description: '@ant-design/charts Line config (AntV G2)'
+                  properties:
+                    annotations:
+                      description: G2 annotation marks passed through (e.g. a peak `point` marker + a dashed `lineX` "now" line); usually computed server-side via a widgetDataTemplate
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      type: array
+                    area:
+                      description: render a gradient area fill under the line (G2 `area`); defaults to false
+                      type: boolean
+                    axis:
+                      description: G2 per-channel axis config (G2 `axis`), e.g. {"x":{"tickCount":6},"y":{"tickCount":4}}
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    colorField:
+                      description: field mapped to color / series (G2 `colorField`)
+                      type: string
+                    colorMap:
+                      description: map each colorField category to a Krateo palette colour name (e.g. {"Created":"cyan"}); sets the G2 color scale domain/range so the line + points render in the brand colour, not G2's default blue palette
+                      type: object
+                      additionalProperties:
+                        type: string
+                    data:
+                      description: chart data records (G2 `data`)
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      type: array
+                    height:
+                      description: fixed height in px (G2 `height`); omit to autofit
+                      format: int32
+                      type: integer
+                    legend:
+                      description: show the legend; false hides it (G2 `legend`)
+                      type: boolean
+                    point:
+                      description: render a default circle marker at each data point (G2 composed `point` mark). Improves legibility of sparse series.
+                      type: boolean
+                    scale:
+                      description: G2 per-channel scale config (G2 `scale`), e.g. {"y":{"zero":true,"nice":true,"domainMin":0,"domainMax":3,"tickCount":4}}. domainMax is a floor — data larger than it still wins, so dense data is never clipped.
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    shapeField:
+                      description: line shape, e.g. 'smooth' or 'line' (G2 `shapeField`)
+                      type: string
+                    stack:
+                      description: stack the series (G2 `stack`)
+                      type: boolean
+                    title:
+                      description: chart title (G2 `title`)
+                      type: string
+                    watch:
+                      description: 'live-refresh watch: involvedObject(s) this widget is tied to (see src/schemas/watch.schema.json). A matching k8s event refetches the widget.'
+                      items:
+                        properties:
+                          apiVersion:
+                            description: group/version, e.g. composition.krateo.io/v1alpha1
+                            type: string
+                          kind:
+                            description: e.g. DemoClaim
+                            type: string
+                          name:
+                            description: a specific object; omit to match any object of this kind ("GVR-level")
+                            type: string
+                          namespace:
+                            description: scope to a namespace; omit to match any
+                            type: string
+                        required:
+                          - apiVersion
+                          - kind
+                        type: object
+                      type: array
+                    xField:
+                      description: field mapped to the x position (G2 `xField`)
+                      type: string
+                    xTimeUnit:
+                      description: 'When set, `xField` values are treated as UNIX epoch SECONDS and formatted to a label in the BROWSER''s local timezone at render: ''hour'' -> ''HH:00'', ''day'' -> ''Mon D''. Use this instead of server-side strftime so a 21:00-Rome bucket reads 21:00 (not the server''s UTC 19:00). Annotations sharing `xField` are localized identically so peak/now marks stay aligned.'
+                      enum:
+                        - hour
+                        - day
+                      type: string
+                    yField:
+                      description: field mapped to the y position (G2 `yField`)
+                      type: string
+                  required:
+                    - data
+                    - xField
+                    - yField
+                  type: object
+                widgetDataTemplate:
+                  items:
+                    properties:
+                      expression:
+                        type: string
+                      forPath:
+                        type: string
+                    type: object
+                  type: array
+                identityContext:
+                  items:
+                    enum:
+                      - username
+                      - groups
+                    type: string
+                  type: array
+                keyExtras:
+                  description: 'F6 (snowplow#130): the request-extras keys (route params / URL query folded into ?extras=) whose values this widget''s resolution depends on. Only declared keys partition the widget cache cell. Absent/empty = the widget does not vary by any request extra (chrome/layout default).'
+                  items:
+                    type: string
+                  type: array
+                freshness:
+                  description: 'Opt-in staleness indicator: when true the widget shows the stale/refreshing dot overlay (exception states only). Absent/false = no badge ever (the default; healthy widgets stay unmarked).'
+                  type: boolean
+              required:
+                - widgetData
+              type: object
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: listies.widgets.templates.krateo.io
+spec:
+  group: widgets.templates.krateo.io
+  names:
+    categories:
+      - widgets
+      - krateo
+    kind: Listy
+    listKind: ListyList
+    plural: listies
+    singular: listy
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+      name: v1beta1
+      schema:
+        openAPIV3Schema:
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              properties:
+                apiRef:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
+                resourcesRefs:
+                  properties:
+                    items:
+                      items:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          slice:
+                            properties:
+                              continue:
+                                type: boolean
+                              offset:
+                                format: int32
+                                type: integer
+                              page:
+                                format: int32
+                                type: integer
+                              perPage:
+                                format: int32
+                                type: integer
+                            required:
+                              - page
+                              - perPage
+                            type: object
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        required:
+                          - id
+                        type: object
+                      type: array
+                    slice:
+                      properties:
+                        continue:
+                          type: boolean
+                        offset:
+                          format: int32
+                          type: integer
+                        page:
+                          format: int32
+                          type: integer
+                        perPage:
+                          format: int32
+                          type: integer
+                      required:
+                        - page
+                        - perPage
+                      type: object
+                  required:
+                    - items
+                  type: object
+                resourcesRefsTemplate:
+                  items:
+                    properties:
+                      iterator:
+                        type: string
+                      template:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        type: object
+                    type: object
+                  type: array
+                widgetData:
+                  description: The properties List renders. Where List wraps an antd component these are antd's own prop names, so antd's documentation for that component describes them.
+                  properties:
+                    actions:
+                      description: the actions of the widget (canonical map; see src/schemas/actions.schema.json). Referenced per-row by itemTemplate.rowActions.
+                      properties:
+                        navigate:
+                          description: client-side navigation actions
+                          items:
+                            properties:
+                              id:
+                                description: unique identifier for the action
+                                type: string
+                              loading:
+                                description: Whether this action shows an in-flight indicator while it runs.
+                                properties:
+                                  display:
+                                    description: Show the in-flight indicator. Set false to run the action without one.
+                                    type: boolean
+                                required:
+                                  - display
+                                type: object
+                              path:
+                                description: the identifier of the route to navigate to
+                                type: string
+                              requireConfirmation:
+                                description: whether user confirmation is required before navigating
+                                type: boolean
+                              resourceRefId:
+                                description: the identifier of the k8s custom resource that should be represented
+                                type: string
+                              type:
+                                description: type of navigation action
+                                enum:
+                                  - navigate
+                                type: string
+                            required:
+                              - id
+                              - type
+                            type: object
+                          type: array
+                        openDrawer:
+                          description: actions to open side drawer components
+                          items:
+                            properties:
+                              id:
+                                description: unique identifier for the drawer action
+                                type: string
+                              loading:
+                                description: Whether this action shows an in-flight indicator while it runs.
+                                properties:
+                                  display:
+                                    description: Show the in-flight indicator. Set false to run the action without one.
+                                    type: boolean
+                                required:
+                                  - display
+                                type: object
+                              requireConfirmation:
+                                description: whether user confirmation is required before opening
+                                type: boolean
+                              resourceRefId:
+                                description: the identifier of the k8s custom resource that should be represented
+                                type: string
+                              size:
+                                description: drawer size to be displayed
+                                enum:
+                                  - default
+                                  - large
+                                type: string
+                              title:
+                                description: title shown in the drawer header
+                                type: string
+                              type:
+                                description: type of drawer action
+                                enum:
+                                  - openDrawer
+                                type: string
+                            required:
+                              - id
+                              - resourceRefId
+                              - type
+                            type: object
+                          type: array
+                        openModal:
+                          description: actions to open modal dialog components
+                          items:
+                            properties:
+                              customWidth:
+                                description: the custom width of the value, which should be used by setting the 'custom' value inside the 'size' property
+                                type: string
+                              id:
+                                description: unique identifier for the modal action
+                                type: string
+                              loading:
+                                description: Whether this action shows an in-flight indicator while it runs.
+                                properties:
+                                  display:
+                                    description: Show the in-flight indicator. Set false to run the action without one.
+                                    type: boolean
+                                required:
+                                  - display
+                                type: object
+                              requireConfirmation:
+                                description: whether user confirmation is required before opening
+                                type: boolean
+                              resourceRefId:
+                                description: the identifier of the k8s custom resource that should be represented
+                                type: string
+                              size:
+                                description: sets the Modal size, 'default' is 520px, 'large' is 80% of the screen width, 'fullscreen' is 100% of the screen width, 'custom' should be used with the 'customWidth' property
+                                enum:
+                                  - default
+                                  - large
+                                  - fullscreen
+                                  - custom
+                                type: string
+                              title:
+                                description: title shown in the modal header
+                                type: string
+                              type:
+                                description: type of modal action
+                                enum:
+                                  - openModal
+                                type: string
+                            required:
+                              - id
+                              - resourceRefId
+                              - type
+                            type: object
+                          type: array
+                        rest:
+                          description: rest api call actions triggered by the widget
+                          items:
+                            properties:
+                              errorMessage:
+                                description: a message that will be displayed inside a toast in case of error
+                                type: string
+                              fanOutPath:
+                                description: 'name of an ARRAY field in the submitted values: the action fans out into ONE ordered write per element (for each write, that field is replaced by the single element before payload/payloadToOverride interpolation). The whole set is gated behind ONE aggregated blast-radius confirm and dispatched sequentially with stop-on-first-error and per-item results (W0-4 applySet semantics); onEventNavigateTo is not supported on a fan-out action'
+                                type: string
+                              headers:
+                                description: 'array of headers as strings, format ''key: value'''
+                                items:
+                                  type: string
+                                type: array
+                              id:
+                                description: unique identifier for the action
+                                type: string
+                              loading:
+                                description: Whether this action shows an in-flight indicator while it runs.
+                                properties:
+                                  display:
+                                    description: Show the in-flight indicator. Set false to run the action without one.
+                                    type: boolean
+                                required:
+                                  - display
+                                type: object
+                              onEventNavigateTo:
+                                description: conditional navigation triggered by a specific event
+                                properties:
+                                  eventReason:
+                                    description: identifier of the awaited event reason
+                                    type: string
+                                  loadingMessage:
+                                    description: message to display while waiting for the event
+                                    type: string
+                                  reloadRoutes:
+                                    description: Re-fetch the route table before navigating. Set it when the action creates its own destination — publishing a new page, for example — so the route exists by the time the navigation happens.
+                                    type: boolean
+                                  timeout:
+                                    default: 50
+                                    description: the timeout in seconds to wait for the event
+                                    format: int32
+                                    type: integer
+                                  url:
+                                    description: url to navigate to when the event is received
+                                    type: string
+                                required:
+                                  - eventReason
+                                  - url
+                                type: object
+                              onSuccessNavigateTo:
+                                description: url to navigate to after successful execution
+                                type: string
+                              ops:
+                                description: 'ordered list of DISTINCT writes applied as ONE gated set (e.g. one Form submit creating a Role AND its RoleBinding): each op resolves its OWN resourceRefId (verb + path + payload base) and builds its OWN payload/payloadToOverride against the SAME submitted values. The whole set is gated behind ONE aggregated blast-radius confirm and dispatched sequentially with stop-on-first-error and per-item results (W0-4 applySet semantics). Mutually exclusive with fanOutPath; onEventNavigateTo is not supported on a multi-op action. The action''s own top-level payload/payloadToOverride are IGNORED when ops is present and its top-level resourceRefId is ignored for dispatch (it must still name a valid resource ref — point it at the first op''s)'
+                                items:
+                                  properties:
+                                    payload:
+                                      description: static payload sent with this op's request
+                                      type: object
+                                      x-kubernetes-preserve-unknown-fields: true
+                                    payloadToOverride:
+                                      description: list of this op's payload fields to override dynamically (values interpolate against the same submitted values as every other op)
+                                      items:
+                                        properties:
+                                          name:
+                                            description: name of the field to override
+                                            type: string
+                                          value:
+                                            description: value to use for overriding the field
+                                            type: string
+                                        required:
+                                          - name
+                                          - value
+                                        type: object
+                                      type: array
+                                    resourceRefId:
+                                      description: 'the identifier of the resource ref this op targets: its verb (must be mutating), path and payload base'
+                                      type: string
+                                  required:
+                                    - resourceRefId
+                                  type: object
+                                type: array
+                              payload:
+                                description: static payload sent with the request
+                                type: object
+                                x-kubernetes-preserve-unknown-fields: true
+                              payloadToOverride:
+                                description: list of payload fields to override dynamically
+                                items:
+                                  properties:
+                                    name:
+                                      description: name of the field to override
+                                      type: string
+                                    value:
+                                      description: value to use for overriding the field
+                                      type: string
+                                  required:
+                                    - name
+                                    - value
+                                  type: object
+                                type: array
+                              requireConfirmation:
+                                description: whether user confirmation is required before triggering the action
+                                type: boolean
+                              resourceRefId:
+                                description: the identifier of the k8s custom resource that should be represented
+                                type: string
+                              successMessage:
+                                description: a message that will be displayed inside a toast in case of success
+                                type: string
+                              type:
+                                description: type of action to execute
+                                enum:
+                                  - rest
+                                type: string
+                            required:
+                              - headers
+                              - id
+                              - resourceRefId
+                              - type
+                            type: object
+                          type: array
+                      type: object
+                    bordered:
+                      description: antd List bordered
+                      type: boolean
+                    dataSource:
+                      description: antd List dataSource. Each element is a data object (rendered via itemTemplate) or { resourceRefId } (rendered as a child widget).
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      type: array
+                    footer:
+                      description: antd List footer (ReactNode in antd; string here)
+                      type: string
+                    grid:
+                      description: antd List grid layout (ListGridType); presence enables grid mode
+                      properties:
+                        column:
+                          description: Number of columns at the default breakpoint. Mirrors antd List `grid.column`.
+                          format: int32
+                          type: integer
+                        gutter:
+                          description: Spacing between grid columns, in pixels. Mirrors antd List `grid.gutter`.
+                          format: int32
+                          type: integer
+                        lg:
+                          description: Number of columns at the large breakpoint. Mirrors antd List `grid.lg`.
+                          format: int32
+                          type: integer
+                        md:
+                          description: Number of columns at the medium breakpoint. Mirrors antd List `grid.md`.
+                          format: int32
+                          type: integer
+                        sm:
+                          description: Number of columns at the small breakpoint. Mirrors antd List `grid.sm`.
+                          format: int32
+                          type: integer
+                        xl:
+                          description: Number of columns at the extra-large breakpoint. Mirrors antd List `grid.xl`.
+                          format: int32
+                          type: integer
+                        xs:
+                          description: Number of columns at the extra-small breakpoint. Mirrors antd List `grid.xs`.
+                          format: int32
+                          type: integer
+                        xxl:
+                          description: Number of columns at the extra-extra-large breakpoint. Mirrors antd List `grid.xxl`.
+                          format: int32
+                          type: integer
+                      type: object
+                    header:
+                      description: antd List header (ReactNode in antd; string here)
+                      type: string
+                    hideWhenEmpty:
+                      description: 'When there are no items, render nothing (null) instead of the antd Empty ''No data'' placeholder. Enables a server-driven conditional section: the RA emits items only when a condition holds (e.g. compositions count == 0), so the section appears/disappears with the data without any client-side logic.'
+                      type: boolean
+                    itemLayout:
+                      description: antd List itemLayout
+                      enum:
+                        - horizontal
+                        - vertical
+                      type: string
+                    itemTemplate:
+                      description: 'serializable substitute for antd renderItem: maps a data element''s fields to row slots ({dot.path}; {a|b} first-non-empty)'
+                      properties:
+                        bar:
+                          description: 'per-row horizontal Progress bar (the reconciliation-rail row): an antd Progress line whose percent + stroke colour are resolved per item'
+                          properties:
+                            color:
+                              description: Resolves the bar's stroke colour per item.
+                              properties:
+                                default:
+                                  description: Stroke colour used when the resolved value is absent from the map.
+                                  type: string
+                                map:
+                                  description: Maps a resolved value to a stroke colour token.
+                                  type: object
+                                  additionalProperties:
+                                    type: string
+                                value:
+                                  description: '{dot.path} to the value the stroke colour is chosen from.'
+                                  type: string
+                              type: object
+                            label:
+                              description: optional trailing {dot.path} label (e.g. the % text or 7/7)
+                              type: string
+                            percent:
+                              description: '{dot.path} to a 0-100 number (e.g. {healthPercent})'
+                              type: string
+                            variant:
+                              description: 'Bar style: `line` for a standalone progress line, `rail` for the denser reconciliation-rail treatment.'
+                              enum:
+                                - line
+                                - rail
+                              type: string
+                          type: object
+                        cardCta:
+                          description: card-footer call-to-action cue (e.g. "Configure") shown footer-left when a card rowVariant is clickable (navigateTo); rendered as mono amber text + a sliding arrow (a navigation hint, not a button)
+                          type: string
+                        color:
+                          description: Resolves the row's accent colour per item, so colour carries meaning from the data rather than being fixed by the author.
+                          properties:
+                            default:
+                              description: Colour used when the resolved value is absent from the map.
+                              type: string
+                            map:
+                              description: Maps a resolved value to a colour token, for example `Ready` to green.
+                              type: object
+                              additionalProperties:
+                                type: string
+                            value:
+                              description: '{dot.path} to the value the colour is chosen from.'
+                              type: string
+                          type: object
+                        description:
+                          description: longer body line (2-line clamp); only rendered by the card rowVariant (e.g. a catalog tile description)
+                          type: string
+                        formats:
+                          description: Per-field rendering applied after each {dot.path} resolves.
+                          properties:
+                            primaryText:
+                              description: 'How the resolved value is rendered: `text` verbatim, `datetime` as an absolute timestamp, `relative` as a time-ago.'
+                              enum:
+                                - text
+                                - datetime
+                                - relative
+                              type: string
+                            secondaryText:
+                              description: 'How the resolved value is rendered: `text` verbatim, `datetime` as an absolute timestamp, `relative` as a time-ago.'
+                              enum:
+                                - text
+                                - datetime
+                                - relative
+                              type: string
+                            subPrimaryText:
+                              description: 'How the resolved value is rendered: `text` verbatim, `datetime` as an absolute timestamp, `relative` as a time-ago.'
+                              enum:
+                                - text
+                                - datetime
+                                - relative
+                              type: string
+                            subSecondaryText:
+                              description: 'How the resolved value is rendered: `text` verbatim, `datetime` as an absolute timestamp, `relative` as a time-ago.'
+                              enum:
+                                - text
+                                - datetime
+                                - relative
+                              type: string
+                          type: object
+                        icon:
+                          description: '{dot.path} to an icon name, or a literal name, shown at the row leading edge.'
+                          type: string
+                        iconVariant:
+                          description: 'leading-indicator style: avatar (solid disc + glyph, default), tile (soft-tint rounded square + glyph), dot (small status dot + halo)'
+                          enum:
+                            - avatar
+                            - tile
+                            - dot
+                          type: string
+                        navigateTo:
+                          description: per-item navigation target ({dot.path} template, e.g. {link}); when it resolves non-empty the row becomes clickable and navigates there (SPA route)
+                          type: string
+                        primaryText:
+                          description: '{dot.path} to the row''s main label.'
+                          type: string
+                        rowActions:
+                          description: per-row action controls rendered on each row as a kebab (⋯) menu or as buttons (see rowActionsDisplay); each entry references an action id from widgetData.actions and is fired with the row's data as the action payload (customPayload). Distinct from navigateTo (whole-row click).
+                          items:
+                            properties:
+                              actionId:
+                                description: id of an action defined in widgetData.actions to fire when this menu item is clicked
+                                type: string
+                              danger:
+                                description: render the menu item in a destructive (red) style
+                                type: boolean
+                              icon:
+                                description: optional Font Awesome icon name for the menu item
+                                type: string
+                              label:
+                                description: menu item label
+                                type: string
+                            required:
+                              - actionId
+                              - label
+                            type: object
+                          type: array
+                        rowActionsDisplay:
+                          description: 'how the default rowVariant presents rowActions: menu (a kebab (⋯) at the row''s end, default) | buttons (antd Buttons at the row''s end, in declared order: the first primary, the rest default, a danger entry as danger). The whole-row click (navigateTo) is unchanged either way. The card rowVariant always renders buttons.'
+                          enum:
+                            - menu
+                            - buttons
+                          type: string
+                        rowVariant:
+                          description: 'row layout: default (antd List.Item.Meta — avatar + stacked title/description) | tree (tight single-line mono Relations row: connector + status dot + primaryText + muted inline subPrimaryText + right-aligned colored secondaryText) | card (full antd Card tile — icon-tile + name + version badge (subPrimaryText) + category tag (secondaryText) + description + a footer of rowActions as visible buttons — the Marketplace catalog grid) | chip (compact navigable filter pill — primaryText label + optional count, solid/amber when the item''s active flag is set — the data-driven Marketplace facet chips)'
+                          enum:
+                            - default
+                            - tree
+                            - card
+                            - chip
+                          type: string
+                        secondaryText:
+                          description: '{dot.path} to the value shown opposite the primary text.'
+                          type: string
+                        secondaryTextAsTag:
+                          description: render secondaryText as a soft-tint Tag pill (e.g. a category) instead of plain text
+                          type: boolean
+                        status:
+                          description: an at-a-glance status indicator (a Font Awesome glyph) rendered top-right of the `card` rowVariant. Each field is a {dot.path} resolved per item; the raw-value -> glyph/colour mapping is computed server-side (jq in the RESTAction), so the widget stays strongly typed. E.g. a blueprint's CompositionDefinition Ready condition resolved to {readyIcon}/{readyColor}/{readyReason}.
+                          properties:
+                            color:
+                              description: '{dot.path} to the resolved palette colour (e.g. {readyColor})'
+                              type: string
+                            icon:
+                              description: '{dot.path} to the resolved Font Awesome icon name (e.g. {readyIcon})'
+                              type: string
+                            tooltip:
+                              description: '{dot.path} tooltip text shown on hover (e.g. {readyReason})'
+                              type: string
+                          type: object
+                        subPrimaryText:
+                          description: '{dot.path} to the line beneath the primary text.'
+                          type: string
+                        subPrimaryTextMono:
+                          description: render subPrimaryText as a small mono bordered pill (e.g. an event involvedObject Kind/name ref) instead of plain sub-text
+                          type: boolean
+                        subSecondaryText:
+                          description: '{dot.path} to the line beneath the secondary text.'
+                          type: string
+                      type: object
+                    loading:
+                      description: antd List loading
+                      type: boolean
+                    maxItems:
+                      description: max items kept when streaming (Krateo extension, default 200)
+                      format: int32
+                      type: integer
+                    pagination:
+                      description: 'antd List pagination (serializable subset); presence enables client-side paging of the delivered dataSource (e.g. the ~400-card Marketplace grid). Server-side facet/search filters (?extras) shrink the array BEFORE it reaches the widget, so paging composes with them: antd clamps the current page into the filtered range, and a single-page result hides the pager entirely (exception-only chrome). Absent = antd default (no pagination).'
+                      properties:
+                        pageSize:
+                          description: antd pagination.pageSize — items per page
+                          format: int32
+                          type: integer
+                        position:
+                          description: antd List pagination.position (default bottom)
+                          enum:
+                            - top
+                            - bottom
+                            - both
+                          type: string
+                      required:
+                        - pageSize
+                      type: object
+                    prefix:
+                      description: Filters prefix (Krateo extension)
+                      type: string
+                    size:
+                      description: antd List size
+                      enum:
+                        - default
+                        - large
+                        - small
+                      type: string
+                    split:
+                      description: antd List split
+                      type: boolean
+                    sseEndpoint:
+                      description: optional SSE endpoint to stream items from (Krateo extension)
+                      type: string
+                    sseTopic:
+                      description: optional SSE subscription topic (Krateo extension)
+                      type: string
+                    watch:
+                      description: 'live-refresh watch: involvedObject(s) this widget is tied to (see src/schemas/watch.schema.json). A matching k8s event refetches the widget.'
+                      items:
+                        properties:
+                          apiVersion:
+                            description: group/version, e.g. composition.krateo.io/v1alpha1
+                            type: string
+                          kind:
+                            description: e.g. DemoClaim
+                            type: string
+                          name:
+                            description: a specific object; omit to match any object of this kind ("GVR-level")
+                            type: string
+                          namespace:
+                            description: scope to a namespace; omit to match any
+                            type: string
+                        required:
+                          - apiVersion
+                          - kind
+                        type: object
+                      type: array
+                  type: object
+                widgetDataTemplate:
+                  items:
+                    properties:
+                      expression:
+                        type: string
+                      forPath:
+                        type: string
+                    type: object
+                  type: array
+                identityContext:
+                  items:
+                    enum:
+                      - username
+                      - groups
+                    type: string
+                  type: array
+                keyExtras:
+                  description: 'F6 (snowplow#130): the request-extras keys (route params / URL query folded into ?extras=) whose values this widget''s resolution depends on. Only declared keys partition the widget cache cell. Absent/empty = the widget does not vary by any request extra (chrome/layout default).'
+                  items:
+                    type: string
+                  type: array
+                freshness:
+                  description: 'Opt-in staleness indicator: when true the widget shows the stale/refreshing dot overlay (exception states only). Absent/false = no badge ever (the default; healthy widgets stay unmarked).'
+                  type: boolean
+              required:
+                - widgetData
+              type: object
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: pageheaders.widgets.templates.krateo.io
+spec:
+  group: widgets.templates.krateo.io
+  names:
+    categories:
+      - widgets
+      - krateo
+    kind: PageHeader
+    listKind: PageHeaderList
+    plural: pageheaders
+    singular: pageheader
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+      name: v1beta1
+      schema:
+        openAPIV3Schema:
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              properties:
+                apiRef:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
+                resourcesRefs:
+                  properties:
+                    items:
+                      items:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          slice:
+                            properties:
+                              continue:
+                                type: boolean
+                              offset:
+                                format: int32
+                                type: integer
+                              page:
+                                format: int32
+                                type: integer
+                              perPage:
+                                format: int32
+                                type: integer
+                            required:
+                              - page
+                              - perPage
+                            type: object
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        required:
+                          - id
+                        type: object
+                      type: array
+                    slice:
+                      properties:
+                        continue:
+                          type: boolean
+                        offset:
+                          format: int32
+                          type: integer
+                        page:
+                          format: int32
+                          type: integer
+                        perPage:
+                          format: int32
+                          type: integer
+                      required:
+                        - page
+                        - perPage
+                      type: object
+                  required:
+                    - items
+                  type: object
+                resourcesRefsTemplate:
+                  items:
+                    properties:
+                      iterator:
+                        type: string
+                      template:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        type: object
+                    type: object
+                  type: array
+                widgetData:
+                  description: the data that will be passed to the widget on the frontend
+                  properties:
+                    allowedResources:
+                      description: the resource plurals this container may hold as children. Typed loosely on purpose — the per-widget enums drifted and enforced nothing; containment is checked by the chart lint (design rule X5) against the real widget registry.
+                      items:
+                        type: string
+                      type: array
+                    counter:
+                      description: an optional count rendered in brackets beside the title, on the title's own type step (e.g. '(397)'). Use for 'how many of these are there', never for a status
+                      format: int32
+                      type: integer
+                    counterLabel:
+                      description: the noun the counter counts, rendered inside the same brackets (e.g. '23 blueprints'). Use it when WHAT is being counted changes — a bare '(23)' beside a filtered catalog does not say 23 of what
+                      type: string
+                    items:
+                      description: 'the page''s actions, rendered on ONE row on the right edge, vertically centred on the title and subtitle together (level with the title when there is no subtitle); never stacked (design rule P26). At most one should be `type: primary`'
+                      items:
+                        properties:
+                          resourceRefId:
+                            description: Handle of the child to render here, matching an `id` in spec.resourcesRefs.
+                            type: string
+                        required:
+                          - resourceRefId
+                        type: object
+                      type: array
+                    subtitle:
+                      description: one line of supporting context below the title. Must NOT restate the title — say it once per page
+                      type: string
+                    tags:
+                      description: status pills on the title line, vertically centred with it
+                      items:
+                        properties:
+                          color:
+                            description: a palette colour NAME (resolved through the shared palette, never an antd preset or a hex)
+                            enum:
+                              - blue
+                              - darkBlue
+                              - orange
+                              - gray
+                              - red
+                              - green
+                              - violet
+                            type: string
+                          label:
+                            description: 'the pill text. Required: a colour with no label carries meaning by colour alone, which a screen reader and a colourblind reader both miss'
+                            type: string
+                        required:
+                          - label
+                        type: object
+                      type: array
+                    title:
+                      description: the page title (H1). The one required field — a page header without a title is not a page header
+                      type: string
+                  required:
+                    - title
+                  type: object
+                widgetDataTemplate:
+                  items:
+                    properties:
+                      expression:
+                        type: string
+                      forPath:
+                        type: string
+                    type: object
+                  type: array
+                identityContext:
+                  items:
+                    enum:
+                      - username
+                      - groups
+                    type: string
+                  type: array
+                keyExtras:
+                  description: 'F6 (snowplow#130): the request-extras keys (route params / URL query folded into ?extras=) whose values this widget''s resolution depends on. Only declared keys partition the widget cache cell. Absent/empty = the widget does not vary by any request extra (chrome/layout default).'
+                  items:
+                    type: string
+                  type: array
+                freshness:
+                  description: 'Opt-in staleness indicator: when true the widget shows the stale/refreshing dot overlay (exception states only). Absent/false = no badge ever (the default; healthy widgets stay unmarked).'
+                  type: boolean
+              required:
+                - resourcesRefs
+                - widgetData
+              type: object
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: paragraphs.widgets.templates.krateo.io
+spec:
+  group: widgets.templates.krateo.io
+  names:
+    categories:
+      - widgets
+      - krateo
+    kind: Paragraph
+    listKind: ParagraphList
+    plural: paragraphs
+    singular: paragraph
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+      name: v1beta1
+      schema:
+        openAPIV3Schema:
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              properties:
+                apiRef:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
+                resourcesRefs:
+                  properties:
+                    items:
+                      items:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          slice:
+                            properties:
+                              continue:
+                                type: boolean
+                              offset:
+                                format: int32
+                                type: integer
+                              page:
+                                format: int32
+                                type: integer
+                              perPage:
+                                format: int32
+                                type: integer
+                            required:
+                              - page
+                              - perPage
+                            type: object
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        required:
+                          - id
+                        type: object
+                      type: array
+                    slice:
+                      properties:
+                        continue:
+                          type: boolean
+                        offset:
+                          format: int32
+                          type: integer
+                        page:
+                          format: int32
+                          type: integer
+                        perPage:
+                          format: int32
+                          type: integer
+                      required:
+                        - page
+                        - perPage
+                      type: object
+                  required:
+                    - items
+                  type: object
+                resourcesRefsTemplate:
+                  items:
+                    properties:
+                      iterator:
+                        type: string
+                      template:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        type: object
+                    type: object
+                  type: array
+                widgetData:
+                  description: The properties Paragraph renders. Where Paragraph wraps an antd component these are antd's own prop names, so antd's documentation for that component describes them.
+                  properties:
+                    code:
+                      description: antd Typography code
+                      type: boolean
+                    copyable:
+                      description: antd Typography copyable
+                      type: boolean
+                    delete:
+                      description: antd Typography delete (strikethrough)
+                      type: boolean
+                    disabled:
+                      description: antd Typography disabled
+                      type: boolean
+                    ellipsis:
+                      description: antd Typography ellipsis
+                      type: boolean
+                    italic:
+                      description: antd Typography italic
+                      type: boolean
+                    level:
+                      description: when set, render as an antd Typography.Title heading of this level (h1-h5) instead of a body paragraph
+                      format: int32
+                      type: integer
+                    mark:
+                      description: antd Typography mark (highlight)
+                      type: boolean
+                    strong:
+                      description: antd Typography strong
+                      type: boolean
+                    text:
+                      description: the content of the paragraph (the antd Typography children, as text)
+                      type: string
+                    type:
+                      description: antd Typography type
+                      enum:
+                        - secondary
+                        - success
+                        - warning
+                        - danger
+                      type: string
+                    underline:
+                      description: antd Typography underline
+                      type: boolean
+                    variant:
+                      description: render style variant. eyebrow renders a small uppercase mono section caption (IBM Plex Mono letter-spaced muted) for page-header / panel eyebrows
+                      enum:
+                        - eyebrow
+                      type: string
+                    watch:
+                      description: 'live-refresh watch: involvedObject(s) this widget is tied to (see src/schemas/watch.schema.json). A matching k8s event refetches the widget.'
+                      items:
+                        properties:
+                          apiVersion:
+                            description: group/version, e.g. composition.krateo.io/v1alpha1
+                            type: string
+                          kind:
+                            description: e.g. DemoClaim
+                            type: string
+                          name:
+                            description: a specific object; omit to match any object of this kind ("GVR-level")
+                            type: string
+                          namespace:
+                            description: scope to a namespace; omit to match any
+                            type: string
+                        required:
+                          - apiVersion
+                          - kind
+                        type: object
+                      type: array
+                  required:
+                    - text
+                  type: object
+                widgetDataTemplate:
+                  items:
+                    properties:
+                      expression:
+                        type: string
+                      forPath:
+                        type: string
+                    type: object
+                  type: array
+                identityContext:
+                  items:
+                    enum:
+                      - username
+                      - groups
+                    type: string
+                  type: array
+                keyExtras:
+                  description: 'F6 (snowplow#130): the request-extras keys (route params / URL query folded into ?extras=) whose values this widget''s resolution depends on. Only declared keys partition the widget cache cell. Absent/empty = the widget does not vary by any request extra (chrome/layout default).'
+                  items:
+                    type: string
+                  type: array
+                freshness:
+                  description: 'Opt-in staleness indicator: when true the widget shows the stale/refreshing dot overlay (exception states only). Absent/false = no badge ever (the default; healthy widgets stay unmarked).'
+                  type: boolean
+              required:
+                - widgetData
+              type: object
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: statistics.widgets.templates.krateo.io
+spec:
+  group: widgets.templates.krateo.io
+  names:
+    categories:
+      - widgets
+      - krateo
+    kind: Statistic
+    listKind: StatisticList
+    plural: statistics
+    singular: statistic
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+      name: v1beta1
+      schema:
+        openAPIV3Schema:
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              properties:
+                apiRef:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
+                resourcesRefs:
+                  properties:
+                    items:
+                      items:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          slice:
+                            properties:
+                              continue:
+                                type: boolean
+                              offset:
+                                format: int32
+                                type: integer
+                              page:
+                                format: int32
+                                type: integer
+                              perPage:
+                                format: int32
+                                type: integer
+                            required:
+                              - page
+                              - perPage
+                            type: object
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        required:
+                          - id
+                        type: object
+                      type: array
+                    slice:
+                      properties:
+                        continue:
+                          type: boolean
+                        offset:
+                          format: int32
+                          type: integer
+                        page:
+                          format: int32
+                          type: integer
+                        perPage:
+                          format: int32
+                          type: integer
+                      required:
+                        - page
+                        - perPage
+                      type: object
+                  required:
+                    - items
+                  type: object
+                resourcesRefsTemplate:
+                  items:
+                    properties:
+                      iterator:
+                        type: string
+                      template:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        type: object
+                    type: object
+                  type: array
+                widgetData:
+                  description: The properties Statistic renders. Where Statistic wraps an antd component these are antd's own prop names, so antd's documentation for that component describes them.
+                  properties:
+                    precision:
+                      description: the number of decimal places
+                      format: int32
+                      type: integer
+                    prefix:
+                      description: text shown before the value
+                      type: string
+                    suffix:
+                      description: text shown after the value
+                      type: string
+                    title:
+                      description: the statistic label
+                      type: string
+                    value:
+                      description: the statistic value
+                      x-kubernetes-int-or-string: true
+                    valueStyle:
+                      description: antd Statistic `valueStyle` — inline style for the numeral, primarily `color` for a semantic value (e.g. Healthy=cyan, Failed=crimson). Accepts a CSS color incl. theme vars like var(--cyan-color).
+                      properties:
+                        color:
+                          description: CSS color (hex or var(--token))
+                          type: string
+                      type: object
+                    watch:
+                      description: 'live-refresh watch: involvedObject(s) this widget is tied to (see src/schemas/watch.schema.json). A matching k8s event refetches the widget.'
+                      items:
+                        properties:
+                          apiVersion:
+                            description: group/version, e.g. composition.krateo.io/v1alpha1
+                            type: string
+                          kind:
+                            description: e.g. DemoClaim
+                            type: string
+                          name:
+                            description: a specific object; omit to match any object of this kind ("GVR-level")
+                            type: string
+                          namespace:
+                            description: scope to a namespace; omit to match any
+                            type: string
+                        required:
+                          - apiVersion
+                          - kind
+                        type: object
+                      type: array
+                  required:
+                    - value
+                  type: object
+                widgetDataTemplate:
+                  items:
+                    properties:
+                      expression:
+                        type: string
+                      forPath:
+                        type: string
+                    type: object
+                  type: array
+                identityContext:
+                  items:
+                    enum:
+                      - username
+                      - groups
+                    type: string
+                  type: array
+                keyExtras:
+                  description: 'F6 (snowplow#130): the request-extras keys (route params / URL query folded into ?extras=) whose values this widget''s resolution depends on. Only declared keys partition the widget cache cell. Absent/empty = the widget does not vary by any request extra (chrome/layout default).'
+                  items:
+                    type: string
+                  type: array
+                freshness:
+                  description: 'Opt-in staleness indicator: when true the widget shows the stale/refreshing dot overlay (exception states only). Absent/false = no badge ever (the default; healthy widgets stay unmarked).'
+                  type: boolean
+              required:
+                - widgetData
+              type: object
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: tables.widgets.templates.krateo.io
+spec:
+  group: widgets.templates.krateo.io
+  names:
+    categories:
+      - widgets
+      - krateo
+    kind: Table
+    listKind: TableList
+    plural: tables
+    singular: table
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+      name: v1beta1
+      schema:
+        openAPIV3Schema:
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              properties:
+                apiRef:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
+                resourcesRefs:
+                  properties:
+                    items:
+                      items:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          slice:
+                            properties:
+                              continue:
+                                type: boolean
+                              offset:
+                                format: int32
+                                type: integer
+                              page:
+                                format: int32
+                                type: integer
+                              perPage:
+                                format: int32
+                                type: integer
+                            required:
+                              - page
+                              - perPage
+                            type: object
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        required:
+                          - id
+                        type: object
+                      type: array
+                    slice:
+                      properties:
+                        continue:
+                          type: boolean
+                        offset:
+                          format: int32
+                          type: integer
+                        page:
+                          format: int32
+                          type: integer
+                        perPage:
+                          format: int32
+                          type: integer
+                      required:
+                        - page
+                        - perPage
+                      type: object
+                  required:
+                    - items
+                  type: object
+                resourcesRefsTemplate:
+                  items:
+                    properties:
+                      iterator:
+                        type: string
+                      template:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        type: object
+                    type: object
+                  type: array
+                widgetData:
+                  description: The properties Table renders. Where Table wraps an antd component these are antd's own prop names, so antd's documentation for that component describes them.
+                  properties:
+                    allowedResources:
+                      description: the resource plurals this container may hold as children. Typed loosely on purpose — the per-widget enums drifted and enforced nothing; containment is checked by the chart lint (design rule X5) against the real widget registry.
+                      items:
+                        type: string
+                      type: array
+                    bordered:
+                      description: antd Table bordered
+                      type: boolean
+                    columns:
+                      description: configuration of the table's columns
+                      items:
+                        properties:
+                          color:
+                            description: the color of the value (or the icon) to be represented. These are KRATEO PALETTE names resolved through the shared palette — not antd presets. The same name on a Button takes antd's vocabulary instead and renders a different shade.
+                            enum:
+                              - blue
+                              - darkBlue
+                              - orange
+                              - gray
+                              - red
+                              - green
+                              - violet
+                            type: string
+                          minWidth:
+                            description: 'antd Table column minWidth in px. Mirrors antd ColumnType.minWidth. Usually the better lever under fitContent: a fixed width re-creates the overflow it was meant to fix, while a floor keeps a column readable and lets the others flex.'
+                            format: int32
+                            type: integer
+                          title:
+                            description: column header label
+                            type: string
+                          valueKey:
+                            description: key used to extract the value from row data
+                            type: string
+                          width:
+                            description: 'antd Table column width — a pixel number, or any CSS length string. Mirrors antd ColumnType.width. Optional: omitted, antd sizes the column as it does today.'
+                            x-kubernetes-int-or-string: true
+                        required:
+                          - title
+                          - valueKey
+                        type: object
+                      type: array
+                    dataSource:
+                      description: antd Table dataSource — the table rows (renamed from `data`; `data` still accepted for back-compat)
+                      items:
+                        items:
+                          properties:
+                            arrayValue:
+                              description: value if type = array
+                              items:
+                                type: string
+                              type: array
+                            booleanValue:
+                              description: value if type = boolean
+                              type: boolean
+                            color:
+                              description: per-cell color — for a `tag` cell, an antd Tag color (e.g. green / red / gold / blue); for a jsonSchemaType cell it overrides the column color. Lets each row carry its own color (e.g. status).
+                              type: string
+                            decimalValue:
+                              description: value if type = number or decimal
+                              type: string
+                            format:
+                              description: optional display format for a string value — `relative` (e.g. "14d ago"), `date`, or `datetime`. The raw value stays in the data; only the rendering changes.
+                              enum:
+                                - relative
+                                - date
+                                - datetime
+                              type: string
+                            kind:
+                              description: type of cell value. `tag` renders the stringValue as a colored antd Tag (use the cell `color`). `bar` renders a reconciliation-rail Progress gauge (stringValue = percent 0-100, `color` = bar/state color, amber target-tick at 100%). `conditions` renders `arrayValue` (an array of {type,status}) as small status pills, each coloured cyan (True) / crimson (False).
+                              enum:
+                                - jsonSchemaType
+                                - icon
+                                - widget
+                                - tag
+                                - bar
+                                - conditions
+                              type: string
+                            numberValue:
+                              description: value if type = number or integer
+                              format: int32
+                              type: integer
+                            resourceRefId:
+                              description: used if kind = widget
+                              type: string
+                            stringValue:
+                              description: value if type = string
+                              type: string
+                            type:
+                              description: used if kind = jsonSchemaType
+                              enum:
+                                - string
+                                - number
+                                - integer
+                                - decimal
+                                - boolean
+                                - array
+                                - 'null'
+                              type: string
+                            valueKey:
+                              description: the key of the column this cell belongs to
+                              type: string
+                          required:
+                            - kind
+                            - valueKey
+                          type: object
+                        type: array
+                      type: array
+                    fitContent:
+                      description: 'Fit columns to the container instead of horizontal-scrolling: a wide cell ellipsis-truncates (full text on hover) rather than pushing a scrollbar. Ignored for virtualized (very large) tables.'
+                      type: boolean
+                    pagination:
+                      description: antd Table pagination config (subproperties mirror antd).
+                      properties:
+                        current:
+                          description: 'server-side pagination: the 1-based current page (controlled). Usually driven by the request `page` param, not the CR.'
+                          format: int32
+                          type: integer
+                        defaultPageSize:
+                          description: default page size
+                          format: int32
+                          type: integer
+                        hideOnSinglePage:
+                          description: hide the pager when there is a single page
+                          type: boolean
+                        pageSize:
+                          description: number of rows per page
+                          format: int32
+                          type: integer
+                        position:
+                          description: pager position(s)
+                          items:
+                            enum:
+                              - topLeft
+                              - topCenter
+                              - topRight
+                              - bottomLeft
+                              - bottomCenter
+                              - bottomRight
+                            type: string
+                          type: array
+                        simple:
+                          description: use the simple pager
+                          type: boolean
+                        total:
+                          description: 'server-side pagination: the TOTAL row count across all pages (the widget''s `dataSource` holds only the current page/window). Set by the widgetDataTemplate from the full list length so the pager renders the correct number of pages. When present, the Table uses controlled server-side pagination (each page fetched on demand) instead of client-side slicing of dataSource.'
+                          format: int32
+                          type: integer
+                      type: object
+                    prefix:
+                      description: it's the filters prefix to get right values
+                      type: string
+                    rowNavigateTo:
+                      description: optional route path to navigate to on row click; `{valueKey}` placeholders are filled from that row's cells (e.g. /compositions/{ns}/{name})
+                      type: string
+                    size:
+                      description: antd Table size. Defaults to 'middle' when omitted (matching Button), so an unset value has a documented, Brand-consistent density rather than antd's raw default
+                      enum:
+                        - large
+                        - middle
+                        - small
+                      type: string
+                    watch:
+                      description: 'live-refresh watch: involvedObject(s) this widget is tied to (see src/schemas/watch.schema.json). A matching k8s event refetches the widget.'
+                      items:
+                        properties:
+                          apiVersion:
+                            description: group/version, e.g. composition.krateo.io/v1alpha1
+                            type: string
+                          kind:
+                            description: e.g. DemoClaim
+                            type: string
+                          name:
+                            description: a specific object; omit to match any object of this kind ("GVR-level")
+                            type: string
+                          namespace:
+                            description: scope to a namespace; omit to match any
+                            type: string
+                        required:
+                          - apiVersion
+                          - kind
+                        type: object
+                      type: array
+                  required:
+                    - allowedResources
+                    - columns
+                  type: object
+                widgetDataTemplate:
+                  items:
+                    properties:
+                      expression:
+                        type: string
+                      forPath:
+                        type: string
+                    type: object
+                  type: array
+                identityContext:
+                  items:
+                    enum:
+                      - username
+                      - groups
+                    type: string
+                  type: array
+                keyExtras:
+                  description: 'F6 (snowplow#130): the request-extras keys (route params / URL query folded into ?extras=) whose values this widget''s resolution depends on. Only declared keys partition the widget cache cell. Absent/empty = the widget does not vary by any request extra (chrome/layout default).'
+                  items:
+                    type: string
+                  type: array
+                freshness:
+                  description: 'Opt-in staleness indicator: when true the widget shows the stale/refreshing dot overlay (exception states only). Absent/false = no badge ever (the default; healthy widgets stay unmarked).'
+                  type: boolean
+              required:
+                - widgetData
+              type: object
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: tags.widgets.templates.krateo.io
+spec:
+  group: widgets.templates.krateo.io
+  names:
+    categories:
+      - widgets
+      - krateo
+    kind: Tag
+    listKind: TagList
+    plural: tags
+    singular: tag
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+      name: v1beta1
+      schema:
+        openAPIV3Schema:
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              properties:
+                apiRef:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
+                resourcesRefs:
+                  properties:
+                    items:
+                      items:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          slice:
+                            properties:
+                              continue:
+                                type: boolean
+                              offset:
+                                format: int32
+                                type: integer
+                              page:
+                                format: int32
+                                type: integer
+                              perPage:
+                                format: int32
+                                type: integer
+                            required:
+                              - page
+                              - perPage
+                            type: object
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        required:
+                          - id
+                        type: object
+                      type: array
+                    slice:
+                      properties:
+                        continue:
+                          type: boolean
+                        offset:
+                          format: int32
+                          type: integer
+                        page:
+                          format: int32
+                          type: integer
+                        perPage:
+                          format: int32
+                          type: integer
+                      required:
+                        - page
+                        - perPage
+                      type: object
+                  required:
+                    - items
+                  type: object
+                resourcesRefsTemplate:
+                  items:
+                    properties:
+                      iterator:
+                        type: string
+                      template:
+                        properties:
+                          apiVersion:
+                            type: string
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          payload:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          resource:
+                            type: string
+                          verb:
+                            enum:
+                              - POST
+                              - PUT
+                              - PATCH
+                              - DELETE
+                              - GET
+                            type: string
+                        type: object
+                    type: object
+                  type: array
+                widgetData:
+                  description: The properties Tag renders. Where Tag wraps an antd component these are antd's own prop names, so antd's documentation for that component describes them.
+                  properties:
+                    color:
+                      description: the tag color (preset name or hex)
+                      type: string
+                    label:
+                      description: the tag text
+                      type: string
+                    style:
+                      description: inline CSS style object passed through to the antd Tag (e.g. {"fontSize":"15px"})
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    variant:
+                      description: antd Tag variant
+                      enum:
+                        - filled
+                        - solid
+                        - outlined
+                      type: string
+                    watch:
+                      description: 'live-refresh watch: involvedObject(s) this widget is tied to (see src/schemas/watch.schema.json). A matching k8s event refetches the widget.'
+                      items:
+                        properties:
+                          apiVersion:
+                            description: group/version, e.g. composition.krateo.io/v1alpha1
+                            type: string
+                          kind:
+                            description: e.g. DemoClaim
+                            type: string
+                          name:
+                            description: a specific object; omit to match any object of this kind ("GVR-level")
+                            type: string
+                          namespace:
+                            description: scope to a namespace; omit to match any
+                            type: string
+                        required:
+                          - apiVersion
+                          - kind
+                        type: object
+                      type: array
+                  required:
+                    - label
+                  type: object
+                widgetDataTemplate:
+                  items:
+                    properties:
+                      expression:
+                        type: string
+                      forPath:
+                        type: string
+                    type: object
+                  type: array
+                identityContext:
+                  items:
+                    enum:
+                      - username
+                      - groups
+                    type: string
+                  type: array
+                keyExtras:
+                  description: 'F6 (snowplow#130): the request-extras keys (route params / URL query folded into ?extras=) whose values this widget''s resolution depends on. Only declared keys partition the widget cache cell. Absent/empty = the widget does not vary by any request extra (chrome/layout default).'
+                  items:
+                    type: string
+                  type: array
+                freshness:
+                  description: 'Opt-in staleness indicator: when true the widget shows the stale/refreshing dot overlay (exception states only). Absent/false = no badge ever (the default; healthy widgets stay unmarked).'
+                  type: boolean
+              required:
+                - widgetData
+              type: object
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

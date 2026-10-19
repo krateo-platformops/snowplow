@@ -76,6 +76,22 @@ func RegisterRefreshHandlers(saRC *rest.Config) {
 			slog.String("effect", "background refresh has no SA *rest.Config; object-fetch sites fall back to the per-user kubeconfig path which fails for a synthetic identity"),
 		)
 	}
+	registerRefreshFuncs(saEP, saRC)
+}
+
+// RegisterRefreshHandlersWithSATransportForTest is RegisterRefreshHandlers with
+// the SA transport passed in instead of read from the pod's projected
+// ServiceAccount files, which do not exist out of cluster (#765: the in-process
+// scale harness, internal/handlers/dispatchers/scale765, points it at its fake
+// apiserver). It registers exactly the handlers RegisterRefreshHandlers does.
+// Test support only; production calls RegisterRefreshHandlers.
+func RegisterRefreshHandlersWithSATransportForTest(saEP *endpoints.Endpoint, saRC *rest.Config) {
+	registerRefreshFuncs(saEP, saRC)
+}
+
+// registerRefreshFuncs registers the refresh handler of every refreshable
+// handler kind over one SA transport (see RegisterRefreshHandlers).
+func registerRefreshFuncs(saEP *endpoints.Endpoint, saRC *rest.Config) {
 	refreshFunc := func(ctx context.Context, _ string, in cache.ResolvedKeyInputs) error {
 		// resolveAndPopulateL1 computes the canonical key from `in`,
 		// installs WithL1KeyContext, builds the entry's own identity
