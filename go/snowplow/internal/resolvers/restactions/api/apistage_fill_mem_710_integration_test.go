@@ -306,8 +306,8 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 	// (architect-623). The margin is logged on every run so drift shows before
 	// it bites.
 	need := bound + oneFillAlloc
-	t.Logf("#780 F-MEM precondition margin: ungated +%d MiB − (bound %d MiB + one fill's allocations %d MiB) = %+d MiB",
-		ungated>>20, bound>>20, oneFillAlloc>>20, (ungated-need)>>20)
+	t.Logf("#780 F-MEM precondition margin: ungated − bound = %.2f × oneFillAlloc (needs ≥ 1.00; ungated +%d MiB, bound %d MiB, oneFillAlloc %d MiB)",
+		float64(ungated-bound)/float64(max(oneFillAlloc, 1)), ungated>>20, bound>>20, oneFillAlloc>>20)
 	if ungated < need {
 		t.Fatalf("PRECONDITION: the ungated burst grew +%d MiB, under bound + one fill's allocations (%d MiB) — "+
 			"the gap between a correct gate and no gate has closed, so the arm cannot discriminate; re-measure fmemAllocateBlackFills",
