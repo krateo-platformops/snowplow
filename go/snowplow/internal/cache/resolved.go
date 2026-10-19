@@ -274,6 +274,16 @@ type ResolvedEntry struct {
 	// rolling restart) skips refresh but still serves TTL+LRU correctly.
 	Inputs *ResolvedKeyInputs
 
+	// ContentAsOf — #765 option A, the content stamp: for an identity-free apistage
+	// content cell stored by a fill leader, the dep-event seq its data read started
+	// at (the fill flight's #375 content-sink startSeq). A refresher re-resolve reuses
+	// the cell instead of re-filling it when ContentStampCovers says the read is not
+	// older than the change that triggered the refresh. 0 = unknown (every other
+	// producer): the refresher re-fills, as before #765. Set before the Put, never
+	// mutated after; in-memory only, so it never outlives the process whose
+	// depEventSeq it counts.
+	ContentAsOf uint64
+
 	// Items / ItemsAPIVersion / ItemsKind — Ship 0.30.121 R3 — the
 	// pre-parsed LIST envelope for a CacheEntryClassApistage CONTENT
 	// entry. F1's content-gate (gateListEnvelope) re-unmarshalled the

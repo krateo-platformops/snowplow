@@ -43,6 +43,22 @@
 // its joiners. A joiner's ctx cancels only its own wait.
 //
 // No admission bound here: that is #710 PR-2.
+//
+// #765 option A — THE STAMP-GATED READER. A refresher re-resolve whose trigger
+// set holds the cell's GVR (contentStampGate.on) must be fresh only as of its
+// dequeue (need, cache.RefreshTriggerAsOf). It joins the current flight when
+// the epoch rule above admits it OR the flight's startSeq ≥ need (its read
+// began after every trigger the refresh consumed). Refused, a BACKGROUND-class
+// stamp-gated reader does not start a concurrent fill of the same list: it
+// joins the key's PENDING flight, creating it if none — a flight queued behind
+// the current one whose leader, once the current flight completes, captures its
+// own content sink (a fresh startSeq) and fills. Every pending joiner joined
+// before that capture, so the pending fill is never older than any joiner's
+// need: lossless. Per key that is at most one flight in flight plus one
+// pending, whatever the number of dependents a change dirtied. Customer- and
+// debt-class readers (#710: users never queue; #740 K5 customer-triggered
+// refreshes, #547 demand revalidation, the D2 refill) never wait on a pending
+// flight: they keep the path above.
 package api
 
 import (
@@ -70,10 +86,23 @@ type contentFlightResult struct {
 	err error
 }
 
+// contentStampGate is a stamp-gated (#765) reader's state: on for a refresher
+// read whose trigger set holds the cell's GVR, need the seq it must be fresh as
+// of.
+type contentStampGate struct {
+	on   bool
+	need uint64
+}
+
 // contentFlight is one in-flight fill of one content key.
 type contentFlight struct {
-	key      string
+	key string
+	// startSeq is the flight's read epoch. A PENDING flight (#765) sets it only
+	// when it starts, under contentFlightsMu; it is read under the same lock, or
+	// after done is closed.
 	startSeq uint64
+	// prior (#765) is, for a pending flight, the flight it is queued behind.
+	prior *contentFlight
 	// ticket (#710 PR-2a) is the flight's place in the memory-admission gate;
 	// its class is the max over the flight's participants.
 	ticket *fillTicket
@@ -89,28 +118,66 @@ var (
 	// here but still completes for the joiners it already has. Bounded by the
 	// concurrent fills.
 	contentFlights = map[string]*contentFlight{}
+	// contentPendingFlights (#765) is each content key's PENDING flight: queued
+	// behind the current one, joinable by background stamp-gated readers. At most
+	// one per key; bounded by the concurrent fills.
+	contentPendingFlights = map[string]*contentFlight{}
 )
 
 // enterContentFlight is the MISS branch's entry. It installs the content cell's
 // #375 (A) child dep-gen sink (fillCtx) BEFORE any data read — its startSeq is
 // the epoch of the flight this reader would lead — and joins or leads the key's
 // flight. fillCtx is meaningful only to a leader.
-func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason) (flight *contentFlight, fillCtx context.Context, lead bool) {
+//
+// #765 — a reader that LEADS a pending flight blocks here until the flight it is
+// queued behind completes, then captures its content sink and starts.
+func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, stamp contentStampGate) (flight *contentFlight, fillCtx context.Context, lead bool) {
 	fillCtx = cache.WithContentDepGenSink(ctx, gvr, namespace, name)
 	startSeq, _ := cache.DepGenStartSeqFromContext(fillCtx)
-	flight, lead = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason, contentFillClassOf(ctx))
+	flight, lead = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason, contentFillClassOf(ctx), stamp)
+	if lead && flight.prior != nil {
+		// The prior flight is bounded by its own detached write deadline, so this
+		// wait is too; it is not cut by this reader's ctx, because the pending
+		// flight's joiners are waiting on THIS leader.
+		<-flight.prior.done
+		fillCtx = cache.WithContentDepGenSink(ctx, gvr, namespace, name)
+		startSeq, _ = cache.DepGenStartSeqFromContext(fillCtx)
+		startPendingContentFlight(flight, startSeq)
+	}
 	return flight, fillCtx, lead
+}
+
+// startPendingContentFlight turns a pending flight into its key's current one
+// at read epoch startSeq. From here new readers judge it by the ordinary join
+// rule, and a refused background reader queues the NEXT pending flight behind
+// it.
+func startPendingContentFlight(f *contentFlight, startSeq uint64) {
+	contentFlightsMu.Lock()
+	defer contentFlightsMu.Unlock()
+	f.startSeq = startSeq
+	f.prior = nil
+	if contentPendingFlights[f.key] == f {
+		delete(contentPendingFlights, f.key)
+	}
+	contentFlights[f.key] = f
 }
 
 // joinOrLeadContentFill returns the flight the reader is in and whether it
 // LEADS it. startSeq is the leader-to-be's content-sink entry seq; it is used
 // only when the reader leads. (gvr, namespace, name) is the cell's own
 // coordinate (name "" = LIST).
-func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, class fillAdmissionClass) (*contentFlight, bool) {
+//
+// #765 — stamp (a stamp-gated refresher reader) adds the need-based join and,
+// for the background class only, the pending flight (see the file comment). A
+// returned flight with a non-nil prior that the reader LEADS is pending: the
+// caller (enterContentFlight) waits for prior before filling.
+func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, class fillAdmissionClass, stamp contentStampGate) (*contentFlight, bool) {
 	contentFlightsMu.Lock()
 	defer contentFlightsMu.Unlock()
-	if cur := contentFlights[key]; cur != nil {
-		if !cache.ContentCoordinateMovedSince(gvr, namespace, name, cur.startSeq) {
+	cur := contentFlights[key]
+	if cur != nil {
+		if !cache.ContentCoordinateMovedSince(gvr, namespace, name, cur.startSeq) ||
+			(stamp.on && cur.startSeq >= stamp.need) {
 			noteContentFillJoined(reason, gvr.String())
 			// #710 PR-2a — a joiner of a higher class promotes a queued flight, or
 			// coalescing would let a customer wait at background priority.
@@ -118,6 +185,20 @@ func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionR
 			return cur, false
 		}
 		noteContentFillJoinRefused(reason)
+	}
+	coalesce := stamp.on && class == fillClassBackground
+	if coalesce {
+		// A pending flight has not captured its read epoch yet: it will start
+		// after this reader's need, whatever that is.
+		if p := contentPendingFlights[key]; p != nil {
+			noteContentRefreshCoalesced(gvr.String())
+			return p, false
+		}
+		if cur != nil {
+			p := &contentFlight{key: key, prior: cur, done: make(chan struct{}), ticket: newFillTicket(class)}
+			contentPendingFlights[key] = p
+			return p, true
+		}
 	}
 	f := &contentFlight{key: key, startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class)}
 	contentFlights[key] = f
@@ -133,6 +214,9 @@ func (f *contentFlight) complete(res contentFlightResult) {
 		contentFlightsMu.Lock()
 		if contentFlights[f.key] == f {
 			delete(contentFlights, f.key)
+		}
+		if contentPendingFlights[f.key] == f {
+			delete(contentPendingFlights, f.key)
 		}
 		contentFlightsMu.Unlock()
 		close(f.done)
@@ -164,6 +248,7 @@ func detachedFillContext(ctx context.Context) (context.Context, context.CancelFu
 func resetContentFlightsForTest() {
 	contentFlightsMu.Lock()
 	contentFlights = map[string]*contentFlight{}
+	contentPendingFlights = map[string]*contentFlight{}
 	contentFlightsMu.Unlock()
 }
 

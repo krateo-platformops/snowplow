@@ -257,11 +257,14 @@ func TestContentFill710_AbsentFillCountsBytesAndItemsAndAHitMovesNothing(t *test
 }
 
 func TestContentFill710_RefreshForcedReason(t *testing.T) {
-	newFill710Watcher(t, 3)
+	dyn := newFill710Watcher(t, 3)
 	store := cache.ResolvedCache()
 	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("cold read not served")
 	}
+	// #765 — a refresh re-fills a resident cell only when a change landed after
+	// the cell's read (the content stamp): make the trigger a real change.
+	stamp765Change(t, dyn, r1FreshManaged)
 	fill710Reset(t)
 
 	ctx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(r1Ctx()), r1FsaGVR)

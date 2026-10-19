@@ -1069,6 +1069,14 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			}
 		}
 	}
+	// #765 — the content stamp's NEED: the dep-event seq AFTER the trigger set was
+	// consumed. Every trigger above came from an event bumped before its mark merged
+	// (R2), so its seq is ≤ this; a content cell read from this seq on covers them all
+	// (content_stamp.go). Read here, never before the LoadAndDelete: a mark merged
+	// between the two would be consumed with a seq the need does not cover.
+	if len(consumedTriggers) > 0 {
+		rctx = withRefreshTriggerAsOf(rctx, depEventSeq.Load())
+	}
 	// #354 P3 — the window is consumed here, beside the trigger GVR, NOT in the
 	// floored branch above: a floored key keeps its window open, so the floor is
 	// part of the measured time. The stamp stays in the map (in flight) so a

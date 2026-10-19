@@ -1604,6 +1604,16 @@ func registerContentFillInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	refreshReused, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_refresh_reused_total",
+		metric.WithDescription("Refresher re-resolve reads whose trigger set held the content cell's GVR but whose stored cell was read after every trigger (content stamp): served from the cell, no re-fill. Each one is a re-fill of the shared list avoided. #765 option A."))
+	if err != nil {
+		return err
+	}
+	refreshCoalesced, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_refresh_coalesced_total",
+		metric.WithDescription("Background refresher readers that joined their content key's pending fill (queued behind the in-flight one, started after their trigger) instead of starting a concurrent re-fill of the same list. #765 option A."))
+	if err != nil {
+		return err
+	}
 	notServable, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_not_servable_total",
 		metric.WithDescription("Content fills whose dispatch the informer could not serve (no bytes; the call falls through). #710."))
 	if err != nil {
@@ -1699,8 +1709,10 @@ func registerContentFillInstruments(m metric.Meter) error {
 		o.ObserveInt64(inflight, s.Inflight)
 		o.ObserveInt64(inflightBytes, s.InflightBytes)
 		o.ObserveInt64(joinWaiting, s.JoinWaiting)
+		o.ObserveInt64(refreshReused, int64(s.RefreshReused))
+		o.ObserveInt64(refreshCoalesced, int64(s.RefreshCoalesced))
 		return nil
-	}, total, dup, bytesTotal, joined, joinRefused, joinWaiting, notServable, inflight, inflightBytes)
+	}, total, dup, bytesTotal, joined, joinRefused, joinWaiting, refreshReused, refreshCoalesced, notServable, inflight, inflightBytes)
 	return err
 }
 
