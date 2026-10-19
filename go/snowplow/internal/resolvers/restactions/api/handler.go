@@ -233,6 +233,12 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 	if opts.uaf != nil {
 		rf := applyUserAccessFilterOnPig(ctx, pig, opts.dict, opts.key, opts.uaf)
 		emitRefilterFalsifierFromHandler(ctx, log, opts.apiCallName, opts.uaf, rf)
+		// #759 (SECURITY) — the refilter REPLACES pig[key] on its fail-closed
+		// branches (the empty list; {} for a denied single object) and for a
+		// narrowed bare array; only a kept {items} list is narrowed in place.
+		// With no stage filter the merge below writes tmp, so tmp must be what
+		// the refilter left — never the raw service-account response.
+		tmp = pig[opts.key]
 	}
 
 	if opts.filter != nil {
