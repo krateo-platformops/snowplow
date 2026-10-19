@@ -16,16 +16,17 @@
 #   4. summarises with paired_summary.py: per-run granted CPU and ratios, a
 #      pair compared only when the granted CPU of its two runs is within 15%.
 #
+# -d: dry run (build trees and binaries, check the refusal, print the plan; no measurement).
 # usage (from the repo root):
 #   go/snowplow/internal/handlers/dispatchers/scale765/paired_ab.sh \
 #     -h <harness-sha> -a <arm-name>=<arm-sha> [-n pairs] [-m mode] [-r rate] -o <out-dir>
 # env passed through: SCALE765_WARMUP, SCALE765_MEASURE, SCALE765_PLATFORM.
 set -u
-HARNESS="" ARM="" PAIRS=3 MODE=annotation RATE=10 OUT=""
-while getopts "h:a:n:m:r:o:" o; do
+HARNESS="" ARM="" PAIRS=3 MODE=annotation RATE=10 OUT="" DRY=0
+while getopts "h:a:n:m:r:o:d" o; do
   case $o in
     h) HARNESS=$OPTARG ;; a) ARM=$OPTARG ;; n) PAIRS=$OPTARG ;;
-    m) MODE=$OPTARG ;; r) RATE=$OPTARG ;; o) OUT=$OPTARG ;;
+    m) MODE=$OPTARG ;; r) RATE=$OPTARG ;; o) OUT=$OPTARG ;; d) DRY=1 ;;
     *) exit 2 ;;
   esac
 done
@@ -66,6 +67,13 @@ run() { # run <name> <n>
   local rc=$?
   echo "run $label end $(date -u +%FT%TZ) load=$(load) rc=$rc"
 }
+if [ "$DRY" = 1 ]; then # -d: build and check only; print the plan, measure nothing
+  for i in $(seq 1 "$PAIRS"); do
+    if [ $((i % 2)) -eq 1 ]; then echo "plan pair $i: H0 then $ARM_NAME"; else echo "plan pair $i: $ARM_NAME then H0"; fi
+  done
+  for b in H0 "$ARM_NAME"; do "$OUT/$b.test" -test.list 'TestScale765_Point' | grep -qx TestScale765_Point || { echo "$b.test lacks TestScale765_Point"; exit 6; }; done
+  echo "dry run OK: both binaries built and list TestScale765_Point"; exit 0
+fi
 for i in $(seq 1 "$PAIRS"); do
   if [ $((i % 2)) -eq 1 ]; then run H0 "$i"; run "$ARM_NAME" "$i"; else run "$ARM_NAME" "$i"; run H0 "$i"; fi
 done
