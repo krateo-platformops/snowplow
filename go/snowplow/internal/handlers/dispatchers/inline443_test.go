@@ -503,6 +503,14 @@ func TestS443_Inline(t *testing.T) {
 		// composition data grid was cold). The inert half is unchanged: inert must
 		// still add no key and learn no identity.
 		f := in443Setup(t)
+		// #760 — the stored control's userAccessFilter stage dials the
+		// ServiceAccount endpoint. Unseamed it is unavailable here, and that
+		// branch used to serve an empty that was CACHED — which is what this
+		// control was observing. That empty is now a stage error (never
+		// stored), so the stage must really dispatch for the Put to happen.
+		t.Cleanup(api.SetServiceAccountEndpointForTest(func() (*endpoints.Endpoint, error) {
+			return &endpoints.Endpoint{ServerURL: f.srv.URL, Token: "tok-sa"}, nil
+		}))
 		cache.ResetLearnedIdentitiesForTest()
 		t.Cleanup(cache.ResetLearnedIdentitiesForTest)
 		alice := in443Ctx(f, psAlice)
