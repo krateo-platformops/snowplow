@@ -82,6 +82,14 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
         print(json.dumps({"name": a[3], "zone": opt("--zone"),
                           "resourceLabels": labels}))
         sys.exit(0)
+    if a[:3] == ["container", "clusters", "delete"]:
+        time.sleep(float(os.environ.get("FAKE_SLOW_DOWN", "0")))   # a delete in flight
+        if os.environ.get("FAKE_DOWN_FAIL") == "1":
+            sys.exit(1)
+        open(os.path.join(STATE, "deleted"), "w").write("1")
+        sys.exit(0)
+    if a[:3] == ["container", "clusters", "create"]:
+        time.sleep(float(os.environ.get("FAKE_SLOW_UP", "0")))   # a hung create
     sys.exit(0)   # create / node-pools create / delete
     """)
 
@@ -336,6 +344,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                               "visit": v, "wall_ms": 50, "calls": 3, "errors": 0,
                               "sched_lag_ms": 1}))
         sys.exit(0)
+    if a[:1] == ["wait"] and "job/fresh606" in a:
+        time.sleep(float(os.environ.get("FAKE_SLOW_WAIT", "0")))   # measure in progress
     if a[:1] == ["wait"] and "job/fresh606" in a and os.environ.get("FAKE_WAIT_FAIL") == "1":
         print("error: timed out waiting for the condition on jobs/fresh606", file=sys.stderr)
         sys.exit(1)

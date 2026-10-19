@@ -357,6 +357,10 @@ _NO = {"fresh": [], "push_refetches": [], "viewer_stats": []}
     (40, {"fresh": DELIV["fresh"], "push_refetches": [],
           "viewer_stats": [{"kind": "viewer_stats", "streams_opened": 1000, "frames": 0}]},
      ["no refresh frame"]),
+    # R2a: frames reached the driver but triggered no refetch
+    (40, {"fresh": DELIV["fresh"], "push_refetches": [],
+          "viewer_stats": [{"kind": "viewer_stats", "streams_opened": 1000, "frames": 7}]},
+     ["no refresh frame"]),
     # frames reached the driver, but the armed probe never saw a push
     (40, {"fresh": [{"kind": "fresh", "label": "list_dep@10", "armed": True, "push_ms": None}],
           "push_refetches": DELIV["push_refetches"], "viewer_stats": DELIV["viewer_stats"]},

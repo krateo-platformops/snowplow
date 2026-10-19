@@ -244,7 +244,7 @@ capped() {
       kill -TERM "$CAPPED_PID" 2>/dev/null || true
       break
     fi
-    sleep 1
+    sleep 1 || true      # a process-group SIGINT kills sleep (130): never fatal here
     waited=$(( waited + 1 ))
   done
   wait "$CAPPED_PID" 2>/dev/null || true
@@ -254,7 +254,7 @@ on_teardown_signal() {
   # A signal DURING teardown must never skip gke-down (reviewer-small (a)):
   # it only cuts the collect/diagnostics short.
   TD_SIGNALED=1
-  log "signal during teardown: collect/diagnostics cut short; the cluster is still deleted"
+  log "signal during teardown: collect/diagnostics cut short; proceeding to gke-down"
   if [[ -n "$CAPPED_PID" ]]; then
     pkill -TERM -P "$CAPPED_PID" 2>/dev/null || true
     kill -TERM "$CAPPED_PID" 2>/dev/null || true
@@ -262,11 +262,14 @@ on_teardown_signal() {
 }
 
 CLUSTER_CREATED=0
+IN_TEARDOWN=0
 teardown() {
   local rc=$?
+  IN_TEARDOWN=1     # from here a signal only cuts collect/diagnostics short (on_signal)
   # FIRST: no signal may abort teardown from here on (the run's INT/TERM/HUP
   # trap is `exit 130`, which inside teardown would skip gke-down).
   trap on_teardown_signal INT TERM HUP
+  set +e   # nothing inside teardown may abort it (a Ctrl-C reaches every child: set -e would exit on their 130)
   trap - EXIT
   declare -F stop_top_loop >/dev/null && stop_top_loop
   if [[ "$CLUSTER_CREATED" == "1" ]]; then
@@ -294,16 +297,30 @@ teardown() {
         log "no kubeconfig yet; no diagnostics to collect"
       fi
     fi
+    # Test hook (like BENCH_606_FAIL_AT): a command that fails inside teardown,
+    # as one killed by a group signal would. It must not stop the delete.
+    [[ "${BENCH_606_TEARDOWN_FAULT:-}" == "1" ]] && false
     log "=== teardown ${RUN_NAME} (exit ${rc}) ==="
-    if ! python3 -m bench.gke gke-down --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" $YES; then
+    # shielded: a process-group Ctrl-C must not interrupt the delete itself
+    if ! ( trap "" INT TERM HUP; exec python3 -m bench.gke gke-down --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" $YES ); then
       log "TEARDOWN FAILED — delete by hand: gcloud container clusters delete ${RUN_NAME} --project ${PROJECT} --zone ${ZONE} --quiet"
       rc=$(( rc == 0 ? 1 : rc ))
+    else
+      # printed ONLY after gke-down succeeded
+      if [[ "$DRY" == "1" ]]; then log "DRY: gke-down only printed; nothing was deleted"; else log "cluster ${RUN_NAME} deleted (gke-down OK)"; fi
     fi
   fi
   exit "$rc"
 }
 trap teardown EXIT
-trap 'exit 130' INT TERM HUP
+# Before teardown a signal ends the run (130) and the EXIT trap tears down;
+# INSIDE teardown the same handler only cuts collect/diagnostics short. One
+# handler for both closes the window between the EXIT trap firing and
+# teardown replacing the traps.
+on_signal() {
+  if [[ "$IN_TEARDOWN" == "1" ]]; then on_teardown_signal; else exit 130; fi
+}
+trap on_signal INT TERM HUP
 
 s_source() {
   # Registry preflight, BEFORE any cluster exists (read-only, ghcr only):
