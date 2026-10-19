@@ -36,7 +36,6 @@
 package dispatchers
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -151,14 +150,14 @@ func leverBRealDeps(t *testing.T) (rePrewarmDeps, *walkCountingLister, *navWidge
 // behavior fn (Marks the BootSeededSet on success so #105's set-delta works,
 // exactly like the #105 harness). prewarmScopeTimeoutFn → never-deadline unless
 // the caller overrides. Also silences the first-nav latch (nil under these
-// tests) and zeroes the customer-inflight gate. Returns a *bytes.Buffer of the
+// tests) and zeroes the customer-inflight gate. Returns a *syncBuffer (#392) of the
 // captured JSON logs.
-func leverBSeedSeams(t *testing.T, seedFn func(ctx context.Context, e navWidgetEntry) error) *bytes.Buffer {
+func leverBSeedSeams(t *testing.T, seedFn func(ctx context.Context, e navWidgetEntry) error) *syncBuffer {
 	t.Helper()
 	zeroCustomerInFlight()
 	resetFirstNavLatchForTest()
 
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

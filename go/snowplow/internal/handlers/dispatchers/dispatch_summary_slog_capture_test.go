@@ -3,6 +3,7 @@ package dispatchers
 import (
 	"bytes"
 	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/krateo-platformops/snowplow/internal/objects"
@@ -34,10 +35,16 @@ import (
 // logger. The stop resets the summary's sync.Once, so a later dispatch
 // relaunches it — production behaviour is unaffected (production never calls
 // the reset).
-func captureDefaultSlogForTest(t *testing.T, level slog.Level) *bytes.Buffer {
+//
+// The buffer is a syncBuffer (#392): quiescing the summary emitters cannot stop
+// EVERY background goroutine that logs through the default logger (the RBAC
+// initial publish of a test's watcher, an informer, a refresher worker), so the
+// capture itself must be safe to write from any goroutine while the test reads
+// or resets it.
+func captureDefaultSlogForTest(t *testing.T, level slog.Level) *syncBuffer {
 	t.Helper()
 	quiesceDefaultSummaryForTest(t)
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: level})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -67,4 +74,44 @@ func quiesceDefaultSummaryForTest(t *testing.T) {
 	objects.ResetObjectsGetSummaryForTest()
 	t.Cleanup(restapi.ResetDispatchSummaryForTest)
 	t.Cleanup(objects.ResetObjectsGetSummaryForTest)
+}
+
+// syncBuffer is a goroutine-safe bytes.Buffer for capturing slog output: the
+// default logger is process-global, so a background goroutine (the RBAC
+// initial publish, an informer, a summary ticker) may write it while the test
+// reads or resets the capture. Every default-slog capture in this package uses
+// it (#392). Bytes returns a copy, so a caller never holds the live slice.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+func (b *syncBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func (b *syncBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
 }
