@@ -36,7 +36,7 @@
 // admit-all, queued flights parking their envelopes, no gate at all.
 // Over-admission by about 2× or less is NOT resolvable on this heap: the GC
 // counts everything allocated during a mark phase as live, and under the
-// integration TestMain's pacing one mark phase absorbs up to ~2.5 fills, so a
+// integration TestMain's pacing one mark phase absorbs up to ~3.7 fills, so a
 // gate admitting 2× its ceiling measured 60–67 MiB against a correct gate's
 // 50–72 MiB. That class is owned by the deterministic ADM1 arms
 // (apistage_fill_admission_710_test.go), where a `<= 2*ceiling` mutation is RED.
@@ -159,18 +159,20 @@ func fill710Burst(store *cache.ResolvedCacheStore, lists, readers int, ctxFn fun
 // phase as live (allocate-black), and how many fills one mark phase absorbs
 // depends on the GC's pacing, not on the gate. A FIXED design constant read
 // from data, never from the run (a bound built from the run's own GC data moves
-// with the defect — #719). Measured on main e6bee57b (#780, issuecomment
-// 6278532568), 24 lists × 5,000, 240 readers:
+// with the defect — #719). Measured for #780 (issuecomments 6278532568,
+// 6279429171), 24 lists × 5,000, 240 readers, -tags unit,integration (the
+// worst GC pacing: 7–9 cycles per burst):
 //
-//   - a CORRECT gate's excess over ceiling0 + oneFill: ≤ 2.5 fills (worst
-//     pacing: -tags unit,integration, 7–9 GC cycles per burst; 0.65–2.5);
+//   - a CORRECT gate's excess over ceiling0 + oneFill: ≤ 3.7 fills at the worst
+//     observed (+86 MiB live growth under load ~22; typically 0.65–2.5);
 //   - the guarded defect class: admit-all ≥ 9.7 fills, ungated ≥ 10.
 //
-// 5 leaves ≈ 2.5 fills of margin above a correct gate and ≈ 4.7 below the
-// defect. If a Go or GC change closes that gap, the ungated precondition
+// 6 sits ≈ 2.3 fills from each side (architect-623). If a correct-gate run
+// ever exceeds ~4.5 fills, the heap check becomes log-only — it is NOT widened
+// again. If a Go or GC change closes the gap, the ungated precondition
 // (ungated ≥ bound + 1 × oneFillAlloc) goes RED rather than letting the arm
 // pass vacuously.
-const fmemAllocateBlackFills = 5
+const fmemAllocateBlackFills = 6
 
 func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T) {
 	const (
@@ -308,6 +310,8 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 	need := bound + oneFillAlloc
 	t.Logf("#780 F-MEM precondition margin: ungated − bound = %.2f × oneFillAlloc (needs ≥ 1.00; ungated +%d MiB, bound %d MiB, oneFillAlloc %d MiB)",
 		float64(ungated-bound)/float64(max(oneFillAlloc, 1)), ungated>>20, bound>>20, oneFillAlloc>>20)
+	t.Logf("#780 F-MEM gated worst: %.2f fills over ceiling0 + oneFill (bound allows %d; a correct gate past ~4.5 makes the heap check log-only)",
+		float64(gated-ceiling0-oneFill)/float64(max(oneFillAlloc, 1)), fmemAllocateBlackFills)
 	if ungated < need {
 		t.Fatalf("PRECONDITION: the ungated burst grew +%d MiB, under bound + one fill's allocations (%d MiB) — "+
 			"the gap between a correct gate and no gate has closed, so the arm cannot discriminate; re-measure fmemAllocateBlackFills",
