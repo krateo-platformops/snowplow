@@ -143,7 +143,17 @@ type listNarrow struct {
 }
 
 func newListNarrow() *listNarrow {
-	return &listNarrow{byKey: map[string]*listInterest{}}
+	n := &listNarrow{byKey: map[string]*listInterest{}}
+	// The closed {verdict, why} set exists from boot at zero, so every series
+	// is present (a cumulative counter that appears only on its first
+	// increment is indistinguishable from one that is not wired).
+	n.verdicts.Store(commitVerdictKey{CommitVerdictNarrowed, CommitWhyOK}, new(atomic.Uint64))
+	for _, why := range []string{CommitWhyStageError, CommitWhyNotInformer, CommitWhyReadsWholeItem,
+		CommitWhyRegistryFull, CommitWhySticky, CommitWhyListLevelRead, CommitWhyQueryUnapplied,
+		CommitWhyParse, CommitWhyUnknownConstruct} {
+		n.verdicts.Store(commitVerdictKey{CommitVerdictAll, why}, new(atomic.Uint64))
+	}
+	return n
 }
 
 // --- record side --------------------------------------------------------------
@@ -685,6 +695,7 @@ func ListNarrowExpvar() any {
 		"would_mark_total":     keptTotal,
 		"kept_by_reason":       kept,
 		"would_change_total":   a[AuditVerdictChanged],
+		"gate":                 ListNarrowGateSnapshot(),
 		"audit":                a,
 		"commit_verdicts":      verdicts,
 		"interests":            ListNarrowInterests(),

@@ -1283,7 +1283,21 @@ func registerUndeclaredExtrasExemptInstrument(m metric.Meter) error {
 // (attribute keys from the closed F8 set: outcome + reason)
 //
 // with the audit's other verdicts as the denominator, so a zero would_change
-// always reads as "N audited, 0 changed".
+// always reads as "N audited, 0 changed". The denominator of the AUDIT is
+// snowplow_deps_list_narrow_audit_samples_total (avoid-only REFRESHES); the
+// would-avoid count is in MARKS. Read the gate as would_change == 0 against a
+// minimum of outcome="identical" audits, and publish outcome="unaudited" /
+// samples as the coverage share (expvar snowplow_deps_list_narrow.gate is the
+// same readout for one process).
+//
+// ACROSS RESTARTS AND REPLICAS. Every instrument here is an Int64Observable
+// COUNTER read from a process-lifetime atomic, exported with the SDK default
+// CUMULATIVE temporality and monotonic (pinned by
+// TestListNarrow765_GateCountersExportCumulativeMonotonic): each series carries
+// its StartTimeUnix, and a restart starts a NEW series at zero. The 7-day gate
+// therefore sums, per (pod, StartTimeUnix), the LAST value of each series,
+// never a sum across exports and never one pod's /debug/vars (which forgets
+// everything before its own start).
 func registerListNarrowInstruments(m metric.Meter) error {
 	decisions, err := m.Int64ObservableCounter("snowplow_deps_list_narrow_total",
 		metric.WithDescription("SHADOW (#603/#765): every list_dep dirty mark of an object event, classified by whether enforcing the JQ read-set narrowing would have skipped it. outcome=avoided reason=unread_field is a WOULD-AVOID (the UPDATE changed no field the cell can observe); outcome=kept by reason (read_field, membership, interest_all, interest_pending, registry_late, undecided, no_mask, degraded). Every mark is still made: nothing is skipped. Their sum equals the object-path list_dep dirty marks."))
@@ -1297,6 +1311,11 @@ func registerListNarrowInstruments(m metric.Meter) error {
 	}
 	verdicts, err := m.Int64ObservableCounter("snowplow_deps_interest_verdict_total",
 		metric.WithDescription("SHADOW (#603/#765) record-side outcome per list edge of a RESTAction resolve: outcome=narrowed (reason=ok) or outcome=all by reason (stage_error, not_informer_served, reads_whole_item, registry_full, sticky_all, list_level_read, query_unapplied, parse, jq_unprovable). Says which templates block narrowing."))
+	if err != nil {
+		return err
+	}
+	samples, err := m.Int64ObservableCounter("snowplow_deps_list_narrow_audit_samples_total",
+		metric.WithDescription("SHADOW (#603/#765) avoid-only refreshes taken at dequeue: the REFRESHES the would-avoid marks would have saved, and the denominator of snowplow_deps_list_narrow_audit_total (each sample ends in exactly one outcome). unaudited / samples is the share the audit could not check."))
 	if err != nil {
 		return err
 	}
@@ -1317,11 +1336,12 @@ func registerListNarrowInstruments(m metric.Meter) error {
 			o.ObserveInt64(verdicts, int64(v.Count), metric.WithAttributes(
 				attribute.String("outcome", v.Verdict), attribute.String("reason", v.Why)))
 		}
+		o.ObserveInt64(samples, int64(cache.ListNarrowAuditSamples()))
 		tr, ns := cache.ListNarrowEvalStats()
 		o.ObserveInt64(eval, int64(tr), metric.WithAttributes(attribute.String("stat", "transitions")))
 		o.ObserveInt64(eval, int64(ns), metric.WithAttributes(attribute.String("stat", "ns")))
 		return nil
-	}, decisions, audit, verdicts, eval)
+	}, decisions, audit, verdicts, samples, eval)
 	return err
 }
 

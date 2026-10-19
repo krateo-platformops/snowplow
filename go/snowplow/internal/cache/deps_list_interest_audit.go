@@ -60,6 +60,12 @@ type narrowAudit struct {
 	changed   atomic.Uint64
 	noPrior   atomic.Uint64
 	unaudited atomic.Uint64
+	// samples counts AVOID-ONLY refreshes taken at dequeue. Each one ends in
+	// exactly one verdict, so samples == identical + changed + no_prior +
+	// unaudited once every taken refresh has settled (pinned by an arm). It is
+	// the gate's denominator: would_avoid counts MARKS, this counts the
+	// REFRESHES those marks would have saved and that were checked.
+	samples atomic.Uint64
 }
 
 type narrowAuditCell struct {
@@ -200,6 +206,9 @@ func (r *refresher) narrowAuditDequeue(ctx context.Context, key string) (context
 		return ctx, nil
 	}
 	t := &narrowAuditToken{key: key, snap: r.narrowAudit.take(key), audit: &r.narrowAudit}
+	if t.snap.avoidOnly() {
+		r.narrowAudit.samples.Add(1)
+	}
 	return context.WithValue(ctx, ctxKeyNarrowAudit, t), t
 }
 
@@ -276,7 +285,66 @@ func NoteNarrowAuditWrite(ctx context.Context, key string, prior *ResolvedEntry,
 func WithNarrowAuditAvoidOnlyForTest(ctx context.Context, key string) context.Context {
 	r := refresherSingleton()
 	t := &narrowAuditToken{key: key, snap: narrowAuditSnap{avoided: true}, audit: &r.narrowAudit}
+	r.narrowAudit.samples.Add(1)
 	return context.WithValue(ctx, ctxKeyNarrowAudit, t)
+}
+
+// ListNarrowAuditSamples returns the avoid-only refreshes taken at dequeue
+// (the audit's denominator).
+func ListNarrowAuditSamples() uint64 {
+	if r := refresherPeek(); r != nil {
+		return r.narrowAudit.samples.Load()
+	}
+	return 0
+}
+
+// ListNarrowGate is the owner's enforcement gate (#603 Q2) as ONE readout,
+// so it is never assembled by hand from counters with different units:
+//
+//	WouldAvoidMarks      list_dep MARKS enforcement would skip (needs >= 100K);
+//	AvoidOnlyRefreshes   REFRESHES those marks would have saved (the audit's
+//	                     denominator; one avoid-only refresh may carry many marks);
+//	IdenticalAudits      of those, rebuilt byte-identical (the evidence FOR
+//	                     the skip — read the gate as WouldChange == 0 against a
+//	                     minimum of these, not against marks);
+//	WouldChange          of those, the bytes changed (needs == 0);
+//	NoPrior / Unaudited  nothing to compare / never reached an accepted Put;
+//	UnauditedShare       Unaudited / AvoidOnlyRefreshes: the share of saved
+//	                     refreshes the audit could NOT check. A high share
+//	                     means WouldChange == 0 covers little.
+//
+// This is one process's view since its start. The gate spans pod restarts
+// and replicas: read it from OTLP, summing each series' last cumulative
+// value per (pod, start time) — see metrics.go registerListNarrowInstruments.
+type ListNarrowGate struct {
+	WouldAvoidMarks    uint64  `json:"would_avoid_marks"`
+	AvoidOnlyRefreshes uint64  `json:"avoid_only_refreshes"`
+	IdenticalAudits    uint64  `json:"identical_audits"`
+	WouldChange        uint64  `json:"would_change"`
+	NoPrior            uint64  `json:"no_prior"`
+	Unaudited          uint64  `json:"unaudited"`
+	UnauditedShare     float64 `json:"unaudited_share"`
+}
+
+// ListNarrowGateSnapshot assembles the gate readout from the live counters.
+func ListNarrowGateSnapshot() ListNarrowGate {
+	a := ListNarrowAuditSnapshot()
+	g := ListNarrowGate{
+		AvoidOnlyRefreshes: ListNarrowAuditSamples(),
+		IdenticalAudits:    a[AuditVerdictIdentical],
+		WouldChange:        a[AuditVerdictChanged],
+		NoPrior:            a[AuditVerdictNoPrior],
+		Unaudited:          a[AuditVerdictUnaudited],
+	}
+	for _, c := range ListNarrowDecisionsSnapshot() {
+		if c.Decision == "avoided" {
+			g.WouldAvoidMarks += c.Count
+		}
+	}
+	if g.AvoidOnlyRefreshes > 0 {
+		g.UnauditedShare = float64(g.Unaudited) / float64(g.AvoidOnlyRefreshes)
+	}
+	return g
 }
 
 // ListNarrowAuditSnapshot returns the audit verdict counts.
