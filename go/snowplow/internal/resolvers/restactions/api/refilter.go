@@ -229,7 +229,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 	// ResourcesFrom that errors or yields an empty set returns an empty
 	// slice — and evalSingle with an empty resource set DENIES every
 	// item (no resource to grant against), never allow-all.
-	resources, resOK := resolveUAFResources(ctx, log, uaf, dict)
+	resources, resOK := resolveRefilterUAFResources(ctx, log, apiCall.Name, uaf, dict)
 	if !resOK {
 		log.Error("userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
 			slog.String("api", apiCall.Name),
@@ -659,9 +659,45 @@ func compileNameFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Code) {
 //     (nil, false); the caller drops all items. An empty array is a
 //     valid "no resources" answer: returns ([], true), and evalSingle
 //     then denies every item (no resource to grant against).
+//
+// This is the STRICT form: a null element fails closed. InspectReadSet uses
+// it, where the dict holds only extras and a null means the expression reads
+// upstream stage data, which must be reported as unresolvable, never as an
+// empty read-set. The refilter uses resolveRefilterUAFResources.
 func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.UserAccessFilterSpec, dict map[string]any) ([]string, bool) {
+	out, ok, _ := uafResourceSet(ctx, log, uaf, dict, false)
+	return out, ok
+}
+
+// resolveRefilterUAFResources is resolveUAFResources for the refilter, which
+// runs against the resolved dict (#767): a null element is skipped like "".
+// A null there is an input that has no resource yet — a stage that was never
+// dispatched (no blueprint named, e.g. `[.compdef.status.resource]` on a
+// keep-warm resolve) or an object not reconciled yet — not a failure, and
+// `[.x // ""]` already meant exactly that. It stays fail-closed: an all-null
+// set is the empty set, and evalSingle denies every item against it. Every
+// other non-string element, a jq error and a non-array result still fail
+// closed as unresolved (#651: a stage error, never cached).
+//
+// The skip logs at DEBUG once per stage with the expression and the stage
+// name only, so a typo'd path that yields null stays findable.
+func resolveRefilterUAFResources(ctx context.Context, log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec, dict map[string]any) ([]string, bool) {
+	out, ok, nulls := uafResourceSet(ctx, log, uaf, dict, true)
+	if ok && nulls > 0 {
+		log.Debug("userAccessFilter: ResourcesFrom yielded null element(s); skipped (no resource to grant against)",
+			slog.String("api", stageName),
+			slog.String("expr", uaf.ResourcesFrom),
+			slog.Int("skipped_null", nulls),
+		)
+	}
+	return out, ok
+}
+
+// uafResourceSet is the shared body of the two resolvers above; skipNull
+// selects the refilter's null rule and nulls counts the elements skipped.
+func uafResourceSet(ctx context.Context, log *slog.Logger, uaf *templates.UserAccessFilterSpec, dict map[string]any, skipNull bool) ([]string, bool, int) {
 	if uaf.ResourcesFrom == "" {
-		return []string{uaf.Resource}, true
+		return []string{uaf.Resource}, true, 0
 	}
 	// Ship A (0.30.137): EvalValue returns gojq's result value directly
 	// (design §3.4.3). Fail-closed for every non-single-array outcome.
@@ -676,7 +712,7 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 			slog.String("expr", uaf.ResourcesFrom),
 			slog.Any("err", err),
 		)
-		return nil, false
+		return nil, false, 0
 	}
 	arr, isArr := v.([]any) // !ok (zero-yield) => v==nil => isArr false
 	if !ok || !isArr {
@@ -686,17 +722,22 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 		log.Warn("userAccessFilter: ResourcesFrom result is not a JSON array; fail-closed",
 			slog.String("expr", uaf.ResourcesFrom),
 		)
-		return nil, false
+		return nil, false, 0
 	}
 	out := make([]string, 0, len(arr))
 	seen := map[string]struct{}{}
+	nulls := 0
 	for _, e := range arr {
+		if e == nil && skipNull {
+			nulls++
+			continue
+		}
 		s, ok := e.(string)
 		if !ok {
 			log.Warn("userAccessFilter: ResourcesFrom yielded a non-string element; fail-closed",
 				slog.String("expr", uaf.ResourcesFrom),
 			)
-			return nil, false
+			return nil, false, 0
 		}
 		if s == "" {
 			continue // skip empty plurals — they grant nothing
@@ -707,7 +748,7 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 		seen[s] = struct{}{}
 		out = append(out, s)
 	}
-	return out, true
+	return out, true, nulls
 }
 
 // evalJQString evaluates expr against data and returns a Go string.
@@ -864,7 +905,7 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 	// Ship K / 0.30.245 — pass `dict` (full resolver scope) instead of
 	// the per-stage `pig`. `dict` carries upstream stage outputs that
 	// resourcesFrom expressions reference (e.g. `.crds`).
-	resources, resOK := resolveUAFResources(ctx, log, uaf, dict)
+	resources, resOK := resolveRefilterUAFResources(ctx, log, stageName, uaf, dict)
 	if !resOK {
 		log.Error("userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
 			slog.String("api", stageName),
