@@ -37,7 +37,8 @@
 // served, the record stays, its timer and overdue clock stop, and it is not in
 // stale_debt_open (stale_debt_parked counts it). An arm of a dependent or a new
 // stale serve joining it resumes it and restarts its overdue clock; an
-// eviction of its content cell retires it.
+// eviction of its content cell retires it, compare-and-evicting its
+// stale-derived dependents instead of re-resolving them for nobody (#755).
 //
 // THE PUSH (G2). On clear, each dependent customer key is re-resolved at once
 // through its class's refresh handler (cache.RunRefreshNow — outside the
@@ -337,11 +338,12 @@ func debtRetrySpec(d *staleDebt) cache.StaleRetrySpec {
 			return open, store != nil && store.Has(d.contentKey)
 		},
 		// The content cell left the store (evicted, never refreshed again): the
-		// stale body the debt stood for is gone, so the debt is retired through
-		// the G2 bridge — its dependents re-resolve, filling the content fresh
-		// (PR-B review: a parked debt must not linger on an evicted cell). Runs
-		// under the engine lock: clearStaleDebt never calls the engine.
-		Evicted: func() { clearStaleDebt(d) },
+		// stale body the debt stood for is gone, so the debt is retired (PR-B
+		// review: a parked debt must not linger on an evicted cell). A PARKED
+		// debt's dependents are compare-and-evicted, not re-resolved: nobody
+		// views them (#755); an active one keeps the G2 bridge. Runs under the
+		// engine lock: retireStaleDebt never calls the engine.
+		Evicted: func() { retireStaleDebt(d, true) },
 		Park: func() {
 			staleDebtsMu.Lock()
 			defer staleDebtsMu.Unlock()
@@ -426,7 +428,18 @@ func staleDebtRefillOnce(d *staleDebt) (bool, cache.StaleRetryOutcome) {
 // COMMITTED dependent now; a dependent still pending (its dispatcher has not
 // reached its write point) is replaced at its Commit instead; a withdrawn one
 // was never written stale and owes nothing.
-func clearStaleDebt(d *staleDebt) {
+func clearStaleDebt(d *staleDebt) { retireStaleDebt(d, false) }
+
+// retireStaleDebt is clearStaleDebt; contentEvicted says d's content cell left
+// the store. #755 (architect ruling): a debt PARKED at that moment does not
+// re-resolve its committed dependents for nobody — at the customer-triggered
+// class, past the cap, with a cold content fill — it compare-and-evicts each
+// still stale-derived one (the D2-3b mechanism: a newer entry is never
+// touched). Their owed-push marks stay: a tab that arms later gets its
+// refresh, and its refetch is an ordinary miss under a viewer. A pending
+// dependent is a customer at its write point right now, so it keeps the
+// replace at its Commit.
+func retireStaleDebt(d *staleDebt, contentEvicted bool) {
 	staleDebtsMu.Lock()
 	if staleDebts[d.contentKey] != d {
 		// Already retired (a concurrent clear, or a test quiesce dropped it).
@@ -439,6 +452,7 @@ func clearStaleDebt(d *staleDebt) {
 	} else {
 		staleDebtOpen.Add(-1)
 	}
+	evict := contentEvicted && d.parked
 	resumedAt := d.resumedAt
 	sinks := make([]*cache.StaleServeSink, 0, len(d.dependents))
 	for sink := range d.dependents {
@@ -446,10 +460,50 @@ func clearStaleDebt(d *staleDebt) {
 	}
 	staleDebtsMu.Unlock()
 	for _, sink := range sinks {
-		if sink.DebtCleared() {
-			goReplaceStaleDependent(sink, resumedAt)
+		if !sink.DebtCleared() {
+			continue
+		}
+		if evict {
+			evictStaleDependent(sink, resumedAt)
+			continue
+		}
+		goReplaceStaleDependent(sink, resumedAt)
+	}
+}
+
+// staleParkedEvictHookForTest runs just before a parked retire evicts a
+// dependent cell (D2-20g: a tab arms in that window). nil in production.
+var staleParkedEvictHookForTest func(l1Key string)
+
+// evictStaleDependent compare-and-evicts sink's cell if it is still the
+// stale-derived body (#755), then publishes, exactly as D2-3b's evict does: a
+// tab that armed while the cell was still stale-derived found no owed push to
+// emit, so this publish is its refresh (an unarmed key keeps its owed mark).
+func evictStaleDependent(sink *cache.StaleServeSink, from time.Time) {
+	store := cache.ResolvedCache()
+	if store == nil {
+		return
+	}
+	l1Key := sink.L1Key()
+	//serve-probe: D2 parked retire — is the dependent cell still stale-derived, serves no body
+	e, ok := store.GetNoTouch(l1Key)
+	if ok && e != nil && !e.StaleDerived {
+		return // replaced by a writer, which published
+	}
+	if ok && e != nil {
+		if staleParkedEvictHookForTest != nil {
+			staleParkedEvictHookForTest(l1Key)
+		}
+		if !store.EvictStaleDerived(l1Key, e) {
+			//serve-probe: D2 parked retire — did a writer replace the cell in between, serves no body
+			if _, still := store.GetNoTouch(l1Key); still {
+				return // a writer replaced it in between, and published
+			}
 		}
 	}
+	// Evicted now, or already gone (an LRU eviction publishes nothing, and a
+	// tab may have armed while the cell was still stale-derived).
+	finishStaleReplace(sink, from)
 }
 
 // CommitStaleServe is the dispatcher's write-point outcome for a stale-derived
