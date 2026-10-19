@@ -651,6 +651,11 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 
 	stored := c.ReplaceIfGenRefresh(rctx, key, entry, gen0)
 	cache.NoteRefreshWrite(rctx, key, stored)
+	// #603 PR-2 / #765 SHADOW audit — when every mark this cell received since
+	// its last refresh was a would-avoid, classify this rebuild against the
+	// same prior the #612 compare used: identical, or changed (would_change).
+	// Observation only.
+	cache.NoteNarrowAuditWrite(rctx, key, rebuildPrior, hadRebuildPrior, encoded, stored)
 	if stored && stageErrSink.Count() > 0 {
 		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteRefresher) // #681
 	}

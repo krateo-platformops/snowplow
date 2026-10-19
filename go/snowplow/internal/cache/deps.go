@@ -845,6 +845,11 @@ type DepTracker struct {
 	enqueueUpdateTotal atomic.Uint64 // refresh enqueues triggered by OnUpdate
 	removeL1Total      atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
 
+	// #603 PR-2 / #765 option B — the list-interest SHADOW (deps_list_interest.go):
+	// per-edge interest, the handler-side masks' registry, the would-avoid
+	// decisions and the would-change audit. Observes only; never changes a mark.
+	narrow *listNarrow
+
 	// #239 dirty-mark attribution: the {path,cause,class} distribution, per-
 	// submit-source counts, fan-out denominator and /debug/vars-only GVR
 	// drill-down. recordDirtyMarks is the SINGLE writer of dirtyMarkTotal AND
@@ -927,6 +932,7 @@ func newDepTracker(maxRecords int64) *DepTracker {
 	return &DepTracker{
 		maxRecords: maxRecords,
 		dmAttr:     newDMAttribution(),
+		narrow:     newListNarrow(),
 	}
 }
 
@@ -1042,6 +1048,13 @@ func (d *DepTracker) RecordList(ctx context.Context, l1Key string, gvr schema.Gr
 // recordInternal is the shared body of Record + RecordList. Idempotent;
 // honours the global cap.
 func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey) {
+	d.recordInternalMode(ctx, l1Key, dk, recordPlain)
+}
+
+// recordInternalMode is recordInternal with the #603 PR-2 interest mode. The
+// mode decides ONLY the reverse-index value of a list edge (deps_list_interest.go):
+// the forward index, the dedup, the cap and every counter are the same for both.
+func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk DepKey, mode recordMode) {
 	// #375 (option c) — append the recorded dep to the per-resolve sink (installed at
 	// resolve ENTRY via WithDepGenSink), gated like the capture tap below. The accepted-
 	// Put check (remarkIfDepsMoved) compares each recorded dep's bucket lastBumpSeq to
@@ -1082,6 +1095,19 @@ func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey
 		storeMaxSeq(&ks.lastBumpSeq, d.gvrLastBumpSeq(dk.GVR))
 	}
 	if _, loaded := ks.keys.LoadOrStore(l1Key, struct{}{}); loaded {
+		// #603 PR-2 — a plain re-record widens a narrowable list edge for good.
+		// The reverse value may not be in place yet (the committing Record is
+		// between its forward and reverse inserts): place it ourselves, so a
+		// plain record is never lost to that window.
+		if dk.Name == listWildcard && mode == recordPlain {
+			dsI, _ := d.reverse.LoadOrStore(l1Key, &depSet{})
+			ds := dsI.(*depSet)
+			if v, loadedV := ds.deps.LoadOrStore(dk, struct{}{}); loadedV {
+				noteReRecord(v, dk, mode)
+			} else {
+				ds.count.Add(1)
+			}
+		}
 		return // already recorded — idempotent no-op
 	}
 	// At this point we are committing a NEW edge. Bound-check first.
@@ -1118,8 +1144,10 @@ func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey
 	// Reverse: l1Key -> *depSet[DepKey]
 	dsI, loadedDS := d.reverse.LoadOrStore(l1Key, &depSet{})
 	ds := dsI.(*depSet)
-	if _, loaded := ds.deps.LoadOrStore(dk, struct{}{}); !loaded {
+	if v, loaded := ds.deps.LoadOrStore(dk, initialEdgeValue(dk, mode)); !loaded {
 		ds.count.Add(1)
+	} else {
+		noteReRecord(v, dk, mode)
 	}
 	// #479 1b / #603 PR-0 — carry the key's depSet on the forward edge, so the
 	// mark loop reads the entry class off the edge it already ranges. A CAS from
@@ -1727,6 +1755,16 @@ func (s objectState) String() string {
 // into L1 forever. See the fire site for why it precedes the no-matches
 // return.
 func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, name string, state objectState) (int, int) {
+	return d.onObjectEventMasked(gvr, namespace, name, state, nil)
+}
+
+// onObjectEventMasked is OnObjectEvent with the transition mask the informer
+// handler computed for this coordinate (#603 PR-2 SHADOW, deps_list_interest.go).
+// The mask is read ONLY by the shadow classification of list_dep marks: the
+// evict/mark partition, every enqueue and every counter are those of
+// OnObjectEvent whatever the mask says. A nil mask (a caller with no
+// transition) classifies every narrowed mark as kept{no_mask}.
+func (d *DepTracker) onObjectEventMasked(gvr schema.GroupVersionResource, namespace, name string, state objectState, mask *eventMask) (int, int) {
 	if d == nil {
 		return 0, 0
 	}
@@ -1760,6 +1798,10 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 	self := DepKey{GVR: gvr, Namespace: namespace, Name: name}
 
 	var toEvict, toMark []string
+	// #603 PR-2 SHADOW — the would-avoid list_dep marks (their enqueue carries
+	// the audit token). Classification only: toMark is built exactly as before.
+	shadow := listNarrowShadowOn()
+	var wouldAvoid map[string]struct{}
 	classCounts := map[string]int{} // #239: self / list_dep / exact_dep of the marked keys
 	// #479 1b / #603 PR-0: entry class of the marked keys, read off the edge.
 	var entryClasses dmEntryClassCounts
@@ -1808,6 +1850,16 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 		toMark = append(toMark, l1Key) // buckets 2 + 3, and self-when-present
 		classCounts[dirtyMarkClassFor(m.listOnly, isSelf)]++
 		entryClasses[m.ds.entryClassIdx()]++
+		if shadow && m.listOnly {
+			r := narrowDecide(m.ds, gvr, namespace, state, mask)
+			d.narrow.decisions[r].Add(1)
+			if r.avoided() {
+				if wouldAvoid == nil {
+					wouldAvoid = map[string]struct{}{}
+				}
+				wouldAvoid[l1Key] = struct{}{}
+			}
+		}
 	}
 
 	// 1.12.7 observability — an UNKNOWN_DEGRADED verdict structurally cannot
@@ -1823,6 +1875,14 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 	}
 	for _, l1Key := range toMark {
 		if enqueue != nil {
+			if _, avoid := wouldAvoid[l1Key]; avoid {
+				// #603 PR-2 — the would-avoid mark's enqueue consumes a one-shot
+				// audit token; it is still enqueued exactly like any other.
+				narrowAuditTokenBegin(l1Key)
+				enqueue(l1Key, gvr)
+				narrowAuditTokenEnd(l1Key)
+				continue
+			}
 			enqueue(l1Key, gvr)
 		}
 	}
@@ -2346,6 +2406,7 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 	if d == nil || l1Key == "" {
 		return
 	}
+	narrowAuditForget(l1Key) // #603 PR-2 — the key's audit pair leaves with it
 	dsI, ok := d.reverse.LoadAndDelete(l1Key)
 	if !ok {
 		return

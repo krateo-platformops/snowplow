@@ -201,6 +201,11 @@ type RefreshFunc func(ctx context.Context, key string, inputs ResolvedKeyInputs)
 type refresher struct {
 	parallelism int
 
+	// narrowAudit (#603 PR-2 SHADOW, deps_list_interest_audit.go) is the
+	// would-change audit: per key, whether every enqueue since the last
+	// accepted refresh Put was a would-avoid mark.
+	narrowAudit narrowAudit
+
 	// queue is the rate-limiting workqueue. Add(key) is idempotent
 	// dedup; AddRateLimited(key) re-enqueues with exponential backoff;
 	// the queue is unbounded so a dirty-mark is NEVER dropped.
@@ -661,6 +666,7 @@ func (r *refresher) enqueue(l1Key string) {
 	if l1Key == "" {
 		return
 	}
+	r.onEnqueueAudit(l1Key) // #603 PR-2 SHADOW audit: a token, or a taint
 	r.queue.Add(l1Key)
 	r.enqueueTotal.Add(1)
 }
@@ -679,6 +685,7 @@ func (r *refresher) enqueueClusterList(l1Key string) {
 	if l1Key == "" {
 		return
 	}
+	r.onEnqueueAudit(l1Key) // #603 PR-2 SHADOW audit: a token, or a taint
 	r.clusterListQueue.Add(l1Key)
 	r.enqueueTotal.Add(1)
 	r.clusterListEnqueueTotal.Add(1)
@@ -1067,6 +1074,9 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// part of the measured time. The stamp stays in the map (in flight) so a
 	// customer hit during the re-resolve still counts as a stale serve.
 	t0, windowOpen := r.beginWindow(key)
+	// #603 PR-2 SHADOW audit — take the key's {avoided, tainted} pair with its
+	// trigger set; the terminal write reports the bytes against it.
+	rctx, auditTok := r.narrowAuditDequeue(rctx, key)
 	var outcome *refreshOutcome
 	if windowOpen {
 		rctx, outcome = withRefreshOutcome(rctx, key)
@@ -1081,6 +1091,9 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	attemptStart := time.Now()
 	err := r.processOne(rctx, key, entry, ok)
 	attemptDur = time.Since(attemptStart)
+	// #603 PR-2 — no accepted Put restores the pair (before any eviction below,
+	// which then forgets it with the key).
+	narrowAuditSettle(auditTok, ok && entry != nil)
 	if err != nil {
 		r.failedTotal.Add(1)
 		// Poison-pill bound (Part A). NumRequeues is how many times this
