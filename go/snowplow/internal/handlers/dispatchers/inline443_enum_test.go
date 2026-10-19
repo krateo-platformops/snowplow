@@ -65,8 +65,15 @@ const (
 
 var cacheAllow443 = map[string]cacheClass443{
 	// --- side-effecting, gated inside the cache package ---------------------
-	"DepTracker.Record":                      gatedInCache443,
-	"DepTracker.RecordList":                  gatedInCache443,
+	"DepTracker.Record":     gatedInCache443,
+	"DepTracker.RecordList": gatedInCache443,
+	// #603 PR-2 SHADOW: RecordListNarrowable checks Inert itself; the commit
+	// and the widen are ctx-less and run only from commitNarrow, which checks it.
+	"DepTracker.RecordListNarrowable":        gatedInCache443,
+	"DepTracker.CommitListInterest":          gatedAtCaller443,
+	"DepTracker.WidenListInterest":           gatedAtCaller443,
+	"ListNarrowShadowOn":                     readOnly443,
+	"CommitWhyOfAnalysis":                    readOnly443,
 	"DepTracker.ReplayEdges":                 gatedInCache443,
 	"ResolvedCacheStore.PutIfGen":            gatedInCache443,
 	"ResolvedCacheStore.PutRAFullListIfGen":  gatedInCache443,
@@ -291,6 +298,8 @@ var callerAllow443 = map[string][]string{
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},
 	"BumpExternalSkippedPut":                      {"ra_full_list.go:raFullListServe"},
+	"DepTracker.CommitListInterest":               {"narrow.go:commitNarrow"},
+	"DepTracker.WidenListInterest":                {"narrow.go:commitNarrow"},
 }
 
 // goAllow443: every `go` statement on the resolve path, by "<file>:<func>",

@@ -138,6 +138,66 @@ type depWatch struct {
 
 	// nilSyncWarned ensures the O14 nil-syncCh WARN fires at most once.
 	nilSyncWarned atomic.Bool
+
+	// #603 PR-2 SHADOW — the per-coordinate transition masks (deps_list_interest.go),
+	// OR-ed by the handlers BEFORE the coordinate is enqueued and swapped out by
+	// the worker. The queue coalesces a coordinate's submits; the mask must not:
+	// an A→B→A flip still sets the bit. Bounded like the queue (one entry per
+	// pending coordinate).
+	maskMu sync.Mutex
+	masks  map[depEventKey]*eventMask
+}
+
+// mergeMask ORs m into k's pending mask.
+func (w *depWatch) mergeMask(k depEventKey, m *eventMask) {
+	if m == nil {
+		return
+	}
+	w.maskMu.Lock()
+	if w.masks == nil {
+		w.masks = map[depEventKey]*eventMask{}
+	}
+	if cur, ok := w.masks[k]; ok {
+		cur.merge(m)
+	} else {
+		cp := *m
+		cp.changed = nil
+		cp.merge(&eventMask{gen: m.gen, changed: m.changed})
+		w.masks[k] = &cp
+	}
+	w.maskMu.Unlock()
+}
+
+// takeMask removes and returns k's pending mask (nil when none).
+func (w *depWatch) takeMask(k depEventKey) *eventMask {
+	w.maskMu.Lock()
+	m := w.masks[k]
+	delete(w.masks, k)
+	w.maskMu.Unlock()
+	return m
+}
+
+// narrowUpdateMask / narrowMembershipMask / narrowUnknownMask are the
+// handler-side mask builders; nil while the shadow is off.
+func narrowUpdateMask(gvr schema.GroupVersionResource, oldObj, newObj interface{}) *eventMask {
+	if !listNarrowShadowOn() {
+		return nil
+	}
+	return Deps().updateMask(gvr, oldObj, newObj)
+}
+
+func narrowMembershipMask(gvr schema.GroupVersionResource) *eventMask {
+	if !listNarrowShadowOn() {
+		return nil
+	}
+	return Deps().membershipMask(gvr)
+}
+
+func narrowUnknownMask() *eventMask {
+	if !listNarrowShadowOn() {
+		return nil
+	}
+	return unknownMask()
 }
 
 var (
@@ -286,6 +346,9 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 		)
 	}()
 
+	// #603 PR-2 — this processing consumes every transition merged so far; one
+	// merged after this point re-adds the coordinate with its own mask.
+	mask := w.takeMask(k)
 	state := w.watcher.Load().probeObjectState(k.gvr, k.namespace, k.name)
 	switch state {
 	case objExists:
@@ -298,6 +361,7 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 		// refresher's re-fetch takes the decision against the apiserver.
 		w.counters.probeUnknown.Add(1)
 		if w.q().NumRequeues(k) < maxRefreshRequeues {
+			w.mergeMask(k, mask) // the requeued processing still owns these transitions
 			w.q().AddRateLimited(k)
 			return
 		}
@@ -316,17 +380,25 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 				"leaves the cell resident and KNOWN-STALE (#547): served, counted on known_stale_served_total "+
 				"and revalidated on the next read"),
 		)
-		Deps().OnObjectEvent(k.gvr, k.namespace, k.name, objUnknownDegraded)
+		Deps().onObjectEventMasked(k.gvr, k.namespace, k.name, objUnknownDegraded, mask)
 		return
 	}
 	w.q().Forget(k)
-	Deps().OnObjectEvent(k.gvr, k.namespace, k.name, state)
+	Deps().onObjectEventMasked(k.gvr, k.namespace, k.name, state, mask)
 }
 
 // submitDepEvent binds the watcher, starts the worker on first use and
 // enqueues the coordinate. Never blocks, never drops: the typed workqueue is
 // unbounded and deduplicates pending keys.
 func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey, source string) {
+	// #603 PR-2 — a submit that carries no transition (reconcile, relist bridge)
+	// decides nothing: its mask is unknown, so every narrowed mark is kept.
+	w.submitDepEventMask(rw, k, source, narrowUnknownMask())
+}
+
+// submitDepEventMask is submitDepEvent carrying the transition mask the
+// handler computed (#603 PR-2 SHADOW). The mask is merged BEFORE the Add.
+func (w *depWatch) submitDepEventMask(rw *ResourceWatcher, k depEventKey, source string, mask *eventMask) {
 	w.watcher.Store(rw)
 	w.startWorker()
 	w.counters.eventsSubmitted.Add(1)
@@ -342,6 +414,7 @@ func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey, source str
 		// In production startWorker above always builds the queue.
 		return
 	}
+	w.mergeMask(k, mask)
 	q.Add(k)
 }
 
@@ -482,7 +555,8 @@ func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depE
 		ns, name := metaNSName(obj)
 		w.counters.addPropagated.Add(1)
 		rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-		w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
+		// #603 PR-2 — an ADD is a membership change.
+		w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch, narrowMembershipMask(gvr))
 		// Ship 0.30.233 — CRD-ADD discovery side-effect, off the informer
 		// processor goroutine. See crd_discovery_side_effect.go.
 		if crdSideEffect {
@@ -491,10 +565,14 @@ func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depE
 	}
 	return depEventHandler{add: add, funcs: clientcache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) { add(obj, false, false) },
-		UpdateFunc: func(_, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj interface{}) {
 			ns, name := metaNSName(newObj)
 			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
+			// #603 PR-2 SHADOW — the ONLY place the pre-image exists: compare it
+			// with the new object on every live interest of the GVR, per
+			// transition, before the queue coalesces it (read-only on both).
+			w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch,
+				narrowUpdateMask(gvr, oldObj, newObj))
 			// Ship L / 0.30.246 — CRD UPDATE lifecycle hook.
 			if crdSideEffect {
 				crdDiscoverySingleton().submitCRDLifecycleEvent(newObj, crdLifecycleUpdate)
@@ -510,7 +588,8 @@ func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depE
 			}
 			ns, name := metaNSName(obj)
 			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
+			// #603 PR-2 — a DELETE (or a tombstone) is a membership change.
+			w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch, narrowMembershipMask(gvr))
 			// Ship L / 0.30.246 — CRD DELETE lifecycle hook (triggerCRDDelete).
 			if crdSideEffect {
 				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleDelete)

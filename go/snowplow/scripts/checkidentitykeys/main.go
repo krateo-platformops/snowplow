@@ -166,6 +166,7 @@ var storeRegistry = map[string]string{
 	"cache.storeVerifySkipByReason":                   "no-content (counters)",
 	"api.internalClientCache":                         "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
 	"api.discoveryClientCache":                        "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
+	"api.narrowMemo":                                  "no-content (#603 PR-2: the jqinterest read set of a RESTAction spec x tracked stage — derived from the spec alone, never from a served body or an identity)",
 }
 
 var storeName = regexp.MustCompile(`(?i)(memo|cache|store|index|shard|registry|broadcaster)|(Set|^set|^subs)$`)

@@ -173,6 +173,11 @@ type ResolveOptions struct {
 	// inline dry-run draft) switches UAF stages and endpointRef Secret reads
 	// to the caller's own identity (see Provenance).
 	Provenance Provenance
+
+	// SpecFilter is the owning RESTAction's spec.filter, read ONLY by the
+	// #603 PR-2 shadow's read-set analysis (narrow.go). Nil is safe: the
+	// analysis then reads the whole dict, a sound over-approximation.
+	SpecFilter *string
 }
 
 // accumulateErrorKey implements Ship 0.30.257 (#313) Option W-A: the shared
@@ -243,6 +248,9 @@ type resolveRun struct {
 	// without continueOnError. Written only by the orchestrator goroutine
 	// between stages (runStage after g.Wait), never by a worker.
 	failure *StageFailure
+	// narrow (#603 PR-2 SHADOW, narrow.go) records this resolve's list edges
+	// and how their calls were served; nil = plain recording.
+	narrow *narrowRun
 }
 
 // newResolveRun builds the per-call resolveRun. user is already resolved by
@@ -360,6 +368,7 @@ func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string
 	mu.Lock()
 	accumulateErrorKey(r.dict, errKey, accumVal)
 	mu.Unlock()
+	r.taintNarrow() // #603 PR-2 — an errored resolve narrows nothing
 	r.stageErrSink.Bump(id, bumpMsg)
 	r.outcomes.fail(id, stageReasonOf(accumVal))
 	if itemErr != nil {
@@ -435,6 +444,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 			// (No stage outcome: outcomes are recorded only for a
 			// caller-supplied resolve, whose UAF stage dials the caller's
 			// endpoint above and never reaches this branch.)
+			r.taintNarrow() // #603 PR-2 — a failed stage narrows nothing
 			r.stageErrSink.Bump(id, uafSAEndpointUnavailableMsg)
 			return endpoints.Endpoint{}, false, false, stageContinue
 		}
@@ -552,6 +562,7 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName))
 		accumulateErrorKey(r.dict, ptr.Deref(apiCall.ErrorKey, "error"), msg)
+		r.taintNarrow() // #603 PR-2
 		r.stageErrSink.Bump(id, msg)
 		r.outcomes.fail(id, StageReasonError)
 		return nil
@@ -575,7 +586,8 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 		if l1Key := cache.L1KeyFromContext(r.ctx); l1Key != "" && !cache.Disabled() &&
 			ptr.Deref(apiCall.Verb, http.MethodGet) == http.MethodGet {
 			if gvr, ns, ok := cache.ParseAPIServerListDepSkeleton(apiCall.Path); ok {
-				cache.Deps().RecordList(r.ctx, l1Key, gvr, ns)
+				// #603 PR-2 — no call serves this edge, so it widens at commit.
+				r.recordListEdge(id, l1Key, gvr, ns)
 				if rw := cache.Global(); rw != nil {
 					rw.EnsureResourceTypeFor(r.ctx, gvr)
 				}
@@ -795,6 +807,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// r.outcomes is nil for a nested stored resolve, so it never marks a
 		// caller's stage by name.
 		stageFailed: func(msg string) {
+			r.taintNarrow() // #603 PR-2 — a served-but-failed stage narrows nothing
 			r.stageErrSink.Bump(id, msg)
 			r.outcomes.fail(id, StageReasonError)
 		},
@@ -1010,6 +1023,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 							dispatch = "apistage-content-resolved"
 						} else {
 							ferr = feedValue(gatedVal)
+							if ferr == nil {
+								// #603 PR-2 — informer-filled content, fed clean.
+								r.noteNarrowServed(id, call.Path)
+							}
 						}
 						if ferr != nil {
 							r.log.Error("apistage-content response handler failed",
@@ -1051,6 +1068,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// recordItemError (no truncation — #313 C-A); the returned
 			// dispatch label captures whether the in-process resolve fired.
 			dispatch := feedRawOrResolved(raw, "informer")
+			if dispatch == "informer" {
+				// #603 PR-2 — informer-served and fed (a feed error taints the run).
+				r.noteNarrowServed(id, call.Path)
+			}
 			// Ship #6 — see depthForLog (support.go).
 			depth := depthForLog(r.ctx, r.log, dictMu, dict)
 			r.log.Debug("api successfully resolved",
@@ -1859,7 +1880,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 			if ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
 				if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
 					if name == "" {
-						cache.Deps().RecordList(r.ctx, l1Key, gvr, ns)
+						r.recordListEdge(id, l1Key, gvr, ns) // #603 PR-2: narrowable
 					} else {
 						cache.Deps().Record(r.ctx, l1Key, gvr, ns, name)
 					}
@@ -2008,6 +2029,10 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	// per-stage mutable primitives stay loop-local (see the resolveRun
 	// concurrency note).
 	r := newResolveRun(ctx, opts, log, user)
+	// #603 PR-2 SHADOW — settle the interest of every list edge this resolve
+	// recorded, on every return below (narrow.go).
+	r.narrow = newNarrowRun(r)
+	defer r.commitNarrow()
 	if opts.Provenance == ProvenanceCallerSupplied {
 		r.outcomes = stageOutcomesFrom(ctx)
 		r.outcomes.register(names)
@@ -2022,6 +2047,7 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 		if r.runStage(id, apiMap) {
 			// A truncating exit: this stage failed (its own item errors, if
 			// any, already carry a more specific reason).
+			r.taintNarrow() // #603 PR-2
 			r.outcomes.fail(id, StageReasonError)
 			// #709 — a truncating exit is a failure of this stage whatever its
 			// continueOnError says. Reported by class only: the endpoint error

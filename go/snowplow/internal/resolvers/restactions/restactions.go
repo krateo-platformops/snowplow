@@ -56,6 +56,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 		RESTActionNamespace: opts.In.GetNamespace(),
 		RESTActionName:      opts.In.GetName(),
 		Provenance:          opts.Provenance,
+		// #603 PR-2 SHADOW — the read-set analysis of the RESTAction chain.
+		SpecFilter: opts.In.Spec.Filter,
 	})
 	if dict == nil {
 		dict = map[string]any{}

@@ -1240,7 +1240,66 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerDenialOnlyInstruments(m); err != nil {
 		return err
 	}
+	if err := registerListNarrowInstruments(m); err != nil {
+		return err
+	}
 	return registerSecurityInstruments(m)
+}
+
+// registerListNarrowInstruments hand-wires the #603 PR-2 / #765 option B
+// SHADOW onto OTLP (no expvar->OTLP bridge). Each instrument reads the typed
+// accessor its expvar closure (snowplow_deps_list_narrow) reads, so the two
+// surfaces cannot diverge. Attributes are closed, code-defined enums only —
+// never a GVR, a key or an identity. Registered only when the cache is on
+// (CFG-1: the expvar key is published from a Disabled()-gated init).
+//
+// THE ENFORCEMENT GATE (#603 Q2) READS:
+//   - would_avoid  = snowplow_deps_list_narrow_total{outcome="avoided"}
+//   - would_change = snowplow_deps_list_narrow_audit_total{outcome="changed"}
+//
+// (attribute keys from the closed F8 set: outcome + reason)
+//
+// with the audit's other verdicts as the denominator, so a zero would_change
+// always reads as "N audited, 0 changed".
+func registerListNarrowInstruments(m metric.Meter) error {
+	decisions, err := m.Int64ObservableCounter("snowplow_deps_list_narrow_total",
+		metric.WithDescription("SHADOW (#603/#765): every list_dep dirty mark of an object event, classified by whether enforcing the JQ read-set narrowing would have skipped it. outcome=avoided reason=unread_field is a WOULD-AVOID (the UPDATE changed no field the cell can observe); outcome=kept by reason (read_field, membership, interest_all, interest_pending, registry_late, undecided, no_mask, degraded). Every mark is still made: nothing is skipped. Their sum equals the object-path list_dep dirty marks."))
+	if err != nil {
+		return err
+	}
+	audit, err := m.Int64ObservableCounter("snowplow_deps_list_narrow_audit_total",
+		metric.WithDescription("SHADOW (#603/#765) audit of refreshes whose every mark since the last refresh was a would-avoid, by outcome: identical (the skip would have been right), changed (WOULD-CHANGE: enforcement would have left the cell stale; the gate requires 0), no_prior (nothing to compare), unaudited (the refresh reached no accepted Put; its marks carry over). Residual rebuild non-determinism reads as changed."))
+	if err != nil {
+		return err
+	}
+	verdicts, err := m.Int64ObservableCounter("snowplow_deps_interest_verdict_total",
+		metric.WithDescription("SHADOW (#603/#765) record-side outcome per list edge of a RESTAction resolve: outcome=narrowed (reason=ok) or outcome=all by reason (stage_error, not_informer_served, reads_whole_item, registry_full, sticky_all, list_level_read, query_unapplied, parse, jq_unprovable). Says which templates block narrowing."))
+	if err != nil {
+		return err
+	}
+	eval, err := m.Int64ObservableCounter("snowplow_deps_interest_eval_total",
+		metric.WithDescription("SHADOW (#603/#765) informer-handler cost of the per-transition projection compare, by stat: transitions (UPDATEs evaluated against >= 1 live interest) and ns (total nanoseconds they took)."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, c := range cache.ListNarrowDecisionsSnapshot() {
+			o.ObserveInt64(decisions, int64(c.Count), metric.WithAttributes(
+				attribute.String("outcome", c.Decision), attribute.String("reason", c.Reason)))
+		}
+		for verdict, n := range cache.ListNarrowAuditSnapshot() {
+			o.ObserveInt64(audit, int64(n), metric.WithAttributes(attribute.String("outcome", verdict)))
+		}
+		for _, v := range cache.ListNarrowCommitVerdictsSnapshot() {
+			o.ObserveInt64(verdicts, int64(v.Count), metric.WithAttributes(
+				attribute.String("outcome", v.Verdict), attribute.String("reason", v.Why)))
+		}
+		tr, ns := cache.ListNarrowEvalStats()
+		o.ObserveInt64(eval, int64(tr), metric.WithAttributes(attribute.String("stat", "transitions")))
+		o.ObserveInt64(eval, int64(ns), metric.WithAttributes(attribute.String("stat", "ns")))
+		return nil
+	}, decisions, audit, verdicts, eval)
+	return err
 }
 
 // registerDenialOnlyInstruments hand-wires #681 / #682 / #677 detectors onto
