@@ -209,7 +209,7 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 	// "extras" keeps its OWN response (response wins; collision Option A). The
 	// guard mirrors the `slice` guard below: write nothing when extras is
 	// absent so the no-extras envelope stays byte-identical to pre-feature.
-	// The map is SHARED, not copied — gojq's braghettos COW fork can't mutate
+	// The map is SHARED, not copied — the gojq COW fork can't mutate
 	// the filter input (same contract as pig["slice"]).
 	if len(opts.extras) > 0 {
 		pig["extras"] = opts.extras
