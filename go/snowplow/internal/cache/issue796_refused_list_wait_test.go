@@ -186,6 +186,45 @@ func TestIssue796_W6_RecoveryClearsTheRefusal(t *testing.T) {
 	}
 }
 
+// W7 — the #776 re-registration path: a GVR refused (404), torn down, then
+// registered again once its version is served. De-registration must drop the
+// old refusal, or the new informer's healthy (slow) initial LIST would be cut
+// short by a stale mark.
+func TestIssue796_W7_ReRegistrationStartsWithoutTheOldRefusal(t *testing.T) {
+	gr := w796GVR().GroupResource()
+	// The re-creatable informer shape production relists (#776): a
+	// navigation-discovered group gets its own standalone informer, which
+	// RemoveResourceType drops and EnsureResourceType builds fresh. A
+	// shared-factory informer is never relisted in production.
+	cache.ResetNavigationDiscoveredGroupsForTest()
+	cache.AddNavigationDiscoveredGroup(w796GVR().Group)
+	t.Cleanup(cache.ResetNavigationDiscoveredGroupsForTest)
+	var served atomic.Bool
+	rw, _ := w796Watcher(t, func(int64) (bool, runtime.Object, error) {
+		if !served.Load() {
+			return true, nil, apierrors.NewNotFound(gr, "")
+		}
+		time.Sleep(800 * time.Millisecond) // healthy, but slower than the poll
+		return false, nil, nil
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for !rw.ServabilitySnapshotFor(w796GVR()).ListRefused && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !rw.ServabilitySnapshotFor(w796GVR()).ListRefused {
+		t.Fatal("PRECONDITION W7: the 404 was never recorded")
+	}
+	rw.RemoveResourceType(w796GVR())
+	served.Store(true)
+	rw.EnsureResourceType(w796GVR())
+	if !rw.WaitForGVRSync(context.Background(), w796GVR(), 5*time.Second) {
+		t.Fatal("#796 W7 RED: the re-registered informer's healthy LIST was cut short — a refusal from the torn-down informer survived de-registration")
+	}
+	if rw.ServabilitySnapshotFor(w796GVR()).ListRefused {
+		t.Fatal("W7: the re-registered, synced informer still reports the old refusal")
+	}
+}
+
 // W3 — a synced informer that later reports a terminal WATCH error still reads
 // as synced (the client-go latch); the caller's IsServable still declines.
 func TestIssue796_W3_SyncedThenRefusedStaysSynced(t *testing.T) {

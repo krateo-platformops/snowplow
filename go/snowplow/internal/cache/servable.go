@@ -1333,17 +1333,6 @@ func (rw *ResourceWatcher) StartDiscoveryRefresher(ctx context.Context) {
 // FireWatchError simulates the reflector dropping gvr's WATCH connection
 // — the exact effect of the production SetWatchErrorHandler closure.
 // After this call, servableLocked's conjunct 3 fails for gvr.
-// InvokeWatchErrorHandlerForTest drives gvr's REAL reflector error handler
-// (watchErrorHandlerFor) with err, as client-go would after a failed
-// List/Watch. Unlike FireWatchError it classifies err (#796 listRefused).
-// Tests only.
-func (rw *ResourceWatcher) InvokeWatchErrorHandlerForTest(gvr schema.GroupVersionResource, err error) {
-	if rw == nil {
-		return
-	}
-	rw.watchErrorHandlerFor(gvr)(nil, err)
-}
-
 func (rw *ResourceWatcher) FireWatchError(gvr schema.GroupVersionResource) {
 	if rw == nil {
 		return
@@ -1354,6 +1343,17 @@ func (rw *ResourceWatcher) FireWatchError(gvr schema.GroupVersionResource) {
 	}
 	rw.watchBroken[gvr] = struct{}{}
 	rw.mu.Unlock()
+}
+
+// InvokeWatchErrorHandlerForTest drives gvr's REAL reflector error handler
+// (watchErrorHandlerFor) with err, as client-go would after a failed
+// List/Watch. Unlike FireWatchError it classifies err (#796 listRefused).
+// Tests only.
+func (rw *ResourceWatcher) InvokeWatchErrorHandlerForTest(gvr schema.GroupVersionResource, err error) {
+	if rw == nil {
+		return
+	}
+	rw.watchErrorHandlerFor(gvr)(nil, err)
 }
 
 // MarkWatchRecovered simulates a successful relist clearing gvr's broken
