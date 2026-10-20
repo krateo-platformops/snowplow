@@ -4,9 +4,10 @@ usage: paired_summary.py <out-dir> <base-name> <arm-name> <pairs>
 
 Reads <name>-<n>.json (the TestScale765_Point reports). Per run it prints the
 granted CPU and the CPU-normalised figures; per pair the arm/base ratio of
-each, and whether the pair is COMPARABLE: the two runs' granted CPU (rusage
-cores) within 15% of each other (coordinator ruling). A pair outside that is
-reported, never compared. Every number here is computed from the reports; no
+each, and whether the pair is COMPARABLE: the two runs' HOST CONTENTION
+(granted rusage cores / Go-busy cores) within 15% of each other (coordinator
+ruling; it replaced a raw-granted-cores rule after #765 pair 1). A pair
+outside that is reported, never compared. Every number here is computed from the reports; no
 bound is read from the code under test.
 """
 import json
@@ -58,10 +59,16 @@ for n in range(1, pairs + 1):
         continue
     fb, fa = figures(b), figures(a)
     keys = keys or list(fb)
-    cb, ca = fb["granted_cores"], fa["granted_cores"]
+    # The pairing rule equalises HOST CONDITIONS: two runs are comparable when
+    # their host contention (granted cores / Go-busy cores) is within 15%.
+    # Changed after #765 pair 1 (coordinator ruling): the first rule compared
+    # raw granted cores, which penalises an arm for using LESS CPU, the very
+    # effect a fix like A is meant to have. Both are always reported.
+    cb, ca = fb["granted_share_of_busy"], fa["granted_share_of_busy"]
     comparable = cb > 0 and ca > 0 and abs(ca - cb) / max(ca, cb) <= TOL
-    print("pair %d: granted cores %s=%.2f %s=%.2f -> %s" % (n, base, cb, arm, ca,
-          "COMPARABLE" if comparable else "NOT COMPARABLE (granted CPU differs > 15%)"))
+    print("pair %d: host contention (granted/busy) %s=%.2f %s=%.2f; granted cores %s=%.2f %s=%.2f -> %s" % (
+        n, base, cb, arm, ca, base, fb["granted_cores"], arm, fa["granted_cores"],
+        "COMPARABLE" if comparable else "NOT COMPARABLE (host contention differs > 15%)"))
     for k in keys:
         ratio = (fa[k] / fb[k]) if fb[k] else float("nan")
         print("    %-24s %s=%-12.4g %s=%-12.4g ratio=%.3g" % (k, base, fb[k], arm, fa[k], ratio))
