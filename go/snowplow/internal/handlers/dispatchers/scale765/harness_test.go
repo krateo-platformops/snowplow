@@ -249,6 +249,7 @@ type s765H struct {
 	dyn     *dynamicfake.FakeDynamicClient
 	rw      *cache.ResourceWatcher
 	call    http.Handler
+	sse     *httptest.Server // the production /refreshes SSE route (RefreshAuth -> handlers.Refreshes), streaming
 	users   []s765User
 	widgets []s765Widget
 	api     *s765APIServer
@@ -576,6 +577,14 @@ func s765Setup(t *testing.T, cfg s765Config) *s765H {
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		handlers.Dispatcher(dispatchers.All())).
 		Then(handlers.Call())
+	// --- the /refreshes SSE route (main.go): a real streaming server, since an
+	// SSE response must flush frame by frame ---
+	sseMux := http.NewServeMux()
+	sseMux.Handle("POST /refreshes", use.NewChain(use.TraceId(), use.Logger(s765Log)).Append(
+		middleware.RefreshAuth(jwtutil.NewStaticKeySource(&key.PublicKey))).
+		Then(handlers.Refreshes()))
+	h.sse = httptest.NewServer(sseMux)
+	t.Cleanup(h.sse.Close)
 
 	t.Cleanup(func() {
 		cache.SetDirtyToFreshRecorder(nil)
@@ -1125,6 +1134,12 @@ type s765Point struct {
 	Drain      time.Duration // after churn stops: wait for the queue to empty, bounded
 	// Platform turns on the measured platform-composition churn (ruling b).
 	Platform bool
+	// Viewers > 0 turns on the VIEWED arm (#765, Diego's ruling: refresh viewed
+	// cells first): that many users, each of a distinct identity class, hold the
+	// dashboard page open (a live /refreshes subscription on its 5
+	// dashboard-data widgets, re-fetching a widget on each push, as the SPA
+	// does); as many other classes form the unviewed control group.
+	Viewers int
 }
 
 // s765Snap is every in-process instrument at one instant.
@@ -1321,6 +1336,9 @@ type s765Report struct {
 	StaleServedDelta uint64                    `json:"stale_served_total_delta"`
 	ResidentAtEnd    int                       `json:"resident_entries_at_end"`
 	UnservedReads    map[string]int            `json:"apiserver_unserved_reads"`
+
+	ChurnRateNote string            `json:"churn_rate_note"`
+	Viewed        *s765ViewedReport `json:"viewed,omitempty"`
 
 	DrainWall    string `json:"drain_wall,omitempty"`
 	DrainReached bool   `json:"drain_reached"`
@@ -1569,6 +1587,11 @@ func (h *s765H) run(p s765Point) s765Report {
 		}
 	}()
 
+	var viewed *s765Viewed
+	if p.Viewers > 0 {
+		viewed = h.startViewed(ctx, &wg, p.Viewers, &measuring)
+	}
+
 	started := time.Now()
 	h.t.Logf("scale765 %s@%g: warm-up %s", p.Mode, p.Rate, p.WarmUp)
 	time.Sleep(p.WarmUp)
@@ -1763,6 +1786,10 @@ func (h *s765H) run(p s765Point) s765Report {
 	rep.StaleServedDelta = b.store.StaleServedTotal - a.store.StaleServedTotal
 	_, rep.ResidentAtEnd = s765Resident()
 	rep.UnservedReads = h.api.unservedReads()
+	rep.ChurnRateNote = "the churn rate is a harness ASSUMPTION (run 8's bench rate), not a measured production rate"
+	if viewed != nil {
+		rep.Viewed = viewed.report()
+	}
 
 	if p.Drain > 0 {
 		d0 := time.Now()

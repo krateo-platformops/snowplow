@@ -123,7 +123,15 @@ func TestScale765_Point(t *testing.T) {
 	s765RefuseBusyHost(t)
 	h := s765Setup(t, s765Full())
 	s765Emit(t, label+"-populate", h.populate())
-	rep := h.run(s765FullPoint(t, mode, rate))
+	pt := s765FullPoint(t, mode, rate)
+	if v := os.Getenv("SCALE765_VIEWERS"); v != "" { // the viewed arm (viewed_test.go)
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("SCALE765_VIEWERS: %v", err)
+		}
+		pt.Viewers = n
+	}
+	rep := h.run(pt)
 	s765Emit(t, label, rep)
 }
 

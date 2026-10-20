@@ -39,7 +39,7 @@ func TestScale765_Smoke(t *testing.T) {
 	for _, mode := range []s765Mode{s765Annotation, s765Status} {
 		rep := h.run(s765Point{Mode: mode, Rate: 10, WarmUp: 2 * time.Second, Measure: 8 * time.Second,
 			ProbeEvery: 2 * time.Second, PollEvery: 250 * time.Millisecond, CustEvery: 500 * time.Millisecond,
-			Drain: 15 * time.Second, Platform: mode == s765Status})
+			Drain: 15 * time.Second, Platform: mode == s765Status, Viewers: 2})
 		s765Emit(t, "smoke-"+string(mode), rep)
 		arm := "smoke " + string(mode)
 		if rep.EventsWritten < 50 || rep.WriteErrors != 0 {
@@ -61,6 +61,10 @@ func TestScale765_Smoke(t *testing.T) {
 		}
 		if mode == s765Status && (rep.PlatformEvents == 0 || rep.MarksPerPlatformEvent == 0) {
 			t.Errorf("%s: platform churn wrote %d events, %.1f marks each", arm, rep.PlatformEvents, rep.MarksPerPlatformEvent)
+		}
+		if vw := rep.Viewed; vw == nil || vw.StreamsConnected != 2 || vw.StreamErrors != 0 ||
+			vw.Subscribed.Cells != 10 || vw.Unsubscribed.Cells != 10 {
+			t.Errorf("%s: viewed arm not running: %+v", arm, vw)
 		}
 		if rep.NarrowGate.WouldChange != 0 {
 			t.Errorf("%s: B shadow would_change=%d: a mark enforcement would skip changed its cell (%+v)",
