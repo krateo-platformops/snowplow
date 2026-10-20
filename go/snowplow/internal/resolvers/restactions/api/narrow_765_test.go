@@ -15,8 +15,8 @@ package api
 
 import (
 	"context"
-	"os"
-	"path/filepath"
+	"go/ast"
+	"go/types"
 	"strings"
 	"testing"
 
@@ -26,6 +26,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"golang.org/x/tools/go/packages"
 	"k8s.io/client-go/rest"
 )
 
@@ -90,6 +91,39 @@ func TestNarrow765_R4_SpecFilterIsPartOfTheChain(t *testing.T) {
 	}
 }
 
+// R7 — END TO END through #651 (architect-623): a UAF stage served from the
+// informer whose resourcesFrom does not resolve is a served-but-FAILED stage
+// (its feed returns nil, so the call reads as informer-served). The edge must
+// stay all. The control (a resolving resourcesFrom) narrows, so the arm is not
+// vacuous.
+func TestNarrow765_R7_ServedButFailedUAFStageDoesNotNarrow(t *testing.T) {
+	newWatcher375(t)
+	orig := serviceAccountEndpointFn
+	serviceAccountEndpointFn = func() (*endpoints.Endpoint, error) {
+		return &endpoints.Endpoint{ServerURL: "http://test.invalid", Token: "sa-765"}, nil
+	}
+	t.Cleanup(func() { serviceAccountEndpointFn = orig })
+	uafStage := func(resourcesFrom string) *templates.API {
+		st := stage765(`[.w.items[] | {name: .metadata.name}]`)
+		st.UserAccessFilter = &templates.UserAccessFilterSpec{
+			Verb: "list", Group: f1WidgetsGVR.Group, ResourcesFrom: resourcesFrom, NamespaceFrom: ".metadata.namespace",
+		}
+		return st
+	}
+	run := func(key, resourcesFrom string) string {
+		t.Helper()
+		resolve765(t, key, nil, uafStage(resourcesFrom))
+		return cache.ListInterestStateForTest(key, dk765())
+	}
+	if got := run("n765-r7-control", `["`+f1WidgetsGVR.Resource+`"]`); !strings.HasPrefix(got, "narrowed:") {
+		t.Fatalf("R7 setup: a UAF stage with a resolving resourcesFrom must narrow (else the arm is vacuous), got %q", got)
+	}
+	if got := run("n765-r7-failed", "[ (.crds"); got != "all" {
+		t.Fatalf("R7 RED: a served-but-failed UAF stage (#651: resourcesFrom does not resolve) narrowed its "+
+			"edge (%q). The stage error must taint the resolve.", got)
+	}
+}
+
 // R6 — STRUCTURAL: every stage-error sink bump in this package taints the
 // resolve's narrowing. A stage error can put partial or fail-closed data into
 // the output while its calls still read as informer-served (#651's
@@ -97,40 +131,141 @@ func TestNarrow765_R4_SpecFilterIsPartOfTheChain(t *testing.T) {
 // tainting would let that edge narrow. New error sites keep landing (#651,
 // #760); a missing edge must read RED, not green (#533).
 func TestNarrow765_R6_EveryStageErrorSiteTaintsTheNarrowing(t *testing.T) {
-	files, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatal(err)
+	// TYPE-BASED, not textual. A "bump" is any call of a method named Bump
+	// whose receiver is *cache.StageErrorSink OR an INTERFACE that
+	// *cache.StageErrorSink implements (a bump through an interface value —
+	// architect-623's probe on #784), reached through any identifier, field,
+	// alias or closure. A Bump SELECTED without being called (a method value,
+	// `f := sink.Bump`) is forbidden outright: the call it later makes is not
+	// visible here. LIMIT (documented): a bump made by ANOTHER package on this
+	// resolve's sink is not seen; the site count (>= 4) keeps a refactor that
+	// moves the bumps out of reach from reading vacuously green.
+	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+		packages.NeedTypes | packages.NeedTypesInfo, Tests: false}
+	pkgs, err := packages.Load(cfg, ".")
+	if err != nil || len(pkgs) != 1 || len(pkgs[0].Errors) > 0 {
+		t.Fatalf("load package: %v %v", err, pkgs)
 	}
-	sites := 0
-	for _, f := range files {
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		b, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		lines := strings.Split(string(b), "\n")
-		for i, l := range lines {
-			if !strings.Contains(l, "stageErrSink.Bump(") {
-				continue
+	pkg := pkgs[0]
+	var sinkPtr types.Type
+	for _, imp := range pkg.Types.Imports() {
+		if strings.HasSuffix(imp.Path(), "/internal/cache") {
+			if obj := imp.Scope().Lookup("StageErrorSink"); obj != nil {
+				sinkPtr = types.NewPointer(obj.Type())
 			}
-			sites++
-			prev := ""
-			for j := i - 1; j >= 0; j-- {
-				if p := strings.TrimSpace(lines[j]); p != "" && !strings.HasPrefix(p, "//") {
-					prev = p
-					break
+		}
+	}
+	if sinkPtr == nil {
+		t.Fatalf("R6: cache.StageErrorSink not found among the package's imports")
+	}
+	// isBumpSel: the selector names a Bump method on the sink, or on an
+	// interface the sink satisfies.
+	isBumpSel := func(sel *ast.SelectorExpr) bool {
+		if sel.Sel.Name != "Bump" {
+			return false
+		}
+		fn, ok := pkg.TypesInfo.Uses[sel.Sel].(*types.Func)
+		if !ok {
+			return false
+		}
+		sig, ok := fn.Type().(*types.Signature)
+		if !ok || sig.Recv() == nil {
+			return false
+		}
+		recv := sig.Recv().Type()
+		if types.Identical(recv, sinkPtr) {
+			return true
+		}
+		if iface, ok := recv.Underlying().(*types.Interface); ok {
+			return types.Implements(sinkPtr, iface)
+		}
+		return false
+	}
+	isBump := func(e ast.Expr) bool {
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		return ok && isBumpSel(sel)
+	}
+	// Every Bump selector must be the callee of a call (no method values).
+	selectors, callees := 0, 0
+	for _, f := range pkg.Syntax {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.SelectorExpr:
+				if isBumpSel(x) {
+					selectors++
+				}
+			case *ast.CallExpr:
+				if sel, ok := x.Fun.(*ast.SelectorExpr); ok && isBumpSel(sel) {
+					callees++
 				}
 			}
-			if !strings.HasPrefix(prev, "r.taintNarrow()") {
-				t.Errorf("R6 RED: %s:%d bumps the stage-error sink without r.taintNarrow() right before it: "+
-					"an errored resolve could narrow its list edges", f, i+1)
-			}
+			return true
+		})
+	}
+	if selectors != callees {
+		t.Errorf("R6 RED: %d Bump selections but only %d are called directly: a method value (f := sink.Bump) "+
+			"hides the bump from the taint rule", selectors, callees)
+	}
+	isTaint := func(st ast.Stmt) bool {
+		es, ok := st.(*ast.ExprStmt)
+		if !ok {
+			return false
 		}
+		call, ok := es.X.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		return ok && sel.Sel.Name == "taintNarrow"
+	}
+	sites := 0
+	for _, f := range pkg.Syntax {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && isBump(call) {
+				sites++
+			}
+			blk, ok := n.(*ast.BlockStmt)
+			if !ok {
+				return true
+			}
+			for i, st := range blk.List {
+				es, ok := st.(*ast.ExprStmt)
+				if !ok || !isBump(es.X) {
+					continue
+				}
+				if i == 0 || !isTaint(blk.List[i-1]) {
+					t.Errorf("R6 RED: %s bumps the stage-error sink without r.taintNarrow() right before it: "+
+						"an errored resolve could narrow its list edges", pkg.Fset.Position(es.Pos()))
+				}
+			}
+			return true
+		})
 	}
 	if sites < 4 {
-		t.Fatalf("R6: found %d sink bump sites, want >= 4 (the guard is scanning the wrong files)", sites)
+		t.Fatalf("R6: found %d StageErrorSink.Bump calls, want >= 4 (the guard is not seeing the error sites)", sites)
+	}
+	// Every Bump call is a statement in a block (checked above); a Bump nested
+	// in an expression would escape the adjacency rule, so forbid it.
+	stmtBumps := 0
+	for _, f := range pkg.Syntax {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if blk, ok := n.(*ast.BlockStmt); ok {
+				for _, st := range blk.List {
+					if es, ok := st.(*ast.ExprStmt); ok && isBump(es.X) {
+						stmtBumps++
+					}
+				}
+			}
+			return true
+		})
+	}
+	if stmtBumps != sites {
+		t.Fatalf("R6 RED: %d StageErrorSink.Bump calls, only %d are plain statements; a Bump inside an "+
+			"expression escapes the taint rule", sites, stmtBumps)
 	}
 }
 

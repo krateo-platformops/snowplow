@@ -643,3 +643,50 @@ func TestListNarrow765_S3_RefreshWithoutAcceptedPutRestoresTheTaint(t *testing.T
 		t.Fatalf("S3: the second refresh must store the current bytes, served %v", b)
 	}
 }
+
+// --- G1: the gate readout (#765 follow-up) -----------------------------------
+//
+// would_avoid counts MARKS; the audit counts REFRESHES. The readout keeps them
+// apart, carries the audit's own denominator (avoid-only refreshes) and the
+// unaudited coverage share over REFRESHES, never over marks. A narrowed cell
+// that is NOT resident takes would-avoid marks but no refresh: it is what
+// makes the two units differ here.
+func TestListNarrow765_G1_GateReadoutSeparatesMarksFromRefreshes(t *testing.T) {
+	h := newAuditHarness(t)
+	const resident, ghost = "L1_g1_resident", "L1_g1_ghost"
+	narrowCreate(t, h.rw, h.dyn, h.gvr, narrowObj(h.gvr, "a", "p1", "n1"))
+	waitQueueIdle(t, harnessWaitBound)
+	h.cell(t, resident, filterNamePhase)
+	narrowKey(t, h.d, ghost, h.gvr, narrowReads(t, filterNamePhase)) // an edge, no resident cell
+	g0 := ListNarrowGateSnapshot()
+
+	// 1) annotation-only UPDATE whose refresh is DECLINED: one avoid-only
+	//    refresh, unaudited. 2) another, accepted: identical.
+	h.decline.Store(resident, true)
+	narrowUpdate(t, h.dyn, h.gvr, "a", setAnn("n2"))
+	h.waitRefreshed(t, resident, 1)
+	narrowUpdate(t, h.dyn, h.gvr, "a", setAnn("n3"))
+	h.waitRefreshed(t, resident, 2)
+
+	g := ListNarrowGateSnapshot()
+	if got := g.WouldAvoidMarks - g0.WouldAvoidMarks; got != 4 {
+		t.Fatalf("G1: 2 UPDATEs x 2 narrowed cells = 4 would-avoid MARKS, got %d (%+v)", got, g)
+	}
+	if got := g.AvoidOnlyRefreshes - g0.AvoidOnlyRefreshes; got != 2 {
+		t.Fatalf("G1 RED: the resident cell's 2 avoid-only REFRESHES must be the audit denominator "+
+			"(the ghost has marks but no refresh), got %d (%+v)", got, g)
+	}
+	if g.IdenticalAudits-g0.IdenticalAudits != 1 || g.Unaudited-g0.Unaudited != 1 || g.WouldChange != g0.WouldChange {
+		t.Fatalf("G1: want 1 identical + 1 unaudited + 0 changed, got %+v (from %+v)", g, g0)
+	}
+	if g.AvoidOnlyRefreshes != g.IdenticalAudits+g.WouldChange+g.NoPrior+g.Unaudited {
+		t.Fatalf("G1 RED: samples (%d) != identical+changed+no_prior+unaudited (%d): every taken sample "+
+			"must end in exactly one outcome (%+v)", g.AvoidOnlyRefreshes, g.IdenticalAudits+g.WouldChange+g.NoPrior+g.Unaudited, g)
+	}
+	if want := float64(g.Unaudited) / float64(g.AvoidOnlyRefreshes); g.UnauditedShare != want {
+		t.Fatalf("G1 RED: unaudited_share %v, want unaudited / avoid-only refreshes = %v (never over marks)", g.UnauditedShare, want)
+	}
+	if _, ok := ListNarrowExpvar().(map[string]any)["gate"].(ListNarrowGate); !ok {
+		t.Fatalf("G1: expvar snowplow_deps_list_narrow carries no gate readout")
+	}
+}
