@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -138,7 +139,13 @@ func TestContentFill710_ADM1_ConcurrentWeightNeverExceedsCeiling_AllComplete(t *
 	release()
 }
 
-func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionWithin2x(t *testing.T) {
+// adm2Tolerance is how far a calibrated expansion and the next fill's weight
+// may sit from the measured ratio (#780 issuecomment-6284877941): 1%. "Within
+// 2×" let a HALVED learned expansion through (1.5 is not < 3.0/2), which is the
+// gate undercharging every later fill by half.
+const adm2Tolerance = 0.01
+
+func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionToTheMeasuredRatio(t *testing.T) {
 	fill710Admission(t)
 	const (
 		gvr       = "adm2.example/v1, Resource=things"
@@ -160,15 +167,17 @@ func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionWithin2x(t *tes
 	release()
 
 	got := ContentFillAdmissionStatsSnapshot().Expansion[gvr]
-	if got < realRatio/2 || got > realRatio*2 {
-		t.Fatalf("F-ADM2 RED: after one measured fill the expansion is %.2f, want within 2× of the real %.1f (seed %.0f)", got, realRatio, contentFillExpansionSeed)
+	if math.Abs(got-realRatio) > adm2Tolerance*realRatio {
+		t.Fatalf("F-ADM2 RED: after one measured fill the expansion is %.4f, want the measured %.1f within %.0f%% (seed %.0f)",
+			got, realRatio, adm2Tolerance*100, contentFillExpansionSeed)
 	}
 	release2, _, err := admitContentFillForTest(context.Background(), gvr, raw, fillClassCustomer)
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
-	if w, _ := contentFillGateStateForTest(); float64(w) > 2*realRatio*float64(raw) || float64(w) < realRatio/2*float64(raw) {
-		t.Fatalf("F-ADM2: the next fill's weight %d does not track the measured expansion", w)
+	want := realRatio * float64(raw)
+	if w, _ := contentFillGateStateForTest(); math.Abs(float64(w)-want) > adm2Tolerance*want {
+		t.Fatalf("F-ADM2 RED: the next fill's weight %d is not raw × the measured expansion (%.0f) within %.0f%%", w, want, adm2Tolerance*100)
 	}
 	release2()
 
