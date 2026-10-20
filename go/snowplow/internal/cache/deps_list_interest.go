@@ -336,6 +336,13 @@ func (d *DepTracker) commitReads(l1Key string, dk DepKey, reads []jqinterest.Rea
 
 // EdgeNarrowState is one edge's interest state, snapshotted for a replay.
 // Opaque outside the cache package.
+//
+// EdgeNarrowStates leaves the ZERO VALUE at the index of an EXACT edge
+// (Name != "*"). Its reason reads as rsNarrowed, but it is never consulted: an
+// exact edge replays through Record (ReplayEdgesWithStates' else branch), and
+// only a LIST edge reaches replayListEdge, which reads the state. A LIST edge
+// always gets an explicit state (narrowed with its li, or all / pending /
+// absent with li == nil), so a zero value never stands for "narrowed".
 type EdgeNarrowState struct {
 	li     *listInterest
 	reason uint8
