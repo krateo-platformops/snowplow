@@ -113,6 +113,10 @@ func (c *crdDiscovery) submitListRefused(rw *ResourceWatcher, gvr schema.GroupVe
 
 // handleListRefused is the worker-side half: retire gvr only if the CRD's
 // recorded served set exists and does not name its version.
+//
+// rw is the watcher whose reflector reported the 404. In production that is
+// always Global(), which is the watcher recordServedVersions unblocks — block
+// and unblock land on the same set.
 func (c *crdDiscovery) handleListRefused(rw *ResourceWatcher, gvr schema.GroupVersionResource) {
 	if rw == nil {
 		return

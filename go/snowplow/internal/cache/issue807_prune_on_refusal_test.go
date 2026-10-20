@@ -22,6 +22,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	metadatafake "k8s.io/client-go/metadata/fake"
 )
 
 // crdBytesObjServing builds a CRD whose spec.versions lists every name in
@@ -248,5 +249,107 @@ func TestIssue807_SchemaPruneAlsoBlocks(t *testing.T) {
 	}
 	if added, _ := rw.EnsureResourceType(newGVR); !added {
 		t.Fatalf("over-block: the newly served %s was refused", newGVR)
+	}
+}
+
+// TestIssue807_EveryFunnelRefusesBlockedVersion — the block holds on all three
+// registration funnels, not only EnsureResourceType. EnsureResourceTypeMetadataOnly
+// and AddResourceType have no production caller today; a future one must not
+// become the door a retired version comes back through. Each refusal counts
+// exactly once.
+func TestIssue807_EveryFunnelRefusesBlockedVersion(t *testing.T) {
+	const group, plural = "composition.krateo.io", "frontends"
+	stale := schema.GroupVersionResource{Group: group, Version: "v1-8-6", Resource: plural}
+	rw, add, _ := setup807(t, stale)
+	// Wired so EnsureResourceTypeMetadataOnly reaches its block check rather
+	// than returning early on a missing metadata client.
+	rw.SetMetadataClient(metadatafake.NewSimpleMetadataClient(metadatafake.NewTestScheme()))
+
+	add(crdBytesObjServing(t, group, plural, []string{"v1-8-6", "v1-8-8"}, map[string]bool{"v1-8-8": true}))
+	waitProcessed807(t, 1, "CRD ADD")
+	rw.EnsureResourceType(stale)
+	rw.watchErrorHandlerFor(stale)(nil, refusedListErr(stale))
+	waitProcessed807(t, 2, "the LIST refusal")
+	if !rw.IsUnservedVersionBlocked(stale) || rw.IsRegistered(stale) {
+		t.Fatalf("precondition: %s blocked=%v registered=%v, want blocked and unregistered",
+			stale, rw.IsUnservedVersionBlocked(stale), rw.IsRegistered(stale))
+	}
+
+	refused := func() uint64 { return CRDDiscoveryStatsSnapshot().UnservedRegistrationsRefused }
+	closedCh := func(ch <-chan struct{}) bool {
+		if ch == nil {
+			return false
+		}
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+	funnels := []struct {
+		name string
+		call func() (added bool, ch <-chan struct{}, hasCh bool)
+	}{
+		{"EnsureResourceType", func() (bool, <-chan struct{}, bool) {
+			a, c := rw.EnsureResourceType(stale)
+			return a, c, true
+		}},
+		{"EnsureResourceTypeMetadataOnly", func() (bool, <-chan struct{}, bool) {
+			a, c := rw.EnsureResourceTypeMetadataOnly(stale)
+			return a, c, true
+		}},
+		{"AddResourceType", func() (bool, <-chan struct{}, bool) {
+			rw.AddResourceType(stale)
+			return false, nil, false
+		}},
+	}
+	for _, f := range funnels {
+		before := refused()
+		added, ch, hasCh := f.call()
+		if added || rw.IsRegistered(stale) {
+			t.Fatalf("RED (#807): %s REGISTERED the blocked version %s — a retired version comes back through "+
+				"this funnel and 404s forever", f.name, stale)
+		}
+		if hasCh && !closedCh(ch) {
+			t.Fatalf("%s refused %s without an already-closed channel — a caller waiting on it would block", f.name, stale)
+		}
+		if got := refused() - before; got != 1 {
+			t.Fatalf("%s moved unserved_version_registrations_refused_total by %d, want exactly 1", f.name, got)
+		}
+	}
+}
+
+// TestIssue807_EmptyServedSetForgetsAndDeclines — a CRD event whose served set
+// is empty (no served version, or a versions subtree that could not be read —
+// crdServedGVRs cannot tell them apart) must FORGET the CRD's record, not store
+// "serves nothing" and not keep the previous one. A 404 then declines as
+// crd_unknown: the version stays registered and is not blocked.
+func TestIssue807_EmptyServedSetForgetsAndDeclines(t *testing.T) {
+	const group, plural = "composition.krateo.io", "krateoobservabilities"
+	gvr := schema.GroupVersionResource{Group: group, Version: "v0-1-22", Resource: plural}
+	rw, add, update := setup807(t, gvr)
+
+	versions := []string{"v0-1-22", "v0-1-23"}
+	withRecord := crdBytesObjServing(t, group, plural, versions, map[string]bool{"v0-1-23": true})
+	add(withRecord)
+	waitProcessed807(t, 1, "CRD ADD")
+	// The same versions, none served: the served set is empty.
+	noneServed := crdBytesObjServing(t, group, plural, versions, map[string]bool{})
+	update(withRecord, noneServed)
+	waitProcessed807(t, 2, "CRD UPDATE with an empty served set")
+
+	rw.EnsureResourceType(gvr)
+	rw.watchErrorHandlerFor(gvr)(nil, refusedListErr(gvr))
+	waitProcessed807(t, 3, "the LIST refusal")
+
+	s := CRDDiscoveryStatsSnapshot()
+	if !rw.IsRegistered(gvr) || rw.IsUnservedVersionBlocked(gvr) || s.RefusedVersionPruned != 0 {
+		t.Fatalf("RED (#807 over-prune): after an empty served set, a 404 on %s pruned=%d registered=%v blocked=%v. "+
+			"An empty set may be an unreadable spec; deciding against it (or against the record it replaced) "+
+			"tears down a live informer", gvr, s.RefusedVersionPruned, rw.IsRegistered(gvr), rw.IsUnservedVersionBlocked(gvr))
+	}
+	if s.ListRefusedCRDUnknown != 1 {
+		t.Fatalf("list_refused_crd_unknown_total=%d, want 1 — the empty set must FORGET the record", s.ListRefusedCRDUnknown)
 	}
 }
