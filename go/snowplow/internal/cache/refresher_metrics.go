@@ -97,6 +97,7 @@ func registerRefresherMetrics() {
 		expvar.Publish("snowplow_refresher_viewed_customer_triggered_total", refresherStatFunc("viewed_customer_triggered"))
 		expvar.Publish("snowplow_refresher_viewed_unsubscribed_total", refresherStatFunc("viewed_unsubscribed"))
 		expvar.Publish("snowplow_refresher_viewed_queue_depth", refresherStatFunc("viewed_queue_depth"))
+		expvar.Publish("snowplow_refresher_deferred_in_flight_total", refresherStatFunc("deferred_in_flight"))
 		expvar.Publish("snowplow_refresher_suppressed_set_total", refresherStatFunc("suppressed_set"))
 		expvar.Publish("snowplow_refresher_suppressed_skips_total", refresherStatFunc("suppressed_skips"))
 		expvar.Publish("snowplow_refresher_suppressed_keys", refresherStatFunc("suppressed_keys"))

@@ -255,6 +255,12 @@ type refresher struct {
 	viewedQueue  workqueue.TypedRateLimitingInterface[string]
 	promotedKeys sync.Map
 	viewed       viewedTierStats
+	// #799 B1 — priorityGetMu makes a priority tier's Len()>0 probe and its Get
+	// one step. B2 — inFlightKeys: the keys a worker is re-resolving now (value:
+	// a dequeue of it from another tier was deferred and must be re-added).
+	priorityGetMu sync.Mutex
+	inFlightMu    sync.Mutex
+	inFlightKeys  map[string]bool
 
 	handlersMu sync.RWMutex
 	handlers   map[string]RefreshFunc
@@ -433,6 +439,7 @@ func refresherSingleton() *refresher {
 			queue:            normalQ,
 			clusterListQueue: workqueue.NewTypedRateLimitingQueue[string](clRL),
 			viewedQueue:      newViewedQueue(vRL, normalQ),
+			inFlightKeys:     map[string]bool{},
 			handlers:         map[string]RefreshFunc{},
 			resolveLatency:   newP2Quantile(0.95),
 			dirtyStats:       newDirtyWindowStats(),
@@ -643,14 +650,7 @@ func (r *refresher) onDirtyMark(l1Key string, triggerGVR schema.GroupVersionReso
 	// #765 — a key open on a page (an armed /refreshes subscription) goes to the
 	// VIEWED tier, drained first. Checked AFTER markDirty: an arm racing this mark
 	// either is seen here, or sees the window markDirty opened (promoteOnArm).
-	switch _, isClusterList := r.clusterListKeys.Load(l1Key); {
-	case HasRefreshSubscriber(l1Key):
-		r.enqueueViewed(l1Key)
-	case isClusterList:
-		r.enqueueClusterList(l1Key)
-	default:
-		r.enqueue(l1Key)
-	}
+	r.routeDirty(l1Key)
 	// #374/#375/#383 INVARIANT — the residency-gated enqueue-DROP (#383,
 	// above) gates ONLY the trigger store + r.enqueue/enqueueClusterList;
 	// SubmitSliceabilityInvalidate fires UNCONDITIONALLY for every
@@ -914,18 +914,13 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		tier     = tierNormal
 	)
 	// #765 — the VIEWED tier first (refresher_viewed.go): cells open on a page.
-	if r.viewedQueue != nil && r.viewedQueue.Len() > 0 {
-		key, shutdown = r.viewedQueue.Get()
-		if !shutdown {
-			tier = tierViewed
-		}
-	}
-	if tier != tierViewed && r.clusterListQueue != nil && r.clusterListQueue.Len() > 0 {
-		key, shutdown = r.clusterListQueue.Get()
-		if !shutdown {
-			fromCL = true
-			tier = tierClusterList
-		}
+	// #799 B1 — the probe and its Get are ONE step (tryPriorityGet): two workers
+	// that both saw Len()==1 must not both reach the blocking Get, or the loser
+	// parks there and the normal tier runs a worker short.
+	if k, ok := r.tryPriorityGet(r.viewedQueue, tierViewed); ok {
+		key, tier = k, tierViewed
+	} else if k, ok := r.tryPriorityGet(r.clusterListQueue, tierClusterList); ok {
+		key, tier, fromCL = k, tierClusterList, true
 	}
 	if tier == tierNormal {
 		// Normal tier blocking Get. This is the steady-state path
@@ -977,6 +972,14 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		r.viewed.skippedConsumed.Add(1)
 		return true
 	}
+	// #799 B2 — one re-resolve of a key at a time ACROSS tiers. The workqueue
+	// only serialises a key within one tier; a key in flight on another tier is
+	// not run here and keeps its trigger set, and the worker finishing it re-adds
+	// it (refresher_viewed.go claimInFlight / releaseInFlight).
+	if !r.claimInFlight(key) {
+		return true
+	}
+	defer r.releaseInFlight(key)
 	// #547 — a background revalidation of a known-stale shared shell settles with
 	// this dequeue (runs before Done, after every branch below has settled the
 	// window).
@@ -1492,6 +1495,7 @@ type refresherStats struct {
 	viewedSkippedConsumed uint64 `stat:"viewed_skipped_consumed"`
 	viewedCustomer        uint64 `stat:"viewed_customer_triggered"`
 	viewedUnsubscribed    uint64 `stat:"viewed_unsubscribed"`
+	deferredInFlight      uint64 `stat:"deferred_in_flight"` // #799 B2
 	viewedQueueDepth      int64  `stat:"viewed_queue_depth" kind:"gauge" desc:"Live depth of the refresher's viewed tier (#765): dirty cells open on a page, drained before every other tier."`
 }
 
@@ -1534,6 +1538,7 @@ func refresherStatsSnapshot() refresherStats {
 		viewedSkippedConsumed: r.viewed.skippedConsumed.Load(),
 		viewedCustomer:        r.viewed.customer.Load(),
 		viewedUnsubscribed:    r.viewed.unsubscribed.Load(),
+		deferredInFlight:      r.viewed.deferredInFlight.Load(),
 		viewedQueueDepth:      viewedQueueDepth(r),
 	}
 }
@@ -1619,6 +1624,8 @@ func AddRefresherPoolCounterForTest(stat string, n uint64) bool {
 		r.viewed.customer.Add(n)
 	case "viewed_unsubscribed":
 		r.viewed.unsubscribed.Add(n)
+	case "deferred_in_flight":
+		r.viewed.deferredInFlight.Add(n)
 	case "parked_ms":
 		r.parkedNanos.Add(n * uint64(time.Millisecond))
 	case "dirty_to_fresh_samples":

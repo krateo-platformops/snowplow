@@ -94,6 +94,9 @@ type viewedTierStats struct {
 	skippedConsumed atomic.Uint64
 	customer        atomic.Uint64
 	unsubscribed    atomic.Uint64
+	// deferredInFlight (#799 B2): dequeues not run because another tier's
+	// worker was re-resolving the same key; the key was re-added when it ended.
+	deferredInFlight atomic.Uint64
 }
 
 // enqueueViewed adds l1Key to the viewed tier and wakes an idle worker.
@@ -173,6 +176,78 @@ func (r *refresher) consumedElsewhere(key string, tier refreshTier) bool {
 func (r *refresher) consumeTriggersOnTier(key string, tier refreshTier) {
 	if tier != tierViewed {
 		r.promotedKeys.Delete(key)
+	}
+}
+
+// routeDirty enqueues a dirty-marked (or deferred) key on its tier: viewed when
+// a tab has it armed, else cluster_list when registered, else normal. Called by
+// onDirtyMark AFTER markDirty: an arm racing the mark is either seen here, or
+// sees the window markDirty opened (promoteOnArm).
+func (r *refresher) routeDirty(l1Key string) {
+	switch _, isClusterList := r.clusterListKeys.Load(l1Key); {
+	case HasRefreshSubscriber(l1Key):
+		r.enqueueViewed(l1Key)
+	case isClusterList:
+		r.enqueueClusterList(l1Key)
+	default:
+		r.enqueue(l1Key)
+	}
+}
+
+// tierProbeHook is a test seam (nil in production) fired between a priority
+// tier's Len()>0 probe and its Get, so an arm can hold a worker exactly there.
+var tierProbeHook atomic.Pointer[func(refreshTier)]
+
+// tryPriorityGet takes one key from a priority tier (viewed, cluster_list) when
+// it has one, WITHOUT ever blocking: the probe and the Get run under one mutex
+// (#799 B1), and processNext is the tiers' only consumer, so a Len()>0 seen
+// under the lock is a key the Get returns at once. Before, two workers could
+// both see Len()==1; the loser parked in the blocking Get until the tier's next
+// add, a worker lost to the normal tier.
+func (r *refresher) tryPriorityGet(q workqueue.TypedRateLimitingInterface[string], t refreshTier) (string, bool) {
+	if q == nil {
+		return "", false
+	}
+	r.priorityGetMu.Lock()
+	defer r.priorityGetMu.Unlock()
+	if q.Len() == 0 {
+		return "", false
+	}
+	if fn := tierProbeHook.Load(); fn != nil {
+		(*fn)(t)
+	}
+	key, shutdown := q.Get()
+	return key, !shutdown
+}
+
+// claimInFlight marks key as being re-resolved by this worker (#799 B2). false:
+// another tier's worker is re-resolving it now — this dequeue does not run, its
+// trigger set stays for the re-add, and the finishing worker re-adds the key.
+// Before #799 a key lived in one tier, whose per-item exclusivity gave one
+// re-resolve per key at a time; the trigger set, the dirty window, the audit
+// pair, the background-revalidation slot and the rate floor all assume it.
+func (r *refresher) claimInFlight(key string) bool {
+	r.inFlightMu.Lock()
+	defer r.inFlightMu.Unlock()
+	if _, busy := r.inFlightKeys[key]; busy {
+		r.inFlightKeys[key] = true // deferred: re-add when it finishes
+		r.viewed.deferredInFlight.Add(1)
+		return false
+	}
+	r.inFlightKeys[key] = false
+	return true
+}
+
+// releaseInFlight ends key's re-resolve and, when a dequeue from another tier
+// was deferred meanwhile, re-adds the key on its tier now (viewed if a tab still
+// has it armed), so the change that dequeue carried is not lost.
+func (r *refresher) releaseInFlight(key string) {
+	r.inFlightMu.Lock()
+	deferred := r.inFlightKeys[key]
+	delete(r.inFlightKeys, key)
+	r.inFlightMu.Unlock()
+	if deferred {
+		r.routeDirty(key)
 	}
 }
 
