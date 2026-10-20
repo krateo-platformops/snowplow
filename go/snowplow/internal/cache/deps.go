@@ -1563,18 +1563,35 @@ func (d *DepTracker) EndCapture(l1Key string, h *[]DepKey) []DepKey {
 // replayed coordinate actually fires. nil-safe on dst=="" (never routes an
 // empty key through the loudFail).
 func (d *DepTracker) ReplayEdges(ctx context.Context, dst string, edges []DepKey) {
+	d.ReplayEdgesWithStates(ctx, dst, edges, nil, "")
+}
+
+// ReplayEdgesWithStates is ReplayEdges carrying the PRODUCER's per-edge
+// interest states (#765 B, EdgeNarrowStates; deps_list_interest.go): a LIST
+// edge whose producer state is narrowed is recorded narrowable and committed to
+// that read set; anything else replays plain, as ReplayEdges always did. states
+// must be index-aligned with edges, else every edge replays plain. site is the
+// replay site for the replay counter (ReplaySiteMemo / ReplaySiteFullList).
+func (d *DepTracker) ReplayEdgesWithStates(ctx context.Context, dst string, edges []DepKey, states []EdgeNarrowState, site string) {
 	if d == nil || dst == "" {
 		return
+	}
+	if len(states) != len(edges) {
+		states = nil
 	}
 	// #443 — an inert (dry-run) resolve replays no edge and registers no
 	// informer (Record/RecordList refuse too; this also skips ensureInformer).
 	if Inert(ctx) {
 		return
 	}
-	for _, e := range edges {
+	for i, e := range edges {
 		d.ensureInformer(ctx, e.GVR)
 		if e.Name == listWildcard {
-			d.RecordList(ctx, dst, e.GVR, e.Namespace)
+			var st *EdgeNarrowState
+			if states != nil {
+				st = &states[i]
+			}
+			d.replayListEdge(ctx, dst, e, st, site)
 		} else {
 			d.Record(ctx, dst, e.GVR, e.Namespace, e.Name)
 		}
@@ -1591,6 +1608,12 @@ func (d *DepTracker) ReplayEdges(ctx context.Context, dst string, edges []DepKey
 // set BEFORE the Records, so any check that observes the Record also observes
 // the floor. No sink on ctx ⇒ plain ReplayEdges.
 func (d *DepTracker) ReplayEdgesAsOf(ctx context.Context, dst string, edges []DepKey, asOf uint64) {
+	d.ReplayEdgesAsOfWithStates(ctx, dst, edges, nil, asOf, "")
+}
+
+// ReplayEdgesAsOfWithStates is ReplayEdgesAsOf carrying the producer's interest
+// states (see ReplayEdgesWithStates).
+func (d *DepTracker) ReplayEdgesAsOfWithStates(ctx context.Context, dst string, edges []DepKey, states []EdgeNarrowState, asOf uint64, site string) {
 	if d == nil || dst == "" {
 		return
 	}
@@ -1606,7 +1629,7 @@ func (d *DepTracker) ReplayEdgesAsOf(ctx context.Context, dst string, edges []De
 		}
 		s.mu.Unlock()
 	}
-	d.ReplayEdges(ctx, dst, edges)
+	d.ReplayEdgesWithStates(ctx, dst, edges, states, site)
 }
 
 // ensureInformer registers (idempotently, singleflighted) the informer for gvr

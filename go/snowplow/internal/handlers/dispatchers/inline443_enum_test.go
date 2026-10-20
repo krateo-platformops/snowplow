@@ -74,7 +74,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"DepTracker.WidenListInterest":           gatedAtCaller443,
 	"ListNarrowShadowOn":                     readOnly443,
 	"CommitWhyOfAnalysis":                    readOnly443,
-	"DepTracker.ReplayEdges":                 gatedInCache443,
+	"DepTracker.ReplayEdgesWithStates":       gatedInCache443, // #765 B: ReplayEdges carrying the producer's interest states
 	"ResolvedCacheStore.PutIfGen":            gatedInCache443,
 	"ResolvedCacheStore.PutRAFullListIfGen":  gatedInCache443,
 	"ResolvedCacheStore.NoteRAFullListSlice": gatedInCache443,
@@ -98,10 +98,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	"AddNavigationDiscoveredGroup":                gatedAtCaller443,
 	"BumpExternalSkippedPut":                      gatedAtCaller443, // a Put-decline counter: no decline without a Put
 	// --- unreachable under the flag -----------------------------------------
-	"DepTracker.ReplayEdgesAsOf":          unreachableInert443, // seed-memo hit only (SeedResolveMemo is installed by seeds); delegates to the gated ReplayEdges
-	"SeedResolveMemo.StoreLayered":        unreachableInert443, // memo installed only by seeds, never on a live/inline ctx
-	"RegisterClusterListKey":              unreachableInert443, // after a PutIfGen that refuses under the flag
-	"ResourceWatcher.ConfirmResourceType": unreachableInert443, // only when EnsureResourceTypeFor reported added=true (never under the flag)
+	"DepTracker.ReplayEdgesAsOfWithStates":   unreachableInert443, // seed-memo hit only (SeedResolveMemo is installed by seeds); delegates to the gated ReplayEdgesWithStates
+	"SeedResolveMemo.StoreLayeredWithStates": unreachableInert443, // memo installed only by seeds, never on a live/inline ctx
+	"RegisterClusterListKey":                 unreachableInert443, // after a PutIfGen that refuses under the flag
+	"ResourceWatcher.ConfirmResourceType":    unreachableInert443, // only when EnsureResourceTypeFor reported added=true (never under the flag)
 	// via the package-level discoverGroupResourcesFn seam, invoked only inside
 	// lazyRegisterInnerCallPaths (returns at its head under the flag, (c)).
 	"DiscoverGroupResources": unreachableInert443,
@@ -266,7 +266,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ResourceWatcher.ListServableEnvelopeJSONWhere": readOnly443 /* #618: ListServableEnvelopeJSON + a pure read-only predicate */, "ResourceWatcher.ServabilitySnapshotFor": readOnly443,
 	"ResourceWatcher.Snapshot": readOnly443, "ResourceWatcher.WaitForGVRSync": readOnly443,
 	"SecretsCacheNamespace": readOnly443, "SecretsCacheServable": readOnly443, "SecretsSnapshotLoad": readOnly443,
-	"SeedResolveMemo.Key": readOnly443, "SeedResolveMemo.LoadLayered": readOnly443,
+	"SeedResolveMemo.Key": readOnly443, "SeedResolveMemo.LoadLayeredWithStates": readOnly443, "DepTracker.EdgeNarrowStates": readOnly443,
 	"SeedResolveMemoFromContext": readOnly443, "ServeWatcherFromContext": readOnly443,
 	"ServiceAccountDialFromContext": readOnly443, "SliceShapeHash": readOnly443,
 	"SliceabilityShapeKnownNegative": readOnly443, "StageErrorSink.Bump": readOnly443,

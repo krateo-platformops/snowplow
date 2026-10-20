@@ -140,6 +140,11 @@ type listNarrow struct {
 
 	evalTransitions atomic.Uint64
 	evalNS          atomic.Uint64
+
+	// replays[producer state][site]: replayed LIST edges by the producer
+	// edge's state (narrowed/all/pending/absent) and the replay site
+	// (memo/full_list). #765 B.
+	replays [4][2]atomic.Uint64
 }
 
 func newListNarrow() *listNarrow {
@@ -273,17 +278,23 @@ func (d *DepTracker) CommitListInterest(l1Key string, dk DepKey, reads []jqinter
 	if d == nil || !listNarrowShadowOn() || dk.Name != listWildcard {
 		return ""
 	}
+	verdict, why := d.commitReads(l1Key, dk, reads)
+	d.narrow.noteVerdict(verdict, why)
+	return verdict
+}
+
+// commitReads is CommitListInterest without the verdict count (a replay counts
+// on its own counter, never as a resolve's commit).
+func (d *DepTracker) commitReads(l1Key string, dk DepKey, reads []jqinterest.Read) (verdict, why string) {
 	n := d.narrow
 	ei := d.edgeInterestOf(l1Key, dk)
 	if ei == nil {
-		n.noteVerdict(CommitVerdictAll, CommitWhySticky)
-		return CommitVerdictAll
+		return CommitVerdictAll, CommitWhySticky
 	}
 	for {
 		cur := ei.p.Load()
 		if cur != nil && cur.all {
-			n.noteVerdict(CommitVerdictAll, CommitWhySticky)
-			return CommitVerdictAll
+			return CommitVerdictAll, CommitWhySticky
 		}
 		want := reads
 		if cur != nil {
@@ -293,20 +304,157 @@ func (d *DepTracker) CommitListInterest(l1Key string, dk DepKey, reads []jqinter
 		next := edgeNarrowAll
 		if li != nil {
 			if cur != nil && cur.li == li {
-				n.noteVerdict(CommitVerdictNarrowed, CommitWhyOK)
-				return CommitVerdictNarrowed
+				return CommitVerdictNarrowed, CommitWhyOK
 			}
 			next = &edgeNarrow{li: li}
 		}
 		if ei.p.CompareAndSwap(cur, next) {
 			if li == nil {
-				n.noteVerdict(CommitVerdictAll, CommitWhyRegistryFull)
-				return CommitVerdictAll
+				return CommitVerdictAll, CommitWhyRegistryFull
 			}
-			n.noteVerdict(CommitVerdictNarrowed, CommitWhyOK)
-			return CommitVerdictNarrowed
+			return CommitVerdictNarrowed, CommitWhyOK
 		}
 	}
+}
+
+// --- replays carry the producer's interest (#765 B, reason 2) ------------------
+//
+// A widget that does not resolve its RESTAction itself receives the producer's
+// edges by REPLAY: a SeedResolveMemo hit (apiref resolve.go) or a slice of the
+// shared RAFullList cell (apiref ra_full_list.go). Until #765 B those replays
+// were plain records, i.e. sticky all, so no sibling widget could ever be
+// decided. The v1 interest is derived from the RESTAction chain ONLY (restactions
+// /api narrow.go: Chain{Widget: nil}); a replay receiver's body is that same
+// RESTAction output (the memo key is RA × identity × RBAC class × extras ×
+// page) or a slice of the raKey cell's output. So the receiver may take the
+// PRODUCER edge's state — narrowed → the same read set (a union with whatever
+// the receiver had); anything else → plain (sticky all). Monotone as ever: a
+// receiver already sticky all stays all. Sound per architect-623
+// (#765 issuecomment-6285013799 / -6285026365): the producer's commit runs inside
+// restactions.Resolve (deferred, before it returns), i.e. before any raKey Put,
+// so the live state covers every version already stored.
+
+// EdgeNarrowState is one edge's interest state, snapshotted for a replay.
+// Opaque outside the cache package.
+type EdgeNarrowState struct {
+	li     *listInterest
+	reason uint8
+}
+
+// Replay outcomes (closed enum, OTLP attribute outcome) and sites (site).
+const (
+	ReplayNarrowed = "narrowed"
+	ReplayAll      = "all"
+	ReplayPending  = "pending"
+	ReplayAbsent   = "absent"
+
+	ReplaySiteMemo     = "memo"
+	ReplaySiteFullList = "full_list"
+)
+
+var replayOutcomes = [...]string{ReplayNarrowed, ReplayAll, ReplayPending, ReplayAbsent}
+var replaySites = [...]string{ReplaySiteMemo, ReplaySiteFullList}
+
+const (
+	rsNarrowed uint8 = iota
+	rsAll
+	rsPending
+	rsAbsent
+)
+
+// EdgeNarrowStates snapshots, for each of dks, the interest state of
+// (l1Key, dk). Exact edges carry no state (they replay as Record, as before).
+// Read-only. nil while the shadow is off.
+func (d *DepTracker) EdgeNarrowStates(l1Key string, dks []DepKey) []EdgeNarrowState {
+	if d == nil || !listNarrowShadowOn() {
+		return nil
+	}
+	out := make([]EdgeNarrowState, len(dks))
+	var ds *depSet
+	if dsI, ok := d.reverse.Load(l1Key); ok {
+		ds = dsI.(*depSet)
+	}
+	for i, dk := range dks {
+		if dk.Name != listWildcard {
+			continue
+		}
+		if ds == nil {
+			out[i] = EdgeNarrowState{reason: rsAbsent}
+			continue
+		}
+		v, ok := ds.deps.Load(dk)
+		if !ok {
+			out[i] = EdgeNarrowState{reason: rsAbsent}
+			continue
+		}
+		ei, isEI := v.(*edgeInterest)
+		if !isEI {
+			out[i] = EdgeNarrowState{reason: rsAll}
+			continue
+		}
+		switch cur := ei.p.Load(); {
+		case cur == nil:
+			out[i] = EdgeNarrowState{reason: rsPending}
+		case cur.all:
+			out[i] = EdgeNarrowState{reason: rsAll}
+		default:
+			out[i] = EdgeNarrowState{li: cur.li, reason: rsNarrowed}
+		}
+	}
+	return out
+}
+
+// replayListEdge records one replayed LIST edge under dst: narrowable plus the
+// producer's read set when the producer edge was narrowed, else plain. Both go
+// through recordInternalMode (the [C1-A] invariant: an open capture on dst sees
+// the edge). Counts the producer state per site.
+func (d *DepTracker) replayListEdge(ctx context.Context, dst string, dk DepKey, st *EdgeNarrowState, site string) {
+	if st == nil || !listNarrowShadowOn() {
+		d.RecordList(ctx, dst, dk.GVR, dk.Namespace)
+		return
+	}
+	d.narrow.noteReplay(st.reason, site)
+	if st.li == nil {
+		d.RecordList(ctx, dst, dk.GVR, dk.Namespace)
+		return
+	}
+	d.RecordListNarrowable(ctx, dst, dk.GVR, dk.Namespace)
+	if Inert(ctx) {
+		return
+	}
+	d.commitReads(dst, dk, st.li.reads)
+}
+
+func (n *listNarrow) noteReplay(reason uint8, site string) {
+	si := 0
+	if site == ReplaySiteFullList {
+		si = 1
+	}
+	if int(reason) < len(replayOutcomes) {
+		n.replays[reason][si].Add(1)
+	}
+}
+
+// ListNarrowReplay is one {outcome, site} cell of the replay counter.
+type ListNarrowReplay struct {
+	Outcome string
+	Site    string
+	Count   uint64
+}
+
+// ListNarrowReplaySnapshot returns every {outcome, site} cell (zeros included).
+// outcome = the PRODUCER edge's state carried by the replay: narrowed (the
+// receiver narrows), or all / pending / absent (a plain record — pending and
+// absent are the lossy fall-backs architect-623's C3 asks to see as a number).
+func ListNarrowReplaySnapshot() []ListNarrowReplay {
+	n := Deps().narrow
+	out := make([]ListNarrowReplay, 0, len(replayOutcomes)*len(replaySites))
+	for r := range replayOutcomes {
+		for s := range replaySites {
+			out = append(out, ListNarrowReplay{Outcome: replayOutcomes[r], Site: replaySites[s], Count: n.replays[r][s].Load()})
+		}
+	}
+	return out
 }
 
 // WidenListInterest makes (l1Key, dk) all for good, counting why.
@@ -695,6 +843,7 @@ func ListNarrowExpvar() any {
 		"would_mark_total":     keptTotal,
 		"kept_by_reason":       kept,
 		"would_change_total":   a[AuditVerdictChanged],
+		"replays":              ListNarrowReplaySnapshot(),
 		"gate":                 ListNarrowGateSnapshot(),
 		"audit":                a,
 		"commit_verdicts":      verdicts,

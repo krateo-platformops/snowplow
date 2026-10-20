@@ -38,6 +38,7 @@ func TestListNarrow765_GateCountersExportCumulativeMonotonic(t *testing.T) {
 		"snowplow_deps_list_narrow_total",
 		"snowplow_deps_list_narrow_audit_total",
 		"snowplow_deps_list_narrow_audit_samples_total",
+		"snowplow_deps_list_narrow_replay_total",
 		"snowplow_deps_interest_verdict_total",
 		"snowplow_deps_interest_eval_total",
 	}
