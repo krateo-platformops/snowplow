@@ -17,7 +17,10 @@
 //     by each GVR's fill bytes;
 //   - the calibration samples by outcome {seeded, raised, decayed, ignored}, so
 //     a fall is attributable (decays under pressure) and its denominator is
-//     visible.
+//     visible. "ignored" is a sample <= 0: the live heap FELL across the fill
+//     because a GC ran mid-fill. It is not a missing measurement; a rising
+//     ignored share is itself a GC-pressure signal (#787: 23-41 per run under
+//     a tight memory limit, 0 without one).
 //
 // Read them beside the heap-pressure signals already exported: the admission
 // ceiling's over_ceiling_bytes (+ _peak) and the runtime's go.memory gauges.
@@ -38,7 +41,7 @@ const (
 	calibSeeded  calibrationOutcome = iota // the GVR's first measurement replaced the seed
 	calibRaised                            // a sample >= the current value, taken at once
 	calibDecayed                           // a smaller sample, decayed toward
-	calibIgnored                           // a sample <= 0 (no measurement)
+	calibIgnored                           // a sample <= 0: the live heap FELL during the fill (a GC ran mid-fill) — itself a pressure signal
 	calibOutcomes
 )
 

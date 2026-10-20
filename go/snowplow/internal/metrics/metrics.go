@@ -1629,7 +1629,7 @@ func registerContentFillExpansionInstruments(m metric.Meter) error {
 		return err
 	}
 	samples, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_calibration_samples_total",
-		metric.WithDescription("Decode-expansion calibration samples by outcome: seeded (a GVR's first measurement replaced the seed), raised (a sample >= the current value, taken at once), decayed (a smaller sample, decayed toward), ignored (no measurement). A rising decayed share under GC pressure is #787's suspected cause. #787."))
+		metric.WithDescription("Decode-expansion calibration samples by outcome: seeded (a GVR's first measurement replaced the seed), raised (a sample >= the current value, taken at once), decayed (a smaller sample, decayed toward), ignored (a sample <= 0: the live heap fell during the fill because a GC ran mid-fill; itself a GC-pressure signal). A rising decayed or ignored share under GC pressure is #787's suspected cause. #787."))
 	if err != nil {
 		return err
 	}
