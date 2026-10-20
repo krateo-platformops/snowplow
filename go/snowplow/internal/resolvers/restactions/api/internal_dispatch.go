@@ -610,7 +610,9 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// Bounded per-GVR sync-wait (returns immediately when already synced —
 		// the common boot case), then the SAME four-conjunct IsServable gate
 		// ListObjectsServable enforces. Both must hold to serve from cache.
+		waitStart := time.Now()
 		synced := rw.WaitForGVRSync(ctx, gvr, internalDispatchServeSyncWait)
+		recordServeSyncWait(time.Since(waitStart)) // #796
 		if synced && rw.IsServable(gvr) {
 			if served, ok := rw.ListServableEnvelopeJSONWhere(gvr, namespace, keep); ok {
 				recordListQuery(query) // applied in process (no-op without a query)
@@ -630,6 +632,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// we fall through to the live paged LIST. Diagnostic only (Task #130 F1);
 		// the dispatch flow below is byte-identical whether or not this fires.
 		snap := rw.ServabilitySnapshotFor(gvr)
+		recordServeMiss(serveMissReason(snap)) // #796 — the shipped surface
 		xcontext.Logger(ctx).Info("internal_dispatch.list.serve_miss",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -637,6 +640,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 			slog.Bool("hasSynced", snap.HasSynced),
 			slog.Bool("watchHealthy", snap.WatchHealthy),
 			slog.Bool("typeConfirmed", snap.TypeConfirmed),
+			slog.Bool("listRefused", snap.ListRefused),
 		)
 		// Fall through to the live paged LIST below (never worse).
 	}

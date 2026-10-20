@@ -141,6 +141,15 @@ type ResourceWatcher struct {
 	// reflector reconnects.
 	watchBroken map[schema.GroupVersionResource]struct{}
 
+	// listRefused records GVRs whose reflector's LATEST List/Watch error was
+	// terminal — NotFound or Forbidden (#796). Such a LIST does not heal by the
+	// reflector's own retry (only a CRD version or an RBAC grant heals it), so
+	// WaitForGVRSync stops waiting on it instead of running out its bound. Set
+	// and DELETED by the same watch-error handler as watchBroken (the latest
+	// error decides: a later non-terminal error removes it); cleared with
+	// watchBroken on recovery and on de-registration.
+	listRefused map[schema.GroupVersionResource]struct{}
+
 	// confirmed records GVRs whose resource *type* has been verified to
 	// exist in the apiserver's currently-served API surface (conjunct 4 —
 	// THE S4 FIX). A GVR is confirmed only after the discovery-refresh
@@ -1842,6 +1851,7 @@ func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResour
 	delete(rw.syncCh, gvr)
 	delete(rw.confirmed, gvr)
 	delete(rw.watchBroken, gvr)
+	delete(rw.listRefused, gvr)
 	delete(rw.informerStop, gvr)
 	delete(rw.metadataOnly, gvr)
 	delete(rw.lastSyncRV, gvr)
@@ -2051,7 +2061,26 @@ func (rw *ResourceWatcher) WaitForGVRSync(ctx context.Context, gvr schema.GroupV
 	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return clientcache.WaitForCacheSync(cctx.Done(), gi.Informer().HasSynced)
+	// #796 — also stop waiting once the reflector's latest List/Watch error is
+	// terminal (listRefused: NotFound / Forbidden). Such a LIST never heals
+	// by the reflector's retry, so the wait could only run out its bound and
+	// then fall through to the same live LIST. A transient error keeps the
+	// bounded wait (the informer's retry usually lands inside it). The return
+	// is re-read from HasSynced: a refusal never reads as "synced".
+	inf := gi.Informer()
+	clientcache.WaitForCacheSync(cctx.Done(), func() bool {
+		return inf.HasSynced() || rw.listRefusedNow(gvr)
+	})
+	return inf.HasSynced()
+}
+
+// listRefusedNow reports whether gvr's reflector's latest error was a terminal
+// LIST refusal (#796). Takes rw.mu in read mode.
+func (rw *ResourceWatcher) listRefusedNow(gvr schema.GroupVersionResource) bool {
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	_, refused := rw.listRefused[gvr]
+	return refused
 }
 
 // passthroughGetTimeout bounds the apiserver Get/List call in
@@ -2396,6 +2425,9 @@ type ServabilitySnapshot struct {
 	HasSynced     bool
 	WatchHealthy  bool
 	TypeConfirmed bool
+	// ListRefused (#796): the reflector's latest error was a terminal LIST
+	// refusal (NotFound / Forbidden). Diagnostic; not a servability conjunct.
+	ListRefused bool
 }
 
 // ServabilitySnapshotFor returns the four servability conjuncts for gvr
@@ -2419,6 +2451,7 @@ func (rw *ResourceWatcher) ServabilitySnapshotFor(gvr schema.GroupVersionResourc
 	_, broken := rw.watchBroken[gvr]
 	snap.WatchHealthy = !broken
 	snap.TypeConfirmed = rw.resourceTypeConfirmedLocked(gvr)
+	_, snap.ListRefused = rw.listRefused[gvr]
 	return snap
 }
 

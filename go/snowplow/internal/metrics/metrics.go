@@ -1252,7 +1252,37 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerUndeclaredExtrasExemptInstrument(m); err != nil {
 		return err
 	}
+	if err := registerInformerServeMissInstruments(m); err != nil {
+		return err
+	}
 	return registerSecurityInstruments(m)
+}
+
+// registerInformerServeMissInstruments hand-wires #796's internal-dispatch
+// informer serve-miss counters onto OTLP (no expvar->OTLP bridge): each reads
+// the typed accessor its expvar closure reads. Attributes are the closed reason
+// enum only — never a GVR. Registered only when the cache is on (CFG-1: the
+// expvar keys are published from a Disabled()-gated init).
+func registerInformerServeMissInstruments(m metric.Meter) error {
+	misses, err := m.Int64ObservableCounter("snowplow_internal_dispatch_informer_serve_miss_total",
+		metric.WithDescription("Internal-dispatch LISTs not served from their informer, by reason: unregistered, list_refused (the informer never synced because its LIST was refused with 404/403: the bounded sync-wait now ends at once, #796), sync_timeout (unsynced with no terminal refusal: the wait ran out its 5 s bound), watch_broken, type_unconfirmed, not_servable. Each one fell through to a live paged LIST."))
+	if err != nil {
+		return err
+	}
+	waitMs, err := m.Int64ObservableCounter("snowplow_internal_dispatch_informer_sync_wait_ms_total",
+		metric.WithDescription("Total milliseconds internal-dispatch LISTs spent in the bounded informer sync-wait before serving or falling through (#796): the latency this path adds."),
+		metric.WithUnit("ms"))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, c := range restactionsapi.ServeMissSnapshot() {
+			o.ObserveInt64(misses, int64(c.Count), metric.WithAttributes(attribute.String("reason", c.Reason)))
+		}
+		o.ObserveInt64(waitMs, int64(restactionsapi.ServeSyncWaitMsTotal()))
+		return nil
+	}, misses, waitMs)
+	return err
 }
 
 // registerUndeclaredExtrasExemptInstrument hand-wires #777 b′'s exemption
