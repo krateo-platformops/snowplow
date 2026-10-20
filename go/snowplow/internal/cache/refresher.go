@@ -959,6 +959,8 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// The slot just freed, and a mark that landed while this key was
 			// processing is re-queued by Done itself, not through Add: wake an
 			// idle worker for whatever waits (#799 B3: wake on slot release).
+			// DEFENSIVE: this worker re-probes the viewed tier itself on its next
+			// loop, so no test arm can tell this wake apart (mutation Z2 survives).
 			if r.viewedQueue.Len() > 0 {
 				r.wakeViewed()
 			}
