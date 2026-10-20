@@ -24,7 +24,17 @@ def figures(r):
     blocked = sum(v for k, v in share.items() if k.startswith("blocked_other") or k == "waiting_fill")
     cust = (r.get("customer_widget_l1_miss") or 0) + (r.get("customer_widget_l1_hit") or 0)
     conc = r.get("bench_list_forced_fills_in_flight") or {}
-    return {
+    vw = r.get("viewed") or {}
+    sub, uns = vw.get("subscribed") or {}, vw.get("unsubscribed") or {}
+    viewed = {
+        "viewed_sub_age_p50_s": (sub.get("served_body_age_s") or {}).get("p50", 0.0),
+        "viewed_sub_age_p95_s": (sub.get("served_body_age_s") or {}).get("p95", 0.0),
+        "viewed_unsub_age_p50_s": (uns.get("served_body_age_s") or {}).get("p50", 0.0),
+        "viewed_unsub_age_p95_s": (uns.get("served_body_age_s") or {}).get("p95", 0.0),
+        "viewed_sub_pushes_per_cell": sub.get("sse_pushes_per_cell", 0.0),
+        "viewed_sub_dirty_share": sub.get("dirty_share", 0.0),
+    } if vw else {}
+    return dict(viewed, **{
         "granted_cores": secs_cpu,
         "granted_share_of_busy": (secs_cpu / r["cpu_cores_runtime_metrics"]) if r.get("cpu_cores_runtime_metrics") else 0.0,
         "bench_fills_per_event": r.get("bench_list_fills_per_event", 0.0),
@@ -39,7 +49,7 @@ def figures(r):
         "dirty_to_fresh_p95_ms": (r.get("dirty_to_fresh_ms") or {}).get("p95", 0.0),
         "probe_p95_ms": (r.get("probe_converged_ms") or {}).get("p95", 0.0),
         "probe_unconverged": r.get("probe_unconverged", 0),
-    }
+    })
 
 
 def load(name, n):
