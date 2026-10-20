@@ -18,6 +18,15 @@ out, base, arm, pairs = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 TOL = 0.15
 
 
+def parse_go_duration(s):
+    """Seconds in a Go duration string such as '10m0s' or '2m30.5s'."""
+    import re
+    total = 0.0
+    for num, unit in re.findall(r"([0-9.]+)(h|ms|m|s)", s or ""):
+        total += float(num) * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}[unit]
+    return total
+
+
 def figures(r):
     secs_cpu = r.get("cpu_cores_rusage") or 0.0
     share = r.get("refresher_worker_state_share") or {}
@@ -45,6 +54,13 @@ def figures(r):
     # expired cells resident.
     viewed["refresher_completed"] = rd.get("completed", 0)
     viewed["normal_tier_completed"] = rd.get("completed", 0) - rd.get("viewed_dequeued", 0)
+    # Normal-tier completions per granted core-second (coordinator, #799): the
+    # tier's throughput normalised by the CPU the host actually gave the run.
+    secs = parse_go_duration(r.get("measure", "")) or 0.0
+    cores = r.get("cpu_cores_rusage") or 0.0
+    viewed["normal_tier_per_core_s"] = (viewed["normal_tier_completed"] / (cores * secs)) if cores and secs else 0.0
+    viewed["viewed_customer_share_of_dequeues"] = (
+        rd.get("viewed_customer_triggered", 0) / rd["viewed_dequeued"]) if rd.get("viewed_dequeued") else 0.0
     viewed["deferred_in_flight"] = rd.get("deferred_in_flight", 0)
     viewed["skipped_no_entry"] = rd.get("skipped_no_entry", 0)
     viewed["evict_ttl"] = r.get("evict_ttl_total_delta", 0)
