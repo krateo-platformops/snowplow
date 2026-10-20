@@ -438,17 +438,17 @@ func refresherSingleton() *refresher {
 			time.Duration(baseMS)*time.Millisecond,
 			time.Duration(maxMS)*time.Millisecond,
 		)
-		normalQ := workqueue.NewTypedRateLimitingQueue[string](rl)
-		refresherInstance.Store(&refresher{
+		r := &refresher{
 			parallelism:      parallelism,
-			queue:            normalQ,
+			queue:            workqueue.NewTypedRateLimitingQueue[string](rl),
 			clusterListQueue: workqueue.NewTypedRateLimitingQueue[string](clRL),
-			viewedQueue:      newViewedQueue(vRL, normalQ),
 			inFlightKeys:     map[string]bool{},
 			handlers:         map[string]RefreshFunc{},
 			resolveLatency:   newP2Quantile(0.95),
 			dirtyStats:       newDirtyWindowStats(),
-		})
+		}
+		r.viewedQueue = newViewedQueue(vRL, r.wakeViewed)
+		refresherInstance.Store(r)
 	})
 	return refresherInstance.Load()
 }
@@ -926,6 +926,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		key, tier = k, tierViewed
 	} else if k, ok := r.tryPriorityGet(r.clusterListQueue, tierClusterList); ok {
 		key, tier, fromCL = k, tierClusterList, true
+		r.lastViewed.Store(false) // #799 N4: a cluster_list turn counts too
 	}
 	if tier == tierNormal {
 		// Normal tier blocking Get. This is the steady-state path
@@ -939,10 +940,13 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		r.lastViewed.Store(false) // #799 fix 2: p=1 alternation
 		if key == viewedWakeKey {
 			// #765 idle wake: back to the viewed probe; wake the next idle worker
-			// while more viewed keys wait.
+			// while more viewed keys wait — but only when the reservation has a
+			// slot for it (#799 B3: re-adding with every slot full made the
+			// reserved worker busy-spin on the wake key). A slot release wakes
+			// again (endViewed).
 			r.queue.Done(key)
 			if r.viewedQueue != nil && r.viewedQueue.Len() > 1 {
-				r.queue.Add(viewedWakeKey)
+				r.wakeViewed()
 			}
 			return true
 		}
@@ -952,10 +956,11 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		defer func() {
 			r.endViewed()
 			r.viewedQueue.Done(key)
-			// A mark that landed while this key was processing is re-queued by
-			// Done itself, not through Add: wake an idle worker for it.
+			// The slot just freed, and a mark that landed while this key was
+			// processing is re-queued by Done itself, not through Add: wake an
+			// idle worker for whatever waits (#799 B3: wake on slot release).
 			if r.viewedQueue.Len() > 0 {
-				r.queue.Add(viewedWakeKey)
+				r.wakeViewed()
 			}
 		}()
 		r.viewed.dequeued.Add(1)

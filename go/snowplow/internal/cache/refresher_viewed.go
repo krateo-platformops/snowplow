@@ -79,10 +79,10 @@ func (w *wakingQueue) Add(item string) {
 	w.wake()
 }
 
-// newViewedQueue builds the viewed tier over rl, waking idle workers through the
-// normal queue.
-func newViewedQueue(rl workqueue.TypedRateLimiter[string], normal workqueue.TypedInterface[string]) workqueue.TypedRateLimitingInterface[string] {
-	wq := &wakingQueue{TypedInterface: workqueue.NewTyped[string](), wake: func() { normal.Add(viewedWakeKey) }}
+// newViewedQueue builds the viewed tier over rl; wake (refresher.wakeViewed)
+// wakes an idle worker through the normal queue.
+func newViewedQueue(rl workqueue.TypedRateLimiter[string], wake func()) workqueue.TypedRateLimitingInterface[string] {
+	wq := &wakingQueue{TypedInterface: workqueue.NewTyped[string](), wake: wake}
 	return workqueue.NewTypedRateLimitingQueueWithConfig(rl, workqueue.TypedRateLimitingQueueConfig[string]{
 		DelayingQueue: workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Queue: wq}),
 	})
@@ -292,9 +292,24 @@ func (r *refresher) tryPriorityGet(q workqueue.TypedRateLimitingInterface[string
 // the normal tier when it has work.
 func (r *refresher) viewedSlotFree() bool {
 	if r.parallelism <= 1 {
-		return !r.lastViewed.Load() || r.queue.Len() == 0
+		return !r.lastViewed.Load() || (r.queue.Len() == 0 && (r.clusterListQueue == nil || r.clusterListQueue.Len() == 0))
 	}
 	return r.viewedActive < r.parallelism-1
+}
+
+// wakeViewed adds the wake key to the normal queue — waking a worker blocked in
+// its Get — only when the reservation has a slot a woken worker could take
+// (#799 B3). With every slot full, a wake would only bring a worker back to a
+// refused viewed probe, the normal Get would hand it the next wake, and so on:
+// a busy spin (architect-623, RUN: ~85% of a core idle). A full reservation is
+// re-woken by the slot release instead (endViewed's caller).
+func (r *refresher) wakeViewed() {
+	r.priorityGetMu.Lock()
+	free := r.viewedSlotFree()
+	r.priorityGetMu.Unlock()
+	if free {
+		r.queue.Add(viewedWakeKey)
+	}
 }
 
 // endViewed releases a viewed-tier worker slot (#799 fix 2).
