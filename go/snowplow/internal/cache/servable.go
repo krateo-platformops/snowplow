@@ -156,6 +156,12 @@ func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource)
 				slog.String("effect", "servable=false until reflector relists; pivot falls through to apiserver"),
 			)
 		}
+		// #807 — a 404 may mean the CRD retired this version. The check and the
+		// teardown run on the CRD-lifecycle worker, never here: this is the
+		// reflector goroutine of the very informer that would be stopped.
+		if apierrors.IsNotFound(err) {
+			crdDiscoverySingleton().submitListRefused(rw, gvr)
+		}
 	}
 }
 
