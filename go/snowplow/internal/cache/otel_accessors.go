@@ -133,6 +133,11 @@ func cappedCells(m *sync.Map, family string) ([]FallthroughCell, int) {
 	return out, len(tail)
 }
 
+// NoteSeriesTruncated records n series folded into __other__ for family, from
+// another package's capped gvr family (#787: the content-fill expansion gauge).
+// Same counter as the cache families'.
+func NoteSeriesTruncated(family string, n uint64) { bumpSeriesTruncated(family, n) }
+
 // bumpSeriesTruncated records overflow for a family. Monotonic across
 // collections: it answers "has this family EVER overflowed", which is
 // what an alert needs, rather than "is it overflowing right now", which

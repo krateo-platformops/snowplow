@@ -1228,6 +1228,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerContentFillInstruments(m); err != nil {
 		return err
 	}
+	if err := registerContentFillExpansionInstruments(m); err != nil {
+		return err
+	}
 	if err := registerNestedResolveAdmissionInstruments(m); err != nil {
 		return err
 	}
@@ -1598,6 +1601,52 @@ func registerUAFNullSkipInstruments(m metric.Meter) error {
 		o.ObserveInt64(stages, int64(restactionsapi.UAFNullSkippingStages()))
 		return nil
 	}, total, stages)
+	return err
+}
+
+// registerContentFillExpansionInstruments hand-wires #787's view of the
+// content-fill admission gate's LEARNED decode expansion (no expvar->OTLP
+// bridge; each instrument reads the accessor its expvar key reads). Attributes:
+// gvr (capped: the GVRs with the most fill bytes keep their series, the tail
+// folds into gvr="__other__" at its MINIMUM, counted on
+// snowplow_metrics_series_truncated_total{family="content_fill_expansion"}),
+// stat {min, max, weighted} and outcome {seeded, raised, decayed, ignored}.
+// Registered only when the cache is on (CFG-1).
+//
+// READ IT BESIDE the heap-pressure signals: a min / weighted that falls while
+// snowplow_apistage_content_fill_admission_over_ceiling_bytes and the
+// runtime's go.memory gauges rise, with calibration_samples{outcome="decayed"}
+// rising, is #787's suspected undercharge under GC pressure.
+func registerContentFillExpansionInstruments(m metric.Meter) error {
+	perGVR, err := m.Float64ObservableGauge("snowplow_apistage_content_fill_decode_expansion",
+		metric.WithDescription("The content-fill admission gate's learned decode expansion (live-heap growth per raw envelope byte; the gate charges raw x this), per GVR with a measured fill. Capped: the GVRs with the most fill bytes keep their series, the rest fold into gvr=\"__other__\" at their MINIMUM. A value falling under GC pressure is #787's suspected undercharge."))
+	if err != nil {
+		return err
+	}
+	summary, err := m.Float64ObservableGauge("snowplow_apistage_content_fill_decode_expansion_summary",
+		metric.WithDescription("The learned decode expansion across GVRs, by stat: min, max, weighted (the mean weighted by each GVR's content-fill bytes). Absent until a GVR has a measured fill. #787."))
+	if err != nil {
+		return err
+	}
+	samples, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_calibration_samples_total",
+		metric.WithDescription("Decode-expansion calibration samples by outcome: seeded (a GVR's first measurement replaced the seed), raised (a sample >= the current value, taken at once), decayed (a smaller sample, decayed toward), ignored (a sample <= 0: the live heap fell during the fill because a GC ran mid-fill; itself a GC-pressure signal). A rising decayed or ignored share under GC pressure is #787's suspected cause. #787."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, c := range restactionsapi.ContentFillExpansionCells() {
+			o.ObserveFloat64(perGVR, c.Expansion, metric.WithAttributes(attribute.String("gvr", c.GVR)))
+		}
+		if s, ok := restactionsapi.ContentFillExpansionSummarySnapshot(); ok {
+			o.ObserveFloat64(summary, s.Min, metric.WithAttributes(attribute.String("stat", "min")))
+			o.ObserveFloat64(summary, s.Max, metric.WithAttributes(attribute.String("stat", "max")))
+			o.ObserveFloat64(summary, s.Weighted, metric.WithAttributes(attribute.String("stat", "weighted")))
+		}
+		for _, c := range restactionsapi.ContentFillCalibrationSamplesSnapshot() {
+			o.ObserveInt64(samples, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Outcome)))
+		}
+		return nil
+	}, perGVR, summary, samples)
 	return err
 }
 
