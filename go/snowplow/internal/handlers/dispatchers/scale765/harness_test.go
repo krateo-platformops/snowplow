@@ -1175,6 +1175,9 @@ func s765Take() s765Snap {
 	for _, d := range cache.ListNarrowDecisionsSnapshot() {
 		s.decisions[d.Decision+"/"+d.Reason] += d.Count
 	}
+	for _, v := range cache.ListNarrowCommitVerdictsSnapshot() {
+		s.decisions["commit:"+v.Verdict+"/"+v.Why] += v.Count
+	}
 	if c := cache.ResolvedCache(); c != nil {
 		s.store = c.Stats()
 	}
@@ -1303,12 +1306,21 @@ type s765Report struct {
 	// a STOP (coordinator ruling).
 	NarrowGate             cache.ListNarrowGate `json:"list_narrow_gate_delta"`
 	WouldAvoidShareOfMarks float64              `json:"would_avoid_share_of_marks"`
-	NarrowDecisions        map[string]uint64    `json:"list_narrow_decisions_delta"` // decision/reason -> list_dep marks
-	HitDelta               uint64               `json:"hit_total_delta"`
-	EvictTTLDelta          uint64               `json:"evict_ttl_total_delta"`
-	StaleServedDelta       uint64               `json:"stale_served_total_delta"`
-	ResidentAtEnd          int                  `json:"resident_entries_at_end"`
-	UnservedReads          map[string]int       `json:"apiserver_unserved_reads"`
+	NarrowDecisions        map[string]uint64    `json:"list_narrow_decisions_delta"` // decision/reason -> list_dep marks; "commit:<verdict>/<why>" -> interest commit verdicts (snowplow_deps_interest_verdict_total)
+	// Per RESTAction at the end of the window: resident cells built on it, and
+	// the interest state of their 50K-GVR list edge (absent / all / pending /
+	// narrowed). Widget cells are attributed to their spec.apiRef.
+	ResidentByRA     map[string]int            `json:"resident_cells_by_ra"`
+	EdgeStateByRA    map[string]map[string]int `json:"bench_list_edge_interest_state_by_ra"`
+	NowRACells       int                       `json:"now_ra_cells_resident"`     // cells on RAs whose JQ uses now (dashboard-data, compositions-list)
+	NowRAMarkShare   float64                   `json:"now_ra_mark_share"`         // widget-cell marks / all marks: every harness widget sits on a now-RA
+	RAEdgeAvoidShare float64                   `json:"ra_edge_would_avoid_share"` // would-avoid marks / marks on RESTAction-class cells
+	RAEdgeMarks      uint64                    `json:"ra_edge_marks"`
+	HitDelta         uint64                    `json:"hit_total_delta"`
+	EvictTTLDelta    uint64                    `json:"evict_ttl_total_delta"`
+	StaleServedDelta uint64                    `json:"stale_served_total_delta"`
+	ResidentAtEnd    int                       `json:"resident_entries_at_end"`
+	UnservedReads    map[string]int            `json:"apiserver_unserved_reads"`
 
 	DrainWall    string `json:"drain_wall,omitempty"`
 	DrainReached bool   `json:"drain_reached"`
@@ -1721,6 +1733,12 @@ func (h *s765H) run(p s765Point) s765Report {
 	if g := &rep.NarrowGate; g.AvoidOnlyRefreshes > 0 {
 		g.UnauditedShare = float64(g.Unaudited) / float64(g.AvoidOnlyRefreshes)
 	}
+	rep.ResidentByRA, rep.EdgeStateByRA = h.narrowStateByRA()
+	rep.NowRACells = rep.ResidentByRA[s765RelNS+"/dashboard-data"] + rep.ResidentByRA[s765RelNS+"/compositions-list"]
+	if rep.MarksTotal > 0 {
+		rep.NowRAMarkShare = float64(rep.MarksByClass["widgets"]) / float64(rep.MarksTotal)
+	}
+	rep.RAEdgeMarks = rep.MarksByClass["restactions"] + rep.MarksByClass["raFullList"]
 	rep.NarrowDecisions = map[string]uint64{}
 	for k, v := range b.decisions {
 		if d := v - a.decisions[k]; d > 0 {
@@ -1729,6 +1747,12 @@ func (h *s765H) run(p s765Point) s765Report {
 	}
 	if rep.MarksTotal > 0 {
 		rep.WouldAvoidShareOfMarks = float64(rep.NarrowGate.WouldAvoidMarks) / float64(rep.MarksTotal)
+	}
+	// Every avoided decision lands on a RESTAction-class cell in this
+	// population (the widget cells are interest_all), so this is the avoided
+	// share among RA-edge marks; the per-RA edge states say which RA.
+	if rep.RAEdgeMarks > 0 {
+		rep.RAEdgeAvoidShare = float64(rep.NarrowGate.WouldAvoidMarks) / float64(rep.RAEdgeMarks)
 	}
 	rep.DirtyTTLExpiriesLB = rep.DirtyEvictedDelta - int64(rep.EvictLRUDelta+rep.EvictDeleteDelta+rep.EvictMaxAgeDelta+rep.EvictNoRepDelta)
 	if rep.DirtyTTLExpiriesLB < 0 {
@@ -1900,6 +1924,52 @@ func s765RefresherWorkerStates() map[string]int {
 		}
 	}
 	return out
+}
+
+// narrowStateByRA attributes every resident widget / RESTAction cell to its
+// RESTAction (a widget by its spec.apiRef) and reads B's interest state on the
+// cell's list edge of the 50K GVR: cluster-wide for the portal RAs, bench-ns-01
+// for the probes. A read of the dep tracker, not a counter.
+func (h *s765H) narrowStateByRA() (map[string]int, map[string]map[string]int) {
+	apiRef := map[string]string{}
+	for _, w := range h.widgets {
+		apiRef[w.name] = s765RelNS + "/" + w.apiRef
+	}
+	resident := map[string]int{}
+	states := map[string]map[string]int{}
+	c := cache.ResolvedCache()
+	if c == nil {
+		return resident, states
+	}
+	c.RangeMetadata(func(m cache.ResolvedEntryMeta) bool {
+		var ra string
+		dk := cache.DepKey{GVR: s765BenchGVR, Name: "*"}
+		switch m.CacheEntryClass {
+		case "widgets":
+			ra = apiRef[m.Name]
+		case "restactions":
+			ra = m.Namespace + "/" + m.Name
+			if m.Namespace == s765ProbeNS {
+				dk.Namespace = s765ProbeNS
+			}
+		default:
+			return true
+		}
+		if ra == "" {
+			return true
+		}
+		resident[ra]++
+		st := cache.ListInterestStateForTest(m.KeyHash, dk)
+		if i := strings.IndexByte(st, ':'); i > 0 {
+			st = st[:i] // "narrowed:<read set>" -> "narrowed"
+		}
+		if states[ra] == nil {
+			states[ra] = map[string]int{}
+		}
+		states[ra][st]++
+		return true
+	})
+	return resident, states
 }
 
 // s765BenchListFillsInFlight counts the goroutines inside a refresh_forced fill
