@@ -155,6 +155,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ContentCoordinateMovedSince": readOnly443,
 	// #765 — the content stamp: pure seq reads/compares.
 	"ContentStampCovers": readOnly443, "RefreshTriggerAsOf": readOnly443,
+	"ViewedRefreshFromContext":   readOnly443, // #799 fix 1: a ctx read
 	"DemandRevalidationDeadline": readOnly443,
 	// #710 PR-2a — the content-fill admission gate reads the shared ceiling and
 	// live-heap sampler (runtime reads, no cache state).

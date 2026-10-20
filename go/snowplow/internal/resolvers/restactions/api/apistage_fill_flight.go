@@ -92,6 +92,8 @@ type contentFlightResult struct {
 type contentStampGate struct {
 	on   bool
 	need uint64
+	// viewed (#799 fix 1): a viewed-tier refresh (cache.ViewedRefreshFromContext).
+	viewed bool
 }
 
 // contentFlight is one in-flight fill of one content key.
@@ -186,7 +188,10 @@ func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionR
 		}
 		noteContentFillJoinRefused(reason)
 	}
-	coalesce := stamp.on && class == fillClassBackground
+	// #799 fix 1 — a viewed-tier refresh (a passive viewer, no customer request
+	// waiting) coalesces too, at its own (debt) admission class: without it, N
+	// viewed refreshes under churn led N concurrent re-fills of the same list.
+	coalesce := stamp.on && (class == fillClassBackground || stamp.viewed)
 	if coalesce {
 		// A pending flight has not captured its read epoch yet: it will start
 		// after this reader's need, whatever that is.
