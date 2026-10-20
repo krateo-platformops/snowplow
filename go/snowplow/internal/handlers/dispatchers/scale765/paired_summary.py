@@ -49,6 +49,11 @@ def figures(r):
     viewed["skipped_no_entry"] = rd.get("skipped_no_entry", 0)
     viewed["evict_ttl"] = r.get("evict_ttl_total_delta", 0)
     viewed["dirty_evicted"] = r.get("dirty_ended_unfresh_evicted_delta", 0)
+    per_min = r.get("normal_tier_completions_per_minute") or []
+    if per_min:
+        # architect-623's bar: > 0 in EVERY 60 s bucket of the fix arm.
+        viewed["normal_tier_min_per_minute"] = min(per_min)
+        viewed["normal_tier_zero_minutes"] = sum(1 for x in per_min if x <= 0)
     if (r.get("viewed_queue_depth") or {}).get("n"):
         viewed["viewed_queue_depth_p95"] = r["viewed_queue_depth"]["p95"]
     return dict(viewed, **{

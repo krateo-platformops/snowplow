@@ -1268,7 +1268,8 @@ type s765Report struct {
 	RefreshesPerSec     float64          `json:"refreshes_per_sec"` // non-content L1 stores/s (the design comment's figure)
 	RefresherDonePerSec float64          `json:"refresher_completed_per_sec"`
 	QueueDepth          s765Dist         `json:"queue_depth"`
-	ViewedQueueDepth    s765Dist         `json:"viewed_queue_depth"` // #799's viewed tier; the viewed_* counters are in refresher_delta
+	ViewedQueueDepth    s765Dist         `json:"viewed_queue_depth"`                 // #799's viewed tier; the viewed_* counters are in refresher_delta
+	NormalTierPerMinute []int64          `json:"normal_tier_completions_per_minute"` // completed - viewed_dequeued, per 60 s bucket
 
 	FillsByReason        map[string]uint64  `json:"fills_by_reason"`
 	FillsPerSecByReason  map[string]float64 `json:"fills_per_sec_by_reason"`
@@ -1517,6 +1518,7 @@ func (h *s765H) run(p s765Point) s765Report {
 	// The sampler: queue depth and the per-class admission queue, every second.
 	var smu sync.Mutex
 	var depth, vdepth []float64
+	var normalCum []int64
 	var custQ, debtQ int64
 	wg.Add(1)
 	go func() {
@@ -1538,6 +1540,9 @@ func (h *s765H) run(p s765Point) s765Report {
 			depth = append(depth, float64(st["queue_depth"]))
 			// #765 viewed tier (#799): its own gauge; absent (0) on a build without it.
 			vdepth = append(vdepth, float64(st["viewed_queue_depth"]))
+			// Normal-tier progress, cumulative (completed - viewed_dequeued),
+			// bucketed per 60 s at the end (architect-623's #799 bar).
+			normalCum = append(normalCum, st["completed"]-st["viewed_dequeued"])
 			if q := adm.Queued["customer"]; q > custQ {
 				custQ = q
 			}
@@ -1662,6 +1667,11 @@ func (h *s765H) run(p s765Point) s765Report {
 	smu.Lock()
 	rep.QueueDepth = s765Summarize(depth)
 	rep.ViewedQueueDepth = s765Summarize(vdepth)
+	// One sample per second while measuring: the per-60-sample deltas are the
+	// normal tier's completions per minute.
+	for i := 60; i < len(normalCum); i += 60 {
+		rep.NormalTierPerMinute = append(rep.NormalTierPerMinute, normalCum[i]-normalCum[i-60])
+	}
 	rep.BenchFillConcurrency = s765Summarize(conc)
 	rep.RefresherWorkerShare = map[string]float64{}
 	total := 0
