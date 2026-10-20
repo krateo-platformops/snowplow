@@ -317,7 +317,9 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 	exp := adm.Expansion[r1FsaGVR.String()]
 	// P-cal (#780 c′): one more isolated replacement fill AFTER the gated bursts,
 	// so the gate charges it at the CALIBRATED expansion. Only the weight-peak
-	// counter is reset — the gate and its calibration are kept.
+	// counter is reset — the gate and its calibration are kept. The gated
+	// bursts' peak is read FIRST, for the summary below (#791).
+	gatedWeightPeak := contentFillAdmissionInflightWeightPeak.Load()
 	contentFillAdmissionInflightWeightPeak.Store(0)
 	ac0 := fill710HeapAllocs()
 	fill710RefreshBurst(store, 1, 1)
@@ -345,7 +347,7 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 		"envelope bytes in flight peak %d (%.1f envelopes, bound %d); admitted-weight peak %d MiB; K / (ceiling / one fill) = %.1f; background admission wait p95 ≤ %d ms, max %d ms",
 		lists, perNS, env, readers, limit>>20, ungated>>20, ungatedObj>>20, gatedRuns, gated>>20, gatedObj>>20, runs, ceiling0>>20, oneFill>>20, fmemAllocateBlackFills, oneFillAlloc>>20, exp, bound>>20, unadmittedPeak.Load(),
 		envPeak, float64(envPeak)/float64(max(env, 1)), envBound,
-		contentFillAdmissionInflightWeightPeak.Load()>>20, float64(lists)/(float64(ceiling0)/float64(max(oneFill, 1))),
+		gatedWeightPeak>>20, float64(lists)/(float64(ceiling0)/float64(max(oneFill, 1))),
 		fill710P95(adm.Wait["background"]), adm.Wait["background"].MaxMS)
 	// The HARD checks (Errorf, so a defect shows each one it breaks).
 	if seedRatio < fmemChargeFloor {
