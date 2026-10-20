@@ -306,6 +306,30 @@ func TestReplay765b_P5_AStickyAllReceiverStaysAll(t *testing.T) {
 	}
 }
 
+// P5b (architect-623) — the receiver's edge is a NARROWABLE edge that its OWN
+// failed resolve widened (an *edgeInterest at all, not P5's plain struct{}).
+// A narrowed replay from a clean producer must leave it all: the widening is
+// sticky on both edge representations.
+func TestReplay765b_P5b_AReceiverWidenedByItsOwnFailedResolveStaysAll(t *testing.T) {
+	e := setup765b(t, "narrow", analyze765b(`[.s.items[] | {name: .metadata.name}]`))
+	widened := widgets765b[2]
+	dk := backingDK765b()
+	// Its own resolve: a narrowable edge-3 record, then a stage error widens it.
+	cache.Deps().RecordListNarrowable(context.Background(), widened, dk.GVR, dk.Namespace)
+	cache.Deps().WidenListInterest(widened, dk, cache.CommitWhyStageError)
+	if got := state765b(widened); got != "all" {
+		t.Fatalf("P5b setup: the receiver's own failed resolve must leave its edge all, got %q", got)
+	}
+	e.seed(t, cache.NewSeedResolveMemo(pmaps.DeepCopyJSON), widgets765b...)
+	if got := state765b(widened); got != "all" {
+		t.Fatalf("P5b RED: a receiver widened by its own failed resolve became %q under a narrowed replay: "+
+			"the widening must stay sticky", got)
+	}
+	if got := state765b(widgets765b[1]); !strings.HasPrefix(got, "narrowed:") {
+		t.Fatalf("P5b setup: the other sibling must still narrow, got %q", got)
+	}
+}
+
 func TestReplay765b_P6_ForwardMatchesAreIdenticalShadowOnAndOff(t *testing.T) {
 	run := func(shadow bool) []string {
 		restore := cache.SetListNarrowShadowForTest(shadow)
