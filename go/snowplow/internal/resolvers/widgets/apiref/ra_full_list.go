@@ -471,7 +471,12 @@ func raFullListServe(
 					if len(edges) == 0 {
 						return nil, false, nil
 					}
-					cache.Deps().ReplayEdges(ctx, widgetL1Key, edges)
+					// #765 B: carry the raKey edges' LIVE interest states. Sound
+					// because the raKey resolve's commit runs inside it (deferred in
+					// restactions.Resolve), before any raKey Put: the live state
+					// covers every version already stored (architect-623, #765).
+					cache.Deps().ReplayEdgesWithStates(ctx, widgetL1Key, edges,
+						cache.Deps().EdgeNarrowStates(raKey, edges), cache.ReplaySiteFullList)
 					// #406 — this body is DERIVED from the raKey cell, which may be
 					// dirty-marked and not yet refreshed (an RA edit marks both; the
 					// refresher may dequeue the widget first). Note which raKey version
@@ -555,7 +560,9 @@ func raFullListServe(
 			if len(edges) == 0 {
 				return nil, false, nil
 			}
-			cache.Deps().ReplayEdges(ctx, widgetL1Key, edges)
+			// #765 B: the raKey edges' live states (see the hit branch).
+			cache.Deps().ReplayEdgesWithStates(ctx, widgetL1Key, edges,
+				cache.Deps().EdgeNarrowStates(raKey, edges), cache.ReplaySiteFullList)
 		}
 		cache.RecordRAFullListServe(cache.RAFullListServeRepopulateSlice)
 		return sliced, true, nil

@@ -100,6 +100,10 @@ type seedMemoValue struct {
 	// hit replays them onto its own sink (ReplayRAFullListSlices) so the memo-served
 	// widget's Put is judged against them, like the producer's.
 	Layers LayeredSources
+	// Narrow (#765 B) holds the producer's per-edge interest states,
+	// index-aligned with Deps, snapshotted AFTER the producer's resolve returned
+	// (its commit ran inside it). nil = replay plain.
+	Narrow []EdgeNarrowState
 }
 
 // SeedResolveMemo memoizes the resolved output of a heavy RESTAction across the
@@ -223,15 +227,22 @@ func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, uint64, b
 // LoadLayered is Load plus the raKey versions the producing resolve sliced (#406),
 // read off the SAME value as the body, deps and stamp.
 func (mo *SeedResolveMemo) LoadLayered(key string) (map[string]any, []DepKey, uint64, LayeredSources, bool) {
+	body, deps, _, stamp, layers, ok := mo.LoadLayeredWithStates(key)
+	return body, deps, stamp, layers, ok
+}
+
+// LoadLayeredWithStates is LoadLayered plus the producer's per-edge interest
+// states (#765 B), read off the SAME value.
+func (mo *SeedResolveMemo) LoadLayeredWithStates(key string) (map[string]any, []DepKey, []EdgeNarrowState, uint64, LayeredSources, bool) {
 	if mo == nil {
-		return nil, nil, 0, nil, false
+		return nil, nil, nil, 0, nil, false
 	}
 	v, ok := mo.m.Load(key)
 	if !ok {
 		mo.mu.Lock()
 		mo.misses++
 		mo.mu.Unlock()
-		return nil, nil, 0, nil, false
+		return nil, nil, nil, 0, nil, false
 	}
 	val, _ := v.(*seedMemoValue)
 	if val != nil && seedMemoDepsMovedSince(val.Deps, val.Stamp) {
@@ -239,21 +250,21 @@ func (mo *SeedResolveMemo) LoadLayered(key string) (map[string]any, []DepKey, ui
 		mo.misses++
 		mo.staleMisses++
 		mo.mu.Unlock()
-		return nil, nil, 0, nil, false
+		return nil, nil, nil, 0, nil, false
 	}
 	mo.mu.Lock()
 	mo.hits++
 	mo.mu.Unlock()
 	if val == nil {
-		return nil, nil, 0, nil, true
+		return nil, nil, nil, 0, nil, true
 	}
 	// Deps is returned as a slice-header copy — the caller only reads it to
 	// replay edges; the underlying DepKeys are immutable value structs.
 	deps := val.Deps
 	if mo.copyFn == nil {
-		return val.Body, deps, val.Stamp, val.Layers, true
+		return val.Body, deps, val.Narrow, val.Stamp, val.Layers, true
 	}
-	return mo.copyFn(val.Body), deps, val.Stamp, val.Layers, true
+	return mo.copyFn(val.Body), deps, val.Narrow, val.Stamp, val.Layers, true
 }
 
 // seedMemoDepsMovedSince reports whether any dep saw a dep event after stamp,
@@ -290,10 +301,16 @@ func (mo *SeedResolveMemo) Store(key string, snapshot map[string]any, deps []Dep
 // StoreLayered is Store plus the raKey versions the producing resolve sliced (#406).
 // Same monotone-in-stamp CAS replacement as Store.
 func (mo *SeedResolveMemo) StoreLayered(key string, snapshot map[string]any, deps []DepKey, stamp uint64, layers LayeredSources) {
+	mo.StoreLayeredWithStates(key, snapshot, deps, nil, stamp, layers)
+}
+
+// StoreLayeredWithStates is StoreLayered plus the producer's per-edge interest
+// states (#765 B), index-aligned with deps.
+func (mo *SeedResolveMemo) StoreLayeredWithStates(key string, snapshot map[string]any, deps []DepKey, states []EdgeNarrowState, stamp uint64, layers LayeredSources) {
 	if mo == nil {
 		return
 	}
-	nv := &seedMemoValue{Body: snapshot, Deps: deps, Stamp: stamp, Layers: layers}
+	nv := &seedMemoValue{Body: snapshot, Deps: deps, Stamp: stamp, Layers: layers, Narrow: states}
 	for {
 		cur, loaded := mo.m.LoadOrStore(key, nv)
 		if !loaded {

@@ -316,7 +316,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// after the body was produced but before THIS resolve's entry is
 		// invisible to this resolve's own #375 Put-check, so a stale entry is a
 		// MISS here: fall through, resolve fresh, and storeMemo replaces it.
-		if body, deps, stamp, layers, ok := memo.LoadLayered(memoKey); ok {
+		if body, deps, states, stamp, layers, ok := memo.LoadLayeredWithStates(memoKey); ok {
 			// #277 / edge-3: replay the deps captured when this body was first
 			// produced onto THIS widget's L1 key, so a memo-served widget cell
 			// carries the same backing-GVR edges a real resolve would have
@@ -329,7 +329,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// [depEventSeq.Add → bucket stamp] window, where this resolve's
 			// startSeq already counts an event whose bucket stamp this Load
 			// did not yet see.
-			cache.Deps().ReplayEdgesAsOf(ctx, l1Key, deps, stamp)
+			//
+			// #765 B: and carry the producer's per-edge interest states, so a
+			// sibling narrows exactly when the producer did (a memo body is the
+			// same RESTAction output the producer's read set was derived for).
+			cache.Deps().ReplayEdgesAsOfWithStates(ctx, l1Key, deps, states, stamp, cache.ReplaySiteMemo)
 			// #406: the body is a slice of the raKey version(s) the producer sliced —
 			// carry them to THIS widget's Put too, so it is checked and recorded like
 			// the producer (the memo-HIT seed driver).
@@ -381,7 +385,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 				deps = append(deps, raDep)
 			}
 		}
-		memo.StoreLayered(memoKey, pmaps.DeepCopyJSON(out), deps, memoStamp, cache.LayeredSourcesSince(ctx, layerMark))
+		// #765 B (C2): snapshot the producer's per-edge interest states HERE —
+		// after the producing restactions.Resolve returned, so its commit (deferred
+		// inside Resolve) has settled every edge it recorded.
+		states := cache.Deps().EdgeNarrowStates(l1Key, deps)
+		memo.StoreLayeredWithStates(memoKey, pmaps.DeepCopyJSON(out), deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark))
 	}
 
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef

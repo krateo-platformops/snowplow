@@ -1327,6 +1327,11 @@ func registerListNarrowInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	replays, err := m.Int64ObservableCounter("snowplow_deps_list_narrow_replay_total",
+		metric.WithDescription("SHADOW (#603/#765 B) LIST edges replayed onto a widget that did not resolve its RESTAction itself, by site (memo = a resolve-memo sibling, full_list = a slice of the shared RAFullList cell) and outcome = the PRODUCER edge's state carried: narrowed (the receiver narrows to the producer's read set), or all / pending / absent (a plain, sticky-all record). pending and absent are the lossy fall-backs."))
+	if err != nil {
+		return err
+	}
 	eval, err := m.Int64ObservableCounter("snowplow_deps_interest_eval_total",
 		metric.WithDescription("SHADOW (#603/#765) informer-handler cost of the per-transition projection compare, by stat: transitions (UPDATEs evaluated against >= 1 live interest) and ns (total nanoseconds they took)."))
 	if err != nil {
@@ -1345,11 +1350,15 @@ func registerListNarrowInstruments(m metric.Meter) error {
 				attribute.String("outcome", v.Verdict), attribute.String("reason", v.Why)))
 		}
 		o.ObserveInt64(samples, int64(cache.ListNarrowAuditSamples()))
+		for _, c := range cache.ListNarrowReplaySnapshot() {
+			o.ObserveInt64(replays, int64(c.Count), metric.WithAttributes(
+				attribute.String("outcome", c.Outcome), attribute.String("site", c.Site)))
+		}
 		tr, ns := cache.ListNarrowEvalStats()
 		o.ObserveInt64(eval, int64(tr), metric.WithAttributes(attribute.String("stat", "transitions")))
 		o.ObserveInt64(eval, int64(ns), metric.WithAttributes(attribute.String("stat", "ns")))
 		return nil
-	}, decisions, audit, verdicts, samples, eval)
+	}, decisions, audit, verdicts, samples, replays, eval)
 	return err
 }
 
