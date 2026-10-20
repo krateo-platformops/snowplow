@@ -75,7 +75,10 @@ for n in range(1, pairs + 1):
         print("pair %d: MISSING (%s=%s, %s=%s)" % (n, base, b is not None, arm, a is not None))
         continue
     fb, fa = figures(b), figures(a)
-    keys = keys or list(fb)
+    keys = list(dict.fromkeys((keys or []) + list(fb) + list(fa)))
+    for f in (fb, fa):
+        for k in keys:
+            f.setdefault(k, 0)
     # The pairing rule equalises HOST CONDITIONS: two runs are comparable when
     # their host contention (granted cores / Go-busy cores) is within 15%.
     # Changed after #765 pair 1 (coordinator ruling): the first rule compared
@@ -95,7 +98,7 @@ ok = [r for r in rows if r[1]]
 print("\ncomparable pairs: %d of %d" % (len(ok), pairs))
 if ok:
     for k in keys:
-        ratios = sorted((fa[k] / fb[k]) for _, _, fb, fa in ok if fb[k])
+        ratios = sorted((fa.get(k, 0) / fb[k]) for _, _, fb, fa in ok if fb.get(k))
         if ratios:
             print("  %-24s %s/%s ratio: median %.3g (min %.3g, max %.3g)" % (
                 k, arm, base, ratios[len(ratios) // 2], ratios[0], ratios[-1]))
