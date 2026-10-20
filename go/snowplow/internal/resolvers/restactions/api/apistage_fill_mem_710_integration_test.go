@@ -51,12 +51,32 @@
 // comparison showed that is the GC-pacing tail, not a code change. The live
 // heap, its bound and the vacuity margin are still LOGGED every run, so the
 // distribution stays visible. What stays HARD: no dispatch for an unadmitted
-// flight (admit-after-dispatch), and envelope bytes in flight within
-// (ceiling0/oneFill + 2) envelopes — oneFill being one isolated fill's REAL
-// live-heap growth, so admit-all and a gate that undercharges a fill's weight
-// both read RED there. What is no longer hard-checked: live memory a flight
+// flight (admit-after-dispatch), envelope bytes in flight within
+// (ceiling0/oneFill + 2) envelopes (admit-all, a ≥~4× undercharge), and the
+// CHARGE check below. What is no longer hard-checked: live memory a flight
 // retains beyond its envelope (a tree or decode buffer kept after the serve,
 // retention growing across fills) — #786 tracks a GC-independent check for it.
+//
+// THE ENVELOPE BOUND'S INPUTS ARE PRODUCTION-DERIVED, each pinned elsewhere
+// (#780 issuecomments 6284754596, 6284877941):
+//   - oneFill ← the SEED weight (envelope × contentFillExpansionSeed). The
+//     "isolated replacement fill" frees the tree it replaces, so its net
+//     live-heap growth is ≈0 (2.6–11 KB measured) and max(isolated, seed) is the
+//     seed. Pinned by the P-seed charge check: a halved seed would loosen this
+//     bound and the gate's charge together, and P-seed reads it RED.
+//   - ceiling0 ← cache.AdmissionCeiling, pinned by
+//     TestAdmissionCeiling_HeadroomMinusReserve and the ADM1 arms.
+//
+// THE CHARGE CHECK (#780 c′). oneFillAlloc — the bytes one fill allocates
+// (/gc/heap/allocs, independent of GC timing) — is the fill's real size. Two
+// probes read what the gate CHARGED one isolated flight:
+//   - P-seed, right after the gate reset (charged at the seed): HARD,
+//     charged ≥ fmemChargeFloor × oneFillAlloc. A correct gate measured
+//     1.306–1.379; an undercharge of 2× reads 0.65–0.69.
+//   - P-cal, after the bursts (charged at the learned expansion): LOG-ONLY.
+//     Its correct tail (0.80 under -race) rests on few samples and the learned
+//     expansion is GC-paced; a 0.1 band is the trap #780 left. A halved learned
+//     expansion is caught deterministically by ADM2 instead.
 package api
 
 import (
@@ -171,7 +191,7 @@ func fill710Burst(store *cache.ResolvedCacheStore, lists, readers int, ctxFn fun
 }
 
 // fmemAllocateBlackFills is how many fills' worth of allocations (oneFillAlloc,
-// measured in isolation before the bursts) the heap bound allows on top of the
+// one fill's /gc/heap/allocs, measured before the bursts) the heap bound allows on top of the
 // starting ceiling and one fill: the GC counts what is allocated during its mark
 // phase as live (allocate-black), and how many fills one mark phase absorbs
 // depends on the GC's pacing, not on the gate. A FIXED design constant read
@@ -190,6 +210,12 @@ func fill710Burst(store *cache.ResolvedCacheStore, lists, readers int, ctxFn fun
 // (ungated ≥ bound + 1 × oneFillAlloc) goes RED rather than letting the arm
 // pass vacuously.
 const fmemAllocateBlackFills = 6
+
+// fmemChargeFloor is the P-seed floor: the gate must charge one fill at least
+// this many times the bytes that fill allocates (#780 issuecomment-6284877941).
+// A correct gate measured 1.306 (-race) – 1.379; a 2× undercharge reads
+// 0.653–0.690. 1.0 leaves ≈0.31 on each side.
+const fmemChargeFloor = 1.0
 
 func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T) {
 	const (
@@ -217,14 +243,18 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 	prevLimit := debug.SetMemoryLimit(limit)
 	t.Cleanup(func() { debug.SetMemoryLimit(prevLimit) })
 
-	// ONE FILL'S WEIGHT, fixed BEFORE the bursts and independent of the gate's own
-	// calibration (which a defect could inflate): the live-heap growth of one
-	// isolated replacement fill, or the seed weight if that is larger.
+	// ONE FILL, fixed BEFORE the bursts: its allocations (oneFillAlloc) and the
+	// weight the gate charged it at the seed (P-seed). oneFill is
+	// max(live-heap growth, seed) — in practice the seed: a replacement fill's
+	// net live growth is ≈0 (see the header).
 	ResetContentFillStatsForTest()
 	restore := cache.SetAdmissionRuntimeSeamsForTest(func() int64 { return 1<<63 - 1 }, fill710HeapObjects)
 	a0 := fill710HeapAllocs()
 	isolated, _, _ := fill710RefreshBurst(store, 1, 1)
 	oneFillAlloc := fill710HeapAllocs() - a0
+	// The weight the gate CHARGED that single flight (its admitted-weight peak:
+	// the only flight in flight, predicted at admit, reconciled to exact).
+	charged := contentFillAdmissionInflightWeightPeak.Load()
 	restore()
 	oneFill := max(isolated, seedFill)
 
@@ -285,6 +315,18 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 		}
 	}
 	exp := adm.Expansion[r1FsaGVR.String()]
+	// P-cal (#780 c′): one more isolated replacement fill AFTER the gated bursts,
+	// so the gate charges it at the CALIBRATED expansion. Only the weight-peak
+	// counter is reset — the gate and its calibration are kept.
+	contentFillAdmissionInflightWeightPeak.Store(0)
+	ac0 := fill710HeapAllocs()
+	fill710RefreshBurst(store, 1, 1)
+	calAlloc := fill710HeapAllocs() - ac0
+	calCharged := contentFillAdmissionInflightWeightPeak.Load()
+	seedRatio := float64(charged) / float64(max(oneFillAlloc, 1))
+	t.Logf("#780 F-MEM charge P-seed: charged %d B, oneFillAlloc %d B, ratio %.3f (floor %.2f, hard)", charged, oneFillAlloc, seedRatio, fmemChargeFloor)
+	t.Logf("#780 F-MEM charge P-cal: charged %d B, oneFillAlloc %d B, ratio %.3f (learned expansion %.2f; log-only)",
+		calCharged, calAlloc, float64(calCharged)/float64(max(calAlloc, 1)), exp)
 	// The bound: the live heap grows by at most the starting ceiling plus one
 	// fill (both fixed before the bursts) plus fmemAllocateBlackFills fills'
 	// ALLOCATIONS: the GC counts everything allocated during its mark phase as
@@ -299,13 +341,17 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 	// reply while the next flight runs, plus the empty-gate escape.
 	envBound := (ceiling0/max(oneFill, 1) + 2) * env
 	t.Logf("#710 PR-2a F-MEM: %d resident lists × %d items (envelope %d B), %d refresh-forced readers, soft limit %d MiB. "+
-		"UNGATED live-heap growth +%d MiB (heap/objects +%d); GATED worst of %d runs +%d MiB (heap/objects +%d; all runs %v MiB) (starting ceiling %d MiB + one fill %d MiB + %d × its allocations %d MiB, measured in isolation; gate expansion %.1f×; bound %d MiB); unadmitted dispatches peak %d; "+
+		"UNGATED live-heap growth +%d MiB (heap/objects +%d); GATED worst of %d runs +%d MiB (heap/objects +%d; all runs %v MiB) (starting ceiling %d MiB + one fill %d MiB + %d × its allocations %d MiB, measured before the bursts; gate expansion %.1f×; bound %d MiB); unadmitted dispatches peak %d; "+
 		"envelope bytes in flight peak %d (%.1f envelopes, bound %d); admitted-weight peak %d MiB; K / (ceiling / one fill) = %.1f; background admission wait p95 ≤ %d ms, max %d ms",
 		lists, perNS, env, readers, limit>>20, ungated>>20, ungatedObj>>20, gatedRuns, gated>>20, gatedObj>>20, runs, ceiling0>>20, oneFill>>20, fmemAllocateBlackFills, oneFillAlloc>>20, exp, bound>>20, unadmittedPeak.Load(),
 		envPeak, float64(envPeak)/float64(max(env, 1)), envBound,
 		contentFillAdmissionInflightWeightPeak.Load()>>20, float64(lists)/(float64(ceiling0)/float64(max(oneFill, 1))),
 		fill710P95(adm.Wait["background"]), adm.Wait["background"].MaxMS)
-	// The two HARD checks (Errorf, so a defect shows each one it breaks).
+	// The HARD checks (Errorf, so a defect shows each one it breaks).
+	if seedRatio < fmemChargeFloor {
+		t.Errorf("F-MEM RED: the gate charged one fill %d B at the seed, %.3f × the %d B it allocates — under the %.2f floor: it undercharges, so it admits more fills than fit",
+			charged, seedRatio, oneFillAlloc, fmemChargeFloor)
+	}
 	if u := unadmittedPeak.Load(); u > 0 {
 		t.Errorf("F-MEM RED: %d dispatches ran for flights the gate had not admitted — a queued flight built its envelope outside the ceiling", u)
 	}
