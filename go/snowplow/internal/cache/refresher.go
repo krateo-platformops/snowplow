@@ -248,6 +248,14 @@ type refresher struct {
 	// is bounded (~10-15 GVRs at 50K prod scale) so contention is trivial.
 	clusterListKeys sync.Map
 
+	// viewedQueue — #765: the VIEWED tier (refresher_viewed.go). A dirty-marked
+	// key with an armed /refreshes subscription is queued here and drained
+	// before both other tiers; promotedKeys marks keys a tab armed while they
+	// waited in another tier (the exactly-once skip); viewed are its counters.
+	viewedQueue  workqueue.TypedRateLimitingInterface[string]
+	promotedKeys sync.Map
+	viewed       viewedTierStats
+
 	handlersMu sync.RWMutex
 	handlers   map[string]RefreshFunc
 
@@ -414,10 +422,17 @@ func refresherSingleton() *refresher {
 			time.Duration(baseMS)*time.Millisecond,
 			time.Duration(maxMS)*time.Millisecond,
 		)
+		// #765 — the viewed tier keeps its own retry history too.
+		vRL := workqueue.NewTypedItemExponentialFailureRateLimiter[string](
+			time.Duration(baseMS)*time.Millisecond,
+			time.Duration(maxMS)*time.Millisecond,
+		)
+		normalQ := workqueue.NewTypedRateLimitingQueue[string](rl)
 		refresherInstance.Store(&refresher{
 			parallelism:      parallelism,
-			queue:            workqueue.NewTypedRateLimitingQueue[string](rl),
+			queue:            normalQ,
 			clusterListQueue: workqueue.NewTypedRateLimitingQueue[string](clRL),
+			viewedQueue:      newViewedQueue(vRL, normalQ),
 			handlers:         map[string]RefreshFunc{},
 			resolveLatency:   newP2Quantile(0.95),
 			dirtyStats:       newDirtyWindowStats(),
@@ -556,6 +571,7 @@ func StartRefresher(ctx context.Context) {
 			<-ctx.Done()
 			r.queue.ShutDown()
 			r.clusterListQueue.ShutDown()
+			r.viewedQueue.ShutDown()
 		}()
 
 		slog.Info("refresher.started",
@@ -573,6 +589,7 @@ func StopRefresher() {
 	r.stopOnce.Do(func() {
 		r.queue.ShutDown()
 		r.clusterListQueue.ShutDown()
+		r.viewedQueue.ShutDown()
 	})
 }
 
@@ -622,9 +639,16 @@ func (r *refresher) onDirtyMark(l1Key string, triggerGVR schema.GroupVersionReso
 	// (phase1_clusterlist_prewarm.go) AND by
 	// EnqueueClusterListRefresh from cluster_list.go's
 	// cold-miss async-populate path.
-	if _, isClusterList := r.clusterListKeys.Load(l1Key); isClusterList {
+	//
+	// #765 — a key open on a page (an armed /refreshes subscription) goes to the
+	// VIEWED tier, drained first. Checked AFTER markDirty: an arm racing this mark
+	// either is seen here, or sees the window markDirty opened (promoteOnArm).
+	switch _, isClusterList := r.clusterListKeys.Load(l1Key); {
+	case HasRefreshSubscriber(l1Key):
+		r.enqueueViewed(l1Key)
+	case isClusterList:
 		r.enqueueClusterList(l1Key)
-	} else {
+	default:
 		r.enqueue(l1Key)
 	}
 	// #374/#375/#383 INVARIANT — the residency-gated enqueue-DROP (#383,
@@ -887,14 +911,23 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		key      string
 		shutdown bool
 		fromCL   bool
+		tier     = tierNormal
 	)
-	if r.clusterListQueue != nil && r.clusterListQueue.Len() > 0 {
+	// #765 — the VIEWED tier first (refresher_viewed.go): cells open on a page.
+	if r.viewedQueue != nil && r.viewedQueue.Len() > 0 {
+		key, shutdown = r.viewedQueue.Get()
+		if !shutdown {
+			tier = tierViewed
+		}
+	}
+	if tier != tierViewed && r.clusterListQueue != nil && r.clusterListQueue.Len() > 0 {
 		key, shutdown = r.clusterListQueue.Get()
 		if !shutdown {
 			fromCL = true
+			tier = tierClusterList
 		}
 	}
-	if !fromCL {
+	if tier == tierNormal {
 		// Normal tier blocking Get. This is the steady-state path
 		// (cluster_list events are infrequent — boot pre-warm
 		// populates ~10-15 cells then refreshes only on informer
@@ -903,11 +936,46 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		if shutdown {
 			return false
 		}
+		if key == viewedWakeKey {
+			// #765 idle wake: back to the viewed probe; wake the next idle worker
+			// while more viewed keys wait.
+			r.queue.Done(key)
+			if r.viewedQueue != nil && r.viewedQueue.Len() > 1 {
+				r.queue.Add(viewedWakeKey)
+			}
+			return true
+		}
 	}
-	if fromCL {
+	switch tier {
+	case tierViewed:
+		defer func() {
+			r.viewedQueue.Done(key)
+			// A mark that landed while this key was processing is re-queued by
+			// Done itself, not through Add: wake an idle worker for it.
+			if r.viewedQueue.Len() > 0 {
+				r.queue.Add(viewedWakeKey)
+			}
+		}()
+		r.viewed.dequeued.Add(1)
+	case tierClusterList:
 		defer r.clusterListQueue.Done(key)
-	} else {
+	default:
 		defer r.queue.Done(key)
+	}
+	// #765 — exactly once: a key whose triggers another tier's dequeue already
+	// consumed has nothing left to do (refresher_viewed.go). Before the yield: a
+	// no-op must not park a worker.
+	if r.consumedElsewhere(key, tier) {
+		switch tier {
+		case tierViewed:
+			r.viewedQueue.Forget(key)
+		case tierClusterList:
+			r.clusterListQueue.Forget(key)
+		default:
+			r.queue.Forget(key)
+		}
+		r.viewed.skippedConsumed.Add(1)
+		return true
 	}
 	// #547 — a background revalidation of a known-stale shared shell settles with
 	// this dequeue (runs before Done, after every branch below has settled the
@@ -944,8 +1012,11 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// SAME q, so a floored cluster_list key defers onto clusterListQueue
 	// and the deferred Done (refresher.go above) is on the matching tier.
 	q := r.queue
-	if fromCL {
+	switch tier {
+	case tierClusterList:
 		q = r.clusterListQueue
+	case tierViewed:
+		q = r.viewedQueue
 	}
 
 	// Task #321 (#318-R1a) — per-key re-resolve RATE-FLOOR (S1: reuse
@@ -1057,6 +1128,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// triggerGVRSet is immutable (see triggerGVRSet), and both the stamp
 	// helpers and mergeTriggerGVR copy before they append.
 	var consumedTriggers []schema.GroupVersionResource
+	r.consumeTriggersOnTier(key, tier) // #765: this dequeue runs the refresh
 	if v, present := r.triggerGVRByKey.LoadAndDelete(key); present {
 		switch tg := v.(type) {
 		case *triggerGVRSet: // #375 B — the merged trigger SET, consumed in full
@@ -1095,6 +1167,16 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// bypasses the admission cap at both gates, like the demand revalidation.
 	if _, held := bgRevalidationInflight.Load(key); held {
 		rctx = WithCustomerTriggeredRefresh(rctx)
+	} else if tier == tierViewed {
+		// #765 rule 3 — re-check at dequeue: a viewer is still waiting on this cell,
+		// so it bypasses the admission cap like K5 and the #740 retries; a tab that
+		// closed meanwhile leaves an ordinary background refresh.
+		if HasRefreshSubscriber(key) {
+			rctx = WithCustomerTriggeredRefresh(rctx)
+			r.viewed.customer.Add(1)
+		} else {
+			r.viewed.unsubscribed.Add(1)
+		}
 	}
 	attemptStart := time.Now()
 	err := r.processOne(rctx, key, entry, ok)
@@ -1402,6 +1484,15 @@ type refresherStats struct {
 	// falsifiers; not published on expvar or OTLP.
 	clusterListEnqueued  uint64 `stat:"-"`
 	clusterListCompleted uint64 `stat:"-"`
+
+	// #765 — the viewed tier (refresher_viewed.go).
+	viewedEnqueued        uint64 `stat:"viewed_enqueue"`
+	viewedPromoted        uint64 `stat:"viewed_promoted"`
+	viewedDequeued        uint64 `stat:"viewed_dequeued"`
+	viewedSkippedConsumed uint64 `stat:"viewed_skipped_consumed"`
+	viewedCustomer        uint64 `stat:"viewed_customer_triggered"`
+	viewedUnsubscribed    uint64 `stat:"viewed_unsubscribed"`
+	viewedQueueDepth      int64  `stat:"viewed_queue_depth" kind:"gauge" desc:"Live depth of the refresher's viewed tier (#765): dirty cells open on a page, drained before every other tier."`
 }
 
 func refresherStatsSnapshot() refresherStats {
@@ -1436,6 +1527,14 @@ func refresherStatsSnapshot() refresherStats {
 		clusterListEnqueued:  r.clusterListEnqueueTotal.Load(),
 		clusterListCompleted: r.clusterListCompletedTotal.Load(),
 		queueDepth:           refresherQueueDepth(r),
+
+		viewedEnqueued:        r.viewed.enqueued.Load(),
+		viewedPromoted:        r.viewed.promoted.Load(),
+		viewedDequeued:        r.viewed.dequeued.Load(),
+		viewedSkippedConsumed: r.viewed.skippedConsumed.Load(),
+		viewedCustomer:        r.viewed.customer.Load(),
+		viewedUnsubscribed:    r.viewed.unsubscribed.Load(),
+		viewedQueueDepth:      viewedQueueDepth(r),
 	}
 }
 
@@ -1508,6 +1607,18 @@ func AddRefresherPoolCounterForTest(stat string, n uint64) bool {
 		r.cappedTotal.Add(n)
 	case "floored":
 		r.flooredTotal.Add(n)
+	case "viewed_enqueue":
+		r.viewed.enqueued.Add(n)
+	case "viewed_promoted":
+		r.viewed.promoted.Add(n)
+	case "viewed_dequeued":
+		r.viewed.dequeued.Add(n)
+	case "viewed_skipped_consumed":
+		r.viewed.skippedConsumed.Add(n)
+	case "viewed_customer_triggered":
+		r.viewed.customer.Add(n)
+	case "viewed_unsubscribed":
+		r.viewed.unsubscribed.Add(n)
 	case "parked_ms":
 		r.parkedNanos.Add(n * uint64(time.Millisecond))
 	case "dirty_to_fresh_samples":
@@ -1583,6 +1694,9 @@ func resetRefresherForTest() {
 		r.queue.ShutDown()
 		if r.clusterListQueue != nil {
 			r.clusterListQueue.ShutDown()
+		}
+		if r.viewedQueue != nil {
+			r.viewedQueue.ShutDown()
 		}
 		// Wait for workers to drain + exit. Capped at 5s as a defensive
 		// deadline that should never fire.

@@ -857,6 +857,9 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 	// #740 — an arm of a dependent resumes an abandoned stale-retry chain with an
 	// immediate attempt: the cell has a viewer again.
 	noteStaleRetryArm(armedKeys)
+	// #765 — a key this tab armed that already waits dirty in another tier is
+	// promoted to the refresher's viewed tier (refresher_viewed.go).
+	notePromoteOnArm(armedKeys)
 
 	var once sync.Once
 	unsub := func() {
