@@ -89,3 +89,8 @@ func ResetUnguardedPutTotalForTest() { Deps().unguardedPutTotal.Store(0) }
 func BumpCoordinateForTest(gvr schema.GroupVersionResource, namespace, name string) {
 	Deps().bumpCoordinateGen(gvr, namespace, name)
 }
+
+// WithViewedRefreshForTest marks ctx as a viewed-tier refresh exactly as the
+// refresher's viewed dequeue does (#799 fix 1), for the api package's content
+// coalescing arms. Production MUST NOT call it.
+func WithViewedRefreshForTest(ctx context.Context) context.Context { return withViewedRefresh(ctx) }

@@ -10,13 +10,64 @@ import (
 	"time"
 )
 
-// TestViewedTier765_V2b_ViewedCopyAfterTheOtherTierRanIsSkipped is V2b: the
-// interleaving the drain order makes rare but a multi-worker Len/Get race or a
-// floor deferral allows — a promoted key's NORMAL copy is dequeued and run
-// first. The viewed copy that follows has nothing left to do and must not
-// re-resolve. Driven step by step with processNext (no workers), so the order
-// is exact.
-func TestViewedTier765_V2b_ViewedCopyAfterTheOtherTierRanIsSkipped(t *testing.T) {
+// TestViewedTier765_V2b_NormalCopyStepsAsideForThePendingViewedCopy is V2b: a
+// promoted key sits in two tiers, and the NORMAL copy reaches a worker first
+// (with the #799 reservation / p=1 alternation the normal tier always gets
+// turns, so this is the common case, not a race). It must step aside: the
+// viewed copy carries the triggers and runs at the viewer's priority, and the
+// key is re-resolved exactly once, customer-triggered. Driven step by step with
+// processNext (no workers), so the order is exact.
+func TestViewedTier765_V2b_NormalCopyStepsAsideForThePendingViewedCopy(t *testing.T) {
+	terminalEnv(t)
+	cleanup := withCleanRefresher(t, 1, 0)
+	t.Cleanup(cleanup)
+	_, keys := terminalFixtureNoReset(t, 1)
+	k := keys[0]
+	var runs, customer atomic.Int32
+	RegisterRefreshFunc("widgets", func(ctx context.Context, key string, _ ResolvedKeyInputs) error {
+		if key == k {
+			runs.Add(1)
+			if CustomerTriggeredRefreshFromContext(ctx) {
+				customer.Add(1)
+			}
+		}
+		return nil
+	})
+	r := refresherSingleton()
+	ctx := context.Background()
+
+	terminalMark([]string{k}) // unviewed: the normal tier
+	viewed765Arm(t, k)        // promoted: now also on the viewed tier
+	if r.viewedQueue.Len() != 1 {
+		t.Fatalf("PRECONDITION: the arm did not promote the key (viewed depth %d)", r.viewedQueue.Len())
+	}
+	vk, _ := r.viewedQueue.Get() // the viewed copy is held back...
+	if !r.processNext(ctx) {     // ...while a worker takes the normal copy
+		t.Fatalf("processNext stopped")
+	}
+	if n := runs.Load(); n != 0 {
+		t.Fatalf("V2b RED (#799): the normal copy re-resolved the promoted key (as background) while its viewed copy was still queued")
+	}
+	r.viewedQueue.Done(vk)
+	r.viewedQueue.Add(vk) // the viewed copy comes back
+	for r.viewedQueue.Len() > 0 || r.queue.Len() > 0 {
+		r.processNext(ctx)
+	}
+	if runs.Load() != 1 || customer.Load() != 1 {
+		t.Fatalf("V2b RED: runs=%d customer-triggered=%d, want exactly one re-resolve, at the viewer's priority", runs.Load(), customer.Load())
+	}
+	if got := r.viewed.skippedConsumed.Load(); got != 1 {
+		t.Fatalf("V2b: viewed_skipped_consumed = %d, want 1 (the normal copy)", got)
+	}
+}
+
+// TestViewedTier765_V2c_ViewedCopyAfterTheOtherTierRanIsSkipped is V2c: a key
+// lands in two tiers WITHOUT a promotion: marked while armed (viewed tier), the
+// tab closes, a second mark routes it normal. With the #799 reservation the
+// normal copy can run first; it consumes the merged trigger set. The viewed copy
+// that follows has nothing left to do and must not re-resolve. Driven step by
+// step with processNext (no workers), so the order is exact.
+func TestViewedTier765_V2c_ViewedCopyAfterTheOtherTierRanIsSkipped(t *testing.T) {
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
@@ -32,14 +83,16 @@ func TestViewedTier765_V2b_ViewedCopyAfterTheOtherTierRanIsSkipped(t *testing.T)
 	r := refresherSingleton()
 	ctx := context.Background()
 
-	terminalMark([]string{k}) // unviewed: the normal tier
-	viewed765Arm(t, k)        // promoted: now also on the viewed tier
+	unsub := viewed765Arm(t, k)
+	terminalMark([]string{k}) // armed: the viewed tier
+	unsub()
+	terminalMark([]string{k}) // no longer armed: the normal tier too
 	if r.viewedQueue.Len() != 1 {
-		t.Fatalf("PRECONDITION: the arm did not promote the key (viewed depth %d)", r.viewedQueue.Len())
+		t.Fatalf("PRECONDITION: the key is not on the viewed tier (depth %d)", r.viewedQueue.Len())
 	}
-	vk, _ := r.viewedQueue.Get() // another worker holds the viewed copy...
-	if !r.processNext(ctx) {     // ...while this one runs the normal copy
-		t.Fatalf("processNext stopped")
+	vk, _ := r.viewedQueue.Get() // the viewed copy is held back...
+	for r.queue.Len() > 0 {      // ...while a worker runs the normal copy
+		r.processNext(ctx)
 	}
 	if runs.Load() != 1 {
 		t.Fatalf("PRECONDITION: the normal copy did not re-resolve (runs=%d)", runs.Load())
@@ -50,10 +103,7 @@ func TestViewedTier765_V2b_ViewedCopyAfterTheOtherTierRanIsSkipped(t *testing.T)
 		r.processNext(ctx)
 	}
 	if got := runs.Load(); got != 1 {
-		t.Fatalf("V2b RED (#765): the key was re-resolved %d times — the viewed copy re-ran a refresh the normal copy had already done", got)
-	}
-	if got := r.viewed.skippedConsumed.Load(); got != 1 {
-		t.Fatalf("V2b: viewed_skipped_consumed = %d, want 1", got)
+		t.Fatalf("V2c RED (#765): the key was re-resolved %d times — the viewed copy re-ran a refresh the normal copy had already done", got)
 	}
 }
 

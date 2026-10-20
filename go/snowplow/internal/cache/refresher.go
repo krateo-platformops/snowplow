@@ -259,8 +259,13 @@ type refresher struct {
 	// one step. B2 — inFlightKeys: the keys a worker is re-resolving now (value:
 	// a dequeue of it from another tier was deferred and must be re-added).
 	priorityGetMu sync.Mutex
-	inFlightMu    sync.Mutex
-	inFlightKeys  map[string]bool
+	// #799 fix 2 — viewedActive: workers in viewed-tier work now (guarded by
+	// priorityGetMu); lastViewed: the last priority dequeue was viewed (p=1
+	// alternation; cleared by any normal-tier dequeue, the wake key included).
+	viewedActive int
+	lastViewed   atomic.Bool
+	inFlightMu   sync.Mutex
+	inFlightKeys map[string]bool
 
 	handlersMu sync.RWMutex
 	handlers   map[string]RefreshFunc
@@ -931,6 +936,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		if shutdown {
 			return false
 		}
+		r.lastViewed.Store(false) // #799 fix 2: p=1 alternation
 		if key == viewedWakeKey {
 			// #765 idle wake: back to the viewed probe; wake the next idle worker
 			// while more viewed keys wait.
@@ -944,6 +950,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	switch tier {
 	case tierViewed:
 		defer func() {
+			r.endViewed()
 			r.viewedQueue.Done(key)
 			// A mark that landed while this key was processing is re-queued by
 			// Done itself, not through Add: wake an idle worker for it.
@@ -1175,7 +1182,9 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		// so it bypasses the admission cap like K5 and the #740 retries; a tab that
 		// closed meanwhile leaves an ordinary background refresh.
 		if HasRefreshSubscriber(key) {
-			rctx = WithCustomerTriggeredRefresh(rctx)
+			// #799 fix 1 — and a passive viewer's refresh joins the key's
+			// pending content fill instead of leading its own (withViewedRefresh).
+			rctx = withViewedRefresh(WithCustomerTriggeredRefresh(rctx))
 			r.viewed.customer.Add(1)
 		} else {
 			r.viewed.unsubscribed.Add(1)

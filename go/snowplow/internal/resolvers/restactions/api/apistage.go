@@ -586,7 +586,7 @@ func apistageContentServeAttempt(
 	// than the change that triggered it — is exactly the stamp check.
 	var stamp contentStampGate
 	if !forceContentMiss && refresherDriven && cache.RefreshTriggerHas(ctx, gvr) {
-		stamp = contentStampGate{on: true, need: cache.RefreshTriggerAsOf(ctx)}
+		stamp = contentStampGate{on: true, need: cache.RefreshTriggerAsOf(ctx), viewed: cache.ViewedRefreshFromContext(ctx)}
 	}
 	// #376 — the content cell is stamped ONLY by a true customer serve. On
 	// forceContentMiss the entry is discarded + re-dispatched fresh anyway → skip the

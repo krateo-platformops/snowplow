@@ -31,6 +31,20 @@
 // self-enqueues — legitimately carry no triggers). A mark landing after the
 // first refresh brings new triggers, so the second dequeue then runs.
 //
+// #799 (dev-765h's pair at 6bd30396, RUN; architect-623's ruling):
+//   - SHARE THE FILL. A viewed re-resolve also carries withViewedRefresh: a
+//     passive viewer, no customer request waiting, so its content fill joins the
+//     key's pending fill like a background reader (keeping the cap bypass)
+//     instead of leading its own re-fill of the same 50K list (fills in flight
+//     went 1 → 4). K5 / #547 demand / D2 never carry it and never wait.
+//   - RESERVE A WORKER. At most parallelism−1 workers are in viewed work at
+//     once (viewedSlotFree); with one worker the tiers alternate. Under constant
+//     churn on viewed cells the viewed tier never empties, and strict priority
+//     had the normal tier complete ZERO refreshes.
+//   - STEP ASIDE. A promoted key's other copy does not run while its viewed copy
+//     is still queued (the reservation gives the normal tier turns, so it could
+//     otherwise run first, as background).
+//
 // UNCHANGED: yieldToCustomer before every tier, the per-key rate floor (applied
 // after the dequeue, so it covers the viewed tier and defers onto it), the
 // suppression, known-stale and poison-pill paths.
@@ -46,6 +60,7 @@
 package cache
 
 import (
+	"context"
 	"sync/atomic"
 
 	"k8s.io/client-go/util/workqueue"
@@ -71,6 +86,30 @@ func newViewedQueue(rl workqueue.TypedRateLimiter[string], normal workqueue.Type
 	return workqueue.NewTypedRateLimitingQueueWithConfig(rl, workqueue.TypedRateLimitingQueueConfig[string]{
 		DelayingQueue: workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Queue: wq}),
 	})
+}
+
+type ctxKeyViewedRefreshType struct{}
+
+var ctxKeyViewedRefresh = ctxKeyViewedRefreshType{}
+
+// withViewedRefresh marks a viewed-tier re-resolve whose tab is still armed
+// (#799 fix 1). It rides beside WithCustomerTriggeredRefresh (the cap bypass)
+// and tells the content fill this refresh has NO customer request waiting on
+// it — a passive viewer waits on a push — so it may join the key's pending fill
+// like a background reader instead of leading its own concurrent re-fill of the
+// same list. K5 / #547 demand revalidations and the D2 refill (a customer read
+// IS waiting) never carry it, and keep never waiting (#710).
+func withViewedRefresh(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxKeyViewedRefresh, true)
+}
+
+// ViewedRefreshFromContext reports withViewedRefresh.
+func ViewedRefreshFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(ctxKeyViewedRefresh).(bool)
+	return v
 }
 
 // viewedWakeKey is the reserved normal-queue item that wakes an idle worker for
@@ -136,7 +175,7 @@ func (r *refresher) promoteOnArm(key string) {
 	if key == "" || r.viewedQueue == nil || !r.dirtyPending(key) {
 		return
 	}
-	r.promotedKeys.Store(key, struct{}{})
+	r.promotedKeys.Store(key, promotedViewedPending)
 	r.viewed.promoted.Add(1)
 	r.enqueueViewed(key)
 }
@@ -159,15 +198,32 @@ func notePromoteOnArm(armedKeys map[string]struct{}) {
 func (r *refresher) consumedElsewhere(key string, tier refreshTier) bool {
 	switch tier {
 	case tierViewed:
+		// The promoted key's viewed copy is being dequeued: from here its other
+		// copy may only run for a mark that lands after it.
+		r.promotedKeys.CompareAndSwap(key, promotedViewedPending, promotedViewedDone)
 		return !r.hasPendingTriggers(key)
 	case tierNormal, tierClusterList:
-		if _, promoted := r.promotedKeys.Load(key); promoted && !r.hasPendingTriggers(key) {
+		v, promoted := r.promotedKeys.Load(key)
+		if !promoted {
+			return false
+		}
+		// #799 — the viewed copy is still queued: it carries the triggers and
+		// runs at the viewer's priority, so this copy steps aside (else, with the
+		// fix-2 reservation or p=1 alternation, it could run first as background).
+		if v == promotedViewedPending || !r.hasPendingTriggers(key) {
 			r.promotedKeys.Delete(key)
 			return true
 		}
 	}
 	return false
 }
+
+// The promoted marker's two states: the viewed copy is still queued, or it has
+// been dequeued (the other copy then runs only for a mark that came after).
+const (
+	promotedViewedPending = 1
+	promotedViewedDone    = 2
+)
 
 // consumeTriggersOnTier is called where a dequeue takes key's trigger set: a
 // non-viewed dequeue that runs the refresh itself retires the promoted marker
@@ -213,11 +269,39 @@ func (r *refresher) tryPriorityGet(q workqueue.TypedRateLimitingInterface[string
 	if q.Len() == 0 {
 		return "", false
 	}
+	if t == tierViewed && !r.viewedSlotFree() {
+		return "", false
+	}
 	if fn := tierProbeHook.Load(); fn != nil {
 		(*fn)(t)
 	}
 	key, shutdown := q.Get()
+	if !shutdown && t == tierViewed {
+		r.viewedActive++ // under priorityGetMu; released by endViewed
+		r.lastViewed.Store(true)
+	}
 	return key, !shutdown
+}
+
+// viewedSlotFree is the #799 fix-2 reservation, read under priorityGetMu: the
+// viewed tier may hold at most parallelism−1 workers at once, so the normal and
+// cluster_list tiers always keep one — under constant churn on viewed cells the
+// viewed tier never empties, and strict priority starved every other cell (RUN,
+// dev-765h: zero normal-tier completions). Structural, not a knob. With one
+// worker the tiers ALTERNATE: after a viewed dequeue, the next dequeue goes to
+// the normal tier when it has work.
+func (r *refresher) viewedSlotFree() bool {
+	if r.parallelism <= 1 {
+		return !r.lastViewed.Load() || r.queue.Len() == 0
+	}
+	return r.viewedActive < r.parallelism-1
+}
+
+// endViewed releases a viewed-tier worker slot (#799 fix 2).
+func (r *refresher) endViewed() {
+	r.priorityGetMu.Lock()
+	r.viewedActive--
+	r.priorityGetMu.Unlock()
 }
 
 // claimInFlight marks key as being re-resolved by this worker (#799 B2). false:
