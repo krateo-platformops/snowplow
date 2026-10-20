@@ -138,6 +138,18 @@ func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource)
 		}
 		_, already := rw.watchBroken[gvr]
 		rw.watchBroken[gvr] = struct{}{}
+		// #796 — the LATEST error decides whether the LIST is refused: a
+		// terminal NotFound / Forbidden (client-go wraps the LIST error with
+		// %w, so apierrors classifies through it) sets the mark, any other
+		// error removes it.
+		if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
+			if rw.listRefused == nil {
+				rw.listRefused = map[schema.GroupVersionResource]struct{}{}
+			}
+			rw.listRefused[gvr] = struct{}{}
+		} else {
+			delete(rw.listRefused, gvr)
+		}
 		rw.mu.Unlock()
 		// 1.12.7 — count EVERY reflector error. The WARN below is one-shot per
 		// GVR (map membership), which keeps a broken watch from flooding the
@@ -430,6 +442,7 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	rv := gi.Informer().LastSyncResourceVersion()
 	prev := rw.lastSyncRV[gvr]
 	if rv != "" && rv != prev && gi.Informer().HasSynced() {
+		delete(rw.listRefused, gvr) // #796 — a relist succeeded
 		if _, broken := rw.watchBroken[gvr]; broken {
 			delete(rw.watchBroken, gvr)
 			slog.Info("cache.watch.recovered",
@@ -1320,6 +1333,17 @@ func (rw *ResourceWatcher) StartDiscoveryRefresher(ctx context.Context) {
 // FireWatchError simulates the reflector dropping gvr's WATCH connection
 // — the exact effect of the production SetWatchErrorHandler closure.
 // After this call, servableLocked's conjunct 3 fails for gvr.
+// InvokeWatchErrorHandlerForTest drives gvr's REAL reflector error handler
+// (watchErrorHandlerFor) with err, as client-go would after a failed
+// List/Watch. Unlike FireWatchError it classifies err (#796 listRefused).
+// Tests only.
+func (rw *ResourceWatcher) InvokeWatchErrorHandlerForTest(gvr schema.GroupVersionResource, err error) {
+	if rw == nil {
+		return
+	}
+	rw.watchErrorHandlerFor(gvr)(nil, err)
+}
+
 func (rw *ResourceWatcher) FireWatchError(gvr schema.GroupVersionResource) {
 	if rw == nil {
 		return
@@ -1342,6 +1366,7 @@ func (rw *ResourceWatcher) MarkWatchRecovered(gvr schema.GroupVersionResource) {
 	}
 	rw.mu.Lock()
 	delete(rw.watchBroken, gvr)
+	delete(rw.listRefused, gvr)
 	rw.mu.Unlock()
 }
 
