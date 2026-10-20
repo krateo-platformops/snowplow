@@ -42,6 +42,8 @@ package dispatchers
 
 import (
 	"context"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -192,18 +194,39 @@ func l250Key() string {
 // drive250Resolve runs the widget-LIST stage through the REAL restactions
 // resolver under the content-prewarm markers. l1Key!="" installs the ambient
 // key (== the pre-fix prewarm install); l1Key=="" is the post-fix bare ctx.
-func drive250Resolve(t *testing.T, rw *cache.ResourceWatcher, l1Key, path string) {
+func drive250Resolve(t *testing.T, rw *cache.ResourceWatcher, l1Key, path string) (dials int64) {
 	t.Helper()
+	// The dead endpoint below drops every connection at once, but the plumbing
+	// RetryClient still retries it with 500ms→10s backoff: ~24s per resolve
+	// (#790). Keep every retry, drop only the sleeps between them; the
+	// listener counts the dials so the DeadDial arm can pin the retries.
+	t.Setenv("CLIENT_BASE_BACKOFF", "1ms")
+	t.Setenv("CLIENT_MAX_BACKOFF", "1ms")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("dead-endpoint listener: %v", err)
+	}
+	defer ln.Close()
+	var accepted atomic.Int64
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			_ = c.Close()
+		}
+	}()
 	ctx := cache.WithApistagePrewarm(xcontext.BuildContext(context.Background(),
 		// The real prewarm SA context carries a system:serviceaccount username
 		// alongside ApistagePrewarm; the resolver needs an identity on ctx even
 		// though the per-user content gate is skipped under prewarm.
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: w250SAUser})))
 	ctx = cache.WithServeWatcher(ctx, rw)
-	// 127.0.0.1:1 fails fast (connection refused, no DNS wait); the K8s call is
-	// served from the synced informer anyway — the endpoint is only dialed for the
-	// stage's discarded live call.
-	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://127.0.0.1:1"})
+	// The K8s call is served from the synced informer anyway — the endpoint is
+	// only dialed for the stage's discarded live call.
+	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://" + ln.Addr().String()})
 	if l1Key != "" {
 		ctx = cache.WithL1KeyContext(ctx, l1Key)
 	}
@@ -217,6 +240,7 @@ func drive250Resolve(t *testing.T, rw *cache.ResourceWatcher, l1Key, path string
 		Watcher: rw,
 		Items:   []*templates.API{stage},
 	})
+	return accepted.Load()
 }
 
 // put250Keys captures every L1 key currently in the resolved store — the
@@ -331,6 +355,26 @@ func TestPrewarm250_Probe_HarnessProducesPutAndPhantomEdge(t *testing.T) {
 	}
 	if got := cache.Deps().EdgesUnder(l433); len(got) != 0 {
 		t.Fatalf("#250 PROBE: the bare-ctx resolve recorded %d edge(s) under l433 — must be 0", len(got))
+	}
+}
+
+// TestPrewarm250_DeadDial_EveryRetryIsKept — #790. The harness shortens the
+// RetryClient's backoff through the environment; that only works because the
+// client is built per call (credhttp.Do → util.NewRetryClient), so the arm pins
+// both halves: the resolve is fast AND the dead endpoint still saw the first
+// dial plus every one of the CLIENT_MAX_RETRIES (default 5) retries.
+func TestPrewarm250_DeadDial_EveryRetryIsKept(t *testing.T) {
+	rw := new250Watcher(t)
+	start := time.Now()
+	dials := drive250Resolve(t, rw, "", w250ListPath)
+	elapsed := time.Since(start)
+	if dials != 6 {
+		t.Fatalf("#790: the dead endpoint saw %d dial(s), want 6 (1 + CLIENT_MAX_RETRIES=5): "+
+			"the harness must keep every retry", dials)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("#790: the resolve took %v with 6 dials — the backoff override did not reach "+
+			"the RetryClient", elapsed)
 	}
 }
 
