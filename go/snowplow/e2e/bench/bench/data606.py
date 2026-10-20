@@ -86,7 +86,9 @@ def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
     t0 = time.time()
     proof: dict = {"scale": scale, "namespaces": namespaces, "users": users}
 
-    lifecycle.create_bench_namespaces(1, namespaces)
+    failed = lifecycle.create_bench_namespaces(1, namespaces)
+    if failed:
+        raise RuntimeError(f"bench namespace apply failed after retries: {failed}")
     if not lifecycle.wait_for_bench_namespaces(namespaces, timeout=600):
         raise RuntimeError(f"bench namespaces not Active ({namespaces})")
     if not cluster.deploy_compositiondefinition("bench-ns-01"):
@@ -94,11 +96,16 @@ def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
     hold_composition_controller("bench-ns-01")
 
     # Probe batch first; the hold must be proven before 50K are stamped.
-    lifecycle.deploy_compositions_parallel(1, 1, probe_batch)
+    failed = lifecycle.deploy_compositions_parallel(1, 1, probe_batch)
+    if failed:
+        raise RuntimeError(f"probe composition batch failed after retries: {failed}")
     time.sleep(hold_probe_wait_s)
     proof["hold_probe"] = assert_no_external_children()
 
-    lifecycle.deploy_compositions_parallel(1, namespaces, per_ns)
+    failed = lifecycle.deploy_compositions_parallel(1, namespaces, per_ns)
+    if failed:
+        raise RuntimeError(f"{len(failed)} composition batches failed after "
+                           f"retries: {sorted(failed)[:10]}")
     proof["compositions"] = cluster.count_compositions()
     proof["hold_final"] = assert_no_external_children()
 
@@ -106,11 +113,10 @@ def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
                                  admins=min(10, users))
     docs = [rbac_model.namespace_rbac_yaml(n) for n in range(1, namespaces + 1)]
     docs.append(rbac_model.admin_rbac_yaml())
-    rc, _, err = cluster.kubectl("apply", "--server-side", "-f", "-",
-                                 input_data="---\n".join(docs),
-                                 timeout_secs=300)
-    if rc != 0:
-        raise RuntimeError(f"RBAC apply failed: {err[:300]}")
+    ok, err = lifecycle.apply_with_retry("---\n".join(docs), "RBAC",
+                                         timeout_secs=300)
+    if not ok:
+        raise RuntimeError(f"RBAC apply failed after retries: {err[:300]}")
     proof["rbac_shape"] = rbac_model.identity_classes(model)
 
     count, _ = lifecycle.create_synthetic_users(
@@ -126,23 +132,21 @@ def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
         if count < users:
             raise RuntimeError(f"only {count}/{users} users registered")
 
-    rc, _, err = cluster.kubectl(
-        "apply", "--server-side", "-f", "-",
-        input_data=list_dep_fixture_yaml(
+    ok, err = lifecycle.apply_with_retry(
+        list_dep_fixture_yaml(
             "bench-ns-01", cluster.COMP_GVR, COMP_VERSION, cluster.COMP_RES),
-        timeout_secs=60)
-    if rc != 0:
-        raise RuntimeError(f"freshness fixture apply failed: {err[:300]}")
+        "freshness fixture", timeout_secs=60)
+    if not ok:
+        raise RuntimeError(f"freshness fixture apply failed after retries: {err[:300]}")
     if "status" in fresh_modes:
         # Run 9: the status-mode probe RA, applied only when status churn runs
         # (an annotation-only run carries exactly the run-8 fixture set).
-        rc, _, err = cluster.kubectl(
-            "apply", "--server-side", "-f", "-",
-            input_data=list_dep_status_fixture_yaml(
+        ok, err = lifecycle.apply_with_retry(
+            list_dep_status_fixture_yaml(
                 "bench-ns-01", cluster.COMP_GVR, COMP_VERSION, cluster.COMP_RES),
-            timeout_secs=60)
-        if rc != 0:
-            raise RuntimeError(f"status freshness fixture apply failed: {err[:300]}")
+            "status freshness fixture", timeout_secs=60)
+        if not ok:
+            raise RuntimeError(f"status freshness fixture apply failed after retries: {err[:300]}")
         proof["fresh_modes"] = list(fresh_modes)
     proof["elapsed_s"] = round(time.time() - t0, 1)
     return proof

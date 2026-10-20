@@ -472,18 +472,54 @@ FINALIZER_RESOURCES = [
 ]
 
 
+# Run 9 attempt 3 (2026-10-20) lost users 301-350 to ONE transient
+# apiserver drop ("http2: client connection lost") right after the 50K
+# deploy, and nothing retried it. Every bulk server-side apply goes through
+# here: the same YAML is re-applied (SSA is idempotent, so objects that
+# landed on a failed attempt are fine), and only a batch that fails EVERY
+# attempt is reported as failed. 4 attempts: sleeps 5s, 10s, 20s between.
+APPLY_RETRY_BACKOFFS_S = (5, 10, 20)
+
+
+def apply_with_retry(yaml_text, what, timeout_secs=60,
+                     backoffs=APPLY_RETRY_BACKOFFS_S):
+    """`kubectl apply --server-side -f -` with retry. Returns (ok, last_err)."""
+    attempts = len(backoffs) + 1
+    err = ""
+    for attempt in range(1, attempts + 1):
+        rc, _, err = kubectl("apply", "--server-side", "-f", "-",
+                             input_data=yaml_text, timeout_secs=timeout_secs)
+        if rc == 0:
+            if attempt > 1:
+                log(f"    {what}: applied on attempt {attempt}/{attempts}")
+            return True, ""
+        if attempt < attempts:
+            wait = backoffs[attempt - 1]
+            log(f"    {what}: attempt {attempt}/{attempts} failed "
+                f"({(err or '').strip()[:200]}); retrying in {wait}s")
+            time.sleep(wait)
+    log(f"    {what}: FAILED after {attempts} attempts: {(err or '').strip()[:200]}")
+    return False, err or ""
+
+
 def create_bench_namespaces(start, end):
-    """Create bench-ns-NN namespaces in batches of 200."""
+    """Create bench-ns-NN namespaces in batches of 200.
+
+    Returns the list of chunk labels that failed after every retry."""
     chunk_size = 200
+    failed = []
     for chunk_start in range(start, end + 1, chunk_size):
         chunk_end = min(chunk_start + chunk_size - 1, end)
         yaml_parts = []
         for i in range(chunk_start, chunk_end + 1):
             yaml_parts.append(f"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: bench-ns-{i:02d}")
-        rc, _, _ = kubectl("apply", "--server-side", "-f", "-",
-                           input_data="\n---\n".join(yaml_parts),
-                           timeout_secs=300)
-        log(f"Created bench-ns-{chunk_start:02d}..{chunk_end:02d} ({chunk_end - chunk_start + 1} ns): rc={rc}")
+        label = f"bench-ns-{chunk_start:02d}..{chunk_end:02d}"
+        ok, _ = apply_with_retry("\n---\n".join(yaml_parts), label,
+                                 timeout_secs=300)
+        if not ok:
+            failed.append(label)
+        log(f"Created {label} ({chunk_end - chunk_start + 1} ns): ok={ok}")
+    return failed
 
 
 def wait_for_bench_namespaces(expected, timeout=120):
@@ -1015,11 +1051,15 @@ def restaction_count_snapshot():
 
 # ─── Composition deploy ──────────────────────────────────────────────────────
 
-def deploy_compositions_parallel(ns_start, ns_end, comps_per_ns, max_retries=5, workers=32):
+def deploy_compositions_parallel(ns_start, ns_end, comps_per_ns, workers=32,
+                                backoffs=APPLY_RETRY_BACKOFFS_S):
     """Deploy compositions in parallel using a thread pool.
 
     Batches compositions per namespace into a single multi-doc YAML to
-    reduce kubectl invocations from N*M to N (one per namespace).
+    reduce kubectl invocations from N*M to N (one per namespace). Each
+    batch goes through apply_with_retry. Returns the list of batch labels
+    that still failed after every retry (empty = all deployed); callers
+    that need the full population must fail on a non-empty list.
     """
     total = (ns_end - ns_start + 1) * comps_per_ns
     log(f"Deploying {total} compositions in parallel (workers={workers}, batch-per-ns) ...")
@@ -1038,20 +1078,13 @@ def deploy_compositions_parallel(ns_start, ns_end, comps_per_ns, max_retries=5, 
                 name = f"bench-app-{ns_i:02d}-{comp_i:02d}"
                 yamls.append(composition_yaml(ns, name))
             batch_yaml = "\n---\n".join(yamls)
-            sub_ok = False
-            err = ""
-            for attempt in range(1, max_retries + 1):
-                rc, _, err = kubectl("apply", "--server-side", "-f", "-", input_data=batch_yaml, timeout_secs=180)
-                if rc == 0:
-                    sub_ok = True
-                    break
-                if attempt < max_retries:
-                    time.sleep(2 * attempt)
+            label = f"{ns}[{sub_start}-{sub_end}]"
+            sub_ok, _ = apply_with_retry(batch_yaml, label, timeout_secs=180,
+                                         backoffs=backoffs)
             if sub_ok:
                 ns_ok += (sub_end - sub_start + 1)
             else:
-                failed.append(f"{ns}[{sub_start}-{sub_end}]")
-                log(f"  FAILED after {max_retries} attempts: {ns}[{sub_start}-{sub_end}]: {err[:200]}")
+                failed.append(label)
         deployed_count[0] += ns_ok
         if deployed_count[0] % 500 == 0 or deployed_count[0] == total:
             log(f"  Deployed {deployed_count[0]}/{total} compositions")
@@ -1060,9 +1093,11 @@ def deploy_compositions_parallel(ns_start, ns_end, comps_per_ns, max_retries=5, 
         list(ex.map(deploy_ns_batch, range(ns_start, ns_end + 1)))
 
     if failed:
-        log(f"  WARNING: {len(failed)} namespace batches failed to deploy")
+        log(f"  WARNING: {len(failed)} composition batches failed to deploy "
+            f"after retries: {', '.join(sorted(failed)[:10])}")
     else:
         log(f"  All {total} compositions deployed successfully")
+    return failed
 
 
 # ─── Single-target composition + namespace delete (S7 / S8 paths) ───────────
@@ -1466,12 +1501,11 @@ spec:
     key: password
 """)
         batch_yaml = "---\n".join(docs)
-        rc, _, err = kubectl("apply", "--server-side", "-f", "-",
-                             input_data=batch_yaml, timeout_secs=60)
-        if rc == 0:
+        ok, _ = apply_with_retry(batch_yaml,
+                                 f"user batch {batch_start}-{batch_end}",
+                                 timeout_secs=60)
+        if ok:
             registered += batch_end - batch_start + 1
-        else:
-            log(f"    Batch {batch_start}-{batch_end} failed: {err[:200]}")
 
     log(f"  Registered {registered}/{total} users")
     if not login:
@@ -1549,6 +1583,7 @@ __all__ = [
     "enable_cache",
     "disable_cache",
     # Namespace + composition CRUD
+    "apply_with_retry",
     "create_bench_namespaces",
     "wait_for_bench_namespaces",
     "deep_clean_bench_namespace",
