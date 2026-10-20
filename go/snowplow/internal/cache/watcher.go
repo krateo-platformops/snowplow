@@ -242,6 +242,14 @@ type ResourceWatcher struct {
 	// Guarded by rw.mu (same lock as rw.informers).
 	informerStop map[schema.GroupVersionResource]chan struct{}
 
+	// unservedVersions is the set of CRD versions retired because the CRD no
+	// longer serves them (#807, unserved_version_block.go). Every registration
+	// funnel refuses a GVR in this set until a CRD ADD/UPDATE serves it again.
+	// It deliberately OUTLIVES the informer, so deletePerGVRStateLocked does
+	// not purge it: forgetting it at teardown is what let a retired version be
+	// re-registered and 404 forever. Guarded by rw.mu; nil until first use.
+	unservedVersions map[schema.GroupVersionResource]struct{}
+
 	// restConfig is the in-cluster *rest.Config — Ship 0.30.122 R4
 	// Lever 1. The streaming ListWatch (streaming_list.go) builds a
 	// rest.RESTClient from it to issue the paged composition LIST as a
@@ -577,6 +585,10 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
+	if _, exists := rw.informers[gvr]; !exists && rw.unservedVersionBlockedLocked(gvr) { // #807
+		_ = refuseUnservedVersion()
+		return
+	}
 	rw.addResourceTypeLocked(gvr)
 }
 
@@ -680,6 +692,12 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 		closed := make(chan struct{})
 		close(closed)
 		return false, closed
+	}
+	// #807 — a version the CRD retired is refused until the CRD serves it
+	// again. Checked on the miss path only, so a hit pays nothing.
+	if rw.unservedVersionBlockedLocked(gvr) {
+		rw.mu.RUnlock()
+		return false, refuseUnservedVersion()
 	}
 	disco := rw.disco
 	rw.mu.RUnlock()
@@ -803,6 +821,11 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 		closed := make(chan struct{})
 		close(closed)
 		return false, closed
+	}
+	// #807 — re-checked under the writer lock: the CRD-lifecycle worker may
+	// have retired gvr between the RUnlock above and this Lock.
+	if rw.unservedVersionBlockedLocked(gvr) {
+		return false, refuseUnservedVersion()
 	}
 
 	// §0.30.93 routing: consult the predicate. RBAC GVRs always take
@@ -1272,6 +1295,9 @@ func (rw *ResourceWatcher) EnsureResourceTypeMetadataOnly(gvr schema.GroupVersio
 		closed := make(chan struct{})
 		close(closed)
 		return false, closed
+	}
+	if rw.unservedVersionBlockedLocked(gvr) { // #807
+		return false, refuseUnservedVersion()
 	}
 
 	rw.addResourceTypeMetadataOnlyLocked(gvr)

@@ -88,6 +88,11 @@ type crdDiscoveryEvent struct {
 	// discovery against the new spec; DELETE tears down the per-resource
 	// informer + dirty-marks dependent L1.
 	kind crdLifecycleKind
+	// rw and gvr carry a crdLifecycleListRefused event (#807): the watcher
+	// whose informer for gvr had its LIST/WATCH refused with 404. obj is nil
+	// for that kind.
+	rw  *ResourceWatcher
+	gvr schema.GroupVersionResource
 }
 
 // crdLifecycleKind discriminates the three CRD events the bridge handles
@@ -95,9 +100,10 @@ type crdDiscoveryEvent struct {
 type crdLifecycleKind uint8
 
 const (
-	crdLifecycleAdd    crdLifecycleKind = iota // CRD CREATE
-	crdLifecycleUpdate                         // CRD UPDATE (spec.versions[] / served[] / group changes)
-	crdLifecycleDelete                         // CRD DELETE (group no longer served by the apiserver)
+	crdLifecycleAdd         crdLifecycleKind = iota // CRD CREATE
+	crdLifecycleUpdate                              // CRD UPDATE (spec.versions[] / served[] / group changes)
+	crdLifecycleDelete                              // CRD DELETE (group no longer served by the apiserver)
+	crdLifecycleListRefused                         // #807: a data informer's LIST/WATCH was refused with 404
 )
 
 // crdDiscovery is the process-scoped CRD-ADD-side-effect bridge:
@@ -157,6 +163,17 @@ type crdDiscovery struct {
 	// previous one); it is the number that should have been moving while
 	// watch_broken climbed 4 -> 40 and never fell.
 	staleVersionPruned atomic.Uint64
+	// #807 (unserved_version_block.go) — servedVersions maps crdServedKey →
+	// map[string]struct{} (the CRD's served version names, from its latest
+	// ADD/UPDATE). Written and read only on the worker; sync.Map for the same
+	// reasons as schemaFingerprints.
+	servedVersions               sync.Map
+	listRefusedChecks            atomic.Uint64 // 404 refusals the worker checked
+	listRefusedDropped           atomic.Uint64 // 404 refusals not queued (queue full; the reflector reports again)
+	listRefusedCRDUnknown        atomic.Uint64 // checked refusals with no CRD record — declined
+	listRefusedStillServed       atomic.Uint64 // checked refusals whose version the CRD still serves — declined
+	refusedVersionPruned         atomic.Uint64 // informers torn down and blocked on a refusal
+	unservedRegistrationsRefused atomic.Uint64 // registrations refused because the version is blocked
 	// 1.12.5 / #187 — post-sync re-fires of the relist dirty-mark. One per
 	// relisted GVR whose new informer synced inside the timeout. A count
 	// lagging schema_relists_fired means informers are not syncing after a
@@ -250,6 +267,8 @@ func (c *crdDiscovery) processEvent(ev crdDiscoveryEvent) {
 		triggerCRDDiscovery(ev.obj, ev.kind)
 	case crdLifecycleDelete:
 		triggerCRDDelete(ev.obj)
+	case crdLifecycleListRefused:
+		c.handleListRefused(ev.rw, ev.gvr)
 	default:
 		// Ship L review note (#200) — defensive default for the closed
 		// crdLifecycleKind enum. submitCRDLifecycleEvent is the only
@@ -389,6 +408,8 @@ func crdLifecycleKindString(k crdLifecycleKind) string {
 		return "UPDATE"
 	case crdLifecycleDelete:
 		return "DELETE"
+	case crdLifecycleListRefused:
+		return "LIST_REFUSED"
 	default:
 		return "unknown"
 	}
@@ -501,6 +522,12 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 	// nav-discovered — watcher.go:1056). Idempotent + order-independent w.r.t.
 	// discovery, so it runs up front, ahead of the SA-rc gate.
 	AddNavigationDiscoveredGroup(group)
+
+	// #807 — record the served set and lift the block on every version the
+	// CRD serves. On EVERY ADD/UPDATE, ahead of the fingerprint gates below:
+	// a re-served version must never stay blocked because an event was judged
+	// a no-op.
+	c.recordServedVersions(u)
 
 	saRC := ProcessSARestConfig()
 	if saRC == nil {
@@ -948,7 +975,10 @@ func (c *crdDiscovery) pruneUnservedGVRs(rw *ResourceWatcher, u *unstructured.Un
 		return
 	}
 	for _, gvr := range pruned {
-		rw.removeResourceTypeWithReason(gvr, confirmRetractStaleVersionPruned)
+		// #807 — retired AND blocked: a resolver touching the old path must
+		// not register it again, which is how a pruned version came back and
+		// 404'd forever.
+		rw.retireUnservedVersion(gvr, confirmRetractStaleVersionPruned)
 	}
 	c.staleVersionPruned.Add(uint64(len(pruned)))
 	names := make([]string, 0, len(pruned))
@@ -1115,6 +1145,7 @@ func triggerCRDDelete(obj interface{}) {
 	// otherwise match the stale fingerprint and no-op, leaving the discovery cache
 	// / RESTMapper without the recreated GVR.
 	c.dropCRDFingerprints(u.GetName())
+	c.forgetServedVersions(u) // #807
 
 	group, _, _ := unstructured.NestedString(u.Object, "spec", "group")
 	plural, _, _ := unstructured.NestedString(u.Object, "spec", "names", "plural")
@@ -1256,6 +1287,13 @@ type CRDDiscoveryStats struct {
 	CRDDiscoveryNoop   uint64 `stat:"crd_discovery_noop"`   // #218 ADD/UPDATE where NEITHER the schema nor the discovery-identity fingerprint changed → nothing invalidated (the ~9.5min re-list amplifier removed; climbs ~1/CRD/re-list at steady state)
 	// 1.12.7 F2 / #219
 	StaleVersionPruned uint64 `stat:"stale_version_pruned_total"` // per-GVR state torn down because the CRD stopped serving that version
+	// #807
+	ListRefusedChecks            uint64 `stat:"list_refused_checks_total"`                    // 404 LIST/WATCH refusals checked against the CRD's served set
+	ListRefusedDropped           uint64 `stat:"list_refused_dropped_total"`                   // 404 refusals not queued (worker queue full)
+	ListRefusedCRDUnknown        uint64 `stat:"list_refused_crd_unknown_total"`               // refusals declined: no CRD record for the group+plural
+	ListRefusedStillServed       uint64 `stat:"list_refused_still_served_total"`              // refusals declined: the CRD still serves the version
+	RefusedVersionPruned         uint64 `stat:"refused_version_pruned_total"`                 // informers torn down and blocked because the 404'd version is not served
+	UnservedRegistrationsRefused uint64 `stat:"unserved_version_registrations_refused_total"` // registrations refused for a blocked version
 
 	// 1.12.5 / #187
 	RelistDirtyMarkPostSync uint64 `stat:"relist_dirtymark_postsync_total"` // post-sync re-fires of the relist dirty-mark
@@ -1297,6 +1335,13 @@ func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
 		SchemaUnchanged:    c.schemaUnchanged.Load(),
 		CRDDiscoveryNoop:   c.crdDiscoveryNoop.Load(),
 		StaleVersionPruned: c.staleVersionPruned.Load(),
+
+		ListRefusedChecks:            c.listRefusedChecks.Load(),
+		ListRefusedDropped:           c.listRefusedDropped.Load(),
+		ListRefusedCRDUnknown:        c.listRefusedCRDUnknown.Load(),
+		ListRefusedStillServed:       c.listRefusedStillServed.Load(),
+		RefusedVersionPruned:         c.refusedVersionPruned.Load(),
+		UnservedRegistrationsRefused: c.unservedRegistrationsRefused.Load(),
 
 		RelistDirtyMarkPostSync: c.relistDirtyMarkPostSync.Load(),
 		RelistPostSyncTimeout:   c.relistPostSyncTimeout.Load(),

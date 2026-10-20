@@ -96,6 +96,10 @@ const (
 	// schema_relist would read as a CRD schema widen, which is the
 	// wrong-cause misattribution #237 exists to stop.
 	confirmRetractStoreRepair = "store_repair"
+
+	// #807: the informer's LIST/WATCH was refused with 404 and the CRD no
+	// longer serves its version (unserved_version_block.go).
+	confirmRetractRefusedVersionPruned = "refused_version_pruned"
 )
 
 // InformerWatchStats is the tagged family. Counters only — the servable GAUGES
