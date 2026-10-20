@@ -1667,14 +1667,16 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// EXACTLY — UAF is untouched by the #57 self-loopback arm.)
 	if !uafActive {
 		if accessToken, _ := xcontext.AccessToken(r.ctx); accessToken != "" {
-			// The append fires iff exportJWT:true OR the resolved endpoint
-			// host EXACTLY equals URL_SELF (a /call loopback at snowplow's own
-			// JWT-gated endpoint) — and never on the SA endpoint (#271). A nil
-			// endpointRef resolves to the caller's own clientconfig, which
-			// carries its own k8s credential, so it gets NO bearer (#292); a
-			// named JWT-gated target must opt in with exportJWT. The rule and
-			// its leak guard live in bearerAppendForStage's doc (self_host.go):
-			// read it there, not here (#794).
+			// The append fires iff the stage sets `exportJwt: true` OR the
+			// resolved endpoint is the same host as URL_SELF (a /call loopback
+			// at snowplow's own JWT-gated endpoint; the short and FQDN forms of
+			// one Service match, scheme and port must match — hostsMatch) — and
+			// never on the SA endpoint (#271). A nil endpointRef resolves to the
+			// caller's own clientconfig, which carries its own k8s credential,
+			// so it gets NO bearer (#292); a named JWT-gated target must opt in
+			// with `exportJwt: true`. The rule and its leak guard live in
+			// bearerAppendForStage's doc (self_host.go): read it there, not
+			// here (#794).
 			if bearerAppendForStage(apiCall, ep, isSA) {
 				// 0.30.164: stage-local Headers — never write the user
 				// bearer back into the shared CR slice (the CR is marshaled
