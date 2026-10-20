@@ -34,6 +34,13 @@ def figures(r):
         "viewed_sub_pushes_per_cell": sub.get("sse_pushes_per_cell", 0.0),
         "viewed_sub_dirty_share": sub.get("dirty_share", 0.0),
     } if vw else {}
+    rd = r.get("refresher_delta") or {}
+    for k in ("viewed_enqueue", "viewed_promoted", "viewed_dequeued", "viewed_skipped_consumed",
+              "viewed_customer_triggered", "viewed_unsubscribed"):
+        if k in rd:
+            viewed["ctr_" + k] = rd[k]
+    if (r.get("viewed_queue_depth") or {}).get("n"):
+        viewed["viewed_queue_depth_p95"] = r["viewed_queue_depth"]["p95"]
     return dict(viewed, **{
         "granted_cores": secs_cpu,
         "granted_share_of_busy": (secs_cpu / r["cpu_cores_runtime_metrics"]) if r.get("cpu_cores_runtime_metrics") else 0.0,

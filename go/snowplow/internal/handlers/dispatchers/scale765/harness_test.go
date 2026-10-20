@@ -1268,6 +1268,7 @@ type s765Report struct {
 	RefreshesPerSec     float64          `json:"refreshes_per_sec"` // non-content L1 stores/s (the design comment's figure)
 	RefresherDonePerSec float64          `json:"refresher_completed_per_sec"`
 	QueueDepth          s765Dist         `json:"queue_depth"`
+	ViewedQueueDepth    s765Dist         `json:"viewed_queue_depth"` // #799's viewed tier; the viewed_* counters are in refresher_delta
 
 	FillsByReason        map[string]uint64  `json:"fills_by_reason"`
 	FillsPerSecByReason  map[string]float64 `json:"fills_per_sec_by_reason"`
@@ -1515,7 +1516,7 @@ func (h *s765H) run(p s765Point) s765Report {
 
 	// The sampler: queue depth and the per-class admission queue, every second.
 	var smu sync.Mutex
-	var depth []float64
+	var depth, vdepth []float64
 	var custQ, debtQ int64
 	wg.Add(1)
 	go func() {
@@ -1535,6 +1536,8 @@ func (h *s765H) run(p s765Point) s765Report {
 			adm := api.ContentFillAdmissionStatsSnapshot()
 			smu.Lock()
 			depth = append(depth, float64(st["queue_depth"]))
+			// #765 viewed tier (#799): its own gauge; absent (0) on a build without it.
+			vdepth = append(vdepth, float64(st["viewed_queue_depth"]))
 			if q := adm.Queued["customer"]; q > custQ {
 				custQ = q
 			}
@@ -1658,6 +1661,7 @@ func (h *s765H) run(p s765Point) s765Report {
 	rep.RefreshesPerSec = float64(nonContent) / secs
 	smu.Lock()
 	rep.QueueDepth = s765Summarize(depth)
+	rep.ViewedQueueDepth = s765Summarize(vdepth)
 	rep.BenchFillConcurrency = s765Summarize(conc)
 	rep.RefresherWorkerShare = map[string]float64{}
 	total := 0
