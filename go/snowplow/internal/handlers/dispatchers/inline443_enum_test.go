@@ -115,6 +115,8 @@ var cacheAllow443 = map[string]cacheClass443{
 	// raFullList store Puts, so it is no longer reached from this path at all and
 	// a renamed entry would have been flagged stale — correctly.
 	"BumpUAFTouched": telemetry443, // request-scoped UAF-touched sink
+	// #787: an OTLP-collection-time truncation count (a process counter only).
+	"NoteSeriesTruncated": telemetry443,
 	// #592 — the OBSERVED limb of the raFullList UAF stamp reads the sink that
 	// BumpUAFTouched writes. Both are pure reads (nil-receiver-safe, no store,
 	// informer, dep or refresher state), strictly weaker than the bump already

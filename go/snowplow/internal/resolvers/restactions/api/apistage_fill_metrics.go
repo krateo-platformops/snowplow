@@ -693,6 +693,9 @@ func ContentFillAdmissionStatsSnapshot() ContentFillAdmissionStats {
 // ResetContentFillStatsForTest zeroes every counter, gauge, peak and table. It
 // must not run while a fill is in flight. Production MUST NOT use it.
 func ResetContentFillStatsForTest() {
+	for o := range contentFillCalibrationSamples { // #787
+		contentFillCalibrationSamples[o].Store(0)
+	}
 	for r := range contentFillTotal {
 		contentFillTotal[r].Store(0)
 		contentFillDuplicate[r].Store(0)
@@ -877,6 +880,15 @@ func registerContentFillExpvar() {
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_by_gvr", expvar.Func(func() any {
 			return ContentFillStatsSnapshot().ByGVR
+		}))
+		// #787 — the learned decode expansion's summary and the calibration
+		// samples by outcome (the per-GVR value is already in by_gvr).
+		expvar.Publish("snowplow_apistage_content_fill_decode_expansion_summary", expvar.Func(func() any {
+			s, _ := ContentFillExpansionSummarySnapshot()
+			return s
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_calibration_samples_total", expvar.Func(func() any {
+			return contentFillCalibrationSamplesMap()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_by_ra", expvar.Func(func() any {
 			return ContentFillStatsSnapshot().ByRA
