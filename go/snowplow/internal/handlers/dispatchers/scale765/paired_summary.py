@@ -39,6 +39,16 @@ def figures(r):
               "viewed_customer_triggered", "viewed_unsubscribed"):
         if k in rd:
             viewed["ctr_" + k] = rd[k]
+    # Per-tier progress and the TTL-eviction causes (#799 diagnosis): normal-tier
+    # completions = completed - viewed_dequeued; an expired cell is reaped when
+    # the refresher dequeues it (skipped_no_entry), so a starved tier keeps
+    # expired cells resident.
+    viewed["refresher_completed"] = rd.get("completed", 0)
+    viewed["normal_tier_completed"] = rd.get("completed", 0) - rd.get("viewed_dequeued", 0)
+    viewed["deferred_in_flight"] = rd.get("deferred_in_flight", 0)
+    viewed["skipped_no_entry"] = rd.get("skipped_no_entry", 0)
+    viewed["evict_ttl"] = r.get("evict_ttl_total_delta", 0)
+    viewed["dirty_evicted"] = r.get("dirty_ended_unfresh_evicted_delta", 0)
     if (r.get("viewed_queue_depth") or {}).get("n"):
         viewed["viewed_queue_depth_p95"] = r["viewed_queue_depth"]["p95"]
     return dict(viewed, **{
