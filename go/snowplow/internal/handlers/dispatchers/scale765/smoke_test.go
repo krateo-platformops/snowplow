@@ -62,6 +62,10 @@ func TestScale765_Smoke(t *testing.T) {
 		if mode == s765Status && (rep.PlatformEvents == 0 || rep.MarksPerPlatformEvent == 0) {
 			t.Errorf("%s: platform churn wrote %d events, %.1f marks each", arm, rep.PlatformEvents, rep.MarksPerPlatformEvent)
 		}
+		if rep.NarrowGate.WouldChange != 0 {
+			t.Errorf("%s: B shadow would_change=%d: a mark enforcement would skip changed its cell (%+v)",
+				arm, rep.NarrowGate.WouldChange, rep.NarrowGate)
+		}
 		if rep.CustomerWidgetHit+rep.CustomerWidgetMiss == 0 {
 			t.Errorf("%s: snowplow counted no customer L1 lookups for %d customer calls", arm, rep.Customer.N)
 		}

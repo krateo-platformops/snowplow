@@ -1138,6 +1138,8 @@ type s765Snap struct {
 	rusageSec  float64
 	rtUsedSec  float64
 	marksByGVR map[string]uint64
+	narrow     cache.ListNarrowGate  // #765 B shadow: the owner's enforcement gate readout (#784)
+	decisions  map[string]uint64     // B shadow: list_dep marks by "decision/reason"
 	lookups    map[string]s765Lookup // snowplow_dispatch_l1_lookups: customer GET /call only
 }
 
@@ -1169,7 +1171,10 @@ func s765Lookups() map[string]s765Lookup {
 func s765Take() s765Snap {
 	s := s765Snap{at: time.Now(), refresher: cache.RefresherStatsByStat(), marks: cache.DirtyMarkByEntryClassSnapshot(),
 		markEvents: cache.DirtyMarkEventsTotal(), fill: api.ContentFillStatsSnapshot(), lookups: s765Lookups(),
-		marksByGVR: cache.DirtyMarkGVRSnapshot()}
+		marksByGVR: cache.DirtyMarkGVRSnapshot(), narrow: cache.ListNarrowGateSnapshot(), decisions: map[string]uint64{}}
+	for _, d := range cache.ListNarrowDecisionsSnapshot() {
+		s.decisions[d.Decision+"/"+d.Reason] += d.Count
+	}
 	if c := cache.ResolvedCache(); c != nil {
 		s.store = c.Stats()
 	}
@@ -1287,17 +1292,23 @@ type s765Report struct {
 	// Evictions in the window, by cause, beside dirty_ended_unfresh_evicted
 	// (every eviction of a cell whose dirty window was open). TTL expiries of
 	// dirty cells >= unfresh_evicted - (lru + delete + max_age + no_representative).
-	EvictLRUDelta      uint64         `json:"evict_lru_total_delta"`
-	EvictDeleteDelta   uint64         `json:"evict_delete_total_delta"`
-	EvictMaxAgeDelta   uint64         `json:"evict_max_age_total_delta"`
-	EvictNoRepDelta    uint64         `json:"evict_no_representative_total_delta"`
-	DirtyEvictedDelta  int64          `json:"dirty_ended_unfresh_evicted_delta"`
-	DirtyTTLExpiriesLB int64          `json:"dirty_ttl_expiries_lower_bound"`
-	HitDelta           uint64         `json:"hit_total_delta"`
-	EvictTTLDelta      uint64         `json:"evict_ttl_total_delta"`
-	StaleServedDelta   uint64         `json:"stale_served_total_delta"`
-	ResidentAtEnd      int            `json:"resident_entries_at_end"`
-	UnservedReads      map[string]int `json:"apiserver_unserved_reads"`
+	EvictLRUDelta      uint64 `json:"evict_lru_total_delta"`
+	EvictDeleteDelta   uint64 `json:"evict_delete_total_delta"`
+	EvictMaxAgeDelta   uint64 `json:"evict_max_age_total_delta"`
+	EvictNoRepDelta    uint64 `json:"evict_no_representative_total_delta"`
+	DirtyEvictedDelta  int64  `json:"dirty_ended_unfresh_evicted_delta"`
+	DirtyTTLExpiriesLB int64  `json:"dirty_ttl_expiries_lower_bound"`
+	// B SHADOW (#773/#784), deltas over the window: the owner's gate readout,
+	// and the share of ALL marks enforcement would skip. would_change > 0 is
+	// a STOP (coordinator ruling).
+	NarrowGate             cache.ListNarrowGate `json:"list_narrow_gate_delta"`
+	WouldAvoidShareOfMarks float64              `json:"would_avoid_share_of_marks"`
+	NarrowDecisions        map[string]uint64    `json:"list_narrow_decisions_delta"` // decision/reason -> list_dep marks
+	HitDelta               uint64               `json:"hit_total_delta"`
+	EvictTTLDelta          uint64               `json:"evict_ttl_total_delta"`
+	StaleServedDelta       uint64               `json:"stale_served_total_delta"`
+	ResidentAtEnd          int                  `json:"resident_entries_at_end"`
+	UnservedReads          map[string]int       `json:"apiserver_unserved_reads"`
 
 	DrainWall    string `json:"drain_wall,omitempty"`
 	DrainReached bool   `json:"drain_reached"`
@@ -1699,6 +1710,26 @@ func (h *s765H) run(p s765Point) s765Report {
 	rep.EvictMaxAgeDelta = b.store.EvictMaxAgeTotal - a.store.EvictMaxAgeTotal
 	rep.EvictNoRepDelta = b.store.EvictNoRepresentativeTotal - a.store.EvictNoRepresentativeTotal
 	rep.DirtyEvictedDelta = rep.RefresherDelta["dirty_ended_unfresh_evicted"]
+	rep.NarrowGate = cache.ListNarrowGate{
+		WouldAvoidMarks:    b.narrow.WouldAvoidMarks - a.narrow.WouldAvoidMarks,
+		AvoidOnlyRefreshes: b.narrow.AvoidOnlyRefreshes - a.narrow.AvoidOnlyRefreshes,
+		IdenticalAudits:    b.narrow.IdenticalAudits - a.narrow.IdenticalAudits,
+		WouldChange:        b.narrow.WouldChange - a.narrow.WouldChange,
+		NoPrior:            b.narrow.NoPrior - a.narrow.NoPrior,
+		Unaudited:          b.narrow.Unaudited - a.narrow.Unaudited,
+	}
+	if g := &rep.NarrowGate; g.AvoidOnlyRefreshes > 0 {
+		g.UnauditedShare = float64(g.Unaudited) / float64(g.AvoidOnlyRefreshes)
+	}
+	rep.NarrowDecisions = map[string]uint64{}
+	for k, v := range b.decisions {
+		if d := v - a.decisions[k]; d > 0 {
+			rep.NarrowDecisions[k] = d
+		}
+	}
+	if rep.MarksTotal > 0 {
+		rep.WouldAvoidShareOfMarks = float64(rep.NarrowGate.WouldAvoidMarks) / float64(rep.MarksTotal)
+	}
 	rep.DirtyTTLExpiriesLB = rep.DirtyEvictedDelta - int64(rep.EvictLRUDelta+rep.EvictDeleteDelta+rep.EvictMaxAgeDelta+rep.EvictNoRepDelta)
 	if rep.DirtyTTLExpiriesLB < 0 {
 		rep.DirtyTTLExpiriesLB = 0
