@@ -44,6 +44,19 @@
 // STOP RULE (architect-623, #780): if a CORRECT gate ever exceeds ~4.5 fills
 // of allocate-black excess (the gated-worst log line), the heap check becomes
 // log-only. The bound (fmemAllocateBlackFills) is never widened again.
+//
+// THE STOP RULE HAS TRIGGERED: the heap check is LOG-ONLY (#780
+// issuecomment-6284262773). A correct gate reached +112 MiB = 5.81 fills over
+// ceiling0 + oneFill (runs [112 69 55], load ~24), and a paired pre/post-#772
+// comparison showed that is the GC-pacing tail, not a code change. The live
+// heap, its bound and the vacuity margin are still LOGGED every run, so the
+// distribution stays visible. What stays HARD: no dispatch for an unadmitted
+// flight (admit-after-dispatch), and envelope bytes in flight within
+// (ceiling0/oneFill + 2) envelopes — oneFill being one isolated fill's REAL
+// live-heap growth, so admit-all and a gate that undercharges a fill's weight
+// both read RED there. What is no longer hard-checked: live memory a flight
+// retains beyond its envelope (a tree or decode buffer kept after the serve,
+// retention growing across fills) — #786 tracks a GC-independent check for it.
 package api
 
 import (
@@ -243,9 +256,9 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 	}
 
 	// GATED, calibration back to the seed for every run. EVERY run must hold the
-	// heap bound and the structural checks (no dispatch for an unadmitted flight,
-	// envelope bytes): the bound already allows fmemAllocateBlackFills fills of
-	// allocate-black slack, so no best-of is needed to absorb GC pacing (#780).
+	// structural checks (no dispatch for an unadmitted flight, envelope bytes);
+	// the worst run's live heap is logged against the bound (log-only since the
+	// #780 stop rule).
 	const gatedRuns = 3
 	restore = cache.SetAdmissionRuntimeSeamsForTest(func() int64 { return limit }, fill710HeapObjects)
 	t.Cleanup(restore)
@@ -292,8 +305,7 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 		envPeak, float64(envPeak)/float64(max(env, 1)), envBound,
 		contentFillAdmissionInflightWeightPeak.Load()>>20, float64(lists)/(float64(ceiling0)/float64(max(oneFill, 1))),
 		fill710P95(adm.Wait["background"]), adm.Wait["background"].MaxMS)
-	// Every check reports (Errorf, not Fatalf), so a defect shows each one it
-	// breaks: admit-all must read RED on the heap AND on the envelopes (#780).
+	// The two HARD checks (Errorf, so a defect shows each one it breaks).
 	if u := unadmittedPeak.Load(); u > 0 {
 		t.Errorf("F-MEM RED: %d dispatches ran for flights the gate had not admitted — a queued flight built its envelope outside the ceiling", u)
 	}
@@ -301,26 +313,19 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 		t.Errorf("F-MEM RED: %d envelope bytes were in flight at once (%.1f envelopes, bound %d B) — queued flights are holding parked envelopes outside the ceiling",
 			envPeak, float64(envPeak)/float64(max(env, 1)), envBound)
 	}
+	// The heap bound is LOG-ONLY (the stop rule, #780 issuecomment-6284262773;
+	// see the header). The same figures are logged every run, so the
+	// distribution stays observable in CI logs: an overshoot is reported, never
+	// failed.
 	if gated > bound {
-		t.Errorf("F-MEM RED: a gated run's live heap grew %d MiB (runs %v MiB), past the starting ceiling + one fill + %d × its allocations (%d MiB)",
+		t.Logf("#780 F-MEM heap (log-only): a gated run's live heap grew %d MiB (runs %v MiB), past the starting ceiling + one fill + %d × its allocations (%d MiB)",
 			gated>>20, runs, fmemAllocateBlackFills, bound>>20)
 	}
-	// Vacuity is loud: the defect class must clear the bound by a full fill's
-	// allocations, or the bound no longer separates a correct gate from no gate
-	// (#780). +1×, not +2×: at +2× the precondition sat inside the ungated
-	// burst's own low tail (133 MiB against 126) and would flake itself
-	// (architect-623). The margin is logged on every run so drift shows before
-	// it bites.
-	need := bound + oneFillAlloc
-	t.Logf("#780 F-MEM precondition margin: ungated − bound = %.2f × oneFillAlloc (needs ≥ 1.00; ungated +%d MiB, bound %d MiB, oneFillAlloc %d MiB)",
+	t.Logf("#780 F-MEM gated worst: %.2f fills over ceiling0 + oneFill (runs %v MiB, bound %d MiB at %d fills; log-only)",
+		float64(gated-ceiling0-oneFill)/float64(max(oneFillAlloc, 1)), runs, bound>>20, fmemAllocateBlackFills)
+	// The vacuity precondition only protected the heap bound, so it is a log too.
+	t.Logf("#780 F-MEM precondition margin: ungated − bound = %.2f × oneFillAlloc (was required ≥ 1.00; ungated +%d MiB, bound %d MiB, oneFillAlloc %d MiB; log-only)",
 		float64(ungated-bound)/float64(max(oneFillAlloc, 1)), ungated>>20, bound>>20, oneFillAlloc>>20)
-	t.Logf("#780 F-MEM gated worst: %.2f fills over ceiling0 + oneFill (bound allows %d; a correct gate past ~4.5 makes the heap check log-only)",
-		float64(gated-ceiling0-oneFill)/float64(max(oneFillAlloc, 1)), fmemAllocateBlackFills)
-	if ungated < need {
-		t.Fatalf("PRECONDITION: the ungated burst grew +%d MiB, under bound + one fill's allocations (%d MiB) — "+
-			"the gap between a correct gate and no gate has closed, so the arm cannot discriminate; re-measure fmemAllocateBlackFills",
-			ungated>>20, need>>20)
-	}
 }
 
 // TestContentFill710_FMEM_CustomerFirstLoadBurst_ReportOnly: users never queue
