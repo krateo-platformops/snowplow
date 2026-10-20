@@ -316,8 +316,7 @@ func i187Fixture(t *testing.T, srv *i187APIServer, typeRegistered bool) (store *
 // i187RunRefreshCycle drives the FULL production refresh loop for one key and
 // returns how many times the handler ran. It registers the production refresh
 // closure verbatim (dispatchers.go), starts the real refresher pool, enqueues
-// the key, and waits until either the entry is gone or the requeue budget has
-// been spent.
+// the key, and waits until the key reaches the drop point (or is evicted).
 //
 // Every bound arm goes through here rather than calling resolveAndPopulateL1
 // directly. Under the drop-point design resolveAndPopulateL1 NEVER evicts — it
@@ -336,20 +335,31 @@ func i187RunRefreshCycle(t *testing.T, inputs cache.ResolvedKeyInputs, key strin
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	w, restoreLog := watchRefreshTerminal()
+	defer restoreLog()
 	cache.StartRefresher(ctx)
 	cache.EnqueueRefresh(key)
 
+	// Wait for the key's terminal outcome. Every caller drives a refresh that
+	// fails on every attempt, so the key always reaches the drop point: after
+	// the whole budget, or on the first attempt for a non-retryable 403 (#608).
+	// A self-404 also evicts there. Only THIS key's drop ends the wait, never
+	// another cell's. The deadline is the failure bound, never the normal exit
+	// (#790): a cycle that never reaches the drop point fails here instead of
+	// asserting on a refresh that did not finish.
 	deadline := time.Now().Add(25 * time.Second)
-	for time.Now().Before(deadline) {
-		_, alive := store.Get(key)
-		if !alive && invocations.Load() > 0 {
+	for {
+		if w.dropped(key) {
 			break
 		}
-		if invocations.Load() > i187MaxRequeues {
-			// Budget spent and the entry is still here — give the drop
-			// path a moment to run, then stop waiting.
-			time.Sleep(300 * time.Millisecond)
+		if _, alive := store.Get(key); !alive && invocations.Load() > 0 {
 			break
+		}
+		if !time.Now().Before(deadline) {
+			cancel()
+			cache.ResetRefresherForTest()
+			t.Fatalf("#790: the refresh cycle reached neither the drop point nor an eviction "+
+				"within 25s (%d invocations)", invocations.Load())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -357,7 +367,9 @@ func i187RunRefreshCycle(t *testing.T, inputs cache.ResolvedKeyInputs, key strin
 	// blocks until every worker goroutine has exited; without that barrier a
 	// worker still inside resolveAndPopulateL1 races the caller's restore of
 	// the resolveOnceFn seam (cleanups run LIFO, so a later-registered
-	// restore would fire while the pool is still draining).
+	// restore would fire while the pool is still draining). It is also the
+	// barrier for the drop point itself: the caller's assertions read the
+	// store and the counters only after the dropping worker has returned.
 	cancel()
 	cache.ResetRefresherForTest()
 	return invocations.Load()
