@@ -5,7 +5,8 @@
 # but two builds measured back to back, alternating, in the same window, can
 # still be compared by RATIOS. This driver:
 #   1. builds one tree per arm from git archives:
-#        H0      = the harness SHA itself (main + harness);
+#        H0      = the harness SHA itself (main + harness), or with -b <sha>
+#                  that SHA with the harness overlaid (main just before a fix);
 #        <ARM>   = the arm's SHA (a fix branch on the same main) with the
 #                  harness overlaid (scale765/ and dispatchers.go from the
 #                  harness SHA). It refuses when the arm changed dispatchers.go
@@ -19,13 +20,13 @@
 # -d: dry run (build trees and binaries, check the refusal, print the plan; no measurement).
 # usage (from the repo root):
 #   go/snowplow/internal/handlers/dispatchers/scale765/paired_ab.sh \
-#     -h <harness-sha> -a <arm-name>=<arm-sha> [-n pairs] [-m mode] [-r rate] -o <out-dir>
+#     -h <harness-sha> [-b <h0-base-sha>] -a <arm-name>=<arm-sha> [-n pairs] [-m mode] [-r rate] -o <out-dir>
 # env passed through: SCALE765_WARMUP, SCALE765_MEASURE, SCALE765_PLATFORM.
 set -u
-HARNESS="" ARM="" PAIRS=3 MODE=annotation RATE=10 OUT="" DRY=0
-while getopts "h:a:n:m:r:o:d" o; do
+HARNESS="" H0BASE="" ARM="" PAIRS=3 MODE=annotation RATE=10 OUT="" DRY=0
+while getopts "h:b:a:n:m:r:o:d" o; do
   case $o in
-    h) HARNESS=$OPTARG ;; a) ARM=$OPTARG ;; n) PAIRS=$OPTARG ;;
+    h) HARNESS=$OPTARG ;; b) H0BASE=$OPTARG ;; a) ARM=$OPTARG ;; n) PAIRS=$OPTARG ;;
     m) MODE=$OPTARG ;; r) RATE=$OPTARG ;; o) OUT=$OPTARG ;; d) DRY=1 ;;
     *) exit 2 ;;
   esac
@@ -38,10 +39,15 @@ DISP=go/snowplow/internal/handlers/dispatchers/dispatchers.go
 mkdir -p "$OUT" || exit 2
 OUT=$(cd "$OUT" && pwd)
 
-BASE=$(git -C "$REPO" merge-base "$HARNESS" "$ARM_SHA") || exit 2
-if ! git -C "$REPO" diff --quiet "$BASE" "$ARM_SHA" -- "$DISP"; then
-  echo "refusing: $ARM_NAME ($ARM_SHA) changed $DISP since $BASE; the harness overlay would drop it"; exit 3
-fi
+refuse_if_overlay_drops() { # <name> <sha>
+  local base
+  base=$(git -C "$REPO" merge-base "$HARNESS" "$2") || exit 2
+  if ! git -C "$REPO" diff --quiet "$base" "$2" -- "$DISP"; then
+    echo "refusing: $1 ($2) changed $DISP since $base; the harness overlay would drop it"; exit 3
+  fi
+}
+refuse_if_overlay_drops "$ARM_NAME" "$ARM_SHA"
+if [ -n "$H0BASE" ]; then refuse_if_overlay_drops H0 "$H0BASE"; fi
 
 build() { # build <name> <tree-sha> [overlay-sha]
   local d=$OUT/tree-$1
@@ -54,7 +60,7 @@ build() { # build <name> <tree-sha> [overlay-sha]
   (cd "$d/go/snowplow" && go test -c -tags scale765 -o "$OUT/$1.test" ./internal/handlers/dispatchers/scale765/) || exit 5
   echo "built $1 from $2${3:+ + harness $3}"
 }
-build H0 "$HARNESS"
+if [ -n "$H0BASE" ]; then build H0 "$H0BASE" "$HARNESS"; else build H0 "$HARNESS"; fi
 build "$ARM_NAME" "$ARM_SHA" "$HARNESS"
 
 load() { python3 -I -c "import os; print(round(os.getloadavg()[0],2))"; }
