@@ -798,6 +798,9 @@ type RefreshStream struct {
 	Keys   <-chan string
 	Resync <-chan struct{}
 	Unsub  func()
+	// Rotated announces armed keys whose identity class moved (#819): one
+	// `refresh` frame per key on THIS connection, paced like an eviction.
+	Rotated func(keys []string)
 }
 
 // SubscribeRefresh is SubscribeRefreshStream without the resync channel —
@@ -820,7 +823,7 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 	if h == nil {
 		ch := make(chan string)
 		close(ch)
-		return RefreshStream{Keys: ch, Unsub: func() {}}
+		return RefreshStream{Keys: ch, Unsub: func() {}, Rotated: func([]string) {}}
 	}
 	limit, burst := refreshEvictionBucket()
 	s := &refreshSub{
@@ -883,7 +886,29 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 			// uses the same "producer never sends to a closed chan" discipline.)
 		})
 	}
-	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub}
+	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated}
+}
+
+// offerRotated announces keys this connection armed whose identity class
+// moved (#819; the handler decides which). The key is dead — nothing will be
+// published on it again — so the frame is the only way the tab learns it must
+// refetch (and re-arm under the new key the /call response names). It takes
+// the eviction path: the same `refresh` frame, paced by this connection's
+// bucket and deferred, never dropped, so a rotation that moves every user's
+// class at once (a binding to system:authenticated) cannot burst a tab's whole
+// armed set in one tick. Only keys this connection armed are offered: the frame
+// never reaches another connection.
+func (s *refreshSub) offerRotated(keys []string) {
+	h := s.hub
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, k := range keys {
+		if _, armed := s.keys[k]; !armed {
+			continue
+		}
+		s.offerEviction(k)
+		refreshRotationAnnouncedTotal.Add(1)
+	}
 }
 
 // close marks the subscriber dead for the eviction path (no more queueing,
@@ -1024,6 +1049,9 @@ var (
 	// the bucket (or a full sink) deferred instead of sending immediately —
 	// the number that proves the bound engaged (design §6.2.3).
 	refreshEvictDeferredTotal atomic.Uint64
+	// refreshRotationAnnouncedTotal counts (key -> subscriber) frames offered
+	// because the armed key's identity class moved (#819).
+	refreshRotationAnnouncedTotal atomic.Uint64
 
 	// C12 — stream lifetime. stream_seconds_total / streams_closed_total is
 	// the mean stream lifetime; the instrument S8 found missing at every hop.
@@ -1107,6 +1135,7 @@ type RefreshBroadcasterStats struct {
 	MaxSinkDepth          int64   `stat:"max_sink_depth" kind:"gauge" desc:"High-water mark of a subscriber sink after a send (consumer lag, 0..64)."`
 	EvictPublished        uint64  `stat:"evict_published" desc:"Eviction-driven live-refresh publishes that reached at least one subscriber."`
 	EvictDeferred         uint64  `stat:"evict_deferred" desc:"Eviction-driven signals deferred by the per-subscriber token bucket (the bound engaged)."`
+	RotationAnnounced     uint64  `stat:"rotation_announced" desc:"Refresh frames sent on an armed key whose identity class moved, so the tab refetches and re-arms under its new key (#819)."`
 	StreamSecondsTotal    float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
 	StreamsClosedTotal    uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
 }
@@ -1139,6 +1168,7 @@ func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
 		MaxSinkDepth:          refreshMaxSinkDepth.Load(),
 		EvictPublished:        refreshEvictPublishedTotal.Load(),
 		EvictDeferred:         refreshEvictDeferredTotal.Load(),
+		RotationAnnounced:     refreshRotationAnnouncedTotal.Load(),
 		StreamSecondsTotal:    float64(refreshStreamNanosTotal.Load()) / float64(time.Second),
 		StreamsClosedTotal:    refreshStreamsClosedTotal.Load(),
 	}
@@ -1252,6 +1282,7 @@ func resetRefreshBroadcasterForTest() {
 	refreshPendingOverflowResyncTotal.Store(0)
 	refreshPendingHighWaterForTest.Store(0)
 	refreshEvictPublishedTotal.Store(0)
+	refreshRotationAnnouncedTotal.Store(0)
 	refreshEvictDeferredTotal.Store(0)
 	refreshStreamNanosTotal.Store(0)
 	refreshStreamsClosedTotal.Store(0)

@@ -58,6 +58,13 @@ var panelGVR = schema.GroupVersionResource{Group: "widgets.templates.krateo.io",
 // informer wiring, same cleanup.
 func seedPanels(t *testing.T, names []string) {
 	t.Helper()
+	seedPanelsClient(t, names)
+}
+
+// seedPanelsClient is seedPanels returning the fake client, so a test can
+// change RBAC through the real informer (#819).
+func seedPanelsClient(t *testing.T, names []string) *dynamicfake.FakeDynamicClient {
+	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("REFRESH_SSE_ENABLED", "")
@@ -129,6 +136,7 @@ func seedPanels(t *testing.T, names []string) {
 		cache.SetGlobal(prev)
 		cache.PublishRBACSnapshotForTest(nil)
 	})
+	return dyn
 }
 
 // evictionWiring wires the process L1 store into the dep tracker (what
@@ -210,7 +218,13 @@ type wireFrame struct {
 // 200).
 func openArmedStream(t *testing.T, base string, names []string, keys []string) (<-chan wireFrame, context.CancelFunc) {
 	t.Helper()
-	resp, cancel := openStream(t, base, "?sub="+subParamForNames(t, names), func(req *http.Request) {
+	return openArmedStreamSub(t, base, subParamForNames(t, names), keys)
+}
+
+// openArmedStreamSub is openArmedStream for an already-built ?sub= value.
+func openArmedStreamSub(t *testing.T, base, sub string, keys []string) (<-chan wireFrame, context.CancelFunc) {
+	t.Helper()
+	resp, cancel := openStream(t, base, "?sub="+sub, func(req *http.Request) {
 		req.Header.Set("Authorization", "Bearer "+mintToken(t, "userA"))
 	})
 	if resp.StatusCode != http.StatusOK {

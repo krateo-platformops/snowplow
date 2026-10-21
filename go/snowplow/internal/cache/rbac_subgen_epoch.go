@@ -45,10 +45,21 @@
 // input — and identity-free classes (which do not fold RBACSubGen) do not rotate.
 //
 // COST. At most ONE global rotation per process, and only when an RBAC edit
-// really landed between the first publish and the first index build. Ready gates
-// customer /call until boot completes, so the cells that exist in that window
-// are mostly the boot seed's; on rotation they miss on their next read, and the
-// refresher's identity-class drift guard re-picks or evicts them (#424/#444).
+// really landed between the first publish and the first index build. The
+// cells that exist in that window are mostly the boot seed's; on rotation they
+// miss on their next read, and the refresher's identity-class drift guard
+// re-picks or evicts them (#424/#444).
+//
+// #819 — THE BUMP LANDS BEFORE READY. The engine's boot pass builds the index
+// only after its navigation re-walk, and readiness does not wait for that pass:
+// a boot pass that errors before the build, or the seed deadline, releases
+// Ready with the index unbuilt, and the requeued pass (which also yields to
+// the customer traffic Ready lets in) built it minutes later. The epoch then
+// rotated every user's keys under tabs already armed on them (bench run 10:
+// 6.5 min after Ready). So the first readiness flip settles the build itself
+// (settleBindingsIndexBeforeReady, from MarkPhase1Done): the bump, if owed,
+// happens before /readyz is 200 on every path, and every later RBAC edit
+// rotates through the per-subject sub-gen, the index being built.
 
 package cache
 
@@ -155,7 +166,39 @@ func rotateIfRBACEventSeenPreBuild() bool {
 		return false
 	}
 	rbacSubGenEpoch.Add(1)
+	noteIdentityClassesMayHaveMoved() // #819: tell armed tabs their keys rotated
 	return true
+}
+
+// settleBindingsIndexBeforeReady (#819) runs the first bindings-index build,
+// and so the #682 bump it owes, before the first readiness flip. Called by
+// MarkPhase1Done. A no-op when the cache is off, there is no watcher, or the
+// index is already built (the boot pass's step 3 got there first).
+//
+// Over the GVRs registered so far: the boot pass's own build later is a
+// rebuild over the full navigated set (never a bump), and AddNavigatedGVR
+// widens it meanwhile. Before the first COMPLETE snapshot it only requests the
+// build, which that publish runs (#686: building over a partial snapshot would
+// skip a binding whose role is not listed yet).
+func settleBindingsIndexBeforeReady() {
+	if Disabled() {
+		return
+	}
+	rw := Global()
+	if rw == nil || rw.mode == modePassthrough || BindingsByGVRIndexBuilt() {
+		return
+	}
+	navigated := rw.RegisteredGVRs()
+	if rbacSnap.Load() != nil && rbacInitialPublishReturned(rw) {
+		BuildBindingsByGVRIndex(navigated)
+		return
+	}
+	requestBindingsIndexBuild(navigated)
+	// A publish that completed between the check above and the request did
+	// not see it: run it now.
+	if rbacSnap.Load() != nil && rbacInitialPublishReturned(rw) {
+		buildPendingBindingsIndex()
+	}
 }
 
 // RBACSubGenEpoch returns the current epoch.
