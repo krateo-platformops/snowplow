@@ -69,15 +69,17 @@ const (
 	// the wire.
 	refreshResyncFrame = "event: resync\ndata: pending-overflow\n\n"
 
-	// refreshSubParamMaxBytes caps the decoded ?sub= payload to avoid a
-	// memory-amplification subscribe vector (extras can be large; design §6
-	// tradeoff). A connection sending a larger payload is rejected 400.
-	refreshSubParamMaxBytes = 16 * 1024
-
 	// refreshSubMaxEntries caps how many widgets one connection may arm in a
 	// single subscribe. Defence-in-depth alongside the byte cap.
 	refreshSubMaxEntries = 512
 )
+
+// refreshSubParamMaxBytes caps the decoded ?sub= payload to avoid a
+// memory-amplification subscribe vector (extras can be large; design §6
+// tradeoff). A connection sending a larger payload is rejected 400. A var only
+// so the #819 armed-set-cap arm can arm refreshSubMaxEntries widgets (16 KiB
+// holds ~110 coordinates); production never changes it.
+var refreshSubParamMaxBytes = 16 * 1024
 
 // refreshWriteDeadlineNS bounds EVERY frame write (#484); it defaults to the
 // heartbeat interval. It is re-armed before each write, which also defeats

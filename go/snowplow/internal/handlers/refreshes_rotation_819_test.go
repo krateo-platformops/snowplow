@@ -16,9 +16,11 @@
 //	    sends no second frame (one per armed key per rotation). RED on main:
 //	    no frame — the tab stays armed on a key nothing publishes again.
 //	R2  a ClusterRoleBinding granting the tab's group → ONE frame on K.
-//	R3  bounded: a rotation of a tab's whole armed set goes out through the
-//	    per-connection eviction bucket — the first second carries at most
-//	    burst + rate frames, and every key arrives exactly once (none dropped).
+//	R3  a rotation of a tab's whole armed set reaches the wire, every key
+//	    exactly once, within the SPA's reconnect debounce of the first frame.
+//	R5  the #828 reviewer's scenario, at 40 widgets and at the 512-entry cap:
+//	    the SPA reconnects (over every armed coordinate) the debounce after
+//	    the first frame; no widget may be left on an unannounced dead key.
 //	N1  negative: a binding for a group the identity is not in → a publish
 //	    happens, the identity's class is unchanged → no frame.
 //	N2  negative: an identity-free (widgetContent) armed key never rotates →
@@ -269,63 +271,139 @@ func TestRefreshes819_N2_IdentityFreeKeyNeverRotates(t *testing.T) {
 	}
 }
 
-func TestRefreshes819_R3_WholeArmedSetRotationIsPacedAndComplete(t *testing.T) {
-	const n, rate, burst = 40, 20, 10
-	t.Setenv("REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND", fmt.Sprint(rate))
-	t.Setenv("REFRESH_EVICTION_PUBLISH_BURST", fmt.Sprint(burst))
+// spaReconnectDebounce is the SPA's arm-change reconnect debounce
+// (refreshSse.ts RECONNECT_DEBOUNCE_MS). The SPA reconnects at the earliest
+// this long after the first rotation frame (plus that widget's refetch, which
+// these arms do not count: the tightest window).
+const spaReconnectDebounce = 200 * time.Millisecond
+
+// rotateWholeTab arms n identity-bound widgets on one stream, moves the epoch
+// (every key of the tab rotates at once) and returns the server, the stream,
+// the old keys and the names.
+func rotateWholeTab(t *testing.T, n int, prefix string) (string, <-chan wireFrame, context.CancelFunc, map[string]bool, []string) {
+	t.Helper()
+	if n > 100 {
+		// 16 KiB of coordinates holds ~110; the server's entry cap is 512.
+		prev := refreshSubParamMaxBytes
+		refreshSubParamMaxBytes = 256 * 1024
+		t.Cleanup(func() { refreshSubParamMaxBytes = prev })
+	}
 	names := make([]string, n)
 	for i := range names {
-		names[i] = fmt.Sprintf("rot-panel-%03d", i)
+		names[i] = fmt.Sprintf("%s-%03d", prefix, i)
 	}
 	dyn := setup819(t, names...)
-	want := map[string]bool{}
+	old := map[string]bool{}
 	keys := make([]string, 0, n)
 	for _, nm := range names {
 		k := widgetsKey819(t, nm)
-		want[k] = true
+		old[k] = true
 		keys = append(keys, k)
 	}
 	base := refreshServer(t)
 	frames, cancel := openArmedStreamSub(t, base, widgetsSub819(names...), keys)
-	defer cancel()
-
 	create819(t, dyn, cr819GVR, map[string]any{
 		"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
-		"metadata": map[string]any{"name": "window-819-r3"},
+		"metadata": map[string]any{"name": "window-" + prefix},
 		"rules":    []any{map[string]any{"apiGroups": []any{""}, "resources": []any{"configmaps"}, "verbs": []any{"get"}}},
 	})
-	awaitPublished(t, "the window ClusterRole", func(s *cache.RBACSnapshot) bool { return s.ClusterRolesByName["window-819-r3"] != nil })
-	tick := time.Now()
-	cache.BuildBindingsByGVRIndex(nil) // the epoch moves every key of the tab at once
+	awaitPublished(t, "the window ClusterRole", func(s *cache.RBACSnapshot) bool { return s.ClusterRolesByName["window-"+prefix] != nil })
+	cache.BuildBindingsByGVRIndex(nil)
+	return base, frames, cancel, old, names
+}
 
+// R3 — every rotated key of a tab reaches the wire before the SPA's earliest
+// reconnect: all n frames within spaReconnectDebounce of the first, each once.
+// (The version reviewed in #828 asserted eviction PACING here, which was the
+// defect: a paced frame still queued at the reconnect is lost.)
+func TestRefreshes819_R3_WholeArmedSetRotationReachesTheTabBeforeReconnect(t *testing.T) {
+	const n = 40
+	_, frames, cancel, old, _ := rotateWholeTab(t, n, "rot-r3")
+	defer cancel()
 	got := map[string]int{}
-	var first time.Time
-	firstSecond := 0
-	deadline := time.After(20 * time.Second)
+	var first, last time.Time
+	deadline := time.After(10 * time.Second)
 	for len(got) < n {
 		select {
 		case f := <-frames:
 			if first.IsZero() {
 				first = f.at
 			}
-			if f.at.Sub(first) < time.Second {
-				firstSecond++
-			}
+			last = f.at
 			got[f.key]++
 		case <-deadline:
-			t.Fatalf("R3: %d/%d rotated keys announced within 20s — the rest were dropped", len(got), n)
+			t.Fatalf("R3: %d/%d rotated keys announced within 10s", len(got), n)
 		}
-	}
-	if limit := burst + rate + 2; firstSecond > limit {
-		t.Fatalf("R3: %d frames in the first second of a %d-key rotation; the bucket allows <= %d — the rotation is UNPACED", firstSecond, n, limit)
 	}
 	for k, c := range got {
-		if !want[k] || c != 1 {
-			t.Fatalf("R3: key %q delivered %d times (armed=%v), want exactly once per armed key", k, c, want[k])
+		if !old[k] || c != 1 {
+			t.Fatalf("R3: key %q delivered %d times (armed=%v), want exactly once per armed key", k, c, old[k])
 		}
 	}
-	if minTotal := time.Duration(float64(n-burst)/float64(rate)*float64(time.Second)) - 300*time.Millisecond; time.Since(tick) < minTotal {
-		t.Fatalf("R3: all %d frames in %v; a paced drain needs >= %v", n, time.Since(tick), minTotal)
+	if span := last.Sub(first); span >= spaReconnectDebounce {
+		t.Fatalf("R3: the %d frames took %v from first to last; the SPA reconnects %v after the first, and a frame "+
+			"still queued then dies with the old connection — rotation frames must not be paced", n, span, spaReconnectDebounce)
 	}
-	t.Logf("R3: %d/%d frames, %d in the first second, all in %v", len(got), n, firstSecond, time.Since(tick))
+	t.Logf("R3: %d/%d frames, first→last %v", len(got), n, last.Sub(first))
+}
+
+// reconnectScenario is the #828 reviewer's probe: after the first rotation
+// frame the SPA refetches that widget and reconnects (here at the tightest
+// window, spaReconnectDebounce) over every armed coordinate. The new
+// connection's keys are all current, so it announces nothing: every widget
+// whose old key had not been announced on the first connection by then stays
+// on a dead key. Asserts none is stranded, and reports the write time.
+func reconnectScenario(t *testing.T, n int, prefix string) {
+	t.Helper()
+	base, framesA, cancelA, old, names := rotateWholeTab(t, n, prefix)
+	announced := map[string]bool{}
+	f, ok := awaitFrame(t, framesA, 5*time.Second)
+	if !ok {
+		cancelA()
+		t.Fatal("no rotation frame at all")
+	}
+	first, last := f.at, f.at
+	announced[f.key] = true
+	until := time.After(spaReconnectDebounce - time.Since(f.at))
+loop:
+	for {
+		select {
+		case f := <-framesA:
+			announced[f.key] = true
+			last = f.at
+		case <-until:
+			break loop
+		}
+	}
+	cancelA() // the SPA's connect() aborts the current stream
+
+	newKeys := make([]string, 0, n)
+	for _, nm := range names {
+		newKeys = append(newKeys, widgetsKey819(t, nm))
+	}
+	framesB, cancelB := openArmedStreamSub(t, base, widgetsSub819(names...), newKeys)
+	defer cancelB()
+	if f, more := awaitFrame(t, framesB, 300*time.Millisecond); more {
+		t.Fatalf("%s: the reconnected stream announced %q — its keys are all current", prefix, f.key)
+	}
+	stranded := 0
+	for k := range old {
+		if !announced[k] {
+			stranded++
+		}
+	}
+	t.Logf("%s: %d/%d old keys announced before the reconnect at %v; first→last frame %v",
+		prefix, len(announced), n, spaReconnectDebounce, last.Sub(first))
+	if stranded > 0 {
+		t.Fatalf("%s: %d of %d widgets stranded on a dead key: their rotation frame had not reached the tab "+
+			"when the SPA reconnected", prefix, stranded, n)
+	}
+}
+
+func TestRefreshes819_R5_SPAReconnectStrandsNoWidget_40(t *testing.T) {
+	reconnectScenario(t, 40, "rot-rc40")
+}
+
+func TestRefreshes819_R5_SPAReconnectStrandsNoWidget_512(t *testing.T) {
+	reconnectScenario(t, refreshSubMaxEntries, "rot-rc512")
 }

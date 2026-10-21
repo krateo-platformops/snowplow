@@ -799,7 +799,7 @@ type RefreshStream struct {
 	Resync <-chan struct{}
 	Unsub  func()
 	// Rotated announces armed keys whose identity class moved (#819): one
-	// `refresh` frame per key on THIS connection, paced like an eviction.
+	// `refresh` frame per key on THIS connection, sent at once (not paced).
 	Rotated func(keys []string)
 }
 
@@ -892,12 +892,20 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 // offerRotated announces keys this connection armed whose identity class
 // moved (#819; the handler decides which). The key is dead — nothing will be
 // published on it again — so the frame is the only way the tab learns it must
-// refetch (and re-arm under the new key the /call response names). It takes
-// the eviction path: the same `refresh` frame, paced by this connection's
-// bucket and deferred, never dropped, so a rotation that moves every user's
-// class at once (a binding to system:authenticated) cannot burst a tab's whole
-// armed set in one tick. Only keys this connection armed are offered: the frame
-// never reaches another connection.
+// refetch (and re-arm under the new key the /call response names).
+//
+// NOT PACED. The first frame makes the SPA refetch that widget and, ~200 ms
+// later (its arm debounce), reconnect over every armed coordinate. That new
+// connection derives every key under the new class and has nothing to
+// announce, and the old connection's backlog dies with it, so a widget whose
+// frame had not reached the tab by then keeps a key nothing publishes on
+// (#828 review: 29 of 40 stranded at the eviction pacing). So every rotated
+// key goes out at once, on the refresher path: straight into the sink, or
+// deferred (never dropped) into the un-paced refresh pending set when the
+// sink is full. The volume is bounded by the armed set (<= refreshSubMaxEntries,
+// once per key), and the SPA paces the refetches the frames trigger (its
+// in-flight cap, per-widget throttle and queue). Only keys this connection
+// armed are offered: the frame never reaches another connection.
 func (s *refreshSub) offerRotated(keys []string) {
 	h := s.hub
 	h.mu.RLock()
@@ -906,7 +914,7 @@ func (s *refreshSub) offerRotated(keys []string) {
 		if _, armed := s.keys[k]; !armed {
 			continue
 		}
-		s.offerEviction(k)
+		s.offerRefresh(k)
 		refreshRotationAnnouncedTotal.Add(1)
 	}
 }
@@ -1135,7 +1143,7 @@ type RefreshBroadcasterStats struct {
 	MaxSinkDepth          int64   `stat:"max_sink_depth" kind:"gauge" desc:"High-water mark of a subscriber sink after a send (consumer lag, 0..64)."`
 	EvictPublished        uint64  `stat:"evict_published" desc:"Eviction-driven live-refresh publishes that reached at least one subscriber."`
 	EvictDeferred         uint64  `stat:"evict_deferred" desc:"Eviction-driven signals deferred by the per-subscriber token bucket (the bound engaged)."`
-	RotationAnnounced     uint64  `stat:"rotation_announced" desc:"Refresh frames sent on an armed key whose identity class moved, so the tab refetches and re-arms under its new key (#819)."`
+	RotationAnnounced     uint64  `stat:"rotation_announced" desc:"Refresh frames sent at once on an armed key whose identity class moved, so the tab refetches and re-arms under its new key (#819)."`
 	StreamSecondsTotal    float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
 	StreamsClosedTotal    uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
 }
