@@ -238,6 +238,16 @@ def test_run606_a_lagging_pod_is_invalid(harness):
     assert "INVALID: driver.sched_lag_p95_ms[nav-load606-3.jsonl]" in log
 
 
+def test_run606_eight_shards_fit_at_a_smaller_cpu_request(harness):
+    env, state, ambient, tmp = harness
+    env.update(DRIVER_SHARDS="8", USERS="16", DRIVER_CPU="600m", FAKE_DRIVER_PODS="8",
+               FAKE_USERS_PER_POD="2", COMPOSITE_BURST_USERS="8")
+    p = _run(env)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+    job = (tmp / "out" / "loadgen-job.yaml").read_text()
+    assert 'cpu: "600m"' in job and "completions: 8" in job
+
+
 def test_run606_refuses_a_plan_the_loadgen_node_cannot_hold(harness):
     env, state, ambient, tmp = harness
     env.update(DRIVER_SHARDS="8", USERS="16")                          # 8 x 1 CPU + 1.25

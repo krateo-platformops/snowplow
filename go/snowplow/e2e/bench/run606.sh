@@ -83,6 +83,11 @@ USERS="${USERS:-1000}"
 # GIL-bound process and framed /out stream. Run 10 (one pod, 1000 users)
 # missed its schedule in the first-load arrival.
 DRIVER_SHARDS="${DRIVER_SHARDS:-4}"
+# Per driver pod requests (load606_job refuses a plan the loadgen node cannot
+# hold): one process uses ~1 core at most, so 1 CPU each at 4 shards; 8
+# shards fit at DRIVER_CPU=600m.
+DRIVER_CPU="${DRIVER_CPU:-1}"
+DRIVER_MEMORY="${DRIVER_MEMORY:-1Gi}"
 NAMESPACES="${NAMESPACES:-50}"
 THINK_S="${THINK_S:-60}"
 DRIVE_S="${DRIVE_S:-1800}"
@@ -547,6 +552,7 @@ s_measure() {
   #             mutating through the Kubernetes API with its own SA.
   # shellcheck disable=SC2086
   python3 -m bench.load606_job --users "$USERS" --shards "$DRIVER_SHARDS" \
+      --driver-cpu "$DRIVER_CPU" --driver-memory "$DRIVER_MEMORY" \
       --think-s "$THINK_S" --duration-s "$DRIVE_S" \
       --linger-s "$(( MEASURE_WAIT_S + COLLECT_CAP_S ))" \
       --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" --password "$PW" \
