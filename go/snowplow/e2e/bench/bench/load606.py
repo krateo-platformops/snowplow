@@ -193,6 +193,7 @@ REFRESH_MAX_INFLIGHT = 6
 REFRESH_BACKOFF_BASE_S = 1.0
 REFRESH_BACKOFF_MAX_S = 30.0
 VIEWER_STACK_BYTES = 512 * 1024
+DEAD_TAB_SAMPLE_S = 60.0     # viewer_dead: tabs armed on a rotated-away key (#817)
 
 
 def refresh_coords(path: str, cls: str) -> dict | None:
@@ -374,28 +375,61 @@ class ViewerHub:
         self.inflight: dict[str, int] = {}
         self.queue: dict[str, list] = {}
         self.stats = {"streams_opened": 0, "frames": 0, "frames_unmatched": 0,
-                      "refetches": 0, "deferred": 0, "rearmed_key_changed": 0}
+                      "refetches": 0, "deferred": 0, "rearmed_key_changed": 0,
+                      "nav_key_rotations": 0, "disarmed_no_headers": 0}
+        # Keys seen to rotate away (#817 re-gate): a key string names one
+        # cell for one identity class, so a tab still armed on one gets no
+        # frame for that widget again — a dead tab, whoever saw the rotation.
+        self.dead_keys: set[str] = set()
+        self.closed = False
 
     def view(self, user: str, token: str, entries: list[dict]) -> None:
-        """The user's tab now shows exactly `entries`: re-arm (one stream)."""
-        with self.view_lock:
-            self._view(user, token, entries)
-
-    def _rearm_key(self, user: str, path: str, key: str) -> None:
-        """A refetch of `path` answered with a different refresh key: the
-        cell's key rotated (it folds identity inputs that change, e.g. the
-        RBAC sub-generation) and the armed one is dead. The SPA re-arms on it
-        (refreshSse.ts recordRefreshHeaders -> the arm hook's entry.key), so
-        the tab does too (#817)."""
+        """The user's tab now shows exactly `entries` (a navigation): re-arm
+        (one stream). A widget that stays on screen under a different key is a
+        rotation the navigation picked up."""
         with self.view_lock:
             with self.lock:
+                before = {e["path"]: e["key"] for e in self.entries.get(user) or []}
+                for e in entries:
+                    old = before.get(e["path"])
+                    if old is not None and old != e["key"]:
+                        self.stats["nav_key_rotations"] += 1
+                        self.dead_keys.add(old)
+            self._view(user, token, entries)
+
+    def _update_entry(self, user: str, path: str, key: str | None) -> None:
+        """A refetch of `path` answered 200 with a different refresh key, or
+        with none. A different key: the cell's key rotated (it folds identity
+        inputs that change, e.g. the RBAC sub-generation) and the armed one is
+        dead — the SPA re-arms (refreshSse.ts recordRefreshHeaders -> the arm
+        hook's entry.key). No key: the SPA deletes the entry and disarms the
+        widget (refreshSse.ts:245-253). The tab does the same (#817)."""
+        with self.view_lock:
+            with self.lock:
+                if self.closed:
+                    return
                 ents = self.entries.get(user) or []
-                if not any(e["path"] == path and e["key"] != key for e in ents):
+                hit = [e for e in ents if e["path"] == path and e["key"] != key]
+                if not hit:
                     return                      # re-armed meanwhile, or navigated away
-                ents = [dict(e, key=key) if e["path"] == path else e for e in ents]
+                if key is None:
+                    ents = [e for e in ents if e["path"] != path]
+                    self.stats["disarmed_no_headers"] += 1
+                else:
+                    ents = [dict(e, key=key) if e["path"] == path else e for e in ents]
+                    self.stats["rearmed_key_changed"] += 1
+                    self.dead_keys.update(e["key"] for e in hit)
                 token = self.tokens[user]
-                self.stats["rearmed_key_changed"] += 1
             self._view(user, token, ents)
+
+    def dead_tabs(self) -> dict:
+        """How many tabs are armed on a key seen to rotate away (no frame will
+        come for it), now."""
+        with self.lock:
+            dead = {u for u, ents in self.entries.items()
+                    if u in self.streams and any(e["key"] in self.dead_keys for e in ents)}
+            return {"tabs_dead": len(dead), "tabs_armed": len(self.streams),
+                    "dead_keys_seen": len(self.dead_keys)}
 
     def _view(self, user: str, token: str, entries: list[dict]) -> None:
         by_key: dict[str, list[str]] = {}
@@ -409,6 +443,8 @@ class ViewerHub:
                 seen.add(c)
                 coords.append(e["coords"])
         with self.lock:
+            if self.closed:
+                return                          # close_all ran: never open another stream
             old = self.streams.pop(user, None)
             self.paths[user] = by_key
             self.entries[user] = list(entries)
@@ -465,8 +501,8 @@ class ViewerHub:
                        "wall_ms": round(r.ms, 1), "status": r.status})
             with self.lock:
                 self.stats["refetches"] += 1
-            if r.refresh and r.refresh[0] != key:
-                self._rearm_key(user, path, r.refresh[0])
+            if r.status == 200 and (r.refresh or (None,))[0] != key:
+                self._update_entry(user, path, r.refresh[0] if r.refresh else None)
         finally:
             nxt = None
             with self.lock:
@@ -492,12 +528,18 @@ class ViewerHub:
             self._schedule(u, key, p, t_event)
 
     def close_all(self) -> dict:
-        with self.lock:
-            streams = list(self.streams.values())
-            self.streams.clear()
+        """Close every tab, for good: under view_lock with `closed` set, so a
+        refetch still in flight cannot re-arm (open a stream nobody closes)."""
+        with self.view_lock:
+            dead = self.dead_tabs()
+            with self.lock:
+                self.closed = True
+                streams = list(self.streams.values())
+                self.streams.clear()
         for s in streams:
             s.close()
-        return dict(self.stats)
+        return {**self.stats, "tabs_dead_at_close": dead["tabs_dead"],
+                "dead_keys_seen": dead["dead_keys_seen"]}
 
 
 def login(authn_url: str, user: str, password: str, timeout: float = 30) -> str:
@@ -1010,6 +1052,7 @@ class Driver:
             for u in self.burst_users:            # all at the SAME instant
                 nxt[u] = t_start + self.burst_at_s
         futures = []
+        next_dead_sample = t_start
         while True:
             now = self.clock()
             if now >= end:
@@ -1029,6 +1072,10 @@ class Driver:
                 nxt[u] = t + self.rng.expovariate(1.0 / self.think_s)
             if self.viewers is not None:
                 self.viewers.flush_trailing()
+                if now >= next_dead_sample:
+                    # #817 re-gate: tabs left armed on a key seen to rotate away
+                    self.sink({"kind": "viewer_dead", "t": now, **self.viewers.dead_tabs()})
+                    next_dead_sample = now + DEAD_TAB_SAMPLE_S
             soonest = min(nxt.values())
             self.sleep(max(0.0, min(0.05, soonest - self.clock())))
         for f in futures:
@@ -1052,6 +1099,7 @@ def freshness_probe(client: HttpClient, token: str, path: str,
                     pause_poll_s: float = 5.0, max_pause_s: float = 3600.0,
                     push_since: Callable[[float], float | None] | None = None,
                     observe: Callable[["Response"], None] | None = None,
+                    viewer: "ProbeViewer | None" = None,
                     deadline: float | None = None,
                     clock: Callable[[], float] = time.time,
                     sleep: Callable[[float], None] = time.sleep) -> list[dict]:
@@ -1071,6 +1119,8 @@ def freshness_probe(client: HttpClient, token: str, path: str,
     """
     sink = sink or (lambda rec: None)
     healthy = healthy or (lambda: True)
+    if viewer is not None and observe is None:
+        observe = viewer.observe
     out = []
     for i in range(samples):
         if deadline is not None and clock() >= deadline:
@@ -1097,6 +1147,7 @@ def freshness_probe(client: HttpClient, token: str, path: str,
         t0 = clock()
         polls = 0
         lat = None
+        gen0 = viewer.gen if viewer is not None else None
         while clock() - t0 < budget_s:
             polls += 1
             r = client.get(path, token)
@@ -1116,6 +1167,16 @@ def freshness_probe(client: HttpClient, token: str, path: str,
             rec["armed"] = True
             rec["push_ms"] = (round((tp - t0) * 1000, 1)
                               if tp is not None and tp - t0 <= budget_s else None)
+        if viewer is not None:
+            # #817 re-gate: which arm this sample ran on, whether a POLL re-armed
+            # it meanwhile (a passive tab could not have), and what the
+            # never-re-armed control (the passive tab) received.
+            rec["arm_gen"] = gen0
+            rec["rearmed_during"] = viewer.gen != gen0
+            if viewer.control is not None:
+                tc = viewer.control_push_since(t0)
+                rec["control_push_ms"] = (round((tc - t0) * 1000, 1)
+                                          if tc is not None and tc - t0 <= budget_s else None)
         if not healthy():
             rec["valid"] = False
             rec["invalid_reason"] = "snowplow not Ready (/readyz) during the sample"
@@ -1411,6 +1472,80 @@ def pod_record(pod_list: dict, phase: str) -> dict:
             "t": time.time()}
 
 
+def _termination(state: dict | None) -> dict | None:
+    t = (state or {}).get("terminated")
+    if not t:
+        return None
+    return {"reason": t.get("reason"), "exit_code": t.get("exitCode"),
+            "finished_at": t.get("finishedAt")}
+
+
+def job_pod_records(pod_list: dict, job: str) -> list[dict]:
+    """`kubectl get pods -l job-name=<job> -o json` → one `job_pod` record per
+    pod: phase, readiness and how each container ended (#817 review: a driver
+    pod's death must reach verdict.json with its reason, not only run.log)."""
+    items = pod_list.get("items") or []
+    if not items:
+        # A deployed Job with no pod at collect: recorded, so it cannot be silent.
+        return [{"kind": "job_pod", "job": job, "t": time.time(), "pod": None,
+                 "missing": True}]
+    out = []
+    for p in items:
+        st = p.get("status") or {}
+        sched = next((c for c in st.get("conditions") or []
+                      if c.get("type") == "PodScheduled" and c.get("status") != "True"), None)
+        out.append({"kind": "job_pod", "job": job, "t": time.time(),
+                    "pod": (p.get("metadata") or {}).get("name"),
+                    "phase": st.get("phase"),
+                    # pod-level reason (Evicted, ...) and why it never scheduled;
+                    # reasons are enum-like, the free-text messages are not kept
+                    "reason": st.get("reason"),
+                    "unscheduled": (sched or {}).get("reason") if sched else None,
+                    "containers": [{"name": cs.get("name"), "ready": cs.get("ready"),
+                                    "restarts": cs.get("restartCount", 0),
+                                    "terminated": _termination(cs.get("state")),
+                                    "last_terminated": _termination(cs.get("lastState"))}
+                                   for cs in st.get("containerStatuses") or []]})
+    return out
+
+
+def job_pod_checks(recs: list[dict]) -> list[dict]:
+    """A validity check per in-cluster Job pod: one whose container died
+    (non-zero exit, a restart, phase Failed) makes the run INVALID, and the
+    verdict says how it died. A pod still lingering for collect is a PASS."""
+    out = []
+    for r in recs:
+        why = []
+        if r.get("missing"):
+            out.append({"check": f"{r.get('job')}.pod", "value": None,
+                        "bar": "the deployed Job has a pod at collect", "result": "FAIL",
+                        "why": f"no {r.get('job')} pod at collect: it never started, "
+                               f"or it was deleted"})
+            continue
+        if r.get("phase") == "Failed":
+            why.append("the pod Failed" + (f" ({r['reason']})" if r.get("reason") else ""))
+        elif r.get("phase") in ("Pending", "Unknown"):
+            why.append(f"the pod is {r['phase']} at collect"
+                       + (f" ({r['unscheduled']})" if r.get("unscheduled") else "")
+                       + (f" ({r['reason']})" if r.get("reason") else "")
+                       + ": it did not run, or its node is unreachable")
+        for c in r.get("containers") or []:
+            for label, t in (("terminated", c.get("terminated")),
+                             ("earlier run terminated", c.get("last_terminated"))):
+                if t and t.get("exit_code") not in (0, None):
+                    why.append(f"container {c.get('name')} {label}: {t.get('reason')} "
+                               f"(exit {t.get('exit_code')}) at {t.get('finished_at')}")
+            if c.get("restarts"):
+                why.append(f"container {c.get('name')} restarted {c['restarts']}x")
+        out.append({"check": f"{r.get('job')}.pod[{r.get('pod')}]",
+                    "value": {"phase": r.get("phase"),
+                              "containers": r.get("containers")},
+                    "bar": "ran; no container death or restart",
+                    "result": "FAIL" if why else "PASS",
+                    **({"why": "; ".join(why)} if why else {})})
+    return out
+
+
 # ─── image digest gate (run 8: a pod on any other digest makes the run VOID) ─
 
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -1573,7 +1708,52 @@ RUN8_VARS_PREFIXES = (
     "snowplow_build_info",
     "snowplow_customer_resolve_inflight",  # Q3
     "snowplow_stale_retry_",               # Q4 (#740)
+    # #817: when does an identity-bound key rotate? (publish_seq, subgen
+    # bumps / epoch, the refresher's drift declines, the armed-key gauges)
+    "snowplow_rbac_",
+    "snowplow_l1_identity_class_drift",
+    "snowplow_refresh_broadcaster",
 )
+# The identity-class inputs whose movement rotates every identity-bound key
+# that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
+# own count of cells it found minted under a stale class.
+ROTATION_KEYS = ("snowplow_rbac_publish_seq", "snowplow_rbac_subgen_bumps_total",
+                 "snowplow_rbac_subgen_epoch", "snowplow_l1_identity_class_drift_declined_total")
+
+
+# Carried in every verdict's report, so a number read across runs comes with
+# what changed under it.
+HARNESS_NOTES = (
+    "run 10+ (#817): the driver's offered load and scheduling lag are NOT comparable "
+    "with runs <= 9. There, closing a /refreshes viewer blocked until its reader "
+    "woke (next frame or the 90 s read timeout), on every navigation's re-arm and "
+    "for 31 min at close_all; each blocked close held a navigation worker and left "
+    "that tab unarmed. Viewers now also re-arm when their cell's refresh key rotates.",
+)
+
+
+def rotation_report(mem: list[dict]) -> dict | None:
+    """#817 report-only: every mem sample at which an identity-class input
+    moved, with the values. These counters are GLOBAL: a change dates a
+    CANDIDATE rotation for some identity, not proof that a given user's key
+    rotated (the probe's own key_rotated records are that proof). An armed
+    /refreshes key goes dead when its cell's key rotates (the armed set is
+    frozen per connection); this dates the candidates so a viewer that
+    stopped being pushed can be matched to one."""
+    rows = sorted((m for m in mem if m.get("kind") == "mem"
+                   and any(k in (m.get("extra") or {}) for k in ROTATION_KEYS)),
+                  key=lambda m: m.get("t") or 0)
+    if not rows:
+        return None
+    changes, prev = [], None
+    for m in rows:
+        cur = {k: _num((m.get("extra") or {}).get(k)) for k in ROTATION_KEYS}
+        if prev is not None and cur != prev:
+            changes.append({"t": m.get("t"), **{k: v for k, v in cur.items()
+                                                 if v != prev.get(k)}})
+        prev = cur
+    first = {k: _num((rows[0].get("extra") or {}).get(k)) for k in ROTATION_KEYS}
+    return {"first": first, "last": prev, "changes": changes}
 # Bars: the #710 / #740 rulings, written here — never derived from the
 # instrument under test.
 STALE_TO_PUSH_P95_BAR_MS = 3000
@@ -2051,7 +2231,10 @@ def client_delivery(fresh: list[dict] | None, push_refetches: list[dict] | None,
             "frames": sum(int(v.get("frames") or 0) for v in vs),
             "push_refetches": len(pr),
             "probe_armed_samples": len(fr),
-            "probe_push_samples": sum(1 for f in fr if f.get("push_ms") is not None)}
+            # #817 re-gate: delivery to a PASSIVE tab, not to the polling probe
+            # (which re-arms on every poll); the probe's own count is reported
+            "probe_push_samples": sum(1 for f in fr if passive_push(f)),
+            "probe_push_samples_polling": sum(1 for f in fr if f.get("push_ms") is not None)}
 
 
 def _exercised_710_740(q2: dict, q4: dict, chk, checks: list[dict],
@@ -2070,7 +2253,8 @@ def _exercised_710_740(q2: dict, q4: dict, chk, checks: list[dict],
     if not (delivery["frames"] and delivery["push_refetches"]):
         missing.append("no refresh frame reached a client (viewer_stats.frames / push_refetch)")
     if not delivery["probe_push_samples"]:
-        missing.append("no armed probe sample received a push (push_ms)")
+        missing.append("no armed probe sample received a push a passive tab would get "
+                       "(control_push_ms, or push_ms on arm generation 0)")
     ok = not missing
     out = {"stale_serve_total_last": serves, **delivery,
            "server_retry_viewers_max": (q4.get("retry_viewers") or {}).get("max"),
@@ -2281,7 +2465,53 @@ def push_report(fresh: list[dict]) -> dict:
                       "no_push_within_budget": len(rows) - len(push),
                       "p50_ms": pct(push, 50), "p95_ms": pct(push, 95),
                       "max_ms": max(push) if push else None}
+        # #817 re-gate: the probe re-arms on a POLL, which a passive tab never
+        # does. Split its pushes by arm generation (0 = the arm a passive tab
+        # also holds), and report the never-re-armed control beside it.
+        gens = sorted({f["arm_gen"] for f in rows if f.get("arm_gen") is not None})
+        if gens:
+            out[label]["by_arm_gen"] = {
+                str(g): {"samples": sum(1 for f in rows if f.get("arm_gen") == g),
+                         "pushed": sum(1 for f in rows if f.get("arm_gen") == g
+                                       and f.get("push_ms") is not None)}
+                for g in gens}
+            out[label]["rearmed_during_sample"] = sum(1 for f in rows if f.get("rearmed_during"))
+        ctl = [f for f in rows if "control_push_ms" in f]
+        if ctl:
+            cpush = [f["control_push_ms"] for f in ctl if f["control_push_ms"] is not None]
+            out[label]["control"] = {
+                "samples": len(ctl), "pushed": len(cpush),
+                "p50_ms": pct(cpush, 50), "p95_ms": pct(cpush, 95),
+                # #819 measured: samples after the probe's key rotated
+                # (arm_gen > 0) that the passive tab got NO push for
+                "no_push_after_rotation": sum(1 for f in ctl if (f.get("arm_gen") or 0) > 0
+                                              and f["control_push_ms"] is None)}
     return out
+
+
+def fresh_viewer_report(fv: list[dict]) -> dict:
+    """The probe's viewer (#817): its arms and stream states, every key
+    rotation BOUNDED (the last poll that saw the old key .. the first that saw
+    the new one) and every disarm; the passive control's states beside it."""
+    def states(rows):
+        return {s: sum(1 for v in rows if v.get("state") == s)
+                for s in sorted({v["state"] for v in rows if v.get("state")})}
+    probe = [v for v in fv if v.get("role", "probe") == "probe"]
+    return {"arms": sum(1 for v in fv if v.get("armed") is True),
+            "states": states(probe),
+            "control_states": states([v for v in fv if v.get("role") == "control"]),
+            "key_rotations": [{"after": v.get("last_old_t"), "by": v.get("first_new_t", v.get("t"))}
+                              for v in probe if v.get("state") == "key_rotated"],
+            "disarmed_no_headers_t": [v.get("t") for v in probe
+                                      if v.get("state") == "disarmed_no_headers"]}
+
+
+def passive_push(f: dict) -> bool:
+    """A push a PASSIVE tab would have received: the never-re-armed control's,
+    or (without a control) one on arm generation 0, before any re-arm."""
+    if "control_push_ms" in f:
+        return f["control_push_ms"] is not None
+    return f.get("push_ms") is not None and (f.get("arm_gen") or 0) == 0
 
 
 def push_refetch_report(rows: list[dict]) -> dict | None:
@@ -2319,7 +2549,10 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              viewer_stats: list[dict] | None = None,
              fresh_truncated: list[dict] | None = None,
              driver_streams: list[dict] | None = None,
-             fresh_viewers: list[dict] | None = None) -> dict:
+             fresh_viewers: list[dict] | None = None,
+             mem_streams: list[dict] | None = None,
+             job_pods: list[dict] | None = None,
+             viewer_dead: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -2404,6 +2637,13 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
                                 "page-load times to evaluate"})
     if driver_streams is not None:
         validity.extend(driver_stream_checks(driver_streams))
+    if mem_streams is not None:
+        # Required once mem606 was deployed (it has a job_pod record): a
+        # memory capture that never arrived is INVALID, not silently absent.
+        validity.extend(framed_stream_checks(
+            MEM_FRAMING, mem_streams,
+            required=any(r.get("job") == "mem606" for r in job_pods or [])))
+    validity.extend(job_pod_checks(job_pods or []))
 
     econ = None
     if len(vars_series) >= 2:
@@ -2430,13 +2670,14 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         "push_refetch_report_only": push_refetch_report(push_refetches or []),
         # #817: the probe's viewer, incl. every time its cell's key rotated
         # under it (it re-arms, like the SPA; run 9 armed once and lost it).
-        "fresh_viewer": {
-            "arms": sum(1 for v in fresh_viewers or [] if v.get("armed") is True),
-            "states": {s: sum(1 for v in fresh_viewers or [] if v.get("state") == s)
-                       for s in sorted({v["state"] for v in fresh_viewers or []
-                                        if v.get("state")})},
-            "key_rotations_t": [v.get("t") for v in fresh_viewers or []
-                                if v.get("state") == "key_rotated"]},
+        "fresh_viewer": fresh_viewer_report(fresh_viewers or []),
+        # #817 re-gate: the driver's tabs left armed on a rotated-away key
+        "viewer_dead_report_only": ({
+            "samples": len(viewer_dead),
+            "tabs_dead_max": max(int(v.get("tabs_dead") or 0) for v in viewer_dead),
+            "tabs_dead_last": viewer_dead[-1].get("tabs_dead"),
+            "dead_keys_seen_last": viewer_dead[-1].get("dead_keys_seen")}
+            if viewer_dead else None),
         "fresh_truncated": fresh_truncated or [],
         "nav_kinds": {k: sum(1 for n in navs if n.get("nav") == k)
                       for k in sorted({n.get("nav") for n in navs if n.get("nav")})},
@@ -2453,6 +2694,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["image_digest"] = {"expected": expected_digest, "gate": image_digests or None}
     report["snowplow_pod"] = snowplow_pods
     report["memory"] = memory_report(mem or [])
+    report["key_rotation_report_only"] = rotation_report(mem or [])
+    report["harness_notes"] = list(HARNESS_NOTES)
     report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
     fv = [f for f in fresh if f.get("valid") is False]
     report["fresh_invalid_samples"] = len(fv)
@@ -2679,64 +2922,99 @@ def _read_jsonl(path: str) -> list[dict]:
     return out
 
 
-# Record kinds only the `drive` command writes: a file holding any of them is
-# a driver stream, and must prove it is whole (#817).
+# A framed stream (#817): a file one in-cluster writer produces, which must
+# prove it is that writer's WHOLE output: its start record first, its end
+# record (how many items it wrote) last, then the pod wrapper's exit record.
+# `kinds` are the record kinds only that writer emits: a file holding any of
+# them is that writer's stream.
+@dataclass(frozen=True)
+class Framing:
+    name: str           # check prefix
+    who: str            # subject of a reason
+    kinds: frozenset
+    start: str
+    end: str
+    exit: str
+    item: str           # the counted record kind
+    count: str          # the end record's count field
+    noun: str           # what `count` counts
+    lost: str           # what was lost when the counts differ
+
+
 DRIVER_KINDS = frozenset({"drive_start", "drive_end", "drive_exit", "nav", "login_curve",
-                          "viewer_config", "viewer", "viewer_stats", "push_refetch", "vars"})
+                          "viewer_config", "viewer", "viewer_stats", "viewer_dead",
+                          "push_refetch", "vars"})
+DRIVER_FRAMING = Framing("driver", "the driver", DRIVER_KINDS, "drive_start", "drive_end",
+                         "drive_exit", "nav", "navs", "navigations", "navigation")
+MEM_FRAMING = Framing("mem606", "the mem606 sampler",
+                      frozenset({"mem_start", "mem_end", "mem_exit", "mem", "heap_profile"}),
+                      "mem_start", "mem_end", "mem_exit", "mem", "samples",
+                      "memory samples", "memory sample")
 
 
-def driver_stream(path: str, recs: list[dict]) -> dict | None:
-    """The framing of one collected driver file: its first record, its
-    drive_end / drive_exit and how many nav records it holds. None when the
-    file holds no driver record (fresh606, mem606, ...)."""
-    own = [r for r in recs if r.get("kind") in DRIVER_KINDS]
+def framed_stream(f: Framing, path: str, recs: list[dict]) -> dict | None:
+    """The framing of one collected file for writer `f`: its first record, its
+    end / exit records and how many items it holds. None when the file holds
+    no record of that writer."""
+    own = [r for r in recs if r.get("kind") in f.kinds]
     if not own:
         return None
     return {"path": os.path.basename(path), "first": own[0].get("kind"),
             "first_t": own[0].get("t", own[0].get("t_event")),
-            "end": next((r for r in own if r["kind"] == "drive_end"), None),
-            "exit": next((r for r in own if r["kind"] == "drive_exit"), None),
-            "navs": sum(1 for r in own if r["kind"] == "nav")}
+            "end": next((r for r in own if r["kind"] == f.end), None),
+            "exit": next((r for r in own if r["kind"] == f.exit), None),
+            "items": sum(1 for r in own if r["kind"] == f.item)}
 
 
-def driver_stream_checks(streams: list[dict]) -> list[dict]:
-    """One validity check per driver stream; a stream that cannot prove it is
-    the driver's whole output makes the run INVALID, with the reason. Run 9:
-    the stream started mid-run (container log rotation cut its head) and held
-    no navigation at all; the verdict only said `warm_navs 0`."""
+def framed_stream_checks(f: Framing, streams: list[dict], *, required: bool) -> list[dict]:
+    """One validity check per stream; a stream that cannot prove it is the
+    writer's whole output makes the run INVALID, with the reason. Run 9: the
+    driver's stream started mid-run (container log rotation cut its head) and
+    held no navigation at all; the verdict only said `warm_navs 0`."""
     if not streams:
-        return [{"check": "driver.stream", "value": None, "bar": "one collected driver stream",
-                 "result": "FAIL",
-                 "why": "no driver output was collected: no file holds a driver record"}]
+        if not required:
+            return []
+        return [{"check": f"{f.name}.stream", "value": None,
+                 "bar": f"one collected {f.name} stream", "result": "FAIL",
+                 "why": f"no {f.name} output was collected: no file holds a {f.name} record"}]
     out = []
     for s in streams:
         why = []
-        if s["first"] != "drive_start":
+        if s["first"] != f.start:
             why.append(f"the stream starts mid-run (first record: {s['first']} at "
                        f"t={s['first_t']}): its head is missing, as when the container "
                        f"log rotated before it was read")
         end, ex = s["end"], s["exit"]
         if end is None:
-            why.append("no drive_end record: the driver did not finish, or the "
-                       "stream's tail is missing")
+            why.append(f"no {f.end} record: {f.who} did not finish, or the "
+                       f"stream's tail is missing")
         else:
-            if end.get("navs") != s["navs"]:
-                why.append(f"drive_end counts {end.get('navs')} navigations, the stream "
-                           f"holds {s['navs']}: navigation records were lost")
-            if not end.get("ok"):
-                why.append(f"the driver failed: {end.get('reason')}")
+            if end.get(f.count) != s["items"]:
+                why.append(f"{f.end} counts {end.get(f.count)} {f.noun}, the stream "
+                           f"holds {s['items']}: {f.lost} records were lost")
+            if not end.get("ok", True):
+                why.append(f"{f.who} failed: {end.get('reason')}")
         if ex is None:
-            why.append("no drive_exit record: the driver's pod died before its "
-                       "wrapper recorded the exit code")
+            why.append(f"no {f.exit} record: {f.who}'s pod died before its "
+                       f"wrapper recorded the exit code")
         elif ex.get("rc") != 0:
-            why.append(f"the driver exited rc={ex.get('rc')}")
-        out.append({"check": f"driver.stream_complete[{s['path']}]",
-                    "value": {"navs": s["navs"], "drive_end_navs": (end or {}).get("navs"),
+            why.append(f"{f.who} exited rc={ex.get('rc')}")
+        out.append({"check": f"{f.name}.stream_complete[{s['path']}]",
+                    "value": {f.count: s["items"],
+                              f"{f.end}_{f.count}": (end or {}).get(f.count),
                               "exit_rc": (ex or {}).get("rc")},
-                    "bar": "drive_start .. drive_end (ok, all navs) .. drive_exit rc=0",
+                    "bar": f"{f.start} .. {f.end} (ok, all {f.count}) .. {f.exit} rc=0",
                     "result": "FAIL" if why else "PASS",
                     **({"why": "; ".join(why)} if why else {})})
     return out
+
+
+def driver_stream(path: str, recs: list[dict]) -> dict | None:
+    return framed_stream(DRIVER_FRAMING, path, recs)
+
+
+def driver_stream_checks(streams: list[dict]) -> list[dict]:
+    return framed_stream_checks(DRIVER_FRAMING, streams, required=True)
 
 
 def classify(resp: "Response") -> str:
@@ -3242,6 +3520,7 @@ def fresh_phases(client, token, sink, *, modes, rates, mutators, paths, targets,
                 samples=samples, poll_ms=poll_ms, gap_s=gap_s,
                 label=label, sink=sink, healthy=healthy,
                 push_since=push_since, observe=getattr(stream, "observe", None),
+                viewer=stream if isinstance(stream, ProbeViewer) else None,
                 deadline=clock() + fresh_phase_budget_s(samples, gap_s))
             if churn:
                 sink({"kind": "churn", "label": label, **churn.stop()})
@@ -3262,6 +3541,11 @@ def arm_probe_viewer(client: HttpClient, token: str, path: str, sink,
               "why": "no X-Snowplow-Refresh-Key/Class on the probe's /call"})
         return None, None
     viewer = ProbeViewer(client.base, token, coords, ref[0], sink, stream_factory)
+    # The passive-tab CONTROL (#817 re-gate): armed once on the same cell and
+    # never re-armed, like an SPA tab that is open but not refetching. After a
+    # key rotation its pushes stop: that is #819, measured directly.
+    viewer.control = ProbeViewer(client.base, token, coords, ref[0], sink, stream_factory,
+                                 role="control")
     sink({"kind": "fresh_viewer", "armed": True, "class": ref[1]})
     return viewer.push_since, viewer
 
@@ -3271,56 +3555,89 @@ class ProbeViewer:
 
     Like the SPA (refreshSse.ts recordRefreshHeaders -> the arm hook's
     entry.key dependency), it RE-ARMS when a /call of the cell answers with a
-    different X-Snowplow-Refresh-Key (`observe`, fed every poll): the cell's
-    key folds identity inputs that can change while the tab is open (binding
-    UID, binding-set digest, RBAC sub-generation), and snowplow's armed set is
+    different X-Snowplow-Refresh-Key, and disarms when a successful /call
+    carries no refresh headers (`observe`, fed every poll): the cell's key
+    folds identity inputs that can change while the tab is open (binding UID,
+    binding-set digest, RBAC sub-generation), and snowplow's armed set is
     frozen per connection. Run 9: the annotation probe's arm went dead minutes
-    in, and 95 min of samples ran with no viewer, unrecorded (#817)."""
+    in, and 95 min of samples ran with no viewer, unrecorded (#817).
+
+    The probe POLLS (every 100 ms), which a passive tab never does, so every
+    arm has a generation (`gen`): samples are tagged with it, and `control`
+    (role "control", never re-armed) is the passive-tab baseline."""
 
     def __init__(self, base: str, token: str, coords: dict, key: str, sink,
-                 stream_factory=RefreshStream, clock: Callable[[], float] = time.time):
+                 stream_factory=RefreshStream, clock: Callable[[], float] = time.time,
+                 role: str = "probe"):
         self.base, self.token, self.coords = base, token, coords
         self.sink, self.stream_factory, self.clock = sink, stream_factory, clock
+        self.role = role
         self.lock = threading.Lock()
         self.events: list[float] = []
         self.key = None
         self.stream = None
+        self.gen = -1
+        self.last_seen_t = None          # the last poll that still saw self.key
+        self.control: "ProbeViewer | None" = None
         self._arm(key)
 
-    def _arm(self, key: str) -> None:
-        def on_refresh(k, t, armed=key):
-            if k == armed:
-                with self.lock:
-                    self.events.append(t)
-        stream = self.stream_factory(
-            self.base, self.token, [self.coords], on_refresh,
-            on_state=lambda st, d: self.sink({"kind": "fresh_viewer", "state": st,
-                                              "t": self.clock(), **d})).start()
+    def _record(self, state: str, **detail) -> None:
+        self.sink({"kind": "fresh_viewer", "role": self.role, "state": state,
+                   "t": self.clock(), **detail})
+
+    def _arm(self, key: str | None) -> None:
+        stream = None
+        if key is not None:
+            def on_refresh(k, t, armed=key):
+                if k == armed:
+                    with self.lock:
+                        self.events.append(t)
+            stream = self.stream_factory(
+                self.base, self.token, [self.coords], on_refresh,
+                on_state=lambda st, d: self._record(st, **d)).start()
         with self.lock:
             old, self.stream, self.key = self.stream, stream, key
+            self.gen += 1
         if old is not None:
             old.close()
 
     def observe(self, resp: "Response") -> None:
-        """One /call response of the cell: re-arm if its key rotated."""
+        """One /call response of the cell: re-arm if its key rotated, disarm
+        if a successful response carries no refresh headers (as the SPA)."""
+        if resp.status != 200:
+            return                       # the SPA records headers on success only
         new = resp.refresh[0] if resp.refresh else None
+        now = self.clock()
         with self.lock:
-            old = self.key
-        if new is None or new == old:
-            return
-        self.sink({"kind": "fresh_viewer", "state": "key_rotated", "t": self.clock(),
-                   "old_key": old[:16], "new_key": new[:16]})
+            old, seen = self.key, self.last_seen_t
+            if new == old:
+                self.last_seen_t = now
+                return
+            self.last_seen_t = now
+        if new is None:
+            self._record("disarmed_no_headers", old_key=old[:16], last_old_t=seen)
+        else:
+            # The rotation happened between the last poll that saw the old key
+            # and this one: both are recorded, so its time is bounded.
+            self._record("key_rotated" if old else "rearmed",
+                         old_key=(old or "")[:16], new_key=new[:16],
+                         last_old_t=seen, first_new_t=now)
         self._arm(new)
 
     def push_since(self, t0: float) -> float | None:
         with self.lock:
             return next((t for t in self.events if t >= t0), None)
 
+    def control_push_since(self, t0: float) -> float | None:
+        return self.control.push_since(t0) if self.control else None
+
     def close(self) -> None:
         with self.lock:
             s, self.stream = self.stream, None
         if s is not None:
             s.close()
+        if self.control is not None:
+            self.control.close()
 
 
 _MEM_FIELDS = (("HeapAlloc", "heap_alloc_mb"), ("HeapInuse", "heap_inuse_mb"),
@@ -3369,16 +3686,25 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
              extra_prefixes: tuple[str, ...] = (),
              burst_interval_s: float = 5.0, burst_window_s: float = 60.0,
              load_min_delta: int = 100,
+             stop_file: str | None = None,
              clock: Callable[[], float] = time.time,
              sleep: Callable[[float], None] = time.sleep) -> int:
     """The standard run-time memory capture (run 7 → #710): a memstats sample
     every `interval_s`, and a heap profile (/debug/pprof/heap) at the FIRST
     Ready, every `profile_every_s` while Ready, and at every not-Ready → Ready
     transition (a restart). Profiles are written to out_dir; their names are
-    emitted as `heap_profile` records."""
+    emitted as `heap_profile` records.
+
+    The stream is framed like the driver's (#817): `mem_start` first,
+    `mem_end` (how many mem records) last, so a cut file is detected. It ends
+    at duration_s, or as soon as `stop_file` exists (the collect step asks for
+    the final stream before it copies it)."""
     os.makedirs(out_dir, exist_ok=True)
     token = None
     end = clock() + duration_s
+    samples = 0
+    sink({"kind": "mem_start", "t": clock(), "duration_s": duration_s,
+          "interval_s": interval_s})
     # Burst resolution (#710: heap went 0.6 -> 6.35 GB in 16 s, so 15 s
     # samples see at most one point inside it): sample every burst_interval_s
     # until the load is seen (L1 lookups +load_min_delta from the first
@@ -3388,12 +3714,13 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
     was_ready = False
     last_prof = None
     n = 0
-    while clock() < end:
+    while clock() < end and not (stop_file and os.path.exists(stop_file)):
         if token is None:
             try:
                 token = login_fn()
             except Exception as e:  # noqa: BLE001
                 sink({"kind": "mem", "t": clock(), "login_error": type(e).__name__})
+                samples += 1
         rec = mem_sample(client, token, extra_prefixes)
         rec["t"] = clock()
         if rec.get("vars_status") == 401:
@@ -3408,6 +3735,7 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
         fast = burst_until is None or clock() < burst_until
         rec["interval_s"] = burst_interval_s if fast else interval_s
         sink(rec)
+        samples += 1
         ready = rec.get("readyz") == 200
         if ready and token and (not was_ready or last_prof is None
                                 or clock() - last_prof >= profile_every_s):
@@ -3423,6 +3751,8 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
                 last_prof = clock()
         was_ready = ready
         sleep(rec["interval_s"])
+    sink({"kind": "mem_end", "t": clock(), "samples": samples, "profiles": n,
+          "stopped": bool(stop_file and os.path.exists(stop_file))})
     with open(os.path.join(out_dir, "done"), "w") as fh:
         fh.write("1")
     return n
@@ -3434,8 +3764,10 @@ def _cmd_memwatch(a) -> int:
     memwatch(client, lambda: login(a.authn_url, a.user, a.password),
              duration_s=a.duration_s, interval_s=a.interval_s,
              profile_every_s=a.profile_every_s, out_dir=a.out_dir, sink=sink,
-             extra_prefixes=tuple(a.vars_prefix or ()))
-    # Stay up so the collect step can copy the profiles out (kubectl cp).
+             extra_prefixes=tuple(a.vars_prefix or ()), stop_file=a.stop_file)
+    # Stay up so the collect step can copy the profiles out (kubectl cp). The
+    # mem606 Job's wrapper lingers itself (--linger-s 0), so a crash here
+    # still leaves the stream copyable.
     time.sleep(a.linger_s)
     return 0
 
@@ -3464,12 +3796,16 @@ def _cmd_check_prefixes(a) -> int:
 def _cmd_evaluate(a) -> int:
     recs = []
     streams = []
+    mem_streams = []
     for p in a.inputs:
         rs = _read_jsonl(p)
         recs.extend(rs)
         s = driver_stream(p, rs)
         if s is not None:
             streams.append(s)
+        ms = framed_stream(MEM_FRAMING, p, rs)
+        if ms is not None:
+            mem_streams.append(ms)
     navs = [r for r in recs if r.get("kind") == "nav"]
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     vs = sorted((r for r in recs if r.get("kind") == "vars"
@@ -3491,7 +3827,11 @@ def _cmd_evaluate(a) -> int:
                       viewer_stats=[r for r in recs if r.get("kind") == "viewer_stats"],
                       fresh_truncated=[r for r in recs if r.get("kind") == "fresh_truncated"],
                       driver_streams=streams,
-                      fresh_viewers=[r for r in recs if r.get("kind") == "fresh_viewer"])
+                      fresh_viewers=[r for r in recs if r.get("kind") == "fresh_viewer"],
+                      mem_streams=mem_streams,
+                      job_pods=[r for r in recs if r.get("kind") == "job_pod"],
+                      viewer_dead=sorted((r for r in recs if r.get("kind") == "viewer_dead"),
+                                         key=lambda r: r.get("t") or 0))
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
@@ -3586,10 +3926,18 @@ def main(argv: list[str] | None = None) -> int:
     mw.add_argument("--profile-every-s", type=float, default=120.0)
     mw.add_argument("--out-dir", default="/out")
     mw.add_argument("--linger-s", type=float, default=3600.0)
+    mw.add_argument("--stop-file", default=None,
+                    help="end the capture early once this file exists (collect)")
     mw.add_argument("--vars-prefix", action="append", default=None,
                     help="also capture every expvar starting with this prefix (repeatable)")
     mw.add_argument("--out", default="/dev/stdout")
     mw.set_defaults(func=_cmd_memwatch)
+    jp = sub.add_parser("job-pod-record",
+                        help="kubectl get pods -l job-name=<job> -o json on stdin -> job_pod records")
+    jp.add_argument("--job", required=True)
+    jp.set_defaults(func=lambda a: print("\n".join(
+        json.dumps(r) for r in job_pod_records(json.loads(sys.stdin.read() or "{}"), a.job)))
+        or 0)
     pr = sub.add_parser("pod-record", help="kubectl get pods -o json on stdin -> snowplow_pod record")
     pr.add_argument("--phase", required=True, choices=["before", "after"])
     pr.set_defaults(func=_cmd_pod_record)

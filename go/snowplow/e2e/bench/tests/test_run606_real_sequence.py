@@ -170,15 +170,27 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         dest = a[-1]
         os.makedirs(dest, exist_ok=True)
         open(os.path.join(dest, "heap-01-150000-ready.pb.gz"), "wb").write(b"\\x1f\\x8bfake")
+        recs = [{"kind": "mem_start", "t": 0.5},
+                {"kind": "mem", "t": 1.0, "readyz": 200, "vars_status": 200,
+                 "heap_inuse_mb": 1392.8, "sys_mb": 1551.9},
+                {"kind": "heap_profile", "t": 1.0, "profile": "heap-01-150000-ready.pb.gz",
+                 "bytes": 152190, "at": "ready"},
+                {"kind": "mem", "t": 16.0, "readyz": 200, "vars_status": 200,
+                 "heap_inuse_mb": 3789.4, "sys_mb": 6741.5},
+                {"kind": "mem_end", "t": 17.0, "samples": 2, "profiles": 1, "stopped": True},
+                {"kind": "mem_exit", "rc": 0, "t": 17}]
+        if os.environ.get("FAKE_MEM_STREAM") == "cut":           # copied mid-stream
+            recs = recs[:-2]
         with open(os.path.join(dest, "mem.jsonl"), "w") as fh:      # /out/mem.jsonl (#817)
-            for r in ({"kind": "mem", "t": 1.0, "readyz": 200, "vars_status": 200,
-                       "heap_inuse_mb": 1392.8, "sys_mb": 1551.9},
-                      {"kind": "heap_profile", "t": 1.0, "profile": "heap-01-150000-ready.pb.gz",
-                       "bytes": 152190, "at": "ready"},
-                      {"kind": "mem", "t": 16.0, "readyz": 200, "vars_status": 200,
-                       "heap_inuse_mb": 3789.4, "sys_mb": 6741.5}):
+            for r in recs:
                 fh.write(json.dumps(r) + "\\n")
         sys.exit(0)
+    if a[:1] == ["exec"] and a[-3:] == ["test", "-f", "/out/exited"] \\
+            and os.environ.get("FAKE_MEM_NEVER_EXITS") == "1":
+        time.sleep(float(os.environ.get("FAKE_EXEC_SLOW", "0")))     # a slow exec
+        sys.exit(1)
+    if a[:1] == ["exec"] and a[-2:] == ["cat", "/out/done"]:
+        print(os.environ.get("FAKE_DRIVE_RC", "0")); sys.exit(0)   # drive's exit code
     if a[:1] == ["cp"] and any(x.startswith("load606") for x in a):
         # The driver's /out/nav.jsonl (#817). FAKE_DRIVE_STREAM: whole (a framed
         # stream) | headcut (run 9: only the tail after log rotation) | nofile.
@@ -259,6 +271,18 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                 cds.append(cr("CompositionDefinition", "oasgen-provider", False, "Creating",
                               "chart fetch timeout"))
             items(cds)
+        if what == "pods" and any(x.startswith("job-name=") for x in a):
+            # an in-cluster Job's pod (#817): lingering, or OOMKilled when
+            # FAKE_DRIVER_POD_DEATH=1 and it is the driver's
+            job = next(x for x in a if x.startswith("job-name=")).split("=", 1)[1]
+            dead = job == "load606" and os.environ.get("FAKE_DRIVER_POD_DEATH") == "1"
+            state = ({"terminated": {"reason": "OOMKilled", "exitCode": 137,
+                                     "finishedAt": "2026-10-21T06:40:00Z"}}
+                     if dead else {"running": {}})
+            items([{"metadata": {"name": f"{job}-0"},
+                    "status": {"phase": "Failed" if dead else "Running",
+                               "containerStatuses": [{"name": "c", "ready": not dead,
+                                                      "restartCount": 0, "state": state}]}}])
         if what == "pods":
             items([{"metadata": {"name": "ok-0", "namespace": "krateo-system"},
                     "spec": {"nodeName": "n1"}, "status": {"phase": "Running",
@@ -323,6 +347,17 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print(json.dumps({"api": {"INIT": init, "BUILDERS_NAMESPACE": "krateo-system"},
                               "params": {"FRONTEND_NAMESPACE": "krateo-system"}}))
             sys.exit(0)
+        if (what == "pods" and "app.kubernetes.io/name=snowplow" in a
+                and any(x.startswith("jsonpath=") for x in a)):
+            # the log stream's live-pod lookup: FAKE_SNOWPLOW_PODS="p1,p2" =
+            # p1 for the first lookups, then p2 (a replaced pod)
+            names = [n for n in os.environ.get("FAKE_SNOWPLOW_PODS", "").split(",") if n]
+            if names:
+                cnt = os.path.join(STATE, "live_pod_reads")
+                n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+                open(cnt, "w").write(str(n + 1))
+                print(f"2026-10-21T05:00:00Z {names[min(n // 2, len(names) - 1)]} ")
+            sys.exit(0)
         if what == "job/load606":                       # ready/failed/completions
             print("/1/1" if os.environ.get("FAKE_DRIVER_FAILED") == "1" else "1//1")
             sys.exit(0)
@@ -365,8 +400,31 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     if a[:1] == ["wait"] and "job/fresh606" in a and os.environ.get("FAKE_WAIT_FAIL") == "1":
         print("error: timed out waiting for the condition on jobs/fresh606", file=sys.stderr)
         sys.exit(1)
-    if a[:1] == ["logs"] and "deploy/snowplow" in a and "--previous" not in a:
-        print("snowplow log line"); sys.exit(0)
+    snow = next((x for x in a if x == "deploy/snowplow" or x.startswith("pod/snowplow")), None)
+    if a[:1] == ["logs"] and snow and "--previous" not in a:
+        ts = "2026-10-21T06:00:00.5Z " if "--timestamps" in a else ""
+        if "-f" not in a and snow.startswith("pod/") and os.environ.get("FAKE_SNOWPLOW_PODS"):
+            # the replaced pod's tail, read once (#823 review)
+            print(ts + json.dumps({"time": "2026-10-21T06:00:00Z", "level": "INFO",
+                                   "msg": "old pod tail"}), flush=True)
+            sys.exit(0)
+        # identity-bearing fields on purpose: the collected copy must not keep them (#822)
+        print(ts + json.dumps({"time": "2026-10-21T06:00:00Z", "level": "INFO",
+                               "msg": "refreshes: subscribed", "subsystem": "cache",
+                               "user": "scaleuser-0001", "name": "scaleuser-0001-clientconfig",
+                               "armed_keys": 3, "-f": "-f" in a}), flush=True)
+        print(ts + "snowplow plain line", flush=True)
+        if "-f" in a and os.environ.get("FAKE_FOLLOW_FOREVER") == "1":
+            # a follower that never ends on its own, like a live `kubectl logs -f`
+            with open(os.path.join(STATE, "followers"), "a") as fh:
+                fh.write(f"{os.getpid()}\\n")
+            i = 0
+            while True:
+                i += 1
+                print(f"2026-10-21T06:00:{i % 60:02d}.{i:09d}Z " + json.dumps(
+                    {"time": "2026-10-21T06:00:01Z", "msg": "tick"}), flush=True)
+                time.sleep(0.2)
+        sys.exit(0)
     sys.exit(0)   # apply / wait / rollout / version / scale / top / logs
     """)
 

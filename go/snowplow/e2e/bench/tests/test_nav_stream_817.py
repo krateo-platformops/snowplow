@@ -263,7 +263,7 @@ def test_driver_job_writes_to_out_turns_ready_when_done_and_lingers():
     assert "--out /out/nav.jsonl || rc=$?" in script and "/dev/stdout" not in script
     assert "exec python3" not in script            # the wrapper outlives the drive
     i_exit = script.index('"kind": "drive_exit"')
-    assert i_exit < script.index("touch /out/done") < script.index("sleep 7200")
+    assert i_exit < script.index('echo "$rc" > /out/done') < script.index("sleep 7200")
     assert script.rstrip().endswith('exit "$rc"')
     assert c["readinessProbe"]["exec"]["command"] == ["test", "-f", "/out/done"]
     assert {"name": "out", "mountPath": "/out"} in c["volumeMounts"]
@@ -306,7 +306,8 @@ def test_run606_collects_the_driver_file_and_mem_trajectory_from_out(harness):
     assert "driver done: 1/1 load606 pod(s) Ready" in p.stderr
     assert _recs(out / "nav-load606-0.jsonl")[0]["kind"] == "drive_start"
     assert (out / "driver-load606-0.log").read_text().startswith("[login]")
-    assert [r["kind"] for r in _recs(out / "mem-mem606-0.jsonl")] == ["mem", "heap_profile", "mem"]
+    assert [r["kind"] for r in _recs(out / "mem-mem606-0.jsonl")] == [
+        "mem_start", "mem", "heap_profile", "mem", "mem_end", "mem_exit"]
     assert not (out / "heap" / "mem.jsonl").exists()           # moved, not duplicated
     kube = [c["argv"] for c in _calls(state) if c["tool"] == "kubectl"]
     assert any("load606-0:/out/nav.jsonl" in a for a in kube if "cp" in a)
