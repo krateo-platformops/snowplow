@@ -47,7 +47,7 @@ def test_run606_measure_failure_collects_everything_before_teardown(harness):
                        capture_output=True, text=True, timeout=300)
     err = p.stderr
     assert p.returncode != 0
-    assert "measure FAILED: load606/fresh606 not Complete" in err
+    assert "measure FAILED: fresh606 not Complete" in err
     i_collect = err.index("collecting partial results before teardown")
     i_diag = err.index("=== diagnostics before teardown")
     i_down = err.index("=== teardown ")

@@ -41,6 +41,7 @@ import math
 import os
 import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -316,10 +317,30 @@ class RefreshStream:
         with self._lock:
             r, self._resp = self._resp, None
         if r is not None:
-            try:
-                r.close()
-            except Exception:  # noqa: BLE001
-                pass
+            abort_response(r)
+
+
+def abort_response(resp) -> None:
+    """Close a response that another thread is blocked reading, without
+    waiting for it. HTTPResponse.close() takes the reader's buffer lock, so it
+    returns only when the reader wakes: on the next frame or the 90 s read
+    timeout (run 9: closing 1000 viewers one by one took 31 min, #817).
+    Shutting the socket down first wakes the reader at once."""
+    try:
+        s = socket.socket(fileno=os.dup(resp.fileno()))
+    except (OSError, ValueError, AttributeError):   # already closed
+        s = None
+    if s is not None:
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        finally:
+            s.close()
+    try:
+        resp.close()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class ViewerHub:
@@ -2266,11 +2287,16 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              image_digests: list[dict] | None = None,
              push_refetches: list[dict] | None = None,
              viewer_stats: list[dict] | None = None,
-             fresh_truncated: list[dict] | None = None) -> dict:
+             fresh_truncated: list[dict] | None = None,
+             driver_streams: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
-    INVALID (the driver, not snowplow, failed) wins over FAIL.
+    INVALID (the driver, not snowplow, failed) wins over FAIL; every INVALID
+    reason is spelled out in "invalid_reasons".
+    `driver_streams` (driver_stream(), one per collected driver file) proves
+    the navigation records are the driver's WHOLE output; None = not checked
+    (callers that hand in records directly).
     """
     th = dict(THRESHOLDS, **(thresholds or {}))
     checks: list[dict] = []
@@ -2340,6 +2366,13 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     _check("driver.error_rate", round(errors / calls, 4) if calls else None,
            "<=", th["max_error_rate"], validity)
     _check("driver.warm_navs", len(warm), ">=", th["min_warm_navs"], validity)
+    if not navs:
+        validity.append({"check": "driver.navs_recorded", "value": 0, "bar": ">= 1",
+                         "result": "FAIL",
+                         "why": "the driver recorded zero navigations: there are no "
+                                "page-load times to evaluate"})
+    if driver_streams is not None:
+        validity.extend(driver_stream_checks(driver_streams))
 
     econ = None
     if len(vars_series) >= 2:
@@ -2400,8 +2433,10 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         verdict = "INCONCLUSIVE"
     else:
         verdict = "PASS"
-    return {"verdict": verdict, "checks": checks, "validity": validity,
-            "report": report, "economics": econ, "thresholds": th}
+    invalid_reasons = [f"{c['check']}: " + (c.get("why") or f"{c.get('value')} vs {c.get('bar')}")
+                       for c in validity if c["result"] == "FAIL"]
+    return {"verdict": verdict, "invalid_reasons": invalid_reasons, "checks": checks,
+            "validity": validity, "report": report, "economics": econ, "thresholds": th}
 
 
 # ─── Fixtures + kubectl mutation (operator side) ────────────────────────────
@@ -2601,6 +2636,66 @@ def _read_jsonl(path: str) -> list[dict]:
                 skipped += 1
     if skipped:
         out.append({"kind": "skipped", "path": path, "lines": skipped})
+    return out
+
+
+# Record kinds only the `drive` command writes: a file holding any of them is
+# a driver stream, and must prove it is whole (#817).
+DRIVER_KINDS = frozenset({"drive_start", "drive_end", "drive_exit", "nav", "login_curve",
+                          "viewer_config", "viewer", "viewer_stats", "push_refetch", "vars"})
+
+
+def driver_stream(path: str, recs: list[dict]) -> dict | None:
+    """The framing of one collected driver file: its first record, its
+    drive_end / drive_exit and how many nav records it holds. None when the
+    file holds no driver record (fresh606, mem606, ...)."""
+    own = [r for r in recs if r.get("kind") in DRIVER_KINDS]
+    if not own:
+        return None
+    return {"path": os.path.basename(path), "first": own[0].get("kind"),
+            "first_t": own[0].get("t", own[0].get("t_event")),
+            "end": next((r for r in own if r["kind"] == "drive_end"), None),
+            "exit": next((r for r in own if r["kind"] == "drive_exit"), None),
+            "navs": sum(1 for r in own if r["kind"] == "nav")}
+
+
+def driver_stream_checks(streams: list[dict]) -> list[dict]:
+    """One validity check per driver stream; a stream that cannot prove it is
+    the driver's whole output makes the run INVALID, with the reason. Run 9:
+    the stream started mid-run (container log rotation cut its head) and held
+    no navigation at all; the verdict only said `warm_navs 0`."""
+    if not streams:
+        return [{"check": "driver.stream", "value": None, "bar": "one collected driver stream",
+                 "result": "FAIL",
+                 "why": "no driver output was collected: no file holds a driver record"}]
+    out = []
+    for s in streams:
+        why = []
+        if s["first"] != "drive_start":
+            why.append(f"the stream starts mid-run (first record: {s['first']} at "
+                       f"t={s['first_t']}): its head is missing, as when the container "
+                       f"log rotated before it was read")
+        end, ex = s["end"], s["exit"]
+        if end is None:
+            why.append("no drive_end record: the driver did not finish, or the "
+                       "stream's tail is missing")
+        else:
+            if end.get("navs") != s["navs"]:
+                why.append(f"drive_end counts {end.get('navs')} navigations, the stream "
+                           f"holds {s['navs']}: navigation records were lost")
+            if not end.get("ok"):
+                why.append(f"the driver failed: {end.get('reason')}")
+        if ex is None:
+            why.append("no drive_exit record: the driver's pod died before its "
+                       "wrapper recorded the exit code")
+        elif ex.get("rc") != 0:
+            why.append(f"the driver exited rc={ex.get('rc')}")
+        out.append({"check": f"driver.stream_complete[{s['path']}]",
+                    "value": {"navs": s["navs"], "drive_end_navs": (end or {}).get("navs"),
+                              "exit_rc": (ex or {}).get("rc")},
+                    "bar": "drive_start .. drive_end (ok, all navs) .. drive_exit rc=0",
+                    "result": "FAIL" if why else "PASS",
+                    **({"why": "; ".join(why)} if why else {})})
     return out
 
 
@@ -2873,32 +2968,53 @@ def _cmd_preflight(a) -> int:
 
 
 def _cmd_drive(a) -> int:
+    """The driver's stream is framed so the evaluator can prove it complete
+    (#817): `drive_start` is its first record and `drive_end` (navigation
+    count, ok, reason) its last; the pod wrapper appends `drive_exit`. Run 9
+    lost every navigation to a stream cut at its head, and nothing said so."""
+    sink = _jsonl_sink(a.out)
+    sink({"kind": "drive_start", "t": time.time(), "user_start": a.user_start,
+          "user_end": a.user_end, "duration_s": a.duration_s, "think_s": a.think_s})
+    navs: list[NavResult] = []
+    try:
+        rc, reason = _drive(a, sink, navs)
+    except Exception as e:  # noqa: BLE001 — recorded in drive_end, then re-raised
+        sink(drive_end_record(navs, 1, f"driver crashed: {type(e).__name__}: {e}"[:300]))
+        raise
+    if rc == 0 and not navs:
+        rc, reason = 3, "the driver recorded zero navigations"
+    if rc != 0:
+        print(f"FATAL: {reason}", file=sys.stderr, flush=True)
+    sink(drive_end_record(navs, rc, reason))
+    return rc
+
+
+def drive_end_record(navs: list["NavResult"], rc: int, reason: str | None) -> dict:
+    return {"kind": "drive_end", "t": time.time(), "ok": rc == 0, "rc": rc,
+            "reason": reason, "navs": len(navs)}
+
+
+def _drive(a, sink, navs: list["NavResult"]) -> tuple[int, str | None]:
     client = HttpClient(a.snowplow_url)
     portal = _portal_from_args(a)
     users = [f"{a.user_prefix}{i:04d}" for i in range(a.user_start, a.user_end + 1)]
-    sink = _jsonl_sink(a.out)
     # Guard in seconds, BEFORE the login burst: the first user's INIT must be
     # servable (the run606 preflight already checked; this keeps `drive`
     # standalone-safe — run 6 spent 54 min logging in before discovering it).
     try:
         tok0 = login(a.authn_url, users[0], a.password)
     except Exception as e:  # noqa: BLE001
-        print(f"first login failed: {e}", file=sys.stderr)
-        return 2
+        return 2, f"first login failed: {e}"
     r0 = client.get(portal.init, tok0)
     if classify(r0) == "config":
-        print(f"INIT {portal.init} -> {r0.status}: not servable on this cluster; refusing",
-              file=sys.stderr)
-        return 2
+        return 2, f"INIT {portal.init} -> {r0.status}: not servable on this cluster; refusing"
     tokens, curve, failed = adaptive_login(
         users[1:], lambda u: login(a.authn_url, u, a.password))
     tokens[users[0]] = tok0
     sink({"kind": "login_curve", "users": len(users), "failed": len(failed),
           "curve": curve})
     if failed:
-        print(f"only {len(tokens)}/{len(users)} users logged in; refusing a "
-              f"partial population", file=sys.stderr)
-        return 2
+        return 2, f"only {len(tokens)}/{len(users)} users logged in; refusing a partial population"
     probe_user = users[0]
     stop = threading.Event()
 
@@ -2924,16 +3040,20 @@ def _cmd_drive(a) -> int:
     sink({"kind": "viewer_config", "enabled": viewers, "users": len(tokens),
           "max_coords": REFRESH_MAX_COORDS, "throttle_s": REFRESH_THROTTLE_S,
           "max_inflight_per_user": REFRESH_MAX_INFLIGHT})
-    Driver(client, tokens, portal, think_s=a.think_s, duration_s=a.duration_s,
-           nav_workers=a.nav_workers, call_workers=a.call_workers,
-           sink=sink, composite_routes=a.composite_route or [],
-           burst_users=burst_users,
-           burst_at_s=a.burst_at_s if burst_users else None,
-           viewers=viewers).run()
-    stop.set()
-    if th:
-        th.join(timeout=a.vars_interval + 30)
-    return 0
+    d = Driver(client, tokens, portal, think_s=a.think_s, duration_s=a.duration_s,
+               nav_workers=a.nav_workers, call_workers=a.call_workers,
+               sink=sink, composite_routes=a.composite_route or [],
+               burst_users=burst_users,
+               burst_at_s=a.burst_at_s if burst_users else None,
+               viewers=viewers)
+    try:
+        d.run()
+    finally:
+        navs.extend(d.results)
+        stop.set()
+        if th:
+            th.join(timeout=a.vars_interval + 30)
+    return 0, None
 
 
 _SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -3261,8 +3381,13 @@ def _cmd_check_prefixes(a) -> int:
 
 def _cmd_evaluate(a) -> int:
     recs = []
+    streams = []
     for p in a.inputs:
-        recs.extend(_read_jsonl(p))
+        rs = _read_jsonl(p)
+        recs.extend(rs)
+        s = driver_stream(p, rs)
+        if s is not None:
+            streams.append(s)
     navs = [r for r in recs if r.get("kind") == "nav"]
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     vs = sorted((r for r in recs if r.get("kind") == "vars"
@@ -3282,7 +3407,8 @@ def _cmd_evaluate(a) -> int:
                       image_digests=[r for r in recs if r.get("kind") == "image_digest"],
                       push_refetches=[r for r in recs if r.get("kind") == "push_refetch"],
                       viewer_stats=[r for r in recs if r.get("kind") == "viewer_stats"],
-                      fresh_truncated=[r for r in recs if r.get("kind") == "fresh_truncated"])
+                      fresh_truncated=[r for r in recs if r.get("kind") == "fresh_truncated"],
+                      driver_streams=streams)
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
