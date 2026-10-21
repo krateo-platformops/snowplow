@@ -2494,7 +2494,11 @@ def push_report(fresh: list[dict]) -> dict:
                 # #819 measured: samples after the probe's key rotated
                 # (arm_gen > 0) that the passive tab got NO push for
                 "no_push_after_rotation": sum(1 for f in ctl if (f.get("arm_gen") or 0) > 0
-                                              and f["control_push_ms"] is None)}
+                                              and f["control_push_ms"] is None),
+                # #824: the control never refetches; a real passive tab that
+                # gets a frame on its OLD key refetches and re-arms, so the
+                # count bounds #819's misses from above
+                "no_push_after_rotation_is": "an upper bound"}
     return out
 
 

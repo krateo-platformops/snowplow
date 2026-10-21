@@ -197,6 +197,10 @@ def _functions(*names):
     src = (BENCH_DIR / "run606.sh").read_text()
     out = []
     for n in names:
+        one = next((ln for ln in src.splitlines() if ln.startswith(f"{n}() {{ ")), None)
+        if one is not None:                       # a one-line function
+            out.append(one)
+            continue
         body = src.split(f"\n{n}() {{\n", 1)[1].split("\n}\n", 1)[0]
         out.append(f"{n}() {{\n{body}\n}}")
     return "\n".join(out)
@@ -207,7 +211,7 @@ def test_stop_without_a_pidfile_kills_nothing(tmp_path):
     pidfile is gone, teardown's stop must not kill whatever owns that PID now."""
     victim = subprocess.Popen(["sleep", "30"])
     try:
-        script = (_functions("stop_log_stream")
+        script = (_functions("safe_pid", "take_pid", "stop_log_stream")
                   + f'\nOUT="{tmp_path}"; LOG_STREAM_PIDFILE="{tmp_path}/.log-stream.pid"\n'
                   + f"LOG_STREAM_PID={victim.pid}\nstop_log_stream\n")
         subprocess.run(["bash", "-c", script], check=True, timeout=10)

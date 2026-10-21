@@ -631,7 +631,21 @@ snowplow_pod_record() {
     || log "could not record the snowplow pod ($phase); the verdict will say restart state unknown"
   log "snowplow pod ($phase): $(cat "$OUT/pod-$phase.jsonl" 2>/dev/null | cut -c1-240)"
 }
-TOP_PID=""
+# safe_pid <value>: a PID that may be signalled — a positive integer above 1.
+# `kill 0` signals the caller's whole process group and `kill -1` every
+# process it may signal (#824): never from a corrupt pidfile or variable.
+safe_pid() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 10#$1 > 1 )); }
+# take_pid <pidfile>: print the pidfile's PID and remove the file FIRST, so no
+# later caller (teardown after collect's subshell) signals a reused PID.
+take_pid() {
+  local f="$1" pid
+  [[ -n "$f" && -f "$f" ]] || return 1
+  pid="$(cat "$f")"
+  rm -f "$f"
+  safe_pid "$pid" || return 1
+  echo "$pid"
+}
+TOP_PIDFILE=""
 start_top_loop() {
   if [[ "$DRY" == "1" ]]; then log "DRY: kubectl top loop -> $OUT/top.log"; return 0; fi
   ( while true; do
@@ -639,11 +653,13 @@ start_top_loop() {
       printf '{"kind":"top","t":%s,"raw":"%s"}\n' "$(date +%s)" "$line"
       sleep "$TOP_POLL_S"
     done ) >> "$OUT/top.jsonl" 2>&1 &
-  TOP_PID=$!
+  TOP_PIDFILE="$OUT/.top-loop.pid"
+  echo "$!" > "$TOP_PIDFILE"
 }
 stop_top_loop() {
-  [[ -n "${TOP_PID:-}" ]] && kill "$TOP_PID" 2>/dev/null || true
-  TOP_PID=""
+  local pid
+  pid="$(take_pid "${TOP_PIDFILE:-}")" || return 0
+  kill "$pid" 2>/dev/null || true
 }
 # #822: snowplow's log, streamed for the WHOLE run (env → collect) into
 # $OUT/snowplow-stream.log. A one-shot `kubectl logs` at collect returns only
@@ -707,9 +723,8 @@ start_log_stream() {
 stop_log_stream() {
   local pid
   [[ -n "${LOG_STREAM_PIDFILE:-}" && -f "$LOG_STREAM_PIDFILE" ]] || return 0
-  pid="$(cat "$LOG_STREAM_PIDFILE")"
-  rm -f "$LOG_STREAM_PIDFILE"      # first: no later caller (teardown) kills this PID again
-  touch "$OUT/.log-stream-stop"
+  touch "$OUT/.log-stream-stop"    # the loop ends on its own even if no PID is usable
+  pid="$(take_pid "$LOG_STREAM_PIDFILE")" || return 0
   pkill -TERM -P "$pid" 2>/dev/null || true
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
