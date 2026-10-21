@@ -363,17 +363,41 @@ class ViewerHub:
         self.max_inflight = max_inflight
         self.clock = clock
         self.lock = threading.Lock()
+        # Serializes re-arms: a navigation's view and a refetch's key re-arm
+        # must not interleave (the later one would arm a stale page).
+        self.view_lock = threading.Lock()
         self.streams: dict[str, RefreshStream] = {}
         self.paths: dict[str, dict[str, list[str]]] = {}     # user -> key -> paths
+        self.entries: dict[str, list[dict]] = {}              # user -> armed entries
         self.tokens: dict[str, str] = {}
         self.window: dict[tuple, dict] = {}                   # (user, path) -> {until, pending}
         self.inflight: dict[str, int] = {}
         self.queue: dict[str, list] = {}
         self.stats = {"streams_opened": 0, "frames": 0, "frames_unmatched": 0,
-                      "refetches": 0, "deferred": 0}
+                      "refetches": 0, "deferred": 0, "rearmed_key_changed": 0}
 
     def view(self, user: str, token: str, entries: list[dict]) -> None:
         """The user's tab now shows exactly `entries`: re-arm (one stream)."""
+        with self.view_lock:
+            self._view(user, token, entries)
+
+    def _rearm_key(self, user: str, path: str, key: str) -> None:
+        """A refetch of `path` answered with a different refresh key: the
+        cell's key rotated (it folds identity inputs that change, e.g. the
+        RBAC sub-generation) and the armed one is dead. The SPA re-arms on it
+        (refreshSse.ts recordRefreshHeaders -> the arm hook's entry.key), so
+        the tab does too (#817)."""
+        with self.view_lock:
+            with self.lock:
+                ents = self.entries.get(user) or []
+                if not any(e["path"] == path and e["key"] != key for e in ents):
+                    return                      # re-armed meanwhile, or navigated away
+                ents = [dict(e, key=key) if e["path"] == path else e for e in ents]
+                token = self.tokens[user]
+                self.stats["rearmed_key_changed"] += 1
+            self._view(user, token, ents)
+
+    def _view(self, user: str, token: str, entries: list[dict]) -> None:
         by_key: dict[str, list[str]] = {}
         coords, seen = [], set()
         for e in entries:
@@ -387,6 +411,7 @@ class ViewerHub:
         with self.lock:
             old = self.streams.pop(user, None)
             self.paths[user] = by_key
+            self.entries[user] = list(entries)
             self.tokens[user] = token
         if old is not None:
             old.close()
@@ -440,6 +465,8 @@ class ViewerHub:
                        "wall_ms": round(r.ms, 1), "status": r.status})
             with self.lock:
                 self.stats["refetches"] += 1
+            if r.refresh and r.refresh[0] != key:
+                self._rearm_key(user, path, r.refresh[0])
         finally:
             nxt = None
             with self.lock:
@@ -1024,6 +1051,7 @@ def freshness_probe(client: HttpClient, token: str, path: str,
                     healthy: Callable[[], bool] | None = None,
                     pause_poll_s: float = 5.0, max_pause_s: float = 3600.0,
                     push_since: Callable[[float], float | None] | None = None,
+                    observe: Callable[["Response"], None] | None = None,
                     deadline: float | None = None,
                     clock: Callable[[], float] = time.time,
                     sleep: Callable[[float], None] = time.sleep) -> list[dict]:
@@ -1072,6 +1100,8 @@ def freshness_probe(client: HttpClient, token: str, path: str,
         while clock() - t0 < budget_s:
             polls += 1
             r = client.get(path, token)
+            if observe is not None:
+                observe(r)                  # the armed viewer follows the cell's key
             if r.status == 200 and marker.encode() in r.body:
                 lat = round((clock() - t0) * 1000, 1)
                 break
@@ -2288,7 +2318,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              push_refetches: list[dict] | None = None,
              viewer_stats: list[dict] | None = None,
              fresh_truncated: list[dict] | None = None,
-             driver_streams: list[dict] | None = None) -> dict:
+             driver_streams: list[dict] | None = None,
+             fresh_viewers: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -2397,6 +2428,15 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         "fresh_modes": modes,
         "fresh_push_report_only": push_report(fresh),
         "push_refetch_report_only": push_refetch_report(push_refetches or []),
+        # #817: the probe's viewer, incl. every time its cell's key rotated
+        # under it (it re-arms, like the SPA; run 9 armed once and lost it).
+        "fresh_viewer": {
+            "arms": sum(1 for v in fresh_viewers or [] if v.get("armed") is True),
+            "states": {s: sum(1 for v in fresh_viewers or [] if v.get("state") == s)
+                       for s in sorted({v["state"] for v in fresh_viewers or []
+                                        if v.get("state")})},
+            "key_rotations_t": [v.get("t") for v in fresh_viewers or []
+                                if v.get("state") == "key_rotated"]},
         "fresh_truncated": fresh_truncated or [],
         "nav_kinds": {k: sum(1 for n in navs if n.get("nav") == k)
                       for k in sorted({n.get("nav") for n in navs if n.get("nav")})},
@@ -3201,7 +3241,7 @@ def fresh_phases(client, token, sink, *, modes, rates, mutators, paths, targets,
                 lambda m, mut=mut: mut(probe[0], probe[1], m),
                 samples=samples, poll_ms=poll_ms, gap_s=gap_s,
                 label=label, sink=sink, healthy=healthy,
-                push_since=push_since,
+                push_since=push_since, observe=getattr(stream, "observe", None),
                 deadline=clock() + fresh_phase_budget_s(samples, gap_s))
             if churn:
                 sink({"kind": "churn", "label": label, **churn.stop()})
@@ -3221,24 +3261,66 @@ def arm_probe_viewer(client: HttpClient, token: str, path: str, sink,
         sink({"kind": "fresh_viewer", "armed": False, "status": r.status,
               "why": "no X-Snowplow-Refresh-Key/Class on the probe's /call"})
         return None, None
-    key = ref[0]
-    events: list[float] = []
-    lock = threading.Lock()
-
-    def on_refresh(k, t):
-        if k == key:
-            with lock:
-                events.append(t)
-
-    def push_since(t0):
-        with lock:
-            return next((t for t in events if t >= t0), None)
-
-    stream = stream_factory(client.base, token, [coords], on_refresh,
-                            on_state=lambda st, d: sink({"kind": "fresh_viewer", "state": st,
-                                                         "t": time.time(), **d})).start()
+    viewer = ProbeViewer(client.base, token, coords, ref[0], sink, stream_factory)
     sink({"kind": "fresh_viewer", "armed": True, "class": ref[1]})
-    return push_since, stream
+    return viewer.push_since, viewer
+
+
+class ProbeViewer:
+    """The probe tab's /refreshes viewer on its one cell.
+
+    Like the SPA (refreshSse.ts recordRefreshHeaders -> the arm hook's
+    entry.key dependency), it RE-ARMS when a /call of the cell answers with a
+    different X-Snowplow-Refresh-Key (`observe`, fed every poll): the cell's
+    key folds identity inputs that can change while the tab is open (binding
+    UID, binding-set digest, RBAC sub-generation), and snowplow's armed set is
+    frozen per connection. Run 9: the annotation probe's arm went dead minutes
+    in, and 95 min of samples ran with no viewer, unrecorded (#817)."""
+
+    def __init__(self, base: str, token: str, coords: dict, key: str, sink,
+                 stream_factory=RefreshStream, clock: Callable[[], float] = time.time):
+        self.base, self.token, self.coords = base, token, coords
+        self.sink, self.stream_factory, self.clock = sink, stream_factory, clock
+        self.lock = threading.Lock()
+        self.events: list[float] = []
+        self.key = None
+        self.stream = None
+        self._arm(key)
+
+    def _arm(self, key: str) -> None:
+        def on_refresh(k, t, armed=key):
+            if k == armed:
+                with self.lock:
+                    self.events.append(t)
+        stream = self.stream_factory(
+            self.base, self.token, [self.coords], on_refresh,
+            on_state=lambda st, d: self.sink({"kind": "fresh_viewer", "state": st,
+                                              "t": self.clock(), **d})).start()
+        with self.lock:
+            old, self.stream, self.key = self.stream, stream, key
+        if old is not None:
+            old.close()
+
+    def observe(self, resp: "Response") -> None:
+        """One /call response of the cell: re-arm if its key rotated."""
+        new = resp.refresh[0] if resp.refresh else None
+        with self.lock:
+            old = self.key
+        if new is None or new == old:
+            return
+        self.sink({"kind": "fresh_viewer", "state": "key_rotated", "t": self.clock(),
+                   "old_key": old[:16], "new_key": new[:16]})
+        self._arm(new)
+
+    def push_since(self, t0: float) -> float | None:
+        with self.lock:
+            return next((t for t in self.events if t >= t0), None)
+
+    def close(self) -> None:
+        with self.lock:
+            s, self.stream = self.stream, None
+        if s is not None:
+            s.close()
 
 
 _MEM_FIELDS = (("HeapAlloc", "heap_alloc_mb"), ("HeapInuse", "heap_inuse_mb"),
@@ -3408,7 +3490,8 @@ def _cmd_evaluate(a) -> int:
                       push_refetches=[r for r in recs if r.get("kind") == "push_refetch"],
                       viewer_stats=[r for r in recs if r.get("kind") == "viewer_stats"],
                       fresh_truncated=[r for r in recs if r.get("kind") == "fresh_truncated"],
-                      driver_streams=streams)
+                      driver_streams=streams,
+                      fresh_viewers=[r for r in recs if r.get("kind") == "fresh_viewer"])
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
