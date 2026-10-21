@@ -194,12 +194,16 @@ def test_viewer_does_not_rearm_a_page_it_navigated_away_from(hub):
 
 def test_verdict_reports_the_probe_viewers_key_rotations():
     fv = [{"kind": "fresh_viewer", "armed": True, "class": "restactions"},
-          {"kind": "fresh_viewer", "state": "open", "t": 1.0},
-          {"kind": "fresh_viewer", "state": "key_rotated", "t": 7.0,
-           "old_key": "a", "new_key": "b"},
-          {"kind": "fresh_viewer", "state": "open", "t": 7.1}]
+          {"kind": "fresh_viewer", "role": "probe", "state": "open", "t": 1.0},
+          {"kind": "fresh_viewer", "role": "control", "state": "open", "t": 1.0},
+          {"kind": "fresh_viewer", "role": "probe", "state": "key_rotated", "t": 7.0,
+           "old_key": "a", "new_key": "b", "last_old_t": 6.9, "first_new_t": 7.0},
+          {"kind": "fresh_viewer", "role": "probe", "state": "open", "t": 7.1}]
     rep = load606.evaluate([], [], [], fresh_viewers=fv)["report"]["fresh_viewer"]
-    assert rep == {"arms": 1, "states": {"key_rotated": 1, "open": 2}, "key_rotations_t": [7.0]}
+    assert rep == {"arms": 1, "states": {"key_rotated": 1, "open": 2},
+                   "control_states": {"open": 1},
+                   "key_rotations": [{"after": 6.9, "by": 7.0}],
+                   "disarmed_no_headers_t": []}
 
 
 def test_unchanged_key_does_not_rearm(hub):
