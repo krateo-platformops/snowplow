@@ -1573,7 +1573,38 @@ RUN8_VARS_PREFIXES = (
     "snowplow_build_info",
     "snowplow_customer_resolve_inflight",  # Q3
     "snowplow_stale_retry_",               # Q4 (#740)
+    # #817: when does an identity-bound key rotate? (publish_seq, subgen
+    # bumps / epoch, the refresher's drift declines, the armed-key gauges)
+    "snowplow_rbac_",
+    "snowplow_l1_identity_class_drift",
+    "snowplow_refresh_broadcaster",
 )
+# The identity-class inputs whose movement rotates every identity-bound key
+# that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
+# own count of cells it found minted under a stale class.
+ROTATION_KEYS = ("snowplow_rbac_publish_seq", "snowplow_rbac_subgen_bumps_total",
+                 "snowplow_rbac_subgen_epoch", "snowplow_l1_identity_class_drift_declined_total")
+
+
+def rotation_report(mem: list[dict]) -> dict | None:
+    """#817 report-only: every mem sample at which an identity-class input
+    moved, with the values. An armed /refreshes key goes dead when its cell's
+    key rotates (the armed set is frozen per connection); this dates the
+    rotations so a viewer that stopped being pushed can be matched to one."""
+    rows = sorted((m for m in mem if m.get("kind") == "mem"
+                   and any(k in (m.get("extra") or {}) for k in ROTATION_KEYS)),
+                  key=lambda m: m.get("t") or 0)
+    if not rows:
+        return None
+    changes, prev = [], None
+    for m in rows:
+        cur = {k: _num((m.get("extra") or {}).get(k)) for k in ROTATION_KEYS}
+        if prev is not None and cur != prev:
+            changes.append({"t": m.get("t"), **{k: v for k, v in cur.items()
+                                                 if v != prev.get(k)}})
+        prev = cur
+    first = {k: _num((rows[0].get("extra") or {}).get(k)) for k in ROTATION_KEYS}
+    return {"first": first, "last": prev, "changes": changes}
 # Bars: the #710 / #740 rulings, written here — never derived from the
 # instrument under test.
 STALE_TO_PUSH_P95_BAR_MS = 3000
@@ -2453,6 +2484,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["image_digest"] = {"expected": expected_digest, "gate": image_digests or None}
     report["snowplow_pod"] = snowplow_pods
     report["memory"] = memory_report(mem or [])
+    report["key_rotation_report_only"] = rotation_report(mem or [])
     report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
     fv = [f for f in fresh if f.get("valid") is False]
     report["fresh_invalid_samples"] = len(fv)
