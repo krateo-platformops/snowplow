@@ -13,3 +13,8 @@
 416a6206a1b37b2e8ff5e794247e6e435003787b:internal/resolvers/restactions/api/peer_dispatch_feed_error_test.go:generic-api-key:466
 37b7bce147e7e20365c0e3331e8f39f289a2a4ac:internal/resolvers/restactions/api/refilter.go:generic-api-key:80
 5d2cc5b1b536f629f73f21e0856ef78f6efa1f2f:internal/resolvers/restactions/api/refilter.go:generic-api-key:80
+
+# Synthetic scrubber fixture (#823): the bench log-scrubber test (LEAKS table)
+# feeds a fake token-shaped string to prove it gets redacted. Not a credential.
+# Exactly this one finding; no path or rule allowlist.
+67fdb1e403e97cff4277ba8f0d75c40803e76052:go/snowplow/e2e/bench/tests/test_review823.py:generic-api-key:33
