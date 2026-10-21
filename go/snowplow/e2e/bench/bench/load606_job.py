@@ -41,6 +41,57 @@ def shard_ranges(users: int, shards: int) -> list[tuple[int, int]]:
     return out
 
 
+def split_burst(burst_users: int, ranges: list[tuple[int, int]]) -> list[int]:
+    """The composite burst cohort split over the shards as evenly as their
+    sizes allow; each shard's share comes from its OWN user range."""
+    shards = len(ranges)
+    base, extra = divmod(burst_users, shards)
+    out = [base + (1 if i < extra else 0) for i in range(shards)]
+    for (a, b), n in zip(ranges, out):
+        if n > b - a + 1:
+            raise ValueError(f"burst share {n} exceeds the shard's {b - a + 1} users")
+    return out
+
+
+# The loadgen node (bench/gke.py: 1 x n2-standard-8). GKE allocatable on an
+# n2-standard-8 is ~7910m CPU / ~29 GiB; HEADROOM keeps the node's daemonsets
+# and a margin out of the requests budget.
+LOADGEN_ALLOCATABLE_MCPU = 7910
+LOADGEN_ALLOCATABLE_MI = 29 * 1024
+LOADGEN_HEADROOM_MCPU = 1000
+LOADGEN_HEADROOM_MI = 4 * 1024
+# A driver pod is ONE python process (GIL-bound, ~1 core at most: measured
+# 0.88 cores at saturation, see #825), so it requests the core it can use.
+DRIVER_CPU = "1"
+DRIVER_MEMORY = "1Gi"
+FRESH_CPU, FRESH_MEMORY = "1", "1Gi"
+MEM_CPU, MEM_MEMORY = "250m", "512Mi"
+LOGIN_CONCURRENCY_TOTAL = 64          # run 10's proven authn concurrency
+
+
+def _mcpu(q: str) -> int:
+    return int(q[:-1]) if q.endswith("m") else int(float(q) * 1000)
+
+
+def _mi(q: str) -> int:
+    return int(q[:-2]) * 1024 if q.endswith("Gi") else int(q[:-2])
+
+
+def loadgen_fit(shards: int, driver_cpu: str, driver_memory: str) -> dict:
+    """The loadgen node must hold every Job's requests (shards drivers +
+    fresh606 + mem606) with headroom, or the render refuses: a pod that
+    cannot schedule would leave a shard Pending and the run INVALID."""
+    cpu = shards * _mcpu(driver_cpu) + _mcpu(FRESH_CPU) + _mcpu(MEM_CPU)
+    mem = shards * _mi(driver_memory) + _mi(FRESH_MEMORY) + _mi(MEM_MEMORY)
+    cap_cpu = LOADGEN_ALLOCATABLE_MCPU - LOADGEN_HEADROOM_MCPU
+    cap_mem = LOADGEN_ALLOCATABLE_MI - LOADGEN_HEADROOM_MI
+    if cpu > cap_cpu or mem > cap_mem:
+        raise ValueError(f"loadgen node over budget: {shards} drivers x ({driver_cpu}, "
+                         f"{driver_memory}) + fresh606 + mem606 = {cpu}m / {mem}Mi requested, "
+                         f"budget {cap_cpu}m / {cap_mem}Mi (n2-standard-8 minus headroom)")
+    return {"cpu_m": cpu, "memory_mi": mem, "budget_cpu_m": cap_cpu, "budget_memory_mi": cap_mem}
+
+
 def _indent(text: str, n: int) -> str:
     pad = " " * n
     return "\n".join(pad + ln if ln else ln for ln in text.splitlines())
@@ -52,18 +103,27 @@ def render(*, users: int, shards: int, think_s: float, duration_s: float,
            builders_ns: str = "krateo-system", src: str | None = None,
            composite_routes: list[str] | tuple = (), burst_users: int = 0,
            burst_at_s: float = 600.0, viewers: bool = True,
-           linger_s: float = 3600.0) -> str:
+           linger_s: float = 3600.0, driver_cpu: str = DRIVER_CPU,
+           driver_memory: str = DRIVER_MEMORY) -> str:
     if not init.startswith("/call"):
         raise ValueError("init must be the frontend config.json api.INIT /call path")
+    loadgen_fit(shards, driver_cpu, driver_memory)
     src = LOAD606_SRC.read_text() if src is None else src
     ranges = shard_ranges(users, shards)
-    # Shell case over JOB_COMPLETION_INDEX → this pod's user range.
-    case = "\n".join(f"  {i}) S={a}; E={b};;" for i, (a, b) in enumerate(ranges))
+    bursts = split_burst(burst_users, ranges)
+    # Shell case over JOB_COMPLETION_INDEX → this pod's user range and its
+    # share of the composite burst cohort.
+    case = "\n".join(f"  {i}) S={a}; E={b}; B={n};;"
+                     for i, ((a, b), n) in enumerate(zip(ranges, bursts)))
     portal_args = (f"--init {json.dumps(init)} --frontend-ns {json.dumps(frontend_ns)} "
                    f"--builders-ns {json.dumps(builders_ns)}")
-    # Cold composite-page burst (#710 ruling 3): the last N users of the
-    # LAST shard arrive together at burst_at_s, each deep-linking to one of
-    # the composite routes the preflight derived from the live menu.
+    # Cold composite-page burst (#710 ruling 3): ONE cohort of burst_users,
+    # split evenly over the shards (each reserves the last B users of its own
+    # range), all arriving at burst_at_s after their pod's drive start — the
+    # pods start together, so the cohort arrives within the pods' login-time
+    # skew, which the verdict reports (composite_burst). Split, not repeated
+    # per pod (that would be shards x the burst), and not all in one pod (one
+    # GIL-bound process would queue the whole cohort's calls behind itself).
     burst_args = ""
     if burst_users > 0:
         burst_args = (f" --burst-users \"$BURST\" --burst-at-s {burst_at_s:g}"
@@ -80,12 +140,18 @@ case "$JOB_COMPLETION_INDEX" in
   *) echo "bad index" >&2; exit 2;;
 esac
 VARS=0; [ "$JOB_COMPLETION_INDEX" = "0" ] && VARS=15
-BURST=0; [ "$JOB_COMPLETION_INDEX" = "{shards - 1}" ] && BURST={burst_users}
+BURST=$B
+# One navigation worker per user (a user has at most one navigation in
+# flight): the pool never queues a due navigation (run 10: 128 workers for
+# 1000 users during the first-load arrival). Logins: the shards share authn,
+# so each pod's adaptive ramp is capped at its share of run 10's 64.
+NAVW=$(( E - S + 1 )); [ "$NAVW" -lt 128 ] && NAVW=128
 rc=0
 python3 -u /opt/load606/load606.py drive \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --password {json.dumps(password)} --user-start "$S" --user-end "$E" \\
   --think-s {think_s} --duration-s {duration_s} --vars-interval "$VARS" \\
+  --nav-workers "$NAVW" --login-max-concurrency {max(8, LOGIN_CONCURRENCY_TOTAL // shards)} \\
   {portal_args}{burst_args}{"" if viewers else " --no-viewers"} --out {DRIVE_OUT} || rc=$?
 printf '{{"kind": "drive_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" >> {DRIVE_OUT}
 echo "drive exited rc=$rc; results in {DRIVE_OUT}; holding {linger_s:g}s for collect"
@@ -142,8 +208,8 @@ spec:
 {_indent(script, 10)}
         resources:
           requests:
-            cpu: "3"
-            memory: 4Gi
+            cpu: {json.dumps(driver_cpu)}
+            memory: {driver_memory}
         readinessProbe:
           exec:
             command: ["test", "-f", "/out/done"]
@@ -285,6 +351,10 @@ spec:
         args:
         - |
 {_indent(script, 10)}
+        resources:
+          requests:
+            cpu: {MEM_CPU}
+            memory: {MEM_MEMORY}
         volumeMounts:
         - name: src
           mountPath: /opt/load606
@@ -400,8 +470,8 @@ spec:
 {_indent(script, 10)}
         resources:
           requests:
-            cpu: "1"
-            memory: 1Gi
+            cpu: {json.dumps(FRESH_CPU)}
+            memory: {FRESH_MEMORY}
         volumeMounts:
         - name: src
           mountPath: /opt/load606
@@ -418,6 +488,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--shards", type=int, default=2)
     p.add_argument("--think-s", type=float, default=60.0)
     p.add_argument("--duration-s", type=float, default=1800.0)
+    p.add_argument("--driver-cpu", default=DRIVER_CPU, help="CPU request per driver pod")
+    p.add_argument("--driver-memory", default=DRIVER_MEMORY, help="memory request per driver pod")
     p.add_argument("--linger-s", type=float, default=3600.0,
                    help="how long a finished driver pod stays up for collect (kubectl cp)")
     p.add_argument("--snowplow-url", required=True)
@@ -466,7 +538,8 @@ def main(argv: list[str] | None = None) -> int:
                             builders_ns=a.builders_ns,
                             composite_routes=a.composite_route or [],
                             burst_users=a.burst_users, burst_at_s=a.burst_at_s,
-                            viewers=not a.no_viewers, linger_s=a.linger_s))
+                            viewers=not a.no_viewers, linger_s=a.linger_s,
+                            driver_cpu=a.driver_cpu, driver_memory=a.driver_memory))
     if a.mem_duration_s > 0:
         sys.stdout.write(render_mem(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,
@@ -487,4 +560,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except ValueError as e:          # a plan the loadgen node or the users cannot hold
+        print(f"refusing the load plan: {e}", file=sys.stderr)
+        sys.exit(2)

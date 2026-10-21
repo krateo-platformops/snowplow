@@ -257,7 +257,7 @@ def test_run606_runs_the_composite_burst_and_the_run8_report(harness):
     assert p.returncode == 0, out[-3000:]
     assert "composite pages for the cold burst: /observability /compositions" in out
     job = (tmp / "out" / "loadgen-job.yaml").read_text()
-    assert '--burst-users "$BURST"' in job and "BURST=2" in job
+    assert '--burst-users "$BURST"' in job and "B=2;;" in job
     assert '--composite-route "/observability"' in job and '--composite-route "/compositions"' in job
     for prefix in load606.RUN8_VARS_PREFIXES:
         assert f'--vars-prefix "{prefix}"' in job

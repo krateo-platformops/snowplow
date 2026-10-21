@@ -79,6 +79,10 @@ MEASURE_STARTED=0
 COLLECTED=0
 SCALE="${SCALE:-50000}"
 USERS="${USERS:-1000}"
+# #825: the driver as N pods x USERS/N users (Indexed Job), each its own
+# GIL-bound process and framed /out stream. Run 10 (one pod, 1000 users)
+# missed its schedule in the first-load arrival.
+DRIVER_SHARDS="${DRIVER_SHARDS:-4}"
 NAMESPACES="${NAMESPACES:-50}"
 THINK_S="${THINK_S:-60}"
 DRIVE_S="${DRIVE_S:-1800}"
@@ -542,7 +546,7 @@ s_measure() {
   #             list_dep@<rate>; the verdict gates at 10/s, reports the rest),
   #             mutating through the Kubernetes API with its own SA.
   # shellcheck disable=SC2086
-  python3 -m bench.load606_job --users "$USERS" --shards 1 \
+  python3 -m bench.load606_job --users "$USERS" --shards "$DRIVER_SHARDS" \
       --think-s "$THINK_S" --duration-s "$DRIVE_S" \
       --linger-s "$(( MEASURE_WAIT_S + COLLECT_CAP_S ))" \
       --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" --password "$PW" \
@@ -815,7 +819,8 @@ s_evaluate() {
   local r8=()
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
-      --expect-digest "$EXPECTED_IMAGE_DIGEST" > "$OUT/verdict.json" || vrc=$?
+      --expect-digest "$EXPECTED_IMAGE_DIGEST" --expect-driver-streams "$DRIVER_SHARDS" \
+      --expect-users "$USERS" > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
   # Every INVALID reason in the run log, not only in verdict.json (#817: run
   # 9's zero navigations surfaced only as `warm_navs 0`).

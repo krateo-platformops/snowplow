@@ -195,12 +195,23 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         # The driver's /out/nav.jsonl (#817). FAKE_DRIVE_STREAM: whole (a framed
         # stream) | headcut (run 9: only the tail after log rotation) | nofile.
         time.sleep(float(os.environ.get("FAKE_SLOW_LOGS", "0")))   # a slow / hung read
-        mode = os.environ.get("FAKE_DRIVE_STREAM", "whole")
+        # #825: FAKE_DRIVER_PODS shards, FAKE_USERS_PER_POD users each; a bad
+        # stream mode hits every pod, or only FAKE_BAD_POD's when it is set
+        idx = int(next(x for x in a if x.startswith("load606")).split(":")[0].split("-")[-1])
+        k = int(os.environ.get("FAKE_USERS_PER_POD", "0"))
+        bad = os.environ.get("FAKE_BAD_POD")
+        mode = (os.environ.get("FAKE_DRIVE_STREAM", "whole")
+                if bad is None or int(bad) == idx else "whole")
         if mode == "nofile":
             print("tar: /out/nav.jsonl: Cannot stat", file=sys.stderr); sys.exit(1)
+        lag = float(os.environ.get("FAKE_POD_LAG_MS", "1")) if str(idx) == os.environ.get(
+            "FAKE_LAGGING_POD") else 1
         navs = [{"kind": "nav", "user": "scaleuser-0001", "page": "p", "visit": v,
-                 "wall_ms": 50, "calls": 3, "errors": 0, "sched_lag_ms": 1} for v in (1, 2)]
-        recs = ([{"kind": "drive_start", "t": 1.0}] + navs
+                 "wall_ms": 50, "calls": 3, "errors": 0, "sched_lag_ms": lag} for v in (1, 2)]
+        start = {"kind": "drive_start", "t": 1.0}
+        if k:
+            start.update(user_start=idx * k + 1, user_end=idx * k + k)
+        recs = ([start] + navs
                 + [{"kind": "drive_end", "t": 2.0, "ok": True, "rc": 0, "reason": None,
                     "navs": 2}, {"kind": "drive_exit", "rc": 0, "t": 2}])
         if mode == "headcut":
@@ -279,10 +290,12 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             state = ({"terminated": {"reason": "OOMKilled", "exitCode": 137,
                                      "finishedAt": "2026-10-21T06:40:00Z"}}
                      if dead else {"running": {}})
-            items([{"metadata": {"name": f"{job}-0"},
+            n = int(os.environ.get("FAKE_DRIVER_PODS", "1")) if job == "load606" else 1
+            items([{"metadata": {"name": f"{job}-{i}"},
                     "status": {"phase": "Failed" if dead else "Running",
                                "containerStatuses": [{"name": "c", "ready": not dead,
-                                                      "restartCount": 0, "state": state}]}}])
+                                                      "restartCount": 0, "state": state}]}}
+                   for i in range(n)])
         if what == "pods":
             items([{"metadata": {"name": "ok-0", "namespace": "krateo-system"},
                     "spec": {"nodeName": "n1"}, "status": {"phase": "Running",
@@ -335,7 +348,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print(json.dumps({"items": [svc("snowplow"), svc("authn"), svc("frontend")]}))
             sys.exit(0)
         if what == "pods" and "job-name=load606" in a:
-            print("pod/load606-0"); sys.exit(0)
+            n = int(os.environ.get("FAKE_DRIVER_PODS", "1"))
+            print("\\n".join(f"pod/load606-{i}" for i in range(n))); sys.exit(0)
         if what == "pods" and "job-name=fresh606" in a:
             print("pod/fresh606-0"); sys.exit(0)
         if what == "pods" and "job-name=mem606" in a:
@@ -359,7 +373,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                 print(f"2026-10-21T05:00:00Z {names[min(n // 2, len(names) - 1)]} ")
             sys.exit(0)
         if what == "job/load606":                       # ready/failed/completions
-            print("/1/1" if os.environ.get("FAKE_DRIVER_FAILED") == "1" else "1//1")
+            n = int(os.environ.get("FAKE_DRIVER_PODS", "1"))
+            print(f"/1/{n}" if os.environ.get("FAKE_DRIVER_FAILED") == "1" else f"{n}//{n}")
             sys.exit(0)
         if what == "job" and "preflight606" in a:
             refused = os.environ.get("FAKE_PREFLIGHT", "ok") == "refused"
@@ -525,7 +540,8 @@ def harness(tmp_path):
         "RUN_NAME": RUN_NAME, "INSTALLER_VERSION": "0.3.422",
         "SNOWPLOW_TAG": "1.12.46", "OUT": str(tmp_path / "out"),
         "EXPECTED_IMAGE_DIGEST": FAKE_DIGEST, "FAKE_IMAGE_DIGEST": FAKE_DIGEST,
-        "SCALE": "4", "NAMESPACES": "2", "USERS": "2",
+        "SCALE": "4", "NAMESPACES": "2", "USERS": "2", "DRIVER_SHARDS": "1",
+        "COMPOSITE_BURST_USERS": "2",
         "THINK_S": "0", "DRIVE_S": "1", "CHURN_RATES": "1",
         "FRESH_SAMPLES": "2", "FRESH_GAP_S": "0", "HOLD_PROBE_WAIT_S": "0",
         "PLATFORM_TIMEOUT_S": "1", "PLATFORM_POLL_S": "0.2",
@@ -585,7 +601,7 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     assert verdict["report"]["navs"] == 2
     framing = [c for c in verdict["validity"] if c["check"].startswith("driver.stream")]
     assert [(c["check"], c["result"]) for c in framing] == [
-        ("driver.stream_complete[nav-load606-0.jsonl]", "PASS")]
+        ("driver.stream_complete[nav-load606-0.jsonl]", "PASS"), ("driver.streams", "PASS")]
     gated = [c["check"] for c in verdict["checks"] if c["check"].startswith("fresh_p95")]
     assert gated == ["fresh_p95_ms[list_dep@10]"]          # ruling: gate at 10/s
     assert set(verdict["report"]["fresh_curve_report_only"]) == {"list_dep@1", "list_dep@50"}

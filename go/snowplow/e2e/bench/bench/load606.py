@@ -1398,12 +1398,21 @@ def login_report(curves: list[dict]) -> dict | None:
     rows = [r for c in curves for r in c.get("curve", [])]
     base = next((r for r in rows if r.get("phase") == "baseline"), {})
     meds = [r["median_ms"] for r in rows if r.get("median_ms") is not None]
+    # #825: driver shards log in CONCURRENTLY, one curve each. authn saw the
+    # SUM of their concurrencies, and the login phase lasted as long as the
+    # slowest shard's — never the sum of their batch walls.
+    per_pod_max = [max((r.get("concurrency", 1) for r in c.get("curve", [])), default=1)
+                   for c in curves]
+    per_pod_wall = [sum(r.get("batch_wall_ms") or 0 for r in c.get("curve", []))
+                    for c in curves]
     return {"users": sum(c.get("users", 0) for c in curves),
             "failed": sum(c.get("failed", 0) for c in curves),
+            "pods": len(curves),
             "baseline_single_login_ms": base.get("median_ms"),
             "median_login_ms": pct(meds, 50),
-            "max_concurrency": max((r.get("concurrency", 1) for r in rows), default=1),
-            "total_batch_wall_s": round(sum(r.get("batch_wall_ms") or 0 for r in rows) / 1000, 1),
+            "max_concurrency": max(per_pod_max),
+            "max_concurrency_all_pods": sum(per_pod_max),
+            "total_batch_wall_s": round(max(per_pod_wall) / 1000, 1),
             "curve": rows,
             "finding": "authn: per-login latency (x509 CSR issued per login) is a user-facing number"}
 
@@ -2552,7 +2561,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              fresh_viewers: list[dict] | None = None,
              mem_streams: list[dict] | None = None,
              job_pods: list[dict] | None = None,
-             viewer_dead: list[dict] | None = None) -> dict:
+             viewer_dead: list[dict] | None = None,
+             expect_driver_streams: int | None = None,
+             expect_users: int | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -2637,6 +2648,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
                                 "page-load times to evaluate"})
     if driver_streams is not None:
         validity.extend(driver_stream_checks(driver_streams))
+        validity.extend(shard_checks(driver_streams, job_pods or [], expect_driver_streams,
+                                     expect_users, th["max_sched_lag_p95_ms"]))
     if mem_streams is not None:
         # Required once mem606 was deployed (it has a job_pod record): a
         # memory capture that never arrived is INVALID, not silently absent.
@@ -2672,12 +2685,10 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         # under it (it re-arms, like the SPA; run 9 armed once and lost it).
         "fresh_viewer": fresh_viewer_report(fresh_viewers or []),
         # #817 re-gate: the driver's tabs left armed on a rotated-away key
-        "viewer_dead_report_only": ({
-            "samples": len(viewer_dead),
-            "tabs_dead_max": max(int(v.get("tabs_dead") or 0) for v in viewer_dead),
-            "tabs_dead_last": viewer_dead[-1].get("tabs_dead"),
-            "dead_keys_seen_last": viewer_dead[-1].get("dead_keys_seen")}
-            if viewer_dead else None),
+        "viewer_dead_report_only": viewer_dead_report(viewer_dead or [], driver_streams),
+        # #825: the cold composite cohort is split over the driver pods; its
+        # arrival spread is the pods' start skew
+        "composite_burst": composite_burst_report(navs),
         "fresh_truncated": fresh_truncated or [],
         "nav_kinds": {k: sum(1 for n in navs if n.get("nav") == k)
                       for k in sorted({n.get("nav") for n in navs if n.get("nav")})},
@@ -3009,6 +3020,81 @@ def framed_stream_checks(f: Framing, streams: list[dict], *, required: bool) -> 
     return out
 
 
+def viewer_dead_report(viewer_dead: list[dict], streams: list[dict] | None) -> dict | None:
+    """The driver's tabs left armed on a rotated-away key. Each pod samples
+    ITS tabs, so with several pods the totals are sums of per-pod values
+    (a merged series' last sample would be one pod's)."""
+    if not viewer_dead:
+        return None
+    per = [s for s in streams or [] if s.get("viewer_dead_last")]
+    if len(per) > 1:
+        return {"samples": len(viewer_dead), "pods": len(per),
+                "tabs_dead_last": sum(int(s["viewer_dead_last"].get("tabs_dead") or 0) for s in per),
+                "tabs_dead_max_by_pod": {s["path"]: s.get("viewer_dead_max") for s in per}}
+    return {"samples": len(viewer_dead),
+            "tabs_dead_max": max(int(v.get("tabs_dead") or 0) for v in viewer_dead),
+            "tabs_dead_last": viewer_dead[-1].get("tabs_dead"),
+            "dead_keys_seen_last": viewer_dead[-1].get("dead_keys_seen")}
+
+
+def composite_burst_report(navs: list[dict]) -> dict | None:
+    """The cold composite cohort: how many arrived, and over how long (one
+    pod: ~0; split over pods: their start skew)."""
+    b = [n for n in navs if n.get("nav") == "composite_first_load"]
+    if not b:
+        return None
+    starts = sorted(n["start"] for n in b if n.get("start") is not None)
+    w = [n["wall_ms"] for n in b]
+    return {"users": len(b), "failed": sum(1 for n in b if n.get("first_load_failed")),
+            "arrival_spread_s": round(starts[-1] - starts[0], 1) if starts else None,
+            "wall_p50_ms": pct(w, 50), "wall_p95_ms": pct(w, 95)}
+
+
+def shard_checks(streams: list[dict], job_pods: list[dict], expect_n: int | None,
+                 expect_users: int | None, lag_bar: float) -> list[dict]:
+    """#825: the driver runs as N pods, each owning a user range and writing
+    its own stream. Every pod's stream must be collected (a missing one is
+    named by its pod), the ranges must be disjoint and cover 1..users, and
+    the schedule must hold in EVERY pod, not only overall (one starved pod
+    can hide inside a 4-pod p95)."""
+    out = []
+    if expect_n is not None:
+        have = {s["path"] for s in streams}
+        pods = sorted(r["pod"] for r in job_pods if r.get("job") == "load606" and r.get("pod"))
+        missing = [p for p in pods if f"nav-{p}.jsonl" not in have]
+        why = None
+        if len(streams) != expect_n or missing:
+            why = (f"collected {len(streams)} of {expect_n} driver streams"
+                   + (f"; no stream from pod(s) {', '.join(missing)}" if missing else ""))
+        out.append({"check": "driver.streams", "value": len(streams),
+                    "bar": f"== {expect_n} (one per driver pod)",
+                    "result": "FAIL" if why else "PASS", **({"why": why} if why else {})})
+    ranges = sorted((s["users"], s["path"]) for s in streams if s.get("users"))
+    if ranges and (expect_n is not None or len(streams) > 1):
+        why = [f"{s['path']} has no user range (no drive_start)"
+               for s in streams if not s.get("users")]
+        for ((a1, b1), p1), ((a2, b2), p2) in zip(ranges, ranges[1:]):
+            if a2 <= b1:
+                why.append(f"{p1} ({a1}-{b1}) and {p2} ({a2}-{b2}) overlap")
+            elif a2 != b1 + 1:
+                why.append(f"users {b1 + 1}-{a2 - 1} belong to no stream")
+        if expect_users is not None:
+            if ranges[0][0][0] != 1:
+                why.append(f"users 1-{ranges[0][0][0] - 1} belong to no stream")
+            if ranges[-1][0][1] != expect_users:
+                why.append(f"the streams end at user {ranges[-1][0][1]}, not {expect_users}")
+        out.append({"check": "driver.user_ranges",
+                    "value": [f"{a}-{b}" for (a, b), _ in ranges],
+                    "bar": f"disjoint, covering 1..{expect_users or '?'}",
+                    "result": "FAIL" if why else "PASS",
+                    **({"why": "; ".join(why)} if why else {})})
+    if expect_n is not None or len(streams) > 1:
+        for s in streams:
+            _check(f"driver.sched_lag_p95_ms[{s['path']}]", s.get("lag_p95_ms"), "<=",
+                   lag_bar, out)
+    return out
+
+
 def driver_stream(path: str, recs: list[dict]) -> dict | None:
     return framed_stream(DRIVER_FRAMING, path, recs)
 
@@ -3327,10 +3413,12 @@ def _drive(a, sink, navs: list["NavResult"]) -> tuple[int, str | None]:
     if classify(r0) == "config":
         return 2, f"INIT {portal.init} -> {r0.status}: not servable on this cluster; refusing"
     tokens, curve, failed = adaptive_login(
-        users[1:], lambda u: login(a.authn_url, u, a.password))
+        users[1:], lambda u: login(a.authn_url, u, a.password),
+        cmax=a.login_max_concurrency)
     tokens[users[0]] = tok0
     sink({"kind": "login_curve", "users": len(users), "failed": len(failed),
-          "curve": curve})
+          "user_start": a.user_start, "user_end": a.user_end,
+          "cmax": a.login_max_concurrency, "curve": curve})
     if failed:
         return 2, f"only {len(tokens)}/{len(users)} users logged in; refusing a partial population"
     probe_user = users[0]
@@ -3802,6 +3890,15 @@ def _cmd_evaluate(a) -> int:
         recs.extend(rs)
         s = driver_stream(p, rs)
         if s is not None:
+            # #825: per POD, for the per-pod schedule check and the shard map
+            start = next((r for r in rs if r.get("kind") == "drive_start"), {})
+            s["users"] = ((start["user_start"], start["user_end"])
+                          if "user_start" in start and "user_end" in start else None)
+            s["lag_p95_ms"] = pct([r.get("sched_lag_ms", 0) for r in rs
+                                   if r.get("kind") == "nav"], 95)
+            dead = [r for r in rs if r.get("kind") == "viewer_dead"]
+            s["viewer_dead_last"] = dead[-1] if dead else None
+            s["viewer_dead_max"] = max((int(r.get("tabs_dead") or 0) for r in dead), default=None)
             streams.append(s)
         ms = framed_stream(MEM_FRAMING, p, rs)
         if ms is not None:
@@ -3831,7 +3928,9 @@ def _cmd_evaluate(a) -> int:
                       mem_streams=mem_streams,
                       job_pods=[r for r in recs if r.get("kind") == "job_pod"],
                       viewer_dead=sorted((r for r in recs if r.get("kind") == "viewer_dead"),
-                                         key=lambda r: r.get("t") or 0))
+                                         key=lambda r: r.get("t") or 0),
+                      expect_driver_streams=a.expect_driver_streams,
+                      expect_users=a.expect_users)
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
@@ -3859,6 +3958,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--think-s", type=float, default=60.0)
     d.add_argument("--duration-s", type=float, default=1800.0)
     d.add_argument("--nav-workers", type=int, default=128)
+    d.add_argument("--login-max-concurrency", type=int, default=64,
+                   help="cap of the adaptive login ramp (shards share authn)")
     d.add_argument("--call-workers", type=int, default=512)
     d.add_argument("--vars-interval", type=float, default=15.0)
     d.add_argument("--no-viewers", action="store_true",
@@ -3956,6 +4057,10 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("inputs", nargs="+")
     e.add_argument("--expect-digest", default=None,
                    help="INVALID (VOID) unless the image-digest gate and pod records show this digest")
+    e.add_argument("--expect-driver-streams", type=int, default=None,
+                   help="the driver's shard count: every shard's stream must be collected")
+    e.add_argument("--expect-users", type=int, default=None,
+                   help="the shards' user ranges must cover 1..N exactly")
     e.add_argument("--run8", action="store_true",
                    help="add the #710 run-8 memory-risk / stale_to_push report and checks")
     e.set_defaults(func=_cmd_evaluate)

@@ -545,7 +545,7 @@ def test_loadgen_job_renders_pinned_to_loadgen_pool_with_source():
     assert spec["tolerations"][0]["value"] == "loadgen"
     assert job["spec"]["completionMode"] == "Indexed"
     script = spec["containers"][0]["args"][0]
-    assert "0) S=1; E=500;;" in script and "1) S=501; E=1000;;" in script
+    assert "0) S=1; E=500; B=0;;" in script and "1) S=501; E=1000; B=0;;" in script
     assert '--init "/call?resource=layouts&name=app-shell&x=1"' in script
     assert "--page" not in script            # no hard-coded page roots any more
 
