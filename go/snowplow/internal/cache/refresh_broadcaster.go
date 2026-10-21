@@ -500,6 +500,11 @@ func (h *refreshBroadcaster) fanoutRefresh(l1Key string) {
 func (s *refreshSub) offerRefresh(l1Key string) {
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
+	s.offerRefreshLocked(l1Key)
+}
+
+// offerRefreshLocked is offerRefresh's body. Caller holds s.pmu.
+func (s *refreshSub) offerRefreshLocked(l1Key string) {
 	if s.closed || s.resynced {
 		return
 	}
@@ -904,8 +909,11 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 // deferred (never dropped) into the un-paced refresh pending set when the
 // sink is full. The volume is bounded by the armed set (<= refreshSubMaxEntries,
 // once per key), and the SPA paces the refetches the frames trigger (its
-// in-flight cap, per-widget throttle and queue). Only keys this connection
-// armed are offered: the frame never reaches another connection.
+// in-flight cap, per-widget throttle and queue). A key already waiting in the
+// PACED eviction backlog is moved out of it onto this path (it is the same
+// frame; left there it would drain at the eviction rate, #828 re-gate nit 1).
+// Only keys this connection armed are offered: the frame never reaches another
+// connection.
 func (s *refreshSub) offerRotated(keys []string) {
 	h := s.hub
 	h.mu.RLock()
@@ -914,7 +922,10 @@ func (s *refreshSub) offerRotated(keys []string) {
 		if _, armed := s.keys[k]; !armed {
 			continue
 		}
-		s.offerRefresh(k)
+		s.pmu.Lock()
+		delete(s.pending, k) // drainEvictions / trySendDeferred skip a key no longer pending
+		s.offerRefreshLocked(k)
+		s.pmu.Unlock()
 		refreshRotationAnnouncedTotal.Add(1)
 	}
 }

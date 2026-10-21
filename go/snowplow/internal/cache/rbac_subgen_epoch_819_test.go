@@ -46,6 +46,7 @@ func TestIssue819_R1_ReadinessFlipSettlesTheEpochBeforeReady(t *testing.T) {
 
 	roleHandler682.OnUpdate(role682(noRule682), role682(cmRule682)) // an edit in the window
 	before := identityKeys682()
+	builtBefore := ReadySettleStatsSnapshot().BuiltAtFlip
 	if BindingsByGVRIndexBuilt() || RBACSubGenEpoch() != 0 {
 		t.Fatal("precondition: the index must be unbuilt and the epoch 0 before the flip")
 	}
@@ -61,6 +62,9 @@ func TestIssue819_R1_ReadinessFlipSettlesTheEpochBeforeReady(t *testing.T) {
 	}
 	if !IsPhase1Done() {
 		t.Fatal("R1: MarkPhase1Done did not flip readiness")
+	}
+	if got := ReadySettleStatsSnapshot().BuiltAtFlip - builtBefore; got != 1 {
+		t.Fatalf("R1: built_at_flip moved by %d, want 1 — the settle that built before Ready must be counted", got)
 	}
 	after := identityKeys682()
 	if before["restactions"] == after["restactions"] {

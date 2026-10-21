@@ -68,6 +68,7 @@ package cache
 
 import (
 	"expvar"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -210,7 +211,7 @@ func settleBindingsIndexBeforeReady() {
 			readySettlePanics.Add(1)
 			slog.Error("cache.bindings_by_gvr.ready_settle_panic",
 				slog.String("subsystem", "cache"),
-				slog.Any("panic", r),
+				slog.String("panic_type", fmt.Sprintf("%T", r)), // metadata only, never the value
 				slog.String("effect", "readiness flips anyway; the boot pass's own build settles the #682 epoch later"))
 		}
 	}()

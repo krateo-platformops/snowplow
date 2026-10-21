@@ -15,6 +15,10 @@ package cache
 //   O1  RefreshStream.Rotated offers only keys THIS connection armed.
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,11 +133,24 @@ func TestIssue819_P2_PublishBetweenRequestAndRecheck_RecheckBuilds(t *testing.T)
 func TestIssue819_P3_PanicInSettleIsRecovered_ReadyStillFlips(t *testing.T) {
 	pendingInitialPublishWatcher(t)
 	rbacSnap.Store(partial819())
-	hook := func() { panic("P3: settle panic") }
+	const panicValue = "P3-settle-panic-value"
+	hook := func() { panic(panicValue) }
 	readySettleAfterRequestHookForTest.Store(&hook)
 	before := ReadySettleStatsSnapshot().Panics
+	logs := &lockedBuffer819{}
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	defer slog.SetDefault(prevLogger)
 
 	MarkPhase1Done() // must not panic out
+	slog.SetDefault(prevLogger)
+	out := logs.String()
+	if !strings.Contains(out, "ready_settle_panic") || !strings.Contains(out, "panic_type=string") {
+		t.Fatalf("P3: the recovered panic was not logged with its type: %q", out)
+	}
+	if strings.Contains(out, panicValue) {
+		t.Fatal("P3: the recovered panic's VALUE reached the log — log only its type (metadata only)")
+	}
 
 	if !IsPhase1Done() {
 		t.Fatal("P3 RED: a panic in the settle skipped the flip — /readyz would stay 503 for good")
@@ -180,4 +197,23 @@ loop:
 		t.Fatalf("O1: another connection received %q from this connection's rotation", k)
 	default:
 	}
+}
+
+// lockedBuffer819 is a goroutine-safe log sink (other goroutines may log while
+// the default logger points at it).
+type lockedBuffer819 struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer819) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer819) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
