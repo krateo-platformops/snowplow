@@ -20,6 +20,15 @@
 // a `bench_frame{frame:start}` point first (setup), `{frame:end}` last
 // (teardown), and handleSummary's /out/k6-summary.json with the totals the
 // evaluator matches against the stream.
+//
+// The open tabs (#830 ruling, option A): after every page load k6 writes one
+// line to its console, which `k6 run --log-format raw --console-output
+// /feed/nav.jsonl` turns into a JSON-lines feed on an emptyDir shared with the
+// viewer sidecar (load606.py view-feed): {kind: nav, nav, user, route, t_end,
+// ok, shell?, page} with the refresh key and class each widget ACTUALLY
+// answered with. The sidecar re-arms that user's /refreshes stream on exactly
+// those widgets — no schedule to predict, no second walk. Framed by
+// feed_start (setup) and feed_end (teardown).
 import http from 'k6/http'
 import exec from 'k6/execution'
 import { SharedArray } from 'k6/data'
@@ -99,6 +108,20 @@ export const options = {
   teardownTimeout: '60s',
 }
 
+function feed (rec) {
+  if (CFG.viewers) console.log(JSON.stringify(rec))
+}
+
+function navId () {
+  return `${exec.scenario.name}:${exec.scenario.iterationInTest}`
+}
+
+function refreshOf (r) {
+  const key = r.headers['X-Snowplow-Refresh-Key']
+  const cls = r.headers['X-Snowplow-Refresh-Class']
+  return key && cls ? { key, cls } : null
+}
+
 function headers (user) {
   return { Authorization: `Bearer ${TOKENS[user - 1]}` }
 }
@@ -112,7 +135,7 @@ function fetcher (user, tags) {
       params: { headers: headers(user), tags: Object.assign({ level: String(depth) }, tags),
                 timeout: '60s' },
     }))
-    return http.batch(reqs).map((r) => ({ status: r.status, body: r.body || '' }))
+    return http.batch(reqs).map((r) => ({ status: r.status, body: r.body || '', refresh: refreshOf(r) }))
   }
 }
 
@@ -140,9 +163,13 @@ function doFirstLoad (user, deepLink) {
   const fl = firstLoad(PORTAL, fetcher(user, { kind }), deepLink)
   const calls = fl.shell.calls + (fl.content ? fl.content.calls : 0)
   const errors = fl.shell.errors + (fl.content ? fl.content.errors : 0)
-  record(start, kind, fl.target ? fl.target.path : '(none)', 'first', calls, errors)
-  if (firstLoadFailed(fl)) FIRST_FAILED.add(1, { kind })
+  const route = fl.target ? fl.target.path : '(none)'
+  record(start, kind, route, 'first', calls, errors)
+  const failed = firstLoadFailed(fl)
+  if (failed) FIRST_FAILED.add(1, { kind })
   else checkRoutes(fl.routes)
+  feed({ kind: 'nav', nav: navId(), user, route, t_end: Date.now() / 1000, ok: !failed,
+         shell: fl.shell.armed, page: fl.content ? fl.content.armed : [] })
 }
 
 function routeClick (user, visit, firstPath) {
@@ -154,6 +181,8 @@ function routeClick (user, visit, firstPath) {
   const start = Date.now()
   const w = walkTree([route.endpoint], fetcher(user, { kind: 'route' }))
   record(start, 'route', route.path, seen ? 'warm' : 'first', w.calls, w.errors)
+  feed({ kind: 'nav', nav: navId(), user, route: route.path, t_end: Date.now() / 1000, ok: true,
+         page: w.armed })
 }
 
 export function navigate () {
@@ -177,8 +206,14 @@ export function burstNavigate () {
              CFG.compositeRoutes[b % CFG.compositeRoutes.length])
 }
 
-export function setup () { FRAME.add(1, { frame: 'start' }) }
-export function teardown () { FRAME.add(1, { frame: 'end' }) }
+export function setup () {
+  FRAME.add(1, { frame: 'start' })
+  feed({ kind: 'feed_start', t: Date.now() / 1000 })
+}
+export function teardown () {
+  FRAME.add(1, { frame: 'end' })
+  feed({ kind: 'feed_end', t: Date.now() / 1000 })
+}
 
 export function handleSummary (data) {
   const keep = {}

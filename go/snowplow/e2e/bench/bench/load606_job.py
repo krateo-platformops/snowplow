@@ -435,12 +435,28 @@ def preflight_routes(path: str) -> list[dict]:
             if r.get("endpoint") and r.get("status") == 200]
 
 
+# The frontend's config.json (installer default, values.schema.json:2552-2556 at
+# 0.3.430) points the SPA at localhost:8081 snowplow, :8082 authn and :8083
+# events. :8083 is the sse-proxy (the /notifications firehose behind live
+# widget refresh, ui/src/hooks/useLiveRefresh.ts:18-21): Service
+# krateo-sse-proxy (installer compositions.yaml:790,803 pin the release name to
+# the component name; chart krateo-sse-proxy 0.1.15 templates/service.yaml:4 +
+# _helpers.tpl:20-31 make it the Service name) on port 8080
+# (templates/service.yaml:14, values.yaml:36; exposure.port is unset, so
+# compositions.yaml:153 leaves it).
+K6_BROWSER_FORWARDS = ("8080=frontend.krateo-system.svc:8080",
+                       "8081=snowplow.krateo-system.svc:8081",
+                       "8082=authn.krateo-system.svc:8082",
+                       "8083=krateo-sse-proxy.krateo-system.svc:8080")
+
+
 def render_k6_driver(a) -> str:
     """#830: the k6 load Job and the real-Chrome Job, from the CLI args."""
     import os
 
     from bench import k6_job, rbac_model
-    k6_job.loadgen_fit(a.loadgen_machine_type, k6_job.k6_plan_requests())
+    viewers = not a.no_viewers
+    k6_job.loadgen_fit(a.loadgen_machine_type, k6_job.k6_plan_requests(viewers=viewers))
     if a.preflight_file and os.path.exists(a.preflight_file):
         routes = preflight_routes(a.preflight_file)
     elif a.dry_run:
@@ -460,13 +476,11 @@ def render_k6_driver(a) -> str:
                            duration_s=a.duration_s, burst_at_s=a.burst_at_s,
                            composite_routes=a.composite_route or (
                                [routes[0]["path"]] if a.dry_run else []),
-                           browser_users=[s["index"] for s in sessions])
+                           browser_users=[s["index"] for s in sessions], viewers=viewers)
     bcfg = k6_job.browser_config(sessions=sessions, routes=[r["path"] for r in routes],
                                  password=a.password, think_s=a.browser_think_s,
                                  duration_s=a.duration_s)
-    forwards = a.browser_forward or [
-        "8080=frontend.krateo-system.svc:8080", "8081=snowplow.krateo-system.svc:8081",
-        "8082=authn.krateo-system.svc:8082"]
+    forwards = a.browser_forward or list(K6_BROWSER_FORWARDS)
     return (k6_job.render_k6(config=cfg, authn_url=a.authn_url, password=a.password,
                              linger_s=a.linger_s)
             + k6_job.render_browser(config=bcfg, forwards=forwards, linger_s=a.linger_s))

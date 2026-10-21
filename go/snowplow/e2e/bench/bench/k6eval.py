@@ -9,6 +9,9 @@ Each pod leaves, under its collected /out:
                         stream's page-load count against it)
   <name>-exit.json      the wrapper's exit record
 
+The k6 pod's viewer sidecar (load606.py view-feed) leaves viewer.jsonl
+(viewer_start .. viewer_end) and viewer-exit.json under the same /out.
+
 A stream that cannot prove it is whole, k6 iterations dropped beyond the bar
 (an arrival-rate executor counts every start it could not make — run 10's
 lag, made visible), or too few real-browser sessions make the run INVALID,
@@ -30,6 +33,9 @@ __all__ = [
     "k6_checks",
     "k6_report",
     "read_k6_out",
+    "read_viewer_out",
+    "viewer_checks",
+    "viewer_report",
 ]
 
 # Bars (THRESHOLDS-style: written here, never derived from the instrument).
@@ -41,12 +47,17 @@ K6_THRESHOLDS = {
     "max_k6_error_rate": 0.01,
     "min_browser_sessions": 3,
     "min_browser_loads_per_session": 20,
+    # open tabs: users whose /refreshes stream opened, of the users k6 brought
+    # to a working portal (k6's own first loads, not the sidecar's count)
+    "min_armed_user_share": 0.9,
+    # per browser session: the SPA's live-update streams that opened
+    "min_sse_opened_per_stream": 1,
 }
 
 _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "route_table_mismatch", "bench_frame", "http_req_failed", "http_req_duration",
          "browser_page_load_ms", "browser_page_loads", "browser_widget_errors",
-         "browser_page_timeouts", "browser_logins", "dropped_iterations")
+         "browser_page_timeouts", "browser_logins", "browser_sse_opened", "dropped_iterations")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 
 
@@ -196,7 +207,111 @@ def browser_checks(o: dict | None, sessions: int | None, th: dict | None = None)
         out.append({"check": f"browser.page_loads[{sess}]", "value": n,
                     "bar": f">= {th['min_browser_loads_per_session']}",
                     "result": "PASS" if ok else "FAIL"})
+    opened = defaultdict(int)
+    for val, t in o["points"].get("browser_sse_opened", []):
+        opened[(t.get("session"), t.get("stream"))] += int(val or 0)
+    for sess in sorted(logged):
+        have = {s: opened.get((sess, s), 0) for s in ("refreshes", "notifications")}
+        low = [s for s, n in have.items() if n < th["min_sse_opened_per_stream"]]
+        out.append({"check": f"browser.live_refresh[{sess}]", "value": have,
+                    "bar": f">= {th['min_sse_opened_per_stream']} opened per stream",
+                    "result": "FAIL" if low else "PASS",
+                    **({"why": "no live-update stream opened: " + ", ".join(
+                        f"/{s}" for s in low) + " (the session saw no SSE path)"} if low else {})})
     return out
+
+
+def read_viewer_out(d: str) -> dict | None:
+    """The viewer sidecar's records and exit record in collected dir d."""
+    path, exitf = os.path.join(d, "viewer.jsonl"), os.path.join(d, "viewer-exit.json")
+    if not (os.path.exists(path) or os.path.exists(exitf)):
+        return None
+    out = {"records": [], "truncated": False, "exit": None}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    out["records"].append(json.loads(line))
+                except ValueError:
+                    out["truncated"] = True
+    except OSError:
+        pass
+    try:
+        with open(exitf) as fh:
+            out["exit"] = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def _active_users(k6o: dict | None) -> int | None:
+    """Users k6 brought to a working portal: its successful first loads (one
+    per user), from k6's own stream."""
+    if k6o is None:
+        return None
+    p = k6o["points"]
+    firsts = sum(1 for _, t in p.get("page_loads", [])
+                 if t.get("kind") in ("first_load", "composite_first_load"))
+    return firsts - int(sum(v or 0 for v, _ in p.get("first_load_failed", [])))
+
+
+def viewer_checks(v: dict | None, k6o: dict | None, th: dict | None = None) -> list[dict]:
+    """The open tabs: the sidecar's stream is whole and ended at k6's
+    feed_end, and >= 90 % of the users k6 brought in were armed."""
+    th = dict(K6_THRESHOLDS, **(th or {}))
+    if v is None:
+        return [{"check": "viewer.stream_complete", "value": None, "bar": "collected",
+                 "result": "FAIL", "why": "no viewer output was collected: no open tabs"}]
+    recs = v["records"]
+    kinds = [r.get("kind") for r in recs]
+    end = next((r for r in reversed(recs) if r.get("kind") == "viewer_end"), None)
+    why = []
+    if not recs or kinds[0] != "viewer_start":
+        why.append("no viewer_start first: the stream's head is missing")
+    if end is None:
+        why.append("no viewer_end: the sidecar did not finish, or the tail is missing")
+    elif end.get("ended_by") != "feed_end":
+        why.append(f"the viewers stopped on: {end.get('ended_by')}")
+    if v["truncated"]:
+        why.append("the stream is cut (an unreadable line)")
+    if v["exit"] is None:
+        why.append("no exit record: the sidecar died before its wrapper recorded the exit code")
+    elif v["exit"].get("rc") != 0:
+        why.append(f"the viewer sidecar exited rc={v['exit'].get('rc')}")
+    out = [{"check": "viewer.stream_complete",
+            "value": {"navs": (end or {}).get("navs"), "exit_rc": (v["exit"] or {}).get("rc")},
+            "bar": "viewer_start .. viewer_end at feed_end, exit rc 0",
+            "result": "FAIL" if why else "PASS", **({"why": "; ".join(why)} if why else {})}]
+    armed = len({r.get("user") for r in recs if r.get("kind") == "viewer_armed"})
+    active = _active_users(k6o)
+    share = round(armed / active, 4) if active else None
+    ok = share is not None and share >= th["min_armed_user_share"]
+    out.append({"check": "viewer.armed_users", "value": {"armed": armed, "active": active,
+                                                          "share": share},
+                "bar": f">= {th['min_armed_user_share']} of the users k6 brought in",
+                "result": "PASS" if ok else "FAIL",
+                **({} if ok else {"why": f"{armed} users had an open tab of {active} that k6 "
+                                         f"brought to a working portal"
+                                  if active else "k6 brought no user to a working portal"})})
+    return out
+
+
+def viewer_report(v: dict | None) -> dict | None:
+    """Arm lag (k6 nav end -> stream open) and push refetches: report only."""
+    if v is None:
+        return None
+    from bench.load606 import push_refetch_report
+    recs = v["records"]
+    lag = [r.get("arm_lag_ms") for r in recs if r.get("kind") == "viewer_armed"]
+    stats = next((r for r in reversed(recs) if r.get("kind") == "viewer_stats"), None)
+    dead = [r for r in recs if r.get("kind") == "viewer_dead"]
+    return {"arms": len(lag), "arm_lag_p50_ms": _pct(lag, 50), "arm_lag_p95_ms": _pct(lag, 95),
+            "arm_lag_max_ms": max(lag) if lag else None,
+            "push_refetch": push_refetch_report([r for r in recs if r.get("kind") == "push_refetch"]),
+            "stream_errors": sum(1 for r in recs if r.get("kind") == "viewer"
+                                 and r.get("state") == "error"),
+            "stats": {k: val for k, val in (stats or {}).items() if k not in ("kind", "t")} or None,
+            "tabs_dead_last": dead[-1].get("tabs_dead") if dead else None}
 
 
 def browser_navs(o: dict | None) -> list[dict]:

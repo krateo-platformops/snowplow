@@ -12,6 +12,11 @@ then lingers for `kubectl cp`.
 Login: the k6 pod's initContainer signs the users in through authn
 (load606.py login-tokens, the proven adaptive ramp) into /work/tokens.json —
 an emptyDir INSIDE the pod, never under /out, never collected or logged.
+
+Open tabs (#830 ruling, option A): the k6 pod's `viewer` sidecar
+(load606.py view-feed, the run 9/10 ViewerHub) tails k6's navigation feed on
+the /feed emptyDir and keeps each user's /refreshes stream armed on the
+widgets that user's last page load actually answered with.
 """
 
 from __future__ import annotations
@@ -43,6 +48,9 @@ K6_UID = 12345                      # the k6 images' user
 K6_CPU, K6_MEMORY = "4", "4Gi"
 BROWSER_CPU, BROWSER_MEMORY = "3", "4Gi"
 FORWARD_CPU, FORWARD_MEMORY = "100m", "64Mi"
+# 1,000 idle SSE reader threads + push refetches (run 10's driver carried them
+# inside its 3 CPU / 4Gi beside the navigation)
+VIEWER_CPU, VIEWER_MEMORY = "1", "2Gi"
 
 LOGIN_CONCURRENCY = 64              # run 10's proven authn concurrency
 FRESH_CPU, FRESH_MEMORY = "1", "1Gi"   # load606_job.render_fresh's requests
@@ -86,11 +94,15 @@ def loadgen_fit(machine: str, requests: list[tuple[str, str]]) -> dict:
             "budget_cpu_m": cap_cpu, "budget_memory_mi": cap_mem}
 
 
-def k6_plan_requests(k6_cpu: str | None = None, browser_cpu: str | None = None) -> list[tuple[str, str]]:
-    """Every Job the k6 plan puts on the loadgen node: k6, the browser pod
-    (Chrome + the forwarder sidecar), fresh606 and mem606."""
-    return [(k6_cpu or K6_CPU, K6_MEMORY), (browser_cpu or BROWSER_CPU, BROWSER_MEMORY),
-            (FORWARD_CPU, FORWARD_MEMORY), (FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi")]
+def k6_plan_requests(k6_cpu: str | None = None, browser_cpu: str | None = None,
+                     viewers: bool = True) -> list[tuple[str, str]]:
+    """Every container the k6 plan puts on the loadgen node: k6 (+ its viewer
+    sidecar), the browser pod (Chrome + the forwarder sidecar), fresh606 and
+    mem606."""
+    return ([(k6_cpu or K6_CPU, K6_MEMORY)]
+            + ([(VIEWER_CPU, VIEWER_MEMORY)] if viewers else [])
+            + [(browser_cpu or BROWSER_CPU, BROWSER_MEMORY), (FORWARD_CPU, FORWARD_MEMORY),
+               (FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi")])
 
 
 def browser_sessions(m: rbac_model.RbacModel, n: int = 5,
@@ -127,7 +139,7 @@ def browser_sessions(m: rbac_model.RbacModel, n: int = 5,
 def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: str,
               routes: list[dict], users: int, burst_users: int, think_s: float,
               duration_s: float, burst_at_s: float, composite_routes: list[str],
-              browser_users: list[int] = ()) -> dict:
+              browser_users: list[int] = (), viewers: bool = True) -> dict:
     """k6's config. The burst users are the LAST `burst_users` of 1..users;
     the real-Chrome sessions' users (`browser_users`) are left out of k6's
     navigating users, so each identity has exactly one client."""
@@ -158,6 +170,7 @@ def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: st
             "navUserIds": nav_ids, "burstUserIds": burst_ids,
             "durationS": int(duration_s), "burstAtS": int(burst_at_s),
             "compositeRoutes": list(composite_routes),
+            "viewers": viewers,            # write the navigation feed (navigate.js)
             # VUs: in steady state ~rate x page time; the first-load minute
             # can need many more. maxVUs = the navigating users (no more
             # page loads in flight than people), and a drop is COUNTED; k6
@@ -181,15 +194,15 @@ def _indent(text: str, n: int) -> str:
     return "\n".join(pad + ln if ln else ln for ln in text.splitlines())
 
 
-def _wrapper(cmd: str, prefix: str, linger_s: float) -> str:
+def _wrapper(cmd: str, prefix: str, linger_s: float, done: str = "/out/done") -> str:
     """#818's discipline: run, record the exit code into the stream dir,
-    mark /out/done (Ready = results final), linger for kubectl cp."""
+    mark `done` (Ready = results final), linger for kubectl cp."""
     return f"""set -u
 rc=0
 {cmd} || rc=$?
 printf '{{"kind": "{prefix}_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" > /out/{prefix}-exit.json
 echo "{prefix} exited rc=$rc; holding {linger_s:g}s for collect"
-echo "$rc" > /out/done
+echo "$rc" > {done}
 sleep {linger_s:g}
 exit "$rc"
 """
@@ -230,7 +243,40 @@ def render_k6(*, config: dict, authn_url: str, password: str, linger_s: float,
              f"--password {json.dumps(password)} --user-prefix {json.dumps(user_prefix)} "
              f"--user-start 1 --user-end {config['users']} --max-concurrency {LOGIN_CONCURRENCY} "
              f"--out /work/tokens.json")
-    run = "k6 run --quiet --out json=/out/k6.json.gz /opt/k6/navigate.js"
+    viewers = bool(config.get("viewers"))
+    # the feed: console.log lines, raw, into the emptyDir the viewer tails
+    feed = " --log-format raw --console-output /feed/nav.jsonl" if viewers else ""
+    run = f"k6 run --quiet{feed} --out json=/out/k6.json.gz /opt/k6/navigate.js"
+    view = (f"exec python3 -u /opt/load606/load606.py view-feed "
+            f"--snowplow-url {json.dumps(config['snowplowUrl'])} --tokens /work/tokens.json "
+            f"--user-prefix {json.dumps(user_prefix)} --feed /feed/nav.jsonl "
+            f"--stop-file /out/done --out /out/viewer.jsonl")
+    sidecar = f"""
+      - name: viewer
+        image: {PY_IMAGE}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+{_indent(_wrapper(view.replace("exec ", "", 1), "viewer", linger_s, done="/out/viewer-done"), 10)}
+        resources:
+          requests:
+            cpu: {json.dumps(VIEWER_CPU)}
+            memory: {VIEWER_MEMORY}
+        readinessProbe:
+          exec:
+            command: ["test", "-f", "/out/viewer-done"]
+          periodSeconds: 10
+        volumeMounts:
+        - name: src
+          mountPath: /opt/load606
+        - name: work
+          mountPath: /work
+          readOnly: true
+        - name: feed
+          mountPath: /feed
+          readOnly: true
+        - name: out
+          mountPath: /out""" if viewers else ""
     return _configmap("k6", scripts) + f"""---
 apiVersion: batch/v1
 kind: Job
@@ -243,6 +289,9 @@ spec:
     metadata:
       labels:
         app: k6load
+      annotations:
+        # collect's `kubectl exec cat /out/done` / `cp` reach k6's container
+        kubectl.kubernetes.io/default-container: k6
     spec:
 {_POOL}
       securityContext:
@@ -289,8 +338,10 @@ spec:
         - name: work
           mountPath: /work
           readOnly: true
+        - name: feed
+          mountPath: /feed
         - name: out
-          mountPath: /out
+          mountPath: /out{sidecar}
       volumes:
       - name: src
         configMap:
@@ -299,6 +350,8 @@ spec:
         configMap:
           name: k6
       - name: work
+        emptyDir: {{}}
+      - name: feed
         emptyDir: {{}}
       - name: out
         emptyDir: {{}}

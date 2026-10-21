@@ -193,7 +193,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         print(os.environ.get("FAKE_DRIVE_RC", "0")); sys.exit(0)   # drive's exit code
     if a[:1] == ["cp"] and any(x.startswith(("k6load", "k6browser")) for x in a):
         # #830: the k6 / browser pod's /out. FAKE_K6_OUT: whole | dropped
-        # (the burst could not start one iteration) | nobrowser
+        # (the burst could not start one iteration) | nobrowser | viewercut
+        # (the viewer sidecar saw no feed_end) | nosse (no live-update stream)
         import gzip
         name = "k6" if any(x.startswith("k6load") for x in a) else "browser"
         mode = os.environ.get("FAKE_K6_OUT", "whole")
@@ -205,10 +206,23 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             return json.dumps({"metric": m, "type": "Point", "data": {"value": v, "tags": tags}})
         lines = [pt("bench_frame", 1, frame="start")]
         if name == "k6":
-            for i in range(4):
-                t = {"kind": "route", "route": "/dashboard", "visit": "warm"}
+            for i in range(7):
+                t = ({"kind": "first_load", "route": "/dashboard", "visit": "first"} if i < 3
+                     else {"kind": "route", "route": "/dashboard", "visit": "warm"})
                 lines += [pt("page_load_ms", 80 + i, **t), pt("page_loads", 1, **t)]
-            m = {"page_loads": {"count": 4}, "http_req_failed": {"rate": 0},
+            cut = mode == "viewercut"
+            vrecs = ([{"kind": "viewer_start", "t": 1}]
+                     + [{"kind": "viewer_armed", "user": "u%d" % u, "nav": "navigate:%d" % u,
+                         "t": 2, "arm_lag_ms": 5.0} for u in range(3)]
+                     + [{"kind": "viewer_stats", "t": 3, "streams_opened": 3},
+                        {"kind": "viewer_end", "t": 4, "rc": 3 if cut else 0,
+                         "ended_by": "k6 exited without feed_end: the feed is cut" if cut
+                         else "feed_end", "navs": 7}])
+            with open(os.path.join(dest, "viewer.jsonl"), "w") as fh:
+                fh.write("".join(json.dumps(r) + "\\n" for r in vrecs))
+            with open(os.path.join(dest, "viewer-exit.json"), "w") as fh:
+                json.dump({"kind": "viewer_exit", "rc": 3 if cut else 0}, fh)
+            m = {"page_loads": {"count": 7}, "http_req_failed": {"rate": 0},
                  "route_table_mismatch": {"count": 0}}
             for sc, n in (("navigate", 3), ("composite_burst", 1)):
                 m["iterations{scenario:%s}" % sc] = {"count": n}
@@ -217,6 +231,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         else:
             for s in ("s1", "s2", "s3"):
                 lines.append(pt("browser_logins", 1, session=s))
+                for stream in ("refreshes", "notifications"):
+                    lines.append(pt("browser_sse_opened", 0 if mode == "nosse" else 1,
+                                    session=s, stream=stream))
                 for i in range(20):
                     t = {"session": s, "route": "/r%d" % (i % 4),
                          "visit": "first" if i < 4 else "warm", "method": "click"}

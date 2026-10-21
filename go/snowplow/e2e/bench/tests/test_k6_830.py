@@ -22,6 +22,8 @@ import stat
 import subprocess
 import sys
 import threading
+import time
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -52,7 +54,10 @@ const calls = []
 const fetchLevel = (paths) => paths.map((p) => {
   calls.push(p)
   const doc = inp.tree[canon(p)]
-  return doc === undefined ? { status: 404, body: '{}' } : { status: 200, body: JSON.stringify(doc) }
+  const rf = (inp.refresh || {})[canon(p)]
+  const refresh = rf ? { key: rf[0], cls: rf[1] } : null
+  return doc === undefined ? { status: 404, body: '{}', refresh }
+    : { status: 200, body: JSON.stringify(doc), refresh }
 })
 const out = { eager: {}, menus: {}, slugs: {} }
 for (const [k, d] of Object.entries(inp.docs)) out.eager[k] = spa.eagerRefs(d)
@@ -65,7 +70,7 @@ out.first = { calls: calls.slice(), routes: fl.routes, shellCalls: fl.shell.call
               target: fl.target ? fl.target.path : null, failed: spa.firstLoadFailed(fl) }
 calls.length = 0
 const w = spa.walkTree(inp.walkRoots, fetchLevel)
-out.walk = { calls: calls.slice(), depth: w.depth, levels: w.levels }
+out.walk = { calls: calls.slice(), depth: w.depth, levels: w.levels, armed: w.armed }
 out.fnv = inp.fnv.map((s) => spa.fnv1a(s))
 process.stdout.write(JSON.stringify(out))
 """
@@ -134,6 +139,43 @@ def test_spa_js_first_load_and_walk_fetch_what_load606_fetches(tmp_path):
     # level by level: a child only after its parent arrived
     assert out["walk"]["levels"][0] == [P("flexes", "page-dashboard"), P("flexes", "page-compositions")]
     assert P("buttons", "row-btn") in out["walk"]["levels"][2]
+
+
+def _refresh_map():
+    """Every tree widget answers with refresh headers, except one without any
+    and one with a class snowplow does not stamp (neither is armed)."""
+    m = {canon(k): ["key-" + str(i), "widgets"] for i, k in enumerate(TREE)}
+    m[canon(P("piecharts", "pie"))] = ["key-x", "nonsense"]
+    del m[canon(P("tables", "tbl"))]
+    m[canon(P("flexes", "gone"))] = ["key-gone", "widgets"]      # on a 404: never armed
+    return m
+
+
+class _RefreshFake(Fake):
+    def get(self, path, token):
+        r = super().get(path, token)
+        rf = _refresh_map().get(canon(path))
+        if r.status == 200 and rf:
+            r.refresh = tuple(rf)
+        return r
+
+
+@needs_node
+def test_spa_js_arms_what_load606_walk_arms(tmp_path):
+    """The widgets a tab arms (#830 viewer feed): every 200 answer that carried
+    a refresh key and a known class, as load606.walk's `armed`."""
+    roots = [P("flexes", "page-dashboard"), P("flexes", "page-compositions"), P("flexes", "gone")]
+    out = _run_spa(tmp_path, _spa_src(), refresh=_refresh_map(), walkRoots=roots)
+    c = _RefreshFake()
+    with cf.ThreadPoolExecutor(6) as pool:
+        w = load606.walk(c, "t", roots, pool=pool)
+    py = sorted((e["path"], e["key"]) for e in w.armed)
+    js = sorted((e["path"], e["key"]) for e in out["walk"]["armed"])
+    assert js == py and len(js) >= 4
+    assert P("piecharts", "pie") not in {p for p, _ in js}       # unknown class
+    assert P("tables", "tbl") not in {p for p, _ in js}          # no headers
+    assert P("flexes", "gone") not in {p for p, _ in js}         # not a 200
+    assert {e["cls"] for e in out["walk"]["armed"]} == {"widgets"}
 
 
 @needs_node
@@ -310,10 +352,14 @@ def test_k6_error_rate_and_route_table(tmp_path):
                   "k6.error_rate")["result"] == "FAIL"           # no data is not a pass
 
 
-def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0):
+def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
+                    sse=("refreshes", "notifications")):
     pts = []
     for s in sessions:
         pts.append(_point("browser_logins", 1, session=s))
+        for stream in ("refreshes", "notifications"):
+            pts.append(_point("browser_sse_opened", 2 if stream in sse else 0,
+                              session=s, stream=stream))
         for i in range(loads):
             tags = {"session": s, "route": f"/r{i % 4}", "visit": "first" if i < 4 else "warm",
                     "method": "login" if i == 0 else "click"}
@@ -348,13 +394,94 @@ def test_too_few_browser_sessions_or_loads_fail(tmp_path):
     assert k6eval.browser_checks(None, 5)[0]["result"] == "FAIL"
 
 
-def _evaluate_cli(tmp_path, k6dir, bdir):
+def test_a_session_without_live_updates_fails(tmp_path):
+    # the sse-proxy firehose never opened (e.g. :8083 not forwarded)
+    _write_out(tmp_path, "browser", _browser_points(sse=("refreshes",)), _browser_summary(63), 0)
+    c = _check(k6eval.browser_checks(k6eval.read_k6_out(str(tmp_path), "browser"), 3),
+               "browser.live_refresh[s1]")
+    assert c["result"] == "FAIL" and "/notifications" in c["why"]
+    assert c["value"] == {"refreshes": 2, "notifications": 0}
+    _write_out(tmp_path, "browser", _browser_points(sse=()), _browser_summary(63), 0)
+    c = _check(k6eval.browser_checks(k6eval.read_k6_out(str(tmp_path), "browser"), 3),
+               "browser.live_refresh[s2]")
+    assert c["result"] == "FAIL" and "/refreshes, /notifications" in c["why"]
+
+
+# ─── the viewer sidecar's output ────────────────────────────────────────────
+
+
+def _write_viewer(d: Path, users=("u1", "u2", "u3", "u4", "u5"), *, ended_by="feed_end",
+                  rc=0, start=True, end=True, cut=False):
+    d.mkdir(parents=True, exist_ok=True)
+    recs = [{"kind": "viewer_start", "t": 1}] if start else []
+    for i, u in enumerate(users):
+        recs.append({"kind": "viewer_armed", "user": u, "nav": f"navigate:{i}", "t": 2,
+                     "arm_lag_ms": 10.0 + i})
+    recs += [{"kind": "push_refetch", "user": users[0], "key": "k", "path": "/call?x",
+              "t_event": 3, "start_lag_ms": 1.0, "wall_ms": 20.0, "status": 200},
+             {"kind": "viewer_dead", "t": 4, "tabs_dead": 0, "tabs_armed": len(users)},
+             {"kind": "viewer_stats", "t": 5, "streams_opened": len(users), "frames": 1}]
+    if end:
+        recs.append({"kind": "viewer_end", "t": 6, "ok": rc == 0, "rc": rc, "ended_by": ended_by,
+                     "navs": 20})
+    body = "".join(json.dumps(r) + "\n" for r in recs)
+    (d / "viewer.jsonl").write_text(body[:-15] if cut else body)
+    if rc is not None:
+        (d / "viewer-exit.json").write_text(json.dumps({"kind": "viewer_exit", "rc": rc}))
+
+
+def _k6o(tmp_path, failed_first=0):
+    pts = _k6_points(20) + [_point("first_load_failed", 1, kind="first_load")] * failed_first
+    _write_out(tmp_path, "k6", pts, _k6_summary(20), 0)
+    return k6eval.read_k6_out(str(tmp_path), "k6")
+
+
+def test_viewer_complete_and_armed_passes(tmp_path):
+    k6o = _k6o(tmp_path)                 # 5 users reached a working portal
+    _write_viewer(tmp_path)
+    v = k6eval.read_viewer_out(str(tmp_path))
+    checks = k6eval.viewer_checks(v, k6o)
+    assert [(c["check"], c["result"]) for c in checks] == [
+        ("viewer.stream_complete", "PASS"), ("viewer.armed_users", "PASS")]
+    assert checks[1]["value"] == {"armed": 5, "active": 5, "share": 1.0}
+    rep = k6eval.viewer_report(v)
+    assert rep["arms"] == 5 and rep["arm_lag_p50_ms"] == 12.0 and rep["arm_lag_max_ms"] == 14.0
+    assert rep["push_refetch"]["refetches"] == 1 and rep["stats"]["streams_opened"] == 5
+
+
+@pytest.mark.parametrize("kw,why", [
+    ({"start": False}, "no viewer_start first"),
+    ({"end": False}, "no viewer_end"),
+    ({"ended_by": "k6 exited without feed_end: the feed is cut"}, "the viewers stopped on: k6 exited"),
+    ({"rc": 3}, "exited rc=3"),
+    ({"rc": None}, "no exit record"),
+    ({"cut": True}, "cut"),
+])
+def test_viewer_stream_that_is_not_whole_fails(tmp_path, kw, why):
+    _write_viewer(tmp_path, **kw)
+    c = k6eval.viewer_checks(k6eval.read_viewer_out(str(tmp_path)), _k6o(tmp_path))[0]
+    assert c["result"] == "FAIL" and why in c["why"], c
+
+
+def test_viewer_armed_users_bar(tmp_path):
+    # 4 armed of the 5 k6 brought in: 0.8 < 0.9
+    _write_viewer(tmp_path, users=("u1", "u2", "u3", "u4"))
+    c = k6eval.viewer_checks(k6eval.read_viewer_out(str(tmp_path)), _k6o(tmp_path))[1]
+    assert c["result"] == "FAIL" and c["value"]["share"] == 0.8
+    # one of k6's first loads failed: 4 of 4 active
+    c = k6eval.viewer_checks(k6eval.read_viewer_out(str(tmp_path)),
+                             _k6o(tmp_path, failed_first=1))[1]
+    assert c["result"] == "PASS" and c["value"]["active"] == 4
+    assert k6eval.viewer_checks(None, None)[0]["result"] == "FAIL"
+
+
+def _evaluate_cli(tmp_path, k6dir, bdir, *extra):
     fresh = tmp_path / "fresh.jsonl"
     fresh.write_text(json.dumps({"kind": "fresh", "label": "list_dep@1", "converged": True,
                                  "latency_ms": 100, "polls": 1, "poll_ms": 100}) + "\n")
     p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(fresh),
                         "--k6-out", str(k6dir), "--browser-out", str(bdir),
-                        "--browser-sessions", "3"],
+                        "--browser-sessions", "3", *extra],
                        capture_output=True, text=True, cwd=BENCH_DIR, timeout=120)
     return p.returncode, json.loads(p.stdout)
 
@@ -362,12 +489,16 @@ def _evaluate_cli(tmp_path, k6dir, bdir):
 def test_evaluate_judges_browser_page_loads_and_k6_validity(tmp_path):
     k6dir, bdir = tmp_path / "k6", tmp_path / "browser"
     _write_out(k6dir, "k6", _k6_points(20), _k6_summary(20), 0)
+    _write_viewer(k6dir)
     _write_out(bdir, "browser", _browser_points(), _browser_summary(63), 0)
     rc, v = _evaluate_cli(tmp_path, k6dir, bdir)
     names = {c["check"]: c for c in v["validity"]}
     for n in ("k6.stream_complete", "k6.dropped_iterations[navigate]", "k6.error_rate",
-              "k6.route_table", "browser.stream_complete", "browser.sessions"):
+              "k6.route_table", "browser.stream_complete", "browser.sessions",
+              "browser.live_refresh[s1]", "viewer.stream_complete", "viewer.armed_users"):
         assert names[n]["result"] == "PASS", names[n]
+    assert all(c["result"] == "PASS" for c in v["validity"]
+               if c["check"].startswith(("k6.", "browser.", "viewer."))), v["validity"]
     # the load606 driver's own checks do not apply
     assert not any(c.startswith("driver.") for c in names)
     assert _check(v["checks"], "browser.page_timeouts")["result"] == "PASS"
@@ -376,12 +507,23 @@ def test_evaluate_judges_browser_page_loads_and_k6_validity(tmp_path):
     assert rep["page_loads_are"].startswith("real Chrome")
     assert rep["browser"]["page_load_by_session"]["s1"]["n"] == 21
     assert rep["k6_report_only"]["page_load_by_kind_visit"]["route/warm"]["n"] == 13
+    assert rep["viewer_report_only"]["arms"] == 5
     # a dropped burst iteration makes the run INVALID with its reason
     _write_out(k6dir, "k6", _k6_points(20),
                _k6_summary(20, dropped={"composite_burst": 1}), 0)
     rc, v = _evaluate_cli(tmp_path, k6dir, bdir)
     assert rc == 3 and v["verdict"] == "INVALID"
     assert any("composite_burst" in r for r in v["invalid_reasons"]), v["invalid_reasons"]
+
+
+def test_evaluate_viewer_output_is_required_unless_no_viewers(tmp_path):
+    k6dir, bdir = tmp_path / "k6", tmp_path / "browser"
+    _write_out(k6dir, "k6", _k6_points(20), _k6_summary(20), 0)
+    _write_out(bdir, "browser", _browser_points(), _browser_summary(63), 0)
+    rc, v = _evaluate_cli(tmp_path, k6dir, bdir)
+    assert rc == 3 and any("no viewer output was collected" in r for r in v["invalid_reasons"])
+    rc, v = _evaluate_cli(tmp_path, k6dir, bdir, "--no-viewers")      # VIEWERS=0
+    assert not any(c["check"].startswith("viewer.") for c in v["validity"])
 
 
 def test_evaluate_without_browser_output_is_invalid(tmp_path):
@@ -410,7 +552,10 @@ def test_k6_plan_needs_the_larger_loadgen_node():
     with pytest.raises(ValueError, match="over budget on n2-standard-8"):
         k6_job.loadgen_fit("n2-standard-8", k6_job.k6_plan_requests())
     fit = k6_job.loadgen_fit("n2-standard-16", k6_job.k6_plan_requests())
-    assert fit["cpu_m"] == 8350 and fit["cpu_m"] <= fit["budget_cpu_m"]
+    # k6 4 + viewer sidecar 1 + Chrome 3 + forwarder 0.1 + fresh606 1 + mem606 0.25
+    assert fit["cpu_m"] == 9350 and fit["cpu_m"] <= fit["budget_cpu_m"]
+    assert k6_job.loadgen_fit("n2-standard-16",
+                              k6_job.k6_plan_requests(viewers=False))["cpu_m"] == 8350
     with pytest.raises(ValueError, match="unknown loadgen machine type"):
         k6_job.loadgen_fit("e2-small", k6_job.k6_plan_requests())
 
@@ -506,8 +651,20 @@ def test_render_k6_driver(tmp_path):
     assert {("Job", "k6load"), ("Job", "k6browser"), ("Job", "fresh606"), ("Job", "mem606"),
             ("ConfigMap", "load606"), ("ConfigMap", "k6"), ("ConfigMap", "k6browser")} <= set(by)
     assert ("Job", "load606") not in by
-    k6 = by[("Job", "k6load")]["spec"]["template"]["spec"]
+    tpl = by[("Job", "k6load")]["spec"]["template"]
+    assert tpl["metadata"]["annotations"]["kubectl.kubernetes.io/default-container"] == "k6"
+    k6 = tpl["spec"]
+    assert [x["name"] for x in k6["containers"]] == ["k6", "viewer"]
     c = k6["containers"][0]
+    assert "--log-format raw --console-output /feed/nav.jsonl" in c["args"][0]
+    vw = k6["containers"][1]
+    assert "view-feed" in vw["args"][0] and "--stop-file /out/done" in vw["args"][0]
+    assert "> /out/viewer-done" in vw["args"][0] and "> /out/done" not in vw["args"][0]
+    assert vw["readinessProbe"]["exec"]["command"] == ["test", "-f", "/out/viewer-done"]
+    vmounts = {m["name"]: m for m in vw["volumeMounts"]}
+    assert vmounts["work"]["readOnly"] is True and vmounts["feed"]["readOnly"] is True
+    assert vmounts["out"]["mountPath"] == "/out"
+    assert vw["resources"]["requests"] == {"cpu": "1", "memory": "2Gi"}
     assert c["image"] == k6_job.K6_IMAGE and "@sha256:" in c["image"]
     assert c["readinessProbe"]["exec"]["command"] == ["test", "-f", "/out/done"]
     mounts = {m["name"]: m for m in c["volumeMounts"]}
@@ -521,20 +678,30 @@ def test_render_k6_driver(tmp_path):
     assert k6["securityContext"]["runAsUser"] == k6_job.K6_UID
     cfg = json.loads(by[("ConfigMap", "k6")]["data"]["config.json"])
     assert [r["path"] for r in cfg["routes"]] == ["/dashboard", "/compositions"]  # 500 left out
+    assert cfg["viewers"] is True
     b = by[("Job", "k6browser")]["spec"]["template"]
     assert b["metadata"]["annotations"]["kubectl.kubernetes.io/default-container"] == "browser"
     names = [x["name"] for x in b["spec"]["containers"]]
     assert names == ["browser", "forward"]
     assert b["spec"]["containers"][0]["image"] == k6_job.K6_BROWSER_IMAGE
-    assert b["spec"]["containers"][1]["command"][-3:] == [
+    assert b["spec"]["containers"][1]["command"][-4:] == [
         "8080=frontend.krateo-system.svc:8080", "8081=snowplow.krateo-system.svc:8081",
-        "8082=authn.krateo-system.svc:8082"]
+        "8082=authn.krateo-system.svc:8082", "8083=krateo-sse-proxy.krateo-system.svc:8080"]
     bcfg = json.loads(by[("ConfigMap", "k6browser")]["data"]["browser-config.json"])
     browser_users = {int(s["user"].rsplit("-", 1)[1]) for s in bcfg["sessions"]}
     assert len(bcfg["sessions"]) == 5 and not browser_users & set(cfg["navUserIds"])
     for d in docs:                               # every pod on the loadgen pool
         if d["kind"] == "Job":
             assert d["spec"]["template"]["spec"]["nodeSelector"] == {"bench.krateo.io/pool": "loadgen"}
+
+
+def test_render_k6_without_viewers(tmp_path):
+    docs = _render(tmp_path, "--no-viewers")
+    by = {(d["kind"], d["metadata"]["name"]): d for d in docs}
+    k6 = by[("Job", "k6load")]["spec"]["template"]["spec"]
+    assert [x["name"] for x in k6["containers"]] == ["k6"]
+    assert "--console-output" not in k6["containers"][0]["args"][0]
+    assert json.loads(by[("ConfigMap", "k6")]["data"]["config.json"])["viewers"] is False
 
 
 def test_render_k6_refuses_the_small_node_and_a_missing_route_table(tmp_path):
@@ -608,6 +775,127 @@ def test_login_tokens_refuses_a_partial_population(tmp_path, authn):
     assert not out.exists()
 
 
+# ─── view-feed: the k6 pod's viewer sidecar ─────────────────────────────────
+
+
+class _Snowplow(http.server.BaseHTTPRequestHandler):
+    """/call answers with refresh headers (key-<name>); /refreshes streams one
+    `refresh` frame for its first widget, then keepalives until closed."""
+    protocol_version = "HTTP/1.1"
+    subs: list = []
+
+    def do_GET(self):
+        name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("name", ["?"])[0]
+        body = b"{}"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Snowplow-Refresh-Key", "key-" + name)
+        self.send_header("X-Snowplow-Refresh-Class", "widgets")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        coords = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).subs.append((self.headers.get("Authorization"), [c["name"] for c in coords]))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            time.sleep(0.2)
+            self.wfile.write(f"event: refresh\ndata: key-{coords[0]['name']}\n\n".encode())
+            self.wfile.flush()
+            while True:
+                time.sleep(0.5)
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+        except OSError:
+            pass
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def snowplow():
+    _Snowplow.subs = []
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Snowplow)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv
+    srv.shutdown()
+
+
+def _armed(*names):
+    return [{"path": P("flexes", n), "key": "key-" + n, "cls": "widgets"} for n in names]
+
+
+def _view_feed(tmp_path, snowplow, lines, *, stop=False):
+    toks = [f"tok-{i}" for i in range(1, 4)]
+    (tmp_path / "tokens.json").write_text(json.dumps(toks))
+    feed, out, stopf = tmp_path / "nav.jsonl", tmp_path / "viewer.jsonl", tmp_path / "done"
+    p = subprocess.Popen(
+        [sys.executable, "-m", "bench.load606", "view-feed",
+         "--snowplow-url", f"http://127.0.0.1:{snowplow.server_address[1]}",
+         "--tokens", str(tmp_path / "tokens.json"), "--feed", str(feed),
+         "--stop-file", str(stopf), "--out", str(out), "--poll-s", "0.05"],
+        cwd=BENCH_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.3)                                    # the feed appears after the sidecar
+    with open(feed, "a") as fh:
+        for ln in lines:
+            fh.write(json.dumps(ln) + "\n")
+            fh.flush()
+            time.sleep(0.4)                            # frames + refetches happen meanwhile
+    if stop:
+        stopf.write_text("0\n")
+    _, err = p.communicate(timeout=60)
+    return p.returncode, [json.loads(x) for x in out.read_text().splitlines()], err
+
+
+def test_view_feed_arms_each_users_tab_on_what_k6_received(tmp_path, snowplow):
+    t = time.time()
+    rc, recs, err = _view_feed(tmp_path, snowplow, [
+        {"kind": "feed_start", "t": t},
+        {"kind": "nav", "nav": "navigate:0", "user": 1, "route": "/dashboard", "t_end": t, "ok": True,
+         "shell": _armed("sider"), "page": _armed("page-dashboard", "tbl")},
+        {"kind": "nav", "nav": "navigate:1", "user": 2, "route": "/dashboard", "t_end": t,
+         "ok": False, "shell": _armed("sider"), "page": []},  # no working portal: not armed
+        {"kind": "nav", "nav": "navigate:3", "user": 3, "route": "/dashboard", "t_end": t,
+         "ok": True, "shell": [], "page": _armed("page-other")},
+        {"kind": "nav", "nav": "navigate:2", "user": 1, "route": "/compositions", "t_end": t,
+         "ok": True, "page": _armed("page-compositions")},  # the shell stays armed
+        {"kind": "feed_end", "t": t}])
+    assert rc == 0, err
+    kinds = [r["kind"] for r in recs]
+    assert kinds[0] == "viewer_start" and kinds[-1] == "viewer_end"
+    end = recs[-1]
+    assert end["ended_by"] == "feed_end" and end["navs"] == 4 and end["navs_failed"] == 1
+    armed = [r for r in recs if r["kind"] == "viewer_armed"]
+    assert {r["user"] for r in armed} == {"scaleuser-0001", "scaleuser-0003"}
+    assert ("Bearer tok-3", ["page-other"]) in _Snowplow.subs      # each user's own token
+    assert all(r["arm_lag_ms"] >= 0 for r in armed)
+    # the second nav re-armed the user's ONE stream on shell + new page, with its token
+    assert _Snowplow.subs[0] == ("Bearer tok-1", ["sider", "page-dashboard", "tbl"])
+    assert _Snowplow.subs[-1] == ("Bearer tok-1", ["sider", "page-compositions"])
+    # a frame refetched the widget like the SPA (push_refetch), then close
+    pr = [r for r in recs if r["kind"] == "push_refetch"]
+    assert pr and all(r["status"] == 200 for r in pr) and pr[0]["key"] == "key-sider"
+    stats = next(r for r in recs if r["kind"] == "viewer_stats")
+    assert stats["streams_opened"] == 3 and stats["frames"] >= 1
+    rep = k6eval.viewer_report({"records": recs, "truncated": False, "exit": None})
+    assert rep["arms"] == len(armed)
+
+
+def test_view_feed_without_feed_end_is_a_cut_feed(tmp_path, snowplow):
+    t = time.time()
+    rc, recs, _ = _view_feed(tmp_path, snowplow, [
+        {"kind": "feed_start", "t": t},
+        {"kind": "nav", "nav": "navigate:0", "user": 3, "route": "/dashboard", "t_end": t,
+         "ok": True, "shell": _armed("sider"), "page": []}], stop=True)
+    assert rc == 3
+    assert recs[-1]["kind"] == "viewer_end" and "the feed is cut" in recs[-1]["ended_by"]
+
+
 def test_preflight_routes_keeps_only_servable_routes(tmp_path):
     assert load606_job.preflight_routes(str(_preflight(tmp_path))) == _routes()
     f = tmp_path / "empty.jsonl"
@@ -620,6 +908,11 @@ def test_navigate_js_reads_no_url_tags_and_keeps_tokens_out_of_out():
     src = (BENCH_DIR / "k6" / "navigate.js").read_text()
     assert "systemTags: ['status', 'method', 'scenario', 'expected_response', 'error_code']" in src
     assert "/work/tokens.json" in src and "/out/tokens" not in src
+    # the viewer feed (exercised end to end only by the kind proof): the refresh
+    # headers k6 received, the first load's shell + page, a click's page
+    assert "refresh: refreshOf(r)" in src
+    assert "shell: fl.shell.armed, page: fl.content ? fl.content.armed : []" in src
+    assert "page: w.armed" in src and "kind: 'feed_end'" in src
 
 
 # ─── run606.sh with LOAD_DRIVER=k6 (fake gcloud / kubectl) ─────────────────
@@ -655,8 +948,16 @@ def test_run606_k6_end_to_end(harness):
     val = {c["check"]: c["result"] for c in v["validity"]}
     for n in ("k6.stream_complete", "k6.dropped_iterations[navigate]",
               "k6.dropped_iterations[composite_burst]", "k6.error_rate", "k6.route_table",
-              "browser.stream_complete", "browser.sessions"):
+              "browser.stream_complete", "browser.sessions", "browser.live_refresh[s1]",
+              "viewer.stream_complete", "viewer.armed_users"):
         assert val[n] == "PASS", (n, v["validity"])
+    assert all(r == "PASS" for c, r in val.items() if c.startswith(("k6.", "browser.", "viewer.")))
+    assert v["report"]["viewer_report_only"]["arms"] == 3
+    # the browser pod forwards the sse-proxy (:8083) like the other localhost URLs
+    fwd = next(d for d in yaml.safe_load_all((out / "loadgen-job.yaml").read_text())
+               if d and d["kind"] == "Job" and d["metadata"]["name"] == "k6browser")
+    assert "8083=krateo-sse-proxy.krateo-system.svc:8080" in \
+        fwd["spec"]["template"]["spec"]["containers"][1]["command"]
     assert v["report"]["navs"] == 60                       # the browsers' page loads
     jp = [json.loads(x) for x in (out / "job-pods.jsonl").read_text().splitlines()]
     assert {r["job"] for r in jp} >= {"k6load", "k6browser", "fresh606", "mem606"}
@@ -671,6 +972,29 @@ def test_run606_k6_dropped_burst_is_invalid(harness):
     assert v["verdict"] == "INVALID"
     assert any("composite_burst" in r for r in v["invalid_reasons"])
     assert "INVALID: " in (out / "run.log").read_text()
+
+
+@pytest.mark.parametrize("mode,reason", [
+    ("viewercut", "the viewers stopped on: k6 exited without feed_end"),
+    ("nosse", "no live-update stream opened: /refreshes, /notifications"),
+])
+def test_run606_k6_viewers_and_live_updates_are_validity(harness, mode, reason):
+    p, _, out = _run606_k6(harness, FAKE_K6_OUT=mode)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-4000:]
+    v = json.loads((out / "verdict.json").read_text())
+    assert v["verdict"] == "INVALID"
+    assert any(reason in r for r in v["invalid_reasons"]), v["invalid_reasons"]
+
+
+def test_run606_k6_without_viewers(harness):
+    """VIEWERS=0: no sidecar is rendered, and the verdict asks for no tabs."""
+    p, _, out = _run606_k6(harness, VIEWERS="0")
+    assert p.returncode == 0, (p.stdout + p.stderr)[-4000:]
+    k6 = next(d for d in yaml.safe_load_all((out / "loadgen-job.yaml").read_text())
+              if d and d["kind"] == "Job" and d["metadata"]["name"] == "k6load")
+    assert [c["name"] for c in k6["spec"]["template"]["spec"]["containers"]] == ["k6"]
+    v = json.loads((out / "verdict.json").read_text())
+    assert not any(c["check"].startswith("viewer.") for c in v["validity"])
 
 
 def test_run606_k6_missing_browser_output_is_invalid(harness):

@@ -22,6 +22,13 @@
 // useProgressiveLoading.ts:13-33), so a list still revealing is not "loaded".
 // Widget end states (data-testid widget-error / -timeout / -forbidden /
 // -notfound, WidgetStates.tsx:34,54,75,89) are counted per load.
+//
+// Live updates, the user's way (#830 re-gate): the SPA keeps two SSE streams,
+// each counted per session when it OPENS (an answered request): snowplow's
+// per-widget `/refreshes` (fetch POST, hooks/refreshSse.ts:572-578) and the
+// sse-proxy's `/notifications` firehose (EventSource, hooks/sseClient.ts:49,
+// subscribed at hooks/useLiveRefresh.ts:18-21; localhost:8083 is forwarded to
+// it). `browser_sse_opened{session, stream}`; the evaluator wants >= 1 of each.
 import { browser } from 'k6/browser'
 import exec from 'k6/execution'
 import { Counter, Trend } from 'k6/metrics'
@@ -34,6 +41,7 @@ const WIDGET_ERRORS = new Counter('browser_widget_errors')
 const TIMEOUTS = new Counter('browser_page_timeouts')
 const LOGINS = new Counter('browser_logins')
 const FRAME = new Counter('bench_frame')
+const SSE = new Counter('browser_sse_opened')
 
 export const options = {
   scenarios: {
@@ -48,6 +56,7 @@ export const options = {
   thresholds: {
     browser_page_loads: ['count>=0'],
     browser_logins: ['count>=0'],
+    browser_sse_opened: ['count>=0'],
     browser_page_timeouts: ['count>=0'],
     browser_widget_errors: ['count>=0'],
     bench_frame: ['count>=0'],
@@ -66,6 +75,28 @@ const OBSERVER = `(() => {
     b.count = n;
   };
   new MutationObserver(tick).observe(document, { childList: true, subtree: true });
+  const sse = window.__benchSse = { refreshes: 0, notifications: 0 };
+  const f = window.fetch;
+  window.fetch = function (input, init) {
+    const url = String((input && input.url) || input);
+    const p = f.apply(this, arguments);
+    if (url.indexOf('/refreshes') >= 0) {
+      p.then((r) => { if (r.ok) sse.refreshes++ }, () => {});
+    }
+    return p;
+  };
+  const ES = window.EventSource;
+  if (ES) {
+    window.EventSource = function (url, opts) {
+      const es = new ES(url, opts);
+      if (String(url).indexOf('/notifications') >= 0) {
+        es.addEventListener('open', () => { sse.notifications++ });
+      }
+      return es;
+    };
+    window.EventSource.prototype = ES.prototype;
+    ['CONNECTING', 'OPEN', 'CLOSED'].forEach((k) => { window.EventSource[k] = ES[k] });
+  }
 })()`
 
 async function markStart (page) {
@@ -150,6 +181,11 @@ export default async function () {
       visited.add(route)
     }
   } finally {
+    try {
+      const n = await page.evaluate(() => window.__benchSse || { refreshes: 0, notifications: 0 })
+      SSE.add(n.refreshes, { session: s.name, stream: 'refreshes' })
+      SSE.add(n.notifications, { session: s.name, stream: 'notifications' })
+    } catch (e) { /* the page is gone: nothing counted, the evaluator says so */ }
     await page.close()
     await context.close()
   }
@@ -161,7 +197,7 @@ export function teardown () { FRAME.add(1, { frame: 'end' }) }
 export function handleSummary (data) {
   const keep = {}
   for (const [name, m] of Object.entries(data.metrics)) {
-    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_errors|browser_page_timeouts|browser_logins|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
+    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_errors|browser_page_timeouts|browser_logins|browser_sse_opened|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
   }
   return { [__ENV.SUMMARY_FILE || '/out/browser-summary.json']: JSON.stringify({
     kind: 'browser_summary', sessions: CFG.sessions.map((x) => x.name), metrics: keep }) }

@@ -94,8 +94,9 @@ if [[ "$LOAD_DRIVER" == "k6" ]]; then LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TY
 else LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-8}"; fi
 BROWSER_THINK_S="${BROWSER_THINK_S:-15}"
 # Inside the browser pod, the frontend's localhost URLs (its config.json was
-# made for a port-forwarding operator) are forwarded to the cluster Services.
-BROWSER_FORWARDS="${BROWSER_FORWARDS:-8080=frontend.krateo-system.svc:8080 8081=snowplow.krateo-system.svc:8081 8082=authn.krateo-system.svc:8082}"
+# made for a port-forwarding operator) are forwarded to the cluster Services;
+# :8083 = the sse-proxy (live refresh): sources in bench/load606_job.py.
+BROWSER_FORWARDS="${BROWSER_FORWARDS:-8080=frontend.krateo-system.svc:8080 8081=snowplow.krateo-system.svc:8081 8082=authn.krateo-system.svc:8082 8083=krateo-sse-proxy.krateo-system.svc:8080}"
 CHURN_RATES="${CHURN_RATES:-1 10 50}"
 FRESH_SAMPLES="${FRESH_SAMPLES:-60}"
 FRESH_GAP_S="${FRESH_GAP_S:-5}"
@@ -855,6 +856,7 @@ s_evaluate() {
   # #830: the page loads are the real browsers'; k6 is the load
   [[ "$LOAD_DRIVER" == "k6" ]] && k6args=(--k6-out "$OUT/k6" --browser-out "$OUT/browser"
                                           --browser-sessions "$BROWSER_SESSIONS")
+  [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" ${k6args[@]+"${k6args[@]}"} > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"

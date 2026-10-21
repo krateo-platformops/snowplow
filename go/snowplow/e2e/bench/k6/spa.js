@@ -124,10 +124,16 @@ export function buildersList (buildersNs) {
   return buildersNs ? `/list?category=builders&ns=${buildersNs}` : null
 }
 
+// The refresh classes snowplow stamps on a /call answer (load606.REFRESH_CLASSES).
+export const REFRESH_CLASSES = ['widgets', 'widgetContent', 'restactions']
+
 // Level-by-level walk of a widget tree. `fetchLevel(paths)` returns, in order,
-// one {status, body} per path (the caller decides HOW: k6 http.batch, node test
-// fixtures). Mirrors load606.walk: a child is requested only after its parent
-// arrived; `inject[path]` adds what the app requests once `path` arrived.
+// one {status, body, refresh} per path (the caller decides HOW: k6 http.batch,
+// node test fixtures); `refresh` = {key, cls} from the X-Snowplow-Refresh-Key /
+// -Class headers, or null. Mirrors load606.walk: a child is requested only
+// after its parent arrived; `inject[path]` adds what the app requests once
+// `path` arrived; `armed` lists the widgets a tab arms on its /refreshes
+// stream ({path, key, cls}: every 200 answer that carried both headers).
 export function walkTree (roots, fetchLevel, opts = {}) {
   const inject = opts.inject || {}
   const maxDepth = opts.maxDepth === undefined ? 12 : opts.maxDepth
@@ -135,7 +141,7 @@ export function walkTree (roots, fetchLevel, opts = {}) {
   const keepDocs = !!opts.keepDocs
   const seen = new Set(roots)
   let level = roots.slice()
-  const res = { calls: 0, errors: 0, bytes: 0, depth: 0, levels: [], docs: {}, statuses: {} }
+  const res = { calls: 0, errors: 0, bytes: 0, depth: 0, levels: [], docs: {}, statuses: {}, armed: [] }
   while (level.length && res.depth <= maxDepth && res.calls < maxCalls) {
     const next = []
     const got = fetchLevel(level, res.depth)
@@ -150,6 +156,9 @@ export function walkTree (roots, fetchLevel, opts = {}) {
         if (!seen.has(extra)) { seen.add(extra); next.push(extra) }
       }
       if (r.status !== 200) { res.errors++; continue }
+      if (r.refresh && r.refresh.key && REFRESH_CLASSES.includes(r.refresh.cls)) {
+        res.armed.push({ path, key: r.refresh.key, cls: r.refresh.cls })
+      }
       let doc = null
       try { doc = JSON.parse(r.body || 'null') } catch (e) { continue }
       if (keepDocs) res.docs[path] = doc

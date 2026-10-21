@@ -355,10 +355,14 @@ class ViewerHub:
                  stream_factory=RefreshStream,
                  throttle_s: float = REFRESH_THROTTLE_S,
                  max_inflight: int = REFRESH_MAX_INFLIGHT,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time,
+                 on_open: Callable[[str, float], None] | None = None):
         self.client = client
         self.pool = pool
         self.sink = sink
+        # on_open(user, t): the user's stream is open = the tab is armed
+        # (#830: view-feed measures the arm lag from it)
+        self.on_open = on_open
         self.stream_factory = stream_factory
         self.throttle_s = throttle_s
         self.max_inflight = max_inflight
@@ -464,6 +468,8 @@ class ViewerHub:
     def _state(self, user, state, detail):
         if state != "open":
             self.sink({"kind": "viewer", "user": user, "state": state, "t": self.clock(), **detail})
+        elif self.on_open is not None:
+            self.on_open(user, self.clock())
 
     def on_refresh(self, user: str, key: str, t_event: float) -> None:
         with self.lock:
@@ -2637,6 +2643,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         validity.extend(k6eval.k6_checks(k6.get("k6"), k6.get("thresholds")))
         validity.extend(k6eval.browser_checks(k6.get("browser"), k6.get("sessions"),
                                               k6.get("thresholds")))
+        if k6.get("viewers", True):
+            validity.extend(k6eval.viewer_checks(k6.get("viewer"), k6.get("k6"),
+                                                 k6.get("thresholds")))
         timeouts = (k6eval.browser_report(k6.get("browser")) or {}).get("timeouts")
         checks.append({"check": "browser.page_timeouts", "value": timeouts, "bar": "== 0",
                        "result": "PASS" if timeouts == 0 else "FAIL",
@@ -2721,6 +2730,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         report["page_loads_are"] = "real Chrome sessions (k6 browser), first visit vs warm per session"
         report["browser"] = k6eval.browser_report(k6.get("browser"))
         report["k6_report_only"] = k6eval.k6_report(k6.get("k6"))
+        report["viewer_report_only"] = k6eval.viewer_report(k6.get("viewer"))
     report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
     fv = [f for f in fresh if f.get("valid") is False]
     report["fresh_invalid_samples"] = len(fv)
@@ -3331,6 +3341,109 @@ def _cmd_login_tokens(a) -> int:
     return 0
 
 
+def _feed_entries(armed: list[dict]) -> list[dict]:
+    """A feed line's widgets ({path, key, cls}) as ViewerHub entries; a widget
+    whose /call cannot form coordinates is not armed (as in `walk`)."""
+    out = []
+    for e in armed or []:
+        coords = refresh_coords(e.get("path") or "", e.get("cls") or "")
+        if coords is not None and e.get("key"):
+            out.append({"path": e["path"], "key": e["key"], "coords": coords})
+    return out
+
+
+def _cmd_view_feed(a) -> int:
+    """#830 (run 11, option A): the users' open tabs, as a sidecar of the k6
+    pod. Tails k6's navigation feed (k6/navigate.js: one JSON line per page
+    load, with the refresh key/class each widget actually answered with) and
+    re-arms that user's /refreshes stream on exactly those widgets, the shell's
+    plus the page's, through ViewerHub — so frames, refetches, rotation re-arms
+    and close are the run 9/10 driver's. Writes a framed stream to --out:
+    viewer_start, viewer_armed (arm lag = k6 nav end -> stream open),
+    viewer / push_refetch / viewer_dead (ViewerHub), viewer_stats, viewer_end.
+    Ends at the feed's feed_end, or when --stop-file appears (k6 exited) and
+    the feed is drained: then rc 3, the feed was cut."""
+    sink = _jsonl_sink(a.out)
+    sink({"kind": "viewer_start", "t": time.time()})
+    with open(a.tokens) as fh:
+        tokens = json.load(fh)
+    threading.stack_size(VIEWER_STACK_BYTES)        # one reader thread per tab (#764)
+    client = HttpClient(a.snowplow_url)
+    pool = concurrent.futures.ThreadPoolExecutor(a.refetch_workers)
+    lock = threading.Lock()
+    pending: dict[str, tuple[str, float]] = {}       # user -> (nav, k6 nav end)
+
+    def on_open(user: str, t: float) -> None:
+        with lock:
+            p = pending.pop(user, None)
+        if p is not None:
+            sink({"kind": "viewer_armed", "user": user, "nav": p[0], "t": t,
+                  "arm_lag_ms": round(max(0.0, t - p[1]) * 1000, 1)})
+
+    hub = ViewerHub(client, pool, sink, on_open=on_open)
+    shell: dict[str, list[dict]] = {}
+    seen = {"navs": 0, "navs_failed": 0, "bad_lines": 0, "feed_start": False}
+    ended_by = None
+    fh, buf = None, ""
+    stopping = False
+    next_dead = time.time() + DEAD_TAB_SAMPLE_S
+    while ended_by is None:
+        if fh is None and os.path.exists(a.feed):
+            fh = open(a.feed)  # noqa: SIM115 — tailed across the loop, closed below
+        chunk = fh.readline() if fh is not None else ""
+        if chunk:
+            buf += chunk
+            if not buf.endswith("\n"):
+                continue                         # a line still being written
+            line, buf = buf, ""
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                seen["bad_lines"] += 1
+                continue
+            kind = rec.get("kind")
+            if kind == "feed_start":
+                seen["feed_start"] = True
+            elif kind == "feed_end":
+                ended_by = "feed_end"
+            elif kind == "nav":
+                seen["navs"] += 1
+                if not rec.get("ok"):
+                    seen["navs_failed"] += 1     # no working portal: nothing to arm
+                    continue
+                idx = int(rec["user"])
+                user = f"{a.user_prefix}{idx:04d}"
+                if "shell" in rec:               # a first load: the shell stays mounted
+                    shell[user] = _feed_entries(rec["shell"])
+                entries = shell.get(user, []) + _feed_entries(rec.get("page"))
+                if entries:
+                    with lock:
+                        pending[user] = (str(rec.get("nav")), float(rec.get("t_end") or 0))
+                hub.view(user, tokens[idx - 1], entries)
+            continue
+        if stopping:
+            ended_by = "k6 exited without feed_end: the feed is cut"
+            break
+        hub.flush_trailing()
+        now = time.time()
+        if now >= next_dead:
+            sink({"kind": "viewer_dead", "t": now, **hub.dead_tabs()})
+            next_dead = now + DEAD_TAB_SAMPLE_S
+        if os.path.exists(a.stop_file):
+            stopping = True                      # drain what is left, then stop
+            continue
+        time.sleep(a.poll_s)
+    if fh is not None:
+        fh.close()
+    stats = hub.close_all()
+    sink({"kind": "viewer_stats", "t": time.time(), **stats})
+    pool.shutdown(wait=True, cancel_futures=True)
+    rc = 0 if ended_by == "feed_end" else 3
+    sink({"kind": "viewer_end", "t": time.time(), "ok": rc == 0, "rc": rc,
+          "ended_by": ended_by, **seen})
+    return rc
+
+
 def _cmd_drive(a) -> int:
     """The driver's stream is framed so the evaluator can prove it complete
     (#817): `drive_start` is its first record and `drive_end` (navigation
@@ -3859,6 +3972,8 @@ def _cmd_evaluate(a) -> int:
         from bench import k6eval
         k6 = {"k6": k6eval.read_k6_out(a.k6_out, "k6") if a.k6_out else None,
               "browser": k6eval.read_k6_out(a.browser_out, "browser") if a.browser_out else None,
+              "viewer": k6eval.read_viewer_out(a.k6_out) if a.k6_out else None,
+              "viewers": not a.no_viewers,
               "sessions": a.browser_sessions}
         navs = k6eval.browser_navs(k6["browser"])
     fresh = [r for r in recs if r.get("kind") == "fresh"]
@@ -4002,6 +4117,16 @@ def main(argv: list[str] | None = None) -> int:
     lt.add_argument("--max-concurrency", type=int, default=64)
     lt.add_argument("--out", required=True)
     lt.set_defaults(func=_cmd_login_tokens)
+    vf = sub.add_parser("view-feed", help="#830: open tabs for k6's navigations (sidecar)")
+    vf.add_argument("--snowplow-url", required=True)
+    vf.add_argument("--tokens", required=True, help="login-tokens' file (user order)")
+    vf.add_argument("--user-prefix", default="scaleuser-")
+    vf.add_argument("--feed", required=True, help="k6's console feed (JSON lines)")
+    vf.add_argument("--stop-file", required=True, help="appears when k6 has exited")
+    vf.add_argument("--out", required=True)
+    vf.add_argument("--refetch-workers", type=int, default=64)
+    vf.add_argument("--poll-s", type=float, default=0.2)
+    vf.set_defaults(func=_cmd_view_feed)
     pr = sub.add_parser("pod-record", help="kubectl get pods -o json on stdin -> snowplow_pod record")
     pr.add_argument("--phase", required=True, choices=["before", "after"])
     pr.set_defaults(func=_cmd_pod_record)
@@ -4025,6 +4150,8 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--browser-out", default=None,
                    help="#830: the browser pod's collected /out; its page loads are the verdict's")
     e.add_argument("--browser-sessions", type=int, default=None)
+    e.add_argument("--no-viewers", action="store_true",
+                   help="#830: the run had no open tabs (VIEWERS=0): no viewer checks")
     e.add_argument("--run8", action="store_true",
                    help="add the #710 run-8 memory-risk / stale_to_push report and checks")
     e.set_defaults(func=_cmd_evaluate)
