@@ -191,6 +191,46 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         sys.exit(1)
     if a[:1] == ["exec"] and a[-2:] == ["cat", "/out/done"]:
         print(os.environ.get("FAKE_DRIVE_RC", "0")); sys.exit(0)   # drive's exit code
+    if a[:1] == ["cp"] and any(x.startswith(("k6load", "k6browser")) for x in a):
+        # #830: the k6 / browser pod's /out. FAKE_K6_OUT: whole | dropped
+        # (the burst could not start one iteration) | nobrowser
+        import gzip
+        name = "k6" if any(x.startswith("k6load") for x in a) else "browser"
+        mode = os.environ.get("FAKE_K6_OUT", "whole")
+        if name == "browser" and mode == "nobrowser":
+            print("error: unable to upgrade connection", file=sys.stderr); sys.exit(1)
+        dest = a[-1]
+        os.makedirs(dest, exist_ok=True)
+        def pt(m, v, **tags):
+            return json.dumps({"metric": m, "type": "Point", "data": {"value": v, "tags": tags}})
+        lines = [pt("bench_frame", 1, frame="start")]
+        if name == "k6":
+            for i in range(4):
+                t = {"kind": "route", "route": "/dashboard", "visit": "warm"}
+                lines += [pt("page_load_ms", 80 + i, **t), pt("page_loads", 1, **t)]
+            m = {"page_loads": {"count": 4}, "http_req_failed": {"rate": 0},
+                 "route_table_mismatch": {"count": 0}}
+            for sc, n in (("navigate", 3), ("composite_burst", 1)):
+                m["iterations{scenario:%s}" % sc] = {"count": n}
+                m["dropped_iterations{scenario:%s}" % sc] = {
+                    "count": 1 if mode == "dropped" and sc == "composite_burst" else 0}
+        else:
+            for s in ("s1", "s2", "s3"):
+                lines.append(pt("browser_logins", 1, session=s))
+                for i in range(20):
+                    t = {"session": s, "route": "/r%d" % (i % 4),
+                         "visit": "first" if i < 4 else "warm", "method": "click"}
+                    lines += [pt("browser_page_load_ms", 300 + i, **t),
+                              pt("browser_page_loads", 1, **t)]
+            m = {"browser_page_loads": {"count": 60}}
+        lines.append(pt("bench_frame", 1, frame="end"))
+        with gzip.open(os.path.join(dest, name + ".json.gz"), "wt") as fh:
+            fh.write("\\n".join(lines) + "\\n")
+        with open(os.path.join(dest, name + "-summary.json"), "w") as fh:
+            json.dump({"metrics": m}, fh)
+        with open(os.path.join(dest, name + "-exit.json"), "w") as fh:
+            json.dump({"kind": name + "_exit", "rc": 0}, fh)
+        sys.exit(0)
     if a[:1] == ["cp"] and any(x.startswith("load606") for x in a):
         # The driver's /out/nav.jsonl (#817). FAKE_DRIVE_STREAM: whole (a framed
         # stream) | headcut (run 9: only the tail after log rotation) | nofile.
@@ -336,6 +376,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             sys.exit(0)
         if what == "pods" and "job-name=load606" in a:
             print("pod/load606-0"); sys.exit(0)
+        if what == "pods" and ("job-name=k6load" in a or "job-name=k6browser" in a):
+            print("pod/" + next(x for x in a if x.startswith("job-name=")).split("=")[1] + "-0")
+            sys.exit(0)
+        if what in ("job/k6load", "job/k6browser"):
+            print("1//1"); sys.exit(0)
         if what == "pods" and "job-name=fresh606" in a:
             print("pod/fresh606-0"); sys.exit(0)
         if what == "pods" and "job-name=mem606" in a:
@@ -377,7 +422,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print("preflight REFUSED: /dashboard -> 500", file=sys.stderr)
         else:
             print(json.dumps({"kind": "preflight", "ok": True, "init_status": 200,
-                              "routes": [{"path": "/dashboard", "status": 200}],
+                              "routes": [{"path": p, "status": 200, "endpoint":
+                                          "/call?resource=flexes&name=page" + p.replace("/", "-")}
+                                         for p in ("/dashboard", "/observability", "/compositions")],
                               "refused": [], "product_errors": [
                                   {"path": "/agents/new", "status": 500,
                                    "body": "unexpected end of JSON input"}],
@@ -525,7 +572,7 @@ def harness(tmp_path):
         "RUN_NAME": RUN_NAME, "INSTALLER_VERSION": "0.3.422",
         "SNOWPLOW_TAG": "1.12.46", "OUT": str(tmp_path / "out"),
         "EXPECTED_IMAGE_DIGEST": FAKE_DIGEST, "FAKE_IMAGE_DIGEST": FAKE_DIGEST,
-        "SCALE": "4", "NAMESPACES": "2", "USERS": "2",
+        "SCALE": "4", "NAMESPACES": "2", "USERS": "2", "LOAD_DRIVER": "load606",
         "THINK_S": "0", "DRIVE_S": "1", "CHURN_RATES": "1",
         "FRESH_SAMPLES": "2", "FRESH_GAP_S": "0", "HOLD_PROBE_WAIT_S": "0",
         "PLATFORM_TIMEOUT_S": "1", "PLATFORM_POLL_S": "0.2",

@@ -155,24 +155,33 @@ def _check_name(name: str) -> None:
         raise NotDeletable(f"cluster name {name!r} is not a valid GKE name")
 
 
+# The load generator's node. n2-standard-8 for the Python driver of runs
+# 1-10; run 11's k6 + real-Chrome plan needs ~8.35 CPU of requests, which only
+# an n2-standard-16 holds with headroom (#830; bench/k6_job.loadgen_fit).
+DEFAULT_LOADGEN_MACHINE = "n2-standard-8"
+
+
 def default_spec(name: str | None = None, *, now: float | None = None,
                  owner: str | None = None, ttl_hours: int = DEFAULT_TTL_HOURS,
                  project: str = DEFAULT_PROJECT, zone: str = DEFAULT_ZONE,
                  cluster_version: str = DEFAULT_CLUSTER_VERSION,
-                 kubeconfig_dir: str | None = None) -> ClusterSpec:
+                 kubeconfig_dir: str | None = None,
+                 loadgen_machine_type: str = DEFAULT_LOADGEN_MACHINE) -> ClusterSpec:
     """The #606 cluster shape. See the run plan for the sizing rationale.
 
     - platform pool: 3 x n2-standard-8 (the reference release cluster runs the
       full platform on 3);
     - snowplow pool: 1 x n2-standard-8, tainted, so snowplow's CPU is measured
       without neighbours (057 steady state is 3.2-3.9 cores of a 4-core limit);
-    - loadgen pool: 1 x n2-standard-8, tainted, for the in-cluster load driver,
-      so 1000 virtual users never share a node with what they measure.
+    - loadgen pool: 1 x `loadgen_machine_type` (n2-standard-8; n2-standard-16
+      for run 11's k6 + Chrome, #830), tainted, for the in-cluster load
+      driver, so 1000 virtual users never share a node with what they measure.
 
     Quota-shaped (read 2026-10-14, operations-dev-krateo-io / europe-west4):
     E2_CPUS limit is 24, so every pool is N2 (N2_CPUS 200); SSD_TOTAL_GB has
     ~133 GB free, so node disks are pd-standard (DISKS_TOTAL_GB 4096);
     IN_USE_ADDRESSES is 16 with 3 used, so 5 nodes + ~5 LoadBalancers fit.
+    With an n2-standard-16 loadgen the cluster is 48 N2 vCPUs (40 before).
     """
     now = time.time() if now is None else now
     if name is None:
@@ -184,7 +193,7 @@ def default_spec(name: str | None = None, *, now: float | None = None,
         NodePool("snowplow", "n2-standard-8", 1,
                  taint=("dedicated", "snowplow", "NoSchedule"),
                  labels=(("bench.krateo.io/pool", "snowplow"),)),
-        NodePool("loadgen", "n2-standard-8", 1,
+        NodePool("loadgen", loadgen_machine_type, 1,
                  taint=("dedicated", "loadgen", "NoSchedule"),
                  labels=(("bench.krateo.io/pool", "loadgen"),)),
     )
@@ -580,7 +589,9 @@ def _spec_from_args(a) -> ClusterSpec:
                         ttl_hours=getattr(a, "ttl_hours", DEFAULT_TTL_HOURS),
                         project=a.project, zone=a.zone,
                         cluster_version=getattr(a, "cluster_version",
-                                                DEFAULT_CLUSTER_VERSION))
+                                                DEFAULT_CLUSTER_VERSION),
+                        loadgen_machine_type=getattr(a, "loadgen_machine_type",
+                                                     DEFAULT_LOADGEN_MACHINE))
 
 
 def cmd_gke_up(a) -> int:
@@ -711,6 +722,8 @@ def add_parsers(sub) -> None:
     up.add_argument("--owner", default=None)
     up.add_argument("--ttl-hours", type=int, default=DEFAULT_TTL_HOURS)
     up.add_argument("--cluster-version", default=DEFAULT_CLUSTER_VERSION)
+    up.add_argument("--loadgen-machine-type", default=DEFAULT_LOADGEN_MACHINE,
+                    help="#830: n2-standard-16 for run 11's k6 + Chrome load")
     up.set_defaults(func=cmd_gke_up)
 
     down = sub.add_parser("gke-down", help="#606: delete a bench cluster "

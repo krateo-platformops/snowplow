@@ -82,6 +82,20 @@ USERS="${USERS:-1000}"
 NAMESPACES="${NAMESPACES:-50}"
 THINK_S="${THINK_S:-60}"
 DRIVE_S="${DRIVE_S:-1800}"
+# #830 (run 11): the load = k6 (1,000 users, arrival-rate) + real Chrome
+# sessions whose page loads the north-star bars judge. load606 = the Python
+# driver of runs 1-10, kept for comparison.
+LOAD_DRIVER="${LOAD_DRIVER:-k6}"
+case "$LOAD_DRIVER" in k6|load606) ;; *) echo "refusing: LOAD_DRIVER must be k6 or load606" >&2; exit 2 ;; esac
+BROWSER_SESSIONS="${BROWSER_SESSIONS:-5}"
+# k6 + Chrome need ~8.35 CPU of requests on the load node: only an
+# n2-standard-16 fits them (bench/k6_job.loadgen_fit refuses the render otherwise).
+if [[ "$LOAD_DRIVER" == "k6" ]]; then LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-16}"
+else LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-8}"; fi
+BROWSER_THINK_S="${BROWSER_THINK_S:-15}"
+# Inside the browser pod, the frontend's localhost URLs (its config.json was
+# made for a port-forwarding operator) are forwarded to the cluster Services.
+BROWSER_FORWARDS="${BROWSER_FORWARDS:-8080=frontend.krateo-system.svc:8080 8081=snowplow.krateo-system.svc:8081 8082=authn.krateo-system.svc:8082}"
 CHURN_RATES="${CHURN_RATES:-1 10 50}"
 FRESH_SAMPLES="${FRESH_SAMPLES:-60}"
 FRESH_GAP_S="${FRESH_GAP_S:-5}"
@@ -346,7 +360,7 @@ s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
 s_up() {
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
-      --zone "$ZONE" --ttl-hours "$TTL_HOURS" $YES
+      --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES
   run "${K[@]}" version
 }
 s_install() {
@@ -557,6 +571,10 @@ s_measure() {
       --burst-users "$COMPOSITE_BURST_USERS" --burst-at-s "$COMPOSITE_BURST_AT_S" \
       ${COMPOSITE_ROUTES[@]+$(printf -- '--composite-route %q ' "${COMPOSITE_ROUTES[@]}")} \
       $([[ "$VIEWERS" == "1" ]] || printf -- '--no-viewers') \
+      --driver "$LOAD_DRIVER" --preflight-file "$OUT/preflight.jsonl" $([[ "$DRY" == "1" ]] && printf -- "--dry-run") \
+      --browser-sessions "$BROWSER_SESSIONS" --browser-think-s "$BROWSER_THINK_S" \
+      --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" \
+      $(for x in $BROWSER_FORWARDS; do printf -- '--browser-forward %s ' "$x"; done) \
       > "$OUT/loadgen-job.yaml"
   # snowplow's restart state BEFORE measure (the verdict compares after/before:
   # any restart or OOM during measure makes the run INVALID, with its reason).
@@ -575,47 +593,54 @@ s_measure() {
     return 1
   fi
 }
-# wait_drive_done <deadline>: every load606 pod is Ready, i.e. its drive has
-# exited and /out/nav.jsonl is final (load606_job: readinessProbe on
-# /out/done). The pods then stay up for collect, so the Job is NOT Complete
-# here. A failed driver pod fails the step at once, not at the deadline.
+# driver_jobs: the in-cluster Jobs that drive the load. load606: the Python
+# driver; k6 (#830, run 11): the k6 1,000-user load and the real-Chrome
+# sessions. Each one's pods turn Ready when their run is over and their
+# results under /out are final; they then stay up for collect.
+driver_jobs() { if [[ "$LOAD_DRIVER" == "k6" ]]; then echo "k6load k6browser"; else echo "load606"; fi; }
+# wait_drive_done <deadline>: every driver Job's pods are Ready (readinessProbe
+# on /out/done), so the Jobs are NOT Complete here. A failed driver pod fails
+# the step at once, not at the deadline.
 wait_drive_done() {
-  local deadline="$1" st ready failed want
-  if [[ "$DRY" == "1" ]]; then log "DRY: wait until every load606 pod is Ready (drive over)"; return 0; fi
-  log "waiting for the driver: load606 pods Ready = drive exited, results final"
-  while true; do
-    st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get job/load606 \
-          -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>/dev/null || true)"
-    IFS=/ read -r ready failed want <<< "$st"
-    if [[ -n "$want" && "${ready:-0}" -ge "$want" ]]; then
-      driver_exit_codes "${ready}/${want}"
-      return 0
-    fi
-    if [[ "${failed:-0}" -ge 1 ]]; then
-      log "measure FAILED: a load606 driver pod failed before its results were final"
-      return 1
-    fi
-    if (( $(date +%s) >= deadline )); then
-      log "measure FAILED: load606 driver not done within ${MEASURE_WAIT_S}s (${ready:-0}/${want:-?} Ready)"
-      return 1
-    fi
-    sleep "$DRIVE_POLL_S"
+  local deadline="$1" st ready failed want j
+  if [[ "$DRY" == "1" ]]; then log "DRY: wait until every $(driver_jobs) pod is Ready (run over)"; return 0; fi
+  for j in $(driver_jobs); do
+    log "waiting for the driver: $j pods Ready = run over, results final"
+    while true; do
+      st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$j" \
+            -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>/dev/null || true)"
+      IFS=/ read -r ready failed want <<< "$st"
+      want="${want:-1}"
+      if [[ -n "$st" && "${ready:-0}" -ge "$want" ]]; then
+        driver_exit_codes "$j" "${ready}/${want}"
+        break
+      fi
+      if [[ "${failed:-0}" -ge 1 ]]; then
+        log "measure FAILED: a $j driver pod failed before its results were final"
+        return 1
+      fi
+      if (( $(date +%s) >= deadline )); then
+        log "measure FAILED: $j not done within ${MEASURE_WAIT_S}s (${ready:-0}/${want} Ready)"
+        return 1
+      fi
+      sleep "$DRIVE_POLL_S"
+    done
   done
 }
-# driver_exit_codes <ready>: Ready only says the drive is OVER; each pod's
-# /out/done holds drive's exit code (load606_job), and the log says which it
-# was. A non-zero exit is not a measure failure (fresh606 still runs and its
-# samples stand); the verdict makes the run INVALID with the driver's reason.
+# driver_exit_codes <job> <ready>: Ready only says the run is OVER; each
+# pod's /out/done holds its exit code, and the log says which it was. A
+# non-zero exit is not a measure failure (fresh606 still runs and its samples
+# stand); the verdict makes the run INVALID with the reason.
 driver_exit_codes() {
-  local p rc bad=""
-  for p in $("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l job-name=load606 -o name 2>/dev/null); do
+  local j="$1" p rc bad=""
+  for p in $("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$j" -o name 2>/dev/null); do
     rc="$(bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "${p#pod/}" -- cat /out/done 2>/dev/null | tr -d '[:space:]')"
     [[ "$rc" == "0" ]] || bad+=" ${p#pod/}=rc${rc:-?}"
   done
   if [[ -z "$bad" ]]; then
-    log "driver done: $1 load606 pod(s) Ready, every drive exited 0"
+    log "driver done: $2 $j pod(s) Ready, every run exited 0"
   else
-    log "driver FAILED:${bad} (drive over, results kept; verdict.json says why)"
+    log "driver FAILED:${bad} (run over, results kept; verdict.json says why)"
   fi
 }
 snowplow_pod_record() {
@@ -732,6 +757,19 @@ s_collect() {
     "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/driver-${p#pod/}.log" \
       || log "could not read the driver's diagnostics log from ${p#pod/}"
   done
+  # #830: the k6 pod's and the browser pod's whole /out (metric stream,
+  # summary, exit record) — never their container logs.
+  local j dir
+  for j in k6load k6browser; do
+    dir="$OUT/$([[ "$j" == "k6load" ]] && echo k6 || echo browser)"
+    for p in $("${KR[@]}" -n bench-loadgen get pods -l "job-name=$j" -o name); do
+      mkdir -p "$dir"
+      "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out" "$dir" >/dev/null 2>&1 \
+        || log "could not copy $j's results (/out) from ${p#pod/}: the verdict will say the stream is missing or incomplete"
+      "${KR[@]}" -n bench-loadgen logs "$p" --all-containers > "$OUT/driver-${p#pod/}.log" \
+        || log "could not read $j's diagnostics log from ${p#pod/}"
+    done
+  done
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=fresh606 -o name); do
     "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/fresh-${p#pod/}.jsonl" \
       || log "could not read the fresh606 log from ${p#pod/}"
@@ -743,7 +781,7 @@ s_collect() {
   # has no pod at all makes the run INVALID with its reason in verdict.json.
   # Before mem606's bounded stop, so nothing slow can come between.
   : > "$OUT/job-pods.jsonl"
-  for p in load606 fresh606 mem606; do
+  for p in $(driver_jobs) fresh606 mem606; do
     "${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>/dev/null \
       | python3 -m bench.load606 job-pod-record --job "$p" >> "$OUT/job-pods.jsonl" \
       || log "could not record how the $p pod(s) ended"
@@ -812,10 +850,13 @@ s_evaluate() {
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
   local vrc=0
-  local r8=()
+  local r8=() k6args=()
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
+  # #830: the page loads are the real browsers'; k6 is the load
+  [[ "$LOAD_DRIVER" == "k6" ]] && k6args=(--k6-out "$OUT/k6" --browser-out "$OUT/browser"
+                                          --browser-sessions "$BROWSER_SESSIONS")
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
-      --expect-digest "$EXPECTED_IMAGE_DIGEST" > "$OUT/verdict.json" || vrc=$?
+      --expect-digest "$EXPECTED_IMAGE_DIGEST" ${k6args[@]+"${k6args[@]}"} > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
   # Every INVALID reason in the run log, not only in verdict.json (#817: run
   # 9's zero navigations surfaced only as `warm_navs 0`).

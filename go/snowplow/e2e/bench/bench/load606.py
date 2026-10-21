@@ -2552,7 +2552,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              fresh_viewers: list[dict] | None = None,
              mem_streams: list[dict] | None = None,
              job_pods: list[dict] | None = None,
-             viewer_dead: list[dict] | None = None) -> dict:
+             viewer_dead: list[dict] | None = None,
+             k6: dict | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -2561,7 +2562,12 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     `driver_streams` (driver_stream(), one per collected driver file) proves
     the navigation records are the driver's WHOLE output; None = not checked
     (callers that hand in records directly).
+    `k6` (#830, run 11): {"k6", "browser": k6eval.read_k6_out(...), "sessions",
+    "thresholds"}; `navs` are then the real-browser page loads.
     """
+    if k6 is not None:
+        # operator side only: this file also runs alone inside the Job pods
+        from bench import k6eval
     th = dict(THRESHOLDS, **(thresholds or {}))
     checks: list[dict] = []
     validity: list[dict] = []
@@ -2624,18 +2630,33 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     if not fresh:
         _check("fresh_p95_ms", None, "<=", th["fresh_p95_ms"], checks)
 
-    _check("driver.sched_lag_p95_ms",
-           pct([n.get("sched_lag_ms", 0) for n in navs], 95), "<=",
-           th["max_sched_lag_p95_ms"], validity)
-    _check("driver.error_rate", round(errors / calls, 4) if calls else None,
-           "<=", th["max_error_rate"], validity)
-    _check("driver.warm_navs", len(warm), ">=", th["min_warm_navs"], validity)
+    if k6 is not None:
+        # #830 run 11: navs are the REAL-BROWSER page loads; the load comes
+        # from k6, whose own validity (stream, dropped iterations, errors,
+        # route table) and the browser sessions' replace load606's driver checks.
+        validity.extend(k6eval.k6_checks(k6.get("k6"), k6.get("thresholds")))
+        validity.extend(k6eval.browser_checks(k6.get("browser"), k6.get("sessions"),
+                                              k6.get("thresholds")))
+        timeouts = (k6eval.browser_report(k6.get("browser")) or {}).get("timeouts")
+        checks.append({"check": "browser.page_timeouts", "value": timeouts, "bar": "== 0",
+                       "result": "PASS" if timeouts == 0 else "FAIL",
+                       **({} if timeouts == 0 else
+                          {"why": "a real-browser page did not finish loading within its "
+                                  "timeout: the worst page load there is"})})
+    else:
+        _check("driver.sched_lag_p95_ms",
+               pct([n.get("sched_lag_ms", 0) for n in navs], 95), "<=",
+               th["max_sched_lag_p95_ms"], validity)
+        _check("driver.error_rate", round(errors / calls, 4) if calls else None,
+               "<=", th["max_error_rate"], validity)
+        _check("driver.warm_navs", len(warm), ">=", th["min_warm_navs"], validity)
     if not navs:
         validity.append({"check": "driver.navs_recorded", "value": 0, "bar": ">= 1",
                          "result": "FAIL",
-                         "why": "the driver recorded zero navigations: there are no "
-                                "page-load times to evaluate"})
-    if driver_streams is not None:
+                         "why": ("no real-browser page load was recorded" if k6 is not None
+                                 else "the driver recorded zero navigations") +
+                                ": there are no page-load times to evaluate"})
+    if driver_streams is not None and k6 is None:      # run 11 has no load606 driver
         validity.extend(driver_stream_checks(driver_streams))
     if mem_streams is not None:
         # Required once mem606 was deployed (it has a job_pod record): a
@@ -2696,6 +2717,10 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["memory"] = memory_report(mem or [])
     report["key_rotation_report_only"] = rotation_report(mem or [])
     report["harness_notes"] = list(HARNESS_NOTES)
+    if k6 is not None:
+        report["page_loads_are"] = "real Chrome sessions (k6 browser), first visit vs warm per session"
+        report["browser"] = k6eval.browser_report(k6.get("browser"))
+        report["k6_report_only"] = k6eval.k6_report(k6.get("k6"))
     report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
     fv = [f for f in fresh if f.get("valid") is False]
     report["fresh_invalid_samples"] = len(fv)
@@ -3285,6 +3310,27 @@ def _cmd_preflight(a) -> int:
     return 0
 
 
+def _cmd_login_tokens(a) -> int:
+    """#830: sign users start..end in through authn (the adaptive ramp, capped
+    at --max-concurrency) and write their bearer tokens, in user order, to
+    --out — a file INSIDE the k6 pod (an emptyDir), never collected or logged.
+    Exit 2 when any user could not sign in: a partial population is refused,
+    as `drive` refuses it."""
+    users = [f"{a.user_prefix}{i:04d}" for i in range(a.user_start, a.user_end + 1)]
+    tokens, curve, failed = adaptive_login(
+        users, lambda u: login(a.authn_url, u, a.password), cmax=a.max_concurrency)
+    print(json.dumps({"kind": "login_curve", "users": len(users), "failed": len(failed),
+                      "cmax": a.max_concurrency, "curve": curve}), flush=True)
+    if failed:
+        print(f"only {len(tokens)}/{len(users)} users signed in; refusing a partial population",
+              file=sys.stderr, flush=True)
+        return 2
+    fd = os.open(a.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump([tokens[u] for u in users], fh)
+    return 0
+
+
 def _cmd_drive(a) -> int:
     """The driver's stream is framed so the evaluator can prove it complete
     (#817): `drive_start` is its first record and `drive_end` (navigation
@@ -3807,6 +3853,14 @@ def _cmd_evaluate(a) -> int:
         if ms is not None:
             mem_streams.append(ms)
     navs = [r for r in recs if r.get("kind") == "nav"]
+    k6 = None
+    if a.k6_out is not None or a.browser_out is not None:
+        # #830 run 11: page loads come from the real browsers; k6 is the load
+        from bench import k6eval
+        k6 = {"k6": k6eval.read_k6_out(a.k6_out, "k6") if a.k6_out else None,
+              "browser": k6eval.read_k6_out(a.browser_out, "browser") if a.browser_out else None,
+              "sessions": a.browser_sessions}
+        navs = k6eval.browser_navs(k6["browser"])
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     vs = sorted((r for r in recs if r.get("kind") == "vars"
                  and not r.get("unreadable")), key=lambda r: r.get("t", 0))
@@ -3831,7 +3885,8 @@ def _cmd_evaluate(a) -> int:
                       mem_streams=mem_streams,
                       job_pods=[r for r in recs if r.get("kind") == "job_pod"],
                       viewer_dead=sorted((r for r in recs if r.get("kind") == "viewer_dead"),
-                                         key=lambda r: r.get("t") or 0))
+                                         key=lambda r: r.get("t") or 0),
+                      k6=k6)
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
@@ -3938,6 +3993,15 @@ def main(argv: list[str] | None = None) -> int:
     jp.set_defaults(func=lambda a: print("\n".join(
         json.dumps(r) for r in job_pod_records(json.loads(sys.stdin.read() or "{}"), a.job)))
         or 0)
+    lt = sub.add_parser("login-tokens", help="#830: sign users in; bearer tokens to a pod-local file")
+    lt.add_argument("--authn-url", required=True)
+    lt.add_argument("--password", required=True)
+    lt.add_argument("--user-prefix", default="scaleuser-")
+    lt.add_argument("--user-start", type=int, required=True)
+    lt.add_argument("--user-end", type=int, required=True)
+    lt.add_argument("--max-concurrency", type=int, default=64)
+    lt.add_argument("--out", required=True)
+    lt.set_defaults(func=_cmd_login_tokens)
     pr = sub.add_parser("pod-record", help="kubectl get pods -o json on stdin -> snowplow_pod record")
     pr.add_argument("--phase", required=True, choices=["before", "after"])
     pr.set_defaults(func=_cmd_pod_record)
@@ -3956,6 +4020,11 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("inputs", nargs="+")
     e.add_argument("--expect-digest", default=None,
                    help="INVALID (VOID) unless the image-digest gate and pod records show this digest")
+    e.add_argument("--k6-out", default=None,
+                   help="#830: the k6 pod's collected /out (k6.json.gz, summary, exit)")
+    e.add_argument("--browser-out", default=None,
+                   help="#830: the browser pod's collected /out; its page loads are the verdict's")
+    e.add_argument("--browser-sessions", type=int, default=None)
     e.add_argument("--run8", action="store_true",
                    help="add the #710 run-8 memory-risk / stale_to_push report and checks")
     e.set_defaults(func=_cmd_evaluate)
