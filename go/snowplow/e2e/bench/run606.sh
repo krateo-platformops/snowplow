@@ -72,6 +72,7 @@ DIGEST_POLL_S="${DIGEST_POLL_S:-5}"
 # Bound on each kubectl read in the collect step (it also runs from the
 # teardown trap after a failed measure, #763).
 COLLECT_TIMEOUT_S="${COLLECT_TIMEOUT_S:-300}"
+DRIVE_POLL_S="${DRIVE_POLL_S:-30}"     # measure: is every driver pod Ready (drive over)?
 MEASURE_STARTED=0
 COLLECTED=0
 SCALE="${SCALE:-50000}"
@@ -522,8 +523,11 @@ s_digest() {
 }
 s_measure() {
   # Load: in-cluster on the tainted loadgen pool, one Indexed-Job pod per
-  # shard. Each pod streams its JSONL to stdout (per nav, flushed) and the
-  # collect step reads it back with `kubectl logs`. The page roots are the
+  # shard. Each pod writes its JSONL to /out/nav.jsonl (per nav, flushed),
+  # turns Ready when the drive is over, and stays up so the collect step can
+  # `kubectl cp` the file (#817: run 9 read it from stdout with `kubectl
+  # logs`, which after log rotation returned only the last ~10 minutes and
+  # none of the navigations). The page roots are the
   # harness's known page widgets; drive's preflight refuses if any is not 200
   # on this portal version.
   # Both Jobs run IN-CLUSTER on the loadgen pool and reach snowplow/authn by
@@ -535,6 +539,7 @@ s_measure() {
   # shellcheck disable=SC2086
   python3 -m bench.load606_job --users "$USERS" --shards 1 \
       --think-s "$THINK_S" --duration-s "$DRIVE_S" \
+      --linger-s "$(( MEASURE_WAIT_S + COLLECT_CAP_S ))" \
       --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" --password "$PW" \
       --init "$PORTAL_INIT" --frontend-ns "$PORTAL_FRONTEND_NS" \
       --builders-ns "$PORTAL_BUILDERS_NS" \
@@ -556,12 +561,41 @@ s_measure() {
   start_top_loop
   MEASURE_STARTED=1
   run "${K[@]}" apply -f "$OUT/loadgen-job.yaml"
-  if ! run "${K[@]}" -n bench-loadgen wait job/load606 job/fresh606 --for=condition=Complete \
-      --timeout="${MEASURE_WAIT_S}s"; then
-    # The teardown trap collects what exists before the cluster goes (#763).
-    log "measure FAILED: load606/fresh606 not Complete within ${MEASURE_WAIT_S}s"
+  local deadline=$(( $(date +%s) + MEASURE_WAIT_S ))
+  # The teardown trap collects what exists before the cluster goes (#763).
+  wait_drive_done "$deadline" || return 1
+  if ! run "${K[@]}" -n bench-loadgen wait job/fresh606 --for=condition=Complete \
+      --timeout="$(( deadline > $(date +%s) ? deadline - $(date +%s) : 1 ))s"; then
+    log "measure FAILED: fresh606 not Complete within ${MEASURE_WAIT_S}s"
     return 1
   fi
+}
+# wait_drive_done <deadline>: every load606 pod is Ready, i.e. its drive has
+# exited and /out/nav.jsonl is final (load606_job: readinessProbe on
+# /out/done). The pods then stay up for collect, so the Job is NOT Complete
+# here. A failed driver pod fails the step at once, not at the deadline.
+wait_drive_done() {
+  local deadline="$1" st ready failed want
+  if [[ "$DRY" == "1" ]]; then log "DRY: wait until every load606 pod is Ready (drive over)"; return 0; fi
+  log "waiting for the driver: load606 pods Ready = drive exited, results final"
+  while true; do
+    st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get job/load606 \
+          -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>/dev/null || true)"
+    IFS=/ read -r ready failed want <<< "$st"
+    if [[ -n "$want" && "${ready:-0}" -ge "$want" ]]; then
+      log "driver done: ${ready}/${want} load606 pod(s) Ready"
+      return 0
+    fi
+    if [[ "${failed:-0}" -ge 1 ]]; then
+      log "measure FAILED: a load606 driver pod failed before its results were final"
+      return 1
+    fi
+    if (( $(date +%s) >= deadline )); then
+      log "measure FAILED: load606 driver not done within ${MEASURE_WAIT_S}s (${ready:-0}/${want:-?} Ready)"
+      return 1
+    fi
+    sleep "$DRIVE_POLL_S"
+  done
 }
 snowplow_pod_record() {
   local phase="$1"
@@ -589,7 +623,7 @@ stop_top_loop() {
 s_collect() {
   local p
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: kubectl logs <each load606 pod> > $OUT/nav-<pod>.jsonl"
+    log "DRY: kubectl cp <each load606 pod>:/out/nav.jsonl $OUT/nav-<pod>.jsonl"
     return 0
   fi
   # Every piece is best effort and bounded: this also runs from the teardown
@@ -599,9 +633,14 @@ s_collect() {
   # --request-timeout does not bound an open exec stream (`kubectl cp`). The
   # whole collect + evaluate runs under ONE cap (COLLECT_CAP_S, see `capped`).
   local KR=(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
+  # The driver's results are the FILE on its /out (#817), never its container
+  # log: the kubelet rotates that, and `kubectl logs` returns only the current
+  # file. The log keeps the driver's diagnostics.
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=load606 -o name); do
-    "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/nav-${p#pod/}.jsonl" \
-      || log "could not read the driver log from ${p#pod/}"
+    "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out/nav.jsonl" "$OUT/nav-${p#pod/}.jsonl" >/dev/null 2>&1 \
+      || log "could not copy the driver's results (/out/nav.jsonl) from ${p#pod/}: the verdict will say the stream is missing or incomplete"
+    "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/driver-${p#pod/}.log" \
+      || log "could not read the driver's diagnostics log from ${p#pod/}"
   done
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=fresh606 -o name); do
     "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/fresh-${p#pod/}.jsonl" \
@@ -609,13 +648,17 @@ s_collect() {
   done
   snowplow_pod_record after
   declare -F stop_top_loop >/dev/null && stop_top_loop
-  # mem606: its memstats trajectory (logs) and heap profiles (files in /out).
+  # mem606: its memstats trajectory and heap profiles, both files in /out
+  # (#817: its stdout log was cut at the head too in run 9).
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=mem606 -o name); do
-    "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/mem-${p#pod/}.jsonl" \
-      || log "could not read the mem606 log from ${p#pod/}"
     mkdir -p "$OUT/heap"
     "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out" "$OUT/heap" >/dev/null 2>&1 \
       || log "could not copy heap profiles from ${p#pod/}"
+    if [[ -f "$OUT/heap/mem.jsonl" ]]; then
+      mv "$OUT/heap/mem.jsonl" "$OUT/mem-${p#pod/}.jsonl"
+    else
+      log "could not copy the mem606 trajectory (/out/mem.jsonl) from ${p#pod/}"
+    fi
   done
   "${KR[@]}" -n krateo-system logs deploy/snowplow --tail=-1 > "$OUT/snowplow.log" \
     || log "could not read the snowplow log"
@@ -640,6 +683,13 @@ s_evaluate() {
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
+  # Every INVALID reason in the run log, not only in verdict.json (#817: run
+  # 9's zero navigations surfaced only as `warm_navs 0`).
+  local r
+  while IFS= read -r r; do
+    [[ -n "$r" ]] && log "INVALID: $r"
+  done < <(python3 -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1])).get("invalid_reasons") or []))' \
+             "$OUT/verdict.json" 2>/dev/null || true)
 }
 
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus ${TTL_MARGIN_S} s"

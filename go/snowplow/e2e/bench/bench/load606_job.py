@@ -2,9 +2,9 @@
 
 Namespace + ConfigMap (carrying bench/load606.py verbatim) + an Indexed Job
 with one pod per shard, pinned to the tainted `loadgen` pool. Each pod drives
-users [start, end] of its shard and streams JSONL to stdout; only shard 0
-samples /debug/vars (one sampler, not N, so the sampler's own reads are a
-known constant).
+users [start, end] of its shard and writes JSONL to its /out (DRIVE_OUT, read
+back with `kubectl cp`); only shard 0 samples /debug/vars (one sampler, not N,
+so the sampler's own reads are a known constant).
 
 The password is passed on the command line of a short-lived Job on a
 throwaway cluster, for synthetic test users only; it is the same fixed test
@@ -22,6 +22,10 @@ __all__ = ["render", "shard_ranges", "main"]
 
 LOAD606_SRC = Path(__file__).with_name("load606.py")
 IMAGE = "python:3.12-slim"
+# Result files on the pods' /out emptyDir (#817): never stdout, whose container
+# log the kubelet rotates under the reader.
+DRIVE_OUT = "/out/nav.jsonl"
+MEM_OUT = "/out/mem.jsonl"
 
 
 def shard_ranges(users: int, shards: int) -> list[tuple[int, int]]:
@@ -47,7 +51,8 @@ def render(*, users: int, shards: int, think_s: float, duration_s: float,
            init: str, frontend_ns: str = "krateo-system",
            builders_ns: str = "krateo-system", src: str | None = None,
            composite_routes: list[str] | tuple = (), burst_users: int = 0,
-           burst_at_s: float = 600.0, viewers: bool = True) -> str:
+           burst_at_s: float = 600.0, viewers: bool = True,
+           linger_s: float = 3600.0) -> str:
     if not init.startswith("/call"):
         raise ValueError("init must be the frontend config.json api.INIT /call path")
     src = LOAD606_SRC.read_text() if src is None else src
@@ -63,6 +68,12 @@ def render(*, users: int, shards: int, think_s: float, duration_s: float,
     if burst_users > 0:
         burst_args = (f" --burst-users \"$BURST\" --burst-at-s {burst_at_s:g}"
                       + "".join(f" --composite-route {json.dumps(r)}" for r in composite_routes))
+    # The results go to a FILE on the pod's /out, never to stdout (#817): the
+    # kubelet rotates container logs at a size cap and `kubectl logs` returns
+    # only the current file, so run 9's ~30 min of navigations were gone by
+    # collect. When drive exits the wrapper appends its exit code, marks
+    # /out/done (the pod turns Ready: its results are final) and stays up for
+    # `kubectl cp` until linger_s.
     script = f"""set -eu
 case "$JOB_COMPLETION_INDEX" in
 {case}
@@ -70,11 +81,17 @@ case "$JOB_COMPLETION_INDEX" in
 esac
 VARS=0; [ "$JOB_COMPLETION_INDEX" = "0" ] && VARS=15
 BURST=0; [ "$JOB_COMPLETION_INDEX" = "{shards - 1}" ] && BURST={burst_users}
-exec python3 -u /opt/load606/load606.py drive \\
+rc=0
+python3 -u /opt/load606/load606.py drive \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --password {json.dumps(password)} --user-start "$S" --user-end "$E" \\
   --think-s {think_s} --duration-s {duration_s} --vars-interval "$VARS" \\
-  {portal_args}{burst_args}{"" if viewers else " --no-viewers"} --out /dev/stdout
+  {portal_args}{burst_args}{"" if viewers else " --no-viewers"} --out {DRIVE_OUT} || rc=$?
+printf '{{"kind": "drive_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" >> {DRIVE_OUT}
+echo "drive exited rc=$rc; results in {DRIVE_OUT}; holding {linger_s:g}s for collect"
+touch /out/done
+sleep {linger_s:g}
+exit "$rc"
 """
     return f"""\
 apiVersion: v1
@@ -127,13 +144,21 @@ spec:
           requests:
             cpu: "3"
             memory: 4Gi
+        readinessProbe:
+          exec:
+            command: ["test", "-f", "/out/done"]
+          periodSeconds: 10
         volumeMounts:
         - name: src
           mountPath: /opt/load606
+        - name: out
+          mountPath: /out
       volumes:
       - name: src
         configMap:
           name: load606
+      - name: out
+        emptyDir: {{}}
 """
 
 
@@ -219,7 +244,7 @@ exec python3 -u /opt/load606/load606.py memwatch \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --user {json.dumps(user)} --password {json.dumps(password)} \\
   --duration-s {duration_s:g} --interval-s {interval_s:g} \\
-  --profile-every-s {profile_every_s:g} --out-dir /out --out /dev/stdout{"".join(f" --vars-prefix {json.dumps(x)}" for x in vars_prefixes)}
+  --profile-every-s {profile_every_s:g} --out-dir /out --out {MEM_OUT}{"".join(f" --vars-prefix {json.dumps(x)}" for x in vars_prefixes)}
 """
     return f"""\
 ---
@@ -383,6 +408,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--shards", type=int, default=2)
     p.add_argument("--think-s", type=float, default=60.0)
     p.add_argument("--duration-s", type=float, default=1800.0)
+    p.add_argument("--linger-s", type=float, default=3600.0,
+                   help="how long a finished driver pod stays up for collect (kubectl cp)")
     p.add_argument("--snowplow-url", required=True)
     p.add_argument("--authn-url", required=True)
     p.add_argument("--password", required=True)
@@ -429,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
                             builders_ns=a.builders_ns,
                             composite_routes=a.composite_route or [],
                             burst_users=a.burst_users, burst_at_s=a.burst_at_s,
-                            viewers=not a.no_viewers))
+                            viewers=not a.no_viewers, linger_s=a.linger_s))
     if a.mem_duration_s > 0:
         sys.stdout.write(render_mem(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,

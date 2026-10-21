@@ -170,14 +170,32 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         dest = a[-1]
         os.makedirs(dest, exist_ok=True)
         open(os.path.join(dest, "heap-01-150000-ready.pb.gz"), "wb").write(b"\\x1f\\x8bfake")
+        with open(os.path.join(dest, "mem.jsonl"), "w") as fh:      # /out/mem.jsonl (#817)
+            for r in ({"kind": "mem", "t": 1.0, "readyz": 200, "vars_status": 200,
+                       "heap_inuse_mb": 1392.8, "sys_mb": 1551.9},
+                      {"kind": "heap_profile", "t": 1.0, "profile": "heap-01-150000-ready.pb.gz",
+                       "bytes": 152190, "at": "ready"},
+                      {"kind": "mem", "t": 16.0, "readyz": 200, "vars_status": 200,
+                       "heap_inuse_mb": 3789.4, "sys_mb": 6741.5}):
+                fh.write(json.dumps(r) + "\\n")
         sys.exit(0)
-    if a[:1] == ["logs"] and any("mem606" in x for x in a):
-        print(json.dumps({"kind": "mem", "t": 1.0, "readyz": 200, "vars_status": 200,
-                          "heap_inuse_mb": 1392.8, "sys_mb": 1551.9}))
-        print(json.dumps({"kind": "heap_profile", "t": 1.0, "profile": "heap-01-150000-ready.pb.gz",
-                          "bytes": 152190, "at": "ready"}))
-        print(json.dumps({"kind": "mem", "t": 16.0, "readyz": 200, "vars_status": 200,
-                          "heap_inuse_mb": 3789.4, "sys_mb": 6741.5}))
+    if a[:1] == ["cp"] and any(x.startswith("load606") for x in a):
+        # The driver's /out/nav.jsonl (#817). FAKE_DRIVE_STREAM: whole (a framed
+        # stream) | headcut (run 9: only the tail after log rotation) | nofile.
+        time.sleep(float(os.environ.get("FAKE_SLOW_LOGS", "0")))   # a slow / hung read
+        mode = os.environ.get("FAKE_DRIVE_STREAM", "whole")
+        if mode == "nofile":
+            print("tar: /out/nav.jsonl: Cannot stat", file=sys.stderr); sys.exit(1)
+        navs = [{"kind": "nav", "user": "scaleuser-0001", "page": "p", "visit": v,
+                 "wall_ms": 50, "calls": 3, "errors": 0, "sched_lag_ms": 1} for v in (1, 2)]
+        recs = ([{"kind": "drive_start", "t": 1.0}] + navs
+                + [{"kind": "drive_end", "t": 2.0, "ok": True, "rc": 0, "reason": None,
+                    "navs": 2}, {"kind": "drive_exit", "rc": 0, "t": 2}])
+        if mode == "headcut":
+            recs = [{"kind": "push_refetch", "t_event": 1.5, "status": 200},
+                    {"kind": "vars", "t": 1.6}]
+        with open(a[-1], "w") as fh:
+            fh.writelines(json.dumps(r) + "\\n" for r in recs)
         sys.exit(0)
     if a[:1] == ["get"] and "json" in a:
         what = a[1]
@@ -305,6 +323,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print(json.dumps({"api": {"INIT": init, "BUILDERS_NAMESPACE": "krateo-system"},
                               "params": {"FRONTEND_NAMESPACE": "krateo-system"}}))
             sys.exit(0)
+        if what == "job/load606":                       # ready/failed/completions
+            print("/1/1" if os.environ.get("FAKE_DRIVER_FAILED") == "1" else "1//1")
+            sys.exit(0)
         if what == "job" and "preflight606" in a:
             refused = os.environ.get("FAKE_PREFLIGHT", "ok") == "refused"
             if any(x.endswith("{.status.succeeded}") for x in a):
@@ -338,12 +359,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                                   "polls": 2, "poll_ms": 100}))
         sys.exit(0)
     if a[:1] == ["logs"] and any("load606" in x for x in a):
-        time.sleep(float(os.environ.get("FAKE_SLOW_LOGS", "0")))   # a slow / hung read
-        for v in (1, 2):
-            print(json.dumps({"kind": "nav", "user": "scaleuser-0001", "page": "p",
-                              "visit": v, "wall_ms": 50, "calls": 3, "errors": 0,
-                              "sched_lag_ms": 1}))
-        sys.exit(0)
+        print("[login] baseline"); sys.exit(0)        # diagnostics only (#817)
     if a[:1] == ["wait"] and "job/fresh606" in a:
         time.sleep(float(os.environ.get("FAKE_SLOW_WAIT", "0")))   # measure in progress
     if a[:1] == ["wait"] and "job/fresh606" in a and os.environ.get("FAKE_WAIT_FAIL") == "1":
@@ -503,11 +519,15 @@ def test_real_sequence_under_wrong_ambient_context(harness):
              (tmp / "out" / "fresh-fresh606-0.jsonl").read_text().splitlines()
              if l.startswith("{")]
     assert {r["label"] for r in fresh} == {"list_dep@1", "list_dep@10", "list_dep@50"}
-    navs = [json.loads(l) for l in
+    recs = [json.loads(l) for l in
             (tmp / "out" / "nav-load606-0.jsonl").read_text().splitlines()]
-    assert [n["visit"] for n in navs] == [1, 2]                 # collected from the Job
+    assert [n["visit"] for n in recs if n["kind"] == "nav"] == [1, 2]   # copied from /out
+    assert recs[0]["kind"] == "drive_start" and recs[-1]["kind"] == "drive_exit"
     verdict = json.loads((tmp / "out" / "verdict.json").read_text())
     assert verdict["report"]["navs"] == 2
+    framing = [c for c in verdict["validity"] if c["check"].startswith("driver.stream")]
+    assert [(c["check"], c["result"]) for c in framing] == [
+        ("driver.stream_complete[nav-load606-0.jsonl]", "PASS")]
     gated = [c["check"] for c in verdict["checks"] if c["check"].startswith("fresh_p95")]
     assert gated == ["fresh_p95_ms[list_dep@10]"]          # ruling: gate at 10/s
     assert set(verdict["report"]["fresh_curve_report_only"]) == {"list_dep@1", "list_dep@50"}

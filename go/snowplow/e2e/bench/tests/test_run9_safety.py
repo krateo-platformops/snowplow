@@ -120,7 +120,7 @@ def test_term_during_measure_then_again_during_collect_still_deletes(harness):
     env = _env483(env)
     env.update(FAKE_483="pass", FAKE_KOG="1", PREFLIGHT_POLL_S="0.1",
                FAKE_SLOW_WAIT="60", FAKE_SLOW_LOGS="40")
-    err = _signal_at(env, [("bench-loadgen wait job/load606", signal.SIGTERM, True),
+    err = _signal_at(env, [("bench-loadgen wait job/fresh606", signal.SIGTERM, True),
                            ("collecting partial results", signal.SIGTERM, True)])
     assert "measure FAILED or interrupted (exit 130)" in err
     _deleted(state, err)
@@ -199,7 +199,7 @@ def test_every_collect_read_is_bounded_twice(harness):
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
                        capture_output=True, text=True, timeout=120)
     assert time.time() - t0 < 35
-    assert "could not read the driver log" in p.stderr
+    assert "could not copy the driver's results (/out/nav.jsonl)" in p.stderr
     assert "stopped after" not in p.stderr          # the per-read bound, not the total cap
     reads = [c["argv"] for c in _calls(state) if c["tool"] == "kubectl"
              and ("cp" in c["argv"] or any(x.startswith("pod/") for x in c["argv"]))
