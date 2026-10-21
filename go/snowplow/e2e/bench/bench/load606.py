@@ -91,6 +91,10 @@ THRESHOLDS = {
     "max_error_rate": 0.01,
     "min_fresh_samples": 30,
     "min_warm_navs": 200,
+    # #827 review: a nav's slowest wait for a free call-pool worker (p95 over
+    # navs). An idle pool starts a call in well under a millisecond; above
+    # 50 ms the DRIVER is adding visible time to page loads.
+    "max_call_wait_p95_ms": 50,
 }
 
 
@@ -591,6 +595,7 @@ class NavResult:
     slowest_call_ms: float
     sched_lag_ms: float = 0.0
     error_samples: list = field(default_factory=list)
+    call_wait_max_ms: float = 0.0     # #827: the driver's own call-pool queueing
 
 
 def _allowed_ref_paths(doc) -> dict[str, str]:
@@ -739,6 +744,11 @@ class WalkResult:
     # The widgets a viewer would arm: [{"path", "key", "coords"}] for every
     # 200 response that carried the refresh headers (#764).
     armed: list = field(default_factory=list)
+    # #827 review: the longest any of this walk's calls waited for a free
+    # call-pool worker. wall_ms includes it, and it is the DRIVER's time, not
+    # snowplow's: the verdict checks it so pool queueing cannot pass as
+    # page-load time.
+    wait_max_ms: float = 0.0
 
 
 def walk(client: HttpClient, token: str, roots: list[str], *,
@@ -762,12 +772,21 @@ def walk(client: HttpClient, token: str, roots: list[str], *,
     armed: list[dict] = []
     t0 = time.perf_counter()
     depth = 0
+    wait_max = 0.0
     while level and depth <= max_depth and calls < max_calls:
         nxt: list[str] = []
         for i in range(0, len(level), per_user_parallel):
             chunk = level[i:i + per_user_parallel]
-            for path, resp in zip(chunk, pool.map(
-                    lambda p: client.get(p, token), chunk)):
+            submitted = time.perf_counter()
+
+            def one(p, submitted=submitted):
+                # submit → a worker picks it up: the call's wait for the pool
+                # (read BEFORE the call, never after it)
+                waited = (time.perf_counter() - submitted) * 1000
+                return client.get(p, token), waited
+
+            for path, (resp, waited) in zip(chunk, pool.map(one, chunk)):
+                wait_max = max(wait_max, waited)
                 calls += 1
                 slowest = max(slowest, resp.ms)
                 nbytes += len(resp.body)
@@ -801,7 +820,8 @@ def walk(client: HttpClient, token: str, roots: list[str], *,
         level = nxt
         depth += 1
     return WalkResult(round((time.perf_counter() - t0) * 1000, 1), calls, errors,
-                      nbytes, round(slowest, 1), samples, statuses, docs, depth, armed)
+                      nbytes, round(slowest, 1), samples, statuses, docs, depth, armed,
+                      round(wait_max, 1))
 
 
 def walk_page(client: HttpClient, token: str, root: str, *,
@@ -954,6 +974,7 @@ class Driver:
             calls=sum(p.calls for p in parts), errors=sum(p.errors for p in parts),
             bytes=sum(p.bytes for p in parts),
             slowest_call_ms=max(p.slowest_ms for p in parts),
+            call_wait_max_ms=max(p.wait_max_ms for p in parts),
             sched_lag_ms=round(max(0.0, started - due) * 1000, 1),
             error_samples=sum((p.samples for p in parts), [])[:5])
         with self.lock:
@@ -1412,6 +1433,7 @@ def login_report(curves: list[dict]) -> dict | None:
             "median_login_ms": pct(meds, 50),
             "max_concurrency": max(per_pod_max),
             "max_concurrency_all_pods": sum(per_pod_max),
+            "max_concurrency_all_pods_is": "an upper bound (the pods need not peak together)",
             "total_batch_wall_s": round(max(per_pod_wall) / 1000, 1),
             "curve": rows,
             "finding": "authn: per-login latency (x509 CSR issued per login) is a user-facing number"}
@@ -2645,6 +2667,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     _check("driver.error_rate", round(errors / calls, 4) if calls else None,
            "<=", th["max_error_rate"], validity)
     _check("driver.warm_navs", len(warm), ">=", th["min_warm_navs"], validity)
+    waits = [n["call_wait_max_ms"] for n in navs if n.get("call_wait_max_ms") is not None]
+    if waits:
+        # #827: only navs that measured it (pre-#827 records do not carry it)
+        _check("driver.call_wait_p95_ms", pct(waits, 95), "<=", th["max_call_wait_p95_ms"],
+               validity)
     if not navs:
         validity.append({"check": "driver.navs_recorded", "value": 0, "bar": ">= 1",
                          "result": "FAIL",
@@ -2653,7 +2680,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     if driver_streams is not None:
         validity.extend(driver_stream_checks(driver_streams))
         validity.extend(shard_checks(driver_streams, job_pods or [], expect_driver_streams,
-                                     expect_users, th["max_sched_lag_p95_ms"]))
+                                     expect_users, th))
     if mem_streams is not None:
         # Required once mem606 was deployed (it has a job_pod record): a
         # memory capture that never arrived is INVALID, not silently absent.
@@ -2693,6 +2720,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         # #825: the cold composite cohort is split over the driver pods; its
         # arrival spread is the pods' start skew
         "composite_burst": composite_burst_report(navs),
+        # #827 review: each driver pod's own CPU (cgroup), so a run shows
+        # whether a GIL-bound pod saturated (one process tops out near 0.9)
+        "driver_cpu_report_only": driver_cpu_report(driver_streams),
         "fresh_truncated": fresh_truncated or [],
         "nav_kinds": {k: sum(1 for n in navs if n.get("nav") == k)
                       for k in sorted({n.get("nav") for n in navs if n.get("nav")})},
@@ -2957,7 +2987,7 @@ class Framing:
 
 
 DRIVER_KINDS = frozenset({"drive_start", "drive_end", "drive_exit", "nav", "login_curve",
-                          "viewer_config", "viewer", "viewer_stats", "viewer_dead",
+                          "viewer_config", "viewer", "viewer_stats", "viewer_dead", "driver_cpu",
                           "push_refetch", "vars"})
 DRIVER_FRAMING = Framing("driver", "the driver", DRIVER_KINDS, "drive_start", "drive_end",
                          "drive_exit", "nav", "navs", "navigations", "navigation")
@@ -3041,6 +3071,20 @@ def viewer_dead_report(viewer_dead: list[dict], streams: list[dict] | None) -> d
             "dead_keys_seen_last": viewer_dead[-1].get("dead_keys_seen")}
 
 
+DRIVER_SATURATED_CORES = 0.85   # one GIL-bound process measured to top out at 0.88 (#825)
+
+
+def driver_cpu_report(streams: list[dict] | None) -> dict | None:
+    """Per driver pod: peak and p95 of its sampled CPU, in cores, and which
+    pods ran near a single process's ceiling."""
+    per = {s["path"]: s["cpu"] for s in streams or [] if s.get("cpu")}
+    if not per:
+        return None
+    return {"by_pod": per,
+            "saturated_pods": sorted(p for p, c in per.items()
+                                     if c["p95_cores"] >= DRIVER_SATURATED_CORES)}
+
+
 def composite_burst_report(navs: list[dict]) -> dict | None:
     """The cold composite cohort: how many arrived, and over how long (one
     pod: ~0; split over pods: their start skew)."""
@@ -3055,7 +3099,7 @@ def composite_burst_report(navs: list[dict]) -> dict | None:
 
 
 def shard_checks(streams: list[dict], job_pods: list[dict], expect_n: int | None,
-                 expect_users: int | None, lag_bar: float) -> list[dict]:
+                 expect_users: int | None, th: dict) -> list[dict]:
     """#825: the driver runs as N pods, each owning a user range and writing
     its own stream. Every pod's stream must be collected (a missing one is
     named by its pod), the ranges must be disjoint and cover 1..users, and
@@ -3093,9 +3137,22 @@ def shard_checks(streams: list[dict], job_pods: list[dict], expect_n: int | None
                     "result": "FAIL" if why else "PASS",
                     **({"why": "; ".join(why)} if why else {})})
     if expect_n is not None or len(streams) > 1:
+        # #827 review: every driver validity check per pod, not only overall —
+        # one pod's lag, errors, queueing or idleness hides inside the merge.
+        # A pod's warm-nav floor is its share of the overall floor.
+        n = max(expect_n or 0, len(streams), 1)
+        warm_bar = math.ceil(th["min_warm_navs"] / n)
         for s in streams:
-            _check(f"driver.sched_lag_p95_ms[{s['path']}]", s.get("lag_p95_ms"), "<=",
-                   lag_bar, out)
+            p = s["path"]
+            _check(f"driver.sched_lag_p95_ms[{p}]", s.get("lag_p95_ms"), "<=",
+                   th["max_sched_lag_p95_ms"], out)
+            _check(f"driver.error_rate[{p}]",
+                   round(s["errors"] / s["calls"], 4) if s.get("calls") else None, "<=",
+                   th["max_error_rate"], out)
+            _check(f"driver.warm_navs[{p}]", s.get("warm_navs"), ">=", warm_bar, out)
+            if s.get("call_wait_p95_ms") is not None:
+                _check(f"driver.call_wait_p95_ms[{p}]", s["call_wait_p95_ms"], "<=",
+                       th["max_call_wait_p95_ms"], out)
     return out
 
 
@@ -3439,6 +3496,13 @@ def _drive(a, sink, navs: list["NavResult"]) -> tuple[int, str | None]:
     if a.vars_interval > 0:
         th = threading.Thread(target=_sampler, daemon=True)
         th.start()
+    # #827 review: this pod's own CPU, sampled into its stream, so the
+    # verdict shows whether the GIL-bound process saturated.
+    cpu_th = None
+    if a.cpu_interval > 0:
+        cpu_th = threading.Thread(target=cpu_sampler, args=(sink, stop, a.cpu_interval),
+                                  daemon=True)
+        cpu_th.start()
     burst_users = users[-a.burst_users:] if a.burst_users > 0 else []
     if burst_users and not a.composite_route:
         print("composite burst requested but no --composite-route (none found at "
@@ -3463,7 +3527,44 @@ def _drive(a, sink, navs: list["NavResult"]) -> tuple[int, str | None]:
         stop.set()
         if th:
             th.join(timeout=a.vars_interval + 30)
+        if cpu_th:
+            cpu_th.join(timeout=a.cpu_interval + 5)
     return 0, None
+
+
+def cpu_seconds() -> tuple[float, str]:
+    """CPU consumed so far: the pod's cgroup (v2 cpu.stat, else v1 cpuacct),
+    else this process (getrusage, children excluded)."""
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as fh:
+            for line in fh:
+                if line.startswith("usage_usec "):
+                    return int(line.split()[1]) / 1e6, "cgroup"
+    except OSError:
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpuacct/cpuacct.usage") as fh:
+            return int(fh.read()) / 1e9, "cgroup"
+    except (OSError, ValueError):
+        pass
+    import resource
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    return ru.ru_utime + ru.ru_stime, "process"
+
+
+def cpu_sampler(sink, stop: threading.Event, interval_s: float,
+                read: Callable[[], tuple[float, str]] = cpu_seconds,
+                clock: Callable[[], float] = time.time) -> None:
+    """Every interval_s: the cores used since the last sample."""
+    used0, source = read()
+    t0 = clock()
+    while not stop.wait(interval_s):
+        used, source = read()
+        t = clock()
+        if t > t0:
+            sink({"kind": "driver_cpu", "t": t, "source": source,
+                  "cores": round((used - used0) / (t - t0), 3)})
+        used0, t0 = used, t
 
 
 _SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -3898,8 +3999,20 @@ def _cmd_evaluate(a) -> int:
             start = next((r for r in rs if r.get("kind") == "drive_start"), {})
             s["users"] = ((start["user_start"], start["user_end"])
                           if "user_start" in start and "user_end" in start else None)
-            s["lag_p95_ms"] = pct([r.get("sched_lag_ms", 0) for r in rs
-                                   if r.get("kind") == "nav"], 95)
+            pnavs = [r for r in rs if r.get("kind") == "nav"]
+            s["lag_p95_ms"] = pct([r.get("sched_lag_ms", 0) for r in pnavs], 95)
+            s["calls"] = sum(int(r.get("calls", 0)) for r in pnavs)
+            s["errors"] = sum(int(r.get("errors", 0)) for r in pnavs)
+            s["warm_navs"] = sum(1 for r in pnavs if (r.get("visit") or 0) > 1)
+            pw = [r["call_wait_max_ms"] for r in pnavs if r.get("call_wait_max_ms") is not None]
+            s["call_wait_p95_ms"] = pct(pw, 95) if pw else None
+            cpu = [r["cores"] for r in rs if r.get("kind") == "driver_cpu"
+                   and r.get("cores") is not None]
+            s["cpu"] = ({"samples": len(cpu), "peak_cores": round(max(cpu), 2),
+                         "p95_cores": round(pct(cpu, 95), 2),
+                         "source": next(r.get("source") for r in rs
+                                        if r.get("kind") == "driver_cpu")}
+                        if cpu else None)
             dead = [r for r in rs if r.get("kind") == "viewer_dead"]
             s["viewer_dead_last"] = dead[-1] if dead else None
             s["viewer_dead_max"] = max((int(r.get("tabs_dead") or 0) for r in dead), default=None)
@@ -3962,6 +4075,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--think-s", type=float, default=60.0)
     d.add_argument("--duration-s", type=float, default=1800.0)
     d.add_argument("--nav-workers", type=int, default=128)
+    d.add_argument("--cpu-interval", type=float, default=5.0,
+                   help="sample this pod's CPU into its stream every N s (0 = off)")
     d.add_argument("--login-max-concurrency", type=int, default=64,
                    help="cap of the adaptive login ramp (shards share authn)")
     d.add_argument("--call-workers", type=int, default=512)

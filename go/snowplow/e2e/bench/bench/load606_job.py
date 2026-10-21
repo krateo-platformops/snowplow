@@ -67,6 +67,7 @@ DRIVER_MEMORY = "1Gi"
 FRESH_CPU, FRESH_MEMORY = "1", "1Gi"
 MEM_CPU, MEM_MEMORY = "250m", "512Mi"
 LOGIN_CONCURRENCY_TOTAL = 64          # run 10's proven authn concurrency
+PER_USER_PARALLEL = 6                 # load606.walk / Driver per_user_parallel
 
 
 def _mcpu(q: str) -> int:
@@ -146,12 +147,17 @@ BURST=$B
 # 1000 users during the first-load arrival). Logins: the shards share authn,
 # so each pod's adaptive ramp is capped at its share of run 10's 64.
 NAVW=$(( E - S + 1 )); [ "$NAVW" -lt 128 ] && NAVW=128
+# The call pool holds every in-flight page's calls ({PER_USER_PARALLEL} per page, the
+# browser's per-host limit) plus one viewer refetch per user, so a call never
+# waits for a worker (#827 review: a 512 pool under 250 pages inflated page
+# load 2.4x). The verdict checks the measured wait anyway (call_wait_p95_ms).
+CALLW=$(( NAVW * {PER_USER_PARALLEL} + E - S + 1 ))
 rc=0
 python3 -u /opt/load606/load606.py drive \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --password {json.dumps(password)} --user-start "$S" --user-end "$E" \\
   --think-s {think_s} --duration-s {duration_s} --vars-interval "$VARS" \\
-  --nav-workers "$NAVW" --login-max-concurrency {max(8, LOGIN_CONCURRENCY_TOTAL // shards)} \\
+  --nav-workers "$NAVW" --call-workers "$CALLW" --login-max-concurrency {max(8, LOGIN_CONCURRENCY_TOTAL // shards)} \\
   {portal_args}{burst_args}{"" if viewers else " --no-viewers"} --out {DRIVE_OUT} || rc=$?
 printf '{{"kind": "drive_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" >> {DRIVE_OUT}
 echo "drive exited rc=$rc; results in {DRIVE_OUT}; holding {linger_s:g}s for collect"
