@@ -644,34 +644,71 @@ stop_top_loop() {
 # #822: snowplow's log, streamed for the WHOLE run (env → collect) into
 # $OUT/snowplow-stream.log. A one-shot `kubectl logs` at collect returns only
 # the container's current file (run 9: the last ~30 s). The stream follows
-# across pod restarts and dropped connections, resuming from the newest
-# `time` seen. Every line passes bench.logscrub: metadata only (no body,
-# username or token reaches $OUT).
-LOG_STREAM_PID=""
+# across dropped connections (resuming at the newest kubelet timestamp seen;
+# `--since-time` is inclusive, and bench.logscrub drops the resent lines) and
+# across a REPLACED pod (it follows the new pod by name, and first reads the
+# old pod's tail while that is still readable; a tail it could not read is
+# marked). Every line passes bench.logscrub: metadata only (no body, username
+# or token reaches $OUT).
+# The loop's PID lives in a pidfile, not only in a variable: stop_log_stream
+# also runs inside collect's `capped` subshell, and a stale variable in the
+# parent would make teardown kill a PID that may have been reused (#823 review).
+BENCH_USER_PREFIX="${BENCH_USER_PREFIX:-scaleuser-}"   # load606 drive --user-prefix
+LOG_STREAM_PIDFILE=""
+scrub() { python3 -m bench.logscrub --deny "$PW" --deny "$BENCH_USER_PREFIX" "$@"; }
+# snowplow_live_pod: the newest snowplow pod not being deleted (empty if none).
+snowplow_live_pod() {
+  "${K[@]}" --request-timeout=30s -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" \
+      -o jsonpath='{range .items[*]}{.metadata.creationTimestamp}{" "}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' \
+      2>/dev/null | awk 'NF == 2' | sort | tail -1 | cut -d' ' -f2
+}
 start_log_stream() {
   if [[ "$DRY" == "1" ]]; then log "DRY: stream snowplow's log -> $OUT/snowplow-stream.log"; return 0; fi
-  rm -f "$OUT/.log-stream-stop"
+  local S="$OUT/.log-stream"
+  rm -f "$S-stop" "$S-state" "$S-last"
   ( set +e
-    while [[ ! -e "$OUT/.log-stream-stop" ]]; do
-      since="$(cat "$OUT/.log-stream-last" 2>/dev/null || true)"
-      "${K[@]}" -n krateo-system logs -f deploy/snowplow ${since:+"--since-time=$since"} \
-          2>>"$OUT/snowplow-stream.err" \
-        | python3 -m bench.logscrub --last-time-file "$OUT/.log-stream-last" --deny "$PW" \
+    pod=""
+    while [[ ! -e "$S-stop" ]]; do
+      cur="$(snowplow_live_pod)"
+      if [[ -n "$pod" && -n "$cur" && "$cur" != "$pod" ]]; then
+        # The pod was replaced: its lines after the last one streamed are on
+        # the OLD pod. Read them while it is readable, then start the new
+        # pod from its beginning (its own timestamps, its own dedup state).
+        since="$(cat "$S-last" 2>/dev/null || true)"
+        if "${K[@]}" --request-timeout=60s -n krateo-system logs "pod/$pod" --timestamps \
+              ${since:+"--since-time=$since"} 2>>"$OUT/snowplow-stream.err" \
+            | scrub --kubelet-timestamps --state-file "$S-state" --last-time-file "$S-last" \
+              >> "$OUT/snowplow-stream.log"; then
+          printf '{"bench_stream":"pod_replaced","tail":"read","t":%s}\n' "$(date +%s)" >> "$OUT/snowplow-stream.log"
+        else
+          printf '{"bench_stream":"pod_replaced","tail":"lost","t":%s}\n' "$(date +%s)" >> "$OUT/snowplow-stream.log"
+        fi
+        rm -f "$S-state" "$S-last"
+      fi
+      target="deploy/snowplow"
+      if [[ -n "$cur" ]]; then pod="$cur"; target="pod/$cur"; fi
+      since="$(cat "$S-last" 2>/dev/null || true)"
+      "${K[@]}" -n krateo-system logs -f "$target" --timestamps \
+          ${since:+"--since-time=$since"} 2>>"$OUT/snowplow-stream.err" \
+        | scrub --kubelet-timestamps --state-file "$S-state" --last-time-file "$S-last" \
           >> "$OUT/snowplow-stream.log"
-      [[ -e "$OUT/.log-stream-stop" ]] && break
+      [[ -e "$S-stop" ]] && break
       printf '{"bench_stream":"reconnect","t":%s}\n' "$(date +%s)" >> "$OUT/snowplow-stream.log"
       sleep "$LOG_STREAM_RETRY_S"
     done ) >/dev/null 2>&1 &
-  LOG_STREAM_PID=$!
+  LOG_STREAM_PIDFILE="$S.pid"
+  echo "$!" > "$LOG_STREAM_PIDFILE"
   log "streaming snowplow's log (scrubbed) -> $OUT/snowplow-stream.log"
 }
 stop_log_stream() {
-  [[ -n "${LOG_STREAM_PID:-}" ]] || return 0
+  local pid
+  [[ -n "${LOG_STREAM_PIDFILE:-}" && -f "$LOG_STREAM_PIDFILE" ]] || return 0
+  pid="$(cat "$LOG_STREAM_PIDFILE")"
+  rm -f "$LOG_STREAM_PIDFILE"      # first: no later caller (teardown) kills this PID again
   touch "$OUT/.log-stream-stop"
-  pkill -TERM -P "$LOG_STREAM_PID" 2>/dev/null || true
-  kill "$LOG_STREAM_PID" 2>/dev/null || true
-  wait "$LOG_STREAM_PID" 2>/dev/null || true
-  LOG_STREAM_PID=""
+  pkill -TERM -P "$pid" 2>/dev/null || true
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
 }
 s_collect() {
   local p
@@ -701,6 +738,16 @@ s_collect() {
   done
   snowplow_pod_record after
   declare -F stop_top_loop >/dev/null && stop_top_loop
+  # How every in-cluster Job pod ended, for the verdict (#817 review): a pod
+  # that died (OOMKilled, evicted, a crash), never ran (Pending / Unknown) or
+  # has no pod at all makes the run INVALID with its reason in verdict.json.
+  # Before mem606's bounded stop, so nothing slow can come between.
+  : > "$OUT/job-pods.jsonl"
+  for p in load606 fresh606 mem606; do
+    "${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>/dev/null \
+      | python3 -m bench.load606 job-pod-record --job "$p" >> "$OUT/job-pods.jsonl" \
+      || log "could not record how the $p pod(s) ended"
+  done
   # mem606: its memstats trajectory and heap profiles, both files in /out
   # (#817: its stdout log was cut at the head too in run 9). Ask it to end
   # its stream first (/out/stop → mem_end, then the wrapper's mem_exit and
@@ -718,40 +765,41 @@ s_collect() {
       log "could not copy the mem606 trajectory (/out/mem.jsonl) from ${p#pod/}"
     fi
   done
-  # How every in-cluster Job pod ended, for the verdict (#817 review): a pod
-  # that died (OOMKilled, a crash) is INVALID with its reason in verdict.json.
-  : > "$OUT/job-pods.jsonl"
-  for p in load606 fresh606 mem606; do
-    "${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>/dev/null \
-      | python3 -m bench.load606 job-pod-record --job "$p" >> "$OUT/job-pods.jsonl" \
-      || log "could not record how the $p pod(s) ended"
-  done
   # #822: the streamed log is the run's snowplow log; the one-shot reads below
   # only cover a stream gap at the very end. All of it scrubbed.
   declare -F stop_log_stream >/dev/null && stop_log_stream
-  "${KR[@]}" -n krateo-system logs deploy/snowplow --tail=-1 \
-    | python3 -m bench.logscrub --deny "$PW" > "$OUT/snowplow.log" \
+  "${KR[@]}" -n krateo-system logs deploy/snowplow --tail=-1 --timestamps \
+    | scrub --kubelet-timestamps > "$OUT/snowplow.log" \
     || log "could not read the snowplow log"
-  "${KR[@]}" -n krateo-system logs deploy/snowplow --previous --tail=-1 2>/dev/null \
-    | python3 -m bench.logscrub --deny "$PW" > "$OUT/snowplow-previous.log"
+  "${KR[@]}" -n krateo-system logs deploy/snowplow --previous --tail=-1 --timestamps 2>/dev/null \
+    | scrub --kubelet-timestamps > "$OUT/snowplow-previous.log"
   [[ -s "$OUT/snowplow-previous.log" ]] || rm -f "$OUT/snowplow-previous.log"
   "${KR[@]}" top nodes > "$OUT/top-nodes.txt" || true
   COLLECTED=1
   log "collected: $(cd "$OUT" && ls nav-*.jsonl fresh-*.jsonl mem-*.jsonl pod-after.jsonl snowplow.log 2>/dev/null | tr '\n' ' ')heap=$(ls "$OUT/heap" 2>/dev/null | wc -l | tr -d ' ')"
 }
-# mem_stop <pod>: ask mem606 for its final stream and wait (bounded) until
-# its wrapper has written the exit code.
+# mem_stop <pod>: ask mem606 for its final stream and wait until its wrapper
+# has written the exit code — against a WALL-CLOCK deadline of
+# MEM_STOP_WAIT_S, every exec included and each one bounded by what is left
+# (#823 review: counting only the sleeps let 60 s execs run ~39 min, past
+# COLLECT_CAP_S, killing collect before job-pods and the snowplow log).
 mem_stop() {
-  local pod="$1" waited=0
-  bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "$pod" -- touch /out/stop \
-    >/dev/null 2>&1 || { log "could not ask $pod to end its stream"; return 0; }
-  until bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "$pod" -- \
-      test -f /out/exited >/dev/null 2>&1; do
-    if (( waited >= MEM_STOP_WAIT_S )); then
+  local pod="$1" deadline left
+  deadline=$(( $(date +%s) + MEM_STOP_WAIT_S ))
+  left=$(( MEM_STOP_WAIT_S < 60 ? MEM_STOP_WAIT_S : 60 ))
+  bounded "$left" "${K[@]}" --request-timeout="${left}s" -n bench-loadgen exec "$pod" -- \
+      touch /out/stop >/dev/null 2>&1 || { log "could not ask $pod to end its stream"; return 0; }
+  while true; do
+    left=$(( deadline - $(date +%s) ))
+    if (( left <= 0 )); then
       log "$pod did not end its stream within ${MEM_STOP_WAIT_S}s: copying it as is"
       return 0
     fi
-    sleep 5; waited=$(( waited + 5 ))
+    (( left > 60 )) && left=60
+    bounded "$left" "${K[@]}" --request-timeout="${left}s" -n bench-loadgen exec "$pod" -- \
+        test -f /out/exited >/dev/null 2>&1 && return 0
+    left=$(( deadline - $(date +%s) ))
+    (( left > 0 )) && sleep "$(( left < 5 ? left : 5 ))"
   done
 }
 collect_and_evaluate() { s_collect; s_evaluate; }

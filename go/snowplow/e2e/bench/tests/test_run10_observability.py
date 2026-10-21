@@ -35,9 +35,14 @@ def test_scrub_keeps_metadata_and_hashes_everything_else():
     assert t == "2026-10-21T06:00:00Z"
     assert (rec["msg"], rec["subsystem"], rec["restaction_name"]) == (
         "refreshes: subscribed", "cache", "incident-detail")
-    assert rec["armed_keys"] == 3 and rec["ok"] is True
-    for k in ("user", "name", "error", "nested"):
+    assert rec["armed_keys"] == 3
+    # `ok` is not an allowlisted key name: the key is hashed, its boolean kept
+    assert "ok" not in rec and True in [v for k, v in rec.items() if k.startswith("k:")]
+    for k in ("user", "name", "error"):
         assert rec[k].startswith("h:") and len(rec[k]) == 14, k
+    assert "nested" not in rec            # not an allowlisted key name: hashed, value too
+    assert all(v.startswith("h:") for k, v in rec.items()
+               if k.startswith("k:") and isinstance(v, str))
     assert "scaleuser" not in out and "s3cr3t" not in out and "clientconfig" not in out
 
 
@@ -52,13 +57,15 @@ def test_scrub_turns_a_non_json_line_into_length_and_hash():
     assert t is None and json.loads(out)["unparsed"] is True and "secret" not in out
 
 
-def test_scrub_cli_records_the_newest_time(tmp_path):
+def test_scrub_cli_records_the_newest_kubelet_time(tmp_path):
     last = tmp_path / "last"
-    src = "\n".join(json.dumps({"time": f"2026-10-21T06:00:0{i}Z", "msg": "m"})
+    src = "\n".join(f"2026-10-21T06:00:0{i}.5Z " + json.dumps({"msg": "m"})
                     for i in range(3)) + "\n"
-    p = subprocess.run(["python3", "-m", "bench.logscrub", "--last-time-file", str(last)],
+    p = subprocess.run(["python3", "-m", "bench.logscrub", "--kubelet-timestamps",
+                        "--last-time-file", str(last)],
                        input=src, capture_output=True, text=True, cwd=BENCH_DIR, check=True)
-    assert len(p.stdout.splitlines()) == 3 and last.read_text() == "2026-10-21T06:00:02Z"
+    assert len(p.stdout.splitlines()) == 3
+    assert last.read_text() == "2026-10-21T06:00:02.500000000Z"
 
 
 # ─── job pods: how a pod ended reaches the verdict ─────────────────────────

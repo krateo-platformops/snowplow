@@ -1484,12 +1484,23 @@ def job_pod_records(pod_list: dict, job: str) -> list[dict]:
     """`kubectl get pods -l job-name=<job> -o json` → one `job_pod` record per
     pod: phase, readiness and how each container ended (#817 review: a driver
     pod's death must reach verdict.json with its reason, not only run.log)."""
+    items = pod_list.get("items") or []
+    if not items:
+        # A deployed Job with no pod at collect: recorded, so it cannot be silent.
+        return [{"kind": "job_pod", "job": job, "t": time.time(), "pod": None,
+                 "missing": True}]
     out = []
-    for p in pod_list.get("items") or []:
+    for p in items:
         st = p.get("status") or {}
+        sched = next((c for c in st.get("conditions") or []
+                      if c.get("type") == "PodScheduled" and c.get("status") != "True"), None)
         out.append({"kind": "job_pod", "job": job, "t": time.time(),
                     "pod": (p.get("metadata") or {}).get("name"),
                     "phase": st.get("phase"),
+                    # pod-level reason (Evicted, ...) and why it never scheduled;
+                    # reasons are enum-like, the free-text messages are not kept
+                    "reason": st.get("reason"),
+                    "unscheduled": (sched or {}).get("reason") if sched else None,
                     "containers": [{"name": cs.get("name"), "ready": cs.get("ready"),
                                     "restarts": cs.get("restartCount", 0),
                                     "terminated": _termination(cs.get("state")),
@@ -1505,8 +1516,19 @@ def job_pod_checks(recs: list[dict]) -> list[dict]:
     out = []
     for r in recs:
         why = []
+        if r.get("missing"):
+            out.append({"check": f"{r.get('job')}.pod", "value": None,
+                        "bar": "the deployed Job has a pod at collect", "result": "FAIL",
+                        "why": f"no {r.get('job')} pod at collect: it never started, "
+                               f"or it was deleted"})
+            continue
         if r.get("phase") == "Failed":
-            why.append("the pod Failed")
+            why.append("the pod Failed" + (f" ({r['reason']})" if r.get("reason") else ""))
+        elif r.get("phase") in ("Pending", "Unknown"):
+            why.append(f"the pod is {r['phase']} at collect"
+                       + (f" ({r['unscheduled']})" if r.get("unscheduled") else "")
+                       + (f" ({r['reason']})" if r.get("reason") else "")
+                       + ": it did not run, or its node is unreachable")
         for c in r.get("containers") or []:
             for label, t in (("terminated", c.get("terminated")),
                              ("earlier run terminated", c.get("last_terminated"))):
@@ -1518,7 +1540,7 @@ def job_pod_checks(recs: list[dict]) -> list[dict]:
         out.append({"check": f"{r.get('job')}.pod[{r.get('pod')}]",
                     "value": {"phase": r.get("phase"),
                               "containers": r.get("containers")},
-                    "bar": "no container death or restart",
+                    "bar": "ran; no container death or restart",
                     "result": "FAIL" if why else "PASS",
                     **({"why": "; ".join(why)} if why else {})})
     return out
@@ -1712,9 +1734,12 @@ HARNESS_NOTES = (
 
 def rotation_report(mem: list[dict]) -> dict | None:
     """#817 report-only: every mem sample at which an identity-class input
-    moved, with the values. An armed /refreshes key goes dead when its cell's
-    key rotates (the armed set is frozen per connection); this dates the
-    rotations so a viewer that stopped being pushed can be matched to one."""
+    moved, with the values. These counters are GLOBAL: a change dates a
+    CANDIDATE rotation for some identity, not proof that a given user's key
+    rotated (the probe's own key_rotated records are that proof). An armed
+    /refreshes key goes dead when its cell's key rotates (the armed set is
+    frozen per connection); this dates the candidates so a viewer that
+    stopped being pushed can be matched to one."""
     rows = sorted((m for m in mem if m.get("kind") == "mem"
                    and any(k in (m.get("extra") or {}) for k in ROTATION_KEYS)),
                   key=lambda m: m.get("t") or 0)
@@ -2613,7 +2638,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     if driver_streams is not None:
         validity.extend(driver_stream_checks(driver_streams))
     if mem_streams is not None:
-        validity.extend(framed_stream_checks(MEM_FRAMING, mem_streams, required=False))
+        # Required once mem606 was deployed (it has a job_pod record): a
+        # memory capture that never arrived is INVALID, not silently absent.
+        validity.extend(framed_stream_checks(
+            MEM_FRAMING, mem_streams,
+            required=any(r.get("job") == "mem606" for r in job_pods or [])))
     validity.extend(job_pod_checks(job_pods or []))
 
     econ = None
