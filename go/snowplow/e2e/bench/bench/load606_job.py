@@ -71,9 +71,9 @@ def render(*, users: int, shards: int, think_s: float, duration_s: float,
     # The results go to a FILE on the pod's /out, never to stdout (#817): the
     # kubelet rotates container logs at a size cap and `kubectl logs` returns
     # only the current file, so run 9's ~30 min of navigations were gone by
-    # collect. When drive exits the wrapper appends its exit code, marks
-    # /out/done (the pod turns Ready: its results are final) and stays up for
-    # `kubectl cp` until linger_s.
+    # collect. When drive exits the wrapper appends its exit code, writes it
+    # to /out/done (the pod turns Ready: its results are final; run606 reads
+    # the code) and stays up for `kubectl cp` until linger_s.
     script = f"""set -eu
 case "$JOB_COMPLETION_INDEX" in
 {case}
@@ -89,7 +89,7 @@ python3 -u /opt/load606/load606.py drive \\
   {portal_args}{burst_args}{"" if viewers else " --no-viewers"} --out {DRIVE_OUT} || rc=$?
 printf '{{"kind": "drive_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" >> {DRIVE_OUT}
 echo "drive exited rc=$rc; results in {DRIVE_OUT}; holding {linger_s:g}s for collect"
-touch /out/done
+echo "$rc" > /out/done
 sleep {linger_s:g}
 exit "$rc"
 """
@@ -234,17 +234,27 @@ spec:
 def render_mem(*, snowplow_url: str, authn_url: str, user: str, password: str,
                duration_s: float, interval_s: float = 15.0,
                profile_every_s: float = 120.0,
-               vars_prefixes: tuple[str, ...] = ()) -> str:
+               vars_prefixes: tuple[str, ...] = (), linger_s: float = 3600.0) -> str:
     """mem606: the standard memory capture for every run (#710) — memstats
     every interval_s and heap profiles at Ready / under load / after any
     restart, kept in the pod's /out until the collect step copies them.
-    METADATA ONLY. Uses the load606 ConfigMap that render() creates."""
+    METADATA ONLY. Uses the load606 ConfigMap that render() creates.
+
+    Framed and crash-proof like the driver (#817): memwatch writes mem_start /
+    mem_end and ends early once /out/stop exists (collect asks for the final
+    stream); this wrapper — not python — appends mem_exit, writes the code to
+    /out/exited and lingers, so a crashed sampler's stream is still copied."""
     script = f"""set -eu
-exec python3 -u /opt/load606/load606.py memwatch \\
+rc=0
+python3 -u /opt/load606/load606.py memwatch \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --user {json.dumps(user)} --password {json.dumps(password)} \\
-  --duration-s {duration_s:g} --interval-s {interval_s:g} \\
-  --profile-every-s {profile_every_s:g} --out-dir /out --out {MEM_OUT}{"".join(f" --vars-prefix {json.dumps(x)}" for x in vars_prefixes)}
+  --duration-s {duration_s:g} --interval-s {interval_s:g} --linger-s 0 --stop-file /out/stop \\
+  --profile-every-s {profile_every_s:g} --out-dir /out --out {MEM_OUT}{"".join(f" --vars-prefix {json.dumps(x)}" for x in vars_prefixes)} || rc=$?
+printf '{{"kind": "mem_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" >> {MEM_OUT}
+echo "$rc" > /out/exited
+sleep {linger_s:g}
+exit "$rc"
 """
     return f"""\
 ---
@@ -462,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,
             user=a.preflight_user, password=a.password,
             duration_s=a.mem_duration_s,
-            vars_prefixes=tuple(a.mem_vars_prefix or ())))
+            vars_prefixes=tuple(a.mem_vars_prefix or ()), linger_s=a.linger_s))
     if a.fresh_rates:
         sys.stdout.write(render_fresh(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,

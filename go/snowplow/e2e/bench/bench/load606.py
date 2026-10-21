@@ -1411,6 +1411,58 @@ def pod_record(pod_list: dict, phase: str) -> dict:
             "t": time.time()}
 
 
+def _termination(state: dict | None) -> dict | None:
+    t = (state or {}).get("terminated")
+    if not t:
+        return None
+    return {"reason": t.get("reason"), "exit_code": t.get("exitCode"),
+            "finished_at": t.get("finishedAt")}
+
+
+def job_pod_records(pod_list: dict, job: str) -> list[dict]:
+    """`kubectl get pods -l job-name=<job> -o json` → one `job_pod` record per
+    pod: phase, readiness and how each container ended (#817 review: a driver
+    pod's death must reach verdict.json with its reason, not only run.log)."""
+    out = []
+    for p in pod_list.get("items") or []:
+        st = p.get("status") or {}
+        out.append({"kind": "job_pod", "job": job, "t": time.time(),
+                    "pod": (p.get("metadata") or {}).get("name"),
+                    "phase": st.get("phase"),
+                    "containers": [{"name": cs.get("name"), "ready": cs.get("ready"),
+                                    "restarts": cs.get("restartCount", 0),
+                                    "terminated": _termination(cs.get("state")),
+                                    "last_terminated": _termination(cs.get("lastState"))}
+                                   for cs in st.get("containerStatuses") or []]})
+    return out
+
+
+def job_pod_checks(recs: list[dict]) -> list[dict]:
+    """A validity check per in-cluster Job pod: one whose container died
+    (non-zero exit, a restart, phase Failed) makes the run INVALID, and the
+    verdict says how it died. A pod still lingering for collect is a PASS."""
+    out = []
+    for r in recs:
+        why = []
+        if r.get("phase") == "Failed":
+            why.append("the pod Failed")
+        for c in r.get("containers") or []:
+            for label, t in (("terminated", c.get("terminated")),
+                             ("earlier run terminated", c.get("last_terminated"))):
+                if t and t.get("exit_code") not in (0, None):
+                    why.append(f"container {c.get('name')} {label}: {t.get('reason')} "
+                               f"(exit {t.get('exit_code')}) at {t.get('finished_at')}")
+            if c.get("restarts"):
+                why.append(f"container {c.get('name')} restarted {c['restarts']}x")
+        out.append({"check": f"{r.get('job')}.pod[{r.get('pod')}]",
+                    "value": {"phase": r.get("phase"),
+                              "containers": r.get("containers")},
+                    "bar": "no container death or restart",
+                    "result": "FAIL" if why else "PASS",
+                    **({"why": "; ".join(why)} if why else {})})
+    return out
+
+
 # ─── image digest gate (run 8: a pod on any other digest makes the run VOID) ─
 
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -1584,6 +1636,17 @@ RUN8_VARS_PREFIXES = (
 # own count of cells it found minted under a stale class.
 ROTATION_KEYS = ("snowplow_rbac_publish_seq", "snowplow_rbac_subgen_bumps_total",
                  "snowplow_rbac_subgen_epoch", "snowplow_l1_identity_class_drift_declined_total")
+
+
+# Carried in every verdict's report, so a number read across runs comes with
+# what changed under it.
+HARNESS_NOTES = (
+    "run 10+ (#817): the driver's offered load and scheduling lag are NOT comparable "
+    "with runs <= 9. There, closing a /refreshes viewer blocked until its reader "
+    "woke (next frame or the 90 s read timeout), on every navigation's re-arm and "
+    "for 31 min at close_all; each blocked close held a navigation worker and left "
+    "that tab unarmed. Viewers now also re-arm when their cell's refresh key rotates.",
+)
 
 
 def rotation_report(mem: list[dict]) -> dict | None:
@@ -2350,7 +2413,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              viewer_stats: list[dict] | None = None,
              fresh_truncated: list[dict] | None = None,
              driver_streams: list[dict] | None = None,
-             fresh_viewers: list[dict] | None = None) -> dict:
+             fresh_viewers: list[dict] | None = None,
+             mem_streams: list[dict] | None = None,
+             job_pods: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -2435,6 +2500,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
                                 "page-load times to evaluate"})
     if driver_streams is not None:
         validity.extend(driver_stream_checks(driver_streams))
+    if mem_streams is not None:
+        validity.extend(framed_stream_checks(MEM_FRAMING, mem_streams, required=False))
+    validity.extend(job_pod_checks(job_pods or []))
 
     econ = None
     if len(vars_series) >= 2:
@@ -2485,6 +2553,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["snowplow_pod"] = snowplow_pods
     report["memory"] = memory_report(mem or [])
     report["key_rotation_report_only"] = rotation_report(mem or [])
+    report["harness_notes"] = list(HARNESS_NOTES)
     report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
     fv = [f for f in fresh if f.get("valid") is False]
     report["fresh_invalid_samples"] = len(fv)
@@ -2711,64 +2780,98 @@ def _read_jsonl(path: str) -> list[dict]:
     return out
 
 
-# Record kinds only the `drive` command writes: a file holding any of them is
-# a driver stream, and must prove it is whole (#817).
+# A framed stream (#817): a file one in-cluster writer produces, which must
+# prove it is that writer's WHOLE output: its start record first, its end
+# record (how many items it wrote) last, then the pod wrapper's exit record.
+# `kinds` are the record kinds only that writer emits: a file holding any of
+# them is that writer's stream.
+@dataclass(frozen=True)
+class Framing:
+    name: str           # check prefix
+    who: str            # subject of a reason
+    kinds: frozenset
+    start: str
+    end: str
+    exit: str
+    item: str           # the counted record kind
+    count: str          # the end record's count field
+    noun: str           # what `count` counts
+    lost: str           # what was lost when the counts differ
+
+
 DRIVER_KINDS = frozenset({"drive_start", "drive_end", "drive_exit", "nav", "login_curve",
                           "viewer_config", "viewer", "viewer_stats", "push_refetch", "vars"})
+DRIVER_FRAMING = Framing("driver", "the driver", DRIVER_KINDS, "drive_start", "drive_end",
+                         "drive_exit", "nav", "navs", "navigations", "navigation")
+MEM_FRAMING = Framing("mem606", "the mem606 sampler",
+                      frozenset({"mem_start", "mem_end", "mem_exit", "mem", "heap_profile"}),
+                      "mem_start", "mem_end", "mem_exit", "mem", "samples",
+                      "memory samples", "memory sample")
 
 
-def driver_stream(path: str, recs: list[dict]) -> dict | None:
-    """The framing of one collected driver file: its first record, its
-    drive_end / drive_exit and how many nav records it holds. None when the
-    file holds no driver record (fresh606, mem606, ...)."""
-    own = [r for r in recs if r.get("kind") in DRIVER_KINDS]
+def framed_stream(f: Framing, path: str, recs: list[dict]) -> dict | None:
+    """The framing of one collected file for writer `f`: its first record, its
+    end / exit records and how many items it holds. None when the file holds
+    no record of that writer."""
+    own = [r for r in recs if r.get("kind") in f.kinds]
     if not own:
         return None
     return {"path": os.path.basename(path), "first": own[0].get("kind"),
             "first_t": own[0].get("t", own[0].get("t_event")),
-            "end": next((r for r in own if r["kind"] == "drive_end"), None),
-            "exit": next((r for r in own if r["kind"] == "drive_exit"), None),
-            "navs": sum(1 for r in own if r["kind"] == "nav")}
+            "end": next((r for r in own if r["kind"] == f.end), None),
+            "exit": next((r for r in own if r["kind"] == f.exit), None),
+            "items": sum(1 for r in own if r["kind"] == f.item)}
 
 
-def driver_stream_checks(streams: list[dict]) -> list[dict]:
-    """One validity check per driver stream; a stream that cannot prove it is
-    the driver's whole output makes the run INVALID, with the reason. Run 9:
-    the stream started mid-run (container log rotation cut its head) and held
-    no navigation at all; the verdict only said `warm_navs 0`."""
+def framed_stream_checks(f: Framing, streams: list[dict], *, required: bool) -> list[dict]:
+    """One validity check per stream; a stream that cannot prove it is the
+    writer's whole output makes the run INVALID, with the reason. Run 9: the
+    driver's stream started mid-run (container log rotation cut its head) and
+    held no navigation at all; the verdict only said `warm_navs 0`."""
     if not streams:
-        return [{"check": "driver.stream", "value": None, "bar": "one collected driver stream",
-                 "result": "FAIL",
-                 "why": "no driver output was collected: no file holds a driver record"}]
+        if not required:
+            return []
+        return [{"check": f"{f.name}.stream", "value": None,
+                 "bar": f"one collected {f.name} stream", "result": "FAIL",
+                 "why": f"no {f.name} output was collected: no file holds a {f.name} record"}]
     out = []
     for s in streams:
         why = []
-        if s["first"] != "drive_start":
+        if s["first"] != f.start:
             why.append(f"the stream starts mid-run (first record: {s['first']} at "
                        f"t={s['first_t']}): its head is missing, as when the container "
                        f"log rotated before it was read")
         end, ex = s["end"], s["exit"]
         if end is None:
-            why.append("no drive_end record: the driver did not finish, or the "
-                       "stream's tail is missing")
+            why.append(f"no {f.end} record: {f.who} did not finish, or the "
+                       f"stream's tail is missing")
         else:
-            if end.get("navs") != s["navs"]:
-                why.append(f"drive_end counts {end.get('navs')} navigations, the stream "
-                           f"holds {s['navs']}: navigation records were lost")
-            if not end.get("ok"):
-                why.append(f"the driver failed: {end.get('reason')}")
+            if end.get(f.count) != s["items"]:
+                why.append(f"{f.end} counts {end.get(f.count)} {f.noun}, the stream "
+                           f"holds {s['items']}: {f.lost} records were lost")
+            if not end.get("ok", True):
+                why.append(f"{f.who} failed: {end.get('reason')}")
         if ex is None:
-            why.append("no drive_exit record: the driver's pod died before its "
-                       "wrapper recorded the exit code")
+            why.append(f"no {f.exit} record: {f.who}'s pod died before its "
+                       f"wrapper recorded the exit code")
         elif ex.get("rc") != 0:
-            why.append(f"the driver exited rc={ex.get('rc')}")
-        out.append({"check": f"driver.stream_complete[{s['path']}]",
-                    "value": {"navs": s["navs"], "drive_end_navs": (end or {}).get("navs"),
+            why.append(f"{f.who} exited rc={ex.get('rc')}")
+        out.append({"check": f"{f.name}.stream_complete[{s['path']}]",
+                    "value": {f.count: s["items"],
+                              f"{f.end}_{f.count}": (end or {}).get(f.count),
                               "exit_rc": (ex or {}).get("rc")},
-                    "bar": "drive_start .. drive_end (ok, all navs) .. drive_exit rc=0",
+                    "bar": f"{f.start} .. {f.end} (ok, all {f.count}) .. {f.exit} rc=0",
                     "result": "FAIL" if why else "PASS",
                     **({"why": "; ".join(why)} if why else {})})
     return out
+
+
+def driver_stream(path: str, recs: list[dict]) -> dict | None:
+    return framed_stream(DRIVER_FRAMING, path, recs)
+
+
+def driver_stream_checks(streams: list[dict]) -> list[dict]:
+    return framed_stream_checks(DRIVER_FRAMING, streams, required=True)
 
 
 def classify(resp: "Response") -> str:
@@ -3401,16 +3504,25 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
              extra_prefixes: tuple[str, ...] = (),
              burst_interval_s: float = 5.0, burst_window_s: float = 60.0,
              load_min_delta: int = 100,
+             stop_file: str | None = None,
              clock: Callable[[], float] = time.time,
              sleep: Callable[[float], None] = time.sleep) -> int:
     """The standard run-time memory capture (run 7 → #710): a memstats sample
     every `interval_s`, and a heap profile (/debug/pprof/heap) at the FIRST
     Ready, every `profile_every_s` while Ready, and at every not-Ready → Ready
     transition (a restart). Profiles are written to out_dir; their names are
-    emitted as `heap_profile` records."""
+    emitted as `heap_profile` records.
+
+    The stream is framed like the driver's (#817): `mem_start` first,
+    `mem_end` (how many mem records) last, so a cut file is detected. It ends
+    at duration_s, or as soon as `stop_file` exists (the collect step asks for
+    the final stream before it copies it)."""
     os.makedirs(out_dir, exist_ok=True)
     token = None
     end = clock() + duration_s
+    samples = 0
+    sink({"kind": "mem_start", "t": clock(), "duration_s": duration_s,
+          "interval_s": interval_s})
     # Burst resolution (#710: heap went 0.6 -> 6.35 GB in 16 s, so 15 s
     # samples see at most one point inside it): sample every burst_interval_s
     # until the load is seen (L1 lookups +load_min_delta from the first
@@ -3420,12 +3532,13 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
     was_ready = False
     last_prof = None
     n = 0
-    while clock() < end:
+    while clock() < end and not (stop_file and os.path.exists(stop_file)):
         if token is None:
             try:
                 token = login_fn()
             except Exception as e:  # noqa: BLE001
                 sink({"kind": "mem", "t": clock(), "login_error": type(e).__name__})
+                samples += 1
         rec = mem_sample(client, token, extra_prefixes)
         rec["t"] = clock()
         if rec.get("vars_status") == 401:
@@ -3440,6 +3553,7 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
         fast = burst_until is None or clock() < burst_until
         rec["interval_s"] = burst_interval_s if fast else interval_s
         sink(rec)
+        samples += 1
         ready = rec.get("readyz") == 200
         if ready and token and (not was_ready or last_prof is None
                                 or clock() - last_prof >= profile_every_s):
@@ -3455,6 +3569,8 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
                 last_prof = clock()
         was_ready = ready
         sleep(rec["interval_s"])
+    sink({"kind": "mem_end", "t": clock(), "samples": samples, "profiles": n,
+          "stopped": bool(stop_file and os.path.exists(stop_file))})
     with open(os.path.join(out_dir, "done"), "w") as fh:
         fh.write("1")
     return n
@@ -3466,8 +3582,10 @@ def _cmd_memwatch(a) -> int:
     memwatch(client, lambda: login(a.authn_url, a.user, a.password),
              duration_s=a.duration_s, interval_s=a.interval_s,
              profile_every_s=a.profile_every_s, out_dir=a.out_dir, sink=sink,
-             extra_prefixes=tuple(a.vars_prefix or ()))
-    # Stay up so the collect step can copy the profiles out (kubectl cp).
+             extra_prefixes=tuple(a.vars_prefix or ()), stop_file=a.stop_file)
+    # Stay up so the collect step can copy the profiles out (kubectl cp). The
+    # mem606 Job's wrapper lingers itself (--linger-s 0), so a crash here
+    # still leaves the stream copyable.
     time.sleep(a.linger_s)
     return 0
 
@@ -3496,12 +3614,16 @@ def _cmd_check_prefixes(a) -> int:
 def _cmd_evaluate(a) -> int:
     recs = []
     streams = []
+    mem_streams = []
     for p in a.inputs:
         rs = _read_jsonl(p)
         recs.extend(rs)
         s = driver_stream(p, rs)
         if s is not None:
             streams.append(s)
+        ms = framed_stream(MEM_FRAMING, p, rs)
+        if ms is not None:
+            mem_streams.append(ms)
     navs = [r for r in recs if r.get("kind") == "nav"]
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     vs = sorted((r for r in recs if r.get("kind") == "vars"
@@ -3523,7 +3645,9 @@ def _cmd_evaluate(a) -> int:
                       viewer_stats=[r for r in recs if r.get("kind") == "viewer_stats"],
                       fresh_truncated=[r for r in recs if r.get("kind") == "fresh_truncated"],
                       driver_streams=streams,
-                      fresh_viewers=[r for r in recs if r.get("kind") == "fresh_viewer"])
+                      fresh_viewers=[r for r in recs if r.get("kind") == "fresh_viewer"],
+                      mem_streams=mem_streams,
+                      job_pods=[r for r in recs if r.get("kind") == "job_pod"])
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 
@@ -3618,10 +3742,18 @@ def main(argv: list[str] | None = None) -> int:
     mw.add_argument("--profile-every-s", type=float, default=120.0)
     mw.add_argument("--out-dir", default="/out")
     mw.add_argument("--linger-s", type=float, default=3600.0)
+    mw.add_argument("--stop-file", default=None,
+                    help="end the capture early once this file exists (collect)")
     mw.add_argument("--vars-prefix", action="append", default=None,
                     help="also capture every expvar starting with this prefix (repeatable)")
     mw.add_argument("--out", default="/dev/stdout")
     mw.set_defaults(func=_cmd_memwatch)
+    jp = sub.add_parser("job-pod-record",
+                        help="kubectl get pods -l job-name=<job> -o json on stdin -> job_pod records")
+    jp.add_argument("--job", required=True)
+    jp.set_defaults(func=lambda a: print("\n".join(
+        json.dumps(r) for r in job_pod_records(json.loads(sys.stdin.read() or "{}"), a.job)))
+        or 0)
     pr = sub.add_parser("pod-record", help="kubectl get pods -o json on stdin -> snowplow_pod record")
     pr.add_argument("--phase", required=True, choices=["before", "after"])
     pr.set_defaults(func=_cmd_pod_record)

@@ -170,15 +170,23 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         dest = a[-1]
         os.makedirs(dest, exist_ok=True)
         open(os.path.join(dest, "heap-01-150000-ready.pb.gz"), "wb").write(b"\\x1f\\x8bfake")
+        recs = [{"kind": "mem_start", "t": 0.5},
+                {"kind": "mem", "t": 1.0, "readyz": 200, "vars_status": 200,
+                 "heap_inuse_mb": 1392.8, "sys_mb": 1551.9},
+                {"kind": "heap_profile", "t": 1.0, "profile": "heap-01-150000-ready.pb.gz",
+                 "bytes": 152190, "at": "ready"},
+                {"kind": "mem", "t": 16.0, "readyz": 200, "vars_status": 200,
+                 "heap_inuse_mb": 3789.4, "sys_mb": 6741.5},
+                {"kind": "mem_end", "t": 17.0, "samples": 2, "profiles": 1, "stopped": True},
+                {"kind": "mem_exit", "rc": 0, "t": 17}]
+        if os.environ.get("FAKE_MEM_STREAM") == "cut":           # copied mid-stream
+            recs = recs[:-2]
         with open(os.path.join(dest, "mem.jsonl"), "w") as fh:      # /out/mem.jsonl (#817)
-            for r in ({"kind": "mem", "t": 1.0, "readyz": 200, "vars_status": 200,
-                       "heap_inuse_mb": 1392.8, "sys_mb": 1551.9},
-                      {"kind": "heap_profile", "t": 1.0, "profile": "heap-01-150000-ready.pb.gz",
-                       "bytes": 152190, "at": "ready"},
-                      {"kind": "mem", "t": 16.0, "readyz": 200, "vars_status": 200,
-                       "heap_inuse_mb": 3789.4, "sys_mb": 6741.5}):
+            for r in recs:
                 fh.write(json.dumps(r) + "\\n")
         sys.exit(0)
+    if a[:1] == ["exec"] and a[-2:] == ["cat", "/out/done"]:
+        print(os.environ.get("FAKE_DRIVE_RC", "0")); sys.exit(0)   # drive's exit code
     if a[:1] == ["cp"] and any(x.startswith("load606") for x in a):
         # The driver's /out/nav.jsonl (#817). FAKE_DRIVE_STREAM: whole (a framed
         # stream) | headcut (run 9: only the tail after log rotation) | nofile.
@@ -259,6 +267,18 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                 cds.append(cr("CompositionDefinition", "oasgen-provider", False, "Creating",
                               "chart fetch timeout"))
             items(cds)
+        if what == "pods" and any(x.startswith("job-name=") for x in a):
+            # an in-cluster Job's pod (#817): lingering, or OOMKilled when
+            # FAKE_DRIVER_POD_DEATH=1 and it is the driver's
+            job = next(x for x in a if x.startswith("job-name=")).split("=", 1)[1]
+            dead = job == "load606" and os.environ.get("FAKE_DRIVER_POD_DEATH") == "1"
+            state = ({"terminated": {"reason": "OOMKilled", "exitCode": 137,
+                                     "finishedAt": "2026-10-21T06:40:00Z"}}
+                     if dead else {"running": {}})
+            items([{"metadata": {"name": f"{job}-0"},
+                    "status": {"phase": "Failed" if dead else "Running",
+                               "containerStatuses": [{"name": "c", "ready": not dead,
+                                                      "restartCount": 0, "state": state}]}}])
         if what == "pods":
             items([{"metadata": {"name": "ok-0", "namespace": "krateo-system"},
                     "spec": {"nodeName": "n1"}, "status": {"phase": "Running",
@@ -366,7 +386,13 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         print("error: timed out waiting for the condition on jobs/fresh606", file=sys.stderr)
         sys.exit(1)
     if a[:1] == ["logs"] and "deploy/snowplow" in a and "--previous" not in a:
-        print("snowplow log line"); sys.exit(0)
+        # identity-bearing fields on purpose: the collected copy must not keep them (#822)
+        print(json.dumps({"time": "2026-10-21T06:00:00Z", "level": "INFO",
+                          "msg": "refreshes: subscribed", "subsystem": "cache",
+                          "user": "scaleuser-0001", "name": "scaleuser-0001-clientconfig",
+                          "armed_keys": 3, "-f": "-f" in a}))
+        print("snowplow plain line")
+        sys.exit(0)
     sys.exit(0)   # apply / wait / rollout / version / scale / top / logs
     """)
 

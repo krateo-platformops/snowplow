@@ -73,6 +73,8 @@ DIGEST_POLL_S="${DIGEST_POLL_S:-5}"
 # teardown trap after a failed measure, #763).
 COLLECT_TIMEOUT_S="${COLLECT_TIMEOUT_S:-300}"
 DRIVE_POLL_S="${DRIVE_POLL_S:-30}"     # measure: is every driver pod Ready (drive over)?
+LOG_STREAM_RETRY_S="${LOG_STREAM_RETRY_S:-5}"   # snowplow log stream: reconnect pause
+MEM_STOP_WAIT_S="${MEM_STOP_WAIT_S:-180}"       # collect: mem606 writes its final stream
 MEASURE_STARTED=0
 COLLECTED=0
 SCALE="${SCALE:-50000}"
@@ -273,6 +275,7 @@ teardown() {
   set +e   # nothing inside teardown may abort it (a Ctrl-C reaches every child: set -e would exit on their 130)
   trap - EXIT
   declare -F stop_top_loop >/dev/null && stop_top_loop
+  declare -F stop_log_stream >/dev/null && stop_log_stream
   if [[ "$CLUSTER_CREATED" == "1" ]]; then
     # On ANY failure, snapshot the cluster BEFORE it is deleted (shakedown #2
     # tore down with nothing captured). Best effort: it never blocks teardown.
@@ -421,6 +424,8 @@ s_env() {
   source "$OUT/env.sh"
   # gke-env re-exports these; re-assert the pin regardless of what it printed.
   export KUBECONFIG="$KCFG" BENCH_GKE_CONTEXT="$KCTX" EXPECTED_IMAGE_TAG="$SNOWPLOW_TAG"
+  # The platform is up: snowplow's log is streamed from here to collect.
+  start_log_stream
 }
 s_preflight() {
   # SECONDS-scale, right after env and BEFORE stamping or any login burst
@@ -583,7 +588,7 @@ wait_drive_done() {
           -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>/dev/null || true)"
     IFS=/ read -r ready failed want <<< "$st"
     if [[ -n "$want" && "${ready:-0}" -ge "$want" ]]; then
-      log "driver done: ${ready}/${want} load606 pod(s) Ready"
+      driver_exit_codes "${ready}/${want}"
       return 0
     fi
     if [[ "${failed:-0}" -ge 1 ]]; then
@@ -596,6 +601,22 @@ wait_drive_done() {
     fi
     sleep "$DRIVE_POLL_S"
   done
+}
+# driver_exit_codes <ready>: Ready only says the drive is OVER; each pod's
+# /out/done holds drive's exit code (load606_job), and the log says which it
+# was. A non-zero exit is not a measure failure (fresh606 still runs and its
+# samples stand); the verdict makes the run INVALID with the driver's reason.
+driver_exit_codes() {
+  local p rc bad=""
+  for p in $("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l job-name=load606 -o name 2>/dev/null); do
+    rc="$(bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "${p#pod/}" -- cat /out/done 2>/dev/null | tr -d '[:space:]')"
+    [[ "$rc" == "0" ]] || bad+=" ${p#pod/}=rc${rc:-?}"
+  done
+  if [[ -z "$bad" ]]; then
+    log "driver done: $1 load606 pod(s) Ready, every drive exited 0"
+  else
+    log "driver FAILED:${bad} (drive over, results kept; verdict.json says why)"
+  fi
 }
 snowplow_pod_record() {
   local phase="$1"
@@ -619,6 +640,38 @@ start_top_loop() {
 stop_top_loop() {
   [[ -n "${TOP_PID:-}" ]] && kill "$TOP_PID" 2>/dev/null || true
   TOP_PID=""
+}
+# #822: snowplow's log, streamed for the WHOLE run (env → collect) into
+# $OUT/snowplow-stream.log. A one-shot `kubectl logs` at collect returns only
+# the container's current file (run 9: the last ~30 s). The stream follows
+# across pod restarts and dropped connections, resuming from the newest
+# `time` seen. Every line passes bench.logscrub: metadata only (no body,
+# username or token reaches $OUT).
+LOG_STREAM_PID=""
+start_log_stream() {
+  if [[ "$DRY" == "1" ]]; then log "DRY: stream snowplow's log -> $OUT/snowplow-stream.log"; return 0; fi
+  rm -f "$OUT/.log-stream-stop"
+  ( set +e
+    while [[ ! -e "$OUT/.log-stream-stop" ]]; do
+      since="$(cat "$OUT/.log-stream-last" 2>/dev/null || true)"
+      "${K[@]}" -n krateo-system logs -f deploy/snowplow ${since:+"--since-time=$since"} \
+          2>>"$OUT/snowplow-stream.err" \
+        | python3 -m bench.logscrub --last-time-file "$OUT/.log-stream-last" --deny "$PW" \
+          >> "$OUT/snowplow-stream.log"
+      [[ -e "$OUT/.log-stream-stop" ]] && break
+      printf '{"bench_stream":"reconnect","t":%s}\n' "$(date +%s)" >> "$OUT/snowplow-stream.log"
+      sleep "$LOG_STREAM_RETRY_S"
+    done ) >/dev/null 2>&1 &
+  LOG_STREAM_PID=$!
+  log "streaming snowplow's log (scrubbed) -> $OUT/snowplow-stream.log"
+}
+stop_log_stream() {
+  [[ -n "${LOG_STREAM_PID:-}" ]] || return 0
+  touch "$OUT/.log-stream-stop"
+  pkill -TERM -P "$LOG_STREAM_PID" 2>/dev/null || true
+  kill "$LOG_STREAM_PID" 2>/dev/null || true
+  wait "$LOG_STREAM_PID" 2>/dev/null || true
+  LOG_STREAM_PID=""
 }
 s_collect() {
   local p
@@ -649,8 +702,13 @@ s_collect() {
   snowplow_pod_record after
   declare -F stop_top_loop >/dev/null && stop_top_loop
   # mem606: its memstats trajectory and heap profiles, both files in /out
-  # (#817: its stdout log was cut at the head too in run 9).
+  # (#817: its stdout log was cut at the head too in run 9). Ask it to end
+  # its stream first (/out/stop → mem_end, then the wrapper's mem_exit and
+  # /out/exited), so the copy is the final, framed stream; a sampler that
+  # does not answer in MEM_STOP_WAIT_S is copied as is and the verdict says
+  # the tail is missing.
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=mem606 -o name); do
+    mem_stop "${p#pod/}"
     mkdir -p "$OUT/heap"
     "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out" "$OUT/heap" >/dev/null 2>&1 \
       || log "could not copy heap profiles from ${p#pod/}"
@@ -660,20 +718,48 @@ s_collect() {
       log "could not copy the mem606 trajectory (/out/mem.jsonl) from ${p#pod/}"
     fi
   done
-  "${KR[@]}" -n krateo-system logs deploy/snowplow --tail=-1 > "$OUT/snowplow.log" \
+  # How every in-cluster Job pod ended, for the verdict (#817 review): a pod
+  # that died (OOMKilled, a crash) is INVALID with its reason in verdict.json.
+  : > "$OUT/job-pods.jsonl"
+  for p in load606 fresh606 mem606; do
+    "${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>/dev/null \
+      | python3 -m bench.load606 job-pod-record --job "$p" >> "$OUT/job-pods.jsonl" \
+      || log "could not record how the $p pod(s) ended"
+  done
+  # #822: the streamed log is the run's snowplow log; the one-shot reads below
+  # only cover a stream gap at the very end. All of it scrubbed.
+  declare -F stop_log_stream >/dev/null && stop_log_stream
+  "${KR[@]}" -n krateo-system logs deploy/snowplow --tail=-1 \
+    | python3 -m bench.logscrub --deny "$PW" > "$OUT/snowplow.log" \
     || log "could not read the snowplow log"
-  "${KR[@]}" -n krateo-system logs deploy/snowplow --previous --tail=-1 > "$OUT/snowplow-previous.log" 2>/dev/null \
-    || rm -f "$OUT/snowplow-previous.log"
+  "${KR[@]}" -n krateo-system logs deploy/snowplow --previous --tail=-1 2>/dev/null \
+    | python3 -m bench.logscrub --deny "$PW" > "$OUT/snowplow-previous.log"
+  [[ -s "$OUT/snowplow-previous.log" ]] || rm -f "$OUT/snowplow-previous.log"
   "${KR[@]}" top nodes > "$OUT/top-nodes.txt" || true
   COLLECTED=1
   log "collected: $(cd "$OUT" && ls nav-*.jsonl fresh-*.jsonl mem-*.jsonl pod-after.jsonl snowplow.log 2>/dev/null | tr '\n' ' ')heap=$(ls "$OUT/heap" 2>/dev/null | wc -l | tr -d ' ')"
+}
+# mem_stop <pod>: ask mem606 for its final stream and wait (bounded) until
+# its wrapper has written the exit code.
+mem_stop() {
+  local pod="$1" waited=0
+  bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "$pod" -- touch /out/stop \
+    >/dev/null 2>&1 || { log "could not ask $pod to end its stream"; return 0; }
+  until bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "$pod" -- \
+      test -f /out/exited >/dev/null 2>&1; do
+    if (( waited >= MEM_STOP_WAIT_S )); then
+      log "$pod did not end its stream within ${MEM_STOP_WAIT_S}s: copying it as is"
+      return 0
+    fi
+    sleep 5; waited=$(( waited + 5 ))
+  done
 }
 collect_and_evaluate() { s_collect; s_evaluate; }
 s_evaluate() {
   shopt -s nullglob
   local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
-               "$OUT"/image-digest.jsonl)
+               "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl)
   if [[ "$DRY" == "1" ]]; then log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>}"; return 0; fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
