@@ -1,0 +1,34 @@
+{"kind": "cpu_start", "container": "viewer", "request_m": 1000, "limit_m": 1000, "cgroup_limit_m": 1000, "interval_s": 5}
+{"kind": "cpu", "t": 773961.05, "usage_usec": 16645, "throttled_usec": 0}
+{"kind": "cpu", "t": 773966.05, "usage_usec": 449741, "throttled_usec": 4569}
+{"kind": "cpu", "t": 773971.05, "usage_usec": 639860, "throttled_usec": 4569}
+{"kind": "cpu", "t": 773976.05, "usage_usec": 802083, "throttled_usec": 4569}
+{"kind": "cpu", "t": 773981.06, "usage_usec": 951652, "throttled_usec": 4569}
+{"kind": "cpu", "t": 773986.06, "usage_usec": 1086852, "throttled_usec": 4569}
+{"kind": "cpu", "t": 773991.06, "usage_usec": 1227853, "throttled_usec": 4569}
+{"kind": "cpu", "t": 773996.06, "usage_usec": 1366991, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774001.06, "usage_usec": 1484559, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774006.06, "usage_usec": 1633208, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774011.06, "usage_usec": 1783665, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774016.07, "usage_usec": 1910881, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774021.07, "usage_usec": 2054865, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774026.07, "usage_usec": 2225657, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774031.07, "usage_usec": 2385227, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774036.07, "usage_usec": 2566386, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774041.07, "usage_usec": 2754263, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774046.07, "usage_usec": 2921344, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774051.08, "usage_usec": 3108265, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774056.08, "usage_usec": 3277411, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774061.08, "usage_usec": 3444620, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774066.08, "usage_usec": 3608864, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774071.08, "usage_usec": 3776380, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774076.08, "usage_usec": 3949681, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774081.08, "usage_usec": 4108074, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774086.08, "usage_usec": 4334696, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774091.09, "usage_usec": 4508291, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774096.09, "usage_usec": 4689961, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774101.09, "usage_usec": 4853430, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774106.09, "usage_usec": 5035736, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774111.09, "usage_usec": 5209453, "throttled_usec": 4569}
+{"kind": "cpu", "t": 774112.02, "usage_usec": 5288833, "throttled_usec": 4569}
+{"kind": "cpu_end"}

@@ -18,7 +18,7 @@ import json
 import sys
 from pathlib import Path
 
-__all__ = ["render", "shard_ranges", "main"]
+__all__ = ["main", "render", "shard_ranges"]
 
 LOAD606_SRC = Path(__file__).with_name("load606.py")
 IMAGE = "python:3.12-slim"
@@ -39,6 +39,29 @@ def shard_ranges(users: int, shards: int) -> list[tuple[int, int]]:
         out.append((start, start + n - 1))
         start += n
     return out
+
+
+def render_base(src: str | None = None) -> str:
+    """The bench-loadgen Namespace + the load606 ConfigMap (load606.py
+    verbatim) every in-cluster Job mounts."""
+    src = LOAD606_SRC.read_text() if src is None else src
+    return f"""\
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bench-loadgen
+  labels:
+    app: scaletest
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: load606
+  namespace: bench-loadgen
+data:
+  load606.py: |
+{_indent(src, 4)}
+"""
 
 
 def _indent(text: str, n: int) -> str:
@@ -93,23 +116,7 @@ echo "$rc" > /out/done
 sleep {linger_s:g}
 exit "$rc"
 """
-    return f"""\
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: bench-loadgen
-  labels:
-    app: scaletest
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: load606
-  namespace: bench-loadgen
-data:
-  load606.py: |
-{_indent(src, 4)}
----
+    return render_base(src) + f"""---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -412,6 +419,73 @@ spec:
 """
 
 
+def preflight_routes(path: str) -> list[dict]:
+    """The run's route table: the preflight's routes (menu order), with the
+    content endpoint each one fetches; only routes it found servable."""
+    rec = None
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("{"):
+                r = json.loads(line)
+                if r.get("kind") == "preflight":
+                    rec = r
+    if rec is None:
+        raise ValueError(f"{path}: no preflight record")
+    return [{"path": r["path"], "endpoint": r["endpoint"]} for r in rec.get("routes") or []
+            if r.get("endpoint") and r.get("status") == 200]
+
+
+# The frontend's config.json (installer default, values.schema.json:2552-2556 at
+# 0.3.430) points the SPA at localhost:8081 snowplow, :8082 authn and :8083
+# events. :8083 is the sse-proxy (the /notifications firehose behind live
+# widget refresh, ui/src/hooks/useLiveRefresh.ts:18-21): Service
+# krateo-sse-proxy (installer compositions.yaml:790,803 pin the release name to
+# the component name; chart krateo-sse-proxy 0.1.15 templates/service.yaml:4 +
+# _helpers.tpl:20-31 make it the Service name) on port 8080
+# (templates/service.yaml:14, values.yaml:36; exposure.port is unset, so
+# compositions.yaml:153 leaves it).
+K6_BROWSER_FORWARDS = ("8080=frontend.krateo-system.svc:8080",
+                       "8081=snowplow.krateo-system.svc:8081",
+                       "8082=authn.krateo-system.svc:8082",
+                       "8083=krateo-sse-proxy.krateo-system.svc:8080")
+
+
+def render_k6_driver(a) -> str:
+    """#830: the k6 load Job and the real-Chrome Job, from the CLI args."""
+    import os
+
+    from bench import k6_job, rbac_model
+    viewers = not a.no_viewers
+    k6_job.loadgen_fit(a.loadgen_machine_type, k6_job.k6_plan_requests(viewers=viewers))
+    if a.preflight_file and os.path.exists(a.preflight_file):
+        routes = preflight_routes(a.preflight_file)
+    elif a.dry_run:
+        # BENCH_606_DRY_RUN prints the manifests and applies nothing; there is
+        # no preflight to read, so the route table is a visible placeholder.
+        routes = [{"path": "/dry-run-no-preflight", "endpoint": a.init}]
+    else:
+        raise ValueError(f"no preflight route table at {a.preflight_file!r}")
+    think_s = a.think_s if a.think_s > 0 or not a.dry_run else 1.0   # dry: printed, never run
+    burst_users = min(a.burst_users, a.users - 1) if a.dry_run else a.burst_users
+    model = rbac_model.RbacModel(users=a.users, namespaces=a.namespaces)
+    sessions = k6_job.browser_sessions(model, a.browser_sessions,
+                                       last=max(0, a.users - burst_users - 1))
+    cfg = k6_job.k6_config(snowplow_url=a.snowplow_url, init=a.init, frontend_ns=a.frontend_ns,
+                           builders_ns=a.builders_ns, routes=routes, users=a.users,
+                           burst_users=burst_users, think_s=think_s,
+                           duration_s=a.duration_s, burst_at_s=a.burst_at_s,
+                           composite_routes=a.composite_route or (
+                               [routes[0]["path"]] if a.dry_run else []),
+                           browser_users=[s["index"] for s in sessions], viewers=viewers)
+    bcfg = k6_job.browser_config(sessions=sessions, routes=[r["path"] for r in routes],
+                                 password=a.password, think_s=a.browser_think_s,
+                                 duration_s=a.duration_s)
+    forwards = a.browser_forward or list(K6_BROWSER_FORWARDS)
+    return (k6_job.render_k6(config=cfg, authn_url=a.authn_url, password=a.password,
+                             linger_s=a.linger_s)
+            + k6_job.render_browser(config=bcfg, forwards=forwards, linger_s=a.linger_s))
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="load606_job")
     p.add_argument("--users", type=int, default=1000)
@@ -451,6 +525,18 @@ def main(argv: list[str] | None = None) -> int:
                    help="fresh606 churn modes: annotation and/or status (run 9)")
     p.add_argument("--no-viewers", action="store_true",
                    help="driver and probe open NO /refreshes viewers (#764)")
+    # #830: run 11's load = k6 + real Chrome, instead of the load606 driver.
+    p.add_argument("--driver", choices=["k6", "load606"], default="load606")
+    p.add_argument("--preflight-file", default=None,
+                   help="k6: preflight.jsonl, whose routes are the run's route table")
+    p.add_argument("--browser-sessions", type=int, default=5)
+    p.add_argument("--loadgen-machine-type", default="n2-standard-16",
+                   help="k6: the loadgen node the plan must fit (bench/gke.py LOADGEN_MACHINE_TYPE)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="k6: no preflight exists (BENCH_606_DRY_RUN); placeholder route table")
+    p.add_argument("--browser-think-s", type=float, default=15.0)
+    p.add_argument("--browser-forward", action="append", default=None,
+                   help="k6: LOCALPORT=host:port forwarded inside the browser pod (repeatable)")
     a = p.parse_args(argv)
     if a.preflight_only:
         sys.stdout.write(render_preflight(
@@ -458,7 +544,10 @@ def main(argv: list[str] | None = None) -> int:
             user=a.preflight_user, password=a.password, init=a.init,
             frontend_ns=a.frontend_ns, builders_ns=a.builders_ns))
         return 0
-    sys.stdout.write(render(users=a.users, shards=a.shards, think_s=a.think_s,
+    if a.driver == "k6":
+        sys.stdout.write(render_base() + render_k6_driver(a))
+    else:
+        sys.stdout.write(render(users=a.users, shards=a.shards, think_s=a.think_s,
                             duration_s=a.duration_s,
                             snowplow_url=a.snowplow_url,
                             authn_url=a.authn_url, password=a.password,

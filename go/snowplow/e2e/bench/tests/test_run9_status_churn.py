@@ -277,7 +277,12 @@ def test_run606_default_runs_both_modes_and_derives_the_wait(harness):
     #   = 2070 s; the driver needs 1 + 900; wait = 2070 + 600
     waits = [c["argv"] for c in _calls(state) if c["tool"] == "kubectl" and "wait" in c["argv"]
              and "job/fresh606" in c["argv"]]
-    assert waits and "--timeout=2670s" in waits[0]
+    # the wait is the deadline minus `now`, read after waiting for the driver
+    # Jobs: crossing a second (or two, with two k6 Jobs) takes 1-2 s off it
+    # (#831 gate: 4/15 runs failed on an exact 2670)
+    assert waits
+    timeout = next(int(a[len("--timeout="):-1]) for a in waits[0] if a.startswith("--timeout="))
+    assert 2667 <= timeout <= 2670, waits[0]
 
 
 def test_run606_annotation_only_renders_the_run8_probe(harness):
