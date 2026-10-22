@@ -21,6 +21,12 @@ captures the one invariant whose violation caused a six-revert retrospective: **
 cache must be keyed by the binding that authorised the request (plus the subject's RBAC
 sub-generation), never by a cohort/content key alone.**
 
+**Precondition (#835):** this design assumes authorization is a function of Kubernetes RBAC
+bindings. That means no authorizer in the apiserver chain that can deny a read RBAC allows,
+ahead of RBAC. Authorizers that only grant (such as GKE IAM, after RBAC) are fine. A
+deny-capable authorizer before RBAC is a supported configuration only with the cache off.
+See [docs/configuration.md](../../../../docs/configuration.md#supported-authorization-configuration).
+
 ---
 
 ## 1. Flow diagram
