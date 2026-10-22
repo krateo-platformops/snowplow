@@ -54,14 +54,9 @@ FORWARD_CPU, FORWARD_MEMORY = "100m", "64Mi"
 VIEWER_CPU, VIEWER_MEMORY = "1", "2Gi"
 
 LOGIN_CONCURRENCY = 64              # run 10's proven authn concurrency
-# Run 10's first loads (808, nav-load606-0-2bkjt.jsonl): p50 30.1 s, p95
-# 61.0 s, p99 88.1 s. In the arrival minute every user starts one, so k6
-# needs ~ arrival rate x p99 first-load time VUs in flight; pre-allocate them
-# all (#831 gate M3: growing VUs while the arrival runs is what drops
-# iterations). Measured: the pinned k6 with 1,800 VUs on this script peaks at
-# 1.09 GiB, inside K6_MEMORY.
-FIRST_LOAD_P99_S = 88.1
-VU_MARGIN = 1.2
+# Run 12: navigate.js runs one VU per k6 user (a tab, as the SPA drives it),
+# so k6 holds at most `users` VUs. Measured (#831): the pinned k6 with 1,800
+# VUs on this script peaks at 1.09 GiB, inside K6_MEMORY.
 FRESH_CPU, FRESH_MEMORY = "1", "1Gi"   # load606_job.render_fresh's requests
 
 # GKE node allocatable (cloud.google.com/kubernetes-engine/docs/concepts/
@@ -187,8 +182,6 @@ def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: st
     nav_ids = [i for i in range(1, users - burst_users + 1) if i not in excluded]
     if not nav_ids:
         raise ValueError("no user left for k6 to drive")
-    nav_rate = len(nav_ids) / think_s
-    vus = max(len(nav_ids), math.ceil(nav_rate * FIRST_LOAD_P99_S * VU_MARGIN))
     return {"snowplowUrl": snowplow_url.rstrip("/"), "init": init, "frontendNs": frontend_ns,
             "buildersNs": builders_ns,
             "routes": [{"path": r["path"], "endpoint": r["endpoint"]} for r in routes],
@@ -196,11 +189,7 @@ def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: st
             "navUserIds": nav_ids, "burstUserIds": burst_ids,
             "durationS": int(duration_s), "burstAtS": int(burst_at_s),
             "compositeRoutes": list(composite_routes),
-            "viewers": viewers,            # write the navigation feed (navigate.js)
-            # VUs: arrival rate x run 10's p99 first-load time, with margin,
-            # and never fewer than the navigating users; ALL pre-allocated
-            # (k6 refuses preAllocatedVUs > maxVUs: the kind proof hit it).
-            "preAllocatedVUs": vus, "maxVUs": vus}
+            "viewers": viewers}            # write the navigation feed (navigate.js)
 
 
 def browser_config(*, sessions: list[dict], routes: list[str], password: str,
@@ -445,16 +434,22 @@ spec:
 # with the reason); browser.js retries its first navigation.
 FORWARD_WAIT_S = 180
 FORWARD_PROBE_PERIOD_S = 2
+# one attempt's whole time (#834 review): `wget -T` is a read-IDLE timeout,
+# so a port that streams at / kept one attempt open forever. A stream that
+# sent its headers has answered; busybox `timeout` ends the attempt.
+FORWARD_ATTEMPT_S = 10
 
 
 def _forward_wait(ports: list[str], wait_s: int) -> str:
     """POSIX sh (busybox): every 127.0.0.1:<port> answers HTTP (any status;
-    busybox wget prints `HTTP/` only when a server answered) within wait_s.
-    Writes /out/browser-forward.json either way."""
+    busybox wget prints `HTTP/` only when a server answered) within wait_s;
+    each attempt ends within FORWARD_ATTEMPT_S (+2 s to kill), so the wait
+    overruns wait_s by at most one attempt. Writes /out/browser-forward.json
+    either way."""
     return f"""wait_forwards() {{
   t0=$(date +%s); end=$((t0 + ${{FORWARD_WAIT_S:-{wait_s}}}))
   for p in {" ".join(ports)}; do
-    until wget -q -T 5 -S -O /dev/null "http://127.0.0.1:$p/" 2>&1 | grep -q 'HTTP/'; do
+    until timeout -k 2 {FORWARD_ATTEMPT_S} wget -q -T 5 -S -O /dev/null "http://127.0.0.1:$p/" 2>&1 | grep -q 'HTTP/'; do
       if [ "$(date +%s)" -ge "$end" ]; then
         echo "forward 127.0.0.1:$p did not answer within ${{FORWARD_WAIT_S:-{wait_s}}}s: not starting the browser" >&2
         printf '{{"kind": "forward_wait", "ok": false, "port": %s, "waited_s": %s}}\\n' "$p" "$(( $(date +%s) - t0 ))" > /out/browser-forward.json

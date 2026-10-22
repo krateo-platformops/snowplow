@@ -25,6 +25,7 @@ import json
 import os
 import re
 from collections import Counter, defaultdict
+from datetime import datetime
 from itertools import pairwise
 
 __all__ = [
@@ -72,6 +73,20 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "browser_page_timeouts", "browser_logins", "browser_signin_ms", "browser_sse_opened",
          "dropped_iterations")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
+# the page loads whose time is kept too (out["times"], index-aligned with
+# out["points"]): run 12 compares latency inside / outside the CPU profiles
+_TIMED = ("page_load_ms", "browser_page_load_ms")
+_RFC3339 = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
+
+
+def epoch(ts: str | None) -> float | None:
+    """k6's point time (RFC 3339, nanoseconds) as epoch seconds."""
+    m = _RFC3339.match(ts or "")
+    if not m:
+        return None
+    tz = "+00:00" if m.group(3) == "Z" else m.group(3)
+    base = datetime.fromisoformat(m.group(1) + tz).timestamp()
+    return base + (float("0." + m.group(2)) if m.group(2) else 0.0)
 
 
 def _pct(vals, p):
@@ -92,6 +107,7 @@ def read_k6_out(d: str, name: str) -> dict | None:
     if not any(os.path.exists(p) for p in (stream, summary, exitf)):
         return None
     out = {"name": name, "stream": os.path.exists(stream), "points": defaultdict(list),
+           "times": defaultdict(list),
            "frames": Counter(), "truncated": False, "summary": None, "exit": None}
     if out["stream"]:
         try:
@@ -115,6 +131,8 @@ def read_k6_out(d: str, name: str) -> dict | None:
                         out["frames"][tags.get("frame")] += 1
                     else:
                         out["points"][r["metric"]].append((data.get("value"), tags))
+                        if r["metric"] in _TIMED:
+                            out["times"][r["metric"]].append(epoch(data.get("time")))
         except (OSError, EOFError):
             out["truncated"] = True                      # a cut gzip member
     for key, path in (("summary", summary), ("exit", exitf)):
@@ -227,9 +245,49 @@ def k6_checks(o: dict | None, th: dict | None = None) -> list[dict]:
     s = o["summary"]
     scenarios = sorted({k.split("scenario:", 1)[1].rstrip("}")
                         for k in (s.get("metrics") or {}) if k.startswith("iterations{scenario:")})
+    cfg = s.get("config") or {}
+    # run 12: one VU per user (navigate.js session); a user's arrival is on
+    # an open schedule, a start later than LATE_MS is counted and every user
+    # must have arrived. Arrival-rate scenarios (run 11's streams) are judged
+    # by their dropped iterations, below.
+    users = {"navigate": cfg.get("navUsers"), "composite_burst": cfg.get("burstUsers")}
     for sc in scenarios:
-        if sc == "composite_burst":
-            continue                     # per-vu-iterations never drops: completeness below
+        if f"arrivals{{scenario:{sc}}}" not in (s.get("metrics") or {}):
+            continue
+        arrived = _metric(s, f"arrivals{{scenario:{sc}}}", "count") or 0
+        late = _metric(s, f"arrivals_late{{scenario:{sc}}}", "count") or 0
+        want = users.get(sc) or 0
+        value = round(late / arrived, 5) if arrived else None
+        why = []
+        if arrived < want:
+            why.append(f"only {arrived} of {want} {sc} users arrived: the others' sessions never "
+                       f"started")
+        if value is None or value > th["max_dropped_share"]:
+            why.append(f"{late} of {arrived} {sc} first loads started more than 1 s after their "
+                       f"arrival slot: the load generator, not snowplow, fell behind"
+                       if arrived else f"no {sc} user arrived: that load never ran")
+        out.append({"check": f"k6.late_arrivals[{sc}]", "value": value,
+                    "bar": f"<= {th['max_dropped_share']} late, all {want} arrived",
+                    "result": "FAIL" if why else "PASS", **({"why": "; ".join(why)} if why else {})})
+        # #839 gate: a click is closed-loop (previous page end + THINK_S); one
+        # that started more than 1 s after that is k6 falling behind, which
+        # would otherwise just lower the offered load
+        clicks = _metric(s, f"clicks{{scenario:{sc}}}", "count") or 0
+        clate = _metric(s, f"clicks_late{{scenario:{sc}}}", "count") or 0
+        open_ = _metric(s, f"clicks_open_schedule{{scenario:{sc}}}", "count") or 0
+        cval = round(clate / clicks, 5) if clicks else None
+        cwhy = (f"{clate} of {clicks} {sc} route clicks started more than 1 s after their "
+                f"intended time (previous page end + think time): the load generator, not "
+                f"snowplow, fell behind and the offered load dropped"
+                if clicks and cval > th["max_dropped_share"] else
+                f"no {sc} route click ran, though the run had time for {open_}"
+                if not clicks and open_ else None)
+        out.append({"check": f"k6.late_clicks[{sc}]", "value": cval,
+                    "bar": f"<= {th['max_dropped_share']} of the clicks late",
+                    "result": "FAIL" if cwhy else "PASS", **({"why": cwhy} if cwhy else {})})
+    for sc in scenarios:
+        if sc == "composite_burst" or f"arrivals{{scenario:{sc}}}" in (s.get("metrics") or {}):
+            continue                     # per-vu-iterations never drops: arrivals above
         done = _metric(s, f"iterations{{scenario:{sc}}}", "count") or 0
         dropped = _metric(s, f"dropped_iterations{{scenario:{sc}}}", "count") or 0
         scheduled = done + dropped
@@ -245,7 +303,11 @@ def k6_checks(o: dict | None, th: dict | None = None) -> list[dict]:
     if burst:
         # every burst user's deep link ran to a recorded page load; one cut
         # by the scenario's maxDuration, or never started, is missing here
-        loads = _metric(s, "page_loads{scenario:composite_burst}", "count") or 0
+        # (run 12's burst users also click: count their first loads only)
+        key = ("first_loads{scenario:composite_burst}"
+               if "first_loads{scenario:composite_burst}" in (s.get("metrics") or {})
+               else "page_loads{scenario:composite_burst}")
+        loads = _metric(s, key, "count") or 0
         ok = loads == burst
         out.append({"check": "k6.composite_burst_complete", "value": loads, "bar": f"== {burst}",
                     "result": "PASS" if ok else "FAIL",
@@ -395,10 +457,22 @@ def browser_navs(o: dict | None) -> list[dict]:
     (visit 1 = this session's first load of the route, 2 = warm)."""
     if o is None:
         return []
+    times = (o.get("times") or {}).get("browser_page_load_ms") or []
     return [{"kind": "nav", "nav": t.get("method"), "page": t.get("route"),
              "session": t.get("session"), "wall_ms": round(v, 1),
-             "visit": 1 if t.get("visit") == "first" else 2, "calls": 0, "errors": 0}
-            for v, t in o["points"].get("browser_page_load_ms", [])]
+             "visit": 1 if t.get("visit") == "first" else 2, "calls": 0, "errors": 0,
+             # the point is written when the load ends
+             **({"start": times[i] - v / 1000} if i < len(times) and times[i] else {})}
+            for i, (v, t) in enumerate(o["points"].get("browser_page_load_ms", []))]
+
+
+def k6_page_loads(o: dict | None) -> list[tuple[float, float, dict]]:
+    """k6's page loads as (start epoch, ms, tags), those with a time."""
+    if o is None:
+        return []
+    times = (o.get("times") or {}).get("page_load_ms") or []
+    return [(times[i] - v / 1000, v, t) for i, (v, t) in enumerate(o["points"].get("page_load_ms", []))
+            if i < len(times) and times[i] and v is not None]
 
 
 def _by(points, *keys):
@@ -408,6 +482,14 @@ def _by(points, *keys):
     return {"/".join(str(x) for x in k): {"n": len(v), "p50_ms": _pct(v, 50), "p95_ms": _pct(v, 95),
                                           "max_ms": max(v)}
             for k, v in sorted(g.items(), key=lambda kv: tuple(str(x) for x in kv[0]))}
+
+
+def _clicks(summary: dict, sc: str) -> dict:
+    done = _metric(summary, f"clicks{{scenario:{sc}}}", "count") or 0
+    open_ = _metric(summary, f"clicks_open_schedule{{scenario:{sc}}}", "count") or 0
+    return {"done": done, "late": _metric(summary, f"clicks_late{{scenario:{sc}}}", "count") or 0,
+            "open_schedule": open_,
+            "achieved_share_of_open_schedule": round(done / open_, 4) if open_ else None}
 
 
 def k6_report(o: dict | None) -> dict | None:
@@ -420,6 +502,19 @@ def k6_report(o: dict | None) -> dict | None:
             "call_ms_by_level": _by(p.get("http_req_duration", []), "level"),
             "first_load_failed": sum(v for v, _ in p.get("first_load_failed", [])),
             "page_errors": sum(v for v, _ in p.get("page_errors", [])),
+            # run 12: route clicks the open schedule would have started while
+            # the user's first load still ran (navigate.js defers them)
+            "clicks_deferred": {
+                k.split("scenario:", 1)[1].rstrip("}"): v.get("count")
+                for k, v in ((o["summary"] or {}).get("metrics") or {}).items()
+                if k.startswith("clicks_deferred{scenario:")},
+            "arrival_lag_ms": ((o["summary"] or {}).get("metrics") or {}).get("arrival_lag_ms"),
+            "click_lag_ms": ((o["summary"] or {}).get("metrics") or {}).get("click_lag_ms"),
+            # achieved route clicks vs run 11's open schedule (one per THINK_S
+            # from the arrival): how much offered load the SPA-like clicks
+            # leave, to compare run 12's load with run 11's
+            "clicks": {sc: _clicks(o["summary"], sc) for sc in ("navigate", "composite_burst")
+                       if _metric(o["summary"], f"clicks{{scenario:{sc}}}", "count") is not None},
             "summary": (o["summary"] or {}).get("metrics")}
 
 

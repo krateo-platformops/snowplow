@@ -73,6 +73,7 @@ DIGEST_POLL_S="${DIGEST_POLL_S:-5}"
 # teardown trap after a failed measure, #763).
 COLLECT_TIMEOUT_S="${COLLECT_TIMEOUT_S:-300}"
 DRIVE_POLL_S="${DRIVE_POLL_S:-30}"     # measure: is every driver pod Ready (drive over)?
+DRIVER_PENDING_S="${DRIVER_PENDING_S:-$(python3 -c 'from bench import load606; print(load606.DRIVER_PENDING_S)')}"  # measure: a driver pod still Pending/Init this long never started
 LOG_STREAM_RETRY_S="${LOG_STREAM_RETRY_S:-5}"   # snowplow log stream: reconnect pause
 MEM_STOP_WAIT_S="${MEM_STOP_WAIT_S:-180}"       # collect: mem606 writes its final stream
 MEASURE_STARTED=0
@@ -601,9 +602,12 @@ s_measure() {
 driver_jobs() { if [[ "$LOAD_DRIVER" == "k6" ]]; then echo "k6load k6browser"; else echo "load606"; fi; }
 # wait_drive_done <deadline>: every driver Job's pods are Ready (readinessProbe
 # on /out/done), so the Jobs are NOT Complete here. A failed driver pod fails
-# the step at once, not at the deadline.
+# the step at once, not at the deadline; so does one that never starts (#834
+# review: a forwarder whose startupProbe never passes holds the browser pod in
+# Init), checked on EVERY driver Job at each poll (the browser pod's would
+# otherwise wait behind k6load's whole run).
 wait_drive_done() {
-  local deadline="$1" st ready failed want j
+  local deadline="$1" st ready failed want j k stuck
   if [[ "$DRY" == "1" ]]; then log "DRY: wait until every $(driver_jobs) pod is Ready (run over)"; return 0; fi
   for j in $(driver_jobs); do
     log "waiting for the driver: $j pods Ready = run over, results final"
@@ -620,6 +624,13 @@ wait_drive_done() {
         log "measure FAILED: a $j driver pod failed before its results were final"
         return 1
       fi
+      for k in $(driver_jobs); do
+        stuck="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o json 2>/dev/null \
+                 | python3 -m bench.load606 driver-stuck --pending-s "$DRIVER_PENDING_S")" || {
+          log "measure FAILED: the $k driver never started: $stuck"
+          return 1
+        }
+      done
       if (( $(date +%s) >= deadline )); then
         log "measure FAILED: $j not done within ${MEASURE_WAIT_S}s (${ready:-0}/${want} Ready)"
         return 1

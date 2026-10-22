@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import concurrent.futures
 import gzip
 import json
@@ -1515,6 +1516,59 @@ def job_pod_records(pod_list: dict, job: str) -> list[dict]:
     return out
 
 
+# A driver pod that never starts (#834 review): a native sidecar whose
+# startupProbe never passes is restarted forever and holds its pod in Init
+# (phase Pending, not Failed), as does a pod no node takes. The driver wait
+# fails on it at once, with the reason, instead of at MEASURE_WAIT_S.
+#   DRIVER_PENDING_S  a pod still Pending this long after it was created.
+#                     Run 11's k6 login initContainer took ~70 s for 1,000
+#                     users (driver-k6load-lj2bw.log); image pulls on a new
+#                     node add a few minutes.
+#   DRIVER_INIT_RESTARTS  an init container (the sidecar) restarted this
+#                     often while the pod is still Pending: each restart is a
+#                     startup that failed for its whole probe budget.
+DRIVER_PENDING_S = 600
+DRIVER_INIT_RESTARTS = 2
+
+
+def _ts(s: str | None) -> float | None:
+    try:
+        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")) if s else None
+    except ValueError:
+        return None
+
+
+def driver_pod_stuck(pod_list: dict, now: float, *, pending_s: float = DRIVER_PENDING_S,
+                     init_restarts: int = DRIVER_INIT_RESTARTS) -> str | None:
+    """Why a driver Job's pod will not start, or None. Reasons only (enum-like
+    states and counts), never a container's message."""
+    for p in pod_list.get("items") or []:
+        st = p.get("status") or {}
+        if st.get("phase") != "Pending":
+            continue
+        name = (p.get("metadata") or {}).get("name")
+        for cs in st.get("initContainerStatuses") or []:
+            n = cs.get("restartCount", 0)
+            if n >= init_restarts:
+                last = _termination(cs.get("lastState"))
+                return (f"pod {name} is still Pending and its init container {cs.get('name')} "
+                        f"restarted {n} times" + (f" (last: {last['reason']}, exit "
+                                                  f"{last['exit_code']})" if last else "")
+                        + ": a sidecar whose startupProbe never passes, or a crashing init step")
+        created = _ts((p.get("metadata") or {}).get("creationTimestamp"))
+        if created is not None and now - created >= pending_s:
+            sched = next((c for c in st.get("conditions") or []
+                          if c.get("type") == "PodScheduled" and c.get("status") != "True"), None)
+            waiting = [f"{cs.get('name')} {((cs.get('state') or {}).get('waiting') or {}).get('reason')}"
+                       for cs in (st.get("initContainerStatuses") or [])
+                       + (st.get("containerStatuses") or [])
+                       if (cs.get("state") or {}).get("waiting")]
+            return (f"pod {name} is still Pending {int(now - created)} s after it was created"
+                    + (f" (unscheduled: {sched.get('reason')})" if sched else "")
+                    + (f" (waiting: {', '.join(waiting)})" if waiting else ""))
+    return None
+
+
 def job_pod_checks(recs: list[dict]) -> list[dict]:
     """A validity check per in-cluster Job pod: one whose container died
     (non-zero exit, a restart, phase Failed) makes the run INVALID, and the
@@ -1653,6 +1707,218 @@ def memory_report(mem: list[dict]) -> dict | None:
             "heap_profiles": [m.get("profile") for m in mem if m.get("kind") == "heap_profile"]}
 
 
+# ─── CPU profiles, GC and scheduler (run 12) ───────────────────────────────
+#
+# Report-only, with one validity bar: the storm window's profiles are the
+# reason the profiler exists, so a run whose storm window they do not cover
+# is INVALID. `cpu_storm_min_coverage` allows ~2 of the 20 planned 30 s
+# profiles to be lost (a failed request, a restart's gap).
+CPU_STORM_MIN_COVERAGE = 0.9
+
+
+def _merged(iv: list[tuple[float, float]], gap: float = 0.0) -> list[tuple[float, float]]:
+    out: list[list[float]] = []
+    for a, b in sorted(iv):
+        if out and a <= out[-1][1] + gap:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def _covered(iv: list[tuple[float, float]], a: float, b: float) -> float:
+    return sum(max(0.0, min(y, b) - max(x, a)) for x, y in _merged(iv))
+
+
+def cpu_profile_windows(mem: list[dict]) -> dict | None:
+    """The CPU-profile plan the mem606 stream announced (mem_start cpu_plan),
+    the windows it meant (anchored where memwatch anchored them: the first
+    load_detected sample, else mem_start) and how much of each the written
+    profiles cover. None when the stream announced no plan."""
+    start = next((r for r in mem if r.get("kind") == "mem_start" and r.get("cpu_plan")), None)
+    if start is None:
+        return None
+    plan = start["cpu_plan"]
+    anchor = next((r["t"] for r in mem if r.get("kind") == "mem" and r.get("load_detected")),
+                  start["t"])
+    end_t = next((r["t"] for r in mem if r.get("kind") == "mem_end"),
+                 max((r.get("t") or 0) for r in mem))
+    profs = sorted((r for r in mem if r.get("kind") == "cpu_profile" and r.get("profile")),
+                   key=lambda r: r["t_start"])
+    # coverage from what each profile recorded itself (its own start and
+    # duration); the request interval only for a profile without them
+    iv = [((r["prof_start"], r["prof_start"] + r["prof_duration_s"])
+           if r.get("prof_start") is not None else (r["t_start"], r["t_end"])) for r in profs]
+
+    def window(a, b):
+        b = min(b, end_t)
+        span = b - a
+        return {"t0": a, "t1": b, "planned_s": round(max(span, 0.0), 1),
+                "covered_s": round(_covered(iv, a, b), 1),
+                "coverage": round(_covered(iv, a, b) / span, 3) if span > 0 else None}
+    burst_at = plan.get("burst_at_s")
+    return {"plan": plan, "anchor_t": anchor,
+            "anchor_is": ("the load first seen (mem sample load_detected)"
+                          if anchor != start["t"] else "mem606's start (no load was seen)"),
+            "storm": window(anchor, anchor + plan["storm_s"]),
+            "burst": (window(anchor + burst_at - plan["burst_pre_s"],
+                             anchor + burst_at + plan["burst_post_s"])
+                      if burst_at is not None else None),
+            "profiles": [{"profile": r["profile"], "window": r["window"],
+                          "t_start": a, "t_end": b} for r, (a, b) in zip(profs, iv)],
+            # requests that took > profile_s + 5 s (queued or slow transfer)
+            "slow_requests": sum(1 for r in profs if r.get("slow_request")),
+            "failed": [{"window": r.get("window"), "t_start": r.get("t_start"),
+                        "error": r.get("error")}
+                       for r in mem if r.get("kind") == "cpu_profile" and not r.get("profile")]}
+
+
+def cpu_storm_check(win: dict | None) -> dict | None:
+    if win is None:
+        return None
+    cov = win["storm"]["coverage"]
+    c = {"check": "mem606.cpu_profiles_storm", "value": cov,
+         "bar": f">= {CPU_STORM_MIN_COVERAGE} of the storm window "
+                f"({win['storm']['planned_s']} s) covered by CPU profiles"}
+    if cov is not None and cov >= CPU_STORM_MIN_COVERAGE:
+        return dict(c, result="PASS")
+    return dict(c, result="FAIL",
+                why=f"the login storm's CPU profiles are missing: {win['storm']['covered_s']} s "
+                    f"of {win['storm']['planned_s']} s covered, {len(win['failed'])} profile "
+                    f"request(s) failed; they are the reason the profiler runs")
+
+
+def _lat(ms: list[float]) -> dict | None:
+    return ({"n": len(ms), "p50_ms": pct(ms, 50), "p95_ms": pct(ms, 95), "max_ms": max(ms)}
+            if ms else None)
+
+
+def latency_by_profiling(loads: list[tuple[float, float]], win: dict) -> dict:
+    """Page loads (start epoch, ms) that started inside a CPU profile vs
+    outside one: everywhere, and in the steady part of the run (outside the
+    storm and burst windows), where only the periodic profiles fall and the
+    load is the same inside and out — the comparison that shows whether
+    profiling itself moved latency."""
+    iv = _merged([(p["t_start"], p["t_end"]) for p in win["profiles"]])
+    busy = [(win["storm"]["t0"] - 1e12, win["storm"]["t1"])] + (
+        [(win["burst"]["t0"], win["burst"]["t1"])] if win["burst"] else [])
+
+    def inside(t, ivs):
+        return any(a <= t < b for a, b in ivs)
+    out = {}
+    for name, rows in (("all", loads), ("steady", [x for x in loads if not inside(x[0], busy)])):
+        out[name] = {"inside_profile": _lat([ms for t, ms in rows if inside(t, iv)]),
+                     "outside_profile": _lat([ms for t, ms in rows if not inside(t, iv)])}
+    return out
+
+
+def _pauses(rows: list[dict]) -> dict | None:
+    ps = [p for r in rows for p in (r.get("gc_pauses_ms") or [])]
+    return ({"n": len(ps), "p50_ms": pct(ps, 50), "p95_ms": pct(ps, 95),
+             "p99_ms": pct(ps, 99), "max_ms": max(ps)} if ps else None)
+
+
+GC_BUCKET_S = 60
+
+
+def gc_over_time(rows: list[dict], bucket_s: float = GC_BUCKET_S) -> list[dict]:
+    """Per minute of the run: the GC pauses' p95 / max, how many GCs, the
+    GC CPU fraction at the minute's last sample (Go's GCCPUFraction is
+    cumulative since the process started: its slope is the minute's share),
+    heap allocated and the next GC target at their peak."""
+    if not rows:
+        return []
+    t0 = rows[0]["t"]
+    buckets: dict[int, list[dict]] = {}
+    for r in rows:
+        buckets.setdefault(int((r["t"] - t0) // bucket_s), []).append(r)
+    out = []
+    for k in sorted(buckets):
+        b = buckets[k]
+        ps = [x for r in b for x in (r.get("gc_pauses_ms") or [])]
+        frac = [r["gc_cpu_fraction"] for r in b if r.get("gc_cpu_fraction") is not None]
+        heap = [r["heap_alloc_mb"] for r in b if r.get("heap_alloc_mb") is not None]
+        nxt = [r["next_gc_mb"] for r in b if r.get("next_gc_mb") is not None]
+        out.append({"t": t0 + k * bucket_s, "gcs": len(ps),
+                    "pause_p95_ms": pct(ps, 95), "pause_max_ms": max(ps) if ps else None,
+                    "gc_cpu_fraction": frac[-1] if frac else None,
+                    "heap_alloc_mb_max": max(heap) if heap else None,
+                    "next_gc_mb_max": max(nxt) if nxt else None})
+    return out
+
+
+def gc_sched_report(mem: list[dict], win: dict | None) -> dict | None:
+    """GC pause distribution, GC CPU share and goroutines from the mem
+    samples (each sample carries the pauses since the previous one), by
+    window when the profiling plan defines them."""
+    rows = [r for r in mem if r.get("kind") == "mem" and "gc_pauses_ms" in r]
+    if not rows:
+        return None
+    phases = {"all": rows}
+    if win is not None:
+        st, bu = win["storm"], win["burst"]
+        phases["storm"] = [r for r in rows if r["t"] < st["t1"]]
+        if bu:
+            phases["burst"] = [r for r in rows if bu["t0"] <= r["t"] < bu["t1"]]
+        phases["steady"] = [r for r in rows if r["t"] >= st["t1"]
+                            and not (bu and bu["t0"] <= r["t"] < bu["t1"])]
+    gor = {k: [r["goroutines"] for r in v if r.get("goroutines") is not None]
+           for k, v in phases.items()}
+    frac = [r["gc_cpu_fraction"] for r in rows if r.get("gc_cpu_fraction") is not None]
+    sched = [r["sched_latencies"] for r in rows if r.get("sched_latencies") is not None]
+    return {"gc_pauses": {k: _pauses(v) for k, v in phases.items()},
+            "gc_pauses_lost": sum(int(r.get("gc_pauses_lost") or 0) for r in rows),
+            "gc_cpu_fraction_last": frac[-1] if frac else None,
+            "over_time": gc_over_time(rows),
+            "goroutines": {k: ({"p50": pct(v, 50), "max": max(v)} if v else None)
+                           for k, v in gor.items()},
+            "sched_latencies": (sched[-1] if sched else
+                                f"not exposed: no {SCHED_LATENCY_KEY} expvar on snowplow's "
+                                f"/debug/vars")}
+
+
+# What a CPU profile costs snowplow, measured on kind (2026-10-22, snowplow
+# 1.12.52, CPU limit 2): a fixed open-loop load (authenticated /debug/vars,
+# 2000 req/s, ~0.36 cores) with and without one 30 s profile in flight, 10
+# ABBA pairs per arm. Two clean arms; a third ran beside an unrelated busy
+# process and is not counted. Reported with every verdict; the run's own
+# inside / outside comparison is report.profiling.latency.
+CPU_PROFILE_OVERHEAD_KIND = {
+    "measured": "2026-10-22, kind, snowplow 1.12.52, 2000 req/s /debug/vars, 10 ABBA pairs x 2 arms",
+    "cpu_overhead_pct_mean_by_arm": [0.67, -1.8],
+    "cpu_overhead_pct_median_pair_by_arm": [0.93, -0.87],
+    "per_pair_noise_pct": "-8.8 .. +9.1",
+    "request_p95_ms": {"no_profile": [0.61, 0.63], "profiling": [0.62, 0.60]},
+    "request_p99_ms": {"no_profile": [2.41, 4.62], "profiling": [7.4, 3.62]},
+    "reading": "below the measurement's resolution (|mean| < 2 % at ~0.36 cores); "
+               "p95 unchanged, p99 mixed",
+}
+
+
+def profiling_report(mem: list[dict], navs: list[dict],
+                     k6_loads: list[tuple[float, float, dict]] | None = None) -> dict | None:
+    win = cpu_profile_windows(mem)
+    gc = gc_sched_report(mem, win)
+    if win is None and gc is None:
+        return None
+    out = {"cpu": None, "gc_sched": gc, "overhead_measured_on_kind": CPU_PROFILE_OVERHEAD_KIND}
+    if win is not None:
+        by_window = {}
+        for p in win["profiles"]:
+            by_window[p["window"]] = by_window.get(p["window"], 0) + 1
+        out["cpu"] = dict(win, written_by_window=by_window,
+                          # back-to-back profiles as one span (a request's
+                          # turnaround apart)
+                          profiled_windows=[list(x) for x in _merged(
+                              [(p["t_start"], p["t_end"]) for p in win["profiles"]], gap=1.0)])
+        out["latency"] = {
+            "page_loads": latency_by_profiling(
+                [(n["start"], n["wall_ms"]) for n in navs if n.get("start") is not None], win),
+            **({"k6_page_loads": latency_by_profiling([(t, ms) for t, ms, _ in k6_loads], win)}
+               if k6_loads else {})}
+    return out
+
+
 # ─── Run 8 (#710 rulings, issuecomment-6187374111) ─────────────────────────
 #
 # Key names as given by architect-ch from the CODE (PR #719 @ 7d8cb8de and
@@ -1725,6 +1991,7 @@ RUN8_VARS_PREFIXES = (
     # cache/prewarm_complete_metric.go, dispatchers/prewarm_engine_metrics.go,
     # dispatchers/phase1_walk_pagination_metrics.go, phase1_readiness_exit.go)
     "snowplow_learned_classes",
+    "snowplow_learned_clientconfig_secrets",   # the learned-classes alarm's denominator
     "snowplow_prewarm_complete",
     "snowplow_phase1_units",
     "snowplow_phase1_readiness_exit",
@@ -2686,6 +2953,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
             MEM_FRAMING, mem_streams,
             required=any(r.get("job") == "mem606" for r in job_pods or [])))
     validity.extend(job_pod_checks(job_pods or []))
+    storm = cpu_storm_check(cpu_profile_windows(mem or []))
+    if storm is not None:
+        validity.append(storm)
 
     econ = None
     if len(vars_series) >= 2:
@@ -2737,6 +3007,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["snowplow_pod"] = snowplow_pods
     report["memory"] = memory_report(mem or [])
     report["key_rotation_report_only"] = rotation_report(mem or [])
+    report["profiling"] = profiling_report(
+        mem or [], navs,
+        k6eval.k6_page_loads(k6.get("k6")) if k6 is not None else None)
     report["harness_notes"] = list(HARNESS_NOTES)
     if k6 is not None:
         report["page_loads_are"] = "real Chrome sessions (k6 browser), first visit vs warm per session"
@@ -2996,7 +3269,8 @@ DRIVER_KINDS = frozenset({"drive_start", "drive_end", "drive_exit", "nav", "logi
 DRIVER_FRAMING = Framing("driver", "the driver", DRIVER_KINDS, "drive_start", "drive_end",
                          "drive_exit", "nav", "navs", "navigations", "navigation")
 MEM_FRAMING = Framing("mem606", "the mem606 sampler",
-                      frozenset({"mem_start", "mem_end", "mem_exit", "mem", "heap_profile"}),
+                      frozenset({"mem_start", "mem_end", "mem_exit", "mem", "heap_profile",
+                                 "cpu_profile"}),
                       "mem_start", "mem_end", "mem_exit", "mem", "samples",
                       "memory samples", "memory sample")
 
@@ -3819,13 +4093,37 @@ _MEM_FIELDS = (("HeapAlloc", "heap_alloc_mb"), ("HeapInuse", "heap_inuse_mb"),
                ("StackInuse", "stack_inuse_mb"))
 
 
+def gc_pauses(memstats: dict, prev_num_gc: int | None) -> tuple[list[float], int]:
+    """The GC pauses (ms) since the sample that saw `prev_num_gc` GCs, from
+    memstats' 256-entry ring (PauseNs[(k+255)%256] is GC number k's pause),
+    and how many of them the ring no longer holds (more than 256 since)."""
+    ring, num = memstats.get("PauseNs") or [], memstats.get("NumGC")
+    if prev_num_gc is None or num is None or len(ring) != 256 or num < prev_num_gc:
+        return [], 0
+    first = max(prev_num_gc + 1, num - 255)
+    return ([round(ring[(k + 255) % 256] / 1e6, 3) for k in range(first, num + 1)],
+            first - prev_num_gc - 1)
+
+
+_GOROUTINE_TOTAL = re.compile(rb"^goroutine profile: total (\d+)")
+# Scheduler latency is a runtime/metrics histogram (/sched/latencies:seconds).
+# snowplow publishes no runtime/metrics on /debug/vars (origin/main 7b3fdcdd),
+# so a sample carries it only once an expvar of that name exists.
+SCHED_LATENCY_KEY = "/sched/latencies:seconds"
+
+
 def mem_sample(client: HttpClient, token: str | None,
-               extra_prefixes: tuple[str, ...] = ()) -> dict:
+               extra_prefixes: tuple[str, ...] = (),
+               prev_num_gc: int | None = None) -> dict:
     """One memory sample: /readyz + /debug/vars memstats and a few counters,
     plus every expvar whose name starts with one of `extra_prefixes` (e.g. the
     #710 PR-0 fill counters — heap profiles cannot carry pprof labels, so the
     per-GVR / fill-reason attribution has to come from expvar during the
-    burst). METADATA ONLY — never cache bodies."""
+    burst). METADATA ONLY — never cache bodies.
+    GC and scheduler evidence (run 12): the GC pauses since the previous
+    sample (`prev_num_gc`), the GC's CPU share, and the goroutine count (the
+    first line of /debug/pprof/goroutine?debug=1; nothing else of that body
+    is kept)."""
     rec = {"kind": "mem", "t": time.time(),
            "readyz": client.get("/readyz", None).status}
     r = client.get("/debug/vars", token)
@@ -3840,6 +4138,11 @@ def mem_sample(client: HttpClient, token: str | None,
             if k in m:
                 rec[out] = round(m[k] / 1048576, 1)
         rec["num_gc"] = m.get("NumGC")
+        rec["gc_pauses_ms"], rec["gc_pauses_lost"] = gc_pauses(m, prev_num_gc)
+        rec["gc_pause_total_ms"] = (round(m["PauseTotalNs"] / 1e6, 3)
+                                    if m.get("PauseTotalNs") is not None else None)
+        rec["gc_cpu_fraction"] = m.get("GCCPUFraction")
+        rec["sched_latencies"] = v.get(SCHED_LATENCY_KEY)
         rec["heap_objects"] = m.get("HeapObjects")
         rec["customer_resolve_inflight"] = v.get("snowplow_customer_resolve_inflight")
         rec["refresher_queue_depth"] = v.get("snowplow_refresher_queue_depth")
@@ -3850,7 +4153,146 @@ def mem_sample(client: HttpClient, token: str | None,
         rec["l1_lookups"] = (hit + miss) if hit is not None else None
         if extra_prefixes:
             rec["extra"] = {k: v[k] for k in sorted(v) if k.startswith(tuple(extra_prefixes))}
+        g = client.get("/debug/pprof/goroutine?debug=1", token)
+        n = _GOROUTINE_TOTAL.match(g.body) if g.status == 200 else None
+        rec["goroutines"] = int(n.group(1)) if n else None
     return rec
+
+
+# ─── CPU profiles (run 12) ──────────────────────────────────────────────────
+#
+# Run 11's storm analysis had heap profiles only: CPU cost could only be
+# inferred from allocations. mem606 also takes CPU profiles
+# (/debug/pprof/profile?seconds=N) on its own thread, so its memstats cadence
+# holds while a profile runs:
+#   storm     back to back from the sampler's start until `storm_s` after the
+#             load is first seen (the login storm);
+#   burst     back to back from `burst_pre_s` before to `burst_post_s` after
+#             the composite burst (`burst_at_s` after the load is first seen);
+#   periodic  one profile every `every_s` otherwise.
+# Each one is a `cpu_profile` record with the window it covers; the files are
+# cpu-NN-HHMMSS.pb.gz next to the heap profiles.
+
+
+@dataclass(frozen=True)
+class CpuPlan:
+    profile_s: int = 30
+    storm_s: float = 600.0
+    every_s: float = 300.0
+    burst_at_s: float | None = None
+    burst_pre_s: float = 60.0
+    burst_post_s: float = 240.0
+
+    def window(self, now: float, anchor: float) -> str | None:
+        """The back-to-back window `now` lies in (anchor = when the load was
+        first seen, until then the sampler's start), None outside them."""
+        if now < anchor + self.storm_s:
+            return "storm"
+        if self.burst_at_s is not None and \
+                anchor + self.burst_at_s - self.burst_pre_s <= now < \
+                anchor + self.burst_at_s + self.burst_post_s:
+            return "burst"
+        return None
+
+    def next_window_start(self, now: float, anchor: float) -> float | None:
+        b = None if self.burst_at_s is None else anchor + self.burst_at_s - self.burst_pre_s
+        return b if b is not None and b > now else None
+
+
+def pprof_window(body: bytes) -> tuple[float, float] | None:
+    """(start epoch s, duration s) a CPU profile itself recorded: its
+    time_nanos (field 9) and duration_nanos (field 10) of profile.proto,
+    read from the top level of the (gzipped) message. None if unreadable."""
+    try:
+        b = gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
+    except (OSError, EOFError):
+        return None
+    i, got = 0, {}
+
+    def varint(i):
+        v = shift = 0
+        while True:
+            c = b[i]
+            v |= (c & 0x7F) << shift
+            i += 1
+            if not c & 0x80:
+                return v, i
+            shift += 7
+    try:
+        while i < len(b):
+            key, i = varint(i)
+            field, wire = key >> 3, key & 7
+            if wire == 0:
+                v, i = varint(i)
+                if field in (9, 10):
+                    got[field] = v
+            elif wire == 2:
+                n, i = varint(i)
+                i += n
+            elif wire == 1:
+                i += 8
+            elif wire == 5:
+                i += 4
+            else:
+                return None
+    except IndexError:
+        return None
+    if 9 not in got or 10 not in got:
+        return None
+    return got[9] / 1e9, got[10] / 1e9
+
+
+def cpu_profiler(client: HttpClient, plan: CpuPlan, *, token_fn: Callable[[], str | None],
+                 anchor_fn: Callable[[], float], stopped: Callable[[], bool],
+                 out_dir: str, sink: Callable[[dict], None],
+                 clock: Callable[[], float] = time.time,
+                 sleep: Callable[[float], None] = time.sleep,
+                 retry_s: float = 5.0) -> int:
+    """Take CPU profiles by `plan` until `stopped()`; returns how many were
+    written. `client` must time out later than plan.profile_s."""
+    n = 0
+    last = None
+    while not stopped():
+        now, anchor = clock(), anchor_fn()
+        window = plan.window(now, anchor)
+        if window is None:
+            if last is None or now - last >= plan.every_s:
+                window = "periodic"
+            else:
+                due = [t for t in (last + plan.every_s, plan.next_window_start(now, anchor))
+                       if t is not None]
+                # at least 0.1 s: `now + (due - now)` can round below `due`
+                sleep(max(0.1, min(min(due) - now, retry_s)))
+                continue
+        token = token_fn()
+        if not token:
+            sleep(retry_s)
+            continue
+        t0 = clock()
+        r = client.get(f"/debug/pprof/profile?seconds={plan.profile_s}", token)
+        t1 = clock()
+        rec = {"kind": "cpu_profile", "t": t1, "t_start": t0, "t_end": t1,
+               "seconds": plan.profile_s, "window": window, "status": r.status}
+        if r.status == 200 and r.body:
+            n += 1
+            name = f"cpu-{n:02d}-{time.strftime('%H%M%S', time.gmtime(t0))}.pb.gz"
+            with open(os.path.join(out_dir, name), "wb") as fh:
+                fh.write(r.body)
+            rec.update(profile=name, bytes=len(r.body))
+            # what the profile itself covers (#839 gate): the request's own
+            # interval also holds its queueing and transfer
+            pw = pprof_window(r.body)
+            if pw:
+                rec.update(prof_start=pw[0], prof_duration_s=round(pw[1], 3))
+            if t1 - t0 > plan.profile_s + 5:
+                rec["slow_request"] = True
+            last = t0
+            sink(rec)
+        else:
+            rec.update(profile=None, error=r.error or f"http {r.status}")
+            sink(rec)
+            sleep(retry_s)
+    return n
 
 
 def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: float,
@@ -3860,6 +4302,7 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
              burst_interval_s: float = 5.0, burst_window_s: float = 60.0,
              load_min_delta: int = 100,
              stop_file: str | None = None,
+             cpu: CpuPlan | None = None, cpu_client: HttpClient | None = None,
              clock: Callable[[], float] = time.time,
              sleep: Callable[[float], None] = time.sleep) -> int:
     """The standard run-time memory capture (run 7 → #710): a memstats sample
@@ -3871,13 +4314,40 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
     The stream is framed like the driver's (#817): `mem_start` first,
     `mem_end` (how many mem records) last, so a cut file is detected. It ends
     at duration_s, or as soon as `stop_file` exists (the collect step asks for
-    the final stream before it copies it)."""
+    the final stream before it copies it).
+
+    With `cpu`, CPU profiles are taken on a second thread (cpu_profiler, on
+    `cpu_client`, whose timeout outlasts a profile) by that plan, anchored at
+    the load first seen; mem_start carries the plan, mem_end the count."""
     os.makedirs(out_dir, exist_ok=True)
     token = None
     end = clock() + duration_s
     samples = 0
-    sink({"kind": "mem_start", "t": clock(), "duration_s": duration_s,
-          "interval_s": interval_s})
+    lock, closed = threading.Lock(), [False]
+    raw_sink = sink
+
+    def sink(rec):      # two writers; nothing follows mem_end
+        with lock:
+            if not closed[0]:
+                raw_sink(rec)
+    t_start = clock()
+    sink({"kind": "mem_start", "t": t_start, "duration_s": duration_s,
+          "interval_s": interval_s, **({"cpu_plan": asdict(cpu)} if cpu else {})})
+    state = {"token": None, "anchor": t_start}
+    stop_cpu = threading.Event()
+    cpu_n = [0]
+    cpu_thread = None
+    if cpu:
+        def run_cpu():
+            cpu_n[0] = cpu_profiler(cpu_client or client, cpu,
+                                    token_fn=lambda: state["token"],
+                                    anchor_fn=lambda: state["anchor"],
+                                    stopped=stop_cpu.is_set, out_dir=out_dir, sink=sink,
+                                    sleep=stop_cpu.wait)
+        # started by the loop once a sample authenticated, so the first
+        # profile does not wait out the profiler's retry
+        cpu_thread = threading.Thread(target=run_cpu, name="cpu-profiler", daemon=True)
+    prev_gc = None
     # Burst resolution (#710: heap went 0.6 -> 6.35 GB in 16 s, so 15 s
     # samples see at most one point inside it): sample every burst_interval_s
     # until the load is seen (L1 lookups +load_min_delta from the first
@@ -3894,10 +4364,14 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
             except Exception as e:  # noqa: BLE001
                 sink({"kind": "mem", "t": clock(), "login_error": type(e).__name__})
                 samples += 1
-        rec = mem_sample(client, token, extra_prefixes)
+        rec = mem_sample(client, token, extra_prefixes, prev_gc)
         rec["t"] = clock()
+        prev_gc = rec.get("num_gc", prev_gc)
         if rec.get("vars_status") == 401:
             token = None
+        state["token"] = token
+        if cpu_thread is not None and token and cpu_thread.ident is None:
+            cpu_thread.start()
         l1 = rec.get("l1_lookups")
         if l1 is not None:
             if l1_base is None:
@@ -3905,6 +4379,7 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
             elif burst_until is None and l1 - l1_base >= load_min_delta:
                 burst_until = clock() + burst_window_s
                 rec["load_detected"] = True
+                state["anchor"] = rec["t"]
         fast = burst_until is None or clock() < burst_until
         rec["interval_s"] = burst_interval_s if fast else interval_s
         sink(rec)
@@ -3924,8 +4399,15 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
                 last_prof = clock()
         was_ready = ready
         sleep(rec["interval_s"])
+    stop_cpu.set()
+    if cpu_thread is not None and cpu_thread.ident is not None:
+        # a profile in flight ends within profile_s; past that, mem_end closes
+        # the stream and a late record is dropped
+        cpu_thread.join(cpu.profile_s + 30)
     sink({"kind": "mem_end", "t": clock(), "samples": samples, "profiles": n,
+          **({"cpu_profiles": cpu_n[0]} if cpu else {}),
           "stopped": bool(stop_file and os.path.exists(stop_file))})
+    closed[0] = True
     with open(os.path.join(out_dir, "done"), "w") as fh:
         fh.write("1")
     return n
@@ -3934,14 +4416,30 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
 def _cmd_memwatch(a) -> int:
     client = HttpClient(a.snowplow_url)
     sink = _jsonl_sink(a.out)
+    cpu = (CpuPlan(profile_s=a.cpu_profile_s, storm_s=a.cpu_storm_s, every_s=a.cpu_every_s,
+                   burst_at_s=a.burst_at_s) if a.cpu_profile_s > 0 else None)
     memwatch(client, lambda: login(a.authn_url, a.user, a.password),
              duration_s=a.duration_s, interval_s=a.interval_s,
              profile_every_s=a.profile_every_s, out_dir=a.out_dir, sink=sink,
-             extra_prefixes=tuple(a.vars_prefix or ()), stop_file=a.stop_file)
+             extra_prefixes=tuple(a.vars_prefix or ()), stop_file=a.stop_file,
+             cpu=cpu, cpu_client=HttpClient(a.snowplow_url, timeout=a.cpu_profile_s + 30))
     # Stay up so the collect step can copy the profiles out (kubectl cp). The
     # mem606 Job's wrapper lingers itself (--linger-s 0), so a crash here
     # still leaves the stream copyable.
     time.sleep(a.linger_s)
+    return 0
+
+
+def _cmd_driver_stuck(a) -> int:
+    try:
+        pods = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return 0                         # an unreadable listing proves nothing
+    why = driver_pod_stuck(pods, time.time(), pending_s=a.pending_s,
+                           init_restarts=a.init_restarts)
+    if why:
+        print(why)
+        return 1
     return 0
 
 
@@ -4003,7 +4501,8 @@ def _cmd_evaluate(a) -> int:
                       login_curves=[r for r in recs if r.get("kind") == "login_curve"],
                       preflights=[r for r in recs if r.get("kind") == "preflight"],
                       snowplow_pods=[r for r in recs if r.get("kind") == "snowplow_pod"],
-                      mem=[r for r in recs if r.get("kind") in ("mem", "heap_profile")],
+                      mem=[r for r in recs if r.get("kind") in
+                           ("mem_start", "mem", "heap_profile", "cpu_profile", "mem_end")],
                       expected_digest=a.expect_digest,
                       image_digests=[r for r in recs if r.get("kind") == "image_digest"],
                       push_refetches=[r for r in recs if r.get("kind") == "push_refetch"],
@@ -4115,7 +4614,20 @@ def main(argv: list[str] | None = None) -> int:
     mw.add_argument("--vars-prefix", action="append", default=None,
                     help="also capture every expvar starting with this prefix (repeatable)")
     mw.add_argument("--out", default="/dev/stdout")
+    mw.add_argument("--cpu-profile-s", type=int, default=30,
+                    help="CPU profile length (s); 0 = no CPU profiles")
+    mw.add_argument("--cpu-storm-s", type=float, default=600.0,
+                    help="back-to-back CPU profiles until this long after the load is seen")
+    mw.add_argument("--cpu-every-s", type=float, default=300.0,
+                    help="one CPU profile every this many seconds outside the windows")
+    mw.add_argument("--burst-at-s", type=float, default=None,
+                    help="the composite burst, seconds after the load is seen")
     mw.set_defaults(func=_cmd_memwatch)
+    ds = sub.add_parser("driver-stuck", help="kubectl get pods -l job-name=<job> -o json on "
+                        "stdin -> exit 1 + the reason when a driver pod will not start")
+    ds.add_argument("--pending-s", type=float, default=DRIVER_PENDING_S)
+    ds.add_argument("--init-restarts", type=int, default=DRIVER_INIT_RESTARTS)
+    ds.set_defaults(func=lambda a: _cmd_driver_stuck(a))
     jp = sub.add_parser("job-pod-record",
                         help="kubectl get pods -l job-name=<job> -o json on stdin -> job_pod records")
     jp.add_argument("--job", required=True)

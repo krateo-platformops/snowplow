@@ -1,14 +1,21 @@
 // navigate.js — run 11's background load (#830): 1,000 users replaying the
-// portal SPA's /call trees against snowplow, under k6's ARRIVAL-RATE
-// executors, so a late start is a counted `dropped_iterations`, never a hidden
-// lag (run 10's single Python driver queued its arrival for ~2 minutes).
+// portal SPA's /call trees against snowplow.
 //
-// Iteration i of `navigate` is user NAV[i mod |NAV|]: its first iteration
-// is the first load (shell + first route, spa.firstLoad), every later one a
-// route click on the route spa.pickRoute(routes, user, visit) chooses — each
-// user navigates once per THINK_S on average, and the first loads arrive spread
-// over the first THINK_S. `composite_burst`: the reserved BURST users deep-link
-// to a composite route all at once at BURST_AT_S, then join `burst_navigate`.
+// Each user is one tab, driven as the SPA drives it (run 12): ONE VU per user
+// (per-vu-iterations, one iteration = the user's whole session). The user
+// ARRIVES on an open schedule — navigating user k of |NAV| at k * THINK_S /
+// |NAV| after the scenario starts, the composite-burst users all at
+// BURST_AT_S — and its first load (shell + first route, spa.firstLoad, or the
+// deep link) starts then, whatever the server is doing; a start later than
+// LATE_MS is counted (`arrivals_late`), never a hidden lag (run 10's single
+// Python driver queued its arrival for ~2 minutes). Its route clicks (the
+// route spa.pickRoute(routes, user, visit) chooses) start only after its first
+// load COMPLETED, each THINK_S after the previous page ended: run 11 started
+// them on a fixed rate whatever the first load was doing, and 36 % of the
+// storm's calls were clicks of users whose dashboard had not loaded yet. Every
+// click the old open schedule would have started while the first load still
+// ran is counted (`clicks_deferred`), so the load the dependency removed is
+// reported, not hidden.
 // NAV and BURST (config navUserIds / burstUserIds, 1-based) leave out the
 // real-Chrome sessions' users: each of the 1,000 identities is driven by ONE
 // client, so k6 never pre-warms a browser user's own first visits.
@@ -31,6 +38,7 @@
 // feed_start (setup) and feed_end (teardown).
 import http from 'k6/http'
 import exec from 'k6/execution'
+import { sleep } from 'k6'
 import { SharedArray } from 'k6/data'
 import { Counter, Trend } from 'k6/metrics'
 import { firstLoad, firstLoadFailed, pickRoute, walkTree } from './spa.js'
@@ -46,21 +54,39 @@ const NAV_ERRORS = new Counter('page_errors')
 const FIRST_FAILED = new Counter('first_load_failed')
 const ROUTE_MISMATCH = new Counter('route_table_mismatch')
 const FRAME = new Counter('bench_frame')
+const ARRIVALS = new Counter('arrivals')               // users whose first load started
+const ARRIVALS_LATE = new Counter('arrivals_late')     // ... more than LATE_MS after their slot
+const ARRIVAL_LAG = new Trend('arrival_lag_ms', true)
+const FIRST_LOADS = new Counter('first_loads')         // first loads recorded (per scenario)
+const CLICKS_DEFERRED = new Counter('clicks_deferred')
+// #839 gate: the clicks are closed-loop (previous page end + THINK_S), so a
+// starved k6 would just click later and the load would quietly drop — run
+// 10's hidden lag, moved into the clicks. Each click's lag against its
+// intended time is measured after the sleep; late ones are counted and gated.
+const CLICKS = new Counter('clicks')
+const CLICKS_LATE = new Counter('clicks_late')
+const CLICK_LAG = new Trend('click_lag_ms', true)
+// what the open schedule (one click per THINK_S from the arrival slot, run
+// 11) would have clicked by the run's end: the achieved click rate's yardstick
+const CLICKS_OPEN = new Counter('clicks_open_schedule')
+const LATE_MS = 1000
 
 const NAV = CFG.navUserIds
 const BURST = CFG.burstUserIds
 const navRate = NAV.length / CFG.thinkS
-const burstRate = BURST.length / CFG.thinkS
+// A page that starts by the end of the run may take this long to finish
+// (spa.js / fetcher: 60 s per request, a few levels deep).
+const GRACE_S = 300
 
+// One VU per user; a session ends when its last page (started before
+// durationS) is done.
 const scenarios = {
   navigate: {
-    executor: 'constant-arrival-rate',
+    executor: 'per-vu-iterations',
     exec: 'navigate',
-    rate: Math.round(navRate * 1000),
-    timeUnit: '1000s',
-    duration: `${CFG.durationS}s`,
-    preAllocatedVUs: CFG.preAllocatedVUs,
-    maxVUs: CFG.maxVUs,
+    vus: NAV.length,
+    iterations: 1,
+    maxDuration: `${CFG.durationS + GRACE_S}s`,
   },
 }
 if (BURST.length > 0) {
@@ -70,18 +96,7 @@ if (BURST.length > 0) {
     vus: BURST.length,
     iterations: 1,
     startTime: `${CFG.burstAtS}s`,
-    maxDuration: `${CFG.thinkS * 5}s`,
-  }
-  scenarios.burst_navigate = {
-    executor: 'constant-arrival-rate',
-    exec: 'burstNavigate',
-    rate: Math.round(burstRate * 1000),
-    timeUnit: '1000s',
-    startTime: `${CFG.burstAtS + CFG.thinkS}s`,
-    duration: `${Math.max(1, CFG.durationS - CFG.burstAtS - CFG.thinkS)}s`,
-    preAllocatedVUs: Math.min(BURST.length,
-      Math.max(10, Math.ceil(CFG.preAllocatedVUs * BURST.length / CFG.users))),
-    maxVUs: BURST.length,
+    maxDuration: `${Math.max(1, CFG.durationS - CFG.burstAtS) + GRACE_S}s`,
   }
 }
 
@@ -89,9 +104,10 @@ if (BURST.length > 0) {
 // which the evaluator matches against the stream.
 const thresholds = {}
 for (const s of Object.keys(scenarios)) {
-  thresholds[`dropped_iterations{scenario:${s}}`] = ['count>=0']
-  thresholds[`iterations{scenario:${s}}`] = ['count>=0']
-  thresholds[`page_loads{scenario:${s}}`] = ['count>=0']
+  for (const m of ['iterations', 'page_loads', 'arrivals', 'arrivals_late', 'first_loads',
+    'clicks_deferred', 'clicks', 'clicks_late', 'clicks_open_schedule']) {
+    thresholds[`${m}{scenario:${s}}`] = ['count>=0']
+  }
 }
 thresholds['page_loads'] = ['count>=0']
 
@@ -112,8 +128,8 @@ function feed (rec) {
   if (CFG.viewers) console.log(JSON.stringify(rec))
 }
 
-function navId () {
-  return `${exec.scenario.name}:${exec.scenario.iterationInTest}`
+function navId (user, visit) {
+  return `${exec.scenario.name}:${user}:${visit}`
 }
 
 function refreshOf (r) {
@@ -165,10 +181,11 @@ function doFirstLoad (user, deepLink) {
   const errors = fl.shell.errors + (fl.content ? fl.content.errors : 0)
   const route = fl.target ? fl.target.path : '(none)'
   record(start, kind, route, 'first', calls, errors)
+  FIRST_LOADS.add(1)
   const failed = firstLoadFailed(fl)
   if (failed) FIRST_FAILED.add(1, { kind })
   else checkRoutes(fl.routes)
-  feed({ kind: 'nav', nav: navId(), user, route, t_end: Date.now() / 1000, ok: !failed,
+  feed({ kind: 'nav', nav: navId(user, 0), user, route, t_end: Date.now() / 1000, ok: !failed,
          shell: fl.shell.armed, page: fl.content ? fl.content.armed : [] })
 }
 
@@ -181,34 +198,63 @@ function routeClick (user, visit, firstPath) {
   const start = Date.now()
   const w = walkTree([route.endpoint], fetcher(user, { kind: 'route' }))
   record(start, 'route', route.path, seen ? 'warm' : 'first', w.calls, w.errors)
-  feed({ kind: 'nav', nav: navId(), user, route: route.path, t_end: Date.now() / 1000, ok: true,
-         page: w.armed })
+  feed({ kind: 'nav', nav: navId(user, visit), user, route: route.path, t_end: Date.now() / 1000,
+         ok: true, page: w.armed })
 }
 
-export function navigate () {
-  const i = exec.scenario.iterationInTest
-  const user = NAV[i % NAV.length]
-  const visit = Math.floor(i / NAV.length)
-  if (visit === 0) doFirstLoad(user, null)
-  else routeClick(user, visit, CFG.routes[0].path)
+// One user's tab: arrive at `slotMs` (epoch ms), first load, then a route
+// click THINK_S after each page completed, until the run's end. `endMs`:
+// no page starts after it.
+function session (user, slotMs, endMs, deepLink, firstPath) {
+  const wait = slotMs - Date.now()
+  if (wait > 0) sleep(wait / 1000)
+  // against the wall-clock slot: a VU that started, or woke, late is late
+  const lag = Math.max(0, Date.now() - slotMs)
+  ARRIVALS.add(1)
+  ARRIVAL_LAG.add(lag)
+  if (lag > LATE_MS) ARRIVALS_LATE.add(1)
+  doFirstLoad(user, deepLink)
+  const thinkMs = CFG.thinkS * 1000
+  const loaded = Date.now()
+  // the open schedule's clicks (slot + v * THINK_S) that fell inside the
+  // first load: a browser cannot click a page it does not have yet
+  const deferred = Math.max(0, Math.ceil((Math.min(loaded, endMs) - slotMs) / thinkMs) - 1)
+  if (deferred > 0) CLICKS_DEFERRED.add(deferred)
+  CLICKS_OPEN.add(Math.max(0, Math.ceil((endMs - slotMs) / thinkMs) - 1))
+  let next = loaded + thinkMs
+  for (let visit = 1; next < endMs; visit++) {
+    sleep(Math.max(0, next - Date.now()) / 1000)
+    const clickLag = Math.max(0, Date.now() - next)
+    CLICKS.add(1)
+    CLICK_LAG.add(clickLag)
+    if (clickLag > LATE_MS) CLICKS_LATE.add(1)
+    routeClick(user, visit, firstPath)
+    next = Date.now() + thinkMs
+  }
 }
 
-export function compositeBurst () {
-  // per-vu-iterations, 1 each: iterationInTest is 0..BURST-1, one per user
+// Every slot is anchored to ONE start, setup's end (the scenarios start right
+// after it): a burst scenario that k6 started late cannot read its own late
+// start as time zero (#839 gate).
+export function navigate (data) {
+  // per-vu-iterations, 1 each: iterationInTest is 0..NAV-1, one per user;
+  // the first loads arrive spread over the first THINK_S, as before
   const i = exec.scenario.iterationInTest
-  doFirstLoad(BURST[i], CFG.compositeRoutes[i % CFG.compositeRoutes.length])
+  session(NAV[i], data.t0 + i * 1000 / navRate, data.t0 + CFG.durationS * 1000, null,
+          CFG.routes[0].path)
 }
 
-export function burstNavigate () {
+export function compositeBurst (data) {
+  // all at BURST_AT_S, each deep-linking to a composite route
   const i = exec.scenario.iterationInTest
-  const b = i % BURST.length
-  routeClick(BURST[b], 1 + Math.floor(i / BURST.length),
-             CFG.compositeRoutes[b % CFG.compositeRoutes.length])
+  const route = CFG.compositeRoutes[i % CFG.compositeRoutes.length]
+  session(BURST[i], data.t0 + CFG.burstAtS * 1000, data.t0 + CFG.durationS * 1000, route, route)
 }
 
 export function setup () {
   FRAME.add(1, { frame: 'start' })
   feed({ kind: 'feed_start', t: Date.now() / 1000 })
+  return { t0: Date.now() }
 }
 export function teardown () {
   FRAME.add(1, { frame: 'end' })
@@ -218,13 +264,13 @@ export function teardown () {
 export function handleSummary (data) {
   const keep = {}
   for (const [name, m] of Object.entries(data.metrics)) {
-    if (/^(page_load_ms|page_loads|page_calls|page_errors|first_load_failed|route_table_mismatch|bench_frame|dropped_iterations|iterations|http_reqs|http_req_failed|http_req_duration|http_req_blocked|vus_max)(\{|$)/.test(name)) {
+    if (/^(page_load_ms|page_loads|page_calls|page_errors|first_load_failed|route_table_mismatch|bench_frame|dropped_iterations|iterations|arrivals|arrivals_late|arrival_lag_ms|first_loads|clicks_deferred|clicks|clicks_late|click_lag_ms|clicks_open_schedule|http_reqs|http_req_failed|http_req_duration|http_req_blocked|vus_max)(\{|$)/.test(name)) {
       keep[name] = m.values
     }
   }
   const out = { kind: 'k6_summary', config: { users: CFG.users, navUsers: NAV.length,
     burstUsers: BURST.length,
     thinkS: CFG.thinkS, durationS: CFG.durationS, burstAtS: CFG.burstAtS,
-    navRate, burstRate, routes: CFG.routes.length }, metrics: keep }
+    navRate, routes: CFG.routes.length }, metrics: keep }
   return { [__ENV.SUMMARY_FILE || '/out/k6-summary.json']: JSON.stringify(out) }
 }
