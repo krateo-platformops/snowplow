@@ -536,7 +536,7 @@ func TestRefreshes_SubEntryCountBoundary(t *testing.T) {
 			xcontext.WithUserInfo(jwtutil.UserInfo{Username: "userA", Groups: []string{"devs"}}),
 		)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/refreshes?sub="+mkSub(n), nil)
-		_, err := validateSubscription(req)
+		_, _, err := validateSubscription(req)
 		return err
 	}
 
@@ -574,7 +574,7 @@ func TestRefreshes_AbsentCoord_SkippedNoApiserverError(t *testing.T) {
 	)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/refreshes?sub="+sub, nil)
 
-	armed, err := validateSubscription(req)
+	armed, _, err := validateSubscription(req)
 	if err != nil {
 		t.Fatalf("M18(c): validateSubscription must not error on absent coords; got %v", err)
 	}

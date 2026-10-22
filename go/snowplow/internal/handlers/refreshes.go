@@ -69,15 +69,17 @@ const (
 	// the wire.
 	refreshResyncFrame = "event: resync\ndata: pending-overflow\n\n"
 
-	// refreshSubParamMaxBytes caps the decoded ?sub= payload to avoid a
-	// memory-amplification subscribe vector (extras can be large; design §6
-	// tradeoff). A connection sending a larger payload is rejected 400.
-	refreshSubParamMaxBytes = 16 * 1024
-
 	// refreshSubMaxEntries caps how many widgets one connection may arm in a
 	// single subscribe. Defence-in-depth alongside the byte cap.
 	refreshSubMaxEntries = 512
 )
+
+// refreshSubParamMaxBytes caps the decoded ?sub= payload to avoid a
+// memory-amplification subscribe vector (extras can be large; design §6
+// tradeoff). A connection sending a larger payload is rejected 400. A var only
+// so the #819 armed-set-cap arm can arm refreshSubMaxEntries widgets (16 KiB
+// holds ~110 coordinates); production never changes it.
+var refreshSubParamMaxBytes = 16 * 1024
 
 // refreshWriteDeadlineNS bounds EVERY frame write (#484); it defaults to the
 // heartbeat interval. It is re-armed before each write, which also defeats
@@ -151,7 +153,10 @@ func Refreshes() http.HandlerFunc {
 		}
 
 		// (3) Validate + re-derive the requested key-set UNDER THIS subject.
-		armed, derr := validateSubscription(req)
+		// #819: take the class signal BEFORE deriving, so a class move during
+		// the derivation is re-checked at the first loop turn.
+		classMoved := cache.IdentityClassesMayHaveMoved()
+		armed, rotation, derr := validateSubscription(req)
 		if derr != nil {
 			// #560 — an arrival snowplow refused ITSELF. On the measured
 			// deployment this stays 0 while the ingress cliff (~22 widgets) sits
@@ -266,6 +271,12 @@ func Refreshes() http.HandlerFunc {
 			slog.Int("armed_keys", len(armed)),
 		)
 
+		// #819: only a connection with an identity-bound key can rotate; a
+		// nil channel never fires.
+		if !rotation.Tracking() {
+			classMoved = nil
+		}
+
 		heartbeat := time.NewTicker(refreshHeartbeatInterval)
 		defer heartbeat.Stop()
 		for {
@@ -291,6 +302,16 @@ func Refreshes() http.HandlerFunc {
 				}
 				if !writeFrame("event: refresh\ndata: " + k + "\n\n") {
 					return // client write failed or exceeded the deadline — disconnect
+				}
+			case <-classMoved:
+				// #819: an RBAC publish or the #682 epoch may have moved this
+				// identity's class. Re-acquire first (coalesced: notes during the
+				// check fold into one more turn), then announce every armed key
+				// minted under another class — once — on its OLD key, so the tab
+				// refetches and re-arms under the key its cell now lives at.
+				classMoved = cache.IdentityClassesMayHaveMoved()
+				if rotated := rotation.Rotated(); len(rotated) > 0 {
+					stream.Rotated(rotated)
 				}
 			case <-heartbeat.C:
 				if !writeFrame(": keepalive\n\n") {
@@ -441,21 +462,24 @@ func readSubscriptionPayload(req *http.Request) ([]byte, error) {
 	return decoded, nil
 }
 
-func validateSubscription(req *http.Request) (map[string]struct{}, error) {
+// validateSubscription (see the comment above readSubscriptionPayload) also
+// returns, since #819, the rotation tracker holding the class each
+// identity-bound armed key was derived under.
+func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.SubscriptionRotationTracker, error) {
 	decoded, err := readSubscriptionPayload(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var reqs []subRequest
 	if err := json.Unmarshal(decoded, &reqs); err != nil {
-		return nil, fmt.Errorf("invalid 'sub' payload: not a JSON coordinate array")
+		return nil, nil, fmt.Errorf("invalid 'sub' payload: not a JSON coordinate array")
 	}
 	if len(reqs) == 0 {
-		return nil, fmt.Errorf("'sub' payload is an empty array")
+		return nil, nil, fmt.Errorf("'sub' payload is an empty array")
 	}
 	if len(reqs) > refreshSubMaxEntries {
-		return nil, fmt.Errorf("too many subscription entries (%d; max %d)", len(reqs), refreshSubMaxEntries)
+		return nil, nil, fmt.Errorf("too many subscription entries (%d; max %d)", len(reqs), refreshSubMaxEntries)
 	}
 
 	// #101: the /refreshes arming reads MUST be informer-only. The route is
@@ -465,10 +489,11 @@ func validateSubscription(req *http.Request) (map[string]struct{}, error) {
 	// marker makes an informer GET-miss a quiet NotFound-shaped skip instead.
 	armCtx := cache.WithInformerOnlyReads(req.Context())
 
+	rotation := dispatchers.NewSubscriptionRotationTracker(armCtx)
 	armed := make(map[string]struct{}, len(reqs))
 	var skippedInformerMiss, skippedOther int
 	for _, s := range reqs {
-		key, ok, reason := dispatchers.DeriveSubscriptionKeyWithReason(armCtx, dispatchers.SubscriptionCoordinates{
+		key, ok, reason := rotation.Derive(armCtx, dispatchers.SubscriptionCoordinates{
 			Class:     s.Class,
 			Group:     s.Group,
 			Version:   s.Version,
@@ -505,5 +530,5 @@ func validateSubscription(req *http.Request) (map[string]struct{}, error) {
 		slog.Int("skipped_informer_miss", skippedInformerMiss),
 		slog.Int("skipped_other", skippedOther),
 	)
-	return armed, nil
+	return armed, rotation, nil
 }

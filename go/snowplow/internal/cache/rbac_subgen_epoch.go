@@ -45,16 +45,33 @@
 // input — and identity-free classes (which do not fold RBACSubGen) do not rotate.
 //
 // COST. At most ONE global rotation per process, and only when an RBAC edit
-// really landed between the first publish and the first index build. Ready gates
-// customer /call until boot completes, so the cells that exist in that window
-// are mostly the boot seed's; on rotation they miss on their next read, and the
-// refresher's identity-class drift guard re-picks or evicts them (#424/#444).
+// really landed between the first publish and the first index build. The
+// cells that exist in that window are mostly the boot seed's; on rotation they
+// miss on their next read, and the refresher's identity-class drift guard
+// re-picks or evicts them (#424/#444).
+//
+// #819 — THE BUMP LANDS BEFORE READY. The engine's boot pass builds the index
+// only after its navigation re-walk, and readiness does not wait for that pass:
+// a boot pass that errors before the build, or the seed deadline, releases
+// Ready with the index unbuilt, and the requeued pass (which also yields to
+// the customer traffic Ready lets in) built it minutes later. The epoch then
+// rotated every user's keys under tabs already armed on them (bench run 10:
+// 6.5 min after Ready). So the first readiness flip settles the build itself
+// (settleBindingsIndexBeforeReady, from MarkPhase1Done): the bump, if owed,
+// happens before /readyz is 200 on every readiness path, and every later RBAC
+// edit rotates through the per-subject sub-gen, the index being built. The one
+// exception is a flip before the first COMPLETE RBAC snapshot: the build is
+// then deferred to that publish (#686) and counted
+// (snowplow_bindings_index_ready_settle.deferred_at_flip).
 
 package cache
 
 import (
 	"expvar"
+	"fmt"
+	"log/slog"
 	"sync/atomic"
+	"time"
 
 	clientcache "k8s.io/client-go/tools/cache"
 )
@@ -155,7 +172,99 @@ func rotateIfRBACEventSeenPreBuild() bool {
 		return false
 	}
 	rbacSubGenEpoch.Add(1)
+	noteIdentityClassesMayHaveMoved() // #819: tell armed tabs their keys rotated
 	return true
+}
+
+// settleBindingsIndexBeforeReady (#819) runs the first bindings-index build,
+// and so the #682 bump it owes, before the first readiness flip. Called by
+// MarkPhase1Done. A no-op when the cache is off, there is no watcher, or the
+// index is already built (the boot pass's step 3 got there first).
+//
+// Over the GVRs registered so far: the boot pass's own build later is a
+// rebuild over the full navigated set (never a bump), and AddNavigatedGVR
+// widens it meanwhile.
+//
+// THE ONE EXCEPTION: no complete RBAC snapshot yet. Building over a partial
+// one would skip a binding whose role is not listed yet, for good (#686), so
+// the flip only REQUESTS the build and the first complete publish runs it —
+// after Ready. Until that publish, EvaluateRBAC has no complete snapshot to
+// grant from (no snapshot: deny; a partial event-driven one: the pre-existing
+// #686 window), so few or no identity-bound keys exist to rotate. The case is
+// counted (snowplow_bindings_index_ready_settle.deferred_at_flip) and logged,
+// never silent.
+//
+// A panic in the build is recovered and counted: it must never skip the flip
+// and pin /readyz at 503.
+func settleBindingsIndexBeforeReady() {
+	if Disabled() {
+		return
+	}
+	rw := Global()
+	if rw == nil || rw.mode == modePassthrough || BindingsByGVRIndexBuilt() {
+		return
+	}
+	start := time.Now()
+	defer func() {
+		readySettleLastNanos.Store(int64(time.Since(start)))
+		if r := recover(); r != nil {
+			readySettlePanics.Add(1)
+			slog.Error("cache.bindings_by_gvr.ready_settle_panic",
+				slog.String("subsystem", "cache"),
+				slog.String("panic_type", fmt.Sprintf("%T", r)), // metadata only, never the value
+				slog.String("effect", "readiness flips anyway; the boot pass's own build settles the #682 epoch later"))
+		}
+	}()
+	navigated := rw.RegisteredGVRs()
+	if rbacSnap.Load() != nil && rbacInitialPublishReturned(rw) {
+		BuildBindingsByGVRIndex(navigated)
+		readySettleBuilt.Add(1)
+		return
+	}
+	requestBindingsIndexBuild(navigated)
+	if hook := readySettleAfterRequestHookForTest.Load(); hook != nil {
+		(*hook)()
+	}
+	// A publish that completed between the check above and the request did
+	// not see it: run it now.
+	if rbacSnap.Load() != nil && rbacInitialPublishReturned(rw) {
+		buildPendingBindingsIndex()
+		readySettleBuilt.Add(1)
+		return
+	}
+	readySettleDeferred.Add(1)
+	slog.Warn("cache.bindings_by_gvr.ready_settle_deferred",
+		slog.String("subsystem", "cache"),
+		slog.String("effect", "Ready flips before the first complete RBAC snapshot: the bindings-index build "+
+			"(and a #682 epoch bump, if owed) runs at that publish, after Ready (#819, #686)"))
+}
+
+var (
+	readySettleBuilt     atomic.Uint64
+	readySettleDeferred  atomic.Uint64
+	readySettlePanics    atomic.Uint64
+	readySettleLastNanos atomic.Int64
+	// readySettleAfterRequestHookForTest runs between the deferred request
+	// and the re-check. TEST-ONLY: nil in production.
+	readySettleAfterRequestHookForTest atomic.Pointer[func()]
+)
+
+// ReadySettleStats is the #819 readiness-settle readout.
+type ReadySettleStats struct {
+	BuiltAtFlip    uint64
+	DeferredAtFlip uint64
+	Panics         uint64
+	LastMS         float64
+}
+
+// ReadySettleStatsSnapshot reads the settle counters.
+func ReadySettleStatsSnapshot() ReadySettleStats {
+	return ReadySettleStats{
+		BuiltAtFlip:    readySettleBuilt.Load(),
+		DeferredAtFlip: readySettleDeferred.Load(),
+		Panics:         readySettlePanics.Load(),
+		LastMS:         float64(readySettleLastNanos.Load()) / float64(time.Millisecond),
+	}
 }
 
 // RBACSubGenEpoch returns the current epoch.
@@ -175,5 +284,18 @@ func init() {
 	}
 	expvar.Publish("snowplow_rbac_subgen_epoch", expvar.Func(func() any {
 		return RBACSubGenEpoch()
+	}))
+	// #819: the readiness flip's bindings-index settle — how often it built
+	// (bump before Ready) or deferred to the first complete publish (bump
+	// after Ready), recovered panics, and the last settle's duration (the
+	// delay it added to Ready).
+	expvar.Publish("snowplow_bindings_index_ready_settle", expvar.Func(func() any {
+		st := ReadySettleStatsSnapshot()
+		return map[string]any{
+			"built_at_flip":    st.BuiltAtFlip,
+			"deferred_at_flip": st.DeferredAtFlip,
+			"panics":           st.Panics,
+			"last_ms":          st.LastMS,
+		}
 	}))
 }

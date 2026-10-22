@@ -682,6 +682,21 @@ var bindingsIndexDeferredTotal atomic.Uint64
 // BindingsIndexDeferredTotalForTest reads bindingsIndexDeferredTotal.
 func BindingsIndexDeferredTotalForTest() uint64 { return bindingsIndexDeferredTotal.Load() }
 
+// requestBindingsIndexBuild records a build for the first complete snapshot
+// publish to run (buildPendingBindingsIndex), unless the index is built or a
+// build is already pending (#819: the readiness flip found no complete
+// snapshot yet).
+func requestBindingsIndexBuild(navigatedGVRs []schema.GroupVersionResource) {
+	idx := bindingsByGVRSingleton()
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.built || idx.pendingNavigated != nil {
+		return
+	}
+	idx.pendingNavigated = append([]schema.GroupVersionResource{}, navigatedGVRs...)
+	bindingsIndexDeferredTotal.Add(1)
+}
+
 // buildPendingBindingsIndex runs a build deferred by BuildBindingsByGVRIndex
 // on a nil snapshot (#686). Called right after a snapshot is published.
 func buildPendingBindingsIndex() {

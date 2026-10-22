@@ -115,7 +115,13 @@ var phase1Done atomic.Bool
 // site — every flip path (dispatcher Step 8, cache-off else, readiness
 // safety-net) funnels through here, so the expvar boundary is observed
 // on all of them. See prewarm_complete_metric.go.
+//
+// #819: the FIRST flip settles the #682 boot epoch before /readyz can turn
+// 200 (settleBindingsIndexBeforeReady), on every readiness path.
 func MarkPhase1Done() {
+	if !phase1Done.Load() {
+		settleBindingsIndexBeforeReady()
+	}
 	phase1Done.Store(true)
 	markPhase1DoneObserved()
 }

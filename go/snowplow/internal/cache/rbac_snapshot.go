@@ -683,6 +683,9 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 	// stay pending for the re-armed rebuild, whose read follows them.
 	flushed = true
 	bumpTakenSubGens(taken)
+	// #819 — a publish can move a requester's class (the binding-set digest,
+	// or a sub-gen just bumped): armed /refreshes tabs re-check theirs.
+	noteIdentityClassesMayHaveMoved()
 
 	slog.Debug("cache.rbac.snapshot.published",
 		slog.String("subsystem", "cache"),
