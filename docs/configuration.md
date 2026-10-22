@@ -15,6 +15,34 @@ machine-readable surface is
 [`helm/snowplow/values.schema.json`](../helm/snowplow/values.schema.json) — every value
 below is typed and validated there; this page explains, it does not re-enumerate.
 
+## Supported authorization configuration
+
+**Requirement: with `env.CACHE_ENABLED: "true"` (the default), Kubernetes RBAC must be the
+only authorizer in the apiserver chain that can deny a read.**
+
+How Kubernetes decides: the apiserver runs a chain of authorizers (`--authorization-mode`
+or an `AuthorizationConfiguration`, e.g. Node, RBAC, Webhook). The first authorizer that
+returns *allow* or *deny* ends the chain. RBAC itself never denies: it either allows (the
+first matching rule from any binding of the user or one of the user's groups) or has no
+opinion.
+
+How snowplow decides: with the cache on, every "may this user see it" decision is an
+in-memory evaluation of RBAC. It covers the request gate, the per-item list filters,
+user-aware filtering and the cache keys; see
+[go/snowplow/docs/architecture/rbac-uaf.md](../go/snowplow/docs/architecture/rbac-uaf.md).
+Many reads use snowplow's own service account and are narrowed per user afterwards. Cached
+answers are shared by users with the same RBAC bindings. Other authorizers are therefore
+never consulted for those reads.
+
+| Cluster setup | Supported with the cache on? | Effect |
+|---|---|---|
+| RBAC only | Yes | snowplow matches the apiserver. |
+| RBAC plus authorizers that only **grant** (e.g. Google IAM on GKE, evaluated after RBAC) | Yes | Users see at most what RBAC allows. Access granted only by the other authorizer is not shown. |
+| An authorizer that can **deny**, ordered **before** RBAC (e.g. a deny-capable webhook) | **No** | snowplow would serve data that authorizer denies. Run with `env.CACHE_ENABLED: "false"`: every access decision is then checked by the apiserver for that user (a SelfSubjectAccessReview through the full chain). |
+
+Writes and direct `/call` passthrough reads always use the user's own credential, so the
+apiserver applies its full chain to them in every mode. Tracking issue: #835.
+
 ## The env contract
 
 The container takes **no direct `env:` array**. Every value that reaches the process

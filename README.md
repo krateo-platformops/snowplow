@@ -27,6 +27,16 @@ helm install snowplow oci://ghcr.io/krateo-platformops/charts/snowplow \
 
 Details, dependencies and the Kind quickstart: [docs/usage.md](docs/usage.md).
 
+> **Supported configuration: Kubernetes RBAC must be the only authorizer that can deny.**
+> With the cache on (the default), snowplow decides what each user may see by evaluating
+> Kubernetes RBAC in memory. It does not consult other authorizers in the apiserver chain.
+> Authorizers that only *grant* extra access (for example Google IAM on GKE, which runs
+> after RBAC) are supported; users then see at most what RBAC allows. An authorizer that can
+> **deny** a request RBAC allows, placed before RBAC (for example a deny-capable webhook),
+> is **not supported** with the cache on. snowplow would not apply that deny. Such clusters
+> must run with `env.CACHE_ENABLED: "false"`, where every access decision is checked by the apiserver for that user
+> (a SelfSubjectAccessReview through the full authorizer chain). Details: [docs/configuration.md](docs/configuration.md#supported-authorization-configuration).
+
 ## Configure
 
 See [docs/configuration.md](docs/configuration.md). Most used:
