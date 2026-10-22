@@ -38,6 +38,7 @@ func TestS262_PerKindCostsWeightTheBound(t *testing.T) {
 	env := l262Setup(t, l262Opts{extraUsers: users, secrets: secrets, widgets: 2, ras: 2})
 	l262Stubs(t, l262StubOpts{widgetSleep: 15 * time.Millisecond, raSleep: 75 * time.Millisecond})
 	l262WaitLearned(t, 5)
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR, l262TargetGVR) // #841: the base cohort's group-only member is a known requester
 
 	l262Boot(t, env, seedModeBoot)
 

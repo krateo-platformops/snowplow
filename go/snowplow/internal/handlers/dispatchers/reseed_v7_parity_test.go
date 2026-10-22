@@ -70,6 +70,8 @@ func TestS258_V7_ReseededKeyEqualsRotatedCustomerKey(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	// #841: carol, the newly bound user, is a known requester (she logs in).
+	cache.ObserveLiveIdentity(s258WideningUser, nil, time.Now().Add(time.Hour))
 	reqs := enumerateRotatedResidentTargets(context.Background(), deps, rotated)
 	if s258TargetsFor(reqs, s258WideningUser) != 1 {
 		t.Fatalf("precondition: one reseed target for carol, got reqs=%d", len(reqs))

@@ -259,6 +259,22 @@ targets via `cache.EnumeratePrewarmTargetsForGVR(gvr, "list")`
 one `PrewarmTarget`; the representative subject identity is drawn from the
 binding's subjects.
 
+**Only identities a real requester can hit (#841).** The production seam
+`enumeratePrewarmTargetsWithLearned` keeps a representative only if a
+**learned class** (a known requester, from the stored clientconfig
+certificates or live traffic) has the same identity signature, and therefore
+the same key. A representative that no known user matches is dropped, because a
+real user's key folds their whole binding set. In bench run 12 such
+representatives used the whole readiness window and drew zero hits. Learned
+classes that differ from every kept representative are seeded as their own
+targets, newest first, within the self-adapting bound. When no unit cost has
+been measured yet, the newest class is admitted alone as the measuring probe.
+The first-nav latch waits for every nav widget × every identity the pass seeds
+before it, including learned classes. `snowplow_prewarm_seed_origin` counts the
+cells seeded per class (base / learned), the hits on them, and the distinct
+cells hit; `snowplow_prewarm_base_targets` counts representatives kept and
+dropped.
+
 Three "no static / no cold-fill" facts, verified in code:
 
 - **No static cohort list.** Targets are read from `BindingsByGVR` per

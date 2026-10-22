@@ -177,6 +177,7 @@ func s258BuildWatcher(t *testing.T, extraUsers ...string) (dynamic.Interface, *c
 	// The live binding index (what EnumeratePrewarmTargetsForGVR reads, and what
 	// gates the informer delta → pending sub-gen bump). Phase 1 builds it in prod.
 	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR})
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	t.Cleanup(func() {
 		rw.Stop()
@@ -277,6 +278,8 @@ func TestS258_WideningSubjectAppearsInReseedSet(t *testing.T) {
 	}
 
 	// THE ARM: carol now appears in the reseed set for the resident widget.
+	// #841: carol, the newly bound user, is a known requester (she logs in).
+	cache.ObserveLiveIdentity(s258WideningUser, nil, time.Now().Add(time.Hour))
 	reqs := enumerateRotatedResidentTargets(context.Background(), deps, rotated)
 	if n := s258TargetsFor(reqs, s258WideningUser); n != 1 {
 		t.Fatalf("post-grant: the reseed set holds %d target(s) for carol, want exactly 1 (the resident "+

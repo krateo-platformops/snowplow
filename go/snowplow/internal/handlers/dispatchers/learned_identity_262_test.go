@@ -265,6 +265,7 @@ func TestF4_262_BoundHolds_EngineBindsFirst(t *testing.T) {
 	env := l262Setup(t, l262Opts{extraUsers: users, secrets: secrets, widgets: 2, ras: 2})
 	l262Stubs(t, l262StubOpts{widgetSleep: 40 * time.Millisecond, raSleep: 60 * time.Millisecond})
 	l262WaitLearned(t, 5)
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR, l262TargetGVR) // #841: the base cohort's group-only member is a known requester
 	phases := l262ObservePhases(t)
 
 	l262Boot(t, env, seedModeBoot)
@@ -345,6 +346,7 @@ func TestF4_262_BoundHolds_MemoryBindsFirst(t *testing.T) {
 	env := l262Setup(t, l262Opts{extraUsers: users, secrets: secrets, widgets: 2, ras: 2})
 	l262Stubs(t, l262StubOpts{})
 	l262WaitLearned(t, 5)
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR, l262TargetGVR) // #841: the base cohort's group-only member is a known requester
 
 	// The adaptive admission ceiling (GOMEMLIMIT-relative) leaves room for
 	// exactly two classes' cells at the store's measured mean entry size, read

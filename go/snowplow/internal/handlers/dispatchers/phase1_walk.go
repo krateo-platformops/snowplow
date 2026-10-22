@@ -1586,6 +1586,19 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		)
 		return nil
 	}
+	// #841 — customer priority at WIDGET granularity. Every widget the walk
+	// resolves, at any depth, first steps aside for an in-flight customer
+	// /call (the engine's cooperative yield; a fast no-op when none is in
+	// flight). The deferred apiRef pagination drain yielded once per PAGE, but a
+	// page's cost is the walk of the children it reveals (run 12 storm profile:
+	// 100% of the drain's 7.2% CPU under iterateApiRefPages → walk →
+	// descendChildren → walk), so a customer arriving mid-page waited for the
+	// whole subtree. The boot walk runs before /readyz (no customer in flight),
+	// the engine re-walks and the drain run beside customers.
+	engineYieldCheckpoint(ctx)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	// Ship F2 (0.30.125) Step 7.5a — harvest this widget's spec.apiRef
 	// into the content-prewarm data-source set. This rides the EXISTING

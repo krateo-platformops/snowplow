@@ -116,6 +116,11 @@ func ResetCacheProcessStateForTest() error {
 	// rather than exempted — #471.
 	ResetRefreshFailedByClassForTest()
 
+	// 5d″ — #841 the seed-origin counters (cells seeded / hit per seed class)
+	// and the kept / unmatched representative counts. Process-global, so a test
+	// asserting on a class's hits would read a sibling's. Composed — #471.
+	ResetSeedOriginStatsForTest()
+
 	// 5d′ — #643 the engine-wide declined-external set (marks keyed by L1 keys)
 	// and its retire-reason breakdown. Process-global, so a test's marks would
 	// otherwise skip a sibling test's units. Composed rather than exempted — #471.

@@ -77,6 +77,7 @@ func TestIssue216_DegradedConfirmed404_ForgetsHarvestAndStopsSeedReplay(t *testi
 	// RESOLVED_CACHE_ENABLED + published global.
 	buildFixCWatcher(t)
 	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{fixCWidgetGVR})
+	knowEveryRepresentative(t, fixCWidgetGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	cache.ResetGoneForgetHooksForTest()
 	t.Cleanup(cache.ResetGoneForgetHooksForTest)
@@ -208,6 +209,7 @@ func TestIssue216_DropPointNon404_DoesNotForgetHarvest(t *testing.T) {
 
 	buildFixCWatcher(t)
 	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{fixCWidgetGVR})
+	knowEveryRepresentative(t, fixCWidgetGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	cache.ResetGoneForgetHooksForTest()
 	t.Cleanup(cache.ResetGoneForgetHooksForTest)

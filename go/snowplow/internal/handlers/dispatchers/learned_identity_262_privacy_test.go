@@ -78,6 +78,7 @@ func TestF6_262_Privacy_NoClassTokenInLogsOrDebug(t *testing.T) {
 	})
 	l262Stubs(t, l262StubOpts{probe: true})
 	l262WaitLearned(t, 1)
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR, l262TargetGVR) // #841: the base cohort's group-only member is a known requester
 
 	// Boot + keepwarm passes.
 	l262Boot(t, env, seedModeBoot)

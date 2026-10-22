@@ -126,6 +126,7 @@ func s436BuildWatcher(t *testing.T) (*dynamicfake.FakeDynamicClient, *cache.Reso
 	prev := cache.Global()
 	cache.SetGlobal(rw)
 	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR})
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	t.Cleanup(func() {
 		rw.Stop()

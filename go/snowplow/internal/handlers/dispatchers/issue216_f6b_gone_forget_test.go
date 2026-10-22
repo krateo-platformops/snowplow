@@ -183,6 +183,7 @@ func TestIssue216_F6b_GoneVerdictStopsTheSeedReplayingAHarvestedCopy(t *testing.
 	// the production derivation and the target enumerator has a real binding.
 	buildFixCWatcher(t)
 	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{fixCWidgetGVR})
+	knowEveryRepresentative(t, fixCWidgetGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 
 	cache.ResetGoneForgetHooksForTest()

@@ -1248,6 +1248,9 @@ func seedScopeYielding(ctx context.Context,
 	for _, rs := range restactionSeeds {
 		baseRAUnits += len(rs.targets)
 	}
+	// onLearnedNavUnit, when set, observes each learned nav unit processed (the
+	// pre-latch phase's readiness accounting, #841).
+	var onLearnedNavUnit func()
 	seedLearnedWidgetsFor := func(k string) bool {
 		for _, ws := range widgetSeeds {
 			for _, c := range ws.learned {
@@ -1256,6 +1259,9 @@ func seedScopeYielding(ctx context.Context,
 				}
 				if seedWidgetTarget(ws.e, c) {
 					return true
+				}
+				if onLearnedNavUnit != nil {
+					onLearnedNavUnit()
 				}
 			}
 		}
@@ -1550,10 +1556,13 @@ func seedScopeYielding(ctx context.Context,
 		}
 		bootNavProgressState.arm(navUnitsTotal, len(navCohorts), navExternal)
 	}
-	if navWidgetRemaining == 0 {
+	if navWidgetRemaining == 0 && len(lp.wUnits) == 0 {
 		// Provably-empty: no nav-widget units at all (all-tail topology, or the
 		// walk reached no widget). There is nothing to warm on the nav-widget
 		// path → fire so the latch never hangs to the PHASE1_TIMEOUT backstop.
+		// #841: a pass with learned nav units is NOT empty even when no
+		// representative is kept — the latch waits for the pre-latch learned
+		// phase below (before #841 it fired here, ahead of every learned class).
 		fireFirstNav("zero-nav-widgets", 0, 0)
 	}
 
@@ -1584,29 +1593,66 @@ func seedScopeYielding(ctx context.Context,
 	// t_widget is measured) AND the time left is re-checked before EACH class
 	// (#442), so a slow tail moves the rest to after the latch. No learned class →
 	// the latch fires at the same instant as before.
+	//
+	// #841 — every identity a pre-latch class seeds is part of what the latch
+	// waits for ("every nav widget × every seeded identity"): its units are
+	// added to the readiness accounting as the class is taken, and the latch
+	// fires after the phase whether or not any representative was kept. When no
+	// unit cost has been measured yet (no kept representative resolved), the
+	// decision admits the newest class alone as the measuring PROBE; it is
+	// seeded, and the decision is re-taken on the cost it measured.
 	backstopLeft, hasBackstop := latch.backstopRemaining()
 	navDecision := lp.decide(baseWidgetUnits, baseRAUnits, backstopLeft, hasBackstop)
 	seededPre := map[string]struct{}{}
 	var preOrder []string
+	learnedNavUnits := 0
+	if trackNav {
+		onLearnedNavUnit = func() { bootNavProgressState.unitProcessed(lastWidgetSeedErr) }
+	}
+	seedPreLatch := func(k string) bool {
+		if trackNav {
+			bootNavProgressState.addUnits(lp.wUnits[k])
+		}
+		learnedNavUnits += lp.wUnits[k]
+		if seedLearnedWidgetsFor(k) {
+			if trackNav {
+				bootNavProgressState.cut()
+			}
+			return true
+		}
+		seededPre[k] = struct{}{}
+		preOrder = append(preOrder, k)
+		return false
+	}
+	if navDecision.probe && len(navDecision.preLatch) > 0 {
+		if seedPreLatch(navDecision.preLatch[0]) {
+			return ctx.Err()
+		}
+		backstopLeft, hasBackstop = latch.backstopRemaining()
+		navDecision = lp.decide(baseWidgetUnits, baseRAUnits, backstopLeft, hasBackstop)
+	}
 	for _, k := range navDecision.preLatch {
+		if _, done := seededPre[k]; done {
+			continue
+		}
 		if hasBackstop {
 			tW, _, _, _, _ := seedUnitCosts()
 			if left, ok := latch.backstopRemaining(); !ok || left < lp.navCost(k, tW) {
 				break // #442: the rest seed after the latch
 			}
 		}
-		if seedLearnedWidgetsFor(k) {
-			if trackNav {
-				bootNavProgressState.cut()
-			}
+		if seedPreLatch(k) {
 			return ctx.Err()
 		}
-		seededPre[k] = struct{}{}
-		preOrder = append(preOrder, k)
 	}
+	onLearnedNavUnit = nil
 	noteLearnedPhase("prelatch", preOrder)
-	if navUnitsTotal > 0 && navWidgetRemaining == 0 {
-		fireFirstNav("segment-complete", distinctNavWidgets, navUnitsTotal)
+	if navWidgetRemaining == 0 && navUnitsTotal+learnedNavUnits > 0 {
+		fireFirstNav("segment-complete", distinctNavWidgets, navUnitsTotal+learnedNavUnits)
+	} else if navWidgetRemaining == 0 {
+		// Learned nav units existed but the bound admitted none before the
+		// latch: nothing on the nav path to wait for.
+		fireFirstNav("zero-nav-widgets", 0, 0)
 	}
 
 	// RA tail — RAs carry no NavOrder (they are the background content layer, not
