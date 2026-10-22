@@ -327,12 +327,16 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		if opts.WinningSubjectClassOut != nil && v.Allowed {
 			*opts.WinningSubjectClassOut = v.WinningSubjectClass
 		}
-		log.Debug("rbac.evaluate",
-			slog.String("path", "in-process-memo-hit"),
-			slog.String("user", redact.User(opts.Username)),
-			slog.Bool("allowed", v.Allowed),
-			slog.String("matched_binding_uid", v.MatchedBindingUID),
-		)
+		// The Enabled guard keeps the per-call keyed user digest (an HMAC)
+		// off the hot path at the shipped warn level.
+		if log.Enabled(ctx, slog.LevelDebug) {
+			log.Debug("rbac.evaluate",
+				slog.String("path", "in-process-memo-hit"),
+				slog.String("user", redact.User(opts.Username)),
+				slog.Bool("allowed", v.Allowed),
+				slog.String("matched_binding_uid", v.MatchedBindingUID),
+			)
+		}
 		return v.Allowed, v.MatchedBindingUID, nil
 	}
 
@@ -384,16 +388,18 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		authzMemoDenyUncached.Add(1)
 	}
 
-	log.Debug("rbac.evaluate",
-		slog.String("path", "in-process"),
-		slog.String("user", redact.User(opts.Username)),
-		slog.String("verb", opts.Verb),
-		slog.String("group", opts.Group),
-		slog.String("resource", opts.Resource),
-		slog.String("namespace", opts.Namespace),
-		slog.Bool("allowed", allowed),
-		slog.String("matched_binding_uid", matchedBindingUID),
-	)
+	if log.Enabled(ctx, slog.LevelDebug) {
+		log.Debug("rbac.evaluate",
+			slog.String("path", "in-process"),
+			slog.String("user", redact.User(opts.Username)),
+			slog.String("verb", opts.Verb),
+			slog.String("group", opts.Group),
+			slog.String("resource", opts.Resource),
+			slog.String("namespace", opts.Namespace),
+			slog.Bool("allowed", allowed),
+			slog.String("matched_binding_uid", matchedBindingUID),
+		)
+	}
 	return allowed, matchedBindingUID, nil
 }
 

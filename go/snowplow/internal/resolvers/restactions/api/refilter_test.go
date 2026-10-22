@@ -47,7 +47,7 @@ func refilterRBACListKinds() map[schema.GroupVersionResource]string {
 // with the supplied RBAC objects. Mirrors the helper in
 // internal/rbac/evaltest. Returns nothing — callers use cache.Global()
 // implicitly via EvaluateRBAC.
-func newRefilterTestWatcher(t *testing.T, seed ...runtime.Object) {
+func newRefilterTestWatcher(t testing.TB, seed ...runtime.Object) {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 

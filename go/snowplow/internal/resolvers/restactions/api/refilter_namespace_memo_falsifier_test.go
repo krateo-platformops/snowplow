@@ -85,7 +85,7 @@ func memoRBToClusterRole(ns, name, clusterRole string) *rbacv1.RoleBinding {
 
 // newMemoTestWatcher seeds the shared fixture and publishes a cache=on
 // watcher (via the existing newRefilterTestWatcher helper).
-func newMemoTestWatcher(t *testing.T) {
+func newMemoTestWatcher(t testing.TB) {
 	t.Helper()
 
 	// Namespaced Role with resourceNames — the name-specific arm.
@@ -444,13 +444,13 @@ func refilterKeptMutant(ctx context.Context, uaf *templates.UserAccessFilterSpec
 	_, nameCode := compileNameFrom(uaf)
 	var kept []any
 	for _, item := range items {
-		ns, err := evalJQStringCompiled(ctx, nsCode, item)
+		ns, err := nsCode.eval(ctx, item)
 		if err != nil {
 			continue
 		}
 		name := ""
 		if rbac.IsNameSpecificVerb(uaf.Verb) {
-			name, _ = evalJQStringCompiled(ctx, nameCode, item)
+			name, _ = nameCode.eval(ctx, item)
 		}
 		var permitted bool
 		switch mode {
