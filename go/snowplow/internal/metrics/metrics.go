@@ -1222,6 +1222,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerListQueryInstrument(m); err != nil {
 		return err
 	}
+	if err := registerExternalFetchCacheInstruments(m); err != nil {
+		return err
+	}
 	if err := registerUAFNullSkipInstruments(m); err != nil {
 		return err
 	}
@@ -1606,6 +1609,45 @@ func registerListQueryInstrument(m metric.Meter) error {
 		}
 		return nil
 	}, listQuery)
+	return err
+}
+
+// registerExternalFetchCacheInstruments hand-wires the external fetch's
+// content-addressed conversion memo (restactions/api/external_fetch_cache.go)
+// onto OTLP (no expvar->OTLP bridge), from the accessors its expvar closures
+// read. outcome is a closed, code-defined set. Registered only when the cache is
+// on (CFG-1).
+func registerExternalFetchCacheInstruments(m metric.Meter) error {
+	total, err := m.Int64ObservableCounter("snowplow_external_fetch_conversion_total",
+		metric.WithDescription("External api-step reads by what their conversion cost, by outcome: convert_hit (the fetched body's exact bytes were already converted; reused, byte-identical), convert_miss (the body was converted, YAML to JSON), not_modified (a conditional read with the validators this same request identity last saw was answered 304; those bytes were reused). Every read fetches: nothing is reused by time. A valid-JSON body is passed through as before and counted in none."))
+	if err != nil {
+		return err
+	}
+	bytes, err := m.Int64ObservableGauge("snowplow_external_fetch_conversion_bytes",
+		metric.WithDescription("Bytes the external conversion memo holds (converted JSON + per-identity validators). Bounded by a share of the memory headroom past the admission reserve (GOMEMLIMIT − live heap), re-read at each store."))
+	if err != nil {
+		return err
+	}
+	entries, err := m.Int64ObservableGauge("snowplow_external_fetch_conversion_entries",
+		metric.WithDescription("Entries the external conversion memo holds (conversions + per-identity validators)."))
+	if err != nil {
+		return err
+	}
+	evictions, err := m.Int64ObservableCounter("snowplow_external_fetch_conversion_evictions_total",
+		metric.WithDescription("External conversion memo entries evicted (least recently used first) to keep it within its byte bound."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, c := range restactionsapi.ExternalFetchCacheSnapshot() {
+			o.ObserveInt64(total, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Outcome)))
+		}
+		n, b := restactionsapi.ExternalFetchCacheHeld()
+		o.ObserveInt64(entries, int64(n))
+		o.ObserveInt64(bytes, b)
+		o.ObserveInt64(evictions, int64(restactionsapi.ExternalFetchCacheEvictions()))
+		return nil
+	}, total, bytes, entries, evictions)
 	return err
 }
 
