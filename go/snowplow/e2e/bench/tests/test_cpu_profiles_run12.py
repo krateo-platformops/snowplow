@@ -432,3 +432,76 @@ def test_the_default_plan_profiles_t0_30_60_120_and_the_burst_at_900(tmp_path):
     burst = [r for r in recs if r["window"] == "burst"]
     assert burst[0]["t_start"] <= 840 + 30 and burst[-1]["t_end"] >= 1140
     assert any(r["t_start"] <= 900 < r["t_end"] for r in recs)
+
+
+# ─── #839 gate: storm coverage from what each profile recorded itself ──────
+
+
+def _varint(v):
+    out = b""
+    while True:
+        b, v = v & 0x7F, v >> 7
+        out += bytes([b | (0x80 if v else 0)])
+        if not v:
+            return out
+
+
+def _pprof(start_s: float, duration_s: float) -> bytes:
+    """A gzipped profile.proto with a string table entry, time_nanos (9)
+    and duration_nanos (10), as Go writes them."""
+    import gzip as gz
+    s = b"cpu"
+    msg = (_varint(6 << 3 | 2) + _varint(len(s)) + s
+           + _varint(9 << 3) + _varint(int(start_s * 1e9))
+           + _varint(10 << 3) + _varint(int(duration_s * 1e9)))
+    return gz.compress(msg)
+
+
+def test_pprof_window_reads_the_profiles_own_start_and_duration():
+    w = load606.pprof_window(_pprof(1792672820.0105, 30.138))
+    assert abs(w[0] - 1792672820.0105) < 1e-6 and abs(w[1] - 30.138) < 1e-6
+    assert load606.pprof_window(b"\x1f\x8bnot gzip") is None
+    assert load606.pprof_window(_pprof(1, 2)[:-4]) is None          # a cut file: None, no raise
+
+
+def test_a_profile_queued_behind_the_storm_covers_only_what_it_recorded():
+    """Requests back to back over the whole storm, but each profile only ran
+    the last 20 s of its 30 s request (queued 10 s): coverage is 2/3."""
+    profs = []
+    for a, b, w in _b2b(0, 700, "storm"):
+        profs.append((a, b, w))
+    mem = _stream(profs + FULL[-11:])
+    for r in mem:
+        if r.get("kind") == "cpu_profile" and r.get("window") == "storm":
+            r.update(prof_start=r["t_start"] + 10, prof_duration_s=20.0)
+    win = load606.cpu_profile_windows(mem)
+    assert 0.6 < win["storm"]["coverage"] < 0.7
+    assert load606.cpu_storm_check(win)["result"] == "FAIL"
+
+
+class PprofSnow(ProfSnow):
+    """The profile's body is a real profile.proto; one request is slow."""
+
+    def get(self, path, token):
+        self.calls += 1
+        t0 = self.clock.t
+        self.clock.sleep(30 + (12 if self.calls == 2 else 0.2))
+        return load606.Response(200, _pprof(t0 + (12 if self.calls == 2 else 0), 30.0), 1)
+
+
+def test_the_profiler_records_the_profiles_window_and_flags_a_slow_request(tmp_path):
+    clk = FakeClock()
+    recs = []
+    load606.cpu_profiler(PprofSnow(clk), PLAN, token_fn=lambda: TOKEN, anchor_fn=lambda: 0,
+                         stopped=lambda: clk.t >= 100, out_dir=str(tmp_path),
+                         sink=recs.append, clock=clk.now, sleep=clk.sleep)
+    assert recs[0]["prof_start"] == recs[0]["t_start"] and recs[0]["prof_duration_s"] == 30.0
+    assert "slow_request" not in recs[0]
+    assert recs[1]["slow_request"] is True and recs[1]["prof_start"] == recs[1]["t_start"] + 12
+    win = load606.cpu_profile_windows(
+        [{"kind": "mem_start", "t": 0.0, "cpu_plan": dict(profile_s=30, storm_s=600, every_s=300,
+                                                           burst_at_s=None, burst_pre_s=60,
+                                                           burst_post_s=240)}]
+        + recs + [{"kind": "mem_end", "t": 200.0}])
+    assert win["slow_requests"] == 1
+    assert win["profiles"][1]["t_start"] == recs[1]["prof_start"]

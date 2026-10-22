@@ -1745,7 +1745,10 @@ def cpu_profile_windows(mem: list[dict]) -> dict | None:
                  max((r.get("t") or 0) for r in mem))
     profs = sorted((r for r in mem if r.get("kind") == "cpu_profile" and r.get("profile")),
                    key=lambda r: r["t_start"])
-    iv = [(r["t_start"], r["t_end"]) for r in profs]
+    # coverage from what each profile recorded itself (its own start and
+    # duration); the request interval only for a profile without them
+    iv = [((r["prof_start"], r["prof_start"] + r["prof_duration_s"])
+           if r.get("prof_start") is not None else (r["t_start"], r["t_end"])) for r in profs]
 
     def window(a, b):
         b = min(b, end_t)
@@ -1762,7 +1765,9 @@ def cpu_profile_windows(mem: list[dict]) -> dict | None:
                              anchor + burst_at + plan["burst_post_s"])
                       if burst_at is not None else None),
             "profiles": [{"profile": r["profile"], "window": r["window"],
-                          "t_start": r["t_start"], "t_end": r["t_end"]} for r in profs],
+                          "t_start": a, "t_end": b} for r, (a, b) in zip(profs, iv)],
+            # requests that took > profile_s + 5 s (queued or slow transfer)
+            "slow_requests": sum(1 for r in profs if r.get("slow_request")),
             "failed": [{"window": r.get("window"), "t_start": r.get("t_start"),
                         "error": r.get("error")}
                        for r in mem if r.get("kind") == "cpu_profile" and not r.get("profile")]}
@@ -4194,6 +4199,49 @@ class CpuPlan:
         return b if b is not None and b > now else None
 
 
+def pprof_window(body: bytes) -> tuple[float, float] | None:
+    """(start epoch s, duration s) a CPU profile itself recorded: its
+    time_nanos (field 9) and duration_nanos (field 10) of profile.proto,
+    read from the top level of the (gzipped) message. None if unreadable."""
+    try:
+        b = gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
+    except (OSError, EOFError):
+        return None
+    i, got = 0, {}
+
+    def varint(i):
+        v = shift = 0
+        while True:
+            c = b[i]
+            v |= (c & 0x7F) << shift
+            i += 1
+            if not c & 0x80:
+                return v, i
+            shift += 7
+    try:
+        while i < len(b):
+            key, i = varint(i)
+            field, wire = key >> 3, key & 7
+            if wire == 0:
+                v, i = varint(i)
+                if field in (9, 10):
+                    got[field] = v
+            elif wire == 2:
+                n, i = varint(i)
+                i += n
+            elif wire == 1:
+                i += 8
+            elif wire == 5:
+                i += 4
+            else:
+                return None
+    except IndexError:
+        return None
+    if 9 not in got or 10 not in got:
+        return None
+    return got[9] / 1e9, got[10] / 1e9
+
+
 def cpu_profiler(client: HttpClient, plan: CpuPlan, *, token_fn: Callable[[], str | None],
                  anchor_fn: Callable[[], float], stopped: Callable[[], bool],
                  out_dir: str, sink: Callable[[dict], None],
@@ -4231,6 +4279,13 @@ def cpu_profiler(client: HttpClient, plan: CpuPlan, *, token_fn: Callable[[], st
             with open(os.path.join(out_dir, name), "wb") as fh:
                 fh.write(r.body)
             rec.update(profile=name, bytes=len(r.body))
+            # what the profile itself covers (#839 gate): the request's own
+            # interval also holds its queueing and transfer
+            pw = pprof_window(r.body)
+            if pw:
+                rec.update(prof_start=pw[0], prof_duration_s=round(pw[1], 3))
+            if t1 - t0 > plan.profile_s + 5:
+                rec["slow_request"] = True
             last = t0
             sink(rec)
         else:
