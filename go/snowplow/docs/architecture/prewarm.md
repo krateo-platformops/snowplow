@@ -267,8 +267,12 @@ the same key. A representative that no known user matches is dropped, because a
 real user's key folds their whole binding set. In bench run 12 such
 representatives used the whole readiness window and drew zero hits. Learned
 classes that differ from every kept representative are seeded as their own
-targets, newest first, within the self-adapting bound. When no unit cost has
-been measured yet, the newest class is admitted alone as the measuring probe.
+targets, within the self-adapting bound. The boot nav phase seeds classes in
+order of **known population**: kept representatives and learned classes are
+merged by how many known requesters each serves, then by NavOrder, then by a
+stable key. Source plays no part, so a backstop cut drops the least-populated
+classes. When no unit cost has been measured yet, the top class is admitted
+alone as the measuring probe.
 The first-nav latch waits for every nav widget × every identity the pass seeds
 before it, including learned classes. `snowplow_prewarm_seed_origin` counts the
 cells seeded per class (base / learned), the hits on them, and the distinct

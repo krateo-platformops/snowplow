@@ -105,6 +105,11 @@ type PrewarmTarget struct {
 	// produced here; the dispatchers-side enumeration wrapper adds such
 	// targets, and they never reach a log line in clear (LearnedClassLabel).
 	Learned bool
+	// Population — #841: how many KNOWN requesters (learned identities) derive
+	// this target's key. ≥1 for every target the dispatchers wrapper emits; the
+	// seed orders classes by it, descending, so a cut by the readiness backstop
+	// drops the least-populated classes. Never produced here (0).
+	Population int
 }
 
 // EnumeratePrewarmTargetsForGVR returns the per-binding prewarm targets

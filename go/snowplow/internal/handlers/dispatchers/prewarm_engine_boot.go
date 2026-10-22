@@ -1481,11 +1481,14 @@ func seedScopeYielding(ctx context.Context,
 		cohortRankIndex[ranked[r].key] = r
 	}
 	type seedUnit struct {
-		navOrder  int
-		rankIndex int
-		wsNSName  string
-		e         navWidgetEntry
-		target    seedTarget
+		// population — #841: the known requesters this unit's identity serves
+		// (seedTarget.Population). The flat order's primary key.
+		population int
+		navOrder   int
+		rankIndex  int
+		wsNSName   string
+		e          navWidgetEntry
+		target     seedTarget
 		// external — #594 cost class, carried from the widgetSeed so the flat
 		// unit order can key on it. THIS is the list the boot seed executes:
 		// it is rebuilt from widgetSeeds and RE-SORTED below, so a cost-class
@@ -1505,22 +1508,31 @@ func seedScopeYielding(ctx context.Context,
 				ri = len(ranked)
 			}
 			flat = append(flat, seedUnit{
-				navOrder:  ws.e.NavOrder,
-				rankIndex: ri,
-				wsNSName:  nsName,
-				e:         ws.e,
-				target:    c,
-				external:  ws.external,
+				population: c.Population,
+				navOrder:   ws.e.NavOrder,
+				rankIndex:  ri,
+				wsNSName:   nsName,
+				e:          ws.e,
+				target:     c,
+				external:   ws.external,
 			})
 		}
 	}
 	sort.SliceStable(flat, func(i, j int) bool {
-		// (0) #594 COST CLASS ASC — internal-backed units first, external-backed
-		// last. The pass below is cut by pipGlobalTimeout mid-list, so this key
-		// decides WHAT A CUT LOSES: units whose cell has no dep edges, can never
-		// publish and carries the bounded external TTL, instead of an arbitrary
-		// suffix of the walk. Ordering only; the set is unchanged, and the
-		// first-nav latch counts the same units in either order.
+		// (0) #841 POPULATION DESC — the class serving the most known requesters
+		// first, so a cut by the readiness backstop drops the least-populated
+		// classes. The same key orders the learned classes (newLearnedPlan) and
+		// the merge of the two below: the order is by who a class serves, never
+		// by where its identity came from.
+		if flat[i].population != flat[j].population {
+			return flat[i].population > flat[j].population
+		}
+		// (0′) #594 COST CLASS ASC within a population — internal-backed units
+		// first, external-backed last. The pass below is cut by pipGlobalTimeout
+		// mid-list, so this key decides WHAT A CUT LOSES: units whose cell has no
+		// dep edges, can never publish and carries the bounded external TTL,
+		// instead of an arbitrary suffix of the walk. Ordering only; the set is
+		// unchanged, and the first-nav latch counts the same units in either order.
 		if flat[i].external != flat[j].external {
 			return !flat[i].external
 		}
@@ -1561,55 +1573,115 @@ func seedScopeYielding(ctx context.Context,
 		// walk reached no widget). There is nothing to warm on the nav-widget
 		// path → fire so the latch never hangs to the PHASE1_TIMEOUT backstop.
 		// #841: a pass with learned nav units is NOT empty even when no
-		// representative is kept — the latch waits for the pre-latch learned
-		// phase below (before #841 it fired here, ahead of every learned class).
+		// representative is kept — the latch waits for the merged phase below
+		// (before #841 it fired here, ahead of every learned class).
 		fireFirstNav("zero-nav-widgets", 0, 0)
 	}
 
-	// Seed the flat list in NavOrder order. SAME primitive (seedWidgetTarget),
-	// SAME abort/yield semantics (return ctx.Err() on abort). Fire the latch the
-	// instant the LAST nav-widget unit is PROCESSED (remaining==0) — before the
-	// RA content tail runs, so readyz does not wait on the RA whale-fanout.
-	// PROCESSED, NOT SUCCEEDED (C2 liveness, unchanged): a per-target failure is
-	// classified+swallowed inside seedWidgetTarget, so the count still decrements
-	// — a permanently-failing widget must not hang /readyz to the backstop.
-	for i := range flat {
-		if seedWidgetTarget(flat[i].e, flat[i].target) {
-			if trackNav {
-				bootNavProgressState.cut()
-			}
-			return ctx.Err()
-		}
-		if trackNav {
-			bootNavProgressState.unitProcessed(lastWidgetSeedErr)
-		}
-		navWidgetRemaining--
-	}
-	// #262: the admitted learned classes' nav widgets, newest class first, whose
-	// nav units fit the time left before the readiness BACKSTOP seed BEFORE the
-	// latch fires (a learned user's first navigation is warm when the pod turns
-	// Ready). A latch released by the backstop is a failed boot, never worth one
-	// learned class: the admission is taken here (after the base nav units, so
-	// t_widget is measured) AND the time left is re-checked before EACH class
-	// (#442), so a slow tail moves the rest to after the latch. No learned class →
-	// the latch fires at the same instant as before.
+	// ── #841: ONE nav phase, ordered by POPULATION. ──
+	// The kept representatives' nav units (flat, above) and the admitted learned
+	// classes (#262) are merged by the population each serves: at every step the
+	// next base unit or the next learned class, whichever serves more known
+	// requesters (a tie goes to the base unit — it is in the latch's mandatory
+	// set). A learned class seeds its nav widgets whole, in NavOrder.
 	//
-	// #841 — every identity a pre-latch class seeds is part of what the latch
-	// waits for ("every nav widget × every seeded identity"): its units are
-	// added to the readiness accounting as the class is taken, and the latch
-	// fires after the phase whether or not any representative was kept. When no
-	// unit cost has been measured yet (no kept representative resolved), the
-	// decision admits the newest class alone as the measuring PROBE; it is
-	// seeded, and the decision is re-taken on the cost it measured.
-	backstopLeft, hasBackstop := latch.backstopRemaining()
-	navDecision := lp.decide(baseWidgetUnits, baseRAUnits, backstopLeft, hasBackstop)
+	// THE LATCH waits for every nav widget × every identity seeded here: all of
+	// flat (PROCESSED, NOT SUCCEEDED — C2 liveness, unchanged: a per-target
+	// failure is classified+swallowed inside seedWidgetTarget, so a permanently-
+	// failing widget cannot hang /readyz) plus each learned class taken before it,
+	// whose units join the readiness accounting as it is taken. A latch released
+	// by the readiness BACKSTOP is a failed boot, so a learned class is taken only
+	// while its nav cost AND the base units still to come fit the time left
+	// (#442's per-class re-check, now also reserving the mandatory base units);
+	// once one does not fit, the remaining learned classes seed after the latch.
+	//
+	// THE PROBE: the admission is decided lazily, when a learned class's turn
+	// first comes (until then the merge compares against the top class by
+	// population, which no decision is needed to know), so it reads the costs and
+	// the store the base units before it measured. If no unit cost has been
+	// measured then, it admits the top class alone as the measuring probe (seeded
+	// without a cost check — that is the measurement); the decision is re-taken
+	// as soon as a cost is measured.
+	var (
+		navDecision  learnedDecision
+		decided      bool
+		backstopLeft time.Duration
+		hasBackstop  bool
+		li           int  // next index into navDecision.preLatch
+		learnedDone  bool // no further learned class before the latch
+	)
+	decideNav := func() {
+		backstopLeft, hasBackstop = latch.backstopRemaining()
+		navDecision = lp.decide(baseWidgetUnits, baseRAUnits, backstopLeft, hasBackstop)
+		decided, li = true, 0
+	}
 	seededPre := map[string]struct{}{}
 	var preOrder []string
 	learnedNavUnits := 0
 	if trackNav {
 		onLearnedNavUnit = func() { bootNavProgressState.unitProcessed(lastWidgetSeedErr) }
 	}
-	seedPreLatch := func(k string) bool {
+	// topLearned: the most-populated class with nav units, the merge's learned
+	// candidate before the admission is decided.
+	topLearned, haveTop := "", false
+	if len(lp.wUnits) > 0 {
+		for _, k := range newLearnedPlan(lp.wUnits, lp.rUnits, lp.pop, 0, 0).order {
+			if lp.wUnits[k] > 0 {
+				topLearned, haveTop = k, true
+				break
+			}
+		}
+	}
+	nextLearned := func() (string, bool) {
+		if learnedDone || !haveTop {
+			return "", false
+		}
+		if !decided {
+			return topLearned, true
+		}
+		for ; li < len(navDecision.preLatch); li++ {
+			if _, done := seededPre[navDecision.preLatch[li]]; !done {
+				return navDecision.preLatch[li], true
+			}
+		}
+		return "", false
+	}
+	bi := 0
+	for {
+		k, haveLearned := nextLearned()
+		if !haveLearned && bi >= len(flat) {
+			break
+		}
+		if !haveLearned || (bi < len(flat) && lp.pop[k] <= flat[bi].population) {
+			if seedWidgetTarget(flat[bi].e, flat[bi].target) {
+				if trackNav {
+					bootNavProgressState.cut()
+				}
+				return ctx.Err()
+			}
+			if trackNav {
+				bootNavProgressState.unitProcessed(lastWidgetSeedErr)
+			}
+			navWidgetRemaining--
+			bi++
+			continue
+		}
+		if !decided {
+			decideNav() // the first learned turn: decide on what was measured so far
+			continue
+		}
+		tW, _, _, _, measured := seedUnitCosts()
+		if navDecision.probe && measured {
+			decideNav() // a cost is known now: decide on it, not on the probe
+			continue
+		}
+		if hasBackstop && !navDecision.probe {
+			need := lp.navCost(k, tW) + time.Duration(len(flat)-bi)*tW
+			if left, ok := latch.backstopRemaining(); !ok || left < need {
+				learnedDone = true // #442: the rest seed after the latch
+				continue
+			}
+		}
 		if trackNav {
 			bootNavProgressState.addUnits(lp.wUnits[k])
 		}
@@ -1618,31 +1690,12 @@ func seedScopeYielding(ctx context.Context,
 			if trackNav {
 				bootNavProgressState.cut()
 			}
-			return true
+			return ctx.Err()
 		}
 		seededPre[k] = struct{}{}
 		preOrder = append(preOrder, k)
-		return false
-	}
-	if navDecision.probe && len(navDecision.preLatch) > 0 {
-		if seedPreLatch(navDecision.preLatch[0]) {
-			return ctx.Err()
-		}
-		backstopLeft, hasBackstop = latch.backstopRemaining()
-		navDecision = lp.decide(baseWidgetUnits, baseRAUnits, backstopLeft, hasBackstop)
-	}
-	for _, k := range navDecision.preLatch {
-		if _, done := seededPre[k]; done {
-			continue
-		}
-		if hasBackstop {
-			tW, _, _, _, _ := seedUnitCosts()
-			if left, ok := latch.backstopRemaining(); !ok || left < lp.navCost(k, tW) {
-				break // #442: the rest seed after the latch
-			}
-		}
-		if seedPreLatch(k) {
-			return ctx.Err()
+		if navDecision.probe {
+			decideNav()
 		}
 	}
 	onLearnedNavUnit = nil

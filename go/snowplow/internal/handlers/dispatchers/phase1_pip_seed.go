@@ -640,6 +640,9 @@ type seedTarget struct {
 	// cache.PrewarmTarget.Learned). Seeded in its own capacity-bounded phase,
 	// and its identity reaches logs only as cache.LearnedClassLabel.
 	Learned bool
+	// Population — #841: known requesters deriving this target's key (carried
+	// from cache.PrewarmTarget.Population). The seed order's primary key.
+	Population int
 }
 
 // withCohortSeedContext builds the per-cohort seed context. Mirrors

@@ -323,6 +323,76 @@ func TestS841_ClassSeedScopeSeedsNewlyMatchedRepresentative(t *testing.T) {
 	}
 }
 
+// ── S7: the seed order is by known population, never by source ───────────────
+
+// s841FirstSeed returns the index of the first widget resolve whose requester
+// matches pred, -1 if none.
+func s841FirstSeed(ev []s841Event, pred func(s841Event) bool) int {
+	for i, e := range ev {
+		if e.kind == "widget" && pred(e) {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestS841_SeedOrderIsByKnownPopulation(t *testing.T) {
+	isRep := func(e s841Event) bool { return e.user == "" }
+	isTeam := func(e s841Event) bool { return strings.HasPrefix(e.user, "team") }
+	isDave := func(e s841Event) bool { return e.user == "dave" }
+	// secrets: `team` users hold devs+ops (a learned class with no representative
+	// of its own), `solo` users hold devs only (they match the devs
+	// representative), dave holds devs + a User binding (a one-user learned
+	// class, and the NEWEST login, so newest-first alone would put him first).
+	run := func(t *testing.T, team, solo int) []s841Event {
+		now := time.Now()
+		var secrets []*corev1.Secret
+		for i := 0; i < team; i++ {
+			u := "team" + itoaLine(i)
+			secrets = append(secrets, l262ClientconfigSecret(t, u+"-clientconfig", u,
+				[]string{l262Group, s841Ops}, now.Add(-time.Duration(10+i)*time.Hour), "1"))
+		}
+		for i := 0; i < solo; i++ {
+			u := "solo" + itoaLine(i)
+			secrets = append(secrets, l262ClientconfigSecret(t, u+"-clientconfig", u,
+				[]string{l262Group}, now.Add(-time.Duration(30+i)*time.Hour), "1"))
+		}
+		secrets = append(secrets, l262ClientconfigSecret(t, "dave-clientconfig", "dave",
+			[]string{l262Group}, now.Add(-time.Minute), "1"))
+		env := l262Setup(t, l262Opts{extraUsers: []string{"dave"}, groupCohorts: []string{s841Ops}, secrets: secrets})
+		l262Stubs(t, l262StubOpts{})
+		l262WaitLearned(t, team+solo+1)
+		rec := s841Record(t)
+		ensureFirstNavLatch()
+		l262Boot(t, env, seedModeBoot)
+		return rec.snapshot()
+	}
+
+	t.Run("learned class shared by 3 before a base cohort matched by 1", func(t *testing.T) {
+		ev := run(t, 3, 1)
+		team, rep, dave := s841FirstSeed(ev, isTeam), s841FirstSeed(ev, isRep), s841FirstSeed(ev, isDave)
+		if team < 0 || rep < 0 || dave < 0 {
+			t.Fatalf("NON-VACUITY: every class must seed (team=%d rep=%d dave=%d)", team, rep, dave)
+		}
+		if !(team < rep && team < dave) {
+			t.Fatalf("S7 RED: the 3-user learned class must seed first; first seeds team=%d rep=%d dave=%d", team, rep, dave)
+		}
+		if !(rep < dave) {
+			t.Fatalf("S7 RED: at equal population (1) the base cohort precedes the learned class; rep=%d dave=%d", rep, dave)
+		}
+	})
+	t.Run("base cohort matched by 3 before a learned class shared by 2", func(t *testing.T) {
+		ev := run(t, 2, 3)
+		team, rep, dave := s841FirstSeed(ev, isTeam), s841FirstSeed(ev, isRep), s841FirstSeed(ev, isDave)
+		if team < 0 || rep < 0 || dave < 0 {
+			t.Fatalf("NON-VACUITY: every class must seed (team=%d rep=%d dave=%d)", team, rep, dave)
+		}
+		if !(rep < team && team < dave) {
+			t.Fatalf("S7 RED: want base(3) < team(2) < dave(1, newest); first seeds rep=%d team=%d dave=%d", rep, team, dave)
+		}
+	})
+}
+
 // ── S5 / S6: the drain yields between widgets ───────────────────────────────
 
 // s841Widget is a minimal widget CR the walk harvests before it resolves.

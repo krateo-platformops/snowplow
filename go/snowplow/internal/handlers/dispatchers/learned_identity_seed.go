@@ -130,11 +130,13 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 		c   cache.LearnedIdentity
 		sig string
 	}
-	known := make(map[string]struct{}, len(classes))
+	// known counts, per signature, the known requesters holding it: the
+	// POPULATION a target with that signature serves (#841 seed order).
+	known := make(map[string]int, len(classes))
 	sigs := make([]sigClass, 0, len(classes))
 	for _, c := range classes {
 		sig := learnedClassSignature(c.Username, c.Groups)
-		known[sig] = struct{}{}
+		known[sig]++
 		sigs = append(sigs, sigClass{c: c, sig: sig})
 	}
 	seen := make(map[string]struct{}, len(base)+len(classes))
@@ -142,11 +144,13 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 	unmatched := 0
 	for _, t := range base {
 		sig := learnedClassSignature(t.Subject.Username, t.Subject.Groups)
-		if _, ok := known[sig]; !ok {
+		pop := known[sig]
+		if pop == 0 {
 			unmatched++
 			continue
 		}
 		seen[sig] = struct{}{}
+		t.Population = pop
 		out = append(out, t)
 	}
 	cache.NoteBaseTargets(len(base)-unmatched, unmatched)
@@ -165,6 +169,7 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 			Verb:              verb,
 			CollapsedBindings: 1,
 			Learned:           true,
+			Population:        known[sig],
 		})
 	}
 	return out
@@ -273,21 +278,26 @@ func resetSeedUnitCostForTest() {
 // ── admission (the self-adapting bound) ──────────────────────────────────────
 
 // learnedPlan is one pass's learned workload: every class with ≥1 distinct
-// target (newest LastSeen first), its widget and RESTAction units, and the
-// pass's base-cohort units of each kind.
+// target (largest known population first, then newest LastSeen), its widget
+// and RESTAction units, its population, and the pass's base-cohort units of
+// each kind.
 type learnedPlan struct {
 	order  []string
 	wUnits map[string]int
 	rUnits map[string]int
+	pop    map[string]int
 	baseW  int
 	baseR  int
 }
 
-// newLearnedPlan orders the classes present in the unit maps by the registry's
-// newest-LastSeen-first order. A class that left the registry since the targets
-// were enumerated (Secret deleted / JWT expired) is not seeded.
-func newLearnedPlan(wUnits, rUnits map[string]int, baseW, baseR int) learnedPlan {
-	p := learnedPlan{wUnits: wUnits, rUnits: rUnits, baseW: baseW, baseR: baseR}
+// newLearnedPlan orders the classes present in the unit maps by POPULATION
+// descending (#841: the known requesters each class's key serves — a class a
+// whole team shares before a one-user class, so the bound and the readiness
+// backstop cut the least-populated classes), ties by the registry's
+// newest-LastSeen-first order. A class that left the registry since the
+// targets were enumerated (Secret deleted / JWT expired) is not seeded.
+func newLearnedPlan(wUnits, rUnits, pop map[string]int, baseW, baseR int) learnedPlan {
+	p := learnedPlan{wUnits: wUnits, rUnits: rUnits, pop: pop, baseW: baseW, baseR: baseR}
 	if len(wUnits) == 0 && len(rUnits) == 0 {
 		return p
 	}
@@ -296,6 +306,7 @@ func newLearnedPlan(wUnits, rUnits map[string]int, baseW, baseR int) learnedPlan
 			p.order = append(p.order, k)
 		}
 	}
+	sort.SliceStable(p.order, func(i, j int) bool { return pop[p.order[i]] > pop[p.order[j]] })
 	return p
 }
 
@@ -522,11 +533,12 @@ func resetLearnedAdmissionForTest() {
 type learnedPass struct {
 	wUnits map[string]int
 	rUnits map[string]int
-	memFit int // -1 until the pass's first decision measured the memory side
+	pop    map[string]int // #841: each class's known population
+	memFit int            // -1 until the pass's first decision measured the memory side
 }
 
 func newLearnedPass() *learnedPass {
-	return &learnedPass{wUnits: map[string]int{}, rUnits: map[string]int{}, memFit: -1}
+	return &learnedPass{wUnits: map[string]int{}, rUnits: map[string]int{}, pop: map[string]int{}, memFit: -1}
 }
 
 // splitLearned returns targets without the learned ones, and the learned ones.
@@ -548,6 +560,7 @@ func (lp *learnedPass) note(learned []seedTarget, isWidget bool) {
 		} else {
 			lp.rUnits[learnedKey(c)]++
 		}
+		lp.pop[learnedKey(c)] = c.Population
 	}
 }
 
@@ -558,7 +571,7 @@ func (lp *learnedPass) note(learned []seedTarget, isWidget bool) {
 // decisions in the pass reuse it, so the cells the pass itself wrote are not
 // charged again.
 func (lp *learnedPass) decide(baseW, baseR int, preLatchBudget time.Duration, hasBackstop bool) learnedDecision {
-	d := decideLearnedAdmission(newLearnedPlan(lp.wUnits, lp.rUnits, baseW, baseR), preLatchBudget, hasBackstop, lp.memFit)
+	d := decideLearnedAdmission(newLearnedPlan(lp.wUnits, lp.rUnits, lp.pop, baseW, baseR), preLatchBudget, hasBackstop, lp.memFit)
 	lp.memFit = d.memFit
 	return d
 }
@@ -681,7 +694,7 @@ type residentLearnedPlan struct {
 }
 
 func planFromResident(units []residentUnit) residentLearnedPlan {
-	wUnits, rUnits := map[string]int{}, map[string]int{}
+	wUnits, rUnits, pop := map[string]int{}, map[string]int{}, map[string]int{}
 	baseW, baseR := 0, 0
 	rp := residentLearnedPlan{widgetReqs: map[string][]reseedRequest{}, raReqs: map[string][]reseedRequest{}}
 	for _, u := range units {
@@ -693,16 +706,18 @@ func planFromResident(units []residentUnit) residentLearnedPlan {
 				baseR++
 			case u.isWidget:
 				k := learnedKey(c)
+				pop[k] = c.Population
 				wUnits[k]++
 				rp.widgetReqs[k] = append(rp.widgetReqs[k], u.request(c))
 			default:
 				k := learnedKey(c)
+				pop[k] = c.Population
 				rUnits[k]++
 				rp.raReqs[k] = append(rp.raReqs[k], u.request(c))
 			}
 		}
 	}
-	rp.plan = newLearnedPlan(wUnits, rUnits, baseW, baseR)
+	rp.plan = newLearnedPlan(wUnits, rUnits, pop, baseW, baseR)
 	return rp
 }
 
@@ -867,6 +882,7 @@ func seedTargetFromPrewarm(t cache.PrewarmTarget) seedTarget {
 		Groups:            append([]string(nil), t.Subject.Groups...),
 		CollapsedBindings: t.CollapsedBindings,
 		Learned:           t.Learned,
+		Population:        t.Population,
 	}
 }
 
