@@ -162,6 +162,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// #710 PR-2a — the content-fill admission gate reads the shared ceiling and
 	// live-heap sampler (runtime reads, no cache state).
 	"AdmissionCeiling": readOnly443, "AdmissionLiveHeapSample": readOnly443,
+	// #844 — the external conversion memo's byte budget: the same runtime reads.
+	// (The memo itself lives in restactions/api, not here; it stores only a pure
+	// function of the bytes an inert resolve's own live fetch returned.)
+	"ExternalFetchCacheBudget": readOnly443,
 	// The admission predictor's partition count: index keys under rw.mu read.
 	"ResourceWatcher.PartitionLen": readOnly443,
 	// #710 PR-2b — the D2 stale serve. The sink and the mark are request-scoped
