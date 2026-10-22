@@ -103,6 +103,10 @@ def test_route_clicks_start_only_after_the_users_first_load(tmp_path):
     checks = {c["check"]: c for c in k6eval.k6_checks(o)}
     for sc in ("navigate", "composite_burst"):
         assert checks[f"k6.late_arrivals[{sc}]"]["result"] == "PASS", checks
+        assert checks[f"k6.late_clicks[{sc}]"]["result"] == "PASS", checks
+    # every click the fixture saw is one counted click
+    nav_clicks = sum(1 for u in cfg["navUserIds"] for r in reqs[u] if r["path"].startswith("/route"))
+    assert m["clicks{scenario:navigate}"]["count"] == nav_clicks
     assert checks["k6.composite_burst_complete"]["result"] == "PASS", checks
     rep = k6eval.k6_report(o)
     assert rep["clicks_deferred"]["navigate"] >= len(cfg["navUserIds"])
@@ -115,7 +119,8 @@ def test_route_clicks_start_only_after_the_users_first_load(tmp_path):
 # ─── the arrival checks, on summaries ───────────────────────────────────────
 
 
-def _summary(arrived, late, *, nav=4, burst=2, burst_arrived=2, burst_first=2):
+def _summary(arrived, late, *, nav=4, burst=2, burst_arrived=2, burst_first=2,
+             clicks=40, clicks_late=0, clicks_open=50):
     m = {"page_loads": {"count": 0}, "http_req_failed": {"rate": 0.0},
          "route_table_mismatch": {"count": 0},
          "iterations{scenario:navigate}": {"count": arrived},
@@ -125,6 +130,12 @@ def _summary(arrived, late, *, nav=4, burst=2, burst_arrived=2, burst_first=2):
          "arrivals{scenario:composite_burst}": {"count": burst_arrived},
          "arrivals_late{scenario:composite_burst}": {"count": 0},
          "first_loads{scenario:composite_burst}": {"count": burst_first},
+         "clicks{scenario:navigate}": {"count": clicks},
+         "clicks_late{scenario:navigate}": {"count": clicks_late},
+         "clicks_open_schedule{scenario:navigate}": {"count": clicks_open},
+         "clicks{scenario:composite_burst}": {"count": 6},
+         "clicks_late{scenario:composite_burst}": {"count": 0},
+         "clicks_open_schedule{scenario:composite_burst}": {"count": 8},
          # the burst users click too: their page loads are more than their deep links
          "page_loads{scenario:composite_burst}": {"count": burst_first + 7}}
     return {"kind": "k6_summary", "config": {"navUsers": nav, "burstUsers": burst}, "metrics": m}
@@ -141,6 +152,8 @@ def test_every_user_arrived_on_time_passes():
     assert c["k6.late_arrivals[navigate]"]["result"] == "PASS"
     assert c["k6.late_arrivals[composite_burst]"]["result"] == "PASS"
     assert c["k6.composite_burst_complete"]["result"] == "PASS"
+    assert c["k6.late_clicks[navigate]"]["result"] == "PASS"
+    assert c["k6.late_clicks[navigate]"]["value"] == 0.0
     # per-vu sessions never drop: the arrival check replaces the dropped one
     assert not any(k.startswith("k6.dropped_iterations") for k in c)
 
@@ -159,3 +172,23 @@ def test_a_user_who_never_arrived_is_invalid():
 def test_the_burst_counts_its_deep_links_not_its_clicks():
     c = _checks(_summary(4, 0, burst_first=1))["k6.composite_burst_complete"]
     assert c["result"] == "FAIL" and c["value"] == 1
+
+
+def test_late_clicks_are_invalid():
+    """#839 gate: a starved k6 clicking late lowers the offered load; it is
+    counted and gated like a late arrival."""
+    c = _checks(_summary(4, 0, clicks=40, clicks_late=1))["k6.late_clicks[navigate]"]
+    assert c["result"] == "FAIL" and c["value"] == 0.025
+    assert "1 of 40 navigate route clicks started more than 1 s after their intended time" in c["why"]
+
+
+def test_no_click_at_all_is_invalid():
+    c = _checks(_summary(4, 0, clicks=0, clicks_open=50))["k6.late_clicks[navigate]"]
+    assert c["result"] == "FAIL" and "no navigate route click ran" in c["why"]
+
+
+def test_the_report_gives_the_achieved_click_rate():
+    o = {"summary": _summary(4, 0, clicks=40, clicks_late=2, clicks_open=50), "points": {}}
+    rep = k6eval.k6_report(o)
+    assert rep["clicks"]["navigate"] == {"done": 40, "late": 2, "open_schedule": 50,
+                                         "achieved_share_of_open_schedule": 0.8}

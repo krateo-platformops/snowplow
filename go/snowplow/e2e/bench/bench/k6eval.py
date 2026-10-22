@@ -269,6 +269,22 @@ def k6_checks(o: dict | None, th: dict | None = None) -> list[dict]:
         out.append({"check": f"k6.late_arrivals[{sc}]", "value": value,
                     "bar": f"<= {th['max_dropped_share']} late, all {want} arrived",
                     "result": "FAIL" if why else "PASS", **({"why": "; ".join(why)} if why else {})})
+        # #839 gate: a click is closed-loop (previous page end + THINK_S); one
+        # that started more than 1 s after that is k6 falling behind, which
+        # would otherwise just lower the offered load
+        clicks = _metric(s, f"clicks{{scenario:{sc}}}", "count") or 0
+        clate = _metric(s, f"clicks_late{{scenario:{sc}}}", "count") or 0
+        open_ = _metric(s, f"clicks_open_schedule{{scenario:{sc}}}", "count") or 0
+        cval = round(clate / clicks, 5) if clicks else None
+        cwhy = (f"{clate} of {clicks} {sc} route clicks started more than 1 s after their "
+                f"intended time (previous page end + think time): the load generator, not "
+                f"snowplow, fell behind and the offered load dropped"
+                if clicks and cval > th["max_dropped_share"] else
+                f"no {sc} route click ran, though the run had time for {open_}"
+                if not clicks and open_ else None)
+        out.append({"check": f"k6.late_clicks[{sc}]", "value": cval,
+                    "bar": f"<= {th['max_dropped_share']} of the clicks late",
+                    "result": "FAIL" if cwhy else "PASS", **({"why": cwhy} if cwhy else {})})
     for sc in scenarios:
         if sc == "composite_burst" or f"arrivals{{scenario:{sc}}}" in (s.get("metrics") or {}):
             continue                     # per-vu-iterations never drops: arrivals above
@@ -468,6 +484,14 @@ def _by(points, *keys):
             for k, v in sorted(g.items(), key=lambda kv: tuple(str(x) for x in kv[0]))}
 
 
+def _clicks(summary: dict, sc: str) -> dict:
+    done = _metric(summary, f"clicks{{scenario:{sc}}}", "count") or 0
+    open_ = _metric(summary, f"clicks_open_schedule{{scenario:{sc}}}", "count") or 0
+    return {"done": done, "late": _metric(summary, f"clicks_late{{scenario:{sc}}}", "count") or 0,
+            "open_schedule": open_,
+            "achieved_share_of_open_schedule": round(done / open_, 4) if open_ else None}
+
+
 def k6_report(o: dict | None) -> dict | None:
     """k6's page and call timings, reported beside the browser's (not gated)."""
     if o is None:
@@ -485,6 +509,12 @@ def k6_report(o: dict | None) -> dict | None:
                 for k, v in ((o["summary"] or {}).get("metrics") or {}).items()
                 if k.startswith("clicks_deferred{scenario:")},
             "arrival_lag_ms": ((o["summary"] or {}).get("metrics") or {}).get("arrival_lag_ms"),
+            "click_lag_ms": ((o["summary"] or {}).get("metrics") or {}).get("click_lag_ms"),
+            # achieved route clicks vs run 11's open schedule (one per THINK_S
+            # from the arrival): how much offered load the SPA-like clicks
+            # leave, to compare run 12's load with run 11's
+            "clicks": {sc: _clicks(o["summary"], sc) for sc in ("navigate", "composite_burst")
+                       if _metric(o["summary"], f"clicks{{scenario:{sc}}}", "count") is not None},
             "summary": (o["summary"] or {}).get("metrics")}
 
 

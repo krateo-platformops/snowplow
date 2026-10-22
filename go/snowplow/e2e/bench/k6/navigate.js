@@ -59,6 +59,16 @@ const ARRIVALS_LATE = new Counter('arrivals_late')     // ... more than LATE_MS 
 const ARRIVAL_LAG = new Trend('arrival_lag_ms', true)
 const FIRST_LOADS = new Counter('first_loads')         // first loads recorded (per scenario)
 const CLICKS_DEFERRED = new Counter('clicks_deferred')
+// #839 gate: the clicks are closed-loop (previous page end + THINK_S), so a
+// starved k6 would just click later and the load would quietly drop — run
+// 10's hidden lag, moved into the clicks. Each click's lag against its
+// intended time is measured after the sleep; late ones are counted and gated.
+const CLICKS = new Counter('clicks')
+const CLICKS_LATE = new Counter('clicks_late')
+const CLICK_LAG = new Trend('click_lag_ms', true)
+// what the open schedule (one click per THINK_S from the arrival slot, run
+// 11) would have clicked by the run's end: the achieved click rate's yardstick
+const CLICKS_OPEN = new Counter('clicks_open_schedule')
 const LATE_MS = 1000
 
 const NAV = CFG.navUserIds
@@ -95,7 +105,7 @@ if (BURST.length > 0) {
 const thresholds = {}
 for (const s of Object.keys(scenarios)) {
   for (const m of ['iterations', 'page_loads', 'arrivals', 'arrivals_late', 'first_loads',
-    'clicks_deferred']) {
+    'clicks_deferred', 'clicks', 'clicks_late', 'clicks_open_schedule']) {
     thresholds[`${m}{scenario:${s}}`] = ['count>=0']
   }
 }
@@ -198,6 +208,7 @@ function routeClick (user, visit, firstPath) {
 function session (user, slotMs, endMs, deepLink, firstPath) {
   const wait = slotMs - Date.now()
   if (wait > 0) sleep(wait / 1000)
+  // against the wall-clock slot: a VU that started, or woke, late is late
   const lag = Math.max(0, Date.now() - slotMs)
   ARRIVALS.add(1)
   ARRIVAL_LAG.add(lag)
@@ -209,37 +220,41 @@ function session (user, slotMs, endMs, deepLink, firstPath) {
   // first load: a browser cannot click a page it does not have yet
   const deferred = Math.max(0, Math.ceil((Math.min(loaded, endMs) - slotMs) / thinkMs) - 1)
   if (deferred > 0) CLICKS_DEFERRED.add(deferred)
+  CLICKS_OPEN.add(Math.max(0, Math.ceil((endMs - slotMs) / thinkMs) - 1))
   let next = loaded + thinkMs
   for (let visit = 1; next < endMs; visit++) {
     sleep(Math.max(0, next - Date.now()) / 1000)
+    const clickLag = Math.max(0, Date.now() - next)
+    CLICKS.add(1)
+    CLICK_LAG.add(clickLag)
+    if (clickLag > LATE_MS) CLICKS_LATE.add(1)
     routeClick(user, visit, firstPath)
     next = Date.now() + thinkMs
   }
 }
 
-function runEndMs () {
-  return exec.scenario.startTime + (CFG.durationS - (exec.scenario.name === 'composite_burst'
-    ? CFG.burstAtS : 0)) * 1000
-}
-
-export function navigate () {
+// Every slot is anchored to ONE start, setup's end (the scenarios start right
+// after it): a burst scenario that k6 started late cannot read its own late
+// start as time zero (#839 gate).
+export function navigate (data) {
   // per-vu-iterations, 1 each: iterationInTest is 0..NAV-1, one per user;
   // the first loads arrive spread over the first THINK_S, as before
   const i = exec.scenario.iterationInTest
-  session(NAV[i], exec.scenario.startTime + i * 1000 / navRate, runEndMs(), null,
+  session(NAV[i], data.t0 + i * 1000 / navRate, data.t0 + CFG.durationS * 1000, null,
           CFG.routes[0].path)
 }
 
-export function compositeBurst () {
-  // all at BURST_AT_S (the scenario's start), each deep-linking to a composite route
+export function compositeBurst (data) {
+  // all at BURST_AT_S, each deep-linking to a composite route
   const i = exec.scenario.iterationInTest
   const route = CFG.compositeRoutes[i % CFG.compositeRoutes.length]
-  session(BURST[i], exec.scenario.startTime, runEndMs(), route, route)
+  session(BURST[i], data.t0 + CFG.burstAtS * 1000, data.t0 + CFG.durationS * 1000, route, route)
 }
 
 export function setup () {
   FRAME.add(1, { frame: 'start' })
   feed({ kind: 'feed_start', t: Date.now() / 1000 })
+  return { t0: Date.now() }
 }
 export function teardown () {
   FRAME.add(1, { frame: 'end' })
@@ -249,7 +264,7 @@ export function teardown () {
 export function handleSummary (data) {
   const keep = {}
   for (const [name, m] of Object.entries(data.metrics)) {
-    if (/^(page_load_ms|page_loads|page_calls|page_errors|first_load_failed|route_table_mismatch|bench_frame|dropped_iterations|iterations|arrivals|arrivals_late|arrival_lag_ms|first_loads|clicks_deferred|http_reqs|http_req_failed|http_req_duration|http_req_blocked|vus_max)(\{|$)/.test(name)) {
+    if (/^(page_load_ms|page_loads|page_calls|page_errors|first_load_failed|route_table_mismatch|bench_frame|dropped_iterations|iterations|arrivals|arrivals_late|arrival_lag_ms|first_loads|clicks_deferred|clicks|clicks_late|click_lag_ms|clicks_open_schedule|http_reqs|http_req_failed|http_req_duration|http_req_blocked|vus_max)(\{|$)/.test(name)) {
       keep[name] = m.values
     }
   }
