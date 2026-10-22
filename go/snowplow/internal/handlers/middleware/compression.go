@@ -26,6 +26,14 @@
 // http.Flusher. This is the ONE exclusion list; it is applied generically by
 // content-type, not per-route, so any future SSE endpoint inherits it by
 // setting Content-Type: text/event-stream.
+//
+// GZIP ONLY, NO ZSTD (#838): starting with klauspost/compress 1.18.7, gzhttp
+// enables zstd by default and prefers it whenever the client accepts both at
+// the same qvalue. Every browser sends "gzip, deflate, br, zstd", so the
+// default would move every portal /call response from gzip to zstd, and a
+// zstd-only client from identity to zstd. EnableZstd(false) keeps the wire
+// encoding as it was before the bump. Adopting zstd is a separate decision
+// that needs its own bench comparison; it does not ride a dependency bump.
 package middleware
 
 import (
@@ -41,13 +49,15 @@ const sseContentType = "text/event-stream"
 
 // Gzip returns an http.Handler that wraps h with Accept-Encoding-gated gzip
 // compression, excluding text/event-stream so the SSE stream keeps its
-// incremental-flush semantics. The gzhttp wrapper is constructed once at wire
+// incremental-flush semantics. zstd is disabled, so gzip is the only encoding
+// ever negotiated (see the GZIP ONLY note above). The gzhttp wrapper is constructed once at wire
 // time; NewWrapper only errors on invalid options (a static, tested option
 // set here), so a construction failure is a programmer error and panics
 // rather than silently shipping an uncompressed server.
 func Gzip(h http.Handler) http.Handler {
 	wrapper, err := gzhttp.NewWrapper(
 		gzhttp.ExceptContentTypes([]string{sseContentType}),
+		gzhttp.EnableZstd(false),
 	)
 	if err != nil {
 		panic("middleware.Gzip: gzhttp.NewWrapper: " + err.Error())
