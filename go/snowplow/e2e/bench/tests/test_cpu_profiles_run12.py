@@ -387,3 +387,48 @@ def test_k6_point_times_become_page_load_starts(tmp_path):
     ((t, ms, tags),) = k6eval.k6_page_loads(o)
     assert t == pytest.approx(1792662341.0 - 0.5, abs=1e-3) and ms == 500.0
     assert k6eval.epoch("not a time") is None
+
+
+def test_gc_over_time_reports_pause_p95_max_and_gc_cpu_fraction_per_minute():
+    rows = [{"kind": "mem", "t": 0.0, "gc_pauses_ms": [1.0, 3.0], "gc_cpu_fraction": 0.01,
+             "heap_alloc_mb": 100.0, "next_gc_mb": 200.0},
+            {"kind": "mem", "t": 30.0, "gc_pauses_ms": [float(x) for x in range(2, 21)],
+             "gc_cpu_fraction": 0.02,
+             "heap_alloc_mb": 150.0, "next_gc_mb": 210.0},
+            {"kind": "mem", "t": 75.0, "gc_pauses_ms": [], "gc_cpu_fraction": 0.03,
+             "heap_alloc_mb": 90.0, "next_gc_mb": 180.0}]
+    rep = load606.gc_sched_report(rows, None)
+    assert rep["over_time"] == [
+        {"t": 0.0, "gcs": 21, "pause_p95_ms": 19.0, "pause_max_ms": 20.0, "gc_cpu_fraction": 0.02,
+         "heap_alloc_mb_max": 150.0, "next_gc_mb_max": 210.0},
+        {"t": 60.0, "gcs": 0, "pause_p95_ms": None, "pause_max_ms": None,
+         "gc_cpu_fraction": 0.03, "heap_alloc_mb_max": 90.0, "next_gc_mb_max": 180.0}]
+
+
+def test_a_sample_records_the_memstats_the_gc_report_reads():
+    """NumGC, NextGC, HeapAlloc, PauseTotalNs, GCCPUFraction and the PauseNs ring."""
+    class S(SampleSnow):
+        def get(self, path, token):
+            r = super().get(path, token)
+            if path == "/debug/vars":
+                v = json.loads(r.body)
+                v["memstats"].update(HeapAlloc=3 * 1048576, NextGC=8 * 1048576)
+                return load606.Response(200, json.dumps(v).encode(), 1)
+            return r
+    r = load606.mem_sample(S(), TOKEN, (), prev_num_gc=2)
+    assert (r["num_gc"], r["heap_alloc_mb"], r["next_gc_mb"]) == (3, 3.0, 8.0)
+    assert (r["gc_pause_total_ms"], r["gc_cpu_fraction"], r["gc_pauses_ms"]) == (7.5, 0.02, [4.5])
+
+
+def test_the_default_plan_profiles_t0_30_60_120_and_the_burst_at_900(tmp_path):
+    """The schedule the lead asked for: the storm back to back from t=0 (0,
+    30, 60, ..., 120, ...), and the composite burst at t=900 covered from 840
+    to 1140."""
+    plan = load606.CpuPlan(burst_at_s=900)                 # every other field: the default
+    n, recs = _profile(tmp_path, plan=plan, until=1800)
+    starts = [r["t_start"] for r in recs if r["profile"]]
+    for t in (0, 30, 60, 120):
+        assert any(abs(s - t) < 2 for s in starts), (t, starts[:6])
+    burst = [r for r in recs if r["window"] == "burst"]
+    assert burst[0]["t_start"] <= 840 + 30 and burst[-1]["t_end"] >= 1140
+    assert any(r["t_start"] <= 900 < r["t_end"] for r in recs)

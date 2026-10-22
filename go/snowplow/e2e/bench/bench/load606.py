@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import concurrent.futures
 import gzip
 import json
@@ -1515,6 +1516,59 @@ def job_pod_records(pod_list: dict, job: str) -> list[dict]:
     return out
 
 
+# A driver pod that never starts (#834 review): a native sidecar whose
+# startupProbe never passes is restarted forever and holds its pod in Init
+# (phase Pending, not Failed), as does a pod no node takes. The driver wait
+# fails on it at once, with the reason, instead of at MEASURE_WAIT_S.
+#   DRIVER_PENDING_S  a pod still Pending this long after it was created.
+#                     Run 11's k6 login initContainer took ~70 s for 1,000
+#                     users (driver-k6load-lj2bw.log); image pulls on a new
+#                     node add a few minutes.
+#   DRIVER_INIT_RESTARTS  an init container (the sidecar) restarted this
+#                     often while the pod is still Pending: each restart is a
+#                     startup that failed for its whole probe budget.
+DRIVER_PENDING_S = 600
+DRIVER_INIT_RESTARTS = 2
+
+
+def _ts(s: str | None) -> float | None:
+    try:
+        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")) if s else None
+    except ValueError:
+        return None
+
+
+def driver_pod_stuck(pod_list: dict, now: float, *, pending_s: float = DRIVER_PENDING_S,
+                     init_restarts: int = DRIVER_INIT_RESTARTS) -> str | None:
+    """Why a driver Job's pod will not start, or None. Reasons only (enum-like
+    states and counts), never a container's message."""
+    for p in pod_list.get("items") or []:
+        st = p.get("status") or {}
+        if st.get("phase") != "Pending":
+            continue
+        name = (p.get("metadata") or {}).get("name")
+        for cs in st.get("initContainerStatuses") or []:
+            n = cs.get("restartCount", 0)
+            if n >= init_restarts:
+                last = _termination(cs.get("lastState"))
+                return (f"pod {name} is still Pending and its init container {cs.get('name')} "
+                        f"restarted {n} times" + (f" (last: {last['reason']}, exit "
+                                                  f"{last['exit_code']})" if last else "")
+                        + ": a sidecar whose startupProbe never passes, or a crashing init step")
+        created = _ts((p.get("metadata") or {}).get("creationTimestamp"))
+        if created is not None and now - created >= pending_s:
+            sched = next((c for c in st.get("conditions") or []
+                          if c.get("type") == "PodScheduled" and c.get("status") != "True"), None)
+            waiting = [f"{cs.get('name')} {((cs.get('state') or {}).get('waiting') or {}).get('reason')}"
+                       for cs in (st.get("initContainerStatuses") or [])
+                       + (st.get("containerStatuses") or [])
+                       if (cs.get("state") or {}).get("waiting")]
+            return (f"pod {name} is still Pending {int(now - created)} s after it was created"
+                    + (f" (unscheduled: {sched.get('reason')})" if sched else "")
+                    + (f" (waiting: {', '.join(waiting)})" if waiting else ""))
+    return None
+
+
 def job_pod_checks(recs: list[dict]) -> list[dict]:
     """A validity check per in-cluster Job pod: one whose container died
     (non-zero exit, a restart, phase Failed) makes the run INVALID, and the
@@ -1759,6 +1813,35 @@ def _pauses(rows: list[dict]) -> dict | None:
              "p99_ms": pct(ps, 99), "max_ms": max(ps)} if ps else None)
 
 
+GC_BUCKET_S = 60
+
+
+def gc_over_time(rows: list[dict], bucket_s: float = GC_BUCKET_S) -> list[dict]:
+    """Per minute of the run: the GC pauses' p95 / max, how many GCs, the
+    GC CPU fraction at the minute's last sample (Go's GCCPUFraction is
+    cumulative since the process started: its slope is the minute's share),
+    heap allocated and the next GC target at their peak."""
+    if not rows:
+        return []
+    t0 = rows[0]["t"]
+    buckets: dict[int, list[dict]] = {}
+    for r in rows:
+        buckets.setdefault(int((r["t"] - t0) // bucket_s), []).append(r)
+    out = []
+    for k in sorted(buckets):
+        b = buckets[k]
+        ps = [x for r in b for x in (r.get("gc_pauses_ms") or [])]
+        frac = [r["gc_cpu_fraction"] for r in b if r.get("gc_cpu_fraction") is not None]
+        heap = [r["heap_alloc_mb"] for r in b if r.get("heap_alloc_mb") is not None]
+        nxt = [r["next_gc_mb"] for r in b if r.get("next_gc_mb") is not None]
+        out.append({"t": t0 + k * bucket_s, "gcs": len(ps),
+                    "pause_p95_ms": pct(ps, 95), "pause_max_ms": max(ps) if ps else None,
+                    "gc_cpu_fraction": frac[-1] if frac else None,
+                    "heap_alloc_mb_max": max(heap) if heap else None,
+                    "next_gc_mb_max": max(nxt) if nxt else None})
+    return out
+
+
 def gc_sched_report(mem: list[dict], win: dict | None) -> dict | None:
     """GC pause distribution, GC CPU share and goroutines from the mem
     samples (each sample carries the pauses since the previous one), by
@@ -1781,6 +1864,7 @@ def gc_sched_report(mem: list[dict], win: dict | None) -> dict | None:
     return {"gc_pauses": {k: _pauses(v) for k, v in phases.items()},
             "gc_pauses_lost": sum(int(r.get("gc_pauses_lost") or 0) for r in rows),
             "gc_cpu_fraction_last": frac[-1] if frac else None,
+            "over_time": gc_over_time(rows),
             "goroutines": {k: ({"p50": pct(v, 50), "max": max(v)} if v else None)
                            for k, v in gor.items()},
             "sched_latencies": (sched[-1] if sched else
@@ -1902,6 +1986,7 @@ RUN8_VARS_PREFIXES = (
     # cache/prewarm_complete_metric.go, dispatchers/prewarm_engine_metrics.go,
     # dispatchers/phase1_walk_pagination_metrics.go, phase1_readiness_exit.go)
     "snowplow_learned_classes",
+    "snowplow_learned_clientconfig_secrets",   # the learned-classes alarm's denominator
     "snowplow_prewarm_complete",
     "snowplow_phase1_units",
     "snowplow_phase1_readiness_exit",
@@ -4290,6 +4375,19 @@ def _cmd_memwatch(a) -> int:
     return 0
 
 
+def _cmd_driver_stuck(a) -> int:
+    try:
+        pods = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return 0                         # an unreadable listing proves nothing
+    why = driver_pod_stuck(pods, time.time(), pending_s=a.pending_s,
+                           init_restarts=a.init_restarts)
+    if why:
+        print(why)
+        return 1
+    return 0
+
+
 def _cmd_pod_record(a) -> int:
     print(json.dumps(pod_record(json.loads(sys.stdin.read() or "{}"), a.phase)))
     return 0
@@ -4470,6 +4568,11 @@ def main(argv: list[str] | None = None) -> int:
     mw.add_argument("--burst-at-s", type=float, default=None,
                     help="the composite burst, seconds after the load is seen")
     mw.set_defaults(func=_cmd_memwatch)
+    ds = sub.add_parser("driver-stuck", help="kubectl get pods -l job-name=<job> -o json on "
+                        "stdin -> exit 1 + the reason when a driver pod will not start")
+    ds.add_argument("--pending-s", type=float, default=DRIVER_PENDING_S)
+    ds.add_argument("--init-restarts", type=int, default=DRIVER_INIT_RESTARTS)
+    ds.set_defaults(func=lambda a: _cmd_driver_stuck(a))
     jp = sub.add_parser("job-pod-record",
                         help="kubectl get pods -l job-name=<job> -o json on stdin -> job_pod records")
     jp.add_argument("--job", required=True)

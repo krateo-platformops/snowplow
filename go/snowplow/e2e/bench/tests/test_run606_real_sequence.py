@@ -343,6 +343,18 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             # an in-cluster Job's pod (#817): lingering, or OOMKilled when
             # FAKE_DRIVER_POD_DEATH=1 and it is the driver's
             job = next(x for x in a if x.startswith("job-name=")).split("=", 1)[1]
+            if os.environ.get("FAKE_DRIVER_STUCK") == job:
+                # a native sidecar whose startupProbe never passes: Init, restarting
+                items([{"metadata": {"name": f"{job}-0", "creationTimestamp": "2026-10-22T09:45:18Z"},
+                        "status": {"phase": "Pending",
+                                   "initContainerStatuses": [{"name": "forward", "ready": False,
+                                       "restartCount": 3, "started": False,
+                                       "state": {"running": {}},
+                                       "lastState": {"terminated": {"reason": "Error",
+                                                                    "exitCode": 137}}}],
+                                   "containerStatuses": [{"name": "browser", "ready": False,
+                                       "restartCount": 0,
+                                       "state": {"waiting": {"reason": "PodInitializing"}}}]}}])
             dead = job == "load606" and os.environ.get("FAKE_DRIVER_POD_DEATH") == "1"
             state = ({"terminated": {"reason": "OOMKilled", "exitCode": 137,
                                      "finishedAt": "2026-10-21T06:40:00Z"}}
@@ -408,7 +420,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print("pod/" + next(x for x in a if x.startswith("job-name=")).split("=")[1] + "-0")
             sys.exit(0)
         if what in ("job/k6load", "job/k6browser"):
-            print("1//1"); sys.exit(0)
+            busy = (os.environ.get("FAKE_DRIVER_STUCK"), os.environ.get("FAKE_DRIVER_RUNNING"))
+            print("0//1" if what[4:] in busy else "1//1")
+            sys.exit(0)
         if what == "pods" and "job-name=fresh606" in a:
             print("pod/fresh606-0"); sys.exit(0)
         if what == "pods" and "job-name=mem606" in a:

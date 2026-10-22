@@ -245,9 +245,33 @@ def k6_checks(o: dict | None, th: dict | None = None) -> list[dict]:
     s = o["summary"]
     scenarios = sorted({k.split("scenario:", 1)[1].rstrip("}")
                         for k in (s.get("metrics") or {}) if k.startswith("iterations{scenario:")})
+    cfg = s.get("config") or {}
+    # run 12: one VU per user (navigate.js session); a user's arrival is on
+    # an open schedule, a start later than LATE_MS is counted and every user
+    # must have arrived. Arrival-rate scenarios (run 11's streams) are judged
+    # by their dropped iterations, below.
+    users = {"navigate": cfg.get("navUsers"), "composite_burst": cfg.get("burstUsers")}
     for sc in scenarios:
-        if sc == "composite_burst":
-            continue                     # per-vu-iterations never drops: completeness below
+        if f"arrivals{{scenario:{sc}}}" not in (s.get("metrics") or {}):
+            continue
+        arrived = _metric(s, f"arrivals{{scenario:{sc}}}", "count") or 0
+        late = _metric(s, f"arrivals_late{{scenario:{sc}}}", "count") or 0
+        want = users.get(sc) or 0
+        value = round(late / arrived, 5) if arrived else None
+        why = []
+        if arrived < want:
+            why.append(f"only {arrived} of {want} {sc} users arrived: the others' sessions never "
+                       f"started")
+        if value is None or value > th["max_dropped_share"]:
+            why.append(f"{late} of {arrived} {sc} first loads started more than 1 s after their "
+                       f"arrival slot: the load generator, not snowplow, fell behind"
+                       if arrived else f"no {sc} user arrived: that load never ran")
+        out.append({"check": f"k6.late_arrivals[{sc}]", "value": value,
+                    "bar": f"<= {th['max_dropped_share']} late, all {want} arrived",
+                    "result": "FAIL" if why else "PASS", **({"why": "; ".join(why)} if why else {})})
+    for sc in scenarios:
+        if sc == "composite_burst" or f"arrivals{{scenario:{sc}}}" in (s.get("metrics") or {}):
+            continue                     # per-vu-iterations never drops: arrivals above
         done = _metric(s, f"iterations{{scenario:{sc}}}", "count") or 0
         dropped = _metric(s, f"dropped_iterations{{scenario:{sc}}}", "count") or 0
         scheduled = done + dropped
@@ -263,7 +287,11 @@ def k6_checks(o: dict | None, th: dict | None = None) -> list[dict]:
     if burst:
         # every burst user's deep link ran to a recorded page load; one cut
         # by the scenario's maxDuration, or never started, is missing here
-        loads = _metric(s, "page_loads{scenario:composite_burst}", "count") or 0
+        # (run 12's burst users also click: count their first loads only)
+        key = ("first_loads{scenario:composite_burst}"
+               if "first_loads{scenario:composite_burst}" in (s.get("metrics") or {})
+               else "page_loads{scenario:composite_burst}")
+        loads = _metric(s, key, "count") or 0
         ok = loads == burst
         out.append({"check": "k6.composite_burst_complete", "value": loads, "bar": f"== {burst}",
                     "result": "PASS" if ok else "FAIL",
@@ -450,6 +478,13 @@ def k6_report(o: dict | None) -> dict | None:
             "call_ms_by_level": _by(p.get("http_req_duration", []), "level"),
             "first_load_failed": sum(v for v, _ in p.get("first_load_failed", [])),
             "page_errors": sum(v for v, _ in p.get("page_errors", [])),
+            # run 12: route clicks the open schedule would have started while
+            # the user's first load still ran (navigate.js defers them)
+            "clicks_deferred": {
+                k.split("scenario:", 1)[1].rstrip("}"): v.get("count")
+                for k, v in ((o["summary"] or {}).get("metrics") or {}).items()
+                if k.startswith("clicks_deferred{scenario:")},
+            "arrival_lag_ms": ((o["summary"] or {}).get("metrics") or {}).get("arrival_lag_ms"),
             "summary": (o["summary"] or {}).get("metrics")}
 
 

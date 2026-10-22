@@ -710,17 +710,9 @@ def test_k6_config_drives_every_identity_once():
     assert burst == list(range(801, 1001)) and len(nav) == 795
     assert not set(nav) & set(burst) and not {1, 20, 11, 12, 13} & set(nav)
     assert len(nav) + len(burst) + 5 == 1000
-    # #831 gate M3: arrival rate (795 / 60 s) x run 10's p99 first load (88.1 s) x 1.2,
-    # all pre-allocated, never fewer than the navigating users
     assert cfg["snowplowUrl"] == "http://snowplow:8081"
-    assert cfg["preAllocatedVUs"] == cfg["maxVUs"] == 1401 >= len(nav)
-    # k6 refuses preAllocatedVUs > maxVUs (the kind proof's first run, rc 104)
-    small = k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
-                             routes=_routes(), users=60, burst_users=10, think_s=5,
-                             duration_s=1, burst_at_s=1, composite_routes=["/dashboard"],
-                             browser_users=[1, 2, 3])
-    assert small["preAllocatedVUs"] == small["maxVUs"] == 994
-    assert small["maxVUs"] >= len(small["navUserIds"])
+    # run 12: one VU per user (navigate.js sessions), no arrival-rate VU pool
+    assert "maxVUs" not in cfg and "preAllocatedVUs" not in cfg
     with pytest.raises(ValueError, match="outside the burst"):
         k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
                          routes=_routes(), users=1000, burst_users=200, think_s=60,
@@ -1159,7 +1151,8 @@ def test_mem606_captures_prewarm_and_learned_identity_counters():
     p = subprocess.run([sys.executable, "-m", "bench.load606", "prefixes"], capture_output=True,
                        text=True, cwd=BENCH_DIR, check=True)
     got = p.stdout.split()
-    for pre in ("snowplow_learned_classes", "snowplow_prewarm_complete", "snowplow_phase1_units",
+    for pre in ("snowplow_learned_classes", "snowplow_learned_clientconfig_secrets",
+                "snowplow_prewarm_complete", "snowplow_phase1_units",
                 "snowplow_phase1_readiness_exit", "snowplow_prewarm_engine"):
         assert pre in got, pre
     assert subprocess.run([sys.executable, "-m", "bench.load606", "check-prefixes", *got],
@@ -1420,6 +1413,7 @@ _K6_STUBS = {
     "execution.js": "export default { scenario: {} }\n",
     "data.js": "export class SharedArray { constructor (n, f) { return f() } }\n",
     "metrics.js": "export class Counter { add () {} }\nexport class Trend { add () {} }\n",
+    "index.js": "export function sleep () {}\n",
 }
 
 
@@ -1431,7 +1425,7 @@ def test_navigate_js_options_under_node(tmp_path):
     pkg.mkdir(parents=True)
     (pkg / "package.json").write_text(json.dumps({
         "name": "k6", "type": "module",
-        "exports": {f"./{n[:-3]}": f"./{n}" for n in _K6_STUBS}}))
+        "exports": {("." if n == "index.js" else f"./{n[:-3]}"): f"./{n}" for n in _K6_STUBS}}))
     for n, src in _K6_STUBS.items():
         (pkg / n).write_text(src)
     for n in ("navigate.js", "spa.js"):
@@ -1455,10 +1449,15 @@ def test_navigate_js_options_under_node(tmp_path):
     o = json.loads(p.stdout)
     assert o["batchPerHost"] == 6
     nav = o["scenarios"]["navigate"]
-    assert nav["executor"] == "constant-arrival-rate"
-    assert nav["preAllocatedVUs"] == nav["maxVUs"] == cfg["maxVUs"] == 1401
-    assert nav["rate"] == round(795 / 60 * 1000) and nav["timeUnit"] == "1000s"
-    assert o["scenarios"]["composite_burst"]["vus"] == 200
+    # run 12: one VU per user, one iteration = its whole session
+    assert nav["executor"] == "per-vu-iterations" and nav["iterations"] == 1
+    assert nav["vus"] == 795 and nav["maxDuration"] == f"{1800 + 300}s"
+    cb = o["scenarios"]["composite_burst"]
+    assert cb["vus"] == 200 and cb["startTime"] == "900s" and cb["iterations"] == 1
+    assert set(o["scenarios"]) == {"navigate", "composite_burst"}
+    for sc in ("navigate", "composite_burst"):
+        for m in ("arrivals", "arrivals_late", "first_loads", "clicks_deferred"):
+            assert f"{m}{{scenario:{sc}}}" in o["thresholds"]
     assert "url" not in o["systemTags"] and "name" not in o["systemTags"]
 
 
