@@ -25,6 +25,7 @@ import json
 import os
 import re
 from collections import Counter, defaultdict
+from itertools import pairwise
 
 __all__ = [
     "browser_checks",
@@ -42,8 +43,6 @@ __all__ = [
 K6_THRESHOLDS = {
     # arrival-rate starts k6 could not make, as a share of the scheduled ones
     "max_dropped_share": 0.001,
-    # the composite burst is ONE instant: any drop there is INVALID
-    "max_dropped_burst": 0,
     "max_k6_error_rate": 0.01,
     "min_browser_sessions": 3,
     "min_browser_loads_per_session": 20,
@@ -52,12 +51,26 @@ K6_THRESHOLDS = {
     "min_armed_user_share": 0.9,
     # per browser session: the SPA's live-update streams that opened
     "min_sse_opened_per_stream": 1,
+    # Chrome's CPU: the p95 of its 5 s windows stays under this share of its
+    # request. The request is what the scheduler guarantees Chrome against
+    # k6/the viewer (both now limited); a p95 under 80 % of it means Chrome
+    # never needed more than its guaranteed share, so the load generator
+    # could not have slowed a judged page (#831 gate M1). The 20 % margin
+    # covers the 5 s window averaging away sub-window bursts.
+    "max_browser_cpu_p95_share_of_request": 0.8,
+    "min_cpu_windows": 3,
+    # page loads that ended with a widget-error / widget-timeout state
+    # (WidgetStates.tsx:34,54; forbidden / notfound are RBAC answers, not
+    # failures): the same 1 % as the k6 error-rate bar. Such a page did not
+    # load its content, so its time cannot stand for a loaded page.
+    "max_widget_error_share": 0.01,
 }
 
 _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "route_table_mismatch", "bench_frame", "http_req_failed", "http_req_duration",
-         "browser_page_load_ms", "browser_page_loads", "browser_widget_errors",
-         "browser_page_timeouts", "browser_logins", "browser_sse_opened", "dropped_iterations")
+         "browser_page_load_ms", "browser_page_loads", "browser_widget_states",
+         "browser_page_timeouts", "browser_logins", "browser_signin_ms", "browser_sse_opened",
+         "dropped_iterations")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 
 
@@ -110,7 +123,58 @@ def read_k6_out(d: str, name: str) -> dict | None:
                 out[key] = json.load(fh)
         except (OSError, ValueError):
             pass
+    out["cpu"] = {c: read_cpu(d, c) for c in ((name, "viewer") if name == "k6" else (name,))}
     return out
+
+
+def read_cpu(d: str, container: str) -> list[dict] | None:
+    """<container>-cpu.jsonl: the wrapper's cgroup samples (k6_job._cpu_sampler)."""
+    try:
+        with open(os.path.join(d, f"{container}-cpu.jsonl")) as fh:
+            return [json.loads(ln) for ln in fh if ln.strip().startswith("{")]
+    except (OSError, ValueError):
+        return None
+
+
+def cpu_stats(recs: list[dict] | None) -> dict | None:
+    """Cores used per sample window, its p95/max, and the throttled share."""
+    if not recs:
+        return None
+    start = next((r for r in recs if r.get("kind") == "cpu_start"), {})
+    pts = [r for r in recs if r.get("kind") == "cpu" and r.get("usage_usec") is not None]
+    cores, thr = [], []
+    for a, b in pairwise(pts):
+        dt = float(b["t"]) - float(a["t"])
+        if dt <= 0:
+            continue
+        cores.append((b["usage_usec"] - a["usage_usec"]) / 1e6 / dt)
+        if a.get("throttled_usec") is not None and b.get("throttled_usec") is not None:
+            thr.append((b["throttled_usec"] - a["throttled_usec"]) / 1e6 / dt)
+    return {"request_m": start.get("request_m"), "limit_m": start.get("limit_m"),
+            "cgroup_limit_m": start.get("cgroup_limit_m"),
+            "windows": len(cores), "p95_cores": _pct(cores, 95) if cores else None,
+            "max_cores": round(max(cores), 2) if cores else None,
+            "throttled_s_per_s_max": round(max(thr), 3) if thr else None}
+
+
+def cpu_check(o: dict | None, container: str, th: dict | None = None) -> dict:
+    """The browser container kept CPU headroom (K6_THRESHOLDS
+    max_browser_cpu_p95_share_of_request)."""
+    th = dict(K6_THRESHOLDS, **(th or {}))
+    st = cpu_stats(((o or {}).get("cpu") or {}).get(container))
+    name = f"{container}.cpu_headroom"
+    share = th["max_browser_cpu_p95_share_of_request"]
+    if st is None or not st["request_m"] or st["windows"] < th["min_cpu_windows"]:
+        return {"check": name, "value": st, "bar": f"p95 <= {share} x request",
+                "result": "FAIL", "why": f"no CPU samples for the {container} container: its "
+                                         f"headroom is unknown"}
+    cap = round(share * st["request_m"] / 1000, 2)
+    ok = st["p95_cores"] <= cap
+    return {"check": name, "value": st, "bar": f"p95 <= {cap} cores ({share} x request)",
+            "result": "PASS" if ok else "FAIL",
+            **({} if ok else {"why": f"the {container} container used {st['p95_cores']} cores at "
+                                     f"p95, over {cap}: it may have been CPU-starved, so its "
+                                     f"page timings may be the load generator's, not snowplow's"})}
 
 
 def _metric(summary: dict | None, name: str, field: str):
@@ -159,22 +223,29 @@ def k6_checks(o: dict | None, th: dict | None = None) -> list[dict]:
     scenarios = sorted({k.split("scenario:", 1)[1].rstrip("}")
                         for k in (s.get("metrics") or {}) if k.startswith("iterations{scenario:")})
     for sc in scenarios:
+        if sc == "composite_burst":
+            continue                     # per-vu-iterations never drops: completeness below
         done = _metric(s, f"iterations{{scenario:{sc}}}", "count") or 0
         dropped = _metric(s, f"dropped_iterations{{scenario:{sc}}}", "count") or 0
         scheduled = done + dropped
-        if sc == "composite_burst":
-            ok = dropped <= th["max_dropped_burst"]
-            bar = f"<= {th['max_dropped_burst']} (the burst is one instant)"
-            value = dropped
-        else:
-            value = round(dropped / scheduled, 5) if scheduled else None
-            ok = value is not None and value <= th["max_dropped_share"]
-            bar = f"<= {th['max_dropped_share']} of {scheduled} scheduled"
+        value = round(dropped / scheduled, 5) if scheduled else None
+        ok = value is not None and value <= th["max_dropped_share"]
+        bar = f"<= {th['max_dropped_share']} of {scheduled} scheduled"
         why = (f"k6 could not start {dropped} of {scheduled} scheduled {sc} iterations on "
                f"time (no free VU): the load generator, not snowplow, fell behind"
                if scheduled else f"k6 scheduled no {sc} iteration: that load never ran")
         out.append({"check": f"k6.dropped_iterations[{sc}]", "value": value, "bar": bar,
                     "result": "PASS" if ok else "FAIL", **({} if ok else {"why": why})})
+    burst = ((s.get("config") or {}).get("burstUsers")) or 0
+    if burst:
+        # every burst user's deep link ran to a recorded page load; one cut
+        # by the scenario's maxDuration, or never started, is missing here
+        loads = _metric(s, "page_loads{scenario:composite_burst}", "count") or 0
+        ok = loads == burst
+        out.append({"check": "k6.composite_burst_complete", "value": loads, "bar": f"== {burst}",
+                    "result": "PASS" if ok else "FAIL",
+                    **({} if ok else {"why": f"only {loads} of the {burst} composite-burst users' "
+                                             f"page loads completed: the burst was not whole"})})
     rate = _metric(s, "http_req_failed", "rate")
     out.append({"check": "k6.error_rate", "value": rate, "bar": f"<= {th['max_k6_error_rate']}",
                 "result": "PASS" if rate is not None and rate <= th["max_k6_error_rate"] else "FAIL",
@@ -330,7 +401,8 @@ def _by(points, *keys):
     for v, t in points:
         g[tuple(t.get(k) for k in keys)].append(v)
     return {"/".join(str(x) for x in k): {"n": len(v), "p50_ms": _pct(v, 50), "p95_ms": _pct(v, 95),
-                                          "max_ms": max(v)} for k, v in sorted(g.items())}
+                                          "max_ms": max(v)}
+            for k, v in sorted(g.items(), key=lambda kv: tuple(str(x) for x in kv[0]))}
 
 
 def k6_report(o: dict | None) -> dict | None:
@@ -350,9 +422,34 @@ def browser_report(o: dict | None) -> dict | None:
     if o is None:
         return None
     p = o["points"]
-    return {"page_load_by_session": _by(p.get("browser_page_load_ms", []), "session"),
+    states = defaultdict(int)
+    for v, t in p.get("browser_widget_states", []):
+        states[t.get("state")] += int(v or 0)
+    return {"first_visit_is": ((o.get("summary") or {}).get("firstVisit")),
+            "page_load_by_session": _by(p.get("browser_page_load_ms", []), "session"),
             "page_load_by_route_visit": _by(p.get("browser_page_load_ms", []), "route", "visit"),
-            # skeleton=no: painted from the app's own cache, no request (browser.js)
+            # skeleton=no: painted from the app's own cache, no request (pageload.js)
             "page_load_by_visit_skeleton": _by(p.get("browser_page_load_ms", []), "visit", "skeleton"),
+            # the sign-in (submit -> the app leaves /login): authn, not a page load
+            "signin_by_session": _by(p.get("browser_signin_ms", []), "session"),
             "timeouts": sum(v for v, _ in p.get("browser_page_timeouts", [])),
-            "widget_errors": sum(v for v, _ in p.get("browser_widget_errors", []))}
+            "widget_states": dict(states),
+            "cpu": cpu_stats((o.get("cpu") or {}).get("browser"))}
+
+
+def widget_error_check(o: dict | None, th: dict | None = None) -> dict:
+    """Page loads that ended with a widget-error / widget-timeout state, as a
+    share of the browser page loads (at most: one point per state per load)."""
+    th = dict(K6_THRESHOLDS, **(th or {}))
+    p = (o or {}).get("points") or {}
+    bad = sum(1 for _, t in p.get("browser_widget_states", []) if t.get("state") in ("error", "timeout"))
+    loads = len(p.get("browser_page_loads", []))
+    share = round(bad / loads, 4) if loads else None
+    ok = share is not None and share <= th["max_widget_error_share"]
+    return {"check": "browser.widget_errors", "value": {"loads_with_error_state": bad, "loads": loads,
+                                                         "share": share},
+            "bar": f"<= {th['max_widget_error_share']} of browser page loads",
+            "result": "PASS" if ok else "FAIL",
+            **({} if ok else {"why": f"{bad} of {loads} browser page loads ended with a widget "
+                                     f"error/timeout state: they did not load their content"
+                              if loads else "no browser page load"})}

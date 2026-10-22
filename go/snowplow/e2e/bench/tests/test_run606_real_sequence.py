@@ -226,8 +226,10 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                  "route_table_mismatch": {"count": 0}}
             for sc, n in (("navigate", 3), ("composite_burst", 1)):
                 m["iterations{scenario:%s}" % sc] = {"count": n}
-                m["dropped_iterations{scenario:%s}" % sc] = {
-                    "count": 1 if mode == "dropped" and sc == "composite_burst" else 0}
+                m["dropped_iterations{scenario:%s}" % sc] = {"count": 0}
+            # "dropped": one of the 2 burst users' page loads never completed
+            m["page_loads{scenario:composite_burst}"] = {"count": 1 if mode == "dropped" else 2}
+            m = {"metrics": m, "config": {"burstUsers": 2}}
         else:
             for s in ("s1", "s2", "s3"):
                 lines.append(pt("browser_logins", 1, session=s))
@@ -239,12 +241,21 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                          "visit": "first" if i < 4 else "warm", "method": "click"}
                     lines += [pt("browser_page_load_ms", 300 + i, **t),
                               pt("browser_page_loads", 1, **t)]
-            m = {"browser_page_loads": {"count": 60}}
+            m = {"metrics": {"browser_page_loads": {"count": 60}}}
         lines.append(pt("bench_frame", 1, frame="end"))
         with gzip.open(os.path.join(dest, name + ".json.gz"), "wt") as fh:
             fh.write("\\n".join(lines) + "\\n")
         with open(os.path.join(dest, name + "-summary.json"), "w") as fh:
-            json.dump({"metrics": m}, fh)
+            json.dump(m, fh)
+        # the wrappers' CPU samples (k6_job._cpu_sampler); "starved": Chrome at
+        # its request the whole run
+        for c, req in ((("k6", 4000), ("viewer", 1000)) if name == "k6" else (("browser", 3000),)):
+            cores = 2.9 if (c == "browser" and mode == "starved") else 1.0
+            recs = [{"kind": "cpu_start", "container": c, "request_m": req, "limit_m": None}]
+            recs += [{"kind": "cpu", "t": 100.0 + 5 * i, "usage_usec": int(cores * 5e6 * i),
+                      "throttled_usec": 0} for i in range(6)]
+            with open(os.path.join(dest, c + "-cpu.jsonl"), "w") as fh:
+                fh.write("".join(json.dumps(r) + "\\n" for r in recs))
         with open(os.path.join(dest, name + "-exit.json"), "w") as fh:
             json.dump({"kind": name + "_exit", "rc": 0}, fh)
         sys.exit(0)

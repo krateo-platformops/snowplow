@@ -15,6 +15,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import gzip
 import http.server
+import itertools
 import json
 import os
 import shutil
@@ -229,9 +230,28 @@ def _point(metric, value, **tags):
             "data": {"time": "2026-10-21T10:00:00Z", "value": value, "tags": tags}}
 
 
+def _cpu_file(d: Path, container: str, request_m: int, cores: list[float], limit_m=None):
+    """<container>-cpu.jsonl as k6_job._cpu_sampler writes it: cumulative
+    usage every 5 s, one window per `cores` value."""
+    recs = [{"kind": "cpu_start", "container": container, "request_m": request_m,
+             "limit_m": limit_m, "interval_s": 5}]
+    used = 0.0
+    recs.append({"kind": "cpu", "t": 1000.0, "usage_usec": 0, "throttled_usec": 0})
+    for i, c in enumerate(cores):
+        used += c * 5
+        recs.append({"kind": "cpu", "t": 1000.0 + 5 * (i + 1), "usage_usec": int(used * 1e6),
+                     "throttled_usec": 0})
+    recs.append({"kind": "cpu_end"})
+    (d / f"{container}-cpu.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+
+
 def _write_out(d: Path, name: str, points: list[dict], summary: dict | None, rc: int | None,
-               frames=("start", "end"), cut=False):
+               frames=("start", "end"), cut=False, cpu=True):
     d.mkdir(parents=True, exist_ok=True)
+    if cpu:
+        for c in (("k6", "viewer") if name == "k6" else (name,)):
+            _cpu_file(d, c, {"k6": 4000, "viewer": 1000, "browser": 3000}[c], [1.0] * 6,
+                      limit_m=None if c == "browser" else 1000)
     lines = [json.dumps({"metric": "bench_frame", "type": "Metric", "data": {}})]
     if "start" in frames:
         lines.append(json.dumps(_point("bench_frame", 1, frame="start")))
@@ -251,15 +271,18 @@ def _write_out(d: Path, name: str, points: list[dict], summary: dict | None, rc:
         (d / f"{name}-exit.json").write_text(json.dumps({"kind": f"{name}_exit", "rc": rc, "t": 1}))
 
 
-def _k6_summary(loads, *, dropped=None, iters=None, failed_rate=0.0, mismatch=0):
+def _k6_summary(loads, *, dropped=None, iters=None, failed_rate=0.0, mismatch=0,
+                burst=2, burst_loads=None):
     iters = iters or {"navigate": loads - 2, "composite_burst": 2, "burst_navigate": 5}
     dropped = dropped or {}
     m = {"page_loads": {"count": loads}, "http_req_failed": {"rate": failed_rate},
-         "route_table_mismatch": {"count": mismatch}}
+         "route_table_mismatch": {"count": mismatch},
+         "page_loads{scenario:composite_burst}": {"count": burst if burst_loads is None
+                                                  else burst_loads}}
     for sc, n in iters.items():
         m[f"iterations{{scenario:{sc}}}"] = {"count": n}
         m[f"dropped_iterations{{scenario:{sc}}}"] = {"count": dropped.get(sc, 0)}
-    return {"kind": "k6_summary", "metrics": m}
+    return {"kind": "k6_summary", "config": {"burstUsers": burst}, "metrics": m}
 
 
 def _k6_points(n):
@@ -283,7 +306,9 @@ def test_k6_out_complete_passes(tmp_path):
     assert all(c["result"] == "PASS" for c in checks), checks
     assert {c["check"] for c in checks} >= {
         "k6.stream_complete", "k6.dropped_iterations[navigate]",
-        "k6.dropped_iterations[composite_burst]", "k6.error_rate", "k6.route_table"}
+        "k6.composite_burst_complete", "k6.error_rate", "k6.route_table"}
+    # per-vu-iterations never drops: no vacuous drop check for the burst (#831 gate)
+    assert "k6.dropped_iterations[composite_burst]" not in {c["check"] for c in checks}
     rep = k6eval.k6_report(o)
     assert rep["page_load_by_kind_visit"]["route/warm"]["n"] == 13
     assert set(rep["call_ms_by_level"]) == {"0", "1"}
@@ -317,15 +342,13 @@ def test_k6_nothing_collected_fails(tmp_path):
 
 
 def test_dropped_iterations_are_a_validity_check(tmp_path):
-    # navigate: 2 of 1000 dropped (0.2 % > 0.1 %); the burst: ANY drop
+    # navigate: 2 of 1000 dropped (0.2 % > 0.1 %)
     _write_out(tmp_path, "k6", _k6_points(20),
                _k6_summary(20, iters={"navigate": 998, "composite_burst": 199, "burst_navigate": 50},
-                           dropped={"navigate": 2, "composite_burst": 1}), 0)
+                           dropped={"navigate": 2}), 0)
     checks = k6eval.k6_checks(k6eval.read_k6_out(str(tmp_path), "k6"))
     nav = _check(checks, "k6.dropped_iterations[navigate]")
     assert nav["result"] == "FAIL" and nav["value"] == 0.002 and "2 of 1000" in nav["why"]
-    burst = _check(checks, "k6.dropped_iterations[composite_burst]")
-    assert burst["result"] == "FAIL" and burst["value"] == 1
     assert _check(checks, "k6.dropped_iterations[burst_navigate]")["result"] == "PASS"
     # a scenario that scheduled nothing never ran: not a pass
     _write_out(tmp_path, "k6", _k6_points(20), _k6_summary(20, iters={"navigate": 0}), 0)
@@ -337,6 +360,49 @@ def test_dropped_iterations_are_a_validity_check(tmp_path):
                _k6_summary(20, iters={"navigate": 999}, dropped={"navigate": 1}), 0)
     checks = k6eval.k6_checks(k6eval.read_k6_out(str(tmp_path), "k6"))
     assert _check(checks, "k6.dropped_iterations[navigate]")["result"] == "PASS"
+
+
+def test_composite_burst_must_be_whole(tmp_path):
+    """All burst users' page loads ran (#831 gate: per-vu-iterations never
+    drops, so a drop count proved nothing; one cut by maxDuration is missing)."""
+    _write_out(tmp_path, "k6", _k6_points(20), _k6_summary(20, burst=200, burst_loads=199), 0)
+    c = _check(k6eval.k6_checks(k6eval.read_k6_out(str(tmp_path), "k6")),
+               "k6.composite_burst_complete")
+    assert c["result"] == "FAIL" and c["value"] == 199 and "199 of the 200" in c["why"]
+    _write_out(tmp_path, "k6", _k6_points(20), _k6_summary(20, burst=200, burst_loads=200), 0)
+    assert _check(k6eval.k6_checks(k6eval.read_k6_out(str(tmp_path), "k6")),
+                  "k6.composite_burst_complete")["result"] == "PASS"
+    _write_out(tmp_path, "k6", _k6_points(20), _k6_summary(20, burst=0), 0)      # no burst
+    assert "k6.composite_burst_complete" not in {
+        c["check"] for c in k6eval.k6_checks(k6eval.read_k6_out(str(tmp_path), "k6"))}
+
+
+def test_cpu_stats_and_the_browser_headroom_check(tmp_path):
+    _cpu_file(tmp_path, "browser", 3000, [1.0, 1.2, 2.0, 1.1, 1.0])
+    st = k6eval.cpu_stats(k6eval.read_cpu(str(tmp_path), "browser"))
+    assert st["windows"] == 5 and st["max_cores"] == 2.0 and st["request_m"] == 3000
+    o = {"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}}
+    c = k6eval.cpu_check(o, "browser")
+    assert c["result"] == "PASS" and c["bar"] == "p95 <= 2.4 cores (0.8 x request)"
+    # Chrome at its request most of the run: starved, the timings can't be judged
+    _cpu_file(tmp_path, "browser", 3000, [2.9] * 6)
+    c = k6eval.cpu_check({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}}, "browser")
+    assert c["result"] == "FAIL" and "CPU-starved" in c["why"]
+    # no samples: unknown is not a pass
+    assert k6eval.cpu_check({"cpu": {}}, "browser")["result"] == "FAIL"
+    _cpu_file(tmp_path, "browser", 3000, [1.0, 1.0])               # 2 windows < 3
+    assert k6eval.cpu_check({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}},
+                            "browser")["result"] == "FAIL"
+
+
+def test_widget_error_states_are_gated(tmp_path):
+    # 1 error state over 63 loads = 1.6 % > 1 %; forbidden/notfound never count
+    _write_out(tmp_path, "browser", _browser_points(error_states=1), _browser_summary(63), 0)
+    c = k6eval.widget_error_check(k6eval.read_k6_out(str(tmp_path), "browser"))
+    assert c["result"] == "FAIL" and c["value"]["loads_with_error_state"] == 1
+    _write_out(tmp_path, "browser", _browser_points(), _browser_summary(63), 0)
+    c = k6eval.widget_error_check(k6eval.read_k6_out(str(tmp_path), "browser"))
+    assert c["result"] == "PASS" and c["value"]["loads_with_error_state"] == 0
 
 
 def test_k6_error_rate_and_route_table(tmp_path):
@@ -353,10 +419,11 @@ def test_k6_error_rate_and_route_table(tmp_path):
 
 
 def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
-                    sse=("refreshes", "notifications")):
+                    sse=("refreshes", "notifications"), error_states=0):
     pts = []
     for s in sessions:
         pts.append(_point("browser_logins", 1, session=s))
+        pts.append(_point("browser_signin_ms", 3100.0, session=s))
         for stream in ("refreshes", "notifications"):
             pts.append(_point("browser_sse_opened", 2 if stream in sse else 0,
                               session=s, stream=stream))
@@ -365,7 +432,14 @@ def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
                     "method": "login" if i == 0 else "click"}
             pts += [_point("browser_page_load_ms", 200.0 + i, **tags),
                     _point("browser_page_loads", 1, **tags)]
-    pts += [_point("browser_page_timeouts", 1, session=sessions[0])] * timeouts
+    for _ in range(timeouts):                    # pageload.recordOps: a timeout is a load too
+        t = {"session": sessions[0], "route": "/r0", "visit": "warm", "method": "click",
+             "skeleton": "timeout", "timeout": "yes"}
+        pts += [_point("browser_page_timeouts", 1, session=sessions[0], route="/r0"),
+                _point("browser_page_load_ms", 60000.0, **t), _point("browser_page_loads", 1, **t)]
+    pts += [_point("browser_widget_states", 1, session=sessions[0], route="/r1", state="error")
+            ] * error_states
+    pts += [_point("browser_widget_states", 2, session=sessions[0], route="/r1", state="forbidden")]
     return pts
 
 
@@ -502,18 +576,19 @@ def test_evaluate_judges_browser_page_loads_and_k6_validity(tmp_path):
     # the load606 driver's own checks do not apply
     assert not any(c.startswith("driver.") for c in names)
     assert _check(v["checks"], "browser.page_timeouts")["result"] == "PASS"
+    assert _check(v["checks"], "browser.widget_errors")["result"] == "PASS"
+    assert _check(v["validity"], "browser.cpu_headroom")["result"] == "PASS"
     rep = v["report"]
     assert rep["navs"] == 63                       # the north-star bars judge these
     assert rep["page_loads_are"].startswith("real Chrome")
     assert rep["browser"]["page_load_by_session"]["s1"]["n"] == 21
     assert rep["k6_report_only"]["page_load_by_kind_visit"]["route/warm"]["n"] == 13
     assert rep["viewer_report_only"]["arms"] == 5
-    # a dropped burst iteration makes the run INVALID with its reason
-    _write_out(k6dir, "k6", _k6_points(20),
-               _k6_summary(20, dropped={"composite_burst": 1}), 0)
+    # a burst user's page load missing makes the run INVALID with its reason
+    _write_out(k6dir, "k6", _k6_points(20), _k6_summary(20, burst=2, burst_loads=1), 0)
     rc, v = _evaluate_cli(tmp_path, k6dir, bdir)
     assert rc == 3 and v["verdict"] == "INVALID"
-    assert any("composite_burst" in r for r in v["invalid_reasons"]), v["invalid_reasons"]
+    assert any("composite_burst_complete" in r for r in v["invalid_reasons"]), v["invalid_reasons"]
 
 
 def test_evaluate_viewer_output_is_required_unless_no_viewers(tmp_path):
@@ -560,6 +635,23 @@ def test_k6_plan_needs_the_larger_loadgen_node():
         k6_job.loadgen_fit("e2-small", k6_job.k6_plan_requests())
 
 
+def _gke_allocatable(vcpu: int, mem_gib: int) -> dict:
+    """GKE's reservation (cloud.google.com/kubernetes-engine/docs/concepts/
+    plan-node-sizes), derived here independently of k6_job's table."""
+    cpu_res = sum(min(max(vcpu - lo, 0), hi - lo) * pct * 1000 for lo, hi, pct in
+                  ((0, 1, .06), (1, 2, .01), (2, 4, .005), (4, 10 ** 6, .0025)))
+    mem_res = sum(min(max(mem_gib - lo, 0), hi - lo) * pct for lo, hi, pct in
+                  ((0, 4, .25), (4, 8, .20), (8, 16, .10), (16, 128, .06), (128, 10 ** 6, .02)))
+    return {"cpu_m": int(vcpu * 1000 - cpu_res),
+            "memory_mi": int(mem_gib * 1024 - int(mem_res * 1024) - 100)}
+
+
+def test_loadgen_allocatable_is_gkes_formula():
+    """#831 gate: an inflated table let a plan 'fit' a node it would not."""
+    assert k6_job.LOADGEN_ALLOCATABLE["n2-standard-8"] == _gke_allocatable(8, 32)
+    assert k6_job.LOADGEN_ALLOCATABLE["n2-standard-16"] == _gke_allocatable(16, 64)
+
+
 def test_gke_loadgen_machine_is_configurable():
     from bench import gke
     spec = gke.default_spec("snowplow-bench-1021-1200", owner="t")
@@ -567,6 +659,30 @@ def test_gke_loadgen_machine_is_configurable():
     spec = gke.default_spec("snowplow-bench-1021-1200", owner="t",
                             loadgen_machine_type="n2-standard-16")
     assert next(p for p in spec.extra_pools if p.name == "loadgen").machine_type == "n2-standard-16"
+
+
+def test_browser_sessions_are_singleton_classes_no_k6_user_shares():
+    m = rbac_model.RbacModel(users=1000, namespaces=50)
+    s = k6_job.browser_sessions(m, 5, last=799)
+    # an admin, then cross-team users: each class its own (1,000 users / 50 ns)
+    assert [x["index"] for x in s] == [1, 20, 30, 40, 50]
+    classes = {}
+    for i in range(1, 1001):
+        classes.setdefault(tuple(sorted(rbac_model.user_groups(i, m))), []).append(i)
+    for x in s:
+        assert classes[tuple(sorted(x["groups"]))] == [x["index"]] and x["cold"] is True
+    cfg = k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
+                           routes=_routes(), users=1000, burst_users=200, think_s=60,
+                           duration_s=1, burst_at_s=1, composite_routes=["/dashboard"],
+                           browser_users=[x["index"] for x in s])
+    k6_classes = {tuple(sorted(rbac_model.user_groups(i, m)))
+                  for i in cfg["navUserIds"] + cfg["burstUserIds"]}
+    assert not k6_classes & {tuple(sorted(x["groups"])) for x in s}
+    # too few singletons: a shared class is taken and the label says so
+    tiny = rbac_model.RbacModel(users=4, namespaces=2, admins=0, cross_team_every=1000)
+    t = k6_job.browser_sessions(tiny, 2)
+    assert [x["cold"] for x in t] == [False, False]
+    assert k6_job.first_visit_label(t).startswith("first for this tab, not cold")
 
 
 def test_browser_sessions_are_distinct_identity_classes_outside_the_burst():
@@ -594,14 +710,17 @@ def test_k6_config_drives_every_identity_once():
     assert burst == list(range(801, 1001)) and len(nav) == 795
     assert not set(nav) & set(burst) and not {1, 20, 11, 12, 13} & set(nav)
     assert len(nav) + len(burst) + 5 == 1000
-    assert cfg["snowplowUrl"] == "http://snowplow:8081" and cfg["maxVUs"] == 795
-    assert cfg["preAllocatedVUs"] == 132                  # 795 / 60 s x 10
+    # #831 gate M3: arrival rate (795 / 60 s) x run 10's p99 first load (88.1 s) x 1.2,
+    # all pre-allocated, never fewer than the navigating users
+    assert cfg["snowplowUrl"] == "http://snowplow:8081"
+    assert cfg["preAllocatedVUs"] == cfg["maxVUs"] == 1401 >= len(nav)
     # k6 refuses preAllocatedVUs > maxVUs (the kind proof's first run, rc 104)
     small = k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
                              routes=_routes(), users=60, burst_users=10, think_s=5,
                              duration_s=1, burst_at_s=1, composite_routes=["/dashboard"],
                              browser_users=[1, 2, 3])
-    assert small["preAllocatedVUs"] <= small["maxVUs"] == 47
+    assert small["preAllocatedVUs"] == small["maxVUs"] == 994
+    assert small["maxVUs"] >= len(small["navUserIds"])
     with pytest.raises(ValueError, match="outside the burst"):
         k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
                          routes=_routes(), users=1000, burst_users=200, think_s=60,
@@ -665,6 +784,13 @@ def test_render_k6_driver(tmp_path):
     assert vmounts["work"]["readOnly"] is True and vmounts["feed"]["readOnly"] is True
     assert vmounts["out"]["mountPath"] == "/out"
     assert vw["resources"]["requests"] == {"cpu": "1", "memory": "2Gi"}
+    # #831 gate M1: k6 and the viewer are LIMITED (Chrome keeps its CPU); every
+    # container samples its own CPU into /out
+    assert vw["resources"]["limits"] == {"cpu": "1"}
+    assert c["resources"]["limits"] == {"cpu": "4"} and c["resources"]["requests"]["cpu"] == "4"
+    assert {e["name"]: e["value"] for e in c["env"]}["GOMAXPROCS"] == "4"
+    assert "/out/k6-cpu.jsonl" in c["args"][0] and "/sys/fs/cgroup/cpu.stat" in c["args"][0]
+    assert "/out/viewer-cpu.jsonl" in vw["args"][0]
     assert c["image"] == k6_job.K6_IMAGE and "@sha256:" in c["image"]
     assert c["readinessProbe"]["exec"]["command"] == ["test", "-f", "/out/done"]
     mounts = {m["name"]: m for m in c["volumeMounts"]}
@@ -690,6 +816,12 @@ def test_render_k6_driver(tmp_path):
     bcfg = json.loads(by[("ConfigMap", "k6browser")]["data"]["browser-config.json"])
     browser_users = {int(s["user"].rsplit("-", 1)[1]) for s in bcfg["sessions"]}
     assert len(bcfg["sessions"]) == 5 and not browser_users & set(cfg["navUserIds"])
+    # singleton identity classes: no k6 user shares their group set (#831 gate)
+    assert sorted(browser_users) == [1, 20, 30, 40, 50]
+    assert bcfg["firstVisit"].startswith("cold for the identity class")
+    assert "pageload.js" in by[("ConfigMap", "k6browser")]["data"]
+    bc = b["spec"]["containers"][0]
+    assert "/out/browser-cpu.jsonl" in bc["args"][0] and "limits" not in bc["resources"]
     for d in docs:                               # every pod on the loadgen pool
         if d["kind"] == "Job":
             assert d["spec"]["template"]["spec"]["nodeSelector"] == {"bench.krateo.io/pool": "loadgen"}
@@ -904,6 +1036,301 @@ def test_preflight_routes_keeps_only_servable_routes(tmp_path):
         load606_job.preflight_routes(str(f))
 
 
+# ─── pageload.js: the judged instrument's logic, under node ─────────────────
+
+_PAGELOAD_DRIVER = r"""
+import { readFileSync } from 'node:fs'
+import * as pl from './pageload.mjs'
+const cases = JSON.parse(readFileSync(process.argv[2], 'utf8'))
+const out = {
+  settled: cases.settled.map((c) => pl.settledNow(c.b, c.here, c.now, c.arg)),
+  loads: cases.loads.map((c) => pl.loadOf(c.b, c.here, c.ids)),
+  ops: cases.ops.map((c) => pl.recordOps(c.r, c.tags, c.timeout)),
+  quiet: pl.QUIET_MS,
+  // shipped into the page as source text: must not carry `export`
+  sources: [pl.settledNow.toString(), pl.loadOf.toString()],
+}
+process.stdout.write(JSON.stringify(out))
+"""
+
+
+def _pageload(tmp_path, cases, src=None):
+    (tmp_path / "pageload.mjs").write_text(src or (BENCH_DIR / "k6" / "pageload.js").read_text())
+    (tmp_path / "drv.mjs").write_text(_PAGELOAD_DRIVER)
+    (tmp_path / "cases.json").write_text(json.dumps(cases))
+    p = subprocess.run([NODE, str(tmp_path / "drv.mjs"), str(tmp_path / "cases.json")],
+                       capture_output=True, text=True, timeout=60, cwd=tmp_path)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+def _b(**kw):
+    return dict({"count": 0, "goneAt": 0, "navT0": 0, "saw": False, "armLogin": False}, **kw)
+
+
+@needs_node
+def test_pageload_settled_needs_the_quiet_window_and_the_route(tmp_path):
+    q = {"path": "/dashboard", "quiet": 1000}
+    out = _pageload(tmp_path, {"settled": [
+        {"b": _b(saw=True, goneAt=400), "here": "/dashboard", "now": 1399, "arg": q},   # 999 ms quiet
+        {"b": _b(saw=True, goneAt=400), "here": "/dashboard", "now": 1400, "arg": q},   # 1000 ms
+        {"b": _b(count=2, saw=True), "here": "/dashboard", "now": 9000, "arg": q},      # skeletons left
+        {"b": _b(), "here": "/other", "now": 9000, "arg": q},                         # wrong route
+        {"b": _b(), "here": "/dashboard", "now": 999, "arg": q},     # no skeleton yet: wait the window
+        # the sign-in arrival: never while still on /login, or `/`, or before the app left /login
+        {"b": _b(armLogin=True), "here": "/dashboard", "now": 9000, "arg": {"path": None, "quiet": 1000}},
+        {"b": _b(), "here": "/login", "now": 9000, "arg": {"path": None, "quiet": 1000}},
+        {"b": _b(), "here": "/", "now": 9000, "arg": {"path": None, "quiet": 1000}},
+        {"b": _b(navT0=500), "here": "/dashboard", "now": 1500, "arg": {"path": None, "quiet": 1000}},
+        {"b": None, "here": "/dashboard", "now": 9000, "arg": q},
+    ], "loads": [], "ops": []})
+    assert out["settled"] == [False, True, False, False, False, False, False, False, True, False]
+    assert out["quiet"] == 1000
+    assert not any(s.lstrip().startswith("export") for s in out["sources"])
+
+
+@needs_node
+def test_pageload_load_time_and_widget_states(tmp_path):
+    out = _pageload(tmp_path, {"settled": [], "ops": [], "loads": [
+        {"b": _b(saw=True, navT0=100, goneAt=503), "here": "/err",
+         "ids": ["widget-error", "widget-forbidden", "widget-forbidden", "widget-other"]},
+        {"b": _b(saw=False, navT0=100, goneAt=0), "here": "/x", "ids": []},     # app cache: 0 ms
+    ]})
+    assert out["loads"][0] == {"ms": 403, "saw": True, "path": "/err",
+                               "states": {"error": 1, "timeout": 0, "forbidden": 2, "notfound": 0}}
+    assert out["loads"][1]["ms"] == 0 and out["loads"][1]["saw"] is False
+
+
+@needs_node
+def test_pageload_a_timeout_counts_as_a_load_and_a_timeout(tmp_path):
+    tags = {"session": "s1", "route": "/r", "visit": "warm", "method": "click"}
+    out = _pageload(tmp_path, {"settled": [], "loads": [], "ops": [
+        {"r": None, "tags": tags, "timeout": 60000},
+        {"r": {"ms": 403, "saw": True, "path": "/r", "states": {"error": 1, "timeout": 0}},
+         "tags": tags, "timeout": 60000},
+    ]})
+    timeout_ops, ok_ops = out["ops"]
+    assert [o[0] for o in timeout_ops] == ["browser_page_timeouts", "browser_page_load_ms",
+                                           "browser_page_loads"]
+    assert timeout_ops[1][1] == 60000 and timeout_ops[1][2]["timeout"] == "yes"
+    assert [(o[0], o[1]) for o in ok_ops] == [("browser_page_load_ms", 403), ("browser_page_loads", 1),
+                                              ("browser_widget_states", 1)]
+    assert ok_ops[2][2]["state"] == "error" and ok_ops[0][2]["skeleton"] == "yes"
+
+
+def test_a_slow_sign_in_with_fast_pages_passes(tmp_path):
+    """#831 gate (High): 3 sessions, each a 3.4 s sign-in and 20 pages at
+    250 ms, recorded as browser.js now records them: the sign-in is
+    browser_signin_ms, the first page is timed from leaving /login. The
+    zero-cold bars must PASS: authn's login is not a page load."""
+    pts = []
+    for s in ("s1", "s2", "s3"):
+        pts.append(_point("browser_signin_ms", 3400.0, session=s))
+        pts.append(_point("browser_page_load_ms", 250.0, session=s, route="/dashboard",
+                          visit="first", method="login"))
+        for i in range(20):
+            pts.append(_point("browser_page_load_ms", 250.0, session=s, route=f"/r{i % 10}",
+                              visit="first" if i < 10 else "warm", method="click"))
+    _write_out(tmp_path, "browser", pts, None, 0)
+    o = k6eval.read_k6_out(str(tmp_path), "browser")
+    res = load606.evaluate(k6eval.browser_navs(o), [], [])
+    got = {c["check"]: c["result"] for c in res["checks"]
+           if c["check"].startswith(("zero_cold", "cold_nav", "warm_nav"))}
+    assert got and all(r == "PASS" for r in got.values()), got
+    assert k6eval.browser_report(o)["signin_by_session"]["s1"]["p50_ms"] == 3400.0
+
+
+# ─── browser.js in real Chrome against a fixture SPA (docker) ──────────────
+
+
+def _docker_ok():
+    return shutil.which("docker") is not None and subprocess.run(
+        ["docker", "info"], capture_output=True).returncode == 0
+
+
+needs_docker = pytest.mark.skipif(not _docker_ok(), reason="docker is not available")
+
+
+def _run_browser_fixture(tmp_path, k6dir=None, signin_ms=3400, skel_ms=150, page_ms=250):
+    """k6/browser.js in the pinned k6 browser image against
+    tests/fixtures/k6_browser_fixture.py, on a private docker network."""
+    net = f"k6brfix-{os.getpid()}"
+    spa = f"{net}-spa"
+    out = tmp_path / "out"
+    out.mkdir(mode=0o777)
+    out.chmod(0o777)
+    (tmp_path / "cfg.json").write_text(json.dumps({
+        "sessions": [{"name": "s1", "user": "fixture-user", "offset": 0}],
+        "routes": ["/dashboard", "/compositions", "/never", "/err"], "password": "x",
+        "thinkS": 0.3, "durationS": 12, "quietMs": 1000, "pageTimeoutMs": 3000,
+        "signinTimeoutMs": 10000, "frontendUrl": f"http://{spa}:8080", "firstVisit": "test"}))
+    subprocess.run(["docker", "network", "create", net], capture_output=True, check=True)
+    try:
+        subprocess.run(["docker", "run", "-d", "--name", spa, "--network", net,
+                        "-v", f"{BENCH_DIR / 'tests' / 'fixtures'}:/f:ro", "python:3.12-slim",
+                        "python3", "-u", "/f/k6_browser_fixture.py", "8080", str(signin_ms),
+                        str(skel_ms), str(page_ms)], capture_output=True, check=True)
+        time.sleep(1)
+        p = subprocess.run(
+            ["docker", "run", "--rm", "--network", net,
+             "-v", f"{k6dir or BENCH_DIR / 'k6'}:/opt/k6:ro", "-v", f"{tmp_path / 'cfg.json'}:/cfg.json:ro",
+             "-v", f"{out}:/out", "-e", "BROWSER_CONFIG=/cfg.json",
+             "-e", "SUMMARY_FILE=/out/browser-summary.json", "-e", "K6_BROWSER_HEADLESS=true",
+             "-e", "K6_BROWSER_ARGS=no-sandbox", k6_job.K6_BROWSER_IMAGE,
+             "run", "--quiet", "--out", "json=/out/browser.json.gz", "/opt/k6/browser.js"],
+            capture_output=True, text=True, timeout=240)
+        assert p.returncode == 0, p.stderr[-3000:]
+    finally:
+        subprocess.run(["docker", "rm", "-f", spa], capture_output=True)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+    (out / "browser-exit.json").write_text(json.dumps({"kind": "browser_exit", "rc": 0}))
+    return k6eval.read_k6_out(str(out), "browser")
+
+
+@needs_docker
+@pytest.mark.parametrize("image", [k6_job.K6_IMAGE, k6_job.PY_IMAGE])
+def test_cpu_sampler_runs_in_the_job_images(tmp_path, image):
+    """The wrapper's cgroup sampler (busybox sh in the k6 images, dash in the
+    python one) writes a framed, increasing CPU series the evaluator reads."""
+    out = tmp_path / "out"
+    out.mkdir()
+    out.chmod(0o777)
+    burn = "i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done; sleep 6"
+    script = k6_job._wrapper(burn, "probe", 0, cpu=("2", "2"))
+    p = subprocess.run(["docker", "run", "--rm", "--cpus", "2", "--user", "12345",
+                        "-v", f"{out}:/out", "--entrypoint", "/bin/sh", image, "-c", script],
+                       capture_output=True, text=True, timeout=180)
+    assert p.returncode == 0, p.stderr
+    recs = k6eval.read_cpu(str(out), "probe")
+    # --cpus 2: the kernel's limit, read from cpu.max, is 2000m
+    assert recs[0] == {"kind": "cpu_start", "container": "probe", "request_m": 2000,
+                       "limit_m": 2000, "cgroup_limit_m": 2000, "interval_s": 5}
+    assert recs[-1] == {"kind": "cpu_end"}
+    pts = [r for r in recs if r["kind"] == "cpu"]
+    assert len(pts) >= 2 and pts[-1]["usage_usec"] > pts[0]["usage_usec"] > 0
+    assert all(b["t"] > a["t"] for a, b in itertools.pairwise(pts))
+    st = k6eval.cpu_stats(recs)
+    assert st["windows"] >= 1 and st["p95_cores"] > 0
+    assert (out / "probe-exit.json").exists() and (out / "done").read_text().strip() == "0"
+
+
+@needs_docker
+def test_browser_js_in_chrome_against_the_fixture_spa(tmp_path):
+    o = _run_browser_fixture(tmp_path)
+    loads = [(t["method"], t["route"], t["timeout"], v) for v, t in o["points"]["browser_page_load_ms"]]
+    # the sign-in (3.4 s) is NOT in the first page's time: 150 ms skeleton delay + 250 ms page
+    login = [x for x in loads if x[0] == "login"]
+    assert len(login) == 1 and login[0][1] == "/dashboard" and 380 <= login[0][3] <= 480, loads
+    signin = [v for v, _ in o["points"]["browser_signin_ms"]]
+    assert len(signin) == 1 and 3300 <= signin[0] <= 4500, signin
+    # a click is timed from the click itself (in the page, not k6's CDP round
+    # trip before it), through the skeleton, to its end: 150 + 250 ms (the
+    # quiet window waits for a skeleton that appears 150 ms in)
+    clicks = [x for x in loads if x[0] == "click" and x[2] == "no"]
+    assert clicks and all(380 <= x[3] <= 480 for x in clicks), loads
+    # /never times out: a load at its timeout value AND a timeout
+    never = [x for x in loads if x[1] == "/never"]
+    assert never and all(x[2] == "yes" and x[3] == 3000 for x in never), loads
+    assert len(o["points"]["browser_page_timeouts"]) == len(never)
+    assert {t["state"] for _, t in o["points"]["browser_widget_states"]} == {"error"}
+    sse = {t["stream"]: v for v, t in o["points"]["browser_sse_opened"]}
+    assert sse["refreshes"] >= 1 and sse["notifications"] >= 1
+    # the stream is whole and the evaluator reads it
+    assert k6eval.browser_checks(o, 1)[0]["result"] == "PASS"
+    # no request URL (the SPA injects the user into /call extras) and no user
+    # name anywhere in the stream
+    with gzip.open(tmp_path / "out" / "browser.json.gz", "rt") as fh:
+        raw = fh.read()
+    assert '"url":' not in raw and '"name":"http' not in raw and "fixture-user" not in raw
+
+
+_K6_STUBS = {
+    "http.js": "export default { batch: () => [] }\n",
+    "execution.js": "export default { scenario: {} }\n",
+    "data.js": "export class SharedArray { constructor (n, f) { return f() } }\n",
+    "metrics.js": "export class Counter { add () {} }\nexport class Trend { add () {} }\n",
+}
+
+
+@needs_node
+def test_navigate_js_options_under_node(tmp_path):
+    """navigate.js's real options object (k6 modules stubbed): Chrome's 6 per
+    host (#831 gate: a 60 survived), the arrival executors and their VUs."""
+    pkg = tmp_path / "node_modules" / "k6"
+    pkg.mkdir(parents=True)
+    (pkg / "package.json").write_text(json.dumps({
+        "name": "k6", "type": "module",
+        "exports": {f"./{n[:-3]}": f"./{n}" for n in _K6_STUBS}}))
+    for n, src in _K6_STUBS.items():
+        (pkg / n).write_text(src)
+    for n in ("navigate.js", "spa.js"):
+        (tmp_path / n.replace(".js", ".mjs")).write_text(
+            (BENCH_DIR / "k6" / n).read_text().replace("'./spa.js'", "'./spa.mjs'"))
+    cfg = k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
+                           routes=_routes(), users=1000, burst_users=200, think_s=60,
+                           duration_s=1800, burst_at_s=900, composite_routes=["/dashboard"],
+                           browser_users=[1, 20, 30, 40, 50])
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    (tmp_path / "tokens.json").write_text("[]")
+    (tmp_path / "globals.mjs").write_text(
+        "import { readFileSync } from 'node:fs'\n"
+        "globalThis.__ENV = { K6_CONFIG: 'config.json', TOKENS_FILE: 'tokens.json' }\n"
+        "globalThis.open = (p) => readFileSync(p, 'utf8')\n")
+    (tmp_path / "opts.mjs").write_text(
+        "const m = await import('./navigate.mjs')\nprocess.stdout.write(JSON.stringify(m.options))\n")
+    p = subprocess.run([NODE, "--import", "./globals.mjs", "opts.mjs"], capture_output=True,
+                       text=True, timeout=60, cwd=tmp_path)
+    assert p.returncode == 0, p.stderr
+    o = json.loads(p.stdout)
+    assert o["batchPerHost"] == 6
+    nav = o["scenarios"]["navigate"]
+    assert nav["executor"] == "constant-arrival-rate"
+    assert nav["preAllocatedVUs"] == nav["maxVUs"] == cfg["maxVUs"] == 1401
+    assert nav["rate"] == round(795 / 60 * 1000) and nav["timeUnit"] == "1000s"
+    assert o["scenarios"]["composite_burst"]["vus"] == 200
+    assert "url" not in o["systemTags"] and "name" not in o["systemTags"]
+
+
+PROOF = BENCH_DIR / "tests" / "fixtures" / "k6proof-831"
+
+
+def test_kind_proof_outputs_pass_every_k6_browser_and_viewer_check(tmp_path):
+    """The kind proof's collected /out (#831), as the reviewer can inspect it:
+    real frontend image 1.8.8 in real Chrome (k6 browser), the real Jobs and
+    images; FAKE snowplow / authn / sse-proxy (portal chart 1.8.77 widgets,
+    60 ms per /call, a refresh frame every 2 s). 60 users, 10 in the burst,
+    think 5 s, 150 s, 3 sessions. Sanitised: user names -> user-NNNN in
+    viewer.jsonl (gzipped here); the streams drop the report-only per-request
+    metrics (http_req_* but duration/failed, data_*, vus, iterations); no
+    token exists in any of it (asserted)."""
+    k6dir, bdir = tmp_path / "k6", tmp_path / "browser"
+    shutil.copytree(PROOF / "k6", k6dir)
+    shutil.copytree(PROOF / "browser", bdir)
+    with gzip.open(k6dir / "viewer.jsonl.gz", "rt") as fi:
+        (k6dir / "viewer.jsonl").write_text(fi.read())
+    _, v = _evaluate_cli(tmp_path, k6dir, bdir)
+    val = [c for c in v["validity"] if c["check"].startswith(("k6.", "browser.", "viewer."))]
+    assert len(val) == 17 and all(c["result"] == "PASS" for c in val), val
+    # only the fake portal's missing snowplow pod records make it INVALID
+    assert v["invalid_reasons"] == [
+        "snowplow.restarts_during_measure: restart state unknown (missing before/after pod record)"]
+    rep = v["report"]
+    assert rep["navs"] == 99 and rep["browser"]["timeouts"] == 0
+    assert all(s["p50_ms"] < 1000 for s in rep["browser"]["signin_by_session"].values())
+    assert rep["viewer_report_only"]["arms"] == 1592
+    assert rep["viewer_report_only"]["push_refetch"]["non_200"] == 0
+    # k6 ran under its kernel limit (scaled to 1.5 CPU for the 8-CPU kind node)
+    assert rep["load_generator_cpu_report_only"]["k6"]["cgroup_limit_m"] == 1500
+    for p in list(PROOF.rglob("*")):
+        if p.is_file():
+            if p.suffix == ".gz":
+                with gzip.open(p, "rt") as fh:
+                    raw = fh.read()
+            else:
+                raw = p.read_text()
+            assert "scaleuser-" not in raw and "proof." not in raw and "Bearer" not in raw, p
+
+
 def test_navigate_js_reads_no_url_tags_and_keeps_tokens_out_of_out():
     src = (BENCH_DIR / "k6" / "navigate.js").read_text()
     assert "systemTags: ['status', 'method', 'scenario', 'expected_response', 'error_code']" in src
@@ -947,7 +1374,8 @@ def test_run606_k6_end_to_end(harness):
     v = json.loads((out / "verdict.json").read_text())
     val = {c["check"]: c["result"] for c in v["validity"]}
     for n in ("k6.stream_complete", "k6.dropped_iterations[navigate]",
-              "k6.dropped_iterations[composite_burst]", "k6.error_rate", "k6.route_table",
+              "k6.composite_burst_complete", "k6.error_rate", "k6.route_table",
+              "browser.cpu_headroom",
               "browser.stream_complete", "browser.sessions", "browser.live_refresh[s1]",
               "viewer.stream_complete", "viewer.armed_users"):
         assert val[n] == "PASS", (n, v["validity"])
@@ -970,11 +1398,12 @@ def test_run606_k6_dropped_burst_is_invalid(harness):
     assert p.returncode == 0, (p.stdout + p.stderr)[-4000:]
     v = json.loads((out / "verdict.json").read_text())
     assert v["verdict"] == "INVALID"
-    assert any("composite_burst" in r for r in v["invalid_reasons"])
+    assert any("composite_burst_complete" in r for r in v["invalid_reasons"])
     assert "INVALID: " in (out / "run.log").read_text()
 
 
 @pytest.mark.parametrize("mode,reason", [
+    ("starved", "browser.cpu_headroom"),
     ("viewercut", "the viewers stopped on: k6 exited without feed_end"),
     ("nosse", "no live-update stream opened: /refreshes, /notifications"),
 ])

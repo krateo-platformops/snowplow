@@ -1,5 +1,7 @@
 // browser.js — run 11's TRUE page load (#830): real Chrome sessions through
 // the real frontend while navigate.js runs the 1,000-user background load.
+// What "loaded" means, and how a load is recorded, is in pageload.js (pure,
+// tested under node); this file drives Chrome.
 //
 // Each VU is one person in one browser context:
 //   - signs in through the UI: /login, the antd form `basic` (username,
@@ -7,21 +9,11 @@
 //     sends GET {AUTHN_API_BASE_URL}{path} with Basic auth (pages/Login/
 //     Login.tsx:78-86), stores the payload in localStorage K_user (:90) and
 //     navigates (:92) — `/` redirects to the first menu route (widgets/Menu/
-//     Menu.tsx:45-50). That arrival is the session's FIRST LOAD.
+//     Menu.tsx:45-50). The page that lands is the session's FIRST LOAD, timed
+//     from the moment the app left /login; the sign-in itself is
+//     `browser_signin_ms` (report only).
 //   - then clicks sidebar routes (Menu.tsx:96 onClick → navigate) every
 //     THINK_S, recording each load as first visit or warm for this session.
-//
-// "Page loaded": the content has no `[data-widget-renderer]` element left for
-// QUIET_MS. WidgetLoading — the skeleton every pending widget shows
-// (components/WidgetRenderer/WidgetRenderer.tsx:131-134, and the Suspense
-// fallback :69) — is the ONLY element carrying that attribute
-// (components/WidgetStates/WidgetStates.tsx:7-10), so "none left" means every
-// widget in the tree has its data or a final state. The load ENDS when the last
-// skeleton disappeared (not at the end of the quiet window). QUIET_MS (1000)
-// exceeds useProgressiveLoading's 500 ms batch reveal (hooks/
-// useProgressiveLoading.ts:13-33), so a list still revealing is not "loaded".
-// Widget end states (data-testid widget-error / -timeout / -forbidden /
-// -notfound, WidgetStates.tsx:34,54,75,89) are counted per load.
 //
 // Live updates, the user's way (#830 re-gate): the SPA keeps two SSE streams,
 // each counted per session when it OPENS (an answered request): snowplow's
@@ -32,13 +24,17 @@
 import { browser } from 'k6/browser'
 import exec from 'k6/execution'
 import { Counter, Trend } from 'k6/metrics'
+import { OBSERVER, QUIET_MS, loadOf, recordOps, settledNow } from './pageload.js'
 
 const CFG = JSON.parse(open(__ENV.BROWSER_CONFIG || '/opt/k6/browser-config.json'))
 
-const LOAD = new Trend('browser_page_load_ms', true)
-const LOADS = new Counter('browser_page_loads')
-const WIDGET_ERRORS = new Counter('browser_widget_errors')
-const TIMEOUTS = new Counter('browser_page_timeouts')
+const METRICS = {
+  browser_page_load_ms: new Trend('browser_page_load_ms', true),
+  browser_page_loads: new Counter('browser_page_loads'),
+  browser_widget_states: new Counter('browser_widget_states'),
+  browser_page_timeouts: new Counter('browser_page_timeouts'),
+}
+const SIGNIN = new Trend('browser_signin_ms', true)
 const LOGINS = new Counter('browser_logins')
 const FRAME = new Counter('bench_frame')
 const SSE = new Counter('browser_sse_opened')
@@ -58,87 +54,50 @@ export const options = {
     browser_logins: ['count>=0'],
     browser_sse_opened: ['count>=0'],
     browser_page_timeouts: ['count>=0'],
-    browser_widget_errors: ['count>=0'],
+    browser_widget_states: ['count>=0'],
     bench_frame: ['count>=0'],
   },
   summaryTrendStats: ['count', 'min', 'med', 'p(95)', 'max'],
+  // no url/name tags: the SPA puts the signed-in user into /call extras
+  // (identity injection), and k6 browser tags every request with its URL
+  systemTags: ['status', 'method', 'scenario', 'expected_response', 'error_code'],
 }
 
-// Installed in every document before the app runs: tracks the skeletons.
-const OBSERVER = `(() => {
-  const b = window.__bench = { count: 0, goneAt: 0, navT0: 0, saw: false };
-  const tick = () => {
-    const n = document.querySelectorAll('[data-widget-renderer]').length;
-    const now = performance.now();
-    if (n > 0) b.saw = true;
-    if (n === 0 && b.count > 0) b.goneAt = now;
-    b.count = n;
-  };
-  new MutationObserver(tick).observe(document, { childList: true, subtree: true });
-  const sse = window.__benchSse = { refreshes: 0, notifications: 0 };
-  const f = window.fetch;
-  window.fetch = function (input, init) {
-    const url = String((input && input.url) || input);
-    const p = f.apply(this, arguments);
-    if (url.indexOf('/refreshes') >= 0) {
-      p.then((r) => { if (r.ok) sse.refreshes++ }, () => {});
-    }
-    return p;
-  };
-  const ES = window.EventSource;
-  if (ES) {
-    window.EventSource = function (url, opts) {
-      const es = new ES(url, opts);
-      if (String(url).indexOf('/notifications') >= 0) {
-        es.addEventListener('open', () => { sse.notifications++ });
-      }
-      return es;
-    };
-    window.EventSource.prototype = ES.prototype;
-    ['CONNECTING', 'OPEN', 'CLOSED'].forEach((k) => { window.EventSource[k] = ES[k] });
-  }
-})()`
-
+// Before a route click: the in-page click listener (pageload.OBSERVER) starts
+// the clock at the click itself; navT0 here is the fallback.
 async function markStart (page) {
   await page.evaluate(() => {
     const b = window.__bench
-    b.navT0 = performance.now(); b.saw = false; b.goneAt = 0
+    b.navT0 = performance.now(); b.saw = false; b.goneAt = 0; b.armClick = true
   })
 }
 
-// Wait until the route is loaded; returns {ms, path, errors} or null on
-// timeout. path null = wherever the app lands after sign-in (the user's OWN
-// first menu route, which need not be the run's route table's first).
+// Wait until the route is loaded (pageload.settledNow, run in the page);
+// returns pageload.loadOf's record, or null on timeout.
+// The sign-in arrival may wait for authn first: its timeout adds
+// signinTimeoutMs (the page itself still gets pageTimeoutMs).
 async function settled (page, path) {
+  const arg = JSON.stringify({ path, quiet: CFG.quietMs || QUIET_MS })
+  const timeout = CFG.pageTimeoutMs + (path ? 0 : (CFG.signinTimeoutMs || 60000))
   try {
-    await page.waitForFunction((arg) => {
-      const b = window.__bench
-      const here = window.location.pathname
-      if (!b || (arg.path ? here !== arg.path : (here === '/login' || here === '/'))) return false
-      if (b.count > 0) return false
-      const end = b.saw ? b.goneAt : b.navT0
-      return performance.now() - end >= arg.quiet
-    }, { polling: 50, timeout: CFG.pageTimeoutMs }, { path, quiet: CFG.quietMs })
+    await page.waitForFunction(
+      `(${settledNow.toString()})(window.__bench, window.location.pathname, performance.now(), ${arg})`,
+      { polling: 50, timeout })
   } catch (e) {
+    console.warn(`page did not settle (${path || 'sign-in'}): ${e}`)
     return null
   }
-  return await page.evaluate(() => {
-    const b = window.__bench
-    const end = b.saw ? b.goneAt : b.navT0
-    return { ms: end - b.navT0, saw: b.saw, path: window.location.pathname,
-             errors: document.querySelectorAll('[data-testid^="widget-"]').length }
-  })
+  // page.evaluate takes only a function: run loadOf's source as an
+  // expression (waitForFunction), keep its value on window, read it back
+  await page.waitForFunction(
+    `(window.__benchLoad = (${loadOf.toString()})(window.__bench, window.location.pathname, ` +
+    `Array.from(document.querySelectorAll('[data-testid^="widget-"]')).map((e) => e.getAttribute('data-testid'))), true)`,
+    { polling: 'raf', timeout: 10000 })
+  return await page.evaluate(() => window.__benchLoad)
 }
 
-// skeleton=no: the route painted with no WidgetLoading at all — every widget
-// came from the app's own React Query cache (App.tsx:25-30, staleTime 30 s),
-// no request; the load is then ~0 ms. Tagged so a report can tell it apart.
 function record (r, tags) {
-  if (r === null) { TIMEOUTS.add(1, tags); return }
-  const t = Object.assign({ skeleton: r.saw ? 'yes' : 'no' }, tags)
-  LOAD.add(r.ms, t)
-  LOADS.add(1, t)
-  if (r.errors) WIDGET_ERRORS.add(r.errors, t)
+  for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs)) METRICS[metric].add(value, t)
 }
 
 export default async function () {
@@ -152,11 +111,19 @@ export default async function () {
     await page.goto(`${CFG.frontendUrl}/login`, { waitUntil: 'load', timeout: CFG.pageTimeoutMs })
     await page.locator('#basic_username').fill(s.user)
     await page.locator('#basic_password').fill(CFG.password)
-    await markStart(page)
+    // the first page's clock starts when the app leaves /login (pageload.js)
+    await page.evaluate(() => {
+      const b = window.__bench
+      b.armLogin = true; b.submitAt = performance.now(); b.signinMs = null
+    })
     await page.locator('#basic_password').press('Enter')
     const first = await settled(page, null)
     const landed = first === null ? '(none)' : first.path
-    if (first !== null) LOGINS.add(1, { session: s.name })
+    if (first !== null) {
+      LOGINS.add(1, { session: s.name })
+      const signin = await page.evaluate(() => window.__bench.signinMs)
+      if (signin !== null) SIGNIN.add(signin, { session: s.name })
+    }
     record(first, { session: s.name, route: landed, visit: 'first', method: 'login' })
     visited.add(landed)
     let n = 0
@@ -172,6 +139,8 @@ export default async function () {
         // a route under a collapsed submenu: the same client-side navigation
         method = 'history'
         await page.evaluate((p) => {
+          const b = window.__bench
+          b.navT0 = performance.now(); b.saw = false; b.goneAt = 0; b.armClick = false
           window.history.pushState({}, '', p)
           window.dispatchEvent(new PopStateEvent('popstate'))
         }, route)
@@ -197,8 +166,9 @@ export function teardown () { FRAME.add(1, { frame: 'end' }) }
 export function handleSummary (data) {
   const keep = {}
   for (const [name, m] of Object.entries(data.metrics)) {
-    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_errors|browser_page_timeouts|browser_logins|browser_sse_opened|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
+    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
   }
   return { [__ENV.SUMMARY_FILE || '/out/browser-summary.json']: JSON.stringify({
-    kind: 'browser_summary', sessions: CFG.sessions.map((x) => x.name), metrics: keep }) }
+    kind: 'browser_summary', sessions: CFG.sessions.map((x) => x.name),
+    firstVisit: CFG.firstVisit, metrics: keep }) }
 }

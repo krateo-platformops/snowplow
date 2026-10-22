@@ -22,6 +22,7 @@ widgets that user's last page load actually answered with.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from bench import rbac_model
@@ -53,6 +54,14 @@ FORWARD_CPU, FORWARD_MEMORY = "100m", "64Mi"
 VIEWER_CPU, VIEWER_MEMORY = "1", "2Gi"
 
 LOGIN_CONCURRENCY = 64              # run 10's proven authn concurrency
+# Run 10's first loads (808, nav-load606-0-2bkjt.jsonl): p50 30.1 s, p95
+# 61.0 s, p99 88.1 s. In the arrival minute every user starts one, so k6
+# needs ~ arrival rate x p99 first-load time VUs in flight; pre-allocate them
+# all (#831 gate M3: growing VUs while the arrival runs is what drops
+# iterations). Measured: the pinned k6 with 1,800 VUs on this script peaks at
+# 1.09 GiB, inside K6_MEMORY.
+FIRST_LOAD_P99_S = 88.1
+VU_MARGIN = 1.2
 FRESH_CPU, FRESH_MEMORY = "1", "1Gi"   # load606_job.render_fresh's requests
 
 # GKE node allocatable (cloud.google.com/kubernetes-engine/docs/concepts/
@@ -107,33 +116,49 @@ def k6_plan_requests(k6_cpu: str | None = None, browser_cpu: str | None = None,
 
 def browser_sessions(m: rbac_model.RbacModel, n: int = 5,
                      last: int | None = None) -> list[dict]:
-    """n users from DISTINCT identity classes, deterministic: a platform
-    admin, a cross-team user, then single-team users of distinct teams.
-    Only users 1..`last` (the navigating users: the burst users are the last
-    ones, k6_config)."""
+    """n users of DISTINCT identity classes, deterministic, among users
+    1..`last` (the navigating users: the burst users are the last ones).
+
+    #831 gate: snowplow's identity-bound cells are per identity CLASS (the
+    binding set, which the group set decides), so a k6 user of the same class
+    warms a browser user's "first" visit. The picks are therefore SINGLETON
+    classes, a group set no other user has, whose user k6 then leaves out
+    (k6_config browser_users): a platform admin, cross-team users, then other
+    singletons. 1,000 users / 50 namespaces have 107 of them. Only when there
+    are too few is a shared class taken, and that session is cold=False."""
     last = m.users if last is None else last
-    picks: list[int] = []
-    seen: set[tuple] = set()
+    classes: dict[tuple, list[int]] = {}
+    for i in range(1, m.users + 1):
+        classes.setdefault(tuple(sorted(rbac_model.user_groups(i, m))), []).append(i)
 
-    def take(i):
-        key = tuple(sorted(rbac_model.user_groups(i, m)))
-        if key not in seen:
-            seen.add(key)
-            picks.append(i)
+    def key(i):
+        return tuple(sorted(rbac_model.user_groups(i, m)))
 
-    if m.admins and last >= 1:
-        take(1)
-    multi = next((i for i in range(m.admins + 1, last + 1)
-                  if len([g for g in rbac_model.user_groups(i, m)
-                          if g.startswith("bench-team-")]) > 1), None)
-    if multi:
-        take(multi)
-    for i in range(m.admins + 1, last + 1):
+    def teams(i):
+        return len([g for g in rbac_model.user_groups(i, m) if g.startswith("bench-team-")])
+
+    single = [i for i in range(1, last + 1) if len(classes[key(i)]) == 1]
+    admins = [i for i in single if i <= m.admins]
+    cross = [i for i in single if i > m.admins and teams(i) > 1]
+    picks = (admins[:1] + cross + admins[1:] + [i for i in single if i not in admins + cross])[:n]
+    seen = {key(i) for i in picks}
+    for i in range(1, last + 1):                 # too few singletons: shared classes
         if len(picks) >= n:
             break
-        take(i)
+        if key(i) not in seen:
+            seen.add(key(i))
+            picks.append(i)
     return [{"name": f"s{k + 1}", "user": f"scaleuser-{i:04d}", "index": i, "offset": 3 * k,
-             "groups": rbac_model.user_groups(i, m)} for k, i in enumerate(picks[:n])]
+             "groups": rbac_model.user_groups(i, m), "cold": len(classes[key(i)]) == 1}
+            for k, i in enumerate(picks)]
+
+
+def first_visit_label(sessions: list[dict]) -> str:
+    """What a browser "first visit" is, for the report."""
+    if sessions and all(s["cold"] for s in sessions):
+        return ("cold for the identity class: every session's group set is its own and its "
+                "user is not driven by k6 (cells shared across classes may still be warm)")
+    return "first for this tab, not cold: k6 users share some sessions' identity classes"
 
 
 def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: str,
@@ -163,6 +188,7 @@ def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: st
     if not nav_ids:
         raise ValueError("no user left for k6 to drive")
     nav_rate = len(nav_ids) / think_s
+    vus = max(len(nav_ids), math.ceil(nav_rate * FIRST_LOAD_P99_S * VU_MARGIN))
     return {"snowplowUrl": snowplow_url.rstrip("/"), "init": init, "frontendNs": frontend_ns,
             "buildersNs": builders_ns,
             "routes": [{"path": r["path"], "endpoint": r["endpoint"]} for r in routes],
@@ -171,22 +197,22 @@ def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: st
             "durationS": int(duration_s), "burstAtS": int(burst_at_s),
             "compositeRoutes": list(composite_routes),
             "viewers": viewers,            # write the navigation feed (navigate.js)
-            # VUs: in steady state ~rate x page time; the first-load minute
-            # can need many more. maxVUs = the navigating users (no more
-            # page loads in flight than people), and a drop is COUNTED; k6
-            # refuses preAllocatedVUs > maxVUs (the kind proof hit it).
-            "preAllocatedVUs": min(len(nav_ids), max(50, int(nav_rate * 10))),
-            "maxVUs": len(nav_ids)}
+            # VUs: arrival rate x run 10's p99 first-load time, with margin,
+            # and never fewer than the navigating users; ALL pre-allocated
+            # (k6 refuses preAllocatedVUs > maxVUs: the kind proof hit it).
+            "preAllocatedVUs": vus, "maxVUs": vus}
 
 
 def browser_config(*, sessions: list[dict], routes: list[str], password: str,
                    think_s: float, duration_s: float, quiet_ms: int = 1000,
-                   page_timeout_ms: int = 60000,
+                   page_timeout_ms: int = 60000, signin_timeout_ms: int = 60000,
                    frontend_url: str = "http://localhost:8080") -> dict:
     return {"sessions": [{k: s[k] for k in ("name", "user", "offset")} for s in sessions],
             "routes": list(routes), "password": password, "thinkS": think_s,
             "durationS": int(duration_s), "quietMs": quiet_ms,
-            "pageTimeoutMs": page_timeout_ms, "frontendUrl": frontend_url}
+            "pageTimeoutMs": page_timeout_ms, "signinTimeoutMs": signin_timeout_ms,
+            "frontendUrl": frontend_url,
+            "firstVisit": first_visit_label(sessions)}
 
 
 def _indent(text: str, n: int) -> str:
@@ -194,13 +220,55 @@ def _indent(text: str, n: int) -> str:
     return "\n".join(pad + ln if ln else ln for ln in text.splitlines())
 
 
-def _wrapper(cmd: str, prefix: str, linger_s: float, done: str = "/out/done") -> str:
+CPU_SAMPLE_S = 5
+
+
+def _cpu_sampler(prefix: str, request: str, limit: str | None) -> str:
+    """The container's own CPU (#831 gate M1), from its cgroup: cpu.stat
+    usage_usec / throttled_usec (v2; cpuacct.usage on v1), every CPU_SAMPLE_S,
+    timed by /proc/uptime (sub-second), into /out/<prefix>-cpu.jsonl, framed
+    by cpu_start (request, limit) and cpu_end. POSIX sh: the k6 images are
+    Alpine (busybox), the python image Debian (dash)."""
+    f = f"/out/{prefix}-cpu.jsonl"
+    lim = _mcpu(limit) if limit else "null"
+    return f"""cpu_sample() {{
+  u=; th=null
+  if [ -r /sys/fs/cgroup/cpu.stat ]; then
+    while read -r k v; do
+      case "$k" in usage_usec) u=$v ;; throttled_usec) th=$v ;; esac
+    done < /sys/fs/cgroup/cpu.stat
+  elif [ -r /sys/fs/cgroup/cpuacct/cpuacct.usage ]; then
+    read -r n < /sys/fs/cgroup/cpuacct/cpuacct.usage; u=$((n / 1000))
+  fi
+  read -r up _ < /proc/uptime
+  [ -n "$u" ] && printf '{{"kind": "cpu", "t": %s, "usage_usec": %s, "throttled_usec": %s}}\\n' "$up" "$u" "$th" >> {f}
+}}
+# the limit the kernel enforces (cgroup v2 cpu.max "<quota> <period>" or "max")
+cg=null
+if [ -r /sys/fs/cgroup/cpu.max ]; then
+  read -r q per < /sys/fs/cgroup/cpu.max
+  [ "$q" != max ] && cg=$((q * 1000 / per))
+fi
+printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}}}\\n' "$cg" > {f}
+( while :; do cpu_sample; sleep {CPU_SAMPLE_S}; done ) &
+sampler=$!
+"""
+
+
+def _wrapper(cmd: str, prefix: str, linger_s: float, done: str = "/out/done",
+             cpu: tuple[str, str | None] | None = None) -> str:
     """#818's discipline: run, record the exit code into the stream dir,
-    mark `done` (Ready = results final), linger for kubectl cp."""
+    mark `done` (Ready = results final), linger for kubectl cp. `cpu` =
+    (request, limit): sample the container's CPU while `cmd` runs."""
+    head = _cpu_sampler(prefix, *cpu) if cpu else ""
+    tail = (f"""kill "$sampler" 2>/dev/null
+cpu_sample
+printf '{{"kind": "cpu_end"}}\\n' >> /out/{prefix}-cpu.jsonl
+""" if cpu else "")
     return f"""set -u
-rc=0
+{head}rc=0
 {cmd} || rc=$?
-printf '{{"kind": "{prefix}_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" > /out/{prefix}-exit.json
+{tail}printf '{{"kind": "{prefix}_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" > /out/{prefix}-exit.json
 echo "{prefix} exited rc=$rc; holding {linger_s:g}s for collect"
 echo "$rc" > {done}
 sleep {linger_s:g}
@@ -257,11 +325,14 @@ def render_k6(*, config: dict, authn_url: str, password: str, linger_s: float,
         command: ["/bin/sh", "-c"]
         args:
         - |
-{_indent(_wrapper(view.replace("exec ", "", 1), "viewer", linger_s, done="/out/viewer-done"), 10)}
+{_indent(_wrapper(view.replace("exec ", "", 1), "viewer", linger_s, done="/out/viewer-done",
+                  cpu=(VIEWER_CPU, VIEWER_CPU)), 10)}
         resources:
           requests:
             cpu: {json.dumps(VIEWER_CPU)}
             memory: {VIEWER_MEMORY}
+          limits:
+            cpu: {json.dumps(VIEWER_CPU)}
         readinessProbe:
           exec:
             command: ["test", "-f", "/out/viewer-done"]
@@ -316,7 +387,7 @@ spec:
         command: ["/bin/sh", "-c"]
         args:
         - |
-{_indent(_wrapper(run, "k6", linger_s), 10)}
+{_indent(_wrapper(run, "k6", linger_s, cpu=(cpu, cpu)), 10)}
         env:
         - name: K6_CONFIG
           value: /opt/k6/config.json
@@ -324,10 +395,16 @@ spec:
           value: /work/tokens.json
         - name: SUMMARY_FILE
           value: /out/k6-summary.json
+        - name: GOMAXPROCS
+          value: {json.dumps(str(math.ceil(_mcpu(cpu) / 1000)))}
         resources:
           requests:
             cpu: {json.dumps(cpu)}
             memory: {memory}
+          # #831 gate M1: k6 (Go, GOMAXPROCS = node cores otherwise) must not
+          # take the CPU Chrome is measuring with
+          limits:
+            cpu: {json.dumps(cpu)}
         readinessProbe:
           exec:
             command: ["test", "-f", "/out/done"]
@@ -363,6 +440,7 @@ def render_browser(*, config: dict, forwards: list[str], linger_s: float,
     """ConfigMap k6browser (script + config + forwarder) + the k6browser Job:
     Chrome through k6 browser, with localhost forwarder sidecar."""
     files = {"browser.js": (K6_DIR / "browser.js").read_text(),
+             "pageload.js": (K6_DIR / "pageload.js").read_text(),
              "forward.py": (K6_DIR / "forward.py").read_text(),
              "browser-config.json": json.dumps(config, indent=1)}
     run = "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js"
@@ -393,7 +471,7 @@ spec:
         command: ["/bin/sh", "-c"]
         args:
         - |
-{_indent(_wrapper(run, "browser", linger_s), 10)}
+{_indent(_wrapper(run, "browser", linger_s, cpu=(cpu, None)), 10)}
         env:
         - name: BROWSER_CONFIG
           value: /opt/k6/browser-config.json

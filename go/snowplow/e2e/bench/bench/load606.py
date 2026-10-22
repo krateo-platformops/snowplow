@@ -2643,6 +2643,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         validity.extend(k6eval.k6_checks(k6.get("k6"), k6.get("thresholds")))
         validity.extend(k6eval.browser_checks(k6.get("browser"), k6.get("sessions"),
                                               k6.get("thresholds")))
+        validity.append(k6eval.cpu_check(k6.get("browser"), "browser", k6.get("thresholds")))
         if k6.get("viewers", True):
             validity.extend(k6eval.viewer_checks(k6.get("viewer"), k6.get("k6"),
                                                  k6.get("thresholds")))
@@ -2652,6 +2653,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
                        **({} if timeouts == 0 else
                           {"why": "a real-browser page did not finish loading within its "
                                   "timeout: the worst page load there is"})})
+        checks.append(k6eval.widget_error_check(k6.get("browser"), k6.get("thresholds")))
     else:
         _check("driver.sched_lag_p95_ms",
                pct([n.get("sched_lag_ms", 0) for n in navs], 95), "<=",
@@ -2731,6 +2733,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         report["browser"] = k6eval.browser_report(k6.get("browser"))
         report["k6_report_only"] = k6eval.k6_report(k6.get("k6"))
         report["viewer_report_only"] = k6eval.viewer_report(k6.get("viewer"))
+        report["load_generator_cpu_report_only"] = {
+            c: k6eval.cpu_stats(((k6.get("k6") or {}).get("cpu") or {}).get(c)) for c in ("k6", "viewer")}
     report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
     fv = [f for f in fresh if f.get("valid") is False]
     report["fresh_invalid_samples"] = len(fv)
