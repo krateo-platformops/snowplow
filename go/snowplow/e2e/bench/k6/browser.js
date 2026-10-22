@@ -100,6 +100,23 @@ function record (r, tags) {
   for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs)) METRICS[metric].add(value, t)
 }
 
+// The first navigation, retried (run 11: a refused localhost port killed 4
+// of 5 sessions outright). Bounded: GOTO_TRIES x GOTO_WAIT_MS (config
+// loginTries / loginRetryMs; tests set 1 to reproduce run 11).
+const GOTO_TRIES = CFG.loginTries || 6
+const GOTO_WAIT_MS = CFG.loginRetryMs || 5000
+async function gotoLogin (page) {
+  for (let i = 1; ; i++) {
+    try {
+      return await page.goto(`${CFG.frontendUrl}/login`, { waitUntil: 'load', timeout: CFG.pageTimeoutMs })
+    } catch (e) {
+      if (i >= GOTO_TRIES) throw e
+      console.warn(`login page attempt ${i} of ${GOTO_TRIES} failed (${e}); retrying in ${GOTO_WAIT_MS} ms`)
+      await page.waitForTimeout(GOTO_WAIT_MS)
+    }
+  }
+}
+
 export default async function () {
   const s = CFG.sessions[exec.vu.idInTest - 1]
   const context = await browser.newContext()
@@ -108,7 +125,7 @@ export default async function () {
   const deadline = Date.now() + CFG.durationS * 1000
   const visited = new Set()
   try {
-    await page.goto(`${CFG.frontendUrl}/login`, { waitUntil: 'load', timeout: CFG.pageTimeoutMs })
+    await gotoLogin(page)
     await page.locator('#basic_username').fill(s.user)
     await page.locator('#basic_password').fill(CFG.password)
     // the first page's clock starts when the app leaves /login (pageload.js)
