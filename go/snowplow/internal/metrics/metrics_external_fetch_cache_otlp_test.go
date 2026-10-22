@@ -13,7 +13,7 @@ import (
 
 func TestExternalFetchCacheCountersReachOTLP(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
-	outcomes := []string{"convert_hit", "convert_miss", "not_modified"}
+	outcomes := []string{"convert_hit", "convert_miss"}
 	read := func(all []point, name string, attrs map[string]string) int64 {
 		v, ok := find643(all, name, attrs)
 		if !ok {

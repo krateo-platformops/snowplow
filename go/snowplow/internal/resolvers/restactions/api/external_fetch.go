@@ -101,35 +101,15 @@ const maxUnstructuredResponseTextBytes = 2048
 // (ProxyURL, not ServerURL) leaking by a different mechanism; it is the #453 /
 // #500 error-prose class and is tracked as #536.
 func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions) (*response.Status, []byte, string, error) {
-	res, jsonBytes, ct, _, err := httpFetchExternal(ctx, opts, nil, toJSONBytes)
-	return res, jsonBytes, ct, err
+	return httpFetchConverting(ctx, opts, toJSONBytes)
 }
 
-// externalValidators are the validators this request identity last saw for
-// this URL; a non-nil one makes the fetch a conditional request
-// (external_fetch_cache.go).
-type externalValidators struct {
-	etag         string
-	lastModified string
-}
-
-// externalFetchMeta is what the shared fetch layer reads off a response: the
-// status code, the headers, and whether a conditional request was answered 304
-// (no body: the bytes last seen for those validators are still current).
-type externalFetchMeta struct {
-	code        int
-	header      http.Header
-	notModified bool
-}
-
-// httpFetchExternal is httpFetchAllowingNonJSON with three seams for the shared
-// fetch layer: it sends cond's validators as If-None-Match / If-Modified-Since,
-// it converts a 2xx body with convert (toJSONBytes, or the layer's
-// content-addressed memo of it), and it returns the response metadata. A 304 to
-// a conditional request returns a Success envelope with no body and
-// meta.notModified. With cond == nil and convert == toJSONBytes every path is
-// the old function's. meta is nil when no response was received.
-func httpFetchExternal(ctx context.Context, opts httpcall.RequestOptions, cond *externalValidators, convert func(string, []byte) ([]byte, error)) (*response.Status, []byte, string, *externalFetchMeta, error) {
+// httpFetchConverting is httpFetchAllowingNonJSON with the 2xx body conversion
+// as a parameter: toJSONBytes, or the content-addressed memo of it
+// (external_fetch_cache.go), which returns exactly what toJSONBytes returns for
+// the same bytes. The request, the response handling and every error path are
+// the same for both.
+func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, convert func(string, []byte) ([]byte, error)) (*response.Status, []byte, string, error) {
 	// --- request assembly (transcribed from request.go:36-95) ---
 	uri := strings.TrimSuffix(opts.Endpoint.ServerURL, "/")
 	if len(opts.Path) > 0 {
@@ -143,7 +123,7 @@ func httpFetchExternal(ctx context.Context, opts httpcall.RequestOptions, cond *
 		// guard's taint is flow-INSENSITIVE, so an object tainted once stays
 		// tainted and `err = redact.ErrorURL(err)` would read as dirty forever.
 		redErr := redact.ErrorURL(err)
-		return response.New(http.StatusInternalServerError, redErr), nil, "", nil, redErr
+		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 
 	verb := ptr.Deref(opts.Verb, http.MethodGet)
@@ -175,7 +155,7 @@ func httpFetchExternal(ctx context.Context, opts httpcall.RequestOptions, cond *
 		// #523: NewRequestWithContext returns url.Parse's *url.Error unwrapped
 		// (net/http request.go), so the URI rides out in its text here too.
 		redErr := redact.ErrorURL(err)
-		return response.New(http.StatusInternalServerError, redErr), nil, "", nil, redErr
+		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 
 	// Additional headers for AWS Signature 4 algorithm — transcribed
@@ -224,15 +204,6 @@ func httpFetchExternal(ctx context.Context, opts httpcall.RequestOptions, cond *
 		}
 	}
 
-	if cond != nil {
-		if cond.etag != "" {
-			call.Header.Set("If-None-Match", cond.etag)
-		}
-		if cond.lastModified != "" {
-			call.Header.Set("If-Modified-Since", cond.lastModified)
-		}
-	}
-
 	// Builds the HTTP client (TLS/CA/client-certs/proxy/timeouts +
 	// bearer/basic/AWS auth roundtrippers) from the Endpoint.
 	//
@@ -254,7 +225,7 @@ func httpFetchExternal(ctx context.Context, opts httpcall.RequestOptions, cond *
 		// see the KNOWN RESIDUAL note on this function for the ProxyURL shape it
 		// cannot reach.
 		werr := redact.ErrorURL(fmt.Errorf("unable to create HTTP Client for endpoint: %w", err))
-		return response.New(http.StatusInternalServerError, werr), nil, "", nil, werr
+		return response.New(http.StatusInternalServerError, werr), nil, "", werr
 	}
 
 	// OTel outbound instrumentation (ADDITIVE + default-OFF). When tracing
@@ -290,16 +261,11 @@ func httpFetchExternal(ctx context.Context, opts httpcall.RequestOptions, cond *
 		// the "https://svc@host/base?token=…" shape still renders its token in
 		// clear. redact.URL removes both.
 		redErr := redact.ErrorURL(err)
-		return response.New(http.StatusInternalServerError, redErr), nil, "", nil, redErr
+		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 	defer respo.Body.Close()
 
 	ct := respo.Header.Get("Content-Type")
-	meta := &externalFetchMeta{code: respo.StatusCode, header: respo.Header}
-	if cond != nil && respo.StatusCode == http.StatusNotModified {
-		meta.notModified = true
-		return response.New(http.StatusOK, nil), nil, ct, meta, nil
-	}
 
 	// --- non-2xx shaping (transcribed BYTE-IDENTICALLY from
 	// request.go:98-116) --- (AC5; falsifier (j)).
@@ -310,10 +276,10 @@ func httpFetchExternal(ctx context.Context, opts httpcall.RequestOptions, cond *
 			// #523: a body-read failure is a TRANSPORT error, not the body's own
 			// text — http2 and the proxy path can surface it as a *url.Error.
 			redErr := redact.ErrorURL(rerr)
-			return response.New(http.StatusInternalServerError, redErr), nil, ct, meta, redErr
+			return response.New(http.StatusInternalServerError, redErr), nil, ct, redErr
 		}
 
-		return nonOKStatus(respo.StatusCode, dat), nil, ct, meta, nil
+		return nonOKStatus(respo.StatusCode, dat), nil, ct, nil
 	}
 
 	// --- 2xx body: detect + convert (the new, snowplow-owned step;
@@ -322,13 +288,13 @@ func httpFetchExternal(ctx context.Context, opts httpcall.RequestOptions, cond *
 	if rerr != nil {
 		// #523: same transport class as the non-2xx read above.
 		redErr := redact.ErrorURL(rerr)
-		return response.New(http.StatusInternalServerError, redErr), nil, ct, meta, redErr
+		return response.New(http.StatusInternalServerError, redErr), nil, ct, redErr
 	}
 
 	// #709 — an empty 2xx body is "no content" (a 204, an accepted write):
 	// the stage's value is JSON null, not a decode failure.
 	if len(bytes.TrimSpace(dat)) == 0 {
-		return response.New(http.StatusOK, nil), []byte("null"), ct, meta, nil
+		return response.New(http.StatusOK, nil), []byte("null"), ct, nil
 	}
 
 	jsonBytes, cerr := convert(ct, dat)
@@ -339,10 +305,10 @@ func httpFetchExternal(ctx context.Context, opts httpcall.RequestOptions, cond *
 		// resolve), NO panic. The envelope message is the conversion
 		// error only; the endpoint auth never appears in it (AC6;
 		// falsifiers (e),(g)).
-		return response.New(http.StatusUnprocessableEntity, cerr), nil, ct, meta, nil
+		return response.New(http.StatusUnprocessableEntity, cerr), nil, ct, nil
 	}
 
-	return response.New(http.StatusOK, nil), jsonBytes, ct, meta, nil
+	return response.New(http.StatusOK, nil), jsonBytes, ct, nil
 }
 
 // nonOKStatus shapes a non-2xx response into the Failure envelope the

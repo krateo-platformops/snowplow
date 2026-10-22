@@ -166,8 +166,7 @@ var storeRegistry = map[string]string{
 	"cache.storeVerifySkipByReason":                   "no-content (counters)",
 	"api.internalClientCache":                         "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
 	"api.discoveryClientCache":                        "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
-	"api.externalFetchCache.conversions":              "no-content identity (content-addressed: sha256(mode + the raw response bytes) → their converted JSON; a hit hands a reader exactly what its OWN response converts to; every read still fetches)",
-	"api.externalFetchCache.validators":               "credential-keyed (the ETag/Last-Modified one request identity last saw: sha256 of method + path + payload + headers + EVERY Endpoint field, credentials included; never sent on an SA-endpoint, held-credential or impersonated dial)",
+	"api.externalFetchCache.conversions":              "no-content identity (content-addressed: sha256(mode + the raw response bytes) → their converted JSON; a hit hands a reader exactly what its OWN response converts to; every read is a full fetch, nothing is revalidated)",
 	"api.narrowMemo":                                  "no-content (#603 PR-2: the jqinterest read set of a RESTAction spec x tracked stage — derived from the spec alone, never from a served body or an identity)",
 }
 

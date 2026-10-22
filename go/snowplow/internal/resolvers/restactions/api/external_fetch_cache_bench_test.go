@@ -18,13 +18,11 @@ import (
 
 // BenchmarkExternalYAMLFetchConvert — one read of an external YAML document,
 // fetched over the real wire and converted, before and after the
-// content-addressed conversion memo. Every variant performs the fetch.
+// content-addressed conversion memo. Every variant performs the full fetch.
 //
 //	before:     httpFetchAllowingNonJSON: full body + YAMLToJSON per read
-//	after-200:  the layer, upstream sends the full body every time (no
-//	            validator): full body + sha256, conversion reused
-//	after-304:  the layer, upstream sends an ETag: a conditional GET per read,
-//	            answered 304, the bytes last seen for it reused
+//	after:      the memo: the same full body every read + sha256, conversion
+//	            reused
 //
 // Run with a fixed -benchtime Nx (e.g. 300x): plumbing's client opens a new
 // connection per request, and a time-based run exhausts local ports.
@@ -33,15 +31,8 @@ func BenchmarkExternalYAMLFetchConvert(b *testing.B) {
 	doc := benchHelmIndex(400)
 	b.Logf("document: %d bytes of YAML", len(doc))
 
-	serve := func(etag string) *httptest.Server {
+	serve := func() *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if etag != "" {
-				w.Header().Set("ETag", etag)
-				if r.Header.Get("If-None-Match") == etag {
-					w.WriteHeader(http.StatusNotModified)
-					return
-				}
-			}
 			w.Header().Set("Content-Type", "text/yaml")
 			_, _ = w.Write([]byte(doc))
 		}))
@@ -59,8 +50,8 @@ func BenchmarkExternalYAMLFetchConvert(b *testing.B) {
 			}
 		}
 	}
-	layer := func(b *testing.B, etag string) {
-		srv := serve(etag)
+	layer := func(b *testing.B) {
+		srv := serve()
 		defer srv.Close()
 		c := newExternalFetchCache()
 		c.budget = func(int64) int64 { return 1 << 30 }
@@ -72,7 +63,7 @@ func BenchmarkExternalYAMLFetchConvert(b *testing.B) {
 	}
 
 	b.Run("before", func(b *testing.B) {
-		srv := serve("")
+		srv := serve()
 		defer srv.Close()
 		o := opts(srv.URL)
 		run(b, func() ([]byte, error) {
@@ -80,8 +71,7 @@ func BenchmarkExternalYAMLFetchConvert(b *testing.B) {
 			return body, err
 		})
 	})
-	b.Run("after-200", func(b *testing.B) { layer(b, "") })
-	b.Run("after-304", func(b *testing.B) { layer(b, `"v1"`) })
+	b.Run("after", layer)
 }
 
 // benchHelmIndex builds a Helm repository index with n charts of 5 versions.

@@ -1619,17 +1619,17 @@ func registerListQueryInstrument(m metric.Meter) error {
 // on (CFG-1).
 func registerExternalFetchCacheInstruments(m metric.Meter) error {
 	total, err := m.Int64ObservableCounter("snowplow_external_fetch_conversion_total",
-		metric.WithDescription("External api-step reads by what their conversion cost, by outcome: convert_hit (the fetched body's exact bytes were already converted; reused, byte-identical), convert_miss (the body was converted, YAML to JSON), not_modified (a conditional read with the validators this same request identity last saw was answered 304; those bytes were reused). Every read fetches: nothing is reused by time. A valid-JSON body is passed through as before and counted in none."))
+		metric.WithDescription("External api-step reads by what their conversion cost, by outcome: convert_hit (the fetched body's exact bytes were already converted; reused, byte-identical), convert_miss (the body was converted, YAML to JSON). Every read is a full, unconditional fetch: no response is reused, by time or by revalidation. A valid-JSON body is passed through as before and counted in neither."))
 	if err != nil {
 		return err
 	}
 	bytes, err := m.Int64ObservableGauge("snowplow_external_fetch_conversion_bytes",
-		metric.WithDescription("Bytes the external conversion memo holds (converted JSON + per-identity validators). Bounded by a share of the memory headroom past the admission reserve (GOMEMLIMIT − live heap), re-read at each store."))
+		metric.WithDescription("Bytes the external conversion memo holds (converted JSON + content keys). Bounded by a share of the memory headroom past the admission reserve (GOMEMLIMIT − live heap), re-read at each store."))
 	if err != nil {
 		return err
 	}
 	entries, err := m.Int64ObservableGauge("snowplow_external_fetch_conversion_entries",
-		metric.WithDescription("Entries the external conversion memo holds (conversions + per-identity validators)."))
+		metric.WithDescription("Entries the external conversion memo holds (conversions)."))
 	if err != nil {
 		return err
 	}
