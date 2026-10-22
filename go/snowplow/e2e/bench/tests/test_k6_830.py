@@ -807,12 +807,22 @@ def test_render_k6_driver(tmp_path):
     assert cfg["viewers"] is True
     b = by[("Job", "k6browser")]["spec"]["template"]
     assert b["metadata"]["annotations"]["kubectl.kubernetes.io/default-container"] == "browser"
-    names = [x["name"] for x in b["spec"]["containers"]]
-    assert names == ["browser", "forward"]
+    assert [x["name"] for x in b["spec"]["containers"]] == ["browser"]
     assert b["spec"]["containers"][0]["image"] == k6_job.K6_BROWSER_IMAGE
-    assert b["spec"]["containers"][1]["command"][-4:] == [
-        "8080=frontend.krateo-system.svc:8080", "8081=snowplow.krateo-system.svc:8081",
-        "8082=authn.krateo-system.svc:8082", "8083=krateo-sse-proxy.krateo-system.svc:8080"]
+    # run 11's race: the forwarder is a NATIVE sidecar whose startupProbe holds
+    # the browser back until every local port accepts
+    fw = b["spec"]["initContainers"]
+    assert [x["name"] for x in fw] == ["forward"] and fw[0]["restartPolicy"] == "Always"
+    specs = ["8080=frontend.krateo-system.svc:8080", "8081=snowplow.krateo-system.svc:8081",
+             "8082=authn.krateo-system.svc:8082", "8083=krateo-sse-proxy.krateo-system.svc:8080"]
+    assert fw[0]["command"][-4:] == specs
+    sp = fw[0]["startupProbe"]
+    assert sp["exec"]["command"] == ["python3", "/opt/k6/forward.py", "--probe", *specs]
+    assert sp["periodSeconds"] * sp["failureThreshold"] >= k6_job.FORWARD_WAIT_S
+    # and the browser itself waits for an HTTP answer on every port first
+    args = b["spec"]["containers"][0]["args"][0]
+    assert "for p in 8080 8081 8082 8083; do" in args
+    assert args.index("wait_forwards && ") < args.index("k6 run --quiet")
     bcfg = json.loads(by[("ConfigMap", "k6browser")]["data"]["browser-config.json"])
     browser_users = {int(s["user"].rsplit("-", 1)[1]) for s in bcfg["sessions"]}
     assert len(bcfg["sessions"]) == 5 and not browser_users & set(cfg["navUserIds"])
@@ -1137,7 +1147,23 @@ def test_a_slow_sign_in_with_fast_pages_passes(tmp_path):
     got = {c["check"]: c["result"] for c in res["checks"]
            if c["check"].startswith(("zero_cold", "cold_nav", "warm_nav"))}
     assert got and all(r == "PASS" for r in got.values()), got
-    assert k6eval.browser_report(o)["signin_by_session"]["s1"]["p50_ms"] == 3400.0
+    rep = k6eval.browser_report(o)
+    assert rep["signin_by_session"]["s1"]["p50_ms"] == 3400.0
+    # one flat value too (run 11's report reader found none)
+    assert rep["signin_ms"] == {"n": 3, "p50_ms": 3400.0, "p95_ms": 3400.0, "max_ms": 3400.0}
+
+
+def test_mem606_captures_prewarm_and_learned_identity_counters():
+    """Run 12 must show why first visits are cold: the default mem606 prefixes
+    (run606 MEM_VARS_PREFIXES = `load606 prefixes`) carry them."""
+    p = subprocess.run([sys.executable, "-m", "bench.load606", "prefixes"], capture_output=True,
+                       text=True, cwd=BENCH_DIR, check=True)
+    got = p.stdout.split()
+    for pre in ("snowplow_learned_classes", "snowplow_prewarm_complete", "snowplow_phase1_units",
+                "snowplow_phase1_readiness_exit", "snowplow_prewarm_engine"):
+        assert pre in got, pre
+    assert subprocess.run([sys.executable, "-m", "bench.load606", "check-prefixes", *got],
+                          cwd=BENCH_DIR).returncode == 0
 
 
 # ─── browser.js in real Chrome against a fixture SPA (docker) ──────────────
@@ -1212,6 +1238,151 @@ def test_cpu_sampler_runs_in_the_job_images(tmp_path, image):
     st = k6eval.cpu_stats(recs)
     assert st["windows"] >= 1 and st["p95_cores"] > 0
     assert (out / "probe-exit.json").exists() and (out / "done").read_text().strip() == "0"
+
+
+def _browser_pod_in_docker(tmp_path, *, forward_delay_s, wrapper=True, login_tries=6,
+                           forward_wait_s=60, forward=True):
+    """The k6browser pod, emulated: a `forward` container owns the network
+    namespace and starts its forwarder `forward_delay_s` late (run 11: the
+    sidecar was not listening yet when Chrome navigated); the browser container
+    joins that namespace and runs the RENDERED browser args (with `wrapper`)
+    or a bare `k6 run` (without: run 11's container). 3 sessions against the
+    fixture SPA."""
+    net = f"k6race-{os.getpid()}-{forward_delay_s}-{int(wrapper)}-{login_tries}"
+    spa, fwd = f"{net}-spa", f"{net}-fwd"
+    out, k6dir = tmp_path / "out", tmp_path / "k6"
+    out.mkdir(mode=0o777)
+    out.chmod(0o777)
+    k6dir.mkdir()
+    for n in ("browser.js", "pageload.js", "forward.py"):
+        shutil.copy(BENCH_DIR / "k6" / n, k6dir / n)
+    sessions = [{"name": f"s{i}", "user": f"fixture-{i}", "offset": i} for i in (1, 2, 3)]
+    cfg = k6_job.browser_config(sessions=[dict(s, cold=True) for s in sessions],
+                                routes=["/dashboard", "/compositions"], password="x",
+                                think_s=0.3, duration_s=6, page_timeout_ms=5000)
+    cfg.update(frontendUrl="http://localhost:8080", loginTries=login_tries, loginRetryMs=2000,
+               signinTimeoutMs=10000)
+    (k6dir / "browser-config.json").write_text(json.dumps(cfg))
+    yaml_text = k6_job.render_browser(config=cfg, forwards=[f"8080={spa}:8080"], linger_s=0,
+                                      forward_wait_s=forward_wait_s)
+    job = next(d for d in yaml.safe_load_all(yaml_text) if d and d["kind"] == "Job")
+    browser = job["spec"]["template"]["spec"]["containers"][0]
+    script = (browser["args"][0] if wrapper
+              else "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js")
+    env = [x for e in browser["env"] for x in ("-e", f"{e['name']}={e['value']}")]
+    fwd_cmd = (f"sleep {forward_delay_s}; exec python3 -u /opt/k6/forward.py 8080={spa}:8080"
+               if forward else "sleep 600")
+    subprocess.run(["docker", "network", "create", net], capture_output=True, check=True)
+    try:
+        subprocess.run(["docker", "run", "-d", "--name", spa, "--network", net,
+                        "-v", f"{BENCH_DIR / 'tests' / 'fixtures'}:/f:ro", "python:3.12-slim",
+                        "python3", "-u", "/f/k6_browser_fixture.py", "8080", "300", "50", "100"],
+                       capture_output=True, check=True)
+        subprocess.run(["docker", "run", "-d", "--name", fwd, "--network", net,
+                        "-v", f"{k6dir}:/opt/k6:ro", "python:3.12-slim", "sh", "-c", fwd_cmd],
+                       capture_output=True, check=True)
+        p = subprocess.run(["docker", "run", "--rm", "--network", f"container:{fwd}",
+                            "-v", f"{k6dir}:/opt/k6:ro", "-v", f"{out}:/out", *env,
+                            "--entrypoint", "/bin/sh", k6_job.K6_BROWSER_IMAGE, "-c", script],
+                           capture_output=True, text=True, timeout=300)
+    finally:
+        subprocess.run(["docker", "rm", "-f", spa, fwd], capture_output=True)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+    if not (out / "browser-exit.json").exists():                # the bare k6 run has no wrapper
+        (out / "browser-exit.json").write_text(json.dumps({"kind": "browser_exit",
+                                                           "rc": p.returncode}))
+    return p, out
+
+
+@needs_docker
+def test_run11_race_reproduced_without_the_gate(tmp_path):
+    """Run 11, reproduced: Chrome navigates while the forwarder is not
+    listening yet, no wait, no retry -> net::ERR_CONNECTION_REFUSED, sessions
+    lost, and browser.sessions keeps such a run INVALID."""
+    p, out = _browser_pod_in_docker(tmp_path, forward_delay_s=6, wrapper=False, login_tries=1)
+    assert "ERR_CONNECTION_REFUSED" in p.stdout + p.stderr
+    o = k6eval.read_k6_out(str(out), "browser")
+    c = _check(k6eval.browser_checks(o, 3), "browser.sessions")
+    assert c["result"] == "FAIL" and c["value"] == 0
+
+
+@needs_docker
+def test_forwarder_late_at_session_start_the_browser_waits(tmp_path):
+    """The same race with the rendered browser container: its wrapper waits
+    for the forwarded port to answer, then all 3 sessions sign in."""
+    p, out = _browser_pod_in_docker(tmp_path, forward_delay_s=6)
+    assert p.returncode == 0, p.stderr[-2000:]
+    fw = json.loads((out / "browser-forward.json").read_text())
+    assert fw["ok"] is True and fw["waited_s"] >= 4
+    o = k6eval.read_k6_out(str(out), "browser")
+    c = _check(k6eval.browser_checks(o, 3), "browser.sessions")
+    assert c["result"] == "PASS" and c["value"] == 3
+    assert k6eval.browser_report(o)["forward_wait"]["ok"] is True
+    assert "ERR_CONNECTION_REFUSED" not in p.stdout + p.stderr
+
+
+@needs_docker
+def test_forwarder_late_the_login_retry_alone_recovers(tmp_path):
+    """Without the wrapper's wait, browser.js's bounded login retry alone
+    carries the sessions over a forwarder that listens 6 s late."""
+    p, out = _browser_pod_in_docker(tmp_path, forward_delay_s=6, wrapper=False, login_tries=6)
+    assert "retrying in 2000 ms" in p.stdout + p.stderr
+    o = k6eval.read_k6_out(str(out), "browser")
+    assert _check(k6eval.browser_checks(o, 3), "browser.sessions")["value"] == 3
+
+
+@needs_docker
+def test_forwarder_never_listens_the_browser_does_not_start(tmp_path):
+    """Bounded: no forward within FORWARD_WAIT_S -> no browser run, rc 3,
+    and the run is INVALID with the reason."""
+    p, out = _browser_pod_in_docker(tmp_path, forward_delay_s=0, forward=False, forward_wait_s=5)
+    assert p.returncode == 3 and "did not answer within 5s: not starting the browser" in p.stderr
+    fw = json.loads((out / "browser-forward.json").read_text())
+    assert fw == {"kind": "forward_wait", "ok": False, "port": 8080, "waited_s": fw["waited_s"]}
+    c = k6eval.browser_checks(k6eval.read_k6_out(str(out), "browser"), 3)[0]
+    assert c["check"] == "browser.stream_complete" and c["result"] == "FAIL" and "rc=3" in c["why"]
+
+
+def test_forward_probe_passes_only_once_every_local_port_listens(tmp_path):
+    """forward.py --probe (the sidecar's startupProbe) fails while any local
+    port is not listening yet (run 11's race) and passes once the forwarder
+    listens on all of them. The targets are the wrapper's bounded wait's job:
+    a probe on them could hold the pod in Init unbounded."""
+    import socket as so
+
+    def free_port():
+        s = so.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    target = so.socket()
+    target.bind(("127.0.0.1", 0))
+    target.listen()
+    tport, l1, l2 = target.getsockname()[1], free_port(), free_port()
+    specs = [f"{l1}=127.0.0.1:{tport}", f"{l2}=127.0.0.1:{tport}"]
+    fwd = [sys.executable, str(BENCH_DIR / "k6" / "forward.py")]
+    probe = subprocess.run(fwd + ["--probe", *specs], capture_output=True, text=True)
+    assert probe.returncode == 1 and f"127.0.0.1:{l1} not accepting" in probe.stderr
+    p = subprocess.Popen(fwd + specs[:1], stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout.readline().startswith(f"forward 127.0.0.1:{l1}")
+        # one of two ports listening is not ready
+        probe = subprocess.run(fwd + ["--probe", *specs], capture_output=True, text=True)
+        assert probe.returncode == 1 and f"127.0.0.1:{l2} not accepting" in probe.stderr
+    finally:
+        p.kill()
+        p.wait()
+    p = subprocess.Popen(fwd + specs, stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout.readline().startswith(f"forward 127.0.0.1:{l1}")
+        assert p.stdout.readline().startswith(f"forward 127.0.0.1:{l2}")
+        assert subprocess.run(fwd + ["--probe", *specs]).returncode == 0
+    finally:
+        p.kill()
+        p.wait()
+        target.close()
 
 
 @needs_docker
@@ -1385,7 +1556,7 @@ def test_run606_k6_end_to_end(harness):
     fwd = next(d for d in yaml.safe_load_all((out / "loadgen-job.yaml").read_text())
                if d and d["kind"] == "Job" and d["metadata"]["name"] == "k6browser")
     assert "8083=krateo-sse-proxy.krateo-system.svc:8080" in \
-        fwd["spec"]["template"]["spec"]["containers"][1]["command"]
+        fwd["spec"]["template"]["spec"]["initContainers"][0]["command"]
     assert v["report"]["navs"] == 60                       # the browsers' page loads
     jp = [json.loads(x) for x in (out / "job-pods.jsonl").read_text().splitlines()]
     assert {r["job"] for r in jp} >= {"k6load", "k6browser", "fresh606", "mem606"}

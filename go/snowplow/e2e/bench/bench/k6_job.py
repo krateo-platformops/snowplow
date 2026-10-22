@@ -435,16 +435,54 @@ spec:
 """
 
 
+# Run 11 (#831 follow-up): 4 of 5 sessions met net::ERR_CONNECTION_REFUSED on
+# localhost:8080 — Chrome was up before the forward sidecar listened (plain
+# containers start together). Three layers, each bounded: the forwarder is a
+# NATIVE sidecar (initContainers, restartPolicy Always) whose startupProbe
+# (forward.py --probe) holds the browser container back until every local
+# port accepts; the browser wrapper then waits for an HTTP answer through
+# every forward, i.e. from its target too (FORWARD_WAIT_S, else rc 3: INVALID
+# with the reason); browser.js retries its first navigation.
+FORWARD_WAIT_S = 180
+FORWARD_PROBE_PERIOD_S = 2
+
+
+def _forward_wait(ports: list[str], wait_s: int) -> str:
+    """POSIX sh (busybox): every 127.0.0.1:<port> answers HTTP (any status;
+    busybox wget prints `HTTP/` only when a server answered) within wait_s.
+    Writes /out/browser-forward.json either way."""
+    return f"""wait_forwards() {{
+  t0=$(date +%s); end=$((t0 + ${{FORWARD_WAIT_S:-{wait_s}}}))
+  for p in {" ".join(ports)}; do
+    until wget -q -T 5 -S -O /dev/null "http://127.0.0.1:$p/" 2>&1 | grep -q 'HTTP/'; do
+      if [ "$(date +%s)" -ge "$end" ]; then
+        echo "forward 127.0.0.1:$p did not answer within ${{FORWARD_WAIT_S:-{wait_s}}}s: not starting the browser" >&2
+        printf '{{"kind": "forward_wait", "ok": false, "port": %s, "waited_s": %s}}\\n' "$p" "$(( $(date +%s) - t0 ))" > /out/browser-forward.json
+        return 3
+      fi
+      sleep 1
+    done
+  done
+  printf '{{"kind": "forward_wait", "ok": true, "waited_s": %s}}\\n' "$(( $(date +%s) - t0 ))" > /out/browser-forward.json
+}}
+"""
+
+
 def render_browser(*, config: dict, forwards: list[str], linger_s: float,
-                   cpu: str = BROWSER_CPU, memory: str = BROWSER_MEMORY) -> str:
+                   cpu: str = BROWSER_CPU, memory: str = BROWSER_MEMORY,
+                   forward_wait_s: int = FORWARD_WAIT_S) -> str:
     """ConfigMap k6browser (script + config + forwarder) + the k6browser Job:
-    Chrome through k6 browser, with localhost forwarder sidecar."""
+    Chrome through k6 browser, behind the localhost forwarder (a native
+    sidecar Chrome waits for)."""
     files = {"browser.js": (K6_DIR / "browser.js").read_text(),
              "pageload.js": (K6_DIR / "pageload.js").read_text(),
              "forward.py": (K6_DIR / "forward.py").read_text(),
              "browser-config.json": json.dumps(config, indent=1)}
-    run = "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js"
+    ports = [f.split("=", 1)[0] for f in forwards]
+    run = (_forward_wait(ports, forward_wait_s) + "wait_forwards && "
+           "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js")
     fwd = ", ".join(json.dumps(f) for f in forwards)
+    probes = math.ceil(forward_wait_s / FORWARD_PROBE_PERIOD_S)
     return _configmap("k6browser", files) + f"""---
 apiVersion: batch/v1
 kind: Job
@@ -465,6 +503,27 @@ spec:
 {_POOL}
       securityContext:
         fsGroup: {K6_UID}
+      initContainers:
+      # a native sidecar (restartPolicy Always): it starts first, the browser
+      # container only once its startupProbe passed, and it never holds the
+      # Job open
+      - name: forward
+        image: {PY_IMAGE}
+        restartPolicy: Always
+        command: ["python3", "-u", "/opt/k6/forward.py", {fwd}]
+        startupProbe:
+          exec:
+            command: ["python3", "/opt/k6/forward.py", "--probe", {fwd}]
+          periodSeconds: {FORWARD_PROBE_PERIOD_S}
+          timeoutSeconds: 10
+          failureThreshold: {probes}
+        resources:
+          requests:
+            cpu: {json.dumps(FORWARD_CPU)}
+            memory: {FORWARD_MEMORY}
+        volumeMounts:
+        - name: k6
+          mountPath: /opt/k6
       containers:
       - name: browser
         image: {K6_BROWSER_IMAGE}
@@ -494,16 +553,6 @@ spec:
           mountPath: /opt/k6
         - name: out
           mountPath: /out
-      - name: forward
-        image: {PY_IMAGE}
-        command: ["python3", "-u", "/opt/k6/forward.py", {fwd}]
-        resources:
-          requests:
-            cpu: {json.dumps(FORWARD_CPU)}
-            memory: {FORWARD_MEMORY}
-        volumeMounts:
-        - name: k6
-          mountPath: /opt/k6
       volumes:
       - name: k6
         configMap:

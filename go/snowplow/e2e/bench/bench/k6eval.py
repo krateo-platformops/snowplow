@@ -124,6 +124,11 @@ def read_k6_out(d: str, name: str) -> dict | None:
         except (OSError, ValueError):
             pass
     out["cpu"] = {c: read_cpu(d, c) for c in ((name, "viewer") if name == "k6" else (name,))}
+    try:
+        with open(os.path.join(d, f"{name}-forward.json")) as fh:
+            out["forward"] = json.load(fh)   # the browser wrapper's wait for its forwards
+    except (OSError, ValueError):
+        out["forward"] = None
     return out
 
 
@@ -432,6 +437,11 @@ def browser_report(o: dict | None) -> dict | None:
             "page_load_by_visit_skeleton": _by(p.get("browser_page_load_ms", []), "visit", "skeleton"),
             # the sign-in (submit -> the app leaves /login): authn, not a page load
             "signin_by_session": _by(p.get("browser_signin_ms", []), "session"),
+            # all sessions together (run 11's reader found no flat value)
+            "signin_ms": (lambda v: {"n": len(v), "p50_ms": _pct(v, 50), "p95_ms": _pct(v, 95),
+                                     "max_ms": max(v)} if v else None)(
+                [x for x, _ in p.get("browser_signin_ms", [])]),
+            "forward_wait": o.get("forward"),
             "timeouts": sum(v for v, _ in p.get("browser_page_timeouts", [])),
             "widget_states": dict(states),
             "cpu": cpu_stats((o.get("cpu") or {}).get("browser"))}

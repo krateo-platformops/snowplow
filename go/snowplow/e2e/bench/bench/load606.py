@@ -1719,6 +1719,16 @@ RUN8_VARS_PREFIXES = (
     "snowplow_rbac_",
     "snowplow_l1_identity_class_drift",
     "snowplow_refresh_broadcaster",
+    # run 12: why are first visits cold? learned identity classes (#262),
+    # prewarm completion and engine, phase-1 units and readiness exit
+    # (expvar keys at 1.12.52: cache/learned_identities.go,
+    # cache/prewarm_complete_metric.go, dispatchers/prewarm_engine_metrics.go,
+    # dispatchers/phase1_walk_pagination_metrics.go, phase1_readiness_exit.go)
+    "snowplow_learned_classes",
+    "snowplow_prewarm_complete",
+    "snowplow_phase1_units",
+    "snowplow_phase1_readiness_exit",
+    "snowplow_prewarm_engine",
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
