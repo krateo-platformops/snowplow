@@ -393,6 +393,72 @@ func TestS841_SeedOrderIsByKnownPopulation(t *testing.T) {
 	})
 }
 
+// S8: two KEPT base cohorts with different populations — the base list itself
+// is ordered by population (all of the larger cohort's nav units before any of
+// the smaller's), in both directions so neither the NavOrder/rank tie-breaks
+// nor the group names can pass it by coincidence.
+func TestS841_KeptBaseCohortsOrderedByPopulation(t *testing.T) {
+	repOf := func(group string) func(s841Event) bool {
+		return func(e s841Event) bool { return e.user == "" && s841HasGroup(e.groups, group) }
+	}
+	run := func(t *testing.T, devs, ops int) []s841Event {
+		now := time.Now()
+		var secrets []*corev1.Secret
+		for i := 0; i < devs; i++ {
+			u := "devsonly" + itoaLine(i)
+			secrets = append(secrets, l262ClientconfigSecret(t, u+"-clientconfig", u,
+				[]string{l262Group}, now.Add(-time.Duration(1+i)*time.Hour), "1"))
+		}
+		for i := 0; i < ops; i++ {
+			u := "opsonly" + itoaLine(i)
+			secrets = append(secrets, l262ClientconfigSecret(t, u+"-clientconfig", u,
+				[]string{s841Ops}, now.Add(-time.Duration(20+i)*time.Hour), "1"))
+		}
+		env := l262Setup(t, l262Opts{groupCohorts: []string{s841Ops}, secrets: secrets})
+		l262Stubs(t, l262StubOpts{})
+		l262WaitLearned(t, devs+ops)
+		rec := s841Record(t)
+		ensureFirstNavLatch()
+		l262Boot(t, env, seedModeBoot)
+		return rec.snapshot()
+	}
+	// assertFirst: every nav unit of the `first` cohort seeds before any of `second`'s.
+	assertFirst := func(t *testing.T, ev []s841Event, first, second string) {
+		t.Helper()
+		lastFirst, firstSecond, nFirst, nSecond := -1, -1, 0, 0
+		for i, e := range ev {
+			if e.kind != "widget" {
+				continue
+			}
+			if e.user != "" {
+				t.Fatalf("PRECONDITION: every known user matches a cohort, so no learned class is seeded; got %+v", e)
+			}
+			switch {
+			case repOf(first)(e):
+				lastFirst, nFirst = i, nFirst+1
+			case repOf(second)(e):
+				if firstSecond < 0 {
+					firstSecond = i
+				}
+				nSecond++
+			}
+		}
+		if nFirst == 0 || nSecond == 0 {
+			t.Fatalf("NON-VACUITY: both kept cohorts must seed nav units (%s=%d %s=%d)", first, nFirst, second, nSecond)
+		}
+		if lastFirst > firstSecond {
+			t.Fatalf("S8 RED: the more-populated cohort %s must seed all its nav units before %s's first "+
+				"(last %s unit at %d, first %s unit at %d)", first, second, first, lastFirst, second, firstSecond)
+		}
+	}
+	t.Run("devs cohort matched by 3 before ops cohort matched by 1", func(t *testing.T) {
+		assertFirst(t, run(t, 3, 1), l262Group, s841Ops)
+	})
+	t.Run("ops cohort matched by 3 before devs cohort matched by 1", func(t *testing.T) {
+		assertFirst(t, run(t, 1, 3), s841Ops, l262Group)
+	})
+}
+
 // ── S5 / S6: the drain yields between widgets ───────────────────────────────
 
 // s841Widget is a minimal widget CR the walk harvests before it resolves.
