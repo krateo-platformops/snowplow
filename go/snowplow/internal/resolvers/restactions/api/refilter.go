@@ -351,6 +351,11 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 	// before; a compile error here fails closed (nsCode==nil → evalSingle
 	// treats every item as denied), exactly as the pre-1b inline EvalValue
 	// compile-error branch did per item.
+	//
+	// A plain field path (.metadata.namespace) is also recognised here, once,
+	// and then read from each item without running gojq (uafExpr.eval);
+	// anything the direct read cannot answer exactly as gojq would still runs
+	// the compiled code.
 	nsExpr, nsCode := compileNamespaceFrom(uaf)
 
 	// #123 — compile the per-item NameFrom expression ONCE for the whole
@@ -374,7 +379,17 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 	// discarded at return — no shared state, no global, no cross-call
 	// staleness (a subsequent refilter builds a fresh memo against the live
 	// RBAC store, exactly like filterListByRBAC AC-6).
-	rbacMemo := make(map[uafRBACMemoKey]bool, len(items))
+	//
+	// Size hint: the memo holds one entry per distinct tuple. For a
+	// collection verb Name is "" and the tuples are the few namespaces, so
+	// sizing it for len(items) would allocate and clear a 50K-entry table on
+	// every call; for a name-specific verb the name is in the key and the
+	// tuples run close to one per item.
+	memoHint := 0
+	if rbac.IsNameSpecificVerb(uaf.Verb) {
+		memoHint = len(items)
+	}
+	rbacMemo := make(map[uafRBACMemoKey]bool, memoHint)
 
 	for _, item := range items {
 		switch item.(type) {
@@ -451,7 +466,7 @@ type uafRBACMemoKey struct {
 // (a lone GET-by-name has nothing to memoize) and by unit tests. It delegates
 // to evalSingleMemo with a nil memo, which is byte-identical to the pre-memo
 // behaviour (every EvaluateRBAC call is made).
-func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *gojq.Code, nameExpr string, nameCode *gojq.Code) bool {
+func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *uafExpr, nameExpr string, nameCode *uafExpr) bool {
 	return evalSingleMemo(ctx, log, username, groups, uaf, resources, item, nsExpr, nsCode, nameExpr, nameCode, nil)
 }
 
@@ -468,7 +483,7 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 // on one (resource,namespace,name) must not poison a later same-tuple item;
 // the next item retries. The filtering RESULT is byte-identical either way —
 // the memo only removes redundant EvaluateRBAC calls.
-func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *gojq.Code, nameExpr string, nameCode *gojq.Code, memo map[uafRBACMemoKey]bool) bool {
+func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *uafExpr, nameExpr string, nameCode *uafExpr, memo map[uafRBACMemoKey]bool) bool {
 	// #121 1b — nsExpr + nsCode are the ONCE-compiled NamespaceFrom
 	// expression, hoisted out of the per-item loop by the caller
 	// (compileNamespaceFrom). nsExpr is kept for error/log fidelity; nsCode
@@ -481,7 +496,7 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		)
 		return false
 	}
-	ns, err := evalJQStringCompiled(ctx, nsCode, item)
+	ns, err := nsCode.eval(ctx, item)
 	if err != nil {
 		log.Warn("userAccessFilter: NamespaceFrom JQ eval failed; treating item as denied",
 			slog.String("expr", nsExpr),
@@ -515,7 +530,7 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 			)
 			return false
 		}
-		n, err := evalJQStringCompiled(ctx, nameCode, item)
+		n, err := nameCode.eval(ctx, item)
 		if err != nil {
 			log.Warn("userAccessFilter: NameFrom JQ eval failed; treating item as denied",
 				slog.String("expr", nameExpr),
@@ -610,16 +625,12 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 // A compile error returns (expr, nil): evalSingle then fails closed (deny),
 // identical to the pre-1b per-item EvalValue compile-error branch. The
 // ModuleLoader matches the pre-1b evalJQString call (jqsupport.ModuleLoader()).
-func compileNamespaceFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Code) {
+func compileNamespaceFrom(uaf *templates.UserAccessFilterSpec) (string, *uafExpr) {
 	nsExpr := uaf.NamespaceFrom
 	if nsExpr == "" {
 		nsExpr = ".metadata.namespace"
 	}
-	code, err := CompileJQ(nsExpr, jqsupport.ModuleLoader())
-	if err != nil {
-		return nsExpr, nil
-	}
-	return nsExpr, code
+	return nsExpr, compileUAFExpr(nsExpr, jqsupport.ModuleLoader())
 }
 
 // compileNameFrom resolves the effective NameFrom expression for a UAF and
@@ -644,16 +655,12 @@ func compileNamespaceFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Co
 // A compile error returns (expr, nil): evalSingle then fails closed (deny),
 // identical to the compileNamespaceFrom compile-error branch. The
 // ModuleLoader matches the NamespaceFrom compile (jqsupport.ModuleLoader()).
-func compileNameFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Code) {
+func compileNameFrom(uaf *templates.UserAccessFilterSpec) (string, *uafExpr) {
 	nameExpr := uaf.NameFrom
 	if nameExpr == "" {
 		nameExpr = ".metadata.name"
 	}
-	code, err := CompileJQ(nameExpr, jqsupport.ModuleLoader())
-	if err != nil {
-		return nameExpr, nil
-	}
-	return nameExpr, code
+	return nameExpr, compileUAFExpr(nameExpr, jqsupport.ModuleLoader())
 }
 
 // resolveUAFResources resolves the RBAC resource-plural set for a UAF
