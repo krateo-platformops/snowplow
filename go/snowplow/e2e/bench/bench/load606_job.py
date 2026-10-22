@@ -241,11 +241,16 @@ spec:
 def render_mem(*, snowplow_url: str, authn_url: str, user: str, password: str,
                duration_s: float, interval_s: float = 15.0,
                profile_every_s: float = 120.0,
-               vars_prefixes: tuple[str, ...] = (), linger_s: float = 3600.0) -> str:
+               vars_prefixes: tuple[str, ...] = (), linger_s: float = 3600.0,
+               cpu_profile_s: int = 30, cpu_storm_s: float = 600.0,
+               cpu_every_s: float = 300.0, burst_at_s: float | None = None) -> str:
     """mem606: the standard memory capture for every run (#710) — memstats
     every interval_s and heap profiles at Ready / under load / after any
     restart, kept in the pod's /out until the collect step copies them.
     METADATA ONLY. Uses the load606 ConfigMap that render() creates.
+    Run 12: also CPU profiles (load606.CpuPlan: back to back through the
+    login storm and around the composite burst at `burst_at_s`, periodic
+    otherwise), GC pauses and the goroutine count.
 
     Framed and crash-proof like the driver (#817): memwatch writes mem_start /
     mem_end and ends early once /out/stop exists (collect asks for the final
@@ -257,7 +262,9 @@ python3 -u /opt/load606/load606.py memwatch \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --user {json.dumps(user)} --password {json.dumps(password)} \\
   --duration-s {duration_s:g} --interval-s {interval_s:g} --linger-s 0 --stop-file /out/stop \\
-  --profile-every-s {profile_every_s:g} --out-dir /out --out {MEM_OUT}{"".join(f" --vars-prefix {json.dumps(x)}" for x in vars_prefixes)} || rc=$?
+  --profile-every-s {profile_every_s:g} --cpu-profile-s {cpu_profile_s:d} \\
+  --cpu-storm-s {cpu_storm_s:g} --cpu-every-s {cpu_every_s:g}{"" if burst_at_s is None else f" --burst-at-s {burst_at_s:g}"} \\
+  --out-dir /out --out {MEM_OUT}{"".join(f" --vars-prefix {json.dumps(x)}" for x in vars_prefixes)} || rc=$?
 printf '{{"kind": "mem_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" >> {MEM_OUT}
 echo "$rc" > /out/exited
 sleep {linger_s:g}
@@ -561,7 +568,8 @@ def main(argv: list[str] | None = None) -> int:
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,
             user=a.preflight_user, password=a.password,
             duration_s=a.mem_duration_s,
-            vars_prefixes=tuple(a.mem_vars_prefix or ()), linger_s=a.linger_s))
+            vars_prefixes=tuple(a.mem_vars_prefix or ()), linger_s=a.linger_s,
+            burst_at_s=a.burst_at_s if a.burst_users > 0 else None))
     if a.fresh_rates:
         sys.stdout.write(render_fresh(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,

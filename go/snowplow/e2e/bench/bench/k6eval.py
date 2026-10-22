@@ -25,6 +25,7 @@ import json
 import os
 import re
 from collections import Counter, defaultdict
+from datetime import datetime
 from itertools import pairwise
 
 __all__ = [
@@ -72,6 +73,20 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "browser_page_timeouts", "browser_logins", "browser_signin_ms", "browser_sse_opened",
          "dropped_iterations")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
+# the page loads whose time is kept too (out["times"], index-aligned with
+# out["points"]): run 12 compares latency inside / outside the CPU profiles
+_TIMED = ("page_load_ms", "browser_page_load_ms")
+_RFC3339 = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
+
+
+def epoch(ts: str | None) -> float | None:
+    """k6's point time (RFC 3339, nanoseconds) as epoch seconds."""
+    m = _RFC3339.match(ts or "")
+    if not m:
+        return None
+    tz = "+00:00" if m.group(3) == "Z" else m.group(3)
+    base = datetime.fromisoformat(m.group(1) + tz).timestamp()
+    return base + (float("0." + m.group(2)) if m.group(2) else 0.0)
 
 
 def _pct(vals, p):
@@ -92,6 +107,7 @@ def read_k6_out(d: str, name: str) -> dict | None:
     if not any(os.path.exists(p) for p in (stream, summary, exitf)):
         return None
     out = {"name": name, "stream": os.path.exists(stream), "points": defaultdict(list),
+           "times": defaultdict(list),
            "frames": Counter(), "truncated": False, "summary": None, "exit": None}
     if out["stream"]:
         try:
@@ -115,6 +131,8 @@ def read_k6_out(d: str, name: str) -> dict | None:
                         out["frames"][tags.get("frame")] += 1
                     else:
                         out["points"][r["metric"]].append((data.get("value"), tags))
+                        if r["metric"] in _TIMED:
+                            out["times"][r["metric"]].append(epoch(data.get("time")))
         except (OSError, EOFError):
             out["truncated"] = True                      # a cut gzip member
     for key, path in (("summary", summary), ("exit", exitf)):
@@ -395,10 +413,22 @@ def browser_navs(o: dict | None) -> list[dict]:
     (visit 1 = this session's first load of the route, 2 = warm)."""
     if o is None:
         return []
+    times = (o.get("times") or {}).get("browser_page_load_ms") or []
     return [{"kind": "nav", "nav": t.get("method"), "page": t.get("route"),
              "session": t.get("session"), "wall_ms": round(v, 1),
-             "visit": 1 if t.get("visit") == "first" else 2, "calls": 0, "errors": 0}
-            for v, t in o["points"].get("browser_page_load_ms", [])]
+             "visit": 1 if t.get("visit") == "first" else 2, "calls": 0, "errors": 0,
+             # the point is written when the load ends
+             **({"start": times[i] - v / 1000} if i < len(times) and times[i] else {})}
+            for i, (v, t) in enumerate(o["points"].get("browser_page_load_ms", []))]
+
+
+def k6_page_loads(o: dict | None) -> list[tuple[float, float, dict]]:
+    """k6's page loads as (start epoch, ms, tags), those with a time."""
+    if o is None:
+        return []
+    times = (o.get("times") or {}).get("page_load_ms") or []
+    return [(times[i] - v / 1000, v, t) for i, (v, t) in enumerate(o["points"].get("page_load_ms", []))
+            if i < len(times) and times[i] and v is not None]
 
 
 def _by(points, *keys):
