@@ -459,6 +459,98 @@ func TestS841_KeptBaseCohortsOrderedByPopulation(t *testing.T) {
 	})
 }
 
+// S9: a learned class that OUTRANKS a kept base cohort by population goes
+// first only while it leaves room for the base units still to come — those are
+// the latch's mandatory set, so taking the class when it and the base no longer
+// both fit would push readiness onto the backstop.
+//
+// Fixture (virtual seed clock, every widget 40ms, 2 nav widgets, the widget
+// cost already measured — a resumed boot chunk, so no probe): teamA (3 users,
+// devs+ops) and teamB (2 users, devs+qa) both outrank the devs cohort (1
+// group-only user), and the admission puts both pre-latch (their 160ms fit the
+// 200ms backstop). teamA + the base units (160ms) fit; after teamA, 120ms are
+// left: teamB alone (80ms) fits, teamB + the base units (160ms) do not. teamB
+// must wait for after the latch, the base units seed, and the latch fires
+// before the backstop. Without the reservation teamB is taken and the base
+// units push the latch past the backstop.
+func TestS841_BackstopReservesTheBaseUnitsStillToCome(t *testing.T) {
+	const unit = 40 * time.Millisecond
+	const qa = "l262-qa"
+	now := time.Now()
+	var secrets []*corev1.Secret
+	add := func(prefix string, n int, groups []string, age time.Duration) {
+		for i := 0; i < n; i++ {
+			u := prefix + itoaLine(i)
+			secrets = append(secrets, l262ClientconfigSecret(t, u+"-clientconfig", u, groups, now.Add(-age-time.Duration(i)*time.Minute), "1"))
+		}
+	}
+	add("teamA", 3, []string{l262Group, s841Ops}, 10*time.Hour)
+	add("teamB", 2, []string{l262Group, qa}, 5*time.Hour)
+	add("erin", 1, []string{l262Group}, 20*time.Hour)
+	env := l262Setup(t, l262Opts{groupCohorts: []string{s841Ops, qa}, secrets: secrets, widgets: 2, ras: 2})
+	clk := l262VirtualClock(t)
+	l262Stubs(t, l262StubOpts{sleep: unit, clock: clk})
+	l262WaitLearned(t, 6)
+	widgetUnitCost.add(unit) // measured by an earlier chunk of this boot: no probe
+
+	var mu sync.Mutex
+	first := map[string]time.Time{} // class prefix → first widget resolve instant
+	var fired time.Time
+	inner := widgetsResolveFn
+	widgetsResolveFn = func(ctx context.Context, o widgets.ResolveOptions) (*widgets.Widget, error) {
+		if ui, err := xcontext.UserInfo(ctx); err == nil {
+			cls := "base"
+			switch {
+			case strings.HasPrefix(ui.Username, "teamA"):
+				cls = "teamA"
+			case strings.HasPrefix(ui.Username, "teamB"):
+				cls = "teamB"
+			}
+			mu.Lock()
+			if _, ok := first[cls]; !ok {
+				first[cls] = clk.now()
+			}
+			mu.Unlock()
+		}
+		return inner(ctx, o)
+	}
+	t.Cleanup(func() { widgetsResolveFn = inner })
+	prevObs := firstNavFireObserver
+	firstNavFireObserver = func(string) { mu.Lock(); fired = clk.now(); mu.Unlock() }
+	t.Cleanup(func() { firstNavFireObserver = prevObs })
+
+	latch := ensureFirstNavLatch()
+	start := clk.now()
+	deadline := start.Add(5 * unit) // teamA (2 units) + 3 units: after teamA, teamB XOR the base fits
+	latch.setBackstopDeadline(deadline)
+
+	l262Boot(t, env, seedModeBoot)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if fired.IsZero() {
+		t.Fatal("NON-VACUITY: the first-nav latch never fired")
+	}
+	for _, c := range []string{"teamA", "teamB", "base"} {
+		if first[c].IsZero() {
+			t.Fatalf("NON-VACUITY: class %s never seeded its nav widgets (%v)", c, first)
+		}
+	}
+	if !first["teamA"].Before(first["base"]) {
+		t.Fatalf("PRECONDITION: the 3-user class seeds before the 1-user base cohort (%v)", first)
+	}
+	t.Logf("S9: latch +%v, backstop +%v, teamB first +%v, base first +%v",
+		fired.Sub(start), deadline.Sub(start), first["teamB"].Sub(start), first["base"].Sub(start))
+	if !fired.Before(deadline) {
+		t.Fatalf("S9 RED: the latch fired at +%v, at or after the backstop +%v — a learned class was taken "+
+			"pre-latch without leaving room for the base units still to come", fired.Sub(start), deadline.Sub(start))
+	}
+	if first["teamB"].Before(fired) {
+		t.Fatalf("S9 RED: teamB seeded pre-latch (+%v) although it and the remaining base units do not both fit "+
+			"before the backstop", first["teamB"].Sub(start))
+	}
+}
+
 // ── S5 / S6: the drain yields between widgets ───────────────────────────────
 
 // s841Widget is a minimal widget CR the walk harvests before it resolves.

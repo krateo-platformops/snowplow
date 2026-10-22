@@ -177,6 +177,7 @@ func TestS262_SlowTailRecheckedBeforeEachPreLatchClass(t *testing.T) {
 	clk := l262VirtualClock(t)
 	l262Stubs(t, l262StubOpts{widgetSleep: unit, widgetSleepFor: map[string]time.Duration{users[4]: slow}, clock: clk})
 	l262WaitLearned(t, 5)
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR, l262TargetGVR) // #841: the base cohort's group-only member is a known requester
 
 	var mu sync.Mutex
 	resolves := map[string][]time.Time{}
