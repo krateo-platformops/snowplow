@@ -1003,6 +1003,19 @@ func (c *ListCell) ComparePass() int {
 		if depWatchInFlight(depEventKey{gvr: c.gvr, namespace: k.ns, name: k.name}) {
 			return true
 		}
+		if idxRaw == nil {
+			// Not in the FILTERED listing: deleted, or still in the indexer but no
+			// longer matching the selector. The delivery is compared with the
+			// indexer's own object (unfiltered), so an object that left the
+			// selector is not mistaken for one still on its way.
+			raw, exists, servable := rw.rawByKey(c.gvr, k.ns, k.name)
+			if !servable {
+				return true // nothing can be judged; Snapshot unanchors on the next read
+			}
+			if exists {
+				idxRaw = raw
+			}
+		}
 		return deliveredMismatch(c.gvr, k, idOf(idxRaw))
 	}
 

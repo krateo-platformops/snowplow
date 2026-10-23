@@ -430,9 +430,9 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 				// in the deadline's queue rather than letting it inherit a
 				// verification from before the gap.
 				invalidateStoreVerification(gvr)
+				bumpServabilityEpoch(gvr) // #854 — confirmation retracted: an exit from servable
 			}
 			delete(rw.confirmed, gvr)
-			bumpServabilityEpoch(gvr) // #854 — confirmation retracted: an exit from servable
 			rw.clearRetainUnknownWarnLocked(gvr)
 		}
 	}

@@ -1019,7 +1019,6 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 		gi = rw.metaFactory.ForResource(gvr)
 	}
 	rw.informers[gvr] = gi
-	bumpServabilityEpoch(gvr) // #854 — an informer (re)creation
 	// Ship 1 / 0.30.225 — record GVR insert timestamp for the
 	// /debug/vars snowplow_plurals_registered_gvrs envelope's
 	// last_register_unix_ns field. The existence-check at the head
@@ -1523,7 +1522,6 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		}
 	}
 	rw.informers[gvr] = gi
-	bumpServabilityEpoch(gvr) // #854 — an informer (re)creation
 	// Ship 1 / 0.30.225 — record GVR insert timestamp for the
 	// /debug/vars snowplow_plurals_registered_gvrs envelope's
 	// last_register_unix_ns field. The existence-check at the head

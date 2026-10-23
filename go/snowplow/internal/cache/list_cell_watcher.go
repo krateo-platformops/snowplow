@@ -2,10 +2,12 @@
 // ResourceWatcher and the dep bridge.
 //
 //   - ServabilityEpoch: a per-GVR counter bumped on every transition OUT of
-//     servable (watch broken, type confirmation retracted, informer removed) and
-//     on every informer (re)creation. A cell captures it at anchor and re-checks
-//     it on every read, so an outage or a rebuild — even one with no event the
-//     dep tracker sees — drops the cell back to a full fill.
+//     servable (watch broken, type confirmation retracted, informer removed). A
+//     cell captures it at anchor and re-checks it on every read, so an outage or
+//     a rebuild — even one that recovered before the read, with no event the dep
+//     tracker sees — drops the cell back to a full fill. An informer is only
+//     created where none exists (first registration, or after a removal), so
+//     the removal's bump also covers every re-creation.
 //   - listRawKeyedServable / rawByKey: the same per-object bytes ListRawServable
 //     serves, with their keys, and one object by key.
 //   - depWatchLostEventSignal / depWatchInFlight: the dep bridge's lost-event
@@ -19,10 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-var (
-	servEpochByGVR sync.Map // schema.GroupVersionResource → *atomic.Uint64
-	servEpochAll   atomic.Uint64
-)
+var servEpochByGVR sync.Map // schema.GroupVersionResource → *atomic.Uint64
 
 // bumpServabilityEpoch marks a servability transition of gvr.
 func bumpServabilityEpoch(gvr schema.GroupVersionResource) {
@@ -30,17 +29,12 @@ func bumpServabilityEpoch(gvr schema.GroupVersionResource) {
 	v.(*atomic.Uint64).Add(1)
 }
 
-// bumpServabilityEpochAll marks a transition of every GVR at once (a reset of
-// the confirmed set).
-func bumpServabilityEpochAll() { servEpochAll.Add(1) }
-
 // ServabilityEpoch returns gvr's servability epoch.
 func (rw *ResourceWatcher) ServabilityEpoch(gvr schema.GroupVersionResource) uint64 {
-	e := servEpochAll.Load()
 	if v, ok := servEpochByGVR.Load(gvr); ok {
-		e += v.(*atomic.Uint64).Load()
+		return v.(*atomic.Uint64).Load()
 	}
-	return e
+	return 0
 }
 
 // keyedRaw is one indexer object's raw JSON with its key.

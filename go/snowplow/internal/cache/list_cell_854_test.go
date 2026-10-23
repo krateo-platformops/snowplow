@@ -61,12 +61,24 @@ func c854Funcs() ListCellFuncs {
 // c854Anchor builds a watcher with n objects and anchors a cell over them.
 func c854Anchor(t *testing.T, n int) (*ResourceWatcher, *ListCell) {
 	t.Helper()
+	rw, c, _ := c854AnchorWith(t, n, c854Funcs(), nil)
+	return rw, c
+}
+
+// c854AnchorWith is c854Anchor with the cell's funcs, a label set on every
+// seeded object, and the dynamic client (for real writes through the informer).
+func c854AnchorWith(t *testing.T, n int, f ListCellFuncs, labels map[string]string) (*ResourceWatcher, *ListCell, *dynamicfake.FakeDynamicClient) {
+	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	ResetListCellsForTest()
 	t.Cleanup(ResetListCellsForTest)
 	var seed []runtime.Object
 	for i := 0; i < n; i++ {
-		seed = append(seed, c854Obj(i))
+		o := c854Obj(i)
+		if labels != nil {
+			o.SetLabels(labels)
+		}
+		seed = append(seed, o)
 	}
 	kinds := rbacListKinds()
 	kinds[c854GVR] = "ThingList"
@@ -96,7 +108,7 @@ func c854Anchor(t *testing.T, n int) (*ResourceWatcher, *ListCell) {
 	if !ok || len(keyed) != n {
 		t.Fatalf("listing: ok=%v n=%d", ok, len(keyed))
 	}
-	f := c854Funcs()
+	keyed, _ = (&ListCell{funcs: f}).filter(keyed)
 	raws := make([][]byte, len(keyed))
 	items := make([]*unstructured.Unstructured, len(keyed))
 	for i, kr := range keyed {
@@ -109,7 +121,7 @@ func c854Anchor(t *testing.T, n int) (*ResourceWatcher, *ListCell) {
 	if c == nil {
 		t.Fatal("PRECONDITION: the cell did not anchor")
 	}
-	return rw, c
+	return rw, c, dyn
 }
 
 func (rw *ResourceWatcher) c854Indexer(t *testing.T) interface {
