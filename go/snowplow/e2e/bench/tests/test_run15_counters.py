@@ -4,8 +4,10 @@ store verification re-check (#875), from mem606's samples, per phase.
 The expvar documents are RECORDED from snowplow's own code at the PR heads:
   * tests/fixtures/list_incremental_expvar_aec5f1fb.json — snowplow_list_incremental
     before / after #865's F5s flow (a divergence, an unanchor, two comparator passes);
-  * tests/fixtures/store_verification_expvar_01d32632.json — snowplow_store_verification
-    and its skipped_by_reason map before / after one forced pass over a true lost update.
+  * tests/fixtures/store_verification_expvar_0934e202.json — snowplow_store_verification
+    and its skipped_by_reason map at #875's near-final head: before / after one forced
+    pass over a true lost update nothing was delivered for (counted undelivered, no
+    GET), and after one over a GVR with no delivery record (counted unavailable).
 They go through mem606's real sampler (load606.mem_sample, default prefixes)
 on run 13's real phase timeline (tests/fixtures/fresh_run13.json). Later
 samples reuse the recorded documents' shape with the counters set to the
@@ -24,7 +26,7 @@ from tests.test_run14_list_narrow import F13, _sample
 
 FIX = Path(__file__).resolve().parent / "fixtures"
 LI = json.loads((FIX / "list_incremental_expvar_aec5f1fb.json").read_text())
-SV = json.loads((FIX / "store_verification_expvar_01d32632.json").read_text())
+SV = json.loads((FIX / "store_verification_expvar_0934e202.json").read_text())
 LI_KEY, SV_KEY = "snowplow_list_incremental", "snowplow_store_verification"
 SKIP_KEY = "snowplow_store_verification_skipped_by_reason"
 BIG, SMALL = "composition.krateo.io/v1-2-2, Resource=compositions", "/v1, Resource=events"
@@ -38,10 +40,12 @@ def _li(passes, unanchors, divergences, refresh_skipped, anchors=1, live=1):
     return d
 
 
-def _sv(gets, cleared, lost_update_forced, candidates, fired, skipped):
+def _sv(gets, cleared, lost_update_forced, candidates, fired, skipped, undelivered, unavailable):
     d = copy.deepcopy(SV["after"])
     d[SV_KEY].update(store_divergence_recheck_gets_total=gets,
                      store_divergence_recheck_cleared_total=cleared,
+                     store_divergence_recheck_undelivered_total=undelivered,
+                     store_divergence_recheck_unavailable_total=unavailable,
                      store_divergent_lost_update_forced_total=lost_update_forced,
                      store_divergence_candidates_total=candidates, store_repairs_fired_total=fired)
     d[SKIP_KEY] = skipped
@@ -61,13 +65,13 @@ POINTS = [
     (100, LI["before"][LI_KEY], SV["before"], _fills(0, 0, 0)),              # storm (recorded)
     (500, LI["after"][LI_KEY], SV["after"], _fills(10, 2, 0)),               # storm (recorded)
     (1000, _li(12, {"divergence": 1}, {"key_mismatch": 1}, 5),
-     _sv(12, 4, 1, 6, 0, {"undecorated_informer": 5, "recheck_error": 1}), _fills(15, 2, 1)),  # burst
+     _sv(12, 4, 1, 6, 0, {"undecorated_informer": 5, "recheck_error": 1}, 3, 0), _fills(15, 2, 1)),  # burst
     (2000, _li(40, {"divergence": 1, "lost_event": 3}, {"key_mismatch": 1}, 50),
-     _sv(30, 14, 2, 20, 1, {"undecorated_informer": 5, "recheck_error": 1}), _fills(15, 40, 4)),  # churn@1
+     _sv(30, 14, 2, 20, 1, {"undecorated_informer": 5, "recheck_error": 1}, 5, 2), _fills(15, 40, 4)),  # churn@1
     (2900, _li(41, {"divergence": 1, "lost_event": 3}, {"key_mismatch": 1, "obj_src": 2}, 950),
-     _sv(80, 60, 2, 70, 1, {"undecorated_informer": 5, "recheck_error": 1}), _fills(19, 400, 6)),  # churn@10
+     _sv(80, 60, 2, 70, 1, {"undecorated_informer": 5, "recheck_error": 1}, 9, 2), _fills(19, 400, 6)),  # churn@10
     (4700, _li(42, {"divergence": 1, "lost_event": 3}, {"key_mismatch": 1, "obj_src": 2}, 951),
-     _sv(80, 60, 2, 70, 1, {"undecorated_informer": 5, "recheck_error": 1}), _fills(19, 400, 6)),  # steady
+     _sv(80, 60, 2, 70, 1, {"undecorated_informer": 5, "recheck_error": 1}, 9, 2), _fills(19, 400, 6)),  # steady
 ]
 
 
@@ -84,7 +88,8 @@ def test_mem606_captures_both_with_the_default_prefixes():
     assert "snowplow_list_incremental" in pre and "snowplow_store_verification" in pre
     rec = _sample(1, {LI_KEY: LI["after"][LI_KEY], **SV["after"]})
     assert set(rec["extra"]) >= {LI_KEY, SV_KEY, SKIP_KEY}
-    assert rec["extra"][SV_KEY]["store_divergence_recheck_gets_total"] == 2      # the recorded value
+    assert rec["extra"][SV_KEY]["store_divergence_recheck_undelivered_total"] == 1   # the recorded value
+    assert "store_divergence_recheck_unavailable_total" in rec["extra"][SV_KEY]
     assert rec["extra"][LI_KEY]["divergences"] == {"key_mismatch": 1}
 
 
@@ -115,29 +120,35 @@ def test_store_verification_report_per_phase():
     assert r["status"] == "present"
     p = r["by_phase"]
     st = p["storm"]
-    # the recorded forced pass: 2 re-check GETs, 1 forced lost update, 1 candidate
-    assert (st["recheck_gets"], st["recheck_cleared"], st["divergence_candidates"]) == (2, 0, 1)
+    # the recorded forced pass: a true lost update nothing was delivered for —
+    # counted undelivered, without a re-check GET; 1 forced lost update, 1 candidate
+    assert (st["recheck_gets"], st["recheck_cleared"], st["divergence_candidates"]) == (0, 0, 1)
+    assert (st["recheck_undelivered"], st["recheck_unavailable"]) == (1, 0)
     assert st["findings"]["lost_update_forced"] == 1 and st["repairs"]["repairs_fired"] == 0
     b = p["burst"]
-    assert (b["recheck_gets"], b["recheck_cleared"]) == (10, 4)
+    assert (b["recheck_gets"], b["recheck_cleared"], b["recheck_undelivered"]) == (12, 4, 2)
     assert b["skipped_by_reason"] == {"recheck_error": 1}
     c1 = p["churn:list_dep@1"]
     assert c1["repairs"]["repairs_fired"] == 1 and c1["findings"]["lost_update_forced"] == 1
-    assert p["churn:list_dep@10"]["recheck_cleared"] == 46
+    assert (c1["recheck_undelivered"], c1["recheck_unavailable"]) == (2, 2)
+    c10 = p["churn:list_dep@10"]
+    assert (c10["recheck_cleared"], c10["recheck_undelivered"], c10["recheck_unavailable"]) == (46, 4, 0)
     assert p["all"]["recheck_gets"] == 80 and p["all"]["recheck_cleared"] == 60
+    assert (p["all"]["recheck_undelivered"], p["all"]["recheck_unavailable"]) == (9, 2)
     assert r["gauges_last"]["store_repairs_pending"] == 1                       # recorded
 
 
 def test_a_restart_takes_the_new_values():
     # 1050: still in the burst (the windows end at the last sample, here 1100)
-    pts = POINTS[:3] + [(1050, _li(2, {}, {}, 1), _sv(3, 1, 0, 1, 0, {"undecorated_informer": 5}),
+    pts = POINTS[:3] + [(1050, _li(2, {}, {}, 1), _sv(3, 1, 0, 1, 0, {"undecorated_informer": 5}, 1, 0),
                          _fills(1, 0, 0)), POINTS[-1]]
     mem = _mem(pts)
     mem[-2]["num_gc"], mem[-3]["num_gc"] = 3, 900                       # NumGC went down
     r = load606.list_incremental_report(mem, F13["fresh"])
     assert r["restarts"] == 1 and r["by_phase"]["burst"]["comparator_passes"] == 10 + 2
     s = load606.store_verification_report(mem, F13["fresh"])
-    assert s["restarts"] == 1 and s["by_phase"]["burst"]["recheck_gets"] == 10 + 3
+    assert s["restarts"] == 1 and s["by_phase"]["burst"]["recheck_gets"] == 12 + 3
+    assert s["by_phase"]["burst"]["recheck_undelivered"] == 2 + 1
 
 
 def test_absent_reports_say_missing_with_a_warning_and_no_verdict_change():
@@ -169,3 +180,26 @@ def test_run13_real_mem_samples_report_both_absent():
     assert v["report"]["list_incremental_report_only"]["status"] == "absent_in_all_samples"
     assert v["report"]["store_verification_report_only"]["status"] == "absent_in_all_samples"
     assert len(v["report"]["report_warnings"]) == 3                     # + #855's list_narrow
+
+
+def test_store_verification_recorded_unavailable_and_an_older_image():
+    """The recorded no-delivery-record pass (#875: the GVR is verified the
+    pre-#872 way, counted unavailable, the repair refused for a factory
+    informer); and a 01d32632-era image that publishes neither new counter:
+    None (missing), never 0."""
+    s0 = F13["mem_start"]["t"]
+    head = [dict(F13["mem_start"]), {"kind": "mem", "t": F13["load_detected_t"], "load_detected": True}]
+    # a later, unchanged sample: the windows end at the last one
+    mem = head + [_sample(s0 + t, d) for t, d in ((100, SV["before"]), (500, SV["after_unavailable"]),
+                                                   (4700, SV["after_unavailable"]))]
+    st = load606.store_verification_report(mem, F13["fresh"])["by_phase"]["storm"]
+    assert (st["recheck_unavailable"], st["recheck_undelivered"], st["recheck_gets"]) == (1, 0, 0)
+    assert st["findings"]["lost_update_forced"] == 1 and st["repairs"]["repair_unsupported"] == 1
+    old = copy.deepcopy([SV["before"], SV["after"]])
+    for d in old:
+        for k in ("store_divergence_recheck_undelivered_total", "store_divergence_recheck_unavailable_total"):
+            d[SV_KEY].pop(k)
+    mem = head + [_sample(s0 + t, d) for t, d in ((100, old[0]), (500, old[1]), (4700, old[1]))]
+    st = load606.store_verification_report(mem, F13["fresh"])["by_phase"]["storm"]
+    assert st["recheck_undelivered"] is None and st["recheck_unavailable"] is None
+    assert st["findings"]["lost_update_forced"] == 1

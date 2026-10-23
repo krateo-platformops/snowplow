@@ -2136,9 +2136,11 @@ def content_fill_report(mem: list[dict], bucket_s: float = CONTENT_FILL_BUCKET_S
 #     the fills avoided), unanchors {reason}, divergences {reason},
 #     divergence_total (must be 0), ...; plus the content-fill reason
 #     "reanchor" in snowplow_apistage_content_fill_total (already captured).
-#   snowplow_store_verification (#875 @ 01d32632, cache/store_verify_stats.go,
-#     statsByTag: the map's keys are the stat tags):
-#     store_divergence_recheck_gets_total / _cleared_total, the
+#   snowplow_store_verification (#875 @ 0934e202, re-checked from 01d32632:
+#     two stats added, none renamed; cache/store_verify_stats.go, statsByTag:
+#     the map's keys are the stat tags):
+#     store_divergence_recheck_gets_total / _cleared_total /
+#     _undelivered_total / _unavailable_total, the
 #     store_divergent_{lost_update,lost_delete,lost_add,uid_mismatch}_
 #     {snapshot,forced}_total findings, store_divergence_candidates_total,
 #     store_repairs_fired_total (one per relist the cache.store.repair line
@@ -2279,6 +2281,8 @@ def _store_verify_counters(m: dict) -> dict | None:
         return None
     out = {k: _num(v.get(k)) for k in ("store_divergence_recheck_gets_total",
                                         "store_divergence_recheck_cleared_total",
+                                        "store_divergence_recheck_undelivered_total",
+                                        "store_divergence_recheck_unavailable_total",
                                         "store_divergence_candidates_total", "store_verifications_total",
                                         *_STORE_FINDINGS, *_STORE_REPAIRS)}
     return out | _flat("skipped", extra.get(STORE_VERIFY_SKIPPED_KEY))
@@ -2286,7 +2290,9 @@ def _store_verify_counters(m: dict) -> dict | None:
 
 def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) -> dict:
     """#875, per phase: the forced pass's re-check GETs and the candidates
-    they cleared, the verification findings (divergences by class and site,
+    they cleared; the candidates counted WITHOUT a re-check — nothing
+    delivered for the key during the pass (undelivered), or the GVR has no
+    delivery record (unavailable: verified the pre-#872 way); the verification findings (divergences by class and site,
     raw candidates), the verifications skipped by reason, and the repairs
     (fired, and ineffective / unsupported / suppressed)."""
     r = _phase_counter_report(mem, fresh, STORE_VERIFY_KEY, _store_verify_counters)
@@ -2301,6 +2307,8 @@ def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) 
             "seconds": p["seconds"], "pairs": p["pairs"],
             "recheck_gets": c.get("store_divergence_recheck_gets_total"),
             "recheck_cleared": c.get("store_divergence_recheck_cleared_total"),
+            "recheck_undelivered": c.get("store_divergence_recheck_undelivered_total"),
+            "recheck_unavailable": c.get("store_divergence_recheck_unavailable_total"),
             "verifications": c.get("store_verifications_total"),
             "findings": {k[len("store_divergent_"):-len("_total")]: c.get(k) for k in _STORE_FINDINGS},
             "divergence_candidates": c.get("store_divergence_candidates_total"),
