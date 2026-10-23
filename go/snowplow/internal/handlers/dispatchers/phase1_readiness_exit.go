@@ -337,6 +337,17 @@ func (p *bootNavProgress) arm(total, cohorts, external int) {
 	p.aborted = 0
 }
 
+// addUnits (#841) extends the armed pass by n nav units: the units of a learned
+// class the pass seeds before the latch, decided as the class is taken.
+func (p *bootNavProgress) addUnits(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.total += n
+	if n > 0 {
+		p.cohorts++
+	}
+}
+
 // unitProcessed counts one processed nav unit; err is the unit's seed error (nil
 // on success). Classification reuses classifySeedErr (the same verdict the
 // expected_deny / operational_failure log lines carry).

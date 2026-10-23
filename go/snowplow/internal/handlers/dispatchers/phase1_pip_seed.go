@@ -640,6 +640,9 @@ type seedTarget struct {
 	// cache.PrewarmTarget.Learned). Seeded in its own capacity-bounded phase,
 	// and its identity reaches logs only as cache.LearnedClassLabel.
 	Learned bool
+	// Population — #841: known requesters deriving this target's key (carried
+	// from cache.PrewarmTarget.Population). The seed order's primary key.
+	Population int
 }
 
 // withCohortSeedContext builds the per-cohort seed context. Mirrors
@@ -682,9 +685,18 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 		}),
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
+	// #841 — the seed class the primitives stamp on the cells they insert
+	// (cache.ResolvedEntry.SeedOrigin; counts only, never identity).
+	// cohort.Learned, not the privacy predicate: a base representative whose
+	// username was once learned is still a base target.
 	if learned {
 		rctx = withLearnedSeedLabel(rctx, redact.Label(cache.LearnedClassLabel(cohort.Username, cohort.Groups)))
 	}
+	origin := cache.SeedOriginBase
+	if cohort.Learned {
+		origin = cache.SeedOriginLearned
+	}
+	rctx = cache.WithSeedOrigin(rctx, origin)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 	// #130 F3b Fix 2 — attach the shared watcher so the cohort seed's inner LIST
@@ -1314,6 +1326,9 @@ func seedRestactionResolveAndPutProd(
 		// already holds. See seedProvenanceForMode.
 		SeededAtBoot: terminalGuard.seededAtBoot,
 		TTLOverride:  uafTTLOverrideForEntry(inputs),
+		// #841 — the seed class, kept only if this Put INSERTS the cell (the store
+		// keeps a resident cell's own origin on a replace).
+		SeedOrigin: cache.SeedOriginFromContext(resCtx),
 	}
 	// #394 — the terminal write goes through seedTerminalPut with the guard
 	// seedOneRestaction captured at seed entry: PutIfGen for the post-readyz
@@ -1690,6 +1705,9 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		// warm (warmLocked) and ride #378's re-mint past #496's gate.
 		SeededAtBoot: terminalGuard.seededAtBoot,
 		TTLOverride:  uafTTLOverrideForEntry(inputs),
+		// #841 — the seed class, kept only if this Put INSERTS the cell (the store
+		// keeps a resident cell's own origin on a replace).
+		SeedOrigin: cache.SeedOriginFromContext(resCtx),
 	}
 	// #394 — generation-guarded terminal write for the post-readyz modes (plain
 	// for boot); see seedOneRestaction's tail. A refusal skips the counter, the

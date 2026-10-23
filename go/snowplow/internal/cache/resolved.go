@@ -267,6 +267,14 @@ type ResolvedEntry struct {
 	// starts a fresh entry without the flag.
 	StaleDerived bool
 
+	// SeedOrigin (#841, metadata only) is the seed class whose seed INSERTED
+	// this cell — SeedOriginBase / SeedOriginLearned — or "" for a cell traffic
+	// or the refresher created. It belongs to the key's lineage like BornAt:
+	// putCoreLocked's replace-in-place keeps the prior entry's origin whatever
+	// the re-Put carries. Never read by warmLocked, a key or a log line; it
+	// feeds snowplow_prewarm_seed_origin only (seed_origin.go).
+	SeedOrigin string
+
 	// Inputs is the canonical key-input bundle the entry was resolved
 	// from. The refresher uses it to drive a re-resolve when an
 	// UPDATE/PATCH event fires for any of this entry's dep tuples.
@@ -1060,6 +1068,10 @@ type lruItem struct {
 	// never read; a boot-seed carries warmth via SeededAtBoot until real traffic
 	// stamps a read here. Covered under -race by the reaper/walk concurrency arm.
 	lastRead time.Time
+	// seedHitSeen (#841) — a customer has hit this seed-inserted cell at least
+	// once (snowplow_prewarm_seed_origin cells_hit). Written and read under c.mu
+	// on the Get-HIT path; like lastRead it rides a replace-in-place.
+	seedHitSeen bool
 }
 
 var (
@@ -1543,6 +1555,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		c.order.MoveToFront(el)
 		item.lastRead = now
 		c.hitTotal.Add(1)
+		noteSeedOriginHitLocked(item) // #841
 	}
 	return item.entry, true
 }
@@ -2210,6 +2223,12 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		if old.entry != nil && old.entry != entry && entry.recentHitters.Load() == nil {
 			entry.recentHitters.Store(old.entry.recentHitters.Load())
 		}
+		// #841 — the seed origin belongs to the KEY too, and only an insert sets
+		// it: a refresh re-Put of a seeded cell keeps counting the hits the seed
+		// bought, and a seed re-Put of a cell traffic created does not claim it.
+		if old.entry != nil {
+			entry.SeedOrigin = old.entry.SeedOrigin
+		}
 		// freshMint re-mint (#378): skip the inherit → entry.BornAt stays the fresh
 		// birth ReplaceIfGenRefresh stamped → the replace-in-place is a FRESH birth
 		// (resets the max-age clock) without evicting first (no cold window).
@@ -2262,6 +2281,7 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 	c.storeTotal.Add(1)
 	c.bumpClassStoreLocked(apistage, widgetContent, raFullList)
 	c.noteEntryClassLocked(key, entry)
+	noteSeedOriginInsertLocked(entry) // #841
 
 	c.evictUntilUnderCapsLocked()
 }

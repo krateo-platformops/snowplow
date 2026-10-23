@@ -12,7 +12,9 @@
 //
 // ONE WRAPPER over the target enumeration (enumeratePrewarmTargetsForGVRFn)
 // covers every seed path — boot, keepwarm, gvr-discovered and the #258 reseed.
-// For a GVR it emits a learned class only if it is
+// #841: it keeps a representative only if some learned class has the SAME
+// signature (a known requester derives its key); the others are dropped, so an
+// empty registry seeds nothing. For a GVR it emits a learned class only if it is
 //
 //   - AUTHORISED: a binding in that GVR's bucket names one of its subjects
 //     (cache.IdentityAuthorisedForGVR), and
@@ -27,7 +29,9 @@
 // per-snapshot memo, rbac.SubjectBindingSetDigest).
 //
 // THE BOUND (self-adapting, no env knob). Learned classes are seeded newest
-// LastSeen first, until the first of two measured capacities is reached:
+// LastSeen first, until the first of two measured capacities is reached (#841:
+// before any unit is measured the newest class alone is admitted — its seed is
+// the measurement — and the decision is re-taken):
 //
 //   - ENGINE: every keepwarm cycle must re-resolve every seeded unit before the
 //     next one, so Σ (W_c·t_widget + R_c·t_ra) ≤ keepwarmSweepInterval −
@@ -35,8 +39,9 @@
 //     wall cost of a resolved widget / RESTAction seed unit (kept apart: an RA
 //     can cost far more than an informer-served widget) and W/R the class's (or
 //     the base cohorts') units of each kind in this pass. Until a unit has been
-//     measured no class is admitted (never over-commit on a guess); until an RA
-//     has been measured t_ra borrows t_widget and the RA phase re-decides.
+//     measured only the newest class is admitted, as the probe (never
+//     over-commit on a guess); until an RA has been measured t_ra borrows
+//     t_widget and the RA phase re-decides.
 //   - MEMORY: the new classes' cells (their units · the store's measured mean
 //     entry size) must fit the L1 store's own byte/entry headroom AND the
 //     adaptive admission ceiling (cache.AdmissionCeiling, GOMEMLIMIT-relative).
@@ -95,26 +100,66 @@ func learnedClassSignature(username string, groups []string) string {
 }
 
 // enumeratePrewarmTargetsWithLearned is THE wrapper: the representative targets
-// for (gvr, verb), plus every learned class that is AUTHORISED for the GVR and
-// DISTINCT from every representative and every learned class already emitted.
-// Live on every call.
+// for (gvr, verb) that some KNOWN REQUESTER matches, plus every learned class
+// that is AUTHORISED for the GVR and DISTINCT from every kept representative and
+// every learned class already emitted. Live on every call.
+//
+// #841 — A REPRESENTATIVE IS KEPT ONLY IF A KNOWN REQUESTER DERIVES ITS KEY. A
+// representative is a one-binding identity; a real user's key folds their FULL
+// binding set, so a representative's cells serve only a user whose signature
+// equals it. The known requesters are the learned classes (the clientconfig
+// certificates and live traffic, #262). A representative no learned class
+// equals seeds cells no one can hit (bench run 12: 59 representatives took the
+// whole 480 s readiness window and every keepwarm budget, and drew 0 hits,
+// while all 310 distinct learned classes stayed unseeded). One that a learned
+// class equals is kept — it seeds exactly that class's cells, and the class is
+// then deduped onto it as before. An empty registry therefore seeds nothing: no
+// known requester. A login adds a class, and with it its representative or its
+// own target, on the next enumeration (the class-seed scope seeds both).
 func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb string) []cache.PrewarmTarget {
 	base := enumerateBasePrewarmTargetsFn(gvr, verb)
 	classes := cache.LearnedIdentitiesSnapshot()
-	if len(classes) == 0 {
-		return base
+	if len(base) == 0 && len(classes) == 0 {
+		return nil
+	}
+	// The signatures of every known requester. A class whose signature equals a
+	// representative's holds that representative's binding set, so it is
+	// authorised wherever the representative is: no per-GVR check is needed to
+	// MATCH a representative, only to emit a class of its own.
+	type sigClass struct {
+		c   cache.LearnedIdentity
+		sig string
+	}
+	// known counts, per signature, the known requesters holding it: the
+	// POPULATION a target with that signature serves (#841 seed order).
+	known := make(map[string]int, len(classes))
+	sigs := make([]sigClass, 0, len(classes))
+	for _, c := range classes {
+		sig := learnedClassSignature(c.Username, c.Groups)
+		known[sig]++
+		sigs = append(sigs, sigClass{c: c, sig: sig})
 	}
 	seen := make(map[string]struct{}, len(base)+len(classes))
+	out := make([]cache.PrewarmTarget, 0, len(base)+len(classes))
+	unmatched := 0
 	for _, t := range base {
-		seen[learnedClassSignature(t.Subject.Username, t.Subject.Groups)] = struct{}{}
-	}
-	out := base
-	for _, c := range classes {
-		if !cache.IdentityAuthorisedForGVR(gvr, c.Username, c.Groups) {
+		sig := learnedClassSignature(t.Subject.Username, t.Subject.Groups)
+		pop := known[sig]
+		if pop == 0 {
+			unmatched++
 			continue
 		}
-		sig := learnedClassSignature(c.Username, c.Groups)
+		seen[sig] = struct{}{}
+		t.Population = pop
+		out = append(out, t)
+	}
+	cache.NoteBaseTargets(len(base)-unmatched, unmatched)
+	for _, sc := range sigs {
+		c, sig := sc.c, sc.sig
 		if _, dup := seen[sig]; dup {
+			continue
+		}
+		if !cache.IdentityAuthorisedForGVR(gvr, c.Username, c.Groups) {
 			continue
 		}
 		seen[sig] = struct{}{}
@@ -124,6 +169,7 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 			Verb:              verb,
 			CollapsedBindings: 1,
 			Learned:           true,
+			Population:        known[sig],
 		})
 	}
 	return out
@@ -232,21 +278,26 @@ func resetSeedUnitCostForTest() {
 // ── admission (the self-adapting bound) ──────────────────────────────────────
 
 // learnedPlan is one pass's learned workload: every class with ≥1 distinct
-// target (newest LastSeen first), its widget and RESTAction units, and the
-// pass's base-cohort units of each kind.
+// target (largest known population first, then newest LastSeen), its widget
+// and RESTAction units, its population, and the pass's base-cohort units of
+// each kind.
 type learnedPlan struct {
 	order  []string
 	wUnits map[string]int
 	rUnits map[string]int
+	pop    map[string]int
 	baseW  int
 	baseR  int
 }
 
-// newLearnedPlan orders the classes present in the unit maps by the registry's
-// newest-LastSeen-first order. A class that left the registry since the targets
-// were enumerated (Secret deleted / JWT expired) is not seeded.
-func newLearnedPlan(wUnits, rUnits map[string]int, baseW, baseR int) learnedPlan {
-	p := learnedPlan{wUnits: wUnits, rUnits: rUnits, baseW: baseW, baseR: baseR}
+// newLearnedPlan orders the classes present in the unit maps by POPULATION
+// descending (#841: the known requesters each class's key serves — a class a
+// whole team shares before a one-user class, so the bound and the readiness
+// backstop cut the least-populated classes), ties by the registry's
+// newest-LastSeen-first order. A class that left the registry since the
+// targets were enumerated (Secret deleted / JWT expired) is not seeded.
+func newLearnedPlan(wUnits, rUnits, pop map[string]int, baseW, baseR int) learnedPlan {
+	p := learnedPlan{wUnits: wUnits, rUnits: rUnits, pop: pop, baseW: baseW, baseR: baseR}
 	if len(wUnits) == 0 && len(rUnits) == 0 {
 		return p
 	}
@@ -255,6 +306,7 @@ func newLearnedPlan(wUnits, rUnits map[string]int, baseW, baseR int) learnedPlan
 			p.order = append(p.order, k)
 		}
 	}
+	sort.SliceStable(p.order, func(i, j int) bool { return pop[p.order[i]] > pop[p.order[j]] })
 	return p
 }
 
@@ -278,8 +330,12 @@ type learnedDecision struct {
 	// preLatch is the newest-first prefix of order whose NAV units fit the
 	// readiness backstop budget (all of order when no backstop applies); the
 	// rest of order seeds right after the latch fires, in the same order.
-	preLatch      []string
-	bound         string // "engine" | "memory" | "none"
+	preLatch []string
+	// probe (#841) — no seed unit had been measured, so the bound admitted only
+	// the newest memory-feasible class: seeding it IS the measurement. The
+	// caller re-takes the decision once it has seeded the probe.
+	probe         bool
+	bound         string // "engine" | "memory" | "none" | "probe"
 	tWidget, tRA  time.Duration
 	budget        time.Duration // keepwarm interval − the base cohorts' cost
 	used          time.Duration
@@ -321,7 +377,8 @@ func learnedMemoryInputs() (memHeadroom, entryHeadroom, avgEntryBytes int64) {
 //
 //   - ENGINE: Σ (W_c·t_widget + R_c·t_ra) ≤ keepwarmSweepInterval −
 //     (W_base·t_widget + R_base·t_ra) — every keepwarm cycle re-resolves every
-//     seeded unit; nothing is admitted until a unit has been measured.
+//     seeded unit; until a unit has been measured only the newest class is
+//     admitted, as the measuring probe (#841).
 //   - MEMORY: a new class's cells (W_c+R_c at the store's mean entry size) fit
 //     the L1 byte/entry headroom and the adaptive admission ceiling.
 //
@@ -361,6 +418,18 @@ func decideLearnedAdmission(plan learnedPlan, preLatchBudget time.Duration, hasB
 		d.used += cost
 		engineFit++
 	}
+	// #841 — THE MEASURING PROBE. The engine side cannot admit anything before a
+	// unit has been measured, and before #841 the base cohorts always measured
+	// one first. Once only the representatives a known requester matches are
+	// seeded there may be none (bench run 12: every user holds ≥2 bindings), and
+	// "admit nothing until measured" became "never seed a learned class". With
+	// nothing measured the newest class is admitted alone — one class's units,
+	// still under the memory side below — and the caller re-decides on the cost
+	// it measured.
+	if !measured && len(plan.order) > 0 {
+		engineFit = 1
+		d.probe = true
+	}
 	if memFit < 0 {
 		memFit = 0
 		var usedMem, usedEntries int64
@@ -383,10 +452,13 @@ func decideLearnedAdmission(plan learnedPlan, preLatchBudget time.Duration, hasB
 	switch {
 	case memFit < engineFit:
 		n, d.bound = memFit, "memory"
+		d.probe = false
 		d.used = 0
 		for _, k := range plan.order[:n] {
 			d.used += time.Duration(plan.wUnits[k])*tW + time.Duration(plan.rUnits[k])*tR
 		}
+	case d.probe:
+		d.bound = "probe"
 	case engineFit < len(plan.order):
 		d.bound = "engine"
 	}
@@ -461,11 +533,12 @@ func resetLearnedAdmissionForTest() {
 type learnedPass struct {
 	wUnits map[string]int
 	rUnits map[string]int
-	memFit int // -1 until the pass's first decision measured the memory side
+	pop    map[string]int // #841: each class's known population
+	memFit int            // -1 until the pass's first decision measured the memory side
 }
 
 func newLearnedPass() *learnedPass {
-	return &learnedPass{wUnits: map[string]int{}, rUnits: map[string]int{}, memFit: -1}
+	return &learnedPass{wUnits: map[string]int{}, rUnits: map[string]int{}, pop: map[string]int{}, memFit: -1}
 }
 
 // splitLearned returns targets without the learned ones, and the learned ones.
@@ -487,6 +560,7 @@ func (lp *learnedPass) note(learned []seedTarget, isWidget bool) {
 		} else {
 			lp.rUnits[learnedKey(c)]++
 		}
+		lp.pop[learnedKey(c)] = c.Population
 	}
 }
 
@@ -497,7 +571,7 @@ func (lp *learnedPass) note(learned []seedTarget, isWidget bool) {
 // decisions in the pass reuse it, so the cells the pass itself wrote are not
 // charged again.
 func (lp *learnedPass) decide(baseW, baseR int, preLatchBudget time.Duration, hasBackstop bool) learnedDecision {
-	d := decideLearnedAdmission(newLearnedPlan(lp.wUnits, lp.rUnits, baseW, baseR), preLatchBudget, hasBackstop, lp.memFit)
+	d := decideLearnedAdmission(newLearnedPlan(lp.wUnits, lp.rUnits, lp.pop, baseW, baseR), preLatchBudget, hasBackstop, lp.memFit)
 	lp.memFit = d.memFit
 	return d
 }
@@ -620,7 +694,7 @@ type residentLearnedPlan struct {
 }
 
 func planFromResident(units []residentUnit) residentLearnedPlan {
-	wUnits, rUnits := map[string]int{}, map[string]int{}
+	wUnits, rUnits, pop := map[string]int{}, map[string]int{}, map[string]int{}
 	baseW, baseR := 0, 0
 	rp := residentLearnedPlan{widgetReqs: map[string][]reseedRequest{}, raReqs: map[string][]reseedRequest{}}
 	for _, u := range units {
@@ -632,16 +706,18 @@ func planFromResident(units []residentUnit) residentLearnedPlan {
 				baseR++
 			case u.isWidget:
 				k := learnedKey(c)
+				pop[k] = c.Population
 				wUnits[k]++
 				rp.widgetReqs[k] = append(rp.widgetReqs[k], u.request(c))
 			default:
 				k := learnedKey(c)
+				pop[k] = c.Population
 				rUnits[k]++
 				rp.raReqs[k] = append(rp.raReqs[k], u.request(c))
 			}
 		}
 	}
-	rp.plan = newLearnedPlan(wUnits, rUnits, baseW, baseR)
+	rp.plan = newLearnedPlan(wUnits, rUnits, pop, baseW, baseR)
 	return rp
 }
 
@@ -686,17 +762,46 @@ func rePrewarmLearnedClasses(ctx context.Context, deps rePrewarmDeps) error {
 		return nil
 	}
 	rp := planFromResident(units)
-	d := decideLearnedAdmission(rp.plan, 0, false, -1)
-	var reqs []reseedRequest
-	for _, k := range d.order {
-		if _, isNew := pending[k]; !isNew {
-			continue
-		}
-		reqs = append(reqs, rp.widgetReqs[k]...)
-		reqs = append(reqs, rp.raReqs[k]...)
-	}
 	start := time.Now()
-	reEnqueue := reseedTargets(ctx, deps, reqs)
+	var reqs, reEnqueue []reseedRequest
+	// run seeds one batch; after a cut every later batch is handed back whole.
+	run := func(batch []reseedRequest) {
+		reqs = append(reqs, batch...)
+		if ctx.Err() != nil || len(reEnqueue) > 0 {
+			reEnqueue = append(reEnqueue, batch...)
+			return
+		}
+		reEnqueue = reseedTargets(ctx, deps, batch)
+	}
+	learnedReqs := func(d learnedDecision, skip map[string]struct{}) []reseedRequest {
+		var out []reseedRequest
+		for _, k := range d.order {
+			if _, isNew := pending[k]; !isNew {
+				continue
+			}
+			if _, done := skip[k]; done {
+				continue
+			}
+			out = append(out, rp.widgetReqs[k]...)
+			out = append(out, rp.raReqs[k]...)
+		}
+		return out
+	}
+	// #841 — a new class whose signature equals a representative's is not a
+	// learned target of its own (it is deduped onto the representative), and
+	// the representative was not seeded while no known requester matched it.
+	// Its units are this class's cells: seed them first.
+	run(newlyMatchedBaseReqs(units, pending))
+	d := decideLearnedAdmission(rp.plan, 0, false, -1)
+	var probed map[string]struct{}
+	if d.probe {
+		// #841 — nothing measured yet: seed the probe class, then decide on the
+		// cost it measured.
+		run(learnedReqs(d, nil))
+		probed = keySetOf(d.order)
+		d = decideLearnedAdmission(rp.plan, 0, false, -1)
+	}
+	run(learnedReqs(d, probed))
 	if ctx.Err() != nil || len(reEnqueue) > 0 {
 		cache.RemergePendingLearnedClasses(pending)
 		if e := prewarmEngineSingleton(); e != nil {
@@ -712,6 +817,51 @@ func rePrewarmLearnedClasses(ctx context.Context, deps rePrewarmDeps) error {
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 	)
 	return nil
+}
+
+// keySetOf is keys as a set.
+func keySetOf(keys []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		m[k] = struct{}{}
+	}
+	return m
+}
+
+// newlyMatchedBaseReqs (#841) returns the resident representative targets
+// whose signature is held ONLY by classes in pending (new since the last
+// drain): representatives no known requester matched before, so unseeded. A
+// representative an older class already matched is warm and is not re-resolved.
+// Order: the resident order (widgets NavOrder, then RESTActions).
+func newlyMatchedBaseReqs(units []residentUnit, pending map[string]struct{}) []reseedRequest {
+	newSigs := map[string]struct{}{}
+	oldSigs := map[string]struct{}{}
+	for _, c := range cache.LearnedIdentitiesSnapshot() {
+		sig := learnedClassSignature(c.Username, c.Groups)
+		if _, isNew := pending[c.Key()]; isNew {
+			newSigs[sig] = struct{}{}
+		} else {
+			oldSigs[sig] = struct{}{}
+		}
+	}
+	for sig := range oldSigs {
+		delete(newSigs, sig)
+	}
+	if len(newSigs) == 0 {
+		return nil
+	}
+	var reqs []reseedRequest
+	for _, u := range units {
+		for _, c := range u.targets {
+			if c.Learned {
+				continue
+			}
+			if _, ok := newSigs[learnedClassSignature(c.Username, c.Groups)]; ok {
+				reqs = append(reqs, u.request(c))
+			}
+		}
+	}
+	return reqs
 }
 
 // reseedIdentityTargetsAll is reseedIdentityTargets WITHOUT the admission
@@ -732,6 +882,7 @@ func seedTargetFromPrewarm(t cache.PrewarmTarget) seedTarget {
 		Groups:            append([]string(nil), t.Subject.Groups...),
 		CollapsedBindings: t.CollapsedBindings,
 		Learned:           t.Learned,
+		Population:        t.Population,
 	}
 }
 

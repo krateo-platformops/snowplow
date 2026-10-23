@@ -147,6 +147,7 @@ func s647DropsByReason() map[string]uint64 { return residentUnitsDroppedSnapshot
 // Arm A — the REAL #258 handler: every (RA × rotated cohort) is reseeded.
 func TestS647_RBACShiftReseedEnumeratesAndSeedsEveryRA(t *testing.T) {
 	env := s647Env(t, l262Opts{groupCohorts: []string{s647CohortA, s647CohortB}})
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR, l262TargetGVR) // #841: a known requester per representative
 	rotated := s647RotatedGroups(t, s647CohortA, s647CohortB)
 	before := s647DropsByReason()
 
@@ -179,6 +180,7 @@ func TestS647_RBACShiftReseedEnumeratesAndSeedsEveryRA(t *testing.T) {
 // requests.
 func TestS647_RotatedResidentTargetsIncludeEveryRA(t *testing.T) {
 	env := s647Env(t, l262Opts{groupCohorts: []string{s647CohortA, s647CohortB}})
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR, l262TargetGVR) // #841: a known requester per representative
 	rotated := s647RotatedGroups(t, s647CohortA, s647CohortB)
 
 	reqs := enumerateRotatedResidentTargets(context.Background(), env.deps, rotated)

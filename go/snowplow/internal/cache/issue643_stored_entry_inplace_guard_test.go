@@ -35,6 +35,7 @@ var resolvedEntryMetadataInPlace = map[string]string{
 	"Pinned":          "putCoreLocked demotes a pin request on the incoming entry",
 	"contentVersion":  "#406 raLayerCommitLocked versions the incoming RAFullList entry",
 	"hitters":         "NoteHitter: the representative pool, metadata",
+	"SeedOrigin":      "#841 putCoreLocked's replace keeps the key's seed origin on the incoming entry (metadata: counters only)",
 	"items":           "EnsureItems: lazily-derived parse of RawJSON, published once",
 	"itemsAPIVersion": "EnsureItems: derived",
 	"itemsKind":       "EnsureItems: derived",

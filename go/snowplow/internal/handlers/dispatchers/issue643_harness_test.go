@@ -523,6 +523,7 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 		time.Sleep(5 * time.Millisecond)
 	}
 	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h643WidgetGVR, h643RAGVR, h643ThingsGVR})
+	knowEveryRepresentative(t, h643WidgetGVR, h643RAGVR, h643ThingsGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	env.rw = rw
 

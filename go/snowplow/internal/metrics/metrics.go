@@ -2094,7 +2094,7 @@ var learnedCapacityStats = []string{
 }
 
 // learnedBounds is the CLOSED set of learnedDecision.bound values.
-var learnedBounds = []string{"none", "memory", "engine"}
+var learnedBounds = []string{"none", "memory", "engine", "probe"} // #841: probe = nothing measured yet, newest class admitted alone
 
 // registerSecurityInstruments hand-wires the #448 post-roll verification
 // counters (previously /debug/vars-only, which needs a user JWT) onto OTLP.
