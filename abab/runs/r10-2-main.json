@@ -1,0 +1,24 @@
+{
+  "alloc_bytes": 20248027504,
+  "alloc_per_event": 68405498.32432432,
+  "completions": 127,
+  "completions_s": 4.233031177169189,
+  "cpu_cores": 1.6305220457457454,
+  "cpu_s": 48.919153,
+  "dependent_errors": 0,
+  "events": 296,
+  "fill_reasons": {
+    "absent": 0,
+    "known_stale": 0,
+    "refresh_forced": 52
+  },
+  "fills": 52,
+  "gc_pause_s": 0.004547667,
+  "heap_inuse_base": 648912896,
+  "n": 50000,
+  "num_gc": 30,
+  "peak_heap_inuse": 1780916224,
+  "rate": 10,
+  "seconds": 30,
+  "wall_s": 30.002141417
+}

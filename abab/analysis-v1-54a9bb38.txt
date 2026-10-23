@@ -1,0 +1,36 @@
+== rate 1 events/s (50K objects, 20 dependents, 4 workers, 30 s per run)
+  process CPU (cores)                        main [0.978, 1.345, 0.673]                    branch [1.414, 1.541, 0.743]                    paired ratio (geo) 1.223
+  TotalAlloc (bytes)                         main [7861110952, 12678745000, 4909651144]    branch [7302964096, 10062253848, 3104398256]    paired ratio (geo) 0.775
+  peak HeapInuse (bytes)                     main [1736392704, 1634009088, 1653252096]     branch [1413939200, 1413718016, 1410605056]     paired ratio (geo) 0.844
+  content fills                              main [17, 26, 11]                             branch [0, 0, 0]                                paired ratio (geo) nan
+  dependent completions/s                    main [2.932, 4.366, 2.066]                    branch [5.826, 7.732, 2.866]                    paired ratio (geo) 1.696
+  events applied                             main [30, 30, 30]                             branch [30, 30, 30]                             paired ratio (geo) 1.000
+  CPU in fill (label apistage_fill_gvr, s)   main [10.56, 13.86, 7.23]                     branch [0.0, 0.0, 0.0]                          paired ratio (geo) nan
+  CPU in dependents (label dep, s)           main [9.06, 13.45, 5.37]                      branch [34.5, 38.4, 17.71]                      paired ratio (geo) 3.297
+  GC pause (s)                               main [0.021, 0.009, 0.088]                    branch [0.118, 0.139, 0.141]                    paired ratio (geo) 5.153
+  branch list_incremental: divergence_total=[0, 0, 0] generations=[30, 30, 25] refresh_skipped=[0, 0, 0] gen_alloc_max=[400000, 400000, 400000] rawjson_built=[0, 0, 0] unanchors=[{}, {}, {}]
+  per-generation bytes (branch): [215990, 215990, 222309]
+== rate 10 events/s (50K objects, 20 dependents, 4 workers, 30 s per run)
+  process CPU (cores)                        main [0.514, 0.791, 0.651]                    branch [0.985, 1.28, 0.985]                     paired ratio (geo) 1.674
+  TotalAlloc (bytes)                         main [4001110688, 6103337824, 4082402336]     branch [5794446640, 8342412544, 4697073216]     paired ratio (geo) 1.316
+  peak HeapInuse (bytes)                     main [1682587648, 1730117632, 1650827264]     branch [1490034688, 1418035200, 1410146304]     paired ratio (geo) 0.853
+  content fills                              main [11, 16, 11]                             branch [0, 0, 0]                                paired ratio (geo) nan
+  dependent completions/s                    main [1.465, 1.867, 1.5]                      branch [4.732, 6.499, 3.962]                    paired ratio (geo) 3.097
+  events applied                             main [290, 297, 295]                          branch [289, 290, 293]                          paired ratio (geo) 0.989
+  CPU in fill (label apistage_fill_gvr, s)   main [7.25, 11.01, 9.19]                      branch [0.0, 0.0, 0.0]                          paired ratio (geo) nan
+  CPU in dependents (label dep, s)           main [2.17, 3.7, 2.59]                        branch [23.93, 32.13, 24.55]                    paired ratio (geo) 9.682
+  GC pause (s)                               main [0.121, 0.045, 0.023]                    branch [0.181, 0.178, 0.124]                    paired ratio (geo) 3.149
+  branch list_incremental: divergence_total=[0, 0, 0] generations=[93, 129, 78] refresh_skipped=[0, 0, 0] gen_alloc_max=[400000, 400000, 400000] rawjson_built=[0, 0, 0] unanchors=[{}, {}, {}]
+  per-generation bytes (branch): [230561, 222415, 235607]
+== rate 50 events/s (50K objects, 20 dependents, 4 workers, 30 s per run)
+  process CPU (cores)                        main [0.806, 0.856, 1.001]                    branch [1.751, 0.956, 1.472]                    paired ratio (geo) 1.528
+  TotalAlloc (bytes)                         main [5687428176, 6464629136, 7403618448]     branch [9650637240, 4469524832, 7677821928]     paired ratio (geo) 1.068
+  peak HeapInuse (bytes)                     main [1896710144, 1770463232, 1828519936]     branch [1415430144, 1403109376, 1409892352]     paired ratio (geo) 0.770
+  content fills                              main [15, 17, 19]                             branch [0, 0, 0]                                paired ratio (geo) nan
+  dependent completions/s                    main [1.766, 1.866, 2.066]                    branch [7.333, 3.723, 5.998]                    paired ratio (geo) 2.886
+  events applied                             main [1310, 1341, 1410]                       branch [1239, 1060, 1298]                       paired ratio (geo) 0.883
+  CPU in fill (label apistage_fill_gvr, s)   main [11.25, 12.49, 14.07]                    branch [0.0, 0.0, 0.0]                          paired ratio (geo) nan
+  CPU in dependents (label dep, s)           main [3.53, 3.24, 4.23]                       branch [43.36, 23.61, 35.98]                    paired ratio (geo) 9.131
+  GC pause (s)                               main [0.089, 0.084, 0.041]                    branch [0.096, 0.124, 0.14]                     paired ratio (geo) 1.749
+  branch list_incremental: divergence_total=[0, 0, 0] generations=[178, 80, 145] refresh_skipped=[0, 0, 0] gen_alloc_max=[539392, 879872, 682752] rawjson_built=[0, 0, 0] unanchors=[{}, {}, {}]
+  per-generation bytes (branch): [264783, 322052, 281512]

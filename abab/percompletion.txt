@@ -1,0 +1,15 @@
+== rate 1 events/s
+  round 1: CPU/completion main 0.306 s branch 0.175 s (x0.57); alloc/completion main 94 MB branch 46 MB (x0.49); other-process CPU main 444% branch 238%
+  round 2: CPU/completion main 0.245 s branch 0.173 s (x0.71); alloc/completion main 80 MB branch 46 MB (x0.57); other-process CPU main 324% branch 385%
+  round 3: CPU/completion main 0.251 s branch 0.173 s (x0.69); alloc/completion main 83 MB branch 46 MB (x0.55); other-process CPU main 328% branch 357%
+  paired geo: CPU/completion x0.65 (range 0.57-0.71); alloc/completion x0.53 (range 0.49-0.57)
+== rate 10 events/s
+  round 1: CPU/completion main 0.363 s branch 0.162 s (x0.45); alloc/completion main 146 MB branch 46 MB (x0.32); other-process CPU main 368% branch 208%
+  round 2: CPU/completion main 0.385 s branch 0.166 s (x0.43); alloc/completion main 159 MB branch 46 MB (x0.29); other-process CPU main 341% branch 336%
+  round 3: CPU/completion main 0.407 s branch 0.187 s (x0.46); alloc/completion main 155 MB branch 46 MB (x0.30); other-process CPU main 377% branch 243%
+  paired geo: CPU/completion x0.44 (range 0.43-0.46); alloc/completion x0.30 (range 0.29-0.32)
+== rate 50 events/s
+  round 1: CPU/completion main 0.423 s branch 0.212 s (x0.50); alloc/completion main 154 MB branch 45 MB (x0.30); other-process CPU main 381% branch 417%
+  round 2: CPU/completion main 0.435 s branch 0.193 s (x0.44); alloc/completion main 150 MB branch 46 MB (x0.31); other-process CPU main 257% branch 316%
+  round 3: CPU/completion main 0.429 s branch 0.207 s (x0.48); alloc/completion main 151 MB branch 45 MB (x0.30); other-process CPU main 393% branch 419%
+  paired geo: CPU/completion x0.48 (range 0.44-0.50); alloc/completion x0.30 (range 0.30-0.31)

@@ -1,0 +1,7 @@
+scripts/check_identity_key_completeness.sh exit=0
+scripts/check_no_parallel_binding_derivation.sh exit=0
+scripts/check_no_unchecked_unstructured_assert.sh exit=0
+scripts/check_rawjson_readers.sh exit=0
+scripts/check_resolved_entry_put_sites.sh exit=0
+scripts/check_resolveoptions_rc.sh exit=0
+DONE
