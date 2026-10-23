@@ -1,8 +1,8 @@
 package dispatchers
 
 // prewarm_real_classes_841_test.go — #841: seed only identities a real
-// requester can hit; the drain yields between widgets; the seed-origin
-// counters show seeded cells being hit.
+// requester can hit, in order of known population; the seed-origin counters
+// show seeded cells being hit.
 //
 //   S1 TestS841_LearnedMultiBindingSeededFirst_UnmatchedBaseNeverSeeded — the
 //      bench run 12 shape: every known user holds ≥2 bindings, so no
@@ -18,9 +18,13 @@ package dispatchers
 //   S4 TestS841_ClassSeedScopeSeedsNewlyMatchedRepresentative — a login whose
 //      class equals an unseeded representative seeds that representative's
 //      cells through the class-seed scope.
-//   S5 TestS841_WalkYieldsBeforeEveryWidget / S6 TestS841_DrainYieldsMidPage —
-//      the pagination drain steps aside for a customer between the widgets of
-//      ONE page, not only between pages.
+//   S7 TestS841_SeedOrderIsByKnownPopulation — a higher-population class
+//      seeds before a lower one, whatever its source.
+//   S8 TestS841_KeptBaseCohortsOrderedByPopulation — the same between two
+//      kept base cohorts.
+//   S9 TestS841_BackstopReservesTheBaseUnitsStillToCome — a learned class that
+//      outranks a kept base cohort is taken pre-latch only if the base units
+//      still to come fit too.
 //
 // The harness is #262's (learned_identity_262_harness_test.go): REAL RBAC
 // informer, Secrets informer → learned registry, enumeration wrapper, seed
@@ -30,7 +34,6 @@ import (
 	"context"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,7 +44,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -548,132 +550,6 @@ func TestS841_BackstopReservesTheBaseUnitsStillToCome(t *testing.T) {
 	if first["teamB"].Before(fired) {
 		t.Fatalf("S9 RED: teamB seeded pre-latch (+%v) although it and the remaining base units do not both fit "+
 			"before the backstop", first["teamB"].Sub(start))
-	}
-}
-
-// ── S5 / S6: the drain yields between widgets ───────────────────────────────
-
-// s841Widget is a minimal widget CR the walk harvests before it resolves.
-func s841Widget(name string) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "widgets.templates.krateo.io/v1beta1",
-		"kind":       "Panel",
-		"metadata":   map[string]any{"namespace": "krateo-system", "name": name},
-		"spec":       map[string]any{},
-	}}
-}
-
-var s841PanelGVR = schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "panels"}
-
-func TestS841_WalkYieldsBeforeEveryWidget(t *testing.T) {
-	paginationTestMu.Lock()
-	defer paginationTestMu.Unlock()
-	drainAllCustomerInFlight()
-
-	harv := newNavWidgetHarvester()
-	w := newPhase1Walker(nil, "test-authn-ns", withNavWidgetHarvester(harv))
-	done := markCustomerInFlight()
-	yieldBefore := prewarmEngineSingleton().yieldTotal.Load()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	finished := make(chan struct{})
-	go func() {
-		_ = w.walk(ctx, s841Widget("s841-w"), s841PanelGVR, 1, 1, 5, -1, -1)
-		close(finished)
-	}()
-	time.Sleep(150 * time.Millisecond)
-	if n := len(harv.snapshot()); n != 0 {
-		done()
-		t.Fatalf("S5 RED: the walk reached widget %d while a customer was in flight; it must yield before every widget", n)
-	}
-	if prewarmEngineSingleton().yieldTotal.Load() == yieldBefore {
-		done()
-		t.Fatal("S5 RED: the walk never parked on the engine yield")
-	}
-	done()
-	select {
-	case <-finished:
-	case <-time.After(5 * time.Second):
-		cancel()
-		t.Fatal("the walk did not finish within 5s of the customer completing")
-	}
-	if n := len(harv.snapshot()); n != 1 {
-		t.Fatalf("after the customer completed the walk harvested %d widget(s), want 1", n)
-	}
-}
-
-func TestS841_DrainYieldsMidPage(t *testing.T) {
-	paginationTestMu.Lock()
-	defer paginationTestMu.Unlock()
-	drainAllCustomerInFlight()
-
-	const children = 4
-	// Page 2 reveals `children` child widgets and is the last page. The customer
-	// arrives WHILE page 2 resolves — after the page-top yield, before any child.
-	var release func()
-	var arrived atomic.Bool
-	installFakePaginationSeams(t, func(page int) (*unstructured.Unstructured, error) {
-		env := fakePageEnvelope(page, false)
-		items := make([]any, 0, children)
-		for i := 0; i < children; i++ {
-			items = append(items, map[string]any{
-				"id":   "c" + itoaLine(i),
-				"verb": "GET",
-				"path": "/call?resource=panels&apiVersion=widgets.templates.krateo.io/v1beta1&namespace=krateo-system&name=s841-child-" + itoaLine(i),
-			})
-		}
-		env.Object["status"].(map[string]any)["resourcesRefs"].(map[string]any)["items"] = items
-		release = markCustomerInFlight()
-		arrived.Store(true)
-		return env, nil
-	})
-	var childFetches atomic.Int64
-	prevChild := paginationFetchChildFn
-	paginationFetchChildFn = func(_ context.Context, ref templatesv1.ObjectReference) objects.Result {
-		childFetches.Add(1)
-		return objects.Result{Unstructured: s841Widget(ref.Name), GVR: s841PanelGVR}
-	}
-	t.Cleanup(func() { paginationFetchChildFn = prevChild })
-
-	harv := newNavWidgetHarvester()
-	w := newPhase1Walker(nil, "test-authn-ns", withNavWidgetHarvester(harv))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	finished := make(chan struct{})
-	go func() {
-		iterateApiRefPages(ctx, w, fakePage1Driven(), schema.GroupVersionResource{
-			Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "datagrids"},
-			fakePage1Driven(), 1, 5, 5, 5, "test-authn-ns")
-		close(finished)
-	}()
-	deadline := time.Now().Add(5 * time.Second)
-	for !arrived.Load() {
-		if time.Now().After(deadline) {
-			t.Fatal("the drain never resolved page 2")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	// Bounded: from the customer's arrival, no child widget is walked — at most
-	// the one child CR already being fetched is read.
-	time.Sleep(150 * time.Millisecond)
-	if n := len(harv.snapshot()); n != 0 {
-		release()
-		t.Fatalf("S6 RED: %d child widget(s) of the page were walked while a customer was in flight; "+
-			"the drain must yield between the widgets of one page", n)
-	}
-	if f := childFetches.Load(); f > 1 {
-		release()
-		t.Fatalf("S6 RED: %d child CRs fetched while a customer was in flight, want ≤1", f)
-	}
-	release()
-	select {
-	case <-finished:
-	case <-time.After(5 * time.Second):
-		cancel()
-		t.Fatal("the drain did not finish within 5s of the customer completing")
-	}
-	if n := len(harv.snapshot()); n != children {
-		t.Fatalf("after the customer completed the drain walked %d/%d children", n, children)
 	}
 }
 

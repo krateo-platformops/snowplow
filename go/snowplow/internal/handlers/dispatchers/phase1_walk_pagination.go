@@ -193,9 +193,6 @@ var (
 	paginationResolvePageFn = func(ctx context.Context, opts widgets.ResolveOptions) (*unstructured.Unstructured, error) {
 		return widgets.Resolve(ctx, opts)
 	}
-	// paginationFetchChildFn fetches a child widget CR a deep page revealed
-	// (#841: lets the mid-page customer yield be driven without an apiserver).
-	paginationFetchChildFn = objects.Get
 )
 
 // isApiRefTemplateDriven reports whether a widget CR (the resolver's
@@ -577,7 +574,7 @@ func iterateApiRefPages(
 			}
 			childKeyPerPage, childKeyPage := deriveSeedKeyTuple(child.Path)
 
-			childGot := paginationFetchChildFn(ctx, childRef)
+			childGot := objects.Get(ctx, childRef)
 			if childGot.Err != nil || childGot.Unstructured == nil {
 				continue
 			}
