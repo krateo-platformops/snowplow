@@ -69,15 +69,25 @@ func c854Anchor(t *testing.T, n int) (*ResourceWatcher, *ListCell) {
 // seeded object, and the dynamic client (for real writes through the informer).
 func c854AnchorWith(t *testing.T, n int, f ListCellFuncs, labels map[string]string) (*ResourceWatcher, *ListCell, *dynamicfake.FakeDynamicClient) {
 	t.Helper()
+	objs := make([]*unstructured.Unstructured, n)
+	for i := range objs {
+		objs[i] = c854Obj(i)
+		if labels != nil {
+			objs[i].SetLabels(labels)
+		}
+	}
+	return c854AnchorObjs(t, objs, f)
+}
+
+// c854AnchorObjs anchors a cell over the given objects (namespace c854).
+func c854AnchorObjs(t *testing.T, objs []*unstructured.Unstructured, f ListCellFuncs) (*ResourceWatcher, *ListCell, *dynamicfake.FakeDynamicClient) {
+	t.Helper()
+	n := len(objs)
 	t.Setenv("CACHE_ENABLED", "true")
 	ResetListCellsForTest()
 	t.Cleanup(ResetListCellsForTest)
 	var seed []runtime.Object
-	for i := 0; i < n; i++ {
-		o := c854Obj(i)
-		if labels != nil {
-			o.SetLabels(labels)
-		}
+	for _, o := range objs {
 		seed = append(seed, o)
 	}
 	kinds := rbacListKinds()
@@ -91,7 +101,7 @@ func c854AnchorWith(t *testing.T, n int, f ListCellFuncs, labels map[string]stri
 	_, syncCh := rw.EnsureResourceType(c854GVR)
 	select {
 	case <-syncCh:
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Minute):
 		t.Fatal("informer did not sync")
 	}
 	prev := Global()

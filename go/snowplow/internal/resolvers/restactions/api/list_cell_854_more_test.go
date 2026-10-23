@@ -5,10 +5,12 @@
 //	     relisted / store repaired) unanchors the cell.
 //	F3c  C5: a CUSTOMER read after a change is served the change (a customer
 //	     read drains pending with the current seq as its need).
-//	F5r  the comparator is read-driven: reads alone schedule passes (no timer).
+//	F5r  the comparator is read-driven: reads alone schedule passes (no timer),
+//	     which the real refresher runs.
 package api
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -58,6 +60,13 @@ func TestListCell854_F5r_ReadsAloneScheduleComparatorPasses(t *testing.T) {
 	newInc854Watcher(t, 5)
 	store := cache.ResolvedCache()
 	inc854Anchor(t, store, fill710ListCall())
+	// A pass is refresher work (#865): the reads make it due and the real
+	// refresher runs it. No refresh handler is registered here, so the dequeue
+	// runs the pass and then skips the key.
+	cache.ResetRefresherForTest()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); cache.ResetRefresherForTest() })
+	cache.StartRefresher(ctx)
 	p0 := cache.ListCellStatsSnapshot().Passes
 	deadline := time.Now().Add(10 * time.Second)
 	for cache.ListCellStatsSnapshot().Passes == p0 {

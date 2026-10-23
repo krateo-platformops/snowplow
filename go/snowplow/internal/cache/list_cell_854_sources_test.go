@@ -28,12 +28,17 @@ package cache
 //   U13b a build error (an object the cell's decoder or selector cannot read)
 //        unanchors on that read and never serves the generation before it.
 //        Mutation → RED: a build error serves the stale generation.
+//   F5y  a comparator pass a read makes due is refresher work: with a customer
+//        in flight the REAL refresher parks it (yieldToCustomer), and it runs
+//        once the customers are gone — never on the reader's goroutine.
+//        Mutation → RED: the read runs the pass itself (the pre-#865 goroutine).
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -291,5 +296,40 @@ func TestListCell854_U13b_ABuildErrorNeverServesTheStaleGeneration(t *testing.T)
 				t.Fatalf("U13b (%s): the cell is still anchored after a build error", tc.name)
 			}
 		})
+	}
+}
+
+func TestListCell854_F5y_AComparatorPassIsRefresherWorkThatYieldsToCustomers(t *testing.T) {
+	cleanup := withCleanRefresher(t, 4, 0) // floor 0: the rate floor is not under test
+	defer cleanup()
+	_, c, _ := c854AnchorWith(t, 5, c854Funcs(), nil)
+	in := &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Namespace: "c854"}
+	ResolvedCache().Put(c.key, NewListCellEntry(c, in))
+	var customers atomic.Bool
+	customers.Store(true)
+	SetCustomerInflightHook(customers.Load)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartRefresher(ctx)
+
+	p0 := ListCellStatsSnapshot().Passes
+	if _, ok := c.Snapshot(DepGenEpochNow()); !ok { // the first read makes a pass due
+		t.Fatal("PRECONDITION: the cell does not serve")
+	}
+	if !c.passDue.Load() {
+		t.Fatal("PRECONDITION: the first read made no pass due")
+	}
+	time.Sleep(300 * time.Millisecond) // 12 yield re-checks with a customer in flight
+	if got := ListCellStatsSnapshot().Passes - p0; got != 0 {
+		t.Fatalf("F5y RED: %d comparator pass(es) ran while a customer was in flight — the pass is not behind the refresher's customer yield", got)
+	}
+	customers.Store(false)
+	for end := time.Now().Add(5 * time.Second); ListCellStatsSnapshot().Passes == p0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatal("F5y RED: the due pass never ran after the customers left — reads no longer schedule passes")
+		}
+	}
+	if c.passDue.Load() {
+		t.Fatal("F5y: the pass ran but is still marked due")
 	}
 }

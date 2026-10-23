@@ -63,6 +63,10 @@
 // and derived from cost: one pass per ⌈passCost / readCost⌉ Snapshot calls
 // (per cell, EWMAs), so comparator CPU stays at or below read CPU. No timer, no
 // knob. Divergence is counted, logged as metadata only, and unanchors the cell.
+// A pass is REFRESHER work, never a reader's: a read that makes one due only
+// marks it and enqueues the cell's own key, and the refresher runs it on that
+// dequeue, after its customer yield (#710). At 50K objects of ~1.4 KB a pass
+// allocates ~24 MB and takes ~0.1 s (list_cell_854_cost_test.go).
 //
 // NOT IN PASSTHROUGH. With CACHE_ENABLED=false there is no informer and no event:
 // a cell is never anchored there.
@@ -194,7 +198,7 @@ type ListCell struct {
 	// comparator.
 	reads       atomic.Uint64
 	lastPassAt  atomic.Uint64 // reads at the last pass
-	passRunning atomic.Bool
+	passDue     atomic.Bool   // a read asked for a pass; the refresher runs it
 	passNS      atomic.Int64 // EWMA of one pass, ns
 	readNS      atomic.Int64 // EWMA of one Snapshot, ns
 	cmpMu       sync.Mutex
@@ -934,9 +938,12 @@ func (b *listBody) envLen(emptyEnv int64) int64 {
 
 // ── comparator ──────────────────────────────────────────────────────────────
 
-// maybePass starts one asynchronous comparator pass when this cell's reads since
-// the last pass reach ⌈passCost / readCost⌉ (at least 1). The first pass runs on
-// the first read after the anchor's cost is unknown (passNS 0 ⇒ due).
+// maybePass makes a comparator pass due when this cell's reads since the last
+// pass reach ⌈passCost / readCost⌉ (at least 1; the first read after the anchor,
+// while the pass cost is unknown, makes one due). It does not run the pass: it
+// enqueues the cell's own key, and the refresher runs the pass on that dequeue
+// (runDuePass) after yielding to customers. The workqueue coalesces the key, and
+// at most one pass is due at a time.
 func (c *ListCell) maybePass() {
 	r := c.reads.Add(1)
 	last := c.lastPassAt.Load()
@@ -944,14 +951,20 @@ func (c *ListCell) maybePass() {
 	if p, rd := c.passNS.Load(), c.readNS.Load(); p > 0 && rd > 0 {
 		every = uint64(math.Ceil(float64(p) / float64(rd)))
 	}
-	if r-last < every || !c.passRunning.CompareAndSwap(false, true) {
+	if r-last < every || !c.passDue.CompareAndSwap(false, true) {
 		return
 	}
 	c.lastPassAt.Store(r)
-	go func() {
-		defer c.passRunning.Store(false)
-		c.ComparePass()
-	}()
+	EnqueueRefresh(c.key)
+}
+
+// runDuePass runs the pass a read made due, if any. Called by the refresher on
+// its dequeue of the cell's key, after the customer yield and the rate floor.
+func (c *ListCell) runDuePass() {
+	if c == nil || !c.passDue.CompareAndSwap(true, false) {
+		return
+	}
+	c.ComparePass()
 }
 
 // ComparePass runs one comparator pass now (exported for the falsifiers).
