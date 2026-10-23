@@ -32,6 +32,14 @@
 //     refresher a ctx carrying the configured logger, and requests carry it
 //     from the middleware (without one, plumbing's xcontext.Logger logs DEBUG).
 //
+// PAIRED865_HITBENCH (default 0) times that many sequential customer GETs of the
+// unrelated RESTAction right after the warm-up — no event, no other customer,
+// the refresher idle — so the L1-hit path itself is compared, alone.
+//
+// PAIRED865_PROBE (default 0) adds CONTROL goroutines with the same think time
+// that time a fixed CPU-only computation touching no snowplow code: their
+// latency is what the process's scheduling alone adds to a short request.
+//
 // Reported (JSON to PAIRED865_OUT): customer p50/p95/p99 and req/s per class,
 // the STALENESS a customer read of a dependent sees (each dependent's filter
 // reports the newest object generation it read; staleness is the time since the
@@ -45,6 +53,7 @@ package dispatchers
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -223,6 +232,10 @@ func TestPaired865Customer(t *testing.T) {
 	secs := p865EnvInt("PAIRED865_SECONDS", 30)
 	depN := p865EnvInt("PAIRED865_CUST_DEP", 2)
 	unrelN := p865EnvInt("PAIRED865_CUST_UNREL", 4)
+	probeN := 0
+	if v, err := strconv.Atoi(os.Getenv("PAIRED865_PROBE")); err == nil && v > 0 {
+		probeN = v
+	}
 	// 0 is a valid think time: the sustained arm keeps a customer request in
 	// flight at all times, so the refresher's yield runs to its 5 s cap.
 	think := 50 * time.Millisecond
@@ -402,9 +415,18 @@ func TestPaired865Customer(t *testing.T) {
 		}
 	}
 	runtime.GC()
+	var hitBench p865Samples
+	if hb, err := strconv.Atoi(os.Getenv("PAIRED865_HITBENCH")); err == nil && hb > 0 {
+		for i := 0; i < hb; i++ {
+			if code, d, _ := call(p865UnrelRA); code == http.StatusOK {
+				hitBench.add(float64(d.Microseconds()) / 1000)
+			}
+		}
+		runtime.GC()
+	}
 
 	// --- customers ------------------------------------------------------------
-	var depLat, unrelLat, staleness p865Samples
+	var depLat, unrelLat, staleness, probeLat p865Samples
 	var custErrs atomic.Int64
 	custStop := make(chan struct{})
 	var custWG sync.WaitGroup
@@ -451,6 +473,27 @@ func TestPaired865Customer(t *testing.T) {
 	for c := 0; c < unrelN; c++ {
 		custWG.Add(1)
 		go customer("unrel", func(int) string { return p865UnrelRA }, &unrelLat)
+	}
+	probeBuf := make([]byte, 4096)
+	for c := 0; c < probeN; c++ {
+		custWG.Add(1)
+		go func() {
+			defer custWG.Done()
+			for {
+				select {
+				case <-custStop:
+					return
+				case <-time.After(think):
+				}
+				t0 := time.Now()
+				for k := 0; k < 8; k++ {
+					_ = sha256.Sum256(probeBuf)
+				}
+				if inWindow.Load() {
+					probeLat.add(float64(time.Since(t0).Microseconds()) / 1000)
+				}
+			}
+		}()
 	}
 
 	// --- measurement window -----------------------------------------------------
@@ -543,6 +586,9 @@ loop:
 		"cust_dep_rps":       float64(len(dep)) / wall.Seconds(),
 		"cust_unrel_rps":     float64(len(unrel)) / wall.Seconds(),
 		"cust_errors":        custErrs.Load(),
+		"probe":              p865Quantiles(probeLat.get()),
+		"hit_bench":          p865Quantiles(hitBench.get()),
+		"probe_n":            probeN,
 		"cust_dep_n":         depN,
 		"cust_unrel_n":       unrelN,
 		"cust_think_ms":      think.Milliseconds(),
