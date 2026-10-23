@@ -222,15 +222,10 @@ func forcedPassInputs(gvr schema.GroupVersionResource) (
 		// pass that quietly does nothing is a zero that reads as health.
 		return nil, "", nil, nil, verifySkipMetaClientNil
 	}
+	// #875 — nil when the informer's transform could not be installed (a
+	// re-registered shared-factory GVR gets the already-started informer back,
+	// and SetTransform refuses it). The pass still runs; see forcedVerify.
 	dl = rw.deliveries[gvr]
-	if dl == nil {
-		// #875 — the informer's transform could not be installed, so nothing
-		// records which keys the reflector delivers during a pass. Without
-		// that record the pass can neither tell a store that moved past the
-		// LIST from a lost event (#872) nor re-read every candidate without
-		// an unbounded GET burst, so it says it cannot run.
-		return nil, "", nil, nil, verifySkipNoDeliveryRecord
-	}
 	return rw.metaClient, rw.lastSyncRV[gvr], inf.GetIndexer(), dl, ""
 }
 
@@ -291,14 +286,22 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	// the last confirm pass copied into lastSyncRV, is what the LIST carries:
 	// the record starts now, so the LIST's lower bound must be now too, or a
 	// delivery between the two would be neither recorded nor in the LIST.
-	win := dl.openPass(idx)
-	defer win.close()
-	if win.position == "" {
-		recordVerifySkipped(verifySkipNoSyncPosition) // same reason, same rule: never RV="0"
-		return
+	//
+	// No delivery record (dl == nil): there is no window to open, and the LIST
+	// carries the confirm-time position as it did before #875.
+	listRV := rv
+	var win *deliveryWindow
+	if dl != nil {
+		win = dl.openPass(idx)
+		defer win.close()
+		if win.position == "" {
+			recordVerifySkipped(verifySkipNoSyncPosition) // same reason, same rule: never RV="0"
+			return
+		}
+		listRV = win.position
 	}
 	opts := metav1.ListOptions{
-		ResourceVersion:      win.position,
+		ResourceVersion:      listRV,
 		ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
 		Limit:                0, // MUST stay 0 — see the file header.
 	}
@@ -328,9 +331,6 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		}
 	}
 	report := compareStore(idx, upstream)
-	// Closed only now: compareStore's confirm loop reads the store until it
-	// returns, so a delivery landing during that loop must be in the record.
-	delivered := win.close()
 	// #872 — the store kept moving while the LIST was in flight, so a
 	// divergence the store may have moved past counts only if it still holds
 	// against the object's current state (store_verify_recheck.go). #875 —
@@ -338,7 +338,21 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	// candidate is counted as it stands. A failed re-check makes the pass
 	// inconclusive: nothing is published or repaired, and the GVR is not marked
 	// verified, so the deadline walker comes back to it.
-	if report.total() > 0 {
+	if report.total() > 0 && win == nil {
+		// #875 — NO DELIVERY RECORD: count every candidate as it stands, with
+		// no GET — the pre-#872 behaviour, for this GVR only. Skipping instead
+		// would leave exactly the #237 class unverified: a re-registered
+		// shared-factory GVR gets its already-started informer back, the
+		// transform cannot be installed, and a skipped pass would also starve
+		// #244's factory-divergence age of its only input (noteVerified). The
+		// cost is that churn can be misread as a loss here, as it was before
+		// #872, and store_divergence_recheck_unavailable_total says so.
+		storeRecheckUnavailableTotal.Add(report.total())
+	} else if report.total() > 0 {
+		// Closed only now: compareStore's confirm loop reads the store until
+		// it returns, so a delivery landing during that loop must be in the
+		// record.
+		delivered := win.close()
 		mayHaveMoved := func(key string, class divergenceClass) bool { return win.delivered(delivered, key, class) }
 		rechecked, ok := recheckAgainstCurrent(ctx, cli, gvr, idx, report, mayHaveMoved)
 		if !ok {

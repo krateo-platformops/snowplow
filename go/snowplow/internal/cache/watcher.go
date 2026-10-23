@@ -183,7 +183,8 @@ type ResourceWatcher struct {
 	// deliveries (#875) holds each GVR's record of what its reflector
 	// delivered, written by the informer transform both registration paths
 	// install (store_verify_delivery.go). Present only when that transform was
-	// installed; the forced pass refuses to run without it. Guarded by rw.mu.
+	// installed; without it the forced pass counts every candidate as it
+	// stands (store_divergence_recheck_unavailable_total). Guarded by rw.mu.
 	deliveries map[schema.GroupVersionResource]*deliveryLog
 
 	// retainUnknownWarned records GVRs currently inside a #217 retain-on-unknown

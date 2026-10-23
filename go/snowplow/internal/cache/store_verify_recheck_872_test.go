@@ -761,3 +761,89 @@ func TestNextOverdueGVR875_AnAttemptSendsAGVRToTheBack(t *testing.T) {
 		t.Errorf("an attempt moved the epoch (%v -> %v); the age must stay true", old, row.epoch)
 	}
 }
+
+// --- a GVR with no delivery record ----------------------------------------
+
+// factory875GVR's group is never navigation-discovered, so its informer comes
+// from the shared dynamic factory: the #237 / #244 class.
+var factory875GVR = schema.GroupVersionResource{Group: "factory875.krateo.io", Version: "v1", Resource: "panels"}
+
+func factory875Obj(name, rv, uid string) *unstructured.Unstructured {
+	u := panelObj("demo", name, rv, uid)
+	u.SetAPIVersion(factory875GVR.GroupVersion().String())
+	return u
+}
+
+func factory875Meta(name, rv, uid string) *metav1.PartialObjectMetadata {
+	m := partialMeta("demo", name, rv, uid)
+	m.APIVersion = factory875GVR.GroupVersion().String()
+	return m
+}
+
+// TestForcedPass875_NoDeliveryRecord_StillVerifiesAndCountsDirectly — residual
+// B. A shared-factory GVR that is removed and registered again gets its
+// ALREADY-STARTED informer back from the factory, SetTransform refuses it, and
+// the GVR has no delivery record. Skipping the pass there would leave exactly
+// the #237 broken-store class unverified and starve #244's factory-divergence
+// age of its only input. The pass must run and count every candidate as it
+// stands: published, repair attempted, the age signal set, no GET.
+func TestForcedPass875_NoDeliveryRecord_StillVerifiesAndCountsDirectly(t *testing.T) {
+	c3Setup(t)
+	resetVerificationForArm(t)
+	ctx := context.Background()
+	rw, _ := silentWatchClusterFor(t, factory875GVR, false, factory875Obj("panel-a", "1", "uid-a"))
+
+	// The re-registration that loses the transform, as production does it.
+	rw.RemoveResourceType(factory875GVR)
+	_, synced := rw.EnsureResourceType(factory875GVR)
+	select {
+	case <-synced:
+	case <-time.After(verifyBound):
+		t.Fatalf("precondition: the re-registered informer never reported synced")
+	}
+	rw.RefreshDiscovery(ctx)
+	rw.mu.RLock()
+	_, recorded := rw.deliveries[factory875GVR]
+	rw.mu.RUnlock()
+	if recorded {
+		t.Fatalf("precondition: the re-registered GVR has a delivery record, so this arm does not reach the no-record path")
+	}
+	if !rw.IsServable(factory875GVR) {
+		t.Fatalf("precondition: the re-registered GVR is not servable, so the pass would skip for that reason instead")
+	}
+	if row, ok := verificationRowFor(factory875GVR); !ok || row.ownsInformer {
+		t.Fatalf("precondition: want a registered factory-built GVR (row=%+v ok=%v)", row, ok)
+	}
+
+	// A TRUE loss: the store holds rv 1, the cluster and the LIST rv 2.
+	rec := attachMetaClient(t, rw, factory875Meta("panel-a", "2", "uid-a"))
+	cli := &r872Client{inner: rec.inner, list: []*metav1.PartialObjectMetadata{factory875Meta("panel-a", "2", "uid-a")}}
+	rw.SetMetadataClient(cli)
+	skipped0, unsupported0 := storeVerifySkippedTotal.Load(), storeRepairUnsupportedTotal.Load()
+
+	forcedVerify(ctx, factory875GVR)
+
+	if got := storeVerifySkippedTotal.Load() - skipped0; got != 0 {
+		t.Fatalf("#875 B RED: the pass was skipped (%d) for a GVR with no delivery record: %v", got, VerifySkippedByReasonSnapshot())
+	}
+	if lu, _, _, _ := divergenceCounts(verifySiteForced); lu != 1 {
+		t.Errorf("published %d lost updates for a TRUE loss, want 1", lu)
+	}
+	if got := storeRecheckUnavailableTotal.Load(); got != 1 {
+		t.Errorf("store_divergence_recheck_unavailable_total = %d, want 1", got)
+	}
+	if g := cli.gets.Load(); g != 0 {
+		t.Errorf("%d GETs for a GVR with no delivery record, want 0", g)
+	}
+	// The repair is attempted; for a factory-built informer the verb refuses
+	// it (#244) and the passive self-heal is the path, timed by the age below.
+	if got := storeRepairUnsupportedTotal.Load() - unsupported0; got != 1 {
+		t.Errorf("repair attempts refused as unsupported advanced by %d, want 1", got)
+	}
+	if factory244Since(factory875GVR).IsZero() {
+		t.Errorf("#875 B RED: #244's factory-divergence age got no input: factoryDivergentSince is unset after a divergent pass")
+	}
+	if row, _ := verificationRowFor(factory875GVR); !row.verified {
+		t.Errorf("a completed pass must mark the GVR verified")
+	}
+}

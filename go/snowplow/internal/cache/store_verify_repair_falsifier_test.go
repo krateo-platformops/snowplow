@@ -208,6 +208,15 @@ func TestSilentWatchCluster_GaugesStartFromSyncedInformers(t *testing.T) {
 // the only fixture in which a repair has anything to repair.
 func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*ResourceWatcher, dynamic.Interface) {
 	t.Helper()
+	return silentWatchClusterFor(t, repairGVR, true, objs...)
+}
+
+// silentWatchClusterFor is silentWatchCluster for any GVR. owned=false leaves
+// the group off the navigation-discovered set, so the GVR's informer comes
+// from the shared dynamic factory: NOT owned, the #237/#244 class whose
+// re-registration hands back the already-started informer.
+func silentWatchClusterFor(t *testing.T, gvr schema.GroupVersionResource, owned bool, objs ...*unstructured.Unstructured) (*ResourceWatcher, dynamic.Interface) {
+	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 
 	sch := k8sruntime.NewScheme()
@@ -217,14 +226,14 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	// LIST — the same set realWatcher registers, for the same reason.
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch,
 		map[schema.GroupVersionResource]string{
-			repairGVR: "PanelList",
+			gvr: "PanelList",
 			{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
 			{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
 			{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
 			{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
 		})
 	for _, o := range objs {
-		if _, err := dyn.Resource(repairGVR).Namespace(o.GetNamespace()).
+		if _, err := dyn.Resource(gvr).Namespace(o.GetNamespace()).
 			Create(context.Background(), o, metav1.CreateOptions{}); err != nil {
 			t.Fatalf("seeding the fake cluster: %v", err)
 		}
@@ -236,7 +245,7 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	dyn.PrependWatchReactor("*", func(a k8stesting.Action) (bool, watch.Interface, error) {
 		w := watch.NewFake()
 		t.Cleanup(w.Stop)
-		if a.GetResource() == repairGVR {
+		if a.GetResource() == gvr {
 			silentWatchLatest.Store(w)
 		}
 		return true, w, nil
@@ -247,9 +256,9 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	// fallback — so the arm asserting "the pass carries OUR sync position"
 	// would be asserting the fallback instead, and would stay green if the
 	// real branch broke.
-	dyn.PrependReactor("list", repairGVR.Resource, func(a k8stesting.Action) (bool, k8sruntime.Object, error) {
-		obj, err := dyn.Tracker().List(repairGVR,
-			repairGVR.GroupVersion().WithKind("Panel"), a.GetNamespace())
+	dyn.PrependReactor("list", gvr.Resource, func(a k8stesting.Action) (bool, k8sruntime.Object, error) {
+		obj, err := dyn.Tracker().List(gvr,
+			gvr.GroupVersion().WithKind("Panel"), a.GetNamespace())
 		if err != nil {
 			return true, nil, err
 		}
@@ -270,7 +279,11 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	// would leave the GVR recorded as factory-built and every repair refused —
 	// the arms would then fail for a fixture reason that looks exactly like
 	// the defect they exist to catch.
-	AddNavigationDiscoveredGroup(repairGVR.Group)
+	if owned {
+		AddNavigationDiscoveredGroup(gvr.Group)
+	} else if IsNavigationDiscoveredGroup(gvr.Group) {
+		t.Fatalf("precondition: %s is navigation-discovered, so its informer would be owned", gvr.Group)
+	}
 
 	// #699 arm seam: an eager RBAC informer still in its initial LIST when the
 	// fixture returns, the shape CPU contention gives one. Off for every other
@@ -288,11 +301,11 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 		rw.Stop()
 		time.Sleep(50 * time.Millisecond)
 	})
-	_, syncCh := rw.EnsureResourceType(repairGVR)
+	_, syncCh := rw.EnsureResourceType(gvr)
 	select {
 	case <-syncCh:
 	case <-time.After(verifyBound):
-		t.Fatalf("informer for %s did not sync", repairGVR)
+		t.Fatalf("informer for %s did not sync", gvr)
 	}
 	// #699 — NewResourceWatcher registers the four typed-RBAC informers
 	// eagerly but does not wait for them, and each one has a verification row.
@@ -308,8 +321,8 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	// carry. With no discovery client, conjunct 4 is degraded-true and the
 	// refresh is purely the conjunct-3 / lastSyncRV update.
 	rw.RefreshDiscovery(context.Background())
-	if !rw.IsServable(repairGVR) {
-		t.Fatalf("precondition: %s is registered and synced but not servable", repairGVR)
+	if !rw.IsServable(gvr) {
+		t.Fatalf("precondition: %s is registered and synced but not servable", gvr)
 	}
 	SetGlobal(rw)
 	t.Cleanup(func() { SetGlobal(nil) })

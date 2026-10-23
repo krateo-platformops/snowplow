@@ -93,6 +93,7 @@ var (
 	storeRecheckGETsTotal        atomic.Uint64
 	storeRecheckClearedTotal     atomic.Uint64
 	storeRecheckUndeliveredTotal atomic.Uint64
+	storeRecheckUnavailableTotal atomic.Uint64
 )
 
 // recheckReads is the number of quorum reads per candidate (see the header).
