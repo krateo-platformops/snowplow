@@ -68,9 +68,6 @@ type ResolveOptions struct {
 var (
 	resolveApiRefFn        = resolveApiRef
 	validateObjectStatusFn = crdschema.ValidateObjectStatus
-	// apirefResolveFn (#874) is resolveApiRef's hop into apiref.Resolve, so a
-	// hermetic test can assert what resolveApiRef hands it (the cursor).
-	apirefResolveFn = apiref.Resolve
 )
 
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
@@ -363,7 +360,15 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 	apiRefInline := GetApiRefExtras(opts.In.Object)
 	apiRefEff := mergeRequestWins(apiRefInline, opts.Extras)
 
-	return apirefResolveFn(ctx, apiref.ResolveOptions{
+	return apiref.Resolve(ctx, apirefOptionsFor(opts, apiRef, apiRefEff))
+}
+
+// apirefOptionsFor builds the apiref.Resolve options for resolveApiRef: the
+// widget request's pagination (and, #874, the data source's cursor) plus the
+// effective extras. A pure function so the hand-off is testable without an
+// apiserver.
+func apirefOptionsFor(opts ResolveOptions, apiRef v1.ObjectReference, apiRefEff map[string]any) apiref.ResolveOptions {
+	return apiref.ResolveOptions{
 		RC:      opts.RC,
 		ApiRef:  apiRef,
 		AuthnNS: opts.AuthnNS,
@@ -382,7 +387,7 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 		// map deep-copies to an empty dict (no-op) — the prewarm/seed/refresher
 		// callers (no request extras, no inline) stay byte-identical.
 		Extras: apiRefEff,
-	})
+	}
 }
 
 func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map[string]any, error) {

@@ -10,7 +10,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -133,19 +133,8 @@ func TestS874_UnpaginatedRequestEmitsNoSlice(t *testing.T) {
 }
 
 func TestS874_ResolveApiRefHandsTheCursorToApiref(t *testing.T) {
-	var got apiref.ResolveOptions
-	orig := apirefResolveFn
-	apirefResolveFn = func(_ context.Context, o apiref.ResolveOptions) (map[string]any, error) {
-		got = o
-		return map[string]any{}, nil
-	}
-	t.Cleanup(func() { apirefResolveFn = orig })
-	w := s874Menu()
-	w.Object["spec"].(map[string]any)["apiRef"] = map[string]any{"name": "src", "namespace": "demo-system"}
-	if _, err := resolveApiRef(hermeticCtx(t), ResolveOptions{In: w, PerPage: 5, Page: 3, Cursor: "c10"}); err != nil {
-		t.Fatal(err)
-	}
+	got := apirefOptionsFor(ResolveOptions{PerPage: 5, Page: 3, Cursor: "c10"}, templatesv1.ObjectReference{}, nil)
 	if got.Cursor != "c10" || got.Page != 3 || got.PerPage != 5 {
-		t.Fatalf("#874 RED: resolveApiRef handed apiref cursor=%q page=%d perPage=%d, want c10/3/5", got.Cursor, got.Page, got.PerPage)
+		t.Fatalf("#874 RED: resolveApiRef hands apiref cursor=%q page=%d perPage=%d, want c10/3/5", got.Cursor, got.Page, got.PerPage)
 	}
 }
