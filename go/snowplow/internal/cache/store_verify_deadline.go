@@ -287,6 +287,26 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		}
 	}
 	report := compareStore(idx, upstream)
+	// #872 — the store kept moving while the LIST was in flight, so a
+	// divergence counts only if it still holds against the object's current
+	// state (store_verify_recheck.go). A failed re-check makes the pass
+	// inconclusive: nothing is published or repaired, and the GVR is not marked
+	// verified, so the deadline walker comes back to it.
+	if report.total() > 0 {
+		rechecked, ok := recheckAgainstCurrent(ctx, cli, gvr, idx, report)
+		if !ok {
+			recordVerifySkipped(verifySkipRecheckError)
+			slog.Warn("cache.store.verification_recheck_failed",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.Int("candidates", int(report.total())),
+				slog.String("hint", "a quorum re-read of a divergence candidate failed, so this pass is "+
+					"inconclusive: nothing was published or repaired and the GVR stays due for "+
+					"verification. A real divergence is found by the next pass."))
+			return
+		}
+		report = rechecked
+	}
 	publishDivergence(gvr, verifySiteForced, report)
 
 	if latched := noteVerified(gvr, report.objectsCompared, report.total()); latched {
