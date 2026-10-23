@@ -15,8 +15,19 @@ The SPA behaviour was traced in `frontend-draganddrop/frontend` at `21f14bd`:
 - `ui/src/components/WidgetRenderer/WidgetRenderer.tsx` (the error branch);
 - `ui/src/components/WidgetStates/WidgetStates.tsx` (`isTimeoutError`).
 
-**No SPA change is needed.** The SPA already handles 424 the way this change
-intends. Section 5 has a test you can add to pin that.
+**No SPA change is required.** The SPA at `21f14bd` already handles a 424
+safely: it does not retry, it does not blank the page, and it shows the red
+`WidgetError` with Retry (section 3).
+
+The frontend's matching branch, `fix/widget-424-dependency` at `8f096d1`, is the
+chosen rendering, confirmed by the owner. It shows a calm state for 424:
+
+- `status=info`;
+- titled "Data source unavailable";
+- this response's `message` as its subtitle;
+- a "Check again" button that refetches only that widget (section 3a).
+
+Section 5 has a test you can add to pin the retry decision.
 
 ## 1. What changed
 
@@ -131,9 +142,35 @@ records it (`TestIssue853_424Body_IsAnIdentityFreeStatus_EndToEnd`).
    context it hands the model. It is unaffected: it gets status `424` and
    the same identity-free message.
 
-The frontend branch `fix/widget-424-dependency` (commit `ec2f302`) adds a calm,
-no-Retry state for 424, with this message as its subtitle. Whether it ships is
-the owner's call. Snowplow's contract above is the same either way.
+## 3a. The chosen 424 state (frontend `fix/widget-424-dependency`, `8f096d1`)
+
+The owner chose this rendering. It was traced in that branch's
+`WidgetRenderer.tsx` and `WidgetStates.tsx`:
+
+- `WidgetRenderer` handles `status === 424` before the generic error branch. It
+  renders `WidgetDependencyMissing`:
+  - an antd `Result` with `status='info'`, titled "Data source unavailable";
+  - `subTitle` set to this response's `message`, verbatim, up to 300
+    characters. The fallback, when there is no message, is "Something this
+    needs is not installed on this cluster.";
+  - a primary "Check again" button that calls `refetch()` for that widget's
+    query only.
+- It is not the red `WidgetError`, and not `WidgetNotFound`. Without the
+  branch (the SPA at `21f14bd`), a 424 shows the red `WidgetError` with Retry
+  (section 3, step 4). Either way it is not retried automatically.
+
+**Recovery in an open tab.**
+
+- An error response is never armed for `/refreshes`. The handler sets
+  `X-Snowplow-Refresh-Key` / `X-Snowplow-Refresh-Class` only on a served body
+  (an L1 hit or a resolved 200), never on an error answer. So no refresh frame
+  will ever announce that the missing dependency appeared.
+- A tab sitting on the 424 state recovers only when the user presses "Check
+  again" or navigates (a new query).
+- Automatic recovery, when the missing dependency appears, is a design question
+  tracked in #858.
+
+Snowplow's wire contract is the same whichever state renders it.
 
 ## 4. Edge cases
 
@@ -154,14 +191,27 @@ the owner's call. Snowplow's contract above is the same either way.
   - Two logic-only mutations each turn that test red: answering the CR read's
     404 as 424, and routing it through the dependency encoder. Without that
     guard, a bulk delete would silently go back to 4 requests per widget.
+  - The refetch a refresh frame triggers is a plain `GET /call`; the server
+    answers it exactly as any other request, so the test drives that request.
   - If a dependency was deleted, the answer is now `424`, which also fails
     fast. No new handling is needed.
+- **A 410 on the widget CR read itself.** This is not a dependency failure and
+  never becomes 424.
+  - On the real read path (informer miss, then the caller's apiserver),
+    `objects.Get` maps only NotFound to 404 and Forbidden to 403. Every other
+    apiserver error, a 410 included, becomes 500, unchanged by #853, and the
+    resolve never runs. The SPA retries that 500 as transient.
+  - A CR read that does produce a 410 Status is answered 410 as it is, which
+    the SPA treats as a permanent 4xx.
+  - Both are pinned by `TestIssue853_WidgetCRRead410_IsNot424`.
 - **During a roll (mixed versions).** For about one roll's length, the same
   widget can get `404` from an old pod and `424` from a new one.
-  - On a 404 the SPA retries for about 4.9 s and shows `WidgetNotFound`.
-  - On a 424 it shows the error state at once.
-  - So a widget with a missing dependency can flip from `WidgetNotFound` to
-    the 424 state within about 5 s, or the other way round on the next load.
+  - On a 404 the SPA retries for about 4.9 s and then shows `WidgetNotFound`
+    ("Not found").
+  - On a 424 it shows the 424 state at once: "Data source unavailable" with
+    the frontend branch, otherwise the red `WidgetError`.
+  - So a widget with a missing dependency can flicker between the two states
+    from one load to the next, the 404 one arriving about 5 s later.
   - This is cosmetic and heals itself once every pod is new. No data is
     wrong, and nothing is cached on either answer.
 - **A dependency answers 403.** This stays `403`, so the calm `WidgetForbidden`
@@ -171,9 +221,12 @@ the owner's call. Snowplow's contract above is the same either way.
 - **An older snowplow.** It answers 404 for a missing dependency, and the SPA
   behaves exactly as today. No capability token is needed, because the SPA's
   existing branches already cover both answers.
-- **Dashboards and alerts.** Anything that counts widget `/call` 404s (the
-  `dispatcher.call.complete` log line, ClickStack panels) will see these
-  answers move to 424.
+- **Dashboards and alerts (ClickStack).** Anything that counts widget `/call`
+  404s will see the missing-dependency share of them move to 424. That is any
+  ClickStack panel or alert built on the response's HTTP status. The
+  `dispatcher.call.complete` log line is not one of them: it carries no status
+  code. A widget whose CR is missing still counts as 404. A panel that reads "404 = broken widget" should add 424 to see the
+  same population, and can now tell the two apart.
 
 ## 5. Optional: pin the behaviour with a test
 

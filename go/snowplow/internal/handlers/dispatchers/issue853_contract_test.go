@@ -151,6 +151,63 @@ func TestIssue853_DeleteEvictedWidget_Is404_NeverTheDependencyPath(t *testing.T)
 	}
 }
 
+// TestIssue853_WidgetCRRead410_IsNot424: a 410 on the widget CR read itself
+// is not a dependency failure and never becomes 424. On the real read path
+// (informer miss, then the caller's apiserver answering 410) objects.Get
+// answers it 500: it maps only NotFound (404) and Forbidden (403) and every
+// other apiserver error to 500 — unchanged by #853. The resolve never runs.
+// A CR read that does yield a 410 Status is encoded as it is (seam arm).
+func TestIssue853_WidgetCRRead410_IsNot424(t *testing.T) {
+	t.Run("real_read_path", func(t *testing.T) {
+		h1BuildWatcherWithRA(t)
+		_, syncCh := cache.Global().EnsureResourceType(h1WidgetGVR)
+		select {
+		case <-syncCh:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("widget informer did not sync")
+		}
+		apiserver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			_, _ = fmt.Fprintf(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Gone","code":410,"message":"%s.%s \"%s\" is gone"}`,
+				h1WidgetGVR.Resource, h1WidgetGVR.Group, h1WName)
+		}))
+		defer apiserver.Close()
+		prevTM := env.TestMode()
+		env.SetTestMode(true)
+		defer env.SetTestMode(prevTM)
+		reqCtx := xcontext.BuildContext(h1ReqCtx(h1User),
+			xcontext.WithUserConfig(endpoints.Endpoint{ServerURL: apiserver.URL, Token: "tok-" + h1User}))
+		resolves := 0
+		r1 := setWidgetsResolveForTest(func(context.Context, widgets.ResolveOptions) (*widgets.Widget, error) {
+			resolves++
+			return nil, i853StatusErr(http.StatusNotFound, metav1.StatusReasonNotFound, "missing")
+		})
+		r2 := setCheckDispatchRBACForTest(func(context.Context, schema.GroupVersionResource, string) bool { return true })
+		defer func() { r2(); r1() }()
+		rec := httptest.NewRecorder()
+		Widgets().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, i853WidgetURL(), nil).WithContext(reqCtx))
+		if rec.Code == http.StatusFailedDependency || resolves != 0 {
+			t.Fatalf("#853 RED: a 410 on the widget CR read answered %d with %d resolves; it is not a dependency failure: %s",
+				rec.Code, resolves, rec.Body.String())
+		}
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("a 410 on the CR read answered %d; objects.Get maps it to 500 — if that mapping changed, update this arm and the integration doc: %s",
+				rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("cr_read_status_410", func(t *testing.T) {
+		got := objects.Result{Err: response.New(http.StatusGone, fmt.Errorf(`panels.widgets.templates.krateo.io "agent-create" is gone`))}
+		rec, calls := i853Serve(t, got, func() (*widgets.Widget, error) {
+			t.Fatal("the resolve ran for a widget whose CR read failed")
+			return nil, nil
+		})
+		if rec.Code != http.StatusGone || calls != 0 {
+			t.Fatalf("#853 RED: a CR read 410 answered %d (resolves %d), want 410 as read", rec.Code, calls)
+		}
+	})
+}
+
 // TestIssue853_424Body_IsAnIdentityFreeStatus_EndToEnd: the /agents/new shape
 // on the real chain (apiref.Resolve → restactions.Resolve → the caller's
 // apiserver), with the upstream 404 message stuffed with the caller's
