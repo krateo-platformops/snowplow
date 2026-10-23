@@ -101,6 +101,15 @@ const maxUnstructuredResponseTextBytes = 2048
 // (ProxyURL, not ServerURL) leaking by a different mechanism; it is the #453 /
 // #500 error-prose class and is tracked as #536.
 func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions) (*response.Status, []byte, string, error) {
+	return httpFetchConverting(ctx, opts, toJSONBytes)
+}
+
+// httpFetchConverting is httpFetchAllowingNonJSON with the 2xx body conversion
+// as a parameter: toJSONBytes, or the content-addressed memo of it
+// (external_fetch_cache.go), which returns exactly what toJSONBytes returns for
+// the same bytes. The request, the response handling and every error path are
+// the same for both.
+func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, convert func(string, []byte) ([]byte, error)) (*response.Status, []byte, string, error) {
 	// --- request assembly (transcribed from request.go:36-95) ---
 	uri := strings.TrimSuffix(opts.Endpoint.ServerURL, "/")
 	if len(opts.Path) > 0 {
@@ -288,7 +297,7 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		return response.New(http.StatusOK, nil), []byte("null"), ct, nil
 	}
 
-	jsonBytes, cerr := toJSONBytes(ct, dat)
+	jsonBytes, cerr := convert(ct, dat)
 	if cerr != nil {
 		// Conversion failed (malformed YAML / HTML garbage). Surface as a
 		// StatusFailure envelope so the caller's recordItemError honours

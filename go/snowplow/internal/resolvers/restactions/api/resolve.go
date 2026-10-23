@@ -1431,7 +1431,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if branchE == branchEImpersonate {
 		fctx = withEndpointImpersonation(fctx, branchEImp)
 	}
-	res, jsonBytes, _, fetchErr := httpFetchAllowingNonJSON(fctx, call)
+	// Always a live fetch; the CONVERSION is memoised by the response's bytes
+	// (external_fetch_cache.go). The touch above still declines the L1 Put.
+	res, jsonBytes, _, fetchErr := sharedExternalFetch(fctx, call)
 	if fetchErr != nil && fctx.Err() != nil {
 		// #643 PR-A — the caller's ctx was done before the response was read
 		// (the boot-readiness bound, a cut scope, a client that left). Counted,
