@@ -224,7 +224,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
-	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "IdentityClass.String": readOnly443,
+	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "SourcePagination": readOnly443, "IdentityClass.String": readOnly443,
 	"Inert": readOnly443, "InformerOnlyReadsFromContext": readOnly443, "InternalEndpointFromContext": readOnly443,
 	// #561 removed "WithInformerOnlyReads" from this table when it deleted
 	// #403's informer-only UAF pre-check read. #594 PUTS IT BACK, for a

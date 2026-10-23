@@ -26,7 +26,12 @@ type ResolveOptions struct {
 	AuthnNS string
 	PerPage int
 	Page    int
-	Extras  map[string]any
+	// Cursor (#874) — the data source's continuation token for THIS page (see
+	// widgets.ResolveOptions.Cursor). A cursor page is not a function of
+	// (perPage, page): it is resolved page-keyed, bypassing the Ship-4a
+	// full-list serve and the seed resolve memo (both keyed by page alone).
+	Cursor string
+	Extras map[string]any
 }
 
 // shouldServeRAFullList is the SINGLE gate for the Ship-4a page-independent
@@ -268,6 +273,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			PerPage: perPage,
 			Page:    page,
 			Extras:  opts.Extras,
+			// #874 — a non-empty cursor skips 4a (below), so it only ever
+			// reaches the page-keyed resolve of the requested page.
+			Cursor: opts.Cursor,
 		}
 		if _, rerr := restactions.Resolve(rctx, raopts); rerr != nil {
 			return nil, rerr
@@ -301,6 +309,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	l1Key := cache.L1KeyFromContext(ctx)
 
 	memo := cache.SeedResolveMemoFromContext(ctx)
+	if opts.Cursor != "" {
+		memo = nil // #874: the memo key has no cursor dimension
+	}
 	var memoKey string
 	var capBuf *[]cache.DepKey
 	var layerMark int
@@ -398,7 +409,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// full list, shared across pages AND widgets. On a miss / not-cleanly-
 	// sliceable shape it transparently falls back to today's page-keyed resolve
 	// below — NEVER a wrong result.
-	if shouldServeRAFullList(ctx, opts.PerPage, opts.Page) {
+	if opts.Cursor == "" && shouldServeRAFullList(ctx, opts.PerPage, opts.Page) {
 		if served, ok, serr := raFullListServe(ctx, res.GVR, opts.ApiRef.Namespace,
 			opts.ApiRef.Name, &ra, opts.PerPage, opts.Page, opts.Extras, resolveRA); serr != nil {
 			return map[string]any{}, serr

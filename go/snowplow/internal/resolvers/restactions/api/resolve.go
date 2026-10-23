@@ -149,7 +149,12 @@ type ResolveOptions struct {
 	Items   []*templates.API
 	PerPage int
 	Page    int
-	Extras  map[string]any
+	// Cursor (#874) — the data source's continuation token from the previous
+	// page. On a paginated resolve it is added to the jq dict as
+	// .slice.cursor next to page/perPage/offset, so a cursor-paging RESTAction
+	// (one that emits slice.cursor) is handed back where it left off.
+	Cursor string
+	Extras map[string]any
 
 	// Watcher is the cluster-wide informer cache. When nil (the
 	// default at 0.30.1, since CACHE_ENABLED defaults to false),
@@ -275,11 +280,15 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 	}
 
 	if opts.PerPage > 0 && opts.Page > 0 {
-		dict["slice"] = map[string]any{
+		sl := map[string]any{
 			"page":    opts.Page,
 			"perPage": opts.PerPage,
 			"offset":  (opts.Page - 1) * opts.PerPage,
 		}
+		if opts.Cursor != "" {
+			sl["cursor"] = opts.Cursor // #874
+		}
+		dict["slice"] = sl
 	}
 
 	// #487: the base dict is the request extras (client-chosen keys and

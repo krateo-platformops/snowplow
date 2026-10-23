@@ -645,6 +645,16 @@ func raFullListServe(
 	//    `full`, so identity holds by construction — re-encode both to
 	//    canonical JSON to be safe) AND S_go must byte-equal S_ra.
 	verdict := sok && canonicalJSONEqual(sGo, sRA)
+	// #874 — a source that DECLARES its own pagination (slice.continue /
+	// slice.cursor in its output) is page-dependent by construction: a page
+	// Go-sliced from the unpaginated full list would carry the full list's
+	// declaration, not this page's. Never sliceable, permanently — even on the
+	// one page where the two happen to byte-match (e.g. a last page whose
+	// continue is false in both).
+	_, _, declaresPagination := cache.SourcePagination(sRA)
+	if declaresPagination {
+		verdict = false
+	}
 
 	// Ship #91 / 0.30.211 — Class C heuristic. When the byte-verify FAILED
 	// AND `full` is shape-identical to S_ra modulo length-vs-perPage, this
@@ -652,8 +662,8 @@ func raFullListServe(
 	// whose verdict will never flip. Mark it permanent so the retry cap
 	// drops from 3 to 1. Mechanism-uniform: derived from (full, sRA, perPage),
 	// no resource/name/GVR literal (feedback_no_special_cases).
-	permanent := false
-	if !verdict {
+	permanent := declaresPagination
+	if !verdict && !permanent {
 		permanent = cache.IsStructurallyNonSliceable(full, sRA, perPage)
 	}
 

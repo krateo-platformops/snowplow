@@ -40,7 +40,13 @@ type ResolveOptions struct {
 	AuthnNS string
 	PerPage int
 	Page    int
-	Extras  map[string]any
+	// Cursor (#874) is the data source's own continuation token from the
+	// previous page (the RA-emitted slice.cursor, echoed in
+	// status.resourcesRefs.slice.cursor). It reaches the apiRef RESTAction as
+	// .slice.cursor. Empty on a first page and for every source that does not
+	// page by cursor.
+	Cursor string
+	Extras map[string]any
 }
 
 // resolveApiRefFn and validateObjectStatusFn are the two cross-boundary
@@ -62,6 +68,9 @@ type ResolveOptions struct {
 var (
 	resolveApiRefFn        = resolveApiRef
 	validateObjectStatusFn = crdschema.ValidateObjectStatus
+	// apirefResolveFn (#874) is resolveApiRef's hop into apiref.Resolve, so a
+	// hermetic test can assert what resolveApiRef hands it (the cursor).
+	apirefResolveFn = apiref.Resolve
 )
 
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
@@ -191,6 +200,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	// `if .slice then $sorted[0 : (.slice.page * .slice.perPage)] else …`)
 	// and silently falls through to "return all rows" when absent —
 	// materialising the unbounded list at the resolver layer.
+	//
+	// #874 — read the SOURCE's declared pagination BEFORE the injection: after
+	// it, ds.slice may be snowplow's own request echo, which declares nothing.
+	sourceMore, sourceCursor, _ := cache.SourcePagination(ds)
 	injectSlice(ds, opts.PerPage, opts.Page)
 
 	// extras-widgets parity (step 2): merge the per-request extras into
@@ -253,16 +266,27 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 			"items": tmp,
 		}
 		if opts.PerPage > 0 && opts.Page > 0 {
-			hasNext := (tot >= opts.PerPage)
+			// #874 — `continue` is the DATA SOURCE's answer (cache.SourcePagination:
+			// its slice.continue, else slice.cursor != "", else false), never an
+			// inference from the item count. The count rule (items >= perPage)
+			// made every source that ignores the window look endless; a source
+			// that does not paginate now yields exactly one page by construction.
+			hasNext := sourceMore
 			page := opts.Page
 			if hasNext {
 				page = page + 1
 			}
-			pig["slice"] = map[string]any{
+			sl := map[string]any{
 				"perPage":  opts.PerPage,
 				"page":     page,
 				"continue": hasNext,
 			}
+			// The next page's cursor, for whoever asks for that page (the
+			// prewarm drain threads it; a client may send it back as cursor=).
+			if hasNext && sourceCursor != "" {
+				sl["cursor"] = sourceCursor
+			}
+			pig["slice"] = sl
 		}
 
 		err = maps.SetNestedField(opts.In.Object, pig, "status", resourcesRefsKey)
@@ -339,12 +363,13 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 	apiRefInline := GetApiRefExtras(opts.In.Object)
 	apiRefEff := mergeRequestWins(apiRefInline, opts.Extras)
 
-	return apiref.Resolve(ctx, apiref.ResolveOptions{
+	return apirefResolveFn(ctx, apiref.ResolveOptions{
 		RC:      opts.RC,
 		ApiRef:  apiRef,
 		AuthnNS: opts.AuthnNS,
 		PerPage: opts.PerPage,
 		Page:    opts.Page,
+		Cursor:  opts.Cursor,
 		// extras-widgets parity (step 1): thread the EFFECTIVE extras
 		// (apiRef-inline folded under request) into the apiRef fetch.
 		// extras flows widget → apiref → restactions.Resolve → api.Resolve,
