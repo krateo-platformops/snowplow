@@ -2125,6 +2125,196 @@ def content_fill_report(mem: list[dict], bucket_s: float = CONTENT_FILL_BUCKET_S
             "note": "report only; bytes = the fills' bytes, which content-fill admission charges"}
 
 
+# ─── run 15 (1.12.55): the incremental list cell (#865) and the store's
+#     verification re-check (#875) — report only ───────────────────────────
+#
+# Both from mem606's samples, per phase (run_phases), with a restart decided
+# once per sample pair (_deltas). Keys, read from the PR heads:
+#   snowplow_list_incremental (#865 @ aec5f1fb, cache/list_cell_expvar.go): a
+#     map — live (anchored cells, a gauge), anchors, passes (shadow comparator),
+#     refresh_skipped (content-key re-dispatches the cells made unnecessary:
+#     the fills avoided), unanchors {reason}, divergences {reason},
+#     divergence_total (must be 0), ...; plus the content-fill reason
+#     "reanchor" in snowplow_apistage_content_fill_total (already captured).
+#   snowplow_store_verification (#875 @ 01d32632, cache/store_verify_stats.go,
+#     statsByTag: the map's keys are the stat tags):
+#     store_divergence_recheck_gets_total / _cleared_total, the
+#     store_divergent_{lost_update,lost_delete,lost_add,uid_mismatch}_
+#     {snapshot,forced}_total findings, store_divergence_candidates_total,
+#     store_repairs_fired_total (one per relist the cache.store.repair line
+#     announces; a GVR torn down in between logs the line but is not counted),
+#     store_repair_{ineffective,unsupported,suppressed}_total; and
+#     snowplow_store_verification_skipped_by_reason {reason}.
+LIST_INCREMENTAL_KEY = "snowplow_list_incremental"
+STORE_VERIFY_KEY = "snowplow_store_verification"
+STORE_VERIFY_SKIPPED_KEY = "snowplow_store_verification_skipped_by_reason"
+CONTENT_FILL_TOTAL_KEY = "snowplow_apistage_content_fill_total"
+REPORT_ABSENT = LIST_NARROW_ABSENT          # the same status, one spelling
+
+_STORE_FINDINGS = tuple(f"store_divergent_{c}_{s}_total"
+                        for c in ("lost_update", "lost_delete", "lost_add", "uid_mismatch")
+                        for s in ("snapshot", "forced"))
+_STORE_REPAIRS = ("store_repairs_fired_total", "store_repair_ineffective_total",
+                  "store_repair_unsupported_total", "store_repair_suppressed_total")
+
+
+def _flat(prefix: str, v) -> dict:
+    """A counter map flattened to prefix/key -> number (one level)."""
+    return {f"{prefix}/{k}": _num(x) for k, x in v.items()} if isinstance(v, dict) else {}
+
+
+def _phase_counter_report(mem: list[dict], fresh: list[dict] | None, key: str, extract) -> dict:
+    """Per-phase sums of the cumulative counters `extract(sample)` returns
+    (None = the sample has no `key`), the seconds each phase's pairs span, and
+    the restarts. status = REPORT_ABSENT when no sample carried `key`."""
+    rows = sorted((m for m in mem if m.get("kind") == "mem" and extract(m) is not None),
+                  key=lambda m: m.get("t") or 0)
+    if not rows:
+        return {"status": REPORT_ABSENT, "mem_samples": sum(1 for m in mem if m.get("kind") == "mem"),
+                "note": f"no mem sample carried {key}: the report is MISSING (an image without it, "
+                        f"or mem606 not capturing it), not zero"}
+    phases = run_phases(mem, fresh)
+    tot: dict[str, dict] = {}
+    restarts = 0
+    for a, b in itertools.pairwise(rows):
+        ca, cb = extract(a), extract(b)
+        d, r = _deltas(a, b, {k: ca.get(k, 0) for k in cb}, cb)
+        restarts += r
+        ph = tot.setdefault(_phase_of(b["t"], phases), {"seconds": 0.0, "pairs": 0, "counters": {}})
+        ph["seconds"] += b["t"] - a["t"]
+        ph["pairs"] += 1
+        for k, v in d.items():
+            if v is not None:
+                ph["counters"][k] = ph["counters"].get(k, 0) + v
+    order = [n for n, _, _ in phases] + ["steady"]
+    by_phase = {n: tot[n] for n in order if n in tot}
+    churn = [n for n in tot if n.startswith("churn:")]
+
+    def summed(names):
+        s = {"seconds": 0.0, "pairs": 0, "counters": {}}
+        for n in names:
+            s["seconds"] += tot[n]["seconds"]
+            s["pairs"] += tot[n]["pairs"]
+            for k, v in tot[n]["counters"].items():
+                s["counters"][k] = s["counters"].get(k, 0) + v
+        return s
+    if churn:
+        by_phase["churn"] = summed(churn)
+    by_phase["all"] = summed(list(tot))
+    for p in by_phase.values():
+        p["seconds"] = round(p["seconds"], 1)
+    return {"status": "present", "by_phase": by_phase, "samples": len(rows), "restarts": restarts,
+            "last": rows[-1], "phases": phases}
+
+
+def _split(counters: dict, prefix: str) -> dict:
+    """The prefix/<key> members of a phase's counters, as {key: n} (non-zero)."""
+    return {k.split("/", 1)[1]: v for k, v in counters.items() if k.startswith(prefix + "/") and v}
+
+
+def _list_incremental_counters(m: dict) -> dict | None:
+    extra = m.get("extra") or {}
+    v = extra.get(LIST_INCREMENTAL_KEY)
+    if not isinstance(v, dict):
+        return None
+    out = {k: _num(v.get(k)) for k in ("divergence_total", "passes", "suspects", "anchors",
+                                        "refresh_skipped", "generations")}
+    out |= _flat("unanchors", v.get("unanchors")) | _flat("divergences", v.get("divergences"))
+    fills = extra.get(CONTENT_FILL_TOTAL_KEY)
+    if isinstance(fills, dict):
+        out["fills_reanchor"] = _num(fills.get("reanchor"))
+    # the largest list cell's fills: the GVR whose single fill is the biggest
+    by_gvr = extra.get(CONTENT_FILL_GVR_KEY)
+    if isinstance(by_gvr, dict):
+        for gvr, row in by_gvr.items():
+            if isinstance(row, dict):
+                out[f"gvr_fills/{gvr}"] = _num(row.get("fills"))
+    return out
+
+
+def list_incremental_report(mem: list[dict], fresh: list[dict] | None = None) -> dict:
+    """#865, per phase: the largest list cell's fills per minute, unanchors
+    by reason, divergences (by reason and total: must stay 0), comparator
+    passes, the fills the cells avoided (refresh_skipped) and the re-anchor
+    fills; the anchored cells (`live`) at the last sample."""
+    r = _phase_counter_report(mem, fresh, LIST_INCREMENTAL_KEY, _list_incremental_counters)
+    if r["status"] == REPORT_ABSENT:
+        return r
+    last = r.pop("last")
+    r.pop("phases")
+    by_gvr = (last.get("extra") or {}).get(CONTENT_FILL_GVR_KEY) or {}
+    largest = max((g for g, v in by_gvr.items() if isinstance(v, dict)),
+                  key=lambda g: (_num(by_gvr[g].get("max_bytes")) or 0, g), default=None)
+    out = {}
+    for name, p in r["by_phase"].items():
+        c = p["counters"]
+        fills = c.get(f"gvr_fills/{largest}", 0) if largest else None
+        out[name] = {
+            "seconds": p["seconds"], "pairs": p["pairs"],
+            "largest_cell_fills": fills,
+            "largest_cell_fills_per_min": (round(fills / (p["seconds"] / 60), 3)
+                                           if fills is not None and p["seconds"] else None),
+            "unanchors_by_reason": _split(c, "unanchors"),
+            "divergences_by_reason": _split(c, "divergences"),
+            "divergence_total": c.get("divergence_total"),
+            "comparator_passes": c.get("passes"),
+            "comparator_suspects": c.get("suspects"),
+            "anchors": c.get("anchors"),
+            "fills_avoided_refresh_skipped": c.get("refresh_skipped"),
+            "reanchor_fills": c.get("fills_reanchor"),
+        }
+    li = (last.get("extra") or {}).get(LIST_INCREMENTAL_KEY) or {}
+    return {"status": "present", "by_phase": out, "samples": r["samples"], "restarts": r["restarts"],
+            "largest_cell_gvr": largest,
+            "largest_cell_max_bytes": _num((by_gvr.get(largest) or {}).get("max_bytes")) if largest else None,
+            "anchored_cells_last": _num(li.get("live")),
+            "note": ("report only. divergence_total must stay 0; the largest cell = the GVR "
+                     "whose single content fill is the biggest (max_bytes, last sample)")}
+
+
+def _store_verify_counters(m: dict) -> dict | None:
+    extra = m.get("extra") or {}
+    v = extra.get(STORE_VERIFY_KEY)
+    if not isinstance(v, dict):
+        return None
+    out = {k: _num(v.get(k)) for k in ("store_divergence_recheck_gets_total",
+                                        "store_divergence_recheck_cleared_total",
+                                        "store_divergence_candidates_total", "store_verifications_total",
+                                        *_STORE_FINDINGS, *_STORE_REPAIRS)}
+    return out | _flat("skipped", extra.get(STORE_VERIFY_SKIPPED_KEY))
+
+
+def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) -> dict:
+    """#875, per phase: the forced pass's re-check GETs and the candidates
+    they cleared, the verification findings (divergences by class and site,
+    raw candidates), the verifications skipped by reason, and the repairs
+    (fired, and ineffective / unsupported / suppressed)."""
+    r = _phase_counter_report(mem, fresh, STORE_VERIFY_KEY, _store_verify_counters)
+    if r["status"] == REPORT_ABSENT:
+        return r
+    last = r.pop("last")
+    r.pop("phases")
+    out = {}
+    for name, p in r["by_phase"].items():
+        c = p["counters"]
+        out[name] = {
+            "seconds": p["seconds"], "pairs": p["pairs"],
+            "recheck_gets": c.get("store_divergence_recheck_gets_total"),
+            "recheck_cleared": c.get("store_divergence_recheck_cleared_total"),
+            "verifications": c.get("store_verifications_total"),
+            "findings": {k[len("store_divergent_"):-len("_total")]: c.get(k) for k in _STORE_FINDINGS},
+            "divergence_candidates": c.get("store_divergence_candidates_total"),
+            "skipped_by_reason": _split(c, "skipped"),
+            "repairs": {k[len("store_"):-len("_total")]: c.get(k) for k in _STORE_REPAIRS},
+        }
+    sv = (last.get("extra") or {}).get(STORE_VERIFY_KEY) or {}
+    return {"status": "present", "by_phase": out, "samples": r["samples"], "restarts": r["restarts"],
+            "gauges_last": {k: _num(sv.get(k)) for k in ("store_gvrs_unverified", "store_gvrs_unverifiable",
+                                                         "store_repairs_pending")},
+            "note": ("report only. repairs.repairs_fired counts relists the cache.store.repair "
+                     "log line announced (a GVR torn down in between is logged, not counted)")}
+
+
 def profiling_report(mem: list[dict], navs: list[dict],
                      k6_loads: list[tuple[float, float, dict]] | None = None) -> dict | None:
     win = cpu_profile_windows(mem)
@@ -2206,6 +2396,8 @@ RUN8_VARS_PREFIXES = (
     "snowplow_refresher_",                # dirty_to_fresh windowed gauges + run-9 counters
     "snowplow_deps_dirty_mark_",          # run 9 (#765): marks per event
     "snowplow_deps_list_narrow",          # run 14 (#765 B shadow): would_avoid / would_change
+    "snowplow_list_incremental",          # run 15 (#865): the incremental list cell
+    "snowplow_store_verification",        # run 15 (#875): re-check, findings, repairs, skipped_by_reason
     "snowplow_resolved_cache",
     "snowplow_informer_dispatch_shape",
     "snowplow_build_info",
@@ -3246,6 +3438,16 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
           f"mem samples: the #765 B shadow report is missing, not zero")]
         if report["list_narrow_shadow_report_only"]["status"] == LIST_NARROW_ABSENT else [])
     report["content_fill_by_gvr_report_only"] = content_fill_report(mem or [])
+    report["list_incremental_report_only"] = list_incremental_report(mem or [], fresh)
+    report["store_verification_report_only"] = store_verification_report(mem or [], fresh)
+    for name, key, what in (("list_incremental_report_only", LIST_INCREMENTAL_KEY,
+                             "the #865 incremental list cell report"),
+                            ("store_verification_report_only", STORE_VERIFY_KEY,
+                             "the #875 store verification report")):
+        if report[name]["status"] == REPORT_ABSENT:
+            report["report_warnings"].append(
+                f"{key} absent in all {report[name]['mem_samples']} mem samples: "
+                f"{what} is missing, not zero")
     report["profiling"] = profiling_report(
         mem or [], navs,
         k6eval.k6_page_loads(k6.get("k6")) if k6 is not None else None)

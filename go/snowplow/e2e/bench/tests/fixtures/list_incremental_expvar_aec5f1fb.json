@@ -1,0 +1,57 @@
+{
+ "source": "recorded from snowplow's own code at #865's head aec5f1fb4273da4b580dc9199733012e94621420 (feat/854-incremental-list-cell): the expvar snowplow_list_incremental (internal/cache/list_cell_expvar.go) read with expvar.Get, CACHE_ENABLED=true, before and after the F5s flow of list_cell_854_sources_test.go (an anchored cell; a lost apply on an object that left the selector; two comparator passes; a read): 1 key_mismatch divergence, 1 unanchor (divergence), 2 passes, 1 suspect",
+ "before": {
+  "snowplow_list_incremental": {
+   "anchor_skipped": 0,
+   "anchors": 1,
+   "applied_keys": 0,
+   "decodes": 0,
+   "divergence_total": 0,
+   "divergences": {},
+   "gen_alloc_bytes_max": 0,
+   "gen_alloc_bytes_total": 0,
+   "gen_alloc_count": 0,
+   "generations": 0,
+   "items_built": 0,
+   "live": 1,
+   "passes": 0,
+   "pending_recorded": 0,
+   "rawjson_built": 0,
+   "reads": 1,
+   "rebinds": 0,
+   "refresh_skipped": 0,
+   "restamps": 0,
+   "suspects": 0,
+   "unanchors": {}
+  }
+ },
+ "after": {
+  "snowplow_list_incremental": {
+   "anchor_skipped": 0,
+   "anchors": 1,
+   "applied_keys": 0,
+   "decodes": 0,
+   "divergence_total": 1,
+   "divergences": {
+    "key_mismatch": 1
+   },
+   "gen_alloc_bytes_max": 0,
+   "gen_alloc_bytes_total": 0,
+   "gen_alloc_count": 0,
+   "generations": 0,
+   "items_built": 0,
+   "live": 0,
+   "passes": 2,
+   "pending_recorded": 0,
+   "rawjson_built": 0,
+   "reads": 1,
+   "rebinds": 0,
+   "refresh_skipped": 0,
+   "restamps": 0,
+   "suspects": 1,
+   "unanchors": {
+    "divergence": 1
+   }
+  }
+ }
+}
