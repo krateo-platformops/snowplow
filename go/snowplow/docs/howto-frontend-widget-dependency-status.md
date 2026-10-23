@@ -103,13 +103,32 @@ records it (`TestIssue853_424Body_IsAnIdentityFreeStatus_EndToEnd`).
     request's own coordinates. A stage failure's message is built from the
     request, never from the upstream (#709 A7). An apiserver NotFound names
     only the resource and the object.
-  - It never names an identity. A message that names a requester
-    (`User "…"`), a `<user>-clientconfig` Secret, or the caller's username
-    (or its DNS form) or groups is replaced by the fixed text
-    `A data source this widget reads is not available.` So is an empty
-    message. This holds whatever the upstream sent: a test stuffs the
-    upstream 404 with the caller's username, group, clientconfig Secret and
-    certificate CN, and asserts that none of them reaches the body.
+  - It never names an identity. The message is replaced by the fixed text
+    `A data source this widget reads is not available.` when it is empty,
+    or when any form of it names one.
+    - The forms checked are the message as sent, plus its path-unescaped and
+      query-unescaped forms (up to three rounds, for double escaping), all
+      case-folded.
+    - The caller's identity is checked in all of these: the username, its
+      DNS-1123 form, its local part before `@`, and every group (`system:`
+      groups included).
+    - So are identity shapes, whoever they belong to: a requester
+      (`User "…"`), a `-clientconfig` Secret (quoted, unquoted or in a
+      path), `CN=`, `username:` / `user=`, `token=`, `Bearer …`, a JWT, and
+      any `system:` name.
+  - Why it matters: a stage's 404 message names the object in the stage's
+    path, and a RESTAction path can be templated from the caller's identity.
+    #288 refuses to dial a name that is not DNS-1123-valid, so names with `@`
+    or `%40` never get that far. The DNS-valid forms do: a lower-cased group,
+    the local part, the DNS form. On main before #856, those reached the 404
+    body, which the SPA shows as the `WidgetNotFound` subtitle. #856 closes
+    that for the 424.
+  - Tests cover it:
+    - every rule above, row by row, with one mutation per rule;
+    - the reachable forms end to end, through a real identity-templated
+      stage;
+    - an upstream 404 stuffed with the caller's username, group, clientconfig
+      Secret and certificate CN.
   - It carries no stack text. It is a single Status message.
 - No refresh headers (`X-Snowplow-Refresh-Key` / `X-Snowplow-Refresh-Class`)
   are set on any error answer, before or after #853.

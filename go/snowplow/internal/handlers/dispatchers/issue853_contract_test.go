@@ -261,25 +261,80 @@ func TestIssue853_424Body_IsAnIdentityFreeStatus_EndToEnd(t *testing.T) {
 	t.Logf("424 message (the SPA subtitle): %q", st.Message)
 }
 
+// i853Carol is the #856 gate's caller: mixed case, an "@", a mixed-case group,
+// a short group and the system:authenticated group every caller carries.
+const i853Carol = "Carol.Smith@Example.org"
+
+var i853CarolGroups = []string{"system:authenticated", "Team-Blue", "sre", "QA Team", "dev+ops"}
+
+// i853JWT is a JWT-shaped fake (header {"alg":"RS256"}, payload {"sub":"erin"}),
+// joined at run time so the source carries no JWT literal for the repo's secret
+// scanner to flag.
+var i853JWT = strings.Join([]string{"eyJhbGciOiJSUzI1NiJ9", "eyJzdWIiOiJlcmluIn0", "c2lnbmF0dXJl"}, ".")
+
 // TestIssue853_424Message_NeverNamesAnIdentity: whatever a dependency's
-// message carries, the 424 never shows a requester, a clientconfig Secret,
-// or the caller's username or groups; nor is it empty. A message without any
-// of them is shown as it is.
+// message carries, the 424 never shows an identity in any form a reader could
+// decode it to — this caller's (any case, path- or query-escaped, local part,
+// DNS form, any group) or anyone's (a requester, a clientconfig Secret, a
+// certificate subject, a user key, a token, a JWT, a system: name) — nor an
+// empty message. A message without any of them is shown as it is, so the
+// guard is not "always hide".
+//
+// The first 24 rows are the #856 gate's attack messages; the three marked e2e
+// are the messages the stage builder really produces for an identity-templated
+// path (TestIssue853_IdentityTemplatedPath_EndToEnd drives them for real).
 func TestIssue853_424Message_NeverNamesAnIdentity(t *testing.T) {
 	ctx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "carol@example.org", Groups: []string{"system:authenticated", "team-blue"}}))
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: i853Carol, Groups: i853CarolGroups}))
+	dns := kubeutil.MakeDNS1123Compatible(i853Carol)
 	cases := []struct {
 		name, msg string
 		shown     bool
 	}{
-		{"plain_not_found", `restactions.templates.krateo.io "agent-formdef" not found`, true},
-		{"caller_username", `widgets "x" not found for carol@example.org`, false},
-		{"caller_dns_name", `configmaps "` + kubeutil.MakeDNS1123Compatible("carol@example.org") + `" not found`, false},
-		{"caller_group", `rolebindings "team-blue" not found`, false},
-		{"clientconfig_secret", `secrets "dave-clientconfig" not found`, false},
-		{"apiserver_requester", `widgets is forbidden: User "erin" cannot get`, false},
+		// The #856 gate's 24.
+		{"lowercase_username_e2e", `configmaps "carol.smith@example.org" not found`, false},
+		{"uppercase_username", `configmaps "CAROL.SMITH@EXAMPLE.ORG" not found`, false},
+		{"query_escaped_username_e2e", `configmaps "carol.smith%40example.org" not found`, false},
+		{"username_local_part", `configmaps "carol.smith" not found`, false},
+		{"lowercase_group_e2e", `configmaps "team-blue" not found`, false},
+		{"system_authenticated", `rolebindings "system:authenticated" not found`, false},
+		{"other_clientconfig_unquoted", `secret dave-clientconfig not found`, false},
+		{"other_clientconfig_in_path", `GET /api/v1/namespaces/krateo-system/secrets/dave-clientconfig: not found`, false},
+		{"requester_uppercase", `USER "erin" cannot get widgets`, false},
+		{"username_key", `lookup failed, username: erin`, false},
+		{"user_key", `lookup failed for user=erin`, false},
+		{"certificate_cn", `certificate CN=erin rejected`, false},
+		{"bearer_jwt", `Authorization: Bearer ` + i853JWT, false},
+		{"query_token_jwt", `GET /x?token=` + i853JWT + ` not found`, false},
+		{"exact_username", `widgets "Carol.Smith@Example.org" not found`, false},
+		{"dns_form", `configmaps "` + dns + `" not found`, false},
+		{"dns_clientconfig", `secrets "` + dns + `-clientconfig" not found`, false},
+		{"exact_group", `rolebindings "Team-Blue" not found`, false},
+		{"short_group", `rolebindings "sre" not found`, false},
+		{"other_clientconfig_quoted", `secrets "dave-clientconfig" not found`, false},
+		{"requester", `widgets is forbidden: User "erin" cannot get`, false},
+		{"requester_serviceaccount", `forbidden: User "system:serviceaccount:krateo-system:snowplow" cannot list`, false},
+		{"double_escaped_username", `configmaps "carol.smith%2540example.org" not found`, false},
+		{"path_escaped_group", `configmaps "Team%2DBlue" not found`, false},
+		// Further shapes. Each guard rule has at least one row only it hides,
+		// so a mutation of that rule alone turns this test red.
+		{"bearer_opaque", `Authorization: Bearer abc123opaque`, false},
+		{"bare_jwt", `widgets "` + i853JWT + `" not found`, false},
+		{"query_unescape_only", `rolebindings "qa+team" not found`, false},      // group "QA Team": '+' is a space only to QueryUnescape
+		{"path_unescape_only", `rolebindings "dev+%6Fps" not found`, false},     // group "dev+ops": '+' stays '+' only in PathUnescape
+		{"double_escaped_group", `configmaps "team%252Dblue" not found`, false}, // needs two unescape rounds
+		{"system_masters", `clusterrolebindings "system:masters" not found`, false},
+		{"access_token_key", `access_token=abc not found`, false},
 		{"empty", "", false},
 		{"blank", "   ", false},
+		// Shown: no identity in any form. These keep the guard from passing by
+		// hiding everything.
+		{"plain_not_found", `restactions.templates.krateo.io "agent-formdef" not found`, true},
+		{"agents_new", `restaction krateo-system/agent-formdef stage "crd" failed: customresourcedefinitions.apiextensions.k8s.io "agents.kagent.dev" not found`, true},
+		{"word_users", `configmaps "users-dashboard" not found`, true},
+		{"word_token", `restactions "token-usage" not found`, true},
+		{"near_local_part", `configmaps "carolina" not found`, true},
+		{"escaped_but_clean", `configmaps "a%2Fb" not found`, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -297,6 +352,26 @@ func TestIssue853_424Message_NeverNamesAnIdentity(t *testing.T) {
 				t.Fatalf("message=%q, want %q", st.Message, want)
 			}
 		})
+	}
+}
+
+// TestIssue853_424Message_UsernameAndDNSFormTokens: for a username without
+// "@" (no local part to fall back on), the username token and the DNS-1123
+// token each hide a message the other does not.
+func TestIssue853_424Message_UsernameAndDNSFormTokens(t *testing.T) {
+	const user = "Erin_X"
+	dns := kubeutil.MakeDNS1123Compatible(user)
+	if strings.Contains(strings.ToLower(user), dns) || strings.Contains(dns, strings.ToLower(user)) {
+		t.Fatalf("PRECONDITION: the username %q and its DNS form %q must not contain each other", user, dns)
+	}
+	ctx := xcontext.BuildContext(context.Background(), xcontext.WithUserInfo(jwtutil.UserInfo{Username: user}))
+	for _, msg := range []string{
+		`widgets "erin_x" not found`,         // the username, case-folded
+		`configmaps "` + dns + `" not found`, // its DNS form
+	} {
+		if got := dependencyFailureMessage(ctx, msg); got != dependencyFailureFallback {
+			t.Fatalf("message %q was shown as %q", msg, got)
+		}
 	}
 }
 

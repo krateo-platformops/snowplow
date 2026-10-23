@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
-	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/plumbing/kubeutil"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
@@ -71,24 +73,104 @@ const dependencyFailureFallback = "A data source this widget reads is not availa
 // dependencyFailureMessage is the dependency's own message when it is safe to
 // show the user, else dependencyFailureFallback.
 //
-// The messages that reach here are identity-free by construction: a stage
-// failure's message is built from the request's coordinates, never from the
-// upstream (stage_failure.go), and an apiserver NotFound names only the
-// resource and the object. This check keeps that true for any other source.
-// A message is never shown when it names a requester (the apiserver's
-// `User "…"`), a `<user>-clientconfig` Secret, or this caller's username or
-// groups (the same token set the learned-class log redaction uses).
+// A stage failure's message is built from the request's coordinates, never
+// from the upstream's text (stage_failure.go). But those coordinates include
+// the object name from the stage path, and a RESTAction path can be templated
+// from the caller's identity — lower-cased into a Kubernetes name or
+// URL-escaped (#856 gate: `configmaps "carol.smith%40example.org" not found`).
+// So the message is checked in every form a reader could decode it to — as
+// sent, path-unescaped and query-unescaped (repeatedly, for double escaping),
+// all case-folded — and is never shown when any form carries:
+//   - one of this caller's tokens: the username, its DNS-1123 form, its local
+//     part (before "@"), or any of its groups;
+//   - an identity shape, whoever it belongs to (identityShapes).
 func dependencyFailureMessage(ctx context.Context, msg string) string {
 	msg = strings.TrimSpace(msg)
-	if msg == "" || redact.ErrorText(msg) != msg {
+	if msg == "" {
 		return dependencyFailureFallback
 	}
+	var tokens []string
 	if ui, err := xcontext.UserInfo(ctx); err == nil {
-		for _, tok := range learnedRedactionTokens(ui.Username, ui.Groups) {
-			if strings.Contains(msg, tok) {
+		tokens = callerIdentityTokens(ui.Username, ui.Groups)
+	}
+	for _, form := range decodedForms(msg) {
+		for _, shape := range identityShapes {
+			if shape.MatchString(form) {
+				return dependencyFailureFallback
+			}
+		}
+		for _, tok := range tokens {
+			if strings.Contains(form, tok) {
 				return dependencyFailureFallback
 			}
 		}
 	}
 	return msg
+}
+
+// identityShapes match, in a case-folded form, text that names or carries an
+// identity or a credential no matter whose it is. A dependency message never
+// needs any of them, so a false positive costs only the fixed sentence.
+var identityShapes = []*regexp.Regexp{
+	regexp.MustCompile(`\buser\s*"[^"]*"`),                           // the apiserver's requester: User "…"
+	regexp.MustCompile(`-clientconfig\b`),                            // an authn <user>-clientconfig Secret, quoted or not, in a path or not
+	regexp.MustCompile(`\bcn\s*=`),                                   // a certificate subject
+	regexp.MustCompile(`\buser(name)?\s*[:=]`),                       // username: … / user=…
+	regexp.MustCompile(`\b(access_|id_|refresh_)?token\s*[:=]`),      // token=… / ?token=…
+	regexp.MustCompile(`\bbearer\s+\S`),                              // an Authorization value
+	regexp.MustCompile(`\beyj[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]*`), // a JWT (base64url of `{"` is eyJ)
+	regexp.MustCompile(`\bsystem:[a-z]`),                             // a system: group or user
+}
+
+// decodedForms is msg case-folded, plus every distinct form path- or
+// query-unescaping reaches from it (up to three rounds).
+func decodedForms(msg string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(s string) bool {
+		s = strings.ToLower(s)
+		if _, dup := seen[s]; dup {
+			return false
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+		return true
+	}
+	add(msg)
+	frontier := []string{msg}
+	for round := 0; round < 3 && len(frontier) > 0; round++ {
+		var next []string
+		for _, f := range frontier {
+			for _, unescape := range []func(string) (string, error){url.PathUnescape, url.QueryUnescape} {
+				if u, err := unescape(f); err == nil && add(u) {
+					next = append(next, u)
+				}
+			}
+		}
+		frontier = next
+	}
+	return out
+}
+
+// callerIdentityTokens is the caller's identity, case-folded: the username,
+// its DNS-1123 form (how authn names the caller's objects), its local part
+// before "@", and every group, system: groups included.
+func callerIdentityTokens(username string, groups []string) []string {
+	var out []string
+	add := func(s string) {
+		if s = strings.ToLower(strings.TrimSpace(s)); s != "" {
+			out = append(out, s)
+		}
+	}
+	add(username)
+	if username != "" {
+		add(kubeutil.MakeDNS1123Compatible(username))
+		if at := strings.IndexByte(username, '@'); at > 0 {
+			add(username[:at])
+		}
+	}
+	for _, g := range groups {
+		add(g)
+	}
+	return out
 }
