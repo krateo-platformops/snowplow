@@ -339,6 +339,12 @@ type ResolvedEntry struct {
 	// map is still private, never on a map already aliased by a serve).
 	itemsLazy atomic.Pointer[lazyListItems]
 
+	// listCell — #854: an ANCHORED apistage LIST content cell keeps its items
+	// incrementally (list_cell.go). Such an entry has no RawJSON and no Items;
+	// readers take a generation through ListCell().Snapshot, and every body
+	// reader goes through Raw() / RawLen(). Set only by NewListCellEntry.
+	listCell *ListCell
+
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a (commit subsequent to
 	// 1d93d02): the previous `CohortGates atomic.Pointer[CohortGateMemoStore]`
 	// field — Ship GMC / 0.30.174's per-(content-entry × cohort) memo of
@@ -2220,6 +2226,10 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		}
 		// #444 — the recent hitters belong to the KEY too: a refresh re-Put must
 		// not forget who the cell is served to (they are its representative pool).
+		if old.entry != nil && old.entry != entry && old.entry.listCell != entry.listCell {
+			// #854 — the incremental cell the replaced entry carried stops.
+			closeListCellOf(old.entry, "replaced")
+		}
 		if old.entry != nil && old.entry != entry && entry.recentHitters.Load() == nil {
 			entry.recentHitters.Store(old.entry.recentHitters.Load())
 		}
@@ -2373,11 +2383,49 @@ func entryBytes(entry *ResolvedEntry) int64 {
 	if entry == nil {
 		return 0
 	}
+	if entry.listCell != nil {
+		// #854 — the SAME number a full fill of the same state would be
+		// accounted at: the exact envelope length (never built) plus the
+		// decoded tree's overhead.
+		b := int64(entry.RawLen())
+		if entry.itemCount() > 0 {
+			b += b * itemsTreeOverheadFactor
+		}
+		return b
+	}
 	b := int64(len(entry.RawJSON))
 	if len(entry.Items) > 0 {
 		b += int64(len(entry.RawJSON)) * itemsTreeOverheadFactor
 	}
 	return b
+}
+
+// reaccountEntry re-reads an incremental entry's size after a generation build
+// (#854) and moves the store's byte accounting by the difference. A no-op when
+// the key no longer holds that entry. No generation move, no Put identity, no
+// recency: the entry did not change, its cell's body did.
+func (c *ResolvedCacheStore) reaccountEntry(key string, e *ResolvedEntry) {
+	if c == nil || e == nil {
+		return
+	}
+	b := entryBytes(e)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.index[key]
+	if !ok {
+		return
+	}
+	item := el.Value.(*lruItem)
+	if item.entry != e || item.bytes == b {
+		return
+	}
+	if e.Pinned {
+		c.curResidentBytes += b - item.bytes
+	} else {
+		c.curBytes += b - item.bytes
+	}
+	item.bytes = b
+	c.evictUntilUnderCapsLocked()
 }
 
 // Len returns the number of entries currently held. Safe to call
@@ -2995,8 +3043,8 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 		Pinned:          entry.Pinned,
 		LastReadSeconds: lastReadSecondsOf(item, now),
 		SeededAtBoot:    entry.SeededAtBoot,
-		ItemsCount:      len(entry.Items),
-		RawJSONBytes:    len(entry.RawJSON),
+		ItemsCount:      entry.itemCount(),
+		RawJSONBytes:    entry.RawLen(),
 	}
 	if eff := c.effectiveTTLLocked(entry); eff > 0 {
 		rem := eff - now.Sub(entry.CreatedAt)
@@ -3067,7 +3115,7 @@ func (c *ResolvedCacheStore) MetadataForKey(key string) (ResolvedEntryMeta, bool
 			continue
 		}
 		out = c.metaForItemLocked(item, now)
-		out.BodySHA256 = fmt.Sprintf("%x", sha256.Sum256(item.entry.RawJSON))
+		out.BodySHA256 = fmt.Sprintf("%x", sha256.Sum256(item.entry.Raw()))
 		return out, true
 	}
 	return out, false
@@ -3220,6 +3268,7 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	delete(c.index, item.key)
 	c.order.Remove(el)
 	c.raLayerForgetLocked(item.key) // #406
+	closeListCellOf(item.entry, "evicted") // #854
 	// 1.12.6 C4 (§6.4) — a refresh-suppression marker must not outlive its
 	// key (every eviction path but deleteForDep funnels through here).
 	clearRefreshSuppression(item.key)
@@ -3403,6 +3452,7 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	delete(c.index, item.key)
 	c.order.Remove(el)
 	c.raLayerForgetLocked(item.key) // #406
+	closeListCellOf(item.entry, "deleted") // #854
 	// 1.12.7 F6a — strip the dep edges HERE, under the same hold as the
 	// index delete, so no window exists in which the key is gone and its
 	// edges are not. The strip is a sync.Map operation that takes no store
@@ -3993,6 +4043,8 @@ func resetResolvedCacheForTest() {
 	// clears resolvedCacheStarted so a subsequent ResolvedCache() — after
 	// the Once below is reset — starts a fresh summary.
 	stopResolvedCacheSummaryForTest()
+	// #854 — the incremental list cells belong to the store being dropped.
+	ResetListCellsForTest()
 	resolvedCacheInstance = nil
 	resolvedCacheOnce = sync.Once{}
 	// 1.12.4 §7b — drop the observability handle too, else a test that

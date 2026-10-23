@@ -104,11 +104,15 @@ const (
 	contentFillAbsent contentFillReason = iota
 	contentFillKnownStale
 	contentFillRefreshForced
+	// contentFillReanchor — #854: the stored cell is an incremental list cell
+	// that stopped trusting itself (servability epoch, lost event, type event,
+	// divergence): the full fill re-anchors it.
+	contentFillReanchor
 	contentFillReasons
 )
 
 // contentFillReasonNames is the closed `reason` key set, in enum order.
-var contentFillReasonNames = [contentFillReasons]string{"absent", "known_stale", "refresh_forced"}
+var contentFillReasonNames = [contentFillReasons]string{"absent", "known_stale", "refresh_forced", "reanchor"}
 
 func (r contentFillReason) String() string {
 	if r >= contentFillReasons {

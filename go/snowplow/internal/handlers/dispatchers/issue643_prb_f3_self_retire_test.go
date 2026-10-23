@@ -192,6 +192,19 @@ const (
 // Returns pass B's and pass C's dials and how many iter-w cells pass C Put.
 func h643F3d(t *testing.T, how h643F3dHow, mutate func()) (dialsB, dialsC, putC int) {
 	t.Helper()
+	// #854 — these arms pin the PLAIN list cell, whose refresh re-Puts it (a new
+	// putSeq retires the mark). The incremental cell's twin, where the refresh
+	// drains a new generation (a new body identity) and Puts nothing, is
+	// list_cell_854_f3d_test.go.
+	t.Cleanup(cache.SetListCellAnchoringForTest(false))
+	return h643F3dRun(t, how, mutate, nil)
+}
+
+// h643F3dRun is h643F3d's scenario; onRefresh, when non-nil, replaces the
+// plain-cell refresh precondition (a new putSeq) with the caller's own checks
+// around the real apistage refresh (the #854 incremental twin).
+func h643F3dRun(t *testing.T, how h643F3dHow, mutate func(), onRefresh func(cellKey string, refresh func())) (dialsB, dialsC, putC int) {
+	t.Helper()
 	env := h643Setup(t, h643Opts{cohorts: h643K, internal: 1, things: 2, extra: []h643Extra{h643IterExtra}})
 	h643Budget(t, nil)
 	RegisterRefreshHandlers(nil)
@@ -243,6 +256,14 @@ func h643F3d(t *testing.T, how h643F3dHow, mutate func()) (dialsB, dialsC, putC 
 		fn := cache.RefreshFuncForTest(cache.CacheEntryClassApistage)
 		if fn == nil {
 			t.Fatal("no apistage RefreshFunc registered")
+		}
+		if onRefresh != nil {
+			onRefresh(cellKey, func() {
+				if err := fn(context.Background(), cellKey, cellInputs); err != nil {
+					t.Fatalf("the real apistage refresh of the list cell failed: %v", err)
+				}
+			})
+			break
 		}
 		seq0, _ := cache.ResolvedCache().CellPutSeq(cellKey)
 		if err := fn(context.Background(), cellKey, cellInputs); err != nil {

@@ -124,6 +124,17 @@ func k710Writes(t *testing.T) func() []k710Write {
 // allowed afterwards so a D2 debt can re-resolve its dependents.
 func k710KnownStaleFound(t *testing.T) (*k547Harness, string) {
 	t.Helper()
+	// #854 — pins the PLAIN content cell: these arms need a body that really is
+	// stale, and an incremental cell applies the change instead (see
+	// TestIssue710_D2_17i for D2 over an incremental cell).
+	return k710KnownStaleFoundAnchoring(t, false)
+}
+
+// k710KnownStaleFoundAnchoring is k710KnownStaleFound with the content cell
+// anchored as an incremental one (anchor) or kept plain.
+func k710KnownStaleFoundAnchoring(t *testing.T, anchor bool) (*k547Harness, string) {
+	t.Helper()
+	t.Cleanup(cache.SetListCellAnchoringForTest(anchor))
 	h := newK547Harness(t, k547DenyBackground)
 	h.contentMode = true
 	cache.RegisterRefreshFunc(cache.CacheEntryClassApistage, func(context.Context, string, cache.ResolvedKeyInputs) error {
@@ -287,6 +298,44 @@ func TestIssue710_D2_17_EveryStaleWriteHasAnAcceptedPutAnArmedHeaderAndAnOwedMar
 	if code1 != 200 || r1 != "v1" {
 		t.Fatalf("D2-17: cohort 1's declined RA served %q (code %d), want fresh v1", r1, code1)
 	}
+}
+
+// TestIssue710_D2_17i — #854: D2 over an INCREMENTAL content cell. The cell
+// is marked known-stale exactly as above (its refresh reports not-servable),
+// but its informer is servable and it applies the change itself. An armable
+// customer read still takes the D2 path (show at once, open the debt), and is
+// shown the cell's CURRENT generation, never an older one: no reader is served
+// content older than a fill would read now (#854 C5). The write point keeps
+// its invariant: every stale-derived write has an accepted Put, the armed
+// header and an owed-push mark.
+// Mutation → RED: drop the Snapshot the stale-serve read takes in
+// apistageContentServe's HIT branch (the read is served the generation the
+// cell published before the change, v0).
+func TestIssue710_D2_17i_AnIncrementalCellUnderAKnownStaleMarkServesItsCurrentGeneration(t *testing.T) {
+	h, contentKey := k710KnownStaleFoundAnchoring(t, true)
+	e, ok := cache.ResolvedCache().GetNoTouch(contentKey)
+	if !ok || e.ListCell() == nil {
+		t.Fatalf("PRECONDITION: the `found` content cell is not an incremental cell")
+	}
+	writes := k710Writes(t)
+	puts := k710Puts(t)
+	release := restactionsapi.HoldStaleDebtRefillsForTest()
+	t.Cleanup(release)
+	s0 := restactionsapi.StaleServeStatsSnapshot()
+	r, code := h.get(0, k547Changed)
+	if d := restactionsapi.StaleServeStatsSnapshot().ServeTotal - s0.ServeTotal; d != 1 {
+		t.Fatalf("PRECONDITION: %d D2 stale decisions for the GET, want 1 (the arm must read through D2)", d)
+	}
+	if code != 200 || r != "v1" {
+		t.Fatalf("D2-17i RED: cohort 0 was served %q (code %d) through D2 over an incremental cell, want its current generation v1", r, code)
+	}
+	release()
+	for _, w := range writes() {
+		if w.staleDerived && (!w.armed || !w.owed) {
+			t.Fatalf("D2-17i RED: a stale-derived body was written with armed=%v owed=%v", w.armed, w.owed)
+		}
+	}
+	k710WriteNoStaleOutsidePutIfGen(t, "D2-17i", puts())
 }
 
 // k710Writer records whether anything reached the wire.

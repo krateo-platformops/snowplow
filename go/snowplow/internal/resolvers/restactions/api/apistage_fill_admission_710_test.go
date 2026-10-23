@@ -358,6 +358,11 @@ func newFill710MultiNSWatcher(t *testing.T, nsCount, perNS int) {
 	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
+	// #854 — as newFill710Watcher: these arms gate FILLS, and their refresh
+	// bursts force a fill only on the plain path (an incremental cell drains
+	// the change instead). TestContentFill710_FMEM_SeedChargeCoversAnAnchoringFill
+	// turns anchoring back on to check the gate's charge for a fill that anchors.
+	t.Cleanup(cache.SetListCellAnchoringForTest(false))
 }
 
 func fill710NS(n int) string { return fmt.Sprintf("fill710-ns-%02d", n) }

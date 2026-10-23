@@ -103,6 +103,11 @@ type depWatchCounters struct {
 	// with the 1.12.5 operator procedure (the H1 signature).
 	workerPanics atomic.Uint64
 
+	// submitDroppedShutdown — submits that reached a shut-down queue: the
+	// event is dropped (an Add after ShutDown is a no-op). #854: a lost
+	// event, so the incremental list cells unanchor.
+	submitDroppedShutdown atomic.Uint64
+
 	// probe outcomes — what the worker derived the action from.
 	probeExists          atomic.Uint64
 	probeAbsent          atomic.Uint64
@@ -146,6 +151,67 @@ type depWatch struct {
 	// pending coordinate).
 	maskMu sync.Mutex
 	masks  map[depEventKey]*eventMask
+
+	// #854 — the coordinates whose event is still on its way to the hook:
+	// queued (submitted or rate-limit-requeued, not yet picked up) and
+	// processing (picked up, hook not yet returned). Guarded by maskMu. The
+	// incremental list cell's comparator skips them (in flight, not diverged).
+	queued     map[depEventKey]struct{}
+	processing map[depEventKey]struct{}
+}
+
+// depWorkerTakenHookForTest runs in the dep worker right after takeMask, before
+// the probe and the dep hook. TEST-ONLY (nil in production): #854 F5b stalls
+// the worker there to prove the comparator treats such a key as in flight.
+var depWorkerTakenHookForTest atomic.Pointer[func(gvr schema.GroupVersionResource, namespace, name string)]
+
+// SetDepWorkerTakenHookForTest installs (nil clears) the hook. TEST-ONLY.
+func SetDepWorkerTakenHookForTest(fn func(gvr schema.GroupVersionResource, namespace, name string)) (restore func()) {
+	var p *func(gvr schema.GroupVersionResource, namespace, name string)
+	if fn != nil {
+		p = &fn
+	}
+	prev := depWorkerTakenHookForTest.Swap(p)
+	return func() { depWorkerTakenHookForTest.Store(prev) }
+}
+
+// BumpDepWatchLostEventForTest moves one of the three lost-event counters
+// ("panic", "nil_sync", "dropped_shutdown"). TEST-ONLY.
+func BumpDepWatchLostEventForTest(kind string) {
+	w := depWatchSingleton()
+	switch kind {
+	case "panic":
+		w.counters.workerPanics.Add(1)
+	case "nil_sync":
+		w.counters.addNilSyncCh.Add(1)
+	case "dropped_shutdown":
+		w.counters.submitDroppedShutdown.Add(1)
+	}
+}
+
+func (w *depWatch) markQueued(k depEventKey) {
+	w.maskMu.Lock()
+	if w.queued == nil {
+		w.queued = map[depEventKey]struct{}{}
+	}
+	w.queued[k] = struct{}{}
+	w.maskMu.Unlock()
+}
+
+func (w *depWatch) beginProcessing(k depEventKey) {
+	w.maskMu.Lock()
+	delete(w.queued, k)
+	if w.processing == nil {
+		w.processing = map[depEventKey]struct{}{}
+	}
+	w.processing[k] = struct{}{}
+	w.maskMu.Unlock()
+}
+
+func (w *depWatch) endProcessing(k depEventKey) {
+	w.maskMu.Lock()
+	delete(w.processing, k)
+	w.maskMu.Unlock()
 }
 
 // mergeMask ORs m into k's pending mask.
@@ -327,6 +393,8 @@ func (w *depWatch) runDepEventWorker(respawns int) {
 // WARN, not ERROR: the chart ships LOG_LEVEL=warn, and this line is the one
 // an operator greps for after a missed invalidation.
 func (w *depWatch) handleDepEvent(k depEventKey) {
+	w.beginProcessing(k)
+	defer w.endProcessing(k)
 	defer func() {
 		rec := recover()
 		if rec == nil {
@@ -349,6 +417,9 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 	// #603 PR-2 — this processing consumes every transition merged so far; one
 	// merged after this point re-adds the coordinate with its own mask.
 	mask := w.takeMask(k)
+	if h := depWorkerTakenHookForTest.Load(); h != nil {
+		(*h)(k.gvr, k.namespace, k.name) // TEST-ONLY: after takeMask, before the hook (#854 F5b)
+	}
 	state := w.watcher.Load().probeObjectState(k.gvr, k.namespace, k.name)
 	switch state {
 	case objExists:
@@ -362,6 +433,7 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 		w.counters.probeUnknown.Add(1)
 		if w.q().NumRequeues(k) < maxRefreshRequeues {
 			w.mergeMask(k, mask) // the requeued processing still owns these transitions
+			w.markQueued(k)
 			w.q().AddRateLimited(k)
 			return
 		}
@@ -414,7 +486,13 @@ func (w *depWatch) submitDepEventMask(rw *ResourceWatcher, k depEventKey, source
 		// In production startWorker above always builds the queue.
 		return
 	}
+	if q.ShuttingDown() {
+		// #854 — an Add onto a shut-down queue is dropped: a lost event.
+		w.counters.submitDroppedShutdown.Add(1)
+		return
+	}
 	w.mergeMask(k, mask)
+	w.markQueued(k)
 	q.Add(k)
 }
 
@@ -506,15 +584,29 @@ var depAddDeliveryHookForTest atomic.Pointer[func(gvr schema.GroupVersionResourc
 // gates. A plain-func caller (depEventHandlers) carries no flag and keeps
 // the syncCh gate, including O14's nil-syncCh fail-safe drop.
 type depEventHandler struct {
+	gvr   schema.GroupVersionResource
 	funcs clientcache.ResourceEventHandlerFuncs
 	add   func(obj interface{}, isInInitialList, fromInformer bool)
 }
 
+// #854 — every informer delivery is recorded for the incremental list cells of
+// its GVR (noteListCellDelivery) AFTER the handler has submitted it, so the
+// comparator sees each key either undelivered (its indexer write is still in
+// the client-go listener buffer, or this handler is still running), queued /
+// processing in the dep worker, or pending in the cell — in flight in all three
+// — and only otherwise as settled.
 func (h depEventHandler) OnAdd(obj interface{}, isInInitialList bool) {
 	h.add(obj, isInInitialList, true)
+	noteListCellDelivery(h.gvr, obj, false)
 }
-func (h depEventHandler) OnUpdate(oldObj, newObj interface{}) { h.funcs.OnUpdate(oldObj, newObj) }
-func (h depEventHandler) OnDelete(obj interface{})            { h.funcs.OnDelete(obj) }
+func (h depEventHandler) OnUpdate(oldObj, newObj interface{}) {
+	h.funcs.OnUpdate(oldObj, newObj)
+	noteListCellDelivery(h.gvr, newObj, false)
+}
+func (h depEventHandler) OnDelete(obj interface{}) {
+	h.funcs.OnDelete(obj)
+	noteListCellDelivery(h.gvr, obj, true)
+}
 
 func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depEventHandler {
 	w := depWatchSingleton()
@@ -563,7 +655,7 @@ func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depE
 			crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleAdd)
 		}
 	}
-	return depEventHandler{add: add, funcs: clientcache.ResourceEventHandlerFuncs{
+	return depEventHandler{gvr: gvr, add: add, funcs: clientcache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) { add(obj, false, false) },
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			ns, name := metaNSName(newObj)

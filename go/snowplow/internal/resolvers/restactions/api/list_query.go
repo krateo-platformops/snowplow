@@ -143,15 +143,29 @@ func (q listQuery) filterRaw(raws [][]byte) ([][]byte, bool) {
 	}
 	out := make([][]byte, 0, len(raws))
 	for _, r := range raws {
-		var m itemMeta
-		if err := json.Unmarshal(r, &m); err != nil {
+		m, ok := q.matchRaw(r)
+		if !ok {
 			return nil, false
 		}
-		if q.matches(m.Metadata.Name, m.Metadata.Namespace, m.Metadata.Labels) {
+		if m {
 			out = append(out, r)
 		}
 	}
 	return out, true
+}
+
+// matchRaw is filterRaw's predicate for ONE item (#854: the incremental list
+// cell re-matches a changed object with exactly this function). ok=false when the
+// item cannot be decoded.
+func (q listQuery) matchRaw(r []byte) (match, ok bool) {
+	if q.empty() {
+		return true, true
+	}
+	var m itemMeta
+	if err := json.Unmarshal(r, &m); err != nil {
+		return false, false
+	}
+	return q.matches(m.Metadata.Name, m.Metadata.Namespace, m.Metadata.Labels), true
 }
 
 // withQuery appends the canonical query to a rebuilt apiserver path.

@@ -45,6 +45,10 @@ var storePutSeq atomic.Uint64
 type ServedCell struct {
 	Key    string
 	PutSeq uint64
+	// BodySeq — #854: an incremental list cell changes its body without a Put
+	// (its generations are built from informer deltas), so its identity is the
+	// Put AND the body. 0 for a plain cell (its body changes only with a Put).
+	BodySeq uint64
 	// Covers are the deps whose current state this cell's body stands for.
 	Covers []DepKey
 }
@@ -70,6 +74,27 @@ func (c *ResolvedCacheStore) CellPutSeq(key string) (uint64, bool) {
 		return 0, false
 	}
 	return item.putSeq, true
+}
+
+// CellServeIdentity is CellPutSeq plus the body identity of an incremental list
+// cell (#854; 0 for a plain cell). Read BEFORE the body, like the Put identity:
+// a generation built during the read leaves a note older than the body the
+// reader got, which can only retire a mark early (safe).
+func (c *ResolvedCacheStore) CellServeIdentity(key string) (putSeq, bodySeq uint64, live bool) {
+	if c == nil || key == "" {
+		return 0, 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.index[key]
+	if !ok {
+		return 0, 0, false
+	}
+	item := el.Value.(*lruItem)
+	if pastTTL, pastMaxAge := c.itemExpiredLocked(item, time.Now()); pastTTL || pastMaxAge {
+		return 0, 0, false
+	}
+	return item.putSeq, item.entry.listBodySeq(), true
 }
 
 // itemExpiredLocked is THE liveness predicate for an indexed cell: past its
@@ -98,7 +123,7 @@ func ServeCell(ctx context.Context, c *ResolvedCacheStore, key string, touch boo
 	if c == nil {
 		return nil, false
 	}
-	seq, live := c.CellPutSeq(key)
+	seq, bseq, live := c.CellServeIdentity(key)
 	var entry *ResolvedEntry
 	var hit bool
 	if touch {
@@ -107,7 +132,7 @@ func ServeCell(ctx context.Context, c *ResolvedCacheStore, key string, touch boo
 		entry, hit = c.GetNoTouch(key)
 	}
 	if hit && entry != nil && live {
-		NoteServedCell(ctx, key, seq, covers...)
+		noteServedCellBody(ctx, key, seq, bseq, covers...)
 	}
 	return entry, hit
 }
@@ -123,19 +148,37 @@ func ServeCell(ctx context.Context, c *ResolvedCacheStore, key string, touch boo
 // hit reports whether a body was read; served whether it was accepted (and
 // noted). A dry-run (cache.Inert) read notes nothing, as NoteServedCell.
 func ServeCellIf(ctx context.Context, c *ResolvedCacheStore, key string, accept func(*ResolvedEntry) bool, covers ...DepKey) (entry *ResolvedEntry, hit, served bool) {
+	return serveCellAccept(ctx, c, key, false, accept, Inert(ctx), covers...)
+}
+
+// ServeCellAccept is ServeCell with an accept check before the cell is noted
+// (#854: an incremental list cell that unanchored on this read is not served —
+// the reader takes the full fill — so it must not be noted as served). touch
+// selects Get (a customer serve) or GetNoTouch, exactly as ServeCell does.
+func ServeCellAccept(ctx context.Context, c *ResolvedCacheStore, key string, touch bool, accept func(*ResolvedEntry) bool, covers ...DepKey) (entry *ResolvedEntry, hit, served bool) {
+	return serveCellAccept(ctx, c, key, touch, accept, Inert(ctx), covers...)
+}
+
+// serveCellAccept is the shared body; inert (the caller's cache.Inert(ctx))
+// suppresses the served-cell note, as ServeCell's NoteServedCell does.
+func serveCellAccept(ctx context.Context, c *ResolvedCacheStore, key string, touch bool, accept func(*ResolvedEntry) bool, inert bool, covers ...DepKey) (entry *ResolvedEntry, hit, served bool) {
 	if c == nil {
 		return nil, false, false
 	}
-	seq, live := c.CellPutSeq(key)
-	entry, hit = c.GetNoTouch(key)
+	seq, bseq, live := c.CellServeIdentity(key)
+	if touch {
+		entry, hit = c.Get(key)
+	} else {
+		entry, hit = c.GetNoTouch(key)
+	}
 	if !hit || entry == nil {
 		return nil, false, false
 	}
 	if accept != nil && !accept(entry) {
 		return entry, true, false
 	}
-	if live && !Inert(ctx) {
-		NoteServedCell(ctx, key, seq, covers...)
+	if live && !inert {
+		noteServedCellBody(ctx, key, seq, bseq, covers...)
 	}
 	return entry, true, true
 }
@@ -143,10 +186,14 @@ func ServeCellIf(ctx context.Context, c *ResolvedCacheStore, key string, accept 
 // NoteServedCell appends one served cell to ctx's dep-gen sink and its
 // ancestors (whose bodies embed this one). No sink → no-op.
 func NoteServedCell(ctx context.Context, key string, putSeq uint64, covers ...DepKey) {
+	noteServedCellBody(ctx, key, putSeq, 0, covers...)
+}
+
+func noteServedCellBody(ctx context.Context, key string, putSeq, bodySeq uint64, covers ...DepKey) {
 	if key == "" || Inert(ctx) {
 		return
 	}
-	sc := ServedCell{Key: key, PutSeq: putSeq, Covers: append([]DepKey(nil), covers...)}
+	sc := ServedCell{Key: key, PutSeq: putSeq, BodySeq: bodySeq, Covers: append([]DepKey(nil), covers...)}
 	for s := depGenSinkFromContext(ctx); s != nil; s = s.parent {
 		s.mu.Lock()
 		s.served = append(s.served, sc)
@@ -173,8 +220,8 @@ func ServedCellsChanged(served []ServedCell) bool {
 	}
 	c := ResolvedCache()
 	for _, sc := range served {
-		seq, ok := c.CellPutSeq(sc.Key)
-		if !ok || seq != sc.PutSeq {
+		seq, bseq, ok := c.CellServeIdentity(sc.Key)
+		if !ok || seq != sc.PutSeq || bseq != sc.BodySeq {
 			return true
 		}
 	}

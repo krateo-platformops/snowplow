@@ -104,6 +104,11 @@ func newFill710Watcher(t *testing.T, n int) dynamic.Interface {
 	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
+	// #854 — the #710 / #765 A / #799 arms built on this harness pin the PLAIN
+	// fill path (every fill re-lists and re-parses), which still serves every
+	// cell that is not, or no longer, incremental. They run with anchoring off;
+	// the incremental cell's own arms (list_cell_854_*_test.go) turn it back on.
+	t.Cleanup(cache.SetListCellAnchoringForTest(false))
 	return dyn
 }
 

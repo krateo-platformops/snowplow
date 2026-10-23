@@ -1019,6 +1019,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 		gi = rw.metaFactory.ForResource(gvr)
 	}
 	rw.informers[gvr] = gi
+	bumpServabilityEpoch(gvr) // #854 — an informer (re)creation
 	// Ship 1 / 0.30.225 — record GVR insert timestamp for the
 	// /debug/vars snowplow_plurals_registered_gvrs envelope's
 	// last_register_unix_ns field. The existence-check at the head
@@ -1522,6 +1523,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		}
 	}
 	rw.informers[gvr] = gi
+	bumpServabilityEpoch(gvr) // #854 — an informer (re)creation
 	// Ship 1 / 0.30.225 — record GVR insert timestamp for the
 	// /debug/vars snowplow_plurals_registered_gvrs envelope's
 	// last_register_unix_ns field. The existence-check at the head
@@ -1847,6 +1849,7 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 // per-GVR map cannot be forgotten — every map keyed by GVR is purged
 // here uniformly (feedback_no_special_cases.md: no map gets a carve-out).
 func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResource) {
+	bumpServabilityEpoch(gvr) // #854 — the informer is removed: an exit from servable
 	delete(rw.informers, gvr)
 	delete(rw.syncCh, gvr)
 	delete(rw.confirmed, gvr)

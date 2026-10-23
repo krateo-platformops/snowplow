@@ -138,6 +138,7 @@ func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource)
 		}
 		_, already := rw.watchBroken[gvr]
 		rw.watchBroken[gvr] = struct{}{}
+		bumpServabilityEpoch(gvr) // #854 — an exit from servable
 		// #796 — the LATEST error decides whether the LIST is refused: a
 		// terminal NotFound / Forbidden (client-go wraps the LIST error with
 		// %w, so apierrors classifies through it) sets the mark, any other
@@ -431,6 +432,7 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 				invalidateStoreVerification(gvr)
 			}
 			delete(rw.confirmed, gvr)
+			bumpServabilityEpoch(gvr) // #854 — confirmation retracted: an exit from servable
 			rw.clearRetainUnknownWarnLocked(gvr)
 		}
 	}
@@ -1342,6 +1344,7 @@ func (rw *ResourceWatcher) FireWatchError(gvr schema.GroupVersionResource) {
 		rw.watchBroken = map[schema.GroupVersionResource]struct{}{}
 	}
 	rw.watchBroken[gvr] = struct{}{}
+	bumpServabilityEpoch(gvr) // #854 — as the production handler does
 	rw.mu.Unlock()
 }
 

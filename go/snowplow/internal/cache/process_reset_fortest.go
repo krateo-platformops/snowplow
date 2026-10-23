@@ -99,6 +99,11 @@ func ResetCacheProcessStateForTest() error {
 	// exists precisely so those assertions are deterministic — #471.
 	ResetLazyItemsStatsForTest()
 
+	// 5b1 — #854 incremental list cells: a process-global registry (GVR → cells)
+	// fed by the dep hook, so a fresh store must not inherit a sibling's cells
+	// or counters. Composed — #471.
+	ResetListCellsForTest()
+
 	// 5b2 — #710 PR-2b owed-push marks: process-global (keyed by L1 keys a
 	// stale-derived body was written under), so a fresh store must not inherit
 	// a sibling's marks or counters. Composed — #471.

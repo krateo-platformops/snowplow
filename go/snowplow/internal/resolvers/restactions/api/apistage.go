@@ -215,6 +215,37 @@ func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListE
 // snowplow has always stripped it before serving. Pre-Ship-2a the strip
 // happened per-serve on a private deep copy (removeManagedFields(dict));
 // Ship 2a moves it to load-time so the shared items are stripped once.
+// decodeListItem decodes ONE list item exactly as parseListEnvelope decodes an
+// element of the envelope: encoding/json into map[string]any (every number a
+// float64), then stripManagedFields. #854: the incremental list cell decodes a
+// changed object with this function, so its items are the full path's items.
+func decodeListItem(raw []byte) (*unstructured.Unstructured, error) {
+	var it map[string]any
+	if err := json.Unmarshal(raw, &it); err != nil {
+		return nil, err
+	}
+	stripManagedFields(it)
+	return &unstructured.Unstructured{Object: it}, nil
+}
+
+// listCellFuncs hands the incremental list cell the full fill's own functions
+// for this stage: the per-item decoder, the query predicate and the envelope
+// writer over the dispatch's apiVersion and list kind (#854).
+func listCellFuncs(gvr schema.GroupVersionResource, q listQuery) cache.ListCellFuncs {
+	apiVersion := gvr.Version
+	if gvr.Group != "" {
+		apiVersion = gvr.Group + "/" + gvr.Version
+	}
+	listKind := listKindForResource(gvr.Resource)
+	return cache.ListCellFuncs{
+		Decode: decodeListItem,
+		Match:  q.matchRaw,
+		Marshal: func(raws [][]byte) ([]byte, error) {
+			return marshalAsListRaw(apiVersion, listKind, raws)
+		},
+	}
+}
+
 func stripManagedFields(obj map[string]any) {
 	if obj == nil {
 		return
@@ -627,6 +658,28 @@ func apistageContentServeAttempt(
 	// servable; the informer's re-fire refreshes the cell.
 	// #710 — which case sent this reader into the fill (apistage_fill_metrics.go).
 	fillReason := contentFillAbsent
+	// #854 — an incremental list cell (cache.ListCell): the generation this
+	// reader is served, taken through Snapshot(need) so its stamp and its data
+	// are one value. need is the refresh's trigger seq for a refresher, the
+	// current dep-event seq for every other reader (#854 C5: a customer is never
+	// served a generation older than what a fill now would read). A cell that
+	// unanchors on this read is not served: the reader takes the full fill,
+	// which re-anchors it.
+	var inc cache.ListView
+	var incOK bool
+	acceptInc := func(e *cache.ResolvedEntry, need uint64) bool {
+		lc := e.ListCell()
+		if lc == nil {
+			return true
+		}
+		v, ok := lc.Snapshot(need)
+		if !ok {
+			fillReason = contentFillReanchor
+			return false
+		}
+		inc, incOK = v, true
+		return true
+	}
 	readContent := func(k string) (*cache.ResolvedEntry, bool) {
 		// #710 PR-2b (D2, owner ruling "show then replace") — an ARMABLE customer
 		// read of a KNOWN-STALE cell is served the cell at once and opens (or
@@ -652,13 +705,25 @@ func apistageContentServeAttempt(
 			// path): the cell is served — and noted — only if its content stamp
 			// covers the refresh's triggers.
 			e, hit, served := cache.ServeCellIf(ctx, store, k, func(e *cache.ResolvedEntry) bool {
+				if e.ListCell() != nil {
+					// #854 — the generation's own stamp: Snapshot(stamp.need)
+					// returns a generation complete as of at least stamp.need (it
+					// drains pending when the published one is older), so the
+					// stamp covers the refresh's triggers by construction. Not
+					// ContentStampCovers: its asOf==0 "unknown" rule is about a
+					// fill's read start, and a generation built before any dep
+					// event is legitimately complete as of seq 0.
+					return acceptInc(e, stamp.need) && inc.AsOf() >= stamp.need
+				}
 				return cache.ContentStampCovers(gvr, ns, name, e.ContentAsOf, stamp.need)
 			}, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
 			if !hit {
 				return nil, false
 			}
 			if !served {
-				fillReason = contentFillRefreshForced
+				if fillReason != contentFillReanchor {
+					fillReason = contentFillRefreshForced
+				}
 				return nil, false
 			}
 			noteContentRefreshReused(gvr.String())
@@ -667,10 +732,17 @@ func apistageContentServeAttempt(
 			// #443 (e) — an inert (dry-run) resolve reads the cell as input
 			// but must not stamp it warm either.
 			// #643 — through ServeCell: the served cell (and the dep it stands
-			// for) is noted on the resolve's sink.
-			return cache.ServeCell(ctx, store, k, false, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			// for) is noted on the resolve's sink. #854 — ServeCellAccept, so an
+			// incremental cell that unanchors on this read is not noted.
+			e, hit, served := cache.ServeCellAccept(ctx, store, k, false, func(e *cache.ResolvedEntry) bool {
+				return acceptInc(e, cache.DepGenEpochNow())
+			}, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			return e, hit && served
 		default:
-			return cache.ServeCell(ctx, store, k, true, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			e, hit, served := cache.ServeCellAccept(ctx, store, k, true, func(e *cache.ResolvedEntry) bool {
+				return acceptInc(e, cache.DepGenEpochNow())
+			}, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			return e, hit && served
 		}
 	}
 	if entry, hit := readContent(contentKey); hit && entry != nil {
@@ -680,6 +752,14 @@ func apistageContentServeAttempt(
 		recordListQuery(query)
 		envelope = entry.RawJSON
 		entryRef = entry
+		if lc := entry.ListCell(); lc != nil && !incOK {
+			// #854 — the #710 stale-serve path read the entry without a
+			// Snapshot: take one now (a cell that unanchored meanwhile serves
+			// its last generation, as a stale serve serves its last fill).
+			if v, ok := lc.Snapshot(cache.DepGenEpochNow()); ok {
+				inc, incOK = v, true
+			}
+		}
 		// R3: a LIST entry stored with pre-parsed Items — gate directly
 		// over them, no re-unmarshal. An entry without Items (legacy /
 		// refresh-stored / malformed-at-Put) falls back to the RawJSON
@@ -691,7 +771,17 @@ func apistageContentServeAttempt(
 		// therefore happens at most once per refresh generation and ONLY for
 		// cells somebody actually reads — where the pre-#578 Put-time parse
 		// ran for every rebuild of every cell, read or not.
-		if isList {
+		if isList && incOK {
+			// #854 — an incremental cell: this generation's shared items; the
+			// envelope is built only for an empty list (the unparsed fallback
+			// below needs bytes).
+			if items := inc.Items(); len(items) > 0 {
+				parsed = parsedListEnvelope{items: items, apiVersion: inc.APIVersion(), kind: inc.Kind()}
+				haveParsed = true
+			} else {
+				envelope = inc.Raw()
+			}
+		} else if isList {
 			if items, av, k, ok := entry.EnsureItems(func(raw []byte) ([]*unstructured.Unstructured, string, string, bool) {
 				p, pOK := parseListEnvelope(gvr, raw)
 				return p.items, p.apiVersion, p.kind, pOK
@@ -887,6 +977,7 @@ func apistageContentServeAttempt(
 		if ttl := cache.CatalogUnservableTTL(); ttl > 0 && !servable {
 			newEntry.TTLOverride = ttl
 		}
+		var anchoredCell *cache.ListCell
 		// R3: parse the LIST envelope ONCE and attach the items to the
 		// entry, so every future content-Get-hit gates without a
 		// re-unmarshal. A malformed envelope (parseOK=false) stores
@@ -905,6 +996,25 @@ func apistageContentServeAttempt(
 				newEntry.ItemsKind = p.kind
 				parsed = p
 				haveParsed = true
+				// #854 — anchor an incremental cell on this fill: from here on
+				// every informer event on the GVR is applied to the stored list
+				// instead of re-filling it. Only for a servable GVR (the cell
+				// trusts its informer); AnchorListCell returns nil when it cannot
+				// prove the items match the indexer (an event raced the fill),
+				// and the entry then stays a plain fill.
+				// A dry run (cache.Inert) persists nothing, so it anchors nothing.
+				if servable && !cache.Inert(ctx) {
+					if cell := cache.AnchorListCell(cache.ListCellAnchor{
+						Key: contentKey, GVR: gvr, Namespace: ns,
+						Envelope: dispatched, Items: p.items,
+						APIVersion: p.apiVersion, Kind: p.kind,
+						Funcs: listCellFuncs(gvr, query),
+					}); cell != nil {
+						cell.AttachStore(store)
+						anchoredCell = cell
+						newEntry = cache.NewListCellEntry(cell, newEntry.Inputs)
+					}
+				}
 			}
 		}
 		// #189 — generation-guarded write: refuse (do not resurrect a pre-delete
@@ -912,7 +1022,11 @@ func apistageContentServeAttempt(
 		// the resolve. A cold fill (key absent, gen 0) still inserts. On refusal
 		// the current request STILL serves `dispatched` below (envelope / parsed
 		// are already set); only the CACHE fill + its dep-record are skipped.
-		if store.PutIfGen(ctx, contentKey, newEntry, contentGen0) {
+		accepted := store.PutIfGen(ctx, contentKey, newEntry, contentGen0)
+		if !accepted && anchoredCell != nil {
+			anchoredCell.Close() // #854 — no entry was stored for it
+		}
+		if accepted {
 			// Ship 0.30.212 — wire informer-event invalidation for this content
 			// entry. Without a dep edge an informer ADD/UPDATE/DELETE on the
 			// underlying objects can never dirty-mark this cell, leaving it

@@ -121,6 +121,27 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 
 	key := cache.ComputeKey(inputs)
 
+	// #854 — an incremental list content cell is kept current by the informer
+	// deltas themselves (cache.ListCell): a refresh of its own key need not —
+	// and must not — re-list and re-Put the whole list. Its Snapshot drains every
+	// change up to the refresh's trigger seq; the refresh then ends FRESH (the
+	// dirty window closes), with no store write: no generation move, no
+	// PublishRefresh, no dep re-record, no rebuild compare (#854 C3). A cell that
+	// unanchors here falls through to today's re-dispatch.
+	if inputs.CacheEntryClass == cache.CacheEntryClassApistage {
+		// #376 — GetNoTouch: the refresher reading its own key's prior entry is
+		// an internal read, never a customer serve.
+		if prior, ok := c.GetNoTouch(key); ok && prior != nil {
+			if lc := prior.ListCell(); lc != nil {
+				if _, ok := lc.Snapshot(cache.RefreshTriggerAsOf(ctx)); ok {
+					cache.NoteListCellRefreshSkipped()
+					cache.NoteRefreshWrite(ctx, key, true)
+					return nil
+				}
+			}
+		}
+	}
+
 	// #189 — capture the key's generation BEFORE the re-resolve. If a DELETE-
 	// eviction lands during the (possibly long) re-resolve, the tail write below
 	// is refused via PutIfGen rather than resurrecting the pre-delete body. This

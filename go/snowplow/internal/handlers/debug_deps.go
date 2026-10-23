@@ -176,8 +176,10 @@ func depsKeyViewFor(keyHash string) depsKeyView {
 	if entry.Inputs != nil {
 		view.CacheEntryClass = entry.Inputs.CacheEntryClass
 	}
-	if len(entry.RawJSON) > 0 {
-		sum := sha256.Sum256(entry.RawJSON)
+	// #854 — Raw(): an incremental list cell builds its envelope on demand
+	// (counted in snowplow_list_incremental.rawjson_built).
+	if raw := entry.Raw(); len(raw) > 0 {
+		sum := sha256.Sum256(raw)
 		view.BodySha256 = hex.EncodeToString(sum[:])
 	}
 	return view
