@@ -298,3 +298,22 @@ def test_an_absent_shadow_reads_as_missing_with_a_warning_and_no_verdict_change(
     assert f"WARNING: {LN_KEY} absent in all" in p.stderr
     assert json.loads(p.stdout)["report"]["list_narrow_shadow_report_only"]["status"] == \
         "absent_in_all_samples"
+
+
+def test_run13_real_mem_stream_reports_the_shadow_absent():
+    """Run 13's REAL mem606 samples (snowplow 1.12.52, no
+    snowplow_deps_list_narrow; tests/fixtures/mem_run13_samples.jsonl.gz =
+    its mem_start and three full mem samples): the report says absent, with
+    a warning, and the content-fill report still works from the same samples."""
+    import gzip
+    with gzip.open(FIX / "mem_run13_samples.jsonl.gz", "rt") as fh:
+        mem = [json.loads(ln) for ln in fh]
+    assert [m["kind"] for m in mem] == ["mem_start", "mem", "mem", "mem"]
+    assert all(LN_KEY not in m["extra"] for m in mem[1:])
+    r = load606.list_narrow_report(mem)
+    assert r == {"status": "absent_in_all_samples", "mem_samples": 3, "note": r["note"]}
+    v = load606.evaluate([], [], [], mem=mem)
+    assert v["report"]["list_narrow_shadow_report_only"]["status"] == "absent_in_all_samples"
+    assert v["report"]["report_warnings"] == [
+        f"{LN_KEY} absent in all 3 mem samples: the #765 B shadow report is missing, not zero"]
+    assert v["report"]["content_fill_by_gvr_report_only"]["total_by_gvr"]
