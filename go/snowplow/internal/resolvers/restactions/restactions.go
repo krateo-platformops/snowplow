@@ -35,7 +35,10 @@ type ResolveOptions struct {
 	AuthnNS string
 	PerPage int
 	Page    int
-	Extras  map[string]any
+	// Cursor (#874) — the data source's continuation token, handed to the
+	// RESTAction's jq as .slice.cursor (api.ResolveOptions.Cursor).
+	Cursor string
+	Extras map[string]any
 	// Provenance (#443 part 2) — who vouches for In. Zero value: a stored CR.
 	// Passed straight through to api.ResolveOptions.
 	Provenance api.Provenance
@@ -49,6 +52,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 		Items:   opts.In.Spec.API,
 		PerPage: opts.PerPage,
 		Page:    opts.Page,
+		Cursor:  opts.Cursor,
 		Extras:  opts.Extras,
 		// Ship E (0.30.116): the owning RESTAction's identity, folded
 		// into the per-api-stage L1 key so a stage id is scoped to its

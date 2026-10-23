@@ -293,6 +293,10 @@ var b777Consumers = map[string]string{
 	"resourcesrefstemplate.Resolve":    "spec.resourcesRefsTemplate (inside resolveResourceRefs)",
 	"widgetdatatemplate.Resolve":       "spec.widgetDataTemplate (inside resolveWidgetData)",
 	"apiref.Resolve":                   "spec.apiRef (inside resolveApiRef)",
+	"apirefOptionsFor":                 "spec.apiRef (builds the apiref.Resolve options inside resolveApiRef; #874)",
+	// #874 — reads the apiRef RA's own output slice (continue/cursor) to emit
+	// status.resourcesRefs.slice; only reached with a resourcesRefs fan-out.
+	"cache.SourcePagination": "spec.apiRef (reads the apiRef RA output's slice; an absent apiRef yields an empty dict, declaring nothing)",
 }
 
 // TestB777_ExtrasConsumersAreEnumerated — B10, the Go-side structural guard. It

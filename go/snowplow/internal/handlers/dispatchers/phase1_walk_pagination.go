@@ -229,9 +229,10 @@ func isApiRefTemplateDriven(obj map[string]any) bool {
 }
 
 // resolverWantsContinue reads `status.resourcesRefs.slice.continue` from
-// a resolved widget envelope. The resolver sets this to true when the
-// resolved items count equals or exceeds the requested perPage —
-// internal/resolvers/widgets/resolve.go:124-134. Returns false on any
+// a resolved widget envelope. #874: the resolver sets it from the DATA
+// SOURCE's declared pagination (cache.SourcePagination — the apiRef RA's
+// slice.continue, else slice.cursor != "", else false), so a source that does
+// not paginate ends the loop after its first page. Returns false on any
 // shape mismatch (absent map, wrong type) — the conservative direction
 // stops pagination.
 func resolverWantsContinue(res *unstructured.Unstructured) bool {
@@ -247,6 +248,21 @@ func resolverWantsContinue(res *unstructured.Unstructured) bool {
 		return false
 	}
 	return cont
+}
+
+// resolverCursor reads `status.resourcesRefs.slice.cursor` — the data source's
+// continuation token for the NEXT page, echoed by the resolver when the source
+// declared one (#874). "" when absent or not a string.
+func resolverCursor(res *unstructured.Unstructured) string {
+	if res == nil {
+		return ""
+	}
+	slice, ok, err := maps.NestedMap(res.Object, "status", "resourcesRefs", "slice")
+	if !ok || err != nil {
+		return ""
+	}
+	c, _ := slice["cursor"].(string)
+	return c
 }
 
 // drainKeyPageFor derives the dispatcher-lookup KEY page for a drain page,
@@ -379,6 +395,13 @@ func iterateApiRefPages(
 	// resolver still asking to continue (see the loop tail).
 	reachedBackstop := false
 
+	// #874 — the data source's own continuation token. A cursor-paging source
+	// emits slice.cursor on each page (echoed by the resolver in
+	// status.resourcesRefs.slice.cursor); the NEXT page must be asked from
+	// there, so each page's cursor is handed to the next page's resolve. Empty
+	// for every source that pages by offset/page or not at all.
+	cursor := resolverCursor(page1Res)
+
 	// The page-1 walk ran at PAGE=1. We start at PAGE=2 and increment.
 	// Each iteration: re-fetch a fresh CR copy (resolver mutates input),
 	// resolve at this page, populate, recurse children, decide whether
@@ -464,7 +487,13 @@ func iterateApiRefPages(
 		// keep-warm / gvr-discovered re-resolve. Cheap + nil-safe.
 		wcGen0 := cache.ResolvedCache().CaptureGen(wcKey)
 		resolveCtx := ctx
-		if wcKey != "" {
+		// #874 — a CURSOR page is not a function of the cell key: the key
+		// (gvr, ns, name, perPage, page) has no cursor dimension, and no customer
+		// /call or refresh ever carries one. Such a page is resolved only to
+		// discover its children; it gets no L1 key (no dep edges recorded against
+		// a cell it will not fill) and no Put below.
+		storePage := cursor == ""
+		if wcKey != "" && storePage {
 			resolveCtx = cache.WithL1KeyContext(resolveCtx, wcKey)
 		}
 		// Task #318 Step 1 / #450 — Put-gate sink parity with the page-1 walk.
@@ -487,6 +516,7 @@ func iterateApiRefPages(
 			AuthnNS: authnNS,
 			PerPage: perPage,
 			Page:    page,
+			Cursor:  cursor,
 		})
 		if err != nil {
 			log.Warn("phase1.walk.apiref_pagination.resolve_failed",
@@ -517,7 +547,9 @@ func iterateApiRefPages(
 		// snowplow_phase1_bindingset_seed_resolves_total). Name reads "seed
 		// units"; semantics are content-pagination cells. See the declaration
 		// doc in phase1_walk_pagination_metrics.go.
-		bumpPrewarmUnitsSeeded()
+		if storePage {
+			bumpPrewarmUnitsSeeded()
+		}
 
 		// Put this page's envelope under the matching content L1 key.
 		// populateWidgetContentL1 idempotently handles the RBAC-
@@ -531,7 +563,11 @@ func iterateApiRefPages(
 		// (which carries the stage-error sink + the L1 key) NOT the bare
 		// ctx, so the Cache-A gate inside populateWidgetContentL1 sees this
 		// resolve's sink (parity with phase1_walk.go:1226).
-		populateWidgetContentL1(resolveCtx, gvr, got.Unstructured, keyPerPage, keyPageForThisPage, res, wcGen0)
+		if storePage {
+			populateWidgetContentL1(resolveCtx, gvr, got.Unstructured, keyPerPage, keyPageForThisPage, res, wcGen0)
+		} else {
+			bumpPrewarmApiRefCursorPagesUnstored()
+		}
 		pagesWalked++
 
 		// Recurse into the children this page produced. Honours the
@@ -590,6 +626,7 @@ func iterateApiRefPages(
 		if !resolverWantsContinue(res) {
 			break
 		}
+		cursor = resolverCursor(res)
 		// The resolver still wants more. If this was the last permitted page
 		// (page == maxPages), the loop is about to exit on the LIVENESS
 		// BACKSTOP rather than the declared terminator — an anomaly we surface
