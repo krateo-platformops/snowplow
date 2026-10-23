@@ -94,6 +94,18 @@ BROWSER_SESSIONS="${BROWSER_SESSIONS:-5}"
 if [[ "$LOAD_DRIVER" == "k6" ]]; then LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-16}"
 else LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-8}"; fi
 BROWSER_THINK_S="${BROWSER_THINK_S:-15}"
+# Run 15 (#865): k6's customer latency (p95/p99 per phase) and req/s are a
+# VERDICT check against this baseline (bench/custlat.py; the file was derived
+# from runs 12/13/14 by `python3 -m bench.custlat derive` and carries its
+# provenance). Empty (the default) = no gate: run 15 passes
+# LATENCY_BASELINE=customer_latency_baseline_run14.json. k6 only: load606
+# makes no k6 calls.
+LATENCY_BASELINE="${LATENCY_BASELINE:-}"
+if [[ -n "$LATENCY_BASELINE" ]]; then
+  [[ "$LOAD_DRIVER" == "k6" ]] || { echo "refusing: LATENCY_BASELINE gates k6's calls; LOAD_DRIVER=${LOAD_DRIVER} makes none" >&2; exit 2; }
+  python3 -c 'import sys; from bench import custlat; custlat.load_baseline(sys.argv[1])' "$LATENCY_BASELINE" 2>/dev/null \
+    || { echo "refusing: LATENCY_BASELINE '${LATENCY_BASELINE}' is not a customer_latency_baseline/1 file" >&2; exit 2; }
+fi
 # Inside the browser pod, the frontend's localhost URLs (its config.json was
 # made for a port-forwarding operator) are forwarded to the cluster Services;
 # :8083 = the sse-proxy (live refresh): sources in bench/load606_job.py.
@@ -142,6 +154,15 @@ FRESH_MODES="${FRESH_MODES:-annotation status}"
 for m in $FRESH_MODES; do
   case "$m" in annotation|status) ;; *) echo "refusing: FRESH_MODES has unknown mode '$m'" >&2; exit 2 ;; esac
 done
+# The latency gate compares against the baseline's schedule: a run whose
+# knobs differ would be INVALID only after it was paid for.
+if [[ -n "$LATENCY_BASELINE" ]]; then
+  python3 -m bench.custlat check-env "$LATENCY_BASELINE" --users "$USERS" \
+      --burst-users "$COMPOSITE_BURST_USERS" --think-s "$THINK_S" --drive-s "$DRIVE_S" \
+      --burst-at-s "$COMPOSITE_BURST_AT_S" --browser-sessions "$BROWSER_SESSIONS" \
+      --modes "$FRESH_MODES" --rates "$CHURN_RATES" \
+    || { echo "refusing: the schedule above is not the latency baseline's (LATENCY_BASELINE= runs without the gate)" >&2; exit 2; }
+fi
 # The measure wait is DERIVED from the work it waits for, and fresh606 is
 # itself BOUNDED to that work (reviewer-small (d)): each (mode, rate) phase
 # gets samples x (30 s budget + gap) x 1.25 of wall clock and stops there,
@@ -858,16 +879,19 @@ s_evaluate() {
   local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl)
-  if [[ "$DRY" == "1" ]]; then log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>}"; return 0; fi
-  if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
-  # The verdict is a RESULT, not a tooling failure: record it, do not abort.
-  local vrc=0
   local r8=() k6args=()
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
   # #830: the page loads are the real browsers'; k6 is the load
   [[ "$LOAD_DRIVER" == "k6" ]] && k6args=(--k6-out "$OUT/k6" --browser-out "$OUT/browser"
                                           --browser-sessions "$BROWSER_SESSIONS")
   [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
+  [[ -n "$LATENCY_BASELINE" ]] && k6args+=(--latency-baseline "$LATENCY_BASELINE")
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} ${k6args[*]:-}"; return 0
+  fi
+  if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
+  # The verdict is a RESULT, not a tooling failure: record it, do not abort.
+  local vrc=0
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" ${k6args[@]+"${k6args[@]}"} > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
@@ -883,9 +907,16 @@ s_evaluate() {
     [[ -n "$r" ]] && log "WARNING: $r"
   done < <(python3 -c 'import json, sys; print("\n".join((json.load(open(sys.argv[1])).get("report") or {}).get("report_warnings") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
+  # run 15: the customer-latency gate's every cell (a verdict check)
+  while IFS= read -r r; do
+    [[ -n "$r" ]] && log "LATENCY: $r"
+  done < <(python3 -c 'import json, sys; print("\n".join("%s %s ratio=%s bar: %s" % (c["result"], c["check"], (c.get("value") or {}).get("ratio"), c["bar"]) for c in json.load(open(sys.argv[1]))["checks"] if c["check"].startswith("customer_latency.")))' \
+             "$OUT/verdict.json" 2>/dev/null || true)
+  return 0       # the loop's last [[ -n "" ]] is not the step's status
 }
 
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus ${TTL_MARGIN_S} s"
+log "customer-latency gate: ${LATENCY_BASELINE:-OFF (LATENCY_BASELINE empty)}"
 step source    s_source
 step reap      s_reap
 step up        s_up

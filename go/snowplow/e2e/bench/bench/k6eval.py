@@ -71,11 +71,13 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "route_table_mismatch", "bench_frame", "http_req_failed", "http_req_duration",
          "browser_page_load_ms", "browser_page_loads", "browser_widget_states",
          "browser_page_timeouts", "browser_logins", "browser_signin_ms", "browser_sse_opened",
-         "dropped_iterations")
+         "dropped_iterations", "clicks", "arrivals")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
-# the page loads whose time is kept too (out["times"], index-aligned with
-# out["points"]): run 12 compares latency inside / outside the CPU profiles
-_TIMED = ("page_load_ms", "browser_page_load_ms")
+# the points whose time is kept too (out["times"], index-aligned with
+# out["points"]): run 12 compares latency inside / outside the CPU profiles;
+# run 15's customer-latency gate (custlat) puts every call, click and arrival
+# in its phase
+_TIMED = ("page_load_ms", "browser_page_load_ms", "http_req_duration", "clicks", "arrivals")
 _RFC3339 = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
 
 
