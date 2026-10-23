@@ -284,19 +284,36 @@ def _validity(name, ok, value, bar, why):
             "result": "PASS" if ok else "FAIL", **({} if ok else {"why": why})}
 
 
+# a run's own verdict that can be compared (INVALID cannot; a missing or
+# unknown one is not a run's verdict at all)
+COMPARABLE_VERDICTS = ("PASS", "FAIL", "INCONCLUSIVE")
+
+
+def _measure(x) -> bool:
+    """A latency / rate / spread value a ratio can be taken of: a finite
+    number, positive (sd: not negative)."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
+
+
 def pair(va: dict, vb: dict, *, replica: dict | None = None,
-         expect_a: str | None = None, expect_b: str | None = None) -> dict:
+         expect_a: str | None = None, expect_b: str | None = None,
+         completed: tuple[bool | None, bool | None] = (None, None)) -> dict:
     """The paired verdict: B's customer latency per phase against A's (module
     doc). INVALID when the pair cannot be compared; FAIL when a cell is past
-    its tolerance."""
+    its tolerance. `completed`: whether each run's evaluate step ran (the
+    launcher's reading of its run.log); None = not known."""
     va, vb = va or {}, vb or {}
     ra = (va.get("report") or {}).get("customer_latency")
     rb = (vb.get("report") or {}).get("customer_latency")
     dig = [((v.get("report") or {}).get("image_digest") or {}).get("expected") for v in (va, vb)]
     validity = [
-        _validity("runs_valid", va.get("verdict") not in (None, "INVALID") and vb.get("verdict") not in
-                  (None, "INVALID"), {"a": va.get("verdict"), "b": vb.get("verdict")},
-                  "neither run INVALID", "a run whose own measurement is INVALID cannot be compared"),
+        _validity("runs_valid", va.get("verdict") in COMPARABLE_VERDICTS and vb.get("verdict") in
+                  COMPARABLE_VERDICTS, {"a": va.get("verdict"), "b": vb.get("verdict")},
+                  f"both runs' own verdicts in {COMPARABLE_VERDICTS}",
+                  "a run whose own measurement is INVALID (or that has no verdict) cannot be compared"),
+        _validity("runs_completed", False not in completed,
+                  {"a": completed[0], "b": completed[1]}, "both runs' evaluate step ran",
+                  "a run failed as tooling before its evaluate step: its verdict is partial"),
         _validity("k6_reports", ra is not None and rb is not None,
                   {"a": ra is not None, "b": rb is not None}, "both verdicts carry customer_latency",
                   "a run without k6 has no customer calls"),
@@ -305,7 +322,7 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                   {"a": dig[0], "b": dig[1]}, "two different images, each the one its run was launched with",
                   "the pair is not the two images it was launched to compare"),
     ]
-    out = {"kind": "customer_latency_pair", "checks": [], "validity": validity,
+    out = {"kind": "customer_latency_pair", "checks": [], "cells": [], "validity": validity,
            "method": {"block_s": BLOCK_S, "half_samples": HALF_SAMPLES, "half_seed": HALF_SEED,
                       "family_alpha": FAMILY_ALPHA,
                       "tolerance": "max(exp(z * sqrt(2) * A's half-sample sd), replica ratio); "
@@ -338,18 +355,30 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                 continue
             for m in METRICS:
                 sd, a, b = sa["half_sd"][m], sa[m], sb.get(m)
-                if sd is None or not a or b is None:
-                    validity.append(_validity(f"spread[{p}].{m}", False, {"a": a, "b": b, "a_half_sd": sd},
-                                              "A's value and half-sample sd",
-                                              f"{p} {m}: no tolerance can be derived"))
+                rep = (((replica or {}).get("phases") or {}).get(p) or {}).get(m)
+                # finite, positive measurements only: a 0 A, a negative p95,
+                # an infinite spread or replica would make the ratio or the
+                # bar meaningless (a +Inf spread passed anything)
+                if not (_measure(a) and _measure(b) and (_measure(sd) or sd == 0)
+                        and (rep is None or (_measure(rep) and rep >= 1))):
+                    validity.append(_validity(f"spread[{p}].{m}", False,
+                                              {"a": a, "b": b, "a_half_sd": sd, "replica": rep},
+                                              "finite positive A, B, A's half-sample sd >= 0, replica >= 1",
+                                              f"{p} {m}: not a measurement, no tolerance can be derived"))
                     continue
                 within = math.exp(z * math.sqrt(2) * sd)
-                rep = (((replica or {}).get("phases") or {}).get(p) or {}).get(m)
                 tol = max(within, rep or 1.0)
                 lower = m in LOWER_IS_WORSE
                 bar = round(1 / tol, 4) if lower else round(tol, 4)
                 ratio = round(b / a, 4)
                 ok = ratio >= bar if lower else ratio <= bar
+                out["cells"].append({
+                    "phase": p, "metric": m, "a": a, "b": b, "ratio": ratio,
+                    "bar": f"{'>=' if lower else '<='} {bar}", "within": round(within, 4), "replica": rep,
+                    "result": "PASS" if ok else "FAIL",
+                    "line": f"{'PASS' if ok else 'FAIL'} {p} {m}: B/A = {ratio} "
+                            f"({'>=' if lower else '<='} {bar}; a {a}, b {b}; within {round(within, 4)}, "
+                            f"replica {rep})"})
                 out["checks"].append({
                     "check": f"customer_latency.pair[{p}].{m}",
                     "value": {"a": a, "b": b, "ratio": ratio},
@@ -439,6 +468,9 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--replica", default=None, help="a customer_latency_replica/1 file")
     pr.add_argument("--expect-a", default=None, help="A's EXPECTED_IMAGE_DIGEST")
     pr.add_argument("--expect-b", default=None, help="B's EXPECTED_IMAGE_DIGEST")
+    for x in ("a", "b"):
+        pr.add_argument(f"--completed-{x}", type=int, choices=(0, 1), default=None,
+                        help=f"1 when {x.upper()}'s evaluate step ran (run606 logged 'run complete')")
     rp = sub.add_parser("replica", help="the replica ratios of two collected run dirs")
     rp.add_argument("dirs", nargs=2)
     a = ap.parse_args(argv)
@@ -455,8 +487,13 @@ def main(argv: list[str] | None = None) -> int:
                 return json.load(fh)
         except (OSError, ValueError):
             return None          # pair() makes it INVALID, with the reason
-    out = pair(load(a.a), load(a.b), replica=load_replica(a.replica) if a.replica else None,
-               expect_a=a.expect_a, expect_b=a.expect_b)
+    done = tuple(None if c is None else bool(c) for c in (a.completed_a, a.completed_b))
+    try:
+        out = pair(load(a.a), load(a.b), replica=load_replica(a.replica) if a.replica else None,
+                   expect_a=a.expect_a, expect_b=a.expect_b, completed=done)
+    except Exception as e:  # noqa: BLE001 — a crash must read INVALID, never exit 1 = FAIL
+        out = {"kind": "customer_latency_pair", "verdict": "INVALID", "checks": [], "cells": [],
+               "invalid_reasons": [f"the paired verdict could not be computed: {type(e).__name__}: {e}"]}
     json.dump(out, sys.stdout, indent=1, default=str)
     print()
     return {"PASS": 0, "FAIL": 1, "INVALID": 3}[out["verdict"]]

@@ -905,6 +905,11 @@ s_evaluate() {
     [[ -n "$r" ]] && log "WARNING: $r"
   done < <(python3 -c 'import json, sys; print("\n".join((json.load(open(sys.argv[1])).get("report") or {}).get("report_warnings") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
+  # A verdict is a result, not a tooling failure: the step succeeds whatever
+  # it is. Without this the loop's last `[[ -n "" ]]` (no warnings) was the
+  # step's status: under set -e runs 12 and 14 exited 1 here, re-collected and
+  # re-evaluated in teardown, and never logged "run complete".
+  return 0
 }
 
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus ${TTL_MARGIN_S} s"

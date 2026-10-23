@@ -199,14 +199,15 @@ def test_the_tolerance_is_the_method():
     a = rep(0.05)
     b = copy.deepcopy(a)
     b["report"]["image_digest"]["expected"] = DIG_B
-    p = custlat.pair(a, b, replica={"phases": {"storm": {"p95_ms": 1.9}}})
+    p = custlat.pair(a, b, replica={"phases": {"storm": {"p95_ms": 1.9},
+                                               "churn:list_dep@10": {"p95_ms": 1.01}}})
     z = NormalDist().inv_cdf(1 - 0.05 / 6)
     w = math.exp(z * math.sqrt(2) * 0.05)
     within = round(w, 4)
     bars = {c["check"]: c["bar"].split()[2] for c in p["checks"]}
     assert bars["customer_latency.pair[storm].p95_ms"] == "1.9"                 # replica above within
     assert bars["customer_latency.pair[storm].p99_ms"] == str(within)          # no replica for it
-    assert bars["customer_latency.pair[churn:list_dep@10].p95_ms"] == str(within)
+    assert bars["customer_latency.pair[churn:list_dep@10].p95_ms"] == str(within)   # replica 1.01 below it
     assert bars["customer_latency.pair[storm].req_s"] == str(round(1 / w, 4))
     assert p["verdict"] == "PASS" and p["method"]["cells"] == 6
 
@@ -222,6 +223,24 @@ def test_the_tolerance_is_the_method():
     (lambda a, b: b["report"]["customer_latency"]["phases"].pop("burst"), "measured[burst]"),
     (lambda a, b: a["report"]["customer_latency"]["phases"]["burst"]["half_sd"].update(p95_ms=None),
      "spread[burst].p95_ms"),
+    # k6 stopped inside the 3rd of the 6 churn steps: the LAST step is what counts
+    (lambda a, b: b["report"]["customer_latency"]["k6_span"].__setitem__(1, _churn_mid(b, 2)),
+     "customers_through_churn[b]"),
+    (lambda a, b: b.pop("verdict"), "runs_valid"),
+    (lambda a, b: a.update(verdict="WAT"), "runs_valid"),
+    (lambda a, b: a["report"]["image_digest"].update(expected=None), "images"),
+    # not measurements: a zero / negative / NaN value, an infinite or negative spread
+    (lambda a, b: a["report"]["customer_latency"]["phases"]["storm"].update(p95_ms=0), "spread[storm].p95_ms"),
+    (lambda a, b: b["report"]["customer_latency"]["phases"]["storm"].update(p95_ms=-5.0), "spread[storm].p95_ms"),
+    (lambda a, b: b["report"]["customer_latency"]["phases"]["storm"].update(req_s=float("nan")),
+     "spread[storm].req_s"),
+    (lambda a, b: a["report"]["customer_latency"]["phases"]["storm"]["half_sd"].update(p95_ms=float("inf")),
+     "spread[storm].p95_ms"),
+    (lambda a, b: a["report"]["customer_latency"]["phases"]["storm"]["half_sd"].update(p99_ms=-0.1),
+     "spread[storm].p99_ms"),
+    (lambda a, b: a["report"]["customer_latency"]["phases"]["storm"].update(p99_ms=True), "spread[storm].p99_ms"),
+    # an A with no phase that had calls has nothing to pass
+    (lambda a, b: [s.update(n=0) for s in a["report"]["customer_latency"]["phases"].values()], "cells"),
 ])
 def test_a_pair_that_cannot_be_compared_is_invalid(va, breaks, check):
     a = copy.deepcopy(va)
@@ -233,11 +252,94 @@ def test_a_pair_that_cannot_be_compared_is_invalid(va, breaks, check):
     assert [c["check"] for c in p["validity"] if c["result"] == "FAIL"] == [f"customer_latency.pair.{check}"]
 
 
-def test_the_launch_digests_are_the_runs(va):
+def _churn_mid(v, i):
+    w = [w for w in v["report"]["customer_latency"]["windows"] if w[0].startswith("churn:")][i]
+    return (w[1] + w[2]) / 2
+
+
+def _ab(va):
     b = copy.deepcopy(va)
     b["report"]["image_digest"] = {"expected": DIG_B}
-    assert _pair(va, b, expect_a=DIG_A, expect_b=DIG_B)["verdict"] == "PASS"
-    assert _pair(va, b, expect_a=DIG_B, expect_b=DIG_A)["verdict"] == "INVALID"
+    return copy.deepcopy(va), b
+
+
+def _failed(p):
+    return {c["check"] for c in p["validity"] if c["result"] == "FAIL"}
+
+
+def test_the_launch_digests_are_the_runs(va):
+    a, b = _ab(va)
+    assert _pair(a, b, expect_a=DIG_A, expect_b=DIG_B)["verdict"] == "PASS"
+    assert _pair(a, b, expect_a=DIG_B, expect_b=DIG_A)["verdict"] == "INVALID"
+    # each side on its own: A launched as another image, B right — and the reverse
+    assert _failed(_pair(a, b, expect_a="sha256:" + "c" * 64, expect_b=DIG_B)) == {"customer_latency.pair.images"}
+    assert _failed(_pair(a, b, expect_a=DIG_A, expect_b="sha256:" + "c" * 64)) == {"customer_latency.pair.images"}
+
+
+def test_a_run_that_failed_as_tooling_makes_the_pair_invalid(va):
+    a, b = _ab(va)
+    assert _pair(a, b, completed=(True, True))["verdict"] == "PASS"
+    assert _failed(_pair(a, b, completed=(True, False))) == {"customer_latency.pair.runs_completed"}
+    assert _failed(_pair(a, b, completed=(False, True))) == {"customer_latency.pair.runs_completed"}
+
+
+def test_invalid_wins_over_fail(va):
+    a, b = _ab(va)
+    b["report"]["customer_latency"]["phases"]["storm"]["p95_ms"] *= 100
+    assert _pair(a, b)["verdict"] == "FAIL"
+    b["verdict"] = "INVALID"
+    p = _pair(a, b)
+    assert p["verdict"] == "INVALID" and any(c["result"] == "FAIL" for c in p["checks"])
+
+
+def test_a_bad_replica_is_invalid(va):
+    a, b = _ab(va)
+    for bad in (0.5, float("inf"), -1.0):
+        p = _pair(a, b, replica={"phases": {"storm": {"p95_ms": bad}}})
+        assert _failed(p) == {"customer_latency.pair.spread[storm].p95_ms"}, bad
+
+
+def test_every_cell_is_printed_with_its_ratio_and_bar(va):
+    a, b = _ab(va)
+    p = _pair(a, b)
+    assert len(p["cells"]) == len(p["checks"]) > 0
+    for c in p["cells"]:
+        assert {"phase", "metric", "a", "b", "ratio", "bar", "within", "replica", "result", "line"} <= set(c)
+        assert f"B/A = {c['ratio']}" in c["line"] and c["bar"] in c["line"]
+
+
+@pytest.mark.parametrize("change, key", [
+    (lambda d: d["mem"][0]["cpu_plan"].update(burst_post_s=180.0), "cpu_plan"),
+    (lambda d: d.update(browser_sessions=d["browser_sessions"][:4]), "browser_sessions"),
+    (lambda d: d["config"].update(users=999), "k6"),
+])
+def test_a_schedule_key_that_differs_is_invalid(va, tmp_path, capsys, change, key):
+    """Through the per-run report (schedule() builds what pair compares):
+    the CPU-profile plan, the browser sessions, k6's users."""
+    d = copy.deepcopy(P14)
+    assert d["mem"][0]["kind"] == "mem_start"
+    change(d)
+    vb = _run(tmp_path, "sched", capsys, doc=d)
+    p = _pair(va, vb)
+    assert p["verdict"] == "INVALID" and "customer_latency.pair.schedules_match" in _failed(p)
+    sm = next(c for c in p["validity"] if c["check"] == "customer_latency.pair.schedules_match")
+    assert list(sm["value"]) == [key]
+
+
+def test_pair_cli_never_reads_a_crash_as_fail(va, tmp_path):
+    """A 0 in A (INVALID, not ZeroDivisionError) and a malformed verdict (an
+    exception inside pair): both exit 3 = INVALID, never 1 = FAIL."""
+    a, b = _ab(va)
+    a["report"]["customer_latency"]["phases"]["storm"]["p95_ms"] = 0
+    (tmp_path / "a.json").write_text(json.dumps(a))
+    (tmp_path / "b.json").write_text(json.dumps(b))
+    (tmp_path / "bad.json").write_text(json.dumps(dict(b, report=dict(b["report"], customer_latency={"phases": 7}))))
+    for bfile in ("b.json", "bad.json"):
+        p = subprocess.run(["python3", "-m", "bench.custlat", "pair", "--a", str(tmp_path / "a.json"),
+                            "--b", str(tmp_path / bfile)], cwd=BENCH, capture_output=True, text=True,
+                           check=False)
+        assert p.returncode == 3, (bfile, p.stderr[-500:])
+        assert json.loads(p.stdout)["verdict"] == "INVALID"
 
 
 def test_run14_itself_is_not_a_paired_run(tmp_path, capsys):
@@ -374,22 +476,46 @@ def test_k6_span_refusals(tmp_path, env, why):
 
 # ─── run606_pair.sh ────────────────────────────────────────────────────────
 
+# A run606.sh stand-in with run606's trap shape: `trap teardown EXIT`, and
+# INT/TERM/HUP -> exit 130 (-> teardown). It records its calls, its signal and
+# its teardown in $FAKE/calls; FAKE/<RUN_NAME>.{dryrc,sleep,verdict.json,rc,
+# incomplete} steer it. Without .incomplete it logs "run complete" (run606's
+# last line after its evaluate step), then exits .rc.
 FAKE_RUN606 = r"""#!/usr/bin/env bash
-# a run606.sh stand-in: records its call; FAKE/<RUN_NAME>.{rc,sleep,verdict.json}
-echo "$RUN_NAME dry=${BENCH_606_DRY_RUN:-0} span=$K6_SPAN driver=$LOAD_DRIVER go=${BENCH_606_GO:-} tag=$SNOWPLOW_TAG digest=$EXPECTED_IMAGE_DIGEST" >> "$FAKE/calls"
-trap 'echo "$RUN_NAME terminated" >> "$FAKE/calls"; exit 143' TERM
+set -Eeuo pipefail
+echo "$RUN_NAME dry=${BENCH_606_DRY_RUN:-0} span=$K6_SPAN driver=$LOAD_DRIVER go=${BENCH_606_GO:-} tag=$SNOWPLOW_TAG digest=$EXPECTED_IMAGE_DIGEST pid=$$" >> "$FAKE/calls"
+SLEEP_PID=""
+teardown() { local rc=$?; trap - EXIT; [[ -n "$SLEEP_PID" ]] && kill "$SLEEP_PID" 2>/dev/null; echo "$RUN_NAME teardown rc=$rc" >> "$FAKE/calls"; exit "$rc"; }
+trap teardown EXIT
+on_signal() { echo "$RUN_NAME signal" >> "$FAKE/calls"; exit 130; }
+trap on_signal INT TERM HUP
 mkdir -p "$OUT"
 if [[ "${BENCH_606_DRY_RUN:-0}" == "1" ]]; then exit "$(cat "$FAKE/$RUN_NAME.dryrc" 2>/dev/null || echo 0)"; fi
-if [[ -f "$FAKE/$RUN_NAME.sleep" ]]; then sleep "$(cat "$FAKE/$RUN_NAME.sleep")" & wait $!; fi
+echo "=== step measure ===" >> "$OUT/run.log"
+if [[ -f "$FAKE/$RUN_NAME.sleep" ]]; then sleep "$(cat "$FAKE/$RUN_NAME.sleep")" & SLEEP_PID=$!; wait "$SLEEP_PID"; SLEEP_PID=""; fi
 [[ -f "$FAKE/$RUN_NAME.verdict.json" ]] && cp "$FAKE/$RUN_NAME.verdict.json" "$OUT/verdict.json"
+[[ -f "$FAKE/$RUN_NAME.incomplete" ]] || echo "run complete: $OUT" >> "$OUT/run.log"
 exit "$(cat "$FAKE/$RUN_NAME.rc" 2>/dev/null || echo 0)"
 """
 NA, NB = "snowplow-bench-r15a", "snowplow-bench-r15b"
+# the bash the script claims to support (macOS /bin/bash 3.2) and a current one
+BASHES = [b for b in dict.fromkeys(["/bin/bash", shutil.which("bash")]) if b and os.path.exists(b)]
+
+
+def _bash_major(b):
+    out = subprocess.run([b, "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True, check=True)
+    return int(out.stdout.strip())
+
+
+def _git_repo(d: Path):
+    for c in (["init", "-q"], ["add", "-A"],
+              ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"]):
+        subprocess.run(["git", *c], cwd=d, check=True, capture_output=True)
 
 
 @pytest.fixture
 def pairbed(tmp_path):
-    """A git checkout holding the launcher, the replica file and a fake
+    """A git checkout holding the launcher, the replica file and a stand-in
     run606.sh (the launcher runs its own directory's run606.sh)."""
     repo = tmp_path / "bench"
     repo.mkdir()
@@ -398,9 +524,7 @@ def pairbed(tmp_path):
     (repo / "run606.sh").write_text(FAKE_RUN606)
     fake = tmp_path / "fake"
     fake.mkdir()
-    for c in (["init", "-q"], ["add", "."],
-              ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"]):
-        subprocess.run(["git", *c], cwd=repo, check=True, capture_output=True)
+    _git_repo(repo)
     today = datetime.now(UTC).strftime("%Y%m%d")
     env = {k: v for k, v in os.environ.items()
            if k not in ("RUN_NAME", "SNOWPLOW_TAG", "EXPECTED_IMAGE_DIGEST", "BENCH_606_GO", "OUT",
@@ -413,11 +537,11 @@ def pairbed(tmp_path):
     return repo, fake, env, tmp_path
 
 
-def _launch(repo, env, **over):
+def _launch(repo, env, bash="bash", **over):
     e = dict(env, **over)
     for k in [k for k, v in e.items() if v is None]:
         e.pop(k)
-    return subprocess.run(["bash", str(repo / "run606_pair.sh")], env=e, capture_output=True,
+    return subprocess.run([bash, str(repo / "run606_pair.sh")], env=e, capture_output=True,
                           text=True, timeout=120, check=False)
 
 
@@ -426,64 +550,120 @@ def _calls(fake):
     return p.read_text().splitlines() if p.exists() else []
 
 
+def _verdicts(fake, va, **b_over):
+    a, b = _ab(va)
+    b.update(b_over)
+    (fake / f"{NA}.verdict.json").write_text(json.dumps(a))
+    (fake / f"{NB}.verdict.json").write_text(json.dumps(b))
+    return a, b
+
+
 def test_pair_runs_both_after_both_dry_passes_and_writes_the_paired_verdict(pairbed, va):
     repo, fake, env, tmp = pairbed
-    vb = copy.deepcopy(va)
-    vb["report"]["image_digest"] = {"expected": DIG_B}
-    (fake / f"{NA}.verdict.json").write_text(json.dumps(va))
-    (fake / f"{NB}.verdict.json").write_text(json.dumps(vb))
+    _verdicts(fake, va)
     p = _launch(repo, env)
     assert p.returncode == 0, p.stderr[-3000:]
-    calls = _calls(fake)
-    assert [c.split()[:2] for c in calls] == [[NA, "dry=1"], [NB, "dry=1"], [NA, "dry=0"], [NB, "dry=0"]] or \
-        [c.split()[:2] for c in calls] == [[NA, "dry=1"], [NB, "dry=1"], [NB, "dry=0"], [NA, "dry=0"]]
-    real = [c for c in calls if "dry=0" in c]
+    calls = [c for c in _calls(fake) if " dry=" in c]
+    assert [c.split()[1] for c in calls] == ["dry=1", "dry=1", "dry=0", "dry=0"]
+    assert sorted(c.split()[0] for c in calls[2:]) == [NA, NB]
     assert all("span=churn driver=k6" in c for c in calls)
+    real = calls[2:]
     assert any(f"go={env['BENCH_606_GO_A']} tag=1.12.54 digest={DIG_A}" in c for c in real)
     assert any(f"go={env['BENCH_606_GO_B']} tag=1.12.55 digest={DIG_B}" in c for c in real)
     v = json.loads((tmp / "pair" / "paired-verdict.json").read_text())
     assert v["verdict"] == "PASS" and v["method"]["replica"] == REPLICA["provenance"]
+    assert next(c for c in v["validity"] if c["check"].endswith("runs_completed"))["value"] == {"a": True, "b": True}
     pj = json.loads((tmp / "pair" / "pair.json").read_text())
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True,
                          check=True).stdout.strip()
     assert pj["bench_sha"] == sha and pj["a"]["digest"] == DIG_A and pj["b"]["tag"] == "1.12.55"
     log = (tmp / "pair" / "pair.log").read_text()
-    assert "paired verdict exit=0" in log and "PASS customer_latency.pair[storm].p95_ms ratio=1.0" in log
+    assert "paired verdict exit=0" in log
+    # every cell, with its ratio and its bar
+    assert len([ln for ln in log.splitlines() if " B/A = " in ln]) == len(v["cells"]) > 0
+    assert "PASS storm p95_ms: B/A = 1.0 (<= " in log
 
 
 def test_pair_slower_b_exits_fail(pairbed, va):
     repo, fake, env, tmp = pairbed
-    vb = copy.deepcopy(va)
-    vb["report"]["image_digest"] = {"expected": DIG_B}
-    vb["report"]["customer_latency"]["phases"]["storm"]["p95_ms"] *= 3
-    (fake / f"{NA}.verdict.json").write_text(json.dumps(va))
-    (fake / f"{NB}.verdict.json").write_text(json.dumps(vb))
+    _, b = _verdicts(fake, va)
+    b["report"]["customer_latency"]["phases"]["storm"]["p95_ms"] *= 3
+    (fake / f"{NB}.verdict.json").write_text(json.dumps(b))
     p = _launch(repo, env)
     assert p.returncode == 1, p.stderr[-3000:]
-    assert "FAIL customer_latency.pair[storm].p95_ms ratio=3.0" in (tmp / "pair" / "pair.log").read_text()
+    assert "FAIL storm p95_ms: B/A = 3.0" in (tmp / "pair" / "pair.log").read_text()
 
 
 def test_pair_a_run_on_another_image_is_invalid(pairbed, va):
     repo, fake, env, tmp = pairbed
-    vb = copy.deepcopy(va)
-    vb["report"]["image_digest"] = {"expected": "sha256:" + "c" * 64}   # not the launched B
-    (fake / f"{NA}.verdict.json").write_text(json.dumps(va))
-    (fake / f"{NB}.verdict.json").write_text(json.dumps(vb))
+    _, b = _verdicts(fake, va)
+    b["report"]["image_digest"] = {"expected": "sha256:" + "c" * 64}   # not the launched B
+    (fake / f"{NB}.verdict.json").write_text(json.dumps(b))
     p = _launch(repo, env)
     assert p.returncode == 3, p.stderr[-3000:]
     assert "INVALID: customer_latency.pair.images" in (tmp / "pair" / "pair.log").read_text()
 
 
-def test_a_failed_run_stops_the_other(pairbed, va):
+@pytest.mark.parametrize("bash", BASHES)
+def test_a_run_that_completed_never_stops_its_partner(pairbed, va, bash):
+    """A completed (its evaluate step ran) and then exited 1 — e.g. its
+    gke-down failed: a measurement, not a tooling failure. B runs to its end."""
     repo, fake, env, tmp = pairbed
+    _verdicts(fake, va)
     (fake / f"{NA}.rc").write_text("1")
+    (fake / f"{NB}.sleep").write_text("2")
+    p = _launch(repo, env, bash=bash)
+    assert p.returncode == 0, p.stderr[-3000:]
+    calls = _calls(fake)
+    assert f"{NB} signal" not in calls and f"{NB} teardown rc=0" in calls
+    assert "failed as tooling" not in (tmp / "pair" / "pair.log").read_text()
+
+
+@pytest.mark.parametrize("bash", BASHES)
+def test_a_run_that_failed_as_tooling_stops_its_partner_and_its_trap_runs(pairbed, va, bash):
+    repo, fake, env, tmp = pairbed
+    _verdicts(fake, va)
+    (fake / f"{NA}.rc").write_text("2")
+    (fake / f"{NA}.incomplete").write_text("")
     (fake / f"{NB}.sleep").write_text("60")
-    p = _launch(repo, env)
+    t0 = datetime.now(UTC)
+    p = _launch(repo, env, bash=bash)
+    assert (datetime.now(UTC) - t0).total_seconds() < 30, "B ran on: the TERM never reached it"
     assert p.returncode == 3, p.stderr[-3000:]
-    assert f"{NB} terminated" in _calls(fake)
+    calls = _calls(fake)
+    # the TERM reached run606's own shell: its trap ran, then its teardown
+    assert f"{NB} signal" in calls and f"{NB} teardown rc=130" in calls
+    pid_b = next(c for c in calls if c.startswith(f"{NB} dry=0")).rsplit("pid=", 1)[1]
     log = (tmp / "pair" / "pair.log").read_text()
-    assert "run A failed: stopping run B" in log
-    assert "INVALID: customer_latency.pair.runs_valid" in log
+    assert f"run B pid {pid_b}" in log                       # $! is run606's shell, not a subshell
+    assert "run A failed as tooling: stopping run B" in log
+    assert "INVALID: customer_latency.pair.runs_completed" in log
+
+
+@pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.parametrize("how", ["ctrl-c to the process group", "TERM to the launcher"])
+def test_a_ctrl_c_tears_both_runs_down(pairbed, va, bash, how):
+    import signal
+    import time
+    repo, fake, env, _ = pairbed
+    _verdicts(fake, va)
+    for n in (NA, NB):
+        (fake / f"{n}.sleep").write_text("60")
+    proc = subprocess.Popen([bash, str(repo / "run606_pair.sh")], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    deadline = time.time() + 30
+    while time.time() < deadline and len([c for c in _calls(fake) if " dry=0 " in c]) < 2:
+        time.sleep(0.1)
+    time.sleep(0.5)                                        # both inside their measure
+    if how.startswith("ctrl-c"):
+        os.killpg(proc.pid, signal.SIGINT)                 # what a terminal Ctrl-C sends
+    else:
+        proc.send_signal(signal.SIGTERM)
+    _, err = proc.communicate(timeout=30)
+    assert proc.returncode == 130, err[-2000:]
+    calls = _calls(fake)
+    for n in (NA, NB):
+        assert f"{n} teardown rc=130" in calls, (n, calls)
 
 
 def test_a_refused_dry_pass_starts_nothing(pairbed):
@@ -514,6 +694,16 @@ def test_pair_refusals_before_anything_runs(pairbed, over, why):
     assert _calls(fake) == []
 
 
+@pytest.mark.parametrize("left", ["verdict.json", "run.log"])
+def test_pair_refuses_an_out_that_holds_an_earlier_run(pairbed, left):
+    repo, fake, env, _ = pairbed
+    Path(env["OUT_B"]).mkdir(parents=True)
+    (Path(env["OUT_B"]) / left).write_text("{}")
+    p = _launch(repo, env)
+    assert p.returncode == 2 and f"OUT_B ({env['OUT_B']}) already holds a run ({left})" in p.stderr
+    assert _calls(fake) == []
+
+
 def test_pair_refuses_an_uncommitted_bench(pairbed):
     repo, _, env, _ = pairbed
     (repo / "run606.sh").write_text(FAKE_RUN606 + "\n# edited\n")
@@ -523,21 +713,72 @@ def test_pair_refuses_an_uncommitted_bench(pairbed):
     assert p.returncode == 0 and "DRY: both runs would start now" in p.stderr
 
 
+def test_bash_versions_under_test():
+    """The stop / Ctrl-C arms run under macOS's /bin/bash 3.2 and a bash >= 4
+    whenever both exist (they do on the macOS this bench is driven from)."""
+    majors = {_bash_major(b) for b in BASHES}
+    if os.path.exists("/bin/bash") and _bash_major("/bin/bash") == 3:
+        assert 3 in majors
+    assert majors
+
+
 def test_pair_dry_run_with_the_real_run606(tmp_path):
-    """Both real run606.sh dry passes (every refusal of each run) from this
-    checkout; nothing starts."""
+    """Both real run606.sh dry passes (every refusal of each run), from a git
+    checkout of this bench (copied: the gate's archive is not a checkout);
+    nothing starts."""
+    repo = tmp_path / "bench"
+    shutil.copytree(BENCH, repo, ignore=shutil.ignore_patterns("__pycache__", ".ruff_cache", ".pytest_cache"))
+    _git_repo(repo)
     env = {k: v for k, v in os.environ.items()
            if k not in ("RUN_NAME", "SNOWPLOW_TAG", "EXPECTED_IMAGE_DIGEST", "BENCH_606_GO", "OUT",
                         "DRIVE_S", "K6_SPAN", "LOAD_DRIVER")}
-    env.update(PYTHONPATH=str(BENCH), HOME=str(tmp_path), PAIR_OUT=str(tmp_path / "pair"),
+    env.update(PYTHONPATH=str(repo), HOME=str(tmp_path), PAIR_OUT=str(tmp_path / "pair"),
                OUT_A=str(tmp_path / "A"), OUT_B=str(tmp_path / "B"), BENCH_606_DRY_RUN="1",
                INSTALLER_VERSION="0.3.422", RUN_NAME_A=NA, RUN_NAME_B=NB,
                SNOWPLOW_TAG_A="1.12.54", SNOWPLOW_TAG_B="1.12.55",
                EXPECTED_IMAGE_DIGEST_A=DIG_A, EXPECTED_IMAGE_DIGEST_B=DIG_B)
-    p = subprocess.run(["bash", str(BENCH / "run606_pair.sh")], env=env, capture_output=True, text=True,
+    p = subprocess.run(["bash", str(repo / "run606_pair.sh")], env=env, capture_output=True, text=True,
                        timeout=300, check=False)
     assert p.returncode == 0, p.stderr[-3000:]
     for x in ("A", "B"):
         log = (tmp_path / "pair" / f"dry-{x}" / "run.log").read_text()
         assert "K6_SPAN=churn, DRIVE_S=16170 s" in log
     assert "DRY: both runs would start now" in p.stderr
+
+
+# ─── run606.sh's evaluate step: a verdict is a result ─────────────────────
+
+def _s_evaluate_body():
+    src = (BENCH / "run606.sh").read_text()
+    i = src.index("s_evaluate() {")
+    j = src.index("\n}\n", i) + 3
+    return src[i:j]
+
+
+@pytest.mark.parametrize("verdict, warnings, invalid", [
+    ("FAIL", [], []), ("INVALID", [], ["x: y"]), ("PASS", ["w"], []), ("PASS", [], [])])
+def test_run606_evaluate_step_succeeds_whatever_the_verdict(tmp_path, verdict, warnings, invalid):
+    """run606.sh's own s_evaluate, under set -e, against a stand-in evaluate
+    that exits with the verdict's code: the step returns 0 (runs 12 and 14
+    exited 1 here when no warning was logged)."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "mem-x.jsonl").write_text("{}\n")
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    doc = json.dumps({"verdict": verdict, "invalid_reasons": invalid, "report": {"report_warnings": warnings}})
+    rc = {"PASS": 0, "FAIL": 1, "INVALID": 3}[verdict]
+    real = shutil.which("python3")
+    (bin_ / "python3").write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [[ "$1 $2 $3" == "-m bench.load606 evaluate" ]]; then echo {json.dumps(doc)}; exit {rc}; fi\n'
+        f'exec {real} "$@"\n')
+    (bin_ / "python3").chmod(0o755)
+    script = ("set -Eeuo pipefail\nlog() { echo \"$*\" >> \"$OUT/run.log\"; }\n"
+              "DRY=0 RUN8_REPORT=1 LOAD_DRIVER=k6 VIEWERS=1 BROWSER_SESSIONS=5 EXPECTED_IMAGE_DIGEST=x\n"
+              + _s_evaluate_body() + "\ns_evaluate\necho step-ok\n")
+    p = subprocess.run(["bash", "-c", script], env=dict(os.environ, OUT=str(out),
+                       PATH=f"{bin_}{os.pathsep}{os.environ['PATH']}"),
+                       capture_output=True, text=True, timeout=60, check=False)
+    assert p.returncode == 0 and "step-ok" in p.stdout, p.stderr[-2000:]
+    assert f"verdict exit={rc}" in (out / "run.log").read_text()
