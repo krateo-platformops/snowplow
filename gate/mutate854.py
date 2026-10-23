@@ -115,6 +115,36 @@ M = [
 ''', CACHE, 'TestListCell854_SH'),
  ('M27 filter keeps objects the selector dropped', LC,
   '''		case !m && out == nil:''', '''		case !m && out == nil && false:''', API, 'TestListCell854_F1_'),
+ ('M29 comparator judges a dropped key against the filtered listing only', LC,
+  '''		if idxRaw == nil {
+			// Not in the FILTERED listing''', '''		if idxRaw == nil && false {
+			// Not in the FILTERED listing''', CACHE, 'TestListCell854_F5s'),
+ ('U7 a submit dropped on a shut-down queue is not counted', 'internal/cache/deps_watch.go',
+  '''		// #854 — an Add onto a shut-down queue is dropped: a lost event.
+		w.counters.submitDroppedShutdown.Add(1)
+''', '''		// #854 — an Add onto a shut-down queue is dropped: a lost event.
+''', CACHE, 'TestListCell854_U7'),
+ ('U8 the watch-error handler does not bump the epoch', 'internal/cache/servable.go',
+  '''		bumpServabilityEpoch(gvr) // #854 — an exit from servable
+''', '', CACHE, 'TestListCell854_U8'),
+ ('U9 a confirmation retraction does not bump the epoch', 'internal/cache/servable.go',
+  '''				bumpServabilityEpoch(gvr) // #854 — confirmation retracted: an exit from servable
+''', '', CACHE, 'TestListCell854_U9'),
+ ('U11 an informer removal does not bump the epoch', 'internal/cache/watcher.go',
+  '''	bumpServabilityEpoch(gvr) // #854 — the informer is removed: an exit from servable
+''', '', CACHE, 'TestListCell854_U11'),
+ ('U13b a build error serves the stale generation', LC,
+  '''		if g, err = c.build(); err != nil {
+			c.unanchor("build_" + err.Error())
+			return ListView{}, false
+		}''', '''		if ng, berr := c.build(); berr == nil {
+			g = ng
+		}
+		_ = err''', CACHE, 'TestListCell854_U13b'),
+ ('M30 the reader runs the comparator pass itself', LC,
+  '''	c.lastPassAt.Store(r)
+	EnqueueRefresh(c.key)''', '''	c.lastPassAt.Store(r)
+	go c.runDuePass()''', CACHE, 'TestListCell854_F5y'),
  ('M28 D2 stale-serve read takes no Snapshot', 'internal/resolvers/restactions/api/apistage.go',
   '''		if lc := entry.ListCell(); lc != nil && !incOK {''', '''		if lc := entry.ListCell(); lc != nil && !incOK && false {''', DISP + ' -tags=integration', 'TestIssue710_D2_17i_'),
 ]
@@ -141,7 +171,7 @@ def run(name, path, old, new, pkg, pattern, extra=None):
         r = subprocess.run(['go', 'test'] + pkg.split() + ['-run', pattern, '-count=1'], cwd=ROOT,
                            capture_output=True, text=True, timeout=900)
         out = r.stdout + r.stderr
-        if 'build failed' in out or '[setup failed]' in out:
+        if '[build failed]' in out or '[setup failed]' in out:
             verdict = 'BUILD-FAILED'
         elif r.returncode != 0:
             verdict = 'RED'

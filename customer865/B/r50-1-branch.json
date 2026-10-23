@@ -1,0 +1,72 @@
+{
+  "alloc_bytes": 23640285176,
+  "completions_s": 0.6999837380244638,
+  "cpu_cores": 2.093295135373635,
+  "cust_dep": {
+    "max_ms": 224.443,
+    "n": 878527,
+    "p50_ms": 0.073,
+    "p95_ms": 0.817,
+    "p99_ms": 1.689
+  },
+  "cust_dep_n": 8,
+  "cust_dep_rps": 29283.553019781815,
+  "cust_dep_staleness": {
+    "max_ms": 26070.054,
+    "n": 878527,
+    "p50_ms": 8123.904,
+    "p95_ms": 21549.367,
+    "p99_ms": 24589.407
+  },
+  "cust_errors": 0,
+  "cust_think_ms": 0,
+  "cust_unrel": {
+    "max_ms": 256.201,
+    "n": 426192,
+    "p50_ms": 0.088,
+    "p95_ms": 0.846,
+    "p99_ms": 1.765
+  },
+  "cust_unrel_n": 4,
+  "cust_unrel_rps": 14206.069965529632,
+  "dirty_to_fresh": {
+    "n": 0
+  },
+  "events": 1484,
+  "fills": 0,
+  "gomaxprocs": 4,
+  "list_incremental": {
+    "Anchors": 2,
+    "AnchorSkipped": 0,
+    "Reads": 62,
+    "Restamps": 4,
+    "Generations": 16,
+    "AppliedKeys": 1484,
+    "Decodes": 1484,
+    "Rebinds": 0,
+    "ItemsBuilt": 20,
+    "RawJSONBuilt": 0,
+    "PendingRecorded": 1484,
+    "Passes": 1,
+    "Suspects": 0,
+    "RefreshSkipped": 3,
+    "GenAllocBytesTotal": 30378752,
+    "GenAllocBytesMax": 3711232,
+    "GenAllocCount": 36,
+    "Unanchors": {},
+    "Divergences": {},
+    "DivergenceTotal": 0,
+    "Live": 2
+  },
+  "n": 50000,
+  "num_gc": 45,
+  "peak_heap_inuse": 1389527040,
+  "rate": 50,
+  "refresh_capped": 20,
+  "refresh_completed": 21,
+  "refresh_floored": 0,
+  "refresh_parked_s": 100.047,
+  "refresh_yielded": 24,
+  "seconds": 30,
+  "wall_s": 30.000696958
+}

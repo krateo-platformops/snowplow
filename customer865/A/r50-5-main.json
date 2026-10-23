@@ -1,0 +1,49 @@
+{
+  "alloc_bytes": 23688113984,
+  "completions_s": 3.8330620643368216,
+  "cpu_cores": 1.7904941185724836,
+  "cust_dep": {
+    "max_ms": 53.671,
+    "n": 1122,
+    "p50_ms": 0.073,
+    "p95_ms": 0.242,
+    "p99_ms": 0.541
+  },
+  "cust_dep_n": 2,
+  "cust_dep_rps": 37.39735335813838,
+  "cust_dep_staleness": {
+    "max_ms": 6331.01,
+    "n": 1122,
+    "p50_ms": 2988.936,
+    "p95_ms": 5584.773,
+    "p99_ms": 5948.129
+  },
+  "cust_errors": 0,
+  "cust_think_ms": 50,
+  "cust_unrel": {
+    "max_ms": 63.447,
+    "n": 2236,
+    "p50_ms": 0.07,
+    "p95_ms": 0.251,
+    "p99_ms": 0.519
+  },
+  "cust_unrel_n": 4,
+  "cust_unrel_rps": 74.52805892049682,
+  "dirty_to_fresh": {
+    "n": 0
+  },
+  "events": 1438,
+  "fills": 57,
+  "gomaxprocs": 4,
+  "n": 50000,
+  "num_gc": 35,
+  "peak_heap_inuse": 1934352384,
+  "rate": 50,
+  "refresh_capped": 0,
+  "refresh_completed": 115,
+  "refresh_floored": 18,
+  "refresh_parked_s": 0.458,
+  "refresh_yielded": 13,
+  "seconds": 30,
+  "wall_s": 30.002123125
+}

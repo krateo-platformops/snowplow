@@ -1,0 +1,16 @@
+r1-1-main exit=0 15:47:36 warn=0
+r1-1-branch exit=0 15:48:14 warn=0
+r1-1-main2 exit=0 15:48:51 warn=0
+r1-2-main exit=0 15:49:27 warn=0
+r1-2-branch exit=0 15:50:04 warn=0
+r1-2-main2 exit=0 15:50:41 warn=4
+r1-3-main exit=0 15:51:18 warn=0
+r1-3-branch exit=0 15:51:54 warn=0
+r1-3-main2 exit=0 15:52:31 warn=0
+r1-4-main exit=0 15:53:08 warn=0
+r1-4-branch exit=0 15:53:45 warn=0
+r1-4-main2 exit=0 15:54:22 warn=0
+r1-5-main exit=0 15:54:59 warn=0
+r1-5-branch exit=0 15:55:36 warn=0
+r1-5-main2 exit=0 15:56:13 warn=0
+CUST-DONE

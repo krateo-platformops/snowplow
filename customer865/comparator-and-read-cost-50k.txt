@@ -1,0 +1,7 @@
+    list_cell_854_cost_test.go:56: COST comparator pass                    mean alloc   24.436 MB   mean wall   96.395 ms   (n=50000 objects, 5 reps)
+    list_cell_854_cost_test.go:56: COST read, nothing pending              mean alloc    0.020 MB   mean wall    0.014 ms   (n=50000 objects, 20 reps)
+    list_cell_854_cost_test.go:56: COST read applying 1 change(s)          mean alloc    0.425 MB   mean wall    0.177 ms   (n=50000 objects, 10 reps)
+    list_cell_854_cost_test.go:56: COST read applying 10 change(s)         mean alloc    0.621 MB   mean wall    0.319 ms   (n=50000 objects, 10 reps)
+    list_cell_854_cost_test.go:56: COST read applying 100 change(s)        mean alloc    2.511 MB   mean wall    1.231 ms   (n=50000 objects, 10 reps)
+--- PASS: TestListCell854_CostAt50K (3.00s)
+ok  	github.com/krateo-platformops/snowplow/internal/cache	3.551s

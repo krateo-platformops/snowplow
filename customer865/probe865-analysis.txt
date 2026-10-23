@@ -1,0 +1,8 @@
+hit_bench   p50_ms  main [18, 17, 17, 17, 17]                     branch [18, 17, 18, 18, 18]                     main2 [18, 18, 17, 18, 18]                     branch/main 1.02 (0.97-1.06)  main/main 0.94-1.06
+hit_bench   p95_ms  main [22, 21, 22, 21, 21]                     branch [23, 22, 23, 23, 26]                     main2 [26, 23, 21, 23, 24]                     branch/main 1.04 (0.96-1.16)  main/main 0.85-1.18
+probe       p50_ms  main [13, 13, 14, 14, 14]                     branch [16, 16, 16, 14, 16]                     main2 [13, 13, 13, 14, 13]                     branch/main 1.16 (1.00-1.23)  main/main 0.93-1.08
+probe       p95_ms  main [45, 45, 46, 43, 43]                     branch [50, 50, 49, 48, 47]                     main2 [47, 50, 44, 47, 41]                     branch/main 1.08 (1.05-1.12)  main/main 0.90-1.11
+cust_unrel  p50_ms  main [94, 85, 104, 107, 99]                   branch [125, 116, 111, 103, 112]                main2 [93, 104, 90, 108, 99]                   branch/main 1.15 (0.96-1.34)  main/main 0.82-1.22
+cust_unrel  p95_ms  main [354, 334, 471, 555, 483]                branch [580, 535, 512, 443, 494]                main2 [438, 500, 390, 561, 387]                branch/main 1.15 (0.79-1.46)  main/main 0.67-1.50
+cust_dep    p50_ms  main [98, 92, 104, 109, 99]                   branch [124, 110, 116, 109, 119]                main2 [96, 109, 90, 113, 101]                  branch/main 1.14 (0.98-1.28)  main/main 0.84-1.18
+(values in microseconds)

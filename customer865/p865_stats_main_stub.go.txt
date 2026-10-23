@@ -1,0 +1,7 @@
+//go:build paired854
+
+package dispatchers
+
+// pairedListStats865 is main's side of the paired customer arm's list-cell stats:
+// main has no incremental list cell.
+func pairedListStats865() any { return nil }
