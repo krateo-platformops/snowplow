@@ -1,0 +1,255 @@
+{
+ "source": "run 13 (snowplow 1.12.52, bench 662515cb), mem606 stream mem-mem606-f8kh8.jsonl: five real samples of snowplow_apistage_content_fill_by_gvr, three GVRs kept; the last pair spans the run's one snowplow restart (the counters began again at 0)",
+ "samples": [
+  {
+   "t_rel_s": 60.75,
+   "by_gvr": {
+    "composition.krateo.io/v1-2-2, Resource=githubscaffoldingwithcompositionpages": {
+     "fills": 1,
+     "duplicates": 0,
+     "joined": 0,
+     "refresh_reused": 0,
+     "refresh_coalesced": 0,
+     "bytes": 70685406,
+     "items_total": 50000,
+     "max_bytes": 70685406,
+     "max_items": 50000,
+     "duration_ms_ewma": 2242,
+     "duration_ms_max": 2242,
+     "decode_expansion": 6.377868495230826,
+     "admission_predict_ratio": 67.41085624694824
+    },
+    "/v1, Resource=events": {
+     "fills": 12,
+     "duplicates": 0,
+     "joined": 11,
+     "refresh_reused": 71,
+     "refresh_coalesced": 0,
+     "bytes": 10790162,
+     "items_total": 11734,
+     "max_bytes": 926830,
+     "max_items": 1003,
+     "duration_ms_ewma": 41.98261272576,
+     "duration_ms_max": 87,
+     "decode_expansion": 34.126560426399664,
+     "admission_predict_ratio": 0.9921532021723607
+    },
+    "composition.krateo.io/v1-8-72, Resource=portals": {
+     "fills": 6,
+     "duplicates": 0,
+     "joined": 0,
+     "refresh_reused": 53,
+     "refresh_coalesced": 0,
+     "bytes": 858102,
+     "items_total": 6,
+     "max_bytes": 143017,
+     "max_items": 1,
+     "duration_ms_ewma": 2.8895999999999997,
+     "duration_ms_max": 7,
+     "decode_expansion": 15.533216610612724,
+     "admission_predict_ratio": 0.7170128124999999
+    }
+   }
+  },
+  {
+   "t_rel_s": 65.822,
+   "by_gvr": {
+    "composition.krateo.io/v1-2-2, Resource=githubscaffoldingwithcompositionpages": {
+     "fills": 2,
+     "duplicates": 0,
+     "joined": 0,
+     "refresh_reused": 0,
+     "refresh_coalesced": 0,
+     "bytes": 72099218,
+     "items_total": 51000,
+     "max_bytes": 70685406,
+     "max_items": 50000,
+     "duration_ms_ewma": 1799.2,
+     "duration_ms_max": 2242,
+     "decode_expansion": 14.946858563939195,
+     "admission_predict_ratio": 54.128699710639374
+    },
+    "/v1, Resource=events": {
+     "fills": 12,
+     "duplicates": 0,
+     "joined": 11,
+     "refresh_reused": 71,
+     "refresh_coalesced": 0,
+     "bytes": 10790162,
+     "items_total": 11734,
+     "max_bytes": 926830,
+     "max_items": 1003,
+     "duration_ms_ewma": 41.98261272576,
+     "duration_ms_max": 87,
+     "decode_expansion": 34.126560426399664,
+     "admission_predict_ratio": 0.9921532021723607
+    },
+    "composition.krateo.io/v1-8-72, Resource=portals": {
+     "fills": 6,
+     "duplicates": 0,
+     "joined": 0,
+     "refresh_reused": 65,
+     "refresh_coalesced": 0,
+     "bytes": 858102,
+     "items_total": 6,
+     "max_bytes": 143017,
+     "max_items": 1,
+     "duration_ms_ewma": 2.8895999999999997,
+     "duration_ms_max": 7,
+     "decode_expansion": 15.533216610612724,
+     "admission_predict_ratio": 0.7170128124999999
+    }
+   }
+  },
+  {
+   "t_rel_s": 70.964,
+   "by_gvr": {
+    "composition.krateo.io/v1-2-2, Resource=githubscaffoldingwithcompositionpages": {
+     "fills": 2,
+     "duplicates": 0,
+     "joined": 0,
+     "refresh_reused": 0,
+     "refresh_coalesced": 0,
+     "bytes": 72099218,
+     "items_total": 51000,
+     "max_bytes": 70685406,
+     "max_items": 50000,
+     "duration_ms_ewma": 1799.2,
+     "duration_ms_max": 2242,
+     "decode_expansion": 14.946858563939195,
+     "admission_predict_ratio": 54.128699710639374
+    },
+    "/v1, Resource=events": {
+     "fills": 12,
+     "duplicates": 0,
+     "joined": 11,
+     "refresh_reused": 71,
+     "refresh_coalesced": 0,
+     "bytes": 10790162,
+     "items_total": 11734,
+     "max_bytes": 926830,
+     "max_items": 1003,
+     "duration_ms_ewma": 41.98261272576,
+     "duration_ms_max": 87,
+     "decode_expansion": 34.126560426399664,
+     "admission_predict_ratio": 0.9921532021723607
+    },
+    "composition.krateo.io/v1-8-72, Resource=portals": {
+     "fills": 6,
+     "duplicates": 0,
+     "joined": 0,
+     "refresh_reused": 77,
+     "refresh_coalesced": 0,
+     "bytes": 858102,
+     "items_total": 6,
+     "max_bytes": 143017,
+     "max_items": 1,
+     "duration_ms_ewma": 2.8895999999999997,
+     "duration_ms_max": 7,
+     "decode_expansion": 15.533216610612724,
+     "admission_predict_ratio": 0.7170128124999999
+    }
+   }
+  },
+  {
+   "t_rel_s": 1866.329,
+   "by_gvr": {
+    "composition.krateo.io/v1-2-2, Resource=githubscaffoldingwithcompositionpages": {
+     "fills": 426,
+     "duplicates": 81,
+     "joined": 612,
+     "refresh_reused": 8,
+     "refresh_coalesced": 126,
+     "bytes": 29434600127,
+     "items_total": 20809000,
+     "max_bytes": 70744182,
+     "max_items": 50000,
+     "duration_ms_ewma": 3486.3458288817915,
+     "duration_ms_max": 43770,
+     "decode_expansion": 19.508300710862695,
+     "admission_predict_ratio": 1.000000069119815
+    },
+    "/v1, Resource=events": {
+     "fills": 23,
+     "duplicates": 0,
+     "joined": 36,
+     "refresh_reused": 139,
+     "refresh_coalesced": 0,
+     "bytes": 20253674,
+     "items_total": 21965,
+     "max_bytes": 930697,
+     "max_items": 1007,
+     "duration_ms_ewma": 20.72586830819545,
+     "duration_ms_max": 87,
+     "decode_expansion": 26.14709762967775,
+     "admission_predict_ratio": 0.8329656997205861
+    },
+    "composition.krateo.io/v1-8-72, Resource=portals": {
+     "fills": 24,
+     "duplicates": 0,
+     "joined": 3,
+     "refresh_reused": 1160,
+     "refresh_coalesced": 0,
+     "bytes": 3432408,
+     "items_total": 24,
+     "max_bytes": 143017,
+     "max_items": 1,
+     "duration_ms_ewma": 40.67319878118785,
+     "duration_ms_max": 369,
+     "decode_expansion": 33.67032621668664,
+     "admission_predict_ratio": 0.9949021560312976
+    }
+   }
+  },
+  {
+   "t_rel_s": 2631.587,
+   "by_gvr": {
+    "composition.krateo.io/v1-2-2, Resource=githubscaffoldingwithcompositionpages": {
+     "fills": 69,
+     "duplicates": 20,
+     "joined": 24,
+     "refresh_reused": 0,
+     "refresh_coalesced": 22,
+     "bytes": 4741291595,
+     "items_total": 3351000,
+     "max_bytes": 70744429,
+     "max_items": 50000,
+     "duration_ms_ewma": 1908.0033520988393,
+     "duration_ms_max": 3554,
+     "decode_expansion": 16.05260967192201,
+     "admission_predict_ratio": 1.0000314508942365
+    },
+    "/v1, Resource=events": {
+     "fills": 3,
+     "duplicates": 0,
+     "joined": 1,
+     "refresh_reused": 11,
+     "refresh_coalesced": 0,
+     "bytes": 227759,
+     "items_total": 217,
+     "max_bytes": 76555,
+     "max_items": 73,
+     "duration_ms_ewma": 313.96,
+     "duration_ms_max": 1565,
+     "decode_expansion": 26.189042617920162,
+     "admission_predict_ratio": 0.40473369324475916
+    },
+    "composition.krateo.io/v1-8-72, Resource=portals": {
+     "fills": 3,
+     "duplicates": 0,
+     "joined": 2,
+     "refresh_reused": 16,
+     "refresh_coalesced": 0,
+     "bytes": 429051,
+     "items_total": 3,
+     "max_bytes": 143017,
+     "max_items": 1,
+     "duration_ms_ewma": 439.12,
+     "duration_ms_max": 2190,
+     "decode_expansion": 6.185275876294427,
+     "admission_predict_ratio": 0.44729064941406255
+    }
+   }
+  }
+ ]
+}

@@ -1561,6 +1561,8 @@ def test_run606_k6_end_to_end(harness):
     assert {r["job"] for r in jp} >= {"k6load", "k6browser", "fresh606", "mem606"}
     assert SCALEUSER_PASSWORD not in log
     assert SCALEUSER_PASSWORD not in (out / "run.log").read_text()
+    # the fake mem606 stream has no #765 B shadow: the run log says it is missing
+    assert "WARNING: snowplow_deps_list_narrow absent in all" in (out / "run.log").read_text()
 
 
 def test_run606_k6_dropped_burst_is_invalid(harness):
