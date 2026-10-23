@@ -1,0 +1,3 @@
+rate  1: parked worker-s per 30 s  main [54.2, 44.1, 57.5] branch [96.0, 97.9, 83.9] main2 [41.6, 69.5, 49.8] | 5 s cap hits main [4, 4, 4] branch [8, 4, 4] main2 [4, 8, 1]
+rate 10: parked worker-s per 30 s  main [56.4, 42.9, 41.4] branch [85.3, 90.0, 77.3] main2 [59.1, 21.0, 68.4] | 5 s cap hits main [4, 1, 0] branch [8, 4, 0] main2 [8, 0, 8]
+rate 50: parked worker-s per 30 s  main [44.9, 49.0, 81.3] branch [79.8, 95.9, 107.2] main2 [28.8, 58.9, 86.2] | 5 s cap hits main [2, 0, 4] branch [4, 8, 16] main2 [0, 0, 16]

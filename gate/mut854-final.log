@@ -5,7 +5,7 @@ M4 servability epoch not checked                                       RED  | li
 M5 lost-event signals ignored                                          RED  | list_cell_854_test.go:293: F2d RED (panic): the cell still serves after an event may have been lost
 M6 type-level event does not unanchor                                  RED  | list_cell_854_more_test.go:32: F2t RED (available): the cell survived a type-level event — not a per-object delta it can apply
 M7 comparator ignores dep-worker in-flight keys                        RED  | list_cell_854_race_test.go:119: F5b RED (C1): pass 2 counted 1 divergence(s) for a key still in the dep worker — a backlog would unanchor the cell and trigger a full fill
-M7b comparator ignores undelivered keys                                RED  | list_cell_854_race_test.go:193: F5b storm RED: the cell unanchored at event 249 (unanchors map[divergence:1], divergences map[key_mismatch:43])
+M7b comparator ignores undelivered keys                                RED  | list_cell_854_race_test.go:193: F5b storm RED: the cell unanchored at event 249 (unanchors map[divergence:1], divergences map[key_mismatch:1])
 M8 comparator skips the obj-from-raw identity                          RED  | list_cell_854_test.go:399: F5c RED: a slot whose decoded object no longer comes from its raw passed the comparator — serving would read the stale object
 M9 comparator never scheduled by reads                                 RED  | list_cell_854_more_test.go:65: F5r RED: 10s of reads scheduled no comparator pass — the comparator never runs on its own
 M9b comparator never confirms a mismatch                               RED  | list_cell_854_test.go:379: F5a RED: a slot whose bytes differ from the indexer survived two passes
