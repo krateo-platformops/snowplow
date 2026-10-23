@@ -63,9 +63,9 @@ Read from `ui/src/hooks/useWidgetQuery.ts`, `components/WidgetRenderer`, `compon
   - It returns `undefined` immediately when the request carried no page (`typeof pageParams.page !== 'number'`).
   - It also returns `undefined` in classic-pager mode (`defaultPageSize`, e.g. the compositions table, which pages through `widgetData` and never reads `continue`).
 - **The Shell's Menu (sidebar-nav)** is fetched **without** page/perPage. snowplow emits no `slice`, so the SPA never paged it, before or after.
-- **`ScrollPagination` / `ButtonPagination`** are wired only around DataGrid.
-  - krateo-057 has **no** DataGrid kind installed (`widgets.templates.krateo.io` API resources, read 2026-10-23).
-  - Upstream portal DataGrids are backed by RAs that emit `slice.cursor`. Their `continue` becomes `cursor != ""`, which is true while the presenter has more, as before.
+- **`ScrollPagination`** wraps every widget kind registered `paginated: true` (`WidgetRenderer.tsx:73-85`), and today that is only `Listy` (`widgets/List/index.ts:10`). **`ButtonPagination`** is not wired anywhere.
+- Infinite scroll needs a request that carries a page. A widget gets one only when the ref that leads to it declares `resourcesRefs.items[].slice`, and a declared slice also puts `useWidgetQuery` into the classic-pager mode (`boundedWindow`), which never reads `continue`. The 1.8.84 portal deployed on krateo-057 (92 RAs, 361 widgets; reviewer-818's corpus scan) has no Listy paged that way.
+- Upstream portal lists backed by the `*-panels` RAs emit `slice.cursor`. Their `continue` becomes `cursor != ""`, which is true while the presenter has more, as before.
 
 So the SPA reads the same field with the same type. No SPA change ships with #874.
 

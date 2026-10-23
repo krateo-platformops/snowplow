@@ -487,7 +487,13 @@ func iterateApiRefPages(
 		// keep-warm / gvr-discovered re-resolve. Cheap + nil-safe.
 		wcGen0 := cache.ResolvedCache().CaptureGen(wcKey)
 		resolveCtx := ctx
-		if wcKey != "" {
+		// #874 — a CURSOR page is not a function of the cell key: the key
+		// (gvr, ns, name, perPage, page) has no cursor dimension, and no customer
+		// /call or refresh ever carries one. Such a page is resolved only to
+		// discover its children; it gets no L1 key (no dep edges recorded against
+		// a cell it will not fill) and no Put below.
+		storePage := cursor == ""
+		if wcKey != "" && storePage {
 			resolveCtx = cache.WithL1KeyContext(resolveCtx, wcKey)
 		}
 		// Task #318 Step 1 / #450 — Put-gate sink parity with the page-1 walk.
@@ -541,7 +547,9 @@ func iterateApiRefPages(
 		// snowplow_phase1_bindingset_seed_resolves_total). Name reads "seed
 		// units"; semantics are content-pagination cells. See the declaration
 		// doc in phase1_walk_pagination_metrics.go.
-		bumpPrewarmUnitsSeeded()
+		if storePage {
+			bumpPrewarmUnitsSeeded()
+		}
 
 		// Put this page's envelope under the matching content L1 key.
 		// populateWidgetContentL1 idempotently handles the RBAC-
@@ -555,7 +563,11 @@ func iterateApiRefPages(
 		// (which carries the stage-error sink + the L1 key) NOT the bare
 		// ctx, so the Cache-A gate inside populateWidgetContentL1 sees this
 		// resolve's sink (parity with phase1_walk.go:1226).
-		populateWidgetContentL1(resolveCtx, gvr, got.Unstructured, keyPerPage, keyPageForThisPage, res, wcGen0)
+		if storePage {
+			populateWidgetContentL1(resolveCtx, gvr, got.Unstructured, keyPerPage, keyPageForThisPage, res, wcGen0)
+		} else {
+			bumpPrewarmApiRefCursorPagesUnstored()
+		}
 		pagesWalked++
 
 		// Recurse into the children this page produced. Honours the

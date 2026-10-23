@@ -12,18 +12,17 @@ spec:
     continueOnError: true
     errorKey: podsError
     path: ${ "/api/v1/namespaces/demo-system/pods" }
+  # Offset paging. The RESTAction is handed `.slice = {page, perPage, offset}`
+  # on a paginated request and returns that window. Since #874 it must also
+  # DECLARE whether there is a next page (`slice.continue`): snowplow no longer
+  # infers it from how many items a page returned, and a source that declares
+  # nothing yields exactly one page. See docs/howto-frontend-source-declared-pagination.md.
   filter: |
-    {
-      "pods": (
-        .pods.items as $items
-        | .slice.offset as $offset
-        | .slice.perPage as $perPage
-        | [
-          $items
-          | length as $len
-          | range($offset; $offset + $perPage)
-          | select(. < $len)
-          | $items[.]
-        ]
-      )
-    }
+    (.pods.items // []) as $items
+    | ($items | length) as $len
+    | (.slice.offset // 0) as $offset
+    | (.slice.perPage // $len) as $perPage
+    | {
+        "pods": [ range($offset; $offset + $perPage) | select(. < $len) | $items[.] ],
+        "slice": { "continue": (($offset + $perPage) < $len) }
+      }

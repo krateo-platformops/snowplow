@@ -196,3 +196,73 @@ func TestS874_Drain_CursorSourceIsThreadedToTheEnd(t *testing.T) {
 		}
 	}
 }
+
+// s874StoreAttempts is how many drain pages reached the widgetContent store
+// (populateWidgetContentL1). Every apiRef+resourcesRefsTemplate page is
+// declined there today by isRBACSensitiveApiRefWidget, and each attempt bumps
+// that decline counter, so the counter delta IS the number of store attempts —
+// the observable that does not depend on the heuristic staying as it is.
+func s874StoreAttempts() uint64 {
+	return widgetContentSkippedRBACSensitiveTotal.Load() + widgetContentSkippedEmptyShellTotal.Load()
+}
+
+// TestS874_Drain_CursorPagesAreNotStoredUnderACursorlessKey — the cell key
+// (gvr, ns, name, perPage, page) has no cursor dimension, and no customer /call
+// or refresh ever carries a cursor. So a page the drain resolved WITH the
+// source's cursor must never be handed to the store: its bytes would depend on
+// who filled the cell (a customer /call for page N must get what a fresh
+// cursor-less resolve gives). The control (a bool-continue source, no cursor)
+// proves the drain does hand its pages to the store.
+func TestS874_Drain_CursorPagesAreNotStoredUnderACursorlessKey(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	const n = 12
+	all := s874Items(n)
+	t.Cleanup(cache.ResetResolvedCacheForTest)
+
+	t.Run("control: a page-keyed source's pages reach the store", func(t *testing.T) {
+		cache.ResetResolvedCacheForTest()
+		before := s874StoreAttempts()
+		s874Drain(t, 50, func(o widgets.ResolveOptions) map[string]any {
+			off := (o.Page - 1) * o.PerPage
+			end := min(off+o.PerPage, n)
+			return map[string]any{"refs": all[off:end], "slice": map[string]any{"continue": end < n}}
+		})
+		if d := s874StoreAttempts() - before; d != 2 {
+			t.Fatalf("NON-VACUITY: pages 2-3 of a page-keyed source reached the store %d times, want 2", d)
+		}
+	})
+	t.Run("cursor pages are walked, never stored", func(t *testing.T) {
+		cache.ResetResolvedCacheForTest()
+		before := s874StoreAttempts()
+		unstored := prewarmApiRefCursorPagesUnstoredTotal.Load()
+		calls, ids := s874Drain(t, 50, func(o widgets.ResolveOptions) map[string]any {
+			start := 0
+			if o.Cursor != "" {
+				fmt.Sscanf(o.Cursor, "c%d", &start)
+			}
+			end := min(start+o.PerPage, n)
+			next := ""
+			if end < n {
+				next = fmt.Sprintf("c%d", end)
+			}
+			return map[string]any{"refs": all[start:end], "slice": map[string]any{"cursor": next, "perPage": o.PerPage}}
+		})
+		if len(calls) != 3 || len(ids) != n {
+			t.Fatalf("PRECONDITION: the cursor walk resolved %d pages and %d ids, want 3 and %d", len(calls), len(ids), n)
+		}
+		if d := s874StoreAttempts() - before; d != 0 {
+			t.Fatalf("#874 RED: %d page(s) resolved with the source's cursor were handed to the store under the "+
+				"cursor-less cell key; a customer /call or refresh for that page would see bytes no cursor-less resolve produces", d)
+		}
+		for _, p := range []int{2, 3} {
+			key, _ := widgetContentL1Key(s874GVR, "krateo-system", "s874-menu", 5, drainKeyPageFor(1, p))
+			if _, ok := cache.ResolvedCache().GetNoTouch(key); ok {
+				t.Fatalf("#874 RED: page %d's cursor-less cell holds a cursor page", p)
+			}
+		}
+		if d := prewarmApiRefCursorPagesUnstoredTotal.Load() - unstored; d != 2 {
+			t.Fatalf("snowplow_phase1_apiref_cursor_pages_unstored_total moved by %d, want 2", d)
+		}
+	})
+}

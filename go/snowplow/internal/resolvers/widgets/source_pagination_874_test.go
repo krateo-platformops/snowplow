@@ -91,6 +91,25 @@ func TestS874_BoolContinueIsTakenAsIs(t *testing.T) {
 	}
 }
 
+// TestS874_DeclaredBoolWinsOverCursor — a source declaring BOTH: the bool is
+// the answer (a non-empty cursor next to continue:false does not page on, and
+// an empty cursor next to continue:true does not stop it).
+func TestS874_DeclaredBoolWinsOverCursor(t *testing.T) {
+	for _, c := range []struct {
+		cont   bool
+		cursor string
+	}{{false, "tok-x"}, {true, ""}} {
+		stubApiRef(t, map[string]any{"refs": s874Refs(5), "slice": map[string]any{"continue": c.cont, "cursor": c.cursor}}, nil)
+		stubValidate(t, nil)
+		w := s874Menu()
+		_, err := Resolve(hermeticCtx(t), ResolveOptions{In: w, PerPage: 5, Page: 1})
+		require.NoError(t, err)
+		sl := s874Slice(t, w)
+		assert.Equal(t, c.cont, sl["continue"],
+			"#874 RED: a declared bool continue must win over the cursor (continue=%v cursor=%q)", c.cont, c.cursor)
+	}
+}
+
 func TestS874_CursorSourceContinuesWhileCursorNonEmpty(t *testing.T) {
 	var seenCursor string
 	orig := resolveApiRefFn

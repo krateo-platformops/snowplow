@@ -86,6 +86,11 @@ var (
 	// walk resolved. Confirms the backstop raise took effect when >> 500×.
 	prewarmApiRefPagesTotal atomic.Uint64
 
+	// prewarmApiRefCursorPagesUnstoredTotal — #874: extra pages resolved with
+	// the data source's cursor, walked for their children but NOT stored (the
+	// cell key has no cursor dimension, so no caller could look the page up).
+	prewarmApiRefCursorPagesUnstoredTotal atomic.Uint64
+
 	// prewarmEligibleNoContinueTotal — Task #318 Step 1 (collection
 	// robustness). One per DISTINCT eligible widget (isApiRefTemplateDriven)
 	// whose page-1 resolve produced NO continuation at collect time — the
@@ -110,6 +115,10 @@ func bumpPrewarmUnitsSeeded() { prewarmUnitsSeeded.Add(1) }
 // bumpPrewarmApiRefPagesTotal increments the extra-pages grand total.
 // Called once per resolved page 2..N.
 func bumpPrewarmApiRefPagesTotal() { prewarmApiRefPagesTotal.Add(1) }
+
+// bumpPrewarmApiRefCursorPagesUnstored counts a cursor page walked but not
+// stored (#874).
+func bumpPrewarmApiRefCursorPagesUnstored() { prewarmApiRefCursorPagesUnstoredTotal.Add(1) }
 
 // bumpPrewarmEligibleNoContinue increments the eligible-but-no-continuation
 // grand total (Task #318 Step 1). Called once per DISTINCT eligible widget the
@@ -149,6 +158,9 @@ func registerPhase1PaginationMetrics() {
 		}))
 		expvar.Publish("snowplow_phase1_apiref_pages_total", expvar.Func(func() any {
 			return prewarmApiRefPagesTotal.Load()
+		}))
+		expvar.Publish("snowplow_phase1_apiref_cursor_pages_unstored_total", expvar.Func(func() any {
+			return prewarmApiRefCursorPagesUnstoredTotal.Load()
 		}))
 		expvar.Publish("snowplow_phase1_eligible_no_continue_total", expvar.Func(func() any {
 			return prewarmEligibleNoContinueTotal.Load()

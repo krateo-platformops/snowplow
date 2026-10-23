@@ -278,8 +278,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 				"page":     page,
 				"continue": hasNext,
 			}
-			// The next page's cursor, for whoever asks for that page (the
-			// prewarm drain threads it; a client may send it back as cursor=).
+			// The next page's cursor. Today only the prewarm drain threads it;
+			// no /call handler reads a cursor yet (see
+			// docs/howto-frontend-source-declared-pagination.md §5).
 			if hasNext && sourceCursor != "" {
 				sl["cursor"] = sourceCursor
 			}
