@@ -3260,8 +3260,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              job_pods: list[dict] | None = None,
              viewer_dead: list[dict] | None = None,
              k6: dict | None = None,
-             churns: list[dict] | None = None,
-             latency_baseline: dict | None = None) -> dict:
+             churns: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -3273,8 +3272,6 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     `k6` (#830, run 11): {"k6", "browser": k6eval.read_k6_out(...), "sessions",
     "thresholds"}; `navs` are then the real-browser page loads.
     `churns`: fresh606's churn records (the per-phase reports' schedule).
-    `latency_baseline` (run 15, custlat.load_baseline): adds the customer
-    latency checks against that run — a VERDICT change; needs `k6`.
     """
     if k6 is not None:
         # operator side only: this file also runs alone inside the Job pods
@@ -3468,19 +3465,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         report["viewer_report_only"] = k6eval.viewer_report(k6.get("viewer"))
         report["load_generator_cpu_report_only"] = {
             c: k6eval.cpu_stats(((k6.get("k6") or {}).get("cpu") or {}).get(c)) for c in ("k6", "viewer")}
+        # the paired gate's input (custlat pair reads it from both runs'
+        # verdicts); in one run's verdict it is report only
         from bench import custlat
         report["customer_latency"] = custlat.report(k6.get("k6"), k6.get("browser"), mem or [],
                                                     fresh, churns, tops or [])
-    if latency_baseline is not None:
-        # run 15 (#865): a VERDICT check, unlike the report-only sections
-        if k6 is None:
-            validity.append({"check": "customer_latency.k6", "value": None, "bar": "a k6 run",
-                             "result": "FAIL",
-                             "why": "a latency baseline was given but the run has no k6 load"})
-        else:
-            lc, lv = custlat.gate(report["customer_latency"], latency_baseline)
-            checks.extend(lc)
-            validity.extend(lv)
     report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
     fv = [f for f in fresh if f.get("valid") is False]
     report["fresh_invalid_samples"] = len(fv)
@@ -4942,8 +4931,6 @@ def _cmd_evaluate(a) -> int:
             mem_streams.append(ms)
     navs = [r for r in recs if r.get("kind") == "nav"]
     k6 = None
-    if a.latency_baseline:
-        from bench import custlat
     if a.k6_out is not None or a.browser_out is not None:
         # #830 run 11: page loads come from the real browsers; k6 is the load
         from bench import k6eval
@@ -4980,9 +4967,7 @@ def _cmd_evaluate(a) -> int:
                       viewer_dead=sorted((r for r in recs if r.get("kind") == "viewer_dead"),
                                          key=lambda r: r.get("t") or 0),
                       k6=k6,
-                      churns=[r for r in recs if r.get("kind") == "churn"],
-                      latency_baseline=(custlat.load_baseline(a.latency_baseline)
-                                        if a.latency_baseline else None))
+                      churns=[r for r in recs if r.get("kind") == "churn"])
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))
@@ -5150,9 +5135,6 @@ def main(argv: list[str] | None = None) -> int:
                    help="#830: the run had no open tabs (VIEWERS=0): no viewer checks")
     e.add_argument("--run8", action="store_true",
                    help="add the #710 run-8 memory-risk / stale_to_push report and checks")
-    e.add_argument("--latency-baseline", default=None,
-                   help="run 15: gate k6's customer latency per phase against this "
-                        "custlat baseline file (a verdict check)")
     e.set_defaults(func=_cmd_evaluate)
     a = p.parse_args(argv)
     return int(a.func(a))

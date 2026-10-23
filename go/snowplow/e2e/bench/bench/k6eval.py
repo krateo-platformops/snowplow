@@ -111,6 +111,9 @@ def read_k6_out(d: str, name: str) -> dict | None:
     out = {"name": name, "stream": os.path.exists(stream), "points": defaultdict(list),
            "times": defaultdict(list),
            "frames": Counter(), "truncated": False, "summary": None, "exit": None}
+    # one shared dict per distinct tag set: a paired run's customers stay on
+    # for hours (K6_SPAN=churn, millions of calls with a few dozen tag sets)
+    tagsets: dict[tuple, dict] = {}
     if out["stream"]:
         try:
             with gzip.open(stream, "rt") as fh:
@@ -129,6 +132,7 @@ def read_k6_out(d: str, name: str) -> dict | None:
                         continue
                     data = r.get("data") or {}
                     tags = data.get("tags") or {}
+                    tags = tagsets.setdefault(tuple(sorted(tags.items())), tags)
                     if r["metric"] == "bench_frame":
                         out["frames"][tags.get("frame")] += 1
                     else:

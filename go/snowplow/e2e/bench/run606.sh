@@ -82,6 +82,9 @@ SCALE="${SCALE:-50000}"
 USERS="${USERS:-1000}"
 NAMESPACES="${NAMESPACES:-50}"
 THINK_S="${THINK_S:-60}"
+# K6_SPAN=churn (paired runs, #865): DRIVE_S is derived below; set by hand it
+# would fight the derivation.
+DRIVE_S_GIVEN="${DRIVE_S:+1}"
 DRIVE_S="${DRIVE_S:-1800}"
 # #830 (run 11): the load = k6 (1,000 users, arrival-rate) + real Chrome
 # sessions whose page loads the north-star bars judge. load606 = the Python
@@ -94,18 +97,6 @@ BROWSER_SESSIONS="${BROWSER_SESSIONS:-5}"
 if [[ "$LOAD_DRIVER" == "k6" ]]; then LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-16}"
 else LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-8}"; fi
 BROWSER_THINK_S="${BROWSER_THINK_S:-15}"
-# Run 15 (#865): k6's customer latency (p95/p99 per phase) and req/s are a
-# VERDICT check against this baseline (bench/custlat.py; the file was derived
-# from runs 12/13/14 by `python3 -m bench.custlat derive` and carries its
-# provenance). Empty (the default) = no gate: run 15 passes
-# LATENCY_BASELINE=customer_latency_baseline_run14.json. k6 only: load606
-# makes no k6 calls.
-LATENCY_BASELINE="${LATENCY_BASELINE:-}"
-if [[ -n "$LATENCY_BASELINE" ]]; then
-  [[ "$LOAD_DRIVER" == "k6" ]] || { echo "refusing: LATENCY_BASELINE gates k6's calls; LOAD_DRIVER=${LOAD_DRIVER} makes none" >&2; exit 2; }
-  python3 -c 'import sys; from bench import custlat; custlat.load_baseline(sys.argv[1])' "$LATENCY_BASELINE" 2>/dev/null \
-    || { echo "refusing: LATENCY_BASELINE '${LATENCY_BASELINE}' is not a customer_latency_baseline/1 file" >&2; exit 2; }
-fi
 # Inside the browser pod, the frontend's localhost URLs (its config.json was
 # made for a port-forwarding operator) are forwarded to the cluster Services;
 # :8083 = the sse-proxy (live refresh): sources in bench/load606_job.py.
@@ -154,15 +145,6 @@ FRESH_MODES="${FRESH_MODES:-annotation status}"
 for m in $FRESH_MODES; do
   case "$m" in annotation|status) ;; *) echo "refusing: FRESH_MODES has unknown mode '$m'" >&2; exit 2 ;; esac
 done
-# The latency gate compares against the baseline's schedule: a run whose
-# knobs differ would be INVALID only after it was paid for.
-if [[ -n "$LATENCY_BASELINE" ]]; then
-  python3 -m bench.custlat check-env "$LATENCY_BASELINE" --users "$USERS" \
-      --burst-users "$COMPOSITE_BURST_USERS" --think-s "$THINK_S" --drive-s "$DRIVE_S" \
-      --burst-at-s "$COMPOSITE_BURST_AT_S" --browser-sessions "$BROWSER_SESSIONS" \
-      --modes "$FRESH_MODES" --rates "$CHURN_RATES" \
-    || { echo "refusing: the schedule above is not the latency baseline's (LATENCY_BASELINE= runs without the gate)" >&2; exit 2; }
-fi
 # The measure wait is DERIVED from the work it waits for, and fresh606 is
 # itself BOUNDED to that work (reviewer-small (d)): each (mode, rate) phase
 # gets samples x (30 s budget + gap) x 1.25 of wall clock and stops there,
@@ -178,6 +160,23 @@ n_rates=$(echo $CHURN_RATES | wc -w | tr -d ' ')
 FRESH_PHASE_S=$(( FRESH_SAMPLES * (FRESH_BUDGET_S + ${FRESH_GAP_S%.*}) * 5 / 4 ))
 FRESH_EST_S=$(( ${THINK_S%.*} + FRESH_LOAD_WAIT_MAX_S
                 + n_modes * n_rates * (FRESH_PHASE_S + FRESH_LAST_SAMPLE_OVERRUN_S) ))
+# K6_SPAN (Diego 2026-10-23, paired runs for #865): "drive" (default) = k6's
+# customers run DRIVE_S, as in runs 11-14, which ended inside fresh606's
+# first (1/s) step. "churn" = they stay on through EVERY churn step: DRIVE_S
+# is the longest fresh606 can run once its start gate opened — THINK_S plus
+# every (mode, rate) phase's own bound — so the storm and burst phases stay
+# where they were (COMPOSITE_BURST_AT_S keeps its 1800 / 2 default) and the
+# churn steps all have customers. custlat.pair checks it (k6's last call
+# after the last step ended), never assumes it.
+K6_SPAN="${K6_SPAN:-drive}"
+case "$K6_SPAN" in
+  drive) ;;
+  churn)
+    [[ "$LOAD_DRIVER" == "k6" ]] || { echo "refusing: K6_SPAN=churn keeps k6's customers on; LOAD_DRIVER=${LOAD_DRIVER}" >&2; exit 2; }
+    [[ -z "$DRIVE_S_GIVEN" ]] || { echo "refusing: K6_SPAN=churn derives DRIVE_S; do not set it" >&2; exit 2; }
+    DRIVE_S=$(( ${THINK_S%.*} + n_modes * n_rates * (FRESH_PHASE_S + FRESH_LAST_SAMPLE_OVERRUN_S) )) ;;
+  *) echo "refusing: K6_SPAN must be drive or churn" >&2; exit 2 ;;
+esac
 DRIVER_EST_S=$(( ${DRIVE_S%.*} + DRIVER_LOGIN_BUDGET_S ))
 MEASURE_WAIT_S="${MEASURE_WAIT_S:-$(( (FRESH_EST_S > DRIVER_EST_S ? FRESH_EST_S : DRIVER_EST_S) + 600 ))}"
 # Every other bounded step (seconds). Each one is ENFORCED where it runs.
@@ -885,7 +884,6 @@ s_evaluate() {
   [[ "$LOAD_DRIVER" == "k6" ]] && k6args=(--k6-out "$OUT/k6" --browser-out "$OUT/browser"
                                           --browser-sessions "$BROWSER_SESSIONS")
   [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
-  [[ -n "$LATENCY_BASELINE" ]] && k6args+=(--latency-baseline "$LATENCY_BASELINE")
   if [[ "$DRY" == "1" ]]; then
     log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} ${k6args[*]:-}"; return 0
   fi
@@ -907,16 +905,10 @@ s_evaluate() {
     [[ -n "$r" ]] && log "WARNING: $r"
   done < <(python3 -c 'import json, sys; print("\n".join((json.load(open(sys.argv[1])).get("report") or {}).get("report_warnings") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
-  # run 15: the customer-latency gate's every cell (a verdict check)
-  while IFS= read -r r; do
-    [[ -n "$r" ]] && log "LATENCY: $r"
-  done < <(python3 -c 'import json, sys; print("\n".join("%s %s ratio=%s bar: %s" % (c["result"], c["check"], (c.get("value") or {}).get("ratio"), c["bar"]) for c in json.load(open(sys.argv[1]))["checks"] if c["check"].startswith("customer_latency.")))' \
-             "$OUT/verdict.json" 2>/dev/null || true)
-  return 0       # the loop's last [[ -n "" ]] is not the step's status
 }
 
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus ${TTL_MARGIN_S} s"
-log "customer-latency gate: ${LATENCY_BASELINE:-OFF (LATENCY_BASELINE empty)}"
+log "k6 customers: K6_SPAN=${K6_SPAN}, DRIVE_S=${DRIVE_S} s, composite burst at ${COMPOSITE_BURST_AT_S} s"
 step source    s_source
 step reap      s_reap
 step up        s_up

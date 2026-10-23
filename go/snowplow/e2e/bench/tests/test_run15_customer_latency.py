@@ -1,12 +1,17 @@
-"""Run 15 (#865): the customer-latency gate — k6's /call p95/p99 and req/s per
-phase against run 14, a VERDICT check (bench/custlat.py).
+"""Run 15 (#865, Diego 2026-10-23): PAIRED runs — 1.12.54 (A) and 1.12.55 (B)
+in parallel, k6's customers on through every churn step (K6_SPAN=churn),
+and the paired customer-latency verdict (bench/custlat.py pair, launched by
+run606_pair.sh).
 
 tests/fixtures/customer_latency_run14_every50.json.gz is RECORDED from run
 14's artifacts (1.12.54, bench adc2e702): every 50th k6 http_req_duration
 point in stream order, the k6 config and browser sessions, mem606's phase
 anchors and refresher counter, fresh606's churn records and kubectl top
-(pod names replaced). The tests write it back out in run606's $OUT layout
-and run `load606 evaluate` on it, as run606.sh does.
+(pod names replaced). Run 14's k6 stopped inside the first churn step; the
+paired-schedule runs below keep its calls and lay its six churn steps over
+k6's span instead (_paired), the shape K6_SPAN=churn produces. The tests
+write a run out in run606's $OUT layout and run `load606 evaluate` on it, as
+run606.sh does.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import json
 import math
 import os
 import random
+import shutil
 import statistics
 import subprocess
 from datetime import UTC, datetime
@@ -32,14 +38,30 @@ FIX = Path(__file__).resolve().parent / "fixtures"
 BENCH = Path(__file__).resolve().parents[1]
 with gzip.open(FIX / "customer_latency_run14_every50.json.gz", "rt") as fh:
     R14 = json.load(fh)
-COMMITTED = BENCH / "customer_latency_baseline_run14.json"
+REPLICA = custlat.load_replica(str(BENCH / "customer_latency_replica_runs12_13.json"))
+DIG_A, DIG_B = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+
+
+def _paired(doc=R14):
+    """Run 14 on the paired schedule: its six churn steps, in order, laid
+    evenly over k6's span (the last ends 30 s before k6's last call)."""
+    d = copy.deepcopy(doc)
+    t0 = d["t0"] + d["calls"][0][0]
+    t1 = d["t0"] + max(off for off, _ in d["calls"]) - 30
+    step = (t1 - t0) / len(d["churns"])
+    for i, c in enumerate(d["churns"]):
+        c["t0"], c["t1"] = t0 + i * step, t0 + (i + 1) * step
+    return d
+
+
+P14 = _paired()
 
 
 def _iso(t: float) -> str:
     return datetime.fromtimestamp(t, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "123Z"
 
 
-def _write_run(d: Path, doc=R14, scale=lambda t, v: v, drop=lambda t: False, config=None) -> list[str]:
+def _write_run(d: Path, doc=P14, scale=lambda t, v: v, drop=lambda t: False, config=None) -> list[str]:
     """`doc` in run606's $OUT layout; `scale` rewrites a call's ms, `drop`
     removes calls (by epoch). Returns evaluate's input files."""
     (d / "k6").mkdir(parents=True)
@@ -60,169 +82,192 @@ def _write_run(d: Path, doc=R14, scale=lambda t, v: v, drop=lambda t: False, con
     return [str(d / n) for n in files]
 
 
-def _evaluate(d: Path, files, baseline: Path | None, capsys) -> dict:
-    args = ["evaluate", *files, "--k6-out", str(d / "k6"), "--browser-out", str(d / "browser"),
-            "--browser-sessions", "5", "--no-viewers"]
-    if baseline is not None:
-        args += ["--latency-baseline", str(baseline)]
+def _evaluate(d: Path, files, capsys, digest=DIG_A) -> dict:
     capsys.readouterr()
-    load606.main(args)
-    return json.loads(capsys.readouterr().out)
+    load606.main(["evaluate", *files, "--k6-out", str(d / "k6"), "--browser-out", str(d / "browser"),
+                  "--browser-sessions", "5", "--no-viewers", "--expect-digest", digest])
+    v = json.loads(capsys.readouterr().out)
+    # the fixture has no snowplow pods / image-digest gate records: the
+    # run's own validity is not what these tests judge
+    v["verdict"] = "FAIL"
+    return v
 
 
-def _baseline_of(d: Path, out: Path, name="run14") -> Path:
-    rep = custlat.report_from_dir(str(d))
-    out.write_text(json.dumps(custlat.derive_baseline(name, rep, {name: rep}, (rep, rep), {})))
-    return out
+def _run(tmp, name, capsys, digest=DIG_B, **kw) -> dict:
+    d = tmp / name
+    return _evaluate(d, _write_run(d, **kw), capsys, digest)
 
 
 @pytest.fixture(scope="module")
-def r14(tmp_path_factory):
-    d = tmp_path_factory.mktemp("run14")
+def va(tmp_path_factory):
+    d = tmp_path_factory.mktemp("a")
     files = _write_run(d)
-    return d, files, _baseline_of(d, d / "baseline.json")
+    args = ["evaluate", *files, "--k6-out", str(d / "k6"), "--browser-out", str(d / "browser"),
+            "--browser-sessions", "5", "--no-viewers", "--expect-digest", DIG_A]
+    p = subprocess.run(["python3", "-m", "bench.load606", *args], cwd=BENCH, capture_output=True,
+                       text=True, check=False)
+    v = json.loads(p.stdout)
+    v["verdict"] = "FAIL"
+    return v
 
 
-def _lat(v):
-    return [c for c in v["checks"] + v["validity"] if c["check"].startswith("customer_latency.")]
+def _pair(va, vb, **kw):
+    return custlat.pair(va, vb, replica=kw.pop("replica", REPLICA), **kw)
 
 
-def test_run14_against_itself_passes_and_keeps_its_verdict(r14, capsys):
-    d, files, base = r14
-    plain = _evaluate(d, files, None, capsys)
-    gated = _evaluate(d, files, base, capsys)
-    cells = [c for c in gated["checks"] if c["check"].startswith("customer_latency.vs_run14[")]
-    assert len(cells) == 9 and {c["result"] for c in cells} == {"PASS"}
-    assert {c["value"]["ratio"] for c in cells} == {1.0}
-    assert gated["verdict"] == plain["verdict"]
-    assert gated["invalid_reasons"] == plain["invalid_reasons"]
-    # apart from the new rows, the verdict document is unchanged
-    strip = copy.deepcopy(gated)
-    strip["checks"] = [c for c in gated["checks"] if c not in _lat(gated)]
-    strip["validity"] = [c for c in gated["validity"] if c not in _lat(gated)]
-    assert strip == plain
-    assert _lat(plain) == []                    # no baseline: no gate, report only
-    assert [(c["check"], c["result"]) for c in gated["validity"] if c in _lat(gated)] == \
-        [("customer_latency.schedule_matches_run14", "PASS")]
+def _cells(p):
+    return {c["check"]: c for c in p["checks"]}
 
 
-def test_report_phases_refresher_and_cpu(r14, capsys):
-    d, files, _ = r14
-    rep = _evaluate(d, files, None, capsys)["report"]["customer_latency"]
-    st = rep["stats"]["phases"]
-    assert set(st) == {"storm", "burst", "rest"}
-    assert sum(p["n"] for p in st.values()) == len(R14["calls"]) == rep["stats"]["calls"]
-    # run 14's windows: the CPU plan (storm 600 s, burst 900 - 60 .. 900 + 240 s from the anchor)
-    assert st["burst"]["seconds"] == 300.0
-    assert st["storm"]["p95_ms"] > 10 * st["rest"]["p95_ms"]           # the login storm
-    for p in st.values():
-        assert p["p99_ms"] > p["p95_ms"]
-        assert p["req_s"] == round(p["n"] / p["seconds"], 2)
-    assert rep["refresher_completions"]["status"] == "present"
-    assert rep["refresher_completions"]["by_phase"]["rest"]["per_s"] > 0
-    # run 14's churn steps after k6 stopped carry no calls but do have refresher work
-    assert set(rep["stats"]["by_run_phase"]) == {"storm", "burst", "churn:list_dep@1"}
-    assert "churn:list_dep_status@50" in rep["refresher_completions"]["by_run_phase"]
-    assert rep["snowplow_cpu"]["by_phase"]["storm"]["samples"] > 0
-    assert rep["schedule"]["browser_sessions"] == 5
-    assert rep["schedule"]["churn"][0] == ["list_dep@1", 1.0]
+def _gate_phases(v):
+    return [p for p, s in v["report"]["customer_latency"]["phases"].items() if s["n"]]
 
 
-def test_a_slower_run_fails_just_past_the_spread(r14, tmp_path, capsys):
-    """Every call of the storm k times slower: FAIL just past the storm's
-    tolerance, PASS just inside it; the other phases untouched."""
-    _, _, base = r14
-    b = json.loads(base.read_text())["phases"]["storm"]
-    wins = custlat.windows(R14["mem"], R14["churns"])
-    tol = (b["p95_ms"]["tolerance"], b["p99_ms"]["tolerance"])
+def test_the_paired_schedule_puts_customers_in_every_churn_step(va):
+    r = va["report"]["customer_latency"]
+    ph = r["phases"]
+    assert {"storm", "burst"} <= set(ph)
+    churn = [p for p in ph if p.startswith("churn:") and ph[p]["n"]]
+    assert len(churn) >= 4, list(ph)             # storm / burst take the rest
+    for s in ph.values():
+        assert s["p99_ms"] > s["p95_ms"]
+        assert s["req_s"] == round(s["n"] / s["seconds"], 2)
+    assert sum(s["n"] for s in ph.values()) == len(P14["calls"]) == r["calls"]
+    # refresher completions / CPU per churn step, while customers were on
+    rc = r["refresher_completions"]["by_phase"]
+    assert all(rc[p]["with_customers"]["seconds"] > 0 for p in churn)
+    cpu = r["snowplow_cpu"]["by_phase"]
+    assert all(cpu[p]["with_customers"]["samples"] > 0 for p in churn)
+    assert r["schedule"]["churn"][0] == ["list_dep@1", 1.0] and len(r["schedule"]["churn"]) == 6
+
+
+def test_a_against_itself_passes(va):
+    p = _pair(va, copy.deepcopy(va) | {"report": dict(va["report"], image_digest={"expected": DIG_B})},
+              expect_a=DIG_A, expect_b=DIG_B)
+    assert p["verdict"] == "PASS", p["invalid_reasons"]
+    assert len(p["checks"]) == 3 * len(_gate_phases(va)) == p["method"]["cells"]
+    assert {c["value"]["ratio"] for c in p["checks"]} == {1.0}
+    assert p["method"]["z"] == round(NormalDist().inv_cdf(1 - 0.05 / p["method"]["cells"]), 4)
+
+
+def test_b_slower_in_one_churn_step_fails_just_past_its_spread(va, tmp_path, capsys):
+    wins = [tuple(w) for w in va["report"]["customer_latency"]["windows"]]
+    step = next(p for p in _gate_phases(va) if p.startswith("churn:"))
+    base = _pair(va, va)
+    tol = [float(_cells(base)[f"customer_latency.pair[{step}].{m}"]["bar"].split()[2]) for m in ("p95_ms", "p99_ms")]
     for k, want in ((max(tol) * 1.02, "FAIL"), (min(tol) * 0.98, "PASS")):
-        d = tmp_path / f"slow{k}"
-        v = _evaluate(d, _write_run(d, scale=lambda t, ms, k=k: ms * k if custlat._phase(t, wins) == "storm"
-                                    else ms), base, capsys)
-        res = {c["check"]: c["result"] for c in v["checks"] if c["check"].startswith("customer_latency.")}
-        assert res.pop("customer_latency.vs_run14[storm].p95_ms") == want, k
-        assert res.pop("customer_latency.vs_run14[storm].p99_ms") == want, k
-        assert set(res.values()) == {"PASS"}             # req/s: same calls, same seconds
-        if want == "FAIL":
-            assert v["verdict"] in ("FAIL", "INVALID")
+        vb = _run(tmp_path, f"slow{k}", capsys,
+                  scale=lambda t, ms, k=k: ms * k if custlat._phase(t, wins) == step else ms)
+        p = _pair(va, vb, expect_a=DIG_A, expect_b=DIG_B)
+        res = {c: x["result"] for c, x in _cells(p).items()}
+        assert res.pop(f"customer_latency.pair[{step}].p95_ms") == want, k
+        assert res.pop(f"customer_latency.pair[{step}].p99_ms") == want, k
+        assert set(res.values()) == {"PASS"}
+        assert p["verdict"] == ("FAIL" if want == "FAIL" else "PASS"), p["invalid_reasons"]
 
 
-def test_fewer_calls_fail_req_s_only_below_the_floor(r14, tmp_path, capsys):
-    _, _, base = r14
-    b = json.loads(base.read_text())
-    floor = 1 / b["phases"]["rest"]["req_s"]["tolerance"]
-    wins = custlat.windows(R14["mem"], R14["churns"])
-    rest = [(R14["t0"] + off) for off, _ in R14["calls"]
-            if custlat._phase(R14["t0"] + off, wins) == "rest"]
+def test_b_with_fewer_calls_fails_req_s_only_below_the_floor(va, tmp_path, capsys):
+    wins = [tuple(w) for w in va["report"]["customer_latency"]["windows"]]
+    step = [p for p in _gate_phases(va) if p.startswith("churn:")][-1]
+    floor = float(_cells(_pair(va, va))[f"customer_latency.pair[{step}].req_s"]["bar"].split()[2])
+    ts = [P14["t0"] + off for off, _ in P14["calls"] if custlat._phase(P14["t0"] + off, wins) == step]
     for share, want in ((floor - 0.05, "FAIL"), (min(1.0, floor + 0.05), "PASS")):
-        # keep `share` of the rest phase's calls, evenly over its time
-        gone = {t for i, t in enumerate(rest) if math.floor((i + 1) * share) == math.floor(i * share)}
-        d = tmp_path / f"drop{share}"
-        v = _evaluate(d, _write_run(d, drop=lambda t, gone=gone: t in gone), base, capsys)
-        c = next(c for c in v["checks"] if c["check"] == "customer_latency.vs_run14[rest].req_s")
+        gone = {t for i, t in enumerate(ts) if math.floor((i + 1) * share) == math.floor(i * share)}
+        vb = _run(tmp_path, f"drop{share}", capsys, drop=lambda t, gone=gone: t in gone)
+        c = _cells(_pair(va, vb))[f"customer_latency.pair[{step}].req_s"]
         assert c["result"] == want, (share, c)
 
 
-def test_a_different_schedule_is_invalid(r14, tmp_path, capsys):
-    _, _, base = r14
-    d = tmp_path / "sched"
-    v = _evaluate(d, _write_run(d, config=dict(R14["config"], thinkS=30)), base, capsys)
-    c = next(c for c in v["validity"] if c["check"] == "customer_latency.schedule_matches_run14")
-    assert c["result"] == "FAIL" and "k6" in c["value"]
-    assert v["verdict"] == "INVALID" and any("schedule_matches_run14" in r for r in v["invalid_reasons"])
+def test_b_own_spread_never_sets_the_bar(va):
+    vb = copy.deepcopy(va)
+    for s in vb["report"]["customer_latency"]["phases"].values():
+        s["half_sd"] = {m: 5.0 for m in s["half_sd"]}
+    assert [c["bar"] for c in _pair(va, vb)["checks"]] == [c["bar"] for c in _pair(va, va)["checks"]]
+    wide = copy.deepcopy(va)
+    for s in wide["report"]["customer_latency"]["phases"].values():
+        s["half_sd"] = {m: 2 * x for m, x in s["half_sd"].items()}
+    assert [c["bar"] for c in _pair(wide, va)["checks"]] != [c["bar"] for c in _pair(va, va)["checks"]]
 
 
-def test_a_phase_without_calls_is_invalid(r14, tmp_path, capsys):
-    _, _, base = r14
-    wins = custlat.windows(R14["mem"], R14["churns"])
-    d = tmp_path / "noburst"
-    v = _evaluate(d, _write_run(d, drop=lambda t: custlat._phase(t, wins) == "burst"), base, capsys)
-    c = next(c for c in v["validity"] if c["check"] == "customer_latency.vs_run14[burst].measured")
-    assert c["result"] == "FAIL" and v["verdict"] == "INVALID"
+def test_the_tolerance_is_the_method():
+    def rep(sd, p95=100.0):
+        ph = {"n": 10, "p95_ms": p95, "p99_ms": 200.0, "req_s": 50.0,
+              "half_sd": {"p95_ms": sd, "p99_ms": sd, "req_s": sd}}
+        return {"verdict": "FAIL", "report": {"image_digest": {"expected": DIG_A}, "customer_latency": {
+            "phases": {"storm": dict(ph), "churn:list_dep@10": dict(ph)}, "k6_span": [0, 100],
+            "windows": [["storm", float("-inf"), 10], ["churn:list_dep@10", 10, 90]], "schedule": {}}}}
+    a = rep(0.05)
+    b = copy.deepcopy(a)
+    b["report"]["image_digest"]["expected"] = DIG_B
+    p = custlat.pair(a, b, replica={"phases": {"storm": {"p95_ms": 1.9}}})
+    z = NormalDist().inv_cdf(1 - 0.05 / 6)
+    w = math.exp(z * math.sqrt(2) * 0.05)
+    within = round(w, 4)
+    bars = {c["check"]: c["bar"].split()[2] for c in p["checks"]}
+    assert bars["customer_latency.pair[storm].p95_ms"] == "1.9"                 # replica above within
+    assert bars["customer_latency.pair[storm].p99_ms"] == str(within)          # no replica for it
+    assert bars["customer_latency.pair[churn:list_dep@10].p95_ms"] == str(within)
+    assert bars["customer_latency.pair[storm].req_s"] == str(round(1 / w, 4))
+    assert p["verdict"] == "PASS" and p["method"]["cells"] == 6
 
 
-def test_a_baseline_without_k6_is_invalid():
-    b = json.loads(COMMITTED.read_text())
-    v = load606.evaluate([], [], [], latency_baseline=b)
-    assert v["verdict"] == "INVALID"
-    assert any(r.startswith("customer_latency.k6:") for r in v["invalid_reasons"])
+@pytest.mark.parametrize("breaks, check", [
+    (lambda a, b: b["report"]["customer_latency"]["schedule"]["k6"].update(thinkS=30), "schedules_match"),
+    (lambda a, b: b["report"]["customer_latency"]["schedule"]["churn"].pop(), "schedules_match"),
+    (lambda a, b: b["report"]["image_digest"].update(expected=DIG_A), "images"),
+    (lambda a, b: b.update(verdict="INVALID"), "runs_valid"),
+    (lambda a, b: a.update(verdict="INVALID"), "runs_valid"),
+    (lambda a, b: b["report"].pop("customer_latency"), "k6_reports"),
+    (lambda a, b: b["report"]["customer_latency"].update(k6_span=[0.0, 1.0]), "customers_through_churn[b]"),
+    (lambda a, b: b["report"]["customer_latency"]["phases"].pop("burst"), "measured[burst]"),
+    (lambda a, b: a["report"]["customer_latency"]["phases"]["burst"]["half_sd"].update(p95_ms=None),
+     "spread[burst].p95_ms"),
+])
+def test_a_pair_that_cannot_be_compared_is_invalid(va, breaks, check):
+    a = copy.deepcopy(va)
+    b = copy.deepcopy(va)
+    b["report"]["image_digest"] = {"expected": DIG_B}
+    breaks(a, b)
+    p = _pair(a, b)
+    assert p["verdict"] == "INVALID"
+    assert [c["check"] for c in p["validity"] if c["result"] == "FAIL"] == [f"customer_latency.pair.{check}"]
 
 
-def test_the_committed_baseline_follows_its_method():
-    """customer_latency_baseline_run14.json (custlat derive on runs 12/13/14):
-    every tolerance is the method's, from the numbers the file records."""
-    b = custlat.load_baseline(str(COMMITTED))
-    m = b["method"]
-    assert b["baseline_run"] == "run14" and m["cells"] == 9
-    assert m["z"] == round(NormalDist().inv_cdf(1 - m["family_alpha"] / m["cells"]), 4)
-    assert b["provenance"]["run14"]["role"] == ["baseline", "spread"]
-    assert b["provenance"]["run12"]["role"] == ["spread", "replica"]
-    assert b["provenance"]["run13"]["role"] == ["replica"]
-    for p, cells in b["phases"].items():
-        for name, c in cells.items():
-            within = math.exp(m["z"] * math.sqrt(2) * max(c["within_sd"].values()))
-            assert abs(c["within_bound"] - within) < 2e-3 * within, (p, name)
-            assert c["tolerance"] == max(c["within_bound"], c["replica_ratio"], 1.0), (p, name)
-            assert c["baseline"] == b["baseline_stats"][p][name]
-    assert b["schedule"]["k6"] == {k: R14["config"][k] for k in custlat.SCHEDULE_KEYS}
+def test_the_launch_digests_are_the_runs(va):
+    b = copy.deepcopy(va)
+    b["report"]["image_digest"] = {"expected": DIG_B}
+    assert _pair(va, b, expect_a=DIG_A, expect_b=DIG_B)["verdict"] == "PASS"
+    assert _pair(va, b, expect_a=DIG_B, expect_b=DIG_A)["verdict"] == "INVALID"
 
 
-def test_derive_takes_the_larger_spread():
-    def rep(p95, sd):
-        ph = {"n": 1, "p95_ms": p95, "p99_ms": None, "req_s": None,
-              "half_sd": {"p95_ms": sd, "p99_ms": None, "req_s": None}}
-        return {"stats": {"phases": {p: dict(ph) for p in custlat.PHASES}}, "schedule": {}}
-    z = NormalDist().inv_cdf(1 - 0.05 / 3)
-    b = custlat.derive_baseline("x", rep(100, 0.1), {"a": rep(100, 0.1), "b": rep(100, 0.05)},
-                                (rep(100, 0), rep(150, 0)), {})
-    c = b["phases"]["storm"]["p95_ms"]
-    assert b["method"]["cells"] == 3                     # p99/req_s None: not gated
-    assert c["within_bound"] == round(math.exp(z * math.sqrt(2) * 0.1), 4)
-    assert c["replica_ratio"] == 1.5 and c["tolerance"] == 1.5 and c["set_by"] == "replica"
-    b = custlat.derive_baseline("x", rep(100, 0.1), {"a": rep(100, 0.2)}, (rep(110, 0), rep(100, 0)), {})
-    c = b["phases"]["storm"]["p95_ms"]
-    assert c["tolerance"] == round(math.exp(z * math.sqrt(2) * 0.2), 4) and c["set_by"] == "within"
-    assert c["replica_ratio"] == 1.1                     # the ratio's size, either direction
+def test_run14_itself_is_not_a_paired_run(tmp_path, capsys):
+    """Run 14's k6 stopped inside the first churn step: as either side of a
+    pair it is INVALID — its later steps had no customers."""
+    v = _run(tmp_path, "r14", capsys, digest=DIG_A, doc=R14)
+    b = copy.deepcopy(v)
+    b["report"]["image_digest"] = {"expected": DIG_B}
+    p = _pair(v, b)
+    assert p["verdict"] == "INVALID"
+    assert {c["check"] for c in p["validity"] if c["result"] == "FAIL"} == {
+        "customer_latency.pair.customers_through_churn[a]", "customer_latency.pair.customers_through_churn[b]"}
+
+
+def test_pair_cli_missing_verdict_is_invalid(va, tmp_path):
+    (tmp_path / "a.json").write_text(json.dumps(va))
+    p = subprocess.run(["python3", "-m", "bench.custlat", "pair", "--a", str(tmp_path / "a.json"),
+                        "--b", str(tmp_path / "nope.json")], cwd=BENCH, capture_output=True, text=True,
+                       check=False)
+    assert p.returncode == 3 and json.loads(p.stdout)["verdict"] == "INVALID"
+
+
+def test_the_committed_replica_is_runs_12_and_13():
+    assert set(REPLICA["phases"]) == {"storm", "burst", "churn:list_dep@1"}
+    assert [x["dir"] for x in REPLICA["provenance"]] == ["snowplow-bench-run12-662515cb",
+                                                         "snowplow-bench-run13-662515cb"]
+    assert all(r >= 1.0 for ph in REPLICA["phases"].values() for r in ph.values())
+    a = {"phases": {"storm": {"n": 1, "p95_ms": 110.0, "p99_ms": 100.0, "req_s": 0}}}
+    b = {"phases": {"storm": {"n": 1, "p95_ms": 100.0, "p99_ms": 125.0, "req_s": 0}}}
+    assert custlat.replica_ratios(a, b, [])["phases"] == {"storm": {"p95_ms": 1.1, "p99_ms": 1.25}}
 
 
 def test_half_sd_keeps_the_time_profile():
@@ -230,6 +275,7 @@ def test_half_sd_keeps_the_time_profile():
     ramp = [([float(10 * (k // 2) + 1)] * 50, 10.0) for k in range(40)]
     assert custlat.half_sd(ramp, "p95_ms") == 0.0
     assert custlat.half_sd(ramp, "req_s") == 0.0
+
     # iid calls: the estimate from ONE run is the spread of many runs' p95
     def run(seed):
         rnd = random.Random(seed)
@@ -243,9 +289,9 @@ def test_half_sd_keeps_the_time_profile():
 
 def test_seconds_split_by_precedence():
     wins = [("storm", float("-inf"), 100.0), ("burst", 90.0, 150.0)]
-    assert custlat._seconds(80, 120, wins) == {"storm": 20.0, "burst": 20.0, "rest": 0.0}
-    assert custlat._seconds(140, 160, wins) == {"storm": 0.0, "burst": 10.0, "rest": 10.0}
-    assert custlat._phase(95, wins) == "storm" and custlat._phase(150, wins) == "rest"
+    assert custlat._seconds(80, 120, wins) == {"storm": 20.0, "burst": 20.0, "steady": 0.0}
+    assert custlat._seconds(140, 160, wins) == {"storm": 0.0, "burst": 10.0, "steady": 10.0}
+    assert custlat._phase(95, wins) == "storm" and custlat._phase(150, wins) == "steady"
 
 
 def test_refresher_restart_and_cpu_pods_sum():
@@ -254,14 +300,16 @@ def test_refresher_restart_and_cpu_pods_sum():
            {"kind": "mem", "t": 20, "num_gc": 1, "extra": {custlat.REFRESHER_KEY: 4}},
            {"kind": "mem", "t": 40, "num_gc": 2, "extra": {custlat.REFRESHER_KEY: 10}}]   # after k6
     r = custlat.refresher_per_phase(mem, [], [0, 20])
-    assert r["restarts"] == 1 and r["by_phase"]["rest"] == {"completed": 24, "seconds": 20.0, "per_s": 1.2}
-    assert r["by_run_phase"]["steady"] == {"completed": 30, "seconds": 40.0, "per_s": 0.75}
+    assert r["restarts"] == 1
+    assert r["by_phase"]["steady"] == {"with_customers": {"completed": 24, "seconds": 20.0, "per_s": 1.2},
+                                       "whole_run": {"completed": 30, "seconds": 40.0, "per_s": 0.75}}
     assert custlat.refresher_per_phase([{"kind": "mem", "t": 0}], [], [0, 1])["status"] == \
         load606.REPORT_ABSENT
     tops = [{"kind": "top", "t": 5, "raw": "snowplow-a 300m 1Gi\nsnowplow-b 200m 900Mi"},
             {"kind": "top", "t": 50, "raw": "snowplow-a 999m 1Gi"}]
-    c = custlat.cpu_per_phase(tops, [], [0, 20])
-    assert c["by_phase"]["rest"] == {"samples": 1, "median_m": 500, "p90_m": 500, "max_m": 500}
+    c = custlat.cpu_per_phase(tops, [], [0, 20])["by_phase"]["steady"]
+    assert c["with_customers"] == {"samples": 1, "median_m": 500, "p90_m": 500, "max_m": 500}
+    assert c["whole_run"] == {"samples": 2, "median_m": 749.5, "p90_m": 949, "max_m": 999}
 
 
 def test_clicks_vs_open_schedule():
@@ -270,7 +318,7 @@ def test_clicks_vs_open_schedule():
     c = custlat.clicks_vs_schedule(o, [("storm", float("-inf"), 12.0)])
     # open schedule: user 0 at 10, 20, 30; user 1 at 15, 25 (35 is the end)
     assert c["storm"] == {"clicks": 1, "open_schedule": 1, "achieved_share": 1.0}
-    assert c["rest"] == {"clicks": 3, "open_schedule": 4, "achieved_share": 0.75}
+    assert c["steady"] == {"clicks": 3, "open_schedule": 4, "achieved_share": 0.75}
 
 
 def test_cli_evaluate_feeds_churn_records_to_the_phase_reports(tmp_path, capsys):
@@ -290,46 +338,206 @@ def test_cli_evaluate_feeds_churn_records_to_the_phase_reports(tmp_path, capsys)
         ["fresh_p95_ms[list_dep@10]"]
 
 
+# ─── run606.sh K6_SPAN ─────────────────────────────────────────────────────
+
 def _run606(env_extra):
     env = dict(os.environ, PYTHONPATH=str(BENCH), RUN_NAME="snowplow-bench-r15lat", INSTALLER_VERSION="0.3.422",
                SNOWPLOW_TAG="1.12.46", BENCH_606_DRY_RUN="1",
                EXPECTED_IMAGE_DIGEST="sha256:" + "0" * 64, **env_extra)
+    for k in [k for k, v in env.items() if v is None]:
+        env.pop(k)
     return subprocess.run(["bash", str(BENCH / "run606.sh")], env=env, capture_output=True,
                           text=True, timeout=120, check=False)
 
 
-def test_run606_refuses_a_latency_baseline_it_cannot_apply(tmp_path):
-    p = _run606({"LOAD_DRIVER": "load606", "LATENCY_BASELINE": str(COMMITTED), "HOME": str(tmp_path),
-                 "OUT": str(tmp_path / "o1")})
-    assert p.returncode == 2 and "LATENCY_BASELINE gates k6's calls" in p.stderr
-    bad = tmp_path / "bad.json"
-    bad.write_text("{}")
-    p = _run606({"LATENCY_BASELINE": str(bad), "HOME": str(tmp_path), "OUT": str(tmp_path / "o2")})
-    assert p.returncode == 2 and "is not a customer_latency_baseline/1 file" in p.stderr
-
-
-def test_run606_passes_the_baseline_to_evaluate(tmp_path):
-    """Off by default (small and kind runs keep their own schedules); run 15
-    sets LATENCY_BASELINE, and run.log says which way it went."""
-    p = _run606({"HOME": str(tmp_path), "OUT": str(tmp_path / "o"),
-                 "LATENCY_BASELINE": "customer_latency_baseline_run14.json"})
+def test_k6_span_churn_keeps_customers_on_through_every_step(tmp_path):
+    p = _run606({"HOME": str(tmp_path), "OUT": str(tmp_path / "o"), "K6_SPAN": "churn"})
     assert p.returncode == 0, p.stderr[-2000:]
     log = (tmp_path / "o" / "run.log").read_text()
-    ev = [ln for ln in log.splitlines() if "DRY: python3 -m bench.load606 evaluate" in ln]
-    assert len(ev) == 1 and "--latency-baseline customer_latency_baseline_run14.json" in ev[0], ev
-    assert "customer-latency gate: customer_latency_baseline_run14.json" in log
+    # THINK_S 60 + 2 modes x 3 rates x (60 x (30 + 5) x 1.25 + 60)
+    assert "driver 17070" in log                                  # DRIVE_S + the login budget
+    assert "K6_SPAN=churn, DRIVE_S=16170 s, composite burst at 900 s" in log   # the burst stays
     p = _run606({"HOME": str(tmp_path), "OUT": str(tmp_path / "o2")})
-    assert p.returncode == 0, p.stderr[-2000:]
     log = (tmp_path / "o2" / "run.log").read_text()
-    assert "--latency-baseline" not in log and "customer-latency gate: OFF" in log
+    assert p.returncode == 0 and "K6_SPAN=drive, DRIVE_S=1800 s, composite burst at 900 s" in log
 
 
-def test_run606_refuses_a_schedule_that_is_not_the_baselines(tmp_path):
-    p = _run606({"HOME": str(tmp_path), "OUT": str(tmp_path / "o"), "THINK_S": "30",
-                 "CHURN_RATES": "1 10", "LATENCY_BASELINE": str(COMMITTED)})
-    assert p.returncode == 2, p.stderr[-2000:]
-    assert "THINK_S=30 but run14 ran 60" in p.stderr
-    assert "FRESH_MODES x CHURN_RATES=" in p.stderr and "is not the latency baseline's" in p.stderr
-    assert not [ln for ln in p.stderr.splitlines() if ln.startswith(("USERS=", "DRIVE_S="))]
-    p = _run606({"HOME": str(tmp_path), "OUT": str(tmp_path / "o2"), "THINK_S": "30"})
-    assert "is not the latency baseline's" not in p.stderr
+@pytest.mark.parametrize("env, why", [
+    ({"K6_SPAN": "churn", "DRIVE_S": "3600"}, "K6_SPAN=churn derives DRIVE_S"),
+    ({"K6_SPAN": "churn", "LOAD_DRIVER": "load606"}, "K6_SPAN=churn keeps k6's customers on"),
+    ({"K6_SPAN": "always"}, "K6_SPAN must be drive or churn"),
+])
+def test_k6_span_refusals(tmp_path, env, why):
+    p = _run606({"HOME": str(tmp_path), "OUT": str(tmp_path / "o"), **env})
+    assert p.returncode == 2 and why in p.stderr, p.stderr[-1000:]
+
+
+# ─── run606_pair.sh ────────────────────────────────────────────────────────
+
+FAKE_RUN606 = r"""#!/usr/bin/env bash
+# a run606.sh stand-in: records its call; FAKE/<RUN_NAME>.{rc,sleep,verdict.json}
+echo "$RUN_NAME dry=${BENCH_606_DRY_RUN:-0} span=$K6_SPAN driver=$LOAD_DRIVER go=${BENCH_606_GO:-} tag=$SNOWPLOW_TAG digest=$EXPECTED_IMAGE_DIGEST" >> "$FAKE/calls"
+trap 'echo "$RUN_NAME terminated" >> "$FAKE/calls"; exit 143' TERM
+mkdir -p "$OUT"
+if [[ "${BENCH_606_DRY_RUN:-0}" == "1" ]]; then exit "$(cat "$FAKE/$RUN_NAME.dryrc" 2>/dev/null || echo 0)"; fi
+if [[ -f "$FAKE/$RUN_NAME.sleep" ]]; then sleep "$(cat "$FAKE/$RUN_NAME.sleep")" & wait $!; fi
+[[ -f "$FAKE/$RUN_NAME.verdict.json" ]] && cp "$FAKE/$RUN_NAME.verdict.json" "$OUT/verdict.json"
+exit "$(cat "$FAKE/$RUN_NAME.rc" 2>/dev/null || echo 0)"
+"""
+NA, NB = "snowplow-bench-r15a", "snowplow-bench-r15b"
+
+
+@pytest.fixture
+def pairbed(tmp_path):
+    """A git checkout holding the launcher, the replica file and a fake
+    run606.sh (the launcher runs its own directory's run606.sh)."""
+    repo = tmp_path / "bench"
+    repo.mkdir()
+    shutil.copy(BENCH / "run606_pair.sh", repo)
+    shutil.copy(BENCH / "customer_latency_replica_runs12_13.json", repo)
+    (repo / "run606.sh").write_text(FAKE_RUN606)
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    for c in (["init", "-q"], ["add", "."],
+              ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"]):
+        subprocess.run(["git", *c], cwd=repo, check=True, capture_output=True)
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("RUN_NAME", "SNOWPLOW_TAG", "EXPECTED_IMAGE_DIGEST", "BENCH_606_GO", "OUT",
+                        "DRIVE_S", "K6_SPAN", "LOAD_DRIVER", "BENCH_606_DRY_RUN")}
+    env.update(PYTHONPATH=str(BENCH), FAKE=str(fake), PAIR_OUT=str(tmp_path / "pair"),
+               OUT_A=str(tmp_path / "A"), OUT_B=str(tmp_path / "B"), PAIR_POLL_S="0.2",
+               RUN_NAME_A=NA, RUN_NAME_B=NB, SNOWPLOW_TAG_A="1.12.54", SNOWPLOW_TAG_B="1.12.55",
+               EXPECTED_IMAGE_DIGEST_A=DIG_A, EXPECTED_IMAGE_DIGEST_B=DIG_B,
+               BENCH_606_GO_A=f"{today}-{NA}", BENCH_606_GO_B=f"{today}-{NB}")
+    return repo, fake, env, tmp_path
+
+
+def _launch(repo, env, **over):
+    e = dict(env, **over)
+    for k in [k for k, v in e.items() if v is None]:
+        e.pop(k)
+    return subprocess.run(["bash", str(repo / "run606_pair.sh")], env=e, capture_output=True,
+                          text=True, timeout=120, check=False)
+
+
+def _calls(fake):
+    p = fake / "calls"
+    return p.read_text().splitlines() if p.exists() else []
+
+
+def test_pair_runs_both_after_both_dry_passes_and_writes_the_paired_verdict(pairbed, va):
+    repo, fake, env, tmp = pairbed
+    vb = copy.deepcopy(va)
+    vb["report"]["image_digest"] = {"expected": DIG_B}
+    (fake / f"{NA}.verdict.json").write_text(json.dumps(va))
+    (fake / f"{NB}.verdict.json").write_text(json.dumps(vb))
+    p = _launch(repo, env)
+    assert p.returncode == 0, p.stderr[-3000:]
+    calls = _calls(fake)
+    assert [c.split()[:2] for c in calls] == [[NA, "dry=1"], [NB, "dry=1"], [NA, "dry=0"], [NB, "dry=0"]] or \
+        [c.split()[:2] for c in calls] == [[NA, "dry=1"], [NB, "dry=1"], [NB, "dry=0"], [NA, "dry=0"]]
+    real = [c for c in calls if "dry=0" in c]
+    assert all("span=churn driver=k6" in c for c in calls)
+    assert any(f"go={env['BENCH_606_GO_A']} tag=1.12.54 digest={DIG_A}" in c for c in real)
+    assert any(f"go={env['BENCH_606_GO_B']} tag=1.12.55 digest={DIG_B}" in c for c in real)
+    v = json.loads((tmp / "pair" / "paired-verdict.json").read_text())
+    assert v["verdict"] == "PASS" and v["method"]["replica"] == REPLICA["provenance"]
+    pj = json.loads((tmp / "pair" / "pair.json").read_text())
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True,
+                         check=True).stdout.strip()
+    assert pj["bench_sha"] == sha and pj["a"]["digest"] == DIG_A and pj["b"]["tag"] == "1.12.55"
+    log = (tmp / "pair" / "pair.log").read_text()
+    assert "paired verdict exit=0" in log and "PASS customer_latency.pair[storm].p95_ms ratio=1.0" in log
+
+
+def test_pair_slower_b_exits_fail(pairbed, va):
+    repo, fake, env, tmp = pairbed
+    vb = copy.deepcopy(va)
+    vb["report"]["image_digest"] = {"expected": DIG_B}
+    vb["report"]["customer_latency"]["phases"]["storm"]["p95_ms"] *= 3
+    (fake / f"{NA}.verdict.json").write_text(json.dumps(va))
+    (fake / f"{NB}.verdict.json").write_text(json.dumps(vb))
+    p = _launch(repo, env)
+    assert p.returncode == 1, p.stderr[-3000:]
+    assert "FAIL customer_latency.pair[storm].p95_ms ratio=3.0" in (tmp / "pair" / "pair.log").read_text()
+
+
+def test_pair_a_run_on_another_image_is_invalid(pairbed, va):
+    repo, fake, env, tmp = pairbed
+    vb = copy.deepcopy(va)
+    vb["report"]["image_digest"] = {"expected": "sha256:" + "c" * 64}   # not the launched B
+    (fake / f"{NA}.verdict.json").write_text(json.dumps(va))
+    (fake / f"{NB}.verdict.json").write_text(json.dumps(vb))
+    p = _launch(repo, env)
+    assert p.returncode == 3, p.stderr[-3000:]
+    assert "INVALID: customer_latency.pair.images" in (tmp / "pair" / "pair.log").read_text()
+
+
+def test_a_failed_run_stops_the_other(pairbed, va):
+    repo, fake, env, tmp = pairbed
+    (fake / f"{NA}.rc").write_text("1")
+    (fake / f"{NB}.sleep").write_text("60")
+    p = _launch(repo, env)
+    assert p.returncode == 3, p.stderr[-3000:]
+    assert f"{NB} terminated" in _calls(fake)
+    log = (tmp / "pair" / "pair.log").read_text()
+    assert "run A failed: stopping run B" in log
+    assert "INVALID: customer_latency.pair.runs_valid" in log
+
+
+def test_a_refused_dry_pass_starts_nothing(pairbed):
+    repo, fake, env, _ = pairbed
+    (fake / f"{NB}.dryrc").write_text("2")
+    p = _launch(repo, env)
+    assert p.returncode == 2 and "run B's dry pass was refused" in p.stderr
+    assert not [c for c in _calls(fake) if "dry=0" in c]
+
+
+@pytest.mark.parametrize("over, why", [
+    ({"RUN_NAME_B": None}, "RUN_NAME_B is required"),
+    ({"RUN_NAME_B": NA}, "RUN_NAME_A and RUN_NAME_B are the same"),
+    ({"EXPECTED_IMAGE_DIGEST_B": DIG_A}, "the two digests are the same image"),
+    ({"RUN_NAME": NA}, "RUN_NAME is per run"),
+    ({"DRIVE_S": "3600"}, "DRIVE_S is derived by K6_SPAN=churn"),
+    ({"K6_SPAN": "drive"}, "a pair runs K6_SPAN=churn"),
+    ({"LOAD_DRIVER": "load606"}, "a pair compares k6's customers"),
+    ({"BENCH_606_GO_B": "20200101-x"}, "BENCH_606_GO_B must be"),
+    ({"OUT_B": "SAME"}, "OUT_A and OUT_B are the same directory"),
+])
+def test_pair_refusals_before_anything_runs(pairbed, over, why):
+    repo, fake, env, _ = pairbed
+    if over.get("OUT_B") == "SAME":
+        over = {"OUT_B": env["OUT_A"]}
+    p = _launch(repo, env, **over)
+    assert p.returncode == 2 and why in p.stderr, p.stderr[-1000:]
+    assert _calls(fake) == []
+
+
+def test_pair_refuses_an_uncommitted_bench(pairbed):
+    repo, _, env, _ = pairbed
+    (repo / "run606.sh").write_text(FAKE_RUN606 + "\n# edited\n")
+    p = _launch(repo, env)
+    assert p.returncode == 2 and "uncommitted changes under the bench" in p.stderr
+    p = _launch(repo, env, BENCH_606_DRY_RUN="1")                 # a dry pass may run on a working tree
+    assert p.returncode == 0 and "DRY: both runs would start now" in p.stderr
+
+
+def test_pair_dry_run_with_the_real_run606(tmp_path):
+    """Both real run606.sh dry passes (every refusal of each run) from this
+    checkout; nothing starts."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("RUN_NAME", "SNOWPLOW_TAG", "EXPECTED_IMAGE_DIGEST", "BENCH_606_GO", "OUT",
+                        "DRIVE_S", "K6_SPAN", "LOAD_DRIVER")}
+    env.update(PYTHONPATH=str(BENCH), HOME=str(tmp_path), PAIR_OUT=str(tmp_path / "pair"),
+               OUT_A=str(tmp_path / "A"), OUT_B=str(tmp_path / "B"), BENCH_606_DRY_RUN="1",
+               INSTALLER_VERSION="0.3.422", RUN_NAME_A=NA, RUN_NAME_B=NB,
+               SNOWPLOW_TAG_A="1.12.54", SNOWPLOW_TAG_B="1.12.55",
+               EXPECTED_IMAGE_DIGEST_A=DIG_A, EXPECTED_IMAGE_DIGEST_B=DIG_B)
+    p = subprocess.run(["bash", str(BENCH / "run606_pair.sh")], env=env, capture_output=True, text=True,
+                       timeout=300, check=False)
+    assert p.returncode == 0, p.stderr[-3000:]
+    for x in ("A", "B"):
+        log = (tmp_path / "pair" / f"dry-{x}" / "run.log").read_text()
+        assert "K6_SPAN=churn, DRIVE_S=16170 s" in log
+    assert "DRY: both runs would start now" in p.stderr

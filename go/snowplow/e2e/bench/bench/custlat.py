@@ -1,35 +1,37 @@
-"""Run 15's customer-latency gate (#606, #865): k6's customer calls (every
-request k6 sends is a portal /call of the SPA's widget tree, k6/navigate.js
-fetcher) per phase, against a committed baseline run, with a PASS/FAIL bar
-derived from run-to-run spread data.
+"""The paired customer-latency gate (#606, #865; Diego 2026-10-23): two runs
+of the same bench on the same schedule, in parallel on two temporary
+clusters — A (the baseline image) and B (the candidate) — and k6's customer
+calls (every request k6 sends is a portal /call of the SPA's widget tree,
+k6/navigate.js fetcher) compared per phase, B against A.
 
-Phases (by each call's completion time, the k6 point's time):
-  storm   the login storm window, burst  the composite deep-link burst
-          window (both load606.run_phases: the CPU-profile plan's windows)
-  rest    every other second k6 ran (between the storm and the burst, and
-          after the burst, whichever churn step fresh606 was in)
+Each run's verdict.json carries report["customer_latency"] (report(): per
+phase n, p95/p99 of http_req_duration, req/s and the half-sample spread of
+each; the schedule; refresher completions/s, snowplow CPU and route clicks
+against the open schedule per phase). `python3 -m bench.custlat pair` reads
+the two verdicts and writes the paired verdict (pair()).
 
-Per phase: n, p95/p99 of http_req_duration, req/s (calls per second of the
-phase while k6 ran). k6 is closed-loop (a click THINK_S after the page
-completed), so a slower snowplow shows as fewer req/s at the same schedule;
-the gate requires the run's schedule to be the baseline's (else INVALID), so
-achieved req/s against the baseline's IS achieved against the schedule.
+Phases are load606.run_phases' (by each call's completion time, the k6
+point's time): storm, burst, churn:<label> per fresh606 step, and steady
+(k6 still running, no churn). With run606's K6_SPAN=churn the customers stay
+on through every churn step; pair() makes a pair whose k6 stopped before the
+last step ended INVALID.
 
-The spread (derive_baseline; the numbers and their provenance live in the
-baseline file, never here):
-  within   each run's own sampling spread: paired half-samples of BLOCK_S
-           blocks — adjacent blocks (2k, 2k+1) go one to each half, so both
-           halves keep the phase's time profile (a storm is a ramp, not a
-           stationary series); sd(log full) = sd(log(A / B)) / 2. The spread
-           runs' largest sd stands for both the baseline's and the gated
-           run's (the gated run's own sd is never used: a noisier run would
-           loosen its own bar). Bound: exp(z * sqrt(2) * sd).
-  replica  the observed ratio between two runs of (nearly) the same code.
-  tolerance = max(within bound, replica ratio); z = the one-sided normal
-  quantile at FAMILY_ALPHA / cells, so the whole gate false-FAILs unchanged
-  code at most FAMILY_ALPHA of the time under the within-run model.
-Latency PASSes when run / baseline <= tolerance; req/s when run / baseline
->= 1 / tolerance.
+Per cell (phase x p95 / p99 / req/s), B / A against a tolerance:
+  within   A's own sampling spread: paired half-samples of BLOCK_S blocks —
+           adjacent blocks (2k, 2k+1) go one to each half, so both halves
+           keep the phase's time profile (a storm is a ramp, not a
+           stationary series); sd(log full) = sd(log(A1 / A2)) / 2. A's sd
+           stands for both runs of the ratio: exp(z * sqrt(2) * sd). B's own
+           sd is never used (a noisier candidate would loosen its own bar).
+  replica  the observed ratio between two earlier runs of (nearly) the same
+           code, for the phases they share with this schedule (a committed
+           file, `custlat replica`): the run-level spread sampling cannot see.
+  tolerance = max(within, replica); z = the one-sided normal quantile at
+  FAMILY_ALPHA / cells, so the whole gate false-FAILs unchanged code at most
+  FAMILY_ALPHA of the time under the within-run model.
+Latency PASSes when B / A <= tolerance; req/s (k6 is closed-loop: a click
+THINK_S after the page completed, so a slower snowplow shows as fewer req/s
+on the same schedule) when B / A >= 1 / tolerance.
 """
 
 from __future__ import annotations
@@ -49,15 +51,15 @@ from statistics import NormalDist
 
 from bench import k6eval, load606
 
-PHASES = ("storm", "burst", "rest")
 METRICS = ("p95_ms", "p99_ms", "req_s")
 LOWER_IS_WORSE = ("req_s",)
 BLOCK_S = 10.0
 HALF_SAMPLES = 400
 HALF_SEED = 606
 FAMILY_ALPHA = 0.05
+STEADY = "steady"
 REFRESHER_KEY = "snowplow_refresher_completed_total"
-# the schedule a gated run must share with its baseline (k6-summary config)
+# the schedule the two runs of a pair must share (k6-summary config)
 SCHEDULE_KEYS = ("users", "navUsers", "burstUsers", "thinkS", "durationS", "burstAtS",
                  "navRate", "routes")
 _TOP_CPU = re.compile(r"(\S+)\s+(\d+)m\s+\d+\w*")
@@ -73,16 +75,15 @@ def _pct(xs: list[float], p: float) -> float | None:
     return v[lo] + (v[hi] - v[lo]) * (k - lo)
 
 
-def windows(mem: list[dict], fresh: list[dict] | None) -> list[tuple[str, float, float]]:
-    """The storm and burst windows (precedence order, as run_phases)."""
-    return [w for w in load606.run_phases(mem, fresh) if w[0] in ("storm", "burst")]
+def _names(wins) -> list[str]:
+    return [n for n, _, _ in wins] + [STEADY]
 
 
 def _seconds(a: float, b: float, wins: list[tuple[str, float, float]]) -> dict[str, float]:
     """[a, b) split by phase: each window takes what the earlier ones left;
-    "rest" is what none took."""
+    "steady" is what none took."""
     left = [(a, b)]
-    out = dict.fromkeys(PHASES, 0.0)
+    out = dict.fromkeys(_names(wins), 0.0)
     for name, w0, w1 in wins:
         nxt = []
         for x, y in left:
@@ -93,12 +94,12 @@ def _seconds(a: float, b: float, wins: list[tuple[str, float, float]]) -> dict[s
             else:
                 nxt.append((x, y))
         left = nxt
-    out["rest"] += sum(y - x for x, y in left)
+    out[STEADY] += sum(y - x for x, y in left)
     return out
 
 
 def _phase(t: float, wins: list[tuple[str, float, float]]) -> str:
-    return next((n for n, w0, w1 in wins if w0 <= t < w1), "rest")
+    return next((n for n, w0, w1 in wins if w0 <= t < w1), STEADY)
 
 
 def calls(o: dict | None) -> list[tuple[float, float]]:
@@ -114,21 +115,21 @@ def blocks(cs: list[tuple[float, float]], wins) -> dict[str, list[tuple[list[flo
     """Per phase, in time order: one (call ms list, seconds in the phase) per
     BLOCK_S block of k6's span (from its first call to its last) that the
     phase holds any of."""
+    out: dict[str, list] = {p: [] for p in _names(wins)}
     if not cs:
-        return {p: [] for p in PHASES}
+        return out
     t0 = min(t for t, _ in cs)
     t1 = max(t for t, _ in cs)
     nb = int((t1 - t0) // BLOCK_S) + 1
     vals: dict[tuple[str, int], list[float]] = {}
     for t, v in cs:
         vals.setdefault((_phase(t, wins), int((t - t0) // BLOCK_S)), []).append(v)
-    out: dict[str, list] = {p: [] for p in PHASES}
     for k in range(nb):
         a = t0 + k * BLOCK_S
         secs = _seconds(a, min(a + BLOCK_S, t1), wins)
-        for p in PHASES:
+        for p, bl in out.items():
             if secs[p] > 0 or (p, k) in vals:
-                out[p].append((vals.get((p, k), []), secs[p]))
+                bl.append((vals.get((p, k), []), secs[p]))
     return out
 
 
@@ -160,35 +161,24 @@ def half_sd(bl: list[tuple[list[float], float]], metric: str,
     return statistics.pstdev(logs) / 2 if len(logs) >= n // 2 else None
 
 
-def phase_stats(o: dict | None, mem: list[dict], fresh: list[dict] | None) -> dict:
-    """Per phase: n, seconds, p95/p99 ms, req/s and their half-sample sd;
-    and the same (no sd) by load606.run_phases label, for context."""
-    wins = windows(mem, fresh)
-    cs = calls(o)
-    bl = blocks(cs, wins)
+def phase_stats(cs: list[tuple[float, float]], wins) -> dict:
+    """Per phase with any k6 second: n, seconds, p95/p99 ms, req/s and their
+    half-sample sd."""
     out = {}
-    for p in PHASES:
-        b = bl[p]
+    for p, b in blocks(cs, wins).items():
+        if not b:
+            continue
         out[p] = {"n": sum(len(v) for v, _ in b), "seconds": round(sum(s for _, s in b), 1),
                   **{m: (round(x, 2) if (x := _stat(b, m)) is not None else None) for m in METRICS},
                   "half_sd": {m: (round(s, 4) if (s := half_sd(b, m)) is not None else None)
                               for m in METRICS}}
-    rp = load606.run_phases(mem, fresh)
-    by: dict[str, list[float]] = {}
-    for t, v in cs:
-        by.setdefault(load606._phase_of(t, rp), []).append(v)
-    return {"block_s": BLOCK_S, "calls": len(cs),
-            "k6_span": [min(t for t, _ in cs), max(t for t, _ in cs)] if cs else None,
-            "windows": [[n, w0, w1] for n, w0, w1 in wins],
-            "phases": out,
-            "by_run_phase": {k: {"n": len(v), "p95_ms": round(_pct(v, 95), 2),
-                                 "p99_ms": round(_pct(v, 99), 2)} for k, v in by.items()}}
+    return out
 
 
 def schedule(o: dict | None, browser: dict | None, mem: list[dict],
              churns: list[dict] | None) -> dict:
-    """What the gated run must share with its baseline: k6's config, the
-    CPU-profile plan (the phase windows), the browser sessions and the churn
+    """What the two runs of a pair must share: k6's config, the CPU-profile
+    plan (the storm and burst windows), the browser sessions and the churn
     steps (label, target rate) in order."""
     cfg = ((o or {}).get("summary") or {}).get("config") or {}
     plan = next((r.get("cpu_plan") for r in mem if r.get("kind") == "mem_start" and r.get("cpu_plan")),
@@ -200,61 +190,52 @@ def schedule(o: dict | None, browser: dict | None, mem: list[dict],
                       if c.get("kind") == "churn"]}
 
 
-def refresher_per_phase(mem: list[dict], wins, span, fresh=None) -> dict:
-    """Refresher completions/s per gate phase while k6 ran, and per
-    run_phases label over the whole run (pair deltas by the later sample's
-    time; a restart's pair counts the later value as-is)."""
+def refresher_per_phase(mem: list[dict], wins, span) -> dict:
+    """Refresher completions/s per phase, while k6 ran (`with_customers`)
+    and over the whole run (pair deltas by the later sample's time; a
+    restart's pair counts the later value as-is)."""
     rows = sorted((m for m in mem if m.get("kind") == "mem"
                    and load606._num((m.get("extra") or {}).get(REFRESHER_KEY)) is not None),
                   key=lambda m: m["t"])
     if not rows:
         return {"status": load606.REPORT_ABSENT,
                 "note": f"no mem sample carried {REFRESHER_KEY}: missing, not zero"}
-    rp = load606.run_phases(mem, fresh)
-    gate: dict[str, list[float]] = {p: [0.0, 0.0] for p in PHASES}
-    whole: dict[str, list[float]] = {}
+    acc: dict[str, dict[str, list[float]]] = {}
     restarts = 0
     for a, b in itertools.pairwise(rows):
         ca = {"c": load606._num(a["extra"][REFRESHER_KEY])}
         cb = {"c": load606._num(b["extra"][REFRESHER_KEY])}
         d, r = load606._deltas(a, b, ca, cb)
         restarts += r
-        dt = b["t"] - a["t"]
-        w = whole.setdefault(load606._phase_of(b["t"], rp), [0.0, 0.0])
-        w[0] += d["c"]
-        w[1] += dt
-        if span and span[0] <= b["t"] <= span[1]:
-            g = gate[_phase(b["t"], wins)]
-            g[0] += d["c"]
-            g[1] += dt
+        p = acc.setdefault(_phase(b["t"], wins), {"whole_run": [0.0, 0.0], "with_customers": [0.0, 0.0]})
+        for k in ("whole_run",) + (("with_customers",) if span and span[0] <= b["t"] <= span[1] else ()):
+            p[k][0] += d["c"]
+            p[k][1] += b["t"] - a["t"]
 
     def rate(x):
         return {"completed": int(x[0]), "seconds": round(x[1], 1),
                 "per_s": round(x[0] / x[1], 3) if x[1] else None}
     return {"status": "present", "restarts": restarts,
-            "by_phase": {p: rate(gate[p]) for p in PHASES},
-            "by_run_phase": {k: rate(v) for k, v in whole.items()}}
+            "by_phase": {p: {k: rate(v) for k, v in x.items()} for p, x in acc.items()}}
 
 
-def cpu_per_phase(tops: list[dict], wins, span, mem=None, fresh=None) -> dict:
+def cpu_per_phase(tops: list[dict], wins, span) -> dict:
     """snowplow's CPU (kubectl top, millicores summed over its pods per
-    sample) per gate phase while k6 ran, and per run_phases label."""
-    rp = load606.run_phases(mem or [], fresh)
-    gate: dict[str, list[int]] = {p: [] for p in PHASES}
-    whole: dict[str, list[int]] = {}
+    sample) per phase, while k6 ran and over the whole run."""
+    acc: dict[str, dict[str, list[int]]] = {}
     for t in tops:
         ms = [int(m.group(2)) for m in _TOP_CPU.finditer(t.get("raw") or "")]
         if not ms or t.get("t") is None:
             continue
-        whole.setdefault(load606._phase_of(t["t"], rp), []).append(sum(ms))
+        p = acc.setdefault(_phase(t["t"], wins), {"whole_run": [], "with_customers": []})
+        p["whole_run"].append(sum(ms))
         if span and span[0] <= t["t"] <= span[1]:
-            gate[_phase(t["t"], wins)].append(sum(ms))
+            p["with_customers"].append(sum(ms))
 
     def st(v):
         return ({"samples": len(v), "median_m": statistics.median(v), "p90_m": round(_pct(v, 90)),
                  "max_m": max(v)} if v else {"samples": 0})
-    return {"by_phase": {p: st(gate[p]) for p in PHASES},
-            "by_run_phase": {k: st(v) for k, v in whole.items()}}
+    return {"by_phase": {p: {k: st(v) for k, v in x.items()} for p, x in acc.items()}}
 
 
 def clicks_vs_schedule(o: dict | None, wins) -> dict | None:
@@ -267,133 +248,148 @@ def clicks_vs_schedule(o: dict | None, wins) -> dict | None:
     if not arr or not cfg.get("thinkS") or not cfg.get("durationS"):
         return None
     end = min(arr) + cfg["durationS"]
-    sched = dict.fromkeys(PHASES, 0)
+    sched: dict[str, int] = {}
     for a in arr:
         v = 1
         while a + v * cfg["thinkS"] < end:
-            sched[_phase(a + v * cfg["thinkS"], wins)] += 1
+            p = _phase(a + v * cfg["thinkS"], wins)
+            sched[p] = sched.get(p, 0) + 1
             v += 1
-    done = dict.fromkeys(PHASES, 0)
+    done: dict[str, int] = {}
     for t in ts.get("clicks") or []:
         if t is not None:
-            done[_phase(t, wins)] += 1
-    return {p: {"clicks": done[p], "open_schedule": sched[p],
-                "achieved_share": round(done[p] / sched[p], 4) if sched[p] else None}
-            for p in PHASES}
+            done[_phase(t, wins)] = done.get(_phase(t, wins), 0) + 1
+    return {p: {"clicks": done.get(p, 0), "open_schedule": sched.get(p, 0),
+                "achieved_share": round(done.get(p, 0) / sched[p], 4) if sched.get(p) else None}
+            for p in _names(wins) if p in sched or p in done}
 
 
 def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[dict] | None,
            churns: list[dict] | None, tops: list[dict]) -> dict:
-    src = list(fresh or []) + list(churns or [])
-    st = phase_stats(k6o, mem, src)
-    wins = windows(mem, src)
-    span = st["k6_span"]
-    return {"stats": st, "schedule": schedule(k6o, browser, mem, churns),
+    """report["customer_latency"] of one run's verdict.json."""
+    wins = load606.run_phases(mem, list(fresh or []) + list(churns or []))
+    cs = calls(k6o)
+    span = [min(t for t, _ in cs), max(t for t, _ in cs)] if cs else None
+    return {"block_s": BLOCK_S, "calls": len(cs), "k6_span": span,
+            "windows": [[n, w0, w1] for n, w0, w1 in wins],
+            "phases": phase_stats(cs, wins),
+            "schedule": schedule(k6o, browser, mem, churns),
             "clicks_vs_open_schedule": clicks_vs_schedule(k6o, wins),
-            "refresher_completions": refresher_per_phase(mem, wins, span, src),
-            "snowplow_cpu": cpu_per_phase(tops, wins, span, mem, src)}
+            "refresher_completions": refresher_per_phase(mem, wins, span),
+            "snowplow_cpu": cpu_per_phase(tops, wins, span)}
 
 
-def gate(rep: dict, baseline: dict) -> tuple[list[dict], list[dict]]:
-    """(checks, validity): one check per baseline cell; INVALID when the
-    run's schedule is not the baseline's or a baseline phase has no calls."""
-    name = baseline["baseline_run"]
-    validity = []
-    want, have = baseline["schedule"], rep["schedule"]
-    diff = sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
-    validity.append({"check": f"customer_latency.schedule_matches_{name}",
-                     "value": {k: {"run": have.get(k), name: want.get(k)} for k in diff} or "same",
-                     "bar": f"the k6 config, CPU-profile plan, browser sessions and churn steps of {name}",
-                     "result": "FAIL" if diff else "PASS",
-                     **({"why": f"{', '.join(diff)} differ from {name}: the latency comparison "
-                                f"would measure the schedule, not snowplow"} if diff else {})})
-    checks = []
-    for p, cells in baseline["phases"].items():
-        got = rep["stats"]["phases"].get(p) or {}
-        if not got.get("n"):
-            validity.append({"check": f"customer_latency.vs_{name}[{p}].measured", "value": 0,
-                             "bar": "> 0 k6 calls", "result": "FAIL",
-                             "why": f"no k6 call completed in the {p} phase: the gate cannot be measured"})
+def _validity(name, ok, value, bar, why):
+    return {"check": f"customer_latency.pair.{name}", "value": value, "bar": bar,
+            "result": "PASS" if ok else "FAIL", **({} if ok else {"why": why})}
+
+
+def pair(va: dict, vb: dict, *, replica: dict | None = None,
+         expect_a: str | None = None, expect_b: str | None = None) -> dict:
+    """The paired verdict: B's customer latency per phase against A's (module
+    doc). INVALID when the pair cannot be compared; FAIL when a cell is past
+    its tolerance."""
+    va, vb = va or {}, vb or {}
+    ra = (va.get("report") or {}).get("customer_latency")
+    rb = (vb.get("report") or {}).get("customer_latency")
+    dig = [((v.get("report") or {}).get("image_digest") or {}).get("expected") for v in (va, vb)]
+    validity = [
+        _validity("runs_valid", va.get("verdict") not in (None, "INVALID") and vb.get("verdict") not in
+                  (None, "INVALID"), {"a": va.get("verdict"), "b": vb.get("verdict")},
+                  "neither run INVALID", "a run whose own measurement is INVALID cannot be compared"),
+        _validity("k6_reports", ra is not None and rb is not None,
+                  {"a": ra is not None, "b": rb is not None}, "both verdicts carry customer_latency",
+                  "a run without k6 has no customer calls"),
+        _validity("images", None not in dig and dig[0] != dig[1]
+                  and (expect_a is None or dig[0] == expect_a) and (expect_b is None or dig[1] == expect_b),
+                  {"a": dig[0], "b": dig[1]}, "two different images, each the one its run was launched with",
+                  "the pair is not the two images it was launched to compare"),
+    ]
+    out = {"kind": "customer_latency_pair", "checks": [], "validity": validity,
+           "method": {"block_s": BLOCK_S, "half_samples": HALF_SAMPLES, "half_seed": HALF_SEED,
+                      "family_alpha": FAMILY_ALPHA,
+                      "tolerance": "max(exp(z * sqrt(2) * A's half-sample sd), replica ratio); "
+                                   "latency: B / A <= tolerance; req_s: B / A >= 1 / tolerance",
+                      "replica": (replica or {}).get("provenance")}}
+    if ra is not None and rb is not None:
+        diff = sorted(k for k in set(ra["schedule"]) | set(rb["schedule"])
+                      if ra["schedule"].get(k) != rb["schedule"].get(k))
+        validity.append(_validity("schedules_match", not diff,
+                                  {k: {"a": ra["schedule"].get(k), "b": rb["schedule"].get(k)}
+                                   for k in diff} or "same",
+                                  "the k6 config, CPU-profile plan, browser sessions and churn steps",
+                                  f"{', '.join(diff)} differ: the comparison would measure the schedule"))
+        for name, r in (("a", ra), ("b", rb)):
+            last = max((w1 for n, _, w1 in r["windows"] if n.startswith("churn:")), default=None)
+            span = r.get("k6_span")
+            validity.append(_validity(
+                f"customers_through_churn[{name}]", last is not None and span is not None and span[1] >= last,
+                {"k6_last_call": span[1] if span else None, "last_churn_end": last},
+                "k6's last call after the last churn step ended",
+                "the customers stopped before the churn did: a churn step has no customer latency"))
+        cells = [(p, m) for p, s in ra["phases"].items() if s["n"] for m in METRICS]
+        z = NormalDist().inv_cdf(1 - FAMILY_ALPHA / len(cells)) if cells else None
+        out["method"]["cells"], out["method"]["z"] = len(cells), round(z, 4) if z else None
+        for p in dict.fromkeys(p for p, _ in cells):
+            sa, sb = ra["phases"][p], rb["phases"].get(p) or {}
+            if not sb.get("n"):
+                validity.append(_validity(f"measured[{p}]", False, 0, "> 0 k6 calls in B",
+                                          f"B has no k6 call in {p}: the cell cannot be compared"))
+                continue
+            for m in METRICS:
+                sd, a, b = sa["half_sd"][m], sa[m], sb.get(m)
+                if sd is None or not a or b is None:
+                    validity.append(_validity(f"spread[{p}].{m}", False, {"a": a, "b": b, "a_half_sd": sd},
+                                              "A's value and half-sample sd",
+                                              f"{p} {m}: no tolerance can be derived"))
+                    continue
+                within = math.exp(z * math.sqrt(2) * sd)
+                rep = (((replica or {}).get("phases") or {}).get(p) or {}).get(m)
+                tol = max(within, rep or 1.0)
+                lower = m in LOWER_IS_WORSE
+                bar = round(1 / tol, 4) if lower else round(tol, 4)
+                ratio = round(b / a, 4)
+                ok = ratio >= bar if lower else ratio <= bar
+                out["checks"].append({
+                    "check": f"customer_latency.pair[{p}].{m}",
+                    "value": {"a": a, "b": b, "ratio": ratio},
+                    "bar": f"ratio {'>=' if lower else '<='} {bar} (within {round(within, 4)} from A's "
+                           f"sd {sd}; replica {rep})",
+                    "result": "PASS" if ok else "FAIL",
+                    **({} if ok else {"why": f"{p} {m}: B is {ratio}x A, beyond the spread ({bar})"})})
+    if not out["checks"] and all(c["result"] == "PASS" for c in validity):
+        validity.append(_validity("cells", False, 0, ">= 1 cell", "A has no phase with k6 calls"))
+    out["verdict"] = ("INVALID" if any(c["result"] == "FAIL" for c in validity) else
+                      "FAIL" if any(c["result"] == "FAIL" for c in out["checks"]) else "PASS")
+    out["invalid_reasons"] = [f"{c['check']}: {c['why']}" for c in validity if c["result"] == "FAIL"]
+    # beside the verdict: both runs' per-phase reports, side by side
+    out["phases"] = {p: {"a": (ra or {}).get("phases", {}).get(p), "b": (rb or {}).get("phases", {}).get(p)}
+                     for p in dict.fromkeys(list((ra or {}).get("phases", {})) +
+                                            list((rb or {}).get("phases", {})))}
+    for k in ("refresher_completions", "snowplow_cpu", "clicks_vs_open_schedule"):
+        out[k] = {"a": (ra or {}).get(k), "b": (rb or {}).get(k)}
+    return out
+
+
+def replica_ratios(r1: dict, r2: dict, provenance: dict) -> dict:
+    """The replica file: per phase both reports measured, |log| ratio per
+    metric (either direction: the spread's size)."""
+    phases = {}
+    for p, s1 in r1["phases"].items():
+        s2 = r2["phases"].get(p)
+        if not (s1.get("n") and s2 and s2.get("n")):
             continue
-        for m, c in cells.items():
-            v, b, tol = got.get(m), c["baseline"], c["tolerance"]
-            ratio = round(v / b, 4) if v is not None and b else None
-            lower = m in LOWER_IS_WORSE
-            bar = round(1 / tol, 4) if lower else tol
-            ok = ratio is not None and (ratio >= bar if lower else ratio <= bar)
-            checks.append({"check": f"customer_latency.vs_{name}[{p}].{m}",
-                           "value": {"run": v, name: b, "ratio": ratio},
-                           "bar": f"ratio {'>=' if lower else '<='} {bar} "
-                                  f"(run-to-run spread, set by {c['set_by']})",
-                           "result": "PASS" if ok else "FAIL",
-                           **({} if ok else {"why": f"{p} {m} is {ratio}x {name}'s, beyond the "
-                                                    f"spread ({bar})"})})
-    return checks, validity
+        phases[p] = {m: round(math.exp(abs(math.log(s1[m] / s2[m]))), 4)
+                     for m in METRICS if s1.get(m) and s2.get(m)}
+    return {"schema": "customer_latency_replica/1", "provenance": provenance, "phases": phases}
 
 
-def derive_baseline(name: str, base: dict, spread: dict[str, dict],
-                    replica: tuple[dict, dict], provenance: dict) -> dict:
-    """The baseline file: base's per-phase stats and each cell's tolerance
-    (module doc). `spread` = {run: report} whose half-sample sd stand for
-    the within-run spread; `replica` = two reports of (nearly) the same code."""
-    cells = [(p, m) for p in PHASES for m in METRICS
-             if base["stats"]["phases"][p]["n"] and base["stats"]["phases"][p][m]]
-    if not cells:
-        raise ValueError(f"{name}: no phase with k6 calls, nothing to gate")
-    z = NormalDist().inv_cdf(1 - FAMILY_ALPHA / len(cells))
-    phases: dict[str, dict] = {}
-    for p, m in cells:
-        sds = {r: rep["stats"]["phases"][p]["half_sd"][m] for r, rep in spread.items()}
-        known = [s for s in sds.values() if s is not None]
-        within = math.exp(z * math.sqrt(2) * max(known)) if known else None
-        a, b = (rep["stats"]["phases"][p][m] for rep in replica)
-        rep_ratio = math.exp(abs(math.log(a / b))) if a and b else None
-        tol = max(x for x in (within, rep_ratio, 1.0) if x is not None)
-        phases.setdefault(p, {})[m] = {
-            "baseline": base["stats"]["phases"][p][m],
-            "tolerance": round(tol, 4),
-            "set_by": ("replica" if rep_ratio is not None and rep_ratio >= (within or 0) else "within"),
-            "within_bound": round(within, 4) if within else None,
-            "within_sd": sds,
-            "replica_ratio": round(rep_ratio, 4) if rep_ratio else None}
-    return {"schema": "customer_latency_baseline/1", "baseline_run": name,
-            "method": {"block_s": BLOCK_S, "half_samples": HALF_SAMPLES, "half_seed": HALF_SEED,
-                       "family_alpha": FAMILY_ALPHA, "cells": len(cells), "z": round(z, 4),
-                       "tolerance": "max(exp(z * sqrt(2) * max within_sd), replica_ratio); "
-                                    "latency: run / baseline <= tolerance; req_s: run / baseline "
-                                    ">= 1 / tolerance"},
-            "schedule": base["schedule"], "provenance": provenance,
-            "baseline_stats": base["stats"]["phases"], "phases": phases}
-
-
-def load_baseline(path: str) -> dict:
+def load_replica(path: str) -> dict:
     with open(path) as fh:
-        b = json.load(fh)
-    if b.get("schema") != "customer_latency_baseline/1":
-        raise ValueError(f"{path}: not a customer_latency_baseline/1 file")
-    return b
-
-
-def env_mismatches(baseline: dict, *, users: int, burst_users: int, think_s: int, drive_s: int,
-                   burst_at_s: int, browser_sessions: int, modes: list[str],
-                   rates: list[str]) -> list[str]:
-    """Before any cloud call: the run606 knobs whose values would make the
-    run's schedule differ from the baseline's (gate() would call the run
-    INVALID only after it was paid for). navUsers / navRate / routes are
-    derived at run time and stay with gate()."""
-    s = baseline["schedule"]
-    want = {"USERS": (users, s["k6"].get("users")),
-            "COMPOSITE_BURST_USERS": (burst_users, s["k6"].get("burstUsers")),
-            "THINK_S": (think_s, s["k6"].get("thinkS")),
-            "DRIVE_S": (drive_s, s["k6"].get("durationS")),
-            "COMPOSITE_BURST_AT_S": (burst_at_s, s["k6"].get("burstAtS")),
-            "BROWSER_SESSIONS": (browser_sessions, s.get("browser_sessions")),
-            # fresh_phases: modes outer, rates inner
-            "FRESH_MODES x CHURN_RATES": (
-                [f"list_dep{'' if m == 'annotation' else '_' + m}@{r}" for m in modes for r in rates],
-                [label for label, _ in s.get("churn") or []])}
-    return [f"{k}={got} but {baseline['baseline_run']} ran {base}" for k, (got, base) in want.items()
-            if got != base]
+        r = json.load(fh)
+    if r.get("schema") != "customer_latency_replica/1":
+        raise ValueError(f"{path}: not a customer_latency_replica/1 file")
+    return r
 
 
 def report_from_dir(d: str) -> dict:
@@ -437,41 +433,33 @@ def _provenance(d: str) -> dict:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="custlat")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    dv = sub.add_parser("derive", help="write a baseline file from collected run dirs")
-    dv.add_argument("--name", required=True, help="the baseline's name in check names (e.g. run14)")
-    dv.add_argument("--baseline", required=True, help="the baseline run's dir")
-    dv.add_argument("--spread", action="append", required=True, metavar="NAME=DIR",
-                    help="a run whose within-run spread is used (repeat)")
-    dv.add_argument("--replica", nargs=2, required=True, metavar=("NAME=DIR", "NAME=DIR"),
-                    help="two runs of (nearly) the same code")
-    ce = sub.add_parser("check-env", help="exit 2 unless run606's knobs give the baseline's schedule")
-    ce.add_argument("baseline")
-    for f in ("users", "burst-users", "think-s", "drive-s", "burst-at-s", "browser-sessions"):
-        ce.add_argument(f"--{f}", type=int, required=True)
-    ce.add_argument("--modes", required=True, help="FRESH_MODES (space-separated)")
-    ce.add_argument("--rates", required=True, help="CHURN_RATES (space-separated)")
+    pr = sub.add_parser("pair", help="the paired verdict of two runs' verdict.json (A baseline, B candidate)")
+    pr.add_argument("--a", required=True, help="A's verdict.json (the baseline image)")
+    pr.add_argument("--b", required=True, help="B's verdict.json (the candidate image)")
+    pr.add_argument("--replica", default=None, help="a customer_latency_replica/1 file")
+    pr.add_argument("--expect-a", default=None, help="A's EXPECTED_IMAGE_DIGEST")
+    pr.add_argument("--expect-b", default=None, help="B's EXPECTED_IMAGE_DIGEST")
+    rp = sub.add_parser("replica", help="the replica ratios of two collected run dirs")
+    rp.add_argument("dirs", nargs=2)
     a = ap.parse_args(argv)
-    if a.cmd == "check-env":
-        bad = env_mismatches(load_baseline(a.baseline), users=a.users, burst_users=a.burst_users,
-                             think_s=a.think_s, drive_s=a.drive_s, burst_at_s=a.burst_at_s,
-                             browser_sessions=a.browser_sessions, modes=a.modes.split(),
-                             rates=a.rates.split())
-        for b in bad:
-            print(b, file=sys.stderr)
-        return 2 if bad else 0
-    named = {}
-    for s in [f"{a.name}={a.baseline}"] + a.spread + a.replica:
-        n, _, d = s.partition("=")
-        named.setdefault(n, (d, report_from_dir(d)))
-    spread = {n.partition("=")[0]: named[n.partition("=")[0]][1] for n in a.spread}
-    rn = [s.partition("=")[0] for s in a.replica]
-    out = derive_baseline(a.name, named[a.name][1], spread, (named[rn[0]][1], named[rn[1]][1]),
-                          {n: _provenance(d) | {"role": [r for r, ok in (
-                              ("baseline", n == a.name), ("spread", n in spread),
-                              ("replica", n in rn)) if ok]} for n, (d, _) in named.items()})
-    json.dump(out, sys.stdout, indent=1, sort_keys=True)
+    if a.cmd == "replica":
+        out = replica_ratios(report_from_dir(a.dirs[0]), report_from_dir(a.dirs[1]),
+                             [_provenance(d) for d in a.dirs])
+        json.dump(out, sys.stdout, indent=1, sort_keys=True)
+        print()
+        return 0
+
+    def load(p):
+        try:
+            with open(p) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None          # pair() makes it INVALID, with the reason
+    out = pair(load(a.a), load(a.b), replica=load_replica(a.replica) if a.replica else None,
+               expect_a=a.expect_a, expect_b=a.expect_b)
+    json.dump(out, sys.stdout, indent=1, default=str)
     print()
-    return 0
+    return {"PASS": 0, "FAIL": 1, "INVALID": 3}[out["verdict"]]
 
 
 if __name__ == "__main__":
