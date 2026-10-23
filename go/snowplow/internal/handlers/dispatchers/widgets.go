@@ -404,7 +404,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		log.Error("unable to resolve widget", slog.Any("err", err))
 		// #853 — the CR exists; a dependency's 404 is answered 424.
-		encodeWidgetResolveError(wri, err)
+		encodeWidgetResolveError(ctx, wri, err)
 		return
 	}
 

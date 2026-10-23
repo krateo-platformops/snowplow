@@ -206,7 +206,7 @@ func TestIssue853_OtherDependencyCodesPassThrough(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			encodeWidgetResolveError(rec, fmt.Errorf("resolve apiRef x/y: %w", c.err))
+			encodeWidgetResolveError(context.Background(), rec, fmt.Errorf("resolve apiRef x/y: %w", c.err))
 			if rec.Code != c.want {
 				t.Fatalf("code=%d, want %d: %s", rec.Code, c.want, rec.Body.String())
 			}

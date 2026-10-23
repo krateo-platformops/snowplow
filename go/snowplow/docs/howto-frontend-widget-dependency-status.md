@@ -72,15 +72,34 @@ Content-Type: application/json
   "kind": "Status",
   "apiVersion": "v1",
   "status": "Failure",
-  "message": "resolve apiRef krateo-system/agent-formdef: ... stage \"crd\": customresourcedefinitions.apiextensions.k8s.io \"agents.kagent.dev\" not found",
+  "message": "restaction krateo-system/agent-formdef stage \"crd\" failed: customresourcedefinitions.apiextensions.k8s.io \"agents.kagent.dev\" not found",
   "reason": "FailedDependency",
   "code": 424
 }
 ```
 
-- `message` names the failing stage and the missing object. As before #853,
-  it carries only the request's own coordinates, never the caller's identity
-  (#709 A7).
+That `message` is the exact one the `/agents/new` shape produces; a test
+records it (`TestIssue853_424Body_IsAnIdentityFreeStatus_EndToEnd`).
+
+- **The status is exactly `424`**, and the body is always a k8s-style
+  `Status`: `kind`, `apiVersion`, `status: "Failure"`,
+  `reason: "FailedDependency"`, `code: 424` and a non-empty `message`.
+- **`message` is product copy.** The frontend's matching branch
+  (`fix/widget-424-dependency`) renders it verbatim, truncated to 300
+  characters, under the title "Data source unavailable". So snowplow
+  guarantees the following:
+  - It names the failing stage and the missing object, and only the
+    request's own coordinates. A stage failure's message is built from the
+    request, never from the upstream (#709 A7). An apiserver NotFound names
+    only the resource and the object.
+  - It never names an identity. A message that names a requester
+    (`User "…"`), a `<user>-clientconfig` Secret, or the caller's username
+    (or its DNS form) or groups is replaced by the fixed text
+    `A data source this widget reads is not available.` So is an empty
+    message. This holds whatever the upstream sent: a test stuffs the
+    upstream 404 with the caller's username, group, clientconfig Secret and
+    certificate CN, and asserts that none of them reaches the body.
+  - It carries no stack text. It is a single Status message.
 - No refresh headers (`X-Snowplow-Refresh-Key` / `X-Snowplow-Refresh-Class`)
   are set on any error answer, before or after #853.
 - The widget CR's own 404 is unchanged: `reason: "NotFound"`, `code: 404`.
@@ -107,6 +126,14 @@ Content-Type: application/json
 
    The rest of the page renders normally. The page is not blanked, even when the
    failing widget is a page-level widget: its slot shows the error card.
+5. `components/Autopilot/useAutopilotContext.ts` (`fetchErrorOf`, around line
+   519) also reads the failed fetch's `detail` and `status` into the page
+   context it hands the model. It is unaffected: it gets status `424` and
+   the same identity-free message.
+
+The frontend branch `fix/widget-424-dependency` (commit `ec2f302`) adds a calm,
+no-Retry state for 424, with this message as its subtitle. Whether it ships is
+the owner's call. Snowplow's contract above is the same either way.
 
 ## 4. Edge cases
 
@@ -116,8 +143,27 @@ Content-Type: application/json
 - **A refetch triggered by a refresh frame (#256).**
   - If the widget CR was deleted, it is still `404`, and `eventTriggered` still
     fails fast.
-  - If a dependency was deleted, it is now `424`, which also fails fast. No new
-    handling is needed.
+  - A deleted widget never reaches the dependency path. The CR read fails
+    first, so the resolve does not run, even when the widget's dependency is
+    missing too.
+  - A test pins this with a widget that is really deleted. It runs the real
+    CR read: informer miss, then the apiserver fallthrough, which answers 404.
+    It covers a healthy, cached widget and a widget whose dependency is
+    missing; in the second case the widget answers 424 before the delete and
+    404 after it.
+  - Two logic-only mutations each turn that test red: answering the CR read's
+    404 as 424, and routing it through the dependency encoder. Without that
+    guard, a bulk delete would silently go back to 4 requests per widget.
+  - If a dependency was deleted, the answer is now `424`, which also fails
+    fast. No new handling is needed.
+- **During a roll (mixed versions).** For about one roll's length, the same
+  widget can get `404` from an old pod and `424` from a new one.
+  - On a 404 the SPA retries for about 4.9 s and shows `WidgetNotFound`.
+  - On a 424 it shows the error state at once.
+  - So a widget with a missing dependency can flip from `WidgetNotFound` to
+    the 424 state within about 5 s, or the other way round on the next load.
+  - This is cosmetic and heals itself once every pod is new. No data is
+    wrong, and nothing is cached on either answer.
 - **A dependency answers 403.** This stays `403`, so the calm `WidgetForbidden`
   state is unchanged.
 - **A dependency answers 5xx or 429.** This stays the same code and is still

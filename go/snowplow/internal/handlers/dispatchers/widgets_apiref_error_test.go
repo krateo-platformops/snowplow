@@ -21,6 +21,7 @@
 package dispatchers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -37,7 +38,7 @@ import (
 // encodeWidgetResolveError, so the test calls production directly and
 // cannot drift from it.
 func runWidgetErrorBlock(wri http.ResponseWriter, err error) {
-	encodeWidgetResolveError(wri, err)
+	encodeWidgetResolveError(context.Background(), wri, err)
 }
 
 // makeApiRefForbidden builds the exact error shape `apiref.Resolve`
