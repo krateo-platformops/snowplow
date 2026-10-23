@@ -1,0 +1,407 @@
+{
+ "source": "recorded from snowplow's own code at main 525b4ddf6f0aacdc55820b30b5215a0fdb77374a: ListNarrowExpvar() and DirtyMarkAttributionExpvar(), the expvar funcs behind snowplow_deps_list_narrow (deps_expvar.go:80-84) and snowplow_deps_dirty_mark_attribution, before and after the G1 flow of internal/cache/list_narrow_shadow_765_test.go: 2 annotation-only UPDATEs x 2 narrowed cells = 4 would-avoid marks, 1 identical audit, 1 unaudited",
+ "before": {
+  "snowplow_deps_dirty_mark_attribution": {
+   "by_bucket": [
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "self",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "self",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "delete",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "delete",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_add",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_delete",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_delete",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "schema_relist",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "schema_relist",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "store_repair",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "store_repair",
+     "class": "list_dep",
+     "count": 0
+    }
+   ],
+   "by_entry_class": {
+    "apistage": 0,
+    "raFullList": 0,
+    "restactions": 0,
+    "unknown": 0,
+    "unregistered": 0,
+    "widgetContent": 0,
+    "widgets": 0
+   },
+   "by_gvr": {},
+   "events_total": 0,
+   "submit_source": {
+    "reconcile": 0,
+    "relist_bridge": 0,
+    "watch": 1
+   },
+   "unattributed": 0
+  },
+  "snowplow_deps_list_narrow": {
+   "audit": {
+    "changed": 0,
+    "identical": 0,
+    "no_prior": 0,
+    "unaudited": 0
+   },
+   "commit_verdicts": {
+    "all/jq_unprovable": 0,
+    "all/list_level_read": 0,
+    "all/not_informer_served": 0,
+    "all/parse": 0,
+    "all/query_unapplied": 0,
+    "all/reads_whole_item": 0,
+    "all/registry_full": 0,
+    "all/stage_error": 0,
+    "all/sticky_all": 0,
+    "narrowed/ok": 2
+   },
+   "eval_ns_total": 0,
+   "eval_transitions": 0,
+   "gate": {
+    "would_avoid_marks": 0,
+    "avoid_only_refreshes": 0,
+    "identical_audits": 0,
+    "would_change": 0,
+    "no_prior": 0,
+    "unaudited": 0,
+    "unaudited_share": 0
+   },
+   "interests": 1,
+   "kept_by_reason": {
+    "degraded": 0,
+    "interest_all": 0,
+    "interest_pending": 0,
+    "membership": 0,
+    "no_mask": 0,
+    "read_field": 0,
+    "registry_late": 0,
+    "undecided": 0
+   },
+   "list_dep_marks_total": 0,
+   "replays": [
+    {
+     "Outcome": "narrowed",
+     "Site": "memo",
+     "Count": 0
+    },
+    {
+     "Outcome": "narrowed",
+     "Site": "full_list",
+     "Count": 0
+    },
+    {
+     "Outcome": "all",
+     "Site": "memo",
+     "Count": 0
+    },
+    {
+     "Outcome": "all",
+     "Site": "full_list",
+     "Count": 0
+    },
+    {
+     "Outcome": "pending",
+     "Site": "memo",
+     "Count": 0
+    },
+    {
+     "Outcome": "pending",
+     "Site": "full_list",
+     "Count": 0
+    },
+    {
+     "Outcome": "absent",
+     "Site": "memo",
+     "Count": 0
+    },
+    {
+     "Outcome": "absent",
+     "Site": "full_list",
+     "Count": 0
+    }
+   ],
+   "would_avoid_total": 0,
+   "would_change_total": 0,
+   "would_mark_total": 0
+  }
+ },
+ "after": {
+  "snowplow_deps_dirty_mark_attribution": {
+   "by_bucket": [
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "list_dep",
+     "count": 4
+    },
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "self",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "self",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "delete",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "delete",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_add",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_delete",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_delete",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "schema_relist",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "schema_relist",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "store_repair",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "store_repair",
+     "class": "list_dep",
+     "count": 0
+    }
+   ],
+   "by_entry_class": {
+    "apistage": 0,
+    "raFullList": 0,
+    "restactions": 0,
+    "unknown": 2,
+    "unregistered": 0,
+    "widgetContent": 0,
+    "widgets": 2
+   },
+   "by_gvr": {
+    "widgets.templates.krateo.io/v1beta1, Resource=flexes": 4
+   },
+   "events_total": 2,
+   "submit_source": {
+    "reconcile": 0,
+    "relist_bridge": 0,
+    "watch": 3
+   },
+   "unattributed": 0
+  },
+  "snowplow_deps_list_narrow": {
+   "audit": {
+    "changed": 0,
+    "identical": 1,
+    "no_prior": 0,
+    "unaudited": 1
+   },
+   "commit_verdicts": {
+    "all/jq_unprovable": 0,
+    "all/list_level_read": 0,
+    "all/not_informer_served": 0,
+    "all/parse": 0,
+    "all/query_unapplied": 0,
+    "all/reads_whole_item": 0,
+    "all/registry_full": 0,
+    "all/stage_error": 0,
+    "all/sticky_all": 0,
+    "narrowed/ok": 2
+   },
+   "eval_ns_total": 136750,
+   "eval_transitions": 2,
+   "gate": {
+    "would_avoid_marks": 4,
+    "avoid_only_refreshes": 2,
+    "identical_audits": 1,
+    "would_change": 0,
+    "no_prior": 0,
+    "unaudited": 1,
+    "unaudited_share": 0.5
+   },
+   "interests": 1,
+   "kept_by_reason": {
+    "degraded": 0,
+    "interest_all": 0,
+    "interest_pending": 0,
+    "membership": 0,
+    "no_mask": 0,
+    "read_field": 0,
+    "registry_late": 0,
+    "undecided": 0
+   },
+   "list_dep_marks_total": 4,
+   "replays": [
+    {
+     "Outcome": "narrowed",
+     "Site": "memo",
+     "Count": 0
+    },
+    {
+     "Outcome": "narrowed",
+     "Site": "full_list",
+     "Count": 0
+    },
+    {
+     "Outcome": "all",
+     "Site": "memo",
+     "Count": 0
+    },
+    {
+     "Outcome": "all",
+     "Site": "full_list",
+     "Count": 0
+    },
+    {
+     "Outcome": "pending",
+     "Site": "memo",
+     "Count": 0
+    },
+    {
+     "Outcome": "pending",
+     "Site": "full_list",
+     "Count": 0
+    },
+    {
+     "Outcome": "absent",
+     "Site": "memo",
+     "Count": 0
+    },
+    {
+     "Outcome": "absent",
+     "Site": "full_list",
+     "Count": 0
+    }
+   ],
+   "would_avoid_total": 4,
+   "would_change_total": 0,
+   "would_mark_total": 0
+  }
+ }
+}

@@ -37,6 +37,7 @@ import base64
 import calendar
 import concurrent.futures
 import gzip
+import itertools
 import json
 import math
 import os
@@ -1895,6 +1896,167 @@ CPU_PROFILE_OVERHEAD_KIND = {
 }
 
 
+# ─── #765 option B shadow and content fills (run 14, report only) ──────────
+#
+# snowplow_deps_list_narrow (cache/deps_expvar.go:80-84, ListNarrowExpvar in
+# deps_list_interest.go): would_avoid_total (list_dep marks B would skip),
+# would_change_total (audited skips whose result DID change), audit
+# {identical, changed, no_prior, unaudited}, list_dep_marks_total (B's own
+# denominator). All cumulative: a phase's value is the sum of the deltas of
+# the sample pairs that END inside it, so phases need not be contiguous. A
+# counter that went backwards restarted from 0 (a snowplow restart: run 13
+# reset every series once): its delta is the new value, and the reset is
+# counted. No gate reads any of it.
+LIST_NARROW_KEY = "snowplow_deps_list_narrow"
+DIRTY_MARK_KEY = "snowplow_deps_dirty_mark_attribution"
+CONTENT_FILL_GVR_KEY = "snowplow_apistage_content_fill_by_gvr"
+CONTENT_FILL_BUCKET_S = 60
+
+
+def _list_dep_marks(attr) -> int | None:
+    """All list_dep marks in one dirty-mark attribution sample."""
+    if not isinstance(attr, dict):
+        return None
+    return sum(int(b.get("count") or 0) for b in attr.get("by_bucket") or []
+               if isinstance(b, dict) and b.get("class") == "list_dep")
+
+
+def _narrow_counters(v) -> dict | None:
+    if not isinstance(v, dict):
+        return None
+    audit = v.get("audit") if isinstance(v.get("audit"), dict) else {}
+    return {"would_avoid": _num(v.get("would_avoid_total")),
+            "would_change": _num(v.get("would_change_total")),
+            "identical_audits": _num(audit.get("identical")),
+            "list_narrow_list_dep_marks": _num(v.get("list_dep_marks_total"))}
+
+
+def run_phases(mem: list[dict], fresh: list[dict] | None) -> dict:
+    """Time windows by phase: storm (and burst) from the CPU-profile plan's
+    windows (cpu_profile_windows), churn = fresh606's samples (first start,
+    t - latency, to the last), steady = everything else. Earlier names win
+    where windows overlap: storm, burst, churn."""
+    win = cpu_profile_windows(mem)
+    out = {}
+    if win is not None:
+        out["storm"] = (float("-inf"), win["storm"]["t1"])
+        if win.get("burst"):
+            out["burst"] = (win["burst"]["t0"], win["burst"]["t1"])
+    fr = [f for f in fresh or [] if f.get("kind") == "fresh" and f.get("t") is not None]
+    if fr:
+        out["churn"] = (min(f["t"] - (f.get("latency_ms") or 0) / 1000 for f in fr),
+                        max(f["t"] for f in fr))
+    return out
+
+
+def _phase_of(t: float, phases: dict) -> str:
+    for name in ("storm", "burst", "churn"):
+        if name in phases and phases[name][0] <= t < phases[name][1]:
+            return name
+    return "steady"
+
+
+def list_narrow_report(mem: list[dict], fresh: list[dict] | None = None) -> dict | None:
+    """#765 B's shadow, per phase: would_avoid, would_change, identical
+    audits, and the would-avoid share of all list_dep marks (the dirty-mark
+    attribution's list_dep, the same per-sample cadence) and of B's own
+    list_dep denominator. None when no sample carried the key."""
+    rows = sorted((m for m in mem if m.get("kind") == "mem"
+                   and LIST_NARROW_KEY in (m.get("extra") or {})), key=lambda m: m.get("t") or 0)
+    if not rows:
+        return None
+    phases = run_phases(mem, fresh)
+    names = ["storm", "burst", "churn", "steady"]
+    tot = {p: {"would_avoid": 0, "would_change": 0, "identical_audits": 0,
+               "list_narrow_list_dep_marks": 0, "list_dep_marks": 0, "pairs": 0}
+           for p in names}
+    resets = 0
+
+    def step(x0, x1):
+        nonlocal resets
+        if x0 is None or x1 is None:
+            return None
+        if x1 < x0:                      # restarted from 0
+            resets += 1
+            return x1
+        return x1 - x0
+    for a, b in itertools.pairwise(rows):
+        ca, cb = _narrow_counters(a["extra"][LIST_NARROW_KEY]), _narrow_counters(b["extra"][LIST_NARROW_KEY])
+        if ca is None or cb is None:
+            continue
+        d = {k: step(ca[k], cb[k]) for k in ca}
+        d["list_dep_marks"] = step(*(_list_dep_marks((x.get("extra") or {}).get(DIRTY_MARK_KEY))
+                                     for x in (a, b)))
+        bucket = tot[_phase_of(b["t"], phases)]
+        bucket["pairs"] += 1
+        for k, v in d.items():
+            if v is not None:
+                bucket[k] += v
+
+    def share(n, den):
+        return round(n / den, 4) if den else None
+    by_phase = {}
+    for p in names:
+        b = tot[p]
+        if not b["pairs"] and p not in phases:
+            continue
+        by_phase[p] = dict(b, would_avoid_share_of_list_dep_marks=share(b["would_avoid"], b["list_dep_marks"]),
+                           would_avoid_share_of_list_narrow_marks=share(
+                               b["would_avoid"], b["list_narrow_list_dep_marks"]))
+    all_ = {k: sum(tot[p][k] for p in names) for k in tot["steady"]}
+    by_phase["all"] = dict(all_, would_avoid_share_of_list_dep_marks=share(
+        all_["would_avoid"], all_["list_dep_marks"]),
+        would_avoid_share_of_list_narrow_marks=share(all_["would_avoid"],
+                                                     all_["list_narrow_list_dep_marks"]))
+    last = rows[-1]["extra"][LIST_NARROW_KEY]
+    return {"by_phase": by_phase,
+            "phase_windows": {k: [None if v[0] == float("-inf") else v[0], v[1]]
+                              for k, v in phases.items()},
+            "samples": len(rows), "counter_resets": resets,
+            "gate_last": last.get("gate") if isinstance(last, dict) else None,
+            "note": "report only: no gate reads it (#765 option B is a shadow)"}
+
+
+def content_fill_report(mem: list[dict], bucket_s: float = CONTENT_FILL_BUCKET_S) -> dict | None:
+    """Per minute of the run, per GVR: content fills and their bytes (the
+    bytes the admission gate charges), from the cumulative
+    snowplow_apistage_content_fill_by_gvr. A minute lists only GVRs that
+    filled. Report only."""
+    rows = sorted((m for m in mem if m.get("kind") == "mem"
+                   and isinstance((m.get("extra") or {}).get(CONTENT_FILL_GVR_KEY), dict)),
+                  key=lambda m: m.get("t") or 0)
+    if not rows:
+        return None
+    t0 = rows[0]["t"]
+    minutes: dict[int, dict] = {}
+    total: dict[str, dict] = {}
+    resets = 0
+    for a, b in itertools.pairwise(rows):
+        ga, gb = a["extra"][CONTENT_FILL_GVR_KEY], b["extra"][CONTENT_FILL_GVR_KEY]
+        for gvr, cur in gb.items():
+            prev = ga.get(gvr) or {}
+            if not isinstance(cur, dict):
+                continue
+            f1, b1 = _num(cur.get("fills")) or 0, _num(cur.get("bytes")) or 0
+            df, db = f1 - (_num(prev.get("fills")) or 0), b1 - (_num(prev.get("bytes")) or 0)
+            if df < 0 or db < 0:         # a restart: the series began again at 0
+                resets += 1
+                df, db = f1, b1
+            if not (df or db):
+                continue
+            m = minutes.setdefault(int((b["t"] - t0) // bucket_s), {})
+            for into in (m.setdefault(gvr, {"fills": 0, "bytes": 0}),
+                         total.setdefault(gvr, {"fills": 0, "bytes": 0})):
+                into["fills"] += df
+                into["bytes"] += db
+    return {"bucket_s": bucket_s, "t0": t0,
+            "per_minute": [{"minute": k, "t": t0 + k * bucket_s, "by_gvr": v}
+                           for k, v in sorted(minutes.items())],
+            "total_by_gvr": dict(sorted(total.items(), key=lambda kv: -kv[1]["bytes"])),
+            "counter_resets": resets,
+            "note": "report only; bytes = the fills' bytes, which content-fill admission charges"}
+
+
 def profiling_report(mem: list[dict], navs: list[dict],
                      k6_loads: list[tuple[float, float, dict]] | None = None) -> dict | None:
     win = cpu_profile_windows(mem)
@@ -1975,6 +2137,7 @@ RUN8_VARS_PREFIXES = (
     "snowplow_apistage_stale_",           # PR-2b stale_to_push / overdue / debt
     "snowplow_refresher_",                # dirty_to_fresh windowed gauges + run-9 counters
     "snowplow_deps_dirty_mark_",          # run 9 (#765): marks per event
+    "snowplow_deps_list_narrow",          # run 14 (#765 B shadow): would_avoid / would_change
     "snowplow_resolved_cache",
     "snowplow_informer_dispatch_shape",
     "snowplow_build_info",
@@ -3007,6 +3170,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["snowplow_pod"] = snowplow_pods
     report["memory"] = memory_report(mem or [])
     report["key_rotation_report_only"] = rotation_report(mem or [])
+    report["list_narrow_shadow_report_only"] = list_narrow_report(mem or [], fresh)
+    report["content_fill_by_gvr_report_only"] = content_fill_report(mem or [])
     report["profiling"] = profiling_report(
         mem or [], navs,
         k6eval.k6_page_loads(k6.get("k6")) if k6 is not None else None)
