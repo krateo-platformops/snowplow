@@ -1,7 +1,6 @@
 package dispatchers
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -14,7 +13,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/rest"
 )
 
@@ -405,14 +403,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	})
 	if err != nil {
 		log.Error("unable to resolve widget", slog.Any("err", err))
-		var statusErr *apierrors.StatusError
-		if errors.As(err, &statusErr) {
-			code := int(statusErr.Status().Code)
-			msg := fmt.Errorf("%s", statusErr.Status().Message)
-			response.Encode(wri, response.New(code, msg))
-			return
-		}
-		response.InternalError(wri, err)
+		// #853 — the CR exists; a dependency's 404 is answered 424.
+		encodeWidgetResolveError(ctx, wri, err)
 		return
 	}
 

@@ -17,8 +17,9 @@ package dispatchers
 //
 //	A1  stored RESTAction /call: 404 NotFound naming the CRD (was 500).
 //	A2  the widget apiRef frame (apiref.Resolve) returns a typed 404, and the
-//	    widget /call handler answers 404 with it (was 500 "resolve apiRef …:
-//	    unexpected end of JSON input").
+//	    widget /call handler answers with it (was 500 "resolve apiRef …:
+//	    unexpected end of JSON input") — since #853 as 424 Failed Dependency,
+//	    because the widget CR exists and only a dependency is missing.
 //	A3  continueOnError: the stage's 404 is recorded under errorKey and the
 //	    later stage still ran — 200, unchanged.
 //	A4  an empty 2xx body is "no content": the stage's value is null, no stage
@@ -115,7 +116,7 @@ func TestIssue709_A1_StoredRESTAction_StageGet404_NoContinueOnError_Is404(t *tes
 	i709AssertNotFound(t, rec)
 }
 
-func TestIssue709_A2_WidgetApiRef_StageGet404_Is404(t *testing.T) {
+func TestIssue709_A2_WidgetApiRef_StageGet404_Is424(t *testing.T) {
 	ra := &unstructured.Unstructured{Object: in443RA("agent-formdef", i709Filter, i709CRDStage(false), targetStage())}
 	f := in443Setup(t, ra)
 	i709Serve404(f)
@@ -157,7 +158,24 @@ func TestIssue709_A2_WidgetApiRef_StageGet404_Is404(t *testing.T) {
 	rec := httptest.NewRecorder()
 	(&widgetsHandler{authnNS: psAuthnNS, saRC: &rest.Config{Host: f.srv.URL}}).ServeHTTP(rec,
 		httptest.NewRequest(http.MethodGet, "/call", nil).WithContext(alice))
-	i709AssertNotFound(t, rec)
+	// #853 — the widget exists, so its missing dependency is answered 424 Failed
+	// Dependency (404 is the CR read's answer only); the message still names the
+	// stage and the missing resource, and the JSON decoder's error never leaks.
+	body := rec.Body.String()
+	if strings.Contains(body, "unexpected end of JSON input") {
+		t.Fatalf("#709 RED: the JSON decoder's error reached the response: %d %s", rec.Code, body)
+	}
+	if rec.Code != http.StatusFailedDependency {
+		t.Fatalf("#853 RED: code=%d, want 424: %s", rec.Code, body)
+	}
+	st := i709Status(t, rec)
+	if st["reason"] != "FailedDependency" || st["status"] != "Failure" || st["kind"] != "Status" {
+		t.Fatalf("want a FailedDependency Failure Status, got %s", body)
+	}
+	msg, _ := st["message"].(string)
+	if !strings.Contains(msg, `"agents.kagent.dev" not found`) || !strings.Contains(msg, `stage "crd"`) {
+		t.Fatalf("the message must name the stage and the missing resource, got %q", msg)
+	}
 }
 
 func TestIssue709_A3_ContinueOnError_RecordsTheStageErrorAndContinues(t *testing.T) {
