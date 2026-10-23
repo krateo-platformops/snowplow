@@ -469,11 +469,22 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 		h.passReached = map[string]struct{}{}
 	}
 	h.passReached[navWidgetCoordKey(gvr, w.GetNamespace(), w.GetName())] = struct{}{}
-	if _, seen := h.entries[key]; seen {
-		// First-write-wins. The dedupe is intentional: the walk's
-		// visited-set in phase1Walker.walk already prevents re-traversal,
-		// so a second harvest for the same key only happens across roots
-		// (idempotent — same CR + same key tuple yields identical Put).
+	if prev, seen := h.entries[key]; seen {
+		// First-write-wins for the entry's STAMPS (NavOrder, RootIndex, the
+		// pagination tuples): the walk's visited-set already prevents
+		// re-traversal within a pass, and a second sighting across roots is the
+		// same CR. #857 — but not for the CR itself: every keep-warm sweep
+		// re-walks the nav roots from live reads, and the seeds resolve THIS
+		// copy, so keeping the boot-time copy resolved an edited widget with its
+		// boot-time spec for the whole pod lifetime (057: an apiRef moved by a
+		// portal upgrade was still resolved at its old address every sweep).
+		// A sighting of a different object version (UID or resourceVersion)
+		// replaces the copy; the stamps stay.
+		if prev.W == nil || prev.W.GetUID() != w.GetUID() || prev.W.GetResourceVersion() != w.GetResourceVersion() {
+			prev.W = w.DeepCopy()
+			h.entries[key] = prev
+			navWidgetHarvestRefreshedTotal.Add(1)
+		}
 		return
 	}
 	// Deep-copy the CR so a downstream resolver mutation does not race
@@ -1563,6 +1574,11 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// the pre-edit harvested spec with no remark; if the edit's own dirty-mark was
 	// already consumed (refresher re-resolve, or skipped_no_entry on a non-resident
 	// cell) the cell stays stale until its next dirty-mark or TTL.
+	// #857 bounds that window: a keep-warm sweep re-walks first, and the walk
+	// REPLACES a harvested copy whose object version moved (harvestNavWidget),
+	// so the sweep resolves the current spec. The reseed paths that do not walk
+	// (#258 rbac-shift, #262 class-seed) can still resolve a copy up to one sweep
+	// old — tracked in #859.
 	resCtx := cache.WithL1KeyContextFromEpoch(ctx, key, cache.DepGenEpochNow(), cache.DepKey{
 		GVR: e.GVR, Namespace: e.W.GetNamespace(), Name: e.W.GetName()})
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)

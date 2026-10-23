@@ -66,6 +66,11 @@ var (
 	pipBindingSetSeedResolvesTotal atomic.Uint64
 	pipBindingSetSeedFailuresTotal atomic.Uint64
 
+	// #857 — harvested nav widgets whose CR copy a re-walk REPLACED because it
+	// saw a different object version (UID or resourceVersion): an edit the
+	// seeds now resolve instead of the boot-time spec.
+	navWidgetHarvestRefreshedTotal atomic.Uint64
+
 	// #158 (P9-B) — the SPLIT of pipBindingSetSeedFailuresTotal by error
 	// class. pipBindingSetSeedFailuresTotal is KEPT as the back-compat
 	// grand total (= rbac_deny + operational) so existing dashboards do
@@ -265,6 +270,10 @@ func registerPIPMetrics() {
 		}))
 		expvar.Publish("snowplow_phase1_bindingset_seed_failures_total", expvar.Func(func() any {
 			return pipBindingSetSeedFailuresTotal.Load()
+		}))
+		// #857 — harvested widget copies replaced by a newer object version.
+		expvar.Publish("snowplow_phase1_nav_harvest_refreshed_total", expvar.Func(func() any {
+			return navWidgetHarvestRefreshedTotal.Load()
 		}))
 
 		// #158 (P9-B) — the discriminated split of the failures total. The
