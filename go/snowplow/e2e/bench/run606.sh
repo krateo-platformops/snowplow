@@ -878,6 +878,11 @@ s_evaluate() {
     [[ -n "$r" ]] && log "INVALID: $r"
   done < <(python3 -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1])).get("invalid_reasons") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
+  # report-only warnings (e.g. the #765 B shadow absent: missing, not zero)
+  while IFS= read -r r; do
+    [[ -n "$r" ]] && log "WARNING: $r"
+  done < <(python3 -c 'import json, sys; print("\n".join((json.load(open(sys.argv[1])).get("report") or {}).get("report_warnings") or []))' \
+             "$OUT/verdict.json" 2>/dev/null || true)
 }
 
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus ${TTL_MARGIN_S} s"

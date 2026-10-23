@@ -2006,16 +2006,25 @@ def _phase_of(t: float, phases: list[tuple[str, float, float]]) -> str:
     return "steady"
 
 
-def list_narrow_report(mem: list[dict], fresh: list[dict] | None = None) -> dict | None:
+LIST_NARROW_ABSENT = "absent_in_all_samples"
+
+
+def list_narrow_report(mem: list[dict], fresh: list[dict] | None = None) -> dict:
     """#765 B's shadow, per phase (run_phases; "churn" sums the churn
     phases): would_avoid, would_change, identical audits, and the would-avoid
     share of all list_dep marks (the dirty-mark attribution's list_dep, the
-    same per-sample cadence) and of B's own list_dep denominator. None when
-    no sample carried the key."""
+    same per-sample cadence) and of B's own list_dep denominator.
+
+    `status`: "present", or — when no mem sample carried the key (an image
+    without it, or mem606 not capturing it) — LIST_NARROW_ABSENT, so an empty
+    report reads as MISSING, never as zero (evaluate adds a report warning)."""
     rows = sorted((m for m in mem if m.get("kind") == "mem" and _narrow_counters(m) is not None),
                   key=lambda m: m.get("t") or 0)
     if not rows:
-        return None
+        return {"status": LIST_NARROW_ABSENT,
+                "mem_samples": sum(1 for m in mem if m.get("kind") == "mem"),
+                "note": f"no mem sample carried {LIST_NARROW_KEY}: the shadow is MISSING "
+                        f"(an image without it, or mem606 not capturing it), not zero"}
     phases = run_phases(mem, fresh)
     keys = ("would_avoid", "would_change", "identical_audits", "list_narrow_list_dep_marks",
             "list_dep_marks")
@@ -2050,7 +2059,7 @@ def list_narrow_report(mem: list[dict], fresh: list[dict] | None = None) -> dict
         b["would_avoid_share_of_list_narrow_marks"] = share(b["would_avoid"],
                                                              b["list_narrow_list_dep_marks"])
     last = rows[-1]["extra"][LIST_NARROW_KEY]
-    return {"by_phase": by_phase,
+    return {"status": "present", "by_phase": by_phase,
             "phase_windows": [{"phase": n, "t0": None if t0 == float("-inf") else t0, "t1": t1}
                               for n, t0, t1 in phases],
             "churn_rates": {f"churn:{label}": rate for label, _, _, rate in churn_windows(fresh)},
@@ -3230,6 +3239,12 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["memory"] = memory_report(mem or [])
     report["key_rotation_report_only"] = rotation_report(mem or [])
     report["list_narrow_shadow_report_only"] = list_narrow_report(mem or [], fresh)
+    # report-only warnings: a report that came out empty says so (run606
+    # logs each one; the verdict never reads them)
+    report["report_warnings"] = (
+        [(f"{LIST_NARROW_KEY} absent in all {report['list_narrow_shadow_report_only']['mem_samples']} "
+          f"mem samples: the #765 B shadow report is missing, not zero")]
+        if report["list_narrow_shadow_report_only"]["status"] == LIST_NARROW_ABSENT else [])
     report["content_fill_by_gvr_report_only"] = content_fill_report(mem or [])
     report["profiling"] = profiling_report(
         mem or [], navs,
@@ -4739,6 +4754,8 @@ def _cmd_evaluate(a) -> int:
                       viewer_dead=sorted((r for r in recs if r.get("kind") == "viewer_dead"),
                                          key=lambda r: r.get("t") or 0),
                       k6=k6)
+    for w in (result.get("report") or {}).get("report_warnings") or []:
+        print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
 

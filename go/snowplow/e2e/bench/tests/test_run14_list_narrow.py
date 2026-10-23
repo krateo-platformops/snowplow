@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 from bench import load606
@@ -26,6 +28,7 @@ from bench import load606
 FIX = Path(__file__).resolve().parent / "fixtures"
 LN = json.loads((FIX / "list_narrow_expvar_525b4ddf.json").read_text())
 CF = json.loads((FIX / "content_fill_by_gvr_run13.json").read_text())
+LN_KEY = "snowplow_deps_list_narrow"
 G = "composition.krateo.io/v1-2-2, Resource=githubscaffoldingwithcompositionpages"
 
 
@@ -254,8 +257,10 @@ def test_reports_land_in_the_verdict_and_change_no_check():
     v = load606.evaluate([], FRESH, [], mem=mem)
     assert v["report"]["list_narrow_shadow_report_only"]["by_phase"]["all"]["would_avoid"] == 37
     assert v["report"]["content_fill_by_gvr_report_only"]["restarts"] == 1
+    assert v["report"]["list_narrow_shadow_report_only"]["status"] == "present"
+    assert v["report"]["report_warnings"] == []
     base = load606.evaluate([], FRESH, [], mem=[m for m in mem if not m.get("extra")])
-    assert base["report"]["list_narrow_shadow_report_only"] is None
+    assert base["report"]["list_narrow_shadow_report_only"]["status"] == "absent_in_all_samples"
     assert base["report"]["content_fill_by_gvr_report_only"] is None
     # report only: the same checks, validity and verdict with or without them
 
@@ -264,3 +269,32 @@ def test_reports_land_in_the_verdict_and_change_no_check():
     assert strip(v["checks"]) == strip(base["checks"])
     assert strip(v["validity"]) == strip(base["validity"])
     assert v["verdict"] == base["verdict"]
+
+
+def test_an_absent_shadow_reads_as_missing_with_a_warning_and_no_verdict_change(tmp_path):
+    """No sample carried snowplow_deps_list_narrow (run 13's image had none):
+    the report says ABSENT, never a silent null that reads as zero; a
+    report-only warning goes to verdict.json and stderr (run606 logs it);
+    checks, validity and verdict are unchanged."""
+    mem = [m for m in _mem() if LN_KEY not in (m.get("extra") or {})]
+    r = load606.list_narrow_report(mem, FRESH)
+    assert r["status"] == "absent_in_all_samples" and r["mem_samples"] == 5
+    assert "by_phase" not in r and "missing" in r["note"].lower()
+    v = load606.evaluate([], FRESH, [], mem=mem)
+    w = v["report"]["report_warnings"]
+    assert len(w) == 1 and LN_KEY in w[0] and "missing, not zero" in w[0]
+    present = load606.evaluate([], FRESH, [], mem=_mem())
+
+    def strip(x):
+        return [(c["check"], c["result"]) for c in x]
+    assert strip(v["checks"]) == strip(present["checks"])
+    assert strip(v["validity"]) == strip(present["validity"])
+    assert v["verdict"] == present["verdict"]
+    # the CLI prints it as a WARNING on stderr
+    f = tmp_path / "mem-mem606-x.jsonl"
+    f.write_text("".join(json.dumps(m) + "\n" for m in mem))
+    p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(f)],
+                       capture_output=True, text=True, cwd=FIX.parent.parent, check=False)
+    assert f"WARNING: {LN_KEY} absent in all" in p.stderr
+    assert json.loads(p.stdout)["report"]["list_narrow_shadow_report_only"]["status"] == \
+        "absent_in_all_samples"
