@@ -1284,7 +1284,9 @@ class ChurnDriver:
         self.thread.join()
         self.pool.shutdown(wait=True)
         span = max(1e-9, self.t1 - self.t0)
+        # t0 / t1: the mutation schedule, for the run-14 phase report
         return {"issued": self.issued, "failed": self.failed,
+                "t0": round(self.t0, 3), "t1": round(self.t1, 3),
                 "target_rate": self.rate,
                 "achieved_rate": round((self.issued - self.failed) / span, 2)}
 
@@ -1903,14 +1905,22 @@ CPU_PROFILE_OVERHEAD_KIND = {
 # would_change_total (audited skips whose result DID change), audit
 # {identical, changed, no_prior, unaudited}, list_dep_marks_total (B's own
 # denominator). All cumulative: a phase's value is the sum of the deltas of
-# the sample pairs that END inside it, so phases need not be contiguous. A
-# counter that went backwards restarted from 0 (a snowplow restart: run 13
-# reset every series once): its delta is the new value, and the reset is
-# counted. No gate reads any of it.
+# the sample pairs that END inside it, so phases need not be contiguous.
+#
+# A snowplow restart is decided once per sample PAIR (#855 gate): Go's
+# memstats NumGC (counted from the process start) went down, or any counter
+# the report reads did. Then every counter of the later sample is taken as
+# is — what it counted since the restart — whether or not it had already
+# grown past its old value (run 13: 11 of 55 per-GVR series had, 13 fills a
+# per-series test missed). `restarts` counts those pairs. No gate reads any of it.
 LIST_NARROW_KEY = "snowplow_deps_list_narrow"
 DIRTY_MARK_KEY = "snowplow_deps_dirty_mark_attribution"
 CONTENT_FILL_GVR_KEY = "snowplow_apistage_content_fill_by_gvr"
 CONTENT_FILL_BUCKET_S = 60
+# verdict.json carries the GVRs with the most fill bytes; the rest is
+# "(other)" (run 13: 44 GVRs x 68 minutes would add 196 KB)
+CONTENT_FILL_TOP_GVRS = 10
+OTHER_GVRS = "(other)"
 
 
 def _list_dep_marks(attr) -> int | None:
@@ -1921,73 +1931,100 @@ def _list_dep_marks(attr) -> int | None:
                if isinstance(b, dict) and b.get("class") == "list_dep")
 
 
-def _narrow_counters(v) -> dict | None:
+def _narrow_counters(m: dict) -> dict | None:
+    """The cumulative counters list_narrow_report reads from one mem sample."""
+    v = (m.get("extra") or {}).get(LIST_NARROW_KEY)
     if not isinstance(v, dict):
         return None
     audit = v.get("audit") if isinstance(v.get("audit"), dict) else {}
     return {"would_avoid": _num(v.get("would_avoid_total")),
             "would_change": _num(v.get("would_change_total")),
             "identical_audits": _num(audit.get("identical")),
-            "list_narrow_list_dep_marks": _num(v.get("list_dep_marks_total"))}
+            "list_narrow_list_dep_marks": _num(v.get("list_dep_marks_total")),
+            "list_dep_marks": _list_dep_marks((m.get("extra") or {}).get(DIRTY_MARK_KEY))}
 
 
-def run_phases(mem: list[dict], fresh: list[dict] | None) -> dict:
-    """Time windows by phase: storm (and burst) from the CPU-profile plan's
-    windows (cpu_profile_windows), churn = fresh606's samples (first start,
-    t - latency, to the last), steady = everything else. Earlier names win
-    where windows overlap: storm, burst, churn."""
-    win = cpu_profile_windows(mem)
-    out = {}
-    if win is not None:
-        out["storm"] = (float("-inf"), win["storm"]["t1"])
-        if win.get("burst"):
-            out["burst"] = (win["burst"]["t0"], win["burst"]["t1"])
+def _restarted(a: dict, b: dict, ca: dict, cb: dict) -> bool:
+    """Did snowplow restart between samples a and b? (see the block comment)"""
+    ga, gb = _num(a.get("num_gc")), _num(b.get("num_gc"))
+    if ga is not None and gb is not None and gb < ga:
+        return True
+    return any(ca.get(k) is not None and cb.get(k) is not None and cb[k] < ca[k] for k in cb)
+
+
+def _deltas(a: dict, b: dict, ca: dict, cb: dict) -> tuple[dict, bool]:
+    """Per-counter deltas over one pair, and whether it spans a restart."""
+    r = _restarted(a, b, ca, cb)
+    return ({k: (cb[k] if r else cb[k] - ca[k]) if cb[k] is not None and (r or ca.get(k) is not None)
+             else None for k in cb}, r)
+
+
+def churn_windows(fresh: list[dict] | None) -> list[tuple[str, float, float, float | None]]:
+    """fresh606's mutation schedule: one (label, t0, t1, target_rate) per
+    churn phase (fresh_phases: modes outer, rates inner; a phase's churn runs
+    while its probe does). From the churn record's own t0/t1 (ChurnDriver,
+    from run 14), else from the phase's probe samples (first start, t -
+    latency, to the last) — run 13's records carry no times."""
     fr = [f for f in fresh or [] if f.get("kind") == "fresh" and f.get("t") is not None]
-    if fr:
-        out["churn"] = (min(f["t"] - (f.get("latency_ms") or 0) / 1000 for f in fr),
-                        max(f["t"] for f in fr))
+    out = []
+    for c in (f for f in fresh or [] if f.get("kind") == "churn"):
+        label = c.get("label")
+        if c.get("t0") is not None and c.get("t1") is not None:
+            t0, t1 = c["t0"], c["t1"]
+        else:
+            ss = [f for f in fr if f.get("label") == label]
+            if not ss:
+                continue
+            t0 = min(f["t"] - (f.get("latency_ms") or 0) / 1000 for f in ss)
+            t1 = max(f["t"] for f in ss)
+        out.append((label, t0, t1, c.get("target_rate")))
     return out
 
 
-def _phase_of(t: float, phases: dict) -> str:
-    for name in ("storm", "burst", "churn"):
-        if name in phases and phases[name][0] <= t < phases[name][1]:
+def run_phases(mem: list[dict], fresh: list[dict] | None) -> list[tuple[str, float, float]]:
+    """Time windows by phase, in PRECEDENCE order (the first that holds a
+    time wins): storm and burst from the CPU-profile plan's windows
+    (cpu_profile_windows), then each fresh606 churn phase as "churn:<label>"
+    (churn_windows, the mutation schedule). Anything else is "steady": no
+    storm, no burst, no churn. fresh606 churns for its whole run (run 13:
+    1/s from 30 s, through the storm, to 4,610 s), so most post-storm time is
+    a churn phase."""
+    win = cpu_profile_windows(mem)
+    out = []
+    if win is not None:
+        out.append(("storm", float("-inf"), win["storm"]["t1"]))
+        if win.get("burst"):
+            out.append(("burst", win["burst"]["t0"], win["burst"]["t1"]))
+    out += [(f"churn:{label}", t0, t1) for label, t0, t1, _ in churn_windows(fresh)]
+    return out
+
+
+def _phase_of(t: float, phases: list[tuple[str, float, float]]) -> str:
+    for name, t0, t1 in phases:
+        if t0 <= t < t1:
             return name
     return "steady"
 
 
 def list_narrow_report(mem: list[dict], fresh: list[dict] | None = None) -> dict | None:
-    """#765 B's shadow, per phase: would_avoid, would_change, identical
-    audits, and the would-avoid share of all list_dep marks (the dirty-mark
-    attribution's list_dep, the same per-sample cadence) and of B's own
-    list_dep denominator. None when no sample carried the key."""
-    rows = sorted((m for m in mem if m.get("kind") == "mem"
-                   and LIST_NARROW_KEY in (m.get("extra") or {})), key=lambda m: m.get("t") or 0)
+    """#765 B's shadow, per phase (run_phases; "churn" sums the churn
+    phases): would_avoid, would_change, identical audits, and the would-avoid
+    share of all list_dep marks (the dirty-mark attribution's list_dep, the
+    same per-sample cadence) and of B's own list_dep denominator. None when
+    no sample carried the key."""
+    rows = sorted((m for m in mem if m.get("kind") == "mem" and _narrow_counters(m) is not None),
+                  key=lambda m: m.get("t") or 0)
     if not rows:
         return None
     phases = run_phases(mem, fresh)
-    names = ["storm", "burst", "churn", "steady"]
-    tot = {p: {"would_avoid": 0, "would_change": 0, "identical_audits": 0,
-               "list_narrow_list_dep_marks": 0, "list_dep_marks": 0, "pairs": 0}
-           for p in names}
-    resets = 0
-
-    def step(x0, x1):
-        nonlocal resets
-        if x0 is None or x1 is None:
-            return None
-        if x1 < x0:                      # restarted from 0
-            resets += 1
-            return x1
-        return x1 - x0
+    keys = ("would_avoid", "would_change", "identical_audits", "list_narrow_list_dep_marks",
+            "list_dep_marks")
+    tot: dict[str, dict] = {}
+    restarts = 0
     for a, b in itertools.pairwise(rows):
-        ca, cb = _narrow_counters(a["extra"][LIST_NARROW_KEY]), _narrow_counters(b["extra"][LIST_NARROW_KEY])
-        if ca is None or cb is None:
-            continue
-        d = {k: step(ca[k], cb[k]) for k in ca}
-        d["list_dep_marks"] = step(*(_list_dep_marks((x.get("extra") or {}).get(DIRTY_MARK_KEY))
-                                     for x in (a, b)))
-        bucket = tot[_phase_of(b["t"], phases)]
+        d, r = _deltas(a, b, _narrow_counters(a), _narrow_counters(b))
+        restarts += r
+        bucket = tot.setdefault(_phase_of(b["t"], phases), dict.fromkeys(keys, 0) | {"pairs": 0})
         bucket["pairs"] += 1
         for k, v in d.items():
             if v is not None:
@@ -1995,65 +2032,87 @@ def list_narrow_report(mem: list[dict], fresh: list[dict] | None = None) -> dict
 
     def share(n, den):
         return round(n / den, 4) if den else None
-    by_phase = {}
-    for p in names:
-        b = tot[p]
-        if not b["pairs"] and p not in phases:
-            continue
-        by_phase[p] = dict(b, would_avoid_share_of_list_dep_marks=share(b["would_avoid"], b["list_dep_marks"]),
-                           would_avoid_share_of_list_narrow_marks=share(
-                               b["would_avoid"], b["list_narrow_list_dep_marks"]))
-    all_ = {k: sum(tot[p][k] for p in names) for k in tot["steady"]}
-    by_phase["all"] = dict(all_, would_avoid_share_of_list_dep_marks=share(
-        all_["would_avoid"], all_["list_dep_marks"]),
-        would_avoid_share_of_list_narrow_marks=share(all_["would_avoid"],
-                                                     all_["list_narrow_list_dep_marks"]))
+
+    def summed(names):
+        s = dict.fromkeys(keys, 0) | {"pairs": 0}
+        for n in names:
+            for k in s:
+                s[k] += tot.get(n, {}).get(k, 0)
+        return s
+    order = [n for n, _, _ in phases] + ["steady"]
+    by_phase = {n: tot[n] for n in order if n in tot}
+    churn = [n for n in tot if n.startswith("churn:")]
+    if churn:
+        by_phase["churn"] = summed(churn)
+    by_phase["all"] = summed(list(tot))
+    for b in by_phase.values():
+        b["would_avoid_share_of_list_dep_marks"] = share(b["would_avoid"], b["list_dep_marks"])
+        b["would_avoid_share_of_list_narrow_marks"] = share(b["would_avoid"],
+                                                             b["list_narrow_list_dep_marks"])
     last = rows[-1]["extra"][LIST_NARROW_KEY]
     return {"by_phase": by_phase,
-            "phase_windows": {k: [None if v[0] == float("-inf") else v[0], v[1]]
-                              for k, v in phases.items()},
-            "samples": len(rows), "counter_resets": resets,
+            "phase_windows": [{"phase": n, "t0": None if t0 == float("-inf") else t0, "t1": t1}
+                              for n, t0, t1 in phases],
+            "churn_rates": {f"churn:{label}": rate for label, _, _, rate in churn_windows(fresh)},
+            "samples": len(rows), "restarts": restarts,
             "gate_last": last.get("gate") if isinstance(last, dict) else None,
-            "note": "report only: no gate reads it (#765 option B is a shadow)"}
+            "note": ("report only: no gate reads it (#765 option B is a shadow). Phases in "
+                     "precedence order; steady = no storm, burst or fresh606 churn")}
 
 
-def content_fill_report(mem: list[dict], bucket_s: float = CONTENT_FILL_BUCKET_S) -> dict | None:
+def _fill_counters(m: dict) -> dict:
+    g = (m.get("extra") or {}).get(CONTENT_FILL_GVR_KEY) or {}
+    out = {}
+    for gvr, v in g.items():
+        if isinstance(v, dict):
+            out[(gvr, "fills")] = _num(v.get("fills"))
+            out[(gvr, "bytes")] = _num(v.get("bytes"))
+    return out
+
+
+def content_fill_report(mem: list[dict], bucket_s: float = CONTENT_FILL_BUCKET_S,
+                        top: int = CONTENT_FILL_TOP_GVRS) -> dict | None:
     """Per minute of the run, per GVR: content fills and their bytes (the
     bytes the admission gate charges), from the cumulative
-    snowplow_apistage_content_fill_by_gvr. A minute lists only GVRs that
-    filled. Report only."""
+    snowplow_apistage_content_fill_by_gvr; the `top` GVRs by total bytes by
+    name, the rest summed as "(other)". A minute lists only GVRs that filled.
+    Report only."""
     rows = sorted((m for m in mem if m.get("kind") == "mem"
                    and isinstance((m.get("extra") or {}).get(CONTENT_FILL_GVR_KEY), dict)),
                   key=lambda m: m.get("t") or 0)
     if not rows:
         return None
     t0 = rows[0]["t"]
-    minutes: dict[int, dict] = {}
-    total: dict[str, dict] = {}
-    resets = 0
+    raw: dict[int, dict] = {}
+    restarts = 0
     for a, b in itertools.pairwise(rows):
-        ga, gb = a["extra"][CONTENT_FILL_GVR_KEY], b["extra"][CONTENT_FILL_GVR_KEY]
-        for gvr, cur in gb.items():
-            prev = ga.get(gvr) or {}
-            if not isinstance(cur, dict):
-                continue
-            f1, b1 = _num(cur.get("fills")) or 0, _num(cur.get("bytes")) or 0
-            df, db = f1 - (_num(prev.get("fills")) or 0), b1 - (_num(prev.get("bytes")) or 0)
-            if df < 0 or db < 0:         # a restart: the series began again at 0
-                resets += 1
-                df, db = f1, b1
-            if not (df or db):
-                continue
-            m = minutes.setdefault(int((b["t"] - t0) // bucket_s), {})
-            for into in (m.setdefault(gvr, {"fills": 0, "bytes": 0}),
-                         total.setdefault(gvr, {"fills": 0, "bytes": 0})):
-                into["fills"] += df
-                into["bytes"] += db
-    return {"bucket_s": bucket_s, "t0": t0,
-            "per_minute": [{"minute": k, "t": t0 + k * bucket_s, "by_gvr": v}
-                           for k, v in sorted(minutes.items())],
-            "total_by_gvr": dict(sorted(total.items(), key=lambda kv: -kv[1]["bytes"])),
-            "counter_resets": resets,
+        ca, cb = _fill_counters(a), _fill_counters(b)
+        d, r = _deltas(a, b, {k: ca.get(k, 0) for k in cb}, cb)
+        restarts += r
+        for (gvr, what), v in d.items():
+            if v:
+                m = raw.setdefault(int((b["t"] - t0) // bucket_s), {})
+                m.setdefault(gvr, {"fills": 0, "bytes": 0})[what] += v
+    total: dict[str, dict] = {}
+    for m in raw.values():
+        for gvr, v in m.items():
+            t = total.setdefault(gvr, {"fills": 0, "bytes": 0})
+            t["fills"] += v["fills"]
+            t["bytes"] += v["bytes"]
+    named = [g for g, _ in sorted(total.items(), key=lambda kv: -kv[1]["bytes"])[:top]]
+
+    def capped(by_gvr):
+        out = {g: by_gvr[g] for g in named if g in by_gvr}
+        rest = [v for g, v in by_gvr.items() if g not in out]
+        if rest:
+            out[OTHER_GVRS] = {"fills": sum(v["fills"] for v in rest),
+                               "bytes": sum(v["bytes"] for v in rest), "gvrs": len(rest)}
+        return out
+    return {"bucket_s": bucket_s, "t0": t0, "top_gvrs": top, "gvrs_seen": len(total),
+            "per_minute": [{"minute": k, "t": t0 + k * bucket_s, "by_gvr": capped(v)}
+                           for k, v in sorted(raw.items())],
+            "total_by_gvr": capped(dict(sorted(total.items(), key=lambda kv: -kv[1]["bytes"]))),
+            "restarts": restarts,
             "note": "report only; bytes = the fills' bytes, which content-fill admission charges"}
 
 
