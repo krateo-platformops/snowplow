@@ -1847,6 +1847,7 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 // per-GVR map cannot be forgotten — every map keyed by GVR is purged
 // here uniformly (feedback_no_special_cases.md: no map gets a carve-out).
 func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResource) {
+	bumpServabilityEpoch(gvr) // #854 — the informer is removed: an exit from servable
 	delete(rw.informers, gvr)
 	delete(rw.syncCh, gvr)
 	delete(rw.confirmed, gvr)

@@ -1197,6 +1197,12 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			r.viewed.unsubscribed.Add(1)
 		}
 	}
+	// #854 — a comparator pass a read of this incremental list cell made due runs
+	// here: refresher work, after the customer yield and the rate floor, never on
+	// a reader's goroutine.
+	if ok && entry != nil {
+		entry.ListCell().runDuePass()
+	}
 	attemptStart := time.Now()
 	err := r.processOne(rctx, key, entry, ok)
 	attemptDur = time.Since(attemptStart)

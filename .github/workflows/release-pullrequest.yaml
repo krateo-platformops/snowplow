@@ -86,3 +86,8 @@ jobs:
       # internal/cache and fails the PR on any unchecked assert.
       - name: No unchecked *unstructured.Unstructured assert in informer handlers gate
         run: bash scripts/check_no_unchecked_unstructured_assert.sh
+      # #854: an incremental list content cell stores no RawJSON. Every direct
+      # read of ResolvedEntry.RawJSON must be a classified site; any other reader
+      # goes through entry.Raw() / entry.RawLen().
+      - name: RawJSON readers are classified gate
+        run: bash scripts/check_rawjson_readers.sh

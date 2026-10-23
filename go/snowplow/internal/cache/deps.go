@@ -1236,6 +1236,10 @@ func (d *DepTracker) bumpResourceTypeGen(gvr schema.GroupVersionResource, listOn
 	if d == nil {
 		return
 	}
+	// #854 — a type-level event (CRD available / removed / schema relisted /
+	// store repaired) is not a per-object delta: the incremental list cells of
+	// the GVR drop back to a full fill.
+	unanchorListCellsForGVR(gvr, "type_event")
 	s := depEventSeq.Add(1)
 	fireDepBumpHook("after_add")
 	fI, _ := d.gvrLastBump.LoadOrStore(gvr, new(atomic.Uint64))
@@ -1801,6 +1805,10 @@ func (d *DepTracker) onObjectEventMasked(gvr schema.GroupVersionResource, namesp
 	if d == nil {
 		return 0, 0
 	}
+	// #854 (MC1) — record the coordinate in every incremental list cell of the
+	// GVR BEFORE bumpCoordinateGen takes this event's seq: a cell generation
+	// stamped at seq s then provably contains every event <= s (list_cell.go).
+	noteListCellsPending(gvr, namespace, name)
 	// 1.12.7 F6b — carry the GONE verdict to whoever holds a harvested
 	// in-memory copy of this object, BEFORE the no-matches return below.
 	// The placement is load-bearing: the population this exists for is

@@ -181,10 +181,12 @@ func TestIssue618_ContentKey_SelectorAndUnselectedNeverShare(t *testing.T) {
 	if !ok1 || !ok2 {
 		t.Fatalf("want both cells resident: unselected=%v selector=%v", ok1, ok2)
 	}
-	if got := namesInEnvelopeBytes(t, unEntry.RawJSON); !eqNames(got, names(all3, "w1", "w2", "w3")) {
+	// #854 — Raw(): an incremental list cell stores no RawJSON; its envelope is
+	// built on demand from the same bytes.
+	if got := namesInEnvelopeBytes(t, unEntry.Raw()); !eqNames(got, names(all3, "w1", "w2", "w3")) {
 		t.Fatalf("unselected cell holds %v", got)
 	}
-	if got := namesInEnvelopeBytes(t, selEntry.RawJSON); !eqNames(got, names(all3, "w1")) {
+	if got := namesInEnvelopeBytes(t, selEntry.Raw()); !eqNames(got, names(all3, "w1")) {
 		t.Fatalf("selector cell holds %v", got)
 	}
 	if selEntry.Inputs == nil || selEntry.Inputs.Query != "labelSelector=env%3Dprod" {

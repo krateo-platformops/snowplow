@@ -87,13 +87,36 @@ var cacheAllow443 = map[string]cacheClass443{
 	// #765 — the stamp-gated refresher read: GetNoTouch (no warmth), and the
 	// served-cell note only for an accepted cell, under its own cache.Inert check.
 	"ServeCellIf": gatedInCache443,
+	// --- #854 incremental list cell -------------------------------------------
+	// Snapshot catches the cell up with the informer (drains its pending keys
+	// into a new generation): identity-free state that mirrors cluster facts,
+	// exactly what any reader of the cell must see; it serves no bytes a full
+	// fill of the same informer state would not, and Puts nothing.
+	"ListCell.Snapshot":      clusterFact443,
+	"ResolvedEntry.ListCell": readOnly443,
+	"ResolvedEntry.RawLen":   readOnly443, // #854: an arithmetic length, nothing built
+	"ListView.AsOf":          readOnly443,
+	"ListView.APIVersion":    readOnly443,
+	"ListView.Kind":          readOnly443,
+	// Items / Raw build their generation's shared slice / envelope once
+	// (a per-generation memo of cluster facts).
+	"ListView.Items": clusterFact443,
+	"ListView.Raw":   clusterFact443,
 	// --- side-effecting, gated at the (listed) caller -----------------------
 	// #643 — the resolve path's ONE L1 body read (it replaced the direct
 	// ResolvedCacheStore.Get): touch=true is the warmth-stamping Get, which each
 	// caller turns into touch=false under the flag; the served-cell note inside
 	// it is itself gated on cache.Inert (NoteServedCell).
-	"ServeCell":                gatedAtCaller443,
-	"ResolvedEntry.NoteHitter": gatedAtCaller443, // representative pool
+	"ServeCell": gatedAtCaller443,
+	// #854 — ServeCell with an accept check before the note; same gating.
+	"ServeCellAccept": gatedAtCaller443,
+	// #854 — anchoring registers a cell and hands it to the store: the caller
+	// anchors only on a non-inert fill leader.
+	"AnchorListCell":                              gatedAtCaller443,
+	"NewListCellEntry":                            gatedAtCaller443,
+	"ListCell.AttachStore":                        gatedAtCaller443,
+	"ListCell.Close":                              gatedAtCaller443,
+	"ResolvedEntry.NoteHitter":                    gatedAtCaller443, // representative pool
 	"ResolvedCacheStore.ForgetRAFullListConsumer": gatedAtCaller443,
 	"AddNavigationDiscoveredGroup":                gatedAtCaller443,
 	"BumpExternalSkippedPut":                      gatedAtCaller443, // a Put-decline counter: no decline without a Put
@@ -307,6 +330,11 @@ var cacheAllow443 = map[string]cacheClass443{
 // allowed to use it. Each listed function must contain a cache.Inert check.
 var callerAllow443 = map[string][]string{
 	"ServeCell":                {"apistage.go:apistageContentServeAttempt", "apistage_stale_debt.go:serveStaleWithDebt", "ra_full_list.go:raFullListServe"},
+	"ServeCellAccept":          {"apistage.go:apistageContentServeAttempt"},
+	"AnchorListCell":           {"apistage.go:apistageContentServeAttempt"},
+	"NewListCellEntry":         {"apistage.go:apistageContentServeAttempt"},
+	"ListCell.AttachStore":     {"apistage.go:apistageContentServeAttempt"},
+	"ListCell.Close":           {"apistage.go:apistageContentServeAttempt"},
 	"ResolvedEntry.NoteHitter": {"ra_full_list.go:raFullListServe"},
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},

@@ -255,21 +255,23 @@ func NoteNarrowAuditWrite(ctx context.Context, key string, prior *ResolvedEntry,
 		return
 	}
 	a := t.audit
+	// #854 — Raw(): a prior incremental list cell holds no RawJSON.
+	priorRaw := prior.Raw()
 	switch {
-	case !hadPrior || prior == nil || len(prior.RawJSON) == 0 || len(encoded) == 0:
+	case !hadPrior || prior == nil || len(priorRaw) == 0 || len(encoded) == 0:
 		a.noPrior.Add(1)
-	case bytes.Equal(prior.RawJSON, encoded):
+	case bytes.Equal(priorRaw, encoded):
 		a.identical.Add(1)
 	default:
 		a.changed.Add(1)
-		ps := sha256.Sum256(prior.RawJSON)
+		ps := sha256.Sum256(priorRaw)
 		ns := sha256.Sum256(encoded)
 		slog.Warn("deps.list_narrow.would_change",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("prior_sha256", hex.EncodeToString(ps[:])),
 			slog.String("rebuilt_sha256", hex.EncodeToString(ns[:])),
-			slog.Int("prior_bytes", len(prior.RawJSON)),
+			slog.Int("prior_bytes", len(priorRaw)),
 			slog.Int("rebuilt_bytes", len(encoded)),
 			slog.String("effect", "SHADOW only (#603/#765): every mark this cell received since its last refresh "+
 				"was a would-avoid, and its refresh changed the bytes. Enforcement would have left it stale. "+

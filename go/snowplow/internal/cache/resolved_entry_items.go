@@ -96,6 +96,14 @@ func (e *ResolvedEntry) EnsureItems(
 	if e == nil {
 		return nil, "", "", false
 	}
+	// 0. #854 — an incremental entry: the current generation's items. A reader
+	// that needs them fresh as of a seq takes ListCell().Snapshot instead.
+	if c := e.listCell; c != nil {
+		if g := c.gen.Load(); g != nil {
+			return ListView{cell: c, gen: g}.Items(), c.apiVersion, c.kind, true
+		}
+		return nil, "", "", false
+	}
 	// 1. Eager Items from a Put-time parse.
 	if len(e.Items) > 0 {
 		lazyItemsEagerTotal.Add(1)

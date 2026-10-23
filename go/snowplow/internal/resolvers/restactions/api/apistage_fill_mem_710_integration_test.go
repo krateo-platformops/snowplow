@@ -217,6 +217,50 @@ const fmemAllocateBlackFills = 6
 // 0.653–0.690. 1.0 leaves ≈0.31 on each side.
 const fmemChargeFloor = 1.0
 
+// TestContentFill710_FMEM_SeedChargeCoversAnAnchoringFill is P-seed for a
+// fill that ANCHORS an incremental cell (#854). Anchoring decodes every item
+// into its slot and proves the pairing by re-marshalling the envelope, all
+// inside the admitted flight: a cold anchoring fill of 5,000 items measured
+// about 1.3x the allocations of a plain one (15.7-16.5 MB vs 12.5 MB), charged
+// at the same seed (ratio 1.06-1.12 against 1.40 plain). The floor is the same
+// fmemChargeFloor: an anchor grown heavier than the seed covers reads RED here
+// instead of the gate quietly admitting more anchoring fills than fit.
+// Each probe is a COLD list (its own namespace), so every probe is a MISS
+// fill; ns 0 warms the informer and the gate first.
+func TestContentFill710_FMEM_SeedChargeCoversAnAnchoringFill(t *testing.T) {
+	const probes = 3
+	newFill710MultiNSWatcher(t, probes+1, 5000)
+	t.Cleanup(cache.SetListCellAnchoringForTest(true))
+	store := cache.ResolvedCache()
+	fill710Admission(t)
+	fill710SpyDispatch(t, nil, nil, nil)
+	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
+		t.Fatalf("PRECONDITION: warm-up list not content-servable")
+	}
+	for n := 1; n <= probes; n++ {
+		anchors0 := cache.ListCellStatsSnapshot().Anchors
+		ResetContentFillStatsForTest()
+		restore := cache.SetAdmissionRuntimeSeamsForTest(func() int64 { return 1<<63 - 1 }, fill710HeapObjects)
+		runtime.GC()
+		a0 := fill710HeapAllocs()
+		_, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false)
+		alloc := fill710HeapAllocs() - a0
+		charged := contentFillAdmissionInflightWeightPeak.Load()
+		restore()
+		if !ok {
+			t.Fatalf("PRECONDITION: probe %d not content-servable", n)
+		}
+		if got := cache.ListCellStatsSnapshot().Anchors - anchors0; got != 1 {
+			t.Fatalf("PRECONDITION: probe %d anchored %d cells, want 1 (the arm must measure an ANCHORING fill)", n, got)
+		}
+		ratio := float64(charged) / float64(max(alloc, 1))
+		t.Logf("#854 F-MEM anchoring P-seed probe %d: charged %d B, allocated %d B, ratio %.3f (floor %.2f)", n, charged, alloc, ratio, fmemChargeFloor)
+		if ratio < fmemChargeFloor {
+			t.Errorf("F-MEM RED: the gate charged an anchoring fill %d B, %.3f x the %d B it allocates, under the %.2f floor", charged, ratio, alloc, fmemChargeFloor)
+		}
+	}
+}
+
 func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T) {
 	const (
 		lists   = 24

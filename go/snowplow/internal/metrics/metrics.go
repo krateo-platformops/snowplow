@@ -1726,13 +1726,13 @@ func registerContentFillExpansionInstruments(m metric.Meter) error {
 // series onto OTLP (no expvar->OTLP bridge). The observables read
 // restactionsapi.ContentFillStatsSnapshot, the accessor the expvar closures
 // read, so the surfaces cannot diverge. The only attribute is `reason`, a
-// closed code-defined set {absent, known_stale, refresh_forced}; the by-GVR
+// closed code-defined set {absent, known_stale, refresh_forced, reanchor}; the by-GVR
 // and by-RA tables stay expvar-only (data-derived keys). The duration is a
 // synchronous histogram fed through the api package's recorder hook (api
 // cannot import this package). Registered only when the cache is on (CFG-1).
 func registerContentFillInstruments(m metric.Meter) error {
 	total, err := m.Int64ObservableCounter("snowplow_apistage_content_fill_total",
-		metric.WithDescription("Apistage content fills started (a reader took the content-cell MISS branch: whole-list envelope build + decode + Put), by reason {absent, known_stale, refresh_forced}. #710."))
+		metric.WithDescription("Apistage content fills started (a reader took the content-cell MISS branch: whole-list envelope build + decode + Put), by reason {absent, known_stale, refresh_forced, reanchor}. #710."))
 	if err != nil {
 		return err
 	}

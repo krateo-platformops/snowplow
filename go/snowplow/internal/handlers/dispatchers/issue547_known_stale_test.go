@@ -1216,6 +1216,9 @@ func TestIssue547_F9_StructurallyPermanentSuppressionSkipsDemandRevalidation(t *
 
 // F3c + F3b (architect R1) — the content arm at the production boundary.
 func TestIssue547_F3c_KnownStaleFoundListIsShownThenReplaced(t *testing.T) {
+	// #854 — pins the PLAIN content cell: an incremental one is kept fresh by
+	// the informer deltas and never goes known-stale this way.
+	t.Cleanup(cache.SetListCellAnchoringForTest(false))
 	h := newK547Harness(t, k547DenyBackground)
 	h.contentMode = true
 	// The identity-free content cell's refresh is NOT SERVABLE across the whole

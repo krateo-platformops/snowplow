@@ -247,8 +247,10 @@ func (g *contentFillGate) calibrateLocked(gvr string, sample float64) {
 // dispatch. resident is the key's current cell (nil when absent); partition is
 // the informer partition's item count (ok=false when unknown).
 func predictContentFillRaw(gvr string, resident *cache.ResolvedEntry, partitionItems int, partitionOK bool) int64 {
-	if resident != nil && len(resident.RawJSON) > 0 {
-		return int64(len(resident.RawJSON))
+	// #854 — RawLen: an incremental list cell stores no RawJSON; its exact
+	// envelope length is maintained without building it.
+	if n := resident.RawLen(); n > 0 {
+		return int64(n)
 	}
 	g := theContentFillGate()
 	g.mu.Lock()
