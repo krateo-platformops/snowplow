@@ -104,8 +104,11 @@ records it (`TestIssue853_424Body_IsAnIdentityFreeStatus_EndToEnd`).
     request, never from the upstream (#709 A7). An apiserver NotFound names
     only the resource and the object.
   - It never names an identity. The message is replaced by the fixed text
-    `A data source this widget reads is not available.` when it is empty,
-    or when any form of it names one.
+    `The details of this data source can't be shown here.` when it is
+    empty, or when any form of it names one. Under the title "Data source
+    unavailable" (frontend#500), that subtitle adds what the title does not:
+    the detail exists and was withheld, not that it is unknown. It names
+    nothing.
     - The forms checked are the message as sent, plus its path-unescaped and
       query-unescaped forms (up to three rounds, for double escaping), all
       case-folded.

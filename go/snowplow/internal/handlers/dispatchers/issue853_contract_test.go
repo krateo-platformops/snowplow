@@ -355,6 +355,30 @@ func TestIssue853_424Message_NeverNamesAnIdentity(t *testing.T) {
 	}
 }
 
+// TestIssue853_424FallbackCopy: the withheld-detail 424 carries exactly the
+// agreed product copy. The literal is spelled out here, not read from the
+// constant, so a change to the copy has to change this test too. The copy is
+// the subtitle under the SPA title "Data source unavailable" (frontend#500): it
+// must not repeat that title, and it must pass the guard itself (it names
+// nothing).
+func TestIssue853_424FallbackCopy(t *testing.T) {
+	const want = "The details of this data source can't be shown here."
+	ctx := xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: i853Carol, Groups: i853CarolGroups}))
+	rec := httptest.NewRecorder()
+	encodeWidgetResolveError(ctx, rec, i853StatusErr(http.StatusNotFound, metav1.StatusReasonNotFound,
+		`configmaps "carol.smith" not found`))
+	if st := i853Body(t, rec); rec.Code != http.StatusFailedDependency || st.Message != want {
+		t.Fatalf("code=%d message=%q, want 424 %q", rec.Code, st.Message, want)
+	}
+	if strings.Contains(strings.ToLower(want), "data source unavailable") {
+		t.Fatalf("the fallback repeats the SPA title")
+	}
+	if got := dependencyFailureMessage(ctx, want); got != want {
+		t.Fatalf("the fallback itself does not pass the guard: %q", got)
+	}
+}
+
 // TestIssue853_424Message_UsernameAndDNSFormTokens: for a username without
 // "@" (no local part to fall back on), the username token and the DNS-1123
 // token each hide a message the other does not.

@@ -67,8 +67,11 @@ func encodeWidgetResolveError(ctx context.Context, wri http.ResponseWriter, err 
 }
 
 // dependencyFailureFallback is the 424 message when the dependency's own
-// message cannot be shown: it is empty, or it names an identity.
-const dependencyFailureFallback = "A data source this widget reads is not available."
+// message cannot be shown: it is empty, or it names an identity. The SPA
+// renders it as the subtitle under the title "Data source unavailable"
+// (frontend#500), so it adds what the title does not: the detail exists and
+// was withheld. It names nothing.
+const dependencyFailureFallback = "The details of this data source can't be shown here."
 
 // dependencyFailureMessage is the dependency's own message when it is safe to
 // show the user, else dependencyFailureFallback.
