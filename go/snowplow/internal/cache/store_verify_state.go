@@ -66,6 +66,9 @@ import (
 type gvrVerification struct {
 	// epoch — see the file header. Never the zero time for a registered GVR.
 	epoch time.Time
+	// lastAttempt is when the latest forced pass started, completed or not
+	// (#875). The walker's turn order only — never the age (noteVerifyAttempt).
+	lastAttempt time.Time
 	// verified is true once a verification has completed since the current
 	// epoch was set. It drives the "never" reading on /debug/servable's row,
 	// which is a different question from the age the gauge reports.
@@ -209,6 +212,19 @@ func invalidateStoreVerification(gvr schema.GroupVersionResource) {
 	storeVerify.mu.Unlock()
 }
 
+// noteVerifyAttempt stamps the start of a forced pass. It is ORDER, not
+// validity: the epoch, and so the age and every gauge, moves only when a pass
+// completes; the stamp only sends a GVR to the back of the walker's turn order
+// (nextOverdueGVR), so one whose passes keep ending inconclusive cannot hold
+// the head of it.
+func noteVerifyAttempt(gvr schema.GroupVersionResource) {
+	storeVerify.mu.Lock()
+	if st, ok := storeVerify.gvrs[gvr]; ok {
+		st.lastAttempt = time.Now()
+	}
+	storeVerify.mu.Unlock()
+}
+
 // noteVerified records a completed verification: the epoch advances, the object
 // count is kept for the R4 coverage assertion, and the breaker reads its verdict.
 //
@@ -309,6 +325,7 @@ func verificationDecorated(gvr schema.GroupVersionResource) (decorated, known bo
 // verificationRow is one GVR's bookkeeping, copied out for a reader.
 type verificationRow struct {
 	epoch                  time.Time
+	lastAttempt            time.Time
 	verified               bool
 	decorated              bool
 	ownsInformer           bool
@@ -327,6 +344,7 @@ func verificationRows() map[schema.GroupVersionResource]verificationRow {
 	for gvr, st := range storeVerify.gvrs {
 		out[gvr] = verificationRow{
 			epoch:                  st.epoch,
+			lastAttempt:            st.lastAttempt,
 			verified:               st.verified,
 			decorated:              st.decorated,
 			ownsInformer:           st.ownsInformer,
@@ -350,6 +368,7 @@ func verificationRowFor(gvr schema.GroupVersionResource) (verificationRow, bool)
 	}
 	return verificationRow{
 		epoch:                  st.epoch,
+		lastAttempt:            st.lastAttempt,
 		verified:               st.verified,
 		decorated:              st.decorated,
 		ownsInformer:           st.ownsInformer,

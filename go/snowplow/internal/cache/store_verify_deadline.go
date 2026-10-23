@@ -29,11 +29,15 @@
 // # THE LIST SHAPE, AND WHY IT CANNOT BE A QUORUM READ
 //
 //	PartialObjectMetadata          no bodies, ~100 B/object: ~5 MB for a 50K GVR
-//	ResourceVersion = lastSyncRV   our store's own position
+//	ResourceVersion = the store's  our store's own position, read when the pass
+//	  published position           opens (store_verify_delivery.go, #875)
 //	ResourceVersionMatch =         the cacher BLOCKS until it reaches that RV,
 //	  NotOlderThan                 so the snapshot is provably at least as fresh
-//	                               as our store — which removes the false
-//	                               positives a naive RV="0" read would invent
+//	                               as our store was when the pass opened — which
+//	                               removes the false positives a naive RV="0"
+//	                               read would invent. The store keeps moving
+//	                               after that; the keys it moves are recorded
+//	                               and re-read (store_verify_recheck.go, #872)
 //	Limit = 0                      REQUIRED. client-go's own rule: a LIST with a
 //	                               Limit and a non-zero resourceVersion is
 //	                               delegated to etcd and SKIPS the watch cache.
@@ -135,6 +139,15 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // Oldest-first rather than round-robin by registration order: a GVR that keeps
 // being missed must eventually reach the head, and ordering by epoch is what
 // guarantees it rather than assuming it.
+//
+// "Oldest" is the later of the epoch and the last ATTEMPT (#875). Whether a GVR
+// is overdue is still its epoch alone, so its age and the gauges stay true; but
+// a GVR whose pass keeps ending inconclusive (a failing LIST or re-check) never
+// advances its epoch, and ordered by epoch alone it would be re-picked at every
+// pace interval, re-LISTed in full each time, while every other overdue GVR
+// waited behind it. With the attempt in the order it goes to the back after
+// each try and the others get their turn. Nothing is limited or skipped: every
+// overdue GVR is still attempted, in turn.
 func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 	rows := verificationRows()
 	if len(rows) == 0 {
@@ -157,8 +170,12 @@ func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 		if now.Sub(row.epoch) <= deadline {
 			continue
 		}
-		if !found || row.epoch.Before(oldest) {
-			pick, oldest, found = gvr, row.epoch, true
+		turn := row.epoch
+		if row.lastAttempt.After(turn) {
+			turn = row.lastAttempt
+		}
+		if !found || turn.Before(oldest) {
+			pick, oldest, found = gvr, turn, true
 		}
 	}
 	return pick, governed, found
@@ -169,49 +186,61 @@ func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 // across I/O, and nothing holds rw.mu and the verification registry mutex at
 // the same time.
 func forcedPassInputs(gvr schema.GroupVersionResource) (
-	cli metadata.Interface, rv string, idx clientcache.Indexer, skip string,
+	cli metadata.Interface, rv string, idx clientcache.Indexer, dl *deliveryLog, skip string,
 ) {
 	rw := Global()
 	if rw == nil || rw.mode == modePassthrough {
-		return nil, "", nil, verifySkipTornDown
+		return nil, "", nil, nil, verifySkipTornDown
 	}
 	rw.mu.RLock()
 	defer rw.mu.RUnlock()
 
 	gi, ok := rw.informers[gvr]
 	if !ok || gi == nil {
-		return nil, "", nil, verifySkipTornDown
+		return nil, "", nil, nil, verifySkipTornDown
 	}
 	inf := gi.Informer()
 	if inf == nil {
-		return nil, "", nil, verifySkipTornDown
+		return nil, "", nil, nil, verifySkipTornDown
 	}
 	if !inf.HasSynced() {
 		// Not yet synced: the store is still filling, and comparing a partial
 		// store against a complete apiserver set would report the remainder as
 		// lost ADDs. Same guard, same reason, as the snapshot path's.
-		return nil, "", nil, verifySkipInitialSync
+		return nil, "", nil, nil, verifySkipInitialSync
 	}
 	if _, servable := rw.servableLocked(gvr); !servable {
 		// Retracted. The store is not being served from, so a comparison
 		// against it would measure a cache nobody is reading — and the
 		// retraction has already invalidated this GVR's verification, so the
 		// deadline re-verifies it as soon as it is confirmed again.
-		return nil, "", nil, verifySkipTornDown
+		return nil, "", nil, nil, verifySkipTornDown
 	}
 	if rw.metaClient == nil {
 		// main.go's metadata.NewForConfig can legitimately fail, and the pass
 		// must SAY it cannot run rather than silently not running. A forced
 		// pass that quietly does nothing is a zero that reads as health.
-		return nil, "", nil, verifySkipMetaClientNil
+		return nil, "", nil, nil, verifySkipMetaClientNil
 	}
-	return rw.metaClient, rw.lastSyncRV[gvr], inf.GetIndexer(), ""
+	dl = rw.deliveries[gvr]
+	if dl == nil {
+		// #875 — the informer's transform could not be installed, so nothing
+		// records which keys the reflector delivers during a pass. Without
+		// that record the pass can neither tell a store that moved past the
+		// LIST from a lost event (#872) nor re-read every candidate without
+		// an unbounded GET burst, so it says it cannot run.
+		return nil, "", nil, nil, verifySkipNoDeliveryRecord
+	}
+	return rw.metaClient, rw.lastSyncRV[gvr], inf.GetIndexer(), dl, ""
 }
 
 // forcedVerify runs one full comparison of a GVR against the apiserver and, on
 // a confirmed divergence, queues a repair.
 func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
-	cli, rv, idx, skip := forcedPassInputs(gvr)
+	// #875 — stamped before anything can end the pass, so a GVR that keeps
+	// ending inconclusive rotates to the back of the walker's order.
+	noteVerifyAttempt(gvr)
+	cli, rv, idx, dl, skip := forcedPassInputs(gvr)
 	if skip != "" {
 		recordVerifySkipped(skip)
 		return
@@ -256,8 +285,20 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		recordVerifySkipped(verifySkipNoSyncPosition)
 		return
 	}
+	// #875 — open the pass BEFORE the LIST: from here every key the reflector
+	// delivers is recorded, and the LIST is no older than the position read
+	// at this instant (store_verify_delivery.go). That position, not the one
+	// the last confirm pass copied into lastSyncRV, is what the LIST carries:
+	// the record starts now, so the LIST's lower bound must be now too, or a
+	// delivery between the two would be neither recorded nor in the LIST.
+	win := dl.openPass(idx)
+	defer win.close()
+	if win.position == "" {
+		recordVerifySkipped(verifySkipNoSyncPosition) // same reason, same rule: never RV="0"
+		return
+	}
 	opts := metav1.ListOptions{
-		ResourceVersion:      rv,
+		ResourceVersion:      win.position,
 		ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
 		Limit:                0, // MUST stay 0 — see the file header.
 	}
@@ -287,13 +328,19 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		}
 	}
 	report := compareStore(idx, upstream)
+	// Closed only now: compareStore's confirm loop reads the store until it
+	// returns, so a delivery landing during that loop must be in the record.
+	delivered := win.close()
 	// #872 — the store kept moving while the LIST was in flight, so a
-	// divergence counts only if it still holds against the object's current
-	// state (store_verify_recheck.go). A failed re-check makes the pass
+	// divergence the store may have moved past counts only if it still holds
+	// against the object's current state (store_verify_recheck.go). #875 —
+	// only a key delivered during the pass can have moved; every other
+	// candidate is counted as it stands. A failed re-check makes the pass
 	// inconclusive: nothing is published or repaired, and the GVR is not marked
 	// verified, so the deadline walker comes back to it.
 	if report.total() > 0 {
-		rechecked, ok := recheckAgainstCurrent(ctx, cli, gvr, idx, report)
+		mayHaveMoved := func(key string, class divergenceClass) bool { return win.delivered(delivered, key, class) }
+		rechecked, ok := recheckAgainstCurrent(ctx, cli, gvr, idx, report, mayHaveMoved)
 		if !ok {
 			recordVerifySkipped(verifySkipRecheckError)
 			slog.Warn("cache.store.verification_recheck_failed",

@@ -99,6 +99,10 @@ const (
 	// the pass could not tell a real divergence from the store having moved
 	// past the LIST. Nothing was published or repaired; the GVR stays due.
 	verifySkipRecheckError = "recheck_error"
+	// #875 — the informer's transform could not be installed, so no record of
+	// which keys the reflector delivered during a pass exists, and the pass
+	// cannot tell a store that moved past the LIST from a lost event.
+	verifySkipNoDeliveryRecord = "no_delivery_record"
 )
 
 // Unverifiable reasons — a registered GVR that no verification mechanism
@@ -187,8 +191,9 @@ type StoreVerificationStats struct {
 	DivergentUIDMismatchForced   uint64 `stat:"store_divergent_uid_mismatch_forced_total" desc:"Same class, found by the forced pass. DURING #237's ten-day staleness: >=1. Healthy: 0. Load-bearing rather than defensive — the ten-day case IS a uid phantom."`
 	DivergenceCandidatesTotal    uint64 `stat:"store_divergence_candidates_total" desc:"RAW divergences seen before the bounded re-read confirmed them. DURING: >= the sum of the confirmed counters. Healthy: ~0. A large candidates-minus-confirmed gap is a DeltaFIFO backlog (the indexer lagging the queue), NOT a store defect — which is why the raw number is published rather than hidden."`
 
-	RecheckGETsTotal    uint64 `stat:"store_divergence_recheck_gets_total" desc:"Quorum metadata GETs the forced pass issued to re-check divergence candidates against the objects' CURRENT state (#872). Bounded at two per candidate that survived the confirm loop — never the GVR's object count. Healthy: ~0 on a quiet cluster, tens per pass under churn."`
-	RecheckClearedTotal uint64 `stat:"store_divergence_recheck_cleared_total" desc:"Forced-pass candidates the re-check cleared: the store already agreed with the object's current state, i.e. it had moved past the LIST, not lost anything (#872). NOT a defect counter. Under churn this is what the forced lost-update counters used to report as losses and repair."`
+	RecheckGETsTotal        uint64 `stat:"store_divergence_recheck_gets_total" desc:"Quorum metadata GETs the forced pass issued to re-check divergence candidates against the objects' CURRENT state (#872). Only a candidate whose key the reflector delivered while the pass was open is re-checked (#875), at most twice, so this is bounded by the churn during passes — never the GVR's object count, and 0 for a wholly divergent store nothing is delivering to. Healthy: ~0 on a quiet cluster, tens per pass under churn."`
+	RecheckClearedTotal     uint64 `stat:"store_divergence_recheck_cleared_total" desc:"Forced-pass candidates the re-check cleared: the store already agreed with the object's current state, i.e. it had moved past the LIST, not lost anything (#872). NOT a defect counter. Under churn this is what the forced lost-update counters used to report as losses and repair."`
+	RecheckUndeliveredTotal uint64 `stat:"store_divergence_recheck_undelivered_total" desc:"Forced-pass candidates counted WITHOUT a re-check because nothing was delivered for their key while the pass was open, so the store cannot have moved past the LIST for them (#875). Each is also in the forced divergence counters. DURING #237's broken-store class: ~the GVR's object count, with store_divergence_recheck_gets_total flat. Healthy: 0."`
 
 	// --- the detectors for a broken detector ---
 	GVRsUnverified            int64   `stat:"store_gvrs_unverified" kind:"gauge" desc:"Servable, synced, reachable GVRs whose last verification is older than maxVerificationAge. DURING #237 with B working this reads 0 — the deadline reached the GVR and found the divergence. It is NOT the #237 detector; it is the DENOMINATOR that makes a zero divergence readable. (unverified 0, divergent 0) = I looked and found nothing. (unverified >0, divergent 0) = I DID NOT LOOK. That distinction is exactly what the 1.12.6 audit's divergent:0 could not express. Healthy: 0."`
@@ -313,6 +318,7 @@ func StoreVerificationStatsSnapshot() StoreVerificationStats {
 		DivergenceCandidatesTotal:    storeDivergenceCandidates.Load(),
 		RecheckGETsTotal:             storeRecheckGETsTotal.Load(),
 		RecheckClearedTotal:          storeRecheckClearedTotal.Load(),
+		RecheckUndeliveredTotal:      storeRecheckUndeliveredTotal.Load(),
 
 		GVRsUnverified:            unverified,
 		GVRsUnverifiable:          unverifiable,
@@ -382,6 +388,7 @@ func ResetStoreVerificationStatsForTest() {
 	storeDivergenceCandidates.Store(0)
 	storeRecheckGETsTotal.Store(0)
 	storeRecheckClearedTotal.Store(0)
+	storeRecheckUndeliveredTotal.Store(0)
 	storeVerifySkippedTotal.Store(0)
 	storeVerifyInvalidatedTotal.Store(0)
 	storeRepairsFiredTotal.Store(0)

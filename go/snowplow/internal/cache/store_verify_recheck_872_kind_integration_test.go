@@ -182,10 +182,12 @@ func TestStoreVerification872_Kind_HighChurnPublishesNoDivergence(t *testing.T) 
 	candidates := storeDivergenceCandidates.Load()
 	gets := storeRecheckGETsTotal.Load()
 	cleared := storeRecheckClearedTotal.Load()
+	undelivered := storeRecheckUndeliveredTotal.Load()
+	skipped := VerifySkippedByReasonSnapshot()
 	lu, ld, la, um := divergenceCounts(verifySiteForced)
-	t.Logf("#872 kind: %d forced passes at %.0f patches/s over %d objects: candidates=%d, re-check GETs=%d, cleared=%d, published update/delete/add/uid=%d/%d/%d/%d, repairs pending=%d, refused-unsupported=%d, skipped{recheck_error}=%d",
-		k872Passes, rate, k872Objects, candidates, gets, cleared, lu, ld, la, um, storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load(),
-		VerifySkippedByReasonSnapshot()[verifySkipRecheckError])
+	t.Logf("#872 kind: %d forced passes at %.0f patches/s over %d objects: candidates=%d, re-check GETs=%d, cleared=%d, counted without a re-check=%d, published update/delete/add/uid=%d/%d/%d/%d, repairs pending=%d, refused-unsupported=%d, skipped{recheck_error}=%d skipped{no_sync_position}=%d",
+		k872Passes, rate, k872Objects, candidates, gets, cleared, undelivered, lu, ld, la, um, storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load(),
+		skipped[verifySkipRecheckError], skipped[verifySkipNoSyncPosition])
 
 	// Non-vacuity: the churn really produced LIST-vs-store disagreement, so a
 	// zero below is the re-check working, not a quiet cluster.
@@ -201,8 +203,24 @@ func TestStoreVerification872_Kind_HighChurnPublishesNoDivergence(t *testing.T) 
 	if d, u := storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load(); d+int64(u) != 0 {
 		t.Errorf("#872 RED: %d repair attempt(s) under churn alone (queued %d, refused-unsupported %d)", d+int64(u), d, u)
 	}
-	if n := VerifySkippedByReasonSnapshot()[verifySkipRecheckError]; n != 0 {
-		t.Errorf("%d pass(es) were inconclusive on re-check errors against a healthy apiserver", n)
+	if n := skipped[verifySkipRecheckError] + skipped[verifySkipNoSyncPosition]; n != 0 {
+		t.Errorf("%d pass(es) did not complete against a healthy apiserver (recheck_error %d, no_sync_position %d)",
+			n, skipped[verifySkipRecheckError], skipped[verifySkipNoSyncPosition])
+	}
+	// The passes really ran: a hang or a skip would leave this short.
+	if got := storeVerifyForcedListsTotal.Load(); got != k872Passes {
+		t.Errorf("%d forced LISTs for %d passes", got, k872Passes)
+	}
+	// The re-check really ran and cleared what churn produced: a zero above
+	// must be the re-check working, not candidates silently dropped.
+	if cleared == 0 {
+		t.Errorf("the re-check cleared nothing although churn produced %d candidates — it did not run", candidates)
+	}
+	// #875 — with nothing lost, every candidate is one the store moved, so
+	// every one was delivered during its pass; one counted without a re-check
+	// would be a delivery the record missed.
+	if undelivered != 0 {
+		t.Errorf("#875 RED: %d candidate(s) counted without a re-check under churn alone — a delivery the record missed", undelivered)
 	}
 	// Bound: at most two quorum GETs per candidate, never the object count.
 	if gets > 2*candidates {

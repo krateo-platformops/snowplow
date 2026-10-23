@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -232,9 +233,12 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	// the informer deaf: the reflector establishes a watch, blocks on it, and
 	// receives nothing, which is what a dropped event stream looks like from
 	// inside the process.
-	dyn.PrependWatchReactor("*", func(k8stesting.Action) (bool, watch.Interface, error) {
+	dyn.PrependWatchReactor("*", func(a k8stesting.Action) (bool, watch.Interface, error) {
 		w := watch.NewFake()
 		t.Cleanup(w.Stop)
+		if a.GetResource() == repairGVR {
+			silentWatchLatest.Store(w)
+		}
 		return true, w, nil
 	})
 	// A LIST that carries a collection resourceVersion, as every real
@@ -311,6 +315,12 @@ func silentWatchCluster(t *testing.T, objs ...*unstructured.Unstructured) (*Reso
 	t.Cleanup(func() { SetGlobal(nil) })
 	return rw, dyn
 }
+
+// silentWatchLatest is the watch repairGVR's informer is blocked on. It stays
+// silent unless an arm writes to it: the #875 arms deliver an event through it
+// while a forced pass's LIST is in flight, which is the only way the store can
+// move past the LIST.
+var silentWatchLatest atomic.Pointer[watch.FakeWatcher]
 
 // clusterListRV is the collection resourceVersion the fake cluster reports on
 // every LIST. Fixed rather than incrementing: the arms assert that the forced

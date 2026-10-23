@@ -19,23 +19,41 @@
 // Create/expire churn produces the same thing in the other classes (deleted
 // after the LIST reads as a lost ADD, created after it as a lost DELETE).
 //
+// # WHICH CANDIDATES ARE RE-CHECKED (#875)
+//
+// Only a candidate the store may have MOVED during the pass: its key was
+// delivered by the reflector while the pass was open, or, for a lost ADD, it
+// was in the store when the pass opened and is gone now. Every other candidate
+// is counted as it stands, with no GET: nothing reached the store for it, so it
+// cannot be ahead of a LIST no older than the store was at open, and its
+// disagreement with that LIST is a real one. Why "delivered" is exactly the
+// set that can be ahead, and how it is recorded, is store_verify_delivery.go.
+//
+// Re-checking every candidate instead was #875's FAIL: a wholly divergent store
+// (#237's broken-store class) makes every stored object a candidate, so the
+// re-check issued two quorum GETs per object before the one repair (400 for 200
+// objects; ~100K at 50K), and any one of them failing made the pass
+// inconclusive, so the store most in need of a repair could be kept from ever
+// getting one.
+//
 // # THE RE-CHECK
 //
-// Each candidate that survived the confirm loop is read again, ONE object, as a
-// quorum metadata GET (resourceVersion unset: the apiserver serves the current
-// state from etcd, not the watch cache). That read is the object's current
-// truth, and the candidate counts only if the store still disagrees with it
-// after the same bounded drain wait the confirm loop already uses — the store
-// is allowed to lag the quorum read by the events in flight, exactly as it is
-// allowed to lag the LIST. No resourceVersion is ever ordered: equality with a
-// fresh read is the whole test, so the API contract (RVs are opaque) holds.
+// Each such candidate that survived the confirm loop is read again, ONE object,
+// as a quorum metadata GET (resourceVersion unset: the apiserver serves the
+// current state from etcd, not the watch cache). That read is the object's
+// current truth, and the candidate counts only if the store still disagrees
+// with it after the same bounded drain wait the confirm loop already uses — the
+// store is allowed to lag the quorum read by the events in flight, exactly as
+// it is allowed to lag the LIST. No resourceVersion is ever ordered: equality
+// with a fresh read is the whole test, so the API contract (RVs are opaque)
+// holds.
 //
 // A candidate still divergent is read ONCE more. If the object moved between
 // the two reads, the second read is the one the store is held to; either way
 // what remains divergent after the second read counts. That bounds the GETs at
-// two per candidate, and the candidates at what the confirm loop left, which on
-// a healthy process is a handful and on the bench is the tens the old counter
-// reported — never the GVR's object count.
+// two per re-checked candidate, and the re-checked candidates at the keys
+// delivered during the pass: the churn in that window, never the GVR's object
+// count.
 //
 // The class is re-derived from the fresh read rather than carried over: a
 // candidate the LIST called a lost UPDATE may be a lost DELETE now (it was
@@ -72,25 +90,46 @@ import (
 )
 
 var (
-	storeRecheckGETsTotal    atomic.Uint64
-	storeRecheckClearedTotal atomic.Uint64
+	storeRecheckGETsTotal        atomic.Uint64
+	storeRecheckClearedTotal     atomic.Uint64
+	storeRecheckUndeliveredTotal atomic.Uint64
 )
 
 // recheckReads is the number of quorum reads per candidate (see the header).
 const recheckReads = 2
 
-// recheckAgainstCurrent returns rep with only the divergences that still hold
-// against the objects' current state. ok=false means a re-check read failed
-// and the pass is inconclusive (see the header).
+// recheckAgainstCurrent returns rep with only the divergences that still hold:
+// a candidate mayHaveMoved reports false is kept as it stands; every other one
+// is kept only if it still holds against the object's current state. ok=false
+// means a re-check read failed and the pass is inconclusive (see the header).
 func recheckAgainstCurrent(ctx context.Context, cli metadata.Interface, gvr schema.GroupVersionResource,
-	idx clientcache.Indexer, rep divergenceReport) (divergenceReport, bool) {
+	idx clientcache.Indexer, rep divergenceReport, mayHaveMoved func(string, divergenceClass) bool) (divergenceReport, bool) {
 
-	keys := make([]string, 0, rep.total())
-	for _, set := range [][]string{rep.lostUpdate, rep.lostDelete, rep.lostAdd, rep.uidMismatch} {
-		keys = append(keys, set...)
-	}
 	out := divergenceReport{objectsCompared: rep.objectsCompared, candidates: rep.candidates}
+	var keys []string
+	for _, set := range []struct {
+		class divergenceClass
+		keys  []string
+		out   *[]string
+	}{
+		{classLostUpdate, rep.lostUpdate, &out.lostUpdate},
+		{classLostDelete, rep.lostDelete, &out.lostDelete},
+		{classLostAdd, rep.lostAdd, &out.lostAdd},
+		{classUIDMismatch, rep.uidMismatch, &out.uidMismatch},
+	} {
+		for _, key := range set.keys {
+			if mayHaveMoved(key, set.class) {
+				keys = append(keys, key)
+				continue
+			}
+			*set.out = append(*set.out, key)
+		}
+	}
+	// Counted only on the paths that return the report: an inconclusive pass
+	// publishes none of these, and the counter says each one was published.
+	counted := out.total()
 	if len(keys) == 0 {
+		storeRecheckUndeliveredTotal.Add(counted)
 		return out, true
 	}
 
@@ -137,7 +176,8 @@ func recheckAgainstCurrent(ctx context.Context, cli metadata.Interface, gvr sche
 			out.uidMismatch = append(out.uidMismatch, key)
 		}
 	}
-	storeRecheckClearedTotal.Add(uint64(len(keys)) - out.total())
+	storeRecheckClearedTotal.Add(uint64(len(keys)) - (out.total() - counted))
+	storeRecheckUndeliveredTotal.Add(counted)
 	return out, true
 }
 
