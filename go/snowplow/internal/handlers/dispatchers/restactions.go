@@ -366,6 +366,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContextFromEpoch(ctx, cacheKey, depEpoch, cache.DepKey{
 			GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
+		// #890/#893 — a resolve whose cell is not stored (refused, declined, failed)
+		// leaves no edges behind; a stored cell keeps them (DepTracker.ReleaseUnstored).
+		defer cache.Deps().ReleaseUnstored(ctx, cacheKey)
 		// #710 PR-2b — this response is armable when its cell is stored, so its
 		// resolve may be served a KNOWN-STALE content cell at once (D2, "show then
 		// replace"); the sink carries the fact to the Put below (StaleDerived) and

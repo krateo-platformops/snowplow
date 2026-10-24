@@ -173,6 +173,8 @@ func (s *SeedDeclinedExternalSet) Reset() {
 	s.m.Range(func(k, _ any) bool {
 		if _, loaded := s.m.LoadAndDelete(k); loaded {
 			s.size.Add(-1)
+			// #890/#893 — see ForgetCoordinate: the dropped mark held its key's edges.
+			Deps().ReleaseUnstored(context.Background(), k.(string))
 		}
 		return true
 	})
@@ -195,6 +197,9 @@ func (s *SeedDeclinedExternalSet) ForgetCoordinate(gvr schema.GroupVersionResour
 		if _, loaded := s.m.LoadAndDelete(k); loaded {
 			s.size.Add(-1)
 			n++
+			// #890/#893 — the mark held its key's edges; nothing re-resolves a
+			// GONE cell, so a non-resident key's edges go with the mark.
+			Deps().ReleaseUnstored(context.Background(), k.(string))
 		}
 		return true
 	})

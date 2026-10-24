@@ -97,7 +97,9 @@ func WithL1KeyContext(ctx context.Context, l1Key string) context.Context {
 	// inner-call dispatch PRESERVES the parent ctx (one sink per resolve). A gen-guarded Put
 	// whose ctx has no sink (a resolve that Put without setting an L1 key — e.g. a content-
 	// populate path keyed directly) is caught by remarkIfDepsMoved's nil-sink detector.
-	return WithDepGenSink(context.WithValue(ctx, ctxKeyL1Record, l1Key))
+	ctx = WithDepGenSink(context.WithValue(ctx, ctxKeyL1Record, l1Key))
+	depGenSinkFromContext(ctx).key = l1Key // #890: this resolve's own key
+	return ctx
 }
 
 // DepGenEpochNow returns the current dep-event sequence (#375). A customer handler
@@ -139,6 +141,7 @@ func WithL1KeyContextFromEpoch(ctx context.Context, l1Key string, epoch uint64, 
 		startSeq: epoch,
 		deps:     append([]DepKey(nil), pre...),
 		parent:   depGenSinkFromContext(ctx),
+		key:      l1Key, // #890
 	})
 }
 
@@ -589,6 +592,25 @@ type depGenSink struct {
 	// each with its Put identity and the deps it covers. A declined-external
 	// mark folds them in: the mark retires when a served cell is re-Put or gone.
 	served []ServedCell
+	// key / own — #890: the L1 key this resolve populates (set by WithL1KeyContext*;
+	// "" for a content child sink), and the deps this resolve recorded UNDER that
+	// key — the edges an accepted write of key re-asserts if a concurrent strip
+	// took them (reassertOwnEdges). Deduped by ownSeen, under mu.
+	key     string
+	own     []DepKey
+	ownSeen map[DepKey]struct{}
+}
+
+// addOwnLocked notes dk as recorded under the sink's own key. Caller holds s.mu.
+func (s *depGenSink) addOwnLocked(dk DepKey) {
+	if s.ownSeen == nil {
+		s.ownSeen = make(map[DepKey]struct{})
+	}
+	if _, dup := s.ownSeen[dk]; dup {
+		return
+	}
+	s.ownSeen[dk] = struct{}{}
+	s.own = append(s.own, dk)
 }
 
 // addDepLocked appends dk unless already present. Caller holds s.mu.
@@ -852,6 +874,9 @@ type DepTracker struct {
 	dirtyMarkTotal     atomic.Uint64 // dirty-marks (OnAdd/OnUpdate + OnDelete non-self)
 	enqueueUpdateTotal atomic.Uint64 // refresh enqueues triggered by OnUpdate
 	removeL1Total      atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
+	// reassertedEdgesTotal — #890: edges an accepted write re-recorded because a
+	// concurrent strip of its then non-resident key had taken them (test seam).
+	reassertedEdgesTotal atomic.Uint64
 
 	// #603 PR-2 / #765 option B — the list-interest SHADOW (deps_list_interest.go):
 	// per-edge interest, the handler-side masks' registry, the would-avoid
@@ -1071,6 +1096,9 @@ func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk De
 	for s := depGenSinkFromContext(ctx); s != nil; s = s.parent {
 		s.mu.Lock()
 		s.addDepLocked(dk)
+		if s.key != "" && s.key == l1Key {
+			s.addOwnLocked(dk) // #890
+		}
 		if recheck == nil && s.putKey != "" && s.putKey == l1Key && !s.putRemarked {
 			recheck = s // #375 C3: a Record for a key this sink's resolve already Put
 		}
@@ -1227,6 +1255,67 @@ func coordinateBuckets(gvr schema.GroupVersionResource, namespace, name string) 
 		n++
 	}
 	return out, n
+}
+
+// reassertOwnEdges — #890: re-record, under key, every dep ctx's resolve recorded
+// under key that the tracker no longer holds (a concurrent strip of the then
+// non-resident key took it). Called by the store's accepted writes while they hold
+// the store lock, so the published cell and its edges appear together. Only
+// MISSING edges are recorded, and in plain mode: a plain record of a list edge is
+// "unknown interest: every event marks" — conservative, never a missed
+// invalidation — and an edge that is present keeps its own mode and narrowing
+// state untouched. No sink, no key match, or nothing missing: no work beyond one
+// lookup per own dep.
+func (d *DepTracker) reassertOwnEdges(ctx context.Context, key string) {
+	if d == nil || key == "" {
+		return
+	}
+	for s := depGenSinkFromContext(ctx); s != nil; s = s.parent {
+		if s.key != key {
+			continue
+		}
+		s.mu.Lock()
+		own := append([]DepKey(nil), s.own...)
+		s.mu.Unlock()
+		for _, dk := range own {
+			if !d.hasEdge(key, dk) {
+				// No ctx: the resolve's sink already holds dk, and the remark /
+				// capture bookkeeping a ctx would drive belongs to the original record.
+				d.recordInternalMode(context.Background(), key, dk, recordPlain)
+				d.reassertedEdgesTotal.Add(1)
+			}
+		}
+		return
+	}
+}
+
+// ReleaseUnstored — #890 / #893: called when a resolve of l1Key ends (deferred at
+// every production site that installs an L1 resolve scope, WithL1KeyContext*). If
+// the resolve's write did not leave l1Key resident — refused, declined by a Put
+// gate, or never reached because the resolve failed — the edges it recorded belong
+// to no cell, and they are stripped through the store's eviction path
+// (stripDepEdges → RemoveL1Key, which also tells the resolve memos). A resident key
+// is untouched. One lock-free lookup when the key holds no edges.
+//
+// Two things keep a non-resident key's edges, and both are checked here:
+//   - an inert (#443 dry-run) resolve leaves no trace, so its end changes nothing;
+//   - a #643 declined-external mark HOLDS its key: it judges whether its facts
+//     still hold by those very edges (DepsMovedSinceUncovered reads the buckets
+//     they anchor; without them the GVR floor would retire the mark on any event
+//     of the type and re-dial the external endpoint every pass). The mark's
+//     retirement re-resolves the cell (whose own end releases) or, for GONE and
+//     a config redrive, releases the key itself (SeedDeclinedExternalSet).
+func (d *DepTracker) ReleaseUnstored(ctx context.Context, l1Key string) {
+	if d == nil || l1Key == "" || Inert(ctx) || !d.hasEdges(l1Key) {
+		return
+	}
+	if EngineDeclinedExternalSet().Marked(l1Key) {
+		return
+	}
+	d.storeMu.RLock()
+	store := d.store
+	d.storeMu.RUnlock()
+	store.releaseUnstored(l1Key)
 }
 
 // hasEdges reports whether the tracker still holds edges recorded under l1Key —

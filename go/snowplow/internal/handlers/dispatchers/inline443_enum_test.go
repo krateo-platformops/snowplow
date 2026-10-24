@@ -75,6 +75,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ListNarrowShadowOn":                     readOnly443,
 	"CommitWhyOfAnalysis":                    readOnly443,
 	"DepTracker.ReplayEdgesWithStates":       gatedInCache443, // #765 B: ReplayEdges carrying the producer's interest states
+	"DepTracker.ReleaseUnstored":             gatedInCache443, // #890/#893: strips a non-resident key's edges at a resolve's end; returns under Inert
 	"ResolvedCacheStore.PutIfGen":            gatedInCache443,
 	"ResolvedCacheStore.PutRAFullListIfGen":  gatedInCache443,
 	"ResolvedCacheStore.NoteRAFullListSlice": gatedInCache443,

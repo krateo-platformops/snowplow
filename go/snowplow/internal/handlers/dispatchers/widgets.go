@@ -331,6 +331,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContextFromEpoch(ctx, cacheKey, depEpoch, cache.DepKey{
 			GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
+		defer cache.Deps().ReleaseUnstored(ctx, cacheKey) // #890/#893 — see restactions.go
 		// #710 PR-2b — armable response: its resolve may be served a known-stale
 		// content cell at once (D2); see restactions.go.
 		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "widgets")

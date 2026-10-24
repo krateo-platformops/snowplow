@@ -402,6 +402,15 @@ func raFullListServe(
 	}
 	fullCtx := cache.WithL1KeyContextFromEpoch(ctx, raKey, raEpoch,
 		cache.DepKey{GVR: gvr, Namespace: namespace, Name: name})
+	// #890/#893 — an unpaginated resolve under fullCtx records edges under raKey;
+	// if its full list is not stored they are released when this serve returns.
+	// The fast-path hit records nothing under raKey, so it releases nothing.
+	resolvedFull := false
+	defer func() {
+		if resolvedFull {
+			cache.Deps().ReleaseUnstored(fullCtx, raKey)
+		}
+	}()
 
 	// Single source of truth for the sliceShape — the SAME derivation the #42
 	// FIX-B pre-check (SeedFullListShapeKnownNonSliceable) uses, so the seed
@@ -502,6 +511,7 @@ func raFullListServe(
 		if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
 			c.ForgetRAFullListConsumer(raKey, widgetL1Key)
 		}
+		resolvedFull = true
 		full, rerr := resolveRA(fullCtx, 0, 0)
 		if rerr != nil {
 			return nil, false, rerr
@@ -574,6 +584,7 @@ func raFullListServe(
 	if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
 		c.ForgetRAFullListConsumer(raKey, widgetL1Key)
 	}
+	resolvedFull = true
 	full, err := resolveRA(fullCtx, 0, 0)
 	if err != nil {
 		return nil, false, err

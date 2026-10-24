@@ -1647,6 +1647,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	// Plain Put is never a re-mint (no ctx, exempt carriers) → freshMint=false.
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key), false)
+	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, provenanceKnown, key, samePrior, entry)
 	ksEnd := endKnownStaleOnPut(ctx, key) // #547/#734/#884 — see PutIfGen (no sink on a plain Put: a no-op)
 	c.mu.Unlock()
@@ -1685,6 +1686,60 @@ func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entr
 	Deps().remarkIfDepsMovedFrom(ctx, key, true)
 }
 
+// #890 / #893 — EDGES OF A CELL THAT IS NOT STORED.
+//
+// A resolve records dep edges under its L1 key while it runs, before its write.
+// When the write does not land — refused (#189: the cell was evicted during the
+// resolve), declined by a Put gate, or never reached (an error) — and the cell is
+// not resident, those edges belong to no cell, and nothing would strip them: the
+// eviction already ran. They keep dirty-marking a key with no entry, and, since
+// #883, keep the resolve-memo entries linked to that key alive.
+//
+// The mechanism has two halves, and they only work together:
+//
+//   - releaseUnstoredLocked STRIPS the edges of a NON-resident key (the refusal
+//     here; DepTracker.ReleaseUnstored at every resolve's end for declines and
+//     errors). It strips every edge of the key, including those of another
+//     resolve of the same key still in flight — so, alone, that resolve could be
+//     stored with edges someone else took away.
+//   - reassertOwnEdgesLocked closes that: an ACCEPTED write re-records, under the
+//     same lock that publishes the cell, every edge its own resolve recorded under
+//     the key that is no longer there (depGenSink.own). A stored cell therefore
+//     always holds its resolve's edges, whatever was stripped meanwhile.
+//
+// Nothing is fenced: no generation is bumped, so overlapping fills of a hot key are
+// never refused by a strip (the #506 failure of the first #890 design, where every
+// refusal bumped the generation and refused the next overlapping fill in turn). And
+// nothing here reads a generation, so the reuse of generation numbers after a
+// tombstone expires cannot matter.
+
+// releaseUnstoredLocked strips key's dep edges if key is not resident. mu held.
+func (c *ResolvedCacheStore) releaseUnstoredLocked(key string) {
+	if _, live := c.index[key]; live {
+		return // a resident cell's edges are its own write's
+	}
+	c.stripDepEdges(key)
+}
+
+// releaseUnstored is releaseUnstoredLocked taking the lock.
+func (c *ResolvedCacheStore) releaseUnstored(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.releaseUnstoredLocked(key)
+	c.mu.Unlock()
+}
+
+// reassertOwnEdgesLocked re-records the edges ctx's resolve recorded under key
+// that the tracker no longer holds (see above). Called by every accepted write
+// that carries the resolve's ctx, right after putCoreLocked. mu held.
+func (c *ResolvedCacheStore) reassertOwnEdgesLocked(ctx context.Context, key string) {
+	if d := Deps(); d != nil {
+		d.reassertOwnEdges(ctx, key)
+	}
+}
+
 // PutIfGen is the #189 generation-guarded write. It stores entry under key ONLY
 // if key's current generation still equals capturedGen — the value the caller
 // read via CaptureGen BEFORE the resolve/fetch that produced entry. If a
@@ -1708,6 +1763,7 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 		// The key was DELETE-evicted (or otherwise removed) between capture and
 		// now — the eviction is authoritative; drop the stale body on the floor.
 		c.putRefusedGenerationMovedTotal.Add(1)
+		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
 		NoteRefreshWrite(ctx, key, false) // #547: a demand revalidation's outcome
 		return false
@@ -1718,6 +1774,7 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 	clearRefreshSuppression(key)
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
+	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
 	// #547/#884 — an accepted Put ends a KNOWN-STALE state (a newer mark leaves an
 	// ordinary open window). #734 — in the critical section that publishes the
@@ -1768,12 +1825,14 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 		// generation (a cold request re-inserted it) — refuse, do not clobber or
 		// resurrect. The eviction / newer write is authoritative.
 		c.putRefusedGenerationMovedTotal.Add(1)
+		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
 		return false
 	}
 	clearRefreshSuppression(key)
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
+	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
 	ksEnd := endKnownStaleOnPut(ctx, key) // #547/#734/#884 — see PutIfGen
 	c.mu.Unlock()
@@ -1852,6 +1911,7 @@ func (c *ResolvedCacheStore) ReplaceIfGenRefresh(ctx context.Context, key string
 	if !live || el.Value.(*lruItem).gen != capturedGen {
 		// Absent or gen-moved: refuse exactly like ReplaceIfGen.
 		c.putRefusedGenerationMovedTotal.Add(1)
+		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
 		return false
 	}
@@ -1865,6 +1925,7 @@ func (c *ResolvedCacheStore) ReplaceIfGenRefresh(ctx context.Context, key string
 	clearRefreshSuppression(key)
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, freshMint)
+	c.reassertOwnEdgesLocked(ctx, key) // #890
 	if freshMint {
 		c.noteRemintLocked(entry)
 	}
