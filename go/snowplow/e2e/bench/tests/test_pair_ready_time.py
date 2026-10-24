@@ -316,16 +316,17 @@ def test_run15_without_b_restarts_computes_over_the_jointly_ready_windows(tmp_pa
 K0 = P14["t0"] + P14["calls"][0][0]           # k6's first call
 
 
-def _down(doc, t0, t1, *, restart=True, prewarm_tail=0):
-    """doc with snowplow down over [K0 + t0, K0 + t1): readyz 0 inside; after
-    a restart its counters start again, and `prewarm_tail` more samples answer
-    readyz 200 with the cold start not complete. Pod records count the restarts."""
+def _down(doc, t0, t1, *, restart=True, prewarm_tail=0, code=0):
+    """doc with snowplow down over [K0 + t0, K0 + t1): readyz `code` inside
+    (0 = no reply); after a restart its counters start again, and
+    `prewarm_tail` more samples answer readyz 200 with the cold start not
+    complete. Pod records count the restarts."""
     d = copy.deepcopy(doc)
     rows = [r for r in d["mem"] if r["kind"] == "mem"]
     a, b = K0 + t0, K0 + t1
     for r in rows:
         if a < r["t"] < b:
-            r.update(readyz=0, vars_status=0, prewarm_complete=None)
+            r.update(readyz=code, vars_status=0, prewarm_complete=None)
             r.pop("num_gc", None)
     after = [r for r in rows if r["t"] >= b]
     if restart:
@@ -411,21 +412,50 @@ def test_synthetic_a_only_restart_is_recorded_and_excluded_from_both(tmp_path):
     assert churn and all(c["excluded"]["a_s"] == c["excluded"]["b_s"] > 0 for c in churn)
 
 
+def _failing(doc, lo, hi):
+    """every k6 request from lo to hi s after the run's first call failed"""
+    d = copy.deepcopy(doc)
+    d["failed"] = [[o, 1 if lo <= o - d["calls"][0][0] < hi else v] for o, v in d["failed"]]
+    return d
+
+
 def test_synthetic_b_not_ready_without_restarting_fails(tmp_path):
-    """B answers readyz 0 for ~200 s without restarting (no counter reset, no
-    pod restart): its users saw it, so the pair FAILs, with the stretch, its
-    seconds and its signal; A's identical stretch would only be excluded."""
-    p = _arms(tmp_path / "b", P14, _shift(_down(P14, 900, 1100, restart=False), SHIFT))
+    """B's snowplow itself answers readyz 503 for ~200 s without restarting
+    (no counter reset, no pod restart): its users saw it, so the pair FAILs,
+    with the stretch, its seconds and its signal; A's identical stretch would
+    only be excluded."""
+    p = _arms(tmp_path / "b", P14, _shift(_down(P14, 900, 1100, restart=False, code=503), SHIFT))
     assert p["verdict"] == "FAIL" and p["candidate_restarts"]["result"] == "PASS"
     c = p["candidate_not_ready"]
     assert c["result"] == "FAIL" and c in p["checks"]
     (st,) = c["value"]["stretches"]
-    assert c["value"]["seconds"] == st["seconds"] >= 200 and "readyz 0" in st["why"]
-    assert "not Ready without restarting" in c["why"] and "readyz 0" in c["why"]
+    assert c["value"]["seconds"] == st["seconds"] >= 200 and "readyz 503" in st["why"]
+    assert "not Ready without restarting" in c["why"] and "readyz 503" in c["why"]
     assert {x["result"] for x in p["checks"] if ".pair[" in x["check"]} == {"PASS"}
-    p = _arms(tmp_path / "a", _down(P14, 900, 1100, restart=False), _shift(P14, SHIFT))
+    p = _arms(tmp_path / "a", _down(P14, 900, 1100, restart=False, code=503), _shift(P14, SHIFT))
     assert p["verdict"] == "PASS" and p["candidate_not_ready"]["result"] == "PASS"
     assert [it["what"] for it in p["exclusion"]["items"]] == ["A not_ready #1"]
+
+
+def test_synthetic_b_readyz_no_reply_k6_is_the_witness(tmp_path):
+    """B's sampler gets no reply to readyz (readyz 0) for ~200 s, no restart
+    signal. k6 decides: errors over its 1 % bar inside the stretch -> B was
+    not serving: FAIL; k6 served -> the stretch is jointly-Ready time (not
+    cut, its calls judged), with a NOTE. A's stretch stays excluded."""
+    down = _shift(_down(P14, 900, 1100, restart=False), SHIFT)
+    p = _arms(tmp_path / "fail", P14, _failing(down, 950, 1050))
+    c = p["candidate_not_ready"]
+    assert p["verdict"] == "FAIL" and c["result"] == "FAIL"
+    (st,) = c["value"]["stretches"]
+    assert st["k6"]["rate"] > 0.01 and "k6 saw" in st["why"] and "over the 0.01 bar" in st["why"]
+    p = _arms(tmp_path / "ok", P14, down)
+    assert p["verdict"] == "PASS" and p["candidate_not_ready"]["result"] == "PASS"
+    assert p["exclusion"]["items"] == []                     # not cut from either run
+    (w,) = p["b_witnessed_ready"]
+    assert w["k6"]["requests"] > 0 and w["k6"]["rate"] <= 0.01
+    assert any(n.startswith("B's readiness sampler:") and "kept as jointly-Ready time" in n for n in p["notes"])
+    p = _arms(tmp_path / "a", _down(P14, 900, 1100, restart=False), _shift(P14, SHIFT))
+    assert p["verdict"] == "PASS" and [it["what"] for it in p["exclusion"]["items"]] == ["A not_ready #1"]
 
 
 def test_synthetic_a_healthy_drops_the_phases_a_restarted_in(tmp_path):
@@ -688,12 +718,34 @@ def test_review_probe1_a_shorter_sample_never_makes_pass_easier():
         assert cut == {"p95_ms": "FAIL", "p99_ms": "INCONCLUSIVE"}[m], (m, cut)
 
 
+def test_review_the_cap_keeps_a_shorter_sample_from_loosening_pass():
+    """Calm blocks 0-29, volatile 30-39 (a 3x spike in 1 of 40 calls); the
+    first 12 calm blocks cut. Kept p99 is volatile, the whole phase's calm:
+    without the cap at A's whole-phase sd the scaled bar (1.43) is looser than
+    the full phase's (1.03) and B = 1.2 x A everywhere would PASS here while it
+    FAILs on the full phase. With the cap it does not PASS."""
+    rnd = random.Random(1)
+    calm = {(k, j): 100 + rnd.random() * 2 for k in range(40) for j in range(20)}
+    vol = {(k, j): (100 + rnd.random() * 2) * (1 + (rnd.random() * 3 if j == 0 and k % 2 else 0))
+           for k in range(40) for j in range(20)}
+    a_cs = _blocks_calls(40, lambda k, j: vol[(k, j)] if k >= 30 else calm[(k, j)])
+    excl = [(1000.0, 1120.0)]
+    b_cs = [(t, v * 1.2) for t, v in a_cs]
+    full = _probe_cell("steady", "p99_ms", a_cs, b_cs, [], [])
+    cut = _probe_cell("steady", "p99_ms", a_cs, b_cs, [], excl)
+    assert full["result"] == "FAIL" and _num(full["bar"]) < 1.2
+    assert _num(cut["bar"]) <= _num(full["bar"]) and cut["pass_bar_from"] == "A's whole-phase sd"
+    assert cut["result"] != "PASS", cut["line"]
+
+
 def test_review_probe2_the_replica_floor_keeps_the_band():
     """The reviewer's probe 2: 39.5 of a 1999.5 s storm jointly Ready, the
     replica above A's own spread. The kept sample's extra spread is charged
     against the replica too: the PASS bar sits below the FAIL bar and below
     the full storm's bar (805ad3bb: both bars = the replica, 1.10x PASSed,
-    no INCONCLUSIVE at all), and the line names the replica."""
+    no INCONCLUSIVE at all), and the line names the replica. The kept bar
+    is sized with a t quantile on its block pairs - 1 (4 blocks: 1 df), so
+    1.10x on 2 % of a calm storm does not PASS (23de078c: z, and it did)."""
     rnd = random.Random(2)
     a_cs = _blocks_calls(200, lambda k, j: 100 + rnd.random())
     wins = [("storm", float("-inf"), 3001.0)]
@@ -702,15 +754,17 @@ def test_review_probe2_the_replica_floor_keeps_the_band():
     full_c = _probe_cell("storm", "p95_ms", a_cs, a_cs, wins, [], replica=rep)
     c = _probe_cell("storm", "p95_ms", a_cs, a_cs, wins, excl, replica=rep)
     assert c["kept_s"] == 39.5 and c["full_s"] == 1999.5
+    assert c.get("kept_quantile", {}).get("df") == 1
     bar, fail_bar = _num(c["bar"]), _num(c["fail_bar"])
-    assert fail_bar == 1.1149 and bar < fail_bar and bar < _num(full_c["bar"]) == 1.1149
-    assert "PASS <= %s = replica bar 1.1149" % bar in c["line"] and "FAIL past 1.1149 (replica)" in c["line"]
+    assert fail_bar >= 1.1149 and bar < fail_bar and bar < _num(full_c["bar"]) == 1.1149
+    assert "PASS <= %s = replica bar 1.1149" % bar in c["line"] and "on 1 df" in c["line"]
     assert "(full-length sd)" not in c["line"]
-    mid = (bar + fail_bar) / 2
-    assert _probe_cell("storm", "p95_ms", a_cs, [(t, v * mid) for t, v in a_cs], wins, excl,
-                       replica=rep)["result"] == "INCONCLUSIVE"
-    assert _probe_cell("storm", "p95_ms", a_cs, [(t, v * 1.2) for t, v in a_cs], wins, excl,
-                       replica=rep)["result"] == "FAIL"
+
+    def at(k):
+        return _probe_cell("storm", "p95_ms", a_cs, [(t, v * k) for t, v in a_cs], wins, excl, replica=rep)
+    assert at(1.10)["result"] != "PASS"
+    assert at((bar + fail_bar) / 2)["result"] == "INCONCLUSIVE"
+    assert at(fail_bar * 1.05)["result"] == "FAIL"
 
 
 def test_review_nothing_excluded_is_the_bar_of_before():
@@ -802,9 +856,12 @@ def test_review_crash_path_keeps_b_restart_and_not_ready_a_fail(tmp_path):
     rc, p = _crash_pair(tmp_path / "r", _shift(_down(P14, 900, 1100), SHIFT))
     assert rc == 1 and p["verdict"] == "FAIL" and "candidate_restarts" in p["fail_reasons"][0]
     assert p["invalid_reasons"][0].startswith("the paired verdict could not be computed")
-    rc, p = _crash_pair(tmp_path / "n", _shift(_down(P14, 900, 1100, restart=False), SHIFT))
+    rc, p = _crash_pair(tmp_path / "n", _shift(_down(P14, 900, 1100, restart=False, code=503), SHIFT))
     assert rc == 1 and p["verdict"] == "FAIL" and "candidate_not_ready" in p["fail_reasons"][0]
     rc, p = _crash_pair(tmp_path / "h", _shift(P14, SHIFT))
+    assert rc == 3 and p["verdict"] == "INVALID"
+    # no reply to readyz needs k6 as its witness, which the crash path has not read: INVALID
+    rc, p = _crash_pair(tmp_path / "z", _shift(_down(P14, 900, 1100, restart=False), SHIFT))
     assert rc == 3 and p["verdict"] == "INVALID"
 
 
@@ -813,7 +870,7 @@ def test_review_crash_path_reads_a_malformed_record_without_raising(tmp_path):
         ex = v["report"]["customer_latency"]["readiness"]["excluded"]
         ex[0].pop("seconds")                                   # a stretch without its seconds
         ex.append("not a stretch")
-    rc, p = _crash_pair(tmp_path, _shift(_down(P14, 900, 1100, restart=False), SHIFT), mangle=mangle)
+    rc, p = _crash_pair(tmp_path, _shift(_down(P14, 900, 1100, restart=False, code=503), SHIFT), mangle=mangle)
     assert rc == 1 and p["verdict"] == "FAIL" and "candidate_not_ready" in p["fail_reasons"][0]
 
 
@@ -849,13 +906,26 @@ def _gap(doc, t0_s, t1_s, k0):
     return d
 
 
-def test_review_a_gap_over_twice_the_interval_is_unknown(tmp_path):
+def _no_calls(doc, lo, hi):
+    """doc without any k6 call or request from lo to hi s after its first call"""
+    d = copy.deepcopy(doc)
+    first = d["calls"][0][0]
+    d["calls"] = [c for c in d["calls"] if not lo <= c[0] - first < hi]
+    d["failed"] = [f for f in d["failed"] if not lo <= f[0] - first < hi]
+    return d
+
+
+def test_review_a_gap_over_twice_the_interval(tmp_path):
     """A gap between two Ready samples longer than twice the sampler's own
-    interval_s (15 s) is "unknown": A's is excluded from both runs, B's voids.
-    A gap of under twice the interval is still Ready."""
+    interval_s (15 s), no restart signal, is a "gap" stretch. A's: excluded
+    from both runs (as before). B's: k6 is the witness — served within its 1 %
+    bar -> jointly-Ready time, judged in the cells (a slow /debug/vars under
+    OOM pressure must not void a paid run); errors over the bar -> B was not
+    serving: FAIL; not one k6 request in it -> no witness: void. A gap under
+    twice the interval is plain Ready time."""
     rd = custlat.readiness(_gap(P14, 1000, 1040, K0)["mem"], None, [K0, K0 + 1800])
     (e,) = rd["excluded"]
-    assert e["kind"] == "unknown" and e["seconds"] > 30 and "over twice the sampler's interval, 15.0 s" in e["why"]
+    assert e["kind"] == "gap" and e["seconds"] > 30 and "over twice the sampler's interval, 15.0 s" in e["why"]
     late = copy.deepcopy(P14)                                  # one sample 12 s late: a ~27 s gap, under 30 s
     rows = [r for r in late["mem"] if r["kind"] == "mem"]
     i = next(i for i, r in enumerate(rows) if r["t"] > K0 + 1000)
@@ -863,10 +933,27 @@ def test_review_a_gap_over_twice_the_interval_is_unknown(tmp_path):
     assert 2 * 15 > rows[i]["t"] - rows[i - 1]["t"] > 15
     assert custlat.readiness(late["mem"], None, [K0, K0 + 1800])["excluded"] == []
     p = _arms(tmp_path / "a", _gap(P14, 1000, 1100, K0), _shift(P14, SHIFT))
-    assert p["verdict"] == "PASS" and [it["what"] for it in p["exclusion"]["items"]] == ["A unknown #1"]
-    p = _arms(tmp_path / "b", P14, _shift(_gap(P14, 1000, 1100, K0), SHIFT))
+    assert p["verdict"] == "PASS" and [it["what"] for it in p["exclusion"]["items"]] == ["A gap #1"]
+    gapb = _shift(_gap(P14, 1000, 1100, K0), SHIFT)
+    # served: jointly-Ready time, nothing cut, B's calls there judged
+    p = _arms(tmp_path / "b", P14, gapb)
+    assert p["verdict"] == "PASS" and p["exclusion"]["items"] == [] and not p["invalid_reasons"]
+    (w,) = p["b_witnessed_ready"]
+    assert w["kind"] == "gap" and w["k6"]["requests"] > 0
+    # 3x slower inside the gap: the cells see it (judged, not hidden)
+    k0b = K0 + SHIFT
+    slow = _arms(tmp_path / "slow", P14, gapb, scale=lambda t, v: v * 3 if k0b + 990 <= t < k0b + 1110 else v)
+    base = {c["check"]: c["value"]["ratio"] for c in p["checks"]}
+    assert any(c["value"]["ratio"] > base[c["check"]] for c in slow["checks"] if ".pair[" in c["check"])
+    # errors over the bar inside it: B was not serving -> FAIL
+    p = _arms(tmp_path / "err", P14, _failing(gapb, 1010, 1090))
+    assert p["verdict"] == "FAIL" and p["candidate_not_ready"]["result"] == "FAIL"
+    assert p["candidate_not_ready"]["value"]["stretches"][0]["k6"]["rate"] > 0.01
+    # not one k6 request in it: no witness -> void
+    p = _arms(tmp_path / "none", P14, _no_calls(gapb, 950, 1150))
     assert p["verdict"] == "INVALID"
     assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.readiness_known[b]"]
+    assert "no witness" in p["invalid_reasons"][0]
 
 
 def test_review_b_inside_a_outage_is_shown(tmp_path):
