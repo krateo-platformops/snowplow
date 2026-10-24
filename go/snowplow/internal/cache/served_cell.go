@@ -101,7 +101,18 @@ func (c *ResolvedCacheStore) CellServeIdentity(key string) (putSeq, bodySeq uint
 // effective TTL (per-entry TTLOverride, else the store TTL) measured from
 // CreatedAt, or past the max entry age measured from BornAt. Used by getCore
 // (which then evicts) and CellPutSeq (which only reports). Caller holds c.mu.
+//
+// #882 F1 (owner ruling) — an anchored incremental LIST content cell is past
+// neither: no TTL or max entry age applies to it. Its body moves with the
+// informer's deltas, not with Puts, so CreatedAt and BornAt are not its
+// freshness; it leaves only through its own unanchor signals (mismatch, lost
+// event, comparator divergence) or byte pressure (LRU). The comparator pass
+// replaces the #378 24 h from-scratch rebuild for it. Once unanchored it is a
+// plain entry again and both bounds apply from its original clocks.
 func (c *ResolvedCacheStore) itemExpiredLocked(item *lruItem, now time.Time) (pastTTL, pastMaxAge bool) {
+	if item.entry.incremental() {
+		return false, false
+	}
 	if eff := c.effectiveTTLLocked(item.entry); eff > 0 && now.Sub(item.entry.CreatedAt) > eff {
 		pastTTL = true
 	}

@@ -17,6 +17,7 @@ func init() {
 			"live":                  s.Live,
 			"anchors":               s.Anchors,
 			"anchor_skipped":        s.AnchorSkipped,
+			"anchor_settling_keys":  s.AnchorSettling,
 			"reads":                 s.Reads,
 			"restamps":              s.Restamps,
 			"generations":           s.Generations,

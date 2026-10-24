@@ -59,6 +59,24 @@
 // debt-class readers (#710: users never queue; #740 K5 customer-triggered
 // refreshes, #547 demand revalidation, the D2 refill) never wait on a pending
 // flight: they keep the path above.
+//
+// #882 F2 — ONE FILL PER INCREMENTAL LIST, WHATEVER THE EDIT RATE. Under churn
+// the epoch rule above refuses nearly every joiner of a LIST flight (at >=10
+// edits/s every reader's list has moved since the flight's startSeq), and each
+// refused reader led its own full fill: 22–28 concurrent 50K fills, the run-15
+// OOM. A LIST flight that will anchor an incremental cell (contentFlight.
+// incremental: anchoring is available and the GVR servable when the flight
+// is created) admits EVERY reader that can be served a snapshot (snapshotJoin):
+// its cell watches the GVR from before its listing, so an edit during the fill
+// is a pending key, not a stale body, and a joiner whose list moved is served
+// cell.Snapshot(its own seq) — the flight's body brought up to the joiner's own
+// sequence (apistage.go). Nobody is served older than its own fill would read,
+// exactly as the epoch rule guarantees, and a joiner waits only the remaining
+// fill time plus the drain of the edits since. If the flight ends without an
+// anchored cell, a joiner that joined a moved list is not served the flight's
+// body: it makes one more attempt under today's rule (errJoinedMovedFlight).
+// GET-by-name and lists that cannot anchor (passthrough, a dry run, a GVR not
+// servable when the flight is created) keep the epoch rule above unchanged.
 package api
 
 import (
@@ -84,6 +102,9 @@ type contentFlightResult struct {
 	// err (#710 PR-2a) is the flight's admission failure: every reader in it
 	// errors with it (D1).
 	err error
+	// cell (#882 F2) is the incremental cell the leader anchored and stored,
+	// nil if none: a joiner takes Snapshot(its own seq) from it.
+	cell *cache.ListCell
 }
 
 // contentStampGate is a stamp-gated (#765) reader's state: on for a refresher
@@ -108,9 +129,13 @@ type contentFlight struct {
 	// ticket (#710 PR-2a) is the flight's place in the memory-admission gate;
 	// its class is the max over the flight's participants.
 	ticket *fillTicket
-	done   chan struct{}
-	once   sync.Once
-	res    contentFlightResult
+	// incremental (#882 F2) — the flight will anchor an incremental list cell,
+	// so a reader whose list moved since startSeq may still join it (see the
+	// file comment). Set when the flight is created; immutable.
+	incremental bool
+	done        chan struct{}
+	once        sync.Once
+	res         contentFlightResult
 }
 
 var (
@@ -133,10 +158,16 @@ var (
 //
 // #765 — a reader that LEADS a pending flight blocks here until the flight it is
 // queued behind completes, then captures its content sink and starts.
-func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, stamp contentStampGate) (flight *contentFlight, fillCtx context.Context, lead bool) {
+//
+// #882 F2 — snapshotJoin: this reader can be served an incremental cell's
+// snapshot, so it may join an incremental flight whatever its list did since the
+// flight started; a flight it creates is incremental. movedJoin reports a join
+// the epoch rule alone would have refused: that joiner is served only from the
+// flight's cell.
+func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, stamp contentStampGate, snapshotJoin bool) (flight *contentFlight, fillCtx context.Context, lead, movedJoin bool) {
 	fillCtx = cache.WithContentDepGenSink(ctx, gvr, namespace, name)
 	startSeq, _ := cache.DepGenStartSeqFromContext(fillCtx)
-	flight, lead = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason, contentFillClassOf(ctx), stamp)
+	flight, lead, movedJoin = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason, contentFillClassOf(ctx), stamp, snapshotJoin)
 	if lead && flight.prior != nil {
 		// The prior flight is bounded by its own detached write deadline, so this
 		// wait is too; it is not cut by this reader's ctx, because the pending
@@ -146,7 +177,7 @@ func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersion
 		startSeq, _ = cache.DepGenStartSeqFromContext(fillCtx)
 		startPendingContentFlight(flight, startSeq)
 	}
-	return flight, fillCtx, lead
+	return flight, fillCtx, lead, movedJoin
 }
 
 // startPendingContentFlight turns a pending flight into its key's current one
@@ -173,18 +204,23 @@ func startPendingContentFlight(f *contentFlight, startSeq uint64) {
 // for the background class only, the pending flight (see the file comment). A
 // returned flight with a non-nil prior that the reader LEADS is pending: the
 // caller (enterContentFlight) waits for prior before filling.
-func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, class fillAdmissionClass, stamp contentStampGate) (*contentFlight, bool) {
+//
+// #882 F2 — snapshotJoin (see enterContentFlight): an incremental current flight
+// is joined whatever the coordinate did; movedJoin marks the join the epoch rule
+// would have refused.
+func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, class fillAdmissionClass, stamp contentStampGate, snapshotJoin bool) (flight *contentFlight, lead, movedJoin bool) {
 	contentFlightsMu.Lock()
 	defer contentFlightsMu.Unlock()
 	cur := contentFlights[key]
 	if cur != nil {
-		if !cache.ContentCoordinateMovedSince(gvr, namespace, name, cur.startSeq) ||
-			(stamp.on && cur.startSeq >= stamp.need) {
+		epochOK := !cache.ContentCoordinateMovedSince(gvr, namespace, name, cur.startSeq) ||
+			(stamp.on && cur.startSeq >= stamp.need)
+		if epochOK || (cur.incremental && snapshotJoin) {
 			noteContentFillJoined(reason, gvr.String())
 			// #710 PR-2a — a joiner of a higher class promotes a queued flight, or
 			// coalescing would let a customer wait at background priority.
 			theContentFillGate().promote(cur.ticket, class)
-			return cur, false
+			return cur, false, !epochOK
 		}
 		noteContentFillJoinRefused(reason)
 	}
@@ -197,17 +233,17 @@ func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionR
 		// after this reader's need, whatever that is.
 		if p := contentPendingFlights[key]; p != nil {
 			noteContentRefreshCoalesced(gvr.String())
-			return p, false
+			return p, false, false
 		}
 		if cur != nil {
-			p := &contentFlight{key: key, prior: cur, done: make(chan struct{}), ticket: newFillTicket(class)}
+			p := &contentFlight{key: key, prior: cur, done: make(chan struct{}), ticket: newFillTicket(class), incremental: snapshotJoin}
 			contentPendingFlights[key] = p
-			return p, true
+			return p, true, false
 		}
 	}
-	f := &contentFlight{key: key, startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class)}
+	f := &contentFlight{key: key, startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class), incremental: snapshotJoin}
 	contentFlights[key] = f
-	return f, true
+	return f, true, false
 }
 
 // complete publishes the flight's result to its joiners and retires it as the

@@ -49,8 +49,15 @@
 //   - a type-level event on the GVR (CRD available / removed / schema relisted /
 //     store repaired);
 //   - the shadow comparator found a divergence;
-//   - the store dropped or replaced the entry (TTL / LRU / max-age / DELETE /
-//     a later Put).
+//   - the store dropped or replaced the entry (byte / entry-count pressure
+//     (LRU), DELETE, a later Put).
+//
+// NO AGE BOUND (#882 F1, owner ruling). An anchored cell is not subject to the
+// store TTL or the max entry age (itemExpiredLocked): its body is rebuilt from
+// informer deltas, never by a Put, so its CreatedAt / BornAt say nothing about
+// its freshness. It leaves only through the signals above or byte pressure. The
+// comparator pass below is its from-scratch check and REPLACES the #378 24 h
+// max-age rebuild for it (no timer).
 //
 // THE COMPARATOR (zero tolerance). A pass compares the latest generation with a
 // fresh, decode-free listing of the same partition and query: key set and raw
@@ -103,19 +110,6 @@ type ListCellFuncs struct {
 	Match func(raw []byte) (match, ok bool)
 	// Marshal is marshalAsListRaw over the cell's apiVersion and list kind.
 	Marshal func(raws [][]byte) ([]byte, error)
-}
-
-// ListCellAnchor is what a fill leader hands AnchorListCell: the envelope it just
-// dispatched and the items it parsed from it.
-type ListCellAnchor struct {
-	Key        string
-	GVR        schema.GroupVersionResource
-	Namespace  string // the partition ("" = cluster-wide)
-	Envelope   []byte // the dispatched marshalAsListRaw envelope
-	Items      []*unstructured.Unstructured
-	APIVersion string
-	Kind       string
-	Funcs      ListCellFuncs
 }
 
 type listObjKey struct{ ns, name string }
@@ -196,14 +190,14 @@ type ListCell struct {
 	lostSig   uint64
 
 	// comparator.
-	reads       atomic.Uint64
-	lastPassAt  atomic.Uint64 // reads at the last pass
-	passDue     atomic.Bool   // a read asked for a pass; the refresher runs it
-	passNS      atomic.Int64 // EWMA of one pass, ns
-	readNS      atomic.Int64 // EWMA of one Snapshot, ns
-	cmpMu       sync.Mutex
-	suspects    map[listObjKey][2]rawID
-	rotate      int
+	reads      atomic.Uint64
+	lastPassAt atomic.Uint64 // reads at the last pass
+	passDue    atomic.Bool   // a read asked for a pass; the refresher runs it
+	passNS     atomic.Int64  // EWMA of one pass, ns
+	readNS     atomic.Int64  // EWMA of one Snapshot, ns
+	cmpMu      sync.Mutex
+	suspects   map[listObjKey][2]rawID
+	rotate     int
 
 	// store sizing (entry bytes are re-accounted after each build).
 	store *ResolvedCacheStore
@@ -228,8 +222,13 @@ func (e *ResolvedEntry) listBodySeq() uint64 {
 // ── registry ────────────────────────────────────────────────────────────────
 
 type listCellSet struct {
-	mu    sync.Mutex
-	cells map[string]*ListCell // content key → cell
+	mu sync.Mutex
+	// cells holds every cell of the GVR that events must reach: the published
+	// cells AND the cells a fill is building (#882 F2: a fill registers its
+	// cell BEFORE it lists the informer, so every edit during the fill is
+	// recorded in that cell's pending). Two cells of one content key — the
+	// published one and its replacement being filled — are both here.
+	cells map[*ListCell]struct{}
 	// delivered — the raw identity of the last informer delivery per key (the
 	// zero rawID for a delete), recorded while the GVR has a cell. The
 	// comparator's in-flight test: an indexer object whose identity is not the
@@ -241,37 +240,52 @@ type listCellSet struct {
 
 var (
 	listCellsByGVR sync.Map // schema.GroupVersionResource → *listCellSet
-	listCellByKey  sync.Map // content key → *ListCell
+	listCellByKey  sync.Map // content key → *ListCell (published cells only)
 )
 
 func listCellSetFor(gvr schema.GroupVersionResource) *listCellSet {
-	v, _ := listCellsByGVR.LoadOrStore(gvr, &listCellSet{cells: map[string]*ListCell{}})
+	v, _ := listCellsByGVR.LoadOrStore(gvr, &listCellSet{cells: map[*ListCell]struct{}{}})
 	return v.(*listCellSet)
 }
 
-func registerListCell(c *ListCell) {
+// watchListCell makes c receive its GVR's events (pending, deliveries, type
+// events). A fill calls it before its informer listing (BeginListCell).
+func watchListCell(c *ListCell) {
+	s := listCellSetFor(c.gvr)
+	s.mu.Lock()
+	s.cells[c] = struct{}{}
+	s.mu.Unlock()
+}
+
+// publishListCell makes c its key's cell, unanchoring the one it replaces.
+func publishListCell(c *ListCell) {
 	if prev, ok := listCellByKey.Swap(c.key, c); ok {
 		if p := prev.(*ListCell); p != c {
 			p.unanchor("replaced")
 		}
 	}
-	s := listCellSetFor(c.gvr)
-	s.mu.Lock()
-	s.cells[c.key] = c
-	s.mu.Unlock()
 }
 
 func deregisterListCell(c *ListCell) {
 	listCellByKey.CompareAndDelete(c.key, c)
 	s := listCellSetFor(c.gvr)
 	s.mu.Lock()
-	if s.cells[c.key] == c {
-		delete(s.cells, c.key)
-	}
+	delete(s.cells, c)
 	if len(s.cells) == 0 {
 		s.delivered = nil // no cell left to compare: stop recording
 	}
 	s.mu.Unlock()
+}
+
+// cellsOf copies the GVR set's cells (the per-cell work runs outside s.mu).
+func (s *listCellSet) cellsOf() []*ListCell {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cells := make([]*ListCell, 0, len(s.cells))
+	for c := range s.cells {
+		cells = append(cells, c)
+	}
+	return cells
 }
 
 // noteListCellDelivery records an informer delivery for the GVR's cells (see
@@ -358,13 +372,7 @@ func noteListCellsPending(gvr schema.GroupVersionResource, namespace, name strin
 	if !ok {
 		return
 	}
-	s := v.(*listCellSet)
-	s.mu.Lock()
-	cells := make([]*ListCell, 0, len(s.cells))
-	for _, c := range s.cells {
-		cells = append(cells, c)
-	}
-	s.mu.Unlock()
+	cells := v.(*listCellSet).cellsOf()
 	k := listObjKey{ns: namespace, name: name}
 	for _, c := range cells {
 		if c.namespace != "" && c.namespace != namespace {
@@ -386,14 +394,7 @@ func unanchorListCellsForGVR(gvr schema.GroupVersionResource, reason string) {
 	if !ok {
 		return
 	}
-	s := v.(*listCellSet)
-	s.mu.Lock()
-	cells := make([]*ListCell, 0, len(s.cells))
-	for _, c := range s.cells {
-		cells = append(cells, c)
-	}
-	s.mu.Unlock()
-	for _, c := range cells {
+	for _, c := range v.(*listCellSet).cellsOf() {
 		c.unanchor(reason)
 	}
 }
@@ -417,77 +418,350 @@ func (c *ListCell) unanchor(reason string) {
 
 // ── anchor ──────────────────────────────────────────────────────────────────
 
-// AnchorListCell builds an incremental cell from a fill leader's just-dispatched
-// envelope and its parsed items, or returns nil (the entry stays a plain fill).
+// ListCellAnchor is what AnchorListCell takes: a fill's envelope and its parsed
+// items, with the cell's identity and functions.
+type ListCellAnchor struct {
+	Key        string
+	GVR        schema.GroupVersionResource
+	Namespace  string // the partition ("" = cluster-wide)
+	Envelope   []byte // the dispatched marshalAsListRaw envelope
+	Items      []*unstructured.Unstructured
+	APIVersion string
+	Kind       string
+	Funcs      ListCellFuncs
+}
+
+// ListCellFill is a cell being built by one fill (#882 F2). BeginListCell
+// creates it BEFORE the fill lists the informer, so every edit from then on is
+// recorded in the cell's pending; Anchor turns the fill's envelope into the
+// cell; Abandon drops it when the fill ends without an Anchor.
+type ListCellFill struct {
+	c     *ListCell
+	shape envelopeShape
+	done  bool
+}
+
+// BeginListCell starts a cell for a fill that is about to list the informer for
+// (gvr, namespace). nil when no cell can be anchored here (passthrough, cache
+// off, anchoring off for a test, a writer whose envelope shape is not
+// derivable); the fill then stays a plain fill.
 //
-// The cell is registered FIRST, so every event from here on is recorded in
-// pending; then the dep-event seq is read, then the partition is listed again
-// (decode-free) and paired item by item with the envelope's own bytes. The
-// pairing proves the items were decoded from exactly the bytes the indexer holds
-// at that listing, so the body is complete as of the seq read before it (the R1
-// argument above); any event that raced the anchor shows as a byte mismatch and
-// the anchor is abandoned (the next fill retries).
-func AnchorListCell(a ListCellAnchor) *ListCell {
+// The cell receives its GVR's events from here on (pending, deliveries, type
+// events) and captures its trust state (servability epoch, lost-event signal):
+// an exit from servable or a lost event during the fill makes its first read
+// unanchor it.
+func BeginListCell(key string, gvr schema.GroupVersionResource, namespace string, funcs ListCellFuncs) *ListCellFill {
 	if listCellAnchorOffForTest.Load() {
 		return nil
 	}
 	rw := Global()
-	if rw == nil || rw.mode == modePassthrough || Disabled() || a.Key == "" ||
-		a.Funcs.Decode == nil || a.Funcs.Match == nil || a.Funcs.Marshal == nil {
+	if rw == nil || rw.mode == modePassthrough || Disabled() || key == "" ||
+		funcs.Decode == nil || funcs.Match == nil || funcs.Marshal == nil {
 		listCellStats.anchorSkipped.Add(1)
 		return nil
 	}
-	shape, ok := deriveEnvelopeShape(a.Funcs.Marshal)
+	shape, ok := deriveEnvelopeShape(funcs.Marshal)
 	if !ok {
 		listCellStats.anchorSkipped.Add(1)
 		return nil
 	}
 	c := &ListCell{
-		key:        a.Key,
-		gvr:        a.GVR,
-		namespace:  a.Namespace,
-		apiVersion: a.APIVersion,
-		kind:       a.Kind,
-		funcs:      a.Funcs,
-		emptyEnv:   int64(len(shape.head) + len(shape.tail)),
-		pending:    map[listObjKey]struct{}{},
-		suspects:   map[listObjKey][2]rawID{},
+		key:       key,
+		gvr:       gvr,
+		namespace: namespace,
+		funcs:     funcs,
+		emptyEnv:  int64(len(shape.head) + len(shape.tail)),
+		pending:   map[listObjKey]struct{}{},
+		suspects:  map[listObjKey][2]rawID{},
 	}
-	// Trust state BEFORE the listing: an exit from servable or a lost event
-	// during the anchor makes the first read unanchor.
-	c.servEpoch = rw.ServabilityEpoch(a.GVR)
+	c.servEpoch = rw.ServabilityEpoch(gvr)
 	c.lostSig = depWatchLostEventSignal()
 	c.anchored.Store(true)
-	registerListCell(c)
+	watchListCell(c)
+	return &ListCellFill{c: c, shape: shape}
+}
 
+// ListCellAnchorable reports whether a LIST fill of gvr would anchor an
+// incremental cell if its envelope pairs: anchoring is available (informer
+// mode, cache on, not turned off for a test) and the GVR is servable now. The
+// content fill marks such a flight incremental (#882 F2).
+func ListCellAnchorable(gvr schema.GroupVersionResource) bool {
+	if listCellAnchorOffForTest.Load() || Disabled() {
+		return false
+	}
+	rw := Global()
+	return rw != nil && rw.mode != modePassthrough && rw.IsServable(gvr)
+}
+
+// Abandon drops a cell whose fill ended without an Anchor (not servable, not
+// admitted, a malformed envelope). nil-safe; a no-op after Anchor.
+func (f *ListCellFill) Abandon() {
+	if f == nil || f.done {
+		return
+	}
+	f.done = true
+	f.c.unanchor("anchor_abandoned")
+}
+
+// AnchorListCell is BeginListCell then Anchor, for a caller whose envelope was
+// listed before the call (the cache package's own arms). The fill path calls
+// BeginListCell before its listing, which is what makes an edit during the
+// fill a recorded key.
+func AnchorListCell(a ListCellAnchor) *ListCell {
+	return BeginListCell(a.Key, a.GVR, a.Namespace, a.Funcs).Anchor(a.Envelope, a.Items, a.APIVersion, a.Kind)
+}
+
+// Anchor builds the cell from the fill's just-dispatched envelope and the items
+// parsed from it (decode once), or returns nil (the entry stays a plain fill).
+//
+// It reads the dep-event seq s, lists the partition again (decode-free) and
+// pairs it key by key with the envelope. A key whose envelope bytes are the
+// listing's keeps the item parsed from them: the pairing proves it was decoded
+// from exactly the bytes the indexer holds. A key that differs — changed,
+// created or deleted while the fill ran — is an edit DURING the fill (#882 F2):
+// the cell has been watching since BeginListCell, so that edit is recorded in
+// pending or is still on its way to the dep hook (in flight). Such a key takes
+// the listing's bytes, decoded once; it is never an abort. A key that differs
+// with neither explanation is refused (anchor_raced): the envelope is not this
+// informer's.
+//
+// The body is complete as of s (the R1 argument: every event <= s wrote the
+// indexer before the listing). Then pending is drained into a newer generation
+// BEFORE the cell is published, so its first reader gets every edit the fill
+// overlapped.
+func (f *ListCellFill) Anchor(envelope []byte, items []*unstructured.Unstructured, apiVersion, kind string) *ListCell {
+	if f == nil || f.done {
+		return nil
+	}
+	f.done = true
+	c := f.c
+	if !c.anchored.Load() {
+		return nil // dropped during the fill (a type-level event): counted by its reason
+	}
+	c.apiVersion, c.kind = apiVersion, kind
+	rw := Global()
+	if rw == nil {
+		c.unanchor("anchor_not_servable")
+		return nil
+	}
 	s := depEventSeq.Load()
-	keyed, ok := rw.listRawKeyedServable(a.GVR, a.Namespace)
+	keyed, ok := rw.listRawKeyedServable(c.gvr, c.namespace)
 	if !ok {
 		c.unanchor("anchor_not_servable")
 		return nil
 	}
 	keyed, ok = c.filter(keyed)
-	if !ok || len(keyed) != len(a.Items) || !shape.holds(a.Envelope, keyed) {
+	if !ok {
+		c.unanchor("anchor_unreadable")
+		return nil
+	}
+	slots, settling, ok := c.pair(rw, f.shape, envelope, items, keyed)
+	if !ok {
 		c.unanchor("anchor_raced")
 		return nil
 	}
-	n := len(keyed)
+	n := len(slots)
 	c.chunkSize = chunkSizeFor(n)
 	body := &listBody{n: n, seq: listBodySeq.Add(1)}
 	for i := 0; i < n; i += c.chunkSize {
 		j := min(i+c.chunkSize, n)
-		ch := &listChunk{slots: make([]listSlot, 0, j-i)}
-		for k := i; k < j; k++ {
-			kr := keyed[k]
-			ch.slots = append(ch.slots, listSlot{key: kr.key, raw: kr.raw, obj: a.Items[k], objSrc: idOf(kr.raw)})
-			body.sumRaw += int64(len(kr.raw))
+		// Each chunk owns its slice (as a copy-on-write replacement does), so a
+		// chunk that is never touched again does not pin the whole table.
+		ch := &listChunk{slots: append(make([]listSlot, 0, j-i), slots[i:j]...)}
+		for _, sl := range ch.slots {
+			body.sumRaw += int64(len(sl.raw))
 		}
 		body.chunks = append(body.chunks, ch)
 	}
 	c.gen.Store(&listGen{asOf: s, body: body})
-	seedDelivered(a.GVR, keyed)
+	seedDelivered(c.gvr, keyed)
+	// #882 F2 — the edits recorded while the fill ran, applied before anyone
+	// can read the cell.
+	if _, err := c.build(); err != nil {
+		c.unanchor("build_" + err.Error())
+		return nil
+	}
+	publishListCell(c)
+	if !c.anchored.Load() {
+		// Dropped between the drain and the publish: never leave it the key's.
+		listCellByKey.CompareAndDelete(c.key, c)
+		return nil
+	}
 	listCellStats.anchors.Add(1)
+	listCellStats.anchorSettling.Add(uint64(settling))
 	return c
+}
+
+// pair walks the envelope and the listing in key order (both sorted by
+// namespace, then name: indexerPartition) and returns the cell's slots and how
+// many keys an edit during the fill explained (settling). ok=false when the
+// envelope is not this writer's shape, an item has no key, a differing key is
+// neither pending nor in flight, or a changed object does not decode.
+func (c *ListCell) pair(rw *ResourceWatcher, sh envelopeShape, env []byte, items []*unstructured.Unstructured, keyed []keyedRaw) (slots []listSlot, settling int, ok bool) {
+	if !bytes.HasPrefix(env, sh.head) {
+		return nil, 0, false
+	}
+	rest := env[len(sh.head):]
+	consumed := 0 // envelope items stepped onto
+	// next positions rest at the next envelope item and returns its length.
+	next := func() (int, bool) {
+		if consumed > 0 {
+			if !bytes.HasPrefix(rest, sh.sep) {
+				return 0, false
+			}
+			rest = rest[len(sh.sep):]
+		}
+		consumed++
+		return jsonValueLen(rest)
+	}
+	// fromListing takes an edited key from the listing, decoded once.
+	fromListing := func(kr keyedRaw) bool {
+		if !c.settling(rw, kr.key, kr.raw) {
+			return false
+		}
+		obj, err := c.funcs.Decode(kr.raw)
+		if err != nil {
+			return false
+		}
+		listCellStats.decodes.Add(1)
+		slots = append(slots, listSlot{key: kr.key, raw: kr.raw, obj: obj, objSrc: idOf(kr.raw)})
+		settling++
+		return true
+	}
+	slots = make([]listSlot, 0, len(keyed))
+	i, j := 0, 0
+	for i < len(items) || j < len(keyed) {
+		var ki listObjKey
+		if i < len(items) {
+			if ki, ok = itemKey(items[i]); !ok {
+				return nil, 0, false
+			}
+		}
+		switch {
+		case i < len(items) && j < len(keyed) && ki == keyed[j].key:
+			kr := keyed[j]
+			l, ok := next()
+			if !ok {
+				return nil, 0, false
+			}
+			if l == len(kr.raw) && bytes.Equal(rest[:l], kr.raw) {
+				slots = append(slots, listSlot{key: kr.key, raw: kr.raw, obj: items[i], objSrc: idOf(kr.raw)})
+			} else if !fromListing(kr) {
+				return nil, 0, false
+			}
+			rest = rest[l:]
+			i++
+			j++
+		case i < len(items) && (j == len(keyed) || ki.less(keyed[j].key)):
+			// In the envelope, not in the listing: deleted (or out of the
+			// selector) while the fill ran.
+			l, ok := next()
+			if !ok || !c.settling(rw, ki, nil) {
+				return nil, 0, false
+			}
+			rest = rest[l:]
+			settling++
+			i++
+		default:
+			// In the listing, not in the envelope: created (or into the
+			// selector) while the fill ran.
+			if !fromListing(keyed[j]) {
+				return nil, 0, false
+			}
+			j++
+		}
+	}
+	if consumed != len(items) || !bytes.Equal(rest, sh.tail) {
+		return nil, 0, false
+	}
+	return slots, settling, true
+}
+
+// itemKey is a parsed item's (namespace, name): indexerSlotKey's key.
+func itemKey(u *unstructured.Unstructured) (listObjKey, bool) {
+	if u == nil || u.GetName() == "" {
+		return listObjKey{}, false
+	}
+	return listObjKey{ns: u.GetNamespace(), name: u.GetName()}, true
+}
+
+// jsonValueLen is the length of the JSON object or array b starts with, or
+// ok=false. A byte scan (strings and escapes honoured), no decode: the anchor
+// uses it only to step over an envelope item whose bytes are not the listing's.
+func jsonValueLen(b []byte) (int, bool) {
+	depth := 0
+	inStr := false
+	for i := 0; i < len(b); i++ {
+		ch := b[i]
+		if inStr {
+			switch ch {
+			case '\\':
+				i++
+			case '"':
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			if depth == 0 {
+				return 0, false
+			}
+			inStr = true
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+			if depth == 0 {
+				return i + 1, true
+			}
+			if depth < 0 {
+				return 0, false
+			}
+		default:
+			if depth == 0 {
+				return 0, false
+			}
+		}
+	}
+	return 0, false
+}
+
+// settling reports whether k's latest edit is explained: still on its way to
+// the dep hook (inFlight), or recorded in pending. In flight is read FIRST: an
+// edit leaves flight only after its hook recorded it in pending, so a key that
+// is neither, read in this order, has no edit outstanding. idxRaw is the key's
+// object in the (filtered) listing, nil if absent there.
+func (c *ListCell) settling(rw *ResourceWatcher, k listObjKey, idxRaw []byte) bool {
+	if c.inFlight(rw, k, idxRaw) {
+		return true
+	}
+	c.mu.Lock()
+	_, p := c.pending[k]
+	c.mu.Unlock()
+	return p
+}
+
+// inFlight reports whether k's latest edit has not reached the dep hook yet:
+// queued or being processed by the dep worker, or not yet delivered (its
+// indexer object is not the last one delivered). idxRaw is the key's object in
+// the filtered listing, nil when absent there: then the indexer's own object
+// (unfiltered) is compared, so an object that left the selector is not
+// mistaken for one still on its way.
+func (c *ListCell) inFlight(rw *ResourceWatcher, k listObjKey, idxRaw []byte) bool {
+	if depWatchInFlight(depEventKey{gvr: c.gvr, namespace: k.ns, name: k.name}) {
+		return true
+	}
+	if idxRaw == nil {
+		raw, exists, servable := rw.rawByKey(c.gvr, k.ns, k.name)
+		if !servable {
+			return true // nothing can be judged; Snapshot unanchors on the next read
+		}
+		if exists {
+			idxRaw = raw
+		}
+	}
+	return deliveredMismatch(c.gvr, k, idOf(idxRaw))
 }
 
 // envelopeShape is the scaffolding of the cell's own envelope writer
@@ -1013,23 +1287,7 @@ func (c *ListCell) ComparePass() int {
 		if _, p := inPending[k]; p {
 			return true
 		}
-		if depWatchInFlight(depEventKey{gvr: c.gvr, namespace: k.ns, name: k.name}) {
-			return true
-		}
-		if idxRaw == nil {
-			// Not in the FILTERED listing: deleted, or still in the indexer but no
-			// longer matching the selector. The delivery is compared with the
-			// indexer's own object (unfiltered), so an object that left the
-			// selector is not mistaken for one still on its way.
-			raw, exists, servable := rw.rawByKey(c.gvr, k.ns, k.name)
-			if !servable {
-				return true // nothing can be judged; Snapshot unanchors on the next read
-			}
-			if exists {
-				idxRaw = raw
-			}
-		}
-		return deliveredMismatch(c.gvr, k, idOf(idxRaw))
+		return c.inFlight(rw, k, idxRaw)
 	}
 
 	diverged := 0
@@ -1153,6 +1411,12 @@ func (c *ListCell) AttachStore(s *ResolvedCacheStore) {
 	}
 }
 
+// incremental reports whether e is an anchored incremental list cell: no TTL
+// or max entry age applies to it (#882 F1, itemExpiredLocked). One atomic load.
+func (e *ResolvedEntry) incremental() bool {
+	return e != nil && e.listCell != nil && e.listCell.anchored.Load()
+}
+
 // Close unanchors the cell (a refused Put stored no entry for it).
 func (c *ListCell) Close() { c.unanchor("put_refused") }
 
@@ -1217,7 +1481,7 @@ type listCellCounters struct {
 	anchors, anchorSkipped, reads, restamps, generations, appliedKeys atomic.Uint64
 	decodes, rebinds, itemsBuilt, rawBuilt, pendingRecorded           atomic.Uint64
 	passes, suspects                                                  atomic.Uint64
-	refreshSkipped                                                    atomic.Uint64
+	refreshSkipped, anchorSettling                                    atomic.Uint64
 	genAllocBytes, genAllocMax                                        atomic.Int64
 	genAllocCount                                                     atomic.Uint64
 	mu                                                                sync.Mutex
@@ -1259,11 +1523,14 @@ type ListCellStats struct {
 	Anchors, AnchorSkipped, Reads, Restamps, Generations, AppliedKeys uint64
 	Decodes, Rebinds, ItemsBuilt, RawJSONBuilt, PendingRecorded       uint64
 	Passes, Suspects, RefreshSkipped                                  uint64
-	GenAllocBytesTotal, GenAllocBytesMax                              int64
-	GenAllocCount                                                     uint64
-	Unanchors, Divergences                                            map[string]uint64
-	DivergenceTotal                                                   uint64
-	Live                                                              int
+	// AnchorSettling (#882 F2) — keys an anchor took from the informer listing
+	// because an edit landed while the fill ran (pending or in flight).
+	AnchorSettling                       uint64
+	GenAllocBytesTotal, GenAllocBytesMax int64
+	GenAllocCount                        uint64
+	Unanchors, Divergences               map[string]uint64
+	DivergenceTotal                      uint64
+	Live                                 int
 }
 
 // ListCellStatsSnapshot reads every counter.
@@ -1275,6 +1542,7 @@ func ListCellStatsSnapshot() ListCellStats {
 		Decodes: s.decodes.Load(), Rebinds: s.rebinds.Load(), ItemsBuilt: s.itemsBuilt.Load(),
 		RawJSONBuilt: s.rawBuilt.Load(), PendingRecorded: s.pendingRecorded.Load(),
 		Passes: s.passes.Load(), Suspects: s.suspects.Load(), RefreshSkipped: s.refreshSkipped.Load(),
+		AnchorSettling:     s.anchorSettling.Load(),
 		GenAllocBytesTotal: s.genAllocBytes.Load(), GenAllocBytesMax: s.genAllocMax.Load(),
 		GenAllocCount: s.genAllocCount.Load(),
 		Unanchors:     map[string]uint64{}, Divergences: map[string]uint64{},
@@ -1345,7 +1613,7 @@ func ResetListCellsForTest() {
 	s := listCellStats
 	for _, a := range []*atomic.Uint64{&s.anchors, &s.anchorSkipped, &s.reads, &s.restamps, &s.generations,
 		&s.appliedKeys, &s.decodes, &s.rebinds, &s.itemsBuilt, &s.rawBuilt, &s.pendingRecorded, &s.passes,
-		&s.suspects, &s.refreshSkipped, &s.genAllocCount} {
+		&s.suspects, &s.refreshSkipped, &s.anchorSettling, &s.genAllocCount} {
 		a.Store(0)
 	}
 	s.genAllocBytes.Store(0)

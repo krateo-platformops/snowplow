@@ -264,6 +264,34 @@ only when that cell was not otherwise re-resolved in 24 h. `"0"` disables. Arms:
 `resolved_max_entry_age_test.go` (G1 is RED on 1.12.5: a key re-Put every 400 ms under a 1 s
 bound is still evicted).
 
+**The incremental LIST content cell is under neither bound (#882 F1, owner ruling).** An
+apistage LIST content cell anchored in incremental mode (`internal/cache/list_cell.go`, #854)
+changes its body by applying informer deltas, never by a `Put`, so its `CreatedAt` and `BornAt`
+say nothing about its freshness. While it is anchored, neither the store TTL nor the max entry
+age applies to it (`itemExpiredLocked`; the read-independent reaper skips it too): it leaves
+only through its own unanchor signals — a servability-epoch move, a lost-event signal, a
+type-level event, a comparator divergence, a refused or replaced `Put`, a `DELETE` — or byte /
+entry-count pressure (LRU). For this cell the from-scratch comparator pass (read-driven, run by
+the refresher) **replaces** the 24 h max-age rebuild above and the #378 re-mint that keeps it
+off a customer path: there is no timer. Before #882 the 3600 s TTL removed a correct 50K list
+cell an hour after it was built while edits flowed, and every reader then re-filled it (the
+run-15 OOM). Once a cell unanchors it is a plain entry again and both bounds apply from its
+original clocks. Arm: `list_cell_882_test.go` F1a (1 s TTL and max age, 5 s of events: still
+served, zero new dispatches, body equal to a full fill).
+
+**One fill per incremental list, whatever the edit rate (#882 F2).** A LIST fill that can
+anchor registers its cell *before* it lists the informer (`cache.BeginListCell`), so every edit
+during the fill is recorded in the cell's pending set. The anchor (`ListCellFill.Anchor`) pairs
+the envelope with a second, decode-free listing key by key: a key whose bytes differ because an
+edit landed during the fill — pending, or still on its way to the dep hook — is taken from the
+informer (decoded once) instead of aborting the anchor; pending is drained before the cell is
+first published. The fill flight (`apistage_fill_flight.go`) admits every LIST reader to such a
+flight even when its list moved since the flight began, and serves it the cell brought up to its
+own sequence (`Snapshot(entry seq)`). GET-by-name and lists that cannot anchor keep the #710
+epoch join rule. Arms: `apistage_fill_herd_710_integration_test.go` (32 readers, one edit per
+ms: one dispatch, one parse, every body holds every edit up to its reader's entry) and
+`list_cell_882_test.go` F2c (edits during the fill: `anchor_raced` stays 0).
+
 ---
 
 ## 4. The dispatcher seam (`handlers/dispatchers/`)
