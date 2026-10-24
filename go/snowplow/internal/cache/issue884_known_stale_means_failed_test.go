@@ -23,6 +23,9 @@
 //	F1b the churn shape: the resolve read the list that moved, so the accepted
 //	    Put is also #375 remarked → the revalidation still settles Fresh, no
 //	    rerun, never counted failed. Mutation: Fresh = accepted && !remarked → RED.
+//	F1c an accepted demand Put on an IN-FLIGHT refresher stamp, then the
+//	    refresher declines (known-stale again), with an absorbed read → zero
+//	    #740 reruns. Mutation: mayRerun `!accepted` → `true` → RED.
 //	F2  the refresher's accepted-but-remarked settle ends the flag even when
 //	    the Put itself could not (a Put with no #375 dep-gen sink: the nil-sink
 //	    fail-fresh remark) → not known-stale, window open from t0.
@@ -187,6 +190,60 @@ func TestIssue884_F1b_ARemarkedDemandPutStillSettlesTheRevalidation(t *testing.T
 	}
 	if n := DemandRevalidationsInFlight(); n != 0 {
 		t.Fatalf("F1b RED: %d demand slot(s) still held", n)
+	}
+}
+
+// F1c — an accepted demand Put never reruns, even when the cell is known-stale
+// AGAIN by the time the attempt settles: the demand write lands on an IN-FLIGHT
+// refresher stamp (ending the flag there), the refresher's own refresh then
+// DECLINES (setting it again), and a read was absorbed into the demand attempt.
+// The demand attempt itself succeeded; the new failure is the refresher's, and
+// the next read revalidates it as any other. Mutation: settleRevalSlot's
+// mayRerun `!accepted` → `true` → RED (a #740 rerun of a successful attempt).
+func TestIssue884_F1c_AnAcceptedDemandPutNeverRerunsAfterAConcurrentDecline(t *testing.T) {
+	c, r, key, t0 := k884Cell(t)
+	resetKnownStaleForTest()
+	t.Cleanup(resetKnownStaleForTest)
+
+	// The refresher dequeues the cell again: its stamp is IN FLIGHT.
+	depEventSeq.Add(1)
+	r.markDirty(key, time.Now())
+	if bt0, open := r.beginWindow(key); !open || !bt0.Equal(t0) {
+		t.Fatalf("PRECONDITION: the refresher dequeue found no window from t0")
+	}
+
+	// A customer read claims the demand slot; a second read is absorbed.
+	if !ClaimDemandRevalidation(key, t0) || ClaimDemandRevalidation(key, t0) {
+		t.Fatalf("PRECONDITION: claim + absorbed read")
+	}
+	dctx, settle := BeginDemandRevalidation(context.Background(), key, t0)
+	rctx := WithL1KeyContext(dctx, key)
+	if !c.PutIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, c.CaptureGen(key)) {
+		t.Fatalf("PRECONDITION: the demand Put was refused")
+	}
+	if _, _, ks := KnownStale(key); ks {
+		t.Fatalf("PRECONDITION: the accepted demand Put did not end the flag on the in-flight stamp")
+	}
+
+	// The refresher's own refresh then DECLINES: known-stale again.
+	r.settleDequeue(key, t0, true, nil)
+	if _, reason, ks := KnownStale(key); !ks || reason != "declined" {
+		t.Fatalf("PRECONDITION: the refresher's decline did not make the cell known-stale again (ks=%v reason=%q)", ks, reason)
+	}
+
+	res := settle()
+	if !res.Fresh {
+		t.Fatalf("F1c: the accepted demand attempt did not settle Fresh")
+	}
+	if res.Rerun {
+		t.Fatalf("F1c RED: an ACCEPTED demand attempt earned a #740 rerun because a concurrent refresher decline " +
+			"made the cell known-stale again — a revalidation settles on its accepted Put (#884)")
+	}
+	if got := KnownStaleRevalidationRerunBySlot()["demand"]; got != 0 {
+		t.Fatalf("F1c RED: rerun{demand} = %d, want 0", got)
+	}
+	if n := DemandRevalidationsInFlight(); n != 0 {
+		t.Fatalf("F1c RED: %d demand slot(s) still held after the accepted attempt settled", n)
 	}
 }
 

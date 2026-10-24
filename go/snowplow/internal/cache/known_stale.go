@@ -644,6 +644,14 @@ func endKnownStaleOnPut(ctx context.Context, key string) knownStaleEnd {
 // refresher through the ordinary mark path (residency, trigger set, viewed
 // tier) — the hook a #375 remark uses. The workqueue coalesces it with a
 // refresh the newer mark already queued.
+//
+// RACE (reviewer, #886 finding 2). The CAS that re-opens the window runs under
+// c.mu; this enqueue runs after the unlock. A refresher dequeue of key in that
+// gap already settles the re-opened window, so this enqueue then opens (through
+// onDirtyMark's markDirty) at most ONE spurious window per re-open, at most a
+// few microseconds wide in where it starts, closed by the refresh it queues. It
+// is the same property a #375 remark has (its enqueue also follows the Put's
+// unlock), and it over-reports staleness, never under-reports it.
 func refreshReopenedWindow(key string) {
 	Deps().enqueueRemark(key, nil)
 }
