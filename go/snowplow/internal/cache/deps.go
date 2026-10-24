@@ -559,7 +559,7 @@ type depGenSink struct {
 	parent *depGenSink
 	// seen dedups deps (a resolve re-Records the same coordinate many times, and every
 	// Record is appended to each ancestor sink). Lazily initialised under mu.
-	seen map[DepKey]struct{}
+	seen map[DepKey]bool // value: recorded under the sink's own key (#890)
 	// #375 C3 — the post-Put window. Set by remarkIfDepsMoved on an ACCEPTED gen-guarded
 	// Put checked against this sink: putKey is the key that was Put, checkedSeq the
 	// dep-event seq at the check, putRemarked whether that check (or a later re-check)
@@ -592,60 +592,71 @@ type depGenSink struct {
 	// each with its Put identity and the deps it covers. A declined-external
 	// mark folds them in: the mark retires when a served cell is re-Put or gone.
 	served []ServedCell
-	// key / own — #890: the L1 key this resolve populates (set by WithL1KeyContext*;
-	// "" for a content child sink), and the deps this resolve recorded UNDER that
-	// key — the edges an accepted write of key re-asserts if a concurrent strip
-	// took them (reassertOwnEdges). Deduped by ownSeen, under mu.
-	key     string
-	own     []DepKey
-	ownSeen map[DepKey]struct{}
+	// key / ownN — #890: the L1 key this resolve populates (set by WithL1KeyContext*;
+	// "" for a content child sink), and how many of the deps this resolve recorded
+	// UNDER that key — the edges an accepted write of key re-asserts if a
+	// concurrent strip took them (reassertOwnEdges). Which deps are own is the
+	// value of seen (true = recorded under key): no second map, no second slice.
+	key  string
+	ownN int
 	// ownDS / ownStripped — #890: the key's edge set (the reverse-index *depSet)
-	// this resolve's first own record went into, and whether a later own record
-	// found a different one. RemoveL1Key — the only writer that deletes a key's
-	// edge set — removes that *depSet, and the next record creates a new one; so
-	// "the key's edge set is still ownDS and never changed" means no strip touched
-	// the key since this resolve recorded under it, and the accepted write has
-	// nothing to re-assert. Under mu.
-	ownDS       *depSet
-	ownStripped bool
+	// this resolve's first own record found, and whether a later own record found
+	// a different one. RemoveL1Key — the only writer that deletes a key's edge set
+	// — removes that *depSet, and the next record creates a new one; so "the key's
+	// edge set is still ownDS and never changed" means no strip touched the key
+	// since this resolve recorded under it, and the accepted write has nothing to
+	// re-assert. Lock-free (one CAS per own record at most).
+	ownDS       atomic.Pointer[depSet]
+	ownStripped atomic.Bool
 }
 
 // noteOwnDepSet records the key's edge-set identity seen by an own record.
 func (s *depGenSink) noteOwnDepSet(ds *depSet) {
-	s.mu.Lock()
-	switch {
-	case s.ownDS == nil:
-		s.ownDS = ds
-	case s.ownDS != ds:
-		s.ownStripped = true
+	if cur := s.ownDS.Load(); cur == nil {
+		if s.ownDS.CompareAndSwap(nil, ds) {
+			return
+		}
+		cur = s.ownDS.Load()
+		if cur != ds {
+			s.ownStripped.Store(true)
+		}
+	} else if cur != ds {
+		s.ownStripped.Store(true)
 	}
-	s.mu.Unlock()
 }
 
-// addOwnLocked notes dk as recorded under the sink's own key. Caller holds s.mu.
+// addOwnLocked marks dk (already added by addDepLocked) as recorded under the
+// sink's own key. Caller holds s.mu.
 func (s *depGenSink) addOwnLocked(dk DepKey) {
-	if s.ownSeen == nil {
-		s.ownSeen = make(map[DepKey]struct{})
+	if own := s.seen[dk]; !own {
+		s.seen[dk] = true
+		s.ownN++
 	}
-	if _, dup := s.ownSeen[dk]; dup {
-		return
+}
+
+// ownDepsLocked returns the deps recorded under the sink's own key. Caller holds s.mu.
+func (s *depGenSink) ownDepsLocked() []DepKey {
+	out := make([]DepKey, 0, s.ownN)
+	for _, dk := range s.deps {
+		if s.seen[dk] {
+			out = append(out, dk)
+		}
 	}
-	s.ownSeen[dk] = struct{}{}
-	s.own = append(s.own, dk)
+	return out
 }
 
 // addDepLocked appends dk unless already present. Caller holds s.mu.
 func (s *depGenSink) addDepLocked(dk DepKey) {
 	if s.seen == nil {
-		s.seen = make(map[DepKey]struct{}, len(s.deps)+4)
+		s.seen = make(map[DepKey]bool, len(s.deps)+4)
 		for _, d := range s.deps {
-			s.seen[d] = struct{}{}
+			s.seen[d] = false
 		}
 	}
 	if _, dup := s.seen[dk]; dup {
 		return
 	}
-	s.seen[dk] = struct{}{}
+	s.seen[dk] = false
 	s.deps = append(s.deps, dk)
 }
 
@@ -1171,6 +1182,15 @@ func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk De
 				ds.count.Add(1)
 			}
 		}
+		// #890 FU-1 — the edge already existed (a refresher re-resolve of a resident
+		// key, a seed re-Put, two fills at once): this resolve's records are all
+		// dedups, so note the key's CURRENT edge set here too, or the accepted
+		// write would find no identity to compare and take the full check.
+		if ownSink != nil {
+			if dsI, ok := d.reverse.Load(l1Key); ok {
+				ownSink.noteOwnDepSet(dsI.(*depSet))
+			}
+		}
 		return // already recorded — idempotent no-op
 	}
 	// At this point we are committing a NEW edge. Bound-check first.
@@ -1304,27 +1324,21 @@ func (d *DepTracker) reassertOwnEdges(ctx context.Context, key string) {
 		if s.key != key {
 			continue
 		}
-		s.mu.Lock()
-		if len(s.own) == 0 {
-			s.mu.Unlock()
-			return
-		}
-		ownDS, stripped := s.ownDS, s.ownStripped
-		var own []DepKey
-		if stripped || ownDS == nil || reassertAlwaysCheckForBench.Load() {
-			own = append([]DepKey(nil), s.own...)
-		}
-		s.mu.Unlock()
-		if own == nil {
+		ownDS := s.ownDS.Load()
+		if ownDS != nil && !s.ownStripped.Load() && !reassertAlwaysCheckForBench.Load() {
 			// The common case: no strip touched key since this resolve recorded
 			// under it iff its edge set is still the one the resolve recorded into.
 			if cur, ok := d.reverse.Load(key); ok && cur.(*depSet) == ownDS {
 				return
 			}
-			s.mu.Lock()
-			own = append([]DepKey(nil), s.own...)
-			s.mu.Unlock()
 		}
+		s.mu.Lock()
+		if s.ownN == 0 {
+			s.mu.Unlock()
+			return
+		}
+		own := s.ownDepsLocked()
+		s.mu.Unlock()
 		d.reassertCheckedTotal.Add(1)
 		for _, dk := range own {
 			if !d.hasExactEdge(key, dk) {

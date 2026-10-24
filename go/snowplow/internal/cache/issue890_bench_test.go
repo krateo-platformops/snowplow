@@ -53,24 +53,51 @@ var bench890Modes = []struct {
 	always bool
 }{{"skip", false}, {"exact", true}}
 
+// BenchmarkIssue890_AcceptedPut — two shapes:
+//
+//	fill    — the resolve's own records created the key's edges (one ctx, Put
+//	          repeatedly): the cold fill.
+//	refresh — every iteration is a NEW resolve of the resident key whose records
+//	          are all dedups of existing edges, then its Put: the refresher /
+//	          seed re-Put / concurrent fill, the most common accepted write
+//	          (#892 FU-1). The records are inside the timed loop on every build.
 func BenchmarkIssue890_AcceptedPut(b *testing.B) {
-	for _, mode := range bench890Modes {
-		for _, others := range []int{0, 1000, 10000} {
-			for _, deps := range []int{10, 100} {
-				b.Run(fmt.Sprintf("%s/others=%d/deps=%d", mode.name, others, deps), func(b *testing.B) {
-					reassertAlwaysCheckForBench.Store(mode.always)
-					defer reassertAlwaysCheckForBench.Store(false)
-					store, ctx, key := setupBench890(b, others, deps)
-					defer ResetDepsForTest()
-					e := &ResolvedEntry{RawJSON: []byte(`{"v":1}`)}
-					b.ReportAllocs()
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
+	gvr := schema.GroupVersionResource{Group: "composition.krateo.io", Version: "v1", Resource: "compositions"}
+	for _, shape := range []string{"fill", "refresh"} {
+		for _, mode := range bench890Modes {
+			for _, others := range []int{0, 1000, 10000} {
+				for _, deps := range []int{10, 100} {
+					b.Run(fmt.Sprintf("%s/%s/others=%d/deps=%d", shape, mode.name, others, deps), func(b *testing.B) {
+						reassertAlwaysCheckForBench.Store(mode.always)
+						defer reassertAlwaysCheckForBench.Store(false)
+						store, ctx, key := setupBench890(b, others, deps)
+						defer ResetDepsForTest()
+						d := Deps()
+						nss, names := make([]string, deps), make([]string, deps)
+						for j := range names {
+							nss[j], names[j] = fmt.Sprintf("ns-%d", j%20), fmt.Sprintf("comp-%d", j)
+						}
+						e := &ResolvedEntry{RawJSON: []byte(`{"v":1}`)}
 						if !store.PutIfGen(ctx, key, e, store.CaptureGen(key)) {
 							b.Fatal("refused")
 						}
-					}
-				})
+						b.ReportAllocs()
+						b.ResetTimer()
+						for i := 0; i < b.N; i++ {
+							c := ctx
+							if shape == "refresh" {
+								c = WithL1KeyContext(context.Background(), key)
+								d.RecordList(c, key, gvr, "")
+								for j := range names {
+									d.Record(c, key, gvr, nss[j], names[j])
+								}
+							}
+							if !store.PutIfGen(c, key, e, store.CaptureGen(key)) {
+								b.Fatal("refused")
+							}
+						}
+					})
+				}
 			}
 		}
 	}

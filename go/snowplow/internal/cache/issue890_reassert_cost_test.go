@@ -61,6 +61,30 @@ func TestIssue890_ReassertCostsNothingWithoutAStrip(t *testing.T) {
 		t.Fatalf("#890 B1 RED: %d of 50 accepted writes checked their edges although no strip touched the key", got)
 	}
 
+	// FU-1 — the refresher shape: the key is resident and its edges already
+	// exist, so every record of the re-resolve is a dedup. With no strip, its
+	// accepted write must still make zero full checks.
+	const kr = "L1_890_refresh"
+	first := WithL1KeyContext(context.Background(), kr)
+	d.Record(first, kr, dep.GVR, dep.Namespace, dep.Name)
+	d.RecordList(first, kr, dep.GVR, dep.Namespace)
+	if !store.PutIfGen(first, kr, &ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(kr)) {
+		t.Fatal("harness: the first fill must be stored")
+	}
+	before = d.reassertCheckedTotal.Load()
+	for i := 0; i < 20; i++ {
+		re := WithL1KeyContext(context.Background(), kr) // a refresher re-resolve
+		gen := store.CaptureGen(kr)
+		d.Record(re, kr, dep.GVR, dep.Namespace, dep.Name) // dedup
+		d.RecordList(re, kr, dep.GVR, dep.Namespace)       // dedup
+		if !store.ReplaceIfGen(re, kr, &ResolvedEntry{RawJSON: []byte(`{"r":1}`)}, gen) {
+			t.Fatal("harness: the refresh must be stored")
+		}
+	}
+	if got := d.reassertCheckedTotal.Load() - before; got != 0 {
+		t.Fatalf("#890 FU-1 RED: %d of 20 refresher-shaped writes (every record a dedup, no strip) took the full check", got)
+	}
+
 	const k2 = "L1_890_strip"
 	ctx2 := WithL1KeyContext(context.Background(), k2)
 	d.Record(ctx2, k2, dep.GVR, dep.Namespace, dep.Name)
