@@ -31,17 +31,23 @@ from __future__ import annotations
 
 import copy
 import gzip
+import inspect
 import io
 import json
+import math
+import random
+import shutil
 import subprocess
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
+from statistics import NormalDist
 
 import pytest
 
 from bench import custlat, load606
-from tests.test_run15_customer_latency import BENCH, FIX, P14, REPLICA, _iso, _write_run
+from tests.test_run15_customer_latency import (BENCH, FIX, NA, NB, P14, REPLICA, _iso, _launch,  # noqa: F401
+                                               _write_run, pairbed)
 
 R15 = json.load(gzip.open(FIX / "customer_latency_run15_pair_every100.json.gz", "rt"))
 DIG_A, DIG_B = "sha256:" + "a" * 64, "sha256:" + "b" * 64
@@ -523,13 +529,16 @@ def test_synthetic_overlap_too_small_is_inconclusive(tmp_path):
     c = next(x for x in base["cells"] if x["phase"] == "storm" and x["metric"] == "p95_ms")
     bar, fail_bar = float(c["bar"].split()[1]), float(c["fail_bar"].split()[1])
     assert c["kept_s"] < c["full_s"] / 3 and bar < fail_bar
-    assert c["result"] == "PASS" and c["ratio"] == 1.0
+    # B = A on a fifth of the storm: not a FAIL; a PASS only if the full-length bar allows it
+    assert c["ratio"] == 1.0 and c["result"] == ("PASS" if bar >= 1.0 else "INCONCLUSIVE")
     wins = custlat._wins(json.loads((tmp_path / "base" / "b" / "verdict.json").read_text())
                          ["report"]["customer_latency"])          # B's own time: scale() gets B's epochs
 
     def run(k, name):
         return _arms(tmp_path / name, a, _shift(P14, SHIFT),
                      scale=lambda t, v: v * k if custlat._phase(t, wins) == "storm" else v)
+    p = run(bar * 0.97, "under")                          # inside the PASS bar: still a PASS
+    assert next(x for x in p["cells"] if x["phase"] == "storm" and x["metric"] == "p95_ms")["result"] == "PASS"
     p = run((bar + fail_bar) / 2, "mid")
     st = {x["metric"]: x for x in p["cells"] if x["phase"] == "storm"}
     assert st["p95_ms"]["result"] == "INCONCLUSIVE", st["p95_ms"]["line"]
@@ -626,3 +635,298 @@ def test_map_interval_is_phase_relative():
     # the storm (open start) maps from its end; steady after the last step from that step's end
     assert custlat.map_interval(80, 90, wa, wb, 0, 1000) == [(1080.0, 1090.0)]
     assert custlat.map_interval(610, 620, wa, wb, 0, 1000) == [(1710.0, 1720.0)]
+
+
+# ─── review of 805ad3bb: the bars, missing signals, the crash path, the log ─
+
+Z9 = NormalDist().inv_cdf(1 - custlat.FAMILY_ALPHA / 9)
+
+
+def _blocks_calls(n_blocks, gen, t0=1000.0, per=20):
+    return [(t0 + k * 10 + j * (10 / per), gen(k, j)) for k in range(n_blocks) for j in range(per)]
+
+
+def _probe_cell(p, m, a_cs, b_cs, wins, excl, replica=None):
+    """_cell as pair() calls it: A's and B's stats over the kept time, A's
+    whole-phase seconds and sd (the sd only where _cell takes it: a test run
+    against an older custlat measures that one's bars)."""
+    full = custlat.phase_stats(a_cs, wins, [])
+    ka = custlat.phase_stats(a_cs, wins, excl)
+    kb = custlat.phase_stats(b_cs, wins, excl)
+    kw = {"full_s": full[p]["seconds"]}
+    if "full_sd" in inspect.signature(custlat._cell).parameters:
+        kw["full_sd"] = full[p]["half_sd"][m]
+    return custlat._cell(p, m, ka.get(p), kb.get(p), Z9, replica, judged=True,
+                         excluded={"a_s": 0.0, "b_s": 0.0, "why": []}, **kw)
+
+
+def _num(bar):
+    return float(bar.split()[1])
+
+
+def test_review_probe1_a_shorter_sample_never_makes_pass_easier():
+    """The reviewer's probe 1: B = k x A at every call; the calm 80 % of A is
+    cut, the volatile 20 % kept. On the full phase k FAILs; after the cut the
+    PASS bar must not have moved past the full one, so k must not PASS
+    (805ad3bb: p99 full bar <= 1.0004, cut PASS bar <= 1.9267: 1.46 PASSed)."""
+    rnd = random.Random(1)
+    calm = {(k, j): 100 + rnd.random() * 2 for k in range(40) for j in range(20)}
+    vol = {(k, j): (100 + rnd.random() * 2) * (1 + (rnd.random() * 3 if j == 0 and k % 2 else 0))
+           for k in range(40) for j in range(20)}
+    a_cs = _blocks_calls(40, lambda k, j: vol[(k, j)] if k >= 32 else calm[(k, j)])
+    excl = [(1000.0, 1320.0)]
+    for m in ("p95_ms", "p99_ms"):
+        full_c = _probe_cell("steady", m, a_cs, a_cs, [], [])
+        cut_c = _probe_cell("steady", m, a_cs, a_cs, [], excl)
+        assert _num(cut_c["bar"]) <= _num(full_c["bar"]), (m, cut_c["bar"], full_c["bar"])
+        assert _num(cut_c["bar"]) < _num(cut_c["fail_bar"])
+        k = 1.46
+        b_cs = [(t, v * k) for t, v in a_cs]
+        assert _probe_cell("steady", m, a_cs, b_cs, [], []) ["result"] == "FAIL"
+        cut = _probe_cell("steady", m, a_cs, b_cs, [], excl)["result"]
+        # p99 (the probe's flip): undecidable on the volatile fifth; p95: past even its FAIL bar
+        assert cut == {"p95_ms": "FAIL", "p99_ms": "INCONCLUSIVE"}[m], (m, cut)
+
+
+def test_review_probe2_the_replica_floor_keeps_the_band():
+    """The reviewer's probe 2: 39.5 of a 1999.5 s storm jointly Ready, the
+    replica above A's own spread. The kept sample's extra spread is charged
+    against the replica too: the PASS bar sits below the FAIL bar and below
+    the full storm's bar (805ad3bb: both bars = the replica, 1.10x PASSed,
+    no INCONCLUSIVE at all), and the line names the replica."""
+    rnd = random.Random(2)
+    a_cs = _blocks_calls(200, lambda k, j: 100 + rnd.random())
+    wins = [("storm", float("-inf"), 3001.0)]
+    excl = [(1000.0, 2960.0)]
+    rep = {"phases": {"storm": {"p95_ms": 1.1149, "p99_ms": 1.0651, "req_s": 1.0036}}}
+    full_c = _probe_cell("storm", "p95_ms", a_cs, a_cs, wins, [], replica=rep)
+    c = _probe_cell("storm", "p95_ms", a_cs, a_cs, wins, excl, replica=rep)
+    assert c["kept_s"] == 39.5 and c["full_s"] == 1999.5
+    bar, fail_bar = _num(c["bar"]), _num(c["fail_bar"])
+    assert fail_bar == 1.1149 and bar < fail_bar and bar < _num(full_c["bar"]) == 1.1149
+    assert "PASS <= %s = replica bar 1.1149" % bar in c["line"] and "FAIL past 1.1149 (replica)" in c["line"]
+    assert "(full-length sd)" not in c["line"]
+    mid = (bar + fail_bar) / 2
+    assert _probe_cell("storm", "p95_ms", a_cs, [(t, v * mid) for t, v in a_cs], wins, excl,
+                       replica=rep)["result"] == "INCONCLUSIVE"
+    assert _probe_cell("storm", "p95_ms", a_cs, [(t, v * 1.2) for t, v in a_cs], wins, excl,
+                       replica=rep)["result"] == "FAIL"
+
+
+def test_review_nothing_excluded_is_the_bar_of_before():
+    rnd = random.Random(3)
+    a_cs = _blocks_calls(40, lambda k, j: rnd.lognormvariate(4, 0.3))
+    for rp in (None, {"phases": {"steady": {"p95_ms": 1.3, "p99_ms": 1.01, "req_s": 1.2}}}):
+        for m in custlat.METRICS:
+            c = _probe_cell("steady", m, a_cs, a_cs, [], [], replica=rp)
+            sd = c["a_half_sd"]
+            tol = max(math.exp(Z9 * math.sqrt(2) * sd), (custlat._replica(rp, "steady", m) or 1.0))
+            want = round(1 / tol, 4) if m == "req_s" else round(tol, 4)
+            assert _num(c["bar"]) == _num(c["fail_bar"]) == want and c["extra_spread"] == 1.0
+
+
+def test_review_property_a_pass_after_exclusion_is_a_pass_on_full_data():
+    """Random volatility splits, random cuts, random replicas, B = A with one
+    true effect everywhere (x k latency; req/s thinned to a share q in every
+    block): whatever is cut, a PASS on the kept time is a PASS on the full
+    phase. Both PASS and INCONCLUSIVE occur (the property is not vacuous)."""
+    rnd = random.Random(606)
+    seen = {"PASS": 0, "INCONCLUSIVE": 0, "FAIL": 0}
+    for trial in range(36):
+        m = custlat.METRICS[trial % 3]
+        nb = rnd.randint(24, 48)
+        vol = [rnd.choice((0.02, 0.05, 0.3, 1.0)) for _ in range(nb)]
+        val = {(k, j): rnd.lognormvariate(4.5, vol[k]) for k in range(nb) for j in range(20)}
+        a_cs = _blocks_calls(nb, lambda k, j: val[(k, j)])
+        lo = rnd.randint(0, nb - 6)
+        hi = rnd.randint(lo + 2, min(nb, lo + int(nb * 0.9)))
+        excl = [(1000.0 + lo * 10, 1000.0 + hi * 10)]
+        rp = None if rnd.random() < 0.5 else {"phases": {"steady": {m: round(1 + rnd.random() * 0.3, 4)}}}
+        if m == "req_s":
+            q = rnd.choice((0.8, 0.85, 0.9, 0.95, 1.0))
+            keep = round(20 * q)
+            b_cs = [c for i, c in enumerate(a_cs) if i % 20 < keep]
+        else:
+            k = rnd.choice((0.95, 1.0, 1.02, 1.05, 1.1, 1.2, 1.4))
+            b_cs = [(t, v * k) for t, v in a_cs]
+        cut = _probe_cell("steady", m, a_cs, b_cs, [], excl, replica=rp)
+        full = _probe_cell("steady", m, a_cs, b_cs, [], [], replica=rp)
+        if cut is None or full is None:
+            continue
+        seen[cut["result"]] += 1
+        lower = m == "req_s"
+        # one true effect: the ratios differ only by the stats' 2-decimal rounding
+        assert abs(cut["ratio"] - full["ratio"]) <= 0.01 * full["ratio"], (trial, cut["ratio"], full["ratio"])
+        if cut["result"] == "PASS":
+            # the same effect passes the full phase's bar
+            r = cut["ratio"]
+            assert (r >= _num(full["bar"])) if lower else (r <= _num(full["bar"])), (trial, m, cut["line"],
+                                                                                    full["line"])
+        assert (_num(cut["bar"]) >= _num(full["bar"])) if lower else (_num(cut["bar"]) <= _num(full["bar"]))
+    assert seen["PASS"] and seen["INCONCLUSIVE"], seen
+
+
+def test_review_b_restart_seen_only_by_its_own_check_fails(tmp_path):
+    """B's report has no readiness record (an older verdict), but its own
+    restart check counted 1: the pair FAILs, never reads INVALID."""
+    _verdict(tmp_path / "a", P14, DIG_A)
+    v = _verdict(tmp_path / "b", _shift(_down(P14, 900, 1100), SHIFT), DIG_B)
+    v["report"]["customer_latency"].pop("readiness")
+    (tmp_path / "b" / "verdict.json").write_text(json.dumps(v))
+    p = _pair(tmp_path / "a", tmp_path / "b")
+    assert p["verdict"] == "FAIL" and p["candidate_restarts"]["value"] == 1
+    assert "seen by its own restart check" in p["candidate_restarts"]["why"]
+    # ... and a replaced pod counts as a restart too
+    v["validity"] = [{"check": custlat.RESTART_CHECK, "result": "FAIL", "value": None,
+                      "why": "snowplow pod REPLACED during measure: x -> y"}]
+    (tmp_path / "b" / "verdict.json").write_text(json.dumps(v))
+    assert _pair(tmp_path / "a", tmp_path / "b")["verdict"] == "FAIL"
+
+
+def _crash_pair(tmp, b_doc, mangle=None, **kw):
+    """The pair CLI when pair() raises (B's phases malformed)."""
+    _verdict(tmp / "a", P14, DIG_A)
+    v = _verdict(tmp / "b", b_doc, DIG_B, **kw)
+    v["report"]["customer_latency"]["phases"] = 7
+    if mangle:
+        mangle(v)
+    (tmp / "b" / "verdict.json").write_text(json.dumps(v))
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = custlat.main(["pair", "--a", str(tmp / "a" / "verdict.json"), "--b", str(tmp / "b" / "verdict.json")])
+    assert buf.getvalue().strip(), "the paired verdict is never empty"
+    return rc, json.loads(buf.getvalue())
+
+
+def test_review_crash_path_keeps_b_restart_and_not_ready_a_fail(tmp_path):
+    rc, p = _crash_pair(tmp_path / "r", _shift(_down(P14, 900, 1100), SHIFT))
+    assert rc == 1 and p["verdict"] == "FAIL" and "candidate_restarts" in p["fail_reasons"][0]
+    assert p["invalid_reasons"][0].startswith("the paired verdict could not be computed")
+    rc, p = _crash_pair(tmp_path / "n", _shift(_down(P14, 900, 1100, restart=False), SHIFT))
+    assert rc == 1 and p["verdict"] == "FAIL" and "candidate_not_ready" in p["fail_reasons"][0]
+    rc, p = _crash_pair(tmp_path / "h", _shift(P14, SHIFT))
+    assert rc == 3 and p["verdict"] == "INVALID"
+
+
+def test_review_crash_path_reads_a_malformed_record_without_raising(tmp_path):
+    def mangle(v):
+        ex = v["report"]["customer_latency"]["readiness"]["excluded"]
+        ex[0].pop("seconds")                                   # a stretch without its seconds
+        ex.append("not a stretch")
+    rc, p = _crash_pair(tmp_path, _shift(_down(P14, 900, 1100, restart=False), SHIFT), mangle=mangle)
+    assert rc == 1 and p["verdict"] == "FAIL" and "candidate_not_ready" in p["fail_reasons"][0]
+
+
+def _sampler_stops(doc, at_s, k0):
+    d = copy.deepcopy(doc)
+    d["mem"] = [r for r in d["mem"] if r["kind"] != "mem" or r["t"] < k0 + at_s]
+    return d
+
+
+def test_review_b_sampler_stops_then_b_degrades_is_invalid(tmp_path):
+    """The reviewer's probe: B's mem606 stops at 900 s, then B runs 3x
+    slower with failing requests, no restart. B's readiness is unknown there:
+    the pair is INVALID — never a PASS, never an accidental INCONCLUSIVE."""
+    k0b = K0 + SHIFT
+    b = _sampler_stops(_shift(P14, SHIFT), 900, k0b)
+    first = b["calls"][0][0]
+    b["failed"] = [[o, 1 if (o - first) >= 1000 and i % 10 == 0 else v] for i, (o, v) in enumerate(b["failed"])]
+    p = _arms(tmp_path, P14, b, scale=lambda t, v: v * 3 if t >= k0b + 1000 else v)
+    assert p["verdict"] == "INVALID"
+    assert "customer_latency.pair.readiness_known[b]" in {r.split(":")[0] for r in p["invalid_reasons"]}
+    rk = next(c for c in p["validity"] if c["check"] == "customer_latency.pair.readiness_known[b]")
+    assert rk["value"]["seconds"] > 800 and "after the last readiness sample" in rk["why"]
+    # A's sampler stopping the same way is excluded from both runs, never voids
+    p = _arms(tmp_path / "a", _sampler_stops(P14, 900, K0), _shift(P14, SHIFT))
+    assert "customer_latency.pair.readiness_known[b]" not in {r.split(":")[0] for r in p["invalid_reasons"]}
+    assert [it["what"] for it in p["exclusion"]["items"]] == ["A unknown #1"]
+
+
+def _gap(doc, t0_s, t1_s, k0):
+    """doc's mem606 samples missing from k0 + t0_s to k0 + t1_s (Ready on both sides)."""
+    d = copy.deepcopy(doc)
+    d["mem"] = [r for r in d["mem"] if r["kind"] != "mem" or not (k0 + t0_s < r["t"] < k0 + t1_s)]
+    return d
+
+
+def test_review_a_gap_over_twice_the_interval_is_unknown(tmp_path):
+    """A gap between two Ready samples longer than twice the sampler's own
+    interval_s (15 s) is "unknown": A's is excluded from both runs, B's voids.
+    A gap of under twice the interval is still Ready."""
+    rd = custlat.readiness(_gap(P14, 1000, 1040, K0)["mem"], None, [K0, K0 + 1800])
+    (e,) = rd["excluded"]
+    assert e["kind"] == "unknown" and e["seconds"] > 30 and "over twice the sampler's interval, 15.0 s" in e["why"]
+    late = copy.deepcopy(P14)                                  # one sample 12 s late: a ~27 s gap, under 30 s
+    rows = [r for r in late["mem"] if r["kind"] == "mem"]
+    i = next(i for i, r in enumerate(rows) if r["t"] > K0 + 1000)
+    rows[i]["t"] += 12
+    assert 2 * 15 > rows[i]["t"] - rows[i - 1]["t"] > 15
+    assert custlat.readiness(late["mem"], None, [K0, K0 + 1800])["excluded"] == []
+    p = _arms(tmp_path / "a", _gap(P14, 1000, 1100, K0), _shift(P14, SHIFT))
+    assert p["verdict"] == "PASS" and [it["what"] for it in p["exclusion"]["items"]] == ["A unknown #1"]
+    p = _arms(tmp_path / "b", P14, _shift(_gap(P14, 1000, 1100, K0), SHIFT))
+    assert p["verdict"] == "INVALID"
+    assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.readiness_known[b]"]
+
+
+def test_review_b_inside_a_outage_is_shown(tmp_path):
+    """B's customers inside the window cut for A's restart: 4x slower there
+    and failing; the cells never see it, the shown-only line does."""
+    k0b = K0 + SHIFT
+    b = _shift(P14, SHIFT)
+    first = b["calls"][0][0]
+    b["failed"] = [[o, 1 if 900 <= o - first < 1100 else v] for o, v in b["failed"]]
+    p = _arms(tmp_path, _down(P14, 900, 1100), b,
+              scale=lambda t, v: v * 4 if k0b + 900 <= t < k0b + 1100 else v)
+    assert p["verdict"] == "PASS"                          # the cells cut that window from both
+    (row,) = p["b_inside_a_outage"]
+    assert row["what"] == "A restart #1" and row["calls"] > 0 and row["error_rate"] > 0.5
+    base = _arms(tmp_path / "base", _down(P14, 900, 1100), _shift(P14, SHIFT))["b_inside_a_outage"][0]
+    assert row["p95_ms"] > 3 * base["p95_ms"] and row["calls"] == base["calls"]
+    assert row["line"].startswith("INFO B inside A's outage: A restart #1") and "shown, not judged" in row["line"]
+
+
+def test_review_run15_b_inside_a_outage(run15):
+    _, _, _, _, p = run15
+    rows = {r["what"]: r for r in p["b_inside_a_outage"]}
+    assert sorted(rows) == ["A restart #1", "A restart #2"]
+    assert rows["A restart #1"]["b_s"] == 675.2 and rows["A restart #2"]["b_s"] == 750.1
+    assert all(r["calls"] > 0 and r["error_rate"] is not None for r in rows.values())
+
+
+def _stage(tmp, fake, a_doc, b_doc):
+    """Each run's verdict for the stand-in run606 to place in its OUT, and its
+    REAL k6 stream already in that OUT (the pair reads it through --a-dir/--b-dir)."""
+    for name, out, doc, dig in ((NA, "A", a_doc, DIG_A), (NB, "B", b_doc, DIG_B)):
+        d = tmp / f"src-{out}"
+        _verdict(d, doc, dig)
+        shutil.copytree(d / "k6", tmp / out / "k6")
+        shutil.copy(d / "verdict.json", fake / f"{name}.verdict.json")
+
+
+@pytest.mark.parametrize("case", ["a_restart_only", "b_restart"])
+def test_run606_pair_logs_fail_note_excluded_lines(pairbed, case):  # noqa: F811
+    """run606_pair.sh end to end (stand-in run606, real k6 streams in each
+    OUT): the pair CLI gets --a-dir/--b-dir, the raw calls match, and the log
+    carries the FAIL / NOTE / EXCLUDED / A-healthy / B-inside-A's-outage lines."""
+    repo, fake, env, tmp = pairbed
+    a = _down(P14, 900, 1100)
+    b = _shift(P14, SHIFT) if case == "a_restart_only" else _shift(_down(P14, 1200, 1350), SHIFT)
+    _stage(tmp, fake, a, b)
+    p = _launch(repo, env)
+    log = (tmp / "pair" / "pair.log").read_text()
+    v = json.loads((tmp / "pair" / "paired-verdict.json").read_text())
+    assert "--a-dir" in (repo / "run606_pair.sh").read_text()
+    assert "EXCLUDED from both runs: A restart #1" in log
+    assert not any(c["check"].startswith("customer_latency.pair.raw_calls") and c["result"] == "FAIL"
+                   for c in v["validity"])
+    assert "INFO B inside A's outage: A restart #1" in log
+    if case == "a_restart_only":
+        assert p.returncode == 0 and v["verdict"] == "PASS"
+        assert "NOTE: A (the baseline) restarted 1x" in log and "NOTE: B passes churn" in log
+        assert "INFO A-healthy churn p95_ms" in log
+    else:
+        assert p.returncode == 1 and v["verdict"] == "FAIL"
+        assert "FAIL: customer_latency.pair.candidate_restarts" in log
+        assert "EXCLUDED from both runs: B restart #1" in log
+        assert "paired verdict exit=1" in log

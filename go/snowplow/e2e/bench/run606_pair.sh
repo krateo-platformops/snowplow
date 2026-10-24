@@ -160,6 +160,7 @@ print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidat
                 + ["INVALID: " + r for r in v["invalid_reasons"]] + ["NOTE: " + n for n in v.get("notes") or []]
                 + ["EXCLUDED from both runs: %s (A %.0f s, B %.0f s): %s" % (i["what"], sum(b - a for a, b in i["a"]),
                    sum(b - a for a, b in i["b"]), i["why"]) for i in ex]
-                + [c["line"] for c in v["cells"]] + (v.get("a_healthy_lines") or [])))' \
+                + [c["line"] for c in v["cells"]] + (v.get("a_healthy_lines") or [])
+                + [r["line"] for r in v.get("b_inside_a_outage") or []]))' \
            "$PAIR_OUT/paired-verdict.json" 2>/dev/null || true)
 exit "$vrc"

@@ -58,12 +58,16 @@ Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
     from its own run AND, mapped by phase-relative time (the arms start
     minutes apart and their churn steps last differently), from the other;
   - a cell whose jointly-Ready sample is too short to decide is
-    INCONCLUSIVE: A's half-sample sd on the kept blocks, scaled by the
-    1/sqrt(n) law to the phase's full length, gives the bar a full-length
-    sample would hold. PASS needs B / A within that bar, FAIL needs B / A
-    past the kept sample's own (wider) bar, and in between the shortened
-    overlap is what decides: INCONCLUSIVE. With nothing excluded the two
-    bars are the same and the cell is decided as before;
+    INCONCLUSIVE (_cell): the PASS bar is the full-length bar — A's kept sd
+    scaled by sqrt(kept / full), capped at A's whole-phase sd — with the
+    kept sample's extra spread charged against the whole tolerance, replica
+    included; the FAIL bar is the kept sample's own. Between them:
+    INCONCLUSIVE. With less data PASS never gets easier; with nothing
+    excluded the two bars are the one bar of before;
+  - B's readiness unknown inside k6's span (no sample, or a gap over twice
+    the sampler's interval) voids the pair; A's is excluded;
+  - beside the cells, B's calls and errors inside each window cut for A
+    ("B inside A's outage", shown only);
   - every cell says how many seconds each arm lost and why;
   - A's minutes before a crash are Ready, so they count. Each cell also
     shows (never judges) an A-healthy sensitivity: the same cell with every
@@ -392,13 +396,17 @@ def readiness(mem: list[dict], pods: list[dict] | None, span) -> dict:
     not-Ready stretch runs from the last Ready sample before it to the first
     Ready sample after it — for a restart, the first sample whose cold start
     (prewarm) is complete: the recovery tail, measured by the run's own
-    signals. Before the first sample and after the last, Ready is unknown:
-    excluded too. The pod records count the restarts the samples must place
-    (a restart they cannot place leaves its recovery unexcluded: `unlocated`)."""
+    signals. Before the first sample, after the last, and across a gap
+    between two Ready samples longer than twice the sampler's own interval
+    (mem_start's interval_s, else the samples' median spacing), Ready is
+    unknown: "unknown" stretches (A's are excluded; B's void the pair). The
+    pod records count the restarts the samples must place (a restart they
+    cannot place leaves its recovery unexcluded: `unlocated`)."""
     rows = sorted((m for m in mem if m.get("kind") == "mem" and m.get("t") is not None),
                   key=lambda m: m["t"])
     start = next((m for m in mem if m.get("kind") == "mem_start"), {})
-    interval = start.get("interval_s")
+    spacing = [b["t"] - a["t"] for a, b in itertools.pairwise(rows)]
+    interval = start.get("interval_s") or (statistics.median(spacing) if spacing else None)
     ex: list[dict] = []
 
     def add(t0, t1, kind, why, **kw):
@@ -452,6 +460,10 @@ def readiness(mem: list[dict], pods: list[dict] | None, span) -> dict:
                 ep["reset"] |= reset
                 close(ep, r, r["t"])
                 ep = None
+            elif last_ready is not None and interval and r["t"] - last_ready["t"] > 2 * interval:
+                add(last_ready["t"], r["t"], "unknown",
+                    f"no readiness sample for {round(r['t'] - last_ready['t'], 1)} s (over twice the "
+                    f"sampler's interval, {interval} s): Ready is unknown")
             last_ready = r
         if ep is not None:
             close(ep, None, max(rows[-1]["t"], span[1] if span else rows[-1]["t"]))
@@ -540,11 +552,52 @@ def _measure(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
 
 
-def _voiding(v: dict, rd: dict | None) -> list[str]:
+def _restart_check_count(v: dict | None) -> int:
+    """The restarts a run's OWN restart check saw (load606.restart_check:
+    a count > 0, or the pod replaced = 1); 0 when it saw none or is unknown."""
+    for c in (v or {}).get("validity") or []:
+        if not isinstance(c, dict) or c.get("check") != RESTART_CHECK or c.get("result") != "FAIL":
+            continue
+        val = c.get("value")
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return val
+        if str(c.get("why") or "").startswith("snowplow pod REPLACED"):
+            return 1
+    return 0
+
+
+def _candidate(vb: dict | None) -> dict:
+    """What FAILs the pair on B's side, read defensively (the CLI's crash
+    path uses it too): a restart its readiness record or its own restart
+    check saw, and any stretch it was not Ready without restarting."""
+    out = {"restarted": False, "count": 0, "not_ready": [], "not_ready_s": 0.0}
+    try:
+        r = ((vb or {}).get("report") or {}).get("customer_latency") or {}
+        rd = r.get("readiness") if isinstance(r, dict) else None
+        rs = (rd or {}).get("restarts") or {} if isinstance(rd, dict) else {}
+        span = r.get("k6_span") if isinstance(r, dict) else None
+        own = _restart_check_count(vb)
+        out["count"] = max(int(rs.get("count") or 0), own)
+        out["restarted"] = rs.get("restarted") is True or own > 0
+        nr = []
+        for e in (rd or {}).get("excluded") or [] if isinstance(rd, dict) else []:
+            try:
+                if e.get("kind") == "not_ready" and (not span or (e["t1"] > span[0] and e["t0"] < span[1])):
+                    nr.append(e)
+            except (TypeError, KeyError, AttributeError):
+                continue
+        out["not_ready"] = nr
+        out["not_ready_s"] = round(sum(float(e.get("seconds") or 0) for e in nr), 1)
+    except Exception:  # noqa: BLE001 — a malformed record: whatever was read stands
+        pass
+    return out
+
+
+def _voiding(v: dict, rd: dict | None, *, restarted: bool | None = None) -> list[str]:
     """The reasons this run's own verdict voids the pair: every INVALID
-    reason except the two the pair judges itself — a restart the readiness
-    record knows (B: FAIL; A: excluded and reported) and k6's whole-run
-    error rate (the pair counts it over the jointly-Ready time)."""
+    reason except the two the pair judges itself — a restart the pair knows
+    (B: FAIL; A: excluded and reported) and k6's whole-run error rate (the
+    pair counts it over the jointly-Ready time)."""
     verdict = v.get("verdict")
     if verdict not in COMPARABLE_VERDICTS + ("INVALID",):
         return [f"the run has no verdict a pair can read ({verdict!r})"]
@@ -553,7 +606,8 @@ def _voiding(v: dict, rd: dict | None) -> list[str]:
     fails = [c for c in v.get("validity") or [] if c.get("result") == "FAIL"]
     if not fails:
         return ["the run is INVALID and states no reason"]
-    restarted = (((rd or {}).get("restarts") or {}).get("restarted")) is True
+    if restarted is None:
+        restarted = (((rd or {}).get("restarts") or {}).get("restarted")) is True
     return [f"{c.get('check')}: {c.get('why') or str(c.get('value')) + ' vs ' + str(c.get('bar'))}"
             for c in fails
             if not (c.get("check") == ERROR_RATE_CHECK or (c.get("check") == RESTART_CHECK and restarted))]
@@ -671,7 +725,8 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
     rb = (vb.get("report") or {}).get("customer_latency")
     rda, rdb = (ra or {}).get("readiness"), (rb or {}).get("readiness")
     dig = [((v.get("report") or {}).get("image_digest") or {}).get("expected") for v in (va, vb)]
-    void = {"a": _voiding(va, rda), "b": _voiding(vb, rdb)}
+    cand = _candidate(vb)
+    void = {"a": _voiding(va, rda), "b": _voiding(vb, rdb, restarted=cand["restarted"])}
     validity = [
         _validity("runs_valid", not void["a"] and not void["b"], void,
                   "each run's own verdict carries no INVALID reason but a known restart and k6's "
@@ -696,30 +751,33 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                                    "latency: B / A <= tolerance; req_s: B / A >= 1 / tolerance",
                       "ready_time": "cells over the time both runs' snowplow was Ready (each run's "
                                     "not-Ready stretches removed from both, by phase-relative time); "
-                                    "PASS within the bar A's sd scaled to the phase's full length "
-                                    "gives, FAIL past the kept sample's own bar, INCONCLUSIVE between",
+                                    "PASS iff B / A * (within_kept / within) <= max(within, replica) with "
+                                    "within from A's kept sd scaled to the phase's full length and capped "
+                                    "at A's whole-phase sd; FAIL past max(within_kept, replica); "
+                                    "INCONCLUSIVE between",
                       "replica": (replica or {}).get("provenance")}}
     # ── restarts: B's FAIL the pair; A's are recorded (module doc) ──
     rs = {x: ((rd or {}).get("restarts") or {}) for x, rd in (("a", rda), ("b", rdb))}
     out["restarts"] = rs
-    b_restart = rs["b"].get("restarted") is True
+    # B's readiness record, or B's own restart check when the record is missing
+    b_restart = cand["restarted"]
     lt = rs["b"].get("last_termination") or {}
     out["candidate_restarts"] = {
-        "check": "customer_latency.pair.candidate_restarts", "value": rs["b"].get("count"), "bar": "== 0",
+        "check": "customer_latency.pair.candidate_restarts", "value": cand["count"], "bar": "== 0",
         "result": "FAIL" if b_restart else "PASS",
-        **({"why": f"B (the candidate) restarted {rs['b'].get('count')}x during measure"
+        **({"why": f"B (the candidate) restarted {cand['count']}x during measure"
                    + (f": last {lt.get('reason')} (exit {lt.get('exit_code')}) at {lt.get('finished_at')}"
-                      if lt else "") + "; any restart of the candidate FAILs the pair"}
+                      if lt else "")
+                   + ("" if rs["b"].get("restarted") else " (seen by its own restart check; no readiness record)")
+                   + "; any restart of the candidate FAILs the pair"}
            if b_restart else {})}
     if b_restart:
         out["checks"].append(out["candidate_restarts"])
     # B not Ready WITHOUT restarting FAILs the pair too (coordinator 2026-10-24):
     # its users saw errors; cutting its windows would hide that
-    spb = (rb or {}).get("k6_span")
-    nr = [e for e in (rdb or {}).get("excluded") or [] if e.get("kind") == "not_ready"
-          and (not spb or (e["t1"] > spb[0] and e["t0"] < spb[1]))]
+    nr = cand["not_ready"]
     b_not_ready = bool(nr)
-    nr_s = round(sum(e["seconds"] for e in nr), 1)
+    nr_s = cand["not_ready_s"]
     out["candidate_not_ready"] = {
         "check": "customer_latency.pair.candidate_not_ready",
         "value": {"seconds": nr_s, "stretches": [{k: e[k] for k in ("t0", "t1", "seconds", "why")} for e in nr]},
@@ -743,6 +801,19 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
             validity.append(_validity(f"readiness[{x}]", rd is not None and "excluded" in rd,
                                       rd is not None, "the run's report carries its readiness record",
                                       "without it the time snowplow was not Ready cannot be excluded"))
+        # B's readiness unknown inside k6's span (no sample, or a gap past twice
+        # the sampler's interval) voids: whether the candidate was down there
+        # cannot be told, and cutting it would hide whatever happened
+        spb = rb.get("k6_span")
+        unk = [e for e in (rdb or {}).get("excluded") or [] if e.get("kind") == "unknown"
+               and (not spb or (e["t1"] > spb[0] and e["t0"] < spb[1]))]
+        validity.append(_validity(
+            "readiness_known[b]", not unk,
+            {"seconds": round(sum(e["seconds"] for e in unk), 1),
+             "stretches": [{k: e[k] for k in ("t0", "t1", "seconds", "why")} for e in unk]} if unk else "known",
+            "B's readiness known for all of k6's span",
+            "B's readiness is unknown for " + "; ".join(f"{e['seconds']} s ({e['why']})" for e in unk)
+            + ": the candidate's not-Ready time cannot be told from its Ready time"))
         if rda is not None and rdb is not None:
             validity.append(_validity("restarts_placed[a]", not rs["a"].get("unlocated"),
                                       rs["a"].get("unlocated") or "every restart placed",
@@ -800,6 +871,8 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                 kpa = phase_stats(got["a"]["calls"], wa, ex["a"])
                 kpb = phase_stats(got["b"]["calls"], wb, ex["b"])
                 rates = {x: _rate(got[x]["requests"], ex[x]) for x in ("a", "b")}
+                # shown only: what B's customers saw while A was down (cut from both runs)
+                out["b_inside_a_outage"] = _b_inside_a_outage(ex, got["b"], rates["b"])
                 # A-healthy sensitivity (shown only): every phase A restarted in
                 # dropped whole from both runs, so a reader sees how much A's
                 # pre-crash minutes (Ready, so kept) move the ratio
@@ -855,7 +928,8 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
             e = _excluded(p, ex, wa, wb)
             for m in METRICS:
                 c = _cell(p, m, ka.get(p), kb.get(p), z, replica, judged=True,
-                          full_s=ga[p].get("seconds"), excluded=e)
+                          full_s=ga[p].get("seconds"), full_sd=(ga[p].get("half_sd") or {}).get(m),
+                          excluded=e)
                 if c is None:
                     kpa_, kpb_ = ka.get(p) or {}, kb.get(p) or {}
                     validity.append(_validity(f"spread[{p}].{m}", False,
@@ -885,7 +959,8 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                 e = _excluded(p, ex, xa, xb)
                 for m in METRICS:
                     c = _cell(p, m, sa_all.get(p), sb_all.get(p), z, replica, judged=False,
-                              full_s=fa[p].get("seconds"), excluded=e)
+                              full_s=fa[p].get("seconds"), full_sd=(fa[p].get("half_sd") or {}).get(m),
+                              excluded=e)
                     if c is None:
                         # still the ratio when both values are measurements;
                         # no bar when A's spread is not (a short step)
@@ -914,6 +989,29 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                     for p in dict.fromkeys(list((ra or {}).get(key) or {}) + list((rb or {}).get(key) or {}))}
     for k in ("refresher_completions", "snowplow_cpu", "clicks_vs_open_schedule", "readiness"):
         out[k] = {"a": (ra or {}).get(k), "b": (rb or {}).get(k)}
+    return out
+
+
+def _b_inside_a_outage(ex: dict, rawb: dict, ready_rate: dict | None) -> list[dict]:
+    """Per window cut for A's not-Ready time: B's calls and errors there
+    (shown, never judged), beside B's jointly-Ready error rate."""
+    out = []
+    for it in ex["items"]:
+        if it["run"] != "A" or not it["b"]:
+            continue
+        ivs = it["b"]
+        starts = [a for a, _ in ivs]
+        ms = [v for t, v in rawb["calls"] if _excluded_at(ivs, starts, t)]
+        req = [f for t, f in rawb["requests"] if _excluded_at(ivs, starts, t)]
+        n, k = len(req), sum(req)
+        row = {"what": it["what"], "b_s": round(sum(b - a for a, b in ivs), 1), "calls": len(ms),
+               "p95_ms": round(_pct(ms, 95), 2) if ms else None, "p99_ms": round(_pct(ms, 99), 2) if ms else None,
+               "requests": n, "failed": k, "error_rate": round(k / n, 6) if n else None,
+               "b_jointly_ready_error_rate": (ready_rate or {}).get("rate")}
+        row["line"] = (f"INFO B inside A's outage: {row['what']} ({row['b_s']} s of B's time): {row['calls']} calls, "
+                       f"p95 {row['p95_ms']} ms, p99 {row['p99_ms']} ms, errors {k} of {n} ({row['error_rate']}); "
+                       f"B's jointly-Ready error rate {row['b_jointly_ready_error_rate']} — shown, not judged")
+        out.append(row)
     return out
 
 
@@ -946,19 +1044,27 @@ def _replica(replica, p, m):
     return (((replica or {}).get("phases") or {}).get(p) or {}).get(m)
 
 
-def _cell(p, m, sa, sb, z, replica, *, judged, full_s=None, excluded=None) -> dict | None:
+def _cell(p, m, sa, sb, z, replica, *, judged, full_s=None, full_sd=None, excluded=None) -> dict | None:
     """One cell: B / A against max(within, replica), over the jointly-Ready
     time. None when A, B, A's sd or the replica is not a finite positive
     measurement (an A of 0, a negative p95, an infinite spread or replica
     would make the ratio or the bar meaningless: a +Inf spread passed
     anything).
 
-    `full_s`: the phase's seconds in A with nothing excluded. When the kept
-    sample is shorter, A's sd on it is scaled by sqrt(kept / full) (the
-    1/sqrt(n) law) to the sd a full-length sample would have: PASS needs B / A
-    within THAT bar, FAIL needs B / A past the kept sample's own bar; in
-    between, the shortened overlap decides: INCONCLUSIVE. A kept sample with
-    no calls, or no spread left, is INCONCLUSIVE."""
+    `full_s` / `full_sd`: the phase's seconds and A's half-sample sd with
+    nothing excluded. When the kept sample is shorter:
+      within_kept = exp(z sqrt2 sd_kept)            the kept sample's own
+      within      = exp(z sqrt2 min(sd_kept sqrt(kept / full), full_sd))
+      PASS iff B / A <= max(within, replica) / (within_kept / within)
+      FAIL iff B / A >  max(within_kept, replica)
+    and INCONCLUSIVE between (req/s mirrored). The 1/sqrt(n) scaling holds
+    only on average, so it is capped at A's whole-phase sd; and the kept
+    sample's extra spread is charged against the whole tolerance, replica
+    included. So with less data PASS is never easier than on the full phase
+    (and strictly harder whenever the kept spread is > 0), FAIL keeps the
+    kept sample's own false-FAIL control, and with nothing excluded both bars
+    are the one bar of before. A kept sample with no calls, or no spread
+    left, is INCONCLUSIVE."""
     e = excluded or {"a_s": 0.0, "b_s": 0.0, "why": []}
     sa, sb = sa or {}, sb or {}
     sd, a, b, rp = (sa.get("half_sd") or {}).get(m), sa.get(m), sb.get(m), _replica(replica, p, m)
@@ -978,8 +1084,18 @@ def _cell(p, m, sa, sb, z, replica, *, judged, full_s=None, excluded=None) -> di
             and (rp is None or (_measure(rp) and rp >= 1))):
         return None
     within_kept = math.exp(z * math.sqrt(2) * sd)
-    within = math.exp(z * math.sqrt(2) * sd * (math.sqrt(kept / full_s) if shrunk else 1.0))
-    tol, tol_fail = max(within, rp or 1.0), max(within_kept, rp or 1.0)
+    sd_pass, capped = sd, False
+    if shrunk:
+        # the 1/sqrt(n) law is right only on average: never looser than A's
+        # own whole-phase spread (a calm part cut, a volatile part kept)
+        sd_pass = sd * math.sqrt(kept / full_s)
+        if (_measure(full_sd) or full_sd == 0) and full_sd < sd_pass:
+            sd_pass, capped = full_sd, True
+    within = math.exp(z * math.sqrt(2) * sd_pass)
+    # the kept sample's extra spread is charged against the WHOLE tolerance,
+    # replica included: with less data PASS only gets harder (1 with nothing cut)
+    extra = within_kept / within
+    tol, tol_fail = max(within, rp or 1.0) / extra, max(within_kept, rp or 1.0)
     lower = m in LOWER_IS_WORSE
     bar = round(1 / tol, 4) if lower else round(tol, 4)
     fail_bar = round(1 / tol_fail, 4) if lower else round(tol_fail, 4)
@@ -990,13 +1106,18 @@ def _cell(p, m, sa, sb, z, replica, *, judged, full_s=None, excluded=None) -> di
         res = "PASS" if ratio <= bar else "FAIL" if ratio > fail_bar else INCONCLUSIVE
     result = res if judged else "INFO"
     op = ">=" if lower else "<="
-    short = (f"; on {kept} of {full_s} s jointly Ready: PASS {op} {bar} (full-length sd), "
-             f"FAIL past {fail_bar} (kept sample's)" if shrunk else "")
-    why = (f"{p} {m}: B is {ratio}x A, beyond the spread ({op} {bar})" if res == "FAIL" else
-           f"{p} {m}: B is {ratio}x A, between the full-length bar {bar} and the kept sample's {fail_bar}: "
+    by = "replica" if rp and rp >= within else ("A's whole-phase sd" if capped else "A's sd scaled to full length")
+    by_fail = "replica" if rp and rp >= within_kept else "the kept sample's sd"
+    short = (f"; on {kept} of {full_s} s jointly Ready: PASS {op} {bar} = {by} bar "
+             f"{round(max(within, rp or 1.0), 4)} less the kept sample's extra spread x{round(extra, 4)}, "
+             f"FAIL past {fail_bar} ({by_fail})" if shrunk else "")
+    why = (f"{p} {m}: B is {ratio}x A, beyond the spread ({op} {fail_bar})" if res == "FAIL" else
+           f"{p} {m}: B is {ratio}x A, between the PASS bar {bar} and the FAIL bar {fail_bar}: "
            f"the shortened jointly-Ready time decides it" if res == INCONCLUSIVE else None)
     return {**base, "ratio": ratio, "bar": f"{op} {bar}", "fail_bar": f"{op} {fail_bar}",
-            "within": round(within, 4), "within_kept": round(within_kept, 4), "result": result, "why": why,
+            "within": round(within, 4), "within_kept": round(within_kept, 4), "extra_spread": round(extra, 4),
+            "pass_bar_from": by if shrunk else ("replica" if rp and rp >= within else "A's sd"),
+            "result": result, "why": why,
             "line": f"{result} {p} {m}: B/A = {ratio} ({op} {bar}"
                     f"{'' if judged else ', not judged'}; a {a}, b {b}; within {round(within, 4)}, "
                     f"replica {rp}{short}) | {_ex_text(e)}"}
@@ -1103,20 +1224,25 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 — a crash must read INVALID, never exit 1 = FAIL
         out = {"kind": "customer_latency_pair", "verdict": "INVALID", "checks": [], "cells": [],
                "invalid_reasons": [f"the paired verdict could not be computed: {type(e).__name__}: {e}"]}
-        # ... unless the candidate restarted or was not Ready: that FAILs the pair, never hidden
-        rs = (((((vb or {}).get("report") or {}).get("customer_latency") or {}).get("readiness") or {})
-              .get("restarts") or {})
-        nr = [e for e in (((((vb or {}).get("report") or {}).get("customer_latency") or {}).get("readiness")
-                           or {}).get("excluded") or []) if e.get("kind") == "not_ready"]
-        if rs.get("restarted") is True or nr:
+        # ... unless the candidate restarted or was not Ready: that FAILs the pair,
+        # never hidden (_candidate reads a malformed record without raising)
+        cand = _candidate(vb)
+        if cand["restarted"] or cand["not_ready"]:
             out["verdict"] = "FAIL"
             out["fail_reasons"] = ([f"customer_latency.pair.candidate_restarts: B (the candidate) restarted "
-                                    f"{rs.get('count')}x during measure"] if rs.get("restarted") is True else []) + (
+                                    f"{cand['count']}x during measure"] if cand["restarted"] else []) + (
                 [f"customer_latency.pair.candidate_not_ready: B (the candidate) was not Ready for "
-                 f"{round(sum(e['seconds'] for e in nr), 1)} s without restarting"] if nr else [])
-    json.dump(out, sys.stdout, indent=1, default=str)
-    print()
-    return {"PASS": 0, "FAIL": 1, "INVALID": 3, INCONCLUSIVE: 4}[out["verdict"]]
+                 f"{cand['not_ready_s']} s without restarting"] if cand["not_ready"] else [])
+    try:
+        text = json.dumps(out, indent=1, default=str)
+    except Exception as e:  # noqa: BLE001 — the paired verdict file is never left empty
+        out = {"kind": "customer_latency_pair", "verdict": out.get("verdict") if out.get("verdict") in (
+            "FAIL", "INVALID") else "INVALID", "checks": [], "cells": [],
+               "fail_reasons": [str(r) for r in out.get("fail_reasons") or []],
+               "invalid_reasons": [f"the paired verdict could not be written: {type(e).__name__}: {e}"]}
+        text = json.dumps(out, indent=1, default=str)
+    print(text)
+    return {"PASS": 0, "FAIL": 1, "INVALID": 3, INCONCLUSIVE: 4}.get(out.get("verdict"), 3)
 
 
 if __name__ == "__main__":
