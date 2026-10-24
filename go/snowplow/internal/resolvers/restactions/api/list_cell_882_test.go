@@ -207,3 +207,149 @@ func TestListCell882_F2c_AnchorUnderChurnTakesEditedKeysAndNeverRaces(t *testing
 		t.Fatalf("F2c: %d LIST dispatches, want 1", got)
 	}
 }
+
+// list882Managed is len(status.managed) of the named item in a served LIST
+// value, -1 when the item is absent.
+func list882Managed(t *testing.T, v any, name string) int {
+	t.Helper()
+	for _, it := range list882ServedItems(t, v) {
+		obj, _ := it.(map[string]any)
+		md, _ := obj["metadata"].(map[string]any)
+		if md["name"] != name {
+			continue
+		}
+		st, _ := obj["status"].(map[string]any)
+		m, _ := st["managed"].([]any)
+		return len(m)
+	}
+	return -1
+}
+
+// list882HoldFirstList holds the first LIST dispatch AFTER its informer
+// listing until release is closed; listed is closed when it is held. Every
+// LIST dispatch is counted (the test's own seam).
+func list882HoldFirstList(t *testing.T) (listed, release chan struct{}, lists *atomic.Int64) {
+	t.Helper()
+	listed, release, lists = make(chan struct{}), make(chan struct{}), new(atomic.Int64)
+	listPath := fill710ListCall().Path
+	orig := dispatchViaInformerFn
+	t.Cleanup(func() { dispatchViaInformerFn = orig })
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+		raw, ok := orig(ctx, call)
+		if call.Path == listPath && lists.Add(1) == 1 {
+			close(listed)
+			<-release
+		}
+		return raw, ok
+	}
+	return listed, release, lists
+}
+
+func list882Wait(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("PRECONDITION: %s", what)
+	}
+}
+
+// F2m — a reader that joined a flight AFTER its list moved, when that flight
+// ends with no incremental cell (the anchor returned nil and nothing was
+// stored), must not be served the flight's body: it re-reads (errJoinedMovedFlight)
+// and gets every edit up to its own entry.
+func TestListCell882_F2m_MovedJoinerOfAFlightWithNoCellReReads(t *testing.T) {
+	dyn := newInc854Watcher(t, 10)
+	store := cache.ResolvedCache()
+	key := fill710ListKey()
+	inc854Anchor(t, store, fill710ListCall())
+	// Unanchor it: the next read takes the full fill (reanchor), with the entry
+	// still resident — its generation is what that fill's Put is checked against.
+	cache.Deps().OnResourceTypeStoreRepaired(r1FsaGVR)
+	listed, release, lists := list882HoldFirstList(t)
+
+	leader := stamp765Serve(r1Ctx(), store)
+	list882Wait(t, listed, "the leader never listed the informer")
+	stamp765Change(t, dyn, 9) // the list moves after the flight began and after its listing
+	joiner := stamp765Serve(r1Ctx(), store)
+	if !fill710WaitFor(30*time.Second, func() bool { return contentFillJoinWaiting.Load() >= 1 || lists.Load() > 1 }) {
+		t.Fatal("PRECONDITION: the second reader neither joined nor filled")
+	}
+	if lists.Load() != 1 {
+		t.Fatal("PRECONDITION: the second reader led its own fill instead of joining the flight")
+	}
+	// The flight anchors no cell (a type-level event drops the cell it is
+	// building: Anchor returns nil) and stores nothing (a DELETE-eviction of the
+	// key: the #189 PutIfGen is refused).
+	cache.Deps().OnResourceTypeStoreRepaired(r1FsaGVR)
+	store.DeleteForTest(key)
+	close(release)
+
+	lr, jr := <-leader, <-joiner
+	if !lr.ok || !lr.served || !jr.ok || !jr.served {
+		t.Fatalf("not served: leader ok=%v served=%v, joiner ok=%v served=%v", lr.ok, lr.served, jr.ok, jr.served)
+	}
+	if got := list882Managed(t, jr.v, stamp765Item); got != 9 {
+		t.Fatalf("F2m RED (#882 F2): the moved joiner was served managed=%d, want 9 — it got the body of a flight whose read "+
+			"predates an edit it saw before it entered, with no cell to bring it up to its own seq", got)
+	}
+	if got := lists.Load(); got != 2 {
+		t.Fatalf("F2m: %d LIST dispatches, want 2 (the flight's, then the moved joiner's re-read)", got)
+	}
+}
+
+// F1u — once a cell is no longer incremental (unanchored), the store's age
+// bounds apply to its entry again, from its original clocks.
+func TestListCell882_F1u_AnUnanchoredCellGetsItsAgeBoundsBack(t *testing.T) {
+	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "1")
+	newInc854Watcher(t, 5)
+	store := cache.ResolvedCache()
+	key := fill710ListKey()
+	c := inc854Anchor(t, store, fill710ListCall())
+	cache.Deps().OnResourceTypeStoreRepaired(r1FsaGVR)
+	if c.Anchored() {
+		t.Fatal("PRECONDITION: the type-level event did not unanchor the cell")
+	}
+	if !fill710WaitFor(5*time.Second, func() bool {
+		_, live := store.CellPutSeq(key)
+		return !live
+	}) {
+		t.Fatal("F1u RED (#882 F1): an UNANCHORED list cell outlived the 1 s TTL — the age-bound exemption " +
+			"follows the entry's shape, not the cell being incremental")
+	}
+	if _, ok := store.GetNoTouch(key); ok {
+		t.Fatal("F1u RED (#882 F1): the expired, unanchored entry was not evicted on read")
+	}
+}
+
+// F2r — a reader on its RETRY attempt (it may not snapshot-join a moved flight
+// itself) that LEADS a fill still makes that flight incremental: its leader
+// anchors, so a later reader whose list moved joins it rather than leading a
+// second fill.
+func TestListCell882_F2r_AFlightLedOnARetryAdmitsMovedReaders(t *testing.T) {
+	dyn := newInc854Watcher(t, 10)
+	store := cache.ResolvedCache()
+	listed, release, lists := list882HoldFirstList(t)
+
+	leader := make(chan fill710Served, 1)
+	go func() {
+		v, served, ok, _ := apistageContentServeAttempt(r1Ctx(), store, fill710ListCall(), false, false) // a retry attempt
+		leader <- fill710Served{v, served, ok}
+	}()
+	list882Wait(t, listed, "the retrying leader never listed the informer")
+	stamp765Change(t, dyn, 9)
+	joiner := stamp765Serve(r1Ctx(), store)
+	fill710WaitFor(30*time.Second, func() bool { return contentFillJoinWaiting.Load() >= 1 || lists.Load() > 1 })
+	close(release)
+	lr, jr := <-leader, <-joiner
+	if !lr.ok || !lr.served || !jr.ok || !jr.served {
+		t.Fatalf("not served: leader ok=%v served=%v, joiner ok=%v served=%v", lr.ok, lr.served, jr.ok, jr.served)
+	}
+	if got := lists.Load(); got != 1 {
+		t.Fatalf("F2r RED (#882 F2): %d LIST dispatches, want 1 — the flight a retrying reader led was not incremental, "+
+			"so a reader whose list moved led a second fill", got)
+	}
+	if got := list882Managed(t, jr.v, stamp765Item); got != 9 {
+		t.Fatalf("F2r: the moved joiner was served managed=%d, want 9 (the cell brought up to its own seq)", got)
+	}
+}

@@ -761,6 +761,9 @@ func apistageContentServeAttempt(
 			return e, hit && served
 		}
 	}
+	// #882 F2 — a fill of this call would anchor an incremental cell: a LIST,
+	// not a dry run, anchoring available on a servable GVR.
+	anchorable := isList && !cache.Inert(ctx) && cache.ListCellAnchorable(gvr)
 	if entry, hit := readContent(contentKey); hit && entry != nil {
 		hitObserved = true // Ship 0.30.193 C3 — observed cache hit.
 		// #618 — a HIT serves this call's selector from its own cell; the MISS
@@ -869,16 +872,15 @@ func apistageContentServeAttempt(
 			slog.String("key_hash", contentKey),
 		)
 	} else if flight, fillCtx, lead, movedJoin := enterContentFlight(ctx, contentKey, gvr, ns, name, fillReason, stamp,
-		isList && mayRetry && !cache.Inert(ctx) && cache.ListCellAnchorable(gvr)); !lead {
+		anchorable, anchorable && mayRetry); !lead {
 		// MISS, JOINER (#710 PR-1, apistage_fill_flight.go) — an in-flight fill of
 		// this key started after this reader's coordinate last moved, so its body is
 		// as fresh as this reader's own fill would be. Serve the flight's envelope
 		// and shared parsed items through this reader's own gate below, exactly as a
 		// content HIT serves entry.Items.
 		//
-		// #882 F2 — or the flight anchors an incremental LIST cell (snapshotJoin,
-		// computed in the call above: a LIST reader on its first attempt, not a dry
-		// run, with anchoring available on a servable GVR): then this reader joined
+		// #882 F2 — or the flight anchors an incremental LIST cell and this reader
+		// may snapshot-join (anchorable, on its first attempt): then it joined
 		// whatever its list did, and is served the cell brought up to its own seq.
 		res, ok := flight.wait(ctx)
 		if res.err != nil {

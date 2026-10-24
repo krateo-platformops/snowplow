@@ -106,7 +106,7 @@ func (c *ResolvedCacheStore) CellServeIdentity(key string) (putSeq, bodySeq uint
 // neither: no TTL or max entry age applies to it. Its body moves with the
 // informer's deltas, not with Puts, so CreatedAt and BornAt are not its
 // freshness; it leaves only through its own unanchor signals (mismatch, lost
-// event, comparator divergence) or byte pressure (LRU). The comparator pass
+// event, comparator divergence) or byte / entry-count pressure (LRU). The comparator pass
 // replaces the #378 24 h from-scratch rebuild for it. Once unanchored it is a
 // plain entry again and both bounds apply from its original clocks.
 func (c *ResolvedCacheStore) itemExpiredLocked(item *lruItem, now time.Time) (pastTTL, pastMaxAge bool) {

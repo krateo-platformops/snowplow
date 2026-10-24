@@ -159,15 +159,18 @@ var (
 // #765 — a reader that LEADS a pending flight blocks here until the flight it is
 // queued behind completes, then captures its content sink and starts.
 //
-// #882 F2 — snapshotJoin: this reader can be served an incremental cell's
-// snapshot, so it may join an incremental flight whatever its list did since the
-// flight started; a flight it creates is incremental. movedJoin reports a join
-// the epoch rule alone would have refused: that joiner is served only from the
-// flight's cell.
-func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, stamp contentStampGate, snapshotJoin bool) (flight *contentFlight, fillCtx context.Context, lead, movedJoin bool) {
+// #882 F2 — anchorable: a flight this reader leads will anchor an incremental
+// cell (a LIST, not a dry run, anchoring available on a servable GVR), so the
+// flight it creates is incremental. snapshotJoin: this reader may join an
+// incremental flight whatever its list did since the flight started (anchorable
+// AND a first attempt — a reader retrying after errJoinedMovedFlight keeps the
+// epoch rule, but a flight it LEADS is still incremental). movedJoin reports a
+// join the epoch rule alone would have refused: that joiner is served only from
+// the flight's cell.
+func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, stamp contentStampGate, anchorable, snapshotJoin bool) (flight *contentFlight, fillCtx context.Context, lead, movedJoin bool) {
 	fillCtx = cache.WithContentDepGenSink(ctx, gvr, namespace, name)
 	startSeq, _ := cache.DepGenStartSeqFromContext(fillCtx)
-	flight, lead, movedJoin = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason, contentFillClassOf(ctx), stamp, snapshotJoin)
+	flight, lead, movedJoin = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason, contentFillClassOf(ctx), stamp, anchorable, snapshotJoin)
 	if lead && flight.prior != nil {
 		// The prior flight is bounded by its own detached write deadline, so this
 		// wait is too; it is not cut by this reader's ctx, because the pending
@@ -205,10 +208,11 @@ func startPendingContentFlight(f *contentFlight, startSeq uint64) {
 // returned flight with a non-nil prior that the reader LEADS is pending: the
 // caller (enterContentFlight) waits for prior before filling.
 //
-// #882 F2 — snapshotJoin (see enterContentFlight): an incremental current flight
-// is joined whatever the coordinate did; movedJoin marks the join the epoch rule
-// would have refused.
-func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, class fillAdmissionClass, stamp contentStampGate, snapshotJoin bool) (flight *contentFlight, lead, movedJoin bool) {
+// #882 F2 — anchorable / snapshotJoin (see enterContentFlight): an incremental
+// current flight is joined whatever the coordinate did by a snapshotJoin reader;
+// a flight an anchorable reader creates is incremental; movedJoin marks the join
+// the epoch rule would have refused.
+func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, class fillAdmissionClass, stamp contentStampGate, anchorable, snapshotJoin bool) (flight *contentFlight, lead, movedJoin bool) {
 	contentFlightsMu.Lock()
 	defer contentFlightsMu.Unlock()
 	cur := contentFlights[key]
@@ -236,12 +240,12 @@ func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionR
 			return p, false, false
 		}
 		if cur != nil {
-			p := &contentFlight{key: key, prior: cur, done: make(chan struct{}), ticket: newFillTicket(class), incremental: snapshotJoin}
+			p := &contentFlight{key: key, prior: cur, done: make(chan struct{}), ticket: newFillTicket(class), incremental: anchorable}
 			contentPendingFlights[key] = p
 			return p, true, false
 		}
 	}
-	f := &contentFlight{key: key, startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class), incremental: snapshotJoin}
+	f := &contentFlight{key: key, startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class), incremental: anchorable}
 	contentFlights[key] = f
 	return f, true, false
 }

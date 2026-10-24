@@ -1539,7 +1539,8 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 	// correct 50K list hourly and made every reader re-fill it (#882, the
 	// run-15 OOM). Its from-scratch check is the comparator pass, which
 	// REPLACES the 24 h rebuild for it; it leaves through its own unanchor
-	// signals (mismatch, lost event, comparator divergence) or byte pressure.
+	// signals (mismatch, lost event, comparator divergence) or byte /
+	// entry-count pressure (LRU).
 	//
 	// #378 — a WARM cell evicted here is split by reader: on the customer path it
 	// is a cold navigation of the working set (the owner's P5 trigger); on the
@@ -2803,7 +2804,7 @@ type ResolvedEntryMeta struct {
 	TTLOverrideSeconds int64 `json:"ttlOverrideSeconds,omitempty"`
 	// Incremental (#882 F1) — an anchored incremental LIST content cell
 	// (list_cell.go). No TTL or max entry age applies to it: it leaves through
-	// its own unanchor signals or byte pressure, and its from-scratch check is
+	// its own unanchor signals or byte / entry-count pressure (LRU), and its from-scratch check is
 	// the comparator pass, not the #378 rebuild. AgeSeconds, LifetimeSeconds and
 	// TTLRemainingSeconds still report the clocks; nothing acts on them.
 	Incremental bool `json:"incremental,omitempty"`

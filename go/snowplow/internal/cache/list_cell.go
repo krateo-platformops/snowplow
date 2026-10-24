@@ -55,9 +55,9 @@
 // NO AGE BOUND (#882 F1, owner ruling). An anchored cell is not subject to the
 // store TTL or the max entry age (itemExpiredLocked): its body is rebuilt from
 // informer deltas, never by a Put, so its CreatedAt / BornAt say nothing about
-// its freshness. It leaves only through the signals above or byte pressure. The
-// comparator pass below is its from-scratch check and REPLACES the #378 24 h
-// max-age rebuild for it (no timer).
+// its freshness. It leaves only through the signals above or byte / entry-count
+// pressure (LRU). The comparator pass below is its from-scratch check and
+// REPLACES the #378 24 h max-age rebuild for it (no timer).
 //
 // THE COMPARATOR (zero tolerance). A pass compares the latest generation with a
 // fresh, decode-free listing of the same partition and query: key set and raw
@@ -526,9 +526,14 @@ func AnchorListCell(a ListCellAnchor) *ListCell {
 // informer's.
 //
 // The body is complete as of s (the R1 argument: every event <= s wrote the
-// indexer before the listing). Then pending is drained into a newer generation
-// BEFORE the cell is published, so its first reader gets every edit the fill
-// overlapped.
+// indexer before the listing), and that is all correctness needs: every reader
+// takes the cell through Snapshot(need), which drains pending itself. The drain
+// before the publish below is an OPTIMISATION: the listing already reflects
+// almost every edit the fill overlapped, so it only advances the first
+// generation's stamp past the edits recorded since s, sparing the first readers
+// that build, and gives the surfaces that read the published generation without
+// a Snapshot (ResolvedEntry.Raw / RawLen / itemCount: debug and fallback
+// readers) a body with those edits.
 func (f *ListCellFill) Anchor(envelope []byte, items []*unstructured.Unstructured, apiVersion, kind string) *ListCell {
 	if f == nil || f.done {
 		return nil
@@ -576,7 +581,8 @@ func (f *ListCellFill) Anchor(envelope []byte, items []*unstructured.Unstructure
 	c.gen.Store(&listGen{asOf: s, body: body})
 	seedDelivered(c.gvr, keyed)
 	// #882 F2 — the edits recorded while the fill ran, applied before anyone
-	// can read the cell.
+	// can read the cell (an optimisation, see the doc above: Snapshot drains
+	// pending for every reader anyway).
 	if _, err := c.build(); err != nil {
 		c.unanchor("build_" + err.Error())
 		return nil
