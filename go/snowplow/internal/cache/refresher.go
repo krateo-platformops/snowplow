@@ -1235,7 +1235,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			if windowOpen {
 				switch {
 				case errors.Is(err, ErrSelfObjectGone):
-					if r.settleWindow(key, t0, false, knownStaleNone) {
+					if r.settleWindow(key, t0, windowEnd, knownStaleNone) {
 						r.dirtyStats.unfresh[unfreshEvicted].Add(1)
 					} else {
 						r.dirtyStats.unfresh[unfreshDropped].Add(1)

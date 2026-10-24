@@ -20,15 +20,19 @@
 //     server's own write deadline, the longest any customer resolve may run. It
 //     runs on its own goroutine and never blocks the response.
 //   - TERMINAL: the cold path's own generation-guarded PutIfGen, which reports
-//     its outcome to the revalidation's sink; an accepted, un-remarked write
-//     closes the known-stale window (a dirty→fresh sample) and the cold path's
-//     publishIfSubscribed announces it over SSE.
+//     its outcome to the revalidation's sink; an accepted write ends the
+//     known-stale state and settles the revalidation (#884, owner ruling F5:
+//     known-stale means the last refresh FAILED). If the data moved during the
+//     resolve, the cell stays an ordinary open window the refresher replaces;
+//     otherwise the window closes (a dirty→fresh sample). The cold path's
+//     publishIfSubscribed announces the write over SSE.
 //   - FAILURE (owner ruling 1): no Put → the slot is released, the cell stays
 //     resident, served and counted; the next read or change retries. Never an
 //     eviction.
 //   - ABSORBED READ (#740): a read that finds the slot held earns the attempt
-//     in flight ONE rerun if it settles still known-stale (it may have read its
-//     inputs before the state that reader needs). The slot stays claimed across
+//     in flight ONE rerun if it settles still known-stale with no accepted Put
+//     (it may have read its inputs before the state that reader needs; #884: an
+//     accepted Put never reruns). The slot stays claimed across
 //     the rerun; with no absorbed read the first settle releases it.
 //   - SUPPRESSED (team ruling (b)): a key suppressed for a structurally-
 //     permanent reason (external endpoint, UAF, unsupported kind, sensitive

@@ -73,8 +73,10 @@
 //	    state, so the next cohort's resolve HITs the fresh content cell.
 //	F8  architect B1 — an accepted Put of a fresh body by ANY carrier (here a
 //	    seed-style PutThenRemark) whose resolve began after the mark ends the
-//	    known-stale state: the next Get counts nothing and starts no demand. A
-//	    Put whose resolve began BEFORE the mark does not.
+//	    known-stale state: the next Get counts nothing and starts no demand.
+//	    #884 (owner ruling F5) — a Put whose resolve began BEFORE the mark ends
+//	    it too, leaving an ordinary open window that the refresher replaces; a
+//	    failed replacement makes the cell known-stale again (t0 kept).
 //
 // The apistage content arm at the reader (F3) lives with the reader:
 // internal/resolvers/restactions/api/issue547_content_read_through_test.go.
@@ -1327,12 +1329,32 @@ func TestIssue547_F8_AFreshAcceptedPutByAnyCarrierEndsKnownStale(t *testing.T) {
 		t.Fatalf("PRECONDITION: cell not known-stale")
 	}
 
-	// A Put whose resolve began BEFORE the mark proves nothing: still known-stale.
+	// #884 (owner ruling F5) — a Put whose resolve began BEFORE the mark ends the
+	// known-stale state (known-stale means the last refresh FAILED), but its body
+	// predates the change, so the cell stays an ORDINARY open window from the same
+	// t0, handed to the refresher. Before #884 this sub-arm asserted the opposite.
+	t0, _, _ := cache.KnownStale(key)
+	d0 := k547Stat("dirty_ended_unfresh_dropped")
 	pre := cache.WithL1KeyContextFromEpoch(context.Background(), key, epochBefore)
 	store.PutThenRemark(pre, key, &cache.ResolvedEntry{RawJSON: e.RawJSON, Inputs: e.Inputs})
-	if _, _, ks := cache.KnownStale(key); !ks {
-		t.Fatalf("F8: a Put whose resolve began BEFORE the mark ended the known-stale state — it carries the pre-change body")
+	if _, _, ks := cache.KnownStale(key); ks {
+		t.Fatalf("F8 (#884): a Put whose resolve began BEFORE the mark did not end the known-stale state")
 	}
+	if !cache.InputsMovedSincePut(key) {
+		t.Fatalf("F8 (#884): the pre-mark Put closed the window — its body predates the change, the window must stay open")
+	}
+	// The refresher replaces it; the background identity is still denied, so that
+	// refresh FAILS and the cell is known-stale again (#547 is about a failed refresh).
+	if !k547WaitFor(t, 30*time.Second, "the re-opened window's refresh dropped", func() bool {
+		_, _, ks := cache.KnownStale(key)
+		return ks && k547Stat("dirty_ended_unfresh_dropped") > d0
+	}) {
+		t.Fatalf("F8 (#884): the re-opened window was never refreshed, or its failed refresh did not make the cell known-stale again")
+	}
+	if t1, _, _ := cache.KnownStale(key); !t1.Equal(t0) {
+		t.Fatalf("F8 (#884): the window's t0 moved across the re-open (%v -> %v)", t0, t1)
+	}
+	k547WaitFor(t, 5*time.Second, "queue drained", func() bool { return k547Stat("queue_depth") == 0 })
 
 	// A seed-style Put of a fresh body whose resolve began after the mark.
 	var obj map[string]any
