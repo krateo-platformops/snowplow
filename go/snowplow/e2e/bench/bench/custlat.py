@@ -44,6 +44,9 @@ Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
 2026-10-24):
   - any snowplow restart (or pod replacement) in B, the candidate, FAILs the
     pair outright, whatever else the pair is (never INVALID, never hidden);
+    so does any stretch B was not Ready WITHOUT restarting (coordinator
+    2026-10-24: its users saw errors; cutting its windows would hide that) —
+    reported with its seconds and its signal (readyz codes, prewarm);
   - a restart of A, the baseline, is recorded and reported; it does not void
     the pair. Only a restart the readiness samples cannot place in time does
     (its recovery could not be excluded);
@@ -62,6 +65,10 @@ Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
     overlap is what decides: INCONCLUSIVE. With nothing excluded the two
     bars are the same and the cell is decided as before;
   - every cell says how many seconds each arm lost and why;
+  - A's minutes before a crash are Ready, so they count. Each cell also
+    shows (never judges) an A-healthy sensitivity: the same cell with every
+    phase A restarted in dropped whole from both runs; when B passes a judged
+    cell A restarted inside, a NOTE says so;
   - k6's error rate (> 1 % voids) is counted only inside the jointly-Ready
     time, and only B's voids; A's whole-run rate is reported beside it.
     Every other reason a run's own verdict is INVALID still voids the pair.
@@ -706,6 +713,24 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
            if b_restart else {})}
     if b_restart:
         out["checks"].append(out["candidate_restarts"])
+    # B not Ready WITHOUT restarting FAILs the pair too (coordinator 2026-10-24):
+    # its users saw errors; cutting its windows would hide that
+    spb = (rb or {}).get("k6_span")
+    nr = [e for e in (rdb or {}).get("excluded") or [] if e.get("kind") == "not_ready"
+          and (not spb or (e["t1"] > spb[0] and e["t0"] < spb[1]))]
+    b_not_ready = bool(nr)
+    nr_s = round(sum(e["seconds"] for e in nr), 1)
+    out["candidate_not_ready"] = {
+        "check": "customer_latency.pair.candidate_not_ready",
+        "value": {"seconds": nr_s, "stretches": [{k: e[k] for k in ("t0", "t1", "seconds", "why")} for e in nr]},
+        "bar": "== 0 s", "result": "FAIL" if b_not_ready else "PASS",
+        **({"why": f"B (the candidate) was not Ready without restarting: {len(nr)} stretch(es), {nr_s} s ("
+                   + "; ".join(f"{e['seconds']} s: {e['why']}" for e in nr)
+                   + "); its users saw it, so it FAILs the pair (its windows are not a way out)"}
+           if b_not_ready else {})}
+    if b_not_ready:
+        out["checks"].append(out["candidate_not_ready"])
+    b_fail = b_restart or b_not_ready
     notes = []
     if rs["a"].get("restarted"):
         lta = rs["a"].get("last_termination") or {}
@@ -751,6 +776,7 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
         out["exclusion"] = {"a": ex["a"], "b": ex["b"],
                             "items": [{k: it[k] for k in ("what", "why", "a", "b")} for it in ex["items"]]}
         ka, kb, kpa, kpb = ga, gb, pa, pb               # nothing excluded: the runs' own stats
+        sick, hs = [], {}
         rates = {x: {"requests": r["k6_errors"]["requests"], "failed": r["k6_errors"]["failed"],
                      "rate": r["k6_errors"]["rate"]} if r.get("k6_errors") else None
                  for x, r in (("a", ra), ("b", rb))}
@@ -774,6 +800,19 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                 kpa = phase_stats(got["a"]["calls"], wa, ex["a"])
                 kpb = phase_stats(got["b"]["calls"], wb, ex["b"])
                 rates = {x: _rate(got[x]["requests"], ex[x]) for x in ("a", "b")}
+                # A-healthy sensitivity (shown only): every phase A restarted in
+                # dropped whole from both runs, so a reader sees how much A's
+                # pre-crash minutes (Ready, so kept) move the ratio
+                sick = [n for n in _names(wa) if any(_secs_in(it["a"], n, wa) > 0 for it in ex["items"]
+                                                     if it["run"] == "A" and it["kind"] == "restart")]
+                if sick:
+                    hx = {x: _union(list(ex[x]) + [iv for n in sick
+                                                   for iv in _region(n, _wins(r), *r["k6_span"])])
+                          for x, r in (("a", ra), ("b", rb))}
+                    hs = {"pooled": (phase_stats(got["a"]["calls"], pooled(wa), hx["a"]),
+                                     phase_stats(got["b"]["calls"], pooled(wb), hx["b"])),
+                          "steps": (phase_stats(got["a"]["calls"], wa, hx["a"]),
+                                    phase_stats(got["b"]["calls"], wb, hx["b"]))}
             else:
                 ka = kb = kpa = kpb = None
                 rates = {"a": None, "b": None}
@@ -826,6 +865,7 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                                               "finite positive A, B, A's half-sample sd >= 0, replica >= 1",
                                               f"{p} {m}: not a measurement, no tolerance can be derived"))
                     continue
+                _a_healthy(c, sick, hs.get("pooled"), out, notes)
                 out["cells"].append(c)
                 out["checks"].append({
                     "check": f"customer_latency.pair[{p}].{m}",
@@ -857,11 +897,12 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                              "replica": _replica(replica, p, m), "result": "INFO", "excluded": e,
                              "line": f"INFO {p} {m}: B/A = {r} (n/a, not judged: no spread for A here; "
                                      f"a {a}, b {b}) | {_ex_text(e)}"}
+                    _a_healthy(c, sick, hs.get("steps" if p.startswith("churn:") else "pooled"), out, notes)
                     out["cells"].append(c)
     out["notes"] = notes
     # (no judged cell at all is already INVALID: judged[storm] / judged[churn])
     results = [c["result"] for c in out["checks"]]
-    out["verdict"] = ("FAIL" if b_restart else
+    out["verdict"] = ("FAIL" if b_fail else
                       "INVALID" if any(c["result"] == "FAIL" for c in validity) else
                       "FAIL" if "FAIL" in results else
                       INCONCLUSIVE if INCONCLUSIVE in results else "PASS")
@@ -874,6 +915,31 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
     for k in ("refresher_completions", "snowplow_cpu", "clicks_vs_open_schedule", "readiness"):
         out[k] = {"a": (ra or {}).get(k), "b": (rb or {}).get(k)}
     return out
+
+
+def _a_healthy(c: dict, sick: list[str], stats, out: dict, notes: list[str]) -> None:
+    """The cell's A-healthy sensitivity (shown, never judged): the same cell
+    with every phase A restarted in dropped whole from both runs. A NOTE when
+    B passes a judged cell that A restarted inside."""
+    p, m = c["phase"], c["metric"]
+    inside = [n for n in sick if n == p or (p == CHURN and n.startswith("churn:"))]
+    if not inside:
+        h = {"phases_dropped": [], "ratio": c.get("ratio"), "same_as_cell": True}
+        line = f"INFO A-healthy {p} {m}: = the cell (A had no restart in {p})"
+    else:
+        sa, sb = ((stats or ({}, {}))[0].get(p) or {}), ((stats or ({}, {}))[1].get(p) or {})
+        a, b = sa.get(m), sb.get(m)
+        r = round(b / a, 4) if _measure(a) and _measure(b) else None
+        h = {"phases_dropped": inside, "a": a, "b": b, "ratio": r, "a_kept_s": sa.get("seconds"),
+             "b_kept_s": sb.get("seconds"), "same_as_cell": False}
+        line = (f"INFO A-healthy {p} {m}: B/A = {r} without {', '.join(inside)} (A restarted there; "
+                f"a {a}, b {b} on {sa.get('seconds')} s of A), vs {c.get('ratio')} in the cell; shown, not judged")
+        if c["judged"] and c["result"] == "PASS":
+            notes.append(f"B passes {p} {m} (B/A {c.get('ratio')}) while A restarted inside it "
+                         f"({', '.join(inside)}): A's pre-crash minutes count as Ready there; "
+                         f"A-healthy B/A = {r}")
+    c["a_healthy"] = dict(h, line=line)
+    out.setdefault("a_healthy_lines", []).append(line)
 
 
 def _replica(replica, p, m):
@@ -1037,13 +1103,17 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 — a crash must read INVALID, never exit 1 = FAIL
         out = {"kind": "customer_latency_pair", "verdict": "INVALID", "checks": [], "cells": [],
                "invalid_reasons": [f"the paired verdict could not be computed: {type(e).__name__}: {e}"]}
-        # ... unless the candidate restarted: that FAILs the pair, never hidden
+        # ... unless the candidate restarted or was not Ready: that FAILs the pair, never hidden
         rs = (((((vb or {}).get("report") or {}).get("customer_latency") or {}).get("readiness") or {})
               .get("restarts") or {})
-        if rs.get("restarted") is True:
+        nr = [e for e in (((((vb or {}).get("report") or {}).get("customer_latency") or {}).get("readiness")
+                           or {}).get("excluded") or []) if e.get("kind") == "not_ready"]
+        if rs.get("restarted") is True or nr:
             out["verdict"] = "FAIL"
-            out["fail_reasons"] = [f"customer_latency.pair.candidate_restarts: B (the candidate) restarted "
-                                   f"{rs.get('count')}x during measure"]
+            out["fail_reasons"] = ([f"customer_latency.pair.candidate_restarts: B (the candidate) restarted "
+                                    f"{rs.get('count')}x during measure"] if rs.get("restarted") is True else []) + (
+                [f"customer_latency.pair.candidate_not_ready: B (the candidate) was not Ready for "
+                 f"{round(sum(e['seconds'] for e in nr), 1)} s without restarting"] if nr else [])
     json.dump(out, sys.stdout, indent=1, default=str)
     print()
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, INCONCLUSIVE: 4}[out["verdict"]]

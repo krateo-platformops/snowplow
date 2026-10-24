@@ -156,10 +156,10 @@ while IFS= read -r r; do
   [[ -n "$r" ]] && log "$r"
 done < <(python3 -c 'import json, sys; v = json.load(open(sys.argv[1]))
 ex = (v.get("exclusion") or {}).get("items") or []
-print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if "candidate_restarts" in r]
+print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidate_" in r]
                 + ["INVALID: " + r for r in v["invalid_reasons"]] + ["NOTE: " + n for n in v.get("notes") or []]
                 + ["EXCLUDED from both runs: %s (A %.0f s, B %.0f s): %s" % (i["what"], sum(b - a for a, b in i["a"]),
                    sum(b - a for a, b in i["b"]), i["why"]) for i in ex]
-                + [c["line"] for c in v["cells"]]))' \
+                + [c["line"] for c in v["cells"]] + (v.get("a_healthy_lines") or [])))' \
            "$PAIR_OUT/paired-verdict.json" 2>/dev/null || true)
 exit "$vrc"

@@ -174,6 +174,30 @@ def test_run15_replayed_is_fail_because_b_restarted(run15):
     assert ra["count"] == 2 and ra["in_samples"] == 2 and ra["pod"] == {"record": "same pod", "restarts": 2}
     assert ra["last_termination"]["located"] and not ra["unlocated"]
     assert any(n.startswith("A (the baseline) restarted 2x") for n in p["notes"])
+    # B's not-Ready time is all restart recovery: no separate not-Ready FAIL
+    assert p["candidate_not_ready"]["result"] == "PASS"
+
+
+def test_run15_a_healthy_sensitivity_and_the_note(run15):
+    """A restarted inside churn:list_dep@10 and churn:list_dep@50: churn's
+    A-healthy line drops both steps whole from both runs; B passes churn
+    req_s there, so a NOTE says A restarted inside that cell."""
+    _, va, vb, _, p = run15
+    by = {(c["phase"], c["metric"]): c for c in p["cells"]}
+    h = by[("churn", "req_s")]["a_healthy"]
+    assert h["phases_dropped"] == ["churn:list_dep@10", "churn:list_dep@50"] and not h["same_as_cell"]
+    ph = va["report"]["customer_latency"]["phases"]
+    full = va["report"]["customer_latency"]["gate_phases"]["churn"]["seconds"]
+    # the dropped steps whole, plus B's restart #2 (in a kept step), 675.2 s
+    want = full - ph["churn:list_dep@10"]["seconds"] - ph["churn:list_dep@50"]["seconds"] - 675.2
+    assert abs(h["a_kept_s"] - want) < 1.0, (h["a_kept_s"], want)
+    assert by[("churn", "req_s")]["result"] == "PASS"
+    assert any(n.startswith("B passes churn req_s") and "list_dep@10, churn:list_dep@50" in n for n in p["notes"])
+    # failed cells get no such note; cells A never restarted in say so
+    assert not any(n.startswith("B passes churn p95_ms") for n in p["notes"])
+    assert by[("storm", "p95_ms")]["a_healthy"]["same_as_cell"]
+    assert by[("churn:list_dep@10", "p95_ms")]["a_healthy"]["ratio"] is None      # nothing left of that step
+    assert len(p["a_healthy_lines"]) == len(p["cells"])
 
 
 def test_run15_not_ready_stretches_from_the_runs_own_signals(run15):
@@ -379,6 +403,41 @@ def test_synthetic_a_only_restart_is_recorded_and_excluded_from_both(tmp_path):
     assert round(b0 - a0, 6) == SHIFT and round(b1 - a1, 6) == SHIFT     # the same windows, B's time
     churn = [c for c in p["checks"] if c["check"].startswith("customer_latency.pair[churn]")]
     assert churn and all(c["excluded"]["a_s"] == c["excluded"]["b_s"] > 0 for c in churn)
+
+
+def test_synthetic_b_not_ready_without_restarting_fails(tmp_path):
+    """B answers readyz 0 for ~200 s without restarting (no counter reset, no
+    pod restart): its users saw it, so the pair FAILs, with the stretch, its
+    seconds and its signal; A's identical stretch would only be excluded."""
+    p = _arms(tmp_path / "b", P14, _shift(_down(P14, 900, 1100, restart=False), SHIFT))
+    assert p["verdict"] == "FAIL" and p["candidate_restarts"]["result"] == "PASS"
+    c = p["candidate_not_ready"]
+    assert c["result"] == "FAIL" and c in p["checks"]
+    (st,) = c["value"]["stretches"]
+    assert c["value"]["seconds"] == st["seconds"] >= 200 and "readyz 0" in st["why"]
+    assert "not Ready without restarting" in c["why"] and "readyz 0" in c["why"]
+    assert {x["result"] for x in p["checks"] if ".pair[" in x["check"]} == {"PASS"}
+    p = _arms(tmp_path / "a", _down(P14, 900, 1100, restart=False), _shift(P14, SHIFT))
+    assert p["verdict"] == "PASS" and p["candidate_not_ready"]["result"] == "PASS"
+    assert [it["what"] for it in p["exclusion"]["items"]] == ["A not_ready #1"]
+
+
+def test_synthetic_a_healthy_drops_the_phases_a_restarted_in(tmp_path):
+    p = _arms(tmp_path, _down(P14, 900, 1100), _shift(P14, SHIFT))
+    v = json.loads((tmp_path / "a" / "verdict.json").read_text())["report"]["customer_latency"]
+    by = {(c["phase"], c["metric"]): c for c in p["cells"]}
+    h = by[("churn", "p95_ms")]["a_healthy"]
+    dropped = h["phases_dropped"]
+    assert dropped and all(n.startswith("churn:") for n in dropped)
+    want = v["gate_phases"]["churn"]["seconds"] - sum(v["phases"][n]["seconds"] for n in dropped)
+    assert abs(h["a_kept_s"] - want) < 1.0 and abs(h["b_kept_s"] - want) < 1.0
+    assert abs(h["ratio"] - 1.0) < 0.02                         # B is A, shifted
+    assert by[("burst", "p95_ms")]["a_healthy"]["phases_dropped"] == ["burst"]
+    assert by[("storm", "p95_ms")]["a_healthy"]["same_as_cell"]
+    for m in custlat.METRICS:
+        assert by[("churn", m)]["result"] == "PASS"
+        assert any(n.startswith(f"B passes churn {m}") for n in p["notes"]), p["notes"]
+    assert not any(n.startswith("B passes storm") for n in p["notes"])
 
 
 def test_synthetic_b_only_restart_fails_whatever_the_cells_say(tmp_path):
