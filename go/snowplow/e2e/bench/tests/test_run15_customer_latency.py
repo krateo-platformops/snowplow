@@ -3,6 +3,10 @@ in parallel, k6's customers on through every churn step (K6_SPAN=churn),
 and the paired customer-latency verdict (bench/custlat.py pair, launched by
 run606_pair.sh).
 
+tests/fixtures/customer_latency_run14_gate_phases.json is run 14's REAL
+gate-phase spread (custlat over its whole collected artifacts): option A's
+bars on it, and whether x0.87 req/s / x1.17 p95 would be caught.
+
 tests/fixtures/customer_latency_run14_every50.json.gz is RECORDED from run
 14's artifacts (1.12.54, bench adc2e702): every 50th k6 http_req_duration
 point in stream order, the k6 config and browser sessions, mem606's phase
@@ -44,10 +48,12 @@ DIG_A, DIG_B = "sha256:" + "a" * 64, "sha256:" + "b" * 64
 
 def _paired(doc=R14):
     """Run 14 on the paired schedule: its six churn steps, in order, laid
-    evenly over k6's span (the last ends 30 s before k6's last call)."""
+    evenly over k6's span, the last ending 200 s before k6's last call (a
+    steady tail with customers, as K6_SPAN=churn leaves when fresh606 ends
+    before its bound)."""
     d = copy.deepcopy(doc)
     t0 = d["t0"] + d["calls"][0][0]
-    t1 = d["t0"] + max(off for off, _ in d["calls"]) - 30
+    t1 = d["t0"] + max(off for off, _ in d["calls"]) - 200
     step = (t1 - t0) / len(d["churns"])
     for i, c in enumerate(d["churns"]):
         c["t0"], c["t1"] = t0 + i * step, t0 + (i + 1) * step
@@ -119,8 +125,12 @@ def _cells(p):
     return {c["check"]: c for c in p["checks"]}
 
 
-def _gate_phases(v):
-    return [p for p, s in v["report"]["customer_latency"]["phases"].items() if s["n"]]
+def _gp(v):
+    return v["report"]["customer_latency"]["gate_phases"]
+
+
+def _bar(p, phase, m):
+    return float(_cells(p)[f"customer_latency.pair[{phase}].{m}"]["bar"].split()[2])
 
 
 def test_the_paired_schedule_puts_customers_in_every_churn_step(va):
@@ -133,6 +143,11 @@ def test_the_paired_schedule_puts_customers_in_every_churn_step(va):
         assert s["p99_ms"] > s["p95_ms"]
         assert s["req_s"] == round(s["n"] / s["seconds"], 2)
     assert sum(s["n"] for s in ph.values()) == len(P14["calls"]) == r["calls"]
+    # the gate's phases: every churn step pooled, the same calls
+    g = r["gate_phases"]
+    assert set(g) == {"storm", "burst", "churn", "steady"}
+    assert g["churn"]["n"] == sum(ph[p]["n"] for p in churn)
+    assert g["storm"] == ph["storm"] and g["burst"] == ph["burst"]
     # refresher completions / CPU per churn step, while customers were on
     rc = r["refresher_completions"]["by_phase"]
     assert all(rc[p]["with_customers"]["seconds"] > 0 for p in churn)
@@ -141,52 +156,128 @@ def test_the_paired_schedule_puts_customers_in_every_churn_step(va):
     assert r["schedule"]["churn"][0] == ["list_dep@1", 1.0] and len(r["schedule"]["churn"]) == 6
 
 
-def test_a_against_itself_passes(va):
-    p = _pair(va, copy.deepcopy(va) | {"report": dict(va["report"], image_digest={"expected": DIG_B})},
-              expect_a=DIG_A, expect_b=DIG_B)
+def test_a_against_itself_passes_on_the_nine_judged_cells(va):
+    a, b = _ab(va)
+    p = _pair(a, b, expect_a=DIG_A, expect_b=DIG_B)
     assert p["verdict"] == "PASS", p["invalid_reasons"]
-    assert len(p["checks"]) == 3 * len(_gate_phases(va)) == p["method"]["cells"]
+    assert p["method"]["judged"] == ["storm", "churn", "steady"] and p["method"]["cells"] == 9
+    assert sorted(c["check"] for c in p["checks"]) == sorted(
+        f"customer_latency.pair[{ph}].{m}" for ph in ("storm", "churn", "steady") for m in custlat.METRICS)
     assert {c["value"]["ratio"] for c in p["checks"]} == {1.0}
-    assert p["method"]["z"] == round(NormalDist().inv_cdf(1 - 0.05 / p["method"]["cells"]), 4)
+    assert p["method"]["z"] == round(NormalDist().inv_cdf(1 - 0.05 / 9), 4)
 
 
-def test_b_slower_in_one_churn_step_fails_just_past_its_spread(va, tmp_path, capsys):
-    wins = [tuple(w) for w in va["report"]["customer_latency"]["windows"]]
-    step = next(p for p in _gate_phases(va) if p.startswith("churn:"))
-    base = _pair(va, va)
-    tol = [float(_cells(base)[f"customer_latency.pair[{step}].{m}"]["bar"].split()[2]) for m in ("p95_ms", "p99_ms")]
+def test_burst_and_each_churn_step_are_shown_never_judged(va):
+    a, b = _ab(va)
+    gb, steps = _gp(b), [s for s in b["report"]["customer_latency"]["phases"] if s.startswith("churn:")]
+    gb["burst"]["p95_ms"] *= 50                                  # far past any bar
+    for s in steps:
+        b["report"]["customer_latency"]["phases"][s]["p99_ms"] *= 50
+    p = _pair(a, b)
+    assert p["verdict"] == "PASS" and not [c for c in p["checks"] if "burst" in c["check"]]
+    info = [c for c in p["cells"] if not c["judged"]]
+    assert {c["phase"] for c in info} == {"burst", *[s for s in steps if _gp(a)["churn"]["n"]
+                                                     and a["report"]["customer_latency"]["phases"][s]["n"]]}
+    assert all(c["result"] == "INFO" and "not judged" in c["line"] for c in info)
+    bp = next(c for c in info if c["phase"] == "burst" and c["metric"] == "p95_ms")
+    assert bp["ratio"] == 50.0 and bp["ratio"] > float(bp["bar"].split()[1])
+
+
+def test_b_slower_in_pooled_churn_fails_just_past_its_spread(va, tmp_path, capsys):
+    wins = custlat.pooled([tuple(w) for w in va["report"]["customer_latency"]["windows"]])
+    a, _ = _ab(va)
+    base = _pair(a, a)
+    tol = [_bar(base, "churn", m) for m in ("p95_ms", "p99_ms")]
     for k, want in ((max(tol) * 1.02, "FAIL"), (min(tol) * 0.98, "PASS")):
         vb = _run(tmp_path, f"slow{k}", capsys,
-                  scale=lambda t, ms, k=k: ms * k if custlat._phase(t, wins) == step else ms)
-        p = _pair(va, vb, expect_a=DIG_A, expect_b=DIG_B)
+                  scale=lambda t, ms, k=k: ms * k if custlat._phase(t, wins) == "churn" else ms)
+        p = _pair(a, vb, expect_a=DIG_A, expect_b=DIG_B)
         res = {c: x["result"] for c, x in _cells(p).items()}
-        assert res.pop(f"customer_latency.pair[{step}].p95_ms") == want, k
-        assert res.pop(f"customer_latency.pair[{step}].p99_ms") == want, k
+        assert res.pop("customer_latency.pair[churn].p95_ms") == want, k
+        assert res.pop("customer_latency.pair[churn].p99_ms") == want, k
         assert set(res.values()) == {"PASS"}
-        assert p["verdict"] == ("FAIL" if want == "FAIL" else "PASS"), p["invalid_reasons"]
+        assert p["verdict"] == want, p["invalid_reasons"]
 
 
 def test_b_with_fewer_calls_fails_req_s_only_below_the_floor(va, tmp_path, capsys):
-    wins = [tuple(w) for w in va["report"]["customer_latency"]["windows"]]
-    step = [p for p in _gate_phases(va) if p.startswith("churn:")][-1]
-    floor = float(_cells(_pair(va, va))[f"customer_latency.pair[{step}].req_s"]["bar"].split()[2])
-    ts = [P14["t0"] + off for off, _ in P14["calls"] if custlat._phase(P14["t0"] + off, wins) == step]
+    wins = custlat.pooled([tuple(w) for w in va["report"]["customer_latency"]["windows"]])
+    floor = _bar(_pair(va, va), "churn", "req_s")
+    ts = [P14["t0"] + off for off, _ in P14["calls"] if custlat._phase(P14["t0"] + off, wins) == "churn"]
     for share, want in ((floor - 0.05, "FAIL"), (min(1.0, floor + 0.05), "PASS")):
         gone = {t for i, t in enumerate(ts) if math.floor((i + 1) * share) == math.floor(i * share)}
         vb = _run(tmp_path, f"drop{share}", capsys, drop=lambda t, gone=gone: t in gone)
-        c = _cells(_pair(va, vb))[f"customer_latency.pair[{step}].req_s"]
+        c = _cells(_pair(va, vb))["customer_latency.pair[churn].req_s"]
         assert c["result"] == want, (share, c)
 
 
+# ─── option A on run 14's REAL spread ─────────────────────────────────────
+GP14 = json.loads((FIX / "customer_latency_run14_gate_phases.json").read_text())["gate_phases"]
+
+
+def _run14_pair(scale: dict, phases=("storm", "churn"), extra=None):
+    """A = run 14's real gate phases (fixture); B = A with metrics scaled."""
+    gpa = {p: copy.deepcopy(GP14[p]) for p in (*phases, "burst")}
+    gpa.update(extra or {})
+    gpb = copy.deepcopy(gpa)
+    for (p, m), k in scale.items():
+        gpb[p][m] = round(gpb[p][m] * k, 4)
+
+    def v(gp, dig):
+        return {"verdict": "FAIL", "report": {"image_digest": {"expected": dig}, "customer_latency": {
+            "gate_phases": gp, "phases": {}, "k6_span": [0, 100], "schedule": {},
+            "windows": [["storm", float("-inf"), 10], ["churn:list_dep@1", 10, 90]]}}}
+    return custlat.pair(v(gpa, DIG_A), v(gpb, DIG_B), replica=REPLICA)
+
+
+def test_run14_spread_x087_req_s_and_x117_p95():
+    """Option A's bars on run 14's REAL spread (what Diego asked to see).
+
+    Run 14 had customers only in its first churn step and no steady, so it
+    judges 6 cells (z 2.394): there x0.87 req/s in pooled churn FAILs (floor
+    0.8719) and x1.17 storm p95 FAILs (bar 1.1571), x1.17 churn p95 passes
+    (bar 1.4992: run 14's churn p95 spread is wide)."""
+    p = _run14_pair({("churn", "req_s"): 0.87})
+    assert p["method"]["cells"] == 6 and p["method"]["z"] == 2.394
+    assert _bar(p, "churn", "req_s") == 0.8719 and p["verdict"] == "FAIL"
+    assert _cells(p)["customer_latency.pair[churn].req_s"]["result"] == "FAIL"
+    p = _run14_pair({("storm", "p95_ms"): 1.17})
+    assert _bar(p, "storm", "p95_ms") == 1.1571 and p["verdict"] == "FAIL"
+    p = _run14_pair({("churn", "p95_ms"): 1.17})
+    assert _bar(p, "churn", "p95_ms") == 1.4992 and p["verdict"] == "PASS"     # missed
+
+
+def test_run14_spread_with_nine_cells_misses_x087_by_a_hair():
+    """With a steady phase too (the paired schedule's 9 cells, z 2.539), the
+    same run-14 spread gives a churn floor of 0.8646: x0.87 PASSes, missed by
+    0.006. It is caught once pooled churn's req/s sd < 0.0388 (run 14's,
+    over 991 s of churn with customers: 0.0405; a paired run pools ~11x the
+    seconds — run 14's own sd falls with length, 0.0636 at 240 s, 0.0477 at
+    481 s — but that is a projection, not a measurement)."""
+    steady = {"steady": copy.deepcopy(GP14["churn"])}          # a stand-in third judged phase
+    p = _run14_pair({("churn", "req_s"): 0.87}, extra=steady)
+    assert p["method"]["cells"] == 9 and p["method"]["z"] == 2.5392
+    assert _bar(p, "churn", "req_s") == 0.8646 and p["verdict"] == "PASS"
+    sd_needed = math.log(1 / 0.87) / (p["method"]["z"] * math.sqrt(2))
+    assert round(sd_needed, 4) == 0.0388
+    tighter = copy.deepcopy(steady)
+    gp = copy.deepcopy(GP14["churn"])
+    gp["half_sd"]["req_s"] = 0.0387                             # just under the sd it needs
+    p = _run14_pair({("churn", "req_s"): 0.87}, extra=dict(tighter, churn=gp))
+    assert p["verdict"] == "FAIL"
+    # x1.17 storm p95 is still caught at 9 cells (bar 1.1674)
+    p = _run14_pair({("storm", "p95_ms"): 1.17}, extra=steady)
+    assert _bar(p, "storm", "p95_ms") == 1.1674 and p["verdict"] == "FAIL"
+
+
 def test_b_own_spread_never_sets_the_bar(va):
-    vb = copy.deepcopy(va)
-    for s in vb["report"]["customer_latency"]["phases"].values():
+    a, b = _ab(va)
+    for s in _gp(b).values():
         s["half_sd"] = {m: 5.0 for m in s["half_sd"]}
-    assert [c["bar"] for c in _pair(va, vb)["checks"]] == [c["bar"] for c in _pair(va, va)["checks"]]
-    wide = copy.deepcopy(va)
-    for s in wide["report"]["customer_latency"]["phases"].values():
+    assert [c["bar"] for c in _pair(a, b)["checks"]] == [c["bar"] for c in _pair(a, a)["checks"]]
+    wide = copy.deepcopy(a)
+    for s in _gp(wide).values():
         s["half_sd"] = {m: 2 * x for m, x in s["half_sd"].items()}
-    assert [c["bar"] for c in _pair(wide, va)["checks"]] != [c["bar"] for c in _pair(va, va)["checks"]]
+    assert [c["bar"] for c in _pair(wide, b)["checks"]] != [c["bar"] for c in _pair(a, b)["checks"]]
 
 
 def test_the_tolerance_is_the_method():
@@ -194,22 +285,25 @@ def test_the_tolerance_is_the_method():
         ph = {"n": 10, "p95_ms": p95, "p99_ms": 200.0, "req_s": 50.0,
               "half_sd": {"p95_ms": sd, "p99_ms": sd, "req_s": sd}}
         return {"verdict": "FAIL", "report": {"image_digest": {"expected": DIG_A}, "customer_latency": {
-            "phases": {"storm": dict(ph), "churn:list_dep@10": dict(ph)}, "k6_span": [0, 100],
+            "gate_phases": {"storm": dict(ph), "churn": dict(ph)}, "phases": {}, "k6_span": [0, 100],
             "windows": [["storm", float("-inf"), 10], ["churn:list_dep@10", 10, 90]], "schedule": {}}}}
     a = rep(0.05)
     b = copy.deepcopy(a)
     b["report"]["image_digest"]["expected"] = DIG_B
-    p = custlat.pair(a, b, replica={"phases": {"storm": {"p95_ms": 1.9},
-                                               "churn:list_dep@10": {"p95_ms": 1.01}}})
+    p = custlat.pair(a, b, replica={"phases": {"storm": {"p95_ms": 1.9}, "churn": {"p95_ms": 1.01}}})
     z = NormalDist().inv_cdf(1 - 0.05 / 6)
     w = math.exp(z * math.sqrt(2) * 0.05)
     within = round(w, 4)
     bars = {c["check"]: c["bar"].split()[2] for c in p["checks"]}
     assert bars["customer_latency.pair[storm].p95_ms"] == "1.9"                 # replica above within
     assert bars["customer_latency.pair[storm].p99_ms"] == str(within)          # no replica for it
-    assert bars["customer_latency.pair[churn:list_dep@10].p95_ms"] == str(within)   # replica 1.01 below it
+    assert bars["customer_latency.pair[churn].p95_ms"] == str(within)          # replica 1.01 below it
     assert bars["customer_latency.pair[storm].req_s"] == str(round(1 / w, 4))
     assert p["verdict"] == "PASS" and p["method"]["cells"] == 6
+
+
+def _gpu(v, phase, **kw):
+    _gp(v)[phase].update(**kw)
 
 
 @pytest.mark.parametrize("breaks, check", [
@@ -220,9 +314,8 @@ def test_the_tolerance_is_the_method():
     (lambda a, b: a.update(verdict="INVALID"), "runs_valid"),
     (lambda a, b: b["report"].pop("customer_latency"), "k6_reports"),
     (lambda a, b: b["report"]["customer_latency"].update(k6_span=[0.0, 1.0]), "customers_through_churn[b]"),
-    (lambda a, b: b["report"]["customer_latency"]["phases"].pop("burst"), "measured[burst]"),
-    (lambda a, b: a["report"]["customer_latency"]["phases"]["burst"]["half_sd"].update(p95_ms=None),
-     "spread[burst].p95_ms"),
+    (lambda a, b: _gp(b).pop("steady"), "measured[steady]"),
+    (lambda a, b: _gp(a)["churn"]["half_sd"].update(p95_ms=None), "spread[churn].p95_ms"),
     # k6 stopped inside the 3rd of the 6 churn steps: the LAST step is what counts
     (lambda a, b: b["report"]["customer_latency"]["k6_span"].__setitem__(1, _churn_mid(b, 2)),
      "customers_through_churn[b]"),
@@ -230,26 +323,38 @@ def test_the_tolerance_is_the_method():
     (lambda a, b: a.update(verdict="WAT"), "runs_valid"),
     (lambda a, b: a["report"]["image_digest"].update(expected=None), "images"),
     # not measurements: a zero / negative / NaN value, an infinite or negative spread
-    (lambda a, b: a["report"]["customer_latency"]["phases"]["storm"].update(p95_ms=0), "spread[storm].p95_ms"),
-    (lambda a, b: b["report"]["customer_latency"]["phases"]["storm"].update(p95_ms=-5.0), "spread[storm].p95_ms"),
-    (lambda a, b: b["report"]["customer_latency"]["phases"]["storm"].update(req_s=float("nan")),
-     "spread[storm].req_s"),
-    (lambda a, b: a["report"]["customer_latency"]["phases"]["storm"]["half_sd"].update(p95_ms=float("inf")),
-     "spread[storm].p95_ms"),
-    (lambda a, b: a["report"]["customer_latency"]["phases"]["storm"]["half_sd"].update(p99_ms=-0.1),
-     "spread[storm].p99_ms"),
-    (lambda a, b: a["report"]["customer_latency"]["phases"]["storm"].update(p99_ms=True), "spread[storm].p99_ms"),
-    # an A with no phase that had calls has nothing to pass
-    (lambda a, b: [s.update(n=0) for s in a["report"]["customer_latency"]["phases"].values()], "cells"),
+    (lambda a, b: _gpu(a, "storm", p95_ms=0), "spread[storm].p95_ms"),
+    (lambda a, b: _gpu(b, "storm", p95_ms=-5.0), "spread[storm].p95_ms"),
+    (lambda a, b: _gpu(b, "storm", req_s=float("nan")), "spread[storm].req_s"),
+    (lambda a, b: _gp(a)["storm"]["half_sd"].update(p95_ms=float("inf")), "spread[storm].p95_ms"),
+    (lambda a, b: _gp(a)["storm"]["half_sd"].update(p99_ms=-0.1), "spread[storm].p99_ms"),
+    (lambda a, b: _gpu(a, "storm", p99_ms=True), "spread[storm].p99_ms"),
+    # option A: storm and churn must be there to judge
+    (lambda a, b: _gpu(a, "churn", n=0), "judged[churn]"),
+    (lambda a, b: _gp(a).pop("storm"), "judged[storm]"),
 ])
 def test_a_pair_that_cannot_be_compared_is_invalid(va, breaks, check):
-    a = copy.deepcopy(va)
-    b = copy.deepcopy(va)
-    b["report"]["image_digest"] = {"expected": DIG_B}
+    a, b = _ab(va)
     breaks(a, b)
     p = _pair(a, b)
     assert p["verdict"] == "INVALID"
     assert [c["check"] for c in p["validity"] if c["result"] == "FAIL"] == [f"customer_latency.pair.{check}"]
+
+
+def test_an_a_with_no_judged_calls_is_invalid(va):
+    a, b = _ab(va)
+    for s in _gp(a).values():
+        s["n"] = 0
+    p = _pair(a, b)
+    assert p["verdict"] == "INVALID" and not p["checks"]
+    assert _failed(p) == {"customer_latency.pair.judged[storm]", "customer_latency.pair.judged[churn]"}
+
+
+def test_steady_is_judged_only_when_a_has_it(va):
+    a, b = _ab(va)
+    _gp(a).pop("steady")
+    p = _pair(a, b)
+    assert p["verdict"] == "PASS" and p["method"]["judged"] == ["storm", "churn"] and p["method"]["cells"] == 6
 
 
 def _churn_mid(v, i):
@@ -285,7 +390,7 @@ def test_a_run_that_failed_as_tooling_makes_the_pair_invalid(va):
 
 def test_invalid_wins_over_fail(va):
     a, b = _ab(va)
-    b["report"]["customer_latency"]["phases"]["storm"]["p95_ms"] *= 100
+    _gp(b)["storm"]["p95_ms"] *= 100
     assert _pair(a, b)["verdict"] == "FAIL"
     b["verdict"] = "INVALID"
     p = _pair(a, b)
@@ -302,7 +407,8 @@ def test_a_bad_replica_is_invalid(va):
 def test_every_cell_is_printed_with_its_ratio_and_bar(va):
     a, b = _ab(va)
     p = _pair(a, b)
-    assert len(p["cells"]) == len(p["checks"]) > 0
+    judged = [c for c in p["cells"] if c["judged"]]
+    assert len(judged) == len(p["checks"]) == 9 and len(p["cells"]) > 9
     for c in p["cells"]:
         assert {"phase", "metric", "a", "b", "ratio", "bar", "within", "replica", "result", "line"} <= set(c)
         assert f"B/A = {c['ratio']}" in c["line"] and c["bar"] in c["line"]
@@ -330,7 +436,7 @@ def test_pair_cli_never_reads_a_crash_as_fail(va, tmp_path):
     """A 0 in A (INVALID, not ZeroDivisionError) and a malformed verdict (an
     exception inside pair): both exit 3 = INVALID, never 1 = FAIL."""
     a, b = _ab(va)
-    a["report"]["customer_latency"]["phases"]["storm"]["p95_ms"] = 0
+    _gp(a)["storm"]["p95_ms"] = 0
     (tmp_path / "a.json").write_text(json.dumps(a))
     (tmp_path / "b.json").write_text(json.dumps(b))
     (tmp_path / "bad.json").write_text(json.dumps(dict(b, report=dict(b["report"], customer_latency={"phases": 7}))))
@@ -363,13 +469,19 @@ def test_pair_cli_missing_verdict_is_invalid(va, tmp_path):
 
 
 def test_the_committed_replica_is_runs_12_and_13():
-    assert set(REPLICA["phases"]) == {"storm", "burst", "churn:list_dep@1"}
+    """Over the gate's phases: runs 12 / 13 had customers only in their first
+    churn step, so their pooled churn IS that step."""
+    assert set(REPLICA["phases"]) == {"storm", "burst", "churn"}
     assert [x["dir"] for x in REPLICA["provenance"]] == ["snowplow-bench-run12-662515cb",
                                                          "snowplow-bench-run13-662515cb"]
     assert all(r >= 1.0 for ph in REPLICA["phases"].values() for r in ph.values())
-    a = {"phases": {"storm": {"n": 1, "p95_ms": 110.0, "p99_ms": 100.0, "req_s": 0}}}
-    b = {"phases": {"storm": {"n": 1, "p95_ms": 100.0, "p99_ms": 125.0, "req_s": 0}}}
+    a = {"gate_phases": {"storm": {"n": 1, "p95_ms": 110.0, "p99_ms": 100.0, "req_s": 0}}}
+    b = {"gate_phases": {"storm": {"n": 1, "p95_ms": 100.0, "p99_ms": 125.0, "req_s": 0}}}
     assert custlat.replica_ratios(a, b, [])["phases"] == {"storm": {"p95_ms": 1.1, "p99_ms": 1.25}}
+    # from the gate's (pooled) phases, never the per-step ones
+    step = {"n": 1, "p95_ms": 300.0, "p99_ms": 300.0, "req_s": 1.0}
+    a["phases"], b["phases"] = {"churn:list_dep@1": step}, {"churn:list_dep@1": step}
+    assert set(custlat.replica_ratios(a, b, [])["phases"]) == {"storm"}
 
 
 def test_half_sd_keeps_the_time_profile():
@@ -587,7 +699,7 @@ def test_pair_runs_both_after_both_dry_passes_and_writes_the_paired_verdict(pair
 def test_pair_slower_b_exits_fail(pairbed, va):
     repo, fake, env, tmp = pairbed
     _, b = _verdicts(fake, va)
-    b["report"]["customer_latency"]["phases"]["storm"]["p95_ms"] *= 3
+    b["report"]["customer_latency"]["gate_phases"]["storm"]["p95_ms"] *= 3
     (fake / f"{NB}.verdict.json").write_text(json.dumps(b))
     p = _launch(repo, env)
     assert p.returncode == 1, p.stderr[-3000:]

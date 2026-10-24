@@ -16,7 +16,14 @@ point's time): storm, burst, churn:<label> per fresh606 step, and steady
 on through every churn step; pair() makes a pair whose k6 stopped before the
 last step ended INVALID.
 
-Per cell (phase x p95 / p99 / req/s), B / A against a tolerance:
+Judged cells (Diego 2026-10-23, option A): 3 coarse phases x p95 / p99 /
+req/s = 9 cells — storm, churn (EVERY churn step pooled, while the customers
+are on) and steady. burst is shown, never judged (one ~15 s stall sets its
+tail: run 14's 99 % of >p95 burst calls fell in 150-165 s); each churn step
+on its own is shown, never judged. Shown cells print their ratio against
+the bar the same method gives them.
+
+Per cell, B / A against a tolerance:
   within   A's own sampling spread: paired half-samples of BLOCK_S blocks —
            adjacent blocks (2k, 2k+1) go one to each half, so both halves
            keep the phase's time profile (a storm is a ramp, not a
@@ -52,6 +59,10 @@ from statistics import NormalDist
 from bench import k6eval, load606
 
 METRICS = ("p95_ms", "p99_ms", "req_s")
+CHURN = "churn"
+JUDGED = ("storm", CHURN, "steady")       # option A: the gated phases
+REQUIRED = ("storm", CHURN)               # a pair without them judges nothing that matters
+SHOWN = ("burst",)                        # shown, never judged (plus each churn step)
 LOWER_IS_WORSE = ("req_s",)
 BLOCK_S = 10.0
 HALF_SAMPLES = 400
@@ -264,6 +275,12 @@ def clicks_vs_schedule(o: dict | None, wins) -> dict | None:
             for p in _names(wins) if p in sched or p in done}
 
 
+def pooled(wins) -> list[tuple[str, float, float]]:
+    """run_phases' windows with every churn step named CHURN (precedence
+    kept): the gate's coarse phases storm / burst / churn / steady."""
+    return [(CHURN if n.startswith("churn:") else n, w0, w1) for n, w0, w1 in wins]
+
+
 def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[dict] | None,
            churns: list[dict] | None, tops: list[dict]) -> dict:
     """report["customer_latency"] of one run's verdict.json."""
@@ -273,6 +290,8 @@ def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[
     return {"block_s": BLOCK_S, "calls": len(cs), "k6_span": span,
             "windows": [[n, w0, w1] for n, w0, w1 in wins],
             "phases": phase_stats(cs, wins),
+            # the gate's phases: every churn step pooled while customers are on
+            "gate_phases": phase_stats(cs, pooled(wins)),
             "schedule": schedule(k6o, browser, mem, churns),
             "clicks_vs_open_schedule": clicks_vs_schedule(k6o, wins),
             "refresher_completions": refresher_per_phase(mem, wins, span),
@@ -344,68 +363,106 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                 {"k6_last_call": span[1] if span else None, "last_churn_end": last},
                 "k6's last call after the last churn step ended",
                 "the customers stopped before the churn did: a churn step has no customer latency"))
-        cells = [(p, m) for p, s in ra["phases"].items() if s["n"] for m in METRICS]
+        ga, gb = ra.get("gate_phases") or {}, rb.get("gate_phases") or {}
+        for p in REQUIRED:
+            if not (ga.get(p) or {}).get("n"):
+                validity.append(_validity(f"judged[{p}]", False, 0, "> 0 k6 calls in A",
+                                          f"A has no k6 call in {p}: the pair judges nothing there"))
+        judged = [p for p in JUDGED if (ga.get(p) or {}).get("n")]
+        cells = [(p, m) for p in judged for m in METRICS]
         z = NormalDist().inv_cdf(1 - FAMILY_ALPHA / len(cells)) if cells else None
-        out["method"]["cells"], out["method"]["z"] = len(cells), round(z, 4) if z else None
-        for p in dict.fromkeys(p for p, _ in cells):
-            sa, sb = ra["phases"][p], rb["phases"].get(p) or {}
-            if not sb.get("n"):
+        out["method"].update(cells=len(cells), z=round(z, 4) if z else None, judged=judged,
+                             shown=list(SHOWN) + ["each churn step"])
+        for p in judged:
+            if not (gb.get(p) or {}).get("n"):
                 validity.append(_validity(f"measured[{p}]", False, 0, "> 0 k6 calls in B",
                                           f"B has no k6 call in {p}: the cell cannot be compared"))
                 continue
             for m in METRICS:
-                sd, a, b = sa["half_sd"][m], sa[m], sb.get(m)
-                rep = (((replica or {}).get("phases") or {}).get(p) or {}).get(m)
-                # finite, positive measurements only: a 0 A, a negative p95,
-                # an infinite spread or replica would make the ratio or the
-                # bar meaningless (a +Inf spread passed anything)
-                if not (_measure(a) and _measure(b) and (_measure(sd) or sd == 0)
-                        and (rep is None or (_measure(rep) and rep >= 1))):
+                c = _cell(p, m, ga[p], gb[p], z, replica, judged=True)
+                if c is None:
                     validity.append(_validity(f"spread[{p}].{m}", False,
-                                              {"a": a, "b": b, "a_half_sd": sd, "replica": rep},
+                                              {"a": ga[p].get(m), "b": gb[p].get(m),
+                                               "a_half_sd": ga[p]["half_sd"].get(m),
+                                               "replica": _replica(replica, p, m)},
                                               "finite positive A, B, A's half-sample sd >= 0, replica >= 1",
                                               f"{p} {m}: not a measurement, no tolerance can be derived"))
                     continue
-                within = math.exp(z * math.sqrt(2) * sd)
-                tol = max(within, rep or 1.0)
-                lower = m in LOWER_IS_WORSE
-                bar = round(1 / tol, 4) if lower else round(tol, 4)
-                ratio = round(b / a, 4)
-                ok = ratio >= bar if lower else ratio <= bar
-                out["cells"].append({
-                    "phase": p, "metric": m, "a": a, "b": b, "ratio": ratio,
-                    "bar": f"{'>=' if lower else '<='} {bar}", "within": round(within, 4), "replica": rep,
-                    "result": "PASS" if ok else "FAIL",
-                    "line": f"{'PASS' if ok else 'FAIL'} {p} {m}: B/A = {ratio} "
-                            f"({'>=' if lower else '<='} {bar}; a {a}, b {b}; within {round(within, 4)}, "
-                            f"replica {rep})"})
+                out["cells"].append(c)
                 out["checks"].append({
                     "check": f"customer_latency.pair[{p}].{m}",
-                    "value": {"a": a, "b": b, "ratio": ratio},
-                    "bar": f"ratio {'>=' if lower else '<='} {bar} (within {round(within, 4)} from A's "
-                           f"sd {sd}; replica {rep})",
-                    "result": "PASS" if ok else "FAIL",
-                    **({} if ok else {"why": f"{p} {m}: B is {ratio}x A, beyond the spread ({bar})"})})
-    if not out["checks"] and all(c["result"] == "PASS" for c in validity):
-        validity.append(_validity("cells", False, 0, ">= 1 cell", "A has no phase with k6 calls"))
+                    "value": {"a": c["a"], "b": c["b"], "ratio": c["ratio"]},
+                    "bar": f"ratio {c['bar']} (within {c['within']} from A's sd {c['a_half_sd']}; "
+                           f"replica {c['replica']})",
+                    "result": c["result"],
+                    **({} if c["result"] == "PASS" else
+                       {"why": f"{p} {m}: B is {c['ratio']}x A, beyond the spread ({c['bar']})"})})
+        # shown, never judged: burst, and each churn step on its own
+        shown = [(p, ga, gb) for p in SHOWN] + [(p, ra.get("phases") or {}, rb.get("phases") or {})
+                                                for p in (ra.get("phases") or {}) if p.startswith("churn:")]
+        for p, sa_all, sb_all in shown:
+            if z and (sa_all.get(p) or {}).get("n") and (sb_all.get(p) or {}).get("n"):
+                for m in METRICS:
+                    c = _cell(p, m, sa_all[p], sb_all[p], z, replica, judged=False)
+                    if c is None:
+                        # still the ratio when both values are measurements;
+                        # no bar when A's spread is not (a short step)
+                        a, b = sa_all[p].get(m), sb_all[p].get(m)
+                        r = round(b / a, 4) if _measure(a) and _measure(b) else None
+                        c = {"phase": p, "metric": m, "judged": False, "a": a, "b": b, "ratio": r,
+                             "bar": "n/a", "within": None, "a_half_sd": (sa_all[p].get("half_sd") or {}).get(m),
+                             "replica": _replica(replica, p, m), "result": "INFO",
+                             "line": f"INFO {p} {m}: B/A = {r} (n/a, not judged: no spread for A here; "
+                                     f"a {a}, b {b})"}
+                    out["cells"].append(c)
+    # (no judged cell at all is already INVALID: judged[storm] / judged[churn])
     out["verdict"] = ("INVALID" if any(c["result"] == "FAIL" for c in validity) else
                       "FAIL" if any(c["result"] == "FAIL" for c in out["checks"]) else "PASS")
     out["invalid_reasons"] = [f"{c['check']}: {c['why']}" for c in validity if c["result"] == "FAIL"]
     # beside the verdict: both runs' per-phase reports, side by side
-    out["phases"] = {p: {"a": (ra or {}).get("phases", {}).get(p), "b": (rb or {}).get("phases", {}).get(p)}
-                     for p in dict.fromkeys(list((ra or {}).get("phases", {})) +
-                                            list((rb or {}).get("phases", {})))}
+    for key in ("gate_phases", "phases"):
+        out[key] = {p: {"a": ((ra or {}).get(key) or {}).get(p), "b": ((rb or {}).get(key) or {}).get(p)}
+                    for p in dict.fromkeys(list((ra or {}).get(key) or {}) + list((rb or {}).get(key) or {}))}
     for k in ("refresher_completions", "snowplow_cpu", "clicks_vs_open_schedule"):
         out[k] = {"a": (ra or {}).get(k), "b": (rb or {}).get(k)}
     return out
 
 
+def _replica(replica, p, m):
+    return (((replica or {}).get("phases") or {}).get(p) or {}).get(m)
+
+
+def _cell(p, m, sa, sb, z, replica, *, judged) -> dict | None:
+    """One cell: B / A against max(within, replica). None when A, B, A's
+    sd or the replica is not a finite positive measurement (an A of 0, a
+    negative p95, an infinite spread or replica would make the ratio or the
+    bar meaningless: a +Inf spread passed anything)."""
+    sd, a, b, rp = (sa.get("half_sd") or {}).get(m), sa.get(m), sb.get(m), _replica(replica, p, m)
+    if not (_measure(a) and _measure(b) and (_measure(sd) or sd == 0)
+            and (rp is None or (_measure(rp) and rp >= 1))):
+        return None
+    within = math.exp(z * math.sqrt(2) * sd)
+    tol = max(within, rp or 1.0)
+    lower = m in LOWER_IS_WORSE
+    bar = round(1 / tol, 4) if lower else round(tol, 4)
+    ratio = round(b / a, 4)
+    ok = ratio >= bar if lower else ratio <= bar
+    result = ("PASS" if ok else "FAIL") if judged else "INFO"
+    op = ">=" if lower else "<="
+    return {"phase": p, "metric": m, "judged": judged, "a": a, "b": b, "ratio": ratio,
+            "bar": f"{op} {bar}", "within": round(within, 4), "a_half_sd": sd, "replica": rp,
+            "result": result,
+            "line": f"{result} {p} {m}: B/A = {ratio} ({op} {bar}"
+                    f"{'' if judged else ', not judged'}; a {a}, b {b}; within {round(within, 4)}, "
+                    f"replica {rp})"}
+
+
 def replica_ratios(r1: dict, r2: dict, provenance: dict) -> dict:
-    """The replica file: per phase both reports measured, |log| ratio per
-    metric (either direction: the spread's size)."""
+    """The replica file: per gate phase both reports measured, |log| ratio
+    per metric (either direction: the spread's size)."""
     phases = {}
-    for p, s1 in r1["phases"].items():
-        s2 = r2["phases"].get(p)
+    for p, s1 in r1["gate_phases"].items():
+        s2 = r2["gate_phases"].get(p)
         if not (s1.get("n") and s2 and s2.get("n")):
             continue
         phases[p] = {m: round(math.exp(abs(math.log(s1[m] / s2[m]))), 4)
