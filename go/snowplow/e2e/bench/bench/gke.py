@@ -514,9 +514,11 @@ spec:
 
 
 def execute(argv: list[str], *, dry_run: bool, env: dict | None = None,
-            input_data: str | None = None, timeout: int = 3600,
-            log: Callable[[str], None] = print) -> tuple[int, str]:
-    """Run one argv (or print it under dry-run). Returns (rc, stdout)."""
+            input_data: str | None = None, timeout: float = 3600,
+            log: Callable[[str], None] = print,
+            stderr_out: list[str] | None = None) -> tuple[int, str]:
+    """Run one argv (or print it under dry-run). Returns (rc, stdout); the
+    stderr is appended to `stderr_out` when given."""
     shown = " ".join(argv)
     if dry_run:
         log(f"DRY-RUN: {shown}")
@@ -526,6 +528,8 @@ def execute(argv: list[str], *, dry_run: bool, env: dict | None = None,
                           env=env, input=input_data, timeout=timeout)
     if proc.returncode != 0:
         log(f"  rc={proc.returncode} stderr={proc.stderr.strip()[:500]}")
+    if stderr_out is not None:
+        stderr_out.append(proc.stderr or "")
     return proc.returncode, proc.stdout
 
 
@@ -564,10 +568,29 @@ def run_with_teardown(spec: ClusterSpec, body: Callable[[], int], *,
     return rc or (1 if teardown_failed else 0)
 
 
+# GKE refuses a delete while another operation runs on the cluster (run 15
+# B: a node-pool / upgrade operation in flight at teardown): "Cluster is
+# running incompatible operation operation-<id>".
+_INCOMPATIBLE_OP = re.compile(r"running incompatible operation (operation-[A-Za-z0-9-]+)")
+
+
+def operation_wait_command(op: str, spec: ClusterSpec) -> list[str]:
+    return ["gcloud", "container", "operations", "wait", op,
+            "--project", spec.project, "--zone", spec.zone]
+
+
 def teardown(spec: ClusterSpec, *, dry_run: bool,
-             log: Callable[[str], None] = print) -> None:
+             log: Callable[[str], None] = print,
+             budget_s: float | None = None,
+             clock: Callable[[], float] = time.monotonic) -> None:
     """Describe → assert_deletable → delete. Raises when not deletable or the
-    delete call fails, so run_with_teardown reports it."""
+    delete call fails, so run_with_teardown reports it.
+
+    A delete refused because another operation is in flight on the cluster
+    waits for THAT operation (`gcloud container operations wait`, bounded by
+    what is left of `budget_s`), then retries the delete — as often as the
+    cluster names a new in-flight operation, until the budget is spent.
+    Any other delete failure raises at once."""
     rc, out = execute(describe_command(spec), dry_run=dry_run, log=log)
     if dry_run:
         execute(delete_command(spec), dry_run=True, log=log)
@@ -576,9 +599,26 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
         raise RuntimeError(f"describe {spec.name} failed (rc={rc}); "
                            f"cluster may already be gone")
     assert_deletable(json.loads(out))
-    rc, _ = execute(delete_command(spec), dry_run=False, log=log)
-    if rc != 0:
-        raise RuntimeError(f"delete {spec.name} failed (rc={rc})")
+    deadline = None if budget_s is None else clock() + budget_s
+    while True:
+        err: list[str] = []
+        rc, _ = execute(delete_command(spec), dry_run=False, log=log, stderr_out=err)
+        if rc == 0:
+            return
+        m = _INCOMPATIBLE_OP.search(err[-1] if err else "")
+        left = None if deadline is None else deadline - clock()
+        if m is None or (left is not None and left <= 0):
+            raise RuntimeError(f"delete {spec.name} failed (rc={rc})"
+                               + (f"; still blocked by {m.group(1)} when the budget ran out" if m else ""))
+        log(f"delete {spec.name} blocked by in-flight {m.group(1)}: waiting for it, then retrying")
+        try:
+            wrc, _ = execute(operation_wait_command(m.group(1), spec), dry_run=False, log=log,
+                             timeout=left if left is not None else 3600)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"delete {spec.name}: {m.group(1)} still running when the "
+                               f"budget ran out") from None
+        if wrc != 0:
+            log(f"  waiting for {m.group(1)} failed (rc={wrc}); retrying the delete anyway")
 
 
 # ─── CLI (registered from cli._build_parser) ────────────────────────────────
@@ -628,7 +668,7 @@ def cmd_gke_up(a) -> int:
 def cmd_gke_down(a) -> int:
     spec = default_spec(a.name, project=a.project, zone=a.zone)
     try:
-        teardown(spec, dry_run=not a.yes)
+        teardown(spec, dry_run=not a.yes, budget_s=a.budget_s)
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"gke-down: {type(e).__name__}: {e}\n")
         return 1
@@ -729,6 +769,9 @@ def add_parsers(sub) -> None:
     down = sub.add_parser("gke-down", help="#606: delete a bench cluster "
                                            "(label-checked; dry run unless --yes)")
     common(down)
+    down.add_argument("--budget-s", type=float, default=None,
+                      help="how long a delete refused by an in-flight cluster operation may wait "
+                           "for it (run606: DOWN_BUDGET_S); unset = until it ends")
     down.set_defaults(func=cmd_gke_down)
 
     reap = sub.add_parser("gke-reap", help="#606: delete bench clusters past "

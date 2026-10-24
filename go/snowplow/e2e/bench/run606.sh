@@ -247,6 +247,15 @@ run() {
   if [[ "$DRY" == "1" ]]; then log "DRY: $*"; return 0; fi
   log "RUN: $*"; "$@"
 }
+# kapply <file>: EVERY manifest this script applies goes through here.
+# Server-side apply: client-side apply copies the whole object into the
+# kubectl.kubernetes.io/last-applied-configuration annotation, and the API
+# caps an object's annotations at 262144 bytes — the load606 ConfigMap ships
+# the bench code (~250 KB), so run 15's preflight apply was refused ("The
+# ConfigMap \"load606\" is invalid: metadata.annotations: Too long"). Server-
+# side apply records field ownership in managedFields instead, no copy.
+# (tests/test_apply_size.py: every object this script applies fits the API.)
+kapply() { run "${K[@]}" apply --server-side --force-conflicts --field-manager=bench606 -f "$1"; }
 step() {
   local name="$1"; shift
   log "=== step ${name} ==="
@@ -342,7 +351,7 @@ teardown() {
     [[ "${BENCH_606_TEARDOWN_FAULT:-}" == "1" ]] && false
     log "=== teardown ${RUN_NAME} (exit ${rc}) ==="
     # shielded: a process-group Ctrl-C must not interrupt the delete itself
-    if ! ( trap "" INT TERM HUP; exec python3 -m bench.gke gke-down --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" $YES ); then
+    if ! ( trap "" INT TERM HUP; exec python3 -m bench.gke gke-down --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" --budget-s "$DOWN_BUDGET_S" $YES ); then
       log "TEARDOWN FAILED — delete by hand: gcloud container clusters delete ${RUN_NAME} --project ${PROJECT} --zone ${ZONE} --quiet"
       rc=$(( rc == 0 ? 1 : rc ))
     else
@@ -484,7 +493,7 @@ s_preflight() {
       --authn-url "$AUTHN_URL" --password "$PW" --init "$PORTAL_INIT" \
       --frontend-ns "$PORTAL_FRONTEND_NS" --builders-ns "$PORTAL_BUILDERS_NS" \
       > "$OUT/preflight-job.yaml"
-  run "${K[@]}" apply -f "$OUT/preflight-job.yaml"
+  kapply "$OUT/preflight-job.yaml"
   local deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S )) ok="" failed=""
   while (( $(date +%s) < deadline )); do
     ok="$("${K[@]}" -n bench-loadgen get job preflight606 -o 'jsonpath={.status.succeeded}' 2>/dev/null || true)"
@@ -605,7 +614,7 @@ s_measure() {
   # plus the in-cluster mem606 Job (memstats + heap profiles, metadata only).
   start_top_loop
   MEASURE_STARTED=1
-  run "${K[@]}" apply -f "$OUT/loadgen-job.yaml"
+  kapply "$OUT/loadgen-job.yaml"
   local deadline=$(( $(date +%s) + MEASURE_WAIT_S ))
   # The teardown trap collects what exists before the cluster goes (#763).
   wait_drive_done "$deadline" || return 1
