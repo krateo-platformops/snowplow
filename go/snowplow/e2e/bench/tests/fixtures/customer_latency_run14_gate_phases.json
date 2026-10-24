@@ -1,0 +1,41 @@
+{
+ "source": "run 14 (1.12.54, bench adc2e702): custlat.report_from_dir over its REAL collected artifacts (k6.json.gz sha256 ffb3fdc172ab836ad4ce20838fe7211500008f182e5ebf27a298645d76b1b621), gate_phases only: n, seconds, p95/p99/req_s and their paired half-sample sd. Run 14 had customers only in its first churn step and no steady with customers.",
+ "gate_phases": {
+  "storm": {
+   "n": 92851,
+   "seconds": 508.6,
+   "p95_ms": 4815.03,
+   "p99_ms": 8297.13,
+   "req_s": 182.56,
+   "half_sd": {
+    "p95_ms": 0.0431,
+    "p99_ms": 0.0407,
+    "req_s": 0.0412
+   }
+  },
+  "burst": {
+   "n": 51260,
+   "seconds": 300.0,
+   "p95_ms": 792.63,
+   "p99_ms": 1768.38,
+   "req_s": 170.87,
+   "half_sd": {
+    "p95_ms": 0.7082,
+    "p99_ms": 0.4317,
+    "req_s": 0.0934
+   }
+  },
+  "churn": {
+   "n": 157490,
+   "seconds": 991.3,
+   "p95_ms": 85.27,
+   "p99_ms": 266.1,
+   "req_s": 158.88,
+   "half_sd": {
+    "p95_ms": 0.1196,
+    "p99_ms": 0.0821,
+    "req_s": 0.0405
+   }
+  }
+ }
+}

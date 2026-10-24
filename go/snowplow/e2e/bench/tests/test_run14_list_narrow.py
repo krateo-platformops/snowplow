@@ -97,6 +97,11 @@ KEYS = ("would_avoid", "would_change", "identical_audits", "list_narrow_list_dep
         "list_dep_marks")
 
 
+def _ln_warnings(v):
+    """This report's warnings (other report-only sections add their own)."""
+    return [w for w in v["report"]["report_warnings"] if w.startswith(LN_KEY + " ")]
+
+
 def _vals(phase):
     return tuple(phase[k] for k in KEYS)
 
@@ -258,7 +263,7 @@ def test_reports_land_in_the_verdict_and_change_no_check():
     assert v["report"]["list_narrow_shadow_report_only"]["by_phase"]["all"]["would_avoid"] == 37
     assert v["report"]["content_fill_by_gvr_report_only"]["restarts"] == 1
     assert v["report"]["list_narrow_shadow_report_only"]["status"] == "present"
-    assert v["report"]["report_warnings"] == []
+    assert _ln_warnings(v) == []
     base = load606.evaluate([], FRESH, [], mem=[m for m in mem if not m.get("extra")])
     assert base["report"]["list_narrow_shadow_report_only"]["status"] == "absent_in_all_samples"
     assert base["report"]["content_fill_by_gvr_report_only"] is None
@@ -281,8 +286,8 @@ def test_an_absent_shadow_reads_as_missing_with_a_warning_and_no_verdict_change(
     assert r["status"] == "absent_in_all_samples" and r["mem_samples"] == 5
     assert "by_phase" not in r and "missing" in r["note"].lower()
     v = load606.evaluate([], FRESH, [], mem=mem)
-    w = v["report"]["report_warnings"]
-    assert len(w) == 1 and LN_KEY in w[0] and "missing, not zero" in w[0]
+    w = _ln_warnings(v)
+    assert len(w) == 1 and "missing, not zero" in w[0]
     present = load606.evaluate([], FRESH, [], mem=_mem())
 
     def strip(x):
@@ -314,6 +319,6 @@ def test_run13_real_mem_stream_reports_the_shadow_absent():
     assert r == {"status": "absent_in_all_samples", "mem_samples": 3, "note": r["note"]}
     v = load606.evaluate([], [], [], mem=mem)
     assert v["report"]["list_narrow_shadow_report_only"]["status"] == "absent_in_all_samples"
-    assert v["report"]["report_warnings"] == [
+    assert _ln_warnings(v) == [
         f"{LN_KEY} absent in all 3 mem samples: the #765 B shadow report is missing, not zero"]
     assert v["report"]["content_fill_by_gvr_report_only"]["total_by_gvr"]
