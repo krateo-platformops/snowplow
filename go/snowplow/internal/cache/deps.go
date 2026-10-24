@@ -1229,6 +1229,15 @@ func coordinateBuckets(gvr schema.GroupVersionResource, namespace, name string) 
 	return out, n
 }
 
+// hasEdges reports whether the tracker still holds edges recorded under l1Key —
+// true from the key's first Record until RemoveL1Key, which the resolved cache
+// calls when it evicts or deletes the key (#883: the memo's liveness test for
+// the L1 keys an entry serves).
+func (d *DepTracker) hasEdges(l1Key string) bool {
+	_, ok := d.reverse.Load(l1Key)
+	return ok
+}
+
 // hasBucket reports whether dk has a forward bucket — i.e. whether
 // depMovedSince judges it by its own lastBumpSeq rather than the GVR floor.
 func (d *DepTracker) hasBucket(dk DepKey) bool {
@@ -2479,6 +2488,9 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 	if !ok {
 		return
 	}
+	// #883 — the resolved cache evicted or deleted l1Key (this is its only strip
+	// funnel): the resolve memo entries that served only this key go with it.
+	notifyResolveMemosL1Gone(l1Key)
 	ds := dsI.(*depSet)
 	ds.deps.Range(func(k, _ any) bool {
 		dk := k.(DepKey)

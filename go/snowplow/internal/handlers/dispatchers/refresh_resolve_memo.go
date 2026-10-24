@@ -18,7 +18,7 @@
 // whose apiRef points at one of a SMALL set of heavy RESTActions … collapses to
 // (#distinct RA) × (#cohorts) × (#distinct pages)". The seed got that memo; the
 // refresher never did. All this file does is install the existing memo on the
-// refresher's resolve context and bound its lifetime.
+// refresher's resolve context and wire it to the dep tracker.
 //
 // WHY A PROCESS-HELD MEMO IS SAFE HERE, where F4 deliberately refused one.
 // F4's objection was teardown: a process-global cache "can never serve a stale
@@ -42,10 +42,11 @@
 // refused a stale entry but left it in the memo, so every body whose key was
 // never looked up again stayed resident until the wholesale swap: bench run 15
 // read it as a ~1 GB/h rising floor (DeepCopyJSON 12 -> 774 MB). The memo now
-// drops an entry when a Load finds it stale and when the dep tracker moves one
-// of its deps (cache.TrackDepMoves, wired below), and it stores the
-// RESTAction's encoded result rather than a decoded deep copy. Its size is
-// published as snowplow_resolve_memo (entries, body_bytes).
+// drops an entry when a Load finds it stale, when the dep tracker moves one of
+// its deps, and when the resolved cache has removed every L1 key it served
+// (cache.TrackDepMoves, wired below); it stores the RESTAction's encoded result
+// rather than a decoded deep copy. With those signals the #598 wholesale swap
+// is gone. Its size is published as snowplow_resolve_memo (entries, body_bytes).
 //
 // WHY THE COLLAPSE ACTUALLY LANDS. DepTracker.OnObjectEvent collects every
 // matching key for one object event FIRST and then enqueues them in a single
@@ -72,73 +73,45 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
-// refreshMemo holds the memo currently installed on refresher resolves. Swapped
-// wholesale rather than evicted per entry (see refreshResolveMemo).
+// refreshMemo holds the one memo installed on refresher resolves for the life of
+// the process (#883: never swapped; see refreshResolveMemo).
 var refreshMemo atomic.Pointer[cache.SeedResolveMemo]
-
-// refreshMemoSwapsTotal counts wholesale swaps. Exposed for the falsifier and
-// for diagnosing a memo that is churning rather than collapsing: a swap rate
-// near the miss rate means the bound is being hit constantly and the memo is
-// holding nothing long enough to be useful.
-var refreshMemoSwapsTotal atomic.Uint64
-
-// RefreshMemoSwaps is the test/diagnostic accessor.
-func RefreshMemoSwaps() uint64 { return refreshMemoSwapsTotal.Load() }
 
 // RefreshMemoStats returns the live memo's hit/miss counters, or (0,0) when no
 // memo has been created yet.
 func RefreshMemoStats() (hits, misses uint64) { return refreshMemo.Load().Stats() }
 
 // refreshResolveMemo returns the memo to install on a refresher resolve,
-// creating one on first use and swapping it wholesale once it has stored more
-// distinct bodies than there are cells for it to serve.
+// creating it on first use.
 //
-// THE BOUND IS DERIVED, NOT CHOSEN. The memo can never usefully hold more
-// distinct keys than there are resident cells eligible to be refreshed, so the
-// live resolved-cache entry count IS the ceiling — no invented constant, and it
-// tracks the cluster's real shape (feedback_self_adapt_no_magic_env_knobs).
-// Misses are the right proxy for stored entries: every miss ends in a Store.
-// Below one entry (a cold or cache-off process) no bound is applied, because a
-// memo that has stored nothing cannot be over budget.
+// #883 — NO WHOLESALE SWAP. #598 bounded this memo by swapping it for an empty
+// one once its cumulative misses exceeded the live resolved-cache entry count.
+// That was a count bound standing in for the real signal, and it neither held
+// memory down (bench run 15: the floor rose ~1 GB/h under it) nor kept only
+// servable bodies (it threw live entries away with dead ones). The memo now
+// keeps exactly the entries that can still be served, by three signals:
+//   - a captured dep moved (Load finds it stale, or the dep tracker's bump
+//     re-judges it — cache.TrackDepMoves);
+//   - every L1 key it served (the producer's and each hitter's) has left the
+//     resolved cache — the cache's eviction / delete strips the key's dep edges
+//     through DepTracker.RemoveL1Key, which the memo follows;
+//   - and nothing else: an entry whose deps are unmoved and that still serves a
+//     resident cell is exactly the entry the refresher will reuse.
 //
-// A SWAP CANNOT CORRUPT ANYTHING. The old memo is simply dropped; in-flight
-// resolves holding a pointer to it keep using it until they finish, and every
-// body it served was decoded afresh on Load. The worst a swap costs is a
-// few duplicate resolves, which is the state this file exists to improve on —
-// so the failure mode of the bound is "less saving", never "wrong answer".
-//
-// #883 — the installed memo is tracked by the dep tracker (cache.TrackDepMoves)
-// so its entries leave the moment a dep moves. A memo is tracked BEFORE it is
-// published, so no Store into it can precede its tracking, and untracked once it
-// lost the race or was swapped out, so the registry never keeps a dropped memo
-// alive.
+// The memo is tracked BEFORE it is published, so no Store into it can precede
+// its tracking; the loser of the creation race untracks its own.
 func refreshResolveMemo() *cache.SeedResolveMemo {
-	m := refreshMemo.Load()
-	if m == nil {
-		fresh := cache.NewSeedResolveMemo()
-		untrack := cache.TrackDepMoves(fresh)
-		if refreshMemo.CompareAndSwap(nil, fresh) {
-			return fresh
-		}
-		// Lost the race — use the winner's memo, never a second one.
-		untrack()
-		return refreshMemo.Load()
+	if m := refreshMemo.Load(); m != nil {
+		return m
 	}
-
-	_, misses := m.Stats()
-	if cap := refreshMemoCap(); cap > 0 && misses > cap {
-		fresh := cache.NewSeedResolveMemo()
-		untrack := cache.TrackDepMoves(fresh)
-		if refreshMemo.CompareAndSwap(m, fresh) {
-			cache.UntrackDepMoves(m)
-			refreshMemoSwapsTotal.Add(1)
-			return fresh
-		}
-		// Another goroutine swapped first; take theirs.
-		untrack()
-		return refreshMemo.Load()
+	fresh := cache.NewSeedResolveMemo()
+	untrack := cache.TrackDepMoves(fresh)
+	if refreshMemo.CompareAndSwap(nil, fresh) {
+		return fresh
 	}
-	return m
+	// Lost the race — use the winner's memo, never a second one.
+	untrack()
+	return refreshMemo.Load()
 }
 
 // RefreshMemoSize is the #883 gauge for the installed refresher memo: how many
@@ -155,18 +128,19 @@ func publishResolveMemoExpvar() {
 	resolveMemoPublishOnce.Do(func() {
 		expvar.Publish("snowplow_resolve_memo", expvar.Func(func() any {
 			entries, bodyBytes := RefreshMemoSize()
-			stale, moved := cache.ResolveMemoDropTotals()
+			stale, moved, l1Gone := cache.ResolveMemoDropTotals()
 			return map[string]any{
-				// GAUGES — the installed refresher memo right now. With #883 they
-				// track the live working set: read them against
-				// snowplow_resolved_cache.entries, never as a climb on their own.
+				// GAUGES — the installed refresher memo right now. They track the
+				// live working set: read them against snowplow_resolved_cache
+				// entries, never as a climb on their own.
 				"entries":    entries,
 				"body_bytes": bodyBytes,
-				// Process totals of entries deleted (every memo, every swap): by a
-				// Load that found the entry stale, and by a dep move nobody read.
-				"dropped_stale_total": stale,
-				"dropped_moved_total": moved,
-				"swaps_total":         refreshMemoSwapsTotal.Load(),
+				// Process totals of entries deleted (every memo): by a Load that
+				// found the entry stale, by a dep move nobody read, and by the
+				// resolved cache removing the last L1 key the entry served.
+				"dropped_stale_total":   stale,
+				"dropped_moved_total":   moved,
+				"dropped_l1_gone_total": l1Gone,
 			}
 		}))
 	})
@@ -181,19 +155,4 @@ func init() {
 		return
 	}
 	publishResolveMemoExpvar()
-}
-
-// refreshMemoCap is the live resolved-cache entry count — the number of cells
-// that exist to be refreshed, and therefore the most distinct bodies the memo
-// could ever usefully hold. 0 means "unknown or empty": apply no bound.
-func refreshMemoCap() uint64 {
-	stats := cache.ResolvedCacheStatsByStat()
-	if stats == nil {
-		return 0
-	}
-	n, ok := stats["entries"]
-	if !ok || n <= 0 {
-		return 0
-	}
-	return uint64(n)
 }

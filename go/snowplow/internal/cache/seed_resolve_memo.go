@@ -145,6 +145,11 @@ type SeedResolveMemo struct {
 	// event re-judges exactly the entries it can have made stale instead of
 	// scanning the memo (see memoDepIndex).
 	deps map[schema.GroupVersionResource]*memoDepIndex
+	// consumers / byConsumer link each entry to the L1 keys it served (the
+	// producer's and every hitter's), both ways (see addConsumerLocked). An
+	// entry with a consumers set lives while that set is non-empty.
+	consumers  map[string]map[string]struct{} // memo key -> L1 keys
+	byConsumer map[string]map[string]struct{} // L1 key -> memo keys
 
 	// entries / bodyBytes are the #883 gauge: the live entry count and the sum
 	// of the stored encoded bodies. Written under mu, read without it.
@@ -185,12 +190,15 @@ var (
 	// resolveMemoDroppedMovedTotal counts entries deleted because the dep
 	// tracker moved one of their deps with nobody looking them up.
 	resolveMemoDroppedMovedTotal atomic.Uint64
+	// resolveMemoDroppedL1GoneTotal counts entries deleted because every L1 key
+	// they served was evicted or deleted from the resolved cache.
+	resolveMemoDroppedL1GoneTotal atomic.Uint64
 )
 
 // ResolveMemoDropTotals returns the process-wide #883 drop totals: entries
-// deleted by a stale Load, and entries deleted by a dep move.
-func ResolveMemoDropTotals() (stale, moved uint64) {
-	return resolveMemoDroppedStaleTotal.Load(), resolveMemoDroppedMovedTotal.Load()
+// deleted by a stale Load, by a dep move, and by losing their last live L1 key.
+func ResolveMemoDropTotals() (stale, moved, l1Gone uint64) {
+	return resolveMemoDroppedStaleTotal.Load(), resolveMemoDroppedMovedTotal.Load(), resolveMemoDroppedL1GoneTotal.Load()
 }
 
 // seedResolveMemoKey canonicalizes the memo key. The identity component is the
@@ -284,13 +292,15 @@ func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, uint64, b
 // LoadLayered is Load plus the raKey versions the producing resolve sliced (#406),
 // read off the SAME value as the body, deps and stamp.
 func (mo *SeedResolveMemo) LoadLayered(key string) (map[string]any, []DepKey, uint64, LayeredSources, bool) {
-	body, deps, _, stamp, layers, ok := mo.LoadLayeredWithStates(key)
+	body, deps, _, stamp, layers, ok := mo.LoadLayeredWithStates(key, "")
 	return body, deps, stamp, layers, ok
 }
 
 // LoadLayeredWithStates is LoadLayered plus the producer's per-edge interest
-// states (#765 B), read off the SAME value.
-func (mo *SeedResolveMemo) LoadLayeredWithStates(key string) (map[string]any, []DepKey, []EdgeNarrowState, uint64, LayeredSources, bool) {
+// states (#765 B), read off the SAME value. consumer is the L1 key the hitting
+// resolve populates: a hit links the entry to it (addConsumerLocked), so the
+// entry lives while any L1 key it served does. "" links nothing.
+func (mo *SeedResolveMemo) LoadLayeredWithStates(key, consumer string) (map[string]any, []DepKey, []EdgeNarrowState, uint64, LayeredSources, bool) {
 	if mo == nil {
 		return nil, nil, nil, 0, nil, false
 	}
@@ -311,6 +321,10 @@ func (mo *SeedResolveMemo) LoadLayeredWithStates(key string) (map[string]any, []
 		return nil, nil, nil, 0, nil, false
 	}
 	mo.hits++
+	// The hit is served either way: the body is valid for this caller. The link
+	// only decides whether the entry outlives it (a consumer already evicted
+	// links nothing, and can delete an entry that served no other live key).
+	mo.addConsumerLocked(key, consumer)
 	mo.mu.Unlock()
 	// The decode runs outside the lock: val is immutable once stored.
 	body, err := decodeMemoBody(val.Body)
@@ -375,7 +389,7 @@ func (mo *SeedResolveMemo) Store(key string, encoded []byte, deps []DepKey, stam
 // StoreLayered is Store plus the raKey versions the producing resolve sliced (#406).
 // Same monotone-in-stamp replacement as Store.
 func (mo *SeedResolveMemo) StoreLayered(key string, encoded []byte, deps []DepKey, stamp uint64, layers LayeredSources) {
-	mo.StoreLayeredWithStates(key, encoded, deps, nil, stamp, layers)
+	mo.StoreLayeredWithStates(key, "", encoded, deps, nil, stamp, layers)
 }
 
 // StoreLayeredWithStates is StoreLayered plus the producer's per-edge interest
@@ -387,7 +401,11 @@ func (mo *SeedResolveMemo) StoreLayered(key string, encoded []byte, deps []DepKe
 // Store inserts and then reads the stamps, so whichever runs second sees the
 // other — a check before the insert could miss an event landing in between and
 // leave an unservable entry behind.
-func (mo *SeedResolveMemo) StoreLayeredWithStates(key string, encoded []byte, deps []DepKey, states []EdgeNarrowState, stamp uint64, layers LayeredSources) {
+//
+// consumer is the producer's L1 key: the entry is linked to it, and to every
+// hitter's (LoadLayeredWithStates), and lives while any of them is still in the
+// resolved cache (addConsumerLocked). "" links nothing.
+func (mo *SeedResolveMemo) StoreLayeredWithStates(key, consumer string, encoded []byte, deps []DepKey, states []EdgeNarrowState, stamp uint64, layers LayeredSources) {
 	if mo == nil {
 		return
 	}
@@ -396,12 +414,19 @@ func (mo *SeedResolveMemo) StoreLayeredWithStates(key string, encoded []byte, de
 	mo.mu.Lock()
 	if cur := mo.m[key]; cur != nil {
 		if cur.Stamp >= stamp {
+			// An equal-or-fresher body is already memoised; it now serves this
+			// producer's L1 key too.
+			mo.addConsumerLocked(key, consumer)
 			mo.mu.Unlock()
-			return // an equal-or-fresher body is already memoised
+			return
 		}
-		mo.removeLocked(key, cur)
+		mo.unindexValueLocked(key, cur) // the fresher body serves the same L1 keys
 	}
 	mo.insertLocked(key, nv)
+	if !mo.addConsumerLocked(key, consumer) {
+		mo.mu.Unlock()
+		return
+	}
 	mo.mu.Unlock()
 	if seedMemoDepsMovedSince(deps, stamp) {
 		mo.mu.Lock()
@@ -443,8 +468,17 @@ func (mo *SeedResolveMemo) insertLocked(key string, v *seedMemoValue) {
 	mo.bodyBytes.Add(int64(len(v.Body)))
 }
 
-// removeLocked deletes key (holding v) and its index entries. mu held.
+// removeLocked deletes key (holding v), its dep index entries and its consumer
+// links. mu held.
 func (mo *SeedResolveMemo) removeLocked(key string, v *seedMemoValue) {
+	mo.unindexValueLocked(key, v)
+	mo.forgetConsumersLocked(key)
+}
+
+// unindexValueLocked deletes key's value and dep index entries but keeps its
+// consumer links — the Store that replaces a value with a fresher one serves the
+// same L1 keys. mu held.
+func (mo *SeedResolveMemo) unindexValueLocked(key string, v *seedMemoValue) {
 	delete(mo.m, key)
 	for _, dk := range v.Deps {
 		ix := mo.deps[dk.GVR]
@@ -464,6 +498,96 @@ func (mo *SeedResolveMemo) removeLocked(key string, v *seedMemoValue) {
 	}
 	mo.entries.Add(-1)
 	mo.bodyBytes.Add(-int64(len(v.Body)))
+}
+
+// addConsumerLocked links key to the L1 key it is serving (#883, the #598 swap's
+// replacement). An entry lives exactly as long as at least one L1 key it served
+// is still held by the dep tracker — the tracker drops a key's edges exactly when
+// the resolved cache evicts or deletes it (RemoveL1Key, the store's only strip
+// funnel). So the link is checked AFTER it is made: if the consumer's edges are
+// already gone the eviction has already been logged before this link existed,
+// and the link is undone here; otherwise the eviction is still to come and its
+// log entry will find the link. "" (no L1 key on the resolve) links nothing.
+// Reports false when the entry was deleted because it serves no live key.
+func (mo *SeedResolveMemo) addConsumerLocked(key, consumer string) bool {
+	if consumer == "" {
+		return true
+	}
+	if mo.consumers == nil {
+		mo.consumers = make(map[string]map[string]struct{})
+		mo.byConsumer = make(map[string]map[string]struct{})
+	}
+	cs := mo.consumers[key]
+	if cs == nil {
+		cs = make(map[string]struct{})
+		mo.consumers[key] = cs
+	}
+	cs[consumer] = struct{}{}
+	ks := mo.byConsumer[consumer]
+	if ks == nil {
+		ks = make(map[string]struct{})
+		mo.byConsumer[consumer] = ks
+	}
+	ks[key] = struct{}{}
+	if d := Deps(); d != nil && !d.hasEdges(consumer) {
+		return !mo.unlinkConsumerLocked(key, consumer)
+	}
+	return true
+}
+
+// unlinkConsumerLocked removes one consumer link and deletes the entry when that
+// was its last live consumer. Reports whether the entry was deleted. mu held.
+func (mo *SeedResolveMemo) unlinkConsumerLocked(key, consumer string) bool {
+	if ks := mo.byConsumer[consumer]; ks != nil {
+		delete(ks, key)
+		if len(ks) == 0 {
+			delete(mo.byConsumer, consumer)
+		}
+	}
+	cs := mo.consumers[key]
+	if cs == nil {
+		return false
+	}
+	delete(cs, consumer)
+	if len(cs) > 0 {
+		return false
+	}
+	if v := mo.m[key]; v != nil {
+		mo.removeLocked(key, v)
+	} else {
+		delete(mo.consumers, key)
+	}
+	resolveMemoDroppedL1GoneTotal.Add(1)
+	return true
+}
+
+// forgetConsumersLocked drops every consumer link of key. mu held.
+func (mo *SeedResolveMemo) forgetConsumersLocked(key string) {
+	for c := range mo.consumers[key] {
+		if ks := mo.byConsumer[c]; ks != nil {
+			delete(ks, key)
+			if len(ks) == 0 {
+				delete(mo.byConsumer, c)
+			}
+		}
+	}
+	delete(mo.consumers, key)
+}
+
+// dropL1Gone handles the resolved cache having evicted or deleted l1Key: every
+// entry that served it loses that consumer, and an entry left serving no live
+// L1 key is deleted — nothing can reach it any more but a new resolve, which
+// stores afresh.
+func (mo *SeedResolveMemo) dropL1Gone(l1Key string) {
+	mo.mu.Lock()
+	defer mo.mu.Unlock()
+	keys := make([]string, 0, len(mo.byConsumer[l1Key]))
+	for k := range mo.byConsumer[l1Key] {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		mo.unlinkConsumerLocked(k, l1Key)
+	}
 }
 
 // dropMovedLocked re-judges every entry that captured one of cands with the
@@ -602,15 +726,22 @@ func notifyResolveMemosTypeMoved(gvr schema.GroupVersionResource) {
 	})
 }
 
-// The bucket-gone log. The tracker prunes a bucket from RemoveL1Key, which the
-// resolved-cache store calls while it holds its own lock — the lock every
-// customer read takes. So the pruner never touches a memo: it appends the
-// coordinate here (a leaf lock held for one append) and the memos judge it at
-// the next dep event or the next memo Load / Store, on the informer or
-// refresher goroutine. A customer therefore never waits on memo work.
+// The tracker log: L1 keys the resolved cache removed, and the dep buckets that
+// removal pruned. Both come from RemoveL1Key, which the resolved-cache store
+// calls while it holds its own lock — the lock every customer read takes. So
+// the tracker never touches a memo there: it records here (a leaf lock held for
+// one set insert) and the memos act on it at the next dep event or the next
+// memo Load / Store, on the informer or refresher goroutine. A customer
+// therefore never waits on memo work.
+//
+// SETS, NOT LOGS: acting on a coordinate or an L1 key is idempotent, so the same
+// one pruned or removed again before a drain adds nothing. Between two drains
+// the pending state is therefore bounded by the distinct coordinates and keys
+// the tracker actually dropped, however often it dropped them.
 var (
 	bucketGoneMu      sync.Mutex
-	bucketGoneLog     []DepKey
+	bucketGoneSet     map[DepKey]struct{}
+	l1GoneSet         map[string]struct{}
 	bucketGonePending atomic.Int64
 )
 
@@ -620,26 +751,57 @@ func notifyResolveMemosBucketGone(dk DepKey) {
 		return // no memo to judge it: nothing may accumulate here
 	}
 	bucketGoneMu.Lock()
-	bucketGoneLog = append(bucketGoneLog, dk)
-	bucketGonePending.Store(int64(len(bucketGoneLog)))
+	if bucketGoneSet == nil {
+		bucketGoneSet = make(map[DepKey]struct{})
+	}
+	bucketGoneSet[dk] = struct{}{}
+	bucketGonePending.Store(int64(len(bucketGoneSet) + len(l1GoneSet)))
 	bucketGoneMu.Unlock()
 }
 
-// drainResolveMemoBucketGone hands every logged bucket-gone coordinate to every
-// tracked memo (dropBucketGone). One atomic load when the log is empty.
+// pendingTrackerDropsForTest reports how many distinct bucket coordinates and
+// L1 keys are waiting for the next drain.
+func pendingTrackerDropsForTest() (buckets, l1Keys int) {
+	bucketGoneMu.Lock()
+	defer bucketGoneMu.Unlock()
+	return len(bucketGoneSet), len(l1GoneSet)
+}
+
+// notifyResolveMemosL1Gone is called after the tracker dropped l1Key's edges —
+// i.e. after the resolved cache evicted or deleted l1Key (#883: the memo entries
+// that served only that key can never be reached again).
+func notifyResolveMemosL1Gone(l1Key string) {
+	if resolveMemoTracked.Load() == 0 {
+		return
+	}
+	bucketGoneMu.Lock()
+	if l1GoneSet == nil {
+		l1GoneSet = make(map[string]struct{})
+	}
+	l1GoneSet[l1Key] = struct{}{}
+	bucketGonePending.Store(int64(len(bucketGoneSet) + len(l1GoneSet)))
+	bucketGoneMu.Unlock()
+}
+
+// drainResolveMemoBucketGone hands every logged L1 removal (dropL1Gone) and
+// bucket prune (dropBucketGone) to every tracked memo. One atomic load when the
+// log is empty.
 func drainResolveMemoBucketGone() {
 	if bucketGonePending.Load() == 0 {
 		return
 	}
 	bucketGoneMu.Lock()
-	log := bucketGoneLog
-	bucketGoneLog = nil
+	buckets, l1s := bucketGoneSet, l1GoneSet
+	bucketGoneSet, l1GoneSet = nil, nil
 	bucketGonePending.Store(0)
 	bucketGoneMu.Unlock()
 	resolveMemoMoveSubscribers.Range(func(k, _ any) bool {
 		mo := k.(*SeedResolveMemo)
+		for l1 := range l1s {
+			mo.dropL1Gone(l1)
+		}
 		n := 0
-		for _, dk := range log {
+		for dk := range buckets {
 			n += mo.dropBucketGone(dk)
 		}
 		if n > 0 {

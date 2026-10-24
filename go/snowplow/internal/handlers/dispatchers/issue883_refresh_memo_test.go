@@ -49,7 +49,7 @@ func TestIssue883_RefreshMemoIsTrackedAndGauged(t *testing.T) {
 	if g := gauge(); g["entries"] != float64(1) || g["body_bytes"] != float64(len(body)) {
 		t.Fatalf("gauge after one Store: %v, want entries=1 body_bytes=%d", g, len(body))
 	}
-	_, movedBefore := cache.ResolveMemoDropTotals()
+	_, movedBefore, _ := cache.ResolveMemoDropTotals()
 
 	d.OnUpdate(gvr, ns, "obj-0") // the informer moves the dependency; nobody Loads
 
@@ -60,7 +60,7 @@ func TestIssue883_RefreshMemoIsTrackedAndGauged(t *testing.T) {
 	if g := gauge(); g["entries"] != float64(0) || g["body_bytes"] != float64(0) {
 		t.Fatalf("gauge after the move: %v, want entries=0 body_bytes=0", g)
 	}
-	if _, movedAfter := cache.ResolveMemoDropTotals(); movedAfter != movedBefore+1 {
+	if _, movedAfter, _ := cache.ResolveMemoDropTotals(); movedAfter != movedBefore+1 {
 		t.Fatalf("dropped_moved_total moved by %d, want 1", movedAfter-movedBefore)
 	}
 }

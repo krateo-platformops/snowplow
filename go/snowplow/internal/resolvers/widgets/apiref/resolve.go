@@ -334,7 +334,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// after the body was produced but before THIS resolve's entry is
 		// invisible to this resolve's own #375 Put-check, so a stale entry is a
 		// MISS here: fall through, resolve fresh, and storeMemo replaces it.
-		if body, deps, states, stamp, layers, ok := memo.LoadLayeredWithStates(memoKey); ok {
+		if body, deps, states, stamp, layers, ok := memo.LoadLayeredWithStates(memoKey, l1Key); ok {
 			// #277 / edge-3: replay the deps captured when this body was first
 			// produced onto THIS widget's L1 key, so a memo-served widget cell
 			// carries the same backing-GVR edges a real resolve would have
@@ -418,7 +418,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			}
 			encoded = b
 		}
-		memo.StoreLayeredWithStates(memoKey, encoded, deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark))
+		memo.StoreLayeredWithStates(memoKey, l1Key, encoded, deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark))
 	}
 
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef
