@@ -636,7 +636,9 @@ func (s *depGenSink) addOwnLocked(dk DepKey) {
 
 // ownDepsLocked returns the deps recorded under the sink's own key. Caller holds s.mu.
 func (s *depGenSink) ownDepsLocked() []DepKey {
-	out := make([]DepKey, 0, s.ownN)
+	// No capacity hint: this runs only on the full check (after a strip), never
+	// on the skip path, so growing by append costs nothing that matters.
+	var out []DepKey
 	for _, dk := range s.deps {
 		if s.seen[dk] {
 			out = append(out, dk)
@@ -1189,6 +1191,12 @@ func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk De
 		if ownSink != nil {
 			if dsI, ok := d.reverse.Load(l1Key); ok {
 				ownSink.noteOwnDepSet(dsI.(*depSet))
+			} else {
+				// No edge set to name (another record is between its forward and
+				// reverse inserts, or a strip just removed it): this resolve cannot
+				// tell later that nothing stripped its dedup'd edge, so its write
+				// takes the full check.
+				ownSink.ownStripped.Store(true)
 			}
 		}
 		return // already recorded — idempotent no-op
