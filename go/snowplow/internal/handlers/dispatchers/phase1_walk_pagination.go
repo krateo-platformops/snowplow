@@ -495,6 +495,10 @@ func iterateApiRefPages(
 		storePage := cursor == ""
 		if wcKey != "" && storePage {
 			resolveCtx = cache.WithL1KeyContext(resolveCtx, wcKey)
+			// #890/#893 — at the drain's end, a page cell that was not stored
+			// leaves no edges behind. Deferred to the function (not the
+			// iteration): a later release only strips later, never wrongly.
+			defer cache.Deps().ReleaseUnstored(resolveCtx, wcKey)
 		}
 		// Task #318 Step 1 / #450 — Put-gate sink parity with the page-1 walk.
 		// Install the FULL widgetContent sink set (stage-error, external-

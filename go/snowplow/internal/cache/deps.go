@@ -97,7 +97,9 @@ func WithL1KeyContext(ctx context.Context, l1Key string) context.Context {
 	// inner-call dispatch PRESERVES the parent ctx (one sink per resolve). A gen-guarded Put
 	// whose ctx has no sink (a resolve that Put without setting an L1 key — e.g. a content-
 	// populate path keyed directly) is caught by remarkIfDepsMoved's nil-sink detector.
-	return WithDepGenSink(context.WithValue(ctx, ctxKeyL1Record, l1Key))
+	ctx = WithDepGenSink(context.WithValue(ctx, ctxKeyL1Record, l1Key))
+	depGenSinkFromContext(ctx).key = l1Key // #890: this resolve's own key
+	return ctx
 }
 
 // DepGenEpochNow returns the current dep-event sequence (#375). A customer handler
@@ -139,6 +141,7 @@ func WithL1KeyContextFromEpoch(ctx context.Context, l1Key string, epoch uint64, 
 		startSeq: epoch,
 		deps:     append([]DepKey(nil), pre...),
 		parent:   depGenSinkFromContext(ctx),
+		key:      l1Key, // #890
 	})
 }
 
@@ -556,7 +559,7 @@ type depGenSink struct {
 	parent *depGenSink
 	// seen dedups deps (a resolve re-Records the same coordinate many times, and every
 	// Record is appended to each ancestor sink). Lazily initialised under mu.
-	seen map[DepKey]struct{}
+	seen map[DepKey]bool // value: recorded under the sink's own key (#890)
 	// #375 C3 — the post-Put window. Set by remarkIfDepsMoved on an ACCEPTED gen-guarded
 	// Put checked against this sink: putKey is the key that was Put, checkedSeq the
 	// dep-event seq at the check, putRemarked whether that check (or a later re-check)
@@ -589,20 +592,73 @@ type depGenSink struct {
 	// each with its Put identity and the deps it covers. A declined-external
 	// mark folds them in: the mark retires when a served cell is re-Put or gone.
 	served []ServedCell
+	// key / ownN — #890: the L1 key this resolve populates (set by WithL1KeyContext*;
+	// "" for a content child sink), and how many of the deps this resolve recorded
+	// UNDER that key — the edges an accepted write of key re-asserts if a
+	// concurrent strip took them (reassertOwnEdges). Which deps are own is the
+	// value of seen (true = recorded under key): no second map, no second slice.
+	key  string
+	ownN int
+	// ownDS / ownStripped — #890: the key's edge set (the reverse-index *depSet)
+	// this resolve's first own record found, and whether a later own record found
+	// a different one. RemoveL1Key — the only writer that deletes a key's edge set
+	// — removes that *depSet, and the next record creates a new one; so "the key's
+	// edge set is still ownDS and never changed" means no strip touched the key
+	// since this resolve recorded under it, and the accepted write has nothing to
+	// re-assert. Lock-free (one CAS per own record at most).
+	ownDS       atomic.Pointer[depSet]
+	ownStripped atomic.Bool
+}
+
+// noteOwnDepSet records the key's edge-set identity seen by an own record.
+func (s *depGenSink) noteOwnDepSet(ds *depSet) {
+	if cur := s.ownDS.Load(); cur == nil {
+		if s.ownDS.CompareAndSwap(nil, ds) {
+			return
+		}
+		cur = s.ownDS.Load()
+		if cur != ds {
+			s.ownStripped.Store(true)
+		}
+	} else if cur != ds {
+		s.ownStripped.Store(true)
+	}
+}
+
+// addOwnLocked marks dk (already added by addDepLocked) as recorded under the
+// sink's own key. Caller holds s.mu.
+func (s *depGenSink) addOwnLocked(dk DepKey) {
+	if own := s.seen[dk]; !own {
+		s.seen[dk] = true
+		s.ownN++
+	}
+}
+
+// ownDepsLocked returns the deps recorded under the sink's own key. Caller holds s.mu.
+func (s *depGenSink) ownDepsLocked() []DepKey {
+	// No capacity hint: this runs only on the full check (after a strip), never
+	// on the skip path, so growing by append costs nothing that matters.
+	var out []DepKey
+	for _, dk := range s.deps {
+		if s.seen[dk] {
+			out = append(out, dk)
+		}
+	}
+	return out
 }
 
 // addDepLocked appends dk unless already present. Caller holds s.mu.
 func (s *depGenSink) addDepLocked(dk DepKey) {
 	if s.seen == nil {
-		s.seen = make(map[DepKey]struct{}, len(s.deps)+4)
+		s.seen = make(map[DepKey]bool, len(s.deps)+4)
 		for _, d := range s.deps {
-			s.seen[d] = struct{}{}
+			s.seen[d] = false
 		}
 	}
 	if _, dup := s.seen[dk]; dup {
 		return
 	}
-	s.seen[dk] = struct{}{}
+	s.seen[dk] = false
 	s.deps = append(s.deps, dk)
 }
 
@@ -852,6 +908,12 @@ type DepTracker struct {
 	dirtyMarkTotal     atomic.Uint64 // dirty-marks (OnAdd/OnUpdate + OnDelete non-self)
 	enqueueUpdateTotal atomic.Uint64 // refresh enqueues triggered by OnUpdate
 	removeL1Total      atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
+	// reassertedEdgesTotal — #890: edges an accepted write re-recorded because a
+	// concurrent strip of its then non-resident key had taken them (test seam).
+	reassertedEdgesTotal atomic.Uint64
+	// reassertCheckedTotal — #890: accepted writes that had to check their own
+	// edges because a strip touched the key since the resolve recorded (test seam).
+	reassertCheckedTotal atomic.Uint64
 
 	// #603 PR-2 / #765 option B — the list-interest SHADOW (deps_list_interest.go):
 	// per-edge interest, the handler-side masks' registry, the would-avoid
@@ -1067,10 +1129,16 @@ func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk De
 	// resolve ENTRY via WithDepGenSink), gated like the capture tap below. The accepted-
 	// Put check (remarkIfDepsMoved) compares each recorded dep's bucket lastBumpSeq to
 	// startSeq. Appended BEFORE the dedup early-return so the resolve's dep set is complete.
-	var recheck *depGenSink
+	var recheck, ownSink *depGenSink
 	for s := depGenSinkFromContext(ctx); s != nil; s = s.parent {
 		s.mu.Lock()
 		s.addDepLocked(dk)
+		if s.key != "" && s.key == l1Key {
+			s.addOwnLocked(dk) // #890
+			if ownSink == nil {
+				ownSink = s
+			}
+		}
 		if recheck == nil && s.putKey != "" && s.putKey == l1Key && !s.putRemarked {
 			recheck = s // #375 C3: a Record for a key this sink's resolve already Put
 		}
@@ -1116,6 +1184,21 @@ func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk De
 				ds.count.Add(1)
 			}
 		}
+		// #890 FU-1 — the edge already existed (a refresher re-resolve of a resident
+		// key, a seed re-Put, two fills at once): this resolve's records are all
+		// dedups, so note the key's CURRENT edge set here too, or the accepted
+		// write would find no identity to compare and take the full check.
+		if ownSink != nil {
+			if dsI, ok := d.reverse.Load(l1Key); ok {
+				ownSink.noteOwnDepSet(dsI.(*depSet))
+			} else {
+				// No edge set to name (another record is between its forward and
+				// reverse inserts, or a strip just removed it): this resolve cannot
+				// tell later that nothing stripped its dedup'd edge, so its write
+				// takes the full check.
+				ownSink.ownStripped.Store(true)
+			}
+		}
 		return // already recorded — idempotent no-op
 	}
 	// At this point we are committing a NEW edge. Bound-check first.
@@ -1153,6 +1236,9 @@ func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk De
 	// Reverse: l1Key -> *depSet[DepKey]
 	dsI, loadedDS := d.reverse.LoadOrStore(l1Key, &depSet{})
 	ds := dsI.(*depSet)
+	if ownSink != nil {
+		ownSink.noteOwnDepSet(ds) // #890: the key's edge-set identity this resolve recorded into
+	}
 	if v, loaded := ds.deps.LoadOrStore(dk, initialEdgeValue(dk, mode)); !loaded {
 		ds.count.Add(1)
 	} else {
@@ -1228,6 +1314,150 @@ func coordinateBuckets(gvr schema.GroupVersionResource, namespace, name string) 
 	}
 	return out, n
 }
+
+// reassertOwnEdges — #890: re-record, under key, every dep ctx's resolve recorded
+// under key that the tracker no longer holds (a concurrent strip of the then
+// non-resident key took it). Called by the store's accepted writes while they hold
+// the store lock, so the published cell and its edges appear together. Only
+// MISSING edges are recorded, and in plain mode: a plain record of a list edge is
+// "unknown interest: every event marks" — conservative, never a missed
+// invalidation — and an edge that is present keeps its own mode and narrowing
+// state untouched. No sink, no key match, or nothing missing: no work beyond one
+// lookup per own dep.
+func (d *DepTracker) reassertOwnEdges(ctx context.Context, key string) {
+	if d == nil || key == "" {
+		return
+	}
+	for s := depGenSinkFromContext(ctx); s != nil; s = s.parent {
+		if s.key != key {
+			continue
+		}
+		ownDS := s.ownDS.Load()
+		if ownDS != nil && !s.ownStripped.Load() && !reassertAlwaysCheckForBench.Load() {
+			// The common case: no strip touched key since this resolve recorded
+			// under it iff its edge set is still the one the resolve recorded into.
+			if cur, ok := d.reverse.Load(key); ok && cur.(*depSet) == ownDS {
+				return
+			}
+		}
+		s.mu.Lock()
+		if s.ownN == 0 {
+			s.mu.Unlock()
+			return
+		}
+		own := s.ownDepsLocked()
+		s.mu.Unlock()
+		d.reassertCheckedTotal.Add(1)
+		for _, dk := range own {
+			if !d.hasExactEdge(key, dk) {
+				// No ctx: the resolve's sink already holds dk, and the remark /
+				// capture bookkeeping a ctx would drive belongs to the original record.
+				d.recordInternalMode(context.Background(), key, dk, recordPlain)
+				d.reassertedEdgesTotal.Add(1)
+			}
+		}
+		return
+	}
+}
+
+// ReleaseUnstored — #890 / #893: called when a resolve of l1Key ends (deferred at
+// every production site that installs an L1 resolve scope, WithL1KeyContext*). If
+// the resolve's write did not leave l1Key resident — refused, declined by a Put
+// gate, or never reached because the resolve failed — the edges it recorded belong
+// to no cell, and they are stripped through the store's eviction path
+// (stripDepEdges → RemoveL1Key, which also tells the resolve memos). A resident key
+// is untouched. One lock-free lookup when the key holds no edges.
+//
+// Two things keep a non-resident key's edges, and both are checked here:
+//   - an inert (#443 dry-run) resolve leaves no trace, so its end changes nothing;
+//   - a registered edge holder holds the key (RegisterEdgeHolder) — today the
+//     #643 declined-external mark, which judges its facts by the buckets these
+//     edges anchor. The holder releases the key when it lets go.
+func (d *DepTracker) ReleaseUnstored(ctx context.Context, l1Key string) {
+	if d == nil || l1Key == "" || Inert(ctx) || !d.hasEdges(l1Key) {
+		return
+	}
+	if edgeHeld(l1Key) {
+		return
+	}
+	d.storeMu.RLock()
+	store := d.store
+	d.storeMu.RUnlock()
+	store.releaseUnstored(l1Key)
+}
+
+// EDGE HOLDERS — #890/#893. A non-resident key's edges are normally orphans and
+// are stripped (ReleaseUnstored, the store's refusal strip). Something that
+// judges its own facts by a key's edges HOLDS the key: while it does, the edges
+// stay. A holder registers a predicate once; every strip of a non-resident key
+// asks all of them. When a holder lets go of a key it releases the key itself
+// (ReleaseUnstored), or the cell is re-resolved and that resolve's end does.
+var edgeHolders atomic.Pointer[[]func(l1Key string) bool]
+
+// RegisterEdgeHolder adds a holder predicate: held(key) true keeps key's edges
+// while key is not resident. It must be cheap and lock-free (it runs under the
+// store lock) and must not call into the store or the tracker.
+func RegisterEdgeHolder(held func(l1Key string) bool) {
+	if held == nil {
+		return
+	}
+	for {
+		cur := edgeHolders.Load()
+		var next []func(string) bool
+		if cur != nil {
+			next = append(next, (*cur)...)
+		}
+		next = append(next, held)
+		if edgeHolders.CompareAndSwap(cur, &next) {
+			return
+		}
+	}
+}
+
+// edgeHeld reports whether any registered holder holds l1Key.
+func edgeHeld(l1Key string) bool {
+	hs := edgeHolders.Load()
+	if hs == nil {
+		return false
+	}
+	for _, h := range *hs {
+		if h(l1Key) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExactEdge — #890: whether the exact edge (l1Key, dk) is in BOTH indexes:
+// the key's edge set (reverse) and the coordinate's bucket (forward). Two map
+// lookups, independent of how many other keys share the bucket. Unlike hasEdge
+// (collectMatchesWithDep: the fan-out view, which walks whole buckets and counts
+// a recorded LIST edge as matching an exact coordinate), it answers "was THIS
+// edge recorded", which is what a re-assert must ask — a LIST edge must not mask
+// a missing exact one.
+func (d *DepTracker) hasExactEdge(l1Key string, dk DepKey) bool {
+	if d == nil {
+		return false
+	}
+	dsI, ok := d.reverse.Load(l1Key)
+	if !ok {
+		return false
+	}
+	if _, ok := dsI.(*depSet).deps.Load(dk); !ok {
+		return false
+	}
+	ksI, ok := d.forward.Load(dk)
+	if !ok {
+		return false
+	}
+	_, ok = ksI.(*keySet).keys.Load(l1Key)
+	return ok
+}
+
+// reassertAlwaysCheckForBench — #890 benchmark seam (false in production): makes
+// reassertOwnEdges check every own edge even when no strip touched the key, so
+// the exact-lookup cost can be measured on its own.
+var reassertAlwaysCheckForBench atomic.Bool
 
 // hasEdges reports whether the tracker still holds edges recorded under l1Key —
 // true from the key's first Record until RemoveL1Key, which the resolved cache

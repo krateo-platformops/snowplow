@@ -1196,6 +1196,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templa
 	// the customer handler's WithL1KeyContextFromEpoch does.
 	resCtx := cache.WithL1KeyContextFromEpoch(ctx, key, selfEpoch, cache.DepKey{
 		GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
+	defer cache.Deps().ReleaseUnstored(resCtx, key) // #890/#893 — a seed whose cell is not stored leaves no edges
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 	// #394 — the terminal-Put guard captured at seed entry, read back by the
 	// resolve+Put tail (seedTerminalGuardFromContext).
@@ -1581,6 +1582,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// old — tracked in #859.
 	resCtx := cache.WithL1KeyContextFromEpoch(ctx, key, cache.DepGenEpochNow(), cache.DepKey{
 		GVR: e.GVR, Namespace: e.W.GetNamespace(), Name: e.W.GetName()})
+	defer cache.Deps().ReleaseUnstored(resCtx, key) // #890/#893 — a seed whose cell is not stored leaves no edges
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 	// #102 GTTL-1 (arch Option A, uniform) — see seedOneRestaction: the
 	// error-aware Put-gate sinks make the seed honor the refresher's backstop

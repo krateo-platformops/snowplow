@@ -1657,6 +1657,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	resolveCtx := ctx
 	if wcKey != "" {
 		resolveCtx = cache.WithL1KeyContext(ctx, wcKey)
+		defer cache.Deps().ReleaseUnstored(resolveCtx, wcKey) // #890/#893
 	}
 	// #643 PR-B2 — name the walked widget and its apiRef RESTAction on the
 	// resolve ctx so a declined-external mark records what it retires on.

@@ -332,6 +332,9 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// WithL1KeyContext threads the L1 key so the resolver's inner-call
 	// recording site re-records dep edges for this refresh.
 	rctx = cache.WithL1KeyContext(rctx, key)
+	// #890/#893 — a re-resolve whose write leaves key non-resident (refused: the
+	// cell was evicted meanwhile) leaves no edges behind (DepTracker.ReleaseUnstored).
+	defer cache.Deps().ReleaseUnstored(rctx, key)
 
 	// #598 — collapse the duplicate RA resolves inside one dirty-mark burst.
 	// One object event dirties every cell on its coordinate and the refresher
