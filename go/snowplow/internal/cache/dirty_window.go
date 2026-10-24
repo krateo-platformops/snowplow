@@ -26,9 +26,11 @@
 //
 // #547 — KNOWN-STALE. A declined or dropped window (and the suppressed skip,
 // which is a decline) is counted as before, but its stamp is NOT deleted: it is
-// converted to {t0, stale: <reason>} and stays until an accepted re-Put closes
-// it (windowFresh, or an accepted demand revalidation) or the cell leaves the
-// store (evictDirtyWindow). Before #547 the stamp was erased there
+// converted to {t0, stale: <reason>} and stays until an accepted re-Put ends
+// it (windowFresh, a remarked accepted re-Put, an accepted demand revalidation
+// or any other carrier's accepted Put — #884: known-stale means the last
+// refresh FAILED; a mark newer than that Put's resolve leaves an ordinary open
+// window) or the cell leaves the store (evictDirtyWindow). Before #547 the stamp was erased there
 // (CompareAndDelete), so the cell looked exactly like a fresh one: every reload
 // was a hit on a body the system knew was stale, nothing re-validated it short
 // of a later informer event or the TTL, and stale_served_total went blind at the
@@ -93,12 +95,14 @@ type dirtyStamp struct {
 	next     time.Time // a mark that landed during the in-flight re-resolve (zero = none)
 	// stale (#547) is non-zero once a refresh of this window ENDED without an
 	// accepted re-Put: the body is KNOWN-STALE since t0. It survives later marks
-	// and later in-flight dequeues; only a fresh Put or an eviction clears it.
+	// and later in-flight dequeues; an accepted Put (any carrier, #884) or an
+	// eviction clears it.
 	stale knownStaleReason
 	// seq (#547) is the dep-event sequence at the LATEST mark of this window. An
 	// accepted Put whose resolve began at or after it (its #375 sink startSeq)
-	// read the post-mark state, so it closes a known-stale window whatever
-	// carrier wrote it (endKnownStaleOnPut).
+	// read the post-mark state, so it closes the window whatever carrier wrote
+	// it; one that began before it ends only the known-stale flag and leaves an
+	// ordinary open window (#884, endKnownStaleOnPut).
 	seq uint64
 }
 
@@ -187,12 +191,29 @@ func (r *refresher) beginWindow(key string) (t0 time.Time, open bool) {
 	}
 }
 
-// settleWindow closes (keepOpen=false, stale=none) or re-opens (keepOpen=true,
-// the earliest mark kept) key's in-flight window, or — #547 — marks it
-// KNOWN-STALE (stale != none: the refresh ended without an accepted re-Put, the
-// earliest mark kept). gone reports that the stamp was removed by an eviction
-// during the dequeue.
-func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool, stale knownStaleReason) (gone bool) {
+// windowKeep says whether a dequeue's settle keeps its window open, and what
+// happens to a KNOWN-STALE flag when it does.
+type windowKeep uint8
+
+const (
+	// windowEnd closes the window (or, with a reason, marks it known-stale).
+	windowEnd windowKeep = iota
+	// windowKeepAccepted re-opens the window after an ACCEPTED re-Put that was
+	// remarked (a dep moved during the resolve). #884 (owner ruling F5): the
+	// refresh succeeded, so a known-stale flag ENDS; the window stays an
+	// ordinary open one from the earliest mark, replaced by the remark's refresh.
+	windowKeepAccepted
+	// windowKeepFailed re-opens the window after a retried error: the refresh
+	// FAILED, so a known-stale flag is KEPT (#547).
+	windowKeepFailed
+)
+
+// settleWindow closes (windowEnd, stale=none) or re-opens (windowKeepAccepted /
+// windowKeepFailed, the earliest mark kept) key's in-flight window, or — #547 —
+// marks it KNOWN-STALE (windowEnd, stale != none: the refresh ended without an
+// accepted re-Put, the earliest mark kept). gone reports that the stamp was
+// removed by an eviction during the dequeue.
+func (r *refresher) settleWindow(key string, t0 time.Time, keep windowKeep, stale knownStaleReason) (gone bool) {
 	for {
 		cur, ok := r.dirty.Load(key)
 		if !ok {
@@ -206,7 +227,12 @@ func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool, stale 
 		}
 		var next any
 		switch {
-		case keepOpen:
+		case keep == windowKeepAccepted:
+			// #884 — known-stale means the last refresh FAILED; this one was
+			// accepted. Before #884 the flag was carried over (stale: s.stale), so
+			// under steady churn a remarked re-Put never ended it.
+			next = &dirtyStamp{t0: t0, seq: s.seq}
+		case keep == windowKeepFailed:
 			next = &dirtyStamp{t0: t0, stale: s.stale, seq: s.seq}
 		case stale != knownStaleNone:
 			// #547 — the mark outlives the failed refresh. A mark that landed
@@ -229,7 +255,7 @@ func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool, stale 
 
 // windowFresh closes the window with a sample of now − t0.
 func (r *refresher) windowFresh(key string, t0 time.Time) {
-	r.settleWindow(key, t0, false, knownStaleNone)
+	r.settleWindow(key, t0, windowEnd, knownStaleNone)
 	r.sampleFresh(t0)
 }
 
@@ -262,15 +288,20 @@ func (r *refresher) windowUnfresh(key string, t0 time.Time, reason unfreshReason
 	if reason == unfreshRemarked || reason == unfreshEvicted {
 		ks = knownStaleNone
 	}
-	if r.settleWindow(key, t0, reason == unfreshRemarked, ks) {
+	keep := windowEnd
+	if reason == unfreshRemarked {
+		keep = windowKeepAccepted // a remark follows an ACCEPTED re-Put (settleDequeue)
+	}
+	if r.settleWindow(key, t0, keep, ks) {
 		reason = unfreshEvicted
 	}
 	r.dirtyStats.unfresh[reason].Add(1)
 }
 
-// windowContinue keeps the window open from t0 (a retried error).
+// windowContinue keeps the window open from t0 (a retried error: a FAILED
+// refresh, so a known-stale flag is kept).
 func (r *refresher) windowContinue(key string, t0 time.Time) {
-	if r.settleWindow(key, t0, true, knownStaleNone) {
+	if r.settleWindow(key, t0, windowKeepFailed, knownStaleNone) {
 		r.dirtyStats.unfresh[unfreshEvicted].Add(1)
 	}
 }

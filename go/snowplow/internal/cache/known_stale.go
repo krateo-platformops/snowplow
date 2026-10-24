@@ -1,9 +1,13 @@
 // known_stale.go — #547: the serve-side half of the KNOWN-STALE state.
 //
-// THE INVARIANT. A resident cell whose latest dirty mark has not been closed by
-// an accepted re-Put is KNOWN-STALE, and that fact outlives the failed refresh
-// (dirty_window.go keeps the stamp as {t0, stale: <reason>}). This file is what
-// the serve path does with it:
+// THE INVARIANT. A resident cell whose last refresh FAILED (declined, dropped,
+// suppressed) and that no accepted Put has written since is KNOWN-STALE, and
+// that fact outlives the failed refresh (dirty_window.go keeps the stamp as
+// {t0, stale: <reason>}). #884 (owner ruling F5): known-stale means "the last
+// refresh failed", not "the data moved since". Any accepted Put ends it, even
+// one whose resolve a newer mark overtook: that newer change is an ordinary
+// open window, served stale while the refresher replaces it (#710).
+// This file is what the serve path does with it:
 //
 //   - DETECT. Every customer hit that delivers a known-stale body is counted on
 //     known_stale_served_total{reason} inside ResolvedCacheStore.Get, the one
@@ -182,10 +186,12 @@ func claimRevalSlot(m *sync.Map, key string) bool {
 }
 
 // settleRevalSlot ends one attempt on key's slot in m. rerun: a read was absorbed
-// into it and key is still known-stale, so the flag is cleared, the slot STAYS
-// claimed (a read during the rerun arms it again) and the caller re-runs at
-// once. Otherwise the slot is released. held: there was a slot to settle.
-func settleRevalSlot(m *sync.Map, key string) (held, rerun bool) {
+// into it, the attempt may rerun (mayRerun) and key is still known-stale, so the
+// flag is cleared, the slot STAYS claimed (a read during the rerun arms it again)
+// and the caller re-runs at once. Otherwise the slot is released. held: there
+// was a slot to settle. #884 — a demand attempt whose Put was accepted may not
+// rerun: that attempt is the successful refresh.
+func settleRevalSlot(m *sync.Map, key string, mayRerun bool) (held, rerun bool) {
 	v, ok := m.Load(key)
 	if !ok {
 		return false, false
@@ -193,7 +199,7 @@ func settleRevalSlot(m *sync.Map, key string) (held, rerun bool) {
 	s := v.(*revalSlot)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.rerun {
+	if s.rerun && mayRerun {
 		if _, _, still := KnownStale(key); still {
 			s.rerun = false
 			return true, true
@@ -407,7 +413,7 @@ func (r *refresher) enqueueRevalidation(key string) {
 // stays claimed and the key is re-queued at once — the workqueue re-adds it
 // after this dequeue's Done.
 func settleBackgroundRevalidation(key string, dur time.Duration) {
-	held, rerun := settleRevalSlot(&bgRevalidationInflight, key)
+	held, rerun := settleRevalSlot(&bgRevalidationInflight, key, true)
 	if !held {
 		return
 	}
@@ -483,11 +489,14 @@ func DemandRevalidationDeadline() time.Duration {
 // (its slot claimed with ClaimDemandRevalidation for t0) and installs the
 // write-outcome sink the customer Put reports into (PutIfGen → NoteRefreshWrite).
 // settle MUST be called once the attempt returns: it counts the outcome and
-// settles the slot. The window itself is closed by the write, through the same
-// rule as any other accepted Put (endKnownStaleOnPut). fresh reports whether
-// the write was accepted un-remarked. rerun (#740): a read was absorbed into this
-// attempt and key is still known-stale — the slot STAYS claimed and the caller
-// runs one more attempt at once, beginning it with another
+// settles the slot. The known-stale state itself is ended by the write, through
+// the same rule as any other accepted Put (endKnownStaleOnPut). Fresh reports
+// whether the write was ACCEPTED (#884, owner ruling F5: the revalidation
+// settles on an accepted Put — a remark of it means only that the data moved
+// again, which leaves an ordinary open window the refresher replaces, never a
+// failed revalidation). rerun (#740): a read was absorbed into this attempt, its
+// Put was NOT accepted and key is still known-stale — the slot STAYS claimed and
+// the caller runs one more attempt at once, beginning it with another
 // BeginDemandRevalidation; otherwise the slot is released.
 func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (context.Context, func() DemandSettle) {
 	ctx, o := withRefreshOutcome(ctx, key)
@@ -496,14 +505,15 @@ func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (con
 	var out DemandSettle
 	return ctx, func() DemandSettle {
 		once.Do(func() {
-			if o.accepted.Load() && !o.remarked.Load() {
+			accepted := o.accepted.Load()
+			if accepted {
 				knownStaleRevalidationFresh.Add(1)
 				out.Fresh = true
 			} else {
 				knownStaleRevalidationFail.Add(1)
 			}
 			out.Refused = o.refused.Load()
-			_, out.Rerun = settleRevalSlot(&demandInflight, key)
+			_, out.Rerun = settleRevalSlot(&demandInflight, key, !accepted)
 			if out.Rerun {
 				knownStaleRevalidationRerun[revalSlotDemand].Add(1)
 			}
@@ -512,8 +522,8 @@ func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (con
 	}
 }
 
-// DemandSettle is one demand attempt's settle: Fresh (an accepted, un-remarked
-// write), Rerun (#740: an absorbed read earned one more attempt; the slot stays
+// DemandSettle is one demand attempt's settle: Fresh (an accepted write, #884),
+// Rerun (#740: an absorbed read earned one more attempt; the slot stays
 // claimed) and Refused (the Put was refused because the generation moved: a
 // TRANSIENT failure for the viewer-gated chain, Q4).
 type DemandSettle struct{ Fresh, Rerun, Refused bool }
@@ -526,56 +536,124 @@ func DemandSlotDone(key string) (<-chan struct{}, bool) { return revalSlotDone(&
 // still known-stale and not suppressed, and resident.
 func KnownStaleRetryState(key string) (stale, resident bool) { return knownStaleRetryState(key) }
 
-// endKnownStaleOnPut ends key's KNOWN-STALE state on an ACCEPTED Put whose
-// resolve began at or after the window's latest mark (#547): that body was read
-// from the post-mark state, so the cell is fresh, whichever carrier wrote it — a
-// demand revalidation, a substrate read-through refill (apistage content MISS,
-// the RAFullList live resolve), a seed or keep-warm re-Put, the refresher's own
-// terminal re-Put. ctx must carry the resolve's #375 dep-gen sink (its startSeq
-// is the resolve-entry epoch); a Put with no sink proves nothing and ends
-// nothing. The store's Put methods call it INSIDE the critical section that
-// publishes the body (#734), so a reader that sees the new body also sees the
-// state ended: before #734 an in-flight stamp kept its flag until the refresher
-// dequeue settled, and a reader in that gap counted a known-stale serve of the
-// fresh body, started a demand revalidation of it, or read a fresh substrate
-// cell through as a MISS. Only sync.Map operations: safe under c.mu.
+// knownStaleEnd is what an accepted Put did to key's KNOWN-STALE state
+// (endKnownStaleOnPut). The Put site acts on it once c.mu is released.
+type knownStaleEnd struct {
+	t0 time.Time
+	// sample: the window closed (the resolve began at or after its latest
+	// mark); t0 starts the dirty→fresh sample to record.
+	sample bool
+	// reopened (#884): the known-stale flag ended, but a mark newer than the
+	// resolve's start keeps the window OPEN at rest, as an ordinary dirty
+	// window that the refresher must replace (#710 stale-then-replace).
+	reopened bool
+}
+
+// afterUnlock records the sample of a closed window and hands a re-opened one
+// to the refresher. Called after c.mu is released: the sample feeds the OTLP
+// histogram hook, and an enqueue must never run under the store lock.
+func (e knownStaleEnd) afterUnlock(key string) {
+	if e.sample {
+		sampleFreshAfterPut(e.t0)
+	}
+	if e.reopened {
+		refreshReopenedWindow(key)
+	}
+}
+
+// endKnownStaleOnPut ends key's KNOWN-STALE state on an ACCEPTED Put (#547;
+// #884 owner ruling F5: known-stale means "the last refresh FAILED", not "the
+// data moved since"). An accepted Put is a refresh that succeeded, whichever
+// carrier wrote it — a demand revalidation, a substrate read-through refill
+// (apistage content MISS, the RAFullList live resolve), a seed or keep-warm
+// re-Put, the refresher's own terminal re-Put — so the flag ends here. ctx must
+// carry the resolve's #375 dep-gen sink (its startSeq is the resolve-entry
+// epoch); a Put with no sink proves nothing and ends nothing. The store's Put
+// methods call it INSIDE the critical section that publishes the body (#734),
+// so a reader that sees the new body also sees the state ended: before #734 an
+// in-flight stamp kept its flag until the refresher dequeue settled, and a
+// reader in that gap counted a known-stale serve of the fresh body, started a
+// demand revalidation of it, or read a fresh substrate cell through as a MISS.
+// Only sync.Map operations: safe under c.mu.
 //
-// A stamp at rest is closed: the window ends, and sample reports the t0 whose
-// dirty→fresh sample the caller records once c.mu is released. An IN-FLIGHT
-// stamp keeps its window: only the known-stale flag ends, and the refresher
-// dequeue still classifies and samples the window by its own outcome. Called
-// before the Put's #375 remark: a dep that moved during the resolve then
-// re-opens a fresh window through the ordinary mark.
-func endKnownStaleOnPut(ctx context.Context, key string) (t0 time.Time, sample bool) {
+// What happens to the WINDOW depends on whether the data moved after the
+// resolve began (a mark whose seq is past the Put's startSeq):
+//
+//   - An IN-FLIGHT stamp keeps its window: only the flag ends, and the
+//     refresher dequeue still classifies and samples the window by its own
+//     outcome (a mark during the resolve is its `next`, already re-queued).
+//   - A stamp at rest whose latest mark the resolve saw (startSeq ≥ seq) is
+//     closed: the window ends, and the result carries the t0 whose dirty→fresh
+//     sample the caller records once c.mu is released.
+//   - A stamp at rest with a NEWER mark (startSeq < seq) stays an ORDINARY open
+//     window from the same t0, so dirty→fresh still measures from the first
+//     mark: the body is served stale (stale_served, never known_stale_served)
+//     while the refresher replaces it (#710). The result says reopened and the
+//     Put site enqueues the key: the newer mark may be the one the failed
+//     refresh already consumed, and an ordinary window always has its refresh
+//     pending.
+//
+// Before #884 a newer mark kept the cell KNOWN-STALE through the Put. At ≥ 10
+// edits/s every resolve of a hot cell overlaps a mark, so the state never
+// ended: every customer read started a demand revalidation (a full re-resolve)
+// and its #740 rerun, and the CPU queue made every customer wait (bench run 15).
+//
+// Called before the Put's #375 remark: a dep that moved during the resolve also
+// re-marks the key through the ordinary mark.
+func endKnownStaleOnPut(ctx context.Context, key string) knownStaleEnd {
 	r := refresherPeek()
 	if r == nil || key == "" {
-		return time.Time{}, false
+		return knownStaleEnd{}
 	}
 	start, ok := DepGenStartSeqFromContext(ctx)
 	if !ok {
-		return time.Time{}, false
+		return knownStaleEnd{}
 	}
 	for {
 		cur, ok := r.dirty.Load(key)
 		if !ok {
-			return time.Time{}, false
+			return knownStaleEnd{}
 		}
 		s := cur.(*dirtyStamp)
-		if s.stale == knownStaleNone || start < s.seq {
-			return time.Time{}, false
+		if s.stale == knownStaleNone {
+			return knownStaleEnd{}
 		}
 		if s.inflight {
 			if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, seq: s.seq}) {
 				noteStaleRetryCellChanged(key) // #740 — a healed cell's chain ends
-				return time.Time{}, false
+				return knownStaleEnd{}
+			}
+			continue
+		}
+		if start < s.seq {
+			// #884 — a newer mark: an ordinary open window, t0 kept.
+			if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, seq: s.seq}) {
+				noteStaleRetryCellChanged(key) // #740 — the known-stale chain ends
+				return knownStaleEnd{reopened: true}
 			}
 			continue
 		}
 		if r.dirty.CompareAndDelete(key, cur) {
 			noteStaleRetryCellChanged(key) // #740 — a healed cell's chain ends
-			return s.t0, true
+			return knownStaleEnd{t0: s.t0, sample: true}
 		}
 	}
+}
+
+// refreshReopenedWindow hands a window an accepted Put re-opened (#884) to the
+// refresher through the ordinary mark path (residency, trigger set, viewed
+// tier) — the hook a #375 remark uses. The workqueue coalesces it with a
+// refresh the newer mark already queued.
+//
+// RACE (reviewer, #886 finding 2). The CAS that re-opens the window runs under
+// c.mu; this enqueue runs after the unlock. A refresher dequeue of key in that
+// gap already settles the re-opened window, so this enqueue then opens (through
+// onDirtyMark's markDirty) at most ONE spurious window per re-open, at most a
+// few microseconds wide in where it starts, closed by the refresh it queues. It
+// is the same property a #375 remark has (its enqueue also follows the Put's
+// unlock), and it over-reports staleness, never under-reports it.
+func refreshReopenedWindow(key string) {
+	Deps().enqueueRemark(key, nil)
 }
 
 // sampleFreshAfterPut records the dirty→fresh sample of a window an accepted Put

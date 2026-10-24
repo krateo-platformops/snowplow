@@ -481,13 +481,21 @@ refresher ends in exactly one of three states, all counted:
 | **known-stale** (#547) | the refresh ended without an accepted re-Put: a decline (stage error, empty full, external / UAF / sensitive gate), a drop after `maxRefreshRequeues` (403, 500, timeout, parse failure, an apistage content call that is not servable), a suppressed skip | `dirty_ended_unfresh_{declined,dropped}`; served: `known_stale_served_total{reason}` |
 
 **Known-stale.** The cell stays resident and its dirty stamp (`dirty_window.go`) is NOT erased: it
-is converted to `{t0, stale: reason, seq}` and stays until an accepted write closes it or the cell
-leaves the store. ANY accepted write whose resolve began at or after the window's latest mark
-closes it — the refresher, a demand revalidation, a substrate read-through refill, a seed or
-keep-warm re-Put, the external-TTL widget Put (an external widget whose RESTAction also reads
-Kubernetes carries the inner-call dep edge, so it is marked too) (`closeKnownStaleOnPut`: the resolve's #375 `startSeq` against the stamp's
-`seq`) — unless a refresh is in flight, whose dequeue settles it. A Put whose resolve began
-before the mark carries the pre-change body and closes nothing. Before #547 the stamp was deleted there,
+is converted to `{t0, stale: reason, seq}` and stays until an accepted write ends it or the cell
+leaves the store. Known-stale means "the last refresh FAILED", not "the data moved since" (#884,
+owner ruling F5). ANY accepted write ends it — the refresher (also when #375 remarks it), a demand
+revalidation, a substrate read-through refill, a seed or keep-warm re-Put, the external-TTL widget
+Put (an external widget whose RESTAction also reads Kubernetes carries the inner-call dep edge, so
+it is marked too) (`endKnownStaleOnPut`, inside the write's critical section; a write with no #375
+sink proves nothing and ends nothing). What happens to the WINDOW depends on the resolve's #375
+`startSeq` against the stamp's `seq`: at or after the latest mark, the window closes (a dirty→fresh
+sample); before it (a newer edit landed during the resolve), the window stays an ORDINARY open one
+from the same t0 — served stale, counted on `stale_served_total`, never on
+`known_stale_served_total` — and is handed to the refresher, which replaces it (#710
+stale-then-replace). If that replacement fails, the cell is known-stale again. An in-flight
+refresh's window is settled by its own dequeue. Before #884 a newer mark kept the cell
+known-stale through the write: at ≥ 10 edits/s every resolve of a hot cell overlaps a mark, so the
+state never ended and every customer read started a full re-resolve (bench run 15). Before #547 the stamp was deleted there,
 so the cell looked exactly like a fresh one — every reload was a hit on a body the system knew
 was stale, nothing re-validated it short of a later event or the TTL, and `stale_served_total`
 went blind at the moment the user started seeing stale data (#547 trace). The serve path
@@ -500,13 +508,14 @@ went blind at the moment the user started seeing stale data (#547 trace). The se
   (key, t0): the handler re-runs its own cold path on a detached copy of the request, under the
   requester's identity and own credential (the read known to work), bounded by the server's write
   deadline, never blocking the response (`dispatchers/demand_revalidate.go`). Its accepted
-  write closes the window and publishes over SSE. If it fails, the body keeps being served and
+  write ends the known-stale state, settles the revalidation (no #740 rerun, #884) and publishes
+  over SSE. If it fails, the body keeps being served and
   counted and the next read or change retries — never an eviction (owner ruling, #547). A key
   suppressed for a structurally-permanent reason (external, UAF, unsupported, sensitive) starts
   NO demand revalidation — its cold path declines the Put by the same gate — and the skip is
   counted (`known_stale_revalidation_skipped_total`, team ruling);
   a read that finds a revalidation slot (background or demand) already held is ABSORBED into that
-  attempt and earns it ONE rerun if it settles still known-stale — the slot stays claimed across the
+  attempt and earns it ONE rerun if it settles still known-stale with no accepted write — the slot stays claimed across the
   rerun, so a read during it arms one more; without an absorbed read the slot is released
   (`known_stale_revalidation_rerun_total{slot}`, #740);
 - the **shared, identity-free widget shell** (widgetContent) is a SERVED body too: it is served
