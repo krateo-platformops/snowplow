@@ -1718,6 +1718,9 @@ func (c *ResolvedCacheStore) releaseUnstoredLocked(key string) {
 	if _, live := c.index[key]; live {
 		return // a resident cell's edges are its own write's
 	}
+	if edgeHeld(key) {
+		return // a registered holder judges its facts by these edges (RegisterEdgeHolder)
+	}
 	c.stripDepEdges(key)
 }
 
