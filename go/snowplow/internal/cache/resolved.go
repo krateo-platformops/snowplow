@@ -1536,6 +1536,16 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 	// for leaving stay distinguishable. KEPT on the GetNoTouch path too (the
 	// internal-read orphan backstop).
 	//
+	// #882 F1 (owner ruling) — the ONE exception: an anchored incremental LIST
+	// content cell (list_cell.go) is under neither bound (itemExpiredLocked).
+	// Its body is rebuilt from informer deltas, never by a Put, so CreatedAt
+	// and BornAt say nothing about its freshness; the two bounds only removed a
+	// correct 50K list hourly and made every reader re-fill it (#882, the
+	// run-15 OOM). Its from-scratch check is the comparator pass, which
+	// REPLACES the 24 h rebuild for it; it leaves through its own unanchor
+	// signals (mismatch, lost event, comparator divergence) or byte /
+	// entry-count pressure (LRU).
+	//
 	// #378 — a WARM cell evicted here is split by reader: on the customer path it
 	// is a cold navigation of the working set (the owner's P5 trigger); on the
 	// GetNoTouch path no customer saw it. The refresher terminal re-mints a cell
@@ -1793,6 +1803,11 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 // #375's PUT-THEN-REMARK — so a re-mint here is a from-scratch resolve of the
 // same key with every freshness and isolation guarantee the refresh already
 // carries.
+//
+// #882 F1 (owner ruling) — NOT for the anchored incremental LIST content cell.
+// The cap does not apply to it (itemExpiredLocked), its refresh writes nothing
+// (resolve_populate.go: a Snapshot, no store write), and its from-scratch check
+// is the comparator pass, which REPLACES this 24 h rebuild for it.
 //
 // #506 item 2 SUPERSEDES the original no-added-resolve promise. This comment
 // used to end "No extra resolve is ever spent on a re-mint (F4a)" — that was
@@ -2784,6 +2799,12 @@ type ResolvedEntryMeta struct {
 	// TTLOverrideSeconds is the per-entry override when one is stamped (UAF
 	// cells), 0 otherwise. It can only ever SHORTEN the effective TTL.
 	TTLOverrideSeconds int64 `json:"ttlOverrideSeconds,omitempty"`
+	// Incremental (#882 F1) — an anchored incremental LIST content cell
+	// (list_cell.go). No TTL or max entry age applies to it: it leaves through
+	// its own unanchor signals or byte / entry-count pressure (LRU), and its from-scratch check is
+	// the comparator pass, not the #378 rebuild. AgeSeconds, LifetimeSeconds and
+	// TTLRemainingSeconds still report the clocks; nothing acts on them.
+	Incremental bool `json:"incremental,omitempty"`
 	// RBACSubGen is the per-subject RBAC sub-generation folded into this
 	// cell's key (#247 instrument). Together with PerPage/Page/ExtrasHash
 	// below, ResolvedEntryMeta now carries EVERY ComputeKey input except the
@@ -3051,6 +3072,7 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 		meta.TTLRemainingSeconds = int64(rem.Seconds())
 	}
 	meta.TTLOverrideSeconds = int64(entry.TTLOverride.Seconds())
+	meta.Incremental = entry.incremental() // #882 F1
 	// #247 instrument — the extras identity is NOT derived here. It was
 	// computed once at Put and carried on the item, so this stays O(1) and
 	// the full walk never hashes under c.mu (see lruItem.extrasHash).
@@ -3556,6 +3578,12 @@ var proactiveRefreshDisabledForTest atomic.Bool
 // BornAt on an accepted refresh inside the lead window [maxAge − L, …), so a warm
 // cell the refresher keeps fresh reaches neither this gauge nor the cap.
 //
+// #882 F1 — an anchored incremental LIST content cell takes none of the three
+// decisions and is in none of the #378 gauges: no TTL or max entry age applies
+// to it (itemExpiredLocked), so it is never reaped by age, never proactively
+// refreshed by a body or birth clock (the informer deltas keep it current; its
+// from-scratch check is the comparator pass), and never at risk at the cap.
+//
 // #378 — the walk also publishes oldestWarmBornAgeGauge: the max LifetimeSeconds
 // over WARM cells (0 if none). It is the scope of the warm-evict detectors: a zero
 // evict_max_age_warm_customer_total is evidence only on a pod where this exceeded
@@ -3616,7 +3644,7 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 			// #378 — the verdict is warmLocked, evaluated per item under the batch
 			// hold (the same predicate getCore and reapOneMaxAgeCold use).
 			warm := warms[i]
-			if warm && m.LifetimeSeconds > oldestWarm {
+			if warm && !m.Incremental && m.LifetimeSeconds > oldestWarm {
 				oldestWarm = m.LifetimeSeconds
 			}
 			// #376 — decompose the warm set by SOURCE over this same walk. Seeded wins
@@ -3642,6 +3670,9 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 				if m.KeyedExtras {
 					warmKeyedExtras[b]++
 				}
+			}
+			if m.Incremental {
+				continue // #882 F1 — no age bound applies; see the doc above
 			}
 			_, suppressed := RefreshSuppressedReason(m.KeyHash)
 			pastMaxAge := maxAgeSec > 0 && m.LifetimeSeconds > maxAgeSec
@@ -3871,6 +3902,9 @@ func (c *ResolvedCacheStore) reapOneMaxAgeSuppressed(key string) bool {
 	if item.entry == nil || item.entry.BornAt.IsZero() || time.Since(item.entry.BornAt) <= c.maxEntryAge {
 		return false // read/re-validated young — never over-evict a within-cap cell
 	}
+	if item.entry.incremental() {
+		return false // #882 F1 — no max entry age applies to an incremental cell
+	}
 	c.removeElementLocked(el)
 	c.evictMaxAgeTotal.Add(1)
 	return true
@@ -3905,6 +3939,9 @@ func (c *ResolvedCacheStore) reapOneMaxAgeCold(key string) bool {
 	item := el.Value.(*lruItem)
 	if item.entry == nil || item.entry.BornAt.IsZero() || time.Since(item.entry.BornAt) <= c.maxEntryAge {
 		return false // young / re-validated within cap
+	}
+	if item.entry.incremental() {
+		return false // #882 F1 — no max entry age applies to an incremental cell
 	}
 	// C3 re-validation: a Get between the walk and now stamps lastRead=now → warm.
 	if c.warmLocked(item, time.Now()) {

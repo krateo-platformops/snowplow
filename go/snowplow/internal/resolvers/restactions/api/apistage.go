@@ -39,6 +39,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/pprof"
+	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -163,6 +164,11 @@ type parsedListEnvelope struct {
 	kind       string
 }
 
+// parseListEnvelopeHookForTest observes every envelope parse. TEST-ONLY (nil
+// in production, one atomic load per parse): the #882 herd arm counts parses
+// through a seam it owns, never through snowplow's own fill metrics.
+var parseListEnvelopeHookForTest atomic.Pointer[func(schema.GroupVersionResource)]
+
 // parseListEnvelope decodes a raw LIST envelope ONCE — Ship 0.30.121 R3.
 // Called at the content-entry Put site so the parsed items can be stored
 // on the ResolvedEntry; the content-gate then runs filterListByRBAC over
@@ -170,6 +176,9 @@ type parsedListEnvelope struct {
 // on a malformed envelope (the caller stores RawJSON only — the gate then
 // falls back to the unmarshal path, byte-identical to pre-0.30.121).
 func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool) {
+	if h := parseListEnvelopeHookForTest.Load(); h != nil {
+		(*h)(gvr) // TEST-ONLY: the #882 herd arm's own parse seam
+	}
 	var envelope struct {
 		APIVersion string           `json:"apiVersion"`
 		Kind       string           `json:"kind"`
@@ -502,7 +511,7 @@ func apistageContentServe(
 	uafActive bool,
 ) (value any, served bool, ok bool, err error) {
 	value, served, ok, err = apistageContentServeAttempt(ctx, store, call, uafActive, true)
-	if errors.Is(err, errInheritedAdmissionTimeout) {
+	if errors.Is(err, errInheritedAdmissionTimeout) || errors.Is(err, errJoinedMovedFlight) {
 		value, served, ok, err = apistageContentServeAttempt(ctx, store, call, uafActive, false)
 	}
 	return value, served, ok, err
@@ -511,6 +520,13 @@ func apistageContentServe(
 // errInheritedAdmissionTimeout is a joiner's signal to retry (never returned
 // from apistageContentServe).
 var errInheritedAdmissionTimeout = errors.New("apistage content fill: joined flight was not admitted")
+
+// errJoinedMovedFlight (#882 F2) is the signal of a joiner whose list moved
+// after the flight began and whose flight ended without an incremental cell to
+// bring up to its own seq: the flight's body may predate an edit it must see,
+// so it makes one more attempt under the epoch rule (never returned from
+// apistageContentServe).
+var errJoinedMovedFlight = errors.New("apistage content fill: joined a moved list and the flight anchored no cell")
 
 // apistageContentServeAttempt is one attempt of apistageContentServe.
 // mayRetry lets a joiner of a never-admitted flight ask for a second attempt.
@@ -745,6 +761,9 @@ func apistageContentServeAttempt(
 			return e, hit && served
 		}
 	}
+	// #882 F2 — a fill of this call would anchor an incremental cell: a LIST,
+	// not a dry run, anchoring available on a servable GVR.
+	anchorable := isList && !cache.Inert(ctx) && cache.ListCellAnchorable(gvr)
 	if entry, hit := readContent(contentKey); hit && entry != nil {
 		hitObserved = true // Ship 0.30.193 C3 — observed cache hit.
 		// #618 — a HIT serves this call's selector from its own cell; the MISS
@@ -852,12 +871,17 @@ func apistageContentServeAttempt(
 			slog.Bool("preparsed", haveParsed),
 			slog.String("key_hash", contentKey),
 		)
-	} else if flight, fillCtx, lead := enterContentFlight(ctx, contentKey, gvr, ns, name, fillReason, stamp); !lead {
+	} else if flight, fillCtx, lead, movedJoin := enterContentFlight(ctx, contentKey, gvr, ns, name, fillReason, stamp,
+		anchorable, anchorable && mayRetry); !lead {
 		// MISS, JOINER (#710 PR-1, apistage_fill_flight.go) — an in-flight fill of
 		// this key started after this reader's coordinate last moved, so its body is
 		// as fresh as this reader's own fill would be. Serve the flight's envelope
 		// and shared parsed items through this reader's own gate below, exactly as a
 		// content HIT serves entry.Items.
+		//
+		// #882 F2 — or the flight anchors an incremental LIST cell and this reader
+		// may snapshot-join (anchorable, on its first attempt): then it joined
+		// whatever its list did, and is served the cell brought up to its own seq.
 		res, ok := flight.wait(ctx)
 		if res.err != nil {
 			// #710 PR-2a (D1) — the flight was never admitted. Its leader's
@@ -873,7 +897,37 @@ func apistageContentServeAttempt(
 			// reader's own ctx ended while it waited.
 			return nil, false, false, nil
 		}
-		envelope, parsed, haveParsed = res.envelope, res.parsed, res.haveParsed
+		// #882 F2 — the flight's incremental cell, brought up to THIS reader's
+		// own seq (its content sink's entry seq, taken before it joined): every
+		// edit up to that seq is in the generation it is served, whatever the
+		// flight's own read saw. Snapshot drains only the edits since the
+		// flight's last generation.
+		servedAsOf := flight.startSeq
+		fromCell := false
+		if res.cell != nil && isList {
+			need, _ := cache.DepGenStartSeqFromContext(fillCtx)
+			if v, vok := res.cell.Snapshot(need); vok {
+				if items := v.Items(); len(items) > 0 {
+					parsed = parsedListEnvelope{items: items, apiVersion: v.APIVersion(), kind: v.Kind()}
+					haveParsed = true
+				} else {
+					envelope = v.Raw()
+				}
+				servedAsOf, fromCell = v.AsOf(), true
+			}
+		}
+		if !fromCell {
+			if movedJoin {
+				// Joined a list that moved after the flight began, and there is no
+				// cell to bring up to this reader's seq: the flight's body may miss
+				// an edit this reader must see. One more attempt (epoch rule).
+				if mayRetry && ctx.Err() == nil {
+					return nil, false, false, errJoinedMovedFlight
+				}
+				return nil, false, false, nil
+			}
+			envelope, parsed, haveParsed = res.envelope, res.parsed, res.haveParsed
+		}
 		if res.stored {
 			// The dep edge the leader Recorded on its accepted Put, on THIS reader's
 			// resolve sink, so its own cell's Put-check sees the coordinate (#375).
@@ -884,7 +938,7 @@ func apistageContentServeAttempt(
 			}
 			entryRef = res.entry
 		}
-		noteFillOutcome(ctx, res.stored, flight.startSeq)
+		noteFillOutcome(ctx, res.stored, servedAsOf)
 	} else {
 		// MISS, LEADER — dispatch UN-GATED so the stored envelope is identity-free.
 		// #710 PR-1 — every exit publishes the flight's outcome to its joiners (a
@@ -934,6 +988,16 @@ func apistageContentServeAttempt(
 				gate.release(flight.ticket, false) // an early exit: nothing decoded
 			}
 		}()
+		// #882 F2 — a LIST fill's incremental cell starts watching its GVR BEFORE
+		// the dispatch lists the informer, so every edit during the fill is
+		// recorded in its pending (an edit the anchor then takes from the
+		// listing, never an abort). nil when no cell can anchor here; abandoned
+		// on every exit that does not anchor it.
+		var listFill *cache.ListCellFill
+		if isList && !cache.Inert(ctx) {
+			listFill = cache.BeginListCell(contentKey, gvr, ns, listCellFuncs(gvr, query))
+			defer listFill.Abandon()
+		}
 		var dispatched []byte
 		var dispatchedOK bool
 		pprof.Do(ctx, fillLabels, func(ctx context.Context) {
@@ -999,17 +1063,13 @@ func apistageContentServeAttempt(
 				// #854 — anchor an incremental cell on this fill: from here on
 				// every informer event on the GVR is applied to the stored list
 				// instead of re-filling it. Only for a servable GVR (the cell
-				// trusts its informer); AnchorListCell returns nil when it cannot
-				// prove the items match the indexer (an event raced the fill),
-				// and the entry then stays a plain fill.
-				// A dry run (cache.Inert) persists nothing, so it anchors nothing.
-				if servable && !cache.Inert(ctx) {
-					if cell := cache.AnchorListCell(cache.ListCellAnchor{
-						Key: contentKey, GVR: gvr, Namespace: ns,
-						Envelope: dispatched, Items: p.items,
-						APIVersion: p.apiVersion, Kind: p.kind,
-						Funcs: listCellFuncs(gvr, query),
-					}); cell != nil {
+				// trusts its informer). #882 F2 — an edit during the fill is a
+				// pending key the anchor takes from the informer, never an
+				// abort; Anchor returns nil only when the envelope cannot be
+				// proven to be this informer's, and the entry then stays a plain
+				// fill. A dry run (cache.Inert) persists nothing: no listFill.
+				if servable {
+					if cell := listFill.Anchor(dispatched, p.items, p.apiVersion, p.kind); cell != nil {
 						cell.AttachStore(store)
 						anchoredCell = cell
 						newEntry = cache.NewListCellEntry(cell, newEntry.Inputs)
@@ -1075,6 +1135,10 @@ func apistageContentServeAttempt(
 			// #740 R1 — ANY accepted fill at or after a debt's mark retires it.
 			retireStaleDebtOnFill(contentKey, flight.startSeq)
 		}
+		var flightCell *cache.ListCell
+		if entryRef != nil && anchoredCell != nil {
+			flightCell = anchoredCell // #882 F2 — joiners bring it up to their own seq
+		}
 		flight.complete(contentFlightResult{
 			ok:         true,
 			envelope:   envelope,
@@ -1082,6 +1146,7 @@ func apistageContentServeAttempt(
 			haveParsed: haveParsed,
 			stored:     entryRef != nil,
 			entry:      entryRef,
+			cell:       flightCell,
 		})
 	}
 

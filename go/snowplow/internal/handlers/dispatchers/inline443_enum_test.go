@@ -94,6 +94,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	// fill of the same informer state would not, and Puts nothing.
 	"ListCell.Snapshot":      clusterFact443,
 	"ResolvedEntry.ListCell": readOnly443,
+	"ListCellAnchorable":     readOnly443, // #882 F2: a predicate over the watcher's servability
 	"ResolvedEntry.RawLen":   readOnly443, // #854: an arithmetic length, nothing built
 	"ListView.AsOf":          readOnly443,
 	"ListView.APIVersion":    readOnly443,
@@ -110,9 +111,13 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ServeCell": gatedAtCaller443,
 	// #854 — ServeCell with an accept check before the note; same gating.
 	"ServeCellAccept": gatedAtCaller443,
-	// #854 — anchoring registers a cell and hands it to the store: the caller
-	// anchors only on a non-inert fill leader.
-	"AnchorListCell":                              gatedAtCaller443,
+	// #854 / #882 F2 — anchoring registers a cell (BeginListCell, before the
+	// fill's listing) and hands it to the store (Anchor): the caller begins one
+	// only on a non-inert fill leader, and Anchor / Abandon of a nil fill are
+	// no-ops.
+	"BeginListCell":                               gatedAtCaller443,
+	"ListCellFill.Anchor":                         gatedAtCaller443,
+	"ListCellFill.Abandon":                        gatedAtCaller443,
 	"NewListCellEntry":                            gatedAtCaller443,
 	"ListCell.AttachStore":                        gatedAtCaller443,
 	"ListCell.Close":                              gatedAtCaller443,
@@ -329,13 +334,15 @@ var cacheAllow443 = map[string]cacheClass443{
 // callerAllow443: for each gatedAtCaller symbol, the "<file>:<func>" sites
 // allowed to use it. Each listed function must contain a cache.Inert check.
 var callerAllow443 = map[string][]string{
-	"ServeCell":                {"apistage.go:apistageContentServeAttempt", "apistage_stale_debt.go:serveStaleWithDebt", "ra_full_list.go:raFullListServe"},
-	"ServeCellAccept":          {"apistage.go:apistageContentServeAttempt"},
-	"AnchorListCell":           {"apistage.go:apistageContentServeAttempt"},
-	"NewListCellEntry":         {"apistage.go:apistageContentServeAttempt"},
-	"ListCell.AttachStore":     {"apistage.go:apistageContentServeAttempt"},
-	"ListCell.Close":           {"apistage.go:apistageContentServeAttempt"},
-	"ResolvedEntry.NoteHitter": {"ra_full_list.go:raFullListServe"},
+	"ServeCell":                                   {"apistage.go:apistageContentServeAttempt", "apistage_stale_debt.go:serveStaleWithDebt", "ra_full_list.go:raFullListServe"},
+	"ServeCellAccept":                             {"apistage.go:apistageContentServeAttempt"},
+	"BeginListCell":                               {"apistage.go:apistageContentServeAttempt"},
+	"ListCellFill.Anchor":                         {"apistage.go:apistageContentServeAttempt"},
+	"ListCellFill.Abandon":                        {"apistage.go:apistageContentServeAttempt"},
+	"NewListCellEntry":                            {"apistage.go:apistageContentServeAttempt"},
+	"ListCell.AttachStore":                        {"apistage.go:apistageContentServeAttempt"},
+	"ListCell.Close":                              {"apistage.go:apistageContentServeAttempt"},
+	"ResolvedEntry.NoteHitter":                    {"ra_full_list.go:raFullListServe"},
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},
 	"BumpExternalSkippedPut":                      {"ra_full_list.go:raFullListServe"},

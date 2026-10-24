@@ -2,9 +2,12 @@
 // #643 served-cell identity of an incremental cell.
 //
 //	F1r  an event that lands between the fill's dispatch and the anchor's
-//	     listing: the fill's items no longer match the indexer, so the anchor
-//	     is REFUSED (anchor_raced) and the entry stays a plain fill — never a
-//	     cell that claims a stamp over an item decoded from older bytes.
+//	     listing: the fill's item no longer matches the indexer. #882 F2 (owner
+//	     ruling) replaced the old refusal (anchor_raced, a plain fill, a refill
+//	     on the next read — 373 aborts in 15 min of run 15): the cell watched
+//	     the GVR from before the dispatch, so the edit is a pending key and the
+//	     anchor takes it from the informer — never a cell that claims a stamp
+//	     over an item decoded from older bytes, and never an abort.
 //	F7b  #643 PR-B: a served incremental cell's identity is its Put AND its body.
 //	     A change applied without a Put must read as "changed" to a
 //	     declined-external mark taken over the cell, or the mark holds forever.
@@ -25,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func TestListCell854_F1r_EventBetweenFillAndAnchorRefusesTheAnchor(t *testing.T) {
+func TestListCell854_F1r_EventBetweenFillAndAnchorIsTakenFromTheInformer(t *testing.T) {
 	dyn := newInc854Watcher(t, 5)
 	store := cache.ResolvedCache()
 	orig := dispatchViaInformerFn
@@ -53,13 +56,20 @@ func TestListCell854_F1r_EventBetweenFillAndAnchorRefusesTheAnchor(t *testing.T)
 	if !ok {
 		t.Fatal("no entry stored")
 	}
-	if e.ListCell() != nil && e.ListCell().Anchored() {
-		v, _ := e.ListCell().Snapshot(cache.DepGenEpochNow())
-		t.Fatalf("F1r RED: the cell anchored over a fill an event raced (managed served=%d) — the pairing proof is gone", inc854Managed(v, stamp765Item))
+	if got := cache.ListCellStatsSnapshot().Unanchors["anchor_raced"] - raced0; got != 0 {
+		t.Fatalf("F1r RED (#882 F2): unanchors{anchor_raced} moved by %d, want 0 — an edit during the fill aborted the anchor", got)
 	}
-	if got := cache.ListCellStatsSnapshot().Unanchors["anchor_raced"] - raced0; got != 1 {
-		t.Fatalf("F1r: unanchors{anchor_raced} moved by %d, want 1", got)
+	if e.ListCell() == nil || !e.ListCell().Anchored() {
+		t.Fatal("F1r RED (#882 F2): the fill an edit overlapped stored no incremental cell")
 	}
+	v, ok := e.ListCell().Snapshot(cache.DepGenEpochNow())
+	if !ok {
+		t.Fatal("F1r: the cell unanchored on its first read")
+	}
+	if got := inc854Managed(v, stamp765Item); got != 9 {
+		t.Fatalf("F1r: the cell serves managed=%d for the item edited during the fill, want 9 — an item decoded from older bytes", got)
+	}
+	inc854Same(t, "F1r", store, fill710ListCall())
 }
 
 func TestListCell854_F7b_ServedIdentityMovesWithTheBody(t *testing.T) {
