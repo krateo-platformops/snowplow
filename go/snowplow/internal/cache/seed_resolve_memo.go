@@ -40,13 +40,28 @@
 //     cohort A's memoized (RBAC-filtered) body. Dropping identity from the key
 //     is a cross-user leak — proven RED by the divergent-output memo test.
 //
-//   - JSON-NATIVE VALUES (C-F4-3): the caller stores an already-deep-copied,
-//     JSON-native snapshot (plumbing/maps.DeepCopyJSON at the apiref seam) and
-//     the memo returns a fresh deep copy on every hit, so no two callers alias
-//     the stored map and no caller can mutate it. The stored value is opaque to
-//     this package — the apiref seam owns the DeepCopyJSON round-trip so a
-//     non-JSON-native value ([]string etc.) panics AT THE SEAM under -race,
-//     never silently aliased here.
+//   - ENCODED VALUES (C-F4-3, #883 F4): the caller stores the RESTAction's
+//     ENCODED result — the JSON bytes its own miss path decodes — and every hit
+//     decodes those bytes once, with encoding/json, the decoder the miss path
+//     uses. So a hit is the miss path's own decode of the same bytes, no two
+//     callers alias a stored map, and no caller can mutate one. Before #883 the
+//     memo held a decoded deep copy (plumbing/maps.DeepCopyJSON) and deep-copied
+//     it again on every hit; DeepCopyJSON shares strings, so each stored body
+//     also pinned the decoded strings of the resolve that produced it. Bench
+//     run 15 measured DeepCopyJSON 12 -> 774 MB and rawExtensionToMap 11 -> 541
+//     MB in lockstep and never falling.
+//
+//   - ONLY LIVE ENTRIES ARE KEPT (#883 F4). An entry is deleted once it can no
+//     longer be served: when Load finds one of its captured deps moved past its
+//     Stamp (#411), and when the dependency tracker moves one of its deps — the
+//     dep-event bump that precedes every dirty-mark fan-out (TrackDepMoves wires
+//     a memo to it). A dep whose tracker bucket is pruned is judged by the GVR
+//     floor from then on; the memo learns of the prune at the next dep event or
+//     memo Load / Store, because the prune runs under the resolved-cache lock
+//     customers take and must not wait on memo work. Before #883 Load refused a
+//     stale entry but left it in the map, so an entry nobody looked up again (a
+//     churned coordinate, an identity gone quiet) held its body for the life of
+//     the memo: the ~1 GB/h rising floor of bench run 15.
 //
 // TOGGLE (C-F4-9): the memo is only ever installed on the seed context, which
 // only exists when the seed runs, which only runs under
@@ -59,9 +74,13 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // ctxKeySeedResolveMemoType is the typed empty-struct context key for the
@@ -76,24 +95,23 @@ var ctxKeySeedResolveMemo = ctxKeySeedResolveMemoType{}
 // memo hit replays Deps under the hitting caller's L1 key so a widget served
 // from the memo carries the SAME backing-GVR edges a real resolve would have
 // recorded — without which the memo-served widget cell goes stale on a backing
-// mutation (edge-3). Body stays the JSON-native, caller-deep-copied snapshot;
-// Deps is a flat slice of cache-package DepKeys, captured by the apiref seam
-// via Deps().BeginCapture/EndCapture around the producing resolve.
+// mutation (edge-3). Body is the RESTAction's ENCODED result (#883 F4), decoded
+// afresh on every hit; Deps is a flat slice of cache-package DepKeys, captured
+// by the apiref seam via Deps().BeginCapture/EndCapture around the producing
+// resolve.
 //
-// [C-lifetime] the struct lives in the SeedResolveMemo = seed-pass lifetime;
-// it is never promoted into the L1 store, so the captured Deps cannot outlive
-// the pass or cross into a user /call.
+// [C-lifetime] the struct lives in the SeedResolveMemo; it is never promoted
+// into the L1 store, so the captured Deps cannot cross into a user /call.
 //
 // [#411] Stamp is the dep-event seq (depEventSeq, #375) the body is fresh AS OF:
 // the PRODUCER resolve's entry epoch (its dep-gen sink startSeq), the
 // conservative choice — every read the body folds happened at or after it, so a
 // dep event at seq <= Stamp is already reflected in Body, and one at seq > Stamp
-// may not be. Load treats the entry as STALE (a miss) when any of Deps moved
-// past Stamp. The struct is immutable once stored: a fresher producer REPLACES
-// the pointer (Store), it never mutates one in place, so a concurrent Load reads
-// a consistent (Body, Deps, Stamp) triple without a lock.
+// may not be. Load treats the entry as STALE (a miss, and deletes it, #883)
+// when any of Deps moved past Stamp. The struct is immutable once stored: a
+// fresher producer REPLACES the pointer (Store), it never mutates one in place.
 type seedMemoValue struct {
-	Body  map[string]any
+	Body  []byte
 	Deps  []DepKey
 	Stamp uint64
 	// Layers — #406: the raKey content versions the producing resolve Go-sliced. A
@@ -107,24 +125,36 @@ type seedMemoValue struct {
 }
 
 // SeedResolveMemo memoizes the resolved output of a heavy RESTAction across the
-// many widgets that share it WITHIN A SINGLE SEED PASS. It is keyed by
-// (RA ns/name, RBAC identity, effective-extras hash, perPage, page) — every
-// input that can change the resolved body — so a hit is only ever served to a
-// caller that would compute a byte-identical result (C-F4-6). Concurrency-safe
-// (sync.Map): the seed fans widgets across cohort goroutines.
+// many widgets that share it. It is keyed by (RA ns/name, RBAC identity,
+// effective-extras hash, perPage, page) — every input that can change the
+// resolved body — so a hit is only ever served to a caller that would compute a
+// byte-identical result (C-F4-6). Concurrency-safe: the seed fans widgets across
+// cohort goroutines and the refresher runs several workers.
 //
-// The memo holds ONE entry per distinct (RA, identity, page, extras) tuple; the
-// value is a JSON-native map[string]any snapshot the CALLER deep-copied before
-// Store (and the memo deep-copies again on Load) so stored bodies are never
-// aliased or mutated.
+// It holds ONE entry per distinct (RA, identity, page, extras) tuple whose
+// captured deps have not moved since it was produced (#883 F4), so its size is
+// the live working set and nothing else.
 type SeedResolveMemo struct {
-	m sync.Map // key string -> *seedMemoValue (JSON-native body, caller-deep-copied, + captured deps)
-	// copyFn deep-copies a stored JSON-native map on Load so no two callers
-	// alias the stored value. Injected by the installer (apiref/widgets seam
-	// owns plumbing/maps.DeepCopyJSON; keeping the dep out of the cache package
-	// avoids importing a resolver util downward). nil copyFn ⇒ Load returns the
-	// stored map directly (test-only / degenerate); production always injects.
-	copyFn func(map[string]any) map[string]any
+	// mu guards m, deps and the hit/miss counters. It is never held across a
+	// decode or a resolve: every critical section is map work plus the #411 seq
+	// reads (atomics), so concurrent resolves never serialise behind each other
+	// on it — and a customer /call never carries a memo at all (C-F4-8).
+	mu sync.Mutex
+	m  map[string]*seedMemoValue // key -> encoded body + captured deps
+	// deps indexes the stored keys by the deps they captured, per GVR, so a dep
+	// event re-judges exactly the entries it can have made stale instead of
+	// scanning the memo (see memoDepIndex).
+	deps map[schema.GroupVersionResource]*memoDepIndex
+	// consumers / byConsumer link each entry to the L1 keys it served (the
+	// producer's and every hitter's), both ways (see addConsumerLocked). An
+	// entry with a consumers set lives while that set is non-empty.
+	consumers  map[string]map[string]struct{} // memo key -> L1 keys
+	byConsumer map[string]map[string]struct{} // L1 key -> memo keys
+
+	// entries / bodyBytes are the #883 gauge: the live entry count and the sum
+	// of the stored encoded bodies. Written under mu, read without it.
+	entries   atomic.Int64
+	bodyBytes atomic.Int64
 
 	hits   uint64
 	misses uint64
@@ -132,7 +162,43 @@ type SeedResolveMemo struct {
 	// captured dep moved past the entry's Stamp, so the caller resolved fresh.
 	// Also counted in misses (a stale entry is a miss to the caller).
 	staleMisses uint64
-	mu          sync.Mutex // guards hits/misses/staleMisses (diagnostic counters only)
+}
+
+// memoDepIndex is one GVR's slice of the memo's dep index.
+//
+// byDep maps every captured dep of this GVR to the memo keys that captured it.
+//
+// floorJudged is the subset of byDep's deps that have NO bucket in the dep
+// tracker. depMovedSince judges such a dep by the GVR's last-bump floor, which
+// ANY object event of the GVR raises — not only an event on that coordinate —
+// so an object event must re-judge these too, alongside the (at most four)
+// buckets bumpCoordinateGen stamps. A dep enters the set when its bucket is
+// absent as the entry is stored, or when the tracker prunes the bucket later
+// (logged by notifyResolveMemosBucketGone, judged at the next dep event or memo
+// Load / Store); it leaves with its last key.
+type memoDepIndex struct {
+	byDep       map[DepKey]map[string]struct{}
+	floorJudged map[DepKey]struct{}
+}
+
+// Process-wide #883 drop totals, monotone across memo swaps (the refresher
+// replaces its memo wholesale, which would reset a per-memo counter).
+var (
+	// resolveMemoDroppedStaleTotal counts entries deleted because a Load found
+	// them stale (#411).
+	resolveMemoDroppedStaleTotal atomic.Uint64
+	// resolveMemoDroppedMovedTotal counts entries deleted because the dep
+	// tracker moved one of their deps with nobody looking them up.
+	resolveMemoDroppedMovedTotal atomic.Uint64
+	// resolveMemoDroppedL1GoneTotal counts entries deleted because every L1 key
+	// they served was evicted or deleted from the resolved cache.
+	resolveMemoDroppedL1GoneTotal atomic.Uint64
+)
+
+// ResolveMemoDropTotals returns the process-wide #883 drop totals: entries
+// deleted by a stale Load, by a dep move, and by losing their last live L1 key.
+func ResolveMemoDropTotals() (stale, moved, l1Gone uint64) {
+	return resolveMemoDroppedStaleTotal.Load(), resolveMemoDroppedMovedTotal.Load(), resolveMemoDroppedL1GoneTotal.Load()
 }
 
 // seedResolveMemoKey canonicalizes the memo key. The identity component is the
@@ -196,11 +262,11 @@ func sortStrings(s []string) {
 }
 
 // Load returns the memoized resolved body for the key and true on a hit, or
-// (nil, nil, false) on a miss. On a hit the returned map is a FRESH deep copy
-// (via the injected copyFn) so the caller may mutate/consume it without
-// corrupting the stored snapshot or aliasing a sibling caller. nil-receiver-
-// safe: (nil).Load is always a miss so a call site with no memo installed
-// behaves as "always resolve".
+// (nil, nil, false) on a miss. On a hit the returned map is decoded afresh from
+// the stored encoded body (#883 F4), so the caller may mutate/consume it
+// without corrupting the stored value or aliasing a sibling caller.
+// nil-receiver-safe: (nil).Load is always a miss so a call site with no memo
+// installed behaves as "always resolve".
 //
 // #411 — FAIL SAFE TOWARD FRESHNESS. A present entry is served ONLY if none of
 // its captured deps saw a dep event after the entry's Stamp (the producer's
@@ -209,10 +275,9 @@ func sortStrings(s []string) {
 // moved after the body was produced but BEFORE the hitting resolve's own entry
 // is invisible to the hitter's #375 Put-check (its bump is < the hitter's
 // startSeq), so without this check the hitter would Put the pre-move body as
-// fresh. A moved dep turns the hit into a MISS: the caller resolves fresh and
-// its Store REPLACES this entry with a later Stamp, so later siblings hit the
-// fresh body again (no cascade of re-resolves). Lock-free: the value is
-// immutable and the seq reads are atomics.
+// fresh. A moved dep turns the hit into a MISS and, since #883, DELETES the
+// entry: it can never be served again, so keeping it only held its body. The
+// caller resolves fresh and its Store puts a later-stamped entry in its place.
 //
 // The fourth return is the served entry's Stamp, read off the SAME value the
 // body and deps come from (no second lookup, no TOCTOU against a concurrent
@@ -227,44 +292,69 @@ func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, uint64, b
 // LoadLayered is Load plus the raKey versions the producing resolve sliced (#406),
 // read off the SAME value as the body, deps and stamp.
 func (mo *SeedResolveMemo) LoadLayered(key string) (map[string]any, []DepKey, uint64, LayeredSources, bool) {
-	body, deps, _, stamp, layers, ok := mo.LoadLayeredWithStates(key)
+	body, deps, _, stamp, layers, ok := mo.LoadLayeredWithStates(key, "")
 	return body, deps, stamp, layers, ok
 }
 
 // LoadLayeredWithStates is LoadLayered plus the producer's per-edge interest
-// states (#765 B), read off the SAME value.
-func (mo *SeedResolveMemo) LoadLayeredWithStates(key string) (map[string]any, []DepKey, []EdgeNarrowState, uint64, LayeredSources, bool) {
+// states (#765 B), read off the SAME value. consumer is the L1 key the hitting
+// resolve populates: a hit links the entry to it (addConsumerLocked), so the
+// entry lives while any L1 key it served does. "" links nothing.
+func (mo *SeedResolveMemo) LoadLayeredWithStates(key, consumer string) (map[string]any, []DepKey, []EdgeNarrowState, uint64, LayeredSources, bool) {
 	if mo == nil {
 		return nil, nil, nil, 0, nil, false
 	}
-	v, ok := mo.m.Load(key)
-	if !ok {
-		mo.mu.Lock()
+	drainResolveMemoBucketGone()
+	mo.mu.Lock()
+	val := mo.m[key]
+	if val == nil {
 		mo.misses++
 		mo.mu.Unlock()
 		return nil, nil, nil, 0, nil, false
 	}
-	val, _ := v.(*seedMemoValue)
-	if val != nil && seedMemoDepsMovedSince(val.Deps, val.Stamp) {
-		mo.mu.Lock()
+	if seedMemoDepsMovedSince(val.Deps, val.Stamp) {
 		mo.misses++
 		mo.staleMisses++
+		mo.removeLocked(key, val)
 		mo.mu.Unlock()
+		resolveMemoDroppedStaleTotal.Add(1)
 		return nil, nil, nil, 0, nil, false
 	}
-	mo.mu.Lock()
 	mo.hits++
+	// The hit is served either way: the body is valid for this caller. The link
+	// only decides whether the entry outlives it (a consumer already evicted
+	// links nothing, and can delete an entry that served no other live key).
+	mo.addConsumerLocked(key, consumer)
 	mo.mu.Unlock()
-	if val == nil {
-		return nil, nil, nil, 0, nil, true
+	// The decode runs outside the lock: val is immutable once stored.
+	body, err := decodeMemoBody(val.Body)
+	if err != nil {
+		// Unreachable for bytes encoding/json produced; fail toward a fresh
+		// resolve and drop the entry rather than serve something else.
+		mo.mu.Lock()
+		if mo.m[key] == val {
+			mo.removeLocked(key, val)
+		}
+		mo.mu.Unlock()
+		return nil, nil, nil, 0, nil, false
 	}
 	// Deps is returned as a slice-header copy — the caller only reads it to
 	// replay edges; the underlying DepKeys are immutable value structs.
-	deps := val.Deps
-	if mo.copyFn == nil {
-		return val.Body, deps, val.Narrow, val.Stamp, val.Layers, true
+	return body, val.Deps, val.Narrow, val.Stamp, val.Layers, true
+}
+
+// decodeMemoBody is the hit's one decode: encoding/json into a map, exactly as
+// the apiref miss path decodes the RESTAction's Status (rawExtensionToMap). An
+// empty body decodes to nil, as a nil body was served before #883.
+func decodeMemoBody(b []byte) (map[string]any, error) {
+	if len(b) == 0 {
+		return nil, nil
 	}
-	return mo.copyFn(val.Body), deps, val.Narrow, val.Stamp, val.Layers, true
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // seedMemoDepsMovedSince reports whether any dep saw a dep event after stamp,
@@ -283,48 +373,459 @@ func seedMemoDepsMovedSince(deps []DepKey, stamp uint64) bool {
 	return false
 }
 
-// Store records a JSON-native, caller-deep-copied resolved body under key,
-// fresh as of stamp (#411: the producer resolve's entry epoch —
-// cache.DepGenStartSeqFromContext, or DepGenEpochNow taken before the
-// producer's first read). The caller MUST deep-copy (plumbing/maps.DeepCopyJSON)
-// before Store so the stored snapshot is not aliased by the caller's live
-// result. Replacement is MONOTONE in stamp: an entry is replaced only by one
-// with a strictly later stamp (the fresh resolve that a stale hit turned into a
-// miss); an equal-or-older concurrent producer of the same tuple discards its
-// body (first-writer-wins among same-epoch producers, as before #411). A
-// later-stamped producer can therefore never be overwritten by an older one
-// racing it. nil-receiver-safe (no-op) so an uninstalled call site never stores.
-func (mo *SeedResolveMemo) Store(key string, snapshot map[string]any, deps []DepKey, stamp uint64) {
-	mo.StoreLayered(key, snapshot, deps, stamp, nil)
+// Store records the RESTAction's ENCODED resolved body (#883 F4: the JSON
+// bytes its miss path decodes) under key, fresh as of stamp (#411: the producer
+// resolve's entry epoch — cache.DepGenStartSeqFromContext, or DepGenEpochNow
+// taken before the producer's first read). The memo keeps the slice: the caller
+// must not mutate it after Store. Replacement is MONOTONE in stamp: an entry is
+// replaced only by one with a strictly later stamp; an equal-or-older concurrent
+// producer of the same tuple discards its body (first-writer-wins among
+// same-epoch producers, as before #411). nil-receiver-safe (no-op) so an
+// uninstalled call site never stores.
+func (mo *SeedResolveMemo) Store(key string, encoded []byte, deps []DepKey, stamp uint64) {
+	mo.StoreLayered(key, encoded, deps, stamp, nil)
 }
 
 // StoreLayered is Store plus the raKey versions the producing resolve sliced (#406).
-// Same monotone-in-stamp CAS replacement as Store.
-func (mo *SeedResolveMemo) StoreLayered(key string, snapshot map[string]any, deps []DepKey, stamp uint64, layers LayeredSources) {
-	mo.StoreLayeredWithStates(key, snapshot, deps, nil, stamp, layers)
+// Same monotone-in-stamp replacement as Store.
+func (mo *SeedResolveMemo) StoreLayered(key string, encoded []byte, deps []DepKey, stamp uint64, layers LayeredSources) {
+	mo.StoreLayeredWithStates(key, "", encoded, deps, nil, stamp, layers)
 }
 
 // StoreLayeredWithStates is StoreLayered plus the producer's per-edge interest
 // states (#765 B), index-aligned with deps.
-func (mo *SeedResolveMemo) StoreLayeredWithStates(key string, snapshot map[string]any, deps []DepKey, states []EdgeNarrowState, stamp uint64, layers LayeredSources) {
+//
+// #883 — an entry whose deps ALREADY moved past its stamp is removed right after
+// it is stored. The check must follow the insert, not precede it: a dep event
+// stamps its bucket and then re-judges the memo's entries (DropMoved), while
+// Store inserts and then reads the stamps, so whichever runs second sees the
+// other — a check before the insert could miss an event landing in between and
+// leave an unservable entry behind.
+//
+// consumer is the producer's L1 key: the entry is linked to it, and to every
+// hitter's (LoadLayeredWithStates), and lives while any of them is still in the
+// resolved cache (addConsumerLocked). "" links nothing.
+func (mo *SeedResolveMemo) StoreLayeredWithStates(key, consumer string, encoded []byte, deps []DepKey, states []EdgeNarrowState, stamp uint64, layers LayeredSources) {
 	if mo == nil {
 		return
 	}
-	nv := &seedMemoValue{Body: snapshot, Deps: deps, Stamp: stamp, Layers: layers, Narrow: states}
-	for {
-		cur, loaded := mo.m.LoadOrStore(key, nv)
-		if !loaded {
+	drainResolveMemoBucketGone()
+	nv := &seedMemoValue{Body: encoded, Deps: deps, Stamp: stamp, Layers: layers, Narrow: states}
+	mo.mu.Lock()
+	if cur := mo.m[key]; cur != nil {
+		if cur.Stamp >= stamp {
+			// An equal-or-fresher body is already memoised; it now serves this
+			// producer's L1 key too.
+			mo.addConsumerLocked(key, consumer)
+			mo.mu.Unlock()
 			return
 		}
-		cv, _ := cur.(*seedMemoValue)
-		if cv != nil && cv.Stamp >= stamp {
-			return // an equal-or-fresher body is already memoised
-		}
-		if mo.m.CompareAndSwap(key, cur, nv) {
-			return
-		}
-		// Lost a race with another Store; re-read and re-decide.
+		mo.unindexValueLocked(key, cur) // the fresher body serves the same L1 keys
 	}
+	mo.insertLocked(key, nv)
+	if !mo.addConsumerLocked(key, consumer) {
+		mo.mu.Unlock()
+		return
+	}
+	mo.mu.Unlock()
+	if seedMemoDepsMovedSince(deps, stamp) {
+		mo.mu.Lock()
+		if mo.m[key] == nv {
+			mo.removeLocked(key, nv)
+			resolveMemoDroppedMovedTotal.Add(1)
+		}
+		mo.mu.Unlock()
+	}
+}
+
+// insertLocked stores v under key and indexes it by each captured dep. mu held.
+func (mo *SeedResolveMemo) insertLocked(key string, v *seedMemoValue) {
+	if mo.m == nil {
+		mo.m = make(map[string]*seedMemoValue)
+	}
+	if mo.deps == nil {
+		mo.deps = make(map[schema.GroupVersionResource]*memoDepIndex)
+	}
+	mo.m[key] = v
+	d := Deps()
+	for _, dk := range v.Deps {
+		ix := mo.deps[dk.GVR]
+		if ix == nil {
+			ix = &memoDepIndex{byDep: make(map[DepKey]map[string]struct{}), floorJudged: make(map[DepKey]struct{})}
+			mo.deps[dk.GVR] = ix
+		}
+		keys := ix.byDep[dk]
+		if keys == nil {
+			keys = make(map[string]struct{})
+			ix.byDep[dk] = keys
+		}
+		keys[key] = struct{}{}
+		if d != nil && !d.hasBucket(dk) {
+			ix.floorJudged[dk] = struct{}{}
+		}
+	}
+	mo.entries.Add(1)
+	mo.bodyBytes.Add(int64(len(v.Body)))
+}
+
+// removeLocked deletes key (holding v), its dep index entries and its consumer
+// links. mu held.
+func (mo *SeedResolveMemo) removeLocked(key string, v *seedMemoValue) {
+	mo.unindexValueLocked(key, v)
+	mo.forgetConsumersLocked(key)
+}
+
+// unindexValueLocked deletes key's value and dep index entries but keeps its
+// consumer links — the Store that replaces a value with a fresher one serves the
+// same L1 keys. mu held.
+func (mo *SeedResolveMemo) unindexValueLocked(key string, v *seedMemoValue) {
+	delete(mo.m, key)
+	for _, dk := range v.Deps {
+		ix := mo.deps[dk.GVR]
+		if ix == nil {
+			continue
+		}
+		if keys := ix.byDep[dk]; keys != nil {
+			delete(keys, key)
+			if len(keys) == 0 {
+				delete(ix.byDep, dk)
+				delete(ix.floorJudged, dk)
+			}
+		}
+		if len(ix.byDep) == 0 {
+			delete(mo.deps, dk.GVR)
+		}
+	}
+	mo.entries.Add(-1)
+	mo.bodyBytes.Add(-int64(len(v.Body)))
+}
+
+// addConsumerLocked links key to the L1 key it is serving (#883, the #598 swap's
+// replacement). An entry lives exactly as long as at least one L1 key it served
+// is still held by the dep tracker — the tracker drops a key's edges exactly when
+// the resolved cache evicts or deletes it (RemoveL1Key, the store's only strip
+// funnel). So the link is checked AFTER it is made: if the consumer's edges are
+// already gone the eviction has already been logged before this link existed,
+// and the link is undone here; otherwise the eviction is still to come and its
+// log entry will find the link. "" (no L1 key on the resolve) links nothing.
+// Reports false when the entry was deleted because it serves no live key.
+func (mo *SeedResolveMemo) addConsumerLocked(key, consumer string) bool {
+	if consumer == "" {
+		return true
+	}
+	if mo.consumers == nil {
+		mo.consumers = make(map[string]map[string]struct{})
+		mo.byConsumer = make(map[string]map[string]struct{})
+	}
+	cs := mo.consumers[key]
+	if cs == nil {
+		cs = make(map[string]struct{})
+		mo.consumers[key] = cs
+	}
+	cs[consumer] = struct{}{}
+	ks := mo.byConsumer[consumer]
+	if ks == nil {
+		ks = make(map[string]struct{})
+		mo.byConsumer[consumer] = ks
+	}
+	ks[key] = struct{}{}
+	if d := Deps(); d != nil && !d.hasEdges(consumer) {
+		return !mo.unlinkConsumerLocked(key, consumer)
+	}
+	return true
+}
+
+// unlinkConsumerLocked removes one consumer link and deletes the entry when that
+// was its last live consumer. Reports whether the entry was deleted. mu held.
+func (mo *SeedResolveMemo) unlinkConsumerLocked(key, consumer string) bool {
+	if ks := mo.byConsumer[consumer]; ks != nil {
+		delete(ks, key)
+		if len(ks) == 0 {
+			delete(mo.byConsumer, consumer)
+		}
+	}
+	cs := mo.consumers[key]
+	if cs == nil {
+		return false
+	}
+	delete(cs, consumer)
+	if len(cs) > 0 {
+		return false
+	}
+	if v := mo.m[key]; v != nil {
+		mo.removeLocked(key, v)
+	} else {
+		delete(mo.consumers, key)
+	}
+	resolveMemoDroppedL1GoneTotal.Add(1)
+	return true
+}
+
+// forgetConsumersLocked drops every consumer link of key. mu held.
+func (mo *SeedResolveMemo) forgetConsumersLocked(key string) {
+	for c := range mo.consumers[key] {
+		if ks := mo.byConsumer[c]; ks != nil {
+			delete(ks, key)
+			if len(ks) == 0 {
+				delete(mo.byConsumer, c)
+			}
+		}
+	}
+	delete(mo.consumers, key)
+}
+
+// dropL1Gone handles the resolved cache having evicted or deleted l1Key: every
+// entry that served it loses that consumer, and an entry left serving no live
+// L1 key is deleted — nothing can reach it any more but a new resolve, which
+// stores afresh.
+func (mo *SeedResolveMemo) dropL1Gone(l1Key string) {
+	mo.mu.Lock()
+	defer mo.mu.Unlock()
+	keys := make([]string, 0, len(mo.byConsumer[l1Key]))
+	for k := range mo.byConsumer[l1Key] {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		mo.unlinkConsumerLocked(k, l1Key)
+	}
+}
+
+// dropMovedLocked re-judges every entry that captured one of cands with the
+// #411 predicate Load uses, and deletes the ones it finds stale. Returns how
+// many it deleted. mu held.
+func (mo *SeedResolveMemo) dropMovedLocked(ix *memoDepIndex, cands []DepKey) int {
+	var stale []string
+	for _, dk := range cands {
+		for key := range ix.byDep[dk] {
+			if v := mo.m[key]; v != nil && seedMemoDepsMovedSince(v.Deps, v.Stamp) {
+				stale = append(stale, key)
+			}
+		}
+	}
+	n := 0
+	for _, key := range stale {
+		if v := mo.m[key]; v != nil { // a key under two moved deps is listed twice
+			mo.removeLocked(key, v)
+			n++
+		}
+	}
+	return n
+}
+
+// dropMovedCoordinate handles one object event on (gvr, namespace, name): the
+// buckets bumpCoordinateGen stamped (coordinateBuckets) and every
+// floor-judged dep of the GVR, whose floor the same event raised.
+func (mo *SeedResolveMemo) dropMovedCoordinate(gvr schema.GroupVersionResource, namespace, name string) int {
+	mo.mu.Lock()
+	defer mo.mu.Unlock()
+	ix := mo.deps[gvr]
+	if ix == nil {
+		return 0
+	}
+	stamped, ns := coordinateBuckets(gvr, namespace, name)
+	cands := make([]DepKey, 0, ns+len(ix.floorJudged))
+	for _, dk := range stamped[:ns] {
+		if _, ok := ix.byDep[dk]; ok {
+			cands = append(cands, dk)
+		}
+	}
+	for dk := range ix.floorJudged {
+		cands = append(cands, dk)
+	}
+	return mo.dropMovedLocked(ix, cands)
+}
+
+// dropMovedType handles a type-level event on gvr (bumpResourceTypeGen): it
+// stamps every bucket of the GVR (or every LIST bucket) and raises the floor,
+// so every dep of the GVR is re-judged.
+func (mo *SeedResolveMemo) dropMovedType(gvr schema.GroupVersionResource) int {
+	mo.mu.Lock()
+	defer mo.mu.Unlock()
+	ix := mo.deps[gvr]
+	if ix == nil {
+		return 0
+	}
+	cands := make([]DepKey, 0, len(ix.byDep))
+	for dk := range ix.byDep {
+		cands = append(cands, dk)
+	}
+	return mo.dropMovedLocked(ix, cands)
+}
+
+// dropBucketGone handles the tracker having pruned dk's bucket: from then on the
+// GVR floor judges dk, and that floor may ALREADY be past an entry's stamp
+// (raised by an event on another coordinate of the GVR), so the entries holding
+// dk are re-judged, and dk joins the floor-judged set for the events to come.
+func (mo *SeedResolveMemo) dropBucketGone(dk DepKey) int {
+	mo.mu.Lock()
+	defer mo.mu.Unlock()
+	ix := mo.deps[dk.GVR]
+	if ix == nil {
+		return 0
+	}
+	if _, ok := ix.byDep[dk]; !ok {
+		return 0
+	}
+	ix.floorJudged[dk] = struct{}{}
+	return mo.dropMovedLocked(ix, []DepKey{dk})
+}
+
+// resolveMemoMoveSubscribers holds the memos the dep tracker re-judges on every
+// dep move (TrackDepMoves). One or two at a time: the refresher's process-held
+// memo and a seed pass's memo while that pass runs. resolveMemoTracked counts
+// them so a pruned bucket costs one atomic load when no memo is tracked.
+var (
+	resolveMemoMoveSubscribers sync.Map // *SeedResolveMemo -> struct{}
+	resolveMemoTracked         atomic.Int64
+)
+
+// TrackDepMoves makes the dep tracker delete mo's entries as their deps move
+// (#883 F4), whether or not anyone looks them up again. The returned func stops
+// it (UntrackDepMoves); call it when mo is dropped, or the registry keeps the
+// memo alive. nil-safe.
+func TrackDepMoves(mo *SeedResolveMemo) (untrack func()) {
+	if mo == nil {
+		return func() {}
+	}
+	if _, loaded := resolveMemoMoveSubscribers.LoadOrStore(mo, struct{}{}); !loaded {
+		resolveMemoTracked.Add(1)
+	}
+	return func() { UntrackDepMoves(mo) }
+}
+
+// UntrackDepMoves stops TrackDepMoves for mo. nil-safe and idempotent.
+func UntrackDepMoves(mo *SeedResolveMemo) {
+	if mo == nil {
+		return
+	}
+	if _, loaded := resolveMemoMoveSubscribers.LoadAndDelete(mo); loaded {
+		resolveMemoTracked.Add(-1)
+	}
+}
+
+// notifyResolveMemosCoordinateMoved is called by bumpCoordinateGen after it
+// stamped the event's buckets and floor — before the dirty-mark fan-out.
+func notifyResolveMemosCoordinateMoved(gvr schema.GroupVersionResource, namespace, name string) {
+	drainResolveMemoBucketGone()
+	resolveMemoMoveSubscribers.Range(func(k, _ any) bool {
+		if n := k.(*SeedResolveMemo).dropMovedCoordinate(gvr, namespace, name); n > 0 {
+			resolveMemoDroppedMovedTotal.Add(uint64(n))
+		}
+		return true
+	})
+}
+
+// notifyResolveMemosTypeMoved is called by bumpResourceTypeGen after its stamps.
+func notifyResolveMemosTypeMoved(gvr schema.GroupVersionResource) {
+	drainResolveMemoBucketGone()
+	resolveMemoMoveSubscribers.Range(func(k, _ any) bool {
+		if n := k.(*SeedResolveMemo).dropMovedType(gvr); n > 0 {
+			resolveMemoDroppedMovedTotal.Add(uint64(n))
+		}
+		return true
+	})
+}
+
+// The tracker log: L1 keys the resolved cache removed, and the dep buckets that
+// removal pruned. Both come from RemoveL1Key, which the resolved-cache store
+// calls while it holds its own lock — the lock every customer read takes. So
+// the tracker never touches a memo there: it records here (a leaf lock held for
+// one set insert) and the memos act on it at the next dep event or the next
+// memo Load / Store, on the informer or refresher goroutine. A customer
+// therefore never waits on memo work.
+//
+// SETS, NOT LOGS: acting on a coordinate or an L1 key is idempotent, so the same
+// one pruned or removed again before a drain adds nothing. Between two drains
+// the pending state is therefore bounded by the distinct coordinates and keys
+// the tracker actually dropped, however often it dropped them.
+var (
+	bucketGoneMu      sync.Mutex
+	bucketGoneSet     map[DepKey]struct{}
+	l1GoneSet         map[string]struct{}
+	bucketGonePending atomic.Int64
+)
+
+// notifyResolveMemosBucketGone is called after the tracker deleted dk's bucket.
+func notifyResolveMemosBucketGone(dk DepKey) {
+	if resolveMemoTracked.Load() == 0 {
+		return // no memo to judge it: nothing may accumulate here
+	}
+	bucketGoneMu.Lock()
+	if bucketGoneSet == nil {
+		bucketGoneSet = make(map[DepKey]struct{})
+	}
+	bucketGoneSet[dk] = struct{}{}
+	bucketGonePending.Store(int64(len(bucketGoneSet) + len(l1GoneSet)))
+	bucketGoneMu.Unlock()
+}
+
+// pendingTrackerDropsForTest reports how many distinct bucket coordinates and
+// L1 keys are waiting for the next drain.
+func pendingTrackerDropsForTest() (buckets, l1Keys int) {
+	bucketGoneMu.Lock()
+	defer bucketGoneMu.Unlock()
+	return len(bucketGoneSet), len(l1GoneSet)
+}
+
+// notifyResolveMemosL1Gone is called after the tracker dropped l1Key's edges —
+// i.e. after the resolved cache evicted or deleted l1Key (#883: the memo entries
+// that served only that key can never be reached again).
+func notifyResolveMemosL1Gone(l1Key string) {
+	if resolveMemoTracked.Load() == 0 {
+		return
+	}
+	bucketGoneMu.Lock()
+	if l1GoneSet == nil {
+		l1GoneSet = make(map[string]struct{})
+	}
+	l1GoneSet[l1Key] = struct{}{}
+	bucketGonePending.Store(int64(len(bucketGoneSet) + len(l1GoneSet)))
+	bucketGoneMu.Unlock()
+}
+
+// drainResolveMemoBucketGone hands every logged L1 removal (dropL1Gone) and
+// bucket prune (dropBucketGone) to every tracked memo. One atomic load when the
+// log is empty.
+func drainResolveMemoBucketGone() {
+	if bucketGonePending.Load() == 0 {
+		return
+	}
+	bucketGoneMu.Lock()
+	buckets, l1s := bucketGoneSet, l1GoneSet
+	bucketGoneSet, l1GoneSet = nil, nil
+	bucketGonePending.Store(0)
+	bucketGoneMu.Unlock()
+	resolveMemoMoveSubscribers.Range(func(k, _ any) bool {
+		mo := k.(*SeedResolveMemo)
+		for l1 := range l1s {
+			mo.dropL1Gone(l1)
+		}
+		n := 0
+		for dk := range buckets {
+			n += mo.dropBucketGone(dk)
+		}
+		if n > 0 {
+			resolveMemoDroppedMovedTotal.Add(uint64(n))
+		}
+		return true
+	})
+}
+
+// Entries is the #883 gauge: how many bodies the memo holds. nil-safe.
+func (mo *SeedResolveMemo) Entries() int64 {
+	if mo == nil {
+		return 0
+	}
+	return mo.entries.Load()
+}
+
+// BodyBytes is the #883 gauge: the summed size of the stored encoded bodies.
+// nil-safe.
+func (mo *SeedResolveMemo) BodyBytes() int64 {
+	if mo == nil {
+		return 0
+	}
+	return mo.bodyBytes.Load()
 }
 
 // StaleMisses returns how many lookups found an entry whose captured deps had
@@ -350,12 +851,10 @@ func (mo *SeedResolveMemo) Stats() (hits, misses uint64) {
 	return mo.hits, mo.misses
 }
 
-// NewSeedResolveMemo builds a memo with the given deep-copy function. copyFn is
-// applied to a stored map on every Load hit so callers never alias the stored
-// snapshot. Production passes plumbing/maps.DeepCopyJSON (injected from the
-// apiref seam to keep the resolver util out of the cache package's imports).
-func NewSeedResolveMemo(copyFn func(map[string]any) map[string]any) *SeedResolveMemo {
-	return &SeedResolveMemo{copyFn: copyFn}
+// NewSeedResolveMemo builds an empty memo. A hit decodes the stored encoded
+// body (#883 F4), so no copy function is needed: every caller gets its own map.
+func NewSeedResolveMemo() *SeedResolveMemo {
+	return &SeedResolveMemo{}
 }
 
 // WithSeedResolveMemo returns a child context carrying memo. Installed by the

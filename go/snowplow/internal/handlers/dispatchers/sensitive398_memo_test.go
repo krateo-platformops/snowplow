@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,7 +44,7 @@ func TestS398_SeedMemoHitStillDeclinesSecret(t *testing.T) {
 	srv := psFakeAPIServer(t, a, k423Counters())
 	psSeedClientconfigs(t, srv.URL)
 
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 	base := cache.WithSeedResolveMemo(context.Background(), memo)
 	cohort := withCohortSeedContext(base, seedTarget{Username: psAlice, Groups: psGroups(a)},
 		endpoints.Endpoint{ServerURL: srv.URL, Token: "tok-sa"}, &rest.Config{Host: srv.URL, BearerToken: "tok-sa"})

@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -26,9 +25,9 @@ func TestSeedResolveMemo411_StaleEntryIsMiss(t *testing.T) {
 	listDep := DepKey{GVR: memo411GVR, Namespace: ns, Name: listWildcard}
 	d.RecordList(t.Context(), "L1_411_producer", memo411GVR, ns) // bucket exists
 
-	m := NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	m := NewSeedResolveMemo()
 	stamp := DepGenEpochNow()
-	m.Store("k", map[string]any{"v": "OLD"}, []DepKey{listDep}, stamp)
+	m.Store("k", memoBody(map[string]any{"v": "OLD"}), []DepKey{listDep}, stamp)
 	if _, _, _, ok := m.Load("k"); !ok {
 		t.Fatal("no dep event since the stamp: the entry must be served")
 	}
@@ -43,7 +42,7 @@ func TestSeedResolveMemo411_StaleEntryIsMiss(t *testing.T) {
 	// Cold coordinate (no bucket): the per-GVR floor decides.
 	cold := DepKey{GVR: schema.GroupVersionResource{Group: "x.io", Version: "v1", Resource: "things"}, Namespace: ns, Name: "t"}
 	stamp2 := DepGenEpochNow()
-	m.Store("cold", map[string]any{"v": 1}, []DepKey{cold}, stamp2)
+	m.Store("cold", memoBody(map[string]any{"v": 1}), []DepKey{cold}, stamp2)
 	if _, _, _, ok := m.Load("cold"); !ok {
 		t.Fatal("cold dep, no event on its GVR: must be served")
 	}
@@ -58,17 +57,17 @@ func TestSeedResolveMemo411_StaleEntryIsMiss(t *testing.T) {
 // fresher entry; an equal-stamp producer keeps first-writer-wins.
 func TestSeedResolveMemo411_ReplaceIsMonotone(t *testing.T) {
 	ResetDepsForTest()
-	m := NewSeedResolveMemo(pmaps.DeepCopyJSON)
-	m.Store("k", map[string]any{"v": "A"}, nil, 5)
-	m.Store("k", map[string]any{"v": "A2"}, nil, 5) // equal stamp: first writer wins
+	m := NewSeedResolveMemo()
+	m.Store("k", memoBody(map[string]any{"v": "A"}), nil, 5)
+	m.Store("k", memoBody(map[string]any{"v": "A2"}), nil, 5) // equal stamp: first writer wins
 	if b, _, _, _ := m.Load("k"); b["v"] != "A" {
 		t.Fatalf("equal-stamp Store replaced the entry: %v", b)
 	}
-	m.Store("k", map[string]any{"v": "B"}, nil, 9) // fresher: replaces
+	m.Store("k", memoBody(map[string]any{"v": "B"}), nil, 9) // fresher: replaces
 	if b, _, _, _ := m.Load("k"); b["v"] != "B" {
 		t.Fatalf("a fresher Store must replace the entry: %v", b)
 	}
-	m.Store("k", map[string]any{"v": "C"}, nil, 7) // older: discarded
+	m.Store("k", memoBody(map[string]any{"v": "C"}), nil, 7) // older: discarded
 	if b, _, _, _ := m.Load("k"); b["v"] != "B" {
 		t.Fatalf("an OLDER-stamped Store overwrote a fresher entry: %v", b)
 	}
@@ -85,7 +84,7 @@ func TestSeedResolveMemo411_ConcurrentLoadStoreBump_Race(t *testing.T) {
 	ns := "ns-411-race"
 	d.RecordList(t.Context(), "L1_411_race", memo411GVR, ns)
 	dep := DepKey{GVR: memo411GVR, Namespace: ns, Name: listWildcard}
-	m := NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	m := NewSeedResolveMemo()
 
 	var wg sync.WaitGroup
 	var maxMu sync.Mutex
@@ -109,7 +108,7 @@ func TestSeedResolveMemo411_ConcurrentLoadStoreBump_Race(t *testing.T) {
 					maxStamp = s
 				}
 				maxMu.Unlock()
-				m.Store(key, pmaps.DeepCopyJSON(map[string]any{"stamp": float64(s)}), []DepKey{dep}, s)
+				m.Store(key, memoBody(map[string]any{"stamp": float64(s)}), []DepKey{dep}, s)
 			}
 		}(g)
 	}
@@ -125,7 +124,7 @@ func TestSeedResolveMemo411_ConcurrentLoadStoreBump_Race(t *testing.T) {
 	// After the storm, a Store at the current epoch (≥ every bump) must be the
 	// served entry: monotone replacement converges on the freshest producer.
 	now := DepGenEpochNow()
-	m.Store("k0", map[string]any{"stamp": float64(now)}, []DepKey{dep}, now)
+	m.Store("k0", memoBody(map[string]any{"stamp": float64(now)}), []DepKey{dep}, now)
 	b, _, _, ok := m.Load("k0")
 	if !ok || b["stamp"] != float64(now) {
 		t.Fatalf("after the storm the freshest producer's entry must be served: ok=%v body=%v (maxStamp=%d now=%d)", ok, b, maxStamp, now)

@@ -1135,6 +1135,7 @@ func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk De
 		// check-then-delete race is the identical benign one accepted there.
 		if !loadedBucket && ks.count.Load() == 0 && d.forward.CompareAndDelete(dk, ks) {
 			d.coordinates.Add(-1)
+			notifyResolveMemosBucketGone(dk) // #883 F4 — the GVR floor judges dk now
 		}
 		if d.capWarned.CompareAndSwap(false, true) {
 			slog.Warn("deps.record.cap_reached",
@@ -1194,20 +1195,54 @@ func (d *DepTracker) bumpCoordinateGen(gvr schema.GroupVersionResource, namespac
 	// bucket created after this point by a racing recordInternal inherits s (see there).
 	fI, _ := d.gvrLastBump.LoadOrStore(gvr, new(atomic.Uint64))
 	storeMaxSeq(fI.(*atomic.Uint64), s)
-	stamp := func(dk DepKey) {
+	buckets, n := coordinateBuckets(gvr, namespace, name)
+	for _, dk := range buckets[:n] {
 		if ksI, ok := d.forward.Load(dk); ok {
 			storeMaxSeq(&ksI.(*keySet).lastBumpSeq, s)
 		}
 	}
-	stamp(DepKey{GVR: gvr, Namespace: namespace, Name: name})
-	if namespace != "" {
-		stamp(DepKey{GVR: gvr, Namespace: "", Name: name})
-	}
-	stamp(DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
-	if namespace != "" {
-		stamp(DepKey{GVR: gvr, Namespace: "", Name: listWildcard})
-	}
 	fireDepBumpHook("after_store") // test seam (nil in prod): the R2 [Store→mark] window
+	// #883 F4 — the resolve memos drop every entry this move made unservable,
+	// judged by the same depMovedSince Load uses, now that the stamps are in.
+	notifyResolveMemosCoordinateMoved(gvr, namespace, name)
+}
+
+// coordinateBuckets is the bucket set one object event on (gvr, namespace, name)
+// stamps — exact + ns-wildcard + list-wildcard, mirroring collectMatchesWithDep's
+// addAll set. Shared by bumpCoordinateGen and the #883 memo drop so the two can
+// never disagree about which deps an event moved.
+func coordinateBuckets(gvr schema.GroupVersionResource, namespace, name string) ([4]DepKey, int) {
+	var out [4]DepKey
+	n := 0
+	out[n] = DepKey{GVR: gvr, Namespace: namespace, Name: name}
+	n++
+	if namespace != "" {
+		out[n] = DepKey{GVR: gvr, Namespace: "", Name: name}
+		n++
+	}
+	out[n] = DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard}
+	n++
+	if namespace != "" {
+		out[n] = DepKey{GVR: gvr, Namespace: "", Name: listWildcard}
+		n++
+	}
+	return out, n
+}
+
+// hasEdges reports whether the tracker still holds edges recorded under l1Key —
+// true from the key's first Record until RemoveL1Key, which the resolved cache
+// calls when it evicts or deletes the key (#883: the memo's liveness test for
+// the L1 keys an entry serves).
+func (d *DepTracker) hasEdges(l1Key string) bool {
+	_, ok := d.reverse.Load(l1Key)
+	return ok
+}
+
+// hasBucket reports whether dk has a forward bucket — i.e. whether
+// depMovedSince judges it by its own lastBumpSeq rather than the GVR floor.
+func (d *DepTracker) hasBucket(dk DepKey) bool {
+	_, ok := d.forward.Load(dk)
+	return ok
 }
 
 // depBumpHook is a test-build seam (nil in production) fired inside bumpCoordinateGen at
@@ -1254,6 +1289,7 @@ func (d *DepTracker) bumpResourceTypeGen(gvr schema.GroupVersionResource, listOn
 		return true
 	})
 	fireDepBumpHook("after_store")
+	notifyResolveMemosTypeMoved(gvr) // #883 F4 — see bumpCoordinateGen
 }
 
 // gvrLastBumpSeq returns the per-GVR floor (#375 fix ii): the seq of the last dep event
@@ -2452,6 +2488,9 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 	if !ok {
 		return
 	}
+	// #883 — the resolved cache evicted or deleted l1Key (this is its only strip
+	// funnel): the resolve memo entries that served only this key go with it.
+	notifyResolveMemosL1Gone(l1Key)
 	ds := dsI.(*depSet)
 	ds.deps.Range(func(k, _ any) bool {
 		dk := k.(DepKey)
@@ -2471,6 +2510,8 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 					// the coordinate's disappearance.
 					if d.forward.CompareAndDelete(dk, ks) {
 						d.coordinates.Add(-1)
+						// #883 F4 — the GVR floor judges dk from now on.
+						notifyResolveMemosBucketGone(dk)
 					}
 				}
 			}

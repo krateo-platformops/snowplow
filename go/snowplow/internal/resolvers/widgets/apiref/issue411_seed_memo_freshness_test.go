@@ -32,7 +32,6 @@ import (
 	"testing"
 	"time"
 
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
@@ -95,7 +94,7 @@ func i411Setup(t *testing.T, raName string) *i411Fixture {
 	f := &i411Fixture{
 		t: t, gRA: gRA, backing: backing, raName: raName, marker: &marker,
 		base:   f6CtxWithUser(t, "admin", []string{"system:masters"}),
-		memo:   cache.NewSeedResolveMemo(pmaps.DeepCopyJSON),
+		memo:   cache.NewSeedResolveMemo(),
 		marked: map[string]bool{},
 		dyn:    dyn,
 	}

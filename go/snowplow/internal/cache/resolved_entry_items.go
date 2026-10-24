@@ -80,7 +80,9 @@ func ResetLazyItemsStatsForTest() {
 //     without draining the cache.
 //  2. An already-published memo is returned as-is — the steady-state path,
 //     one atomic load.
-//  3. Otherwise `parse` runs against RawJSON and the result is CAS-published.
+//  3. Otherwise exactly one caller runs `parse` against RawJSON and publishes
+//     the result; concurrent first readers wait for it and return the same
+//     published value (#883 F3).
 //
 // `parse` is injected because parseListEnvelope lives in the api package (it
 // needs the GVR to synthesize a missing apiVersion/kind); this package must not
@@ -117,25 +119,40 @@ func (e *ResolvedEntry) EnsureItems(
 	if parse == nil || len(e.RawJSON) == 0 {
 		return nil, "", "", false
 	}
-	// 3. Materialise. A racing caller may do the same work; the CAS decides
-	// which private tree becomes the shared one, and the Load below makes
-	// every caller return THAT tree rather than its own.
+	// 3. Materialise — exactly once per entry (#883 F3). The slow path enters
+	// the entry's parse lock; the first caller parses and publishes, every
+	// concurrent first reader blocks here and then returns THAT published value
+	// rather than starting a parse of its own. Re-checking the memo under the
+	// lock is what turns a waiter into a reader of the parser's result.
+	fireEnsureItemsSlowPathHook()
+	e.itemsParseMu.Lock()
+	defer e.itemsParseMu.Unlock()
+	if p := e.itemsLazy.Load(); p != nil {
+		lazyItemsServedTotal.Add(1)
+		return p.items, p.apiVersion, p.kind, p.ok
+	}
 	items, apiVersion, kind, ok := parse(e.RawJSON)
 	lazyItemsParsedTotal.Add(1)
-	e.itemsLazy.CompareAndSwap(nil, &lazyListItems{
+	e.itemsLazy.Store(&lazyListItems{
 		items:      items,
 		apiVersion: apiVersion,
 		kind:       kind,
 		ok:         ok,
 	})
-	p := e.itemsLazy.Load()
-	if p == nil {
-		// Unreachable: the CAS either stored our value or found another.
-		// Returning the local result keeps the method total rather than
-		// nil-panicking if that ever changes.
-		return items, apiVersion, kind, ok
+	return items, apiVersion, kind, ok
+}
+
+// ensureItemsSlowPathHook is a test seam (nil in production): fired by every
+// EnsureItems caller that found no published memo, BEFORE it enters the parse
+// lock. The #883 F3 falsifier counts these entries to know that every one of
+// its N concurrent first readers is past the memo check, so a parse fn that
+// waits for all N proves whether the N readers ran N parses or one.
+var ensureItemsSlowPathHook atomic.Pointer[func()]
+
+func fireEnsureItemsSlowPathHook() {
+	if fn := ensureItemsSlowPathHook.Load(); fn != nil {
+		(*fn)()
 	}
-	return p.items, p.apiVersion, p.kind, p.ok
 }
 
 // HasMaterialisedItems reports whether this entry already carries pre-parsed

@@ -92,25 +92,35 @@ func TestI598_Arm3_MemoIsSharedAcrossResolves(t *testing.T) {
 	}
 }
 
-// ARM4 — the bound is DERIVED from the live cell count, and absent when there
-// are no cells. A hardcoded cap would pass ARM3 and fail this.
-func TestI598_Arm4_BoundIsDerivedFromLiveEntryCount(t *testing.T) {
+// ARM4 — #883 replaced #598's derived bound (a wholesale swap once cumulative
+// misses exceeded the live resolved-cache entry count) with the memo's own
+// signals: dep moves and L1 removal. So the memo is never swapped, however many
+// misses it takes against however few live cells — what bounds it now is
+// pinned by cache.TestIssue883_MemoNeverOutgrowsLiveServableKeys. Re-adding the
+// swap turns this RED.
+func TestI598_Arm4_MemoIsNeverSwapped(t *testing.T) {
 	cacheOnForMemo(t)
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	resetRefreshMemoForTest()
+	t.Cleanup(resetRefreshMemoForTest)
+	cache.ResetResolvedCacheForTest()
+	t.Cleanup(cache.ResetResolvedCacheForTest)
+	store := cache.ResolvedCache()
+	if store == nil {
+		t.Fatal("harness: no resolved cache under CACHE_ENABLED")
+	}
+	store.Put("L1_598_arm4_cell", &cache.ResolvedEntry{RawJSON: []byte(`{}`)})
+	if n := cache.ResolvedCacheStatsByStat()["entries"]; n < 1 {
+		t.Fatalf("harness: the published cache reports %d entries; the arm needs a live cell so the old swap bound would be in force", n)
+	}
 
-	// With no published cache there are no entries, so no bound may be applied —
-	// otherwise a cold process would swap its memo on every resolve.
-	if cap := refreshMemoCap(); cap != 0 {
-		t.Fatalf("#598 ARM4 VIOLATED: refreshMemoCap() = %d with no live cache; want 0 "+
-			"(no bound). A non-zero cap here means the bound is an invented constant rather "+
-			"than the live entry count.", cap)
-	}
-	before := RefreshMemoSwaps()
-	for i := 0; i < 50; i++ {
-		refreshResolveMemo()
-	}
-	if got := RefreshMemoSwaps() - before; got != 0 {
-		t.Fatalf("#598 ARM4 VIOLATED: %d memo swaps with no bound in force; want 0", got)
+	m := refreshResolveMemo()
+	for i := 0; i < 50; i++ { // 50 misses against 1 live cell
+		m.Load("k-598-arm4-" + string(rune('a'+i%26)) + string(rune('a'+i/26)))
+		if got := refreshResolveMemo(); got != m {
+			t.Fatalf("#883 ARM4 VIOLATED: the refresher memo was swapped after %d misses — "+
+				"the memo must be bounded by its own signals, not replaced wholesale", i+1)
+		}
 	}
 }
 
@@ -119,7 +129,7 @@ func TestI598_Arm4_BoundIsDerivedFromLiveEntryCount(t *testing.T) {
 // because #598 widens WHO holds a memo, and a reader of this file should see the
 // property restated at the new call site rather than have to find it in F4.
 func TestI598_Arm5_IdentityNeverCollapses(t *testing.T) {
-	memo := cache.NewSeedResolveMemo(nil)
+	memo := cache.NewSeedResolveMemo()
 	kAlice := memo.Key("krateo-system", "incident-detail", "alice", []string{"devs"}, "cls", "x", -1, -1)
 	kBob := memo.Key("krateo-system", "incident-detail", "bob", []string{"devs"}, "cls", "x", -1, -1)
 	kAliceOps := memo.Key("krateo-system", "incident-detail", "alice", []string{"ops"}, "cls", "x", -1, -1)
@@ -140,7 +150,7 @@ func TestI598_Arm5_IdentityNeverCollapses(t *testing.T) {
 }
 
 // resetRefreshMemoForTest drops the process memo so an arm starts clean.
-func resetRefreshMemoForTest() { refreshMemo.Store(nil) }
+func resetRefreshMemoForTest() { cache.UntrackDepMoves(refreshMemo.Swap(nil)) }
 
 func cacheOnForMemo(t *testing.T) {
 	t.Helper()
