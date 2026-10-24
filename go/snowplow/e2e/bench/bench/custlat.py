@@ -66,10 +66,15 @@ Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
     excluded the two bars are the one bar of before;
   - where B's sampler saw nothing with no restart signal — a gap over twice
     its interval between two Ready samples, or no reply to readyz (readyz 0)
-    — k6 is the witness: errors over its 1 % bar there FAIL B (not Ready);
-    requests served within it keep the stretch as jointly-Ready time (its
-    calls judged, its errors counted); a gap without a single k6 request
-    voids. B's sampler missing at either end of k6's span voids. A's such
+    — k6 is the witness. Every request in flight during the stretch counts
+    (start = completion - its duration), and a request is not served if it
+    failed or waited past the readiness probe's own HTTP timeout (the run's
+    mem_start http_timeout_s, else load606.HTTP_TIMEOUT_S: the no-reply test
+    that gave readyz 0). Not served over k6's 1 % bar FAILs B (not Ready);
+    served within it keeps the stretch as jointly-Ready time (its calls
+    judged, its errors counted). Not one request in flight: no readyz reply
+    -> FAIL (both witnesses say B was not serving); a gap -> void. B's
+    sampler missing at either end of k6's span voids. A's such
     stretches stay excluded from both runs. (The 2x threshold now only
     decides what k6 must witness for B and what is cut for A; a sampler-own
     stall measure would need mem606 to time each request: not done);
@@ -564,8 +569,15 @@ def readiness(mem: list[dict], pods: list[dict] | None, span) -> dict:
                          f"stretch of the readiness samples")
     if pod["record"] == "replaced" and not in_samples:
         unlocated.append("the pod was replaced during measure and no readiness sample shows when")
+    # readyz 0 = no reply within the probe's own HTTP timeout: the run's
+    # mem_start records it (mem606 since #891), else load606's HttpClient
+    # default, which memwatch's client uses
+    probe_timeout = start.get("http_timeout_s")
     return {"signal": "mem606 /readyz samples (+ prewarm_complete, counter resets); pod records",
             "interval_s": interval, "samples": len(rows), "ready_samples": sum(1 for r in rows if _ready(r)),
+            "probe_timeout_s": probe_timeout or load606.HTTP_TIMEOUT_S,
+            "probe_timeout_from": ("mem_start.http_timeout_s" if probe_timeout
+                                   else "load606.HTTP_TIMEOUT_S (memwatch's HttpClient default)"),
             "excluded": ex,
             "restarts": {"restarted": count > 0, "count": count, "in_samples": in_samples, "pod": pod,
                          "last_termination": lt, "unlocated": unlocated}}
@@ -585,6 +597,21 @@ def requests(o: dict | None) -> list[tuple[float, bool]]:
     ts = (o.get("times") or {}).get("http_req_failed") or []
     return [(ts[i], bool(v)) for i, (v, _) in enumerate(o["points"].get("http_req_failed", []))
             if i < len(ts) and ts[i] is not None]
+
+
+def request_spans(o: dict | None) -> list[tuple[float, float, bool, float]] | None:
+    """k6's requests as (start, completion, failed, ms): the i-th
+    http_req_duration and the i-th http_req_failed point are one request (k6
+    writes a request's samples together, at one time; run 15: 2,470,654 of
+    2,470,654 paired). None when the two do not pair up by time."""
+    if not o:
+        return []
+    pd, pf = o["points"].get("http_req_duration", []), o["points"].get("http_req_failed", [])
+    td, tf = (o.get("times") or {}).get("http_req_duration") or [], (o.get("times") or {}).get("http_req_failed") or []
+    if not (len(pd) == len(pf) == len(td) == len(tf)) or any(a != b for a, b in zip(td, tf)):
+        return None
+    return [(t - v / 1000.0, t, bool(f), v) for (v, _), (f, _), t in zip(pd, pf, td)
+            if t is not None and v is not None]
 
 
 def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[dict] | None,
@@ -777,7 +804,7 @@ def _ex_text(e: dict) -> str:
 def raw_from_dir(d: str) -> dict:
     """One run's k6 calls and requests from its collected dir (run606's $OUT)."""
     o = k6eval.read_k6_out(os.path.join(d, "k6"), "k6")
-    return {"calls": calls(o), "requests": requests(o)}
+    return {"calls": calls(o), "requests": requests(o), "spans": request_spans(o)}
 
 
 def _rate(reqs, ex) -> dict:
@@ -895,17 +922,33 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
         ready_again, no_witness = [], []
         if cand["witness"]:
             rwb = get_raw("b")
+            spans = (rwb or {}).get("spans")
+            # not served: failed, or no reply within the readiness probe's own
+            # timeout — the same no-reply test that gave readyz 0
+            tmo = float((rdb or {}).get("probe_timeout_s") or load606.HTTP_TIMEOUT_S)
             for e in cand["witness"]:
                 if rwb is None:
                     continue                                   # raw_calls[b] voids already
-                reqs = [f for t, f in rwb["requests"] if e["t0"] <= t < e["t1"]]
-                n, k = len(reqs), sum(reqs)
-                w = dict(e, k6={"requests": n, "failed": k, "rate": round(k / n, 6) if n else None})
-                seen = f"k6 saw {k} of {n} requests fail in it ({w['k6']['rate']})"
+                if spans is None:
+                    no_witness.append(dict(e, why=f"{e['why']}; k6's duration and failed points do not pair "
+                                                  f"up: no witness"))
+                    continue
+                # every request in flight during the stretch (start = completion - duration)
+                ov = [f or ms > tmo * 1000 for s, t, f, ms in spans if s < e["t1"] and t > e["t0"]]
+                n, k = len(ov), sum(ov)
+                w = dict(e, k6={"requests": n, "not_served": k, "rate": round(k / n, 6) if n else None,
+                                "timeout_s": tmo})
+                seen = (f"k6 had {n} requests in flight in it, {k} not served (failed, or no reply within the "
+                        f"probe's {tmo} s) ({w['k6']['rate']})")
                 if n and k / n > th:
                     nr.append(dict(w, why=f"{e['why']}; {seen}: over the {th} bar, so B was not serving"))
-                elif n or e["kind"] == "not_ready":
+                elif n:
                     ready_again.append(dict(w, why=f"{e['why']}; {seen}: within the {th} bar"))
+                elif e["kind"] == "not_ready":
+                    # readyz had no reply AND k6 had not one request in flight:
+                    # both witnesses say B was not serving
+                    nr.append(dict(w, why=f"{e['why']}; not one k6 request in flight in it either: "
+                                          f"B was not serving"))
                 else:
                     no_witness.append(dict(w, why=f"{e['why']}; not one k6 request in it: no witness"))
         out["b_witnessed_ready"] = [{k: e[k] for k in ("t0", "t1", "seconds", "kind", "why", "k6")}

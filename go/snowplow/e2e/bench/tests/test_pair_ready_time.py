@@ -447,7 +447,7 @@ def test_synthetic_b_readyz_no_reply_k6_is_the_witness(tmp_path):
     c = p["candidate_not_ready"]
     assert p["verdict"] == "FAIL" and c["result"] == "FAIL"
     (st,) = c["value"]["stretches"]
-    assert st["k6"]["rate"] > 0.01 and "k6 saw" in st["why"] and "over the 0.01 bar" in st["why"]
+    assert st["k6"]["rate"] > 0.01 and "k6 had" in st["why"] and "over the 0.01 bar" in st["why"]
     p = _arms(tmp_path / "ok", P14, down)
     assert p["verdict"] == "PASS" and p["candidate_not_ready"]["result"] == "PASS"
     assert p["exclusion"]["items"] == []                     # not cut from either run
@@ -1017,3 +1017,122 @@ def test_run606_pair_logs_fail_note_excluded_lines(pairbed, case):  # noqa: F811
         assert "FAIL: customer_latency.pair.candidate_restarts" in log
         assert "EXCLUDED from both runs: B restart #1" in log
         assert "paired verdict exit=1" in log
+
+
+# ─── re-review of e94f2da9: what k6 witnesses inside B's sampler-blind stretch ─
+
+def _window(doc, lo_abs, hi_abs):
+    """(last Ready sample <= lo, first Ready sample >= hi), absolute epochs."""
+    rows = sorted((r for r in doc["mem"] if r["kind"] == "mem"), key=lambda r: r["t"])
+    w0 = max(r["t"] for r in rows if r["t"] <= lo_abs and r.get("readyz") == 200)
+    w1 = min(r["t"] for r in rows if r["t"] >= hi_abs and r.get("readyz") == 200)
+    return w0, w1
+
+
+def _hang(doc, h0, h1, release, *, fail=False, every=1):
+    """B hung over [h0, h1) (absolute): every `every`-th call / request completing
+    there completes at `release` instead, its duration grown by the wait (and
+    failed if `fail`). k6 writes a request's duration and failed points
+    together, so both lists move alike."""
+    d = copy.deepcopy(doc)
+    t0 = d["t0"]
+
+    def move(rows, grow):
+        out = []
+        for i, (off, v) in enumerate(rows):
+            t = t0 + off
+            out.append([release - t0, grow(v, t)] if h0 <= t < h1 and i % every == 0 else [off, v])
+        return out
+    d["calls"] = move(d["calls"], lambda v, t: v + (release - t) * 1000)
+    d["failed"] = move(d["failed"], lambda v, t: 1 if fail else v)
+    order = sorted(range(len(d["calls"])), key=lambda i: d["calls"][i][0])
+    d["calls"] = [d["calls"][i] for i in order]
+    d["failed"] = [d["failed"][i] for i in order]
+    return d
+
+
+def _no_reply_b():
+    b = _shift(_down(P14, 900, 960, restart=False), SHIFT)
+    kb = K0 + SHIFT
+    return b, _window(b, kb + 900, kb + 960)
+
+
+def _rel(doc, t_abs):
+    """an absolute epoch as seconds after the doc's first call"""
+    return t_abs - doc["t0"] - doc["calls"][0][0]
+
+
+@pytest.mark.parametrize("case, want", [
+    ("served", "PASS"),
+    ("released_after", "FAIL"),           # not one completion inside the window
+    ("served_late", "FAIL"),              # served inside, customers waiting up to the whole window
+    ("timed_out_after", "FAIL"),          # they fail just after the window
+    ("partly_released_after", "FAIL"),    # half hang past the window, half served inside
+    ("nothing_in_flight", "FAIL"),        # no readyz reply and not one k6 request either
+])
+def test_review_v4_no_reply_witness(tmp_path, case, want):
+    """The reviewer's v4 probe: B's readyz unanswered for ~76 s, no restart.
+    k6 places each request by its whole flight (start = completion - its
+    duration) and counts it not served if it failed or waited past the
+    readiness probe's own timeout (load606.HTTP_TIMEOUT_S, 30 s). A real
+    outage — requests queued and released or served after the wait, or
+    timed out — FAILs; B served normally stays jointly-Ready time."""
+    b, (w0, w1) = _no_reply_b()
+    assert 70 < w1 - w0 < 80
+    if case == "released_after":
+        b = _hang(b, w0, w1, w1 + 0.5)
+    elif case == "served_late":
+        b = _hang(b, w0, w1 - 1, w1 - 0.5)
+    elif case == "timed_out_after":
+        b = _hang(b, w0, w1, w1 + 0.5, fail=True)
+    elif case == "partly_released_after":
+        b = _hang(b, w0, w1, w1 + 0.5, every=2)
+    elif case == "nothing_in_flight":
+        b = _no_calls(b, _rel(b, w0) - 120, _rel(b, w1) + 120)
+    p = _arms(tmp_path, P14, b)
+    c = p["candidate_not_ready"]
+    assert p["verdict"] == want, (case, c, p["invalid_reasons"])
+    assert c["result"] == ("FAIL" if want == "FAIL" else "PASS")
+    if want == "FAIL":
+        (st,) = c["value"]["stretches"]
+        assert "B was not serving" in st["why"]
+        if case == "released_after":
+            # by completion time not one request is inside the window
+            assert not [o for o, _ in b["calls"] if w0 <= b["t0"] + o < w1]
+            assert st["k6"]["requests"] > 0 and st["k6"]["not_served"] > 0
+    else:
+        (w,) = p["b_witnessed_ready"]
+        # run 14's own sparse failures stay under the bar
+        assert w["k6"]["rate"] <= 0.01 and w["k6"]["timeout_s"] == load606.HTTP_TIMEOUT_S
+
+
+@pytest.mark.parametrize("case, want", [("served", "PASS"), ("no_requests", "INVALID"), ("errors", "FAIL")])
+def test_review_v4_gap_witness(tmp_path, case, want):
+    """The reviewer's gap probe: served -> jointly Ready; not one request ->
+    no witness, void; 5 % failed -> FAIL."""
+    b = _shift(_gap(P14, 1000, 1100, K0), SHIFT)
+    kb = K0 + SHIFT
+    w0, w1 = _window(b, kb + 1000, kb + 1100)
+    if case == "no_requests":
+        b = _no_calls(b, _rel(b, w0) - 120, _rel(b, w1) + 120)
+    elif case == "errors":
+        b["failed"] = [[o, 1 if w0 <= b["t0"] + o < w1 and i % 20 == 0 else v] for i, (o, v) in enumerate(b["failed"])]
+    p = _arms(tmp_path, P14, b)
+    assert p["verdict"] == want, (case, p["invalid_reasons"], p["fail_reasons"])
+
+
+def test_review_v4_probe_timeout_is_the_samplers_own(tmp_path):
+    """The not-served bound is the readiness probe's HTTP timeout: the run's
+    mem_start records it (memwatch's client), else load606's HttpClient
+    default — the constant memwatch's client uses."""
+    assert inspect.signature(load606.HttpClient.__init__).parameters["timeout"].default == load606.HTTP_TIMEOUT_S
+    rd = custlat.readiness(P14["mem"], None, [K0, K0 + 1800])
+    assert rd["probe_timeout_s"] == load606.HTTP_TIMEOUT_S and "HttpClient default" in rd["probe_timeout_from"]
+    mem = copy.deepcopy(P14["mem"])
+    next(r for r in mem if r["kind"] == "mem_start")["http_timeout_s"] = 12.0
+    rd = custlat.readiness(mem, None, [K0, K0 + 1800])
+    assert rd["probe_timeout_s"] == 12.0 and rd["probe_timeout_from"] == "mem_start.http_timeout_s"
+    out = []
+    load606.memwatch(load606.HttpClient("http://127.0.0.1:9", timeout=7.0), lambda: "t", duration_s=0,
+                     sink=out.append, out_dir=str(tmp_path))
+    assert next(r for r in out if r["kind"] == "mem_start")["http_timeout_s"] == 7.0

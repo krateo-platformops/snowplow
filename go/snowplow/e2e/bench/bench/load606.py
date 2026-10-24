@@ -140,8 +140,15 @@ def _refresh_headers(headers) -> tuple | None:
     return (key, cls) if key and cls in REFRESH_CLASSES else None
 
 
+# A request with no reply within this long is a failed request (status 0):
+# mem606's readyz probe uses it (memwatch's client is HttpClient's default), so
+# readyz 0 means "no reply within HTTP_TIMEOUT_S"; custlat's paired verdict
+# reads the same bound for k6's requests in a stretch the sampler could not see.
+HTTP_TIMEOUT_S = 30.0
+
+
 class HttpClient:
-    def __init__(self, base_url: str, timeout: float = 30.0):
+    def __init__(self, base_url: str, timeout: float = HTTP_TIMEOUT_S):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
 
@@ -4792,7 +4799,8 @@ def memwatch(client: HttpClient, login_fn: Callable[[], str], *, duration_s: flo
                 raw_sink(rec)
     t_start = clock()
     sink({"kind": "mem_start", "t": t_start, "duration_s": duration_s,
-          "interval_s": interval_s, **({"cpu_plan": asdict(cpu)} if cpu else {})})
+          "interval_s": interval_s, "http_timeout_s": getattr(client, "timeout", None),
+          **({"cpu_plan": asdict(cpu)} if cpu else {})})
     state = {"token": None, "anchor": t_start}
     stop_cpu = threading.Event()
     cpu_n = [0]
