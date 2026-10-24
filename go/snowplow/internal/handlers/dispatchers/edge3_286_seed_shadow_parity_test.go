@@ -39,7 +39,6 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -240,7 +239,7 @@ func e3286Run(t *testing.T, base context.Context, wPrefix string, shadowOn bool)
 	t.Helper()
 	w1Key = "L1_edge3_286_" + wPrefix + "_w1"
 	w2Key = "L1_edge3_286_" + wPrefix + "_w2"
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 	ra := e3286RA()
 	opts := apiref.ResolveOptions{ApiRef: e3286ApiRef(), PerPage: 5, Page: 1}
 
@@ -324,7 +323,7 @@ func TestEdge3_286_SeedShadowParityDoesNotPerturbCapture(t *testing.T) {
 
 	widgets := map[string]context.Context{
 		w2Off: cache.WithL1KeyContext(base, w2Off),
-		w2On:  cache.WithSeedResolveMemo(cache.WithL1KeyContext(base, w2On), cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)),
+		w2On:  cache.WithSeedResolveMemo(cache.WithL1KeyContext(base, w2On), cache.NewSeedResolveMemo()),
 	}
 	var mu sync.Mutex
 	marked := map[string]bool{}

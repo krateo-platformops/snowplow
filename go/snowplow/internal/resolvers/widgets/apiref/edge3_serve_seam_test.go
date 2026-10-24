@@ -32,7 +32,6 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/plumbing/jqutil"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/testsupport/fakewatch"
@@ -469,7 +468,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 	cache.RecordSliceability(raKey, shape, true)
 	d.Record(context.Background(), raKey, gRA, edge3BackingNS, raName) // RA-CR self-dep (mirror ra_full_list.go:469)
 
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 
 	// w1: memo MISS whose body comes from the 4a fast path. Capture (B2).
 	ctx1 := cache.WithL1KeyContext(base, w1Key)
@@ -491,7 +490,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 		t.Fatalf("F-C1b RED: captured deps do not contain the backing edge (edge-3): %v", deps)
 	}
 	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, "", cache.HashExtras(nil), 5, 1)
-	memo.Store(memoKey, pmaps.DeepCopyJSON(served1), deps, cache.DepGenEpochNow())
+	memo.Store(memoKey, edge3MustJSON(t, served1), deps, cache.DepGenEpochNow())
 	store.Put(w1Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, served1), Inputs: edge3WidgetInputs("w1")})
 
 	// w2: memo HIT → replay the captured deps under w2's key (B3).
@@ -534,7 +533,7 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 	marker := "OLD"
 	resolve := edge3StubResolveRA(t, &marker, backing)
 	base := f6CtxWithUser(t, "admin", []string{"system:masters"})
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 
 	// Carrier 1 — FIRST-SIGHT (page 1). It is also the memo PRODUCER: wrap its
 	// serve in a capture so the memo entry carries the deps (as the seed pass's
@@ -548,7 +547,7 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 	depsFS := d.EndCapture(wfsKey, capBuf)
 	store.Put(wfsKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, gotFS), Inputs: edge3WidgetInputs("fs")})
 	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, "", cache.HashExtras(nil), 5, 1)
-	memo.Store(memoKey, pmaps.DeepCopyJSON(gotFS), depsFS, cache.DepGenEpochNow())
+	memo.Store(memoKey, edge3MustJSON(t, gotFS), depsFS, cache.DepGenEpochNow())
 
 	// Carrier 2 — 4a FAST-PATH HIT (page 2). edge-3 via C2's replay in the hit
 	// branch.
@@ -675,7 +674,7 @@ func TestEdge3_E2E_ResolveB2B3WiringThroughApirefResolve(t *testing.T) {
 	cache.RecordSliceability(raKey, shape, true)
 	d.Record(context.Background(), raKey, gRA, ns, raName) // RA-CR self-dep
 
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 	apiRef := templatesv1.ObjectReference{
 		Reference:  templatesv1.Reference{Name: raName, Namespace: ns},
 		Resource:   "restactions",

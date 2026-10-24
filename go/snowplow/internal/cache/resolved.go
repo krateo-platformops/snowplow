@@ -329,15 +329,19 @@ type ResolvedEntry struct {
 	// generation (the field is only ever written on a fresh entry, so a
 	// rebuilt cell starts empty again and re-materialises on demand).
 	//
-	// ATOMIC POINTER, NOT A MUTEX OR sync.Once. Reads are lock-free on the
-	// serve path. A concurrent double-parse is harmless and deliberately
-	// tolerated: each racer strips and builds its OWN private maps, the CAS
-	// publishes exactly one of them, and EnsureItems returns the PUBLISHED
-	// value to every caller — so the maps every serve aliases are the same
-	// maps, and the loser's trees are simply dropped. That preserves the
-	// invariant the eager path depends on (stripManagedFields runs while the
-	// map is still private, never on a map already aliased by a serve).
-	itemsLazy atomic.Pointer[lazyListItems]
+	// ATOMIC POINTER FOR THE READ, ONE PARSE PER ENTRY (#883 F3). Reads of a
+	// published value are lock-free on the serve path. The FIRST materialisation
+	// runs exactly once: itemsParseMu admits one parser, and every concurrent
+	// first reader waits on it and then returns the value that parser published.
+	// Before #883 a concurrent double-parse was tolerated as "harmless" (the CAS
+	// kept one tree and dropped the rest); bench run 15 measured what that costs
+	// on a 50K-item list — N first readers ran N full parses at once, and that
+	// burst was the 1.12.54 OOM kill. A waiter is never slower than running its
+	// own parse: the parse it waits on started first. The published maps are
+	// still built privately by the one parser (stripManagedFields runs before
+	// any serve aliases them), the invariant the eager path depends on.
+	itemsLazy    atomic.Pointer[lazyListItems]
+	itemsParseMu sync.Mutex
 
 	// listCell — #854: an ANCHORED apistage LIST content cell keeps its items
 	// incrementally (list_cell.go). Such an entry has no RawJSON and no Items;

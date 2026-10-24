@@ -132,8 +132,9 @@ func TestIssue578_EnsureItems_MemoisesNegativeResult(t *testing.T) {
 
 // TestIssue578_EnsureItems_ConcurrentReadersSharePublishedTree is the race arm.
 //
-// Concurrent first-readers may each parse (that is deliberately tolerated), but
-// exactly ONE tree may be PUBLISHED, and every caller must receive that one.
+// Exactly ONE tree may be PUBLISHED, and every caller must receive that one.
+// (Since #883 F3 only one of them parses at all; the parse count is pinned by
+// TestIssue883_F3_ConcurrentFirstReadersRunOneParse.)
 // If callers could receive their own private trees, two serves would alias
 // different maps and the "strip once while private, then share" invariant that
 // the gate and gojq depend on would be broken.

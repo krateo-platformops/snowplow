@@ -38,6 +38,15 @@
 //     Freshness is therefore a property of the memo's existing guard, not of how
 //     long this file keeps it alive.
 //
+// #883 F4 — REFUSED IS NOT ENOUGH: A STALE BODY IS DELETED. The #411 guard
+// refused a stale entry but left it in the memo, so every body whose key was
+// never looked up again stayed resident until the wholesale swap: bench run 15
+// read it as a ~1 GB/h rising floor (DeepCopyJSON 12 -> 774 MB). The memo now
+// drops an entry when a Load finds it stale and when the dep tracker moves one
+// of its deps (cache.TrackDepMoves, wired below), and it stores the
+// RESTAction's encoded result rather than a decoded deep copy. Its size is
+// published as snowplow_resolve_memo (entries, body_bytes).
+//
 // WHY THE COLLAPSE ACTUALLY LANDS. DepTracker.OnObjectEvent collects every
 // matching key for one object event FIRST and then enqueues them in a single
 // loop, and the refresher's queue is a client-go workqueue, which is FIFO. So a
@@ -56,9 +65,10 @@
 package dispatchers
 
 import (
+	"expvar"
+	"sync"
 	"sync/atomic"
 
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
@@ -93,31 +103,84 @@ func RefreshMemoStats() (hits, misses uint64) { return refreshMemo.Load().Stats(
 //
 // A SWAP CANNOT CORRUPT ANYTHING. The old memo is simply dropped; in-flight
 // resolves holding a pointer to it keep using it until they finish, and every
-// body it served was already deep-copied on Load. The worst a swap costs is a
+// body it served was decoded afresh on Load. The worst a swap costs is a
 // few duplicate resolves, which is the state this file exists to improve on —
 // so the failure mode of the bound is "less saving", never "wrong answer".
+//
+// #883 — the installed memo is tracked by the dep tracker (cache.TrackDepMoves)
+// so its entries leave the moment a dep moves. A memo is tracked BEFORE it is
+// published, so no Store into it can precede its tracking, and untracked once it
+// lost the race or was swapped out, so the registry never keeps a dropped memo
+// alive.
 func refreshResolveMemo() *cache.SeedResolveMemo {
 	m := refreshMemo.Load()
 	if m == nil {
-		fresh := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+		fresh := cache.NewSeedResolveMemo()
+		untrack := cache.TrackDepMoves(fresh)
 		if refreshMemo.CompareAndSwap(nil, fresh) {
 			return fresh
 		}
 		// Lost the race — use the winner's memo, never a second one.
+		untrack()
 		return refreshMemo.Load()
 	}
 
 	_, misses := m.Stats()
 	if cap := refreshMemoCap(); cap > 0 && misses > cap {
-		fresh := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+		fresh := cache.NewSeedResolveMemo()
+		untrack := cache.TrackDepMoves(fresh)
 		if refreshMemo.CompareAndSwap(m, fresh) {
+			cache.UntrackDepMoves(m)
 			refreshMemoSwapsTotal.Add(1)
 			return fresh
 		}
 		// Another goroutine swapped first; take theirs.
+		untrack()
 		return refreshMemo.Load()
 	}
 	return m
+}
+
+// RefreshMemoSize is the #883 gauge for the installed refresher memo: how many
+// bodies it holds and their summed encoded size. (0, 0) before the first one.
+func RefreshMemoSize() (entries, bodyBytes int64) {
+	m := refreshMemo.Load()
+	return m.Entries(), m.BodyBytes()
+}
+
+// publishResolveMemoExpvar installs snowplow_resolve_memo (#883). Named outside
+// the snowplow_refresher_ prefix, which C7 reserves for tagged refresherStats
+// fields. Idempotent: expvar panics on a duplicate Publish.
+func publishResolveMemoExpvar() {
+	resolveMemoPublishOnce.Do(func() {
+		expvar.Publish("snowplow_resolve_memo", expvar.Func(func() any {
+			entries, bodyBytes := RefreshMemoSize()
+			stale, moved := cache.ResolveMemoDropTotals()
+			return map[string]any{
+				// GAUGES — the installed refresher memo right now. With #883 they
+				// track the live working set: read them against
+				// snowplow_resolved_cache.entries, never as a climb on their own.
+				"entries":    entries,
+				"body_bytes": bodyBytes,
+				// Process totals of entries deleted (every memo, every swap): by a
+				// Load that found the entry stale, and by a dep move nobody read.
+				"dropped_stale_total": stale,
+				"dropped_moved_total": moved,
+				"swaps_total":         refreshMemoSwapsTotal.Load(),
+			}
+		}))
+	})
+}
+
+var resolveMemoPublishOnce sync.Once
+
+func init() {
+	// CFG-1 gate, as publishRefreshRebuildExpvar: the memo only exists under
+	// the cache, so a cache-off pod publishes nothing rather than zeros.
+	if cache.Disabled() {
+		return
+	}
+	publishResolveMemoExpvar()
 }
 
 // refreshMemoCap is the live resolved-cache entry count — the number of cells

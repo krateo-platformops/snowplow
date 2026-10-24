@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -84,7 +83,7 @@ func TestIssue406_SeedMemo_RAEditBeforeSeed_AllSeededWidgetsConverge(t *testing.
 	}
 
 	// The seed pass: three widgets share (RA, identity, page) → one memo MISS + two HITs.
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 	opts := ResolveOptions{
 		ApiRef: templatesv1.ObjectReference{
 			Reference:  templatesv1.Reference{Name: raName, Namespace: ns},

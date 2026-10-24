@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/plumbing/jqutil"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -120,7 +119,7 @@ func TestS874_CursorReachesTheRESTActionThroughApirefResolve(t *testing.T) {
 	// A REAL seed resolve memo on ctx: its key has no cursor dimension, so a
 	// cursor page must bypass it (else page 2 at cursor c10 is served page 2 at c5).
 	ctx := cache.WithSeedResolveMemo(cache.WithL1KeyContext(f6CtxWithUser(t, "admin", []string{"system:masters"}), "L1_s874_cursor"),
-		cache.NewSeedResolveMemo(pmaps.DeepCopyJSON))
+		cache.NewSeedResolveMemo())
 	ref := templatesv1.ObjectReference{
 		Reference: templatesv1.Reference{Name: raName, Namespace: ns}, Resource: "restactions", APIVersion: "templates.krateo.io/v1",
 	}

@@ -119,7 +119,7 @@ func TestI598_Arm4_BoundIsDerivedFromLiveEntryCount(t *testing.T) {
 // because #598 widens WHO holds a memo, and a reader of this file should see the
 // property restated at the new call site rather than have to find it in F4.
 func TestI598_Arm5_IdentityNeverCollapses(t *testing.T) {
-	memo := cache.NewSeedResolveMemo(nil)
+	memo := cache.NewSeedResolveMemo()
 	kAlice := memo.Key("krateo-system", "incident-detail", "alice", []string{"devs"}, "cls", "x", -1, -1)
 	kBob := memo.Key("krateo-system", "incident-detail", "bob", []string{"devs"}, "cls", "x", -1, -1)
 	kAliceOps := memo.Key("krateo-system", "incident-detail", "alice", []string{"ops"}, "cls", "x", -1, -1)
@@ -140,7 +140,7 @@ func TestI598_Arm5_IdentityNeverCollapses(t *testing.T) {
 }
 
 // resetRefreshMemoForTest drops the process memo so an arm starts clean.
-func resetRefreshMemoForTest() { refreshMemo.Store(nil) }
+func resetRefreshMemoForTest() { cache.UntrackDepMoves(refreshMemo.Swap(nil)) }
 
 func cacheOnForMemo(t *testing.T) {
 	t.Helper()

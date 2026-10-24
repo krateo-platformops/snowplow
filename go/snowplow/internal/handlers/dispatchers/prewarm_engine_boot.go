@@ -45,7 +45,6 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
@@ -676,9 +675,11 @@ func seedScopeYielding(ctx context.Context,
 	// function's scope — nothing references it once seedScopeYielding returns
 	// (C-F4-5 teardown: the next pass builds a fresh one). Keyed by the full
 	// RBAC identity so it is per-cohort correct (C-F4-4). Inert under
-	// Disabled(): WithSeedResolveMemo returns ctx unchanged (C-F4-9). copyFn =
-	// plumbing/maps.DeepCopyJSON (JSON-native round-trip on every hit, C-F4-3).
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	// Disabled(): WithSeedResolveMemo returns ctx unchanged (C-F4-9). It stores
+	// encoded bodies and decodes one per hit (#883 F4, C-F4-3), and the dep
+	// tracker drops its entries as their deps move for as long as the pass runs.
+	memo := cache.NewSeedResolveMemo()
+	defer cache.TrackDepMoves(memo)()
 	ctx = cache.WithSeedResolveMemo(ctx, memo)
 	defer func() {
 		h, m := memo.Stats()

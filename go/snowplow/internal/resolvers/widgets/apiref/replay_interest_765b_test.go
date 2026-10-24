@@ -39,7 +39,6 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/plumbing/jqutil"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/cache/jqinterest"
@@ -222,7 +221,7 @@ func TestReplay765b_P1_C2_P4_SiblingsNarrowToTheProducersReadSet(t *testing.T) {
 	if !strings.HasPrefix(want, "narrowed:") {
 		t.Fatalf("setup: the raKey edge must be narrowed, got %q", want)
 	}
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 	r0 := replays765b()
 	hit0 := cache.RAFullListServeSnapshot().Hit
 	e.seed(t, memo, widgets765b...)
@@ -262,7 +261,7 @@ func TestReplay765b_P2_AnAllProducerLeavesEveryReceiverAll(t *testing.T) {
 				t.Fatalf("setup: the raKey edge must be all, got %q", got)
 			}
 			r0 := replays765b()
-			e.seed(t, cache.NewSeedResolveMemo(pmaps.DeepCopyJSON), widgets765b...)
+			e.seed(t, cache.NewSeedResolveMemo(), widgets765b...)
 			for _, w := range widgets765b {
 				if got := state765b(w); got != "all" {
 					t.Fatalf("P2 RED (%s): widget %s is %q although its producer is all", tc.name, w, got)
@@ -281,7 +280,7 @@ func TestReplay765b_P3_APendingProducerReplaysPlainAndIsCounted(t *testing.T) {
 		t.Fatalf("setup: the raKey edge must be pending, got %q", got)
 	}
 	r0 := replays765b()
-	e.seed(t, cache.NewSeedResolveMemo(pmaps.DeepCopyJSON), widgets765b...)
+	e.seed(t, cache.NewSeedResolveMemo(), widgets765b...)
 	for _, w := range widgets765b {
 		if got := state765b(w); got != "all" {
 			t.Fatalf("P3 RED: widget %s is %q although its producer edge was pending", w, got)
@@ -297,7 +296,7 @@ func TestReplay765b_P5_AStickyAllReceiverStaysAll(t *testing.T) {
 	sticky := widgets765b[2]
 	dk := backingDK765b()
 	cache.Deps().RecordList(context.Background(), sticky, dk.GVR, dk.Namespace) // a plain record first
-	e.seed(t, cache.NewSeedResolveMemo(pmaps.DeepCopyJSON), widgets765b...)
+	e.seed(t, cache.NewSeedResolveMemo(), widgets765b...)
 	if got := state765b(sticky); got != "all" {
 		t.Fatalf("P5 RED: a receiver that was already sticky all became %q: a replay must never narrow it", got)
 	}
@@ -320,7 +319,7 @@ func TestReplay765b_P5b_AReceiverWidenedByItsOwnFailedResolveStaysAll(t *testing
 	if got := state765b(widened); got != "all" {
 		t.Fatalf("P5b setup: the receiver's own failed resolve must leave its edge all, got %q", got)
 	}
-	e.seed(t, cache.NewSeedResolveMemo(pmaps.DeepCopyJSON), widgets765b...)
+	e.seed(t, cache.NewSeedResolveMemo(), widgets765b...)
 	if got := state765b(widened); got != "all" {
 		t.Fatalf("P5b RED: a receiver widened by its own failed resolve became %q under a narrowed replay: "+
 			"the widening must stay sticky", got)
@@ -335,7 +334,7 @@ func TestReplay765b_P6_ForwardMatchesAreIdenticalShadowOnAndOff(t *testing.T) {
 		restore := cache.SetListNarrowShadowForTest(shadow)
 		defer restore()
 		e := setup765b(t, "narrow", analyze765b(`[.s.items[] | {name: .metadata.name}]`))
-		e.seed(t, cache.NewSeedResolveMemo(pmaps.DeepCopyJSON), widgets765b...)
+		e.seed(t, cache.NewSeedResolveMemo(), widgets765b...)
 		var keys []string
 		for k := range cache.Deps().CollectMatchesForTest(edge3BackingGVR(), edge3BackingNS, "any-object") {
 			keys = append(keys, k)
@@ -354,7 +353,7 @@ func TestReplay765b_P6_ForwardMatchesAreIdenticalShadowOnAndOff(t *testing.T) {
 
 func TestReplay765b_P7_ACaptureOnAReceiverSeesTheReplayedEdge(t *testing.T) {
 	e := setup765b(t, "narrow", analyze765b(`[.s.items[] | {name: .metadata.name}]`))
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 	e.seed(t, memo, widgets765b[0]) // the producer (memo MISS)
 	sib := widgets765b[1]
 	h := cache.Deps().BeginCapture(sib)
@@ -408,7 +407,7 @@ func TestReplay765b_P9_TheAuditCoversAReceiverWidget(t *testing.T) {
 	cache.ResetRefresherForTest()
 	t.Cleanup(cache.ResetRefresherForTest)
 	e := setup765b(t, "narrow", analyze765b(`[.s.items[] | {name: .metadata.name}]`))
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 	bodies := e.seed(t, memo, widgets765b[0], widgets765b[1]) // [1] is a memo sibling
 	sib := widgets765b[1]
 	if got := state765b(sib); !strings.HasPrefix(got, "narrowed:") {

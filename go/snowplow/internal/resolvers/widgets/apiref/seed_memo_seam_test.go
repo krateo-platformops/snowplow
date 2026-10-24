@@ -17,7 +17,6 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
@@ -67,7 +66,7 @@ func TestSeedMemo_NotConsultedOffSeedPath(t *testing.T) {
 // the memo keys on is the one on ctx.
 func TestSeedMemo_ConsultedUnderSeedCtx(t *testing.T) {
 	cacheOn(t)
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 	seedCtx := cache.WithSeedResolveMemo(
 		xcontext.BuildContext(t.Context(),
 			xcontext.WithUserInfo(jwtutil.UserInfo{Username: "cyberjoker", Groups: []string{"dev-team"}})),

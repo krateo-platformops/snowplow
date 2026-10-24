@@ -5,13 +5,13 @@ package apiref
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
@@ -263,7 +263,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// dirty-mark). Dep recording is idempotent (sync.Map LoadOrStore), so a
 	// page-keyed resolve under the widget's own L1 key and an unpaginated
 	// resolve under the RAFullList key coexist safely.
-	resolveRA := func(rctx context.Context, perPage, page int) (map[string]any, error) {
+	//
+	// resolveRAEncoded also returns the exact bytes the Status map was decoded
+	// from (#883 F4: what the resolve memo stores); resolveRA drops them.
+	resolveRAEncoded := func(rctx context.Context, perPage, page int) (map[string]any, []byte, error) {
 		local := ra
 		local.Status = nil
 		raopts := restactions.ResolveOptions{
@@ -278,9 +281,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			Cursor: opts.Cursor,
 		}
 		if _, rerr := restactions.Resolve(rctx, raopts); rerr != nil {
-			return nil, rerr
+			return nil, nil, rerr
 		}
-		return rawExtensionToMap(local.Status)
+		return rawExtensionToMapEncoded(local.Status)
+	}
+	resolveRA := func(rctx context.Context, perPage, page int) (map[string]any, error) {
+		m, _, err := resolveRAEncoded(rctx, perPage, page)
+		return m, err
 	}
 
 	// #130 F4 — the RA-resolve memo. Installed on the boot-seed context
@@ -331,8 +338,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// #277 / edge-3: replay the deps captured when this body was first
 			// produced onto THIS widget's L1 key, so a memo-served widget cell
 			// carries the same backing-GVR edges a real resolve would have
-			// recorded (else it goes stale on a backing mutation). Load returns
-			// a fresh deep copy; safe to hand straight back.
+			// recorded (else it goes stale on a backing mutation). Load decodes
+			// the stored bytes afresh (#883); safe to hand straight back.
 			//
 			// #411 C1: replay AS OF the entry's stamp, so this resolve's own
 			// Put-check judges the reused deps from when the body was produced,
@@ -369,13 +376,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		ctx, memoSensitive = cache.WithSensitiveTouchedSink(ctx)
 	}
 
-	// storeMemo deep-copies the resolved body (JSON-native round-trip, C-F4-3 —
-	// panics AT THIS SEAM on a non-JSON-native value rather than aliasing a bad
-	// value into the shared memo), closes the edge-3 capture, and records BOTH
-	// under memoKey so sibling widgets in the pass hit the body AND replay its
-	// deps. No-op when no memo is installed (nil memo / empty key). Called
-	// exactly once per resolve.
-	storeMemo := func(out map[string]any) {
+	// storeMemo stores the resolved body ENCODED (#883 F4), closes the edge-3
+	// capture, and records BOTH under memoKey so sibling widgets hit the body AND
+	// replay its deps. `encoded` is the RESTAction's own encoded result — the
+	// bytes `out` was decoded from — when the caller has them (the page-keyed
+	// resolve), so a hit is the miss path's decode of the miss path's bytes. The
+	// Ship 4a serve hands nil (its body is a Go-slice of a decoded full list) and
+	// the body is encoded here. Either way a hit decodes once, with the decoder
+	// the miss path uses, and the memo holds no decoded tree between hits. No-op
+	// when no memo is installed (nil memo / empty key). Called exactly once per
+	// resolve.
+	storeMemo := func(out map[string]any, encoded []byte) {
 		if memo == nil || memoKey == "" || out == nil {
 			return
 		}
@@ -400,7 +411,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// after the producing restactions.Resolve returned, so its commit (deferred
 		// inside Resolve) has settled every edge it recorded.
 		states := cache.Deps().EdgeNarrowStates(l1Key, deps)
-		memo.StoreLayeredWithStates(memoKey, pmaps.DeepCopyJSON(out), deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark))
+		if encoded == nil {
+			b, err := json.Marshal(out)
+			if err != nil {
+				return // not encodable: never memoise a body a hit could not reproduce
+			}
+			encoded = b
+		}
+		memo.StoreLayeredWithStates(memoKey, encoded, deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark))
 	}
 
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef
@@ -414,17 +432,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			opts.ApiRef.Name, &ra, opts.PerPage, opts.Page, opts.Extras, resolveRA); serr != nil {
 			return map[string]any{}, serr
 		} else if ok {
-			storeMemo(served)
+			storeMemo(served, nil)
 			return served, nil
 		}
 		// served=false, no error — fall through to the page-keyed resolve.
 	}
 
-	out, err := resolveRA(ctx, opts.PerPage, opts.Page)
+	out, encoded, err := resolveRAEncoded(ctx, opts.PerPage, opts.Page)
 	if err != nil {
 		return map[string]any{}, err
 	}
-	storeMemo(out)
+	storeMemo(out, encoded)
 	return out, nil
 }
 
