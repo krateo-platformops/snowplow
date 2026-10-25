@@ -28,6 +28,11 @@ FAKE_GCLOUD = textwrap.dedent("""\
     def opt(n):
         return a[a.index(n) + 1] if n in a else None
     if a[:3] == ["container", "clusters", "describe"]:
+        if os.path.exists(os.path.join(st, "deleted")):          # #895: the delete went through
+            log("gone")
+            sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, "
+                             "message=Not found: clusters/" + a[3] + ".\\n")
+            sys.exit(1)
         log("describe")
         print(json.dumps({"name": a[3], "resourceLabels": {
             "purpose": "snowplow-bench", "issue": "606", "created-by": "bench-gke", "owner": "t",
@@ -44,6 +49,11 @@ FAKE_GCLOUD = textwrap.dedent("""\
             sys.stderr.write("ERROR: (gcloud.container.clusters.delete) Some requests did not succeed:\\n"
                              f" - ResponseError: code=400, message=Cluster is running incompatible operation {ops[n]}.\\n")
             sys.exit(1)
+        open(os.path.join(st, "deleted"), "w").write("1")
+        sys.exit(0)
+    if a[:3] == ["compute", "disks", "list"]:
+        log("disks-list")
+        print("[]")
         sys.exit(0)
     if a[:3] == ["container", "operations", "wait"]:
         log(f"wait {a[3]} {opt('--project')} {opt('--region')}")
@@ -59,6 +69,8 @@ def fakegke(tmp_path, monkeypatch):
     bin_.mkdir()
     (bin_ / "gcloud").write_text(FAKE_GCLOUD)
     (bin_ / "gcloud").chmod(0o755)
+    (bin_ / "kubectl").write_text(FAKE_KUBECTL)
+    (bin_ / "kubectl").chmod(0o755)
     st = tmp_path / "state"
     st.mkdir()
     monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
@@ -66,9 +78,16 @@ def fakegke(tmp_path, monkeypatch):
     return st
 
 
+# no PV in the cluster (#895's PV release and disk backstop: test_gke_pvc_disks)
+FAKE_KUBECTL = '#!/usr/bin/env python3\nimport json, os\nopen(os.path.join(os.environ["FAKE_STATE"], "calls"), "a").write("kubectl\\n")\nprint(json.dumps({"items": []}))\n'
+
+
 def _calls(st: Path):
+    """The cluster operations, in order (the PV release, the gone-poll and the
+    disk backstop around them are #895's, tested in test_gke_pvc_disks)."""
     p = st / "calls"
-    return p.read_text().splitlines() if p.exists() else []
+    return [c for c in (p.read_text().splitlines() if p.exists() else [])
+            if c not in ("kubectl", "gone", "disks-list")]
 
 
 SPEC = gke.default_spec("snowplow-bench-r15b")
@@ -128,6 +147,7 @@ def test_gke_down_passes_the_budget(fakegke, monkeypatch, capsys):
     assert f"wait {OP1} {SPEC.project} {SPEC.region}" in _calls(fakegke)
     # and honours it: an operation that outlasts --budget-s fails gke-down, fast
     (fakegke / "calls").unlink()
+    (fakegke / "deleted").unlink()
     monkeypatch.setenv("FAKE_WAIT_S", "30")
     t0 = time.monotonic()
     assert gke.main(["gke-down", "--name", SPEC.name, "--budget-s", "1.5", "--yes"]) == 1

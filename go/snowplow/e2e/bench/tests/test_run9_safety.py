@@ -19,7 +19,7 @@ import pytest
 from bench import load606
 from tests.test_606 import _run606
 from tests.test_run606_pr483 import _env483
-from tests.test_run606_real_sequence import BENCH_DIR, _calls, harness  # noqa: F401
+from tests.test_run606_real_sequence import BENCH_DIR, TEARDOWN_TAIL, _calls, harness  # noqa: F401
 
 
 def _measure_fails(env, **extra):
@@ -50,7 +50,7 @@ def test_term_during_partial_collect_still_deletes_the_cluster(harness):
     assert "signal during teardown" in err
     assert "=== teardown " in err
     gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
-    assert gcl[-1] == ["container", "clusters", "delete"]
+    assert gcl[-3:] == TEARDOWN_TAIL
 
 
 def test_process_group_ctrl_c_during_partial_collect_still_deletes_the_cluster(harness):
@@ -73,7 +73,7 @@ def test_process_group_ctrl_c_during_partial_collect_still_deletes_the_cluster(h
     _, rest = p.communicate(timeout=60)
     err = "".join(lines) + rest
     gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
-    assert gcl[-1] == ["container", "clusters", "delete"], (gcl[-3:], err[-1500:])
+    assert gcl[-3:] == TEARDOWN_TAIL, (gcl[-3:], err[-1500:])
     assert "=== teardown " in err and "TEARDOWN FAILED" not in err
 
 
@@ -100,7 +100,7 @@ def _signal_at(env, plan, timeout=90):
 
 def _deleted(state, err):
     gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
-    assert gcl[-1] == ["container", "clusters", "delete"], (gcl[-3:], err[-1500:])
+    assert gcl[-3:] == TEARDOWN_TAIL, (gcl[-3:], err[-1500:])
     assert (state / "deleted").exists()                         # the delete COMPLETED
     i_ok = err.index("deleted (gke-down OK)")
     assert "TEARDOWN FAILED" not in err
@@ -176,7 +176,7 @@ def test_a_hung_gke_up_is_bounded_and_torn_down(harness):
     assert p.returncode != 0 and time.time() - t0 < 30
     assert "=== step install ===" not in p.stderr
     gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
-    assert gcl[-1] == ["container", "clusters", "delete"]
+    assert gcl[-3:] == TEARDOWN_TAIL
 
 
 def test_partial_collect_has_one_wall_clock_cap(harness):
@@ -188,7 +188,7 @@ def test_partial_collect_has_one_wall_clock_cap(harness):
     assert time.time() - t0 < 35
     assert "partial collect: stopped after 2s (cap 2s reached)" in p.stderr
     gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
-    assert gcl[-1] == ["container", "clusters", "delete"]
+    assert gcl[-3:] == TEARDOWN_TAIL
 
 
 def test_every_collect_read_is_bounded_twice(harness):

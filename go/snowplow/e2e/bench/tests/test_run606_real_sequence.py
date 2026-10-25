@@ -45,6 +45,10 @@ ZONE = "europe-west4-a"                       # every node's zone
 REGION = "europe-west4"                       # the regional control plane's: gcloud and the context name it
 KCTX = f"gke_{PROJECT}_{REGION}_{RUN_NAME}"
 AMBIENT_CTX = "kind-krateo-4388"
+# #895: a successful teardown ends with the cluster delete, the poll that sees
+# it gone, and the exact disk backstop for it
+TEARDOWN_TAIL = [["container", "clusters", "delete"], ["container", "clusters", "describe"],
+                 ["compute", "disks", "list"]]
 # The digest the fake snowplow pod runs and the run expects (a test value).
 FAKE_DIGEST = "sha256:" + "ab" * 32
 OTHER_DIGEST = "sha256:" + "cd" * 32
@@ -76,6 +80,17 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
                        "clusters": [{"name": ctx, "cluster": {"server": "https://127.0.0.1:1"}}],
                        "users": []}, fh)
         sys.exit(0)
+    if a[:3] == ["compute", "regions", "describe"]:            # #895: the SSD quota read
+        print(json.dumps({"name": a[3], "quotas": [
+            {"metric": "SSD_TOTAL_GB", "limit": 500.0,
+             "usage": float(os.environ.get("FAKE_SSD_USAGE", "333"))}]}))
+        sys.exit(0)
+    if a[:3] == ["compute", "disks", "list"]:                  # #895: the disk backstop
+        print(os.environ.get("FAKE_DISKS", "[]")); sys.exit(0)
+    if a[:3] == ["container", "clusters", "describe"] and os.path.exists(os.path.join(STATE, "deleted")):
+        sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, "
+                         "message=Not found: clusters/" + a[3] + ".\\n")
+        sys.exit(1)
     if a[:3] == ["container", "clusters", "describe"]:
         labels = {"purpose": "snowplow-bench", "issue": "606",
                   "created-by": "bench-gke", "owner": "t",
@@ -133,6 +148,23 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                                            "message": smsg}]}}
     def items(xs):
         print(json.dumps({"items": xs})); sys.exit(0)
+    # #895: GKE's default PD CSI class, re-created by gke-up with the bench disk labels
+    if a[:2] == ["get", "storageclass"]:
+        items([{"metadata": {"name": "standard-rwo",
+                             "annotations": {"storageclass.kubernetes.io/is-default-class": "true"},
+                             "labels": {"addonmanager.kubernetes.io/mode": "EnsureExists"}},
+                "provisioner": "pd.csi.storage.gke.io", "parameters": {"type": "pd-balanced"},
+                "reclaimPolicy": "Delete", "volumeBindingMode": "WaitForFirstConsumer",
+                "allowVolumeExpansion": True}])
+    if a[:2] == ["create", "-f"]:
+        with open(os.path.join(STATE, "created.jsonl"), "a") as fh:
+            fh.write(sys.stdin.read().replace("\\n", " ") + "\\n")
+        sys.exit(0)
+    if a[:2] == ["get", "pv"]:                                 # #895: the PV release at teardown
+        gone = os.path.exists(os.path.join(STATE, "pvcs_deleted"))
+        items([] if gone else json.loads(os.environ.get("FAKE_PVS", "[]")))
+    if a[:2] == ["delete", "pvc"]:
+        open(os.path.join(STATE, "pvcs_deleted"), "w").write("1"); sys.exit(0)
     f483 = os.environ.get("FAKE_483", "")          # "", pass, wide
     if a[:3] == ["get", "crd", "alerts.observability.krateo.io"]:
         sys.exit(0 if f483 in ("pass", "wide") else 1)
@@ -680,10 +712,13 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     assert gated == ["fresh_p95_ms[list_dep@10]"]          # ruling: gate at 10/s
     assert set(verdict["report"]["fresh_curve_report_only"]) == {"list_dep@1", "list_dep@50"}
 
-    # teardown went through the label-checked path and deleted THIS cluster
+    # teardown went through the label-checked path and deleted THIS cluster,
+    # waited for it to be gone, then ran the exact disk backstop for it (#895)
     gcl = [c["argv"] for c in calls if c["tool"] == "gcloud"]
-    assert ["container", "clusters", "describe", RUN_NAME] == gcl[-2][:4]
-    assert gcl[-1][:4] == ["container", "clusters", "delete", RUN_NAME]
+    assert ["container", "clusters", "describe", RUN_NAME] == gcl[-4][:4]
+    assert gcl[-3][:4] == ["container", "clusters", "delete", RUN_NAME]
+    assert [g[:3] for g in gcl[-3:]] == TEARDOWN_TAIL
+    assert f"labels.goog-k8s-cluster-name={RUN_NAME}" in " ".join(gcl[-1])
     assert "krateo-057" not in json.dumps(calls)
 
     # the synthetic users' password never reaches a log

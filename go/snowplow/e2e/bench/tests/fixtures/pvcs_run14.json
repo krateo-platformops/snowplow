@@ -1,0 +1,30 @@
+[
+  {
+    "namespace": "krateo-system",
+    "name": "clickhouse-storage-volume-krateo-clickstack-clickhouse-clickhouse-0-0-0",
+    "phase": "Bound",
+    "class": "standard-rwo",
+    "request": "15Gi"
+  },
+  {
+    "namespace": "krateo-system",
+    "name": "clickhouse-storage-volume-krateo-clickstack-keeper-keeper-0-0",
+    "phase": "Bound",
+    "class": "standard-rwo",
+    "request": "5Gi"
+  },
+  {
+    "namespace": "krateo-system",
+    "name": "data-volume-krateo-clickstack-mongodb-0",
+    "phase": "Bound",
+    "class": "standard-rwo",
+    "request": "10G"
+  },
+  {
+    "namespace": "krateo-system",
+    "name": "logs-volume-krateo-clickstack-mongodb-0",
+    "phase": "Bound",
+    "class": "standard-rwo",
+    "request": "2G"
+  }
+]

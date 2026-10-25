@@ -22,7 +22,7 @@ import pytest
 from bench import load606
 from tests.test_run606_pr483 import _env483
 from tests.test_run606_real_sequence import (  # noqa: F401
-    BENCH_DIR, FAKE_DIGEST, OTHER_DIGEST, _calls, harness)
+    BENCH_DIR, FAKE_DIGEST, OTHER_DIGEST, TEARDOWN_TAIL, _calls, harness)
 from tests.test_run8 import DELIV, PODS, H, _mem, _navs, q234
 
 K = load606.RUN8_KEYS
@@ -128,7 +128,7 @@ def test_run606_mismatched_digest_aborts_void_before_any_load(harness):
     assert rec["result"] == "VOID" and rec["expected"] == FAKE_DIGEST
     assert [r["digest"] for r in rec["pods"]] == [OTHER_DIGEST]
     gcl = [c["argv"][:3] for c in calls if c["tool"] == "gcloud"]
-    assert gcl[-1] == ["container", "clusters", "delete"]              # torn down
+    assert gcl[-3:] == TEARDOWN_TAIL                                  # torn down
 
 
 def test_run606_matching_digest_is_recorded_in_the_verdict(harness):
@@ -432,7 +432,7 @@ def test_run606_leftover_that_never_clears_fails_clearly_before_load(harness):
     rec = json.loads((tmp / "out" / "image-digest.jsonl").read_text())
     assert rec["result"] == "UNSETTLED" and rec["terminating"] == ["snowplow-old"]
     gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
-    assert gcl[-1] == ["container", "clusters", "delete"]
+    assert gcl[-3:] == TEARDOWN_TAIL
 
 
 def test_wrong_digest_with_a_terminating_leftover_is_void_not_unsettled():
