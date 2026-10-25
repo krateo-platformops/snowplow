@@ -97,7 +97,14 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
         labels = {"purpose": "snowplow-bench", "issue": "606",
                   "created-by": "bench-gke", "owner": "t",
                   "ttl-expires": str(int(time.time()) + 3600)}
-        print(json.dumps({"name": a[3], "location": opt("--region"),
+        # what GKE reports for the regional cluster gke-up made (#899 F1 records it)
+        print(json.dumps({"name": a[3], "location": opt("--region") or opt("--zone"),
+                          "locations": ["europe-west4-a"], "currentNodeCount": 5,
+                          "nodePools": [{"name": n, "config": {"machineType": m}, "initialNodeCount": c,
+                                         "locations": ["europe-west4-a"]}
+                                        for n, m, c in (("default-pool", "n2-standard-8", 3),
+                                                        ("snowplow", "n2-standard-8", 1),
+                                                        ("loadgen", "n2-standard-8", 1))],
                           "resourceLabels": labels}))
         sys.exit(0)
     if a[:3] == ["container", "clusters", "delete"]:

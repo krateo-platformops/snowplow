@@ -36,6 +36,13 @@ case "$RUN_NAME" in
 esac
 PROJECT="${PROJECT:-operations-dev-krateo-io}"
 ZONE="${ZONE:-europe-west4-a}"      # every node's zone
+# A ZONE, never a region: REGION is derived from it below, and a region here
+# would put the nodes in "europe-west4" and the control plane in "europe" (#899
+# F2). The same pattern as bench/gke.py ZONE_PATTERN; refused before anything.
+if ! [[ "$ZONE" =~ ^[a-z]+-[a-z]+[0-9]+-[a-z]$ ]]; then
+  echo "ZONE must be a zone (e.g. europe-west4-a), got '$ZONE': every node goes in it and the control plane in its region" >&2
+  exit 2
+fi
 # The control plane is REGIONAL (3 replicas; run 16 attempt 2 lost B's zonal
 # one for 5+ minutes): gcloud and the kube context name the region.
 REGION="${ZONE%-*}"
@@ -402,14 +409,20 @@ s_source() {
 }
 s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
 s_up() {
-  # the run's record of the cluster's shape (runs 14-16: zonal control plane; 17+: regional)
-  python3 -m bench.gke gke-shape --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
-      --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" > "$OUT/cluster-shape.jsonl"
   log "control plane: regional (${REGION}); every node in ${ZONE}; context ${KCTX}"
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
       --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES
   run "${K[@]}" version
+  # the run's record of the cluster's shape (runs 14-16: zonal control plane;
+  # 17+: regional), READ BACK from GKE after create (#899 F1): where the control
+  # plane is, where the nodes are and how many — not what the spec asked for.
+  # A describe that does not answer records the shape as unknown (never the
+  # spec); a dry run records the spec, marked as such.
+  local shape_msg
+  shape_msg="$(python3 -m bench.gke gke-shape --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
+      --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES 2>&1 >"$OUT/cluster-shape.jsonl")"
+  log "$shape_msg"
 }
 s_install() {
   cat > "$OUT/installer-values.yaml" <<EOF

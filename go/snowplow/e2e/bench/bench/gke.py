@@ -164,8 +164,21 @@ def region_of(zone: str) -> str:
     return zone.rsplit("-", 1)[0] if _is_zone(zone) else zone
 
 
+ZONE_PATTERN = r"[a-z]+-[a-z]+\d+-[a-z]"      # run606.sh checks ZONE against the same
+
+
 def _is_zone(location: str) -> bool:
-    return bool(re.fullmatch(r"[a-z]+-[a-z]+\d+-[a-z]", location or ""))
+    return bool(re.fullmatch(ZONE_PATTERN, location or ""))
+
+
+def check_zone(zone: str) -> str:
+    """The node zone, e.g. europe-west4-a. A REGION here (europe-west4) would
+    put every node in --node-locations europe-west4 and make the region
+    europe-west4 itself: refused at once instead (#899 F2)."""
+    if not _is_zone(zone):
+        raise ValueError(f"zone {zone!r} is not a zone (e.g. europe-west4-a): every node goes in "
+                         f"this zone and the control plane in its region")
+    return zone
 
 
 def _location_flag(location: str) -> list[str]:
@@ -218,6 +231,7 @@ def default_spec(name: str | None = None, *, now: float | None = None,
     if name is None:
         name = BENCH_NAME_PREFIX + time.strftime("%m%d-%H%M", time.gmtime(now))
     _check_name(name)
+    check_zone(zone)
     owner = owner or os.environ.get("USER", "unknown")
     kdir = kubeconfig_dir or os.path.expanduser("~/.kube/snowplow-bench")
     pools = (
@@ -242,13 +256,45 @@ def kube_context(spec: ClusterSpec) -> str:
     return f"gke_{spec.project}_{spec.region}_{spec.name}"
 
 
-def cluster_shape(spec: ClusterSpec) -> dict:
-    """The run's record of the cluster's shape (runs 14-16: zonal control
-    plane; 17+: regional), for the verdict."""
-    return {"kind": "cluster_shape", "control_plane": "regional", "region": spec.region,
+DRY_SHAPE_SOURCE = "spec (dry run: nothing created, nothing observed)"
+
+
+def cluster_shape(spec: ClusterSpec, source: str = DRY_SHAPE_SOURCE) -> dict:
+    """The shape gke-up ASKS for (runs 14-16: zonal control plane; 17+:
+    regional). What the run records is what GKE reports (`observed_shape`);
+    this is only the dry run's record, and says so."""
+    return {"kind": "cluster_shape", "source": source,
+            "control_plane": "regional", "region": spec.region,
             "node_locations": [spec.zone], "cluster": spec.name,
             "node_pools": [{"name": p.name, "machine_type": p.machine_type, "nodes": p.count}
                            for p in (spec.platform_pool, *spec.extra_pools)]}
+
+
+def observed_shape(describe: dict) -> dict:
+    """The run's record of the cluster's shape, from `gcloud container
+    clusters describe` AFTER create (#899 F1): where GKE put the control plane
+    (`location`: a region → regional, a zone → zonal), where it put the nodes
+    (`locations`) and how many there are (`currentNodeCount`) — not what the
+    spec asked for."""
+    loc = describe.get("location") or describe.get("zone") or ""
+    return {"kind": "cluster_shape", "source": "gcloud container clusters describe, after create",
+            "control_plane": "zonal" if _is_zone(loc) else ("regional" if loc else None),
+            "location": loc or None, "region": region_of(loc) if loc else None,
+            "node_locations": list(describe.get("locations") or []),
+            "current_node_count": describe.get("currentNodeCount"),
+            "cluster": describe.get("name"),
+            "node_pools": [{"name": p.get("name"),
+                            "machine_type": (p.get("config") or {}).get("machineType"),
+                            "locations": list(p.get("locations") or []),
+                            "nodes_per_location": p.get("initialNodeCount")}
+                           for p in describe.get("nodePools") or []]}
+
+
+def unobserved_shape(spec: ClusterSpec, why: str) -> dict:
+    """The record when the describe after create did not answer: the shape is
+    UNKNOWN (control_plane null), with what was asked for beside it."""
+    return {"kind": "cluster_shape", "source": f"unobserved: {why}", "control_plane": None,
+            "cluster": spec.name, "requested": cluster_shape(spec, "spec: what gke-up asked for")}
 
 
 def _labels_arg(labels: dict[str, str]) -> str:
@@ -372,9 +418,12 @@ def list_command(project: str = DEFAULT_PROJECT) -> list[str]:
             "--format", "json"]
 
 
-def describe_command(spec: ClusterSpec) -> list[str]:
+def describe_command(spec: ClusterSpec, location: str | None = None) -> list[str]:
+    """`location`: the region (default), or the node zone for a zonal cluster
+    made before run 17."""
     return ["gcloud", "container", "clusters", "describe", spec.name,
-            "--project", spec.project, "--region", spec.region, "--format", "json"]
+            "--project", spec.project, *_location_flag(location or spec.region),
+            "--format", "json"]
 
 
 # ─── Endpoint resolution ────────────────────────────────────────────────────
@@ -621,9 +670,38 @@ def run_with_teardown(spec: ClusterSpec, body: Callable[[], int], *,
 _INCOMPATIBLE_OP = re.compile(r"running incompatible operation (operation-[A-Za-z0-9-]+)")
 
 
-def operation_wait_command(op: str, spec: ClusterSpec) -> list[str]:
+def operation_wait_command(op: str, spec: ClusterSpec, location: str | None = None) -> list[str]:
     return ["gcloud", "container", "operations", "wait", op,
-            "--project", spec.project, "--region", spec.region]
+            "--project", spec.project, *_location_flag(location or spec.region)]
+
+
+# gcloud's answer for a cluster that is not at the location asked:
+# "ResponseError: code=404, message=Not found: projects/…/locations/…/clusters/…"
+_NOT_FOUND = re.compile(r"code=404|NOT_FOUND|Not found:")
+
+
+def find_cluster(spec: ClusterSpec, *, log: Callable[[str], None] = print) -> tuple[str, dict]:
+    """(location, describe) of the bench cluster `spec` names: in its region
+    (runs 17+), or — only when the region answers NotFound — in its node zone
+    (a zonal cluster made before run 17, #899 F3). Any other describe failure
+    raises: an unanswered describe is not evidence the cluster is elsewhere."""
+    for location in (spec.region, spec.zone):
+        err: list[str] = []
+        rc, out = execute(describe_command(spec, location), dry_run=False, log=log, stderr_out=err)
+        if rc == 0:
+            d = json.loads(out)
+            if d.get("name") != spec.name:
+                raise NotDeletable(f"describe of {spec.name} in {location} returned {d.get('name')!r}")
+            return location, d
+        not_found = bool(_NOT_FOUND.search(err[-1] if err else ""))
+        if not not_found:
+            raise RuntimeError(f"describe {spec.name} in {location} failed (rc={rc})")
+        if location == spec.zone:
+            raise RuntimeError(f"describe {spec.name} failed (rc={rc}): not found in region "
+                               f"{spec.region} nor in zone {spec.zone}; it may already be gone")
+        log(f"{spec.name} not found in region {spec.region}; looking in zone {spec.zone} "
+            f"(a zonal cluster made before run 17)")
+    raise AssertionError("unreachable")
 
 
 # gke-down's budget when none is given (run606.sh passes DOWN_BUDGET_S, whose
@@ -656,19 +734,21 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
     waits for THAT operation (`gcloud container operations wait`, bounded by
     what is left of the budget), then retries the delete — as often as the
     cluster names a new in-flight operation, until the budget is spent.
-    Any other delete failure raises at once."""
-    rc, out = execute(describe_command(spec), dry_run=dry_run, log=log)
+    Any other delete failure raises at once.
+
+    The cluster is looked up in its region, then — on NotFound only — in its
+    node zone (a zonal cluster made before run 17), and deleted where it was
+    found (#899 F3)."""
     if dry_run:
+        execute(describe_command(spec), dry_run=True, log=log)
         execute(_kubectl(spec) + ["delete", "pvc", "--all", "--all-namespaces", "--wait=false"],
                 dry_run=True, log=log)
         execute(delete_command(spec), dry_run=True, log=log)
         execute(disks_list_command(spec), dry_run=True, log=log)
         return []
-    if rc != 0:
-        raise RuntimeError(f"describe {spec.name} failed (rc={rc}); "
-                           f"cluster may already be gone")
-    describe = json.loads(out)
+    location, describe = find_cluster(spec, log=log)
     assert_deletable(describe)
+    delete_argv = delete_command(spec.name, project=spec.project, location=location)
     budget = DEFAULT_DOWN_BUDGET_S if budget_s is None else budget_s
     start = clock()
     deadline = start + budget
@@ -677,11 +757,12 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
                                  deadline=start + budget / 2)
     while True:
         err: list[str] = []
-        rc, _ = execute(delete_command(spec), dry_run=False, log=log, stderr_out=err)
+        rc, _ = execute(delete_argv, dry_run=False, log=log, stderr_out=err)
         if rc == 0:
             problems = []
             try:
-                if wait_cluster_gone(spec, log=log, deadline=deadline, clock=clock, sleep=sleep):
+                if wait_cluster_gone(spec, log=log, deadline=deadline, clock=clock, sleep=sleep,
+                                     location=location):
                     disk_backstop(spec, cluster_id=cluster_id_b32(describe), recorded=recorded, log=log)
                 else:
                     raise RuntimeError(
@@ -701,7 +782,8 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
                                + (f"; still blocked by {m.group(1)} when the budget ran out" if m else ""))
         log(f"delete {spec.name} blocked by in-flight {m.group(1)}: waiting for it, then retrying")
         try:
-            wrc, _ = execute(operation_wait_command(m.group(1), spec), dry_run=False, log=log, timeout=left)
+            wrc, _ = execute(operation_wait_command(m.group(1), spec, location), dry_run=False, log=log,
+                             timeout=left)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"delete {spec.name}: {m.group(1)} still running when the "
                                f"budget ran out") from None
@@ -959,13 +1041,18 @@ def disk_backstop(spec: ClusterSpec, *, cluster_id: str | None, recorded: list[d
 
 
 def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline: float,
-                      clock: Callable[[], float], sleep: Callable[[float], None]) -> bool:
+                      clock: Callable[[], float], sleep: Callable[[float], None],
+                      location: str | None = None) -> bool:
     """Poll describe until GKE reports the cluster NotFound (an --async delete
     returns at once; its nodes, and the disks attached to them, go when the
-    operation ends). False when the budget ends first."""
+    operation ends). False when the budget ends first. `location`: where the
+    cluster was found and deleted (its region; its zone for a zonal cluster
+    made before run 17) — polled THERE, or the region's describe 404s at once
+    and the backstop runs while the nodes still hold the PVC disks (#896
+    reviewer: a false "no disk left")."""
     while True:
         err: list[str] = []
-        rc, _ = execute(describe_command(spec), dry_run=False, log=lambda _: None, stderr_out=err)
+        rc, _ = execute(describe_command(spec, location), dry_run=False, log=lambda _: None, stderr_out=err)
         if rc != 0 and re.search(r"(?i)not ?found|was not found|404", err[-1] if err else ""):
             return True
         if clock() >= deadline:
@@ -1034,8 +1121,32 @@ def cmd_gke_up(a) -> int:
 
 
 def cmd_gke_shape(a) -> int:
-    """The cluster-shape record run606 keeps with the run (gke-up's shape)."""
-    print(json.dumps(cluster_shape(_spec_from_args(a))))
+    """The cluster-shape record run606 keeps with the run, read back from GKE
+    after create (a read-only describe). A dry run (no --yes) records the
+    spec, marked as such. A describe that fails records the shape as
+    UNKNOWN — never the spec in its place — and exits 0: the record is
+    evidence for the verdict, not a reason to end the run."""
+    spec = _spec_from_args(a)
+    say = lambda m: sys.stderr.write(m + "\n")  # noqa: E731
+    if not a.yes:
+        rec = cluster_shape(spec)
+    else:
+        err: list[str] = []
+        rc, out = execute(describe_command(spec), dry_run=False, log=lambda _m: None, stderr_out=err)
+        try:
+            rec = observed_shape(json.loads(out)) if rc == 0 else None
+            why = f"describe failed (rc={rc}): {(err[-1] if err else '').strip()[:300]}"
+        except ValueError as e:
+            rec, why = None, f"describe answered with no JSON ({e})"
+        if rec is None:
+            rec = unobserved_shape(spec, why)
+    if rec["control_plane"] is None:
+        say(f"cluster shape UNKNOWN: {rec['source']}")
+    else:
+        say(f"cluster shape ({rec['source']}): control plane {rec['control_plane']} "
+            f"({rec.get('location') or rec.get('region')}); nodes in {','.join(rec['node_locations']) or '?'}"
+            + (f"; {rec['current_node_count']} nodes" if rec.get("current_node_count") is not None else ""))
+    print(json.dumps(rec))
     return 0
 
 
@@ -1141,12 +1252,20 @@ def cmd_gke_env(a) -> int:
     return 0
 
 
+def _zone_arg(v: str) -> str:
+    import argparse
+    try:
+        return check_zone(v)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def add_parsers(sub) -> None:
     def common(p, *, name_required=True):
         p.add_argument("--name", required=name_required, default=None,
                        help=f"cluster name; must start with {BENCH_NAME_PREFIX}")
         p.add_argument("--project", default=DEFAULT_PROJECT)
-        p.add_argument("--zone", default=DEFAULT_ZONE,
+        p.add_argument("--zone", default=DEFAULT_ZONE, type=_zone_arg,
                        help="the zone every node is in; the control plane is regional (its region)")
         p.add_argument("--yes", action="store_true",
                        help="actually run gcloud (default: dry run)")
@@ -1164,7 +1283,8 @@ def add_parsers(sub) -> None:
                          f"{BENCH_PVC_FOOTPRINT_GB})")
     up.set_defaults(func=cmd_gke_up)
 
-    shape = sub.add_parser("gke-shape", help="the cluster-shape record of a run (no cloud call)")
+    shape = sub.add_parser("gke-shape", help="the cluster-shape record of a run: read back from GKE "
+                                             "with --yes (read-only describe); the spec without")
     common(shape)
     shape.add_argument("--loadgen-machine-type", default=DEFAULT_LOADGEN_MACHINE)
     shape.set_defaults(func=cmd_gke_shape)
