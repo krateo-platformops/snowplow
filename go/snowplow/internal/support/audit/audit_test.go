@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/log"
@@ -22,6 +24,13 @@ func flattenRecords(rec logtest.Recording) []logtest.Record {
 		out = append(out, recs...)
 	}
 	return out
+}
+
+// actorCtx is a request context carrying an authenticated actor, the way every
+// audited route's UserConfig middleware leaves it.
+func actorCtx() context.Context {
+	return xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}}))
 }
 
 func TestSanitizeID(t *testing.T) {
@@ -114,7 +123,7 @@ func TestEmitOTLPRecord(t *testing.T) {
 	rec := logtest.NewRecorder()
 	e := New(rec.Logger("test"))
 
-	ctx := WithSessionID(context.Background(), "corr-42")
+	ctx := WithSessionID(actorCtx(), "corr-42")
 
 	e.Emit(ctx, Event{
 		Action:    "call",
@@ -169,7 +178,7 @@ func TestEmitOTLPRecord(t *testing.T) {
 func TestEmitFailureSeverity(t *testing.T) {
 	rec := logtest.NewRecorder()
 	e := New(rec.Logger("test"))
-	e.Emit(context.Background(), Event{Action: "call", Outcome: "failure", Code: 500})
+	e.Emit(actorCtx(), Event{Action: "call", Verb: "POST", Resource: "fireworksapps", Outcome: "failure", Code: 500})
 
 	got := flattenRecords(rec.Result())
 	if len(got) != 1 {
@@ -193,7 +202,7 @@ func TestPackageEmitNoOpWhenUnset(t *testing.T) {
 // it (the add() empty-skip → backward-compatible record shape).
 func TestEmitRecordsSubresource(t *testing.T) {
 	rec := logtest.NewRecorder()
-	New(rec.Logger("test")).Emit(context.Background(), Event{
+	New(rec.Logger("test")).Emit(actorCtx(), Event{
 		Action: "call", Verb: "PUT", Group: "example.com", Version: "v1",
 		Resource: "widgets", Subresource: "status", Name: "w1", Namespace: "ns1",
 		Outcome: "success", Code: 200,
@@ -212,7 +221,7 @@ func TestEmitRecordsSubresource(t *testing.T) {
 
 	// A whole-object call (no subresource) must OMIT the attribute entirely.
 	rec2 := logtest.NewRecorder()
-	New(rec2.Logger("test")).Emit(context.Background(), Event{
+	New(rec2.Logger("test")).Emit(actorCtx(), Event{
 		Action: "call", Verb: "PUT", Resource: "widgets", Name: "w1",
 		Namespace: "ns1", Outcome: "success", Code: 200,
 	})

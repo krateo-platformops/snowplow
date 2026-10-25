@@ -26,6 +26,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"expvar"
 	"net/http"
 	"regexp"
 	"sync/atomic"
@@ -152,6 +153,71 @@ type Event struct {
 	Code int
 	// Message is an optional human-readable detail -> LogRecord.Body.
 	Message string
+
+	// ServerAddress is the host (and port) the action was sent to ->
+	// server.address. Set by the RESTAction stage emit (AUDIT-4), where a
+	// write can go to an external API rather than the Kubernetes apiserver;
+	// it never carries userinfo or a query.
+	ServerAddress string
+	// URLPath is the request path, without its query -> url.path.
+	URLPath string
+	// RESTActionNamespace/RESTActionName/Stage name the RESTAction and the
+	// api[] stage that performed the action -> krateo.restaction.{namespace,
+	// name,stage}. Empty for an action that is not a RESTAction stage.
+	RESTActionNamespace string
+	RESTActionName      string
+	Stage               string
+}
+
+// Incomplete-record reasons: the closed set of fields whose absence makes a
+// record unanswerable, in the order they are checked.
+const (
+	IncompleteActor  = "actor"
+	IncompleteAction = "action"
+	IncompleteMethod = "method"
+	IncompleteTarget = "target"
+)
+
+// incomplete counts records that were NOT emitted because they could not say
+// who did what to which target, by the first missing field.
+// snowplow_audit_incomplete_total in /debug/vars. Every cell is published at
+// startup, so a 0 is a reading.
+var incomplete = func() *expvar.Map {
+	m := expvar.NewMap("snowplow_audit_incomplete_total")
+	for _, k := range []string{IncompleteActor, IncompleteAction, IncompleteMethod, IncompleteTarget} {
+		m.Add(k, 0)
+	}
+	return m
+}()
+
+// missingField returns the first field ev (with actor user) lacks to be an
+// answerable record, or "" when it has them all.
+//
+// AUDIT-4 (installer#410): "no record is emitted without an actor; prefer no
+// record to a recordless actor". A record that carries only event.name, outcome
+// and session.id passes any "is the trail emitting" check and answers none of
+// the questions the trail exists for, so it is refused here, at the one place
+// every emit site passes, instead of trusting each site to fill every field.
+func missingField(user string, ev Event) string {
+	switch {
+	case user == "":
+		return IncompleteActor
+	case ev.Action == "":
+		return IncompleteAction
+	case ev.Verb == "":
+		return IncompleteMethod
+	case ev.Resource == "" && ev.ServerAddress == "":
+		return IncompleteTarget
+	}
+	return ""
+}
+
+// IncompleteCount returns how many records were refused for reason.
+func IncompleteCount(reason string) int64 {
+	if v, ok := incomplete.Get(reason).(*expvar.Int); ok {
+		return v.Value()
+	}
+	return 0
 }
 
 // Emitter wraps a single OTel Logs API Logger. Construct once at startup
@@ -185,9 +251,23 @@ func Emit(ctx context.Context, ev Event) {
 
 // Emit writes one canonical AuditEvent as an OTLP LogRecord. ctx MUST carry
 // the active span (so the SDK stamps TraceId/SpanId) and baggage (so
-// session.id is captured). A nil Emitter is a no-op.
+// session.id is captured). A nil Emitter is a no-op. A record that cannot name
+// its actor (the authenticated user on ctx), action, method and target is not
+// emitted; it is counted in snowplow_audit_incomplete_total (missingField).
 func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	if e == nil || e.logger == nil {
+		return
+	}
+
+	// Acting user identity, from the request's authenticated user info.
+	user := ""
+	var groups []string
+	if ui, err := xcontext.UserInfo(ctx); err == nil {
+		user = ui.Username
+		groups = ui.Groups
+	}
+	if reason := missingField(user, ev); reason != "" {
+		incomplete.Add(reason, 1)
 		return
 	}
 
@@ -208,15 +288,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 		rec.SetSeverityText("ERROR")
 	}
 
-	// Acting user identity, from the request's authenticated user info.
-	user := ""
-	var groups []string
-	if ui, err := xcontext.UserInfo(ctx); err == nil {
-		user = ui.Username
-		groups = ui.Groups
-	}
-
-	attrs := make([]attribute.KeyValue, 0, 16)
+	attrs := make([]attribute.KeyValue, 0, 22)
 	add := func(k, v string) {
 		if v != "" {
 			attrs = append(attrs, attribute.String(k, v))
@@ -238,6 +310,11 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	add("krateo.action", ev.Action)
 	add("http.request.method", ev.Verb)
 	add("outcome", ev.Outcome)
+	add("server.address", ev.ServerAddress)
+	add("url.path", ev.URLPath)
+	add("krateo.restaction.namespace", ev.RESTActionNamespace)
+	add("krateo.restaction.name", ev.RESTActionName)
+	add("krateo.restaction.stage", ev.Stage)
 
 	if len(groups) > 0 {
 		// v0.21.0: the log API adopted the shared attribute value types, so the

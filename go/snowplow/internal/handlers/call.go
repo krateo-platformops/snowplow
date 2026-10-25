@@ -217,8 +217,10 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// Audit correlation: every WRITE through /call emits a
 	// normalized AuditEvent carrying the request correlation id (see
 	// internal/support/audit) so a portal action is linkable to the
-	// object it mutated. Reads are deliberately not audited here (volume;
-	// they are already covered by the request log + trace id).
+	// object it mutated. Reads are not audited: AUDIT-4 (installer#410) covers
+	// mutations. The request log and trace id once named as their cover do not
+	// cover them (measured on 057: no outcome/resource/session in the gateway
+	// log; the trace is sampled) — docs/architecture/audit-coverage.md.
 	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
 		outcome, code, msg := "success", http.StatusOK, ""
 		if rt.Status == response.StatusFailure {

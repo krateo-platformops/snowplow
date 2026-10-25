@@ -1457,6 +1457,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// these as res.Status == Failure with the error message).
 		_ = fetchErr
 	}
+	// AUDIT-4 (installer#410) — a write-verb stage records the answer of the
+	// authority it was sent to, read HERE: before the stage filter below can turn
+	// an accepted write into a 500 of its own (stage_audit.go).
+	auditStageWrite(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, apiCall, call, res)
 
 	// SUCCESS (feat/restaction-yaml-response): on a non-Failure fetch the
 	// owned fetch does NOT invoke call.ResponseHandler (unlike httpcall.Do);

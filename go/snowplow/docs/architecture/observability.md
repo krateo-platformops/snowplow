@@ -81,7 +81,10 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   (`session.id`)** — minted/accepted by `audit.Middleware()` and serialized
   downstream by the Baggage propagator. It **replaces** the old
   `X-Krateo-Correlation-Id` header entirely; the shortid `X-Krateo-TraceId`
-  and the OTel `traceparent` coexist.
+  and the OTel `traceparent` coexist. Which actions emit an AuditEvent, which
+  do not, and why: [audit-coverage.md](audit-coverage.md). A record that cannot
+  name its actor, action, method and target is refused at the emitter and
+  counted in `snowplow_audit_incomplete_total{actor,action,method,target}`.
 
 ---
 
