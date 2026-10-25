@@ -34,7 +34,8 @@
 # Out: $PAIR_OUT/pair.json (bench commit, both runs' names / tags / digests /
 # OUTs), pair.log, <A|B>.console, paired-verdict.json. Exit: the paired
 # verdict's (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE); 2 = refused before
-# any cloud call. A restart of B FAILs the pair; a restart of A is recorded and
+# anything was created (#895: the SSD quota read refuses too). A restart of B
+# FAILs the pair; a restart of A is recorded and
 # its not-Ready time is removed from both runs (bench/custlat.py's module doc):
 # the pair reads each run's k6 stream from its OUT for that.
 set -Eeuo pipefail
@@ -107,6 +108,15 @@ if [[ "$DRY" == "1" ]]; then
   log "DRY: both runs would start now; then ${eval_cmd[*]} > $PAIR_OUT/paired-verdict.json"
   exit 0
 fi
+# #895: both clusters' PVC disks must fit the region's SSD_TOTAL_GB together
+# (each gke-up alone would see room for itself); a read, nothing is created
+quota_args=()
+[[ -n "${PROJECT:-}" ]] && quota_args+=(--project "$PROJECT")
+[[ -n "${ZONE:-}" ]] && quota_args+=(--zone "$ZONE")
+if ! quota_msg="$(python3 -m bench.gke gke-ssd-quota ${quota_args[@]+"${quota_args[@]}"} --runs 2 2>&1)"; then
+  refuse "${quota_msg#refusing: }"
+fi
+log "$quota_msg"
 
 python3 -c 'import json, sys, time
 keys = ("run_name", "tag", "digest", "out")

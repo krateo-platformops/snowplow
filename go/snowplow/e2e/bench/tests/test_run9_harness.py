@@ -27,7 +27,7 @@ import pytest
 from bench import load606, load606_job
 from tests.test_navmodel import INIT, PORTAL, Fake, P
 from tests.test_run606_pr483 import _env483
-from tests.test_run606_real_sequence import BENCH_DIR, _calls, harness  # noqa: F401
+from tests.test_run606_real_sequence import BENCH_DIR, TEARDOWN_TAIL, _calls, harness  # noqa: F401
 from tests.test_run8 import DELIV, PODS, _mem, _navs, q234
 
 K = load606.RUN8_KEYS
@@ -60,7 +60,7 @@ def test_run606_measure_failure_collects_everything_before_teardown(harness):
     v = json.loads((out / "verdict.json").read_text())
     assert v["report"]["navs"] == 2                    # the driver's records made it
     gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
-    assert gcl[-1] == ["container", "clusters", "delete"]
+    assert gcl[-3:] == TEARDOWN_TAIL
 
 
 def test_run606_failure_before_measure_does_not_try_to_collect(harness):
