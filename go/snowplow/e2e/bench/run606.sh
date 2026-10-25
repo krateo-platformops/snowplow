@@ -629,37 +629,89 @@ s_measure() {
   local deadline=$(( $(date +%s) + MEASURE_WAIT_S ))
   # The teardown trap collects what exists before the cluster goes (#763).
   wait_drive_done "$deadline" || return 1
-  # A failed wait is a verdict when the API server answers (/readyz); while it
-  # does not, the wait is retried to the same deadline (run 16 attempt 2).
-  while ! run "${K[@]}" -n bench-loadgen wait job/fresh606 --for=condition=Complete \
+  # The wait's own "timed out waiting for the condition" is the verdict: the
+  # watch ran (the API answered) for its whole --timeout, which is what was
+  # left to the deadline. Otherwise a failed wait is a verdict only when the
+  # API server ANSWERED it with an error, twice (read_verdict); anything else
+  # (a connection lost, a TLS / dial timeout, a 5xx) is retried to the same
+  # deadline (run 16 attempt 2).
+  local rv
+  while ! kwait "${K[@]}" -n bench-loadgen wait job/fresh606 --for=condition=Complete \
       --timeout="$(( deadline > $(date +%s) ? deadline - $(date +%s) : 1 ))s"; do
-    if api_answers; then
+    if grep -q 'timed out waiting for the condition' "$KERR" 2>/dev/null; then
       api_seen ok
       log "measure FAILED: fresh606 not Complete within ${MEASURE_WAIT_S}s"
       return 1
     fi
-    api_seen down "wait job/fresh606"
+    rv=0
+    read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get job/fresh606 -o name || rv=$?
+    case "$rv" in
+      0) api_seen ok
+         log "measure FAILED: waiting for fresh606 failed while the API server answers: $(kerr_line)"
+         return 1 ;;
+      2) api_seen ok ;;
+      *) api_seen down "wait job/fresh606" ;;
+    esac
     if (( $(date +%s) >= deadline )); then
-      log "measure FAILED: fresh606 not seen Complete within ${MEASURE_WAIT_S}s (the API server did not answer)"
+      log "measure FAILED: fresh606 not seen Complete within ${MEASURE_WAIT_S}s (last error: $(kerr_line))"
       return 1
     fi
     sleep "$DRIVE_POLL_S"
   done
   api_seen ok
 }
+# kwait <kubectl wait ...>: like run, with kubectl's stderr kept in $KERR (the
+# failed wait is classified from it) and its first line logged.
+kwait() {
+  if [[ "$DRY" == "1" ]]; then log "DRY: $*"; return 0; fi
+  log "RUN: $*"
+  "$@" 2>"$KERR" && return 0
+  local rc=$?
+  log "  wait failed (rc=$rc): $(kerr_line)"
+  return "$rc"
+}
 # api_answers: does the bench cluster's API server answer at all? (/readyz on
-# the same bench kubeconfig and context.) After a failed read it tells an
-# ANSWERED error (NotFound, Forbidden, a 5xx — a real answer: the step fails
-# with kubectl's own first error line) from no answer (an outage: waited out).
+# the same bench kubeconfig and context.)
 api_answers() { "${K[@]}" --request-timeout=30s get --raw=/readyz >/dev/null 2>&1; }
 KERR="$OUT/.kubectl-last-error"
-kerr_line() { head -1 "$KERR" 2>/dev/null | cut -c1-300; }
+# kerr_line: kubectl's first error line, for the log and collect's record —
+# with any user name ('User "…"') or e-mail address redacted first (a GKE
+# Forbidden names the operator's account; never logged, never recorded).
+kerr_line() {
+  head -1 "$KERR" 2>/dev/null \
+    | sed -E 's/User "[^"]*"/User "<redacted>"/g; s/[^[:space:]"'"'"']+@[^[:space:]"'"'"']+/<redacted>/g' \
+    | cut -c1-300
+}
+# answered_error: kubectl's error (in $KERR) is the API server's own ANSWER —
+# the request reached it and it refused: NotFound, Forbidden, Unauthorized,
+# BadRequest, Invalid. Anything else — "Unable to connect", a TLS / dial /
+# client timeout, EOF, a 5xx, a 429 — is waited out, never a verdict: the
+# read that spans an outage's END times out (up to ~75 s) while the server
+# comes back, so /readyz right after it answers (#898 re-review: run 16
+# attempt 2 again). The error itself decides, not a probe taken after it.
+answered_error() {
+  grep -qE 'Error from server \((NotFound|Forbidden|Unauthorized|BadRequest|Invalid)\)' "$KERR" 2>/dev/null
+}
+# read_verdict <re-read cmd...>: a read just failed (its stderr in $KERR).
+#   0  a verdict: it was ANSWERED with an error, /readyz answers, and the one
+#      re-read (<re-read cmd...>) was answered with an error again;
+#   2  the re-read succeeded: the API answers, no verdict — poll again;
+#   1  waited out: not an answered error, or /readyz or the re-read did not
+#      answer.
+read_verdict() {
+  answered_error || return 1
+  api_answers || return 1
+  if "$@" >/dev/null 2>"$KERR"; then return 2; fi
+  answered_error && return 0
+  return 1
+}
 # api_seen <ok|down> [what]: the API server's reachability as the measure /
 # collect loops see it. Logged on a change of state only (start and end of an
 # outage, each with its time). Each outage is recorded in api-outages.jsonl
 # with its window bounded by run606's own polls — from the last poll the API
 # answered to the first it answered again — which the paired verdict uses (an
-# A outage is excluded from both runs; a B outage makes the pair INVALID).
+# A outage is excluded from both runs; a B-ONLY outage makes the pair INVALID; one
+# at the same wall-clock time as an A outage is the vantage's, excluded from both).
 API_DOWN_SINCE="" API_DOWN_AT="" API_DOWN_WHAT="" API_LAST_OK=""
 api_seen() {
   local now
@@ -716,23 +768,27 @@ driver_jobs() { if [[ "$LOAD_DRIVER" == "k6" ]]; then echo "k6load k6browser"; e
 # Init), checked on EVERY driver Job at each poll (the browser pod's would
 # otherwise wait behind k6load's whole run).
 wait_drive_done() {
-  local deadline="$1" st ready failed want j k stuck pods src
+  local deadline="$1" st ready failed want j k stuck pods src rv
   if [[ "$DRY" == "1" ]]; then log "DRY: wait until every $(driver_jobs) pod is Ready (run over)"; return 0; fi
   for j in $(driver_jobs); do
     log "waiting for the driver: $j pods Ready = run over, results final"
     while true; do
       # A read the API server did not answer proves nothing: it is waited out
-      # (to the measure deadline), never concluded (run 16 attempt 2). A read
-      # it ANSWERED with an error is a real answer: the step fails on it.
+      # (to the measure deadline), never concluded (run 16 attempt 2). Only a
+      # read it ANSWERED with an error, twice (read_verdict), fails the step.
       if st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$j" \
                -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>"$KERR")"; then
         api_seen ok
-      elif api_answers; then
-        api_seen ok
-        log "measure FAILED: reading job/$j failed while the API server answers: $(kerr_line)"
-        return 1
       else
-        st=""; api_seen down "get job/$j"
+        st="" rv=0
+        read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$j" -o name || rv=$?
+        case "$rv" in
+          0) api_seen ok
+             log "measure FAILED: reading job/$j failed while the API server answers: $(kerr_line)"
+             return 1 ;;
+          2) api_seen ok ;;
+          *) api_seen down "get job/$j" ;;
+        esac
       fi
       IFS=/ read -r ready failed want <<< "$st"
       want="${want:-1}"
@@ -748,12 +804,16 @@ wait_drive_done() {
         # only positive evidence fails the step: a pod seen Pending past
         # DRIVER_PENDING_S (its own creationTimestamp) or a restarting init step
         if ! pods="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o json 2>"$KERR")"; then
-          if api_answers; then
-            api_seen ok
-            log "measure FAILED: listing the $k driver pods failed while the API server answers: $(kerr_line)"
-            return 1
-          fi
-          api_seen down "get pods job-name=$k"; continue
+          rv=0
+          read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o name || rv=$?
+          case "$rv" in
+            0) api_seen ok
+               log "measure FAILED: listing the $k driver pods failed while the API server answers: $(kerr_line)"
+               return 1 ;;
+            2) api_seen ok ;;
+            *) api_seen down "get pods job-name=$k" ;;
+          esac
+          continue
         fi
         api_seen ok
         src=0
@@ -780,7 +840,7 @@ driver_exit_codes() {
   local j="$1" p rc bad="" names
   if ! names="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$j" -o name 2>"$KERR")" \
       || [[ -z "$names" ]]; then
-    log "driver $j exit codes unknown (API did not answer: $(kerr_line)); the collected results say how it ended"
+    log "driver $j exit codes unknown ($(answered_error && echo "the API answered" || echo "API did not answer"): $(kerr_line)); the collected results say how it ended"
     return 0
   fi
   for p in $names; do
@@ -934,20 +994,23 @@ s_collect() {
   # has no pod at all makes the run INVALID with its reason in verdict.json.
   # Before mem606's bounded stop, so nothing slow can come between.
   : > "$OUT/job-pods.jsonl"
-  local jp
+  local jp rv
   for p in $(driver_jobs) fresh606 mem606; do
     # kubectl's own exit decides: an unanswered read is retried within
     # collect's cap; one still unanswered is recorded "unreadable", never as
     # a pod that is missing ("never started": run 16's bug, at collect)
+    # a verdict only when the API ANSWERED with an error, twice (read_verdict)
     while ! jp="$("${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>"$KERR")"; do
-      if api_answers || (( $(date +%s) + COLLECT_TIMEOUT_S >= COLLECT_DEADLINE )); then
+      rv=0
+      read_verdict "${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o name || rv=$?
+      if [[ "$rv" == "1" ]]; then api_seen down "collect: $p pods"; else api_seen ok; fi
+      if [[ "$rv" == "0" ]] || (( $(date +%s) + COLLECT_TIMEOUT_S >= COLLECT_DEADLINE )); then
         log "could not read how the $p pod(s) ended: $(kerr_line)"
         python3 -m bench.load606 job-pod-record --job "$p" \
-            --unreadable "$(api_answers && echo "the API answered: $(kerr_line)" || echo "API did not answer")" \
+            --unreadable "$([[ "$rv" == "1" ]] && echo "API did not answer" || echo "the API answered: $(kerr_line)")" \
             >> "$OUT/job-pods.jsonl"
         continue 2
       fi
-      api_seen down "collect: $p pods"
       sleep "$DRIVE_POLL_S"
     done
     api_seen ok

@@ -637,6 +637,14 @@ def control_plane_outages(outages: list[dict] | None, span) -> list[dict]:
     return out
 
 
+def vantage_outage(o: dict, others: list[dict]) -> bool:
+    """Does outage `o` (one run's) overlap, in wall-clock time, any of the
+    OTHER run's outages? Both runs of a pair are polled from the same
+    operator machine; a drop of its own network is an "outage" of both at
+    the same moment — the vantage's, not either cluster's."""
+    return any(o["t0"] < x["t1"] and x["t0"] < o["t1"] for x in others)
+
+
 def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[dict] | None,
            churns: list[dict] | None, tops: list[dict], pods: list[dict] | None = None,
            outages: list[dict] | None = None) -> dict:
@@ -792,7 +800,7 @@ def joint_exclusion(ra: dict, rb: dict) -> dict:
             other = map_interval(e["t0"], e["t1"], wins[x], wins[y], spans[x][0], spans[y][0])
             items.append({"what": f"{x.upper()} {e['kind']} #{i}", "why": e["why"], "kind": e["kind"],
                           "run": x.upper(), x: own, y: other})
-        # a control-plane outage is cut like a restart (B's also makes the pair INVALID)
+        # a control-plane outage is cut like a restart (a B-only one also makes the pair INVALID)
         for i, o in enumerate(r.get("control_plane_outages") or [], 1):
             own = [(o["t0"], o["t1"])]
             other = map_interval(o["t0"], o["t1"], wins[x], wins[y], spans[x][0], spans[y][0])
@@ -1003,17 +1011,30 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
             "B's readiness is unknown for " + "; ".join(f"{e['seconds']} s ({e['why']})" for e in unk)
             + ": the candidate's not-Ready time cannot be told from its Ready time"))
         if rda is not None and rdb is not None:
-            # A control-plane outage of B during the measure: INVALID, never PASS —
-            # the candidate may have caused it, so it is never silently cut
-            cpo = rb.get("control_plane_outages") or []
+            # A control-plane outage of B ONLY during the measure: INVALID, never
+            # PASS — the candidate may have caused it, so it is never silently
+            # cut. One that overlaps an A outage in wall-clock time is the
+            # vantage's: both runs are polled from the same operator machine, so
+            # its own network dropping reads as an outage of both at once (#898
+            # re-review). That one is excluded from both runs (joint_exclusion
+            # cuts every outage of either run from both) and noted, not voided.
+            cpo_a = ra.get("control_plane_outages") or []
+            cpo_all = rb.get("control_plane_outages") or []
+            shared = [o for o in cpo_all if vantage_outage(o, cpo_a)]
+            cpo = [o for o in cpo_all if o not in shared]
+            for o in shared:
+                notes.append(f"B's control plane did not answer for {o['seconds']} s from {o['t0']:.0f} to "
+                             f"{o['t1']:.0f} while A's did not answer either (same wall-clock time, "
+                             f"{o['source']}): the operator's vantage, not the candidate — excluded from both "
+                             f"runs, not voided")
             validity.append(_validity(
                 "control_plane_outage[b]", not cpo,
                 [{k: o[k] for k in ("t0", "t1", "seconds", "source", "open")} for o in cpo] or "none",
-                "B's API server answered through the measure",
+                "B's API server answered through the measure, except when A's did not either (the vantage's)",
                 "B's control plane did not answer during the measure ("
                 + "; ".join(f"{o['seconds']} s from {o['t0']:.0f} to {o['t1']:.0f}, {o['source']}" for o in cpo)
                 + "): the candidate may have caused it — never excluded silently"))
-            for o in ra.get("control_plane_outages") or []:
+            for o in cpo_a:
                 notes.append(f"A's control plane did not answer for {o['seconds']} s during the measure "
                              f"({o['source']}): excluded from both runs, like an A restart")
             validity.append(_validity("restarts_placed[a]", not rs["a"].get("unlocated"),

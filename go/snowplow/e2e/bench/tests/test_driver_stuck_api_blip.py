@@ -138,12 +138,13 @@ def test_collect_waits_out_an_outage_before_declaring_results_missing(harness): 
 
 @pytest.mark.parametrize("what, line", [
     ("job", 'Error from server (NotFound): jobs.batch "k6load" not found'),
-    ("pods", "Error from server (InternalError): an error on the server has prevented the request"),
+    ("pods", 'Error from server (Forbidden): pods is forbidden: User "<redacted>" cannot list resource "pods"'),
 ])
 def test_an_answered_error_fails_the_step_with_kubectls_line(harness, what, line):  # noqa: F811
-    """1: a read the API server ANSWERED with an error (NotFound, Forbidden, a
-    5xx) is a real answer — /readyz answers — so the step fails at once with
-    kubectl's own first error line; it is never waited out as an outage."""
+    """1: a read the API server ANSWERED with an error (NotFound, Forbidden,
+    Unauthorized, BadRequest, Invalid), /readyz answering and the one re-read
+    answered so too, is a real answer: the step fails with kubectl's own
+    first error line; it is never waited out as an outage."""
     t0 = time.time()
     p, _, out = _run606_k6(harness, FAKE_ANSWERED_ERROR=what, FAKE_DRIVER_RUNNING="k6load",
                            DRIVE_POLL_S="1", MEASURE_WAIT_S="3600")
@@ -162,8 +163,131 @@ def test_a_fresh606_wait_answered_with_an_error_fails_by_readyz(harness):  # noq
     t0 = time.time()
     subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True, timeout=300)
     log = (tmp / "out" / "run.log").read_text()
-    assert "measure FAILED: fresh606 not Complete within 3600s" in log and "API server unreachable" not in log
+    assert ('measure FAILED: waiting for fresh606 failed while the API server answers: Error from server '
+            '(Forbidden): jobs.batch "fresh606" is forbidden' in log) and "API server unreachable" not in log
     assert time.time() - t0 < 240
+
+
+# ─── #898 re-review: the error itself decides; one answer is re-read ───────
+
+def test_the_read_that_spans_an_outages_end_is_waited_out(harness):  # noqa: F811
+    """The reviewer's edge (#898 re-review): the last read of an outage times
+    out (TLS handshake timeout) while the API server comes back, so /readyz
+    right after it ANSWERS. That read proves nothing: waited out, the run
+    completes — not "reading job/k6load failed while the API server answers"
+    (run 16 attempt 2 again)."""
+    p, _, out = _run606_k6(harness, FAKE_EDGE_READS="3", DRIVE_POLL_S="1", MEASURE_WAIT_S="3600")
+    log = _log(out)
+    assert p.returncode == 0 and "measure FAILED" not in log, log[-3000:]
+    assert "API server unreachable since" in log and "API server reachable again" in log
+    rec = [json.loads(x) for x in (out / "api-outages.jsonl").read_text().splitlines()]
+    assert rec and rec[0]["seen_by"] == "get job/k6load"
+
+
+def test_the_outage_end_edge_on_the_driver_pod_listing_is_waited_out(harness):  # noqa: F811
+    """k6load keeps running; its pod listings time out while /readyz answers:
+    waited out — the step ends at its deadline, never on the timed-out read."""
+    p, _, out = _run606_k6(harness, FAKE_EDGE_PODS="3", FAKE_DRIVER_RUNNING="k6load", DRIVE_POLL_S="1",
+                           MEASURE_WAIT_S="8")
+    log = _log(out)
+    assert "listing the k6load driver pods failed" not in log and "never started" not in log, log[-3000:]
+    assert "measure FAILED: k6load not done within 8s" in log
+    assert "(get pods job-name=" in log and "waiting it out" in log
+
+
+@pytest.mark.parametrize("line, want", [
+    ('Error from server (Forbidden): pods is forbidden: User "a.b@ex.io" cannot list resource "pods"',
+     'Error from server (Forbidden): pods is forbidden: User "<redacted>" cannot list resource "pods"'),
+    ('Error from server (Forbidden): jobs.batch "k6load" is forbidden: User "system:anonymous" cannot get',
+     'Error from server (Forbidden): jobs.batch "k6load" is forbidden: User "<redacted>" cannot get'),
+    ("error: authenticated as someone@example.invalid (and 'x@y.z')",
+     "error: authenticated as <redacted> (and '<redacted>')"),
+    ("Unable to connect to the server: net/http: TLS handshake timeout",
+     "Unable to connect to the server: net/http: TLS handshake timeout"),
+])
+def test_kerr_line_redacts_users(tmp_path, line, want):
+    src = (BENCH_DIR / "run606.sh").read_text()
+    fn = src[src.index("kerr_line() {"):]
+    fn = fn[:fn.index("\n}\n") + 3]
+    kerr = tmp_path / "kerr"
+    kerr.write_text(line + "\n")
+    p = subprocess.run(["bash", "-c", fn + "\nkerr_line"], env={"KERR": str(kerr), "PATH": "/usr/bin:/bin"},
+                       capture_output=True, text=True)
+    assert p.stdout.strip() == want
+
+
+def test_kubectl_error_lines_never_carry_a_user(harness):  # noqa: F811
+    """kubectl's own error line is logged (and recorded at collect): any user
+    name or e-mail address in it is redacted first."""
+    p, _, out = _run606_k6(harness, FAKE_ANSWERED_ERROR="pods", FAKE_DRIVER_RUNNING="k6load",
+                           DRIVE_POLL_S="1", MEASURE_WAIT_S="3600")
+    log = _log(out)
+    assert 'User "<redacted>" cannot list resource "pods"' in log, log[-3000:]
+    assert "someone@example.invalid" not in log and "@example" not in log
+
+
+def test_the_outage_end_edge_on_the_fresh606_wait_is_waited_out(harness):  # noqa: F811
+    env, state, _, tmp = harness
+    env = dict(env, FAKE_EDGE_WAITS="2", DRIVE_POLL_S="1")
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
+                       timeout=300)
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode == 0 and "measure FAILED" not in log, log[-3000:]
+    assert "(wait job/fresh606): waiting it out" in log
+
+
+def test_the_outage_end_edge_at_collect_is_waited_out_not_unreadable(harness):  # noqa: F811
+    """collect's pod listing times out while /readyz answers: retried, then
+    read — never recorded "unreadable (the API answered: Unable to connect…)"."""
+    p, _, out = _run606_k6(harness, FAKE_EDGE_COLLECT="2", DRIVE_POLL_S="1")
+    recs = [json.loads(x) for x in (out / "job-pods.jsonl").read_text().splitlines()]
+    assert recs and not any(r.get("unreadable") for r in recs), recs
+
+
+def test_a_5xx_is_waited_out_never_a_verdict(harness):  # noqa: F811
+    """A 5xx (InternalError) is the server failing, not answering the read:
+    waited out like an outage, while /readyz answers."""
+    p, _, out = _run606_k6(harness, FAKE_5XX_READS="3", DRIVE_POLL_S="1", MEASURE_WAIT_S="3600")
+    log = _log(out)
+    assert p.returncode == 0 and "measure FAILED" not in log, log[-3000:]
+    assert "API server unreachable since" in log
+
+
+def test_one_answered_error_with_a_good_reread_is_no_verdict(harness):  # noqa: F811
+    """An answered NotFound whose re-read right after succeeds: the API
+    answers and the Job is there — no verdict, no outage, the run completes."""
+    p, _, out = _run606_k6(harness, FAKE_ANSWERED_ONCE="1", DRIVE_POLL_S="1", MEASURE_WAIT_S="3600")
+    log = _log(out)
+    assert p.returncode == 0 and "measure FAILED" not in log, log[-3000:]
+    assert "API server unreachable" not in log
+
+
+@pytest.mark.parametrize("line, answered", [
+    ('Error from server (NotFound): jobs.batch "k6load" not found', True),
+    ('Error from server (Forbidden): jobs.batch "k6load" is forbidden', True),
+    ("Error from server (Unauthorized): the server has asked for the client to provide credentials", True),
+    ("Error from server (BadRequest): a container name must be specified", True),
+    ('Error from server (Invalid): Job.batch "x" is invalid', True),
+    ("Unable to connect to the server: net/http: TLS handshake timeout", False),
+    ("Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout", False),
+    ("Error from server (InternalError): an error on the server has prevented the request", False),
+    ("Error from server (ServiceUnavailable): the server is currently unable to handle the request", False),
+    ("Error from server (TooManyRequests): the server has received too many requests", False),
+    ("Error from server (Timeout): the server was unable to return a response in the time allotted", False),
+    ("error: unexpected EOF", False),
+    ("The connection to the server 10.0.0.2:443 was refused - did you specify the right host or port?", False),
+    ("", False),
+])
+def test_only_the_servers_own_refusals_are_answers(tmp_path, line, answered):
+    """run606's answered_error, run on kubectl's own error lines."""
+    src = (BENCH_DIR / "run606.sh").read_text()
+    fn = src[src.index("answered_error() {"):]
+    fn = fn[:fn.index("\n}\n") + 3]
+    kerr = tmp_path / "kerr"
+    kerr.write_text(line + "\n")
+    rc = subprocess.run(["bash", "-c", fn + "\nanswered_error"],
+                        env={"KERR": str(kerr), "PATH": "/usr/bin:/bin"}).returncode
+    assert (rc == 0) == answered, line
 
 
 def test_job_pod_record_never_reads_an_unreadable_listing_as_missing():
@@ -240,6 +364,39 @@ def test_a_b_outage_makes_the_pair_invalid_with_its_window(tmp_path):
     assert "200.0 s from" in why and "run606 polls" in why and "never excluded silently" in why
     v = next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
     assert v["value"][0]["seconds"] == 200.0
+
+
+def test_the_operators_own_network_blip_is_the_vantages_not_bs(tmp_path):
+    """#898 re-review: both runs are polled from the same machine, so its own
+    network dropping records an outage in BOTH at the same wall-clock time.
+    That B outage is the vantage's: excluded from both runs (like A's), noted
+    — not INVALID. (The reviewer's same-time probe.)"""
+    t0 = 1000                                        # seconds after A's first call: wall-clock, both runs
+    a = _outage(P14, t0, t0 + 40, K0)                          # the same wall-clock moment
+    b = _shift(_outage(P14, t0, t0 + 40, K0), SHIFT)
+    assert a["api_outages"][0]["t0"] == b["api_outages"][0]["t0"]
+    p = _arms(tmp_path, a, b)
+    assert p["verdict"] == "PASS", (p["invalid_reasons"], p["fail_reasons"])
+    v = next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
+    assert v["result"] == "PASS" and v["value"] == "none"
+    whats = {it["what"] for it in p["exclusion"]["items"]}
+    assert {"A control-plane outage #1", "B control-plane outage #1"} <= whats
+    assert any("the operator's vantage, not the candidate" in n for n in p["notes"])
+
+
+@pytest.mark.parametrize("b_t0, b_t1, invalid", [
+    (1030, 1080, False),        # overlaps the end of A's [1000, 1040): the vantage's
+    (1040, 1080, True),         # starts as A's ends: B-only
+    (1200, 1240, True),         # B only, later
+])
+def test_only_a_b_only_outage_voids(tmp_path, b_t0, b_t1, invalid):
+    """wall-clock overlap with an A outage decides; touching is not overlap"""
+    a = _outage(P14, 1000, 1040, K0)
+    b = _shift(_outage(P14, b_t0, b_t1, K0), SHIFT)
+    p = _arms(tmp_path, a, b)
+    assert (p["verdict"] == "INVALID") == invalid, (p["invalid_reasons"], p["fail_reasons"])
+    if invalid:
+        assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.control_plane_outage[b]"]
 
 
 def test_an_outage_outside_the_measure_is_not_the_pairs(tmp_path):

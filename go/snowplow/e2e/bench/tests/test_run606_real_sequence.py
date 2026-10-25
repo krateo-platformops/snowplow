@@ -146,9 +146,48 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     if ans == "job" and a[:1] == ["get"] and any(x in (f"job/{d}" for d in drivers) for x in a):
         print('Error from server (NotFound): jobs.batch "k6load" not found', file=sys.stderr); sys.exit(1)
     if ans == "pods" and a[:2] == ["get", "pods"] and any(x in (f"job-name={d}" for d in drivers) for x in a) \
-            and "json" in a:
+            and ("json" in a or "name" in a):
+        print('Error from server (Forbidden): pods is forbidden: User "someone@example.invalid" cannot list resource "pods"',
+              file=sys.stderr); sys.exit(1)
+    def count(name, n_max):   # True for the first n_max calls counted under `name`
+        p =os.path.join(STATE, name)
+        n = int(open(p).read()) if os.path.exists(p) else 0
+        if n < n_max:
+            open(p, "w").write(str(n + 1))
+            return True
+        return False
+    driver_job_read = a[:1] == ["get"] and any(x in (f"job/{d}" for d in drivers) for x in a)
+    # FAKE_EDGE_READS=N (the #898 re-reviewer's): the last read of an outage — it
+    # timed out while the API server came back, so /readyz right after it
+    # ANSWERS (no down flag). Waited out, never a verdict.
+    if driver_job_read and count("edge_reads", int(os.environ.get("FAKE_EDGE_READS", "0"))):
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+        sys.exit(1)
+    # FAKE_EDGE_PODS=N / FAKE_EDGE_WAITS=N / FAKE_EDGE_COLLECT=N: the same edge
+    # on the driver pod listings, the fresh606 wait, and collect's pod listings
+    if (not os.path.exists(collect_started) and a[:2] == ["get", "pods"] and "json" in a
+            and any(x in (f"job-name={d}" for d in drivers) for x in a)
+            and count("edge_pods", int(os.environ.get("FAKE_EDGE_PODS", "0")))):
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+        sys.exit(1)
+    if a[:1] == ["wait"] and "job/fresh606" in a and count("edge_waits", int(os.environ.get("FAKE_EDGE_WAITS", "0"))):
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+        sys.exit(1)
+    if (os.path.exists(collect_started) and a[:2] == ["get", "pods"] and "json" in a
+            and any(x.startswith("job-name=") for x in a)
+            and count("edge_collect", int(os.environ.get("FAKE_EDGE_COLLECT", "0")))):
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+        sys.exit(1)
+    # FAKE_5XX_READS=N: the first N driver job reads answered with a 5xx while
+    # /readyz answers: an overloaded / restarting server, waited out
+    if driver_job_read and count("5xx_reads", int(os.environ.get("FAKE_5XX_READS", "0"))):
         print("Error from server (InternalError): an error on the server has prevented the request",
               file=sys.stderr); sys.exit(1)
+    # FAKE_ANSWERED_ONCE=1: the first driver job status read is answered
+    # NotFound, the re-read right after it is fine: no verdict on one answer
+    if driver_job_read and "jsonpath" in " ".join(a) and os.environ.get("FAKE_ANSWERED_ONCE") == "1" \
+            and count("answered_once", 1):
+        print('Error from server (NotFound): jobs.batch "k6load" not found', file=sys.stderr); sys.exit(1)
     if collect_down and a[:2] == ["get", "pods"] and any(x.startswith("job-name=") for x in a) and "json" in a:
         unanswered()
     # FAKE_EXIT_CODES_UNANSWERED=1: the driver pods' name listing (their exit
