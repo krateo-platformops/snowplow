@@ -33,7 +33,10 @@
 # that already holds a run (verdict.json or run.log) is refused.
 # Out: $PAIR_OUT/pair.json (bench commit, both runs' names / tags / digests /
 # OUTs), pair.log, <A|B>.console, paired-verdict.json. Exit: the paired
-# verdict's (0 PASS, 1 FAIL, 3 INVALID); 2 = refused before any cloud call.
+# verdict's (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE); 2 = refused before
+# any cloud call. A restart of B FAILs the pair; a restart of A is recorded and
+# its not-Ready time is removed from both runs (bench/custlat.py's module doc):
+# the pair reads each run's k6 stream from its OUT for that.
 set -Eeuo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
@@ -98,6 +101,7 @@ for x in A B; do
   log "run $x: dry pass OK"
 done
 eval_cmd=(python3 -m bench.custlat pair --a "$OUT_A/verdict.json" --b "$OUT_B/verdict.json"
+          --a-dir "$OUT_A" --b-dir "$OUT_B"
           --replica "$REPLICA" --expect-a "$EXPECTED_IMAGE_DIGEST_A" --expect-b "$EXPECTED_IMAGE_DIGEST_B")
 if [[ "$DRY" == "1" ]]; then
   log "DRY: both runs would start now; then ${eval_cmd[*]} > $PAIR_OUT/paired-verdict.json"
@@ -147,10 +151,16 @@ done
 trap - INT TERM HUP
 vrc=0
 "${eval_cmd[@]}" --completed-a "$DONE_A" --completed-b "$DONE_B" > "$PAIR_OUT/paired-verdict.json" || vrc=$?
-log "paired verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID) -> $PAIR_OUT/paired-verdict.json"
+log "paired verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $PAIR_OUT/paired-verdict.json"
 while IFS= read -r r; do
   [[ -n "$r" ]] && log "$r"
 done < <(python3 -c 'import json, sys; v = json.load(open(sys.argv[1]))
-print("\n".join(["INVALID: " + r for r in v["invalid_reasons"]] + [c["line"] for c in v["cells"]]))' \
+ex = (v.get("exclusion") or {}).get("items") or []
+print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidate_" in r]
+                + ["INVALID: " + r for r in v["invalid_reasons"]] + ["NOTE: " + n for n in v.get("notes") or []]
+                + ["EXCLUDED from both runs: %s (A %.0f s, B %.0f s): %s" % (i["what"], sum(b - a for a, b in i["a"]),
+                   sum(b - a for a, b in i["b"]), i["why"]) for i in ex]
+                + [c["line"] for c in v["cells"]] + (v.get("a_healthy_lines") or [])
+                + [r["line"] for r in v.get("b_inside_a_outage") or []]))' \
            "$PAIR_OUT/paired-verdict.json" 2>/dev/null || true)
 exit "$vrc"

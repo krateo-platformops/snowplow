@@ -11,7 +11,9 @@ tests/fixtures/customer_latency_run14_every50.json.gz is RECORDED from run
 14's artifacts (1.12.54, bench adc2e702): every 50th k6 http_req_duration
 point in stream order, the k6 config and browser sessions, mem606's phase
 anchors and refresher counter, fresh606's churn records and kubectl top
-(pod names replaced). Run 14's k6 stopped inside the first churn step; the
+(pod names replaced); since the paired gate's Ready-time rule (2026-10-24),
+from the same artifacts, each mem606 sample's readyz and prewarm_complete
+(all Ready) and every 50th http_req_failed point. Run 14's k6 stopped inside the first churn step; the
 paired-schedule runs below keep its calls and lay its six churn steps over
 k6's span instead (_paired), the shape K6_SPAN=churn produces. The tests
 write a run out in run606's $OUT layout and run `load606 evaluate` on it, as
@@ -80,9 +82,16 @@ def _write_run(d: Path, doc=P14, scale=lambda t, v: v, drop=lambda t: False, con
             fh.write(json.dumps({"metric": "http_req_duration", "type": "Point",
                                  "data": {"time": _iso(t), "value": scale(t, v),
                                           "tags": {"scenario": "navigate", "status": "200"}}}) + "\n")
+        for off, v in doc.get("failed") or []:
+            t = doc["t0"] + off
+            if drop(t):
+                continue
+            fh.write(json.dumps({"metric": "http_req_failed", "type": "Point",
+                                 "data": {"time": _iso(t), "value": v, "tags": {"scenario": "navigate"}}}) + "\n")
     (d / "k6" / "k6-summary.json").write_text(json.dumps({"config": config or doc["config"]}))
     (d / "browser" / "browser-summary.json").write_text(json.dumps({"sessions": doc["browser_sessions"]}))
-    files = {"mem-x.jsonl": doc["mem"], "fresh-x.jsonl": doc["churns"], "top.jsonl": doc["tops"]}
+    files = {"mem-x.jsonl": doc["mem"], "fresh-x.jsonl": doc["churns"], "top.jsonl": doc["tops"],
+             **({"pod-x.jsonl": doc["pods"]} if doc.get("pods") else {})}
     for name, rows in files.items():
         (d / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
     return [str(d / n) for n in files]
@@ -212,6 +221,10 @@ def test_b_with_fewer_calls_fails_req_s_only_below_the_floor(va, tmp_path, capsy
 
 # ─── option A on run 14's REAL spread ─────────────────────────────────────
 GP14 = json.loads((FIX / "customer_latency_run14_gate_phases.json").read_text())["gate_phases"]
+# a hand-built run's readiness and k6 errors: Ready all along, no failed request
+READY_NO_ERRORS = {"readiness": {"excluded": [], "restarts": {"restarted": False, "count": 0, "in_samples": 0,
+                                                              "unlocated": []}},
+                   "k6_errors": {"requests": 1000, "failed": 0, "rate": 0.0}}
 
 
 def _run14_pair(scale: dict, phases=("storm", "churn"), extra=None):
@@ -224,7 +237,7 @@ def _run14_pair(scale: dict, phases=("storm", "churn"), extra=None):
 
     def v(gp, dig):
         return {"verdict": "FAIL", "report": {"image_digest": {"expected": dig}, "customer_latency": {
-            "gate_phases": gp, "phases": {}, "k6_span": [0, 100], "schedule": {},
+            "gate_phases": gp, "phases": {}, "k6_span": [0, 100], "schedule": {}, **READY_NO_ERRORS,
             "windows": [["storm", float("-inf"), 10], ["churn:list_dep@1", 10, 90]]}}}
     return custlat.pair(v(gpa, DIG_A), v(gpb, DIG_B), replica=REPLICA)
 
@@ -286,7 +299,8 @@ def test_the_tolerance_is_the_method():
               "half_sd": {"p95_ms": sd, "p99_ms": sd, "req_s": sd}}
         return {"verdict": "FAIL", "report": {"image_digest": {"expected": DIG_A}, "customer_latency": {
             "gate_phases": {"storm": dict(ph), "churn": dict(ph)}, "phases": {}, "k6_span": [0, 100],
-            "windows": [["storm", float("-inf"), 10], ["churn:list_dep@10", 10, 90]], "schedule": {}}}}
+            "windows": [["storm", float("-inf"), 10], ["churn:list_dep@10", 10, 90]], "schedule": {},
+            **READY_NO_ERRORS}}}
     a = rep(0.05)
     b = copy.deepcopy(a)
     b["report"]["image_digest"]["expected"] = DIG_B
