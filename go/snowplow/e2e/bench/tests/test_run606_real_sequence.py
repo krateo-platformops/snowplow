@@ -94,6 +94,15 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
                          "message=Not found: clusters/" + a[3] + ".\\n")
         sys.exit(1)
     if a[:3] == ["container", "clusters", "describe"]:
+        # FAKE_REGIONAL_NOTFOUND=1: the region answers NotFound (gcloud's real
+        # text, the account a placeholder); a same-named zonal bench cluster
+        # answers in the zone (#900 review: run606's teardown must not go there)
+        if os.environ.get("FAKE_REGIONAL_NOTFOUND") == "1" and "--region" in a:
+            sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not "
+                             f"found: projects/{opt('--project')}/locations/{opt('--region')}/clusters/{a[3]}. "
+                             "This command is authenticated as PLACEHOLDER-OPERATOR@example.invalid which is the "
+                             "active account specified by the [core/account] property.\\n")
+            sys.exit(1)
         labels = {"purpose": "snowplow-bench", "issue": "606",
                   "created-by": "bench-gke", "owner": "t",
                   "ttl-expires": str(int(time.time()) + 3600)}

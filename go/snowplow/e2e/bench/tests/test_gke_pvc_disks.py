@@ -196,6 +196,9 @@ FAKE = textwrap.dedent("""\
             pvs = [] if has("pvcs_deleted") and not os.environ.get("FAKE_PV_STUCK") else json.load(
                 open(os.environ["FAKE_PVS"]))
             print(json.dumps({"items": pvs})); sys.exit(0)
+        if a[:2] == ["patch", "pv"] and os.environ.get("FAKE_PATCH_FAIL") == a[2]:
+            sys.stderr.write('Error from server (Forbidden): persistentvolumes "x" is forbidden: User '
+                             '"someone@example.invalid" cannot patch resource\\n'); sys.exit(1)
         if a[:2] == ["delete", "pvc"]:
             open(os.path.join(st, "pvcs_deleted"), "w").write("1"); sys.exit(0)
         if a[:2] == ["get", "pods"]:
@@ -320,6 +323,26 @@ def test_only_a_disk_provisioned_here_is_reclaimed_by_delete(fakes):
                for x in c if x[:3] == ["kubectl", "patch", "pv"]}
     assert patches == {"pvc-ours-recorded-unlabelled": "Delete", "static-foreign": "Retain"}
     assert _first(c, ["kubectl", "patch", "pv", "static-foreign"]) < _first(c, ["kubectl", "delete", "pvc"])
+
+
+@pytest.mark.parametrize("pv, refused", [("static-foreign", True), ("pvc-ours-recorded-unlabelled", False)])
+def test_a_failed_retain_patch_deletes_no_pvc(fakes, monkeypatch, capsys, pv, refused):
+    """#896 reviewer: the exit code of the Retain patch decides. A foreign
+    Delete-reclaimed PV that could not be set to Retain: no `delete pvc --all`
+    (it could take that disk), said loudly; the cluster delete and the disk
+    backstop still run. A failed Delete patch on OUR PV only leaves the disk to
+    the backstop: the PVCs still go."""
+    monkeypatch.setenv("FAKE_PATCH_FAIL", pv)
+    logs: list[str] = []
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=logs.append, budget_s=60, sleep=lambda s: None)
+    c = _calls(fakes)
+    deleted_pvcs = any(x[:3] == ["kubectl", "delete", "pvc"] for x in c)
+    assert deleted_pvcs is not refused
+    err = capsys.readouterr().err
+    assert ("PVC release REFUSED: static-foreign" in err) is refused
+    assert any(x[:4] == ["gcloud", "container", "clusters", "delete"] for x in c)      # the cluster still goes
+    assert any(x[:4] == ["gcloud", "compute", "disks", "list"] for x in c)            # and the backstop runs
+    assert not any("@" in m for m in logs + [err])                                    # B1: no user in a log
 
 
 def test_a_kubeconfig_that_is_not_this_cluster_changes_nothing(fakes, monkeypatch):

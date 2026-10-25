@@ -609,6 +609,28 @@ spec:
 # ─── Execution ──────────────────────────────────────────────────────────────
 
 
+# gcloud's error text names the operator's account ("This command is
+# authenticated as <account> which is the active account ...", in its 404 and
+# 503 answers), and kubectl's can name a user ("User \"…\" cannot …"). None of
+# it may reach a log, a record or verdict.json (#900 review): only the code.
+_ERR_CODE = re.compile(r"\bcode=(\d{3})\b")
+_ERR_REASON = re.compile(r"Error from server \(([A-Za-z]+)\)")
+
+
+def error_summary(stderr: str | None) -> str:
+    """What of a failed gcloud / kubectl call's stderr may be kept or logged:
+    `ResponseError: code=<n>` (gcloud), `Error from server (<Reason>)`
+    (kubectl), else nothing of its text."""
+    s = stderr or ""
+    m = _ERR_CODE.search(s)
+    if m:
+        return f"ResponseError: code={m.group(1)}"
+    m = _ERR_REASON.search(s)
+    if m:
+        return f"Error from server ({m.group(1)})"
+    return "no error code; the error text is withheld (it may name the account)" if s.strip() else "no error text"
+
+
 def execute(argv: list[str], *, dry_run: bool, env: dict | None = None,
             input_data: str | None = None, timeout: float = 3600,
             log: Callable[[str], None] = print,
@@ -623,7 +645,8 @@ def execute(argv: list[str], *, dry_run: bool, env: dict | None = None,
     proc = subprocess.run(argv, capture_output=True, text=True,
                           env=env, input=input_data, timeout=timeout)
     if proc.returncode != 0:
-        log(f"  rc={proc.returncode} stderr={proc.stderr.strip()[:500]}")
+        # never the free stderr: gcloud's names the operator's account (error_summary)
+        log(f"  rc={proc.returncode} ({error_summary(proc.stderr)})")
     if stderr_out is not None:
         stderr_out.append(proc.stderr or "")
     return proc.returncode, proc.stdout
@@ -680,12 +703,17 @@ def operation_wait_command(op: str, spec: ClusterSpec, location: str | None = No
 _NOT_FOUND = re.compile(r"code=404|NOT_FOUND|Not found:")
 
 
-def find_cluster(spec: ClusterSpec, *, log: Callable[[str], None] = print) -> tuple[str, dict]:
+def find_cluster(spec: ClusterSpec, *, log: Callable[[str], None] = print,
+                 legacy_zonal: bool = False) -> tuple[str, dict]:
     """(location, describe) of the bench cluster `spec` names: in its region
-    (runs 17+), or — only when the region answers NotFound — in its node zone
-    (a zonal cluster made before run 17, #899 F3). Any other describe failure
-    raises: an unanswered describe is not evidence the cluster is elsewhere."""
-    for location in (spec.region, spec.zone):
+    (runs 17+). Only with `legacy_zonal` (gke-down --legacy-zonal, a manual
+    cleanup; run606 never passes it) and only when the region answers
+    NotFound, in its node zone (a zonal cluster made before run 17, #899 F3):
+    in run606's teardown a regional create that failed before the cluster
+    existed must never lead to a same-named zonal cluster. Any other describe
+    failure raises: an unanswered describe is not evidence the cluster is
+    elsewhere."""
+    for location in (spec.region, spec.zone) if legacy_zonal else (spec.region,):
         err: list[str] = []
         rc, out = execute(describe_command(spec, location), dry_run=False, log=log, stderr_out=err)
         if rc == 0:
@@ -696,6 +724,10 @@ def find_cluster(spec: ClusterSpec, *, log: Callable[[str], None] = print) -> tu
         not_found = bool(_NOT_FOUND.search(err[-1] if err else ""))
         if not not_found:
             raise RuntimeError(f"describe {spec.name} in {location} failed (rc={rc})")
+        if not legacy_zonal:
+            raise RuntimeError(f"describe {spec.name} failed (rc={rc}): not found in region {spec.region}; "
+                               f"it may already be gone (a zonal cluster made before run 17 is deleted "
+                               f"only by hand: gke-down --legacy-zonal)")
         if location == spec.zone:
             raise RuntimeError(f"describe {spec.name} failed (rc={rc}): not found in region "
                                f"{spec.region} nor in zone {spec.zone}; it may already be gone")
@@ -716,7 +748,8 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
              log: Callable[[str], None] = print,
              budget_s: float | None = None,
              clock: Callable[[], float] = time.monotonic,
-             sleep: Callable[[float], None] = time.sleep) -> list[str]:
+             sleep: Callable[[float], None] = time.sleep,
+             legacy_zonal: bool = False) -> list[str]:
     """Describe → assert_deletable → release the PVC disks → delete → wait
     for the cluster to be gone → delete this cluster's leftover disks by exact
     name. Raises when not deletable or the delete call fails, so
@@ -736,9 +769,10 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
     cluster names a new in-flight operation, until the budget is spent.
     Any other delete failure raises at once.
 
-    The cluster is looked up in its region, then — on NotFound only — in its
-    node zone (a zonal cluster made before run 17), and deleted where it was
-    found (#899 F3)."""
+    The cluster is looked up in its region. With `legacy_zonal` only (a
+    manual cleanup: gke-down --legacy-zonal; run606 never passes it), on
+    NotFound there it is looked up in its node zone (a zonal cluster made
+    before run 17) and deleted where it was found (#899 F3)."""
     if dry_run:
         execute(describe_command(spec), dry_run=True, log=log)
         execute(_kubectl(spec) + ["delete", "pvc", "--all", "--all-namespaces", "--wait=false"],
@@ -746,7 +780,7 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
         execute(delete_command(spec), dry_run=True, log=log)
         execute(disks_list_command(spec), dry_run=True, log=log)
         return []
-    location, describe = find_cluster(spec, log=log)
+    location, describe = find_cluster(spec, log=log, legacy_zonal=legacy_zonal)
     assert_deletable(describe)
     delete_argv = delete_command(spec.name, project=spec.project, location=location)
     budget = DEFAULT_DOWN_BUDGET_S if budget_s is None else budget_s
@@ -976,8 +1010,18 @@ def release_pvc_disks(spec: ClusterSpec, describe: dict, *, log: Callable[[str],
     for d in disks:
         want = "Delete" if _ours(d, spec) else "Retain"
         if d["reclaim"] != want and (want == "Delete" or d["reclaim"] == "Delete"):
-            execute(k + ["patch", "pv", d["pv"], "--type=merge", "-p",
-                         json.dumps({"spec": {"persistentVolumeReclaimPolicy": want}})], dry_run=False, log=log)
+            rc, _ = execute(k + ["patch", "pv", d["pv"], "--type=merge", "-p",
+                                 json.dumps({"spec": {"persistentVolumeReclaimPolicy": want}})],
+                            dry_run=False, log=log)
+            if rc != 0 and want == "Retain":
+                # a disk this cluster did not provision is still reclaimed by
+                # Delete: deleting the PVCs now could delete it (#896 reviewer)
+                msg = (f"PVC release REFUSED: {d['pv']} (a disk this cluster did not provision, reclaimed by "
+                       f"Delete) could not be set to Retain (rc={rc}); no PVC deleted, so it cannot take that "
+                       f"disk; the disk backstop runs after the delete")
+                log(msg)
+                sys.stderr.write(msg + "\n")
+                return mine
     execute(k + ["delete", "pvc", "--all", "--all-namespaces", "--wait=false"], dry_run=False, log=log)
     rc, out = execute(k + ["get", "pods", "--all-namespaces", "-o", "json"], dry_run=False, log=log)
     for p in ((_json(out) or {}).get("items") or []) if rc == 0 else []:
@@ -1135,7 +1179,8 @@ def cmd_gke_shape(a) -> int:
         rc, out = execute(describe_command(spec), dry_run=False, log=lambda _m: None, stderr_out=err)
         try:
             rec = observed_shape(json.loads(out)) if rc == 0 else None
-            why = f"describe failed (rc={rc}): {(err[-1] if err else '').strip()[:300]}"
+            # the code only: gcloud's text names the operator's account (#900 review)
+            why = f"describe failed (rc={rc}, {error_summary(err[-1] if err else '')})"
         except ValueError as e:
             rec, why = None, f"describe answered with no JSON ({e})"
         if rec is None:
@@ -1158,7 +1203,7 @@ EXIT_BACKSTOP_FAILED = 4
 def cmd_gke_down(a) -> int:
     spec = default_spec(a.name, project=a.project, zone=a.zone)
     try:
-        problems = teardown(spec, dry_run=not a.yes, budget_s=a.budget_s)
+        problems = teardown(spec, dry_run=not a.yes, budget_s=a.budget_s, legacy_zonal=a.legacy_zonal)
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"gke-down: {type(e).__name__}: {e}\n")
         return 1
@@ -1303,6 +1348,9 @@ def add_parsers(sub) -> None:
                       help="bound of every teardown wait: the PV release (half of it), an in-flight "
                            "cluster operation, the gone-poll before the disk backstop (run606: "
                            f"DOWN_BUDGET_S; default {DEFAULT_DOWN_BUDGET_S:g} s)")
+    down.add_argument("--legacy-zonal", action="store_true",
+                      help="manual cleanup only (run606 never passes it): when the region answers NotFound, "
+                           "look for a zonal bench cluster made before run 17 in --zone and delete it there")
     down.set_defaults(func=cmd_gke_down)
 
     reap = sub.add_parser("gke-reap", help="#606: delete bench clusters past "

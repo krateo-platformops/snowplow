@@ -7,9 +7,13 @@ F1  The run's cluster-shape record is READ BACK from GKE after create
     a dry run records the spec and says so.
 F2  ZONE must be a zone. A region passed as ZONE (europe-west4) is refused at
     once by run606.sh — before any cloud call — and by bench.gke.
-F3  gke-down finds a zonal bench cluster made before run 17: the region's
-    describe answers NotFound, so it looks in the node zone and deletes there.
-    Only NotFound sends it to the zone; any other describe failure raises.
+F3  `gke-down --legacy-zonal` (a manual cleanup; run606 never passes it)
+    finds a zonal bench cluster made before run 17: the region's describe
+    answers NotFound, so it looks in the node zone and deletes there. Only
+    NotFound sends it to the zone; any other describe failure raises. Without
+    the flag the zone is never looked at.
+B1  (#900 review) gcloud's error text names the authenticated account: only
+    its code (`ResponseError: code=<n>`) reaches a record or a log.
 
 A stand-in gcloud on PATH plays GKE. No cluster is created or deleted.
 """
@@ -32,6 +36,15 @@ NAME = "snowplow-bench-r16z"
 SPEC = gke.default_spec(NAME)
 REGION, ZONE = "europe-west4", "europe-west4-a"
 OP1 = "operation-1792823484322-b2555fe0"
+# gcloud's real error texts (gcloud 561, captured by the #900 reviewer), the
+# account replaced by a placeholder
+REAL_404 = ("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: "
+            "projects/operations-dev-krateo-io/locations/europe-west4/clusters/snowplow-bench-r16z. This command "
+            "is authenticated as PLACEHOLDER-OPERATOR@example.invalid which is the active account specified by "
+            "the [core/account] property.\nNo cluster named 'snowplow-bench-r16z' in operations-dev-krateo-io.\n")
+REAL_503 = ("ERROR: (gcloud.container.clusters.describe) ResponseError: code=503, message=The service is "
+            "currently unavailable. This command is authenticated as PLACEHOLDER-OPERATOR@example.invalid "
+            "which is the active account specified by the [core/account] property.\n")
 
 FAKE_GCLOUD = textwrap.dedent("""\
     #!/usr/bin/env python3
@@ -51,13 +64,21 @@ FAKE_GCLOUD = textwrap.dedent("""\
         mode = os.environ.get("FAKE_REGION_DESCRIBE" if flag == "--region" else "FAKE_ZONE_DESCRIBE", "notfound")
         if os.path.exists(os.path.join(st, f"deleted_{loc}")):
             mode = "notfound"                                   # deleted there: gone
+        # gcloud's REAL answers (gcloud 561, captured by the #900 reviewer), the
+        # account replaced by a placeholder: both name the authenticated account
+        kind = "locations" if flag == "--region" else "zones"
         if mode == "notfound":
-            sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, "
-                             f"message=Not found: projects/p/locations/{loc}/clusters/{a[3]}.\\n")
+            sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not "
+                             f"found: projects/operations-dev-krateo-io/{kind}/{loc}/clusters/{a[3]}. This command "
+                             "is authenticated as PLACEHOLDER-OPERATOR@example.invalid which is the active account "
+                             "specified by the [core/account] property.\\n"
+                             f"No cluster named '{a[3]}' in operations-dev-krateo-io.\\n")
             sys.exit(1)
         if mode == "error":
-            sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=503, "
-                             "message=The service is currently unavailable.\\n")
+            sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=503, message=The "
+                             "service is currently unavailable. This command is authenticated as "
+                             "PLACEHOLDER-OPERATOR@example.invalid which is the active account specified by the "
+                             "[core/account] property.\\n")
             sys.exit(1)
         if mode == "nojson":
             print("not json"); sys.exit(0)
@@ -155,8 +176,37 @@ def test_an_unanswered_describe_records_unknown_never_the_spec(fakegke, monkeypa
     assert rec["requested"]["source"] == "spec: what gke-up asked for"
     assert rec["requested"]["control_plane"] == "regional"
     assert "cluster shape UNKNOWN" in err
-    if mode == "error":
-        assert "code=503" in rec["source"]
+    if mode in ("error", "notfound"):
+        assert ("code=503" if mode == "error" else "code=404") in rec["source"]
+    # B1 (#900 review): gcloud's real text names the account; none of it is kept
+    for text in (json.dumps(rec), err):
+        assert "authenticated as" not in text and "@" not in text and "PLACEHOLDER" not in text, text
+
+
+@pytest.mark.parametrize("stderr, want", [
+    (REAL_404, "ResponseError: code=404"),
+    (REAL_503, "ResponseError: code=503"),
+    ('Error from server (Forbidden): pods is forbidden: User "someone@example.invalid" cannot list', "Error from server (Forbidden)"),
+    ("ERROR: (gcloud.auth) You do not currently have an active account selected. someone@example.invalid", None),
+    ("", "no error text"),
+])
+def test_error_summary_keeps_the_code_never_the_text(stderr, want):
+    got = gke.error_summary(stderr)
+    assert "@" not in got and "authenticated as" not in got and "PLACEHOLDER" not in got
+    assert got == want if want else got.startswith("no error code")
+
+
+@pytest.mark.parametrize("region_mode, legacy", [("notfound", True), ("notfound", False), ("error", True)])
+def test_no_log_line_carries_the_account(fakegke, monkeypatch, region_mode, legacy):
+    """execute()'s failure line, F3's two describes: the code, never gcloud's text"""
+    monkeypatch.setenv("FAKE_REGION_DESCRIBE", region_mode)
+    monkeypatch.setenv("FAKE_ZONE_DESCRIBE", "notfound")
+    logs: list[str] = []
+    with pytest.raises(RuntimeError) as e:
+        gke.teardown(SPEC, dry_run=False, log=logs.append, budget_s=60, legacy_zonal=legacy)
+    for line in logs + [str(e.value)]:
+        assert "authenticated as" not in line and "@" not in line and "PLACEHOLDER" not in line, line
+    assert any("rc=1 (ResponseError: code=" in m for m in logs)
 
 
 def test_a_dry_run_records_the_spec_and_says_so(fakegke, capsys):
@@ -216,12 +266,48 @@ def test_run606_and_bench_gke_agree_on_what_a_zone_is(z):
 
 # ─── F3: gke-down finds a zonal cluster made before run 17 ──────────────────
 
+def test_without_legacy_zonal_the_zone_is_never_looked_at(fakegke, monkeypatch):
+    """The default (run606's teardown): a region NotFound is the end — a
+    regional create that failed before the cluster existed must never lead
+    to a same-named zonal bench cluster (#900 review)."""
+    monkeypatch.setenv("FAKE_REGION_DESCRIBE", "notfound")
+    monkeypatch.setenv("FAKE_ZONE_DESCRIBE", "found")
+    with pytest.raises(RuntimeError, match="only by hand: gke-down --legacy-zonal"):
+        gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60)
+    assert calls(fakegke) == [f"describe --region {REGION}"]
+    assert gke.main(["gke-down", "--name", NAME, "--zone", ZONE, "--budget-s", "60", "--yes"]) == 1
+    assert not any("--zone" in c or c.startswith("delete") for c in calls(fakegke))
+
+
+def test_run606_teardown_never_passes_legacy_zonal():
+    src = (BENCH_DIR / "run606.sh").read_text()
+    lines = [ln for ln in src.splitlines() if "bench.gke gke-down" in ln]
+    assert lines and not any("legacy" in ln for ln in lines)
+    assert "legacy" not in (BENCH_DIR / "run606_pair.sh").read_text()
+
+
+def test_run606_teardown_never_uses_the_zone(harness):  # noqa: F811
+    """run606 against a region that answers NotFound (gcloud's real text) and
+    a same-named zonal bench cluster: the teardown fails loudly, nothing in
+    the zone is described or deleted, and the account is in no log."""
+    env, state, _, tmp = harness
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=dict(env, FAKE_REGIONAL_NOTFOUND="1"),
+                       capture_output=True, text=True, timeout=600)
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode != 0 and "TEARDOWN FAILED" in log
+    gcl = [c["argv"] for c in _calls(state) if c["tool"] == "gcloud"]
+    assert not any("--zone" in a for a in gcl if a[:2] == ["container", "clusters"])
+    assert not any(a[:3] == ["container", "clusters", "delete"] for a in gcl)
+    for text in (log, p.stderr, p.stdout):
+        assert "authenticated as" not in text and "PLACEHOLDER-OPERATOR" not in text
+
+
 def test_a_zonal_cluster_is_found_in_its_zone_and_deleted_there(fakegke, monkeypatch):
     monkeypatch.setenv("FAKE_REGION_DESCRIBE", "notfound")
     monkeypatch.setenv("FAKE_ZONE_DESCRIBE", "found")
     monkeypatch.setenv("FAKE_BLOCKING_OPS", OP1)
     logs: list[str] = []
-    gke.teardown(SPEC, dry_run=False, log=logs.append, budget_s=60)
+    gke.teardown(SPEC, dry_run=False, log=logs.append, budget_s=60, legacy_zonal=True)
     # deleted, waited on AND polled until gone in its zone (#896 reviewer: a
     # regional poll 404s at once — a false "no disk left" while nodes still
     # hold the PVC disks); then the disk backstop
@@ -231,10 +317,11 @@ def test_a_zonal_cluster_is_found_in_its_zone_and_deleted_there(fakegke, monkeyp
     assert any("not found in region europe-west4; looking in zone europe-west4-a" in m for m in logs)
 
 
-def test_a_regional_cluster_never_looks_in_the_zone(fakegke, monkeypatch):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_a_regional_cluster_never_looks_in_the_zone(fakegke, monkeypatch, legacy):
     monkeypatch.setenv("FAKE_REGION_DESCRIBE", "found")
     monkeypatch.setenv("FAKE_ZONE_DESCRIBE", "found")
-    gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60)
+    gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60, legacy_zonal=legacy)
     assert calls(fakegke) == [f"describe --region {REGION}", f"delete --region {REGION}",
                               f"describe --region {REGION}", "disks list"]
 
@@ -245,7 +332,7 @@ def test_only_notfound_sends_it_to_the_zone(fakegke, monkeypatch):
     monkeypatch.setenv("FAKE_REGION_DESCRIBE", "error")
     monkeypatch.setenv("FAKE_ZONE_DESCRIBE", "found")
     with pytest.raises(RuntimeError, match=f"describe {NAME} in {REGION} failed"):
-        gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60)
+        gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60, legacy_zonal=True)
     assert calls(fakegke) == [f"describe --region {REGION}"]
 
 
@@ -255,7 +342,7 @@ def test_not_in_the_region_nor_answered_in_the_zone_deletes_nothing(fakegke, mon
     monkeypatch.setenv("FAKE_ZONE_DESCRIBE", zone_mode)
     with pytest.raises(RuntimeError, match=("nor in zone europe-west4-a" if zone_mode == "notfound"
                                             else f"describe {NAME} in {ZONE} failed")):
-        gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60)
+        gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60, legacy_zonal=True)
     assert not any(c.startswith("delete") for c in calls(fakegke))
 
 
@@ -266,14 +353,15 @@ def test_the_zone_fallback_keeps_every_safety_check(fakegke, monkeypatch, zone_m
     monkeypatch.setenv("FAKE_REGION_DESCRIBE", "notfound")
     monkeypatch.setenv("FAKE_ZONE_DESCRIBE", zone_mode)
     with pytest.raises(gke.NotDeletable):
-        gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60)
+        gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60, legacy_zonal=True)
     assert not any(c.startswith("delete") for c in calls(fakegke))
 
 
 def test_gke_down_cli_deletes_a_zonal_cluster(fakegke, monkeypatch):
     monkeypatch.setenv("FAKE_REGION_DESCRIBE", "notfound")
     monkeypatch.setenv("FAKE_ZONE_DESCRIBE", "found")
-    assert gke.main(["gke-down", "--name", NAME, "--zone", ZONE, "--budget-s", "60", "--yes"]) == 0
+    assert gke.main(["gke-down", "--name", NAME, "--zone", ZONE, "--budget-s", "60", "--legacy-zonal",
+                     "--yes"]) == 0
     assert f"delete --zone {ZONE}" in calls(fakegke) and not any(c.startswith("delete --region") for c in calls(fakegke))
 
 
