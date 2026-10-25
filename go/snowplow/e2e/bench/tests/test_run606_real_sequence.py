@@ -86,6 +86,8 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
              "usage": float(os.environ.get("FAKE_SSD_USAGE", "333"))}]}))
         sys.exit(0)
     if a[:3] == ["compute", "disks", "list"]:                  # #895: the disk backstop
+        if os.environ.get("FAKE_DISKS_FAIL") == "1":
+            sys.exit(1)
         print(os.environ.get("FAKE_DISKS", "[]")); sys.exit(0)
     if a[:3] == ["container", "clusters", "describe"] and os.path.exists(os.path.join(STATE, "deleted")):
         sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, "
@@ -148,18 +150,6 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                                            "message": smsg}]}}
     def items(xs):
         print(json.dumps({"items": xs})); sys.exit(0)
-    # #895: GKE's default PD CSI class, re-created by gke-up with the bench disk labels
-    if a[:2] == ["get", "storageclass"]:
-        items([{"metadata": {"name": "standard-rwo",
-                             "annotations": {"storageclass.kubernetes.io/is-default-class": "true"},
-                             "labels": {"addonmanager.kubernetes.io/mode": "EnsureExists"}},
-                "provisioner": "pd.csi.storage.gke.io", "parameters": {"type": "pd-balanced"},
-                "reclaimPolicy": "Delete", "volumeBindingMode": "WaitForFirstConsumer",
-                "allowVolumeExpansion": True}])
-    if a[:2] == ["create", "-f"]:
-        with open(os.path.join(STATE, "created.jsonl"), "a") as fh:
-            fh.write(sys.stdin.read().replace("\\n", " ") + "\\n")
-        sys.exit(0)
     if a[:2] == ["get", "pv"]:                                 # #895: the PV release at teardown
         gone = os.path.exists(os.path.join(STATE, "pvcs_deleted"))
         items([] if gone else json.loads(os.environ.get("FAKE_PVS", "[]")))

@@ -114,7 +114,7 @@ quota_args=()
 [[ -n "${PROJECT:-}" ]] && quota_args+=(--project "$PROJECT")
 [[ -n "${ZONE:-}" ]] && quota_args+=(--zone "$ZONE")
 if ! quota_msg="$(python3 -m bench.gke gke-ssd-quota ${quota_args[@]+"${quota_args[@]}"} --runs 2 2>&1)"; then
-  refuse "$quota_msg"
+  refuse "${quota_msg#refusing: }"
 fi
 log "$quota_msg"
 

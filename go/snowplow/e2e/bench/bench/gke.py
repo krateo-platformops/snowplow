@@ -25,10 +25,10 @@ This module owns that lifecycle and nothing else:
     the new cluster's Services (LB IPs are new every run, and the harness's
     baked defaults point at a cluster deleted 2026-06-14);
   - PVC disks (#895): gke-up refuses a run whose PVC disks do not fit the
-    region's SSD_TOTAL_GB and re-creates every PD CSI StorageClass with the
-    bench disk labels; teardown releases every PVC (the CSI driver deletes
-    its disk) before the cluster, then deletes what is left of THIS cluster
-    by exact name (`backstop_disks`).
+    region's SSD_TOTAL_GB; teardown releases every PVC (the CSI driver
+    deletes its disk) before the cluster, then deletes what is left of THIS
+    cluster by exact name (`backstop_disks`). GKE itself labels each PVC disk
+    with the cluster's resource labels, name and id.
 
 Every command is built as an argv list and only EXECUTED by `execute()`,
 which honours dry-run. The unit tests drive the builders and never shell out.
@@ -626,25 +626,35 @@ def operation_wait_command(op: str, spec: ClusterSpec) -> list[str]:
             "--project", spec.project, "--region", spec.region]
 
 
+# gke-down's budget when none is given (run606.sh passes DOWN_BUDGET_S, whose
+# default is this same 900 s: a test pins the two). Bounds every wait of a
+# teardown — the PV release, an in-flight operation, the NotFound poll —
+# including gke-up's own teardown after a failed create.
+DEFAULT_DOWN_BUDGET_S = 900.0
+BACKSTOP_FAILED = "DISK BACKSTOP FAILED"
+
+
 def teardown(spec: ClusterSpec, *, dry_run: bool,
              log: Callable[[str], None] = print,
              budget_s: float | None = None,
              clock: Callable[[], float] = time.monotonic,
-             sleep: Callable[[float], None] = time.sleep) -> None:
+             sleep: Callable[[float], None] = time.sleep) -> list[str]:
     """Describe → assert_deletable → release the PVC disks → delete → wait
     for the cluster to be gone → delete this cluster's leftover disks by exact
     name. Raises when not deletable or the delete call fails, so
-    run_with_teardown reports it.
+    run_with_teardown reports it. Returns the disk backstop's problems (each
+    also written to stderr as DISK BACKSTOP FAILED): the cluster is deleted,
+    but disks of it may be left.
 
     #895: PVC disks survive `clusters delete`. First every PVC goes and the CSI
-    driver deletes its disk (release_pvc_disks, within half of `budget_s`);
+    driver deletes its disk (release_pvc_disks, within half of the budget);
     then, the cluster gone, disk_backstop deletes whatever of THIS cluster is
     left (its own PVs' disks, and disks GKE labelled with this cluster's name
-    and id) — never another cluster's.
+    and id) — never another cluster's. `budget_s` None = DEFAULT_DOWN_BUDGET_S.
 
     A delete refused because another operation is in flight on the cluster
     waits for THAT operation (`gcloud container operations wait`, bounded by
-    what is left of `budget_s`), then retries the delete — as often as the
+    what is left of the budget), then retries the delete — as often as the
     cluster names a new in-flight operation, until the budget is spent.
     Any other delete failure raises at once."""
     rc, out = execute(describe_command(spec), dry_run=dry_run, log=log)
@@ -653,38 +663,45 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
                 dry_run=True, log=log)
         execute(delete_command(spec), dry_run=True, log=log)
         execute(disks_list_command(spec), dry_run=True, log=log)
-        return
+        return []
     if rc != 0:
         raise RuntimeError(f"describe {spec.name} failed (rc={rc}); "
                            f"cluster may already be gone")
     describe = json.loads(out)
     assert_deletable(describe)
+    budget = DEFAULT_DOWN_BUDGET_S if budget_s is None else budget_s
     start = clock()
-    deadline = None if budget_s is None else start + budget_s
+    deadline = start + budget
     # half the budget releases the PVs; the rest deletes the cluster and runs the backstop
-    recorded = release_pvc_disks(spec, log=log, clock=clock, sleep=sleep,
-                                 deadline=None if budget_s is None else start + budget_s / 2)
+    recorded = release_pvc_disks(spec, describe, log=log, clock=clock, sleep=sleep,
+                                 deadline=start + budget / 2)
     while True:
         err: list[str] = []
         rc, _ = execute(delete_command(spec), dry_run=False, log=log, stderr_out=err)
         if rc == 0:
-            if wait_cluster_gone(spec, log=log, deadline=deadline, clock=clock, sleep=sleep):
-                try:
+            problems = []
+            try:
+                if wait_cluster_gone(spec, log=log, deadline=deadline, clock=clock, sleep=sleep):
                     disk_backstop(spec, cluster_id=cluster_id_b32(describe), recorded=recorded, log=log)
-                except RuntimeError as e:
-                    # the cluster IS deleted; a disk left over is said loudly, not as a failed delete
-                    log(f"DISK BACKSTOP FAILED: {e}")
-                    sys.stderr.write(f"DISK BACKSTOP FAILED for {spec.name}: {e}\n")
-            return
+                else:
+                    raise RuntimeError(
+                        f"skipped: {spec.name} still being deleted when the {budget:g} s budget ran out, so "
+                        f"its disks were never checked; once it is gone list them with "
+                        f"{' '.join(disks_list_command(spec))}")
+            except RuntimeError as e:
+                # the cluster IS deleted; a disk possibly left over is said loudly, not as a failed delete
+                problems.append(str(e))
+                log(f"{BACKSTOP_FAILED}: {e}")
+                sys.stderr.write(f"{BACKSTOP_FAILED} for {spec.name}: {e}\n")
+            return problems
         m = _INCOMPATIBLE_OP.search(err[-1] if err else "")
-        left = None if deadline is None else deadline - clock()
-        if m is None or (left is not None and left <= 0):
+        left = deadline - clock()
+        if m is None or left <= 0:
             raise RuntimeError(f"delete {spec.name} failed (rc={rc})"
                                + (f"; still blocked by {m.group(1)} when the budget ran out" if m else ""))
         log(f"delete {spec.name} blocked by in-flight {m.group(1)}: waiting for it, then retrying")
         try:
-            wrc, _ = execute(operation_wait_command(m.group(1), spec), dry_run=False, log=log,
-                             timeout=left if left is not None else 3600)
+            wrc, _ = execute(operation_wait_command(m.group(1), spec), dry_run=False, log=log, timeout=left)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"delete {spec.name}: {m.group(1)} still running when the "
                                f"budget ran out") from None
@@ -692,12 +709,16 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
             log(f"  waiting for {m.group(1)} failed (rc={wrc}); retrying the delete anyway")
 
 
-# ─── PVC disks: labels, quota, release at teardown, exact backstop (#895) ───
+# ─── PVC disks: quota, release at teardown, exact backstop (#895) ───────────
 #
 # Run 16 attempt 1 never measured: the CSI-provisioned PVC disks (pd-balanced,
 # counted against the region's SSD_TOTAL_GB) survive `clusters delete`; ~32 GB
 # per bench cluster piled up until ClickStack's MongoDB PVC could not be
 # provisioned (QUOTA_EXCEEDED, limit 500 in europe-west4).
+#
+# The disks are attributable without anything of ours: GKE puts the cluster's
+# own resource labels (created-by=bench-gke, purpose, issue, owner — see
+# create_commands) and its name and id on every PD CSI disk it provisions.
 
 PD_CSI = "pd.csi.storage.gke.io"
 SSD_QUOTA_METRIC = "SSD_TOTAL_GB"
@@ -706,7 +727,7 @@ SSD_QUOTA_METRIC = "SSD_TOTAL_GB"
 # cluster's the base32 one): the value is base32 of the cluster's `id`.
 GKE_DISK_CLUSTER_NAME = "goog-k8s-cluster-name"
 GKE_DISK_CLUSTER_ID_KEYS = ("goog-gke-cluster-id-base32", "cluster-id-gke-io")
-DISK_CLUSTER_LABEL = "bench-cluster"
+PROVISIONED_BY = "pv.kubernetes.io/provisioned-by"
 # One bench cluster's PVCs: run 14's diagnostics/pvcs.json — ClickStack
 # ClickHouse 15Gi + Keeper 5Gi + MongoDB data 10G + logs 2G, each rounded up to
 # whole GB as GCE provisions a disk (pvc_footprint_gb; a test pins the two).
@@ -739,71 +760,6 @@ def pvc_footprint_gb(pvcs: Iterable[dict]) -> int:
     return tot
 
 
-def bench_disk_labels(spec: ClusterSpec) -> dict[str, str]:
-    """The labels every bench PVC disk carries (through the StorageClass)."""
-    return dict(BENCH_LABELS, **{DISK_CLUSTER_LABEL: sanitize_label_value(spec.name)})
-
-
-def labelled_storageclasses(sc_list: dict, labels: dict[str, str]) -> list[dict]:
-    """Every PD CSI StorageClass of the cluster, rebuilt with `labels` merged
-    into its `labels` parameter (the PD CSI driver labels each disk it
-    provisions with it). StorageClass parameters are immutable, so gke-up
-    deletes and re-creates each, before the platform asks for any PVC; a
-    chart that names standard-rwo explicitly gets labelled disks too."""
-    out = []
-    for sc in sc_list.get("items") or []:
-        if sc.get("provisioner") != PD_CSI:
-            continue
-        meta = sc.get("metadata") or {}
-        params = dict(sc.get("parameters") or {})
-        have = dict(kv.split("=", 1) for kv in params.get("labels", "").split(",") if "=" in kv)
-        params["labels"] = ",".join(f"{k}={v}" for k, v in sorted({**have, **labels}.items()))
-        new = {"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
-               "metadata": {k: meta[k] for k in ("name", "labels", "annotations") if meta.get(k)},
-               "provisioner": PD_CSI, "parameters": params}
-        for k in ("reclaimPolicy", "volumeBindingMode", "allowVolumeExpansion", "mountOptions",
-                  "allowedTopologies"):
-            if k in sc:
-                new[k] = sc[k]
-        (new["metadata"].get("annotations") or {}).pop("kubectl.kubernetes.io/last-applied-configuration", None)
-        out.append(new)
-    return out
-
-
-def label_storageclasses(spec: ClusterSpec, *, dry_run: bool, env: dict | None = None,
-                         log: Callable[[str], None] = print) -> int:
-    """gke-up, before the platform: re-create every PD CSI StorageClass with
-    the bench disk labels (labelled_storageclasses). 0 when done (or nothing
-    to label); 1 when the classes could not be read or re-created."""
-    k = ["kubectl", f"--kubeconfig={spec.kubeconfig}", f"--context={kube_context(spec)}"]
-    labels = bench_disk_labels(spec)
-    rc, out = execute(k + ["get", "storageclass", "-o", "json"], dry_run=dry_run, env=env, log=log)
-    if dry_run:
-        log(f"DRY-RUN: every {PD_CSI} StorageClass re-created with labels={_labels_arg(labels)}")
-        return 0
-    scs = _json(out) if rc == 0 else None
-    if not isinstance(scs, dict):
-        log(f"StorageClasses of {spec.name} could not be read (rc={rc})")
-        return 1
-    new = labelled_storageclasses(scs, labels)
-    if not new:
-        log(f"no {PD_CSI} StorageClass in {spec.name}: no PVC disk to label")
-        return 0
-    for sc in new:
-        name = sc["metadata"]["name"]
-        # twice: GKE's addon manager may re-create a default class in between
-        for _ in range(2):
-            rc, _ = execute(k + ["delete", "storageclass", name, "--wait=true", "--ignore-not-found"],
-                            dry_run=False, env=env, log=log)
-            rc2, _ = execute(k + ["create", "-f", "-"], dry_run=False, env=env, log=log,
-                             input_data=json.dumps(sc))
-            if rc2 == 0:
-                break
-        if rc2 != 0:
-            log(f"StorageClass {name} could not be re-created (delete rc={rc}, create rc={rc2})")
-            return 1
-    log(f"PVC disks labelled {_labels_arg(labels)} through {', '.join(s['metadata']['name'] for s in new)}")
-    return 0
 
 
 def ssd_quota_command(project: str, zone: str) -> list[str]:
@@ -827,21 +783,31 @@ def _kubectl(spec: ClusterSpec) -> list[str]:
             "--request-timeout=30s"]
 
 
-_HANDLE = re.compile(r"^projects/[^/]+/(zones|regions)/([^/]+)/disks/([^/]+)$")
+_HANDLE = re.compile(r"^projects/([^/]+)/(zones|regions)/([^/]+)/disks/([^/]+)$")
 
 
 def pv_disks(pv_list: dict) -> list[dict]:
-    """The GCE disks behind the cluster's PD CSI PersistentVolumes."""
+    """The GCE disks behind the cluster's PD CSI PersistentVolumes, with
+    whether the PD CSI driver provisioned each (its provisioned-by
+    annotation) — a statically bound PV may point at any disk."""
     out = []
     for pv in pv_list.get("items") or []:
         csi = ((pv.get("spec") or {}).get("csi") or {})
         m = _HANDLE.match(csi.get("volumeHandle") or "")
         if csi.get("driver") != PD_CSI or not m:
             continue
-        out.append({"pv": (pv.get("metadata") or {}).get("name"), "location": m.group(2), "disk": m.group(3),
+        md = pv.get("metadata") or {}
+        out.append({"pv": md.get("name"), "project": m.group(1), "location": m.group(3), "disk": m.group(4),
+                    "dynamic": (md.get("annotations") or {}).get(PROVISIONED_BY) == PD_CSI,
                     "reclaim": (pv.get("spec") or {}).get("persistentVolumeReclaimPolicy"),
                     "gb": disk_gb(((pv.get("spec") or {}).get("capacity") or {}).get("storage") or "1Gi")})
     return out
+
+
+def _ours(d: dict, spec: ClusterSpec) -> bool:
+    """A PV's disk this cluster provisioned: by the PD CSI driver, in this
+    project and this zone."""
+    return d["dynamic"] and d["project"] == spec.project and d["location"] == spec.zone
 
 
 def cluster_id_b32(describe: dict) -> str | None:
@@ -886,29 +852,50 @@ def _json(out: str):
         return None
 
 
-def release_pvc_disks(spec: ClusterSpec, *, log: Callable[[str], None], deadline: float | None,
-                      clock: Callable[[], float], sleep: Callable[[float], None]) -> list[dict]:
-    """Before the cluster goes: every PD CSI PV reclaimed by Delete, every PVC
-    deleted, the pods holding them deleted (their controllers' new pods cannot
-    be scheduled on a terminating PVC, so the PVC is released), then wait until
-    the CSI driver deleted the PVs' disks — bounded by `deadline`. Best effort:
-    an unreachable cluster or a slow driver leaves the rest to the backstop.
-    Returns the disks the PVs pointed at (for the backstop)."""
+def _host(url: str | None) -> str | None:
+    m = re.match(r"^(?:https?://)?\[?([^\]/:]+)\]?(?::\d+)?(?:/.*)?$", (url or "").strip())
+    return m.group(1) if m else None
+
+
+def release_pvc_disks(spec: ClusterSpec, describe: dict, *, log: Callable[[str], None],
+                      deadline: float, clock: Callable[[], float],
+                      sleep: Callable[[float], None]) -> list[dict]:
+    """Before the cluster goes: every PVC deleted and the pods holding them
+    deleted (their controllers' new pods cannot be scheduled on a terminating
+    PVC, so the PVC is released), then wait — bounded by `deadline` — until
+    the CSI driver deleted the PVs' disks. Best effort: an unreachable
+    cluster or a slow driver leaves the rest to the backstop.
+
+    Nothing is changed unless the bench kubeconfig's server IS this cluster's
+    endpoint (describe.endpoint). Only a PV the PD CSI driver provisioned in
+    this project and zone is set to reclaim by Delete; any other PD CSI PV
+    reclaimed by Delete is set to Retain first, so no PVC deletion here can
+    delete a disk this cluster did not create. Returns this cluster's own
+    PV disks (for the backstop)."""
     k = _kubectl(spec)
     rc, out = execute(k + ["get", "pv", "-o", "json"], dry_run=False, log=log)
     pvs = _json(out) if rc == 0 else None
     if not isinstance(pvs, dict):
         log(f"PVC release: could not list {spec.name}'s PVs (rc={rc}); the disk backstop runs after the delete")
         return []
+    rc, out = execute(k + ["config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}"],
+                      dry_run=False, log=log)
+    server, endpoint = _host(out) if rc == 0 else None, describe.get("endpoint")
+    if not server or not endpoint or server != endpoint:
+        log(f"PVC release: refusing — the bench kubeconfig's server ({server}) is not {spec.name}'s endpoint "
+            f"({endpoint}); nothing changed, the disk backstop runs after the delete")
+        return []
     disks = pv_disks(pvs)
-    log(f"PVC release: {len(disks)} PD CSI volume(s), {sum(d['gb'] for d in disks)} GB: "
-        + ", ".join(f"{d['pv']}={d['disk']}" for d in disks))
+    mine = [d for d in disks if _ours(d, spec)]
+    log(f"PVC release: {len(disks)} PD CSI volume(s), {len(mine)} provisioned here "
+        f"({sum(d['gb'] for d in mine)} GB): " + ", ".join(f"{d['pv']}={d['disk']}" for d in mine))
     if not disks:
         return []
     for d in disks:
-        if d["reclaim"] != "Delete":
+        want = "Delete" if _ours(d, spec) else "Retain"
+        if d["reclaim"] != want and (want == "Delete" or d["reclaim"] == "Delete"):
             execute(k + ["patch", "pv", d["pv"], "--type=merge", "-p",
-                         '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'], dry_run=False, log=log)
+                         json.dumps({"spec": {"persistentVolumeReclaimPolicy": want}})], dry_run=False, log=log)
     execute(k + ["delete", "pvc", "--all", "--all-namespaces", "--wait=false"], dry_run=False, log=log)
     rc, out = execute(k + ["get", "pods", "--all-namespaces", "-o", "json"], dry_run=False, log=log)
     for p in ((_json(out) or {}).get("items") or []) if rc == 0 else []:
@@ -916,19 +903,20 @@ def release_pvc_disks(spec: ClusterSpec, *, log: Callable[[str], None], deadline
             md = p.get("metadata") or {}
             execute(k + ["delete", "pod", "-n", md.get("namespace", "default"), md.get("name", ""),
                          "--wait=false"], dry_run=False, log=log)
-    want = {d["pv"] for d in disks}
-    while True:
+    want = {d["pv"] for d in mine}
+    while want:
         rc, out = execute(k + ["get", "pv", "-o", "json"], dry_run=False, log=lambda _: None)
         left = {p.get("metadata", {}).get("name") for p in ((_json(out) or {}).get("items") or [])} & want \
             if rc == 0 else want
         if not left:
-            log(f"PVC release: every PV is gone (the CSI driver deleted their disks)")
-            return disks
-        if deadline is not None and clock() >= deadline:
+            log("PVC release: every PV is gone (the CSI driver deleted their disks)")
+            break
+        if clock() >= deadline:
             log(f"PVC release: {len(left)} PV(s) still there at the budget's end ({', '.join(sorted(left))}); "
                 f"the disk backstop runs after the delete")
-            return disks
+            break
         sleep(_POLL_S)
+    return mine
 
 
 def disks_list_command(spec: ClusterSpec) -> list[str]:
@@ -940,13 +928,17 @@ def disks_list_command(spec: ClusterSpec) -> list[str]:
 def disk_backstop(spec: ClusterSpec, *, cluster_id: str | None, recorded: list[dict],
                   log: Callable[[str], None]) -> list[str]:
     """After the cluster is gone: delete THIS cluster's leftover disks by exact
-    name (backstop_disks). Returns what it deleted."""
+    name (backstop_disks). Returns what it deleted; raises when the disks
+    cannot be listed or deleted (a leak must never read as "none left")."""
     rc, out = execute(disks_list_command(spec), dry_run=False, log=log)
     found = _json(out) if rc == 0 else None
-    disks = list(found) if isinstance(found, list) else []
+    if not isinstance(found, list):
+        raise RuntimeError(f"listing {spec.name}'s disks failed (rc={rc}): whether any is left is unknown; "
+                           f"run {' '.join(disks_list_command(spec))}")
+    disks = list(found)
     have = {d.get("name") for d in disks}
     for d in recorded:
-        if d["disk"] not in have and d["location"] == spec.zone:
+        if d["disk"] not in have and d["location"] == spec.zone and d["project"] == spec.project:
             rc, out = execute(["gcloud", "compute", "disks", "describe", d["disk"], "--zone", spec.zone,
                                "--project", spec.project, "--format", "json"], dry_run=False, log=log)
             one = _json(out) if rc == 0 else None
@@ -960,13 +952,13 @@ def disk_backstop(spec: ClusterSpec, *, cluster_id: str | None, recorded: list[d
     rc, _ = execute(["gcloud", "compute", "disks", "delete", *names, "--zone", spec.zone,
                      "--project", spec.project, "--quiet"], dry_run=False, log=log)
     if rc != 0:
-        raise RuntimeError(f"disk backstop: deleting {', '.join(names)} failed (rc={rc}); "
+        raise RuntimeError(f"deleting {', '.join(names)} failed (rc={rc}); "
                            f"delete them by hand (gcloud compute disks delete ... --zone {spec.zone})")
     log(f"disk backstop: deleted {len(names)} leftover disk(s) of {spec.name}: {', '.join(names)}")
     return names
 
 
-def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline: float | None,
+def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline: float,
                       clock: Callable[[], float], sleep: Callable[[float], None]) -> bool:
     """Poll describe until GKE reports the cluster NotFound (an --async delete
     returns at once; its nodes, and the disks attached to them, go when the
@@ -976,9 +968,7 @@ def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline
         rc, _ = execute(describe_command(spec), dry_run=False, log=lambda _: None, stderr_out=err)
         if rc != 0 and re.search(r"(?i)not ?found|was not found|404", err[-1] if err else ""):
             return True
-        if deadline is not None and clock() >= deadline:
-            log(f"{spec.name} still being deleted at the budget's end: the disk backstop did not run "
-                f"(its disks carry {DISK_CLUSTER_LABEL}={spec.name} and created-by=bench-gke)")
+        if clock() >= deadline:
             return False
         sleep(_POLL_S)
 
@@ -1034,16 +1024,6 @@ def cmd_gke_up(a) -> int:
                 except Exception as e:  # noqa: BLE001
                     sys.stderr.write(f"teardown after failed create: {e}\n")
             return rc
-    # #895: every PVC disk labelled created-by=bench-gke and bench-cluster=<name>
-    if label_storageclasses(spec, dry_run=dry, env=env) != 0:
-        sys.stderr.write("could not label the PD CSI StorageClasses: refusing to go on with a cluster "
-                         "whose PVC disks could not be told apart; tearing it down\n")
-        if not dry:
-            try:
-                teardown(spec, dry_run=False)
-            except Exception as e:  # noqa: BLE001
-                sys.stderr.write(f"teardown after failed StorageClass labelling: {e}\n")
-        return 1
     rc, _ = execute(["kubectl", f"--kubeconfig={spec.kubeconfig}",
                      f"--context={kube_context(spec)}", "apply", "-f", "-"],
                     dry_run=dry, input_data=self_destruct_manifest(spec))
@@ -1059,14 +1039,19 @@ def cmd_gke_shape(a) -> int:
     return 0
 
 
+# gke-down's exit when the cluster IS deleted but the disk backstop failed or
+# was skipped (run606 reports it: disks of the run may be left)
+EXIT_BACKSTOP_FAILED = 4
+
+
 def cmd_gke_down(a) -> int:
     spec = default_spec(a.name, project=a.project, zone=a.zone)
     try:
-        teardown(spec, dry_run=not a.yes, budget_s=a.budget_s)
+        problems = teardown(spec, dry_run=not a.yes, budget_s=a.budget_s)
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"gke-down: {type(e).__name__}: {e}\n")
         return 1
-    return 0
+    return EXIT_BACKSTOP_FAILED if problems else 0
 
 
 def cmd_gke_ssd_quota(a) -> int:
@@ -1078,7 +1063,8 @@ def cmd_gke_ssd_quota(a) -> int:
     ok, msg = ssd_quota_fit(region if isinstance(region, dict) else {}, need)
     if rc != 0:
         ok, msg = False, f"could not read the region's quotas (rc={rc}): whether the runs fit is unknown"
-    print(("" if ok else "refusing: ") + msg + f" ({a.runs} bench cluster(s) x {BENCH_PVC_FOOTPRINT_GB} GB)",
+    # no "refusing:" prefix: the caller (run606_pair.sh) says it once
+    print(msg + f" ({a.runs} bench cluster(s) x {BENCH_PVC_FOOTPRINT_GB} GB)",
           file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 2
 
@@ -1193,9 +1179,10 @@ def add_parsers(sub) -> None:
     down = sub.add_parser("gke-down", help="#606: delete a bench cluster "
                                            "(label-checked; dry run unless --yes)")
     common(down)
-    down.add_argument("--budget-s", type=float, default=None,
-                      help="how long a delete refused by an in-flight cluster operation may wait "
-                           "for it (run606: DOWN_BUDGET_S); unset = until it ends")
+    down.add_argument("--budget-s", type=float, default=DEFAULT_DOWN_BUDGET_S,
+                      help="bound of every teardown wait: the PV release (half of it), an in-flight "
+                           "cluster operation, the gone-poll before the disk backstop (run606: "
+                           f"DOWN_BUDGET_S; default {DEFAULT_DOWN_BUDGET_S:g} s)")
     down.set_defaults(func=cmd_gke_down)
 
     reap = sub.add_parser("gke-reap", help="#606: delete bench clusters past "
