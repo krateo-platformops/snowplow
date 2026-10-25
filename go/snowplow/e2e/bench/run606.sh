@@ -191,6 +191,10 @@ ROLLOUT_TIMEOUT_S="${ROLLOUT_TIMEOUT_S:-2700}" # reboot: rollout status
 COLLECT_CAP_S="${COLLECT_CAP_S:-1800}"        # collect + evaluate, all reads together
 DIAG_CAP_S="${DIAG_CAP_S:-900}"               # diag606 snapshot on failure
 DOWN_BUDGET_S="${DOWN_BUDGET_S:-900}"         # gke-down
+# evaluate runs after collect while the cluster is still up: run 15 measured
+# it at 809 s (A) and 828 s (B) ("=== step evaluate ===" -> "verdict exit=" in
+# snowplow-bench-run15{a,b}-983b17d8/run.log); the larger is its budget term
+EVALUATE_EST_S="${EVALUATE_EST_S:-828}"
 TTL_MARGIN_S="${TTL_MARGIN_S:-1800}"
 if [[ "$RUN8_REPORT" == "1" ]]; then
   # shellcheck disable=SC2086
@@ -204,9 +208,9 @@ fi
 RUN_BUDGET_S=$(( UP_BUDGET_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ENDPOINT_WAIT_S + PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
-                 + COLLECT_CAP_S + DIAG_CAP_S + DOWN_BUDGET_S ))
+                 + COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + DOWN_BUDGET_S ))
 TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
-budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + env ${ENDPOINT_WAIT_S} + preflight ${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + diag ${DIAG_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + env ${ENDPOINT_WAIT_S} + preflight ${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -625,11 +629,11 @@ s_measure() {
   local deadline=$(( $(date +%s) + MEASURE_WAIT_S ))
   # The teardown trap collects what exists before the cluster goes (#763).
   wait_drive_done "$deadline" || return 1
-  # A failed wait is a verdict only when the API server answers; while it
+  # A failed wait is a verdict when the API server answers (/readyz); while it
   # does not, the wait is retried to the same deadline (run 16 attempt 2).
   while ! run "${K[@]}" -n bench-loadgen wait job/fresh606 --for=condition=Complete \
       --timeout="$(( deadline > $(date +%s) ? deadline - $(date +%s) : 1 ))s"; do
-    if "${K[@]}" --request-timeout=60s -n bench-loadgen get job/fresh606 -o name >/dev/null 2>&1; then
+    if api_answers; then
       api_seen ok
       log "measure FAILED: fresh606 not Complete within ${MEASURE_WAIT_S}s"
       return 1
@@ -643,11 +647,20 @@ s_measure() {
   done
   api_seen ok
 }
+# api_answers: does the bench cluster's API server answer at all? (/readyz on
+# the same bench kubeconfig and context.) After a failed read it tells an
+# ANSWERED error (NotFound, Forbidden, a 5xx — a real answer: the step fails
+# with kubectl's own first error line) from no answer (an outage: waited out).
+api_answers() { "${K[@]}" --request-timeout=30s get --raw=/readyz >/dev/null 2>&1; }
+KERR="$OUT/.kubectl-last-error"
+kerr_line() { head -1 "$KERR" 2>/dev/null | cut -c1-300; }
 # api_seen <ok|down> [what]: the API server's reachability as the measure /
 # collect loops see it. Logged on a change of state only (start and end of an
-# outage, each with its time); each outage is recorded in api-outages.jsonl,
-# which evaluate shows beside the verdict (never judged).
-API_DOWN_SINCE="" API_DOWN_AT="" API_DOWN_WHAT=""
+# outage, each with its time). Each outage is recorded in api-outages.jsonl
+# with its window bounded by run606's own polls — from the last poll the API
+# answered to the first it answered again — which the paired verdict uses (an
+# A outage is excluded from both runs; a B outage makes the pair INVALID).
+API_DOWN_SINCE="" API_DOWN_AT="" API_DOWN_WHAT="" API_LAST_OK=""
 api_seen() {
   local now
   now=$(date +%s)
@@ -656,15 +669,21 @@ api_seen() {
       API_DOWN_SINCE=$now API_DOWN_AT="$(date -u +%H:%M:%S)" API_DOWN_WHAT="${2:-}"
       log "API server unreachable since ${API_DOWN_AT} (${API_DOWN_WHAT}): waiting it out, not a verdict"
     fi
-  elif [[ -n "$API_DOWN_SINCE" ]]; then
-    log "API server reachable again at $(date -u +%H:%M:%S), after $(( now - API_DOWN_SINCE )) s (unreachable since ${API_DOWN_AT})"
-    api_record "$now" false
+  else
+    if [[ -n "$API_DOWN_SINCE" ]]; then
+      log "API server reachable again at $(date -u +%H:%M:%S), after $(( now - API_DOWN_SINCE )) s (unreachable since ${API_DOWN_AT})"
+      api_record "$now" false
+    fi
+    API_LAST_OK=$now
   fi
 }
-# api_record <t1> <open>: one outage into the run's record
+# api_record <t1> <open>: one outage into the run's record. t0 = the last poll
+# the API answered before it (else the first that went unanswered), t1 = the
+# first it answered after (or now, still open).
 api_record() {
-  printf '{"kind":"api_unreachable","t0":%s,"t1":%s,"seconds":%s,"seen_by":"%s","open":%s}\n' \
-    "$API_DOWN_SINCE" "$1" "$(( $1 - API_DOWN_SINCE ))" "$API_DOWN_WHAT" "$2" >> "$OUT/api-outages.jsonl"
+  printf '{"kind":"api_unreachable","t0":%s,"t1":%s,"seconds":%s,"first_unanswered":%s,"seen_by":"%s","open":%s,"source":"run606 polls: the last answered poll before to the first answered poll after"}\n' \
+    "${API_LAST_OK:-$API_DOWN_SINCE}" "$1" "$(( $1 - ${API_LAST_OK:-$API_DOWN_SINCE} ))" "$API_DOWN_SINCE" \
+    "$API_DOWN_WHAT" "$2" >> "$OUT/api-outages.jsonl"
   API_DOWN_SINCE=""
 }
 # api_reachable_for_collect: before collect reads anything, wait out an API
@@ -703,10 +722,15 @@ wait_drive_done() {
     log "waiting for the driver: $j pods Ready = run over, results final"
     while true; do
       # A read the API server did not answer proves nothing: it is waited out
-      # (to the measure deadline), never concluded (run 16 attempt 2).
+      # (to the measure deadline), never concluded (run 16 attempt 2). A read
+      # it ANSWERED with an error is a real answer: the step fails on it.
       if st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$j" \
-               -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>/dev/null)"; then
+               -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>"$KERR")"; then
         api_seen ok
+      elif api_answers; then
+        api_seen ok
+        log "measure FAILED: reading job/$j failed while the API server answers: $(kerr_line)"
+        return 1
       else
         st=""; api_seen down "get job/$j"
       fi
@@ -723,7 +747,12 @@ wait_drive_done() {
       for k in $(driver_jobs); do
         # only positive evidence fails the step: a pod seen Pending past
         # DRIVER_PENDING_S (its own creationTimestamp) or a restarting init step
-        if ! pods="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o json 2>/dev/null)"; then
+        if ! pods="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o json 2>"$KERR")"; then
+          if api_answers; then
+            api_seen ok
+            log "measure FAILED: listing the $k driver pods failed while the API server answers: $(kerr_line)"
+            return 1
+          fi
           api_seen down "get pods job-name=$k"; continue
         fi
         api_seen ok
@@ -745,10 +774,16 @@ wait_drive_done() {
 # driver_exit_codes <job> <ready>: Ready only says the run is OVER; each
 # pod's /out/done holds its exit code, and the log says which it was. A
 # non-zero exit is not a measure failure (fresh606 still runs and its samples
-# stand); the verdict makes the run INVALID with the reason.
+# stand); the verdict makes the run INVALID with the reason. A listing the API
+# server did not answer says nothing: "unknown", never "every run exited 0".
 driver_exit_codes() {
-  local j="$1" p rc bad=""
-  for p in $("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$j" -o name 2>/dev/null); do
+  local j="$1" p rc bad="" names
+  if ! names="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$j" -o name 2>"$KERR")" \
+      || [[ -z "$names" ]]; then
+    log "driver $j exit codes unknown (API did not answer: $(kerr_line)); the collected results say how it ended"
+    return 0
+  fi
+  for p in $names; do
     rc="$(bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "${p#pod/}" -- cat /out/done 2>/dev/null | tr -d '[:space:]')"
     [[ "$rc" == "0" ]] || bad+=" ${p#pod/}=rc${rc:-?}"
   done
@@ -863,6 +898,7 @@ s_collect() {
   # --request-timeout does not bound an open exec stream (`kubectl cp`). The
   # whole collect + evaluate runs under ONE cap (COLLECT_CAP_S, see `capped`).
   local KR=(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
+  COLLECT_DEADLINE=$(( $(date +%s) + COLLECT_CAP_S ))     # collect's own cap (capped)
   # an outage still open from measure, or starting now, is waited out first
   api_reachable_for_collect
   # The driver's results are the FILE on its /out (#817), never its container
@@ -898,9 +934,24 @@ s_collect() {
   # has no pod at all makes the run INVALID with its reason in verdict.json.
   # Before mem606's bounded stop, so nothing slow can come between.
   : > "$OUT/job-pods.jsonl"
+  local jp
   for p in $(driver_jobs) fresh606 mem606; do
-    "${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>/dev/null \
-      | python3 -m bench.load606 job-pod-record --job "$p" >> "$OUT/job-pods.jsonl" \
+    # kubectl's own exit decides: an unanswered read is retried within
+    # collect's cap; one still unanswered is recorded "unreadable", never as
+    # a pod that is missing ("never started": run 16's bug, at collect)
+    while ! jp="$("${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>"$KERR")"; do
+      if api_answers || (( $(date +%s) + COLLECT_TIMEOUT_S >= COLLECT_DEADLINE )); then
+        log "could not read how the $p pod(s) ended: $(kerr_line)"
+        python3 -m bench.load606 job-pod-record --job "$p" \
+            --unreadable "$(api_answers && echo "the API answered: $(kerr_line)" || echo "API did not answer")" \
+            >> "$OUT/job-pods.jsonl"
+        continue 2
+      fi
+      api_seen down "collect: $p pods"
+      sleep "$DRIVE_POLL_S"
+    done
+    api_seen ok
+    printf '%s' "$jp" | python3 -m bench.load606 job-pod-record --job "$p" >> "$OUT/job-pods.jsonl" \
       || log "could not record how the $p pod(s) ended"
   done
   # mem606: its memstats trajectory and heap profiles, both files in /out

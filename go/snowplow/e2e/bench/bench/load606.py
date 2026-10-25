@@ -1586,6 +1586,12 @@ def job_pod_checks(recs: list[dict]) -> list[dict]:
     out = []
     for r in recs:
         why = []
+        if r.get("unreadable"):
+            out.append({"check": f"{r.get('job')}.pod", "value": None,
+                        "bar": "the deployed Job's pods readable at collect", "result": "FAIL",
+                        "why": f"{r.get('job')} pod state unreadable at collect ({r.get('why')}): how it "
+                               f"ended is unknown — not that it never started"})
+            continue
         if r.get("missing"):
             out.append({"check": f"{r.get('job')}.pod", "value": None,
                         "bar": "the deployed Job has a pod at collect", "result": "FAIL",
@@ -3275,7 +3281,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              job_pods: list[dict] | None = None,
              viewer_dead: list[dict] | None = None,
              k6: dict | None = None,
-             churns: list[dict] | None = None) -> dict:
+             churns: list[dict] | None = None,
+             api_outages: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -3484,7 +3491,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         # verdicts); in one run's verdict it is report only
         from bench import custlat
         report["customer_latency"] = custlat.report(k6.get("k6"), k6.get("browser"), mem or [],
-                                                    fresh, churns, tops or [], snowplow_pods)
+                                                    fresh, churns, tops or [], snowplow_pods,
+                                                    outages=api_outages)
     report["first_loads_failed"] = sum(1 for n in navs if n.get("first_load_failed"))
     fv = [f for f in fresh if f.get("valid") is False]
     report["fresh_invalid_samples"] = len(fv)
@@ -4905,6 +4913,29 @@ def _cmd_memwatch(a) -> int:
 DRIVER_STUCK_UNKNOWN = 3
 
 
+def _cmd_job_pod_record(a) -> int:
+    """job_pod records of one Job. A listing that could not be read (run606's
+    --unreadable, or an empty / unparseable / item-less body) is recorded as
+    UNREADABLE: how the pods ended is unknown — never "missing", which reads
+    as "never started" (run 16's bug, at collect)."""
+    why = a.unreadable
+    pods = None
+    if why is None:
+        raw = sys.stdin.read()
+        try:
+            pods = json.loads(raw) if raw.strip() else None
+        except ValueError:
+            pods = None
+        if not isinstance(pods, dict) or not isinstance(pods.get("items"), list):
+            why = "the pod listing was empty or unparseable"
+    if why is not None:
+        print(json.dumps({"kind": "job_pod", "job": a.job, "t": time.time(), "pod": None,
+                          "unreadable": True, "why": why}))
+        return 0
+    print("\n".join(json.dumps(r) for r in job_pod_records(pods, a.job)))
+    return 0
+
+
 def _cmd_driver_stuck(a) -> int:
     """0 = no driver pod is stuck; 1 = one is, on positive evidence (the
     reason is printed); DRIVER_STUCK_UNKNOWN = the listing proves nothing."""
@@ -4996,7 +5027,8 @@ def _cmd_evaluate(a) -> int:
                       viewer_dead=sorted((r for r in recs if r.get("kind") == "viewer_dead"),
                                          key=lambda r: r.get("t") or 0),
                       k6=k6,
-                      churns=[r for r in recs if r.get("kind") == "churn"])
+                      churns=[r for r in recs if r.get("kind") == "churn"],
+                      api_outages=[r for r in recs if r.get("kind") == "api_unreachable"])
     # the cluster's shape (gke-shape): "control_plane": "regional" from run 17;
     # runs 14-16 have no record (their control plane was zonal)
     result["report"]["cluster_shape"] = next((r for r in recs if r.get("kind") == "cluster_shape"), None)
@@ -5121,9 +5153,9 @@ def main(argv: list[str] | None = None) -> int:
     jp = sub.add_parser("job-pod-record",
                         help="kubectl get pods -l job-name=<job> -o json on stdin -> job_pod records")
     jp.add_argument("--job", required=True)
-    jp.set_defaults(func=lambda a: print("\n".join(
-        json.dumps(r) for r in job_pod_records(json.loads(sys.stdin.read() or "{}"), a.job)))
-        or 0)
+    jp.add_argument("--unreadable", default=None,
+                    help="the listing could not be read (why): recorded as unreadable, never as missing")
+    jp.set_defaults(func=_cmd_job_pod_record)
     lt = sub.add_parser("login-tokens", help="#830: sign users in; bearer tokens to a pod-local file")
     lt.add_argument("--authn-url", required=True)
     lt.add_argument("--password", required=True)

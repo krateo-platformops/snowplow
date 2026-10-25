@@ -15,6 +15,7 @@ api-outages.jsonl, which evaluate shows beside the verdict (never judged).
 
 from __future__ import annotations
 
+import copy
 import json
 import subprocess
 import time
@@ -131,3 +132,128 @@ def test_collect_waits_out_an_outage_before_declaring_results_missing(harness): 
     assert "(collect): waiting it out" in log and "API server reachable again" in log
     assert "could not copy the driver's results" not in log
     assert json.loads((tmp / "out" / "api-outages.jsonl").read_text().splitlines()[0])["seen_by"] == "collect"
+
+
+# ─── #898 review: answered errors, collect, exit codes, the outage rule, the budget ─
+
+@pytest.mark.parametrize("what, line", [
+    ("job", 'Error from server (NotFound): jobs.batch "k6load" not found'),
+    ("pods", "Error from server (InternalError): an error on the server has prevented the request"),
+])
+def test_an_answered_error_fails_the_step_with_kubectls_line(harness, what, line):  # noqa: F811
+    """1: a read the API server ANSWERED with an error (NotFound, Forbidden, a
+    5xx) is a real answer — /readyz answers — so the step fails at once with
+    kubectl's own first error line; it is never waited out as an outage."""
+    t0 = time.time()
+    p, _, out = _run606_k6(harness, FAKE_ANSWERED_ERROR=what, FAKE_DRIVER_RUNNING="k6load",
+                           DRIVE_POLL_S="1", MEASURE_WAIT_S="3600")
+    log = _log(out)
+    assert "measure FAILED:" in log and line in log, log[-3000:]
+    assert "while the API server answers" in log and "API server unreachable" not in log
+    assert time.time() - t0 < 240
+
+
+def test_a_fresh606_wait_answered_with_an_error_fails_by_readyz(harness):  # noqa: F811
+    """1: the fresh606 wait's probe is /readyz: an answered Forbidden fails
+    the step, it is not waited to the deadline (a `get job/fresh606` probe
+    would have failed too and read as an outage)."""
+    env, state, _, tmp = harness
+    env = dict(env, FAKE_WAIT_ANSWERED="1", DRIVE_POLL_S="1", MEASURE_WAIT_S="3600")
+    t0 = time.time()
+    subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True, timeout=300)
+    log = (tmp / "out" / "run.log").read_text()
+    assert "measure FAILED: fresh606 not Complete within 3600s" in log and "API server unreachable" not in log
+    assert time.time() - t0 < 240
+
+
+def test_job_pod_record_never_reads_an_unreadable_listing_as_missing():
+    """2: an empty / unparseable listing, or run606's --unreadable, is
+    recorded unreadable — never `missing` ("never started")."""
+    def rec(stdin, *extra):
+        p = subprocess.run(["python3", "-m", "bench.load606", "job-pod-record", "--job", "k6load", *extra],
+                           input=stdin, cwd=BENCH_DIR, capture_output=True, text=True, check=True)
+        return json.loads(p.stdout)
+    for stdin in ("", "garbage", "{}"):
+        r = rec(stdin)
+        assert r["unreadable"] is True and "missing" not in r, stdin
+    r = rec("", "--unreadable", "API did not answer")
+    assert r["why"] == "API did not answer"
+    assert rec('{"items": []}')["missing"] is True              # an answered empty list: the pod IS missing
+    (chk,) = load606.job_pod_checks([r])
+    assert chk["result"] == "FAIL" and "unreadable at collect (API did not answer)" in chk["why"]
+    assert "never started" not in chk["why"] or "not that it never started" in chk["why"]
+
+
+def test_collect_records_unanswered_pod_reads_as_unreadable(harness):  # noqa: F811
+    """2: at collect the API stops answering the pod listings: retried within
+    collect's cap, then recorded "unreadable (API did not answer)"; the
+    verdict says so — not "no k6load pod at collect: it never started"."""
+    p, _, out = _run606_k6(harness, FAKE_COLLECT_PODS_UNANSWERED="1", DRIVE_POLL_S="1",
+                           COLLECT_CAP_S="30", COLLECT_TIMEOUT_S="29")
+    recs = [json.loads(x) for x in (out / "job-pods.jsonl").read_text().splitlines()]
+    assert recs and all(r.get("unreadable") and r["why"] == "API did not answer" for r in recs), recs
+    v = json.loads((out / "verdict.json").read_text())
+    whys = [c.get("why") or "" for c in v["validity"] if c["check"].endswith(".pod") and c["result"] == "FAIL"]
+    assert whys and all("unreadable at collect (API did not answer)" in w for w in whys)
+    assert not any("never started" in w and "not that it never started" not in w for w in whys)
+
+
+def test_unanswered_exit_codes_are_unknown_never_exited_0(harness):  # noqa: F811
+    """3: the driver's exit codes cannot be listed: "unknown", never "every
+    run exited 0"."""
+    p, _, out = _run606_k6(harness, FAKE_EXIT_CODES_UNANSWERED="1", DRIVE_POLL_S="1")
+    log = _log(out)
+    assert "driver k6load exit codes unknown (API did not answer" in log, log[-3000:]
+    assert "k6load pod(s) Ready, every run exited 0" not in log      # the unanswered listing claims nothing
+    assert "k6browser pod(s) Ready, every run exited 0" in log       # the next one answered
+
+
+# 4: the outage rule in the paired verdict (run 14's recorded run, test_pair_ready_time's arms)
+
+def _outage(doc, t0_s, t1_s, k0):
+    d = copy.deepcopy(doc)
+    d["api_outages"] = [{"kind": "api_unreachable", "t0": k0 + t0_s, "t1": k0 + t1_s,
+                         "seconds": t1_s - t0_s, "first_unanswered": k0 + t0_s + 30, "seen_by": "get job/k6load",
+                         "open": False,
+                         "source": "run606 polls: the last answered poll before to the first answered poll after"}]
+    return d
+
+
+def test_an_a_outage_is_excluded_from_both_runs_like_an_a_restart(tmp_path):
+    p = _arms(tmp_path, _outage(P14, 900, 1100, K0), _shift(P14, SHIFT))
+    assert p["verdict"] == "PASS", (p["invalid_reasons"], p["fail_reasons"])
+    (it,) = p["exclusion"]["items"]
+    assert it["what"] == "A control-plane outage #1" and "run606 polls" in it["why"]
+    (a0, a1), = it["a"]
+    (b0, b1), = it["b"]
+    assert round(b0 - a0, 6) == SHIFT and round(b1 - a1, 6) == SHIFT
+    assert any("A's control plane did not answer for 200" in n and "excluded from both runs" in n for n in p["notes"])
+    churn = [c for c in p["checks"] if c["check"].startswith("customer_latency.pair[churn]")]
+    assert all(c["excluded"]["a_s"] == c["excluded"]["b_s"] > 0 for c in churn)
+
+
+def test_a_b_outage_makes_the_pair_invalid_with_its_window(tmp_path):
+    p = _arms(tmp_path, P14, _shift(_outage(P14, 900, 1100, K0), SHIFT))
+    assert p["verdict"] == "INVALID"
+    assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.control_plane_outage[b]"]
+    why = p["invalid_reasons"][0]
+    assert "200.0 s from" in why and "run606 polls" in why and "never excluded silently" in why
+    v = next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
+    assert v["value"][0]["seconds"] == 200.0
+
+
+def test_an_outage_outside_the_measure_is_not_the_pairs(tmp_path):
+    """only an outage that touches k6's span counts (collect-time ones do not)"""
+    p = _arms(tmp_path, P14, _shift(_outage(P14, 5000, 5100, K0), SHIFT))
+    assert p["verdict"] == "PASS"
+
+
+def test_evaluate_is_in_the_run_budget():
+    """5: evaluate runs while the cluster is up (run 15: 809 s A, 828 s B)."""
+    src = (BENCH_DIR / "run606.sh").read_text()
+    assert 'EVALUATE_EST_S="${EVALUATE_EST_S:-828}"' in src and "809 s (A) and 828 s (B)" in src
+    assert "+ COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + DOWN_BUDGET_S ))" in src
+    assert "+ evaluate ${EVALUATE_EST_S} +" in src
+
+
+from tests.test_pair_ready_time import K0, P14, SHIFT, _arms, _shift  # noqa: E402

@@ -614,8 +614,32 @@ def request_spans(o: dict | None) -> list[tuple[float, float, bool, float]] | No
             if t is not None and v is not None]
 
 
+def control_plane_outages(outages: list[dict] | None, span) -> list[dict]:
+    """The run's control-plane outages (run606's api-outages.jsonl) that touch
+    k6's span — the measure. Window from run606's own polls: the last poll the
+    API server answered before to the first it answered after (no in-cluster
+    signal bounds it today: fresh606 keeps only per-phase failure counts, and
+    mem606 captures no API-request / watch-error expvar). Report-only beside
+    the window: snowplow's own API request counters — not captured."""
+    out = []
+    for o in outages or []:
+        try:
+            t0, t1 = float(o["t0"]), float(o["t1"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if span and (t1 <= span[0] or t0 >= span[1]):
+            continue
+        out.append({"t0": t0, "t1": t1, "seconds": round(t1 - t0, 1), "open": bool(o.get("open")),
+                    "first_unanswered": o.get("first_unanswered"), "seen_by": o.get("seen_by"),
+                    "source": o.get("source") or "run606 polls",
+                    "snowplow_api_counters": "not captured: mem606 has no snowplow API-request expvar "
+                                             "prefix (report-only when it has)"})
+    return out
+
+
 def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[dict] | None,
-           churns: list[dict] | None, tops: list[dict], pods: list[dict] | None = None) -> dict:
+           churns: list[dict] | None, tops: list[dict], pods: list[dict] | None = None,
+           outages: list[dict] | None = None) -> dict:
     """report["customer_latency"] of one run's verdict.json."""
     wins = load606.run_phases(mem, list(fresh or []) + list(churns or []))
     cs = calls(k6o)
@@ -628,6 +652,8 @@ def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[
             "schedule": schedule(k6o, browser, mem, churns),
             # when snowplow was not Ready inside k6's span (the pair removes it from both runs)
             "readiness": readiness(mem, pods, span),
+            # the control plane not answering during the measure (run606's polls)
+            "control_plane_outages": control_plane_outages(outages, span),
             "k6_errors": k6_errors(k6o),
             "clicks_vs_open_schedule": clicks_vs_schedule(k6o, wins),
             "refresher_completions": refresher_per_phase(mem, wins, span),
@@ -766,6 +792,13 @@ def joint_exclusion(ra: dict, rb: dict) -> dict:
             other = map_interval(e["t0"], e["t1"], wins[x], wins[y], spans[x][0], spans[y][0])
             items.append({"what": f"{x.upper()} {e['kind']} #{i}", "why": e["why"], "kind": e["kind"],
                           "run": x.upper(), x: own, y: other})
+        # a control-plane outage is cut like a restart (B's also makes the pair INVALID)
+        for i, o in enumerate(r.get("control_plane_outages") or [], 1):
+            own = [(o["t0"], o["t1"])]
+            other = map_interval(o["t0"], o["t1"], wins[x], wins[y], spans[x][0], spans[y][0])
+            items.append({"what": f"{x.upper()} control-plane outage #{i}",
+                          "why": f"the API server did not answer for {o['seconds']} s ({o['source']})",
+                          "kind": "api_outage", "run": x.upper(), x: own, y: other})
     out = {"items": [], "a": [], "b": []}
     for it in items:
         for z in ("a", "b"):
@@ -970,6 +1003,19 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
             "B's readiness is unknown for " + "; ".join(f"{e['seconds']} s ({e['why']})" for e in unk)
             + ": the candidate's not-Ready time cannot be told from its Ready time"))
         if rda is not None and rdb is not None:
+            # A control-plane outage of B during the measure: INVALID, never PASS —
+            # the candidate may have caused it, so it is never silently cut
+            cpo = rb.get("control_plane_outages") or []
+            validity.append(_validity(
+                "control_plane_outage[b]", not cpo,
+                [{k: o[k] for k in ("t0", "t1", "seconds", "source", "open")} for o in cpo] or "none",
+                "B's API server answered through the measure",
+                "B's control plane did not answer during the measure ("
+                + "; ".join(f"{o['seconds']} s from {o['t0']:.0f} to {o['t1']:.0f}, {o['source']}" for o in cpo)
+                + "): the candidate may have caused it — never excluded silently"))
+            for o in ra.get("control_plane_outages") or []:
+                notes.append(f"A's control plane did not answer for {o['seconds']} s during the measure "
+                             f"({o['source']}): excluded from both runs, like an A restart")
             validity.append(_validity("restarts_placed[a]", not rs["a"].get("unlocated"),
                                       rs["a"].get("unlocated") or "every restart placed",
                                       "each of A's restarts placed in time by its readiness samples",
