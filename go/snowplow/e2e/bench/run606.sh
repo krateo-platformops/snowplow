@@ -625,11 +625,65 @@ s_measure() {
   local deadline=$(( $(date +%s) + MEASURE_WAIT_S ))
   # The teardown trap collects what exists before the cluster goes (#763).
   wait_drive_done "$deadline" || return 1
-  if ! run "${K[@]}" -n bench-loadgen wait job/fresh606 --for=condition=Complete \
-      --timeout="$(( deadline > $(date +%s) ? deadline - $(date +%s) : 1 ))s"; then
-    log "measure FAILED: fresh606 not Complete within ${MEASURE_WAIT_S}s"
-    return 1
+  # A failed wait is a verdict only when the API server answers; while it
+  # does not, the wait is retried to the same deadline (run 16 attempt 2).
+  while ! run "${K[@]}" -n bench-loadgen wait job/fresh606 --for=condition=Complete \
+      --timeout="$(( deadline > $(date +%s) ? deadline - $(date +%s) : 1 ))s"; do
+    if "${K[@]}" --request-timeout=60s -n bench-loadgen get job/fresh606 -o name >/dev/null 2>&1; then
+      api_seen ok
+      log "measure FAILED: fresh606 not Complete within ${MEASURE_WAIT_S}s"
+      return 1
+    fi
+    api_seen down "wait job/fresh606"
+    if (( $(date +%s) >= deadline )); then
+      log "measure FAILED: fresh606 not seen Complete within ${MEASURE_WAIT_S}s (the API server did not answer)"
+      return 1
+    fi
+    sleep "$DRIVE_POLL_S"
+  done
+  api_seen ok
+}
+# api_seen <ok|down> [what]: the API server's reachability as the measure /
+# collect loops see it. Logged on a change of state only (start and end of an
+# outage, each with its time); each outage is recorded in api-outages.jsonl,
+# which evaluate shows beside the verdict (never judged).
+API_DOWN_SINCE="" API_DOWN_AT="" API_DOWN_WHAT=""
+api_seen() {
+  local now
+  now=$(date +%s)
+  if [[ "$1" == "down" ]]; then
+    if [[ -z "$API_DOWN_SINCE" ]]; then
+      API_DOWN_SINCE=$now API_DOWN_AT="$(date -u +%H:%M:%S)" API_DOWN_WHAT="${2:-}"
+      log "API server unreachable since ${API_DOWN_AT} (${API_DOWN_WHAT}): waiting it out, not a verdict"
+    fi
+  elif [[ -n "$API_DOWN_SINCE" ]]; then
+    log "API server reachable again at $(date -u +%H:%M:%S), after $(( now - API_DOWN_SINCE )) s (unreachable since ${API_DOWN_AT})"
+    api_record "$now" false
   fi
+}
+# api_record <t1> <open>: one outage into the run's record
+api_record() {
+  printf '{"kind":"api_unreachable","t0":%s,"t1":%s,"seconds":%s,"seen_by":"%s","open":%s}\n' \
+    "$API_DOWN_SINCE" "$1" "$(( $1 - API_DOWN_SINCE ))" "$API_DOWN_WHAT" "$2" >> "$OUT/api-outages.jsonl"
+  API_DOWN_SINCE=""
+}
+# api_reachable_for_collect: before collect reads anything, wait out an API
+# outage within half of COLLECT_CAP_S (collect's own cap; the other half is
+# for the reads), so results are not declared missing over a blip. An outage
+# still open then is recorded as open.
+api_reachable_for_collect() {
+  local until=$(( $(date +%s) + COLLECT_CAP_S / 2 ))
+  while ! bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
+        -n bench-loadgen get jobs -o name >/dev/null 2>&1; do
+    api_seen down "collect"
+    if (( $(date +%s) >= until )); then
+      log "collect: the API server still unreachable after $(( COLLECT_CAP_S / 2 )) s; collecting what answers"
+      api_record "$(date +%s)" true
+      return 0
+    fi
+    sleep "$DRIVE_POLL_S"
+  done
+  api_seen ok
 }
 # driver_jobs: the in-cluster Jobs that drive the load. load606: the Python
 # driver; k6 (#830, run 11): the k6 1,000-user load and the real-Chrome
@@ -643,13 +697,19 @@ driver_jobs() { if [[ "$LOAD_DRIVER" == "k6" ]]; then echo "k6load k6browser"; e
 # Init), checked on EVERY driver Job at each poll (the browser pod's would
 # otherwise wait behind k6load's whole run).
 wait_drive_done() {
-  local deadline="$1" st ready failed want j k stuck
+  local deadline="$1" st ready failed want j k stuck pods src
   if [[ "$DRY" == "1" ]]; then log "DRY: wait until every $(driver_jobs) pod is Ready (run over)"; return 0; fi
   for j in $(driver_jobs); do
     log "waiting for the driver: $j pods Ready = run over, results final"
     while true; do
-      st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$j" \
-            -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>/dev/null || true)"
+      # A read the API server did not answer proves nothing: it is waited out
+      # (to the measure deadline), never concluded (run 16 attempt 2).
+      if st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$j" \
+               -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>/dev/null)"; then
+        api_seen ok
+      else
+        st=""; api_seen down "get job/$j"
+      fi
       IFS=/ read -r ready failed want <<< "$st"
       want="${want:-1}"
       if [[ -n "$st" && "${ready:-0}" -ge "$want" ]]; then
@@ -661,11 +721,18 @@ wait_drive_done() {
         return 1
       fi
       for k in $(driver_jobs); do
-        stuck="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o json 2>/dev/null \
-                 | python3 -m bench.load606 driver-stuck --pending-s "$DRIVER_PENDING_S")" || {
+        # only positive evidence fails the step: a pod seen Pending past
+        # DRIVER_PENDING_S (its own creationTimestamp) or a restarting init step
+        if ! pods="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o json 2>/dev/null)"; then
+          api_seen down "get pods job-name=$k"; continue
+        fi
+        api_seen ok
+        src=0
+        stuck="$(printf '%s' "$pods" | python3 -m bench.load606 driver-stuck --pending-s "$DRIVER_PENDING_S")" || src=$?
+        if [[ "$src" == "1" ]]; then
           log "measure FAILED: the $k driver never started: $stuck"
           return 1
-        }
+        fi
       done
       if (( $(date +%s) >= deadline )); then
         log "measure FAILED: $j not done within ${MEASURE_WAIT_S}s (${ready:-0}/${want} Ready)"
@@ -796,6 +863,8 @@ s_collect() {
   # --request-timeout does not bound an open exec stream (`kubectl cp`). The
   # whole collect + evaluate runs under ONE cap (COLLECT_CAP_S, see `capped`).
   local KR=(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
+  # an outage still open from measure, or starting now, is waited out first
+  api_reachable_for_collect
   # The driver's results are the FILE on its /out (#817), never its container
   # log: the kubelet rotates that, and `kubectl logs` returns only the current
   # file. The log keeps the driver's diagnostics.
@@ -893,7 +962,8 @@ s_evaluate() {
   shopt -s nullglob
   local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
-               "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl)
+               "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
+               "$OUT"/api-outages*.jsonl)
   local r8=() k6args=()
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
   # #830: the page loads are the real browsers'; k6 is the load

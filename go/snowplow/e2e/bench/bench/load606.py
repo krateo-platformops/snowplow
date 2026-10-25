@@ -4898,11 +4898,24 @@ def _cmd_memwatch(a) -> int:
     return 0
 
 
+# driver-stuck's exit when the pod listing proves nothing either way (empty,
+# unparseable, no `items`: the API server did not answer). Never a failure:
+# run 16 attempt 2 lost 65 healthy minutes of measure to a ~5 min API outage
+# read as "the driver never started".
+DRIVER_STUCK_UNKNOWN = 3
+
+
 def _cmd_driver_stuck(a) -> int:
+    """0 = no driver pod is stuck; 1 = one is, on positive evidence (the
+    reason is printed); DRIVER_STUCK_UNKNOWN = the listing proves nothing."""
+    raw = sys.stdin.read()
     try:
-        pods = json.loads(sys.stdin.read() or "{}")
+        pods = json.loads(raw) if raw.strip() else None
     except ValueError:
-        return 0                         # an unreadable listing proves nothing
+        pods = None
+    if not isinstance(pods, dict) or not isinstance(pods.get("items"), list):
+        print("the driver pods could not be read (no pod listing): unknown, not stuck")
+        return DRIVER_STUCK_UNKNOWN
     why = driver_pod_stuck(pods, time.time(), pending_s=a.pending_s,
                            init_restarts=a.init_restarts)
     if why:
@@ -4987,6 +5000,9 @@ def _cmd_evaluate(a) -> int:
     # the cluster's shape (gke-shape): "control_plane": "regional" from run 17;
     # runs 14-16 have no record (their control plane was zonal)
     result["report"]["cluster_shape"] = next((r for r in recs if r.get("kind") == "cluster_shape"), None)
+    # the stretches the run's measure / collect loops could not reach the API
+    # server (run606 api_seen): shown with the verdict, never judged
+    result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))
