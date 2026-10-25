@@ -131,6 +131,12 @@ var nonCacheInitPublishers = map[string][]string{
 	// SA-discovery family (cached_client_metrics.go) IS a cache-path mechanism
 	// and stays gated. Rationale at partial_discovery.go:42-49.
 	"internal/dynamic/partial_discovery.go": {"snowplow_discovery"},
+	// AUDIT-4 (installer#410) refused-audit-record counter: the audit emitter is
+	// not a cache surface — /call writes and RESTAction write stages emit in
+	// either cache mode, so a record refused for a missing actor/action/method/
+	// target must stay observable with the cache off. Gating it would hide the
+	// refusals in a configuration where writes still happen.
+	"internal/support/audit/incomplete_metrics.go": {"snowplow_audit_incomplete_total"},
 }
 
 // legacyHG321Keys are the five names the shell falsifier asserted since

@@ -26,7 +26,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"expvar"
 	"net/http"
 	"regexp"
 	"sync/atomic"
@@ -169,27 +168,6 @@ type Event struct {
 	Stage               string
 }
 
-// Incomplete-record reasons: the closed set of fields whose absence makes a
-// record unanswerable, in the order they are checked.
-const (
-	IncompleteActor  = "actor"
-	IncompleteAction = "action"
-	IncompleteMethod = "method"
-	IncompleteTarget = "target"
-)
-
-// incomplete counts records that were NOT emitted because they could not say
-// who did what to which target, by the first missing field.
-// snowplow_audit_incomplete_total in /debug/vars. Every cell is published at
-// startup, so a 0 is a reading.
-var incomplete = func() *expvar.Map {
-	m := expvar.NewMap("snowplow_audit_incomplete_total")
-	for _, k := range []string{IncompleteActor, IncompleteAction, IncompleteMethod, IncompleteTarget} {
-		m.Add(k, 0)
-	}
-	return m
-}()
-
 // missingField returns the first field ev (with actor user) lacks to be an
 // answerable record, or "" when it has them all.
 //
@@ -210,14 +188,6 @@ func missingField(user string, ev Event) string {
 		return IncompleteTarget
 	}
 	return ""
-}
-
-// IncompleteCount returns how many records were refused for reason.
-func IncompleteCount(reason string) int64 {
-	if v, ok := incomplete.Get(reason).(*expvar.Int); ok {
-		return v.Value()
-	}
-	return 0
 }
 
 // Emitter wraps a single OTel Logs API Logger. Construct once at startup
