@@ -1735,6 +1735,10 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 						stageHeaders = append(stageHeaders,
 							fmt.Sprintf("%s: %s", cache.ResolveAncestorsHeader, anc))
 					}
+					// #871 — measurement only (self_host.go).
+					if h, ok := selfLoopbackWorkClassHeader(r.ctx); ok {
+						stageHeaders = append(stageHeaders, h)
+					}
 				}
 
 				local := *apiCall

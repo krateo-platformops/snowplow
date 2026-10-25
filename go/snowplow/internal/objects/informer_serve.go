@@ -56,6 +56,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -146,6 +147,7 @@ func startObjectsGetSummary() {
 		objectsGetSummaryWG.Add(1)
 		go func() {
 			defer objectsGetSummaryWG.Done()
+			workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 			t := time.NewTicker(every)
 			defer t.Stop()
 			for {

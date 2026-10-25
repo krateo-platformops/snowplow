@@ -47,6 +47,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
+
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // Refresher env knobs. The base/max backoff delays drive the
@@ -1000,6 +1002,17 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	var attemptDur time.Duration // #740: the failed attempt's own duration floors its backoff
 	defer func() { settleBackgroundRevalidation(key, attemptDur) }()
 
+	// #871 — measurement only: from here this dequeue is one refresh unit. Its
+	// ctx and goroutine carry snowplow_work=refresh|refresh_viewed, and every
+	// goroutine the re-resolve starts (stage errgroups, fill leaders) inherits
+	// it. Nothing reads the label.
+	workClass := workclass.Refresh
+	if tier == tierViewed {
+		workClass = workclass.RefreshViewed
+	}
+	ctx, endWork := workclass.Begin(ctx, workClass)
+	defer endWork()
+
 	// Customer-priority cooperative yield (Ship #98). Mirrors prewarm
 	// engine's yield-before-scope pattern (prewarm_engine.go:275). The
 	// yield reads the dispatcher-injected customer-inflight hook; with
@@ -1201,7 +1214,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// here: refresher work, after the customer yield and the rate floor, never on
 	// a reader's goroutine.
 	if ok && entry != nil {
-		entry.ListCell().runDuePass()
+		entry.ListCell().runDuePass(ctx)
 	}
 	attemptStart := time.Now()
 	err := r.processOne(rctx, key, entry, ok)

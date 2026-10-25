@@ -44,6 +44,11 @@ var _ http.Handler = (*widgetsHandler)(nil)
 func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #443 (j) ingest — FIRST, before observeLiveCaller and the L1 key mint.
 	req = reseedInertFromHeaders(req)
+	// #871 — measurement only: the dispatch's work class (customer, or a
+	// demand revalidation's fill_bg, or a background caller's class across a
+	// self-loopback) as a pprof label on req's context and goroutine.
+	req, endWork := beginServeWorkClass(req)
+	defer endWork()
 	start := time.Now()
 
 	// #443 part 2 — an inline object is a RESTAction only. BodyExtrasDecode

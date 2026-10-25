@@ -56,6 +56,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -611,7 +612,16 @@ func populateClusterListCellAsync(
 		// internal endpoint + REST config + apistage-content-resolve
 		// markers so dispatchViaInformer can serve the cluster-scope
 		// call. Use a fresh timeout context anchored to Background.
-		populateCtx, cancel := context.WithTimeout(context.Background(),
+		//
+		// #871 — measurement only: started from the caller's goroutine, so it
+		// inherited the caller's label, but the ctx below starts from nothing
+		// and the content fill's pprof.Do would reset the goroutine to it.
+		// workclass.Detach replaces context.Background(): a background
+		// caller's populate continues that unit's class; a customer's is a
+		// new fill_bg unit (no user waits on it). The pre-build check's E1.
+		detachedCtx, endWork := workclass.Detach(customerCtx)
+		defer endWork()
+		populateCtx, cancel := context.WithTimeout(detachedCtx,
 			clusterListAsyncPopulateTimeout)
 		defer cancel()
 		// Carry endpoint identity from the customer ctx so the

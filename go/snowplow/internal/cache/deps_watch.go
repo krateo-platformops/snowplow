@@ -68,6 +68,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientcache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -344,6 +345,7 @@ const maxDepWorkerRespawns = 5
 // FIRST so it runs LAST, so the re-spawn's Add(1) lands while the counter is
 // still ≥1 (no zero-transition race against stopWorker's Wait).
 func (w *depWatch) runDepEventWorker(respawns int) {
+	workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 	defer w.workerWG.Done()
 	defer func() {
 		rec := recover()

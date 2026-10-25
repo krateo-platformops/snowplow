@@ -53,6 +53,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -223,6 +224,7 @@ func (c *crdDiscovery) startCRDDiscoveryWorker() {
 		c.workerWG.Add(1)
 		go func() {
 			defer c.workerWG.Done()
+			workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 			defer func() {
 				if rec := recover(); rec != nil {
 					slog.Error("cache.crd_discovery.worker.panic",

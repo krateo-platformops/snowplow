@@ -81,6 +81,7 @@ package cache
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -95,6 +96,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientcache "k8s.io/client-go/tools/cache"
+
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // ListCellFuncs are the apistage layer's own functions, so the incremental cell
@@ -1240,12 +1243,23 @@ func (c *ListCell) maybePass() {
 
 // runDuePass runs the pass a read made due, if any. Called by the refresher on
 // its dequeue of the cell's key, after the customer yield and the rate floor.
-func (c *ListCell) runDuePass() {
+// #871 — a pass that runs is one comparator unit (pprof label + counter); ctx is
+// the refresher unit's, so its label is restored when the pass returns.
+func (c *ListCell) runDuePass(ctx context.Context) {
 	if c == nil || !c.passDue.CompareAndSwap(true, false) {
 		return
 	}
-	c.ComparePass()
+	workclass.Do(ctx, workclass.Comparator, func(ctx context.Context) {
+		if h := comparePassHookForTest.Load(); h != nil {
+			(*h)(ctx)
+		}
+		c.ComparePass()
+	})
 }
+
+// comparePassHookForTest, when set, runs inside the comparator unit right
+// before the pass (the #871 label arm). Production never sets it.
+var comparePassHookForTest atomic.Pointer[func(context.Context)]
 
 // ComparePass runs one comparator pass now (exported for the falsifiers).
 // It returns the number of divergences found (0 means none, or skipped).

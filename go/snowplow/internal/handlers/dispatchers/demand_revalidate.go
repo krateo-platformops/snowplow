@@ -54,6 +54,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // isDemandRevalidation reports whether req is a #547 demand revalidation.
@@ -84,6 +85,12 @@ func revalidateKnownStale(h http.Handler, req *http.Request, key string) {
 	}
 	tpl := setDemandTemplate(key, req)
 	go func() {
+		// #871 — measurement only: detached work no user waits on. The
+		// goroutine was started by a customer dispatch and inherited its
+		// label; it is fill_bg (each attempt's re-entered ServeHTTP counts
+		// the unit).
+		_, endWork := workclass.Continue(context.Background(), workclass.FillBG)
+		defer endWork()
 		res := runDemandRevalidation(h, tpl, key, t0, reason)
 		demandAfterSettle(h, key, reason, res)
 	}()
@@ -229,6 +236,10 @@ func demandRevalidateOnce(h http.Handler, req *http.Request, key string, t0 time
 	// attempt, the absorbed-read reruns included.
 	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(context.WithoutCancel(req.Context())), cache.DemandRevalidationDeadline())
 	defer cancel()
+	// #871 — measurement only: the template is a customer request and carries
+	// its label; the attempt is fill_bg. The re-entered ServeHTTP labels its
+	// goroutine from this ctx and restores it to this ctx's labels on return.
+	ctx = workclass.Label(ctx, workclass.FillBG)
 	ctx, settle := cache.BeginDemandRevalidation(ctx, key, t0)
 	defer func() {
 		if p := recover(); p != nil {
