@@ -35,7 +35,10 @@ case "$RUN_NAME" in
   *) echo "RUN_NAME must start with snowplow-bench-" >&2; exit 2 ;;
 esac
 PROJECT="${PROJECT:-operations-dev-krateo-io}"
-ZONE="${ZONE:-europe-west4-a}"
+ZONE="${ZONE:-europe-west4-a}"      # every node's zone
+# The control plane is REGIONAL (3 replicas; run 16 attempt 2 lost B's zonal
+# one for 5+ minutes): gcloud and the kube context name the region.
+REGION="${ZONE%-*}"
 # The cluster's TTL (the self-destruct CronJob and gke-reap read it). The
 # whole run's worst case must fit inside it, or the run is refused before any
 # cloud call (see the budget below). 11 h holds run 9's default plan (two
@@ -222,7 +225,7 @@ fi
 
 YES="--yes"; [[ "$DRY" == "1" ]] && YES=""
 KCFG="$HOME/.kube/snowplow-bench/${RUN_NAME}.kubeconfig"
-KCTX="gke_${PROJECT}_${ZONE}_${RUN_NAME}"
+KCTX="gke_${PROJECT}_${REGION}_${RUN_NAME}"
 K=(kubectl "--kubeconfig=${KCFG}" "--context=${KCTX}")
 H=(helm --kubeconfig "${KCFG}" --kube-context "${KCTX}")
 
@@ -352,7 +355,7 @@ teardown() {
     log "=== teardown ${RUN_NAME} (exit ${rc}) ==="
     # shielded: a process-group Ctrl-C must not interrupt the delete itself
     if ! ( trap "" INT TERM HUP; exec python3 -m bench.gke gke-down --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" --budget-s "$DOWN_BUDGET_S" $YES ); then
-      log "TEARDOWN FAILED — delete by hand: gcloud container clusters delete ${RUN_NAME} --project ${PROJECT} --zone ${ZONE} --quiet"
+      log "TEARDOWN FAILED — delete by hand: gcloud container clusters delete ${RUN_NAME} --project ${PROJECT} --region ${REGION} --quiet"
       rc=$(( rc == 0 ? 1 : rc ))
     else
       # printed ONLY after gke-down succeeded
@@ -389,6 +392,10 @@ s_source() {
 }
 s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
 s_up() {
+  # the run's record of the cluster's shape (runs 14-16: zonal control plane; 17+: regional)
+  python3 -m bench.gke gke-shape --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
+      --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" > "$OUT/cluster-shape.jsonl"
+  log "control plane: regional (${REGION}); every node in ${ZONE}; context ${KCTX}"
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
       --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES
@@ -886,7 +893,7 @@ s_evaluate() {
   shopt -s nullglob
   local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
-               "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl)
+               "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl)
   local r8=() k6args=()
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
   # #830: the page loads are the real browsers'; k6 is the load

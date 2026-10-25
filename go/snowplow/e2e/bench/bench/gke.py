@@ -6,7 +6,11 @@ GKE cluster created per run and torn down afterwards. NEVER on krateo-057.
 This module owns that lifecycle and nothing else:
 
   - `default_spec()` / `create_commands()` — the exact gcloud argv for the
-    cluster and its node pools, labelled with an owner, the issue and a TTL;
+    cluster and its node pools, labelled with an owner, the issue and a TTL.
+    From run 17 the control plane is REGIONAL (3 replicas; run 16 attempt 2
+    lost B's zonal one for 5+ minutes) while every node stays in the spec's
+    zone (--node-locations); every cluster call names the region, and the
+    kube context is gke_<project>_<region>_<name>;
   - `delete_command()` + `assert_deletable()` — teardown, which REFUSES any
     cluster that does not carry the bench labels and the bench name prefix,
     so a mistyped name can never delete 057 or the release cluster;
@@ -136,11 +140,33 @@ class ClusterSpec:
     def ttl_expires(self) -> int:
         return int(self.created_at) + int(self.ttl_hours) * 3600
 
+    @property
+    def region(self) -> str:
+        """Where the control plane runs: a REGIONAL cluster (3 control-plane
+        replicas; run 16 attempt 2 lost B's zonal one for 5+ minutes). Every
+        node stays in `zone` (--node-locations)."""
+        return region_of(self.zone)
+
     def labels(self) -> dict[str, str]:
         out = dict(BENCH_LABELS)
         out[OWNER_LABEL] = sanitize_label_value(self.owner)
         out[TTL_LABEL] = str(self.ttl_expires)
         return out
+
+
+def region_of(zone: str) -> str:
+    """europe-west4-a -> europe-west4 (a region is returned as is)."""
+    return zone.rsplit("-", 1)[0] if _is_zone(zone) else zone
+
+
+def _is_zone(location: str) -> bool:
+    return bool(re.fullmatch(r"[a-z]+-[a-z]+\d+-[a-z]", location or ""))
+
+
+def _location_flag(location: str) -> list[str]:
+    """`--zone` for a zonal cluster's location, `--region` for a regional
+    one's (gke-reap still meets zonal bench clusters made before run 17)."""
+    return ["--zone" if _is_zone(location) else "--region", location]
 
 
 def _check_name(name: str) -> None:
@@ -207,8 +233,17 @@ def default_spec(name: str | None = None, *, now: float | None = None,
 
 
 def kube_context(spec: ClusterSpec) -> str:
-    """The context name gcloud writes for a zonal cluster."""
-    return f"gke_{spec.project}_{spec.zone}_{spec.name}"
+    """The context name gcloud writes for the (regional) cluster."""
+    return f"gke_{spec.project}_{spec.region}_{spec.name}"
+
+
+def cluster_shape(spec: ClusterSpec) -> dict:
+    """The run's record of the cluster's shape (runs 14-16: zonal control
+    plane; 17+: regional), for the verdict."""
+    return {"kind": "cluster_shape", "control_plane": "regional", "region": spec.region,
+            "node_locations": [spec.zone], "cluster": spec.name,
+            "node_pools": [{"name": p.name, "machine_type": p.machine_type, "nodes": p.count}
+                           for p in (spec.platform_pool, *spec.extra_pools)]}
 
 
 def _labels_arg(labels: dict[str, str]) -> str:
@@ -238,9 +273,12 @@ def create_commands(spec: ClusterSpec) -> list[list[str]]:
     leak into the run.
     """
     _check_name(spec.name)
-    loc = ["--project", spec.project, "--zone", spec.zone]
+    # REGIONAL control plane, every node in ONE zone: --num-nodes is per node
+    # location, so with the one zone each pool keeps its count (no extra nodes)
+    loc = ["--project", spec.project, "--region", spec.region]
+    nodes = ["--node-locations", spec.zone]
     cmds = [[
-        "gcloud", "container", "clusters", "create", spec.name, *loc,
+        "gcloud", "container", "clusters", "create", spec.name, *loc, *nodes,
         "--cluster-version", spec.cluster_version,
         # REGULAR carries 1.36.4-gke.1391002, the exact version 057 runs
         # (rapid only offers newer 1.36 patches).
@@ -257,7 +295,7 @@ def create_commands(spec: ClusterSpec) -> list[list[str]]:
     for pool in spec.extra_pools:
         cmds.append([
             "gcloud", "container", "node-pools", "create", pool.name,
-            "--cluster", spec.name, *loc, *_pool_flags(pool), "--quiet",
+            "--cluster", spec.name, *loc, *nodes, *_pool_flags(pool), "--quiet",
         ])
     cmds.append([
         "gcloud", "container", "clusters", "get-credentials", spec.name, *loc,
@@ -266,15 +304,18 @@ def create_commands(spec: ClusterSpec) -> list[list[str]]:
 
 
 def delete_command(spec_or_name, *, project: str = DEFAULT_PROJECT,
-                   zone: str = DEFAULT_ZONE) -> list[str]:
+                   location: str | None = None) -> list[str]:
+    """`location`: the cluster's (a region, or a zone for a zonal cluster made
+    before run 17); a spec's is its region."""
     if isinstance(spec_or_name, ClusterSpec):
-        name, project, zone = (spec_or_name.name, spec_or_name.project,
-                               spec_or_name.zone)
+        name, project, location = (spec_or_name.name, spec_or_name.project,
+                                   spec_or_name.region)
     else:
         name = spec_or_name
     _check_name(name)
     return ["gcloud", "container", "clusters", "delete", name,
-            "--project", project, "--zone", zone, "--quiet", "--async"]
+            "--project", project, *_location_flag(location or region_of(DEFAULT_ZONE)),
+            "--quiet", "--async"]
 
 
 def assert_deletable(describe: dict) -> None:
@@ -314,8 +355,9 @@ def reap_commands(clusters: Iterable[dict], *, now: float,
                   project: str = DEFAULT_PROJECT) -> list[list[str]]:
     cmds = []
     for c in expired_clusters(clusters, now=now):
-        zone = c.get("zone") or c.get("location") or DEFAULT_ZONE
-        cmds.append(delete_command(c["name"], project=project, zone=zone))
+        # `location` is the cluster's own (a region now; a zone for an older one)
+        loc = c.get("location") or c.get("zone") or region_of(DEFAULT_ZONE)
+        cmds.append(delete_command(c["name"], project=project, location=loc))
     return cmds
 
 
@@ -327,7 +369,7 @@ def list_command(project: str = DEFAULT_PROJECT) -> list[str]:
 
 def describe_command(spec: ClusterSpec) -> list[str]:
     return ["gcloud", "container", "clusters", "describe", spec.name,
-            "--project", spec.project, "--zone", spec.zone, "--format", "json"]
+            "--project", spec.project, "--region", spec.region, "--format", "json"]
 
 
 # ─── Endpoint resolution ────────────────────────────────────────────────────
@@ -467,13 +509,13 @@ def self_destruct_manifest(spec: ClusterSpec,
         "set -eu\n"
         f"now=$(date +%s); [ \"$now\" -ge {exp} ] || exit 0\n"
         f"labels=$(gcloud container clusters describe {spec.name} "
-        f"--project {spec.project} --zone {spec.zone} "
+        f"--project {spec.project} --region {spec.region} "
         "--format='value(resourceLabels)')\n"
         f"for kv in {want}; do k=${{kv%%=*}}; v=${{kv#*=}}; "
         "echo \"$labels\" | tr ';' '\\n' | grep -qx \"$k=$v\" "
         "|| { echo \"label $kv missing; refusing\"; exit 1; }; done\n"
         f"gcloud container clusters delete {spec.name} --project {spec.project} "
-        f"--zone {spec.zone} --quiet --async\n"
+        f"--region {spec.region} --quiet --async\n"
     )
     indented = "\n".join("              " + ln for ln in script.splitlines())
     return f"""\
@@ -576,7 +618,7 @@ _INCOMPATIBLE_OP = re.compile(r"running incompatible operation (operation-[A-Za-
 
 def operation_wait_command(op: str, spec: ClusterSpec) -> list[str]:
     return ["gcloud", "container", "operations", "wait", op,
-            "--project", spec.project, "--zone", spec.zone]
+            "--project", spec.project, "--region", spec.region]
 
 
 def teardown(spec: ClusterSpec, *, dry_run: bool,
@@ -640,6 +682,7 @@ def cmd_gke_up(a) -> int:
     spec = _spec_from_args(a)
     dry = not a.yes
     env = dict(os.environ, KUBECONFIG=spec.kubeconfig)
+    print(f"control plane: regional ({spec.region}); every node in {spec.zone}")
     print(f"cluster={spec.name} context={kube_context(spec)} "
           f"kubeconfig={spec.kubeconfig} ttl-expires={spec.ttl_expires} "
           f"({time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(spec.ttl_expires))})")
@@ -662,6 +705,12 @@ def cmd_gke_up(a) -> int:
     if rc != 0:
         sys.stderr.write("self-destruct CronJob NOT applied; the trap and "
                          "`gke-reap` are the remaining teardown layers\n")
+    return 0
+
+
+def cmd_gke_shape(a) -> int:
+    """The cluster-shape record run606 keeps with the run (gke-up's shape)."""
+    print(json.dumps(cluster_shape(_spec_from_args(a))))
     return 0
 
 
@@ -752,7 +801,8 @@ def add_parsers(sub) -> None:
         p.add_argument("--name", required=name_required, default=None,
                        help=f"cluster name; must start with {BENCH_NAME_PREFIX}")
         p.add_argument("--project", default=DEFAULT_PROJECT)
-        p.add_argument("--zone", default=DEFAULT_ZONE)
+        p.add_argument("--zone", default=DEFAULT_ZONE,
+                       help="the zone every node is in; the control plane is regional (its region)")
         p.add_argument("--yes", action="store_true",
                        help="actually run gcloud (default: dry run)")
 
@@ -765,6 +815,11 @@ def add_parsers(sub) -> None:
     up.add_argument("--loadgen-machine-type", default=DEFAULT_LOADGEN_MACHINE,
                     help="#830: n2-standard-16 for run 11's k6 + Chrome load")
     up.set_defaults(func=cmd_gke_up)
+
+    shape = sub.add_parser("gke-shape", help="the cluster-shape record of a run (no cloud call)")
+    common(shape)
+    shape.add_argument("--loadgen-machine-type", default=DEFAULT_LOADGEN_MACHINE)
+    shape.set_defaults(func=cmd_gke_shape)
 
     down = sub.add_parser("gke-down", help="#606: delete a bench cluster "
                                            "(label-checked; dry run unless --yes)")
