@@ -4984,6 +4984,9 @@ def _cmd_evaluate(a) -> int:
                                          key=lambda r: r.get("t") or 0),
                       k6=k6,
                       churns=[r for r in recs if r.get("kind") == "churn"])
+    # the cluster's shape (gke-shape): "control_plane": "regional" from run 17;
+    # runs 14-16 have no record (their control plane was zonal)
+    result["report"]["cluster_shape"] = next((r for r in recs if r.get("kind") == "cluster_shape"), None)
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))

@@ -41,8 +41,9 @@ from tests import _planted
 BENCH_DIR = Path(__file__).resolve().parent.parent
 RUN_NAME = "snowplow-bench-1014-1300"
 PROJECT = "operations-dev-krateo-io"
-ZONE = "europe-west4-a"
-KCTX = f"gke_{PROJECT}_{ZONE}_{RUN_NAME}"
+ZONE = "europe-west4-a"                       # every node's zone
+REGION = "europe-west4"                       # the regional control plane's: gcloud and the context name it
+KCTX = f"gke_{PROJECT}_{REGION}_{RUN_NAME}"
 AMBIENT_CTX = "kind-krateo-4388"
 # The digest the fake snowplow pod runs and the run expects (a test value).
 FAKE_DIGEST = "sha256:" + "ab" * 32
@@ -66,7 +67,7 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
     if a[:3] == ["container", "clusters", "list"]:
         print("[]"); sys.exit(0)
     if a[:3] == ["container", "clusters", "get-credentials"]:
-        name, p, z = a[3], opt("--project"), opt("--zone")
+        name, p, z = a[3], opt("--project"), opt("--region")   # regional control plane
         ctx = f"gke_{p}_{z}_{name}"
         with open(os.environ["KUBECONFIG"], "w") as fh:
             json.dump({"apiVersion": "v1", "kind": "Config",
@@ -79,7 +80,7 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
         labels = {"purpose": "snowplow-bench", "issue": "606",
                   "created-by": "bench-gke", "owner": "t",
                   "ttl-expires": str(int(time.time()) + 3600)}
-        print(json.dumps({"name": a[3], "zone": opt("--zone"),
+        print(json.dumps({"name": a[3], "location": opt("--region"),
                           "resourceLabels": labels}))
         sys.exit(0)
     if a[:3] == ["container", "clusters", "delete"]:

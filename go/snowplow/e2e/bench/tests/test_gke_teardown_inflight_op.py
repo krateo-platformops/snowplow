@@ -46,7 +46,7 @@ FAKE_GCLOUD = textwrap.dedent("""\
             sys.exit(1)
         sys.exit(0)
     if a[:3] == ["container", "operations", "wait"]:
-        log(f"wait {a[3]} {opt('--project')} {opt('--zone')}")
+        log(f"wait {a[3]} {opt('--project')} {opt('--region')}")
         time.sleep(float(os.environ.get("FAKE_WAIT_S", "0")))
         sys.exit(int(os.environ.get("FAKE_WAIT_RC", "0")))
     sys.exit(2)
@@ -78,14 +78,14 @@ OP1, OP2 = "operation-1792823484322-b2555fe0", "operation-1792823999000-c0ffee00
 def test_a_delete_blocked_by_an_operation_waits_for_it_then_deletes(fakegke, monkeypatch):
     monkeypatch.setenv("FAKE_BLOCKING_OPS", OP1)
     gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60)
-    assert _calls(fakegke) == ["describe", "delete", f"wait {OP1} {SPEC.project} {SPEC.zone}", "delete"]
+    assert _calls(fakegke) == ["describe", "delete", f"wait {OP1} {SPEC.project} {SPEC.region}", "delete"]
 
 
 def test_each_new_blocking_operation_is_waited_for(fakegke, monkeypatch):
     monkeypatch.setenv("FAKE_BLOCKING_OPS", f"{OP1} {OP2}")
     gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60)
-    assert _calls(fakegke) == ["describe", "delete", f"wait {OP1} {SPEC.project} {SPEC.zone}", "delete",
-                               f"wait {OP2} {SPEC.project} {SPEC.zone}", "delete"]
+    assert _calls(fakegke) == ["describe", "delete", f"wait {OP1} {SPEC.project} {SPEC.region}", "delete",
+                               f"wait {OP2} {SPEC.project} {SPEC.region}", "delete"]
 
 
 def test_a_failed_wait_still_retries_the_delete(fakegke, monkeypatch):
@@ -125,7 +125,7 @@ def test_an_operation_still_blocking_when_the_budget_is_spent_fails(fakegke, mon
 def test_gke_down_passes_the_budget(fakegke, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_BLOCKING_OPS", OP1)
     assert gke.main(["gke-down", "--name", SPEC.name, "--budget-s", "60", "--yes"]) == 0
-    assert f"wait {OP1} {SPEC.project} {SPEC.zone}" in _calls(fakegke)
+    assert f"wait {OP1} {SPEC.project} {SPEC.region}" in _calls(fakegke)
     # and honours it: an operation that outlasts --budget-s fails gke-down, fast
     (fakegke / "calls").unlink()
     monkeypatch.setenv("FAKE_WAIT_S", "30")
