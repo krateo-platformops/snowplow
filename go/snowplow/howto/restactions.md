@@ -295,6 +295,28 @@ stage's own request (resource, namespace, name), never from the upstream's
 text, which can name the requester. The upstream's full text stays under the
 stage's `errorKey` and in the logs.
 
+## Write stages run only on a user's request
+
+A **write** stage (any verb but `GET`, `HEAD`, `OPTIONS`, `TRACE`) is sent
+only when a user (or a controller, with its own credential) calls `/call`.
+Snowplow's own background work — the cache refresher, the prewarm walks and
+seeds, the content prewarm, the pagination drain, and the revalidation of a
+stale cached answer — resolves the same RESTActions but **never sends their
+write stages**, whatever credential the stage uses (snowplow's
+ServiceAccount, an `endpointRef` Secret, an external URL). The refused stage
+gets an error under its `errorKey`, and that background result is never
+stored or served.
+
+- An answer whose resolve sent a write stage is never stored: the next
+  `/call` runs the RESTAction again.
+- A `/call` that snowplow makes to itself on behalf of background work
+  carries `X-Snowplow-Background: 1`, so that call refuses write stages too.
+  Snowplow sends the header only to itself and strips it from every other
+  request.
+- A resolve that stops before a write stage it declares (for example its
+  `endpointRef` Secret is missing) is never stored, so no later refresh can
+  re-run the sequence.
+
 ## jq templating of `path`, `payload` and `headers`
 
 A stage's `path`, `payload` and each `headers` entry may embed a **jq template**

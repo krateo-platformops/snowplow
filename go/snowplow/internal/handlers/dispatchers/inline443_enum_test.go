@@ -273,6 +273,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// cannot drift out of half of it again (which is #563 itself). The stale-entry
 	// half of this census is what required removing the row.
 	"RefDenialOrigin": readOnly443,
+	// #903 — "is this a customer's own request?" for the write refusal and the
+	// self-loopback header: RefDenialOrigin plus two more ctx values (the #547
+	// demand revalidation, the background hop). Pure ctx reads.
+	"NonCustomerWriteOrigin": readOnly443,
 	// #608 — the validator's transport pick reads the set-once process SA
 	// *rest.Config (an RLock + pointer read, no state written), and the stage
 	// wrap only builds an error value. Neither outlives the request.

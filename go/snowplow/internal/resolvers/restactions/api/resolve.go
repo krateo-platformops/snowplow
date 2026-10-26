@@ -753,6 +753,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			map[string]any{"reason": StageReasonNotExecuted, "message": msg}, msg, itemErr)
 		return nil
 	}
+	// #903 — background work never writes: a write stage is sent only on a
+	// customer's own request, whatever credential it uses (background_write.go).
+	// Before any egress, like the dry-run refusal above.
+	if r.refuseBackgroundWrite(gctx, sc, i) {
+		return nil
+	}
 	// Ship 0.30.121 R1-a — per-call verbose decision. `sc.ep` is shared
 	// across every call of this stage; setting Debug in place would race the
 	// concurrent workers. When this call wants the wire-dump, take a SHALLOW
@@ -1771,6 +1777,13 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		local.Headers = hdrs
 		apiCall = &local
 	}
+	// #903 egress — a non-customer resolve that calls snowplow ITSELF (the HTTP
+	// self-loopback) tells the next hop, so that hop refuses write stages too
+	// (its ctx carries no background marker otherwise). Sent ONLY to snowplow's
+	// own host (parsedHostEqualsSelf, the self-loopback predicate); on every
+	// other egress the header is stripped, even when the RESTAction itself sets
+	// it, so it never reaches an external endpoint. Stage-local copy.
+	apiCall = withBackgroundHopHeader(apiCall, cache.NonCustomerWriteOrigin(r.ctx) != "", parsedHostEqualsSelf(ep.ServerURL))
 	// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
 	// is the single largest transient-memory consumer (~1.94 GiB
 	// alloc_space on the 50K bench: it stringifies every HTTP response
@@ -2075,6 +2088,15 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 			// any, already carry a more specific reason).
 			r.taintNarrow() // #603 PR-2
 			r.outcomes.fail(id, StageReasonError)
+			// #903 — a resolve that stopped before a write stage it declares
+			// (this one or a later one) is never stored: its cell would let a
+			// later refresh re-run the sequence with the stored extras once the
+			// missing endpoint resolves. The stage-error sink is what every L1
+			// Put declines on.
+			if w := firstWriteStageFrom(names, id, apiMap); w != "" {
+				r.taintNarrow() // #603 PR-2 (already tainted above; the R6 census pins it beside every bump)
+				r.stageErrSink.Bump(id, "the resolve stopped before write stage "+w+" (#903)")
+			}
 			// #709 — a truncating exit is a failure of this stage whatever its
 			// continueOnError says. Reported by class only: the endpoint error
 			// can name the requester's clientconfig Secret, so its text stays
