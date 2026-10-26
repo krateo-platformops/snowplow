@@ -6,10 +6,15 @@ package api
 //   C1  every write-verb stage of a customer resolve emits one record, with
 //       enduser.id / user.name from the REQUEST context, the stage's target and
 //       the RESTAction + stage that performed it; a read stage emits none.
-//   C1e a stage with an endpointRef records where it went (server.address +
-//       url.path), never a Kubernetes resource it cannot know it addressed.
+//   C1e a stage with an endpointRef records where it went (server.address),
+//       never a Kubernetes resource it cannot know it addressed.
 //   C2  a write the answering authority refuses emits outcome=failure with that
-//       authority's code and message — the shape of the /call write record.
+//       authority's code and a reason class — the shape of the /call record.
+//   Cr  a credential in the stage PATH (a webhook) or in the upstream's error
+//       BODY never reaches the record (review item C).
+//   E   the outcome is what the authority answered: the real 2xx code, an
+//       accepted write whose body is unusable is a success with a note, a dial
+//       with no response is a failure with no code (review item E).
 //   C3  the same write dialled by a BACKGROUND driver (no requester: a reconcile,
 //       not a request) emits nothing, though the write went out.
 //   C5  is the audit package's (audit_incomplete_410_test.go); here the stage
@@ -27,7 +32,6 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/env"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
-	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
@@ -46,6 +50,10 @@ const (
 	raNS410     = "krateo-system"
 	raName410   = "ra410"
 	denyPath410 = "/apis/composition.krateo.io/v1alpha1/namespaces/team-b/fireworksapps"
+	// Credentials a stage can carry in its PATH and an upstream can echo in its
+	// error BODY. Neither may ever reach the 365-day trail.
+	pathSecret410 = "HOOKSECRET410"
+	bodySecret410 = "xoxb-BODYSECRET410"
 )
 
 // dial410 is one request a fake upstream received.
@@ -63,6 +71,24 @@ func upstream410(t *testing.T) (*httptest.Server, func() []dial410) {
 		got = append(got, dial410{r.Method, r.URL.Path})
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/created"):
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"ok":true}`)
+			return
+		case strings.HasSuffix(r.URL.Path, "/nocontent"):
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case strings.HasSuffix(r.URL.Path, "/html"):
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, `<html><body>accepted</body></html>`)
+			return
+		case strings.HasPrefix(r.URL.Path, "/services/"):
+			// A webhook that refuses, echoing a credential in its error body.
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":"invalid_token","token":"`+bodySecret410+`"}`)
+			return
+		}
 		if strings.Contains(r.URL.Path, "/team-b/") {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403,`+
@@ -197,7 +223,12 @@ func TestAudit410_C1_EveryWriteVerbStageEmits_WithRequestIdentity(t *testing.T) 
 		wantAttrs410(t, r, common)
 		wantAttrs410(t, r, map[string]string{"http.request.method": method})
 	}
-	wantAttrs410(t, byStage["create"], map[string]string{"k8s.resource.name": "", "url.path": base})
+	wantAttrs410(t, byStage["create"], map[string]string{"k8s.resource.name": ""})
+	for stage, r := range byStage {
+		if v, ok := r["url.path"]; ok {
+			t.Errorf("stage %s: the record carries url.path=%q; a path is never recorded", stage, v)
+		}
+	}
 	wantAttrs410(t, byStage["patch"], map[string]string{"k8s.resource.name": "demo"})
 	wantAttrs410(t, byStage["status"], map[string]string{"k8s.resource.name": "demo", "k8s.resource.subresource": "status"})
 	if roles := byStage["create"]["user.roles"]; !strings.Contains(roles, group410) {
@@ -205,9 +236,9 @@ func TestAudit410_C1_EveryWriteVerbStageEmits_WithRequestIdentity(t *testing.T) 
 	}
 }
 
-// C1e — an endpointRef stage records the host and path it wrote to, and no
-// Kubernetes resource: a named endpoint may be any HTTP API.
-func TestAudit410_C1e_EndpointRefStage_RecordsHostAndPath(t *testing.T) {
+// C1e — an endpointRef stage records the host it wrote to, and neither a path
+// nor a Kubernetes resource: a named endpoint may be any HTTP API.
+func TestAudit410_C1e_EndpointRefStage_RecordsHostOnly(t *testing.T) {
 	api, _ := upstream410(t)
 	ext, extDials := upstream410(t)
 	env410(t, api.URL, ext.URL)
@@ -228,11 +259,13 @@ func TestAudit410_C1e_EndpointRefStage_RecordsHostAndPath(t *testing.T) {
 	}
 	host := strings.TrimPrefix(ext.URL, "http://")
 	wantAttrs410(t, got[0], map[string]string{
-		"server.address": host, "url.path": extPath, "http.request.method": "POST",
+		"server.address": host, "http.request.method": "POST",
 		"enduser.id": user410, "krateo.restaction.stage": "render", "outcome": "success",
 	})
-	if r, ok := got[0]["k8s.resource.resource"]; ok {
-		t.Errorf("an endpointRef stage must not claim a Kubernetes resource, got %q", r)
+	for _, k := range []string{"k8s.resource.resource", "url.path"} {
+		if v, ok := got[0][k]; ok {
+			t.Errorf("an endpointRef stage record must not carry %s, got %q", k, v)
+		}
 	}
 	for k, v := range got[0] {
 		if strings.Contains(v, "SECRET410") {
@@ -241,8 +274,19 @@ func TestAudit410_C1e_EndpointRefStage_RecordsHostAndPath(t *testing.T) {
 	}
 }
 
+// bodies410 returns every emitted record's body.
+func bodies410(rec *logtest.Recorder) []string {
+	var out []string
+	for _, recs := range rec.Result() {
+		for _, r := range recs {
+			out = append(out, r.Body.AsString())
+		}
+	}
+	return out
+}
+
 // C2 — a refused write emits outcome=failure with the refusing authority's
-// code and message.
+// code and a reason class from a closed set — never the upstream's own text.
 func TestAudit410_C2_RefusedWrite_EmitsFailureWithAuthorityCode(t *testing.T) {
 	api, _ := upstream410(t)
 	env410(t, api.URL, api.URL)
@@ -258,15 +302,103 @@ func TestAudit410_C2_RefusedWrite_EmitsFailureWithAuthorityCode(t *testing.T) {
 		"outcome": "failure", "http.response.status_code": "403", "http.request.method": "POST",
 		"enduser.id": user410, "k8s.namespace.name": "team-b", "k8s.resource.resource": "fireworksapps",
 	})
-	var body string
-	for _, recs := range rec.Result() {
-		for _, r := range recs {
-			body = r.Body.AsString()
+	if b := bodies410(rec); len(b) != 1 || b[0] != "upstream answered 403 Forbidden" {
+		t.Errorf("record body = %q, want the reason class %q", b, "upstream answered 403 Forbidden")
+	}
+}
+
+// Cr — review item C: a credential carried in the stage PATH (a webhook) or
+// echoed in the upstream's error BODY never reaches any attribute or the body
+// of the record. The record still says who, which RESTAction/stage, which host,
+// and the authority's code.
+func TestAudit410_Cr_CredentialsInPathOrBody_NeverReachTheRecord(t *testing.T) {
+	api, _ := upstream410(t)
+	ext, extDials := upstream410(t)
+	env410(t, api.URL, ext.URL)
+	rec := records410(t)
+
+	resolve410(ctxWithUser(user410, group410), api.URL,
+		extStage410("notify", http.MethodPost, "/services/T000/B000/"+pathSecret410))
+
+	if d := extDials(); len(d) != 1 || !strings.Contains(d[0].path, pathSecret410) {
+		t.Fatalf("precondition: the webhook was not dialled with its secret path: %v", d)
+	}
+	got := attrs410(rec)
+	if len(got) != 1 {
+		t.Fatalf("records = %d, want 1: %v", len(got), got)
+	}
+	wantAttrs410(t, got[0], map[string]string{
+		"outcome": "failure", "http.response.status_code": "403", "enduser.id": user410,
+		"krateo.restaction.stage": "notify", "server.address": strings.TrimPrefix(ext.URL, "http://"),
+	})
+	for _, secret := range []string{pathSecret410, bodySecret410, "invalid_token", "/services/"} {
+		for k, v := range got[0] {
+			if strings.Contains(v, secret) {
+				t.Errorf("attribute %s carries %q: %q", k, secret, v)
+			}
+		}
+		for _, b := range bodies410(rec) {
+			if strings.Contains(b, secret) {
+				t.Errorf("record body carries %q: %q", secret, b)
+			}
 		}
 	}
-	if !strings.Contains(body, "is forbidden") {
-		t.Errorf("record body = %q, want the authority's refusal message", body)
+}
+
+// E — review item E: the outcome is what the authority answered.
+func TestAudit410_E_OutcomeIsWhatTheAuthorityAnswered(t *testing.T) {
+	cases := []struct {
+		name, path, outcome, code, body string
+	}{
+		{"201 created", "/things/created", "success", "201", ""},
+		{"204 no content", "/things/nocontent", "success", "204", ""},
+		{"2xx body not convertible", "/things/html", "success", "200", dialNoteBodyUnconvertible},
 	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			api, _ := upstream410(t)
+			ext, extDials := upstream410(t)
+			env410(t, api.URL, ext.URL)
+			rec := records410(t)
+
+			resolve410(ctxWithUser(user410, group410), api.URL, extStage410("w", http.MethodPost, c.path))
+
+			if n := len(extDials()); n != 1 {
+				t.Fatalf("precondition: %d dials, want 1", n)
+			}
+			got := attrs410(rec)
+			if len(got) != 1 {
+				t.Fatalf("records = %d, want 1: %v", len(got), got)
+			}
+			wantAttrs410(t, got[0], map[string]string{"outcome": c.outcome, "http.response.status_code": c.code})
+			if b := bodies410(rec); len(b) != 1 || b[0] != c.body {
+				t.Errorf("record body = %q, want %q", b, c.body)
+			}
+		})
+	}
+
+	t.Run("no response", func(t *testing.T) {
+		api, _ := upstream410(t)
+		gone := httptest.NewServer(http.NotFoundHandler())
+		goneURL := gone.URL
+		gone.Close() // nothing listens: the dial gets no response
+		env410(t, api.URL, goneURL)
+		rec := records410(t)
+
+		resolve410(ctxWithUser(user410, group410), api.URL, extStage410("w", http.MethodPost, "/things"))
+
+		got := attrs410(rec)
+		if len(got) != 1 {
+			t.Fatalf("records = %d, want 1: %v", len(got), got)
+		}
+		wantAttrs410(t, got[0], map[string]string{"outcome": "failure"})
+		if v, ok := got[0]["http.response.status_code"]; ok {
+			t.Errorf("a dial with no response must carry no status code, got %q", v)
+		}
+		if b := bodies410(rec); len(b) != 1 || b[0] != "no response from the endpoint" {
+			t.Errorf("record body = %q", b)
+		}
+	})
 }
 
 // C3 — a write a background driver dials (a reconcile: no requester) emits
@@ -315,7 +447,7 @@ func TestAudit410_C3_BackgroundDriverWrite_EmitsNoRecord(t *testing.T) {
 func TestAudit410_C5_StageSite_NoActor_NoRecord(t *testing.T) {
 	rec := records410(t)
 	call := httpcallOpts410(http.MethodPost, "/render", "https://render.example")
-	res := responseOK410()
+	res := &dialAnswer{code: http.StatusOK}
 	apiCall := extStage410("render", http.MethodPost, "/render")
 
 	before := audit.IncompleteCount(audit.IncompleteActor)
@@ -339,8 +471,6 @@ func httpcallOpts410(verb, path, server string) httpcall.RequestOptions {
 		Endpoint:    &endpoints.Endpoint{ServerURL: server},
 	}
 }
-
-func responseOK410() *response.Status { return response.New(http.StatusOK, nil) }
 
 // The subresource is read from the parser's path shapes, including a namespace
 // whose name equals the object's.

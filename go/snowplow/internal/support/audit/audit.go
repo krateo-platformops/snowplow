@@ -28,6 +28,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -156,10 +157,12 @@ type Event struct {
 	// ServerAddress is the host (and port) the action was sent to ->
 	// server.address. Set by the RESTAction stage emit (AUDIT-4), where a
 	// write can go to an external API rather than the Kubernetes apiserver;
-	// it never carries userinfo or a query.
+	// it never carries userinfo, a path or a query. The request PATH is
+	// deliberately not recorded: a webhook path (/services/T/B/<secret>,
+	// /bot<token>/…) or a jq-built one can carry a credential, and this trail
+	// is kept for 365 days. The RESTAction, its stage and this host identify
+	// the action and the authority without it.
 	ServerAddress string
-	// URLPath is the request path, without its query -> url.path.
-	URLPath string
 	// RESTActionNamespace/RESTActionName/Stage name the RESTAction and the
 	// api[] stage that performed the action -> krateo.restaction.{namespace,
 	// name,stage}. Empty for an action that is not a RESTAction stage.
@@ -168,26 +171,21 @@ type Event struct {
 	Stage               string
 }
 
-// missingField returns the first field ev (with actor user) lacks to be an
-// answerable record, or "" when it has them all.
-//
-// AUDIT-4 (installer#410): "no record is emitted without an actor; prefer no
-// record to a recordless actor". A record that carries only event.name, outcome
-// and session.id passes any "is the trail emitting" check and answers none of
-// the questions the trail exists for, so it is refused here, at the one place
-// every emit site passes, instead of trusting each site to fill every field.
-func missingField(user string, ev Event) string {
-	switch {
-	case user == "":
-		return IncompleteActor
-	case ev.Action == "":
-		return IncompleteAction
-	case ev.Verb == "":
-		return IncompleteMethod
-	case ev.Resource == "" && ev.ServerAddress == "":
-		return IncompleteTarget
+// missingFields returns, in a fixed order, the fields other than the actor
+// that ev lacks to answer "what was done to which target": action, method,
+// target (a Kubernetes resource or a server address). Empty when complete.
+func missingFields(ev Event) []string {
+	var out []string
+	if ev.Action == "" {
+		out = append(out, IncompleteAction)
 	}
-	return ""
+	if ev.Verb == "" {
+		out = append(out, IncompleteMethod)
+	}
+	if ev.Resource == "" && ev.ServerAddress == "" {
+		out = append(out, IncompleteTarget)
+	}
+	return out
 }
 
 // Emitter wraps a single OTel Logs API Logger. Construct once at startup
@@ -221,9 +219,16 @@ func Emit(ctx context.Context, ev Event) {
 
 // Emit writes one canonical AuditEvent as an OTLP LogRecord. ctx MUST carry
 // the active span (so the SDK stamps TraceId/SpanId) and baggage (so
-// session.id is captured). A nil Emitter is a no-op. A record that cannot name
-// its actor (the authenticated user on ctx), action, method and target is not
-// emitted; it is counted in snowplow_audit_incomplete_total (missingField).
+// session.id is captured). A nil Emitter is a no-op.
+//
+// AUDIT-4 (installer#410) completeness, enforced here because every emit site
+// passes through it:
+//   - NO ACTOR, NO RECORD. "Prefer no record to a recordless actor": a record
+//     with no authenticated user on ctx is refused and counted under "actor".
+//   - Any other missing field (action, method, target) does not hide the record:
+//     it is emitted marked krateo.audit.incomplete=<fields> and each missing
+//     field is counted, so a gap in a site is visible both in the trail and in
+//     snowplow_audit_incomplete_total.
 func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	if e == nil || e.logger == nil {
 		return
@@ -236,9 +241,13 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 		user = ui.Username
 		groups = ui.Groups
 	}
-	if reason := missingField(user, ev); reason != "" {
-		incomplete.Add(reason, 1)
+	if user == "" {
+		incomplete.Add(IncompleteActor, 1)
 		return
+	}
+	missing := missingFields(ev)
+	for _, f := range missing {
+		incomplete.Add(f, 1)
 	}
 
 	var rec log.Record
@@ -281,7 +290,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	add("http.request.method", ev.Verb)
 	add("outcome", ev.Outcome)
 	add("server.address", ev.ServerAddress)
-	add("url.path", ev.URLPath)
+	add("krateo.audit.incomplete", strings.Join(missing, ","))
 	add("krateo.restaction.namespace", ev.RESTActionNamespace)
 	add("krateo.restaction.name", ev.RESTActionName)
 	add("krateo.restaction.stage", ev.Stage)

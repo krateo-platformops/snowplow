@@ -29,10 +29,7 @@ admission-side enforcement (AUDIT-5, installer#411) can give that guarantee.
 
 ## What every record contains
 
-A record that cannot answer "who did what to which target" is worse than no
-record, because it looks like coverage. The emitter refuses one, and counts the
-refusal in `snowplow_audit_incomplete_total{actor,action,method,target}`
-(`/debug/vars`). A record is emitted only when it has:
+A record should answer "who did what to which target":
 
 | field | attribute | source |
 |---|---|---|
@@ -41,9 +38,28 @@ refusal in `snowplow_audit_incomplete_total{actor,action,method,target}`
 | method | `http.request.method` | the verb actually sent |
 | target | `k8s.resource.*` + `k8s.namespace.name`, or `server.address` | the object acted on, or the host a RESTAction stage wrote to |
 
+The emitter enforces it, for every emit site:
+
+- **no actor, no record.** A record without an authenticated user is worse than
+  none, because it looks like coverage. It is refused and counted in
+  `snowplow_audit_incomplete_total{actor}` (`/debug/vars`).
+- **an actor but a missing action, method or target**: the record is still
+  emitted, marked `krateo.audit.incomplete=<fields>` (e.g. `method,target`), and
+  each missing field is counted in `snowplow_audit_incomplete_total`. The person
+  is known, so the action is not hidden; the mark says what the site failed to
+  supply.
+
 Every record also carries `outcome` (`success` / `failure`),
-`http.response.status_code`, `session.id` (W3C baggage) and the request's
-TraceId/SpanId.
+`http.response.status_code` (when the authority answered), `session.id` (W3C
+baggage) and the request's TraceId/SpanId.
+
+**What a record never holds.** The trail is kept 365 days, so nothing that can
+carry a credential goes into it: no request path or query (a webhook path such
+as Slack's `/services/T/B/<secret>`, Discord's `/api/webhooks/<id>/<token>` or
+Telegram's `/bot<token>/…`, or a path built by jq from an earlier stage's token,
+is a secret in its own right), and no upstream response body (an error body can
+echo a token). A RESTAction stage record's body is a reason class from a closed
+set (below).
 
 ## Inventory
 
@@ -55,6 +71,7 @@ TraceId/SpanId.
 | `GET /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export` |
 | a RESTAction write stage in a background resolve (refresher, cohort seed, prewarm) | as above | **out of scope** — see "Writes nobody requested" |
 | a RESTAction write stage in a dry run (inline object on `POST /call/read`) | nothing: the stage is refused before any request leaves (#443) | **out of scope** — no authority was asked, nothing was done |
+| a RESTAction write stage abandoned before the dial: its endpoint Secret cannot be resolved, its iterator or path template fails, or the #288 malformed-dial guard refuses the path | nothing: no request leaves | **out of scope** — nothing was sent; the stage error is in the response and the log, not in the trail |
 | authentication failures (bad, expired or missing token) on any route | nothing: answered 401 by the UserConfig middleware before any handler | **out of scope** — see "Authentication failures" |
 | reads: `GET /call`, `POST /call/read`, `GET /list`, `GET /rbac`, `GET /api-info/names` | nothing | **out of scope** for AUDIT-4, which covers mutations. Note that the request log and trace id these were once delegated to do not cover them today (installer#410: the gateway access log has no outcome, resource or session id, and the trace is sampled) |
 | `GET/POST /refreshes` | nothing: the live-refresh SSE subscription | **out of scope** — cache machinery, no user action |
@@ -73,15 +90,22 @@ other `POST`. Each record carries:
 
 - `krateo.restaction.namespace`, `krateo.restaction.name`,
   `krateo.restaction.stage`: the RESTAction and the stage that acted;
-- `server.address` (host and port, never userinfo) and `url.path` (never the
-  query, which can carry credentials);
+- `server.address`: host and port only — never userinfo, a path or a query;
 - for a stage with no `endpointRef` (the caller's own clientconfig, i.e. the
   apiserver): `k8s.resource.{group,version,resource,subresource,name}` and
-  `k8s.namespace.name` parsed from the path. A named endpoint may be any HTTP
-  API, so its record claims no Kubernetes resource;
-- `outcome`/`http.response.status_code` from the authority that answered,
-  read before the stage's own filter runs. A refused write is `failure` with the
-  upstream's code and message, the same shape as a `/call` write record.
+  `k8s.namespace.name`, the object's coordinates as a `/call` record holds them.
+  A named endpoint may be any HTTP API: its record names no Kubernetes resource
+  and nothing of its path;
+- `outcome` and `http.response.status_code`: what the authority answered,
+  observed at the dial — not the resolver's reshaped result, and not what the
+  stage's own filter makes of it:
+
+  | the authority answered | outcome | code | record body |
+  |---|---|---|---|
+  | a 2xx | `success` | the real code (`201`, `204` are not reported as `200`) | empty |
+  | a 2xx whose body snowplow cannot read or convert to JSON/YAML | `success` — the write was accepted | the real code | `accepted; the response body could not be read` / `accepted; the response body is not JSON or YAML` |
+  | any other status | `failure` | the real code | `upstream answered <code> <status text>` — never the upstream's body |
+  | nothing (connection refused, reset, timeout) | `failure` | absent | `no response from the endpoint` |
 
 ### Writes nobody requested
 
@@ -147,3 +171,21 @@ ORDER BY n DESC
 Report a volume with its window and its filter. "12 rows" and "N rows" compare
 only when both state the same window, scope, service and version
 (`ResourceAttributes['service.version']`).
+
+### Effect-free POSTs dominate the `restaction` rows
+
+The verb decides what is recorded, so RESTAction stages that `POST` only to
+evaluate something are in the trail, once per customer view. In the
+portal-platformops chart (October 2026), each view of these RESTActions emits:
+
+| RESTAction | `restaction` records per view | what the POSTs do |
+|---|---|---|
+| `access-preview` | 10 | one SubjectAccessReview per capability row (nothing persisted) |
+| `blueprint-palette` | 2 | two SelfSubjectAccessReviews |
+| `blueprint-render`, `blueprint-render-draft`, `controller-render-draft` | 1 each | a helm-render-service `/render` |
+| `upgrade-impact` | 1 | a helm-render-service `/diff` |
+
+So after this ships, a rise in `restaction` rows is mostly page views of those
+RESTActions, not changes to anything. To read real mutations, group by
+`krateo.restaction.name` and `krateo.restaction.stage` and set these apart,
+rather than reading the total.

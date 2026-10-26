@@ -1442,6 +1442,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	}
 	// Always a live fetch; the CONVERSION is memoised by the response's bytes
 	// (external_fetch_cache.go). The touch above still declines the L1 Put.
+	// AUDIT-4 — observe what the authority answered (the real code, an accepted
+	// body that could not be used) for the audit record below.
+	fctx, answer := withDialAnswer(fctx)
 	res, jsonBytes, _, fetchErr := sharedExternalFetch(fctx, call)
 	if fetchErr != nil && fctx.Err() != nil {
 		// #643 PR-A — the caller's ctx was done before the response was read
@@ -1457,10 +1460,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// these as res.Status == Failure with the error message).
 		_ = fetchErr
 	}
-	// AUDIT-4 (installer#410) — a write-verb stage records the answer of the
-	// authority it was sent to, read HERE: before the stage filter below can turn
-	// an accepted write into a 500 of its own (stage_audit.go).
-	auditStageWrite(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, apiCall, call, res)
+	// AUDIT-4 (installer#410) — a write-verb stage records what the authority it
+	// was sent to answered, as observed at the dial: never the fetch's reshaped
+	// envelope, nor what the stage filter below makes of it (stage_audit.go).
+	auditStageWrite(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, apiCall, call, answer)
 
 	// SUCCESS (feat/restaction-yaml-response): on a non-Failure fetch the
 	// owned fetch does NOT invoke call.ResponseHandler (unlike httpcall.Do);
