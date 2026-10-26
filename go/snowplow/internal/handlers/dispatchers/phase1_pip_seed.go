@@ -95,6 +95,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1261,6 +1262,9 @@ func seedRestactionResolveAndPutProd(
 	stageErrSink *cache.StageErrorSink,
 	extTouchedSink *cache.ExternalTouchedSink,
 ) error {
+	// #904 — the seed's stage outcomes, kept on the entry so an L1 hit of the
+	// seeded cell answers with the header a cold resolve would have.
+	resCtx, stageOutcomes := restactionsapi.WithStageOutcomes(resCtx)
 	res, err := restactions.Resolve(resCtx, restactions.ResolveOptions{
 		In: cr,
 		// Ship 0.30.230 fix-at-root: SArc is the SA *rest.Config carried
@@ -1341,6 +1345,8 @@ func seedRestactionResolveAndPutProd(
 		// #841 — the seed class, kept only if this Put INSERTS the cell (the store
 		// keeps a resident cell's own origin on a replace).
 		SeedOrigin: cache.SeedOriginFromContext(resCtx),
+		// #904 — "" when every stage succeeded.
+		StageOutcomes: storableStageOutcomes(stageOutcomes),
 	}
 	// #394 — the terminal write goes through seedTerminalPut with the guard
 	// seedOneRestaction captured at seed entry: PutIfGen for the post-readyz

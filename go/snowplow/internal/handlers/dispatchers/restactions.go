@@ -303,7 +303,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
-			staleHitWritePoint(cacheKey, entry) // #710 PR-2b
+			setStoredStageOutcomesHeader(wri, entry) // #904
+			staleHitWritePoint(cacheKey, entry)      // #710 PR-2b
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
@@ -459,13 +460,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// unchanged). No-op (ctx unchanged) in production until an observability
 	// control turns the toggle on.
 	ctx = installShadowParityRESTAction(ctx, &cr)
-	// #443 part 2 — an inline resolve reports per-stage outcomes in a header
-	// (reason codes only), outside the body, so the body stays byte-identical
-	// to a stored resolve even when the draft's filter drops its error keys.
-	var outcomes *api.StageOutcomes
-	if inline {
-		ctx, outcomes = api.WithStageOutcomes(ctx)
-	}
+	// #443 part 2 / #904 — every RESTAction resolve reports its per-stage
+	// outcomes in a header (stage names and reason codes only), outside the
+	// body, so a caller can tell a half-done write sequence from a done one
+	// even when the RESTAction's filter drops the error keys from the body.
+	ctx, outcomes := api.WithStageOutcomes(ctx)
 	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,
@@ -478,9 +477,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// stages are read as the caller (api.ProvenanceCallerSupplied).
 		Provenance: provenanceFor(inline),
 	})
-	if outcomes != nil {
-		wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
-	}
+	wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
 	if err != nil {
 		log.Error("unable to resolve rest action",
 			slog.String("name", cr.GetName()),
@@ -669,10 +666,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
 			noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
 			putStored := cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
-				RawJSON:      encoded,
-				Inputs:       cacheInputs,
-				TTLOverride:  uafTTLOverrideForEntry(cacheInputs),
-				StaleDerived: staleSink.StaleDerived(), // #710 PR-2b
+				RawJSON:       encoded,
+				Inputs:        cacheInputs,
+				TTLOverride:   uafTTLOverrideForEntry(cacheInputs),
+				StaleDerived:  staleSink.StaleDerived(),        // #710 PR-2b
+				StageOutcomes: storableStageOutcomes(outcomes), // #904
 			}, cacheGen0)
 			// #189 — the dep Record + the /refreshes publish run ONLY on an
 			// accepted write. A refused PutIfGen (a DELETE-eviction bumped the gen

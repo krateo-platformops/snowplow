@@ -122,17 +122,26 @@ Content-Type: application/json
   Both are a **stable contract**: match on `reason == "StageNotExecuted"`
   (preferred), or on the message prefix `dry-run: stage ` and suffix
   ` is not executed`.
-- **Per-stage outcomes, outside the body.** Every inline reply from the
+- **Per-stage outcomes, outside the body.** Every RESTAction reply from the
   resolver carries `X-Snowplow-Stage-Outcomes`, compact JSON in topological
-  stage order: `[{"name":"<stage>","ok":true},{"name":"<stage>","ok":false,"reason":"<code>"}]`.
-  Use it when the draft's own `filter` drops the error keys from the body.
+  stage order listing every stage that did **not** succeed:
+  `[{"name":"<stage>","ok":false,"reason":"<code>"}]`. `[]` means every
+  stage succeeded. Use it when the draft's own `filter` drops the error keys
+  from the body.
   - `reason` is a code from a closed set: `StageNotExecuted`, `Forbidden`,
     `NotFound`, `Unauthorized`, `NotRun` (the resolve stopped before this
-    stage), `Error` (anything else). The header never carries an error
-    message, a path or response data.
+    stage), `Skipped` (#904: a write stage not sent because the stage it depends
+    on failed or was skipped; the row's `dependsOn` names that stage),
+    `Error` (anything else).
+    The header never carries an error message, a path, an identity or
+    response data.
   - Bounded: above 4 KiB it is `{"truncated":true,"failed":<N>}`.
-  - Never set on a stored resolve. The body is unaffected (still
-    byte-identical to a stored resolve).
+  - Since #904 it is set on stored resolves too (and on a cached answer). The
+    body is unaffected (still byte-identical to a stored resolve).
+  - Changed in #904: a succeeded stage is no longer listed (it was
+    `{"name":"<stage>","ok":true}`). A reader that only looks at `ok:false`
+    rows is unaffected. In a dry run a write stage depending on another write
+    stage still reports `StageNotExecuted`, never `Skipped`.
 - **Everything runs as the caller.** A named `endpointRef` Secret is read with
   the caller's own credentials (a Secret the caller cannot read is a stage
   error), and a `-clientconfig` endpointRef is refused. A `userAccessFilter`
@@ -160,7 +169,7 @@ Content-Type: application/json
 | `X-Snowplow-Field-Validation: <Ignore\|Strict>` | The apiserver request carried that `fieldValidation`. |
 | `X-Snowplow-Raw: true` | The stored object was read without resolving. |
 | `X-Snowplow-Resolve-Source: request-body` | The RESTAction resolved was the request body (with `X-Snowplow-Dry-Run: All`). |
-| `X-Snowplow-Stage-Outcomes: [...]` | Inline replies only: per-stage outcome codes (section 5). |
+| `X-Snowplow-Stage-Outcomes: [...]` | Every RESTAction reply (#904; inline-only before): the stages that did not succeed, with outcome codes (section 5). |
 
 - The echoes are derived from the outbound request snowplow actually built,
   and set before the reply is written.

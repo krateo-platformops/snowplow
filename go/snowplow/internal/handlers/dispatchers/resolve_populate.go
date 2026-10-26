@@ -383,6 +383,9 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// re-resolve runs a refilter — including a widgets-class cell, whose stored
 	// Inputs never carry HasUAF because the declaration lives on the apiRef'd RA.
 	rctx, uafTouchedSink := cache.WithUAFTouchedSink(rctx)
+	// #904 — the re-resolve's stage outcomes, kept on a restactions-class entry
+	// so an L1 hit answers with the header its cold resolve would have.
+	rctx, stageOutcomes := restactionsapi.WithStageOutcomes(rctx)
 
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
@@ -606,6 +609,8 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// without needing the RESTAction CR. Returns 0 (no override) when the knob
 		// is unset or the cell is non-UAF → byte-identical to today.
 		TTLOverride: uafTTLOverrideForEntry(&inputs),
+		// #904 — a restactions-class cell keeps its resolve's stage outcomes.
+		StageOutcomes: storableStageOutcomesFor(inputs.CacheEntryClass, stageOutcomes),
 	}
 	// Ship #97 (0.30.214) — restore the R3 fast-path on refresher Puts
 	// of apistage-class LIST entries. Pre-fix the refresher Put wrote
