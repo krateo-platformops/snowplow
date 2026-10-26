@@ -51,9 +51,7 @@ func workClass871Refresh(t *testing.T, viewed bool, want string) {
 	workclassprobe.RequireAll(t, "refresher worker goroutine", p.Self(), want)
 	workclassprobe.RequireAll(t, "goroutine started by the re-resolve", p.Children(), want)
 	workclassprobe.RequireAll(t, "re-resolve ctx", p.Ctx(), want)
-	if got[want] == 0 || len(got) != 1 {
-		t.Fatalf("CPU samples of the re-resolve: %v, want only %q", got, want)
-	}
+	workclassprobe.RequireOnly(t, "CPU samples of the re-resolve", got, want)
 	if after := workclassprobe.GoroutineClass(); after != workclassprobe.None {
 		t.Fatalf("the worker goroutine still carries %q after the dequeue", after)
 	}
@@ -85,9 +83,7 @@ func TestWorkClass871_CMP_DuePassIsComparatorNestedInRefresh(t *testing.T) {
 	workclassprobe.RequireAll(t, "comparator pass goroutine", p.Self(), "comparator")
 	workclassprobe.RequireAll(t, "goroutine started by the pass", p.Children(), "comparator")
 	workclassprobe.RequireAll(t, "comparator pass ctx", p.Ctx(), "comparator")
-	if got["comparator"] == 0 || len(got) != 1 {
-		t.Fatalf("CPU samples of the pass: %v, want only comparator", got)
-	}
+	workclassprobe.RequireOnly(t, "CPU samples of the pass", got, "comparator")
 	if after != "refresh" {
 		t.Fatalf("after the pass the refresher unit carries %q, want refresh restored", after)
 	}

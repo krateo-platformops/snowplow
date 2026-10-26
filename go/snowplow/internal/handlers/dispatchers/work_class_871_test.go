@@ -54,9 +54,7 @@ func wc871RequireUnit(t *testing.T, p *workclassprobe.Probe, got map[string]int,
 	workclassprobe.RequireAll(t, "dispatch goroutine", p.Self(), want)
 	workclassprobe.RequireAll(t, "goroutine started by the dispatch", p.Children(), want)
 	workclassprobe.RequireAll(t, "dispatch request ctx", p.Ctx(), want)
-	if got[want] == 0 || len(got) != 1 {
-		t.Fatalf("CPU samples of the dispatch: %v, want only %q", got, want)
-	}
+	workclassprobe.RequireOnly(t, "CPU samples of the dispatch", got, want)
 }
 
 func wc871Started(c workclass.Class) uint64 { return workclass.Snapshot()[c.String()].Started }
@@ -173,9 +171,7 @@ func TestWorkClass871_P_EngineScopeIsPrewarm(t *testing.T) {
 	workclassprobe.RequireAll(t, "scope goroutine", p.Self(), "prewarm")
 	workclassprobe.RequireAll(t, "goroutine started by the scope", p.Children(), "prewarm")
 	workclassprobe.RequireAll(t, "scope ctx", p.Ctx(), "prewarm")
-	if got["prewarm"] == 0 || len(got) != 1 {
-		t.Fatalf("CPU samples of the scope: %v, want only prewarm", got)
-	}
+	workclassprobe.RequireOnly(t, "CPU samples of the scope", got, "prewarm")
 	if d := wc871Started(workclass.Prewarm) - before; d != 1 {
 		t.Fatalf("prewarm units started moved by %d, want 1", d)
 	}
@@ -199,9 +195,7 @@ func TestWorkClass871_S_SeedTargetIsSeedNestedInItsScope(t *testing.T) {
 	workclassprobe.RequireAll(t, "seed goroutine", p.Self(), "seed")
 	workclassprobe.RequireAll(t, "goroutine started by the seed", p.Children(), "seed")
 	workclassprobe.RequireAll(t, "seed ctx", p.Ctx(), "seed")
-	if got["seed"] == 0 || len(got) != 1 {
-		t.Fatalf("CPU samples of the seed target: %v, want only seed", got)
-	}
+	workclassprobe.RequireOnly(t, "CPU samples of the seed target", got, "seed")
 	if after != "prewarm" {
 		t.Fatalf("after the seed target the scope carries %q, want prewarm restored", after)
 	}
@@ -259,9 +253,7 @@ func TestWorkClass871_D_DrainJobIsDrain(t *testing.T) {
 	workclassprobe.RequireAll(t, "drain page goroutine", p.Self(), "drain")
 	workclassprobe.RequireAll(t, "goroutine started by the page", p.Children(), "drain")
 	workclassprobe.RequireAll(t, "drain page ctx", p.Ctx(), "drain")
-	if got["drain"] == 0 || len(got) != 1 {
-		t.Fatalf("CPU samples of the drain: %v, want only drain", got)
-	}
+	workclassprobe.RequireOnly(t, "CPU samples of the drain", got, "drain")
 	if d := wc871Started(workclass.Drain) - before; d != 1 {
 		t.Fatalf("drain units started moved by %d, want 1 (one job)", d)
 	}
@@ -285,7 +277,5 @@ func TestWorkClass871_D_RecollectPassIsDrain(t *testing.T) {
 	workclassprobe.RequireAll(t, "re-collection goroutine", p.Self(), "drain")
 	workclassprobe.RequireAll(t, "goroutine started by the re-collection", p.Children(), "drain")
 	workclassprobe.RequireAll(t, "re-collection ctx", p.Ctx(), "drain")
-	if got["drain"] == 0 || len(got) != 1 {
-		t.Fatalf("CPU samples of the re-collection: %v, want only drain", got)
-	}
+	workclassprobe.RequireOnly(t, "CPU samples of the re-collection", got, "drain")
 }

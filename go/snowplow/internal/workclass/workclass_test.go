@@ -21,8 +21,9 @@ import (
 func TestDo_EveryClass_OnCPUSamples_SelfAndChild(t *testing.T) {
 	for _, c := range workclass.Classes {
 		t.Run(c.String(), func(t *testing.T) {
-			p := &workclassprobe.Probe{Child: true, Spin: 150 * time.Millisecond}
-			got := workclassprobe.CPUClasses(t, func() {
+			var p *workclassprobe.Probe
+			got := workclassprobe.CPUClassesUntilSampled(t, func(spin time.Duration) {
+				p = &workclassprobe.Probe{Child: true, Spin: spin}
 				workclass.Do(context.Background(), c, func(ctx context.Context) { p.Observe(ctx) })
 			})
 			if got[c.String()] == 0 {
@@ -43,8 +44,11 @@ func TestDo_EveryClass_OnCPUSamples_SelfAndChild(t *testing.T) {
 // TestProbe_NegativeControl: the instruments read "<none>" off unlabelled
 // work, so a pass above is not an instrument that always says yes.
 func TestProbe_NegativeControl(t *testing.T) {
-	p := &workclassprobe.Probe{Child: true, Spin: 150 * time.Millisecond}
-	got := workclassprobe.CPUClasses(t, func() { p.Observe(context.Background()) })
+	var p *workclassprobe.Probe
+	got := workclassprobe.CPUClassesUntilSampled(t, func(spin time.Duration) {
+		p = &workclassprobe.Probe{Child: true, Spin: spin}
+		p.Observe(context.Background())
+	})
 	if got[workclassprobe.None] == 0 || len(got) != 1 {
 		t.Fatalf("unlabelled spin samples: %v, want only %q", got, workclassprobe.None)
 	}

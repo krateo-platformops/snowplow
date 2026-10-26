@@ -179,6 +179,44 @@ func CPUClasses(t testing.TB, f func()) map[string]int {
 	return out
 }
 
+// CPUClassesUntilSampled runs f(spin) under the CPU profiler, doubling spin
+// from 150 ms until at least one spin sample lands (CI's Linux runners under
+// -race were seen to take none in a 150 ms window), up to 2.4 s. f must be
+// re-runnable. A run where no attempt took a sample fails: the arm proves
+// nothing.
+func CPUClassesUntilSampled(t testing.TB, f func(spin time.Duration)) map[string]int {
+	t.Helper()
+	for spin := 150 * time.Millisecond; spin <= 2400*time.Millisecond; spin *= 2 {
+		got := CPUClasses(t, func() { f(spin) })
+		n := 0
+		for _, v := range got {
+			n += v
+		}
+		if n > 0 {
+			return got
+		}
+		t.Logf("no CPU sample of a %v spin landed; retrying longer", spin)
+	}
+	t.Fatal("no CPU sample landed in any attempt: the CPU-sample arm proves nothing on this host")
+	return nil
+}
+
+// RequireOnly fails t if any spin sample carries a class other than want.
+// Zero samples is logged, not failed: a wrapper arm's deterministic detector
+// is the goroutine-profile check (RequireAll); this one adds that no sample
+// that did land was charged elsewhere.
+func RequireOnly(t testing.TB, what string, got map[string]int, want string) {
+	t.Helper()
+	for k, n := range got {
+		if k != want {
+			t.Fatalf("%s: %d sample(s) carried %q, want only %q (all: %v)", what, n, k, want, got)
+		}
+	}
+	if got[want] == 0 {
+		t.Logf("%s: no CPU sample landed (instrument); the goroutine-label check carries the arm", what)
+	}
+}
+
 // --- a minimal profile.proto reader ------------------------------------------
 
 type pbuf struct {
