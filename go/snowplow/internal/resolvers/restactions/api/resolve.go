@@ -1431,6 +1431,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			slog.String("dispatch", "branch-e-sa-regate-denied"))
 		return nil
 	}
+	// #905 — a customer write is sent exactly once. This is the one place a
+	// write leaves snowplow (every other dispatch branch is GET-only), so the
+	// D2 stale-serve sink is asked here, right before the send: a pass that is
+	// already stale-derived does not send it (that pass is withdrawn and re-run
+	// with D2 disabled, and the re-run sends it), and a sent write ends D2 for
+	// the rest of the resolve (stale_write_once.go).
+	if r.refuseWriteFromStalePass(gctx, sc, i) {
+		return nil
+	}
 	cache.ExternalTouchedSinkFromContext(gctx).Bump()
 	// #643 PR-A — count the fetch at the same site that marks the touch, by
 	// origin (background driver vs customer /call).

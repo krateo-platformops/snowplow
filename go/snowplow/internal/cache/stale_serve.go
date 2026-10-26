@@ -52,6 +52,10 @@ type StaleServeSink struct {
 	state           staleSinkState
 	replaceOnCommit bool
 	servedAt        time.Time
+	// wrote (#905): a write stage of this resolve was sent. From then on the
+	// resolve is never served stale (staleServeEligible), so it can never be
+	// withdrawn and re-run, which would send the write a second time.
+	wrote bool
 }
 
 type staleServedRef struct {
@@ -182,6 +186,42 @@ func (s *StaleServeSink) StaleDerived() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.served) > 0
+}
+
+// BeginWrite (#905) is asked before a write stage item of this resolve is
+// sent. A customer resolve that is stale-derived (D2) is withdrawn and re-run
+// at its write point whenever its Put is declined — and a sent write always
+// declines it (an external touch) — so a write sent from it would be sent again
+// by the re-run. BeginWrite therefore answers:
+//   - false when the resolve is already stale-derived: the write must not be
+//     sent from this pass (its re-run, with D2 disabled, sends it once);
+//   - true otherwise, and records that a write was sent, which ends D2 for the
+//     rest of this resolve (WriteSent): it is never served stale afterwards, so
+//     it is never re-run.
+//
+// Nil-safe: no sink (no D2 for this resolve) → true.
+func (s *StaleServeSink) BeginWrite() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.served) > 0 {
+		return false
+	}
+	s.wrote = true
+	return true
+}
+
+// WriteSent reports whether a write stage of this resolve was sent (#905).
+// Nil-safe.
+func (s *StaleServeSink) WriteSent() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wrote
 }
 
 // NoteServedAt records the first stale serve's time (the stale_to_push

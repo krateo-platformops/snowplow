@@ -201,10 +201,16 @@ var (
 
 // staleServeEligible reports whether ctx's resolve may be served stale: a
 // CUSTOMER read (not background, not a refill, not inert) under an armable
-// customer dispatch (a stale-serve sink).
+// customer dispatch (a stale-serve sink), that has not sent a write stage
+// (#905: a stale serve after a sent write would get the resolve withdrawn and
+// re-run, sending the write twice — the read reads through instead).
+//
+// No race with the write: a resolve's stages run one after another and every
+// item of a stage has the stage's verb, so no read of this resolve runs while
+// one of its write items is being decided (BeginWrite).
 func staleServeEligible(ctx context.Context) (*cache.StaleServeSink, bool) {
 	s := cache.StaleServeSinkFromContext(ctx)
-	if s == nil || cache.Inert(ctx) || contentFillClassOf(ctx) != fillClassCustomer {
+	if s == nil || cache.Inert(ctx) || contentFillClassOf(ctx) != fillClassCustomer || s.WriteSent() {
 		return nil, false
 	}
 	return s, true
