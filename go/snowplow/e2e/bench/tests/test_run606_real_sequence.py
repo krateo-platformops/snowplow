@@ -178,6 +178,14 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             and count("edge_collect", int(os.environ.get("FAKE_EDGE_COLLECT", "0")))):
         print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
         sys.exit(1)
+    # FAKE_LOCAL_ERROR=1: kubectl's own configuration fails every driver job
+    # read (the context does not exist): no API server is reached
+    if driver_job_read and os.environ.get("FAKE_LOCAL_ERROR") == "1":
+        print('error: context "gke_bench" does not exist', file=sys.stderr); sys.exit(1)
+    # FAKE_LOGGED_OUT_READS=N: the first N driver job reads: logged out
+    # (the operator can log in again: waited out)
+    if driver_job_read and count("logged_out", int(os.environ.get("FAKE_LOGGED_OUT_READS", "0"))):
+        print("error: You must be logged in to the server (Unauthorized)", file=sys.stderr); sys.exit(1)
     # FAKE_5XX_READS=N: the first N driver job reads answered with a 5xx while
     # /readyz answers: an overloaded / restarting server, waited out
     if driver_job_read and count("5xx_reads", int(os.environ.get("FAKE_5XX_READS", "0"))):

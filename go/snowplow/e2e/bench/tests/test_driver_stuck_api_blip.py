@@ -204,6 +204,19 @@ def test_the_outage_end_edge_on_the_driver_pod_listing_is_waited_out(harness):  
      "error: authenticated as <redacted> (and '<redacted>')"),
     ("Unable to connect to the server: net/http: TLS handshake timeout",
      "Unable to connect to the server: net/http: TLS handshake timeout"),
+    # the #898 re-reviewer's three forms after "authenticated as", and users "<name>"
+    ("error: request denied (authenticated as someone@example.com)",
+     "error: request denied (authenticated as <redacted>)"),
+    ("error: request denied (authenticated as: 112233445566778899)",
+     "error: request denied (authenticated as <redacted>)"),
+    ("error: request denied, authenticated as system:serviceaccount:ns:sa",
+     "error: request denied, authenticated as <redacted>"),
+    ('Error from server (Forbidden): users "alice" is forbidden: User "bob" cannot impersonate resource "users"',
+     'Error from server (Forbidden): users "<redacted>" is forbidden: User "<redacted>" cannot impersonate '
+     'resource "users"'),
+    ('Error from server (Forbidden): pods is forbidden: User "system:serviceaccount:ns:sa" cannot list',
+     'Error from server (Forbidden): pods is forbidden: User "<redacted>" cannot list'),
+    ("error: see (x@y.z), then", "error: see (<redacted>), then"),
 ])
 def test_kerr_line_redacts_users(tmp_path, line, want):
     src = (BENCH_DIR / "run606.sh").read_text()
@@ -214,6 +227,36 @@ def test_kerr_line_redacts_users(tmp_path, line, want):
     p = subprocess.run(["bash", "-c", fn + "\nkerr_line"], env={"KERR": str(kerr), "PATH": "/usr/bin:/bin"},
                        capture_output=True, text=True)
     assert p.stdout.strip() == want
+
+
+def test_answered_error_carries_local_errors_patterns_verbatim():
+    """answered_error is self-contained (a reviewer's classifier copies it
+    alone) and so repeats local_error's patterns: the two must not drift."""
+    import re as _re
+    fns = _sh_fns("local_error", "answered_error")
+    local, answered = _re.findall(r"grep -qE '([^']*)'", fns)
+    assert answered.endswith("|" + local), (local, answered)
+
+
+def test_a_local_kubectl_misconfiguration_is_a_verdict_at_once(harness):  # noqa: F811
+    """kubectl's own client-side error (here: the context does not exist)
+    never reached an API server: a verdict at once, with the reason — not
+    "API server unreachable", waited to the deadline."""
+    t0 = time.time()
+    p, _, out = _run606_k6(harness, FAKE_LOCAL_ERROR="1", FAKE_DRIVER_RUNNING="k6load", DRIVE_POLL_S="1",
+                           MEASURE_WAIT_S="3600")
+    log = _log(out)
+    assert ("measure FAILED: reading job/k6load failed before reaching any API server (kubectl's local "
+            'configuration): error: context "gke_bench" does not exist') in log, log[-3000:]
+    assert "API server unreachable" not in log
+    assert time.time() - t0 < 240
+
+
+def test_logged_out_is_waited_out_the_operator_can_log_in_again(harness):  # noqa: F811
+    p, _, out = _run606_k6(harness, FAKE_LOGGED_OUT_READS="3", DRIVE_POLL_S="1", MEASURE_WAIT_S="3600")
+    log = _log(out)
+    assert p.returncode == 0 and "measure FAILED" not in log, log[-3000:]
+    assert "API server unreachable since" in log
 
 
 def test_kubectl_error_lines_never_carry_a_user(harness):  # noqa: F811
@@ -262,32 +305,57 @@ def test_one_answered_error_with_a_good_reread_is_no_verdict(harness):  # noqa: 
     assert "API server unreachable" not in log
 
 
-@pytest.mark.parametrize("line, answered", [
-    ('Error from server (NotFound): jobs.batch "k6load" not found', True),
-    ('Error from server (Forbidden): jobs.batch "k6load" is forbidden', True),
-    ("Error from server (Unauthorized): the server has asked for the client to provide credentials", True),
-    ("Error from server (BadRequest): a container name must be specified", True),
-    ('Error from server (Invalid): Job.batch "x" is invalid', True),
-    ("Unable to connect to the server: net/http: TLS handshake timeout", False),
-    ("Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout", False),
-    ("Error from server (InternalError): an error on the server has prevented the request", False),
-    ("Error from server (ServiceUnavailable): the server is currently unable to handle the request", False),
-    ("Error from server (TooManyRequests): the server has received too many requests", False),
-    ("Error from server (Timeout): the server was unable to return a response in the time allotted", False),
-    ("error: unexpected EOF", False),
-    ("The connection to the server 10.0.0.2:443 was refused - did you specify the right host or port?", False),
-    ("", False),
-])
-def test_only_the_servers_own_refusals_are_answers(tmp_path, line, answered):
-    """run606's answered_error, run on kubectl's own error lines."""
+def _sh_fns(*names):
     src = (BENCH_DIR / "run606.sh").read_text()
-    fn = src[src.index("answered_error() {"):]
-    fn = fn[:fn.index("\n}\n") + 3]
+    out = []
+    for n in names:
+        fn = src[src.index(f"{n}() {{"):]
+        out.append(fn[:fn.index("\n}\n") + 3])
+    return "\n".join(out)
+
+
+# kind: "answer" (the server refused: re-read, then a verdict), "local"
+# (kubectl's own configuration: a verdict at once), "wait" (waited out).
+# The #898 re-reviewer's samples (scratchpad/classify.sh) and more.
+@pytest.mark.parametrize("line, kind", [
+    ('Error from server (NotFound): jobs.batch "k6load" not found', "answer"),
+    ('Error from server (Forbidden): jobs.batch "k6load" is forbidden', "answer"),
+    ("Error from server (Unauthorized): the server has asked for the client to provide credentials", "answer"),
+    ("Error from server (BadRequest): a container name must be specified", "answer"),
+    ('Error from server (Invalid): Job.batch "x" is invalid', "answer"),
+    ('Error from server (Forbidden): users "alice" is forbidden: User "bob" cannot impersonate resource "users"',
+     "answer"),
+    ("Unable to connect to the server: net/http: TLS handshake timeout", "wait"),
+    ("Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout", "wait"),
+    ("Unable to connect to the server: EOF", "wait"),
+    ('Error from server (InternalError): an error on the server ("") has prevented the request from succeeding',
+     "wait"),
+    ("Error from server (ServiceUnavailable): the server is currently unable to handle the request", "wait"),
+    ("Error from server (TooManyRequests): the server has received too many requests", "wait"),
+    ("Error from server (Timeout): the server was unable to return a response in the time allotted", "wait"),
+    ("Error from server: etcdserver: request timed out", "wait"),
+    ("error: unexpected EOF", "wait"),
+    ("The connection to the server 10.0.0.2:443 was refused - did you specify the right host or port?", "wait"),
+    ("error: You must be logged in to the server (Unauthorized)", "wait"),      # the operator can log in again
+    ("error: unknown flag: --request-timeoutt", "local"),
+    ("error: unknown shorthand flag: 'x' in -x", "local"),
+    ('error: error loading config file "/tmp/x/kubeconfig": open /tmp/x/kubeconfig: no such file or directory',
+     "local"),
+    ('error: context "gke_p_z_c" does not exist', "local"),
+    ("The connection to the server localhost:8080 was refused - did you specify the right host or port?", "local"),
+    ("", "wait"),
+])
+def test_only_the_servers_own_refusals_or_a_local_misconfiguration_end_a_wait(tmp_path, line, kind):
+    """run606's answered_error / local_error, run on kubectl's own error lines."""
     kerr = tmp_path / "kerr"
     kerr.write_text(line + "\n")
-    rc = subprocess.run(["bash", "-c", fn + "\nanswered_error"],
-                        env={"KERR": str(kerr), "PATH": "/usr/bin:/bin"}).returncode
-    assert (rc == 0) == answered, line
+    fns = _sh_fns("local_error", "answered_error")
+
+    def rc(f):
+        return subprocess.run(["bash", "-c", fns + "\n" + f],
+                              env={"KERR": str(kerr), "PATH": "/usr/bin:/bin"}).returncode
+    assert (rc("answered_error") == 0) == (kind != "wait"), line
+    assert (rc("local_error") == 0) == (kind == "local"), line
 
 
 def test_job_pod_record_never_reads_an_unreadable_listing_as_missing():
@@ -384,19 +452,41 @@ def test_the_operators_own_network_blip_is_the_vantages_not_bs(tmp_path):
     assert any("the operator's vantage, not the candidate" in n for n in p["notes"])
 
 
-@pytest.mark.parametrize("b_t0, b_t1, invalid", [
-    (1030, 1080, False),        # overlaps the end of A's [1000, 1040): the vantage's
-    (1040, 1080, True),         # starts as A's ends: B-only
-    (1200, 1240, True),         # B only, later
+# A's outage [1000, 1040], first unanswered poll at 1030: its own poll
+# interval, 30 s, is how far its true edges can sit from the window's, so A
+# covers [970, 1070] of wall-clock time — no other margin.
+@pytest.mark.parametrize("b_t0, b_t1, b_only_s", [
+    (1000, 1040, None),         # the same window: the vantage's
+    (980, 1060, None),          # inside A's cover (its edges within A's poll interval): the vantage's
+    (1030, 1080, 10.0),         # 10 s past A's cover: B's alone, voids
+    (1040, 1080, 10.0),         # starts as A's ends: 10 s B-only
+    (1200, 1240, 40.0),         # B only, later
 ])
-def test_only_a_b_only_outage_voids(tmp_path, b_t0, b_t1, invalid):
-    """wall-clock overlap with an A outage decides; touching is not overlap"""
+def test_only_the_part_of_bs_outage_that_as_covers_is_the_vantages(tmp_path, b_t0, b_t1, b_only_s):
     a = _outage(P14, 1000, 1040, K0)
     b = _shift(_outage(P14, b_t0, b_t1, K0), SHIFT)
     p = _arms(tmp_path, a, b)
-    assert (p["verdict"] == "INVALID") == invalid, (p["invalid_reasons"], p["fail_reasons"])
-    if invalid:
+    v = next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
+    if b_only_s is None:
+        assert p["verdict"] == "PASS" and v["value"] == "none", (p["invalid_reasons"], p["fail_reasons"])
+    else:
+        assert p["verdict"] == "INVALID"
         assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.control_plane_outage[b]"]
+        assert v["value"][0]["b_only_seconds"] == b_only_s and f"{b_only_s} s of it while A's answered" in v["why"]
+
+
+@pytest.mark.parametrize("b_t1", [1100, 1300, 1600])
+def test_a_long_b_outage_touching_a_short_a_blip_voids(tmp_path, b_t1):
+    """The #898 re-reviewer's probe: A blips 30 s (1000-1030), B is down from
+    1010 to b_t1. Only the 20 s they share (and A's poll interval around it)
+    is the vantage's; the rest of B's outage is B's alone — INVALID."""
+    a = _outage(P14, 1000, 1030, K0)
+    b = _shift(_outage(P14, 1010, b_t1, K0), SHIFT)
+    p = _arms(tmp_path, a, b)
+    assert p["verdict"] == "INVALID", (p["invalid_reasons"], p["fail_reasons"])
+    assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.control_plane_outage[b]"]
+    v = next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
+    assert v["value"][0]["b_only"] == [[round(K0 + 1060.0, 1), round(K0 + b_t1, 1)]]   # A covers to 1030 + 30
 
 
 def test_an_outage_outside_the_measure_is_not_the_pairs(tmp_path):

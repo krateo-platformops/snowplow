@@ -637,12 +637,30 @@ def control_plane_outages(outages: list[dict] | None, span) -> list[dict]:
     return out
 
 
-def vantage_outage(o: dict, others: list[dict]) -> bool:
-    """Does outage `o` (one run's) overlap, in wall-clock time, any of the
-    OTHER run's outages? Both runs of a pair are polled from the same
-    operator machine; a drop of its own network is an "outage" of both at
-    the same moment — the vantage's, not either cluster's."""
-    return any(o["t0"] < x["t1"] and x["t0"] < o["t1"] for x in others)
+def vantage_cover(others: list[dict]) -> list[tuple[float, float]]:
+    """The wall-clock time the OTHER run's outages may have covered: each
+    window [t0, t1] widened on both sides by that record's own edge
+    uncertainty — t0 (the last poll answered) to first_unanswered (the first
+    poll not answered): its poll interval, which is how far the true edge of
+    a drop can sit from the window's edge. No other margin."""
+    out = []
+    for x in others:
+        try:
+            u = max(0.0, float(x.get("first_unanswered") or x["t0"]) - float(x["t0"]))
+            out.append((float(x["t0"]) - u, float(x["t1"]) + u))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return _union(out)
+
+
+def b_only_parts(o: dict, others: list[dict]) -> list[tuple[float, float]]:
+    """The parts of outage `o` (B's) that NO outage of the other run (A's)
+    covers (vantage_cover). Both runs of a pair are polled from the same
+    operator machine, so a drop of its own network is an "outage" of both at
+    the same moment — the vantage's. Only the part A's outage covers is the
+    vantage's: whatever of B's outage is left is B's alone (#898 re-review:
+    a 30 s A blip must not excuse a 590 s B outage that touches it)."""
+    return _minus(float(o["t0"]), float(o["t1"]), vantage_cover(others))
 
 
 def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[dict] | None,
@@ -1013,26 +1031,33 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
         if rda is not None and rdb is not None:
             # A control-plane outage of B ONLY during the measure: INVALID, never
             # PASS — the candidate may have caused it, so it is never silently
-            # cut. One that overlaps an A outage in wall-clock time is the
+            # cut. The part of it an A outage covers in wall-clock time is the
             # vantage's: both runs are polled from the same operator machine, so
             # its own network dropping reads as an outage of both at once (#898
-            # re-review). That one is excluded from both runs (joint_exclusion
-            # cuts every outage of either run from both) and noted, not voided.
+            # re-review). Only an outage A's covers WHOLLY (b_only_parts empty)
+            # is excused: excluded from both runs (joint_exclusion cuts every
+            # outage of either run from both) and noted. Any B time left over
+            # is B's alone and voids, with those parts listed.
             cpo_a = ra.get("control_plane_outages") or []
-            cpo_all = rb.get("control_plane_outages") or []
-            shared = [o for o in cpo_all if vantage_outage(o, cpo_a)]
-            cpo = [o for o in cpo_all if o not in shared]
-            for o in shared:
-                notes.append(f"B's control plane did not answer for {o['seconds']} s from {o['t0']:.0f} to "
-                             f"{o['t1']:.0f} while A's did not answer either (same wall-clock time, "
-                             f"{o['source']}): the operator's vantage, not the candidate — excluded from both "
-                             f"runs, not voided")
+            cpo = []
+            for o in rb.get("control_plane_outages") or []:
+                own = b_only_parts(o, cpo_a)
+                if own:
+                    cpo.append(dict(o, b_only=[[round(x, 1), round(y, 1)] for x, y in own],
+                                    b_only_seconds=round(sum(y - x for x, y in own), 1)))
+                else:
+                    notes.append(f"B's control plane did not answer for {o['seconds']} s from {o['t0']:.0f} to "
+                                 f"{o['t1']:.0f}, all of it while A's did not answer either (same wall-clock "
+                                 f"time, {o['source']}): the operator's vantage, not the candidate — excluded "
+                                 f"from both runs, not voided")
             validity.append(_validity(
                 "control_plane_outage[b]", not cpo,
-                [{k: o[k] for k in ("t0", "t1", "seconds", "source", "open")} for o in cpo] or "none",
-                "B's API server answered through the measure, except when A's did not either (the vantage's)",
+                [{k: o[k] for k in ("t0", "t1", "seconds", "b_only", "b_only_seconds", "source", "open")}
+                 for o in cpo] or "none",
+                "B's API server answered through the measure, except while A's did not either (the vantage's)",
                 "B's control plane did not answer during the measure ("
-                + "; ".join(f"{o['seconds']} s from {o['t0']:.0f} to {o['t1']:.0f}, {o['source']}" for o in cpo)
+                + "; ".join(f"{o['seconds']} s from {o['t0']:.0f} to {o['t1']:.0f}, {o['b_only_seconds']} s of it "
+                            f"while A's answered, {o['source']}" for o in cpo)
                 + "): the candidate may have caused it — never excluded silently"))
             for o in cpo_a:
                 notes.append(f"A's control plane did not answer for {o['seconds']} s during the measure "

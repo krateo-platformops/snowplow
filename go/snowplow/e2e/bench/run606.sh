@@ -646,9 +646,9 @@ s_measure() {
     rv=0
     read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get job/fresh606 -o name || rv=$?
     case "$rv" in
-      0) api_seen ok
-         log "measure FAILED: waiting for fresh606 failed while the API server answers: $(kerr_line)"
-         return 1 ;;
+      0|4) api_seen ok
+           log "measure FAILED: waiting for fresh606 failed $(verdict_why "$rv"): $(kerr_line)"
+           return 1 ;;
       2) api_seen ok ;;
       *) api_seen down "wait job/fresh606" ;;
     esac
@@ -675,12 +675,26 @@ kwait() {
 api_answers() { "${K[@]}" --request-timeout=30s get --raw=/readyz >/dev/null 2>&1; }
 KERR="$OUT/.kubectl-last-error"
 # kerr_line: kubectl's first error line, for the log and collect's record —
-# with any user name ('User "…"') or e-mail address redacted first (a GKE
-# Forbidden names the operator's account; never logged, never recorded).
+# with every identity redacted first (a GKE Forbidden names the operator's
+# account; never logged, never recorded): 'User "…"', 'users "…"', whatever
+# follows "authenticated as" (an e-mail, a numeric id,
+# system:serviceaccount:…), and any e-mail address. A closing ")" or ","
+# stays.
 kerr_line() {
   head -1 "$KERR" 2>/dev/null \
-    | sed -E 's/User "[^"]*"/User "<redacted>"/g; s/[^[:space:]"'"'"']+@[^[:space:]"'"'"']+/<redacted>/g' \
+    | sed -E 's/User "[^"]*"/User "<redacted>"/g; s/users "[^"]*"/users "<redacted>"/g;
+              s/authenticated as:? [^)[:space:],]+/authenticated as <redacted>/g;
+              s/[^[:space:]"'"'"'(),]+@[^[:space:]"'"'"'(),]+/<redacted>/g' \
     | cut -c1-300
+}
+# local_error: kubectl failed BEFORE reaching any API server — its own
+# client-side configuration: an unknown flag or command, a kubeconfig that
+# cannot be loaded, a context that does not exist, no server configured (the
+# localhost:8080 default). Deterministic: a verdict at once, with the reason,
+# never waited out as "API server unreachable". "You must be logged in
+# (Unauthorized)" is NOT one: the operator can re-authenticate, so it waits.
+local_error() {
+  grep -qE '^error: (unknown (shorthand )?flag|unknown command|error loading config file|context "[^"]*" does not exist|no context exists|invalid configuration)|The connection to the server localhost:8080 was refused' "$KERR" 2>/dev/null
 }
 # answered_error: kubectl's error (in $KERR) is the API server's own ANSWER —
 # the request reached it and it refused: NotFound, Forbidden, Unauthorized,
@@ -690,20 +704,36 @@ kerr_line() {
 # comes back, so /readyz right after it answers (#898 re-review: run 16
 # attempt 2 again). The error itself decides, not a probe taken after it.
 answered_error() {
-  grep -qE 'Error from server \((NotFound|Forbidden|Unauthorized|BadRequest|Invalid)\)' "$KERR" 2>/dev/null
+  # self-contained (a reviewer's classifier copies this function alone): the
+  # server's own refusals, and — a verdict too, said at once by read_verdict —
+  # local_error's patterns, the same text (a test pins that the two agree)
+  grep -qE 'Error from server \((NotFound|Forbidden|Unauthorized|BadRequest|Invalid)\)|^error: (unknown (shorthand )?flag|unknown command|error loading config file|context "[^"]*" does not exist|no context exists|invalid configuration)|The connection to the server localhost:8080 was refused' "$KERR" 2>/dev/null
 }
 # read_verdict <re-read cmd...>: a read just failed (its stderr in $KERR).
+#   4  a verdict at once: kubectl's own local configuration (local_error);
 #   0  a verdict: it was ANSWERED with an error, /readyz answers, and the one
 #      re-read (<re-read cmd...>) was answered with an error again;
 #   2  the re-read succeeded: the API answers, no verdict — poll again;
 #   1  waited out: not an answered error, or /readyz or the re-read did not
 #      answer.
 read_verdict() {
+  local_error && return 4
   answered_error || return 1
   api_answers || return 1
   if "$@" >/dev/null 2>"$KERR"; then return 2; fi
   answered_error && return 0
   return 1
+}
+# verdict_why <rv>: how a read_verdict verdict (0 or 4) is said in the log
+verdict_why() {
+  if [[ "$1" == "4" ]]; then echo "before reaching any API server (kubectl's local configuration)"
+  else echo "while the API server answers"; fi
+}
+# err_kind: what kubectl's last error (in $KERR) says of the API server
+err_kind() {
+  if local_error; then echo "kubectl's local configuration"
+  elif answered_error; then echo "the API answered"
+  else echo "API did not answer"; fi
 }
 # api_seen <ok|down> [what]: the API server's reachability as the measure /
 # collect loops see it. Logged on a change of state only (start and end of an
@@ -783,9 +813,9 @@ wait_drive_done() {
         st="" rv=0
         read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$j" -o name || rv=$?
         case "$rv" in
-          0) api_seen ok
-             log "measure FAILED: reading job/$j failed while the API server answers: $(kerr_line)"
-             return 1 ;;
+          0|4) api_seen ok
+               log "measure FAILED: reading job/$j failed $(verdict_why "$rv"): $(kerr_line)"
+               return 1 ;;
           2) api_seen ok ;;
           *) api_seen down "get job/$j" ;;
         esac
@@ -807,9 +837,9 @@ wait_drive_done() {
           rv=0
           read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o name || rv=$?
           case "$rv" in
-            0) api_seen ok
-               log "measure FAILED: listing the $k driver pods failed while the API server answers: $(kerr_line)"
-               return 1 ;;
+            0|4) api_seen ok
+                 log "measure FAILED: listing the $k driver pods failed $(verdict_why "$rv"): $(kerr_line)"
+                 return 1 ;;
             2) api_seen ok ;;
             *) api_seen down "get pods job-name=$k" ;;
           esac
@@ -840,7 +870,7 @@ driver_exit_codes() {
   local j="$1" p rc bad="" names
   if ! names="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$j" -o name 2>"$KERR")" \
       || [[ -z "$names" ]]; then
-    log "driver $j exit codes unknown ($(answered_error && echo "the API answered" || echo "API did not answer"): $(kerr_line)); the collected results say how it ended"
+    log "driver $j exit codes unknown ($(err_kind): $(kerr_line)); the collected results say how it ended"
     return 0
   fi
   for p in $names; do
@@ -1003,11 +1033,18 @@ s_collect() {
     while ! jp="$("${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>"$KERR")"; do
       rv=0
       read_verdict "${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o name || rv=$?
-      if [[ "$rv" == "1" ]]; then api_seen down "collect: $p pods"; else api_seen ok; fi
-      if [[ "$rv" == "0" ]] || (( $(date +%s) + COLLECT_TIMEOUT_S >= COLLECT_DEADLINE )); then
+      case "$rv" in
+        1) api_seen down "collect: $p pods" ;;
+        0|2) api_seen ok ;;
+      esac
+      if [[ "$rv" == "0" || "$rv" == "4" ]] || (( $(date +%s) + COLLECT_TIMEOUT_S >= COLLECT_DEADLINE )); then
         log "could not read how the $p pod(s) ended: $(kerr_line)"
         python3 -m bench.load606 job-pod-record --job "$p" \
-            --unreadable "$([[ "$rv" == "1" ]] && echo "API did not answer" || echo "the API answered: $(kerr_line)")" \
+            --unreadable "$(case "$rv" in
+                              1) echo "API did not answer" ;;
+                              4) echo "kubectl's local configuration: $(kerr_line)" ;;
+                              *) echo "the API answered: $(kerr_line)" ;;
+                            esac)" \
             >> "$OUT/job-pods.jsonl"
         continue 2
       fi
