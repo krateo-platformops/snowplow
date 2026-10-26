@@ -1128,13 +1128,15 @@ s_evaluate() {
                                           --browser-sessions "$BROWSER_SESSIONS")
   [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} ${k6args[*]:-}"; return 0
+    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-}"; return 0
   fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
   local vrc=0
+  # #871: --profile-dir attributes mem606's CPU profiles by the snowplow_work label
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
-      --expect-digest "$EXPECTED_IMAGE_DIGEST" ${k6args[@]+"${k6args[@]}"} > "$OUT/verdict.json" || vrc=$?
+      --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
+      ${k6args[@]+"${k6args[@]}"} > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
   # Every INVALID reason in the run log, not only in verdict.json (#817: run
   # 9's zero navigations surfaced only as `warm_navs 0`).
