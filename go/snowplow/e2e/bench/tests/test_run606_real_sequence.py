@@ -129,6 +129,120 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             resolved = None
     record("kubectl", kc, resolved)
     port = os.environ["FAKE_PORT"]
+    # run 16 attempt 2: the API server stops answering for a while mid-measure.
+    # FAKE_API_DOWN_POLLS=N: the first N driver-wait reads (the job status and
+    # the driver pods) fail as kubectl does then; FAKE_API_DOWN_WAITS=N: the
+    # first N fresh606 waits and their probes too. Then the API answers again.
+    down_flag = os.path.join(STATE, "api_down")         # an outage in progress: /readyz unanswered too
+    def unanswered():
+        open(down_flag, "w").write("1")
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+        sys.exit(1)
+    def api_blip(var, counter):
+        n_max = int(os.environ.get(var, "0"))
+        if not n_max:
+            return
+        p = os.path.join(STATE, counter)
+        n = int(open(p).read()) if os.path.exists(p) else 0
+        if n < n_max:
+            open(p, "w").write(str(n + 1))
+            unanswered()
+        if os.path.exists(down_flag):
+            os.remove(down_flag)
+    collect_started = os.path.join(STATE, "collect_started")
+    collect_down = (os.environ.get("FAKE_COLLECT_PODS_UNANSWERED") == "1" and os.path.exists(collect_started))
+    if a[:2] == ["get", "--raw=/readyz"]:                       # run606's api_answers probe
+        if os.path.exists(down_flag) or collect_down:
+            print("Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout", file=sys.stderr)
+            sys.exit(1)
+        print("ok"); sys.exit(0)
+    drivers = ("load606", "k6load", "k6browser")
+    # FAKE_ANSWERED_ERROR=job|pods: the API server ANSWERS that read with an
+    # error (NotFound): a real answer, not an outage
+    ans = os.environ.get("FAKE_ANSWERED_ERROR")
+    if ans == "job" and a[:1] == ["get"] and any(x in (f"job/{d}" for d in drivers) for x in a):
+        print('Error from server (NotFound): jobs.batch "k6load" not found', file=sys.stderr); sys.exit(1)
+    if ans == "pods" and a[:2] == ["get", "pods"] and any(x in (f"job-name={d}" for d in drivers) for x in a) \
+            and ("json" in a or "name" in a):
+        print('Error from server (Forbidden): pods is forbidden: User "someone@example.invalid" cannot list resource "pods"',
+              file=sys.stderr); sys.exit(1)
+    def count(name, n_max):   # True for the first n_max calls counted under `name`
+        p =os.path.join(STATE, name)
+        n = int(open(p).read()) if os.path.exists(p) else 0
+        if n < n_max:
+            open(p, "w").write(str(n + 1))
+            return True
+        return False
+    driver_job_read = a[:1] == ["get"] and any(x in (f"job/{d}" for d in drivers) for x in a)
+    # FAKE_EDGE_READS=N (the #898 re-reviewer's): the last read of an outage — it
+    # timed out while the API server came back, so /readyz right after it
+    # ANSWERS (no down flag). Waited out, never a verdict.
+    if driver_job_read and count("edge_reads", int(os.environ.get("FAKE_EDGE_READS", "0"))):
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+        sys.exit(1)
+    # FAKE_EDGE_PODS=N / FAKE_EDGE_WAITS=N / FAKE_EDGE_COLLECT=N: the same edge
+    # on the driver pod listings, the fresh606 wait, and collect's pod listings
+    if (not os.path.exists(collect_started) and a[:2] == ["get", "pods"] and "json" in a
+            and any(x in (f"job-name={d}" for d in drivers) for x in a)
+            and count("edge_pods", int(os.environ.get("FAKE_EDGE_PODS", "0")))):
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+        sys.exit(1)
+    if a[:1] == ["wait"] and "job/fresh606" in a and count("edge_waits", int(os.environ.get("FAKE_EDGE_WAITS", "0"))):
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+        sys.exit(1)
+    if (os.path.exists(collect_started) and a[:2] == ["get", "pods"] and "json" in a
+            and any(x.startswith("job-name=") for x in a)
+            and count("edge_collect", int(os.environ.get("FAKE_EDGE_COLLECT", "0")))):
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+        sys.exit(1)
+    # FAKE_LOCAL_ERROR=1: kubectl's own configuration fails every driver job
+    # read (the context does not exist): no API server is reached
+    if driver_job_read and os.environ.get("FAKE_LOCAL_ERROR") == "1":
+        print('error: context "gke_bench" does not exist', file=sys.stderr); sys.exit(1)
+    # FAKE_LOGGED_OUT_READS=N: the first N driver job reads: logged out
+    # (the operator can log in again: waited out)
+    if driver_job_read and count("logged_out", int(os.environ.get("FAKE_LOGGED_OUT_READS", "0"))):
+        print("error: You must be logged in to the server (Unauthorized)", file=sys.stderr); sys.exit(1)
+    # FAKE_5XX_READS=N: the first N driver job reads answered with a 5xx while
+    # /readyz answers: an overloaded / restarting server, waited out
+    if driver_job_read and count("5xx_reads", int(os.environ.get("FAKE_5XX_READS", "0"))):
+        print("Error from server (InternalError): an error on the server has prevented the request",
+              file=sys.stderr); sys.exit(1)
+    # FAKE_ANSWERED_ONCE=1: the first driver job status read is answered
+    # NotFound, the re-read right after it is fine: no verdict on one answer
+    if driver_job_read and "jsonpath" in " ".join(a) and os.environ.get("FAKE_ANSWERED_ONCE") == "1" \
+            and count("answered_once", 1):
+        print('Error from server (NotFound): jobs.batch "k6load" not found', file=sys.stderr); sys.exit(1)
+    if collect_down and a[:2] == ["get", "pods"] and any(x.startswith("job-name=") for x in a) and "json" in a:
+        unanswered()
+    # FAKE_EXIT_CODES_UNANSWERED=1: the driver pods' name listing (their exit
+    # codes' read) goes unanswered, once
+    if (os.environ.get("FAKE_EXIT_CODES_UNANSWERED") == "1" and a[:2] == ["get", "pods"]
+            and any(x in (f"job-name={d}" for d in drivers) for x in a) and "name" in a
+            and not os.path.exists(os.path.join(STATE, "exit_codes_unanswered"))):
+        open(os.path.join(STATE, "exit_codes_unanswered"), "w").write("1")
+        print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr); sys.exit(1)
+    # FAKE_WAIT_ANSWERED=1: the fresh606 wait, and a get of the Job, ANSWERED
+    # with an error while /readyz answers: a real answer, never waited out
+    if os.environ.get("FAKE_WAIT_ANSWERED") == "1" and (
+            (a[:1] == ["wait"] and "job/fresh606" in a) or a[:2] == ["get", "job/fresh606"]):
+        print('Error from server (Forbidden): jobs.batch "fresh606" is forbidden', file=sys.stderr); sys.exit(1)
+    if a[:1] == ["get"] and (any(x in (f"job/{d}" for d in drivers) for x in a)
+                             or (any(x in (f"job-name={d}" for d in drivers) for x in a) and "json" in a)):
+        api_blip("FAKE_API_DOWN_POLLS", "api_down_polls")
+    if (a[:1] == ["wait"] and "job/fresh606" in a) or (a[:2] == ["get", "job/fresh606"] and "name" in a):
+        api_blip("FAKE_API_DOWN_WAITS", "api_down_waits")
+    # FAKE_API_EMPTY_PODS=N: the first N driver pod listings answer rc 0 with
+    # an empty body (a proxy in between, a cut stream): proves nothing either
+    if a[:2] == ["get", "pods"] and any(x in (f"job-name={d}" for d in drivers) for x in a) and "json" in a:
+        n_max = int(os.environ.get("FAKE_API_EMPTY_PODS", "0"))
+        cnt = os.path.join(STATE, "api_empty_pods")
+        n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+        if n < n_max:
+            open(cnt, "w").write(str(n + 1)); sys.exit(0)
+    if a[:2] == ["get", "jobs"] and "name" in a:                  # collect's reachability probe
+        api_blip("FAKE_API_DOWN_COLLECT", "api_down_collect")
+        open(collect_started, "w").write("1")
     if a[:2] == ["config", "current-context"]:
         if resolved is None: sys.exit(1)
         print(resolved); sys.exit(0)

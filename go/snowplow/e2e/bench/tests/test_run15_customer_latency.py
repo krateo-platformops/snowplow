@@ -91,7 +91,8 @@ def _write_run(d: Path, doc=P14, scale=lambda t, v: v, drop=lambda t: False, con
     (d / "k6" / "k6-summary.json").write_text(json.dumps({"config": config or doc["config"]}))
     (d / "browser" / "browser-summary.json").write_text(json.dumps({"sessions": doc["browser_sessions"]}))
     files = {"mem-x.jsonl": doc["mem"], "fresh-x.jsonl": doc["churns"], "top.jsonl": doc["tops"],
-             **({"pod-x.jsonl": doc["pods"]} if doc.get("pods") else {})}
+             **({"pod-x.jsonl": doc["pods"]} if doc.get("pods") else {}),
+             **({"api-outages.jsonl": doc["api_outages"]} if doc.get("api_outages") else {})}
     for name, rows in files.items():
         (d / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
     return [str(d / n) for n in files]
