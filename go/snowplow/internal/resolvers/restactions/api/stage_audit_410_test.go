@@ -50,10 +50,12 @@ const (
 	raNS410     = "krateo-system"
 	raName410   = "ra410"
 	denyPath410 = "/apis/composition.krateo.io/v1alpha1/namespaces/team-b/fireworksapps"
-	// Credentials a stage can carry in its PATH and an upstream can echo in its
-	// error BODY. Neither may ever reach the 365-day trail.
-	pathSecret410 = "HOOKSECRET410"
-	bodySecret410 = "xoxb-BODYSECRET410"
+	// Canaries standing for a credential a stage carries in its PATH and one an
+	// upstream echoes in its error BODY. Neither may ever reach the 365-day
+	// trail. Deliberately low-entropy, so no secret scanner mistakes the test
+	// for a leak.
+	pathCanary410 = "PATHCANARY410"
+	bodyCanary410 = "BODYCANARY410"
 )
 
 // dial410 is one request a fake upstream received.
@@ -86,7 +88,7 @@ func upstream410(t *testing.T) (*httptest.Server, func() []dial410) {
 		case strings.HasPrefix(r.URL.Path, "/services/"):
 			// A webhook that refuses, echoing a credential in its error body.
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = io.WriteString(w, `{"error":"invalid_token","token":"`+bodySecret410+`"}`)
+			_, _ = io.WriteString(w, `{"error":"invalid_token","token":"`+bodyCanary410+`"}`)
 			return
 		}
 		if strings.Contains(r.URL.Path, "/team-b/") {
@@ -318,9 +320,9 @@ func TestAudit410_Cr_CredentialsInPathOrBody_NeverReachTheRecord(t *testing.T) {
 	rec := records410(t)
 
 	resolve410(ctxWithUser(user410, group410), api.URL,
-		extStage410("notify", http.MethodPost, "/services/T000/B000/"+pathSecret410))
+		extStage410("notify", http.MethodPost, "/services/T000/B000/"+pathCanary410))
 
-	if d := extDials(); len(d) != 1 || !strings.Contains(d[0].path, pathSecret410) {
+	if d := extDials(); len(d) != 1 || !strings.Contains(d[0].path, pathCanary410) {
 		t.Fatalf("precondition: the webhook was not dialled with its secret path: %v", d)
 	}
 	got := attrs410(rec)
@@ -331,7 +333,7 @@ func TestAudit410_Cr_CredentialsInPathOrBody_NeverReachTheRecord(t *testing.T) {
 		"outcome": "failure", "http.response.status_code": "403", "enduser.id": user410,
 		"krateo.restaction.stage": "notify", "server.address": strings.TrimPrefix(ext.URL, "http://"),
 	})
-	for _, secret := range []string{pathSecret410, bodySecret410, "invalid_token", "/services/"} {
+	for _, secret := range []string{pathCanary410, bodyCanary410, "invalid_token", "/services/"} {
 		for k, v := range got[0] {
 			if strings.Contains(v, secret) {
 				t.Errorf("attribute %s carries %q: %q", k, secret, v)
