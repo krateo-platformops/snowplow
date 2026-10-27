@@ -858,10 +858,11 @@ func (c *crdDiscovery) relistGVRForRepair(
 	// The teardown above opens a window in which DELETEs are lost with no
 	// trace at any log level. RemoveResourceType closes the old informer's
 	// per-GVR stop channel and purges its state, so anything still in its
-	// DeltaFIFO or in flight on its watch is dropped with no handler run.
-	// The replacement informer is freshly constructed, so its knownObjects
-	// indexer is EMPTY — DeltaFIFO.Replace() has nothing to diff against
-	// and synthesises NO Deleted delta for an object that vanished before
+	// FIFO or in flight on its watch is dropped with no handler run.
+	// The replacement informer is freshly constructed, so its store is
+	// EMPTY — the Replace of its first LIST (an atomic ReplacedAll at
+	// client-go v0.36.5, which diffs against that store) has nothing to diff
+	// against and synthesises NO delete for an object that vanished before
 	// the new LIST. The object simply never appears.
 	//
 	// The dirty-mark on the line above does cover entries whose objects

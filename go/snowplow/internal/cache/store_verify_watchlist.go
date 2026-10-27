@@ -3,7 +3,7 @@
 //
 // # WHY THIS BRANCH IS THE ONE THAT MATTERS
 //
-// At client-go v0.35.3 the WatchListClient gate defaults to true and nothing in
+// At client-go v0.36.5 the WatchListClient gate defaults to true and nothing in
 // this process opts out, so ListAndWatchWithContext calls watchList() first and
 // the classic LIST is only a fallback. A detector that covered only the LIST
 // path would be a detector that never runs.

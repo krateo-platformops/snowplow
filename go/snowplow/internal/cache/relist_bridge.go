@@ -3,10 +3,11 @@
 //
 // THE GAP (§4.1, trace addendum 4 §1). triggerCRDSchemaRelist tears the
 // per-GVR informer down (RemoveResourceType closes its stop channel and
-// purges its state — anything in its DeltaFIFO or in flight on its watch is
+// purges its state — anything in its FIFO or in flight on its watch is
 // dropped with no handler run) and builds a FRESH one. A fresh informer's
-// knownObjects indexer is empty, so DeltaFIFO.Replace() synthesises NO
-// Deleted delta for an object that vanished before the new LIST: the object
+// store is empty, so the Replace of its first LIST (client-go v0.36.5's atomic
+// ReplacedAll diffs against that store) synthesises NO delete for an object
+// that vanished before the new LIST: the object
 // simply never appears, and no DELETE is ever generated for it. The 1.12.5
 // pre-sync and post-sync dirty-marks reach such an entry only through a
 // refresh whose own re-fetch must then 404 — a two-hop path that depends on
