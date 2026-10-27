@@ -481,3 +481,23 @@ from tests.test_run606_real_sequence import harness  # noqa: E402,F401
 def _pair_calls(fake):
     p = fake / "calls"
     return p.read_text().splitlines() if p.exists() else []
+
+
+@pytest.mark.parametrize("stderr, gone", [
+    ("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: "
+     "projects/p/locations/europe-west4/clusters/c.", True),
+    ("ERROR: ResponseError: code=503, message=backend not found, try again", False),
+    ("ERROR: (gcloud.container.clusters.describe) the server was not found (dial tcp: lookup)", False),
+    ("ERROR: (gcloud.container.clusters.describe) ResponseError: code=500, message=error 404 upstream", False),
+])
+def test_the_gone_poll_counts_only_gclouds_notfound(monkeypatch, stderr, gone):
+    """#907 N1: the same NotFound test as the cluster lookup — code=404 /
+    NOT_FOUND — never "not found" or "404" anywhere in a failure, which could
+    run the disk backstop while the cluster's nodes still hold its disks."""
+    def fake(argv, *, stderr_out=None, **kw):
+        stderr_out.append(stderr)
+        return 1, ""
+    monkeypatch.setattr(gke, "execute", fake)
+    t = iter([0.0, 1e9])
+    assert gke.wait_cluster_gone(gke.default_spec(NAME), log=lambda m: None, deadline=1.0,
+                                 clock=lambda: next(t), sleep=lambda s: None) is gone
