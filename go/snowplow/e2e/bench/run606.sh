@@ -36,6 +36,13 @@ case "$RUN_NAME" in
 esac
 PROJECT="${PROJECT:-operations-dev-krateo-io}"
 ZONE="${ZONE:-europe-west4-a}"      # every node's zone
+# A ZONE, never a region: REGION is derived from it below, and a region here
+# would put the nodes in "europe-west4" and the control plane in "europe" (#899
+# F2). The same pattern as bench/gke.py ZONE_PATTERN; refused before anything.
+if ! [[ "$ZONE" =~ ^[a-z]+-[a-z]+[0-9]+-[a-z]$ ]]; then
+  echo "ZONE must be a zone (e.g. europe-west4-a), got '$ZONE': every node goes in it and the control plane in its region" >&2
+  exit 2
+fi
 # The control plane is REGIONAL (3 replicas; run 16 attempt 2 lost B's zonal
 # one for 5+ minutes): gcloud and the kube context name the region.
 REGION="${ZONE%-*}"
@@ -402,14 +409,20 @@ s_source() {
 }
 s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
 s_up() {
-  # the run's record of the cluster's shape (runs 14-16: zonal control plane; 17+: regional)
-  python3 -m bench.gke gke-shape --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
-      --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" > "$OUT/cluster-shape.jsonl"
   log "control plane: regional (${REGION}); every node in ${ZONE}; context ${KCTX}"
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
       --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES
   run "${K[@]}" version
+  # the run's record of the cluster's shape (runs 14-16: zonal control plane;
+  # 17+: regional), READ BACK from GKE after create (#899 F1): where the control
+  # plane is, where the nodes are and how many — not what the spec asked for.
+  # A describe that does not answer records the shape as unknown (never the
+  # spec); a dry run records the spec, marked as such.
+  local shape_msg
+  shape_msg="$(python3 -m bench.gke gke-shape --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
+      --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES 2>&1 >"$OUT/cluster-shape.jsonl")"
+  log "$shape_msg"
 }
 s_install() {
   cat > "$OUT/installer-values.yaml" <<EOF
@@ -681,17 +694,20 @@ kwait() {
 api_answers() { "${K[@]}" --request-timeout=30s get --raw=/readyz >/dev/null 2>&1; }
 KERR="$OUT/.kubectl-last-error"
 # kerr_line: kubectl's first error line, for the log and collect's record —
-# with every identity redacted first (a GKE Forbidden names the operator's
-# account; never logged, never recorded): 'User "…"', 'users "…"', whatever
-# follows "authenticated as" (an e-mail, a numeric id,
-# system:serviceaccount:…), and any e-mail address. A closing ")" or ","
-# stays.
+# every identity redacted first by bench/identity.py, the bench's ONE identity
+# redaction (bench.gke's error summary uses it too): 'User "…"', 'users "…"',
+# whatever follows "authenticated as" (an e-mail, a numeric id,
+# system:serviceaccount:…), any e-mail address. A redactor that does not run
+# withholds the line: it is never logged unredacted.
 kerr_line() {
-  head -1 "$KERR" 2>/dev/null \
-    | sed -E 's/User "[^"]*"/User "<redacted>"/g; s/users "[^"]*"/users "<redacted>"/g;
-              s/authenticated as:? [^)[:space:],]+/authenticated as <redacted>/g;
-              s/[^[:space:]"'"'"'(),]+@[^[:space:]"'"'"'(),]+/<redacted>/g' \
-    | cut -c1-300
+  local line out
+  line="$(head -1 "$KERR" 2>/dev/null)" || true
+  [[ -n "$line" ]] || return 0
+  if out="$(printf '%s\n' "$line" | python3 "${HERE:-.}/bench/identity.py" 2>/dev/null)"; then
+    printf '%s\n' "${out:0:300}"
+  else
+    echo "<kubectl's error withheld: the identity redactor did not run>"
+  fi
 }
 # local_error: kubectl failed BEFORE reaching any API server — its own
 # client-side configuration: an unknown flag or command, a kubeconfig that

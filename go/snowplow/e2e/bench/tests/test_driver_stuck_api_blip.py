@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
+import sys
 import time
 
 import pytest
@@ -219,14 +221,74 @@ def test_the_outage_end_edge_on_the_driver_pod_listing_is_waited_out(harness):  
     ("error: see (x@y.z), then", "error: see (<redacted>), then"),
 ])
 def test_kerr_line_redacts_users(tmp_path, line, want):
+    assert kerr_line(tmp_path, line) == want
+
+
+def kerr_line(tmp_path, line, here=None):
+    """run606.sh's kerr_line, run on one kubectl error line (HERE: the bench dir)."""
     src = (BENCH_DIR / "run606.sh").read_text()
     fn = src[src.index("kerr_line() {"):]
     fn = fn[:fn.index("\n}\n") + 3]
     kerr = tmp_path / "kerr"
     kerr.write_text(line + "\n")
-    p = subprocess.run(["bash", "-c", fn + "\nkerr_line"], env={"KERR": str(kerr), "PATH": "/usr/bin:/bin"},
-                       capture_output=True, text=True)
-    assert p.stdout.strip() == want
+    env = {"KERR": str(kerr), "HERE": str(here or BENCH_DIR),
+           "PATH": f"{os.path.dirname(sys.executable)}:/usr/bin:/bin"}
+    p = subprocess.run(["bash", "-c", fn + "\nkerr_line"], env=env, capture_output=True, text=True)
+    return p.stdout.rstrip("\n")
+
+
+# The #900 re-reviewer's sample lines (scratchpad/classify2.sh): ONE identity
+# redaction (bench/identity.py) behind run606's kerr_line and bench.gke's
+# error_summary — both paths give the same, identity-free answer.
+CLASSIFY2 = [
+    'Error from server (InternalError): an error on the server ("") has prevented the request from succeeding',
+    "Error from server (ServiceUnavailable): the server is currently unable to handle the request",
+    "Error from server (TooManyRequests): the server has received too many requests and has asked us to try "
+    "again later",
+    "Error from server (Timeout): the server was unable to return a response in the time allotted",
+    "Error from server: etcdserver: request timed out",
+    "Unable to connect to the server: net/http: TLS handshake timeout",
+    "Unable to connect to the server: EOF",
+    "error: unknown flag: --request-timeoutt",
+    'error: error loading config file "/tmp/x/kubeconfig": open /tmp/x/kubeconfig: no such file or directory',
+    'error: context "gke_p_z_c" does not exist',
+    "The connection to the server localhost:8080 was refused - did you specify the right host or port?",
+    "error: You must be logged in to the server (Unauthorized)",
+    'Error from server (NotFound): jobs.batch "k6load" not found',
+    'Error from server (Forbidden): jobs.batch "k6load" is forbidden: User "someone@example.com" cannot get '
+    'resource "jobs" in API group "batch" in the namespace "bench-loadgen"',
+    'Error from server (Forbidden): pods is forbidden: User "system:serviceaccount:ns:sa" cannot list resource '
+    '"pods"',
+    "error: request denied (authenticated as someone@example.com)",
+    "error: request denied (authenticated as: 112233445566778899)",
+    "error: request denied, authenticated as system:serviceaccount:ns:sa",
+    'Error from server (Forbidden): users "alice" is forbidden: User "bob" cannot impersonate resource "users"',
+    # gcloud's real 404 (the account a placeholder)
+    "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: projects/p/"
+    "locations/europe-west4/clusters/c. This command is authenticated as PLACEHOLDER-OPERATOR@example.invalid "
+    "which is the active account specified by the [core/account] property.",
+]
+_IDENTITIES = ("someone@example.com", "system:serviceaccount", "112233445566778899", '"alice"', '"bob"',
+               "PLACEHOLDER-OPERATOR", "@example")
+
+
+@pytest.mark.parametrize("line", CLASSIFY2)
+def test_one_identity_redaction_behind_both_paths(tmp_path, line):
+    from bench import gke, identity
+    assert gke.error_summary is identity.error_summary          # bench.gke has no redaction of its own
+    want = identity.redact_identity(line)[:300]
+    assert kerr_line(tmp_path, line) == want                    # run606's kerr_line: the same function
+    for text in (want, identity.error_summary(line)):
+        assert not any(x in text for x in _IDENTITIES), text
+    src = (BENCH_DIR / "run606.sh").read_text()
+    fn = src[src.index("kerr_line() {"):]
+    assert "sed" not in fn[:fn.index("\n}\n")]                 # no second rule set in the shell
+
+
+def test_a_redactor_that_does_not_run_withholds_the_line(tmp_path):
+    out = kerr_line(tmp_path, 'Error from server (Forbidden): User "someone@example.com" cannot get',
+                    here=tmp_path / "nowhere")
+    assert out == "<kubectl's error withheld: the identity redactor did not run>"
 
 
 def test_answered_error_carries_local_errors_patterns_verbatim():

@@ -1,0 +1,66 @@
+"""The bench's ONE identity redaction for tool error text (#898, #900).
+
+kubectl and gcloud name the operator in their errors: a GKE Forbidden says
+`User "<account>" cannot …`, gcloud's 404 / 503 say "This command is
+authenticated as <account> …". None of it may reach a log, a record or
+verdict.json. Two policies, one place:
+
+- redact_identity(line): kubectl's error line, kept for its meaning
+  (run606.sh kerr_line pipes through this file) with every identity
+  replaced by <redacted>: `User "…"`, `users "…"`, whatever follows
+  "authenticated as" (an e-mail, a numeric id, system:serviceaccount:…) and
+  any e-mail address. A closing ")" or "," stays.
+- error_summary(stderr): a failed gcloud / kubectl call as bench.gke logs
+  and records it — its code only (`ResponseError: code=<n>`, or `Error from
+  server (<Reason>)`), never its free text (#900 B1), and passed through
+  redact_identity all the same.
+
+Imports nothing from bench (bench.gke imports it and must stay free of
+bench.cluster's import-time context guard). As a script:
+`python3 bench/identity.py < lines` redacts each line of stdin.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+
+_RULES = (
+    (re.compile(r'User "[^"]*"'), 'User "<redacted>"'),
+    (re.compile(r'users "[^"]*"'), 'users "<redacted>"'),
+    (re.compile(r"authenticated as:? [^)\s,]+"), "authenticated as <redacted>"),
+    (re.compile(r"""[^\s"'(),]+@[^\s"'(),]+"""), "<redacted>"),
+)
+
+_ERR_CODE = re.compile(r"\bcode=(\d{3})\b")
+_ERR_REASON = re.compile(r"Error from server \(([A-Za-z]+)\)")
+
+
+def redact_identity(line: str) -> str:
+    for rx, rep in _RULES:
+        line = rx.sub(rep, line)
+    return line
+
+
+def error_summary(stderr: str | None) -> str:
+    s = stderr or ""
+    m = _ERR_CODE.search(s)
+    if m:
+        out = f"ResponseError: code={m.group(1)}"
+    elif (m := _ERR_REASON.search(s)):
+        out = f"Error from server ({m.group(1)})"
+    elif s.strip():
+        out = "no error code; the error text is withheld (it may name the account)"
+    else:
+        out = "no error text"
+    return redact_identity(out)
+
+
+def main() -> int:
+    for line in sys.stdin:
+        sys.stdout.write(redact_identity(line.rstrip("\n")) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
