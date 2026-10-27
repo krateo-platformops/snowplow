@@ -459,6 +459,10 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 				args = append(args, reflect.ValueOf(map[string]any{"v": 2}))
 			case pt.Kind() == reflect.Bool:
 				args = append(args, reflect.ValueOf(false))
+			case pt == reflect.TypeOf(PutVerdict{}):
+				// #912 re-review — a verdict-gated write: drive it with a STORING
+				// verdict so the dep-gen check is what decides.
+				args = append(args, reflect.ValueOf(PutGateVerdict(PutGateSinks{}, "arm9")))
 			default:
 				t.Errorf("#375 arm-9: gen-guarded Put %s has a parameter of type %s this enumeration cannot "+
 					"synthesize — extend arm-9 so the new method is DRIVEN, never silently skipped", m.Name, pt)

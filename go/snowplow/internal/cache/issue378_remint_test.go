@@ -241,6 +241,10 @@ func r378SynthArgs(t *testing.T, c *ResolvedCacheStore, m reflect.Method, key st
 			args = append(args, reflect.ValueOf(in))
 		case pt == reflect.TypeOf(map[string]any{}):
 			args = append(args, reflect.ValueOf(map[string]any{"items": []any{map[string]any{"v": "rewrite"}}}))
+		case pt == reflect.TypeOf(PutVerdict{}):
+			// #912 re-review — a verdict-gated write: a STORING verdict, so the
+			// write lands and its re-mint behaviour is what is judged.
+			args = append(args, reflect.ValueOf(PutGateVerdict(PutGateSinks{}, CacheEntryClassRAFullList)))
 		default:
 			t.Errorf("#378 F2c: write method %s has a parameter of type %s this enumeration cannot synthesize — "+
 				"extend it so the method is DRIVEN, never silently skipped", m.Name, pt)
@@ -269,7 +273,10 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	var cells []cell
 	for i := 0; i < st.NumMethod(); i++ {
 		m := st.Method(i)
-		if !(strings.HasPrefix(m.Name, "Put") || strings.HasPrefix(m.Name, "Replace")) || m.Name == "ReplaceIfGenRefresh" {
+		// The refresher terminal's re-mint and its verdict-gated wrapper (#912
+		// re-review) are the one allowed re-mint.
+		if !(strings.HasPrefix(m.Name, "Put") || strings.HasPrefix(m.Name, "Replace")) ||
+			m.Name == "ReplaceIfGenRefresh" || m.Name == "ReplaceResolvedIfGenRefresh" {
 			continue
 		}
 		in := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Namespace: "f2c", Name: m.Name}
