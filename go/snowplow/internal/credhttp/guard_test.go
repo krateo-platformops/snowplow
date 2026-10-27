@@ -13,10 +13,14 @@ package credhttp
 // #920 extends it to the client-side rate limit. Outside this package a
 // *rest.Config may only be copied from one credhttp returned (rest.CopyConfig,
 // *rc), never built from nothing (a rest.Config literal, new(rest.Config), a
-// zero-value variable, field or renamed type), and no code assigns QPS, Burst
-// or RateLimiter: those would bring client-go's limiter back. Inside this
+// zero-value variable, field or renamed type; and, by type, from any function
+// outside this module that returns one: ratelimit_920_typed_guard_test.go),
+// and no code writes to, or takes the address of, QPS, Burst or RateLimiter
+// (limiterWrites): those would bring client-go's limiter back. Inside this
 // package, every function that builds a REST client or a *rest.Config must
-// apply noClientRateLimit (TestIssue920_EveryCredhttpBuilderAppliesNoClientRateLimit).
+// apply noClientRateLimit (TestIssue920_EveryCredhttpBuilderAppliesNoClientRateLimit),
+// and the behavioural test must cover it
+// (TestIssue920_BehaviouralTestCoversEveryCredhttpBuilder).
 
 import (
 	"go/ast"
@@ -102,6 +106,40 @@ func limiterField(name string) bool {
 	return name == "QPS" || name == "Burst" || name == "RateLimiter"
 }
 
+// limiterWrites is the one #920 predicate for "this code can change a
+// client-side rate limit": every field named QPS, Burst or RateLimiter that n
+// writes to or takes the address of. That is an assignment's left side (=,
+// :=, +=, ...), the operand of ++ or --, and the operand of & (an address
+// lets a later write through the pointer escape every other shape).
+// Parentheses are looked through.
+func limiterWrites(n ast.Node) []*ast.SelectorExpr {
+	var targets []ast.Expr
+	switch x := n.(type) {
+	case *ast.AssignStmt:
+		targets = x.Lhs
+	case *ast.IncDecStmt:
+		targets = []ast.Expr{x.X}
+	case *ast.UnaryExpr:
+		if x.Op == token.AND {
+			targets = []ast.Expr{x.X}
+		}
+	}
+	var out []*ast.SelectorExpr
+	for _, e := range targets {
+		for {
+			p, ok := e.(*ast.ParenExpr)
+			if !ok {
+				break
+			}
+			e = p.X
+		}
+		if sel, ok := e.(*ast.SelectorExpr); ok && limiterField(sel.Sel.Name) {
+			out = append(out, sel)
+		}
+	}
+	return out
+}
+
 // allowed: (module-relative file, enclosing func, reference) → reason.
 // "http.Client{}" stands for a composite literal of net/http.Client.
 var allowed = map[[3]string]string{
@@ -150,6 +188,12 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 				fn = fd.Name.Name
 			}
 		}
+		// #920: writing to (or taking the address of) QPS, Burst or
+		// RateLimiter puts a client-side limiter back on a config credhttp
+		// cleared.
+		for _, sel := range limiterWrites(n) {
+			out = append(out, ref{rel, fn, "write ." + sel.Sel.Name, fset.Position(sel.Pos())})
+		}
 		switch x := n.(type) {
 		case *ast.CallExpr:
 			// #729: new(http.Client) / new(http.Transport) is a zero-value client.
@@ -174,14 +218,6 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 			// type, so new(C), `var c C` and C{} would escape every shape above.
 			if name, ok := httpClientType(x.Type, imports); ok {
 				out = append(out, ref{rel, fn, "type " + name, fset.Position(x.Pos())})
-			}
-		case *ast.AssignStmt:
-			// #920: assigning QPS, Burst or RateLimiter puts a client-side
-			// limiter back on a config credhttp cleared.
-			for _, lhs := range x.Lhs {
-				if sel, ok := lhs.(*ast.SelectorExpr); ok && limiterField(sel.Sel.Name) {
-					out = append(out, ref{rel, fn, "assign ." + sel.Sel.Name, fset.Position(lhs.Pos())})
-				}
 			}
 		case *ast.SelectorExpr:
 			id, ok := x.X.(*ast.Ident)
@@ -345,6 +381,12 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 		"burst":             `func f(rc *x) { rc.Burst = 100 }`,
 		"rateLimiter":       `func f(rc *x) { rc.RateLimiter = nil }`,
 		"qpsMulti":          `func f(rc *x) { rc.Host, rc.QPS = "h", 50 }`,
+		"qpsCompound":       `func f(rc *x) { rc.QPS += 6 }`,
+		"incQPS":            `func f(rc *x) { rc.QPS++ }`,
+		"decBurst":          `func f(rc *x) { rc.Burst-- }`,
+		"addrOfQPS":         `func f(rc *x) { p := &rc.QPS; *p = 5 }`,
+		"addrOfLimiter":     `func f(rc *x) { set(&rc.RateLimiter) }`,
+		"parenQPS":          `func f(rc *x) { (rc.QPS)++ }`,
 	}
 	for name, body := range cases {
 		fset := token.NewFileSet()
@@ -379,4 +421,9 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 	if got := scanFile(fset, f, "x.go"); len(got) != 0 {
 		t.Errorf("hardened literal flagged: %v", got)
 	}
+	// #920 — a *rest.Config from a third-party source is judged by TYPE
+	// (ratelimit_920_typed_guard_test.go): clientcmd.RESTConfigFromKubeConfig
+	// and every other function returning a rest.Config, called or taken as a
+	// value.
+	typedShapeCases(t)
 }

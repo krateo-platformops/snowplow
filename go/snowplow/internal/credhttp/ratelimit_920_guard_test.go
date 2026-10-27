@@ -2,12 +2,14 @@ package credhttp
 
 // ratelimit_920_guard_test.go — #920 structural gate, the in-package half.
 // guard_test.go keeps every client and every *rest.Config inside this package
-// (and, for #920, refuses a rest.Config built from nothing or a QPS / Burst /
-// RateLimiter assignment anywhere else). This file checks the inside: every
-// function here that builds a REST client or a *rest.Config applies
-// noClientRateLimit, directly or through a function of this package that does
-// (Harden). A builder added without it, or the call dropped from one (or from
-// Harden), turns this RED.
+// (and, for #920, refuses a rest.Config built from nothing, or a write to or
+// address of QPS / Burst / RateLimiter, anywhere else). This file checks the
+// inside: every function here that builds a REST client or a *rest.Config
+// applies noClientRateLimit, directly or through a function of this package
+// that does (Harden). A builder added without it, or the call dropped from one
+// (or from Harden), turns this RED. Because a call is not proof that the
+// result is used, every exported builder must also be covered by the
+// behavioural limiter read (TestIssue920_BehaviouralTestCoversEveryCredhttpBuilder).
 
 import (
 	"go/ast"
@@ -52,8 +54,45 @@ func buildsRESTClientOrConfig(pkgPath, name string) bool {
 const noLimitHelper = "noClientRateLimit"
 
 type builderFn struct {
-	builds string          // the first REST-client/config builder it references
-	calls  map[string]bool // package-local functions (or func vars) it calls
+	builds   string          // the first REST-client/config builder it references
+	calls    map[string]bool // package-local functions (or func vars) it calls
+	returns  string          // "client", "config" or "": what its declared results carry
+	exported bool
+}
+
+// resultKind classifies a declared result type: "config" for rest.Config,
+// "client" for any other type from a client-go or apiextensions client package
+// (a REST client, a clientset, a dynamic, metadata or discovery client, a
+// rest.Interface), "" otherwise (an *http.Client has no rate limiter).
+func resultKind(e ast.Expr, imports map[string]string) string {
+	for {
+		switch x := e.(type) {
+		case *ast.StarExpr:
+			e = x.X
+			continue
+		case *ast.ParenExpr:
+			e = x.X
+			continue
+		}
+		break
+	}
+	sel, ok := e.(*ast.SelectorExpr)
+	if !ok {
+		return ""
+	}
+	id, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	p := imports[id.Name]
+	switch {
+	case p == "k8s.io/client-go/rest" && sel.Sel.Name == "Config":
+		return "config"
+	case strings.HasPrefix(p, "k8s.io/client-go/"),
+		strings.HasPrefix(p, "k8s.io/apiextensions-apiserver/pkg/client/"):
+		return "client"
+	}
+	return ""
 }
 
 // scanBuilders parses the non-test files of dir and returns every top-level
@@ -109,7 +148,19 @@ func scanBuilders(t *testing.T, fset *token.FileSet, files map[string]string) ma
 				if d.Recv != nil || d.Body == nil {
 					continue
 				}
-				fi := &builderFn{calls: map[string]bool{}}
+				fi := &builderFn{calls: map[string]bool{}, exported: d.Name.IsExported()}
+				if d.Type.Results != nil {
+					for _, r := range d.Type.Results.List {
+						switch resultKind(r.Type, imports) {
+						case "client":
+							fi.returns = "client"
+						case "config":
+							if fi.returns == "" {
+								fi.returns = "config"
+							}
+						}
+					}
+				}
 				ast.Inspect(d.Body, func(n ast.Node) bool {
 					if b := builder(n); b != "" && fi.builds == "" {
 						fi.builds = b
@@ -287,6 +338,67 @@ func TestIssue920_BuilderGateDetectsEveryShape(t *testing.T) {
 		bad, _ := builderViolations(fns)
 		if got := len(bad) > 0; got != c.wantBad {
 			t.Errorf("%s: flagged=%v, want %v (%v)", name, got, c.wantBad, bad)
+		}
+	}
+}
+
+// #920 F2: the behavioural test (ratelimit_920_test.go) reads the limiter of
+// every client built by clientBuilders, from every config in configSources.
+// Its coverage is derived from the same scan, not maintained by hand: every
+// exported credhttp function whose declared results carry a REST client must
+// be in clientBuilders, and every one that returns a *rest.Config must be in
+// configSources. A builder that applies noClientRateLimit to a copy it never
+// uses passes the call-graph gate above; it cannot pass the limiter read.
+func TestIssue920_BehaviouralTestCoversEveryCredhttpBuilder(t *testing.T) {
+	dir := filepath.Join(moduleRoot(t), "internal", "credhttp")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{}
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[filepath.Join(dir, e.Name())] = string(b)
+	}
+	fns := scanBuilders(t, token.NewFileSet(), files)
+	configs := configSources(t)
+	var clients, cfgs []string
+	for name, fi := range fns {
+		if !fi.exported {
+			continue
+		}
+		switch fi.returns {
+		case "client":
+			clients = append(clients, name)
+			if _, ok := clientBuilders[name]; !ok {
+				t.Errorf("credhttp.%s returns a REST client but is not in clientBuilders: no test reads its limiter (#920)", name)
+			}
+		case "config":
+			cfgs = append(cfgs, name)
+			if _, ok := configs[name]; !ok {
+				t.Errorf("credhttp.%s returns a *rest.Config but is not in configSources: no test reads the limiter of clients built from it (#920)", name)
+			}
+		}
+	}
+	sort.Strings(clients)
+	sort.Strings(cfgs)
+	// Non-vacuity: the classification finds the builders known today.
+	if got, want := strings.Join(clients, ","), "APIExtensions,Discovery,Dynamic,Kubernetes,Metadata,RESTClient"; got != want {
+		t.Errorf("client builders classified %q, want %q", got, want)
+	}
+	if got, want := strings.Join(cfgs, ","), "Harden,InClusterConfig,NewClientConfig"; got != want {
+		t.Errorf("config builders classified %q, want %q", got, want)
+	}
+	// And the reverse: no stale entry in clientBuilders.
+	for name := range clientBuilders {
+		if fi, ok := fns[name]; !ok || fi.returns != "client" {
+			t.Errorf("clientBuilders has %s, which is not an exported credhttp client builder", name)
 		}
 	}
 }
