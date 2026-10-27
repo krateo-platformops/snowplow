@@ -168,6 +168,19 @@ func NewClientConfig(ctx context.Context, ep endpoints.Endpoint) (*rest.Config, 
 	return Harden(rc), nil
 }
 
+// FromSecret is plumbing's endpoints.FromSecret over a hardened copy of rc.
+// FromSecret builds its own REST client from the config it is given (one per
+// call), so this is where that client gets both #723's redirect refusal and
+// #920's absence of a client-side rate limit, whatever config the caller holds.
+// The caller's rc is not changed. Errors are plumbing's, unwrapped, so callers
+// keep telling a NotFound from any other failure.
+func FromSecret(ctx context.Context, rc *rest.Config, name, namespace string) (endpoints.Endpoint, error) {
+	if rc != nil {
+		rc = Harden(rest.CopyConfig(rc))
+	}
+	return endpoints.FromSecret(ctx, rc, name, namespace)
+}
+
 // HTTPClientFor is rest.HTTPClientFor with both layers applied.
 func HTTPClientFor(rc *rest.Config) (*http.Client, error) {
 	hc, err := rest.HTTPClientFor(rc)

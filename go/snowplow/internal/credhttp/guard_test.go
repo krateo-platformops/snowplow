@@ -66,6 +66,10 @@ func forbidden(pkgPath, name string) bool {
 		return name == "HTTPClientForEndpoint" || name == "Do"
 	case "github.com/krateo-platformops/plumbing/kubeconfig":
 		return name == "NewClientConfig"
+	case "github.com/krateo-platformops/plumbing/endpoints":
+		// #920: FromSecret builds its own REST client from the config it is
+		// given; credhttp.FromSecret hands it a hardened copy.
+		return name == "FromSecret"
 	case "net/http":
 		switch name {
 		case "DefaultClient", "DefaultTransport", "Get", "Head", "Post", "PostForm":
@@ -334,32 +338,34 @@ func TestIssue723_724_NoCredentialedClientBypassesCredhttp(t *testing.T) {
 // The guard must bite on every shape it claims to catch.
 func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 	cases := map[string]string{
-		"dynamic":    `import "k8s.io/client-go/dynamic"; func f() { dynamic.NewForConfig(nil) }`,
-		"aliased":    `import k8sdynamic "k8s.io/client-go/dynamic"; func f() { k8sdynamic.NewForConfigAndClient(nil, nil) }`,
-		"kubernetes": `import "k8s.io/client-go/kubernetes"; func f() { kubernetes.NewForConfig(nil) }`,
-		"typed":      `import authv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"; func f() { authv1.NewForConfig(nil) }`,
-		"discovery":  `import "k8s.io/client-go/discovery"; func f() { discovery.NewDiscoveryClientForConfig(nil) }`,
-		"metadata":   `import "k8s.io/client-go/metadata"; func f() { metadata.NewForConfig(nil) }`,
-		"incluster":  `import "k8s.io/client-go/rest"; var x = rest.InClusterConfig`,
-		"restclient": `import "k8s.io/client-go/rest"; func f() { rest.RESTClientFor(nil) }`,
-		"httpclient": `import "k8s.io/client-go/rest"; func f() { rest.HTTPClientFor(nil) }`,
-		"transport":  `import "k8s.io/client-go/transport"; func f() { transport.New(nil) }`,
-		"plumbing":   `import "github.com/krateo-platformops/plumbing/http/request"; func f() { request.HTTPClientForEndpoint(nil, nil) }`,
-		"kubeconfig": `import "github.com/krateo-platformops/plumbing/kubeconfig"; func f() { kubeconfig.NewClientConfig(nil, x) }`,
-		"literal":    `import "net/http"; var c = &http.Client{}`,
-		"transportL": `import "net/http"; var c = &http.Transport{}`,
-		"default":    `import "net/http"; var c = http.DefaultClient`,
-		"defaultRT":  `import "net/http"; var rt = http.DefaultTransport`,
-		"newClient":  `import "net/http"; var c = new(http.Client)`,
-		"newRT":      `import "net/http"; var c = new(http.Transport)`,
-		"zeroVar":    `import "net/http"; func f() { var c http.Client; _ = c }`,
-		"zeroField":  `import "net/http"; type T struct{ c http.Client }`,
-		"aliasedNet": `import nh "net/http"; var c nh.Client`,
-		"zeroParam":  `import "net/http"; func f(c http.Client) {}`,
-		"embedded":   `import "net/http"; type T struct{ http.Client }`,
-		"typeDef":    `import "net/http"; type C http.Client`,
-		"typeAlias":  `import "net/http"; type C = http.Transport`,
-		"apiext":     `import apiext "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"; func f() { apiext.NewForConfig(nil) }`,
+		"dynamic":     `import "k8s.io/client-go/dynamic"; func f() { dynamic.NewForConfig(nil) }`,
+		"aliased":     `import k8sdynamic "k8s.io/client-go/dynamic"; func f() { k8sdynamic.NewForConfigAndClient(nil, nil) }`,
+		"kubernetes":  `import "k8s.io/client-go/kubernetes"; func f() { kubernetes.NewForConfig(nil) }`,
+		"typed":       `import authv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"; func f() { authv1.NewForConfig(nil) }`,
+		"discovery":   `import "k8s.io/client-go/discovery"; func f() { discovery.NewDiscoveryClientForConfig(nil) }`,
+		"metadata":    `import "k8s.io/client-go/metadata"; func f() { metadata.NewForConfig(nil) }`,
+		"incluster":   `import "k8s.io/client-go/rest"; var x = rest.InClusterConfig`,
+		"restclient":  `import "k8s.io/client-go/rest"; func f() { rest.RESTClientFor(nil) }`,
+		"httpclient":  `import "k8s.io/client-go/rest"; func f() { rest.HTTPClientFor(nil) }`,
+		"transport":   `import "k8s.io/client-go/transport"; func f() { transport.New(nil) }`,
+		"plumbing":    `import "github.com/krateo-platformops/plumbing/http/request"; func f() { request.HTTPClientForEndpoint(nil, nil) }`,
+		"kubeconfig":  `import "github.com/krateo-platformops/plumbing/kubeconfig"; func f() { kubeconfig.NewClientConfig(nil, x) }`,
+		"fromSecret":  `import "github.com/krateo-platformops/plumbing/endpoints"; func f() { endpoints.FromSecret(nil, nil, "s", "n") }`,
+		"fromSecretV": `import "github.com/krateo-platformops/plumbing/endpoints"; var f = endpoints.FromSecret`,
+		"literal":     `import "net/http"; var c = &http.Client{}`,
+		"transportL":  `import "net/http"; var c = &http.Transport{}`,
+		"default":     `import "net/http"; var c = http.DefaultClient`,
+		"defaultRT":   `import "net/http"; var rt = http.DefaultTransport`,
+		"newClient":   `import "net/http"; var c = new(http.Client)`,
+		"newRT":       `import "net/http"; var c = new(http.Transport)`,
+		"zeroVar":     `import "net/http"; func f() { var c http.Client; _ = c }`,
+		"zeroField":   `import "net/http"; type T struct{ c http.Client }`,
+		"aliasedNet":  `import nh "net/http"; var c nh.Client`,
+		"zeroParam":   `import "net/http"; func f(c http.Client) {}`,
+		"embedded":    `import "net/http"; type T struct{ http.Client }`,
+		"typeDef":     `import "net/http"; type C http.Client`,
+		"typeAlias":   `import "net/http"; type C = http.Transport`,
+		"apiext":      `import apiext "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"; func f() { apiext.NewForConfig(nil) }`,
 		// #735 — a dot import hides every selector; it is refused outright.
 		"dotHTTP":     `import . "net/http"; var c = &Client{}`,
 		"dotClientGo": `import . "k8s.io/client-go/dynamic"; func f() { NewForConfig(nil) }`,

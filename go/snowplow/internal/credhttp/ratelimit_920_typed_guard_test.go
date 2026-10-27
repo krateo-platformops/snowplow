@@ -2,39 +2,48 @@ package credhttp
 
 // ratelimit_920_typed_guard_test.go — #920 structural gate, the typed half.
 //
-// A *rest.Config built from nothing never had noClientRateLimit applied, so
-// every client built from it gets client-go's 5/s limiter (and #723's
-// redirect refusal is missing). Outside credhttp, a config may only be one
-// credhttp returned, a pointer to it, or a copy of it (rest.CopyConfig, *rc).
-// Three TYPED rules enforce that, over every non-test file of the module
+// The guarantee: every client built from a *rest.Config is built by
+// credhttp, and every credhttp builder applies noClientRateLimit to whatever
+// config it is handed (proven per builder by the behavioural test). Then where
+// a config came from does not matter. Rule 4 is what makes that hold. Rules
+// 1-3 refuse configs built from nothing, as defence in depth: a config built
+// that way never had noClientRateLimit applied (nor #723's redirect refusal).
+// They cannot see every allocation. Reflection and decoders can make one
+// through a pointer-typed path (reflect.New over a *rest.Config's Elem,
+// json.Unmarshal into a struct with a *rest.Config field), and a module
+// function CAN create a config that way. Rule 4 makes such a config harmless:
+// nothing outside credhttp can turn it into a client.
+//
+// All four rules are TYPED. They run over every non-test file of the module
 // outside credhttp, under every build-tag set the module uses:
 //
 //  1. BY VALUE. No type expression and no generic type argument (inferred or
 //     explicit) may contain a rest.Config by value: restConfigIn without the
-//     pointer step. A rest.Config can only come into being as a value of its
-//     own type (a literal, new, make, a variable, an array or map element, a
-//     field, a conversion, a generic that makes a T, reflect.TypeFor[T]), so
-//     this one rule covers every shape that would otherwise be listed one by
-//     one. *rest.Config and a *rc dereference stay legal. A composite literal
-//     whose type is elided (the {..} inside []*rest.Config{{..}}) is judged by
-//     its own type, since it has no type expression to look at.
+//     pointer step. This covers a literal, new, make, a variable, an array or
+//     map element, a field, a conversion, a generic that makes a T, and
+//     reflect.TypeFor[T]. *rest.Config and a *rc dereference stay legal. A
+//     composite literal whose type is elided (the {..} inside
+//     []*rest.Config{{..}}) is judged by its own type.
 //  2. NO ADDRESS OF A CONFIG POINTER. &x, where x is a *rest.Config (or
-//     reaches one through slices, arrays, maps or pointers), is how a decoder
-//     or reflection allocates a config: json.Unmarshal(b, &rc).
+//     reaches one through slices, arrays, maps or pointers): json.Unmarshal(b,
+//     &rc).
 //  3. NO THIRD-PARTY SOURCE. No reference to a function, or a function-typed
 //     variable or field, defined outside this module whose declared results
-//     are or contain a rest.Config, except rest.CopyConfig. That covers
+//     are or contain a rest.Config, except rest.CopyConfig:
 //     clientcmd.RESTConfigFromKubeConfig, clientcmd's ClientConfig method,
-//     rest.AnonymousClientConfig, dynamic.ConfigFor and plumbing's
-//     kubeconfig.NewClientConfig by what they return, whether called or taken
-//     as a value. A generic is judged by what its OWN code declares (its
-//     origin): a result that is a config only through a type parameter is the
-//     caller's value (atomic.Pointer[T].Load), and if the type argument holds
-//     a config by value, rule 1 already refuses the instantiation
-//     (reflect.TypeFor[rest.Config], New[rest.Config]()).
+//     rest.AnonymousClientConfig, dynamic.ConfigFor, plumbing's
+//     kubeconfig.NewClientConfig, called or taken as a value.
+//  4. NO THIRD-PARTY CONSUMER. No reference to a function, or a
+//     function-typed variable or field, defined outside this module whose
+//     declared parameters or receiver contain a rest.Config (through pointers
+//     and struct fields), except rest.CopyConfig. Only credhttp turns a config
+//     into a client: client-go's constructors, plumbing's endpoints.FromSecret
+//     (use credhttp.FromSecret) and methods on rest.Config itself are refused.
 //
-// Functions defined in this module may hand on a *rest.Config: under these
-// rules none of them can create one.
+// Rules 3 and 4 judge a generic by what its OWN code declares (its origin): a
+// parameter or result that is a config only through a type parameter is the
+// caller's value (atomic.Pointer[T].Store / Load), and an instantiation whose
+// type argument holds a config by value is refused by rule 1.
 
 import (
 	"bufio"
@@ -155,6 +164,28 @@ func returnsRESTConfig(obj types.Object) bool {
 	return ok && restConfigIn(sig.Results())
 }
 
+// consumesRESTConfig reports whether obj is a function, or a function-typed
+// variable or field, whose OWN declared parameters or receiver (its generic
+// origin) are or contain rest.Config.
+func consumesRESTConfig(obj types.Object) bool {
+	switch o := obj.(type) {
+	case *types.Func:
+		obj = o.Origin()
+	case *types.Var:
+		obj = o.Origin()
+	default:
+		return false
+	}
+	sig, ok := obj.Type().Underlying().(*types.Signature)
+	if !ok {
+		return false
+	}
+	if r := sig.Recv(); r != nil && restConfigIn(r.Type()) {
+		return true
+	}
+	return restConfigIn(sig.Params())
+}
+
 type typedHit struct {
 	pos  string // file:line:col
 	fn   string // enclosing top-level declaration
@@ -224,14 +255,21 @@ func typedConfigSources(pkgs []*packages.Package, modulePath string) (hits []typ
 								}
 							}
 						}
-						// Rule 3.
+						// Rules 3 and 4: an object defined outside this module.
 						if obj := info.Uses[x]; obj != nil && obj.Pkg() != nil {
 							path := obj.Pkg().Path()
-							if path != modulePath && !strings.HasPrefix(path, modulePath+"/") && returnsRESTConfig(obj) {
-								if path == restPkg && obj.Name() == "CopyConfig" {
-									allowedSeen++
-								} else {
-									add(p, x.Pos(), encl, obj.Pkg().Name()+"."+obj.Name()+" returns a *rest.Config built outside internal/credhttp")
+							if path != modulePath && !strings.HasPrefix(path, modulePath+"/") {
+								isCopy := path == restPkg && obj.Name() == "CopyConfig"
+								name := obj.Pkg().Name() + "." + obj.Name()
+								if returnsRESTConfig(obj) {
+									if isCopy {
+										allowedSeen++
+									} else {
+										add(p, x.Pos(), encl, name+" returns a *rest.Config built outside internal/credhttp")
+									}
+								}
+								if consumesRESTConfig(obj) && !isCopy {
+									add(p, x.Pos(), encl, name+" takes a *rest.Config: only internal/credhttp turns a config into a client")
 								}
 							}
 						}
@@ -410,14 +448,15 @@ func TestIssue920_NoRESTConfigFromOutsideTheModuleOutsideCredhttp(t *testing.T) 
 	if len(pkgs) < 20 {
 		t.Fatalf("NON-VACUITY: only %d packages loaded", len(pkgs))
 	}
-	// F6 non-vacuity: each way of covering a file is exercised today. The
+	// F6 non-vacuity: each way of TYPE-CHECKING a file is exercised today. The
 	// *_baseline.go files compile only under rbac_narrow_baseline, and
-	// scripts/lint's programs only on their own.
+	// scripts/lint's programs only on their own. "imports-only" is not
+	// required: it only accepts files, so its absence is no defect (F8).
 	byHow := map[string]int{}
 	for _, how := range covered {
 		byHow[how]++
 	}
-	for _, how := range []string{"tags:0", "tags:1", "standalone", "imports-only"} {
+	for _, how := range []string{"tags:0", "tags:1", "standalone"} {
 		if byHow[how] == 0 {
 			t.Errorf("NON-VACUITY: no non-test file was type-checked as %q (coverage %v)", how, byHow)
 		}
@@ -449,6 +488,7 @@ import (
 	"github.com/krateo-platformops/plumbing/kubeconfig"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	k8srest "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -515,6 +555,55 @@ func badDecode(b []byte) *rest.Config { var rc *rest.Config; _ = json.Unmarshal(
 
 func badDecodeSlice(b []byte) []*rest.Config { var rcs []*rest.Config; _ = json.Unmarshal(b, &rcs); return rcs }
 
+// Rule 4: a third-party consumer of a config.
+func badConsumerFromSecret(rc *rest.Config) { _, _ = endpoints.FromSecret(context.Background(), rc, "s", "n") }
+
+var badConsumerValue = endpoints.FromSecret
+
+func badConsumerClientset(rc *rest.Config) { _, _ = kubernetes.NewForConfig(rc) }
+
+func badConsumerMethod(rc *rest.Config) { rc.Wrap(nil) }
+
+// H6-H9: reflection and decoders allocate a config through a pointer-typed
+// path that rules 1-3 do not see. Handing it to a third party is refused
+// (rule 4); handing it to credhttp is allowed, because credhttp applies
+// noClientRateLimit to whatever it is given (the okH* twins).
+func h6() *rest.Config {
+	return reflect.New(reflect.TypeFor[*rest.Config]().Elem()).Interface().(*rest.Config)
+}
+
+func h7() *rest.Config {
+	return reflect.New(reflect.TypeOf((*rest.Config)(nil)).Elem()).Interface().(*rest.Config)
+}
+
+func h8(b []byte) *rest.Config {
+	var s struct{ RC *rest.Config }
+	_ = json.Unmarshal(b, &s)
+	return s.RC
+}
+
+func h9() *rest.Config {
+	return reflect.New(reflect.TypeOf(rest.CopyConfig).Out(0).Elem()).Interface().(*rest.Config)
+}
+
+func badH6Consumed() { _, _ = endpoints.FromSecret(context.Background(), h6(), "s", "n") }
+
+func badH7Consumed() { _, _ = kubernetes.NewForConfig(h7()) }
+
+func badH8Consumed(b []byte) { _, _ = endpoints.FromSecret(context.Background(), h8(b), "s", "n") }
+
+func badH9Consumed() { _, _ = dynamic.NewForConfig(h9()) }
+
+func okH6ToCredhttp() { _, _ = credhttp.FromSecret(context.Background(), h6(), "s", "n") }
+
+func okH7ToCredhttp() { _, _ = credhttp.Kubernetes(h7()) }
+
+func okH8ToCredhttp(b []byte) { _, _ = credhttp.FromSecret(context.Background(), h8(b), "s", "n") }
+
+func okH9ToCredhttp() { _, _ = credhttp.Dynamic(h9()) }
+
+func okAtomicStore(p *atomic.Pointer[holder]) { p.Store(&holder{}) }
+
 // Allowed.
 func okCopyConfig(rc *rest.Config) *rest.Config { return rest.CopyConfig(rc) }
 
@@ -577,8 +666,9 @@ func typedShapeCases(t *testing.T) {
 	if nBad < 25 {
 		t.Errorf("fixture scope lists only %d bad* cases; the fixture did not load whole", nBad)
 	}
-	if copies != 1 {
-		t.Errorf("typed guard counted %d rest.CopyConfig references in the fixture, want 1", copies)
+	// okCopyConfig calls it; h9 takes it as a value.
+	if copies != 2 {
+		t.Errorf("typed guard counted %d rest.CopyConfig references in the fixture, want 2", copies)
 	}
 	for name, want := range map[string][2]bool{
 		// name: {restConfigIn, restConfigByValue}

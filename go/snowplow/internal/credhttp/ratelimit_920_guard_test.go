@@ -47,6 +47,8 @@ func buildsRESTClientOrConfig(pkgPath, name string) bool {
 		return strings.Contains(name, "ClientConfig") || strings.HasPrefix(name, "BuildConfig")
 	case "github.com/krateo-platformops/plumbing/kubeconfig":
 		return name == "NewClientConfig"
+	case "github.com/krateo-platformops/plumbing/endpoints":
+		return name == "FromSecret" // builds its own REST client from the config
 	}
 	return false
 }
@@ -323,15 +325,17 @@ func TestIssue920_BuilderGateDetectsEveryShape(t *testing.T) {
 		src     string
 		wantBad bool
 	}{
-		"direct":          {"package credhttp\nimport \"k8s.io/client-go/dynamic\"\nfunc D(rc *rest.Config) { cfg := dynamic.ConfigFor(rc); noClientRateLimit(cfg); dynamic.NewForConfigAndClient(cfg, nil) }\n", false},
-		"missing":         {"package credhttp\nimport \"k8s.io/client-go/dynamic\"\nfunc D(rc *rest.Config) { dynamic.NewForConfigAndClient(rc, nil) }\n", true},
-		"viaHarden":       {"package credhttp\nimport \"k8s.io/client-go/rest\"\nfunc Harden(rc *rest.Config) *rest.Config { noClientRateLimit(rc); return rc }\nfunc I() { rc, _ := rest.InClusterConfig(); Harden(rc) }\n", false},
-		"hardenDropped":   {"package credhttp\nimport \"k8s.io/client-go/rest\"\nfunc Harden(rc *rest.Config) *rest.Config { return rc }\nfunc I() { rc, _ := rest.InClusterConfig(); Harden(rc) }\n", true},
-		"seamVar":         {"package credhttp\nimport \"k8s.io/client-go/rest\"\nvar src = rest.InClusterConfig\nfunc I() { src() }\n", true},
-		"aliasedClientGo": {"package credhttp\nimport k \"k8s.io/client-go/kubernetes\"\nfunc K(rc *rest.Config) { k.NewForConfigAndClient(rc, nil) }\n", true},
-		"restClient":      {"package credhttp\nimport \"k8s.io/client-go/rest\"\nfunc R(rc *rest.Config) { rest.RESTClientForConfigAndClient(rc, nil) }\n", true},
-		"kubeconfig":      {"package credhttp\nimport \"github.com/krateo-platformops/plumbing/kubeconfig\"\nfunc N() { kubeconfig.NewClientConfig(nil, x) }\n", true},
-		"httpOnly":        {"package credhttp\nimport \"k8s.io/client-go/rest\"\nfunc H(rc *rest.Config) { rest.HTTPClientFor(rc) }\n", false},
+		"direct":           {"package credhttp\nimport \"k8s.io/client-go/dynamic\"\nfunc D(rc *rest.Config) { cfg := dynamic.ConfigFor(rc); noClientRateLimit(cfg); dynamic.NewForConfigAndClient(cfg, nil) }\n", false},
+		"missing":          {"package credhttp\nimport \"k8s.io/client-go/dynamic\"\nfunc D(rc *rest.Config) { dynamic.NewForConfigAndClient(rc, nil) }\n", true},
+		"viaHarden":        {"package credhttp\nimport \"k8s.io/client-go/rest\"\nfunc Harden(rc *rest.Config) *rest.Config { noClientRateLimit(rc); return rc }\nfunc I() { rc, _ := rest.InClusterConfig(); Harden(rc) }\n", false},
+		"hardenDropped":    {"package credhttp\nimport \"k8s.io/client-go/rest\"\nfunc Harden(rc *rest.Config) *rest.Config { return rc }\nfunc I() { rc, _ := rest.InClusterConfig(); Harden(rc) }\n", true},
+		"seamVar":          {"package credhttp\nimport \"k8s.io/client-go/rest\"\nvar src = rest.InClusterConfig\nfunc I() { src() }\n", true},
+		"aliasedClientGo":  {"package credhttp\nimport k \"k8s.io/client-go/kubernetes\"\nfunc K(rc *rest.Config) { k.NewForConfigAndClient(rc, nil) }\n", true},
+		"restClient":       {"package credhttp\nimport \"k8s.io/client-go/rest\"\nfunc R(rc *rest.Config) { rest.RESTClientForConfigAndClient(rc, nil) }\n", true},
+		"kubeconfig":       {"package credhttp\nimport \"github.com/krateo-platformops/plumbing/kubeconfig\"\nfunc N() { kubeconfig.NewClientConfig(nil, x) }\n", true},
+		"fromSecretRaw":    {"package credhttp\nimport \"github.com/krateo-platformops/plumbing/endpoints\"\nfunc F(rc *rest.Config) { endpoints.FromSecret(nil, rc, \"s\", \"n\") }\n", true},
+		"fromSecretHarden": {"package credhttp\nimport \"github.com/krateo-platformops/plumbing/endpoints\"\nfunc Harden(rc *rest.Config) *rest.Config { noClientRateLimit(rc); return rc }\nfunc F(rc *rest.Config) { endpoints.FromSecret(nil, Harden(rc), \"s\", \"n\") }\n", false},
+		"httpOnly":         {"package credhttp\nimport \"k8s.io/client-go/rest\"\nfunc H(rc *rest.Config) { rest.HTTPClientFor(rc) }\n", false},
 	}
 	for name, c := range cases {
 		fns := scanBuilders(t, token.NewFileSet(), map[string]string{"helper.go": helperSrc, "x.go": c.src})
