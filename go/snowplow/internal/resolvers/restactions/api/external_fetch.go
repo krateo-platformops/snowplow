@@ -266,6 +266,10 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 	defer respo.Body.Close()
 
 	ct := respo.Header.Get("Content-Type")
+	// AUDIT-4 — what the authority answered, for the audit record only
+	// (stage_audit.go). The returned envelope is unchanged.
+	answer := dialAnswerFromContext(ctx)
+	answer.answered(respo.StatusCode)
 
 	// --- non-2xx shaping (transcribed BYTE-IDENTICALLY from
 	// request.go:98-116) --- (AC5; falsifier (j)).
@@ -287,6 +291,7 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 	dat, rerr := io.ReadAll(respo.Body)
 	if rerr != nil {
 		// #523: same transport class as the non-2xx read above.
+		answer.note(dialNoteBodyUnread)
 		redErr := redact.ErrorURL(rerr)
 		return response.New(http.StatusInternalServerError, redErr), nil, ct, redErr
 	}
@@ -305,6 +310,7 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 		// resolve), NO panic. The envelope message is the conversion
 		// error only; the endpoint auth never appears in it (AC6;
 		// falsifiers (e),(g)).
+		answer.note(dialNoteBodyUnconvertible)
 		return response.New(http.StatusUnprocessableEntity, cerr), nil, ct, nil
 	}
 
