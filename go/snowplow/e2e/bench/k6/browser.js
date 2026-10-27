@@ -24,7 +24,7 @@
 import { browser } from 'k6/browser'
 import exec from 'k6/execution'
 import { Counter, Trend } from 'k6/metrics'
-import { OBSERVER, QUIET_MS, loadOf, recordOps, settledNow } from './pageload.js'
+import { OBSERVER, QUIET_MS, callOps, loadOf, recordOps, requestLedger, settledNow } from './pageload.js'
 
 const CFG = JSON.parse(open(__ENV.BROWSER_CONFIG || '/opt/k6/browser-config.json'))
 
@@ -38,6 +38,15 @@ const SIGNIN = new Trend('browser_signin_ms', true)
 const LOGINS = new Counter('browser_logins')
 const FRAME = new Counter('bench_frame')
 const SSE = new Counter('browser_sse_opened')
+// #919: each /call the page fetched, tagged with its resource, name and namespace
+const CALL = new Trend('browser_call_ms', true)
+// #919 (N7): each browser request that failed at network level or never
+// completed (pageload.requestLedger): ms from its start to its failure or to
+// the session's end; it started at the point's time minus its value
+const INCOMPLETE = new Trend('browser_request_incomplete_ms', true)
+// a failed request whose start the ledger never saw: counted, no duration
+const UNSEEN = new Counter('browser_request_failed_start_unseen')
+const LEDGER_METRICS = { browser_request_incomplete_ms: INCOMPLETE, browser_request_failed_start_unseen: UNSEEN }
 
 export const options = {
   scenarios: {
@@ -56,6 +65,7 @@ export const options = {
     browser_page_timeouts: ['count>=0'],
     browser_widget_states: ['count>=0'],
     bench_frame: ['count>=0'],
+    browser_request_failed_start_unseen: ['count>=0'],
   },
   summaryTrendStats: ['count', 'min', 'med', 'p(95)', 'max'],
   // no url/name tags: the SPA puts the signed-in user into /call extras
@@ -100,6 +110,20 @@ function record (r, tags) {
   for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs)) METRICS[metric].add(value, t)
 }
 
+// #919: the /calls the page made since the last drain (pageload.callOf), as
+// browser_call_ms points with the page's tags: during=load right after a
+// load settled (the load's own calls), during=between before the next click
+// (live refreshes while the user thinks). A page that is gone: none drained.
+async function drainCalls (page, tags) {
+  let calls
+  try {
+    calls = await page.evaluate(() => (window.__benchCalls || []).splice(0))
+  } catch (e) {
+    return
+  }
+  for (const [, value, t] of callOps(calls, tags)) CALL.add(value, t)
+}
+
 // The first navigation, retried (run 11: a refused localhost port killed 4
 // of 5 sessions outright). Bounded: GOTO_TRIES x GOTO_WAIT_MS (config
 // loginTries / loginRetryMs; tests set 1 to reproduce run 11).
@@ -124,6 +148,18 @@ export default async function () {
   const page = await context.newPage()
   const deadline = Date.now() + CFG.durationS * 1000
   const visited = new Set()
+  let shown = '(none)'     // the route on screen: tags the calls made between loads
+  // #919 (N7): every request the page makes, until it finishes or fails
+  // (k6 emits nothing for a request that failed at network level)
+  const ledger = requestLedger()
+  page.on('request', (req) => ledger.started(req.method(), req.url(), Date.now(), req.resourceType()))
+  page.on('response', (res) => ledger.responded(res.request().method(), res.url()))
+  page.on('requestfinished', (req) => ledger.finished(req.method(), req.url()))
+  page.on('requestfailed', (req) => {
+    const f = req.failure()
+    const op = ledger.failed(req.method(), req.url(), Date.now(), f && f.errorText, req.resourceType())
+    if (op) LEDGER_METRICS[op[0]].add(op[1], Object.assign({ session: s.name, route: shown }, op[2]))
+  })
   try {
     await gotoLogin(page)
     await page.locator('#basic_username').fill(s.user)
@@ -142,13 +178,16 @@ export default async function () {
       if (signin !== null) SIGNIN.add(signin, { session: s.name })
     }
     record(first, { session: s.name, route: landed, visit: 'first', method: 'login' })
+    await drainCalls(page, { session: s.name, route: landed, visit: 'first', during: 'load' })
     visited.add(landed)
+    shown = landed
     let n = 0
     while (Date.now() < deadline) {
       await page.waitForTimeout(CFG.thinkS * 1000)
       const route = CFG.routes[(s.offset + (++n)) % CFG.routes.length]
       const item = page.locator(`li.ant-menu-item[data-menu-id$="-${route}"]`)
       let method = 'click'
+      await drainCalls(page, { session: s.name, route: shown, during: 'between' })
       await markStart(page)
       if (await item.isVisible()) {
         await item.click()
@@ -163,10 +202,17 @@ export default async function () {
         }, route)
       }
       const r = await settled(page, route)
-      record(r, { session: s.name, route, visit: visited.has(route) ? 'warm' : 'first', method })
+      const visit = visited.has(route) ? 'warm' : 'first'
+      record(r, { session: s.name, route, visit, method })
+      await drainCalls(page, { session: s.name, route, visit, during: 'load' })
       visited.add(route)
+      shown = route
     }
   } finally {
+    await drainCalls(page, { session: s.name, route: shown, during: 'between' })
+    for (const [, value, t] of ledger.unfinished(Date.now())) {
+      INCOMPLETE.add(value, Object.assign({ session: s.name, route: shown }, t))
+    }
     try {
       const n = await page.evaluate(() => window.__benchSse || { refreshes: 0, notifications: 0 })
       SSE.add(n.refreshes, { session: s.name, stream: 'refreshes' })
@@ -183,7 +229,7 @@ export function teardown () { FRAME.add(1, { frame: 'end' }) }
 export function handleSummary (data) {
   const keep = {}
   for (const [name, m] of Object.entries(data.metrics)) {
-    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
+    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|browser_call_ms|browser_request_incomplete_ms|browser_request_failed_start_unseen|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
   }
   return { [__ENV.SUMMARY_FILE || '/out/browser-summary.json']: JSON.stringify({
     kind: 'browser_summary', sessions: CFG.sessions.map((x) => x.name),

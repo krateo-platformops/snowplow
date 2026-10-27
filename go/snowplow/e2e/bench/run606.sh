@@ -124,6 +124,9 @@ FRONTEND_CONFIGMAP="${FRONTEND_CONFIGMAP:-frontend-config-vars}"
 PREFLIGHT_TIMEOUT_S="${PREFLIGHT_TIMEOUT_S:-300}"
 PREFLIGHT_POLL_S="${PREFLIGHT_POLL_S:-3}"
 SNOWPLOW_POD_SELECTOR="${SNOWPLOW_POD_SELECTOR:-app.kubernetes.io/name=snowplow}"
+# The period of run606's cluster samples (kubectl top, the API server's APF
+# metrics; bench/sampler.py) and each sample's bound: a sample still
+# unanswered when the next one is due has failed, recorded as such (#919).
 TOP_POLL_S="${TOP_POLL_S:-15}"
 # Extra /debug/vars key prefixes mem606 records verbatim every sample.
 # Default = load606.RUN8_VARS_PREFIXES (single source): the #710 PR-0 fill and
@@ -334,6 +337,8 @@ teardown() {
   set +e   # nothing inside teardown may abort it (a Ctrl-C reaches every child: set -e would exit on their 130)
   trap - EXIT
   declare -F stop_top_loop >/dev/null && stop_top_loop
+  declare -F stop_apf_loop >/dev/null && stop_apf_loop
+  declare -F stop_sampler >/dev/null && stop_sampler top_boot
   declare -F stop_log_stream >/dev/null && stop_log_stream
   if [[ "$CLUSTER_CREATED" == "1" ]]; then
     # On ANY failure, snapshot the cluster BEFORE it is deleted (shakedown #2
@@ -499,8 +504,41 @@ s_env() {
   source "$OUT/env.sh"
   # gke-env re-exports these; re-assert the pin regardless of what it printed.
   export KUBECONFIG="$KCFG" BENCH_GKE_CONTEXT="$KCTX" EXPECTED_IMAGE_TAG="$SNOWPLOW_TAG"
-  # The platform is up: snowplow's log is streamed from here to collect.
+  # The platform is up: snowplow's log is streamed from here to collect, and
+  # the API server's flow control sampled (#919).
   start_log_stream
+  apf_preflight || return 1
+  start_apf_loop
+  flowcontrol_attribution || return 1
+}
+# flowcontrol_attribution (#922 F3, #924 review M2/M3): which APF flow schema
+# serves snowplow's ServiceAccount, the requests it sends as a bench user, and
+# the bench's own drivers — ASKED of the API server (one LIST as each, by
+# kubectl impersonation; the response's X-Kubernetes-PF-* headers), never
+# re-derived. Each then gets a FlowSchema of its own at the priority level it
+# landed in (one precedence below the schema that took it: same level, same
+# queuing), applied through kapply, and a second probe proves each lands in
+# its own schema — so the figures under snowplow's schemas are snowplow's
+# alone, and the bench's churn is apart. bench/flowcontrol.py; names only are
+# recorded. Without it the run's #922 figures cannot be attributed: the step
+# fails, before the data load is paid for.
+flowcontrol_attribution() {
+  local fc=(python3 -m bench.flowcontrol --users "$USERS" --namespaces "$NAMESPACES"
+            --timeout-s "$COLLECT_TIMEOUT_S")
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: ${fc[*]} probe -> bench-flowschemas.yaml (kapply) -> verify -> $OUT/flowcontrol-config.jsonl"
+    return 0
+  fi
+  "${fc[@]}" probe --out "$OUT/.flowcontrol-probe.json" -- "${K[@]}" 2>"$KERR" \
+    || { log "flow control FAILED: the API server's APF classification could not be read ($(kerr_line))"; return 1; }
+  "${fc[@]}" render --probe "$OUT/.flowcontrol-probe.json" > "$OUT/bench-flowschemas.yaml" 2>"$KERR" \
+    || { log "flow control FAILED: $(kerr_line)"; return 1; }
+  kapply "$OUT/bench-flowschemas.yaml"
+  if ! "${fc[@]}" verify --probe "$OUT/.flowcontrol-probe.json" -- "${K[@]}" > "$OUT/flowcontrol-config.jsonl" 2>"$KERR"; then
+    log "flow control FAILED: an identity does not land in its bench FlowSchema: $(cut -c1-600 "$OUT/flowcontrol-config.jsonl") $(kerr_line)"
+    return 1
+  fi
+  log "flow control: $(cut -c1-600 "$OUT/flowcontrol-config.jsonl")"
 }
 s_preflight() {
   # SECONDS-scale, right after env and BEFORE stamping or any login burst
@@ -563,6 +601,13 @@ s_data() {
 }
 s_reboot() {
   # Cold start at 50K: restart once the data exists, time Ready (#594/#637).
+  # #922 F3: boot is its own phase — its restart time here (boot.jsonl; the
+  # new pod's start and Ready times come from its before-record), and kubectl
+  # top through it (kind top_boot, apart from the measure's samples, stopped
+  # when the measure starts its own).
+  start_sampler top_boot "$OUT/top-boot.jsonl" -n krateo-system top pod -l "$SNOWPLOW_POD_SELECTOR" --no-headers
+  [[ "$DRY" == "1" ]] || python3 -c 'import json, time; print(json.dumps({"kind": "boot", "t_restart": time.time()}))' \
+      > "$OUT/boot.jsonl"
   run "${K[@]}" -n krateo-system rollout restart deploy/snowplow
   run "${K[@]}" -n krateo-system rollout status deploy/snowplow --timeout="${ROLLOUT_TIMEOUT_S}s"
 }
@@ -640,8 +685,10 @@ s_measure() {
   # snowplow's restart state BEFORE measure (the verdict compares after/before:
   # any restart or OOM during measure makes the run INVALID, with its reason).
   snowplow_pod_record before
-  # Standard memory capture (#710): kubectl top every TOP_POLL_S from here,
-  # plus the in-cluster mem606 Job (memstats + heap profiles, metadata only).
+  # Standard memory capture (#710): kubectl top every TOP_POLL_S from here
+  # (each sample bounded by it, #919), plus the in-cluster mem606 Job
+  # (memstats + heap profiles, metadata only). The boot's own samples end here.
+  stop_sampler top_boot
   start_top_loop
   MEASURE_STARTED=1
   kapply "$OUT/loadgen-job.yaml"
@@ -929,19 +976,65 @@ snowplow_pod_record() {
     || log "could not record the snowplow pod ($phase); the verdict will say restart state unknown"
   log "snowplow pod ($phase): $(cat "$OUT/pod-$phase.jsonl" 2>/dev/null | cut -c1-240)"
 }
-TOP_PID=""
-start_top_loop() {
-  if [[ "$DRY" == "1" ]]; then log "DRY: kubectl top loop -> $OUT/top.log"; return 0; fi
-  ( while true; do
-      line="$("${K[@]}" -n krateo-system top pod -l "$SNOWPLOW_POD_SELECTOR" --no-headers 2>&1 | tr -s ' ' | tr '\n' ' ' | tr -d '"\\')"
-      printf '{"kind":"top","t":%s,"raw":"%s"}\n' "$(date +%s)" "$line"
-      sleep "$TOP_POLL_S"
-    done ) >> "$OUT/top.jsonl" 2>&1 &
-  TOP_PID=$!
+# start_sampler <kind> <file> <kubectl args...> (#919): every TOP_POLL_S, one
+# kubectl read of the bench cluster, one record in <file> (bench/sampler.py).
+# Each sample is bounded by its period — kubectl's own --request-timeout and
+# the sampler's wall clock (it kills the call's process group) — so a sample
+# still unanswered when the next one is due is recorded as a FAILED sample
+# (rc, timed_out, kubectl's error line redacted by bench/identity.py) and the
+# loop carries on. Run 16 B: one hung `kubectl top` with no request timeout
+# ended CPU sampling for the last 3.5 h, the stall included. The PID lives in
+# a pidfile: stop_sampler also runs inside collect's `capped` subshell.
+start_sampler() {
+  local kind="$1" file="$2"; shift 2
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.sampler --kind $kind --every-s $TOP_POLL_S --out $file -- ${K[*]} --request-timeout=${TOP_POLL_S}s $*"
+    return 0
+  fi
+  python3 -m bench.sampler --kind "$kind" --every-s "$TOP_POLL_S" --out "$file" -- \
+      "${K[@]}" --request-timeout="${TOP_POLL_S}s" "$@" 2>>"$OUT/sampler-$kind.err" &
+  echo "$!" > "$OUT/.sampler-$kind.pid"
+  log "sampling $kind every ${TOP_POLL_S}s (each sample bounded by it) -> $file"
 }
-stop_top_loop() {
-  [[ -n "${TOP_PID:-}" ]] && kill "$TOP_PID" 2>/dev/null || true
-  TOP_PID=""
+stop_sampler() {
+  local f="$OUT/.sampler-$1.pid" pid
+  [[ -f "$f" ]] || return 0
+  pid="$(cat "$f")"
+  rm -f "$f"       # first: no later caller (teardown) kills this PID again
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+# Standard memory capture (#710): snowplow's pods, kubectl top.
+start_top_loop() {
+  start_sampler top "$OUT/top.jsonl" -n krateo-system top pod -l "$SNOWPLOW_POD_SELECTOR" --no-headers
+}
+stop_top_loop() { stop_sampler top; }
+# #919: the API server's flow control (APF), for the whole run (env ->
+# collect): every apiserver_flowcontrol_* series of its /metrics (request wait,
+# rejections, in-queue / executing per priority level and flow schema), and
+# process_start_time_seconds, which says which replica of the regional control
+# plane answered. evaluate reports it per phase (report only).
+start_apf_loop() { start_sampler apf "$OUT/apf.jsonl.gz" get --raw=/metrics; }
+stop_apf_loop() { stop_sampler apf; }
+# apf_preflight: one bounded scrape before the loop. The paired run judges
+# #920 by API-server load, so a /metrics the API server REFUSES (Forbidden,
+# Unauthorized: deterministic) fails the step now, before the data load and
+# the measure are paid for; any other failure is the loop's to record.
+apf_preflight() {
+  if [[ "$DRY" == "1" ]]; then log "DRY: ${K[*]} --request-timeout=${TOP_POLL_S}s get --raw=/metrics (APF preflight)"; return 0; fi
+  local m="$OUT/.apf-preflight-metrics"
+  if bounded "$TOP_POLL_S" "${K[@]}" --request-timeout="${TOP_POLL_S}s" get --raw=/metrics \
+        >"$m" 2>"$KERR" && grep -q '^apiserver_flowcontrol_' "$m"; then
+    rm -f "$m"
+    log "APF preflight: the API server's /metrics has apiserver_flowcontrol_* series"
+    return 0
+  fi
+  rm -f "$m"
+  if answered_error; then
+    log "APF preflight FAILED: the API server refused /metrics ($(kerr_line)): the run would have no flow-control evidence"
+    return 1
+  fi
+  log "WARNING: APF preflight read no apiserver_flowcontrol_* series ($(err_kind): $(kerr_line)); the sampler records every sample"
 }
 # #822: snowplow's log, streamed for the WHOLE run (env → collect) into
 # $OUT/snowplow-stream.log. A one-shot `kubectl logs` at collect returns only
@@ -1056,6 +1149,7 @@ s_collect() {
   done
   snowplow_pod_record after
   declare -F stop_top_loop >/dev/null && stop_top_loop
+  declare -F stop_apf_loop >/dev/null && stop_apf_loop
   # How every in-cluster Job pod ended, for the verdict (#817 review): a pod
   # that died (OOMKilled, evicted, a crash), never ran (Pending / Unknown) or
   # has no pod at all makes the run INVALID with its reason in verdict.json.
@@ -1150,16 +1244,19 @@ s_evaluate() {
   shopt -s nullglob
   local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
+               "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
                "$OUT"/api-outages*.jsonl)
-  local r8=() k6args=()
+  # #919: the API server's flow-control scrapes, read by evaluate as a stream
+  # (a file that is not there is reported missing)
+  local r8=() k6args=() apfargs=(--apf "$OUT/apf.jsonl.gz")
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
   # #830: the page loads are the real browsers'; k6 is the load
   [[ "$LOAD_DRIVER" == "k6" ]] && k6args=(--k6-out "$OUT/k6" --browser-out "$OUT/browser"
                                           --browser-sessions "$BROWSER_SESSIONS")
   [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-}"; return 0
+    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-} ${apfargs[*]}"; return 0
   fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
@@ -1167,7 +1264,7 @@ s_evaluate() {
   # #871: --profile-dir attributes mem606's CPU profiles by the snowplow_work label
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
-      ${k6args[@]+"${k6args[@]}"} > "$OUT/verdict.json" || vrc=$?
+      ${k6args[@]+"${k6args[@]}"} "${apfargs[@]}" > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
   # Every INVALID reason in the run log, not only in verdict.json (#817: run
   # 9's zero navigations surfaced only as `warm_navs 0`).

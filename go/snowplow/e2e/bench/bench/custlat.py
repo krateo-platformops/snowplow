@@ -105,10 +105,10 @@ Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
     and no longer voids the pair;
   - the customer witness reads ALL of B's customer streams it can: k6load
     and the browser's completed requests (browser_http_req_duration /
-    _failed, flight = response time - duration). Still missing (#919):
-    browser requests that failed at the network level or never completed
-    (k6's browser module emits no duration for them; run 16 B: 99,504
-    browser_data_sent against 94,497 durations).
+    _failed, flight = response time - duration), and the browser requests k6
+    never times (#919 N7: failed at the network level, or never answered by
+    the session's end — browser.js's ledger, browser_incomplete; run 16 B:
+    99,504 browser_data_sent against 94,497 durations), every one not served.
 """
 
 from __future__ import annotations
@@ -405,21 +405,34 @@ def refresher_per_phase(mem: list[dict], wins, span) -> dict:
 
 def cpu_per_phase(tops: list[dict], wins, span) -> dict:
     """snowplow's CPU (kubectl top, millicores summed over its pods per
-    sample) per phase, while k6 ran and over the whole run."""
+    sample) per phase, while k6 ran and over the whole run. A sample run606's
+    sampler recorded as failed (#919: no answer within its bound, or an
+    error) is counted as failed, never as a missing reading."""
     acc: dict[str, dict[str, list[int]]] = {}
+    failed: dict[str, dict[str, int]] = {}
     for t in tops:
+        if t.get("t") is None:
+            continue
+        if t.get("failed"):
+            f = failed.setdefault(_phase(t["t"], wins), {"whole_run": 0, "with_customers": 0})
+            f["whole_run"] += 1
+            if span and span[0] <= t["t"] <= span[1]:
+                f["with_customers"] += 1
+            continue
         ms = [int(m.group(2)) for m in _TOP_CPU.finditer(t.get("raw") or "")]
-        if not ms or t.get("t") is None:
+        if not ms:
             continue
         p = acc.setdefault(_phase(t["t"], wins), {"whole_run": [], "with_customers": []})
         p["whole_run"].append(sum(ms))
         if span and span[0] <= t["t"] <= span[1]:
             p["with_customers"].append(sum(ms))
 
-    def st(v):
-        return ({"samples": len(v), "median_m": statistics.median(v), "p90_m": round(_pct(v, 90)),
-                 "max_m": max(v)} if v else {"samples": 0})
-    return {"by_phase": {p: {k: st(v) for k, v in x.items()} for p, x in acc.items()}}
+    def st(v, nf):
+        return dict({"samples": len(v), "median_m": statistics.median(v), "p90_m": round(_pct(v, 90)),
+                     "max_m": max(v)} if v else {"samples": 0}, failed_samples=nf)
+    phases = list(acc) + [p for p in failed if p not in acc]
+    return {"by_phase": {p: {k: st(acc.get(p, {}).get(k, []), failed.get(p, {}).get(k, 0))
+                             for k in ("whole_run", "with_customers")} for p in phases}}
 
 
 def clicks_vs_schedule(o: dict | None, wins) -> dict | None:
@@ -641,7 +654,7 @@ def browser_request_spans(o: dict | None) -> list[tuple[float, float, bool, floa
     when the response has timing; a duration with no failed point at its
     time had no timed response: not served. Requests that failed at the
     network level or never completed push neither (onLoadingFailed): they
-    are missing here — #919 adds them as another source."""
+    are not here: browser_incomplete_spans is their source (#919 N7)."""
     if not o:
         return []
     failed: dict[float, list[bool]] = {}
@@ -656,6 +669,51 @@ def browser_request_spans(o: dict | None) -> list[tuple[float, float, bool, floa
             continue
         f = failed[t].pop() if failed.get(t) else True
         out.append((t - v / 1000.0, t, f, v))
+    return out
+
+
+# Chrome's net error for a request the CLIENT ended: the page's own fetch
+# cancel (an AbortController, a route change), a navigation away, the page
+# closing. Every other errorText (ERR_CONNECTION_REFUSED / _RESET / _CLOSED,
+# ERR_TIMED_OUT, ERR_EMPTY_RESPONSE, ERR_NAME_NOT_RESOLVED, ERR_FAILED, ...)
+# is the request failing at the network level.
+CLIENT_CANCEL = "net::ERR_ABORTED"
+
+
+def browser_incomplete_spans(o: dict | None) -> list[tuple[float, float, bool | None, float | None]]:
+    """The browser's requests k6 never times (#919 N7, browser.js's ledger),
+    as (start, end, not served, ms), by the witness's own definition — not
+    served = failed, or no reply within the probe's timeout (judge_stretch):
+      failed at the       outcome=failed with any error but CLIENT_CANCEL:
+      network level       not served (True); its flight is the point's time
+                          minus its value to the point's time;
+      cancelled by the    outcome=failed, CLIENT_CANCEL; and outcome=
+      page, or cut at     never_completed answered=no (no answer by the
+      the session's end   session's end): None — a witness only once its
+                          flight outlasted the probe's timeout (then not
+                          served); before that it proves nothing;
+      start unseen        browser_request_failed_start_unseen: a network
+                          failure at the point's time, its start not known
+                          (an instant, not served); a client cancel of
+                          unknown flight is no witness and is left out.
+    A never-completed request that WAS answered (its response headers came:
+    a live stream, /refreshes or /notifications, open by design) is served
+    and is not a witness of anything here."""
+    if not o:
+        return []
+    out = []
+    for (v, tg), t in zip(o["points"].get("browser_request_incomplete_ms", []),
+                          (o.get("times") or {}).get("browser_request_incomplete_ms") or []):
+        if t is None or v is None:
+            continue
+        if tg.get("outcome") == "failed":
+            out.append((t - v / 1000.0, t, None if tg.get("error") == CLIENT_CANCEL else True, v))
+        elif tg.get("outcome") == "never_completed" and tg.get("answered") == "no":
+            out.append((t - v / 1000.0, t, None, v))
+    for (_, tg), t in zip(o["points"].get("browser_request_failed_start_unseen", []),
+                          (o.get("times") or {}).get("browser_request_failed_start_unseen") or []):
+        if t is not None and tg.get("error") != CLIENT_CANCEL:
+            out.append((t, t, True, None))
     return out
 
 
@@ -717,15 +775,26 @@ def judge_stretch(parts: list[tuple[float, float]], customers: dict[str, list | 
       served    within it;
       none      not one request in flight;
       unpaired  a stream's points do not pair up: no witness can be read.
-    Shaped for more sources: a stream is one more key (#919 adds the
-    browser's network-failed and never-completed requests)."""
+    Each stream is one key: k6load, browser (completed requests) and
+    browser_incomplete (failed at network level / never answered, #919 N7).
+    A request whose `failed` is None (browser_incomplete: cancelled by the
+    page, or cut at the session's end) is a witness only once it outlasted
+    `timeout_s` (not served); before that it is no witness: left out of the
+    count, reported as `no_witness`."""
     if any(sp is None for sp in customers.values()):
         bad = sorted(k for k, sp in customers.items() if sp is None)
         return {"verdict": "unpaired", "k6": {"unpaired": bad}}
     by, n, k = {}, 0, 0
     for src, spans in sorted(customers.items()):
-        ov = [f or ms > timeout_s * 1000 for s0, t, f, ms in spans if any(s0 < y and t > x for x, y in parts)]
-        by[src] = {"requests": len(ov), "not_served": sum(ov)}
+        ov, nw = [], 0
+        for s0, t, f, ms in spans:
+            if not any(s0 < y and t > x for x, y in parts):
+                continue
+            if f is None and not (ms is not None and ms > timeout_s * 1000):
+                nw += 1
+                continue
+            ov.append(bool(f) or ms > timeout_s * 1000)
+        by[src] = {"requests": len(ov), "not_served": sum(ov), **({"no_witness": nw} if nw else {})}
         n, k = n + len(ov), k + sum(ov)
     w = {"requests": n, "not_served": k, "rate": round(k / n, 6) if n else None, "timeout_s": timeout_s,
          "by_source": by}
@@ -937,7 +1006,8 @@ def raw_from_dir(d: str) -> dict:
     o = k6eval.read_k6_out(os.path.join(d, "k6"), "k6")
     ob = k6eval.read_k6_out(os.path.join(d, "browser"), "browser")
     return {"calls": calls(o), "requests": requests(o),
-            "customers": {"k6load": request_spans(o), "browser": browser_request_spans(ob)}}
+            "customers": {"k6load": request_spans(o), "browser": browser_request_spans(ob),
+                          "browser_incomplete": browser_incomplete_spans(ob)}}
 
 
 def _rate(reqs, ex) -> dict:
@@ -1054,11 +1124,11 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
         # (FAIL); served -> jointly-Ready time (its calls judged, its errors
         # counted), a NOTE; not one request in flight -> no witness (void),
         # except readyz's no reply, where both witnesses then say B was not
-        # serving (FAIL). B's customers: k6load, and the browser's COMPLETED
-        # requests. Still missing (#919 adds them as one more source): browser
-        # requests that failed at the network level or never completed — k6's
-        # browser module emits no duration for them (run 16 B: 99,504
-        # browser_data_sent against 94,497 durations, about 5,000 unseen).
+        # serving (FAIL). B's customers: k6load, the browser's COMPLETED
+        # requests, and (#919 N7) the browser's requests that failed at the
+        # network level or were never answered — k6's browser module emits no
+        # duration for them (run 16 B: 99,504 browser_data_sent against 94,497
+        # durations); browser.js's ledger does, and each is not served.
         # Run 16's B outage, by this definition: 10,035 k6load requests in
         # flight in its 63 s window, 48 failed (0.48 %) — plus the browser's.
         th = k6eval.K6_THRESHOLDS["max_k6_error_rate"]
@@ -1584,6 +1654,12 @@ def main(argv: list[str] | None = None) -> int:
                                     f"{cand['count']}x during measure"] if cand["restarted"] else []) + (
                 [f"customer_latency.pair.candidate_not_ready: B (the candidate) was not Ready for "
                  f"{cand['not_ready_s']} s without restarting"] if cand["not_ready"] else [])
+    # #922 F3: the acceptance figures as B/A ratios, report only
+    try:
+        from bench import figures
+        out["acceptance_ratios_report_only"] = figures.ratios(va, vb)
+    except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
+        out["acceptance_ratios_report_only"] = {"error": f"{type(e).__name__}: {e}"}
     try:
         text = json.dumps(out, indent=1, default=str)
     except Exception as e:  # noqa: BLE001 — the paired verdict file is never left empty

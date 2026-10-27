@@ -66,6 +66,13 @@ class RbacModel:
             raise ValueError("admins cannot exceed users")
 
 
+def bench_model(users: int, namespaces: int) -> "RbacModel":
+    """The #606 bench's model, as data606 creates its users: the first
+    min(10, users) users are platform admins. One definition (data606 and
+    bench/flowcontrol.py's probe read it)."""
+    return RbacModel(users=users, namespaces=namespaces, admins=min(10, users))
+
+
 def team_group(ns_index: int) -> str:
     return f"bench-team-{ns_index:02d}"
 

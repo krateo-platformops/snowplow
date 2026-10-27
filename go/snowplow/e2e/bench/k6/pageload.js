@@ -78,7 +78,156 @@ export const OBSERVER = `(() => {
     window.EventSource.prototype = ES.prototype;
     ['CONNECTING', 'OPEN', 'CLOSED'].forEach((k) => { window.EventSource[k] = ES[k] });
   }
+  // #919: every /call the page fetches, from its own Resource Timing entry
+  // (callOf); browser.js drains window.__benchCalls into browser_call_ms
+  const calls = window.__benchCalls = [];
+  const callOf = ${callOf.toString()};
+  if (window.PerformanceObserver) {
+    try {
+      new window.PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          const c = callOf(e.name, window.location.href, e.duration, e.responseStatus);
+          if (c) calls.push(c);
+        }
+      }).observe({ type: 'resource', buffered: true });
+    } catch (e) { /* no Resource Timing: no call recorded, the evaluator says none came */ }
+  }
 })()`
+
+// #919: one /call request as the page saw it — its Resource Timing entry
+// (`duration`: start to the response's last byte; `responseStatus`, 0 when
+// the browser does not expose it) — tagged with the /call's resource, name
+// and namespace: those query parameters ONLY, never the rest of the URL (the
+// SPA puts the signed-in user into /call's extras). Not a /call: null.
+// k6 browser's own per-request metric (browser_http_req_duration) cannot
+// carry them: its one per-request tag hook (page.on('metric') tag()) names
+// a URL pattern with a fixed string and needs the `url` system tag, which
+// would put the extras into every point. Self-contained, like settledNow
+// (shipped into the page as source text).
+function callOf (url, base, duration, status) {
+  let u
+  try { u = new URL(url, base) } catch (e) { return null }
+  if (!/\/call$/.test(u.pathname)) return null
+  const q = u.searchParams
+  return {
+    resource: q.get('resource') || '',
+    name: q.get('name') || '',
+    namespace: q.get('namespace') || '',
+    ms: duration,
+    status: status || 0,
+  }
+}
+
+// The metric points the calls drained from one page write: browser_call_ms,
+// tagged with the page's own tags (session, route, visit, during) and the
+// call's resource, name, namespace and status.
+export function callOps (calls, tags) {
+  return (calls || []).map((c) => ['browser_call_ms', c.ms, Object.assign({}, tags, {
+    call_resource: c.resource, call_name: c.name, call_namespace: c.namespace, call_status: String(c.status),
+  })])
+}
+
+// A request's per-request tags (#919): `request` tells a /call from any
+// other request — "call", else Chrome's resource type (document, script,
+// stylesheet, fetch, eventsource, ...) — and a /call carries its resource /
+// name / namespace parameters, the same /call tags as browser_call_ms. No
+// path and no other query parameter: a pathname can carry a name, and the
+// query carries the extras (the user). Plain string work: k6's runtime has no
+// URL global.
+export function requestTags (url, resourceType) {
+  const s = String(url || '').split('#')[0]
+  const qi = s.indexOf('?')
+  const path = (qi < 0 ? s : s.slice(0, qi)).replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/]*/, '')
+  const call = /\/call$/.test(path)
+  const q = {}
+  if (call && qi >= 0) {
+    for (const kv of s.slice(qi + 1).split('&')) {
+      const i = kv.indexOf('=')
+      const k = i < 0 ? kv : kv.slice(0, i)
+      if (k === 'resource' || k === 'name' || k === 'namespace') {
+        try { q[k] = decodeURIComponent((i < 0 ? '' : kv.slice(i + 1)).replace(/\+/g, ' ')) } catch (e) { q[k] = '' }
+      }
+    }
+  }
+  return {
+    request: call ? 'call' : String(resourceType || 'other').toLowerCase(),
+    call_resource: q.resource || '',
+    call_name: q.name || '',
+    call_namespace: q.namespace || '',
+  }
+}
+
+// #919 (N7): the browser requests that never answered. k6's browser module
+// emits no duration and no failed point for a request that failed at network
+// level (network_manager.go emitResponseMetrics runs on a response only; run
+// 16 B: 99,504 browser_data_sent vs 94,497 durations), so browser.js keeps
+// this ledger from the page's own events — request, response,
+// requestfinished, requestfailed — and emits one browser_request_incomplete_ms
+// point for each request that FAILED (refused, reset, timed out, aborted —
+// the page's own cancel included: Chrome's errorText says which) or NEVER
+// COMPLETED by the end of the session. Value: ms from the request's start to
+// its failure, or to the session's end. Point time: when it was emitted — the
+// failure, or the session's end — so the request STARTED at the point's time
+// minus its value. Tags: requestTags, outcome (failed | never_completed),
+// error, answered ("yes" when its response headers had arrived: a live
+// stream still open is a never_completed request that WAS answered; "no": no
+// answer at all).
+// A failed request whose start the ledger never saw has no duration: it is a
+// browser_request_failed_start_unseen count (1, the same tags), never a
+// made-up 0 ms.
+// k6 hands a new Request object to each event, so a request is matched by
+// method + URL, oldest start first: the counts are exact; two identical
+// requests (same method and URL) in flight at once may swap durations.
+export function requestLedger () {
+  const open = new Map()                  // method + URL -> [{t0, type, answered}], oldest first
+  const key = (method, url) => `${method} ${url}`
+  const take = (k) => {
+    const q = open.get(k)
+    const e = q && q.length ? q.shift() : null
+    if (q && !q.length) open.delete(k)
+    return e
+  }
+  const tags = (url, type, outcome, error, answered) =>
+    Object.assign(requestTags(url, type), { outcome, error, answered: answered ? 'yes' : 'no' })
+  let ended = false                       // the session's end: unfinished() reported the rest
+  return {
+    started (method, url, t, resourceType) {
+      if (ended) return
+      const k = key(method, url)
+      if (!open.has(k)) open.set(k, [])
+      open.get(k).push({ t0: t, type: resourceType, answered: false })
+    },
+    // its response headers arrived (the oldest such request not yet answered)
+    responded (method, url) {
+      const e = (open.get(key(method, url)) || []).find((x) => !x.answered)
+      if (e) e.answered = true
+    },
+    finished (method, url) { take(key(method, url)) },
+    // the point for a failed request; null after the session's end: closing
+    // the page aborts what is still open, and unfinished() reported it
+    failed (method, url, t, error, resourceType) {
+      if (ended) return null
+      const e = take(key(method, url))
+      if (!e) {
+        return ['browser_request_failed_start_unseen', 1,
+          Object.assign(tags(url, resourceType, 'failed', error || 'unknown', false), { start_seen: 'false' })]
+      }
+      return ['browser_request_incomplete_ms', t - e.t0, tags(url, e.type, 'failed', error || 'unknown', e.answered)]
+    },
+    // every request still open at `t` (the session's end): never completed
+    unfinished (t) {
+      ended = true
+      const out = []
+      for (const [k, q] of open) {
+        const url = k.slice(k.indexOf(' ') + 1)
+        for (const e of q) out.push(['browser_request_incomplete_ms', t - e.t0, tags(url, e.type, 'never_completed', '', e.answered)])
+      }
+      open.clear()
+      return out
+    },
+    size () { let n = 0; for (const q of open.values()) n += q.length; return n },
+  }
+}
 
 // Is the page loaded at `now`? Self-contained: browser.js sends its source
 // into the page (declared WITHOUT `export`: k6's goja keeps the keyword in
@@ -127,4 +276,4 @@ export function recordOps (r, tags, timeoutMs) {
   return ops
 }
 
-export { loadOf, settledNow }
+export { callOf, loadOf, settledNow }

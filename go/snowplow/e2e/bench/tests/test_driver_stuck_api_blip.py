@@ -541,7 +541,7 @@ def test_a_b_outage_its_customers_served_is_jointly_ready_time_with_a_note(tmp_p
     (w,) = p["b_witnessed_ready"]
     assert w["kind"] == "api_outage" and (w["t0"] - K0, w["t1"] - K0, w["seconds"]) == (900.0, 1100.0, 200.0)
     assert w["parts"] == [_w(900, 1100)]
-    assert w["k6"]["requests"] > 0 and w["k6"]["rate"] <= 0.01 and set(w["k6"]["by_source"]) == {"k6load", "browser"}
+    assert w["k6"]["requests"] > 0 and w["k6"]["rate"] <= 0.01 and set(w["k6"]["by_source"]) == {"k6load", "browser", "browser_incomplete"}
     assert not p["exclusion"]["items"]                       # kept: nothing cut from either run
     assert any("kept as jointly-Ready time" in n and "within the 0.01 bar" in n for n in p["notes"])
 

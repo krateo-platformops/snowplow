@@ -129,13 +129,15 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
 
 FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     raw = sys.argv[1:]
-    kc = os.environ.get("KUBECONFIG"); ctx = None; a = []; ns = None
+    kc = os.environ.get("KUBECONFIG"); ctx = None; a = []; ns = None; imp = []
     it = iter(raw)
     for x in it:
         if x.startswith("--kubeconfig="): kc = x.split("=", 1)[1]
         elif x.startswith("--context="): ctx = x.split("=", 1)[1]
         elif x in ("-n", "--namespace"): ns = next(it, None)   # anywhere, like kubectl
         elif x.startswith("--request-timeout="): pass          # global flag, anywhere
+        elif x.startswith(("--as=", "--as-group=")): imp.append(x)   # impersonation (#922 F3)
+        elif x.startswith("-v="): pass                         # verbosity
         else: a.append(x)
     resolved = ctx
     if resolved is None:
@@ -172,6 +174,75 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             os.remove(down_flag)
     collect_started = os.path.join(STATE, "collect_started")
     collect_down = (os.environ.get("FAKE_COLLECT_PODS_UNANSWERED") == "1" and os.path.exists(collect_started))
+    if a[:2] == ["get", "--raw=/metrics"]:                      # #919: the APF preflight + sampler
+        if os.environ.get("FAKE_METRICS_FORBIDDEN") == "1":
+            print('Error from server (Forbidden): User "someone@example.invalid" cannot get path "/metrics"',
+                  file=sys.stderr)
+            sys.exit(1)
+        p = os.path.join(STATE, "metrics_reads")
+        n = (int(open(p).read()) if os.path.exists(p) else 0) + 1
+        open(p, "w").write(str(n))
+        lb = 'flow_schema="global-default",priority_level="global-default"'
+        print("# TYPE process_start_time_seconds gauge\\nprocess_start_time_seconds 1.7929e+09")
+        print(f"apiserver_flowcontrol_dispatched_requests_total{{{lb}}} {10 * n}")
+        print(f"apiserver_flowcontrol_current_inqueue_requests{{{lb}}} {n % 3}")
+        for le, c in (("0.005", 9 * n), ("+Inf", 10 * n)):
+            print(f'apiserver_flowcontrol_request_wait_duration_seconds_bucket{{execute="true",{lb},le="{le}"}} {c}')
+        print(f'apiserver_flowcontrol_request_wait_duration_seconds_sum{{execute="true",{lb}}} {0.1 * n}')
+        print(f'apiserver_flowcontrol_request_wait_duration_seconds_count{{execute="true",{lb}}} {10 * n}')
+        print("apiserver_request_total{code=\\"200\\"} 5")
+        sys.exit(0)
+    # #922 F3 (#924 M2/M3): APF as the API server answers it. A request's
+    # X-Kubernetes-PF-* headers (kubectl -v=8 prints them) name its flow
+    # schema; once the bench's FlowSchemas are applied, each identity lands
+    # in its own (FAKE_BENCH_FS_IGNORED=1: they never take, verify fails).
+    fs_uid = {"service-accounts": "00000000-0000-4000-8000-000000000001",
+              "global-default": "00000000-0000-4000-8000-000000000002",
+              "bench-snowplow-sa": "00000000-0000-4000-8000-000000000011",
+              "bench-snowplow-users": "00000000-0000-4000-8000-000000000012",
+              "bench-drivers": "00000000-0000-4000-8000-000000000013"}
+    pl_uid = {"workload-low": "00000000-0000-4000-8000-000000000101",
+              "global-default": "00000000-0000-4000-8000-000000000102"}
+    pl_of = {"service-accounts": "workload-low", "global-default": "global-default",
+             "bench-snowplow-sa": "workload-low", "bench-snowplow-users": "global-default",
+             "bench-drivers": "workload-low"}
+    prec = {"service-accounts": 9000, "global-default": 9900, "bench-snowplow-sa": 8999,
+            "bench-snowplow-users": 9899, "bench-drivers": 8999}
+    bench_fs = (os.path.exists(os.path.join(STATE, "bench_flowschemas"))
+                and os.environ.get("FAKE_BENCH_FS_IGNORED") != "1")
+    if a[:1] == ["apply"] and any(x.endswith("bench-flowschemas.yaml") for x in a):
+        open(os.path.join(STATE, "bench_flowschemas"), "w").write(open(a[-1]).read())
+        sys.exit(0)
+    if a[:2] == ["get", "flowschemas.flowcontrol.apiserver.k8s.io"]:
+        names = [n for n in fs_uid if bench_fs or not n.startswith("bench-")]
+        print(json.dumps({"items": [{"metadata": {"name": n, "uid": fs_uid[n]},
+                                     "spec": {"matchingPrecedence": prec[n],
+                                              "priorityLevelConfiguration": {"name": pl_of[n]}}} for n in names]}))
+        sys.exit(0)
+    if a[:2] == ["get", "prioritylevelconfigurations.flowcontrol.apiserver.k8s.io"]:
+        print(json.dumps({"items": [{"metadata": {"name": n, "uid": u}, "spec": {}} for n, u in pl_uid.items()]}))
+        sys.exit(0)
+    if a[:2] == ["get", "--raw"] and imp:
+        who = imp[0].split("=", 1)[1]
+        # FAKE_BENCH_FS_IGNORED_FOR=<identity>: that identity's bench schema never takes
+        ign = os.environ.get("FAKE_BENCH_FS_IGNORED_FOR", "")
+        if who.startswith("system:serviceaccount:krateo-system:"):
+            fs = "bench-snowplow-sa" if bench_fs and ign != "snowplow_sa" else "service-accounts"
+        elif who.startswith("system:serviceaccount:bench-loadgen:"):
+            fs = "bench-drivers" if bench_fs and ign != "bench_drivers" else "service-accounts"
+        else:
+            fs = "bench-snowplow-users" if bench_fs and ign != "snowplow_users" else "global-default"
+        print("I1027 00:00:00.000000 1 round_trippers.go:560] Response Status: 403 Forbidden in 3 milliseconds\\n"
+              "I1027 00:00:00.000000 1 round_trippers.go:567] Response Headers:\\n"
+              f"I1027 00:00:00.000000 1 round_trippers.go:570]     X-Kubernetes-Pf-Flowschema-Uid: {fs_uid[fs]}\\n"
+              f"I1027 00:00:00.000000 1 round_trippers.go:570]     X-Kubernetes-Pf-Prioritylevel-Uid: {pl_uid[pl_of[fs]]}",
+              file=sys.stderr)
+        print('Error from server (Forbidden): configmaps is forbidden', file=sys.stderr)
+        sys.exit(1)
+    if a[:2] == ["get", "deploy/snowplow"]:
+        print(json.dumps({"metadata": {"name": "snowplow", "namespace": ns},
+                          "spec": {"template": {"spec": {"serviceAccountName": "snowplow"}}}}))
+        sys.exit(0)
     if a[:2] == ["get", "--raw=/readyz"]:                       # run606's api_answers probe
         if os.path.exists(down_flag) or collect_down:
             print("Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout", file=sys.stderr)
@@ -307,9 +378,14 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
               "lastState": ({"terminated": {"reason": "OOMKilled", "exitCode": 137,
                                             "finishedAt": "2026-10-14T15:04:53Z"}}
                             if restarted else {})}
+        # #922 F3: started a second ago, Ready now (the boot's end)
+        now = time.time()
+        cs["state"] = {"running": {"startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 1))}}
         pods = [{"metadata": {"name": "snowplow-abc"},
                  "spec": {"containers": [{"resources": {"limits": {"memory": "8Gi"}}}]},
-                 "status": {"containerStatuses": [cs]}}]
+                 "status": {"containerStatuses": [cs],
+                            "conditions": [{"type": "Ready", "status": "True", "lastTransitionTime":
+                                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}]}}]
         # FAKE_TERMINATING_READS=N: the first N reads also list the old
         # ReplicaSet's Terminating pod (old digest) FIRST; -1 = it never goes.
         tr = int(os.environ.get("FAKE_TERMINATING_READS", "0"))

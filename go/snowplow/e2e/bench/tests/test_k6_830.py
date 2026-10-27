@@ -1408,6 +1408,30 @@ def test_browser_js_in_chrome_against_the_fixture_spa(tmp_path):
     assert '"url":' not in raw and '"name":"http' not in raw and "fixture-user" not in raw
 
 
+@needs_docker
+def test_in_chrome_a_refused_call_and_the_open_streams_are_points(tmp_path):
+    """k6/browser.js in the pinned k6 browser image, real Chrome, against the
+    fixture SPA: its refused /call (port 8099) is a `failed` point with Chrome's
+    error, its live streams `never_completed`, its answered /call a
+    browser_call_ms point; no point carries the extras. Pinned EXACTLY (#924
+    review M4): every other request the page made — the document, the
+    answered /call — finished, so k6 2.3.0 fired requestfinished for each,
+    requestfailed with Request.failure() for the refused one, and response for
+    the two streams."""
+    o = _run_browser_fixture(tmp_path)
+    inc = sorted((t["outcome"], t["request"], t["call_resource"], t["answered"], t["error"])
+                 for _, t in o["points"]["browser_request_incomplete_ms"])
+    assert inc == [("failed", "call", "boom", "no", "net::ERR_CONNECTION_REFUSED"),
+                   ("never_completed", "eventsource", "", "yes", ""),     # /notifications, open
+                   ("never_completed", "fetch", "", "yes", "")], inc       # /refreshes, open
+    assert all(v >= 0 for v, _ in o["points"]["browser_request_incomplete_ms"])
+    assert not o["points"].get("browser_request_failed_start_unseen")    # every start was seen
+    calls = [t for _, t in o["points"]["browser_call_ms"]]
+    assert any(t["call_resource"] == "tables" and t["call_status"] == "200" for t in calls), calls
+    with gzip.open(tmp_path / "out" / "browser.json.gz", "rt") as fh:
+        assert "FIXTURE-SECRET" not in fh.read()
+
+
 _K6_STUBS = {
     "http.js": "export default { batch: () => [] }\n",
     "execution.js": "export default { scenario: {} }\n",

@@ -8,8 +8,10 @@ verdict.json. Two policies, one place:
 - redact_identity(line): kubectl's error line, kept for its meaning
   (run606.sh kerr_line pipes through this file) with every identity
   replaced by <redacted>: `User "…"`, `users "…"`, whatever follows
-  "authenticated as" (an e-mail, a numeric id, system:serviceaccount:…) and
-  any e-mail address. A closing ")" or "," stays.
+  "authenticated as" (an e-mail, a numeric id, system:serviceaccount:…),
+  any e-mail address, a Secret's name (`secrets/…`, `secrets "…"`) and a
+  certificate's `CN=…`. A closing ")" or "," stays. bench/logscrub.py runs
+  it over snowplow's non-JSON (klog) log lines too (#919).
 - error_summary(stderr): a failed gcloud / kubectl call as bench.gke logs
   and records it — its code only (`ResponseError: code=<n>`, or `Error from
   server (<Reason>)`), never its free text (#900 B1), and passed through
@@ -25,11 +27,21 @@ from __future__ import annotations
 import re
 import sys
 
+REDACTED = "<redacted>"
 _RULES = (
     (re.compile(r'User "[^"]*"'), 'User "<redacted>"'),
     (re.compile(r'users "[^"]*"'), 'users "<redacted>"'),
     (re.compile(r"authenticated as:? [^)\s,]+"), "authenticated as <redacted>"),
     (re.compile(r"""[^\s"'(),]+@[^\s"'(),]+"""), "<redacted>"),
+    # #919: a Secret's name (the bench's per-user `<user>-clientconfig`, any
+    # other) in an API path or an API error, and a certificate subject's CN
+    # (client certificates name their user)
+    (re.compile(r"\b(secrets?)/[^/\s?&,\"']+"), r"\1/<redacted>"),
+    (re.compile(r'\b(secrets?) "[^"]*"'), r'\1 "<redacted>"'),
+    (re.compile(r"\bCN=[^,/\s\"')]+"), "CN=<redacted>"),
+    # a user named in prose ("token for user carol expired"): the word after
+    # "user" / "username" (the quoted form is the first rule's)
+    (re.compile(r"(?i)\b(user(?:name)?)([:=]?\s+)(?![\"<])[^\s,;)\"]+"), r"\1\2<redacted>"),
 )
 
 _ERR_CODE = re.compile(r"\bcode=(\d{3})\b")

@@ -109,8 +109,19 @@ def test_run606_applies_everything_through_one_server_side_apply():
                if re.search(r"\bapply\b", ln) and not ln.lstrip().startswith("#")]
     assert applies == [ln for ln in applies if ln.startswith("kapply()")], applies
     sites = [ln.strip() for ln in src.splitlines() if ln.strip().startswith('kapply "')]
-    assert sites == ['kapply "$OUT/preflight-job.yaml"', 'kapply "$OUT/loadgen-job.yaml"']
+    # #924 M3: the bench's own FlowSchemas (env), then the two Jobs
+    assert sites == ['kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/preflight-job.yaml"',
+                     'kapply "$OUT/loadgen-job.yaml"']
     assert "--server-side" in _kapply()
+
+
+def test_the_bench_flowschemas_fit_the_api():
+    from bench import flowcontrol
+    orig = {i: {"flow_schema": "service-accounts", "precedence": 9000, "priority_level": "workload-low"}
+            for i in flowcontrol.IDENTITIES}
+    objs = _objects(flowcontrol.render(orig, "snowplow"))
+    assert [o["metadata"]["name"] for o in objs] == list(flowcontrol.BENCH_SCHEMA.values())
+    assert all(check(o, client_side=False) == [] for o in objs)
 
 
 @pytest.mark.parametrize("driver", ["k6", "load606"])

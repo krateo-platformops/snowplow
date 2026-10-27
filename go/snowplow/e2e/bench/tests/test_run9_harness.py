@@ -294,7 +294,7 @@ def test_fresh_probe_records_push_ms_from_its_armed_viewer():
     def sleep(s):
         t[0] += s
 
-    recs = load606.freshness_probe(C(), "t", RA, lambda m: True, samples=1, poll_ms=100,
+    recs = load606.freshness_probe(C(), "t", RA, lambda m: load606.WriteResult(True), samples=1, poll_ms=100,
                                    gap_s=0, label="list_dep@10", clock=clock, sleep=sleep,
                                    push_since=lambda t0: t0 + 0.25)
     r = recs[0]

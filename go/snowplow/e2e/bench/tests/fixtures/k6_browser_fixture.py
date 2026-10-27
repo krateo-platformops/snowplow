@@ -10,6 +10,7 @@ in real Chrome under test (tests/test_k6_830.py, #831 gate):
   /err         resolves to a `data-testid="widget-error"` end state
   sidebar      `li.ant-menu-item` with `data-menu-id="rc-menu-<path>"`
   live updates POST /refreshes (fetch) and EventSource /notifications
+  /call        one GET /call that answers, one to a refused port (#919)
 
 Usage: k6_browser_fixture.py PORT SIGNIN_MS SKELETON_DELAY_MS PAGE_MS"""
 import http.server
@@ -62,6 +63,11 @@ function render (path) {
 function live () {
   fetch('/refreshes', { method: 'POST', body: '[]' }).catch(() => {});
   new EventSource('/notifications');
+  // #919: a /call that answers, and one refused at network level (nothing
+  // listens on port 8099 in the browser's container; not one of Chrome's
+  // blocked 'unsafe' ports, which fail before connecting), with user extras
+  fetch('/call?resource=tables&name=t1&namespace=ns1&extras=FIXTURE-SECRET').catch(() => {});
+  fetch('http://127.0.0.1:8099/call?resource=boom&name=b1&namespace=ns1&extras=FIXTURE-SECRET').catch(() => {});
 }
 window.addEventListener('popstate', () => render(location.pathname));
 if (location.pathname !== '/login') { menu(); live(); }

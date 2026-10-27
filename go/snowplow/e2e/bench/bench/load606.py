@@ -1152,10 +1152,13 @@ def freshness_probe(client: HttpClient, token: str, path: str,
             sink({"kind": "fresh_pause", "label": label, "t": p0,
                   "paused_s": round(clock() - p0, 1), "recovered": healthy()})
         marker = f"fresh-{label}-{int(clock() * 1000)}-{i}"
-        if not mutate(marker):
+        tw = clock()
+        w = mutate(marker)
+        if not w.ok:
             rec = {"kind": "fresh", "label": label, "marker": marker,
                    "converged": False, "latency_ms": None, "polls": 0,
-                   "error": "mutate failed", "poll_ms": poll_ms}
+                   "error": "mutate failed", "poll_ms": poll_ms, "t": tw,
+                   "write_status": w.status, "write_error": w.error}
             out.append(rec)
             sink(rec)
             continue
@@ -1238,20 +1241,36 @@ def readyz(client: HttpClient) -> bool:
     return client.get("/readyz", None).status == 200
 
 
+@dataclass(frozen=True)
+class WriteResult:
+    """One write to the Kubernetes API (a churn or probe mutate): whether it
+    succeeded, the API server's HTTP status when one came back, and — when
+    none did, or the write gave up — what failed (#919: run 16's churn
+    failures had neither a time nor a code). Never a response body (it can
+    name the writer's identity)."""
+    ok: bool
+    status: int | None = None
+    error: str | None = None
+
+
 class ChurnDriver:
     """`rate` mutations/s over `targets`, round-robin, in a background thread.
 
-    `mutate(target, marker) -> bool`. Records how many it issued and how many
-    failed, so the verdict can state the event rate it actually achieved.
+    `mutate(target, marker) -> WriteResult`. Records how many it issued and
+    how many failed, so the verdict can state the event rate it actually
+    achieved, and hands each failed write to `on_failure` as it happens:
+    {t (when the write was issued), ms (how long it took), status, error}.
     """
 
     def __init__(self, targets: list, rate: float,
-                 mutate: Callable[[object, str], bool], workers: int = 16):
+                 mutate: Callable[[object, str], "WriteResult"], workers: int = 16,
+                 on_failure: Callable[[dict], None] | None = None):
         if rate <= 0 or not targets:
             raise ValueError("rate must be > 0 and targets non-empty")
         self.targets = targets
         self.rate = rate
         self.mutate = mutate
+        self.on_failure = on_failure
         self.pool = concurrent.futures.ThreadPoolExecutor(workers)
         self.stop_evt = threading.Event()
         self.issued = 0
@@ -1262,14 +1281,20 @@ class ChurnDriver:
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
     def _one(self, target, marker):
-        ok = False
+        t0 = time.time()
         try:
-            ok = bool(self.mutate(target, marker))
-        finally:
-            with self.lock:
-                self.issued += 1
-                if not ok:
-                    self.failed += 1
+            res = self.mutate(target, marker)
+        except Exception as e:  # noqa: BLE001 — a write that raised is a failed write, recorded
+            res = WriteResult(False, None, f"{type(e).__name__}: {e}")
+        with self.lock:
+            self.issued += 1
+            if not res.ok:
+                self.failed += 1
+        # every failure, with or without an HTTP status (a timeout, a refused
+        # connection: an API server that does not answer, run 16's case)
+        if not res.ok and self.on_failure is not None:
+            self.on_failure({"t": round(t0, 3), "ms": round((time.time() - t0) * 1000, 1),
+                             "status": res.status, "error": res.error})
 
     def _loop(self):
         self.t0 = time.time()
@@ -1486,6 +1511,11 @@ def pod_record(pod_list: dict, phase: str) -> dict:
                        .get("resources") or {}).get("limits"),
             "image_id": cs.get("imageID"),
             "digest": image_digest_of(cs.get("imageID")),
+            # #922 F3: the pod's boot — created, its container started, Ready
+            "created_at": _ts((p.get("metadata") or {}).get("creationTimestamp")),
+            "started_at": _ts(((cs.get("state") or {}).get("running") or {}).get("startedAt")),
+            "ready_at": _ts(next((c.get("lastTransitionTime") for c in (p.get("status") or {}).get("conditions") or []
+                                  if c.get("type") == "Ready" and c.get("status") == "True"), None)),
             "t": time.time()}
 
 
@@ -2441,6 +2471,13 @@ RUN8_VARS_PREFIXES = (
     "snowplow_phase1_readiness_exit",
     "snowplow_prewarm_engine",
     "snowplow_work_class",                # #871: units started / completed per work class
+    # #919 (#933 review): reflector establishments by wire path — relists,
+    # lazy first informer starts and schema relists alike
+    # (cache/reflector_path_stats.go) — and ListAndWatch errors
+    # (cache/informer_watch_stats.go). Process-wide: snowplow exposes no
+    # per-GVR count or time (#932 step 0 adds it).
+    "snowplow_reflector_path",
+    "snowplow_informer_watch",
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -3635,7 +3672,7 @@ def with_fresh_condition(obj: dict, value: str, now: str) -> dict:
 def incluster_status_condition(group: str, version: str, plural: str, ns: str,
                                name: str, value: str, *, sa_dir: str | None = None,
                                api: str = "https://kubernetes.default.svc",
-                               timeout: float = 30, attempts: int = 3) -> bool:
+                               timeout: float = 30, attempts: int = 3) -> WriteResult:
     """GET the object, set the SnowplowBenchFresh condition, PUT it to the
     /status subresource with its resourceVersion (409 → re-read, retry)."""
     import ssl
@@ -3646,27 +3683,32 @@ def incluster_status_condition(group: str, version: str, plural: str, ns: str,
         ctx = ssl.create_default_context(cafile=os.path.join(sa_dir, "ca.crt"))
         url = f"{api}/apis/{group}/{version}/namespaces/{ns}/{plural}/{name}"
         hdr = {"Authorization": "Bearer " + tok}
+        last = WriteResult(False, None, "no attempt")
         for _ in range(attempts):
-            with urllib.request.urlopen(urllib.request.Request(url, headers=hdr),
-                                        timeout=timeout, context=ctx) as r:
-                obj = json.loads(r.read())
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=hdr),
+                                            timeout=timeout, context=ctx) as r:
+                    obj = json.loads(r.read())
+            except Exception as e:  # noqa: BLE001
+                return write_failure(e, "get")
             now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             body = json.dumps(with_fresh_condition(obj, value, now)).encode()
             req = urllib.request.Request(url + "/status", data=body, method="PUT",
                                          headers=dict(hdr, **{"Content-Type": "application/json"}))
             try:
                 with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-                    return 200 <= r.status < 300
+                    return WriteResult(200 <= r.status < 300, r.status)
             except urllib.error.HTTPError as e:
+                last = write_failure(e, "put")
                 if e.code != 409:
-                    return False
-        return False
-    except Exception:  # noqa: BLE001 — a failed mutate is recorded, not raised
-        return False
+                    return last
+        return WriteResult(False, last.status, f"{last.error} on all {attempts} attempts")
+    except Exception as e:  # noqa: BLE001 — a failed mutate is recorded, not raised
+        return write_failure(e)
 
 
 def kubectl_status_condition(kubeconfig: str, context: str, resource: str, ns: str,
-                             name: str, value: str, timeout: int = 30) -> bool:
+                             name: str, value: str, timeout: int = 30) -> WriteResult:
     """Operator-side twin: `kubectl get -o json` + `kubectl replace
     --subresource=status`, explicit kubeconfig + context."""
     import subprocess
@@ -3675,14 +3717,25 @@ def kubectl_status_condition(kubeconfig: str, context: str, resource: str, ns: s
         g = subprocess.run(base + ["get", resource, name, "-o", "json"],
                            capture_output=True, timeout=timeout)
         if g.returncode != 0:
-            return False
+            return kubectl_write_failure(g, "get")
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         body = json.dumps(with_fresh_condition(json.loads(g.stdout), value, now))
         r = subprocess.run(base + ["replace", "--subresource=status", "-f", "-"],
                            input=body.encode(), capture_output=True, timeout=timeout)
-        return r.returncode == 0
-    except Exception:  # noqa: BLE001
-        return False
+        return WriteResult(True) if r.returncode == 0 else kubectl_write_failure(r, "replace")
+    except Exception as e:  # noqa: BLE001
+        return write_failure(e)
+
+
+def kubectl_write_failure(p, stage: str) -> WriteResult:
+    """A failed operator-side kubectl write: kubectl prints no HTTP code, so
+    its error is reduced to the API server's reason (`Error from server
+    (Conflict)`) by bench/identity.py's error_summary, never its free text,
+    which can name the operator (operator-side only: the in-cluster fresh606
+    never runs kubectl)."""
+    from bench import identity
+    return WriteResult(False, None, f"{stage}: kubectl rc={p.returncode}: "
+                                    f"{identity.error_summary((p.stderr or b'').decode('utf-8', 'replace'))}")
 
 
 def call_path(group: str, version: str, plural: str, name: str, ns: str) -> str:
@@ -3691,7 +3744,7 @@ def call_path(group: str, version: str, plural: str, name: str, ns: str) -> str:
 
 
 def kubectl_annotate(kubeconfig: str, context: str, resource: str, ns: str,
-                     name: str, value: str, timeout: int = 30) -> bool:
+                     name: str, value: str, timeout: int = 30) -> WriteResult:
     """`kubectl annotate --overwrite` with an EXPLICIT kubeconfig + context:
     the operator's ambient context is never consulted."""
     import subprocess
@@ -3699,10 +3752,10 @@ def kubectl_annotate(kubeconfig: str, context: str, resource: str, ns: str,
             "annotate", "--overwrite", resource, name, "-n", ns,
             f"{FRESH_ANNOTATION}={value}"]
     try:
-        return subprocess.run(argv, capture_output=True,
-                              timeout=timeout).returncode == 0
-    except Exception:  # noqa: BLE001
-        return False
+        p = subprocess.run(argv, capture_output=True, timeout=timeout)
+        return WriteResult(True) if p.returncode == 0 else kubectl_write_failure(p, "annotate")
+    except Exception as e:  # noqa: BLE001
+        return write_failure(e)
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
@@ -3721,24 +3774,37 @@ def _jsonl_sink(path: str):
 def _read_jsonl(path: str) -> list[dict]:
     """Records from a JSONL file. `kubectl logs` interleaves the driver's
     stderr diagnostics with its JSONL; non-JSON lines are skipped and counted
-    (a `{"kind": "skipped"}` record) so nothing disappears silently."""
-    out = []
+    (a `{"kind": "skipped"}` record) so nothing disappears silently. A `.gz`
+    file is read as gzip (bench.sampler writes one member per record); a
+    member cut by a killed writer ends the file, said in the skipped record."""
+    return list(iter_jsonl(path))
+
+
+def iter_jsonl(path: str) -> Iterable[dict]:
+    """_read_jsonl's records one at a time (the APF stream is read so: its
+    scrapes hold millions of series in all)."""
     skipped = 0
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            if not line.startswith("{"):
-                skipped += 1
-                continue
-            try:
-                out.append(json.loads(line))
-            except ValueError:
-                skipped += 1
-    if skipped:
-        out.append({"kind": "skipped", "path": path, "lines": skipped})
-    return out
+    cut = None
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt") as fh:
+        try:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                if not line.startswith("{"):
+                    skipped += 1
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    skipped += 1
+                    continue
+                yield rec
+        except (EOFError, OSError) as e:          # a cut last gzip member
+            cut = f"{type(e).__name__}: {e}"
+    if skipped or cut:
+        yield {"kind": "skipped", "path": path, "lines": skipped, **({"truncated": cut} if cut else {})}
 
 
 # A framed stream (#817): a file one in-cluster writer produces, which must
@@ -4324,7 +4390,7 @@ _SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 def incluster_annotate(group: str, version: str, plural: str, ns: str,
                        name: str, value: str, *, sa_dir: str = _SA_DIR,
                        api: str = "https://kubernetes.default.svc",
-                       timeout: float = 30) -> bool:
+                       timeout: float = 30) -> WriteResult:
     """Merge-patch the freshness annotation through the Kubernetes API using
     the pod's ServiceAccount (the fresh606 Job). No kubectl, no kubeconfig."""
     import ssl
@@ -4339,9 +4405,21 @@ def incluster_annotate(group: str, version: str, plural: str, ns: str,
             headers={"Authorization": "Bearer " + tok,
                      "Content-Type": "application/merge-patch+json"})
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-            return 200 <= r.status < 300
-    except Exception:  # noqa: BLE001 — a failed mutate is recorded, not raised
-        return False
+            return WriteResult(200 <= r.status < 300, r.status)
+    except Exception as e:  # noqa: BLE001 — a failed mutate is recorded, not raised
+        return write_failure(e)
+
+
+def write_failure(e: BaseException, stage: str | None = None) -> WriteResult:
+    """A write that raised: the API server's status when it answered (an
+    HTTPError: its code and reason phrase, never its body), else what failed
+    (a timeout, a refused connection)."""
+    where = f"{stage}: " if stage else ""
+    if isinstance(e, urllib.error.HTTPError):
+        return WriteResult(False, e.code, f"{where}{e.code} {e.reason}")
+    if isinstance(e, urllib.error.URLError):
+        return WriteResult(False, None, f"{where}{type(e.reason).__name__}: {e.reason}")
+    return WriteResult(False, None, f"{where}{type(e).__name__}: {e}")
 
 
 def _cmd_fresh(a) -> int:
@@ -4456,8 +4534,10 @@ def fresh_phases(client, token, sink, *, modes, rates, mutators, paths, targets,
             label = f"{FRESH_MODE_LABEL[mode]}@{rate:g}"
             churn = None
             if rate > 0:
-                churn = churn_factory(targets, rate,
-                                      lambda t, m, mut=mut: mut(t[0], t[1], m)).start()
+                churn = churn_factory(
+                    targets, rate, lambda t, m, mut=mut: mut(t[0], t[1], m),
+                    on_failure=lambda f, label=label: sink({"kind": "churn_write_failed",
+                                                            "label": label, **f})).start()
             probe_fn(
                 client, token, paths[mode],
                 lambda m, mut=mut: mut(probe[0], probe[1], m),
@@ -4998,6 +5078,65 @@ def _cmd_check_prefixes(a) -> int:
     return 0
 
 
+def churn_write_failures_report(recs: list[dict]) -> dict:
+    """fresh606's failed churn writes (#919), per churn phase: how many, by
+    the API server's status code (or, with none, what failed), and when the
+    first and the last were. Report only. A phase whose churn record counts
+    failures with no failure record of its own was written before #919."""
+    fails = [r for r in recs if r.get("kind") == "churn_write_failed"]
+    out: dict[str, dict] = {}
+    for c in (r for r in recs if r.get("kind") == "churn"):
+        out[c.get("label")] = {"issued": c.get("issued"), "failed": c.get("failed"), "recorded": 0,
+                               "by_status": {}, "first_t": None, "last_t": None}
+    for f in sorted(fails, key=lambda r: r.get("t") or 0):
+        ph = out.setdefault(f.get("label"), {"issued": None, "failed": None, "recorded": 0,
+                                             "by_status": {}, "first_t": None, "last_t": None})
+        ph["recorded"] += 1
+        key = str(f["status"]) if f.get("status") is not None else f"no status: {f.get('error')}"
+        ph["by_status"][key] = ph["by_status"].get(key, 0) + 1
+        ph["first_t"] = f.get("t") if ph["first_t"] is None else ph["first_t"]
+        ph["last_t"] = f.get("t")
+    for ph in out.values():
+        if ph["failed"] and not ph["recorded"]:
+            ph["note"] = "failures counted without a record each (fresh606 before #919): no time or status"
+    return out
+
+
+def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None,
+                            k6_calls: list[tuple[float, float]] | None = None) -> None:
+    """#919's report-only sections of verdict.json: run606's kubectl top
+    samples (answered / failed), the API server's flow control per phase
+    (bench/apf.py, streamed from `apf_path`: run606's apf.jsonl.gz) and
+    fresh606's failed churn writes; and the figures #922's acceptance is
+    read from (bench/figures.py: boot as its own phase)."""
+    from bench import apf, figures, sampler
+    report["top_samples_report_only"] = sampler.summary(recs, "top")
+    window, boot_facts = figures.boot_window(recs)
+    churns = [r for r in recs if r.get("kind") == "churn"]
+    fresh = [r for r in recs if r.get("kind") == "fresh"]
+    mem = [r for r in recs if r.get("kind") in ("mem_start", "mem", "heap_profile", "cpu_profile", "mem_end")]
+    before = [r.get("t") for r in recs if r.get("kind") == "snowplow_pod" and r.get("phase") == "before"
+              and r.get("t") is not None]
+    have = apf_path is not None and os.path.exists(apf_path)
+    rep = apf.report(iter_jsonl(apf_path) if have else [], run_phases(mem, fresh + churns), _phase_of,
+                     min(before) if before else None, boot=window)
+    if apf_path is not None and not have:
+        rep["note"] += f"; {apf_path} does not exist"
+    report["apiserver_flowcontrol_report_only"] = rep
+    warnings = report.setdefault("report_warnings", [])
+    if rep["status"] == apf.REPORT_ABSENT:
+        warnings.append(f"apiserver_flowcontrol report: {rep['note']}")
+    elif not rep["samples"]["answered"]:
+        warnings.append(f"apiserver_flowcontrol report: all {rep['samples']['failed']} samples failed "
+                        f"({rep['samples']['failed_by_error']}): the flow-control evidence is missing")
+    if report["top_samples_report_only"]["failed"]:
+        t = report["top_samples_report_only"]
+        warnings.append(f"kubectl top: {t['failed']} of {t['failed'] + t['answered']} samples failed "
+                        f"(longest unanswered stretch {t['longest_unanswered_s']} s)")
+    report["churn_write_failures_report_only"] = churn_write_failures_report(recs)
+    report["acceptance_figures_report_only"] = figures.run_figures(report, recs, window, boot_facts, k6_calls)
+
+
 def _cmd_evaluate(a) -> int:
     recs = []
     streams = []
@@ -5058,6 +5197,8 @@ def _cmd_evaluate(a) -> int:
     # the stretches the run's measure / collect loops could not reach the API
     # server (run606 api_seen): shown with the verdict, never judged
     result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]
+    from bench import custlat
+    _cluster_sample_reports(result["report"], recs, a.apf, custlat.calls((k6 or {}).get("k6")))
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))
@@ -5233,6 +5374,9 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--browser-out", default=None,
                    help="#830: the browser pod's collected /out; its page loads are the verdict's")
     e.add_argument("--browser-sessions", type=int, default=None)
+    e.add_argument("--apf", default=None,
+                   help="#919: run606's apf.jsonl.gz (the API server's flow-control scrapes), read as a "
+                        "stream; the report is per phase, report only")
     e.add_argument("--no-viewers", action="store_true",
                    help="#830: the run had no open tabs (VIEWERS=0): no viewer checks")
     e.add_argument("--run8", action="store_true",

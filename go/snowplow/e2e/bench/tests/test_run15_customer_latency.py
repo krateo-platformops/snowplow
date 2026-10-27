@@ -537,8 +537,10 @@ def test_refresher_restart_and_cpu_pods_sum():
     tops = [{"kind": "top", "t": 5, "raw": "snowplow-a 300m 1Gi\nsnowplow-b 200m 900Mi"},
             {"kind": "top", "t": 50, "raw": "snowplow-a 999m 1Gi"}]
     c = custlat.cpu_per_phase(tops, [], [0, 20])["by_phase"]["steady"]
-    assert c["with_customers"] == {"samples": 1, "median_m": 500, "p90_m": 500, "max_m": 500}
-    assert c["whole_run"] == {"samples": 2, "median_m": 749.5, "p90_m": 949, "max_m": 999}
+    assert c["with_customers"] == {"samples": 1, "median_m": 500, "p90_m": 500, "max_m": 500,
+                                   "failed_samples": 0}
+    assert c["whole_run"] == {"samples": 2, "median_m": 749.5, "p90_m": 949, "max_m": 999,
+                              "failed_samples": 0}
 
 
 def test_clicks_vs_open_schedule():

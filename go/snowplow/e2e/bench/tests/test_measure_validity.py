@@ -115,7 +115,7 @@ def test_freshness_pauses_while_not_ready_and_invalidates_outage_samples():
 
     def mutate(m):
         state["marker"] = m
-        return True
+        return load606.WriteResult(True)
 
     recs = []
     load606.freshness_probe(C(), "t", "/p", mutate, samples=2, gap_s=0,
