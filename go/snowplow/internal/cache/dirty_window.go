@@ -485,15 +485,16 @@ func NoteRefreshWrite(ctx context.Context, key string, stored bool) {
 	}
 	if stored {
 		o.accepted.Store(true)
-		// #870 — the store-swap push ledger's "refreshed" is the accepted,
-		// un-remarked re-Put: the same event windowFresh records, taken HERE,
-		// at the write, because the publish that follows (PublishRefresh, after
-		// this call) can reach a subscriber and be WRITTEN before this dequeue
-		// returns to settle its window — and a frame written for an entry still
-		// marked stale would close nothing, leaving it open forever.
-		if !o.remarked.Load() {
-			ledgerRefreshed(key, refreshDequeueBegan(key))
-		}
+		// #870 (design v5.3) — the store-swap push ledger's "refreshed" is the
+		// accepted re-Put, taken HERE, at the write: the publish that follows
+		// (PublishRefresh, after this call) can reach a subscriber and be
+		// WRITTEN before this dequeue returns to settle its window, and a
+		// frame written for an entry still marked stale would close nothing.
+		// A remark does not matter: a dequeue that began after the ledger
+		// opened read the installed copy, so its body already carries the
+		// corrected content (only that dequeue counts — ledgerRefreshed checks
+		// when it began).
+		ledgerRefreshed(key, refreshDequeueBegan(key))
 	} else {
 		o.refused.Store(true)
 	}
