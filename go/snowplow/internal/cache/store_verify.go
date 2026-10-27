@@ -255,24 +255,53 @@ func identityOf(obj any) (string, objIdentity, bool) {
 	return key, objIdentity{rv: acc.GetResourceVersion(), uid: string(acc.GetUID())}, true
 }
 
-// compareStore is the whole of B's classification, and it is deliberately one
+// compareStore is the snapshot path's comparison: diffStore's candidates,
+// judged by confirmDivergences under the one lost-update rule. On this path
+// the rule's delivery clause holds by construction — the reflector is blocked
+// inside the read, so nothing can be delivered after it — and settled is nil.
+// The forced pass, where deliveries do continue, judges the same candidates
+// with the same function, passing the clause (store_verify_recheck.go).
+func compareStore(idx clientcache.Indexer, upstream map[string]objIdentity) divergenceReport {
+	candidates := diffStore(idx, upstream)
+	return reportOf(len(upstream), len(candidates), confirmDivergences(idx, upstream, candidates, nil))
+}
+
+// reportOf builds a report from the candidates that still diverge.
+func reportOf(objectsCompared, candidates int, confirmed []divergenceCandidate) divergenceReport {
+	rep := divergenceReport{objectsCompared: objectsCompared, candidates: candidates}
+	for _, c := range confirmed {
+		switch c.class {
+		case classLostAdd:
+			rep.lostAdd = append(rep.lostAdd, c.key)
+		case classLostUpdate:
+			rep.lostUpdate = append(rep.lostUpdate, c.key)
+		case classLostDelete:
+			rep.lostDelete = append(rep.lostDelete, c.key)
+		case classUIDMismatch:
+			rep.uidMismatch = append(rep.uidMismatch, c.key)
+		}
+	}
+	return rep
+}
+
+// diffStore is the whole of B's classification, and it is deliberately one
 // function shared by both detection sites so the two can never drift about what
-// a lost UPDATE is.
+// a lost UPDATE is. It returns every key on which the store and the read
+// disagree, by class; whether a candidate COUNTS is the rule's, applied by
+// confirmDivergences.
 //
 // The UID class is the one that matters most and the one a key-set diff is
 // structurally blind to: ResolvedKeyInputs carries class/G/V/R/namespace/name/
 // BindingUID and NO object UID, so a delete-and-recreate under the same name
 // reuses the byte-identical L1 cell. The ten-day staleness in #237 is a UID
 // phantom, which is why that arm is load-bearing rather than defensive.
-func compareStore(idx clientcache.Indexer, upstream map[string]objIdentity) divergenceReport {
-	var rep divergenceReport
+func diffStore(idx clientcache.Indexer, upstream map[string]objIdentity) []divergenceCandidate {
 	stored := make(map[string]objIdentity, len(upstream))
 	for _, obj := range idx.List() {
 		if key, id, ok := identityOf(obj); ok {
 			stored[key] = id
 		}
 	}
-	rep.objectsCompared = len(upstream)
 
 	var candidates []divergenceCandidate
 	for key, up := range upstream {
@@ -294,25 +323,8 @@ func compareStore(idx clientcache.Indexer, upstream map[string]objIdentity) dive
 			candidates = append(candidates, divergenceCandidate{key, classLostDelete})
 		}
 	}
-	rep.candidates = len(candidates)
-	if rep.candidates == 0 {
-		return rep
-	}
-	storeDivergenceCandidates.Add(uint64(rep.candidates))
-
-	for _, c := range confirmDivergences(idx, upstream, candidates) {
-		switch c.class {
-		case classLostAdd:
-			rep.lostAdd = append(rep.lostAdd, c.key)
-		case classLostUpdate:
-			rep.lostUpdate = append(rep.lostUpdate, c.key)
-		case classLostDelete:
-			rep.lostDelete = append(rep.lostDelete, c.key)
-		case classUIDMismatch:
-			rep.uidMismatch = append(rep.uidMismatch, c.key)
-		}
-	}
-	return rep
+	storeDivergenceCandidates.Add(uint64(len(candidates)))
+	return candidates
 }
 
 // divergenceClass is which of the four classes a candidate falls in.
@@ -338,13 +350,48 @@ const confirmDivergenceBudget = 250 * time.Millisecond
 // confirmDivergenceTick is the re-read cadence inside the budget.
 const confirmDivergenceTick = 10 * time.Millisecond
 
-// confirmDivergences re-reads the candidate keys until they agree with upstream
-// or the budget expires, and returns those that still disagree.
+// confirmDivergences applies THE LOST-UPDATE RULE (#918) to every candidate of
+// every comparison site, and returns those that count. A candidate counts only
+// if BOTH hold:
+//
+//  1. nothing was delivered for its key after the read it is held to began,
+//     and
+//  2. the store still disagrees with that read — judged on what the store has
+//     RECEIVED, not only on what it has applied yet: a delivery that carried
+//     exactly the read's {rv, uid} gave the store the read's state, and only
+//     its application is pending.
+//
+// A key delivered after the read is not a lost update whatever the store now
+// holds: the watch is still carrying that object, so the store has received
+// its state after the read. Comparing such a store with the read compares two
+// different moments of the object and reads the difference as a loss — the
+// store AHEAD of the read: #872's LIST, and #918's re-check sweep, which read
+// 379 objects at 5/s, took longer than their 20 s update interval, and so
+// found most of them "lost". The store BEHIND the read (#878) is the same
+// mistake the other way round: the read's state was delivered, before or
+// after the read, and the store had not applied it yet when it was compared.
+// A key with no delivery after the read, whose store has not received the
+// read's state and still disagrees with it, did miss a change, and it counts
+// however long the pass took to get there — so no verdict depends on the
+// pass's duration.
+//
+// settled is what the site's delivery record says about a key: clause 1, and
+// clause 2's "received". nil on the snapshot path, where the reflector is
+// blocked inside the read, so nothing CAN be delivered after it, and the
+// comparison is against the store's applied state with the drain wait below.
+// On the forced pass it reads the delivery record, which stays open until
+// this returns (store_verify_recheck.go). It is checked on every re-read, so a
+// delivery landing during the wait settles its key.
+//
+// confirmDivergences re-reads the candidate keys until each is settled or
+// agrees with the read, or the budget expires, and returns those that still
+// disagree.
 //
 // THE DRAIN RACE. The indexer lags the DeltaFIFO: a delta already queued but
 // not yet popped makes the store look older than upstream, and counting that as
 // a divergence would be a false positive on a perfectly healthy process.
-// Because the reflector is blocked inside our call we can afford to wait.
+// On the snapshot path the reflector is blocked inside our call, so we can
+// afford to wait.
 //
 // THE BUDGET IS FOR THE WHOLE COMPARISON, NOT PER KEY. A correlated divergence
 // across thousands of keys must not be able to stall the watch stream for
@@ -357,12 +404,16 @@ const confirmDivergenceTick = 10 * time.Millisecond
 // candidates-minus-confirmed gap is itself a signal — it says the FIFO is
 // backing up, which is a different problem from a stale store and deserves to
 // be readable as one.
-func confirmDivergences(idx clientcache.Indexer, upstream map[string]objIdentity, candidates []divergenceCandidate) []divergenceCandidate {
+func confirmDivergences(idx clientcache.Indexer, upstream map[string]objIdentity, candidates []divergenceCandidate,
+	settled func(key string) bool) []divergenceCandidate {
 	deadline := time.Now().Add(confirmDivergenceBudget)
 	pending := candidates
 	for {
 		still := pending[:0:0]
 		for _, c := range pending {
+			if settled != nil && settled(c.key) {
+				continue
+			}
 			if stillDivergent(idx, upstream, c) {
 				still = append(still, c)
 			}

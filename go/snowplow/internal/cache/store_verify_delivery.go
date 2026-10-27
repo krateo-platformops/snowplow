@@ -1,7 +1,9 @@
-// store_verify_delivery.go — #875: which keys the reflector delivered while a
-// forced pass was open. Only those can be "store ahead of the LIST", so only
-// those are re-read (store_verify_recheck.go); every other candidate is counted
-// as it stands, with no GET.
+// store_verify_delivery.go — #875, #918: which keys the reflector delivered
+// while a forced pass was open, and when. Only those can be "store ahead of
+// the LIST", so only those are re-read (store_verify_recheck.go); every other
+// candidate is held to the LIST, with no GET. Each delivery's position against
+// the pass's reads is what the lost-update rule reads (#918, see DELIVERY
+// POSITIONS below).
 //
 // # WHY A SIGNAL AND NOT A CAP
 //
@@ -88,7 +90,7 @@
 // reflects every change up to p, resourceVersions are unique, and the
 // reflector publishes positions in delivery order. It does not assume the
 // watch and the LIST are served by the same apiserver. Step 3 costs at most
-// one key (two GETs), and only when that key is also a candidate.
+// one key (one GET), and only when that key is also a candidate.
 //
 // # RELISTS
 //
@@ -115,6 +117,22 @@
 // anything the watch had already delivered. The result is one unnecessary
 // repair, never a hidden loss: an uncovered key is counted as a divergence,
 // not cleared.
+//
+// # DELIVERY POSITIONS (#918)
+//
+// The record also orders the deliveries. Every delivery the transform sees
+// takes the next number on one per-informer counter, and while a pass is open
+// the record keeps, per key, the number and the {rv, uid} of that key's latest
+// delivery. The counter is ours, not a resourceVersion: it says only "this
+// delivery happened before or after that instant, in this process", which is
+// all the lost-update rule needs (store_verify_recheck.go). It never orders two
+// resourceVersions, which the API forbids.
+//
+// mark() reads the counter at the instant a read is issued. A delivery for the
+// read's key numbered above the mark was delivered after the read began. The
+// pass keeps the record open until it has judged every candidate — through the
+// re-check's reads and the drain wait — so a delivery that lands at any point
+// before the verdict is in the record.
 package cache
 
 import (
@@ -132,10 +150,21 @@ type deliveryLog struct {
 	position func() string
 
 	mu sync.Mutex
+	// seq numbers the deliveries: how many objects the transform has seen. A
+	// delivery's number is seq just after its increment.
+	seq uint64
 	// latest is the latest object the transform saw.
 	latest any
-	// open is the set of keys delivered since a pass opened; nil when none is.
-	open map[string]struct{}
+	// open holds the latest delivery of each key delivered since a pass
+	// opened; nil when no pass is open.
+	open map[string]delivery
+}
+
+// delivery is one key's latest delivery while a pass is open: its number on
+// the log's counter and the {rv, uid} it carried.
+type delivery struct {
+	seq uint64
+	id  objIdentity
 }
 
 func newDeliveryLog(position func() string) *deliveryLog {
@@ -156,10 +185,11 @@ func (rw *ResourceWatcher) rememberDeliveryLogLocked(gvr schema.GroupVersionReso
 func (l *deliveryLog) transform(next clientcache.TransformFunc) clientcache.TransformFunc {
 	return func(obj any) (any, error) {
 		l.mu.Lock()
+		l.seq++
 		l.latest = obj
 		if l.open != nil {
-			if key, _, ok := identityOf(obj); ok {
-				l.open[key] = struct{}{}
+			if key, id, ok := identityOf(obj); ok {
+				l.open[key] = delivery{seq: l.seq, id: id}
 			}
 		}
 		l.mu.Unlock()
@@ -177,35 +207,42 @@ type deliveryWindow struct {
 	// forced LIST's NotOlderThan resourceVersion. Empty when none is
 	// published yet.
 	position string
+	// openedAt is the delivery counter when the pass opened. It is the mark
+	// the forced LIST is held to: the LIST is issued after it, so a delivery
+	// numbered above it came after the LIST began.
+	openedAt uint64
 	// presentAtOpen is the store's key set at open, sorted.
 	presentAtOpen []string
 
 	// closed and keys are set by the first close (under log.mu).
 	closed bool
-	keys   map[string]struct{}
+	keys   map[string]delivery
 }
 
 // openPass opens a pass (see the file header).
 func (l *deliveryLog) openPass(idx clientcache.Indexer) *deliveryWindow {
 	l.mu.Lock()
-	l.open = map[string]struct{}{}
-	latest := l.latest
+	l.open = map[string]delivery{}
+	latest, openedAt := l.latest, l.seq
 	present := idx.ListKeys()
 	l.mu.Unlock()
 
-	w := &deliveryWindow{log: l, position: l.position(), presentAtOpen: present}
+	w := &deliveryWindow{log: l, position: l.position(), openedAt: openedAt, presentAtOpen: present}
 	sort.Strings(w.presentAtOpen)
 	// The latest object may be in flight: transformed, its position not yet
 	// published. Unless the position just read IS its resourceVersion — a
 	// watch delivery publishes exactly its object's resourceVersion, so then
 	// it is published, the LIST includes it, and it needs no re-read. Any
 	// other value (a bookmark since, a relist item) keeps it, at the cost of
-	// at most one key.
+	// at most one key. It is recorded under openedAt, not a later number: it
+	// was delivered before the pass opened, so it is never "delivered after"
+	// any read the pass issues. A delivery for the same key since open is
+	// newer and is kept instead.
 	if latest != nil {
 		if key, id, ok := identityOf(latest); ok && id.rv != w.position {
 			l.mu.Lock()
-			if l.open != nil {
-				l.open[key] = struct{}{}
+			if _, since := l.open[key]; l.open != nil && !since {
+				l.open[key] = delivery{seq: openedAt, id: id}
 			}
 			l.mu.Unlock()
 		}
@@ -213,10 +250,19 @@ func (l *deliveryLog) openPass(idx clientcache.Indexer) *deliveryWindow {
 	return w
 }
 
-// close stops recording and returns the keys delivered while the pass was
-// open. Idempotent: forcedVerify closes explicitly once the comparison is done
+// recordedLocked is the record the window reads: live while the pass is open,
+// frozen by close. Callers hold log.mu.
+func (w *deliveryWindow) recordedLocked() map[string]delivery {
+	if w.closed {
+		return w.keys
+	}
+	return w.log.open
+}
+
+// close stops recording and returns the deliveries recorded while the pass
+// was open. Idempotent: forcedVerify closes once every candidate is judged,
 // and again, deferred, on every early return.
-func (w *deliveryWindow) close() map[string]struct{} {
+func (w *deliveryWindow) close() map[string]delivery {
 	w.log.mu.Lock()
 	defer w.log.mu.Unlock()
 	if !w.closed {
@@ -226,11 +272,24 @@ func (w *deliveryWindow) close() map[string]struct{} {
 	return w.keys
 }
 
-// delivered reports whether key may be ahead of the LIST: it was delivered
-// while the pass was open, or (a lost ADD) it was in the store at open and is
-// gone now. Only such a candidate is re-read.
-func (w *deliveryWindow) delivered(keys map[string]struct{}, key string, class divergenceClass) bool {
-	if _, ok := keys[key]; ok {
+// mark returns the delivery counter now. A read issued after this call is
+// held to it: a delivery for the read's key numbered above it came after the
+// read began.
+func (w *deliveryWindow) mark() uint64 {
+	w.log.mu.Lock()
+	defer w.log.mu.Unlock()
+	return w.log.seq
+}
+
+// moved reports whether the store may have moved for key since the pass
+// opened: a delivery for it was recorded, or (a lost ADD) it was in the store
+// at open and is gone now — a relist tombstone, which skips the transform.
+// Only such a candidate is re-read; every other one is held to the LIST.
+func (w *deliveryWindow) moved(key string, class divergenceClass) bool {
+	w.log.mu.Lock()
+	_, ok := w.recordedLocked()[key]
+	w.log.mu.Unlock()
+	if ok {
 		return true
 	}
 	if class != classLostAdd {
@@ -238,4 +297,12 @@ func (w *deliveryWindow) delivered(keys map[string]struct{}, key string, class d
 	}
 	i := sort.SearchStrings(w.presentAtOpen, key)
 	return i < len(w.presentAtOpen) && w.presentAtOpen[i] == key
+}
+
+// latestFor returns key's latest delivery recorded while the pass was open.
+func (w *deliveryWindow) latestFor(key string) (delivery, bool) {
+	w.log.mu.Lock()
+	defer w.log.mu.Unlock()
+	d, ok := w.recordedLocked()[key]
+	return d, ok
 }

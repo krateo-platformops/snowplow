@@ -330,43 +330,46 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 			upstream[key] = id
 		}
 	}
-	report := compareStore(idx, upstream)
-	// #872 — the store kept moving while the LIST was in flight, so a
-	// divergence the store may have moved past counts only if it still holds
-	// against the object's current state (store_verify_recheck.go). #875 —
-	// only a key delivered during the pass can have moved; every other
-	// candidate is counted as it stands. A failed re-check makes the pass
-	// inconclusive: nothing is published or repaired, and the GVR is not marked
-	// verified, so the deadline walker comes back to it.
-	if report.total() > 0 && win == nil {
-		// #875 — NO DELIVERY RECORD: count every candidate as it stands, with
-		// no GET — the pre-#872 behaviour, for this GVR only. Skipping instead
+	candidates := diffStore(idx, upstream)
+	// #872 / #875 / #918 — the store kept moving while the LIST was in flight
+	// and keeps moving while the candidates are judged, so each candidate is
+	// held to one read and counts only under the lost-update rule: nothing
+	// delivered for its key after that read began, and the store still
+	// disagrees with it (store_verify_recheck.go). The delivery record stays
+	// open until the last candidate is judged (closed by the defer above). A
+	// failed re-read makes the pass inconclusive: nothing is published or
+	// repaired, and the GVR is not marked verified, so the deadline walker
+	// comes back to it.
+	var report divergenceReport
+	switch {
+	case len(candidates) == 0:
+		report = reportOf(len(upstream), 0, nil)
+	case win == nil:
+		// #875 — NO DELIVERY RECORD: the rule's delivery clause cannot be
+		// evaluated, so every candidate is judged on the store alone, with no
+		// GET — the pre-#872 behaviour, for this GVR only. Skipping instead
 		// would leave exactly the #237 class unverified: a re-registered
 		// shared-factory GVR gets its already-started informer back, the
 		// transform cannot be installed, and a skipped pass would also starve
 		// #244's factory-divergence age of its only input (noteVerified). The
 		// cost is that churn can be misread as a loss here, as it was before
 		// #872, and store_divergence_recheck_unavailable_total says so.
+		report = reportOf(len(upstream), len(candidates), confirmDivergences(idx, upstream, candidates, nil))
 		storeRecheckUnavailableTotal.Add(report.total())
-	} else if report.total() > 0 {
-		// Closed only now: compareStore's confirm loop reads the store until
-		// it returns, so a delivery landing during that loop must be in the
-		// record.
-		delivered := win.close()
-		mayHaveMoved := func(key string, class divergenceClass) bool { return win.delivered(delivered, key, class) }
-		rechecked, ok := recheckAgainstCurrent(ctx, cli, gvr, idx, report, mayHaveMoved)
+	default:
+		judged, ok := judgeForcedPass(ctx, cli, gvr, idx, upstream, candidates, win)
 		if !ok {
 			recordVerifySkipped(verifySkipRecheckError)
 			slog.Warn("cache.store.verification_recheck_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
-				slog.Int("candidates", int(report.total())),
+				slog.Int("candidates", len(candidates)),
 				slog.String("hint", "a quorum re-read of a divergence candidate failed, so this pass is "+
 					"inconclusive: nothing was published or repaired and the GVR stays due for "+
 					"verification. A real divergence is found by the next pass."))
 			return
 		}
-		report = rechecked
+		report = judged
 	}
 	publishDivergence(gvr, verifySiteForced, report)
 
