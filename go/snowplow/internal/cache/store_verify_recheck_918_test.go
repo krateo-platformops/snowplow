@@ -30,7 +30,9 @@ import (
 	"fmt"
 	"strconv"
 	"testing"
+	"time"
 
+	"k8s.io/apimachinery/pkg/watch"
 	clientcache "k8s.io/client-go/tools/cache"
 )
 
@@ -336,5 +338,54 @@ func TestDeliveryLog918_PositionsOrderDeliveriesAgainstReads(t *testing.T) {
 	_, _ = tf(a3.obj())
 	if d, _ := win.latestFor("demo/panel-a"); d.id.rv != a2.rv {
 		t.Errorf("a delivery after close changed the record: %+v", d)
+	}
+}
+
+// TestForcedPass918_879_DeliveryDuringTheDrainWait_Settles — #879's missing
+// arm: a delivery that lands while the pass is already judging, inside the
+// drain wait. panel-b is behind the LIST and nothing was delivered for it
+// while the LIST was in flight, so it is held to the LIST. ~50 ms after the
+// LIST answers — after the comparison found it, inside the 250 ms wait — the
+// watch delivers panel-b's NEXT state, which the LIST does not have either:
+// the store never agrees with the LIST, so only the rule's delivery clause,
+// read on every pass of the wait with the record still open, can settle it.
+// A record closed before the judgement (reviewer-818's mutant D4, and #918's
+// M4) publishes it.
+func TestForcedPass918_879_DeliveryDuringTheDrainWait_Settles(t *testing.T) {
+	b2 := r872Object{"panel-b", "2", "uid-b"}
+	b3 := r872Object{"panel-b", "3", "uid-b"}
+	_, cli := r872Setup(t, []r872Object{b1}, []r872Object{b3}, []r872Object{b2}, nil)
+	w := silentWatchLatest.Load()
+	delivered := make(chan time.Time, 1)
+	cli.duringList = func() {
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			w.Action(watch.Modified, b3.obj())
+			delivered <- time.Now()
+		}()
+	}
+	candidates0 := storeDivergenceCandidates.Load()
+	forcedVerify(context.Background(), repairGVR)
+	returned := time.Now()
+
+	if got := storeDivergenceCandidates.Load() - candidates0; got != 1 {
+		t.Fatalf("precondition: %d candidates, want panel-b (the delivery landed before the comparison?)", got)
+	}
+	select {
+	case at := <-delivered:
+		if !at.Before(returned) {
+			t.Fatalf("precondition: the delivery landed after the pass returned, not during its wait")
+		}
+	case <-time.After(verifyBound):
+		t.Fatalf("precondition: the delivery never happened")
+	}
+	if got := r872Published(); got != 0 {
+		t.Fatalf("#879 RED: a key delivered during the drain wait was published as %d lost update(s)", got)
+	}
+	if d := storeRepairQueueDepth(); d != 0 {
+		t.Fatalf("#879 RED: %d repair(s) queued for a store that lost nothing", d)
+	}
+	if got := storeRecheckDeliveredAfterTotal.Load(); got != 1 {
+		t.Errorf("store_divergence_recheck_delivered_after_read_total = %d, want 1", got)
 	}
 }
