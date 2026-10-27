@@ -728,9 +728,11 @@ def test_a_churn_failure_without_an_http_status_is_recorded(mutate, error):
                             on_failure=lambda f: (lock.acquire(), seen.append(f), lock.release())).start()
     time.sleep(0.2)
     rec = d.stop()
+    t1 = time.time()
     assert rec["failed"] == rec["issued"] == len(seen) >= 1
-    # t is rounded to the millisecond (the record's own resolution): within one of the clock read before
-    assert all(f["status"] is None and f["error"] == error and t0 - 0.001 <= f["t"] <= time.time() for f in seen), (t0, seen)
+    # t is rounded to the millisecond (the record's own resolution, up or down): within one of
+    # the clock reads before the start and after the stop
+    assert all(f["status"] is None and f["error"] == error and t0 - 0.001 <= f["t"] <= t1 + 0.001 for f in seen), (t0, t1, seen)
 
 
 def test_a_failed_probe_write_carries_its_status_too():
