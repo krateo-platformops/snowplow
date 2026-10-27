@@ -15,8 +15,8 @@ package api
 //   E   the outcome is what the authority answered: the real 2xx code, an
 //       accepted write whose body is unusable is a success with a note, a dial
 //       with no response is a failure with no code (review item E).
-//   C3  the same write dialled by a BACKGROUND driver (no requester: a reconcile,
-//       not a request) emits nothing, though the write went out.
+//   C3  the same write under a BACKGROUND driver (no requester: a reconcile,
+//       not a request) is never sent (#903) and emits nothing.
 //   C5  is the audit package's (audit_incomplete_410_test.go); here the stage
 //       emit site handed a write with no actor emits nothing.
 
@@ -403,42 +403,37 @@ func TestAudit410_E_OutcomeIsWhatTheAuthorityAnswered(t *testing.T) {
 	})
 }
 
-// C3 — a write a background driver dials (a reconcile: no requester) emits
-// nothing. The precondition proves the write went out, so the absence is the
-// emit site's decision and not a write that never happened.
+// C3 — a write under a background driver (a reconcile: no requester) is never
+// sent (#903: background work only reads) and so emits no record. 0 sends AND 0
+// records: the trail has nothing to say about a write that never happened. The
+// control (the same stage on a customer resolve) proves both counts can move.
 func TestAudit410_C3_BackgroundDriverWrite_EmitsNoRecord(t *testing.T) {
-	for _, origin := range []string{cache.BackgroundOriginRefresher, cache.BackgroundOriginCohortSeed, cache.BackgroundOriginPrewarmEngineBoot} {
-		t.Run(origin, func(t *testing.T) {
-			api, _ := upstream410(t)
-			ext, extDials := upstream410(t)
-			env410(t, api.URL, ext.URL)
-			rec := records410(t)
-
-			ctx := cache.WithBackgroundResolveOrigin(ctxWithUser(user410, group410), origin)
-			resolve410(ctx, api.URL, extStage410("render", http.MethodPost, "/render"))
-
-			if n := len(extDials()); n != 1 {
-				t.Fatalf("precondition: the background resolve dialled %d writes, want 1", n)
-			}
-			if got := attrs410(rec); len(got) != 0 {
-				t.Fatalf("a background write emitted %d records, want 0: %v", len(got), got)
-			}
-		})
-	}
-	t.Run("prewarm-path", func(t *testing.T) {
+	run := func(t *testing.T, ctx context.Context, wantSends, wantRecords int) {
+		t.Helper()
 		api, _ := upstream410(t)
 		ext, extDials := upstream410(t)
 		env410(t, api.URL, ext.URL)
 		rec := records410(t)
 
-		resolve410(cache.WithPrewarmPath(ctxWithUser(user410, group410)), api.URL, extStage410("render", http.MethodPost, "/render"))
+		resolve410(ctx, api.URL, extStage410("render", http.MethodPost, "/render"))
 
-		if n := len(extDials()); n != 1 {
-			t.Fatalf("precondition: the prewarm resolve dialled %d writes, want 1", n)
+		if n := len(extDials()); n != wantSends {
+			t.Fatalf("the resolve dialled %d writes, want %d", n, wantSends)
 		}
-		if got := attrs410(rec); len(got) != 0 {
-			t.Fatalf("a prewarm write emitted %d records, want 0: %v", len(got), got)
+		if got := attrs410(rec); len(got) != wantRecords {
+			t.Fatalf("the resolve emitted %d records, want %d: %v", len(got), wantRecords, got)
 		}
+	}
+	for _, origin := range []string{cache.BackgroundOriginRefresher, cache.BackgroundOriginCohortSeed, cache.BackgroundOriginPrewarmEngineBoot} {
+		t.Run(origin, func(t *testing.T) {
+			run(t, cache.WithBackgroundResolveOrigin(ctxWithUser(user410, group410), origin), 0, 0)
+		})
+	}
+	t.Run("prewarm-path", func(t *testing.T) {
+		run(t, cache.WithPrewarmPath(ctxWithUser(user410, group410)), 0, 0)
+	})
+	t.Run("control-customer", func(t *testing.T) {
+		run(t, ctxWithUser(user410, group410), 1, 1)
 	})
 }
 
