@@ -59,6 +59,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -515,11 +516,13 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	installed := time.Now()
 	rw.mu.Unlock()
 	storeSwapStats.swaps.Add(1)
+	swapStep(c, "installed")
 
 	// Step 2 — no lock held. C3: close EVERY retiring copy's stop (once
 	// each), then wait for every one's Run to return. The wait ends when each
 	// listener's in-flight handler call returns (an inherited bound: the CRD
 	// lifecycle park, crdLifecycleParkMax).
+	swapStep(c, "before_close_retiring")
 	for _, r := range retiring {
 		r.closeStop()
 	}
@@ -542,6 +545,7 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	acc = c.account
 	c.account = nil
 	rw.mu.Unlock()
+	swapStep(c, "after_step3")
 
 	// Step 4 — unmute. First every key whose object is not the one the old
 	// copy held is made pending in the incremental cells (F5: the comparator
@@ -551,12 +555,14 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	// handlers act.
 	markChangedPending(gvr, live, c)
 	setComparatorRecord(gvr, c)
+	swapStep(c, "before_unmute")
 	c.muted.Store(false)
 
 	// Step 5 — M, after the unmute: a write the new copy took while muted
 	// cannot fall between the two.
 	m := computeM(c)
 	storeSwapStats.mKeys.Add(uint64(len(m)))
+	swapStep(c, "after_m")
 
 	// Q3 — the ledger opens BEFORE M is delivered, so no dependent can be
 	// refreshed and pushed before its entry exists.
@@ -573,6 +579,19 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 		slog.Int("m_keys", len(m)),
 		slog.Int("retired_copies", len(retiring)),
 	)
+}
+
+// swapStepHookForTest, when non-nil, runs at named points of installBuild
+// ("installed", "before_close_retiring", "after_step3", "before_unmute",
+// "after_m"), never under a lock. TEST-ONLY: production pays one atomic load
+// per point. The interleaving arms (K11d, K11e, K11f) use it to land a write
+// or another install at an exact step.
+var swapStepHookForTest atomic.Pointer[func(c *storeInstance, step string)]
+
+func swapStep(c *storeInstance, step string) {
+	if h := swapStepHookForTest.Load(); h != nil {
+		(*h)(c, step)
+	}
 }
 
 // pruneRetiredLocked drops the waited-for copies from the retiring set.

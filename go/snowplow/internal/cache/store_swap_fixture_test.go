@@ -228,7 +228,7 @@ func newSwapFix(t *testing.T, gvr schema.GroupVersionResource, objs []*unstructu
 	}
 	f.fake = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, kinds)
 	for _, o := range objs {
-		if err := f.fake.Tracker().Create(gvr, o.DeepCopy(), swapNS); err != nil {
+		if err := f.fake.Tracker().Create(gvr, o.DeepCopy(), o.GetNamespace()); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 	}
@@ -296,6 +296,13 @@ func newSwapFix(t *testing.T, gvr schema.GroupVersionResource, objs []*unstructu
 	return f
 }
 
+// newSwapFixCluster is newSwapFix for objects of any namespace (a
+// cluster-scoped GVR's objects have none).
+func newSwapFixCluster(t *testing.T, gvr schema.GroupVersionResource, objs ...*unstructured.Unstructured) *swapFix {
+	t.Helper()
+	return newSwapFix(t, gvr, objs)
+}
+
 // holdList holds the n-th LIST of the GVR (1-based: 1 is the live copy's).
 // Returns the release func.
 func (f *swapFix) holdList(n int64) func() {
@@ -346,8 +353,8 @@ func (f *swapFix) clusterSet(o *unstructured.Unstructured) {
 		}
 		return
 	}
-	if err := f.fake.Tracker().Update(f.gvr, o.DeepCopy(), swapNS); err != nil {
-		if err := f.fake.Tracker().Create(f.gvr, o.DeepCopy(), swapNS); err != nil {
+	if err := f.fake.Tracker().Update(f.gvr, o.DeepCopy(), o.GetNamespace()); err != nil {
+		if err := f.fake.Tracker().Create(f.gvr, o.DeepCopy(), o.GetNamespace()); err != nil {
 			f.t.Fatalf("cluster set: %v", err)
 		}
 	}
