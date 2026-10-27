@@ -9,6 +9,14 @@ package credhttp
 //
 // Exemptions are listed in `allowed` with the reason. Each one must still
 // match something, so an exemption cannot outlive the code it excuses.
+//
+// #920 extends it to the client-side rate limit. Outside this package a
+// *rest.Config may only be copied from one credhttp returned (rest.CopyConfig,
+// *rc), never built from nothing (a rest.Config literal, new(rest.Config), a
+// zero-value variable, field or renamed type), and no code assigns QPS, Burst
+// or RateLimiter: those would bring client-go's limiter back. Inside this
+// package, every function that builds a REST client or a *rest.Config must
+// apply noClientRateLimit (TestIssue920_EveryCredhttpBuilderAppliesNoClientRateLimit).
 
 import (
 	"go/ast"
@@ -67,18 +75,31 @@ func forbidden(pkgPath, name string) bool {
 
 var forConfigRe = regexp.MustCompile(`^New.*ForConfig`)
 
-// httpClientType reports whether e is the NON-pointer type net/http.Client or
-// net/http.Transport, and which.
+// httpClientType reports whether e is the NON-pointer type net/http.Client,
+// net/http.Transport or (#920) k8s.io/client-go/rest.Config, and which, as
+// "http.Client", "http.Transport" or "rest.Config".
 func httpClientType(e ast.Expr, imports map[string]string) (string, bool) {
 	sel, ok := e.(*ast.SelectorExpr)
 	if !ok {
 		return "", false
 	}
 	id, ok := sel.X.(*ast.Ident)
-	if !ok || imports[id.Name] != "net/http" || (sel.Sel.Name != "Client" && sel.Sel.Name != "Transport") {
+	if !ok {
 		return "", false
 	}
-	return sel.Sel.Name, true
+	switch p := imports[id.Name]; {
+	case p == "net/http" && (sel.Sel.Name == "Client" || sel.Sel.Name == "Transport"):
+		return "http." + sel.Sel.Name, true
+	case p == "k8s.io/client-go/rest" && sel.Sel.Name == "Config":
+		return "rest.Config", true
+	}
+	return "", false
+}
+
+// limiterField reports whether name is a rest.Config field that sets the
+// client-side rate limit (#920).
+func limiterField(name string) bool {
+	return name == "QPS" || name == "Burst" || name == "RateLimiter"
 }
 
 // allowed: (module-relative file, enclosing func, reference) → reason.
@@ -134,25 +155,33 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 			// #729: new(http.Client) / new(http.Transport) is a zero-value client.
 			if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "new" && len(x.Args) == 1 {
 				if name, ok := httpClientType(x.Args[0], imports); ok {
-					out = append(out, ref{rel, fn, "new(http." + name + ")", fset.Position(x.Pos())})
+					out = append(out, ref{rel, fn, "new(" + name + ")", fset.Position(x.Pos())})
 				}
 			}
 		case *ast.ValueSpec:
 			// #729: `var c http.Client` (no value) is a zero-value client.
 			if name, ok := httpClientType(x.Type, imports); ok && len(x.Values) == 0 {
-				out = append(out, ref{rel, fn, "var http." + name, fset.Position(x.Pos())})
+				out = append(out, ref{rel, fn, "var " + name, fset.Position(x.Pos())})
 			}
 		case *ast.Field:
 			// #729: a by-value http.Client/Transport field or parameter is a
 			// zero-value (or copied) client that never passed through credhttp.
 			if name, ok := httpClientType(x.Type, imports); ok {
-				out = append(out, ref{rel, fn, "field http." + name, fset.Position(x.Pos())})
+				out = append(out, ref{rel, fn, "field " + name, fset.Position(x.Pos())})
 			}
 		case *ast.TypeSpec:
 			// #729: `type C http.Client` / `type C = http.Client` renames the
 			// type, so new(C), `var c C` and C{} would escape every shape above.
 			if name, ok := httpClientType(x.Type, imports); ok {
-				out = append(out, ref{rel, fn, "type http." + name, fset.Position(x.Pos())})
+				out = append(out, ref{rel, fn, "type " + name, fset.Position(x.Pos())})
+			}
+		case *ast.AssignStmt:
+			// #920: assigning QPS, Burst or RateLimiter puts a client-side
+			// limiter back on a config credhttp cleared.
+			for _, lhs := range x.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok && limiterField(sel.Sel.Name) {
+					out = append(out, ref{rel, fn, "assign ." + sel.Sel.Name, fset.Position(lhs.Pos())})
+				}
 			}
 		case *ast.SelectorExpr:
 			id, ok := x.X.(*ast.Ident)
@@ -164,12 +193,13 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 				out = append(out, ref{rel, fn, p[strings.LastIndex(p, "/")+1:] + "." + x.Sel.Name, fset.Position(x.Pos())})
 			}
 		case *ast.CompositeLit:
-			sel, ok := x.Type.(*ast.SelectorExpr)
+			name, ok := httpClientType(x.Type, imports)
 			if !ok {
 				return true
 			}
-			id, ok := sel.X.(*ast.Ident)
-			if !ok || imports[id.Name] != "net/http" || (sel.Sel.Name != "Client" && sel.Sel.Name != "Transport") {
+			// #920: a rest.Config literal is a config credhttp never saw.
+			if name == "rest.Config" {
+				out = append(out, ref{rel, fn, "rest.Config{}", fset.Position(x.Pos())})
 				return true
 			}
 			// An http.Client literal handed straight to credhttp.Client is hardened.
@@ -183,7 +213,7 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 					}
 				}
 			}
-			out = append(out, ref{rel, fn, "http." + sel.Sel.Name + "{}", fset.Position(x.Pos())})
+			out = append(out, ref{rel, fn, name + "{}", fset.Position(x.Pos())})
 		}
 		return true
 	})
@@ -304,6 +334,17 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 		"dotHTTP":     `import . "net/http"; var c = &Client{}`,
 		"dotClientGo": `import . "k8s.io/client-go/dynamic"; func f() { NewForConfig(nil) }`,
 		"dotPlumbing": `import . "github.com/krateo-platformops/plumbing/http/request"; func f() { HTTPClientForEndpoint(nil, nil) }`,
+		// #920 — a *rest.Config built from nothing, or a limiter put back.
+		"restConfigLit":     `import "k8s.io/client-go/rest"; var c = &rest.Config{Host: "h"}`,
+		"restConfigAliased": `import k8srest "k8s.io/client-go/rest"; var c = k8srest.Config{}`,
+		"restConfigNew":     `import "k8s.io/client-go/rest"; var c = new(rest.Config)`,
+		"restConfigVar":     `import "k8s.io/client-go/rest"; func f() { var c rest.Config; _ = c }`,
+		"restConfigField":   `import "k8s.io/client-go/rest"; type T struct{ c rest.Config }`,
+		"restConfigType":    `import "k8s.io/client-go/rest"; type C rest.Config`,
+		"qps":               `func f(rc *x) { rc.QPS = 50 }`,
+		"burst":             `func f(rc *x) { rc.Burst = 100 }`,
+		"rateLimiter":       `func f(rc *x) { rc.RateLimiter = nil }`,
+		"qpsMulti":          `func f(rc *x) { rc.Host, rc.QPS = "h", 50 }`,
 	}
 	for name, body := range cases {
 		fset := token.NewFileSet()
@@ -327,8 +368,9 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 			t.Errorf("package-level literal after a func: want fn \"\", got %+v", got)
 		}
 	}
-	// And it must NOT flag the hardened forms.
-	ok := `import ("net/http"; "github.com/krateo-platformops/snowplow/internal/credhttp"); var c = credhttp.Client(&http.Client{}); type T struct{ h *http.Client }; func g(h *http.Client) {}; var p *http.Client`
+	// And it must NOT flag the hardened forms, nor a copy of a config credhttp
+	// returned (#920: a copy keeps the no-limiter setting).
+	ok := `import ("net/http"; "k8s.io/client-go/rest"; "github.com/krateo-platformops/snowplow/internal/credhttp"); var c = credhttp.Client(&http.Client{}); type T struct{ h *http.Client; rc *rest.Config }; func g(h *http.Client, rc *rest.Config) { cp := rest.CopyConfig(rc); v := *rc; cp.Host = v.Host }; var p *http.Client`
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "x.go", "package p\n"+ok+"\n", parser.SkipObjectResolution)
 	if err != nil {

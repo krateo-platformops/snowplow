@@ -1,36 +1,31 @@
 // phase1_roots_unthrottled_test.go — #120 falsifier for the boot-critical
-// navigation-roots read.
+// navigation-roots read, on its #920 home.
 //
-// ROOT CAUSE (#120): the roots-read dynamic client at phase1_walk.go was
-// built directly from the shared rc (main.go's rest.InClusterConfig()),
-// which carries no QPS / RateLimiter — so client-go synthesises its default
-// 5-QPS / 10-burst token-bucket limiter for it. On a slow-apiserver boot the
-// very first roots read (the frontend-config ConfigMap Get) can lose its
-// tryThrottle Wait to the startupProbe ctx deadline BEFORE the request is
-// sent — no nav roots, no recursive walk, proactive informer registration
+// ROOT CAUSE (#120): the roots-read dynamic client was built from main.go's
+// in-cluster config, which carried no QPS / RateLimiter, so client-go gave it
+// its default 5-QPS / 10-burst token bucket. On a slow-apiserver boot the
+// very first roots read (the frontend-config ConfigMap Get) could lose its
+// tryThrottle Wait to the startupProbe ctx deadline BEFORE the request was
+// sent: no nav roots, no recursive walk, proactive informer registration
 // starved.
 //
-// FIX (#120): rootsReadRESTConfig(rc) returns a shallow copy of rc with
-// QPS=-1 / Burst=0, so the roots client's limiter is nil (client-go only
-// builds a bucket when qps > 0) and tryThrottleWithInfo returns immediately
-// — the boot-critical roots path can never deadline on the throttle.
+// FIX: #120 copied the config and cleared the limiter for this one read
+// (rootsReadRESTConfig). #920 removed that per-site copy: credhttp builds
+// every client with no client-side limiter, so Phase1Warmup builds the roots
+// client with credhttp.Dynamic(rc) directly.
 //
 // These are HERMETIC unit tests: they drive the REAL client-go throttle path
-// (dynamic.NewForConfig → Request.tryThrottle → RateLimiter.Wait) against an
-// httptest apiserver, exercising the exact production helper
-// rootsReadRESTConfig. No cluster.
+// (Request.tryThrottle → RateLimiter.Wait) against an httptest apiserver. No
+// cluster.
 //
 // ARMS:
-//   - RED (pre-fix posture): the client built from the UN-tuned rc with a
-//     PRE-DRAINED token bucket (the boot condition) + a tight ctx — the read
-//     DEADLINES in tryThrottle, proving the limiter is the cause.
-//   - GREEN (with fix): the SAME drained-bucket rc passed through
-//     rootsReadRESTConfig — the limiter is dropped, so the SAME tight-ctx read
-//     COMPLETES.
-//   - NON-MUTATION: rootsReadRESTConfig(rc) does NOT mutate the shared rc's
-//     QPS / Burst / RateLimiter — the shared-rc safety invariant the fix
-//     depends on (rc also backs the informer/metadata/discovery/config-vars/
-//     secrets/controller-health clients).
+//   - RED (pre-fix posture): a client-go dynamic client built straight from a
+//     config whose token bucket is already drained (the boot condition), under
+//     a tight ctx: the read DEADLINES in tryThrottle, proving the limiter is
+//     the cause.
+//   - GREEN (with fix): the SAME drained-bucket config handed to
+//     credhttp.Dynamic, the builder Phase1Warmup uses: the client has no
+//     limiter, so the SAME tight-ctx read COMPLETES.
 
 package dispatchers
 
@@ -42,6 +37,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -91,10 +87,9 @@ func drainedBucketConfig(t *testing.T, srv *configMapReplyServer) *rest.Config {
 
 // getRootsConfigMap performs the SAME dynamic ConfigMap Get the roots read
 // uses (readFrontendConfig → dynCli.Resource(configMapGVR).Get), through the
-// real client-go throttle path, under the given ctx. dynCfg is the config the
-// dynamic client is built from — the arm under test.
-func getRootsConfigMap(ctx context.Context, dynCfg *rest.Config) error {
-	cli, err := k8sdynamic.NewForConfig(dynCfg)
+// real client-go throttle path, under the given ctx, with a client from build.
+func getRootsConfigMap(ctx context.Context, build func(*rest.Config) (k8sdynamic.Interface, error), rc *rest.Config) error {
+	cli, err := build(rc)
 	if err != nil {
 		return err
 	}
@@ -102,8 +97,15 @@ func getRootsConfigMap(ctx context.Context, dynCfg *rest.Config) error {
 	return err
 }
 
+func rawClientGoDynamic(rc *rest.Config) (k8sdynamic.Interface, error) {
+	return k8sdynamic.NewForConfig(rc)
+}
+
+// Phase1Warmup's builder.
+func credhttpDynamic(rc *rest.Config) (k8sdynamic.Interface, error) { return credhttp.Dynamic(rc) }
+
 // TestRootsRead_DrainedLimiter_DeadlinesWithoutFix is the RED arm: the pre-fix
-// posture (un-tuned rc + drained default-style bucket) under a tight ctx
+// posture (a client-go client over a drained bucket) under a tight ctx
 // DEADLINES in the client-side throttle before the request is sent.
 func TestRootsRead_DrainedLimiter_DeadlinesWithoutFix(t *testing.T) {
 	srv := newConfigMapReplyServer(t)
@@ -112,7 +114,7 @@ func TestRootsRead_DrainedLimiter_DeadlinesWithoutFix(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err := getRootsConfigMap(ctx, rc) // NO fix: rc used as-is
+	err := getRootsConfigMap(ctx, rawClientGoDynamic, rc)
 	if err == nil {
 		t.Fatalf("RED arm expected the roots read to fail (throttle should deadline), got nil error")
 	}
@@ -126,8 +128,8 @@ func TestRootsRead_DrainedLimiter_DeadlinesWithoutFix(t *testing.T) {
 }
 
 // TestRootsRead_Unthrottled_CompletesWithFix is the GREEN arm: the SAME
-// drained-bucket rc, once passed through rootsReadRESTConfig (the fix), has no
-// limiter — so the SAME tight-ctx read COMPLETES and reaches the apiserver.
+// drained-bucket config through credhttp.Dynamic (Phase1Warmup's builder) has
+// no limiter, so the SAME tight-ctx read COMPLETES and reaches the apiserver.
 func TestRootsRead_Unthrottled_CompletesWithFix(t *testing.T) {
 	srv := newConfigMapReplyServer(t)
 	rc := drainedBucketConfig(t, srv)
@@ -135,52 +137,10 @@ func TestRootsRead_Unthrottled_CompletesWithFix(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err := getRootsConfigMap(ctx, rootsReadRESTConfig(rc)) // fix applied
-	if err != nil {
+	if err := getRootsConfigMap(ctx, credhttpDynamic, rc); err != nil {
 		t.Fatalf("GREEN arm expected the roots read to complete under the fix, got: %v", err)
 	}
 	if !srv.reached {
 		t.Fatalf("GREEN arm: the apiserver handler should have been reached (no throttle to deadline)")
-	}
-}
-
-// TestRootsReadRESTConfig_DoesNotMutateSharedConfig pins the load-bearing
-// safety invariant: the fix COPIES rc before tuning, so the shared rc — which
-// also backs the informer factory, metadata, discovery, config-vars-watch,
-// secrets and controller-health clients — keeps its throttling untouched.
-func TestRootsReadRESTConfig_DoesNotMutateSharedConfig(t *testing.T) {
-	origLimiter := flowcontrol.NewTokenBucketRateLimiter(5, 10)
-	rc := &rest.Config{
-		Host:        "https://example.invalid",
-		QPS:         5,
-		Burst:       10,
-		RateLimiter: origLimiter,
-	}
-
-	got := rootsReadRESTConfig(rc)
-
-	// The COPY carries the un-throttled posture.
-	if got.QPS != -1 {
-		t.Errorf("roots config QPS = %v, want -1", got.QPS)
-	}
-	if got.Burst != 0 {
-		t.Errorf("roots config Burst = %v, want 0", got.Burst)
-	}
-	if got.RateLimiter != nil {
-		t.Errorf("roots config RateLimiter = %v, want nil (QPS<=0 only disables throttling when RateLimiter is nil)", got.RateLimiter)
-	}
-	if got == rc {
-		t.Errorf("rootsReadRESTConfig returned the SAME pointer as rc; must be a copy")
-	}
-
-	// The shared rc is UNTOUCHED — the whole point of copying.
-	if rc.QPS != 5 {
-		t.Errorf("shared rc.QPS mutated to %v, want 5 (unchanged)", rc.QPS)
-	}
-	if rc.Burst != 10 {
-		t.Errorf("shared rc.Burst mutated to %v, want 10 (unchanged)", rc.Burst)
-	}
-	if rc.RateLimiter != origLimiter {
-		t.Errorf("shared rc.RateLimiter changed; want the original limiter pointer preserved")
 	}
 }
