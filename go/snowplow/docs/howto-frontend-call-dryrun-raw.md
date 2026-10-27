@@ -137,9 +137,16 @@ Content-Type: application/json
     `NotRun`), `Error` (anything else).
     The header never carries an error message, a path, an identity or
     response data.
-  - Bounded: above 4 KiB it is `{"truncated":true,"failed":<N>}`.
+  - Bounded: above 4 KiB it is `{"truncated":true,"failed":<N>}` (N stages
+    did not succeed). So the header is EITHER a JSON array OR that object. A
+    parser must never read a parse failure, a non-array or a missing header
+    as success: only the array `[]` means every stage succeeded.
   - Since #904 it is set on stored resolves too (and on a cached answer). The
-    body is unaffected (still byte-identical to a stored resolve).
+    body is unaffected (still byte-identical to a stored resolve). A cached
+    answer carries the header of the resolve that stored it: `[]`, a #681
+    per-identity-forbidden resolve's rows, or an `Aborted` resolve's rows (it
+    is stored and answered with `Aborted` / `NotRun` until the RESTAction is
+    edited).
   - Changed in #904: a succeeded stage is no longer listed (it was
     `{"name":"<stage>","ok":true}`). A reader that only looks at `ok:false`
     rows is unaffected. In a dry run a write stage depending on another write

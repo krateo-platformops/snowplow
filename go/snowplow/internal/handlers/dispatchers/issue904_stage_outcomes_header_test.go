@@ -28,6 +28,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
@@ -151,6 +152,15 @@ func TestIssue904_W5_AbortedResolveHeader(t *testing.T) {
 	}
 	if w := (w904Row{Name: "sa", Reason: api.StageReasonNotRun}); rows["sa"] != w {
 		t.Fatalf("want stage sa NotRun, header=%s", v)
+	}
+	// As documented (howto/restactions.md): an aborted resolve of a read-only
+	// RESTAction is stored WITH its Aborted header, and a hit answers it.
+	if _, stored := cache.ResolvedCache().GetNoTouch(e.key(t, c681A)); !stored {
+		t.Fatal("the aborted resolve of a read-only RESTAction is documented as stored; it was not")
+	}
+	rec2, _ := e.callRec(t, c681A)
+	if v2, _ := w904Rows(t, rec2); v2 != v {
+		t.Fatalf("the L1 hit answered header %s, the resolve that stored it %s", v2, v)
 	}
 }
 

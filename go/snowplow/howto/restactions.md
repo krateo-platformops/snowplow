@@ -245,6 +245,15 @@ Every `/call` answer of a RESTAction carries `X-Snowplow-Stage-Outcomes`: a
 compact JSON array, in dependency order, of every stage that did **not**
 succeed. `[]` means every stage succeeded.
 
+The header has exactly two shapes:
+
+- a JSON **array** of rows (above); `[]` is the only "all succeeded";
+- the object `{"truncated":true,"failed":N}` when the array would exceed
+  4 KiB: N stages did not succeed, and which ones cannot be told.
+
+A reader must treat anything else — a header it cannot parse, a JSON value
+that is neither, a missing header — as **not** succeeded, never as `[]`.
+
 ```
 [{"name":"detachVolumes","ok":false,"reason":"Error"},
  {"name":"delete","ok":false,"reason":"Skipped","dependsOn":"detachVolumes"}]
@@ -258,12 +267,16 @@ succeed. `[]` means every stage succeeded.
   `{"name":"","ok":false,"reason":"Aborted"}` followed by every stage as
   `NotRun`, never `[]`.
 - It carries stage names and codes only: no error text, path, identity or
-  data. Above 4 KiB it is `{"truncated":true,"failed":N}`.
+  data.
 - The HTTP status is unchanged (see below), so a controller that drives a
   write lifecycle through `/call` reads this header to tell a half-done
   sequence from a done one, even when the RESTAction's `filter` hides the
   error keys. A cached answer carries the header of the resolve that stored
-  it.
+  it. Most cached answers carry `[]`; two kinds of resolve are stored with
+  a non-`[]` header: one whose only failures are per-identity forbiddens
+  (#681), and one that ran no stage (`Aborted`) — it is stored with its
+  `Aborted` / `NotRun` header and answered with it until the RESTAction is
+  edited (an edit evicts the cell).
 
 ### The HTTP status
 
