@@ -95,10 +95,6 @@ const (
 	// pass cannot issue a LIST whose result is provably at least as fresh as
 	// our store. Skipped rather than downgraded — see forcedVerify.
 	verifySkipNoSyncPosition = "no_sync_position"
-	// #872 — a quorum re-read of a forced-pass divergence candidate failed, so
-	// the pass could not tell a real divergence from the store having moved
-	// past the LIST. Nothing was published or repaired; the GVR stays due.
-	verifySkipRecheckError = "recheck_error"
 )
 
 // Unverifiable reasons — a registered GVR that no verification mechanism
@@ -187,14 +183,17 @@ type StoreVerificationStats struct {
 	DivergentUIDMismatchForced   uint64 `stat:"store_divergent_uid_mismatch_forced_total" desc:"Same class, found by the forced pass. DURING #237's ten-day staleness: >=1. Healthy: 0. Load-bearing rather than defensive — the ten-day case IS a uid phantom."`
 	DivergenceCandidatesTotal    uint64 `stat:"store_divergence_candidates_total" desc:"RAW divergences seen before the bounded re-read confirmed them. DURING: >= the sum of the confirmed counters. Healthy: ~0. A large candidates-minus-confirmed gap is a DeltaFIFO backlog (the indexer lagging the queue), NOT a store defect — which is why the raw number is published rather than hidden."`
 
-	RecheckGETsTotal              uint64 `stat:"store_divergence_recheck_gets_total" desc:"Quorum metadata GETs the forced pass issued to re-read divergence candidates (#872). Only a candidate whose key the reflector delivered while the pass was open is re-read (#875), ONCE (#918), so this is bounded by the churn during passes — never the GVR's object count, and 0 for a wholly divergent store nothing is delivering to. Healthy: ~0 on a quiet cluster, tens per pass under churn."`
-	RecheckClearedTotal           uint64 `stat:"store_divergence_recheck_cleared_total" desc:"Forced-pass candidates that did not count under the lost-update rule (#918): something was delivered for the key after the read it was held to began, the store had received that read's state, or the store agreed with the read. NOT a defect counter. Under churn this is what the forced lost-update counters used to report as losses and repair (#872, #918)."`
-	RecheckDeliveredAfterTotal    uint64 `stat:"store_divergence_recheck_delivered_after_read_total" desc:"Of store_divergence_recheck_cleared_total: candidates settled because the reflector delivered their key AFTER the read they were held to began, so the store had received the object's state after that read — the store ahead of the read (#918). NOT a defect counter. Under churn with a slow re-read sweep (bench run 16: 5 reads/s, a 60-76 s sweep, objects changing every 20 s) most re-read candidates land here; before #918 they were published as lost updates and repaired."`
-	RecheckReadStateReceivedTotal uint64 `stat:"store_divergence_recheck_read_state_received_total" desc:"Of store_divergence_recheck_cleared_total: candidates settled because the reflector had ALREADY delivered exactly the read's {rv, uid} before the read, and the store had not applied it yet — the store behind the read only by its pending apply (#878). NOT a defect counter. Climbing with CPU load means the informer is slow to apply what it has received, which is a different problem from a lost update."`
-	RecheckUndeliveredTotal       uint64 `stat:"store_divergence_recheck_undelivered_total" desc:"Forced-pass candidates counted WITHOUT a re-check because nothing was delivered for their key while the pass was open, so the store cannot have moved past the LIST for them (#875). Each is also in the forced divergence counters. DURING #237's broken-store class: ~the GVR's object count, with store_divergence_recheck_gets_total flat. Healthy: 0."`
-	RecheckUnavailableTotal       uint64 `stat:"store_divergence_recheck_unavailable_total" desc:"Forced-pass candidates counted WITHOUT a re-check because the GVR has no delivery record: its informer's transform could not be installed (a re-registered shared-factory GVR gets the already-started informer back and SetTransform refuses it). The pass runs, publishes and repairs as usual; skipping it would leave the #237 broken-store class unverified and starve store_factory_divergence_age_seconds (#875). Healthy: 0. Non-zero: that GVR is verified the pre-#872 way, where churn can read as a loss; cache.strip.set_transform_failed in the log names it."`
+	ClearedTotal                 uint64 `stat:"store_divergence_cleared_total" desc:"Divergence candidates the lost-update rule cleared (#918), at either site: the store agreed with the read it was held to, was AHEAD of it, or had received its state and not yet applied it. NOT a defect counter. Under churn this is what the forced lost-update counters used to report, and repair, as losses (#872, #918)."`
+	StoreAheadTotal              uint64 `stat:"store_divergence_store_ahead_total" desc:"Of store_divergence_cleared_total: the store held a NEWER state than the read (ordered by resourceVersion), or deleted or created the object after it (#918). NOT a defect counter; it climbs with churn during forced passes."`
+	ReceivedTotal                uint64 `stat:"store_divergence_received_total" desc:"Of store_divergence_cleared_total: the store did NOT hold the read's state, but had received it (or a newer one) and not yet applied it — the store behind the read only by its pending apply (#878). Counted only when the store's own state disagreed. Climbing with CPU load means the informer applies what it receives slowly, which is a different problem from a lost update."`
+	UndecidedTotal               uint64 `stat:"store_divergence_undecided_total" desc:"Candidates the lost-update rule could not decide and did NOT publish (#918): a pair of resourceVersions the API does not let a client order (CompareResourceVersion refused it: an aggregated API, or a malformed version), a key a relist tombstone removed, or a pending key on a GVR with no delivery record. Healthy: 0 for kube-apiserver types; non-zero and steady for an aggregated API is the contract, not a defect."`
+	PendingResolvedLostTotal     uint64 `stat:"store_divergence_pending_resolved_lost_total" desc:"Pending keys (see store_divergence_pending_keys) that resolved to a LOST update once the store's applied position reached their read: published and repaired by the resolver, after their pass. Healthy: 0."`
+	PendingResolvedReceivedTotal uint64 `stat:"store_divergence_pending_resolved_received_total" desc:"Pending keys that resolved to NOT lost: the store applied, received or passed the read's state. NOT a defect counter; it is the watch catching up."`
+	PendingSupersededTotal       uint64 `stat:"store_divergence_pending_superseded_total" desc:"Pending keys still undecided when their GVR's next forced pass began, which judges them again against its own, newer read. A bookmark advances the store's position with no callback (client-go v0.36.5), so on a GVR that only receives bookmarks this is how a pending key is decided."`
+	UnrecordedTotal              uint64 `stat:"store_divergence_unrecorded_total" desc:"Forced-pass divergences published for a GVR with no delivery record: its informer's transform could not be installed (a re-registered shared-factory GVR gets the already-started informer back and SetTransform refuses it). The rule still orders the store against the LIST; what the store received and not yet applied, and its applied deletes, are unknown. Healthy: 0. cache.strip.set_transform_failed in the log names the GVR."`
 
 	// --- the detectors for a broken detector ---
+	PendingKeys               int64   `stat:"store_divergence_pending_keys" kind:"gauge" desc:"Forced-pass candidates held PENDING right now, across all GVRs (#918): the store is behind the read and its applied position has not reached it, so it is neither a loss nor cleared yet. Each is re-judged on its GVR's next applied add, update or delete, or by its next forced pass (its GVR goes to the front of the walker). A bookmark advances the position with no callback (client-go v0.36.5), so a GVR that only receives bookmarks holds its pending keys until that pass. Healthy: 0 or briefly non-zero under churn; steadily non-zero means a watch is not catching up."`
 	GVRsUnverified            int64   `stat:"store_gvrs_unverified" kind:"gauge" desc:"Servable, synced, reachable GVRs whose last verification is older than maxVerificationAge. DURING #237 with B working this reads 0 — the deadline reached the GVR and found the divergence. It is NOT the #237 detector; it is the DENOMINATOR that makes a zero divergence readable. (unverified 0, divergent 0) = I looked and found nothing. (unverified >0, divergent 0) = I DID NOT LOOK. That distinction is exactly what the 1.12.6 audit's divergent:0 could not express. Healthy: 0."`
 	GVRsUnverifiable          int64   `stat:"store_gvrs_unverifiable" kind:"gauge" desc:"Registered GVRs no verification mechanism reaches right now, broken down in snowplow_store_verification_unverifiable_by_reason (retracted / not_synced / unreachable). Split from store_gvrs_unverified so a retracted GVR cannot be dropped from that gauge's set and produce a zero that reads as health. DURING a retraction storm: >0 with reason=retracted. Healthy: 0."`
 	GVRsUndecorated           int64   `stat:"store_gvrs_undecorated" kind:"gauge" desc:"Registered GVRs whose informer did not get the verifying ListerWatcher, so the snapshot path is blind to them and only the forced pass covers them. Healthy baseline is NOT 0: it is the size of the non-streaming class, whose membership follows from informer routing and must be read as a class rather than as today's list. DURING the coverage cliff (RESOLVER_COMPOSITION_STREAMING_LIST=false): jumps to nearly every GVR while every store_divergent_*_snapshot_total silently drops to 0 — which would otherwise read as health. A jump here is what names that."`
@@ -306,21 +305,24 @@ func StoreVerificationStatsSnapshot() StoreVerificationStats {
 		ObjectsVerifiedTotal: storeObjectsVerifiedTotal.Load(),
 		ForcedListsTotal:     storeVerifyForcedListsTotal.Load(),
 
-		DivergentLostUpdateSnapshot:   storeDivergentLostUpdate[verifySiteSnapshot].Load(),
-		DivergentLostUpdateForced:     storeDivergentLostUpdate[verifySiteForced].Load(),
-		DivergentLostDeleteSnapshot:   storeDivergentLostDelete[verifySiteSnapshot].Load(),
-		DivergentLostDeleteForced:     storeDivergentLostDelete[verifySiteForced].Load(),
-		DivergentLostAddSnapshot:      storeDivergentLostAdd[verifySiteSnapshot].Load(),
-		DivergentLostAddForced:        storeDivergentLostAdd[verifySiteForced].Load(),
-		DivergentUIDMismatchSnapshot:  storeDivergentUIDMismatch[verifySiteSnapshot].Load(),
-		DivergentUIDMismatchForced:    storeDivergentUIDMismatch[verifySiteForced].Load(),
-		DivergenceCandidatesTotal:     storeDivergenceCandidates.Load(),
-		RecheckGETsTotal:              storeRecheckGETsTotal.Load(),
-		RecheckClearedTotal:           storeRecheckClearedTotal.Load(),
-		RecheckUndeliveredTotal:       storeRecheckUndeliveredTotal.Load(),
-		RecheckUnavailableTotal:       storeRecheckUnavailableTotal.Load(),
-		RecheckDeliveredAfterTotal:    storeRecheckDeliveredAfterTotal.Load(),
-		RecheckReadStateReceivedTotal: storeRecheckReceivedReadStateTotal.Load(),
+		DivergentLostUpdateSnapshot:  storeDivergentLostUpdate[verifySiteSnapshot].Load(),
+		DivergentLostUpdateForced:    storeDivergentLostUpdate[verifySiteForced].Load(),
+		DivergentLostDeleteSnapshot:  storeDivergentLostDelete[verifySiteSnapshot].Load(),
+		DivergentLostDeleteForced:    storeDivergentLostDelete[verifySiteForced].Load(),
+		DivergentLostAddSnapshot:     storeDivergentLostAdd[verifySiteSnapshot].Load(),
+		DivergentLostAddForced:       storeDivergentLostAdd[verifySiteForced].Load(),
+		DivergentUIDMismatchSnapshot: storeDivergentUIDMismatch[verifySiteSnapshot].Load(),
+		DivergentUIDMismatchForced:   storeDivergentUIDMismatch[verifySiteForced].Load(),
+		DivergenceCandidatesTotal:    storeDivergenceCandidates.Load(),
+		ClearedTotal:                 storeClearedTotal.Load(),
+		StoreAheadTotal:              storeAheadTotal.Load(),
+		ReceivedTotal:                storeReceivedTotal.Load(),
+		UndecidedTotal:               storeUndecidedTotal.Load(),
+		PendingResolvedLostTotal:     storePendingResolvedLostTotal.Load(),
+		PendingResolvedReceivedTotal: storePendingResolvedReceivedTotal.Load(),
+		PendingSupersededTotal:       storePendingSupersededTotal.Load(),
+		UnrecordedTotal:              storeUnrecordedTotal.Load(),
+		PendingKeys:                  storePendingKeys.Load(),
 
 		GVRsUnverified:            unverified,
 		GVRsUnverifiable:          unverifiable,
@@ -388,12 +390,14 @@ func ResetStoreVerificationStatsForTest() {
 	storeObjectsVerifiedTotal.Store(0)
 	storeVerifyForcedListsTotal.Store(0)
 	storeDivergenceCandidates.Store(0)
-	storeRecheckGETsTotal.Store(0)
-	storeRecheckClearedTotal.Store(0)
-	storeRecheckUndeliveredTotal.Store(0)
-	storeRecheckUnavailableTotal.Store(0)
-	storeRecheckDeliveredAfterTotal.Store(0)
-	storeRecheckReceivedReadStateTotal.Store(0)
+	storeClearedTotal.Store(0)
+	storeAheadTotal.Store(0)
+	storeReceivedTotal.Store(0)
+	storeUndecidedTotal.Store(0)
+	storePendingResolvedLostTotal.Store(0)
+	storePendingResolvedReceivedTotal.Store(0)
+	storePendingSupersededTotal.Store(0)
+	storeUnrecordedTotal.Store(0)
 	storeVerifySkippedTotal.Store(0)
 	storeVerifyInvalidatedTotal.Store(0)
 	storeRepairsFiredTotal.Store(0)
