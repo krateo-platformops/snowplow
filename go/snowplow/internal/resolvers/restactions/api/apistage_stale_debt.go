@@ -73,6 +73,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // staleMaxMS is the ratified maximum time from a stale serve to its push
@@ -290,6 +291,10 @@ func contentRefillCall(call httpcall.RequestOptions) httpcall.RequestOptions {
 // retry chain (#740).
 func runStaleDebt(d *staleDebt) {
 	defer staleDebtWG.Done()
+	// #871 — measurement only: started by a customer's stale serve, inherited
+	// its label; detached work no user waits on is fill_bg.
+	_, endWork := workclass.Continue(context.Background(), workclass.FillBG)
+	defer endWork()
 	start := time.Now()
 	ok, kind := staleDebtRefillOnce(d)
 	if ok {
@@ -405,7 +410,12 @@ func staleDebtRefillOnce(d *staleDebt) (bool, cache.StaleRetryOutcome) {
 	staleDebtsMu.Lock()
 	mark := d.markSeq
 	staleDebtsMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), cache.DemandRevalidationDeadline())
+	// #871 — measurement only: one refill attempt is one fill_bg unit. Its ctx
+	// carries the label (the content fill's own pprof.Do restores to it), and
+	// the goroutine stays fill_bg when it returns.
+	ctx, endWork := workclass.Begin(workclass.Background(workclass.FillBG), workclass.FillBG)
+	defer endWork()
+	ctx, cancel := context.WithTimeout(ctx, cache.DemandRevalidationDeadline())
 	defer cancel()
 	ctx, out := withFillOutcome(withContentDebtRefill(ctx))
 	store := cache.ResolvedCache()
@@ -534,6 +544,9 @@ func goReplaceStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 	staleDebtWG.Add(1)
 	go func() {
 		defer staleDebtWG.Done()
+		// #871 — measurement only: see runStaleDebt.
+		_, endWork := workclass.Continue(context.Background(), workclass.FillBG)
+		defer endWork()
 		replaceStaleDependent(sink, from)
 	}()
 }
@@ -622,9 +635,13 @@ func replaceStaleDependentOnce(sink *cache.StaleServeSink) bool {
 	if !ok || before == nil || !before.StaleDerived {
 		return true // evicted (the refetch fills) or already replaced by another writer
 	}
-	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(context.Background()), cache.DemandRevalidationDeadline())
+	// #871 — measurement only: one replace is one fill_bg unit (see
+	// staleDebtRefillOnce).
+	wctx, endWork := workclass.Begin(workclass.Background(workclass.FillBG), workclass.FillBG)
+	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(wctx), cache.DemandRevalidationDeadline())
 	err := cache.RunRefreshNow(ctx, l1Key)
 	cancel()
+	endWork()
 	if err == nil || errors.Is(err, cache.ErrRefreshNowNoHandler) {
 		//serve-probe: D2 replace — was the dependent cell replaced (pointer compare), serves no body
 		if after, _ := store.GetNoTouch(l1Key); after == before {
@@ -665,6 +682,7 @@ var staleOverdueOnce sync.Once
 func ensureStaleOverdueScanner() {
 	staleOverdueOnce.Do(func() {
 		go func() {
+			workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 			t := time.NewTicker(250 * time.Millisecond)
 			defer t.Stop()
 			for range t.C {

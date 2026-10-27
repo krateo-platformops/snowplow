@@ -68,6 +68,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/util/workqueue"
 )
@@ -657,6 +658,12 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// Done MUST be called for every Get, whatever the outcome, or the queue
 	// leaks the "processing" mark and refuses to re-deliver the item.
 	defer e.queue.Done(s)
+
+	// #871 — measurement only: one scope is one prewarm unit. scopeCtx below
+	// derives from this ctx, so the walk, its stage goroutines and every seed
+	// target (relabelled seed by measuredSeedUnit) carry the label.
+	ctx, endWork := workclass.Begin(ctx, workclass.Prewarm)
+	defer endWork()
 
 	// CUSTOMER PRIORITY — yield before running the scope while any customer
 	// /call is in flight. The seed work inside the handler also yields

@@ -82,6 +82,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -225,7 +226,14 @@ type seedUnitMarkerKey struct{}
 // per-target wall cost (seed ctx build, key derivation, admission wait,
 // resolve, terminal Put) under its kind — the cost a keepwarm cycle pays per
 // seeded unit.
+//
+// #871 — it is also the seed work-class bracket (measurement only): every seed
+// target, engine seed and reseed alike, funnels through here, so the target's
+// resolve and every goroutine it starts carry snowplow_work=seed, nested inside
+// the prewarm scope that runs it.
 func measuredSeedUnit(ctx context.Context, isWidget bool, do func(context.Context) error) error {
+	ctx, endWork := workclass.Begin(ctx, workclass.Seed)
+	defer endWork()
 	m := new(atomic.Bool)
 	start := seedClock()
 	err := do(context.WithValue(ctx, seedUnitMarkerKey{}, m))

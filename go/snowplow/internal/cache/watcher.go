@@ -23,6 +23,7 @@ import (
 	clientcache "k8s.io/client-go/tools/cache"
 
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // listPageLimit is the chunk size used by every informer LIST call.
@@ -1134,6 +1135,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	rw.goroutineWG.Add(2)
 	go func(inf clientcache.SharedIndexInformer) {
 		defer rw.goroutineWG.Done()
+		workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 		inf.Run(stop)
 	}(gi.Informer())
 	go func(hasSynced func() bool) {
@@ -1689,6 +1691,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		rw.goroutineWG.Add(1)
 		go func(inf clientcache.SharedIndexInformer) {
 			defer rw.goroutineWG.Done()
+			workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 			inf.Run(stop)
 		}(gi.Informer())
 

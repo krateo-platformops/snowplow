@@ -67,6 +67,7 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -409,37 +410,12 @@ func drainApiRefPaginationJobs(
 		// drainCtx (SA-credentialed) so the yield observes the drain's own
 		// cancellation, symmetric with the loop's ctx.Err() guard.
 		engineYieldCheckpoint(drainCtx)
-		// Run the original 3.2.2 mechanism, unchanged. Returns no error
-		// (logs internally); a failure leaves the page-1 cell correct
-		// and proceeds to the next job.
-		iterateApiRefPages(
-			drainCtx,
-			// The walker is gone by the time the drain runs. Construct a
-			// minimal walker shell for the SAME helpers iterateApiRefPages
-			// uses (visited set + harvesters). The visited set is
-			// per-drain so children discovered by THIS drain are
-			// internally deduped; we do NOT share with the original
-			// walker's visited (the walker's visited is no longer
-			// referenced post-MarkPhase1Done). Harvesters are nil — the
-			// drain runs AFTER MarkPhase1Done so the content-pass / PIP-
-			// seed harvesters have already been drained; populating them
-			// now would have no consumer.
-			// Ship 0.30.232: type-safe construction via newPhase1Walker.
-			// Ship 0.30.230 fix-at-root preserved — the drain shell walker
-			// MUST carry the SA *rest.Config so the page-N
-			// widgets.Resolve at phase1_walk_pagination.go's literal
-			// receives non-nil rc downstream of opts.RC. No harvesters
-			// (drain post-MarkPhase1Done; consumers already drained).
-			newPhase1Walker(saRC, j.AuthnNS),
-			j.In,
-			j.GVR,
-			j.Page1Res,
-			j.Depth,
-			j.PerPage,
-			j.KeyPerPage,
-			j.KeyPage,
-			j.AuthnNS,
-		)
+		// #871 — measurement only: one job is one drain unit (pprof label +
+		// counter); its pages, their child walks and their stage goroutines
+		// carry snowplow_work=drain.
+		workclass.Do(drainCtx, workclass.Drain, func(jobCtx context.Context) {
+			drainOneApiRefPaginationJob(jobCtx, j, saRC)
+		})
 		completed++
 	}
 
@@ -448,6 +424,43 @@ func drainApiRefPaginationJobs(
 		slog.String("phase", "post_phase1_done"),
 		slog.Int("jobs_completed", completed),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+	)
+}
+
+// drainOneApiRefPaginationJob runs one collected job through the unchanged
+// iterateApiRefPages mechanism (split out of drainApiRefPaginationJobs for the
+// #871 drain work-class bracket only).
+func drainOneApiRefPaginationJob(ctx context.Context, j apiRefPaginationJob, saRC *rest.Config) {
+	// Run the original 3.2.2 mechanism, unchanged. Returns no error
+	// (logs internally); a failure leaves the page-1 cell correct
+	// and proceeds to the next job.
+	iterateApiRefPages(
+		ctx,
+		// The walker is gone by the time the drain runs. Construct a
+		// minimal walker shell for the SAME helpers iterateApiRefPages
+		// uses (visited set + harvesters). The visited set is
+		// per-drain so children discovered by THIS drain are
+		// internally deduped; we do NOT share with the original
+		// walker's visited (the walker's visited is no longer
+		// referenced post-MarkPhase1Done). Harvesters are nil — the
+		// drain runs AFTER MarkPhase1Done so the content-pass / PIP-
+		// seed harvesters have already been drained; populating them
+		// now would have no consumer.
+		// Ship 0.30.232: type-safe construction via newPhase1Walker.
+		// Ship 0.30.230 fix-at-root preserved — the drain shell walker
+		// MUST carry the SA *rest.Config so the page-N
+		// widgets.Resolve at phase1_walk_pagination.go's literal
+		// receives non-nil rc downstream of opts.RC. No harvesters
+		// (drain post-MarkPhase1Done; consumers already drained).
+		newPhase1Walker(saRC, j.AuthnNS),
+		j.In,
+		j.GVR,
+		j.Page1Res,
+		j.Depth,
+		j.PerPage,
+		j.KeyPerPage,
+		j.KeyPage,
+		j.AuthnNS,
 	)
 }
 
@@ -515,6 +528,9 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 	if len(candidates) == 0 {
 		return
 	}
+	// #871 — measurement only: the re-collection pass is one drain unit.
+	ctx, endWork := workclass.Begin(ctx, workclass.Drain)
+	defer endWork()
 
 	log.Info("phase1.pagination_recollect.start",
 		slog.String("subsystem", "cache"),

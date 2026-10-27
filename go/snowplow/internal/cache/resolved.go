@@ -43,6 +43,8 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // Resolver-cache env knobs (defaults match chart-0.30.7 spec).
@@ -4047,6 +4049,7 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 	resolvedCacheSummaryWG.Add(1)
 	go func() {
 		defer resolvedCacheSummaryWG.Done()
+		workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {

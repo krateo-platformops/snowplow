@@ -131,6 +131,12 @@ var nonCacheInitPublishers = map[string][]string{
 	// SA-discovery family (cached_client_metrics.go) IS a cache-path mechanism
 	// and stays gated. Rationale at partial_discovery.go:42-49.
 	"internal/dynamic/partial_discovery.go": {"snowplow_discovery"},
+	// #871 work-class unit counters: a measurement of what the PROCESS does,
+	// not a cache surface. The customer class counts every resolve-path /call
+	// in any cache mode, and the counters are the expvar twin of the
+	// snowplow_work pprof label every CPU profile carries; gating them on
+	// Disabled() would hide the customer count cache-off while the label stays.
+	"internal/workclass/workclass.go": {"snowplow_work_class"},
 	// AUDIT-4 (installer#410) refused-audit-record counter: the audit emitter is
 	// not a cache surface — /call writes and RESTAction write stages emit in
 	// either cache mode, so a record refused for a missing actor/action/method/

@@ -33,6 +33,7 @@
 package api
 
 import (
+	"context"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -40,6 +41,7 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // selfHostKey is the (scheme, host, port) tuple parsed once from URL_SELF.
@@ -147,6 +149,21 @@ func parsedHostEqualsSelf(rawURL string) bool {
 		return false
 	}
 	return u.Scheme == sh.scheme && u.Port() == sh.port && hostsMatch(u.Hostname(), sh.host)
+}
+
+// selfLoopbackWorkClassHeader is the #871 work-class header a self-loopback
+// stage carries (resolve.go, the same self-host arm as the depth and ancestor
+// headers; measurement only). The hop re-enters ServeHTTP as a fresh request on
+// a net/http goroutine, so the caller's pprof label does not travel with it: a
+// BACKGROUND caller's class rides this header and the ingest continues it on a
+// trusted self-loopback (dispatchers/work_class_serve.go). A customer's hop
+// needs none — the ingest labels it customer.
+func selfLoopbackWorkClassHeader(ctx context.Context) (string, bool) {
+	wc := workclass.Of(ctx)
+	if !wc.Background() {
+		return "", false
+	}
+	return workclass.Header + ": " + wc.String(), true
 }
 
 // bearerAppendForStage is the #57 (C-b) user-bearer-append DECISION for a

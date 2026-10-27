@@ -46,6 +46,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // StaleRetryOutcome is what one chain attempt reports.
@@ -288,7 +290,12 @@ func (c *staleRetryChain) wake(gated bool) {
 // run performs one attempt and schedules what follows from its outcome.
 func (c *staleRetryChain) run(spec StaleRetrySpec) {
 	defer staleRetryWG.Done()
-	ctx := WithCustomerTriggeredRefresh(context.Background()) // a viewer is waiting on it
+	// #871 — measurement only: the attempt runs on its own goroutine, detached
+	// work no user's request is waiting on; it carries snowplow_work=fill_bg
+	// (labelled, not counted: the work it drives is counted where it runs — a
+	// demand dispatch, a debt refill, a refresher dequeue).
+	ctx, endWork := workclass.Continue(WithCustomerTriggeredRefresh(context.Background()), workclass.FillBG) // a viewer is waiting on it
+	defer endWork()
 	start := staleRetryNow()
 	out := spec.Attempt(ctx)
 	dur := staleRetryNow().Sub(start)
