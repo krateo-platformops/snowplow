@@ -36,8 +36,9 @@
 //	                               as our store was when the pass opened — which
 //	                               removes the false positives a naive RV="0"
 //	                               read would invent. The store keeps moving
-//	                               after that; the keys it moves are recorded
-//	                               and re-read (store_verify_recheck.go, #872)
+//	                               after that; each candidate is ordered
+//	                               against the LIST's own revisions
+//	                               (store_verify_judge.go, #872, #918)
 //	Limit = 0                      REQUIRED. client-go's own rule: a LIST with a
 //	                               Limit and a non-zero resourceVersion is
 //	                               delegated to etcd and SKIPS the watch cache.
@@ -158,7 +159,7 @@ func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 
 	var pick schema.GroupVersionResource
 	var oldest time.Time
-	governed, found := 0, false
+	governed, found, pickFirst := 0, false, false
 	for gvr, row := range rows {
 		if row.repairPending {
 			// A repair for this GVR is queued or running: its store is about
@@ -167,15 +168,21 @@ func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 			continue
 		}
 		governed++
-		if now.Sub(row.epoch) <= deadline {
+		// #918 — a GVR whose last pass left keys pending or undecided is due
+		// now and goes ahead of every other: only a newer pass, or an event
+		// a bookmark never produces, can decide them.
+		if !row.reverifyFirst && now.Sub(row.epoch) <= deadline {
 			continue
 		}
 		turn := row.epoch
 		if row.lastAttempt.After(turn) {
 			turn = row.lastAttempt
 		}
-		if !found || turn.Before(oldest) {
-			pick, oldest, found = gvr, turn, true
+		switch {
+		case !found,
+			row.reverifyFirst && !pickFirst,
+			row.reverifyFirst == pickFirst && turn.Before(oldest):
+			pick, oldest, found, pickFirst = gvr, turn, true, row.reverifyFirst
 		}
 	}
 	return pick, governed, found
@@ -280,25 +287,19 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		recordVerifySkipped(verifySkipNoSyncPosition)
 		return
 	}
-	// #875 — open the pass BEFORE the LIST: from here every key the reflector
-	// delivers is recorded, and the LIST is no older than the position read
-	// at this instant (store_verify_delivery.go). That position, not the one
-	// the last confirm pass copied into lastSyncRV, is what the LIST carries:
-	// the record starts now, so the LIST's lower bound must be now too, or a
-	// delivery between the two would be neither recorded nor in the LIST.
+	// #875 / #918 — open the pass: the delete generations rotate, what is
+	// still pending from the previous pass is superseded by this pass's read,
+	// and the LIST is no older than the reflector's position read now
+	// (store_verify_delivery.go beginPass).
 	//
-	// No delivery record (dl == nil): there is no window to open, and the LIST
-	// carries the confirm-time position as it did before #875.
+	// No delivery record (dl == nil): the LIST carries the confirm-time
+	// position as it did before #875.
 	listRV := rv
-	var win *deliveryWindow
 	if dl != nil {
-		win = dl.openPass(idx)
-		defer win.close()
-		if win.position == "" {
+		if listRV = dl.beginPass(); listRV == "" {
 			recordVerifySkipped(verifySkipNoSyncPosition) // same reason, same rule: never RV="0"
 			return
 		}
-		listRV = win.position
 	}
 	opts := metav1.ListOptions{
 		ResourceVersion:      listRV,
@@ -331,45 +332,28 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		}
 	}
 	candidates := diffStore(idx, upstream)
-	// #872 / #875 / #918 — the store kept moving while the LIST was in flight
-	// and keeps moving while the candidates are judged, so each candidate is
-	// held to one read and counts only under the lost-update rule: nothing
-	// delivered for its key after that read began, and the store still
-	// disagrees with it (store_verify_recheck.go). The delivery record stays
-	// open until the last candidate is judged (closed by the defer above). A
-	// failed re-read makes the pass inconclusive: nothing is published or
-	// repaired, and the GVR is not marked verified, so the deadline walker
-	// comes back to it.
-	var report divergenceReport
-	switch {
-	case len(candidates) == 0:
-		report = reportOf(len(upstream), 0, nil)
-	case win == nil:
-		// #875 — NO DELIVERY RECORD: the rule's delivery clause cannot be
-		// evaluated, so every candidate is judged on the store alone, with no
-		// GET — the pre-#872 behaviour, for this GVR only. Skipping instead
-		// would leave exactly the #237 class unverified: a re-registered
-		// shared-factory GVR gets its already-started informer back, the
-		// transform cannot be installed, and a skipped pass would also starve
-		// #244's factory-divergence age of its only input (noteVerified). The
-		// cost is that churn can be misread as a loss here, as it was before
-		// #872, and store_divergence_recheck_unavailable_total says so.
-		report = reportOf(len(upstream), len(candidates), confirmDivergences(idx, upstream, candidates, nil))
-		storeRecheckUnavailableTotal.Add(report.total())
-	default:
-		judged, ok := judgeForcedPass(ctx, cli, gvr, idx, upstream, candidates, win)
-		if !ok {
-			recordVerifySkipped(verifySkipRecheckError)
-			slog.Warn("cache.store.verification_recheck_failed",
-				slog.String("subsystem", "cache"),
-				slog.String("gvr", gvr.String()),
-				slog.Int("candidates", len(candidates)),
-				slog.String("hint", "a quorum re-read of a divergence candidate failed, so this pass is "+
-					"inconclusive: nothing was published or repaired and the GVR stays due for "+
-					"verification. A real divergence is found by the next pass."))
-			return
+	// #872 / #875 / #878 / #918 — the store kept moving while the LIST was in
+	// flight and keeps moving now, so each candidate is ordered against the
+	// LIST's own revisions under the lost-update rule (store_verify_judge.go):
+	// lost only if the store is behind the read and has applied everything up
+	// to it. A key the store has not caught up with yet is PENDING, re-judged
+	// by the GVR's next applied event or its next pass; a pair of
+	// resourceVersions the API does not let us order is UNDECIDED.
+	//
+	// #875 — NO DELIVERY RECORD (dl == nil): a re-registered shared-factory
+	// GVR gets its already-started informer back and the transform cannot be
+	// installed. The pass still runs — skipping it would leave the #237 class
+	// unverified and starve #244's factory-divergence age (noteVerified) — and
+	// the rule still orders the store against the LIST; only what the store
+	// has received and not applied, and which deletes it applied, are unknown,
+	// and store_divergence_unrecorded_total counts what it publishes.
+	report := reportOf(len(upstream), 0, nil)
+	if len(candidates) > 0 {
+		var reverify bool
+		report, reverify = judgeForcedPass(gvr, idx, dl, upstream, list.ResourceVersion, candidates)
+		if reverify {
+			markReverifyFirst(gvr)
 		}
-		report = judged
 	}
 	publishDivergence(gvr, verifySiteForced, report)
 

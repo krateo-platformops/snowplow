@@ -1,7 +1,7 @@
 //go:build integration
 // +build integration
 
-// store_verify_recheck_872_kind_integration_test.go — #872 and #918 against a
+// store_verify_judge_kind_integration_test.go — #872 and #918 against a
 // REAL apiserver (kind): update churn must not make the forced pass publish a
 // divergence or queue a repair.
 //
@@ -12,13 +12,15 @@
 //   - #872: high churn (3,000 objects, ~500 patches/s), fast reads. Before
 //     #872 this arm measured 63-126 published lost updates per 5 passes, 100%
 //     of them with the store AHEAD of the LIST and 0 really lost.
-//   - #918: the bench run-16 shape. About 1,000 objects of a large GVR change
-//     once every 20 s (50 patches/s), and the re-check reads at the metadata
-//     client's default 5 reads/s, as the pod's in-cluster client does (#920).
-//     The LIST is large enough that the churn moves well over 100 keys past
-//     it, so the re-check sweep takes longer than an object's update interval
-//     and most objects change after their read. Before #918 that published
-//     lost updates and queued a full repair (run 16: 264 of 379, one repair).
+//   - #918: the bench run-16 shape. About 1,000 objects of a larger GVR change
+//     once every 20 s (50 patches/s), with the metadata client at its default
+//     rate. Before #918 the forced pass re-read its candidates at 5 reads/s and
+//     compared after the whole sweep, which outlasted the objects' update
+//     interval, and published lost updates (run 16: 264 of 379, one repair).
+//     Now every candidate is ordered against the LIST's own revisions.
+//
+// Both arms report their numbers to the CI job's step summary (kChurnReport),
+// so they are visible without -v.
 //
 // CLUSTER. One kind cluster for both arms, krateo-sptest-<pid> (#522, #742),
 // created and destroyed inside the test, as issue624_rbac_kind_integration_test.go
@@ -29,6 +31,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -221,15 +224,57 @@ func kChurn(t *testing.T, cfg *rest.Config, gvr schema.GroupVersionResource, rat
 	return patched, stop
 }
 
-// kChurnAssertNothingPublished is the verdict both arms share: churn alone
-// published nothing, attempted no repair, and every pass completed.
-func kChurnAssertNothingPublished(t *testing.T, issue string, passes int) {
+// kChurnReport logs one arm's numbers where CI shows them without -v: the
+// job's step summary (GITHUB_STEP_SUMMARY), as well as the test log. A passing
+// test's t.Logf is invisible in `go test ./...` output.
+func kChurnReport(t *testing.T, line string) {
 	t.Helper()
-	skipped := VerifySkippedByReasonSnapshot()
+	t.Log(line)
+	if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
+		if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			_, _ = fmt.Fprintf(f, "- `%s`: %s\n", t.Name(), line)
+			_ = f.Close()
+		}
+	}
+}
+
+// kChurnSettle waits, after the churn has stopped, until no key is pending:
+// every pending key is re-judged by the GVR's next applied event, and the
+// churn's own last events are still being applied.
+func kChurnSettle(t *testing.T) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Minute); storePendingKeys.Load() != 0; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d key(s) still pending two minutes after the churn stopped: the store never caught up with their reads", storePendingKeys.Load())
+		}
+	}
+}
+
+// kChurnVerdict is the verdict both arms share: churn alone published nothing,
+// attempted no repair, resolved no pending key as lost, completed every pass,
+// and — the non-vacuity the #923 review asked for — cleared at least one key
+// whose store was AHEAD of the read, the mechanism that published false losses
+// before #872 and #918 (mutation M1 of the PR turns exactly these RED).
+func kChurnVerdict(t *testing.T, issue string, passes int, rate float64) {
+	t.Helper()
 	lu, ld, la, um := divergenceCounts(verifySiteForced)
+	candidates, ahead := storeDivergenceCandidates.Load(), storeAheadTotal.Load()
+	kChurnReport(t, fmt.Sprintf("%s: %d passes at %.0f patches/s: candidates=%d cleared=%d (store ahead %d, received %d) undecided=%d pending resolved lost/received/superseded=%d/%d/%d published update/delete/add/uid=%d/%d/%d/%d repairs queued=%d refused=%d",
+		issue, passes, rate, candidates, storeClearedTotal.Load(), ahead, storeReceivedTotal.Load(), storeUndecidedTotal.Load(),
+		storePendingResolvedLostTotal.Load(), storePendingResolvedReceivedTotal.Load(), storePendingSupersededTotal.Load(),
+		lu, ld, la, um, storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load()))
+	if candidates == 0 {
+		t.Fatalf("precondition: %d passes at %.0f patches/s produced no candidate — the arm tests nothing", passes, rate)
+	}
+	if ahead == 0 {
+		t.Fatalf("precondition: no candidate had the store ahead of its read — the arm does not exercise the false-loss mechanism")
+	}
 	if lu+ld+la+um != 0 {
 		t.Errorf("%s RED: churn alone published %d forced divergences (update/delete/add/uid = %d/%d/%d/%d) on a store that lost nothing",
 			issue, lu+ld+la+um, lu, ld, la, um)
+	}
+	if n := storePendingResolvedLostTotal.Load(); n != 0 {
+		t.Errorf("%s RED: %d pending key(s) resolved as lost under churn alone", issue, n)
 	}
 	// A repair ATTEMPT, whether queued or refused as unsupported: this GVR's
 	// informer may not be rebuildable here, and counting only the queue would
@@ -237,9 +282,8 @@ func kChurnAssertNothingPublished(t *testing.T, issue string, passes int) {
 	if d, u := storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load(); d+int64(u) != 0 {
 		t.Errorf("%s RED: %d repair attempt(s) under churn alone (queued %d, refused-unsupported %d)", issue, d+int64(u), d, u)
 	}
-	if n := skipped[verifySkipRecheckError] + skipped[verifySkipNoSyncPosition]; n != 0 {
-		t.Errorf("%d pass(es) did not complete against a healthy apiserver (recheck_error %d, no_sync_position %d)",
-			n, skipped[verifySkipRecheckError], skipped[verifySkipNoSyncPosition])
+	if n := VerifySkippedByReasonSnapshot()[verifySkipNoSyncPosition]; n != 0 {
+		t.Errorf("%d pass(es) did not complete against a healthy apiserver (no_sync_position)", n)
 	}
 	// The passes really ran: a hang or a skip would leave this short.
 	if got := storeVerifyForcedListsTotal.Load(); got != uint64(passes) {
@@ -253,7 +297,7 @@ const (
 	k872Passes  = 5
 )
 
-// k872Arm — high churn, fast reads (the client at 1000 QPS).
+// k872Arm — high churn: 3,000 objects at ~500 patches/s.
 func k872Arm(t *testing.T, cfg *rest.Config) {
 	ctx := context.Background()
 	gvr := kChurnSeed(t, cfg, "churn872s", "Churn872", k872Objects, 0)
@@ -269,110 +313,40 @@ func k872Arm(t *testing.T, cfg *rest.Config) {
 	}
 	rate := float64(patched.Load()-p0) / time.Since(t0).Seconds()
 	stop()
-
-	candidates := storeDivergenceCandidates.Load()
-	gets := storeRecheckGETsTotal.Load()
-	cleared := storeRecheckClearedTotal.Load()
-	undelivered := storeRecheckUndeliveredTotal.Load()
-	t.Logf("#872 kind: %d forced passes at %.0f patches/s over %d objects: candidates=%d, re-check GETs=%d, cleared=%d (delivered after the read %d, read state received %d), counted without a re-check=%d",
-		k872Passes, rate, k872Objects, candidates, gets, cleared, storeRecheckDeliveredAfterTotal.Load(), storeRecheckReceivedReadStateTotal.Load(), undelivered)
-
-	// Non-vacuity: the churn really produced LIST-vs-store disagreement, so a
-	// zero below is the rule working, not a quiet cluster.
-	if candidates == 0 {
-		t.Fatalf("precondition: %d passes at %.0f patches/s produced no candidate — the arm tests nothing", k872Passes, rate)
-	}
-	kChurnAssertNothingPublished(t, "#872", k872Passes)
-	// The re-check really ran and cleared what churn produced: a zero above
-	// must be the rule working, not candidates silently dropped.
-	if cleared == 0 {
-		t.Errorf("the re-check cleared nothing although churn produced %d candidates — it did not run", candidates)
-	}
-	// #875 — with nothing lost, every candidate is one the store moved, so
-	// every one was delivered during its pass; one counted without a re-check
-	// would be a delivery the record missed.
-	if undelivered != 0 {
-		t.Errorf("#875 RED: %d candidate(s) counted without a re-check under churn alone — a delivery the record missed", undelivered)
-	}
-	// Bound (#918): one quorum GET per candidate at most, never the object count.
-	if gets > candidates {
-		t.Errorf("re-check issued %d GETs for %d candidates, above one per candidate", gets, candidates)
-	}
+	kChurnSettle(t)
+	kChurnVerdict(t, "#872", k872Passes, rate)
 }
 
 const (
-	// k918Objects × k918Pad is the metadata LIST's size (~120 MB): large
-	// enough that the LIST is in flight for seconds, so 50 patches/s move
-	// over 100 keys past it — the run-16 shape (379 at 50K), at a size a CI
-	// kind cluster seeds in under a minute.
+	// The run-16 shape (#918): 1,000 objects of a larger GVR change round-robin
+	// at 50 patches/s, each one every 20 s, and the metadata client runs at
+	// client-go's default rate, as the pod's in-cluster client does (#920).
+	// The forced pass no longer re-reads anything, so neither the LIST's size
+	// nor the client's rate decides a verdict any more; the GVR is sized to
+	// what the shape needs and no more (F5 of the #923 review).
 	k918Objects = 5000
-	k918Pad     = 24 << 10
-	// k918Churned objects change round-robin at k918Rate per second: each one
-	// every k918Churned/k918Rate = 20 s, run 16's interval.
 	k918Churned = 1000
 	k918Rate    = 50
-	// k918MaxPasses bounds the arm's runtime. It stops early once a pass's
-	// re-check sweep has outlasted the update interval AND a delivery after a
-	// read has been seen, i.e. once the run-16 mechanism has happened.
-	k918MaxPasses = 3
+	k918Passes  = 3
 )
 
-// k918Arm — the run-16 shape: slow reads (the metadata client at client-go's
-// default rate, 5/s), a sweep longer than the objects' update interval.
+// k918Arm — the run-16 shape.
 func k918Arm(t *testing.T, cfg *rest.Config) {
 	ctx := context.Background()
-	gvr := kChurnSeed(t, cfg, "churn918s", "Churn918", k918Objects, k918Pad)
-	// The client under test reads at client-go's default rate (QPS 0 => 5/s,
-	// burst 10), as the pod's in-cluster metadata client does (#920). That
-	// rate is the condition, not the fix: the rule must hold at any rate.
+	gvr := kChurnSeed(t, cfg, "churn918s", "Churn918", k918Objects, 0)
 	metaCfg := rest.CopyConfig(cfg)
-	metaCfg.QPS, metaCfg.Burst = 0, 0
+	metaCfg.QPS, metaCfg.Burst = 0, 0 // client-go's default: 5/s, burst 10
 	rw := kChurnWatcher(t, cfg, metaCfg, gvr)
 	patched, stop := kChurn(t, cfg, gvr, k918Rate, func(n int) int { return n % k918Churned })
-	interval := time.Duration(k918Churned/k918Rate) * time.Second
-	time.Sleep(interval) // every churned object has changed once before the first pass
+	time.Sleep(5 * time.Second) // steady churn before the first pass
 
 	t0, p0 := time.Now(), patched.Load()
-	passes, longest := 0, time.Duration(0)
-	for passes < k918MaxPasses {
+	for p := 0; p < k918Passes; p++ {
 		rw.ConfirmResourceType(ctx, gvr)
-		gets0 := storeRecheckGETsTotal.Load()
-		start := time.Now()
 		forcedVerify(ctx, gvr)
-		passes++
-		took := time.Since(start)
-		t.Logf("#918 kind pass %d: %s, %d re-check GETs", passes, took.Round(time.Millisecond), storeRecheckGETsTotal.Load()-gets0)
-		if took > longest {
-			longest = took
-		}
-		if longest > interval && storeRecheckDeliveredAfterTotal.Load() > 0 {
-			break
-		}
 	}
 	rate := float64(patched.Load()-p0) / time.Since(t0).Seconds()
 	stop()
-
-	candidates := storeDivergenceCandidates.Load()
-	gets := storeRecheckGETsTotal.Load()
-	after := storeRecheckDeliveredAfterTotal.Load()
-	t.Logf("#918 kind: %d forced passes at %.0f patches/s over %d of %d objects (each every %s); longest pass %s: candidates=%d, re-check GETs=%d, cleared=%d (delivered after the read %d, read state received %d), counted without a re-check=%d",
-		passes, rate, k918Churned, k918Objects, interval, longest.Round(time.Millisecond), candidates, gets,
-		storeRecheckClearedTotal.Load(), after, storeRecheckReceivedReadStateTotal.Load(), storeRecheckUndeliveredTotal.Load())
-
-	// Non-vacuity: the run-16 mechanism happened. The sweep outlasted the
-	// update interval, and objects changed — and were delivered — after their
-	// read. Before #918 each such key was published as a lost update unless
-	// it changed after its second read too, which a sweep this long makes
-	// likely: this arm published and queued a repair.
-	if longest <= interval {
-		t.Fatalf("precondition: the longest pass took %s, not longer than the %s update interval — the run-16 shape was not reached (candidates=%d, GETs=%d)",
-			longest.Round(time.Millisecond), interval, candidates, gets)
-	}
-	if after == 0 {
-		t.Fatalf("precondition: no object changed after its read in %d passes — the arm tests nothing", passes)
-	}
-	kChurnAssertNothingPublished(t, "#918", passes)
-	if gets > candidates {
-		t.Errorf("re-check issued %d GETs for %d candidates, above one per candidate", gets, candidates)
-	}
+	kChurnSettle(t)
+	kChurnVerdict(t, "#918", k918Passes, rate)
 }

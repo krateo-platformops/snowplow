@@ -181,11 +181,12 @@ type ResourceWatcher struct {
 	// rw.mu.
 	lastSyncRV map[schema.GroupVersionResource]string
 
-	// deliveries (#875) holds each GVR's record of what its reflector
-	// delivered, written by the informer transform both registration paths
-	// install (store_verify_delivery.go). Present only when that transform was
-	// installed; without it the forced pass counts every candidate as it
-	// stands (store_divergence_recheck_unavailable_total). Guarded by rw.mu.
+	// deliveries (#875, #918) holds each GVR's record of what its store has
+	// received and not yet applied, its applied deletes and its pending keys,
+	// written by the transform and the handler both registration paths install
+	// (store_verify_delivery.go). Present only when that transform was
+	// installed; without it the forced pass judges on the store alone
+	// (store_divergence_unrecorded_total). Guarded by rw.mu.
 	deliveries map[schema.GroupVersionResource]*deliveryLog
 
 	// retainUnknownWarned records GVRs currently inside a #217 retain-on-unknown
@@ -1067,16 +1068,13 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// #875 — the delivery record for the forced store verification. This
 	// path strips nothing (metadata objects carry no body), so the transform
 	// is the record alone.
-	dl := newDeliveryLog(gi.Informer().LastSyncResourceVersion)
-	if err := gi.Informer().SetTransform(dl.transform(nil)); err != nil {
+	if err := rw.installDeliveryLogLocked(gvr, gi, nil); err != nil {
 		slog.Warn("cache.store.delivery_record_not_installed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
 			slog.String("path", "metadata-only"),
 			slog.String("error", err.Error()),
 		)
-	} else {
-		rw.rememberDeliveryLogLocked(gvr, dl)
 	}
 
 	// DepTracker event handlers (Ship A 0.30.110). Identical wiring to
@@ -1587,18 +1585,15 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 
 	resourceType := gvrResourceTypeString(gvr)
 	tf := StripBulkyFieldsForResourceType(resourceType, gvr)
-	// #875 — the same transform also records each delivery for the forced
-	// store verification (store_verify_delivery.go).
-	dl := newDeliveryLog(gi.Informer().LastSyncResourceVersion)
-	if err := gi.Informer().SetTransform(dl.transform(tf)); err != nil {
+	// #875 / #918 — the same transform also records each delivery for the
+	// store verification, after the strip (store_verify_delivery.go).
+	if err := rw.installDeliveryLogLocked(gvr, gi, tf); err != nil {
 		slog.Warn("cache.strip.set_transform_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
 			slog.String("error", err.Error()),
 			slog.Bool("post_start", rw.started),
 		)
-	} else {
-		rw.rememberDeliveryLogLocked(gvr, dl)
 	}
 
 	// 0.30.8 / 0.30.110: dep-tracker event hooks for the L1
@@ -1886,6 +1881,9 @@ func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResour
 	delete(rw.informerStop, gvr)
 	delete(rw.metadataOnly, gvr)
 	delete(rw.lastSyncRV, gvr)
+	if dl := rw.deliveries[gvr]; dl != nil {
+		dl.close() // #918 — its pending keys and resolver go with the informer
+	}
 	delete(rw.deliveries, gvr)
 	delete(rw.watchHandlerInstalled, gvr)
 	// #237 A3 — the reflector-path attribution state is keyed by GVR too, so

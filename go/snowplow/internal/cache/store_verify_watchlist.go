@@ -51,12 +51,17 @@ type initialEventsVerifier struct {
 	out    chan watch.Event
 	stopCh chan struct{}
 	once   sync.Once
+	// mark is the delivery record's transform counter when the stream began:
+	// its initial events are transformed into the reflector's temporary
+	// store, and must not count as something the live store had received.
+	mark uint64
 }
 
 var _ watch.Interface = (*initialEventsVerifier)(nil)
 
-func newInitialEventsVerifier(v *verifyingListerWatcher, src watch.Interface) *initialEventsVerifier {
+func newInitialEventsVerifier(v *verifyingListerWatcher, src watch.Interface, mark uint64) *initialEventsVerifier {
 	w := &initialEventsVerifier{
+		mark:   mark,
 		v:      v,
 		src:    src,
 		out:    make(chan watch.Event),
@@ -105,7 +110,11 @@ func (w *initialEventsVerifier) pump() {
 					}
 				case watch.Bookmark:
 					if isInitialEventsEndBookmark(ev.Object) {
-						w.v.verify(upstream)
+						listRV := ""
+						if acc, err := meta.Accessor(ev.Object); err == nil {
+							listRV = acc.GetResourceVersion()
+						}
+						w.v.verify(upstream, listRV, w.mark)
 						upstream = nil
 						accumulating = false
 					}

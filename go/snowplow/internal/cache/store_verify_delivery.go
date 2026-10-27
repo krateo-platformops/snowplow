@@ -1,44 +1,39 @@
-// store_verify_delivery.go — #875, #918: which keys the reflector delivered
-// while a forced pass was open, and when. Only those can be "store ahead of
-// the LIST", so only those are re-read (store_verify_recheck.go); every other
-// candidate is held to the LIST, with no GET. Each delivery's position against
-// the pass's reads is what the lost-update rule reads (#918, see DELIVERY
-// POSITIONS below).
+// store_verify_delivery.go — #875, #918: what each informer's store has
+// RECEIVED and not yet applied, which deletes it applied, and the keys a forced
+// pass could not decide yet. The lost-update rule (store_verify_judge.go) reads
+// these records together with the store's applied position.
 //
-// # WHY A SIGNAL AND NOT A CAP
+// # WHY THE STORE'S APPLIED STATE IS NOT ENOUGH
 //
-// The re-check exists to explain one thing: the store moved past the LIST
-// while the LIST was in flight. The store moves only when the reflector
-// delivers to it. So a key nothing was delivered for since the pass opened
-// cannot be ahead of a LIST that is no older than the store was at that
-// moment; if it disagrees with the LIST, the store is behind, and that is
-// what the pass exists to find. Re-reading it would be a GET spent proving
-// what the comparison already proved. Re-reading only delivered keys bounds
-// the GETs by the churn during the pass, by construction: a wholly divergent
-// store (#237's broken-store class) with no churn issues zero GETs and goes
-// straight to its one repair, where a per-candidate re-check issued two
-// quorum GETs per stored object before it (#875 review: 400 GETs for 200
-// objects). No count limit is involved, so none can be mistuned.
+// The reflector hands each object to the informer's queue, and the queue is
+// applied to the store later (client-go@v0.36.5 AtomicFIFO: the_real_fifo.go
+// addToItems_locked / addReplaceToItemsLocked enqueue, processDeltas applies).
+// Until it is applied the store is BEHIND what it has received, and comparing a
+// read with the store alone calls that a lost update (#878: the store behind
+// the read). Until #918 a 250 ms wait papered over it; the wait is gone, and
+// these records replace it:
 //
-// # WHAT IS RECORDED, AND WHERE
+//   - RECEIVED. The informer's transform records, per key, the {rv, uid} of
+//     the latest delivery it handed on, and the transform's sequence number.
+//     An entry is "still queued" while the store's applied position
+//     (Store.LastStoreSyncResourceVersion) is older than the entry's rv: the
+//     queue applies in resourceVersion order, so once the position has passed
+//     an entry, the entry has been applied — or dropped, in which case the
+//     store, not the record, is the truth (store_verify_judge.go). Our own
+//     handler removes an entry when it sees that very delivery applied.
+//   - APPLIED DELETES. The handler is the first place the event TYPE is known:
+//     a TransformFunc receives the object only, and a watch DELETE's object is
+//     indistinguishable from an update by content. The handler (processDeltas
+//     writes the store, then calls OnAdd / OnUpdate / OnDelete) records which
+//     keys were deleted and at which resourceVersion — or by a relist
+//     tombstone, which carries none.
 //
-// The informer's transform. Every object the reflector delivers passes through
-// it exactly once, synchronously, on the reflector goroutine, BEFORE the
-// object is queued for the store and BEFORE the reflector publishes the
-// delivery's position (LastSyncResourceVersion): watch ADD, UPDATE and DELETE
-// (the deleted object itself is transformed), and every item of a relist,
-// classic or streamed (client-go@v0.36.5 reflector.go handleAnyWatch, list,
-// watchList; the_real_fifo.go:255 addToItems_locked for watch events and
-// :295 addReplaceToItemsLocked, which transforms a whole relist at once under
-// AtomicFIFO). A watch-list relist is transformed twice: once into the
-// reflector's temporary store and again by the Replace (reflector.go:833-835,
-// :901); recording a key twice is idempotent. An event handler would be the
-// wrong place: handlers run on the processor's listener goroutines, after the
-// store write, so a delivery could already show in the store and not yet in
-// the record — the race this file exists to close.
+// # WHERE THE TRANSFORM RECORDS (F1 of the #923 review)
 //
-// While a pass is open the transform records the delivered key; always, it
-// keeps the latest object it saw.
+// AFTER the strip, and only when the strip returned no error and a non-nil
+// object. A delivery the strip failed on is never queued (an error) or never
+// applied (a nil object client-go cannot key), so recording it would say
+// "received" for a state the store will never hold, and hide a real loss.
 //
 // # THE TRANSFORM TAKES NO LOCK BUT ITS OWN
 //
@@ -46,129 +41,122 @@
 // releases that lock only around PROCESSING a popped delta
 // (the_real_fifo.go:454 whileProcessing_locked), never around the enqueue the
 // transform belongs to. At client-go v0.35.3 the informer's accessors took
-// startedLock and HasSynced then took the FIFO's lock (HasSynced ->
-// controller.HasSynced -> RealFIFO.HasSynced), so reading the informer's
-// position from inside the transform was an AB/BA deadlock with any
-// concurrent HasSynced — one this file's first draft had, and the kind churn
-// falsifier hung on. v0.36.5 made HasSynced a channel read
-// (shared_informer.go:791), which removes that particular cycle, but
-// LastSyncResourceVersion still takes startedLock and the reflector's mutex
-// (shared_informer.go:819, controller.go:223) and LastStoreSyncResourceVersion
-// takes the store's lock (thread_safe_store.go:436), and a transform-time read
-// of either is not the position of the delivery being transformed anyway. So
-// the rule stands: the transform touches only deliveryLog.mu, under which
-// nothing but map writes happen, and nothing ever waits for another lock while
-// holding deliveryLog.mu except the indexer's read lock, whose holders never
-// wait for this one.
+// startedLock and HasSynced then took the FIFO's lock, so reading the
+// informer's position from inside the transform was an AB/BA deadlock with
+// any concurrent HasSynced — one this file's first draft had, and the kind
+// churn falsifier hung on. v0.36.5 made HasSynced a channel read
+// (shared_informer.go:791), but LastSyncResourceVersion still takes
+// startedLock and the reflector's mutex (shared_informer.go:819,
+// controller.go:223) and LastStoreSyncResourceVersion takes the store's lock
+// (thread_safe_store.go:436), and a transform-time read of either is not the
+// position of the delivery being transformed anyway. So the rule stands: the
+// transform touches only deliveryLog.mu, under which nothing but map writes
+// happen, and no informer accessor or indexer read ever happens under mu.
 //
-// # OPENING A PASS
+// # PENDING KEYS, AND WHAT RE-JUDGES THEM
 //
-//  1. Under this log's mutex: start recording, take the store's key set
-//     (presence at open, for relist deletions below), and note the latest
-//     object the transform saw.
-//  2. With no lock held, read the published position. That is the
-//     resourceVersion the pass then LISTs no older than.
-//  3. Record the latest object's key, unless the position just read is that
-//     object's own resourceVersion (then its delivery is published and the
-//     LIST includes it).
+// A forced-pass candidate the rule cannot decide yet — the store's applied
+// position has not reached the read — is held here as PENDING, with the read
+// it is held to. A resolver goroutine re-judges the pending keys whenever our
+// handler sees anything applied to this GVR's store: the handler runs after
+// the store write, and every applied add, update or delete advances the
+// store's position (thread_safe_store.go Add / Update / Delete set c.rv), so
+// the resolver reads a position that includes that event. Nothing is timed
+// and the walker never waits: a resolved loss is published and repaired from
+// the resolver (publishResolvedLoss).
 //
-// # WHY A DELIVERED KEY CANNOT BE MISCLASSIFIED
-//
-// Let d be a watch delivery whose effect is in the store but not in the LIST.
-// The LIST is no older than the position read in step 2, so d's position was
-// not yet published at step 2, which is after step 1. Either d's transform ran
-// after step 1, saw a pass open and recorded its key; or it ran before step 1,
-// in which case d was IN FLIGHT at step 1 (transformed, not yet published).
-// The reflector delivers one at a time and publishes each delivery before it
-// transforms the next, so an in-flight delivery is always the latest object
-// the transform saw, and step 3 records it: its position was not published at
-// step 2, so the position read there is the one before it, not its own
-// resourceVersion. A transform that started before step 1 but had not yet
-// taken the mutex is ordered after step 1 by the mutex and records too. Hence
-// every key a watch delivery can have moved past the LIST is in the record.
-// The argument needs only what the API guarantees: a LIST with NotOlderThan p
-// reflects every change up to p, resourceVersions are unique, and the
-// reflector publishes positions in delivery order. It does not assume the
-// watch and the LIST are served by the same apiserver. Step 3 costs at most
-// one key (one GET), and only when that key is also a candidate.
-//
-// # RELISTS
-//
-// A relist delivers many objects and publishes one position, after all of
-// them, and it deletes the keys its new list lacks with synthesized
-// DeletedFinalStateUnknown tombstones that skip the transform. Under
-// AtomicFIFO the relist is ONE queued ReplacedAll delta: its items are
-// transformed when it is queued, and its tombstones are computed from the
-// store only when it is processed, which replaces the store and then hands
-// the tombstones to the handlers (controller.go:756 processReplacedAllInfo,
-// the Replace at :784). A tombstone can only produce a lost ADD (the store
-// lacks a key the LIST has), so a lost-ADD candidate that WAS in the store at
-// step 1 and is gone now counts as delivered: something removed it during the
-// pass. A relist that starts after step 1 transforms its items first and its
-// tombstones apply only after its items are queued, so they apply after the
-// key set was taken and the presence check sees them.
-//
-// Not covered, stated rather than assumed away: a relist already IN PROGRESS
-// at step 1 (its earlier items and any tombstones it has applied are not in
-// the record; under AtomicFIFO the store applies a relist all at once, so
-// "in progress" narrows to "queued or being transformed"), and a relist that
-// deletes a key whose ADD was still queued at step 1. Either needs, in addition, a LIST served by an apiserver whose cache
-// is older than that relist; on a single apiserver the LIST is no older than
-// anything the watch had already delivered. The result is one unnecessary
-// repair, never a hidden loss: an uncovered key is counted as a divergence,
-// not cleared.
-//
-// # DELIVERY POSITIONS (#918)
-//
-// The record also orders the deliveries. Every delivery the transform sees
-// takes the next number on one per-informer counter, and while a pass is open
-// the record keeps, per key, the number and the {rv, uid} of that key's latest
-// delivery. The counter is ours, not a resourceVersion: it says only "this
-// delivery happened before or after that instant, in this process", which is
-// all the lost-update rule needs (store_verify_recheck.go). It never orders two
-// resourceVersions, which the API forbids.
-//
-// mark() reads the counter at the instant a read is issued. A delivery for the
-// read's key numbered above the mark was delivered after the read began. The
-// pass keeps the record open until it has judged every candidate — through the
-// re-check's reads and the drain wait — so a delivery that lands at any point
-// before the verdict is in the record.
+// A BOOKMARK advances the store's position too, but client-go v0.36.5 gives no
+// callback for it: processDeltas `case Bookmark` calls only
+// clientState.Bookmark (controller.go:656-661), which sets the position and a
+// metrics gauge and nothing else (thread_safe_store.go:447-458), and
+// ResourceEventHandler has only OnAdd / OnUpdate / OnDelete (controller.go:279).
+// There is NO event for a bookmark-only advance, and this code does not poll
+// and does not read the gauge. So a key whose read only a bookmark passes is
+// re-judged by the GVR's next applied event or by its next forced pass, and
+// while keys are pending the GVR goes to the front of the walker
+// (markReverifyFirst). The next forced pass supersedes whatever is still
+// pending, with its own, newer read.
 package cache
 
 import (
-	"sort"
+	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/informers"
 	clientcache "k8s.io/client-go/tools/cache"
 )
 
-// deliveryLog is one informer's record of the reflector's deliveries.
+// storePendingKeys is the store_divergence_pending_keys gauge: pending keys
+// across every GVR.
+var storePendingKeys atomic.Int64
+
+// received is one key's latest delivery: what it carried, and its number on
+// the log's transform counter.
+type received struct {
+	id  objIdentity
+	seq uint64
+}
+
+// appliedDelete is one applied delete: its resourceVersion, or tombstone for a
+// relist's synthesized delete, which carries none.
+type appliedDelete struct {
+	rv        string
+	tombstone bool
+}
+
+// deliveryLog is one informer's records (see the file header).
 type deliveryLog struct {
-	// position reads the informer's published LastSyncResourceVersion. NEVER
-	// called from the transform or under mu (see the file header).
-	position func() string
+	gvr schema.GroupVersionResource
+
+	// bound once, before the informer runs (bind); read without mu.
+	//   published: the reflector's published position — the forced LIST is no
+	//              older than it.
+	//   applied:   the store's applied position.
+	published func() string
+	applied   func() string
+	indexer   clientcache.Indexer
 
 	mu sync.Mutex
-	// seq numbers the deliveries: how many objects the transform has seen. A
-	// delivery's number is seq just after its increment.
+	// seq numbers the transform's deliveries.
 	seq uint64
-	// latest is the latest object the transform saw.
-	latest any
-	// open holds the latest delivery of each key delivered since a pass
-	// opened; nil when no pass is open.
-	open map[string]delivery
+	// unapplied: key -> its latest delivery, until the handler sees it applied.
+	unapplied map[string]received
+	// deletes / prevDeletes: deletes applied since the latest pass opened, and
+	// since the one before. Two generations, rotated by beginPass, so a delete
+	// applied just before a pass opened is still known to it; an older one is
+	// not needed — a LIST no older than the store then lacks the key.
+	deletes, prevDeletes map[string]appliedDelete
+	// pending: keys a forced pass could not decide yet, with the read each is
+	// held to. gen numbers the pending sets: a resolver acts only on its own.
+	pending map[string]readState
+	gen     uint64
+	running bool
+	closed  bool
+	wake    chan struct{}
+	stop    chan struct{}
+	// sweeps counts the resolver's judgements of its pending set, so a test
+	// can tell "the resolver has looked" from "the resolver has not run yet".
+	sweeps atomic.Uint64
 }
 
-// delivery is one key's latest delivery while a pass is open: its number on
-// the log's counter and the {rv, uid} it carried.
-type delivery struct {
-	seq uint64
-	id  objIdentity
+func newDeliveryLog(gvr schema.GroupVersionResource) *deliveryLog {
+	return &deliveryLog{
+		gvr:       gvr,
+		unapplied: map[string]received{},
+		deletes:   map[string]appliedDelete{},
+		wake:      make(chan struct{}, 1),
+		stop:      make(chan struct{}),
+	}
 }
 
-func newDeliveryLog(position func() string) *deliveryLog {
-	return &deliveryLog{position: position}
+// bind attaches the informer the records describe. Called once, after the
+// transform and the handler are installed and before the informer runs.
+func (l *deliveryLog) bind(inf clientcache.SharedIndexInformer) {
+	l.published = inf.LastSyncResourceVersion
+	l.indexer = inf.GetIndexer()
+	l.applied = l.indexer.LastStoreSyncResourceVersion
 }
 
 // rememberDeliveryLogLocked records gvr's delivery log once its transform is
@@ -180,129 +168,275 @@ func (rw *ResourceWatcher) rememberDeliveryLogLocked(gvr schema.GroupVersionReso
 	rw.deliveries[gvr] = dl
 }
 
-// transform returns the informer transform: it records the delivery, then
-// applies next (nil for none).
-func (l *deliveryLog) transform(next clientcache.TransformFunc) clientcache.TransformFunc {
-	return func(obj any) (any, error) {
-		l.mu.Lock()
-		l.seq++
-		l.latest = obj
-		if l.open != nil {
-			if key, id, ok := identityOf(obj); ok {
-				l.open[key] = delivery{seq: l.seq, id: id}
-			}
-		}
-		l.mu.Unlock()
-		if next == nil {
-			return obj, nil
-		}
-		return next(obj)
-	}
-}
-
-// deliveryWindow is one open pass.
-type deliveryWindow struct {
-	log *deliveryLog
-	// position is the published position read once the pass was open: the
-	// forced LIST's NotOlderThan resourceVersion. Empty when none is
-	// published yet.
-	position string
-	// openedAt is the delivery counter when the pass opened. It is the mark
-	// the forced LIST is held to: the LIST is issued after it, so a delivery
-	// numbered above it came after the LIST began.
-	openedAt uint64
-	// presentAtOpen is the store's key set at open, sorted.
-	presentAtOpen []string
-
-	// closed and keys are set by the first close (under log.mu).
-	closed bool
-	keys   map[string]delivery
-}
-
-// openPass opens a pass (see the file header).
-func (l *deliveryLog) openPass(idx clientcache.Indexer) *deliveryWindow {
-	l.mu.Lock()
-	l.open = map[string]delivery{}
-	latest, openedAt := l.latest, l.seq
-	present := idx.ListKeys()
-	l.mu.Unlock()
-
-	w := &deliveryWindow{log: l, position: l.position(), openedAt: openedAt, presentAtOpen: present}
-	sort.Strings(w.presentAtOpen)
-	// The latest object may be in flight: transformed, its position not yet
-	// published. Unless the position just read IS its resourceVersion — a
-	// watch delivery publishes exactly its object's resourceVersion, so then
-	// it is published, the LIST includes it, and it needs no re-read. Any
-	// other value (a bookmark since, a relist item) keeps it, at the cost of
-	// at most one key. It is recorded under openedAt, not a later number: it
-	// was delivered before the pass opened, so it is never "delivered after"
-	// any read the pass issues. A delivery for the same key since open is
-	// newer and is kept instead.
-	if latest != nil {
-		if key, id, ok := identityOf(latest); ok && id.rv != w.position {
-			l.mu.Lock()
-			if _, since := l.open[key]; l.open != nil && !since {
-				l.open[key] = delivery{seq: openedAt, id: id}
-			}
-			l.mu.Unlock()
-		}
-	}
-	return w
-}
-
-// recordedLocked is the record the window reads: live while the pass is open,
-// frozen by close. Callers hold log.mu.
-func (w *deliveryWindow) recordedLocked() map[string]delivery {
-	if w.closed {
-		return w.keys
-	}
-	return w.log.open
-}
-
-// close stops recording and returns the deliveries recorded while the pass
-// was open. Idempotent: forcedVerify closes once every candidate is judged,
-// and again, deferred, on every early return.
-func (w *deliveryWindow) close() map[string]delivery {
-	w.log.mu.Lock()
-	defer w.log.mu.Unlock()
-	if !w.closed {
-		w.closed, w.keys = true, w.log.open
-		w.log.open = nil
-	}
-	return w.keys
-}
-
-// mark returns the delivery counter now. A read issued after this call is
-// held to it: a delivery for the read's key numbered above it came after the
-// read began.
-func (w *deliveryWindow) mark() uint64 {
-	w.log.mu.Lock()
-	defer w.log.mu.Unlock()
-	return w.log.seq
-}
-
-// moved reports whether the store may have moved for key since the pass
-// opened: a delivery for it was recorded, or (a lost ADD) it was in the store
-// at open and is gone now — a relist tombstone, which skips the transform.
-// Only such a candidate is re-read; every other one is held to the LIST.
-func (w *deliveryWindow) moved(key string, class divergenceClass) bool {
-	w.log.mu.Lock()
-	_, ok := w.recordedLocked()[key]
-	w.log.mu.Unlock()
-	if ok {
+// isNilObject reports a nil interface or a typed nil pointer.
+func isNilObject(obj any) bool {
+	if obj == nil {
 		return true
 	}
-	if class != classLostAdd {
-		return false
-	}
-	i := sort.SearchStrings(w.presentAtOpen, key)
-	return i < len(w.presentAtOpen) && w.presentAtOpen[i] == key
+	v := reflect.ValueOf(obj)
+	return v.Kind() == reflect.Ptr && v.IsNil()
 }
 
-// latestFor returns key's latest delivery recorded while the pass was open.
-func (w *deliveryWindow) latestFor(key string) (delivery, bool) {
-	w.log.mu.Lock()
-	defer w.log.mu.Unlock()
-	d, ok := w.recordedLocked()[key]
+// transform returns the informer transform: next (the strip; nil for none),
+// then the record of what it handed on (see "WHERE THE TRANSFORM RECORDS").
+func (l *deliveryLog) transform(next clientcache.TransformFunc) clientcache.TransformFunc {
+	return func(obj any) (any, error) {
+		out, err := obj, error(nil)
+		if next != nil {
+			out, err = next(obj)
+		}
+		if err != nil || isNilObject(out) {
+			return out, err
+		}
+		if key, id, ok := identityOf(out); ok {
+			l.mu.Lock()
+			l.seq++
+			l.unapplied[key] = received{id: id, seq: l.seq}
+			l.mu.Unlock()
+		}
+		return out, err
+	}
+}
+
+// mark returns the transform counter now: deliveries numbered at or below it
+// were handed on before this call.
+func (l *deliveryLog) mark() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.seq
+}
+
+// handler returns the event handler that sees each delivery applied.
+func (l *deliveryLog) handler() clientcache.ResourceEventHandler {
+	return clientcache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { l.appliedEvent(obj, false) },
+		UpdateFunc: func(_, obj any) { l.appliedEvent(obj, false) },
+		DeleteFunc: func(obj any) { l.appliedEvent(obj, true) },
+	}
+}
+
+// appliedEvent records one applied event. The unapplied entry goes only when
+// the applied object IS the latest received one ({rv, uid} equal): an older
+// delivery's apply leaves the newer, still queued one in place.
+func (l *deliveryLog) appliedEvent(obj any, deleted bool) {
+	l.mu.Lock()
+	if t, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
+		l.deletes[t.Key] = appliedDelete{tombstone: true}
+	} else if key, id, ok := identityOf(obj); ok {
+		if e, has := l.unapplied[key]; has && e.id == id {
+			delete(l.unapplied, key)
+		}
+		if deleted {
+			l.deletes[key] = appliedDelete{rv: id.rv}
+		}
+	}
+	wake := len(l.pending) > 0
+	l.mu.Unlock()
+	if wake {
+		l.signal()
+	}
+}
+
+func (l *deliveryLog) signal() {
+	select {
+	case l.wake <- struct{}{}:
+	default:
+	}
+}
+
+// appliedPosition is the store's applied position ("" when unknown).
+func (l *deliveryLog) appliedPosition() string {
+	if l.applied == nil {
+		return ""
+	}
+	return l.applied()
+}
+
+// receivedFor returns key's latest delivery not yet seen applied, if any.
+func (l *deliveryLog) receivedFor(key string) (received, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e, ok := l.unapplied[key]
+	return e, ok
+}
+
+// deleteFor returns the latest applied delete of key, if one is known.
+func (l *deliveryLog) deleteFor(key string) (appliedDelete, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if d, ok := l.deletes[key]; ok {
+		return d, true
+	}
+	d, ok := l.prevDeletes[key]
 	return d, ok
+}
+
+// beginPass opens a forced pass: the delete generations rotate, received
+// entries the store's position has already passed are dropped (they are
+// applied or were dropped by the queue; the store is the truth for them — a
+// relist that re-delivers an unchanged object is applied without telling the
+// handler, sharedIndexInformer.OnUpdate treating an unchanged resourceVersion
+// as a sync), whatever is still pending from the previous pass is superseded
+// (this pass reads again), and the reflector's published position is returned:
+// the forced LIST is no older than it.
+func (l *deliveryLog) beginPass() string {
+	applied := l.appliedPosition()
+	l.mu.Lock()
+	l.prevDeletes, l.deletes = l.deletes, map[string]appliedDelete{}
+	if applied != "" {
+		for key, e := range l.unapplied {
+			if c, err := orderRV(e.id.rv, applied); err == nil && c <= 0 {
+				delete(l.unapplied, key)
+			}
+		}
+	}
+	superseded := len(l.pending)
+	l.pending = nil
+	l.gen++
+	l.mu.Unlock()
+	if superseded > 0 {
+		storePendingKeys.Add(-int64(superseded))
+		storePendingSupersededTotal.Add(uint64(superseded))
+	}
+	if l.published == nil {
+		return ""
+	}
+	return l.published()
+}
+
+// setPending holds keys a pass could not decide yet and starts the resolver.
+// It wakes the resolver once: an apply that landed between the pass's verdict
+// and this call found nothing pending and woke no one.
+func (l *deliveryLog) setPending(reads map[string]readState) {
+	if len(reads) == 0 {
+		return
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	l.pending = reads
+	l.gen++
+	start := !l.running
+	l.running = true
+	l.mu.Unlock()
+	storePendingKeys.Add(int64(len(reads)))
+	if start {
+		go l.resolve()
+	}
+	l.signal()
+}
+
+// pendingCount is the number of keys pending on this GVR.
+func (l *deliveryLog) pendingCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.pending)
+}
+
+// close stops the resolver and drops what is pending: the GVR's informer is
+// being torn down (deletePerGVRStateLocked).
+func (l *deliveryLog) close() {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	l.closed = true
+	n := len(l.pending)
+	l.pending = nil
+	l.gen++
+	l.mu.Unlock()
+	storePendingKeys.Add(-int64(n))
+	close(l.stop)
+}
+
+// resolve re-judges the pending keys on every wake until none is left.
+func (l *deliveryLog) resolve() {
+	for {
+		select {
+		case <-l.stop:
+			return
+		case <-l.wake:
+		}
+		l.mu.Lock()
+		if len(l.pending) == 0 {
+			l.running = false
+			l.mu.Unlock()
+			return
+		}
+		gen := l.gen
+		keys := make(map[string]readState, len(l.pending))
+		for k, r := range l.pending {
+			keys[k] = r
+		}
+		l.mu.Unlock()
+
+		var lost []divergenceCandidate
+		var settled []string
+		var resolvedReceived, undecided uint64
+		for key, read := range keys {
+			switch v := judgeKey(l.indexer, l, positionOf(l.appliedPosition()), key, read); v.outcome {
+			case outcomeLost:
+				lost = append(lost, divergenceCandidate{key, v.class})
+				settled = append(settled, key)
+			case outcomeAgree, outcomeStoreAhead, outcomeReceived:
+				settled = append(settled, key)
+				resolvedReceived++
+			case outcomeUndecided:
+				settled = append(settled, key)
+				undecided++
+			}
+		}
+
+		l.sweeps.Add(1)
+		l.mu.Lock()
+		if l.gen != gen {
+			// Superseded by a newer pass, or closed, while judging: its read
+			// is the one that counts now.
+			l.mu.Unlock()
+			continue
+		}
+		for _, k := range settled {
+			delete(l.pending, k)
+		}
+		empty := len(l.pending) == 0
+		if empty {
+			l.running = false
+		}
+		l.mu.Unlock()
+		storePendingKeys.Add(-int64(len(settled)))
+		storePendingResolvedReceivedTotal.Add(resolvedReceived)
+		storeUndecidedTotal.Add(undecided)
+		if len(lost) > 0 {
+			storePendingResolvedLostTotal.Add(uint64(len(lost)))
+			publishResolvedLoss(l.gvr, lost)
+		}
+		if empty {
+			return
+		}
+	}
+}
+
+// installDeliveryLogLocked installs gvr's delivery record on gi: the transform
+// (next, the strip, runs first; nil for none) and the handler, both before the
+// informer runs. Callers MUST hold rw.mu.Lock(). An error means the informer
+// already runs (a re-registered shared-factory GVR gets its started informer
+// back): the GVR then has no record, and the forced pass judges it without one.
+func (rw *ResourceWatcher) installDeliveryLogLocked(gvr schema.GroupVersionResource, gi informers.GenericInformer, next clientcache.TransformFunc) error {
+	dl := newDeliveryLog(gvr)
+	inf := gi.Informer()
+	if err := inf.SetTransform(dl.transform(next)); err != nil {
+		return err
+	}
+	if _, err := inf.AddEventHandler(dl.handler()); err != nil {
+		return err
+	}
+	dl.bind(inf)
+	if s, ok := gi.(*streamingDynamicInformer); ok && s.verifier != nil {
+		s.verifier.setDeliveryLog(dl)
+	}
+	rw.rememberDeliveryLogLocked(gvr, dl)
+	return nil
 }

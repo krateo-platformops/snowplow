@@ -96,7 +96,6 @@ import (
 	"context"
 	"log/slog"
 	"sync/atomic"
-	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -141,6 +140,9 @@ type verifyingListerWatcher struct {
 	innerCtx clientcache.ListerWatcherWithContext
 	gvr      schema.GroupVersionResource
 	informer clientcache.SharedIndexInformer
+	// log is the GVR's delivery record (#918), nil when its transform could
+	// not be installed. Set once, before the informer runs.
+	log *deliveryLog
 }
 
 var _ clientcache.ListerWatcher = (*verifyingListerWatcher)(nil)
@@ -161,11 +163,26 @@ func newVerifyingListerWatcher(lw clientcache.ListerWatcher, gvr schema.GroupVer
 // race: the reflector that reads this field does not exist until Run.
 func (v *verifyingListerWatcher) bind(inf clientcache.SharedIndexInformer) { v.informer = inf }
 
+// setDeliveryLog attaches the GVR's delivery record. Called once, at
+// registration, before the informer runs.
+func (v *verifyingListerWatcher) setDeliveryLog(l *deliveryLog) { v.log = l }
+
+// mark is the delivery record's transform counter as a read begins: what the
+// transform hands on after it is the read itself, not something the store had
+// received before the read (judge.receivedMark).
+func (v *verifyingListerWatcher) mark() uint64 {
+	if v.log == nil {
+		return 0
+	}
+	return v.log.mark()
+}
+
 func (v *verifyingListerWatcher) List(options metav1.ListOptions) (runtime.Object, error) {
 	return v.ListWithContext(context.Background(), options)
 }
 
 func (v *verifyingListerWatcher) ListWithContext(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+	mark := v.mark()
 	list, err := v.innerCtx.ListWithContext(ctx, options)
 	if err != nil || list == nil {
 		return list, err
@@ -184,7 +201,11 @@ func (v *verifyingListerWatcher) ListWithContext(ctx context.Context, options me
 			upstream[key] = id
 		}
 	}
-	v.verify(upstream)
+	listRV := ""
+	if la, laErr := meta.ListAccessor(list); laErr == nil {
+		listRV = la.GetResourceVersion()
+	}
+	v.verify(upstream, listRV, mark)
 	return list, nil
 }
 
@@ -204,13 +225,14 @@ func (v *verifyingListerWatcher) WatchWithContext(ctx context.Context, options m
 	if options.SendInitialEvents == nil || !*options.SendInitialEvents {
 		return w, nil
 	}
-	return newInitialEventsVerifier(v, w), nil
+	return newInitialEventsVerifier(v, w, v.mark()), nil
 }
 
 // verify runs the comparison against the bound informer's indexer and reports.
-// site is always verifySiteSnapshot here; the forced pass calls compareStore
-// directly with verifySiteForced.
-func (v *verifyingListerWatcher) verify(upstream map[string]objIdentity) {
+// site is always verifySiteSnapshot here; the forced pass judges its own
+// candidates (judgeForcedPass) with verifySiteForced. listRV is the
+// snapshot's resourceVersion; mark the transform counter when it began.
+func (v *verifyingListerWatcher) verify(upstream map[string]objIdentity, listRV string, mark uint64) {
 	if v.informer == nil {
 		recordVerifySkipped(verifySkipTornDown)
 		return
@@ -231,7 +253,7 @@ func (v *verifyingListerWatcher) verify(upstream map[string]objIdentity) {
 		recordVerifySkipped(verifySkipTornDown)
 		return
 	}
-	report := compareStore(idx, upstream)
+	report := compareStore(idx, v.log, upstream, listRV, mark)
 	publishDivergence(v.gvr, verifySiteSnapshot, report)
 }
 
@@ -256,14 +278,20 @@ func identityOf(obj any) (string, objIdentity, bool) {
 }
 
 // compareStore is the snapshot path's comparison: diffStore's candidates,
-// judged by confirmDivergences under the one lost-update rule. On this path
-// the rule's delivery clause holds by construction — the reflector is blocked
-// inside the read, so nothing can be delivered after it — and settled is nil.
-// The forced pass, where deliveries do continue, judges the same candidates
-// with the same function, passing the clause (store_verify_recheck.go).
-func compareStore(idx clientcache.Indexer, upstream map[string]objIdentity) divergenceReport {
+// judged under the one lost-update rule (store_verify_judge.go). On this path
+// the reflector is blocked inside the read, and the read IS the store's next
+// state, so a store behind it is a divergence by definition (the position is
+// "always reached"); what the store had already received and not yet applied
+// before the read began (mark) still counts as received, which is what the
+// 250 ms drain wait used to approximate. log may be nil.
+func compareStore(idx clientcache.Indexer, log *deliveryLog, upstream map[string]objIdentity, listRV string, mark uint64) divergenceReport {
 	candidates := diffStore(idx, upstream)
-	return reportOf(len(upstream), len(candidates), confirmDivergences(idx, upstream, candidates, nil))
+	if len(candidates) == 0 {
+		return reportOf(len(upstream), 0, nil)
+	}
+	pos := positionView{applied: idx.LastStoreSyncResourceVersion(), always: true}
+	t := judge{idx: idx, log: log, pos: pos, receivedMark: mark}.sweep(upstream, listRV, candidates)
+	return reportOf(len(upstream), len(candidates), t.lost)
 }
 
 // reportOf builds a report from the candidates that still diverge.
@@ -287,8 +315,8 @@ func reportOf(objectsCompared, candidates int, confirmed []divergenceCandidate) 
 // diffStore is the whole of B's classification, and it is deliberately one
 // function shared by both detection sites so the two can never drift about what
 // a lost UPDATE is. It returns every key on which the store and the read
-// disagree, by class; whether a candidate COUNTS is the rule's, applied by
-// confirmDivergences.
+// disagree, by class; whether a candidate COUNTS is the rule's
+// (store_verify_judge.go).
 //
 // The UID class is the one that matters most and the one a key-set diff is
 // structurally blind to: ResolvedKeyInputs carries class/G/V/R/namespace/name/
@@ -342,127 +370,6 @@ type divergenceCandidate struct {
 	class divergenceClass
 }
 
-// confirmDivergenceBudget bounds the re-read that separates a real divergence
-// from the DeltaFIFO drain race. Paid only on a divergence, which in a healthy
-// process is never.
-const confirmDivergenceBudget = 250 * time.Millisecond
-
-// confirmDivergenceTick is the re-read cadence inside the budget.
-const confirmDivergenceTick = 10 * time.Millisecond
-
-// confirmDivergences applies THE LOST-UPDATE RULE (#918) to every candidate of
-// every comparison site, and returns those that count. A candidate counts only
-// if BOTH hold:
-//
-//  1. nothing was delivered for its key after the read it is held to began,
-//     and
-//  2. the store still disagrees with that read — judged on what the store has
-//     RECEIVED, not only on what it has applied yet: a delivery that carried
-//     exactly the read's {rv, uid} gave the store the read's state, and only
-//     its application is pending.
-//
-// A key delivered after the read is not a lost update whatever the store now
-// holds: the watch is still carrying that object, so the store has received
-// its state after the read. Comparing such a store with the read compares two
-// different moments of the object and reads the difference as a loss — the
-// store AHEAD of the read: #872's LIST, and #918's re-check sweep, which read
-// 379 objects at 5/s, took longer than their 20 s update interval, and so
-// found most of them "lost". The store BEHIND the read (#878) is the same
-// mistake the other way round: the read's state was delivered, before or
-// after the read, and the store had not applied it yet when it was compared.
-// A key with no delivery after the read, whose store has not received the
-// read's state and still disagrees with it, did miss a change, and it counts
-// however long the pass took to get there — so no verdict depends on the
-// pass's duration.
-//
-// settled is what the site's delivery record says about a key: clause 1, and
-// clause 2's "received". nil on the snapshot path, where the reflector is
-// blocked inside the read, so nothing CAN be delivered after it, and the
-// comparison is against the store's applied state with the drain wait below.
-// On the forced pass it reads the delivery record, which stays open until
-// this returns (store_verify_recheck.go). It is checked on every re-read, so a
-// delivery landing during the wait settles its key.
-//
-// confirmDivergences re-reads the candidate keys until each is settled or
-// agrees with the read, or the budget expires, and returns those that still
-// disagree.
-//
-// THE DRAIN RACE. The indexer lags the DeltaFIFO: a delta already queued but
-// not yet popped makes the store look older than upstream, and counting that as
-// a divergence would be a false positive on a perfectly healthy process.
-// On the snapshot path the reflector is blocked inside our call, so we can
-// afford to wait.
-//
-// THE BUDGET IS FOR THE WHOLE COMPARISON, NOT PER KEY. A correlated divergence
-// across thousands of keys must not be able to stall the watch stream for
-// keys x 250ms. Whatever still disagrees when the budget expires is counted as
-// confirmed, which is the safe direction: the alternative is discarding a real
-// divergence because the FIFO happened to be busy.
-//
-// The raw count is published as store_divergence_candidates_total alongside the
-// confirmed classes, rather than hidden, because a large
-// candidates-minus-confirmed gap is itself a signal — it says the FIFO is
-// backing up, which is a different problem from a stale store and deserves to
-// be readable as one.
-func confirmDivergences(idx clientcache.Indexer, upstream map[string]objIdentity, candidates []divergenceCandidate,
-	settled func(key string) bool) []divergenceCandidate {
-	deadline := time.Now().Add(confirmDivergenceBudget)
-	pending := candidates
-	for {
-		still := pending[:0:0]
-		for _, c := range pending {
-			if settled != nil && settled(c.key) {
-				continue
-			}
-			if stillDivergent(idx, upstream, c) {
-				still = append(still, c)
-			}
-		}
-		pending = still
-		if len(pending) == 0 || !time.Now().Before(deadline) {
-			return pending
-		}
-		time.Sleep(confirmDivergenceTick)
-	}
-}
-
-// stillDivergent re-reads ONE key from the indexer and re-applies the same
-// predicate the first pass used. It re-derives the class rather than trusting
-// the recorded one so a candidate that changed class while the FIFO drained
-// (a lost ADD that arrived, leaving only an rv difference) is not confirmed
-// under a class it no longer belongs to.
-func stillDivergent(idx clientcache.Indexer, upstream map[string]objIdentity, c divergenceCandidate) bool {
-	obj, exists, err := idx.GetByKey(c.key)
-	if err != nil {
-		return true
-	}
-	up, wanted := upstream[c.key]
-	if !exists || obj == nil {
-		// Absent from the store: a real lost ADD if upstream has it, and
-		// nothing at all if upstream does not (the lost DELETE drained).
-		return wanted && c.class == classLostAdd
-	}
-	_, st, ok := identityOf(obj)
-	if !ok {
-		return true
-	}
-	if !wanted {
-		return c.class == classLostDelete
-	}
-	switch c.class {
-	case classUIDMismatch:
-		return st.uid != "" && up.uid != "" && st.uid != up.uid
-	case classLostUpdate:
-		return st.rv != up.rv
-	case classLostAdd:
-		// The object arrived while we waited — the ADD was not lost.
-		return false
-	case classLostDelete:
-		return false
-	}
-	return false
-}
-
 // publishDivergence moves a report onto the counters and, when it is non-empty,
 // emits ONE warn-level line naming the classes and a bounded sample of the
 // coordinates.
@@ -477,7 +384,13 @@ func stillDivergent(idx clientcache.Indexer, upstream map[string]objIdentity, c 
 func publishDivergence(gvr schema.GroupVersionResource, site string, rep divergenceReport) {
 	storeVerificationsTotal.Add(1)
 	storeObjectsVerifiedTotal.Add(uint64(rep.objectsCompared))
+	recordDivergence(gvr, site, rep)
+}
 
+// recordDivergence moves a report's divergences onto the counters and logs
+// them. A pending key resolved after its pass (publishResolvedLoss) records
+// through here alone: it is not a verification of its own.
+func recordDivergence(gvr schema.GroupVersionResource, site string, rep divergenceReport) {
 	addN(storeDivergentLostUpdate[site], len(rep.lostUpdate))
 	addN(storeDivergentLostDelete[site], len(rep.lostDelete))
 	addN(storeDivergentLostAdd[site], len(rep.lostAdd))

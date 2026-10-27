@@ -69,6 +69,10 @@ type gvrVerification struct {
 	// lastAttempt is when the latest forced pass started, completed or not
 	// (#875). The walker's turn order only — never the age (noteVerifyAttempt).
 	lastAttempt time.Time
+	// reverifyFirst (#918): a pass left keys pending or undecided that a
+	// newer pass can decide, so the walker takes this GVR next, ahead of the
+	// deadline. Cleared when its next pass starts (noteVerifyAttempt).
+	reverifyFirst bool
 	// verified is true once a verification has completed since the current
 	// epoch was set. It drives the "never" reading on /debug/servable's row,
 	// which is a different question from the age the gauge reports.
@@ -221,6 +225,18 @@ func noteVerifyAttempt(gvr schema.GroupVersionResource) {
 	storeVerify.mu.Lock()
 	if st, ok := storeVerify.gvrs[gvr]; ok {
 		st.lastAttempt = time.Now()
+		st.reverifyFirst = false
+	}
+	storeVerify.mu.Unlock()
+}
+
+// markReverifyFirst puts gvr at the front of the walker (#918): its last pass
+// left keys only a newer pass, or an event that may never come (a bookmark has
+// no callback), can decide.
+func markReverifyFirst(gvr schema.GroupVersionResource) {
+	storeVerify.mu.Lock()
+	if st, ok := storeVerify.gvrs[gvr]; ok {
+		st.reverifyFirst = true
 	}
 	storeVerify.mu.Unlock()
 }
@@ -326,6 +342,7 @@ func verificationDecorated(gvr schema.GroupVersionResource) (decorated, known bo
 type verificationRow struct {
 	epoch                  time.Time
 	lastAttempt            time.Time
+	reverifyFirst          bool
 	verified               bool
 	decorated              bool
 	ownsInformer           bool
@@ -345,6 +362,7 @@ func verificationRows() map[schema.GroupVersionResource]verificationRow {
 		out[gvr] = verificationRow{
 			epoch:                  st.epoch,
 			lastAttempt:            st.lastAttempt,
+			reverifyFirst:          st.reverifyFirst,
 			verified:               st.verified,
 			decorated:              st.decorated,
 			ownsInformer:           st.ownsInformer,
@@ -369,6 +387,7 @@ func verificationRowFor(gvr schema.GroupVersionResource) (verificationRow, bool)
 	return verificationRow{
 		epoch:                  st.epoch,
 		lastAttempt:            st.lastAttempt,
+		reverifyFirst:          st.reverifyFirst,
 		verified:               st.verified,
 		decorated:              st.decorated,
 		ownsInformer:           st.ownsInformer,
