@@ -263,12 +263,8 @@ func kChurnVerdict(t *testing.T, issue string, passes int, rate float64) {
 		issue, passes, rate, candidates, storeClearedTotal.Load(), ahead, storeReceivedTotal.Load(), storeUndecidedTotal.Load(),
 		storePendingResolvedLostTotal.Load(), storePendingResolvedReceivedTotal.Load(), storePendingSupersededTotal.Load(),
 		lu, ld, la, um, storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load()))
-	if candidates == 0 {
-		t.Fatalf("precondition: %d passes at %.0f patches/s produced no candidate — the arm tests nothing", passes, rate)
-	}
-	if ahead == 0 {
-		t.Fatalf("precondition: no candidate had the store ahead of its read — the arm does not exercise the false-loss mechanism")
-	}
+	// The verdict first, so a mutant that publishes is reported as what it
+	// is; the non-vacuity preconditions follow.
 	if lu+ld+la+um != 0 {
 		t.Errorf("%s RED: churn alone published %d forced divergences (update/delete/add/uid = %d/%d/%d/%d) on a store that lost nothing",
 			issue, lu+ld+la+um, lu, ld, la, um)
@@ -288,6 +284,12 @@ func kChurnVerdict(t *testing.T, issue string, passes int, rate float64) {
 	// The passes really ran: a hang or a skip would leave this short.
 	if got := storeVerifyForcedListsTotal.Load(); got != uint64(passes) {
 		t.Errorf("%d forced LISTs for %d passes", got, passes)
+	}
+	if candidates == 0 {
+		t.Fatalf("precondition: %d passes at %.0f patches/s produced no candidate — the arm tests nothing", passes, rate)
+	}
+	if ahead == 0 {
+		t.Fatalf("precondition: no candidate had the store ahead of its read — the arm does not exercise the false-loss mechanism")
 	}
 }
 

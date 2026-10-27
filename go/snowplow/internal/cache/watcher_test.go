@@ -224,6 +224,12 @@ func TestNewResourceWatcher_AddResourceTypeIdempotent(t *testing.T) {
 //
 // Headroom = 12× absorbs client-go version drift, the existing
 // sync-watcher per GVR, AND the Ship B additions.
+//
+// #918 adds one event handler per informer that carries a delivery record
+// (store_verify_delivery.go: it sees each delivery applied). client-go runs
+// every handler as a processorListener with TWO goroutines (run and pop), so
+// the bound per GVR grows by exactly 2: 14×. Still a constant per GVR, which
+// is what this test guards.
 func TestNewResourceWatcher_GoroutineFootprintBounded(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 
@@ -243,7 +249,7 @@ func TestNewResourceWatcher_GoroutineFootprintBounded(t *testing.T) {
 
 	after := runtime.NumGoroutine()
 	delta := after - before
-	const headroom = 12
+	const headroom = 14
 	maxAllowed := len(cache.RBACResourceTypes) * headroom
 	if delta > maxAllowed {
 		t.Fatalf("goroutine delta = %d (want <= %d); before=%d after=%d", delta, maxAllowed, before, after)
