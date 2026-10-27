@@ -12,8 +12,12 @@ package dispatchers
 //   W1  A: the POST is NOT sent (the only dial is the 403), the status stays
 //       200, and X-Snowplow-Stage-Outcomes lists the Forbidden read and the
 //       skipped write with the stage it depended on — no identity in it.
-//   W2  A's result is denial-only (#681), so it is cached; the L1 hit (0
-//       dials) answers with the SAME header as the cold resolve.
+//   W2  a READ-ONLY RESTAction whose x/y read A may not do: the result is
+//       denial-only (#681), so it is cached; the L1 hit (0 dials) answers with
+//       the SAME header as the cold resolve. (Read-only on purpose: since #903
+//       a RESTAction that declares a write is never stored.)
+//   W5  (F3) a RESTAction whose stages cannot be ordered (a dependsOn naming
+//       no stage) answers a header with the resolve-level Aborted row, never [].
 //   W3  B (may read x/y): the POST is sent exactly once.
 //   W4  a RESTAction whose stages all succeed answers [] cold and warm.
 
@@ -85,7 +89,7 @@ func w904Rows(t *testing.T, rec *httptest.ResponseRecorder) (string, map[string]
 	return v, out
 }
 
-func TestIssue904_W1_W2_SkippedWriteHeaderColdAndWarm(t *testing.T) {
+func TestIssue904_W1_SkippedWriteHeader(t *testing.T) {
 	e := c681Setup(t)
 	e.ra = w904RA()
 
@@ -109,7 +113,17 @@ func TestIssue904_W1_W2_SkippedWriteHeaderColdAndWarm(t *testing.T) {
 			t.Errorf("the header carries %q: %s", s, v1)
 		}
 	}
+}
 
+func TestIssue904_W2_HitHeaderEqualsColdHeader(t *testing.T) {
+	e := c681Setup(t)
+	e.ra = c681RAObj("/api/v1/namespaces/x/configmaps/y", "/api/v1/namespaces/pub/configmaps/p")
+
+	rec1, _ := e.callRec(t, c681A)
+	v1, rows := w904Rows(t, rec1)
+	if w := (w904Row{Name: "sa", Reason: api.StageReasonForbidden}); rows["sa"] != w {
+		t.Fatalf("PRE: stage sa outcome = %+v, want %+v (header=%s)", rows["sa"], w, v1)
+	}
 	if _, ok := e.cell(c681A, t); !ok {
 		t.Fatal("PRE: A's denial-only result must be cached (#681)")
 	}
@@ -119,6 +133,24 @@ func TestIssue904_W1_W2_SkippedWriteHeaderColdAndWarm(t *testing.T) {
 	}
 	if v2 := rec2.Header().Get(util.HeaderStageOutcomes); v2 != v1 {
 		t.Fatalf("#904 RED: the L1 hit answered %s=%q, the cold resolve %q", util.HeaderStageOutcomes, v2, v1)
+	}
+}
+
+func TestIssue904_W5_AbortedResolveHeader(t *testing.T) {
+	e := c681Setup(t)
+	e.ra = c681RAObj("/api/v1/namespaces/pub/configmaps/p")
+	stages := e.ra.Object["spec"].(map[string]any)["api"].([]any)
+	stages[0].(map[string]any)["dependsOn"] = map[string]any{"name": "nosuch"}
+	rec, _ := e.callRec(t, c681A)
+	v, rows := w904Rows(t, rec)
+	if v == "[]" {
+		t.Fatal("#904 F3 RED: a RESTAction that ran no stage answered the header [] (all succeeded)")
+	}
+	if w := (w904Row{Name: "", Reason: api.StageReasonAborted}); rows[""] != w {
+		t.Fatalf("want the resolve-level Aborted row, header=%s", v)
+	}
+	if w := (w904Row{Name: "sa", Reason: api.StageReasonNotRun}); rows["sa"] != w {
+		t.Fatalf("want stage sa NotRun, header=%s", v)
 	}
 }
 

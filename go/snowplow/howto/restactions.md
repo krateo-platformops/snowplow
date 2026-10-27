@@ -253,6 +253,10 @@ succeed. `[]` means every stage succeeded.
 - `reason` is a code: `Forbidden`, `NotFound`, `Unauthorized`, `Error`,
   `Skipped`, `NotRun` (the resolve stopped before this stage),
   `StageNotExecuted` (a dry run). `dependsOn` is set on a `Skipped` row.
+- A resolve that runs no stage at all (its `dependsOn` graph names a stage
+  that does not exist or has a cycle) answers a resolve-level row
+  `{"name":"","ok":false,"reason":"Aborted"}` followed by every stage as
+  `NotRun`, never `[]`.
 - It carries stage names and codes only: no error text, path, identity or
   data. Above 4 KiB it is `{"truncated":true,"failed":N}`.
 - The HTTP status is unchanged (see below), so a controller that drives a

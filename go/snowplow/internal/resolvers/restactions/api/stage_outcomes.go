@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"sync"
 	"sync/atomic"
+
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // Per-stage outcomes of one resolve.
@@ -48,6 +50,12 @@ const (
 	// StageReasonSkipped (#904) — a write stage not dialed because the stage it
 	// depends on failed or was skipped. Recorded only by skip(), never by fail().
 	StageReasonSkipped = "Skipped"
+	// StageReasonAborted (#904 review F3) — the RESOLVE-level row (name "")
+	// of a resolve that stopped before running any stage: its stage graph
+	// cannot be ordered (a dependsOn naming no stage, a cycle) or it has no
+	// identity or no client config. Every declared stage is then NotRun, so
+	// the header can never read "all succeeded" ([]) for it.
+	StageReasonAborted = "Aborted"
 )
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
@@ -76,6 +84,7 @@ type stageOutcome struct {
 type StageOutcomes struct {
 	claimed atomic.Bool // a top-level resolve took this collector (claimStageOutcomes)
 	mu      sync.Mutex
+	aborted bool // the resolve stopped before running any stage (F3)
 	order   []string
 	by      map[string]*stageOutcome
 }
@@ -151,6 +160,25 @@ func (s *StageOutcomes) fail(name, reason string) {
 	}
 }
 
+// abortedResolve (#904 review F3) is ResolveWithFailure's answer when it stops
+// before running any stage: an empty dict, and — on the collector this resolve
+// claims — a resolve-level Aborted row plus every declared stage as NotRun, so
+// a controller reading the header never reads "all succeeded".
+func abortedResolve(ctx context.Context, items []*templates.API) (map[string]any, *StageFailure) {
+	o := claimStageOutcomes(ctx)
+	names := make([]string, 0, len(items))
+	for _, it := range items {
+		if it != nil {
+			names = append(names, it.Name)
+		}
+	}
+	o.register(names)
+	o.mu.Lock()
+	o.aborted = true
+	o.mu.Unlock()
+	return map[string]any{}, nil
+}
+
 // skip records that a stage was not dialed because dependsOn did not succeed
 // (#904). Called by the orchestrator between stages, never by a worker.
 func (s *StageOutcomes) skip(name, dependsOn string) {
@@ -198,7 +226,10 @@ func (s *StageOutcomes) HeaderValue() string {
 		return ""
 	}
 	s.mu.Lock()
-	out := make([]stageOutcomeJSON, 0, len(s.order))
+	out := make([]stageOutcomeJSON, 0, len(s.order)+1)
+	if s.aborted {
+		out = append(out, stageOutcomeJSON{Name: "", Reason: StageReasonAborted})
+	}
 	for _, n := range s.order {
 		o := s.by[n]
 		switch {

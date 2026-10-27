@@ -2004,7 +2004,7 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 		var err error
 		opts.RC, err = inClusterConfigFn()
 		if err != nil {
-			return map[string]any{}, nil
+			return abortedResolve(ctx, opts.Items)
 		}
 	}
 
@@ -2023,14 +2023,14 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		log.Error("unable to fetch user info from context", slog.Any("err", err))
-		return map[string]any{}, nil
+		return abortedResolve(ctx, opts.Items)
 	}
 
 	// Sort API by Depends
 	names, err := topologicalSort(opts.Items)
 	if err != nil {
 		log.Error("unable to sorted api by deps", slog.Any("error", err))
-		return map[string]any{}, nil
+		return abortedResolve(ctx, opts.Items)
 	}
 	log.Debug("sorted api by deps", slog.Any("names", names))
 

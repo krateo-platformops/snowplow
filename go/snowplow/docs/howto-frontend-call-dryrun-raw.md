@@ -132,7 +132,9 @@ Content-Type: application/json
     `NotFound`, `Unauthorized`, `NotRun` (the resolve stopped before this
     stage), `Skipped` (#904: a write stage not sent because the stage it depends
     on failed or was skipped; the row's `dependsOn` names that stage),
-    `Error` (anything else).
+    `Aborted` (#904: the resolve-level row, `name` "", of a resolve that ran
+    no stage — a `dependsOn` naming no stage, a cycle; every stage is then
+    `NotRun`), `Error` (anything else).
     The header never carries an error message, a path, an identity or
     response data.
   - Bounded: above 4 KiB it is `{"truncated":true,"failed":<N>}`.
