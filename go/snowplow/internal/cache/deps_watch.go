@@ -562,7 +562,7 @@ var depAddDeliveryHookForTest atomic.Pointer[func(gvr schema.GroupVersionResourc
 // initial LIST after syncCh has closed; the syncCh gate then reads a replayed
 // ADD as live, which stamps the freshness clock and dirty-marks dependents
 // of an object that did not change, at boot and on every relist. The flag is
-// set per notification by client-go (DeltaFIFO's "not yet synced" at pop
+// set per notification by client-go (the FIFO's "not yet synced" at pop
 // time, and true for the replay a handler added to a running informer
 // receives), so it is exact whatever the delivery lag. A relist through
 // RemoveResourceType + EnsureResourceType builds a fresh informer whose LIST
