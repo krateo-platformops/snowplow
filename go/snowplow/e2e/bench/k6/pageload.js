@@ -78,7 +78,54 @@ export const OBSERVER = `(() => {
     window.EventSource.prototype = ES.prototype;
     ['CONNECTING', 'OPEN', 'CLOSED'].forEach((k) => { window.EventSource[k] = ES[k] });
   }
+  // #919: every /call the page fetches, from its own Resource Timing entry
+  // (callOf); browser.js drains window.__benchCalls into browser_call_ms
+  const calls = window.__benchCalls = [];
+  const callOf = ${callOf.toString()};
+  if (window.PerformanceObserver) {
+    try {
+      new window.PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          const c = callOf(e.name, window.location.href, e.duration, e.responseStatus);
+          if (c) calls.push(c);
+        }
+      }).observe({ type: 'resource', buffered: true });
+    } catch (e) { /* no Resource Timing: no call recorded, the evaluator says none came */ }
+  }
 })()`
+
+// #919: one /call request as the page saw it — its Resource Timing entry
+// (`duration`: start to the response's last byte; `responseStatus`, 0 when
+// the browser does not expose it) — tagged with the /call's resource, name
+// and namespace: those query parameters ONLY, never the rest of the URL (the
+// SPA puts the signed-in user into /call's extras). Not a /call: null.
+// k6 browser's own per-request metric (browser_http_req_duration) cannot
+// carry them: its one per-request tag hook (page.on('metric') tag()) names
+// a URL pattern with a fixed string and needs the `url` system tag, which
+// would put the extras into every point. Self-contained, like settledNow
+// (shipped into the page as source text).
+function callOf (url, base, duration, status) {
+  let u
+  try { u = new URL(url, base) } catch (e) { return null }
+  if (!/\/call$/.test(u.pathname)) return null
+  const q = u.searchParams
+  return {
+    resource: q.get('resource') || '',
+    name: q.get('name') || '',
+    namespace: q.get('namespace') || '',
+    ms: duration,
+    status: status || 0,
+  }
+}
+
+// The metric points the calls drained from one page write: browser_call_ms,
+// tagged with the page's own tags (session, route, visit, during) and the
+// call's resource, name, namespace and status.
+export function callOps (calls, tags) {
+  return (calls || []).map((c) => ['browser_call_ms', c.ms, Object.assign({}, tags, {
+    call_resource: c.resource, call_name: c.name, call_namespace: c.namespace, call_status: String(c.status),
+  })])
+}
 
 // Is the page loaded at `now`? Self-contained: browser.js sends its source
 // into the page (declared WITHOUT `export`: k6's goja keeps the keyword in
@@ -127,4 +174,4 @@ export function recordOps (r, tags, timeoutMs) {
   return ops
 }
 
-export { loadOf, settledNow }
+export { callOf, loadOf, settledNow }

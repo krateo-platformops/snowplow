@@ -392,7 +392,7 @@ def test_freshness_probe_measures_from_mutation_return():
 
     def mutate(m):
         state["marker"], state["visible_at"] = m, clk.t + 0.35
-        return True
+        return load606.WriteResult(True)
 
     class C:
         def get(self, path, token):
@@ -412,7 +412,7 @@ def test_freshness_probe_records_never_converged_samples():
     class C:
         def get(self, path, token):
             return load606.Response(200, b"never", 1)
-    recs = load606.freshness_probe(C(), "t", "/p", lambda m: True, samples=2,
+    recs = load606.freshness_probe(C(), "t", "/p", lambda m: load606.WriteResult(True), samples=2,
                                    budget_s=1, gap_s=0, clock=clk.now,
                                    sleep=clk.sleep)
     assert [r["converged"] for r in recs] == [False, False]
@@ -421,7 +421,7 @@ def test_freshness_probe_records_never_converged_samples():
 
 def test_churn_driver_reaches_its_rate():
     seen = []
-    c = load606.ChurnDriver(list(range(5)), 50, lambda t, m: seen.append(t) or True)
+    c = load606.ChurnDriver(list(range(5)), 50, lambda t, m: seen.append(t) or load606.WriteResult(True))
     c.start()
     import time as _t
     _t.sleep(0.5)

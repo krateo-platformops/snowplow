@@ -61,7 +61,7 @@ class _Rec:
         self.calls.append(("probe", kw["label"], path, kw["samples"], kw["poll_ms"],
                            kw["gap_s"], kw["push_since"]))
 
-    def churn(self, targets, rate, mutate):
+    def churn(self, targets, rate, mutate, on_failure=None):
         rec = self
 
         class C:
@@ -194,7 +194,7 @@ def test_incluster_status_write_goes_to_the_status_subresource(tmp_path, monkeyp
         *GVR, "bench-ns-01", "bench-app-01-01", "fresh-x", sa_dir=str(tmp_path),
         api=f"http://127.0.0.1:{srv.server_address[1]}")
     srv.shutdown()
-    assert got is ok and len(_API.puts) == puts
+    assert got.ok is ok and len(_API.puts) == puts
     path, body = _API.puts[0]
     assert path.endswith("/namespaces/bench-ns-01/githubscaffoldingwithcompositionpages"
                          "/bench-app-01-01/status")

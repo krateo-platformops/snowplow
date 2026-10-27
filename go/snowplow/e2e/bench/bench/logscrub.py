@@ -10,13 +10,23 @@ reaches $OUT. A line keeps:
   - every number and boolean;
 and every other string (names, paths, namespaces, errors, causes, reasons,
 user fields) is replaced by `h:<12 hex>` of its sha256, so lines still
-correlate without their content. A nested value is hashed whole. A non-JSON
-line becomes {"unparsed": true, "len": n, "h": ...}. Free text is never
-trusted: `cause` / `reason` carry raw error text (snowplow
+correlate without their content. A nested value is hashed whole. Free text is
+never trusted: `cause` / `reason` carry raw error text (snowplow
 internal/handlers/list.go:97 `pd.Error()`), and a kept field such as `msg` is
 hashed as soon as it looks like it names a subject, a credential or a
 key=value pair (DENY), a `--deny` literal (the test password, the bench's
-user prefix) or a `--deny-pattern`.
+user prefix) or a `--deny-pattern`; a kept one also passes bench/identity.py,
+the bench's one identity redaction.
+
+A klog line (client-go's own log: `W1027 00:02:54.123456   1 request.go:697]
+msg`; #919, run 16's burst of 21 at 00:02:54Z was unreadable) keeps its
+severity, klog time, thread and file:line, and its message PART BY PART with
+the same redaction: bench/identity.py's rules first (a user, an
+"authenticated as", an e-mail, a Secret's name, a certificate's CN), then
+every part the JSON path would hash (DENY, `--deny`, `--deny-pattern`: a
+quoted string, a key=value, a scaleuser-N, ...) hashed alone, the rest kept:
+{"format": "klog", "severity", "klog_time", "thread", "source", "msg"}. Any
+other non-JSON line becomes {"unparsed": true, "len": n, "h": ...}.
 
     kubectl logs --timestamps ... | python3 -m bench.logscrub --kubelet-timestamps \
         [--state-file F] [--last-time-file F] [--deny S ...] [--deny-pattern RE ...]
@@ -36,6 +46,8 @@ import hashlib
 import json
 import re
 import sys
+
+from bench import identity
 
 KEEP = frozenset({
     "time", "level", "msg", "subsystem", "event", "kind", "class", "hint",
@@ -60,6 +72,12 @@ DENY = re.compile(
     r"secret|passw|authoriz|bearer|cookie|credential|eyJ[A-Za-z0-9_-]{10,}|@|=|\"",
     re.IGNORECASE)
 TS = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z (.*)$", re.DOTALL)
+# klog's header (k8s.io/klog/v2): Lmmdd hh:mm:ss.uuuuuu threadid file:line] msg
+KLOG = re.compile(r"^([IWEF])(\d{4} \d\d:\d\d:\d\d\.\d{6})\s+(\d+) ([^\s\]]+:\d+)\] ?(.*)$",
+                  re.DOTALL)
+# A part of free text, redacted on its own: a quoted string whole, else a run
+# without whitespace and without the separators of a path, a query or a list
+PART = re.compile(r'"[^"]*"|[^\s/?&,"]+')
 
 
 def _norm_ts(m: "re.Match") -> str:
@@ -86,6 +104,27 @@ class Scrubber:
     def denied(self, v: str) -> bool:
         return bool(DENY.search(v)) or self._given(v)
 
+    def kept(self, v: str) -> str:
+        """A string the JSON path keeps (a KEEP field, not denied): through
+        bench/identity.py all the same."""
+        return identity.redact_identity(v)
+
+    def text(self, v: str) -> str:
+        """Free text, part by part (#919): identity's rules over the whole
+        text, then each PART the JSON path would hash (denied) hashed alone,
+        the rest kept; identity's own marker stays as it is."""
+        def part(m):
+            x = m.group(0)
+            if x.strip('"') == identity.REDACTED or not self.denied(x):
+                return x
+            return _h(x)
+        return PART.sub(part, identity.redact_identity(v))
+
+    def klog(self, m: "re.Match") -> dict:
+        sev, ts, thread, src, msg = m.groups()
+        return {"format": "klog", "severity": sev, "klog_time": ts, "thread": int(thread),
+                "source": self.text(src), "msg": self.text(msg)}
+
     def key(self, k: str) -> str:
         # KEY_NAMES are code constants ("user" names a field, it is not one);
         # only the caller's own literals / patterns can veto one.
@@ -97,7 +136,7 @@ class Scrubber:
             if isinstance(v, bool) or isinstance(v, (int, float)) or v is None:
                 val = v
             elif isinstance(v, str) and k in KEEP and not self.denied(v):
-                val = v
+                val = self.kept(v)
             else:
                 val = _h(v)
             out[self.key(k)] = val
@@ -109,6 +148,9 @@ class Scrubber:
         except ValueError:
             rec = None
         if not isinstance(rec, dict):
+            m = KLOG.match(raw)
+            if m:
+                return json.dumps(self.klog(m))
             return json.dumps({"unparsed": True, "len": len(raw), "h": _h(raw)})
         return json.dumps(self.scrub(rec))
 

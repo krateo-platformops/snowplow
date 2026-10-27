@@ -405,21 +405,34 @@ def refresher_per_phase(mem: list[dict], wins, span) -> dict:
 
 def cpu_per_phase(tops: list[dict], wins, span) -> dict:
     """snowplow's CPU (kubectl top, millicores summed over its pods per
-    sample) per phase, while k6 ran and over the whole run."""
+    sample) per phase, while k6 ran and over the whole run. A sample run606's
+    sampler recorded as failed (#919: no answer within its bound, or an
+    error) is counted as failed, never as a missing reading."""
     acc: dict[str, dict[str, list[int]]] = {}
+    failed: dict[str, dict[str, int]] = {}
     for t in tops:
+        if t.get("t") is None:
+            continue
+        if t.get("failed"):
+            f = failed.setdefault(_phase(t["t"], wins), {"whole_run": 0, "with_customers": 0})
+            f["whole_run"] += 1
+            if span and span[0] <= t["t"] <= span[1]:
+                f["with_customers"] += 1
+            continue
         ms = [int(m.group(2)) for m in _TOP_CPU.finditer(t.get("raw") or "")]
-        if not ms or t.get("t") is None:
+        if not ms:
             continue
         p = acc.setdefault(_phase(t["t"], wins), {"whole_run": [], "with_customers": []})
         p["whole_run"].append(sum(ms))
         if span and span[0] <= t["t"] <= span[1]:
             p["with_customers"].append(sum(ms))
 
-    def st(v):
-        return ({"samples": len(v), "median_m": statistics.median(v), "p90_m": round(_pct(v, 90)),
-                 "max_m": max(v)} if v else {"samples": 0})
-    return {"by_phase": {p: {k: st(v) for k, v in x.items()} for p, x in acc.items()}}
+    def st(v, nf):
+        return dict({"samples": len(v), "median_m": statistics.median(v), "p90_m": round(_pct(v, 90)),
+                     "max_m": max(v)} if v else {"samples": 0}, failed_samples=nf)
+    phases = list(acc) + [p for p in failed if p not in acc]
+    return {"by_phase": {p: {k: st(acc.get(p, {}).get(k, []), failed.get(p, {}).get(k, 0))
+                             for k in ("whole_run", "with_customers")} for p in phases}}
 
 
 def clicks_vs_schedule(o: dict | None, wins) -> dict | None:

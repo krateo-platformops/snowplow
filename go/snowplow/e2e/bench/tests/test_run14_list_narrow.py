@@ -184,7 +184,7 @@ def test_run13_phases_come_from_the_churn_schedule_and_storm_wins():
 
 
 def test_churn_driver_records_its_schedule():
-    d = load606.ChurnDriver([("t", "x")], 50.0, lambda t, m: True).start()
+    d = load606.ChurnDriver([("t", "x")], 50.0, lambda t, m: load606.WriteResult(True)).start()
     import time
     time.sleep(0.1)
     rec = d.stop()

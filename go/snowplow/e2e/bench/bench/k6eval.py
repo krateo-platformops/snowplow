@@ -73,7 +73,8 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "browser_page_timeouts", "browser_logins", "browser_signin_ms", "browser_sse_opened",
          "dropped_iterations", "clicks", "arrivals",
          # the browser's completed requests: the pair's customer witness reads them
-         "browser_http_req_duration", "browser_http_req_failed")
+         "browser_http_req_duration", "browser_http_req_failed",
+         "browser_call_ms")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # the points whose time is kept too (out["times"], index-aligned with
 # out["points"]): run 12 compares latency inside / outside the CPU profiles;
@@ -81,7 +82,7 @@ _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # in its phase; the paired gate counts k6's errors (http_req_failed) only
 # inside the time both runs' snowplow was Ready
 _TIMED = ("page_load_ms", "browser_page_load_ms", "http_req_duration", "http_req_failed", "clicks",
-          "arrivals", "browser_http_req_duration", "browser_http_req_failed")
+          "arrivals", "browser_http_req_duration", "browser_http_req_failed", "browser_call_ms")
 _RFC3339 = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
 
 
@@ -549,7 +550,30 @@ def browser_report(o: dict | None) -> dict | None:
             "forward_wait": o.get("forward"),
             "timeouts": sum(v for v, _ in p.get("browser_page_timeouts", [])),
             "widget_states": dict(states),
+            "calls_report_only": calls_report(p.get("browser_call_ms", [])),
             "cpu": cpu_stats((o.get("cpu") or {}).get("browser"))}
+
+
+CALL_KEY = ("call_resource", "call_namespace", "call_name")
+
+
+def calls_report(points: list) -> dict:
+    """#919: the browsers' /call requests (browser.js browser_call_ms: each
+    one's Resource Timing duration), by the /call's resource / namespace /
+    name, by the page route whose load made them, and by HTTP status. A
+    browser stream without one browser_call_ms point says so: missing, not
+    zero (a browser.js before #919)."""
+    if not points:
+        return {"status": "absent", "note": "no browser_call_ms point: the per-/call times are missing "
+                                            "(browser.js before #919), not zero"}
+    status: dict[str, int] = defaultdict(int)
+    for _, t in points:
+        status["/".join(str(t.get(k)) for k in CALL_KEY) + f" {t.get('call_status')}"] += 1
+    return {"status": "present", "calls": len(points),
+            "by_call": _by(points, *CALL_KEY),
+            # a page load's own calls (during=load), by the route that loaded
+            "by_route_call": _by([pt for pt in points if pt[1].get("during") == "load"], "route", *CALL_KEY),
+            "by_call_status": dict(sorted(status.items()))}
 
 
 def widget_error_check(o: dict | None, th: dict | None = None) -> dict:

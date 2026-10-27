@@ -249,7 +249,7 @@ def test_fresh606_phases_are_bounded_and_truncation_is_recorded():
     def sleep(s):
         t[0] += s
 
-    out = load606.freshness_probe(C(), "t", "/p", lambda m: True, samples=60, poll_ms=100,
+    out = load606.freshness_probe(C(), "t", "/p", lambda m: load606.WriteResult(True), samples=60, poll_ms=100,
                                   gap_s=5, label="list_dep_status@10", sink=recs.append,
                                   clock=lambda: t[0], sleep=sleep, deadline=100.0)
     assert len(out) == 3                                   # 3 x 35 s > 100 s: stopped

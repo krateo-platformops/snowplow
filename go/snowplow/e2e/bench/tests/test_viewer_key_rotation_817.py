@@ -55,7 +55,7 @@ class _RotatingCell:
     def mutate(self, m):
         self.marker, self.since = m, self.n
         self.clock[0] += 0.01               # the write takes time: t0 is after the last frame
-        return True
+        return load606.WriteResult(True)
 
     def get(self, path, token):
         self.n += 1

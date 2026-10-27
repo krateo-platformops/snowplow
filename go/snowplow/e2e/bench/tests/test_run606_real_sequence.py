@@ -172,6 +172,24 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             os.remove(down_flag)
     collect_started = os.path.join(STATE, "collect_started")
     collect_down = (os.environ.get("FAKE_COLLECT_PODS_UNANSWERED") == "1" and os.path.exists(collect_started))
+    if a[:2] == ["get", "--raw=/metrics"]:                      # #919: the APF preflight + sampler
+        if os.environ.get("FAKE_METRICS_FORBIDDEN") == "1":
+            print('Error from server (Forbidden): User "someone@example.invalid" cannot get path "/metrics"',
+                  file=sys.stderr)
+            sys.exit(1)
+        p = os.path.join(STATE, "metrics_reads")
+        n = (int(open(p).read()) if os.path.exists(p) else 0) + 1
+        open(p, "w").write(str(n))
+        lb = 'flow_schema="global-default",priority_level="global-default"'
+        print("# TYPE process_start_time_seconds gauge\\nprocess_start_time_seconds 1.7929e+09")
+        print(f"apiserver_flowcontrol_dispatched_requests_total{{{lb}}} {10 * n}")
+        print(f"apiserver_flowcontrol_current_inqueue_requests{{{lb}}} {n % 3}")
+        for le, c in (("0.005", 9 * n), ("+Inf", 10 * n)):
+            print(f'apiserver_flowcontrol_request_wait_duration_seconds_bucket{{execute="true",{lb},le="{le}"}} {c}')
+        print(f'apiserver_flowcontrol_request_wait_duration_seconds_sum{{execute="true",{lb}}} {0.1 * n}')
+        print(f'apiserver_flowcontrol_request_wait_duration_seconds_count{{execute="true",{lb}}} {10 * n}')
+        print("apiserver_request_total{code=\\"200\\"} 5")
+        sys.exit(0)
     if a[:2] == ["get", "--raw=/readyz"]:                       # run606's api_answers probe
         if os.path.exists(down_flag) or collect_down:
             print("Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout", file=sys.stderr)
