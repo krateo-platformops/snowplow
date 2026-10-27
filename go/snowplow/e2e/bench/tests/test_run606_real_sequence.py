@@ -190,6 +190,18 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         print(f'apiserver_flowcontrol_request_wait_duration_seconds_count{{execute="true",{lb}}} {10 * n}')
         print("apiserver_request_total{code=\\"200\\"} 5")
         sys.exit(0)
+    if a[:2] == ["get", "flowschemas.flowcontrol.apiserver.k8s.io"]:   # #922 F3: the flow control config
+        rule = {"subjects": [{"kind": "Group", "group": {"name": "system:serviceaccounts"}}],
+                "resourceRules": [{"verbs": ["*"], "apiGroups": ["*"], "resources": ["*"],
+                                   "clusterScope": True, "namespaces": ["*"]}]}
+        print(json.dumps({"items": [{"metadata": {"name": "global-default"},
+                                     "spec": {"matchingPrecedence": 9900, "rules": [rule],
+                                              "priorityLevelConfiguration": {"name": "global-default"}}}]}))
+        sys.exit(0)
+    if a[:2] == ["get", "deploy/snowplow"]:
+        print(json.dumps({"metadata": {"name": "snowplow", "namespace": ns},
+                          "spec": {"template": {"spec": {"serviceAccountName": "snowplow"}}}}))
+        sys.exit(0)
     if a[:2] == ["get", "--raw=/readyz"]:                       # run606's api_answers probe
         if os.path.exists(down_flag) or collect_down:
             print("Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout", file=sys.stderr)
@@ -325,9 +337,14 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
               "lastState": ({"terminated": {"reason": "OOMKilled", "exitCode": 137,
                                             "finishedAt": "2026-10-14T15:04:53Z"}}
                             if restarted else {})}
+        # #922 F3: started a second ago, Ready now (the boot's end)
+        now = time.time()
+        cs["state"] = {"running": {"startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 1))}}
         pods = [{"metadata": {"name": "snowplow-abc"},
                  "spec": {"containers": [{"resources": {"limits": {"memory": "8Gi"}}}]},
-                 "status": {"containerStatuses": [cs]}}]
+                 "status": {"containerStatuses": [cs],
+                            "conditions": [{"type": "Ready", "status": "True", "lastTransitionTime":
+                                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}]}}]
         # FAKE_TERMINATING_READS=N: the first N reads also list the old
         # ReplicaSet's Terminating pod (old digest) FIRST; -1 = it never goes.
         tr = int(os.environ.get("FAKE_TERMINATING_READS", "0"))

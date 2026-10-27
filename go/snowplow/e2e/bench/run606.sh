@@ -338,6 +338,7 @@ teardown() {
   trap - EXIT
   declare -F stop_top_loop >/dev/null && stop_top_loop
   declare -F stop_apf_loop >/dev/null && stop_apf_loop
+  declare -F stop_sampler >/dev/null && stop_sampler top_boot
   declare -F stop_log_stream >/dev/null && stop_log_stream
   if [[ "$CLUSTER_CREATED" == "1" ]]; then
     # On ANY failure, snapshot the cluster BEFORE it is deleted (shakedown #2
@@ -508,6 +509,27 @@ s_env() {
   start_log_stream
   apf_preflight || return 1
   start_apf_loop
+  flowcontrol_config_record
+}
+# flowcontrol_config_record (#922 F3): which flow schema / priority level
+# serve snowplow's ServiceAccount, and a user it impersonates — from the
+# cluster's FlowSchemas and snowplow's Deployment (bench/apf.py config-record;
+# names only: no schema's subjects are kept). Best effort: without it the
+# figures say snowplow's flow schema is not known.
+flowcontrol_config_record() {
+  if [[ "$DRY" == "1" ]]; then log "DRY: flow schemas + deploy/snowplow -> $OUT/flowcontrol-config.jsonl"; return 0; fi
+  local fs="$OUT/.flowschemas.json" dep="$OUT/.snowplow-deploy.json"
+  if bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
+        get flowschemas.flowcontrol.apiserver.k8s.io -o json >"$fs" 2>"$KERR" \
+     && bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
+        -n krateo-system get deploy/snowplow -o json >"$dep" 2>"$KERR"; then
+    python3 -m bench.apf config-record --flowschemas "$fs" --deployment "$dep" > "$OUT/flowcontrol-config.jsonl" \
+      || log "could not tell snowplow's flow schema: $(cut -c1-300 "$OUT/flowcontrol-config.jsonl")"
+    log "flow control: $(cut -c1-300 "$OUT/flowcontrol-config.jsonl")"
+  else
+    log "could not read the flow schemas or deploy/snowplow ($(kerr_line)): the figures name no flow schema"
+  fi
+  rm -f "$fs" "$dep"
 }
 s_preflight() {
   # SECONDS-scale, right after env and BEFORE stamping or any login burst
@@ -570,6 +592,13 @@ s_data() {
 }
 s_reboot() {
   # Cold start at 50K: restart once the data exists, time Ready (#594/#637).
+  # #922 F3: boot is its own phase — its restart time here (boot.jsonl; the
+  # new pod's start and Ready times come from its before-record), and kubectl
+  # top through it (kind top_boot, apart from the measure's samples, stopped
+  # when the measure starts its own).
+  start_sampler top_boot "$OUT/top-boot.jsonl" -n krateo-system top pod -l "$SNOWPLOW_POD_SELECTOR" --no-headers
+  [[ "$DRY" == "1" ]] || python3 -c 'import json, time; print(json.dumps({"kind": "boot", "t_restart": time.time()}))' \
+      > "$OUT/boot.jsonl"
   run "${K[@]}" -n krateo-system rollout restart deploy/snowplow
   run "${K[@]}" -n krateo-system rollout status deploy/snowplow --timeout="${ROLLOUT_TIMEOUT_S}s"
 }
@@ -649,7 +678,8 @@ s_measure() {
   snowplow_pod_record before
   # Standard memory capture (#710): kubectl top every TOP_POLL_S from here
   # (each sample bounded by it, #919), plus the in-cluster mem606 Job
-  # (memstats + heap profiles, metadata only).
+  # (memstats + heap profiles, metadata only). The boot's own samples end here.
+  stop_sampler top_boot
   start_top_loop
   MEASURE_STARTED=1
   kapply "$OUT/loadgen-job.yaml"
@@ -1205,6 +1235,7 @@ s_evaluate() {
   shopt -s nullglob
   local files=("$OUT"/nav-*.jsonl "$OUT"/fresh-*.jsonl "$OUT"/preflight.jsonl
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
+               "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
                "$OUT"/api-outages*.jsonl)
   # #919: the API server's flow-control scrapes, read by evaluate as a stream

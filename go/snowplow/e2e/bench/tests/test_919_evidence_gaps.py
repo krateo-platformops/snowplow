@@ -733,6 +733,140 @@ def test_a_cut_last_gzip_member_keeps_the_samples_before_it(tmp_path):
     assert [r["t"] for r in recs if r.get("kind") == "apf"] == [1] and recs[-1].get("truncated")
 
 
+# ─── 5b (#922 F3). the acceptance figures, boot as its own phase, B/A ───────
+
+def _fs(name, prec, pl, subjects, all_resources=True):
+    rr = ([{"verbs": ["*"], "apiGroups": ["*"], "resources": ["*"], "clusterScope": True, "namespaces": ["*"]}]
+          if all_resources else [{"verbs": ["get"], "apiGroups": [""], "resources": ["nodes"], "clusterScope": True}])
+    return {"metadata": {"name": name}, "spec": {"matchingPrecedence": prec,
+                                                 "priorityLevelConfiguration": {"name": pl},
+                                                 "rules": [{"subjects": subjects, "resourceRules": rr}]}}
+
+
+def _grp(n):
+    return {"kind": "Group", "group": {"name": n}}
+
+
+FLOWSCHEMAS = {"items": [
+    _fs("global-default", 9900, "global-default", [_grp("system:serviceaccounts"), _grp("system:authenticated")]),
+    _fs("exempt", 1, "exempt", [_grp("system:masters")]),
+    _fs("service-accounts", 9000, "workload-low", [_grp("system:serviceaccounts")]),
+    _fs("kube-system-service-accounts", 8000, "workload-high", [_grp("system:serviceaccounts:kube-system")]),
+    _fs("node-reads", 700, "system", [{"kind": "ServiceAccount",
+                                       "serviceAccount": {"namespace": "krateo-system", "name": "*"}}],
+        all_resources=False)]}
+DEPLOY = {"metadata": {"name": "snowplow", "namespace": "krateo-system"},
+          "spec": {"template": {"spec": {"serviceAccountName": "snowplow-sa", "containers": [{"env": [
+              {"name": "SECRET_TOKEN", "value": "do-not-keep"}]}]}}}}
+
+
+def test_snowplows_flow_schema_is_the_first_matching_by_precedence(tmp_path):
+    (tmp_path / "fs.json").write_text(json.dumps(FLOWSCHEMAS))
+    (tmp_path / "dep.json").write_text(json.dumps(DEPLOY))
+    p = subprocess.run([sys.executable, "-m", "bench.apf", "config-record", "--flowschemas",
+                        str(tmp_path / "fs.json"), "--deployment", str(tmp_path / "dep.json")],
+                       cwd=BENCH_DIR, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stderr
+    r = json.loads(p.stdout)
+    assert (r["snowplow_sa"], r["flow_schema"], r["priority_level"]) == \
+        ("krateo-system/snowplow-sa", "service-accounts", "workload-low")
+    assert r["partial_rules"] == ["node-reads"]                   # takes some requests, said apart
+    assert r["impersonated_user"]["flow_schema"] == "global-default"
+    assert "do-not-keep" not in p.stdout and "subjects" not in p.stdout
+
+
+def _apf_text(sa_fs, imp, start=1.7929e9):
+    """sa_fs / imp: (dispatched, waited, slow, wait_sum, inqueue, executing, rejected) of the
+    service-accounts / global-default flow schemas."""
+    out = [f"process_start_time_seconds {start}",
+           'apiserver_flowcontrol_demand_seats_high_watermark{priority_level="workload-low"} ' + str(sa_fs[4] * 2)]
+    for (fs, pl), (disp, waited, slow, wsum, inq, exe, rej) in ((("service-accounts", "workload-low"), sa_fs),
+                                                                (("global-default", "global-default"), imp)):
+        lb = f'flow_schema="{fs}",priority_level="{pl}"'
+        out += [f"apiserver_flowcontrol_dispatched_requests_total{{{lb}}} {disp}",
+                f"apiserver_flowcontrol_current_inqueue_requests{{{lb}}} {inq}",
+                f"apiserver_flowcontrol_current_executing_requests{{{lb}}} {exe}",
+                f'apiserver_flowcontrol_request_wait_duration_seconds_bucket{{execute="true",{lb},le="0.005"}} '
+                f"{waited - slow}",
+                f'apiserver_flowcontrol_request_wait_duration_seconds_bucket{{execute="true",{lb},le="5"}} {waited}',
+                f'apiserver_flowcontrol_request_wait_duration_seconds_bucket{{execute="true",{lb},le="+Inf"}} {waited}',
+                f'apiserver_flowcontrol_request_wait_duration_seconds_sum{{execute="true",{lb}}} {wsum}',
+                f'apiserver_flowcontrol_request_wait_duration_seconds_count{{execute="true",{lb}}} {waited}']
+        if rej:
+            out.append(f'apiserver_flowcontrol_rejected_requests_total{{{lb},reason="time-out"}} {rej}')
+    return "\n".join(out) + "\n"
+
+
+def _run_files(boot_mem_mi: int, boot_rejected: int, ready_at: float = 1100.0) -> dict:
+    """One run's collected files: restart at 1000, the new pod started at
+    1010 and Ready at `ready_at`, the measure from 1200."""
+    from bench import apf
+    cfg = apf.config_record(FLOWSCHEMAS, DEPLOY)
+
+    def a(t, sa, imp):
+        return {"kind": "apf", "t": t, "t_start": t - 1, **_mod("sampler").parse_apf(_apf_text(sa, imp))}
+    return {
+        "boot.jsonl": [{"kind": "boot", "t_restart": 1000.0}],
+        "pod-before.jsonl": [{"kind": "snowplow_pod", "phase": "before", "pod": "snowplow-new", "restarts": 0,
+                              "started_at": 1010.0, "ready_at": ready_at, "t": 1200.0}],
+        "top-boot.jsonl": [
+            {"kind": "top_boot", "t": 1020.0, "raw": f"snowplow-old 900m 7000Mi snowplow-new 500m {boot_mem_mi // 2}Mi"},
+            {"kind": "top_boot", "t": 1060.0, "raw": f"snowplow-new 800m {boot_mem_mi}Mi"},
+            {"kind": "top_boot", "t": 1080.0, "t_start": 1065.0, "failed": True, "rc": None, "timed_out": True,
+             "bound_s": 15, "error": "no answer within the sample's bound (15 s): killed"},
+            {"kind": "top_boot", "t": 1150.0, "raw": "snowplow-new 100m 9999Mi"}],      # after Ready: not boot
+        "flowcontrol-config.jsonl": [cfg],
+        "apf.jsonl.gz": [a(990, (100, 100, 0, 0.0, 0, 1, 0), (10, 10, 0, 0.0, 0, 0, 0)),
+                         a(1050, (500, 400, 50, 120.0, 40, 60, 0), (20, 20, 0, 0.0, 0, 1, 0)),
+                         a(1095, (900, 700, 100, 300.0, 5, 20, boot_rejected), (30, 30, 0, 0.0, 0, 1, 0)),
+                         a(1250, (950, 750, 100, 301.0, 0, 2, boot_rejected), (40, 40, 0, 0.0, 0, 0, 0))]}
+
+
+def test_the_acceptance_figures_through_evaluate(tmp_path):
+    v = _evaluate(tmp_path, _run_files(boot_mem_mi=2600, boot_rejected=7))
+    f = v["report"]["acceptance_figures_report_only"]
+    b = f["boot"]
+    assert (b["restart_to_ready_s"], b["start_to_ready_s"]) == (100.0, 90.0)
+    assert b["peak_memory_bytes"] == 2600 * 1024 ** 2 and b["pod"] == "snowplow-new"   # the new pod, in the window
+    assert (b["memory_samples"], b["memory_failed_samples"]) == (2, 1)
+    assert f["flow"]["flow_schema"] == "service-accounts" and f["flow"]["priority_level"] == "workload-low"
+    boot = f["by_phase"]["boot"]["snowplow_sa"]
+    # boot = the two scrapes inside [1000, 1100): 990 -> 1050 -> 1095
+    assert boot["rejected"] == 7 and boot["wait_requests"] == 300 + 300
+    assert boot["peak_inflight_requests"] == 100 and boot["level_demand_seats_high_watermark"] == 80
+    assert boot["wait_p99_s"] > 0.005                          # 100 of 600 waited up to 5 s
+    assert f["by_phase"]["boot"]["impersonated_user"]["wait_requests"] == 20
+    assert f["by_phase"]["before_measure"]["snowplow_sa"]["wait_requests"] == 0     # 1250: no pair before it
+    assert f["steady_refreshes_per_core"]["value"] is None and "no steady phase" in \
+        f["steady_refreshes_per_core"]["note"]                 # no k6 in this run
+
+
+def test_steady_refreshes_per_core():
+    from bench import figures
+    cl = {"refresher_completions": {"by_phase": {"steady": {"with_customers": {"per_s": 30.0}}}},
+          "snowplow_cpu": {"by_phase": {"steady": {"with_customers": {"median_m": 1500}}}}}
+    assert figures.steady_refreshes_per_core(cl) == {"value": 20.0, "refreshes_per_s": 30.0, "cpu_median_m": 1500}
+
+
+def test_the_pair_reports_each_figure_as_b_over_a_through_the_cli(tmp_path):
+    for x, mem, rej in (("a", 2000, 4), ("b", 3000, 10)):
+        d = tmp_path / x
+        d.mkdir()
+        v = _evaluate(d, _run_files(boot_mem_mi=mem, boot_rejected=rej))
+        v.pop("_stderr")
+        (d / "verdict.json").write_text(json.dumps(v))
+    p = subprocess.run([sys.executable, "-m", "bench.custlat", "pair", "--a", str(tmp_path / "a" / "verdict.json"),
+                        "--b", str(tmp_path / "b" / "verdict.json")], cwd=BENCH_DIR, capture_output=True,
+                       text=True, timeout=300)
+    out = json.loads(p.stdout)
+    r = out["acceptance_ratios_report_only"]
+    assert r["ratios"]["boot/peak_memory_bytes"]["b_over_a"] == 1.5
+    assert r["ratios"]["by_phase/boot/snowplow_sa/rejected"] == {"a": 4, "b": 10, "b_over_a": 2.5}
+    assert r["ratios"]["boot/restart_to_ready_s"]["b_over_a"] == 1.0
+    assert not any(k.endswith(("t_restart", "ready_at", "started_at")) for k in r["ratios"])
+    assert r["notes"] == []
+
+
 # ─── run606: the samplers in the dry run and in the real sequence ───────────
 
 
@@ -741,10 +875,12 @@ def test_dry_run_shows_both_bounded_samplers(tmp_path):
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", TOP_POLL_S="15")
     assert p.returncode == 0, p.stderr[-2000:]
     sam = [ln for ln in p.stderr.splitlines() if "DRY: python3 -m bench.sampler" in ln]
-    assert len(sam) == 2, sam
+    assert len(sam) == 3, sam
     assert all("--every-s 15" in ln and "--request-timeout=15s" in ln for ln in sam)
     assert "--kind apf" in sam[0] and "get --raw=/metrics" in sam[0]          # from env: the whole run
-    assert "--kind top" in sam[1] and "top pod -l app.kubernetes.io/name=snowplow" in sam[1]
+    assert "--kind top_boot" in sam[1] and "top-boot.jsonl" in sam[1]         # #922 F3: from the restart
+    assert "--kind top " in sam[2] and "top pod -l app.kubernetes.io/name=snowplow" in sam[2]
+    assert "DRY: flow schemas + deploy/snowplow" in p.stderr
     assert "get --raw=/metrics (APF preflight)" in p.stderr
     ev = next(ln for ln in p.stderr.splitlines() if "DRY: python3 -m bench.load606 evaluate" in ln)
     assert ev.endswith(f"--apf {tmp_path / 'out' / 'apf.jsonl.gz'}")
@@ -766,6 +902,12 @@ def test_the_real_sequence_samples_top_and_apf_into_the_verdict(harness):  # noq
     r = v["report"]["apiserver_flowcontrol_report_only"]
     assert r["status"] == "present" and r["samples"]["answered"] == len(apfs)
     assert v["report"]["top_samples_report_only"]["answered"] == len(tops)
+    # #922 F3: the boot's facts, its own top samples, snowplow's flow schema
+    f = v["report"]["acceptance_figures_report_only"]
+    assert f["boot"]["t_restart"] and f["boot"]["pod"] == "snowplow-abc" and f["boot"]["ready_at"]
+    assert (out / "top-boot.jsonl").exists() and not (out / ".sampler-top_boot.pid").exists()
+    assert f["flow"]["snowplow_sa"] == "krateo-system/snowplow" and f["flow"]["flow_schema"] == "global-default"
+    assert f["by_phase"] is not None
     # every scrape went to the bench cluster, bounded by kubectl's own timeout too
     scrapes = [c for c in _calls(state) if c["tool"] == "kubectl" and "--raw=/metrics" in c["argv"]]
     # + the preflight; + at most the one in flight when collect stopped the sampler (not recorded)

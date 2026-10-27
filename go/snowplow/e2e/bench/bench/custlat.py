@@ -1597,6 +1597,12 @@ def main(argv: list[str] | None = None) -> int:
                                     f"{cand['count']}x during measure"] if cand["restarted"] else []) + (
                 [f"customer_latency.pair.candidate_not_ready: B (the candidate) was not Ready for "
                  f"{cand['not_ready_s']} s without restarting"] if cand["not_ready"] else [])
+    # #922 F3: the acceptance figures as B/A ratios, report only
+    try:
+        from bench import figures
+        out["acceptance_ratios_report_only"] = figures.ratios(va, vb)
+    except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
+        out["acceptance_ratios_report_only"] = {"error": f"{type(e).__name__}: {e}"}
     try:
         text = json.dumps(out, indent=1, default=str)
     except Exception as e:  # noqa: BLE001 — the paired verdict file is never left empty

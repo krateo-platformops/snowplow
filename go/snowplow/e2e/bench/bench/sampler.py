@@ -124,7 +124,9 @@ def parse_apf(text: str) -> dict:
     return {"replica": replica, "series": series}
 
 
-PARSERS: dict[str, Callable[[str], dict]] = {"top": parse_top, "apf": parse_apf}
+# top_boot: kubectl top through snowplow's restart (#922 F3: boot is its own
+# phase), apart from the measure's `top` so no boot sample reads as storm
+PARSERS: dict[str, Callable[[str], dict]] = {"top": parse_top, "top_boot": parse_top, "apf": parse_apf}
 
 
 def _first_line(b: bytes) -> str | None:

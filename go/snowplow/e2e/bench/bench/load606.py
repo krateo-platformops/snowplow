@@ -1509,6 +1509,11 @@ def pod_record(pod_list: dict, phase: str) -> dict:
                        .get("resources") or {}).get("limits"),
             "image_id": cs.get("imageID"),
             "digest": image_digest_of(cs.get("imageID")),
+            # #922 F3: the pod's boot — created, its container started, Ready
+            "created_at": _ts((p.get("metadata") or {}).get("creationTimestamp")),
+            "started_at": _ts(((cs.get("state") or {}).get("running") or {}).get("startedAt")),
+            "ready_at": _ts(next((c.get("lastTransitionTime") for c in (p.get("status") or {}).get("conditions") or []
+                                  if c.get("type") == "Ready" and c.get("status") == "True"), None)),
             "t": time.time()}
 
 
@@ -5092,9 +5097,11 @@ def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None
     """#919's report-only sections of verdict.json: run606's kubectl top
     samples (answered / failed), the API server's flow control per phase
     (bench/apf.py, streamed from `apf_path`: run606's apf.jsonl.gz) and
-    fresh606's failed churn writes."""
-    from bench import apf, sampler
+    fresh606's failed churn writes; and the figures #922's acceptance is
+    read from (bench/figures.py: boot as its own phase)."""
+    from bench import apf, figures, sampler
     report["top_samples_report_only"] = sampler.summary(recs, "top")
+    window, boot_facts = figures.boot_window(recs)
     churns = [r for r in recs if r.get("kind") == "churn"]
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     mem = [r for r in recs if r.get("kind") in ("mem_start", "mem", "heap_profile", "cpu_profile", "mem_end")]
@@ -5102,7 +5109,7 @@ def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None
               and r.get("t") is not None]
     have = apf_path is not None and os.path.exists(apf_path)
     rep = apf.report(iter_jsonl(apf_path) if have else [], run_phases(mem, fresh + churns), _phase_of,
-                     min(before) if before else None)
+                     min(before) if before else None, boot=window)
     if apf_path is not None and not have:
         rep["note"] += f"; {apf_path} does not exist"
     report["apiserver_flowcontrol_report_only"] = rep
@@ -5117,6 +5124,7 @@ def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None
         warnings.append(f"kubectl top: {t['failed']} of {t['failed'] + t['answered']} samples failed "
                         f"(longest unanswered stretch {t['longest_unanswered_s']} s)")
     report["churn_write_failures_report_only"] = churn_write_failures_report(recs)
+    report["acceptance_figures_report_only"] = figures.run_figures(report, recs, window, boot_facts)
 
 
 def _cmd_evaluate(a) -> int:
