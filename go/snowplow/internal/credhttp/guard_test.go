@@ -159,6 +159,17 @@ type ref struct {
 	pos            token.Position
 }
 
+// explain is the failure text for r: a failure must say why it is one.
+func explain(r ref) string {
+	switch r.what {
+	case "import of unsafe":
+		return "imports unsafe outside internal/credhttp: unsafe can bypass the client-side-limiter and config rules (#920)"
+	case "//go:linkname":
+		return "uses //go:linkname outside internal/credhttp: a linkname can bypass the client-side-limiter and config rules (#920)"
+	}
+	return r.what + " (in " + r.fn + ") builds a client/transport/rest.Config outside internal/credhttp"
+}
+
 func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 	imports := map[string]string{} // local name → path
 	var out []ref
@@ -332,7 +343,7 @@ func TestIssue723_724_NoCredentialedClientBypassesCredhttp(t *testing.T) {
 				used[k] = true
 				continue
 			}
-			bad = append(bad, r.pos.String()+": "+r.what+" (in "+r.fn+") builds a client/transport/rest.Config outside internal/credhttp")
+			bad = append(bad, r.pos.String()+": "+explain(r))
 		}
 		return nil
 	})
