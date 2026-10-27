@@ -1438,10 +1438,11 @@ def test_in_chrome_a_refused_call_and_the_open_streams_are_points(tmp_path):
 def test_in_chrome_each_session_switches_to_its_fresh_identity_classes(tmp_path):
     """#935: a session signs in as its initial user, visits every route twice
     (first, then warm), then signs in as its next fresh class in a new browser
-    context and visits every route for the first time again. The fixture has
-    no /debug/vars (it answers HTML), so no class is proven cold here: the
-    browser_fresh_class points carry empty counters, and evaluate leaves them
-    out (tests/test_935_fresh_first_visits.py proves the counting)."""
+    context and visits every route for the first time again. The real read
+    path end to end (#939 review LOW): the previous class's K_user token,
+    the Bearer header, the two expvar names — the fixture's /debug/vars
+    (401 without a token) learns a class the first time its token reads,
+    so every fresh class is proven cold."""
     o = _run_browser_fixture(tmp_path, signin_ms=300, fresh=["fixture-fresh-1", "fixture-fresh-2"],
                              duration_s=40)
     loads = [(t["class"], t["identity"], t["route"], t["visit"]) for _, t in o["points"]["browser_page_load_ms"]]
@@ -1455,7 +1456,11 @@ def test_in_chrome_each_session_switches_to_its_fresh_identity_classes(tmp_path)
     assert {i for k, i, *_ in loads if k == "1"} == {"fresh"} and {i for k, i, *_ in loads if k == "0"} == {"initial"}
     fc = [t for _, t in o["points"]["browser_fresh_class"]]
     assert sorted(t["class"] for t in fc) == [c for c in classes if c != "0"]
-    assert all(t["registered_before"] == "" == t["registered_after"] and t["t_before"] for t in fc)
+    assert all(t["registered_before"] and int(t["registered_after"]) == int(t["registered_before"]) + 1
+               and t["t_before"] for t in fc), fc
+    from bench import figures
+    r = figures.fresh_first_visits(o, [], load606._phase_of)
+    assert r["cold_proven"] == r["classes"] == len(fc) and r["by_route"]["/dashboard"]["all"]["n"] >= 1, r
     with gzip.open(tmp_path / "out" / "browser.json.gz", "rt") as fh:
         assert "fixture-fresh" not in fh.read()            # a class's user name is never a tag
 

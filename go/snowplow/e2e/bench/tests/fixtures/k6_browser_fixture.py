@@ -11,10 +11,16 @@ in real Chrome under test (tests/test_k6_830.py, #831 gate):
   sidebar      `li.ant-menu-item` with `data-menu-id="rc-menu-<path>"`
   live updates POST /refreshes (fetch) and EventSource /notifications
   /call        one GET /call that answers, one to a refused port (#919)
+  sign-in      stores K_user {accessToken} in localStorage, as the SPA's Login
+               does (utils/getAccessToken.ts reads it back)
+  /debug/vars  (#935) Bearer-only (401 without): snowplow's two learned-class
+               counters; a class is "learned" the first time its token reads
 
 Usage: k6_browser_fixture.py PORT SIGNIN_MS SKELETON_DELAY_MS PAGE_MS"""
 import http.server
+import json
 import sys
+import threading
 import time
 
 PORT, SIGNIN_MS, SKEL_MS, PAGE_MS = (int(x) for x in sys.argv[1:5])
@@ -45,7 +51,11 @@ function render (path) {
     document.getElementById('basic_password').addEventListener('keydown', (e) => {
       if (e.key !== 'Enter') return;
       e.preventDefault();
-      setTimeout(() => { history.pushState({}, '', '/dashboard'); menu(); render('/dashboard'); live(); }, SIGNIN);
+      const who = document.getElementById('basic_username').value;
+      setTimeout(() => {
+        localStorage.setItem('K_user', JSON.stringify({ accessToken: 'fixture-token-' + who }));
+        history.pushState({}, '', '/dashboard'); menu(); render('/dashboard'); live();
+      }, SIGNIN);
     });
     return;
   }
@@ -76,6 +86,10 @@ render(location.pathname);
     "@SKEL@", str(SKEL_MS)).replace("@PAGE@", str(PAGE_MS))
 
 
+LEARNED: set = set()
+LEARNED_LOCK = threading.Lock()
+
+
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -99,7 +113,22 @@ class H(http.server.BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _vars(self):
+        auth = self.headers.get("Authorization") or ""
+        if not auth.startswith("Bearer ") or len(auth) <= len("Bearer "):
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        with LEARNED_LOCK:
+            LEARNED.add(auth)
+            n = len(LEARNED)
+        body = json.dumps({"snowplow_learned_classes_registered": n, "snowplow_learned_classes_seeded": n}).encode()
+        self._send(body, "application/json")
+
     def do_GET(self):
+        if self.path.startswith("/debug/vars"):
+            return self._vars()
         if self.path.startswith("/notifications"):
             return self._stream()
         return self._send(PAGE.encode(), "text/html")

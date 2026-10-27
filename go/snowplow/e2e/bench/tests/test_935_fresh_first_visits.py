@@ -199,12 +199,51 @@ def test_fresh_first_visits_per_route_proven_cold_through_evaluate(tmp_path):
     assert r["status"] == "present" and (r["classes"], r["cold_proven"]) == (5, 3)
     assert sorted((x["session"], x["class"]) for x in r["not_proven"]) == [("s2", "2"), ("s3", "1")]
     assert r["seed_ran_during_first_visit"] == 1
+    assert (r["registered_between_windows"], r["between_windows_read"]) == (0, 2) and "warning" not in r
     d = r["by_route"]["/dashboard"]["all"]
     # three proven first visits of /dashboard: 2000, 3000, 4000 (never the initial user's, the warm one,
     # or an unproven class's)
     assert d == {"n": 3, "p50_ms": 3000.0, "p95_ms": 3900.0, "max_ms": 4000.0}
     assert r["by_route"]["/compositions"]["all"]["n"] == 1
     assert set(r["by_route"]["/dashboard"]) == {"steady", "all"}    # no phase plan in this run: steady
+
+
+def _cls(session, t0, t1, rb, ra):
+    return {"session": session, "class": "1", "t0": t0, "t1": t1, "registered_before": rb, "registered_after": ra,
+            "seeded_before": 0, "seeded_after": 0}
+
+
+def test_two_overlapping_sign_ins_with_one_registration_prove_neither():
+    """#939 review R2: the overlap rule pinned — one registration cannot
+    prove two overlapping sign-ins (the reviewer's Q1: any movement)."""
+    from bench import figures
+    cs = [_cls("s1", 100, 120, 40, 41), _cls("s2", 110, 130, 40, 41)]
+    figures.prove_cold(cs)
+    assert [c["cold_proven"] for c in cs] == [False, False]
+    assert all("1 class(es) registered for 2 sign-in(s)" in c["why"] for c in cs)
+    cs = [_cls("s1", 100, 120, 40, 41), _cls("s2", 110, 130, 40, 42)]       # two registrations: both
+    figures.prove_cold(cs)
+    assert [c["cold_proven"] for c in cs] == [True, True]
+
+
+def test_a_neighbour_whose_read_failed_still_counts_in_the_window():
+    """#939 review R1: class A reads fine but is NOT fresh (registers
+    nothing); class C overlaps it, is fresh (registers 1) and its read
+    failed. C's registration must not prove A: C stays in the group, which
+    needs two registrations; both are unproven."""
+    from bench import figures
+    a, c = _cls("s1", 100, 120, 40, 41), _cls("s2", 105, 125, None, None)
+    figures.prove_cold([a, c])
+    assert (a["cold_proven"], c["cold_proven"]) == (False, False)
+    assert "1 class(es) registered for 2 sign-in(s)" in a["why"] and "read failed" in c["why"]
+
+
+def test_registrations_between_the_windows_falsify_nothing_else_registers():
+    from bench import figures
+    quiet = [_cls("s1", 100, 120, 40, 41), _cls("s2", 200, 220, 41, 42)]
+    assert figures.prove_cold(quiet) == {"registered_between_windows": 0, "gaps_read": 1}
+    noisy = [_cls("s1", 100, 120, 40, 41), _cls("s2", 200, 220, 44, 45)]  # 3 registered by something else
+    assert figures.prove_cold(noisy) == {"registered_between_windows": 3, "gaps_read": 1}
 
 
 def test_the_pair_gives_each_fresh_first_visit_figure_as_b_over_a(tmp_path):
@@ -250,3 +289,11 @@ def test_run606_creates_hands_on_and_cleans_up_the_fresh_classes(harness):  # no
     assert "fresh classes cleaned up" in log
     # no fresh user's name in what run606 prints
     assert not any(u in log for u in users)
+    # #939 review: no manifest run606 applied keeps the password on disk
+    from bench.load606 import SCALEUSER_PASSWORD
+    for name in ("fresh-classes.yaml", "loadgen-job.yaml", "preflight-job.yaml"):
+        text = (out / name).read_text()
+        assert SCALEUSER_PASSWORD not in text and "<redacted>" in text, name
+    leaks = [str(p.relative_to(out)) for p in out.rglob("*") if p.is_file()
+             and SCALEUSER_PASSWORD in p.read_text(errors="replace")]
+    assert leaks == [], leaks

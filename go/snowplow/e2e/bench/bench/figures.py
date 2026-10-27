@@ -252,31 +252,51 @@ def fresh_classes(o: dict | None) -> list[dict]:
     return sorted(out, key=lambda c: (c["t0"] is None, c["t0"] or 0))
 
 
-def prove_cold(classes: list[dict]) -> None:
+def prove_cold(classes: list[dict]) -> dict:
     """Mark each class `cold_proven`: snowplow's learned-class registrations
-    across its window cover it. Windows of different sessions that overlap
-    are judged together (the counter is process-wide): the registrations from
-    the first window's start to the last's end must be at least the classes
-    in them. Registrations by anything else in the window would count too:
-    after the k6 users' own first calls, nothing else registers a class."""
-    groups: list[list[dict]] = []
+    across its window cover it. Windows that overlap (any session; the
+    counter is process-wide) form ONE group, every class in it — a class
+    whose own counter read failed included: it may have registered, so it
+    counts toward what the group must cover, and is itself unproven (#939
+    review R1). A group's classes are proven when the registrations from
+    its first read to its last (`max(after) - min(before)`, over the reads
+    that came back) are at least the classes in the group; one registration
+    for two sign-ins proves neither.
+
+    The assumption that nothing else registers a class meanwhile is
+    falsified, not trusted: the registrations seen BETWEEN groups (from one
+    group's last read to the next group's first) are returned; non-zero
+    means something else registers classes, and a group's proof may have
+    counted one of them."""
+    known = [c for c in classes if c["t1"] is not None]
     for c in classes:
-        if c["t0"] is None or c["t1"] is None or c["registered_before"] is None or c["registered_after"] is None:
-            c["cold_proven"], c["why"] = False, "a learned-class read failed"
-            continue
-        if groups and c["t0"] <= max(x["t1"] for x in groups[-1]):
+        if c["t1"] is None:
+            c["cold_proven"], c["why"] = False, "no time for its window"
+    groups: list[list[dict]] = []
+    for c in sorted(known, key=lambda c: c["t0"] if c["t0"] is not None else c["t1"]):
+        start = c["t0"] if c["t0"] is not None else c["t1"]
+        if groups and start <= max(x["t1"] for x in groups[-1]):
             groups[-1].append(c)
         else:
             groups.append([c])
+    edges = []                                    # per group: (first read, last read), None when none came back
     for g in groups:
-        moved = max(x["registered_after"] for x in g) - min(x["registered_before"] for x in g)
-        ok = moved >= len(g)
+        before = [x["registered_before"] for x in g if x["registered_before"] is not None]
+        after = [x["registered_after"] for x in g if x["registered_after"] is not None]
+        moved = max(after) - min(before) if before and after else None
+        ok = moved is not None and moved >= len(g)
         for x in g:
-            x["cold_proven"] = ok
-            if not ok:
+            read_ok = x["t0"] is not None and x["registered_before"] is not None and x["registered_after"] is not None
+            x["cold_proven"] = ok and read_ok
+            if not read_ok:
+                x["why"] = "its learned-class read failed (it still counts toward its window's registrations)"
+            elif not ok:
                 x["why"] = f"{moved} class(es) registered for {len(g)} sign-in(s) in the window"
             x["seed_ran_during_first_visit"] = (x["seeded_before"] is not None and x["seeded_after"] is not None
                                                 and x["seeded_after"] > x["seeded_before"])
+        edges.append((min(before) if before else None, max(after) if after else None))
+    between = [nb - pa for (_, pa), (nb, _) in zip(edges, edges[1:]) if pa is not None and nb is not None]
+    return {"registered_between_windows": sum(between), "gaps_read": len(between)}
 
 
 def _stats(v: list[float]) -> dict:
@@ -291,7 +311,7 @@ def fresh_first_visits(o: dict | None, phases, phase_of) -> dict:
     if not classes:
         return {"status": "absent", "note": "no browser_fresh_class point: no fresh identity class ran "
                                             "(browser.js or run606 before #935, or no session switched)"}
-    prove_cold(classes)
+    between = prove_cold(classes)
     ok = {(c["session"], c["class"]) for c in classes if c["cold_proven"]}
     by_route: dict[str, dict[str, list[float]]] = {}
     for (v, t), at in zip(o["points"].get("browser_page_load_ms", []),
@@ -309,6 +329,14 @@ def fresh_first_visits(o: dict | None, phases, phase_of) -> dict:
             "cold_proven": sum(1 for c in classes if c["cold_proven"]),
             "not_proven": [{k: c.get(k) for k in ("session", "class", "why")} for c in classes if not c["cold_proven"]],
             "seed_ran_during_first_visit": sum(1 for c in classes if c.get("seed_ran_during_first_visit")),
+            # the falsifier of "nothing else registers a class": registrations
+            # between the fresh windows; non-zero means a proof may have
+            # counted one of them
+            "registered_between_windows": between["registered_between_windows"],
+            "between_windows_read": between["gaps_read"],
+            **({"warning": f"{between['registered_between_windows']} class(es) registered between the fresh "
+                           f"windows: something else registers classes, so a window's proof may have counted "
+                           f"one of them"} if between["registered_between_windows"] > 0 else {}),
             "by_route": {r: {p: _stats(v) for p, v in ps.items()} for r, ps in sorted(by_route.items())},
             "how": "first visits (visit=first) of fresh identity classes (identity=fresh) whose cold start "
                    "snowplow's learned-class counter proves; a page that timed out counts at its timeout"}

@@ -272,7 +272,15 @@ run() {
 # ConfigMap \"load606\" is invalid: metadata.annotations: Too long"). Server-
 # side apply records field ownership in managedFields instead, no copy.
 # (tests/test_apply_size.py: every object this script applies fits the API.)
-kapply() { run "${K[@]}" apply --server-side --force-conflicts --field-manager=bench606 -f "$1"; }
+# Once applied (or refused), the manifest keeps no password on disk: the
+# Jobs' command lines, the browser config and #935's user Secrets carry the
+# bench users' password, and the run directory outlives the cluster (#939
+# review); redact_pw replaces it in place, success or not.
+kapply() { local rc=0; run "${K[@]}" apply --server-side --force-conflicts --field-manager=bench606 -f "$1" || rc=$?; redact_pw "$1"; return "$rc"; }
+redact_pw() {
+  python3 -c 'import sys; p, s = sys.argv[1], sys.argv[2]; t = open(p).read(); open(p, "w").write(t.replace(s, "<redacted>"))' \
+      "$1" "$PW"
+}
 step() {
   local name="$1"; shift
   log "=== step ${name} ==="
