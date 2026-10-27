@@ -485,9 +485,32 @@ func NoteRefreshWrite(ctx context.Context, key string, stored bool) {
 	}
 	if stored {
 		o.accepted.Store(true)
+		// #870 — the store-swap push ledger's "refreshed" is the accepted,
+		// un-remarked re-Put: the same event windowFresh records, taken HERE,
+		// at the write, because the publish that follows (PublishRefresh, after
+		// this call) can reach a subscriber and be WRITTEN before this dequeue
+		// returns to settle its window — and a frame written for an entry still
+		// marked stale would close nothing, leaving it open forever.
+		if !o.remarked.Load() {
+			ledgerRefreshed(key, refreshDequeueBegan(key))
+		}
 	} else {
 		o.refused.Store(true)
 	}
+}
+
+// refreshDequeueBegan is when key's in-flight dequeue began (zero when none).
+func refreshDequeueBegan(key string) time.Time {
+	r := refresherPeek()
+	if r == nil {
+		return time.Time{}
+	}
+	if cur, ok := r.dirty.Load(key); ok {
+		if s := cur.(*dirtyStamp); s.inflight {
+			return s.began
+		}
+	}
+	return time.Time{}
 }
 
 // noteRefreshRemark reports a #375 remark of key on the dequeue's ctx.
