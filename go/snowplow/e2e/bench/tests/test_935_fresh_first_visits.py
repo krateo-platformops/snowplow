@@ -246,6 +246,37 @@ def test_registrations_between_the_windows_falsify_nothing_else_registers():
     assert figures.prove_cold(noisy) == {"registered_between_windows": 3, "gaps_read": 1}
 
 
+def test_an_eviction_between_windows_does_not_hide_a_foreign_registration():
+    """#939 delta L7: the learned-class counter is a gauge. Gap 1 FALLS by
+    2 (an eviction), gap 2 RISES by 2 (something else registered). A signed
+    sum reads 0 and the falsifier goes quiet; only the rises count, and the
+    report still warns."""
+    from bench import figures
+    cs = [_cls("s1", 100, 120, 40, 41), _cls("s2", 200, 220, 39, 40), _cls("s3", 300, 320, 42, 43)]
+    assert figures.prove_cold(cs) == {"registered_between_windows": 2, "gaps_read": 2}
+    o = {"points": {"browser_fresh_class": [(1, {"session": c["session"], "class": c["class"], "t_before": c["t0"],
+                                                 "registered_before": c["registered_before"],
+                                                 "registered_after": c["registered_after"],
+                                                 "seeded_before": 0, "seeded_after": 0}) for c in cs],
+                    "browser_page_load_ms": []},
+         "times": {"browser_fresh_class": [c["t1"] for c in cs], "browser_page_load_ms": []}}
+    r = figures.fresh_first_visits(o, [], lambda at, phases: "steady")
+    assert r["registered_between_windows"] == 2 and r["between_windows_read"] == 2
+    assert "2 class(es) registered between the fresh windows" in r["warning"]
+
+
+def test_a_covered_group_does_not_prove_its_failed_read_class():
+    """#939 delta L8 (the reviewer's Q7): three overlapping sign-ins and
+    three registrations cover the group, so the two whose reads came back
+    are proven; the one whose read failed counted toward the three, but
+    nothing shows IT registered, so it stays unproven."""
+    from bench import figures
+    a, c, b = _cls("s1", 100, 120, 40, 41), _cls("s2", 105, 125, None, None), _cls("s3", 110, 130, 41, 43)
+    figures.prove_cold([a, c, b])
+    assert (a["cold_proven"], c["cold_proven"], b["cold_proven"]) == (True, False, True)
+    assert "read failed" in c["why"] and "why" not in a and "why" not in b
+
+
 def test_the_pair_gives_each_fresh_first_visit_figure_as_b_over_a(tmp_path):
     for x, scale in (("a", 1.0), ("b", 1.5)):
         d = tmp_path / x

@@ -267,7 +267,10 @@ def prove_cold(classes: list[dict]) -> dict:
     falsified, not trusted: the registrations seen BETWEEN groups (from one
     group's last read to the next group's first) are returned; non-zero
     means something else registers classes, and a group's proof may have
-    counted one of them."""
+    counted one of them. The counter is a gauge (an eviction lowers it), so
+    only the gaps that ROSE are summed: a gap that fell says nothing about
+    registrations, and summing it signed would let an eviction in one gap
+    cancel a foreign registration in another (#939 delta L7)."""
     known = [c for c in classes if c["t1"] is not None]
     for c in classes:
         if c["t1"] is None:
@@ -296,7 +299,7 @@ def prove_cold(classes: list[dict]) -> dict:
                                                 and x["seeded_after"] > x["seeded_before"])
         edges.append((min(before) if before else None, max(after) if after else None))
     between = [nb - pa for (_, pa), (nb, _) in zip(edges, edges[1:]) if pa is not None and nb is not None]
-    return {"registered_between_windows": sum(between), "gaps_read": len(between)}
+    return {"registered_between_windows": sum(d for d in between if d > 0), "gaps_read": len(between)}
 
 
 def _stats(v: list[float]) -> dict:
@@ -329,9 +332,9 @@ def fresh_first_visits(o: dict | None, phases, phase_of) -> dict:
             "cold_proven": sum(1 for c in classes if c["cold_proven"]),
             "not_proven": [{k: c.get(k) for k in ("session", "class", "why")} for c in classes if not c["cold_proven"]],
             "seed_ran_during_first_visit": sum(1 for c in classes if c.get("seed_ran_during_first_visit")),
-            # the falsifier of "nothing else registers a class": registrations
-            # between the fresh windows; non-zero means a proof may have
-            # counted one of them
+            # the falsifier of "nothing else registers a class": the rises of
+            # the learned-class gauge between the fresh windows; non-zero
+            # means a proof may have counted one of them
             "registered_between_windows": between["registered_between_windows"],
             "between_windows_read": between["gaps_read"],
             **({"warning": f"{between['registered_between_windows']} class(es) registered between the fresh "
