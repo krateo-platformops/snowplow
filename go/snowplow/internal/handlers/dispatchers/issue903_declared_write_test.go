@@ -16,11 +16,15 @@ package dispatchers
 //       the list later gains an item, the next customer /call is a miss and
 //       sends the write once — it is never an L1 hit that skips it, and the
 //       background never sends it.
+//   S4  (B2) the prewarm walk: its resolve of a RESTAction that declares a
+//       write sends no write, and the walk's mark site (walkMarkDeclinedExternal,
+//       over the walk's own resolve ctx) MARKS it declined-external, so later
+//       walks replay the mark instead of re-resolving it.
 //
 // Mutation (logic-only): drop the declared-write bump in ResolveWithFailure →
 // S1 (no mark, re-resolved every pass), S3 (stored; the later /call is a hit
-// that never writes) go RED. Drop the external-permanent decline in the
-// refresher's stage-error branch → S2 RED.
+// that never writes), S4 (the walk does not mark) go RED. Drop the
+// external-permanent decline in the refresher's stage-error branch → S2 RED.
 
 import (
 	"context"
@@ -32,8 +36,10 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )
 
@@ -164,5 +170,39 @@ func TestIssue903_S3_DeclaredWriteRANeverStored_TheWriteRunsOnTheNextCall(t *tes
 	e.t903Call(t, c681A)
 	if n := up.writes(); n != 1 {
 		t.Fatalf("#903 F1: the declared write must run exactly once on the next customer /call, got %d", n)
+	}
+}
+
+func TestIssue903_S4_WalkMarksADeclaredWriteRADeclinedExternal(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	e := c681Setup(t)
+	e.ra = s903WriteRA("")
+	up := newB903Counter(t)
+	t903PublishSecrets(e, up.srv.URL, true)
+	var cr templatesv1.RESTAction
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(e.ra.Object, &cr); err != nil {
+		t.Fatal(err)
+	}
+	// The walk's resolve ctx (phase1_walk.go): a prewarm walk, carrying the
+	// sinks walkMarkDeclinedExternal reads and the run's declined-external set.
+	set := cache.NewSeedDeclinedExternalSet()
+	ctx := cache.WithSeedDeclinedExternalSet(cache.WithPrewarmPath(c681A.ctx()), set)
+	ctx, _ = cache.WithStageErrorSink(ctx)
+	ctx, _ = cache.WithExternalTouchedSink(ctx)
+	ctx, _ = cache.WithPerIdentityForbiddenSink(ctx)
+	if _, err := restactions.Resolve(ctx, restactions.ResolveOptions{In: cr.DeepCopy(),
+		SArc: &rest.Config{Host: e.user.URL}, AuthnNS: c681AuthnNS}); err != nil {
+		t.Logf("walk resolve: %v", err)
+	}
+	if n := up.writes(); n != 0 {
+		t.Fatalf("#903 RED: the walk sent %d write(s)", n)
+	}
+	w := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "widgets.templates.krateo.io/v1beta1", "kind": "Panel",
+		"metadata": map[string]any{"name": "w", "namespace": h1NS}}}
+	walkMarkDeclinedExternal(ctx, "key/s4", w, "uid", "1", nil, false)
+	if !set.Marked("key/s4") {
+		t.Fatal("#903 B2 RED: the walk resolved a RESTAction that declares a write (refused in the background) " +
+			"without marking it declined-external — every later walk re-resolves it")
 	}
 }
