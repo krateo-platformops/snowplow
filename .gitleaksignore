@@ -18,3 +18,9 @@
 # feeds a fake token-shaped string to prove it gets redacted. Not a credential.
 # Exactly this one finding; no path or rule allowlist.
 67fdb1e403e97cff4277ba8f0d75c40803e76052:go/snowplow/e2e/bench/tests/test_review823.py:generic-api-key:33
+
+# Synthetic credential canary (installer#410 / snowplow#902): the AUDIT-4 arm that
+# proves an upstream-echoed token never reaches the audit trail used a token-shaped
+# test constant in dd3b8b1c. Not a credential; renamed to a low-entropy canary in
+# 555c610a. Exactly this one finding; no path or rule allowlist.
+dd3b8b1c73acc2f6ee3e9d85121ae9cd24113dc1:go/snowplow/internal/resolvers/restactions/api/stage_audit_410_test.go:generic-api-key:56
