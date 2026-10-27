@@ -64,7 +64,7 @@ func TestFactory244_RefusedAndAgeSignalDiscriminates(t *testing.T) {
 	// (1) REFUSAL — the active repair verb is UNAVAILABLE for the factory class,
 	// so the passive self-heal is the sole path.
 	before := storeRepairUnsupportedTotal.Load()
-	if enqueueStoreRepair(factory244GVR, "div") {
+	if requestStoreRepair(factory244GVR, []string{"ns/div"}) {
 		t.Fatal("#244: a factory-built GVR must be REFUSED — a shared-factory teardown hands back " +
 			"the STOPPED informer and kills the cache; the active relist-repair is not available")
 	}
@@ -73,17 +73,13 @@ func TestFactory244_RefusedAndAgeSignalDiscriminates(t *testing.T) {
 	}
 
 	// (1b) POSITIVE CONTROL — the refusal is CLASS-DISCRIMINATING (the !ownsInformer
-	// boundary), NOT "repair is off everywhere". An OWNED-informer GVR is ACCEPTED
-	// (relistGVRForRepair IS enqueued) and does NOT advance store_repair_unsupported_total.
-	// Without this the factory-refused assertion could pass vacuously if
-	// enqueueStoreRepair refused every GVR.
+	// boundary), NOT "repair is off everywhere". An OWNED-informer GVR is NOT refused
+	// as unsupported. (#870: with no watcher here there is no live copy to build
+	// beside, so the request itself cannot be accepted; the end-to-end acceptance on
+	// a real watcher is arm K8b, TestStoreSwap_K8b_OwnedOnly.)
 	rememberStoreVerification(owned244GVR, true, true)
 	unsupBefore := storeRepairUnsupportedTotal.Load()
-	if !enqueueStoreRepair(owned244GVR, "owned") {
-		t.Fatal("#244 positive control: an OWNED GVR must be ACCEPTED — its informer can be torn down + " +
-			"rebuilt; a refusal here would mean the predicate is not reading ownership, or repair is " +
-			"globally off (the vacuous pass this control guards against)")
-	}
+	_ = requestStoreRepair(owned244GVR, []string{"ns/owned"})
 	if got := storeRepairUnsupportedTotal.Load(); got != unsupBefore {
 		t.Fatalf("#244 positive control: an owned GVR's acceptance must NOT increment "+
 			"store_repair_unsupported_total; it moved %d→%d", unsupBefore, got)

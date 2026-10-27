@@ -1,7 +1,17 @@
-// store_swap_stats.go — #870: the build-and-swap counters, on expvar
-// (snowplow_store_swap) and, through StoreSwapStatsSnapshot and the histogram
-// recorder hook, on hand-wired OTLP instruments (internal/metrics). The
-// labelled families are CLOSED sets fixed at init (StoreSwapReasons ×
+// store_swap_stats.go — #870: the build-and-swap instruments.
+//
+// Two surfaces, by shape:
+//
+//   - the SCALAR counters are a tagged stats family (stats_by_tag.go):
+//     expvar snowplow_store_swap, OTLP snowplow_store_swap{stat=...}, derived
+//     from StoreSwapStats' tags so the two can never drift;
+//   - the LABELLED known-stale family (owner ruling 3: `reason` × `outcome`,
+//     `reason` × `close`, per-reason gauges, two per-entry histograms) cannot
+//     ride a stat tag (the tag system has no labels), so it is hand-wired on
+//     OTLP (internal/metrics/store_swap_metrics.go, #311) and published on
+//     expvar as snowplow_store_swap_known_stale.
+//
+// The labelled families are CLOSED sets fixed at init (StoreSwapReasons ×
 // StoreSwapOutcomes / StoreSwapCloses), so every series exists from the first
 // scrape and its zero is a reading, not an absence. No key, body or identity
 // reaches any series.
@@ -62,12 +72,12 @@ type swapStats struct {
 	detectHist  map[[2]string]*histCell // reason × close: detect → close
 	installHist map[[2]string]*histCell // reason × close: install → close
 
-	swaps         atomic.Uint64 // installs
-	superseded    atomic.Uint64 // installs a later install superseded during the retiring wait
-	deliveries    atomic.Uint64 // swap deliveries acted on by the dep handler (= |M| minus C1 skips)
-	mKeys         atomic.Uint64 // Σ |M|
-	reused        atomic.Uint64 // objects the reuse transform shared with the live copy
-	regressedKeys atomic.Uint64 // F8: a swap pushed a body older than the consumer had
+	swaps         atomic.Uint64
+	superseded    atomic.Uint64
+	deliveries    atomic.Uint64
+	mKeys         atomic.Uint64
+	reused        atomic.Uint64
+	regressedKeys atomic.Uint64
 }
 
 var storeSwapStats = newSwapStats()
@@ -89,6 +99,36 @@ func newSwapStats() *swapStats {
 	}
 	return s
 }
+
+// ── the scalar family (tagged) ───────────────────────────────────────────────
+
+// StoreSwapStats is the scalar build-and-swap family (snowplow_store_swap).
+type StoreSwapStats struct {
+	Swaps         uint64 `stat:"store_swaps_total" desc:"Store builds installed: a replacement built beside the live informer and swapped in (#870). Each is a repair or a schema change that left the GVR servable throughout."`
+	Superseded    uint64 `stat:"store_swap_superseded_total" desc:"Installs superseded by a later install during their retiring wait; the later swap delivered for both (Q6)."`
+	Deliveries    uint64 `stat:"store_swap_deliveries_total" desc:"Swap deliveries the dep handler ACTED on (a key of M whose consumer had not already acted on its current state — v5.1 C1). Equals the swaps' Σ|M| minus the keys a live event delivered first."`
+	MKeys         uint64 `stat:"store_swap_m_keys_total" desc:"Σ|M| over all swaps: the keys whose bytes differed between the new copy and what the consumers last acted on. A whole-type mark is gone; this is all a swap marks."`
+	Reused        uint64 `stat:"store_swap_reused_objects_total" desc:"Objects a new copy SHARED with the live copy because their bytes were equal (the reuse transform): the new copy costs only what changed."`
+	RegressedKeys uint64 `stat:"store_swap_regressed_keys" desc:"Swap deliveries that pushed a body OLDER than the consumer had (the new copy synced behind the live one, F8); each converges when the new copy's own watch delivers the newer version. Counted, not avoided (design v5 §5)."`
+}
+
+// StoreSwapStatsSnapshot reads the scalar family.
+func StoreSwapStatsSnapshot() StoreSwapStats {
+	s := storeSwapStats
+	return StoreSwapStats{
+		Swaps:         s.swaps.Load(),
+		Superseded:    s.superseded.Load(),
+		Deliveries:    s.deliveries.Load(),
+		MKeys:         s.mKeys.Load(),
+		Reused:        s.reused.Load(),
+		RegressedKeys: s.regressedKeys.Load(),
+	}
+}
+
+// StoreSwapStatsByStat is the scalar family as a stat → value map.
+func StoreSwapStatsByStat() map[string]any { return statsByTag(StoreSwapStatsSnapshot()) }
+
+// ── the labelled known-stale family ──────────────────────────────────────────
 
 // storeSwapCloseRecorder is the OTLP histogram hook: kind is "detect" or
 // "install". nil = no histogram (metrics off).
@@ -146,28 +186,26 @@ type StoreSwapReasonGauge struct {
 	Value  float64
 }
 
-// StoreSwapStats is the snapshot the OTLP callback and expvar read.
-type StoreSwapStats struct {
-	KnownStaleKeys    []StoreSwapLabelled // reason × outcome
-	KnownStaleBuilds  []StoreSwapLabelled // reason × outcome
-	KnownStaleWindowS []StoreSwapLabelled // reason × outcome, Value in ms (seconds = Value/1000)
-	LedgerCloses      []StoreSwapLabelled // reason × close
-	KeysOpen          []StoreSwapReasonGauge
-	WindowOpenMaxS    []StoreSwapReasonGauge
-	LedgerOwed        []StoreSwapReasonGauge
-
-	Swaps, Superseded, Deliveries, MKeys, Reused, RegressedKeys uint64
+// StoreSwapKnownStale is the labelled family's snapshot (OTLP + expvar).
+type StoreSwapKnownStale struct {
+	Keys           []StoreSwapLabelled // reason × outcome
+	Builds         []StoreSwapLabelled // reason × outcome
+	WindowMS       []StoreSwapLabelled // reason × outcome, milliseconds
+	LedgerCloses   []StoreSwapLabelled // reason × close
+	KeysOpen       []StoreSwapReasonGauge
+	WindowOpenMaxS []StoreSwapReasonGauge
+	LedgerOwed     []StoreSwapReasonGauge
 }
 
-// StoreSwapStatsSnapshot reads every #870 instrument.
-func StoreSwapStatsSnapshot() StoreSwapStats {
+// StoreSwapKnownStaleSnapshot reads the labelled family.
+func StoreSwapKnownStaleSnapshot() StoreSwapKnownStale {
 	s := storeSwapStats
-	var out StoreSwapStats
+	var out StoreSwapKnownStale
 	for _, r := range StoreSwapReasons {
 		for _, o := range StoreSwapOutcomes {
-			out.KnownStaleKeys = append(out.KnownStaleKeys, StoreSwapLabelled{r, o, s.keys.get(r, o)})
-			out.KnownStaleBuilds = append(out.KnownStaleBuilds, StoreSwapLabelled{r, o, s.builds.get(r, o)})
-			out.KnownStaleWindowS = append(out.KnownStaleWindowS, StoreSwapLabelled{r, o, s.windowNS.get(r, o) / 1e6})
+			out.Keys = append(out.Keys, StoreSwapLabelled{r, o, s.keys.get(r, o)})
+			out.Builds = append(out.Builds, StoreSwapLabelled{r, o, s.builds.get(r, o)})
+			out.WindowMS = append(out.WindowMS, StoreSwapLabelled{r, o, s.windowNS.get(r, o) / 1e6})
 		}
 		for _, c := range StoreSwapCloses {
 			out.LedgerCloses = append(out.LedgerCloses, StoreSwapLabelled{r, c, s.closes.get(r, c)})
@@ -179,12 +217,6 @@ func StoreSwapStatsSnapshot() StoreSwapStats {
 		out.WindowOpenMaxS = append(out.WindowOpenMaxS, StoreSwapReasonGauge{r, winMax[r]})
 		out.LedgerOwed = append(out.LedgerOwed, StoreSwapReasonGauge{r, float64(owed[r])})
 	}
-	out.Swaps = s.swaps.Load()
-	out.Superseded = s.superseded.Load()
-	out.Deliveries = s.deliveries.Load()
-	out.MKeys = s.mKeys.Load()
-	out.Reused = s.reused.Load()
-	out.RegressedKeys = s.regressedKeys.Load()
 	return out
 }
 
@@ -193,17 +225,10 @@ func storeSwapWindowSeconds(reason, outcome string) float64 {
 	return float64(storeSwapStats.windowNS.get(reason, outcome)) / 1e9
 }
 
-func storeSwapExpvar() any {
-	snap := StoreSwapStatsSnapshot()
+func storeSwapKnownStaleExpvar() any {
+	snap := StoreSwapKnownStaleSnapshot()
 	s := storeSwapStats
-	m := map[string]any{
-		"store_swaps_total":               snap.Swaps,
-		"store_swap_superseded_total":     snap.Superseded,
-		"store_swap_deliveries_total":     snap.Deliveries,
-		"store_swap_m_keys_total":         snap.MKeys,
-		"store_swap_reused_objects_total": snap.Reused,
-		"store_swap_regressed_keys":       snap.RegressedKeys,
-	}
+	m := map[string]any{}
 	keys, builds, win := map[string]uint64{}, map[string]uint64{}, map[string]float64{}
 	for _, r := range StoreSwapReasons {
 		for _, o := range StoreSwapOutcomes {
@@ -249,7 +274,8 @@ func init() {
 		return
 	}
 	storeSwapExpvarOnce.Do(func() {
-		expvar.Publish("snowplow_store_swap", expvar.Func(storeSwapExpvar))
+		expvar.Publish("snowplow_store_swap", expvar.Func(func() any { return StoreSwapStatsByStat() }))
+		expvar.Publish("snowplow_store_swap_known_stale", expvar.Func(storeSwapKnownStaleExpvar))
 	})
 }
 

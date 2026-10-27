@@ -304,14 +304,7 @@ func (rw *ResourceWatcher) requestStoreBuild(gvr schema.GroupVersionResource, re
 	owned, known, suppressed := storeVerificationOwnership(gvr)
 	if !known || !owned || !live.shape.owned() {
 		rw.mu.Unlock()
-		storeRepairUnsupportedTotal.Add(1)
-		slog.Warn("cache.store.repair_unsupported",
-			slog.String("subsystem", "cache"),
-			slog.String("gvr", gvr.String()),
-			slog.String("reason", reason),
-			slog.String("hint", "this GVR's informer comes from a shared informer factory, which hands back "+
-				"the same cached informer: a replacement cannot be built beside it. The divergence is "+
-				"still reported; it is not repaired."))
+		refuseUnownedBuild(gvr, reason)
 		return false
 	}
 	if reason == reasonDivergence && suppressed {
@@ -365,6 +358,19 @@ func (rw *ResourceWatcher) requestStoreBuild(gvr schema.GroupVersionResource, re
 			"servable and every key the build will change stays known-stale until the swap"),
 	)
 	return true
+}
+
+// refuseUnownedBuild counts and logs a refused build of a factory-built GVR
+// (store_repair_unsupported_total). Detection continues.
+func refuseUnownedBuild(gvr schema.GroupVersionResource, reason string) {
+	storeRepairUnsupportedTotal.Add(1)
+	slog.Warn("cache.store.repair_unsupported",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("reason", reason),
+		slog.String("hint", "this GVR's informer comes from a shared informer factory, which hands back "+
+			"the same cached informer: a replacement cannot be built beside it. The divergence is "+
+			"still reported; it is not repaired."))
 }
 
 // constructCandidateLocked builds a muted copy of gvr through the live copy's

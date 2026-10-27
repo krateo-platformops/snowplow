@@ -1,7 +1,8 @@
 package metrics
 
-// store_swap_metrics.go — #870: the build-and-swap instruments, hand-wired on
-// OTLP (no expvar→OTLP bridge, #311). The labelled families are closed sets
+// store_swap_metrics.go — #870: the LABELLED build-and-swap instruments,
+// hand-wired on OTLP (no expvar→OTLP bridge, #311). The scalar counters ride
+// the tagged family snowplow_store_swap{stat=...} (cache.TaggedStatFamilies). The labelled families are closed sets
 // (cache.StoreSwapReasons × StoreSwapOutcomes / StoreSwapCloses). The two
 // per-entry histograms are synchronous, fed through cache's recorder hook.
 
@@ -52,11 +53,6 @@ func registerStoreSwapInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
-	scalars, err := m.Int64ObservableCounter("snowplow_store_swap",
-		metric.WithDescription("Store-swap counters by stat: store_swaps_total, store_swap_superseded_total, store_swap_deliveries_total (dep-handler swap deliveries acted on), store_swap_m_keys_total (Σ|M|), store_swap_reused_objects_total, store_swap_regressed_keys (F8) (#870)."))
-	if err != nil {
-		return err
-	}
 	detect, err := m.Int64Histogram("snowplow_store_swap_detect_to_push_ms",
 		metric.WithDescription("Per push-ledger entry: detection → close (ms), by reason and close (#870)."),
 		metric.WithUnit("ms"),
@@ -80,17 +76,17 @@ func registerStoreSwapInstruments(m metric.Meter) error {
 		install.Record(context.Background(), ms, set)
 	})
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		s := cache.StoreSwapStatsSnapshot()
+		s := cache.StoreSwapKnownStaleSnapshot()
 		ro := func(c cache.StoreSwapLabelled) metric.ObserveOption {
 			return metric.WithAttributes(attribute.String("reason", c.Reason), attribute.String("outcome", c.Label))
 		}
-		for _, c := range s.KnownStaleKeys {
+		for _, c := range s.Keys {
 			o.ObserveInt64(keysTotal, int64(c.Value), ro(c))
 		}
-		for _, c := range s.KnownStaleBuilds {
+		for _, c := range s.Builds {
 			o.ObserveInt64(buildsTotal, int64(c.Value), ro(c))
 		}
-		for _, c := range s.KnownStaleWindowS {
+		for _, c := range s.WindowMS {
 			o.ObserveFloat64(windowTotal, float64(c.Value)/1000, ro(c))
 		}
 		for _, c := range s.LedgerCloses {
@@ -106,17 +102,7 @@ func registerStoreSwapInstruments(m metric.Meter) error {
 		for _, g := range s.LedgerOwed {
 			o.ObserveInt64(owed, int64(g.Value), metric.WithAttributes(attribute.String("reason", g.Reason)))
 		}
-		for stat, v := range map[string]uint64{
-			"store_swaps_total":               s.Swaps,
-			"store_swap_superseded_total":     s.Superseded,
-			"store_swap_deliveries_total":     s.Deliveries,
-			"store_swap_m_keys_total":         s.MKeys,
-			"store_swap_reused_objects_total": s.Reused,
-			"store_swap_regressed_keys":       s.RegressedKeys,
-		} {
-			o.ObserveInt64(scalars, int64(v), metric.WithAttributes(attribute.String("stat", stat)))
-		}
 		return nil
-	}, keysTotal, buildsTotal, windowTotal, closesTotal, keysOpen, windowMax, owed, scalars)
+	}, keysTotal, buildsTotal, windowTotal, closesTotal, keysOpen, windowMax, owed)
 	return err
 }

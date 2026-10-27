@@ -67,6 +67,12 @@ import "k8s.io/apimachinery/pkg/runtime/schema"
 // registered, factory-built — counted on store_repair_unsupported_total — or
 // suppressed by the breaker).
 func requestStoreRepair(gvr schema.GroupVersionResource, keys []string) bool {
+	// Bound 6 first, from the RECORDED property alone: a factory-built GVR is
+	// refused, out loud, whatever state the watcher is in.
+	if owned, known, _ := storeVerificationOwnership(gvr); known && !owned {
+		refuseUnownedBuild(gvr, reasonDivergence)
+		return false
+	}
 	rw := Global()
 	if rw == nil {
 		return false

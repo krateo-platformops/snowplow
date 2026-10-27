@@ -78,7 +78,7 @@ func c854LostApply(t *testing.T, rw *ResourceWatcher, c *ListCell, i int, sel st
 	if err := rw.c854Indexer(t).Update(bo); err != nil {
 		t.Fatal(err)
 	}
-	noteListCellDelivery(c854GVR, bo, false)
+	noteDeliveredForTest(c854GVR, bo, false)
 	c.mu.Lock()
 	c.pending = map[listObjKey]struct{}{}
 	c.mu.Unlock()

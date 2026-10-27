@@ -278,7 +278,7 @@ func TestForcedPass872_StoreMovedDuringTheList_IsNotALoss(t *testing.T) {
 			if got := r872Published(); got != 0 {
 				t.Fatalf("#872 RED: a store that moved past the LIST published %d forced divergences (class %s); it lost nothing", got, c.class)
 			}
-			if d := storeRepairQueueDepth(); d != 0 {
+			if d := storeRepairsRequestedForTest(); d != 0 {
 				t.Fatalf("#872 RED: %d repair(s) queued for a store that lost nothing", d)
 			}
 			if got := storeRecheckClearedTotal.Load(); got != 1 {
@@ -325,8 +325,8 @@ func TestForcedPass872_TrueLoss_NothingDelivered_IsRepairedWithoutAGET(t *testin
 			if got := r872Published(); got != 1 {
 				t.Errorf("published %d divergences in total, want 1", got)
 			}
-			if d := storeRepairQueueDepth(); d != 1 {
-				t.Fatalf("store_repairs_pending = %d after a TRUE loss, want 1", d)
+			if d := storeRepairsRequestedForTest(); d != 1 {
+				t.Fatalf("repairs requested = %d after a TRUE loss, want 1", d)
 			}
 			if g := cli.gets.Load(); g != 0 {
 				t.Errorf("#875 RED: %d GETs for a candidate nothing was delivered for, want 0", g)
@@ -366,8 +366,8 @@ func TestForcedPass875_DeliveredButStillLost_IsDetectedAndRepaired(t *testing.T)
 			if got := r872Published(); got != 1 {
 				t.Errorf("published %d divergences in total, want 1", got)
 			}
-			if d := storeRepairQueueDepth(); d != 1 {
-				t.Fatalf("store_repairs_pending = %d after a TRUE loss, want 1 — the re-check must not stop the repair", d)
+			if d := storeRepairsRequestedForTest(); d != 1 {
+				t.Fatalf("repairs requested = %d after a TRUE loss, want 1 — the re-check must not stop the repair", d)
 			}
 			// A candidate that stays divergent is read twice, never more. A
 			// literal, not recheckReads: a bound read from the constant under
@@ -405,8 +405,8 @@ func TestForcedPass875_WhollyDivergentStore_GoesStraightToRepair(t *testing.T) {
 			if g := cli.gets.Load(); g != 0 {
 				t.Errorf("#875 RED: a wholly divergent store issued %d quorum GETs for %d objects nothing was delivered for, want 0", g, n)
 			}
-			if d := storeRepairQueueDepth(); d != 1 {
-				t.Errorf("store_repairs_pending = %d, want 1", d)
+			if d := storeRepairsRequestedForTest(); d != 1 {
+				t.Errorf("repairs requested = %d, want 1", d)
 			}
 			if got := storeRecheckUndeliveredTotal.Load(); got != uint64(n) {
 				t.Errorf("store_divergence_recheck_undelivered_total = %d, want %d", got, n)
@@ -455,8 +455,8 @@ func TestForcedPass875_Mixed_OnlyDeliveredKeysAreReread(t *testing.T) {
 	if got := storeRecheckUndeliveredTotal.Load(); got != 3 {
 		t.Errorf("store_divergence_recheck_undelivered_total = %d, want the 3 truly lost", got)
 	}
-	if d := storeRepairQueueDepth(); d != 1 {
-		t.Errorf("store_repairs_pending = %d, want 1", d)
+	if d := storeRepairsRequestedForTest(); d != 1 {
+		t.Errorf("repairs requested = %d, want 1", d)
 	}
 }
 
@@ -515,7 +515,7 @@ func TestForcedPass875_RelistDeletionDuringThePass_IsNotALoss(t *testing.T) {
 	if got := r872Published(); got != 0 {
 		t.Fatalf("#875 RED: a relist deletion during the pass published %d forced divergence(s); the store lost nothing", got)
 	}
-	if d := storeRepairQueueDepth(); d != 0 {
+	if d := storeRepairsRequestedForTest(); d != 0 {
 		t.Fatalf("#875 RED: %d repair(s) queued for a store a relist had just made current", d)
 	}
 	if g := cli.gets.Load(); g != 1 {
@@ -535,7 +535,7 @@ func TestForcedPass872_ObjectMovedDuringRecheck_IsNotALoss(t *testing.T) {
 	if got := r872Published(); got != 0 {
 		t.Fatalf("#872 RED: an object that moved during the re-check was published as %d divergence(s)", got)
 	}
-	if d := storeRepairQueueDepth(); d != 0 {
+	if d := storeRepairsRequestedForTest(); d != 0 {
 		t.Fatalf("#872 RED: %d repair(s) queued for an object that only moved", d)
 	}
 	if g := cli.gets.Load(); g != 2 {
@@ -561,7 +561,7 @@ func TestForcedPass872_FailedRecheck_IsInconclusive(t *testing.T) {
 	if got := r872Published(); got != 0 {
 		t.Errorf("#872 RED: an unconfirmed candidate was published as %d divergence(s) after the re-check failed", got)
 	}
-	if d := storeRepairQueueDepth(); d != 0 {
+	if d := storeRepairsRequestedForTest(); d != 0 {
 		t.Errorf("#872 RED: %d repair(s) queued on a re-check error; an error must not become a repair", d)
 	}
 	if got := VerifySkippedByReasonSnapshot()[verifySkipRecheckError] - before; got != 1 {

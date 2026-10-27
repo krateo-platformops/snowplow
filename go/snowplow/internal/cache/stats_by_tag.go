@@ -287,6 +287,18 @@ func TaggedStatFamilies() []StatFamily {
 			Untagged:   untaggedNumericFields(reflect.TypeOf(StoreVerificationStats{})),
 			typ:        reflect.TypeOf(StoreVerificationStats{}),
 		},
+		// #870 — the build-and-swap scalar counters. Shared instrument labelled
+		// by stat. The labelled known-stale family is hand-wired
+		// (store_swap_stats.go). APPENDED, not inserted — see the note above.
+		{
+			Expvar:   "snowplow_store_swap",
+			OTelName: "snowplow_store_swap",
+			Desc:     "Store build-and-swap counters (#870), labelled by stat.",
+			Values:   StoreSwapStatsByStat,
+			Specs:    statSpecsOf(reflect.TypeOf(StoreSwapStats{})),
+			Untagged: untaggedNumericFields(reflect.TypeOf(StoreSwapStats{})),
+			typ:      reflect.TypeOf(StoreSwapStats{}),
+		},
 	}
 }
 

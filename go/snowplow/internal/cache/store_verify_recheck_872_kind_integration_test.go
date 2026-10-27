@@ -186,7 +186,7 @@ func TestStoreVerification872_Kind_HighChurnPublishesNoDivergence(t *testing.T) 
 	skipped := VerifySkippedByReasonSnapshot()
 	lu, ld, la, um := divergenceCounts(verifySiteForced)
 	t.Logf("#872 kind: %d forced passes at %.0f patches/s over %d objects: candidates=%d, re-check GETs=%d, cleared=%d, counted without a re-check=%d, published update/delete/add/uid=%d/%d/%d/%d, repairs pending=%d, refused-unsupported=%d, skipped{recheck_error}=%d skipped{no_sync_position}=%d",
-		k872Passes, rate, k872Objects, candidates, gets, cleared, undelivered, lu, ld, la, um, storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load(),
+		k872Passes, rate, k872Objects, candidates, gets, cleared, undelivered, lu, ld, la, um, storeRepairsRequestedForTest(), storeRepairUnsupportedTotal.Load(),
 		skipped[verifySkipRecheckError], skipped[verifySkipNoSyncPosition])
 
 	// Non-vacuity: the churn really produced LIST-vs-store disagreement, so a
@@ -200,7 +200,7 @@ func TestStoreVerification872_Kind_HighChurnPublishesNoDivergence(t *testing.T) 
 	// A repair ATTEMPT, whether queued or refused as unsupported: this GVR's
 	// informer may not be rebuildable here, and counting only the queue would
 	// make the assertion vacuous on exactly that path.
-	if d, u := storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load(); d+int64(u) != 0 {
+	if d, u := storeRepairsRequestedForTest(), storeRepairUnsupportedTotal.Load(); d+int64(u) != 0 {
 		t.Errorf("#872 RED: %d repair attempt(s) under churn alone (queued %d, refused-unsupported %d)", d+int64(u), d, u)
 	}
 	if n := skipped[verifySkipRecheckError] + skipped[verifySkipNoSyncPosition]; n != 0 {

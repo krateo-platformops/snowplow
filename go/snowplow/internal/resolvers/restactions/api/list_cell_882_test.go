@@ -265,7 +265,7 @@ func TestListCell882_F2m_MovedJoinerOfAFlightWithNoCellReReads(t *testing.T) {
 	inc854Anchor(t, store, fill710ListCall())
 	// Unanchor it: the next read takes the full fill (reanchor), with the entry
 	// still resident — its generation is what that fill's Put is checked against.
-	cache.Deps().OnResourceTypeStoreRepaired(r1FsaGVR)
+	cache.Deps().OnResourceTypeRemoved(r1FsaGVR) // a type-level event (#870 deleted the store-repair one)
 	listed, release, lists := list882HoldFirstList(t)
 
 	leader := stamp765Serve(r1Ctx(), store)
@@ -281,7 +281,7 @@ func TestListCell882_F2m_MovedJoinerOfAFlightWithNoCellReReads(t *testing.T) {
 	// The flight anchors no cell (a type-level event drops the cell it is
 	// building: Anchor returns nil) and stores nothing (a DELETE-eviction of the
 	// key: the #189 PutIfGen is refused).
-	cache.Deps().OnResourceTypeStoreRepaired(r1FsaGVR)
+	cache.Deps().OnResourceTypeRemoved(r1FsaGVR) // a type-level event (#870 deleted the store-repair one)
 	store.DeleteForTest(key)
 	close(release)
 
@@ -306,7 +306,7 @@ func TestListCell882_F1u_AnUnanchoredCellGetsItsAgeBoundsBack(t *testing.T) {
 	store := cache.ResolvedCache()
 	key := fill710ListKey()
 	c := inc854Anchor(t, store, fill710ListCall())
-	cache.Deps().OnResourceTypeStoreRepaired(r1FsaGVR)
+	cache.Deps().OnResourceTypeRemoved(r1FsaGVR) // a type-level event (#870 deleted the store-repair one)
 	if c.Anchored() {
 		t.Fatal("PRECONDITION: the type-level event did not unanchor the cell")
 	}

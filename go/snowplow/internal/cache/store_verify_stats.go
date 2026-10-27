@@ -381,7 +381,7 @@ func init() {
 }
 
 // ResetStoreVerificationStatsForTest zeroes every counter, the breakdowns, the
-// registry, the repair queue and the override.
+// registry, the #870 swap instruments and the override.
 func ResetStoreVerificationStatsForTest() {
 	storeVerificationsTotal.Store(0)
 	storeObjectsVerifiedTotal.Store(0)
@@ -407,6 +407,7 @@ func ResetStoreVerificationStatsForTest() {
 	}
 	storeVerifySkipMu.Lock()
 	storeVerifySkipByReason = map[string]uint64{}
+	resetStoreSwapStatsForTest() // #870 — the build-and-swap instruments and the push ledger
 	storeVerifySkipMu.Unlock()
 	storeVerificationStatsOverride.Store(nil)
 	resetStoreVerificationStateForTest()
