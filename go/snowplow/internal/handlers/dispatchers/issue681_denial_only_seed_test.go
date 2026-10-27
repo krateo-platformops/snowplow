@@ -129,14 +129,14 @@ func TestIssue681_C2s_SeedDoesNotMarkAnOwnDial403AsExternal(t *testing.T) {
 	set := cache.NewSeedDeclinedExternalSet()
 	ctx := cache.WithSeedDeclinedExternalSet(context.Background(), set)
 	ctx, st, ext, f := c2Sinks(ctx)
-	if declineSeedPutOnError(ctx, "restactions", "ns/ra", "key/c2s", st, ext, f) {
+	if declineSeedPutOnError(ctx, "restactions", "ns/ra", "key/c2s", cache.PutGateVerdict(cache.PutGateSinks{Stage: st, Forbidden: f, External: ext}, "restactions"), st, ext) {
 		t.Fatal("C2s RED: a denial-only result whose only external touch is an own-credential 403 was declined")
 	}
 	// Control: the same resolve with a GENUINE external touch is marked.
 	ctxG := cache.WithSeedDeclinedExternalSet(context.Background(), set)
 	ctxG, stG, extG, fG := c2Sinks(ctxG)
 	extG.Bump()
-	_ = declineSeedPutOnError(ctxG, "restactions", "ns/ra", "key/c2s-ext", stG, extG, fG)
+	_ = declineSeedPutOnError(ctxG, "restactions", "ns/ra", "key/c2s-ext", cache.PutGateVerdict(cache.PutGateSinks{Stage: stG, Forbidden: fG, External: extG}, "restactions"), stG, extG)
 	if !set.Marked("key/c2s-ext") {
 		t.Fatal("C2s control: a genuine external touch no longer marks")
 	}

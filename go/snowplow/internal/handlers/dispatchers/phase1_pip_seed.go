@@ -1293,7 +1293,9 @@ func seedRestactionResolveAndPutProd(
 	// #643 PR-B — resCtx, not ctx: the decline's mark reads the resolve's
 	// captured deps + entry stamp and the decline unit off it. resCtx inherits
 	// everything the decline otherwise reads off ctx (identity, the set).
-	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, stageErrSink, extTouchedSink, cache.PerIdentityForbiddenSinkFromContext(resCtx)) {
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink,
+		Forbidden: cache.PerIdentityForbiddenSinkFromContext(resCtx), External: extTouchedSink}, "restactions")
+	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, verdict, stageErrSink, extTouchedSink) {
 		return nil
 	}
 
@@ -1329,7 +1331,6 @@ func seedRestactionResolveAndPutProd(
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
 	terminalGuard := seedTerminalGuardFromContext(resCtx)
-	// put-verdict: taken above by declineSeedPutOnError (cache.PutGateVerdict over this resolve's sinks).
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
@@ -1683,7 +1684,8 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// #102 GTTL-1: decline the Put (best-effort, return nil) on a stage error
 	// or external touch — keeps any prior good entry; TTL is the outer net.
 	// #643 PR-B — resCtx (deps, stamp, decline unit); see seedRestactionResolveAndPutProd.
-	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, stageErrSink, extTouchedSink, forbiddenSink) {
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, "widgets")
+	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, verdict, stageErrSink, extTouchedSink) {
 		return nil
 	}
 
@@ -1710,7 +1712,6 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	if inputs != nil && uafTouchedSink.Count() > 0 {
 		inputs.HasUAF = true
 	}
-	// put-verdict: taken above by declineSeedPutOnError (cache.PutGateVerdict over this resolve's sinks).
 	// #561 — this site USED to carry a scope-waiver:TTLOverride annotation whose
 	// stated reason was "a refilter-touched widget can no longer REACH this Put
 	// (the UAFTouchedSink gate immediately above declines it), so every cell
@@ -1945,14 +1946,14 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 //
 // The identity for the log is read from ctx (withCohortSeedContext installs
 // WithUserInfo) so both primitives share one helper without threading a label.
-func declineSeedPutOnError(ctx context.Context, class, target, key string,
-	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink,
-	forbiddenSink *cache.PerIdentityForbiddenSink) bool {
-
-	// The shared Put-gate verdict (cache.PutGateVerdict). #681 C2 — an
-	// own-credential apiserver 403 (F2) is not a genuine external touch, at the
-	// mark AND at the decline.
-	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, class)
+//
+// verdict is the shared Put-gate verdict (cache.PutGateVerdict) the caller took
+// over this resolve's sinks, in the same function that builds the entry it
+// Puts (scripts/check_resolved_entry_put_sites.sh). #681 C2 — an
+// own-credential apiserver 403 (F2) is not a genuine external touch, at the
+// mark AND at the decline. The sinks are read for the decline log only.
+func declineSeedPutOnError(ctx context.Context, class, target, key string, verdict cache.PutVerdict,
+	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink) bool {
 
 	// #643 PR-B (brief §1(c) as amended, #643 comment 6150618043) — mark on a
 	// PERMANENT verdict, whichever reason declines: a genuine external touch (a

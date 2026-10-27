@@ -381,6 +381,13 @@ func TestIssue681_H10_EveryStageErrorPutGateUsesDenialOnly(t *testing.T) {
 				continue
 			}
 			readsStage, usesDenialOnly := false, false
+			// A gate handed the verdict its caller took (a cache.PutVerdict
+			// parameter, e.g. declineSeedPutOnError) decides through it too.
+			for _, p := range fd.Type.Params.List {
+				if sel, ok := p.Type.(*ast.SelectorExpr); ok && sel.Sel.Name == "PutVerdict" {
+					usesDenialOnly = true
+				}
+			}
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				ce, ok := n.(*ast.CallExpr)
 				if !ok {
