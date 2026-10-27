@@ -381,6 +381,108 @@ def test_the_calls_report_through_evaluate(tmp_path):
     assert c["by_call_status"] == {"restactions/ns/ra 0": 1, "tables/krateo-system/compositions-list 200": 2}
 
 
+# ─── 3b (N7). browser requests that failed or never completed ──────────────
+# k6's browser module emits nothing for a request that failed at network
+# level (run 16 B: 99,504 browser_data_sent vs 94,497 durations).
+
+_LEDGER_DRIVER = r"""
+import { readFileSync } from 'node:fs'
+import * as pl from './pageload.mjs'
+const ev = JSON.parse(readFileSync(process.argv[2], 'utf8'))
+const l = pl.requestLedger()
+const out = { failed: [], tags: ev.tags.map(([u, t]) => pl.requestTags(u, t)) }
+for (const [kind, method, url, t, x, type] of ev.events) {
+  if (kind === 'request') l.started(method, url, t, type)
+  else if (kind === 'finished') l.finished(method, url)
+  else if (kind === 'failed') out.failed.push(l.failed(method, url, t, x, type))
+  else if (kind === 'end') { out.open = l.size(); out.unfinished = l.unfinished(t) }
+}
+process.stdout.write(JSON.stringify(out))
+"""
+SECRET_CALL = f"http://h:8081/call?apiVersion=v1&resource=tables&name=t1&namespace=ns1&{EXTRAS}"
+
+
+def _ledger(tmp_path, events, tags=()):
+    (tmp_path / "pageload.mjs").write_text((BENCH_DIR / "k6" / "pageload.js").read_text())
+    (tmp_path / "drv.mjs").write_text(_LEDGER_DRIVER)
+    (tmp_path / "ev.json").write_text(json.dumps({"events": events, "tags": list(tags)}))
+    p = subprocess.run([NODE, str(tmp_path / "drv.mjs"), str(tmp_path / "ev.json")],
+                       capture_output=True, text=True, timeout=60, cwd=tmp_path)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+@needs_node
+def test_a_failed_and_a_never_completed_request_each_emit_one_point(tmp_path):
+    out = _ledger(tmp_path, [
+        ["request", "GET", SECRET_CALL, 1000, None, "Fetch"],
+        ["request", "GET", "http://h:8080/static/app.js", 1001, None, "Script"],
+        ["request", "POST", "http://h:8081/refreshes", 1002, None, "Fetch"],     # a live stream
+        ["request", "GET", SECRET_CALL, 1500, None, "Fetch"],                    # the same URL again
+        ["finished", "GET", "http://h:8080/static/app.js"],
+        ["failed", "GET", SECRET_CALL, 4000, "net::ERR_CONNECTION_REFUSED", "Fetch"],
+        ["end", None, None, 9000],
+        ["failed", "POST", "http://h:8081/refreshes", 9001, "net::ERR_ABORTED", "Fetch"],  # page closed
+    ])
+    f = out["failed"]
+    # the oldest of the two identical requests failed: 3,000 ms after it started
+    assert f[0] == ["browser_request_incomplete_ms", 3000,
+                    {"request": "call", "call_resource": "tables", "call_name": "t1", "call_namespace": "ns1",
+                     "outcome": "failed", "error": "net::ERR_CONNECTION_REFUSED"}]
+    assert f[1] is None                         # after the session's end: already reported, not twice
+    assert out["open"] == 2
+    got = sorted((v, t["request"], t["outcome"], t["call_resource"]) for _, v, t in out["unfinished"])
+    assert got == [(7500, "call", "never_completed", "tables"), (7998, "fetch", "never_completed", "")]
+    assert "alice" not in json.dumps(out) and "extras" not in json.dumps(out)
+
+
+@needs_node
+def test_request_tags_tell_a_call_from_anything_else_and_carry_no_path(tmp_path):
+    out = _ledger(tmp_path, [], tags=[
+        [SECRET_CALL, "Fetch"], ["/call?resource=a%20b&name=n", "XHR"],
+        ["http://h/users/alice/avatar.png", "Image"], ["http://h/callx?resource=r", "Fetch"], ["", None]])
+    assert out["tags"] == [
+        {"request": "call", "call_resource": "tables", "call_name": "t1", "call_namespace": "ns1"},
+        {"request": "call", "call_resource": "a b", "call_name": "n", "call_namespace": ""},
+        {"request": "image", "call_resource": "", "call_name": "", "call_namespace": ""},
+        {"request": "fetch", "call_resource": "", "call_name": "", "call_namespace": ""},
+        {"request": "other", "call_resource": "", "call_name": "", "call_namespace": ""}]
+    assert "alice" not in json.dumps(out)
+
+
+def test_browser_js_tracks_every_request_from_before_the_first_navigation():
+    src = (BENCH_DIR / "k6" / "browser.js").read_text()
+    body = src[src.index("export default async function"):]
+    for ev in ("'request'", "'requestfinished'", "'requestfailed'"):
+        assert body.index(f"page.on({ev}") < body.index("await gotoLogin(page)"), ev
+    fin = body[body.index("} finally {"):]
+    assert fin.index("ledger.unfinished(Date.now())") < fin.index("await page.close()")
+    assert "new Trend('browser_request_incomplete_ms', true)" in src
+    assert "browser_request_incomplete_ms|" in src
+
+
+def test_the_incomplete_requests_report_through_evaluate(tmp_path):
+    base = dict(session="s1", route="/dashboard")
+    pts = [_point("browser_page_load_ms", 900.0, session="s1", route="/dashboard", visit="warm",
+                  method="click", skeleton="yes", timeout="no"),
+           _point("browser_request_incomplete_ms", 3000.0, **base, request="call", call_resource="tables",
+                  call_name="t1", call_namespace="ns1", outcome="failed", error="net::ERR_CONNECTION_REFUSED"),
+           _point("browser_request_incomplete_ms", 60000.0, **base, request="fetch", call_resource="",
+                  call_name="", call_namespace="", outcome="never_completed", error=""),
+           _point("browser_request_incomplete_ms", 60000.0, **base, request="eventsource", call_resource="",
+                  call_name="", call_namespace="", outcome="never_completed", error="")]
+    _write_out(tmp_path / "browser", "browser", pts, None, 0)
+    v = _evaluate(tmp_path, {"preflight.jsonl": [{"kind": "preflight"}]},
+                  "--browser-out", str(tmp_path / "browser"), "--browser-sessions", "1")
+    r = v["report"]["browser"]["incomplete_requests_report_only"]
+    assert r["status"] == "present" and r["requests"] == 3
+    assert r["by_outcome"] == {"failed": 1, "never_completed": 2}
+    assert r["by_outcome_request_error"] == {"failed call net::ERR_CONNECTION_REFUSED": 1,
+                                             "never_completed eventsource -": 1,
+                                             "never_completed fetch -": 1}
+    assert r["calls"]["failed/tables/ns1/t1"]["max_ms"] == 3000.0
+
+
 # ─── 4. churn write failures: time and status code ──────────────────────────
 
 

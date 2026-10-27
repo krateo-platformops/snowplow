@@ -1408,6 +1408,24 @@ def test_browser_js_in_chrome_against_the_fixture_spa(tmp_path):
     assert '"url":' not in raw and '"name":"http' not in raw and "fixture-user" not in raw
 
 
+@needs_docker
+def test_in_chrome_a_refused_call_and_the_open_streams_are_points(tmp_path):
+    """k6/browser.js in the pinned k6 browser image, real Chrome, against the
+    fixture SPA: its refused /call (port 9) is a `failed` point with Chrome's
+    error, its live streams `never_completed`, its answered /call a
+    browser_call_ms point; no point carries the extras."""
+    o = _run_browser_fixture(tmp_path)
+    inc = [(t["outcome"], t["request"], t["call_resource"], t["error"], v)
+           for v, t in o["points"]["browser_request_incomplete_ms"]]
+    failed = [x for x in inc if x[0] == "failed" and x[2] == "boom"]
+    assert failed and all(x[1] == "call" and "ERR_CONNECTION_REFUSED" in x[3] and x[4] >= 0 for x in failed), inc
+    assert {x[1] for x in inc if x[0] == "never_completed"} >= {"eventsource"}, inc
+    calls = [t for _, t in o["points"]["browser_call_ms"]]
+    assert any(t["call_resource"] == "tables" and t["call_status"] == "200" for t in calls), calls
+    with gzip.open(tmp_path / "out" / "browser.json.gz", "rt") as fh:
+        assert "FIXTURE-SECRET" not in fh.read()
+
+
 _K6_STUBS = {
     "http.js": "export default { batch: () => [] }\n",
     "execution.js": "export default { scenario: {} }\n",

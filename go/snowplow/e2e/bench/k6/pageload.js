@@ -127,6 +127,96 @@ export function callOps (calls, tags) {
   })])
 }
 
+// A request's per-request tags (#919): `request` tells a /call from any
+// other request — "call", else Chrome's resource type (document, script,
+// stylesheet, fetch, eventsource, ...) — and a /call carries its resource /
+// name / namespace parameters, the same /call tags as browser_call_ms. No
+// path and no other query parameter: a pathname can carry a name, and the
+// query carries the extras (the user). Plain string work: k6's runtime has no
+// URL global.
+export function requestTags (url, resourceType) {
+  const s = String(url || '').split('#')[0]
+  const qi = s.indexOf('?')
+  const path = (qi < 0 ? s : s.slice(0, qi)).replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/]*/, '')
+  const call = /\/call$/.test(path)
+  const q = {}
+  if (call && qi >= 0) {
+    for (const kv of s.slice(qi + 1).split('&')) {
+      const i = kv.indexOf('=')
+      const k = i < 0 ? kv : kv.slice(0, i)
+      if (k === 'resource' || k === 'name' || k === 'namespace') {
+        try { q[k] = decodeURIComponent((i < 0 ? '' : kv.slice(i + 1)).replace(/\+/g, ' ')) } catch (e) { q[k] = '' }
+      }
+    }
+  }
+  return {
+    request: call ? 'call' : String(resourceType || 'other').toLowerCase(),
+    call_resource: q.resource || '',
+    call_name: q.name || '',
+    call_namespace: q.namespace || '',
+  }
+}
+
+// #919 (N7): the browser requests that never answered. k6's browser module
+// emits no duration and no failed point for a request that failed at network
+// level (network_manager.go emitResponseMetrics runs on a response only; run
+// 16 B: 99,504 browser_data_sent vs 94,497 durations), so browser.js keeps
+// this ledger from the page's own events — request, requestfinished,
+// requestfailed — and emits one browser_request_incomplete_ms point for each
+// request that FAILED (refused, reset, timed out, aborted: Chrome's
+// errorText) or NEVER COMPLETED by the end of the session (an open stream, a
+// hung call). Value: ms from the request's start to its failure, or to the
+// session's end. Point time: when it was emitted — the failure, or the
+// session's end — so the request STARTED at the point's time minus its value.
+// Tags: requestTags, outcome (failed | never_completed), error.
+// k6 hands a new Request object to each event, so a request is matched by
+// method + URL, oldest start first: the counts are exact; two identical
+// requests (same method and URL) in flight at once may swap durations.
+export function requestLedger () {
+  const open = new Map()                  // method + URL -> [{t0, type}], oldest first
+  const key = (method, url) => `${method} ${url}`
+  const take = (k) => {
+    const q = open.get(k)
+    const e = q && q.length ? q.shift() : null
+    if (q && !q.length) open.delete(k)
+    return e
+  }
+  let ended = false                       // the session's end: unfinished() reported the rest
+  return {
+    started (method, url, t, resourceType) {
+      if (ended) return
+      const k = key(method, url)
+      if (!open.has(k)) open.set(k, [])
+      open.get(k).push({ t0: t, type: resourceType })
+    },
+    finished (method, url) { take(key(method, url)) },
+    // the point for a failed request (one whose start was never seen ran 0
+    // ms); null after the session's end: closing the page aborts what is
+    // still open, and unfinished() already reported it as never completed
+    failed (method, url, t, error, resourceType) {
+      if (ended) return null
+      const e = take(key(method, url))
+      return ['browser_request_incomplete_ms', e ? t - e.t0 : 0,
+        Object.assign(requestTags(url, e ? e.type : resourceType), { outcome: 'failed', error: error || 'unknown' })]
+    },
+    // every request still open at `t` (the session's end): never completed
+    unfinished (t) {
+      ended = true
+      const out = []
+      for (const [k, q] of open) {
+        const url = k.slice(k.indexOf(' ') + 1)
+        for (const e of q) {
+          out.push(['browser_request_incomplete_ms', t - e.t0,
+            Object.assign(requestTags(url, e.type), { outcome: 'never_completed', error: '' })])
+        }
+      }
+      open.clear()
+      return out
+    },
+    size () { let n = 0; for (const q of open.values()) n += q.length; return n },
+  }
+}
+
 // Is the page loaded at `now`? Self-contained: browser.js sends its source
 // into the page (declared WITHOUT `export`: k6's goja keeps the keyword in
 // Function.prototype.toString, which the page cannot parse; exported below). arg = {path, quiet}; path null = the sign-in arrival, which
