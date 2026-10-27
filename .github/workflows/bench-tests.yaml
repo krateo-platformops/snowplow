@@ -41,7 +41,7 @@ jobs:
           node-version: "22"
 
       - name: Install the bench's Python dependencies
-        run: python -m pip install -r requirements.txt pyyaml
+        run: python -m pip install -r requirements.txt pyyaml jsonschema
 
       - name: Docker is there (the k6 / Chrome tests skip without it)
         run: docker info
