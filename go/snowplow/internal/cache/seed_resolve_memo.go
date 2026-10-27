@@ -122,6 +122,10 @@ type seedMemoValue struct {
 	// index-aligned with Deps, snapshotted AFTER the producer's resolve returned
 	// (its commit ran inside it). nil = replay plain.
 	Narrow []EdgeNarrowState
+	// Effects (#912 N1) is what the producing resolve recorded on the Put-gate
+	// sinks (put_gate_effects.go). A hit replays it onto the hitter's sinks, so a
+	// memo-served body is judged at every Put site exactly as the producer's was.
+	Effects PutGateEffects
 }
 
 // SeedResolveMemo memoizes the resolved output of a heavy RESTAction across the
@@ -292,17 +296,18 @@ func (mo *SeedResolveMemo) Load(key string) (map[string]any, []DepKey, uint64, b
 // LoadLayered is Load plus the raKey versions the producing resolve sliced (#406),
 // read off the SAME value as the body, deps and stamp.
 func (mo *SeedResolveMemo) LoadLayered(key string) (map[string]any, []DepKey, uint64, LayeredSources, bool) {
-	body, deps, _, stamp, layers, ok := mo.LoadLayeredWithStates(key, "")
+	body, deps, _, stamp, layers, _, ok := mo.LoadLayeredWithStates(key, "")
 	return body, deps, stamp, layers, ok
 }
 
 // LoadLayeredWithStates is LoadLayered plus the producer's per-edge interest
-// states (#765 B), read off the SAME value. consumer is the L1 key the hitting
+// states (#765 B) and its Put-gate effects (#912 N1: the caller replays them),
+// read off the SAME value. consumer is the L1 key the hitting
 // resolve populates: a hit links the entry to it (addConsumerLocked), so the
 // entry lives while any L1 key it served does. "" links nothing.
-func (mo *SeedResolveMemo) LoadLayeredWithStates(key, consumer string) (map[string]any, []DepKey, []EdgeNarrowState, uint64, LayeredSources, bool) {
+func (mo *SeedResolveMemo) LoadLayeredWithStates(key, consumer string) (map[string]any, []DepKey, []EdgeNarrowState, uint64, LayeredSources, PutGateEffects, bool) {
 	if mo == nil {
-		return nil, nil, nil, 0, nil, false
+		return nil, nil, nil, 0, nil, PutGateEffects{}, false
 	}
 	drainResolveMemoBucketGone()
 	mo.mu.Lock()
@@ -310,7 +315,7 @@ func (mo *SeedResolveMemo) LoadLayeredWithStates(key, consumer string) (map[stri
 	if val == nil {
 		mo.misses++
 		mo.mu.Unlock()
-		return nil, nil, nil, 0, nil, false
+		return nil, nil, nil, 0, nil, PutGateEffects{}, false
 	}
 	if seedMemoDepsMovedSince(val.Deps, val.Stamp) {
 		mo.misses++
@@ -318,7 +323,7 @@ func (mo *SeedResolveMemo) LoadLayeredWithStates(key, consumer string) (map[stri
 		mo.removeLocked(key, val)
 		mo.mu.Unlock()
 		resolveMemoDroppedStaleTotal.Add(1)
-		return nil, nil, nil, 0, nil, false
+		return nil, nil, nil, 0, nil, PutGateEffects{}, false
 	}
 	mo.hits++
 	// The hit is served either way: the body is valid for this caller. The link
@@ -336,11 +341,11 @@ func (mo *SeedResolveMemo) LoadLayeredWithStates(key, consumer string) (map[stri
 			mo.removeLocked(key, val)
 		}
 		mo.mu.Unlock()
-		return nil, nil, nil, 0, nil, false
+		return nil, nil, nil, 0, nil, PutGateEffects{}, false
 	}
 	// Deps is returned as a slice-header copy — the caller only reads it to
 	// replay edges; the underlying DepKeys are immutable value structs.
-	return body, val.Deps, val.Narrow, val.Stamp, val.Layers, true
+	return body, val.Deps, val.Narrow, val.Stamp, val.Layers, val.Effects, true
 }
 
 // decodeMemoBody is the hit's one decode: encoding/json into a map, exactly as
@@ -389,11 +394,13 @@ func (mo *SeedResolveMemo) Store(key string, encoded []byte, deps []DepKey, stam
 // StoreLayered is Store plus the raKey versions the producing resolve sliced (#406).
 // Same monotone-in-stamp replacement as Store.
 func (mo *SeedResolveMemo) StoreLayered(key string, encoded []byte, deps []DepKey, stamp uint64, layers LayeredSources) {
-	mo.StoreLayeredWithStates(key, "", encoded, deps, nil, stamp, layers)
+	mo.StoreLayeredWithStates(key, "", encoded, deps, nil, stamp, layers, PutGateEffects{})
 }
 
 // StoreLayeredWithStates is StoreLayered plus the producer's per-edge interest
-// states (#765 B), index-aligned with deps.
+// states (#765 B), index-aligned with deps, and its Put-gate effects (#912 N1:
+// what the producing resolve recorded on the Put-gate sinks; every hit replays
+// them).
 //
 // #883 — an entry whose deps ALREADY moved past its stamp is removed right after
 // it is stored. The check must follow the insert, not precede it: a dep event
@@ -405,12 +412,12 @@ func (mo *SeedResolveMemo) StoreLayered(key string, encoded []byte, deps []DepKe
 // consumer is the producer's L1 key: the entry is linked to it, and to every
 // hitter's (LoadLayeredWithStates), and lives while any of them is still in the
 // resolved cache (addConsumerLocked). "" links nothing.
-func (mo *SeedResolveMemo) StoreLayeredWithStates(key, consumer string, encoded []byte, deps []DepKey, states []EdgeNarrowState, stamp uint64, layers LayeredSources) {
+func (mo *SeedResolveMemo) StoreLayeredWithStates(key, consumer string, encoded []byte, deps []DepKey, states []EdgeNarrowState, stamp uint64, layers LayeredSources, effects PutGateEffects) {
 	if mo == nil {
 		return
 	}
 	drainResolveMemoBucketGone()
-	nv := &seedMemoValue{Body: encoded, Deps: deps, Stamp: stamp, Layers: layers, Narrow: states}
+	nv := &seedMemoValue{Body: encoded, Deps: deps, Stamp: stamp, Layers: layers, Narrow: states, Effects: effects}
 	mo.mu.Lock()
 	if cur := mo.m[key]; cur != nil {
 		if cur.Stamp >= stamp {

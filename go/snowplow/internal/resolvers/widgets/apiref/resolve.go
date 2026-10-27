@@ -325,6 +325,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// #398 — the producing resolve's own sensitive-read sink (a child: every bump
 	// still reaches the caller's sink, so the caller's Put declines as before).
 	var memoSensitive *cache.SensitiveTouchedSink
+	// #912 N1 — the producing resolve's own Put-gate sinks (children: every bump
+	// still reaches the caller's sinks), so the memo stores what it recorded and
+	// a hit replays it.
+	var memoEffects *cache.PutGateCapture
 	if memo != nil {
 		username, groups := identityForMemo(ctx)
 		memoKey = memo.Key(opts.ApiRef.Namespace, opts.ApiRef.Name,
@@ -334,7 +338,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// after the body was produced but before THIS resolve's entry is
 		// invisible to this resolve's own #375 Put-check, so a stale entry is a
 		// MISS here: fall through, resolve fresh, and storeMemo replaces it.
-		if body, deps, states, stamp, layers, ok := memo.LoadLayeredWithStates(memoKey, l1Key); ok {
+		if body, deps, states, stamp, layers, effects, ok := memo.LoadLayeredWithStates(memoKey, l1Key); ok {
+			// #912 N1 — a hit is indistinguishable from the resolve it replaces:
+			// replay what the producer recorded on the Put-gate sinks (stage
+			// errors, per-identity forbiddens, external touches and the declared-
+			// write mark, UAF refilters) onto THIS caller's sinks, so every Put rule
+			// judges the memo-served body exactly as it judged the producer's.
+			effects.Replay(ctx)
 			// #277 / edge-3: replay the deps captured when this body was first
 			// produced onto THIS widget's L1 key, so a memo-served widget cell
 			// carries the same backing-GVR edges a real resolve would have
@@ -374,6 +384,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// sensitive read is never STORED in the memo (which also keeps the Secret
 		// out of the per-pass memo itself); every sibling re-resolves live.
 		ctx, memoSensitive = cache.WithSensitiveTouchedSink(ctx)
+		ctx, memoEffects = cache.WithPutGateEffectsCapture(ctx)
 	}
 
 	// storeMemo stores the resolved body ENCODED (#883 F4), closes the edge-3
@@ -418,7 +429,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			}
 			encoded = b
 		}
-		memo.StoreLayeredWithStates(memoKey, l1Key, encoded, deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark))
+		memo.StoreLayeredWithStates(memoKey, l1Key, encoded, deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark),
+			memoEffects.Effects())
 	}
 
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef

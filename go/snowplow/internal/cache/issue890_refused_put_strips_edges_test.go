@@ -76,7 +76,7 @@ func TestIssue890_RefusedPutOfAnEvictedCellLeavesNoEdges(t *testing.T) {
 			d.OnUpdate(gvr883Other, "ns-other", "x")                                         // 3. drain
 			record883(t, d, k, dep)                                                          // 4. the in-flight resolve records again
 			m.StoreLayeredWithStates("memo-orphan", k, memoBody(map[string]any{"v": "new"}), // 5.
-				[]DepKey{dep}, nil, DepGenEpochNow(), nil)
+				[]DepKey{dep}, nil, DepGenEpochNow(), nil, PutGateEffects{})
 			if !d.hasEdges(k) || len(memoKeys883(m)) != 1 {
 				t.Fatalf("harness: before the write-back K must have edges and a linked memo entry (edges=%v memo=%v)", d.hasEdges(k), memoKeys883(m))
 			}

@@ -129,8 +129,12 @@ var cacheAllow443 = map[string]cacheClass443{
 	// --- unreachable under the flag -----------------------------------------
 	"DepTracker.ReplayEdgesAsOfWithStates":   unreachableInert443, // seed-memo hit only (SeedResolveMemo is installed by seeds); delegates to the gated ReplayEdgesWithStates
 	"SeedResolveMemo.StoreLayeredWithStates": unreachableInert443, // memo installed only by seeds, never on a live/inline ctx
-	"RegisterClusterListKey":                 unreachableInert443, // after a PutIfGen that refuses under the flag
-	"ResourceWatcher.ConfirmResourceType":    unreachableInert443, // only when EnsureResourceTypeFor reported added=true (never under the flag)
+	// #912 N1 — the memo's Put-gate effects capture / replay: only under a
+	// memo (seeds and the refresher), never on a live/inline ctx.
+	"WithPutGateEffectsCapture": unreachableInert443, "PutGateCapture.Effects": unreachableInert443,
+	"PutGateEffects.Replay":               unreachableInert443,
+	"RegisterClusterListKey":              unreachableInert443, // after a PutIfGen that refuses under the flag
+	"ResourceWatcher.ConfirmResourceType": unreachableInert443, // only when EnsureResourceTypeFor reported added=true (never under the flag)
 	// via the package-level discoverGroupResourcesFn seam, invoked only inside
 	// lazyRegisterInnerCallPaths (returns at its head under the flag, (c)).
 	"DiscoverGroupResources": unreachableInert443,

@@ -140,7 +140,7 @@ func TestIssue890_DeclinedResolveReleasesItsEdges(t *testing.T) {
 	const cold = "L1_890_declined"
 	ctx := WithL1KeyContext(context.Background(), cold)
 	d.Record(ctx, cold, dep.GVR, dep.Namespace, dep.Name)
-	m.StoreLayeredWithStates("memo-declined", cold, memoBody(map[string]any{"x": 1.0}), []DepKey{dep}, nil, DepGenEpochNow(), nil)
+	m.StoreLayeredWithStates("memo-declined", cold, memoBody(map[string]any{"x": 1.0}), []DepKey{dep}, nil, DepGenEpochNow(), nil, PutGateEffects{})
 	// ... the Put gate declines: no write.
 	d.ReleaseUnstored(context.Background(), cold)
 	if d.hasEdges(cold) {

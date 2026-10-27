@@ -54,12 +54,12 @@ func TestIssue883_MemoNeverOutgrowsLiveServableKeys(t *testing.T) {
 			body := memoBody(map[string]any{"u": float64(u), "c": float64(c)})
 			if c%2 == 0 { // a cell with its own RESTAction tuple
 				key := fmt.Sprintf("memo-u%d-c%d", u, c)
-				m.StoreLayeredWithStates(key, l1, body, []DepKey{dep}, nil, DepGenEpochNow(), nil)
+				m.StoreLayeredWithStates(key, l1, body, []DepKey{dep}, nil, DepGenEpochNow(), nil, PutGateEffects{})
 				link(key, l1)
-			} else if _, _, _, _, _, ok := m.LoadLayeredWithStates(shared, l1); ok {
+			} else if _, _, _, _, _, _, ok := m.LoadLayeredWithStates(shared, l1); ok {
 				link(shared, l1) // a sibling widget hits the identity's shared tuple
 			} else {
-				m.StoreLayeredWithStates(shared, l1, body, []DepKey{dep}, nil, DepGenEpochNow(), nil)
+				m.StoreLayeredWithStates(shared, l1, body, []DepKey{dep}, nil, DepGenEpochNow(), nil, PutGateEffects{})
 				link(shared, l1)
 			}
 			store.Put(l1, &ResolvedEntry{RawJSON: body})
@@ -120,16 +120,16 @@ func TestIssue883_MemoLinkToAnEvictedKeyDoesNotKeepAnEntry(t *testing.T) {
 
 	record883(t, d, "L1-gone", dep)
 	d.RemoveL1Key("L1-gone") // evicted before the producer's Store lands
-	m.StoreLayeredWithStates("memo-ghost", "L1-gone", memoBody(map[string]any{"x": 1.0}), []DepKey{dep}, nil, DepGenEpochNow(), nil)
+	m.StoreLayeredWithStates("memo-ghost", "L1-gone", memoBody(map[string]any{"x": 1.0}), []DepKey{dep}, nil, DepGenEpochNow(), nil, PutGateEffects{})
 	if keys := memoKeys883(m); len(keys) != 0 {
 		t.Fatalf("#883 RED: an entry produced for an already-evicted L1 key was kept: %v", keys)
 	}
 
 	record883(t, d, "L1-live", dep)
-	m.StoreLayeredWithStates("memo-shared", "L1-live", memoBody(map[string]any{"x": 2.0}), []DepKey{dep}, nil, DepGenEpochNow(), nil)
+	m.StoreLayeredWithStates("memo-shared", "L1-live", memoBody(map[string]any{"x": 2.0}), []DepKey{dep}, nil, DepGenEpochNow(), nil, PutGateEffects{})
 	record883(t, d, "L1-late", dep)
 	d.RemoveL1Key("L1-late")
-	if _, _, _, _, _, ok := m.LoadLayeredWithStates("memo-shared", "L1-late"); !ok {
+	if _, _, _, _, _, _, ok := m.LoadLayeredWithStates("memo-shared", "L1-late"); !ok {
 		t.Fatal("a live entry must still serve the hit")
 	}
 	d.RemoveL1Key("L1-live")
