@@ -9,15 +9,16 @@
 // keeps applying watch events, so they need a real watch and a real apiserver
 // serving LIST from its watch cache while writes land.
 //
-//   - #872: high churn (3,000 objects, ~500 patches/s), fast reads. Before
-//     #872 this arm measured 63-126 published lost updates per 5 passes, 100%
-//     of them with the store AHEAD of the LIST and 0 really lost.
-//   - #918: the bench run-16 shape. About 1,000 objects of a larger GVR change
-//     once every 20 s (50 patches/s), with the metadata client at its default
-//     rate. Before #918 the forced pass re-read its candidates at 5 reads/s and
-//     compared after the whole sweep, which outlasted the objects' update
-//     interval, and published lost updates (run 16: 264 of 379, one repair).
-//     Now every candidate is ordered against the LIST's own revisions.
+//   - #872: high churn (3,000 objects, ~500 patches/s). Before #872 this arm
+//     measured 63-126 published lost updates per 5 passes, 100% of them with
+//     the store AHEAD of the LIST and 0 really lost.
+//   - #918: bench run 16's churn rate. About 1,000 objects of a larger GVR
+//     change once every 20 s (50 patches/s). Before #918 the forced pass
+//     re-read its candidates at 5 reads/s and compared after the whole sweep,
+//     which outlasted the objects' update interval, and published lost
+//     updates (run 16: 264 of 379, one repair). Now every candidate is ordered
+//     against the LIST's own revisions, with no re-read, so the client's rate
+//     no longer matters and the arm uses the same client as the other.
 //
 // Both arms report their numbers to the CI job's step summary (kChurnReport),
 // so they are visible without -v.
@@ -64,7 +65,7 @@ func TestStoreVerification_Kind_ChurnPublishesNoDivergence(t *testing.T) {
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cfg := kChurnCluster(t)
 	t.Run("872_high_churn_fast_reads", func(t *testing.T) { k872Arm(t, cfg) })
-	t.Run("918_run16_shape_slow_reads", func(t *testing.T) { k918Arm(t, cfg) })
+	t.Run("918_churn_50_per_second", func(t *testing.T) { k918Arm(t, cfg) })
 }
 
 // kChurnCluster creates this process's kind cluster and the namespaces both
@@ -320,25 +321,22 @@ func k872Arm(t *testing.T, cfg *rest.Config) {
 }
 
 const (
-	// The run-16 shape (#918): 1,000 objects of a larger GVR change round-robin
-	// at 50 patches/s, each one every 20 s, and the metadata client runs at
-	// client-go's default rate, as the pod's in-cluster client does (#920).
-	// The forced pass no longer re-reads anything, so neither the LIST's size
-	// nor the client's rate decides a verdict any more; the GVR is sized to
-	// what the shape needs and no more (F5 of the #923 review).
+	// Bench run 16's churn (#918): 1,000 objects of a larger GVR change
+	// round-robin at 50 patches/s, each one every 20 s. The forced pass no
+	// longer re-reads anything, so neither the LIST's size nor the client's
+	// rate decides a verdict; the GVR is sized to what the churn needs and no
+	// more (F5 of the #923 review).
 	k918Objects = 5000
 	k918Churned = 1000
 	k918Rate    = 50
 	k918Passes  = 3
 )
 
-// k918Arm — the run-16 shape.
+// k918Arm — run 16's churn rate.
 func k918Arm(t *testing.T, cfg *rest.Config) {
 	ctx := context.Background()
 	gvr := kChurnSeed(t, cfg, "churn918s", "Churn918", k918Objects, 0)
-	metaCfg := rest.CopyConfig(cfg)
-	metaCfg.QPS, metaCfg.Burst = 0, 0 // client-go's default: 5/s, burst 10
-	rw := kChurnWatcher(t, cfg, metaCfg, gvr)
+	rw := kChurnWatcher(t, cfg, cfg, gvr)
 	patched, stop := kChurn(t, cfg, gvr, k918Rate, func(n int) int { return n % k918Churned })
 	time.Sleep(5 * time.Second) // steady churn before the first pass
 

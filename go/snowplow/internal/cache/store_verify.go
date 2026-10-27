@@ -95,6 +95,7 @@ package cache
 import (
 	"context"
 	"log/slog"
+	"math"
 	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -290,7 +291,9 @@ func compareStore(idx clientcache.Indexer, log *deliveryLog, upstream map[string
 		return reportOf(len(upstream), 0, nil)
 	}
 	pos := positionView{applied: idx.LastStoreSyncResourceVersion(), always: true}
-	t := judge{idx: idx, log: log, pos: pos, receivedMark: mark}.sweep(upstream, listRV, candidates)
+	// A tombstone's pass generation means nothing here (no pass took this
+	// read), so none counts as "after the read".
+	t := judge{idx: idx, log: log, pos: pos, receivedMark: mark}.sweep(upstream, listRV, math.MaxUint64, candidates, false)
 	return reportOf(len(upstream), len(candidates), t.lost)
 }
 

@@ -33,6 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
 	"k8s.io/client-go/metadata"
 	clientcache "k8s.io/client-go/tools/cache"
 )
@@ -103,6 +105,7 @@ type j9Client struct {
 	listRV  string
 	asked   string
 	current map[string]j9Object
+	listErr error
 }
 
 // setCurrent records o as the apiserver's current state for a GET.
@@ -148,6 +151,9 @@ func (r *j9Resource) List(_ context.Context, opts metav1.ListOptions) (*metav1.P
 	}
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
+	if r.c.listErr != nil {
+		return nil, r.c.listErr
+	}
 	out := &metav1.PartialObjectMetadataList{}
 	out.ResourceVersion = r.c.listRV
 	for _, o := range r.c.list {
@@ -477,13 +483,16 @@ func TestForcedPass918_WhollyDivergentStore_GoesStraightToRepair(t *testing.T) {
 	}
 }
 
-// TestForcedPass918_878_ReceivedNotYetApplied_IsNotALoss — #878, the store
-// BEHIND the read. The reflector has received the read's state and the store
-// has not applied it. Recorded as received (the transform ran), not applied
-// (never queued here), its rv past the store's applied position.
+// TestForcedPass918_878_ReceivedNotYetApplied_IsHeldUntilApplied — #878, the
+// store BEHIND the read. The reflector has received the read's state and the
+// store has not applied it (the transform ran; the object was never queued
+// here). Not a loss: the key is held PENDING until the apply lands, not
+// cleared, so a delivery the queue then drops is still judged (#923 review
+// L1). Here the apply lands — the watch delivers it for real — and the key
+// resolves as received.
 //
 // RED before #918: the store alone was compared and the key published.
-func TestForcedPass918_878_ReceivedNotYetApplied_IsNotALoss(t *testing.T) {
+func TestForcedPass918_878_ReceivedNotYetApplied_IsHeldUntilApplied(t *testing.T) {
 	rw, cli := j9Setup(t, repairGVR, true, ja1)
 	cli.answer("5002", ja2, jclock)
 	cli.duringList = func() { j9Transformed(t, rw, repairGVR, ja2) }
@@ -496,6 +505,17 @@ func TestForcedPass918_878_ReceivedNotYetApplied_IsNotALoss(t *testing.T) {
 	}
 	if got := storeReceivedTotal.Load(); got != 1 {
 		t.Errorf("store_divergence_received_total = %d, want 1", got)
+	}
+	if got := j9Log(t, rw, repairGVR).pendingCount(); got != 1 {
+		t.Fatalf("L1 RED: a received, unapplied key is not held pending (%d pending)", got)
+	}
+	j9Deliver(t, rw, repairGVR, jmod(ja2))
+	j9WaitFor(t, "the held key resolving", func() bool { return storePendingKeys.Load() == 0 })
+	if got := storePendingResolvedReceivedTotal.Load(); got != 1 {
+		t.Errorf("store_divergence_pending_resolved_received_total = %d, want 1", got)
+	}
+	if got := j9Published(); got != 0 {
+		t.Errorf("the applied delivery was published as %d lost update(s)", got)
 	}
 }
 
@@ -539,8 +559,8 @@ func TestForcedPass918_PendingKey_ClearedByTheNextAppliedEvent(t *testing.T) {
 			if got := j9Published(); got != 0 {
 				t.Fatalf("a pending key was published as %d lost update(s)", got)
 			}
-			if row, _ := verificationRowFor(origin.gvr); !row.reverifyFirst {
-				t.Errorf("a pass that left a key pending must put its GVR at the front of the walker")
+			if row, _ := verificationRowFor(origin.gvr); !row.hasPending {
+				t.Errorf("a pass that left a key pending must flag its GVR for the walker")
 			}
 			// The watch catches up: the read's own state is delivered.
 			j9Deliver(t, rw, origin.gvr, jmod(ja2))
@@ -550,6 +570,11 @@ func TestForcedPass918_PendingKey_ClearedByTheNextAppliedEvent(t *testing.T) {
 			}
 			if got := storePendingResolvedLostTotal.Load() + j9Published(); got != 0 {
 				t.Fatalf("a key the watch caught up with was published as lost (%d)", got)
+			}
+			// H2 — the flag goes with the keys: the walker must not re-LIST a
+			// GVR that has nothing left to decide.
+			if row, _ := verificationRowFor(origin.gvr); row.hasPending {
+				t.Errorf("H2 RED: the GVR is still flagged after its last pending key resolved")
 			}
 		})
 	}
@@ -597,8 +622,8 @@ func TestForcedPass918_PendingKey_ResolvedLostByAnAppliedEventPastIt(t *testing.
 // moves the store's position past the read, and nothing else happens on the
 // GVR. client-go v0.36.5 gives a bookmark no callback
 // (thread_safe_store.go:447-458, controller.go:279), so nothing re-judges the
-// key until the GVR's next forced pass — which the walker takes first. That
-// pass decides it: lost.
+// key until the GVR's next forced pass — which the walker takes next, and
+// which judges the key against its OWN read before taking its own: lost.
 func TestForcedPass918_PendingKey_QuietGVR_ResolvedByTheNextPass(t *testing.T) {
 	for _, origin := range []struct {
 		name  string
@@ -612,6 +637,9 @@ func TestForcedPass918_PendingKey_QuietGVR_ResolvedByTheNextPass(t *testing.T) {
 			if got := storePendingKeys.Load(); got != 1 {
 				t.Fatalf("precondition: %d pending keys, want 1", got)
 			}
+			if got := PendingByGVRSnapshot()[origin.gvr.String()]; got != 1 {
+				t.Errorf("L3: the per-GVR breakdown shows %d pending on %s, want 1", got, origin.gvr)
+			}
 			// The resolver judges once when the key is held; let it, so the
 			// bookmark below is the only thing that changes afterwards.
 			dl := j9Log(t, rw, origin.gvr)
@@ -621,20 +649,117 @@ func TestForcedPass918_PendingKey_QuietGVR_ResolvedByTheNextPass(t *testing.T) {
 				t.Fatalf("the bookmark resolved the pending key (%d left); client-go v0.36.5 gives it no callback, so this arm no longer describes the code", got)
 			}
 			if got, _, ok := nextOverdueGVR(); !ok || got != origin.gvr {
-				t.Fatalf("#918 RED: the walker would take %v next, want %v (a pending key on it)", got, origin.gvr)
+				t.Fatalf("the walker would take %v next, want %v (a pending key on it)", got, origin.gvr)
 			}
-			cli.answer("5100", ja2, jclock)
+			cli.answer("5150", ja2, jclock) // the cluster moved on past the bookmark
 			forcedVerify(context.Background(), origin.gvr)
-			if got := storePendingSupersededTotal.Load(); got != 1 {
-				t.Errorf("store_divergence_pending_superseded_total = %d, want 1", got)
-			}
 			if got := j9Class("update"); got != 1 {
 				t.Fatalf("#918 RED: the next pass published %d lost updates, want 1", got)
+			}
+			if got := storePendingResolvedLostTotal.Load(); got != 1 {
+				t.Errorf("store_divergence_pending_resolved_lost_total = %d, want 1 (decided against its own read)", got)
 			}
 			if got := storePendingKeys.Load(); got != 0 {
 				t.Errorf("%d keys still pending after the deciding pass", got)
 			}
 		})
+	}
+}
+
+// TestForcedPass918_LostDeleteOnAQuietGVR_PublishedByTheNextPass — #923 review
+// H1. A real lost DELETE: the store still holds panel-b, which the apiserver
+// deleted, so every LIST lacks it and it is held to the LIST's own
+// resourceVersion — cluster-wide, moved on by every other resource — while
+// this GVR's position moves only on its own events and bookmarks. Each LIST
+// is taken after the cluster moved past the latest bookmark. The pending key
+// must be judged against its OWN read at the next pass: published at pass 2.
+//
+// RED before the fix: the next pass discarded the pending key unjudged and
+// held it again against its own, newer LIST, on every pass.
+func TestForcedPass918_LostDeleteOnAQuietGVR_PublishedByTheNextPass(t *testing.T) {
+	rw, cli := j9Setup(t, repairGVR, true, ja1, jb1)
+	dl := j9Log(t, rw, repairGVR)
+	rounds := []struct{ bookmark, listRV string }{
+		{"", "5002"},     // pass 1: the LIST is at 5002, the store at 4242
+		{"5100", "5150"}, // a bookmark at 5100; the cluster moved on, LIST at 5150
+		{"5200", "5250"},
+		{"5300", "5350"},
+	}
+	for i, r := range rounds {
+		if r.bookmark != "" {
+			j9Bookmark(t, rw, repairGVR, r.bookmark)
+		}
+		cli.answer(r.listRV, ja1, jclock) // panel-b is gone upstream
+		sweeps0 := dl.sweeps.Load()
+		forcedVerify(context.Background(), repairGVR)
+		if dl.pendingCount() > 0 {
+			j9WaitFor(t, "the resolver's first judgement", func() bool { return dl.sweeps.Load() > sweeps0 })
+		}
+		got := j9Class("delete")
+		switch {
+		case i == 0 && got != 0:
+			t.Fatalf("pass 1 published %d lost deletes while the store had not reached the read", got)
+		case i == 1 && got != 1:
+			t.Fatalf("H1 RED: pass %d published %d lost deletes, want 1 — the key pending since pass 1 was not judged against its own read", i+1, got)
+		case i > 1 && got < 1:
+			t.Fatalf("pass %d: the lost delete is no longer published", i+1)
+		}
+		// Later passes publish it again while the repair (queued, not run by
+		// this fixture) has not fixed the store: the divergence is still real.
+	}
+	if d := storeRepairQueueDepth(); d != 1 {
+		t.Errorf("store_repairs_pending = %d, want 1", d)
+	}
+}
+
+// TestForcedPass918_PendingKeyAge_SurvivesTheSupersedingPass — #923 review L3:
+// a key that stays pending pass after pass keeps the time it FIRST became
+// pending, so store_divergence_pending_oldest_age_seconds grows instead of
+// resetting at every pass.
+func TestForcedPass918_PendingKeyAge_SurvivesTheSupersedingPass(t *testing.T) {
+	rw, cli := j9Setup(t, repairGVR, true, ja1)
+	dl := j9Log(t, rw, repairGVR)
+	cli.answer("5002", ja2, jclock)
+	forcedVerify(context.Background(), repairGVR)
+	first := dl.oldestPending()
+	if first.IsZero() {
+		t.Fatalf("precondition: nothing pending after pass 1")
+	}
+	cli.answer("5003", ja3, jclock) // the store still has not caught up
+	forcedVerify(context.Background(), repairGVR)
+	if got := dl.pendingCount(); got != 1 {
+		t.Fatalf("precondition: %d pending after pass 2, want the same key again", got)
+	}
+	if again := dl.oldestPending(); !again.Equal(first) {
+		t.Errorf("L3 RED: the superseding pass reset the key's pending time (%v -> %v)", first, again)
+	}
+	if storePendingSupersededTotal.Load() != 1 {
+		t.Errorf("store_divergence_pending_superseded_total = %d, want 1", storePendingSupersededTotal.Load())
+	}
+	if pendingOldestAgeSeconds() <= 0 {
+		t.Errorf("store_divergence_pending_oldest_age_seconds is %v with a key pending", pendingOldestAgeSeconds())
+	}
+}
+
+// TestForcedPass918_SkippedPass_KeepsTheKeysAndTheFlag — #923 review L4: a
+// pass that cannot take its read keeps what is pending, and the flag with it.
+func TestForcedPass918_SkippedPass_KeepsTheKeysAndTheFlag(t *testing.T) {
+	rw, cli := j9Setup(t, repairGVR, true, ja1)
+	cli.answer("5002", ja2, jclock)
+	forcedVerify(context.Background(), repairGVR)
+	dl := j9Log(t, rw, repairGVR)
+	if dl.pendingCount() != 1 {
+		t.Fatalf("precondition: nothing pending")
+	}
+	cli.mu.Lock()
+	cli.listErr = errors.New("the apiserver is unavailable")
+	cli.mu.Unlock()
+	forcedVerify(context.Background(), repairGVR)
+	if got := dl.pendingCount(); got != 1 {
+		t.Errorf("L4 RED: a pass that could not LIST dropped the pending key (%d left)", got)
+	}
+	if row, _ := verificationRowFor(repairGVR); !row.hasPending {
+		t.Errorf("L4 RED: a pass that could not LIST cleared the flag while the key stays pending")
 	}
 }
 
@@ -654,11 +779,12 @@ func TestForcedPass918_ListCarriesThePublishedPosition(t *testing.T) {
 	}
 }
 
-// TestForcedPass918_RelistTombstone_IsUndecidedAndReverified — a relist during
-// the pass deletes panel-b with a synthesized tombstone, which says nothing of
-// when. The LIST still has panel-b: undecided, not published, and the GVR goes
-// to the front of the walker so a pass over the relisted store decides it.
-func TestForcedPass918_RelistTombstone_IsUndecidedAndReverified(t *testing.T) {
+// TestForcedPass918_RelistTombstone_HeldAndDecidedByTheNextPass — a relist
+// during the pass deletes panel-b with a synthesized tombstone, which says
+// nothing of when. The LIST still has panel-b: held pending, not published,
+// and the GVR flagged. The NEXT pass decides it (#923 review L6): its read
+// comes after the relist, so the tombstone is no longer "after the read".
+func TestForcedPass918_RelistTombstone_HeldAndDecidedByTheNextPass(t *testing.T) {
 	rw, cli := j9Setup(t, repairGVR, true, ja1, jb1)
 	dyn := rw.dyn
 	cli.answer("5001", ja1, jb1, jclock)
@@ -675,23 +801,39 @@ func TestForcedPass918_RelistTombstone_IsUndecidedAndReverified(t *testing.T) {
 	if got := j9Published(); got != 0 {
 		t.Fatalf("a relist deletion during the pass published %d divergence(s)", got)
 	}
-	if got := storeUndecidedTotal.Load(); got < 1 {
-		t.Errorf("store_divergence_undecided_total = %d, want the tombstoned key", got)
+	if got := j9Log(t, rw, repairGVR).pendingCount(); got != 1 {
+		t.Fatalf("the tombstoned key is not held pending (%d pending)", got)
 	}
-	if row, _ := verificationRowFor(repairGVR); !row.reverifyFirst {
-		t.Errorf("an undecided tombstone must put the GVR at the front of the walker")
+	if row, _ := verificationRowFor(repairGVR); !row.hasPending {
+		t.Errorf("a held tombstone must flag the GVR for the walker")
+	}
+	// The next pass: the apiserver no longer has panel-b either.
+	cli.duringList = nil
+	cli.answer(j9Position(t, rw, repairGVR), ja1, jclock)
+	forcedVerify(context.Background(), repairGVR)
+	if got := j9Log(t, rw, repairGVR).pendingCount(); got != 0 {
+		t.Errorf("L6 RED: the tombstoned key is still pending after the next pass (%d)", got)
+	}
+	if got := j9Published(); got != 0 {
+		t.Errorf("the next pass published %d divergence(s) for a key that agrees", got)
+	}
+	if row, _ := verificationRowFor(repairGVR); row.hasPending {
+		t.Errorf("the flag outlived the tombstoned key")
 	}
 }
 
-// TestForcedPass918_NoDeliveryRecord_StillVerifies — #875 residual B: a
-// re-registered shared-factory GVR has no record. The rule still orders the
-// store against the LIST: a real loss is published and the repair attempted,
-// and #244's factory-divergence age gets its input.
-func TestForcedPass918_NoDeliveryRecord_StillVerifies(t *testing.T) {
+// TestForcedPass918_NoTransform_StillVerifiesWithTheHandler — #875 residual B,
+// covered (#923 review L5): a re-registered shared-factory GVR gets its
+// started informer back and SetTransform refuses it, but the handler is still
+// installed, so the GVR has a log without the RECEIVED record. The rule orders
+// the store against the LIST: a real loss is published and the repair
+// attempted, #244's factory-divergence age gets its input, and applied
+// deletes reach its record.
+func TestForcedPass918_NoTransform_StillVerifiesWithTheHandler(t *testing.T) {
 	c3Setup(t)
 	resetVerificationForArm(t)
 	ctx := context.Background()
-	rw, _ := silentWatchClusterFor(t, factory875GVR, false, ja1.obj(factory875GVR))
+	rw, _ := silentWatchClusterFor(t, factory875GVR, false, ja1.obj(factory875GVR), jb1.obj(factory875GVR))
 	rw.RemoveResourceType(factory875GVR)
 	_, synced := rw.EnsureResourceType(factory875GVR)
 	select {
@@ -701,19 +843,25 @@ func TestForcedPass918_NoDeliveryRecord_StillVerifies(t *testing.T) {
 	}
 	rw.RefreshDiscovery(ctx)
 	rw.mu.RLock()
-	_, recorded := rw.deliveries[factory875GVR]
+	dl := rw.deliveries[factory875GVR]
 	rw.mu.RUnlock()
-	if recorded {
-		t.Fatalf("precondition: the re-registered GVR has a delivery record")
+	if dl == nil || dl.recording {
+		t.Fatalf("precondition: want a log without the RECEIVED record (log=%v)", dl)
 	}
 	rec := attachMetaClient(t, rw)
 	cli := &j9Client{inner: rec.inner, gvr: factory875GVR}
-	cli.answer("4242", j9Object{ja1.name, "4100", ja1.uid}) // changed before the store's position
+	// panel-a changed before the store's position: a real loss.
+	cli.answer("4242", j9Object{ja1.name, "4100", ja1.uid}, jb1)
 	rw.SetMetadataClient(cli)
 	unsupported0 := storeRepairUnsupportedTotal.Load()
 	forcedVerify(ctx, factory875GVR)
-	if lu, _, _, _ := divergenceCounts(verifySiteForced); lu != 1 {
-		t.Fatalf("published %d lost updates for a real loss, want 1", lu)
+	if lu, _, la, _ := divergenceCounts(verifySiteForced); lu != 1 || la != 0 {
+		t.Fatalf("published %d lost updates and %d lost adds, want the real update loss only", lu, la)
+	}
+	// The handler is the log's: an applied delete reaches its record.
+	dl.handler().OnDelete(j9Object{jb1.name, "5006", jb1.uid}.obj(factory875GVR))
+	if d, ok := dl.deleteFor(jb1.key()); !ok || d.rv != "5006" {
+		t.Errorf("L5: the handler-only log does not record an applied delete (%+v, %v)", d, ok)
 	}
 	if got := storeUnrecordedTotal.Load(); got != 1 {
 		t.Errorf("store_divergence_unrecorded_total = %d, want 1", got)
@@ -782,7 +930,10 @@ func TestJudge918_TheRule(t *testing.T) {
 		{name: "present in the read, store deleted it after", pos: "5009", delete: &appliedDelete{rv: "5006"}, read: j9Present(ja2), want: outcomeStoreAhead},
 		{name: "present in the read, store deleted it before: lost add", pos: "5009", delete: &appliedDelete{rv: "5001"}, read: j9Present(ja2), want: outcomeLost, class: classLostAdd},
 		{name: "present in the read, never in the store: lost add", pos: "5009", read: j9Present(ja2), want: outcomeLost, class: classLostAdd},
-		{name: "relist tombstone: undecided, reverify", pos: "5009", delete: &appliedDelete{tombstone: true}, read: j9Present(ja2), want: outcomeUndecided, reverify: true},
+		{name: "relist tombstone after the read: undecided, held", pos: "5009", delete: &appliedDelete{tombstone: true, gen: 1}, read: readState{present: true, id: ja2.id(), rev: ja2.rv, gen: 1}, want: outcomeUndecided, reverify: true},
+		{name: "relist tombstone before the read: decided (L6)", pos: "5009", delete: &appliedDelete{tombstone: true, gen: 1}, read: readState{present: true, id: ja2.id(), rev: ja2.rv, gen: 2}, want: outcomeLost, class: classLostAdd},
+		{name: "delete applied, handler not yet run: store ahead (H3)", pos: "5006", received: []j9Object{ja1del}, read: j9Present(ja2), want: outcomeStoreAhead},
+		{name: "older delivery applied, store lacks the key: lost add", pos: "5006", received: []j9Object{{ja1.name, "5001", ja1.uid}}, read: j9Present(ja2), want: outcomeLost, class: classLostAdd},
 		{name: "non-comparable versions: undecided", pos: "5009", store: []j9Object{{ja1.name, "abc", ja1.uid}}, read: j9Present(j9Object{ja1.name, "xyz", ja1.uid}), want: outcomeUndecided},
 		{name: "non-comparable position: undecided", pos: "p-9", store: []j9Object{ja1}, read: j9Present(ja2), want: outcomeUndecided},
 		{name: "non-comparable but equal: agrees", pos: "p-9", store: []j9Object{{ja1.name, "abc", ja1.uid}}, read: j9Present(j9Object{ja1.name, "abc", ja1.uid}), want: outcomeAgree},
@@ -815,15 +966,25 @@ func TestJudge918_EmptyPositionNeverPublishes(t *testing.T) {
 	idx, dl := j9Rule(t, "", ja1, jb1)
 	defer dl.close()
 	upstream := map[string]objIdentity{ja1.key(): ja2.id(), jb1.key(): {rv: "5003", uid: jb1.uid}}
-	rep, reverify := judgeForcedPass(repairGVR, idx, dl, upstream, "5009", diffStore(idx, upstream))
+	rep := judgeForcedPass(repairGVR, idx, dl, upstream, "5009", 0, diffStore(idx, upstream), nil)
 	if rep.total() != 0 {
 		t.Fatalf("an unknown store position published %d lost update(s)", rep.total())
 	}
 	if got := dl.pendingCount(); got != 2 {
 		t.Errorf("%d keys pending, want 2", got)
 	}
-	if !reverify {
-		t.Errorf("pending keys must put the GVR at the front of the walker")
+}
+
+// TestJudge918_PositionUnavailableIsLoud — #923 review L2: with AtomicFIFO
+// off the store reports no position and the forced pass can never publish;
+// the store_position_unavailable gauge says so.
+func TestJudge918_PositionUnavailableIsLoud(t *testing.T) {
+	if got := positionUnavailable(); got != 0 {
+		t.Fatalf("precondition: store_position_unavailable = %d with client-go's default gates", got)
+	}
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.AtomicFIFO, false)
+	if got := positionUnavailable(); got != 1 {
+		t.Errorf("L2 RED: store_position_unavailable = %d with AtomicFIFO off, want 1", got)
 	}
 }
 
@@ -935,6 +1096,24 @@ func TestDeliveryLog918_HandlerSeesAppliedDeliveries(t *testing.T) {
 	}
 }
 
+// TestDeliveryLog918_UnchangedRedeliveryIsNotRecorded — #923 review L8: a
+// relist re-delivers every object, and applies an unchanged one without
+// telling any handler. Such a delivery is identical to what the handler last
+// saw applied, so it is never recorded as received; a changed one is.
+func TestDeliveryLog918_UnchangedRedeliveryIsNotRecorded(t *testing.T) {
+	_, dl := j9Rule(t, "5002", ja1)
+	dl.handler().OnAdd(ja2.obj(repairGVR), false)
+	tf := dl.transform(nil)
+	_, _ = tf(ja2.obj(repairGVR))
+	if _, ok := dl.receivedFor(ja1.key()); ok {
+		t.Errorf("L8 RED: an unchanged re-delivery is recorded as received and not yet applied")
+	}
+	_, _ = tf(ja3.obj(repairGVR))
+	if r, ok := dl.receivedFor(ja1.key()); !ok || r.id != ja3.id() {
+		t.Errorf("a changed delivery is not recorded (%+v, %v)", r, ok)
+	}
+}
+
 // TestDeliveryLog918_TransformNeverBlocksOnInformerLocks — the transform runs
 // under the queue's lock and must take no informer lock (#875). Here the watch
 // delivers a stream of updates while other goroutines call the informer's
@@ -984,27 +1163,68 @@ func TestDeliveryLog918_TransformNeverBlocksOnInformerLocks(t *testing.T) {
 	})
 }
 
-// TestNextOverdueGVR918_ReverifyFirstGoesAhead — a GVR flagged by a pass that
-// left keys pending is taken before every overdue one, and the flag clears
-// when its pass starts.
-func TestNextOverdueGVR918_ReverifyFirstGoesAhead(t *testing.T) {
+// TestNextOverdueGVR918_FlaggedAndOverdueAlternate — owner ruling 2026-10-27
+// (#923 review H2): a GVR with pending keys is taken next, but the turn after
+// goes to the most overdue GVR, and so on. Two GVRs stay flagged across
+// passes while a third is overdue: the overdue one is served within one turn.
+func TestNextOverdueGVR918_FlaggedAndOverdueAlternate(t *testing.T) {
 	resetVerificationForArm(t)
-	overdue := schema.GroupVersionResource{Group: "a.krateo.io", Version: "v1", Resource: "overdues"}
-	fresh := schema.GroupVersionResource{Group: "b.krateo.io", Version: "v1", Resource: "freshes"}
+	f1 := schema.GroupVersionResource{Group: "a.krateo.io", Version: "v1", Resource: "flaggedones"}
+	f2 := schema.GroupVersionResource{Group: "b.krateo.io", Version: "v1", Resource: "flaggedtwos"}
+	over := schema.GroupVersionResource{Group: "c.krateo.io", Version: "v1", Resource: "overdues"}
+	now := time.Now()
 	storeVerify.mu.Lock()
-	storeVerify.gvrs[overdue] = &gvrVerification{epoch: time.Now().Add(-3 * maxVerificationAge())}
-	storeVerify.gvrs[fresh] = &gvrVerification{epoch: time.Now()}
+	storeVerify.gvrs[f1] = &gvrVerification{epoch: now}
+	storeVerify.gvrs[f2] = &gvrVerification{epoch: now}
+	storeVerify.gvrs[over] = &gvrVerification{epoch: now.Add(-3 * maxVerificationAge())}
 	storeVerify.mu.Unlock()
-	if g, _, _ := nextOverdueGVR(); g != overdue {
-		t.Fatalf("precondition: first pick %v, want %v", g, overdue)
+	setPendingFlag(f1, true)
+	setPendingFlag(f2, true)
+
+	var turns []schema.GroupVersionResource
+	for i := 0; i < 4; i++ {
+		g, _, ok := nextOverdueGVR()
+		if !ok {
+			t.Fatalf("turn %d: nothing picked", i+1)
+		}
+		turns = append(turns, g)
+		noteVerifyAttempt(g) // the pass runs; f1 and f2 stay flagged
 	}
-	markReverifyFirst(fresh)
-	if g, _, ok := nextOverdueGVR(); !ok || g != fresh {
-		t.Fatalf("#918 RED: picked %v, want the flagged %v ahead of the overdue one", g, fresh)
+	if turns[0] != f1 && turns[0] != f2 {
+		t.Errorf("turn 1 took %v, want a flagged GVR", turns[0])
 	}
-	noteVerifyAttempt(fresh)
-	if g, _, _ := nextOverdueGVR(); g != overdue {
-		t.Errorf("the flag did not clear when the pass started (picked %v)", g)
+	if turns[1] != over {
+		t.Errorf("H2 RED: turn 2 took %v, want the overdue %v after a flagged turn (turns: %v)", turns[1], over, turns)
+	}
+	if turns[2] != f1 && turns[2] != f2 {
+		t.Errorf("turn 3 took %v, want a flagged GVR again", turns[2])
+	}
+	seen := map[schema.GroupVersionResource]bool{}
+	for _, g := range turns {
+		seen[g] = true
+	}
+	if !seen[f1] || !seen[f2] {
+		t.Errorf("both flagged GVRs must get turns: %v", turns)
+	}
+}
+
+// TestNextOverdueGVR918_FlagGoesWithTheKeys — the flag is the pending set's:
+// cleared the moment it empties, by whatever empties it.
+func TestNextOverdueGVR918_FlagGoesWithTheKeys(t *testing.T) {
+	resetVerificationForArm(t)
+	gvr := schema.GroupVersionResource{Group: "a.krateo.io", Version: "v1", Resource: "flaggeds"}
+	over := schema.GroupVersionResource{Group: "b.krateo.io", Version: "v1", Resource: "overdues"}
+	storeVerify.mu.Lock()
+	storeVerify.gvrs[gvr] = &gvrVerification{epoch: time.Now()}
+	storeVerify.gvrs[over] = &gvrVerification{epoch: time.Now().Add(-3 * maxVerificationAge())}
+	storeVerify.mu.Unlock()
+	setPendingFlag(gvr, true)
+	if g, _, _ := nextOverdueGVR(); g != gvr {
+		t.Fatalf("precondition: picked %v, want the flagged %v", g, gvr)
+	}
+	setPendingFlag(gvr, false)
+	if g, _, _ := nextOverdueGVR(); g != over {
+		t.Errorf("an unflagged GVR inside its deadline was picked (%v)", g)
 	}
 }
 

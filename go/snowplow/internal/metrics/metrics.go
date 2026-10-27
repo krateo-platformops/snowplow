@@ -829,6 +829,12 @@ func registerInstruments(m metric.Meter, build string) error {
 	// --min-request-timeout. This gauge is the age of the oldest such unrepaired
 	// divergence: within the reconnect window = expected self-heal, beyond it =
 	// genuinely stuck.
+	storeDivergencePendingByGVR, err := m.Int64ObservableGauge(
+		"snowplow_store_divergence_pending_keys_by_gvr",
+		metric.WithDescription("Forced-pass candidates held PENDING right now, per GVR (#918): the per-GVR breakdown of snowplow_store_verification's store_divergence_pending_keys. Bounded by the GVR count. A GVR whose keys stay pending pass after pass is a watch not catching up; store_divergence_pending_oldest_age_seconds says for how long."))
+	if err != nil {
+		return err
+	}
 	storeFactoryDivergenceAge, err := m.Int64ObservableGauge(
 		"snowplow_store_factory_divergence_age_seconds",
 		metric.WithDescription("Age in seconds of the oldest unrepaired factory-built (shared-informer, !ownsInformer) GVR divergence — 0 when none. It self-heals on the reflector's next watch re-establishment, bounded by the apiserver --min-request-timeout (cluster-config-dependent); a value beyond that cadence is a genuinely stuck divergence, within it an expected passive self-heal (#244)."))
@@ -1137,6 +1143,10 @@ func registerInstruments(m metric.Meter, build string) error {
 
 		// --- #244: factory-built divergence age (bounded self-heal detector) ---
 		o.ObserveInt64(storeFactoryDivergenceAge, cache.FactoryDivergenceMaxAgeSeconds())
+		// --- #918: pending keys per GVR ---
+		for gvr, n := range cache.PendingByGVRSnapshot() {
+			o.ObserveInt64(storeDivergencePendingByGVR, n, metric.WithAttributes(attribute.String("gvr", gvr)))
+		}
 
 		// --- 1.12.4: build identity, constant 1 ---
 		o.ObserveInt64(buildInfo, 1,
@@ -1205,6 +1215,8 @@ func registerInstruments(m metric.Meter, build string) error {
 		movedRemarkTotal,
 		// --- #244 ---
 		storeFactoryDivergenceAge,
+		// --- #918 ---
+		storeDivergencePendingByGVR,
 		// --- #239: dirty-mark attribution ---
 		dirtyMarkAttributed, dirtyMarkEvents, dirtyMarkSubmits, dirtyMarkUnattributed,
 		// --- #479 1b / #603 PR-0 ---
