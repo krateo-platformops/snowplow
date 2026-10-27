@@ -680,7 +680,7 @@ def browser_request_spans(o: dict | None) -> list[tuple[float, float, bool, floa
 CLIENT_CANCEL = "net::ERR_ABORTED"
 
 
-def browser_incomplete_spans(o: dict | None) -> list[tuple[float, float, bool | None, float | None]]:
+def browser_incomplete_spans(o: dict | None) -> list[tuple[float, float, bool | None, float | None, str]]:
     """The browser's requests k6 never times (#919 N7, browser.js's ledger),
     as (start, end, not served, ms), by the witness's own definition — not
     served = failed, or no reply within the probe's timeout (judge_stretch):
@@ -698,7 +698,9 @@ def browser_incomplete_spans(o: dict | None) -> list[tuple[float, float, bool | 
                           unknown flight is no witness and is left out.
     A never-completed request that WAS answered (its response headers came:
     a live stream, /refreshes or /notifications, open by design) is served
-    and is not a witness of anything here."""
+    and is not a witness of anything here. Each span carries its CAUSE as a
+    fifth element — Chrome's errorText, or "never answered" — which
+    judge_stretch counts its not-served requests by."""
     if not o:
         return []
     out = []
@@ -707,13 +709,14 @@ def browser_incomplete_spans(o: dict | None) -> list[tuple[float, float, bool | 
         if t is None or v is None:
             continue
         if tg.get("outcome") == "failed":
-            out.append((t - v / 1000.0, t, None if tg.get("error") == CLIENT_CANCEL else True, v))
+            err = tg.get("error") or "unknown"
+            out.append((t - v / 1000.0, t, None if err == CLIENT_CANCEL else True, v, err))
         elif tg.get("outcome") == "never_completed" and tg.get("answered") == "no":
-            out.append((t - v / 1000.0, t, None, v))
+            out.append((t - v / 1000.0, t, None, v, "never answered"))
     for (_, tg), t in zip(o["points"].get("browser_request_failed_start_unseen", []),
                           (o.get("times") or {}).get("browser_request_failed_start_unseen") or []):
         if t is not None and tg.get("error") != CLIENT_CANCEL:
-            out.append((t, t, True, None))
+            out.append((t, t, True, None, f"{tg.get('error') or 'unknown'}, start unseen"))
     return out
 
 
@@ -760,6 +763,19 @@ def b_only_parts(o: dict, a_outages: list[dict]) -> list[tuple[float, float]]:
     return _minus(o["t0"], o["t1"], _union((x["t0"], x["t1"]) for x in a_outages))
 
 
+def witness_text(w: dict, tmo: float) -> str:
+    """judge_stretch's witness, said in the verdict: how many of B's
+    requests were in flight, per source, how many not served, and WHAT each
+    not-served one was (its cause: Chrome's errorText for the browser's
+    incomplete requests), so a FAIL names its cause."""
+    seen = (f"B's customers had {w['requests']} requests in flight in it ("
+            + ", ".join(f"{src} {c['requests']}" for src, c in w["by_source"].items())
+            + f"), {w['not_served']} not served (failed, or no reply within the probe's {tmo} s) ({w['rate']})")
+    causes = [f"{src}: " + ", ".join(f"{n} {c}" for c, n in sorted(x["not_served_by"].items()))
+              for src, x in w["by_source"].items() if x.get("not_served_by")]
+    return seen + (" — " + "; ".join(causes) if causes else "")
+
+
 def judge_stretch(parts: list[tuple[float, float]], customers: dict[str, list | None], timeout_s: float,
                   bar: float) -> dict:
     """ONE judgement of a stretch of B's time by B's customers — for a
@@ -780,21 +796,34 @@ def judge_stretch(parts: list[tuple[float, float]], customers: dict[str, list | 
     A request whose `failed` is None (browser_incomplete: cancelled by the
     page, or cut at the session's end) is a witness only once it outlasted
     `timeout_s` (not served); before that it is no witness: left out of the
-    count, reported as `no_witness`."""
+    count, reported as `no_witness`. A span may carry its cause as a fifth
+    element (browser_incomplete: Chrome's errorText); every source's
+    not-served requests are counted by cause (`not_served_by`), so a FAIL
+    names what failed: a span's own cause, else "failed" or "no reply within
+    the probe's timeout"."""
     if any(sp is None for sp in customers.values()):
         bad = sorted(k for k, sp in customers.items() if sp is None)
         return {"verdict": "unpaired", "k6": {"unpaired": bad}}
     by, n, k = {}, 0, 0
+    late = f"no reply within the probe's {timeout_s:g} s"
     for src, spans in sorted(customers.items()):
-        ov, nw = [], 0
-        for s0, t, f, ms in spans:
+        ov, nw, why = [], 0, {}
+        for sp in spans:
+            s0, t, f, ms = sp[:4]
             if not any(s0 < y and t > x for x, y in parts):
                 continue
             if f is None and not (ms is not None and ms > timeout_s * 1000):
                 nw += 1
                 continue
-            ov.append(bool(f) or ms > timeout_s * 1000)
-        by[src] = {"requests": len(ov), "not_served": sum(ov), **({"no_witness": nw} if nw else {})}
+            bad = bool(f) or ms > timeout_s * 1000
+            ov.append(bad)
+            if bad:
+                cause = sp[4] if len(sp) > 4 else ("failed" if f else late)
+                if f is None:
+                    cause = f"{cause}, outlasting the probe's {timeout_s:g} s"
+                why[cause] = why.get(cause, 0) + 1
+        by[src] = {"requests": len(ov), "not_served": sum(ov), **({"not_served_by": why} if why else {}),
+                   **({"no_witness": nw} if nw else {})}
         n, k = n + len(ov), k + sum(ov)
     w = {"requests": n, "not_served": k, "rate": round(k / n, 6) if n else None, "timeout_s": timeout_s,
          "by_source": by}
@@ -1170,10 +1199,7 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                                             f"{', '.join(j['k6']['unpaired'])} do not pair up: no witness"))
                     continue
                 w = j["k6"]
-                seen = (f"B's customers had {w['requests']} requests in flight in it ("
-                        + ", ".join(f"{src} {c['requests']}" for src, c in w["by_source"].items())
-                        + f"), {w['not_served']} not served (failed, or no reply within the probe's {tmo} s) "
-                          f"({w['rate']})")
+                seen = witness_text(w, tmo)
                 if j["verdict"] == "fail":
                     nr.append(dict(e, why=f"{e['why']}; {seen}: over the {th} bar, so B was not serving"))
                 elif j["verdict"] == "served":
