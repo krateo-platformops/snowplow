@@ -61,8 +61,6 @@ export const options = {
     browser_sse_opened: ['count>=0'],
     browser_page_timeouts: ['count>=0'],
     browser_widget_states: ['count>=0'],
-    browser_call_ms: ['count>=0'],
-    browser_request_incomplete_ms: ['count>=0'],
     bench_frame: ['count>=0'],
   },
   summaryTrendStats: ['count', 'min', 'med', 'p(95)', 'max'],

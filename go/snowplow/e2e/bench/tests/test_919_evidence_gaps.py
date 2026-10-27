@@ -461,6 +461,18 @@ def test_browser_js_tracks_every_request_from_before_the_first_navigation():
     assert "browser_request_incomplete_ms|" in src
 
 
+def test_no_trend_carries_a_count_threshold():
+    """k6 refuses `count` on a Trend ("unsupported aggregation method count
+    on metric of type trend") and the run never starts: caught by the
+    bench-tests workflow's Chrome tests on #924's first run."""
+    src = (BENCH_DIR / "k6" / "browser.js").read_text()
+    trends = set(re.findall(r"new Trend\('([a-z_]+)'", src))
+    thresholds = src[src.index("thresholds: {"):]
+    thresholds = thresholds[:thresholds.index("}")]
+    counted = set(re.findall(r"([a-z_]+): \['count", thresholds))
+    assert trends >= {"browser_call_ms", "browser_request_incomplete_ms"} and not trends & counted
+
+
 def test_the_incomplete_requests_report_through_evaluate(tmp_path):
     base = dict(session="s1", route="/dashboard")
     pts = [_point("browser_page_load_ms", 900.0, session="s1", route="/dashboard", visit="warm",
