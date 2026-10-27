@@ -409,6 +409,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		Extras:  extras,
 	})
 	if err != nil {
+		// #905 (c) — a stale-derived pass's error is withdrawn and re-run fresh
+		// (twin of restactions.go).
+		if staleWritePoint(r, wri, req, staleSink, false) {
+			return
+		}
 		log.Error("unable to resolve widget", slog.Any("err", err))
 		// #853 — the CR exists; a dependency's 404 is answered 424.
 		encodeWidgetResolveError(ctx, wri, err)

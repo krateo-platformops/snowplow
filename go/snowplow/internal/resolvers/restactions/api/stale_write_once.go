@@ -18,8 +18,16 @@
 //	(b) once a write is sent, the rest of the resolve is never served stale
 //	    (staleServeEligible), so it is never withdrawn and never re-run.
 //
-// A resolve with no D2 sink (background work, a dry run, the re-run itself, a
-// nested resolve filling its own cell) is untouched: BeginWrite is nil-safe.
+// Both are decided on the REQUEST's sink (cache.StaleServeSinkForWrite), a
+// nested resolve's write included, and atomically with the stale-serve note
+// (NoteIfNoWrite), so parallel nested items cannot interleave a stale read and
+// a write. A resolve with no D2 sink (background work, a dry run, the re-run
+// itself) is untouched: BeginWrite is nil-safe.
+//
+// Rule (c): the answer of a stale-derived pass is withdrawn and re-run on the
+// ERROR path too (dispatchers: restactions.go, widgets.go). A held write turns
+// a filter that needs the write's output into an error, and an error derived
+// from stale content is no more final than a body derived from it.
 package api
 
 import (
@@ -36,7 +44,7 @@ import (
 // It returns true when the write must not be sent from this pass.
 func (r *resolveRun) refuseWriteFromStalePass(gctx context.Context, sc *stageCtx, i int) bool {
 	call := sc.calls[i]
-	if !isWriteVerb(call.Verb) || cache.StaleServeSinkFromContext(gctx).BeginWrite() {
+	if !isWriteVerb(call.Verb) || cache.StaleServeSinkForWrite(gctx).BeginWrite() {
 		return false
 	}
 	verb := ptr.Deref(call.Verb, http.MethodGet)

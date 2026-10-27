@@ -149,6 +149,38 @@ func StaleServeSinkFromContext(ctx context.Context) *StaleServeSink {
 	return s
 }
 
+// StaleServeSinkForWrite (#905) is the customer request's sink WHATEVER L1 key
+// the resolve is filling now. A write anywhere under the request — in a nested
+// resolve that re-scoped to its own cell included — is sent or held for the
+// request as a whole, because it is the request that is withdrawn and re-run.
+func StaleServeSinkForWrite(ctx context.Context) *StaleServeSink {
+	if ctx == nil {
+		return nil
+	}
+	s, _ := ctx.Value(ctxKeyStaleServeSink).(*StaleServeSink)
+	return s
+}
+
+// NoteIfNoWrite (#905) is Note, atomic with BeginWrite: it records the stale
+// serve of contentKey and returns true, unless a write of this resolve was
+// already sent, in which case it records nothing and returns false (the read
+// must read through). Under the sink's lock, so a stale read and a write
+// running in parallel (nested resolve:true items of one stage) can never both
+// happen: either the stale serve is noted first and the write is held, or the
+// write is begun first and the read is not served stale. Nil-safe (true).
+func (s *StaleServeSink) NoteIfNoWrite(contentKey string) bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wrote {
+		return false
+	}
+	s.served = append(s.served, staleServedRef{key: contentKey})
+	return true
+}
+
 // L1Key is the dependent customer cell's key. Nil-safe.
 func (s *StaleServeSink) L1Key() string {
 	if s == nil {

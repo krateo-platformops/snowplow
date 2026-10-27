@@ -202,7 +202,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	// The admission predictor's partition count: index keys under rw.mu read.
 	"ResourceWatcher.PartitionLen": readOnly443,
 	// #710 PR-2b — the D2 stale serve. The sink and the mark are request-scoped
-	// reads; Note/NoteServedAt write only the request's own sink, after
+	// reads; NoteIfNoWrite/NoteServedAt write only the request's own sink, after
 	// serveStaleWithDebt's cache.Inert check. Commit/Withdraw (the write point)
 	// act only on a sink that check let note a stale serve (StaleDerived is
 	// false under the flag). The debt goroutines' DebtCleared / publish /
@@ -213,11 +213,12 @@ var cacheAllow443 = map[string]cacheClass443{
 	// it: request-scoped, nothing outlives the request (an inert resolve has no
 	// sink, and the nil sink answers without state).
 	"StaleServeSink.BeginWrite": readOnly443, "StaleServeSink.WriteSent": readOnly443,
+	"StaleServeSinkForWrite": readOnly443,
 	"HasRefreshSubscriber": readOnly443, "StaleOwedStatsSnapshot": readOnly443,
 	// #710 PR-2b — the customer-triggered-refresh marker: a ctx value (set by the debt
 	// lane on its own detached ctx, read by the two admission classifiers).
 	"CustomerTriggeredRefreshFromContext": readOnly443, "WithCustomerTriggeredRefresh": readOnly443,
-	"StaleServeSink.Note": unreachableInert443, "StaleServeSink.NoteServedAt": unreachableInert443,
+	"StaleServeSink.NoteIfNoWrite": unreachableInert443, "StaleServeSink.NoteServedAt": unreachableInert443,
 	"StaleServeSink.Commit": unreachableInert443, "StaleServeSink.Withdraw": unreachableInert443,
 	"StaleServeSink.DebtCleared": unreachableInert443, "ResolvedCacheStore.EvictStaleDerived": unreachableInert443,
 	"RunRefreshNow": unreachableInert443, "PublishRefresh": unreachableInert443,

@@ -480,6 +480,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	})
 	wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
 	if err != nil {
+		// #905 (c) — an error from a stale-derived pass is withdrawn and the
+		// request re-run with D2 disabled, exactly like a declined body: a write
+		// held in that pass (rule a) makes a filter that needs its output fail,
+		// and the fresh re-run is the one that sends the write.
+		if staleWritePoint(r, wri, req, staleSink, false) {
+			return
+		}
 		log.Error("unable to resolve rest action",
 			slog.String("name", cr.GetName()),
 			slog.String("namespace", cr.GetNamespace()),

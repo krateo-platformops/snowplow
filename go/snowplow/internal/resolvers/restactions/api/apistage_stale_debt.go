@@ -205,9 +205,10 @@ var (
 // (#905: a stale serve after a sent write would get the resolve withdrawn and
 // re-run, sending the write twice — the read reads through instead).
 //
-// No race with the write: a resolve's stages run one after another and every
-// item of a stage has the stage's verb, so no read of this resolve runs while
-// one of its write items is being decided (BeginWrite).
+// WriteSent here is only the fast path. A read and a write CAN run in parallel
+// (nested resolve:true items of one stage, each resolving a RESTAction with its
+// own stages), so the decision itself is atomic: serveStaleWithDebt notes the
+// stale serve with NoteIfNoWrite, under the same lock BeginWrite takes.
 func staleServeEligible(ctx context.Context) (*cache.StaleServeSink, bool) {
 	s := cache.StaleServeSinkFromContext(ctx)
 	if s == nil || cache.Inert(ctx) || contentFillClassOf(ctx) != fillClassCustomer || s.WriteSent() {
@@ -245,6 +246,12 @@ func serveStaleWithDebt(ctx context.Context, sink *cache.StaleServeSink, store *
 	if !hit || entry == nil {
 		return nil, false
 	}
+	// #905 — the stale serve is noted atomically with BeginWrite: when a write
+	// of this request was already sent (a parallel nested item), the read is
+	// not served stale (it reads through) and no debt is opened for it.
+	if !sink.NoteIfNoWrite(k) {
+		return nil, false
+	}
 	if staleServeRegistrationHookForTest != nil {
 		staleServeRegistrationHookForTest() // D2-7: a refill may commit here; it waits on this lock
 	}
@@ -274,7 +281,6 @@ func serveStaleWithDebt(ctx context.Context, sink *cache.StaleServeSink, store *
 		d.dependents[sink] = staleDependent{servedAt: now}
 	}
 	sink.NoteServedAt(now)
-	sink.Note(k)
 	staleServeTotal.Add(1)
 	staleServeAgeHist.record(now.Sub(t0).Milliseconds())
 	ensureStaleOverdueScanner()
