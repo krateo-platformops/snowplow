@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import gzip
 import os
+import zlib
 from typing import Iterable
 
 KEY = "snowplow_work"
@@ -223,7 +224,11 @@ def cpu_report(win: dict | None, mem: list[dict], profile_dir: str | None) -> di
             except FileNotFoundError:
                 missing.append(name)
                 continue
-            except (OSError, ValueError, IndexError, EOFError) as e:
+            # a truncated or corrupt profile (bad gzip header: OSError; corrupt
+            # deflate: zlib.error; truncated: EOFError; bad proto: ValueError /
+            # IndexError) is listed, never fatal: evaluate must still write
+            # verdict.json
+            except (OSError, ValueError, IndexError, EOFError, zlib.error) as e:
                 unreadable.append({"profile": name, "error": str(e)})
                 continue
             bodies.append(body)

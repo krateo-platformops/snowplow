@@ -23,6 +23,7 @@ import copy
 import gzip
 import json
 import shutil
+import zlib
 from pathlib import Path
 
 from bench import load606, workclass
@@ -225,6 +226,33 @@ def test_evaluate_without_profile_dir_or_files(tmp_path, capsys):
     assert "1 missing" in cpu["note"]
     cpu = _evaluate(tmp_path, files, capsys, profile_dir=False)["work_class_report_only"]["cpu"]
     assert cpu["status"] == "no_profiles"
+
+
+def _corrupt(body: bytes) -> bytes:
+    """A valid gzip header over a corrupt deflate stream (zlib.error)."""
+    return body[:20] + bytes(x ^ 0xFF for x in body[20:60]) + body[60:]
+
+
+def test_a_corrupt_profile_is_listed_and_evaluate_still_writes_the_verdict(tmp_path, capsys):
+    """F1 (#910 review): a corrupt-deflate profile raises zlib.error, which is
+    not an OSError; it must be listed as unreadable, never crash evaluate (and
+    lose verdict.json). The good profile next to it is still attributed."""
+    bad = _corrupt(PROFILE)
+    try:
+        gzip.decompress(bad)
+        raise AssertionError("PRECONDITION: the corrupted fixture still decompresses")
+    except zlib.error:
+        pass
+    files = _run(tmp_path, {"cpu-01-120000.pb.gz": bad, "cpu-02-120030.pb.gz": PROFILE})
+    cpu = _evaluate(tmp_path, files, capsys)["work_class_report_only"]["cpu"]
+    assert cpu["status"] == "present"
+    assert [u["profile"] for u in cpu["unreadable_profiles"]] == ["cpu-01-120000.pb.gz"]
+    st = cpu["by_window"]["storm"]
+    assert st["profiles"] == 1 and st["cpu_s"] == 1.85 and st["profiled_s"] == 30.0
+    # only corrupt profiles: still a verdict, the report says none could be read
+    files = _run(tmp_path / "only-bad", {"cpu-01-120000.pb.gz": bad})
+    cpu = _evaluate(tmp_path / "only-bad", files, capsys)["work_class_report_only"]["cpu"]
+    assert cpu["status"] == "no_profiles" and "1 unreadable" in cpu["note"]
 
 
 def test_work_class_cli_attributes_profiles(tmp_path, capsys):
