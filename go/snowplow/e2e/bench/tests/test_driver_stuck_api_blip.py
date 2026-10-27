@@ -82,6 +82,23 @@ def test_run16_shape_an_api_outage_mid_measure_is_waited_out(harness):  # noqa: 
     assert v["report"]["api_unreachable_report_only"] == [rec]
 
 
+def test_the_outage_record_stamps_send_times_not_when_kubectl_gave_up(harness):  # noqa: F811
+    """#917 review F1: first_unanswered is when the first unanswered poll was
+    SENT, not when kubectl gave up on it (its --request-timeout later) — the
+    old stamp put the hung request's whole flight into the "poll gap". Here
+    each unanswered call hangs 6 s before failing."""
+    p, _, out = _run606_k6(harness, FAKE_API_DOWN_POLLS="1", FAKE_UNANSWERED_HANG_S="6", DRIVE_POLL_S="1",
+                           MEASURE_WAIT_S="3600")
+    assert p.returncode == 0, _log(out)[-3000:]
+    (rec,) = [json.loads(x) for x in (out / "api-outages.jsonl").read_text().splitlines()]
+    _, state, _, _ = harness
+    first = min(float(x) for x in (state / "unanswered_sent").read_text().split())   # the fake's own clock
+    # stamped just before the call (whole seconds), never after its 6 s hang
+    assert first - 2 <= rec["first_unanswered"] <= first + 1, (rec, first)
+    # the window holds the hang (run606 stamps whole seconds: t1 is truncated)
+    assert rec["t0"] <= rec["first_unanswered"] and rec["t1"] + 1 > first + 6
+
+
 def test_an_empty_pod_listing_answered_rc_0_is_unknown_too(harness):  # noqa: F811
     """kubectl exits 0 but the body is empty: driver-stuck says unknown (3),
     and run606 waits on — only its "stuck" (1) fails the step."""
@@ -462,7 +479,11 @@ def test_unanswered_exit_codes_are_unknown_never_exited_0(harness):  # noqa: F81
     assert "k6browser pod(s) Ready, every run exited 0" in log       # the next one answered
 
 
-# 4: the outage rule in the paired verdict (run 14's recorded run, test_pair_ready_time's arms)
+# 4: the outage rule in the paired verdict (run 14's recorded run, test_pair_ready_time's arms).
+# The WHOLE window [t0, t1] of a record is judged; of B's, exactly the part an
+# A window also covers is the vantage's (no margin); the rest is one more
+# stretch for B's customer witness — the same judgement, output
+# (b_witnessed_ready) and validity (readiness_known[b]) as a readiness gap.
 
 def _outage(doc, t0_s, t1_s, k0):
     d = copy.deepcopy(doc)
@@ -473,6 +494,29 @@ def _outage(doc, t0_s, t1_s, k0):
     return d
 
 
+def _b_failing(doc, lo, hi):
+    """B's k6 requests failing over [K0 + lo, K0 + hi) wall-clock (B runs SHIFT later)"""
+    return _failing(doc, lo - SHIFT, hi - SHIFT)
+
+
+def _b_silent(doc, lo, hi):
+    """not one B k6 request completing over [K0 + lo, K0 + hi) wall-clock"""
+    d = copy.deepcopy(doc)
+    c0 = d["calls"][0][0]
+    keep = lambda o: not (lo - SHIFT <= o - c0 < hi - SHIFT)     # noqa: E731
+    d["calls"] = [x for x in d["calls"] if keep(x[0])]
+    d["failed"] = [x for x in d["failed"] if keep(x[0])]
+    return d
+
+
+def _rk_b(p):
+    return next(c for c in p["validity"] if c["check"].endswith("readiness_known[b]"))
+
+
+def _w(x0, x1):
+    return [round(K0 + x0, 1), round(K0 + x1, 1)]
+
+
 def test_an_a_outage_is_excluded_from_both_runs_like_an_a_restart(tmp_path):
     p = _arms(tmp_path, _outage(P14, 900, 1100, K0), _shift(P14, SHIFT))
     assert p["verdict"] == "PASS", (p["invalid_reasons"], p["fail_reasons"])
@@ -481,74 +525,122 @@ def test_an_a_outage_is_excluded_from_both_runs_like_an_a_restart(tmp_path):
     (a0, a1), = it["a"]
     (b0, b1), = it["b"]
     assert round(b0 - a0, 6) == SHIFT and round(b1 - a1, 6) == SHIFT
+    assert round(a0 - K0, 6) == 900.0                       # its whole window
     assert any("A's control plane did not answer for 200" in n and "excluded from both runs" in n for n in p["notes"])
     churn = [c for c in p["checks"] if c["check"].startswith("customer_latency.pair[churn]")]
     assert all(c["excluded"]["a_s"] == c["excluded"]["b_s"] > 0 for c in churn)
 
 
-def test_a_b_outage_makes_the_pair_invalid_with_its_window(tmp_path):
+def test_a_b_outage_its_customers_served_is_jointly_ready_time_with_a_note(tmp_path):
+    """B's control plane did not answer; B's customers in flight over its
+    whole window were served within the 1 % bar: not void, not cut —
+    jointly-Ready time, and a NOTE (#606 run 16)."""
     p = _arms(tmp_path, P14, _shift(_outage(P14, 900, 1100, K0), SHIFT))
+    assert p["verdict"] == "PASS", (p["invalid_reasons"], p["fail_reasons"])
+    assert _rk_b(p)["result"] == "PASS"
+    (w,) = p["b_witnessed_ready"]
+    assert w["kind"] == "api_outage" and (w["t0"] - K0, w["t1"] - K0, w["seconds"]) == (900.0, 1100.0, 200.0)
+    assert w["parts"] == [_w(900, 1100)]
+    assert w["k6"]["requests"] > 0 and w["k6"]["rate"] <= 0.01 and set(w["k6"]["by_source"]) == {"k6load", "browser"}
+    assert not p["exclusion"]["items"]                       # kept: nothing cut from either run
+    assert any("kept as jointly-Ready time" in n and "within the 0.01 bar" in n for n in p["notes"])
+
+
+def test_a_b_outage_with_customer_errors_fails_the_pair(tmp_path):
+    """B's requests in flight in it not served over the bar: B was not
+    serving — FAIL (candidate_not_ready), never cut, never void."""
+    b = _b_failing(_shift(_outage(P14, 900, 1100, K0), SHIFT), 900, 1100)
+    p = _arms(tmp_path, P14, b)
+    assert p["verdict"] == "FAIL", (p["invalid_reasons"], p["fail_reasons"])
+    assert p["candidate_not_ready"]["result"] == "FAIL"
+    (st,) = p["candidate_not_ready"]["value"]["stretches"]
+    assert st["kind"] == "api_outage" and st["seconds"] == 200.0 and st["k6"]["rate"] > 0.01
+    assert "B was not serving" in st["why"]
+
+
+def test_customer_errors_only_in_the_poll_gap_fail_the_pair(tmp_path):
+    """B's customers fail ONLY in the poll gap — between the last answered
+    poll (900) and the first unanswered one (930). That is inside the
+    window: B was not serving. Judging from the first unanswered poll on
+    would have missed every one of them (#917, Diego's rule)."""
+    b = _b_failing(_shift(_outage(P14, 900, 1100, K0), SHIFT), 900, 930)
+    p = _arms(tmp_path, P14, b)
+    assert p["verdict"] == "FAIL", (p["invalid_reasons"], p["fail_reasons"])
+    (st,) = p["candidate_not_ready"]["value"]["stretches"]
+    assert st["parts"] == [_w(900, 1100)] and st["k6"]["rate"] > 0.01
+
+
+def test_a_b_outage_no_customer_request_witnessed_voids(tmp_path):
+    """not one B request in flight: whether B served cannot be told — void,
+    by the one witness validity (readiness_known[b])"""
+    b = _b_silent(_shift(_outage(P14, 900, 1100, K0), SHIFT), 880, 1150)
+    p = _arms(tmp_path, P14, b)
     assert p["verdict"] == "INVALID"
-    assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.control_plane_outage[b]"]
-    why = p["invalid_reasons"][0]
-    assert "200.0 s from" in why and "run606 polls" in why and "never excluded silently" in why
-    v = next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
-    assert v["value"][0]["seconds"] == 200.0
+    assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.readiness_known[b]"]
+    (st,) = _rk_b(p)["value"]["stretches"]
+    assert st["kind"] == "api_outage" and st["k6"]["requests"] == 0 and "no witness" in st["why"]
 
 
 def test_the_operators_own_network_blip_is_the_vantages_not_bs(tmp_path):
     """#898 re-review: both runs are polled from the same machine, so its own
     network dropping records an outage in BOTH at the same wall-clock time.
     That B outage is the vantage's: excluded from both runs (like A's), noted
-    — not INVALID. (The reviewer's same-time probe.)"""
+    — not witnessed. (The reviewer's same-time probe.)"""
     t0 = 1000                                        # seconds after A's first call: wall-clock, both runs
     a = _outage(P14, t0, t0 + 40, K0)                          # the same wall-clock moment
-    b = _shift(_outage(P14, t0, t0 + 40, K0), SHIFT)
-    assert a["api_outages"][0]["t0"] == b["api_outages"][0]["t0"]
+    b = _b_silent(_shift(_outage(P14, t0, t0 + 40, K0), SHIFT), t0, t0 + 40)   # even with no witness
     p = _arms(tmp_path, a, b)
     assert p["verdict"] == "PASS", (p["invalid_reasons"], p["fail_reasons"])
-    v = next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
-    assert v["result"] == "PASS" and v["value"] == "none"
+    assert _rk_b(p)["result"] == "PASS" and not p["b_witnessed_ready"]
     whats = {it["what"] for it in p["exclusion"]["items"]}
     assert {"A control-plane outage #1", "B control-plane outage #1"} <= whats
-    assert any("the operator's vantage, not the candidate" in n for n in p["notes"])
+    assert any("the operator's vantage" in n and "none of it B's alone" in n for n in p["notes"])
 
 
-# A's outage [1000, 1040], first unanswered poll at 1030: its own poll
-# interval, 30 s, is how far its true edges can sit from the window's, so A
-# covers [970, 1070] of wall-clock time — no other margin.
-@pytest.mark.parametrize("b_t0, b_t1, b_only_s", [
-    (1000, 1040, None),         # the same window: the vantage's
-    (980, 1060, None),          # inside A's cover (its edges within A's poll interval): the vantage's
-    (1030, 1080, 10.0),         # 10 s past A's cover: B's alone, voids
-    (1040, 1080, 10.0),         # starts as A's ends: 10 s B-only
-    (1200, 1240, 40.0),         # B only, later
+# A's outage window [1000, 1040]. Exactly what of B's whole window it also
+# covers is the vantage's — no margin (#917 N4); the rest B's customers judge.
+@pytest.mark.parametrize("b_t0, b_t1, own", [
+    (1000, 1040, []),                                 # the same window: the vantage's
+    (1010, 1030, []),                                 # inside A's window
+    (980, 1060, [(980, 1000), (1040, 1060)]),         # past both of A's edges: B's alone there
+    (1030, 1080, [(1040, 1080)]),
+    (1040, 1080, [(1040, 1080)]),                     # starts as A's ends: all B's
+    (1200, 1240, [(1200, 1240)]),                     # B only, later
 ])
-def test_only_the_part_of_bs_outage_that_as_covers_is_the_vantages(tmp_path, b_t0, b_t1, b_only_s):
+def test_only_what_as_window_covers_is_the_vantages(tmp_path, b_t0, b_t1, own):
     a = _outage(P14, 1000, 1040, K0)
     b = _shift(_outage(P14, b_t0, b_t1, K0), SHIFT)
-    p = _arms(tmp_path, a, b)
-    v = next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
-    if b_only_s is None:
-        assert p["verdict"] == "PASS" and v["value"] == "none", (p["invalid_reasons"], p["fail_reasons"])
-    else:
-        assert p["verdict"] == "INVALID"
-        assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.control_plane_outage[b]"]
-        assert v["value"][0]["b_only_seconds"] == b_only_s and f"{b_only_s} s of it while A's answered" in v["why"]
+    p = _arms(tmp_path / "recorded", a, b)
+    judged = p["b_witnessed_ready"] + p["candidate_not_ready"]["value"]["stretches"]
+    if not own:
+        assert p["verdict"] == "PASS" and not judged, (p["invalid_reasons"], p["fail_reasons"])
+        return
+    # B's own part judged by its recorded customers (run 14's stream), whatever they say
+    (w,) = judged
+    assert w["parts"] == [_w(x, y) for x, y in own]
+    # B's own part with its customers failing: FAIL
+    bf = b
+    for x, y in own:
+        bf = _b_failing(bf, x, y)
+    p = _arms(tmp_path / "failing", a, bf)
+    assert p["verdict"] == "FAIL" and p["candidate_not_ready"]["result"] == "FAIL", p["fail_reasons"]
 
 
 @pytest.mark.parametrize("b_t1", [1100, 1300, 1600])
-def test_a_long_b_outage_touching_a_short_a_blip_voids(tmp_path, b_t1):
+def test_a_long_b_outage_touching_a_short_a_blip_is_judged_by_bs_customers(tmp_path, b_t1):
     """The #898 re-reviewer's probe: A blips 30 s (1000-1030), B is down from
-    1010 to b_t1. Only the 20 s they share (and A's poll interval around it)
-    is the vantage's; the rest of B's outage is B's alone — INVALID."""
+    1010 to b_t1. Only what A's blip covers (1010-1030) is the vantage's; the
+    rest (1030 on) is B's alone, and B's customers judge it: failing ->
+    FAIL. Never excused by A's blip."""
     a = _outage(P14, 1000, 1030, K0)
     b = _shift(_outage(P14, 1010, b_t1, K0), SHIFT)
-    p = _arms(tmp_path, a, b)
-    assert p["verdict"] == "INVALID", (p["invalid_reasons"], p["fail_reasons"])
-    assert [r.split(":")[0] for r in p["invalid_reasons"]] == ["customer_latency.pair.control_plane_outage[b]"]
-    v = next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
-    assert v["value"][0]["b_only"] == [[round(K0 + 1060.0, 1), round(K0 + b_t1, 1)]]   # A covers to 1030 + 30
+    p = _arms(tmp_path / "failing", a, _b_failing(b, 1030, b_t1))
+    assert p["verdict"] == "FAIL" and p["candidate_not_ready"]["result"] == "FAIL", p["fail_reasons"]
+    (st,) = p["candidate_not_ready"]["value"]["stretches"]
+    assert st["parts"] == [_w(1030, b_t1)]
+    p = _arms(tmp_path / "recorded", a, b)
+    (w,) = p["b_witnessed_ready"] + p["candidate_not_ready"]["value"]["stretches"]
+    assert w["parts"] == [_w(1030, b_t1)]
 
 
 def test_an_outage_outside_the_measure_is_not_the_pairs(tmp_path):
@@ -565,4 +657,4 @@ def test_evaluate_is_in_the_run_budget():
     assert "+ evaluate ${EVALUATE_EST_S} +" in src
 
 
-from tests.test_pair_ready_time import K0, P14, SHIFT, _arms, _shift  # noqa: E402
+from tests.test_pair_ready_time import K0, P14, SHIFT, _arms, _failing, _shift  # noqa: E402

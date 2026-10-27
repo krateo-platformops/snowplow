@@ -686,7 +686,9 @@ def operation_wait_command(op: str, spec: ClusterSpec, location: str | None = No
 
 # gcloud's answer for a cluster that is not at the location asked:
 # "ResponseError: code=404, message=Not found: projects/…/locations/…/clusters/…"
-_NOT_FOUND = re.compile(r"code=404|NOT_FOUND|Not found:")
+# — exactly HTTP 404 (code=404) or the API status NOT_FOUND; never a message
+# text like "Not found:" (it rides on other status codes too) (#917 F5/N8)
+_NOT_FOUND = re.compile(r"\bcode=404\b|\bNOT_FOUND\b")
 
 
 def find_cluster(spec: ClusterSpec, *, log: Callable[[str], None] = print,
@@ -1083,7 +1085,9 @@ def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline
     while True:
         err: list[str] = []
         rc, _ = execute(describe_command(spec, location), dry_run=False, log=lambda _: None, stderr_out=err)
-        if rc != 0 and re.search(r"(?i)not ?found|was not found|404", err[-1] if err else ""):
+        # the same NotFound test as the lookup (find_cluster): code=404 / NOT_FOUND only — a
+        # looser match ("not found" anywhere, any 404) could run the disk backstop early (#907 N1)
+        if rc != 0 and _NOT_FOUND.search(err[-1] if err else ""):
             return True
         if clock() >= deadline:
             return False

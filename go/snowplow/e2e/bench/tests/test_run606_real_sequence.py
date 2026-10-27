@@ -152,6 +152,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     down_flag = os.path.join(STATE, "api_down")         # an outage in progress: /readyz unanswered too
     def unanswered():
         open(down_flag, "w").write("1")
+        # FAKE_UNANSWERED_HANG_S: an unanswered call hangs this long before
+        # kubectl gives up (its --request-timeout); when it was SENT is logged
+        with open(os.path.join(STATE, "unanswered_sent"), "a") as fh:
+            fh.write(f"{time.time()}\\n")
+        time.sleep(float(os.environ.get("FAKE_UNANSWERED_HANG_S", "0")))
         print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
         sys.exit(1)
     def api_blip(var, counter):

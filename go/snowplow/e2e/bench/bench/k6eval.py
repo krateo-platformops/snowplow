@@ -71,7 +71,9 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "route_table_mismatch", "bench_frame", "http_req_failed", "http_req_duration",
          "browser_page_load_ms", "browser_page_loads", "browser_widget_states",
          "browser_page_timeouts", "browser_logins", "browser_signin_ms", "browser_sse_opened",
-         "dropped_iterations", "clicks", "arrivals")
+         "dropped_iterations", "clicks", "arrivals",
+         # the browser's completed requests: the pair's customer witness reads them
+         "browser_http_req_duration", "browser_http_req_failed")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # the points whose time is kept too (out["times"], index-aligned with
 # out["points"]): run 12 compares latency inside / outside the CPU profiles;
@@ -79,7 +81,7 @@ _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # in its phase; the paired gate counts k6's errors (http_req_failed) only
 # inside the time both runs' snowplow was Ready
 _TIMED = ("page_load_ms", "browser_page_load_ms", "http_req_duration", "http_req_failed", "clicks",
-          "arrivals")
+          "arrivals", "browser_http_req_duration", "browser_http_req_failed")
 _RFC3339 = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
 
 
