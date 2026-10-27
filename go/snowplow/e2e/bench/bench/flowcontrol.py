@@ -9,7 +9,7 @@ the figures attribute, through kubectl's own impersonation (`--as`,
 `--as-group`; kubectl -v=8 prints the response headers):
 
   snowplow_sa     snowplow's ServiceAccount (from deploy/snowplow);
-  snowplow_users  a bench user with that user's own groups (bench/rbac_model):
+  snowplow_users  a probe user carrying a bench user's own groups (bench/rbac_model):
                   snowplow reads as each user (#615), and APF classifies those
                   requests by the user and its groups;
   bench_drivers   the bench's own in-cluster drivers' ServiceAccounts
@@ -49,6 +49,10 @@ BENCH_SCHEMA = {"snowplow_sa": "bench-snowplow-sa", "snowplow_users": "bench-sno
 DRIVERS_NAMESPACE = "bench-loadgen"     # bench/load606_job.py's namespace for every in-cluster driver
 DRIVER_SA = "fresh606"                  # the churn writer (load606_job.render_fresh)
 SNOWPLOW_NAMESPACE = "krateo-system"
+# the bench user snowplow reads as is impersonated by its GROUPS (a bench
+# user's own, bench/rbac_model): APF classifies by them, the schema is keyed
+# on them, and no real bench user's name is used
+PROBE_USER = "bench-flowcontrol-probe"
 _UID = r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 _FS = re.compile(r"(?i)x-kubernetes-pf-flowschema-uid[\"':=\s]+" + _UID)
 _PL = re.compile(r"(?i)x-kubernetes-pf-prioritylevel-uid[\"':=\s]+" + _UID)
@@ -147,14 +151,13 @@ def _identity_flags(a, kubectl) -> tuple[str, dict]:
     spec = ((json.loads(p.stdout).get("spec") or {}).get("template") or {}).get("spec") or {}
     sa = spec.get("serviceAccountName") or "default"
     model = rbac_model.RbacModel(users=a.users, namespaces=a.namespaces, admins=min(10, a.users))
-    return sa, impersonation(sa, f"{a.user_prefix}{1:04d}", rbac_model.user_groups(1, model))
+    return sa, impersonation(sa, PROBE_USER, rbac_model.user_groups(1, model))
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bench.flowcontrol")
     ap.add_argument("--users", type=int, required=True)
     ap.add_argument("--namespaces", type=int, required=True)
-    ap.add_argument("--user-prefix", required=True)
     ap.add_argument("--timeout-s", type=float, required=True, help="each kubectl read's bound; verify's whole wait")
     sub = ap.add_subparsers(dest="cmd", required=True)
     pr = sub.add_parser("probe")

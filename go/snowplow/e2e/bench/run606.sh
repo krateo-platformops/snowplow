@@ -524,7 +524,7 @@ s_env() {
 # fails, before the data load is paid for.
 flowcontrol_attribution() {
   local fc=(python3 -m bench.flowcontrol --users "$USERS" --namespaces "$NAMESPACES"
-            --user-prefix "$BENCH_USER_PREFIX" --timeout-s "$COLLECT_TIMEOUT_S")
+            --timeout-s "$COLLECT_TIMEOUT_S")
   if [[ "$DRY" == "1" ]]; then
     log "DRY: ${fc[*]} probe -> bench-flowschemas.yaml (kapply) -> verify -> $OUT/flowcontrol-config.jsonl"
     return 0
