@@ -95,6 +95,53 @@ func TestWorkClass871_CMP_DuePassIsComparatorNestedInRefresh(t *testing.T) {
 	}
 }
 
+// TestWorkClass871_CMPq_DuePassRunsThroughTheRefresherDequeue pins the
+// refresher.go wiring the CMP arm above bypasses: a dequeue of a cell whose
+// pass is due runs the pass as a comparator unit INSIDE the refresh unit, on
+// the refresher's labelled ctx, and the re-resolve that follows is refresh
+// again. Handing the pass any other ctx (context.Background()) leaves the
+// re-resolve unlabelled; skipping the pass never runs the probe.
+func TestWorkClass871_CMPq_DuePassRunsThroughTheRefresherDequeue(t *testing.T) {
+	terminalEnv(t)
+	cleanup := withCleanRefresher(t, 1, 0)
+	t.Cleanup(cleanup)
+	store, keys := terminalFixtureNoReset(t, 1)
+	k := keys[0]
+	e, ok := store.GetNoTouch(k)
+	if !ok || e == nil {
+		t.Fatal("PRECONDITION: fixture entry missing")
+	}
+	cell := &ListCell{key: k}
+	cell.passDue.Store(true)
+	e.listCell = cell // a cell whose comparator pass a read made due
+
+	pass := &workclassprobe.Probe{Child: true}
+	h := func(ctx context.Context) { pass.Observe(ctx) }
+	comparePassHookForTest.Store(&h)
+	t.Cleanup(func() { comparePassHookForTest.Store(nil) })
+	reresolve := &workclassprobe.Probe{}
+	RegisterRefreshFunc("widgets", func(ctx context.Context, key string, _ ResolvedKeyInputs) error {
+		if key == k {
+			reresolve.Observe(ctx)
+		}
+		return nil
+	})
+
+	r := refresherSingleton()
+	terminalMark([]string{k})
+	for r.viewedQueue.Len() > 0 || r.queue.Len() > 0 {
+		r.processNext(context.Background())
+	}
+	workclassprobe.RequireAll(t, "comparator pass goroutine (via processNext)", pass.Self(), "comparator")
+	workclassprobe.RequireAll(t, "goroutine started by the pass", pass.Children(), "comparator")
+	workclassprobe.RequireAll(t, "comparator pass ctx", pass.Ctx(), "comparator")
+	workclassprobe.RequireAll(t, "re-resolve goroutine after the pass", reresolve.Self(), "refresh")
+	workclassprobe.RequireAll(t, "re-resolve ctx after the pass", reresolve.Ctx(), "refresh")
+	if cell.passDue.Load() {
+		t.Fatal("the due pass was not consumed by the dequeue")
+	}
+}
+
 func TestWorkClass871_SR_StaleRetryAttemptIsFillBG(t *testing.T) {
 	clock := retryEngineSetup(t)
 	const key = "k-871-sr"
