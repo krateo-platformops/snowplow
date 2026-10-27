@@ -32,6 +32,7 @@ const stageOutcomesAllSucceeded = "[]"
 // answers a RESTAction /call), the outcomes ("" when every stage succeeded).
 // Callers add their site-specific fields.
 func newResolveEntry(class string, raw []byte, inputs *cache.ResolvedKeyInputs, outcomes *api.StageOutcomes) *cache.ResolvedEntry {
+	// put-verdict: a constructor, not a Put site — each caller (restActionHandler.ServeHTTP, seedRestactionResolveAndPutProd, resolveAndPopulateL1) decides whether to store before it Puts.
 	return &cache.ResolvedEntry{
 		RawJSON:       raw,
 		Inputs:        inputs,
