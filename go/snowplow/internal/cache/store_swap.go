@@ -37,17 +37,29 @@
 //     GVR keeps its confirmation. No whole-type mark, no unanchor: the only
 //     apiserver List per repair is the new copy's own.
 //
-// # LOCK ORDER (design v5 §2.6, every edge measured in the code cited there)
+// # LOCK ORDER (design v5 §2.6, re-cited for client-go v0.36.5 by the
+// architect's #870 evaluation, issuecomment-6446166419)
 //
-//	rw.mu → informer FIFO lock (servableLocked → HasSynced)
-//	new copy's FIFO lock → live indexer read lock (the reuse transform)
-//	FIFO lock → indexer (processDeltas / processDeltasInBatch)
+//	(HasSynced is a channel read on v0.36.5: rw.mu takes no informer lock)
+//	new copy's transform → live indexer read lock (the reuse transform); a
+//	  transform can run concurrently with processing of the same informer, so
+//	  it NEVER takes rw.mu
+//	blockDeltas → indexer (processDeltas / processDeltasInBatch, controller.go
+//	  :607-667 / :676-754); FIFO → blockDeltas when the queue holds ≥2 batches
 //	transform → deliveryLog.mu (released before next)
 //	listener → rw.mu.RLock (syncChState); → listCellSet.mu; → depWatch maskMu
 //	listener (adapter) → adapter / record mutex (leaves)
-//	swap goroutine OnUpdate → listenersLock.RLock + one send per listener
+//	swap goroutine OnUpdate (shared_informer.go :969) → listenersLock.RLock +
+//	  one send per listener (distribute :1094-1117)
 //	hub.mu → (released) → ledger mutex (leaf); /refreshes handler → ledger mutex
 //	rw.mu → storeVerify.mu; rw.mu → ledger mutex (leaf)
+//
+// THE TRANSFORM CHAIN IS IDEMPOTENT. Under watch-list each object is
+// transformed twice (the reflector's temporary store, then
+// addReplaceToItemsLocked): the strip passes a bytes-backed object through
+// unchanged, the #875 delivery log records a key and the latest object (a set
+// and a pointer), and reuse hands back the same live object again
+// (TestStoreSwap_TransformChainIsIdempotent).
 //
 // The swap goroutine holds rw.mu only in step 1 and in the step-3 check, and
 // does no waiting and no delivery under it. NO DELIVERY MAY EVER BE PLACED

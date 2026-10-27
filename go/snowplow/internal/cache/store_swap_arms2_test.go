@@ -7,6 +7,9 @@ package cache
 
 import (
 	"context"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -332,5 +335,89 @@ func TestStoreSwap_K12_ComparatorRecordIsTheLiveSeen(t *testing.T) {
 	if n1 != 0 || n2 == 0 || c.Anchored() {
 		t.Fatalf("K12 RED (X18): passes %d,%d anchored=%v after the swap; want 0, >0, false — the comparator "+
 			"must judge keys by the live instance's seen", n1, n2, c.Anchored())
+	}
+}
+
+// ── K11c-5 — a same-version write reaches the adapter on every informer kind ─
+
+// TestStoreSwap_K11c5_SameVersionWriteIsDelivered pins the client-go behaviour
+// the identity rule of §2.7 depends on: snowplow registers its handlers with
+// resync period 0, so a listener is always "syncing" and a store write that
+// keeps the resourceVersion is DELIVERED — every store write queues exactly one
+// notification per listener. On every informer kind snowplow builds: the
+// standalone dynamic informer, the shared-factory one and the metadata-only
+// one. RED under X51 (a handler registered with a resync period > 0).
+func TestStoreSwap_K11c5_SameVersionWriteIsDelivered(t *testing.T) {
+	check := func(t *testing.T, f *swapFix, key string, o any) {
+		n := len(f.rec.forKey(key))
+		f.watcher(0).Modify(o.(k8sruntimeObject))
+		f.waitFor("the same-version write at the consumer", func() bool { return len(f.rec.forKey(key)) > n })
+	}
+	t.Run("standalone_dynamic", func(t *testing.T) {
+		gvr := swapGVR(t)
+		f := newSwapFix(t, gvr, objs(gvr, 2))
+		check(t, f, swapKey("o00"), swapObj(gvr, "o00", "1", "same-rv-new-bytes"))
+		if e := f.rec.forKey(swapKey("o00")); e[len(e)-1].v != "same-rv-new-bytes" {
+			t.Fatalf("K11c-5 RED (X51): %v", e)
+		}
+	})
+	t.Run("factory_dynamic", func(t *testing.T) {
+		gvr := swapGVR(t)
+		f := newSwapFix(t, gvr, objs(gvr, 2), withFactoryBuilt())
+		if f.live().shape.owned() {
+			t.Fatal("precondition: a factory-built informer")
+		}
+		check(t, f, swapKey("o00"), swapObj(gvr, "o00", "1", "same-rv-new-bytes"))
+	})
+	t.Run("metadata_only", func(t *testing.T) {
+		gvr := swapGVR(t)
+		f := newSwapFixMetadata(t, gvr, 2)
+		pm := &metav1.PartialObjectMetadata{
+			TypeMeta:   metav1.TypeMeta{APIVersion: gvr.GroupVersion().String(), Kind: "Panel"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: swapNS, Name: "m0", ResourceVersion: "1", UID: "u", Labels: map[string]string{"x": "y"}},
+		}
+		check(t, f, swapKey("m0"), pm)
+	})
+}
+
+type k8sruntimeObject = k8sruntime.Object
+
+// TestStoreSwap_TransformChainIsIdempotent — on client-go v0.36.5 a watch-list
+// transforms each object TWICE. The whole chain a copy installs (delivery log,
+// strip, reuse) must give the same store object the second time: same bytes,
+// and, when the live copy holds an equal object, the same shared pointer.
+func TestStoreSwap_TransformChainIsIdempotent(t *testing.T) {
+	gvr := swapGVR(t)
+	f := newSwapFix(t, gvr, objs(gvr, 2))
+	live := f.live()
+	c := newStoreInstance(gvr, live.gi, live.shape, make(chan struct{}))
+	idx := live.gi.Informer().GetIndexer()
+	c.reuse.Store(&idx)
+	dl := newDeliveryLog(func() string { return "" })
+	chain := c.reuseTransform(dl.transform(StripBulkyFieldsForResourceType(gvrResourceTypeString(gvr), gvr)))
+	for _, in := range []*unstructured.Unstructured{
+		swapObj(gvr, "o00", "1", "v1"),        // equal to the live copy's: reused
+		swapObj(gvr, "o01", "5", "changed"),   // different: the copy's own
+		swapObj(gvr, "brand-new", "1", "new"), // absent from the live copy
+	} {
+		once, err := chain(in.DeepCopy())
+		if err != nil {
+			t.Fatal(err)
+		}
+		twice, err := chain(once)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b1, _ := itemBytes(once)
+		b2, _ := itemBytes(twice)
+		if string(b1) != string(b2) {
+			t.Fatalf("transform chain is not idempotent for %s:\n once:  %s\n twice: %s", in.GetName(), b1, b2)
+		}
+		if in.GetName() == "o00" {
+			liveObj, _, _ := idx.GetByKey(swapKey("o00"))
+			if once != liveObj || twice != liveObj {
+				t.Fatalf("reuse is not idempotent: the second pass did not hand back the live object")
+			}
+		}
 	}
 }

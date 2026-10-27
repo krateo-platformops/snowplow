@@ -148,51 +148,51 @@ func TestStoreSwap_K11b_OrderIsNonDecreasing(t *testing.T) {
 	}
 }
 
-// TestStoreSwap_K11c0_NoSuppressionWhenNothingPending — at the swap delivery the
-// store holds a same-version REPLACE of what the listener already delivered
-// (seen = S by presence and version; client-go sends no notification for a
-// same-version replace), then a real write: the consumer receives S then the
-// write. RED when suppression starts although seen = S.
+// TestStoreSwap_K11c0_NoSuppressionWhenNothingPending — the listener already
+// delivered S itself (seen is S, by identity) when the swap delivery reads it:
+// nothing is pending, so nothing is suppressed, and the next real write is
+// delivered. RED when suppression starts although seen = S.
 func TestStoreSwap_K11c0_NoSuppressionWhenNothingPending(t *testing.T) {
 	gvr := schema.GroupVersionResource{Group: "adapter870.krateo.io", Version: "v1", Resource: "panels"}
 	r := newAdapterRig(t, liveActedOn(t, swapObj(gvr, "k", "2", "v2")), true)
-	a3 := r.obj("3", "v3")
-	r.write(a3)
-	r.nAdd(a3) // seen = rv 3
+	s3 := r.obj("3", "v3")
+	r.write(s3)
+	r.nAdd(s3) // muted: seen = S
 	r.inst.muted.Store(false)
-	b3 := r.obj("3", "v3") // same version, a new object (a relist's replace): no notification
-	r.write(b3)
 	r.nSwap()
+	if n, _ := r.a.suppressingForTest(); n != 0 {
+		t.Fatalf("K11c-0 RED: %d key(s) suppressed although the listener already delivered S", n)
+	}
 	v4 := r.obj("4", "v4")
 	r.write(v4)
-	r.nUpdate(b3, v4)
+	r.nUpdate(s3, v4)
 	if got, want := r.seq(), []string{"update:3:v3", "update:4:v4"}; !eqSeq(got, want) {
 		t.Fatalf("K11c-0 RED: sequence %v, want %v — nothing was pending, so nothing may be suppressed", got, want)
 	}
 }
 
-// TestStoreSwap_K11c1_PendingPredecessorEndsSuppression — S's same-version
-// predecessor P is still queued; S itself arrived by a same-version replace and
-// will never be notified. Suppression must end on P (version equality), or it
-// stalls and swallows every later write. RED under X26 (match by identity).
-func TestStoreSwap_K11c1_PendingPredecessorEndsSuppression(t *testing.T) {
+// TestStoreSwap_K11c6_SameVersionOlderBytesNeverFollowNewer — two
+// same-resourceVersion writes with different bytes (S1 = a, then S = b) are
+// pending behind the swap delivery, and the listener's seen is a third
+// same-version object. The consumer must never see a after b: suppression ends
+// on S's OWN notification (identity), so S1's is dropped. RED under X50
+// (match by presence plus version: seen "equals" S, nothing is suppressed, and
+// a arrives after b).
+func TestStoreSwap_K11c6_SameVersionOlderBytesNeverFollowNewer(t *testing.T) {
 	gvr := schema.GroupVersionResource{Group: "adapter870.krateo.io", Version: "v1", Resource: "panels"}
-	r := newAdapterRig(t, liveActedOn(t, swapObj(gvr, "k", "2", "v2")), true)
-	v6 := r.obj("6", "v6")
-	r.write(v6)
-	r.nAdd(v6) // seen = rv 6
+	r := newAdapterRig(t, liveActedOn(t, swapObj(gvr, "k", "6", "v6")), true)
+	s0 := r.obj("7", "z")
+	r.write(s0)
+	r.nAdd(s0) // muted: seen = S0 (rv 7)
 	r.inst.muted.Store(false)
-	p7 := r.obj("7", "v7")
-	r.write(p7) // P: its notification is queued behind the swap delivery
-	s7 := r.obj("7", "v7")
-	r.write(s7) // S: a same-version replace — no notification, ever
-	r.nSwap()
-	r.nUpdate(v6, p7) // P's notification: same version as S → ends suppression
-	v8 := r.obj("8", "v8")
-	r.write(v8)
-	r.nUpdate(s7, v8)
-	if got, want := r.seq(), []string{"update:7:v7", "update:8:v8"}; !eqSeq(got, want) {
-		t.Fatalf("K11c-1 RED (X26): sequence %v, want %v — suppression must match S's version, not its identity", got, want)
+	s1, s2 := r.obj("7", "a"), r.obj("7", "b")
+	r.write(s1)
+	r.write(s2)
+	r.nSwap() // S = s2 (b)
+	r.nUpdate(s0, s1)
+	r.nUpdate(s1, s2)
+	if got, want := r.seq(), []string{"update:7:b"}; !eqSeq(got, want) {
+		t.Fatalf("K11c-6 RED (X50): sequence %v, want %v — the older same-version bytes reached the consumer after the newer", got, want)
 	}
 }
 

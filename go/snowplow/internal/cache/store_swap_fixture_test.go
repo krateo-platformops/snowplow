@@ -160,12 +160,17 @@ type swapFix struct {
 	extra    []schema.GroupVersionResource
 	meta     *metadatafake.FakeMetadataClient // the metadata-only variant's cluster
 	hdyn     holdListDynamic                  // counts every LIST of the GVR as it is ISSUED
+	factory  bool                             // the GVR's informer comes from the shared factory (not owned)
 }
 
 type swapFixOpt func(*swapFix)
 
 // withListErr makes the n-th LIST of the GVR fail with the returned error.
 func withListErr(f func(n int64) error) swapFixOpt { return func(s *swapFix) { s.listErr = f } }
+
+// withFactoryBuilt leaves the GVR's group off the navigation-discovered set,
+// so its informer comes from the shared dynamic factory (not owned).
+func withFactoryBuilt() swapFixOpt { return func(s *swapFix) { s.factory = true } }
 
 // withExtraGVR makes the fake cluster serve another GVR too (silent watch,
 // tracker LIST).
@@ -263,7 +268,9 @@ func newSwapFix(t *testing.T, gvr schema.GroupVersionResource, objs []*unstructu
 		return true, obj, nil
 	})
 
-	AddNavigationDiscoveredGroup(gvr.Group)
+	if !f.factory {
+		AddNavigationDiscoveredGroup(gvr.Group)
+	}
 	t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 	f.hdyn = newHoldListDynamic(f.fake, gvr, func(n int64) <-chan struct{} {

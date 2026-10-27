@@ -202,7 +202,7 @@ func (in *storeInstance) adapt(name string, inner clientcache.ResourceEventHandl
 		inner:    inner,
 		acted:    acted,
 		seen:     map[string]any{},
-		suppress: map[string]objState{},
+		suppress: map[string]suppressTarget{},
 	}
 	in.mu.Lock()
 	in.adapters = append(in.adapters, a)
@@ -279,9 +279,9 @@ func (r *actedRecord) snapshot() map[string]any {
 	return out
 }
 
-// objState is presence plus resourceVersion: what suppression matches on
-// (string equality, never ordering — safe for every API, aggregated ones
-// included).
+// objState is presence plus resourceVersion: what C1 compares (string
+// equality, never ordering — safe for every API, aggregated ones included) and
+// what the F8 regression count matches.
 type objState struct {
 	present bool
 	rv      string
@@ -350,6 +350,26 @@ func sameDelivered(acted any, hadActed bool, s any, present bool) bool {
 
 // ── the adapter ───────────────────────────────────────────────────────────────
 
+// suppressTarget is the notification that ends a key's suppression: S's OWN
+// notification, matched by OBJECT IDENTITY (architect, #870 on client-go
+// v0.36.5: snowplow's handlers are registered with resync period 0, so every
+// store write — a same-resourceVersion one included — queues exactly one
+// notification per listener, and the one carrying S is in the queue).
+// Matching by version instead would end suppression on an OLDER same-version
+// write and let it reach the consumer after S (X50, K11c-6). An absent S is
+// matched by the first delete (P2, the stated limit).
+type suppressTarget struct {
+	present bool
+	obj     any
+}
+
+func (t suppressTarget) matches(obj any, present bool) bool {
+	if !t.present {
+		return !present
+	}
+	return present && obj == t.obj
+}
+
 // swapDelivery is the notification a swap enqueues for key k through the new
 // informer's own OnUpdate, so it reaches every listener IN ORDER with that
 // listener's real notifications. It has no meta accessor, so client-go never
@@ -366,7 +386,7 @@ type handlerAdapter struct {
 	mu       sync.Mutex
 	freed    bool
 	seen     map[string]any
-	suppress map[string]objState
+	suppress map[string]suppressTarget
 	// displaced[k] is the resourceVersion a swap delivery replaced for k. A
 	// later real delivery carrying exactly that version means the swap pushed
 	// an OLDER body than the consumer had (F8): store_swap_regressed_keys.
@@ -413,10 +433,10 @@ func (a *handlerAdapter) deliver(obj, old any, present, isInInitialList, update 
 		return
 	}
 	if t, suppressing := a.suppress[key]; suppressing {
-		// Drop every notification for k until the one whose presence and
-		// version equal S's arrives; swallow that one too (seen only).
+		// Drop every notification for k until S's own arrives; swallow that
+		// one too (seen only).
 		a.recordSeenLocked(key, obj, st.present)
-		if st == t {
+		if t.matches(obj, st.present) {
 			delete(a.suppress, key)
 		}
 		a.mu.Unlock()
@@ -506,7 +526,6 @@ func (a *handlerAdapter) swapDeliver(key string) {
 	if a.acted != nil {
 		a.acted.set(key, s, present)
 	}
-	sState := stateOf(s, present)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.freed {
@@ -519,9 +538,10 @@ func (a *handlerAdapter) swapDeliver(key string) {
 		a.displaced[key] = stateOf(acted, true).rv
 	}
 	seenObj, seenOK := a.seen[key]
-	if stateOf(seenObj, seenOK) != sState {
-		// S's own notification is still queued behind this one.
-		a.suppress[key] = sState
+	if seenOK != present || (present && seenObj != s) {
+		// The listener has not delivered S itself yet: S's own notification
+		// is still queued behind this one.
+		a.suppress[key] = suppressTarget{present: present, obj: s}
 	}
 }
 
