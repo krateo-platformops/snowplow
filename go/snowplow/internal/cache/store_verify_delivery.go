@@ -47,11 +47,13 @@
 //
 // # A GVR WHOSE TRANSFORM CANNOT BE INSTALLED
 //
-// A re-registered shared-factory GVR gets its already-started informer back,
-// and SetTransform refuses a started informer. Its log then has no RECEIVED
-// record (recording=false) but still the handler, which an informer accepts
-// at any time: applied deletes and the pending keys work as for every other
-// GVR. What it cannot see is a delivery queued and not yet applied.
+// SetTransform refuses an informer that has started. If the informer still
+// runs, its log is installed without the RECEIVED record (recording=false) but
+// with the handler, which a running informer accepts: applied deletes and the
+// pending keys work as for every other GVR; what it cannot see is a delivery
+// queued and not yet applied. A re-registered shared-factory GVR gets its
+// informer back STOPPED (#244), which takes no handler either: that GVR has no
+// log at all, and the forced pass judges it on the store alone (#940).
 //
 // # THE TRANSFORM TAKES NO LOCK BUT ITS OWN
 //

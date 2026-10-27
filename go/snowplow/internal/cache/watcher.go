@@ -2811,8 +2811,17 @@ func (rw *ResourceWatcher) Stop() {
 	for gvr := range rw.informerStop {
 		rw.closePerGVRStopLocked(gvr)
 	}
+	// #918 — every delivery log's resolver and pending keys go with the
+	// watcher; its handler with its informer.
+	logs := make([]*deliveryLog, 0, len(rw.deliveries))
+	for _, dl := range rw.deliveries {
+		logs = append(logs, dl)
+	}
 	factory := rw.factory
 	rw.mu.Unlock()
+	for _, dl := range logs {
+		dl.close()
+	}
 
 	// Phase 2 — Task #85: BLOCK until every goroutine this watcher
 	// started has exited. MUST run with rw.mu released: the drained

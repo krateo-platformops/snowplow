@@ -822,19 +822,25 @@ func TestForcedPass918_RelistTombstone_HeldAndDecidedByTheNextPass(t *testing.T)
 	}
 }
 
-// TestForcedPass918_NoTransform_StillVerifiesWithTheHandler — #875 residual B,
-// covered (#923 review L5): a re-registered shared-factory GVR gets its
-// started informer back and SetTransform refuses it, but the handler is still
-// installed, so the GVR has a log without the RECEIVED record. The rule orders
-// the store against the LIST: a real loss is published and the repair
-// attempted, #244's factory-divergence age gets its input, and applied
-// deletes reach its record.
-func TestForcedPass918_NoTransform_StillVerifiesWithTheHandler(t *testing.T) {
+// TestForcedPass918_NoDeliveryLog_StillVerifies — #875 residual B: a
+// re-registered shared-factory GVR gets its informer back from the factory
+// STOPPED (RemoveResourceType stopped it, #244), and a stopped informer takes
+// neither a transform nor a handler, so the GVR has no delivery log at all.
+// The pass still runs and the rule still orders the store against the LIST: a
+// real loss is published and the repair attempted, and #244's
+// factory-divergence age gets its input. What it cannot know — deliveries
+// received and not applied, applied deletes, a key to hold pending — is
+// #940.
+func TestForcedPass918_NoDeliveryLog_StillVerifies(t *testing.T) {
 	c3Setup(t)
 	resetVerificationForArm(t)
 	ctx := context.Background()
 	rw, _ := silentWatchClusterFor(t, factory875GVR, false, ja1.obj(factory875GVR), jb1.obj(factory875GVR))
+	rw.mu.RLock()
+	first := rw.informers[factory875GVR].Informer()
+	rw.mu.RUnlock()
 	rw.RemoveResourceType(factory875GVR)
+	j9WaitFor(t, "the removed factory informer stopping", first.IsStopped)
 	_, synced := rw.EnsureResourceType(factory875GVR)
 	select {
 	case <-synced:
@@ -845,23 +851,17 @@ func TestForcedPass918_NoTransform_StillVerifiesWithTheHandler(t *testing.T) {
 	rw.mu.RLock()
 	dl := rw.deliveries[factory875GVR]
 	rw.mu.RUnlock()
-	if dl == nil || dl.recording {
-		t.Fatalf("precondition: want a log without the RECEIVED record (log=%v)", dl)
+	if dl != nil {
+		t.Fatalf("precondition: the re-registered GVR has a delivery log (recording=%v)", dl.recording)
 	}
 	rec := attachMetaClient(t, rw)
 	cli := &j9Client{inner: rec.inner, gvr: factory875GVR}
-	// panel-a changed before the store's position: a real loss.
-	cli.answer("4242", j9Object{ja1.name, "4100", ja1.uid}, jb1)
+	cli.answer("4242", j9Object{ja1.name, "4100", ja1.uid}, jb1) // a real loss
 	rw.SetMetadataClient(cli)
 	unsupported0 := storeRepairUnsupportedTotal.Load()
 	forcedVerify(ctx, factory875GVR)
-	if lu, _, la, _ := divergenceCounts(verifySiteForced); lu != 1 || la != 0 {
-		t.Fatalf("published %d lost updates and %d lost adds, want the real update loss only", lu, la)
-	}
-	// The handler is the log's: an applied delete reaches its record.
-	dl.handler().OnDelete(j9Object{jb1.name, "5006", jb1.uid}.obj(factory875GVR))
-	if d, ok := dl.deleteFor(jb1.key()); !ok || d.rv != "5006" {
-		t.Errorf("L5: the handler-only log does not record an applied delete (%+v, %v)", d, ok)
+	if lu, _, _, _ := divergenceCounts(verifySiteForced); lu != 1 {
+		t.Fatalf("published %d lost updates for a real loss, want 1", lu)
 	}
 	if got := storeUnrecordedTotal.Load(); got != 1 {
 		t.Errorf("store_divergence_unrecorded_total = %d, want 1", got)
