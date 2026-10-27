@@ -99,6 +99,10 @@ const (
 	// the pass could not tell a real divergence from the store having moved
 	// past the LIST. Nothing was published or repaired; the GVR stays due.
 	verifySkipRecheckError = "recheck_error"
+	// #870 (design v5 §3) — the pass compared an informer instance that a
+	// swap replaced before the pass finished. Its result is discarded: the new
+	// copy is judged by its own next pass, never by the old one's comparison.
+	verifySkipInstanceChanged = "instance_changed"
 )
 
 // Unverifiable reasons — a registered GVR that no verification mechanism
@@ -201,12 +205,13 @@ type StoreVerificationStats struct {
 	InvalidatedTotal          uint64  `stat:"store_verification_invalidated_total" desc:"Verifications invalidated by a servability retraction, which makes a GVR's prior verification no longer current. CONTEXT, NOT A DETECTOR — it climbs in both regimes (krateo-057 measured 10,011 discovery_refresh retractions in 18h). It is what explains a GVR's age resetting without a verification having run."`
 
 	// --- repair ---
-	RepairsFiredTotal      uint64  `stat:"store_repairs_fired_total" desc:"Targeted relists fired to repair a divergence the forced pass found. DURING a confirmed forced-path divergence: >=1. Healthy: 0. Read it AGAINST store_divergent_*_forced_total: divergence climbing while this stays flat is detection without repair — a green counter over a still-wrong store, which is the failure the design was corrected to prevent."`
-	RepairIneffectiveTotal uint64  `stat:"store_repair_ineffective_total" desc:"Repairs after which the NEXT verification still reported divergence. ALARMABLE, and the only stat in this family whose non-zero means B ITSELF is wrong rather than the store: a full relist that does not clear a divergence does not indicate a lost event, it indicates our comparison is wrong or our view and the apiserver's differ for a reason a relist cannot fix. Healthy: 0."`
-	RepairUnsupportedTotal uint64  `stat:"store_repair_unsupported_total" desc:"Divergences whose GVR CANNOT be repaired by a relist, because its informer comes from the shared dynamic factory — which has no eviction API, so a teardown plus re-register hands back the STOPPED informer and kills the cache for that GVR instead of repairing it. Healthy: 0 in production, where the streaming path owns the informer for the overwhelming majority of GVRs. Non-zero is the honest statement that this GVR is DETECTED and NEVER repaired — a state that would otherwise look identical to a divergence nobody acted on, and one the permanence bound does NOT cover. The refused set is a CLASS determined by construction and recorded at registration, never inferred from the GVR's group."`
-	RepairSuppressedTotal  uint64  `stat:"store_repair_suppressed_total" desc:"GVRs the circuit breaker has latched after an ineffective repair. Non-zero means the permanence bound no longer holds for that GVR: its staleness is UNBOUNDED and the alarm is the only mitigation. Detection continues under suppression — the breaker never produces silence. Healthy: 0."`
-	RepairsPending         int64   `stat:"store_repairs_pending" kind:"gauge" desc:"GVRs waiting in the serialised repair queue. Repairs run ONE AT A TIME across all GVRs so a correlated divergence cannot take the cache non-servable everywhere at once; the cost of that choice is queue wait, and this is where it is visible. DURING correlated divergence: >0, the queue depth. Healthy: 0."`
-	RepairQueueAgeSeconds  float64 `stat:"store_repair_queue_age_seconds" kind:"gauge" desc:"Age of the oldest entry in the repair queue. DURING: rising without bound means the serialised queue is not draining, i.e. the staleness bound (maxVerificationAge + queue wait + one relist) has stopped holding and the real figure is hours, not minutes. Healthy: 0."`
+	RepairsFiredTotal      uint64 `stat:"store_repairs_fired_total" desc:"Targeted relists fired to repair a divergence the forced pass found. DURING a confirmed forced-path divergence: >=1. Healthy: 0. Read it AGAINST store_divergent_*_forced_total: divergence climbing while this stays flat is detection without repair — a green counter over a still-wrong store, which is the failure the design was corrected to prevent."`
+	RepairIneffectiveTotal uint64 `stat:"store_repair_ineffective_total" desc:"Repairs after which the NEXT verification still reported divergence. ALARMABLE, and the only stat in this family whose non-zero means B ITSELF is wrong rather than the store: a full relist that does not clear a divergence does not indicate a lost event, it indicates our comparison is wrong or our view and the apiserver's differ for a reason a relist cannot fix. Healthy: 0."`
+	RepairUnsupportedTotal uint64 `stat:"store_repair_unsupported_total" desc:"Divergences whose GVR CANNOT be repaired by a relist, because its informer comes from the shared dynamic factory — which has no eviction API, so a teardown plus re-register hands back the STOPPED informer and kills the cache for that GVR instead of repairing it. Healthy: 0 in production, where the streaming path owns the informer for the overwhelming majority of GVRs. Non-zero is the honest statement that this GVR is DETECTED and NEVER repaired — a state that would otherwise look identical to a divergence nobody acted on, and one the permanence bound does NOT cover. The refused set is a CLASS determined by construction and recorded at registration, never inferred from the GVR's group."`
+	RepairSuppressedTotal  uint64 `stat:"store_repair_suppressed_total" desc:"GVRs the circuit breaker has latched after an ineffective repair. Non-zero means the permanence bound no longer holds for that GVR: its staleness is UNBOUNDED and the alarm is the only mitigation. Detection continues under suppression — the breaker never produces silence. Healthy: 0."`
+	// #870 deleted store_repairs_pending and store_repair_queue_age_seconds with
+	// the serialised queue they measured. A build's open window is
+	// store_swap_known_stale_window_open_seconds_max (store_swap_stats.go).
 }
 
 // storeVerificationStatsOverride is the test seam every C7 family carries.
@@ -329,8 +334,6 @@ func StoreVerificationStatsSnapshot() StoreVerificationStats {
 		RepairIneffectiveTotal: storeRepairIneffectiveTotal.Load(),
 		RepairSuppressedTotal:  storeRepairSuppressedTotal.Load(),
 		RepairUnsupportedTotal: storeRepairUnsupportedTotal.Load(),
-		RepairsPending:         storeRepairQueueDepth(),
-		RepairQueueAgeSeconds:  storeRepairQueueAgeSeconds(),
 	}
 }
 
@@ -407,5 +410,4 @@ func ResetStoreVerificationStatsForTest() {
 	storeVerifySkipMu.Unlock()
 	storeVerificationStatsOverride.Store(nil)
 	resetStoreVerificationStateForTest()
-	resetStoreRepairForTest()
 }

@@ -267,6 +267,23 @@ type ResourceWatcher struct {
 	// re-registered and 404 forever. Guarded by rw.mu; nil until first use.
 	unservedVersions map[schema.GroupVersionResource]struct{}
 
+	// #870 — build-and-swap state (store_swap.go, store_instance.go). Guarded
+	// by rw.mu like every map above, and listed in perGVRFields, the ONE list
+	// a teardown purges and an install writes.
+	//
+	//   - instances: the LIVE instance of each registered GVR (its informer,
+	//     stop and done channels, handler adapters).
+	//   - builds: the build in progress — a muted copy constructed beside the
+	//     live one. The servability check never reads it.
+	//   - retiring: copies a swap replaced, until their Run returns.
+	//   - acted: per (GVR, handler), what each consumer last acted on; it
+	//     survives swaps. Only for owned informers (the only ones a build can
+	//     replace).
+	instances map[schema.GroupVersionResource]*storeInstance
+	builds    map[schema.GroupVersionResource]*storeBuild
+	retiring  map[schema.GroupVersionResource][]*storeInstance
+	acted     map[schema.GroupVersionResource]map[string]*actedRecord
+
 	// restConfig is the in-cluster *rest.Config — Ship 0.30.122 R4
 	// Lever 1. The streaming ListWatch (streaming_list.go) builds a
 	// rest.RESTClient from it to issue the paged composition LIST as a
@@ -997,12 +1014,16 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// because that branch is the only place that knows the answer. It must
 	// never be re-derived from the GVR's group: a shared-factory informer
 	// cannot be torn down and rebuilt (the factory caches by GVR with no
-	// eviction API and hands the stopped one back), and a repair that assumed
-	// otherwise would kill the cache for that GVR. See enqueueStoreRepair.
+	// eviction API and hands the stopped one back), and a build that assumed
+	// otherwise would install the live informer over itself. See
+	// requestStoreBuild. #870 — the branch is recorded as the instance's shape,
+	// so a build constructs its copy through the same one.
 	ownsInformer := false
+	shape := shapeFactoryMetadata
 	standalone := IsNavigationDiscoveredGroup(gvr.Group)
 	if standalone {
 		ownsInformer = true // standalone: this GVR owns it outright
+		shape = shapeStandaloneMetadata
 		gi = metadatainformer.NewFilteredMetadataInformer(
 			rw.metaClient,
 			gvr,
@@ -1052,23 +1073,20 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	}
 	rw.metadataOnly[gvr] = struct{}{}
 
-	if rw.syncCh == nil {
-		rw.syncCh = map[schema.GroupVersionResource]chan struct{}{}
-	}
-	rw.syncCh[gvr] = make(chan struct{})
-
-	// R6 (0.30.115): per-GVR stop channel — same rationale as the
-	// dynamic full-informer path. RemoveResourceType cancels this
-	// metadata informer alone.
-	rw.perGVRStopLocked(gvr)
+	// #870 — the GVR's first (live) instance. It allocates the sync channel
+	// and, R6 (0.30.115), the per-GVR stop channel — same rationale as the
+	// dynamic full-informer path: RemoveResourceType cancels this metadata
+	// informer alone.
+	in := rw.newLiveInstanceLocked(gvr, gi, shape)
 
 	resourceType := gvrResourceTypeString(gvr)
 
 	// #875 — the delivery record for the forced store verification. This
 	// path strips nothing (metadata objects carry no body), so the transform
-	// is the record alone.
+	// is the record alone (#870: wrapped by the reuse step, a no-op on a live
+	// instance).
 	dl := newDeliveryLog(gi.Informer().LastSyncResourceVersion)
-	if err := gi.Informer().SetTransform(dl.transform(nil)); err != nil {
+	if err := gi.Informer().SetTransform(in.reuseTransform(dl.transform(nil))); err != nil {
 		slog.Warn("cache.store.delivery_record_not_installed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
@@ -1076,38 +1094,19 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 			slog.String("error", err.Error()),
 		)
 	} else {
+		in.dl = dl
 		rw.rememberDeliveryLogLocked(gvr, dl)
 	}
 
-	// DepTracker event handlers (Ship A 0.30.110). Identical wiring to
-	// addResourceTypeLocked — the SHARED depEventHandlers builder. The
-	// obj coming through here is a *metav1.PartialObjectMetadata, which
-	// embeds ObjectMeta and therefore satisfies the nsNameAccessor
-	// interface used by metaNSName. ADD post-sync gate, UPDATE
-	// dirty-mark, DELETE classify+evict-via-worker are byte-identical
-	// to the full-informer path.
-	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandler(gvr)); regErr != nil {
-		slog.Warn("cache.deps.add_event_handler_failed",
-			slog.String("subsystem", "cache"),
-			slog.String("resource_type", resourceType),
-			slog.String("path", "metadata-only"),
-			slog.String("error", regErr.Error()),
-		)
-	}
-
-	// Ship 0 / 0.30.222 — declarative handler-extension registry; same
-	// iteration as the full-informer path. Production never reaches here
-	// for RBAC (the eager-registration loop in NewResourceWatcher uses
-	// the full addResourceTypeLocked path); the registry still iterates
-	// — non-matching predicates are O(1) skips — so a future caller that
-	// adds RBAC metadata-only does not silently bypass snapshot wiring.
-	attachMatchingHandlerExtensions(rw, gvr, gi.Informer())
-
-	// 0.30.98 Tag A: install the WATCH-error handler BEFORE Run
-	// (conjunct 3) — same uniform wiring as the dynamic full-informer
-	// path. The metadata-only reflector drops its WATCH on the same
-	// failure modes, so the servability gate must observe it.
-	rw.installWatchErrorHandler(gvr, gi)
+	// DepTracker event handlers (Ship A 0.30.110), the declarative
+	// handler-extension registry (Ship 0 / 0.30.222) and the WATCH-error
+	// handler (0.30.98 Tag A, conjunct 3) — the SAME wiring as the dynamic
+	// full-informer path, through the #870 adapters (wireInstanceLocked).
+	// The obj coming through here is a *metav1.PartialObjectMetadata, which
+	// embeds ObjectMeta and therefore satisfies the nsNameAccessor interface
+	// used by metaNSName. Everything is installed BEFORE Run.
+	rw.wireInstanceLocked(gvr, in, "metadata-only")
+	setComparatorRecord(gvr, in)
 
 	// Start the metadata informer and spawn the sync-watcher. We
 	// always reach this branch post-Start (the constructor never
@@ -1130,14 +1129,15 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	if rw.stopRequestedLocked() {
 		return
 	}
-	stop := rw.informerStop[gvr]
-	ch := rw.syncCh[gvr]
+	stop := in.stop
+	ch := in.syncCh
+	in.ownRun = true
 	rw.goroutineWG.Add(2)
-	go func(inf clientcache.SharedIndexInformer) {
+	go func() {
 		defer rw.goroutineWG.Done()
 		workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
-		inf.Run(stop)
-	}(gi.Informer())
+		in.runInformer()
+	}()
 	go func(hasSynced func() bool) {
 		defer rw.goroutineWG.Done()
 		waitInformerSync(hasSynced, ch, stop)
@@ -1488,6 +1488,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// #237 B — see the note at the other registration site: ownership is
 	// recorded by the constructing branch, never inferred from the group.
 	ownsInformer := false
+	shape := shapeFactoryDynamic // #870 — the branch, recorded for a build
 	if !isStreamingException(gvr) && compositionStreamingListEnabled() {
 		if sgi, ok := newStreamingDynamicInformer(
 			rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak,
@@ -1495,6 +1496,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 			gi = sgi
 			decorated = true
 			ownsInformer = true // the streaming constructor builds a fresh informer every call
+			shape = shapeStreaming
 			slog.Info("cache.streaming_list.informer_routed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
@@ -1532,6 +1534,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		standalone := IsNavigationDiscoveredGroup(gvr.Group)
 		if standalone {
 			ownsInformer = true // standalone: this GVR owns it outright
+			shape = shapeStandaloneDynamic
 			gi = dynamicinformer.NewFilteredDynamicInformer(
 				rw.dyn,
 				gvr,
@@ -1566,31 +1569,27 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// perfect health while nothing has been verified at all.
 	rememberStoreVerification(gvr, decorated, ownsInformer)
 
-	// 0.30.9 Sub-scope B: allocate the sync channel BEFORE we spawn
-	// any goroutine that could close it. The channel is closed by
-	// the late-registration sync-watcher (below, in the rw.started
-	// branch) or by the constructor-driven post-Start sync watcher
-	// (registered in NewResourceWatcher's terminal block). We
-	// allocate the channel here unconditionally so EnsureResourceType
-	// can return it for either path.
-	if rw.syncCh == nil {
-		rw.syncCh = map[schema.GroupVersionResource]chan struct{}{}
-	}
-	rw.syncCh[gvr] = make(chan struct{})
-
-	// R6 (0.30.115): allocate the per-GVR stop channel. Both the
-	// informer's Run goroutine and its sync-watcher are bound by THIS
-	// channel — not the process-wide rw.stopCh — so RemoveResourceType
-	// can cancel exactly this GVR. Stop() reaps every channel still
-	// present, so global shutdown is unchanged.
-	rw.perGVRStopLocked(gvr)
+	// #870 — the GVR's first (live) instance. It allocates:
+	//   - 0.30.9 Sub-scope B: the sync channel, BEFORE we spawn any goroutine
+	//     that could close it. The channel is closed by the late-registration
+	//     sync-watcher (below, in the rw.started branch) or by the
+	//     constructor-driven post-Start sync watcher (registered in
+	//     NewResourceWatcher's terminal block), so EnsureResourceType can
+	//     return it for either path;
+	//   - R6 (0.30.115): the per-GVR stop channel. Both the informer's Run
+	//     goroutine and its sync-watcher are bound by THIS channel — not the
+	//     process-wide rw.stopCh — so RemoveResourceType can cancel exactly
+	//     this GVR. Stop() reaps every channel still present, so global
+	//     shutdown is unchanged.
+	in := rw.newLiveInstanceLocked(gvr, gi, shape)
 
 	resourceType := gvrResourceTypeString(gvr)
 	tf := StripBulkyFieldsForResourceType(resourceType, gvr)
 	// #875 — the same transform also records each delivery for the forced
-	// store verification (store_verify_delivery.go).
+	// store verification (store_verify_delivery.go). #870 — wrapped by the
+	// reuse step, a no-op on a live instance.
 	dl := newDeliveryLog(gi.Informer().LastSyncResourceVersion)
-	if err := gi.Informer().SetTransform(dl.transform(tf)); err != nil {
+	if err := gi.Informer().SetTransform(in.reuseTransform(dl.transform(tf))); err != nil {
 		slog.Warn("cache.strip.set_transform_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
@@ -1598,6 +1597,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 			slog.Bool("post_start", rw.started),
 		)
 	} else {
+		in.dl = dl
 		rw.rememberDeliveryLogLocked(gvr, dl)
 	}
 
@@ -1623,13 +1623,11 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// UPDATE complete in O(deps-for-this-tuple); DELETE classification
 	// is likewise cheap and the eviction burst is handed to the R3
 	// worker so it never blocks the processor.
-	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandler(gvr)); regErr != nil {
-		slog.Warn("cache.deps.add_event_handler_failed",
-			slog.String("subsystem", "cache"),
-			slog.String("resource_type", resourceType),
-			slog.String("error", regErr.Error()),
-		)
-	}
+	//
+	// #870 — every handler is attached through its adapter
+	// (store_instance.go), which keeps the `seen` and `acted` records a swap
+	// needs; wireInstanceLocked attaches the dep handler, then the extensions
+	// below, then the WATCH-error handler further below — one call.
 
 	// Ship 0 / 0.30.222 — declarative handler-extension registry.
 	// Pre-Ship-0 this site carried an inline `if isTypedRBACGVR(gvr)`
@@ -1644,8 +1642,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// The handler sets themselves are unchanged. attachMatching* logs
 	// per-failure via the registry; this site stays silent on attach
 	// failures (the contract is "log loud at the owner's branch", not
-	// here).
-	attachMatchingHandlerExtensions(rw, gvr, gi.Informer())
+	// here). (#870: attached by wireInstanceLocked, below.)
 
 	// 0.30.99 Tag B — watch-handler coverage guard. Install the
 	// conjunct-3 WATCH-error handler UNCONDITIONALLY here, at
@@ -1670,7 +1667,8 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// function, so this is in fact the single install site for them
 	// too once 0.30.99 lands. assertWatchHandlerCoverageLocked verifies
 	// the invariant at boot.
-	rw.installWatchErrorHandler(gvr, gi)
+	rw.wireInstanceLocked(gvr, in, "full-unstructured")
+	setComparatorRecord(gvr, in)
 
 	if rw.started && !rw.stopRequestedLocked() {
 		// Late registration after Start(): kick the new informer.
@@ -1687,13 +1685,14 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		// Add starting from a zero counter never races the Wait. Skipping
 		// is correct on its own terms too: a freshly-spawned informer would
 		// see the already-closed stop channel and exit immediately anyway.
-		stop := rw.informerStop[gvr]
+		stop := in.stop
+		in.ownRun = true
 		rw.goroutineWG.Add(1)
-		go func(inf clientcache.SharedIndexInformer) {
+		go func() {
 			defer rw.goroutineWG.Done()
 			workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
-			inf.Run(stop)
-		}(gi.Informer())
+			in.runInformer()
+		}()
 
 		// 0.30.9 Sub-scope B: spawn the sync-watcher for this GVR.
 		// The watcher polls HasSynced (cheap atomic load in
@@ -1708,7 +1707,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		// Stop() drains them deterministically (the standalone informer
 		// Run is NOT factory-tracked, so factory.Shutdown() alone would
 		// not reap it).
-		ch := rw.syncCh[gvr]
+		ch := in.syncCh
 		rw.goroutineWG.Add(1)
 		go func(hasSynced func() bool) {
 			defer rw.goroutineWG.Done()
@@ -1767,6 +1766,13 @@ func (rw *ResourceWatcher) perGVRStopLocked(gvr schema.GroupVersionResource) cha
 func (rw *ResourceWatcher) closePerGVRStopLocked(gvr schema.GroupVersionResource) {
 	ch, ok := rw.informerStop[gvr]
 	if !ok {
+		return
+	}
+	// #870 — an instance's stop channel is closed only through its own
+	// once-guarded closeStop, because a swap's retiring wait closes it too,
+	// without rw.mu (v5.1 C3).
+	if in := rw.instances[gvr]; in != nil && in.stop == ch {
+		in.closeStop()
 		return
 	}
 	select {
@@ -1878,16 +1884,17 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 // here uniformly (feedback_no_special_cases.md: no map gets a carve-out).
 func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResource) {
 	bumpServabilityEpoch(gvr) // #854 — the informer is removed: an exit from servable
-	delete(rw.informers, gvr)
-	delete(rw.syncCh, gvr)
-	delete(rw.confirmed, gvr)
-	delete(rw.watchBroken, gvr)
-	delete(rw.listRefused, gvr)
-	delete(rw.informerStop, gvr)
-	delete(rw.metadataOnly, gvr)
-	delete(rw.lastSyncRV, gvr)
-	delete(rw.deliveries, gvr)
-	delete(rw.watchHandlerInstalled, gvr)
+	// #870 — a teardown aborts the GVR's build (abort_teardown: the slot is
+	// purged here, so its copy can never be installed — F3) and stops every
+	// copy of it.
+	aborted := rw.teardownSwapStateLocked(gvr)
+	// ONE list (perGVRFields, store_swap.go): the same set a swap writes.
+	for _, f := range perGVRFields {
+		f.del(rw, gvr)
+	}
+	for _, acc := range aborted {
+		acc.endAll(outcomeAbortTeardown, time.Now())
+	}
 	// #237 A3 — the reflector-path attribution state is keyed by GVR too, so
 	// it is purged here like every other per-GVR map. It lives behind its own
 	// mutex rather than in this struct because the classifier that reads it
@@ -2759,16 +2766,12 @@ func (rw *ResourceWatcher) everyPerGVRMapClearForTest(gvr schema.GroupVersionRes
 	}
 	rw.mu.RLock()
 	defer rw.mu.RUnlock()
-	_, inInformers := rw.informers[gvr]
-	_, inSync := rw.syncCh[gvr]
-	_, inConfirmed := rw.confirmed[gvr]
-	_, inBroken := rw.watchBroken[gvr]
-	_, inStop := rw.informerStop[gvr]
-	_, inMeta := rw.metadataOnly[gvr]
-	_, inRV := rw.lastSyncRV[gvr]
-	_, inWHI := rw.watchHandlerInstalled[gvr]
-	return !inInformers && !inSync && !inConfirmed && !inBroken &&
-		!inStop && !inMeta && !inRV && !inWHI
+	for _, f := range perGVRFields {
+		if f.has(rw, gvr) {
+			return false
+		}
+	}
+	return true
 }
 
 // Stop signals every informer goroutine to exit. Idempotent.
@@ -2812,6 +2815,16 @@ func (rw *ResourceWatcher) Stop() {
 	// is the belt-and-braces guard against any residual race.
 	for gvr := range rw.informerStop {
 		rw.closePerGVRStopLocked(gvr)
+	}
+	// #870 — every build's copy and every retiring copy is stopped too, so
+	// their Run goroutines and any swap waiting on them return.
+	for _, b := range rw.builds {
+		b.inst.closeStop()
+	}
+	for _, rs := range rw.retiring {
+		for _, r := range rs {
+			r.closeStop()
+		}
 	}
 	factory := rw.factory
 	rw.mu.Unlock()

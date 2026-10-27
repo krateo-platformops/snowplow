@@ -806,6 +806,12 @@ type RefreshStream struct {
 	// Rotated announces armed keys whose identity class moved (#819): one
 	// `refresh` frame per key on THIS connection, sent at once (not paced).
 	Rotated func(keys []string)
+	// Wrote and WroteResync (#870, design v5.1 C2) tell the store-swap push
+	// ledger that a frame was WRITTEN to this stream — called by the handler
+	// after its writeFrame returned true, with no lock held. An offer is not a
+	// write: only these close a ledger entry as pushed.
+	Wrote       func(key string)
+	WroteResync func()
 }
 
 // SubscribeRefresh is SubscribeRefreshStream without the resync channel —
@@ -828,7 +834,8 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 	if h == nil {
 		ch := make(chan string)
 		close(ch)
-		return RefreshStream{Keys: ch, Unsub: func() {}, Rotated: func([]string) {}}
+		return RefreshStream{Keys: ch, Unsub: func() {}, Rotated: func([]string) {},
+			Wrote: func(string) {}, WroteResync: func() {}}
 	}
 	limit, burst := refreshEvictionBucket()
 	s := &refreshSub{
@@ -862,6 +869,15 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 		h.mu.RUnlock()
 		noteStaleOwedArmEmit(k)
 	}
+	// #870 (P4) — the store-swap push ledger: every open entry for these keys
+	// has a subscriber now, and an entry already REFRESHED is owed a frame on
+	// this stream at once (it closes pushed_on_arm when the handler writes it).
+	// The ledger mutex is a leaf, taken with no hub lock held.
+	for _, k := range ledgerArmed(armedKeys) {
+		h.mu.RLock()
+		s.offerRefresh(k)
+		h.mu.RUnlock()
+	}
 	// #740 — an arm of a dependent resumes an abandoned stale-retry chain with an
 	// immediate attempt: the cell has a viewer again.
 	noteStaleRetryArm(armedKeys)
@@ -891,7 +907,15 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 			// uses the same "producer never sends to a closed chan" discipline.)
 		})
 	}
-	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated}
+	armedAt := s.subscribedAt
+	armedCopy := make(map[string]struct{}, len(armedKeys))
+	for k := range armedKeys {
+		armedCopy[k] = struct{}{}
+	}
+	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated,
+		Wrote:       func(k string) { ledgerFrameWritten(k, armedAt) },
+		WroteResync: func() { ledgerResyncWritten(armedCopy) },
+	}
 }
 
 // offerRotated announces keys this connection armed whose identity class

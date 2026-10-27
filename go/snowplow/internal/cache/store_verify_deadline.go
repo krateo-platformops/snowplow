@@ -75,9 +75,10 @@ import (
 	clientcache "k8s.io/client-go/tools/cache"
 )
 
-// StartStoreVerification starts the deadline walker and the serialised repair
-// worker. Called from main.go alongside StartDepsReconcile; a no-op with the
-// cache off, where there are no informers to verify.
+// StartStoreVerification starts the deadline walker. Called from main.go
+// alongside StartDepsReconcile; a no-op with the cache off, where there are no
+// informers to verify. (#870: there is no repair worker — a confirmed
+// divergence requests a build, which ends on its own events, store_swap.go.)
 func StartStoreVerification(ctx context.Context) {
 	if !ResolvedCacheEnabled() {
 		return
@@ -89,7 +90,6 @@ func StartStoreVerification(ctx context.Context) {
 			"within max_verification_age; snapshots do it for free, this walker is the backstop "+
 			"for GVRs whose watch only ever recycles"))
 	go runStoreVerificationWalker(ctx)
-	go runStoreRepairQueue(ctx)
 }
 
 // runStoreVerificationWalker picks the most overdue eligible GVR, verifies it,
@@ -160,12 +160,10 @@ func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 	var oldest time.Time
 	governed, found := 0, false
 	for gvr, row := range rows {
-		if row.repairPending {
-			// A repair for this GVR is queued or running: its store is about
-			// to be rebuilt wholesale, so verifying it now would measure a
-			// state that is already being replaced.
-			continue
-		}
+		// #870 (architect Q2) — a build sets nothing the walker reads: the
+		// live copy keeps serving while its replacement is built, so the
+		// deadline alone decides when it is verified. A re-detection joins
+		// the build; a clean pass removes the build's divergence reason.
 		governed++
 		if now.Sub(row.epoch) <= deadline {
 			continue
@@ -185,48 +183,51 @@ func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 // releases the lock BEFORE any apiserver call. Nothing in this file holds rw.mu
 // across I/O, and nothing holds rw.mu and the verification registry mutex at
 // the same time.
+//
+// #870 (design v5 §3) — it also returns the informer INSTANCE the pass
+// compares, so the result is judged against that instance only.
 func forcedPassInputs(gvr schema.GroupVersionResource) (
-	cli metadata.Interface, rv string, idx clientcache.Indexer, dl *deliveryLog, skip string,
+	cli metadata.Interface, rv string, idx clientcache.Indexer, dl *deliveryLog, inst *storeInstance, skip string,
 ) {
 	rw := Global()
 	if rw == nil || rw.mode == modePassthrough {
-		return nil, "", nil, nil, verifySkipTornDown
+		return nil, "", nil, nil, nil, verifySkipTornDown
 	}
 	rw.mu.RLock()
 	defer rw.mu.RUnlock()
 
 	gi, ok := rw.informers[gvr]
 	if !ok || gi == nil {
-		return nil, "", nil, nil, verifySkipTornDown
+		return nil, "", nil, nil, nil, verifySkipTornDown
 	}
 	inf := gi.Informer()
 	if inf == nil {
-		return nil, "", nil, nil, verifySkipTornDown
+		return nil, "", nil, nil, nil, verifySkipTornDown
 	}
 	if !inf.HasSynced() {
 		// Not yet synced: the store is still filling, and comparing a partial
 		// store against a complete apiserver set would report the remainder as
 		// lost ADDs. Same guard, same reason, as the snapshot path's.
-		return nil, "", nil, nil, verifySkipInitialSync
+		return nil, "", nil, nil, nil, verifySkipInitialSync
 	}
 	if _, servable := rw.servableLocked(gvr); !servable {
 		// Retracted. The store is not being served from, so a comparison
 		// against it would measure a cache nobody is reading — and the
 		// retraction has already invalidated this GVR's verification, so the
 		// deadline re-verifies it as soon as it is confirmed again.
-		return nil, "", nil, nil, verifySkipTornDown
+		return nil, "", nil, nil, nil, verifySkipTornDown
 	}
 	if rw.metaClient == nil {
 		// main.go's metadata.NewForConfig can legitimately fail, and the pass
 		// must SAY it cannot run rather than silently not running. A forced
 		// pass that quietly does nothing is a zero that reads as health.
-		return nil, "", nil, nil, verifySkipMetaClientNil
+		return nil, "", nil, nil, nil, verifySkipMetaClientNil
 	}
 	// #875 — nil when the informer's transform could not be installed (a
 	// re-registered shared-factory GVR gets the already-started informer back,
 	// and SetTransform refuses it). The pass still runs; see forcedVerify.
 	dl = rw.deliveries[gvr]
-	return rw.metaClient, rw.lastSyncRV[gvr], inf.GetIndexer(), dl, ""
+	return rw.metaClient, rw.lastSyncRV[gvr], inf.GetIndexer(), dl, rw.instances[gvr], ""
 }
 
 // forcedVerify runs one full comparison of a GVR against the apiserver and, on
@@ -235,7 +236,7 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	// #875 — stamped before anything can end the pass, so a GVR that keeps
 	// ending inconclusive rotates to the back of the walker's order.
 	noteVerifyAttempt(gvr)
-	cli, rv, idx, dl, skip := forcedPassInputs(gvr)
+	cli, rv, idx, dl, inst, skip := forcedPassInputs(gvr)
 	if skip != "" {
 		recordVerifySkipped(skip)
 		return
@@ -368,9 +369,17 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		}
 		report = rechecked
 	}
+	// #870 (design v5 §3, F6) — the result belongs to the instance it
+	// compared. A pass open across a swap is discarded here: it neither
+	// publishes nor latches nor requests, and the new copy is judged by its
+	// own next pass.
+	latched, discarded := Global().noteVerifiedFor(gvr, inst, report.objectsCompared, report.total())
+	if discarded {
+		return
+	}
 	publishDivergence(gvr, verifySiteForced, report)
 
-	if latched := noteVerified(gvr, report.objectsCompared, report.total()); latched {
+	if latched {
 		slog.Error("cache.store.repair_ineffective",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -381,13 +390,15 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 				"and this alarm is the only mitigation."))
 	}
 	if report.total() == 0 {
+		// #870 — a clean pass on the live copy removes only a build's
+		// divergence reason (N1); the build aborts only when no reason is left.
+		Global().noteCleanPass(gvr, inst)
 		return
 	}
 	// ORDERING IS LOAD-BEARING, and it reads as incidental: noteVerified above
-	// runs BEFORE this enqueue, so when it latches the breaker the enqueue
-	// below is already refused (enqueueStoreRepair returns false for a
-	// suppressed GVR). Reverse the two and an ineffective repair would latch
-	// AND re-enqueue in the same pass, which is the hammering the breaker
-	// exists to stop.
-	enqueueStoreRepair(gvr, "store_divergence")
+	// runs BEFORE this request, so when it latches the breaker the request
+	// below is already refused (requestStoreBuild refuses a suppressed GVR).
+	// Reverse the two and an ineffective repair would latch AND rebuild in the
+	// same pass, which is the hammering the breaker exists to stop.
+	requestStoreRepair(gvr, report.confirmedKeys())
 }

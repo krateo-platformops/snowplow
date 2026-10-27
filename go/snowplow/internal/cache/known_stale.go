@@ -619,7 +619,7 @@ func endKnownStaleOnPut(ctx context.Context, key string) knownStaleEnd {
 			return knownStaleEnd{}
 		}
 		if s.inflight {
-			if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, seq: s.seq}) {
+			if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, seq: s.seq, began: s.began}) {
 				noteStaleRetryCellChanged(key) // #740 — a healed cell's chain ends
 				return knownStaleEnd{}
 			}

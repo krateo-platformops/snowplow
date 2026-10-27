@@ -284,7 +284,12 @@ func Refreshes() http.HandlerFunc {
 			// so the stream must end now for the SPA to re-validate.
 			select {
 			case <-stream.Resync:
-				_ = writeFrame(refreshResyncFrame)
+				// #870 C2 — a WRITTEN resync closes the stream's refreshed
+				// push-ledger entries (the SPA re-reads every armed key); a
+				// failed write closes nothing.
+				if writeFrame(refreshResyncFrame) {
+					stream.WroteResync()
+				}
 				return
 			default:
 			}
@@ -292,7 +297,9 @@ func Refreshes() http.HandlerFunc {
 			case <-req.Context().Done():
 				return // client gone
 			case <-stream.Resync:
-				_ = writeFrame(refreshResyncFrame)
+				if writeFrame(refreshResyncFrame) {
+					stream.WroteResync() // #870 C2 — see above
+				}
 				return
 			case k, ok := <-stream.Keys:
 				if !ok {
@@ -303,6 +310,9 @@ func Refreshes() http.HandlerFunc {
 				if !writeFrame("event: refresh\ndata: " + k + "\n\n") {
 					return // client write failed or exceeded the deadline — disconnect
 				}
+				// #870 C2 — the frame for k was WRITTEN: the latest point the
+				// server can observe. Only now does a push-ledger entry close.
+				stream.Wrote(k)
 			case <-classMoved:
 				// #819: an RBAC publish or the #682 epoch may have moved this
 				// identity's class. Re-acquire first (coalesced: notes during the

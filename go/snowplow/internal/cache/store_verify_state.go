@@ -406,3 +406,48 @@ func resetStoreVerificationStateForTest() {
 	storeVerify.gvrs = map[schema.GroupVersionResource]*gvrVerification{}
 	storeVerify.mu.Unlock()
 }
+
+// #870 — the build path's reads and writes of this registry. Each takes only
+// storeVerify.mu and may run under rw.mu (the documented order).
+
+// storeVerificationOwnership reports gvr's RECORDED ownsInformer (set by the
+// constructing branch at registration), whether gvr is known, and whether the
+// breaker has suppressed its repairs.
+func storeVerificationOwnership(gvr schema.GroupVersionResource) (owned, known, suppressed bool) {
+	storeVerify.mu.Lock()
+	defer storeVerify.mu.Unlock()
+	st, ok := storeVerify.gvrs[gvr]
+	if !ok {
+		return false, false, false
+	}
+	return st.ownsInformer, true, st.suppressed
+}
+
+// markRepairPending sets the /debug row's "a build with reason divergence is
+// open". Nothing schedules on it: the walker's deadline alone decides when the
+// live copy is verified (architect Q2).
+func markRepairPending(gvr schema.GroupVersionResource, on bool) {
+	storeVerify.mu.Lock()
+	if st, ok := storeVerify.gvrs[gvr]; ok {
+		st.repairPending = on
+	}
+	storeVerify.mu.Unlock()
+}
+
+// resetVerificationAfterSwap is the install's write (design v5 §2.6 step 1):
+// the new copy has not been verified, so its deadline restarts now; and when
+// the build repaired a divergence, the next verification judges the repair
+// (the breaker's input, bound 3). No verification registry state is wiped:
+// suppression and the factory-divergence age survive the swap.
+func resetVerificationAfterSwap(gvr schema.GroupVersionResource, repaired bool) {
+	storeVerify.mu.Lock()
+	if st, ok := storeVerify.gvrs[gvr]; ok {
+		st.epoch = time.Now()
+		st.verified = false
+		st.repairPending = false
+		if repaired {
+			st.repairedAwaitingVerify = true
+		}
+	}
+	storeVerify.mu.Unlock()
+}
