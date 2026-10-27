@@ -227,7 +227,10 @@ func seedTerminalGuardFor(mode seedScopeMode, handle cacheHandle, key string) se
 // (the refresh-overwrite case above converges fresh). A sink-less ctx would make
 // every accepted keepwarm / gvr-discovered seed Put a nil-sink drift
 // (unguarded_put_total++ plus a fail-fresh remark = refresher amplification).
-func seedTerminalPut(ctx context.Context, handle cacheHandle, key string, entry *cache.ResolvedEntry, g seedTerminalGuard) bool {
+//
+// v is the seed resolve's Put-gate verdict (cache.PutGateVerdict): the writes
+// below take it and store nothing unless it allows the Put (#912 re-review).
+func seedTerminalPut(ctx context.Context, handle cacheHandle, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, g seedTerminalGuard) bool {
 	// #424 — the cohort's RBAC class must still be the one key was minted for
 	// (a grant/revoke on the representative mid-resolve makes the body another
 	// class's). Refused like a generation move: no cell, no dep Record. Applies
@@ -247,14 +250,13 @@ func seedTerminalPut(ctx context.Context, handle cacheHandle, key string, entry 
 	if g.guarded || (g.boot && cache.IsPhase1Done()) {
 		// Post-readyz (any mode, or a boot unit whose Put crossed the /readyz
 		// flip): gen-guarded. The IfGen method runs the #375 remark on accept.
-		return handle.PutIfGen(ctx, key, entry, g.gen)
+		return handle.PutResolvedIfGen(ctx, v, key, entry, g.gen)
 	}
 	// Pre-readyz boot: plain, so an LRU-evicted cell is never refused (#323), but
 	// with the #375 remark (#408). A dep that moved during this resolve dirty-
 	// marked a key that was not resident yet, so the refresher skipped it; the
 	// remark re-marks it now that it is.
-	handle.PutThenRemark(ctx, key, entry)
-	return true
+	return handle.PutResolvedThenRemark(ctx, v, key, entry)
 }
 
 // seedTerminalGuardCtxKey carries the captured seedTerminalGuard from

@@ -744,7 +744,7 @@ func TestIssue548_L1Hit_StillArms(t *testing.T) {
 			t.Fatalf("PRECONDITION: live widgets key/handle expected")
 		}
 		warm := []byte(`{"warm":"widget-cell"}` + "\n")
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
 
 		restore := installWidgetFakes(t, cr, func() bool { return true },
 			func(context.Context, widgets.ResolveOptions) (*widgets.Widget, error) {
@@ -770,7 +770,7 @@ func TestIssue548_L1Hit_StillArms(t *testing.T) {
 			t.Fatalf("PRECONDITION: live restactions key/handle expected")
 		}
 		warm := []byte(`{"warm":"ra-cell"}` + "\n")
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
 
 		restore := installRAFakes(t, h1RAUnstructured(), func() bool { return true },
 			func(context.Context, restactions.ResolveOptions) (*templatesv1.RESTAction, error) {

@@ -260,7 +260,7 @@ func TestEdge3_FC2_FastPathServeGoesStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raKey refresh resolve failed: %v", err)
 	}
-	store.PutRAFullList(raKey, raKeyInputs, freshFull)
+	store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, raKeyInputs, freshFull)
 
 	// The refresher: a widget key handed to it re-serves via the 4a fast path
 	// (now over the FRESH raKey cell) and re-Puts the widget cell. This is the
@@ -358,7 +358,7 @@ func edge3MutateAndAssertConverge(t *testing.T, base context.Context, gRA, backi
 	if err != nil {
 		t.Fatalf("raKey refresh resolve failed: %v", err)
 	}
-	store.PutRAFullList(raKey, raKeyInputs, freshFull)
+	store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, raKeyInputs, freshFull)
 
 	byKey := map[string]edge3Widget{}
 	for _, w := range widgets {
@@ -464,7 +464,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pre-warm resolve failed: %v", err)
 	}
-	store.PutRAFullList(raKey, raKeyInputs, fullDict)
+	store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, raKeyInputs, fullDict)
 	cache.RecordSliceability(raKey, shape, true)
 	d.Record(context.Background(), raKey, gRA, edge3BackingNS, raName) // RA-CR self-dep (mirror ra_full_list.go:469)
 
@@ -670,7 +670,7 @@ func TestEdge3_E2E_ResolveB2B3WiringThroughApirefResolve(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pre-warm resolve failed: %v", err)
 	}
-	store.PutRAFullList(raKey, raKeyInputs, fullDict)
+	store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, raKeyInputs, fullDict)
 	cache.RecordSliceability(raKey, shape, true)
 	d.Record(context.Background(), raKey, gRA, ns, raName) // RA-CR self-dep
 

@@ -37,6 +37,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -273,6 +274,15 @@ func raFullListServe(
 	c := cache.ResolvedCache()
 	if c == nil {
 		return nil, false, nil // cache off — fall back
+	}
+	// #912 re-review — a RESTAction that DECLARES a write is never stored (#903
+	// F1), so this layer, which exists to cache its full list, has nothing to
+	// serve; and its first-sight path resolves the RESTAction TWICE (unpaginated
+	// for the cell, page-keyed for the byte-verify), which would send the write
+	// twice for one /call. Fall back to the page-keyed resolve, which runs it
+	// exactly once.
+	if ra != nil && restactionsapi.DeclaresWrite(ra.Spec.API) {
+		return nil, false, nil
 	}
 
 	// #592 — THE 1.12.3 A-1 BYPASS WAS REMOVED HERE. It used to refuse this whole
@@ -530,7 +540,7 @@ func raFullListServe(
 		// #684 — GenuineExternal (#681 C2): the requester's own-credential
 		// apiserver 403 is not an external touch. Read through the shared
 		// Put-gate verdict, which also declines a declared write (#903 F1).
-		if raFullListPermanentDecline(ctx, gate) {
+		if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
@@ -545,7 +555,11 @@ func raFullListServe(
 		// minted for; a change mid-resolve makes `full` another class's body.
 		// Serve the slice (correct for this requester), never write it.
 		// #684 — a stage error that is not a per-identity forbidden declines.
-		if cache.DeclineSensitivePut(fullCtx) || raFullListStageDecline(ctx, gate) ||
+		// #912 re-review — the verdict is taken over everything this path
+		// resolved, and the write itself takes it: PutRAFullListIfGen stores
+		// nothing unless it allows the Put.
+		v := raFullListVerdict(gate)
+		if cache.DeclineSensitivePut(fullCtx) || raFullListDeclines(ctx, v) ||
 			!raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
@@ -554,8 +568,8 @@ func raFullListServe(
 		// resolve that built `full` has run by now, so a nested refilter has
 		// bumped the sink).
 		stampObservedUAF()
-		if c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0) {
-			noteRAFullListDenialOnlyPut(gate)
+		if c.PutRAFullListIfGen(fullCtx, v, raKey, keyInputs, full, raGen0) {
+			noteRAFullListDenialOnlyPut(v)
 			// #375 C3 — under fullCtx (the Put's sink; it chains to the widget sink, which
 			// still receives the dep), so an RA edit in [Put-check, Record) is re-checked.
 			cache.Deps().Record(fullCtx, raKey, gvr, namespace, name)
@@ -612,7 +626,7 @@ func raFullListServe(
 	// the sink reflects either one touching the external fetch (#684: both
 	// resolve under the gate sinks; GenuineExternal per #681 C2). Read through
 	// the shared Put-gate verdict, which also declines a declared write.
-	if raFullListPermanentDecline(ctx, gate) {
+	if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
 	}
@@ -717,15 +731,16 @@ func raFullListServe(
 	// #424 — same identity-class re-check as the repopulate branch.
 	// #398 — a full list built from a sensitive read is never cached.
 	// #684 — nor one with a stage error that is not a per-identity forbidden.
-	if cache.DeclineSensitivePut(fullCtx) || raFullListStageDecline(ctx, gate) ||
+	v := raFullListVerdict(gate) // #912 re-review — twin of the repopulate branch
+	if cache.DeclineSensitivePut(fullCtx) || raFullListDeclines(ctx, v) ||
 		!raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sGo, true, nil
 	}
 	// #592 — observed limb, twin of the repopulate branch above.
 	stampObservedUAF()
-	if c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0) {
-		noteRAFullListDenialOnlyPut(gate)
+	if c.PutRAFullListIfGen(fullCtx, v, raKey, keyInputs, full, raGen0) {
+		noteRAFullListDenialOnlyPut(v)
 	}
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
 	return sGo, true, nil
@@ -739,16 +754,21 @@ var raFullListStageErrorDeclined atomic.Uint64
 // RAFullListStageErrorDeclinedForTest reads the counter.
 func RAFullListStageErrorDeclinedForTest() uint64 { return raFullListStageErrorDeclined.Load() }
 
-// raFullListStageDecline is the #681 stage-error gate on the full-list cell,
-// over the full list's own sinks (#684): any stage error declines unless
-// EVERY one was a per-identity forbidden (cache.DenialOnly — the one predicate
-// every Put site shares). The denial-only body is already identity-free: the
-// resolver records F1 and F2 as the canonical forbidden body.
-func raFullListStageDecline(ctx context.Context, g cache.PutGateSinks) bool {
-	if cache.PutGateVerdict(g, cache.CacheEntryClassRAFullList).Reason != cache.PutReasonStageError {
+// raFullListVerdict is the full-list cell's Put-gate verdict, over the full
+// list's own sinks (#684): the same cache.PutGateVerdict every Put site reads.
+func raFullListVerdict(g cache.PutGateSinks) cache.PutVerdict {
+	return cache.PutGateVerdict(g, cache.CacheEntryClassRAFullList)
+}
+
+// raFullListDeclines reports whether the verdict declines the full-list Put
+// (any reason; the write would refuse it anyway). A stage error that is not a
+// per-identity forbidden (#681 DenialOnly false) is counted; the reason only
+// selects the counter.
+func raFullListDeclines(ctx context.Context, v cache.PutVerdict) bool {
+	if v.Store() {
 		return false
 	}
-	if !cache.Inert(ctx) { // #443 — dry-run traffic is not a decline
+	if v.Reason() == cache.PutReasonStageError && !cache.Inert(ctx) { // #443 — dry-run traffic is not a decline
 		raFullListStageErrorDeclined.Add(1)
 	}
 	return true
@@ -756,24 +776,23 @@ func raFullListStageDecline(ctx context.Context, g cache.PutGateSinks) bool {
 
 // noteRAFullListDenialOnlyPut counts a STORED full-list cell that carried
 // stage errors (the gate admitted it, so they were all per-identity forbidden).
-func noteRAFullListDenialOnlyPut(g cache.PutGateSinks) {
-	if cache.PutGateVerdict(g, cache.CacheEntryClassRAFullList).DenialOnly {
+func noteRAFullListDenialOnlyPut(v cache.PutVerdict) {
+	if v.DenialOnly() {
 		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteRAFullList)
 	}
 }
 
-// raFullListPermanentDecline is the full-list cell's permanent decline, over
-// its own sinks (#684), from the shared Put-gate verdict: a declared write
-// (#903 F1) or a genuine external touch (alone, or beside a stage error) — no
-// resolve of this RESTAction can ever be stored. A transient stage error is
-// raFullListStageDecline's, later. The external-skip counter counts external
-// touches only.
-func raFullListPermanentDecline(ctx context.Context, g cache.PutGateSinks) bool {
-	v := cache.PutGateVerdict(g, cache.CacheEntryClassRAFullList)
+// raFullListPermanentDecline is the full-list cell's early decline, taken as
+// soon as the resolve ran: a PERMANENT verdict (a declared write, #903 F1, or a
+// genuine external touch, alone or beside a stage error) means no resolve of
+// this RESTAction can ever be stored, so no sliceability verdict is recorded
+// either. A transient decline is raFullListDeclines', at the Put. The
+// external-skip counter counts external touches only.
+func raFullListPermanentDecline(ctx context.Context, v cache.PutVerdict) bool {
 	if !v.Permanent() {
 		return false
 	}
-	if v.Reason != cache.PutReasonDeclaredWrite && !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
+	if v.Reason() != cache.PutReasonDeclaredWrite && !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
 		cache.BumpExternalSkippedPut()
 	}
 	return true

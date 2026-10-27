@@ -119,6 +119,26 @@ func (h *getRecordingHandle) PutEndingKnownStale(ctx context.Context, key string
 	h.Put(key, entry)
 }
 
+// #912 re-review — the verdict-gated writes the cacheHandle interface carries;
+// like the store, they refuse a declining verdict.
+func (h *getRecordingHandle) PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool {
+	return v.Store() && h.PutIfGen(ctx, key, entry, capturedGen)
+}
+func (h *getRecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool {
+	if !v.Store() {
+		return false
+	}
+	h.PutThenRemark(ctx, key, entry)
+	return true
+}
+func (h *getRecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool {
+	if !v.Store() {
+		return false
+	}
+	h.PutEndingKnownStale(ctx, key, entry)
+	return true
+}
+
 // getCount is method-AGNOSTIC: the number of liveness reads (Get + #376 GetNoTouch),
 // so "a liveness read occurred / did not occur" assertions survive the #376 switch
 // of the seed-skip read from Get to GetNoTouch.

@@ -104,6 +104,13 @@ var (
 	// refresher's counter). Exposed as snowplow_phase1_seed_skipped_stage_error_total.
 	pipSeedSkippedStageErrorTotal atomic.Uint64
 
+	// #912 re-review — pipSeedSkippedDeclaredWriteTotal counts seed Puts declined
+	// because the RESTAction DECLARES a write stage (#903 F1: never stored). Its
+	// own series, not folded into the stage-error one: a declared write is not a
+	// degraded resolve, and it is permanent (the cell is marked and skipped).
+	// Exposed as snowplow_phase1_seed_skipped_declared_write_total.
+	pipSeedSkippedDeclaredWriteTotal atomic.Uint64
+
 	// F.4 (design §3.2) — pipSeedFreshSkipTotal counts boot-scope seed targets
 	// fast-forwarded by the boot-only fresh-skip: a live (non-expired) L1 cell
 	// already existed under the production key, so the resolve + Put were
@@ -292,6 +299,11 @@ func registerPIPMetrics() {
 		// refresherSkippedStageError so a keepwarm-sweep decline is attributable.
 		expvar.Publish("snowplow_phase1_seed_skipped_stage_error_total", expvar.Func(func() any {
 			return pipSeedSkippedStageErrorTotal.Load()
+		}))
+		// #912 re-review — seed Puts declined because the RESTAction declares a
+		// write (#903 F1). SEED-SCOPED, its own reason.
+		expvar.Publish("snowplow_phase1_seed_skipped_declared_write_total", expvar.Func(func() any {
+			return pipSeedSkippedDeclaredWriteTotal.Load()
 		}))
 
 		// F.4 (design §3.2) — boot-scope seed targets fresh-skipped (live cell

@@ -251,6 +251,26 @@ func (h *s394RecordingHandle) PutIfGen(_ context.Context, _ string, _ *cache.Res
 	return g == h.gen
 }
 
+// #912 re-review — the verdict-gated writes; like the store, they refuse a
+// declining verdict.
+func (h *s394RecordingHandle) PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry, g uint64) bool {
+	return v.Store() && h.PutIfGen(ctx, k, e, g)
+}
+func (h *s394RecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry) bool {
+	if !v.Store() {
+		return false
+	}
+	h.PutThenRemark(ctx, k, e)
+	return true
+}
+func (h *s394RecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry) bool {
+	if !v.Store() {
+		return false
+	}
+	h.PutEndingKnownStale(ctx, k, e)
+	return true
+}
+
 func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) {
 	// guardedByMode is the classification table. A new seedScopeMode constant
 	// fails below until it is added here — and only seedModeBoot may be false.
@@ -285,7 +305,7 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 		if g.guarded != c.guarded {
 			t.Errorf("#394: seedTerminalGuardFor(%s) = {guarded:%v}, want {guarded:%v}", name, g.guarded, c.guarded)
 		}
-		if !seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, g) {
+		if !seedTerminalPut(context.Background(), h, fixtureStoreVerdict, "k", &cache.ResolvedEntry{}, g) {
 			t.Errorf("#394: %s: an unmoved generation must be accepted", name)
 		}
 		if c.guarded {
@@ -294,7 +314,7 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 					"puts=%d putIfGens=%d gen=%d", name, h.puts, h.putIfGens, h.lastCapturedGenInPut)
 			}
 			h.gen = 8 // a removal moved the generation
-			if seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, g) {
+			if seedTerminalPut(context.Background(), h, fixtureStoreVerdict, "k", &cache.ResolvedEntry{}, g) {
 				t.Errorf("#394: %s: a moved generation must be REFUSED", name)
 			}
 		} else if h.puts != 0 || h.putIfGens != 0 || h.putThenRemarks != 1 {
@@ -317,7 +337,7 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 	pre := seedTerminalGuardFor(seedModeBoot, h, "k")
 	cache.MarkPhase1Done()
 	h.gen = 8 // a removal during the resolve, after the capture
-	if seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, pre) {
+	if seedTerminalPut(context.Background(), h, fixtureStoreVerdict, "k", &cache.ResolvedEntry{}, pre) {
 		t.Errorf("#408: a boot Put that crossed the /readyz flip must be gen-guarded and REFUSE a moved generation")
 	}
 	if h.putIfGens != 1 || h.lastCapturedGenInPut != 7 || h.puts != 0 || h.putThenRemarks != 0 {

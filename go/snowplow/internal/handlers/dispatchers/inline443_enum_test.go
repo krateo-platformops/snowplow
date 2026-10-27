@@ -334,7 +334,8 @@ var cacheAllow443 = map[string]cacheClass443{
 	// package) and PutVerdict.Permanent are pure reads of them. None touches
 	// cache, informer, dep or refresher state.
 	"WithChildPutGateSinks": readOnly443, "PutGateVerdict": readOnly443,
-	"PutVerdict.Permanent": readOnly443,
+	"PutVerdict.Permanent": readOnly443, "PutVerdict.Store": readOnly443, "PutVerdict.Reason": readOnly443,
+	"PutVerdict.DenialOnly": readOnly443,
 	// The denial-only Put counter: a process counter, reached only after a
 	// PutRAFullListIfGen that STORED (which refuses under the flag).
 	"RecordDenialOnlyPut": telemetry443,

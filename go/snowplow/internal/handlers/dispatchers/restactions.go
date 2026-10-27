@@ -595,7 +595,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// The shared Put-gate verdict (cache.PutGateVerdict): a declared write
 		// (#903 F1), a stage error that is not per-identity forbidden (#681), a
 		// genuine external touch. Each reason keeps its own log and counter.
-		switch verdict.Reason {
+		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
 			// DEBUG: designed, and it fires on every /call of a write RESTAction.
 			log.Debug("RESTAction declares a write stage; declining to cache",
@@ -679,7 +679,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// delete body) if a DELETE-eviction bumped the key's generation during
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
 			noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
-			putStored := cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
+			putStored := cacheHandle.PutResolvedIfGen(ctx, verdict, cacheKey, &cache.ResolvedEntry{
 				RawJSON:       encoded,
 				Inputs:        cacheInputs,
 				TTLOverride:   uafTTLOverrideForEntry(cacheInputs),
@@ -691,7 +691,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// during the resolve) stored no cell, so — exactly like the declined
 			// branches above (1.12.3 A-1) — there is nothing to dep-track and
 			// nothing to announce.
-			if putStored && verdict.DenialOnly {
+			if putStored && verdict.DenialOnly() {
 				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallRA) // #681
 			}
 			if putStored {

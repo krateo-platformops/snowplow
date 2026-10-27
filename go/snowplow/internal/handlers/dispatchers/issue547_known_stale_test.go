@@ -1096,7 +1096,7 @@ func TestIssue547_F7_KnownStaleSharedShellIsServedAndRevalidatedInTheBackground(
 	shell.Object["status"] = map[string]any{"widgetData": map[string]any{"conditions": []any{
 		map[string]any{"type": "Ready", "status": "True", "reason": "v0"}}}}
 	raw, _ := json.Marshal(shell.Object)
-	handle.Put(contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
+	putFixture(handle, contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
 	cache.Deps().Record(context.Background(), contentKey, k547CompGVR, k547CompNS, fmt.Sprintf("comp-%d", k547Changed))
 	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
 		t.Fatalf("PRECONDITION: the shared shell must serve before the UPDATE (code=%d reason=%q)", code, r)
@@ -1531,7 +1531,7 @@ func TestIssue547_F12_PermanentSuppressionSkipsTheShellBackgroundRevalidation(t 
 	shell.Object["status"] = map[string]any{"widgetData": map[string]any{"conditions": []any{
 		map[string]any{"type": "Ready", "status": "True", "reason": "v0"}}}}
 	raw, _ := json.Marshal(shell.Object)
-	handle.Put(contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
+	putFixture(handle, contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
 	cache.Deps().Record(context.Background(), contentKey, k547CompGVR, k547CompNS, fmt.Sprintf("comp-%d", k547Changed))
 
 	d0 := k547Stat("dirty_ended_unfresh_dropped")

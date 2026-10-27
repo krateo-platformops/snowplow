@@ -1,32 +1,32 @@
-// Package verdict is the site-class 4 RED-arm fixture (#912 re-review): every
-// ResolvedEntry Put site reads the shared Put-gate verdict. It is parsed, never
-// compiled. The checker (-verdict-only) must FLAG the two offending sites and
-// accept the two well-formed ones.
+// Package verdict is the site-class 4 RED-arm fixture (#912 re-review). The
+// typed checker (-verdict-only) must FLAG every ungated write of a
+// ResolvedEntry — a direct call, a method value, an ad-hoc interface over the
+// store, an entry built without a literal — and accept the verdict-gated ones.
 package verdict
 
-import "github.com/krateo-platformops/snowplow/internal/cache"
+import (
+	"context"
 
-func gatedSite(handle *cache.ResolvedCacheStore, key string, g cache.PutGateSinks) {
-	// WELL-FORMED: the function decides through the verdict.
-	if !cache.PutGateVerdict(g, "restactions").Store() {
-		return
-	}
-	handle.Put(key, &cache.ResolvedEntry{})
+	"github.com/krateo-platformops/snowplow/internal/cache"
+)
+
+func gated(ctx context.Context, c *cache.ResolvedCacheStore, v cache.PutVerdict) {
+	c.PutResolvedIfGen(ctx, v, "k", &cache.ResolvedEntry{}, 0)
 }
 
-func namedSite(handle *cache.ResolvedCacheStore, key string) {
-	// WELL-FORMED: names where its verdict is taken.
-	// put-verdict: taken by the caller, fixture.
-	handle.Put(key, &cache.ResolvedEntry{})
+func direct(ctx context.Context, c *cache.ResolvedCacheStore) {
+	c.PutIfGen(ctx, "k", &cache.ResolvedEntry{}, 0)
 }
 
-func bypassSite(handle *cache.ResolvedCacheStore, key string) {
-	// OFFENDING: a Put that never reads the verdict (the #915 / #912 N1 shape).
-	handle.Put(key, &cache.ResolvedEntry{})
+func methodValue(c *cache.ResolvedCacheStore) {
+	put := c.Put
+	put("k", new(cache.ResolvedEntry))
 }
 
-func emptyReasonSite(handle *cache.ResolvedCacheStore, key string) {
-	// OFFENDING: an annotation with no reason.
-	// put-verdict:
-	handle.Put(key, &cache.ResolvedEntry{})
+func viaInterface(c *cache.ResolvedCacheStore, e *cache.ResolvedEntry) {
+	var w interface {
+		PutThenRemark(ctx context.Context, key string, entry *cache.ResolvedEntry)
+	} = c
+	copied := *e
+	w.PutThenRemark(context.Background(), "k", &copied)
 }

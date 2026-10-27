@@ -156,7 +156,7 @@ func TestIssue883_MemoHitIsTheMissPath_FullListServe(t *testing.T) {
 			"tags": []any{"<a&b>", " ", "é", nil, true}, "empty": map[string]any{}, "earr": []any{},
 		}
 	}
-	e.store.PutRAFullList(e.raKey, e.raIn, map[string]any{
+	e.store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), e.raKey, e.raIn, map[string]any{
 		"compositionspanels": items,
 		"meta":               map[string]any{"f": 0.1, "exp": 1e300, "n": nil, "nested": map[string]any{"a": []any{1.0, 2.5}}},
 	})

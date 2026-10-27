@@ -71,7 +71,7 @@ func TestFARCH1_SeedParity_NonDeclaredWidget_PortalShapedHIT(t *testing.T) {
 		t.Fatal("F-ARCH-1: expected a live per-cohort cache handle + key under the seed ctx")
 	}
 	body := []byte(`{"status":{"widgetData":{"label":"warm"}}}`)
-	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
+	putFixture(seedHandle, seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
 
 	// SERVE key: the REAL dispatcher fold under a POST-CONTRACT portal request
 	// (empty extras) — effectiveKeyExtras(ctx, cr, portalDashboardRequest()).
@@ -137,7 +137,7 @@ func TestFARCH1_F6_OldFrontendRequest_NowHits(t *testing.T) {
 		t.Fatal("F-ARCH-1 F6: expected a live seed handle + key")
 	}
 	body := []byte(`{"x":1}`)
-	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
+	putFixture(seedHandle, seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
 
 	// OLD-FRONTEND serve request: unconditional identity extras on the wire. Under
 	// F6 the undeclared widget DROPS them from the key.

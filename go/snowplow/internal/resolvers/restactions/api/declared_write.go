@@ -15,3 +15,10 @@ func declaredWriteStage(items []*templates.API) string {
 	}
 	return ""
 }
+
+// DeclaresWrite reports whether a RESTAction spec declares a write stage — the
+// same classification, for callers outside this package (the apiref raFullList
+// layer, which never serves such a RESTAction).
+func DeclaresWrite(items []*templates.API) bool {
+	return declaredWriteStage(items) != ""
+}

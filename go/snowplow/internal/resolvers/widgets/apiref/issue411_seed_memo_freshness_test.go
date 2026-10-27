@@ -106,7 +106,7 @@ func i411Setup(t *testing.T, raName string) *i411Fixture {
 	if err != nil {
 		t.Fatalf("pre-warm resolve failed: %v", err)
 	}
-	store.PutRAFullList(f.raKey, f.raIn, fullDict)
+	store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), f.raKey, f.raIn, fullDict)
 	cache.RecordSliceability(f.raKey, shape, true)
 	d.Record(context.Background(), f.raKey, gRA, ns, raName) // RA-CR self-dep
 
@@ -204,7 +204,7 @@ func (f *i411Fixture) drain(widgets map[string]string) {
 	if err != nil {
 		f.t.Fatalf("raKey refresh resolve failed: %v", err)
 	}
-	store.PutRAFullList(f.raKey, f.raIn, fresh)
+	store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), f.raKey, f.raIn, fresh)
 	for key, name := range widgets {
 		if !marked[key] {
 			continue

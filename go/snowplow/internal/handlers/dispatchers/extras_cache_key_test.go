@@ -154,7 +154,7 @@ func TestExtras_WidgetContentCell_NoCrossCollision(t *testing.T) {
 	}
 
 	bodyA := []byte(`{"status":{"widgetData":{"tenant":"acme"}}}`)
-	handle.Put(keyA, &cache.ResolvedEntry{RawJSON: bodyA})
+	putFixture(handle, keyA, &cache.ResolvedEntry{RawJSON: bodyA})
 
 	// Request B (different extras) must NOT hit A's cell.
 	if _, hit := handle.Get(keyB); hit {

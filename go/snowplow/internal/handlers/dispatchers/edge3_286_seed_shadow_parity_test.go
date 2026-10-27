@@ -187,7 +187,7 @@ func e3286PrewarmRAKey(t *testing.T, marker string) string {
 	raKey := cache.ComputeKey(inputs)
 	// The apiRef caller-class is "apiref" (raFullListServe's raFullListCallerClass).
 	shape := cache.SliceShapeHash("apiref", g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286SliceJQ)
-	cache.ResolvedCache().PutRAFullList(raKey, inputs, e3286FullDict(marker))
+	cache.ResolvedCache().PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, inputs, e3286FullDict(marker))
 	cache.RecordSliceability(raKey, shape, true)
 	cache.Deps().RecordList(context.Background(), raKey, e3286BackingGVR(), e3286NS) // edge-2 (backing LIST)
 	cache.Deps().Record(context.Background(), raKey, g, e3286NS, e3286RAName)        // RA-CR self-dep
@@ -319,7 +319,7 @@ func TestEdge3_286_SeedShadowParityDoesNotPerturbCapture(t *testing.T) {
 	// through the real dep decision site; a refresher re-serves any dirty-marked
 	// widget. Both siblings carry edge-3, so both must converge.
 	inputs := e3286KeyInputs(g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286BindingUID, nil)
-	cache.ResolvedCache().PutRAFullList(raKey, inputs, e3286FullDict("NEW"))
+	cache.ResolvedCache().PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, inputs, e3286FullDict("NEW"))
 
 	widgets := map[string]context.Context{
 		w2Off: cache.WithL1KeyContext(base, w2Off),

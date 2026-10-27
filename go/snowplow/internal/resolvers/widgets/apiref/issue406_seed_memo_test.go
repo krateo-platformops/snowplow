@@ -59,7 +59,7 @@ func TestIssue406_SeedMemo_RAEditBeforeSeed_AllSeededWidgetsConverge(t *testing.
 	if err != nil {
 		t.Fatalf("pre-warm resolve: %v", err)
 	}
-	store.PutRAFullList(raKey, raIn, full)
+	store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, raIn, full)
 	cache.RecordSliceability(raKey, seedFullListShape(gRA, ns, raName, ra(raSliceJQ)), true)
 	d.Record(context.Background(), raKey, gRA, ns, raName)
 

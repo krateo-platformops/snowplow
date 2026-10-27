@@ -111,7 +111,7 @@ func i507Setup(t *testing.T, ttlS, maxAgeS int) i507Fixture {
 // un-did.
 func (f i507Fixture) coldResidentUnseeded(t *testing.T, bodyAge time.Duration) time.Time {
 	t.Helper()
-	f.handle.Put(f.key, &cache.ResolvedEntry{RawJSON: []byte(`{"seed":1}`), Inputs: f.inputs, SeededAtBoot: true})
+	putFixture(f.handle, f.key, &cache.ResolvedEntry{RawJSON: []byte(`{"seed":1}`), Inputs: f.inputs, SeededAtBoot: true})
 	born, ok := f.handle.GetNoTouch(f.key)
 	if !ok {
 		t.Fatal("SETUP: the boot-seed insert left no resident cell")
@@ -263,7 +263,7 @@ func TestIssue507_SweepPreservesGenuineBootProvenance(t *testing.T) {
 	f := i507Setup(t, 60, 86400)
 	// A genuine boot seed: SeededAtBoot=true, lastRead zero, body old enough that
 	// the sweep will not age-skip it. No refresher has replaced it.
-	f.handle.Put(f.key, &cache.ResolvedEntry{
+	putFixture(f.handle, f.key, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"seed":1}`), Inputs: f.inputs, SeededAtBoot: true,
 		CreatedAt: time.Now().Add(-30 * time.Second),
 	})

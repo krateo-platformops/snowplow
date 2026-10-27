@@ -152,7 +152,7 @@ func setup765b(t *testing.T, mode string, in jqinterest.Interest) *env765b {
 	if err != nil {
 		t.Fatalf("raKey pre-warm: %v", err)
 	}
-	e.store.PutRAFullList(e.raKey, e.raIn, full)
+	e.store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), e.raKey, e.raIn, full)
 	cache.RecordSliceability(e.raKey, seedFullListShape(gRA, edge3BackingNS, raName765b, ra(raSliceJQ)), true)
 	cache.Deps().Record(context.Background(), e.raKey, gRA, edge3BackingNS, raName765b)
 	return e
@@ -380,7 +380,7 @@ func TestReplay765b_P8b_AWidgetSlicingADirtyV2IsAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("V2 resolve: %v", err)
 	}
-	e.store.PutRAFullList(e.raKey, e.raIn, full)
+	e.store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), e.raKey, e.raIn, full)
 	if got := state765b(e.raKey); got != "all" {
 		t.Fatalf("P8b setup: V2 must leave the raKey edge all, got %q", got)
 	}

@@ -67,7 +67,7 @@ func TestFC3_SeedRewalk_GVRDiscovered_ReResolvesWarmCell_RepopulatesEdge(t *test
 	// Install a LIVE cell under the production key — the "already warm from the
 	// iterator-empty first pass" state (warm, but the empty iterator recorded no
 	// LIST edge).
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("F-C3 setup: the seeded cell must be live under the production key")
 	}

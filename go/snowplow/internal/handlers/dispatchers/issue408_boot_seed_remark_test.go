@@ -276,7 +276,7 @@ func TestIssue408_PostReadyzBootSeed_RemovalDuringResolve_Refused(t *testing.T) 
 				if key == raKey {
 					inputs = raIn
 				}
-				handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
+				putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
 				cache.ResolvedCache().DeleteForTest(key)
 			}
 			h.install(t)

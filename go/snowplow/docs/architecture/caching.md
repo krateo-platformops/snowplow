@@ -309,9 +309,13 @@ here is load-bearing:
 4. On miss: attach `WithL1KeyContext(ctx, cacheKey)` so the resolver records dep edges against
    this key as it reads L3; attach a `StageErrorSink` and an `ExternalTouchedSink`; resolve;
    encode once; serve; then **Put only when every gate passes**. The sink-derived gates are
-   ONE verdict, `cache.PutGateVerdict` (`put_verdict.go`), which every Put site and every
-   background mark site reads (`scripts/check_resolved_entry_put_sites.sh` fails a Put site
-   that does not). Its closed set, first match wins:
+   ONE verdict, `cache.PutGateVerdict` (`put_verdict.go`). The TYPE enforces it: every write of a
+   resolve output takes the verdict and stores nothing unless it allows the Put (`put_gated.go`;
+   `PutRAFullList(IfGen)` too), mark sites read `Permanent()`, and a verdict cannot be forged
+   (only `PutGateVerdict` makes one; the zero value admits nothing). The decline reason only
+   picks the log line and the counter. `scripts/check_resolved_entry_put_sites.sh` fails any
+   ungated `ResolvedEntry` write in the dispatchers or apiref packages. Its closed set, first
+   match wins:
    - **declared write** (permanent, `declared_write`) — a RESTAction that declares a write-verb
      stage is never stored, whether or not this resolve sent it (#903 F1): every `/call` runs it,
      and the background marks it and stops re-resolving it. It is its own input, never counted
@@ -688,7 +692,7 @@ and the SPA's recovery are OPEN rows owned by the chart review checklist and fro
 | Terminal refresh semantics (known-stale, suppression) | `internal/cache/refresher_terminal.go`, `dirty_window.go`, `known_stale.go`; `internal/handlers/dispatchers/demand_revalidate.go` | `NoteRefreshDecline`, `RefreshTerminalStatsSnapshot`, `KnownStale`, `KnownStaleReadThrough`, `BeginDemandRevalidation`; consulted in `refresher.go` `processNext` and the `Get` funnel |
 | Tag-derived stats families (1.12.6 C7) | `internal/cache/stats_by_tag.go`, `internal/cache/stats_families.go` | `StatSpec`, `StatFamily`, `TaggedStatFamilies`; `stat`/`kind`/`desc` tags on `CRDDiscoveryStats`, `RefreshBroadcasterStats`, `refresherStats`, `RefreshTerminalStats` drive expvar, the OTLP mirror (`internal/metrics/metrics.go` `newDerivedFamilies`) and the parity arms |
 | Invalidation | `internal/cache/deps.go`, `deps_watch.go` | `Record`, `RecordList`, `OnObjectEvent` (state-derived; `OnAdd`/`OnUpdate`/`OnDelete` are shims), `isSelfRepresentation`; bridge: `depEventHandlers` → `submitDepEvent` → `probeObjectState` |
-| Put-gate verdict | `internal/cache/put_verdict.go`, `put_gate_effects.go` | `PutGateVerdict`, `PutGateSinksFromContext`, `WithPutGateEffectsCapture`, `PutGateEffects.Replay` |
+| Put-gate verdict | `internal/cache/put_verdict.go`, `put_gated.go`, `put_gate_effects.go` | `PutGateVerdict`, `PutVerdict.WithExternalTTL`, the verdict-gated `PutResolved*` / `ReplaceResolvedIfGenRefresh` writes, `PutGateSinksFromContext`, `WithPutGateEffectsCapture`, `PutGateEffects.Replay` |
 | External Put-gate | `internal/cache/external_touched_sink.go` | `WithExternalTouchedSink`, `MarkDeclaredWrite` |
 | L3 informer | `internal/cache/watcher.go` | `NewResourceWatcher`, `GetObject`, `ListObjects`, `depEventHandlers` |
 | Servability tripwire | `internal/cache/serve_assert.go` | `serve_requires_servable` |

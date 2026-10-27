@@ -349,7 +349,7 @@ func (e *r378Env) fill(t *testing.T) {
 			t.Fatalf("FILL: no raKey for alice")
 		}
 		k := cache.ComputeKey(seedIn)
-		c.PutRAFullList(k, seedIn, map[string]any{"items": []any{map[string]any{"n": i, "phase": "fill"}}})
+		c.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), k, seedIn, map[string]any{"items": []any{map[string]any{"n": i, "phase": "fill"}}})
 		cache.RecordSliceability(k, cache.SliceShapeHash("apiref", h1RAGVR.Group, h1RAGVR.Version, h1RAGVR.Resource,
 			h1NS, r378RAFL, r378RAFLFilter), true)
 		cache.Deps().Record(context.Background(), k, h1RAGVR, h1NS, r378RAFL) // RA-CR self-dep (the producer records it)

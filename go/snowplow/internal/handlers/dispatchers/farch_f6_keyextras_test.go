@@ -102,7 +102,7 @@ func TestFARCH_F6_1_ChromeWidget_RouteParamsFoldNothing_HIT(t *testing.T) {
 		t.Fatal("F6-1: expected a live per-cohort handle + key under the seed ctx")
 	}
 	body := []byte(`{"status":{"widgetData":{"chrome":"shell"}}}`)
-	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
+	putFixture(seedHandle, seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
 
 	// SERVE key: the browser folds route params on a /compositions route.
 	serveExtras := effectiveKeyExtras(ctx, cr, routeParamsRequest("team-a", "demo-1"))
@@ -159,7 +159,7 @@ func TestFARCH_F6_2_RED_UndeclaredRouteConsumer_CollidesAndServesWrongBody(t *te
 		t.Fatal("F6-2 RED: expected a live handle + key on route A")
 	}
 	bodyA := []byte(`{"namespace":"team-a"}`)
-	handleA.Put(keyA, &cache.ResolvedEntry{RawJSON: bodyA, Inputs: inputsA})
+	putFixture(handleA, keyA, &cache.ResolvedEntry{RawJSON: bodyA, Inputs: inputsA})
 
 	// Route B (team-b) — a DIFFERENT namespace. Same GVR+name (the same widget
 	// CR, only the route differs). Without a declaration the namespace extra is
@@ -192,7 +192,7 @@ func TestFARCH_F6_2_RED_UndeclaredRouteConsumer_CollidesAndServesWrongBody(t *te
 	}
 	// The wrong-body proof: route-A body warms the shared cell; route B reads it.
 	bodyA2 := []byte(`{"route_namespace":"team-a"}`)
-	hA2.Put(keyA2, &cache.ResolvedEntry{RawJSON: bodyA2, Inputs: iA2})
+	putFixture(hA2, keyA2, &cache.ResolvedEntry{RawJSON: bodyA2, Inputs: iA2})
 	gotB, hitB := hB2.Get(keyB2)
 	if !hitB {
 		t.Fatal("F6-2 RED: route-B request did not hit the route-A-warmed shared cell — collision not demonstrated")
@@ -242,8 +242,8 @@ func TestFARCH_F6_3_DeclaredWidget_PartitionsByRoute_DistinctContent(t *testing.
 	}
 	bodyA := []byte(`{"ns":"team-a"}`)
 	bodyB := []byte(`{"ns":"team-b"}`)
-	hA.Put(keyA, &cache.ResolvedEntry{RawJSON: bodyA, Inputs: iA})
-	hB.Put(keyB, &cache.ResolvedEntry{RawJSON: bodyB, Inputs: iB})
+	putFixture(hA, keyA, &cache.ResolvedEntry{RawJSON: bodyA, Inputs: iA})
+	putFixture(hB, keyB, &cache.ResolvedEntry{RawJSON: bodyB, Inputs: iB})
 	if gA, hit := hA.Get(keyA); !hit || string(gA.RawJSON) != string(bodyA) {
 		t.Fatalf("F6-3: route A served wrong/no body (hit=%v got=%q)", hit, gA.RawJSON)
 	}
@@ -437,7 +437,7 @@ func TestFARCH_F6_6_SelfQuarantine_UndeclaredExtrasDeclinePut(t *testing.T) {
 	aEvilBody := []byte(`{"status":{"widgetData":{"echoedFoo":"evil"}}}`)
 	if requestExtrasFullyDeclared(cr, extrasA) {
 		// (not reached — asserted false above; this mirrors the prod if-structure)
-		handleA.Put(keyA, &cache.ResolvedEntry{RawJSON: aEvilBody, Inputs: inputsA})
+		putFixture(handleA, keyA, &cache.ResolvedEntry{RawJSON: aEvilBody, Inputs: inputsA})
 	}
 
 	// (3) userB (clean, fully-declared trivially) now reads the shared key → MISS,
@@ -477,7 +477,7 @@ func TestFARCH_F6_6_RED_NeuteredGuard_ServesEvilToB(t *testing.T) {
 
 	// NEUTERED guard: Put unconditionally (the pre-guard / regression behaviour).
 	aEvilBody := []byte(`{"status":{"widgetData":{"echoedFoo":"evil"}}}`)
-	handleA.Put(keyA, &cache.ResolvedEntry{RawJSON: aEvilBody, Inputs: inputsA})
+	putFixture(handleA, keyA, &cache.ResolvedEntry{RawJSON: aEvilBody, Inputs: inputsA})
 
 	// userB, on the SAME key, is served A's evil body — the leak the guard prevents.
 	got, hit := handleB.Get(keyB)
@@ -526,7 +526,7 @@ func TestFARCH_F6_6_DeclaredCounterpart_GuardInert(t *testing.T) {
 	}
 	// A's Put lands in A's own (distinct) cell; B never sees it.
 	aBody := []byte(`{"foo":"evil"}`)
-	hA.Put(keyA, &cache.ResolvedEntry{RawJSON: aBody, Inputs: iA})
+	putFixture(hA, keyA, &cache.ResolvedEntry{RawJSON: aBody, Inputs: iA})
 	if _, hit := hB.Get(keyB); hit {
 		t.Fatal("F6-6 declared: B's distinct-key cell must be a MISS after A's Put (partitioned, not shared)")
 	}
@@ -586,7 +586,7 @@ func TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt(t *testing.T) {
 	// The Put only happens because the guard allowed it (mirrors widgets.go's
 	// genuine-Put gate: the F6 decline branch is skipped when requestExtrasFullyDeclared).
 	if requestExtrasFullyDeclared(cr, req) {
-		handle1.Put(key1, &cache.ResolvedEntry{RawJSON: body, Inputs: inputs1})
+		putFixture(handle1, key1, &cache.ResolvedEntry{RawJSON: body, Inputs: inputs1})
 	}
 
 	// REVISIT: same widget, same request → same key → HIT (was 0/14 on west4).
