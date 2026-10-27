@@ -21,6 +21,7 @@ import (
 	"time"
 
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -132,6 +133,56 @@ var repairGVR = schema.GroupVersionResource{Group: "widgets.krateo.io", Version:
 // TestSilentWatchCluster_GaugesStartFromSyncedInformers).
 var silentWatchSlowCRBList time.Duration
 
+// silentWatchWatchList makes the fixture serve watch-list requests (see the
+// watch reactor in silentWatchClusterFor). Set it together with the
+// WatchListClient gate, which the package TestMain turns off; the #931 arms do
+// both to run the production regime.
+var silentWatchWatchList bool
+
+// silentWatchListRequests counts the watch-list requests the fixture served
+// for its GVR, so an arm can prove the reflector took the watch-list path.
+var silentWatchListRequests atomic.Int64
+
+// watchListCapableDynamic hides the fake client's watch-list opt-out.
+type watchListCapableDynamic struct{ dynamic.Interface }
+
+// silentWatchInitialEvents is a watch-list answer for res: one ADDED per
+// object the fake cluster holds, then the initial-events-end bookmark at
+// clusterListRV.
+func silentWatchInitialEvents(t *testing.T, dyn *dynamicfake.FakeDynamicClient, res schema.GroupVersionResource, listKind, ns string) []watch.Event {
+	t.Helper()
+	kind := strings.TrimSuffix(listKind, "List")
+	obj, err := dyn.Tracker().List(res, res.GroupVersion().WithKind(kind), ns)
+	if err != nil {
+		t.Errorf("fixture: listing %s for a watch-list answer: %v", res, err)
+		return nil
+	}
+	items, err := meta.ExtractList(obj)
+	if err != nil {
+		t.Errorf("fixture: extracting %s items: %v", res, err)
+		return nil
+	}
+	events := make([]watch.Event, 0, len(items)+1)
+	for _, it := range items {
+		u, ok := it.(*unstructured.Unstructured)
+		if !ok {
+			m, err := k8sruntime.DefaultUnstructuredConverter.ToUnstructured(it)
+			if err != nil {
+				t.Errorf("fixture: converting a %s item: %v", res, err)
+				return nil
+			}
+			u = &unstructured.Unstructured{Object: m}
+		}
+		events = append(events, watch.Event{Type: watch.Added, Object: u})
+	}
+	end := &unstructured.Unstructured{}
+	end.SetAPIVersion(res.GroupVersion().String())
+	end.SetKind(kind)
+	end.SetResourceVersion(clusterListRV)
+	end.SetAnnotations(map[string]string{metav1.InitialEventsAnnotationKey: "true"})
+	return append(events, watch.Event{Type: watch.Bookmark, Object: end})
+}
+
 // slowListDynamic delays LISTs of one GVR. It wraps the client the watcher is
 // given rather than adding a fake reactor: the fake holds one lock across its
 // whole reactor chain, so a sleeping reactor would stall every other LIST too
@@ -224,14 +275,14 @@ func silentWatchClusterFor(t *testing.T, gvr schema.GroupVersionResource, owned 
 	// NewResourceWatcher registers the four typed-RBAC informers eagerly, so
 	// their list kinds must be present or the fake client panics on the first
 	// LIST — the same set realWatcher registers, for the same reason.
-	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch,
-		map[schema.GroupVersionResource]string{
-			gvr: "PanelList",
-			{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
-			{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
-			{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
-			{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
-		})
+	listKinds := map[schema.GroupVersionResource]string{
+		gvr: "PanelList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
+	}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds)
 	for _, o := range objs {
 		if _, err := dyn.Resource(gvr).Namespace(o.GetNamespace()).
 			Create(context.Background(), o, metav1.CreateOptions{}); err != nil {
@@ -242,8 +293,28 @@ func silentWatchClusterFor(t *testing.T, gvr schema.GroupVersionResource, owned 
 	// the informer deaf: the reflector establishes a watch, blocks on it, and
 	// receives nothing, which is what a dropped event stream looks like from
 	// inside the process.
+	//
+	// With silentWatchWatchList set, a watch-list request (SendInitialEvents,
+	// the production default) is answered the way an apiserver answers it: one
+	// ADDED per object the cluster holds, then the initial-events-end bookmark
+	// at the collection resourceVersion. The watch then stays silent like any
+	// other. The answer is buffered so the reactor never blocks while the fake
+	// holds its lock.
 	dyn.PrependWatchReactor("*", func(a k8stesting.Action) (bool, watch.Interface, error) {
-		w := watch.NewFake()
+		var initial []watch.Event
+		if silentWatchWatchList {
+			if lo, ok := a.(interface{ GetListOptions() metav1.ListOptions }); ok &&
+				lo.GetListOptions().SendInitialEvents != nil && *lo.GetListOptions().SendInitialEvents {
+				initial = silentWatchInitialEvents(t, dyn, a.GetResource(), listKinds[a.GetResource()], a.GetNamespace())
+				if a.GetResource() == gvr {
+					silentWatchListRequests.Add(1)
+				}
+			}
+		}
+		w := watch.NewFakeWithChanSize(len(initial), false)
+		for _, e := range initial {
+			w.Action(e.Type, e.Object)
+		}
 		t.Cleanup(w.Stop)
 		if a.GetResource() == gvr {
 			silentWatchLatest.Store(w)
@@ -292,6 +363,13 @@ func silentWatchClusterFor(t *testing.T, gvr schema.GroupVersionResource, owned 
 	if d := silentWatchSlowCRBList; d > 0 {
 		watcherClient = slowListDynamic{Interface: dyn, delay: d,
 			gvr: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}}
+	}
+	if silentWatchWatchList {
+		// The fake client declares it cannot serve watch-list
+		// (IsWatchListSemanticsUnSupported), which makes the reflector fall
+		// back to LIST+WATCH even with the gate on. The reactor above serves
+		// it, so hide that declaration from the informers.
+		watcherClient = watchListCapableDynamic{Interface: watcherClient}
 	}
 	rw, err := NewResourceWatcher(context.Background(), watcherClient)
 	if err != nil || rw == nil {
