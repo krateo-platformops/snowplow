@@ -2069,9 +2069,10 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	// permanent (the seed and walk declined-external marks, the refresher's
 	// suppression). Stored, its cell would be "stale then replace" with a
 	// replace that never comes: every background re-resolve refuses the write,
-	// and a customer hit never runs it.
+	// and a customer hit never runs it. The declared-write mark (#915) makes
+	// the opt-in external-TTL widget Put decline it too.
 	if declaredWriteStage(names, apiMap) != "" {
-		cache.ExternalTouchedSinkFromContext(ctx).Bump()
+		cache.ExternalTouchedSinkFromContext(ctx).BumpDeclaredWrite()
 	}
 
 	// Build the per-call resolve-invariant state (P2 mapper / P3 dict / P4

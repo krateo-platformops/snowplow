@@ -227,7 +227,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
-	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,
+	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.BumpDeclaredWrite": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "SourcePagination": readOnly443, "IdentityClass.String": readOnly443,

@@ -517,6 +517,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
 		)
 	} else if extTTL := externalCacheTTLFromAnnotations(got.Unstructured); cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 && extTTL > 0 &&
+		!extTouchedSink.DeclaredWrite() && // #903 F1 / #915: a resolve that declares a write is never stored
 		cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
 		// External-widget bounded-TTL cache (Option A, 2026-07-10) — the
 		// widget's resolve touched a genuine external endpoint AND the widget

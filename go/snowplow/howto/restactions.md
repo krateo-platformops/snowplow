@@ -310,7 +310,9 @@ stored or served.
 - A RESTAction that **declares** a write stage is never stored, whether or
   not a given `/call` sent the write (an iterator with no items, a resolve
   that stopped early because an `endpointRef` Secret is missing). Every
-  `/call` runs it, and the background never prewarms or refreshes it.
+  `/call` runs it, and the background never prewarms or refreshes it. This
+  holds for a widget that uses it too, including a widget that opted into the
+  external cache (`krateo.io/external-cache-ttl-seconds`, #915).
 - A `/call` that snowplow makes to itself on behalf of background work
   carries `X-Snowplow-Background: 1`, so that call refuses write stages too.
   Snowplow sends the header only to itself and strips it from every other
