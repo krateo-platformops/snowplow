@@ -97,17 +97,10 @@ func init() {
 	}))
 }
 
-// firstWriteStageFrom returns the first write stage of names (topological
-// order) at or after stage from, or "" if there is none.
-func firstWriteStageFrom(names []string, from string, apiMap map[string]*templates.API) string {
-	reached := false
+// declaredWriteStage returns the first write stage of names (topological
+// order), or "" if the RESTAction declares none.
+func declaredWriteStage(names []string, apiMap map[string]*templates.API) string {
 	for _, n := range names {
-		if n == from {
-			reached = true
-		}
-		if !reached {
-			continue
-		}
 		if a := apiMap[n]; a != nil && isWriteVerb(a.Verb) {
 			return n
 		}

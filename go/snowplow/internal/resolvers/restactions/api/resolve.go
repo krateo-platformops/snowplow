@@ -741,7 +741,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// stage is NOT executed. It gets an explicit per-stage error and returns
 	// before any egress (no informer, no internal rest config, no discovery,
 	// no external fetch), so a draft can never mutate anything.
-	if verb := ptr.Deref(call.Verb, http.MethodGet); cache.Inert(gctx) && verb != http.MethodGet {
+	// #903 F7 — the one write classifier (isWriteVerb / isSafeMethod).
+	if verb := ptr.Deref(call.Verb, http.MethodGet); cache.Inert(gctx) && isWriteVerb(call.Verb) {
 		// Stable contract (#443): reason "StageNotExecuted" is the machine
 		// field; the message keeps its stable prefix/suffix.
 		msg := fmt.Sprintf("dry-run: stage %q verb %s is not executed", id, verb)
@@ -2058,6 +2059,21 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	}
 	log.Debug("created api map", slog.Int("total", len(apiMap)))
 
+	// #903 (team-lead ruling, the generic form of "never store a resolve that
+	// stopped before its write") — a RESTAction that DECLARES a write stage is
+	// never stored, whether or not this resolve dialed the write (a zero-item
+	// write iterator, a truncated resolve, a write refused in the background).
+	// A write is only ever sent by branch E, so a resolve that declares one is a
+	// branch-E resolve: it bumps the external-touched sink, the signal every L1
+	// Put declines on AND every background site treats as structurally
+	// permanent (the seed and walk declined-external marks, the refresher's
+	// suppression). Stored, its cell would be "stale then replace" with a
+	// replace that never comes: every background re-resolve refuses the write,
+	// and a customer hit never runs it.
+	if declaredWriteStage(names, apiMap) != "" {
+		cache.ExternalTouchedSinkFromContext(ctx).Bump()
+	}
+
 	// Build the per-call resolve-invariant state (P2 mapper / P3 dict / P4
 	// gate+sinks). The per-stage loop below reads these via r.*; the
 	// per-stage mutable primitives stay loop-local (see the resolveRun
@@ -2088,15 +2104,6 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 			// any, already carry a more specific reason).
 			r.taintNarrow() // #603 PR-2
 			r.outcomes.fail(id, StageReasonError)
-			// #903 — a resolve that stopped before a write stage it declares
-			// (this one or a later one) is never stored: its cell would let a
-			// later refresh re-run the sequence with the stored extras once the
-			// missing endpoint resolves. The stage-error sink is what every L1
-			// Put declines on.
-			if w := firstWriteStageFrom(names, id, apiMap); w != "" {
-				r.taintNarrow() // #603 PR-2 (already tainted above; the R6 census pins it beside every bump)
-				r.stageErrSink.Bump(id, "the resolve stopped before write stage "+w+" (#903)")
-			}
 			// #709 — a truncating exit is a failure of this stage whatever its
 			// continueOnError says. Reported by class only: the endpoint error
 			// can name the requester's clientconfig Secret, so its text stays

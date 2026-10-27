@@ -469,7 +469,17 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// knob is retired. The #191 WARN storm is bounded instead by logging at
 		// WARN once per stale generation: a decline of a cell that is ALREADY
 		// known-stale is DEBUG (the counter carries the rate).
-		suppressed := cache.NoteRefreshDecline(key, "stage_error", false)
+		// #903 B2 — a stage error on a resolve that ALSO touched an external
+		// endpoint (a write refused in the background is both: a stage error,
+		// and its RESTAction declares a branch-E write) can never be re-Put by
+		// the refresher (the external gate below would decline it anyway), so
+		// it is structurally permanent like the external decline: suppress,
+		// don't re-resolve it on every change.
+		declineReason, permanent := "stage_error", cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0
+		if permanent {
+			declineReason = "external_touched"
+		}
+		suppressed := cache.NoteRefreshDecline(key, declineReason, permanent)
 		_, _, alreadyKnownStale := cache.KnownStale(key)
 		declineLevel := slog.LevelWarn
 		if alreadyKnownStale {

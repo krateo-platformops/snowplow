@@ -307,15 +307,14 @@ ServiceAccount, an `endpointRef` Secret, an external URL). The refused stage
 gets an error under its `errorKey`, and that background result is never
 stored or served.
 
-- An answer whose resolve sent a write stage is never stored: the next
-  `/call` runs the RESTAction again.
+- A RESTAction that **declares** a write stage is never stored, whether or
+  not a given `/call` sent the write (an iterator with no items, a resolve
+  that stopped early because an `endpointRef` Secret is missing). Every
+  `/call` runs it, and the background never prewarms or refreshes it.
 - A `/call` that snowplow makes to itself on behalf of background work
   carries `X-Snowplow-Background: 1`, so that call refuses write stages too.
   Snowplow sends the header only to itself and strips it from every other
   request.
-- A resolve that stops before a write stage it declares (for example its
-  `endpointRef` Secret is missing) is never stored, so no later refresh can
-  re-run the sequence.
 
 ## jq templating of `path`, `payload` and `headers`
 

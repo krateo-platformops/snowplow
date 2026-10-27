@@ -69,9 +69,9 @@ set (below).
 | `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun` |
 | a RESTAction `api[]` stage with a write verb, reached by `GET /call`, `POST /call/read` or `GET /export` | whatever the stage's target does with the request: the caller's own apiserver (no `endpointRef`) or a named endpoint | **audited** — `restaction`, one record per dialled call (an iterator stage of N calls is N records). See below |
 | `GET /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export` |
-| a RESTAction write stage in a background resolve (refresher, cohort seed, prewarm) | as above | **out of scope** — see "Writes nobody requested" |
+| a RESTAction write stage in a background resolve (refresher, cohort seed, prewarm, content prewarm, pagination drain, a #547 demand revalidation, or a `/call` snowplow makes to itself for one of them) | nothing: the stage is refused before any request leaves (#903) | **out of scope** — nothing was sent; see "Writes nobody requested" |
 | a RESTAction write stage in a dry run (inline object on `POST /call/read`) | nothing: the stage is refused before any request leaves (#443) | **out of scope** — no authority was asked, nothing was done |
-| a RESTAction write stage abandoned before the dial: its endpoint Secret cannot be resolved, its iterator or path template fails, or the #288 malformed-dial guard refuses the path | nothing: no request leaves | **out of scope** — nothing was sent; the stage error is in the response and the log, not in the trail |
+| a RESTAction write stage abandoned before the dial: its endpoint Secret cannot be resolved, its iterator or path template fails, the #288 malformed-dial guard refuses the path, the resolve is not a customer request (#903, the row above), the stage it depends on did not succeed (#904: reported `Skipped` in `X-Snowplow-Stage-Outcomes`), or the pass was served stale content and its fresh re-run sends the write instead (#905: the withdrawn pass sends nothing, the re-run's dial is the one recorded) | nothing: no request leaves | **out of scope** — nothing was sent; the stage error is in the response and the log, not in the trail |
 | authentication failures (bad, expired or missing token) on any route | nothing: answered 401 by the UserConfig middleware before any handler | **out of scope** — see "Authentication failures" |
 | reads: `GET /call`, `POST /call/read`, `GET /list`, `GET /rbac`, `GET /api-info/names` | nothing | **out of scope** for AUDIT-4, which covers mutations. Note that the request log and trace id these were once delegated to do not cover them today (installer#410: the gateway access log has no outcome, resource or session id, and the trace is sampled) |
 | `GET/POST /refreshes` | nothing: the live-refresh SSE subscription | **out of scope** — cache machinery, no user action |
@@ -110,9 +110,12 @@ other `POST`. Each record carries:
 ### Writes nobody requested
 
 The refresher, the cohort seed and the prewarm drivers re-resolve RESTActions
-with no person behind them. When one of them dials a write stage (an
-`endpointRef` stage uses the endpoint's own credential, so it is not stopped by
-the ServiceAccount's read-only grant), it emits no record:
+with no person behind them. Since #903 they never send a write stage, whatever
+credential the stage uses: the stage is refused before the dial, so there is
+nothing to record. Before #903 such a write (an `endpointRef` stage uses the
+endpoint's own credential, so it was not stopped by the ServiceAccount's
+read-only grant) was sent and emitted no record, for two reasons that still
+hold for any write without a requester:
 
 - there is no actor. The context carries a cohort's identity, so a record would
   attribute to a real user an action that user did not take;
@@ -122,8 +125,12 @@ the ServiceAccount's read-only grant), it emits no record:
   previous reconcile. Snowplow holds no previous state of a stage's target, so
   it cannot establish the last two; the predicate is not met.
 
-That background drivers dial write stages at all is a separate question from the
-trail, tracked outside this page.
+`TestAudit410_C3_BackgroundDriverWrite_EmitsNoRecord` pins it: per background
+driver, 0 sends and 0 records; a customer control sends once and records once.
+
+What counts as a write is one classifier for the trail and for #903, #904 and
+#905 (`isSafeMethod`): anything but `GET`, `HEAD`, `OPTIONS`, `TRACE`, and an
+empty verb is `GET` (it is sent as one).
 
 ### Authentication failures
 

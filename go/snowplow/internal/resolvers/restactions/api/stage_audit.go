@@ -68,10 +68,14 @@ import (
 const stageAuditAction = "restaction"
 
 // isSafeMethod reports whether verb is a safe (read-only) HTTP method, RFC 9110
-// §9.2.1. Every other method is a write for the audit trail.
+// §9.2.1. Every other method is a write. It is THE write classifier of the
+// resolver: the audit trail (#902), the background-write refusal (#903), the
+// dependent-write rule (#904) and the stale-pass hold (#905) all read it
+// (isWriteVerb, write_verb.go). The empty method is classified as it is sent:
+// net/http sends "" as GET.
 func isSafeMethod(verb string) bool {
 	switch strings.ToUpper(verb) {
-	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+	case "", http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
 		return true
 	}
 	return false

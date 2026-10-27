@@ -14,7 +14,9 @@ package dispatchers
 //       same RESTAction sends 0 writes (rule 1), and the next customer /call
 //       sends the DELETE exactly once (a real user request).
 //
-// Mutation (logic-only, owned): drop the firstWriteStageFrom bump in
+// Since the review (F1) the general rule covers this case: a RESTAction that
+// DECLARES a write stage is never stored (issue903_declared_write_test.go).
+// Mutation (logic-only, owned): drop the declared-write bump in
 // ResolveWithFailure → T1 RED (the truncated cell is stored).
 
 import (
