@@ -91,16 +91,24 @@ Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
     time, and only B's voids; A's whole-run rate is reported beside it.
     Every other reason a run's own verdict is INVALID still voids the pair;
   - a control-plane outage is its whole window from run606's polls, [t0,
-    t1]: the last poll answered before to the first answered after — the
-    drop began somewhere in it, so all of it is judged; the poll gap (t0 to
-    the first unanswered poll) is reported for information only. A's are cut
-    from both runs. Of B's, the part an A outage covers in wall-clock time is
-    the vantage's (the operator's own network, polling both): cut from both
-    runs. The rest is judged by k6 as a readiness gap is: not served over
-    the 1 % bar -> FAIL (not Ready); served -> jointly-Ready time, kept, with
-    a NOTE; no request in flight -> void (run 16: one failed poll in a 63 s
-    window while B's k6 served 10,035 requests in flight at 0.48 % — no
-    longer INVALID).
+    t1]: the send time of the last poll answered before to the return of the
+    first answered after — the drop began somewhere in it, so all of it is
+    judged; the poll gap (t0 to the first unanswered poll's send time) is in
+    the run's report for information only. A's are cut from both runs, whole.
+    Of B's, exactly the part an A outage's window also covers is the
+    vantage's (the operator's own network, polling both): cut from both
+    runs, no margin. The rest is one more stretch of B's time for the
+    customer witness (judge_stretch, the same as a readiness gap): not
+    served over the 1 % bar -> FAIL (not Ready); served -> jointly-Ready
+    time, kept, with a NOTE; no request in flight -> void. Run 16: B's 63 s
+    window held 10,035 of B's k6load requests in flight, 48 failed (0.48 %),
+    and no longer voids the pair;
+  - the customer witness reads ALL of B's customer streams it can: k6load
+    and the browser's completed requests (browser_http_req_duration /
+    _failed, flight = response time - duration). Still missing (#919):
+    browser requests that failed at the network level or never completed
+    (k6's browser module emits no duration for them; run 16 B: 99,504
+    browser_data_sent against 94,497 durations).
 """
 
 from __future__ import annotations
@@ -625,117 +633,103 @@ def request_spans(o: dict | None) -> list[tuple[float, float, bool, float]] | No
             if t is not None and v is not None]
 
 
-def control_plane_outages(outages: list[dict] | None, span) -> list[dict]:
-    """The run's control-plane outages (run606's api-outages.jsonl) that touch
-    k6's span — the measure. Window from run606's own polls: the last poll the
-    API server answered before to the first it answered after (no in-cluster
-    signal bounds it today: fresh606 keeps only per-phase failure counts, and
-    mem606 captures no API-request / watch-error expvar). Report-only beside
-    the window: snowplow's own API request counters — not captured."""
+def browser_request_spans(o: dict | None) -> list[tuple[float, float, bool, float]]:
+    """The browser's COMPLETED requests as (start, completion, failed, ms). k6's
+    browser module pushes browser_http_req_duration at the response's wall
+    time with value = response time - request time, always, and
+    browser_http_req_failed (status outside 200-399) at the same time only
+    when the response has timing; a duration with no failed point at its
+    time had no timed response: not served. Requests that failed at the
+    network level or never completed push neither (onLoadingFailed): they
+    are missing here — #919 adds them as another source."""
+    if not o:
+        return []
+    failed: dict[float, list[bool]] = {}
+    for (v, _), t in zip(o["points"].get("browser_http_req_failed", []),
+                         (o.get("times") or {}).get("browser_http_req_failed") or []):
+        if t is not None:
+            failed.setdefault(t, []).append(bool(v))
     out = []
-    for o in outages or []:
-        try:
-            w = outage_window(o)
-        except (KeyError, TypeError, ValueError):
+    for (v, _), t in zip(o["points"].get("browser_http_req_duration", []),
+                         (o.get("times") or {}).get("browser_http_req_duration") or []):
+        if t is None or v is None:
             continue
-        if span and (w["t1"] <= span[0] or w["t0"] >= span[1]):
-            continue
-        out.append(dict(w, snowplow_api_counters="not captured: mem606 has no snowplow API-request expvar "
-                                                 "prefix (report-only when it has)"))
+        f = failed[t].pop() if failed.get(t) else True
+        out.append((t - v / 1000.0, t, f, v))
     return out
 
 
-def outage_window(o: dict) -> dict:
-    """One outage record as the pair judges it: its WHOLE window [t0, t1],
-    the last poll the API answered before to the first it answered after.
-    The drop began somewhere between t0 and the first unanswered poll — when
-    is not known — so all of it is judged, never a narrower part that could
-    miss up to a poll interval of real failure. The poll gap (t0 to
-    first_unanswered) is reported for information only (poll_gap_s)."""
-    t0, t1 = float(o["t0"]), float(o["t1"])
-    fu = o.get("first_unanswered")
-    gap = round(min(max(float(fu) - t0, 0.0), t1 - t0), 1) if fu is not None else None
-    return {"t0": t0, "t1": t1, "seconds": round(t1 - t0, 1), "first_unanswered": fu, "poll_gap_s": gap,
-            "open": bool(o.get("open")), "seen_by": o.get("seen_by"), "source": o.get("source") or "run606 polls"}
-
-
-def vantage_cover(others: list[dict]) -> list[tuple[float, float]]:
-    """The wall-clock time the OTHER run's outages may have covered: each
-    window [t0, t1] widened on both sides by that record's own poll gap —
-    t0 (the last poll answered) to first_unanswered (the first poll not
-    answered): its poll interval, which is how far the true edge of a drop
-    can sit from the window's edge. No other margin."""
+def control_plane_outages(outages: list[dict] | None, span) -> list[dict]:
+    """The run's control-plane outages (run606's api-outages.jsonl) that touch
+    k6's span — the measure — each normalised here, once: its WHOLE window
+    [t0, t1], from the send time of the last poll the API answered to the
+    return of the first it answered after (run606 stamps poll send times). The
+    drop began somewhere between t0 and the first unanswered poll — when is
+    not known — so the pair judges all of it; the poll gap (t0 to
+    first_unanswered) is kept here for information only. No in-cluster signal
+    bounds it today (#901). Report-only beside the window: snowplow's own API
+    request counters — not captured."""
     out = []
-    for x in others:
+    for o in outages or []:
         try:
-            w = outage_window(x)
-            u = float(w["poll_gap_s"] or 0.0)
-            out.append((w["t0"] - u, w["t1"] + u))
+            t0, t1 = float(o["t0"]), float(o["t1"])
         except (KeyError, TypeError, ValueError):
             continue
-    return _union(out)
+        if span and (t1 <= span[0] or t0 >= span[1]):
+            continue
+        fu = o.get("first_unanswered")
+        out.append({"t0": t0, "t1": t1, "seconds": round(t1 - t0, 1), "open": bool(o.get("open")),
+                    "first_unanswered": fu, "poll_gap_s": round(float(fu) - t0, 1) if fu is not None else None,
+                    "seen_by": o.get("seen_by"), "source": o.get("source") or "run606 polls",
+                    "snowplow_api_counters": "not captured: mem606 has no snowplow API-request expvar "
+                                             "prefix (report-only when it has)"})
+    return out
 
 
-def vantage_parts(o: dict, others: list[dict]) -> list[tuple[float, float]]:
-    """The parts of outage `o` (B's) that the other run's outages cover
-    (vantage_cover): the vantage's, excluded from both runs."""
-    w = outage_window(o)
-    return [(max(a, w["t0"]), min(b, w["t1"])) for a, b in vantage_cover(others)
-            if a < w["t1"] and b > w["t0"]]
+def vantage_parts(o: dict, a_outages: list[dict]) -> list[tuple[float, float]]:
+    """The parts of B's outage `o` that one of A's outage windows also covers,
+    in wall-clock time: the vantage's (both runs are polled from the same
+    operator machine; a drop of its own network is an outage of both at
+    once). Exactly the overlap — no margin."""
+    return [(max(x["t0"], o["t0"]), min(x["t1"], o["t1"])) for x in a_outages
+            if x["t0"] < o["t1"] and x["t1"] > o["t0"]]
 
 
-def k6_witness(spans, t0: float, t1: float, timeout_s: float) -> dict:
-    """k6 as the witness of [t0, t1): every request whose flight overlaps it
-    (start = completion - duration); not served = failed, or no reply within
-    `timeout_s` (the readiness probe's own HTTP timeout)."""
-    ov = [f or ms > timeout_s * 1000 for s, t, f, ms in spans if s < t1 and t > t0]
-    n, k = len(ov), sum(ov)
-    return {"requests": n, "not_served": k, "rate": round(k / n, 6) if n else None, "timeout_s": timeout_s}
+def b_only_parts(o: dict, a_outages: list[dict]) -> list[tuple[float, float]]:
+    """The parts of B's outage `o` that NO window of A's covers: B's alone
+    (#898 re-review: a 30 s A blip must not excuse a 590 s B outage that
+    touches it)."""
+    return _minus(o["t0"], o["t1"], _union((x["t0"], x["t1"]) for x in a_outages))
 
 
-def b_only_parts(o: dict, others: list[dict]) -> list[tuple[float, float]]:
-    """The parts of outage `o` (B's) that NO outage of the other run (A's)
-    covers (vantage_cover). Both runs of a pair are polled from the same
-    operator machine, so a drop of its own network is an "outage" of both at
-    the same moment — the vantage's. Only the part A's outage covers is the
-    vantage's: whatever of B's outage is left is B's alone (#898 re-review:
-    a 30 s A blip must not excuse a 590 s B outage that touches it)."""
-    w = outage_window(o)
-    return _minus(w["t0"], w["t1"], vantage_cover(others))
-
-
-def outage_text(o: dict) -> str:
-    """One outage window, said plainly (the poll gap for information)."""
-    gap = (f"; its first unanswered poll {o['poll_gap_s']} s in (when the drop began inside the window "
-           f"is not known)" if o.get("poll_gap_s") is not None else "")
-    return (f"B's control plane did not answer for {o['seconds']} s from {o['t0']:.0f} to {o['t1']:.0f} "
-            f"({o['source']}{gap})")
-
-
-def judge_b_outage(o: dict, own: list[tuple[float, float]], spans, timeout_s: float,
-                   bar: float) -> tuple[str, dict]:
-    """B's own part of a control-plane outage (`own`: what no A outage
-    covers), judged by k6 exactly as a readiness gap is (#891): B's requests
-    in flight in it not served over `bar` -> "fail" (B was not serving);
-    served within it -> "served" (jointly-Ready time, kept); not one request
-    in flight, or k6's points that do not pair up -> "void" (no witness)."""
-    o = outage_window(o)
-    own_s = round(sum(y - x for x, y in own), 1)
-    rec = dict(o, b_only=[[round(x, 1), round(y, 1)] for x, y in own], b_only_seconds=own_s)
-    base = outage_text(o)
-    if spans is None:
-        return "void", dict(rec, why=f"{base}; k6's duration and failed points do not pair up: no witness")
-    kw = k6_witness([sp for sp in spans if any(sp[0] < y and sp[1] > x for x, y in own)],
-                    own[0][0], own[-1][1], timeout_s)
-    n, k = kw["requests"], kw["not_served"]
-    seen = (f"{own_s} s of it B's alone; k6 had {n} requests in flight in it, {k} not served "
-            f"(failed, or no reply within the probe's {timeout_s} s) ({kw['rate']})")
-    rec["k6"] = kw
-    if n and k / n > bar:
-        return "fail", dict(rec, why=f"{base}; {seen}: over the {bar} bar, so B was not serving")
-    if n:
-        return "served", dict(rec, why=f"{base}; {seen}: within the {bar} bar")
-    return "void", dict(rec, why=f"{base}; {seen}: not one k6 request in it, no witness")
+def judge_stretch(parts: list[tuple[float, float]], customers: dict[str, list | None], timeout_s: float,
+                  bar: float) -> dict:
+    """ONE judgement of a stretch of B's time by B's customers — for a
+    readiness gap and a control-plane outage alike. `parts`: the stretch (one
+    or more intervals); `customers`: every customer stream of B's run,
+    {source: [(start, completion, failed, ms)] or None when its points do not
+    pair up}. Every request whose flight overlaps a part counts; not served =
+    failed, or no reply within `timeout_s` (the readiness probe's own HTTP
+    timeout) — so a request hung THROUGH the stretch is not served once it
+    outlasts the probe. The 1 % `bar` decides alone, at any count: a single
+    request served is "served", a single one not served is "fail".
+      fail      not served over the bar;
+      served    within it;
+      none      not one request in flight;
+      unpaired  a stream's points do not pair up: no witness can be read.
+    Shaped for more sources: a stream is one more key (#919 adds the
+    browser's network-failed and never-completed requests)."""
+    if any(sp is None for sp in customers.values()):
+        bad = sorted(k for k, sp in customers.items() if sp is None)
+        return {"verdict": "unpaired", "k6": {"unpaired": bad}}
+    by, n, k = {}, 0, 0
+    for src, spans in sorted(customers.items()):
+        ov = [f or ms > timeout_s * 1000 for s0, t, f, ms in spans if any(s0 < y and t > x for x, y in parts)]
+        by[src] = {"requests": len(ov), "not_served": sum(ov)}
+        n, k = n + len(ov), k + sum(ov)
+    w = {"requests": n, "not_served": k, "rate": round(k / n, 6) if n else None, "timeout_s": timeout_s,
+         "by_source": by}
+    return {"verdict": "fail" if n and k / n > bar else "served" if n else "none", "k6": w}
 
 
 def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[dict] | None,
@@ -895,9 +889,8 @@ def joint_exclusion(ra: dict, rb: dict) -> dict:
                           "run": x.upper(), x: own, y: other})
         # a control-plane outage (its whole window) is cut like a restart; of
         # B's, pair() passes only the parts A's outages cover (the vantage's) —
-        # the rest k6 judges
+        # the rest B's customers judge
         for i, o in enumerate(r.get("control_plane_outages") or [], 1):
-            o = outage_window(o)
             own = [(o["t0"], o["t1"])]
             other = map_interval(o["t0"], o["t1"], wins[x], wins[y], spans[x][0], spans[y][0])
             items.append({"what": f"{x.upper()} control-plane outage #{i}",
@@ -939,9 +932,12 @@ def _ex_text(e: dict) -> str:
 
 
 def raw_from_dir(d: str) -> dict:
-    """One run's k6 calls and requests from its collected dir (run606's $OUT)."""
+    """One run's k6 calls and requests from its collected dir (run606's $OUT),
+    and every customer stream the witness reads (`customers`)."""
     o = k6eval.read_k6_out(os.path.join(d, "k6"), "k6")
-    return {"calls": calls(o), "requests": requests(o), "spans": request_spans(o)}
+    ob = k6eval.read_k6_out(os.path.join(d, "browser"), "browser")
+    return {"calls": calls(o), "requests": requests(o),
+            "customers": {"k6load": request_spans(o), "browser": browser_request_spans(ob)}}
 
 
 def _rate(reqs, ex) -> dict:
@@ -1049,105 +1045,98 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
             validity.append(_validity(f"readiness[{x}]", rd is not None and "excluded" in rd,
                                       rd is not None, "the run's report carries its readiness record",
                                       "without it the time snowplow was not Ready cannot be excluded"))
-        # k6 as the witness of B's stretches the sampler could not see (a gap
-        # past twice its interval between two Ready samples, or no reply to
-        # readyz), none with a restart signal: errors over the k6 bar inside
-        # one -> B was not Ready (FAIL); requests served -> jointly-Ready time
-        # (its calls judged, its errors counted); a gap without a single k6
-        # request -> no witness: B's readiness unknown there (void)
+        # B's customers as the witness of every stretch of B's time nothing
+        # else decides: a readiness gap (no restart signal: a gap past twice
+        # the sampler's interval between two Ready samples, or no reply to
+        # readyz) and B's own part of a control-plane outage. One judgement
+        # (judge_stretch), one output (b_witnessed_ready), one validity
+        # (readiness_known[b]): not served over the bar -> B was not Ready
+        # (FAIL); served -> jointly-Ready time (its calls judged, its errors
+        # counted), a NOTE; not one request in flight -> no witness (void),
+        # except readyz's no reply, where both witnesses then say B was not
+        # serving (FAIL). B's customers: k6load, and the browser's COMPLETED
+        # requests. Still missing (#919 adds them as one more source): browser
+        # requests that failed at the network level or never completed — k6's
+        # browser module emits no duration for them (run 16 B: 99,504
+        # browser_data_sent against 94,497 durations, about 5,000 unseen).
+        # Run 16's B outage, by this definition: 10,035 k6load requests in
+        # flight in its 63 s window, 48 failed (0.48 %) — plus the browser's.
         th = k6eval.K6_THRESHOLDS["max_k6_error_rate"]
-        ready_again, no_witness = [], []
-        cpo_vantage: list[dict] = []          # B's outage parts A's covers: cut from both runs
-        if cand["witness"]:
+        tmo = float((rdb or {}).get("probe_timeout_s") or load606.HTTP_TIMEOUT_S)
+        stretches = [dict(e, parts=[(e["t0"], e["t1"])], note=f"B's readiness sampler: {e['seconds']} s ")
+                     for e in cand["witness"]]
+        cpo_vantage: list[dict] = []          # B's outage parts A's windows cover: cut from both runs
+        cpo_a = ra.get("control_plane_outages") or []
+        if rda is not None and rdb is not None:
+            for o in rb.get("control_plane_outages") or []:
+                text = (f"B's control plane did not answer for {o['seconds']} s from {o['t0']:.0f} to "
+                        f"{o['t1']:.0f} ({o['source']})")
+                vp = vantage_parts(o, cpo_a)
+                cpo_vantage += [{"t0": x, "t1": y, "seconds": round(y - x, 1), "source": o["source"]}
+                                for x, y in vp]
+                own = b_only_parts(o, cpo_a)
+                if vp:
+                    notes.append(f"{text}: {round(sum(y - x for x, y in vp), 1)} s of it while A's did not answer "
+                                 f"either (same wall-clock time) — the operator's vantage, excluded from both runs"
+                                 + ("" if own else "; none of it B's alone"))
+                if own:
+                    stretches.append({"kind": "api_outage", "t0": o["t0"], "t1": o["t1"], "seconds": o["seconds"],
+                                      "parts": own, "why": f"{text}; {round(sum(y - x for x, y in own), 1)} s of "
+                                                           f"it B's alone",
+                                      "note": ""})
+        served, void = [], []
+        if stretches:
             rwb = get_raw("b")
-            spans = (rwb or {}).get("spans")
-            # not served: failed, or no reply within the readiness probe's own
-            # timeout — the same no-reply test that gave readyz 0
-            tmo = float((rdb or {}).get("probe_timeout_s") or load606.HTTP_TIMEOUT_S)
-            for e in cand["witness"]:
+            for e in stretches:
+                e = dict(e, parts=[[round(x, 1), round(y, 1)] for x, y in e["parts"]])
                 if rwb is None:
-                    continue                                   # raw_calls[b] voids already
-                if spans is None:
-                    no_witness.append(dict(e, why=f"{e['why']}; k6's duration and failed points do not pair "
-                                                  f"up: no witness"))
+                    void.append(dict(e, why=f"{e['why']}; B's own customer requests are not available "
+                                            f"(raw_calls[b]): no witness"))
                     continue
-                # every request in flight during the stretch (start = completion - duration)
-                kw = k6_witness(spans, e["t0"], e["t1"], tmo)
-                n, k = kw["requests"], kw["not_served"]
-                w = dict(e, k6=kw)
-                seen = (f"k6 had {n} requests in flight in it, {k} not served (failed, or no reply within the "
-                        f"probe's {tmo} s) ({w['k6']['rate']})")
-                if n and k / n > th:
-                    nr.append(dict(w, why=f"{e['why']}; {seen}: over the {th} bar, so B was not serving"))
-                elif n:
-                    ready_again.append(dict(w, why=f"{e['why']}; {seen}: within the {th} bar"))
+                j = judge_stretch([tuple(x) for x in e["parts"]], rwb["customers"], tmo, th)
+                e["k6"] = j["k6"]
+                if j["verdict"] == "unpaired":
+                    void.append(dict(e, why=f"{e['why']}; the duration and failed points of "
+                                            f"{', '.join(j['k6']['unpaired'])} do not pair up: no witness"))
+                    continue
+                w = j["k6"]
+                seen = (f"B's customers had {w['requests']} requests in flight in it ("
+                        + ", ".join(f"{src} {c['requests']}" for src, c in w["by_source"].items())
+                        + f"), {w['not_served']} not served (failed, or no reply within the probe's {tmo} s) "
+                          f"({w['rate']})")
+                if j["verdict"] == "fail":
+                    nr.append(dict(e, why=f"{e['why']}; {seen}: over the {th} bar, so B was not serving"))
+                elif j["verdict"] == "served":
+                    served.append(dict(e, why=f"{e['why']}; {seen}: within the {th} bar"))
                 elif e["kind"] == "not_ready":
-                    # readyz had no reply AND k6 had not one request in flight:
-                    # both witnesses say B was not serving
-                    nr.append(dict(w, why=f"{e['why']}; not one k6 request in flight in it either: "
+                    # readyz had no reply AND not one request in flight: both
+                    # witnesses say B was not serving
+                    nr.append(dict(e, why=f"{e['why']}; not one customer request in flight in it either: "
                                           f"B was not serving"))
                 else:
-                    no_witness.append(dict(w, why=f"{e['why']}; not one k6 request in it: no witness"))
-        out["b_witnessed_ready"] = [{k: e[k] for k in ("t0", "t1", "seconds", "kind", "why", "k6")}
-                                    for e in ready_again]
-        for e in ready_again:
-            notes.append(f"B's readiness sampler: {e['seconds']} s {e['why']} -> kept as jointly-Ready time "
-                         f"(its calls judged, its errors counted)")
+                    void.append(dict(e, why=f"{e['why']}; not one customer request in it: no witness"))
+        out["b_witnessed_ready"] = [{k: e[k] for k in ("t0", "t1", "seconds", "kind", "parts", "why", "k6")}
+                                    for e in served]
+        for e in served:
+            notes.append(f"{e['note']}{e['why']} -> kept as jointly-Ready time (its calls judged, its errors "
+                         f"counted)")
         # B's readiness unknown inside k6's span (no sample at an end of it, or a
-        # gap no k6 request witnessed) voids: whether the candidate was down
-        # there cannot be told, and cutting it would hide whatever happened
+        # stretch no customer request witnessed) voids: whether the candidate
+        # was down there cannot be told, and cutting it would hide whatever
+        # happened
         spb = rb.get("k6_span")
         unk = [e for e in (rdb or {}).get("excluded") or [] if e.get("kind") == "unknown"
-               and (not spb or (e["t1"] > spb[0] and e["t0"] < spb[1]))] + no_witness
+               and (not spb or (e["t1"] > spb[0] and e["t0"] < spb[1]))] + void
         validity.append(_validity(
             "readiness_known[b]", not unk,
             {"seconds": round(sum(e["seconds"] for e in unk), 1),
-             "stretches": [{k: e[k] for k in ("t0", "t1", "seconds", "why")} for e in unk]} if unk else "known",
-            "B's readiness known for all of k6's span",
+             "stretches": [{k: e.get(k) for k in ("t0", "t1", "seconds", "kind", "parts", "why", "k6")}
+                           for e in unk]} if unk else "known",
+            "B's readiness known for all of k6's span (every stretch nothing else decides witnessed by B's "
+            "customers)",
             "B's readiness is unknown for " + "; ".join(f"{e['seconds']} s ({e['why']})" for e in unk)
             + ": the candidate's not-Ready time cannot be told from its Ready time"))
         if rda is not None and rdb is not None:
-            # A control-plane outage of B, its whole window (outage_window; the
-            # poll gap reported for information only). The part an A outage covers in wall-clock time is the
-            # vantage's — both runs are polled from the same operator machine,
-            # so its own network dropping reads as an outage of both at once —
-            # and is excluded from both runs (rb_cut below). The rest is B's
-            # alone, and k6 is its witness, exactly as for a readiness gap
-            # (#891; run 16: one failed laptop poll, 2 s, while B's k6 served
-            # 20,532 requests at 0.41 %): B's requests in flight in it not
-            # served over the k6 bar -> FAIL (candidate_not_ready); served
-            # within it -> jointly-Ready time, kept, and a NOTE; not one request
-            # in flight -> no witness: void.
-            cpo_a = [outage_window(o) for o in ra.get("control_plane_outages") or []]
-            cpo_void, cpo_served, cpo_vantage = [], [], []
-            for o in (outage_window(x) for x in rb.get("control_plane_outages") or []):
-                cpo_vantage += [{"t0": x, "t1": y, "seconds": round(y - x, 1), "source": o["source"]}
-                                for x, y in vantage_parts(o, cpo_a)]
-                own = b_only_parts(o, cpo_a)
-                if not own:
-                    notes.append(f"{outage_text(o)}, all of it while A's did not answer either (same "
-                                 f"wall-clock time): the operator's vantage, not the candidate — excluded "
-                                 f"from both runs")
-                    continue
-                rwb = get_raw("b")
-                if rwb is None:
-                    continue                                   # raw_calls[b] voids already
-                tmo = float((rdb or {}).get("probe_timeout_s") or load606.HTTP_TIMEOUT_S)
-                kind, rec = judge_b_outage(o, own, rwb.get("spans"), tmo, th)
-                {"fail": nr, "served": cpo_served, "void": cpo_void}[kind].append(rec)
-            out["b_outages_witnessed_served"] = [
-                {k: e[k] for k in ("t0", "t1", "seconds", "first_unanswered", "poll_gap_s", "b_only",
-                                   "b_only_seconds", "k6", "why")} for e in cpo_served]
-            for e in cpo_served:
-                notes.append(f"{e['why']} -> kept as jointly-Ready time (its calls judged, its errors counted)")
-            validity.append(_validity(
-                "control_plane_outage[b]", not cpo_void,
-                [{k: e.get(k) for k in ("t0", "t1", "seconds", "first_unanswered", "poll_gap_s", "b_only",
-                                        "b_only_seconds", "k6", "source", "open")} for e in cpo_void] or "none",
-                "each of B's control-plane outages either the vantage's (A's at the same time) or witnessed by "
-                "B's k6 requests",
-                "B's control plane did not answer and no k6 request of B was in flight to tell whether B "
-                "served: " + "; ".join(e["why"] for e in cpo_void)))
             for o in cpo_a:
                 notes.append(f"A's control plane did not answer for {o['seconds']} s during the measure "
                              f"({o['source']}): excluded from both runs, like an A restart")
@@ -1175,7 +1164,7 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
         # ── the jointly-Ready time ──
         ex = {"items": [], "a": [], "b": []}
         if rda is not None and rdb is not None and ra.get("k6_span") and rb.get("k6_span"):
-            kept_b = {(e["t0"], e["t1"]) for e in ready_again}
+            kept_b = {(e["t0"], e["t1"]) for e in served if e["kind"] != "api_outage"}
             rb_cut = dict(rb, readiness=dict(rdb, excluded=[e for e in rdb.get("excluded") or []
                                                             if (e.get("t0"), e.get("t1")) not in kept_b]),
                           # of B's outages only the vantage's parts are cut; the rest
@@ -1309,8 +1298,8 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
     nr_s = round(sum(float(e.get("seconds") or 0) for e in nr), 1)
     out["candidate_not_ready"] = {
         "check": "customer_latency.pair.candidate_not_ready",
-        "value": {"seconds": nr_s, "stretches": [{k: e.get(k) for k in ("t0", "t1", "seconds", "why", "k6")
-                                                  + (("b_only", "b_only_seconds") if "b_only" in e else ())}
+        "value": {"seconds": nr_s, "stretches": [{k: e.get(k) for k in ("t0", "t1", "seconds", "kind", "parts",
+                                                                       "why", "k6")}
                                                  for e in nr]},
         "bar": "== 0 s", "result": "FAIL" if b_not_ready else "PASS",
         **({"why": f"B (the candidate) was not Ready without restarting: {len(nr)} stretch(es), {nr_s} s ("

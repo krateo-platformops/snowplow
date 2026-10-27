@@ -489,6 +489,11 @@ def _pair_calls(fake):
     ("ERROR: ResponseError: code=503, message=backend not found, try again", False),
     ("ERROR: (gcloud.container.clusters.describe) the server was not found (dial tcp: lookup)", False),
     ("ERROR: (gcloud.container.clusters.describe) ResponseError: code=500, message=error 404 upstream", False),
+    # #917 F5/N8: the message text "Not found:" on another status is not NotFound
+    ("ERROR: (gcloud.container.clusters.describe) ResponseError: code=503, message=Not found: backend", False),
+    ("ERROR: (gcloud.container.clusters.describe) ResponseError: code=4040, message=x", False),
+    # the API status NOT_FOUND, as gcloud prints it in a status block
+    ("ERROR: (gcloud.container.clusters.describe) status: NOT_FOUND", True),
 ])
 def test_the_gone_poll_counts_only_gclouds_notfound(monkeypatch, stderr, gone):
     """#907 N1: the same NotFound test as the cluster lookup — code=404 /
@@ -501,3 +506,20 @@ def test_the_gone_poll_counts_only_gclouds_notfound(monkeypatch, stderr, gone):
     t = iter([0.0, 1e9])
     assert gke.wait_cluster_gone(gke.default_spec(NAME), log=lambda m: None, deadline=1.0,
                                  clock=lambda: next(t), sleep=lambda s: None) is gone
+
+
+def test_the_lookup_counts_only_gclouds_notfound(monkeypatch):
+    """#917 N8: the cluster lookup's NotFound is the same exact test — a 503
+    whose message says "Not found:" is a failed describe, never a reason to
+    look in the zone"""
+    calls = []
+
+    def fake(argv, *, stderr_out=None, **kw):
+        calls.append(argv)
+        stderr_out.append("ERROR: (gcloud.container.clusters.describe) ResponseError: code=503, "
+                          "message=Not found: backend")
+        return 1, ""
+    monkeypatch.setattr(gke, "execute", fake)
+    with pytest.raises(RuntimeError, match="failed"):
+        gke.find_cluster(gke.default_spec(NAME), log=lambda m: None, legacy_zonal=True)
+    assert len(calls) == 1 and "--zone" not in calls[0]

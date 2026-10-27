@@ -447,7 +447,7 @@ def test_synthetic_b_readyz_no_reply_k6_is_the_witness(tmp_path):
     c = p["candidate_not_ready"]
     assert p["verdict"] == "FAIL" and c["result"] == "FAIL"
     (st,) = c["value"]["stretches"]
-    assert st["k6"]["rate"] > 0.01 and "k6 had" in st["why"] and "over the 0.01 bar" in st["why"]
+    assert st["k6"]["rate"] > 0.01 and "B's customers had" in st["why"] and "over the 0.01 bar" in st["why"]
     p = _arms(tmp_path / "ok", P14, down)
     assert p["verdict"] == "PASS" and p["candidate_not_ready"]["result"] == "PASS"
     assert p["exclusion"]["items"] == []                     # not cut from either run

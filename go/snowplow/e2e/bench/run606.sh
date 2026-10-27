@@ -655,7 +655,7 @@ s_measure() {
   # (a connection lost, a TLS / dial timeout, a 5xx) is retried to the same
   # deadline (run 16 attempt 2).
   local rv
-  while ! kwait "${K[@]}" -n bench-loadgen wait job/fresh606 --for=condition=Complete \
+  while poll_sent && ! kwait "${K[@]}" -n bench-loadgen wait job/fresh606 --for=condition=Complete \
       --timeout="$(( deadline > $(date +%s) ? deadline - $(date +%s) : 1 ))s"; do
     if grep -q 'timed out waiting for the condition' "$KERR" 2>/dev/null; then
       api_seen ok
@@ -757,20 +757,32 @@ err_kind() {
   elif answered_error; then echo "the API answered"
   else echo "API did not answer"; fi
 }
+# poll_sent: stamp a poll's SEND time, just before the polled kubectl call
+# (#917 review F1). A poll's outcome is known only when the call returns — an
+# unanswered one up to its --request-timeout later — but what it says is about
+# the time it was sent from on: api_seen records send times, never the moment
+# kubectl gave up. Every call whose outcome api_seen records stamps first.
+POLL_SENT=""
+poll_sent() { POLL_SENT=$(date +%s); }
 # api_seen <ok|down> [what]: the API server's reachability as the measure /
-# collect loops see it. Logged on a change of state only (start and end of an
-# outage, each with its time). Each outage is recorded in api-outages.jsonl
-# with its window bounded by run606's own polls — from the last poll the API
-# answered to the first it answered again — which the paired verdict uses (an
-# A outage is excluded from both runs; a B-ONLY outage makes the pair INVALID; one
-# at the same wall-clock time as an A outage is the vantage's, excluded from both).
+# collect loops see it, from the poll just made (sent at POLL_SENT). Logged on a
+# change of state only (start and end of an outage, each with its time). Each
+# outage is recorded in api-outages.jsonl with its window bounded by run606's
+# own polls, as wide as they can bound it: t0 = the SEND time of the last poll
+# the API answered (it answered at some moment after that), first_unanswered =
+# the SEND time of the first poll it did not answer, t1 = the moment the first
+# poll it answered again RETURNED. The paired verdict judges the whole [t0, t1]
+# (an A outage is excluded from both runs; of B's, the part an A outage covers
+# is the vantage's, the rest is judged by B's k6 requests).
 API_DOWN_SINCE="" API_DOWN_AT="" API_DOWN_WHAT="" API_LAST_OK=""
 api_seen() {
-  local now
+  local now sent
   now=$(date +%s)
+  sent=${POLL_SENT:-$now}
   if [[ "$1" == "down" ]]; then
     if [[ -z "$API_DOWN_SINCE" ]]; then
-      API_DOWN_SINCE=$now API_DOWN_AT="$(date -u +%H:%M:%S)" API_DOWN_WHAT="${2:-}"
+      API_DOWN_SINCE=$sent API_DOWN_AT="$(date -u -r "$sent" +%H:%M:%S 2>/dev/null || date -u -d "@$sent" +%H:%M:%S)"
+      API_DOWN_WHAT="${2:-}"
       log "API server unreachable since ${API_DOWN_AT} (${API_DOWN_WHAT}): waiting it out, not a verdict"
     fi
   else
@@ -778,12 +790,13 @@ api_seen() {
       log "API server reachable again at $(date -u +%H:%M:%S), after $(( now - API_DOWN_SINCE )) s (unreachable since ${API_DOWN_AT})"
       api_record "$now" false
     fi
-    API_LAST_OK=$now
+    API_LAST_OK=$sent
   fi
 }
-# api_record <t1> <open>: one outage into the run's record. t0 = the last poll
-# the API answered before it (else the first that went unanswered), t1 = the
-# first it answered after (or now, still open).
+# api_record <t1> <open>: one outage into the run's record. t0 = the send time
+# of the last poll the API answered before it (else of the first that went
+# unanswered), t1 = when the first it answered after returned (or now, still
+# open).
 api_record() {
   printf '{"kind":"api_unreachable","t0":%s,"t1":%s,"seconds":%s,"first_unanswered":%s,"seen_by":"%s","open":%s,"source":"run606 polls: the last answered poll before to the first answered poll after"}\n' \
     "${API_LAST_OK:-$API_DOWN_SINCE}" "$1" "$(( $1 - ${API_LAST_OK:-$API_DOWN_SINCE} ))" "$API_DOWN_SINCE" \
@@ -796,7 +809,7 @@ api_record() {
 # still open then is recorded as open.
 api_reachable_for_collect() {
   local until=$(( $(date +%s) + COLLECT_CAP_S / 2 ))
-  while ! bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
+  while poll_sent && ! bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
         -n bench-loadgen get jobs -o name >/dev/null 2>&1; do
     api_seen down "collect"
     if (( $(date +%s) >= until )); then
@@ -828,6 +841,7 @@ wait_drive_done() {
       # A read the API server did not answer proves nothing: it is waited out
       # (to the measure deadline), never concluded (run 16 attempt 2). Only a
       # read it ANSWERED with an error, twice (read_verdict), fails the step.
+      poll_sent
       if st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$j" \
                -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>"$KERR")"; then
         api_seen ok
@@ -855,6 +869,7 @@ wait_drive_done() {
       for k in $(driver_jobs); do
         # only positive evidence fails the step: a pod seen Pending past
         # DRIVER_PENDING_S (its own creationTimestamp) or a restarting init step
+        poll_sent
         if ! pods="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o json 2>"$KERR")"; then
           rv=0
           read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o name || rv=$?
@@ -1052,7 +1067,7 @@ s_collect() {
     # collect's cap; one still unanswered is recorded "unreadable", never as
     # a pod that is missing ("never started": run 16's bug, at collect)
     # a verdict only when the API ANSWERED with an error, twice (read_verdict)
-    while ! jp="$("${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>"$KERR")"; do
+    while poll_sent && ! jp="$("${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o json 2>"$KERR")"; do
       rv=0
       read_verdict "${KR[@]}" -n bench-loadgen get pods -l "job-name=$p" -o name || rv=$?
       case "$rv" in
