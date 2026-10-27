@@ -1,0 +1,60 @@
+# The #606 GKE bench's own test suite (go/snowplow/e2e/bench), on every pull
+# request that touches it: the whole suite, the Docker tests included (k6 and
+# real Chrome in the pinned k6 browser image, tests/test_k6_830.py and
+# tests/test_k6_clicks_after_first_load.py), which the shared developer host
+# is too loaded to run. Hermetic: fake gcloud / kubectl / helm, local HTTP
+# fixtures, no cloud and no cluster. Not a required check (the owner's call).
+name: bench-tests
+
+on:
+  pull_request:
+    paths:
+      - "go/snowplow/e2e/bench/**"
+      - ".github/workflows/bench-tests.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: go/snowplow/e2e/bench
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Node (k6 scripts' pure parts run under node)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the bench's Python dependencies
+        run: python -m pip install -r requirements.txt pyyaml
+
+      - name: Docker is there (the k6 / Chrome tests skip without it)
+        run: docker info
+
+      - name: Pull the pinned k6 images
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import subprocess
+          from bench import k6_job
+          for image in (k6_job.K6_IMAGE, k6_job.K6_BROWSER_IMAGE, k6_job.PY_IMAGE):
+              subprocess.run(["docker", "pull", image], check=True)
+          PY
+
+      - name: Bench suite (Docker k6 / Chrome tests included)
+        run: python -m pytest -q -rfs --tb=short tests/
