@@ -2440,6 +2440,7 @@ RUN8_VARS_PREFIXES = (
     "snowplow_phase1_units",
     "snowplow_phase1_readiness_exit",
     "snowplow_prewarm_engine",
+    "snowplow_work_class",                # #871: units started / completed per work class
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -3282,7 +3283,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              viewer_dead: list[dict] | None = None,
              k6: dict | None = None,
              churns: list[dict] | None = None,
-             api_outages: list[dict] | None = None) -> dict:
+             api_outages: list[dict] | None = None,
+             profile_dir: str | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -3294,6 +3296,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     `k6` (#830, run 11): {"k6", "browser": k6eval.read_k6_out(...), "sessions",
     "thresholds"}; `navs` are then the real-browser page loads.
     `churns`: fresh606's churn records (the per-phase reports' schedule).
+    `profile_dir`: where mem606's CPU profiles were copied (the run's heap/
+    dir), for the #871 work-class CPU report; None = not attributed.
     """
     if k6 is not None:
         # operator side only: this file also runs alone inside the Job pods
@@ -3479,6 +3483,24 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["profiling"] = profiling_report(
         mem or [], navs,
         k6eval.k6_page_loads(k6.get("k6")) if k6 is not None else None)
+    # #871 — the work-class label: CPU per class from the profiles, units per
+    # class from the expvar. Report only; local import (load606.py alone runs
+    # in the cluster).
+    from bench import workclass
+    report["work_class_report_only"] = {
+        "cpu": workclass.cpu_report(cpu_profile_windows(mem or []), mem or [], profile_dir),
+        "units": workclass.units_report(mem or [], phase_src, _phase_counter_report)}
+    wc = report["work_class_report_only"]
+    if wc["units"]["status"] == REPORT_ABSENT:
+        report["report_warnings"].append(
+            f"{workclass.EXPVAR_KEY} absent in all {wc['units']['mem_samples']} mem samples: "
+            f"the #871 work-class unit counts are missing, not zero")
+    # a run with no CPU profile at all is the profiling report's business
+    # (mem606.cpu_profiles_storm); this warns only when profiles exist but
+    # cannot be attributed (an image without the label, files not handed over)
+    if wc["cpu"]["status"] != "present" and any(m.get("kind") == "cpu_profile" and m.get("profile")
+                                                for m in mem or []):
+        report["report_warnings"].append(f"#871 work-class CPU report: {wc['cpu']['note']}")
     report["harness_notes"] = list(HARNESS_NOTES)
     if k6 is not None:
         report["page_loads_are"] = "real Chrome sessions (k6 browser), first visit vs warm per session"
@@ -5028,7 +5050,8 @@ def _cmd_evaluate(a) -> int:
                                          key=lambda r: r.get("t") or 0),
                       k6=k6,
                       churns=[r for r in recs if r.get("kind") == "churn"],
-                      api_outages=[r for r in recs if r.get("kind") == "api_unreachable"])
+                      api_outages=[r for r in recs if r.get("kind") == "api_unreachable"],
+                      profile_dir=a.profile_dir)
     # the cluster's shape (gke-shape): "control_plane": "regional" from run 17;
     # runs 14-16 have no record (their control plane was zonal)
     result["report"]["cluster_shape"] = next((r for r in recs if r.get("kind") == "cluster_shape"), None)
@@ -5039,6 +5062,18 @@ def _cmd_evaluate(a) -> int:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))
     return {"PASS": 0, "FAIL": 1, "INVALID": 3, "INCONCLUSIVE": 4}[result["verdict"]]
+
+
+def _cmd_work_class(a) -> int:
+    """#871: one attribution over the given profiles (the ad-hoc root-frame
+    scripts of the pre-build check, replaced by the label)."""
+    from bench import workclass
+    bodies = []
+    for path in a.profiles:
+        with open(path, "rb") as fh:
+            bodies.append(fh.read())
+    print(json.dumps(workclass.attribute(bodies), indent=2))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5202,7 +5237,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="#830: the run had no open tabs (VIEWERS=0): no viewer checks")
     e.add_argument("--run8", action="store_true",
                    help="add the #710 run-8 memory-risk / stale_to_push report and checks")
+    e.add_argument("--profile-dir", default=None,
+                   help="#871: where mem606's CPU profiles were copied (the run's heap/ dir); "
+                        "attributes their CPU by the snowplow_work label")
     e.set_defaults(func=_cmd_evaluate)
+    wcp = sub.add_parser("work-class",
+                         help="#871: CPU per snowplow_work class over the given CPU profiles")
+    wcp.add_argument("profiles", nargs="+")
+    wcp.set_defaults(func=_cmd_work_class)
     a = p.parse_args(argv)
     return int(a.func(a))
 

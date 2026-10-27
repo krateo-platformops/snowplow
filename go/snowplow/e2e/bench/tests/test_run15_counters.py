@@ -179,7 +179,8 @@ def test_run13_real_mem_samples_report_both_absent():
     v = load606.evaluate([], [], [], mem=mem)
     assert v["report"]["list_incremental_report_only"]["status"] == "absent_in_all_samples"
     assert v["report"]["store_verification_report_only"]["status"] == "absent_in_all_samples"
-    assert len(v["report"]["report_warnings"]) == 3                     # + #855's list_narrow
+    # + #855's list_narrow, + #871's work-class units (1.12.52 has no label; no CPU profile here)
+    assert len(v["report"]["report_warnings"]) == 4
 
 
 def test_store_verification_recorded_unavailable_and_an_older_image():
