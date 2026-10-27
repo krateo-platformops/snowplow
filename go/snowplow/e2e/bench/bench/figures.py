@@ -121,25 +121,27 @@ def steady_refreshes_per_core(cl: dict | None) -> dict:
     return {"value": round(per_s / (med / 1000), 3), "refreshes_per_s": per_s, "cpu_median_m": med}
 
 
-# ─── natural relists (#933 review) ──────────────────────────────────────────
+# ─── reflector establishments after Ready (#933 review; #924 review R2) ─────
 # What snowplow exposes (mem606 samples it every 15 s, MEM_VARS_PREFIXES):
 #   reflector_watchlist_established_total (snowplow_reflector_path): a WATCH
-#     with sendInitialEvents — a reflector (re-)establishing its whole state
-#     from the watch cache; only reflectors send one. After boot, each is a
-#     relist (watch-list regime).
+#     with sendInitialEvents — a reflector establishing its whole state from
+#     the watch cache. After Ready that is a relist, OR an informer snowplow
+#     starts lazily for a GVR it first meets then (DepTracker.ensureInformer
+#     -> EnsureResourceTypeFor), OR a CRD schema-change relist: one counter
+#     for all three, so this report counts REFLECTOR ESTABLISHMENTS, never
+#     "relists";
 #   watch_errors_total (snowplow_informer_watch): every ListAndWatch error;
-#     the reflector relists after each.
+#     the reflector re-establishes after each (beside it, same window);
 #   the two classic-LIST counters (reflector_list_cache_eligible_total,
 #     reflector_list_etcd_delegated_total) count snowplow's own fallthrough
-#     LISTs too: reported, never read as relists.
-# All process-wide: snowplow exposes no per-GVR relist count or time (its
-# per-GVR path map holds only the current path; the cache.watch.broken WARN
-# names a GVR on its FIRST failure only). So a relist's GVR is not known, and
-# k6's requests carry no GVR either: the 50K-composition-GVR comparison is
-# not derivable from what the bench can collect — the windows below are
-# "some GVR relisted" against "none did", for every k6 call.
-RELIST = {"watchlist_established": ("snowplow_reflector_path", "reflector_watchlist_established_total"),
-          "watch_errors": ("snowplow_informer_watch", "watch_errors_total")}
+#     LISTs too: not read at all.
+# All process-wide. A relist cannot be told from a first start, nor its GVR
+# known, without a per-GVR / per-cause signal in snowplow itself — #932 step
+# 0's; #933 reads relists from that. k6's requests carry no GVR either: the
+# 50K-composition-GVR comparison is not derivable here, and the windows below
+# are "some reflector established" against "none did", for every k6 call.
+ESTABLISHMENT = {"watchlist_established": ("snowplow_reflector_path", "reflector_watchlist_established_total"),
+                 "watch_errors": ("snowplow_informer_watch", "watch_errors_total")}
 CLASSIC_LIST = ("reflector_list_cache_eligible_total", "reflector_list_etcd_delegated_total")
 _TOP_M = re.compile(r"(\S+)\s+(\d+)m\s+(\S+)")
 
@@ -153,33 +155,36 @@ def _pct(v: list[float], p: float) -> float | None:
     return round(s[lo] + (s[hi] - s[lo]) * (k - lo), 1)
 
 
-def _relist_counts(m: dict) -> dict | None:
+def _establishment_counts(m: dict) -> dict | None:
     ex = m.get("extra") or {}
     out = {}
-    for name, (fam, stat) in RELIST.items():
+    for name, (fam, stat) in ESTABLISHMENT.items():
         v = (ex.get(fam) or {}).get(stat) if isinstance(ex.get(fam), dict) else None
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             out[name] = v
     return out or None
 
 
-def relists(mem: list[dict], after: float | None, k6_calls: list[tuple[float, float]], tops: list[dict]) -> dict:
-    """Natural relists after the boot (snowplow Ready at `after`): their
-    count per hour, each one's interval (two consecutive mem606 samples, 15 s)
-    with snowplow's heap before / after and CPU (kubectl top) in it, and k6's
-    calls completing in relist intervals against the quiet ones."""
+def reflector_establishments(mem: list[dict], after: float | None, k6_calls: list[tuple[float, float]],
+                             tops: list[dict]) -> dict:
+    """Reflector establishments after the boot (snowplow Ready at `after`):
+    relists, lazy first informer starts and schema relists alike (the block
+    above). Their count per hour, each one's interval (two consecutive mem606
+    samples, 15 s) with snowplow's heap before / after and CPU (kubectl top)
+    in it, and k6's calls completing in those intervals against the quiet
+    ones."""
     rows = sorted((m for m in mem if m.get("kind") == "mem" and m.get("t") is not None
-                   and _relist_counts(m) is not None and (after is None or m["t"] >= after)),
+                   and _establishment_counts(m) is not None and (after is None or m["t"] >= after)),
                   key=lambda m: m["t"])
     if len(rows) < 2:
         n = sum(1 for m in mem if m.get("kind") == "mem")
         return {"status": "absent",
                 "note": (f"{n} mem samples, {len(rows)} after Ready carry "
-                         f"{' / '.join(f'{f}.{s}' for f, s in RELIST.values())}: the relist count is MISSING "
+                         f"{' / '.join(f'{f}.{s}' for f, s in ESTABLISHMENT.values())}: the count is MISSING "
                          f"(an image or MEM_VARS_PREFIXES without them), not zero")}
-    events, quiet, seconds, totals, resets = [], [], 0.0, dict.fromkeys(RELIST, 0), 0
+    events, quiet, seconds, totals, resets = [], [], 0.0, dict.fromkeys(ESTABLISHMENT, 0), 0
     for a, b in zip(rows, rows[1:]):
-        ca, cb = _relist_counts(a), _relist_counts(b)
+        ca, cb = _establishment_counts(a), _establishment_counts(b)
         d = {k: cb[k] - ca[k] for k in cb if k in ca}
         if any(v < 0 for v in d.values()):
             resets += 1                       # a restart reset the counters: not this interval
@@ -203,20 +208,24 @@ def relists(mem: list[dict], after: float | None, k6_calls: list[tuple[float, fl
     def lat(groups):
         v = [x for g in groups for x in g]
         return {"windows": len(groups), "calls": len(v), "p95_ms": _pct(v, 95), "max_ms": max(v) if v else None}
-    in_relist = lat([e.pop("_ms") for e in events])
+    in_events = lat([e.pop("_ms") for e in events])
     hours = seconds / 3600
-    return {"status": "present", "measured_s": round(seconds, 1), "counter_resets_skipped": resets,
+    return {"status": "present", "counts": "reflector establishments (relists, lazy first informer starts and "
+                                           "schema relists alike) and ListAndWatch errors; NOT relists",
+            "relists": "not derivable: a relist cannot be told from a first start without snowplow's per-GVR / "
+                       "per-cause signal (#932 step 0)",
+            "measured_s": round(seconds, 1), "counter_resets_skipped": resets,
             "totals": totals,
             "per_hour": {k: round(v / hours, 3) if hours else None for k, v in totals.items()},
             "none_occurred": not events,
             "per_gvr": "not exposed by snowplow (process-wide counters only)",
             "events": events,
-            "k6_calls_in_relist_windows": in_relist,
+            "k6_calls_in_establishment_windows": in_events,
             "k6_calls_in_quiet_windows": lat(quiet),
-            "composition_gvr_comparison": "not derivable: neither a relist's GVR nor a k6 call's GVR is "
-                                          "collected (snowplow exposes no per-GVR relist signal)",
+            "composition_gvr_comparison": "not derivable: neither an establishment's GVR nor a k6 call's GVR is "
+                                          "collected (snowplow exposes no per-GVR signal; #932 step 0)",
             "classic_list_note": f"{' / '.join(CLASSIC_LIST)} also count snowplow's own fallthrough LISTs: "
-                                 f"not relists, not reported as such"}
+                                 f"not read"}
 
 
 def run_figures(report: dict, recs: list[dict], window, facts: dict,
@@ -227,9 +236,9 @@ def run_figures(report: dict, recs: list[dict], window, facts: dict,
     out = {"boot": dict(facts, **boot_memory(recs, window, facts.get("pod"))),
            "flow": cfg or {"note": "no flowcontrol_config record: the identities' flow schemas are not known"},
            "steady_refreshes_per_core": steady_refreshes_per_core(report.get("customer_latency")),
-           "relists": relists([r for r in recs if r.get("kind") == "mem"],
-                              facts.get("ready_at"), k6_calls or [],
-                              [r for r in recs if r.get("kind") == "top"])}
+           "reflector_establishments_after_ready": reflector_establishments(
+               [r for r in recs if r.get("kind") == "mem"], facts.get("ready_at"), k6_calls or [],
+               [r for r in recs if r.get("kind") == "top"])}
     ids = (cfg or {}).get("identities") or {}
     if cfg and cfg.get("verified") and ap.get("status") == "present":
         def per(rep):

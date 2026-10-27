@@ -2471,10 +2471,11 @@ RUN8_VARS_PREFIXES = (
     "snowplow_phase1_readiness_exit",
     "snowplow_prewarm_engine",
     "snowplow_work_class",                # #871: units started / completed per work class
-    # #919 (#933 review): natural relists — reflector (re-)establishments by
-    # wire path (cache/reflector_path_stats.go) and ListAndWatch errors, each
-    # followed by a relist (cache/informer_watch_stats.go). Process-wide:
-    # snowplow exposes no per-GVR count or time.
+    # #919 (#933 review): reflector establishments by wire path — relists,
+    # lazy first informer starts and schema relists alike
+    # (cache/reflector_path_stats.go) — and ListAndWatch errors
+    # (cache/informer_watch_stats.go). Process-wide: snowplow exposes no
+    # per-GVR count or time (#932 step 0 adds it).
     "snowplow_reflector_path",
     "snowplow_informer_watch",
 )

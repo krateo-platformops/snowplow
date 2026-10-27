@@ -672,16 +672,30 @@ def browser_request_spans(o: dict | None) -> list[tuple[float, float, bool, floa
     return out
 
 
-def browser_incomplete_spans(o: dict | None) -> list[tuple[float, float, bool, float | None]]:
+# Chrome's net error for a request the CLIENT ended: the page's own fetch
+# cancel (an AbortController, a route change), a navigation away, the page
+# closing. Every other errorText (ERR_CONNECTION_REFUSED / _RESET / _CLOSED,
+# ERR_TIMED_OUT, ERR_EMPTY_RESPONSE, ERR_NAME_NOT_RESOLVED, ERR_FAILED, ...)
+# is the request failing at the network level.
+CLIENT_CANCEL = "net::ERR_ABORTED"
+
+
+def browser_incomplete_spans(o: dict | None) -> list[tuple[float, float, bool | None, float | None]]:
     """The browser's requests k6 never times (#919 N7, browser.js's ledger),
-    as (start, end, not served, ms) — every one NOT SERVED:
-      failed            browser_request_incomplete_ms outcome=failed: its
-                        flight is the point's time minus its value to the
-                        point's time (the failure);
-      never completed,  outcome=never_completed answered=no: no answer at all
-      unanswered        by the session's end (the point's time);
-      start unseen      browser_request_failed_start_unseen: a failure at the
-                        point's time, its start not known (an instant).
+    as (start, end, not served, ms), by the witness's own definition — not
+    served = failed, or no reply within the probe's timeout (judge_stretch):
+      failed at the       outcome=failed with any error but CLIENT_CANCEL:
+      network level       not served (True); its flight is the point's time
+                          minus its value to the point's time;
+      cancelled by the    outcome=failed, CLIENT_CANCEL; and outcome=
+      page, or cut at     never_completed answered=no (no answer by the
+      the session's end   session's end): None — a witness only once its
+                          flight outlasted the probe's timeout (then not
+                          served); before that it proves nothing;
+      start unseen        browser_request_failed_start_unseen: a network
+                          failure at the point's time, its start not known
+                          (an instant, not served); a client cancel of
+                          unknown flight is no witness and is left out.
     A never-completed request that WAS answered (its response headers came:
     a live stream, /refreshes or /notifications, open by design) is served
     and is not a witness of anything here."""
@@ -692,11 +706,13 @@ def browser_incomplete_spans(o: dict | None) -> list[tuple[float, float, bool, f
                           (o.get("times") or {}).get("browser_request_incomplete_ms") or []):
         if t is None or v is None:
             continue
-        if tg.get("outcome") == "failed" or (tg.get("outcome") == "never_completed" and tg.get("answered") == "no"):
-            out.append((t - v / 1000.0, t, True, v))
-    for (_, _), t in zip(o["points"].get("browser_request_failed_start_unseen", []),
-                         (o.get("times") or {}).get("browser_request_failed_start_unseen") or []):
-        if t is not None:
+        if tg.get("outcome") == "failed":
+            out.append((t - v / 1000.0, t, None if tg.get("error") == CLIENT_CANCEL else True, v))
+        elif tg.get("outcome") == "never_completed" and tg.get("answered") == "no":
+            out.append((t - v / 1000.0, t, None, v))
+    for (_, tg), t in zip(o["points"].get("browser_request_failed_start_unseen", []),
+                          (o.get("times") or {}).get("browser_request_failed_start_unseen") or []):
+        if t is not None and tg.get("error") != CLIENT_CANCEL:
             out.append((t, t, True, None))
     return out
 
@@ -760,14 +776,25 @@ def judge_stretch(parts: list[tuple[float, float]], customers: dict[str, list | 
       none      not one request in flight;
       unpaired  a stream's points do not pair up: no witness can be read.
     Each stream is one key: k6load, browser (completed requests) and
-    browser_incomplete (failed at network level / never answered, #919 N7)."""
+    browser_incomplete (failed at network level / never answered, #919 N7).
+    A request whose `failed` is None (browser_incomplete: cancelled by the
+    page, or cut at the session's end) is a witness only once it outlasted
+    `timeout_s` (not served); before that it is no witness: left out of the
+    count, reported as `no_witness`."""
     if any(sp is None for sp in customers.values()):
         bad = sorted(k for k, sp in customers.items() if sp is None)
         return {"verdict": "unpaired", "k6": {"unpaired": bad}}
     by, n, k = {}, 0, 0
     for src, spans in sorted(customers.items()):
-        ov = [f or ms > timeout_s * 1000 for s0, t, f, ms in spans if any(s0 < y and t > x for x, y in parts)]
-        by[src] = {"requests": len(ov), "not_served": sum(ov)}
+        ov, nw = [], 0
+        for s0, t, f, ms in spans:
+            if not any(s0 < y and t > x for x, y in parts):
+                continue
+            if f is None and not (ms is not None and ms > timeout_s * 1000):
+                nw += 1
+                continue
+            ov.append(bool(f) or ms > timeout_s * 1000)
+        by[src] = {"requests": len(ov), "not_served": sum(ov), **({"no_witness": nw} if nw else {})}
         n, k = n + len(ov), k + sum(ov)
     w = {"requests": n, "not_served": k, "rate": round(k / n, 6) if n else None, "timeout_s": timeout_s,
          "by_source": by}

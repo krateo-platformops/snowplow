@@ -576,6 +576,53 @@ def test_a_network_failed_request_inside_a_stretch_is_not_served(tmp_path):
     assert j["k6"]["by_source"]["browser_incomplete"] == {"requests": 1, "not_served": 1}
 
 
+def _incomplete(T, *pts):
+    base = dict(session="s1", route="/dashboard", call_name="", call_namespace="", call_resource="")
+    return [_timed_point(m, v, t, **base, request="fetch", **tags) for m, v, t, tags in pts]
+
+
+def test_a_page_cancel_or_a_session_end_cut_is_no_witness_until_it_outlasts_the_probe(tmp_path):
+    """#924 delta review R1, the reviewer's case: a 2 s stretch in which B
+    served all 150 k6load requests, plus two fetches the PAGE cancelled
+    (net::ERR_ABORTED, 120 ms) and one request cut 40 ms before the session
+    ended. By the witness's own definition (failed, or no reply within the
+    probe's timeout) none of the three is "not served": the stretch is served."""
+    from bench import custlat
+    T = 1_793_000_000
+    _write_out(tmp_path / "browser", "browser", _incomplete(
+        T,
+        ("browser_request_incomplete_ms", 120.0, T + 101, dict(outcome="failed", error="net::ERR_ABORTED", answered="no")),
+        ("browser_request_incomplete_ms", 120.0, T + 101, dict(outcome="failed", error="net::ERR_ABORTED", answered="no")),
+        ("browser_request_incomplete_ms", 40.0, T + 101, dict(outcome="never_completed", error="", answered="no")),
+        # a page cancel whose start was never seen: its flight unknown, no witness at all
+        ("browser_request_failed_start_unseen", 1, T + 101, dict(outcome="failed", error="net::ERR_ABORTED",
+                                                                  answered="no", start_seen="false"))),
+        None, 0)
+    raw = custlat.raw_from_dir(str(tmp_path))
+    customers = dict(raw["customers"], k6load=[(T + 100 + i / 100, T + 100.5 + i / 100, False, 50.0) for i in range(150)])
+    j = custlat.judge_stretch([(T + 100, T + 102)], customers, timeout_s=10, bar=0.01)
+    assert j["verdict"] == "served", j
+    assert j["k6"]["by_source"]["browser_incomplete"] == {"requests": 0, "not_served": 0, "no_witness": 3}
+    assert j["k6"]["requests"] == 150 and j["k6"]["not_served"] == 0
+
+
+def test_a_page_cancel_or_a_cut_that_outlasted_the_probe_is_not_served(tmp_path):
+    from bench import custlat
+    T = 1_793_000_000
+    _write_out(tmp_path / "browser", "browser", _incomplete(
+        T,
+        ("browser_request_incomplete_ms", 15000.0, T + 105, dict(outcome="failed", error="net::ERR_ABORTED", answered="no")),
+        ("browser_request_incomplete_ms", 20000.0, T + 110, dict(outcome="never_completed", error="", answered="no")),
+        ("browser_request_incomplete_ms", 50.0, T + 101, dict(outcome="failed", error="net::ERR_CONNECTION_RESET",
+                                                              answered="no"))),
+        None, 0)
+    raw = custlat.raw_from_dir(str(tmp_path))
+    j = custlat.judge_stretch([(T + 100, T + 102)], raw["customers"], timeout_s=10, bar=0.01)
+    # hung 15 s / 20 s through the stretch: past the 10 s probe, not served; a reset: a network failure
+    assert j["k6"]["by_source"]["browser_incomplete"] == {"requests": 3, "not_served": 3}
+    assert custlat.CLIENT_CANCEL == "net::ERR_ABORTED"
+
+
 # ─── 4. churn write failures: time and status code ──────────────────────────
 
 
@@ -753,6 +800,22 @@ def test_parse_keeps_every_flowcontrol_series_and_the_replica():
                                                          "priority_level": "workload-low", "le": "+Inf"})
 
 
+def test_a_pair_that_straddles_a_whole_phase_spans_it():
+    """#924 delta review L4, the reviewer's case: burst [200, 230) inside
+    churn:a [100, 1000); a replica scraped at 190 and 240 — both scrapes in
+    churn:a, the burst between them. Its 30 rejections are spanning
+    (churn:a..burst..churn:a), never booked to churn:a."""
+    r = _mod("apf").report([_apf(150, _metrics(1, 1, 0, 0.0, 0, rejected=0)),
+                            _apf(190, _metrics(2, 2, 0, 0.0, 0, rejected=5)),
+                            _apf(240, _metrics(3, 3, 0, 0.0, 0, rejected=35))],
+                           [("burst", 200, 230), ("churn:a", 100, 1000)], load606._phase_of, None)
+    assert list(r["spanning"]) == ["churn:a..burst..churn:a"]
+    sp = r["spanning"]["churn:a..burst..churn:a"]["priority_levels"]["workload-low"]["flow_schemas"]["snowplow"]
+    assert sp["rejected"] == {"queue-full": 30}
+    ch = r["by_phase"]["churn:a"]["priority_levels"]["workload-low"]["flow_schemas"]["snowplow"]
+    assert ch["rejected"] == {"queue-full": 5}                       # only 150 -> 190, inside churn:a
+
+
 def test_counters_are_differenced_within_one_replica_never_across():
     """Two replicas answer in turn (a regional control plane): replica A's
     counters are in the thousands, B's in the tens. Differencing across them
@@ -815,7 +878,8 @@ def test_apf_per_phase_through_evaluate(tmp_path):
     assert r["by_phase"]["before_measure"]["priority_levels"]["workload-low"]["flow_schemas"]["snowplow"][
         "dispatched"] == 100
     sp = {k: v["priority_levels"]["workload-low"]["dispatched"] for k, v in r["spanning"].items()}
-    assert sp == {"before_measure..churn:list_dep@10": 100, "churn:list_dep@10..steady": 100}
+    # 90 -> 110 crosses the measure's start (100) and the churn step's (105): every phase it crossed
+    assert sp == {"before_measure..steady..churn:list_dep@10": 100, "churn:list_dep@10..steady": 100}
     assert r["by_phase"]["steady"]["failed_scrapes"] == 1 and r["samples"]["failed"] == 1
     assert r["by_phase"]["steady"]["counters"].startswith("NOT MEASURED")          # its only pair spans
     assert r["by_phase"]["all"]["priority_levels"]["workload-low"]["dispatched"] == 700
@@ -927,7 +991,8 @@ def test_the_acceptance_figures_through_evaluate(tmp_path):
     # #924 M3: the bench's own churn in its own schema, never in snowplow's
     assert boot["bench_drivers"]["rejected"] == 3 and boot["bench_drivers"]["wait_requests"] == 11
     # #924 M1: the differences across the boot's edges are spanning, booked to neither side
-    assert set(f["spanning"]) == {"before_measure..boot", "boot..steady"}
+    # 1095 -> 1250 crosses Ready (1100, before_measure) and the measure's start (1200)
+    assert set(f["spanning"]) == {"before_measure..boot", "boot..before_measure..steady"}
     assert f["spanning"]["before_measure..boot"]["snowplow_sa"]["wait_requests"] == 300
     assert f["by_phase"]["before_measure"]["snowplow_sa"]["wait_requests"] is None   # not measured, never 0
     assert f["by_phase"]["steady"]["snowplow_sa"]["counters"].startswith("NOT MEASURED")
@@ -939,7 +1004,7 @@ def test_a_phase_without_a_pair_is_not_measured_and_a_crossing_pair_spans(tmp_pa
     """#924 review M1, the reviewer's case: a boot of [100, 130), replica 1
     scraped at 101 and 200, replica 2 at 116; replica 1's rejections 5 -> 50.
     The boot has no pair: its counters are NOT MEASURED, never 0. The 45
-    rejections are spanning boot..steady, never booked to steady."""
+    rejections are spanning (boot..before_measure..steady), never booked to steady."""
     r1, r2 = 1.0e9, 2.0e9
     files = {"boot.jsonl": [{"kind": "boot", "t_restart": 100.0}],
              "pod-before.jsonl": [{"kind": "snowplow_pod", "phase": "before", "pod": "s", "restarts": 0,
@@ -954,7 +1019,7 @@ def test_a_phase_without_a_pair_is_not_measured_and_a_crossing_pair_spans(tmp_pa
     assert boot["counters"].startswith("NOT MEASURED")
     assert boot["sampled_max_inflight_requests"] == 4               # a gauge: both scrapes in the boot
     assert f["by_phase"]["steady"]["snowplow_sa"]["rejected"] is None
-    assert f["spanning"]["boot..steady"]["snowplow_sa"]["rejected"] == 45
+    assert f["spanning"]["boot..before_measure..steady"]["snowplow_sa"]["rejected"] == 45
     ap = v["report"]["apiserver_flowcontrol_report_only"]
     assert ap["by_phase"]["boot"]["counters"].startswith("NOT MEASURED")
     assert ap["by_phase"]["all"]["same_replica_pairs"] == 1           # the whole run keeps it
@@ -1012,31 +1077,31 @@ def _relist_run(tmp_path, counts):
         "--k6-out", str(tmp_path / "k6"))
 
 
-def test_a_natural_relist_its_k6_windows_and_its_heap_and_cpu_through_evaluate(tmp_path):
+def test_a_reflector_establishment_its_k6_windows_and_its_heap_and_cpu_through_evaluate(tmp_path):
     v = _relist_run(tmp_path, [(990, 0, 0, 100.0),            # before Ready: the boot's establishments
                                (1000, 280, 0, 500.0), (1015, 281, 1, 700.0),   # one relist in (1000, 1015]
                                (1030, 281, 1, 650.0), (1045, 281, 1, 640.0)])
-    r = v["report"]["acceptance_figures_report_only"]["relists"]
+    r = v["report"]["acceptance_figures_report_only"]["reflector_establishments_after_ready"]
     assert r["status"] == "present" and r["none_occurred"] is False and r["measured_s"] == 45.0
     assert r["totals"] == {"watchlist_established": 1, "watch_errors": 1}
     assert r["per_hour"]["watchlist_established"] == 80.0
     e = r["events"]
     assert len(e) == 1 and (e[0]["t0"], e[0]["t1"]) == (1000, 1015)
     assert (e[0]["heap_inuse_mb_before"], e[0]["heap_inuse_mb_after"], e[0]["cpu_m_samples"]) == (500.0, 700.0, [900])
-    assert r["k6_calls_in_relist_windows"] == {"windows": 1, "calls": 2, "p95_ms": 4755.0, "max_ms": 5000.0}
+    assert r["k6_calls_in_establishment_windows"] == {"windows": 1, "calls": 2, "p95_ms": 4755.0, "max_ms": 5000.0}
     assert r["k6_calls_in_quiet_windows"] == {"windows": 2, "calls": 2, "p95_ms": 59.5, "max_ms": 60.0}
     assert "not exposed" in r["per_gvr"] and "not derivable" in r["composition_gvr_comparison"]
 
 
 def test_no_relist_is_said_as_none_and_no_counter_as_missing(tmp_path):
     v = _relist_run(tmp_path, [(1000, 280, 0, 500.0), (1015, 280, 0, 500.0), (1030, 280, 0, 500.0)])
-    r = v["report"]["acceptance_figures_report_only"]["relists"]
+    r = v["report"]["acceptance_figures_report_only"]["reflector_establishments_after_ready"]
     assert r["none_occurred"] is True and r["totals"] == {"watchlist_established": 0, "watch_errors": 0}
     assert r["per_hour"]["watchlist_established"] == 0.0 and r["events"] == []
     d = tmp_path / "absent"
     d.mkdir()
     v = _evaluate(d, {"mem-mem606-0.jsonl": [{"kind": "mem", "t": 1.0, "extra": {}}, {"kind": "mem", "t": 2.0}]})
-    r = v["report"]["acceptance_figures_report_only"]["relists"]
+    r = v["report"]["acceptance_figures_report_only"]["reflector_establishments_after_ready"]
     assert r["status"] == "absent" and "MISSING" in r["note"]
 
 
@@ -1159,15 +1224,26 @@ def test_a_refused_metrics_endpoint_fails_the_run_before_the_data_load(harness):
     assert "=== step data ===" not in p.stderr and "deleted (gke-down OK)" in p.stderr
 
 
-def test_an_identity_that_does_not_land_in_its_own_schema_fails_env(harness):  # noqa: F811
-    """#924 M3: the figures are only snowplow's when the bench's schemas took.
-    A cluster that ignores them (FAKE_BENCH_FS_IGNORED) fails env, before the
-    data load is paid for."""
+@pytest.mark.parametrize("ignored, missed", [
+    ({"FAKE_BENCH_FS_IGNORED": "1"}, {"snowplow_sa", "snowplow_users", "bench_drivers"}),
+    # #924 review R3: EVERY identity is checked, not snowplow's ServiceAccount alone
+    ({"FAKE_BENCH_FS_IGNORED_FOR": "snowplow_users"}, {"snowplow_users"}),
+    ({"FAKE_BENCH_FS_IGNORED_FOR": "bench_drivers"}, {"bench_drivers"}),
+])
+def test_an_identity_that_does_not_land_in_its_own_schema_fails_env(harness, ignored, missed):  # noqa: F811
+    """#924 M3: the figures are only each identity's own when its bench
+    schema took. A cluster where any one does not (FAKE_BENCH_FS_IGNORED*)
+    fails env, before the data load is paid for."""
     env, state, ambient, tmp = harness
-    env.update(FAKE_BENCH_FS_IGNORED="1", COLLECT_TIMEOUT_S="2")
+    env.update(ignored, COLLECT_TIMEOUT_S="2")
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
                        timeout=600)
     assert p.returncode != 0
     assert "flow control FAILED: an identity does not land in its bench FlowSchema" in p.stderr
-    assert '"verified": false' in p.stderr and "scaleuser-0001" not in p.stderr
+    rec = json.loads((tmp / "out" / "flowcontrol-config.jsonl").read_text())
+    assert rec["verified"] is False and "PROBE identities" in rec["probes"]
+    from bench import flowcontrol
+    landed = {i for i, x in rec["identities"].items() if x["measured"]["flow_schema"] == flowcontrol.BENCH_SCHEMA[i]}
+    assert set(flowcontrol.IDENTITIES) - landed == missed
+    assert "scaleuser-0001" not in p.stderr
     assert "=== step data ===" not in p.stderr and "deleted (gke-down OK)" in p.stderr

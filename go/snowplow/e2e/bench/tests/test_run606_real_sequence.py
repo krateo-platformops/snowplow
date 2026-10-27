@@ -224,12 +224,14 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         sys.exit(0)
     if a[:2] == ["get", "--raw"] and imp:
         who = imp[0].split("=", 1)[1]
+        # FAKE_BENCH_FS_IGNORED_FOR=<identity>: that identity's bench schema never takes
+        ign = os.environ.get("FAKE_BENCH_FS_IGNORED_FOR", "")
         if who.startswith("system:serviceaccount:krateo-system:"):
-            fs = "bench-snowplow-sa" if bench_fs else "service-accounts"
+            fs = "bench-snowplow-sa" if bench_fs and ign != "snowplow_sa" else "service-accounts"
         elif who.startswith("system:serviceaccount:bench-loadgen:"):
-            fs = "bench-drivers" if bench_fs else "service-accounts"
+            fs = "bench-drivers" if bench_fs and ign != "bench_drivers" else "service-accounts"
         else:
-            fs = "bench-snowplow-users" if bench_fs else "global-default"
+            fs = "bench-snowplow-users" if bench_fs and ign != "snowplow_users" else "global-default"
         print("I1027 00:00:00.000000 1 round_trippers.go:560] Response Status: 403 Forbidden in 3 milliseconds\\n"
               "I1027 00:00:00.000000 1 round_trippers.go:567] Response Headers:\\n"
               f"I1027 00:00:00.000000 1 round_trippers.go:570]     X-Kubernetes-Pf-Flowschema-Uid: {fs_uid[fs]}\\n"

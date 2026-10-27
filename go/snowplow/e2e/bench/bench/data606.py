@@ -109,8 +109,7 @@ def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
     proof["compositions"] = cluster.count_compositions()
     proof["hold_final"] = assert_no_external_children()
 
-    model = rbac_model.RbacModel(users=users, namespaces=namespaces,
-                                 admins=min(10, users))
+    model = rbac_model.bench_model(users, namespaces)
     docs = [rbac_model.namespace_rbac_yaml(n) for n in range(1, namespaces + 1)]
     docs.append(rbac_model.admin_rbac_yaml())
     ok, err = lifecycle.apply_with_retry("---\n".join(docs), "RBAC",

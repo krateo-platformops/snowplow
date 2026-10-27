@@ -43,6 +43,12 @@ import time
 
 from bench import rbac_model
 
+# what verify proves, and what the figures under the bench schemas cover
+PROBES_NOTE = ("verify proves the PROBE identities land in their bench schemas: snowplow's ServiceAccount; "
+               "bench-flowcontrol-probe with bench user 1's groups — an ADMIN (it also carries the platform-admins group), "
+               "the bench-users schema being keyed on devs, which every bench user carries; fresh606's "
+               "ServiceAccount. A user whose groups match a stock schema of higher precedence than its bench "
+               "one stays there (APF's own order): the figures cover the requests that reach the bench schemas")
 IDENTITIES = ("snowplow_sa", "snowplow_users", "bench_drivers")
 BENCH_SCHEMA = {"snowplow_sa": "bench-snowplow-sa", "snowplow_users": "bench-snowplow-users",
                 "bench_drivers": "bench-drivers"}
@@ -150,7 +156,7 @@ def _identity_flags(a, kubectl) -> tuple[str, dict]:
         raise RuntimeError(f"kubectl get deploy/snowplow: rc={p.returncode}")
     spec = ((json.loads(p.stdout).get("spec") or {}).get("template") or {}).get("spec") or {}
     sa = spec.get("serviceAccountName") or "default"
-    model = rbac_model.RbacModel(users=a.users, namespaces=a.namespaces, admins=min(10, a.users))
+    model = rbac_model.bench_model(a.users, a.namespaces)
     return sa, impersonation(sa, PROBE_USER, rbac_model.user_groups(1, model))
 
 
@@ -211,7 +217,8 @@ def main(argv: list[str] | None = None) -> int:
                                              "measured": {k: measured[i].get(k) for k in
                                                           ("flow_schema", "priority_level")}}
                                          for i in IDENTITIES},
-                          "snowplow_sa": f"{SNOWPLOW_NAMESPACE}/{sa}"}))
+                          "snowplow_sa": f"{SNOWPLOW_NAMESPACE}/{sa}",
+                          "probes": PROBES_NOTE}))
         return 0 if ok else 1
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, KeyError) as e:
         print(f"flowcontrol {a.cmd}: {type(e).__name__}: {e}", file=sys.stderr)

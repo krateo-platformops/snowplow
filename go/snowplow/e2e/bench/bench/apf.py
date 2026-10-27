@@ -208,6 +208,20 @@ def report(recs: Iterable[dict], phases: list[tuple[str, float, float]], phase_o
         if boot is not None and boot[0] <= t < boot[1]:
             return BOOT
         return BEFORE if measure_t0 is not None and t < measure_t0 else phase_of(t, phases)
+    # every phase edge: where the phase a time falls in can change
+    edges = sorted({e for _, a0, a1 in phases for e in (a0, a1) if e not in (float("inf"), float("-inf"))}
+                   | ({measure_t0} if measure_t0 is not None else set()) | (set(boot) if boot else set()))
+
+    def crossed(t0, t1):
+        """The phases from t0 to t1, in order (each edge in (t0, t1] may
+        change it): one name when no phase boundary lies between."""
+        seq = [phase(t0)]
+        for e in edges:
+            if t0 < e <= t1 and phase(e) != seq[-1]:
+                seq.append(phase(e))
+        if phase(t1) != seq[-1]:
+            seq.append(phase(t1))
+        return seq
     acc: dict[str, _Phase] = defaultdict(_Phase)
     spanning: dict[str, _Phase] = defaultdict(_Phase)
     last: dict = {}                       # replica -> (t, its reported series)
@@ -242,11 +256,13 @@ def report(recs: Iterable[dict], phases: list[tuple[str, float, float]], phase_o
         if any(v < 0 for v in d.values()):
             resets += 1                   # a counter went back: not differenced
             continue
-        # a difference counts in a phase only when BOTH its scrapes are in it;
-        # one whose interval crosses a phase boundary is reported as spanning
-        # (from..to), never booked to either side
-        pa = phase(prev[0])
-        q = p if pa == phase(r["t"]) else spanning[f"{pa}..{phase(r['t'])}"]
+        # a difference counts in a phase only when no phase boundary lies
+        # between its two scrapes; one that crosses any (a neighbour, or a
+        # whole phase between two stretches of another: burst inside a churn
+        # step) is reported as spanning (the phases it crossed, in order),
+        # never booked to any of them
+        seq = crossed(prev[0], r["t"])
+        q = p if len(seq) == 1 else spanning["..".join(seq)]
         q.pairs += 1
         q.pair_seconds += r["t"] - prev[0]
         for k, v in d.items():
