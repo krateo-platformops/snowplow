@@ -52,10 +52,12 @@ var ctxKeyExternalTouchedSink = ctxKeyExternalTouchedSinkType{}
 // errgroup workers of a multi-stage resolve, so all access is atomic.
 type ExternalTouchedSink struct {
 	count atomic.Int64
-	// declaredWrite (#903 F1, #915): a RESTAction resolved under this sink
-	// DECLARES a write stage. Such a resolve is never stored on ANY Put path —
-	// the opt-in external-TTL widget Put included, which otherwise stores an
-	// external-touched resolve on purpose.
+	// declaredWrite (#903 F1, #915, #912 re-review): a RESTAction resolved under
+	// this sink DECLARES a write stage. It is NOT an external touch (count is
+	// untouched): it is its own input of the Put-gate verdict (PutGateVerdict,
+	// reason declared_write), which declines it on every Put path. It rides this
+	// sink only because this sink already travels with every resolve that may
+	// Put, child sinks included.
 	declaredWrite atomic.Bool
 	// parent is the enclosing resolve's sink when this is a CHILD sink
 	// (WithChildPutGateSinks, #684); every bump is forwarded to it.
@@ -70,19 +72,17 @@ func (s *ExternalTouchedSink) Bump() {
 	}
 }
 
-// BumpDeclaredWrite (#903 F1) records that a RESTAction resolved under this
-// sink declares a write stage: one external touch (every L1 Put and every
-// background site reads it as such) plus the declared-write mark, forwarded to
-// the parent sinks like Bump. nil-receiver-safe.
-func (s *ExternalTouchedSink) BumpDeclaredWrite() {
+// MarkDeclaredWrite (#903 F1) records that a RESTAction resolved under this
+// sink declares a write stage, here and in every parent sink (like Bump). It is
+// not counted as an external touch. nil-receiver-safe.
+func (s *ExternalTouchedSink) MarkDeclaredWrite() {
 	for cur := s; cur != nil; cur = cur.parent {
 		cur.declaredWrite.Store(true)
-		cur.count.Add(1)
 	}
 }
 
 // DeclaredWrite reports whether a RESTAction resolved under this sink declares
-// a write stage (BumpDeclaredWrite). nil-receiver-safe (false).
+// a write stage (MarkDeclaredWrite). nil-receiver-safe (false).
 func (s *ExternalTouchedSink) DeclaredWrite() bool {
 	return s != nil && s.declaredWrite.Load()
 }

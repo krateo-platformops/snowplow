@@ -97,17 +97,6 @@ func init() {
 	}))
 }
 
-// declaredWriteStage returns the first write stage of names (topological
-// order), or "" if the RESTAction declares none.
-func declaredWriteStage(names []string, apiMap map[string]*templates.API) string {
-	for _, n := range names {
-		if a := apiMap[n]; a != nil && isWriteVerb(a.Verb) {
-			return n
-		}
-	}
-	return ""
-}
-
 // withBackgroundHopHeader returns the stage with cache.BackgroundHeader set as
 // the hop rule needs (stage-local copy; the CR's own slice is never written):
 //   - to snowplow itself (toSelf): added when this resolve is not a customer's

@@ -528,11 +528,9 @@ func raFullListServe(
 		// edge to invalidate the cell). Load-bearing surface #4 — without this
 		// the external aggregate would be cached + served stale across pages.
 		// #684 — GenuineExternal (#681 C2): the requester's own-credential
-		// apiserver 403 is not an external touch.
-		if cache.GenuineExternal(gate.External, gate.Forbidden) > 0 {
-			if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
-				cache.BumpExternalSkippedPut()
-			}
+		// apiserver 403 is not an external touch. Read through the shared
+		// Put-gate verdict, which also declines a declared write (#903 F1).
+		if raFullListPermanentDecline(ctx, gate) {
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
@@ -612,11 +610,9 @@ func raFullListServe(
 	// invalidate it, so caching it would serve it stale across pages/widgets
 	// (the exact defect this proposal kills). Checked AFTER both resolves so
 	// the sink reflects either one touching the external fetch (#684: both
-	// resolve under the gate sinks; GenuineExternal per #681 C2).
-	if cache.GenuineExternal(gate.External, gate.Forbidden) > 0 {
-		if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
-			cache.BumpExternalSkippedPut()
-		}
+	// resolve under the gate sinks; GenuineExternal per #681 C2). Read through
+	// the shared Put-gate verdict, which also declines a declared write.
+	if raFullListPermanentDecline(ctx, gate) {
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
 	}
@@ -749,7 +745,7 @@ func RAFullListStageErrorDeclinedForTest() uint64 { return raFullListStageErrorD
 // every Put site shares). The denial-only body is already identity-free: the
 // resolver records F1 and F2 as the canonical forbidden body.
 func raFullListStageDecline(ctx context.Context, g cache.PutGateSinks) bool {
-	if g.Stage.Count() == 0 || cache.DenialOnly(g.Stage, g.Forbidden, g.External, cache.CacheEntryClassRAFullList) {
+	if cache.PutGateVerdict(g, cache.CacheEntryClassRAFullList).Reason != cache.PutReasonStageError {
 		return false
 	}
 	if !cache.Inert(ctx) { // #443 — dry-run traffic is not a decline
@@ -761,9 +757,26 @@ func raFullListStageDecline(ctx context.Context, g cache.PutGateSinks) bool {
 // noteRAFullListDenialOnlyPut counts a STORED full-list cell that carried
 // stage errors (the gate admitted it, so they were all per-identity forbidden).
 func noteRAFullListDenialOnlyPut(g cache.PutGateSinks) {
-	if g.Stage.Count() > 0 {
+	if cache.PutGateVerdict(g, cache.CacheEntryClassRAFullList).DenialOnly {
 		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteRAFullList)
 	}
+}
+
+// raFullListPermanentDecline is the full-list cell's permanent decline, over
+// its own sinks (#684), from the shared Put-gate verdict: a declared write
+// (#903 F1) or a genuine external touch (alone, or beside a stage error) — no
+// resolve of this RESTAction can ever be stored. A transient stage error is
+// raFullListStageDecline's, later. The external-skip counter counts external
+// touches only.
+func raFullListPermanentDecline(ctx context.Context, g cache.PutGateSinks) bool {
+	v := cache.PutGateVerdict(g, cache.CacheEntryClassRAFullList)
+	if !v.Permanent() {
+		return false
+	}
+	if v.Reason != cache.PutReasonDeclaredWrite && !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
+		cache.BumpExternalSkippedPut()
+	}
+	return true
 }
 
 // raKeyClassDriftDeclined counts raFullList cell writes declined because the

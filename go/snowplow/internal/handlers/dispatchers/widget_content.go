@@ -303,7 +303,22 @@ func populateWidgetContentL1(
 	// — e.g. a caller that did not install one) is nil-receiver-safe
 	// (Count()==0) and Puts as before; recordWidgetDeps is ALSO skipped on
 	// the declined path — there is no entry to dep-track.
-	if sink := cache.StageErrorSinkFromContext(ctx); sink.Count() > 0 {
+	// The shared Put-gate verdict (cache.PutGateVerdict) over the walk's resolve
+	// sinks. widgetContent is identity-free, so no stage error is denial-only.
+	verdict := cache.PutGateVerdict(cache.PutGateSinksFromContext(ctx), cache.CacheEntryClassWidgetContent)
+	if verdict.Reason == cache.PutReasonDeclaredWrite {
+		log.Debug("widget_content.populate.skip_declared_write",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", in.GetNamespace()),
+			slog.String("name", in.GetName()),
+			slog.Int("perPage", perPage),
+			slog.Int("page", page),
+			slog.String("reason", "apiRef RESTAction declares a write stage — never stored, every /call runs its write (#903 F1)"),
+		)
+		return
+	}
+	if sink := cache.StageErrorSinkFromContext(ctx); verdict.Reason == cache.PutReasonStageError {
 		log.Debug("widget_content.populate.skip_stage_error",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -323,7 +338,7 @@ func populateWidgetContentL1(
 	// F2 walker installs the external-touched sink on resolveCtx
 	// (phase1_walk.go); recordWidgetDeps is ALSO skipped on this declined path
 	// (the return below) — there is no entry to dep-track.
-	if extSink := cache.ExternalTouchedSinkFromContext(ctx); extSink.Count() > 0 {
+	if extSink := cache.ExternalTouchedSinkFromContext(ctx); verdict.Reason == cache.PutReasonExternal {
 		cache.BumpExternalSkippedPut()
 		log.Debug("widget_content.populate.skip_external_touched",
 			slog.String("subsystem", "cache"),

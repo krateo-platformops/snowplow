@@ -43,7 +43,7 @@ func e912Produce(ctx context.Context) {
 	PerIdentityForbiddenSinkFromContext(ctx).BumpStage()
 	PerIdentityForbiddenSinkFromContext(ctx).BumpExternal()
 	ExternalTouchedSinkFromContext(ctx).Bump()
-	ExternalTouchedSinkFromContext(ctx).BumpDeclaredWrite()
+	ExternalTouchedSinkFromContext(ctx).MarkDeclaredWrite()
 	BumpUAFTouched(ctx)
 }
 

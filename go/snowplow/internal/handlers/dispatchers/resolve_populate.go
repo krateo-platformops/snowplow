@@ -454,7 +454,25 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// #681 — a result whose ONLY stage errors are per-identity forbidden is NOT
 	// an under-served result: it is exactly what this identity's class reads.
 	// It falls through to the re-Put below.
-	if stageErrSink.Count() > 0 && !cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, inputs.CacheEntryClass) {
+	// The shared Put-gate verdict (cache.PutGateVerdict): the refresher's
+	// decline, its reason and whether it is permanent all come from it.
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, inputs.CacheEntryClass)
+
+	// #903 F1 — a RESTAction that declares a write is never stored, so its
+	// re-resolve can never be re-Put: structurally permanent, suppressed on
+	// first occurrence (reason declared_write — not an external touch).
+	if verdict.Reason == cache.PutReasonDeclaredWrite {
+		cache.NoteRefreshDecline(key, string(verdict.Reason), true)
+		log.Debug("resolveAndPopulateL1: the RESTAction declares a write stage; declining to re-Put",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("handler", inputs.CacheEntryClass),
+			slog.String("effect", "never stored: every /call runs its write (#903 F1); suppressed until the next real Put"),
+		)
+		return nil
+	}
+
+	if verdict.Reason == cache.PutReasonStageError {
 		// #301 observability: surface the FIRST failing stage's name + err
 		// inline so a decline can be attributed without a cross-grep
 		// against the resolver's error lines (which cost two traces).
@@ -469,17 +487,11 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// knob is retired. The #191 WARN storm is bounded instead by logging at
 		// WARN once per stale generation: a decline of a cell that is ALREADY
 		// known-stale is DEBUG (the counter carries the rate).
-		// #903 B2 — a stage error on a resolve that ALSO touched an external
-		// endpoint (a write refused in the background is both: a stage error,
-		// and its RESTAction declares a branch-E write) can never be re-Put by
-		// the refresher (the external gate below would decline it anyway), so
-		// it is structurally permanent like the external decline: suppress,
-		// don't re-resolve it on every change.
-		declineReason, permanent := "stage_error", cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0
-		if permanent {
-			declineReason = "external_touched"
-		}
-		suppressed := cache.NoteRefreshDecline(key, declineReason, permanent)
+		// #903 B2 — a stage error on a resolve that ALSO touched a genuine
+		// external endpoint can never be re-Put by the refresher (the external
+		// decline would refuse it anyway), so the verdict makes it structurally
+		// permanent: suppress, don't re-resolve it on every change.
+		suppressed := cache.NoteRefreshDecline(key, string(verdict.Reason), verdict.Permanent())
 		_, _, alreadyKnownStale := cache.KnownStale(key)
 		declineLevel := slog.LevelWarn
 		if alreadyKnownStale {
@@ -507,12 +519,12 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// have no dep edge to invalidate them; decline the re-Put (keep the prior
 	// entry; TTL is the outer net) exactly as the stage-error gate does.
 	// #681 C2 — an own-credential apiserver 403 is not a genuine external touch.
-	if cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 {
+	if verdict.Reason == cache.PutReasonExternal {
 		cache.BumpExternalSkippedPut()
 		// 1.12.6 C4 (§6.2 row 7) — structurally permanent: an external RA has
 		// no dep edge, so every dirty-mark re-resolve is pure waste. Suppress
 		// on first occurrence; the next real Put clears it.
-		cache.NoteRefreshDecline(key, "external_touched", true)
+		cache.NoteRefreshDecline(key, string(verdict.Reason), verdict.Permanent())
 		// Not a fault: a designed defense-in-depth decline (external data has no
 		// dep edge to invalidate it, so keep the prior entry; TTL is the outer
 		// net). Fires on every refresh of an external-touching entry — DEBUG.
@@ -695,7 +707,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// same prior the #612 compare used: identical, or changed (would_change).
 	// Observation only.
 	cache.NoteNarrowAuditWrite(rctx, key, rebuildPrior, hadRebuildPrior, encoded, stored)
-	if stored && stageErrSink.Count() > 0 {
+	if stored && verdict.DenialOnly {
 		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteRefresher) // #681
 	}
 	if !stored {

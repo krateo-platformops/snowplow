@@ -507,17 +507,29 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("uaf_reason", uafDeclineObserved),
 			slog.String("effect", "envelope served (200) narrowed for THIS requester; not persisted — the widgets cell is keyed per BINDING, so a co-bound user would be served these rows verbatim (1.12.3 A-1/R-1; 1.13.0 folds the UAF scope into the key)"),
 		)
-	} else if stageErrSink.Count() > 0 && !cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, "widgets") {
-		// #681 — a denial-only envelope is cached below (twin of restactions.go).
-		// A bare decline, twin of restactions.go: the partial envelope is
-		// SERVED (written below) and not persisted. 1.12.6 C9 retired the D
-		// bounded-partial Put that used to sit here (PARTIAL_RESULT_TTL_SECONDS).
-		log.Warn("Widget served with per-item stage error(s); declining to cache the partial result",
-			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
-		)
-	} else if extTTL := externalCacheTTLFromAnnotations(got.Unstructured); cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 && extTTL > 0 &&
-		!extTouchedSink.DeclaredWrite() && // #903 F1 / #915: a resolve that declares a write is never stored
+	} else if verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, "widgets"); !verdict.Store() && verdict.Reason != cache.PutReasonExternal {
+		// The shared Put-gate verdict (cache.PutGateVerdict), twin of
+		// restactions.go. A genuine external touch alone is handled below (the
+		// opt-in external-TTL Put, else the external decline); every other
+		// decline reason ends here — the external-TTL opt-in never stores a
+		// resolve that declares a write (#915) or failed a stage.
+		switch verdict.Reason {
+		case cache.PutReasonDeclaredWrite:
+			// DEBUG: designed, and it fires on every /call of such a widget.
+			log.Debug("Widget's RESTAction declares a write stage; declining to cache",
+				slog.String("effect", "envelope served (200); not persisted — every /call runs its write (#903 F1)"),
+			)
+		default: // cache.PutReasonStageError
+			// #681 — a denial-only envelope is cached below (twin of restactions.go).
+			// A bare decline, twin of restactions.go: the partial envelope is
+			// SERVED (written below) and not persisted. 1.12.6 C9 retired the D
+			// bounded-partial Put that used to sit here (PARTIAL_RESULT_TTL_SECONDS).
+			log.Warn("Widget served with per-item stage error(s); declining to cache the partial result",
+				slog.Int64("stage_errors", stageErrSink.Count()),
+				slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+			)
+		}
+	} else if extTTL := externalCacheTTLFromAnnotations(got.Unstructured); verdict.Reason == cache.PutReasonExternal && extTTL > 0 &&
 		cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
 		// External-widget bounded-TTL cache (Option A, 2026-07-10) — the
 		// widget's resolve touched a genuine external endpoint AND the widget
@@ -576,7 +588,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("external_ttl", extTTL.String()),
 			slog.String("effect", "body served (200) + persisted under the per-binding widgets key with TTLOverride; served from L1 for <=TTL then re-fetched live; NO dep-Record, NO publish, NO /refreshes arm"),
 		)
-	} else if cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 {
+	} else if verdict.Reason == cache.PutReasonExternal {
 		// #681 C2: an own-credential apiserver 403 is not an external touch.
 		// External-no-cache (proposal 2026-06-22) — the widget's resolve
 		// touched a genuine external endpoint (e.g. an external apiRef RA) and
@@ -671,7 +683,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			TTLOverride:  uafTTLOverrideForEntry(cacheInputs),
 			StaleDerived: staleSink.StaleDerived(), // #710 PR-2b
 		}, cacheGen0) {
-			if stageErrSink.Count() > 0 {
+			if verdict.DenialOnly {
 				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallWidget) // #681
 			}
 			// 0.30.8: record dep edges. Widget self-dep, apiRef→RestAction

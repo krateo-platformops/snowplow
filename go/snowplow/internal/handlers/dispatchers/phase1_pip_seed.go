@@ -1329,6 +1329,7 @@ func seedRestactionResolveAndPutProd(
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
 	terminalGuard := seedTerminalGuardFromContext(resCtx)
+	// put-verdict: taken above by declineSeedPutOnError (cache.PutGateVerdict over this resolve's sinks).
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
@@ -1709,6 +1710,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	if inputs != nil && uafTouchedSink.Count() > 0 {
 		inputs.HasUAF = true
 	}
+	// put-verdict: taken above by declineSeedPutOnError (cache.PutGateVerdict over this resolve's sinks).
 	// #561 — this site USED to carry a scope-waiver:TTLOverride annotation whose
 	// stated reason was "a refilter-touched widget can no longer REACH this Put
 	// (the UAFTouchedSink gate immediately above declines it), so every cell
@@ -1947,26 +1949,42 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string,
 	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink,
 	forbiddenSink *cache.PerIdentityForbiddenSink) bool {
 
-	// #681 C2 — the ONE external count: an own-credential apiserver 403 (F2) is
-	// not a genuine external touch, at the mark AND at the decline.
-	genuineExternal := cache.GenuineExternal(extTouchedSink, forbiddenSink)
+	// The shared Put-gate verdict (cache.PutGateVerdict). #681 C2 — an
+	// own-credential apiserver 403 (F2) is not a genuine external touch, at the
+	// mark AND at the decline.
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, class)
 
-	// #643 PR-B (brief §1(c) as amended, #643 comment 6150618043) — mark on an
-	// OBSERVED external touch, whichever branch declines. A fetch abandoned at
-	// the boot-readiness bound bumps the stage-error sink TOO, and returning from
-	// the stage-error branch first left exactly those fetches — the bulk of the
-	// 057 ClickHouse load — unmarked and re-dialled every pass. A stage error
-	// with no external touch never marks (it is transient and is retried).
-	if genuineExternal > 0 {
+	// #643 PR-B (brief §1(c) as amended, #643 comment 6150618043) — mark on a
+	// PERMANENT verdict, whichever reason declines: a genuine external touch (a
+	// fetch abandoned at the boot-readiness bound bumps the stage-error sink
+	// TOO, and returning from the stage-error branch first left exactly those
+	// fetches — the bulk of the 057 ClickHouse load — unmarked and re-dialled
+	// every pass), or a declared write (#903 F1: never storable). A transient
+	// stage error never marks (it is retried).
+	if verdict.Permanent() {
 		markDeclinedExternal(ctx, key)
 	}
 	// #681 G — a result whose ONLY stage errors are per-identity forbidden is
 	// seeded (shared DenialOnly predicate): first visit warm.
-	if stageErrSink.Count() > 0 && cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, class) {
-		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteSeed)
+	if verdict.Store() {
+		if verdict.DenialOnly {
+			cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteSeed)
+		}
 		return false
 	}
-	if stageErrSink.Count() > 0 {
+	if verdict.Reason == cache.PutReasonDeclaredWrite {
+		pipSeedSkippedStageErrorTotal.Add(1)
+		slog.Default().Info("phase1.seed.skip.declared_write",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
+			slog.String("effect", "the RESTAction declares a write stage: never stored, every /call runs its write "+
+				"(#903 F1); marked so later passes skip it"),
+		)
+		return true
+	}
+	if verdict.Reason == cache.PutReasonStageError {
 		pipSeedSkippedStageErrorTotal.Add(1)
 		// Back-compat parity with the refresher's process-wide counter so
 		// existing "how many degraded re-Puts were declined" dashboards see the
@@ -1986,7 +2004,7 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string,
 		)
 		return true
 	}
-	if genuineExternal > 0 {
+	if verdict.Reason == cache.PutReasonExternal {
 		pipSeedSkippedStageErrorTotal.Add(1)
 		cache.BumpExternalSkippedPut()
 		// #132 F4b Lever A / #643 — the declined-external mark for this EXACT key

@@ -2014,6 +2014,22 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 		return map[string]any{}, nil
 	}
 
+	// #903 (team-lead ruling, the generic form of "never store a resolve that
+	// stopped before its write") — a RESTAction that DECLARES a write stage is
+	// never stored, whether or not this resolve dialed the write (a zero-item
+	// write iterator, a truncated resolve, a write refused in the background).
+	// Stored, its cell would be "stale then replace" with a replace that never
+	// comes: every background re-resolve refuses the write, and a customer hit
+	// never runs it. The mark is an input of the shared Put-gate verdict
+	// (cache.PutGateVerdict → permanent, declared_write), which every Put site
+	// and every background mark site reads — the opt-in external-TTL widget Put
+	// (#915) included. Classified ONCE over the spec, before any exit (#912
+	// N2): a resolve that stops before running a stage (no client config, no
+	// identity, a dependsOn naming no stage or a cycle) is never stored either.
+	if declaredWriteStage(opts.Items) != "" {
+		cache.ExternalTouchedSinkFromContext(ctx).MarkDeclaredWrite()
+	}
+
 	if opts.RC == nil {
 		var err error
 		opts.RC, err = inClusterConfigFn()
@@ -2058,22 +2074,6 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 		}
 	}
 	log.Debug("created api map", slog.Int("total", len(apiMap)))
-
-	// #903 (team-lead ruling, the generic form of "never store a resolve that
-	// stopped before its write") — a RESTAction that DECLARES a write stage is
-	// never stored, whether or not this resolve dialed the write (a zero-item
-	// write iterator, a truncated resolve, a write refused in the background).
-	// A write is only ever sent by branch E, so a resolve that declares one is a
-	// branch-E resolve: it bumps the external-touched sink, the signal every L1
-	// Put declines on AND every background site treats as structurally
-	// permanent (the seed and walk declined-external marks, the refresher's
-	// suppression). Stored, its cell would be "stale then replace" with a
-	// replace that never comes: every background re-resolve refuses the write,
-	// and a customer hit never runs it. The declared-write mark (#915) makes
-	// the opt-in external-TTL widget Put decline it too.
-	if declaredWriteStage(names, apiMap) != "" {
-		cache.ExternalTouchedSinkFromContext(ctx).BumpDeclaredWrite()
-	}
 
 	// Build the per-call resolve-invariant state (P2 mapper / P3 dict / P4
 	// gate+sinks). The per-stage loop below reads these via r.*; the

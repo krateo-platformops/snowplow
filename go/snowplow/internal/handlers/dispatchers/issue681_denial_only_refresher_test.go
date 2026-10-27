@@ -356,9 +356,9 @@ func TestIssue681_R5_MixedDenialAndOtherError_Declined_KnownStale(t *testing.T) 
 }
 
 // H10 — every function in this package (non-test) that reads a stage-error
-// sink count as a Put gate also calls cache.DenialOnly. The identity-free
-// widget-content gate (widget_content.go, `sink`) is excluded by construction:
-// it never holds a per-identity denial (DenialOnly is false for that class).
+// sink count as a Put gate decides through the shared Put-gate verdict
+// (cache.PutGateVerdict, which applies cache.DenialOnly). #912 re-review moved
+// the four gates from calling DenialOnly by hand to the verdict.
 func TestIssue681_H10_EveryStageErrorPutGateUsesDenialOnly(t *testing.T) {
 	ents, err := os.ReadDir(".")
 	if err != nil {
@@ -394,7 +394,7 @@ func TestIssue681_H10_EveryStageErrorPutGateUsesDenialOnly(t *testing.T) {
 					if id.Name == "stageErrSink" && sel.Sel.Name == "Count" {
 						readsStage = true
 					}
-					if id.Name == "cache" && sel.Sel.Name == "DenialOnly" {
+					if id.Name == "cache" && sel.Sel.Name == "PutGateVerdict" {
 						usesDenialOnly = true
 					}
 				}
@@ -412,6 +412,6 @@ func TestIssue681_H10_EveryStageErrorPutGateUsesDenialOnly(t *testing.T) {
 		t.Fatalf("census found %d gate functions, want >= 4 (restactions, widgets, refresher, seed) — the scan is not seeing them", checked)
 	}
 	if len(offenders) > 0 {
-		t.Fatalf("H10: stage-error Put gates that bypass cache.DenialOnly: %v", offenders)
+		t.Fatalf("H10: stage-error Put gates that bypass the shared verdict (cache.PutGateVerdict): %v", offenders)
 	}
 }

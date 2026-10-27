@@ -7,10 +7,12 @@ package dispatchers
 //       write (the 057 blueprint-palette / access-preview shape) sends no write,
 //       stores nothing, and MARKS the cell declined-external, so later passes
 //       skip it instead of re-resolving it every pass.
-//   S2  (B2) the refresher: a re-resolve whose write was refused (a stage
-//       error) on a RESTAction that declares a write suppresses the key as
-//       structurally permanent (reason external_touched), never a plain
-//       known-stale retry.
+//   S2  (B2) the refresher: the REAL re-resolve of a RESTAction that declares
+//       a write (the write is refused in the background) suppresses the key as
+//       structurally permanent with its own verdict reason, declared_write —
+//       never a known-stale retry, and never counted as an external touch.
+//   S2b the shared verdict's other permanent stage-error case: a stage error
+//       beside a genuine external touch suppresses with reason stage_error.
 //   S3  (F1) a RESTAction that DECLARES a write stage is never stored, even
 //       when this /call dialed none of it (a zero-item write iterator). When
 //       the list later gains an item, the next customer /call is a miss and
@@ -20,11 +22,16 @@ package dispatchers
 //       write sends no write, and the walk's mark site (walkMarkDeclinedExternal,
 //       over the walk's own resolve ctx) MARKS it declined-external, so later
 //       walks replay the mark instead of re-resolving it.
+//   S5  (#912 re-review N2) a RESTAction that declares a write but whose
+//       resolve stops before running any stage (its write's dependsOn names no
+//       stage; a dependsOn cycle) is not stored either: the declared-write bump
+//       runs before every early exit.
 //
 // Mutation (logic-only): drop the declared-write bump in ResolveWithFailure →
 // S1 (no mark, re-resolved every pass), S3 (stored; the later /call is a hit
-// that never writes), S4 (the walk does not mark) go RED. Drop the
-// external-permanent decline in the refresher's stage-error branch → S2 RED.
+// that never writes), S4 (the walk does not mark), S5 go RED. Move the bump
+// back after the early exits → S5 RED. Drop the external-permanent decline in
+// the refresher's stage-error branch → S2 RED.
 
 import (
 	"context"
@@ -32,7 +39,9 @@ import (
 	"testing"
 	"time"
 
+	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
@@ -97,24 +106,68 @@ func TestIssue903_S1_SeedMarksADeclaredWriteRADeclinedExternal(t *testing.T) {
 }
 
 func TestIssue903_S2_RefresherSuppressesARefusedWriteRA(t *testing.T) {
+	t.Setenv("CLIENT_MAX_RETRIES", "0")
 	e := c681Setup(t)
+	cache.ResetRefresherForTest() // the suppression markers are package state
+	t.Cleanup(cache.ResetRefresherForTest)
+	e.ra = s903WriteRA("")
+	up := newB903Counter(t)
+	t903PublishSecrets(e, up.srv.URL, true)
 	k, _, in := dispatchCacheLookupKey(c681A.ctx(), "restactions",
 		h1RAGVR.Group, h1RAGVR.Version, h1RAGVR.Resource, h1NS, c681RA, -1, -1, nil)
 	if in == nil || k == "" {
 		t.Fatal("PRE: no key inputs")
 	}
-	_ = e
-	// The refresher's re-resolve of a RESTAction that declares a write: the
-	// write is refused (a stage error) and the resolve is external-touched.
+	var cr templatesv1.RESTAction
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(e.ra.Object, &cr); err != nil {
+		t.Fatal(err)
+	}
+	// The refresher's re-resolve, through the real RESTAction resolver under the
+	// refresher origin: the write stage is refused (background work never
+	// writes) and the RESTAction declares it.
 	t.Cleanup(setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
-		cache.StageErrorSinkFromContext(ctx).Bump("render", "background work never writes (#903)")
+		rctx := refresherResolveCtx(xcontext.BuildContext(ctx,
+			xcontext.WithUserInfo(jwtutil.UserInfo{Username: c681A.user, Groups: c681A.groups})))
+		res, err := restactions.Resolve(rctx, restactions.ResolveOptions{In: cr.DeepCopy(),
+			SArc: &rest.Config{Host: e.user.URL}, AuthnNS: c681AuthnNS})
+		if err != nil {
+			return nil, err
+		}
+		return encodeResolvedJSON(res)
+	}))
+	ext0 := cache.ExternalSkippedPut()
+	_ = resolveAndPopulateL1(context.Background(), *in, nil, nil)
+	if n := up.writes(); n != 0 {
+		t.Fatalf("#903 RED: the refresher sent %d write(s)", n)
+	}
+	if reason, ok := cache.RefreshSuppressedReason(k); !ok || reason != string(cache.PutReasonDeclaredWrite) {
+		t.Fatalf("#903 B2 RED: a refused-write re-resolve left the key suppressed=%v reason=%q, want %q — "+
+			"it would be re-resolved on every change", ok, reason, cache.PutReasonDeclaredWrite)
+	}
+	if d := cache.ExternalSkippedPut() - ext0; d != 0 {
+		t.Fatalf("#912 RED: a declared write was counted as %d external-skip decline(s) — it is its own reason", d)
+	}
+}
+
+func TestIssue903_S2b_StageErrorBesideAnExternalTouchIsPermanent(t *testing.T) {
+	e := c681Setup(t)
+	_ = e
+	cache.ResetRefresherForTest() // the suppression markers are package state
+	t.Cleanup(cache.ResetRefresherForTest)
+	k, _, in := dispatchCacheLookupKey(c681A.ctx(), "restactions",
+		h1RAGVR.Group, h1RAGVR.Version, h1RAGVR.Resource, h1NS, c681RA, -1, -1, nil)
+	if in == nil || k == "" {
+		t.Fatal("PRE: no key inputs")
+	}
+	t.Cleanup(setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
+		cache.StageErrorSinkFromContext(ctx).Bump("ext", "upstream 500")
 		cache.ExternalTouchedSinkFromContext(ctx).Bump()
 		return []byte(`{"status":{}}`), nil
 	}))
 	_ = resolveAndPopulateL1(context.Background(), *in, nil, nil)
-	if reason, ok := cache.RefreshSuppressedReason(k); !ok || reason != "external_touched" {
-		t.Fatalf("#903 B2 RED: a refused-write re-resolve left the key suppressed=%v reason=%q, want external_touched — "+
-			"it would be re-resolved on every change", ok, reason)
+	if reason, ok := cache.RefreshSuppressedReason(k); !ok || reason != string(cache.PutReasonStageError) {
+		t.Fatalf("#903 B2 RED: a stage error beside a genuine external touch left the key suppressed=%v reason=%q, want a "+
+			"permanent %q", ok, reason, cache.PutReasonStageError)
 	}
 }
 
@@ -204,5 +257,36 @@ func TestIssue903_S4_WalkMarksADeclaredWriteRADeclinedExternal(t *testing.T) {
 	if !set.Marked("key/s4") {
 		t.Fatal("#903 B2 RED: the walk resolved a RESTAction that declares a write (refused in the background) " +
 			"without marking it declined-external — every later walk re-resolves it")
+	}
+}
+
+func TestIssue903_S5_AnAbortedResolveOfAWriteRAIsNeverStored(t *testing.T) {
+	cases := map[string]func(ra *unstructured.Unstructured){
+		"dependsOn names no stage": func(ra *unstructured.Unstructured) {
+			api := ra.Object["spec"].(map[string]any)["api"].([]any)
+			api[1].(map[string]any)["dependsOn"] = map[string]any{"name": "nosuch"}
+		},
+		"dependsOn cycle": func(ra *unstructured.Unstructured) {
+			api := ra.Object["spec"].(map[string]any)["api"].([]any)
+			api[0].(map[string]any)["dependsOn"] = map[string]any{"name": "render"}
+			api[1].(map[string]any)["dependsOn"] = map[string]any{"name": "cm"}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("CLIENT_MAX_RETRIES", "0")
+			e := c681Setup(t)
+			up := newB903Counter(t)
+			e.ra = s903WriteRA("")
+			mutate(e.ra)
+			t903PublishSecrets(e, up.srv.URL, true)
+			e.t903Call(t, c681A)
+			if n := up.writes(); n != 0 {
+				t.Fatalf("PRE: an aborted resolve sent %d write(s)", n)
+			}
+			if _, stored := cache.ResolvedCache().GetNoTouch(e.key(t, c681A)); stored {
+				t.Fatal("#912 N2 RED: an aborted resolve of a RESTAction that declares a write was stored")
+			}
+		})
 	}
 }

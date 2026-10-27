@@ -231,7 +231,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
-	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.BumpDeclaredWrite": readOnly443,
+	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.MarkDeclaredWrite": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "SourcePagination": readOnly443, "IdentityClass.String": readOnly443,
@@ -329,12 +329,12 @@ var cacheAllow443 = map[string]cacheClass443{
 	"WithSensitiveTouchedSink": readOnly443,
 	// #684 — the raFullList cell's own #681 Put gate. WithChildPutGateSinks is a
 	// ctx builder installing request-scoped sinks (their bumps forward to the
-	// enclosing request-scoped sinks only); DenialOnly / GenuineExternal /
-	// StageErrorSink.Count are pure reads of them. None touches cache, informer,
-	// dep or refresher state. (ExternalTouchedSink.Count left the resolve path:
-	// GenuineExternal now reads it inside the cache package.)
-	"WithChildPutGateSinks": readOnly443, "DenialOnly": readOnly443,
-	"GenuineExternal": readOnly443, "StageErrorSink.Count": readOnly443,
+	// enclosing request-scoped sinks only); PutGateVerdict (#912 re-review: the
+	// shared verdict, which reads DenialOnly / GenuineExternal inside the cache
+	// package) and PutVerdict.Permanent are pure reads of them. None touches
+	// cache, informer, dep or refresher state.
+	"WithChildPutGateSinks": readOnly443, "PutGateVerdict": readOnly443,
+	"PutVerdict.Permanent": readOnly443,
 	// The denial-only Put counter: a process counter, reached only after a
 	// PutRAFullListIfGen that STORED (which refuses under the flag).
 	"RecordDenialOnlyPut": telemetry443,
@@ -354,7 +354,7 @@ var callerAllow443 = map[string][]string{
 	"ResolvedEntry.NoteHitter":                    {"ra_full_list.go:raFullListServe"},
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},
-	"BumpExternalSkippedPut":                      {"ra_full_list.go:raFullListServe"},
+	"BumpExternalSkippedPut":                      {"ra_full_list.go:raFullListPermanentDecline"},
 	"DepTracker.CommitListInterest":               {"narrow.go:commitNarrow"},
 	"DepTracker.WidenListInterest":                {"narrow.go:commitNarrow"},
 }
