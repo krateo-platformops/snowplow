@@ -36,9 +36,13 @@ package credhttp
 //  4. NO THIRD-PARTY CONSUMER. No reference to a function, or a
 //     function-typed variable or field, defined outside this module whose
 //     declared parameters or receiver contain a rest.Config (through pointers
-//     and struct fields), except rest.CopyConfig. Only credhttp turns a config
-//     into a client: client-go's constructors, plumbing's endpoints.FromSecret
-//     (use credhttp.FromSecret) and methods on rest.Config itself are refused.
+//     and struct fields), or whose parameters hand in a
+//     flowcontrol.RateLimiter (through pointers and exported fields), except
+//     rest.CopyConfig. Those are the two inputs a REST client takes its
+//     client-side rate limit from, so only credhttp builds a client and sets
+//     its limit: client-go's constructors, plumbing's endpoints.FromSecret
+//     (use credhttp.FromSecret), methods on rest.Config itself,
+//     rest.NewRESTClient and Request.Throttle are refused (#920 F10).
 //
 // Rules 3 and 4 judge a generic by what its OWN code declares (its origin): a
 // parameter or result that is a config only through a type parameter is the
@@ -64,60 +68,117 @@ import (
 
 const restPkg = "k8s.io/client-go/rest"
 
-func isRESTConfig(t types.Type) bool {
+const flowcontrolPkg = "k8s.io/client-go/util/flowcontrol"
+
+func isNamed(t types.Type, pkg, name string) bool {
 	n, ok := types.Unalias(t).(*types.Named)
 	if !ok {
 		return false
 	}
 	o := n.Obj()
-	return o.Pkg() != nil && o.Pkg().Path() == restPkg && o.Name() == "Config"
+	return o.Pkg() != nil && o.Pkg().Path() == pkg && o.Name() == name
 }
+
+func isRESTConfig(t types.Type) bool { return isNamed(t, restPkg, "Config") }
+
+func isRateLimiter(t types.Type) bool { return isNamed(t, flowcontrolPkg, "RateLimiter") }
 
 // restConfigIn reports whether t is, or contains, rest.Config: through
 // pointers, slices, arrays, maps, channels, struct fields (exported or not)
 // and result tuples. A function or interface type does not contain the values
 // it would produce; a function-typed reference is judged by its own results.
 func restConfigIn(t types.Type) bool {
-	return restConfigWalk(t, true, map[types.Type]bool{})
+	return typeWalk(t, true, isRESTConfig, map[types.Type]bool{})
 }
 
 // restConfigByValue is restConfigIn without the pointer step: whether a value
 // of type t holds a rest.Config itself rather than a pointer to one.
 func restConfigByValue(t types.Type) bool {
-	return restConfigWalk(t, false, map[types.Type]bool{})
+	return typeWalk(t, false, isRESTConfig, map[types.Type]bool{})
 }
 
-func restConfigWalk(t types.Type, throughPointers bool, seen map[types.Type]bool) bool {
+// limiterHandedIn reports whether a value of type t can carry a
+// flowcontrol.RateLimiter the caller chose: t is one, or holds one through
+// pointers, slices, arrays, maps, channels, tuples and EXPORTED struct fields.
+// An unexported field is not followed: code outside client-go cannot fill it,
+// and it is where a REST client already built keeps its own limiter
+// (*rest.RESTClient, *rest.Request), so a method on one sets nothing.
+func limiterHandedIn(t types.Type) bool {
+	return limiterWalk(t, map[types.Type]bool{})
+}
+
+func limiterWalk(t types.Type, seen map[types.Type]bool) bool {
 	t = types.Unalias(t)
 	if seen[t] {
 		return false
 	}
 	seen[t] = true
-	if isRESTConfig(t) {
+	if isRateLimiter(t) {
 		return true
 	}
 	switch x := t.(type) {
 	case *types.Named:
-		return restConfigWalk(x.Underlying(), throughPointers, seen)
+		return limiterWalk(x.Underlying(), seen)
 	case *types.Pointer:
-		return throughPointers && restConfigWalk(x.Elem(), throughPointers, seen)
+		return limiterWalk(x.Elem(), seen)
 	case *types.Slice:
-		return restConfigWalk(x.Elem(), throughPointers, seen)
+		return limiterWalk(x.Elem(), seen)
 	case *types.Array:
-		return restConfigWalk(x.Elem(), throughPointers, seen)
+		return limiterWalk(x.Elem(), seen)
 	case *types.Chan:
-		return restConfigWalk(x.Elem(), throughPointers, seen)
+		return limiterWalk(x.Elem(), seen)
 	case *types.Map:
-		return restConfigWalk(x.Key(), throughPointers, seen) || restConfigWalk(x.Elem(), throughPointers, seen)
+		return limiterWalk(x.Key(), seen) || limiterWalk(x.Elem(), seen)
 	case *types.Struct:
 		for i := 0; i < x.NumFields(); i++ {
-			if restConfigWalk(x.Field(i).Type(), throughPointers, seen) {
+			if f := x.Field(i); f.Exported() && limiterWalk(f.Type(), seen) {
 				return true
 			}
 		}
 	case *types.Tuple:
 		for i := 0; i < x.Len(); i++ {
-			if restConfigWalk(x.At(i).Type(), throughPointers, seen) {
+			if limiterWalk(x.At(i).Type(), seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// typeWalk reports whether t is, or contains, a type match accepts (see
+// restConfigIn for what "contains" follows). A named interface is matched by
+// name and not looked into.
+func typeWalk(t types.Type, throughPointers bool, match func(types.Type) bool, seen map[types.Type]bool) bool {
+	t = types.Unalias(t)
+	if seen[t] {
+		return false
+	}
+	seen[t] = true
+	if match(t) {
+		return true
+	}
+	switch x := t.(type) {
+	case *types.Named:
+		return typeWalk(x.Underlying(), throughPointers, match, seen)
+	case *types.Pointer:
+		return throughPointers && typeWalk(x.Elem(), throughPointers, match, seen)
+	case *types.Slice:
+		return typeWalk(x.Elem(), throughPointers, match, seen)
+	case *types.Array:
+		return typeWalk(x.Elem(), throughPointers, match, seen)
+	case *types.Chan:
+		return typeWalk(x.Elem(), throughPointers, match, seen)
+	case *types.Map:
+		return typeWalk(x.Key(), throughPointers, match, seen) || typeWalk(x.Elem(), throughPointers, match, seen)
+	case *types.Struct:
+		for i := 0; i < x.NumFields(); i++ {
+			if typeWalk(x.Field(i).Type(), throughPointers, match, seen) {
+				return true
+			}
+		}
+	case *types.Tuple:
+		for i := 0; i < x.Len(); i++ {
+			if typeWalk(x.At(i).Type(), throughPointers, match, seen) {
 				return true
 			}
 		}
@@ -164,10 +225,13 @@ func returnsRESTConfig(obj types.Object) bool {
 	return ok && restConfigIn(sig.Results())
 }
 
-// consumesRESTConfig reports whether obj is a function, or a function-typed
-// variable or field, whose OWN declared parameters or receiver (its generic
-// origin) are or contain rest.Config.
-func consumesRESTConfig(obj types.Object) bool {
+// consumesConfigOrLimiter reports whether obj is a function, or a
+// function-typed variable or field, whose OWN declared signature (its generic
+// origin) takes one of the two inputs a REST client sets its client-side rate
+// limit from: a parameter or receiver that is or contains a rest.Config, or a
+// parameter through which the caller hands in a flowcontrol.RateLimiter
+// (limiterHandedIn).
+func consumesConfigOrLimiter(obj types.Object) bool {
 	switch o := obj.(type) {
 	case *types.Func:
 		obj = o.Origin()
@@ -183,7 +247,7 @@ func consumesRESTConfig(obj types.Object) bool {
 	if r := sig.Recv(); r != nil && restConfigIn(r.Type()) {
 		return true
 	}
-	return restConfigIn(sig.Params())
+	return restConfigIn(sig.Params()) || limiterHandedIn(sig.Params())
 }
 
 type typedHit struct {
@@ -268,8 +332,8 @@ func typedConfigSources(pkgs []*packages.Package, modulePath string) (hits []typ
 										add(p, x.Pos(), encl, name+" returns a *rest.Config built outside internal/credhttp")
 									}
 								}
-								if consumesRESTConfig(obj) && !isCopy {
-									add(p, x.Pos(), encl, name+" takes a *rest.Config: only internal/credhttp turns a config into a client")
+								if consumesConfigOrLimiter(obj) && !isCopy {
+									add(p, x.Pos(), encl, name+" takes a *rest.Config or a flowcontrol.RateLimiter: only internal/credhttp builds a client and sets its rate limit")
 								}
 							}
 						}
@@ -492,6 +556,8 @@ import (
 	k8srest "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/flowcontrol"
+	"net/url"
 )
 
 // Rule 3: third-party sources.
@@ -563,6 +629,25 @@ var badConsumerValue = endpoints.FromSecret
 func badConsumerClientset(rc *rest.Config) { _, _ = kubernetes.NewForConfig(rc) }
 
 func badConsumerMethod(rc *rest.Config) { rc.Wrap(nil) }
+
+// F10: a limiter handed to a REST client directly, without a config.
+func badP1NewRESTClient(rc *rest.Config) {
+	hc, _ := credhttp.HTTPClientFor(rc)
+	base, _ := url.Parse("https://h")
+	c, _ := rest.NewRESTClient(base, "/apis", rest.ClientContentConfig{}, flowcontrol.NewTokenBucketRateLimiter(5, 10), hc)
+	_ = dynamic.New(c)
+}
+
+func badP2Throttle(rc *rest.Config) {
+	c, _ := credhttp.RESTClient(rc)
+	_ = c.Get().Throttle(flowcontrol.NewTokenBucketRateLimiter(5, 10))
+}
+
+func okLimiterBuiltNotHanded() { _ = flowcontrol.NewTokenBucketRateLimiter(5, 10) }
+
+// A client already built keeps its own limiter in an unexported field; calling
+// its methods hands nothing in.
+func okBuiltClientMethods(c *rest.RESTClient) { _ = c.Get().AbsPath("/x").Do(context.Background()) }
 
 // H6-H9: reflection and decoders allocate a config through a pointer-typed
 // path that rules 1-3 do not see. Handing it to a third party is refused
