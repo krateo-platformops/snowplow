@@ -103,22 +103,6 @@ func WithStageOutcomes(ctx context.Context) (context.Context, *StageOutcomes) {
 	return context.WithValue(ctx, stageOutcomesKey{}, s), s
 }
 
-// NewStageOutcomesForTest returns a collector in which every name ran and the
-// names in failed failed with their reason. Test-only (another package's arms
-// need a collector without running a resolve).
-func NewStageOutcomesForTest(names []string, failed map[string]string) *StageOutcomes {
-	s := newStageOutcomes()
-	s.register(names)
-	for _, n := range names {
-		if reason, ok := failed[n]; ok {
-			s.fail(n, reason)
-		} else {
-			s.ran(n)
-		}
-	}
-	return s
-}
-
 // claimStageOutcomes returns the collector this resolve records into: the
 // ctx's, when no earlier resolve on this ctx claimed it (this one is then the
 // top-level resolve), else a private one. Never nil, so the #904 rule always

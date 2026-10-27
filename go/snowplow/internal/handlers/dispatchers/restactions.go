@@ -665,9 +665,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// delete body) if a DELETE-eviction bumped the key's generation during
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
 			noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
-			entry := newResolveEntry("restactions", encoded, cacheInputs, outcomes) // #904: carries the stage outcomes
-			entry.StaleDerived = staleSink.StaleDerived()                           // #710 PR-2b
-			putStored := cacheHandle.PutIfGen(ctx, cacheKey, entry, cacheGen0)
+			putStored := cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
+				RawJSON:       encoded,
+				Inputs:        cacheInputs,
+				TTLOverride:   uafTTLOverrideForEntry(cacheInputs),
+				StaleDerived:  staleSink.StaleDerived(),        // #710 PR-2b
+				StageOutcomes: storableStageOutcomes(outcomes), // #904
+			}, cacheGen0)
 			// #189 — the dep Record + the /refreshes publish run ONLY on an
 			// accepted write. A refused PutIfGen (a DELETE-eviction bumped the gen
 			// during the resolve) stored no cell, so — exactly like the declined

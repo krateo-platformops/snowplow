@@ -386,6 +386,7 @@ func populateWidgetContentL1(
 	// it (the boot-seed exemption). cache.IsPhase1Done() — the same atomic /readyz
 	// consults — is the authoritative pre/post-readyz boundary (the seed-mode
 	// discriminator freshness-audit ruled; seedScopeMode is not threaded into walk()).
+	// stage-outcomes-waiver: a widgetContent cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 	// scope-waiver:TTLOverride: widgetContent-class cell — identity-free shared envelope, per-user serve-time filter (gateWidgetEnvelope). 1.12.3 A-1/R-1: it holds no per-user UAF refilter output because a refilter-touched resolve can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it) — previously this rested on isRBACSensitiveApiRefWidget's routing argument alone, which the R-1 finding showed is not a safe basis for a UAF claim (uaf_shortttl.go R-d-4 SITE MAP).
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,

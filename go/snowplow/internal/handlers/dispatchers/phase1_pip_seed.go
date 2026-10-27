@@ -1329,21 +1329,25 @@ func seedRestactionResolveAndPutProd(
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
 	terminalGuard := seedTerminalGuardFromContext(resCtx)
-	// #904 — newResolveEntry carries the stage outcomes ("" when every stage
-	// succeeded) and the UAF TTL cap.
-	entry := newResolveEntry("restactions", encoded, inputs, stageOutcomes)
-	// #130 F3 seed-attribution / #507 — PROVENANCE, carried, never manufactured.
-	// This flag also satisfies warmLocked, so the `true` that used to sit here
-	// made every post-readyz seed mode (above all the keepwarm sweep, which
-	// re-Puts any resident cell whose body is older than TTL/4) confer warmth on
-	// a cell no customer had ever read — defeating #496's re-mint gate
-	// indefinitely for the keepwarm-scoped set. The guard decided it once at
-	// seed entry: true for a boot seed, otherwise whatever the resident cell
-	// already holds. See seedProvenanceForMode.
-	entry.SeededAtBoot = terminalGuard.seededAtBoot
-	// #841 — the seed class, kept only if this Put INSERTS the cell (the store
-	// keeps a resident cell's own origin on a replace).
-	entry.SeedOrigin = cache.SeedOriginFromContext(resCtx)
+	entry := &cache.ResolvedEntry{
+		RawJSON: encoded,
+		Inputs:  inputs,
+		// #130 F3 seed-attribution / #507 — PROVENANCE, carried, never manufactured.
+		// This flag also satisfies warmLocked, so the `true` that used to sit here
+		// made every post-readyz seed mode (above all the keepwarm sweep, which
+		// re-Puts any resident cell whose body is older than TTL/4) confer warmth on
+		// a cell no customer had ever read — defeating #496's re-mint gate
+		// indefinitely for the keepwarm-scoped set. The guard decided it once at
+		// seed entry: true for a boot seed, otherwise whatever the resident cell
+		// already holds. See seedProvenanceForMode.
+		SeededAtBoot: terminalGuard.seededAtBoot,
+		TTLOverride:  uafTTLOverrideForEntry(inputs),
+		// #841 — the seed class, kept only if this Put INSERTS the cell (the store
+		// keeps a resident cell's own origin on a replace).
+		SeedOrigin: cache.SeedOriginFromContext(resCtx),
+		// #904 — "" when every stage succeeded.
+		StageOutcomes: storableStageOutcomes(stageOutcomes),
+	}
 	// #394 — the terminal write goes through seedTerminalPut with the guard
 	// seedOneRestaction captured at seed entry: PutIfGen for the post-readyz
 	// modes (a removal during the resolve refuses the write instead of
@@ -1715,6 +1719,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// seed Put above — HasUAF was stamped from the sink before the Put, so
 	// uafTTLOverrideForEntry yields the short UAF_RESOLVED_TTL_SECONDS for a
 	// narrowed cell and 0 (unchanged, full store TTL) for every other widget.
+	// stage-outcomes-waiver: a widgets cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,

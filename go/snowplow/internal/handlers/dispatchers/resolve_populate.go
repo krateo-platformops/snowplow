@@ -591,23 +591,27 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	if uafTouchedSink.Count() > 0 {
 		inputs.HasUAF = true
 	}
-	// #904 — newResolveEntry carries a restactions-class cell's stage outcomes
-	// (and nothing for any other class) and the UAF TTL cap.
-	entry := newResolveEntry(inputs.CacheEntryClass, encoded, &inputs, stageOutcomes)
-	// Ship 4a (0.30.198) — preserve the resident pin on a RAFullList
-	// refresh so a dirty-mark re-resolve never demotes a prewarmed
-	// expensive cell to the transient LRU. Put honours the pin subject
-	// to the resident budget (else demotes — the safe degrade).
-	entry.Pinned = prePinned
-	// #118 (d) interim — C-118-6 CRUX: newResolveEntry re-stamps the short UAF
-	// TTLOverride on the REFRESHER re-Put too. The refresher builds a FRESH entry
-	// with zero CreatedAt (Put stamps a new time.Now()), so a hot,
-	// data-plane-refreshed UAF cell would slide its CreatedAt forward every
-	// refresh and OUTLIVE the cap if the override were stamped only on the first
-	// customer Put. inputs is the STORED ResolvedKeyInputs (carrying HasUAF from
-	// the original dispatch), so uafTTLOverrideForEntry re-derives the same
-	// override without needing the RESTAction CR. 0 (no override) when the knob
-	// is unset or the cell is non-UAF.
+	entry := &cache.ResolvedEntry{
+		RawJSON: encoded,
+		Inputs:  &inputs,
+		// Ship 4a (0.30.198) — preserve the resident pin on a RAFullList
+		// refresh so a dirty-mark re-resolve never demotes a prewarmed
+		// expensive cell to the transient LRU. Put honours the pin subject
+		// to the resident budget (else demotes — the safe degrade).
+		Pinned: prePinned,
+		// #118 (d) interim — C-118-6 CRUX: re-stamp the short UAF TTLOverride on
+		// the REFRESHER re-Put too. The refresher builds a FRESH entry with zero
+		// CreatedAt (Put stamps a new time.Now()), so a hot, data-plane-refreshed
+		// UAF cell would slide its CreatedAt forward every refresh and OUTLIVE the
+		// cap if the override were stamped only on the first customer Put. inputs
+		// is the STORED ResolvedKeyInputs (carrying HasUAF from the original
+		// dispatch), so uafTTLOverrideForEntry re-derives the same override here
+		// without needing the RESTAction CR. Returns 0 (no override) when the knob
+		// is unset or the cell is non-UAF → byte-identical to today.
+		TTLOverride: uafTTLOverrideForEntry(&inputs),
+		// #904 — a restactions-class cell keeps its resolve's stage outcomes.
+		StageOutcomes: storableStageOutcomesFor(inputs.CacheEntryClass, stageOutcomes),
+	}
 	// Ship #97 (0.30.214) — restore the R3 fast-path on refresher Puts
 	// of apistage-class LIST entries. Pre-fix the refresher Put wrote
 	// RawJSON only (Items: nil); the apistage read path at apistage.go:487
