@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -87,17 +88,31 @@ var (
 
 // j9Client is the apiserver the forced pass talks to: LIST answers with list
 // at listRV, after running duringList (what the watch delivers while the LIST
-// is in flight). A GET is counted and refused: the rule never re-reads (#918).
+// is in flight). A GET answers from current and then runs onGet; it is
+// counted, because the rule never re-reads (#918) — the arms that drive churn
+// from it do so to reproduce #875's re-check, which did.
 type j9Client struct {
 	inner      metadata.Interface
 	gvr        schema.GroupVersionResource
 	duringList func()
+	onGet      func(name string)
 	gets       atomic.Int64
 
-	mu     sync.Mutex
-	list   []j9Object
-	listRV string
-	asked  string
+	mu      sync.Mutex
+	list    []j9Object
+	listRV  string
+	asked   string
+	current map[string]j9Object
+}
+
+// setCurrent records o as the apiserver's current state for a GET.
+func (c *j9Client) setCurrent(o j9Object) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.current == nil {
+		c.current = map[string]j9Object{}
+	}
+	c.current[o.name] = o
 }
 
 func (c *j9Client) answer(listRV string, objs ...j9Object) {
@@ -141,9 +156,19 @@ func (r *j9Resource) List(_ context.Context, opts metav1.ListOptions) (*metav1.P
 	return out, nil
 }
 
-func (r *j9Resource) Get(context.Context, string, metav1.GetOptions, ...string) (*metav1.PartialObjectMetadata, error) {
+func (r *j9Resource) Get(_ context.Context, name string, _ metav1.GetOptions, _ ...string) (*metav1.PartialObjectMetadata, error) {
 	r.c.gets.Add(1)
-	return nil, errors.New("the lost-update rule never re-reads an object (#918)")
+	r.c.mu.Lock()
+	o, ok := r.c.current[name]
+	r.c.mu.Unlock()
+	if !ok {
+		return nil, apierrors.NewNotFound(schema.GroupResource{Group: r.c.gvr.Group, Resource: r.c.gvr.Resource}, name)
+	}
+	m := o.meta(r.c.gvr)
+	if r.c.onGet != nil {
+		r.c.onGet(name)
+	}
+	return &m, nil
 }
 
 // j9Setup builds a watcher for gvr (owned: a standalone informer the GVR owns;
@@ -279,6 +304,20 @@ func TestForcedPass918_ObjectsThatChangeAfterTheirRead_AreNotLosses(t *testing.T
 	rw, cli := j9Setup(t, repairGVR, true, seeded...)
 	cli.answer("5050", append(listed, jclock)...)
 	cli.duringList = func() { j9Deliver(t, rw, repairGVR, moves...) }
+	// #875's re-check read each object, and each changed again right after
+	// its read: churn driven from the GET, so it happens exactly where that
+	// re-check would look. The rule issues no GET, so here it never fires.
+	for _, m := range moves {
+		cli.setCurrent(m.obj)
+	}
+	cli.onGet = func(name string) {
+		cli.mu.Lock()
+		cur := cli.current[name]
+		cli.mu.Unlock()
+		next := cur.next(t)
+		cli.setCurrent(next)
+		j9Deliver(t, rw, repairGVR, jmod(next))
+	}
 	candidates0 := storeDivergenceCandidates.Load()
 	forcedVerify(context.Background(), repairGVR)
 
