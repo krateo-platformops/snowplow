@@ -64,9 +64,10 @@ function live () {
   fetch('/refreshes', { method: 'POST', body: '[]' }).catch(() => {});
   new EventSource('/notifications');
   // #919: a /call that answers, and one refused at network level (nothing
-  // listens on port 9 in the browser's container), each with user extras
+  // listens on port 8099 in the browser's container; not one of Chrome's
+  // blocked 'unsafe' ports, which fail before connecting), with user extras
   fetch('/call?resource=tables&name=t1&namespace=ns1&extras=FIXTURE-SECRET').catch(() => {});
-  fetch('http://127.0.0.1:9/call?resource=boom&name=b1&namespace=ns1&extras=FIXTURE-SECRET').catch(() => {});
+  fetch('http://127.0.0.1:8099/call?resource=boom&name=b1&namespace=ns1&extras=FIXTURE-SECRET').catch(() => {});
 }
 window.addEventListener('popstate', () => render(location.pathname));
 if (location.pathname !== '/login') { menu(); live(); }

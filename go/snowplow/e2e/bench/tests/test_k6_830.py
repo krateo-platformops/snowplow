@@ -1411,7 +1411,7 @@ def test_browser_js_in_chrome_against_the_fixture_spa(tmp_path):
 @needs_docker
 def test_in_chrome_a_refused_call_and_the_open_streams_are_points(tmp_path):
     """k6/browser.js in the pinned k6 browser image, real Chrome, against the
-    fixture SPA: its refused /call (port 9) is a `failed` point with Chrome's
+    fixture SPA: its refused /call (port 8099) is a `failed` point with Chrome's
     error, its live streams `never_completed`, its answered /call a
     browser_call_ms point; no point carries the extras."""
     o = _run_browser_fixture(tmp_path)
