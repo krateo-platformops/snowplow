@@ -462,6 +462,36 @@ func TestAudit410_C5_StageSite_NoActor_NoRecord(t *testing.T) {
 	}
 }
 
+// C3e (#912 re-review N3, emit-site arm) — the stage site itself, handed a
+// write dialed under a background driver, emits no record. Since #903 such a
+// write is refused before the dial (C3), so this guard is defence in depth;
+// this arm keeps it honest. The control (the same write on a customer resolve)
+// proves the site emits at all.
+func TestAudit410_C3e_StageSite_BackgroundDriver_NoRecord(t *testing.T) {
+	rec := records410(t)
+	call := httpcallOpts410(http.MethodPost, "/render", "https://render.example")
+	res := &dialAnswer{code: http.StatusOK}
+	apiCall := extStage410("render", http.MethodPost, "/render")
+
+	bg := map[string]context.Context{
+		cache.BackgroundOriginRefresher:         cache.WithBackgroundResolveOrigin(ctxWithUser(user410, group410), cache.BackgroundOriginRefresher),
+		cache.BackgroundOriginCohortSeed:        cache.WithBackgroundResolveOrigin(ctxWithUser(user410, group410), cache.BackgroundOriginCohortSeed),
+		cache.BackgroundOriginPrewarmEngineBoot: cache.WithBackgroundResolveOrigin(ctxWithUser(user410, group410), cache.BackgroundOriginPrewarmEngineBoot),
+		"prewarm-path":                          cache.WithPrewarmPath(ctxWithUser(user410, group410)),
+	}
+	for name, ctx := range bg {
+		auditStageWrite(ctx, raNS410, raName410, apiCall, call, res)
+		if got := attrs410(rec); len(got) != 0 {
+			t.Fatalf("#912 N3 RED: a write handed to the stage site under %s emitted %d record(s), want 0: %v", name, len(got), got)
+		}
+	}
+
+	auditStageWrite(ctxWithUser(user410, group410), raNS410, raName410, apiCall, call, res)
+	if got := attrs410(rec); len(got) != 1 {
+		t.Fatalf("control: the same write on a customer resolve emitted %d record(s), want 1: %v", len(got), got)
+	}
+}
+
 func httpcallOpts410(verb, path, server string) httpcall.RequestOptions {
 	return httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: path, Verb: ptr.To(verb)},
