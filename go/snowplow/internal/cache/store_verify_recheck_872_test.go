@@ -19,7 +19,7 @@ package cache
 //     delivery touched the key during the pass: counted directly, NO GET,
 //     repaired. The wholly divergent store is this arm at scale.
 //   - A TRUE LOSS ON A DELIVERED KEY. Delivered, but still behind afterwards:
-//     re-checked (two GETs) and still counted and repaired.
+//     re-read (one GET) and still counted and repaired.
 //   - A RELIST DELETION. The one store change the transform does not see; the
 //     presence-at-open check must cover it.
 //   - A FAILED RE-CHECK. Inconclusive: nothing published or repaired, the GVR
@@ -46,16 +46,19 @@ import (
 // r872Client answers LIST from list and GET from inner (the cluster's current
 // state), or fails every GET with getErr. duringList, when set, runs inside the
 // forced LIST before it answers: whatever it delivers reaches the store while
-// the LIST is in flight. firstGetRV, when set, is the resourceVersion the FIRST
-// GET answers with — the object as it was a moment before it moved again,
-// which the second read then catches.
+// the LIST is in flight.
 type r872Client struct {
 	inner      metadata.Interface
 	list       []*metav1.PartialObjectMetadata
 	duringList func()
 	getErr     error
-	firstGetRV string
 	gets       atomic.Int64
+	// #918 — answers, when it holds a name, is the object's current state the
+	// GET answers with instead of inner's; onGet, when set, runs once the GET
+	// has taken its answer and before it returns: what it delivers lands after
+	// the read.
+	answers map[string]r872Object
+	onGet   func(name string)
 
 	mu     sync.Mutex
 	got    []string
@@ -104,19 +107,37 @@ func (r *r872Resource) List(_ context.Context, opts metav1.ListOptions) (*metav1
 }
 
 func (r *r872Resource) Get(ctx context.Context, name string, opts metav1.GetOptions, sub ...string) (*metav1.PartialObjectMetadata, error) {
-	n := r.c.gets.Add(1)
+	r.c.gets.Add(1)
 	r.c.mu.Lock()
 	r.c.got = append(r.c.got, name)
 	r.c.mu.Unlock()
 	if r.c.getErr != nil {
 		return nil, r.c.getErr
 	}
-	obj, err := r.ResourceInterface.Get(ctx, name, opts, sub...)
-	if err == nil && n == 1 && r.c.firstGetRV != "" {
-		obj = obj.DeepCopy()
-		obj.ResourceVersion = r.c.firstGetRV
+	r.c.mu.Lock()
+	o, answered := r.c.answers[name]
+	r.c.mu.Unlock()
+	var obj *metav1.PartialObjectMetadata
+	var err error
+	if answered {
+		obj = partialMeta("demo", o.name, o.rv, o.uid)
+	} else {
+		obj, err = r.ResourceInterface.Get(ctx, name, opts, sub...)
+	}
+	if r.c.onGet != nil {
+		r.c.onGet(name)
 	}
 	return obj, err
+}
+
+// answer sets the object's current state as the GET answers it.
+func (c *r872Client) answer(o r872Object) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.answers == nil {
+		c.answers = map[string]r872Object{}
+	}
+	c.answers[o.name] = o
 }
 
 // r872Object is one object as "name, rv, uid".
@@ -369,11 +390,10 @@ func TestForcedPass875_DeliveredButStillLost_IsDetectedAndRepaired(t *testing.T)
 			if d := storeRepairQueueDepth(); d != 1 {
 				t.Fatalf("store_repairs_pending = %d after a TRUE loss, want 1 — the re-check must not stop the repair", d)
 			}
-			// A candidate that stays divergent is read twice, never more. A
-			// literal, not recheckReads: a bound read from the constant under
-			// test would loosen with it.
-			if g := cli.gets.Load(); g != 2 {
-				t.Errorf("re-check issued %d GETs for 1 divergent delivered candidate, want 2", g)
+			// #918 — a candidate is read once: a second read could only
+			// give the drain more time (store_verify_recheck.go).
+			if g := cli.gets.Load(); g != 1 {
+				t.Errorf("re-check issued %d GETs for 1 divergent delivered candidate, want 1", g)
 			}
 			if got := storeRecheckClearedTotal.Load(); got != 0 {
 				t.Errorf("store_divergence_recheck_cleared_total = %d for a true loss, want 0", got)
@@ -523,23 +543,28 @@ func TestForcedPass875_RelistDeletionDuringThePass_IsNotALoss(t *testing.T) {
 	}
 }
 
-// TestForcedPass872_ObjectMovedDuringRecheck_IsNotALoss — why the re-check
-// reads twice. The store reaches rv 3 during the LIST; the first quorum read
-// answers rv 2 (the object as it was a moment before it moved again). One read
-// would call that a lost UPDATE; the second read sees rv 3 and clears it.
-func TestForcedPass872_ObjectMovedDuringRecheck_IsNotALoss(t *testing.T) {
-	rw, cli := r872Setup(t, []r872Object{a1}, []r872Object{a3}, []r872Object{a1}, nil)
-	cli.duringList = func() { r872Deliver(t, rw, modified(a3)) }
-	cli.firstGetRV = "2"
+// TestForcedPass872_ObjectMovedAfterItsReRead_IsNotALoss — the object moves
+// again after its re-read, and the watch delivers the move before the pass
+// compares: the store is ahead of the read. #875 read a second time to catch
+// this; under the #918 rule the delivery after the read settles it with one
+// read (the many-object form is TestForcedPass918_*).
+func TestForcedPass872_ObjectMovedAfterItsReRead_IsNotALoss(t *testing.T) {
+	rw, cli := r872Setup(t, []r872Object{a1}, []r872Object{a2}, []r872Object{a1}, nil)
+	cli.duringList = func() { r872Deliver(t, rw, modified(a2)) }
+	cli.answer(a2)
+	cli.onGet = func(string) {
+		cli.answer(a3)
+		r872Deliver(t, rw, modified(a3))
+	}
 	forcedVerify(context.Background(), repairGVR)
 	if got := r872Published(); got != 0 {
-		t.Fatalf("#872 RED: an object that moved during the re-check was published as %d divergence(s)", got)
+		t.Fatalf("#872 RED: an object that moved after its re-read was published as %d divergence(s)", got)
 	}
 	if d := storeRepairQueueDepth(); d != 0 {
 		t.Fatalf("#872 RED: %d repair(s) queued for an object that only moved", d)
 	}
-	if g := cli.gets.Load(); g != 2 {
-		t.Errorf("re-check issued %d GETs, want 2 (the first read stale, the second current)", g)
+	if g := cli.gets.Load(); g != 1 {
+		t.Errorf("re-check issued %d GETs, want 1", g)
 	}
 }
 
@@ -710,14 +735,14 @@ func TestDeliveryLog875_ALostAddPresentAtOpenCountsAsDelivered(t *testing.T) {
 		t.Fatal(err)
 	}
 	win := dl.openPass(idx)
-	keys := win.close()
-	if !win.delivered(keys, "demo/panel-b", classLostAdd) {
+	win.close()
+	if !win.moved("demo/panel-b", classLostAdd) {
 		t.Errorf("a lost ADD for a key the store held at open must be re-read")
 	}
-	if win.delivered(keys, "demo/panel-b", classLostUpdate) {
+	if win.moved("demo/panel-b", classLostUpdate) {
 		t.Errorf("presence at open says nothing about any class but a lost ADD")
 	}
-	if win.delivered(keys, "demo/panel-c", classLostAdd) {
+	if win.moved("demo/panel-c", classLostAdd) {
 		t.Errorf("a lost ADD for a key the store never held is a real loss, not a move")
 	}
 }

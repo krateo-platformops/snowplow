@@ -1,5 +1,5 @@
-// store_verify_recheck.go — #872: the forced pass re-checks every confirmed
-// divergence against the object's CURRENT state before it counts.
+// store_verify_recheck.go — #872, #875, #918: how the forced pass judges its
+// candidates while the store keeps moving.
 //
 // # WHY THE FORCED PASS NEEDS THIS AND THE SNAPSHOT PATH DOES NOT
 //
@@ -8,64 +8,97 @@
 // LISTs, and only when the LIST returns does it compare against the LIVE
 // indexer, which kept applying watch events the whole time. An object updated
 // after the LIST's snapshot is NEWER in the store than in the LIST, and
-// compareStore's `st.rv != up.rv` — an unordered inequality, because
-// resourceVersions are opaque — counts it as a lost UPDATE. The confirm loop
-// cannot clear it either: it waits for the store to EQUAL the LIST, which a
-// store that is ahead never does. Under churn every forced pass therefore
-// "found" lost updates the store never lost, and each one queued a repair: a
-// full relist that makes the GVR unservable until the replacement syncs (#870).
-// Measured in kind (#872): 100% of the reported keys had the store ahead of
-// the LIST, 0 were really lost, and the count rose with the churn rate.
-// Create/expire churn produces the same thing in the other classes (deleted
-// after the LIST reads as a lost ADD, created after it as a lost DELETE).
+// diffStore's `st.rv != up.rv` — an unordered inequality, because
+// resourceVersions are opaque — reports it. Under churn every forced pass
+// therefore "found" lost updates the store never lost, and each one queued a
+// repair: a full relist that makes the GVR unservable until the replacement
+// syncs (#870). Measured in kind (#872): 100% of the reported keys had the
+// store ahead of the LIST, 0 were really lost, and the count rose with the
+// churn rate. Create/expire churn produces the same thing in the other classes
+// (deleted after the LIST reads as a lost ADD, created after it as a lost
+// DELETE).
 //
-// # WHICH CANDIDATES ARE RE-CHECKED (#875)
+// # THE RULE (#918)
 //
-// Only a candidate the store may have MOVED during the pass: its key was
-// delivered by the reflector while the pass was open, or, for a lost ADD, it
-// was in the store when the pass opened and is gone now. Every other candidate
-// is counted as it stands, with no GET: nothing reached the store for it, so it
-// cannot be ahead of a LIST no older than the store was at open, and its
-// disagreement with that LIST is a real one. Why "delivered" is exactly the
-// set that can be ahead, and how it is recorded, is store_verify_delivery.go.
+// Every candidate is held to ONE read of the object — the forced LIST, or a
+// quorum re-read — and counts only under the lost-update rule that
+// confirmDivergences applies at every comparison site (store_verify.go):
+// nothing was delivered for its key after that read began, and the store,
+// counting what it has received, still disagrees with that read. The delivery
+// record (store_verify_delivery.go) numbers every delivery and stays open
+// until the last candidate is judged, so "after the read began" is a
+// comparison of two numbers, never of two resourceVersions, and never of
+// durations.
 //
-// Re-checking every candidate instead was #875's FAIL: a wholly divergent store
+// What #875 did instead, and #918 measured, is why the rule has to be this one:
+// it read every re-checked candidate first and compared the store with those
+// reads only after the whole sweep. In bench run 16 the sweep read 379
+// candidates at the metadata client's 5 reads/s and took 60-76 s, while the
+// churned objects changed every ~20 s. Most had changed — and been delivered —
+// after their read, so the store was ahead of the read, and 264 "lost
+// updates" queued a full repair of the 50K composition store. Reading twice
+// did not help: the object moved after the second read too. The verdict
+// depended on how long the sweep took; under the rule it cannot.
+//
+// # WHICH CANDIDATES ARE RE-READ (#875)
+//
+// Only a candidate the store may have MOVED since the pass opened: its key was
+// delivered while the pass was open, or, for a lost ADD, it was in the store
+// when the pass opened and is gone now (a relist tombstone, which skips the
+// transform). Such a candidate is no longer comparable with the LIST — the
+// store moved after the LIST began, so under the rule the LIST cannot convict
+// it — and it is read again, so that a real loss among the keys that churned
+// is still found in this pass rather than the next. Every other candidate is
+// held to the LIST, with no GET: nothing reached the store for it since the
+// pass opened, so the LIST, no older than the store was then, is a read it can
+// be held to. It is judged with the others at the end, so a delivery for it
+// during the re-check settles it too.
+//
+// Re-reading every candidate instead was #875's FAIL: a wholly divergent store
 // (#237's broken-store class) makes every stored object a candidate, so the
-// re-check issued two quorum GETs per object before the one repair (400 for 200
-// objects; ~100K at 50K), and any one of them failing made the pass
-// inconclusive, so the store most in need of a repair could be kept from ever
-// getting one.
+// re-check issued quorum GETs per object before the one repair (~100K at
+// 50K), and any one of them failing made the pass inconclusive, so the store
+// most in need of a repair could be kept from ever getting one.
 //
-// # THE RE-CHECK
+// # THE RE-READ
 //
-// Each such candidate that survived the confirm loop is read again, ONE object,
-// as a quorum metadata GET (resourceVersion unset: the apiserver serves the
-// current state from etcd, not the watch cache). That read is the object's
-// current truth, and the candidate counts only if the store still disagrees
-// with it after the same bounded drain wait the confirm loop already uses — the
-// store is allowed to lag the quorum read by the events in flight, exactly as
-// it is allowed to lag the LIST. No resourceVersion is ever ordered: equality
-// with a fresh read is the whole test, so the API contract (RVs are opaque)
-// holds.
+// One quorum metadata GET per re-read candidate (resourceVersion unset: the
+// apiserver serves the current state from etcd, not the watch cache), with
+// the delivery counter marked just before it is issued. The read's own instant
+// lies somewhere inside the request, so a delivery during the request counts
+// as after the read. That is the direction that never repairs a store that
+// lost nothing; the cost, a real loss whose state reached etcd inside one
+// request while another delivery for the same key also landed inside it, is
+// found by the next pass — a real divergence does not go away by waiting.
 //
-// A candidate still divergent is read ONCE more. If the object moved between
-// the two reads, the second read is the one the store is held to; either way
-// what remains divergent after the second read counts. That bounds the GETs at
-// two per re-checked candidate, and the re-checked candidates at the keys
-// delivered during the pass: the churn in that window, never the GVR's object
-// count.
+// There is no second read. #875 read a still-divergent candidate again to
+// catch an object that moved between the read and the comparison; a move that
+// reaches the store is now a delivery after the read, which settles the key by
+// itself, and one that does not reach the store is a loss either read shows.
+// A second read only bought the drain more time, and was a retry bound.
 //
 // The class is re-derived from the fresh read rather than carried over: a
 // candidate the LIST called a lost UPDATE may be a lost DELETE now (it was
 // deleted since), and it must be counted, if at all, as what it is now.
 //
-// # A FAILED RE-CHECK MAKES THE PASS INCONCLUSIVE
+// # WHAT THE RULE CANNOT SEE, STATED
 //
-// If any re-check read fails (other than NotFound, which is an answer), the
-// pass publishes nothing, queues no repair and does NOT mark the GVR verified,
-// so its epoch stays old and the deadline walker picks it up again. It is
-// counted as a skip under its own reason, so "could not finish" is never
-// spelled like "found nothing". Neither alternative is safer:
+// A read whose state has not reached this process's reflector at all when the
+// pass decides — the watch stream lagging the read by more than the drain
+// wait, with no other delivery for the key since the read — looks exactly like
+// a loss. Telling the two apart needs knowing whether the watch has passed the
+// read's resourceVersion, which means ordering resourceVersions, which the API
+// forbids. Every candidate read before the last ones has the rest of the sweep
+// for its delivery to arrive; the last ones have the drain wait, as the
+// snapshot path's candidates always did.
+//
+// # A FAILED RE-READ MAKES THE PASS INCONCLUSIVE
+//
+// If any re-read fails (other than NotFound, which is an answer), the pass
+// publishes nothing, queues no repair and does NOT mark the GVR verified, so
+// its epoch stays old and the deadline walker picks it up again. It is counted
+// as a skip under its own reason, so "could not finish" is never spelled like
+// "found nothing". Neither alternative is safer:
 //   - counting the unverified candidates as lost turns a transient apiserver
 //     error into a repair — the very false repair (and #870 window) this file
 //     removes, now triggered by an error instead of by churn;
@@ -90,96 +123,95 @@ import (
 )
 
 var (
-	storeRecheckGETsTotal        atomic.Uint64
-	storeRecheckClearedTotal     atomic.Uint64
-	storeRecheckUndeliveredTotal atomic.Uint64
-	storeRecheckUnavailableTotal atomic.Uint64
+	storeRecheckGETsTotal              atomic.Uint64
+	storeRecheckClearedTotal           atomic.Uint64
+	storeRecheckUndeliveredTotal       atomic.Uint64
+	storeRecheckUnavailableTotal       atomic.Uint64
+	storeRecheckDeliveredAfterTotal    atomic.Uint64
+	storeRecheckReceivedReadStateTotal atomic.Uint64
 )
 
-// recheckReads is the number of quorum reads per candidate (see the header).
-const recheckReads = 2
+// judgeForcedPass returns the forced pass's report: candidates (diffStore's,
+// against the LIST upstream) judged under the lost-update rule, each held to
+// the read described in the file header. ok=false means a re-read failed and
+// the pass is inconclusive. win must stay open until this returns.
+func judgeForcedPass(ctx context.Context, cli metadata.Interface, gvr schema.GroupVersionResource,
+	idx clientcache.Indexer, upstream map[string]objIdentity, candidates []divergenceCandidate,
+	win *deliveryWindow) (divergenceReport, bool) {
 
-// recheckAgainstCurrent returns rep with only the divergences that still hold:
-// a candidate mayHaveMoved reports false is kept as it stands; every other one
-// is kept only if it still holds against the object's current state. ok=false
-// means a re-check read failed and the pass is inconclusive (see the header).
-func recheckAgainstCurrent(ctx context.Context, cli metadata.Interface, gvr schema.GroupVersionResource,
-	idx clientcache.Indexer, rep divergenceReport, mayHaveMoved func(string, divergenceClass) bool) (divergenceReport, bool) {
-
-	out := divergenceReport{objectsCompared: rep.objectsCompared, candidates: rep.candidates}
-	var keys []string
-	for _, set := range []struct {
-		class divergenceClass
-		keys  []string
-		out   *[]string
-	}{
-		{classLostUpdate, rep.lostUpdate, &out.lostUpdate},
-		{classLostDelete, rep.lostDelete, &out.lostDelete},
-		{classLostAdd, rep.lostAdd, &out.lostAdd},
-		{classUIDMismatch, rep.uidMismatch, &out.uidMismatch},
-	} {
-		for _, key := range set.keys {
-			if mayHaveMoved(key, set.class) {
-				keys = append(keys, key)
-				continue
-			}
-			*set.out = append(*set.out, key)
-		}
-	}
-	// Counted only on the paths that return the report: an inconclusive pass
-	// publishes none of these, and the counter says each one was published.
-	counted := out.total()
-	if len(keys) == 0 {
-		storeRecheckUndeliveredTotal.Add(counted)
-		return out, true
-	}
-
-	current := make(map[string]objIdentity, len(keys))
-	pending := keys
-	for read := 0; read < recheckReads && len(pending) > 0; read++ {
-		for _, key := range pending {
-			id, found, err := currentIdentity(ctx, cli, gvr, key)
-			if err != nil {
-				return divergenceReport{}, false
-			}
-			if found {
-				current[key] = id
-			} else {
-				delete(current, key)
-			}
-		}
-		var cands []divergenceCandidate
-		for _, key := range pending {
-			if c, divergent := classifyKey(idx, current, key); divergent {
-				cands = append(cands, divergenceCandidate{key, c})
-			}
-		}
-		still := confirmDivergences(idx, current, cands)
-		pending = pending[:0:0]
-		for _, c := range still {
-			pending = append(pending, c.key)
-		}
-	}
-
-	for _, key := range pending {
-		c, divergent := classifyKey(idx, current, key)
-		if !divergent {
+	// reads[key] is what the read key is held to says (absent: no object);
+	// marks[key] is the delivery counter when that read began.
+	reads := make(map[string]objIdentity, len(candidates))
+	marks := make(map[string]uint64, len(candidates))
+	reread := map[string]bool{}
+	var judged []divergenceCandidate
+	var rereadKeys []string
+	for _, c := range candidates {
+		if win.moved(c.key, c.class) {
+			reread[c.key] = true
+			rereadKeys = append(rereadKeys, c.key)
 			continue
 		}
-		switch c {
-		case classLostAdd:
-			out.lostAdd = append(out.lostAdd, key)
-		case classLostUpdate:
-			out.lostUpdate = append(out.lostUpdate, key)
-		case classLostDelete:
-			out.lostDelete = append(out.lostDelete, key)
-		case classUIDMismatch:
-			out.uidMismatch = append(out.uidMismatch, key)
+		if up, ok := upstream[c.key]; ok {
+			reads[c.key] = up
+		}
+		marks[c.key] = win.openedAt
+		judged = append(judged, c)
+	}
+
+	for _, key := range rereadKeys {
+		mark := win.mark()
+		id, found, err := currentIdentity(ctx, cli, gvr, key)
+		if err != nil {
+			return divergenceReport{}, false
+		}
+		marks[key] = mark
+		if found {
+			reads[key] = id
 		}
 	}
-	storeRecheckClearedTotal.Add(uint64(len(keys)) - (out.total() - counted))
-	storeRecheckUndeliveredTotal.Add(counted)
-	return out, true
+	for _, key := range rereadKeys {
+		if c, divergent := classifyKey(idx, reads, key); divergent {
+			judged = append(judged, divergenceCandidate{key, c})
+		}
+	}
+
+	settledBy := func(key string) (after, received bool) {
+		d, ok := win.latestFor(key)
+		if !ok {
+			return false, false
+		}
+		if d.seq > marks[key] {
+			return true, false
+		}
+		read, found := reads[key]
+		return false, found && d.id == read
+	}
+	confirmed := confirmDivergences(idx, reads, judged, func(key string) bool {
+		after, received := settledBy(key)
+		return after || received
+	})
+
+	counted := map[string]bool{}
+	for _, c := range confirmed {
+		counted[c.key] = true
+		if !reread[c.key] {
+			storeRecheckUndeliveredTotal.Add(1)
+		}
+	}
+	for _, c := range candidates {
+		if counted[c.key] {
+			continue
+		}
+		storeRecheckClearedTotal.Add(1)
+		switch after, received := settledBy(c.key); {
+		case after:
+			storeRecheckDeliveredAfterTotal.Add(1)
+		case received:
+			storeRecheckReceivedReadStateTotal.Add(1)
+		}
+	}
+	return reportOf(len(upstream), len(candidates), confirmed), true
 }
 
 // currentIdentity reads one object's current {rv, uid} with a quorum metadata
@@ -200,7 +232,7 @@ func currentIdentity(ctx context.Context, cli metadata.Interface, gvr schema.Gro
 	return objIdentity{rv: obj.GetResourceVersion(), uid: string(obj.GetUID())}, true, nil
 }
 
-// classifyKey applies compareStore's predicate to ONE key against the given
+// classifyKey applies diffStore's predicate to ONE key against the given
 // upstream view: its class, and whether the store diverges from it at all.
 func classifyKey(idx clientcache.Indexer, upstream map[string]objIdentity, key string) (divergenceClass, bool) {
 	up, wanted := upstream[key]
