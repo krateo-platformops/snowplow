@@ -5103,7 +5103,7 @@ def churn_write_failures_report(recs: list[dict]) -> dict:
 
 
 def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None,
-                            k6_calls: list[tuple[float, float]] | None = None) -> None:
+                            k6_calls: list[tuple[float, float]] | None = None, browser: dict | None = None) -> None:
     """#919's report-only sections of verdict.json: run606's kubectl top
     samples (answered / failed), the API server's flow control per phase
     (bench/apf.py, streamed from `apf_path`: run606's apf.jsonl.gz) and
@@ -5134,7 +5134,8 @@ def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None
         warnings.append(f"kubectl top: {t['failed']} of {t['failed'] + t['answered']} samples failed "
                         f"(longest unanswered stretch {t['longest_unanswered_s']} s)")
     report["churn_write_failures_report_only"] = churn_write_failures_report(recs)
-    report["acceptance_figures_report_only"] = figures.run_figures(report, recs, window, boot_facts, k6_calls)
+    report["acceptance_figures_report_only"] = figures.run_figures(report, recs, window, boot_facts, k6_calls,
+                                                                   browser)
 
 
 def _cmd_evaluate(a) -> int:
@@ -5198,7 +5199,8 @@ def _cmd_evaluate(a) -> int:
     # server (run606 api_seen): shown with the verdict, never judged
     result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]
     from bench import custlat
-    _cluster_sample_reports(result["report"], recs, a.apf, custlat.calls((k6 or {}).get("k6")))
+    _cluster_sample_reports(result["report"], recs, a.apf, custlat.calls((k6 or {}).get("k6")),
+                            (k6 or {}).get("browser"))
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))

@@ -484,9 +484,14 @@ def render_k6_driver(a) -> str:
                            composite_routes=a.composite_route or (
                                [routes[0]["path"]] if a.dry_run else []),
                            browser_users=[s["index"] for s in sessions], viewers=viewers)
+    fresh = None
+    if a.fresh_classes:
+        import json
+        with open(a.fresh_classes) as fh:
+            fresh = json.load(fh)
     bcfg = k6_job.browser_config(sessions=sessions, routes=[r["path"] for r in routes],
                                  password=a.password, think_s=a.browser_think_s,
-                                 duration_s=a.duration_s)
+                                 duration_s=a.duration_s, fresh=fresh)
     forwards = a.browser_forward or list(K6_BROWSER_FORWARDS)
     return (k6_job.render_k6(config=cfg, authn_url=a.authn_url, password=a.password,
                              linger_s=a.linger_s)
@@ -542,6 +547,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="k6: no preflight exists (BENCH_606_DRY_RUN); placeholder route table")
     p.add_argument("--browser-think-s", type=float, default=15.0)
+    p.add_argument("--fresh-classes", default=None,
+                   help="#935: bench/fresh_classes plan JSON (each browser session's fresh identity classes)")
     p.add_argument("--browser-forward", action="append", default=None,
                    help="k6: LOCALPORT=host:port forwarded inside the browser pod (repeatable)")
     a = p.parse_args(argv)

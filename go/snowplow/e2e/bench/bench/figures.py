@@ -228,8 +228,94 @@ def reflector_establishments(mem: list[dict], after: float | None, k6_calls: lis
                                  f"not read"}
 
 
+# ─── first visits by fresh identity classes (#935) ──────────────────────────
+
+def _int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def fresh_classes(o: dict | None) -> list[dict]:
+    """browser.js's browser_fresh_class points: each fresh class's window
+    (its sign-in to its first page) and snowplow's learned-class counters at
+    both ends."""
+    if not o:
+        return []
+    out = []
+    for (_, t), at in zip(o["points"].get("browser_fresh_class", []),
+                          (o.get("times") or {}).get("browser_fresh_class") or []):
+        out.append({"session": t.get("session"), "class": t.get("class"), "t0": _int(t.get("t_before")),
+                    "t1": at, **{k: _int(t.get(k)) for k in ("registered_before", "registered_after",
+                                                              "seeded_before", "seeded_after")}})
+    return sorted(out, key=lambda c: (c["t0"] is None, c["t0"] or 0))
+
+
+def prove_cold(classes: list[dict]) -> None:
+    """Mark each class `cold_proven`: snowplow's learned-class registrations
+    across its window cover it. Windows of different sessions that overlap
+    are judged together (the counter is process-wide): the registrations from
+    the first window's start to the last's end must be at least the classes
+    in them. Registrations by anything else in the window would count too:
+    after the k6 users' own first calls, nothing else registers a class."""
+    groups: list[list[dict]] = []
+    for c in classes:
+        if c["t0"] is None or c["t1"] is None or c["registered_before"] is None or c["registered_after"] is None:
+            c["cold_proven"], c["why"] = False, "a learned-class read failed"
+            continue
+        if groups and c["t0"] <= max(x["t1"] for x in groups[-1]):
+            groups[-1].append(c)
+        else:
+            groups.append([c])
+    for g in groups:
+        moved = max(x["registered_after"] for x in g) - min(x["registered_before"] for x in g)
+        ok = moved >= len(g)
+        for x in g:
+            x["cold_proven"] = ok
+            if not ok:
+                x["why"] = f"{moved} class(es) registered for {len(g)} sign-in(s) in the window"
+            x["seed_ran_during_first_visit"] = (x["seeded_before"] is not None and x["seeded_after"] is not None
+                                                and x["seeded_after"] > x["seeded_before"])
+
+
+def _stats(v: list[float]) -> dict:
+    return {"n": len(v), "p50_ms": _pct(v, 50), "p95_ms": _pct(v, 95), "max_ms": max(v) if v else None}
+
+
+def fresh_first_visits(o: dict | None, phases, phase_of) -> dict:
+    """Per route: the FIRST visits of fresh identity classes proven cold, per
+    phase and over the run — n, p50, p95, max — and the classes not proven
+    (left out, with why)."""
+    classes = fresh_classes(o)
+    if not classes:
+        return {"status": "absent", "note": "no browser_fresh_class point: no fresh identity class ran "
+                                            "(browser.js or run606 before #935, or no session switched)"}
+    prove_cold(classes)
+    ok = {(c["session"], c["class"]) for c in classes if c["cold_proven"]}
+    by_route: dict[str, dict[str, list[float]]] = {}
+    for (v, t), at in zip(o["points"].get("browser_page_load_ms", []),
+                          (o.get("times") or {}).get("browser_page_load_ms") or []):
+        if t.get("identity") != "fresh" or t.get("visit") != "first" or v is None or at is None:
+            continue
+        if (t.get("session"), t.get("class")) not in ok:
+            continue
+        r = by_route.setdefault(t.get("route"), {})
+        ph = phase_of(at, phases)
+        # each phase, the churn steps pooled (as every per-phase report), the run
+        for p in (ph,) + (("churn",) if ph.startswith("churn:") else ()) + ("all",):
+            r.setdefault(p, []).append(v)
+    return {"status": "present", "classes": len(classes),
+            "cold_proven": sum(1 for c in classes if c["cold_proven"]),
+            "not_proven": [{k: c.get(k) for k in ("session", "class", "why")} for c in classes if not c["cold_proven"]],
+            "seed_ran_during_first_visit": sum(1 for c in classes if c.get("seed_ran_during_first_visit")),
+            "by_route": {r: {p: _stats(v) for p, v in ps.items()} for r, ps in sorted(by_route.items())},
+            "how": "first visits (visit=first) of fresh identity classes (identity=fresh) whose cold start "
+                   "snowplow's learned-class counter proves; a page that timed out counts at its timeout"}
+
+
 def run_figures(report: dict, recs: list[dict], window, facts: dict,
-                k6_calls: list[tuple[float, float]] | None = None) -> dict:
+                k6_calls: list[tuple[float, float]] | None = None, browser: dict | None = None) -> dict:
     """One run's figures (report: its verdict report, with the APF report)."""
     cfg = next((r for r in recs if r.get("kind") == "flowcontrol_config"), None)
     ap = report.get("apiserver_flowcontrol_report_only") or {}
@@ -238,7 +324,12 @@ def run_figures(report: dict, recs: list[dict], window, facts: dict,
            "steady_refreshes_per_core": steady_refreshes_per_core(report.get("customer_latency")),
            "reflector_establishments_after_ready": reflector_establishments(
                [r for r in recs if r.get("kind") == "mem"], facts.get("ready_at"), k6_calls or [],
-               [r for r in recs if r.get("kind") == "top"])}
+               [r for r in recs if r.get("kind") == "top"]),
+           # #935: phases from the run's own schedule (load606.run_phases), as every per-phase report
+           "fresh_first_visits": fresh_first_visits(
+               browser, load606.run_phases([r for r in recs if r.get("kind") in ("mem_start", "mem", "mem_end")],
+                                           [r for r in recs if r.get("kind") in ("fresh", "churn")]),
+               load606._phase_of)}
     ids = (cfg or {}).get("identities") or {}
     if cfg and cfg.get("verified") and ap.get("status") == "present":
         def per(rep):
