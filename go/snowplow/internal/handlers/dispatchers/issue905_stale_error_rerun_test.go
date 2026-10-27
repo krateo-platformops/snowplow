@@ -13,10 +13,16 @@
 //	    error of the stale-derived pass is withdrawn and the request re-run
 //	    fresh (rule c).
 //	    Mutation → RED: no write point on the error path (0 POSTs, 500).
+//	W4  the widgets twin: a widget whose stale-derived pass ERRORS (its apiRef
+//	    RESTAction's held write failed it) is withdrawn and re-run fresh, and
+//	    answers the fresh body with 200, never the stale pass's error.
+//	    Mutation → RED: no write point on widgets.go's error path (an error
+//	    status).
 package dispatchers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -26,6 +32,8 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )
@@ -71,5 +79,32 @@ func TestIssue905_W3_StrictWriteRA_StalePassError_ReRun_SentOnce200(t *testing.T
 	if n := posts.Load(); n != 1 || code != http.StatusOK {
 		t.Fatalf("#905 RED: one customer write request sent its POST %d time(s) and answered %d; want exactly 1 POST and 200 "+
 			"(stale decisions %d, withdrawn %d)", n, code, st.ServeTotal-s0.ServeTotal, st.WithdrawnUnarmable-s0.WithdrawnUnarmable)
+	}
+}
+
+func TestIssue905_W4_Widget_StalePassError_ReRun_Fresh200(t *testing.T) {
+	h, _ := k710KnownStaleFound(t)
+	inner := h.resolve
+	// The widget's apiRef RESTAction holds its write on a pass served stale
+	// (rule a) and fails without it (#709): the widget resolve errors on THAT
+	// pass only.
+	t.Cleanup(setWidgetsResolveForTest(func(ctx context.Context, opts widgets.ResolveOptions) (*widgets.Widget, error) {
+		w, err := inner(ctx, opts)
+		if err == nil && cache.StaleServeSinkFromContext(ctx).StaleDerived() {
+			return nil, apierrors.NewInternalError(errors.New("apiRef failed: its write was held on a stale pass (injected)"))
+		}
+		return w, err
+	}))
+	s0 := restactionsapi.StaleServeStatsSnapshot()
+
+	r, code := h.get(0, k547Changed)
+
+	st := restactionsapi.StaleServeStatsSnapshot()
+	if d := st.ServeTotal - s0.ServeTotal; d != 1 {
+		t.Fatalf("PRE: the first pass must be served stale (stale decisions %d) — else this arm is vacuous", d)
+	}
+	if code != http.StatusOK || r != "v1" {
+		t.Fatalf("#905 RED: the widget answered %d %q; want 200 and the fresh re-run's v1 — the stale pass's error must be "+
+			"withdrawn and re-run (withdrawn %d)", code, r, st.WithdrawnUnarmable-s0.WithdrawnUnarmable)
 	}
 }
