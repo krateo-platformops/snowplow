@@ -463,16 +463,14 @@ def test_unanswered_exit_codes_are_unknown_never_exited_0(harness):  # noqa: F81
 
 
 # 4: the outage rule in the paired verdict (run 14's recorded run, test_pair_ready_time's arms).
-# A record's window is narrowed to what was unanswered (first_unanswered -> t1);
-# here first_unanswered is t0 + 30 (half the window when shorter), so [t0, t1]
-# is judged as [t0 + 30, t1]. A first unanswered poll at or after t1 is no
-# narrowing (bad data): the poll window stands, with no known uncertainty.
+# The WHOLE window [t0, t1] of a record is judged; its first unanswered poll
+# (here t0 + 30) is reported, and widens an A outage's vantage cover by its
+# poll gap.
 
 def _outage(doc, t0_s, t1_s, k0):
     d = copy.deepcopy(doc)
     d["api_outages"] = [{"kind": "api_unreachable", "t0": k0 + t0_s, "t1": k0 + t1_s,
-                         "seconds": t1_s - t0_s, "first_unanswered": k0 + t0_s + min(30, (t1_s - t0_s) / 2),
-                         "seen_by": "get job/k6load",
+                         "seconds": t1_s - t0_s, "first_unanswered": k0 + t0_s + 30, "seen_by": "get job/k6load",
                          "open": False,
                          "source": "run606 polls: the last answered poll before to the first answered poll after"}]
     return d
@@ -493,18 +491,6 @@ def _b_silent(doc, lo, hi):
     return d
 
 
-def _b_clean(doc, lo, hi):
-    """B's k6 requests over [K0 + lo, K0 + hi) wall-clock all served (none
-    failed, none slow): run 14's recorded stream has a few errors and slow
-    requests in places, which a short window would rightly count"""
-    d = copy.deepcopy(doc)
-    c0 = d["calls"][0][0]
-    inside = lambda o: lo - SHIFT - 30 <= o - c0 < hi - SHIFT + 30     # noqa: E731  (flights overlap)
-    d["calls"] = [[o, min(v, 500.0) if inside(o) else v] for o, v in d["calls"]]
-    d["failed"] = [[o, 0 if inside(o) else v] for o, v in d["failed"]]
-    return d
-
-
 def _cpo_b(p):
     return next(c for c in p["validity"] if c["check"].endswith("control_plane_outage[b]"))
 
@@ -517,22 +503,22 @@ def test_an_a_outage_is_excluded_from_both_runs_like_an_a_restart(tmp_path):
     (a0, a1), = it["a"]
     (b0, b1), = it["b"]
     assert round(b0 - a0, 6) == SHIFT and round(b1 - a1, 6) == SHIFT
-    assert round(a0 - K0, 6) == 930.0                       # narrowed: from its first unanswered poll
-    assert any("A's control plane did not answer for 170" in n and "excluded from both runs" in n for n in p["notes"])
+    assert round(a0 - K0, 6) == 900.0                       # its whole window
+    assert any("A's control plane did not answer for 200" in n and "excluded from both runs" in n for n in p["notes"])
     churn = [c for c in p["checks"] if c["check"].startswith("customer_latency.pair[churn]")]
     assert all(c["excluded"]["a_s"] == c["excluded"]["b_s"] > 0 for c in churn)
 
 
 def test_a_b_outage_k6_saw_served_is_jointly_ready_time_with_a_note(tmp_path):
-    """B's control plane did not answer, B's k6 requests in flight then were
-    served within the 1 % bar: not void, not cut — jointly-Ready time, and a
-    NOTE (#606 run 16)."""
+    """B's control plane did not answer, B's k6 requests in flight over its
+    whole window were served within the 1 % bar: not void, not cut —
+    jointly-Ready time, and a NOTE (#606 run 16)."""
     p = _arms(tmp_path, P14, _shift(_outage(P14, 900, 1100, K0), SHIFT))
     assert p["verdict"] == "PASS", (p["invalid_reasons"], p["fail_reasons"])
     assert _cpo_b(p)["result"] == "PASS" and _cpo_b(p)["value"] == "none"
     (w,) = p["b_outages_witnessed_served"]
-    assert (w["t0"] - K0, w["t1"] - K0, w["seconds"]) == (930.0, 1100.0, 170.0)
-    assert w["poll_t0"] - K0 == 900.0 and w["edge_uncertainty_s"] == 30.0
+    assert (w["t0"] - K0, w["t1"] - K0, w["seconds"], w["poll_gap_s"]) == (900.0, 1100.0, 200.0, 30.0)
+    assert w["b_only"] == [[round(K0 + 900.0, 1), round(K0 + 1100.0, 1)]]
     assert w["k6"]["requests"] > 0 and w["k6"]["rate"] <= 0.01
     assert not p["exclusion"]["items"]                       # kept: nothing cut from either run
     assert any("kept as jointly-Ready time" in n and "within the 0.01 bar" in n for n in p["notes"])
@@ -541,12 +527,24 @@ def test_a_b_outage_k6_saw_served_is_jointly_ready_time_with_a_note(tmp_path):
 def test_a_b_outage_with_customer_errors_fails_the_pair(tmp_path):
     """B's requests in flight in it not served over the bar: B was not
     serving — FAIL (candidate_not_ready), never cut, never void."""
-    b = _b_failing(_shift(_outage(P14, 900, 1100, K0), SHIFT), 930, 1100)
+    b = _b_failing(_shift(_outage(P14, 900, 1100, K0), SHIFT), 900, 1100)
     p = _arms(tmp_path, P14, b)
     assert p["verdict"] == "FAIL", (p["invalid_reasons"], p["fail_reasons"])
     assert p["candidate_not_ready"]["result"] == "FAIL"
     (st,) = p["candidate_not_ready"]["value"]["stretches"]
-    assert st["seconds"] == 170.0 and st["k6"]["rate"] > 0.01 and "B was not serving" in st["why"]
+    assert st["seconds"] == 200.0 and st["k6"]["rate"] > 0.01 and "B was not serving" in st["why"]
+
+
+def test_customer_errors_only_in_the_poll_gap_fail_the_pair(tmp_path):
+    """B's customers fail ONLY in the poll gap — between the last answered
+    poll (900) and the first unanswered one (930). That is inside the
+    window: B was not serving. Judging from the first unanswered poll on
+    would have missed every one of them (#917, Diego's rule)."""
+    b = _b_failing(_shift(_outage(P14, 900, 1100, K0), SHIFT), 900, 930)
+    p = _arms(tmp_path, P14, b)
+    assert p["verdict"] == "FAIL", (p["invalid_reasons"], p["fail_reasons"])
+    (st,) = p["candidate_not_ready"]["value"]["stretches"]
+    assert (st["t0"] - K0, st["t1"] - K0) == (900.0, 1100.0) and st["k6"]["rate"] > 0.01
 
 
 def test_a_b_outage_no_k6_request_witnessed_voids(tmp_path):
@@ -575,27 +573,28 @@ def test_the_operators_own_network_blip_is_the_vantages_not_bs(tmp_path):
     assert any("the operator's vantage, not the candidate" in n for n in p["notes"])
 
 
-# A's outage poll window [1000, 1040], first unanswered poll at 1020: its own
-# poll interval, 20 s, is how far its true edges can sit from the window's, so
-# A covers [980, 1060] of wall-clock time — no other margin. B's window is
-# narrowed to its first unanswered poll; whatever of it A does not cover k6
-# judges.
+# A's outage window [1000, 1040], first unanswered poll at 1030: its own poll
+# gap, 30 s, is how far its true edges can sit from the window's, so A covers
+# [970, 1070] of wall-clock time — no other margin. Whatever of B's whole
+# window A does not cover, k6 judges.
 @pytest.mark.parametrize("b_t0, b_t1, b_only", [
     (1000, 1040, None),          # the same window: the vantage's
-    (980, 1060, None),           # narrowed [1010, 1060], inside A's cover: the vantage's
-    (1030, 1080, (1060, 1080)),  # narrowed [1055, 1080]: 20 s past A's cover, B's alone
-    (1040, 1080, (1060, 1080)),  # narrowed [1060, 1080]: starts as A's cover ends
-    (1200, 1240, (1220, 1240)),  # B only, later
+    (980, 1060, None),           # inside A's cover: the vantage's
+    (1030, 1080, (1070, 1080)),  # 10 s past A's cover: B's alone
+    (1040, 1080, (1070, 1080)),  # starts as A's ends: 10 s B-only
+    (1200, 1240, (1200, 1240)),  # B only, later
 ])
 def test_only_the_part_of_bs_outage_that_as_covers_is_the_vantages(tmp_path, b_t0, b_t1, b_only):
     a = _outage(P14, 1000, 1040, K0)
     b = _shift(_outage(P14, b_t0, b_t1, K0), SHIFT)
-    p = _arms(tmp_path / "served", a, _b_clean(b, b_t0, b_t1))
-    assert p["verdict"] == "PASS", (p["invalid_reasons"], p["fail_reasons"])
+    p = _arms(tmp_path / "recorded", a, b)
     if b_only is None:
-        assert not p["b_outages_witnessed_served"]
+        assert p["verdict"] == "PASS", (p["invalid_reasons"], p["fail_reasons"])
+        assert not p["b_outages_witnessed_served"] and _cpo_b(p)["value"] == "none"
     else:
-        (w,) = p["b_outages_witnessed_served"]
+        # B's own part judged by its recorded k6 (run 14's stream), whatever it says
+        judged = p["b_outages_witnessed_served"] or p["candidate_not_ready"]["value"]["stretches"]
+        (w,) = judged
         assert w["b_only"] == [[round(K0 + b_only[0], 1), round(K0 + b_only[1], 1)]]
         # B's own part with its customers failing: FAIL
         p = _arms(tmp_path / "failing", a, _b_failing(b, *b_only))
@@ -604,21 +603,20 @@ def test_only_the_part_of_bs_outage_that_as_covers_is_the_vantages(tmp_path, b_t
 
 @pytest.mark.parametrize("b_t1", [1100, 1300, 1600])
 def test_a_long_b_outage_touching_a_short_a_blip_is_judged_by_bs_k6(tmp_path, b_t1):
-    """The #898 re-reviewer's probe: A blips 30 s (1000-1030, first unanswered
-    1015: A covers [985, 1045]), B is down from 1010 to b_t1 (narrowed: from
-    1040). Only what A's blip covers is the vantage's; the rest (1045 on) is
-    B's alone, and B's k6 judges it: its customers failing -> FAIL; served ->
-    kept, with a NOTE. Never excused by A's blip."""
+    """The #898 re-reviewer's probe: A blips 30 s (1000-1030; first unanswered
+    1030: A covers [970, 1060]), B is down from 1010 to b_t1. Only what A's
+    blip covers is the vantage's; the rest (1060 on) is B's alone, and B's
+    k6 judges it: its customers failing -> FAIL. Never excused by A's blip."""
     a = _outage(P14, 1000, 1030, K0)
     b = _shift(_outage(P14, 1010, b_t1, K0), SHIFT)
-    p = _arms(tmp_path / "failing", a, _b_failing(b, 1045, b_t1))
+    p = _arms(tmp_path / "failing", a, _b_failing(b, 1060, b_t1))
     assert p["verdict"] == "FAIL" and p["candidate_not_ready"]["result"] == "FAIL", p["fail_reasons"]
     (st,) = p["candidate_not_ready"]["value"]["stretches"]
-    assert st["b_only"] == [[round(K0 + 1045.0, 1), round(K0 + b_t1, 1)]]
-    p = _arms(tmp_path / "served", a, _b_clean(b, 1010, b_t1))
-    assert p["verdict"] == "PASS", (p["invalid_reasons"], p["fail_reasons"])
-    (w,) = p["b_outages_witnessed_served"]
-    assert w["b_only"] == [[round(K0 + 1045.0, 1), round(K0 + b_t1, 1)]]
+    assert st["b_only"] == [[round(K0 + 1060.0, 1), round(K0 + b_t1, 1)]]
+    p = _arms(tmp_path / "recorded", a, b)
+    judged = p["b_outages_witnessed_served"] or p["candidate_not_ready"]["value"]["stretches"]
+    (w,) = judged
+    assert w["b_only"] == [[round(K0 + 1060.0, 1), round(K0 + b_t1, 1)]]
 
 
 def test_an_outage_outside_the_measure_is_not_the_pairs(tmp_path):
