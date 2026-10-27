@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -130,9 +131,9 @@ func withBackgroundHopHeader(apiCall *templates.API, nonCustomer, toSelf bool) *
 	}
 	switch {
 	case toSelf && nonCustomer && !present:
-		hdrs := make([]string, 0, len(apiCall.Headers)+1)
-		hdrs = append(hdrs, apiCall.Headers...)
-		hdrs = append(hdrs, cache.BackgroundHeader+": 1")
+		// slices.Clip: cap == len, so the append always copies into a new
+		// array and never writes the CR's own header slice.
+		hdrs := append(slices.Clip(apiCall.Headers), cache.BackgroundHeader+": 1")
 		local := *apiCall
 		local.Headers = hdrs
 		return &local
