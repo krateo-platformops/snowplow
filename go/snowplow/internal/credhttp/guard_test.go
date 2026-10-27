@@ -12,10 +12,11 @@ package credhttp
 //
 // #920 extends it to the client-side rate limit. Outside this package a
 // *rest.Config may only be copied from one credhttp returned (rest.CopyConfig,
-// *rc), never built from nothing (a rest.Config literal, new(rest.Config), a
-// zero-value variable, field or renamed type; and, by type, from any function
-// outside this module that returns one: ratelimit_920_typed_guard_test.go),
-// and no code writes to, or takes the address of, QPS, Burst or RateLimiter
+// *rc), never built from nothing. That is judged by TYPE in
+// ratelimit_920_typed_guard_test.go (no rest.Config by value in any type
+// expression or generic type argument, no &x of a *rest.Config, no reference
+// to a function outside this module that returns one), and here no code
+// writes to, or takes the address of, QPS, Burst or RateLimiter
 // (limiterWrites): those would bring client-go's limiter back. Inside this
 // package, every function that builds a REST client or a *rest.Config must
 // apply noClientRateLimit (TestIssue920_EveryCredhttpBuilderAppliesNoClientRateLimit),
@@ -79,9 +80,10 @@ func forbidden(pkgPath, name string) bool {
 
 var forConfigRe = regexp.MustCompile(`^New.*ForConfig`)
 
-// httpClientType reports whether e is the NON-pointer type net/http.Client,
-// net/http.Transport or (#920) k8s.io/client-go/rest.Config, and which, as
-// "http.Client", "http.Transport" or "rest.Config".
+// httpClientType reports whether e is the NON-pointer type net/http.Client or
+// net/http.Transport, and which, as "http.Client" or "http.Transport". (A
+// rest.Config by value is refused by the typed #920 gate, which also sees it
+// inside []T, [N]T, map[K]T, chan T and generic type arguments.)
 func httpClientType(e ast.Expr, imports map[string]string) (string, bool) {
 	sel, ok := e.(*ast.SelectorExpr)
 	if !ok {
@@ -91,11 +93,8 @@ func httpClientType(e ast.Expr, imports map[string]string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	switch p := imports[id.Name]; {
-	case p == "net/http" && (sel.Sel.Name == "Client" || sel.Sel.Name == "Transport"):
+	if imports[id.Name] == "net/http" && (sel.Sel.Name == "Client" || sel.Sel.Name == "Transport") {
 		return "http." + sel.Sel.Name, true
-	case p == "k8s.io/client-go/rest" && sel.Sel.Name == "Config":
-		return "rest.Config", true
 	}
 	return "", false
 }
@@ -233,11 +232,6 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 			if !ok {
 				return true
 			}
-			// #920: a rest.Config literal is a config credhttp never saw.
-			if name == "rest.Config" {
-				out = append(out, ref{rel, fn, "rest.Config{}", fset.Position(x.Pos())})
-				return true
-			}
 			// An http.Client literal handed straight to credhttp.Client is hardened.
 			if u, ok := parent.(*ast.UnaryExpr); ok && u.X == x && len(stack) >= 3 {
 				parent = stack[len(stack)-3]
@@ -370,23 +364,18 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 		"dotHTTP":     `import . "net/http"; var c = &Client{}`,
 		"dotClientGo": `import . "k8s.io/client-go/dynamic"; func f() { NewForConfig(nil) }`,
 		"dotPlumbing": `import . "github.com/krateo-platformops/plumbing/http/request"; func f() { HTTPClientForEndpoint(nil, nil) }`,
-		// #920 — a *rest.Config built from nothing, or a limiter put back.
-		"restConfigLit":     `import "k8s.io/client-go/rest"; var c = &rest.Config{Host: "h"}`,
-		"restConfigAliased": `import k8srest "k8s.io/client-go/rest"; var c = k8srest.Config{}`,
-		"restConfigNew":     `import "k8s.io/client-go/rest"; var c = new(rest.Config)`,
-		"restConfigVar":     `import "k8s.io/client-go/rest"; func f() { var c rest.Config; _ = c }`,
-		"restConfigField":   `import "k8s.io/client-go/rest"; type T struct{ c rest.Config }`,
-		"restConfigType":    `import "k8s.io/client-go/rest"; type C rest.Config`,
-		"qps":               `func f(rc *x) { rc.QPS = 50 }`,
-		"burst":             `func f(rc *x) { rc.Burst = 100 }`,
-		"rateLimiter":       `func f(rc *x) { rc.RateLimiter = nil }`,
-		"qpsMulti":          `func f(rc *x) { rc.Host, rc.QPS = "h", 50 }`,
-		"qpsCompound":       `func f(rc *x) { rc.QPS += 6 }`,
-		"incQPS":            `func f(rc *x) { rc.QPS++ }`,
-		"decBurst":          `func f(rc *x) { rc.Burst-- }`,
-		"addrOfQPS":         `func f(rc *x) { p := &rc.QPS; *p = 5 }`,
-		"addrOfLimiter":     `func f(rc *x) { set(&rc.RateLimiter) }`,
-		"parenQPS":          `func f(rc *x) { (rc.QPS)++ }`,
+		// #920 — a limiter put back. (A rest.Config built from nothing is a
+		// typed case: typedShapeCases below.)
+		"qps":           `func f(rc *x) { rc.QPS = 50 }`,
+		"burst":         `func f(rc *x) { rc.Burst = 100 }`,
+		"rateLimiter":   `func f(rc *x) { rc.RateLimiter = nil }`,
+		"qpsMulti":      `func f(rc *x) { rc.Host, rc.QPS = "h", 50 }`,
+		"qpsCompound":   `func f(rc *x) { rc.QPS += 6 }`,
+		"incQPS":        `func f(rc *x) { rc.QPS++ }`,
+		"decBurst":      `func f(rc *x) { rc.Burst-- }`,
+		"addrOfQPS":     `func f(rc *x) { p := &rc.QPS; *p = 5 }`,
+		"addrOfLimiter": `func f(rc *x) { set(&rc.RateLimiter) }`,
+		"parenQPS":      `func f(rc *x) { (rc.QPS)++ }`,
 	}
 	for name, body := range cases {
 		fset := token.NewFileSet()
@@ -421,9 +410,9 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 	if got := scanFile(fset, f, "x.go"); len(got) != 0 {
 		t.Errorf("hardened literal flagged: %v", got)
 	}
-	// #920 — a *rest.Config from a third-party source is judged by TYPE
-	// (ratelimit_920_typed_guard_test.go): clientcmd.RESTConfigFromKubeConfig
-	// and every other function returning a rest.Config, called or taken as a
-	// value.
+	// #920 — a *rest.Config built from nothing is judged by TYPE
+	// (ratelimit_920_typed_guard_test.go): a rest.Config by value anywhere in
+	// a type expression or a generic type argument, &x of a *rest.Config, and
+	// any function outside the module that returns one.
 	typedShapeCases(t)
 }

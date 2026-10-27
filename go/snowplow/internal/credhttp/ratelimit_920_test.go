@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/flowcontrol"
 )
@@ -41,6 +42,21 @@ func limiters(t *testing.T, c any) map[string]flowcontrol.RateLimiter {
 	case *discovery.DiscoveryClient:
 		out["discovery"] = x.RESTClient().GetRateLimiter()
 		return out
+	}
+	// A typed API-group client (*corev1.CoreV1Client, ...) exposes its REST
+	// client. A clientset does too, through its embedded discovery client, but
+	// only a clientset has Discovery(); it is walked group by group below.
+	if g, ok := c.(interface{ RESTClient() rest.Interface }); ok {
+		if _, clientset := c.(interface {
+			Discovery() discovery.DiscoveryInterface
+		}); !clientset {
+			ri := g.RESTClient()
+			if ri == nil || reflect.ValueOf(ri).IsNil() {
+				t.Fatalf("limiters: %T has no REST client", c)
+			}
+			out["group"] = ri.GetRateLimiter()
+			return out
+		}
 	}
 	v := reflect.ValueOf(c)
 	if v.Kind() != reflect.Pointer || v.Elem().Kind() != reflect.Struct {
@@ -152,6 +168,30 @@ func TestIssue920_Control_InstrumentSeesClientGoDefaultLimiter(t *testing.T) {
 			} else if rl.QPS() != rest.DefaultQPS {
 				t.Errorf("control %s/%s: limiter QPS %v, want client-go's default %v", name, group, rl.QPS(), rest.DefaultQPS)
 			}
+		}
+	}
+}
+
+// The instrument reads a typed API-group client's limiter (the shape a future
+// credhttp builder such as CoreV1 would return): it sees client-go's default on
+// one built from a raw config, and none on one built from a credhttp config.
+func TestIssue920_InstrumentReadsTypedGroupClients(t *testing.T) {
+	raw, _ := rawInCluster()
+	ctrl, err := corev1client.NewForConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := limiters(t, ctrl)
+	if rl := got["group"]; len(got) != 1 || rl == nil || rl.QPS() != rest.DefaultQPS {
+		t.Errorf("control: typed-group client from a raw config read as %v; want one limiter at client-go's default %v", got, rest.DefaultQPS)
+	}
+	for src, rc := range configSources(t) {
+		c, err := corev1client.NewForConfig(rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rl := limiters(t, c)["group"]; rl != nil {
+			t.Errorf("typed-group client from %s: RED — limiter installed (QPS %v)", src, rl.QPS())
 		}
 	}
 }
