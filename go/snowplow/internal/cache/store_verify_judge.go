@@ -175,7 +175,7 @@ func (j judge) key(key string, read readState) verdict {
 		if err != nil {
 			return undecided()
 		}
-		if c >= 0 {
+		if c >= 0 && false { // MUTANT M1 (#923 F4): drop the store-ahead clause
 			// Newer (recreated after the read when the uid differs too);
 			// equal versions are the same state.
 			return verdict{outcome: outcomeStoreAhead}
