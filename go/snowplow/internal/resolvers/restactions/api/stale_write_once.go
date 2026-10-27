@@ -8,21 +8,28 @@
 // point (dispatchers.staleWritePoint) withdraws it and re-runs the WHOLE
 // request with D2 disabled: the write was sent a second time.
 //
-// THE RULE (generic, no caps or timers), at the one place a write leaves
-// snowplow (branch E; every other dispatch branch is GET-only):
+// THE RULE (generic, no caps or timers):
 //
+//	(0) a RESTAction that DECLARES a write stage is never served stale content
+//	    (#913 re-review). ResolveWithFailure marks the REQUEST's D2 sink from
+//	    the spec before any stage runs (NoteDeclaredWrite), and
+//	    staleServeEligible refuses every later read of the request. A top-level
+//	    write RESTAction is therefore never stale-derived at all; (a) and (b)
+//	    only ever apply to a write first seen inside a nested resolve
+//	    (a resolve:true item), after a read was already served stale.
 //	(a) a write is not sent from a pass that is already stale-derived: that
 //	    pass is withdrawn and re-run anyway (the refusal is a stage error, so
 //	    its Put declines), and the re-run — D2 disabled, every read fresh —
-//	    sends it once;
-//	(b) once a write is sent, the rest of the resolve is never served stale
-//	    (staleServeEligible), so it is never withdrawn and never re-run.
+//	    sends it once. Decided at the one place a write leaves snowplow
+//	    (branch E; every other dispatch branch is GET-only).
+//	(b) once a write is sent, no read of the request is served stale, so it is
+//	    never withdrawn and never re-run.
 //
-// Both are decided on the REQUEST's sink (cache.StaleServeSinkForWrite), a
-// nested resolve's write included, and atomically with the stale-serve note
-// (NoteIfNoWrite), so parallel nested items cannot interleave a stale read and
-// a write. A resolve with no D2 sink (background work, a dry run, the re-run
-// itself) is untouched: BeginWrite is nil-safe.
+// All are decided on the REQUEST's sink (cache.StaleServeSinkForWrite), a
+// nested resolve's write included, and (a)/(b) atomically with the
+// stale-serve note (NoteIfNoWrite), so parallel nested items cannot interleave
+// a stale read and a write. A resolve with no D2 sink (background work, a dry
+// run, the re-run itself) is untouched: every sink method is nil-safe.
 //
 // Rule (c): the answer of a stale-derived pass is withdrawn and re-run on the
 // ERROR path too (dispatchers: restactions.go, widgets.go). A held write turns

@@ -2,12 +2,13 @@
 
 // issue905_stale_error_rerun_test.go — #905 review B3, from the review's arm.
 //
-// The usual write RESTAction: its write stage keeps the default
-// continueOnError=false and its filter needs the write's output
-// (`.create | select(. != null)`). On a stale-derived first pass the write is
-// held (rule a), the filter yields no value, and restactions.Resolve returns
-// the held stage's failure (#709) — an ERROR, which used to be answered
-// directly (500) before the write point, so the write was never sent at all.
+// A RESTAction whose write sits in a nested resolve (a resolve:true item):
+// the write stage keeps the default continueOnError=false and the filter needs
+// its output (`.create | select(. != null)`). On a stale-derived first pass the
+// nested write is held (rule a), the filter yields no value, and
+// restactions.Resolve returns the held stage's failure (#709) — an ERROR, which
+// used to be answered directly (500) before the write point, so the write was
+// never sent at all.
 //
 //	W3  one customer request sends its POST exactly once and answers 200: the
 //	    error of the stale-derived pass is withdrawn and the request re-run
@@ -49,9 +50,18 @@ func (h *k547Harness) w905StrictSeam(up string) func(context.Context, restaction
 		found := &templates.API{Name: "found", Verb: ptr.To("GET"),
 			Path: "/apis/" + k547CompGVR.Group + "/" + k547CompGVR.Version + "/" + k547CompGVR.Resource}
 		create := &templates.API{Name: "create", Verb: ptr.To("POST"), Path: "/create",
-			Payload: ptr.To(`{"n":1}`), DependsOn: &templates.Dependency{Name: "found"}}
-		dict, failure := restactionsapi.ResolveWithFailure(rctx, restactionsapi.ResolveOptions{
-			RC: &rest.Config{Host: up}, Watcher: rw, Items: []*templates.API{found, create},
+			Payload: ptr.To(`{"n":1}`)}
+		// The RESTAction reads `found`; its write is in a NESTED resolve (a
+		// resolve:true item that re-scoped its L1 key) whose write stage keeps
+		// the default continueOnError=false — the shape the hold still applies
+		// to since #913 re-review (a top-level write RESTAction is never served
+		// stale).
+		_, _ = restactionsapi.ResolveWithFailure(rctx, restactionsapi.ResolveOptions{
+			RC: &rest.Config{Host: up}, Watcher: rw, Items: []*templates.API{found},
+			RESTActionNamespace: k547WNS, RESTActionName: k547RAName,
+		})
+		dict, failure := restactionsapi.ResolveWithFailure(cache.WithL1KeyContext(rctx, "w905-nested-cell"), restactionsapi.ResolveOptions{
+			RC: &rest.Config{Host: up}, Watcher: rw, Items: []*templates.API{create},
 			RESTActionNamespace: k547WNS, RESTActionName: k547RAName,
 		})
 		if dict["create"] == nil && failure != nil { // filter `.create | select(. != null)`: no value

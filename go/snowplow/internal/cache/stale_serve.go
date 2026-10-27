@@ -52,10 +52,18 @@ type StaleServeSink struct {
 	state           staleSinkState
 	replaceOnCommit bool
 	servedAt        time.Time
-	// wrote (#905): a write stage of this resolve was sent. From then on the
-	// resolve is never served stale (staleServeEligible), so it can never be
-	// withdrawn and re-run, which would send the write a second time.
+	// wrote (#905): a write stage of this resolve was sent. From then on no read
+	// of it is served stale (NoteIfNoWrite refuses, under the lock BeginWrite
+	// takes), so it can never be withdrawn and re-run, which would send the
+	// write a second time.
 	wrote bool
+	// declaredWrite (#905, #913 re-review): a RESTAction resolved for this
+	// request DECLARES a write stage. It is known from the spec before any stage
+	// runs, so the request is never served stale from then on: a top-level
+	// write RESTAction is never stale-derived at all, and the hold / withdraw /
+	// re-run machinery only ever applies to a write first seen inside a nested
+	// resolve, after a read was already served stale.
+	declaredWrite bool
 }
 
 type staleServedRef struct {
@@ -227,9 +235,11 @@ func (s *StaleServeSink) StaleDerived() bool {
 // by the re-run. BeginWrite therefore answers:
 //   - false when the resolve is already stale-derived: the write must not be
 //     sent from this pass (its re-run, with D2 disabled, sends it once);
-//   - true otherwise, and records that a write was sent, which ends D2 for the
-//     rest of this resolve (WriteSent): it is never served stale afterwards, so
-//     it is never re-run.
+//   - true otherwise, and records that a write was sent: a parallel read that
+//     reaches serveStaleWithDebt afterwards is refused (NoteIfNoWrite), so the
+//     request is never served stale after its write and never re-run. (A read
+//     that STARTS after the write never gets that far: the RESTAction that
+//     sent it marked the sink DeclaredWrite before its first stage.)
 //
 // Nil-safe: no sink (no D2 for this resolve) → true.
 func (s *StaleServeSink) BeginWrite() bool {
@@ -245,15 +255,26 @@ func (s *StaleServeSink) BeginWrite() bool {
 	return true
 }
 
-// WriteSent reports whether a write stage of this resolve was sent (#905).
-// Nil-safe.
-func (s *StaleServeSink) WriteSent() bool {
+// NoteDeclaredWrite records that a RESTAction resolved for this request
+// declares a write stage (see declaredWrite). Nil-safe.
+func (s *StaleServeSink) NoteDeclaredWrite() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.declaredWrite = true
+	s.mu.Unlock()
+}
+
+// DeclaredWrite reports whether a RESTAction resolved for this request declares
+// a write stage (NoteDeclaredWrite). Nil-safe.
+func (s *StaleServeSink) DeclaredWrite() bool {
 	if s == nil {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.wrote
+	return s.declaredWrite
 }
 
 // NoteServedAt records the first stale serve's time (the stale_to_push

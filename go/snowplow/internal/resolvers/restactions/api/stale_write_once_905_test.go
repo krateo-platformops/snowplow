@@ -2,7 +2,7 @@ package api
 
 // stale_write_once_905_test.go — #905 review F5 at the D2 decision site.
 //
-// staleServeEligible's WriteSent check is only the fast path: a write of the
+// staleServeEligible's DeclaredWrite check is only the fast path: a write of the
 // same request can begin AFTER it (a parallel nested resolve:true item), so
 // serveStaleWithDebt itself must refuse the stale serve under the sink's lock
 // (NoteIfNoWrite). The cache package pins the primitive

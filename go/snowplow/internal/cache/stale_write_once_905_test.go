@@ -34,8 +34,8 @@ func TestIssue905_A1_NoteAndWriteAreExclusive(t *testing.T) {
 	if w.NoteIfNoWrite("c1") {
 		t.Fatal("a stale serve after a sent write must be refused (read through)")
 	}
-	if !w.WriteSent() || w.StaleDerived() {
-		t.Fatalf("after a write: WriteSent=%v StaleDerived=%v", w.WriteSent(), w.StaleDerived())
+	if w.StaleDerived() {
+		t.Fatal("after a write: the sink must not be stale-derived")
 	}
 	var nilSink *StaleServeSink
 	if !nilSink.BeginWrite() || !nilSink.NoteIfNoWrite("c") {

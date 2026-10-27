@@ -2084,6 +2084,15 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	}
 	log.Debug("created api map", slog.Int("total", len(apiMap)))
 
+	// #905 (#913 re-review) — a RESTAction that DECLARES a write stage is never
+	// served stale content: mark the REQUEST's D2 sink (a nested resolve's
+	// write included) before any stage runs, so staleServeEligible refuses every
+	// later read of the request. The hold / withdraw / re-run machinery then
+	// only applies to a write first seen inside a nested resolve.
+	if declaredWriteStage(opts.Items) != "" {
+		cache.StaleServeSinkForWrite(ctx).NoteDeclaredWrite()
+	}
+
 	// Build the per-call resolve-invariant state (P2 mapper / P3 dict / P4
 	// gate+sinks). The per-stage loop below reads these via r.*; the
 	// per-stage mutable primitives stay loop-local (see the resolveRun

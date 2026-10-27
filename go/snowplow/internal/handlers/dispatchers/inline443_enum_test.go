@@ -209,12 +209,13 @@ var cacheAllow443 = map[string]cacheClass443{
 	// re-resolve / evict run only for a debt that check let open.
 	"StaleServeSinkFromContext": readOnly443, "StaleServeSink.L1Key": readOnly443,
 	"StaleServeSink.ServedAt": readOnly443, "KnownStaleMark": readOnly443,
-	// #905 — BeginWrite sets a flag on the request's own sink, WriteSent reads
-	// it: request-scoped, nothing outlives the request (an inert resolve has no
+	// #905 — BeginWrite and NoteDeclaredWrite set flags on the request's own sink, DeclaredWrite reads
+	// them: request-scoped, nothing outlives the request (an inert resolve has no
 	// sink, and the nil sink answers without state).
-	"StaleServeSink.BeginWrite": readOnly443, "StaleServeSink.WriteSent": readOnly443,
-	"StaleServeSinkForWrite": readOnly443,
-	"HasRefreshSubscriber": readOnly443, "StaleOwedStatsSnapshot": readOnly443,
+	"StaleServeSink.BeginWrite": readOnly443, "StaleServeSink.DeclaredWrite": readOnly443,
+	"StaleServeSink.NoteDeclaredWrite": readOnly443,
+	"StaleServeSinkForWrite":           readOnly443,
+	"HasRefreshSubscriber":             readOnly443, "StaleOwedStatsSnapshot": readOnly443,
 	// #710 PR-2b — the customer-triggered-refresh marker: a ctx value (set by the debt
 	// lane on its own detached ctx, read by the two admission classifiers).
 	"CustomerTriggeredRefreshFromContext": readOnly443, "WithCustomerTriggeredRefresh": readOnly443,

@@ -6,17 +6,30 @@
 // The #710 D2 harness: the shared `found` content cell is KNOWN-STALE, and a
 // customer GET /call of the RESTAction goes through the REAL restActionHandler
 // (D2 sink, write point, withdraw + re-run). The RESTAction resolve seam runs
-// the real api resolver over the `found` stage AND a POST stage to a counting
+// the real api resolver over the `found` stage and a POST stage to a counting
 // upstream; the test owns the count.
 //
-//   W1  read then write: the first pass is served `found` stale, so its write
-//       is held (rule a); the pass is withdrawn and the fresh re-run sends the
-//       POST — exactly once. PRE: one stale decision, one withdrawal.
-//       Mutation → RED: BeginWrite never refuses (2 POSTs).
-//   W2  write then read: the POST is sent first, so the later `found` read is
-//       never served stale (rule b) and the request is never re-run — exactly
-//       one POST, zero stale decisions.
-//       Mutation → RED: staleServeEligible ignores WriteSent (2 POSTs).
+// #913 re-review: a RESTAction that DECLARES a write is never served stale
+// (the declared-write mark on the request's D2 sink, set before any stage
+// runs). So the hold (rule a) and the write-then-read rule (b) apply only to a
+// write first seen inside a NESTED resolve (a resolve:true item filling its own
+// cell), which is the shape W1 and W2 drive; W5 is the top-level case.
+//
+//	W1  read then nested write: the first pass is served `found` stale, so the
+//	    nested write is held (rule a); the pass is withdrawn and the fresh
+//	    re-run sends the POST — exactly once. PRE: one stale decision, one
+//	    withdrawal.
+//	    Mutation → RED: BeginWrite never refuses (2 POSTs).
+//	W2  nested write then read: the POST is sent first, so the later `found`
+//	    read is never served stale (rule b) and the request is never re-run —
+//	    exactly one POST, zero stale decisions.
+//	    Mutation → RED: staleServeEligible ignores DeclaredWrite AND NoteIfNoWrite
+//	    ignores a sent write (2 POSTs); either check alone holds it.
+//	W5  a RESTAction that declares the write itself: `found` is never served
+//	    stale (0 stale decisions, no withdrawal), the POST is sent once, and
+//	    the answer is the fresh v1.
+//	    Mutation → RED: staleServeEligible ignores DeclaredWrite (a stale
+//	    decision and a withdrawal).
 package dispatchers
 
 import (
@@ -39,9 +52,19 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+// w905Shape is where the POST stage sits relative to the `found` read.
+type w905Shape int
+
+const (
+	w905NestedAfter  w905Shape = iota // found, then a nested resolve that POSTs
+	w905NestedBefore                  // a nested resolve that POSTs, then found
+	w905TopLevel                      // one RESTAction: found, then its own POST
+)
+
 // w905Seam is the RESTAction resolve seam: the `found` stage through the real
-// api-stage resolver, plus a POST to up (before or after it).
-func (h *k547Harness) w905Seam(up string, writeFirst bool) func(context.Context, restactions.ResolveOptions) (*templates.RESTAction, error) {
+// api-stage resolver, plus a POST to up — in a nested resolve (one that
+// re-scoped its L1 key, as a resolve:true item does) or in the RESTAction itself.
+func (h *k547Harness) w905Seam(up string, shape w905Shape) func(context.Context, restactions.ResolveOptions) (*templates.RESTAction, error) {
 	return func(ctx context.Context, opts restactions.ResolveOptions) (*templates.RESTAction, error) {
 		name, _ := opts.Extras["name"].(string)
 		ns, _ := opts.Extras["namespace"].(string)
@@ -54,18 +77,25 @@ func (h *k547Harness) w905Seam(up string, writeFirst bool) func(context.Context,
 			Path: "/apis/" + k547CompGVR.Group + "/" + k547CompGVR.Version + "/" + k547CompGVR.Resource}
 		create := &templates.API{Name: "create", Verb: ptr.To("POST"), Path: "/create",
 			Payload: ptr.To(`{"n":1}`), ContinueOnError: ptr.To(true), ErrorKey: ptr.To("createErr")}
-		items := []*templates.API{found, create}
-		if writeFirst {
-			create.DependsOn = nil
-			found.DependsOn = &templates.Dependency{Name: "create"}
-			items = []*templates.API{create, found}
-		} else {
-			create.DependsOn = &templates.Dependency{Name: "found"}
+		resolve := func(c context.Context, items ...*templates.API) map[string]any {
+			return restactionsapi.Resolve(c, restactionsapi.ResolveOptions{
+				RC: &rest.Config{Host: up}, Watcher: rw, Items: items,
+				RESTActionNamespace: k547WNS, RESTActionName: k547RAName,
+			})
 		}
-		dict := restactionsapi.Resolve(rctx, restactionsapi.ResolveOptions{
-			RC: &rest.Config{Host: up}, Watcher: rw, Items: items,
-			RESTActionNamespace: k547WNS, RESTActionName: k547RAName,
-		})
+		nested := func() { resolve(cache.WithL1KeyContext(rctx, "w905-nested-cell"), create) }
+		var dict map[string]any
+		switch shape {
+		case w905NestedAfter:
+			dict = resolve(rctx, found)
+			nested()
+		case w905NestedBefore:
+			nested()
+			dict = resolve(rctx, found)
+		default:
+			create.DependsOn = &templates.Dependency{Name: "found"}
+			dict = resolve(rctx, found, create)
+		}
 		var conds []any
 		if v, ok := dict["found"].(map[string]any); ok {
 			list, _ := v["items"].([]any)
@@ -101,11 +131,11 @@ func w905Upstream(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	return srv, &posts
 }
 
-func TestIssue905_W1_ReadThenWrite_StalePassHoldsTheWrite_SentOnce(t *testing.T) {
+func TestIssue905_W1_ReadThenNestedWrite_StalePassHoldsTheWrite_SentOnce(t *testing.T) {
 	t.Setenv("CLIENT_MAX_RETRIES", "0")
 	h, _ := k710KnownStaleFound(t)
 	up, posts := w905Upstream(t)
-	t.Cleanup(setRestactionsResolveForTest(h.w905Seam(up.URL, false)))
+	t.Cleanup(setRestactionsResolveForTest(h.w905Seam(up.URL, w905NestedAfter)))
 	s0 := restactionsapi.StaleServeStatsSnapshot()
 
 	r, code := h.getRA(0, k547Changed)
@@ -123,11 +153,11 @@ func TestIssue905_W1_ReadThenWrite_StalePassHoldsTheWrite_SentOnce(t *testing.T)
 	}
 }
 
-func TestIssue905_W2_WriteThenRead_NeverServedStaleAfterTheWrite_SentOnce(t *testing.T) {
+func TestIssue905_W2_NestedWriteThenRead_NeverServedStaleAfterTheWrite_SentOnce(t *testing.T) {
 	t.Setenv("CLIENT_MAX_RETRIES", "0")
 	h, _ := k710KnownStaleFound(t)
 	up, posts := w905Upstream(t)
-	t.Cleanup(setRestactionsResolveForTest(h.w905Seam(up.URL, true)))
+	t.Cleanup(setRestactionsResolveForTest(h.w905Seam(up.URL, w905NestedBefore)))
 	s0 := restactionsapi.StaleServeStatsSnapshot()
 
 	r, code := h.getRA(0, k547Changed)
@@ -142,5 +172,27 @@ func TestIssue905_W2_WriteThenRead_NeverServedStaleAfterTheWrite_SentOnce(t *tes
 	}
 	if code != http.StatusOK || r != "v1" {
 		t.Fatalf("served %q (code %d), want the fresh v1 (the read after the write read through)", r, code)
+	}
+}
+
+func TestIssue905_W5_ADeclaredWriteRAIsNeverServedStale_SentOnce(t *testing.T) {
+	t.Setenv("CLIENT_MAX_RETRIES", "0")
+	h, _ := k710KnownStaleFound(t)
+	up, posts := w905Upstream(t)
+	t.Cleanup(setRestactionsResolveForTest(h.w905Seam(up.URL, w905TopLevel)))
+	s0 := restactionsapi.StaleServeStatsSnapshot()
+
+	r, code := h.getRA(0, k547Changed)
+
+	st := restactionsapi.StaleServeStatsSnapshot()
+	if d, w := st.ServeTotal-s0.ServeTotal, st.WithdrawnUnarmable-s0.WithdrawnUnarmable; d != 0 || w != 0 {
+		t.Fatalf("#913 RED: a RESTAction that declares a write was served stale content (%d stale decision(s), %d withdrawal(s)) "+
+			"— it must read through before any stage runs", d, w)
+	}
+	if n := posts.Load(); n != 1 {
+		t.Fatalf("one customer request sent its POST %d time(s), want exactly 1", n)
+	}
+	if code != http.StatusOK || r != "v1" {
+		t.Fatalf("served %q (code %d), want the fresh v1 (the read read through)", r, code)
 	}
 }
