@@ -729,8 +729,8 @@ def test_a_churn_failure_without_an_http_status_is_recorded(mutate, error):
     time.sleep(0.2)
     rec = d.stop()
     assert rec["failed"] == rec["issued"] == len(seen) >= 1
-    # t is rounded to the millisecond: within half a millisecond of the clock read before the start
-    assert all(f["status"] is None and f["error"] == error and t0 - 0.0005 <= f["t"] <= time.time() for f in seen)
+    # t is rounded to the millisecond (the record's own resolution): within one of the clock read before
+    assert all(f["status"] is None and f["error"] == error and t0 - 0.001 <= f["t"] <= time.time() for f in seen), (t0, seen)
 
 
 def test_a_failed_probe_write_carries_its_status_too():
