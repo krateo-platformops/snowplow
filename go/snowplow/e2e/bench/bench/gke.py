@@ -610,25 +610,11 @@ spec:
 
 
 # gcloud's error text names the operator's account ("This command is
-# authenticated as <account> which is the active account ...", in its 404 and
-# 503 answers), and kubectl's can name a user ("User \"…\" cannot …"). None of
-# it may reach a log, a record or verdict.json (#900 review): only the code.
-_ERR_CODE = re.compile(r"\bcode=(\d{3})\b")
-_ERR_REASON = re.compile(r"Error from server \(([A-Za-z]+)\)")
-
-
-def error_summary(stderr: str | None) -> str:
-    """What of a failed gcloud / kubectl call's stderr may be kept or logged:
-    `ResponseError: code=<n>` (gcloud), `Error from server (<Reason>)`
-    (kubectl), else nothing of its text."""
-    s = stderr or ""
-    m = _ERR_CODE.search(s)
-    if m:
-        return f"ResponseError: code={m.group(1)}"
-    m = _ERR_REASON.search(s)
-    if m:
-        return f"Error from server ({m.group(1)})"
-    return "no error code; the error text is withheld (it may name the account)" if s.strip() else "no error text"
+# authenticated as <account> …", in its 404 and 503 answers), and kubectl's
+# can name a user ("User \"…\" cannot …"). None of it may reach a log, a
+# record or verdict.json (#900 review): only the code — bench.identity, the
+# bench's one identity redaction (run606.sh's kerr_line uses it too).
+from bench.identity import error_summary  # noqa: E402,F401  (imports nothing from bench)
 
 
 def execute(argv: list[str], *, dry_run: bool, env: dict | None = None,
@@ -1378,7 +1364,8 @@ def main(argv: list[str] | None = None) -> int:
     guards (bench name prefix, forbidden names, label check), so the ambient
     context must neither block them nor be consulted by them. The first
     shakedown attempt (2026-10-14) died at gke-reap on exactly that guard.
-    This module imports nothing from bench.
+    This module imports nothing from bench but bench.identity, which imports
+    nothing at all (and bench/__init__ imports nothing).
     """
     import argparse
     p = argparse.ArgumentParser(prog="python -m bench.gke")

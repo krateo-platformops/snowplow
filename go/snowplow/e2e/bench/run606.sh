@@ -694,17 +694,20 @@ kwait() {
 api_answers() { "${K[@]}" --request-timeout=30s get --raw=/readyz >/dev/null 2>&1; }
 KERR="$OUT/.kubectl-last-error"
 # kerr_line: kubectl's first error line, for the log and collect's record —
-# with every identity redacted first (a GKE Forbidden names the operator's
-# account; never logged, never recorded): 'User "…"', 'users "…"', whatever
-# follows "authenticated as" (an e-mail, a numeric id,
-# system:serviceaccount:…), and any e-mail address. A closing ")" or ","
-# stays.
+# every identity redacted first by bench/identity.py, the bench's ONE identity
+# redaction (bench.gke's error summary uses it too): 'User "…"', 'users "…"',
+# whatever follows "authenticated as" (an e-mail, a numeric id,
+# system:serviceaccount:…), any e-mail address. A redactor that does not run
+# withholds the line: it is never logged unredacted.
 kerr_line() {
-  head -1 "$KERR" 2>/dev/null \
-    | sed -E 's/User "[^"]*"/User "<redacted>"/g; s/users "[^"]*"/users "<redacted>"/g;
-              s/authenticated as:? [^)[:space:],]+/authenticated as <redacted>/g;
-              s/[^[:space:]"'"'"'(),]+@[^[:space:]"'"'"'(),]+/<redacted>/g' \
-    | cut -c1-300
+  local line out
+  line="$(head -1 "$KERR" 2>/dev/null)" || true
+  [[ -n "$line" ]] || return 0
+  if out="$(printf '%s\n' "$line" | python3 "${HERE:-.}/bench/identity.py" 2>/dev/null)"; then
+    printf '%s\n' "${out:0:300}"
+  else
+    echo "<kubectl's error withheld: the identity redactor did not run>"
+  fi
 }
 # local_error: kubectl failed BEFORE reaching any API server — its own
 # client-side configuration: an unknown flag or command, a kubeconfig that
