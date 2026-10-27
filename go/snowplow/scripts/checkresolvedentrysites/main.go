@@ -132,6 +132,26 @@ func main() {
 		return
 	}
 
+	// Site-class 4 only, over one explicit root (the gate's own discrimination
+	// fixture: `-verdict-only ./testdata/verdict`).
+	if os.Args[1] == "-verdict-only" {
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: checkresolvedentrysites -verdict-only <root>")
+			os.Exit(2)
+		}
+		findings, sites, err := checkVerdictTree(os.Args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: verdict: %v\n", err)
+			os.Exit(2)
+		}
+		if len(findings) > 0 {
+			reportVerdictFindings(findings)
+			os.Exit(1)
+		}
+		fmt.Printf("OK: %d ResolvedEntry Put site(s) read the shared Put-gate verdict or name where it is taken.\n", sites)
+		return
+	}
+
 	fset := token.NewFileSet()
 	var entryFindings []entryFinding
 	var scanned, entrySites, bootScopeStamps int
@@ -254,8 +274,31 @@ func main() {
 		}
 	}
 
+	// Site-class 4 (#912 re-review): every Put site reads the shared Put-gate
+	// verdict. Runs when a scanned root is the production `internal` tree.
+	verdictSites, verdictScoped := 0, false
+	for _, root := range os.Args[1:] {
+		if filepath.Base(filepath.Clean(root)) != "internal" {
+			continue
+		}
+		verdictScoped = true
+		findings, sites, err := checkVerdictTree(root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: verdict: %v\n", err)
+			os.Exit(2)
+		}
+		verdictSites += sites
+		if len(findings) > 0 {
+			failed = true
+			reportVerdictFindings(findings)
+		}
+	}
+
 	if failed {
 		os.Exit(1)
+	}
+	if verdictScoped {
+		fmt.Printf("OK: %d ResolvedEntry Put site(s) read the shared Put-gate verdict or name where it is taken.\n", verdictSites)
 	}
 
 	fmt.Printf("OK: %d ResolvedEntry Put site(s) all set %s or carry a waiver; %d boot-scope stamp site(s) (floor %d); %d files scanned.\n",

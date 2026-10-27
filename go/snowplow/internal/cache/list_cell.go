@@ -1417,6 +1417,7 @@ func NewListCellEntry(c *ListCell, inputs *ResolvedKeyInputs) *ResolvedEntry {
 	if g := c.gen.Load(); g != nil {
 		asOf = g.asOf
 	}
+	// put-verdict: not a resolve output — a GET-only apiserver LIST content cell (no RESTAction stage, write or external endpoint can reach it).
 	// uaf-scope-waiver: PRE-refilter substrate, the same apistage content cell apistage.go stores (identity-free by key, narrowed only downstream on the way to the requester); never holds refilter output.
 	// scope-waiver:TTLOverride: apistage identity-free content substrate, stored only while its GVR is servable (an anchor requires it) — the CATALOG_UNSERVABLE TTLOverride never applies; NOT the UAF-cap class (uaf_shortttl.go R-d-4 SITE MAP).
 	e := &ResolvedEntry{Inputs: inputs, listCell: c, ContentAsOf: asOf, ItemsAPIVersion: c.apiVersion, ItemsKind: c.kind}

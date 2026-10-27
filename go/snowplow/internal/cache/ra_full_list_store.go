@@ -62,6 +62,7 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 	}
 	pin := int64(len(encoded)) >= raFullListPinBytesThreshold()
 	in := inputs // copy onto the heap for the entry
+	// put-verdict: taken by the sole caller apiref.raFullListServe over the full list's own sinks (raFullListPermanentDecline, raFullListStageDecline).
 	// #592 — BOTH PRIOR WAIVERS HERE WERE WITHDRAWN, because both rested on the
 	// raFullListServe bypass that #592 removed. They read "UNREACHABLE for a
 	// refilter-narrowed body ... the only caller bypasses this whole layer for a
@@ -147,6 +148,7 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, key string,
 	}
 	pin := int64(len(encoded)) >= raFullListPinBytesThreshold()
 	in := inputs // copy onto the heap for the entry
+	// put-verdict: taken by the sole caller apiref.raFullListServe over the full list's own sinks (raFullListPermanentDecline, raFullListStageDecline).
 	// #592 — twin of PutRAFullList above: both prior waivers withdrawn, same
 	// reason (they cited the removed bypass), same cap from the same single
 	// derivation. The #323 generation guard is orthogonal to the UAF scope — it
