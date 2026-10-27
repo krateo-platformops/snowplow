@@ -74,7 +74,7 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "dropped_iterations", "clicks", "arrivals",
          # the browser's completed requests: the pair's customer witness reads them
          "browser_http_req_duration", "browser_http_req_failed",
-         "browser_call_ms", "browser_request_incomplete_ms")
+         "browser_call_ms", "browser_request_incomplete_ms", "browser_request_failed_start_unseen")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # the points whose time is kept too (out["times"], index-aligned with
 # out["points"]): run 12 compares latency inside / outside the CPU profiles;
@@ -83,7 +83,7 @@ _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # inside the time both runs' snowplow was Ready
 _TIMED = ("page_load_ms", "browser_page_load_ms", "http_req_duration", "http_req_failed", "clicks",
           "arrivals", "browser_http_req_duration", "browser_http_req_failed", "browser_call_ms",
-          "browser_request_incomplete_ms")
+          "browser_request_incomplete_ms", "browser_request_failed_start_unseen")
 _RFC3339 = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
 
 
@@ -552,31 +552,38 @@ def browser_report(o: dict | None) -> dict | None:
             "timeouts": sum(v for v, _ in p.get("browser_page_timeouts", [])),
             "widget_states": dict(states),
             "calls_report_only": calls_report(p.get("browser_call_ms", [])),
-            "incomplete_requests_report_only": incomplete_report(p.get("browser_request_incomplete_ms", [])),
+            "incomplete_requests_report_only": incomplete_report(p.get("browser_request_incomplete_ms", []),
+                                                                 p.get("browser_request_failed_start_unseen", [])),
             "cpu": cpu_stats((o.get("cpu") or {}).get("browser"))}
 
 
 CALL_KEY = ("call_resource", "call_namespace", "call_name")
 
 
-def incomplete_report(points: list) -> dict:
+def incomplete_report(points: list, unseen: list | None = None) -> dict:
     """#919 (N7): the browser requests that failed at network level or never
     completed (browser.js browser_request_incomplete_ms; k6 itself emits
-    nothing for them): how many, by outcome / request kind / error, and per
-    /call; each one's ms ran from its start to its failure or the session's
-    end. A browser stream without the metric says so: missing, not zero."""
+    nothing for them): how many, by outcome / request kind / answered / error,
+    and per /call; each one's ms ran from its start to its failure or the
+    session's end. Failed requests whose start was never seen have no
+    duration: counted apart (start_unseen). A browser stream without the
+    metric says so: missing, not zero."""
     if not points:
         return {"status": "absent", "note": "no browser_request_incomplete_ms point: MISSING (browser.js "
                                             "before #919, or no session ran), not zero — every session "
                                             "ends with its live streams still open"}
     kinds: dict[str, int] = defaultdict(int)
     for _, t in points:
-        kinds[f"{t.get('outcome')} {t.get('request')} {t.get('error') or '-'}"] += 1
+        kinds[f"{t.get('outcome')} {t.get('request')} answered={t.get('answered')} {t.get('error') or '-'}"] += 1
+    gone: dict[str, int] = defaultdict(int)
+    for v, t in unseen or []:
+        gone[f"{t.get('request')} {t.get('error') or '-'}"] += int(v or 0)
     return {"status": "present", "requests": len(points),
             "by_outcome": {o: sum(1 for _, t in points if t.get("outcome") == o)
                            for o in sorted({t.get("outcome") for _, t in points})},
-            "by_outcome_request_error": dict(sorted(kinds.items())),
-            "calls": _by([pt for pt in points if pt[1].get("request") == "call"], "outcome", *CALL_KEY)}
+            "by_outcome_request_answered_error": dict(sorted(kinds.items())),
+            "calls": _by([pt for pt in points if pt[1].get("request") == "call"], "outcome", *CALL_KEY),
+            "failed_start_unseen": dict(sorted(gone.items()))}
 
 
 def calls_report(points: list) -> dict:

@@ -105,10 +105,10 @@ Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
     and no longer voids the pair;
   - the customer witness reads ALL of B's customer streams it can: k6load
     and the browser's completed requests (browser_http_req_duration /
-    _failed, flight = response time - duration). Still missing (#919):
-    browser requests that failed at the network level or never completed
-    (k6's browser module emits no duration for them; run 16 B: 99,504
-    browser_data_sent against 94,497 durations).
+    _failed, flight = response time - duration), and the browser requests k6
+    never times (#919 N7: failed at the network level, or never answered by
+    the session's end — browser.js's ledger, browser_incomplete; run 16 B:
+    99,504 browser_data_sent against 94,497 durations), every one not served.
 """
 
 from __future__ import annotations
@@ -654,7 +654,7 @@ def browser_request_spans(o: dict | None) -> list[tuple[float, float, bool, floa
     when the response has timing; a duration with no failed point at its
     time had no timed response: not served. Requests that failed at the
     network level or never completed push neither (onLoadingFailed): they
-    are missing here — #919 adds them as another source."""
+    are not here: browser_incomplete_spans is their source (#919 N7)."""
     if not o:
         return []
     failed: dict[float, list[bool]] = {}
@@ -669,6 +669,35 @@ def browser_request_spans(o: dict | None) -> list[tuple[float, float, bool, floa
             continue
         f = failed[t].pop() if failed.get(t) else True
         out.append((t - v / 1000.0, t, f, v))
+    return out
+
+
+def browser_incomplete_spans(o: dict | None) -> list[tuple[float, float, bool, float | None]]:
+    """The browser's requests k6 never times (#919 N7, browser.js's ledger),
+    as (start, end, not served, ms) — every one NOT SERVED:
+      failed            browser_request_incomplete_ms outcome=failed: its
+                        flight is the point's time minus its value to the
+                        point's time (the failure);
+      never completed,  outcome=never_completed answered=no: no answer at all
+      unanswered        by the session's end (the point's time);
+      start unseen      browser_request_failed_start_unseen: a failure at the
+                        point's time, its start not known (an instant).
+    A never-completed request that WAS answered (its response headers came:
+    a live stream, /refreshes or /notifications, open by design) is served
+    and is not a witness of anything here."""
+    if not o:
+        return []
+    out = []
+    for (v, tg), t in zip(o["points"].get("browser_request_incomplete_ms", []),
+                          (o.get("times") or {}).get("browser_request_incomplete_ms") or []):
+        if t is None or v is None:
+            continue
+        if tg.get("outcome") == "failed" or (tg.get("outcome") == "never_completed" and tg.get("answered") == "no"):
+            out.append((t - v / 1000.0, t, True, v))
+    for (_, _), t in zip(o["points"].get("browser_request_failed_start_unseen", []),
+                         (o.get("times") or {}).get("browser_request_failed_start_unseen") or []):
+        if t is not None:
+            out.append((t, t, True, None))
     return out
 
 
@@ -730,8 +759,8 @@ def judge_stretch(parts: list[tuple[float, float]], customers: dict[str, list | 
       served    within it;
       none      not one request in flight;
       unpaired  a stream's points do not pair up: no witness can be read.
-    Shaped for more sources: a stream is one more key (#919 adds the
-    browser's network-failed and never-completed requests)."""
+    Each stream is one key: k6load, browser (completed requests) and
+    browser_incomplete (failed at network level / never answered, #919 N7)."""
     if any(sp is None for sp in customers.values()):
         bad = sorted(k for k, sp in customers.items() if sp is None)
         return {"verdict": "unpaired", "k6": {"unpaired": bad}}
@@ -950,7 +979,8 @@ def raw_from_dir(d: str) -> dict:
     o = k6eval.read_k6_out(os.path.join(d, "k6"), "k6")
     ob = k6eval.read_k6_out(os.path.join(d, "browser"), "browser")
     return {"calls": calls(o), "requests": requests(o),
-            "customers": {"k6load": request_spans(o), "browser": browser_request_spans(ob)}}
+            "customers": {"k6load": request_spans(o), "browser": browser_request_spans(ob),
+                          "browser_incomplete": browser_incomplete_spans(ob)}}
 
 
 def _rate(reqs, ex) -> dict:
@@ -1067,11 +1097,11 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
         # (FAIL); served -> jointly-Ready time (its calls judged, its errors
         # counted), a NOTE; not one request in flight -> no witness (void),
         # except readyz's no reply, where both witnesses then say B was not
-        # serving (FAIL). B's customers: k6load, and the browser's COMPLETED
-        # requests. Still missing (#919 adds them as one more source): browser
-        # requests that failed at the network level or never completed — k6's
-        # browser module emits no duration for them (run 16 B: 99,504
-        # browser_data_sent against 94,497 durations, about 5,000 unseen).
+        # serving (FAIL). B's customers: k6load, the browser's COMPLETED
+        # requests, and (#919 N7) the browser's requests that failed at the
+        # network level or were never answered — k6's browser module emits no
+        # duration for them (run 16 B: 99,504 browser_data_sent against 94,497
+        # durations); browser.js's ledger does, and each is not served.
         # Run 16's B outage, by this definition: 10,035 k6load requests in
         # flight in its 63 s window, 48 failed (0.48 %) — plus the browser's.
         th = k6eval.K6_THRESHOLDS["max_k6_error_rate"]

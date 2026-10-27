@@ -161,19 +161,25 @@ export function requestTags (url, resourceType) {
 // emits no duration and no failed point for a request that failed at network
 // level (network_manager.go emitResponseMetrics runs on a response only; run
 // 16 B: 99,504 browser_data_sent vs 94,497 durations), so browser.js keeps
-// this ledger from the page's own events — request, requestfinished,
-// requestfailed — and emits one browser_request_incomplete_ms point for each
-// request that FAILED (refused, reset, timed out, aborted: Chrome's
-// errorText) or NEVER COMPLETED by the end of the session (an open stream, a
-// hung call). Value: ms from the request's start to its failure, or to the
-// session's end. Point time: when it was emitted — the failure, or the
-// session's end — so the request STARTED at the point's time minus its value.
-// Tags: requestTags, outcome (failed | never_completed), error.
+// this ledger from the page's own events — request, response,
+// requestfinished, requestfailed — and emits one browser_request_incomplete_ms
+// point for each request that FAILED (refused, reset, timed out, aborted —
+// the page's own cancel included: Chrome's errorText says which) or NEVER
+// COMPLETED by the end of the session. Value: ms from the request's start to
+// its failure, or to the session's end. Point time: when it was emitted — the
+// failure, or the session's end — so the request STARTED at the point's time
+// minus its value. Tags: requestTags, outcome (failed | never_completed),
+// error, answered ("yes" when its response headers had arrived: a live
+// stream still open is a never_completed request that WAS answered; "no": no
+// answer at all).
+// A failed request whose start the ledger never saw has no duration: it is a
+// browser_request_failed_start_unseen count (1, the same tags), never a
+// made-up 0 ms.
 // k6 hands a new Request object to each event, so a request is matched by
 // method + URL, oldest start first: the counts are exact; two identical
 // requests (same method and URL) in flight at once may swap durations.
 export function requestLedger () {
-  const open = new Map()                  // method + URL -> [{t0, type}], oldest first
+  const open = new Map()                  // method + URL -> [{t0, type, answered}], oldest first
   const key = (method, url) => `${method} ${url}`
   const take = (k) => {
     const q = open.get(k)
@@ -181,23 +187,32 @@ export function requestLedger () {
     if (q && !q.length) open.delete(k)
     return e
   }
+  const tags = (url, type, outcome, error, answered) =>
+    Object.assign(requestTags(url, type), { outcome, error, answered: answered ? 'yes' : 'no' })
   let ended = false                       // the session's end: unfinished() reported the rest
   return {
     started (method, url, t, resourceType) {
       if (ended) return
       const k = key(method, url)
       if (!open.has(k)) open.set(k, [])
-      open.get(k).push({ t0: t, type: resourceType })
+      open.get(k).push({ t0: t, type: resourceType, answered: false })
+    },
+    // its response headers arrived (the oldest such request not yet answered)
+    responded (method, url) {
+      const e = (open.get(key(method, url)) || []).find((x) => !x.answered)
+      if (e) e.answered = true
     },
     finished (method, url) { take(key(method, url)) },
-    // the point for a failed request (one whose start was never seen ran 0
-    // ms); null after the session's end: closing the page aborts what is
-    // still open, and unfinished() already reported it as never completed
+    // the point for a failed request; null after the session's end: closing
+    // the page aborts what is still open, and unfinished() reported it
     failed (method, url, t, error, resourceType) {
       if (ended) return null
       const e = take(key(method, url))
-      return ['browser_request_incomplete_ms', e ? t - e.t0 : 0,
-        Object.assign(requestTags(url, e ? e.type : resourceType), { outcome: 'failed', error: error || 'unknown' })]
+      if (!e) {
+        return ['browser_request_failed_start_unseen', 1,
+          Object.assign(tags(url, resourceType, 'failed', error || 'unknown', false), { start_seen: 'false' })]
+      }
+      return ['browser_request_incomplete_ms', t - e.t0, tags(url, e.type, 'failed', error || 'unknown', e.answered)]
     },
     // every request still open at `t` (the session's end): never completed
     unfinished (t) {
@@ -205,10 +220,7 @@ export function requestLedger () {
       const out = []
       for (const [k, q] of open) {
         const url = k.slice(k.indexOf(' ') + 1)
-        for (const e of q) {
-          out.push(['browser_request_incomplete_ms', t - e.t0,
-            Object.assign(requestTags(url, e.type), { outcome: 'never_completed', error: '' })])
-        }
+        for (const e of q) out.push(['browser_request_incomplete_ms', t - e.t0, tags(url, e.type, 'never_completed', '', e.answered)])
       }
       open.clear()
       return out

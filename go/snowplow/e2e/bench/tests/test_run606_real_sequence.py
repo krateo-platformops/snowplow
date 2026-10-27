@@ -129,13 +129,15 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
 
 FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     raw = sys.argv[1:]
-    kc = os.environ.get("KUBECONFIG"); ctx = None; a = []; ns = None
+    kc = os.environ.get("KUBECONFIG"); ctx = None; a = []; ns = None; imp = []
     it = iter(raw)
     for x in it:
         if x.startswith("--kubeconfig="): kc = x.split("=", 1)[1]
         elif x.startswith("--context="): ctx = x.split("=", 1)[1]
         elif x in ("-n", "--namespace"): ns = next(it, None)   # anywhere, like kubectl
         elif x.startswith("--request-timeout="): pass          # global flag, anywhere
+        elif x.startswith(("--as=", "--as-group=")): imp.append(x)   # impersonation (#922 F3)
+        elif x.startswith("-v="): pass                         # verbosity
         else: a.append(x)
     resolved = ctx
     if resolved is None:
@@ -190,14 +192,51 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         print(f'apiserver_flowcontrol_request_wait_duration_seconds_count{{execute="true",{lb}}} {10 * n}')
         print("apiserver_request_total{code=\\"200\\"} 5")
         sys.exit(0)
-    if a[:2] == ["get", "flowschemas.flowcontrol.apiserver.k8s.io"]:   # #922 F3: the flow control config
-        rule = {"subjects": [{"kind": "Group", "group": {"name": "system:serviceaccounts"}}],
-                "resourceRules": [{"verbs": ["*"], "apiGroups": ["*"], "resources": ["*"],
-                                   "clusterScope": True, "namespaces": ["*"]}]}
-        print(json.dumps({"items": [{"metadata": {"name": "global-default"},
-                                     "spec": {"matchingPrecedence": 9900, "rules": [rule],
-                                              "priorityLevelConfiguration": {"name": "global-default"}}}]}))
+    # #922 F3 (#924 M2/M3): APF as the API server answers it. A request's
+    # X-Kubernetes-PF-* headers (kubectl -v=8 prints them) name its flow
+    # schema; once the bench's FlowSchemas are applied, each identity lands
+    # in its own (FAKE_BENCH_FS_IGNORED=1: they never take, verify fails).
+    fs_uid = {"service-accounts": "00000000-0000-4000-8000-000000000001",
+              "global-default": "00000000-0000-4000-8000-000000000002",
+              "bench-snowplow-sa": "00000000-0000-4000-8000-000000000011",
+              "bench-snowplow-users": "00000000-0000-4000-8000-000000000012",
+              "bench-drivers": "00000000-0000-4000-8000-000000000013"}
+    pl_uid = {"workload-low": "00000000-0000-4000-8000-000000000101",
+              "global-default": "00000000-0000-4000-8000-000000000102"}
+    pl_of = {"service-accounts": "workload-low", "global-default": "global-default",
+             "bench-snowplow-sa": "workload-low", "bench-snowplow-users": "global-default",
+             "bench-drivers": "workload-low"}
+    prec = {"service-accounts": 9000, "global-default": 9900, "bench-snowplow-sa": 8999,
+            "bench-snowplow-users": 9899, "bench-drivers": 8999}
+    bench_fs = (os.path.exists(os.path.join(STATE, "bench_flowschemas"))
+                and os.environ.get("FAKE_BENCH_FS_IGNORED") != "1")
+    if a[:1] == ["apply"] and any(x.endswith("bench-flowschemas.yaml") for x in a):
+        open(os.path.join(STATE, "bench_flowschemas"), "w").write(open(a[-1]).read())
         sys.exit(0)
+    if a[:2] == ["get", "flowschemas.flowcontrol.apiserver.k8s.io"]:
+        names = [n for n in fs_uid if bench_fs or not n.startswith("bench-")]
+        print(json.dumps({"items": [{"metadata": {"name": n, "uid": fs_uid[n]},
+                                     "spec": {"matchingPrecedence": prec[n],
+                                              "priorityLevelConfiguration": {"name": pl_of[n]}}} for n in names]}))
+        sys.exit(0)
+    if a[:2] == ["get", "prioritylevelconfigurations.flowcontrol.apiserver.k8s.io"]:
+        print(json.dumps({"items": [{"metadata": {"name": n, "uid": u}, "spec": {}} for n, u in pl_uid.items()]}))
+        sys.exit(0)
+    if a[:2] == ["get", "--raw"] and imp:
+        who = imp[0].split("=", 1)[1]
+        if who.startswith("system:serviceaccount:krateo-system:"):
+            fs = "bench-snowplow-sa" if bench_fs else "service-accounts"
+        elif who.startswith("system:serviceaccount:bench-loadgen:"):
+            fs = "bench-drivers" if bench_fs else "service-accounts"
+        else:
+            fs = "bench-snowplow-users" if bench_fs else "global-default"
+        print("I1027 00:00:00.000000 1 round_trippers.go:560] Response Status: 403 Forbidden in 3 milliseconds\\n"
+              "I1027 00:00:00.000000 1 round_trippers.go:567] Response Headers:\\n"
+              f"I1027 00:00:00.000000 1 round_trippers.go:570]     X-Kubernetes-Pf-Flowschema-Uid: {fs_uid[fs]}\\n"
+              f"I1027 00:00:00.000000 1 round_trippers.go:570]     X-Kubernetes-Pf-Prioritylevel-Uid: {pl_uid[pl_of[fs]]}",
+              file=sys.stderr)
+        print('Error from server (Forbidden): configmaps is forbidden', file=sys.stderr)
+        sys.exit(1)
     if a[:2] == ["get", "deploy/snowplow"]:
         print(json.dumps({"metadata": {"name": "snowplow", "namespace": ns},
                           "spec": {"template": {"spec": {"serviceAccountName": "snowplow"}}}}))

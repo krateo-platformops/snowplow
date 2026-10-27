@@ -1282,17 +1282,19 @@ class ChurnDriver:
 
     def _one(self, target, marker):
         t0 = time.time()
-        res = WriteResult(False, error="the write raised")
         try:
             res = self.mutate(target, marker)
-        finally:
-            with self.lock:
-                self.issued += 1
-                if not res.ok:
-                    self.failed += 1
-            if not res.ok and self.on_failure is not None:
-                self.on_failure({"t": round(t0, 3), "ms": round((time.time() - t0) * 1000, 1),
-                                 "status": res.status, "error": res.error})
+        except Exception as e:  # noqa: BLE001 — a write that raised is a failed write, recorded
+            res = WriteResult(False, None, f"{type(e).__name__}: {e}")
+        with self.lock:
+            self.issued += 1
+            if not res.ok:
+                self.failed += 1
+        # every failure, with or without an HTTP status (a timeout, a refused
+        # connection: an API server that does not answer, run 16's case)
+        if not res.ok and self.on_failure is not None:
+            self.on_failure({"t": round(t0, 3), "ms": round((time.time() - t0) * 1000, 1),
+                             "status": res.status, "error": res.error})
 
     def _loop(self):
         self.t0 = time.time()
@@ -2469,6 +2471,12 @@ RUN8_VARS_PREFIXES = (
     "snowplow_phase1_readiness_exit",
     "snowplow_prewarm_engine",
     "snowplow_work_class",                # #871: units started / completed per work class
+    # #919 (#933 review): natural relists — reflector (re-)establishments by
+    # wire path (cache/reflector_path_stats.go) and ListAndWatch errors, each
+    # followed by a relist (cache/informer_watch_stats.go). Process-wide:
+    # snowplow exposes no per-GVR count or time.
+    "snowplow_reflector_path",
+    "snowplow_informer_watch",
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -5093,7 +5101,8 @@ def churn_write_failures_report(recs: list[dict]) -> dict:
     return out
 
 
-def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None) -> None:
+def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None,
+                            k6_calls: list[tuple[float, float]] | None = None) -> None:
     """#919's report-only sections of verdict.json: run606's kubectl top
     samples (answered / failed), the API server's flow control per phase
     (bench/apf.py, streamed from `apf_path`: run606's apf.jsonl.gz) and
@@ -5124,7 +5133,7 @@ def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None
         warnings.append(f"kubectl top: {t['failed']} of {t['failed'] + t['answered']} samples failed "
                         f"(longest unanswered stretch {t['longest_unanswered_s']} s)")
     report["churn_write_failures_report_only"] = churn_write_failures_report(recs)
-    report["acceptance_figures_report_only"] = figures.run_figures(report, recs, window, boot_facts)
+    report["acceptance_figures_report_only"] = figures.run_figures(report, recs, window, boot_facts, k6_calls)
 
 
 def _cmd_evaluate(a) -> int:
@@ -5187,7 +5196,8 @@ def _cmd_evaluate(a) -> int:
     # the stretches the run's measure / collect loops could not reach the API
     # server (run606 api_seen): shown with the verdict, never judged
     result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]
-    _cluster_sample_reports(result["report"], recs, a.apf)
+    from bench import custlat
+    _cluster_sample_reports(result["report"], recs, a.apf, custlat.calls((k6 or {}).get("k6")))
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))

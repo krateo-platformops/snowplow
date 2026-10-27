@@ -509,27 +509,36 @@ s_env() {
   start_log_stream
   apf_preflight || return 1
   start_apf_loop
-  flowcontrol_config_record
+  flowcontrol_attribution || return 1
 }
-# flowcontrol_config_record (#922 F3): which flow schema / priority level
-# serve snowplow's ServiceAccount, and a user it impersonates — from the
-# cluster's FlowSchemas and snowplow's Deployment (bench/apf.py config-record;
-# names only: no schema's subjects are kept). Best effort: without it the
-# figures say snowplow's flow schema is not known.
-flowcontrol_config_record() {
-  if [[ "$DRY" == "1" ]]; then log "DRY: flow schemas + deploy/snowplow -> $OUT/flowcontrol-config.jsonl"; return 0; fi
-  local fs="$OUT/.flowschemas.json" dep="$OUT/.snowplow-deploy.json"
-  if bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
-        get flowschemas.flowcontrol.apiserver.k8s.io -o json >"$fs" 2>"$KERR" \
-     && bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
-        -n krateo-system get deploy/snowplow -o json >"$dep" 2>"$KERR"; then
-    python3 -m bench.apf config-record --flowschemas "$fs" --deployment "$dep" > "$OUT/flowcontrol-config.jsonl" \
-      || log "could not tell snowplow's flow schema: $(cut -c1-300 "$OUT/flowcontrol-config.jsonl")"
-    log "flow control: $(cut -c1-300 "$OUT/flowcontrol-config.jsonl")"
-  else
-    log "could not read the flow schemas or deploy/snowplow ($(kerr_line)): the figures name no flow schema"
+# flowcontrol_attribution (#922 F3, #924 review M2/M3): which APF flow schema
+# serves snowplow's ServiceAccount, the requests it sends as a bench user, and
+# the bench's own drivers — ASKED of the API server (one LIST as each, by
+# kubectl impersonation; the response's X-Kubernetes-PF-* headers), never
+# re-derived. Each then gets a FlowSchema of its own at the priority level it
+# landed in (one precedence below the schema that took it: same level, same
+# queuing), applied through kapply, and a second probe proves each lands in
+# its own schema — so the figures under snowplow's schemas are snowplow's
+# alone, and the bench's churn is apart. bench/flowcontrol.py; names only are
+# recorded. Without it the run's #922 figures cannot be attributed: the step
+# fails, before the data load is paid for.
+flowcontrol_attribution() {
+  local fc=(python3 -m bench.flowcontrol --users "$USERS" --namespaces "$NAMESPACES"
+            --user-prefix "$BENCH_USER_PREFIX" --timeout-s "$COLLECT_TIMEOUT_S")
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: ${fc[*]} probe -> bench-flowschemas.yaml (kapply) -> verify -> $OUT/flowcontrol-config.jsonl"
+    return 0
   fi
-  rm -f "$fs" "$dep"
+  "${fc[@]}" probe --out "$OUT/.flowcontrol-probe.json" -- "${K[@]}" 2>"$KERR" \
+    || { log "flow control FAILED: the API server's APF classification could not be read ($(kerr_line))"; return 1; }
+  "${fc[@]}" render --probe "$OUT/.flowcontrol-probe.json" > "$OUT/bench-flowschemas.yaml" 2>"$KERR" \
+    || { log "flow control FAILED: $(kerr_line)"; return 1; }
+  kapply "$OUT/bench-flowschemas.yaml"
+  if ! "${fc[@]}" verify --probe "$OUT/.flowcontrol-probe.json" -- "${K[@]}" > "$OUT/flowcontrol-config.jsonl" 2>"$KERR"; then
+    log "flow control FAILED: an identity does not land in its bench FlowSchema: $(cut -c1-600 "$OUT/flowcontrol-config.jsonl") $(kerr_line)"
+    return 1
+  fi
+  log "flow control: $(cut -c1-600 "$OUT/flowcontrol-config.jsonl")"
 }
 s_preflight() {
   # SECONDS-scale, right after env and BEFORE stamping or any login burst

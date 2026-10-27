@@ -19,14 +19,16 @@ user prefix) or a `--deny-pattern`; a kept one also passes bench/identity.py,
 the bench's one identity redaction.
 
 A klog line (client-go's own log: `W1027 00:02:54.123456   1 request.go:697]
-msg`; #919, run 16's burst of 21 at 00:02:54Z was unreadable) keeps its
-severity, klog time, thread and file:line, and its message PART BY PART with
-the same redaction: bench/identity.py's rules first (a user, an
-"authenticated as", an e-mail, a Secret's name, a certificate's CN), then
-every part the JSON path would hash (DENY, `--deny`, `--deny-pattern`: a
-quoted string, a key=value, a scaleuser-N, ...) hashed alone, the rest kept:
-{"format": "klog", "severity", "klog_time", "thread", "source", "msg"}. Any
-other non-JSON line becomes {"unparsed": true, "len": n, "h": ...}.
+...`; #919, run 16's burst of 21 at 00:02:54Z was unreadable) keeps its
+header — severity, klog time, thread, file:line — and its body becomes a
+record the JSON path scrubs, with the SAME function (Scrubber.scrub): a
+structured line (`"message" key="value" key2=3`, klog's InfoS / ErrorS)
+gives {"msg": message, key: value, ...}; any other body is {"msg": body}.
+So the message is judged WHOLE, exactly as a JSON line's msg (kept only
+when nothing in it is denied, else hashed whole), and each key / value
+through KEY_NAMES / KEEP: {"format": "klog", "severity", "klog_time",
+"thread", "source", "msg", ...}. Any other non-JSON line becomes
+{"unparsed": true, "len": n, "h": ...}.
 
     kubectl logs --timestamps ... | python3 -m bench.logscrub --kubelet-timestamps \
         [--state-file F] [--last-time-file F] [--deny S ...] [--deny-pattern RE ...]
@@ -54,6 +56,9 @@ KEEP = frozenset({
     "dispatch", "gvr", "group", "version", "resource", "restaction_namespace",
     "restaction_name", "wire_shape", "previous", "phase", "tier", "outcome", "state",
     "traceId", "spanId",
+    # client-go's own structured fields (its throttling line: "Waited before
+    # sending request" delay= reason= verb= URL=; the URL is hashed)
+    "delay", "verb",
 })
 # Key names that may appear as written (their string values are still hashed
 # unless the key is also in KEEP). Every other key name is hashed.
@@ -63,7 +68,7 @@ KEY_NAMES = KEEP | frozenset({
     "first_observation", "snap_seq", "armed_keys", "requested", "armed",
     "skipped_informer_miss", "skipped_other", "count", "bytes", "status", "code",
     "attempt", "seq", "gen", "elapsed_ms", "duration_ms", "wall_ms", "ms", "items",
-    "unparsed", "len", "h",
+    "unparsed", "len", "h", "URL",
 })
 # A KEEP value is hashed anyway when it looks like it names an identity, a
 # credential or carries a key=value / quoted fragment (concatenated messages).
@@ -72,12 +77,15 @@ DENY = re.compile(
     r"secret|passw|authoriz|bearer|cookie|credential|eyJ[A-Za-z0-9_-]{10,}|@|=|\"",
     re.IGNORECASE)
 TS = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z (.*)$", re.DOTALL)
-# klog's header (k8s.io/klog/v2): Lmmdd hh:mm:ss.uuuuuu threadid file:line] msg
-KLOG = re.compile(r"^([IWEF])(\d{4} \d\d:\d\d:\d\d\.\d{6})\s+(\d+) ([^\s\]]+:\d+)\] ?(.*)$",
+# klog's header (k8s.io/klog/v2): Lmmdd hh:mm:ss.uuuuuu threadid file.go:line]
+# body. The file:line is a Go source file's base name: anything else is not a
+# klog line.
+KLOG = re.compile(r"^([IWEF])(\d{4} \d\d:\d\d:\d\d\.\d{6})\s+(\d+) ([A-Za-z0-9_.-]+\.go:\d+)\] ?(.*)$",
                   re.DOTALL)
-# A part of free text, redacted on its own: a quoted string whole, else a run
-# without whitespace and without the separators of a path, a query or a list
-PART = re.compile(r'"[^"]*"|[^\s/?&,"]+')
+# a structured klog body: its quoted message, then key=value pairs (a value
+# quoted, Go-style, or bare)
+KLOG_MSG = re.compile(r'^"((?:[^"\\]|\\.)*)"')
+KLOG_KV = re.compile(r'\s+([A-Za-z_][A-Za-z0-9_.-]*)=("(?:[^"\\]|\\.)*"|[^\s"]+)')
 
 
 def _norm_ts(m: "re.Match") -> str:
@@ -109,21 +117,12 @@ class Scrubber:
         bench/identity.py all the same."""
         return identity.redact_identity(v)
 
-    def text(self, v: str) -> str:
-        """Free text, part by part (#919): identity's rules over the whole
-        text, then each PART the JSON path would hash (denied) hashed alone,
-        the rest kept; identity's own marker stays as it is."""
-        def part(m):
-            x = m.group(0)
-            if x.strip('"') == identity.REDACTED or not self.denied(x):
-                return x
-            return _h(x)
-        return PART.sub(part, identity.redact_identity(v))
-
     def klog(self, m: "re.Match") -> dict:
-        sev, ts, thread, src, msg = m.groups()
-        return {"format": "klog", "severity": sev, "klog_time": ts, "thread": int(thread),
-                "source": self.text(src), "msg": self.text(msg)}
+        """A klog line: its header kept, its body scrubbed as a JSON line's
+        record is (scrub), the message judged whole."""
+        sev, ts, thread, src, body = m.groups()
+        return {"format": "klog", "severity": sev, "klog_time": ts, "thread": int(thread), "source": src,
+                **self.scrub(klog_record(body))}
 
     def key(self, k: str) -> str:
         # KEY_NAMES are code constants ("user" names a field, it is not one);
@@ -153,6 +152,39 @@ class Scrubber:
                 return json.dumps(self.klog(m))
             return json.dumps({"unparsed": True, "len": len(raw), "h": _h(raw)})
         return json.dumps(self.scrub(rec))
+
+
+def _klog_value(v: str):
+    """A klog value: a quoted one unquoted (Go's %q, JSON-compatible for the
+    escapes klog writes), a bare number as a number, else the text as is."""
+    if v.startswith('"'):
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v[1:-1]
+    for conv in (int, float):
+        try:
+            return conv(v)
+        except ValueError:
+            pass
+    return v
+
+
+def klog_record(body: str) -> dict:
+    """A klog body as the record the JSON path scrubs: a structured body
+    (`"message" k="v" k2=3`, the whole of it parsed) is {"msg": message,
+    k: v, k2: 3}; any other body, printf-style, is {"msg": body}."""
+    m = KLOG_MSG.match(body)
+    if m:
+        rec, pos = {"msg": _klog_value(m.group(0))}, m.end()
+        for kv in KLOG_KV.finditer(body, pos):
+            if kv.start() != pos:
+                break
+            rec.setdefault(kv.group(1), _klog_value(kv.group(2)))
+            pos = kv.end()
+        if body[pos:].strip() == "":
+            return rec
+    return {"msg": body}
 
 
 # Kept for callers of the earlier function API.

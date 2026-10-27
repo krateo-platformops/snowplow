@@ -23,9 +23,12 @@ A regional control plane has several replicas behind one endpoint, and each
 scrape lands on one of them: process_start_time_seconds (the record's
 `replica`) says which. Counters and histograms are differenced only between
 two scrapes of the SAME replica (a new start time is a new replica or a
-restart: never differenced across), and each difference counts in the phase
-of its later scrape (as load606's per-phase counter reports do). A gauge is
-one replica's value at one moment. A counter vector exports a series only
+restart: never differenced across). A difference counts in a phase only when
+both its scrapes are in that phase; one that crosses a phase boundary is
+reported under `spanning` (from..to), never booked to either side, and a
+phase with no such pair says its counters are NOT MEASURED (never 0). A gauge
+is one replica's value at one moment (a 15 s sample: its max is the max of
+the samples, not the true peak). A counter vector exports a series only
 after its first increment: rejected_requests_total absent from a replica's
 scrapes means none rejected since that replica started, said as such.
 """
@@ -183,6 +186,9 @@ def _phase_out(ph: _Phase) -> dict:
             node(pl, fs if fs else None)[out] = _stats(vals) if out not in PL_GAUGES else max(vals)
     return {"scrapes": ph.scrapes, "failed_scrapes": ph.failed, "replicas": len(ph.replicas),
             "same_replica_pairs": ph.pairs, "pair_seconds": round(ph.pair_seconds, 1),
+            "counters": ("measured" if ph.pairs else
+                         "NOT MEASURED: no two scrapes of one replica inside the phase (rejections, "
+                         "waits, dispatched unknown, never 0)"),
             "rejected_series_seen": rejected_seen,
             "priority_levels": {k: levels[k] for k in sorted(levels)}}
 
@@ -203,6 +209,7 @@ def report(recs: Iterable[dict], phases: list[tuple[str, float, float]], phase_o
             return BOOT
         return BEFORE if measure_t0 is not None and t < measure_t0 else phase_of(t, phases)
     acc: dict[str, _Phase] = defaultdict(_Phase)
+    spanning: dict[str, _Phase] = defaultdict(_Phase)
     last: dict = {}                       # replica -> (t, its reported series)
     answered, resets, unattributed, truncated = 0, 0, 0, None
     replicas: set = set()
@@ -235,11 +242,16 @@ def report(recs: Iterable[dict], phases: list[tuple[str, float, float]], phase_o
         if any(v < 0 for v in d.values()):
             resets += 1                   # a counter went back: not differenced
             continue
-        p.pairs += 1
-        p.pair_seconds += r["t"] - prev[0]
+        # a difference counts in a phase only when BOTH its scrapes are in it;
+        # one whose interval crosses a phase boundary is reported as spanning
+        # (from..to), never booked to either side
+        pa = phase(prev[0])
+        q = p if pa == phase(r["t"]) else spanning[f"{pa}..{phase(r['t'])}"]
+        q.pairs += 1
+        q.pair_seconds += r["t"] - prev[0]
         for k, v in d.items():
             if v:
-                p.counters[k] += v
+                q.counters[k] += v
     if not acc:
         return {"status": REPORT_ABSENT,
                 "note": "no apf sample in the inputs: the API server's flow-control metrics are MISSING "
@@ -248,11 +260,16 @@ def report(recs: Iterable[dict], phases: list[tuple[str, float, float]], phase_o
     order = [n for n in (BEFORE, BOOT) if n in acc] + [n for n, _, _ in phases] + ["steady"]
     by_phase = {n: _phase_out(acc[n]) for n in order if n in acc}
     churn = [n for n in acc if n.startswith("churn:")]
-    for name, members in (("churn", churn), ("all", list(acc))):
+    # pooled: the churn steps (with the differences spanning only churn steps)
+    # and the whole run (every difference)
+    for name, members, spans in (("churn", churn, [k for k in spanning if all(
+            x.startswith("churn:") for x in k.split(".."))]), ("all", list(acc), list(spanning))):
         if members:
             s = _Phase()
             for n in members:
                 s.merge(acc[n])
+            for k in spans:
+                s.merge(spanning[k])
             by_phase[name] = _phase_out(s)
     return {"status": "present",
             "samples": {"answered": answered, "failed": failed, "failed_by_error": dict(errors)},
@@ -261,9 +278,13 @@ def report(recs: Iterable[dict], phases: list[tuple[str, float, float]], phase_o
             "counter_resets_skipped": resets,
             "measure_t0": measure_t0,
             "boot": list(boot) if boot else None,
+            # differences whose two scrapes are in different phases: in no phase
+            "spanning": {k: _phase_out(v) for k, v in sorted(spanning.items())},
             **({"stream_cut": truncated} if truncated else {}),
             "how": "counters / histograms differenced between consecutive scrapes of the same replica "
-                   "(process_start_time_seconds), each difference in its later scrape's phase; gauges: one "
+                   "(process_start_time_seconds); a difference counts in a phase only when both its scrapes "
+                   "are in it, else it is reported under `spanning` (from..to); a phase with no such pair "
+                   "has its counters NOT MEASURED (never 0); gauges: one "
                    "replica's value per scrape; rejected_requests_total absent = none rejected since that "
                    "replica started (a counter vector exports a series on its first increment); a gauge series "
                    "is exported from its first use, so its mean is over the scrapes that carried it",
@@ -283,102 +304,3 @@ def _reported(key: str) -> bool:
     """A series of a family this report reads (the sampler keeps every
     apiserver_flowcontrol_* series; the rest stay in apf.jsonl.gz)."""
     return key.startswith(_REPORTED)
-
-
-# ─── which flow schema serves snowplow (#922 F3) ─────────────────────────────
-
-SA_GROUPS = ("system:serviceaccounts", "system:authenticated")
-
-
-def _subject_matches(subj: dict, user: str, groups: tuple[str, ...], sa: tuple[str, str] | None) -> bool:
-    kind = subj.get("kind")
-    if kind == "ServiceAccount" and sa is not None:
-        s = subj.get("serviceAccount") or {}
-        return s.get("namespace") == sa[0] and s.get("name") in ("*", sa[1])
-    if kind == "User":
-        return (subj.get("user") or {}).get("name") in ("*", user)
-    if kind == "Group":
-        return (subj.get("group") or {}).get("name") in groups
-    return False
-
-
-def _all_resources(rule: dict, verbs: tuple[str, ...]) -> bool:
-    """A resource rule that covers `verbs` on every resource, cluster-wide and
-    in every namespace."""
-    for r in rule.get("resourceRules") or []:
-        v = r.get("verbs") or []
-        if (("*" in v or all(x in v for x in verbs)) and "*" in (r.get("apiGroups") or [])
-                and "*" in (r.get("resources") or []) and r.get("clusterScope")
-                and "*" in (r.get("namespaces") or [])):
-            return True
-    return False
-
-
-def matching_flow_schema(flowschemas: list[dict], user: str, groups: tuple[str, ...],
-                         sa: tuple[str, str] | None = None, verbs: tuple[str, ...] = ("list", "watch")):
-    """The flow schema APF classifies `user`'s `verbs` on any resource into:
-    the first, by matchingPrecedence then name, with a rule whose subjects
-    match and whose resource rule covers every resource. A schema whose rule
-    covers only some resources is listed apart (it may take some of the
-    requests). Returns (flow schema, its priority level, partial names)."""
-    partial = []
-    for fs in sorted(flowschemas, key=lambda f: ((f.get("spec") or {}).get("matchingPrecedence", 1000),
-                                                 (f.get("metadata") or {}).get("name", ""))):
-        spec = fs.get("spec") or {}
-        for rule in spec.get("rules") or []:
-            if not any(_subject_matches(x, user, groups, sa) for x in rule.get("subjects") or []):
-                continue
-            name = (fs.get("metadata") or {}).get("name")
-            if _all_resources(rule, verbs):
-                return name, (spec.get("priorityLevelConfiguration") or {}).get("name"), partial
-            if rule.get("resourceRules"):
-                partial.append(name)
-    return None, None, partial
-
-
-def config_record(flowschemas_doc: dict, deployment_doc: dict) -> dict:
-    """The flowcontrol_config record: which flow schema and priority level
-    serve snowplow's own ServiceAccount, and which a user it impersonates
-    (the refresher reads as the user, #615: APF classifies those requests by
-    the impersonated user). Only names and precedences are kept: a schema's
-    subjects are not recorded."""
-    spec = ((deployment_doc.get("spec") or {}).get("template") or {}).get("spec") or {}
-    ns = (deployment_doc.get("metadata") or {}).get("namespace")
-    sa_name = spec.get("serviceAccountName") or "default"
-    items = flowschemas_doc.get("items") or []
-    fs, pl, partial = matching_flow_schema(items, f"system:serviceaccount:{ns}:{sa_name}",
-                                           (*SA_GROUPS, f"system:serviceaccounts:{ns}"), sa=(ns, sa_name))
-    ufs, upl, upartial = matching_flow_schema(items, "an-impersonated-user", ("system:authenticated",))
-    return {"kind": "flowcontrol_config", "snowplow_sa": f"{ns}/{sa_name}",
-            "flow_schema": fs, "priority_level": pl, "partial_rules": partial,
-            "impersonated_user": {"flow_schema": ufs, "priority_level": upl, "partial_rules": upartial},
-            "flowschemas": [{"name": (f.get("metadata") or {}).get("name"),
-                             "precedence": (f.get("spec") or {}).get("matchingPrecedence"),
-                             "priority_level": ((f.get("spec") or {}).get("priorityLevelConfiguration")
-                                                or {}).get("name")} for f in items]}
-
-
-def main(argv: list[str] | None = None) -> int:
-    import argparse
-    import json
-    import sys
-    ap = argparse.ArgumentParser(prog="bench.apf")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("config-record", help="the flowcontrol_config record (run606 env step)")
-    c.add_argument("--flowschemas", required=True, help="kubectl get flowschemas -o json")
-    c.add_argument("--deployment", required=True, help="kubectl get deploy/snowplow -o json")
-    a = ap.parse_args(argv)
-    try:
-        with open(a.flowschemas) as fh:
-            fsd = json.load(fh)
-        with open(a.deployment) as fh:
-            dep = json.load(fh)
-    except (OSError, ValueError) as e:
-        print(json.dumps({"kind": "flowcontrol_config", "error": f"unreadable: {type(e).__name__}"}))
-        return 1
-    print(json.dumps(config_record(fsd, dep)))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

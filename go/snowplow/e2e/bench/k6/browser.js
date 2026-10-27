@@ -44,6 +44,9 @@ const CALL = new Trend('browser_call_ms', true)
 // completed (pageload.requestLedger): ms from its start to its failure or to
 // the session's end; it started at the point's time minus its value
 const INCOMPLETE = new Trend('browser_request_incomplete_ms', true)
+// a failed request whose start the ledger never saw: counted, no duration
+const UNSEEN = new Counter('browser_request_failed_start_unseen')
+const LEDGER_METRICS = { browser_request_incomplete_ms: INCOMPLETE, browser_request_failed_start_unseen: UNSEEN }
 
 export const options = {
   scenarios: {
@@ -62,6 +65,7 @@ export const options = {
     browser_page_timeouts: ['count>=0'],
     browser_widget_states: ['count>=0'],
     bench_frame: ['count>=0'],
+    browser_request_failed_start_unseen: ['count>=0'],
   },
   summaryTrendStats: ['count', 'min', 'med', 'p(95)', 'max'],
   // no url/name tags: the SPA puts the signed-in user into /call extras
@@ -149,11 +153,12 @@ export default async function () {
   // (k6 emits nothing for a request that failed at network level)
   const ledger = requestLedger()
   page.on('request', (req) => ledger.started(req.method(), req.url(), Date.now(), req.resourceType()))
+  page.on('response', (res) => ledger.responded(res.request().method(), res.url()))
   page.on('requestfinished', (req) => ledger.finished(req.method(), req.url()))
   page.on('requestfailed', (req) => {
     const f = req.failure()
     const op = ledger.failed(req.method(), req.url(), Date.now(), f && f.errorText, req.resourceType())
-    if (op) INCOMPLETE.add(op[1], Object.assign({ session: s.name, route: shown }, op[2]))
+    if (op) LEDGER_METRICS[op[0]].add(op[1], Object.assign({ session: s.name, route: shown }, op[2]))
   })
   try {
     await gotoLogin(page)
@@ -224,7 +229,7 @@ export function teardown () { FRAME.add(1, { frame: 'end' }) }
 export function handleSummary (data) {
   const keep = {}
   for (const [name, m] of Object.entries(data.metrics)) {
-    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|browser_call_ms|browser_request_incomplete_ms|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
+    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|browser_call_ms|browser_request_incomplete_ms|browser_request_failed_start_unseen|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
   }
   return { [__ENV.SUMMARY_FILE || '/out/browser-summary.json']: JSON.stringify({
     kind: 'browser_summary', sessions: CFG.sessions.map((x) => x.name),

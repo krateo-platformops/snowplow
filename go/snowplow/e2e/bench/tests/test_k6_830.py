@@ -1413,13 +1413,19 @@ def test_in_chrome_a_refused_call_and_the_open_streams_are_points(tmp_path):
     """k6/browser.js in the pinned k6 browser image, real Chrome, against the
     fixture SPA: its refused /call (port 8099) is a `failed` point with Chrome's
     error, its live streams `never_completed`, its answered /call a
-    browser_call_ms point; no point carries the extras."""
+    browser_call_ms point; no point carries the extras. Pinned EXACTLY (#924
+    review M4): every other request the page made — the document, the
+    answered /call — finished, so k6 2.3.0 fired requestfinished for each,
+    requestfailed with Request.failure() for the refused one, and response for
+    the two streams."""
     o = _run_browser_fixture(tmp_path)
-    inc = [(t["outcome"], t["request"], t["call_resource"], t["error"], v)
-           for v, t in o["points"]["browser_request_incomplete_ms"]]
-    failed = [x for x in inc if x[0] == "failed" and x[2] == "boom"]
-    assert failed and all(x[1] == "call" and "ERR_CONNECTION_REFUSED" in x[3] and x[4] >= 0 for x in failed), inc
-    assert {x[1] for x in inc if x[0] == "never_completed"} >= {"eventsource"}, inc
+    inc = sorted((t["outcome"], t["request"], t["call_resource"], t["answered"], t["error"])
+                 for _, t in o["points"]["browser_request_incomplete_ms"])
+    assert inc == [("failed", "call", "boom", "no", "net::ERR_CONNECTION_REFUSED"),
+                   ("never_completed", "eventsource", "", "yes", ""),     # /notifications, open
+                   ("never_completed", "fetch", "", "yes", "")], inc       # /refreshes, open
+    assert all(v >= 0 for v, _ in o["points"]["browser_request_incomplete_ms"])
+    assert not o["points"].get("browser_request_failed_start_unseen")    # every start was seen
     calls = [t for _, t in o["points"]["browser_call_ms"]]
     assert any(t["call_resource"] == "tables" and t["call_status"] == "200" for t in calls), calls
     with gzip.open(tmp_path / "out" / "browser.json.gz", "rt") as fh:
