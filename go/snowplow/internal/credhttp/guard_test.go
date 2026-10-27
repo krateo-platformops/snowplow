@@ -17,7 +17,10 @@ package credhttp
 // expression or generic type argument, no &x of a *rest.Config, no reference
 // to a function outside this module that returns one), and here no code
 // writes to, or takes the address of, QPS, Burst or RateLimiter
-// (limiterWrites): those would bring client-go's limiter back. Inside this
+// (limiterWrites): those would bring client-go's limiter back. Nothing
+// outside this package imports unsafe or uses //go:linkname (F13): both reach
+// past every typed rule, e.g. writing a limiter into *rest.Request's
+// unexported field. Inside this
 // package, every function that builds a REST client or a *rest.Config must
 // apply noClientRateLimit (TestIssue920_EveryCredhttpBuilderAppliesNoClientRateLimit),
 // and the behavioural test must cover it
@@ -164,11 +167,26 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 		if im.Name != nil && im.Name.Name == "." && dotImportForbidden(p) {
 			out = append(out, ref{rel, "import", "dot import of " + p, fset.Position(im.Pos())})
 		}
+		// #920 F13: unsafe reaches past every typed rule (a limiter written
+		// into *rest.Request's unexported field through reflect.NewAt and
+		// unsafe.Pointer), so it is refused outright.
+		if p == "unsafe" {
+			out = append(out, ref{rel, "import", "import of unsafe", fset.Position(im.Pos())})
+		}
 		name := p[strings.LastIndex(p, "/")+1:]
 		if im.Name != nil {
 			name = im.Name.Name
 		}
 		imports[name] = p
+	}
+	// #920 F13: //go:linkname binds a local name to another package's
+	// unexported symbol, which reaches past every typed rule the same way.
+	for _, cg := range f.Comments {
+		for _, c := range cg.List {
+			if strings.HasPrefix(c.Text, "//go:linkname") {
+				out = append(out, ref{rel, "directive", "//go:linkname", fset.Position(c.Pos())})
+			}
+		}
 	}
 	var fn string
 	var stack []ast.Node
@@ -303,7 +321,7 @@ func TestIssue723_724_NoCredentialedClientBypassesCredhttp(t *testing.T) {
 		if strings.HasPrefix(rel, "internal/credhttp/") {
 			return nil
 		}
-		f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
+		f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution|parser.ParseComments)
 		if perr != nil {
 			return perr
 		}
@@ -382,10 +400,20 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 		"addrOfQPS":     `func f(rc *x) { p := &rc.QPS; *p = 5 }`,
 		"addrOfLimiter": `func f(rc *x) { set(&rc.RateLimiter) }`,
 		"parenQPS":      `func f(rc *x) { (rc.QPS)++ }`,
+		// #920 F13 — U1: write a limiter into *rest.Request's unexported
+		// field; and a linkname to another package's unexported symbol.
+		"unsafeU1": `import ("reflect"; "unsafe"; "k8s.io/client-go/rest"; "k8s.io/client-go/util/flowcontrol")
+func u1(r *rest.Request) {
+	f := reflect.ValueOf(r).Elem().FieldByName("rateLimiter")
+	*(*flowcontrol.RateLimiter)(reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Interface().(*flowcontrol.RateLimiter)) = flowcontrol.NewTokenBucketRateLimiter(5, 10)
+}`,
+		"unsafeAliased": `import u "unsafe"; var _ = u.Sizeof(0)`,
+		"linkname":      "import _ \"unsafe\"\n//go:linkname defaultQPS k8s.io/client-go/rest.DefaultQPS\nvar defaultQPS float32",
+		"linknameOnly":  "//go:linkname f runtime.nanotime\nfunc f() int64",
 	}
 	for name, body := range cases {
 		fset := token.NewFileSet()
-		f, err := parser.ParseFile(fset, "x.go", "package p\n"+body+"\n", parser.SkipObjectResolution)
+		f, err := parser.ParseFile(fset, "x.go", "package p\n"+body+"\n", parser.SkipObjectResolution|parser.ParseComments)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
