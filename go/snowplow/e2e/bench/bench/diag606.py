@@ -35,6 +35,7 @@ __all__ = ["redact", "summarize_conditions", "pod_summary", "failing_pods",
            "installer_progress", "Kube", "collect", "wait_installer",
            "evaluate483", "verify483", "chart_inspector_errors",
            "platform_state", "platform_line", "parse_not_ready_children", "declared_components",
+           "core_features",
            "allow_list_from_env", "DEFAULT_ALLOW_NOT_READY", "REQUIRED_READY",
            "main"]
 
@@ -189,10 +190,46 @@ REQUIRED_READY = ("snowplow", "frontend", "authn", "portal")
 _CHILDREN_RX = re.compile(r"managed children are not ready:\s*(.+)$", re.S)
 
 
-def declared_components(installer: dict) -> list[dict] | None:
+_CORE_FEATURES_RX = re.compile(
+    r'\{\{-?\s*define\s+"inst\.coreFeatures"\s*-?\}\}(.*?)\{\{-?\s*end\s*-?\}\}', re.S)
+
+
+def core_features(chart: str) -> tuple[str, ...]:
+    """The features the installer chart turns on whatever spec.features says:
+    the body of its `inst.coreFeatures` define (templates/_helpers.tpl), which
+    inst.featureEnabled reads first. Empty in 0.3.459
+    (`{{- define "inst.coreFeatures" -}}{{- end -}}`), read here from the
+    chart the source step PULLED, so an installer that adds a core feature
+    cannot slip past the declared-components rule. `chart` is the chart
+    directory or the pull workdir holding exactly one. Raises ValueError when
+    the define is missing or is not a static space-separated list: the rule
+    this gate mirrors is then not the chart's."""
+    if not os.path.isfile(os.path.join(chart, "Chart.yaml")):
+        subs = [d for d in sorted(os.listdir(chart))
+                if os.path.isfile(os.path.join(chart, d, "Chart.yaml"))]
+        if len(subs) != 1:
+            raise ValueError(f"{chart}: not a chart and not a pull holding one chart ({subs})")
+        chart = os.path.join(chart, subs[0])
+    tdir = os.path.join(chart, "templates")
+    bodies = []
+    for name in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
+        if name.endswith((".tpl", ".yaml")):
+            with open(os.path.join(tdir, name)) as fh:
+                bodies += _CORE_FEATURES_RX.findall(fh.read())
+    if len(bodies) != 1:
+        raise ValueError(f"{chart}: {len(bodies)} inst.coreFeatures defines (want 1): "
+                         "the installer's feature rule is not the one this gate mirrors")
+    body = bodies[0].strip()
+    if "{{" in body:
+        raise ValueError(f"{chart}: inst.coreFeatures is not a static list ({body[:120]!r})")
+    return tuple(body.split())
+
+
+def declared_components(installer: dict, core: tuple[str, ...] = ()) -> list[dict] | None:
     """The component CRs this Installer CR WILL create: the entries of its
     spec.components that are not registerOnly and whose feature is on
-    (no feature = on; otherwise spec.features[<feature>] is true). This is
+    (no feature = on; a `core` feature = on, see core_features; otherwise
+    spec.features[<feature>] is true). This is
     the installer chart's own rule: templates/compositions.yaml Pass B emits a
     component when inst.featureEnabled (templates/_helpers.tpl) holds, once
     its CRD is served and its deps are Ready, "re-evaluated every reconcile;
@@ -213,7 +250,7 @@ def declared_components(installer: dict) -> list[dict] | None:
         if not isinstance(c, dict) or not c.get("name") or not c.get("kind") or c.get("registerOnly"):
             continue
         f = c.get("feature")
-        if f and not feats.get(f):
+        if f and f not in core and not feats.get(f):
             continue
         out.append({"name": c["name"], "kind": c["kind"], "deps": list(c.get("deps") or [])})
     return out
@@ -254,8 +291,10 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
     `declares`, see declared_components) exists, every not-ready child is on
     the allow-list WITH its expected reason, and every `required` component
     CR is Ready. A declared component with no CR yet is not-ready; it is
-    excused only when its CompositionDefinition is itself allow-listed (a
-    definition that never serves its CRD cannot create the CR). An Installer
+    excused only when its CompositionDefinition is itself an ALLOWED not-ready
+    child, i.e. not Ready for its allow-listed reason (a definition that never
+    serves its CRD cannot create the CR; a Ready one, or one failing for any
+    other reason, excuses nothing). An Installer
     CR whose declaration cannot be read is not-ready: which components it
     will still create is then unknown.
     """
@@ -296,9 +335,10 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
             row = {"id": f"declared/{c['kind']}/{c['name']}", "reason": "NotCreated",
                    "message": (f"declared by the Installer CR (feature on), no {c['kind']} CR yet"
                                + (f"; deps: {', '.join(c['deps'])}" if c["deps"] else ""))}
-            want = allow_map.get(cd)
-            if want is not None and cd in by_id and want.lower() in _messages(by_id[cd]).lower():
-                allowed.append({**row, "expected_reason": f"its definition {cd} is allow-listed ({want})"})
+            excused = next((a for a in allowed if a["id"] == cd), None)
+            if excused is not None:
+                allowed.append({**row, "expected_reason": f"its definition {cd} is an allowed not-ready "
+                                                          f"child ({excused['expected_reason']})"})
             else:
                 unexpected.append({**row, "why": "declared, not created yet"})
     by_name = {s.get("name"): s for s in leaves}
@@ -398,9 +438,9 @@ def _alert_crd_present(k: "Kube") -> bool:
     return rc == 0
 
 
-def verify483(k: "Kube", allow=None, required=REQUIRED_READY) -> dict:
+def verify483(k: "Kube", allow=None, required=REQUIRED_READY, core: tuple[str, ...] = ()) -> dict:
     allow = allow_list_from_env() if allow is None else allow
-    inst, leaves = _leaf_summaries(k)
+    inst, leaves = _leaf_summaries(k, core=core)
     cds = _cd_summaries(k)
     present = _alert_crd_present(k)
     alerts = k.items(ALERT_CRD, "-A") if present else []
@@ -517,7 +557,7 @@ class Kube:
         return sorted(out)
 
 
-def _leaf_summaries(k: Kube, skip_installer=True) -> tuple[list[dict], list[dict]]:
+def _leaf_summaries(k: Kube, skip_installer=True, core: tuple[str, ...] = ()) -> tuple[list[dict], list[dict]]:
     """(installer CRs, platform component CRs). Objects in bench-* namespaces
     are bench DATA (the 50K held compositions), never platform children."""
     inst, leaves = [], []
@@ -528,7 +568,7 @@ def _leaf_summaries(k: Kube, skip_installer=True) -> tuple[list[dict], list[dict
         sums = [summarize_conditions(o, resource) for o in objs[:MAX_ITEMS_PER_KIND]]
         if kind.startswith("installers."):
             for s, o in zip(sums, objs):
-                s["declares"] = declared_components(o)
+                s["declares"] = declared_components(o, core)
             inst.extend(sums)
         else:
             leaves.extend(sums)
@@ -541,7 +581,7 @@ def _cd_summaries(k: Kube) -> list[dict]:
 
 
 def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
-                   allow=None, required=REQUIRED_READY,
+                   allow=None, required=REQUIRED_READY, core: tuple[str, ...] = (),
                    log: Callable[[str], None] = print,
                    clock=time.monotonic, sleep=time.sleep) -> bool:
     """Poll until every child (CDs + CRs) is Ready except the allow-listed
@@ -551,7 +591,7 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
         + (", ".join(f"{i}[{r}]" for i, r in allow) or "(empty)"))
     deadline = clock() + timeout_s
     while True:
-        inst, leaves = _leaf_summaries(k)
+        inst, leaves = _leaf_summaries(k, core=core)
         st = platform_state(inst, leaves, _cd_summaries(k), allow, required)
         log(f"[platform] {platform_line(st)}")
         if st["ok"]:
@@ -567,7 +607,7 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
 
 
 def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
-            log: Callable[[str], None] = print) -> dict:
+            core: tuple[str, ...] = (), log: Callable[[str], None] = print) -> dict:
     """Write the diagnostics bundle. Never raises: a probe that fails records
     its error, so one broken call cannot cost the rest of the bundle."""
     os.makedirs(out_dir, exist_ok=True)
@@ -599,7 +639,7 @@ def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
     def installer_and_leaves():
         inst_raw = k.items(f"installers.{COMP_GROUP}", "-A")
         w("installer-cr.json", inst_raw)
-        inst, leaves = _leaf_summaries(k)
+        inst, leaves = _leaf_summaries(k, core=core)
         w("composition-crs.json", {"installer": inst, "components": leaves})
         st = platform_state(inst, leaves, cd_box, allow_list_from_env())
         w("platform-state.json", st)
@@ -713,10 +753,24 @@ def main(argv=None) -> int:
         if name == "collect":
             s.add_argument("--redact", action="append", default=[],
                            help="extra literal to redact (repeatable)")
+        # the PULLED installer chart (the source step's workdir): its
+        # inst.coreFeatures. Required where the platform is GATED; the
+        # diagnostics bundle reads it when it exists (a run can fail before
+        # the pull)
+        s.add_argument("--installer-chart", required=name != "collect",
+                       help="the pulled installer chart, or the pull workdir holding it")
     a = p.parse_args(argv)
+    try:
+        core = core_features(a.installer_chart) if a.installer_chart and (
+            a.cmd != "collect" or os.path.isdir(a.installer_chart)) else ()
+    except ValueError as e:
+        print(f"refusing: {e}", file=sys.stderr, flush=True)
+        if a.cmd != "collect":
+            return 2
+        core = ()
     k = Kube(a.kubeconfig, a.context)
     if a.cmd == "verify483":
-        res = verify483(k)
+        res = verify483(k, core=core)
         with open(a.out, "w") as fh:
             fh.write(redact(json.dumps(res, indent=2, default=str)))
         h = res["headline"]
@@ -738,10 +792,12 @@ def main(argv=None) -> int:
               f"(headline: alert-provider ABSENT = {h['result']})", flush=True)
         return 0 if res["verdict"] == "PASS" else 1
     if a.cmd == "wait-installer":
+        print(f"[platform] installer core features (inst.coreFeatures): {' '.join(core) or '(none)'}",
+              flush=True)
         return 0 if wait_installer(k, timeout_s=a.timeout_s,
-                                   interval_s=a.interval_s,
+                                   interval_s=a.interval_s, core=core,
                                    log=lambda m: print(m, flush=True)) else 1
-    collect(k, a.out, extra_secrets=tuple(a.redact),
+    collect(k, a.out, extra_secrets=tuple(a.redact), core=core,
             log=lambda m: print(m, file=sys.stderr, flush=True))
     return 0
 

@@ -723,7 +723,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                               "refused": [], "product_errors": [
                                   {"path": "/agents/new", "status": 500,
                                    "body": "unexpected end of JSON input"}],
-                              "composite_routes": ["/observability", "/compositions"],
+                              "composite_routes": ([] if os.environ.get("FAKE_PREFLIGHT") == "nocomposite"
+                                                   else ["/observability", "/compositions"]),
                               "full_walk_report_only": {"calls": 590, "bytes": 8429613,
                                                         "wall_ms": 17644}}))
         sys.exit(0)
@@ -785,6 +786,12 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         os.makedirs(os.path.join(d, "files"), exist_ok=True)
         os.makedirs(os.path.join(d, "charts"), exist_ok=True)
         open(os.path.join(d, "charts", "core-provider-2.13.24.tgz"), "w").write("x")
+        os.makedirs(os.path.join(d, "templates"), exist_ok=True)
+        core = os.environ.get("FAKE_CORE_FEATURES", "")
+        if core == "dynamic":
+            core = "{{ .Values.coreFeatures }}"
+        open(os.path.join(d, "templates", "_helpers.tpl"), "w").write(
+            '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10))
         open(os.path.join(d, "Chart.yaml"), "w").write(json.dumps({
             "apiVersion": "v2", "name": "installer", "version": ver,
             "dependencies": [{"name": "core-provider", "version": "2.13.24"}]}))

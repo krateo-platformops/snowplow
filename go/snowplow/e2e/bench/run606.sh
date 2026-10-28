@@ -368,7 +368,8 @@ teardown() {
       elif [[ -s "$KCFG" ]]; then
         log "=== diagnostics before teardown -> $OUT/diagnostics ==="
         capped "$DIAG_CAP_S" "diagnostics" python3 -m bench.diag606 collect \
-            --kubeconfig "$KCFG" --context "$KCTX" --out "$OUT/diagnostics" --redact "$PW"
+            --kubeconfig "$KCFG" --context "$KCTX" --out "$OUT/diagnostics" --redact "$PW" \
+            --installer-chart "$OUT/installer-pulled"
       else
         log "no kubeconfig yet; no diagnostics to collect"
       fi
@@ -476,14 +477,16 @@ s_verify483() {
   # installer#483 acceptance. Items 1-4 gate (a FAIL aborts the run with
   # diagnostics before teardown); item 5 is recorded only.
   run python3 -m bench.diag606 verify483 --kubeconfig "$KCFG" --context "$KCTX" \
-      --out "$OUT/verify483.json"
+      --installer-chart "$OUT/installer-pulled" --out "$OUT/verify483.json"
 }
 s_wait_platform() {
   # Polled, not a blind wait: prints which components are Ready (and why the
   # others are not) every PLATFORM_POLL_S, so a stall shows WHERE.
+  # The pulled chart (source step) gives inst.coreFeatures: what the
+  # Installer CR declares is read with the chart's own feature rule.
   run python3 -m bench.diag606 wait-installer --kubeconfig "$KCFG" \
       --context "$KCTX" --timeout-s "$PLATFORM_TIMEOUT_S" \
-      --interval-s "$PLATFORM_POLL_S"
+      --interval-s "$PLATFORM_POLL_S" --installer-chart "$OUT/installer-pulled"
   # NEVER wait on the umbrella Installer being Ready: on a credential-free
   # bench it never is (github-provider-kog stays 401, installer#484). Wait on
   # the specific components the bench uses: their Deployments Available and
@@ -598,7 +601,12 @@ s_preflight() {
   while IFS= read -r r; do [[ -n "$r" ]] && COMPOSITE_ROUTES+=("$r"); done \
     < <(python3 -m bench.load606 preflight-composite < "$OUT/preflight.jsonl")
   if (( COMPOSITE_BURST_USERS > 0 )) && (( ${#COMPOSITE_ROUTES[@]} == 0 )); then
-    log "WARNING: no composite page found in the live menu: the composite burst will record FAILED navigations"
+    # refused HERE, before data and reboot: the k6 driver cannot render a
+    # composite burst without a composite route (bench/k6_job.py k6_config
+    # raises at the measure step), and load606's would record only FAILED
+    # navigations
+    log "PREFLIGHT REFUSED: COMPOSITE_BURST_USERS=${COMPOSITE_BURST_USERS} but the live menu has no composite page (bench.load606 composite_routes found none) — see $OUT/preflight.jsonl"
+    return 1
   fi
   log "composite pages for the cold burst: ${COMPOSITE_ROUTES[*]:-NONE}"
 }

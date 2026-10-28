@@ -127,8 +127,8 @@ class Response:
     # (X-Snowplow-Refresh-Key, X-Snowplow-Refresh-Class) when snowplow keyed
     # the /call response — what the SPA arms its /refreshes stream with.
     refresh: tuple | None = None
-    # X-Snowplow-Stage-Outcomes (#904): on a RESTAction /call, every stage
-    # that did not succeed ("[]" when all did)
+    # X-Snowplow-Stage-Outcomes, verbatim (see parse_stage_outcomes); None
+    # when the response did not carry it
     stage_outcomes: str | None = None
 
 
@@ -136,6 +136,36 @@ REFRESH_HEADER_KEY = "X-Snowplow-Refresh-Key"
 REFRESH_HEADER_CLASS = "X-Snowplow-Refresh-Class"
 REFRESH_CLASSES = ("widgets", "widgetContent", "restactions")
 STAGE_OUTCOMES_HEADER = "X-Snowplow-Stage-Outcomes"
+# snowplow's closed set of stage reasons (resolvers/restactions/api/stage_outcomes.go)
+STAGE_REASONS = ("StageNotExecuted", "Forbidden", "NotFound", "Unauthorized", "NotRun", "Error",
+                 "Skipped", "Aborted")
+
+
+def parse_stage_outcomes(value: str | None):
+    """X-Snowplow-Stage-Outcomes as snowplow renders it (StageOutcomes.
+    HeaderValue, resolvers/restactions/api/stage_outcomes.go): a JSON array of
+    the stages that did NOT succeed, in topological order, each
+    {"name","ok":false,"reason"[,"dependsOn"]} ([] = every stage succeeded),
+    or {"truncated":true,"failed":N} past its size cap. Which /calls carry it
+    depends on the image: from 1.12.57 (#904, #911) every RESTAction /call,
+    cold resolve and L1 hit alike (dispatchers/restactions.go:481,
+    stage_outcomes_header.go:51); 1.12.56 sets it on an INLINE resolve only
+    (restactions.go:453-475), so a stored RESTAction's /call has none there.
+    Returns None when absent, {"unparsed": <first 80 chars>} when it is not
+    that shape; only names, reason codes and dependsOn are kept."""
+    if value is None:
+        return None
+    try:
+        v = json.loads(value)
+    except ValueError:
+        return {"unparsed": value[:80]}
+    if isinstance(v, dict) and v.get("truncated") is True and isinstance(v.get("failed"), int):
+        return {"truncated": True, "failed": v["failed"]}
+    if not isinstance(v, list) or not all(
+            isinstance(x, dict) and isinstance(x.get("name"), str) and x.get("reason") in STAGE_REASONS
+            for x in v):
+        return {"unparsed": value[:80]}
+    return [{k: x[k] for k in ("name", "reason", "dependsOn") if isinstance(x.get(k), str)} for x in v]
 
 
 def _refresh_headers(headers) -> tuple | None:
@@ -904,9 +934,33 @@ def menu_evidence(client: HttpClient, token: str, shell: WalkResult, routes: lis
         ra = ("/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions"
               f"&name={ref['name']}&namespace={ref.get('namespace') or ''}")
         r = client.get(ra, token)
-        out["api_ref_call"] = {"path": ra, "status": r.status,
-                               "stage_outcomes": getattr(r, "stage_outcomes", None)}
+        so = parse_stage_outcomes(getattr(r, "stage_outcomes", None))
+        out["api_ref_call"] = {"path": ra, "status": r.status, "stage_outcomes": so,
+                               "stage_outcomes_header": "absent" if so is None else "present"}
     return out
+
+
+def menu_reread(client: HttpClient, token: str, menu: dict, routes: list,
+                frontend_ns: str) -> dict | None:
+    """R1: the same Menu, read again by the same identity after the route
+    walk. The sidebar is resolved per caller from what exists NOW (pages,
+    their RoleBindings, snowplow's view of both), so a route set that moved
+    between two reads seconds apart means the platform was still converging:
+    a page CR can be Ready before snowplow has the new bindings and flexes.
+    None when there is nothing to compare (no Menu, or no route at all)."""
+    if not menu.get("found") or not routes:
+        return None
+    r = client.get(menu["path"], token)
+    try:
+        doc = json.loads(r.body or b"null") if r.status == 200 else None
+    except ValueError:
+        doc = None
+    first = {x["path"] for x in routes}
+    again = ({x["path"] for x in menu_routes(doc, frontend_ns) if not x["templated"]}
+             if isinstance(doc, dict) else None)
+    return {"status": r.status, "routes": None if again is None else len(again),
+            "added": sorted((again or set()) - first), "removed": sorted(first - (again or set())),
+            "same": again == first}
 
 
 def first_load_failed(shell: WalkResult, routes: list, content: WalkResult | None) -> bool:
@@ -4106,7 +4160,10 @@ def _cmd_preflight_summary(a) -> int:
             f"{m.get('path')} items={m.get('items')} resourcesRefs={m.get('resources_refs')} "
             f"routes={m.get('routes')} error={m.get('error')} api_ref={m.get('api_ref')}"
             + (f" api_ref_call={m['api_ref_call'].get('status')} "
-               f"stage_outcomes={m['api_ref_call'].get('stage_outcomes')}" if m.get("api_ref_call") else "")),
+               f"stage_outcomes={m['api_ref_call'].get('stage_outcomes')} "
+               f"(header {m['api_ref_call'].get('stage_outcomes_header')})" if m.get("api_ref_call") else "")
+            + (f" reread: routes={m['reread'].get('routes')} same={m['reread'].get('same')}"
+               if m.get("reread") else "")),
             flush=True)
     for x in rec.get("refused") or []:
         print(f"[preflight] REFUSED {x.get('path')} -> {x.get('status')}: "
@@ -4142,6 +4199,28 @@ def composite_routes(rows: list[dict], *, min_depth: int = 3, top: int = 3) -> l
 
 def preflight(client: HttpClient, token: str, portal: "Portal", *,
               full_walk: bool = False, per_user_parallel: int = 6) -> dict:
+    """The preflight record (see _preflight), every string in it passed
+    through the bench's one identity redaction: snowplow answers carry raw
+    error text (a Menu's status.error is the apiRef resolve's err.Error(),
+    e.g. a Forbidden naming `User "<name>"`), and the record is printed by
+    the in-cluster Job and kept as preflight.jsonl."""
+    from bench import identity      # in the Job: /opt/load606/bench/identity.py (load606_job)
+    return _redact_strings(_preflight(client, token, portal, full_walk=full_walk,
+                                      per_user_parallel=per_user_parallel), identity.redact_identity)
+
+
+def _redact_strings(obj, redact):
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, dict):
+        return {k: _redact_strings(v, redact) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_strings(v, redact) for v in obj]
+    return obj
+
+
+def _preflight(client: HttpClient, token: str, portal: "Portal", *,
+               full_walk: bool = False, per_user_parallel: int = 6) -> dict:
     """Seconds-scale check BEFORE stamping data or mass logins.
 
     Refuses (ok=False) on a CONFIG error: INIT or a menu route's content page
@@ -4185,6 +4264,14 @@ def preflight(client: HttpClient, token: str, portal: "Portal", *,
                 out["product_errors"].append({**row, "body": (rr.body or b"")[:400].decode("utf-8", "replace")})
             elif c == "forbidden":
                 out["forbidden"].append(row)
+        again = menu_reread(client, token, out["menu"], routes, portal.frontend_ns)
+        if again is not None:
+            out["menu"]["reread"] = again
+            if not again["same"]:
+                out["refused"].append({"path": "(sidebar menu)", "status": again["status"], "body": (
+                    f"the sidebar menu changed during the preflight: {len(routes)} routes, then "
+                    f"{again['routes']} on a second read (added {again['added']}, removed "
+                    f"{again['removed']}): the platform is still converging")})
         out["composite_routes"] = composite_routes(out["routes"])
         if full_walk:
             wall, calls, errs, nbytes, slowest, samples = walk_page(
