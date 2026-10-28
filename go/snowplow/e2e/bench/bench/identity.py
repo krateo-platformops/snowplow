@@ -32,7 +32,12 @@ _RULES = (
     (re.compile(r'User "[^"]*"'), 'User "<redacted>"'),
     (re.compile(r'users "[^"]*"'), 'users "<redacted>"'),
     (re.compile(r"authenticated as:? [^)\s,]+"), "authenticated as <redacted>"),
-    (re.compile(r"""[^\s"'(),]+@[^\s"'(),]+"""), "<redacted>"),
+    # an e-mail address: a local part, "@", and a MAIL-SHAPED domain (dot-separated
+    # labels, a letters-only TLD). Not an OCI digest reference: `name@sha256:<hex>`
+    # has an algorithm and a colon right after the "@" and no dotted domain. The
+    # old `[^\s"'(),]+@[^\s"'(),]+` ate every digest the bench records (#960
+    # review: an image_id became <redacted>).
+    (re.compile(r"""[^\s"'(),<>@/:]+@(?![A-Za-z0-9]+:)(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b"""), "<redacted>"),
     # #919: a Secret's name (the bench's per-user `<user>-clientconfig`, any
     # other) in an API path or an API error, and a certificate subject's CN
     # (client certificates name their user)
