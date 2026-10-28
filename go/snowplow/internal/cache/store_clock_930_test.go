@@ -80,7 +80,9 @@ func TestIssue930_C1_EveryStoreAgeReadsTheStoreClock(t *testing.T) {
 	if got := ageOf(c.RangeMetadata); got != 30 {
 		t.Fatalf("C1 RED: RangeMetadata reads age %d at +30 s on the store clock", got)
 	}
-	if got := ageOf(func(fn func(ResolvedEntryMeta) bool) { c.RangeMetadataSample(1, fn) }); got != 30 {
+	// Sample BOTH resident cells (a, a2): the sample walks the index map, whose
+	// order is random, so a sample of 1 can return a2 instead of a.
+	if got := ageOf(func(fn func(ResolvedEntryMeta) bool) { c.RangeMetadataSample(2, fn) }); got != 30 {
 		t.Fatalf("C1 RED: RangeMetadataSample reads age %d at +30 s on the store clock", got)
 	}
 	if _, live := c.CellPutSeq(a); !live {
