@@ -146,25 +146,62 @@ func p3Body(store *cache.ResolvedCacheStore, key string) string {
 
 // --- F6b ---------------------------------------------------------------------
 
+// p3Clock is a virtual dirty-window clock (cache.SetDirtyWindowClockForTest): it
+// reads the instant the arm last moved it to, and nothing else moves it.
+type p3Clock struct{ at atomic.Int64 }
+
+func (k *p3Clock) now() time.Time          { return time.Unix(0, k.at.Load()) }
+func (k *p3Clock) advance(d time.Duration) { k.at.Add(int64(d)) }
+
+// p3VirtualWindowClock installs a virtual dirty-window clock for the arm.
+func p3VirtualWindowClock(t *testing.T) *p3Clock {
+	t.Helper()
+	k := &p3Clock{}
+	k.at.Store(time.Now().UnixNano())
+	t.Cleanup(cache.SetDirtyWindowClockForTest(k.now))
+	return k
+}
+
+// p3Settle waits for the refresher to have no key queued or in a worker's hands,
+// with no deferred re-add scheduled since base (the event a fixed settle sleep
+// stood in for).
+func p3Settle(t *testing.T, base cache.RefresherWork) {
+	t.Helper()
+	if w, err := cache.WaitRefresherQuiescentForTest(base, time.Minute); err != nil {
+		t.Fatalf("SETUP: %v (outstanding=%d floored Δ=%d retried Δ=%d)", err, w.Outstanding, w.Floored-base.Floored, w.Retried-base.Retried)
+	}
+}
+
+// TestIssue354_P3_F6b_RemarkKeepsTheOriginalWindowOpen — #930: the window's
+// instants are placed on a VIRTUAL dirty-window clock. The first mark is at T0,
+// the dep move (the remark) at T0+300 ms inside the first resolve, the clean Put
+// at T0+400 ms inside the second. The one sample is then EXACTLY 400 ms when the
+// window is kept open from the first mark, and 100 ms when it is restarted at the
+// remark. Before #930 the bound came from the test's own time.Now() stamps with
+// 1 ms of slack, and under load the mark landed more than 1 ms after the stamp
+// (main 4085c447: "sample 307 ms but the clean Put came 309 ms after the
+// ORIGINAL mark").
 func TestIssue354_P3_F6b_RemarkKeepsTheOriginalWindowOpen(t *testing.T) {
+	const toRemark, toClean = 300 * time.Millisecond, 100 * time.Millisecond
 	store := p3Env(t)
 	c := p3PutCell(t, store, "f6b", `{"v":"old"}`)
 	dep := "f6b-dep"
+	clk := p3VirtualWindowClock(t)
 
 	var calls atomic.Int64
-	var cleanReturn atomic.Int64 // unix nanos of the clean resolve's return
 	restore := setResolveOnceForTest(func(ctx context.Context, in cache.ResolvedKeyInputs) ([]byte, error) {
 		n := calls.Add(1)
 		key := cache.L1KeyFromContext(ctx)
 		cache.Deps().Record(ctx, key, p3GVR, p3NS, dep)
 		if n == 1 {
-			// The dep this body was built from moves DURING the resolve: the #375
-			// Put-then-remark check sees it at the accepted Put.
+			// The dep this body was built from moves DURING the resolve, 300 ms
+			// after the first mark: the #375 Put-then-remark check sees it at the
+			// accepted Put.
+			clk.advance(toRemark)
 			cache.Deps().OnUpdate(p3GVR, p3NS, dep)
-			time.Sleep(300 * time.Millisecond)
 			return []byte(`{"v":"mid"}`), nil
 		}
-		cleanReturn.Store(time.Now().UnixNano())
+		clk.advance(toClean)
 		return []byte(`{"v":"new"}`), nil
 	})
 	t.Cleanup(restore)
@@ -172,28 +209,29 @@ func TestIssue354_P3_F6b_RemarkKeepsTheOriginalWindowOpen(t *testing.T) {
 	u0, s0 := p3Unfresh(), p3RefStat("dirty_to_fresh_samples")
 	_, stop := p3Loop(t)
 	defer stop()
-	tMark := time.Now()
+	base := cache.RefresherWorkSnapshot()
 	if n := cache.Deps().OnUpdate(p3GVR, p3NS, c.name); n == 0 {
 		t.Fatalf("PRE: the informer UPDATE must dirty-mark the resident cell")
 	}
 	p3Wait(t, 10*time.Second, "the clean re-resolve", func() bool {
 		return calls.Load() >= 2 && p3Body(store, c.key) == `{"v":"new"}`
 	})
-	p3Wait(t, 5*time.Second, "the clean Put's sample", func() bool { return p3RefStat("dirty_to_fresh_samples") > s0 })
-	time.Sleep(50 * time.Millisecond)
+	p3Settle(t, base)
 
 	u1 := p3Unfresh()
 	if d := u1["remarked"] - u0["remarked"]; d != 1 {
 		t.Fatalf("F6b: dirty_ended_unfresh_remarked Δ=%d, want 1 — the accepted-and-remarked Put must end the "+
 			"dequeue unfresh (the cell holds a body built from a moved dep)", d)
 	}
-	if d := p3RefStat("dirty_to_fresh_samples") - s0; d != 1 {
-		t.Fatalf("F6b: dirty_to_fresh_samples Δ=%d, want exactly 1 — NO sample at the remarked Put, one at the clean Put", d)
+	if d := p3RefStat("dirty_to_fresh_samples") - s0; d != 1 || calls.Load() != 2 {
+		t.Fatalf("F6b: dirty_to_fresh_samples Δ=%d over %d resolves, want exactly 1 over 2 — NO sample at the "+
+			"remarked Put, one at the clean Put", d, calls.Load())
 	}
-	bound := time.Duration(cleanReturn.Load()-tMark.UnixNano()) / time.Millisecond
-	if got := p3RefStat("dirty_to_fresh_ms_max"); got < int64(bound)-1 {
-		t.Fatalf("F6b DISCRIMINATING: the sample is %d ms but the clean Put came %d ms after the ORIGINAL mark — "+
-			"the window was restarted at the remark instead of kept open from the first mark", got, bound)
+	want := (toRemark + toClean).Milliseconds()
+	if got := p3RefStat("dirty_to_fresh_ms_max"); got != want {
+		t.Fatalf("F6b DISCRIMINATING: the sample is %d ms, want exactly %d ms — the clean Put came %v after the "+
+			"ORIGINAL mark and %v after the remark; a sample of %d ms means the window was restarted at the remark "+
+			"instead of kept open from the first mark", got, want, toRemark+toClean, toClean, toClean.Milliseconds())
 	}
 }
 
@@ -289,12 +327,28 @@ func TestIssue354_P3_F6c_PoisonPillEndsDropped(t *testing.T) {
 	}
 }
 
+// TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow — #930: ONE virtual
+// clock drives both the store (the rate floor reads the entry's age on it) and
+// the dirty window. Frozen, every dequeue of the young cell is floored, so the
+// first one always is, however late the worker runs. The arm then moves the
+// clock by the floor, and only after that lets the deferred re-resolve return
+// (a re-resolve can run only once the floor has expired on the clock). The one
+// sample is then EXACTLY the deferral when the window stays open across the
+// floored dequeue, and 0 ms when that dequeue ends or restarts it. Before #930
+// the bound came from the test's own time.Now() stamps with 5 ms of slack (the
+// F6b shape), and a worker that dequeued more than the floor after the Put was
+// not floored at all.
 func TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow(t *testing.T) {
+	const deferral = time.Second // = RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS
 	store := p3Env(t)
 	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "1")
+	clk := p3VirtualWindowClock(t)
+	t.Cleanup(store.SetClockForTest(clk.now))
+	advanced := make(chan struct{})
 	var calls atomic.Int64
 	restore := setResolveOnceForTest(func(context.Context, cache.ResolvedKeyInputs) ([]byte, error) {
 		calls.Add(1)
+		<-advanced
 		return []byte(`{"v":"new"}`), nil
 	})
 	t.Cleanup(restore)
@@ -302,18 +356,23 @@ func TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow(t *testing.T) {
 	s0 := p3RefStat("dirty_to_fresh_samples")
 	_, stop := p3Loop(t)
 	defer stop()
-	tPut := time.Now()
+	f0 := p3RefStat("floored")
 	c := p3PutCell(t, store, "f6c-floor", `{"v":"old"}`)
-	tMark := time.Now()
 	cache.Deps().OnUpdate(p3GVR, p3NS, c.name)
-	p3Wait(t, 5*time.Second, "the deferred refresh", func() bool { return p3RefStat("dirty_to_fresh_samples") > s0 })
-	if p3RefStat("floored") == 0 {
-		t.Fatalf("PRE: the dequeue must have been floored (the arm cannot fail otherwise)")
+	p3Wait(t, 5*time.Second, "the floored dequeue", func() bool { return p3RefStat("floored") > f0 })
+	if calls.Load() != 0 {
+		t.Fatalf("PRE: a dequeue resolved before the floor expired on the clock (calls=%d)", calls.Load())
 	}
-	// The floor expires 1 s after the Put; the window opened at the mark.
-	bound := (time.Second - tMark.Sub(tPut)) / time.Millisecond
-	if got := p3RefStat("dirty_to_fresh_ms_max"); got < int64(bound)-5 {
-		t.Fatalf("F6c: the sample (%d ms) must include the rate-floor deferral (>= %d ms)", got, bound)
+	clk.advance(deferral)
+	close(advanced)
+	p3Wait(t, 10*time.Second, "the deferred refresh", func() bool { return p3RefStat("dirty_to_fresh_samples") > s0 })
+	if d := p3RefStat("dirty_to_fresh_samples") - s0; d != 1 || calls.Load() != 1 {
+		t.Fatalf("F6c: dirty_to_fresh_samples Δ=%d over %d resolves, want exactly 1 over 1 — the floored dequeue "+
+			"must not close the window", d, calls.Load())
+	}
+	if got := p3RefStat("dirty_to_fresh_ms_max"); got != deferral.Milliseconds() {
+		t.Fatalf("F6c: the sample is %d ms, want exactly the %d ms rate-floor deferral — the window must stay open "+
+			"from the mark across the floored dequeue", got, deferral.Milliseconds())
 	}
 }
 

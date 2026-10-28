@@ -46,6 +46,7 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	restapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -251,6 +252,9 @@ func TestIssue354_P3_F6_WindowKxM_GetByName(t *testing.T) {
 	t.Cleanup(func() { cancel(); cache.ResetRefresherForTest(); restoreSeam() })
 
 	s0 := p3RefStat("dirty_to_fresh_samples")
+	work0 := cache.RefresherWorkSnapshot()
+	ksServed0 := p3StoreStat("known_stale_served_total")
+	d2Serve0 := restapi.StaleServeStatsSnapshot().ServeTotal
 	enq0 := p3RefStat("enqueue")
 	i431UpdateCM(t, e.dyn, p3NewValue)
 	p3Wait(t, 10*time.Second, "the 12 dirty-marks", func() bool { return p3RefStat("enqueue")-enq0 >= int64(len(keys)) })
@@ -283,8 +287,13 @@ func TestIssue354_P3_F6_WindowKxM_GetByName(t *testing.T) {
 		}
 		return true
 	})
-	p3Wait(t, 5*time.Second, "the 12 samples", func() bool { return p3RefStat("dirty_to_fresh_samples")-s0 >= int64(len(keys)) })
-	time.Sleep(100 * time.Millisecond)
+	// #930 — settle on the EVENT: no refresh queued or in a worker's hands (the
+	// substrate cells' no-handler declines included). A fixed 100 ms here could
+	// not tell a duplicated sample from a refresh still in flight.
+	p3Settle(t, work0)
+	if d := p3RefStat("dirty_to_fresh_samples") - s0; d < int64(len(keys)) {
+		t.Fatalf("F6: dirty_to_fresh_samples Δ=%d once the refresher is quiescent, want ≥ %d (one per converged cell)", d, len(keys))
+	}
 
 	// After the Put: the next GET returns the NEW body and does not count.
 	stale2 := p3StoreStat("stale_served_total")
@@ -306,6 +315,22 @@ func TestIssue354_P3_F6_WindowKxM_GetByName(t *testing.T) {
 	// configmap change also marked, refilled by the GETs' read-through). So the
 	// conservation law is: every window ends fresh (one sample) or is still
 	// known-stale — the 12 cells' windows plus each declined one, exactly once.
+	// #930 — the GETs above can hand work to the refresher (an accepted
+	// read-through Put that re-opens a window re-enqueues it): settle again, then
+	// read the conservation law at rest. SCOPE of that settle: the refresher is
+	// the only asynchronous writer of these windows in this arm — no customer
+	// read hit a known-stale identity-bound cell (so no demand revalidation
+	// started) and no D2 stale serve opened a debt (so no refill ran). Asserted,
+	// not assumed: if either ever moves, the settle no longer covers every
+	// carrier and the arm says so instead of passing on a partial settle.
+	p3Settle(t, work0)
+	if d := p3StoreStat("known_stale_served_total") - ksServed0; d != 0 {
+		t.Fatalf("SCOPE: %d customer read(s) hit a known-stale cell — a demand revalidation may be in flight, "+
+			"outside the refresher settle", d)
+	}
+	if d := restapi.StaleServeStatsSnapshot().ServeTotal - d2Serve0; d != 0 {
+		t.Fatalf("SCOPE: %d D2 stale serve(s) opened a debt — its refill runs outside the refresher settle", d)
+	}
 	declined := p3Unfresh()["declined"]
 	stillKnownStale := p3StoreStat("known_stale_resident")
 	if d := p3RefStat("dirty_to_fresh_samples") - s0; d+stillKnownStale != int64(len(keys))+declined || d < int64(len(keys)) {
