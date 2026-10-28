@@ -83,17 +83,16 @@ func (k danglingRoleRef) roleNamespace() string {
 	return ""
 }
 
-// logAttrs are the attributes every dangling-roleRef line carries: kinds in
-// clear, names as labels.
-func (k danglingRoleRef) logAttrs() []any {
-	return []any{
-		slog.String("subsystem", "cache"),
-		slog.String("binding_kind", k.bindingKind),
-		slog.String("binding", RBACBindingLabel(k.bindingKind, k.bindingNamespace, k.bindingName)),
-		slog.String("binding_namespace", RBACNamespaceLabel(k.bindingNamespace)),
-		slog.String("roleref_kind", k.roleKind),
-		slog.String("roleref", RBACRoleLabel(k.roleKind, k.roleNamespace(), k.roleName)),
-	}
+// bindingLabel / namespaceLabel / roleLabel are the labels every
+// dangling-roleRef line carries in place of the names. Written out at each
+// slog call (no opaque attribute slice), so the #453 log guard sees every
+// value a line carries.
+func (k danglingRoleRef) bindingLabel() string {
+	return RBACBindingLabel(k.bindingKind, k.bindingNamespace, k.bindingName)
+}
+func (k danglingRoleRef) namespaceLabel() string { return RBACNamespaceLabel(k.bindingNamespace) }
+func (k danglingRoleRef) roleLabel() string {
+	return RBACRoleLabel(k.roleKind, k.roleNamespace(), k.roleName)
 }
 
 // danglingRoleRef identifies one binding and the absent role it references.
@@ -185,10 +184,16 @@ func noteDanglingRoleRefs(snap *RBACSnapshot, next map[danglingRoleRef]struct{})
 		if _, was := danglingState.current[k]; was {
 			continue
 		}
-		slog.Warn("cache.rbac.snapshot.dangling_roleref", append(k.logAttrs(),
+		slog.Warn("cache.rbac.snapshot.dangling_roleref",
+			slog.String("subsystem", "cache"),
+			slog.String("binding_kind", k.bindingKind),
+			slog.String("binding", k.bindingLabel()),
+			slog.String("binding_namespace", k.namespaceLabel()),
+			slog.String("roleref_kind", k.roleKind),
+			slog.String("roleref", k.roleLabel()),
 			slog.Uint64("snap_seq", snap.PublishSeq),
 			slog.String("hint", danglingRoleRefHint),
-		)...)
+		)
 	}
 	for k := range danglingState.current {
 		if _, still := next[k]; still {
@@ -198,10 +203,16 @@ func noteDanglingRoleRefs(snap *RBACSnapshot, next map[danglingRoleRef]struct{})
 		if roleRefPresent(snap, k.bindingNamespace, rbacv1.RoleRef{Kind: k.roleKind, Name: k.roleName}) {
 			reason = "role_present"
 		}
-		slog.Warn("cache.rbac.snapshot.dangling_roleref_resolved", append(k.logAttrs(),
+		slog.Warn("cache.rbac.snapshot.dangling_roleref_resolved",
+			slog.String("subsystem", "cache"),
+			slog.String("binding_kind", k.bindingKind),
+			slog.String("binding", k.bindingLabel()),
+			slog.String("binding_namespace", k.namespaceLabel()),
+			slog.String("roleref_kind", k.roleKind),
+			slog.String("roleref", k.roleLabel()),
 			slog.String("reason", reason),
 			slog.Uint64("snap_seq", snap.PublishSeq),
-		)...)
+		)
 	}
 
 	danglingState.current = next
