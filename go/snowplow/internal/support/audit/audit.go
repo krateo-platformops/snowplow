@@ -52,6 +52,10 @@ const (
 	// (event.name="audit") — the constant every audit row is filtered on.
 	EventName = "audit"
 
+	// DryRunSuffix is appended to krateo.action for a dry-run write
+	// (Event.DryRun): "call.dryRun", "restaction.dryRun".
+	DryRunSuffix = ".dryRun"
+
 	// maxIDLen bounds an inbound session id; anything longer (or with
 	// characters outside idPattern) is rejected and replaced, so a hostile
 	// caller cannot inject baggage/pipeline control characters.
@@ -131,8 +135,14 @@ func Middleware() func(http.Handler) http.Handler {
 // optional; unset fields are omitted from the record. Field names map to the
 // semconv attribute keys in D19a §1.
 type Event struct {
-	// Action is the logical operation -> krateo.action ("call", "export").
+	// Action is the logical operation -> krateo.action ("call", "export",
+	// "restaction").
 	Action string
+	// DryRun marks a write the apiserver was asked to validate and not
+	// persist (dryRun=All). krateo.action then carries the suffix DryRunSuffix
+	// ("call.dryRun", "restaction.dryRun"), and RecordWrittenObject records no
+	// object identity: nothing was written (#957).
+	DryRun bool
 	// Verb is the HTTP verb -> http.request.method.
 	Verb string
 	// Group/Version/Resource/Name/Namespace identify the object acted on ->
@@ -183,6 +193,16 @@ type Event struct {
 	ObjectUID             string
 	ObjectGeneration      int64
 	ObjectResourceVersion string
+}
+
+// actionOf is the krateo.action value of ev: its Action, marked DryRunSuffix
+// when the write was a dry run. An absent action stays absent (and is counted
+// missing).
+func actionOf(ev Event) string {
+	if ev.DryRun && ev.Action != "" {
+		return ev.Action + DryRunSuffix
+	}
+	return ev.Action
 }
 
 // missingFields returns, in a fixed order, the fields other than the actor
@@ -307,7 +327,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	add("k8s.resource.name", ev.Name)
 	add("k8s.object.uid", ev.ObjectUID)
 	add("k8s.object.resource_version", ev.ObjectResourceVersion)
-	add("krateo.action", ev.Action)
+	add("krateo.action", actionOf(ev))
 	add("http.request.method", ev.Verb)
 	add("outcome", ev.Outcome)
 	add("server.address", ev.ServerAddress)

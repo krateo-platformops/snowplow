@@ -14,6 +14,10 @@
 //     body: the request carries what the caller sent (often no uid, and a
 //     resourceVersion that the write replaces), the response what was stored;
 //   - a write that did not succeed records none: there is no written object;
+//   - a dry run (Event.DryRun) records none: nothing was persisted, and the
+//     object it answers with carries the real uid and the generation a later
+//     REAL write may reach, so recording it would join a controller's
+//     reconcile to a write that never happened;
 //   - a DELETE records only the uid: of the returned object when deletion is
 //     pending (finalizers), or the one a Status answer names in details.uid
 //     when the object is gone. A deleted object has no generation to reconcile;
@@ -44,11 +48,11 @@ type writtenObjectResponse struct {
 }
 
 // RecordWrittenObject sets ev's object identity from response, the body the
-// apiserver answered ev's write with. ev.Verb and ev.Outcome must already be
-// set: only a successful POST, PUT, PATCH or DELETE records anything. Every
-// other case leaves the three fields empty.
+// apiserver answered ev's write with. ev.Verb, ev.Outcome and ev.DryRun must
+// already be set: only a successful POST, PUT, PATCH or DELETE that is not a
+// dry run records anything. Every other case leaves the three fields empty.
 func (ev *Event) RecordWrittenObject(response []byte) {
-	if ev.Outcome != "success" || len(response) == 0 {
+	if ev.DryRun || ev.Outcome != "success" || len(response) == 0 {
 		return
 	}
 	switch ev.Verb {

@@ -19,7 +19,10 @@
 // A successful write to the apiserver (no endpointRef) also records the written
 // object's uid, generation and resourceVersion, read from the apiserver's
 // answer (#957, audit.Event.RecordWrittenObject): three object identifiers,
-// never the body itself. A write to a named endpoint records none of them.
+// never the body itself. A write to a named endpoint records none of them. A
+// stage whose apiserver path asks for a dry run (?dryRun=All) is recorded as
+// krateo.action=restaction.dryRun and names no written object: nothing was
+// persisted.
 //
 // WHAT A RECORD NEVER HOLDS. This trail is kept for 365 days, so nothing that
 // can carry a credential goes into it:
@@ -118,7 +121,11 @@ func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *t
 	// may be any HTTP API: nothing of its path is recorded.
 	apiServerObject := false
 	if apiCall.EndpointRef == nil && !cache.ServiceAccountDialFromContext(ctx) {
-		path, _, _ := strings.Cut(call.Path, "?")
+		path, query, _ := strings.Cut(call.Path, "?")
+		// #957 — a stage may ask the apiserver for a dry run in its path
+		// (".../demo?dryRun=All", e.g. a validation stage). Nothing is
+		// persisted: the record says so and names no written object.
+		ev.DryRun = apiServerDryRun(query)
 		if gvr, ns, name, ok := cache.ParseAPIServerPathToDep(path); ok {
 			ev.Group, ev.Version, ev.Resource = gvr.Group, gvr.Version, gvr.Resource
 			ev.Namespace, ev.Name = ns, name
@@ -135,6 +142,18 @@ func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *t
 		ev.RecordWrittenObject(body)
 	}
 	return ev, true
+}
+
+// apiServerDryRun reports whether an apiserver request with this raw query is
+// a dry run, decided as the apiserver decides it (k8s.io/apimachinery
+// meta/v1 zz_generated.conversion.go, k8s.io/apiserver util/dryrun.IsDryRun):
+// the case-sensitive key "dryRun" is present with at least one value. Only
+// "All" is accepted; any other value is refused with a 400, so such a write
+// fails and is recorded as a failure anyway. Pairs that do not parse are
+// skipped, as the apiserver's url.Values decoding skips them.
+func apiServerDryRun(rawQuery string) bool {
+	q, _ := url.ParseQuery(rawQuery)
+	return len(q["dryRun"]) > 0
 }
 
 // outcomeOf turns what the authority answered into (outcome, code, message).

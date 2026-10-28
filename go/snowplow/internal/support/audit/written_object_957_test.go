@@ -85,6 +85,57 @@ func TestWrittenObject957_R_ReadsTheResponse(t *testing.T) {
 			}
 		})
 	}
+	// A dry run: the same successful answers record nothing. A dry-run update
+	// answers with the real uid and the generation the change would reach.
+	for _, verb := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
+		ev := Event{Verb: verb, Outcome: "success", DryRun: true}
+		ev.RecordWrittenObject([]byte(object957))
+		if got := identityOf957(ev); got != (identity957{}) {
+			t.Errorf("dry-run %s: identity = %+v, want none", verb, got)
+		}
+	}
+	for _, body := range []string{deleting957, deletedStatus957} {
+		ev := Event{Verb: http.MethodDelete, Outcome: "success", DryRun: true}
+		ev.RecordWrittenObject([]byte(body))
+		if got := identityOf957(ev); got != (identity957{}) {
+			t.Errorf("dry-run DELETE: identity = %+v, want none", got)
+		}
+	}
+}
+
+// The dry-run mark: krateo.action carries DryRunSuffix; a write that is not a
+// dry run keeps its action; an absent action stays absent (and missing).
+func TestWrittenObject957_DryRunMarksTheAction(t *testing.T) {
+	cases := []struct {
+		action string
+		dry    bool
+		want   string
+	}{
+		{"call", true, "call.dryRun"},
+		{"restaction", true, "restaction.dryRun"},
+		{"restaction", false, "restaction"},
+		{"", true, ""},
+	}
+	for _, c := range cases {
+		rec := logtest.NewRecorder()
+		New(rec.Logger("test-957")).Emit(actorCtx(), Event{
+			Action: c.action, DryRun: c.dry, Verb: http.MethodPatch, Resource: "fireworksapps", Outcome: "success",
+		})
+		got := attrsOf957(t, rec)
+		v, has := got["krateo.action"]
+		if c.want == "" {
+			if has {
+				t.Errorf("action %q dry=%t: krateo.action = %v, want absent", c.action, c.dry, v)
+			}
+			if got["krateo.audit.incomplete"].AsString() != IncompleteAction {
+				t.Errorf("action %q dry=%t: incomplete = %v, want %q", c.action, c.dry, got["krateo.audit.incomplete"], IncompleteAction)
+			}
+			continue
+		}
+		if v.AsString() != c.want {
+			t.Errorf("action %q dry=%t: krateo.action = %q, want %q", c.action, c.dry, v.AsString(), c.want)
+		}
+	}
 }
 
 // attrsOf957 is the attribute map of the only record rec holds, values typed.
@@ -147,6 +198,8 @@ func fillEveryField(t *testing.T, ev *Event) {
 			f.SetString("x-" + v.Type().Field(i).Name)
 		case reflect.Int, reflect.Int64:
 			f.SetInt(1)
+		case reflect.Bool:
+			f.SetBool(true)
 		default:
 			t.Fatalf("Event.%s has kind %v: teach fillEveryField to set it, so docs parity covers it", v.Type().Field(i).Name, f.Kind())
 		}

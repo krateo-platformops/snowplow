@@ -34,7 +34,7 @@ A record should answer "who did what to which target":
 | field | attribute | source |
 |---|---|---|
 | actor | `enduser.id`, `user.name` (+ `user.roles`) | the request's authenticated user, read from the request context, never reconstructed |
-| action | `krateo.action` | the emit site: `call`, `call.dryRun`, `export`, `restaction` |
+| action | `krateo.action` | the emit site: `call`, `call.dryRun`, `export`, `restaction`, `restaction.dryRun` |
 | method | `http.request.method` | the verb actually sent |
 | target | `k8s.resource.*` + `k8s.namespace.name`, or `server.address` | the object acted on, or the host a RESTAction stage wrote to |
 
@@ -72,7 +72,7 @@ table does not name.
 | `event.name` | always `audit` |
 | `enduser.id`, `user.name` | the authenticated user |
 | `user.roles` | the user's groups |
-| `krateo.action` | `call`, `call.dryRun`, `export`, `restaction` |
+| `krateo.action` | `call`, `export`, `restaction`; a dry-run write carries the suffix `.dryRun` (`call.dryRun`, `restaction.dryRun`) |
 | `http.request.method` | the verb sent |
 | `outcome` | `success` / `failure` |
 | `http.response.status_code` | the authority's code, when it answered |
@@ -101,7 +101,7 @@ set (below).
 |---|---|---|
 | `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write |
 | `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun` |
-| a RESTAction `api[]` stage with a write verb, reached by `GET /call`, `POST /call/read` or `GET /export` | whatever the stage's target does with the request: the caller's own apiserver (no `endpointRef`) or a named endpoint | **audited** — `restaction`, one record per dialled call (an iterator stage of N calls is N records). See below |
+| a RESTAction `api[]` stage with a write verb, reached by `GET /call`, `POST /call/read` or `GET /export` | whatever the stage's target does with the request: the caller's own apiserver (no `endpointRef`) or a named endpoint | **audited** — `restaction` (`restaction.dryRun` when the stage's apiserver path asks for a dry run), one record per dialled call (an iterator stage of N calls is N records). See below |
 | `GET /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export` |
 | a RESTAction write stage in a background resolve (refresher, cohort seed, prewarm, content prewarm, pagination drain, a #547 demand revalidation, or a `/call` snowplow makes to itself for one of them) | nothing: the stage is refused before any request leaves (#903) | **out of scope** — nothing was sent; see "Writes nobody requested" |
 | a RESTAction write stage in a dry run (inline object on `POST /call/read`) | nothing: the stage is refused before any request leaves (#443) | **out of scope** — no authority was asked, nothing was done |
@@ -134,6 +134,13 @@ other `POST`. Each record carries:
   and `k8s.object.resource_version` of the object the apiserver answered with
   (see "Written object identity"). A stage to a named endpoint records none of
   them;
+- `krateo.action=restaction.dryRun` instead of `restaction` when a stage with
+  no `endpointRef` asks the apiserver for a dry run in its path
+  (`…/demo?dryRun=All`, e.g. a validation stage). The rule is the apiserver's
+  own: the query key `dryRun` (case-sensitive) is present with any value; any
+  value but `All` is refused with a 400, so such a write is a `failure`. A dry-run
+  stage names no written object. A named endpoint's `dryRun` query means
+  nothing to the trail and is not marked;
 - `outcome` and `http.response.status_code`: what the authority answered,
   observed at the dial — not the resolver's reshaped result, and not what the
   stage's own filter makes of it:
@@ -168,7 +175,7 @@ The rules, the same for `/call` and for a RESTAction stage
 | a successful `POST`, `PUT` or `PATCH` (a subresource included) | the response's `metadata.uid` | the response's `metadata.generation` | the response's `metadata.resourceVersion` |
 | a successful `DELETE` | the returned object's `metadata.uid` (deletion pending on finalizers), or the `details.uid` of the `Status` the apiserver answers with once the object is gone | none | none |
 | a failed or refused write | none: there is no written object. This is not an error | none | none |
-| a dry run (`call.dryRun`) | none: nothing was persisted, and the generation a dry run answers with is one a later real write can reach | none | none |
+| a dry run: `/call/dry-run` (`call.dryRun`) or a stage path with `?dryRun=All` (`restaction.dryRun`) | none: nothing was persisted. A dry-run update answers with the real uid and the generation the change would reach, which a later real write can reach too, so recording it would join that write's reconcile to this dry run | none | none |
 | a RESTAction stage to a named endpoint (`endpointRef`) | none: it may be any HTTP API | none | none |
 | `export` (a read) | none | none | none |
 

@@ -230,12 +230,12 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if rt.Status == response.StatusFailure {
 			outcome, code, msg = "failure", rt.Code, rt.Message
 		}
-		action := "call"
-		if opts.dryRun {
-			action = "call.dryRun"
-		}
+		// A dry run (#443, /call/dry-run: the apiserver is always sent
+		// dryRun=All, and a plain /call refuses an inbound dryRun) is recorded
+		// as krateo.action=call.dryRun and with no written object (#957).
 		ev := audit.Event{
-			Action:      action,
+			Action:      "call",
+			DryRun:      opts.dryRun,
 			Verb:        strings.ToUpper(opts.verb),
 			Group:       opts.gvr.Group,
 			Version:     opts.gvr.Version,
@@ -248,13 +248,8 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			Message:     msg,
 		}
 		// #957 — the written object's uid/generation/resourceVersion, from the
-		// apiserver's answer. A dry run persisted nothing: the object it
-		// answers with was never written, and its generation is one a later
-		// real write may reach, so recording it would join a controller's
-		// reconcile to a write that never happened.
-		if !opts.dryRun {
-			ev.RecordWrittenObject(answer)
-		}
+		// apiserver's answer (none on a failure or a dry run).
+		ev.RecordWrittenObject(answer)
 		audit.Emit(req.Context(), ev)
 	}
 

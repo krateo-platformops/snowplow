@@ -233,3 +233,77 @@ func TestStageAudit957_Fb_StageSite_FailureWithBody_RecordsNone(t *testing.T) {
 		"k8s.object.uid": "uid-resp-957", "k8s.object.generation": "4", "k8s.object.resource_version": "502",
 	})
 }
+
+// Dr — review F1 (#962): a stage whose apiserver path asks for a dry run is
+// marked restaction.dryRun and records none of the three fields, though the
+// apiserver answers with the object (a real dry-run update carries the real
+// uid and the generation the change would reach). Controls: a key in another
+// case is not a dry run to the apiserver, so it is a real write and records
+// the object; a named endpoint's "dryRun" query means nothing to the trail.
+func TestStageAudit957_Dr_DryRunStageRecordsNoObject(t *testing.T) {
+	api, _ := apiserver957(t)
+	ext, _ := apiserver957(t)
+	env410(t, api.URL, ext.URL)
+	rec := records410(t)
+
+	resolve410(ctxWithUser(user410, group410), api.URL,
+		withPayload957(stage410("probe", http.MethodPatch, base957+"/demo?dryRun=All")),
+		withPayload957(stage410("create", http.MethodPost, base957+"?fieldManager=x&dryRun=All")),
+		withPayload957(stage410("update", http.MethodPut, base957+"/demo?dryRun=All")),
+		stage410("remove", http.MethodDelete, base957+"/demo?dryRun=All"),
+		withPayload957(stage410("othercase", http.MethodPatch, base957+"/demo?DryRun=All")),
+		withPayload957(extStage410("endpoint", http.MethodPatch, base957+"/demo?dryRun=All")))
+
+	byStage := map[string]map[string]string{}
+	for _, r := range attrs410(rec) {
+		byStage[r["krateo.restaction.stage"]] = r
+	}
+	if len(byStage) != 6 {
+		t.Fatalf("records = %d stages, want 6: %v", len(byStage), byStage)
+	}
+	for _, stage := range []string{"probe", "create", "update", "remove"} {
+		r := byStage[stage]
+		if r["outcome"] != "success" || r["k8s.resource.resource"] != "fireworksapps" {
+			t.Fatalf("stage %s: precondition: record %v is not a successful apiserver write", stage, r)
+		}
+		if r["krateo.action"] != "restaction.dryRun" {
+			t.Errorf("stage %s: krateo.action = %q, want restaction.dryRun", stage, r["krateo.action"])
+		}
+		wantObject957(t, r, nil)
+	}
+	if r := byStage["othercase"]; r["krateo.action"] != "restaction" {
+		t.Errorf("othercase: krateo.action = %q, want restaction (the apiserver's key is case-sensitive)", r["krateo.action"])
+	} else {
+		wantObject957(t, r, map[string]string{
+			"k8s.object.uid": "uid-resp-957", "k8s.object.generation": "5", "k8s.object.resource_version": "503",
+		})
+	}
+	if r := byStage["endpoint"]; r["krateo.action"] != "restaction" {
+		t.Errorf("endpoint: krateo.action = %q, want restaction (a named endpoint is not the apiserver)", r["krateo.action"])
+	} else {
+		wantObject957(t, r, nil)
+	}
+}
+
+// apiServerDryRun decides as the apiserver does: the case-sensitive key
+// "dryRun" present with at least one value.
+func TestStageAudit957_APIServerDryRun(t *testing.T) {
+	cases := map[string]bool{
+		"":                          false,
+		"dryRun=All":                true,
+		"fieldManager=x&dryRun=All": true,
+		"dryRun=All&dryRun=All":     true,
+		"dryRun=":                   true, // a dry run to the apiserver (then refused 400)
+		"dryRun":                    true,
+		"dryRun=Bogus":              true, // ditto
+		"DryRun=All":                false,
+		"dryrun=All":                false,
+		"fieldManager=x":            false,
+		"%zz&dryRun=All":            true, // a pair that does not parse is skipped, not fatal
+	}
+	for q, want := range cases {
+		if got := apiServerDryRun(q); got != want {
+			t.Errorf("apiServerDryRun(%q) = %t, want %t", q, got, want)
+		}
+	}
+}
