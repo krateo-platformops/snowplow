@@ -69,14 +69,24 @@ type regateDeniedError struct{ status *apierrors.StatusError }
 func (e *regateDeniedError) Error() string { return e.status.Error() }
 func (e *regateDeniedError) Unwrap() error { return e.status }
 
-// newRegateForbidden builds the deny both branch C deny points return. Its text
-// IS the #681 canonical identity-free message (canonicalForbiddenMessage).
+// newRegateForbidden builds the deny both branch C GET deny points return. Its
+// text IS the #681 canonical identity-free message (canonicalForbiddenMessage).
 func newRegateForbidden(gvr schema.GroupVersionResource, namespace, name string) error {
-	return &regateDeniedError{status: apierrors.NewForbidden(gvr.GroupResource(), name,
-		fmt.Errorf("user not authorized to get %s/%s", namespace, name))}
+	return newRegateForbiddenVerb(gvr, namespace, name, "get")
 }
 
-// isRegateDenied reports whether err is a branch C per-identity re-gate deny.
+// newRegateForbiddenVerb is the per-identity deny of verb on (gvr, namespace,
+// name) that snowplow decides from RBAC, for a GET-by-name ("get") or a LIST
+// ("list", name "", newListForbidden). canonicalForbiddenMessage is its text,
+// so the deny and the apiserver's own 403 for the same path are recorded with
+// one body.
+func newRegateForbiddenVerb(gvr schema.GroupVersionResource, namespace, name, verb string) error {
+	return &regateDeniedError{status: apierrors.NewForbidden(gvr.GroupResource(), name,
+		fmt.Errorf("user not authorized to %s %s/%s", verb, namespace, name))}
+}
+
+// isRegateDenied reports whether err is a per-identity deny snowplow decided
+// from RBAC: a branch C re-gate deny, or a served LIST's deny (#961).
 func isRegateDenied(err error) bool {
 	var e *regateDeniedError
 	return errors.As(err, &e)

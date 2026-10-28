@@ -225,7 +225,7 @@ func TestDispatchViaInformer_RBACNarrowing_ListIsUserScoped(t *testing.T) {
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")
 	ctx := ctxWithUser(narrowUser)
 
-	raw, served, _ := dispatchViaInformer(ctx, call)
+	raw, served, _, _ := dispatchViaInformer(ctx, call)
 	if !served {
 		t.Fatalf("cluster-wide LIST: expected served=true; got served=false")
 	}
@@ -269,7 +269,7 @@ func TestDispatchViaInformer_RBACNarrowing_NamespacedListScoped(t *testing.T) {
 
 	// Authorized namespace → 2 items.
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/team-a/restactions")
-	raw, served, _ := dispatchViaInformer(ctx, call)
+	raw, served, _, _ := dispatchViaInformer(ctx, call)
 	if !served {
 		t.Fatalf("authorized-namespace LIST: expected served=true")
 	}
@@ -277,21 +277,21 @@ func TestDispatchViaInformer_RBACNarrowing_NamespacedListScoped(t *testing.T) {
 		t.Fatalf("authorized-namespace LIST: want 2 items; got %d (%v)", len(got), sortedKeys(got))
 	}
 
-	// Denied namespace → 0 items (filtered) when Tag-A is present.
+	// Denied namespace → no items. Since #961 the LIST itself is refused with
+	// the per-identity Forbidden (the apiserver's answer), not served empty.
 	call = buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/bench-ns-1/restactions")
-	raw, served, _ = dispatchViaInformer(ctx, call)
-	if !served {
-		t.Fatalf("denied-namespace LIST: expected served=true")
-	}
-	got := servedItemNames(t, raw)
+	raw, served, _, denied := dispatchViaInformer(ctx, call)
 	if rbacNarrowBaseline {
-		if len(got) != 2 {
+		if got := servedItemNames(t, raw); len(got) != 2 {
 			t.Fatalf("BASELINE negative control: expected denied-namespace LIST to leak all 2 items; got %d", len(got))
 		}
 		return
 	}
-	if len(got) != 0 {
-		t.Fatalf("denied-namespace LIST: want 0 items (narrow user has no grant); got %d (%v) — LEAK", len(got), sortedKeys(got))
+	if served || raw != nil {
+		t.Fatalf("denied-namespace LIST: served=%v (%d bytes) — LEAK or served-empty", served, len(raw))
+	}
+	if !isRegateDenied(denied) {
+		t.Fatalf("denied-namespace LIST: want the per-identity Forbidden (#961); got %v", denied)
 	}
 }
 
@@ -305,7 +305,7 @@ func TestDispatchViaInformer_RBACFailClosed_NilIdentity(t *testing.T) {
 
 	// No UserInfo attached — context.Background() only.
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")
-	raw, served, _ := dispatchViaInformer(context.Background(), call)
+	raw, served, _, _ := dispatchViaInformer(context.Background(), call)
 
 	if rbacNarrowBaseline {
 		// Pre-Tag-A: the pivot never reads identity → leaks everything.
@@ -390,7 +390,7 @@ func TestDispatchViaInformer_RBACNarrowing_GroupGrant(t *testing.T) {
 
 	// User "alice" is in group "devs".
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")
-	raw, served, _ := dispatchViaInformer(ctxWithUser("alice", "devs"), call)
+	raw, served, _, _ := dispatchViaInformer(ctxWithUser("alice", "devs"), call)
 	if !served {
 		t.Fatalf("group-grant LIST: expected served=true")
 	}

@@ -167,7 +167,7 @@ func TestIssue624_DispatchRBACList_ServedEqualsApiserver(t *testing.T) {
 		for _, b := range branches {
 			b := b
 			t.Run(b.name+c.path, func(t *testing.T) {
-				raw, served, _ := dispatchViaInformer(b.ctx(), buildCall(http.MethodGet, c.path))
+				raw, served, _, _ := dispatchViaInformer(b.ctx(), buildCall(http.MethodGet, c.path))
 				if !served {
 					t.Fatalf("served=false — a synced typed RBAC GVR must be served from the informer")
 				}
@@ -200,7 +200,7 @@ func TestIssue624_DispatchRBACList_ServedEqualsApiserver(t *testing.T) {
 			if err != nil {
 				t.Fatalf("apiserver get: %v", err)
 			}
-			raw, served, _ := dispatchViaInformer(b.ctx(), buildCall(http.MethodGet, base+"/namespaces/ns-a/rolebindings/grant-ns-a"))
+			raw, served, _, _ := dispatchViaInformer(b.ctx(), buildCall(http.MethodGet, base+"/namespaces/ns-a/rolebindings/grant-ns-a"))
 			if !served {
 				t.Fatalf("GET served=false on a stored typed object — the GET path drops typed slots")
 			}

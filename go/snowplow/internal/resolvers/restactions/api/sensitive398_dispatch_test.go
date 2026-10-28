@@ -20,7 +20,7 @@ func TestS398_Gate5b_SensitiveFallthroughReason(t *testing.T) {
 	secrets := schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
 
 	for _, p := range []string{"/api/v1/namespaces/x/secrets/y", "/api/v1/namespaces/x/secrets"} {
-		if raw, served, _ := dispatchViaInformer(ctx, buildCall(http.MethodGet, p)); served {
+		if raw, served, _, _ := dispatchViaInformer(ctx, buildCall(http.MethodGet, p)); served {
 			t.Fatalf("Gate 5b: a sensitive read must never be informer-served (%s); got %d bytes", p, len(raw))
 		}
 	}
@@ -43,7 +43,7 @@ func TestS398_Gate5a_RepresentationFallthroughReason(t *testing.T) {
 	path := "/apis/templates.krateo.io/v1/namespaces/default/restactions"
 
 	// CONTROL: the default representation is served from the synced informer.
-	if _, served, _ := dispatchViaInformer(ctx, buildCall(http.MethodGet, path)); !served {
+	if _, served, _, _ := dispatchViaInformer(ctx, buildCall(http.MethodGet, path)); !served {
 		t.Fatalf("CONTROL: a default-representation LIST on a synced informer must be served")
 	}
 	for _, accept := range []string{
@@ -52,7 +52,7 @@ func TestS398_Gate5a_RepresentationFallthroughReason(t *testing.T) {
 	} {
 		call := buildCall(http.MethodGet, path)
 		call.Headers = []string{accept}
-		if raw, served, _ := dispatchViaInformer(ctx, call); served {
+		if raw, served, _, _ := dispatchViaInformer(ctx, call); served {
 			t.Fatalf("Gate 5a: %q must fall through to the apiserver; the informer served %d bytes", accept, len(raw))
 		}
 	}
@@ -62,7 +62,7 @@ func TestS398_Gate5a_RepresentationFallthroughReason(t *testing.T) {
 	// The resolver's default Accept carries no `as=` and must stay informer-servable.
 	call := buildCall(http.MethodGet, path)
 	call.Headers = []string{"Accept: application/json, application/x-yaml, text/yaml"}
-	if _, served, _ := dispatchViaInformer(ctx, call); !served {
+	if _, served, _, _ := dispatchViaInformer(ctx, call); !served {
 		t.Fatalf("Gate 5a must not catch the resolver's default Accept header")
 	}
 }

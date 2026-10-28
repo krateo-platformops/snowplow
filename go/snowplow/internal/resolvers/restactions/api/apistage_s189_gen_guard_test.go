@@ -44,7 +44,7 @@ func TestApistageContentServe_S189_ResolveRacingDelete_RefusedNotResurrected(t *
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
-		raw, ok, fctx := dispatchViaInformer(ctx, call)
+		raw, ok, fctx, _ := dispatchViaInformer(ctx, call)
 		store.PutResolved(fixtureStoreVerdict, contentKey, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 		store.DeleteForTest(contentKey)
 		return raw, ok, fctx

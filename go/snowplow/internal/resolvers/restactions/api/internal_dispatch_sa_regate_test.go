@@ -19,7 +19,7 @@
 // identity-free operation (internalDispatchServesUnnarrowed), the fetched
 // bytes are re-gated with the SAME per-user helpers branch B uses
 // (filterGetByRBAC / filterListByRBAC). A denied GET → apierrors.Forbidden;
-// a LIST → the ctx identity's authorized subset (served-empty on full deny).
+// a LIST → the ctx identity's authorized subset (a LIST the identity may not make at all is the typed re-gate Forbidden, #961).
 //
 // RIGGING: each arm drives the REAL dispatchViaInternalRESTConfig against a
 // hermetic in-process fake apiserver (httptest) reachable through a

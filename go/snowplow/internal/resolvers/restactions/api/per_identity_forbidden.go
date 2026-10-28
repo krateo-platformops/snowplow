@@ -29,23 +29,22 @@ package api
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 
 	"github.com/krateo-platformops/plumbing/http/response"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 )
 
 // canonicalForbiddenMessage is the identity-free message for a denied read of
-// (gvr, ns, name). For a GET it is exactly the regateDeniedError text.
+// (gvr, ns, name). It is exactly the regateDeniedError text snowplow's own deny
+// of the same read carries (a branch C GET, a served LIST — #961), so an
+// in-process deny and the apiserver's 403 are recorded with one body.
 func canonicalForbiddenMessage(gvr schema.GroupVersionResource, namespace, name, verb string) string {
-	return apierrors.NewForbidden(gvr.GroupResource(), name,
-		fmt.Errorf("user not authorized to %s %s/%s", verb, namespace, name)).Error()
+	return newRegateForbiddenVerb(gvr, namespace, name, verb).Error()
 }
 
 // canonicalForbiddenBody is the identity-free value recorded under errorKey.

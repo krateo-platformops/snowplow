@@ -213,6 +213,35 @@ recorded under its `errorKey` (default `error`): the upstream's `Status`
 non-2xx answer always keeps its HTTP code, even with an empty body or a body
 that is not a `Status`.
 
+### A list the caller may not make is `Forbidden`, whichever path answers it
+
+A read stage without `endpointRef` runs as the caller. Snowplow answers it
+either from its own copy of the data (the cache) or by asking the Kubernetes
+API server, depending on what it holds at that moment. A `GET` of a list gets
+the same answer either way:
+
+- **The caller may not list that resource anywhere the request covers.** The
+  stage fails with `Forbidden`: `errorKey` holds the `Status`
+  `{"reason":"Forbidden","code":403}` with a message that names the resource
+  and the namespace but never the caller, and the stage-outcome header lists
+  the stage as `Forbidden`. A namespaced list (`.../namespaces/team-a/...`)
+  needs a grant in that namespace. A cluster-wide list needs a cluster-wide
+  grant or, for a namespaced resource, a grant in at least one namespace; a
+  `RoleBinding` grants nothing on a cluster-scoped resource. A `RESTAction`
+  that branches on a 403 sees it on every path, not only when the cache is
+  cold.
+- **The caller may list it.** The stage gets `200` with the items the caller
+  may see. An empty collection is `200` with `items: []`, not a 403.
+- **The caller may list only some namespaces of a cluster-wide list.** When
+  the cache answers, the stage gets `200` with the items of those namespaces.
+  The API server itself refuses a cluster-wide list without a cluster-wide
+  grant, so when snowplow has to ask it (cache cold) the same request is
+  `Forbidden`. To get one answer on every path, list each namespace the
+  caller may read.
+
+The decision comes from the caller's RBAC rules, never from how many items
+happen to be visible.
+
 ### A write stage waits for the stage it depends on
 
 A **write** stage (any verb but `GET`, `HEAD`, `OPTIONS`, `TRACE`) whose

@@ -55,7 +55,9 @@ func TestFalsifierF1_RBACMemoIsNamespaceKeyed(t *testing.T) {
 
 	const itemsPerNS = 3
 	namespaces := []string{"team-a", "team-b", "bench-ns-1", "bench-ns-2", "kube-system"}
-	wantCalls := uint64(len(namespaces)) // one EvaluateRBAC per namespace
+	// One EvaluateRBAC per namespace, plus the ONE scope evaluation of the
+	// request itself (#961: may the requester list at the cluster scope?).
+	wantCalls := uint64(len(namespaces)) + 1
 
 	var items []*unstructured.Unstructured
 	for _, ns := range namespaces {
@@ -67,15 +69,16 @@ func TestFalsifierF1_RBACMemoIsNamespaceKeyed(t *testing.T) {
 	ctx := ctxWithUser(narrowUser)
 	rbac.ResetEvaluateRBACCallCount()
 
-	_, served := filterListByRBAC(ctx, dispatchTestGVR, items)
-	if !served {
-		t.Fatalf("F1: filterListByRBAC served=false (expected an identity-present pass)")
+	// A cluster-wide LIST (namespace ""): narrowUser holds team-a and team-b.
+	_, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "", items)
+	if gateErr != nil {
+		t.Fatalf("F1: filterListByRBAC = %v (expected an identity-present pass)", gateErr)
 	}
 
 	got := rbac.EvaluateRBACCallCount()
 	if got != wantCalls {
 		t.Fatalf("F1: filterListByRBAC over %d namespaces × %d items made %d EvaluateRBAC calls; "+
-			"want exactly %d (one per namespace) — the per-item evaluation is not namespace-memoized",
+			"want exactly %d (one per namespace + the scope) — the per-item evaluation is not namespace-memoized",
 			len(namespaces), itemsPerNS, got, wantCalls)
 	}
 }
@@ -96,13 +99,14 @@ func TestFalsifierF1_RBACMemoNameIndependence(t *testing.T) {
 	ctx := ctxWithUser(narrowUser)
 	rbac.ResetEvaluateRBACCallCount()
 
-	kept, served := filterListByRBAC(ctx, dispatchTestGVR, items)
-	if !served {
-		t.Fatalf("F1-name: filterListByRBAC served=false")
+	// A LIST of team-a: the scope evaluation (team-a) plus ONE per-item one.
+	kept, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "team-a", items)
+	if gateErr != nil {
+		t.Fatalf("F1-name: filterListByRBAC = %v", gateErr)
 	}
-	if got := rbac.EvaluateRBACCallCount(); got != 1 {
-		t.Fatalf("F1-name: two same-namespace items made %d EvaluateRBAC calls; want 1 "+
-			"(verb:list is name-independent — one namespace, one evaluation)", got)
+	if got := rbac.EvaluateRBACCallCount(); got != 2 {
+		t.Fatalf("F1-name: two same-namespace items made %d EvaluateRBAC calls; want 2 "+
+			"(the scope + verb:list is name-independent — one namespace, one evaluation)", got)
 	}
 	if len(kept) != 2 {
 		t.Fatalf("F1-name: name-independence broken — %d/2 items kept; the verdict must be "+

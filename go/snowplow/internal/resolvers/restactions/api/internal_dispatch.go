@@ -762,9 +762,11 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 	// Per-user RBAC re-gate on the LIST (defensive authorization). See the
 	// GET branch above: branch C reads under the SA client, so an un-narrowed
 	// LIST would serve every namespace's items to a denied per-user caller.
-	// DEFAULT POSTURE on a full deny: a served-EMPTY `items` list, byte-
-	// consistent with the informer path (filterListByRBAC returns an empty
-	// subset, not a fall-through). The informer-serve early return above is
+	// A caller who may `list` on NO scope the request covers gets the typed
+	// re-gate Forbidden (#961) — the apiserver's own answer for that caller,
+	// and the informer path's: filterListByRBAC decides it from the RBAC rules,
+	// never from how many items survive. An allowed LIST keeps the caller's
+	// items (possibly none). The informer-serve early return above is
 	// unreachable for a per-user request (it is gated on a serve-watcher,
 	// which is itself clause (a) of serveUnnarrowed), so this is the single
 	// narrowing site for a live-LIST branch-C serve.
@@ -779,11 +781,15 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		for i := range resultList.Items {
 			items[i] = &resultList.Items[i]
 		}
-		filtered, servedOK := filterListByRBAC(ctx, gvr, items)
-		if !servedOK {
-			// filterListByRBAC's no-identity contract (fall-through, not
-			// serve). Unreachable here — clause (c) already exempts a
-			// no-identity ctx before we narrow — but honour it defensively.
+		filtered, gateErr := filterListByRBAC(ctx, gvr, namespace, items)
+		if isRegateDenied(gateErr) {
+			return nil, false, gateErr
+		}
+		if gateErr != nil {
+			// filterListByRBAC's not-decided contract (fall-through, not
+			// serve): no identity — unreachable here, clause (c) already
+			// exempts a no-identity ctx before we narrow — or an evaluator
+			// error.
 			return nil, false, nil
 		}
 		narrowed := make([]unstructured.Unstructured, len(filtered))

@@ -210,7 +210,7 @@ func armChurnSeam(t *testing.T, dyn dynamic.Interface, armed *atomic.Bool, churn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	var done sync.Map
 	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
-		raw, ok, fctx := dispatchViaInformer(ctx, call)
+		raw, ok, fctx, _ := dispatchViaInformer(ctx, call)
 		if armed.Load() {
 			for g, kn := range churns {
 				if strings.HasSuffix(call.Path, "/"+g.Resource) {
@@ -328,7 +328,7 @@ func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[sche
 		}
 		gen0 := store.CaptureGen(k)
 		path := "/apis/" + used.Group + "/" + used.Version + "/" + used.Resource
-		raw, ok, _ := dispatchViaInformer(cache.WithApistageContentResolve(hctx),
+		raw, ok, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(hctx),
 			httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{Path: path, Verb: ptr.To(http.MethodGet)}})
 		if ok {
 			rctx := cache.WithL1KeyContext(hctx, k)
@@ -431,7 +431,7 @@ func TestIssue375_ContentOwnDepChurn_ContentKeyRemarked_ConvergesFresh(t *testin
 	cache.RegisterRefreshFunc(cache.CacheEntryClassApistage, func(hctx context.Context, k string, used cache.ResolvedKeyInputs) error {
 		gen0 := store.CaptureGen(k)
 		path := "/apis/" + used.Group + "/" + used.Version + "/" + used.Resource
-		raw, ok, _ := dispatchViaInformer(cache.WithApistageContentResolve(hctx),
+		raw, ok, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(hctx),
 			httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{Path: path, Verb: ptr.To(http.MethodGet)}})
 		if ok {
 			store.ReplaceResolvedIfGen(cache.WithL1KeyContext(hctx, k), fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: raw, Inputs: &used}, gen0)
