@@ -225,9 +225,29 @@ FAKE = textwrap.dedent("""\
             pvs = [] if has("pvcs_deleted") and not os.environ.get("FAKE_PV_STUCK") else json.load(
                 open(os.environ["FAKE_PVS"]))
             if has("pvcs_deleted") and os.environ.get("FAKE_REPROVISIONED"):
-                # run 17: the StatefulSet re-created its pod and claim; a new PV, a new disk
+                # a claim created before the policy took hold: a new PV, a new disk
                 pvs = pvs + [json.loads(os.environ["FAKE_REPROVISIONED"])]
+            if has("sts_recreated"):
+                pvs = pvs + [json.loads(os.environ["FAKE_STS_CLAIM"])]
             print(json.dumps({"items": pvs})); sys.exit(0)
+        guard = has("guard_applied") and not os.environ.get("FAKE_GUARD_IGNORED")
+        if a[:2] == ["apply", "--server-side"] and "bench-teardown" in " ".join(a):
+            if os.environ.get("FAKE_GUARD_APPLY_RC"):
+                sys.exit(int(os.environ["FAKE_GUARD_APPLY_RC"]))
+            open(os.path.join(st, "guard_applied"), "w").write(sys.stdin.read()); sys.exit(0)
+        if a[:2] == ["create", "--dry-run=server"]:
+            if guard:      # the API server's answer to a claim the policy refuses
+                sys.stderr.write('The persistentvolumeclaims "bench-teardown-probe" is invalid: : '
+                                 "ValidatingAdmissionPolicy 'bench-teardown-no-new-claims' with binding "
+                                 "'bench-teardown-no-new-claims' denied request: bench teardown (#954)\\n")
+                sys.exit(1)
+            sys.exit(0)
+        if a[:3] == ["delete", "pod", "-n"] and a[4] == "mongodb-0" and os.environ.get("FAKE_STS_CLAIM"):
+            # the StatefulSet controller: its pod is gone, so it re-creates the pod AND its claim
+            # (volumeClaimTemplates) unless the API server refuses the claim
+            if not guard and has("pvcs_deleted"):
+                open(os.path.join(st, "sts_recreated"), "w").write("1")
+            sys.exit(0)
         if a[:2] == ["patch", "pv"] and os.environ.get("FAKE_PATCH_FAIL") == a[2]:
             sys.stderr.write('Error from server (Forbidden): persistentvolumes "x" is forbidden: User '
                              '"someone@example.invalid" cannot patch resource\\n'); sys.exit(1)
@@ -366,7 +386,10 @@ def test_teardown_releases_the_pvcs_before_the_cluster_then_backstops_exactly(fa
     c = _calls(fakes)
     i_view = _first(c, ["kubectl", "config", "view"])
     i_patch = _first(c, ["kubectl", "patch", "pv", "pvc-ours-recorded-unlabelled"])   # Retain -> Delete
+    i_guard = _first(c, ["kubectl", "apply", "--server-side"])
+    i_probe = _first(c, ["kubectl", "create", "--dry-run=server"])
     i_pvc = _first(c, ["kubectl", "delete", "pvc", "--all", "--all-namespaces"])
+    assert i_patch < i_guard < i_probe < i_pvc
     i_pod = _first(c, ["kubectl", "delete", "pod", "-n", "krateo-system", "mongodb-0"])
     i_gone_pv = max(i for i, x in enumerate(c) if x[:3] == ["kubectl", "get", "pv"])
     i_del = _first(c, ["gcloud", "container", "clusters", "delete", NAME])
@@ -517,6 +540,59 @@ def test_a_claim_re_created_during_the_release_is_recorded_and_its_disk_deleted(
                    f"labels.cluster-id-gke-io={OURS_B32} OR name=(pvc-ours-leftover pvc-ours-recorded-unlabelled "
                    f"pvc-reprovisioned-id-only))")
     assert any("for PVC krateo-system/datadir-krateo-clickstack-mongodb-0" in m for m in log)
+
+
+MONGO_PV = _pv("pvc-sts-recreated", f"projects/{PROJECT}/zones/{ZONE}/disks/pvc-sts-recreated", "Delete")
+
+
+def test_a_statefulset_re_creates_its_claim_when_nothing_refuses_it(fakes, monkeypatch, capsys):
+    """#954, the REPRODUCTION (the old order: claims and pods deleted while new
+    claims are allowed). mongodb-0's StatefulSet re-creates its claim: a new
+    PV, a new disk, after the release has recorded its PVs."""
+    monkeypatch.setenv("FAKE_STS_CLAIM", json.dumps(MONGO_PV))
+    monkeypatch.setattr(gke, "block_new_claims", lambda k, **kw: True)     # the old order: no guard
+    log = []
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60, sleep=lambda s: None)
+    assert (fakes / "state" / "sts_recreated").exists()
+    assert any("1 PV(s) provisioned DURING the release: pvc-sts-recreated" in m for m in log)
+    assert "provisioned DURING the release" in capsys.readouterr().err                   # said loudly
+
+
+def test_the_release_refuses_new_claims_before_it_deletes_any(fakes, monkeypatch):
+    """#954: the new order. The API server refuses every new claim (verified
+    by a denied dry-run claim) BEFORE the claims and their pods go, so the
+    StatefulSet cannot re-create one."""
+    monkeypatch.setenv("FAKE_STS_CLAIM", json.dumps(MONGO_PV))
+    log = []
+    assert gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60,
+                        sleep=lambda s: None) == []
+    c = _calls(fakes)
+    assert _first(c, ["kubectl", "apply", "--server-side"]) < _first(c, ["kubectl", "create", "--dry-run=server"]) \
+        < _first(c, ["kubectl", "delete", "pvc"]) < _first(c, ["kubectl", "delete", "pod"])
+    assert not (fakes / "state" / "sts_recreated").exists()
+    assert not any("provisioned DURING" in m for m in log)
+    assert any(f"new claims refused ({gke.NO_NEW_CLAIMS} in force)" in m for m in log)
+    applied = (fakes / "state" / "guard_applied").read_text()
+    assert "kind: ValidatingAdmissionPolicy" in applied and "operations: [\"CREATE\"]" in applied
+    assert 'resources: ["persistentvolumeclaims"]' in applied and "validationActions: [Deny]" in applied
+
+
+@pytest.mark.parametrize("env", [{"FAKE_GUARD_IGNORED": "1"}, {"FAKE_GUARD_APPLY_RC": "1"}])
+def test_no_claim_is_deleted_unless_new_claims_are_refused(fakes, monkeypatch, capsys, env):
+    """A policy the API server does not enforce (or could not apply): no claim
+    deleted — nothing to re-create — and the disks are left to the backstop,
+    which runs; the wait for the policy is bounded by the release's budget."""
+    monkeypatch.setenv("FAKE_STS_CLAIM", json.dumps(MONGO_PV))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    log = []
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60, clock=_ticks(),
+                 sleep=lambda s: None)
+    c = _calls(fakes)
+    assert not any(x[:3] == ["kubectl", "delete", "pvc"] for x in c)
+    assert not any(x[:3] == ["kubectl", "delete", "pod"] for x in c)
+    assert "PVC release REFUSED: the API server of" in capsys.readouterr().err
+    assert any(x[:4] == ["gcloud", "compute", "disks", "delete"] for x in c)            # the backstop ran
 
 
 def test_the_backstop_waits_for_an_attached_disk_to_detach_then_deletes_it(fakes, monkeypatch):

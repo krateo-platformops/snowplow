@@ -763,6 +763,10 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
     before run 17) and deleted where it was found (#899 F3)."""
     if dry_run:
         execute(describe_command(spec), dry_run=True, log=log)
+        execute(_kubectl(spec) + ["apply", "--server-side", "--field-manager=bench-teardown", "-f", "-"],
+                dry_run=True, log=log)
+        log(f"DRY-RUN: (stdin: ValidatingAdmissionPolicy {NO_NEW_CLAIMS}, then a server-side dry-run claim "
+            f"that must be denied)")
         execute(_kubectl(spec) + ["delete", "pvc", "--all", "--all-namespaces", "--wait=false"],
                 dry_run=True, log=log)
         execute(delete_command(spec), dry_run=True, log=log)
@@ -1000,6 +1004,75 @@ def _host(url: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+# #954: the PVC release must not make anything re-create a claim. The claims'
+# StatefulSets belong to operators (on 057, 2026-10-28: ClickHouseCluster,
+# KeeperCluster, MongoDBCommunity, controller=true), whose CRs belong to the
+# platform's helm release: a StatefulSet scaled to 0 or deleted is re-created
+# by its operator, a CR by its composition. So the API server itself refuses
+# every new PersistentVolumeClaim for the rest of the cluster's life — no
+# workload, owner or operator named — before any claim is deleted.
+NO_NEW_CLAIMS = "bench-teardown-no-new-claims"
+NO_NEW_CLAIMS_MANIFEST = f"""\
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {NO_NEW_CLAIMS}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["persistentvolumeclaims"]
+  validations:
+  - expression: "false"
+    message: "bench teardown (#954): no new PersistentVolumeClaim while the cluster's disks are released"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {NO_NEW_CLAIMS}
+spec:
+  policyName: {NO_NEW_CLAIMS}
+  validationActions: [Deny]
+"""
+# the probe of the real condition: a claim the API server must refuse (server-side dry run:
+# admission runs, nothing is stored)
+NO_NEW_CLAIMS_PROBE = """\
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bench-teardown-probe
+  namespace: default
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+"""
+
+
+def block_new_claims(k: list[str], *, log: Callable[[str], None], deadline: float,
+                     clock: Callable[[], float], sleep: Callable[[float], None]) -> bool:
+    """Apply NO_NEW_CLAIMS and wait — on the real condition, bounded by
+    `deadline` — until the API server refuses a new claim (a server-side
+    dry-run create is denied by this policy). True once it is in force."""
+    rc, _ = execute(k + ["apply", "--server-side", "--field-manager=bench-teardown", "-f", "-"], dry_run=False,
+                    log=log, input_data=NO_NEW_CLAIMS_MANIFEST)
+    if rc != 0:
+        return False
+    while True:
+        err: list[str] = []
+        rc, _ = execute(k + ["create", "--dry-run=server", "-f", "-"], dry_run=False, log=lambda _: None,
+                        input_data=NO_NEW_CLAIMS_PROBE, stderr_out=err)
+        if rc != 0 and NO_NEW_CLAIMS in (err[-1] if err else ""):
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(_POLL_S)
+
+
 def release_pvc_disks(spec: ClusterSpec, describe: dict, *, log: Callable[[str], None],
                       deadline: float, clock: Callable[[], float],
                       sleep: Callable[[float], None]) -> list[dict]:
@@ -1049,6 +1122,16 @@ def release_pvc_disks(spec: ClusterSpec, describe: dict, *, log: Callable[[str],
                 log(msg)
                 sys.stderr.write(msg + "\n")
                 return mine
+    # #954: first nothing may re-create a claim (run 17: the StatefulSets re-created theirs, and
+    # each new claim provisioned a disk the release never saw)
+    if not block_new_claims(k, log=log, deadline=deadline, clock=clock, sleep=sleep):
+        msg = (f"PVC release REFUSED: the API server of {spec.name} does not yet refuse new claims "
+               f"({NO_NEW_CLAIMS}); deleting the PVCs now would let their StatefulSets re-create them, each "
+               f"with a NEW disk. No PVC deleted; the disk backstop deletes the cluster's disks after the delete")
+        log(msg)
+        sys.stderr.write(msg + "\n")
+        return mine
+    log(f"PVC release: new claims refused ({NO_NEW_CLAIMS} in force); deleting the PVCs and their pods")
     execute(k + ["delete", "pvc", "--all", "--all-namespaces", "--wait=false"], dry_run=False, log=log)
     rc, out = execute(k + ["get", "pods", "--all-namespaces", "-o", "json"], dry_run=False, log=log)
     for p in ((_json(out) or {}).get("items") or []) if rc == 0 else []:
@@ -1073,13 +1156,15 @@ def release_pvc_disks(spec: ClusterSpec, describe: dict, *, log: Callable[[str],
                 f"the disk backstop runs after the delete")
             break
         sleep(_POLL_S)
-    # #954: deleting a StatefulSet's pod and claim makes it re-create both, and a new claim
-    # provisions a NEW disk; run 17 leaked 4 such disks per cluster. Record them for the backstop.
+    # #954: with new claims refused, no PV may appear meanwhile; one that does (a claim created
+    # before the policy took hold) is said loudly and recorded for the backstop
     new = [d for d in pv_disks(last) if _ours(d, spec) and d["pv"] not in want] if isinstance(last, dict) else []
     if new:
-        log(f"PVC release: {len(new)} PV(s) provisioned DURING the release (their workloads re-created the "
-            f"claims): " + ", ".join(f"{d['pv']}={d['disk']}" for d in new)
-            + "; the disk backstop deletes their disks after the cluster delete")
+        msg = (f"PVC release: {len(new)} PV(s) provisioned DURING the release: "
+               + ", ".join(f"{d['pv']}={d['disk']}" for d in new)
+               + "; the disk backstop deletes their disks after the cluster delete")
+        log(msg)
+        sys.stderr.write(msg + "\n")
     return mine + new
 
 
