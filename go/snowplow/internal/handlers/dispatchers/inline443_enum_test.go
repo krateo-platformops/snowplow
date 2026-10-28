@@ -209,6 +209,9 @@ var cacheAllow443 = map[string]cacheClass443{
 	// re-resolve / evict run only for a debt that check let open.
 	"StaleServeSinkFromContext": readOnly443, "StaleServeSink.L1Key": readOnly443,
 	"StaleServeSink.ServedAt": readOnly443, "KnownStaleMark": readOnly443,
+	// #930 — reads the dirty-window clock (an atomic pointer load, time.Now by
+	// default) to age a known-stale mark; no state is written.
+	"DirtyWindowNow": readOnly443,
 	// #905 — BeginWrite and NoteDeclaredWrite set flags on the request's own sink, DeclaredWrite reads
 	// them: request-scoped, nothing outlives the request (an inert resolve has no
 	// sink, and the nil sink answers without state).
