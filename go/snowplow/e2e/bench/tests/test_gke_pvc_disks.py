@@ -236,6 +236,8 @@ FAKE = textwrap.dedent("""\
                 sys.exit(int(os.environ["FAKE_GUARD_APPLY_RC"]))
             open(os.path.join(st, "guard_applied"), "w").write(sys.stdin.read()); sys.exit(0)
         if a[:2] == ["create", "--dry-run=server"]:
+            if os.environ.get("FAKE_PROBE_REFUSAL"):     # refused, but NOT by our policy
+                sys.stderr.write(os.environ["FAKE_PROBE_REFUSAL"] + "\\n"); sys.exit(1)
             if guard:      # the API server's answer to a claim the policy refuses
                 sys.stderr.write('The persistentvolumeclaims "bench-teardown-probe" is invalid: : '
                                  "ValidatingAdmissionPolicy 'bench-teardown-no-new-claims' with binding "
@@ -592,6 +594,36 @@ def test_no_claim_is_deleted_unless_new_claims_are_refused(fakes, monkeypatch, c
     assert not any(x[:3] == ["kubectl", "delete", "pvc"] for x in c)
     assert not any(x[:3] == ["kubectl", "delete", "pod"] for x in c)
     assert "PVC release REFUSED: the API server of" in capsys.readouterr().err
+    assert any(x[:4] == ["gcloud", "compute", "disks", "delete"] for x in c)            # the backstop ran
+
+
+@pytest.mark.parametrize("why, stderr", [
+    ("a quota", 'Error from server (Forbidden): persistentvolumeclaims "bench-teardown-probe" is forbidden: '
+                "exceeded quota: storage, requested: requests.storage=1Gi, used: requests.storage=40Gi, "
+                "limited: requests.storage=40Gi"),
+    ("another webhook", 'Error from server (InternalError): Internal error occurred: failed calling webhook '
+                        '"validate.kyverno.svc": failed to call webhook: context deadline exceeded'),
+    ("another admission policy", "The persistentvolumeclaims \"bench-teardown-probe\" is invalid: : "
+                                 "ValidatingAdmissionPolicy 'require-storage-class' with binding "
+                                 "'require-storage-class' denied request: storageClassName is required"),
+    ("Unauthorized", "error: You must be logged in to the server (Unauthorized)"),
+    ("a client error", "error: unable to recognize \"STDIN\": no matches for kind \"PersistentVolumeClaim\""),
+])
+def test_a_probe_refused_for_any_other_reason_deletes_no_claim(fakes, monkeypatch, capsys, why, stderr):
+    """#956 review R1 (the reviewer's Z5): only a refusal BY bench-teardown-no-new-claims
+    proves new claims are refused. A probe refused by a quota, another webhook or
+    policy, Unauthorized or a client error says nothing about re-created claims:
+    no claim is deleted, and the disks are left to the backstop."""
+    monkeypatch.setenv("FAKE_STS_CLAIM", json.dumps(MONGO_PV))
+    monkeypatch.setenv("FAKE_PROBE_REFUSAL", stderr)
+    log = []
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60, clock=_ticks(),
+                 sleep=lambda s: None)
+    c = _calls(fakes)
+    assert not any(x[:3] == ["kubectl", "delete", "pvc"] for x in c), why
+    assert not any(x[:3] == ["kubectl", "delete", "pod"] for x in c), why
+    assert "PVC release REFUSED: the API server of" in capsys.readouterr().err
+    assert not (fakes / "state" / "sts_recreated").exists()
     assert any(x[:4] == ["gcloud", "compute", "disks", "delete"] for x in c)            # the backstop ran
 
 

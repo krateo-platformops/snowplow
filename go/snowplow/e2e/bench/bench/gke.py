@@ -1196,7 +1196,13 @@ def disk_backstop(spec: ClusterSpec, *, cluster_id: str | None, recorded: list[d
     disk left" is said only from a list that returned none. Raises when the
     disks cannot be listed or deleted, when the cluster's id is unknown, or
     when a disk is still there at the deadline (a leak never reads as
-    success, #954)."""
+    success, #954).
+
+    Zonal disks only: the list is filtered by the cluster's zone, so a
+    REGIONAL persistent disk (a StorageClass with replication-type
+    regional-pd; it has no zone) is never listed. Every bench claim today is
+    a zonal standard-rwo disk; a regional StorageClass would need its own
+    region-filtered list."""
     if cluster_id is None:
         raise RuntimeError(f"{spec.name}'s cluster id is unknown (describe had none): its disks cannot be "
                            f"found by GKE's id label, so whether any is left is unknown")
