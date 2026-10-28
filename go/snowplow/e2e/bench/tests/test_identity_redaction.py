@@ -47,6 +47,18 @@ def test_a_digest_reference_survives(ref):
     assert identity.redact_identity(json.dumps({"image_id": ref})) == json.dumps({"image_id": ref})
 
 
+@pytest.mark.parametrize("ref", [
+    "github.com/krateo-platformops/provider-runtime@v1.5.1",          # a Go module reference (build info, logs)
+    "github.com/krateoplatformops/provider-runtime@v1.3.0-rc.1",
+    "golang.org/x/net@v0.30.0",
+    "k8s.io/client-go@v0.31.2",
+])
+def test_a_module_reference_survives(ref):
+    """Not an e-mail: its last label is not letters-only (only the mail-shaped
+    domain rule keeps these, not the digest lookahead)."""
+    assert identity.redact_identity(f"dep {ref} h1:abc=") == f"dep {ref} h1:abc="
+
+
 @pytest.mark.parametrize("line, want", EMAILS)
 def test_an_email_is_still_redacted(line, want):
     assert identity.redact_identity(line) == want
