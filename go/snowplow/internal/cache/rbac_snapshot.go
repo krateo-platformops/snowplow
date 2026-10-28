@@ -105,6 +105,26 @@ type RBACSnapshot struct {
 	// in one operation against rbacSnapshotPublishSeq).
 	PublishSeq uint64
 
+	// Synced — #947. True iff every one of the four RBAC informers had
+	// finished its initial LIST (HasSynced) BEFORE this snapshot read the
+	// indexers, so the snapshot holds every binding and every role the
+	// cluster had at that point. Stamped once by rebuildRBACSnapshot, read
+	// by the evaluator; immutable like every other field.
+	//
+	// It decides what a roleRef that resolves to nothing means:
+	//   - Synced: the role really is absent. A binding to an absent role is
+	//     a valid Kubernetes state that grants nothing. The snapshot writer
+	//     reports it once, when the binding becomes dangling and when it stops
+	//     (rbac_dangling_roleref.go); the evaluator denies without logging.
+	//   - not Synced: a snapshot published while an informer was still
+	//     listing (an event-driven rebuild during the initial LIST) can lack a
+	//     role that exists. That is a consistency fault, and the evaluator
+	//     keeps reporting it on every miss (RecordRBACSnapshotMiss).
+	//
+	// The zero value is "not synced", so a snapshot that does not come from
+	// rebuildRBACSnapshot (a hand-built test snapshot) keeps the loud path.
+	Synced bool
+
 	// Cluster-wide ClusterRoleBindings — read at evaluate.go:198.
 	ClusterRoleBindings []*rbacv1.ClusterRoleBinding
 
@@ -221,11 +241,12 @@ var (
 )
 
 // rbacSnapshotMissCount counts every roleRef map-lookup miss in
-// `roleRefPermits` (AC-B.10 — mirrors the 0.30.6 fallback=true
-// invariant at evaluate.go:185-186). Production target: miss-count /
-// EvaluateRBAC-count MUST stay below 1% over any 1-minute window. The
-// steady-state >0% baseline is the rebuild-lag eventual-consistency
-// window described in the design §4.2.
+// `roleRefPermits` against a snapshot that is not Synced (AC-B.10 — mirrors
+// the 0.30.6 fallback=true invariant at evaluate.go:185-186). Production
+// target: miss-count / EvaluateRBAC-count MUST stay below 1% over any
+// 1-minute window. Since #947 a miss in a Synced snapshot (a binding to an
+// absent role) is not counted here: it is a valid cluster state, counted by
+// the dangling-roleRef gauge instead.
 var rbacSnapshotMissCount atomic.Uint64
 
 // RBACSnapshotMissCount returns the cumulative count of `roleRefPermits`
@@ -236,16 +257,19 @@ func RBACSnapshotMissCount() uint64 {
 }
 
 // RecordRBACSnapshotMiss is called by the RBAC `roleRefPermits` code
-// when a roleRef name is not in the snapshot's CR/R map even though the
-// binding still references it. The miss is WARN-logged and a counter
-// incremented; the caller treats the miss as a deny (same fail-closed
-// posture as today's `GetTypedObject !ok`).
+// when a roleRef name is not in the CR/R map of a snapshot that is NOT
+// Synced (#947): one built before every RBAC informer finished its initial
+// LIST, so the role may exist and simply not be listed yet. That is a
+// snapshot consistency fault: the miss is WARN-logged on every occurrence
+// and a counter incremented; the caller treats it as a deny (same
+// fail-closed posture as today's `GetTypedObject !ok`).
 //
-// The expected steady-state miss rate is the bounded rebuild lag from
-// §4.2 (a binding whose target CR/R was just deleted; the snapshot
-// rebuild has not landed yet). >1% over any 1-minute window indicates a
-// genuine half-done migration / registration bug — the tester polls the
-// ratio for the AC-B.10 gate.
+// A miss in a Synced snapshot is NOT recorded here. Both the binding and
+// the role list are complete there, so the role really is absent: a valid
+// Kubernetes state that grants nothing. The snapshot writer reports it once
+// per state change (rbac_dangling_roleref.go) and the evaluator denies
+// silently. Before #947 every evaluation that reached such a binding logged
+// here, so the log volume scaled with traffic.
 func RecordRBACSnapshotMiss(kind, namespace, name string) {
 	rbacSnapshotMissCount.Add(1)
 	// Snapshot-version sequence number — bumped on every publish —
@@ -259,8 +283,8 @@ func RecordRBACSnapshotMiss(kind, namespace, name string) {
 		slog.String("namespace", namespace),
 		slog.String("name", name),
 		slog.Uint64("snap_seq", snapSeq),
-		slog.String("hint", "roleRef references a target absent from the snapshot — "+
-			"either rebuild-lag (self-healing) or a genuine indexer/snapshot inconsistency"),
+		slog.String("hint", "roleRef references a target absent from a snapshot built before every RBAC informer "+
+			"finished its initial LIST — a snapshot consistency fault; the next synced snapshot resolves it"),
 	)
 }
 
@@ -538,7 +562,14 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		(*h)(taken) // #703 arm (b): after the take, before the indexer read
 	}
 
+	// #947 — read the informers' synced state BEFORE the indexers: if all
+	// four had synced at this point, the reads below see at least their
+	// complete initial LIST. Read on the rebuild goroutine, never from an
+	// informer transform (the transform runs under the FIFO lock).
+	synced := rbacInformersSynced(rw)
+
 	snap := &RBACSnapshot{
+		Synced:             synced,
 		RoleBindingsByNS:   map[string][]*rbacv1.RoleBinding{},
 		ClusterRolesByName: map[string]*rbacv1.ClusterRole{},
 		RolesByNSName:      map[string]*rbacv1.Role{},
@@ -625,6 +656,13 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 	// after the slice/map fields are stable means a reader that observes
 	// snap via Snapshot() sees a fully-formed snapshot, indexes and all.
 	rebuildSubjectIndexes(snap)
+	// #947 — the bindings whose roleRef names an absent role. Only a synced
+	// snapshot can tell: in an unsynced one the role may just not be listed
+	// yet.
+	var dangling map[danglingRoleRef]struct{}
+	if snap.Synced {
+		dangling = danglingRoleRefsOf(snap)
+	}
 	if h := rebuildPreStoreHookForTest.Load(); h != nil {
 		(*h)() // #703 arm (a): the snapshot is built, not yet Stored
 	}
@@ -656,6 +694,11 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 	}
 	rbacSnap.Store(snap)
 	notePublished() // #691
+	// #947 — report the dangling roleRefs that changed with this publish:
+	// one line per binding that became dangling or stopped being dangling.
+	if snap.Synced {
+		noteDanglingRoleRefs(snap, dangling)
+	}
 
 	// #686 — a bindings-index build requested before the first publish was
 	// deferred, not marked built over nothing. Run it over a COMPLETE
@@ -848,6 +891,32 @@ func indexerList(rw *ResourceWatcher, gvr schema.GroupVersionResource) []interfa
 		return nil
 	}
 	return gi.Informer().GetIndexer().List()
+}
+
+// rbacInformersSynced reports whether all four typed-RBAC informers are
+// registered and have finished their initial LIST (#947). A missing informer
+// counts as not synced. Called by rebuildRBACSnapshot before it reads the
+// indexers, on the rebuild goroutine. It must never be called from an
+// informer transform: the transform runs under the FIFO lock, and no informer
+// accessor may be called from it (#875).
+func rbacInformersSynced(rw *ResourceWatcher) bool {
+	rw.mu.RLock()
+	hasSynced := make([]func() bool, 0, len(rbacTypedGVRs))
+	for _, gvr := range rbacTypedGVRs {
+		gi, ok := rw.informers[gvr]
+		if !ok {
+			rw.mu.RUnlock()
+			return false
+		}
+		hasSynced = append(hasSynced, gi.Informer().HasSynced)
+	}
+	rw.mu.RUnlock()
+	for _, fn := range hasSynced {
+		if !fn() {
+			return false
+		}
+	}
+	return true
 }
 
 // fallbackUnstructuredFromIndexer decodes an indexer entry that is NOT

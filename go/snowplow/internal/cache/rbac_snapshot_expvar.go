@@ -68,5 +68,8 @@ func RegisterRBACSnapshotExpvar() {
 		expvar.Publish("snowplow_rbac_rebuild_post_release_pickups_total", expvar.Func(func() any {
 			return RBACRebuildPostReleasePickups()
 		}))
+		// #947 — bindings whose roleRef names an absent role, by roleRef
+		// kind ({"ClusterRole": n, "Role": n}). No name in any key.
+		expvar.Publish("snowplow_rbac_dangling_roleref", expvar.Func(rbacDanglingRoleRefExpvar))
 	})
 }
