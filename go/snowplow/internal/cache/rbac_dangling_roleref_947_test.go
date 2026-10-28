@@ -15,11 +15,13 @@ import (
 	"errors"
 	"expvar"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
@@ -241,6 +243,90 @@ func TestDanglingRoleRef947_OneLinePerStateChange(t *testing.T) {
 			}
 			assertNoSubject947(t, sink)
 		})
+	}
+}
+
+// TestDanglingRoleRef947_FlapIsOneLinePerTransition: dangling, then resolved
+// (role created), then dangling again (role deleted) is three transitions and
+// exactly three lines, with the gauge reading 1, 0, 1. Many publishes sit
+// between the transitions and add nothing. A per-process "warned once" flag
+// fails here: it stays silent on the second transition into dangling.
+func TestDanglingRoleRef947_FlapIsOneLinePerTransition(t *testing.T) {
+	const publishes = 10
+	sh := shapes947()[0]
+	rw, sink := setup947(t, sh)
+	phase := func(label string, wantDangling, wantResolved, wantCR int) {
+		t.Helper()
+		for i := 0; i < publishes; i++ {
+			RebuildRBACSnapshotForTest(rw)
+		}
+		d, r := sink.count(msgDangling947, sh.bindingName), sink.count(msgResolved947, sh.bindingName)
+		if d != wantDangling || r != wantResolved {
+			t.Errorf("%s: dangling lines = %d, resolved lines = %d; want %d and %d", label, d, r, wantDangling, wantResolved)
+		}
+		if cr, role := gauge947(t); cr != wantCR || role != 0 {
+			t.Errorf("%s: gauge = {ClusterRole:%d Role:%d}; want {ClusterRole:%d Role:0}", label, cr, role, wantCR)
+		}
+	}
+
+	phase("1 dangling", 1, 0, 1)
+	roles := indexerOf947(t, rw, sh.missingGVR)
+	if err := roles.Add(sh.missing); err != nil {
+		t.Fatalf("add role: %v", err)
+	}
+	phase("2 resolved by the role", 1, 1, 0)
+	if err := roles.Delete(sh.missing); err != nil {
+		t.Fatalf("delete role: %v", err)
+	}
+	phase("3 dangling again", 2, 1, 1)
+}
+
+// TestDanglingRoleRef947_UnrelatedChangesAddNoLines: once a binding has been
+// reported, publishes caused by changes to OTHER bindings and roles (adds, an
+// update, a delete) add no line for it, and the gauge stays 1. The reported
+// state is the writer's dangling set, carried from publish to publish; if it
+// were reset on each publish, every one of these publishes would report the
+// binding again.
+func TestDanglingRoleRef947_UnrelatedChangesAddNoLines(t *testing.T) {
+	sh := shapes947()[0]
+	rw, sink := setup947(t, sh)
+	RebuildRBACSnapshotForTest(rw)
+	if got := sink.count(msgDangling947, sh.bindingName); got != 1 {
+		t.Fatalf("dangling lines = %d; want exactly 1", got)
+	}
+
+	crbs, crs := indexerOf947(t, rw, "crb"), indexerOf947(t, rw, "cr")
+	for i := 0; i < 10; i++ {
+		other := mkCRB("unrelated-947-"+strconv.Itoa(i), userSub("unrelated-subject-947"))
+		if err := crbs.Add(other); err != nil {
+			t.Fatalf("add unrelated binding: %v", err)
+		}
+		if err := crs.Add(mkCR(other.RoleRef.Name)); err != nil {
+			t.Fatalf("add unrelated role: %v", err)
+		}
+		RebuildRBACSnapshotForTest(rw)
+	}
+	changed := mkCR("unrelated-947-0-role")
+	changed.Rules = append(changed.Rules, rbacv1.PolicyRule{Verbs: []string{"list"}, APIGroups: []string{""}, Resources: []string{"secrets"}})
+	if err := crs.Update(changed); err != nil {
+		t.Fatalf("update unrelated role: %v", err)
+	}
+	RebuildRBACSnapshotForTest(rw)
+	if err := crbs.Delete(mkCRB("unrelated-947-1", userSub("unrelated-subject-947"))); err != nil {
+		t.Fatalf("delete unrelated binding: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		RebuildRBACSnapshotForTest(rw)
+	}
+
+	if got := sink.count(msgDangling947, sh.bindingName); got != 1 {
+		t.Errorf("dangling lines after 22 publishes of unrelated changes = %d; want still exactly 1", got)
+	}
+	if got := sink.count(msgResolved947, sh.bindingName); got != 0 {
+		t.Errorf("resolved lines = %d; want 0 (the binding never stopped dangling)", got)
+	}
+	if cr, r := gauge947(t); cr != 1 || r != 0 {
+		t.Errorf("gauge = {ClusterRole:%d Role:%d}; want {ClusterRole:1 Role:0}", cr, r)
 	}
 }
 
