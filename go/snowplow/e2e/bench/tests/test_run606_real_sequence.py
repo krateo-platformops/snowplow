@@ -540,8 +540,27 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             if extra:
                 kids.append("compositiondefinitions/krateo-system/oasgen-provider")
             msg = (f"{len(kids)} of 41 managed children are not ready: " + ", ".join(kids)) if kids else ""
-            items([cr("Installer", "installer", not kids,
-                      "Creating" if kids else "Available", msg)])
+            inst = cr("Installer", "installer", not kids, "Creating" if kids else "Available", msg)
+            # spec.components as the 0.3.459 Installer CR carries it: what it WILL
+            # create (a feature-off entry is not created; github-provider-kog is
+            # declared, its CR never appears while its definition 401s)
+            decl = [("authn", "Authn", None), ("snowplow", "Snowplow", None),
+                    ("frontend", "Frontend", None), ("portal", "Portal", None),
+                    ("agentgateway", "Agentgateway", "agentGateway")]
+            if f483:
+                decl += [("alert-provider-crd", "AlertProviderCrds", None),
+                         ("krateo-observability", "KrateoObservability", None)]
+            if f483 == "wide":
+                decl.append(("alert-provider", "AlertProvider", None))
+            if kog:
+                decl.append(("github-provider-kog", "GithubProviderKog", None))
+            if os.environ.get("FAKE_DECLARED_LATER") == "1":   # run 17: deps on portal, not created yet
+                decl.append(("dashboard-page", "DashboardPage", None))
+            inst["spec"] = {"features": {"portal": True, "agentGateway": False},
+                            "components": [{"name": n, "kind": k, "feature": f or "portal",
+                                            **({"deps": ["portal"]} if n == "dashboard-page" else {})}
+                                           for n, k, f in decl]}
+            items([inst])
         if what.startswith("authns."):
             items([cr("Authn", "authn", ready, "ReconcileError",
                       "helm install failed: token=" + os.environ.get("FAKE_TOKVAL", ""))])

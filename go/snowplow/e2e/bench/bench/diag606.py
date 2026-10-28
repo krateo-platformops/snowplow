@@ -34,7 +34,7 @@ from typing import Callable
 __all__ = ["redact", "summarize_conditions", "pod_summary", "failing_pods",
            "installer_progress", "Kube", "collect", "wait_installer",
            "evaluate483", "verify483", "chart_inspector_errors",
-           "platform_state", "platform_line", "parse_not_ready_children",
+           "platform_state", "platform_line", "parse_not_ready_children", "declared_components",
            "allow_list_from_env", "DEFAULT_ALLOW_NOT_READY", "REQUIRED_READY",
            "main"]
 
@@ -128,8 +128,12 @@ Example queries (jq):
 Other files:
   installer-cr.json            raw Installer CR(s) (the API object, unflattened)
   platform-state.json          ok, installer_message, CR/CD tallies, required_ready,
+                               declared_created (component CRs created / declared
+                               by the Installer CR's spec.components, feature on),
                                allowed_not_ready (allow-listed, reason matched),
-                               unexpected_not_ready, allow_list
+                               unexpected_not_ready (declared/<Kind>/<name> = declared,
+                               not created yet), allow_list
+                               composition-crs.json .installer[].declares lists them
   progress.txt                 the one-line platform summary
   chart-inspector-errors.txt   every condition message mentioning chart-inspector, VERBATIM
   focus-483.json               alert_crd_present + CD/CR summaries of alert-provider-crd,
@@ -185,6 +189,36 @@ REQUIRED_READY = ("snowplow", "frontend", "authn", "portal")
 _CHILDREN_RX = re.compile(r"managed children are not ready:\s*(.+)$", re.S)
 
 
+def declared_components(installer: dict) -> list[dict] | None:
+    """The component CRs this Installer CR WILL create: the entries of its
+    spec.components that are not registerOnly and whose feature is on
+    (no feature = on; otherwise spec.features[<feature>] is true). This is
+    the installer chart's own rule: templates/compositions.yaml Pass B emits a
+    component when inst.featureEnabled (templates/_helpers.tpl) holds, once
+    its CRD is served and its deps are Ready, "re-evaluated every reconcile;
+    the next layer unlocks as deps go Ready". So the CRs that EXIST at a
+    moment are not the platform: a layer whose deps have only just gone
+    Ready does not exist yet, while the Installer CR already reads
+    Ready=True "Composition is up-to-date" (run 17, installer 0.3.459: 24 of
+    the 38 declared CRs existed, all Ready; the 13 pages and portal-agents,
+    each deps: [portal], came 14-30 s later, and the sidebar menu built from
+    those pages was empty). None when spec.components cannot be read."""
+    spec = installer.get("spec") or {}
+    comps = spec.get("components")
+    if not isinstance(comps, list):
+        return None
+    feats = spec.get("features") or {}
+    out = []
+    for c in comps:
+        if not isinstance(c, dict) or not c.get("name") or not c.get("kind") or c.get("registerOnly"):
+            continue
+        f = c.get("feature")
+        if f and not feats.get(f):
+            continue
+        out.append({"name": c["name"], "kind": c["kind"], "deps": list(c.get("deps") or [])})
+    return out
+
+
 def allow_list_from_env(env=os.environ) -> tuple[tuple[str, str], ...]:
     raw = env.get("BENCH_ALLOW_NOT_READY")
     if raw is None:
@@ -216,8 +250,14 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
                    allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY) -> dict:
     """Readiness across BOTH layers (CompositionDefinitions and component CRs).
 
-    ok ⇔ an Installer CR exists, every not-ready child is on the allow-list
-    WITH its expected reason, and every `required` component CR is Ready.
+    ok ⇔ an Installer CR exists, every component it DECLARES (its
+    `declares`, see declared_components) exists, every not-ready child is on
+    the allow-list WITH its expected reason, and every `required` component
+    CR is Ready. A declared component with no CR yet is not-ready; it is
+    excused only when its CompositionDefinition is itself allow-listed (a
+    definition that never serves its CRD cannot create the CR). An Installer
+    CR whose declaration cannot be read is not-ready: which components it
+    will still create is then unknown.
     """
     inst = installer[0] if installer else {}
     inst_msg = (inst.get("Ready") or {}).get("message") or ""
@@ -241,6 +281,26 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
                                        f"{want!r} is not in its conditions"),
                                "reason": (s or {}).get("Ready", {}).get("reason"),
                                "message": msgs[:2000]})
+    declares = inst.get("declares") if installer else None
+    present = {(s.get("kind"), s.get("name")) for s in leaves}
+    if installer:
+        if declares is None:
+            unexpected.append({"id": inst.get("id") or "installer",
+                               "why": "its spec.components cannot be read: which components "
+                                      "it will still create is unknown",
+                               "reason": "DeclarationUnreadable", "message": ""})
+        for c in declares or []:
+            if (c["kind"], c["name"]) in present:
+                continue
+            cd = f"compositiondefinitions/{inst.get('namespace')}/{c['name']}"
+            row = {"id": f"declared/{c['kind']}/{c['name']}", "reason": "NotCreated",
+                   "message": (f"declared by the Installer CR (feature on), no {c['kind']} CR yet"
+                               + (f"; deps: {', '.join(c['deps'])}" if c["deps"] else ""))}
+            want = allow_map.get(cd)
+            if want is not None and cd in by_id and want.lower() in _messages(by_id[cd]).lower():
+                allowed.append({**row, "expected_reason": f"its definition {cd} is allow-listed ({want})"})
+            else:
+                unexpected.append({**row, "why": "declared, not created yet"})
     by_name = {s.get("name"): s for s in leaves}
     req = {n: _cond(by_name.get(n), "Ready") == "True" for n in required}
     ok = bool(installer) and not unexpected and all(req.values())
@@ -248,6 +308,8 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
             "installer_message": inst_msg,
             "components_ready": f"{sum(_cond(s, 'Ready') == 'True' for s in leaves)}/{len(leaves)}",
             "definitions_ready": f"{sum(_cond(s, 'Ready') == 'True' for s in cds)}/{len(cds)}",
+            "declared_created": (None if declares is None else
+                                 f"{sum((c['kind'], c['name']) in present for c in declares)}/{len(declares)}"),
             "required_ready": req, "allowed_not_ready": allowed,
             "unexpected_not_ready": unexpected,
             "allow_list": [{"id": i, "expected_reason": r} for i, r in allow]}
@@ -256,6 +318,7 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
 def platform_line(st: dict) -> str:
     line = (f"installer Ready={st['installer_ready'] or 'absent'} "
             f"msg={st['installer_message'][:300]!r}; CRs ready {st['components_ready']}; "
+            f"declared CRs created {st.get('declared_created') or 'UNKNOWN'}; "
             f"CDs ready {st['definitions_ready']}; required "
             + ",".join(f"{n}={'ok' if v else 'NO'}" for n, v in st["required_ready"].items()))
     if st["allowed_not_ready"]:
@@ -464,6 +527,8 @@ def _leaf_summaries(k: Kube, skip_installer=True) -> tuple[list[dict], list[dict
                 if not ((o.get("metadata") or {}).get("namespace") or "").startswith("bench-")]
         sums = [summarize_conditions(o, resource) for o in objs[:MAX_ITEMS_PER_KIND]]
         if kind.startswith("installers."):
+            for s, o in zip(sums, objs):
+                s["declares"] = declared_components(o)
             inst.extend(sums)
         else:
             leaves.extend(sums)

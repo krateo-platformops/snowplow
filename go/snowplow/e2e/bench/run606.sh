@@ -579,9 +579,14 @@ s_preflight() {
     sleep "$PREFLIGHT_POLL_S"
   done
   "${K[@]}" -n bench-loadgen logs job/preflight606 > "$OUT/preflight.jsonl" 2>&1 || true
-  python3 -m bench.load606 preflight-summary < "$OUT/preflight.jsonl" >&2 || true
+  local summary why
+  summary="$(python3 -m bench.load606 preflight-summary < "$OUT/preflight.jsonl" 2>&1 || true)"
+  printf '%s\n' "$summary" >&2
   if [[ -n "$failed" && "$failed" != "0" ]]; then
-    log "PREFLIGHT REFUSED (config error: unserved type / 404) — see $OUT/preflight.jsonl"
+    # name WHAT was refused (run 17: "(sidebar menu) -> None: the shell
+    # rendered no sidebar Menu with routes" was logged as an unserved type / 404)
+    why="$(printf '%s\n' "$summary" | sed -n 's/^\[preflight\] REFUSED //p' | awk 'NR<=3' | tr '\n' ';')"
+    log "PREFLIGHT REFUSED: ${why:-no refusal line (the preflight Job failed without a result)} — see $OUT/preflight.jsonl"
     return 1
   fi
   if [[ -z "$ok" || "$ok" == "0" ]]; then

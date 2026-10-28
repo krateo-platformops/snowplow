@@ -1,0 +1,617 @@
+{
+ "source": "run 17 B (installer 0.3.459), diagnostics/installer-cr.json: spec.components (name/kind/feature/deps only), spec.features, and status.managed's composition CRs = the 24 that existed when the platform gate passed at 09:45:46",
+ "features": {
+  "agentGateway": false,
+  "codegenAgents": false,
+  "configConnector": false,
+  "coreAgents": false,
+  "coreProvider": true,
+  "externalDns": false,
+  "ingress": false,
+  "oasgenProvider": true,
+  "portal": true,
+  "repoGraph": false,
+  "specialistAgents": false,
+  "structureGraph": false
+ },
+ "components": [
+  {
+   "name": "authn-crd",
+   "kind": "AuthnCrds",
+   "feature": "portal"
+  },
+  {
+   "name": "oasgen-provider-crd",
+   "kind": "OasgenProviderCrds",
+   "feature": "oasgenProvider"
+  },
+  {
+   "name": "frontend-crd",
+   "kind": "FrontendCrds",
+   "feature": "portal"
+  },
+  {
+   "name": "snowplow-crd",
+   "kind": "SnowplowCrds",
+   "feature": "portal"
+  },
+  {
+   "name": "authn",
+   "kind": "Authn",
+   "feature": "portal",
+   "deps": [
+    "authn-crd"
+   ]
+  },
+  {
+   "name": "snowplow",
+   "kind": "Snowplow",
+   "feature": "portal",
+   "deps": [
+    "snowplow-crd",
+    "authn"
+   ]
+  },
+  {
+   "name": "frontend",
+   "kind": "Frontend",
+   "feature": "portal",
+   "deps": [
+    "frontend-crd",
+    "authn",
+    "snowplow"
+   ]
+  },
+  {
+   "name": "krateo-marketplace-catalog",
+   "kind": "KrateoMarketplaceCatalog",
+   "feature": "portal"
+  },
+  {
+   "name": "git-provider-crd",
+   "kind": "GitProviderCrds",
+   "feature": "portal"
+  },
+  {
+   "name": "git-provider",
+   "kind": "GitProvider",
+   "feature": "portal",
+   "deps": [
+    "git-provider-crd"
+   ]
+  },
+  {
+   "name": "github-provider-kog",
+   "kind": "GithubProviderKog",
+   "feature": "portal"
+  },
+  {
+   "name": "portal",
+   "kind": "Portal",
+   "feature": "portal",
+   "deps": [
+    "frontend",
+    "git-provider"
+   ]
+  },
+  {
+   "name": "portal-agents",
+   "kind": "PortalAgents",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "marketplace-page",
+   "kind": "MarketplacePage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "incidents-page",
+   "kind": "IncidentsPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "alerts-page",
+   "kind": "AlertsPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "dashboard-page",
+   "kind": "DashboardPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "compositions-page",
+   "kind": "CompositionsPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "blueprints-page",
+   "kind": "BlueprintsPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "resources-page",
+   "kind": "ResourcesPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "search-page",
+   "kind": "SearchPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "builders-page",
+   "kind": "BuildersPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "clusters-page",
+   "kind": "ClustersPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "reviews-page",
+   "kind": "ReviewsPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "settings-page",
+   "kind": "SettingsPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "observability-page",
+   "kind": "ObservabilityPage",
+   "feature": "portal",
+   "deps": [
+    "portal"
+   ]
+  },
+  {
+   "name": "blueprint-render-service",
+   "kind": "BlueprintRenderService",
+   "feature": "portal"
+  },
+  {
+   "name": "controller-render-service",
+   "kind": "ControllerRenderService",
+   "feature": "portal"
+  },
+  {
+   "name": "oasgen-provider",
+   "kind": "OasgenProvider",
+   "feature": "oasgenProvider",
+   "deps": [
+    "oasgen-provider-crd"
+   ]
+  },
+  {
+   "name": "clickhouse-operator",
+   "kind": "ClickhouseOperator",
+   "feature": "portal"
+  },
+  {
+   "name": "mongodb-operator",
+   "kind": "MongodbOperator",
+   "feature": "portal"
+  },
+  {
+   "name": "krateo-observability",
+   "kind": "KrateoObservability",
+   "feature": "portal",
+   "deps": [
+    "clickhouse-operator",
+    "mongodb-operator",
+    "alert-provider-crd"
+   ]
+  },
+  {
+   "name": "otel-collector-deployment",
+   "kind": "OtelCollectorDeployment",
+   "feature": "portal",
+   "deps": [
+    "krateo-observability"
+   ]
+  },
+  {
+   "name": "otel-collector-daemonset",
+   "kind": "OtelCollectorDaemonset",
+   "feature": "portal",
+   "deps": [
+    "otel-collector-deployment"
+   ]
+  },
+  {
+   "name": "krateo-sse-proxy",
+   "kind": "KrateoSseProxy",
+   "feature": "portal",
+   "deps": [
+    "krateo-observability"
+   ]
+  },
+  {
+   "name": "gateway-api-crds",
+   "kind": "GatewayAPICrds",
+   "feature": "ingress"
+  },
+  {
+   "name": "agentgateway",
+   "kind": "Agentgateway",
+   "feature": "ingress",
+   "deps": [
+    "gateway-api-crds"
+   ]
+  },
+  {
+   "name": "cert-manager",
+   "kind": "CertManager",
+   "feature": "ingress",
+   "deps": [
+    "agentgateway"
+   ]
+  },
+  {
+   "name": "cert-manager-issuers",
+   "kind": "CertManagerIssuers",
+   "feature": "ingress",
+   "deps": [
+    "cert-manager"
+   ]
+  },
+  {
+   "name": "external-dns",
+   "kind": "ExternalDNS",
+   "feature": "externalDns"
+  },
+  {
+   "name": "kagent-crds",
+   "kind": "KagentCrds",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "kagent",
+   "kind": "Kagent",
+   "feature": "coreAgents",
+   "deps": [
+    "kagent-crds"
+   ]
+  },
+  {
+   "name": "model-configs",
+   "kind": "ModelConfigs",
+   "feature": "coreAgents",
+   "deps": [
+    "kagent"
+   ]
+  },
+  {
+   "name": "installer-agent",
+   "kind": "InstallerAgent",
+   "feature": "coreAgents",
+   "deps": [
+    "repo-mcp-server",
+    "kagent",
+    "model-configs"
+   ]
+  },
+  {
+   "name": "repo-mcp-server",
+   "kind": "RepoMcpServer",
+   "feature": "coreAgents",
+   "deps": [
+    "kagent"
+   ]
+  },
+  {
+   "name": "structure-graph-mcp-server",
+   "kind": "StructureGraphMcpServer",
+   "feature": "structureGraph",
+   "deps": [
+    "kagent"
+   ]
+  },
+  {
+   "name": "config-refs-mcp-server",
+   "kind": "ConfigRefsMcpServer",
+   "feature": "coreAgents",
+   "deps": [
+    "kagent"
+   ]
+  },
+  {
+   "name": "krateo-autopilot",
+   "kind": "KrateoAutopilot",
+   "feature": "coreAgents",
+   "deps": [
+    "repo-mcp-server",
+    "config-refs-mcp-server",
+    "kagent",
+    "model-configs",
+    "installer-agent",
+    "incident-agent",
+    "authn-agent",
+    "snowplow-agent",
+    "frontend-agent",
+    "clickstack-agent",
+    "core-provider-agent"
+   ]
+  },
+  {
+   "name": "incident-agent",
+   "kind": "IncidentAgent",
+   "feature": "coreAgents",
+   "deps": [
+    "repo-mcp-server",
+    "kagent",
+    "model-configs",
+    "clickhouse-mcp-server"
+   ]
+  },
+  {
+   "name": "clickhouse-mcp-server",
+   "kind": "ClickhouseMcpServer",
+   "feature": "specialistAgents",
+   "deps": [
+    "krateo-observability"
+   ]
+  },
+  {
+   "name": "authn-agent",
+   "kind": "AuthnAgent",
+   "feature": "specialistAgents",
+   "deps": [
+    "repo-mcp-server",
+    "kagent",
+    "model-configs"
+   ]
+  },
+  {
+   "name": "snowplow-agent",
+   "kind": "SnowplowAgent",
+   "feature": "specialistAgents",
+   "deps": [
+    "repo-mcp-server",
+    "kagent",
+    "model-configs"
+   ]
+  },
+  {
+   "name": "frontend-agent",
+   "kind": "FrontendAgent",
+   "feature": "specialistAgents",
+   "deps": [
+    "repo-mcp-server",
+    "kagent",
+    "model-configs",
+    "snowplow-agent"
+   ]
+  },
+  {
+   "name": "clickstack-agent",
+   "kind": "ClickstackAgent",
+   "feature": "specialistAgents",
+   "deps": [
+    "repo-mcp-server",
+    "kagent",
+    "model-configs",
+    "clickhouse-mcp-server"
+   ]
+  },
+  {
+   "name": "core-provider-agent",
+   "kind": "CoreProviderAgent",
+   "feature": "coreAgents",
+   "deps": [
+    "repo-mcp-server",
+    "kagent",
+    "model-configs"
+   ]
+  },
+  {
+   "name": "incident-controller-crd",
+   "kind": "IncidentControllerCrds",
+   "feature": "portal"
+  },
+  {
+   "name": "incident-controller",
+   "kind": "IncidentController",
+   "feature": "specialistAgents",
+   "deps": [
+    "incident-controller-crd"
+   ]
+  },
+  {
+   "name": "alert-provider-crd",
+   "kind": "AlertProviderCrds",
+   "feature": "portal"
+  },
+  {
+   "name": "alert-provider",
+   "kind": "AlertProvider",
+   "feature": "portal",
+   "deps": [
+    "alert-provider-crd",
+    "incident-controller-crd",
+    "krateo-observability"
+   ]
+  },
+  {
+   "name": "nightly-review-crd",
+   "kind": "NightlyReviewCrds",
+   "feature": "specialistAgents"
+  },
+  {
+   "name": "nightly-review",
+   "kind": "NightlyReview",
+   "feature": "specialistAgents",
+   "deps": [
+    "nightly-review-crd",
+    "kagent",
+    "krateo-observability"
+   ]
+  },
+  {
+   "name": "agentgateway-controller",
+   "kind": "AgentgatewayController",
+   "feature": "agentGateway"
+  },
+  {
+   "name": "agentgateway-policies",
+   "kind": "AgentgatewayPolicies",
+   "feature": "agentGateway",
+   "deps": [
+    "agentgateway-controller"
+   ]
+  },
+  {
+   "name": "gcp-configconnector-crd",
+   "kind": "KrateoGcpConfigconnectorCrds",
+   "feature": "configConnector"
+  },
+  {
+   "name": "gcp-configconnector",
+   "kind": "KrateoGcpConfigconnector",
+   "feature": "configConnector",
+   "deps": [
+    "gcp-configconnector-crd"
+   ]
+  }
+ ],
+ "present_at_gate": [
+  {
+   "kind": "AlertProvider",
+   "name": "alert-provider"
+  },
+  {
+   "kind": "AlertProviderCrds",
+   "name": "alert-provider-crd"
+  },
+  {
+   "kind": "Authn",
+   "name": "authn"
+  },
+  {
+   "kind": "AuthnCrds",
+   "name": "authn-crd"
+  },
+  {
+   "kind": "BlueprintRenderService",
+   "name": "blueprint-render-service"
+  },
+  {
+   "kind": "ClickhouseOperator",
+   "name": "clickhouse-operator"
+  },
+  {
+   "kind": "ControllerRenderService",
+   "name": "controller-render-service"
+  },
+  {
+   "kind": "Frontend",
+   "name": "frontend"
+  },
+  {
+   "kind": "FrontendCrds",
+   "name": "frontend-crd"
+  },
+  {
+   "kind": "GitProvider",
+   "name": "git-provider"
+  },
+  {
+   "kind": "GitProviderCrds",
+   "name": "git-provider-crd"
+  },
+  {
+   "kind": "GithubProviderKog",
+   "name": "github-provider-kog"
+  },
+  {
+   "kind": "IncidentControllerCrds",
+   "name": "incident-controller-crd"
+  },
+  {
+   "kind": "KrateoMarketplaceCatalog",
+   "name": "krateo-marketplace-catalog"
+  },
+  {
+   "kind": "KrateoObservability",
+   "name": "krateo-observability"
+  },
+  {
+   "kind": "KrateoSseProxy",
+   "name": "krateo-sse-proxy"
+  },
+  {
+   "kind": "MongodbOperator",
+   "name": "mongodb-operator"
+  },
+  {
+   "kind": "OasgenProvider",
+   "name": "oasgen-provider"
+  },
+  {
+   "kind": "OasgenProviderCrds",
+   "name": "oasgen-provider-crd"
+  },
+  {
+   "kind": "OtelCollectorDaemonset",
+   "name": "otel-collector-daemonset"
+  },
+  {
+   "kind": "OtelCollectorDeployment",
+   "name": "otel-collector-deployment"
+  },
+  {
+   "kind": "Portal",
+   "name": "portal"
+  },
+  {
+   "kind": "Snowplow",
+   "name": "snowplow"
+  },
+  {
+   "kind": "SnowplowCrds",
+   "name": "snowplow-crd"
+  }
+ ]
+}

@@ -1,0 +1,127 @@
+{
+ "source": "057 2026-10-28, portal 1.8.84 (installer 0.3.459): restaction sidebar-nav's spec.filter (jq) over the page flexes' nav annotations in the namespaces where group devs may list flexes (the RA's userAccessFilter step); refs resolve to flexes in each page's own namespace",
+ "devs_namespaces": [
+  "krateo-blueprints",
+  "krateo-compositions",
+  "krateo-dashboard",
+  "krateo-resources",
+  "krateo-search",
+  "krateo-system"
+ ],
+ "items": [
+  {
+   "path": "/dashboard",
+   "page": "dashboard",
+   "order": 1,
+   "resourceRefId": "page-dashboard",
+   "label": "Dashboard",
+   "icon": "fa-gauge"
+  },
+  {
+   "path": "/compositions",
+   "page": "compositions",
+   "order": 2,
+   "resourceRefId": "page-compositions",
+   "label": "Compositions",
+   "icon": "fa-cubes"
+  },
+  {
+   "path": "/compositions/{namespace}",
+   "page": "compositions",
+   "order": 2,
+   "resourceRefId": "page-compositions"
+  },
+  {
+   "path": "/blueprints",
+   "page": "blueprints",
+   "order": 3,
+   "resourceRefId": "page-blueprints",
+   "label": "Blueprints",
+   "icon": "fa-layer-group"
+  },
+  {
+   "path": "/event-health",
+   "page": "event-health",
+   "order": 100,
+   "resourceRefId": "page-event-health",
+   "label": "Event sites"
+  },
+  {
+   "path": "/search",
+   "page": "search",
+   "order": 800,
+   "resourceRefId": "page-search"
+  },
+  {
+   "path": "/compositions/{namespace}/{name}",
+   "page": "composition-detail",
+   "order": 900,
+   "resourceRefId": "page-composition-detail"
+  },
+  {
+   "path": "/blueprints/{namespace}/{name}/new",
+   "page": "blueprint-create",
+   "order": 910,
+   "resourceRefId": "page-blueprint-create"
+  },
+  {
+   "path": "/blueprints/{namespace}/{name}",
+   "page": "blueprint-detail",
+   "order": 920,
+   "resourceRefId": "page-blueprint-detail"
+  },
+  {
+   "path": "/resources/{namespace}/{group}/{version}/{plural}/{name}",
+   "page": "resource-detail",
+   "order": 960,
+   "resourceRefId": "page-resource-detail"
+  }
+ ],
+ "refs": [
+  {
+   "id": "page-blueprint-create",
+   "name": "page-blueprint-create",
+   "namespace": "krateo-blueprints"
+  },
+  {
+   "id": "page-blueprint-detail",
+   "name": "page-blueprint-detail",
+   "namespace": "krateo-blueprints"
+  },
+  {
+   "id": "page-blueprints",
+   "name": "page-blueprints",
+   "namespace": "krateo-blueprints"
+  },
+  {
+   "id": "page-composition-detail",
+   "name": "page-composition-detail",
+   "namespace": "krateo-compositions"
+  },
+  {
+   "id": "page-compositions",
+   "name": "page-compositions",
+   "namespace": "krateo-compositions"
+  },
+  {
+   "id": "page-dashboard",
+   "name": "page-dashboard",
+   "namespace": "krateo-dashboard"
+  },
+  {
+   "id": "page-event-health",
+   "name": "page-event-health",
+   "namespace": "krateo-system"
+  },
+  {
+   "id": "page-resource-detail",
+   "name": "page-resource-detail",
+   "namespace": "krateo-resources"
+  },
+  {
+   "id": "page-search",
+   "name": "page-search",
+   "namespace": "krateo-search"
+  }
+ ]
+}

@@ -127,11 +127,15 @@ class Response:
     # (X-Snowplow-Refresh-Key, X-Snowplow-Refresh-Class) when snowplow keyed
     # the /call response — what the SPA arms its /refreshes stream with.
     refresh: tuple | None = None
+    # X-Snowplow-Stage-Outcomes (#904): on a RESTAction /call, every stage
+    # that did not succeed ("[]" when all did)
+    stage_outcomes: str | None = None
 
 
 REFRESH_HEADER_KEY = "X-Snowplow-Refresh-Key"
 REFRESH_HEADER_CLASS = "X-Snowplow-Refresh-Class"
 REFRESH_CLASSES = ("widgets", "widgetContent", "restactions")
+STAGE_OUTCOMES_HEADER = "X-Snowplow-Stage-Outcomes"
 
 
 def _refresh_headers(headers) -> tuple | None:
@@ -163,7 +167,8 @@ class HttpClient:
                 raw = r.read()
                 return Response(r.status, _decode(raw, r.headers),
                                 (time.perf_counter() - t0) * 1000,
-                                refresh=_refresh_headers(r.headers))
+                                refresh=_refresh_headers(r.headers),
+                                stage_outcomes=r.headers.get(STAGE_OUTCOMES_HEADER))
         except urllib.error.HTTPError as e:
             return Response(e.code, b"", (time.perf_counter() - t0) * 1000,
                             f"http {e.code}")
@@ -872,6 +877,36 @@ def first_load(client: HttpClient, token: str, portal: Portal, *,
         content = walk(client, token, [routes[0]["endpoint"]], pool=pool,
                        per_user_parallel=per_user_parallel)
     return shell, routes, content
+
+
+def menu_evidence(client: HttpClient, token: str, shell: WalkResult, routes: list) -> dict:
+    """What the sidebar Menu the shell rendered was made of (run 17: "no
+    routes" said nothing about why). The Menu /call answers the CR with its
+    status resolved: items, resourcesRefs, and status.error when its apiRef
+    RESTAction failed (widgets/resolve.go). With no route, ONE more read,
+    report-only and not a navigation: the Menu's own spec.apiRef RESTAction,
+    as the same identity, for its X-Snowplow-Stage-Outcomes (#904): which
+    stage of the per-caller resolve failed, was skipped or did not run."""
+    hit = next(((p, d) for p, d in shell.docs.items()
+                if isinstance(d, dict) and d.get("kind") == "Menu"), None)
+    if hit is None:
+        return {"found": False}
+    path, doc = hit
+    st = doc.get("status") or {}
+    wd = st.get("widgetData") or {}
+    ref = (doc.get("spec") or {}).get("apiRef") or {}
+    out = {"found": True, "path": path, "items": len(wd.get("items") or []),
+           "resources_refs": len((st.get("resourcesRefs") or {}).get("items") or []),
+           "routes": len(routes), "error": (str(st["error"])[:400] if st.get("error") else None),
+           "api_ref": ({"name": ref.get("name"), "namespace": ref.get("namespace")}
+                       if ref.get("name") else None)}
+    if not routes and out["api_ref"]:
+        ra = ("/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions"
+              f"&name={ref['name']}&namespace={ref.get('namespace') or ''}")
+        r = client.get(ra, token)
+        out["api_ref_call"] = {"path": ra, "status": r.status,
+                               "stage_outcomes": getattr(r, "stage_outcomes", None)}
+    return out
 
 
 def first_load_failed(shell: WalkResult, routes: list, content: WalkResult | None) -> bool:
@@ -4064,6 +4099,15 @@ def _cmd_preflight_summary(a) -> int:
     if fl:
         print(f"[preflight] first-load shell: {fl.get('calls')} calls, "
               f"{fl.get('wall_ms')} ms, statuses {fl.get('statuses')}", flush=True)
+    m = rec.get("menu")
+    if m:
+        print("[preflight] sidebar menu: " + (
+            "no Menu in the shell" if not m.get("found") else
+            f"{m.get('path')} items={m.get('items')} resourcesRefs={m.get('resources_refs')} "
+            f"routes={m.get('routes')} error={m.get('error')} api_ref={m.get('api_ref')}"
+            + (f" api_ref_call={m['api_ref_call'].get('status')} "
+               f"stage_outcomes={m['api_ref_call'].get('stage_outcomes')}" if m.get("api_ref_call") else "")),
+            flush=True)
     for x in rec.get("refused") or []:
         print(f"[preflight] REFUSED {x.get('path')} -> {x.get('status')}: "
               f"{(x.get('body') or '')[:200]}", flush=True)
@@ -4121,6 +4165,7 @@ def preflight(client: HttpClient, token: str, portal: "Portal", *,
                                             per_user_parallel=per_user_parallel)
         out["first_load_shell"] = {"calls": shell.calls, "errors": shell.errors,
                                    "wall_ms": shell.wall_ms, "statuses": shell.statuses}
+        out["menu"] = menu_evidence(client, token, shell, routes)
         if not routes:
             out["refused"].append({"path": "(sidebar menu)", "status": None,
                                    "body": "the shell rendered no sidebar Menu with routes"})

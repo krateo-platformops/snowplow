@@ -80,9 +80,12 @@ def test_wait_installer_polls_until_ready_and_logs_each_poll():
 
         def items(self, kind, *a):
             ok = self._ok
-            return [{"kind": "X", "metadata": {"name": kind.split(".")[0]},
-                     "status": {"conditions": [{"type": "Ready",
-                                                "status": "True" if ok else "False"}]}}]
+            o = {"kind": "X", "metadata": {"name": kind.split(".")[0]},
+                 "status": {"conditions": [{"type": "Ready",
+                                            "status": "True" if ok else "False"}]}}
+            if kind.startswith("installers."):     # it declares the one component CR
+                o["spec"] = {"components": [{"name": "authns", "kind": "X"}]}
+            return [o]
 
     k = K()
 

@@ -76,15 +76,26 @@ def _s(name, ready=True, synced=True, kind="X"):
             "Synced": {"status": "True" if synced else "False"}}
 
 
+def _inst(*names):
+    """The Installer CR's summary, declaring (spec.components, feature on) the
+    component CRs named — what diag606._leaf_summaries attaches as `declares`."""
+    s = _s("installer")
+    s["declares"] = [{"kind": "X", "name": n, "deps": []} for n in names]
+    return s
+
+
+DECLARED = ("authn", "krateo-observability", "alert-provider-crd")
+
+
 def test_evaluate483_pass_and_item5_recorded_only():
     leaves = [_s("authn"), _s("krateo-observability"), _s("alert-provider-crd")]
-    r = diag606.evaluate483([_s("installer")], leaves,
+    r = diag606.evaluate483([_inst(*DECLARED)], leaves,
                             [_s("authn"), _s("alert-provider-crd")], True,
                             [{"metadata": {"name": "sre-pod-crashloop"}}])
     assert r["verdict"] == "PASS"
     assert r["recorded"]["as_expected"] is True
     # item 5 never gates: no Alert CRs at all still PASSes 1-4
-    r = diag606.evaluate483([_s("installer")], leaves,
+    r = diag606.evaluate483([_inst(*DECLARED)], leaves,
                             [_s("alert-provider-crd")], True, [])
     assert r["verdict"] == "PASS" and r["recorded"]["as_expected"] is False
 
@@ -101,7 +112,7 @@ def test_evaluate483_each_gating_item_fails_alone(mut, item):
     C = [_s("authn"), _s("alert-provider-crd")]
     crd = [True]
     mut(L, C, crd)
-    r = diag606.evaluate483([_s("installer")], L, C, crd[0], [])
+    r = diag606.evaluate483([_inst(*DECLARED)], L, C, crd[0], [])
     assert r["verdict"] == "FAIL"
     assert [c["item"] for c in r["checks"] if not c["pass"]] == [item]
 
@@ -148,8 +159,10 @@ def test_oci_run_passes_verify483_headline_first_and_continues(harness):
     assert v["verdict"] == "PASS" and v["headline"]["result"] == "PASS"
     assert v["checks"][0]["item"] == 4
     assert sorted(c["item"] for c in v["checks"]) == [1, 2, 3, 4, 6]
+    # the definition 401s, so its declared CR is never created: both are excused
     assert [a["id"] for a in v["known_unrelated_allowed"]] == [
-        "compositiondefinitions/krateo-system/github-provider-kog"]
+        "compositiondefinitions/krateo-system/github-provider-kog",
+        "declared/GithubProviderKog/github-provider-kog"]
     assert v["recorded"]["sre_pod_crashloop_present"] is True
     assert "[verify483] (5) RECORDED" in out
     # it went on into the measurement
