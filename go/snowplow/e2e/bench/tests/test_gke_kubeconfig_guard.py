@@ -65,6 +65,11 @@ def realkubectl(T_fakes, tmp_path, monkeypatch):
         case "${{r[0]}} ${{r[1]}}" in
           "get pv") cat "{T_fakes}/pvs_k.json";;
           "get pods") cat "{T_fakes}/pods_k.json";;
+          "apply --server-side") cat > "{T_fakes}/state/guard_k";;     # #954: the no-new-claims policy
+          "create --dry-run=server")                                     # refused once it is in force
+            [ -f "{T_fakes}/state/guard_k" ] || exit 0
+            echo "ValidatingAdmissionPolicy 'bench-teardown-no-new-claims' with binding" \
+                 "'bench-teardown-no-new-claims' denied request" >&2; exit 1;;
           "config view") exec "{REAL_KUBECTL}" "$@";;    # reads the kubeconfig file only
         esac
         exit 0
