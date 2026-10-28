@@ -73,9 +73,15 @@ def _gke_labels(name, b32, location, *, both_ids=False, publish=None):
     return lab
 
 
-def _disk(name, labels, *, zone=ZONE, users=None):
+def _disk(name, labels, *, zone=ZONE, users=None, pvc=None):
     return {"name": name, "zone": f"https://www.googleapis.com/compute/v1/projects/p/zones/{zone}",
-            "sizeGb": "10", "type": "pd-balanced", "labels": labels, **({"users": users} if users else {})}
+            "sizeGb": "10", "type": "pd-balanced", "labels": labels, **({"users": users} if users else {}),
+            # the PD CSI driver's description (run 17's leftovers: gcloud compute disks list)
+            **({"description": json.dumps({"kubernetes.io/created-for/pv/name": name,
+                                           "kubernetes.io/created-for/pvc/name": pvc[1],
+                                           "kubernetes.io/created-for/pvc/namespace": pvc[0],
+                                           "storage.gke.io/created-by": "pd.csi.storage.gke.io"})}
+               if pvc else {})}
 
 
 OURS_B32 = gke.cluster_id_b32({"id": ID_OURS})
@@ -99,6 +105,13 @@ DISKS = [
     _disk("pvc-057-mongodb-in-our-zone", _gke_labels("krateo-057", B32_057, "europe-west3-a", both_ids=True)),
     # our labels, another zone: not ours to delete from here
     _disk("pvc-ours-other-zone", _gke_labels(NAME, OURS_B32, ZONE), zone="europe-west4-b"),
+    # #954, run 17: a claim the StatefulSet re-created during the PVC release; its disk was
+    # provisioned seconds before the cluster went and carries the id label ONLY (no
+    # goog-k8s-cluster-name), and no PV of it was recorded
+    _disk("pvc-reprovisioned-id-only", {"cluster-id-gke-io": OURS_B32},
+          pvc=("krateo-system", "datadir-krateo-clickstack-mongodb-0")),
+    # the same shape for an EARLIER cluster of the same name: not ours
+    _disk("pvc-prev-cluster-id-only", {"cluster-id-gke-io": PREV_B32}),
 ]
 
 
@@ -154,12 +167,28 @@ def test_the_default_teardown_budget_is_run606s():
 def test_the_backstop_takes_this_clusters_leftovers_only():
     got = gke.backstop_disks(DISKS, name=NAME, cluster_id=OURS_B32, zone=ZONE,
                              recorded=["pvc-ours-recorded-unlabelled"])
-    assert got == ["pvc-ours-leftover", "pvc-ours-recorded-unlabelled"]
+    assert got == ["pvc-ours-leftover", "pvc-ours-recorded-unlabelled", "pvc-reprovisioned-id-only"]
+
+
+def test_a_disk_with_only_this_clusters_id_label_is_found():
+    """#954, the non-vacuous control: run 17's leftovers carried
+    cluster-id-gke-io alone. The old filter (goog-k8s-cluster-name AND an id)
+    found none of them while they were there."""
+    only = [d for d in DISKS if d["name"] in ("pvc-reprovisioned-id-only", "pvc-prev-cluster-id-only")]
+    got = gke.cluster_disks(only, name=NAME, cluster_id=OURS_B32, zone=ZONE)
+    assert [d["name"] for d in got] == ["pvc-reprovisioned-id-only"]
+    assert gke.disk_pvc(got[0]) == "krateo-system/datadir-krateo-clickstack-mongodb-0"
+    assert "goog-k8s-cluster-name" not in got[0]["labels"]
+    # attached: still this cluster's disk (waited for), just not deletable yet
+    att = [dict(only[0], users=["projects/p/zones/z/instances/n1"])]
+    assert [d["name"] for d in gke.cluster_disks(att, name=NAME, cluster_id=OURS_B32, zone=ZONE)] == [
+        "pvc-reprovisioned-id-only"]
+    assert gke.backstop_disks(att, name=NAME, cluster_id=OURS_B32, zone=ZONE) == []
 
 
 @pytest.mark.parametrize("other", ["pvc-release-kagent", "pvc-release-in-our-zone", "pvc-057-mongodb",
                                    "pvc-057-mongodb-in-our-zone", "pvc-same-name-other-cluster",
-                                   "pvc-our-id-other-name"])
+                                   "pvc-our-id-other-name", "pvc-prev-cluster-id-only"])
 def test_the_backstop_never_takes_another_clusters_disk(other):
     """Not even when that disk is in our zone, unattached, and named among
     this cluster's recorded PVs (a corrupted record)."""
@@ -195,7 +224,32 @@ FAKE = textwrap.dedent("""\
         if a[:2] == ["get", "pv"]:
             pvs = [] if has("pvcs_deleted") and not os.environ.get("FAKE_PV_STUCK") else json.load(
                 open(os.environ["FAKE_PVS"]))
+            if has("pvcs_deleted") and os.environ.get("FAKE_REPROVISIONED"):
+                # a claim created before the policy took hold: a new PV, a new disk
+                pvs = pvs + [json.loads(os.environ["FAKE_REPROVISIONED"])]
+            if has("sts_recreated"):
+                pvs = pvs + [json.loads(os.environ["FAKE_STS_CLAIM"])]
             print(json.dumps({"items": pvs})); sys.exit(0)
+        guard = has("guard_applied") and not os.environ.get("FAKE_GUARD_IGNORED")
+        if a[:2] == ["apply", "--server-side"] and "bench-teardown" in " ".join(a):
+            if os.environ.get("FAKE_GUARD_APPLY_RC"):
+                sys.exit(int(os.environ["FAKE_GUARD_APPLY_RC"]))
+            open(os.path.join(st, "guard_applied"), "w").write(sys.stdin.read()); sys.exit(0)
+        if a[:2] == ["create", "--dry-run=server"]:
+            if os.environ.get("FAKE_PROBE_REFUSAL"):     # refused, but NOT by our policy
+                sys.stderr.write(os.environ["FAKE_PROBE_REFUSAL"] + "\\n"); sys.exit(1)
+            if guard:      # the API server's answer to a claim the policy refuses
+                sys.stderr.write('The persistentvolumeclaims "bench-teardown-probe" is invalid: : '
+                                 "ValidatingAdmissionPolicy 'bench-teardown-no-new-claims' with binding "
+                                 "'bench-teardown-no-new-claims' denied request: bench teardown (#954)\\n")
+                sys.exit(1)
+            sys.exit(0)
+        if a[:3] == ["delete", "pod", "-n"] and a[4] == "mongodb-0" and os.environ.get("FAKE_STS_CLAIM"):
+            # the StatefulSet controller: its pod is gone, so it re-creates the pod AND its claim
+            # (volumeClaimTemplates) unless the API server refuses the claim
+            if not guard and has("pvcs_deleted"):
+                open(os.path.join(st, "sts_recreated"), "w").write("1")
+            sys.exit(0)
         if a[:2] == ["patch", "pv"] and os.environ.get("FAKE_PATCH_FAIL") == a[2]:
             sys.stderr.write('Error from server (Forbidden): persistentvolumes "x" is forbidden: User '
                              '"someone@example.invalid" cannot patch resource\\n'); sys.exit(1)
@@ -220,14 +274,50 @@ FAKE = textwrap.dedent("""\
     if a[:3] == ["compute", "disks", "list"]:
         if os.environ.get("FAKE_DISK_LIST_RC"):
             sys.exit(int(os.environ["FAKE_DISK_LIST_RC"]))
-        print(open(os.environ["FAKE_DISKS"]).read()); sys.exit(0)   # unfiltered: the Python filter decides
-    if a[:3] == ["compute", "disks", "describe"]:
+        # gcloud's filter, as the backstop writes it (zone AND (label=v OR name=(a b))); any other
+        # shape is refused, so the test sees exactly what the argv would list
+        import re
+        m = re.fullmatch(r"zone:\\((\\S+)\\) AND \\((.+)\\)", a[a.index("--filter") + 1])
+        if not m:
+            sys.stderr.write("ERROR: (gcloud.compute.disks.list) unexpected filter\\n"); sys.exit(2)
+        terms = m.group(2).split(" OR ")
+        def hit(d):
+            if d["zone"].rsplit("/", 1)[-1] != m.group(1):
+                return False
+            for t in terms:
+                lm = re.fullmatch(r"labels\\.([\\w-]+)=(\\S+)", t)
+                nm = re.fullmatch(r"name=\\((.+)\\)", t)
+                if lm and (d.get("labels") or {}).get(lm.group(1)) == lm.group(2):
+                    return True
+                if nm and d["name"] in nm.group(1).split():
+                    return True
+            return False
+        gone = set(open(os.path.join(st, "deleted_disks")).read().split()) if has("deleted_disks") else set()
+        # FAKE_DETACH_AFTER=n: the first n lists after the cluster delete still see the disks
+        # attached (the nodes go with the operation, the disks detach after)
+        n = 0
+        if has("deleted"):
+            with open(os.path.join(st, "lists_after_delete"), "a") as fh:
+                fh.write("x")
+            n = len(open(os.path.join(st, "lists_after_delete")).read())
+        out = []
         for d in json.load(open(os.environ["FAKE_DISKS"])):
-            if d["name"] == a[3]:
-                print(json.dumps(d)); sys.exit(0)
-        sys.exit(1)
+            if d["name"] in gone or not hit(d):
+                continue
+            if (has("deleted") and not os.environ.get("FAKE_STAY_ATTACHED")
+                    and n > int(os.environ.get("FAKE_DETACH_AFTER", "0"))):
+                d.pop("users", None)                     # the nodes went with the cluster
+            out.append(d)
+        print(json.dumps(out)); sys.exit(0)
+    if a[:3] == ["compute", "disks", "describe"]:
+        sys.exit(1)                                       # #954: never relied upon (run 17's rc=1s)
     if a[:3] == ["compute", "disks", "delete"]:
-        sys.exit(int(os.environ.get("FAKE_DISK_DELETE_RC", "0")))
+        rc = int(os.environ.get("FAKE_DISK_DELETE_RC", "0"))
+        if rc == 0 and not os.environ.get("FAKE_DELETE_NOOP"):
+            names = a[3:a.index("--zone")]
+            with open(os.path.join(st, "deleted_disks"), "a") as fh:
+                fh.write(" ".join(names) + " ")
+        sys.exit(rc)
     if a[:3] == ["compute", "regions", "describe"]:
         q = json.load(open(os.environ["FAKE_QUOTAS"])); print(json.dumps(q)); sys.exit(0)
     sys.exit(0)
@@ -298,7 +388,10 @@ def test_teardown_releases_the_pvcs_before_the_cluster_then_backstops_exactly(fa
     c = _calls(fakes)
     i_view = _first(c, ["kubectl", "config", "view"])
     i_patch = _first(c, ["kubectl", "patch", "pv", "pvc-ours-recorded-unlabelled"])   # Retain -> Delete
+    i_guard = _first(c, ["kubectl", "apply", "--server-side"])
+    i_probe = _first(c, ["kubectl", "create", "--dry-run=server"])
     i_pvc = _first(c, ["kubectl", "delete", "pvc", "--all", "--all-namespaces"])
+    assert i_patch < i_guard < i_probe < i_pvc
     i_pod = _first(c, ["kubectl", "delete", "pod", "-n", "krateo-system", "mongodb-0"])
     i_gone_pv = max(i for i, x in enumerate(c) if x[:3] == ["kubectl", "get", "pv"])
     i_del = _first(c, ["gcloud", "container", "clusters", "delete", NAME])
@@ -307,10 +400,17 @@ def test_teardown_releases_the_pvcs_before_the_cluster_then_backstops_exactly(fa
     assert i_view < i_patch < i_pvc < i_pod < i_gone_pv < i_del < i_list < i_disk
     assert not any(x[:4] == ["kubectl", "delete", "pod", "-n"] and "web-0" in x for x in c)   # no PVC: left alone
     deleted = c[i_disk][4:c[i_disk].index("--zone")]
-    assert deleted == ["pvc-ours-leftover", "pvc-ours-recorded-unlabelled"]
+    # the attached one too, once the cluster (and its nodes) went; the id-only one by its label
+    assert deleted == ["pvc-ours-attached", "pvc-ours-leftover", "pvc-ours-recorded-unlabelled",
+                       "pvc-reprovisioned-id-only"]
     assert c[i_disk][c[i_disk].index("--zone") + 1] == ZONE
-    assert any("every PV is gone" in m for m in log)
-    assert any(m.startswith("disk backstop: deleted 2 leftover disk(s)") for m in log)
+    assert any("the 2 recorded PV(s) are gone; their disks are checked after the cluster delete" in m
+               for m in log)
+    assert not any("every PV is gone" in m for m in log)
+    # the delete is verified by a second list, which finds none
+    assert sum(1 for x in c if x[:3] == ["gcloud", "compute", "disks"] and x[3] == "list") == 2
+    assert any(m.startswith("disk backstop: verified, no disk of " + NAME + " left") for m in log)
+    assert not any(x[:4] == ["gcloud", "compute", "disks", "describe"] for x in c)
 
 
 def test_only_a_disk_provisioned_here_is_reclaimed_by_delete(fakes):
@@ -355,7 +455,8 @@ def test_a_kubeconfig_that_is_not_this_cluster_changes_nothing(fakes, monkeypatc
     assert _mutating(c) == []
     assert any("refusing — the bench kubeconfig's server (34.90.12.7) is not" in m for m in log)
     i_disk = _first(c, ["gcloud", "compute", "disks", "delete"])
-    assert c[i_disk][4:c[i_disk].index("--zone")] == ["pvc-ours-leftover"]   # the backstop, by GKE's labels
+    assert c[i_disk][4:c[i_disk].index("--zone")] == [                    # the backstop, by the id label
+        "pvc-ours-attached", "pvc-ours-leftover", "pvc-reprovisioned-id-only"]
 
 
 def test_a_stuck_pv_is_bounded_and_the_backstop_still_runs(fakes, monkeypatch):
@@ -393,13 +494,18 @@ def test_an_unreachable_cluster_skips_the_release_but_not_the_backstop(fakes, mo
     c = _calls(fakes)
     assert any("could not list" in m for m in log)
     i_disk = _first(c, ["gcloud", "compute", "disks", "delete"])
-    assert c[i_disk][4:c[i_disk].index("--zone")] == ["pvc-ours-leftover"]   # by GKE's labels alone
+    assert c[i_disk][4:c[i_disk].index("--zone")] == [                    # by the id label alone
+        "pvc-ours-attached", "pvc-ours-leftover", "pvc-reprovisioned-id-only"]
 
 
 @pytest.mark.parametrize("how, env", [
     ("the disks cannot be deleted", {"FAKE_DISK_DELETE_RC": "1"}),
     ("the disks cannot be listed", {"FAKE_DISK_LIST_RC": "1"}),       # 1: never "no disk left"
     ("the cluster never reads gone", {"FAKE_NEVER_GONE": "1"}),       # 2: the skip is loud
+    # #954: a disk still attached at the deadline, and a delete that "succeeds" and leaves it
+    ("a disk never detaches", {"FAKE_STAY_ATTACHED": "1"}),
+    ("a delete leaves the disk", {"FAKE_DELETE_NOOP": "1"}),
+    ("the cluster's id is unknown", {"FAKE_ID": ""}),
 ])
 def test_a_backstop_that_could_not_do_its_job_is_loud(fakes, monkeypatch, capsys, how, env):
     for k, v in env.items():
@@ -409,11 +515,147 @@ def test_a_backstop_that_could_not_do_its_job_is_loud(fakes, monkeypatch, capsys
                             clock=_ticks(), sleep=lambda s: None)
     err = capsys.readouterr().err
     assert problems and f"{gke.BACKSTOP_FAILED} for {NAME}" in err, how
-    assert not any(m.startswith("disk backstop: no disk") for m in log)
+    assert not any("no disk of" in m for m in log)
     # gke-down: exit 4 (the cluster is deleted; its disks may not be)
     (fakes / "state" / "deleted").unlink()
     monkeypatch.setattr(gke, "_POLL_S", 0.01)                # gke-down's real clock and sleep
     assert gke.main(["gke-down", "--name", NAME, "--budget-s", "1", "--yes"]) == gke.EXIT_BACKSTOP_FAILED
+
+
+def test_a_claim_re_created_during_the_release_is_recorded_and_its_disk_deleted(fakes, monkeypatch):
+    """#954, run 17: deleting a StatefulSet's pod and claim makes it re-create
+    both; the new claim's PV (and disk) appear while the release waits for the
+    recorded ones. The release says so, records it, and the backstop lists it
+    by NAME too."""
+    monkeypatch.setenv("FAKE_REPROVISIONED", json.dumps(_pv(
+        "pvc-reprovisioned-id-only", f"projects/{PROJECT}/zones/{ZONE}/disks/pvc-reprovisioned-id-only",
+        "Delete")))
+    log = []
+    assert gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60,
+                        sleep=lambda s: None) == []
+    assert any("PVC release: 1 PV(s) provisioned DURING the release" in m
+               and "pvc-reprovisioned-id-only" in m for m in log)
+    c = _calls(fakes)
+    lst = next(x for x in c if x[:4] == ["gcloud", "compute", "disks", "list"])
+    flt = lst[lst.index("--filter") + 1]
+    assert flt == (f"zone:({ZONE}) AND (labels.goog-gke-cluster-id-base32={OURS_B32} OR "
+                   f"labels.cluster-id-gke-io={OURS_B32} OR name=(pvc-ours-leftover pvc-ours-recorded-unlabelled "
+                   f"pvc-reprovisioned-id-only))")
+    assert any("for PVC krateo-system/datadir-krateo-clickstack-mongodb-0" in m for m in log)
+
+
+MONGO_PV = _pv("pvc-sts-recreated", f"projects/{PROJECT}/zones/{ZONE}/disks/pvc-sts-recreated", "Delete")
+
+
+def test_a_statefulset_re_creates_its_claim_when_nothing_refuses_it(fakes, monkeypatch, capsys):
+    """#954, the REPRODUCTION (the old order: claims and pods deleted while new
+    claims are allowed). mongodb-0's StatefulSet re-creates its claim: a new
+    PV, a new disk, after the release has recorded its PVs."""
+    monkeypatch.setenv("FAKE_STS_CLAIM", json.dumps(MONGO_PV))
+    monkeypatch.setattr(gke, "block_new_claims", lambda k, **kw: True)     # the old order: no guard
+    log = []
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60, sleep=lambda s: None)
+    assert (fakes / "state" / "sts_recreated").exists()
+    assert any("1 PV(s) provisioned DURING the release: pvc-sts-recreated" in m for m in log)
+    assert "provisioned DURING the release" in capsys.readouterr().err                   # said loudly
+
+
+def test_the_release_refuses_new_claims_before_it_deletes_any(fakes, monkeypatch):
+    """#954: the new order. The API server refuses every new claim (verified
+    by a denied dry-run claim) BEFORE the claims and their pods go, so the
+    StatefulSet cannot re-create one."""
+    monkeypatch.setenv("FAKE_STS_CLAIM", json.dumps(MONGO_PV))
+    log = []
+    assert gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60,
+                        sleep=lambda s: None) == []
+    c = _calls(fakes)
+    assert _first(c, ["kubectl", "apply", "--server-side"]) < _first(c, ["kubectl", "create", "--dry-run=server"]) \
+        < _first(c, ["kubectl", "delete", "pvc"]) < _first(c, ["kubectl", "delete", "pod"])
+    assert not (fakes / "state" / "sts_recreated").exists()
+    assert not any("provisioned DURING" in m for m in log)
+    assert any(f"new claims refused ({gke.NO_NEW_CLAIMS} in force)" in m for m in log)
+    applied = (fakes / "state" / "guard_applied").read_text()
+    assert "kind: ValidatingAdmissionPolicy" in applied and "operations: [\"CREATE\"]" in applied
+    assert 'resources: ["persistentvolumeclaims"]' in applied and "validationActions: [Deny]" in applied
+
+
+@pytest.mark.parametrize("env", [{"FAKE_GUARD_IGNORED": "1"}, {"FAKE_GUARD_APPLY_RC": "1"}])
+def test_no_claim_is_deleted_unless_new_claims_are_refused(fakes, monkeypatch, capsys, env):
+    """A policy the API server does not enforce (or could not apply): no claim
+    deleted — nothing to re-create — and the disks are left to the backstop,
+    which runs; the wait for the policy is bounded by the release's budget."""
+    monkeypatch.setenv("FAKE_STS_CLAIM", json.dumps(MONGO_PV))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    log = []
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60, clock=_ticks(),
+                 sleep=lambda s: None)
+    c = _calls(fakes)
+    assert not any(x[:3] == ["kubectl", "delete", "pvc"] for x in c)
+    assert not any(x[:3] == ["kubectl", "delete", "pod"] for x in c)
+    assert "PVC release REFUSED: the API server of" in capsys.readouterr().err
+    assert any(x[:4] == ["gcloud", "compute", "disks", "delete"] for x in c)            # the backstop ran
+
+
+@pytest.mark.parametrize("why, stderr", [
+    ("a quota", 'Error from server (Forbidden): persistentvolumeclaims "bench-teardown-probe" is forbidden: '
+                "exceeded quota: storage, requested: requests.storage=1Gi, used: requests.storage=40Gi, "
+                "limited: requests.storage=40Gi"),
+    ("another webhook", 'Error from server (InternalError): Internal error occurred: failed calling webhook '
+                        '"validate.kyverno.svc": failed to call webhook: context deadline exceeded'),
+    ("another admission policy", "The persistentvolumeclaims \"bench-teardown-probe\" is invalid: : "
+                                 "ValidatingAdmissionPolicy 'require-storage-class' with binding "
+                                 "'require-storage-class' denied request: storageClassName is required"),
+    ("Unauthorized", "error: You must be logged in to the server (Unauthorized)"),
+    ("a client error", "error: unable to recognize \"STDIN\": no matches for kind \"PersistentVolumeClaim\""),
+])
+def test_a_probe_refused_for_any_other_reason_deletes_no_claim(fakes, monkeypatch, capsys, why, stderr):
+    """#956 review R1 (the reviewer's Z5): only a refusal BY bench-teardown-no-new-claims
+    proves new claims are refused. A probe refused by a quota, another webhook or
+    policy, Unauthorized or a client error says nothing about re-created claims:
+    no claim is deleted, and the disks are left to the backstop."""
+    monkeypatch.setenv("FAKE_STS_CLAIM", json.dumps(MONGO_PV))
+    monkeypatch.setenv("FAKE_PROBE_REFUSAL", stderr)
+    log = []
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60, clock=_ticks(),
+                 sleep=lambda s: None)
+    c = _calls(fakes)
+    assert not any(x[:3] == ["kubectl", "delete", "pvc"] for x in c), why
+    assert not any(x[:3] == ["kubectl", "delete", "pod"] for x in c), why
+    assert "PVC release REFUSED: the API server of" in capsys.readouterr().err
+    assert not (fakes / "state" / "sts_recreated").exists()
+    assert any(x[:4] == ["gcloud", "compute", "disks", "delete"] for x in c)            # the backstop ran
+
+
+def test_the_backstop_waits_for_an_attached_disk_to_detach_then_deletes_it(fakes, monkeypatch):
+    """#954: wait on the REAL condition. pvc-ours-attached stays attached for
+    3 lists after the cluster went: never deleted while attached; deleted on
+    the list that sees it free; the run ends on a list that finds none."""
+    monkeypatch.setenv("FAKE_DETACH_AFTER", "3")
+    sleeps, log = [], []
+    assert gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=600,
+                        clock=_ticks(1), sleep=sleeps.append) == []
+    c = _calls(fakes)
+    ops = [x[3] for x in c if x[:3] == ["gcloud", "compute", "disks"]]
+    first = [x for x in c if x[:4] == ["gcloud", "compute", "disks", "delete"]]
+    assert "pvc-ours-attached" not in first[0][4:first[0].index("--zone")]   # the free ones go at once
+    assert any("pvc-ours-attached" in x for x in first[1:])                   # it goes once free
+    i_att = next(i for i, x in enumerate(c) if x[:4] == ["gcloud", "compute", "disks", "delete"]
+                 and "pvc-ours-attached" in x)
+    lists_before = sum(1 for x in c[:i_att] if x[:4] == ["gcloud", "compute", "disks", "list"])
+    assert lists_before == 4 and ops[-1] == "list"
+    assert gke._POLL_S in sleeps                                              # it waited, on the poll
+    assert any(m.startswith("disk backstop: verified, no disk of") for m in log)
+
+
+def test_the_disks_list_is_by_name_and_by_id_never_by_the_name_label():
+    argv = gke.disks_list_command(gke.default_spec(NAME), cluster_id=OURS_B32, names=["b", "a", "a"])
+    flt = argv[argv.index("--filter") + 1]
+    assert flt == (f"zone:({ZONE}) AND (labels.goog-gke-cluster-id-base32={OURS_B32} OR "
+                   f"labels.cluster-id-gke-io={OURS_B32} OR name=(a b))")
+    assert "goog-k8s-cluster-name" not in flt
+    with pytest.raises(RuntimeError, match="cannot be listed"):
+        gke.disks_list_command(gke.default_spec(NAME), cluster_id=None, names=[])
 
 
 def test_the_dry_run_teardown_names_every_step_and_runs_nothing(monkeypatch, capsys):
@@ -470,7 +712,8 @@ def test_run606_reports_a_failed_disk_backstop(harness):  # noqa: F811
     env = dict(env, FAKE_DISKS_FAIL="1")
     p = subprocess.run(["bash", str(BENCH / "run606.sh")], env=env, capture_output=True, text=True, timeout=600)
     assert "deleted (gke-down OK)" not in p.stderr
-    assert "deleted, but DISK BACKSTOP FAILED" in p.stderr and "labels.goog-k8s-cluster-name=" in p.stderr
+    assert "deleted, but DISK BACKSTOP FAILED" in p.stderr
+    assert "lists them by the cluster's id" in p.stderr and "goog-k8s-cluster-name" not in p.stderr
     assert p.returncode != 0
 
 

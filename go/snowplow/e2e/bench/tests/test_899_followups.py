@@ -84,7 +84,7 @@ FAKE_GCLOUD = textwrap.dedent("""\
             print("not json"); sys.exit(0)
         labels = dict(BENCH) if mode != "foreign" else {"purpose": "someone-else"}
         name = a[3] if mode != "othername" else "snowplow-bench-other"
-        print(json.dumps({"name": name, "location": loc, "locations": [os.environ.get("FAKE_NODE_ZONE", "europe-west4-a")],
+        print(json.dumps({"name": name, "id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796", "location": loc, "locations": [os.environ.get("FAKE_NODE_ZONE", "europe-west4-a")],
                           "currentNodeCount": int(os.environ.get("FAKE_NODES", "5")),
                           "nodePools": [{"name": "default-pool", "config": {"machineType": "n2-standard-8"},
                                          "initialNodeCount": 3, "locations": ["europe-west4-a"]}],

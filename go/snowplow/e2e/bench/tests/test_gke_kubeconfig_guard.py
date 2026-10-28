@@ -65,6 +65,11 @@ def realkubectl(T_fakes, tmp_path, monkeypatch):
         case "${{r[0]}} ${{r[1]}}" in
           "get pv") cat "{T_fakes}/pvs_k.json";;
           "get pods") cat "{T_fakes}/pods_k.json";;
+          "apply --server-side") cat > "{T_fakes}/state/guard_k";;     # #954: the no-new-claims policy
+          "create --dry-run=server")                                     # refused once it is in force
+            [ -f "{T_fakes}/state/guard_k" ] || exit 0
+            echo "ValidatingAdmissionPolicy 'bench-teardown-no-new-claims' with binding" \
+                 "'bench-teardown-no-new-claims' denied request" >&2; exit 1;;
           "config view") exec "{REAL_KUBECTL}" "$@";;    # reads the kubeconfig file only
         esac
         exit 0
@@ -105,10 +110,10 @@ def test_release_never_mutates_without_the_bench_context(realkubectl, shape):
     assert all(l.split()[3:5] == ["get", "pv"] for l in lines), lines
     assert not muts, muts
     assert any("could not list" in m for m in log), log
-    # the backstop still deletes only our labelled disk (by GKE labels)
+    # the backstop still deletes only this cluster's disks, by its id label (#954)
     c = T._calls(realkubectl)
     i = T._first(c, ["gcloud", "compute", "disks", "delete"])
-    assert c[i][4:c[i].index("--zone")] == ["pvc-ours-leftover"]
+    assert c[i][4:c[i].index("--zone")] == ["pvc-ours-attached", "pvc-ours-leftover", "pvc-reprovisioned-id-only"]
 
 
 def test_control_the_bench_context_present_does_release(realkubectl):

@@ -34,7 +34,7 @@ FAKE_GCLOUD = textwrap.dedent("""\
                              "message=Not found: clusters/" + a[3] + ".\\n")
             sys.exit(1)
         log("describe")
-        print(json.dumps({"name": a[3], "resourceLabels": {
+        print(json.dumps({"name": a[3], "id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796", "resourceLabels": {
             "purpose": "snowplow-bench", "issue": "606", "created-by": "bench-gke", "owner": "t",
             "ttl-expires": str(int(time.time()) + 3600)}}))
         sys.exit(0)

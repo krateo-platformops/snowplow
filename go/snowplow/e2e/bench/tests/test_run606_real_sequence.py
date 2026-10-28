@@ -107,7 +107,7 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
                   "created-by": "bench-gke", "owner": "t",
                   "ttl-expires": str(int(time.time()) + 3600)}
         # what GKE reports for the regional cluster gke-up made (#899 F1 records it)
-        print(json.dumps({"name": a[3], "location": opt("--region") or opt("--zone"),
+        print(json.dumps({"name": a[3], "id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796", "location": opt("--region") or opt("--zone"),
                           "locations": ["europe-west4-a"], "currentNodeCount": 5,
                           "nodePools": [{"name": n, "config": {"machineType": m}, "initialNodeCount": c,
                                          "locations": ["europe-west4-a"]}
@@ -945,7 +945,11 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     assert ["container", "clusters", "describe", RUN_NAME] == gcl[-4][:4]
     assert gcl[-3][:4] == ["container", "clusters", "delete", RUN_NAME]
     assert [g[:3] for g in gcl[-3:]] == TEARDOWN_TAIL
-    assert f"labels.goog-k8s-cluster-name={RUN_NAME}" in " ".join(gcl[-1])
+    # #954: by the cluster's id (the describe's id, base32), never by its name label
+    from bench import gke as _gke
+    cid = _gke.cluster_id_b32({"id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796"})
+    assert f"labels.cluster-id-gke-io={cid}" in " ".join(gcl[-1])
+    assert "goog-k8s-cluster-name" not in " ".join(gcl[-1])
     assert "krateo-057" not in json.dumps(calls)
 
     # the synthetic users' password never reaches a log
