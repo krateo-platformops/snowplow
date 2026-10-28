@@ -337,7 +337,7 @@ func TestF4_FreshSkip_RealSeedOneWidget_SkipsLiveCell(t *testing.T) {
 	// Put that warmed this target). This is not a hand-fed skip key — it is the
 	// key the primitive itself derived above, and the skip lookup will re-derive
 	// the SAME key internally.
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("F4-C2 setup: the seeded cell must be live under the production key")
 	}
@@ -406,7 +406,7 @@ func TestF4_FreshSkip_MisKeyedLookupDoesNotSkip_MutationShape(t *testing.T) {
 	// Put a live cell under a WRONG key (the mutation: skip lookup keyed on
 	// something other than the production key). The real primitive derives the
 	// PRODUCTION key, finds NO live cell there, and does NOT skip.
-	handle.Put(key+"-WRONG", &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
+	putFixture(handle, key+"-WRONG", &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 
 	skipBefore := pipSeedFreshSkipTotal.Load()
 	_ = seedOneWidget(granted, e, "authn-ns", seedModeBoot)
@@ -440,7 +440,7 @@ func TestF4_Boundary_GVRDiscoveredScopeNeverSkipsLiveCell(t *testing.T) {
 		t.Fatal("setup: real key derivation")
 	}
 	// Install a live cell — the exact condition boot-scope WOULD fresh-skip.
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("setup: live cell installed")
 	}

@@ -189,6 +189,27 @@ func reseedInertFromHeaders(req *http.Request) *http.Request {
 	return req.WithContext(cache.WithInert(req.Context()))
 }
 
+// reseedBackgroundFromHeaders is the ingest half of the #903 self-loopback
+// rule: a background resolve that calls snowplow's own /call sends
+// cache.BackgroundHeader: 1, and this hop then refuses write stages too (its
+// ctx carries no background marker of its own).
+//
+// Trust rule (the reseedInertFromHeaders precedent): honoured on ANY request
+// with a snowplow-validated identity, because the hop marker only RESTRICTS —
+// it refuses that one request's write stages and changes nothing else (not the
+// origin, the memory gates, the cache key or a log level). A user forging it
+// stops only their own request's writes. Any value but "1" is ignored. Runs
+// first in ServeHTTP, with the inert ingest.
+func reseedBackgroundFromHeaders(req *http.Request) *http.Request {
+	if req == nil || req.Header.Get(cache.BackgroundHeader) != "1" || cache.BackgroundHop(req.Context()) {
+		return req
+	}
+	if _, err := xcontext.UserInfo(req.Context()); err != nil {
+		return req
+	}
+	return req.WithContext(cache.WithBackgroundHop(req.Context()))
+}
+
 // reseedNestedGuardsFromHeaders re-installs the depth counter + ancestor set from
 // the inbound X-Snowplow-* headers onto ctx — but ONLY when isTrustedSelfLoopback.
 // Returns ctx unchanged for an untrusted request (headers ignored). The parse

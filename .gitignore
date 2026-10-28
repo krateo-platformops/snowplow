@@ -35,3 +35,11 @@ experiments/**
 
 # Compiled auditor binary (go build output, not an artifact we ship)
 /go/snowplow/checkidentitykeys
+
+# Built tool binaries: a `go build` run in go/snowplow/scripts/<tool>/ leaves an
+# extensionless executable beside the tool's source (#912 committed one). Ignore
+# every file without a source extension directly in a tool directory; the
+# check_no_tracked_binaries.sh gate refuses one that is added anyway.
+/go/snowplow/scripts/*/*
+!/go/snowplow/scripts/*/*.*
+!/go/snowplow/scripts/*/*/

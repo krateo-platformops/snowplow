@@ -22,7 +22,7 @@ import (
 )
 
 type r378RefreshPutter interface {
-	ReplaceIfGenRefresh(ctx context.Context, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
+	ReplaceResolvedIfGenRefresh(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
 }
 
 // r378RemintClasses is the closed class set the live query requires (5 series).
@@ -38,14 +38,14 @@ func TestIssue378_D3_P1SeriesLeaveTheProcessOnOTLP(t *testing.T) {
 	store := cache.ResolvedCache()
 	rp, ok := any(store).(r378RefreshPutter)
 	if !ok {
-		t.Fatalf("#378 D3 RED: the store has no ReplaceIfGenRefresh, so nothing can re-mint and remint_total{class} cannot move")
+		t.Fatalf("#378 D3 RED: the store has no ReplaceResolvedIfGenRefresh, so nothing can re-mint and remint_total{class} cannot move")
 	}
 
 	put := func(class, name string, e *cache.ResolvedEntry) string {
 		in := cache.ResolvedKeyInputs{CacheEntryClass: class, Namespace: "d3", Name: name}
 		k := cache.ComputeKey(in)
 		e.Inputs = &in
-		store.Put(k, e)
+		store.PutResolved(fixtureStoreVerdict, k, e)
 		return k
 	}
 	// Re-mint population: class i gets i+1 cells → distinct per-class counts.
@@ -72,7 +72,7 @@ func TestIssue378_D3_P1SeriesLeaveTheProcessOnOTLP(t *testing.T) {
 		if e, ok := store.GetNoTouch(r[1]); ok {
 			in = *e.Inputs
 		}
-		if !rp.ReplaceIfGenRefresh(context.Background(), r[1], &cache.ResolvedEntry{RawJSON: []byte(`2`), Inputs: &in}, store.CaptureGen(r[1])) {
+		if !rp.ReplaceResolvedIfGenRefresh(context.Background(), fixtureStoreVerdict, r[1], &cache.ResolvedEntry{RawJSON: []byte(`2`), Inputs: &in}, store.CaptureGen(r[1])) {
 			t.Fatalf("SETUP: in-window refresh of %s refused", r[0])
 		}
 	}

@@ -75,7 +75,7 @@ func TestExternalTTL_Isolation_TwoDimensional(t *testing.T) {
 
 	// A renders first: external-TTL Put of A's OWN external bytes under keyA.
 	bytesA := []byte(`{"otel_logs":["A-secret-row"]}`)
-	store.Put(keyA, &ResolvedEntry{
+	store.put(keyA, &ResolvedEntry{
 		RawJSON: bytesA, CreatedAt: time.Now(),
 		TTLOverride: 20 * time.Second, ExternalTTL: true,
 	})
@@ -113,7 +113,7 @@ func TestExternalTTL_Isolation_RED_IdentityFreeCell_MustCrossDeliver(t *testing.
 	}
 
 	bytesA := []byte(`{"otel_logs":["A-secret-row"]}`)
-	store.Put(keyA, &ResolvedEntry{
+	store.put(keyA, &ResolvedEntry{
 		RawJSON: bytesA, CreatedAt: time.Now(),
 		TTLOverride: 20 * time.Second, ExternalTTL: true,
 	})
@@ -142,14 +142,14 @@ func TestExternalTTL_PersistedMarkerSurvivesPutGet(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	// External-TTL Put: marker true, short override.
-	c.Put("k-ext", &ResolvedEntry{
+	c.put("k-ext", &ResolvedEntry{
 		RawJSON:     []byte(`{"ext":true}`),
 		CreatedAt:   time.Now(),
 		TTLOverride: 20 * time.Second,
 		ExternalTTL: true,
 	})
 	// Normal Put: marker defaults to zero value (false).
-	c.Put("k-normal", &ResolvedEntry{
+	c.put("k-normal", &ResolvedEntry{
 		RawJSON:   []byte(`{"ext":false}`),
 		CreatedAt: time.Now(),
 	})
@@ -184,7 +184,7 @@ func TestExternalTTL_StalenessBoundedByTTLOverride(t *testing.T) {
 	body := []byte(`{"otel_logs":["row1","row2"]}`)
 
 	// Read at t+5s (well inside a 20s TTL): HIT, identical bytes.
-	c.Put("k-fresh", &ResolvedEntry{
+	c.put("k-fresh", &ResolvedEntry{
 		RawJSON:     body,
 		CreatedAt:   time.Now().Add(-5 * time.Second),
 		TTLOverride: 20 * time.Second,
@@ -200,7 +200,7 @@ func TestExternalTTL_StalenessBoundedByTTLOverride(t *testing.T) {
 
 	// Read at t+25s (past the 20s TTL): MISS → re-fetch. Proves the served
 	// data age can NEVER exceed the TTL even though the store ttl is 1h.
-	c.Put("k-stale", &ResolvedEntry{
+	c.put("k-stale", &ResolvedEntry{
 		RawJSON:     body,
 		CreatedAt:   time.Now().Add(-25 * time.Second),
 		TTLOverride: 20 * time.Second,
@@ -230,7 +230,7 @@ func TestExternalTTL_StormCollapse_ConcurrentRendersAreHits(t *testing.T) {
 	body := []byte(`{"otel_logs":["r1","r2"]}`)
 
 	// Single first-render cold fill (the ONE external fetch per window).
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON: body, CreatedAt: time.Now(),
 		TTLOverride: 20 * time.Second, ExternalTTL: true,
 	})
@@ -271,9 +271,9 @@ func TestExternalTTL_NotWireEncoded(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	body := []byte(`{"a":1,"b":[2,3]}`)
 
-	c.Put("k-marked", &ResolvedEntry{RawJSON: body, CreatedAt: time.Now(),
+	c.put("k-marked", &ResolvedEntry{RawJSON: body, CreatedAt: time.Now(),
 		TTLOverride: 20 * time.Second, ExternalTTL: true})
-	c.Put("k-plain", &ResolvedEntry{RawJSON: body, CreatedAt: time.Now()})
+	c.put("k-plain", &ResolvedEntry{RawJSON: body, CreatedAt: time.Now()})
 
 	em, _ := c.Get("k-marked")
 	ep, _ := c.Get("k-plain")

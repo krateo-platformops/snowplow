@@ -152,7 +152,7 @@ func setup765b(t *testing.T, mode string, in jqinterest.Interest) *env765b {
 	if err != nil {
 		t.Fatalf("raKey pre-warm: %v", err)
 	}
-	e.store.PutRAFullList(e.raKey, e.raIn, full)
+	e.store.PutRAFullList(fixtureStoreVerdict, e.raKey, e.raIn, full)
 	cache.RecordSliceability(e.raKey, seedFullListShape(gRA, edge3BackingNS, raName765b, ra(raSliceJQ)), true)
 	cache.Deps().Record(context.Background(), e.raKey, gRA, edge3BackingNS, raName765b)
 	return e
@@ -380,7 +380,7 @@ func TestReplay765b_P8b_AWidgetSlicingADirtyV2IsAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("V2 resolve: %v", err)
 	}
-	e.store.PutRAFullList(e.raKey, e.raIn, full)
+	e.store.PutRAFullList(fixtureStoreVerdict, e.raKey, e.raIn, full)
 	if got := state765b(e.raKey); got != "all" {
 		t.Fatalf("P8b setup: V2 must leave the raKey edge all, got %q", got)
 	}
@@ -415,7 +415,7 @@ func TestReplay765b_P9_TheAuditCoversAReceiverWidget(t *testing.T) {
 	}
 	sibIn := edge3WidgetInputs("w765b-sib")
 	sibBody, _ := json.Marshal(bodies[sib])
-	e.store.Put(sib, &cache.ResolvedEntry{RawJSON: sibBody, Inputs: sibIn})
+	e.store.PutResolved(fixtureStoreVerdict, sib, &cache.ResolvedEntry{RawJSON: sibBody, Inputs: sibIn})
 
 	// The refresher terminal, as resolve_populate.go does it; `force` makes the
 	// rebuild differ.
@@ -434,7 +434,7 @@ func TestReplay765b_P9_TheAuditCoversAReceiverWidget(t *testing.T) {
 			enc = []byte(`{"forced":"difference"}`)
 		}
 		prior, had := e.store.GetNoTouch(key)
-		stored := e.store.ReplaceIfGenRefresh(ctx, key, &cache.ResolvedEntry{RawJSON: enc, Inputs: &in}, gen0)
+		stored := e.store.ReplaceResolvedIfGenRefresh(ctx, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: enc, Inputs: &in}, gen0)
 		cache.NoteRefreshWrite(ctx, key, stored)
 		cache.NoteNarrowAuditWrite(ctx, key, prior, had, enc, stored)
 		return nil

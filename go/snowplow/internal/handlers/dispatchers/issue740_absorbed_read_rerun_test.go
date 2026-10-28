@@ -56,7 +56,7 @@ func k740Shell(t *testing.T, h *k547Harness) (string, cacheHandle) {
 	shell.Object["status"] = map[string]any{"widgetData": map[string]any{"conditions": []any{
 		map[string]any{"type": "Ready", "status": "True", "reason": "v0"}}}}
 	raw, _ := json.Marshal(shell.Object)
-	handle.Put(contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
+	putFixture(handle, contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
 	cache.Deps().Record(ctx, contentKey, k547CompGVR, k547CompNS, fmt.Sprintf("comp-%d", k547Changed))
 	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
 		t.Fatalf("PRECONDITION: the shared shell must serve before the UPDATE (code=%d reason=%q)", code, r)

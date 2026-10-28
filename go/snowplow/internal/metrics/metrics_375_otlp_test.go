@@ -37,17 +37,17 @@ func TestIssue375_UnguardedPutTotalReachesOTLP(t *testing.T) {
 
 	// Control: a guarded Put (sink installed at the resolve entry) must NOT count.
 	guarded := cache.WithL1KeyContext(context.Background(), "k375-guarded")
-	if !store.PutIfGen(guarded, "k375-guarded", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen("k375-guarded")) {
+	if !store.PutResolvedIfGen(guarded, fixtureStoreVerdict, "k375-guarded", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen("k375-guarded")) {
 		t.Fatalf("setup: guarded PutIfGen refused")
 	}
 
 	// Two drifted resolve-entry Puts (bare ctx → nil sink) + one drifted ReplaceIfGen.
 	for _, k := range []string{"k375-a", "k375-b"} {
-		if !store.PutIfGen(context.Background(), k, &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(k)) {
+		if !store.PutResolvedIfGen(context.Background(), fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(k)) {
 			t.Fatalf("setup: nil-sink PutIfGen(%s) refused", k)
 		}
 	}
-	if !store.ReplaceIfGen(context.Background(), "k375-a", &cache.ResolvedEntry{RawJSON: []byte(`{"v":2}`), CreatedAt: time.Now()}, store.CaptureGen("k375-a")) {
+	if !store.ReplaceResolvedIfGen(context.Background(), fixtureStoreVerdict, "k375-a", &cache.ResolvedEntry{RawJSON: []byte(`{"v":2}`), CreatedAt: time.Now()}, store.CaptureGen("k375-a")) {
 		t.Fatalf("setup: nil-sink ReplaceIfGen refused")
 	}
 

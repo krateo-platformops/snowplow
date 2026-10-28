@@ -57,7 +57,7 @@ func TestIssue375_TypeLevelDirtyMarkInsideWindow_Remarks(t *testing.T) {
 					continue
 				}
 				Deps().Record(o.ctx, cs.key, g375A, "ns", cs.name)
-				if !c.PutIfGen(o.ctx, cs.key, body375(`{}`), o.gen0) {
+				if !c.putIfGen(o.ctx, cs.key, body375(`{}`), o.gen0) {
 					t.Fatalf("setup: PutIfGen refused")
 				}
 				if got := rl.count(cs.key); got != 1 {

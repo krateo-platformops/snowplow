@@ -41,7 +41,7 @@ func TestIssue386_M2_RealDrainExcludesSkippedNoEntry(t *testing.T) {
 	for i := 0; i < reals; i++ {
 		in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "real" + itoa(i)}
 		k := ComputeKey(in)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		enqueueRefreshForTest(k)
 		r.processNext(ctx)
 	}

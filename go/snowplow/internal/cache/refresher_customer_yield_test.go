@@ -54,7 +54,7 @@ func TestRefresher_YieldEngagesAndReleases(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-feed"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"y":1}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"y":1}`), Inputs: &inputs})
 
 	handlerRan := make(chan struct{}, 1)
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {
@@ -107,7 +107,7 @@ func TestRefresher_NilHookNoYield(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-0042"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	handlerRan := make(chan struct{}, 1)
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {
@@ -157,7 +157,7 @@ func TestRefresher_YieldCapBound(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-dead"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	handlerRan := make(chan time.Time, 1)
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {
@@ -233,7 +233,7 @@ func TestRefresher_ConvergesUnderIntermittentBurst(t *testing.T) {
 	for i := 0; i < N; i++ {
 		in := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: fmt.Sprintf("uid-0100-%d", i)}
 		k := ComputeKey(in)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		keys[i] = k
 	}
 
@@ -284,7 +284,7 @@ func TestRefresher_RaceYieldUnderConcurrentInflightFlips(t *testing.T) {
 	for i := 0; i < N; i++ {
 		in := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: fmt.Sprintf("uid-c000-%d", i)}
 		k := ComputeKey(in)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		keys[i] = k
 	}
 
@@ -438,8 +438,8 @@ func TestRefresher_YieldUniformAcrossKinds(t *testing.T) {
 	rsInputs := ResolvedKeyInputs{CacheEntryClass: "restactions", BindingUID: "uid-0002"}
 	wk := ComputeKey(widgetInputs)
 	rk := ComputeKey(rsInputs)
-	c.Put(wk, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &widgetInputs})
-	c.Put(rk, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &rsInputs})
+	c.put(wk, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &widgetInputs})
+	c.put(rk, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &rsInputs})
 
 	wRan := make(chan struct{}, 1)
 	rRan := make(chan struct{}, 1)

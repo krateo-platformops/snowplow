@@ -425,7 +425,7 @@ func TestRAServe_EmptyBindingDeclines(t *testing.T) {
 	keyInputs := f6KeyInputs(gvr().Group, gvr().Version, gvr().Resource,
 		"krateo-system", raName, "" /* the empty-identity key */, nil)
 	raKey := cache.ComputeKey(keyInputs)
-	cache.ResolvedCache().PutRAFullList(raKey, keyInputs, panelDict(40))
+	cache.ResolvedCache().PutRAFullList(fixtureStoreVerdict, raKey, keyInputs, panelDict(40))
 	cache.RecordSliceability(raKey, shape, true) // known-sliceable → would HIT
 	if _, ok := cache.ResolvedCache().Get(raKey); !ok {
 		t.Fatalf("setup: the representative empty-identity cell must be present")

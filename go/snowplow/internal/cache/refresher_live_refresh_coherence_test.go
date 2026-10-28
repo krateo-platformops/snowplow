@@ -97,7 +97,7 @@ func runStaleWindowProbe(t *testing.T, floorSeconds string, customerInflight boo
 	// (1) Commit the first /call result (v1). Put stamps CreatedAt=now — the
 	// realistic case: a live-refresh refetch hits an entry the first /call
 	// JUST populated, i.e. YOUNGER than the 2s floor.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
 	// (2) Real dep edge: widget L1 key depends on the backing object.
 	Deps().Record(context.Background(), key, gvr, ns, objName)
 
@@ -108,7 +108,7 @@ func runStaleWindowProbe(t *testing.T, floorSeconds string, customerInflight boo
 		if resolveCost > 0 {
 			time.Sleep(resolveCost)
 		}
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
 		committedAt.Store(time.Now().UnixNano())
 		return nil
 	})
@@ -252,12 +252,12 @@ func TestLiveRefreshCoherence_RefetchLandsInsideWindow(t *testing.T) {
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: ns, Name: "widget-detail"}
 	key := ComputeKey(in)
 
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
 	Deps().Record(context.Background(), key, gvr, ns, objName)
 
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
 		time.Sleep(5 * time.Millisecond)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
 		return nil
 	})
 
@@ -355,7 +355,7 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 	// "1 immediate + collapsed-rest" shape deterministically — mirrors
 	// putAgedEntry's intent in refresher_rate_floor_test.go). agedBackoff
 	// (30s) is past every test floor yet under the cache TTL.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
 	Deps().Record(context.Background(), key, gvr, ns, objName)
 
 	var resolves atomic.Int32
@@ -365,7 +365,7 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 		// small but non-zero cost so the alloc/wall figures are meaningful
 		// without making the test slow.
 		time.Sleep(2 * time.Millisecond)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
 		resolves.Add(1)
 		lastCommitAt.Store(time.Now().UnixNano())
 		return nil

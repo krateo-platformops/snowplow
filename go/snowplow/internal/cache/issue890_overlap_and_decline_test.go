@@ -26,7 +26,7 @@ func TestIssue890_AcceptedWriteReassertsItsOwnEdges(t *testing.T) {
 	ctxR1 := WithL1KeyContext(context.Background(), k)
 	d.Record(ctxR1, k, dep.GVR, dep.Namespace, dep.Name)
 	old := &ResolvedEntry{RawJSON: []byte(`{}`)}
-	store.Put(k, old)
+	store.put(k, old)
 	gen1 := store.CaptureGen(k)
 	store.EvictUnrefreshable(k, old)
 
@@ -35,14 +35,14 @@ func TestIssue890_AcceptedWriteReassertsItsOwnEdges(t *testing.T) {
 	d.Record(ctxR2, k, dep.GVR, dep.Namespace, dep.Name)
 	d.Record(ctxR1, k, dep.GVR, dep.Namespace, dep.Name) // R1 is still recording too
 
-	if store.ReplaceIfGen(ctxR1, k, &ResolvedEntry{RawJSON: []byte(`{"r":1}`)}, gen1) {
+	if store.replaceIfGen(ctxR1, k, &ResolvedEntry{RawJSON: []byte(`{"r":1}`)}, gen1) {
 		t.Fatal("harness: R1 must be refused")
 	}
 	if d.hasEdge(k, dep) {
 		t.Fatal("harness: R1's refusal of non-resident K must strip its edges")
 	}
 	before := d.reassertedEdgesTotal.Load()
-	if !store.PutIfGen(ctxR2, k, &ResolvedEntry{RawJSON: []byte(`{"r":2}`)}, gen2) {
+	if !store.putIfGen(ctxR2, k, &ResolvedEntry{RawJSON: []byte(`{"r":2}`)}, gen2) {
 		t.Fatal("#890 RED: R2 overlapped R1's refusal and was refused — a strip must never refuse a fill")
 	}
 	if !d.hasEdge(k, dep) {
@@ -74,7 +74,7 @@ func TestIssue890_OverlappingColdFillsCacheTheKey(t *testing.T) {
 			ctx0 := WithL1KeyContext(context.Background(), k)
 			d.Record(ctx0, k, dep.GVR, dep.Namespace, dep.Name)
 			old := &ResolvedEntry{RawJSON: []byte(`{}`)}
-			store.Put(k, old)
+			store.put(k, old)
 			gen0 := store.CaptureGen(k)
 			store.EvictUnrefreshable(k, old)
 			d.Record(ctx0, k, dep.GVR, dep.Namespace, dep.Name)
@@ -95,7 +95,7 @@ func TestIssue890_OverlappingColdFillsCacheTheKey(t *testing.T) {
 					inflight = append(inflight, f)
 				}
 				if i == 1 { // the in-flight refresher's write-back lands DURING fill 1: refused
-					if store.ReplaceIfGen(ctx0, k, &ResolvedEntry{RawJSON: []byte(`{"r":0}`)}, gen0) {
+					if store.replaceIfGen(ctx0, k, &ResolvedEntry{RawJSON: []byte(`{"r":0}`)}, gen0) {
 						t.Fatal("harness: the refresher's write-back of evicted K must be refused")
 					}
 					d.ReleaseUnstored(context.Background(), k) // its deferred release
@@ -106,7 +106,7 @@ func TestIssue890_OverlappingColdFillsCacheTheKey(t *testing.T) {
 						rest = append(rest, f)
 						continue
 					}
-					if !store.PutIfGen(f.ctx, k, &ResolvedEntry{RawJSON: []byte(`{"v":1}`)}, f.gen) {
+					if !store.putIfGen(f.ctx, k, &ResolvedEntry{RawJSON: []byte(`{"v":1}`)}, f.gen) {
 						refused++
 					}
 					d.ReleaseUnstored(context.Background(), k) // the fill's deferred release
@@ -140,7 +140,7 @@ func TestIssue890_DeclinedResolveReleasesItsEdges(t *testing.T) {
 	const cold = "L1_890_declined"
 	ctx := WithL1KeyContext(context.Background(), cold)
 	d.Record(ctx, cold, dep.GVR, dep.Namespace, dep.Name)
-	m.StoreLayeredWithStates("memo-declined", cold, memoBody(map[string]any{"x": 1.0}), []DepKey{dep}, nil, DepGenEpochNow(), nil)
+	m.StoreLayeredWithStates("memo-declined", cold, memoBody(map[string]any{"x": 1.0}), []DepKey{dep}, nil, DepGenEpochNow(), nil, PutGateEffects{})
 	// ... the Put gate declines: no write.
 	d.ReleaseUnstored(context.Background(), cold)
 	if d.hasEdges(cold) {
@@ -153,7 +153,7 @@ func TestIssue890_DeclinedResolveReleasesItsEdges(t *testing.T) {
 
 	const warm = "L1_890_declined_resident"
 	d.Record(context.Background(), warm, dep.GVR, dep.Namespace, dep.Name)
-	store.Put(warm, &ResolvedEntry{RawJSON: []byte(`{}`)})
+	store.put(warm, &ResolvedEntry{RawJSON: []byte(`{}`)})
 	ctxW := WithL1KeyContext(context.Background(), warm) // a refresh that declines
 	d.Record(ctxW, warm, dep.GVR, dep.Namespace, dep.Name)
 	d.ReleaseUnstored(context.Background(), warm)

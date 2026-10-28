@@ -107,7 +107,7 @@ func TestShip97_F1_ApistageRefreshPopulatesItems(t *testing.T) {
 	key := cache.ComputeKey(inputs)
 
 	// Seed a stale entry with Items=nil (what pre-fix refresh would also leave).
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
 
 	// Drive the refresh as the worker would.
 	RegisterRefreshHandlers(nil)
@@ -221,7 +221,7 @@ func TestShip97_F2_ApistageGetByNameLeavesItemsNil(t *testing.T) {
 		Name:            "w1", // GET-by-name
 	}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
 
 	RegisterRefreshHandlers(nil)
 	fn := cache.RefreshFuncForTest(cache.CacheEntryClassApistage)
@@ -275,7 +275,7 @@ func TestShip97_F3_NonApistageClassesUnaffected(t *testing.T) {
 			RepresentativeGroups:   []string{"devs"},
 		}
 		key := cache.ComputeKey(inputs)
-		c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
+		c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
 
 		RegisterRefreshHandlers(nil)
 		fn := cache.RefreshFuncForTest(class)
@@ -328,7 +328,7 @@ func TestShip97_F4_ConcurrentReadersOverRefresherPutEntry(t *testing.T) {
 		Name:            "",
 	}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
 
 	RegisterRefreshHandlers(nil)
 	fn := cache.RefreshFuncForTest(cache.CacheEntryClassApistage)

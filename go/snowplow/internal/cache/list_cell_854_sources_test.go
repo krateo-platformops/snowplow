@@ -304,7 +304,7 @@ func TestListCell854_F5y_AComparatorPassIsRefresherWorkThatYieldsToCustomers(t *
 	defer cleanup()
 	_, c, _ := c854AnchorWith(t, 5, c854Funcs(), nil)
 	in := &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Namespace: "c854"}
-	ResolvedCache().Put(c.key, NewListCellEntry(c, in))
+	ResolvedCache().put(c.key, NewListCellEntry(c, in))
 	var customers atomic.Bool
 	customers.Store(true)
 	SetCustomerInflightHook(customers.Load)

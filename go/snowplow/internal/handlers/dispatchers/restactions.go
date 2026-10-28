@@ -67,6 +67,7 @@ var _ http.Handler = (*restActionHandler)(nil)
 func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #443 (j) ingest — FIRST, before observeLiveCaller and the L1 key mint.
 	req = reseedInertFromHeaders(req)
+	req = reseedBackgroundFromHeaders(req) // #903
 	// #871 — measurement only: the dispatch's work class (customer, or a
 	// demand revalidation's fill_bg, or a background caller's class across a
 	// self-loopback) as a pprof label on req's context and goroutine.
@@ -590,42 +591,63 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
 			slog.String("effect", "body served (200) narrowed for THIS requester; not persisted — a co-bound user would key onto the same cell and be served these rows (1.12.3 A-1; 1.13.0 folds the UAF scope into the key)"),
 		)
-	} else if stageErrSink.Count() > 0 && !cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, "restactions") {
-		// #681 — a result whose ONLY stage errors are per-identity forbidden
-		// (cache.DenialOnly) is NOT declined here: it is correct and
-		// deterministic for this requester's binding-set class, carries the
-		// identity-free canonical error body, and is cached below.
-		//
-		// A bare decline: the partial body is SERVED (written below) and not
-		// persisted, so a transient item failure self-heals on the next
-		// resolve. 1.12.6 C9 retired the D bounded-partial Put that used to
-		// sit here (PARTIAL_RESULT_TTL_SECONDS, default-off, never enabled on
-		// any deployment): a partial-with-errors body is exactly the kind of
-		// wrong content the C4 terminal semantics and the C5 lifetime bound
-		// exist to keep OUT of L1, and a second, parallel TTL layer for it was
-		// one more mechanism to reason about for no measured gain.
-		log.Warn("RESTAction served with per-item stage error(s); declining to cache the partial result",
-			slog.String("name", cr.Name),
-			slog.String("namespace", cr.Namespace),
-			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
-		)
-	} else if cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 {
-		// External-no-cache (proposal 2026-06-22) — the resolve touched a
-		// genuine external endpoint (no informer/dep edge to invalidate it).
-		// #681 C2: an own-credential apiserver 403 is not one.
-		// Serve the body (already encoded above) but DECLINE the Put so every
-		// /call re-fetches the external API live (fresh). Declining the Put
-		// also declines the self-dep Record below — an external RA never
-		// enters the DepTracker. BumpExternalSkippedPut is the process-wide
-		// "did the gate fire?" falsifier.
-		cache.BumpExternalSkippedPut()
-		log.Warn("RESTAction touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
-			slog.String("name", cr.Name),
-			slog.String("namespace", cr.Namespace),
-			slog.Int64("external_touches", extTouchedSink.Count()),
-			slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
-		)
+	} else if verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, "restactions"); !verdict.Store() {
+		// The shared Put-gate verdict (cache.PutGateVerdict): a declared write
+		// (#903 F1), a stage error that is not per-identity forbidden (#681), a
+		// genuine external touch. Each reason keeps its own log and counter.
+		switch verdict.Reason() {
+		case cache.PutReasonDeclaredWrite:
+			// DEBUG: designed, and it fires on every /call of a write RESTAction.
+			log.Debug("RESTAction declares a write stage; declining to cache",
+				slog.String("name", cr.Name),
+				slog.String("namespace", cr.Namespace),
+				slog.String("effect", "body served (200); not persisted — every /call runs its write (#903 F1)"),
+			)
+		case cache.PutReasonStageError:
+			// #681 — a result whose ONLY stage errors are per-identity forbidden
+			// (cache.DenialOnly) is NOT declined here: it is correct and
+			// deterministic for this requester's binding-set class, carries the
+			// identity-free canonical error body, and is cached below.
+			//
+			// A bare decline: the partial body is SERVED (written below) and not
+			// persisted, so a transient item failure self-heals on the next
+			// resolve. 1.12.6 C9 retired the D bounded-partial Put that used to
+			// sit here (PARTIAL_RESULT_TTL_SECONDS, default-off, never enabled on
+			// any deployment): a partial-with-errors body is exactly the kind of
+			// wrong content the C4 terminal semantics and the C5 lifetime bound
+			// exist to keep OUT of L1, and a second, parallel TTL layer for it was
+			// one more mechanism to reason about for no measured gain.
+			log.Warn("RESTAction served with per-item stage error(s); declining to cache the partial result",
+				slog.String("name", cr.Name),
+				slog.String("namespace", cr.Namespace),
+				slog.Int64("stage_errors", stageErrSink.Count()),
+				slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+			)
+		case cache.PutReasonExternal:
+			// External-no-cache (proposal 2026-06-22) — the resolve touched a
+			// genuine external endpoint (no informer/dep edge to invalidate it).
+			// #681 C2: an own-credential apiserver 403 is not one.
+			// Serve the body (already encoded above) but DECLINE the Put so every
+			// /call re-fetches the external API live (fresh). Declining the Put
+			// also declines the self-dep Record below — an external RA never
+			// enters the DepTracker. BumpExternalSkippedPut is the process-wide
+			// "did the gate fire?" falsifier.
+			cache.BumpExternalSkippedPut()
+			log.Warn("RESTAction touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
+				slog.String("name", cr.Name),
+				slog.String("namespace", cr.Namespace),
+				slog.Int64("external_touches", extTouchedSink.Count()),
+				slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
+			)
+		default:
+			// Any other decline: today only cache.PutReasonUnobserved, a verdict
+			// over Put-gate sinks that were not all installed on the resolve. It
+			// admits nothing (#912 delta-3 item 3); never read as another reason.
+			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+				slog.String("reason", string(verdict.Reason())),
+				slog.String("effect", "body served; not persisted"),
+			)
+		}
 	} else if cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
 		// #95 SECURITY (A4 populate side, customer path) — sibling of the
 		// widgets.go Put-gate + seed FIX-C: a re-derived BindingUID of "" must
@@ -665,7 +687,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// delete body) if a DELETE-eviction bumped the key's generation during
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
 			noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
-			putStored := cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
+			putStored := cacheHandle.PutResolvedIfGen(ctx, verdict, cacheKey, &cache.ResolvedEntry{
 				RawJSON:       encoded,
 				Inputs:        cacheInputs,
 				TTLOverride:   uafTTLOverrideForEntry(cacheInputs),
@@ -677,7 +699,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// during the resolve) stored no cell, so — exactly like the declined
 			// branches above (1.12.3 A-1) — there is nothing to dep-track and
 			// nothing to announce.
-			if putStored && stageErrSink.Count() > 0 {
+			if putStored && verdict.DenialOnly() {
 				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallRA) // #681
 			}
 			if putStored {

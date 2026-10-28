@@ -632,7 +632,7 @@ func TestRefresher427_TenantSARepresentative_Narrowed(t *testing.T) {
 	}
 	// A narrowed body already sits in the cell (what the #425-fixed seed or a
 	// narrowed resolve produces). The arm drives the REAL refresher over it.
-	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"kind":"RESTAction","status":{"sa":"narrowed"}}`), Inputs: inputs})
 
 	cr := s425RA(s425PathGetY())

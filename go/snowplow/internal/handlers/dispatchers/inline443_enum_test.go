@@ -76,7 +76,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"CommitWhyOfAnalysis":                    readOnly443,
 	"DepTracker.ReplayEdgesWithStates":       gatedInCache443, // #765 B: ReplayEdges carrying the producer's interest states
 	"DepTracker.ReleaseUnstored":             gatedInCache443, // #890/#893: strips a non-resident key's edges at a resolve's end; returns under Inert
-	"ResolvedCacheStore.PutIfGen":            gatedInCache443,
+	"ResolvedCacheStore.PutContentIfGen":     gatedInCache443,
 	"ResolvedCacheStore.PutRAFullListIfGen":  gatedInCache443,
 	"ResolvedCacheStore.NoteRAFullListSlice": gatedInCache443,
 	"ResourceWatcher.EnsureResourceTypeFor":  gatedInCache443,
@@ -129,8 +129,12 @@ var cacheAllow443 = map[string]cacheClass443{
 	// --- unreachable under the flag -----------------------------------------
 	"DepTracker.ReplayEdgesAsOfWithStates":   unreachableInert443, // seed-memo hit only (SeedResolveMemo is installed by seeds); delegates to the gated ReplayEdgesWithStates
 	"SeedResolveMemo.StoreLayeredWithStates": unreachableInert443, // memo installed only by seeds, never on a live/inline ctx
-	"RegisterClusterListKey":                 unreachableInert443, // after a PutIfGen that refuses under the flag
-	"ResourceWatcher.ConfirmResourceType":    unreachableInert443, // only when EnsureResourceTypeFor reported added=true (never under the flag)
+	// #912 N1 — the memo's Put-gate effects capture / replay: only under a
+	// memo (seeds and the refresher), never on a live/inline ctx.
+	"WithPutGateEffectsCapture": unreachableInert443, "PutGateCapture.Effects": unreachableInert443,
+	"PutGateEffects.Replay":               unreachableInert443,
+	"RegisterClusterListKey":              unreachableInert443, // after a PutIfGen that refuses under the flag
+	"ResourceWatcher.ConfirmResourceType": unreachableInert443, // only when EnsureResourceTypeFor reported added=true (never under the flag)
 	// via the package-level discoverGroupResourcesFn seam, invoked only inside
 	// lazyRegisterInnerCallPaths (returns at its head under the flag, (c)).
 	"DiscoverGroupResources": unreachableInert443,
@@ -227,7 +231,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
-	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,
+	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.MarkDeclaredWrite": readOnly443, "ExternalTouchedSink.DeclaredWrite": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "SourcePagination": readOnly443, "IdentityClass.String": readOnly443,
@@ -273,6 +277,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// cannot drift out of half of it again (which is #563 itself). The stale-entry
 	// half of this census is what required removing the row.
 	"RefDenialOrigin": readOnly443,
+	// #903 — "is this a customer's own request?" for the write refusal and the
+	// self-loopback header: RefDenialOrigin plus two more ctx values (the #547
+	// demand revalidation, the background hop). Pure ctx reads.
+	"NonCustomerWriteOrigin": readOnly443,
 	// #608 — the validator's transport pick reads the set-once process SA
 	// *rest.Config (an RLock + pointer read, no state written), and the stage
 	// wrap only builds an error value. Neither outlives the request.
@@ -321,12 +329,13 @@ var cacheAllow443 = map[string]cacheClass443{
 	"WithSensitiveTouchedSink": readOnly443,
 	// #684 — the raFullList cell's own #681 Put gate. WithChildPutGateSinks is a
 	// ctx builder installing request-scoped sinks (their bumps forward to the
-	// enclosing request-scoped sinks only); DenialOnly / GenuineExternal /
-	// StageErrorSink.Count are pure reads of them. None touches cache, informer,
-	// dep or refresher state. (ExternalTouchedSink.Count left the resolve path:
-	// GenuineExternal now reads it inside the cache package.)
-	"WithChildPutGateSinks": readOnly443, "DenialOnly": readOnly443,
-	"GenuineExternal": readOnly443, "StageErrorSink.Count": readOnly443,
+	// enclosing request-scoped sinks only); PutGateVerdict (#912 re-review: the
+	// shared verdict, which reads DenialOnly / GenuineExternal inside the cache
+	// package) and PutVerdict.Permanent are pure reads of them. None touches
+	// cache, informer, dep or refresher state.
+	"WithChildPutGateSinks": readOnly443, "PutGateVerdict": readOnly443,
+	"PutVerdict.Permanent": readOnly443, "PutVerdict.Store": readOnly443, "PutVerdict.Reason": readOnly443,
+	"PutVerdict.DenialOnly": readOnly443,
 	// The denial-only Put counter: a process counter, reached only after a
 	// PutRAFullListIfGen that STORED (which refuses under the flag).
 	"RecordDenialOnlyPut": telemetry443,
@@ -346,7 +355,7 @@ var callerAllow443 = map[string][]string{
 	"ResolvedEntry.NoteHitter":                    {"ra_full_list.go:raFullListServe"},
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},
-	"BumpExternalSkippedPut":                      {"ra_full_list.go:raFullListServe"},
+	"BumpExternalSkippedPut":                      {"ra_full_list.go:raFullListPermanentDecline"},
 	"DepTracker.CommitListInterest":               {"narrow.go:commitNarrow"},
 	"DepTracker.WidenListInterest":                {"narrow.go:commitNarrow"},
 }

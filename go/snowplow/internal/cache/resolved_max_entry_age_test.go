@@ -41,12 +41,12 @@ func TestMaxEntryAge_G1_RePutsDoNotExtendTheLifetime(t *testing.T) {
 	key := ComputeKey(inputs)
 
 	born := time.Now()
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":0}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":0}`), Inputs: &inputs})
 	// Re-Put every 400 ms for ~1.3 s: three re-Puts, each with a fresh
 	// CreatedAt, exactly what a dirty-mark → refresh → re-Put cycle does.
 	for i := 1; i <= 3; i++ {
 		time.Sleep(400 * time.Millisecond)
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &inputs})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &inputs})
 		if time.Since(born) < time.Second {
 			if _, ok := c.Get(key); !ok {
 				t.Fatalf("G1: entry evicted at %v, BEFORE the 1 s max age", time.Since(born))
@@ -71,11 +71,11 @@ func TestMaxEntryAge_G1c_BornAtInheritedAndCountedSeparately(t *testing.T) {
 	key := ComputeKey(inputs)
 
 	born := time.Now().Add(-2 * time.Hour)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":0}`), Inputs: &inputs, BornAt: born})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":0}`), Inputs: &inputs, BornAt: born})
 	// Bypass Get (which would evict): a replace-in-place Put must INHERIT
 	// the birth even though the new entry's own BornAt is zero and its
 	// CreatedAt is fresh.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &inputs})
 	c.mu.Lock()
 	el := c.index[key]
 	got := el.Value.(*lruItem).entry
@@ -116,7 +116,7 @@ func TestMaxEntryAge_G2_ZeroDisablesAndFreshEntriesServe(t *testing.T) {
 	c.maxEntryAge = 0
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "g2"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs, BornAt: time.Now().Add(-25 * time.Hour)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs, BornAt: time.Now().Add(-25 * time.Hour)})
 	if _, ok := c.Get(key); !ok {
 		t.Fatalf("G2: with the bound disabled an old-born entry must still be served")
 	}
@@ -125,7 +125,7 @@ func TestMaxEntryAge_G2_ZeroDisablesAndFreshEntriesServe(t *testing.T) {
 	if d.maxEntryAge != 86400*time.Second {
 		t.Fatalf("G2: constructor default = %v, want 24 h", d.maxEntryAge)
 	}
-	d.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	d.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 	if _, ok := d.Get(key); !ok {
 		t.Fatalf("G2: a fresh-born entry must be served under the default bound")
 	}
@@ -139,7 +139,7 @@ func TestMaxEntryAge_G3_FirstPutBirth(t *testing.T) {
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "g3"}
 	key := ComputeKey(inputs)
 	before := time.Now()
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 	e, _ := c.Get(key)
 	if e.BornAt.IsZero() || e.BornAt.Before(before) || !e.BornAt.Equal(e.CreatedAt) {
 		t.Fatalf("G3: first Put with zero BornAt → %v (CreatedAt %v), want BornAt == CreatedAt == now", e.BornAt, e.CreatedAt)
@@ -147,7 +147,7 @@ func TestMaxEntryAge_G3_FirstPutBirth(t *testing.T) {
 	other := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "g3b"}
 	okey := ComputeKey(other)
 	explicit := time.Now().Add(-10 * time.Minute)
-	c.Put(okey, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &other, BornAt: explicit})
+	c.put(okey, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &other, BornAt: explicit})
 	oe, _ := c.Get(okey)
 	if !oe.BornAt.Equal(explicit) {
 		t.Fatalf("G3: explicit BornAt on a first Put not honoured: %v", oe.BornAt)

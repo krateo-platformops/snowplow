@@ -71,7 +71,7 @@ func c2Setup(t *testing.T) (*ResolvedCacheStore, chan string) {
 
 func c2PutSelf(store *ResolvedCacheStore, gvr schema.GroupVersionResource, ns, name string) string {
 	key := "L1_" + name
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"` + name + `"}`), Inputs: widgetInputs(gvr, ns, name)})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"` + name + `"}`), Inputs: widgetInputs(gvr, ns, name)})
 	Deps().Record(context.Background(), key, gvr, ns, name) // the self dep edge
 	return key
 }

@@ -132,6 +132,22 @@ func main() {
 		return
 	}
 
+	// Site-class 4 only, over explicit package patterns (the gate's own
+	// discrimination fixture: `-verdict-only ./testdata/verdict`).
+	if os.Args[1] == "-verdict-only" {
+		findings, files, err := checkVerdictSites(".", os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: verdict: %v\n", err)
+			os.Exit(2)
+		}
+		if len(findings) > 0 {
+			reportVerdictFindings(findings)
+			os.Exit(1)
+		}
+		fmt.Printf("OK: no resolve-output write bypasses the Put-gate verdict; %d file(s) scanned.\n", files)
+		return
+	}
+
 	fset := token.NewFileSet()
 	var entryFindings []entryFinding
 	var scanned, entrySites, bootScopeStamps int
@@ -254,8 +270,36 @@ func main() {
 		}
 	}
 
+	// Site-class 4 (#912 re-review): the resolve-output packages write a
+	// ResolvedEntry only through a write that takes the Put-gate verdict. Runs
+	// when a scanned root is the production `internal` tree.
+	verdictFiles, verdictScoped := 0, false
+	for _, root := range os.Args[1:] {
+		if filepath.Base(filepath.Clean(root)) != "internal" {
+			continue
+		}
+		verdictScoped = true
+		var patterns []string
+		for _, p := range verdictScope {
+			patterns = append(patterns, "./"+filepath.ToSlash(filepath.Join(root, strings.TrimPrefix(p, "./internal/"))))
+		}
+		findings, files, err := checkVerdictSites(".", patterns)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: verdict: %v\n", err)
+			os.Exit(2)
+		}
+		verdictFiles += files
+		if len(findings) > 0 {
+			failed = true
+			reportVerdictFindings(findings)
+		}
+	}
+
 	if failed {
 		os.Exit(1)
+	}
+	if verdictScoped {
+		fmt.Printf("OK: no resolve-output write bypasses the Put-gate verdict; %d file(s) scanned.\n", verdictFiles)
 	}
 
 	fmt.Printf("OK: %d ResolvedEntry Put site(s) all set %s or carry a waiver; %d boot-scope stamp site(s) (floor %d); %d files scanned.\n",

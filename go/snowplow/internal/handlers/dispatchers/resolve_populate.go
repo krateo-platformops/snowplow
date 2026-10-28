@@ -454,68 +454,93 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// #681 — a result whose ONLY stage errors are per-identity forbidden is NOT
 	// an under-served result: it is exactly what this identity's class reads.
 	// It falls through to the re-Put below.
-	if stageErrSink.Count() > 0 && !cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, inputs.CacheEntryClass) {
-		// #301 observability: surface the FIRST failing stage's name + err
-		// inline so a decline can be attributed without a cross-grep
-		// against the resolver's error lines (which cost two traces).
-		sampleStage, sampleErr := stageErrSink.Sample()
-		// #547 — an inner stage that fails under the background identity (a
-		// refresher-only 403, an exportJwt loopback) ends the dequeue's window
-		// KNOWN-STALE: the cell keeps serving its pre-change body, every hit on
-		// it is counted (known_stale_served_total{reason=declined}), and the
-		// next read revalidates it under the REQUESTER, whose read is the one
-		// known to work. 1.12.6 C4 suppressed the key after K consecutive
-		// declines (REFRESH_SUPPRESS_AFTER_DECLINES) and left it frozen; that
-		// knob is retired. The #191 WARN storm is bounded instead by logging at
-		// WARN once per stale generation: a decline of a cell that is ALREADY
-		// known-stale is DEBUG (the counter carries the rate).
-		suppressed := cache.NoteRefreshDecline(key, "stage_error", false)
-		_, _, alreadyKnownStale := cache.KnownStale(key)
-		declineLevel := slog.LevelWarn
-		if alreadyKnownStale {
-			declineLevel = slog.LevelDebug
-		}
-		log.Log(rctx, declineLevel, "resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
-			slog.String("subsystem", "cache"),
-			slog.String("key_hash", key),
-			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshLogUser(refreshUser)),
-			slog.String("rep_source", repSource),
-			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.String("stage_err_stage", sampleStage),
-			slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
-			slog.Bool("suppressed", suppressed),
-			slog.String("effect", "prior entry kept and marked KNOWN-STALE: served and counted, revalidated "+
-				"on the next read under the requester, re-enqueued by the next change (#547)"),
-		)
-		cache.BumpRefresherSkippedStageError()
-		return nil
-	}
+	// The shared Put-gate verdict (cache.PutGateVerdict): the refresher's
+	// decline, its reason and whether it is permanent all come from it.
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, inputs.CacheEntryClass)
 
-	// External-no-cache (proposal 2026-06-22) — defense-in-depth re-Put gate.
-	// If the re-resolve touched a genuine external endpoint, the fresh bytes
-	// have no dep edge to invalidate them; decline the re-Put (keep the prior
-	// entry; TTL is the outer net) exactly as the stage-error gate does.
-	// #681 C2 — an own-credential apiserver 403 is not a genuine external touch.
-	if cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 {
-		cache.BumpExternalSkippedPut()
-		// 1.12.6 C4 (§6.2 row 7) — structurally permanent: an external RA has
-		// no dep edge, so every dirty-mark re-resolve is pure waste. Suppress
-		// on first occurrence; the next real Put clears it.
-		cache.NoteRefreshDecline(key, "external_touched", true)
-		// Not a fault: a designed defense-in-depth decline (external data has no
-		// dep edge to invalidate it, so keep the prior entry; TTL is the outer
-		// net). Fires on every refresh of an external-touching entry — DEBUG.
-		// The BumpExternalSkippedPut counter carries the rate for operators.
-		log.Debug("resolveAndPopulateL1: re-resolve touched an external endpoint; declining to overwrite entry",
-			slog.String("subsystem", "cache"),
-			slog.String("key_hash", key),
-			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshLogUser(refreshUser)),
-			slog.String("rep_source", repSource),
-			slog.Int64("external_touches", extTouchedSink.Count()),
-			slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
-		)
+	// Declined, whatever the reason (#912 re-review: the reason only selects
+	// the log line and the counter; the refresher's write takes the verdict too
+	// and would refuse it anyway). A permanent verdict — a declared write
+	// (#903 F1), a genuine external touch (1.12.6 C4 §6.2 row 7: no dep edge, so
+	// every dirty-mark re-resolve is waste), a stage error beside one (#903 B2)
+	// — suppresses the key on first occurrence; the next real Put clears it. A
+	// transient stage error leaves the cell KNOWN-STALE (#547).
+	if !verdict.Store() {
+		suppressed := cache.NoteRefreshDecline(key, string(verdict.Reason()), verdict.Permanent())
+		switch verdict.Reason() {
+		case cache.PutReasonDeclaredWrite:
+			log.Debug("resolveAndPopulateL1: the RESTAction declares a write stage; declining to re-Put",
+				slog.String("subsystem", "cache"),
+				slog.String("key_hash", key),
+				slog.String("handler", inputs.CacheEntryClass),
+				slog.String("effect", "never stored: every /call runs its write (#903 F1); suppressed until the next real Put"),
+			)
+		case cache.PutReasonExternal:
+			// External-no-cache (proposal 2026-06-22) — defense-in-depth re-Put
+			// gate: the fresh bytes have no dep edge to invalidate them; keep the
+			// prior entry (TTL is the outer net). #681 C2 — an own-credential
+			// apiserver 403 is not a genuine external touch.
+			cache.BumpExternalSkippedPut()
+			// Not a fault: a designed defense-in-depth decline (external data has no
+			// dep edge to invalidate it, so keep the prior entry; TTL is the outer
+			// net). Fires on every refresh of an external-touching entry — DEBUG.
+			// The BumpExternalSkippedPut counter carries the rate for operators.
+			log.Debug("resolveAndPopulateL1: re-resolve touched an external endpoint; declining to overwrite entry",
+				slog.String("subsystem", "cache"),
+				slog.String("key_hash", key),
+				slog.String("handler", inputs.CacheEntryClass),
+				slog.String("user", refreshLogUser(refreshUser)),
+				slog.String("rep_source", repSource),
+				slog.Int64("external_touches", extTouchedSink.Count()),
+				slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
+			)
+		case cache.PutReasonStageError:
+			// #301 observability: surface the FIRST failing stage's name + err
+			// inline so a decline can be attributed without a cross-grep
+			// against the resolver's error lines (which cost two traces).
+			sampleStage, sampleErr := stageErrSink.Sample()
+			// #547 — an inner stage that fails under the background identity (a
+			// refresher-only 403, an exportJwt loopback) ends the dequeue's window
+			// KNOWN-STALE: the cell keeps serving its pre-change body, every hit on
+			// it is counted (known_stale_served_total{reason=declined}), and the
+			// next read revalidates it under the REQUESTER, whose read is the one
+			// known to work. 1.12.6 C4 suppressed the key after K consecutive
+			// declines (REFRESH_SUPPRESS_AFTER_DECLINES) and left it frozen; that
+			// knob is retired. The #191 WARN storm is bounded instead by logging at
+			// WARN once per stale generation: a decline of a cell that is ALREADY
+			// known-stale is DEBUG (the counter carries the rate).
+			// #903 B2 — a stage error on a resolve that ALSO touched a genuine
+			// external endpoint can never be re-Put by the refresher (the external
+			// decline would refuse it anyway), so the verdict makes it structurally
+			// permanent: suppress, don't re-resolve it on every change.
+			_, _, alreadyKnownStale := cache.KnownStale(key)
+			declineLevel := slog.LevelWarn
+			if alreadyKnownStale {
+				declineLevel = slog.LevelDebug
+			}
+			log.Log(rctx, declineLevel, "resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
+				slog.String("subsystem", "cache"),
+				slog.String("key_hash", key),
+				slog.String("handler", inputs.CacheEntryClass),
+				slog.String("user", refreshLogUser(refreshUser)),
+				slog.String("rep_source", repSource),
+				slog.Int64("stage_errors", stageErrSink.Count()),
+				slog.String("stage_err_stage", sampleStage),
+				slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
+				slog.Bool("suppressed", suppressed),
+				slog.String("effect", "prior entry kept and marked KNOWN-STALE: served and counted, revalidated "+
+					"on the next read under the requester, re-enqueued by the next change (#547)"),
+			)
+			cache.BumpRefresherSkippedStageError()
+		default:
+			// Any other decline: today only cache.PutReasonUnobserved, a verdict
+			// over Put-gate sinks that were not all installed on the resolve. It
+			// admits nothing (#912 delta-3 item 3); never read as another reason.
+			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+				slog.String("reason", string(verdict.Reason())),
+				slog.String("effect", "body served; not persisted"),
+			)
+		}
 		return nil
 	}
 
@@ -678,14 +703,14 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	rebuildPrior, hadRebuildPrior := c.GetNoTouch(key)
 	noteRefreshRebuild(rebuildPrior, hadRebuildPrior, encoded)
 
-	stored := c.ReplaceIfGenRefresh(rctx, key, entry, gen0)
+	stored := c.ReplaceResolvedIfGenRefresh(rctx, verdict, key, entry, gen0)
 	cache.NoteRefreshWrite(rctx, key, stored)
 	// #603 PR-2 / #765 SHADOW audit — when every mark this cell received since
 	// its last refresh was a would-avoid, classify this rebuild against the
 	// same prior the #612 compare used: identical, or changed (would_change).
 	// Observation only.
 	cache.NoteNarrowAuditWrite(rctx, key, rebuildPrior, hadRebuildPrior, encoded, stored)
-	if stored && stageErrSink.Count() > 0 {
+	if stored && verdict.DenialOnly() {
 		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteRefresher) // #681
 	}
 	if !stored {

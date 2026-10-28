@@ -50,7 +50,7 @@ func TestIssue406x424_DeclinedSeedPutRecordsNoLayeredSources(t *testing.T) {
 			putRA := func(body string) {
 				t.Helper()
 				in := raIn
-				cache.ResolvedCache().Put(raKey, &cache.ResolvedEntry{RawJSON: []byte(body), Inputs: &in})
+				cache.ResolvedCache().PutResolved(fixtureStoreVerdict, raKey, &cache.ResolvedEntry{RawJSON: []byte(body), Inputs: &in})
 			}
 			putRA(`{"items":["v1"]}`)
 			slice := func(ctx context.Context) {
@@ -67,7 +67,7 @@ func TestIssue406x424_DeclinedSeedPutRecordsNoLayeredSources(t *testing.T) {
 			cg := seedTerminalGuardFor(seedModeBoot, chandle, ckey)
 			cctx := cache.WithL1KeyContext(cohort, ckey)
 			slice(cctx)
-			if !seedTerminalPut(cctx, chandle, ckey, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: cinputs}, cg) {
+			if !seedTerminalPut(cctx, chandle, fixtureStoreVerdict, ckey, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: cinputs}, cg) {
 				t.Fatalf("CONTROL (%s): an unchanged class must be written", tc.name)
 			}
 			if _, cons := cache.ResolvedCache().RAFullListLayerStatsForTest(); cons != 1 {
@@ -84,7 +84,7 @@ func TestIssue406x424_DeclinedSeedPutRecordsNoLayeredSources(t *testing.T) {
 			dctx := cache.WithL1KeyContext(cohort, key)
 			slice(dctx)
 			k424Grant(t, dyn, a, psCarol)
-			if seedTerminalPut(dctx, handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs}, g) {
+			if seedTerminalPut(dctx, handle, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs}, g) {
 				t.Fatalf("setup (%s): the drifted write must be declined (#424)", tc.name)
 			}
 			if recs, cons := cache.ResolvedCache().RAFullListLayerStatsForTest(); recs != 0 || cons != 0 {

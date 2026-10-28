@@ -58,14 +58,14 @@ func TestPR0_EntryClass_AttributionAndSumInvariant(t *testing.T) {
 	// Put THEN Record (the content-cell order: apistage.go records after PutIfGen).
 	for i, class := range RemintClasses {
 		k := "L1-put-then-record-" + class
-		store.Put(k, ecEntry(class, "own"+itoa(i)))
+		store.put(k, ecEntry(class, "own"+itoa(i)))
 		d.RecordList(ctx, k, gvr, "ns")
 	}
 	// Record THEN Put (the resolver order: edges are recorded during the resolve).
 	for i, class := range RemintClasses {
 		k := "L1-record-then-put-" + class
 		d.RecordList(ctx, k, gvr, "ns")
-		store.Put(k, ecEntry(class, "own2"+itoa(i)))
+		store.put(k, ecEntry(class, "own2"+itoa(i)))
 	}
 	// An edge whose cell was never stored: attributed unknown, still counted.
 	d.RecordList(ctx, "L1-no-cell", gvr, "ns")
@@ -101,10 +101,10 @@ func TestPR0_EntryClass_AttributionAndSumInvariant(t *testing.T) {
 func TestPR0_EntryClass_UnregisteredGuard(t *testing.T) {
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
-	store.Put("L1-odd", ecEntry("someNewClass", "own"))
+	store.put("L1-odd", ecEntry("someNewClass", "own"))
 	d.RecordList(context.Background(), "L1-odd", gvr, "ns")
 	// A real class string can never alias a sentinel label.
-	store.Put("L1-alias", ecEntry(dmEntryClassUnknown, "own2"))
+	store.put("L1-alias", ecEntry(dmEntryClassUnknown, "own2"))
 	d.RecordList(context.Background(), "L1-alias", gvr, "ns")
 
 	d.OnObjectEvent(gvr, "ns", "x", objExists)
@@ -143,7 +143,7 @@ func TestPR0_EntryClass_DeleteCountsMarkedNotEvicted(t *testing.T) {
 func TestPR0_EntryClass_BusyStoreLockDefersNeverBlocks(t *testing.T) {
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
-	store.Put("L1-busy", ecEntry(CacheEntryClassApistage, "own"))
+	store.put("L1-busy", ecEntry(CacheEntryClassApistage, "own"))
 
 	store.mu.Lock()
 	done := make(chan struct{})
@@ -163,7 +163,7 @@ func TestPR0_EntryClass_BusyStoreLockDefersNeverBlocks(t *testing.T) {
 	if got := d.dirtyMarkByEntryClassSnapshot(); got[dmEntryClassUnknown] != 1 {
 		t.Fatalf("after a busy peek: unknown=%d, want 1 — snapshot=%v", got[dmEntryClassUnknown], got)
 	}
-	store.Put("L1-busy", ecEntry(CacheEntryClassApistage, "own"))
+	store.put("L1-busy", ecEntry(CacheEntryClassApistage, "own"))
 	d.OnObjectEvent(gvr, "ns", "x", objExists)
 	if got := d.dirtyMarkByEntryClassSnapshot(); got[CacheEntryClassApistage] != 1 {
 		t.Fatalf("after the next store: apistage=%d, want 1 — snapshot=%v", got[CacheEntryClassApistage], got)
@@ -176,7 +176,7 @@ func TestPR0_EntryClass_RelearnedAfterStrip(t *testing.T) {
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
 	ctx := context.Background()
-	store.Put("L1-w", ecEntry("widgets", "own"))
+	store.put("L1-w", ecEntry("widgets", "own"))
 	d.RecordList(ctx, "L1-w", gvr, "ns")
 	d.RemoveL1Key("L1-w")
 	d.RecordList(ctx, "L1-w", gvr, "ns") // depSet recreated; peek relearns from the resident entry
@@ -191,9 +191,9 @@ func TestPR0_EntryClass_TypePath(t *testing.T) {
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
 	ctx := context.Background()
-	store.Put("L1-ra", ecEntry(CacheEntryClassRAFullList, "own"))
+	store.put("L1-ra", ecEntry(CacheEntryClassRAFullList, "own"))
 	d.RecordList(ctx, "L1-ra", gvr, "ns")
-	store.Put("L1-wc", ecEntry(CacheEntryClassWidgetContent, "own2"))
+	store.put("L1-wc", ecEntry(CacheEntryClassWidgetContent, "own2"))
 	d.Record(ctx, "L1-wc", gvr, "ns", "named")
 
 	if n := d.OnResourceTypeRemoved(gvr); n != 2 {
@@ -221,10 +221,10 @@ func TestPR0_EntryClass_PeekOncePerDepSetNotPerRefresh(t *testing.T) {
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
 	ctx := context.Background()
-	store.Put("L1-c", ecEntry(CacheEntryClassApistage, "own"))
+	store.put("L1-c", ecEntry(CacheEntryClassApistage, "own"))
 	d.RecordList(ctx, "L1-c", gvr, "ns")
 	for i := 0; i < 3; i++ {
-		store.Put("L1-c", ecEntry(CacheEntryClassApistage, "own")) // refresh re-Put (replace in place)
+		store.put("L1-c", ecEntry(CacheEntryClassApistage, "own")) // refresh re-Put (replace in place)
 		d.RecordList(ctx, "L1-c", gvr, "ns")                       // HIT re-record (idempotent)
 		d.Record(ctx, "L1-c", gvr, "ns", "named"+itoa(i))          // a NEW edge on the SAME depSet
 	}
@@ -256,7 +256,7 @@ func TestPR0_EntryClass_ExactBeatsWildcardPreserved(t *testing.T) {
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
 	ctx := context.Background()
-	store.Put("L1-both", ecEntry("widgets", "owner"))
+	store.put("L1-both", ecEntry("widgets", "owner"))
 	d.RecordList(ctx, "L1-both", gvr, "ns")
 	d.Record(ctx, "L1-both", gvr, "ns", "obj")
 	_, marked := d.OnObjectEvent(gvr, "ns", "obj", objExists)

@@ -301,7 +301,7 @@ func i187Fixture(t *testing.T, srv *i187APIServer, typeRegistered bool) (store *
 		SubjectBindingSet: rbac.SubjectBindingSetDigest("admin", []string{"admins"}),
 	}
 	key = cache.ComputeKey(inputs)
-	store.Put(key, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"children":["agents-header","agents-list","agents-servers"]}`),
 		Inputs:  &inputs,
 	})

@@ -212,7 +212,7 @@ func TestR3_DeleteFuncDispatchesViaWorker(t *testing.T) {
 
 	gvr := gvrCompositions()
 	const l1Key = "L1_self_rep"
-	store.Put(l1Key, &ResolvedEntry{
+	store.put(l1Key, &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs:  inputsFor(gvr, "ns", "victim"),
 	})

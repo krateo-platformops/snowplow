@@ -216,7 +216,7 @@ func TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry(t *testing.T) {
 		Name:            b5Object,
 	}
 	key := ComputeKey(*inputs)
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"pre-delete"}`), Inputs: inputs})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"pre-delete"}`), Inputs: inputs})
 	Deps().Record(context.Background(), key, b5GVR(), b5NS, b5Object) // the self dep edge
 
 	// objectGone models the delete landing INSIDE the teardown window: the
@@ -231,7 +231,7 @@ func TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry(t *testing.T) {
 		if n == 1 {
 			// Pre-sync mark: object still live, re-resolve succeeds, entry
 			// survives with a fresh body. THE DELETE LANDS NOW.
-			store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"still-here"}`), Inputs: inputs})
+			store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"still-here"}`), Inputs: inputs})
 			objectGone.Store(true)
 			close(firstResolved) // the fresh informer may LIST now (b5HoldRelistList)
 			return nil
@@ -324,13 +324,13 @@ func TestIssue187_B5b_RelistDoesNotEvictALiveObject(t *testing.T) {
 		Name:            "button-live",
 	}
 	key := ComputeKey(*inputs)
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: inputs})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: inputs})
 	Deps().Record(context.Background(), key, b5GVR(), b5NS, "button-live")
 
 	var attempts atomic.Int64
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {
 		attempts.Add(1)
-		store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: inputs})
+		store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: inputs})
 		return nil
 	})
 

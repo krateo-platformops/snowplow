@@ -106,7 +106,7 @@ func i411Setup(t *testing.T, raName string) *i411Fixture {
 	if err != nil {
 		t.Fatalf("pre-warm resolve failed: %v", err)
 	}
-	store.PutRAFullList(f.raKey, f.raIn, fullDict)
+	store.PutRAFullList(fixtureStoreVerdict, f.raKey, f.raIn, fullDict)
 	cache.RecordSliceability(f.raKey, shape, true)
 	d.Record(context.Background(), f.raKey, gRA, ns, raName) // RA-CR self-dep
 
@@ -140,7 +140,7 @@ func (f *i411Fixture) seedResolve(key, name string) map[string]any {
 	if err != nil {
 		f.t.Fatalf("seed apiref.Resolve(%s) failed: %v", key, err)
 	}
-	store.PutIfGen(ctx, key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(f.t, body), Inputs: edge3WidgetInputs(name)}, gen)
+	store.PutResolvedIfGen(ctx, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(f.t, body), Inputs: edge3WidgetInputs(name)}, gen)
 	return body
 }
 
@@ -204,7 +204,7 @@ func (f *i411Fixture) drain(widgets map[string]string) {
 	if err != nil {
 		f.t.Fatalf("raKey refresh resolve failed: %v", err)
 	}
-	store.PutRAFullList(f.raKey, f.raIn, fresh)
+	store.PutRAFullList(fixtureStoreVerdict, f.raKey, f.raIn, fresh)
 	for key, name := range widgets {
 		if !marked[key] {
 			continue
@@ -214,7 +214,7 @@ func (f *i411Fixture) drain(widgets map[string]string) {
 		if err != nil || !ok {
 			f.t.Fatalf("refresh re-serve of %q failed: ok=%v err=%v", key, ok, err)
 		}
-		store.Put(key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(f.t, got), Inputs: edge3WidgetInputs(name)})
+		store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(f.t, got), Inputs: edge3WidgetInputs(name)})
 	}
 }
 
@@ -325,7 +325,7 @@ func TestIssue411_KeepwarmResidentNotOverwrittenByStaleMemo(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("prior-pass w2 serve failed: ok=%v err=%v", ok, err)
 	}
-	store.Put(w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, prior), Inputs: edge3WidgetInputs("w2")})
+	store.PutResolved(fixtureStoreVerdict, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, prior), Inputs: edge3WidgetInputs("w2")})
 
 	// Current pass: w1 produces the memo body (OLD).
 	f.seedResolve(w1Key, "w1")
@@ -399,7 +399,7 @@ func TestIssue411_TornWindowMemoHitIsRemarked(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("prior-pass w2 serve failed: ok=%v err=%v", ok, err)
 	}
-	store.Put(w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, prior), Inputs: edge3WidgetInputs("w2")})
+	store.PutResolved(fixtureStoreVerdict, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, prior), Inputs: edge3WidgetInputs("w2")})
 
 	f.seedResolve(w1Key, "w1") // current pass: memo body (OLD)
 
@@ -437,7 +437,7 @@ func TestIssue411_TornWindowMemoHitIsRemarked(t *testing.T) {
 	}
 
 	reasons := i411RemarksFor(t, w2Key)
-	if !store.PutIfGen(w2ctx, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, w2body), Inputs: edge3WidgetInputs("w2")}, gen) {
+	if !store.PutResolvedIfGen(w2ctx, fixtureStoreVerdict, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, w2body), Inputs: edge3WidgetInputs("w2")}, gen) {
 		t.Fatalf("setup: the keepwarm PutIfGen must be accepted (a refresh does not move the gen)")
 	}
 	if got := reasons(); len(got) == 0 {

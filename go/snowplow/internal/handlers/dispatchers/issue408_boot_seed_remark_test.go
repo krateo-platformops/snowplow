@@ -213,7 +213,7 @@ func TestIssue408_PreReadyzWidgetContentBoot_DepEventRemarksOnce(t *testing.T) {
 	res := h1WidgetUnstructured(map[string]any{})
 
 	// quiet first: no dep event → no remark.
-	quiet := cache.WithL1KeyContext(context.Background(), key)
+	quiet := cache.WithL1KeyContext(withWidgetContentPutSinks(context.Background()), key)
 	cache.Deps().Record(quiet, key, i408DepGVR, "i408-ns", "wc-quiet")
 	populateWidgetContentL1(quiet, h1WidgetGVR, in, -1, -1, res, 0)
 	if _, ok := cache.ResolvedCache().Get(key); !ok {
@@ -224,7 +224,7 @@ func TestIssue408_PreReadyzWidgetContentBoot_DepEventRemarksOnce(t *testing.T) {
 	}
 
 	cache.ResolvedCache().DeleteForTest(key)
-	ctx := cache.WithL1KeyContext(context.Background(), key)
+	ctx := cache.WithL1KeyContext(withWidgetContentPutSinks(context.Background()), key)
 	cache.Deps().Record(ctx, key, i408DepGVR, "i408-ns", "wc")
 	cache.Deps().OnUpdate(i408DepGVR, "i408-ns", "wc")
 	if cache.ResolvedCache().Has(key) {
@@ -276,7 +276,7 @@ func TestIssue408_PostReadyzBootSeed_RemovalDuringResolve_Refused(t *testing.T) 
 				if key == raKey {
 					inputs = raIn
 				}
-				handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
+				putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
 				cache.ResolvedCache().DeleteForTest(key)
 			}
 			h.install(t)

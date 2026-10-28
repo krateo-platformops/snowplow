@@ -295,6 +295,29 @@ stage's own request (resource, namespace, name), never from the upstream's
 text, which can name the requester. The upstream's full text stays under the
 stage's `errorKey` and in the logs.
 
+## Write stages run only on a user's request
+
+A **write** stage (any verb but `GET`, `HEAD`, `OPTIONS`, `TRACE`) is sent
+only when a user (or a controller, with its own credential) calls `/call`.
+Snowplow's own background work — the cache refresher, the prewarm walks and
+seeds, the content prewarm, the pagination drain, and the revalidation of a
+stale cached answer — resolves the same RESTActions but **never sends their
+write stages**, whatever credential the stage uses (snowplow's
+ServiceAccount, an `endpointRef` Secret, an external URL). The refused stage
+gets an error under its `errorKey`, and that background result is never
+stored or served.
+
+- A RESTAction that **declares** a write stage is never stored, whether or
+  not a given `/call` sent the write (an iterator with no items, a resolve
+  that stopped early because an `endpointRef` Secret is missing). Every
+  `/call` runs it, and the background never prewarms or refreshes it. This
+  holds for a widget that uses it too, including a widget that opted into the
+  external cache (`krateo.io/external-cache-ttl-seconds`, #915).
+- A `/call` that snowplow makes to itself on behalf of background work
+  carries `X-Snowplow-Background: 1`, so that call refuses write stages too.
+  Snowplow sends the header only to itself and strips it from every other
+  request.
+
 ## jq templating of `path`, `payload` and `headers`
 
 A stage's `path`, `payload` and each `headers` entry may embed a **jq template**

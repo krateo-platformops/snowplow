@@ -308,15 +308,48 @@ here is load-bearing:
    `BindingUID`; the #95 guard). On hit, `writeResolvedJSON(entry.RawJSON)` and return.
 4. On miss: attach `WithL1KeyContext(ctx, cacheKey)` so the resolver records dep edges against
    this key as it reads L3; attach a `StageErrorSink` and an `ExternalTouchedSink`; resolve;
-   encode once; serve; then **Put only when every gate passes**:
-   - `stageErrSink.Count() == 0` — a partial-with-errors body is served (200) but never
-     persisted, so transient item failures self-heal on the next resolve;
-   - `extTouchedSink.Count() == 0` — a resolve that reached a genuine external endpoint
-     (`httpFetchAllowingNonJSON`, ADR 0006) has **no dep edge to invalidate it**, so the Put is
-     declined and every `/call` re-fetches live (`external_touched_sink.go`). *Exception:* a
-     widget annotated `krateo.io/external-cache-ttl-seconds: <n>` opts into a bounded-staleness
-     Put with `TTLOverride = min(n, 120s)` (`external_ttl.go`) — general opt-in, no hardcoded
-     widget names;
+   encode once; serve; then **Put only when every gate passes**. The sink-derived gates are
+   ONE verdict, `cache.PutGateVerdict` (`put_verdict.go`). The TYPE and the COMPILER enforce it:
+   every exported `ResolvedEntry` write takes the verdict and stores nothing unless it allows the
+   Put (`put_gated.go`; `PutRAFullList(IfGen)` too); the ungated store methods are unexported, so
+   no other package can reach one; the one exported write without a verdict, `PutContentIfGen`,
+   writes only a GET-only content cell (an `apistage` entry under the key its own inputs compute).
+   Mark sites read `Permanent()`, and a verdict cannot be forged (only `PutGateVerdict` makes one;
+   the zero value admits nothing). A verdict over sinks that were not ALL installed (an empty
+   `PutGateSinks{}`, a field left out) is `unobserved`: it admits nothing and is not permanent.
+   The decline reason only picks the log line and the counter.
+   `scripts/check_resolved_entry_put_sites.sh` fails a write reached around the verdict through
+   any receiver in the dispatchers or apiref packages, and, inside the cache package, an ungated
+   store call outside a function that takes the verdict and returns on `!v.Store()` first. Its
+   closed set, first match wins:
+   - **declared write** (permanent, `declared_write`) — a RESTAction that declares a write-verb
+     stage is never stored, whether or not this resolve sent it (#903 F1): every `/call` runs it,
+     and the background marks it and stops re-resolving it. It is its own input, never counted
+     as an external touch;
+   - **stage error** (`stage_error`; permanent only beside a genuine external touch) — a
+     partial-with-errors body is served (200) but never persisted, so transient item failures
+     self-heal on the next resolve. A body whose every stage error is a per-identity forbidden
+     (#681 `DenialOnly`) is stored;
+   - **external touch** (permanent, `external_touched`) — a resolve that reached a genuine
+     external endpoint (`httpFetchAllowingNonJSON`, ADR 0006) has **no dep edge to invalidate
+     it**, so the Put is declined and every `/call` re-fetches live (`external_touched_sink.go`).
+     *Exception:* a widget annotated `krateo.io/external-cache-ttl-seconds: <n>` opts into a
+     bounded-staleness Put with `TTLOverride = min(n, 120s)` (`external_ttl.go`) — general
+     opt-in, no hardcoded widget names; it applies to this reason ALONE, never to a declared
+     write or a stage error (#915).
+
+   A seed / refresher `SeedResolveMemo` hit (`apiref.Resolve`) replays the producing resolve's
+   Put-gate inputs (`put_gate_effects.go`) onto the hitter's sinks, so a memo-served body gets
+   exactly the verdict its producer got (#912 N1).
+
+   The `raFullList` layer (`apiref/ra_full_list.go`) never runs a RESTAction a second time in
+   one `/call` once that run declared a write (#942). Whether it did is known only after the run:
+   the RESTAction's own write stage AND a write in any RESTAction it resolves in-process
+   (`resolve:true`) set the same runtime declared-write mark, which no check of the widget
+   RESTAction's own spec can see. So first sight runs the page-keyed resolve FIRST and takes a
+   permanent decline before the unpaginated one, serving the page it holds; every fall-back to
+   `apiref.Resolve`'s page-keyed resolve after a run goes through one helper that refuses a run
+   which declared a write (the `/call` gets an error rather than a second write);
    - `serveFromCacheEligible(inputs)` — never write the shared empty-`BindingUID` row from the
      dispatch path;
    - the **F6 undeclared-extras quarantine** — request extras must all be declared in the
@@ -674,7 +707,8 @@ and the SPA's recovery are OPEN rows owned by the chart review checklist and fro
 | Terminal refresh semantics (known-stale, suppression) | `internal/cache/refresher_terminal.go`, `dirty_window.go`, `known_stale.go`; `internal/handlers/dispatchers/demand_revalidate.go` | `NoteRefreshDecline`, `RefreshTerminalStatsSnapshot`, `KnownStale`, `KnownStaleReadThrough`, `BeginDemandRevalidation`; consulted in `refresher.go` `processNext` and the `Get` funnel |
 | Tag-derived stats families (1.12.6 C7) | `internal/cache/stats_by_tag.go`, `internal/cache/stats_families.go` | `StatSpec`, `StatFamily`, `TaggedStatFamilies`; `stat`/`kind`/`desc` tags on `CRDDiscoveryStats`, `RefreshBroadcasterStats`, `refresherStats`, `RefreshTerminalStats` drive expvar, the OTLP mirror (`internal/metrics/metrics.go` `newDerivedFamilies`) and the parity arms |
 | Invalidation | `internal/cache/deps.go`, `deps_watch.go` | `Record`, `RecordList`, `OnObjectEvent` (state-derived; `OnAdd`/`OnUpdate`/`OnDelete` are shims), `isSelfRepresentation`; bridge: `depEventHandlers` → `submitDepEvent` → `probeObjectState` |
-| External Put-gate | `internal/cache/external_touched_sink.go` | `WithExternalTouchedSink` |
+| Put-gate verdict | `internal/cache/put_verdict.go`, `put_gated.go`, `put_gate_effects.go` | `PutGateVerdict`, `PutVerdict.WithExternalTTL`, the verdict-gated `PutResolved*` / `ReplaceResolvedIfGenRefresh` writes, `PutGateSinksFromContext`, `WithPutGateEffectsCapture`, `PutGateEffects.Replay` |
+| External Put-gate | `internal/cache/external_touched_sink.go` | `WithExternalTouchedSink`, `MarkDeclaredWrite` |
 | L3 informer | `internal/cache/watcher.go` | `NewResourceWatcher`, `GetObject`, `ListObjects`, `depEventHandlers` |
 | Servability tripwire | `internal/cache/serve_assert.go` | `serve_requires_servable` |
 | Dispatcher seam — keys | `internal/handlers/dispatchers/helpers.go` | `dispatchCacheLookupKey`, `dispatchWidgetContentKey`, `serveFromCacheEligible`, `filterDeclaredKeyExtras` |

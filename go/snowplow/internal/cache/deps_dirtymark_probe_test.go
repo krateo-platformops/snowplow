@@ -87,7 +87,7 @@ func probeFixture(t *testing.T, dep probeDepClass, selfRep bool) (*DepTracker, *
 	if selfRep {
 		own = name // the entry's resolved output IS the event's object
 	}
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, own)})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, own)})
 	switch dep {
 	case probeExactDep:
 		d.Record(context.Background(), key, gvr, ns, name)
@@ -308,11 +308,11 @@ func TestDirtyMarkProbe_SavingAndItsDeferredEvict(t *testing.T) {
 	for i := 0; i < nListDeps; i++ {
 		k := "L1list_" + itoa(i)
 		listKeys = append(listKeys, k)
-		store.Put(k, expired("listowner"+itoa(i)))
+		store.put(k, expired("listowner"+itoa(i)))
 		d.RecordList(context.Background(), k, gvr, "ns")
 	}
 	const controlKey = "L1exact_control"
-	store.Put(controlKey, expired("owner"))
+	store.put(controlKey, expired("owner"))
 	d.Record(context.Background(), controlKey, gvr, "ns", name)
 
 	if got := store.evictTTLTotal.Load(); got != 0 {

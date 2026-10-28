@@ -1615,7 +1615,7 @@ func (c *ResolvedCacheStore) Has(key string) bool {
 // entry-count and byte-budget caps are satisfied. The entry's CreatedAt
 // is set to time.Now() if zero. Putting under a key that already exists
 // replaces the entry and adjusts curBytes accordingly.
-func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
+func (c *ResolvedCacheStore) put(key string, entry *ResolvedEntry) {
 	c.putPlain(context.Background(), false, key, entry)
 }
 
@@ -1629,7 +1629,7 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 // (generation preserved, unknown provenance for the #406 layer index); ctx only
 // ends the known-stale state, inside the same critical section as the write
 // (#734).
-func (c *ResolvedCacheStore) PutEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) {
+func (c *ResolvedCacheStore) putEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) {
 	c.putPlain(ctx, false, key, entry)
 }
 
@@ -1685,7 +1685,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 // #406 — the store runs with provenanceKnown=true (putPlain): ctx's sink also holds
 // the raKey versions the body Go-sliced, so the layer check judges this Put by them.
 // #323's plain no-gen semantics are unchanged.
-func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entry *ResolvedEntry) {
+func (c *ResolvedCacheStore) putThenRemark(ctx context.Context, key string, entry *ResolvedEntry) {
 	if c == nil || entry == nil {
 		return
 	}
@@ -1761,7 +1761,7 @@ func (c *ResolvedCacheStore) reassertOwnEdgesLocked(ctx context.Context, key str
 // between, the Put is REFUSED and the pre-delete body is not resurrected. The
 // check and the write are ONE c.mu critical section — no Get-then-Put TOCTOU.
 // Returns true iff the entry was stored.
-func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
 		return false
 	}
@@ -1821,7 +1821,7 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 // preserves the "a non-resurrecting refresh emits no live-refresh signal"
 // contract while closing the resurrection race in one c.mu section. Request-path
 // COLD fills use PutIfGen (which inserts on absent). Returns true iff stored.
-func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+func (c *ResolvedCacheStore) replaceIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
 		return false
 	}
@@ -1909,7 +1909,7 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 // remarks the key, and the follow-up refresh (BornAt age ≈ 0) inherits the new
 // birth. #375's arm-9 reflective enumeration covers this method. Returns true
 // iff stored.
-func (c *ResolvedCacheStore) ReplaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
 		return false
 	}

@@ -52,8 +52,12 @@ func raFullListPinBytesThreshold() int64 {
 // (and re-pins via the refresher's own path — resolve_populate.go carries the
 // prior pin and re-Puts through the #189-guarded ReplaceIfGen). A nil/marshal-
 // fail full is a no-op returning (nil,false).
-func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs, full map[string]any) ([]byte, bool) {
-	if c == nil {
+//
+// v is the full list's Put-gate verdict (PutGateVerdict over the full list's
+// own sinks, #684): nothing is stored unless it allows the Put (#912
+// re-review — the write itself refuses a declined resolve).
+func (c *ResolvedCacheStore) PutRAFullList(v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any) ([]byte, bool) {
+	if c == nil || !v.Store() {
 		return nil, false
 	}
 	encoded, err := json.Marshal(full)
@@ -107,7 +111,7 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 	// quietly; one that reasons about a gate can.
 	//
 	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — see the paragraphs above.
-	c.Put(key, &ResolvedEntry{
+	c.put(key, &ResolvedEntry{
 		RawJSON:     encoded,
 		Inputs:      &in,
 		Pinned:      pin,
@@ -133,8 +137,10 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 // fail full is a no-op returning false. PutIfGen (insert-or-replace), not
 // ReplaceIfGen: raFullListServe is the SERVE path and first-populates the raKey
 // cell on a cold /call, so an insert-on-absent (gen 0) must succeed.
-func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, key string, inputs ResolvedKeyInputs, full map[string]any, capturedGen uint64) bool {
-	if c == nil {
+//
+// v is the full list's Put-gate verdict, as for PutRAFullList.
+func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any, capturedGen uint64) bool {
+	if c == nil || !v.Store() {
 		return false
 	}
 	// #443 (a) — an inert (dry-run) resolve persists nothing.
@@ -162,7 +168,7 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, key string,
 	// (apiref.raFullListServe), same two stamp limbs, same arms holding it up.
 	//
 	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — twin of PutRAFullList above.
-	stored := c.PutIfGen(ctx, key, &ResolvedEntry{
+	stored := c.putIfGen(ctx, key, &ResolvedEntry{
 		RawJSON:     encoded,
 		Inputs:      &in,
 		Pinned:      pin,

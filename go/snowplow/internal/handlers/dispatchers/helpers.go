@@ -693,20 +693,23 @@ type cacheHandle interface {
 	// evicts. Internal seed-sweep reads (phase1_pip_seed seedSkipDecision) use it so
 	// they never fake #315/#316 warmth or contaminate the customer hit/miss ratio.
 	GetNoTouch(key string) (*cache.ResolvedEntry, bool)
-	Put(key string, entry *cache.ResolvedEntry)
 	// #189 — generation-guarded write. CaptureGen reads the key's generation
-	// before a resolve; PutIfGen stores only if it has not moved (a DELETE-
-	// eviction during the resolve would refuse the write rather than resurrect
-	// the pre-delete body).
+	// before a resolve; PutResolvedIfGen stores only if it has not moved (a
+	// DELETE-eviction during the resolve would refuse the write rather than
+	// resurrect the pre-delete body).
+	//
+	// #912 re-review — every write a dispatcher makes takes the resolve's
+	// Put-gate verdict (cache.PutGateVerdict) and stores nothing unless it
+	// allows the Put: there is no ungated write on this interface.
 	CaptureGen(key string) uint64
-	PutIfGen(ctx context.Context, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
+	PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
 	// #408 — a plain Put plus the #375 remark, for the PRE-readyz boot seed
-	// carriers. Never refuses; re-marks the key once if a dep recorded on ctx's
-	// dep-gen sink moved since the resolve began.
-	PutThenRemark(ctx context.Context, key string, entry *cache.ResolvedEntry)
+	// carriers. Never refuses a storing verdict; re-marks the key once if a dep
+	// recorded on ctx's dep-gen sink moved since the resolve began.
+	PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool
 	// #547/#734 — the external-TTL widget's plain Put: exactly Put, plus ending a
 	// KNOWN-STALE state in the write's own critical section (ctx's dep-gen sink).
-	PutEndingKnownStale(ctx context.Context, key string, entry *cache.ResolvedEntry)
+	PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool
 	// #378 — no seed write re-mints: the only BornAt-resetting write is the
 	// refresher terminal's ReplaceIfGenRefresh (resolve_populate.go), which uses
 	// the concrete store, not this handle.

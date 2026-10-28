@@ -268,7 +268,7 @@ func TestS841_SeededCellsAreHitByTheMatchingRequester(t *testing.T) {
 	// A refresher re-Put (no origin on the new entry) keeps the cell's origin;
 	// a second read is a hit but not a new first-hit cell.
 	prev, _ := handle.GetNoTouch(daveKeys[0])
-	handle.Put(daveKeys[0], &cache.ResolvedEntry{RawJSON: prev.RawJSON, Inputs: prev.Inputs})
+	putFixture(handle, daveKeys[0], &cache.ResolvedEntry{RawJSON: prev.RawJSON, Inputs: prev.Inputs})
 	for _, k := range daveKeys {
 		handle.Get(k)
 	}
@@ -284,8 +284,8 @@ func TestS841_SeededCellsAreHitByTheMatchingRequester(t *testing.T) {
 	}
 	// A cell traffic created is never attributed, even after a seed re-Put.
 	trafficKey := "s841-traffic-cell"
-	handle.Put(trafficKey, &cache.ResolvedEntry{RawJSON: []byte(`{}`)})
-	handle.Put(trafficKey, &cache.ResolvedEntry{RawJSON: []byte(`{}`), SeedOrigin: cache.SeedOriginLearned})
+	putFixture(handle, trafficKey, &cache.ResolvedEntry{RawJSON: []byte(`{}`)})
+	putFixture(handle, trafficKey, &cache.ResolvedEntry{RawJSON: []byte(`{}`), SeedOrigin: cache.SeedOriginLearned})
 	before := cache.SeedOriginStats(cache.SeedOriginLearned)
 	handle.Get(trafficKey)
 	if after := cache.SeedOriginStats(cache.SeedOriginLearned); after != before {

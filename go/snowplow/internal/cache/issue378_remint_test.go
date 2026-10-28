@@ -46,17 +46,17 @@ import (
 // r378RefreshPutter is the #378 refresher-terminal carrier, reached through an
 // interface so this file compiles where it does not exist yet.
 type r378RefreshPutter interface {
-	ReplaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool
+	replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool
 }
 
 func r378RefreshPut(t testing.TB, c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
 	t.Helper()
 	rp, ok := any(c).(r378RefreshPutter)
 	if !ok {
-		t.Fatalf("#378 RED: *ResolvedCacheStore has no ReplaceIfGenRefresh — the refresher terminal has no re-mint carrier, " +
+		t.Fatalf("#378 RED: *ResolvedCacheStore has no replaceIfGenRefresh — the refresher terminal has no re-mint carrier, " +
 			"so a warm cell the refresher keeps body-fresh still reaches the C5 cap under a customer")
 	}
-	return rp.ReplaceIfGenRefresh
+	return rp.replaceIfGenRefresh
 }
 
 // r378Stat reads one snowplow_resolved_cache stat; an absent stat is RED.
@@ -87,7 +87,7 @@ func TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect(t *testing
 		for m := 0; m < 4; m++ {
 			in := ResolvedKeyInputs{CacheEntryClass: class, Namespace: "d1", Name: class + "-" + string(rune('a'+m))}
 			k := ComputeKey(in)
-			c.Put(k, &ResolvedEntry{RawJSON: []byte(`{"d1":1}`), Inputs: &in})
+			c.put(k, &ResolvedEntry{RawJSON: []byte(`{"d1":1}`), Inputs: &in})
 			keys = append(keys, k)
 		}
 	}
@@ -140,10 +140,10 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 		return &ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "d2-" + n}
 	}
 	cold, seeded, warm, ttlWarm := key("cold"), key("seeded"), key("warm"), key("ttl")
-	c.Put(cold, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("cold")})
-	c.Put(seeded, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("seeded"), SeededAtBoot: true})
-	c.Put(warm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("warm")})
-	c.Put(ttlWarm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("ttl")})
+	c.put(cold, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("cold")})
+	c.put(seeded, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("seeded"), SeededAtBoot: true})
+	c.put(warm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("warm")})
+	c.put(ttlWarm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("ttl")})
 	t0 := time.Now()
 
 	r378SleepUntil(t0.Add(1200 * time.Millisecond))
@@ -171,7 +171,7 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 	// BornAt and lastRead), and re-read `warm` so it stays customer-warm.
 	for name, k := range map[string]string{"cold": cold, "seeded": seeded, "warm": warm} {
 		e := &ResolvedEntry{RawJSON: []byte(`2`), Inputs: in(name), SeededAtBoot: k == seeded}
-		if !c.ReplaceIfGen(context.Background(), k, e, c.CaptureGen(k)) {
+		if !c.replaceIfGen(context.Background(), k, e, c.CaptureGen(k)) {
 			t.Fatalf("SETUP: refresh-style re-Put of %s refused", name)
 		}
 	}
@@ -241,6 +241,10 @@ func r378SynthArgs(t *testing.T, c *ResolvedCacheStore, m reflect.Method, key st
 			args = append(args, reflect.ValueOf(in))
 		case pt == reflect.TypeOf(map[string]any{}):
 			args = append(args, reflect.ValueOf(map[string]any{"items": []any{map[string]any{"v": "rewrite"}}}))
+		case pt == reflect.TypeOf(PutVerdict{}):
+			// #912 re-review — a verdict-gated write: a STORING verdict, so the
+			// write lands and its re-mint behaviour is what is judged.
+			args = append(args, reflect.ValueOf(fixtureStoreVerdict))
 		default:
 			t.Errorf("#378 F2c: write method %s has a parameter of type %s this enumeration cannot synthesize — "+
 				"extend it so the method is DRIVEN, never silently skipped", m.Name, pt)
@@ -269,13 +273,20 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	var cells []cell
 	for i := 0; i < st.NumMethod(); i++ {
 		m := st.Method(i)
-		if !(strings.HasPrefix(m.Name, "Put") || strings.HasPrefix(m.Name, "Replace")) || m.Name == "ReplaceIfGenRefresh" {
+		// The refresher terminal's re-mint and its verdict-gated wrapper (#912
+		// re-review) are the one allowed re-mint.
+		if !(strings.HasPrefix(m.Name, "Put") || strings.HasPrefix(m.Name, "Replace")) ||
+			m.Name == "ReplaceIfGenRefresh" || m.Name == "ReplaceResolvedIfGenRefresh" {
 			continue
 		}
 		in := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Namespace: "f2c", Name: m.Name}
+		if m.Name == "PutContentIfGen" {
+			// It writes only an apistage entry under its own key (TestIssue912_V3).
+			in.CacheEntryClass = CacheEntryClassApistage
+		}
 		k := ComputeKey(in)
 		inCopy := in
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"born"}]}`), Inputs: &inCopy})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"born"}]}`), Inputs: &inCopy})
 		e, _ := c.GetNoTouch(k)
 		cells = append(cells, cell{m: m, key: k, in: in, born: e.BornAt})
 	}
@@ -283,7 +294,10 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	for _, x := range cells {
 		names[x.m.Name] = true
 	}
-	for _, must := range []string{"Put", "PutIfGen", "ReplaceIfGen", "PutThenRemark", "PutRAFullList", "PutRAFullListIfGen"} {
+	// #912 delta-3 item 3 — the ungated primitives are unexported; these exported
+	// writes wrap every one of them and are the only way another package reaches one.
+	for _, must := range []string{"PutResolved", "PutResolvedIfGen", "ReplaceResolvedIfGen", "PutResolvedThenRemark",
+		"PutResolvedEndingKnownStale", "PutRAFullList", "PutRAFullListIfGen", "PutContentIfGen"} {
 		if !names[must] {
 			t.Fatalf("#378 F2c: the enumeration did not find %s — the filter is broken (found %v)", must, names)
 		}
@@ -323,7 +337,7 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	put := r378RefreshPut(t, c)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "f2c", Name: "refresh"}
 	k := ComputeKey(in)
-	c.Put(k, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: &in})
+	c.put(k, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: &in})
 	e0, _ := c.GetNoTouch(k)
 	time.Sleep(maxAge/2 + 300*time.Millisecond)
 	if !put(context.Background(), k, &ResolvedEntry{RawJSON: []byte(`2`), Inputs: &in}, c.CaptureGen(k)) {
@@ -357,7 +371,7 @@ func r378RunF4aArm(t *testing.T, writeFor func(c *ResolvedCacheStore) func(conte
 		for i := 0; i < perClass; i++ {
 			in := ResolvedKeyInputs{CacheEntryClass: class, Namespace: "f4a", Name: class + "-" + itoa378(i)}
 			k := ComputeKey(in)
-			c.Put(k, &ResolvedEntry{RawJSON: []byte(`{"boot":1}`), Inputs: &in, SeededAtBoot: true, CreatedAt: born, BornAt: born})
+			c.put(k, &ResolvedEntry{RawJSON: []byte(`{"boot":1}`), Inputs: &in, SeededAtBoot: true, CreatedAt: born, BornAt: born})
 			keys = append(keys, k)
 		}
 	}
@@ -448,7 +462,7 @@ func TestIssue378_F4a_NoAmplification_MultiTick(t *testing.T) {
 	// the re-mint is exactly ReplaceIfGen (test-only seam: chosen here, never in
 	// production code).
 	ctlReal, ctlResets, n := r378RunF4aArm(t, func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
-		return c.ReplaceIfGen
+		return c.replaceIfGen
 	})
 	for k, r := range ctlResets {
 		if r != 0 {
@@ -488,7 +502,7 @@ func TestIssue378_F4b_DepMovesMidResolve_ReMintIsRemarked(t *testing.T) {
 	put := r378RefreshPut(t, c)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "f4b"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 	e0, _ := c.GetNoTouch(key)
 	time.Sleep(2300 * time.Millisecond) // into the window by real elapse
 

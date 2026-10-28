@@ -25,7 +25,7 @@ func TestServeCellIf765(t *testing.T) {
 		t.Fatalf("PRECONDITION: no resolved cache")
 	}
 	const key = "served-cell-765"
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), ContentAsOf: 7})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), ContentAsOf: 7})
 	dk := DepKey{GVR: schema.GroupVersionResource{Group: "g", Version: "v1", Resource: "rs"}, Namespace: "ns", Name: listWildcard}
 	h0, m0 := c.hitTotal.Load(), c.missTotal.Load()
 

@@ -294,7 +294,7 @@ func TestKey424_SeedTerminalPut_DeclinesOnClassDrift(t *testing.T) {
 		endpoints.Endpoint{}, nil)
 	key, handle, inputs := k424SeedKey(t, cohort)
 	k424Grant(t, dyn, a, psCarol) // the class moves after the mint, before the terminal write
-	ok := seedTerminalPut(cohort, handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs},
+	ok := seedTerminalPut(cohort, handle, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs},
 		seedTerminalGuardFor(seedModeBoot, handle, key))
 	if ok {
 		t.Fatalf("SEED TOCTOU: seedTerminalPut wrote a body under a key minted for the cohort's PRE-grant class")
@@ -304,7 +304,7 @@ func TestKey424_SeedTerminalPut_DeclinesOnClassDrift(t *testing.T) {
 	}
 	// Control: with no class change the same write lands.
 	key2, handle2, inputs2 := k424SeedKey(t, cohort)
-	if !seedTerminalPut(cohort, handle2, key2, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs2},
+	if !seedTerminalPut(cohort, handle2, fixtureStoreVerdict, key2, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs2},
 		seedTerminalGuardFor(seedModeBoot, handle2, key2)) {
 		t.Fatalf("CONTROL: an unchanged class must still be written (the guard is over-broad)")
 	}
@@ -517,7 +517,7 @@ func TestKey424_RefresherSubGenOnlyDrift_RoleEditMidResolve(t *testing.T) {
 	carolCtx := psUserCtx(a, psCarol)
 	key, in := k423RAKey(t, carolCtx)
 	in.RepresentativeUsername, in.RepresentativeGroups = psCarol, psGroups(a)
-	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"password":"pre-edit"}`), Inputs: in})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"password":"pre-edit"}`), Inputs: in})
 
 	rGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}
 	var armed atomic.Bool

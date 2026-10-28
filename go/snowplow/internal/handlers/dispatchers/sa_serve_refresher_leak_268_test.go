@@ -131,7 +131,7 @@ func TestRefresherLeak_Site3_DispatchCR_ServedUnderSA(t *testing.T) {
 	if store == nil {
 		t.Skip("resolved cache disabled")
 	}
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &inputs})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &inputs})
 
 	saEP := &endpoints.Endpoint{ServerURL: srv.URL(), Token: saLeakToken}
 	saRC := saLeakRC(srv.URL())
@@ -274,7 +274,7 @@ func TestRefresherLeak_Site1_SubresourceBranchE_ServedUnderSA(t *testing.T) {
 	if store == nil {
 		t.Skip("resolved cache disabled")
 	}
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &inputs})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &inputs})
 
 	saEP := &endpoints.Endpoint{ServerURL: srv.URL(), Token: saLeakToken}
 	saRC := saLeakRC(srv.URL())

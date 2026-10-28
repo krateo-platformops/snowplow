@@ -1293,7 +1293,9 @@ func seedRestactionResolveAndPutProd(
 	// #643 PR-B — resCtx, not ctx: the decline's mark reads the resolve's
 	// captured deps + entry stamp and the decline unit off it. resCtx inherits
 	// everything the decline otherwise reads off ctx (identity, the set).
-	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, stageErrSink, extTouchedSink, cache.PerIdentityForbiddenSinkFromContext(resCtx)) {
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink,
+		Forbidden: cache.PerIdentityForbiddenSinkFromContext(resCtx), External: extTouchedSink}, "restactions")
+	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, verdict, stageErrSink, extTouchedSink) {
 		return nil
 	}
 
@@ -1354,7 +1356,7 @@ func seedRestactionResolveAndPutProd(
 	// resurrecting the cell), plain Put for boot (pre-readyz exemption, #323). A refusal wrote nothing, so the
 	// resolves counter, the seeded-set Mark and the dep Record below are all
 	// skipped; the engine closure re-seeds once.
-	if !seedTerminalPut(resCtx, handle, key, entry, terminalGuard) {
+	if !seedTerminalPut(resCtx, handle, verdict, key, entry, terminalGuard) {
 		logSeedTerminalPutRefused("restactions", ref.Namespace+"/"+ref.Name)
 		return fmt.Errorf("restaction %s/%s: %w", ref.Namespace, ref.Name, errSeedTerminalPutRefused)
 	}
@@ -1682,7 +1684,8 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// #102 GTTL-1: decline the Put (best-effort, return nil) on a stage error
 	// or external touch — keeps any prior good entry; TTL is the outer net.
 	// #643 PR-B — resCtx (deps, stamp, decline unit); see seedRestactionResolveAndPutProd.
-	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, stageErrSink, extTouchedSink, forbiddenSink) {
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, "widgets")
+	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, verdict, stageErrSink, extTouchedSink) {
 		return nil
 	}
 
@@ -1737,7 +1740,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// #394 — generation-guarded terminal write for the post-readyz modes (plain
 	// for boot); see seedOneRestaction's tail. A refusal skips the counter, the
 	// seeded-set Mark, the dep Record and the 4a full-list pin below.
-	if !seedTerminalPut(resCtx, handle, key, entry, terminalGuard) {
+	if !seedTerminalPut(resCtx, handle, verdict, key, entry, terminalGuard) {
 		logSeedTerminalPutRefused("widgets", e.W.GetNamespace()+"/"+e.W.GetName())
 		return fmt.Errorf("widget %s/%s: %w", e.W.GetNamespace(), e.W.GetName(), errSeedTerminalPutRefused)
 	}
@@ -1943,30 +1946,64 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 //
 // The identity for the log is read from ctx (withCohortSeedContext installs
 // WithUserInfo) so both primitives share one helper without threading a label.
-func declineSeedPutOnError(ctx context.Context, class, target, key string,
-	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink,
-	forbiddenSink *cache.PerIdentityForbiddenSink) bool {
+//
+// verdict is the shared Put-gate verdict (cache.PutGateVerdict) the caller took
+// over this resolve's sinks, in the same function that builds the entry it
+// Puts (scripts/check_resolved_entry_put_sites.sh). #681 C2 — an
+// own-credential apiserver 403 (F2) is not a genuine external touch, at the
+// mark AND at the decline. The sinks are read for the decline log only.
+func declineSeedPutOnError(ctx context.Context, class, target, key string, verdict cache.PutVerdict,
+	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink) bool {
 
-	// #681 C2 — the ONE external count: an own-credential apiserver 403 (F2) is
-	// not a genuine external touch, at the mark AND at the decline.
-	genuineExternal := cache.GenuineExternal(extTouchedSink, forbiddenSink)
-
-	// #643 PR-B (brief §1(c) as amended, #643 comment 6150618043) — mark on an
-	// OBSERVED external touch, whichever branch declines. A fetch abandoned at
-	// the boot-readiness bound bumps the stage-error sink TOO, and returning from
-	// the stage-error branch first left exactly those fetches — the bulk of the
-	// 057 ClickHouse load — unmarked and re-dialled every pass. A stage error
-	// with no external touch never marks (it is transient and is retried).
-	if genuineExternal > 0 {
+	// #643 PR-B (brief §1(c) as amended, #643 comment 6150618043) — mark on a
+	// PERMANENT verdict, whichever reason declines: a genuine external touch (a
+	// fetch abandoned at the boot-readiness bound bumps the stage-error sink
+	// TOO, and returning from the stage-error branch first left exactly those
+	// fetches — the bulk of the 057 ClickHouse load — unmarked and re-dialled
+	// every pass), or a declared write (#903 F1: never storable). A transient
+	// stage error never marks (it is retried).
+	if verdict.Permanent() {
 		markDeclinedExternal(ctx, key)
 	}
 	// #681 G — a result whose ONLY stage errors are per-identity forbidden is
 	// seeded (shared DenialOnly predicate): first visit warm.
-	if stageErrSink.Count() > 0 && cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, class) {
-		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteSeed)
+	if verdict.Store() {
+		if verdict.DenialOnly() {
+			cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteSeed)
+		}
 		return false
 	}
-	if stageErrSink.Count() > 0 {
+	// Declined, whatever the reason (#912 re-review: the reason only selects the
+	// counter and the log line; the seed's write takes the verdict too and would
+	// refuse it anyway).
+	switch verdict.Reason() {
+	case cache.PutReasonDeclaredWrite:
+		pipSeedSkippedDeclaredWriteTotal.Add(1)
+		slog.Default().Info("phase1.seed.skip.declared_write",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
+			slog.String("effect", "the RESTAction declares a write stage: never stored, every /call runs its write "+
+				"(#903 F1); marked so later passes skip it"),
+		)
+	case cache.PutReasonExternal:
+		pipSeedSkippedStageErrorTotal.Add(1)
+		cache.BumpExternalSkippedPut()
+		// #132 F4b Lever A / #643 — the declined-external mark for this EXACT key
+		// (C-F4B-2) is taken above, so it covers every permanent reason. The set
+		// is absent on /call and the refresher, so Mark is a nil-receiver no-op
+		// there (C-F4B-3's request half, I-6).
+		slog.Default().Info("phase1.seed.skip.external_touch",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
+			slog.Int64("external_touches", extTouchedSink.Count()),
+			slog.String("effect", "seed re-resolve touched an external endpoint (no dep edge to invalidate); "+
+				"declining the Put — GTTL-1 backstop, uniform with the refresher"),
+		)
+	case cache.PutReasonStageError:
 		pipSeedSkippedStageErrorTotal.Add(1)
 		// Back-compat parity with the refresher's process-wide counter so
 		// existing "how many degraded re-Puts were declined" dashboards see the
@@ -1978,33 +2015,23 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string,
 			slog.String("class", class),
 			slog.String("target", target),
 			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
+			slog.String("reason", string(verdict.Reason())),
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("stage_err_stage", stage),
 			slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
 			slog.String("effect", "seed re-resolve observed a swallowed stage error; declining the Put "+
 				"(keeps any prior good entry; TTL is the outer net) — GTTL-1 backstop, uniform with the refresher"),
 		)
-		return true
-	}
-	if genuineExternal > 0 {
-		pipSeedSkippedStageErrorTotal.Add(1)
-		cache.BumpExternalSkippedPut()
-		// #132 F4b Lever A / #643 — the declined-external mark for this EXACT key
-		// (C-F4B-2) is taken above the stage-error branch, so it covers both. The
-		// set is absent on /call and the refresher, so Mark is a nil-receiver no-op
-		// there (C-F4B-3's request half, I-6).
-		slog.Default().Info("phase1.seed.skip.external_touch",
-			slog.String("subsystem", "cache"),
-			slog.String("class", class),
-			slog.String("target", target),
-			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
-			slog.Int64("external_touches", extTouchedSink.Count()),
-			slog.String("effect", "seed re-resolve touched an external endpoint (no dep edge to invalidate); "+
-				"declining the Put — GTTL-1 backstop, uniform with the refresher"),
+	default:
+		// Any other decline: today only cache.PutReasonUnobserved, a verdict
+		// over Put-gate sinks that were not all installed on the resolve. It
+		// admits nothing (#912 delta-3 item 3); never read as another reason.
+		slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+			slog.String("reason", string(verdict.Reason())),
+			slog.String("effect", "body served; not persisted"),
 		)
-		return true
 	}
-	return false
+	return true
 }
 
 // seedIdentityLabelFromCtx renders the seeding identity from the cohort ctx

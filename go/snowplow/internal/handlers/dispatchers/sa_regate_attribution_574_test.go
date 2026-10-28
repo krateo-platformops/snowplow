@@ -10,16 +10,21 @@ package dispatchers
 // This package runs untagged and drives the REAL refresher entry point
 // (resolveAndPopulateL1 → resolveOnceProd → restactions.Resolve → branch E).
 //
-//   B1  a background SAR stays re-gated, and the WARN names origin=refresher,
-//       trigger=none and the cell's key_hash.
+//   B1  a background SA-endpoint read stays re-gated, and the WARN names
+//       origin=refresher, trigger=none and the cell's key_hash.
 //   B1t the same on a triggered (dirty-mark) dispatch: trigger=dirty-mark.
+//   B1s #903: a background SAR is a WRITE (a POST), so it is never sent at all:
+//       refused before branch E (no dial, a stage error, the refusal counted
+//       under origin=refresher). B1/B1t used the SAR as their vehicle; since
+//       #903 they use a re-gated read, which is what they measure.
 //   B2  a background NON-SAR SA dial stays re-gated and is attributed.
 //   B3  a platform-template SA fetch (objects.getFromAPIServer) stays denied, and
 //       its DENIED WARN names origin and key_hash.
 //   B4  attribution across drivers: keepwarm seed (origin=cohort-seed,
 //       scope=keepwarm), live (origin=serve), key_hash never raw.
-//   A1b MEASUREMENT pinned by the ruling: with the gate stood down, the SAR
-//       result still does NOT re-Put the cell (external-touched decline).
+//   A1b with the gate stood down (impersonation available), the background SAR
+//       is still NOT sent (#903 supersedes the #615 access-review carve-out)
+//       and the cell is not re-Put.
 
 import (
 	"bytes"
@@ -40,6 +45,7 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -391,7 +397,7 @@ func sar574Refresh(t *testing.T, ctx context.Context, srv *sar574Server, ns, nam
 	if store == nil {
 		t.Fatal("resolved cache disabled: the arm cannot observe the cell")
 	}
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &inputs})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &inputs})
 
 	ext0 := cache.ExternalSkippedPut()
 	se0 := cache.RefresherSkippedStageError()
@@ -428,22 +434,24 @@ func sar574Attr(rec map[string]any, k string) string {
 	return v
 }
 
-// ── B1: a background SAR is re-gated (owner ruling) and the WARN says who ────
+// ── B1: a background SA read is re-gated and the WARN says who ──────────────
 
-// The owner ruled 2026-10-13 (#574) NOT to exempt SubjectAccessReviews: the
-// exemption alone changes nothing a user sees (A1b). The SAR stays re-gated, and
-// the refusal WARN now names its driver and its cell. Trigger-less dispatch:
-// the dequeue carried no trigger GVRs.
+// The owner ruled 2026-10-13 (#574) to attribute every re-gate refusal: the
+// refusal WARN names its driver and its cell. Trigger-less dispatch: the dequeue
+// carried no trigger GVRs. (Before #903 the vehicle was a SAR; a background SAR
+// is now refused as a write before it reaches the re-gate — see B1s.)
 func TestIssue574SAR_B1_BackgroundSARRegated_WarnNamesRefresherTriggerlessAndCell(t *testing.T) {
-	ra := sar574RA("ns1", "sar574-review", sar574ReviewStage(sar574SARPath))
+	ra := sar574RA("ns1", "sar574-review", sar574PodStage())
 	sar574Watcher(t, []*unstructured.Unstructured{ra}, true, []rbacv1.PolicyRule{sar574CreateSAR})
-	srv := newSAR574Server(t, nil)
+	srv := newSAR574Server(t, map[string]any{
+		sar574PodPath: map[string]any{"apiVersion": "v1", "kind": "Pod", "status": map[string]any{"phase": sar574Marker}},
+	})
 	logs := sar574CaptureLogs(t)
 
-	got := sar574Refresh(t, logs.ctx(context.Background()), srv, "ns1", "sar574-review", http.MethodPost, sar574SARPath)
+	got := sar574Refresh(t, logs.ctx(context.Background()), srv, "ns1", "sar574-review", http.MethodGet, sar574PodPath)
 
 	if got.dialed {
-		t.Fatalf("B1: the background SAR was dialed; the owner ruling keeps it re-gated.\n  wire:%s", srv.dump())
+		t.Fatalf("B1: the background SA read was dialed; the re-gate must refuse it.\n  wire:%s", srv.dump())
 	}
 	sar574RequireRegateFired(t, "B1", got)
 	recs := logs.lines(t, sar574BranchEMsg)
@@ -469,14 +477,16 @@ func TestIssue574SAR_B1_BackgroundSARRegated_WarnNamesRefresherTriggerlessAndCel
 // trigger GVR set is what the refresher's processNext puts on the ctx before
 // dispatch (refresher.go, WithRefreshTriggerGVRs); the arm installs it the same way.
 func TestIssue574SAR_B1t_TriggeredDispatch_WarnSaysDirtyMark(t *testing.T) {
-	ra := sar574RA("ns1", "sar574-review-trig", sar574ReviewStage(sar574SARPath))
+	ra := sar574RA("ns1", "sar574-review-trig", sar574PodStage())
 	sar574Watcher(t, []*unstructured.Unstructured{ra}, true, []rbacv1.PolicyRule{sar574CreateSAR})
-	srv := newSAR574Server(t, nil)
+	srv := newSAR574Server(t, map[string]any{
+		sar574PodPath: map[string]any{"apiVersion": "v1", "kind": "Pod", "status": map[string]any{"phase": sar574Marker}},
+	})
 	logs := sar574CaptureLogs(t)
 
 	ctx := cache.WithRefreshTriggerGVRs(context.Background(),
 		[]schema.GroupVersionResource{{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}})
-	got := sar574Refresh(t, logs.ctx(ctx), srv, "ns1", "sar574-review-trig", http.MethodPost, sar574SARPath)
+	got := sar574Refresh(t, logs.ctx(ctx), srv, "ns1", "sar574-review-trig", http.MethodGet, sar574PodPath)
 	sar574RequireRegateFired(t, "B1t", got)
 
 	recs := logs.lines(t, sar574BranchEMsg)
@@ -485,6 +495,31 @@ func TestIssue574SAR_B1t_TriggeredDispatch_WarnSaysDirtyMark(t *testing.T) {
 	}
 	if tr := sar574Attr(recs[0], "sa_regate_trigger"); tr != "dirty-mark" {
 		t.Errorf("B1t: sa_regate_trigger = %q, want \"dirty-mark\"", tr)
+	}
+}
+
+// ── B1s (#903): a background SAR is a write and is never sent ──────────────
+
+func TestIssue574SAR_B1s_BackgroundSARIsAWrite_NeverSent(t *testing.T) {
+	ra := sar574RA("ns1", "sar574-review-903", sar574ReviewStage(sar574SARPath))
+	sar574Watcher(t, []*unstructured.Unstructured{ra}, true, []rbacv1.PolicyRule{sar574CreateSAR})
+	srv := newSAR574Server(t, nil)
+	before := restactionsapi.BackgroundWriteRefusedSnapshot()[cache.BackgroundOriginRefresher]
+
+	got := sar574Refresh(t, context.Background(), srv, "ns1", "sar574-review-903", http.MethodPost, sar574SARPath)
+
+	if got.dialed {
+		t.Fatalf("#903 RED: a background refresh sent a SubjectAccessReview POST.\n  wire:%s", srv.dump())
+	}
+	// #912 re-review — the RESTAction declares a write, so the shared Put-gate
+	// verdict declines the re-Put as declared_write (permanent), not as a
+	// stage error or an external touch.
+	if r, ok := cache.RefreshSuppressedReason(got.key); !ok || r != string(cache.PutReasonDeclaredWrite) {
+		t.Fatalf("B1s: the refresher must decline a write RESTAction as declared_write; suppressed=%v reason=%q "+
+			"(external_skip_delta=%d stage_err_skip_delta=%d)", ok, r, got.extSkipDelta, got.stageErrDelta)
+	}
+	if d := restactionsapi.BackgroundWriteRefusedSnapshot()[cache.BackgroundOriginRefresher] - before; d < 1 {
+		t.Fatalf("#903: the refusal must be counted under origin=refresher (delta %d)", d)
 	}
 }
 
@@ -632,24 +667,19 @@ func TestIssue574SAR_A1b_GateStoodDown_SARResultStillNotRePut(t *testing.T) {
 
 	got := sar574Refresh(t, context.Background(), srv, "ns1", "sar574-review-put", http.MethodPost, sar574SARPath)
 
-	if !got.dialed {
-		t.Fatalf("A1b precondition: with the gate stood down the SAR must be dialed.\n  wire:%s", srv.dump())
+	// #903 (owner ruling 2026-10-25): background work never writes, an access
+	// review included — the #615 carve-out that let the refresher create one as
+	// the cohort is gone. With the gate stood down the SAR is still not sent.
+	if got.dialed {
+		t.Fatalf("#903 RED: with the gate stood down a background refresh sent the SAR (Impersonate-User=%q).\n  wire:%s",
+			srv.impersonatedAs(http.MethodPost, sar574SARPath), srv.dump())
 	}
 	if got.cellHasMarker {
-		t.Fatalf("A1b: a branch-E SAR decision now RE-PUTS the cell. That was not part of the #574 ruling; " +
-			"review keying, invalidation and #615 before accepting it (see this arm's comment).")
+		t.Fatalf("A1b: the cell carries a SAR decision although no SAR was sent")
 	}
-	if got.extSkipDelta == 0 {
-		t.Fatalf("A1b: expected the re-Put to be declined by the external-touched gate (external_skip_delta>0); "+
-			"got external_skip_delta=%d stage_err_skip_delta=%d", got.extSkipDelta, got.stageErrDelta)
+	if r, ok := cache.RefreshSuppressedReason(got.key); !ok || r != string(cache.PutReasonDeclaredWrite) {
+		t.Fatalf("A1b: the re-Put of a RESTAction that declares a write must be declined as declared_write; "+
+			"suppressed=%v reason=%q (external_skip_delta=%d stage_err_skip_delta=%d)", ok, r, got.extSkipDelta, got.stageErrDelta)
 	}
-	// #615 — the gate stood down on the impersonated-dial marker, so the dial
-	// must itself read as the cohort: the SA's own credential WITH the cohort's
-	// Impersonate-User, never the plain SA.
-	if imp := srv.impersonatedAs(http.MethodPost, sar574SARPath); imp != sar574Rep {
-		t.Fatalf("#615 RED: the branch-E SAR dial under the impersonated-dial marker went out as Impersonate-User=%q, "+
-			"want the cohort %q (an un-gated plain-SA read).\n  wire:%s", imp, sar574Rep, srv.dump())
-	}
-	t.Logf("A1b MEASURED: SAR dialed=true as the cohort (SA credential: %v, Impersonate-User=%q), cell re-Put=false, decline=external_touched (delta %d)",
-		got.dialAuth == "Bearer "+sar574SAToken, sar574Rep, got.extSkipDelta)
+	t.Logf("A1b MEASURED: SAR dialed=false (#903), cell re-Put=false, decline=declared_write")
 }

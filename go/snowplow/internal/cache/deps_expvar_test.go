@@ -121,7 +121,7 @@ func TestDepsExpvar_TracksRealEvictionAndPanic(t *testing.T) {
 	before := depsExpvarStats(t)
 
 	// (1) A real informer DELETE of a self-representation -> one eviction.
-	store.Put("L1_evictme", &ResolvedEntry{
+	store.put("L1_evictme", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs: &ResolvedKeyInputs{
 			CacheEntryClass: "widgets",
@@ -135,7 +135,7 @@ func TestDepsExpvar_TracksRealEvictionAndPanic(t *testing.T) {
 	d.SetRefreshHook(func(string, schema.GroupVersionResource) {
 		panic("simulated fault inside OnDelete")
 	})
-	store.Put("L1_other", &ResolvedEntry{
+	store.put("L1_other", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs: &ResolvedKeyInputs{
 			CacheEntryClass: "widgets",

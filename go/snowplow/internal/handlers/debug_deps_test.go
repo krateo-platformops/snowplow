@@ -67,13 +67,13 @@ func TestDebugDeps_MissingBackingEdgeDetectorAndNoBodyLeak(t *testing.T) {
 	const edgelessKey = "L1_deps_no_backing"
 
 	// Cell WITH a backing edge: templates edge + a real backing LIST edge.
-	store.Put(backingKey, &cache.ResolvedEntry{RawJSON: body, Inputs: depsWidgetInputs("w-backing")})
+	store.PutResolved(fixtureStoreVerdict, backingKey, &cache.ResolvedEntry{RawJSON: body, Inputs: depsWidgetInputs("w-backing")})
 	d.Record(context.Background(), backingKey, restactionsGVR, "krateo-system", "some-ra")
 	d.RecordList(context.Background(), backingKey, backing, "krateo-system")
 
 	// Cell WITHOUT a backing edge: only the RA-CR template edge (the edge-3
 	// staleness class — served by the 4a fast path pre-fix).
-	store.Put(edgelessKey, &cache.ResolvedEntry{RawJSON: body, Inputs: depsWidgetInputs("w-edgeless")})
+	store.PutResolved(fixtureStoreVerdict, edgelessKey, &cache.ResolvedEntry{RawJSON: body, Inputs: depsWidgetInputs("w-edgeless")})
 	d.Record(context.Background(), edgelessKey, restactionsGVR, "krateo-system", "some-ra")
 
 	// --- ?filter=missing-backing-edges ---

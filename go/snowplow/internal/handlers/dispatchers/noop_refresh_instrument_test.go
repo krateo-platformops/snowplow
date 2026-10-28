@@ -57,7 +57,7 @@ func TestNoopInstrument_ARM1_IdenticalRebuildIsCountedAtTheRealCallSite(t *testi
 	c := instrumentCacheOn(t)
 	inputs := instrumentInputs("arm1")
 	body := []byte(`{"items":[{"a":1}]}`)
-	c.Put(cache.ComputeKey(inputs), &cache.ResolvedEntry{RawJSON: body, Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, cache.ComputeKey(inputs), &cache.ResolvedEntry{RawJSON: body, Inputs: &inputs})
 
 	i0, ch0, _ := RefreshRebuildStats()
 	drive(t, inputs, body)
@@ -78,7 +78,7 @@ func TestNoopInstrument_ARM1_IdenticalRebuildIsCountedAtTheRealCallSite(t *testi
 func TestNoopInstrument_ARM2_ChangedRebuildIsCounted(t *testing.T) {
 	c := instrumentCacheOn(t)
 	inputs := instrumentInputs("arm2")
-	c.Put(cache.ComputeKey(inputs), &cache.ResolvedEntry{
+	c.PutResolved(fixtureStoreVerdict, cache.ComputeKey(inputs), &cache.ResolvedEntry{
 		RawJSON: []byte(`{"items":[{"a":1}]}`), Inputs: &inputs})
 
 	i0, ch0, _ := RefreshRebuildStats()
@@ -156,7 +156,7 @@ func TestNoopInstrument_ARM5_ObservationDoesNotSkipTheStore(t *testing.T) {
 
 	// A prior entry that is byte-identical to what the rebuild will produce,
 	// but distinguishable by a field the comparison does not look at.
-	c.Put(key, &cache.ResolvedEntry{RawJSON: body, Inputs: &inputs, Pinned: true})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: body, Inputs: &inputs, Pinned: true})
 
 	drive(t, inputs, body)
 

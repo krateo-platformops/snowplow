@@ -217,7 +217,7 @@ func TestH1_RA_RBACDenyIsBeforeCacheGet(t *testing.T) {
 	if handle == nil || key == "" || inputs == nil || inputs.BindingUID == "" {
 		t.Fatalf("setup: expected a live non-empty-BindingUID key; key=%q handle=%v inputs=%+v", key, handle != nil, inputs)
 	}
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"leaked":"cache-hit-body"}`), Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"leaked":"cache-hit-body"}`), Inputs: inputs})
 
 	restore := installRAFakes(t, h1RAUnstructured(), func() bool { return false /* DENY */ },
 		func(ctx context.Context, opts restactions.ResolveOptions) (*templatesv1.RESTAction, error) {
@@ -251,7 +251,7 @@ func TestH1_RA_L1Hit_ServesCellAndRefreshHeader_NoResolve(t *testing.T) {
 		t.Fatalf("setup: expected a live non-empty-BindingUID key; got %q %v %+v", key, handle != nil, inputs)
 	}
 	warm := []byte(`{"warm":"ra-cell"}` + "\n")
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
 
 	restore := installRAFakes(t, h1RAUnstructured(), func() bool { return true },
 		func(ctx context.Context, opts restactions.ResolveOptions) (*templatesv1.RESTAction, error) {
@@ -515,7 +515,7 @@ func TestH1_Widget_ContentHit_GatedBody_ClassWidgetContent(t *testing.T) {
 	// A minimal well-formed envelope gateWidgetEnvelope can serve (status shell
 	// with an empty resourcesRefs items list — nothing to narrow, served as-is).
 	shell := []byte(`{"status":{"widgetData":{"x":1},"resourcesRefs":{"items":[]}}}`)
-	contentHandle.Put(contentKey, &cache.ResolvedEntry{RawJSON: shell, Inputs: nil})
+	putFixture(contentHandle, contentKey, &cache.ResolvedEntry{RawJSON: shell, Inputs: nil})
 
 	restore := installWidgetFakes(t, cr, func() bool { return true },
 		func(ctx context.Context, opts widgets.ResolveOptions) (*widgets.Widget, error) {
@@ -564,7 +564,7 @@ func TestH1_Widget_RBACSensitive_SkipsContentLookup(t *testing.T) {
 	if contentHandle == nil || contentKey == "" {
 		t.Fatalf("setup: expected a live widgetContent handle+key")
 	}
-	contentHandle.Put(contentKey, &cache.ResolvedEntry{
+	putFixture(contentHandle, contentKey, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"status":{"widgetData":{"SA_MAXIMAL":"leak"},"resourcesRefs":{"items":[]}}}`),
 		Inputs:  nil,
 	})
@@ -804,7 +804,7 @@ func TestH1_RA_S189_ResolveRacingDelete_RefusedNotResurrected(t *testing.T) {
 			// Runs AFTER the dispatcher captured the key's generation (restactions.go:221)
 			// and BEFORE its PutIfGen (:463): a real Put+DELETE-evict bumps the
 			// generation past the captured value.
-			c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+			c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 			c.DeleteForTest(key)
 			return resolved, nil
 		})
@@ -840,7 +840,7 @@ func TestH1_Widget_S189_ResolveRacingDelete_RefusedNotResurrected(t *testing.T) 
 		func(ctx context.Context, opts widgets.ResolveOptions) (*widgets.Widget, error) {
 			// Between the widget-cell capture (widgets.go:267) and its PutIfGen
 			// (:522): bump the widget key's generation via a real Put+DELETE-evict.
-			c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+			c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 			c.DeleteForTest(key)
 			return h1WidgetUnstructured(map[string]any{}), nil
 		})

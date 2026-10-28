@@ -22,7 +22,7 @@ func TestListNarrow765_AuditIsWiredAtTheRefresherTerminal(t *testing.T) {
 		t.Helper()
 		inputs := instrumentInputs(name)
 		key := cache.ComputeKey(inputs)
-		c.Put(key, &cache.ResolvedEntry{RawJSON: prior, Inputs: &inputs})
+		c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: prior, Inputs: &inputs})
 		prev := resolveOnceFn
 		resolveOnceFn = func(context.Context, cache.ResolvedKeyInputs) ([]byte, error) { return produces, nil }
 		defer func() { resolveOnceFn = prev }()

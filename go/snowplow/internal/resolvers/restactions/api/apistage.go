@@ -1082,7 +1082,7 @@ func apistageContentServeAttempt(
 		// the resolve. A cold fill (key absent, gen 0) still inserts. On refusal
 		// the current request STILL serves `dispatched` below (envelope / parsed
 		// are already set); only the CACHE fill + its dep-record are skipped.
-		accepted := store.PutIfGen(ctx, contentKey, newEntry, contentGen0)
+		accepted := store.PutContentIfGen(ctx, contentKey, newEntry, contentGen0)
 		if !accepted && anchoredCell != nil {
 			anchoredCell.Close() // #854 — no entry was stored for it
 		}

@@ -58,8 +58,8 @@ func TestDebugApistage_CarriesKeyMultiplicityAttributionFields(t *testing.T) {
 		t.Fatalf("precondition: the two inputs must derive distinct keys")
 	}
 	inBase, inSib := base, sibling
-	store.Put(kBase, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &inBase})
-	store.Put(kSib, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &inSib})
+	store.PutResolved(fixtureStoreVerdict, kBase, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &inBase})
+	store.PutResolved(fixtureStoreVerdict, kSib, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &inSib})
 
 	rec := httptest.NewRecorder()
 	DebugApistage()(rec, httptest.NewRequest(http.MethodGet, "/debug/apistage", nil))
@@ -163,7 +163,7 @@ func TestDebugApistage_ZeroSubGenStillSerialises(t *testing.T) {
 	}
 	key := cache.ComputeKey(in)
 	stamped := in
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &stamped})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &stamped})
 
 	rec := httptest.NewRecorder()
 	DebugApistage()(rec, httptest.NewRequest(http.MethodGet, "/debug/apistage?key_hash="+key, nil))

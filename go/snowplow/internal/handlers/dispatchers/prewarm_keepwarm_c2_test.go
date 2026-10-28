@@ -91,7 +91,7 @@ func TestC2AgeSkip_YoungSkipped_OldReResolved(t *testing.T) {
 
 	// ── (a) YOUNG live cell (age well under threshold) → age-skip. Put with a
 	// CreatedAt of "now" (fresh); the store honors an explicit CreatedAt.
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: time.Now()})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: time.Now()})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("C2-C3 setup: young cell must be live")
 	}
@@ -116,7 +116,7 @@ func TestC2AgeSkip_YoungSkipped_OldReResolved(t *testing.T) {
 	// it LIVE — this is the crux: live BUT old).
 	buf.Reset()
 	oldCreatedAt := time.Now().Add(-(threshold + 500*time.Millisecond)) // age ≈ 1.5s: > TTL/4 (1s), < TTL (4s)
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: oldCreatedAt})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: oldCreatedAt})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("C2-C3(b) setup: the OLD cell must still be LIVE (age < full TTL) — the live-but-old crux")
 	}
@@ -159,7 +159,7 @@ func TestC2AgeSkip_MutationShape_AgeTermDiscriminates(t *testing.T) {
 	quietLoggingE(t)
 
 	skipOf := func(createdAt time.Time) uint64 {
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: createdAt})
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: createdAt})
 		before := keepwarmAgeSkipTotal.Load()
 		_ = seedOneWidget(granted, e, "authn-ns", seedModeKeepwarm)
 		return keepwarmAgeSkipTotal.Load() - before
@@ -206,7 +206,7 @@ func TestC2Boundary_BootFreshSkipsOldLiveCell_BareLiveness(t *testing.T) {
 
 	// OLD-but-LIVE cell: age = threshold + margin (>= TTL/4) but < full TTL.
 	oldCreatedAt := time.Now().Add(-(threshold + 500*time.Millisecond))
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: oldCreatedAt})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: oldCreatedAt})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("setup: old cell must still be LIVE (age < full TTL)")
 	}
@@ -373,7 +373,7 @@ func TestC2Cost_SecondSweepOverYoungSet_AgeSkipsAll(t *testing.T) {
 	// Warm the cell YOUNG (fresh CreatedAt), then run keepwarm: a churny/fresh
 	// cell is age-skipped, NOT re-resolved (cost-proportional: no work for a cell
 	// the refresher / a customer Put already refreshed this window).
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: time.Now()})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs, CreatedAt: time.Now()})
 	ageBefore := keepwarmAgeSkipTotal.Load()
 	resolvesBefore := pipBindingSetSeedResolvesTotal.Load()
 	_ = seedOneWidget(granted, e, "authn-ns", seedModeKeepwarm)

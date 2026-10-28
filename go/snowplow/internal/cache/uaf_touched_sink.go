@@ -98,15 +98,18 @@ var ctxKeyUAFTouchedSink = ctxKeyUAFTouchedSinkType{}
 // resolve, so all access is atomic.
 type UAFTouchedSink struct {
 	count atomic.Int64
+	// parent is the enclosing resolve's sink when this is a CHILD sink
+	// (WithPutGateEffectsCapture, #915 N1); every bump is forwarded to it.
+	parent *UAFTouchedSink
 }
 
-// Bump records one userAccessFilter refilter execution. nil-receiver-safe so the
-// bump site can call it unconditionally even when no sink is installed on ctx.
+// Bump records one userAccessFilter refilter execution, here and in every
+// ancestor sink. nil-receiver-safe so the bump site can call it unconditionally
+// even when no sink is installed on ctx.
 func (s *UAFTouchedSink) Bump() {
-	if s == nil {
-		return
+	for cur := s; cur != nil; cur = cur.parent {
+		cur.count.Add(1)
 	}
-	s.count.Add(1)
 }
 
 // Count returns the number of refilter executions recorded. nil-receiver-safe

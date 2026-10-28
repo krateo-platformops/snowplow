@@ -77,7 +77,7 @@ func TestSeedOneWidget_GVRDiscovered_GuardedReplaceInheritsBornAt(t *testing.T) 
 	key, handle, inputs := reseedWidgetKey(t, ctx, e)
 
 	past := time.Now().Add(-90 * time.Minute)
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"seed":1}`), Inputs: inputs, BornAt: past, CreatedAt: time.Now()})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"seed":1}`), Inputs: inputs, BornAt: past, CreatedAt: time.Now()})
 
 	if err := seedOneWidget(ctx, e, h1NS, seedModeGVRDiscovered); err != nil {
 		t.Fatalf("seedOneWidget(seedModeGVRDiscovered): %v", err)
@@ -132,13 +132,13 @@ func TestSeedTerminalPut_ReseedModes_RefusedOnRemoval(t *testing.T) {
 	for _, mode := range []seedScopeMode{seedModeRBACShift} {
 		t.Run(mode.String(), func(t *testing.T) {
 			k := "reseed-genrace-probe-" + mode.String()
-			store.Put(k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
+			store.PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
 			g := seedTerminalGuardFor(mode, store, k)
 			if !g.guarded {
 				t.Fatalf("%s: guard = %+v, want guarded", mode, g)
 			}
 			store.DeleteForTest(k) // a removal lands after capture → the generation moves
-			if seedTerminalPut(context.Background(), store, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":2}`)}, g) {
+			if seedTerminalPut(context.Background(), store, fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":2}`)}, g) {
 				t.Fatalf("%s: a gen-moved terminal Put must be REFUSED", mode)
 			}
 			if got, ok := store.Get(k); ok && string(got.RawJSON) == `{"v":2}` {
@@ -147,7 +147,7 @@ func TestSeedTerminalPut_ReseedModes_RefusedOnRemoval(t *testing.T) {
 		})
 	}
 	const pk = "reseed-plain-probe"
-	if !seedTerminalPut(context.Background(), store, pk, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)},
+	if !seedTerminalPut(context.Background(), store, fixtureStoreVerdict, pk, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)},
 		seedTerminalGuardFor(seedModeBoot, store, pk)) {
 		t.Fatal("boot (plain) must never refuse")
 	}
@@ -226,7 +226,13 @@ func TestReMint_SingleSetterAudit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
 		t.Fatalf("VACUOUS GUARD: module root %s has no go.mod: %v", root, err)
 	}
-	callRe := regexp.MustCompile(`\.ReplaceIfGenRefresh\(`)
+	// #912 re-review — the refresher's write is verdict-gated: it calls
+	// ReplaceResolvedIfGenRefresh, and the ONLY call of the ungated
+	// replaceIfGenRefresh (unexported since #912 delta-3 item 3) is that gated
+	// wrapper (cache/put_gated.go).
+	callRe := regexp.MustCompile(`\.replaceIfGenRefresh\(`)
+	gatedRe := regexp.MustCompile(`\.ReplaceResolvedIfGenRefresh\(`)
+	gatedCallers := map[string]int{}
 	retiredRe := regexp.MustCompile(`ReplaceIfGenReMint|seedModeReMint|reseedFromInputs`)
 	coreRe := regexp.MustCompile(`c\.putCoreLocked\([^\n]*, ([A-Za-z]+)\)`)
 	callers := map[string]int{}
@@ -245,6 +251,9 @@ func TestReMint_SingleSetterAudit(t *testing.T) {
 		}
 		if n := len(callRe.FindAll(b, -1)); n > 0 {
 			callers[filepath.ToSlash(path)] += n
+		}
+		if n := len(gatedRe.FindAll(b, -1)); n > 0 {
+			gatedCallers[filepath.ToSlash(path)] += n
 		}
 		if retiredRe.Match(b) {
 			for _, line := range strings.Split(string(b), "\n") {
@@ -266,10 +275,19 @@ func TestReMint_SingleSetterAudit(t *testing.T) {
 	for _, n := range callers {
 		total += n
 	}
+	wrapper := filepath.ToSlash(filepath.Join(root, "internal", "cache", "put_gated.go"))
+	if total != 1 || callers[wrapper] != 1 {
+		t.Fatalf("replaceIfGenRefresh must have EXACTLY ONE production caller (its verdict-gated wrapper in %s); "+
+			"found %d call(s) across %v. A second caller lets a non-refresher write reset BornAt.", wrapper, total, callers)
+	}
 	want := filepath.ToSlash(filepath.Join(root, "internal", "handlers", "dispatchers", "resolve_populate.go"))
-	if total != 1 || callers[want] != 1 {
-		t.Fatalf("ReplaceIfGenRefresh must have EXACTLY ONE production caller (the refresher terminal in %s); "+
-			"found %d call(s) across %v. A second caller lets a non-refresher write reset BornAt.", want, total, callers)
+	gatedTotal := 0
+	for _, n := range gatedCallers {
+		gatedTotal += n
+	}
+	if gatedTotal != 1 || gatedCallers[want] != 1 {
+		t.Fatalf("ReplaceResolvedIfGenRefresh must have EXACTLY ONE production caller (the refresher terminal in %s); "+
+			"found %d call(s) across %v. A second caller lets a non-refresher write reset BornAt.", want, gatedTotal, gatedCallers)
 	}
 	if len(retired) != 0 {
 		t.Fatalf("the retired seed-path re-mint is referenced by production code: %v", retired)

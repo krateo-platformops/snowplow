@@ -75,7 +75,7 @@ func terminalFixture(t *testing.T, n int) (*ResolvedCacheStore, []string) {
 		inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Group: "widgets.templates.krateo.io",
 			Version: "v1beta1", Resource: "flexes", Namespace: "ns", Name: fmt.Sprintf("w-%d", i)}
 		key := ComputeKey(inputs)
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"old"}`), Inputs: &inputs})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"old"}`), Inputs: &inputs})
 		keys = append(keys, key)
 	}
 	return c, keys
@@ -253,7 +253,7 @@ func TestRefreshTerminal_F6s_PermanentDeclineSuppressesSkipEndsKnownStale(t *tes
 
 	// One real Put clears the marker → the next dequeue resolves again.
 	e, _ := c.GetNoTouch(key)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"traffic"}`), Inputs: e.Inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"traffic"}`), Inputs: e.Inputs})
 	if _, still := RefreshSuppressedReason(key); still {
 		t.Fatalf("F6s: marker survived a real Put — suppress-and-never-recover")
 	}
@@ -336,7 +336,7 @@ func TestRefreshTerminal_F6e_EvictionClearsTheMarker(t *testing.T) {
 	t.Cleanup(resetRefreshTerminalForTest)
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "gone"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 	NoteRefreshDecline(key, "uaf", true)
 	if _, ok := RefreshSuppressedReason(key); !ok {
 		t.Fatal("F6e: setup — key should be suppressed")

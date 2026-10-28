@@ -41,7 +41,7 @@ func TestIssue216_F6a_DeletePrimitiveStripsEdgesBeforeItReturns(t *testing.T) {
 	gvr := f6aGVR()
 	const key = "L1_f6a-flex"
 
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
 		CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource,
 		Namespace: "demo-system", Name: "f6a-flex",
 	}})
@@ -93,7 +93,7 @@ func TestIssue216_F6a_ConcurrentRewriteKeepsItsEdges(t *testing.T) {
 		rows[i] = row{key: "L1_" + name, dk: DepKey{GVR: gvr, Namespace: "demo-system", Name: name}}
 	}
 	put := func(r row) {
-		store.Put(r.key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
+		store.put(r.key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
 			CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource,
 			Namespace: r.dk.Namespace, Name: r.dk.Name,
 		}})

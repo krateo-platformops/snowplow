@@ -43,13 +43,13 @@ func TestUAFShortTTL_CapsUAFCell_NotNonUAF(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour) // standard ttl = 1h
 
 	// UAF cell: short 1s override, aged 2s → past the override, far inside 1h.
-	c.Put("k-uaf", &ResolvedEntry{
+	c.put("k-uaf", &ResolvedEntry{
 		RawJSON:     []byte(`{}`),
 		CreatedAt:   time.Now().Add(-2 * time.Second),
 		TTLOverride: 1 * time.Second,
 	})
 	// Non-UAF cell: NO override, same age → governed by the 1h standard ttl.
-	c.Put("k-plain", &ResolvedEntry{
+	c.put("k-plain", &ResolvedEntry{
 		RawJSON:   []byte(`{}`),
 		CreatedAt: time.Now().Add(-2 * time.Second),
 	})

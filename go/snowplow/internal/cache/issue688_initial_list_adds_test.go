@@ -234,7 +234,7 @@ func issue688Arm(t *testing.T, standalone bool) {
 	d := Deps()
 	d.SetStore(store)
 	const l1Key = "L1_issue688_paragraph_list"
-	store.Put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), Inputs: widgetInputs(gvr, issue688NS, "")})
+	store.put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), Inputs: widgetInputs(gvr, issue688NS, "")})
 	d.RecordList(context.Background(), l1Key, gvr, issue688NS)
 
 	rw, dyn, _ := issue688Watcher(t, gvr)
@@ -289,7 +289,7 @@ func issue688Arm(t *testing.T, standalone bool) {
 	// --- relist: a fresh informer re-LISTs; its replay is initial again ---
 	// The dependent was re-marked by the live ADD; re-Put it so a mark on the
 	// relist is observable as a fresh mark.
-	store.Put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), Inputs: widgetInputs(gvr, issue688NS, "")})
+	store.put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), Inputs: widgetInputs(gvr, issue688NS, "")})
 	d.RecordList(context.Background(), l1Key, gvr, issue688NS)
 	rw.RemoveResourceType(gvr)
 	beforeRelist := issue688Read(rw, gvr)
@@ -336,7 +336,7 @@ func TestIssue688_LiveAddBeforeSyncChClosesIsNotDropped(t *testing.T) {
 	d := Deps()
 	d.SetStore(store)
 	const l1Key = "L1_issue688_paragraph_list_live"
-	store.Put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), Inputs: widgetInputs(gvr, issue688NS, "")})
+	store.put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`), Inputs: widgetInputs(gvr, issue688NS, "")})
 	d.RecordList(context.Background(), l1Key, gvr, issue688NS)
 
 	rw, dyn, gate := issue688Watcher(t, gvr)

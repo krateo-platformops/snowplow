@@ -69,7 +69,7 @@ func captureRefreshIdentity(t *testing.T, inputs cache.ResolvedKeyInputs, saEP *
 
 	c := cache.ResolvedCache()
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
 
 	var gotUser string
 	var gotGroups []string
@@ -371,7 +371,7 @@ func TestLever1_PopulateSkipsEmptyPoisonShell(t *testing.T) {
 	beforeStore := cache.ResolvedCache().Stats().WidgetContentStoreTotal
 	beforeRBAC := widgetContentSkippedRBACSensitiveTotal.Load()
 
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
+	populateWidgetContentL1(withWidgetContentPutSinks(context.Background()), gvr, in, 5, 1, res, 0)
 
 	if got := cache.ResolvedCache().Stats().WidgetContentStoreTotal; got != beforeStore {
 		t.Fatalf("LEVER 1 FAIL: a poison/RBAC-sensitive shell was STORED (WidgetContentStoreTotal %d -> %d). "+
@@ -420,7 +420,7 @@ func TestLever1_PopulateDoesNotStorePopulatedDatagrid(t *testing.T) {
 	res := widgetWithShape("compositions-panels", true, 5) // apiRef+resourcesRefsTemplate, POPULATED
 
 	beforeRBAC := widgetContentSkippedRBACSensitiveTotal.Load()
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
+	populateWidgetContentL1(withWidgetContentPutSinks(context.Background()), gvr, in, 5, 1, res, 0)
 
 	if got := widgetContentSkippedRBACSensitiveTotal.Load(); got != beforeRBAC+1 {
 		t.Fatalf("task #69: a POPULATED apiRef+template datagrid must be skipped via the "+
@@ -455,7 +455,7 @@ func TestLever1_PopulateStoresStaticOnlyEmptyWidget(t *testing.T) {
 	// Re-stamp identity so the key matches.
 	res.Object["metadata"] = map[string]any{"namespace": "krateo-system", "name": "dashboard-piechart"}
 
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
+	populateWidgetContentL1(withWidgetContentPutSinks(context.Background()), gvr, in, 5, 1, res, 0)
 
 	key := cache.ComputeKey(cache.ResolvedKeyInputs{
 		CacheEntryClass: cache.CacheEntryClassWidgetContent,

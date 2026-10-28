@@ -252,7 +252,7 @@ func TestIssue375_Arm1_ApistageReadToRecordWindow_OuterRemarks(t *testing.T) {
 	if got := names375(dict, "w"); strings.Contains(strings.Join(got, ","), "late-widget") {
 		t.Fatalf("setup: the resolve must have read PRE-churn data (the seam returns the @N bytes), got %v", got)
 	}
-	if !store.PutIfGen(octx, outerKey, &cache.ResolvedEntry{RawJSON: outerBody375(dict, "w")}, gen0) {
+	if !store.PutResolvedIfGen(octx, fixtureStoreVerdict, outerKey, &cache.ResolvedEntry{RawJSON: outerBody375(dict, "w")}, gen0) {
 		t.Fatalf("setup: outer PutIfGen refused")
 	}
 	if got := rem.get(outerKey); got != 1 {
@@ -315,7 +315,7 @@ func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[sche
 		gen0 := store.CaptureGen(k)
 		rctx := cache.WithL1KeyContext(hctx, k) // hctx carries the consumed trigger set
 		dict := resolve375(rctx, stages...)
-		store.ReplaceIfGen(rctx, k, &cache.ResolvedEntry{RawJSON: outerBody375(dict, ids...), Inputs: &used}, gen0)
+		store.ReplaceResolvedIfGen(rctx, fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: outerBody375(dict, ids...), Inputs: &used}, gen0)
 		outerOnce.Do(func() { close(outerDone) })
 		return nil
 	})
@@ -332,7 +332,7 @@ func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[sche
 			httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{Path: path, Verb: ptr.To(http.MethodGet)}})
 		if ok {
 			rctx := cache.WithL1KeyContext(hctx, k)
-			store.ReplaceIfGen(rctx, k, &cache.ResolvedEntry{RawJSON: raw, Inputs: &used}, gen0)
+			store.ReplaceResolvedIfGen(rctx, fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: raw, Inputs: &used}, gen0)
 		}
 		return nil
 	})
@@ -366,7 +366,7 @@ func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[sche
 			t.Fatalf("setup: the initial resolve must have served PRE-churn data, got %s", stale)
 		}
 	}
-	if !store.PutIfGen(octx, outerKey, &cache.ResolvedEntry{RawJSON: stale, Inputs: &outerIn}, gen0) {
+	if !store.PutResolvedIfGen(octx, fixtureStoreVerdict, outerKey, &cache.ResolvedEntry{RawJSON: stale, Inputs: &outerIn}, gen0) {
 		t.Fatalf("setup: outer PutIfGen refused")
 	}
 
@@ -434,7 +434,7 @@ func TestIssue375_ContentOwnDepChurn_ContentKeyRemarked_ConvergesFresh(t *testin
 		raw, ok := dispatchViaInformer(cache.WithApistageContentResolve(hctx),
 			httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{Path: path, Verb: ptr.To(http.MethodGet)}})
 		if ok {
-			store.ReplaceIfGen(cache.WithL1KeyContext(hctx, k), k, &cache.ResolvedEntry{RawJSON: raw, Inputs: &used}, gen0)
+			store.ReplaceResolvedIfGen(cache.WithL1KeyContext(hctx, k), fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: raw, Inputs: &used}, gen0)
 		}
 		return nil
 	})

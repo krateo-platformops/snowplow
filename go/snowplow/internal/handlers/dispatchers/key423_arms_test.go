@@ -339,7 +339,7 @@ func TestKey423_SeedKeyParity(t *testing.T) {
 
 	// The cell the seed would Put is the cell carol's /call reads.
 	marker := []byte(`{"kind":"RESTAction","status":{"seeded":"` + psSentinel + `"}}`)
-	cache.ResolvedCache().Put(seedKey, &cache.ResolvedEntry{RawJSON: marker, Inputs: seedIn})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, seedKey, &cache.ResolvedEntry{RawJSON: marker, Inputs: seedIn})
 	before := counters[psCarol].Load()
 	rec := psServe(t, a, srv.URL, psUserCtx(a, psCarol))
 	if counters[psCarol].Load() != before || !bytes.Contains(rec.Body.Bytes(), marker) {

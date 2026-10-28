@@ -109,7 +109,7 @@ func TestI598_Arm4_MemoIsNeverSwapped(t *testing.T) {
 	if store == nil {
 		t.Fatal("harness: no resolved cache under CACHE_ENABLED")
 	}
-	store.Put("L1_598_arm4_cell", &cache.ResolvedEntry{RawJSON: []byte(`{}`)})
+	store.PutResolved(fixtureStoreVerdict, "L1_598_arm4_cell", &cache.ResolvedEntry{RawJSON: []byte(`{}`)})
 	if n := cache.ResolvedCacheStatsByStat()["entries"]; n < 1 {
 		t.Fatalf("harness: the published cache reports %d entries; the arm needs a live cell so the old swap bound would be in force", n)
 	}

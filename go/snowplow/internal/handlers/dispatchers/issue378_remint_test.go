@@ -170,7 +170,7 @@ func r378IdentityFreeCell(t *testing.T, ttlS, maxAgeS int, name string) (cache.R
 		Namespace: h1NS, Name: name, PerPage: -1, Page: -1}
 	key := cache.ComputeKey(in)
 	inCopy := in
-	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fill"}`), Inputs: &inCopy})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fill"}`), Inputs: &inCopy})
 	restore := setResolveOnceForTest(func(context.Context, cache.ResolvedKeyInputs) ([]byte, error) {
 		return []byte(`{"v":"refreshed"}`), nil
 	})
@@ -234,14 +234,14 @@ func TestIssue378_F2c_SeedModesInheritBornAtInTheWindow(t *testing.T) {
 	born := map[seedScopeMode]time.Time{}
 	for _, mode := range modes {
 		k := "r378-f2c-" + mode.String()
-		store.Put(k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
+		store.PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
 		e, _ := store.GetNoTouch(k)
 		keys[mode], born[mode] = k, e.BornAt
 	}
 	e := reseedWidgetEntry()
 	ctx := reseedSeedCtx()
 	wKey, handle, inputs := reseedWidgetKey(t, ctx, e)
-	handle.Put(wKey, &cache.ResolvedEntry{RawJSON: []byte(`{"seed":1}`), Inputs: inputs})
+	putFixture(handle, wKey, &cache.ResolvedEntry{RawJSON: []byte(`{"seed":1}`), Inputs: inputs})
 	wE0, _ := handle.GetNoTouch(wKey)
 
 	time.Sleep(2300 * time.Millisecond) // every cell is inside the lead window
@@ -249,7 +249,7 @@ func TestIssue378_F2c_SeedModesInheritBornAtInTheWindow(t *testing.T) {
 	for _, mode := range modes {
 		k := keys[mode]
 		g := seedTerminalGuardFor(mode, store, k)
-		if !seedTerminalPut(context.Background(), store, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":2}`)}, g) {
+		if !seedTerminalPut(context.Background(), store, fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":2}`)}, g) {
 			t.Fatalf("%s: terminal Put refused on a live cell", mode)
 		}
 		got, ok := store.GetNoTouch(k)

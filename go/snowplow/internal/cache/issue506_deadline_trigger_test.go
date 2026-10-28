@@ -97,7 +97,7 @@ func i506Put(t *testing.T, store *ResolvedCacheStore, name string, birthAge, bod
 	now := time.Now()
 	inputs := widgetInputs(gvrFlexes(), "krateo-system", name)
 	key := ComputeKey(*inputs)
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON:      []byte(`{"cell":"` + name + `"}`),
 		Inputs:       inputs,
 		BornAt:       now.Add(-birthAge),
@@ -348,7 +348,7 @@ func TestIssue506_DeadlineTriggerDoesNotEnqueueColdCells(t *testing.T) {
 	now := time.Now()
 	inputs := widgetInputs(gvrFlexes(), "krateo-system", "cold-in-window")
 	key := ComputeKey(*inputs)
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON:   []byte(`{"cell":"cold"}`),
 		Inputs:    inputs,
 		BornAt:    now.Add(-980 * time.Second),
@@ -473,7 +473,7 @@ func TestIssue506_KeepwarmClearedCellIsColdWithAFreshBody(t *testing.T) {
 
 	// INSERT, old in both clocks. The insert branch stamps lastRead = CreatedAt,
 	// so lastRead starts 980s stale.
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON:   []byte(`{"cell":"kw-insert"}`),
 		Inputs:    inputs,
 		BornAt:    now.Add(-980 * time.Second),
@@ -481,7 +481,7 @@ func TestIssue506_KeepwarmClearedCellIsColdWithAFreshBody(t *testing.T) {
 	})
 	// REPLACE, standing in for the keepwarm sweep: a fresh body on a resident key.
 	// BornAt and lastRead are both inherited; only CreatedAt moves.
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON:   []byte(`{"cell":"kw-replace"}`),
 		Inputs:    inputs,
 		CreatedAt: now,
@@ -556,9 +556,9 @@ func TestIssue506_WarmInLeadWindowIsTheJitterFreeWarmPopulation(t *testing.T) {
 	coldIn := widgetInputs(gvrFlexes(), "krateo-system", "den-cold-in")
 	coldKey := ComputeKey(*coldIn)
 	now := time.Now()
-	store.Put(coldKey, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: coldIn,
+	store.put(coldKey, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: coldIn,
 		BornAt: now.Add(-980 * time.Second), CreatedAt: now.Add(-980 * time.Second)})
-	store.Put(coldKey, &ResolvedEntry{RawJSON: []byte(`2`), Inputs: coldIn, CreatedAt: now})
+	store.put(coldKey, &ResolvedEntry{RawJSON: []byte(`2`), Inputs: coldIn, CreatedAt: now})
 	if m, _ := store.MetadataForKey(coldKey); m.LastReadSeconds >= 0 && m.LastReadSeconds < 100 {
 		t.Fatalf("precondition: the cold cell is warm (lastRead %ds) — the replace restamped it", m.LastReadSeconds)
 	}

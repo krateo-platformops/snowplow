@@ -478,7 +478,7 @@ func populateClusterListCellSync(
 	// during the defensive resolve. On refusal the populate DECLINES — the caller
 	// degrades (per-NS fallback / log-only), same as any other populate failure —
 	// and the dep-Record + tier-key registration are skipped (no cell to track).
-	if !apistageStore.PutIfGen(ctx, contentKey, newEntry, contentGen0) {
+	if !apistageStore.PutContentIfGen(ctx, contentKey, newEntry, contentGen0) {
 		log.Debug("cluster_list.populate_refused_gen_moved",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),

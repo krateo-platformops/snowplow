@@ -224,7 +224,7 @@ func TestEdge3_FC2_FastPathServeGoesStale(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("w1 first-sight serve failed: ok=%v err=%v", ok, err)
 	}
-	store.Put(w1Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got1), Inputs: edge3WidgetInputs("w1")})
+	store.PutResolved(fixtureStoreVerdict, w1Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got1), Inputs: edge3WidgetInputs("w1")})
 
 	// --- w2: MUST take the REAL 4a fast path (RAFullListServeHit). ---
 	before := cache.RAFullListServeSnapshot()
@@ -239,7 +239,7 @@ func TestEdge3_FC2_FastPathServeGoesStale(t *testing.T) {
 	if after.VerifiedSlice-before.VerifiedSlice != 0 || after.Repopulate-before.Repopulate != 0 || after.Fallback-before.Fallback != 0 {
 		t.Fatalf("[C-prove-path] w2 serve took a NON-hit path (verified/repopulate/fallback moved): before=%+v after=%+v — the arm does not prove the REAL 4a path", before, after)
 	}
-	store.Put(w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got2), Inputs: edge3WidgetInputs("w2")})
+	store.PutResolved(fixtureStoreVerdict, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got2), Inputs: edge3WidgetInputs("w2")})
 
 	// Both cells currently hold OLD content.
 	if !edge3ServedContainsMarker(t, w1Key, "OLD") || !edge3ServedContainsMarker(t, w2Key, "OLD") {
@@ -260,7 +260,7 @@ func TestEdge3_FC2_FastPathServeGoesStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raKey refresh resolve failed: %v", err)
 	}
-	store.PutRAFullList(raKey, raKeyInputs, freshFull)
+	store.PutRAFullList(fixtureStoreVerdict, raKey, raKeyInputs, freshFull)
 
 	// The refresher: a widget key handed to it re-serves via the 4a fast path
 	// (now over the FRESH raKey cell) and re-Puts the widget cell. This is the
@@ -284,7 +284,7 @@ func TestEdge3_FC2_FastPathServeGoesStale(t *testing.T) {
 			t.Errorf("refresh re-serve of %q failed: ok=%v err=%v", k, ok, err)
 			return
 		}
-		store.Put(k, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got), Inputs: edge3WidgetInputs(widgetName[k])})
+		store.PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got), Inputs: edge3WidgetInputs(widgetName[k])})
 	})
 
 	// Drive the backing-object mutation through the dep tracker's REAL decision
@@ -358,7 +358,7 @@ func edge3MutateAndAssertConverge(t *testing.T, base context.Context, gRA, backi
 	if err != nil {
 		t.Fatalf("raKey refresh resolve failed: %v", err)
 	}
-	store.PutRAFullList(raKey, raKeyInputs, freshFull)
+	store.PutRAFullList(fixtureStoreVerdict, raKey, raKeyInputs, freshFull)
 
 	byKey := map[string]edge3Widget{}
 	for _, w := range widgets {
@@ -379,7 +379,7 @@ func edge3MutateAndAssertConverge(t *testing.T, base context.Context, gRA, backi
 			t.Errorf("refresh re-serve of %q failed: ok=%v err=%v", k, ok, err)
 			return
 		}
-		store.Put(k, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got), Inputs: edge3WidgetInputs(w.name)})
+		store.PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got), Inputs: edge3WidgetInputs(w.name)})
 	})
 	d.OnUpdate(backing, edge3BackingNS, edge3BackingName)
 	for _, w := range widgets {
@@ -464,7 +464,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pre-warm resolve failed: %v", err)
 	}
-	store.PutRAFullList(raKey, raKeyInputs, fullDict)
+	store.PutRAFullList(fixtureStoreVerdict, raKey, raKeyInputs, fullDict)
 	cache.RecordSliceability(raKey, shape, true)
 	d.Record(context.Background(), raKey, gRA, edge3BackingNS, raName) // RA-CR self-dep (mirror ra_full_list.go:469)
 
@@ -491,7 +491,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 	}
 	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, "", cache.HashExtras(nil), 5, 1)
 	memo.Store(memoKey, edge3MustJSON(t, served1), deps, cache.DepGenEpochNow())
-	store.Put(w1Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, served1), Inputs: edge3WidgetInputs("w1")})
+	store.PutResolved(fixtureStoreVerdict, w1Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, served1), Inputs: edge3WidgetInputs("w1")})
 
 	// w2: memo HIT → replay the captured deps under w2's key (B3).
 	ctx2 := cache.WithL1KeyContext(base, w2Key)
@@ -500,7 +500,7 @@ func TestEdge3_FC1b_MemoMissBodyFromFastPathCapturesNonEmptyDeps(t *testing.T) {
 		t.Fatalf("harness broken: w2 memo load MISS under key %q", memoKey)
 	}
 	d.ReplayEdges(context.Background(), w2Key, deps2)
-	store.Put(w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body2), Inputs: edge3WidgetInputs("w2")})
+	store.PutResolved(fixtureStoreVerdict, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body2), Inputs: edge3WidgetInputs("w2")})
 	if !edge3EdgesContainBacking(d.EdgesUnder(w2Key), backing) {
 		t.Fatalf("F-C1b RED: w2 (memo hit) cell carries no edge-3 after replay: %v", d.EdgesUnder(w2Key))
 	}
@@ -545,7 +545,7 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 		t.Fatalf("first-sight serve failed: ok=%v err=%v", ok, err)
 	}
 	depsFS := d.EndCapture(wfsKey, capBuf)
-	store.Put(wfsKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, gotFS), Inputs: edge3WidgetInputs("fs")})
+	store.PutResolved(fixtureStoreVerdict, wfsKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, gotFS), Inputs: edge3WidgetInputs("fs")})
 	memoKey := memo.Key(edge3BackingNS, raName, "admin", []string{"system:masters"}, "", cache.HashExtras(nil), 5, 1)
 	memo.Store(memoKey, edge3MustJSON(t, gotFS), depsFS, cache.DepGenEpochNow())
 
@@ -560,7 +560,7 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 	if cache.RAFullListServeSnapshot().Hit-before.Hit != 1 {
 		t.Fatalf("[C-prove-path] the 4a-slice widget must take the fast-path hit")
 	}
-	store.Put(w4aKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got4A), Inputs: edge3WidgetInputs("4a")})
+	store.PutResolved(fixtureStoreVerdict, w4aKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got4A), Inputs: edge3WidgetInputs("4a")})
 
 	// Carrier 3 — MEMO HIT (page 1). edge-3 via B3's memo replay.
 	ctxMemo := cache.WithL1KeyContext(base, wmemoKey)
@@ -569,7 +569,7 @@ func TestEdge3_FGENERAL_ThreeCarriersConverge(t *testing.T) {
 		t.Fatalf("harness broken: memo widget load MISS")
 	}
 	d.ReplayEdges(context.Background(), wmemoKey, depsMemo)
-	store.Put(wmemoKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, bodyMemo), Inputs: edge3WidgetInputs("memo")})
+	store.PutResolved(fixtureStoreVerdict, wmemoKey, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, bodyMemo), Inputs: edge3WidgetInputs("memo")})
 
 	// Each carrier's cell must carry edge-3.
 	for _, w := range []struct {
@@ -670,7 +670,7 @@ func TestEdge3_E2E_ResolveB2B3WiringThroughApirefResolve(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pre-warm resolve failed: %v", err)
 	}
-	store.PutRAFullList(raKey, raKeyInputs, fullDict)
+	store.PutRAFullList(fixtureStoreVerdict, raKey, raKeyInputs, fullDict)
 	cache.RecordSliceability(raKey, shape, true)
 	d.Record(context.Background(), raKey, gRA, ns, raName) // RA-CR self-dep
 
@@ -693,7 +693,7 @@ func TestEdge3_E2E_ResolveB2B3WiringThroughApirefResolve(t *testing.T) {
 	if cache.RAFullListServeSnapshot().Hit-before.Hit != 1 {
 		t.Fatalf("[C-prove-path] w1 must be served by the 4a fast-path HIT through apiref.Resolve")
 	}
-	store.Put(w1Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body1), Inputs: edge3WidgetInputs("w1")})
+	store.PutResolved(fixtureStoreVerdict, w1Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body1), Inputs: edge3WidgetInputs("w1")})
 
 	// --- w2: memo HIT through apiref.Resolve. B3 replays the captured deps
 	// under w2's key. Assert it took the memo path (NO fast-path serve — Hit
@@ -709,7 +709,7 @@ func TestEdge3_E2E_ResolveB2B3WiringThroughApirefResolve(t *testing.T) {
 	if afterW2.Hit != beforeW2.Hit || afterW2.VerifiedSlice != beforeW2.VerifiedSlice || afterW2.Repopulate != beforeW2.Repopulate {
 		t.Fatalf("E2E: w2 must be served by the B3 memo HIT (no raFullListServe), but a serve counter moved: before=%+v after=%+v", beforeW2, afterW2)
 	}
-	store.Put(w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body2), Inputs: edge3WidgetInputs("w2")})
+	store.PutResolved(fixtureStoreVerdict, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body2), Inputs: edge3WidgetInputs("w2")})
 
 	// The B2/B3 wiring must have landed edge-3 on w2's cell.
 	if !edge3EdgesContainBacking(d.EdgesUnder(w2Key), backing) {

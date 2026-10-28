@@ -126,7 +126,7 @@ func TestFalsifierF2_DeleteDirtyMarksDependentGet(t *testing.T) {
 
 	// The widget L1 entry: its OWN object is widget "save-btn" in ns app.
 	const widgetL1 = "L1_widget_save_btn"
-	store.Put(widgetL1, &ResolvedEntry{
+	store.put(widgetL1, &ResolvedEntry{
 		RawJSON: []byte(`{"kind":"button"}`),
 		Inputs: &ResolvedKeyInputs{
 			CacheEntryClass: "widgets",

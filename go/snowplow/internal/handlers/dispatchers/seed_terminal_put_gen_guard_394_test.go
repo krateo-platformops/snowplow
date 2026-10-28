@@ -163,7 +163,7 @@ func (h *s394Harness) install(t *testing.T) {
 // re-resolve. age backdates CreatedAt (keepwarm only re-resolves cells at or
 // beyond the age-skip threshold).
 func s394PreSeed(handle cacheHandle, key string, inputs *cache.ResolvedKeyInputs, age time.Duration) {
-	handle.Put(key, &cache.ResolvedEntry{
+	putFixture(handle, key, &cache.ResolvedEntry{
 		RawJSON:   []byte(`{"body":"pre-removal"}`),
 		Inputs:    inputs,
 		CreatedAt: time.Now().Add(-age),
@@ -263,7 +263,7 @@ func TestS394_PostReadyzSeed_RemovalDuringResolve_NotResurrected_ReseededOnce(t 
 								if key == raKey {
 									inputs = raIn
 								}
-								handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
+								putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
 							}
 							cache.ResolvedCache().DeleteForTest(key)
 						}
@@ -355,8 +355,8 @@ func TestS394_BootSeed_LRUEvictionDuringResolve_StillPlainPuts(t *testing.T) {
 	widgetKey, raKey, handle, wIn, raIn := s394Keys(t)
 
 	lruEvict := func(key string, inputs *cache.ResolvedKeyInputs) {
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
-		handle.Put("s394-filler", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}) // cap 1 → evicts key
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
+		putFixture(handle, "s394-filler", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}) // cap 1 → evicts key
 		if _, ok := handle.Get(key); ok {
 			t.Fatalf("PRECONDITION: the filler Put did not LRU-evict %q (RESOLVED_CACHE_MAX_ENTRIES not honoured?)", key)
 		}

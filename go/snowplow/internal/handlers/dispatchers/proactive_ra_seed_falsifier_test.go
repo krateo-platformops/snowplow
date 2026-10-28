@@ -101,7 +101,7 @@ func TestProactiveRASeed_F1_SeedServeHit(t *testing.T) {
 		t.Fatal("expected a live seed handle + key")
 	}
 	body := []byte(`{"status":{"items":[{"name":"comp-b-resource"}]}}`)
-	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
+	putFixture(seedHandle, seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
 
 	// SERVE side — the dispatcher's key for the same RA tuple (same identity).
 	serveKey, serveHandle, _ := dispatchCacheLookupKey(ctx, "restactions",

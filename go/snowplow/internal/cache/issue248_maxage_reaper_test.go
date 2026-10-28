@@ -31,7 +31,7 @@ func i248PutSuppressedOld(t *testing.T, store *ResolvedCacheStore, name string, 
 	inputs := widgetInputs(gvr, ns, name)
 	key := ComputeKey(*inputs)
 	born := time.Now().Add(-age)
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON:   []byte(`{"frozen":"` + name + `"}`),
 		Inputs:    inputs,
 		BornAt:    born,
@@ -110,7 +110,7 @@ func TestIssue248_MaxAgeReaper(t *testing.T) {
 	// isolation is ever needed again.
 	warmInputs := widgetInputs(gvrFlexes(), ns, "warmseed")
 	warmKey := ComputeKey(*warmInputs)
-	store.Put(warmKey, &ResolvedEntry{
+	store.put(warmKey, &ResolvedEntry{
 		RawJSON:      []byte(`{"warm":"seed"}`),
 		Inputs:       warmInputs,
 		BornAt:       time.Now().Add(-2 * time.Hour),

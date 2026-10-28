@@ -741,7 +741,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// stage is NOT executed. It gets an explicit per-stage error and returns
 	// before any egress (no informer, no internal rest config, no discovery,
 	// no external fetch), so a draft can never mutate anything.
-	if verb := ptr.Deref(call.Verb, http.MethodGet); cache.Inert(gctx) && verb != http.MethodGet {
+	// #903 F7 — the one write classifier (isWriteVerb / isSafeMethod).
+	if verb := ptr.Deref(call.Verb, http.MethodGet); cache.Inert(gctx) && isWriteVerb(call.Verb) {
 		// Stable contract (#443): reason "StageNotExecuted" is the machine
 		// field; the message keeps its stable prefix/suffix.
 		msg := fmt.Sprintf("dry-run: stage %q verb %s is not executed", id, verb)
@@ -751,6 +752,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey,
 			map[string]any{"reason": StageReasonNotExecuted, "message": msg}, msg, itemErr)
+		return nil
+	}
+	// #903 — background work never writes: a write stage is sent only on a
+	// customer's own request, whatever credential it uses (background_write.go).
+	// Before any egress, like the dry-run refusal above.
+	if r.refuseBackgroundWrite(gctx, sc, i) {
 		return nil
 	}
 	// Ship 0.30.121 R1-a — per-call verbose decision. `sc.ep` is shared
@@ -1771,6 +1778,13 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		local.Headers = hdrs
 		apiCall = &local
 	}
+	// #903 egress — a non-customer resolve that calls snowplow ITSELF (the HTTP
+	// self-loopback) tells the next hop, so that hop refuses write stages too
+	// (its ctx carries no background marker otherwise). Sent ONLY to snowplow's
+	// own host (parsedHostEqualsSelf, the self-loopback predicate); on every
+	// other egress the header is stripped, even when the RESTAction itself sets
+	// it, so it never reaches an external endpoint. Stage-local copy.
+	apiCall = withBackgroundHopHeader(apiCall, cache.NonCustomerWriteOrigin(r.ctx) != "", parsedHostEqualsSelf(ep.ServerURL))
 	// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
 	// is the single largest transient-memory consumer (~1.94 GiB
 	// alloc_space on the 50K bench: it stringifies every HTTP response
@@ -1998,6 +2012,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]any, *StageFailure) {
 	if len(opts.Items) == 0 {
 		return map[string]any{}, nil
+	}
+
+	// #903 (team-lead ruling, the generic form of "never store a resolve that
+	// stopped before its write") — a RESTAction that DECLARES a write stage is
+	// never stored, whether or not this resolve dialed the write (a zero-item
+	// write iterator, a truncated resolve, a write refused in the background).
+	// Stored, its cell would be "stale then replace" with a replace that never
+	// comes: every background re-resolve refuses the write, and a customer hit
+	// never runs it. The mark is an input of the shared Put-gate verdict
+	// (cache.PutGateVerdict → permanent, declared_write), which every Put site
+	// and every background mark site reads — the opt-in external-TTL widget Put
+	// (#915) included. Classified ONCE over the spec, before any exit (#912
+	// N2): a resolve that stops before running a stage (no client config, no
+	// identity, a dependsOn naming no stage or a cycle) is never stored either.
+	if declaredWriteStage(opts.Items) != "" {
+		cache.ExternalTouchedSinkFromContext(ctx).MarkDeclaredWrite()
 	}
 
 	if opts.RC == nil {

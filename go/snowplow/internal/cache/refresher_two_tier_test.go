@@ -75,7 +75,7 @@ func putAndKey(t *testing.T, class, name string) string {
 	}
 	key := ComputeKey(in)
 	in2 := in
-	c.Put(key, &ResolvedEntry{RawJSON: []byte("{}"), Inputs: &in2})
+	c.put(key, &ResolvedEntry{RawJSON: []byte("{}"), Inputs: &in2})
 	return key
 }
 

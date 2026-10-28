@@ -25,7 +25,7 @@ func TestIssue1127Obs_LifetimeSeconds_SurvivesARePut(t *testing.T) {
 	const key = "L1_obs-lifetime"
 
 	born := time.Now().Add(-90 * time.Minute)
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON:   []byte(`{}`),
 		Inputs:    &ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "lifetime-flex"},
 		CreatedAt: born,
@@ -33,7 +33,7 @@ func TestIssue1127Obs_LifetimeSeconds_SurvivesARePut(t *testing.T) {
 	})
 
 	// A refresh re-Put: a NEW body, so CreatedAt is now; BornAt is inherited.
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON: []byte(`{"refreshed":true}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "lifetime-flex"},
 	})
@@ -69,7 +69,7 @@ func TestIssue1127Obs_LifetimeSeconds_AppearsOnTheFullWalk(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	born := time.Now().Add(-45 * time.Minute)
-	store.Put("L1_walk-lifetime", &ResolvedEntry{
+	store.put("L1_walk-lifetime", &ResolvedEntry{
 		RawJSON:   []byte(`{}`),
 		Inputs:    &ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "walk-flex"},
 		CreatedAt: born,

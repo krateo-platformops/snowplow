@@ -91,3 +91,8 @@ jobs:
       # goes through entry.Raw() / entry.RawLen().
       - name: RawJSON readers are classified gate
         run: bash scripts/check_rawjson_readers.sh
+      # No compiled executable is tracked: a `go build` in scripts/<tool>/ once
+      # committed a 7 MB checker binary (#912). Content-based (ELF / Mach-O /
+      # PE magic), so a tracked shell script (mode 755) stays allowed.
+      - name: No tracked executable binaries gate
+        run: bash scripts/check_no_tracked_binaries.sh --self-test && bash scripts/check_no_tracked_binaries.sh

@@ -23,11 +23,12 @@
 //	                 come from that ONE source, so a DNS-name endpoint and an
 //	                 IP-literal config (kubernetes.default.svc vs 10.96.0.1,
 //	                 as on every real cluster) never disagree (#721 gate F2);
-//	               - the request writes: only a GET, or a POST creating an
-//	                 ACCESS REVIEW (the four authorization.k8s.io review
-//	                 resources, non-persistent queries that read no tenant
-//	                 data; a path with dot segments or %-encoding is never
-//	                 classified as one) is performed as the cohort.
+//	               - the request writes: only a GET is performed as the
+//	                 cohort. (#903 — the access-review POST carve-out is
+//	                 gone: background work never writes, whatever the
+//	                 endpoint, and dispatchOneCall refuses any write of a
+//	                 non-customer resolve before it reaches here. This check
+//	                 stays as the SA dial's own defense in depth.)
 //
 // ON EVERY SA-ENDPOINT DIAL (marker or not, UAF or not):
 //   - a stage's own Impersonate-* and Authorization headers are dropped: only
@@ -72,15 +73,6 @@ const (
 	branchEFailClosed                         // refuse before the dial
 )
 
-// accessReviewResources are the authorization.k8s.io resources whose create is
-// a non-persistent review query that reads no tenant data.
-var accessReviewResources = map[string]bool{
-	"subjectaccessreviews":      true,
-	"selfsubjectaccessreviews":  true,
-	"localsubjectaccessreviews": true,
-	"selfsubjectrulesreviews":   true,
-}
-
 // branchEDecide decides the identity of a non-UAF SA-endpoint dial at branch E
 // under gctx. On branchEFailClosed, reason says why (identity-free).
 func branchEDecide(gctx context.Context, call httpcall.RequestOptions) (imp rest.ImpersonationConfig, d branchEDecision, reason string) {
@@ -96,7 +88,7 @@ func branchEDecide(gctx context.Context, call httpcall.RequestOptions) (imp rest
 		return rest.ImpersonationConfig{}, branchEFailClosed, "the endpoint is not the in-cluster apiserver endpoint"
 	}
 	verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
-	if verb != http.MethodGet && !(verb == http.MethodPost && isAccessReviewPath(call.Path)) {
+	if verb != http.MethodGet {
 		return rest.ImpersonationConfig{}, branchEFailClosed, "a background refresh never performs a " + verb + " as the cohort"
 	}
 	return rc.Impersonate, branchEImpersonate, ""
@@ -112,23 +104,6 @@ func dialsInternalEndpoint(gctx context.Context, call httpcall.RequestOptions) b
 		return false
 	}
 	return call.Endpoint.ServerURL == ie.ServerURL
-}
-
-// isAccessReviewPath reports whether path creates one of the access-review
-// resources. A path with a dot segment, %-encoding, a backslash or a query is
-// never one: it could resolve to a different resource on the server than the
-// one classified here (#721 gate hardening).
-func isAccessReviewPath(path string) bool {
-	if strings.ContainsAny(path, `%\?#`) {
-		return false
-	}
-	for _, seg := range strings.Split(path, "/") {
-		if seg == "." || seg == ".." {
-			return false
-		}
-	}
-	gvr, _, name, ok := cache.ParseAPIServerPathToDep(path)
-	return ok && name == "" && gvr.Group == "authorization.k8s.io" && accessReviewResources[gvr.Resource]
 }
 
 // isSADialControlledHeader reports whether a stage-supplied header names the

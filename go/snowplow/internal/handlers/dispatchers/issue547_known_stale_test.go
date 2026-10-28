@@ -1096,7 +1096,7 @@ func TestIssue547_F7_KnownStaleSharedShellIsServedAndRevalidatedInTheBackground(
 	shell.Object["status"] = map[string]any{"widgetData": map[string]any{"conditions": []any{
 		map[string]any{"type": "Ready", "status": "True", "reason": "v0"}}}}
 	raw, _ := json.Marshal(shell.Object)
-	handle.Put(contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
+	putFixture(handle, contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
 	cache.Deps().Record(context.Background(), contentKey, k547CompGVR, k547CompNS, fmt.Sprintf("comp-%d", k547Changed))
 	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
 		t.Fatalf("PRECONDITION: the shared shell must serve before the UPDATE (code=%d reason=%q)", code, r)
@@ -1336,7 +1336,7 @@ func TestIssue547_F8_AFreshAcceptedPutByAnyCarrierEndsKnownStale(t *testing.T) {
 	t0, _, _ := cache.KnownStale(key)
 	d0 := k547Stat("dirty_ended_unfresh_dropped")
 	pre := cache.WithL1KeyContextFromEpoch(context.Background(), key, epochBefore)
-	store.PutThenRemark(pre, key, &cache.ResolvedEntry{RawJSON: e.RawJSON, Inputs: e.Inputs})
+	store.PutResolvedThenRemark(pre, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: e.RawJSON, Inputs: e.Inputs})
 	if _, _, ks := cache.KnownStale(key); ks {
 		t.Fatalf("F8 (#884): a Put whose resolve began BEFORE the mark did not end the known-stale state")
 	}
@@ -1365,7 +1365,7 @@ func TestIssue547_F8_AFreshAcceptedPutByAnyCarrierEndsKnownStale(t *testing.T) {
 		map[string]any{"type": "Ready", "status": "True", "reason": "v1"}}}}
 	fresh, _ := json.Marshal(obj)
 	post := cache.WithL1KeyContext(context.Background(), key)
-	store.PutThenRemark(post, key, &cache.ResolvedEntry{RawJSON: fresh, Inputs: e.Inputs})
+	store.PutResolvedThenRemark(post, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: fresh, Inputs: e.Inputs})
 
 	ks0, _ := k547KnownStaleServed()
 	c0 := h.custCalls.Load()
@@ -1531,7 +1531,7 @@ func TestIssue547_F12_PermanentSuppressionSkipsTheShellBackgroundRevalidation(t 
 	shell.Object["status"] = map[string]any{"widgetData": map[string]any{"conditions": []any{
 		map[string]any{"type": "Ready", "status": "True", "reason": "v0"}}}}
 	raw, _ := json.Marshal(shell.Object)
-	handle.Put(contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
+	putFixture(handle, contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
 	cache.Deps().Record(context.Background(), contentKey, k547CompGVR, k547CompNS, fmt.Sprintf("comp-%d", k547Changed))
 
 	d0 := k547Stat("dirty_ended_unfresh_dropped")

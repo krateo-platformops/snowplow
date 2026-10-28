@@ -276,7 +276,7 @@ func TestIssue548_Widgets_NoDeclineBranchArms(t *testing.T) {
 			user: h1User,
 			during: func(t *testing.T, _ context.Context, key string) {
 				c := cache.ResolvedCache()
-				c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+				c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 				c.DeleteForTest(key)
 			},
 		},
@@ -535,7 +535,7 @@ func TestIssue548_RESTActions_NoDeclineBranchArms(t *testing.T) {
 			user: h1User,
 			during: func(t *testing.T, _ context.Context, key string) {
 				c := cache.ResolvedCache()
-				c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+				c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 				c.DeleteForTest(key)
 			},
 		},
@@ -744,7 +744,7 @@ func TestIssue548_L1Hit_StillArms(t *testing.T) {
 			t.Fatalf("PRECONDITION: live widgets key/handle expected")
 		}
 		warm := []byte(`{"warm":"widget-cell"}` + "\n")
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
 
 		restore := installWidgetFakes(t, cr, func() bool { return true },
 			func(context.Context, widgets.ResolveOptions) (*widgets.Widget, error) {
@@ -770,7 +770,7 @@ func TestIssue548_L1Hit_StillArms(t *testing.T) {
 			t.Fatalf("PRECONDITION: live restactions key/handle expected")
 		}
 		warm := []byte(`{"warm":"ra-cell"}` + "\n")
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
 
 		restore := installRAFakes(t, h1RAUnstructured(), func() bool { return true },
 			func(context.Context, restactions.ResolveOptions) (*templatesv1.RESTAction, error) {

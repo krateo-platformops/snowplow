@@ -37,7 +37,7 @@ func setupBench890(b testing.TB, others, deps int) (*ResolvedCacheStore, context
 	for i := 0; i < others; i++ {
 		k := fmt.Sprintf("L1_other_%d", i)
 		d.RecordList(bg, k, gvr, "")
-		store.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`)})
+		store.put(k, &ResolvedEntry{RawJSON: []byte(`{}`)})
 	}
 	const key = "L1_bench_K"
 	ctx := WithL1KeyContext(bg, key)
@@ -78,7 +78,7 @@ func BenchmarkIssue890_AcceptedPut(b *testing.B) {
 							nss[j], names[j] = fmt.Sprintf("ns-%d", j%20), fmt.Sprintf("comp-%d", j)
 						}
 						e := &ResolvedEntry{RawJSON: []byte(`{"v":1}`)}
-						if !store.PutIfGen(ctx, key, e, store.CaptureGen(key)) {
+						if !store.putIfGen(ctx, key, e, store.CaptureGen(key)) {
 							b.Fatal("refused")
 						}
 						b.ReportAllocs()
@@ -92,7 +92,7 @@ func BenchmarkIssue890_AcceptedPut(b *testing.B) {
 									d.Record(c, key, gvr, nss[j], names[j])
 								}
 							}
-							if !store.PutIfGen(c, key, e, store.CaptureGen(key)) {
+							if !store.putIfGen(c, key, e, store.CaptureGen(key)) {
 								b.Fatal("refused")
 							}
 						}
@@ -115,7 +115,7 @@ func BenchmarkIssue890_UnrelatedReadUnderPuts(b *testing.B) {
 					defer reassertAlwaysCheckForBench.Store(false)
 					store, ctx, key := setupBench890(b, others, deps)
 					defer ResetDepsForTest()
-					store.Put("L1_customer", &ResolvedEntry{RawJSON: []byte(`{}`)})
+					store.put("L1_customer", &ResolvedEntry{RawJSON: []byte(`{}`)})
 					var lat []time.Duration
 					for i := 0; i < b.N; i++ {
 						var stop atomic.Bool
@@ -125,7 +125,7 @@ func BenchmarkIssue890_UnrelatedReadUnderPuts(b *testing.B) {
 							defer wg.Done()
 							e := &ResolvedEntry{RawJSON: []byte(`{"v":1}`)}
 							for !stop.Load() {
-								store.PutIfGen(ctx, key, e, store.CaptureGen(key))
+								store.putIfGen(ctx, key, e, store.CaptureGen(key))
 							}
 						}()
 						deadline := time.Now().Add(300 * time.Millisecond)
