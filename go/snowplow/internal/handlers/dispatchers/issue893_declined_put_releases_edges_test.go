@@ -40,7 +40,7 @@ func TestIssue893_DeclinedCallLeavesNoEdgesForItsKey(t *testing.T) {
 		}},
 		{name: "putifgen_refused", during: func(_ context.Context, key string) {
 			c := cache.ResolvedCache()
-			c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+			c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 			c.DeleteForTest(key)
 		}},
 	}

@@ -116,7 +116,7 @@ func (f i507Fixture) coldResidentUnseeded(t *testing.T, bodyAge time.Duration) t
 	if !ok {
 		t.Fatal("SETUP: the boot-seed insert left no resident cell")
 	}
-	if !f.store.ReplaceIfGen(context.Background(), f.key,
+	if !f.store.ReplaceResolvedIfGen(context.Background(), fixtureStoreVerdict, f.key,
 		&cache.ResolvedEntry{RawJSON: []byte(`{"refreshed":1}`), Inputs: f.inputs, CreatedAt: time.Now().Add(-bodyAge)},
 		f.store.CaptureGen(f.key)) {
 		t.Fatal("SETUP: the refresher re-Put must be ACCEPTED on a live cell")
@@ -397,7 +397,7 @@ func TestIssue507_TheColdCellStaysReclaimableAfterTheSweep(t *testing.T) {
 		if time.Since(born) >= windowStart {
 			break
 		}
-		if !f.store.ReplaceIfGen(context.Background(), f.key,
+		if !f.store.ReplaceResolvedIfGen(context.Background(), fixtureStoreVerdict, f.key,
 			&cache.ResolvedEntry{RawJSON: []byte(`{"refreshed":1}`), Inputs: f.inputs, CreatedAt: time.Now().Add(-ttl / 2)},
 			f.store.CaptureGen(f.key)) {
 			t.Fatalf("SETUP: the keep-resident refresh was refused at BornAt age %v", time.Since(born))
@@ -408,7 +408,7 @@ func TestIssue507_TheColdCellStaysReclaimableAfterTheSweep(t *testing.T) {
 	// pass1 — the gate REFUSES the cold cell. This is #496 working, and it is what
 	// makes the post-sweep comparison meaningful.
 	refused0 := f.store.Stats().RemintRefusedColdTotal
-	if !f.store.ReplaceIfGenRefresh(context.Background(), f.key,
+	if !f.store.ReplaceResolvedIfGenRefresh(context.Background(), fixtureStoreVerdict, f.key,
 		&cache.ResolvedEntry{RawJSON: []byte(`{"pass1":1}`), Inputs: f.inputs, CreatedAt: time.Now().Add(-ttl / 2)},
 		f.store.CaptureGen(f.key)) {
 		t.Fatal("SETUP: the refresh WRITE must be accepted on a live cell — only the re-mint is gated")
@@ -440,7 +440,7 @@ func TestIssue507_TheColdCellStaysReclaimableAfterTheSweep(t *testing.T) {
 
 	// pass2 — the same refresh on the same cell. It must still be refused.
 	i507MustBeInWindow(t, born, windowStart, maxAge, "before pass2")
-	if !f.store.ReplaceIfGenRefresh(context.Background(), f.key,
+	if !f.store.ReplaceResolvedIfGenRefresh(context.Background(), fixtureStoreVerdict, f.key,
 		&cache.ResolvedEntry{RawJSON: []byte(`{"pass2":1}`), Inputs: f.inputs, CreatedAt: time.Now().Add(-ttl / 2)},
 		f.store.CaptureGen(f.key)) {
 		t.Fatal("SETUP: the pass2 refresh WRITE must be accepted on a live cell")

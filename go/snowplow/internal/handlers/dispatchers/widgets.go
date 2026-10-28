@@ -534,7 +534,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 				slog.Int64("external_touches", extTouchedSink.Count()),
 				slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
 			)
-		default: // cache.PutReasonStageError
+		case cache.PutReasonStageError:
 			// #681 — a denial-only envelope is cached below (twin of restactions.go).
 			// A bare decline, twin of restactions.go: the partial envelope is
 			// SERVED (written below) and not persisted. 1.12.6 C9 retired the D
@@ -542,6 +542,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			log.Warn("Widget served with per-item stage error(s); declining to cache the partial result",
 				slog.Int64("stage_errors", stageErrSink.Count()),
 				slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+			)
+		default:
+			// Any other decline: today only cache.PutReasonUnobserved, a verdict
+			// over Put-gate sinks that were not all installed on the resolve. It
+			// admits nothing (#912 delta-3 item 3); never read as another reason.
+			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+				slog.String("reason", string(verdict.Reason())),
+				slog.String("effect", "body served; not persisted"),
 			)
 		}
 	} else if verdict.ExternalTTL() && cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {

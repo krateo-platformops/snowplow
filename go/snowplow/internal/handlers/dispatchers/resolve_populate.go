@@ -494,7 +494,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 				slog.Int64("external_touches", extTouchedSink.Count()),
 				slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
 			)
-		default: // cache.PutReasonStageError
+		case cache.PutReasonStageError:
 			// #301 observability: surface the FIRST failing stage's name + err
 			// inline so a decline can be attributed without a cross-grep
 			// against the resolver's error lines (which cost two traces).
@@ -532,6 +532,14 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 					"on the next read under the requester, re-enqueued by the next change (#547)"),
 			)
 			cache.BumpRefresherSkippedStageError()
+		default:
+			// Any other decline: today only cache.PutReasonUnobserved, a verdict
+			// over Put-gate sinks that were not all installed on the resolve. It
+			// admits nothing (#912 delta-3 item 3); never read as another reason.
+			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+				slog.String("reason", string(verdict.Reason())),
+				slog.String("effect", "body served; not persisted"),
+			)
 		}
 		return nil
 	}

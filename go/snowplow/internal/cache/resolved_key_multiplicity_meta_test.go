@@ -47,7 +47,7 @@ func putInputs(t *testing.T, c *ResolvedCacheStore, in ResolvedKeyInputs, body s
 	t.Helper()
 	inputs := in
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &inputs})
 	return key
 }
 
@@ -166,7 +166,7 @@ func TestResolvedMeta_ExtrasHashTracksReplaceInPlace(t *testing.T) {
 	key := ComputeKey(in)
 
 	first := in
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &first})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &first})
 	before := metaByKey(t, c)[key].ExtrasHash
 	if before == "" || before == "e0" {
 		t.Fatalf("precondition: expected a real extras hash on the first Put, got %q", before)
@@ -177,7 +177,7 @@ func TestResolvedMeta_ExtrasHashTracksReplaceInPlace(t *testing.T) {
 	// follows the entry the item currently holds, whatever put it there.)
 	second := in
 	second.Extras = map[string]any{"compositionId": "comp-REPLACED"}
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":2}`), Inputs: &second})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":2}`), Inputs: &second})
 
 	after := metaByKey(t, c)[key]
 	if after.ExtrasHash == before {
@@ -298,7 +298,7 @@ func TestResolvedMeta_SubGenZeroIsReadableOnlyWithClass(t *testing.T) {
 func TestResolvedMeta_NoInputsProjectsEmptyNotSentinel(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
-	c.Put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
+	c.put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
 
 	emptyExtras := oneLogicalCell()
 	emptyExtras.Extras = nil
@@ -322,7 +322,7 @@ func TestResolvedMeta_NoInputsProjectsEmptyNotSentinel(t *testing.T) {
 func TestResolvedMeta_NilInputsZerosAreDiscriminatedByClass(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
-	c.Put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
+	c.put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
 
 	// A genuine raFullList fold: page-independent 0/0, WITH an Inputs record.
 	raFull := oneLogicalCell()
@@ -465,7 +465,7 @@ func TestResolvedMeta_ExtrasHashRaceUnderConcurrentPutAndWalk(t *testing.T) {
 
 	// Seed every key so readers always find rows.
 	for k := 0; k < nKeys; k++ {
-		c.Put(keys[k], entryForVariant(k, 0, -1, -1))
+		c.put(keys[k], entryForVariant(k, 0, -1, -1))
 	}
 
 	keyIndex := map[string]int{}
@@ -523,7 +523,7 @@ func TestResolvedMeta_ExtrasHashRaceUnderConcurrentPutAndWalk(t *testing.T) {
 			defer wg.Done()
 			for r := 0; r < nRounds; r++ {
 				for k := 0; k < nKeys; k++ {
-					c.Put(keys[k], entryForVariant(k, (w+r)%nVariants, w, r))
+					c.put(keys[k], entryForVariant(k, (w+r)%nVariants, w, r))
 				}
 			}
 		}(w)

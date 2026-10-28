@@ -71,7 +71,7 @@ func TestPhase1WalkContent_S323_PostReadyz_ResolveRacingDelete_RefusedNotResurre
 		// so the tail populateWidgetContentL1 PutIfGen refuses.
 		wcKey := cache.L1KeyFromContext(ctx)
 		wcKeyV.Store(wcKey)
-		store.Put(wcKey, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+		store.PutResolved(fixtureStoreVerdict, wcKey, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 		store.DeleteForTest(wcKey)
 		// NON-RBAC-sensitive page envelope so the tail Put site is reached;
 		// continue=false halts the loop after this page.

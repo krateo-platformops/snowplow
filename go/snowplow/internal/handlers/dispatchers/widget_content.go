@@ -111,6 +111,8 @@ func widgetContentL1Key(gvr schema.GroupVersionResource, namespace, name string,
 //
 //   - StageErrorSink (Ship 0.30.257 #313 Cache-A) — a per-item iterator hard
 //     error left a partial-with-errors shell; do not seed it.
+//   - PerIdentityForbiddenSink (#681) — the third Put-gate verdict input; it
+//     tells an own-credential apiserver 403 from a genuine external touch.
 //   - ExternalTouchedSink (external-no-cache, 2026-06-22) — the resolve touched
 //     a genuine external endpoint, which no informer/dep edge can invalidate.
 //   - UAFTouchedSink (1.12.3 A-1/R-1) — the resolve ran a userAccessFilter
@@ -131,6 +133,11 @@ func widgetContentL1Key(gvr schema.GroupVersionResource, namespace, name string,
 // populateWidgetContentL1 means adding its sink HERE.
 func withWidgetContentPutSinks(ctx context.Context) context.Context {
 	ctx, _ = cache.WithStageErrorSink(ctx)
+	// #912 delta-3 item 3 — the Put-gate verdict needs all three of its sinks
+	// (a missing one reads as "unobserved" and admits nothing). The forbidden
+	// sink also makes #681 C2 hold on the walk: an own-credential apiserver 403
+	// is not a genuine external touch at the content Put and the walk mark.
+	ctx, _ = cache.WithPerIdentityForbiddenSink(ctx)
 	ctx, _ = cache.WithExternalTouchedSink(ctx)
 	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
 	ctx, _ = cache.WithUAFTouchedSink(ctx)
@@ -299,10 +306,10 @@ func populateWidgetContentL1(
 	// and served (gated per-user) for the TTL. Symmetric with the refresher
 	// Put-gate (resolve_populate.go:242), the request-path RESTAction/widget
 	// gates (restactions.go / widgets.go), and the 0.30.254 "never cache an
-	// under-served result" posture. sink==nil (no sink threaded on this ctx
-	// — e.g. a caller that did not install one) is nil-receiver-safe
-	// (Count()==0) and Puts as before; recordWidgetDeps is ALSO skipped on
-	// the declined path — there is no entry to dep-track.
+	// under-served result" posture. A caller that did not install every
+	// Put-gate sink (withWidgetContentPutSinks) gets the "unobserved" verdict,
+	// which admits nothing (#912 delta-3 item 3); recordWidgetDeps is ALSO
+	// skipped on the declined path — there is no entry to dep-track.
 	// The shared Put-gate verdict (cache.PutGateVerdict) over the walk's resolve
 	// sinks. widgetContent is identity-free, so no stage error is denial-only.
 	verdict := cache.PutGateVerdict(cache.PutGateSinksFromContext(ctx), cache.CacheEntryClassWidgetContent)
@@ -341,7 +348,7 @@ func populateWidgetContentL1(
 				slog.Int64("external_touches", extSink.Count()),
 				slog.String("reason", "apiRef RESTAction touched an external endpoint — no dep edge to invalidate; not seeding identity-free cell, served live per /call"),
 			)
-		default: // cache.PutReasonStageError
+		case cache.PutReasonStageError:
 			sink := cache.StageErrorSinkFromContext(ctx)
 			log.Debug("widget_content.populate.skip_stage_error",
 				slog.String("subsystem", "cache"),
@@ -352,6 +359,14 @@ func populateWidgetContentL1(
 				slog.Int("page", page),
 				slog.Int64("stage_errors", sink.Count()),
 				slog.String("reason", "apiRef RESTAction resolved with per-item stage error(s) — partial-with-errors shell; not seeding identity-free cell (Cache-A)"),
+			)
+		default:
+			// Any other decline: today only cache.PutReasonUnobserved, a verdict
+			// over Put-gate sinks that were not all installed on the resolve. It
+			// admits nothing (#912 delta-3 item 3); never read as another reason.
+			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+				slog.String("reason", string(verdict.Reason())),
+				slog.String("effect", "body served; not persisted"),
 			)
 		}
 		return

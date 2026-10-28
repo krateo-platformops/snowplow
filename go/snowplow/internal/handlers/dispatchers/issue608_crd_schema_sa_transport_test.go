@@ -517,7 +517,7 @@ func (e *f608Env) seedCell(t *testing.T, in cache.ResolvedKeyInputs) string {
 	t.Helper()
 	key := cache.ComputeKey(in)
 	cp := in
-	e.store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(f608StaleBody), Inputs: &cp})
+	e.store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(f608StaleBody), Inputs: &cp})
 	return key
 }
 

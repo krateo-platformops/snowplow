@@ -349,7 +349,7 @@ func (e *r378Env) fill(t *testing.T) {
 			t.Fatalf("FILL: no raKey for alice")
 		}
 		k := cache.ComputeKey(seedIn)
-		c.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), k, seedIn, map[string]any{"items": []any{map[string]any{"n": i, "phase": "fill"}}})
+		c.PutRAFullList(fixtureStoreVerdict, k, seedIn, map[string]any{"items": []any{map[string]any{"n": i, "phase": "fill"}}})
 		cache.RecordSliceability(k, cache.SliceShapeHash("apiref", h1RAGVR.Group, h1RAGVR.Version, h1RAGVR.Resource,
 			h1NS, r378RAFL, r378RAFLFilter), true)
 		cache.Deps().Record(context.Background(), k, h1RAGVR, h1NS, r378RAFL) // RA-CR self-dep (the producer records it)
@@ -359,7 +359,7 @@ func (e *r378Env) fill(t *testing.T) {
 		if err != nil {
 			t.Fatalf("FILL: %v", err)
 		}
-		populateWidgetContentL1(context.Background(), h1WidgetGVR, obj, -1, -1, e.widgetBody(obj), 0)
+		populateWidgetContentL1(withWidgetContentPutSinks(context.Background()), h1WidgetGVR, obj, -1, -1, e.widgetBody(obj), 0)
 	}
 	// Locate every cell by its stored inputs.
 	byClass := map[string]map[string]bool{}

@@ -120,7 +120,7 @@ func p3PutCell(t *testing.T, store *cache.ResolvedCacheStore, name, body string)
 		SubjectBindingSet:      rbac.SubjectBindingSetDigest("admin", []string{"admins"}),
 	}
 	key := cache.ComputeKey(in)
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(body), Inputs: &in})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(body), Inputs: &in})
 	cache.Deps().Record(context.Background(), key, p3GVR, p3NS, name)
 	return p3Cell{name: name, key: key, inputs: in}
 }

@@ -181,7 +181,7 @@ func expectedKey(t *testing.T, name string) string {
 // putSelfEntry stores a widgetContent self-representation for the panel under
 // key and records its self edge, so a DELETE of the panel evicts exactly it.
 func putSelfEntry(store *cache.ResolvedCacheStore, key, name string) {
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"kind":"panel"}`), Inputs: &cache.ResolvedKeyInputs{
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"kind":"panel"}`), Inputs: &cache.ResolvedKeyInputs{
 		CacheEntryClass: cache.CacheEntryClassWidgetContent,
 		Group:           panelGVR.Group, Version: panelGVR.Version, Resource: panelGVR.Resource,
 		Namespace: evictTestNS, Name: name,

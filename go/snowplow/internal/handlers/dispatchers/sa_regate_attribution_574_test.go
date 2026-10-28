@@ -397,7 +397,7 @@ func sar574Refresh(t *testing.T, ctx context.Context, srv *sar574Server, ns, nam
 	if store == nil {
 		t.Fatal("resolved cache disabled: the arm cannot observe the cell")
 	}
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &inputs})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &inputs})
 
 	ext0 := cache.ExternalSkippedPut()
 	se0 := cache.RefresherSkippedStageError()

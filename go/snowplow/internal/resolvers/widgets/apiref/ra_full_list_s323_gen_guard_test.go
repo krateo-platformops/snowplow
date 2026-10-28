@@ -49,7 +49,7 @@ func TestRAServe_S323_ResolveRacingDelete_RefusedNotResurrected(t *testing.T) {
 	// the captured value.
 	resolve := func(rctx context.Context, perPage, page int) (map[string]any, error) {
 		full, err := base(rctx, perPage, page)
-		store.Put(raKey, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+		store.PutResolved(fixtureStoreVerdict, raKey, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 		store.DeleteForTest(raKey)
 		return full, err
 	}

@@ -20,13 +20,13 @@ type refusal890 struct {
 
 var refusals890 = []refusal890{
 	{"PutIfGen", func(c *ResolvedCacheStore, k string, e *ResolvedEntry, g uint64) bool {
-		return c.PutIfGen(context.Background(), k, e, g)
+		return c.putIfGen(context.Background(), k, e, g)
 	}},
 	{"ReplaceIfGen", func(c *ResolvedCacheStore, k string, e *ResolvedEntry, g uint64) bool {
-		return c.ReplaceIfGen(context.Background(), k, e, g)
+		return c.replaceIfGen(context.Background(), k, e, g)
 	}},
 	{"ReplaceIfGenRefresh", func(c *ResolvedCacheStore, k string, e *ResolvedEntry, g uint64) bool {
-		return c.ReplaceIfGenRefresh(context.Background(), k, e, g)
+		return c.replaceIfGenRefresh(context.Background(), k, e, g)
 	}},
 }
 
@@ -67,7 +67,7 @@ func TestIssue890_RefusedPutOfAnEvictedCellLeavesNoEdges(t *testing.T) {
 
 			record883(t, d, k, dep)
 			resident := &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`)}
-			store.Put(k, resident)
+			store.put(k, resident)
 			gen := store.CaptureGen(k) // 1. the refresher resolve starts
 
 			if !store.EvictUnrefreshable(k, resident) { // 2. eviction
@@ -108,12 +108,12 @@ func TestIssue890_RefusalOfAResidentKeyKeepsItsEdges(t *testing.T) {
 			dep := DepKey{GVR: gvr883Calm, Namespace: "ns-890", Name: "res"}
 			record883(t, d, k, dep)
 			first := &ResolvedEntry{RawJSON: []byte(`{}`)}
-			store.Put(k, first)
+			store.put(k, first)
 			stale := store.CaptureGen(k)
 			store.EvictUnrefreshable(k, first)
 			fresh := store.CaptureGen(k)
 			record883(t, d, k, dep)
-			if !store.PutIfGen(context.Background(), k, &ResolvedEntry{RawJSON: []byte(`{"n":1}`)}, fresh) {
+			if !store.putIfGen(context.Background(), k, &ResolvedEntry{RawJSON: []byte(`{"n":1}`)}, fresh) {
 				t.Fatal("harness: the newer write must be stored")
 			}
 			if r.put(store, k, &ResolvedEntry{RawJSON: []byte(`{"n":0}`)}, stale) {

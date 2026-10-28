@@ -95,7 +95,7 @@ func TestIssue884_F1_AnAcceptedPutEndsKnownStaleEvenWhenANewerMarkLanded(t *test
 		t.Fatalf("PRECONDITION: the later mark is not newer than the resolve's start")
 	}
 
-	if !c.PutIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, gen) {
+	if !c.putIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, gen) {
 		t.Fatalf("PRECONDITION: the revalidation's Put was refused")
 	}
 
@@ -168,7 +168,7 @@ func TestIssue884_F1b_ARemarkedDemandPutStillSettlesTheRevalidation(t *testing.T
 	r.markDirty(key, time.Now())                 // and dirty-marks the cell
 
 	moved0 := Deps().movedRemarkGuardedTotal.Load()
-	if !c.PutIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, gen) {
+	if !c.putIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, gen) {
 		t.Fatalf("PRECONDITION: the revalidation's Put was refused")
 	}
 	if Deps().movedRemarkGuardedTotal.Load() != moved0+1 {
@@ -218,7 +218,7 @@ func TestIssue884_F1c_AnAcceptedDemandPutNeverRerunsAfterAConcurrentDecline(t *t
 	}
 	dctx, settle := BeginDemandRevalidation(context.Background(), key, t0)
 	rctx := WithL1KeyContext(dctx, key)
-	if !c.PutIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, c.CaptureGen(key)) {
+	if !c.putIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, c.CaptureGen(key)) {
 		t.Fatalf("PRECONDITION: the demand Put was refused")
 	}
 	if _, _, ks := KnownStale(key); ks {
@@ -262,7 +262,7 @@ func TestIssue884_F2_ARemarkedAcceptedRefreshEndsKnownStaleAtTheSettle(t *testin
 	// nothing) and the guard remarks it fail-fresh. The refresh still succeeded.
 	octx, o := withRefreshOutcome(context.Background(), key)
 	gen := c.CaptureGen(key)
-	stored := c.ReplaceIfGenRefresh(octx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, gen)
+	stored := c.replaceIfGenRefresh(octx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, gen)
 	NoteRefreshWrite(octx, key, stored)
 	if !stored || !o.accepted.Load() || !o.remarked.Load() {
 		t.Fatalf("PRECONDITION: want an accepted, remarked write (stored=%v accepted=%v remarked=%v)",
@@ -301,7 +301,7 @@ func TestIssue884_F3_AFailedRefreshStillKeepsTheCellKnownStale(t *testing.T) {
 	}
 
 	// (b) a Put with no dep-gen sink ends nothing (it proves nothing).
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"plain"}`), Inputs: mustInputs(t, c, key)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"plain"}`), Inputs: mustInputs(t, c, key)})
 	if _, _, ks := KnownStale(key); !ks {
 		t.Fatalf("F3b: a plain Put with no #375 sink ended the known-stale state")
 	}
@@ -325,7 +325,7 @@ func TestIssue884_F3_AFailedRefreshStillKeepsTheCellKnownStale(t *testing.T) {
 	rctx := WithL1KeyContext(context.Background(), key)
 	depEventSeq.Add(1)
 	r.markDirty(key, time.Now())
-	if !c.PutIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, c.CaptureGen(key)) {
+	if !c.putIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, c.CaptureGen(key)) {
 		t.Fatalf("PRECONDITION: Put refused")
 	}
 	if _, _, ks := KnownStale(key); ks {

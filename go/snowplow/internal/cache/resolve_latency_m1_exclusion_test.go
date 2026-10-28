@@ -58,7 +58,7 @@ func TestIssue386_M1_ExcludesSkipNoHandlerAndFloor(t *testing.T) {
 	// Forget+AddAfter+flooredTotal++ and returns BEFORE processOne/fn().
 	flInputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "fl"}
 	flKey := ComputeKey(flInputs)
-	c.Put(flKey, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &flInputs})
+	c.put(flKey, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &flInputs})
 	// A handler exists for the class so ONLY the floor (not no-handler) can
 	// explain an unmoved p95 on this arm.
 	var floored int
@@ -122,7 +122,7 @@ func TestIssue386_M1_ExcludesPark(t *testing.T) {
 
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "parked"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	// processNext yields (parks ~200ms) THEN resolves (~10ms). We time the whole
 	// call to confirm the park really happened, but assert the RECORDED p95 is the

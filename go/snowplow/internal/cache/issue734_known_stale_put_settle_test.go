@@ -72,7 +72,7 @@ func k734KnownStaleCell(t *testing.T) (c *ResolvedCacheStore, key string, ok *at
 		if fn := during.Load(); fn != nil {
 			(*fn)()
 		}
-		stored := c.ReplaceIfGenRefresh(rctx, k, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &in}, gen)
+		stored := c.replaceIfGenRefresh(rctx, k, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &in}, gen)
 		NoteRefreshWrite(rctx, k, stored)
 		// Still inside the dequeue: processNext has not settled the window.
 		served0 := ResolvedCacheStatsByStat()["known_stale_served_dropped_total"]
@@ -232,7 +232,7 @@ func TestIssue734_K4_ExternalTTLPlainPutEndsKnownStaleInTheWritesCriticalSection
 	const rounds = 2000
 	torn := 0
 	for i := 0; i < rounds; i++ {
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"old"}`), Inputs: &inputs})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"old"}`), Inputs: &inputs})
 		r.dirty.Store(key, &dirtyStamp{t0: time.Now(), stale: knownStaleDropped, seq: depEventSeq.Load()})
 		ctx := WithL1KeyContext(context.Background(), key) // the resolve began after the mark
 		saw := make(chan bool, 1)
@@ -253,7 +253,7 @@ func TestIssue734_K4_ExternalTTLPlainPutEndsKnownStaleInTheWritesCriticalSection
 			}
 		}()
 		<-spinning
-		c.PutEndingKnownStale(ctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &inputs})
+		c.putEndingKnownStale(ctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &inputs})
 		if <-saw {
 			torn++
 		}

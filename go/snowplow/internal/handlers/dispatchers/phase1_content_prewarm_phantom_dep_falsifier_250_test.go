@@ -556,7 +556,7 @@ func TestPrewarm250_ControlA_SelfCoverageInvariantFires(t *testing.T) {
 	store := cache.ResolvedCache()
 
 	const kE = "L1_control_A_content_cell"
-	store.PutIfGen(context.Background(), kE, &cache.ResolvedEntry{RawJSON: []byte("{}")}, store.CaptureGen(kE))
+	store.PutResolvedIfGen(context.Background(), fixtureStoreVerdict, kE, &cache.ResolvedEntry{RawJSON: []byte("{}")}, store.CaptureGen(kE))
 	cache.Deps().RecordList(context.Background(), l433, w250GVR, w250NS) // edge anchored at l433, which has NO entry
 
 	bad := phantomAnchors250(store)
@@ -593,7 +593,7 @@ func TestPrewarm250_ControlB_Put433AndDifferentialFire(t *testing.T) {
 	l433 := l250Key()
 	store := cache.ResolvedCache()
 
-	store.PutIfGen(context.Background(), l433, &cache.ResolvedEntry{RawJSON: []byte("{}")}, store.CaptureGen(l433))
+	store.PutResolvedIfGen(context.Background(), fixtureStoreVerdict, l433, &cache.ResolvedEntry{RawJSON: []byte("{}")}, store.CaptureGen(l433))
 	cache.Deps().RecordList(context.Background(), l433, w250GVR, w250NS)
 
 	if !put250Keys(store)[l433] {

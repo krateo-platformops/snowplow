@@ -81,9 +81,9 @@ func TestIssue354_P3_F6f_B3KeyShapeGaugesCountWarmCellsOnly(t *testing.T) {
 		if !warm {
 			// COLD: the fill was read two TTLs ago (a cold fill stamps lastRead at
 			// its CreatedAt) and the refresh re-Put below inherits that lastRead.
-			c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-2 * c.ttl)})
+			c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-2 * c.ttl)})
 		}
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		if warm {
 			if _, ok := c.Get(key); !ok { // a customer read stamps lastRead: WARM
 				t.Fatalf("PRE: Put cell not resident")

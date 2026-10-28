@@ -40,14 +40,14 @@ func TestIssue408_MovedRemarkTotalReachesOTLP(t *testing.T) {
 	}
 
 	for _, k := range []string{"m408-boot-a", "m408-boot-b"} {
-		store.PutThenRemark(moved(k), k, &cache.ResolvedEntry{RawJSON: []byte(`{}`)})
+		store.PutResolvedThenRemark(moved(k), fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(`{}`)})
 	}
-	if !store.PutIfGen(moved("m408-guarded"), "m408-guarded", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen("m408-guarded")) {
+	if !store.PutResolvedIfGen(moved("m408-guarded"), fixtureStoreVerdict, "m408-guarded", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen("m408-guarded")) {
 		t.Fatalf("setup: guarded PutIfGen refused")
 	}
 	quiet := cache.WithL1KeyContext(context.Background(), "m408-quiet")
 	cache.Deps().Record(quiet, "m408-quiet", gvr, "ns", "m408-quiet")
-	if !store.PutIfGen(quiet, "m408-quiet", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen("m408-quiet")) {
+	if !store.PutResolvedIfGen(quiet, fixtureStoreVerdict, "m408-quiet", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen("m408-quiet")) {
 		t.Fatalf("setup: quiet PutIfGen refused")
 	}
 

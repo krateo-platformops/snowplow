@@ -219,7 +219,7 @@ func TestIssue1126_C4_F7_ApistageNotServableStaysResidentAtTheDropPoint(t *testi
 		Namespace: i187NS, Name: i187Name,
 	}
 	key := cache.ComputeKey(inputs)
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"kind":"Flex","metadata":{"name":"stale"}}`), Inputs: &inputs})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"kind":"Flex","metadata":{"name":"stale"}}`), Inputs: &inputs})
 	cache.Deps().Record(context.Background(), key, i187GVR(), i187NS, i187Name)
 
 	// Classification first: typed, and NOT a self-gone.

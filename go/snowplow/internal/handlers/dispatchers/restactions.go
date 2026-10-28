@@ -623,7 +623,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				slog.Int64("stage_errors", stageErrSink.Count()),
 				slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
 			)
-		default: // cache.PutReasonExternal
+		case cache.PutReasonExternal:
 			// External-no-cache (proposal 2026-06-22) — the resolve touched a
 			// genuine external endpoint (no informer/dep edge to invalidate it).
 			// #681 C2: an own-credential apiserver 403 is not one.
@@ -638,6 +638,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				slog.String("namespace", cr.Namespace),
 				slog.Int64("external_touches", extTouchedSink.Count()),
 				slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
+			)
+		default:
+			// Any other decline: today only cache.PutReasonUnobserved, a verdict
+			// over Put-gate sinks that were not all installed on the resolve. It
+			// admits nothing (#912 delta-3 item 3); never read as another reason.
+			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+				slog.String("reason", string(verdict.Reason())),
+				slog.String("effect", "body served; not persisted"),
 			)
 		}
 	} else if cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {

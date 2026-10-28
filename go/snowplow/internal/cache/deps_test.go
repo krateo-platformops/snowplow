@@ -118,7 +118,7 @@ func TestDeps_OnDelete_EvictsSelfRepresentation(t *testing.T) {
 
 	gvr := gvrCompositions()
 	// L1A's own object IS (gvr, bench-ns-01, app-1).
-	store.Put("L1A", &ResolvedEntry{
+	store.put("L1A", &ResolvedEntry{
 		RawJSON: []byte(`{"a":1}`),
 		Inputs:  inputsFor(gvr, "bench-ns-01", "app-1"),
 	})
@@ -150,7 +150,7 @@ func TestDeps_OnDelete_DirtyMarksDependentGet(t *testing.T) {
 	gvr := gvrCompositions()
 	// L1A's own object is (gvr, ns, "owner") — but it GET-depends on
 	// the SEPARATE object (gvr, ns, "dependency").
-	store.Put("L1A", &ResolvedEntry{
+	store.put("L1A", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs:  inputsFor(gvr, "ns", "owner"),
 	})
@@ -210,7 +210,7 @@ func TestDeps_OnUpdate_EnqueuesAndDoesNotEvict(t *testing.T) {
 	d.SetStore(store)
 
 	gvr := gvrCompositions()
-	store.Put("L1A", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	store.put("L1A", &ResolvedEntry{RawJSON: []byte(`{}`)})
 	d.Record(context.Background(), "L1A", gvr, "ns", "n")
 
 	var enqueued []string
@@ -414,7 +414,7 @@ func TestDeps_ConcurrentRecordAndDelete_RaceFree(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < N; i++ {
 			key := "L1_" + itoa(i)
-			store.Put(key, &ResolvedEntry{RawJSON: []byte("x")})
+			store.put(key, &ResolvedEntry{RawJSON: []byte("x")})
 			d.Record(context.Background(), key, gvr, "ns", "n_"+itoa(i%50))
 		}
 	}()
@@ -486,7 +486,7 @@ func TestRecordingInnerCallDep_ListScope(t *testing.T) {
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
 
-	store.Put("L1_admin_list", &ResolvedEntry{RawJSON: []byte(`{"items":[]}`)})
+	store.put("L1_admin_list", &ResolvedEntry{RawJSON: []byte(`{"items":[]}`)})
 
 	// Synthesise the resolver-side recording path for a list-form call:
 	//   path = /apis/composition.krateo.io/v1/namespaces/bench-ns-02/<resource>
@@ -542,11 +542,11 @@ func TestRecordingInnerCallDep_ExactObject(t *testing.T) {
 	rGVR := gvrCompositions()
 	// Widget A's own object is (rGVR, ns, "widget-a-owner") — it merely
 	// GET-depends on the composition object below.
-	store.Put("L1_widget_a", &ResolvedEntry{
+	store.put("L1_widget_a", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs:  inputsFor(rGVR, "bench-ns-02", "widget-a-owner"),
 	})
-	store.Put("L1_widget_b", &ResolvedEntry{
+	store.put("L1_widget_b", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs:  inputsFor(rGVR, "bench-ns-02", "widget-b-owner"),
 	})
@@ -602,7 +602,7 @@ func TestIteratorEmitsPerNamespaceEdges(t *testing.T) {
 	d.SetStore(store)
 
 	const adminL1 = "L1_admin_compositions"
-	store.Put(adminL1, &ResolvedEntry{RawJSON: []byte(`{}`)})
+	store.put(adminL1, &ResolvedEntry{RawJSON: []byte(`{}`)})
 
 	const N = 49
 	// gvr derived from the iterator path — single GVR across all 49 iterations.
@@ -672,7 +672,7 @@ func TestOnDelete_DirtyMarksViaListScope(t *testing.T) {
 
 	gvr := gvrCompositions()
 	const l1Key = "L1_admin_list_dirty"
-	store.Put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`)})
+	store.put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`)})
 	d.RecordList(context.Background(), l1Key, gvr, "bench-ns-02")
 
 	if got := d.evictDeleteTotal.Load(); got != 0 {
@@ -784,11 +784,11 @@ func TestDeps_OnResourceTypeRemoved_DirtyMarksListAndGetDeps(t *testing.T) {
 	d.SetStore(store)
 	gvr := gvrCompositions()
 
-	store.Put("L1_list", &ResolvedEntry{RawJSON: []byte(`{}`)})
-	store.Put("L1_get", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	store.put("L1_list", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	store.put("L1_get", &ResolvedEntry{RawJSON: []byte(`{}`)})
 	// A self-representation of the GVR — even THIS must be dirty-marked,
 	// not evicted: a CRD removal is never a single-object DELETE.
-	store.Put("L1_self", &ResolvedEntry{
+	store.put("L1_self", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs:  inputsFor(gvr, "ns", "self-obj"),
 	})

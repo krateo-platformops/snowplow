@@ -2003,7 +2003,7 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string, verdi
 			slog.String("effect", "seed re-resolve touched an external endpoint (no dep edge to invalidate); "+
 				"declining the Put — GTTL-1 backstop, uniform with the refresher"),
 		)
-	default: // cache.PutReasonStageError
+	case cache.PutReasonStageError:
 		pipSeedSkippedStageErrorTotal.Add(1)
 		// Back-compat parity with the refresher's process-wide counter so
 		// existing "how many degraded re-Puts were declined" dashboards see the
@@ -2021,6 +2021,14 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string, verdi
 			slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
 			slog.String("effect", "seed re-resolve observed a swallowed stage error; declining the Put "+
 				"(keeps any prior good entry; TTL is the outer net) — GTTL-1 backstop, uniform with the refresher"),
+		)
+	default:
+		// Any other decline: today only cache.PutReasonUnobserved, a verdict
+		// over Put-gate sinks that were not all installed on the resolve. It
+		// admits nothing (#912 delta-3 item 3); never read as another reason.
+		slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+			slog.String("reason", string(verdict.Reason())),
+			slog.String("effect", "body served; not persisted"),
 		)
 	}
 	return true

@@ -59,7 +59,7 @@ func TestIssue406_SeedMemo_RAEditBeforeSeed_AllSeededWidgetsConverge(t *testing.
 	if err != nil {
 		t.Fatalf("pre-warm resolve: %v", err)
 	}
-	store.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, raIn, full)
+	store.PutRAFullList(fixtureStoreVerdict, raKey, raIn, full)
 	cache.RecordSliceability(raKey, seedFullListShape(gRA, ns, raName, ra(raSliceJQ)), true)
 	d.Record(context.Background(), raKey, gRA, ns, raName)
 
@@ -101,7 +101,7 @@ func TestIssue406_SeedMemo_RAEditBeforeSeed_AllSeededWidgetsConverge(t *testing.
 			t.Fatalf("seed Resolve(%s): %v", w, err)
 		}
 		// Boot seed terminal Put: plain (#323), via PutThenRemark(resCtx) (seedTerminalPut).
-		store.PutThenRemark(ctx, w, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body), Inputs: edge3WidgetInputs("w406seed" + itoa2(i))})
+		store.PutResolvedThenRemark(ctx, fixtureStoreVerdict, w, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body), Inputs: edge3WidgetInputs("w406seed" + itoa2(i))})
 	}
 	if got := cache.RAFullListServeSnapshot().Hit - hit0; got != 1 {
 		t.Fatalf("[prove-path] want exactly one 4a fast-path HIT (the memo MISS), the rest memo HITs; got %d", got)
@@ -141,7 +141,7 @@ func TestIssue406_SeedMemo_RAEditBeforeSeed_AllSeededWidgetsConverge(t *testing.
 			}
 			e = &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got), Inputs: edge3WidgetInputs(k)}
 		}
-		if !store.ReplaceIfGen(rctx, k, e, gen0) {
+		if !store.ReplaceResolvedIfGen(rctx, fixtureStoreVerdict, k, e, gen0) {
 			t.Fatalf("refresh %s: ReplaceIfGen refused", k)
 		}
 	}

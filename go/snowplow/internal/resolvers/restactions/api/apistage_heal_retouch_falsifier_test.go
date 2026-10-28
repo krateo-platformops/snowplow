@@ -122,7 +122,7 @@ func newHealRetouchWatcher(t *testing.T) *cache.ResourceWatcher {
 // GVR was not-servable, the state 1a must re-touch on the next HIT.
 func putHealContentEntry(store *cache.ResolvedCacheStore, gvr schema.GroupVersionResource, ns, name string) string {
 	key := cache.ComputeKey(contentKeyInputs(gvr, ns, name))
-	store.Put(key, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"apiVersion":"v1","kind":"List","items":[]}`),
 	})
 	return key

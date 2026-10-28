@@ -345,7 +345,7 @@ func TestA1_Refresher_DeclinesCarriedHasUAF_ControlRefreshes(t *testing.T) {
 			HasUAF:                 hasUAF,
 		}
 		key := cache.ComputeKey(inputs)
-		c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"prior":1}`), Inputs: &inputs})
+		c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"prior":1}`), Inputs: &inputs})
 		if err := resolveAndPopulateL1(context.Background(), inputs, nil, nil); err != nil {
 			t.Fatalf("resolveAndPopulateL1(%s): %v", name, err)
 		}

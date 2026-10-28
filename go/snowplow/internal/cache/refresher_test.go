@@ -76,7 +76,7 @@ func TestRefresher_HandlerInvokedOnEnqueue(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-0abc"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"x":1}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"x":1}`), Inputs: &inputs})
 
 	var called atomic.Int32
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, in ResolvedKeyInputs) error {
@@ -121,7 +121,7 @@ func TestRefresher_RapidMarksCoalesce(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "coalesce"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	// Gate the single worker so all M marks land while the key sits
 	// queued — the workqueue must coalesce them to ONE processing.
@@ -169,7 +169,7 @@ func TestRefresher_ErrorRetriesThenForgets(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "retry"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	var attempts atomic.Int32
 	const failFirst = 3
@@ -226,7 +226,7 @@ func TestRefresher_PoisonPillDroppedAfterCap(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "poison"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	var attempts atomic.Int32
 	RegisterRefreshFunc("widgets", func(context.Context, string, ResolvedKeyInputs) error {
@@ -289,7 +289,7 @@ func TestRefresher_TransientUnderCapStillSucceeds(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "transient"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	var attempts atomic.Int32
 	// Fail maxRefreshRequeues-1 times (strictly under the cap), then OK.
@@ -327,7 +327,7 @@ func TestRefresher_HandlerErrorDoesNotEvict(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "noevict"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	RegisterRefreshFunc("widgets", func(context.Context, string, ResolvedKeyInputs) error {
 		return errors.New("permanent failure")
@@ -355,7 +355,7 @@ func TestRefresher_NilInputsEntrySkips(t *testing.T) {
 	c := ResolvedCache()
 	// Synthesise a key + a legacy entry with nil Inputs under it.
 	key := ComputeKey(ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "legacy"})
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: nil})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: nil})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -377,7 +377,7 @@ func TestRefresher_NoHandlerForKind(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "unregistered"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -437,7 +437,7 @@ func TestRefresher_ConcurrentEnqueueRaceFree(t *testing.T) {
 	for i := 0; i < N; i++ {
 		inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "n" + itoa(i)}
 		key := ComputeKey(inputs)
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 		wg.Add(1)
 		go func(k string) {
 			defer wg.Done()
@@ -466,7 +466,7 @@ func TestRefresher_OnUpdateRefreshesContent(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "content"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &inputs})
 
 	gvr := gvrCompositions()
 	Deps().Record(context.Background(), key, gvr, "ns", "n")
@@ -474,7 +474,7 @@ func TestRefresher_OnUpdateRefreshesContent(t *testing.T) {
 	fresh := []byte(`{"v":"fresh"}`)
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, _ ResolvedKeyInputs) error {
 		// A real RefreshFunc re-resolves and Put()s; emulate that here.
-		c.Put(k, &ResolvedEntry{RawJSON: fresh, Inputs: &inputs})
+		c.put(k, &ResolvedEntry{RawJSON: fresh, Inputs: &inputs})
 		return nil
 	})
 
@@ -576,7 +576,7 @@ func TestRefresher_DepTrackerOnUpdateEnqueues(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	gvr := gvrCompositions()
 	Deps().Record(context.Background(), key, gvr, "ns", "n")

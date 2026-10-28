@@ -187,7 +187,7 @@ func e3286PrewarmRAKey(t *testing.T, marker string) string {
 	raKey := cache.ComputeKey(inputs)
 	// The apiRef caller-class is "apiref" (raFullListServe's raFullListCallerClass).
 	shape := cache.SliceShapeHash("apiref", g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286SliceJQ)
-	cache.ResolvedCache().PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, inputs, e3286FullDict(marker))
+	cache.ResolvedCache().PutRAFullList(fixtureStoreVerdict, raKey, inputs, e3286FullDict(marker))
 	cache.RecordSliceability(raKey, shape, true)
 	cache.Deps().RecordList(context.Background(), raKey, e3286BackingGVR(), e3286NS) // edge-2 (backing LIST)
 	cache.Deps().Record(context.Background(), raKey, g, e3286NS, e3286RAName)        // RA-CR self-dep
@@ -319,7 +319,7 @@ func TestEdge3_286_SeedShadowParityDoesNotPerturbCapture(t *testing.T) {
 	// through the real dep decision site; a refresher re-serves any dirty-marked
 	// widget. Both siblings carry edge-3, so both must converge.
 	inputs := e3286KeyInputs(g.Group, g.Version, g.Resource, e3286NS, e3286RAName, e3286BindingUID, nil)
-	cache.ResolvedCache().PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), raKey, inputs, e3286FullDict("NEW"))
+	cache.ResolvedCache().PutRAFullList(fixtureStoreVerdict, raKey, inputs, e3286FullDict("NEW"))
 
 	widgets := map[string]context.Context{
 		w2Off: cache.WithL1KeyContext(base, w2Off),
@@ -340,7 +340,7 @@ func TestEdge3_286_SeedShadowParityDoesNotPerturbCapture(t *testing.T) {
 			t.Errorf("refresh re-serve of %q failed: %v", k, err)
 			return
 		}
-		cache.ResolvedCache().Put(k, &cache.ResolvedEntry{RawJSON: e3286MustJSON(t, got), Inputs: &cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "widgets", Namespace: e3286NS, Name: k}})
+		cache.ResolvedCache().PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: e3286MustJSON(t, got), Inputs: &cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "widgets", Namespace: e3286NS, Name: k}})
 	})
 	cache.Deps().OnUpdate(e3286BackingGVR(), e3286NS, "comp-286-x")
 

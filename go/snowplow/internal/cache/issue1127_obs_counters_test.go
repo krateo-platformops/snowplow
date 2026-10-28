@@ -33,7 +33,7 @@ func TestIssue1127Obs_DegradedNoEvict_CountsTheConsequence(t *testing.T) {
 	Deps().SetStore(store)
 	gvr := obsGVR()
 	const ns, name, key = "demo-system", "obs-flex", "L1_obs-flex"
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
 		CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource,
 		Namespace: ns, Name: name,
 	}})

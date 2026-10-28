@@ -135,7 +135,7 @@ func TestR3_EntryItemsAccountedInBytes(t *testing.T) {
 
 	// Entry 1 — RawJSON only (no pre-parsed Items).
 	plain := &cache.ResolvedEntry{RawJSON: raw, Inputs: apistageInputs}
-	store.Put("r3-plain", plain)
+	store.PutResolved(fixtureStoreVerdict, "r3-plain", plain)
 	plainBytes := store.Bytes()
 
 	// Entry 2 — same RawJSON PLUS pre-parsed Items. f1WidgetsGVR is a
@@ -151,7 +151,7 @@ func TestR3_EntryItemsAccountedInBytes(t *testing.T) {
 		ItemsAPIVersion: parsed.apiVersion,
 		ItemsKind:       parsed.kind,
 	}
-	store.Put("r3-with-items", withItems)
+	store.PutResolved(fixtureStoreVerdict, "r3-with-items", withItems)
 	bothBytes := store.Bytes()
 
 	// The Items-carrying entry must add strictly more than its RawJSON

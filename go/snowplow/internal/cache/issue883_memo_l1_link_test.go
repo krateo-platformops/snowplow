@@ -62,7 +62,7 @@ func TestIssue883_MemoNeverOutgrowsLiveServableKeys(t *testing.T) {
 				m.StoreLayeredWithStates(shared, l1, body, []DepKey{dep}, nil, DepGenEpochNow(), nil, PutGateEffects{})
 				link(shared, l1)
 			}
-			store.Put(l1, &ResolvedEntry{RawJSON: body})
+			store.put(l1, &ResolvedEntry{RawJSON: body})
 			putOrder = append(putOrder, l1)
 		}
 

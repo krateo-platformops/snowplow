@@ -116,7 +116,7 @@ func TestIssue643_F3b_PutRetiresTheMark_ExternalTTLPutDoesNot(t *testing.T) {
 	// An ExternalTTL Put — the /call path's opt-in cache of an EXTERNAL result
 	// (widgets.go, krateo.io/external-cache-ttl-seconds) — proves nothing about
 	// cacheability: the mark stays and the next background pass dials 0.
-	store.Put(keys[0], &cache.ResolvedEntry{RawJSON: []byte(`{"ext":true}`), Inputs: inputs, ExternalTTL: true})
+	store.PutResolved(fixtureStoreVerdict, keys[0], &cache.ResolvedEntry{RawJSON: []byte(`{"ext":true}`), Inputs: inputs, ExternalTTL: true})
 	if !set.Marked(keys[0]) {
 		t.Fatal("F3b: an ExternalTTL Put retired the mark — that cell still touches external")
 	}
@@ -126,7 +126,7 @@ func TestIssue643_F3b_PutRetiresTheMark_ExternalTTLPutDoesNot(t *testing.T) {
 	}
 
 	// A plain Put proves the key cacheable: the mark retires (store-side hook).
-	store.Put(keys[1], &cache.ResolvedEntry{RawJSON: []byte(`{"cacheable":true}`), Inputs: inputs})
+	store.PutResolved(fixtureStoreVerdict, keys[1], &cache.ResolvedEntry{RawJSON: []byte(`{"cacheable":true}`), Inputs: inputs})
 	if set.Marked(keys[1]) {
 		t.Fatal("F3b: a plain L1 Put of the key did not retire its declined-external mark (retire rule a)")
 	}

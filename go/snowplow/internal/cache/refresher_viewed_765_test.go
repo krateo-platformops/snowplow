@@ -100,7 +100,7 @@ func terminalFixtureNoReset(t *testing.T, n int) (*ResolvedCacheStore, []string)
 		inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Group: "widgets.templates.krateo.io",
 			Version: "v1beta1", Resource: "flexes", Namespace: "ns", Name: "v765-" + string(rune('a'+i%26)) + string(rune('a'+i/26))}
 		key := ComputeKey(inputs)
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"old"}`), Inputs: &inputs})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"old"}`), Inputs: &inputs})
 		keys = append(keys, key)
 	}
 	return c, keys

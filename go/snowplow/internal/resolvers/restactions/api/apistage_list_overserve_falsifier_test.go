@@ -81,7 +81,7 @@ func seedNamespacesCell(t *testing.T, nss ...string) {
 		}})
 	}
 	key := cache.ComputeKey(contentKeyInputs(nsGVR, "", ""))
-	store.Put(key, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON:         []byte(`{"apiVersion":"v1","kind":"NamespaceList","items":[]}`),
 		Inputs:          ptrTo(contentKeyInputs(nsGVR, "", "")),
 		Items:           items,
@@ -223,7 +223,7 @@ func seedOverserveCell(t *testing.T) {
 		}})
 	}
 	key := cache.ComputeKey(contentKeyInputs(f1WidgetsGVR, "", ""))
-	store.Put(key, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON:         []byte(`{"apiVersion":"widgets.krateo.io/v1","kind":"WidgetList","items":[]}`),
 		Inputs:          ptrTo(contentKeyInputs(f1WidgetsGVR, "", "")),
 		Items:           items,
@@ -307,7 +307,7 @@ func TestFalsifier58_GetByName_StaysGated(t *testing.T) {
 	// NARROW user is NOT granted).
 	raw := []byte(`{"apiVersion":"widgets.krateo.io/v1","kind":"Widget","metadata":{"namespace":"team-c","name":"w-team-c"}}`)
 	key := cache.ComputeKey(contentKeyInputs(f1WidgetsGVR, "team-c", "w-team-c"))
-	store.Put(key, &cache.ResolvedEntry{RawJSON: raw, Inputs: ptrTo(contentKeyInputs(f1WidgetsGVR, "team-c", "w-team-c"))})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: raw, Inputs: ptrTo(contentKeyInputs(f1WidgetsGVR, "team-c", "w-team-c"))})
 
 	ctx := xcontext.BuildContext(context.Background(), xcontext.WithUserInfo(jwtutil.UserInfo{Username: f1NarrowUser}))
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
@@ -358,7 +358,7 @@ func TestFalsifier58_UAF_GetByName_PassesThroughForRefilter(t *testing.T) {
 	store := cache.ResolvedCache()
 	raw := []byte(`{"apiVersion":"widgets.krateo.io/v1","kind":"Widget","metadata":{"namespace":"bench-ns-01","name":"w-1"}}`)
 	key := cache.ComputeKey(contentKeyInputs(f1WidgetsGVR, "bench-ns-01", "w-1"))
-	store.Put(key, &cache.ResolvedEntry{RawJSON: raw, Inputs: ptrTo(contentKeyInputs(f1WidgetsGVR, "bench-ns-01", "w-1"))})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: raw, Inputs: ptrTo(contentKeyInputs(f1WidgetsGVR, "bench-ns-01", "w-1"))})
 
 	ctx := ctxWithUser("cyberjoker", "devs")
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{

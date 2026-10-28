@@ -43,7 +43,7 @@ func (h *layered406) sliceInFlight(wKey string) inflight406 {
 
 func (h *layered406) putInFlight(wKey string, f inflight406) {
 	h.t.Helper()
-	if !cache.ResolvedCache().PutIfGen(f.ctx, wKey, &cache.ResolvedEntry{RawJSON: f.body, Inputs: edge3WidgetInputs(wKey)}, f.gen0) {
+	if !cache.ResolvedCache().PutResolvedIfGen(f.ctx, fixtureStoreVerdict, wKey, &cache.ResolvedEntry{RawJSON: f.body, Inputs: edge3WidgetInputs(wKey)}, f.gen0) {
 		h.t.Fatalf("PutIfGen %s refused", wKey)
 	}
 }
@@ -132,7 +132,7 @@ func TestIssue406_C1_OneResolveSlicesRAKeyAtTwoVersions_PutRemarks(t *testing.T)
 	marker = "NEW"
 	h.refresh(h.raKey)
 	serve(2) // second apiRef slices NEW (current)
-	if !cache.ResolvedCache().PutIfGen(ctx, w, &cache.ResolvedEntry{RawJSON: []byte(`{"w":1}`), Inputs: edge3WidgetInputs(w)}, gen0) {
+	if !cache.ResolvedCache().PutResolvedIfGen(ctx, fixtureStoreVerdict, w, &cache.ResolvedEntry{RawJSON: []byte(`{"w":1}`), Inputs: edge3WidgetInputs(w)}, gen0) {
 		t.Fatalf("PutIfGen refused")
 	}
 	if h.layeredBy[w] != 1 {

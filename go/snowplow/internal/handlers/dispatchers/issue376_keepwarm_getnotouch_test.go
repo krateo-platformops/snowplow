@@ -66,7 +66,7 @@ func TestIssue376_KeepwarmSweep_EvictsPastMaxAge_ThenReseatsFresh(t *testing.T) 
 	// A WARM (SeededAtBoot) cell already past maxEntryAge (BornAt 48h ago). The reaper
 	// would KEEP this (warm → not cold-evicted, counted in warm_past_max_age), so the
 	// seed sweep's GetNoTouch is the only maxAge bound.
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &in, SeededAtBoot: true, BornAt: time.Now().Add(-48 * time.Hour), CreatedAt: time.Now()})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &in, SeededAtBoot: true, BornAt: time.Now().Add(-48 * time.Hour), CreatedAt: time.Now()})
 
 	evBefore := c.Stats().EvictMaxAgeTotal
 	missBefore := c.Stats().MissTotal
@@ -86,7 +86,7 @@ func TestIssue376_KeepwarmSweep_EvictsPastMaxAge_ThenReseatsFresh(t *testing.T) 
 
 	// Model the sweep's re-resolve + re-Put with a FRESH BornAt (zero → cold-fill now):
 	// the cell is re-seated within the cap and no longer evicts (pop-A self-heal).
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, SeededAtBoot: true, CreatedAt: time.Now()})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, SeededAtBoot: true, CreatedAt: time.Now()})
 	if _, ok := c.GetNoTouch(key); !ok {
 		t.Fatal("#376 keep-evict: after re-Put with a fresh BornAt the cell must be resident (not immediately re-evicted)")
 	}
@@ -117,9 +117,9 @@ func TestIssue376_WarmGauge_KeepwarmSweepLeavesNeitherBucket(t *testing.T) {
 	// Non-seeded, body within TTL (age-skippable) but lastRead COLD (aged past TTL):
 	// Put old (lastRead=CreatedAt=-100s), ReplaceIfGen fresh (CreatedAt=-1s) inherits the
 	// old lastRead. In neither warm bucket (not seeded; lastRead age 100s > TTL 20s).
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: &in, CreatedAt: time.Now().Add(-100 * time.Second)})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: &in, CreatedAt: time.Now().Add(-100 * time.Second)})
 	gen := c.CaptureGen(key)
-	if !c.ReplaceIfGen(context.Background(), key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
+	if !c.ReplaceResolvedIfGen(context.Background(), fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
 		t.Fatal("setup: ReplaceIfGen must succeed")
 	}
 

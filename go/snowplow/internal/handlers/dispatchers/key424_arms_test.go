@@ -517,7 +517,7 @@ func TestKey424_RefresherSubGenOnlyDrift_RoleEditMidResolve(t *testing.T) {
 	carolCtx := psUserCtx(a, psCarol)
 	key, in := k423RAKey(t, carolCtx)
 	in.RepresentativeUsername, in.RepresentativeGroups = psCarol, psGroups(a)
-	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"password":"pre-edit"}`), Inputs: in})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"password":"pre-edit"}`), Inputs: in})
 
 	rGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}
 	var armed atomic.Bool

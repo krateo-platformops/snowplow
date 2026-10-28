@@ -804,7 +804,7 @@ func TestH1_RA_S189_ResolveRacingDelete_RefusedNotResurrected(t *testing.T) {
 			// Runs AFTER the dispatcher captured the key's generation (restactions.go:221)
 			// and BEFORE its PutIfGen (:463): a real Put+DELETE-evict bumps the
 			// generation past the captured value.
-			c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+			c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 			c.DeleteForTest(key)
 			return resolved, nil
 		})
@@ -840,7 +840,7 @@ func TestH1_Widget_S189_ResolveRacingDelete_RefusedNotResurrected(t *testing.T) 
 		func(ctx context.Context, opts widgets.ResolveOptions) (*widgets.Widget, error) {
 			// Between the widget-cell capture (widgets.go:267) and its PutIfGen
 			// (:522): bump the widget key's generation via a real Put+DELETE-evict.
-			c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+			c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 			c.DeleteForTest(key)
 			return h1WidgetUnstructured(map[string]any{}), nil
 		})

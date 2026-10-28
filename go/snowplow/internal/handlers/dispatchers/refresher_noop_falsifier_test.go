@@ -70,7 +70,7 @@ func TestFalsifierFNoop_RefreshFuncReallyReResolves(t *testing.T) {
 		RepresentativeGroups:   []string{"devs"},
 	}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})
 
 	seededStores := c.Stats().StoreTotal // == 1
 

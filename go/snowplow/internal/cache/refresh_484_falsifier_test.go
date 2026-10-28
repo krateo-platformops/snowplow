@@ -141,7 +141,7 @@ func f484Keys(t *testing.T, prefix string, n int) []string {
 }
 
 func f484Commit(store *ResolvedCacheStore, k, body string) {
-	store.Put(k, &ResolvedEntry{RawJSON: []byte(body)})
+	store.put(k, &ResolvedEntry{RawJSON: []byte(body)})
 	PublishRefresh(k) // strictly post-commit, as resolve_populate does
 }
 
@@ -233,7 +233,7 @@ func TestRefresh484_FDrop_FullSinkChangeReachesClient(t *testing.T) {
 	// v1 is committed BEFORE anyone subscribes; each client "loaded" v1 on
 	// mount (it reads L1 directly — the initial /call).
 	for _, k := range keys {
-		store.Put(k, &ResolvedEntry{RawJSON: []byte(v(1)(k))})
+		store.put(k, &ResolvedEntry{RawJSON: []byte(v(1)(k))})
 	}
 	gate := make(chan struct{}) // the clients' drains are BLOCKED until closed
 	clients := make([]*spaClient, f484M)

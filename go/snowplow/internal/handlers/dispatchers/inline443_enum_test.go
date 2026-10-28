@@ -76,7 +76,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"CommitWhyOfAnalysis":                    readOnly443,
 	"DepTracker.ReplayEdgesWithStates":       gatedInCache443, // #765 B: ReplayEdges carrying the producer's interest states
 	"DepTracker.ReleaseUnstored":             gatedInCache443, // #890/#893: strips a non-resident key's edges at a resolve's end; returns under Inert
-	"ResolvedCacheStore.PutIfGen":            gatedInCache443,
+	"ResolvedCacheStore.PutContentIfGen":     gatedInCache443,
 	"ResolvedCacheStore.PutRAFullListIfGen":  gatedInCache443,
 	"ResolvedCacheStore.NoteRAFullListSlice": gatedInCache443,
 	"ResourceWatcher.EnsureResourceTypeFor":  gatedInCache443,
@@ -231,7 +231,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
-	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.MarkDeclaredWrite": readOnly443,
+	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.MarkDeclaredWrite": readOnly443, "ExternalTouchedSink.DeclaredWrite": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "SourcePagination": readOnly443, "IdentityClass.String": readOnly443,

@@ -47,7 +47,7 @@ func TestFalsifierFBackoff_ErrorRetriesWithBoundedBackoff(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "backoff"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	var attempts atomic.Int32
 	const failFirst = 3
@@ -135,7 +135,7 @@ func TestFalsifierFDrop_BurstDropsNothing(t *testing.T) {
 	for i := 0; i < burst; i++ {
 		inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "drop" + itoa(i)}
 		key := ComputeKey(inputs)
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 		keys = append(keys, key)
 	}
 	for _, k := range keys {

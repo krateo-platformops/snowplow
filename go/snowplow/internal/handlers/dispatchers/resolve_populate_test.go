@@ -43,7 +43,7 @@ func TestACC7_ReResolveUsesEntryIdentityAndL1KeyContext(t *testing.T) {
 		RepresentativeGroups:   []string{"devs", "qa"},
 	}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
 
 	// Capture the context the resolve seam is handed.
 	var gotUser string
@@ -94,7 +94,7 @@ func TestACC5_ResolveSeamDeclineIsCleanSkip(t *testing.T) {
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "skip"}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"orig":1}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"orig":1}`), Inputs: &inputs})
 	before := c.Stats().StoreTotal
 
 	// Seam returns (nil, nil) — "declined to resolve" (e.g. unknown
@@ -124,7 +124,7 @@ func TestResolvePopulate_EvictedDuringResolveNotResurrected(t *testing.T) {
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "racey"}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	// The seam evicts the entry mid-resolve (emulates a DELETE landing
 	// while the refresh is in flight), then returns fresh bytes.
@@ -172,7 +172,7 @@ func TestPartB_SATransportOnContext(t *testing.T) {
 		RepresentativeGroups:   []string{"devs"},
 	}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
 
 	saEP := &endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc", Token: "sa-token"}
 	saRC := &rest.Config{Host: "https://kubernetes.default.svc"}
@@ -241,7 +241,7 @@ func TestPartB_NilSATransportIsIdentityOnly(t *testing.T) {
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "no-sa", RepresentativeUsername: "u"}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	var userCfgOK bool
 	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
@@ -269,7 +269,7 @@ func TestResolvePopulate_SeamErrorPropagates(t *testing.T) {
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "err"}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	restore := setResolveOnceForTest(func(context.Context, cache.ResolvedKeyInputs) ([]byte, error) {
 		return nil, errors.New("resolver blew up")

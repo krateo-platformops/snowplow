@@ -110,7 +110,7 @@ func TestIssue216_DegradedConfirmed404_ForgetsHarvestAndStopsSeedReplay(t *testi
 		SubjectBindingSet: rbac.SubjectBindingSetDigest("admin", []string{"admins"}),
 	}
 	delKey := cache.ComputeKey(del)
-	store.Put(delKey, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, delKey, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"stale":"deleted-content"}`),
 		Inputs:  &del,
 	})
@@ -240,7 +240,7 @@ func TestIssue216_DropPointNon404_DoesNotForgetHarvest(t *testing.T) {
 		SubjectBindingSet: rbac.SubjectBindingSetDigest("admin", []string{"admins"}),
 	}
 	key := cache.ComputeKey(in)
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"outage-not-deletion"}`), Inputs: &in})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"outage-not-deletion"}`), Inputs: &in})
 	cache.Deps().Record(context.Background(), key, i187GVR(), i187NS, i187Name)
 
 	nav := newNavWidgetHarvester()

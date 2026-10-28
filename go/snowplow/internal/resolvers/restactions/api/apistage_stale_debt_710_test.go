@@ -112,7 +112,7 @@ func newD2Fixture(t *testing.T) *d2Fixture {
 			}
 			f.secondFilled.Store(true)
 		}
-		f.store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":true}`), Inputs: &in})
+		f.store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":true}`), Inputs: &in})
 		cache.PublishRefresh(key)
 		return nil
 	})
@@ -148,7 +148,7 @@ func (f *d2Fixture) putDependent(l1Key string) {
 
 // storeAndCommit is putDependent without the tab (D2-16: the tab arms late).
 func (f *d2Fixture) storeAndCommit(l1Key string) {
-	f.store.Put(l1Key, &cache.ResolvedEntry{
+	f.store.PutResolved(fixtureStoreVerdict, l1Key, &cache.ResolvedEntry{
 		RawJSON:      []byte(`{"fresh":false}`),
 		Inputs:       &cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Namespace: "d2", Name: l1Key},
 		StaleDerived: true,
@@ -311,7 +311,7 @@ func TestStale710_D2_6_ATransientRefillFailureRetriesAtOnceAndTheDebtClears(t *t
 				// is refused (#189) — a TRANSIENT failure.
 				prior, _ := f.store.GetNoTouch(f.contentKey)
 				f.store.DeleteForTest(f.contentKey)
-				f.store.Put(f.contentKey, prior)
+				f.store.PutResolved(fixtureStoreVerdict, f.contentKey, prior)
 			}
 		}
 		return orig(ctx, call)
@@ -715,9 +715,9 @@ func TestStale710_V8b_AViewedFailingDebtRetriesOnTheBackoffAndHeals(t *testing.T
 func TestStale710_D2_3d_TheCompareAndEvictNeverEvictsANewerEntry(t *testing.T) {
 	store := newD2Fixture(t).store
 	in := &cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Namespace: "d2", Name: "dep-3d"}
-	store.Put("dep-3d", &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":false}`), Inputs: in, StaleDerived: true})
+	store.PutResolved(fixtureStoreVerdict, "dep-3d", &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":false}`), Inputs: in, StaleDerived: true})
 	old, _ := store.GetNoTouch("dep-3d")
-	store.Put("dep-3d", &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":true}`), Inputs: in})
+	store.PutResolved(fixtureStoreVerdict, "dep-3d", &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":true}`), Inputs: in})
 	t.Cleanup(func() { store.DeleteForTest("dep-3d") })
 	if store.EvictStaleDerived("dep-3d", old) {
 		t.Fatalf("D2-3d RED: the compare-and-evict removed a newer entry")
@@ -1100,7 +1100,7 @@ func TestStale710_D2_20e_AParkedDebtsEvictedContentEvictsItsDependentsWithoutReR
 	heal, dispatches := d2ParkedN(t, f, "dep-20e-a", "dep-20e-b")
 	newer := &cache.ResolvedEntry{RawJSON: []byte(`{"newer":true}`),
 		Inputs: &cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Namespace: "d2", Name: "dep-20e-b"}}
-	f.store.Put("dep-20e-b", newer) // another writer replaced dependent b
+	f.store.PutResolved(fixtureStoreVerdict, "dep-20e-b", newer) // another writer replaced dependent b
 	r0, n0 := f.rereso.Load(), dispatches.Load()
 	f.store.DeleteForTest(f.contentKey) // the content cell is evicted
 	if !fill710WaitFor(10*time.Second, func() bool {
@@ -1318,7 +1318,7 @@ func TestStale710_D2_3e_AReplaceChainStopsWhenAnotherWriterReplacedTheCell(t *te
 	}
 	newer := &cache.ResolvedEntry{RawJSON: []byte(`{"newer":true}`),
 		Inputs: &cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Namespace: "d2", Name: "dep-3e"}}
-	f.store.Put("dep-3e", newer) // another writer replaced the stale-derived cell
+	f.store.PutResolved(fixtureStoreVerdict, "dep-3e", newer) // another writer replaced the stale-derived cell
 	r0, p0 := f.rereso.Load(), StaleServeStatsSnapshot().PushTotal
 	clock.FireNext()
 	if f.rereso.Load() != r0 || StaleServeStatsSnapshot().PushTotal != p0 || len(clock.Pending()) != 0 {
@@ -1372,7 +1372,7 @@ func TestStale710_V8d_ARefusedRefillNobodyViewsStopsAfterOneImmediateRetry(t *te
 			// resident: its Put is always refused (#189).
 			prior, _ := f.store.GetNoTouch(f.contentKey)
 			f.store.DeleteForTest(f.contentKey)
-			f.store.Put(f.contentKey, prior)
+			f.store.PutResolved(fixtureStoreVerdict, f.contentKey, prior)
 		}
 		return orig(ctx, call)
 	}

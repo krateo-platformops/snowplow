@@ -50,7 +50,7 @@ func TestIssue406x424_DeclinedSeedPutRecordsNoLayeredSources(t *testing.T) {
 			putRA := func(body string) {
 				t.Helper()
 				in := raIn
-				cache.ResolvedCache().Put(raKey, &cache.ResolvedEntry{RawJSON: []byte(body), Inputs: &in})
+				cache.ResolvedCache().PutResolved(fixtureStoreVerdict, raKey, &cache.ResolvedEntry{RawJSON: []byte(body), Inputs: &in})
 			}
 			putRA(`{"items":["v1"]}`)
 			slice := func(ctx context.Context) {

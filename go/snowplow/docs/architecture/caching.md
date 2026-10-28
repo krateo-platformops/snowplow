@@ -309,13 +309,19 @@ here is load-bearing:
 4. On miss: attach `WithL1KeyContext(ctx, cacheKey)` so the resolver records dep edges against
    this key as it reads L3; attach a `StageErrorSink` and an `ExternalTouchedSink`; resolve;
    encode once; serve; then **Put only when every gate passes**. The sink-derived gates are
-   ONE verdict, `cache.PutGateVerdict` (`put_verdict.go`). The TYPE enforces it: every write of a
-   resolve output takes the verdict and stores nothing unless it allows the Put (`put_gated.go`;
-   `PutRAFullList(IfGen)` too), mark sites read `Permanent()`, and a verdict cannot be forged
-   (only `PutGateVerdict` makes one; the zero value admits nothing). The decline reason only
-   picks the log line and the counter. `scripts/check_resolved_entry_put_sites.sh` fails any
-   ungated `ResolvedEntry` write in the dispatchers or apiref packages. Its closed set, first
-   match wins:
+   ONE verdict, `cache.PutGateVerdict` (`put_verdict.go`). The TYPE and the COMPILER enforce it:
+   every exported `ResolvedEntry` write takes the verdict and stores nothing unless it allows the
+   Put (`put_gated.go`; `PutRAFullList(IfGen)` too); the ungated store methods are unexported, so
+   no other package can reach one; the one exported write without a verdict, `PutContentIfGen`,
+   writes only a GET-only content cell (an `apistage` entry under the key its own inputs compute).
+   Mark sites read `Permanent()`, and a verdict cannot be forged (only `PutGateVerdict` makes one;
+   the zero value admits nothing). A verdict over sinks that were not ALL installed (an empty
+   `PutGateSinks{}`, a field left out) is `unobserved`: it admits nothing and is not permanent.
+   The decline reason only picks the log line and the counter.
+   `scripts/check_resolved_entry_put_sites.sh` fails a write reached around the verdict through
+   any receiver in the dispatchers or apiref packages, and, inside the cache package, an ungated
+   store call outside a function that takes the verdict and returns on `!v.Store()` first. Its
+   closed set, first match wins:
    - **declared write** (permanent, `declared_write`) — a RESTAction that declares a write-verb
      stage is never stored, whether or not this resolve sent it (#903 F1): every `/call` runs it,
      and the background marks it and stops re-resolving it. It is its own input, never counted

@@ -231,7 +231,7 @@ func i677Setup(t *testing.T, ra *unstructured.Unstructured) *i677Env {
 		SubjectBindingSet:      rbac.SubjectBindingSetDigest(i677Rep, nil),
 	}
 	e.key = cache.ComputeKey(e.inputs)
-	e.store.Put(e.key, &cache.ResolvedEntry{RawJSON: []byte(`{"prior":true}`), Inputs: &e.inputs})
+	e.store.PutResolved(fixtureStoreVerdict, e.key, &cache.ResolvedEntry{RawJSON: []byte(`{"prior":true}`), Inputs: &e.inputs})
 	// ONE refresher pool for the whole arm: its stop resets the refresher
 	// (including the #547 dirty windows the arms read).
 	_, stop := i1126Loop(t, "restactions", e.saEP, e.saRC)

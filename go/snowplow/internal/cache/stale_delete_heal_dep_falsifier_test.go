@@ -176,7 +176,7 @@ func TestFalsifierHealB_DeleteDirtyMarksListDepContent(t *testing.T) {
 	})
 
 	const blueprintsL1 = "L1_blueprints_resolved_output"
-	store.Put(blueprintsL1, &ResolvedEntry{
+	store.put(blueprintsL1, &ResolvedEntry{
 		RawJSON: []byte(`{"items":["secret-keep","secret-doomed"]}`),
 	})
 	// The /blueprints entry LIST-depends on the secrets GVR in ns-a — the
@@ -226,7 +226,7 @@ func TestFalsifierHealB_DeleteDirtyMarksListDepContent(t *testing.T) {
 				// Recompute + re-Put the resolved-output entry from the
 				// current membership (what the resolver does on revalidation)
 				// and assert the SERVED bytes have the deleted member absent.
-				store.Put(blueprintsL1, &ResolvedEntry{
+				store.put(blueprintsL1, &ResolvedEntry{
 					RawJSON: []byte(`{"items":["secret-keep"]}`),
 				})
 				entry, ok := store.Get(blueprintsL1)

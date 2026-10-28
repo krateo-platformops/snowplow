@@ -144,7 +144,7 @@ func h643F5zABC(t *testing.T) (h643F5zResult, map[string]string) {
 
 	cache.ResolvedCache().DeleteForTest(w0[0]) // (a)
 	old := h643Entry(w0[1])                    // (c): a different writer's Put
-	cache.ResolvedCache().Put(w0[1], &cache.ResolvedEntry{RawJSON: append([]byte(nil), old.RawJSON...), Inputs: old.Inputs})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, w0[1], &cache.ResolvedEntry{RawJSON: append([]byte(nil), old.RawJSON...), Inputs: old.Inputs})
 	h643Dirty(t, env, "int-w1", w1, cache.InputsMovedSincePut) // (b)
 
 	before := map[string]*cache.ResolvedEntry{}

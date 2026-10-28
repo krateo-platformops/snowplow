@@ -59,6 +59,11 @@ const (
 	// PutReasonExternal — a genuine external touch (#681 C2): no dep edge can
 	// invalidate the result.
 	PutReasonExternal PutReason = "external_touched"
+	// PutReasonUnobserved — at least one Put-gate sink was not installed on the
+	// resolve, so what it recorded is unknown (#912 delta-3 item 3): the
+	// verdict admits nothing. Neither transient nor permanent: no retry of the
+	// same wiring can observe more, and nothing proves the result unstorable.
+	PutReasonUnobserved PutReason = "unobserved"
 )
 
 // PutVerdict is the combined Put-gate decision for one resolve. Only
@@ -113,8 +118,15 @@ func (v PutVerdict) WithExternalTTL(optedIn bool) PutVerdict {
 //  4. otherwise                            → store (DenialOnly when stage errors
 //     were recorded and every one was a per-identity forbidden)
 //
-// nil sinks read as empty.
+// A store is an ASSERTION that the resolve recorded nothing forbidding it, so
+// it needs every sink: a missing one (PutGateSinks{}, a field left out, or a
+// ctx that did not install it) reads as "unobserved", never as "nothing
+// recorded" (#912 delta-3 item 3). The unobserved verdict admits nothing and is
+// not permanent.
 func PutGateVerdict(g PutGateSinks, class string) PutVerdict {
+	if g.Stage == nil || g.Forbidden == nil || g.External == nil {
+		return PutVerdict{reason: PutReasonUnobserved}
+	}
 	external := GenuineExternal(g.External, g.Forbidden)
 	switch {
 	case g.External.DeclaredWrite():

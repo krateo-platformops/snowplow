@@ -24,7 +24,7 @@ func TestIssue890_DedupFirstRecordThenStripKeepsTheEdge(t *testing.T) {
 
 	r1 := WithL1KeyContext(context.Background(), k)
 	d.Record(r1, k, a.GVR, a.Namespace, a.Name)
-	if !store.PutIfGen(r1, k, &ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(k)) {
+	if !store.putIfGen(r1, k, &ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(k)) {
 		t.Fatal("harness: R1 must be stored")
 	}
 
@@ -33,7 +33,7 @@ func TestIssue890_DedupFirstRecordThenStripKeepsTheEdge(t *testing.T) {
 	d.Record(r2, k, a.GVR, a.Namespace, a.Name) // a dedup: dk_a already recorded
 	d.RemoveL1Key(k)                            // a strip
 	d.Record(r2, k, b.GVR, b.Namespace, b.Name) // a new record: a new edge set
-	if !store.PutIfGen(r2, k, &ResolvedEntry{RawJSON: []byte(`{"r":2}`)}, gen) {
+	if !store.putIfGen(r2, k, &ResolvedEntry{RawJSON: []byte(`{"r":2}`)}, gen) {
 		t.Fatal("harness: R2 must be stored")
 	}
 	if !d.hasExactEdge(k, a) || !d.hasExactEdge(k, b) {
@@ -75,7 +75,7 @@ func TestIssue890_DedupWithNoEdgeSetForcesTheFullCheck(t *testing.T) {
 
 	d.RemoveL1Key(k)                            // a strip removes S0 and the forward edge
 	d.Record(r2, k, b.GVR, b.Namespace, b.Name) // R2's next own record creates and notes S1
-	if !store.PutIfGen(r2, k, &ResolvedEntry{RawJSON: []byte(`{"r":2}`)}, gen) {
+	if !store.putIfGen(r2, k, &ResolvedEntry{RawJSON: []byte(`{"r":2}`)}, gen) {
 		t.Fatal("harness: R2 must be stored")
 	}
 	if !d.hasExactEdge(k, a) {

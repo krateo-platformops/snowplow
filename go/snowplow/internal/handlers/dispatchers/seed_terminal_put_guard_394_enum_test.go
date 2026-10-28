@@ -253,6 +253,13 @@ func (h *s394RecordingHandle) PutIfGen(_ context.Context, _ string, _ *cache.Res
 
 // #912 re-review — the verdict-gated writes; like the store, they refuse a
 // declining verdict.
+func (h *s394RecordingHandle) PutResolved(v cache.PutVerdict, k string, e *cache.ResolvedEntry) bool {
+	if !v.Store() {
+		return false
+	}
+	h.Put(k, e)
+	return true
+}
 func (h *s394RecordingHandle) PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry, g uint64) bool {
 	return v.Store() && h.PutIfGen(ctx, k, e, g)
 }

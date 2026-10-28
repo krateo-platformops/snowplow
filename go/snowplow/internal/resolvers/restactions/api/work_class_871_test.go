@@ -124,7 +124,7 @@ func TestWorkClass871_D2_DebtRefillAndReplaceAreFillBG(t *testing.T) {
 		mu.Lock()
 		replace = append(replace, workclassprobe.GoroutineClass()+"/"+workclass.Of(ctx).String())
 		mu.Unlock()
-		f.store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":true}`), Inputs: &in})
+		f.store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"fresh":true}`), Inputs: &in})
 		cache.PublishRefresh(key)
 		return nil
 	})

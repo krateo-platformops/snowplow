@@ -22,7 +22,7 @@ func TestIssue890_ListEdgeDoesNotMaskAMissingExactEdge(t *testing.T) {
 	const k = "L1_890_fa"
 	exact := DepKey{GVR: gvr883Hot, Namespace: "ns-fa", Name: "obj-1"}
 
-	store.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`)})
+	store.put(k, &ResolvedEntry{RawJSON: []byte(`{}`)})
 	old, _ := store.GetNoTouch(k)
 	store.EvictUnrefreshable(k, old)
 	ctxR2 := WithL1KeyContext(context.Background(), k)
@@ -33,7 +33,7 @@ func TestIssue890_ListEdgeDoesNotMaskAMissingExactEdge(t *testing.T) {
 	d.RemoveL1Key(k)                                                                       // a strip (a concurrent refusal / release)
 	d.RecordList(WithL1KeyContext(context.Background(), k), k, exact.GVR, exact.Namespace) // another resolve: LIST only
 
-	if !store.PutIfGen(ctxR2, k, &ResolvedEntry{RawJSON: []byte(`{"r":2}`)}, gen) {
+	if !store.putIfGen(ctxR2, k, &ResolvedEntry{RawJSON: []byte(`{"r":2}`)}, gen) {
 		t.Fatal("harness: R2 must be stored")
 	}
 	if !d.hasExactEdge(k, exact) {
@@ -53,7 +53,7 @@ func TestIssue890_ReassertCostsNothingWithoutAStrip(t *testing.T) {
 	d.Record(ctx, k, dep.GVR, dep.Namespace, dep.Name)
 	before := d.reassertCheckedTotal.Load()
 	for i := 0; i < 50; i++ {
-		if !store.PutIfGen(ctx, k, &ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(k)) {
+		if !store.putIfGen(ctx, k, &ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(k)) {
 			t.Fatal("harness: the write must be stored")
 		}
 	}
@@ -68,7 +68,7 @@ func TestIssue890_ReassertCostsNothingWithoutAStrip(t *testing.T) {
 	first := WithL1KeyContext(context.Background(), kr)
 	d.Record(first, kr, dep.GVR, dep.Namespace, dep.Name)
 	d.RecordList(first, kr, dep.GVR, dep.Namespace)
-	if !store.PutIfGen(first, kr, &ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(kr)) {
+	if !store.putIfGen(first, kr, &ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(kr)) {
 		t.Fatal("harness: the first fill must be stored")
 	}
 	before = d.reassertCheckedTotal.Load()
@@ -77,7 +77,7 @@ func TestIssue890_ReassertCostsNothingWithoutAStrip(t *testing.T) {
 		gen := store.CaptureGen(kr)
 		d.Record(re, kr, dep.GVR, dep.Namespace, dep.Name) // dedup
 		d.RecordList(re, kr, dep.GVR, dep.Namespace)       // dedup
-		if !store.ReplaceIfGen(re, kr, &ResolvedEntry{RawJSON: []byte(`{"r":1}`)}, gen) {
+		if !store.replaceIfGen(re, kr, &ResolvedEntry{RawJSON: []byte(`{"r":1}`)}, gen) {
 			t.Fatal("harness: the refresh must be stored")
 		}
 	}
@@ -90,7 +90,7 @@ func TestIssue890_ReassertCostsNothingWithoutAStrip(t *testing.T) {
 	d.Record(ctx2, k2, dep.GVR, dep.Namespace, dep.Name)
 	d.RemoveL1Key(k2)
 	before = d.reassertCheckedTotal.Load()
-	if !store.PutIfGen(ctx2, k2, &ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(k2)) {
+	if !store.putIfGen(ctx2, k2, &ResolvedEntry{RawJSON: []byte(`{}`)}, store.CaptureGen(k2)) {
 		t.Fatal("harness: the write must be stored")
 	}
 	if got := d.reassertCheckedTotal.Load() - before; got != 1 {

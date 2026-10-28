@@ -43,7 +43,7 @@ func TestS398_Carrier_RefresherReResolveOfSecretStepNotRePut(t *testing.T) {
 	aliceCtx := psUserCtx(a, psAlice)
 	key, in := k423RAKey(t, aliceCtx)
 	in.RepresentativeUsername, in.RepresentativeGroups = psAlice, psGroups(a)
-	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"pre":"edit"}`), Inputs: in})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"pre":"edit"}`), Inputs: in})
 
 	// The RA was edited to add a Secret step; the refresher re-resolves it.
 	edited := psRACR(a)
@@ -91,8 +91,8 @@ func TestS398_Carrier_WidgetContentShellNotSeeded(t *testing.T) {
 
 	// The walker's resolve ctx with the sink installed and bumped — exactly what
 	// the resolver's per-call dispatch does for a core v1/secrets call.
-	ctx, sink := cache.WithSensitiveTouchedSink(context.Background())
-	sink.Bump()
+	ctx := withWidgetContentPutSinks(context.Background())
+	cache.SensitiveTouchedSinkFromContext(ctx).Bump()
 	before := sensitiveSkipped398()
 	populateWidgetContentL1(ctx, h1WidgetGVR, in, -1, -1, res, 0)
 
@@ -107,7 +107,7 @@ func TestS398_Carrier_WidgetContentShellNotSeeded(t *testing.T) {
 	}
 
 	// CONTROL: the same populate WITHOUT a sensitive read seeds the shell.
-	populateWidgetContentL1(context.Background(), h1WidgetGVR, in, -1, -1, res, 0)
+	populateWidgetContentL1(withWidgetContentPutSinks(context.Background()), h1WidgetGVR, in, -1, -1, res, 0)
 	if len(c.KeysForTest()) == 0 {
 		t.Fatalf("CONTROL: a non-sensitive populate must seed the shell (the arm would be vacuous otherwise)")
 	}

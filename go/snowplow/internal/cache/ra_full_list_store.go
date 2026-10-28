@@ -111,7 +111,7 @@ func (c *ResolvedCacheStore) PutRAFullList(v PutVerdict, key string, inputs Reso
 	// quietly; one that reasons about a gate can.
 	//
 	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — see the paragraphs above.
-	c.Put(key, &ResolvedEntry{
+	c.put(key, &ResolvedEntry{
 		RawJSON:     encoded,
 		Inputs:      &in,
 		Pinned:      pin,
@@ -168,7 +168,7 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, v PutVerdic
 	// (apiref.raFullListServe), same two stamp limbs, same arms holding it up.
 	//
 	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — twin of PutRAFullList above.
-	stored := c.PutIfGen(ctx, key, &ResolvedEntry{
+	stored := c.putIfGen(ctx, key, &ResolvedEntry{
 		RawJSON:     encoded,
 		Inputs:      &in,
 		Pinned:      pin,

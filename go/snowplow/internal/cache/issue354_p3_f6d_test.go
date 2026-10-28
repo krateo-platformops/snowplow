@@ -38,7 +38,7 @@ func TestIssue354_P3_F6d_WindowMapNeverOutlivesItsKeys(t *testing.T) {
 		in := ResolvedKeyInputs{CacheEntryClass: "restactions", Group: gvr.Group, Version: gvr.Version,
 			Resource: gvr.Resource, Namespace: "p3", Name: fmt.Sprintf("o%d", i), BindingUID: "uid"}
 		key := ComputeKey(in)
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		Deps().Record(context.Background(), key, gvr, "p3", in.Name)
 	}
 	for i := 0; i < n; i++ {
@@ -89,14 +89,14 @@ func TestIssue354_P3_F6d_RefilledKeyIsNotDirty(t *testing.T) {
 	in := ResolvedKeyInputs{CacheEntryClass: "restactions", Group: gvr.Group, Version: gvr.Version,
 		Resource: gvr.Resource, Namespace: "p3", Name: "refill", BindingUID: "uid"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in})
 	Deps().Record(context.Background(), key, gvr, "p3", in.Name)
 	Deps().OnUpdate(gvr, "p3", in.Name)
 	if _, dirty := dirtySince(key); !dirty {
 		t.Fatalf("PRE: the mark must open a window")
 	}
 	Deps().OnDelete(gvr, "p3", in.Name)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":2}`), Inputs: &in}) // the customer's cold refill
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":2}`), Inputs: &in}) // the customer's cold refill
 	s0 := c.Stats().StaleServedTotal
 	if _, ok := c.Get(key); !ok {
 		t.Fatalf("PRE: the refill must be resident")

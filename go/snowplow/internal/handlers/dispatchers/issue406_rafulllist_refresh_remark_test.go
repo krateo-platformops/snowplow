@@ -40,7 +40,7 @@ func TestIssue406_RefresherRAFullListRePut_RemarksSlicedWidgetOnlyOnChange(t *te
 	inputs.RepresentativeUsername = "admin"
 	raKey := cache.ComputeKey(inputs)
 	in := inputs
-	c.Put(raKey, &cache.ResolvedEntry{RawJSON: []byte(`{"items":["old"]}`), Inputs: &in})
+	c.PutResolved(fixtureStoreVerdict, raKey, &cache.ResolvedEntry{RawJSON: []byte(`{"items":["old"]}`), Inputs: &in})
 
 	// The widget cell, served through the 4a fast path over that raKey body.
 	const wKey = "L1_w406_refresher"
@@ -51,7 +51,7 @@ func TestIssue406_RefresherRAFullListRePut_RemarksSlicedWidgetOnlyOnChange(t *te
 	}
 	c.NoteRAFullListSlice(wctx, raKey, prior)
 	wIn := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "w406"}
-	if !c.PutIfGen(wctx, wKey, &cache.ResolvedEntry{RawJSON: []byte(`{"old":1}`), Inputs: &wIn}, c.CaptureGen(wKey)) {
+	if !c.PutResolvedIfGen(wctx, fixtureStoreVerdict, wKey, &cache.ResolvedEntry{RawJSON: []byte(`{"old":1}`), Inputs: &wIn}, c.CaptureGen(wKey)) {
 		t.Fatalf("setup: widget PutIfGen refused")
 	}
 

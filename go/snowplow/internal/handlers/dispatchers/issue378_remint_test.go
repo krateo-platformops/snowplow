@@ -170,7 +170,7 @@ func r378IdentityFreeCell(t *testing.T, ttlS, maxAgeS int, name string) (cache.R
 		Namespace: h1NS, Name: name, PerPage: -1, Page: -1}
 	key := cache.ComputeKey(in)
 	inCopy := in
-	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fill"}`), Inputs: &inCopy})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fill"}`), Inputs: &inCopy})
 	restore := setResolveOnceForTest(func(context.Context, cache.ResolvedKeyInputs) ([]byte, error) {
 		return []byte(`{"v":"refreshed"}`), nil
 	})
@@ -234,7 +234,7 @@ func TestIssue378_F2c_SeedModesInheritBornAtInTheWindow(t *testing.T) {
 	born := map[seedScopeMode]time.Time{}
 	for _, mode := range modes {
 		k := "r378-f2c-" + mode.String()
-		store.Put(k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
+		store.PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
 		e, _ := store.GetNoTouch(k)
 		keys[mode], born[mode] = k, e.BornAt
 	}

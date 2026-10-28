@@ -131,7 +131,7 @@ func TestResolvedCache_BasicGetPut(t *testing.T) {
 	if _, ok := c.Get("nope"); ok {
 		t.Fatalf("Get on empty cache must miss")
 	}
-	c.Put("k", &ResolvedEntry{RawJSON: []byte(`{"a":1}`)})
+	c.put("k", &ResolvedEntry{RawJSON: []byte(`{"a":1}`)})
 	got, ok := c.Get("k")
 	if !ok {
 		t.Fatalf("Get after Put should hit")
@@ -149,7 +149,7 @@ func TestResolvedCache_LRUEvictionAtEntryCap(t *testing.T) {
 	c := newResolvedCache(3, 1<<30, time.Hour) // 3 entries, generous bytes
 	// Insert 3 entries.
 	for i := 0; i < 3; i++ {
-		c.Put(fmt.Sprintf("k%d", i), &ResolvedEntry{RawJSON: []byte("x")})
+		c.put(fmt.Sprintf("k%d", i), &ResolvedEntry{RawJSON: []byte("x")})
 	}
 	if c.Len() != 3 {
 		t.Fatalf("expected 3 entries, got %d", c.Len())
@@ -157,7 +157,7 @@ func TestResolvedCache_LRUEvictionAtEntryCap(t *testing.T) {
 	// Touch k0 to make it MRU.
 	c.Get("k0")
 	// Add a fourth — k1 (now LRU) should evict.
-	c.Put("k3", &ResolvedEntry{RawJSON: []byte("x")})
+	c.put("k3", &ResolvedEntry{RawJSON: []byte("x")})
 	if _, ok := c.Get("k1"); ok {
 		t.Fatalf("k1 should have been LRU-evicted")
 	}
@@ -173,9 +173,9 @@ func TestResolvedCache_ByteBudgetEviction(t *testing.T) {
 	// Entries are ~100 bytes; budget = 250 bytes -> at most 2 fit.
 	c := newResolvedCache(1000, 250, time.Hour)
 	payload := strings.Repeat("a", 100)
-	c.Put("k1", &ResolvedEntry{RawJSON: []byte(payload)})
-	c.Put("k2", &ResolvedEntry{RawJSON: []byte(payload)})
-	c.Put("k3", &ResolvedEntry{RawJSON: []byte(payload)})
+	c.put("k1", &ResolvedEntry{RawJSON: []byte(payload)})
+	c.put("k2", &ResolvedEntry{RawJSON: []byte(payload)})
+	c.put("k3", &ResolvedEntry{RawJSON: []byte(payload)})
 	if got := c.Bytes(); got > 250 {
 		t.Fatalf("byte budget violated: %d > 250", got)
 	}
@@ -186,8 +186,8 @@ func TestResolvedCache_ByteBudgetEviction(t *testing.T) {
 
 func TestResolvedCache_ReplaceInPlace(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
-	c.Put("k", &ResolvedEntry{RawJSON: []byte("aaa")})
-	c.Put("k", &ResolvedEntry{RawJSON: []byte("bbbbb")})
+	c.put("k", &ResolvedEntry{RawJSON: []byte("aaa")})
+	c.put("k", &ResolvedEntry{RawJSON: []byte("bbbbb")})
 	if c.Len() != 1 {
 		t.Fatalf("expected 1 entry after replace, got %d", c.Len())
 	}
@@ -202,7 +202,7 @@ func TestResolvedCache_ReplaceInPlace(t *testing.T) {
 
 func TestResolvedCache_TTLExpiry(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, 10*time.Millisecond)
-	c.Put("k", &ResolvedEntry{RawJSON: []byte("x")})
+	c.put("k", &ResolvedEntry{RawJSON: []byte("x")})
 	if _, ok := c.Get("k"); !ok {
 		t.Fatalf("immediate Get should hit")
 	}
@@ -217,7 +217,7 @@ func TestResolvedCache_TTLExpiry(t *testing.T) {
 
 func TestResolvedCache_StatsHitRate(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
-	c.Put("k", &ResolvedEntry{RawJSON: []byte("x")})
+	c.put("k", &ResolvedEntry{RawJSON: []byte("x")})
 	c.Get("k") // hit
 	c.Get("k") // hit
 	c.Get("k") // hit
@@ -244,7 +244,7 @@ func TestResolvedCache_ConcurrentSafe(t *testing.T) {
 			for i := 0; i < 200; i++ {
 				k := fmt.Sprintf("k%d-%d", w, i%17)
 				if i%2 == 0 {
-					c.Put(k, &ResolvedEntry{RawJSON: []byte("x")})
+					c.put(k, &ResolvedEntry{RawJSON: []byte("x")})
 				} else {
 					c.Get(k)
 				}
@@ -261,7 +261,7 @@ func TestResolvedCache_EmptyTreatedAsMiss(t *testing.T) {
 	if _, ok := c.Get("x"); ok {
 		t.Fatalf("nil cache must miss, not hit")
 	}
-	c.Put("x", &ResolvedEntry{RawJSON: []byte("y")}) // must not panic
+	c.put("x", &ResolvedEntry{RawJSON: []byte("y")}) // must not panic
 	if c.Len() != 0 || c.Bytes() != 0 {
 		t.Fatalf("nil cache should report zero metrics")
 	}
@@ -315,7 +315,7 @@ func TestApistageCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 	c := newResolvedCache(1, 1<<20, time.Hour) // entry cap 1 → next Put evicts
 
 	// A non-apistage entry: api-stage counters stay 0.
-	c.Put("plain", &ResolvedEntry{
+	c.put("plain", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: "restactions"},
 	})
@@ -325,7 +325,7 @@ func TestApistageCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 
 	// An api-stage entry: store counter ticks; the cap-1 store evicts the
 	// "plain" entry (non-apistage → apistage_evict stays 0).
-	c.Put("stageA", &ResolvedEntry{
+	c.put("stageA", &ResolvedEntry{
 		RawJSON: []byte(`{"value":1}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Stage: "s1"},
 	})
@@ -338,7 +338,7 @@ func TestApistageCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 
 	// A second api-stage Put evicts the first api-stage entry → apistage
 	// evict counter ticks.
-	c.Put("stageB", &ResolvedEntry{
+	c.put("stageB", &ResolvedEntry{
 		RawJSON: []byte(`{"value":2}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Stage: "s2"},
 	})

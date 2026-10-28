@@ -85,7 +85,7 @@ func TestIssue544_RetryStillForcesContentMiss(t *testing.T) {
 	}
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "i544-retry"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
 	Deps().Record(context.Background(), key, g544A, "ns", "a")
 	Deps().Record(context.Background(), key, g544B, "ns", "b")
 
@@ -179,7 +179,7 @@ func TestIssue544_FirstAttemptSuccessLeavesNoRestoredTrigger(t *testing.T) {
 	}
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "i544-success"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
 	Deps().Record(context.Background(), key, g544A, "ns", "a")
 
 	var sawA atomic.Bool
@@ -240,7 +240,7 @@ func TestIssue544_FloorDeferredKeyConsumesTriggerAtEventualDispatch(t *testing.T
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "i544-floored"}
 	key := ComputeKey(in)
 	// FRESH CreatedAt → the first dequeue is inside the floor and is deferred.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now()})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now()})
 	Deps().Record(context.Background(), key, g544A, "ns", "a")
 
 	var attempts atomic.Int32

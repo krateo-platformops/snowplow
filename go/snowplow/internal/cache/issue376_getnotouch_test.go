@@ -15,7 +15,7 @@ func TestIssue376_GetNoTouch_NoStampNoHit(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "n", Name: "w"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in, SeededAtBoot: true})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in, SeededAtBoot: true})
 
 	h0 := c.Stats().HitTotal
 	if e, ok := c.GetNoTouch(key); !ok || e == nil {
@@ -60,7 +60,7 @@ func TestIssue376_GetNoTouch_KeepsLazyEvicts(t *testing.T) {
 	c.maxEntryAge = time.Minute
 	inA := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "n", Name: "maxage"}
 	keyA := ComputeKey(inA)
-	c.Put(keyA, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inA, BornAt: time.Now().Add(-2 * time.Hour), CreatedAt: time.Now()})
+	c.put(keyA, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inA, BornAt: time.Now().Add(-2 * time.Hour), CreatedAt: time.Now()})
 	beforeMax := c.Stats().EvictMaxAgeTotal
 	beforeMiss := c.Stats().MissTotal
 	if _, ok := c.GetNoTouch(keyA); ok {
@@ -76,7 +76,7 @@ func TestIssue376_GetNoTouch_KeepsLazyEvicts(t *testing.T) {
 	}
 	inB := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "n", Name: "ttl"}
 	keyB := ComputeKey(inB)
-	c.Put(keyB, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inB, CreatedAt: time.Now().Add(-time.Hour)})
+	c.put(keyB, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inB, CreatedAt: time.Now().Add(-time.Hour)})
 	beforeTTL := c.Stats().EvictTTLTotal
 	if _, ok := c.GetNoTouch(keyB); ok {
 		t.Fatal("#376(iv): GetNoTouch on a past-TTL cell must MISS (evicted)")
@@ -91,7 +91,7 @@ func TestIssue376_Has_NoSideEffects(t *testing.T) {
 	c.maxEntryAge = time.Minute
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "n", Name: "has"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, BornAt: time.Now().Add(-2 * time.Hour), CreatedAt: time.Now()})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, BornAt: time.Now().Add(-2 * time.Hour), CreatedAt: time.Now()})
 	h0, m0, e0 := c.Stats().HitTotal, c.Stats().MissTotal, c.Stats().EvictMaxAgeTotal
 	if !c.Has(key) {
 		t.Fatal("#376 Has: must report a resident key")
@@ -131,9 +131,9 @@ func TestIssue376_InternalReadStaysCold_No316Enqueue(t *testing.T) {
 	// customer-COLD (lastRead old) yet body-fresh/APPROACHING-TTL: Put old (cold-fill
 	// lastRead=CreatedAt=-100s) then ReplaceIfGen CreatedAt=-16s (replace-in-place
 	// inherits lastRead=-100s). Models a refresher-kept-fresh cell no customer read in 100s.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: in, CreatedAt: time.Now().Add(-100 * time.Second)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: in, CreatedAt: time.Now().Add(-100 * time.Second)})
 	gen := c.CaptureGen(key)
-	if !c.ReplaceIfGen(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"v":"refreshed"}`), Inputs: in, CreatedAt: time.Now().Add(-16 * time.Second)}, gen) {
+	if !c.replaceIfGen(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"v":"refreshed"}`), Inputs: in, CreatedAt: time.Now().Add(-16 * time.Second)}, gen) {
 		t.Fatal("setup: ReplaceIfGen must succeed")
 	}
 	if m, _ := c.MetadataForKey(key); m.LastReadSeconds < 20 || m.TTLRemainingSeconds >= 5 {
@@ -178,9 +178,9 @@ func TestIssue376_WarmGauge_InternalReadNeitherBucket(t *testing.T) {
 	// customer-COLD (lastRead aged past TTL) yet body within-TTL (resident): Put old
 	// (cold-fill lastRead=CreatedAt=-100s) then ReplaceIfGen CreatedAt=-1s — replace-
 	// in-place inherits the old lastRead=-100s while the body is freshly within TTL.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: in, CreatedAt: time.Now().Add(-100 * time.Second)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: in, CreatedAt: time.Now().Add(-100 * time.Second)})
 	gen := c.CaptureGen(key)
-	if !c.ReplaceIfGen(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
+	if !c.replaceIfGen(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
 		t.Fatal("setup: ReplaceIfGen must succeed")
 	}
 	if _, ok := c.GetNoTouch(key); !ok {
@@ -209,7 +209,7 @@ func TestIssue376_IsSelfRepresentationUsesGetNoTouch(t *testing.T) {
 	const ns = "krateo-system"
 	in := widgetInputs(gvr, ns, "selfprobe")
 	key := ComputeKey(*in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: in, SeededAtBoot: true})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: in, SeededAtBoot: true})
 
 	h0 := c.Stats().HitTotal
 	_ = Deps().isSelfRepresentation(c, key, DepKey{GVR: gvr, Namespace: ns, Name: "selfprobe"})

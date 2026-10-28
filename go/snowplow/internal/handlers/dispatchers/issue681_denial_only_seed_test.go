@@ -158,9 +158,10 @@ func TestIssue681_C2w_WalkDoesNotMarkAnOwnDial403AsExternal(t *testing.T) {
 		t.Fatal("C2w RED: the walk DES-marked an own-credential apiserver 403 as external")
 	}
 	// Control: a genuine external touch still marks.
-	ctx2 := cache.WithSeedDeclinedExternalSet(context.Background(), set)
-	ctx2, ext2 := cache.WithExternalTouchedSink(ctx2)
-	ext2.Bump()
+	// The walk's resolve ctx carries every Put-gate sink (withWidgetContentPutSinks);
+	// a verdict over a missing one is "unobserved" and marks nothing (#912 delta-3).
+	ctx2 := withWidgetContentPutSinks(cache.WithSeedDeclinedExternalSet(context.Background(), set))
+	cache.ExternalTouchedSinkFromContext(ctx2).Bump()
 	walkMarkDeclinedExternal(ctx2, "key/c2w-ext", w, "uid", "1", nil, false)
 	if !set.Marked("key/c2w-ext") {
 		t.Fatal("C2w control: a genuine external touch no longer marks")

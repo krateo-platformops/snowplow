@@ -132,7 +132,7 @@ func TestSeedTerminalPut_ReseedModes_RefusedOnRemoval(t *testing.T) {
 	for _, mode := range []seedScopeMode{seedModeRBACShift} {
 		t.Run(mode.String(), func(t *testing.T) {
 			k := "reseed-genrace-probe-" + mode.String()
-			store.Put(k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
+			store.PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
 			g := seedTerminalGuardFor(mode, store, k)
 			if !g.guarded {
 				t.Fatalf("%s: guard = %+v, want guarded", mode, g)
@@ -228,8 +228,9 @@ func TestReMint_SingleSetterAudit(t *testing.T) {
 	}
 	// #912 re-review — the refresher's write is verdict-gated: it calls
 	// ReplaceResolvedIfGenRefresh, and the ONLY call of the ungated
-	// ReplaceIfGenRefresh is that gated wrapper (cache/put_gated.go).
-	callRe := regexp.MustCompile(`\.ReplaceIfGenRefresh\(`)
+	// replaceIfGenRefresh (unexported since #912 delta-3 item 3) is that gated
+	// wrapper (cache/put_gated.go).
+	callRe := regexp.MustCompile(`\.replaceIfGenRefresh\(`)
 	gatedRe := regexp.MustCompile(`\.ReplaceResolvedIfGenRefresh\(`)
 	gatedCallers := map[string]int{}
 	retiredRe := regexp.MustCompile(`ReplaceIfGenReMint|seedModeReMint|reseedFromInputs`)
@@ -276,7 +277,7 @@ func TestReMint_SingleSetterAudit(t *testing.T) {
 	}
 	wrapper := filepath.ToSlash(filepath.Join(root, "internal", "cache", "put_gated.go"))
 	if total != 1 || callers[wrapper] != 1 {
-		t.Fatalf("ReplaceIfGenRefresh must have EXACTLY ONE production caller (its verdict-gated wrapper in %s); "+
+		t.Fatalf("replaceIfGenRefresh must have EXACTLY ONE production caller (its verdict-gated wrapper in %s); "+
 			"found %d call(s) across %v. A second caller lets a non-refresher write reset BornAt.", wrapper, total, callers)
 	}
 	want := filepath.ToSlash(filepath.Join(root, "internal", "handlers", "dispatchers", "resolve_populate.go"))

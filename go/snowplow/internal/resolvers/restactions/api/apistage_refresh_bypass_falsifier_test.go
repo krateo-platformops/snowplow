@@ -158,7 +158,7 @@ func putR1StaleContentEntry(store *cache.ResolvedCacheStore) string {
 		"status":     map[string]any{"managed": r1ManagedList(r1StaleManaged)},
 	}
 	raw, _ := json.Marshal(stale)
-	store.Put(key, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON: raw,
 		Inputs:  ptrTo(contentKeyInputs(r1FsaGVR, r1Ns, r1Name)),
 	})

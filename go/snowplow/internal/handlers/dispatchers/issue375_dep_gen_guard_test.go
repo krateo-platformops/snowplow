@@ -202,7 +202,7 @@ func TestIssue375_Arm7_BootSeedResolve_IsGuarded(t *testing.T) {
 		gen0 := cache.ResolvedCache().CaptureGen(nested)
 		cache.Deps().Record(resCtx, key, dep, "ns", "x")
 		cache.Deps().OnUpdate(dep, "ns", "x")
-		cache.ResolvedCache().PutIfGen(resCtx, nested, &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, gen0)
+		cache.ResolvedCache().PutResolvedIfGen(resCtx, fixtureStoreVerdict, nested, &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, gen0)
 		return nil
 	}
 	if err := seedOneRestaction(seedCohortCtx(user), "cohort-granted", ref, "krateo-system", seedModeBoot); err != nil {

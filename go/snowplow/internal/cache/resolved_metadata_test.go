@@ -77,7 +77,7 @@ func TestRangeMetadata_BehaviorallyEmitsNoBody(t *testing.T) {
 			Extras:          map[string]any{"compositionId": sentinel},
 		},
 	}
-	c.Put("opaque-key-1", entry)
+	c.put("opaque-key-1", entry)
 
 	var got []ResolvedEntryMeta
 	c.RangeMetadata(func(m ResolvedEntryMeta) bool {
@@ -131,7 +131,7 @@ func TestRangeMetadata_AgeAndTTL(t *testing.T) {
 		CreatedAt: time.Now().Add(-10 * time.Minute),
 		Inputs:    &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Version: "v1", Resource: "configmaps"},
 	}
-	c.Put("k-old", old)
+	c.put("k-old", old)
 
 	var m ResolvedEntryMeta
 	c.RangeMetadata(func(x ResolvedEntryMeta) bool { m = x; return false })

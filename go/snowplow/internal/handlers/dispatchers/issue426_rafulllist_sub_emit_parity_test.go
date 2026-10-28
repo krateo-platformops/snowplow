@@ -341,7 +341,7 @@ func TestIssue426_RAFullListRefreshDeliversToSubscriber(t *testing.T) {
 		full[i] = map[string]any{"n": i}
 	}
 	c := cache.ResolvedCache()
-	c.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), seedKey, seedIn, map[string]any{"items": full})
+	c.PutRAFullList(fixtureStoreVerdict, seedKey, seedIn, map[string]any{"items": full})
 	cache.RecordSliceability(seedKey, cache.SliceShapeHash("apiref", g.Group, g.Version, g.Resource,
 		i426NS, i426RAName, i426Filter), true)
 	cache.Deps().Record(context.Background(), seedKey, g, i426NS, i426RAName) // RA-CR self-dep

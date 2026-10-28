@@ -351,7 +351,7 @@ func TestIssue444_WidgetsCarrier_GroupRepReplacesDriftedRepresentative(t *testin
 	if dk, _ := wKey(psUserCtx(a, psDave)); dk != key {
 		t.Fatalf("PRE: carol and dave must share one widgets cell")
 	}
-	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"w":"pre-drift"}`), Inputs: in})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"w":"pre-drift"}`), Inputs: in})
 	stored := *in
 
 	rb := &rbacv1.RoleBinding{

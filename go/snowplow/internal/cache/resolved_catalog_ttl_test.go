@@ -25,13 +25,13 @@ func TestTTLOverride_ShortBackstopEvictsBeforeStandardTTL(t *testing.T) {
 	// Degraded entry: stored "while not servable" → short 1s override,
 	// CreatedAt backdated 2s so it is already past the override but FAR
 	// inside the 1h standard ttl.
-	c.Put("k-degraded", &ResolvedEntry{
+	c.put("k-degraded", &ResolvedEntry{
 		RawJSON:     []byte(`{}`),
 		CreatedAt:   time.Now().Add(-2 * time.Second),
 		TTLOverride: 1 * time.Second,
 	})
 	// Healthy entry: no override, same backdate → governed by the 1h ttl.
-	c.Put("k-healthy", &ResolvedEntry{
+	c.put("k-healthy", &ResolvedEntry{
 		RawJSON:   []byte(`{}`),
 		CreatedAt: time.Now().Add(-2 * time.Second),
 	})
@@ -51,7 +51,7 @@ func TestTTLOverride_ShortBackstopEvictsBeforeStandardTTL(t *testing.T) {
 // evict eagerly).
 func TestTTLOverride_HonouredWithinWindow(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
-	c.Put("k", &ResolvedEntry{
+	c.put("k", &ResolvedEntry{
 		RawJSON:     []byte(`{}`),
 		CreatedAt:   time.Now(), // fresh
 		TTLOverride: 1 * time.Hour,
@@ -70,7 +70,7 @@ func TestEffectiveTTL_OverrideOnlyTightens(t *testing.T) {
 	// Override of 10h (longer than the 1h standard) on an entry aged 2h:
 	// the entry is past the 1h standard ttl, so effectiveTTL must clamp to
 	// the standard ttl and evict it — the override must NOT keep it alive.
-	c.Put("k", &ResolvedEntry{
+	c.put("k", &ResolvedEntry{
 		RawJSON:     []byte(`{}`),
 		CreatedAt:   time.Now().Add(-2 * time.Hour),
 		TTLOverride: 10 * time.Hour,

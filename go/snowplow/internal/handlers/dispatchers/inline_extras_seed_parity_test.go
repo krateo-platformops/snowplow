@@ -118,7 +118,7 @@ func TestInlineExtras_6_SeedParity_RAFullListSubCell(t *testing.T) {
 		t.Fatal("expected a live resolved cache")
 	}
 	full := map[string]any{"items": []any{map[string]any{"x": float64(1)}}}
-	c.PutRAFullList(cache.PutGateVerdict(cache.PutGateSinks{}, cache.CacheEntryClassRAFullList), seedRAKey, cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
+	c.PutRAFullList(fixtureStoreVerdict, seedRAKey, cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		widgets.GetApiRefExtras(cr)), full)
 	if _, hit := c.Get(serveRAKey); !hit {
 		t.Fatal("FALSIFIER #6 FAILED (RAFullList sub-cell): serve-key lookup MISSED the seeded full-list cell")

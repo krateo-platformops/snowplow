@@ -160,7 +160,7 @@ func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
 		t.Fatalf("ResolvedCache nil — CACHE_ENABLED test setup broken")
 	}
 	const l1Key = "test:composition-evict"
-	rc.Put(l1Key, &cache.ResolvedEntry{
+	rc.PutResolved(fixtureStoreVerdict, l1Key, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"items":["before"]}`),
 		Inputs: &cache.ResolvedKeyInputs{
 			CacheEntryClass: "restactions",

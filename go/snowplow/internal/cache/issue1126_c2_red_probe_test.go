@@ -40,7 +40,7 @@ func TestIssue1126_E1_RedProbe_MissedDeleteSurvivesRelistWithoutTheBridge(t *tes
 	rw, dyn, faults := c2Watcher(t, gvr)
 	createObj(t, rw, dyn, gvr, b5NS, "button-x", "x")
 	key := "L1_button-x"
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"pre-delete"}`), Inputs: widgetInputs(gvr, b5NS, "button-x")})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"pre-delete"}`), Inputs: widgetInputs(gvr, b5NS, "button-x")})
 	Deps().Record(context.Background(), key, gvr, b5NS, "button-x")
 
 	faults.swallow("button-x")

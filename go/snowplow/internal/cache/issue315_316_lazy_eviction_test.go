@@ -87,7 +87,7 @@ func TestIssue315_GetHitStampsLastRead(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "w"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in, SeededAtBoot: true})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in, SeededAtBoot: true})
 
 	// Seeded, never traffic-read → LastReadSeconds == -1.
 	if m, ok := c.MetadataForKey(key); !ok || m.LastReadSeconds != -1 {
@@ -112,7 +112,7 @@ func i316WarmApproachingTTL(t *testing.T, c *ResolvedCacheStore, name string, tt
 	const ns = "team-a"
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: ns, Name: name}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-ttlAgo)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-ttlAgo)})
 	Deps().Record(context.Background(), key, gvr, ns, name)
 	if warmViaGet {
 		if _, ok := c.Get(key); !ok {
@@ -154,7 +154,7 @@ func TestIssue316_MissedDirtyMark_WarmCellProactivelyRefreshed(t *testing.T) {
 
 	// FRESH indexer: the refresher re-resolves to v2.
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
 		return nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -219,7 +219,7 @@ func TestIssue316_StaleSource_PassCannotManufactureFreshness(t *testing.T) {
 	// informer cache — #244, not #316).
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
 		reresolves.Add(1)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &used})
 		return nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -315,7 +315,7 @@ func TestIssue316_TTLOverrideCell_NotProactivelyRefreshed(t *testing.T) {
 	key := ComputeKey(in)
 	// TTLOverride=8s, body 7s old → EFFECTIVE TTLRemaining ~1s (< standard TTL/4=5),
 	// so it WOULD be a refresh candidate if not for the TTLOverride exclusion.
-	c.Put(key, &ResolvedEntry{
+	c.put(key, &ResolvedEntry{
 		RawJSON:     []byte(coherenceV1),
 		Inputs:      &in,
 		CreatedAt:   time.Now().Add(-7 * time.Second),
@@ -344,14 +344,14 @@ func TestIssue315_ColdFillPut_IsImmediatelyWarm(t *testing.T) {
 
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "coldfill"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in}) // cold-fill (SeededAtBoot=false)
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in}) // cold-fill (SeededAtBoot=false)
 	if m, ok := c.MetadataForKey(key); !ok || m.LastReadSeconds < 0 {
 		t.Fatalf("a cold-fill (non-seeded) Put must be immediately warm (LastReadSeconds>=0, no 2nd read); ok=%v got=%d", ok, m.LastReadSeconds)
 	}
 
 	sin := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "seed"}
 	skey := ComputeKey(sin)
-	c.Put(skey, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &sin, SeededAtBoot: true})
+	c.put(skey, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &sin, SeededAtBoot: true})
 	if m, ok := c.MetadataForKey(skey); !ok || m.LastReadSeconds != -1 {
 		t.Fatalf("a boot-seed Put must leave LastReadSeconds=-1 (warm via SeededAtBoot, not lastRead); ok=%v got=%d", ok, m.LastReadSeconds)
 	}
@@ -385,7 +385,7 @@ func TestIssue315_LastReadWarmPastMaxAge_NotEvicted(t *testing.T) {
 	const ns = "krateo-system"
 	in := widgetInputs(gvrFlexes(), ns, "lastread-warm")
 	key := ComputeKey(*in)
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON:   []byte(`{"lrw":1}`),
 		Inputs:    in,
 		BornAt:    time.Now().Add(-2 * time.Hour), // past the 60s cap

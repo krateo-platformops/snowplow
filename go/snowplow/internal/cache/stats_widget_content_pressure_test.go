@@ -115,7 +115,7 @@ func TestWidgetContentCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 	c := newResolvedCache(1, 1<<20, time.Hour) // entry cap 1 → next Put evicts
 
 	// A non-widgetContent entry: widget-content counters stay 0.
-	c.Put("plain", &ResolvedEntry{
+	c.put("plain", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: "restactions"},
 	})
@@ -126,7 +126,7 @@ func TestWidgetContentCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 
 	// First widgetContent entry: store ticks; evicting the plain entry does NOT
 	// bump the widget-content evict counter (class-attributed).
-	c.Put("wcA", &ResolvedEntry{
+	c.put("wcA", &ResolvedEntry{
 		RawJSON: []byte(`{"v":1}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassWidgetContent, Namespace: "ns", Name: "a"},
 	})
@@ -137,7 +137,7 @@ func TestWidgetContentCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 
 	// Second widgetContent entry evicts the first widgetContent entry → evict
 	// counter ticks; ratio = 1/2.
-	c.Put("wcB", &ResolvedEntry{
+	c.put("wcB", &ResolvedEntry{
 		RawJSON: []byte(`{"v":2}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassWidgetContent, Namespace: "ns", Name: "b"},
 	})
@@ -158,7 +158,7 @@ func TestWidgetContentCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 func TestRAFullListCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 	c := newResolvedCache(1, 1<<20, time.Hour)
 
-	c.Put("plain", &ResolvedEntry{
+	c.put("plain", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: "restactions"},
 	})
@@ -167,7 +167,7 @@ func TestRAFullListCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 			s.RAFullListStoreTotal, s.RAFullListEvictTotal)
 	}
 
-	c.Put("rfA", &ResolvedEntry{
+	c.put("rfA", &ResolvedEntry{
 		RawJSON: []byte(`{"items":[1]}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Name: "a"},
 	})
@@ -176,7 +176,7 @@ func TestRAFullListCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 			s.RAFullListStoreTotal, s.RAFullListEvictTotal)
 	}
 
-	c.Put("rfB", &ResolvedEntry{
+	c.put("rfB", &ResolvedEntry{
 		RawJSON: []byte(`{"items":[2]}`),
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Name: "b"},
 	})

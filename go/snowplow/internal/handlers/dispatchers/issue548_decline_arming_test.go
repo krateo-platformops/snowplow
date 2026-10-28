@@ -276,7 +276,7 @@ func TestIssue548_Widgets_NoDeclineBranchArms(t *testing.T) {
 			user: h1User,
 			during: func(t *testing.T, _ context.Context, key string) {
 				c := cache.ResolvedCache()
-				c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+				c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 				c.DeleteForTest(key)
 			},
 		},
@@ -535,7 +535,7 @@ func TestIssue548_RESTActions_NoDeclineBranchArms(t *testing.T) {
 			user: h1User,
 			during: func(t *testing.T, _ context.Context, key string) {
 				c := cache.ResolvedCache()
-				c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+				c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 				c.DeleteForTest(key)
 			},
 		},

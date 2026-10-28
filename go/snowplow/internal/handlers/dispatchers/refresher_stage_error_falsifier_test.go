@@ -85,7 +85,7 @@ func TestRefresher_StageErrorDoesNotOverwriteGoodEntry(t *testing.T) {
 		RepresentativeGroups:   []string{"devs"},
 	}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})
 
 	// Emulate the poisoned re-resolve: touch the stage-error sink that
 	// resolveAndPopulateL1 installed on ctx (this is exactly what the api
@@ -146,7 +146,7 @@ func TestRefresher_LegitimateEmptyIsStored(t *testing.T) {
 		RepresentativeUsername: "loner",
 	}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})
 
 	// Empty result, NO sink touch — a legitimate "0 compositions" outcome.
 	restore := setResolveOnceForTest(func(_ context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {

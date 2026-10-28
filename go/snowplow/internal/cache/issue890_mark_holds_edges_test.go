@@ -21,7 +21,7 @@ func TestIssue890_DeclinedExternalMarkHoldsItsKeysEdges(t *testing.T) {
 
 	t.Run("refusal_keeps_a_held_key", func(t *testing.T) {
 		k := "L1_890_marked_refused"
-		store.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`)})
+		store.put(k, &ResolvedEntry{RawJSON: []byte(`{}`)})
 		gen := store.CaptureGen(k)
 		old, _ := store.GetNoTouch(k)
 		store.EvictUnrefreshable(k, old)
@@ -29,7 +29,7 @@ func TestIssue890_DeclinedExternalMarkHoldsItsKeysEdges(t *testing.T) {
 		d.Record(ctx, k, dep.GVR, dep.Namespace, dep.Name)
 		set.MarkWith(k, &DeclinedExternalMark{Widget: widget, Deps: []DepKey{dep}})
 		t.Cleanup(func() { set.Unmark(k) })
-		if store.PutIfGen(ctx, k, &ResolvedEntry{RawJSON: []byte(`{"x":1}`)}, gen) {
+		if store.putIfGen(ctx, k, &ResolvedEntry{RawJSON: []byte(`{"x":1}`)}, gen) {
 			t.Fatal("harness: the write-back of the evicted cell must be refused")
 		}
 		if !d.hasEdge(k, dep) {

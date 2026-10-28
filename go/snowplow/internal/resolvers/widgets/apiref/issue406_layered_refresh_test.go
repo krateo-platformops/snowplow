@@ -108,7 +108,7 @@ func (h *layered406) coldFill() {
 	ctx := cache.WithL1KeyContext(h.base, h.wKey)
 	gen0 := c.CaptureGen(h.wKey)
 	body := h.serveWidget(ctx)
-	if !c.PutIfGen(ctx, h.wKey, &cache.ResolvedEntry{RawJSON: body, Inputs: edge3WidgetInputs("w406")}, gen0) {
+	if !c.PutResolvedIfGen(ctx, fixtureStoreVerdict, h.wKey, &cache.ResolvedEntry{RawJSON: body, Inputs: edge3WidgetInputs("w406")}, gen0) {
 		h.t.Fatalf("setup: widget cold PutIfGen refused")
 	}
 	if _, ok := c.GetNoTouch(h.raKey); !ok {
@@ -143,7 +143,7 @@ func (h *layered406) refresh(k string) {
 	default:
 		return
 	}
-	if !c.ReplaceIfGen(rctx, k, entry, gen0) {
+	if !c.ReplaceResolvedIfGen(rctx, fixtureStoreVerdict, k, entry, gen0) {
 		h.t.Fatalf("refresh of %q: ReplaceIfGen refused", k)
 	}
 	h.refreshes[k]++
