@@ -204,6 +204,9 @@ def core_features(chart: str) -> tuple[str, ...]:
     directory or the pull workdir holding exactly one. Raises ValueError when
     the define is missing or is not a static space-separated list: the rule
     this gate mirrors is then not the chart's."""
+    if not os.path.isdir(chart):
+        raise ValueError(f"{chart}: no pulled installer chart there (the source step pulls it): "
+                         "the installer's core features cannot be read")
     if not os.path.isfile(os.path.join(chart, "Chart.yaml")):
         subs = [d for d in sorted(os.listdir(chart))
                 if os.path.isfile(os.path.join(chart, d, "Chart.yaml"))]

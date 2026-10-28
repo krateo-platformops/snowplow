@@ -362,6 +362,29 @@ def test_the_preflight_job_redacts_with_the_shipped_identity_module(tmp_path):
     assert 'User "<redacted>"' in rec["menu"]["error"] and "scaleuser-0000" not in p.stdout
 
 
+def test_route_bodies_naming_a_user_are_redacted_inside_the_records_lists():
+    """#946 delta T1: the record's LISTS carry raw answer bodies too: a route's
+    404 lands in `refused`, a 5xx in `product_errors`. Both name the user;
+    neither the record nor run606's printed summary may."""
+    tree = _part(2)
+    ref = {r["id"]: P("flexes", r["name"], r["namespace"]) for r in NAV["refs"]}
+    dash, comps = ref["page-dashboard"], ref["page-compositions"]
+    body = ('flexes.widgets.templates.krateo.io "page-{}" is forbidden: User "scaleuser-0000" '
+            'cannot get resource "flexes" in API group "widgets.templates.krateo.io"')
+    fake = Fake(tree, status={dash: 404, comps: 500},
+                bodies={dash: body.format("dashboard"), comps: body.format("compositions")})
+    out = load606.preflight(fake, "t", load606.Portal(init=INIT))
+    assert [x["path"] for x in out["refused"]] == ["/dashboard"]
+    assert [x["path"] for x in out["product_errors"]] == ["/compositions"]
+    for x in out["refused"] + out["product_errors"]:
+        assert 'User "<redacted>" cannot get resource "flexes"' in x["body"]
+    assert "scaleuser-0000" not in json.dumps(out)
+    p = subprocess.run([sys.executable, "-m", "bench.load606", "preflight-summary"], cwd=BENCH_DIR,
+                       input=json.dumps(out) + "\n", capture_output=True, text=True, timeout=60)
+    assert "REFUSED /dashboard -> 404" in p.stdout and "PRODUCT ERROR" in p.stdout
+    assert 'User "<redacted>"' in p.stdout and "scaleuser-0000" not in p.stdout
+
+
 # ─── R1: the menu read twice ─────────────────────────────────────────────────
 
 
@@ -397,6 +420,26 @@ def test_a_menu_that_changes_between_two_reads_refuses_at_preflight():
     # the same menu twice: no refusal, the re-read recorded
     out = load606.preflight(ChangingFake(_part(4), _part(4)), "t", load606.Portal(init=INIT))
     assert out["ok"] and out["menu"]["reread"]["same"] is True
+
+
+def _pick(paths):
+    items = [i for i in NAV["items"] if i["path"] in paths]
+    ids = {i["resourceRefId"] for i in items}
+    return _shell_0_3_459(items, [r for r in NAV["refs"] if r["id"] in ids])
+
+
+def test_a_menu_that_swaps_a_route_at_the_same_count_refuses_at_preflight():
+    """#946 delta T2: the SET is compared, not the count: two routes, then two
+    routes with one swapped for another."""
+    out = load606.preflight(ChangingFake(_pick({"/dashboard", "/compositions"}),
+                                         _pick({"/dashboard", "/blueprints"})),
+                            "t", load606.Portal(init=INIT))
+    assert not out["ok"]
+    rr = out["menu"]["reread"]
+    assert (rr["routes"], rr["added"], rr["removed"], rr["same"]) == (2, ["/blueprints"], ["/compositions"], False)
+    r = [x for x in out["refused"] if x["path"] == "(sidebar menu)"]
+    assert len(r) == 1 and "2 routes, then 2" in r[0]["body"]
+    assert "added ['/blueprints'], removed ['/compositions']" in r[0]["body"]
 
 
 # ─── R2 / R3 through run606.sh ───────────────────────────────────────────────
@@ -443,6 +486,8 @@ def test_core_features_are_read_from_the_pulled_chart(tmp_path, body, want):
 
 
 def test_core_features_fail_closed_on_a_rule_this_gate_does_not_mirror(tmp_path):
+    with pytest.raises(ValueError, match="no pulled installer chart there"):
+        diag606.core_features(str(tmp_path / "never-pulled"))
     chart = tmp_path / "installer"
     (chart / "templates").mkdir(parents=True)
     (chart / "Chart.yaml").write_text("name: installer\n")
