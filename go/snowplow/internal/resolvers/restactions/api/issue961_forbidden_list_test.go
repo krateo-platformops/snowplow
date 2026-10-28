@@ -310,7 +310,14 @@ func canon961(t *testing.T, v any) string {
 	}
 	if m, ok := g.(map[string]any); ok {
 		if items, ok := m["items"].([]any); ok {
-			issue624SortItems(items)
+			key := func(v any) string {
+				it, _ := v.(map[string]any)
+				md, _ := it["metadata"].(map[string]any)
+				ns, _ := md["namespace"].(string)
+				n, _ := md["name"].(string)
+				return ns + "/" + n
+			}
+			sort.SliceStable(items, func(i, j int) bool { return key(items[i]) < key(items[j]) })
 		}
 	}
 	b, _ = json.Marshal(g)
