@@ -1431,6 +1431,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			slog.String("dispatch", "branch-e-sa-regate-denied"))
 		return nil
 	}
+	// #905 — a customer write is sent exactly once. This is the one place a
+	// write leaves snowplow (every other dispatch branch is GET-only), so the
+	// D2 stale-serve sink is asked here, right before the send: a pass that is
+	// already stale-derived does not send it (that pass is withdrawn and re-run
+	// with D2 disabled, and the re-run sends it), and a sent write ends D2 for
+	// the rest of the resolve (stale_write_once.go).
+	if r.refuseWriteFromStalePass(gctx, sc, i) {
+		return nil
+	}
 	cache.ExternalTouchedSinkFromContext(gctx).Bump()
 	// #643 PR-A — count the fetch at the same site that marks the touch, by
 	// origin (background driver vs customer /call).
@@ -2026,8 +2035,16 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	// (#915) included. Classified ONCE over the spec, before any exit (#912
 	// N2): a resolve that stops before running a stage (no client config, no
 	// identity, a dependsOn naming no stage or a cycle) is never stored either.
+	//
+	// #905 (#913 re-review) — the same classification marks the REQUEST's D2
+	// sink too (a nested resolve's write included), before any stage runs, so
+	// staleServeEligible refuses every later read of the request: a RESTAction
+	// that declares a write is never served stale content. The hold / withdraw
+	// / re-run machinery then only applies to a write first seen inside a
+	// nested resolve. ONE classification, both marks.
 	if declaredWriteStage(opts.Items) != "" {
 		cache.ExternalTouchedSinkFromContext(ctx).MarkDeclaredWrite()
+		cache.StaleServeSinkForWrite(ctx).NoteDeclaredWrite()
 	}
 
 	if opts.RC == nil {

@@ -201,10 +201,23 @@ var (
 
 // staleServeEligible reports whether ctx's resolve may be served stale: a
 // CUSTOMER read (not background, not a refill, not inert) under an armable
-// customer dispatch (a stale-serve sink).
+// customer dispatch (a stale-serve sink) whose request has not yet resolved a
+// RESTAction that DECLARES a write stage (#905, #913 re-review). The mark is
+// set from the spec before that RESTAction runs any stage, so it precedes every
+// write it can send: a write RESTAction is never stale-derived, and a read
+// after any write of the request reads through (a stale serve there would get
+// the request withdrawn and re-run, sending the write twice).
+//
+// This is the fast path. A read and a NESTED write CAN run in parallel (nested
+// resolve:true items of one stage, each resolving a RESTAction with its own
+// stages): a read may pass here just before a sibling marks the sink. So the
+// decision itself is atomic: serveStaleWithDebt notes the stale serve with
+// NoteIfNoWrite, under the lock BeginWrite takes — either the read is served
+// stale first and the write is held (the request is re-run fresh), or the write
+// is begun first and the read reads through.
 func staleServeEligible(ctx context.Context) (*cache.StaleServeSink, bool) {
 	s := cache.StaleServeSinkFromContext(ctx)
-	if s == nil || cache.Inert(ctx) || contentFillClassOf(ctx) != fillClassCustomer {
+	if s == nil || cache.Inert(ctx) || contentFillClassOf(ctx) != fillClassCustomer || s.DeclaredWrite() {
 		return nil, false
 	}
 	return s, true
@@ -239,6 +252,12 @@ func serveStaleWithDebt(ctx context.Context, sink *cache.StaleServeSink, store *
 	if !hit || entry == nil {
 		return nil, false
 	}
+	// #905 — the stale serve is noted atomically with BeginWrite: when a write
+	// of this request was already sent (a parallel nested item), the read is
+	// not served stale (it reads through) and no debt is opened for it.
+	if !sink.NoteIfNoWrite(k) {
+		return nil, false
+	}
 	if staleServeRegistrationHookForTest != nil {
 		staleServeRegistrationHookForTest() // D2-7: a refill may commit here; it waits on this lock
 	}
@@ -268,7 +287,6 @@ func serveStaleWithDebt(ctx context.Context, sink *cache.StaleServeSink, store *
 		d.dependents[sink] = staleDependent{servedAt: now}
 	}
 	sink.NoteServedAt(now)
-	sink.Note(k)
 	staleServeTotal.Add(1)
 	staleServeAgeHist.record(now.Sub(t0).Milliseconds())
 	ensureStaleOverdueScanner()

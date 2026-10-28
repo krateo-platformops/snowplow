@@ -52,6 +52,18 @@ type StaleServeSink struct {
 	state           staleSinkState
 	replaceOnCommit bool
 	servedAt        time.Time
+	// wrote (#905): a write stage of this resolve was sent. From then on no read
+	// of it is served stale (NoteIfNoWrite refuses, under the lock BeginWrite
+	// takes), so it can never be withdrawn and re-run, which would send the
+	// write a second time.
+	wrote bool
+	// declaredWrite (#905, #913 re-review): a RESTAction resolved for this
+	// request DECLARES a write stage. It is known from the spec before any stage
+	// runs, so the request is never served stale from then on: a top-level
+	// write RESTAction is never stale-derived at all, and the hold / withdraw /
+	// re-run machinery only ever applies to a write first seen inside a nested
+	// resolve, after a read was already served stale.
+	declaredWrite bool
 }
 
 type staleServedRef struct {
@@ -145,6 +157,38 @@ func StaleServeSinkFromContext(ctx context.Context) *StaleServeSink {
 	return s
 }
 
+// StaleServeSinkForWrite (#905) is the customer request's sink WHATEVER L1 key
+// the resolve is filling now. A write anywhere under the request — in a nested
+// resolve that re-scoped to its own cell included — is sent or held for the
+// request as a whole, because it is the request that is withdrawn and re-run.
+func StaleServeSinkForWrite(ctx context.Context) *StaleServeSink {
+	if ctx == nil {
+		return nil
+	}
+	s, _ := ctx.Value(ctxKeyStaleServeSink).(*StaleServeSink)
+	return s
+}
+
+// NoteIfNoWrite (#905) is Note, atomic with BeginWrite: it records the stale
+// serve of contentKey and returns true, unless a write of this resolve was
+// already sent, in which case it records nothing and returns false (the read
+// must read through). Under the sink's lock, so a stale read and a write
+// running in parallel (nested resolve:true items of one stage) can never both
+// happen: either the stale serve is noted first and the write is held, or the
+// write is begun first and the read is not served stale. Nil-safe (true).
+func (s *StaleServeSink) NoteIfNoWrite(contentKey string) bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wrote {
+		return false
+	}
+	s.served = append(s.served, staleServedRef{key: contentKey})
+	return true
+}
+
 // L1Key is the dependent customer cell's key. Nil-safe.
 func (s *StaleServeSink) L1Key() string {
 	if s == nil {
@@ -182,6 +226,55 @@ func (s *StaleServeSink) StaleDerived() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.served) > 0
+}
+
+// BeginWrite (#905) is asked before a write stage item of this resolve is
+// sent. A customer resolve that is stale-derived (D2) is withdrawn and re-run
+// at its write point whenever its Put is declined — and a sent write always
+// declines it (an external touch) — so a write sent from it would be sent again
+// by the re-run. BeginWrite therefore answers:
+//   - false when the resolve is already stale-derived: the write must not be
+//     sent from this pass (its re-run, with D2 disabled, sends it once);
+//   - true otherwise, and records that a write was sent: a parallel read that
+//     reaches serveStaleWithDebt afterwards is refused (NoteIfNoWrite), so the
+//     request is never served stale after its write and never re-run. (A read
+//     that STARTS after the write never gets that far: the RESTAction that
+//     sent it marked the sink DeclaredWrite before its first stage.)
+//
+// Nil-safe: no sink (no D2 for this resolve) → true.
+func (s *StaleServeSink) BeginWrite() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.served) > 0 {
+		return false
+	}
+	s.wrote = true
+	return true
+}
+
+// NoteDeclaredWrite records that a RESTAction resolved for this request
+// declares a write stage (see declaredWrite). Nil-safe.
+func (s *StaleServeSink) NoteDeclaredWrite() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.declaredWrite = true
+	s.mu.Unlock()
+}
+
+// DeclaredWrite reports whether a RESTAction resolved for this request declares
+// a write stage (NoteDeclaredWrite). Nil-safe.
+func (s *StaleServeSink) DeclaredWrite() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.declaredWrite
 }
 
 // NoteServedAt records the first stale serve's time (the stale_to_push
