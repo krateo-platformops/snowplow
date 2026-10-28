@@ -1481,7 +1481,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// AUDIT-4 (installer#410) — a write-verb stage records what the authority it
 	// was sent to answered, as observed at the dial: never the fetch's reshaped
 	// envelope, nor what the stage filter below makes of it (stage_audit.go).
-	auditStageWrite(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, apiCall, call, answer)
+	auditStageWrite(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, apiCall, call, answer, jsonBytes)
 
 	// SUCCESS (feat/restaction-yaml-response): on a non-Failure fetch the
 	// owned fetch does NOT invoke call.ResponseHandler (unlike httpcall.Do);

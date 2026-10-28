@@ -16,6 +16,11 @@
 // that only evaluates (an access review, a render) is recorded like any other
 // POST.
 //
+// A successful write to the apiserver (no endpointRef) also records the written
+// object's uid, generation and resourceVersion, read from the apiserver's
+// answer (#957, audit.Event.RecordWrittenObject): three object identifiers,
+// never the body itself. A write to a named endpoint records none of them.
+//
 // WHAT A RECORD NEVER HOLDS. This trail is kept for 365 days, so nothing that
 // can carry a credential goes into it:
 //   - the request PATH: a webhook path (Slack /services/T/B/<secret>, Discord
@@ -83,8 +88,10 @@ func isSafeMethod(verb string) bool {
 
 // stageAuditEvent builds the record for one write-verb stage dial whose
 // authority answered a, or reports false when the dial is not one the trail
-// records: a safe method, or a resolve that is not a customer request.
-func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *dialAnswer) (audit.Event, bool) {
+// records: a safe method, or a resolve that is not a customer request. body is
+// the 2xx response body the dial returned (nil when there is none): a write to
+// the apiserver records the identity of the object it names (#957).
+func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *dialAnswer, body []byte) (audit.Event, bool) {
 	verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
 	if isSafeMethod(verb) {
 		return audit.Event{}, false
@@ -109,16 +116,24 @@ func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *t
 	// the Kubernetes apiserver: its path names the object acted on, and the
 	// object's coordinates are recorded as /call records them. A named endpoint
 	// may be any HTTP API: nothing of its path is recorded.
+	apiServerObject := false
 	if apiCall.EndpointRef == nil && !cache.ServiceAccountDialFromContext(ctx) {
 		path, _, _ := strings.Cut(call.Path, "?")
 		if gvr, ns, name, ok := cache.ParseAPIServerPathToDep(path); ok {
 			ev.Group, ev.Version, ev.Resource = gvr.Group, gvr.Version, gvr.Resource
 			ev.Namespace, ev.Name = ns, name
 			ev.Subresource = apiServerSubresource(path)
+			apiServerObject = true
 		}
 	}
 
 	ev.Outcome, ev.Code, ev.Message = outcomeOf(a)
+	// #957 — the written object's identity accompanies its coordinates: only a
+	// record that names a Kubernetes object can say which object it was. It is
+	// read from the response, never from the stage's request payload.
+	if apiServerObject {
+		ev.RecordWrittenObject(body)
+	}
 	return ev, true
 }
 
@@ -144,8 +159,8 @@ func outcomeMessage(code int) string {
 }
 
 // auditStageWrite emits the record for one dialled stage (see stageAuditEvent).
-func auditStageWrite(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *dialAnswer) {
-	if ev, ok := stageAuditEvent(ctx, raNamespace, raName, apiCall, call, a); ok {
+func auditStageWrite(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *dialAnswer, body []byte) {
+	if ev, ok := stageAuditEvent(ctx, raNamespace, raName, apiCall, call, a, body); ok {
 		audit.Emit(ctx, ev)
 	}
 }

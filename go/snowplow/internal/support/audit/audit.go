@@ -169,11 +169,30 @@ type Event struct {
 	RESTActionNamespace string
 	RESTActionName      string
 	Stage               string
+
+	// ObjectUID/ObjectGeneration/ObjectResourceVersion are the identity of the
+	// object a successful Kubernetes write wrote, as the apiserver RETURNED it
+	// (#957, krateo-acmp#59 Option B) -> k8s.object.{uid,generation,
+	// resource_version}. They are the join key to the audit record of the
+	// controller that later reconciles that object: it records the same uid and
+	// the generation it acted on. The attribute keys are those of the shared
+	// emitter, github.com/krateo-platformops/audit, so the join cannot drift.
+	// Optional: set only by RecordWrittenObject (written_object.go), so a failed
+	// write, a read, a dry run or a write to a non-Kubernetes endpoint carries
+	// none of them. A zero generation is omitted.
+	ObjectUID             string
+	ObjectGeneration      int64
+	ObjectResourceVersion string
 }
 
 // missingFields returns, in a fixed order, the fields other than the actor
 // that ev lacks to answer "what was done to which target": action, method,
 // target (a Kubernetes resource or a server address). Empty when complete.
+//
+// The written object's identity (ObjectUID, ObjectGeneration,
+// ObjectResourceVersion) is OPTIONAL and never listed here: only a successful
+// Kubernetes write has a returned object, so its absence on a failure, a read,
+// a dry run or an external endpoint is the correct record, not a gap.
 func missingFields(ev Event) []string {
 	var out []string
 	if ev.Action == "" {
@@ -267,7 +286,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 		rec.SetSeverityText("ERROR")
 	}
 
-	attrs := make([]attribute.KeyValue, 0, 22)
+	attrs := make([]attribute.KeyValue, 0, 25)
 	add := func(k, v string) {
 		if v != "" {
 			attrs = append(attrs, attribute.String(k, v))
@@ -286,6 +305,8 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	add("k8s.resource.resource", ev.Resource)
 	add("k8s.resource.subresource", ev.Subresource)
 	add("k8s.resource.name", ev.Name)
+	add("k8s.object.uid", ev.ObjectUID)
+	add("k8s.object.resource_version", ev.ObjectResourceVersion)
 	add("krateo.action", ev.Action)
 	add("http.request.method", ev.Verb)
 	add("outcome", ev.Outcome)
@@ -299,6 +320,9 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 		// v0.21.0: the log API adopted the shared attribute value types, so the
 		// hand-rolled []log.Value is now just a typed string slice.
 		attrs = append(attrs, attribute.StringSlice("user.roles", groups))
+	}
+	if ev.ObjectGeneration != 0 {
+		attrs = append(attrs, attribute.Int64("k8s.object.generation", ev.ObjectGeneration))
 	}
 	if ev.Code != 0 {
 		attrs = append(attrs, attribute.Int("http.response.status_code", ev.Code))

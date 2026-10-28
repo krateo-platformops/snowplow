@@ -448,7 +448,7 @@ func TestAudit410_C5_StageSite_NoActor_NoRecord(t *testing.T) {
 	apiCall := extStage410("render", http.MethodPost, "/render")
 
 	before := audit.IncompleteCount(audit.IncompleteActor)
-	auditStageWrite(context.Background(), raNS410, raName410, apiCall, call, res)
+	auditStageWrite(context.Background(), raNS410, raName410, apiCall, call, res, nil)
 	if got := attrs410(rec); len(got) != 0 {
 		t.Fatalf("an actorless write emitted %d records, want 0: %v", len(got), got)
 	}
@@ -456,7 +456,7 @@ func TestAudit410_C5_StageSite_NoActor_NoRecord(t *testing.T) {
 		t.Fatalf("incomplete{actor} moved by %d, want 1", d)
 	}
 
-	auditStageWrite(ctxWithUser(user410, group410), raNS410, raName410, apiCall, call, res)
+	auditStageWrite(ctxWithUser(user410, group410), raNS410, raName410, apiCall, call, res, nil)
 	if got := attrs410(rec); len(got) != 1 || got[0]["enduser.id"] != user410 {
 		t.Fatalf("control: the same write with an actor emitted %v, want one record for %q", got, user410)
 	}
@@ -480,13 +480,13 @@ func TestAudit410_C3e_StageSite_BackgroundDriver_NoRecord(t *testing.T) {
 		"prewarm-path":                          cache.WithPrewarmPath(ctxWithUser(user410, group410)),
 	}
 	for name, ctx := range bg {
-		auditStageWrite(ctx, raNS410, raName410, apiCall, call, res)
+		auditStageWrite(ctx, raNS410, raName410, apiCall, call, res, nil)
 		if got := attrs410(rec); len(got) != 0 {
 			t.Fatalf("#912 N3 RED: a write handed to the stage site under %s emitted %d record(s), want 0: %v", name, len(got), got)
 		}
 	}
 
-	auditStageWrite(ctxWithUser(user410, group410), raNS410, raName410, apiCall, call, res)
+	auditStageWrite(ctxWithUser(user410, group410), raNS410, raName410, apiCall, call, res, nil)
 	if got := attrs410(rec); len(got) != 1 {
 		t.Fatalf("control: the same write on a customer resolve emitted %d record(s), want 1: %v", len(got), got)
 	}

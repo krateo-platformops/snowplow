@@ -4,7 +4,7 @@ title: snowplow — audit coverage
 description: Which snowplow actions emit an AuditEvent, which do not and why, what a record must contain, and how to count the trail without miscounting it. The checked-in inventory AUDIT-4 (krateo-platformops/installer#410) asks for.
 resource: oci://ghcr.io/krateo-platformops/charts/snowplow
 tags: [audit, observability, security, restactions]
-timestamp: 2026-10-25T00:00:00Z
+timestamp: 2026-10-28T00:00:00Z
 ---
 
 # Audit coverage
@@ -53,6 +53,40 @@ Every record also carries `outcome` (`success` / `failure`),
 `http.response.status_code` (when the authority answered), `session.id` (W3C
 baggage) and the request's TraceId/SpanId.
 
+A successful write to the Kubernetes apiserver also carries the **written
+object's identity**, as the apiserver returned it (see "Written object
+identity" below). These attributes are optional: they are never listed as
+missing, and a record without them is not incomplete.
+
+### Every attribute
+
+Each attribute is written only when it has a value. The names are those of the
+shared Krateo audit emitter (`github.com/krateo-platformops/audit`), so a join
+with another component's records uses the same keys.
+`TestWrittenObject957_D_AuditCoverageDocNamesEveryAttribute`
+(`internal/support/audit`) fails when the emitter can write an attribute this
+table does not name.
+
+| attribute | value |
+|---|---|
+| `event.name` | always `audit` |
+| `enduser.id`, `user.name` | the authenticated user |
+| `user.roles` | the user's groups |
+| `krateo.action` | `call`, `call.dryRun`, `export`, `restaction` |
+| `http.request.method` | the verb sent |
+| `outcome` | `success` / `failure` |
+| `http.response.status_code` | the authority's code, when it answered |
+| `k8s.resource.group`, `k8s.resource.version`, `k8s.resource.resource`, `k8s.resource.name`, `k8s.namespace.name` | the Kubernetes object's coordinates |
+| `k8s.resource.subresource` | the addressed subresource (`status`, `scale`), when there is one |
+| `k8s.object.uid` | **optional**: the written object's `metadata.uid`, from the apiserver's response; on a DELETE, the deleted object's uid |
+| `k8s.object.generation` | **optional**, an integer: the written object's `metadata.generation`, from the response; never on a DELETE |
+| `k8s.object.resource_version` | **optional**: the written object's `metadata.resourceVersion`, from the response; never on a DELETE |
+| `server.address` | host and port a RESTAction stage was sent to |
+| `krateo.restaction.namespace`, `krateo.restaction.name`, `krateo.restaction.stage` | the RESTAction and stage that acted |
+| `session.id` | the session id, from W3C baggage |
+| `krateo.audit.incomplete` | the required fields the site did not supply, e.g. `method,target` |
+| `krateo.audit.no_trace_context` | `true` when the record was emitted with no span (so it has no TraceId) |
+
 **What a record never holds.** The trail is kept 365 days, so nothing that can
 carry a credential goes into it: no request path or query (a webhook path such
 as Slack's `/services/T/B/<secret>`, Discord's `/api/webhooks/<id>/<token>` or
@@ -96,6 +130,10 @@ other `POST`. Each record carries:
   `k8s.namespace.name`, the object's coordinates as a `/call` record holds them.
   A named endpoint may be any HTTP API: its record names no Kubernetes resource
   and nothing of its path;
+- for the same stages, on success: `k8s.object.uid`, `k8s.object.generation`
+  and `k8s.object.resource_version` of the object the apiserver answered with
+  (see "Written object identity"). A stage to a named endpoint records none of
+  them;
 - `outcome` and `http.response.status_code`: what the authority answered,
   observed at the dial — not the resolver's reshaped result, and not what the
   stage's own filter makes of it:
@@ -106,6 +144,39 @@ other `POST`. Each record carries:
   | a 2xx whose body snowplow cannot read or convert to JSON/YAML | `success` — the write was accepted | the real code | `accepted; the response body could not be read` / `accepted; the response body is not JSON or YAML` |
   | any other status | `failure` | the real code | `upstream answered <code> <status text>` — never the upstream's body |
   | nothing (connection refused, reset, timeout) | `failure` | absent | `no response from the endpoint` |
+
+### Written object identity
+
+Decided 2026-10-28 (#957, krateo-acmp#59 Option B). A user's write through
+snowplow changes a custom resource; a controller later reconciles it and makes
+the real external change (a VM, a repository, a bucket). To join the two audit
+records, both name the object by its identity: snowplow records the uid,
+generation and resourceVersion the apiserver returned for the write, and the
+controller records the uid and the generation it acted on
+(oasgen-provider#253). Join `krateo_audit` on
+`(k8s.object.uid, k8s.object.generation)`, adding
+`k8s.object.resource_version` where both sides have it. Snowplow never
+annotates or otherwise changes the user's object for this: an annotation would
+name "the last write through snowplow", not the cause of a reconcile, and would
+trigger server-side-apply, GitOps and webhook side effects.
+
+The rules, the same for `/call` and for a RESTAction stage
+(`audit.Event.RecordWrittenObject`):
+
+| the write | `k8s.object.uid` | `k8s.object.generation` | `k8s.object.resource_version` |
+|---|---|---|---|
+| a successful `POST`, `PUT` or `PATCH` (a subresource included) | the response's `metadata.uid` | the response's `metadata.generation` | the response's `metadata.resourceVersion` |
+| a successful `DELETE` | the returned object's `metadata.uid` (deletion pending on finalizers), or the `details.uid` of the `Status` the apiserver answers with once the object is gone | none | none |
+| a failed or refused write | none: there is no written object. This is not an error | none | none |
+| a dry run (`call.dryRun`) | none: nothing was persisted, and the generation a dry run answers with is one a later real write can reach | none | none |
+| a RESTAction stage to a named endpoint (`endpointRef`) | none: it may be any HTTP API | none | none |
+| `export` (a read) | none | none | none |
+
+The values always come from the apiserver's **response**, never from the
+request body: the request carries what the caller sent (often no uid, and the
+resourceVersion the write replaces), the response what was stored. A field the
+response does not carry is left out. These are object identifiers, not user
+data: no identity is added to the record.
 
 ### Writes nobody requested
 
