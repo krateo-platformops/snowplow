@@ -1177,6 +1177,51 @@ func TestDeliveryLog918_AppliedEntriesReleasedByTheNextPass(t *testing.T) {
 	}
 }
 
+// TestDeliveryLog918_TombstoneReleasesTheReceivedEntry — #923 review O1. A
+// relist re-delivers an unchanged object (recorded; applied as a sync, so no
+// handler sees it), then a later relist removes the key with a tombstone,
+// which skips the transform. With the key gone from the store, beginPass keeps
+// such an entry, so the tombstone must release it, or it is held for the life
+// of the informer. 200 keys, 5 passes after: none may be left. A NEWER entry
+// — a recreate queued behind the tombstone — is kept.
+func TestDeliveryLog918_TombstoneReleasesTheReceivedEntry(t *testing.T) {
+	idx, dl := j9Rule(t, "4500")
+	tf, h := dl.transform(nil), dl.handler()
+	const n = 200
+	for i := 0; i < n; i++ {
+		o := j9Object{fmt.Sprintf("gone-%03d", i), "4100", fmt.Sprintf("uid-gone-%03d", i)}
+		if err := idx.Add(o.obj(repairGVR)); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = tf(o.obj(repairGVR)) // the relist's unchanged re-delivery
+		if err := idx.Delete(o.obj(repairGVR)); err != nil {
+			t.Fatal(err)
+		}
+		h.OnDelete(clientcache.DeletedFinalStateUnknown{Key: o.key(), Obj: o.obj(repairGVR)})
+	}
+	// A recreate queued behind its tombstone: newer than the last known state.
+	re := j9Object{"gone-recreated", "4100", "uid-r1"}
+	_, _ = tf(j9Object{re.name, "4600", "uid-r2"}.obj(repairGVR))
+	h.OnDelete(clientcache.DeletedFinalStateUnknown{Key: re.key(), Obj: re.obj(repairGVR)})
+
+	idx.Bookmark("9000")
+	for i := 0; i < 5; i++ {
+		dl.beginPass()
+	}
+	left := 0
+	for i := 0; i < n; i++ {
+		if _, ok := dl.receivedFor(j9Object{name: fmt.Sprintf("gone-%03d", i)}.key()); ok {
+			left++
+		}
+	}
+	if left != 0 {
+		t.Errorf("O1 RED: %d of %d tombstoned keys still hold a received entry after 5 passes", left, n)
+	}
+	if _, ok := dl.receivedFor(re.key()); !ok {
+		t.Errorf("a recreate queued behind its tombstone lost its received entry")
+	}
+}
+
 // TestDeliveryLog918_TransformNeverBlocksOnInformerLocks — the transform runs
 // under the queue's lock and must take no informer lock (#875). Here the watch
 // delivers a stream of updates while other goroutines call the informer's

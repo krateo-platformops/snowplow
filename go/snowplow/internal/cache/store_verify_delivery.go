@@ -277,6 +277,20 @@ func (l *deliveryLog) appliedEvent(obj any, deleted bool) {
 	l.mu.Lock()
 	if t, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
 		l.deletes[t.Key] = appliedDelete{tombstone: true, gen: l.gen}
+		// #923 review O1 — the tombstone removed the key, and the tombstone
+		// record now speaks for it (held, then decided by the next pass). A
+		// received entry no newer than the key's last known state is released
+		// with it: it is a delivery the handler never saw applied (a relist's
+		// unchanged re-delivery, a discarded watch-list attempt), and with the
+		// key gone from the store beginPass would keep it for good. A NEWER
+		// entry — a recreate queued behind the tombstone — is kept.
+		if e, has := l.unapplied[t.Key]; has {
+			if _, last, ok := identityOf(t.Obj); ok {
+				if c, err := orderRV(e.id.rv, last.rv); err == nil && c <= 0 {
+					delete(l.unapplied, t.Key)
+				}
+			}
+		}
 	} else if key, id, ok := identityOf(obj); ok {
 		if e, has := l.unapplied[key]; has && e.id == id {
 			delete(l.unapplied, key)
