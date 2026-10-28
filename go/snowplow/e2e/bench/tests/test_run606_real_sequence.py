@@ -570,6 +570,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             items([cr("Frontend", "frontend", True)])
         if what.startswith("portals."):
             items([cr("Portal", "portal", True)])
+        if what.startswith("restdefinitions."):
+            items(json.loads(os.environ.get("FAKE_RDS", "[]")))
         if what.startswith("compositiondefinitions."):
             cds = [cr("CompositionDefinition", "authn", True)]
             if f483:
@@ -616,6 +618,15 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                     "status": {"phase": "Failed" if dead else "Running",
                                "containerStatuses": [{"name": "c", "ready": not dead,
                                                       "restartCount": 0, "state": state}]}}])
+        if what == "pods" and any(x.startswith("app.kubernetes.io/name in (") for x in a):
+            # the two controllers (diag606 definitions); their images on a registry nothing serves
+            items([{"metadata": {"name": n, "namespace": "krateo-system", "labels": {"app.kubernetes.io/name": c}},
+                    "spec": {"containers": [{"name": c}]},
+                    "status": {"containerStatuses": [{"name": c, "restartCount": r,
+                                                      "image": f"127.0.0.1:1/krateo/{c}:x",
+                                                      "imageID": f"127.0.0.1:1/krateo/{c}@sha256:" + "0" * 64}]}}
+                   for n, c, r in (("oasgen-provider-0", "oasgen-provider", 0),
+                                   ("installer-core-provider-0", "core-provider", 1))])
         if what == "pods":
             items([{"metadata": {"name": "ok-0", "namespace": "krateo-system"},
                     "spec": {"nodeName": "n1"}, "status": {"phase": "Running",
@@ -638,6 +649,14 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             items(ev)
         if what in ("pvc", "nodes"):
             items([])
+    if a[:1] == ["logs"] and ("oasgen-provider-0" in a or "installer-core-provider-0" in a):
+        # a controller's log: long, with the line after a failure, and one naming a user
+        n = int(os.environ.get("FAKE_CONTROLLER_LOG_LINES", "3000"))
+        for i in range(n):
+            print(f"2026-10-28T09:4{i % 10}:00Z line {i}")
+        print('2026-10-28T09:50:00Z E create failed: User "scaleuser-0001" cannot create restdefinitions')
+        print("2026-10-28T09:50:01Z I the line after the failure")
+        sys.exit(0)
     if a[:1] == ["logs"] and "crash-0" in a:
         print("starting app")
         print("Authorization: Bearer " + os.environ.get("FAKE_BEARER", ""))

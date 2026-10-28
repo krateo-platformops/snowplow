@@ -374,6 +374,11 @@ teardown() {
         log "no kubeconfig yet; no diagnostics to collect"
       fi
     fi
+    # every teardown, the run's outcome whatever it is: the definitions and the
+    # controller logs once more, before the cluster goes
+    if [[ "$TD_SIGNALED" != "1" ]] && { [[ "$DRY" == "1" ]] || [[ -s "$KCFG" ]]; }; then
+      capped "$DIAG_CAP_S" "platform definitions" platform_definitions teardown
+    fi
     # Test hook (like BENCH_606_FAIL_AT): a command that fails inside teardown,
     # as one killed by a group signal would. It must not stop the delete.
     [[ "${BENCH_606_TEARDOWN_FAULT:-}" == "1" ]] && false
@@ -482,14 +487,37 @@ s_verify483() {
   run python3 -m bench.diag606 verify483 --kubeconfig "$KCFG" --context "$KCTX" \
       --installer-chart "$OUT/installer-pulled" --out "$OUT/verify483.json"
 }
+# platform_definitions <platform_end|teardown>: every RestDefinition and
+# CompositionDefinition (its create markers, Ready/Synced, what it manages;
+# WEDGED = a pending create past provider-runtime's recovery window) and the
+# oasgen-provider / core-provider logs IN FULL, appended to
+# platform-definitions.jsonl (evaluate's platform section) and kept under
+# platform-logs/<at>/. Evidence: it never fails the run.
+platform_definitions() {
+  local at="$1" extra=()
+  [[ "$at" == "platform_end" ]] && extra=(--provider-runtime)
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.diag606 definitions --at $at --out $OUT/platform-definitions.jsonl --logs-dir $OUT/platform-logs/$at ${extra[*]:-}"
+    return 0
+  fi
+  python3 -m bench.diag606 definitions --kubeconfig "$KCFG" --context "$KCTX" --at "$at" \
+      --out "$OUT/platform-definitions.jsonl" --logs-dir "$OUT/platform-logs/$at" --redact "$PW" \
+      ${extra[@]+"${extra[@]}"} >&2 \
+    || log "platform definitions at ${at}: not recorded (exit $?)"
+}
 s_wait_platform() {
   # Polled, not a blind wait: prints which components are Ready (and why the
   # others are not) every PLATFORM_POLL_S, so a stall shows WHERE.
   # The pulled chart (source step) gives inst.coreFeatures: what the
   # Installer CR declares is read with the chart's own feature rule.
+  local prc=0
   run python3 -m bench.diag606 wait-installer --kubeconfig "$KCFG" \
       --context "$KCTX" --timeout-s "$PLATFORM_TIMEOUT_S" \
-      --interval-s "$PLATFORM_POLL_S" --installer-chart "$OUT/installer-pulled"
+      --interval-s "$PLATFORM_POLL_S" --installer-chart "$OUT/installer-pulled" || prc=$?
+  # the platform step's end, READY or not: a platform that never got ready is
+  # the case the definitions and the controller logs explain
+  platform_definitions platform_end
+  (( prc == 0 )) || return "$prc"
   # NEVER wait on the umbrella Installer being Ready: on a credential-free
   # bench it never is (github-provider-kog stays 401, installer#484). Wait on
   # the specific components the bench uses: their Deployments Available and
@@ -1316,7 +1344,7 @@ s_evaluate() {
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
                "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
-               "$OUT"/api-outages*.jsonl)
+               "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl)
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
   local r8=() k6args=() apfargs=(--apf "$OUT/apf.jsonl.gz")

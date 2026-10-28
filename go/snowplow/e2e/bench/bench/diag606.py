@@ -35,7 +35,8 @@ __all__ = ["redact", "summarize_conditions", "pod_summary", "failing_pods",
            "installer_progress", "Kube", "collect", "wait_installer",
            "evaluate483", "verify483", "chart_inspector_errors",
            "platform_state", "platform_line", "parse_not_ready_children", "declared_components",
-           "core_features",
+           "core_features", "create_state", "definition_record", "definitions_snapshot",
+           "controller_logs", "controller_images", "platform_report", "WEDGE_AFTER_S",
            "allow_list_from_env", "DEFAULT_ALLOW_NOT_READY", "REQUIRED_READY",
            "main"]
 
@@ -738,13 +739,233 @@ def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
     return written
 
 
+# ─── RestDefinitions / CompositionDefinitions: the create handshake ─────────
+#
+# A run lost a whole attempt to a wedged platform component, and the bundle
+# kept neither controller logs nor the managed objects' annotations: the
+# cause was unprovable afterwards. Recorded at the end of the platform step and
+# at every teardown, so the bench can say what it OBSERVED (it fixes nothing).
+
+CREATE_PENDING = "krateo.io/external-create-pending"
+CREATE_SUCCEEDED = "krateo.io/external-create-succeeded"
+CREATE_FAILED = "krateo.io/external-create-failed"
+# provider-runtime's defaults (krateo-platformops/provider-runtime v1.5.1,
+# pkg/reconciler/reconciler.go:38 and :40, commit 7a8b8d46): an unresolved
+# create keeps its pending marker and is re-observed every interval until the
+# grace period has elapsed, then retried. The measured recovery (2m0.1s) lands
+# on the first re-observe after the grace period, so a pending marker is a
+# wedge only once it is older than the grace period plus two re-observes.
+CREATE_RECOVERY_GRACE_S = 120.0       # defaultCreateRecoveryGracePeriod = 2 * time.Minute
+CREATE_RECOVERY_REOBSERVE_S = 15.0    # defaultCreateRecoveryReobserveInterval = 15 * time.Second
+WEDGE_AFTER_S = CREATE_RECOVERY_GRACE_S + 2 * CREATE_RECOVERY_REOBSERVE_S
+DEFINITION_KINDS = (("restdefinitions.ogen.krateo.io", "restdefinitions"),
+                    ("compositiondefinitions.core.krateo.io", "compositiondefinitions"))
+# the two controllers, by app.kubernetes.io/name EXACTLY (not core-provider-chart-inspector,
+# not the agents)
+CONTROLLERS = ("oasgen-provider", "core-provider")
+# provider-runtime's module path, under both org spellings it has had
+PROVIDER_RUNTIME = ("github.com/krateo-platformops/provider-runtime",
+                    "github.com/krateoplatformops/provider-runtime")
+
+
+def _ts(v) -> float | None:
+    if not isinstance(v, str):
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def create_state(annotations: dict | None, now: float) -> dict:
+    """The create handshake as the object's own annotations tell it, at `now`.
+
+    WEDGED: the pending marker is newer than BOTH terminal markers (strictly:
+    a marker at the same second resolved it) AND older than WEDGE_AFTER_S by
+    its own timestamp. pending: the same, inside that window (provider-runtime
+    is still confirming the negative; not a wedge). cleared: a pending marker
+    superseded by a later succeeded. create-failed: superseded by a later
+    failed. no-pending: no pending marker at all. unreadable: a marker that is
+    not a timestamp."""
+    a = annotations or {}
+    raw = {k: a.get(f"krateo.io/external-create-{k}") for k in ("pending", "succeeded", "failed")}
+    out = {"annotations": {k: v for k, v in raw.items() if v is not None}}
+    if raw["pending"] is None:
+        return {**out, "state": "no-pending"}
+    t = {k: _ts(v) for k, v in raw.items() if v is not None}
+    if any(v is None for v in t.values()):
+        return {**out, "state": "unreadable"}
+    pending = t["pending"]
+    terminal = {k: t[k] for k in ("succeeded", "failed") if k in t}
+    age = round(now - pending, 1)
+    if all(pending > v for v in terminal.values()):
+        return {**out, "pending_age_s": age, "state": "WEDGED" if age > WEDGE_AFTER_S else "pending"}
+    last = max(terminal, key=lambda k: (terminal[k], k == "succeeded"))
+    return {**out, "state": "cleared" if last == "succeeded" else "create-failed"}
+
+
+def definition_record(obj: dict, resource: str, now: float) -> dict:
+    """One RestDefinition / CompositionDefinition as the bench saw it."""
+    s = summarize_conditions(obj, resource)
+    st = obj.get("status") or {}
+    rec = {"id": s.get("id"), "kind": obj.get("kind"), "namespace": s.get("namespace"), "name": s.get("name"),
+           **create_state((obj.get("metadata") or {}).get("annotations"), now),
+           "ready": s.get("Ready"), "synced": s.get("Synced")}
+    managed = st.get("managed")
+    if isinstance(managed, dict):              # CompositionDefinition: status.managed{group,kind}, apiVersion
+        rec["managed"] = {"group": managed.get("group"), "kind": managed.get("kind")}
+    if isinstance(st.get("apiVersion"), str):
+        rec["apiVersion"] = st["apiVersion"]
+    if st.get("resource") is not None:         # RestDefinition: status.resource{apiVersion,kind}
+        rec["resource"] = st["resource"]
+    return rec
+
+
+STATES = ("WEDGED", "pending", "cleared", "create-failed", "no-pending", "unreadable")
+
+
+def definitions_snapshot(k: "Kube", *, at: str, now: Callable[[], float] = time.time) -> dict:
+    """Every RestDefinition and CompositionDefinition, classified."""
+    t = now()
+    objects, unlisted = [], []
+    for kind, resource in DEFINITION_KINDS:
+        rc, out, err = k.kubectl("get", kind, "-A", "-o", "json")
+        try:
+            items = json.loads(out).get("items", []) if rc == 0 else None
+        except ValueError:
+            items = None
+        if items is None:
+            unlisted.append({"kind": kind, "rc": rc, "error": redact(_first_line(err))})
+            continue
+        objects += [definition_record(o, resource, t) for o in items]
+    counts = {st: sum(1 for o in objects if o["state"] == st) for st in STATES}
+    return {"kind": "platform_definitions", "at": at, "t": t, "context": k.ctx,
+            "wedge_after_s": WEDGE_AFTER_S, "grace_s": CREATE_RECOVERY_GRACE_S,
+            "reobserve_s": CREATE_RECOVERY_REOBSERVE_S, "counts": counts, "unlisted": unlisted,
+            "objects": objects}
+
+
+def _first_line(text: str) -> str:
+    return next((ln for ln in (text or "").splitlines() if ln.strip()), "")[:300]
+
+
+def _redact_log(text: str, extra: tuple[str, ...] = ()) -> str:
+    """A log as every bench log is kept: credentials (redact) AND identities
+    (bench/identity.py: users, e-mails, Secret names, CNs). identity imports
+    nothing from bench, so this module stays free of bench's import-time
+    context guard."""
+    from bench import identity
+    return "\n".join(identity.redact_identity(ln) for ln in redact(text, extra).split("\n"))
+
+
+def controller_pods(k: "Kube") -> list[dict]:
+    rc, out, _ = k.kubectl("get", "pods", "-A", "-l",
+                           f"app.kubernetes.io/name in ({','.join(CONTROLLERS)})", "-o", "json")
+    try:
+        return json.loads(out).get("items", []) if rc == 0 else []
+    except ValueError:
+        return []
+
+
+def controller_logs(k: "Kube", pods: list[dict], out_dir: str, *, extra: tuple[str, ...] = ()) -> list[dict]:
+    """Every container log of the controllers, IN FULL (no --tail: the line
+    after a failure is never cut), with timestamps; the previous container's
+    too when it restarted. Redacted like every bench log."""
+    os.makedirs(out_dir, exist_ok=True)
+    out = []
+    for p in pods:
+        md = p.get("metadata") or {}
+        restarts = {c.get("name"): c.get("restartCount") or 0
+                    for c in (p.get("status") or {}).get("containerStatuses") or []}
+        for c in (p.get("spec") or {}).get("containers") or []:
+            for prev in ((False, True) if restarts.get(c["name"]) else (False,)):
+                args = ["logs", "-n", md.get("namespace"), md.get("name"), "-c", c["name"], "--timestamps"]
+                rc, text, err = k.kubectl(*(args + (["--previous"] if prev else [])), timeout=600)
+                name = (f"{md.get('namespace')}__{md.get('name')}__{c['name']}__"
+                        f"{'previous' if prev else 'current'}.log")
+                path = os.path.join(out_dir, name)
+                with open(path, "w") as fh:
+                    fh.write(_redact_log(text if rc == 0 else f"rc={rc} {_first_line(err)}", extra))
+                out.append({"component": (md.get("labels") or {}).get("app.kubernetes.io/name"),
+                            "pod": md.get("name"), "container": c["name"], "previous": prev, "rc": rc,
+                            "lines": len(text.splitlines()) if rc == 0 else 0, "file": path})
+    return out
+
+
+def controller_images(pods: list[dict], *, read=None) -> list[dict]:
+    """Which provider-runtime each controller carries, read from the image
+    digest the pod runs (bench/imagemod.py), never assumed from a pin."""
+    if read is None:
+        from bench import imagemod
+        read = imagemod.image_deps
+    out, cache = [], {}
+    for p in pods:
+        md = p.get("metadata") or {}
+        spec = {c["name"]: c for c in (p.get("spec") or {}).get("containers") or []}
+        for cs in (p.get("status") or {}).get("containerStatuses") or []:
+            ref = (cs.get("imageID") or "").replace("docker-pullable://", "") or cs.get("image")
+            row = {"component": (md.get("labels") or {}).get("app.kubernetes.io/name"), "pod": md.get("name"),
+                   "container": cs.get("name"), "image": cs.get("image"), "image_id": ref}
+            if ref not in cache:
+                try:
+                    cache[ref] = read(ref, PROVIDER_RUNTIME, command=(spec.get(cs.get("name")) or {}).get("command"))
+                except Exception as e:  # noqa: BLE001 — evidence: why it could not be read
+                    cache[ref] = {"version": None, "why": f"{type(e).__name__}: {e}"[:300]}
+            got = cache[ref]
+            row["provider_runtime"] = {k2: got.get(k2) for k2 in ("module", "version", "process_binary", "why")
+                                       if got.get(k2) is not None}
+            out.append(row)
+    return out
+
+
+def definitions_line(rec: dict) -> str:
+    c = rec["counts"]
+    line = (f"[platform] definitions at {rec['at']}: {len(rec['objects'])} object(s); WEDGED {c['WEDGED']} "
+            f"(pending > {rec['wedge_after_s']:g} s by its own timestamp, expected 0); pending in the window "
+            f"{c['pending']}; cleared {c['cleared']}; create-failed {c['create-failed']}")
+    for o in rec["objects"]:
+        if o["state"] == "WEDGED":
+            line += (f"\n[platform]   WEDGED {o['id']}: pending {o['annotations'].get('pending')} "
+                     f"({o['pending_age_s']:g} s old), Ready={(o.get('ready') or {}).get('status')} "
+                     f"({(o.get('ready') or {}).get('reason')}), Synced={(o.get('synced') or {}).get('status')} "
+                     f"({(o.get('synced') or {}).get('reason')})")
+    for u in rec["unlisted"]:
+        line += f"\n[platform]   could not list {u['kind']} (rc={u['rc']}): {u['error']}"
+    for i in rec.get("controller_images") or []:
+        pr = i.get("provider_runtime") or {}
+        line += (f"\n[platform]   {i['component']} {i.get('image')}: provider-runtime "
+                 f"{pr.get('version') or 'UNKNOWN (' + str(pr.get('why')) + ')'}")
+    return line
+
+
+def platform_report(snaps: list[dict]) -> dict:
+    """The verdict's platform section: per snapshot (platform_end, teardown)
+    the counts; for the cluster, WEDGED (expected 0) and cleared."""
+    if not snaps:
+        return {"status": "absent", "note": "no platform_definitions record (a run before the bench recorded them)"}
+    snaps = sorted(snaps, key=lambda r: r.get("t") or 0)
+    last = snaps[-1]
+    images = next((r.get("controller_images") for r in snaps if r.get("controller_images")), None)
+    return {"status": "present", "context": last.get("context"), "wedge_after_s": last.get("wedge_after_s"),
+            "wedged": max(r["counts"]["WEDGED"] for r in snaps), "expected_wedged": 0,
+            "cleared": last["counts"]["cleared"],
+            "snapshots": [{"at": r["at"], "t": r["t"], "counts": r["counts"], "unlisted": r.get("unlisted") or [],
+                           "wedged": [{"id": o["id"], "pending": o["annotations"].get("pending"),
+                                       "pending_age_s": o.get("pending_age_s")}
+                                      for o in r["objects"] if o["state"] == "WEDGED"]} for r in snaps],
+            "provider_runtime": [{"component": i["component"], "image": i.get("image"),
+                                  "version": (i.get("provider_runtime") or {}).get("version")}
+                                 for i in images or []]}
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m bench.diag606")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("wait-installer", "collect", "verify483"):
+    for name in ("wait-installer", "collect", "verify483", "definitions"):
         s = sub.add_parser(name)
         s.add_argument("--kubeconfig", required=True)
         s.add_argument("--context", required=True)
@@ -753,6 +974,13 @@ def main(argv=None) -> int:
             s.add_argument("--interval-s", type=float, default=60)
         else:
             s.add_argument("--out", required=True)
+        if name == "definitions":
+            s.add_argument("--at", required=True, choices=("platform_end", "teardown"))
+            s.add_argument("--logs-dir", required=True)
+            s.add_argument("--provider-runtime", action="store_true",
+                           help="also read each controller image's provider-runtime (registry, no Docker)")
+            s.add_argument("--redact", action="append", default=[])
+            continue
         if name == "collect":
             s.add_argument("--redact", action="append", default=[],
                            help="extra literal to redact (repeatable)")
@@ -763,6 +991,17 @@ def main(argv=None) -> int:
         s.add_argument("--installer-chart", required=name != "collect",
                        help="the pulled installer chart, or the pull workdir holding it")
     a = p.parse_args(argv)
+    if a.cmd == "definitions":
+        k = Kube(a.kubeconfig, a.context)
+        rec = definitions_snapshot(k, at=a.at)
+        pods = controller_pods(k)
+        rec["controller_logs"] = controller_logs(k, pods, a.logs_dir, extra=tuple(a.redact))
+        if a.provider_runtime:
+            rec["controller_images"] = controller_images(pods)
+        with open(a.out, "a") as fh:
+            fh.write(redact(json.dumps(rec, default=str), tuple(a.redact)) + "\n")
+        print(definitions_line(rec), flush=True)
+        return 0                                   # evidence, not a gate
     try:
         core = core_features(a.installer_chart) if a.installer_chart and (
             a.cmd != "collect" or os.path.isdir(a.installer_chart)) else ()

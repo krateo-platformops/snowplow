@@ -5330,6 +5330,15 @@ def _cmd_evaluate(a) -> int:
     # the stretches the run's measure / collect loops could not reach the API
     # server (run606 api_seen): shown with the verdict, never judged
     result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]
+    # the platform's create handshakes (diag606 definitions): WEDGED expected 0, said when not
+    from bench import diag606
+    plat = diag606.platform_report([r for r in recs if r.get("kind") == "platform_definitions"])
+    result["report"]["platform"] = plat
+    if plat.get("wedged"):
+        result["report"].setdefault("report_warnings", []).append(
+            f"platform: {plat['wedged']} WEDGED create(s) (a pending marker older than "
+            f"{plat['wedge_after_s']:g} s, expected 0): " + ", ".join(
+                w["id"] for s in plat["snapshots"] for w in s["wedged"]))
     from bench import custlat
     _cluster_sample_reports(result["report"], recs, a.apf, custlat.calls((k6 or {}).get("k6")),
                             (k6 or {}).get("browser"))
