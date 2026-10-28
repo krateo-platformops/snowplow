@@ -334,7 +334,16 @@ here is load-bearing:
 
    A seed / refresher `SeedResolveMemo` hit (`apiref.Resolve`) replays the producing resolve's
    Put-gate inputs (`put_gate_effects.go`) onto the hitter's sinks, so a memo-served body gets
-   exactly the verdict its producer got (#912 N1);
+   exactly the verdict its producer got (#912 N1).
+
+   The `raFullList` layer (`apiref/ra_full_list.go`) never runs a RESTAction a second time in
+   one `/call` once that run declared a write (#942). Whether it did is known only after the run:
+   the RESTAction's own write stage AND a write in any RESTAction it resolves in-process
+   (`resolve:true`) set the same runtime declared-write mark, which no check of the widget
+   RESTAction's own spec can see. So first sight runs the page-keyed resolve FIRST and takes a
+   permanent decline before the unpaginated one, serving the page it holds; every fall-back to
+   `apiref.Resolve`'s page-keyed resolve after a run goes through one helper that refuses a run
+   which declared a write (the `/call` gets an error rather than a second write);
    - `serveFromCacheEligible(inputs)` — never write the shared empty-`BindingUID` row from the
      dispatch path;
    - the **F6 undeclared-extras quarantine** — request extras must all be declared in the

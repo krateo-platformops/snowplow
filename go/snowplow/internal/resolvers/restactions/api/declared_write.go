@@ -6,7 +6,11 @@ import templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 // spec order), or "" if it declares none. It reads the spec only, so it is
 // known before any stage runs and holds for a resolve that stops before running
 // one. It is the ONE declared-write classification of a resolve: #903 F1 (never
-// stored) and #905 (never served stale) both read it.
+// stored) and #905 (never served stale) both read it. Callers outside this
+// package read its RUNTIME result, the declared-write mark it sets on the
+// Put-gate sinks, never the spec: a RESTAction resolved in-process
+// (resolve:true) marks the same sinks, which no spec check of the caller sees
+// (#942).
 func declaredWriteStage(items []*templates.API) string {
 	for _, a := range items {
 		if a != nil && isWriteVerb(a.Verb) {
@@ -14,11 +18,4 @@ func declaredWriteStage(items []*templates.API) string {
 		}
 	}
 	return ""
-}
-
-// DeclaresWrite reports whether a RESTAction spec declares a write stage — the
-// same classification, for callers outside this package (the apiref raFullList
-// layer, which never serves such a RESTAction).
-func DeclaresWrite(items []*templates.API) bool {
-	return declaredWriteStage(items) != ""
 }

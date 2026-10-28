@@ -29,6 +29,7 @@ package apiref
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"sync/atomic"
 
@@ -37,7 +38,6 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -262,6 +262,18 @@ func SeedFullListRAKeyInputsForTest(ctx context.Context, gvr schema.GroupVersion
 // resolveRA(perPage, page) is the page-keyed resolve seam — a closure over
 // restactions.Resolve so this file does not duplicate the apiref Resolve
 // plumbing; it returns the RA Status map for the given pagination.
+//
+// ONE RUN OF A WRITE PER /call (#942). served=false makes apiref.Resolve run the
+// RESTAction page-keyed, so once this function has run it, falling back would
+// run every stage again, writes included. What a run wrote is known only after
+// it ran: the RESTAction's own write stage AND a write in any RESTAction it
+// resolves in-process (resolve:true) both set the runtime declared-write mark on
+// the Put-gate sinks installed below (restactions/api ResolveWithFailure). So:
+//   - first sight runs the page-keyed resolve FIRST, and takes a permanent
+//     decline (a declared write among them) before it runs the unpaginated one:
+//     the page it already holds is served, nothing runs twice;
+//   - every fall-back after a run goes through fallBackAfterRun, which never
+//     hands a run that declared a write back for a second run.
 func raFullListServe(
 	ctx context.Context,
 	gvr schema.GroupVersionResource,
@@ -275,16 +287,6 @@ func raFullListServe(
 	if c == nil {
 		return nil, false, nil // cache off — fall back
 	}
-	// #912 re-review — a RESTAction that DECLARES a write is never stored (#903
-	// F1), so this layer, which exists to cache its full list, has nothing to
-	// serve; and its first-sight path resolves the RESTAction TWICE (unpaginated
-	// for the cell, page-keyed for the byte-verify), which would send the write
-	// twice for one /call. Fall back to the page-keyed resolve, which runs it
-	// exactly once.
-	if ra != nil && restactionsapi.DeclaresWrite(ra.Spec.API) {
-		return nil, false, nil
-	}
-
 	// #592 — THE 1.12.3 A-1 BYPASS WAS REMOVED HERE. It used to refuse this whole
 	// layer (served=false) for a RESTAction declaring a userAccessFilter, before
 	// deriving a key, on this reasoning: the cell holds the RA's full resolve
@@ -405,6 +407,22 @@ func raFullListServe(
 	// (cache.DenialOnly, cache.GenuineExternal) over what THIS path resolved —
 	// never over counts the enclosing /call recorded before it got here.
 	ctx, gate := cache.WithChildPutGateSinks(ctx)
+
+	// fallBackAfterRun is the ONLY way out with served=false once this function
+	// has run the RESTAction (#942, see the function comment). A read-only run
+	// falls back to the page-keyed resolve as before. A run that declared a write
+	// has sent it: it is not run again, and the /call answers an error instead
+	// of a page it does not have. Reached only on the known-sliceable repopulate
+	// branch (first sight never falls back after a run), when the full list
+	// stops slicing (shape drift) or a just-stored cell has no backing edge,
+	// which a declared write cannot reach: its verdict never stores.
+	fallBackAfterRun := func() (map[string]any, bool, error) {
+		if gate.External.DeclaredWrite() {
+			raFullListWriteNotRerun.Add(1)
+			return nil, false, errRAFullListWriteNotRerun
+		}
+		return nil, false, nil
+	}
 
 	raEpoch, haveEpoch := cache.DepGenStartSeqFromContext(ctx)
 	if !haveEpoch {
@@ -529,8 +547,9 @@ func raFullListServe(
 		sliced, sok := cache.GoSliceFullList(full, offset, perPage)
 		if !sok {
 			// The full result no longer slices cleanly (shape drift). Fall
-			// back this /call without poisoning the established verdict.
-			return nil, false, nil
+			// back this /call without poisoning the established verdict —
+			// never by running a write a second time (#942).
+			return fallBackAfterRun()
 		}
 		// External-no-cache (proposal 2026-06-22) — if the unpaginated
 		// re-resolve touched a genuine external endpoint, SERVE the slice but
@@ -580,7 +599,7 @@ func raFullListServe(
 			// the cell we just Put carries no backing edge, so fall through.
 			edges := cache.Deps().EdgesUnder(raKey)
 			if len(edges) == 0 {
-				return nil, false, nil
+				return fallBackAfterRun()
 			}
 			// #765 B: the raKey edges' live states (see the hit branch).
 			cache.Deps().ReplayEdgesWithStates(ctx, widgetL1Key, edges,
@@ -591,19 +610,15 @@ func raFullListServe(
 	}
 
 	// --- First sight of (RA × shape): byte-VERIFY, then memoise ---------
-	// 1. Resolve UNPAGINATED -> full F (deps scoped to the RAFullList key).
 	// #406 — as on the repopulate branch: a fresh-resolve body is no consumer.
 	if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
 		c.ForgetRAFullListConsumer(raKey, widgetL1Key)
 	}
-	resolvedFull = true
-	full, err := resolveRA(fullCtx, 0, 0)
-	if err != nil {
-		return nil, false, err
-	}
-	// 2. Resolve the OLD page-keyed way -> S_ra (the fall-back reference).
-	//    Under the ORIGINAL ctx so its deps belong to the widget cell,
-	//    unchanged from today.
+	// 1. Resolve the OLD page-keyed way -> S_ra (the fall-back reference, and
+	//    the page this /call is served whenever first sight declines). Under
+	//    the ORIGINAL ctx so its deps belong to the widget cell, unchanged from
+	//    today. FIRST, so a permanent decline is known before a second run
+	//    (#942, below).
 	//
 	// #277 / edge-3 [C3 + C-branch-precision] PIN: this first-sight page-keyed
 	// resolve runs under the ORIGINAL ctx (widget L1 key), so its inner LIST/
@@ -617,15 +632,29 @@ func raFullListServe(
 		return nil, false, err
 	}
 
-	// External-no-cache (proposal 2026-06-22) — load-bearing surface #4. If
-	// either first-sight resolve touched a genuine external endpoint, SERVE
-	// the (correct, fresh) page-keyed S_ra but record NO sliceability verdict,
-	// NO dep edge, and Put NO cell — external data has no informer edge to
-	// invalidate it, so caching it would serve it stale across pages/widgets
-	// (the exact defect this proposal kills). Checked AFTER both resolves so
-	// the sink reflects either one touching the external fetch (#684: both
-	// resolve under the gate sinks; GenuineExternal per #681 C2). Read through
-	// the shared Put-gate verdict, which also declines a declared write.
+	// External-no-cache (proposal 2026-06-22) — load-bearing surface #4, and
+	// #942. If the page-keyed resolve declared a write (its own stage or one of
+	// a RESTAction it resolved in-process) or touched a genuine external
+	// endpoint, SERVE the (correct, fresh) page-keyed S_ra and stop: record NO
+	// sliceability verdict, NO dep edge, Put NO cell, and do NOT run the
+	// unpaginated resolve — a write would be sent a second time for this /call,
+	// and external data has no informer edge to invalidate a cell (the exact
+	// defect the proposal kills). Read through the shared Put-gate verdict
+	// (#684: the resolve ran under the gate sinks; GenuineExternal per #681 C2).
+	if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
+		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+		return sRA, true, nil
+	}
+
+	// 2. Resolve UNPAGINATED -> full F (deps scoped to the RAFullList key).
+	resolvedFull = true
+	full, err := resolveRA(fullCtx, 0, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	// The same decline for what only the unpaginated resolve touched (a
+	// genuine external endpoint reached on a later page). It has run once, so
+	// S_ra is served and nothing runs again.
 	if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
@@ -753,6 +782,18 @@ var raFullListStageErrorDeclined atomic.Uint64
 
 // RAFullListStageErrorDeclinedForTest reads the counter.
 func RAFullListStageErrorDeclinedForTest() uint64 { return raFullListStageErrorDeclined.Load() }
+
+// errRAFullListWriteNotRerun is the /call's answer when the known-sliceable
+// repopulate run declared a write and cannot be served as a page (#942,
+// fallBackAfterRun): the write was sent once, and is not sent again.
+var errRAFullListWriteNotRerun = errors.New("raFullList: the RESTAction declares a write that this request already sent, " +
+	"and its full list does not slice into the requested page; it is not run a second time")
+
+// raFullListWriteNotRerun counts fallBackAfterRun refusing a second run (#942).
+var raFullListWriteNotRerun atomic.Uint64
+
+// RAFullListWriteNotRerunForTest reads the counter.
+func RAFullListWriteNotRerunForTest() uint64 { return raFullListWriteNotRerun.Load() }
 
 // raFullListVerdict is the full-list cell's Put-gate verdict, over the full
 // list's own sinks (#684): the same cache.PutGateVerdict every Put site reads.
