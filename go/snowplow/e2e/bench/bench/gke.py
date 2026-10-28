@@ -766,7 +766,8 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
         execute(_kubectl(spec) + ["delete", "pvc", "--all", "--all-namespaces", "--wait=false"],
                 dry_run=True, log=log)
         execute(delete_command(spec), dry_run=True, log=log)
-        execute(disks_list_command(spec), dry_run=True, log=log)
+        execute(disks_list_command(spec, cluster_id="<the cluster's id, base32>",
+                                   names=["<each recorded PV's disk>"]), dry_run=True, log=log)
         return []
     location, describe = find_cluster(spec, log=log, legacy_zonal=legacy_zonal)
     assert_deletable(describe)
@@ -783,14 +784,16 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
         if rc == 0:
             problems = []
             try:
+                cid = cluster_id_b32(describe)
                 if wait_cluster_gone(spec, log=log, deadline=deadline, clock=clock, sleep=sleep,
                                      location=location):
-                    disk_backstop(spec, cluster_id=cluster_id_b32(describe), recorded=recorded, log=log)
+                    disk_backstop(spec, cluster_id=cid, recorded=recorded, log=log,
+                                  deadline=deadline, clock=clock, sleep=sleep)
                 else:
                     raise RuntimeError(
                         f"skipped: {spec.name} still being deleted when the {budget:g} s budget ran out, so "
                         f"its disks were never checked; once it is gone list them with "
-                        f"{' '.join(disks_list_command(spec))}")
+                        f"{' '.join(disks_list_command(spec, cluster_id=cid, names=[d['disk'] for d in recorded]))}")
             except RuntimeError as e:
                 # the cluster IS deleted; a disk possibly left over is said loudly, not as a failed delete
                 problems.append(str(e))
@@ -822,7 +825,13 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
 #
 # The disks are attributable without anything of ours: GKE puts the cluster's
 # own resource labels (created-by=bench-gke, purpose, issue, owner — see
-# create_commands) and its name and id on every PD CSI disk it provisions.
+# create_commands) and its name and id on every PD CSI disk it provisions —
+# but not all at once (#954). The id label (cluster-id-gke-io) comes with the
+# disk; goog-k8s-cluster-name and the rest come by later setLabels calls, so a
+# disk provisioned seconds before its cluster went (run 17: the StatefulSets
+# re-created their claims during the PVC release) carries the id and NOT the
+# name. A disk is this cluster's by its id; the name label, when present, must
+# not name another cluster.
 
 PD_CSI = "pd.csi.storage.gke.io"
 SSD_QUOTA_METRIC = "SSD_TOTAL_GB"
@@ -925,28 +934,58 @@ def cluster_id_b32(describe: dict) -> str | None:
         return None
 
 
-def backstop_disks(disks: Iterable[dict], *, name: str, cluster_id: str | None, zone: str,
-                   recorded: Iterable[str] = ()) -> list[str]:
-    """The exact names of THIS cluster's leftover disks, safe to delete: in the
-    cluster's zone, attached to nothing, and either carrying this cluster's
-    name AND this cluster's id in GKE's own disk labels, or recorded from this
-    cluster's own PersistentVolumes before it went (and labelled for no other
-    cluster). Never a pattern: another cluster's disk differs in name or id."""
+def cluster_disks(disks: Iterable[dict], *, name: str, cluster_id: str | None, zone: str,
+                  recorded: Iterable[str] = ()) -> list[dict]:
+    """THIS cluster's disks among `disks`, attached or not: in the cluster's
+    zone and either carrying this cluster's id in one of GKE's id labels
+    (cluster-id-gke-io, goog-gke-cluster-id-base32) with no name label naming
+    another cluster, or recorded from this cluster's own PersistentVolumes
+    before it went (and labelled for no other cluster). The id is enough: GKE
+    writes it with the disk, the name label only later (#954: run 17's
+    leftovers carried the id alone). Never a pattern: another cluster's disk
+    differs in id, or names its own cluster."""
     _check_name(name)
     rec = set(recorded)
     out = []
     for d in disks:
         lab = d.get("labels") or {}
         dz = str(d.get("zone") or "").rsplit("/", 1)[-1]
-        if dz != zone or d.get("users"):
+        if dz != zone:
             continue
-        by_label = (lab.get(GKE_DISK_CLUSTER_NAME) == name and cluster_id is not None
-                    and any(lab.get(k) == cluster_id for k in GKE_DISK_CLUSTER_ID_KEYS))
-        by_record = (d.get("name") in rec and lab.get(GKE_DISK_CLUSTER_NAME) in (None, name)
+        named = lab.get(GKE_DISK_CLUSTER_NAME) in (None, name)
+        by_id = (named and cluster_id is not None
+                 and any(lab.get(k) == cluster_id for k in GKE_DISK_CLUSTER_ID_KEYS))
+        by_record = (d.get("name") in rec and named
                      and all(lab.get(k) in (None, cluster_id) for k in GKE_DISK_CLUSTER_ID_KEYS))
-        if by_label or by_record:
-            out.append(d["name"])
-    return sorted(set(out))
+        if by_id or by_record:
+            out.append(d)
+    return sorted({d["name"]: d for d in out}.values(), key=lambda d: d["name"])
+
+
+def backstop_disks(disks: Iterable[dict], *, name: str, cluster_id: str | None, zone: str,
+                   recorded: Iterable[str] = ()) -> list[str]:
+    """The exact names of THIS cluster's leftover disks that are safe to delete
+    now: its disks (cluster_disks) attached to nothing."""
+    return [d["name"] for d in cluster_disks(disks, name=name, cluster_id=cluster_id, zone=zone,
+                                             recorded=recorded) if not d.get("users")]
+
+
+def disk_pvc(d: dict) -> str | None:
+    """The claim a PD CSI disk was provisioned for, from the JSON description
+    the driver writes (kubernetes.io/created-for/pvc/{namespace,name})."""
+    try:
+        desc = json.loads(d.get("description") or "")
+    except ValueError:
+        return None
+    if not isinstance(desc, dict) or "kubernetes.io/created-for/pvc/name" not in desc:
+        return None
+    return f"{desc.get('kubernetes.io/created-for/pvc/namespace')}/{desc['kubernetes.io/created-for/pvc/name']}"
+
+
+def _disk_line(d: dict) -> str:
+    pvc = disk_pvc(d)
+    return (f"{d.get('name')} ({d.get('sizeGb')} GB, {'attached' if d.get('users') else 'unattached'}"
+            + (f", for PVC {pvc}" if pvc else "") + ")")
 
 
 def _json(out: str):
@@ -1018,58 +1057,99 @@ def release_pvc_disks(spec: ClusterSpec, describe: dict, *, log: Callable[[str],
             execute(k + ["delete", "pod", "-n", md.get("namespace", "default"), md.get("name", ""),
                          "--wait=false"], dry_run=False, log=log)
     want = {d["pv"] for d in mine}
+    last = None
     while want:
         rc, out = execute(k + ["get", "pv", "-o", "json"], dry_run=False, log=lambda _: None)
-        left = {p.get("metadata", {}).get("name") for p in ((_json(out) or {}).get("items") or [])} & want \
-            if rc == 0 else want
+        last = _json(out) if rc == 0 else None
+        left = {p.get("metadata", {}).get("name") for p in ((last or {}).get("items") or [])} & want \
+            if isinstance(last, dict) else want
         if not left:
-            log("PVC release: every PV is gone (the CSI driver deleted their disks)")
+            # the PVs, not the disks: whether each disk is gone is verified after the cluster delete (#954)
+            log(f"PVC release: the {len(want)} recorded PV(s) are gone; their disks are checked after the "
+                f"cluster delete")
             break
         if clock() >= deadline:
             log(f"PVC release: {len(left)} PV(s) still there at the budget's end ({', '.join(sorted(left))}); "
                 f"the disk backstop runs after the delete")
             break
         sleep(_POLL_S)
-    return mine
+    # #954: deleting a StatefulSet's pod and claim makes it re-create both, and a new claim
+    # provisions a NEW disk; run 17 leaked 4 such disks per cluster. Record them for the backstop.
+    new = [d for d in pv_disks(last) if _ours(d, spec) and d["pv"] not in want] if isinstance(last, dict) else []
+    if new:
+        log(f"PVC release: {len(new)} PV(s) provisioned DURING the release (their workloads re-created the "
+            f"claims): " + ", ".join(f"{d['pv']}={d['disk']}" for d in new)
+            + "; the disk backstop deletes their disks after the cluster delete")
+    return mine + new
 
 
-def disks_list_command(spec: ClusterSpec) -> list[str]:
+def disks_list_command(spec: ClusterSpec, *, cluster_id: str | None, names: Iterable[str]) -> list[str]:
+    """ONE list of every disk that can be this cluster's, in its zone: by the
+    recorded names (exact: `name=(…)`) OR by the cluster's id in either of
+    GKE's id labels. A list, not one describe per name: "none" is rc 0 and
+    [], never a non-zero exit read as "gone" (#954: run 17's describes all
+    exited 1, NotFound, and said nothing). cluster_disks then decides."""
+    terms = [f"labels.{k}={cluster_id}" for k in GKE_DISK_CLUSTER_ID_KEYS] if cluster_id else []
+    names = sorted(set(names))
+    if names:
+        terms.append(f"name=({' '.join(names)})")
+    if not terms:
+        raise RuntimeError(f"{spec.name}: neither its cluster id nor any of its disks' names is known, "
+                           f"so its disks cannot be listed")
     return ["gcloud", "compute", "disks", "list", "--project", spec.project,
-            "--filter", f"zone:({spec.zone}) AND labels.{GKE_DISK_CLUSTER_NAME}={spec.name}",
-            "--format", "json"]
+            "--filter", f"zone:({spec.zone}) AND ({' OR '.join(terms)})", "--format", "json"]
 
 
 def disk_backstop(spec: ClusterSpec, *, cluster_id: str | None, recorded: list[dict],
-                  log: Callable[[str], None]) -> list[str]:
-    """After the cluster is gone: delete THIS cluster's leftover disks by exact
-    name (backstop_disks). Returns what it deleted; raises when the disks
-    cannot be listed or deleted (a leak must never read as "none left")."""
-    rc, out = execute(disks_list_command(spec), dry_run=False, log=log)
-    found = _json(out) if rc == 0 else None
-    if not isinstance(found, list):
-        raise RuntimeError(f"listing {spec.name}'s disks failed (rc={rc}): whether any is left is unknown; "
-                           f"run {' '.join(disks_list_command(spec))}")
-    disks = list(found)
-    have = {d.get("name") for d in disks}
-    for d in recorded:
-        if d["disk"] not in have and d["location"] == spec.zone and d["project"] == spec.project:
-            rc, out = execute(["gcloud", "compute", "disks", "describe", d["disk"], "--zone", spec.zone,
-                               "--project", spec.project, "--format", "json"], dry_run=False, log=log)
-            one = _json(out) if rc == 0 else None
-            if isinstance(one, dict):
-                disks.append(one)
-    names = backstop_disks(disks, name=spec.name, cluster_id=cluster_id, zone=spec.zone,
-                           recorded=[d["disk"] for d in recorded])
-    if not names:
-        log(f"disk backstop: no disk of {spec.name} left")
-        return []
-    rc, _ = execute(["gcloud", "compute", "disks", "delete", *names, "--zone", spec.zone,
-                     "--project", spec.project, "--quiet"], dry_run=False, log=log)
-    if rc != 0:
-        raise RuntimeError(f"deleting {', '.join(names)} failed (rc={rc}); "
-                           f"delete them by hand (gcloud compute disks delete ... --zone {spec.zone})")
-    log(f"disk backstop: deleted {len(names)} leftover disk(s) of {spec.name}: {', '.join(names)}")
-    return names
+                  log: Callable[[str], None], deadline: float, clock: Callable[[], float],
+                  sleep: Callable[[float], None]) -> list[str]:
+    """After the cluster is gone, until NONE of its disks is listed: list
+    every disk that can be this cluster's (by its recorded PV disks' names
+    and by its id label, disks_list_command), delete those attached to
+    nothing (cluster_disks), and wait — on that condition, bounded by
+    `deadline` — for the others to detach. Returns what it deleted. "No
+    disk left" is said only from a list that returned none. Raises when the
+    disks cannot be listed or deleted, when the cluster's id is unknown, or
+    when a disk is still there at the deadline (a leak never reads as
+    success, #954)."""
+    if cluster_id is None:
+        raise RuntimeError(f"{spec.name}'s cluster id is unknown (describe had none): its disks cannot be "
+                           f"found by GKE's id label, so whether any is left is unknown")
+    names = [d["disk"] for d in recorded if d["location"] == spec.zone and d["project"] == spec.project]
+    argv = disks_list_command(spec, cluster_id=cluster_id, names=names)
+    deleted: list[str] = []
+    while True:
+        rc, out = execute(argv, dry_run=False, log=log)
+        found = _json(out) if rc == 0 else None
+        if not isinstance(found, list):
+            raise RuntimeError(f"listing {spec.name}'s disks failed (rc={rc}): whether any is left is unknown; "
+                               f"run {' '.join(argv)}")
+        mine = cluster_disks(found, name=spec.name, cluster_id=cluster_id, zone=spec.zone, recorded=names)
+        if not mine:
+            log(f"disk backstop: verified, no disk of {spec.name} left (listed by its {len(names)} recorded "
+                f"disk name(s) and by its cluster id)"
+                + (f"; deleted {len(deleted)}: {', '.join(deleted)}" if deleted else ""))
+            return deleted
+        free = [d for d in mine if not d.get("users")]
+        late = clock() >= deadline
+        # past the deadline each unattached disk is still tried once; a delete is verified by the next
+        # list, never assumed (one that "succeeds" and leaves the disk ends at the deadline, loudly)
+        todo = [d for d in free if not (late and d["name"] in deleted)]
+        if todo:
+            log(f"disk backstop: deleting {len(todo)} leftover disk(s) of {spec.name}: "
+                + ", ".join(_disk_line(d) for d in todo))
+            rc, _ = execute(["gcloud", "compute", "disks", "delete", *[d["name"] for d in todo], "--zone",
+                             spec.zone, "--project", spec.project, "--quiet"], dry_run=False, log=log)
+            if rc != 0:
+                raise RuntimeError(f"deleting {', '.join(d['name'] for d in todo)} failed (rc={rc}); they are "
+                                   f"still there: delete them by hand (gcloud compute disks delete ... --zone "
+                                   f"{spec.zone})")
+            deleted += [d["name"] for d in todo if d["name"] not in deleted]
+            continue                    # re-list: the delete is verified, not assumed
+        if late:
+            raise RuntimeError(f"{len(mine)} disk(s) of {spec.name} still there when the budget ran out: "
+                               + ", ".join(_disk_line(d) for d in mine) + f"; list them with {' '.join(argv)}")
+        sleep(_POLL_S)
 
 
 def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline: float,

@@ -383,7 +383,10 @@ teardown() {
     ( trap "" INT TERM HUP; exec python3 -m bench.gke gke-down --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" --budget-s "$DOWN_BUDGET_S" $YES ) || down_rc=$?
     if [[ "$down_rc" == "4" ]]; then
       # #895: the cluster IS deleted, but its PVC disks could not be checked or deleted
-      log "cluster ${RUN_NAME} deleted, but DISK BACKSTOP FAILED (gke-down's stderr says why): its PVC disks may be left — gcloud compute disks list --project ${PROJECT} --filter='zone:(${ZONE}) AND labels.goog-k8s-cluster-name=${RUN_NAME}'"
+      # #954: its disks are found by the cluster's ID label (cluster-id-gke-io), not its name
+      # label (a disk provisioned late carries the id alone); gke-down's stderr names each disk
+      # left and the exact list command
+      log "cluster ${RUN_NAME} deleted, but DISK BACKSTOP FAILED (gke-down's stderr says why and names the disks left, with the gcloud command that lists them by the cluster's id): its disks may be left"
       rc=$(( rc == 0 ? 1 : rc ))
     elif [[ "$down_rc" != "0" ]]; then
       log "TEARDOWN FAILED — delete by hand: gcloud container clusters delete ${RUN_NAME} --project ${PROJECT} --region ${REGION} --quiet"

@@ -107,7 +107,7 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
                   "created-by": "bench-gke", "owner": "t",
                   "ttl-expires": str(int(time.time()) + 3600)}
         # what GKE reports for the regional cluster gke-up made (#899 F1 records it)
-        print(json.dumps({"name": a[3], "location": opt("--region") or opt("--zone"),
+        print(json.dumps({"name": a[3], "id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796", "location": opt("--region") or opt("--zone"),
                           "locations": ["europe-west4-a"], "currentNodeCount": 5,
                           "nodePools": [{"name": n, "config": {"machineType": m}, "initialNodeCount": c,
                                          "locations": ["europe-west4-a"]}

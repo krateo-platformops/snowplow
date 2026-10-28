@@ -105,10 +105,10 @@ def test_release_never_mutates_without_the_bench_context(realkubectl, shape):
     assert all(l.split()[3:5] == ["get", "pv"] for l in lines), lines
     assert not muts, muts
     assert any("could not list" in m for m in log), log
-    # the backstop still deletes only our labelled disk (by GKE labels)
+    # the backstop still deletes only this cluster's disks, by its id label (#954)
     c = T._calls(realkubectl)
     i = T._first(c, ["gcloud", "compute", "disks", "delete"])
-    assert c[i][4:c[i].index("--zone")] == ["pvc-ours-leftover"]
+    assert c[i][4:c[i].index("--zone")] == ["pvc-ours-attached", "pvc-ours-leftover", "pvc-reprovisioned-id-only"]
 
 
 def test_control_the_bench_context_present_does_release(realkubectl):
