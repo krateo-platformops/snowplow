@@ -31,20 +31,71 @@ import (
 	ktesting "k8s.io/client-go/testing"
 )
 
-// sink947 captures every record at Info and above.
-type sink947 struct {
+// store947 holds every record captured by a sink947 and by every handler
+// derived from it with WithAttrs / WithGroup.
+type store947 struct {
 	mu   sync.Mutex
 	recs []slog.Record
 }
 
+// sink947 captures every record at Info and above. It KEEPS what a logger
+// binds with With (WithAttrs) and WithGroup: each stored record carries the
+// bound attributes first, then its own, nested in the open groups. So an
+// attribute attached as slog.With("k", v).Warn(...) is scanned like any
+// record attribute (#947 F5).
+type sink947 struct {
+	*store947
+	bound  []slog.Attr // already wrapped in the groups open when they were bound
+	groups []string
+}
+
+// wrapInGroups947 nests as inside groups, outermost first.
+func wrapInGroups947(groups []string, as []slog.Attr) []slog.Attr {
+	for i := len(groups) - 1; i >= 0; i-- {
+		as = []slog.Attr{{Key: groups[i], Value: slog.GroupValue(as...)}}
+	}
+	return as
+}
+
 func (s *sink947) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelInfo }
-func (s *sink947) WithAttrs([]slog.Attr) slog.Handler           { return s }
-func (s *sink947) WithGroup(string) slog.Handler                { return s }
+func (s *sink947) WithAttrs(as []slog.Attr) slog.Handler {
+	c := *s
+	c.bound = append(append([]slog.Attr(nil), s.bound...), wrapInGroups947(s.groups, as)...)
+	return &c
+}
+func (s *sink947) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return s
+	}
+	c := *s
+	c.groups = append(append([]string(nil), s.groups...), name)
+	return &c
+}
 func (s *sink947) Handle(_ context.Context, r slog.Record) error {
+	nr := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	nr.AddAttrs(s.bound...)
+	var own []slog.Attr
+	r.Attrs(func(a slog.Attr) bool {
+		own = append(own, a)
+		return true
+	})
+	nr.AddAttrs(wrapInGroups947(s.groups, own)...)
 	s.mu.Lock()
-	s.recs = append(s.recs, r.Clone())
+	s.recs = append(s.recs, nr)
 	s.mu.Unlock()
 	return nil
+}
+
+// leaves947 calls fn for every leaf attribute of a, groups inlined.
+func leaves947(a slog.Attr, fn func(key, value string)) {
+	v := a.Value.Resolve()
+	if v.Kind() == slog.KindGroup {
+		for _, ga := range v.Group() {
+			leaves947(ga, fn)
+		}
+		return
+	}
+	fn(a.Key, v.String())
 }
 
 // count returns how many records satisfy keep.
@@ -81,7 +132,7 @@ func evaluatePathLine(r slog.Record) bool { return strings.HasPrefix(r.Message, 
 // carries the request logger.
 func capture947(t *testing.T) (*sink947, context.Context) {
 	t.Helper()
-	sink := &sink947{}
+	sink := &sink947{store947: &store947{}}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(sink))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -277,7 +328,8 @@ func TestDanglingRoleRef947_UnsyncedSnapshotStaysLoud(t *testing.T) {
 const tok947 = "u947alice"
 
 // assertNoClear947 fails if any captured record, of any message, carries tok
-// in its message or in any attribute value.
+// in its message, in any attribute key or value, including attributes bound
+// with With and nested in groups.
 func assertNoClear947(t *testing.T, sink *sink947, tok string) {
 	t.Helper()
 	sink.mu.Lock()
@@ -287,9 +339,11 @@ func assertNoClear947(t *testing.T, sink *sink947, tok string) {
 			t.Errorf("record %q carries %q in its message", r.Message, tok)
 		}
 		r.Attrs(func(a slog.Attr) bool {
-			if strings.Contains(a.Value.String(), tok) {
-				t.Errorf("record %q carries %q in attribute %q", r.Message, tok, a.Key)
-			}
+			leaves947(a, func(key, value string) {
+				if strings.Contains(key, tok) || strings.Contains(value, tok) {
+					t.Errorf("record %q carries %q in attribute %q", r.Message, tok, key)
+				}
+			})
 			return true
 		})
 	}

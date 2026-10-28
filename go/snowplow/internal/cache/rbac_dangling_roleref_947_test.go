@@ -43,21 +43,76 @@ type logRecord947 struct {
 	attrs map[string]string
 }
 
-// logSink947 captures every record at Info and above.
-type logSink947 struct {
+// logStore947 holds every record captured by a logSink947 and by every
+// handler derived from it with WithAttrs / WithGroup.
+type logStore947 struct {
 	mu   sync.Mutex
 	recs []logRecord947
 }
 
+// logSink947 captures every record at Info and above. It KEEPS what a logger
+// binds with With (WithAttrs) and WithGroup, so an attribute attached as
+// slog.With("k", v).Warn(...) is captured and scanned like a record
+// attribute (#947 F5). Attributes are flattened to "group.key" -> value.
+type logSink947 struct {
+	*logStore947
+	bound  []slog.Attr // already wrapped in the groups open when they were bound
+	groups []string
+}
+
+// wrapInGroups947 nests as inside groups, outermost first.
+func wrapInGroups947(groups []string, as []slog.Attr) []slog.Attr {
+	for i := len(groups) - 1; i >= 0; i-- {
+		as = []slog.Attr{{Key: groups[i], Value: slog.GroupValue(as...)}}
+	}
+	return as
+}
+
+// flatten947 writes a's leaves into out under "prefix.key" (groups inlined).
+func flatten947(prefix string, a slog.Attr, out map[string]string) {
+	v := a.Value.Resolve()
+	key := a.Key
+	if prefix != "" && key != "" {
+		key = prefix + "." + key
+	} else if prefix != "" {
+		key = prefix
+	}
+	if v.Kind() == slog.KindGroup {
+		for _, ga := range v.Group() {
+			flatten947(key, ga, out)
+		}
+		return
+	}
+	out[key] = v.String()
+}
+
 func (s *logSink947) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelInfo }
-func (s *logSink947) WithAttrs([]slog.Attr) slog.Handler           { return s }
-func (s *logSink947) WithGroup(string) slog.Handler                { return s }
+func (s *logSink947) WithAttrs(as []slog.Attr) slog.Handler {
+	c := *s
+	c.bound = append(append([]slog.Attr(nil), s.bound...), wrapInGroups947(s.groups, as)...)
+	return &c
+}
+func (s *logSink947) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return s
+	}
+	c := *s
+	c.groups = append(append([]string(nil), s.groups...), name)
+	return &c
+}
 func (s *logSink947) Handle(_ context.Context, r slog.Record) error {
 	rec := logRecord947{msg: r.Message, attrs: map[string]string{}}
+	for _, a := range s.bound {
+		flatten947("", a, rec.attrs)
+	}
+	var own []slog.Attr
 	r.Attrs(func(a slog.Attr) bool {
-		rec.attrs[a.Key] = a.Value.String()
+		own = append(own, a)
 		return true
 	})
+	for _, a := range wrapInGroups947(s.groups, own) {
+		flatten947("", a, rec.attrs)
+	}
 	s.mu.Lock()
 	s.recs = append(s.recs, rec)
 	s.mu.Unlock()
@@ -109,7 +164,7 @@ func (s *logSink947) find(msg, binding string) []logRecord947 {
 // captureLogs947 routes the default logger to a fresh sink for the test.
 func captureLogs947(t *testing.T) *logSink947 {
 	t.Helper()
-	sink := &logSink947{}
+	sink := &logSink947{logStore947: &logStore947{}}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(sink))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -390,7 +445,7 @@ func assertNoClear947(t *testing.T, sink *logSink947, tokens ...string) {
 				t.Errorf("record %q carries %q in its message", r.msg, tok)
 			}
 			for k, v := range r.attrs {
-				if strings.Contains(v, tok) {
+				if strings.Contains(k, tok) || strings.Contains(v, tok) {
 					t.Errorf("record %q carries %q in attribute %q", r.msg, tok, k)
 				}
 			}
