@@ -1163,6 +1163,8 @@ func TestDeliveryLog918_HandlerSeesAppliedDeliveries(t *testing.T) {
 func TestDeliveryLog918_AppliedEntriesReleasedByTheNextPass(t *testing.T) {
 	idx, dl := j9Rule(t, "5006", ja2)
 	tf := dl.transform(nil)
+	// Events the handler has processed, all before panel-b's delete.
+	dl.handler().OnUpdate(jclock.obj(repairGVR), j9Object{jclock.name, "5001", jclock.uid}.obj(repairGVR))
 	_, _ = tf(ja2.obj(repairGVR))    // an unchanged re-delivery: the store holds it
 	_, _ = tf(jb1del.obj(repairGVR)) // panel-b's delete, applied, handler not yet run
 	dl.beginPass()
@@ -1177,37 +1179,75 @@ func TestDeliveryLog918_AppliedEntriesReleasedByTheNextPass(t *testing.T) {
 	}
 }
 
-// TestDeliveryLog918_TombstoneReleasesTheReceivedEntry — #923 review O1. A
-// relist re-delivers an unchanged object (recorded; applied as a sync, so no
-// handler sees it), then a later relist removes the key with a tombstone,
-// which skips the transform. With the key gone from the store, beginPass keeps
-// such an entry, so the tombstone must release it, or it is held for the life
-// of the informer. 200 keys, 5 passes after: none may be left. A NEWER entry
-// — a recreate queued behind the tombstone — is kept.
-func TestDeliveryLog918_TombstoneReleasesTheReceivedEntry(t *testing.T) {
+// TestDeliveryLog918_NeverNotifiedEntriesReleasedByTheNextPass — #923 review
+// O1 and P1. Three ways a received entry is never followed by our handler's
+// notification, each for a key the store ends up lacking, so "the store holds
+// the key" cannot release it:
+//
+//   - O1: a relist re-delivers an unchanged object (applied as a sync, no
+//     handler runs), and a later relist removes the key with a tombstone.
+//     200 keys.
+//   - P1-A: a discarded watch-list attempt records the key at a NEWER state
+//     (updated during the gap), and the relist that follows tombstones it
+//     with the store's older state.
+//   - P1-B: a discarded attempt alone saw an object created and deleted in the
+//     gap. The store never had it, and no tombstone ever names it.
+//
+// Once our handler has processed an event past such an entry, it was never
+// notified — had it been applied, its notification would have come first and
+// removed it — so the next pass releases it. Until then it is kept: an entry
+// past everything the handler has seen may be a DELETE applied before the
+// handler runs (H3). A recreate queued behind its tombstone, newer than every
+// event handled, is kept too.
+func TestDeliveryLog918_NeverNotifiedEntriesReleasedByTheNextPass(t *testing.T) {
 	idx, dl := j9Rule(t, "4500")
 	tf, h := dl.transform(nil), dl.handler()
+
+	// O1: 200 keys, applied (handled), re-delivered unchanged, tombstoned.
 	const n = 200
 	for i := 0; i < n; i++ {
 		o := j9Object{fmt.Sprintf("gone-%03d", i), "4100", fmt.Sprintf("uid-gone-%03d", i)}
 		if err := idx.Add(o.obj(repairGVR)); err != nil {
 			t.Fatal(err)
 		}
+		h.OnAdd(o.obj(repairGVR), false)
 		_, _ = tf(o.obj(repairGVR)) // the relist's unchanged re-delivery
 		if err := idx.Delete(o.obj(repairGVR)); err != nil {
 			t.Fatal(err)
 		}
 		h.OnDelete(clientcache.DeletedFinalStateUnknown{Key: o.key(), Obj: o.obj(repairGVR)})
 	}
-	// A recreate queued behind its tombstone: newer than the last known state.
-	re := j9Object{"gone-recreated", "4100", "uid-r1"}
-	_, _ = tf(j9Object{re.name, "4600", "uid-r2"}.obj(repairGVR))
-	h.OnDelete(clientcache.DeletedFinalStateUnknown{Key: re.key(), Obj: re.obj(repairGVR)})
+	// P1-A: in the store at 4100; the discarded attempt saw it at 4200.
+	pa := j9Object{"updated-in-gap", "4100", "uid-pa"}
+	if err := idx.Add(pa.obj(repairGVR)); err != nil {
+		t.Fatal(err)
+	}
+	h.OnAdd(pa.obj(repairGVR), false)
+	_, _ = tf(j9Object{pa.name, "4200", pa.uid}.obj(repairGVR))
+	if err := idx.Delete(pa.obj(repairGVR)); err != nil {
+		t.Fatal(err)
+	}
+	h.OnDelete(clientcache.DeletedFinalStateUnknown{Key: pa.key(), Obj: pa.obj(repairGVR)})
+	// P1-B: seen only by the discarded attempt.
+	pb := j9Object{"born-and-gone-in-gap", "4250", "uid-pb"}
+	_, _ = tf(pb.obj(repairGVR))
 
+	idx.Bookmark("9000")
+	dl.beginPass()
+	// Nothing handled yet reaches P1-A's or P1-B's entry: both kept so far.
+	if _, ok := dl.receivedFor(pa.key()); !ok {
+		t.Fatalf("precondition: P1-A's entry released before the handler passed it")
+	}
+	// The GVR's next event, past all of them.
+	h.OnUpdate(jclock.obj(repairGVR), j9Object{jclock.name, "4300", jclock.uid}.obj(repairGVR))
+	// A recreate queued behind its tombstone: newer than every event handled.
+	re := j9Object{"recreated", "4600", "uid-re"}
+	_, _ = tf(re.obj(repairGVR))
 	idx.Bookmark("9000")
 	for i := 0; i < 5; i++ {
 		dl.beginPass()
 	}
+
 	left := 0
 	for i := 0; i < n; i++ {
 		if _, ok := dl.receivedFor(j9Object{name: fmt.Sprintf("gone-%03d", i)}.key()); ok {
@@ -1217,8 +1257,14 @@ func TestDeliveryLog918_TombstoneReleasesTheReceivedEntry(t *testing.T) {
 	if left != 0 {
 		t.Errorf("O1 RED: %d of %d tombstoned keys still hold a received entry after 5 passes", left, n)
 	}
+	if _, ok := dl.receivedFor(pa.key()); ok {
+		t.Errorf("P1-A RED: an entry newer than its tombstone, never notified, is held for good")
+	}
+	if _, ok := dl.receivedFor(pb.key()); ok {
+		t.Errorf("P1-B RED: an entry no tombstone names, never notified, is held for good")
+	}
 	if _, ok := dl.receivedFor(re.key()); !ok {
-		t.Errorf("a recreate queued behind its tombstone lost its received entry")
+		t.Errorf("a recreate newer than every handled event lost its received entry")
 	}
 }
 

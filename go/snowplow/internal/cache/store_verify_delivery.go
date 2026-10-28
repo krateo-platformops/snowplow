@@ -23,10 +23,10 @@
 //     that very delivery applied. A relist re-delivering an object that did
 //     not change is applied without telling any handler
 //     (sharedIndexInformer.OnUpdate treats an unchanged resourceVersion as a
-//     sync), so its entry is released at the start of the next pass instead:
-//     every entry the store's position has passed, for a key the store holds,
-//     is dropped there (transient, and no per-key record of what was applied
-//     is kept for it). #870's per-informer `seen` record will hold the
+//     sync), so its entry is released at the start of the next pass instead
+//     (beginPass: every entry the store's position has passed, for a key the
+//     store holds or that our handler has passed without ever seeing it —
+//     transient, and no per-key record of what was applied is kept for it). #870's per-informer `seen` record will hold the
 //     identity each delivery reached the store with; once it lands, the
 //     transform reads `seen` and records no unchanged re-delivery at all.
 //   - APPLIED DELETES. The handler is the first place the event TYPE is known:
@@ -169,8 +169,10 @@ type deliveryLog struct {
 	// seq numbers the transform's deliveries.
 	seq uint64
 	// unapplied: key -> its latest delivery, until the handler sees it applied
-	// or the next pass finds the store's position past it (beginPass).
+	// or the next pass finds it applied or never notified (beginPass).
 	unapplied map[string]received
+	// handled is the newest resourceVersion our handler has processed.
+	handled string
 	// deletes: key -> its latest applied delete, from this pass generation or
 	// the one before (beginPass prunes older ones: a LIST no older than the
 	// store then lacks the key).
@@ -277,21 +279,15 @@ func (l *deliveryLog) appliedEvent(obj any, deleted bool) {
 	l.mu.Lock()
 	if t, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
 		l.deletes[t.Key] = appliedDelete{tombstone: true, gen: l.gen}
-		// #923 review O1 — the tombstone removed the key, and the tombstone
-		// record now speaks for it (held, then decided by the next pass). A
-		// received entry no newer than the key's last known state is released
-		// with it: it is a delivery the handler never saw applied (a relist's
-		// unchanged re-delivery, a discarded watch-list attempt), and with the
-		// key gone from the store beginPass would keep it for good. A NEWER
-		// entry — a recreate queued behind the tombstone — is kept.
-		if e, has := l.unapplied[t.Key]; has {
-			if _, last, ok := identityOf(t.Obj); ok {
-				if c, err := orderRV(e.id.rv, last.rv); err == nil && c <= 0 {
-					delete(l.unapplied, t.Key)
-				}
-			}
-		}
 	} else if key, id, ok := identityOf(obj); ok {
+		// handled: the newest resourceVersion this handler has processed
+		// (see beginPass). A tombstone carries the key's last known state,
+		// not an applied event's version, so it does not move it.
+		if l.handled == "" {
+			l.handled = id.rv
+		} else if c, err := orderRV(id.rv, l.handled); err == nil && c > 0 {
+			l.handled = id.rv
+		}
 		if e, has := l.unapplied[key]; has && e.id == id {
 			delete(l.unapplied, key)
 		}
@@ -402,12 +398,26 @@ func (l *deliveryLog) judgePending() []divergenceCandidate {
 // applied are released, and the reflector's published position is returned —
 // the forced LIST is no older than it.
 //
-// An entry is released when the store's applied position has passed it AND
-// the store holds its key: the store then has that state or a newer one, which
-// is all the rule could learn from the entry. An entry for a key the store
-// lacks is kept until our handler sees it applied: it may be a DELETE the store
-// applied before the handler recorded it, which only the entry tells apart
-// from a lost add (store_verify_judge.go, #923 review H3).
+// An entry the store's applied position has passed is released when either
+// holds (#923 review N2, P1):
+//
+//   - the store holds its key: the store then has that state or a newer one,
+//     which is all the rule could learn from the entry;
+//   - our handler has processed an event at or past the entry's
+//     resourceVersion (handled). The handler receives notifications in the
+//     order the store applied them (distribute runs under blockDeltas, and each
+//     processorListener delivers FIFO), so an entry the store had applied as an
+//     event would have been notified before that one, and its notification
+//     would have removed it. An entry still here was never notified: a relist's
+//     unchanged re-delivery, or what a discarded watch-list attempt recorded —
+//     including an object that attempt alone saw, created and deleted in the
+//     gap, which no tombstone ever names.
+//
+// Anything else is kept. That includes the case the entry exists for: a DELETE
+// the store has applied while our handler has not yet run, so handled is below
+// it. Only that entry tells it apart from a lost add (store_verify_judge.go,
+// #923 review H3). What stays unreleased is only what was recorded after the
+// handler's latest event; the GVR's next event passes it.
 func (l *deliveryLog) beginPass() string {
 	pos := l.appliedPosition()
 	l.mu.Lock()
@@ -425,9 +435,16 @@ func (l *deliveryLog) beginPass() string {
 			}
 		}
 	}
+	handled := l.handled
 	l.mu.Unlock()
 	for key, id := range passed {
-		if _, exists, err := l.indexer.GetByKey(key); err != nil || !exists {
+		release := false
+		if c, err := orderRV(id.rv, handled); err == nil && c <= 0 {
+			release = true // never notified (see above)
+		} else if _, exists, err := l.indexer.GetByKey(key); err == nil && exists {
+			release = true // the store holds the key
+		}
+		if !release {
 			continue
 		}
 		l.mu.Lock()
