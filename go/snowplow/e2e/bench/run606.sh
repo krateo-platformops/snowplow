@@ -272,7 +272,15 @@ run() {
 # ConfigMap \"load606\" is invalid: metadata.annotations: Too long"). Server-
 # side apply records field ownership in managedFields instead, no copy.
 # (tests/test_apply_size.py: every object this script applies fits the API.)
-kapply() { run "${K[@]}" apply --server-side --force-conflicts --field-manager=bench606 -f "$1"; }
+# Once applied (or refused), the manifest keeps no password on disk: the
+# Jobs' command lines, the browser config and #935's user Secrets carry the
+# bench users' password, and the run directory outlives the cluster (#939
+# review); redact_pw replaces it in place, success or not.
+kapply() { local rc=0; run "${K[@]}" apply --server-side --force-conflicts --field-manager=bench606 -f "$1" || rc=$?; redact_pw "$1"; return "$rc"; }
+redact_pw() {
+  python3 -c 'import sys; p, s = sys.argv[1], sys.argv[2]; t = open(p).read(); open(p, "w").write(t.replace(s, "<redacted>"))' \
+      "$1" "$PW"
+}
 step() {
   local name="$1"; shift
   log "=== step ${name} ==="
@@ -598,6 +606,49 @@ s_data() {
       --namespaces "$NAMESPACES" --hold-probe-wait-s "$HOLD_PROBE_WAIT_S" \
       --out "$OUT/data-proof.json" ${login[@]+"${login[@]}"} \
       $([[ "$FRESH_MODES" == "annotation" ]] || printf -- '--fresh-modes %s' "$FRESH_MODES")
+  if [[ "$LOAD_DRIVER" == "k6" ]]; then fresh_classes_create || return 1; fi
+}
+# fresh_classes_create (#935): the fresh identity classes each Chrome session
+# switches to through the run (bench/fresh_classes.py: a new user per class,
+# never logged in, and a RoleBinding naming it alone), created before the
+# reboot — nothing warms a class before its own login. One class per two
+# route cycles: cycle_s = 2 x len(routes) x BROWSER_THINK_S; per session
+# ceil(DRIVE_S / cycle_s) classes, its initial user's included. Applied with
+# kapply, its output discarded: it names the users; an error line goes
+# through bench/identity.py (kerr_line).
+fresh_classes_create() {
+  local pwf="$OUT/.bench-password"
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.fresh_classes plan --sessions $BROWSER_SESSIONS --browser-think-s $BROWSER_THINK_S --duration-s $DRIVE_S -> $OUT/fresh-classes.json; kapply $OUT/fresh-classes.yaml"
+    return 0
+  fi
+  (umask 077; printf '%s' "$PW" > "$pwf")
+  local rc=0
+  python3 -m bench.fresh_classes plan --preflight-file "$OUT/preflight.jsonl" --sessions "$BROWSER_SESSIONS" \
+      --browser-think-s "$BROWSER_THINK_S" --duration-s "$DRIVE_S" --namespaces "$NAMESPACES" \
+      --user-prefix "$BENCH_USER_PREFIX" --password-file "$pwf" --out "$OUT/fresh-classes.json" \
+      --manifest "$OUT/fresh-classes.yaml" 2>"$KERR" || rc=$?
+  rm -f "$pwf"
+  (( rc == 0 )) || { log "fresh classes FAILED: the plan could not be made: $(kerr_line)"; return 1; }
+  log "$(kerr_line)"
+  if [[ ! -s "$OUT/fresh-classes.yaml" ]]; then
+    log "no fresh identity class: the browser's run is shorter than one class cycle"
+    return 0
+  fi
+  kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" \
+    || { log "fresh classes FAILED: $(kerr_line)"; return 1; }
+}
+# fresh_classes_cleanup (#935): every object fresh_classes_create made, and
+# each fresh user's clientconfig Secret authn wrote at its login; bounded,
+# best effort (the cluster's deletion is the backstop), output discarded.
+fresh_classes_cleanup() {
+  [[ -f "$OUT/fresh-classes.json" ]] || return 0
+  local args
+  while read -r -a args; do
+    bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" "${args[@]}" \
+        >/dev/null 2>"$KERR" || log "fresh classes cleanup: $(kerr_line)"
+  done < <(python3 -m bench.fresh_classes cleanup --plan "$OUT/fresh-classes.json")
+  log "fresh classes cleaned up"
 }
 s_reboot() {
   # Cold start at 50K: restart once the data exists, time Ready (#594/#637).
@@ -679,6 +730,7 @@ s_measure() {
       $([[ "$VIEWERS" == "1" ]] || printf -- '--no-viewers') \
       --driver "$LOAD_DRIVER" --preflight-file "$OUT/preflight.jsonl" $([[ "$DRY" == "1" ]] && printf -- "--dry-run") \
       --browser-sessions "$BROWSER_SESSIONS" --browser-think-s "$BROWSER_THINK_S" \
+      $([[ -f "$OUT/fresh-classes.json" ]] && printf -- "--fresh-classes %s" "$OUT/fresh-classes.json") \
       --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" \
       $(for x in $BROWSER_FORWARDS; do printf -- '--browser-forward %s ' "$x"; done) \
       > "$OUT/loadgen-job.yaml"
@@ -1212,6 +1264,8 @@ s_collect() {
     | scrub --kubelet-timestamps > "$OUT/snowplow-previous.log"
   [[ -s "$OUT/snowplow-previous.log" ]] || rm -f "$OUT/snowplow-previous.log"
   "${KR[@]}" top nodes > "$OUT/top-nodes.txt" || true
+  # #935: the fresh identity classes, once the browser is done with them
+  fresh_classes_cleanup
   COLLECTED=1
   log "collected: $(cd "$OUT" && ls nav-*.jsonl fresh-*.jsonl mem-*.jsonl pod-after.jsonl snowplow.log 2>/dev/null | tr '\n' ' ')heap=$(ls "$OUT/heap" 2>/dev/null | wc -l | tr -d ' ')"
 }

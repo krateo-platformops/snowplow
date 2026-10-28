@@ -74,7 +74,8 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "dropped_iterations", "clicks", "arrivals",
          # the browser's completed requests: the pair's customer witness reads them
          "browser_http_req_duration", "browser_http_req_failed",
-         "browser_call_ms", "browser_request_incomplete_ms", "browser_request_failed_start_unseen")
+         "browser_call_ms", "browser_request_incomplete_ms", "browser_request_failed_start_unseen",
+         "browser_fresh_class")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # the points whose time is kept too (out["times"], index-aligned with
 # out["points"]): run 12 compares latency inside / outside the CPU profiles;
@@ -83,7 +84,8 @@ _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # inside the time both runs' snowplow was Ready
 _TIMED = ("page_load_ms", "browser_page_load_ms", "http_req_duration", "http_req_failed", "clicks",
           "arrivals", "browser_http_req_duration", "browser_http_req_failed", "browser_call_ms",
-          "browser_request_incomplete_ms", "browser_request_failed_start_unseen")
+          "browser_request_incomplete_ms", "browser_request_failed_start_unseen",
+          "browser_fresh_class")
 _RFC3339 = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
 
 

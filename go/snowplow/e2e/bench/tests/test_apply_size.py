@@ -109,10 +109,19 @@ def test_run606_applies_everything_through_one_server_side_apply():
                if re.search(r"\bapply\b", ln) and not ln.lstrip().startswith("#")]
     assert applies == [ln for ln in applies if ln.startswith("kapply()")], applies
     sites = [ln.strip() for ln in src.splitlines() if ln.strip().startswith('kapply "')]
-    # #924 M3: the bench's own FlowSchemas (env), then the two Jobs
+    # #924 M3: the bench's own FlowSchemas (env); the preflight Job; #935's
+    # fresh identity classes (data; its output names users: discarded); the load
     assert sites == ['kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/preflight-job.yaml"',
-                     'kapply "$OUT/loadgen-job.yaml"']
+                     'kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" \\', 'kapply "$OUT/loadgen-job.yaml"']
     assert "--server-side" in _kapply()
+
+
+def test_the_fresh_classes_fit_the_api():
+    from bench import fresh_classes
+    p = fresh_classes.plan(sessions=5, routes=8, think_s=15, duration_s=9000, namespaces=50, user_prefix="scaleuser-")
+    objs = _objects(fresh_classes.manifest(p, "pw"))
+    assert len(objs) == 3 * 5 * (p["classes_per_session"] - 1)
+    assert all(check(o, client_side=False) == [] for o in objs)
 
 
 def test_the_bench_flowschemas_fit_the_api():

@@ -23,8 +23,11 @@
 // it). `browser_sse_opened{session, stream}`; the evaluator wants >= 1 of each.
 import { browser } from 'k6/browser'
 import exec from 'k6/execution'
+import http from 'k6/http'
 import { Counter, Trend } from 'k6/metrics'
-import { OBSERVER, QUIET_MS, callOps, loadOf, recordOps, requestLedger, settledNow } from './pageload.js'
+import {
+  OBSERVER, QUIET_MS, callOps, freshClassTags, loadOf, recordOps, requestLedger, settledNow, switchDue,
+} from './pageload.js'
 
 const CFG = JSON.parse(open(__ENV.BROWSER_CONFIG || '/opt/k6/browser-config.json'))
 
@@ -46,6 +49,9 @@ const CALL = new Trend('browser_call_ms', true)
 const INCOMPLETE = new Trend('browser_request_incomplete_ms', true)
 // a failed request whose start the ledger never saw: counted, no duration
 const UNSEEN = new Counter('browser_request_failed_start_unseen')
+// #935: one point per fresh identity class: snowplow's learned-class counters
+// around its sign-in (the proof it was cold) and the clock before it
+const FRESH = new Counter('browser_fresh_class')
 const LEDGER_METRICS = { browser_request_incomplete_ms: INCOMPLETE, browser_request_failed_start_unseen: UNSEEN }
 
 export const options = {
@@ -66,6 +72,7 @@ export const options = {
     browser_widget_states: ['count>=0'],
     bench_frame: ['count>=0'],
     browser_request_failed_start_unseen: ['count>=0'],
+    browser_fresh_class: ['count>=0'],
   },
   summaryTrendStats: ['count', 'min', 'med', 'p(95)', 'max'],
   // no url/name tags: the SPA puts the signed-in user into /call extras
@@ -141,14 +148,52 @@ async function gotoLogin (page) {
   }
 }
 
+// #935: snowplow's learned-class counters (/debug/vars, as the signed-in
+// user): the proof a fresh class was one snowplow had not learned. null when
+// there is no token yet or the read fails (the class is then not proven).
+function learnedCounts (token) {
+  if (!token || !CFG.snowplowUrl) return null
+  try {
+    const r = http.get(`${CFG.snowplowUrl}/debug/vars`, {
+      headers: { Authorization: `Bearer ${token}` }, tags: { bench: 'learned_classes' }, timeout: '30s',
+    })
+    if (r.status !== 200) return null
+    const v = r.json()
+    return { registered: v.snowplow_learned_classes_registered, seeded: v.snowplow_learned_classes_seeded }
+  } catch (e) {
+    return null
+  }
+}
+
+async function tokenOf (page) {
+  try {
+    return await page.evaluate(() => JSON.parse(window.localStorage.getItem('K_user') || '{}').accessToken || null)
+  } catch (e) {
+    return null
+  }
+}
+
 export default async function () {
   const s = CFG.sessions[exec.vu.idInTest - 1]
+  const deadline = Date.now() + CFG.durationS * 1000
+  // #935: the session's identity classes, its initial user first, then each
+  // FRESH class (bench/fresh_classes.py); one browser context each, like a
+  // new person: its own sign-in, its own app cache, its own first visits
+  const users = [s.user].concat(s.fresh || [])
+  let token = null
+  for (let k = 0; k < users.length && Date.now() < deadline; k++) {
+    token = await runClass(s, users[k], k, k === users.length - 1, deadline, token)
+  }
+}
+
+async function runClass (s, user, k, last, deadline, prevToken) {
   const context = await browser.newContext()
   await context.addInitScript(OBSERVER)
   const page = await context.newPage()
-  const deadline = Date.now() + CFG.durationS * 1000
-  const visited = new Set()
+  const visits = {}
+  const base = { session: s.name, class: String(k), identity: k === 0 ? 'initial' : 'fresh' }
   let shown = '(none)'     // the route on screen: tags the calls made between loads
+  let token = prevToken
   // #919 (N7): every request the page makes, until it finishes or fails
   // (k6 emits nothing for a request that failed at network level)
   const ledger = requestLedger()
@@ -162,7 +207,10 @@ export default async function () {
   })
   try {
     await gotoLogin(page)
-    await page.locator('#basic_username').fill(s.user)
+    // #935: snowplow's learned classes right before a fresh class's sign-in
+    const tBefore = Date.now() / 1000
+    const before = k > 0 ? learnedCounts(prevToken) : null
+    await page.locator('#basic_username').fill(user)
     await page.locator('#basic_password').fill(CFG.password)
     // the first page's clock starts when the app leaves /login (pageload.js)
     await page.evaluate(() => {
@@ -177,17 +225,22 @@ export default async function () {
       const signin = await page.evaluate(() => window.__bench.signinMs)
       if (signin !== null) SIGNIN.add(signin, { session: s.name })
     }
-    record(first, { session: s.name, route: landed, visit: 'first', method: 'login' })
-    await drainCalls(page, { session: s.name, route: landed, visit: 'first', during: 'load' })
-    visited.add(landed)
+    record(first, Object.assign({ route: landed, visit: 'first', method: 'login' }, base))
+    await drainCalls(page, Object.assign({ route: landed, visit: 'first', during: 'load' }, base))
+    token = (await tokenOf(page)) || prevToken
+    if (k > 0) {
+      const after = learnedCounts(token)
+      FRESH.add(1, Object.assign({}, base, freshClassTags(before, after, tBefore)))
+    }
+    visits[landed] = (visits[landed] || 0) + 1
     shown = landed
     let n = 0
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !switchDue(visits, CFG.routes, last)) {
       await page.waitForTimeout(CFG.thinkS * 1000)
       const route = CFG.routes[(s.offset + (++n)) % CFG.routes.length]
       const item = page.locator(`li.ant-menu-item[data-menu-id$="-${route}"]`)
       let method = 'click'
-      await drainCalls(page, { session: s.name, route: shown, during: 'between' })
+      await drainCalls(page, Object.assign({ route: shown, during: 'between' }, base))
       await markStart(page)
       if (await item.isVisible()) {
         await item.click()
@@ -202,25 +255,26 @@ export default async function () {
         }, route)
       }
       const r = await settled(page, route)
-      const visit = visited.has(route) ? 'warm' : 'first'
-      record(r, { session: s.name, route, visit, method })
-      await drainCalls(page, { session: s.name, route, visit, during: 'load' })
-      visited.add(route)
+      const visit = visits[route] ? 'warm' : 'first'
+      record(r, Object.assign({ route, visit, method }, base))
+      await drainCalls(page, Object.assign({ route, visit, during: 'load' }, base))
+      visits[route] = (visits[route] || 0) + 1
       shown = route
     }
   } finally {
-    await drainCalls(page, { session: s.name, route: shown, during: 'between' })
+    await drainCalls(page, Object.assign({ route: shown, during: 'between' }, base))
     for (const [, value, t] of ledger.unfinished(Date.now())) {
       INCOMPLETE.add(value, Object.assign({ session: s.name, route: shown }, t))
     }
     try {
-      const n = await page.evaluate(() => window.__benchSse || { refreshes: 0, notifications: 0 })
-      SSE.add(n.refreshes, { session: s.name, stream: 'refreshes' })
-      SSE.add(n.notifications, { session: s.name, stream: 'notifications' })
+      const sse = await page.evaluate(() => window.__benchSse || { refreshes: 0, notifications: 0 })
+      SSE.add(sse.refreshes, { session: s.name, stream: 'refreshes' })
+      SSE.add(sse.notifications, { session: s.name, stream: 'notifications' })
     } catch (e) { /* the page is gone: nothing counted, the evaluator says so */ }
     await page.close()
     await context.close()
   }
+  return token
 }
 
 export function setup () { FRAME.add(1, { frame: 'start' }) }
@@ -229,7 +283,7 @@ export function teardown () { FRAME.add(1, { frame: 'end' }) }
 export function handleSummary (data) {
   const keep = {}
   for (const [name, m] of Object.entries(data.metrics)) {
-    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|browser_call_ms|browser_request_incomplete_ms|browser_request_failed_start_unseen|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
+    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|browser_call_ms|browser_request_incomplete_ms|browser_request_failed_start_unseen|browser_fresh_class|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
   }
   return { [__ENV.SUMMARY_FILE || '/out/browser-summary.json']: JSON.stringify({
     kind: 'browser_summary', sessions: CFG.sessions.map((x) => x.name),

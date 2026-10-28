@@ -129,7 +129,8 @@ def test_every_customer_source_counts_and_none_is_no_witness():
     spans_ok = [(12.0, 13.0, False, 1000.0)] * 99
     j = custlat.judge_stretch([(10.0, 20.0)], {"k6load": spans_ok, "browser": [(14.0, 15.0, True, 1000.0)] * 2},
                               30.0, BAR)
-    assert j["verdict"] == "fail" and j["k6"]["by_source"]["browser"] == {"requests": 2, "not_served": 2}
+    assert j["verdict"] == "fail" and j["k6"]["by_source"]["browser"] == {"requests": 2, "not_served": 2,
+                                                                           "not_served_by": {"failed": 2}}
     assert custlat.judge_stretch([(10.0, 20.0)], {"k6load": [], "browser": []}, 30.0, BAR)["verdict"] == "none"
     j = custlat.judge_stretch([(10.0, 20.0)], {"k6load": None, "browser": []}, 30.0, BAR)
     assert j["verdict"] == "unpaired" and j["k6"]["unpaired"] == ["k6load"]

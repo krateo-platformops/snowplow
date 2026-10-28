@@ -382,7 +382,7 @@ def test_each_call_carries_its_resource_name_and_namespace_never_the_extras(tmp_
 
 def test_browser_js_drains_the_calls_after_each_load_and_before_each_click():
     src = (BENCH_DIR / "k6" / "browser.js").read_text()
-    loop = src[src.index("while (Date.now() < deadline)"):]
+    loop = src[src.index("while (Date.now() < deadline && !switchDue("):]   # each class's route loop (#935)
     assert loop.index("during: 'between'") < loop.index("await markStart(page)")
     assert loop.index("const r = await settled(page, route)") < loop.index("during: 'load'")
     assert "new Trend('browser_call_ms', true)" in src and "browser_call_ms|" in src
@@ -568,12 +568,16 @@ def test_a_network_failed_request_inside_a_stretch_is_not_served(tmp_path):
                      start_seen="false")]
     _write_out(tmp_path / "browser", "browser", pts, None, 0)
     raw = custlat.raw_from_dir(str(tmp_path))
-    assert raw["customers"]["browser_incomplete"] == [(T + 5.0, T + 10.0, True, 5000.0), (T + 120, T + 120, True, None)]
+    assert raw["customers"]["browser_incomplete"] == [
+        (T + 5.0, T + 10.0, True, 5000.0, "net::ERR_CONNECTION_REFUSED"),
+        (T + 120, T + 120, True, None, "net::ERR_FAILED, start unseen")]
     j = custlat.judge_stretch([(T, T + 60)], raw["customers"], timeout_s=10, bar=0.01)
-    assert j["verdict"] == "fail" and j["k6"]["by_source"]["browser_incomplete"] == {"requests": 1, "not_served": 1}
+    assert j["verdict"] == "fail" and j["k6"]["by_source"]["browser_incomplete"] == {
+        "requests": 1, "not_served": 1, "not_served_by": {"net::ERR_CONNECTION_REFUSED": 1}}
     # the unseen-start failure counts where it happened
     j = custlat.judge_stretch([(T + 100, T + 130)], raw["customers"], timeout_s=10, bar=0.01)
-    assert j["k6"]["by_source"]["browser_incomplete"] == {"requests": 1, "not_served": 1}
+    assert j["k6"]["by_source"]["browser_incomplete"] == {
+        "requests": 1, "not_served": 1, "not_served_by": {"net::ERR_FAILED, start unseen": 1}}
 
 
 def _incomplete(T, *pts):
@@ -619,7 +623,14 @@ def test_a_page_cancel_or_a_cut_that_outlasted_the_probe_is_not_served(tmp_path)
     raw = custlat.raw_from_dir(str(tmp_path))
     j = custlat.judge_stretch([(T + 100, T + 102)], raw["customers"], timeout_s=10, bar=0.01)
     # hung 15 s / 20 s through the stretch: past the 10 s probe, not served; a reset: a network failure
-    assert j["k6"]["by_source"]["browser_incomplete"] == {"requests": 3, "not_served": 3}
+    # #924 review LOW: a fail-closed FAIL names its cause, each by Chrome's errorText
+    assert j["k6"]["by_source"]["browser_incomplete"] == {"requests": 3, "not_served": 3, "not_served_by": {
+        "net::ERR_ABORTED, outlasting the probe's 10 s": 1, "never answered, outlasting the probe's 10 s": 1,
+        "net::ERR_CONNECTION_RESET": 1}}
+    # ... and the pair's verdict says it, in the stretch's why
+    text = custlat.witness_text(j["k6"], 10)
+    assert text.endswith("— browser_incomplete: 1 net::ERR_ABORTED, outlasting the probe's 10 s, "
+                         "1 net::ERR_CONNECTION_RESET, 1 never answered, outlasting the probe's 10 s"), text
     assert custlat.CLIENT_CANCEL == "net::ERR_ABORTED"
 
 

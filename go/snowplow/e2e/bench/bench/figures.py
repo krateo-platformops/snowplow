@@ -228,8 +228,125 @@ def reflector_establishments(mem: list[dict], after: float | None, k6_calls: lis
                                  f"not read"}
 
 
+# ─── first visits by fresh identity classes (#935) ──────────────────────────
+
+def _int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def fresh_classes(o: dict | None) -> list[dict]:
+    """browser.js's browser_fresh_class points: each fresh class's window
+    (its sign-in to its first page) and snowplow's learned-class counters at
+    both ends."""
+    if not o:
+        return []
+    out = []
+    for (_, t), at in zip(o["points"].get("browser_fresh_class", []),
+                          (o.get("times") or {}).get("browser_fresh_class") or []):
+        out.append({"session": t.get("session"), "class": t.get("class"), "t0": _int(t.get("t_before")),
+                    "t1": at, **{k: _int(t.get(k)) for k in ("registered_before", "registered_after",
+                                                              "seeded_before", "seeded_after")}})
+    return sorted(out, key=lambda c: (c["t0"] is None, c["t0"] or 0))
+
+
+def prove_cold(classes: list[dict]) -> dict:
+    """Mark each class `cold_proven`: snowplow's learned-class registrations
+    across its window cover it. Windows that overlap (any session; the
+    counter is process-wide) form ONE group, every class in it — a class
+    whose own counter read failed included: it may have registered, so it
+    counts toward what the group must cover, and is itself unproven (#939
+    review R1). A group's classes are proven when the registrations from
+    its first read to its last (`max(after) - min(before)`, over the reads
+    that came back) are at least the classes in the group; one registration
+    for two sign-ins proves neither.
+
+    The assumption that nothing else registers a class meanwhile is
+    falsified, not trusted: the registrations seen BETWEEN groups (from one
+    group's last read to the next group's first) are returned; non-zero
+    means something else registers classes, and a group's proof may have
+    counted one of them. The counter is a gauge (an eviction lowers it), so
+    only the gaps that ROSE are summed: a gap that fell says nothing about
+    registrations, and summing it signed would let an eviction in one gap
+    cancel a foreign registration in another (#939 delta L7)."""
+    known = [c for c in classes if c["t1"] is not None]
+    for c in classes:
+        if c["t1"] is None:
+            c["cold_proven"], c["why"] = False, "no time for its window"
+    groups: list[list[dict]] = []
+    for c in sorted(known, key=lambda c: c["t0"] if c["t0"] is not None else c["t1"]):
+        start = c["t0"] if c["t0"] is not None else c["t1"]
+        if groups and start <= max(x["t1"] for x in groups[-1]):
+            groups[-1].append(c)
+        else:
+            groups.append([c])
+    edges = []                                    # per group: (first read, last read), None when none came back
+    for g in groups:
+        before = [x["registered_before"] for x in g if x["registered_before"] is not None]
+        after = [x["registered_after"] for x in g if x["registered_after"] is not None]
+        moved = max(after) - min(before) if before and after else None
+        ok = moved is not None and moved >= len(g)
+        for x in g:
+            read_ok = x["t0"] is not None and x["registered_before"] is not None and x["registered_after"] is not None
+            x["cold_proven"] = ok and read_ok
+            if not read_ok:
+                x["why"] = "its learned-class read failed (it still counts toward its window's registrations)"
+            elif not ok:
+                x["why"] = f"{moved} class(es) registered for {len(g)} sign-in(s) in the window"
+            x["seed_ran_during_first_visit"] = (x["seeded_before"] is not None and x["seeded_after"] is not None
+                                                and x["seeded_after"] > x["seeded_before"])
+        edges.append((min(before) if before else None, max(after) if after else None))
+    between = [nb - pa for (_, pa), (nb, _) in zip(edges, edges[1:]) if pa is not None and nb is not None]
+    return {"registered_between_windows": sum(d for d in between if d > 0), "gaps_read": len(between)}
+
+
+def _stats(v: list[float]) -> dict:
+    return {"n": len(v), "p50_ms": _pct(v, 50), "p95_ms": _pct(v, 95), "max_ms": max(v) if v else None}
+
+
+def fresh_first_visits(o: dict | None, phases, phase_of) -> dict:
+    """Per route: the FIRST visits of fresh identity classes proven cold, per
+    phase and over the run — n, p50, p95, max — and the classes not proven
+    (left out, with why)."""
+    classes = fresh_classes(o)
+    if not classes:
+        return {"status": "absent", "note": "no browser_fresh_class point: no fresh identity class ran "
+                                            "(browser.js or run606 before #935, or no session switched)"}
+    between = prove_cold(classes)
+    ok = {(c["session"], c["class"]) for c in classes if c["cold_proven"]}
+    by_route: dict[str, dict[str, list[float]]] = {}
+    for (v, t), at in zip(o["points"].get("browser_page_load_ms", []),
+                          (o.get("times") or {}).get("browser_page_load_ms") or []):
+        if t.get("identity") != "fresh" or t.get("visit") != "first" or v is None or at is None:
+            continue
+        if (t.get("session"), t.get("class")) not in ok:
+            continue
+        r = by_route.setdefault(t.get("route"), {})
+        ph = phase_of(at, phases)
+        # each phase, the churn steps pooled (as every per-phase report), the run
+        for p in (ph,) + (("churn",) if ph.startswith("churn:") else ()) + ("all",):
+            r.setdefault(p, []).append(v)
+    return {"status": "present", "classes": len(classes),
+            "cold_proven": sum(1 for c in classes if c["cold_proven"]),
+            "not_proven": [{k: c.get(k) for k in ("session", "class", "why")} for c in classes if not c["cold_proven"]],
+            "seed_ran_during_first_visit": sum(1 for c in classes if c.get("seed_ran_during_first_visit")),
+            # the falsifier of "nothing else registers a class": the rises of
+            # the learned-class gauge between the fresh windows; non-zero
+            # means a proof may have counted one of them
+            "registered_between_windows": between["registered_between_windows"],
+            "between_windows_read": between["gaps_read"],
+            **({"warning": f"{between['registered_between_windows']} class(es) registered between the fresh "
+                           f"windows: something else registers classes, so a window's proof may have counted "
+                           f"one of them"} if between["registered_between_windows"] > 0 else {}),
+            "by_route": {r: {p: _stats(v) for p, v in ps.items()} for r, ps in sorted(by_route.items())},
+            "how": "first visits (visit=first) of fresh identity classes (identity=fresh) whose cold start "
+                   "snowplow's learned-class counter proves; a page that timed out counts at its timeout"}
+
+
 def run_figures(report: dict, recs: list[dict], window, facts: dict,
-                k6_calls: list[tuple[float, float]] | None = None) -> dict:
+                k6_calls: list[tuple[float, float]] | None = None, browser: dict | None = None) -> dict:
     """One run's figures (report: its verdict report, with the APF report)."""
     cfg = next((r for r in recs if r.get("kind") == "flowcontrol_config"), None)
     ap = report.get("apiserver_flowcontrol_report_only") or {}
@@ -238,7 +355,12 @@ def run_figures(report: dict, recs: list[dict], window, facts: dict,
            "steady_refreshes_per_core": steady_refreshes_per_core(report.get("customer_latency")),
            "reflector_establishments_after_ready": reflector_establishments(
                [r for r in recs if r.get("kind") == "mem"], facts.get("ready_at"), k6_calls or [],
-               [r for r in recs if r.get("kind") == "top"])}
+               [r for r in recs if r.get("kind") == "top"]),
+           # #935: phases from the run's own schedule (load606.run_phases), as every per-phase report
+           "fresh_first_visits": fresh_first_visits(
+               browser, load606.run_phases([r for r in recs if r.get("kind") in ("mem_start", "mem", "mem_end")],
+                                           [r for r in recs if r.get("kind") in ("fresh", "churn")]),
+               load606._phase_of)}
     ids = (cfg or {}).get("identities") or {}
     if cfg and cfg.get("verified") and ap.get("status") == "present":
         def per(rep):

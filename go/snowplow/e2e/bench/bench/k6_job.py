@@ -195,12 +195,19 @@ def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: st
 def browser_config(*, sessions: list[dict], routes: list[str], password: str,
                    think_s: float, duration_s: float, quiet_ms: int = 1000,
                    page_timeout_ms: int = 60000, signin_timeout_ms: int = 60000,
-                   frontend_url: str = "http://localhost:8080") -> dict:
-    return {"sessions": [{k: s[k] for k in ("name", "user", "offset")} for s in sessions],
+                   frontend_url: str = "http://localhost:8080",
+                   snowplow_url: str = "http://localhost:8081",
+                   fresh: dict | None = None) -> dict:
+    """`fresh` (#935): bench/fresh_classes.plan — each session's fresh users,
+    in order; `snowplow_url`: snowplow as the browser pod reaches it (its
+    forward), where a session reads the learned-class counters."""
+    by_session = {x["session"]: [f["user"] for f in x["fresh"]] for x in (fresh or {}).get("sessions", [])}
+    return {"sessions": [dict({k: s[k] for k in ("name", "user", "offset")}, fresh=by_session.get(s["name"], []))
+                         for s in sessions],
             "routes": list(routes), "password": password, "thinkS": think_s,
             "durationS": int(duration_s), "quietMs": quiet_ms,
             "pageTimeoutMs": page_timeout_ms, "signinTimeoutMs": signin_timeout_ms,
-            "frontendUrl": frontend_url,
+            "frontendUrl": frontend_url, "snowplowUrl": snowplow_url,
             "firstVisit": first_visit_label(sessions)}
 
 

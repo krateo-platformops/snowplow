@@ -1170,7 +1170,8 @@ def _docker_ok():
 needs_docker = pytest.mark.skipif(not _docker_ok(), reason="docker is not available")
 
 
-def _run_browser_fixture(tmp_path, k6dir=None, signin_ms=3400, skel_ms=150, page_ms=250):
+def _run_browser_fixture(tmp_path, k6dir=None, signin_ms=3400, skel_ms=150, page_ms=250, fresh=(),
+                         duration_s=12):
     """k6/browser.js in the pinned k6 browser image against
     tests/fixtures/k6_browser_fixture.py, on a private docker network."""
     net = f"k6brfix-{os.getpid()}"
@@ -1179,10 +1180,11 @@ def _run_browser_fixture(tmp_path, k6dir=None, signin_ms=3400, skel_ms=150, page
     out.mkdir(mode=0o777)
     out.chmod(0o777)
     (tmp_path / "cfg.json").write_text(json.dumps({
-        "sessions": [{"name": "s1", "user": "fixture-user", "offset": 0}],
+        "sessions": [{"name": "s1", "user": "fixture-user", "offset": 0, "fresh": list(fresh)}],
         "routes": ["/dashboard", "/compositions", "/never", "/err"], "password": "x",
-        "thinkS": 0.3, "durationS": 12, "quietMs": 1000, "pageTimeoutMs": 3000,
-        "signinTimeoutMs": 10000, "frontendUrl": f"http://{spa}:8080", "firstVisit": "test"}))
+        "thinkS": 0.3, "durationS": duration_s, "quietMs": 1000, "pageTimeoutMs": 3000,
+        "signinTimeoutMs": 10000, "frontendUrl": f"http://{spa}:8080", "snowplowUrl": f"http://{spa}:8080",
+        "firstVisit": "test"}))
     subprocess.run(["docker", "network", "create", net], capture_output=True, check=True)
     try:
         subprocess.run(["docker", "run", "-d", "--name", spa, "--network", net,
@@ -1430,6 +1432,37 @@ def test_in_chrome_a_refused_call_and_the_open_streams_are_points(tmp_path):
     assert any(t["call_resource"] == "tables" and t["call_status"] == "200" for t in calls), calls
     with gzip.open(tmp_path / "out" / "browser.json.gz", "rt") as fh:
         assert "FIXTURE-SECRET" not in fh.read()
+
+
+@needs_docker
+def test_in_chrome_each_session_switches_to_its_fresh_identity_classes(tmp_path):
+    """#935: a session signs in as its initial user, visits every route twice
+    (first, then warm), then signs in as its next fresh class in a new browser
+    context and visits every route for the first time again. The real read
+    path end to end (#939 review LOW): the previous class's K_user token,
+    the Bearer header, the two expvar names — the fixture's /debug/vars
+    (401 without a token) learns a class the first time its token reads,
+    so every fresh class is proven cold."""
+    o = _run_browser_fixture(tmp_path, signin_ms=300, fresh=["fixture-fresh-1", "fixture-fresh-2"],
+                             duration_s=40)
+    loads = [(t["class"], t["identity"], t["route"], t["visit"]) for _, t in o["points"]["browser_page_load_ms"]]
+    classes = sorted({c for c, *_ in loads})
+    assert classes[:2] == ["0", "1"], loads
+    for c in classes[:-1]:                 # every class but the last switched after two visits of each route
+        routes = [r for k, _, r, _ in loads if k == c]
+        assert all(routes.count(r) >= 2 for r in ("/dashboard", "/compositions", "/never", "/err")), loads
+    first1 = sorted(r for k, i, r, v in loads if k == "1" and v == "first")
+    assert first1 == ["/compositions", "/dashboard", "/err", "/never"], loads
+    assert {i for k, i, *_ in loads if k == "1"} == {"fresh"} and {i for k, i, *_ in loads if k == "0"} == {"initial"}
+    fc = [t for _, t in o["points"]["browser_fresh_class"]]
+    assert sorted(t["class"] for t in fc) == [c for c in classes if c != "0"]
+    assert all(t["registered_before"] and int(t["registered_after"]) == int(t["registered_before"]) + 1
+               and t["t_before"] for t in fc), fc
+    from bench import figures
+    r = figures.fresh_first_visits(o, [], load606._phase_of)
+    assert r["cold_proven"] == r["classes"] == len(fc) and r["by_route"]["/dashboard"]["all"]["n"] >= 1, r
+    with gzip.open(tmp_path / "out" / "browser.json.gz", "rt") as fh:
+        assert "fixture-fresh" not in fh.read()            # a class's user name is never a tag
 
 
 _K6_STUBS = {

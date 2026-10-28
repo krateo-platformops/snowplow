@@ -229,6 +229,28 @@ export function requestLedger () {
   }
 }
 
+// #935: when a session switches to its next identity class. A class's
+// purpose is one FIRST visit of every route, and the run's warm bars still
+// need WARM visits: so a class stays until every route has been visited twice
+// (once first, once warm) — two route cycles, 2 x len(routes) x thinkS. The
+// session's last class stays to the end.
+export function switchDue (visits, routes, last) {
+  if (last) return false
+  return routes.every((r) => (visits[r] || 0) >= 2)
+}
+
+// #935: the browser_fresh_class point's tags — snowplow's learned-class
+// counters before the fresh sign-in and after its first page ('' when a read
+// failed), and the clock before it (epoch seconds), the window evaluate
+// proves the class cold in.
+export function freshClassTags (before, after, tBefore) {
+  const v = (x, k) => (x && typeof x[k] === 'number' ? String(x[k]) : '')
+  return {
+    registered_before: v(before, 'registered'), registered_after: v(after, 'registered'),
+    seeded_before: v(before, 'seeded'), seeded_after: v(after, 'seeded'), t_before: String(Math.floor(tBefore)),
+  }
+}
+
 // Is the page loaded at `now`? Self-contained: browser.js sends its source
 // into the page (declared WITHOUT `export`: k6's goja keeps the keyword in
 // Function.prototype.toString, which the page cannot parse; exported below). arg = {path, quiet}; path null = the sign-in arrival, which

@@ -72,7 +72,8 @@ def test_run16_window_is_witnessed_served_not_void(run16):
     j = judge(run16, run16["customers"])
     assert j["verdict"] == "served"
     assert j["k6"]["by_source"] == {"browser": {"requests": 357, "not_served": 0},
-                                    "k6load": {"requests": 10035, "not_served": 48}}
+                                    "k6load": {"requests": 10035, "not_served": 48,
+                                               "not_served_by": {"failed": 48}}}
     assert (j["k6"]["requests"], j["k6"]["not_served"], j["k6"]["rate"]) == (10392, 48, 0.004619)
 
 
