@@ -97,6 +97,7 @@ func TestDanglingRoleRef947_EvaluateLogsNothing(t *testing.T) {
 	cases := []struct {
 		name        string
 		binding     runtime.Object
+		bindingKind string
 		bindingName string
 		namespace   string
 		wantCR      int
@@ -105,17 +106,17 @@ func TestDanglingRoleRef947_EvaluateLogsNothing(t *testing.T) {
 		{
 			name:        "ClusterRoleBinding_to_absent_ClusterRole",
 			binding:     clusterRoleBinding("crb-947", "absent-cr-947", groupSubject("grp-947")),
-			bindingName: "crb-947", wantCR: 1,
+			bindingKind: "ClusterRoleBinding", bindingName: "crb-947", wantCR: 1,
 		},
 		{
 			name:        "RoleBinding_to_absent_Role",
 			binding:     roleBinding("ns-947", "rb-947", "Role", "absent-r-947", groupSubject("grp-947")),
-			bindingName: "rb-947", namespace: "ns-947", wantR: 1,
+			bindingKind: "RoleBinding", bindingName: "rb-947", namespace: "ns-947", wantR: 1,
 		},
 		{
 			name:        "RoleBinding_to_absent_ClusterRole",
 			binding:     roleBinding("ns-947", "rbcr-947", "ClusterRole", "absent-cr-947", groupSubject("grp-947")),
-			bindingName: "rbcr-947", namespace: "ns-947", wantCR: 1,
+			bindingKind: "RoleBinding", bindingName: "rbcr-947", namespace: "ns-947", wantCR: 1,
 		},
 	}
 	for _, tc := range cases {
@@ -150,7 +151,7 @@ func TestDanglingRoleRef947_EvaluateLogsNothing(t *testing.T) {
 				t.Errorf("%d evaluations recorded %d snapshot misses; want 0", evaluations, got)
 			}
 			dangling := sink.count(func(r slog.Record) bool {
-				return r.Message == "cache.rbac.snapshot.dangling_roleref" && attr947(r, "binding_name") == tc.bindingName
+				return r.Message == "cache.rbac.snapshot.dangling_roleref" && attr947(r, "binding") == cache.RBACBindingLabel(tc.bindingKind, tc.namespace, tc.bindingName)
 			})
 			if dangling != 1 {
 				t.Errorf("dangling lines = %d; want exactly 1", dangling)
@@ -183,8 +184,8 @@ func TestDanglingRoleRef947_UnsyncedSnapshotStaysLoud(t *testing.T) {
 		t.Fatalf("rbacv1.AddToScheme: %v", err)
 	}
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, rbacListKinds(),
-		clusterRoleBinding("crb-unsynced-947", "present-cr-947", groupSubject("grp-947")),
-		clusterRole("present-cr-947", rule([]string{""}, []string{"pods"}, []string{"get"})),
+		clusterRoleBinding(tok947+"-crb-unsynced", tok947+"-present-cr", groupSubject(tok947+"-group")),
+		clusterRole(tok947+"-present-cr", rule([]string{""}, []string{"pods"}, []string{"get"})),
 	)
 	var released atomic.Bool
 	dyn.PrependReactor("list", "clusterroles", func(ktesting.Action) (bool, runtime.Object, error) {
@@ -209,7 +210,7 @@ func TestDanglingRoleRef947_UnsyncedSnapshotStaysLoud(t *testing.T) {
 	var unsynced *cache.RBACSnapshot
 	waitFor947(t, "a snapshot holding this test's binding", func() bool {
 		s := cache.RBACSnapshotForTest()
-		if s == nil || len(s.ClusterRoleBindings) != 1 || s.ClusterRoleBindings[0].Name != "crb-unsynced-947" {
+		if s == nil || len(s.ClusterRoleBindings) != 1 || s.ClusterRoleBindings[0].Name != tok947+"-crb-unsynced" {
 			return false
 		}
 		unsynced = s
@@ -219,9 +220,9 @@ func TestDanglingRoleRef947_UnsyncedSnapshotStaysLoud(t *testing.T) {
 		t.Fatalf("snapshot built while the ClusterRole LIST was failing claims Synced")
 	}
 
-	opts := rbac.EvaluateOptions{Username: "u-947", Groups: []string{"grp-947"}, Verb: "get", Resource: "pods"}
+	opts := rbac.EvaluateOptions{Username: tok947, Groups: []string{tok947 + "-group"}, Verb: "get", Resource: "pods"}
 	isMiss := func(r slog.Record) bool {
-		return r.Message == "rbac.evaluate.snapshot.miss" && attr947(r, "name") == "present-cr-947"
+		return r.Message == "rbac.evaluate.snapshot.miss" && attr947(r, "role") == cache.RBACRoleLabel("ClusterRole", "", tok947+"-present-cr")
 	}
 	linesBefore := sink.count(isMiss)
 	missBefore := cache.RBACSnapshotMissCount()
@@ -265,6 +266,32 @@ func TestDanglingRoleRef947_UnsyncedSnapshotStaysLoud(t *testing.T) {
 	}
 	if got := sink.count(func(r slog.Record) bool { return r.Message == "cache.rbac.snapshot.dangling_roleref" }); got != 0 {
 		t.Errorf("a binding whose role exists was reported dangling %d times; want 0", got)
+	}
+	// The binding, role, group and user names all carry the token; the loud
+	// miss lines name the role by label only.
+	assertNoClear947(t, sink, tok947)
+}
+
+// tok947 is a username-shaped token planted in the unsynced arm's binding,
+// role, group and user names: no log line may carry it in clear (#947 F1).
+const tok947 = "u947alice"
+
+// assertNoClear947 fails if any captured record, of any message, carries tok
+// in its message or in any attribute value.
+func assertNoClear947(t *testing.T, sink *sink947, tok string) {
+	t.Helper()
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	for _, r := range sink.recs {
+		if strings.Contains(r.Message, tok) {
+			t.Errorf("record %q carries %q in its message", r.Message, tok)
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if strings.Contains(a.Value.String(), tok) {
+				t.Errorf("record %q carries %q in attribute %q", r.Message, tok, a.Key)
+			}
+			return true
+		})
 	}
 }
 

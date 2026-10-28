@@ -16,8 +16,17 @@
 //   - The current count, by roleRef kind, is the expvar
 //     snowplow_rbac_dangling_roleref.
 //
-// The lines name the binding and the role, never the binding's subjects. The
-// gauge is keyed by roleRef kind only, never by any name.
+// IDENTITY. Binding, role and namespace names often embed a tenant username
+// (on one cluster 28 of 423 ClusterRoleBindings, 12/417 RoleBindings, 28/434
+// ClusterRoles and 12/414 Roles did). So the lines never carry a name in
+// clear: the binding, the role and the namespace are redact labels
+// (redact.Prefixed, keyed per process). A label is stable for the process
+// lifetime, so the dangling line and the resolved line of one binding carry
+// the same labels. The kinds, the reason and snap_seq are logged as they are.
+// The binding's subjects are never logged. The gauge is keyed by roleRef kind
+// only, never by any name. To find the real objects, the operator lists the
+// bindings whose roleRef names a role that does not exist (the hint below and
+// docs/architecture/observability.md give the query).
 //
 // Concurrency: the production writer is single (the rebuild slot), so calls
 // arrive in publish order. The mutex covers the test-only synchronous rebuild
@@ -28,8 +37,64 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/krateo-platformops/snowplow/internal/redact"
+
 	rbacv1 "k8s.io/api/rbac/v1"
 )
+
+// danglingRoleRefHint tells the operator how to find the objects behind the
+// labels: the gauge says how many, the query lists them.
+const danglingRoleRefHint = "the binding references a role that does not exist, so it grants nothing; " +
+	"Kubernetes allows this. Logged once when it starts and once when it ends; the current count is " +
+	"snowplow_rbac_dangling_roleref in /debug/vars. Names are redact labels: to find the objects, list " +
+	"each binding's roleRef (kubectl get clusterrolebindings,rolebindings -A -o custom-columns=" +
+	"KIND:.kind,NS:.metadata.namespace,NAME:.metadata.name,ROLEKIND:.roleRef.kind,ROLE:.roleRef.name) " +
+	"and keep the rows whose role kubectl get cannot find"
+
+// RBACBindingLabel is the log label of a binding: kind, namespace ("" for a
+// ClusterRoleBinding) and name, never in clear. Stable per process.
+func RBACBindingLabel(kind, namespace, name string) string {
+	return redact.Prefixed("binding", kind+"/"+namespace+"/"+name)
+}
+
+// RBACRoleLabel is the log label of a referenced role: kind, namespace (the
+// binding's namespace for a Role, "" for a ClusterRole) and name, never in
+// clear. Stable per process, and the same label the evaluator's
+// rbac.evaluate.snapshot.miss line uses.
+func RBACRoleLabel(kind, namespace, name string) string {
+	return redact.Prefixed("role", kind+"/"+namespace+"/"+name)
+}
+
+// RBACNamespaceLabel is the log label of a namespace; "" stays "" (a
+// cluster-scoped object has none).
+func RBACNamespaceLabel(namespace string) string {
+	if namespace == "" {
+		return ""
+	}
+	return redact.Prefixed("ns", namespace)
+}
+
+// roleNamespace is the namespace a roleRef resolves in: the binding's for a
+// Role, none for a ClusterRole.
+func (k danglingRoleRef) roleNamespace() string {
+	if k.roleKind == "Role" {
+		return k.bindingNamespace
+	}
+	return ""
+}
+
+// logAttrs are the attributes every dangling-roleRef line carries: kinds in
+// clear, names as labels.
+func (k danglingRoleRef) logAttrs() []any {
+	return []any{
+		slog.String("subsystem", "cache"),
+		slog.String("binding_kind", k.bindingKind),
+		slog.String("binding", RBACBindingLabel(k.bindingKind, k.bindingNamespace, k.bindingName)),
+		slog.String("binding_namespace", RBACNamespaceLabel(k.bindingNamespace)),
+		slog.String("roleref_kind", k.roleKind),
+		slog.String("roleref", RBACRoleLabel(k.roleKind, k.roleNamespace(), k.roleName)),
+	}
+}
 
 // danglingRoleRef identifies one binding and the absent role it references.
 // The roleRef is part of the key, so a binding that now points at a different
@@ -120,18 +185,10 @@ func noteDanglingRoleRefs(snap *RBACSnapshot, next map[danglingRoleRef]struct{})
 		if _, was := danglingState.current[k]; was {
 			continue
 		}
-		slog.Warn("cache.rbac.snapshot.dangling_roleref",
-			slog.String("subsystem", "cache"),
-			slog.String("binding_kind", k.bindingKind),
-			slog.String("binding_namespace", k.bindingNamespace),
-			slog.String("binding_name", k.bindingName),
-			slog.String("roleref_kind", k.roleKind),
-			slog.String("roleref_name", k.roleName),
+		slog.Warn("cache.rbac.snapshot.dangling_roleref", append(k.logAttrs(),
 			slog.Uint64("snap_seq", snap.PublishSeq),
-			slog.String("hint", "the binding references a role that does not exist, so it grants nothing; "+
-				"Kubernetes allows this. Logged once when it starts and once when it ends; "+
-				"the current count is snowplow_rbac_dangling_roleref in /debug/vars"),
-		)
+			slog.String("hint", danglingRoleRefHint),
+		)...)
 	}
 	for k := range danglingState.current {
 		if _, still := next[k]; still {
@@ -141,16 +198,10 @@ func noteDanglingRoleRefs(snap *RBACSnapshot, next map[danglingRoleRef]struct{})
 		if roleRefPresent(snap, k.bindingNamespace, rbacv1.RoleRef{Kind: k.roleKind, Name: k.roleName}) {
 			reason = "role_present"
 		}
-		slog.Warn("cache.rbac.snapshot.dangling_roleref_resolved",
-			slog.String("subsystem", "cache"),
-			slog.String("binding_kind", k.bindingKind),
-			slog.String("binding_namespace", k.bindingNamespace),
-			slog.String("binding_name", k.bindingName),
-			slog.String("roleref_kind", k.roleKind),
-			slog.String("roleref_name", k.roleName),
+		slog.Warn("cache.rbac.snapshot.dangling_roleref_resolved", append(k.logAttrs(),
 			slog.String("reason", reason),
 			slog.Uint64("snap_seq", snap.PublishSeq),
-		)
+		)...)
 	}
 
 	danglingState.current = next

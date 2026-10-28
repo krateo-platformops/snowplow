@@ -16,6 +16,7 @@ import (
 	"expvar"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/informers"
 	k8stesting "k8s.io/client-go/testing"
 	clientcache "k8s.io/client-go/tools/cache"
 )
@@ -62,27 +64,42 @@ func (s *logSink947) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-// count returns how many captured records have message msg and name the
-// binding bindingName.
-func (s *logSink947) count(msg, bindingName string) int {
+// count returns how many captured records have message msg and carry the
+// binding label binding (RBACBindingLabel).
+func (s *logSink947) count(msg, binding string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
 	for _, r := range s.recs {
-		if r.msg == msg && r.attrs["binding_name"] == bindingName {
+		if r.msg == msg && r.attrs["binding"] == binding {
 			n++
 		}
 	}
 	return n
 }
 
-// find returns the captured records with message msg naming bindingName.
-func (s *logSink947) find(msg, bindingName string) []logRecord947 {
+// countRole returns how many captured records have message msg, carry the
+// binding label binding and the role label role (RBACRoleLabel).
+func (s *logSink947) countRole(msg, binding, role string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, r := range s.recs {
+		if r.msg == msg && r.attrs["binding"] == binding && r.attrs["roleref"] == role {
+			n++
+		}
+	}
+	return n
+}
+
+// find returns the captured records with message msg carrying the binding
+// label binding.
+func (s *logSink947) find(msg, binding string) []logRecord947 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []logRecord947
 	for _, r := range s.recs {
-		if r.msg == msg && r.attrs["binding_name"] == bindingName {
+		if r.msg == msg && r.attrs["binding"] == binding {
 			out = append(out, r)
 		}
 	}
@@ -110,6 +127,8 @@ func gauge947(t *testing.T) (clusterRole, role int) {
 type danglingShape947 struct {
 	name        string
 	binding     runtime.Object
+	bindingKind string // "ClusterRoleBinding" | "RoleBinding"
+	bindingNS   string
 	bindingName string
 	bindingGVR  string // "crb" | "rb"
 	missing     runtime.Object
@@ -119,6 +138,14 @@ type danglingShape947 struct {
 	wantR       int
 }
 
+// label is the binding's log label.
+func (sh danglingShape947) label() string {
+	return RBACBindingLabel(sh.bindingKind, sh.bindingNS, sh.bindingName)
+}
+
+// crbLabel947 is the log label of a ClusterRoleBinding.
+func crbLabel947(name string) string { return RBACBindingLabel("ClusterRoleBinding", "", name) }
+
 func shapes947() []danglingShape947 {
 	crbToCR := mkCRB("crb-947", userSub(subject947))       // roleRef ClusterRole "crb-947-role"
 	rbToR := mkRB("ns-947", "rb-947", userSub(subject947)) // roleRef Role "rb-947-role" in ns-947
@@ -126,17 +153,17 @@ func shapes947() []danglingShape947 {
 	rbToCR.RoleRef.Kind = "ClusterRole" // roleRef ClusterRole "rbcr-947-role"
 	return []danglingShape947{
 		{
-			name: "ClusterRoleBinding_to_absent_ClusterRole", binding: crbToCR, bindingName: "crb-947", bindingGVR: "crb",
+			name: "ClusterRoleBinding_to_absent_ClusterRole", binding: crbToCR, bindingKind: "ClusterRoleBinding", bindingName: "crb-947", bindingGVR: "crb",
 			missing: mkCR("crb-947-role"), missingGVR: "cr",
 			decoy: mkR("ns-947", "crb-947-role"), wantCR: 1,
 		},
 		{
-			name: "RoleBinding_to_absent_Role", binding: rbToR, bindingName: "rb-947", bindingGVR: "rb",
+			name: "RoleBinding_to_absent_Role", binding: rbToR, bindingKind: "RoleBinding", bindingNS: "ns-947", bindingName: "rb-947", bindingGVR: "rb",
 			missing: mkR("ns-947", "rb-947-role"), missingGVR: "r",
 			decoy: mkR("other-ns-947", "rb-947-role"), wantR: 1,
 		},
 		{
-			name: "RoleBinding_to_absent_ClusterRole", binding: rbToCR, bindingName: "rbcr-947", bindingGVR: "rb",
+			name: "RoleBinding_to_absent_ClusterRole", binding: rbToCR, bindingKind: "RoleBinding", bindingNS: "ns-947", bindingName: "rbcr-947", bindingGVR: "rb",
 			missing: mkCR("rbcr-947-role"), missingGVR: "cr",
 			decoy: mkR("ns-947", "rbcr-947-role"), wantCR: 1,
 		},
@@ -189,13 +216,13 @@ func TestDanglingRoleRef947_OneLinePerStateChange(t *testing.T) {
 			if s := RBACSnapshotForTest(); s == nil || !s.Synced {
 				t.Fatalf("snapshot after a synced watcher's rebuild is not Synced: %+v", s)
 			}
-			if got := sink.count(msgDangling947, sh.bindingName); got != 1 {
+			if got := sink.count(msgDangling947, sh.label()); got != 1 {
 				t.Errorf("dangling lines after %d publishes = %d; want exactly 1", publishes, got)
 			}
 			if cr, r := gauge947(t); cr != sh.wantCR || r != sh.wantR {
 				t.Errorf("gauge = {ClusterRole:%d Role:%d}; want {ClusterRole:%d Role:%d}", cr, r, sh.wantCR, sh.wantR)
 			}
-			if got := sink.count(msgResolved947, sh.bindingName); got != 0 {
+			if got := sink.count(msgResolved947, sh.label()); got != 0 {
 				t.Errorf("resolved lines before the role exists = %d; want 0", got)
 			}
 
@@ -205,13 +232,13 @@ func TestDanglingRoleRef947_OneLinePerStateChange(t *testing.T) {
 			for i := 0; i < publishes; i++ {
 				RebuildRBACSnapshotForTest(rw)
 			}
-			if got := sink.count(msgResolved947, sh.bindingName); got != 1 {
+			if got := sink.count(msgResolved947, sh.label()); got != 1 {
 				t.Errorf("resolved lines after the role was created = %d; want exactly 1", got)
 			}
-			if recs := sink.find(msgResolved947, sh.bindingName); len(recs) == 1 && recs[0].attrs["reason"] != "role_present" {
+			if recs := sink.find(msgResolved947, sh.label()); len(recs) == 1 && recs[0].attrs["reason"] != "role_present" {
 				t.Errorf("resolved reason = %q; want role_present", recs[0].attrs["reason"])
 			}
-			if got := sink.count(msgDangling947, sh.bindingName); got != 1 {
+			if got := sink.count(msgDangling947, sh.label()); got != 1 {
 				t.Errorf("dangling lines after resolution = %d; want still exactly 1", got)
 			}
 			if cr, r := gauge947(t); cr != 0 || r != 0 {
@@ -223,7 +250,7 @@ func TestDanglingRoleRef947_OneLinePerStateChange(t *testing.T) {
 		t.Run(sh.name+"/binding_deleted", func(t *testing.T) {
 			rw, sink := setup947(t, sh)
 			RebuildRBACSnapshotForTest(rw)
-			if got := sink.count(msgDangling947, sh.bindingName); got != 1 {
+			if got := sink.count(msgDangling947, sh.label()); got != 1 {
 				t.Fatalf("dangling lines = %d; want exactly 1", got)
 			}
 			if err := indexerOf947(t, rw, sh.bindingGVR).Delete(sh.binding); err != nil {
@@ -232,10 +259,10 @@ func TestDanglingRoleRef947_OneLinePerStateChange(t *testing.T) {
 			for i := 0; i < publishes; i++ {
 				RebuildRBACSnapshotForTest(rw)
 			}
-			if got := sink.count(msgResolved947, sh.bindingName); got != 1 {
+			if got := sink.count(msgResolved947, sh.label()); got != 1 {
 				t.Errorf("resolved lines after the binding was deleted = %d; want exactly 1", got)
 			}
-			if recs := sink.find(msgResolved947, sh.bindingName); len(recs) == 1 && recs[0].attrs["reason"] != "binding_changed_or_deleted" {
+			if recs := sink.find(msgResolved947, sh.label()); len(recs) == 1 && recs[0].attrs["reason"] != "binding_changed_or_deleted" {
 				t.Errorf("resolved reason = %q; want binding_changed_or_deleted", recs[0].attrs["reason"])
 			}
 			if cr, r := gauge947(t); cr != 0 || r != 0 {
@@ -260,7 +287,7 @@ func TestDanglingRoleRef947_FlapIsOneLinePerTransition(t *testing.T) {
 		for i := 0; i < publishes; i++ {
 			RebuildRBACSnapshotForTest(rw)
 		}
-		d, r := sink.count(msgDangling947, sh.bindingName), sink.count(msgResolved947, sh.bindingName)
+		d, r := sink.count(msgDangling947, sh.label()), sink.count(msgResolved947, sh.label())
 		if d != wantDangling || r != wantResolved {
 			t.Errorf("%s: dangling lines = %d, resolved lines = %d; want %d and %d", label, d, r, wantDangling, wantResolved)
 		}
@@ -291,7 +318,7 @@ func TestDanglingRoleRef947_UnrelatedChangesAddNoLines(t *testing.T) {
 	sh := shapes947()[0]
 	rw, sink := setup947(t, sh)
 	RebuildRBACSnapshotForTest(rw)
-	if got := sink.count(msgDangling947, sh.bindingName); got != 1 {
+	if got := sink.count(msgDangling947, sh.label()); got != 1 {
 		t.Fatalf("dangling lines = %d; want exactly 1", got)
 	}
 
@@ -319,32 +346,14 @@ func TestDanglingRoleRef947_UnrelatedChangesAddNoLines(t *testing.T) {
 		RebuildRBACSnapshotForTest(rw)
 	}
 
-	if got := sink.count(msgDangling947, sh.bindingName); got != 1 {
+	if got := sink.count(msgDangling947, sh.label()); got != 1 {
 		t.Errorf("dangling lines after 22 publishes of unrelated changes = %d; want still exactly 1", got)
 	}
-	if got := sink.count(msgResolved947, sh.bindingName); got != 0 {
+	if got := sink.count(msgResolved947, sh.label()); got != 0 {
 		t.Errorf("resolved lines = %d; want 0 (the binding never stopped dangling)", got)
 	}
 	if cr, r := gauge947(t); cr != 1 || r != 0 {
 		t.Errorf("gauge = {ClusterRole:%d Role:%d}; want {ClusterRole:1 Role:0}", cr, r)
-	}
-}
-
-// assertNoSubject947 fails if any captured dangling/resolved line carries the
-// binding's subject anywhere in its attributes.
-func assertNoSubject947(t *testing.T, sink *logSink947) {
-	t.Helper()
-	sink.mu.Lock()
-	defer sink.mu.Unlock()
-	for _, r := range sink.recs {
-		if r.msg != msgDangling947 && r.msg != msgResolved947 {
-			continue
-		}
-		for k, v := range r.attrs {
-			if v == subject947 {
-				t.Errorf("%s carries the binding's subject in %q", r.msg, k)
-			}
-		}
 	}
 }
 
@@ -369,81 +378,315 @@ func TestDanglingRoleRef947_GaugeExpvar(t *testing.T) {
 	}
 }
 
-// TestDanglingRoleRef947_UnsyncedSnapshotNotTracked: a snapshot built while an
-// RBAC informer has not finished its initial LIST is not Synced, and a role
-// it is missing is not reported as dangling (it may exist and not be listed
-// yet). Once the LIST completes, only the genuinely absent role is reported.
-//
-// The ClusterRole LIST fails until the test releases it, as when the
-// apiserver is not yet answering for that resource at boot.
-func TestDanglingRoleRef947_UnsyncedSnapshotNotTracked(t *testing.T) {
+// assertNoClear947 fails if any captured record, of any message, carries one
+// of tokens in its message or in any attribute value.
+func assertNoClear947(t *testing.T, sink *logSink947, tokens ...string) {
+	t.Helper()
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	for _, r := range sink.recs {
+		for _, tok := range tokens {
+			if strings.Contains(r.msg, tok) {
+				t.Errorf("record %q carries %q in its message", r.msg, tok)
+			}
+			for k, v := range r.attrs {
+				if strings.Contains(v, tok) {
+					t.Errorf("record %q carries %q in attribute %q", r.msg, tok, k)
+				}
+			}
+		}
+	}
+}
+
+// assertNoSubject947 fails if any captured record carries the binding's
+// subject.
+func assertNoSubject947(t *testing.T, sink *logSink947) {
+	t.Helper()
+	assertNoClear947(t, sink, subject947)
+}
+
+// countMsg returns how many captured records have message msg.
+func (s *logSink947) countMsg(msg string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, r := range s.recs {
+		if r.msg == msg {
+			n++
+		}
+	}
+	return n
+}
+
+// TestDanglingRoleRef947_NoNameInClear: binding, role and namespace names
+// often embed a tenant username. With every name (and the subject) planted
+// with a username-shaped token, the full dangling -> resolved cycle of all
+// three shapes logs the expected lines, and NO captured record of any message
+// carries the token. The lines carry labels instead, and the dangling and
+// resolved line of one binding carry the same ones.
+func TestDanglingRoleRef947_NoNameInClear(t *testing.T) {
+	const tok = "u947alice"
 	ResetDanglingRoleRefsForTest()
 	t.Cleanup(ResetDanglingRoleRefsForTest)
 	sink := captureLogs947(t)
-	t.Setenv("CACHE_ENABLED", "true")
 
-	present := mkCRB("present-947", userSub(subject947)) // its role exists, but is not listed yet
-	absent := mkCRB("absent-947", userSub(subject947))   // its role does not exist
+	crb := mkCRB(tok+"-crb", userSub(tok)) // -> ClusterRole tok-crb-role
+	rbR := mkRB(tok+"-ns", tok+"-rb", userSub(tok))
+	rbCR := mkRB(tok+"-ns", tok+"-rbcr", userSub(tok))
+	rbCR.RoleRef.Kind = "ClusterRole"
+	rw := newSnapshotTestWatcher(t, crb, rbR, rbCR)
+	if err := rw.WaitRBACQuiescentForTest(time.Minute); err != nil {
+		t.Fatalf("quiesce: %v", err)
+	}
+	RebuildRBACSnapshotForTest(rw)
+	if got := sink.countMsg(msgDangling947); got != 3 {
+		t.Fatalf("dangling lines = %d; want 3", got)
+	}
+
+	if err := indexerOf947(t, rw, "cr").Add(mkCR(tok + "-crb-role")); err != nil {
+		t.Fatalf("add role: %v", err)
+	}
+	if err := indexerOf947(t, rw, "r").Add(mkR(tok+"-ns", tok+"-rb-role")); err != nil {
+		t.Fatalf("add role: %v", err)
+	}
+	if err := indexerOf947(t, rw, "rb").Delete(rbCR); err != nil {
+		t.Fatalf("delete binding: %v", err)
+	}
+	RebuildRBACSnapshotForTest(rw)
+	if got := sink.countMsg(msgResolved947); got != 3 {
+		t.Fatalf("resolved lines = %d; want 3", got)
+	}
+
+	for _, b := range []struct{ kind, ns, name, roleKind, roleNS, role string }{
+		{"ClusterRoleBinding", "", tok + "-crb", "ClusterRole", "", tok + "-crb-role"},
+		{"RoleBinding", tok + "-ns", tok + "-rb", "Role", tok + "-ns", tok + "-rb-role"},
+		{"RoleBinding", tok + "-ns", tok + "-rbcr", "ClusterRole", "", tok + "-rbcr-role"},
+	} {
+		bl, rl := RBACBindingLabel(b.kind, b.ns, b.name), RBACRoleLabel(b.roleKind, b.roleNS, b.role)
+		if d, r := sink.countRole(msgDangling947, bl, rl), sink.countRole(msgResolved947, bl, rl); d != 1 || r != 1 {
+			t.Errorf("%s %s: dangling/resolved lines carrying its labels = %d/%d; want 1/1", b.kind, bl, d, r)
+		}
+		for _, rec := range sink.find(msgDangling947, bl) {
+			if rec.attrs["binding_namespace"] != RBACNamespaceLabel(b.ns) {
+				t.Errorf("%s: binding_namespace = %q; want the namespace label", bl, rec.attrs["binding_namespace"])
+			}
+		}
+	}
+	assertNoClear947(t, sink, tok)
+}
+
+// TestDanglingRoleRef947_MovedBindingIsTwoTransitions: a binding that now
+// names a different absent role (deleted and recreated under the same name,
+// since roleRef is immutable) leaves the old dangling reference and enters a
+// new one: one resolved line for role A, one dangling line for role B, and the
+// gauge stays 1.
+func TestDanglingRoleRef947_MovedBindingIsTwoTransitions(t *testing.T) {
+	ResetDanglingRoleRefsForTest()
+	t.Cleanup(ResetDanglingRoleRefsForTest)
+	sink := captureLogs947(t)
+	toA := mkCRB("move-947", userSub(subject947))
+	toA.RoleRef.Name = "role-a-947"
+	rw := newSnapshotTestWatcher(t, toA)
+	if err := rw.WaitRBACQuiescentForTest(time.Minute); err != nil {
+		t.Fatalf("quiesce: %v", err)
+	}
+	RebuildRBACSnapshotForTest(rw)
+
+	toB := mkCRB("move-947", userSub(subject947))
+	toB.RoleRef.Name = "role-b-947"
+	if err := indexerOf947(t, rw, "crb").Update(toB); err != nil {
+		t.Fatalf("update binding: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		RebuildRBACSnapshotForTest(rw)
+	}
+
+	b := crbLabel947("move-947")
+	a, bRole := RBACRoleLabel("ClusterRole", "", "role-a-947"), RBACRoleLabel("ClusterRole", "", "role-b-947")
+	if got := sink.countRole(msgDangling947, b, a); got != 1 {
+		t.Errorf("dangling lines for role A = %d; want 1", got)
+	}
+	if got := sink.countRole(msgResolved947, b, a); got != 1 {
+		t.Errorf("resolved lines for role A after the binding moved = %d; want 1", got)
+	}
+	if got := sink.countRole(msgDangling947, b, bRole); got != 1 {
+		t.Errorf("dangling lines for role B after the binding moved = %d; want 1", got)
+	}
+	if got := sink.countRole(msgResolved947, b, bRole); got != 0 {
+		t.Errorf("resolved lines for role B = %d; want 0", got)
+	}
+	for _, rec := range sink.find(msgResolved947, b) {
+		if rec.attrs["reason"] != "binding_changed_or_deleted" {
+			t.Errorf("resolved reason = %q; want binding_changed_or_deleted", rec.attrs["reason"])
+		}
+	}
+	if cr, r := gauge947(t); cr != 1 || r != 0 {
+		t.Errorf("gauge = {ClusterRole:%d Role:%d}; want {ClusterRole:1 Role:0}", cr, r)
+	}
+}
+
+// heldListWatcher947 builds a watcher over a fake whose LIST of resource held
+// fails until the returned release is called, as when the apiserver does not
+// yet answer for that resource at boot. It returns once every OTHER RBAC
+// informer has synced and the held LIST has failed at least once.
+//
+// Seed: two bindings whose roles exist (a ClusterRoleBinding and a
+// RoleBinding to a Role) and one ClusterRoleBinding to an absent ClusterRole.
+func heldListWatcher947(t *testing.T, held string) (*ResourceWatcher, func()) {
+	t.Helper()
+	t.Setenv("CACHE_ENABLED", "true")
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(rbacScheme(t), rbacListKinds(),
-		present, absent, mkCR("present-947-role"))
+		mkCRB("crb-present-947", userSub(subject947)), mkCR("crb-present-947-role"),
+		mkRB("ns-947", "rb-present-947", userSub(subject947)), mkR("ns-947", "rb-present-947-role"),
+		mkCRB("absent-947", userSub(subject947)),
+	)
 	var released atomic.Bool
 	var failedLists atomic.Int64
-	dyn.PrependReactor("list", "clusterroles", func(k8stesting.Action) (bool, runtime.Object, error) {
+	dyn.PrependReactor("list", held, func(k8stesting.Action) (bool, runtime.Object, error) {
 		if released.Load() {
 			return false, nil, nil
 		}
 		failedLists.Add(1)
-		return true, nil, errors.New("clusterroles LIST held by the test (#947)")
+		return true, nil, errors.New(held + " LIST held by the test (#947)")
 	})
 	rw, err := NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
 		t.Fatalf("NewResourceWatcher: %v", err)
 	}
 	t.Cleanup(rw.Stop)
-	t.Cleanup(func() { released.Store(true) })
-
-	// Wait for the ClusterRoleBinding informer to list both bindings and for
-	// the ClusterRole LIST to have failed at least once.
-	waitFor947(t, "CRB informer synced and CR LIST failed", func() bool {
+	release := func() { released.Store(true) }
+	t.Cleanup(release)
+	waitFor947(t, "every other RBAC informer synced and the "+held+" LIST failed", func() bool {
+		if failedLists.Load() == 0 {
+			return false
+		}
 		rw.mu.RLock()
-		gi := rw.informers[clusterRoleBindingsTypedGVR]
-		rw.mu.RUnlock()
-		return gi.Informer().HasSynced() && failedLists.Load() > 0
+		defer rw.mu.RUnlock()
+		for gvr, gi := range rw.informers {
+			if isTypedRBACGVR(gvr) && gvr.Resource != held && !gi.Informer().HasSynced() {
+				return false
+			}
+		}
+		return true
 	})
+	return rw, release
+}
+
+// TestDanglingRoleRef947_UnsyncedSnapshotNotTracked, for each of the four RBAC
+// informers in turn: while that one informer's LIST has not completed, the
+// snapshot is not Synced and reports nothing as dangling (a role may exist and
+// not be listed yet). Once the LIST completes, only the genuinely absent role
+// is reported, once. A synced check that skipped any one informer fails its
+// subtest.
+func TestDanglingRoleRef947_UnsyncedSnapshotNotTracked(t *testing.T) {
+	for _, held := range []string{"clusterrolebindings", "rolebindings", "clusterroles", "roles"} {
+		t.Run(held, func(t *testing.T) {
+			ResetDanglingRoleRefsForTest()
+			t.Cleanup(ResetDanglingRoleRefsForTest)
+			sink := captureLogs947(t)
+			rw, release := heldListWatcher947(t, held)
+
+			RebuildRBACSnapshotForTest(rw)
+			s := RBACSnapshotForTest()
+			if s == nil {
+				t.Fatalf("no snapshot published")
+			}
+			if s.Synced {
+				t.Errorf("snapshot built while the %s LIST had not completed claims Synced", held)
+			}
+			if got := sink.countMsg(msgDangling947); got != 0 {
+				t.Errorf("dangling lines from an unsynced snapshot = %d; want 0", got)
+			}
+			if cr, r := gauge947(t); cr != 0 || r != 0 {
+				t.Errorf("gauge after an unsynced snapshot = {ClusterRole:%d Role:%d}; want 0/0", cr, r)
+			}
+
+			release()
+			if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
+				t.Fatalf("initial publish: %v", err)
+			}
+			if err := rw.WaitRBACQuiescentForTest(time.Minute); err != nil {
+				t.Fatalf("quiesce: %v", err)
+			}
+			RebuildRBACSnapshotForTest(rw)
+			if s := RBACSnapshotForTest(); s == nil || !s.Synced {
+				t.Fatalf("snapshot after every LIST completed is not Synced: %+v", s)
+			}
+			if got := sink.countMsg(msgDangling947); got != 1 {
+				t.Errorf("dangling lines once every LIST completed = %d; want exactly 1", got)
+			}
+			if got := sink.count(msgDangling947, crbLabel947("absent-947")); got != 1 {
+				t.Errorf("dangling lines for the binding whose role is absent = %d; want exactly 1", got)
+			}
+			if cr, r := gauge947(t); cr != 1 || r != 0 {
+				t.Errorf("gauge = {ClusterRole:%d Role:%d}; want {ClusterRole:1 Role:0}", cr, r)
+			}
+		})
+	}
+}
+
+// flipInformer947 wraps the ClusterRole informer so that its indexer's List()
+// flips HasSynced to true as it returns: the initial LIST lands right after the
+// snapshot has read the (still empty) indexer. The synced state must be read
+// BEFORE the indexers; read after them, it would claim a complete snapshot
+// over an incomplete read.
+type flipInformer947 struct {
+	informers.GenericInformer
+	sii *flipSII947
+}
+
+func (f flipInformer947) Informer() clientcache.SharedIndexInformer { return f.sii }
+
+type flipSII947 struct {
+	clientcache.SharedIndexInformer
+	synced atomic.Bool
+}
+
+func (s *flipSII947) HasSynced() bool { return s.synced.Load() }
+func (s *flipSII947) GetIndexer() clientcache.Indexer {
+	return flipIndexer947{Indexer: s.SharedIndexInformer.GetIndexer(), s: s}
+}
+
+type flipIndexer947 struct {
+	clientcache.Indexer
+	s *flipSII947
+}
+
+func (i flipIndexer947) List() []interface{} {
+	out := i.Indexer.List()
+	i.s.synced.Store(true)
+	return out
+}
+
+// TestDanglingRoleRef947_SyncedReadBeforeIndexers: the ClusterRole informer
+// becomes synced while the snapshot is reading the indexers. The snapshot
+// read an empty ClusterRole set, so it must not claim Synced, and the binding
+// whose role exists must not be reported as dangling.
+func TestDanglingRoleRef947_SyncedReadBeforeIndexers(t *testing.T) {
+	ResetDanglingRoleRefsForTest()
+	t.Cleanup(ResetDanglingRoleRefsForTest)
+	sink := captureLogs947(t)
+	rw, _ := heldListWatcher947(t, "clusterroles")
+
+	rw.mu.Lock()
+	real := rw.informers[clusterRolesTypedGVR]
+	rw.informers[clusterRolesTypedGVR] = flipInformer947{GenericInformer: real, sii: &flipSII947{SharedIndexInformer: real.Informer()}}
+	rw.mu.Unlock()
+	t.Cleanup(func() {
+		rw.mu.Lock()
+		rw.informers[clusterRolesTypedGVR] = real
+		rw.mu.Unlock()
+	})
+
 	RebuildRBACSnapshotForTest(rw)
-	s := RBACSnapshotForTest()
-	if s == nil || len(s.ClusterRoleBindings) != 2 {
-		t.Fatalf("unsynced snapshot does not hold both bindings: %+v", s)
+	if s := RBACSnapshotForTest(); s == nil || s.Synced {
+		t.Errorf("snapshot whose ClusterRole read preceded the sync claims Synced: %+v", s)
 	}
-	if s.Synced {
-		t.Fatalf("snapshot built while the ClusterRole LIST had not completed claims Synced")
-	}
-	if got := sink.count(msgDangling947, "present-947") + sink.count(msgDangling947, "absent-947"); got != 0 {
-		t.Errorf("dangling lines from an unsynced snapshot = %d; want 0", got)
+	if got := sink.count(msgDangling947, crbLabel947("crb-present-947")); got != 0 {
+		t.Errorf("the binding whose role exists was reported dangling %d times; want 0", got)
 	}
 	if cr, r := gauge947(t); cr != 0 || r != 0 {
-		t.Errorf("gauge after an unsynced snapshot = {ClusterRole:%d Role:%d}; want 0/0", cr, r)
-	}
-
-	released.Store(true)
-	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
-		t.Fatalf("initial publish: %v", err)
-	}
-	if err := rw.WaitRBACQuiescentForTest(time.Minute); err != nil {
-		t.Fatalf("quiesce: %v", err)
-	}
-	RebuildRBACSnapshotForTest(rw)
-	if s := RBACSnapshotForTest(); s == nil || !s.Synced {
-		t.Fatalf("snapshot after every LIST completed is not Synced: %+v", s)
-	}
-	if got := sink.count(msgDangling947, "present-947"); got != 0 {
-		t.Errorf("dangling lines for the binding whose role exists = %d; want 0", got)
-	}
-	if got := sink.count(msgDangling947, "absent-947"); got != 1 {
-		t.Errorf("dangling lines for the binding whose role is absent = %d; want exactly 1", got)
-	}
-	if cr, r := gauge947(t); cr != 1 || r != 0 {
-		t.Errorf("gauge = {ClusterRole:%d Role:%d}; want {ClusterRole:1 Role:0}", cr, r)
+		t.Errorf("gauge = {ClusterRole:%d Role:%d}; want 0/0", cr, r)
 	}
 }
 

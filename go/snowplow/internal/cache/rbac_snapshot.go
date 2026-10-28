@@ -276,12 +276,15 @@ func RecordRBACSnapshotMiss(kind, namespace, name string) {
 	// lets ops correlate a miss-burst with a specific snapshot version
 	// in the logs. Cheaper than a pointer-identity hash.
 	snapSeq := rbacSnapshotPublishSeq.Load()
+	// #947 — the role and namespace are redact labels, never names in clear
+	// (role names embed tenant usernames); the label matches the role label of
+	// the dangling-roleRef lines.
 	slog.Warn("rbac.evaluate.snapshot.miss",
 		slog.String("subsystem", "rbac"),
 		slog.String("event", "snapshot.miss"),
 		slog.String("kind", kind),
-		slog.String("namespace", namespace),
-		slog.String("name", name),
+		slog.String("namespace", RBACNamespaceLabel(namespace)),
+		slog.String("role", RBACRoleLabel(kind, namespace, name)),
 		slog.Uint64("snap_seq", snapSeq),
 		slog.String("hint", "roleRef references a target absent from a snapshot built before every RBAC informer "+
 			"finished its initial LIST — a snapshot consistency fault; the next synced snapshot resolves it"),
@@ -899,6 +902,29 @@ func indexerList(rw *ResourceWatcher, gvr schema.GroupVersionResource) []interfa
 // indexers, on the rebuild goroutine. It must never be called from an
 // informer transform: the transform runs under the FIFO lock, and no informer
 // accessor may be called from it (#875).
+//
+// WHY HasSynced() == true MEANS THE INITIAL LIST IS IN THE INDEXER READ NEXT
+// (client-go v0.36.5, tools/cache; InOrderInformers is GA and locked on, and
+// AtomicFIFO and UnlockWhileProcessingFIFO default on, features/
+// known_features.go:112-113,127-129,138-139, so the queue is a RealFIFO with
+// atomic events, controller.go:848-866):
+//   - HasSynced reads s.synced (shared_informer.go:791-797), closed only when
+//     the controller's HasSyncedChecker is done (:771-773), never on stop
+//     (:769-770). That checker is the queue's (controller.go:219-220).
+//   - The initial Replace enqueues ONE ReplacedAll delta holding the whole
+//     LIST (the_real_fifo.go:295-317) and sets initialPopulationCount
+//     (:624-627).
+//   - Pop/PopBatch decrement that count and close synced in a defer that
+//     runs only AFTER process returns (:410-418, :541-549; checkSynced_locked
+//     :246-250). UnlockWhileProcessing releases the FIFO lock during process
+//     (:458-461) but not that ordering.
+//   - process is handleDeltas -> processDeltas(s.indexer) (shared_informer.go
+//     :944-950), and for ReplacedAll it Replaces the indexer before any
+//     handler runs (controller.go:784). GetIndexer returns that same s.indexer
+//     (shared_informer.go:833-835).
+//
+// So once HasSynced is true, the indexer the snapshot then reads holds at
+// least the complete initial LIST.
 func rbacInformersSynced(rw *ResourceWatcher) bool {
 	rw.mu.RLock()
 	hasSynced := make([]func() bool, 0, len(rbacTypedGVRs))
