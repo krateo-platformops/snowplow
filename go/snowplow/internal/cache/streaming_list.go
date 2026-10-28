@@ -236,7 +236,7 @@ func newStreamingDynamicInformer(
 	// #237 deliverable B — the verifying decorator. THIS is the hook point,
 	// and it is the ListerWatcher rather than the ListFunc above for one
 	// reason: production takes the WATCH-LIST path, not the LIST path
-	// (WatchListClient defaults true at client-go v0.35.3 and nothing here
+	// (WatchListClient defaults true at client-go v0.36.5 and nothing here
 	// opts out), so a hook on ListFunc would only ever cover the fallback.
 	// The decorator sees both — see store_verify.go.
 	//

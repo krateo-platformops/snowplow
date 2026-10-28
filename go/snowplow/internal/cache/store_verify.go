@@ -33,7 +33,7 @@
 //
 // # WHY THE DECORATOR HOOKS THE ListerWatcher AND NOT THE ListFunc
 //
-// Production does not take the LIST path. client-go is v0.35.3, where the
+// Production does not take the LIST path. client-go is v0.36.5, where the
 // WatchListClient feature gate defaults to TRUE, nothing in this repo, the
 // image, the chart's env or the externally-managed override ConfigMap sets
 // KUBE_FEATURE_WatchListClient, and no ListerWatcher in the process implements
@@ -61,13 +61,15 @@
 // An earlier draft had it call submitDepEvent per divergent coordinate. That
 // was wrong twice:
 //
-//  1. REDUNDANT. processDeltas (controller.go) does clientState.Update(obj)
-//     and THEN handler.OnUpdate(old, obj) for a Replaced delta, and
-//     sharedIndexInformer.OnUpdate computes isSync = (newRV == oldRV), which is
-//     FALSE for a lost UPDATE — so it is distributed to snowplow's own
-//     UpdateFunc as an ordinary update, on an ALREADY-REPAIRED store. Lost
-//     DELETEs arrive the same way through the synthesised Deleted /
-//     DeletedFinalStateUnknown, lost ADDs through OnAdd.
+//  1. REDUNDANT. Under client-go v0.36.5's AtomicFIFO a snapshot is one
+//     ReplacedAll delta: processReplacedAllInfo (controller.go:756) does
+//     clientState.Replace with the whole snapshot and THEN calls
+//     handler.OnDelete for every key it lacks and OnUpdate(old, obj) /
+//     OnAdd for every key it holds, and sharedIndexInformer.OnUpdate computes
+//     isSync = (newRV == oldRV), which is FALSE for a lost UPDATE — so it is
+//     distributed to snowplow's own UpdateFunc as an ordinary update, on an
+//     ALREADY-REPAIRED store. Lost DELETEs arrive the same way as
+//     DeletedFinalStateUnknown tombstones, lost ADDs through OnAdd.
 //
 //  2. ACTIVELY HARMFUL. The decorator runs BEFORE Replace. A dep event
 //     submitted here races the worker onto probeObjectState -> GetByKey on the

@@ -32,31 +32,30 @@
 // CONSTRAINTS (all three from #510, all honoured here):
 //
 //   - INSTALLED BEFORE START. client-go refuses a transform on a started
-//     informer (sharedIndexInformer.SetTransform, client-go@v0.35.3
-//     tools/cache/shared_informer.go:513-523). informers.WithTransform stores
-//     it on the factory (informers/factory.go:103-109) and the factory applies
-//     it in InformerFor (informers/factory.go:216) — i.e. at the
-//     `factory.Core().V1().Secrets().Informer()` call, secrets_informer.go:225-226,
-//     which is strictly before `factory.Start(...)` at secrets_informer.go:270.
+//     informer (sharedIndexInformer.SetTransform, client-go@v0.36.5
+//     tools/cache/shared_informer.go:703-713). informers.WithTransform stores
+//     it on the factory and the factory applies it in InformerFor — i.e. at
+//     the `factory.Core().V1().Secrets().Informer()` call in
+//     secrets_informer.go, which is strictly before `factory.Start(...)`.
 //   - TOTAL AND CHEAP. It runs on every object that enters the store from the
 //     wire: ADD, UPDATE, DELETE and Replace (the initial LIST and every
-//     relist). Only a Resync of an object ALREADY in the store skips it, and
-//     that object was transformed on its way in — RealFIFO.addToItems_locked
-//     (the_real_fifo.go:138-174) is called with skipTransform=false at :183,
-//     :194, :207 and :428 and with true only at :481 (Resync) and :390 (a
-//     tombstone built from the known store); DeltaFIFO is the same shape
-//     (delta_fifo.go:428-478, Replace at :573 passes Replaced, Resync at :678
-//     passes Sync). InOrderInformers defaults ON at 1.33, so RealFIFO is the
-//     live path. The function never errors — a non-nil error there makes the
-//     FIFO DROP the object — and in the common case (a clientconfig Secret
-//     whose keys are all retained) it allocates one struct copy and keeps the
-//     decoded map as-is.
+//     relist). At client-go v0.36.5 with its default gates (InOrderInformers
+//     GA, AtomicFIFO on) the queue is an atomic RealFIFO: watch events go
+//     through addToItems_locked (the_real_fifo.go:255) with skipTransform
+//     false, a Replace transforms every listed item in
+//     addReplaceToItemsLocked (:295), and a Resync is one SyncAll delta that
+//     re-delivers objects ALREADY in the store, untransformed — they were
+//     transformed on their way in. The function never errors — a non-nil
+//     error there makes the FIFO DROP the object — and in the common case (a
+//     clientconfig Secret whose keys are all retained) it allocates one
+//     struct copy and keeps the decoded map as-is.
 //   - DEFENSIVE. A non-Secret object and a DeletedFinalStateUnknown tombstone
-//     are both handled. client-go v0.35.3 does not currently hand a tombstone
-//     to the transformer (the_real_fifo.go:157-158, delta_fifo.go:445-446),
-//     but that is not our contract to lean on, and WithTransform is
-//     factory-wide: any other informer ever built from this factory would route
-//     through here too.
+//     are both handled. client-go v0.36.5 does not hand a tombstone to the
+//     transformer (the_real_fifo.go:274-275; an atomic relist builds its
+//     tombstones from the already-transformed store at processing time,
+//     controller.go:756), but that is not our contract to lean on, and
+//     WithTransform is factory-wide: any other informer ever built from this
+//     factory would route through here too.
 package cache
 
 import (

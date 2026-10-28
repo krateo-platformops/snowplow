@@ -25,26 +25,39 @@
 // object is queued for the store and BEFORE the reflector publishes the
 // delivery's position (LastSyncResourceVersion): watch ADD, UPDATE and DELETE
 // (the deleted object itself is transformed), and every item of a relist,
-// classic or streamed (client-go@v0.35.3 reflector.go handleAnyWatch, list,
-// watchList; the_real_fifo.go addToItems_locked). An event handler would be
-// the wrong place: handlers run on the processor's listener goroutines, after
-// the store write, so a delivery could already show in the store and not yet
-// in the record — the race this file exists to close.
+// classic or streamed (client-go@v0.36.5 reflector.go handleAnyWatch, list,
+// watchList; the_real_fifo.go:255 addToItems_locked for watch events and
+// :295 addReplaceToItemsLocked, which transforms a whole relist at once under
+// AtomicFIFO). A watch-list relist is transformed twice: once into the
+// reflector's temporary store and again by the Replace (reflector.go:833-835,
+// :901); recording a key twice is idempotent. An event handler would be the
+// wrong place: handlers run on the processor's listener goroutines, after the
+// store write, so a delivery could already show in the store and not yet in
+// the record — the race this file exists to close.
 //
 // While a pass is open the transform records the delivered key; always, it
 // keeps the latest object it saw.
 //
 // # THE TRANSFORM TAKES NO LOCK BUT ITS OWN
 //
-// It runs under the FIFO's lock, and the informer's own accessors take
-// startedLock, which HasSynced holds while it takes the FIFO's lock
-// (shared_informer.go HasSynced -> controller.HasSynced -> RealFIFO.HasSynced).
-// Reading the informer's position from inside the transform is therefore an
-// AB/BA deadlock with any concurrent HasSynced — one this file's first draft
-// had, and the kind churn falsifier hung on. So the transform touches only
-// deliveryLog.mu, under which nothing but map writes happen, and nothing ever
-// waits for another lock while holding deliveryLog.mu except the indexer's
-// read lock, whose holders never wait for this one.
+// It runs under the FIFO's lock: AtomicFIFO's UnlockWhileProcessingFIFO
+// releases that lock only around PROCESSING a popped delta
+// (the_real_fifo.go:454 whileProcessing_locked), never around the enqueue the
+// transform belongs to. At client-go v0.35.3 the informer's accessors took
+// startedLock and HasSynced then took the FIFO's lock (HasSynced ->
+// controller.HasSynced -> RealFIFO.HasSynced), so reading the informer's
+// position from inside the transform was an AB/BA deadlock with any
+// concurrent HasSynced — one this file's first draft had, and the kind churn
+// falsifier hung on. v0.36.5 made HasSynced a channel read
+// (shared_informer.go:791), which removes that particular cycle, but
+// LastSyncResourceVersion still takes startedLock and the reflector's mutex
+// (shared_informer.go:819, controller.go:223) and LastStoreSyncResourceVersion
+// takes the store's lock (thread_safe_store.go:436), and a transform-time read
+// of either is not the position of the delivery being transformed anyway. So
+// the rule stands: the transform touches only deliveryLog.mu, under which
+// nothing but map writes happen, and nothing ever waits for another lock while
+// holding deliveryLog.mu except the indexer's read lock, whose holders never
+// wait for this one.
 //
 // # OPENING A PASS
 //
@@ -80,19 +93,24 @@
 // # RELISTS
 //
 // A relist delivers many objects and publishes one position, after all of
-// them, and it deletes the keys its new list lacks with synthesized tombstones
-// that skip the transform (the_real_fifo.go: a DeletedFinalStateUnknown is
-// not transformed). A tombstone can only produce a lost ADD (the store lacks a
-// key the LIST has), so a lost-ADD candidate that WAS in the store at step 1
-// and is gone now counts as delivered: something removed it during the pass.
-// A relist that starts after step 1 transforms its items first and its
+// them, and it deletes the keys its new list lacks with synthesized
+// DeletedFinalStateUnknown tombstones that skip the transform. Under
+// AtomicFIFO the relist is ONE queued ReplacedAll delta: its items are
+// transformed when it is queued, and its tombstones are computed from the
+// store only when it is processed, which replaces the store and then hands
+// the tombstones to the handlers (controller.go:756 processReplacedAllInfo,
+// the Replace at :784). A tombstone can only produce a lost ADD (the store
+// lacks a key the LIST has), so a lost-ADD candidate that WAS in the store at
+// step 1 and is gone now counts as delivered: something removed it during the
+// pass. A relist that starts after step 1 transforms its items first and its
 // tombstones apply only after its items are queued, so they apply after the
 // key set was taken and the presence check sees them.
 //
 // Not covered, stated rather than assumed away: a relist already IN PROGRESS
 // at step 1 (its earlier items and any tombstones it has applied are not in
-// the record), and a relist that deletes a key whose ADD was still queued at
-// step 1. Either needs, in addition, a LIST served by an apiserver whose cache
+// the record; under AtomicFIFO the store applies a relist all at once, so
+// "in progress" narrows to "queued or being transformed"), and a relist that
+// deletes a key whose ADD was still queued at step 1. Either needs, in addition, a LIST served by an apiserver whose cache
 // is older than that relist; on a single apiserver the LIST is no older than
 // anything the watch had already delivered. The result is one unnecessary
 // repair, never a hidden loss: an uncovered key is counted as a divergence,
