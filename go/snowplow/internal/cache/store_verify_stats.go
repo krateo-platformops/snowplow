@@ -95,6 +95,10 @@ const (
 	// pass cannot issue a LIST whose result is provably at least as fresh as
 	// our store. Skipped rather than downgraded — see forcedVerify.
 	verifySkipNoSyncPosition = "no_sync_position"
+	// #918 — client-go's AtomicFIFO is off, so the store reports no applied
+	// position and no forced-pass candidate behind its read can be decided:
+	// the forced pass does not run (and does not mark the GVR verified).
+	verifySkipPositionUnavailable = "position_unavailable"
 )
 
 // Unverifiable reasons — a registered GVR that no verification mechanism
@@ -105,6 +109,9 @@ const (
 	// unreachable = the informer is undecorated AND there is no metadata
 	// client, so neither the snapshot path nor the forced pass can reach it.
 	unverifiableUnreachable = "unreachable"
+	// position_unavailable = client-go's AtomicFIFO is off, so the forced
+	// pass cannot decide a loss and does not verify any GVR (#918).
+	unverifiablePositionUnavailable = "position_unavailable"
 )
 
 var (
@@ -195,9 +202,9 @@ type StoreVerificationStats struct {
 	// --- the detectors for a broken detector ---
 	PendingKeys               int64   `stat:"store_divergence_pending_keys" kind:"gauge" desc:"Forced-pass candidates held PENDING right now, across all GVRs (#918): the store is behind the read and its applied position has not reached it, it has received the read's state and not applied it, or a relist tombstone removed it during the pass. Each is re-judged on its GVR's next applied add, update or delete, and by its GVR's next forced pass, which judges it against its own read before that pass's LIST. A bookmark advances the position with no callback (client-go v0.36.5), so on a GVR that only receives bookmarks that pass decides it; GVRs holding pending keys and the most overdue GVRs take the walker's turns alternately. Per-GVR breakdown: snowplow_store_verification_pending_by_gvr (expvar) and snowplow_store_divergence_pending_keys_by_gvr (OTLP). Healthy: 0 or briefly non-zero under churn; steadily non-zero means a watch is not catching up."`
 	PendingOldestAgeSeconds   float64 `stat:"store_divergence_pending_oldest_age_seconds" kind:"gauge" desc:"How long the oldest pending key, on any GVR, has been pending — across the passes that re-read it, so a key that stays pending pass after pass ages instead of resetting (#918). 0 when nothing is pending. Healthy: below one walker turn plus the watch's lag; growing without bound means a key no event or pass is deciding."`
-	PositionUnavailable       int64   `stat:"store_position_unavailable" kind:"gauge" desc:"1 when client-go's AtomicFIFO feature is OFF in this process: the store's applied position (Store.LastStoreSyncResourceVersion) is then always empty, every forced-pass candidate behind its read stays PENDING, and the forced pass can NEVER publish a lost update — detection by the forced pass is disabled. Logged once at startup as cache.store_verification.position_unavailable. Healthy: 0 (AtomicFIFO is on by default from client-go v0.36)."`
+	PositionUnavailable       int64   `stat:"store_position_unavailable" kind:"gauge" desc:"1 when client-go's AtomicFIFO feature is OFF in this process: the store's applied position (Store.LastStoreSyncResourceVersion) is then always empty, the forced pass cannot decide a lost update, so it does not run (store_verification_skipped{position_unavailable}) and every GVR reads as UNVERIFIABLE with reason position_unavailable — never as verified. Logged once at startup, at ERROR, as cache.store_verification.position_unavailable. Healthy: 0 (AtomicFIFO is on by default from client-go v0.36)."`
 	GVRsUnverified            int64   `stat:"store_gvrs_unverified" kind:"gauge" desc:"Servable, synced, reachable GVRs whose last verification is older than maxVerificationAge. DURING #237 with B working this reads 0 — the deadline reached the GVR and found the divergence. It is NOT the #237 detector; it is the DENOMINATOR that makes a zero divergence readable. (unverified 0, divergent 0) = I looked and found nothing. (unverified >0, divergent 0) = I DID NOT LOOK. That distinction is exactly what the 1.12.6 audit's divergent:0 could not express. Healthy: 0."`
-	GVRsUnverifiable          int64   `stat:"store_gvrs_unverifiable" kind:"gauge" desc:"Registered GVRs no verification mechanism reaches right now, broken down in snowplow_store_verification_unverifiable_by_reason (retracted / not_synced / unreachable). Split from store_gvrs_unverified so a retracted GVR cannot be dropped from that gauge's set and produce a zero that reads as health. DURING a retraction storm: >0 with reason=retracted. Healthy: 0."`
+	GVRsUnverifiable          int64   `stat:"store_gvrs_unverifiable" kind:"gauge" desc:"Registered GVRs no verification mechanism reaches right now, broken down in snowplow_store_verification_unverifiable_by_reason (retracted / not_synced / unreachable / position_unavailable: client-go AtomicFIFO off, so the forced pass cannot decide a loss, #918). Split from store_gvrs_unverified so a retracted GVR cannot be dropped from that gauge's set and produce a zero that reads as health. DURING a retraction storm: >0 with reason=retracted. Healthy: 0."`
 	GVRsUndecorated           int64   `stat:"store_gvrs_undecorated" kind:"gauge" desc:"Registered GVRs whose informer did not get the verifying ListerWatcher, so the snapshot path is blind to them and only the forced pass covers them. Healthy baseline is NOT 0: it is the size of the non-streaming class, whose membership follows from informer routing and must be read as a class rather than as today's list. DURING the coverage cliff (RESOLVER_COMPOSITION_STREAMING_LIST=false): jumps to nearly every GVR while every store_divergent_*_snapshot_total silently drops to 0 — which would otherwise read as health. A jump here is what names that."`
 	VerificationMaxAgeSeconds float64 `stat:"store_verification_max_age_seconds" kind:"gauge" desc:"Oldest age-since-last-verified across the same GVR set store_gvrs_unverified counts. At boot, before anything has been verified, this reads AGE SINCE REGISTRATION and never 0 — a never-verified GVR excluded from the max would make this read 0 while nothing had been verified at all. DURING suppressed or failing forced passes: rises past maxVerificationAge without bound. Healthy: at or below maxVerificationAge."`
 	SkippedTotal              uint64  `stat:"store_verification_skipped_total" desc:"Comparisons declined, broken down in snowplow_store_verification_skipped_by_reason. Gives 'no divergence found' its scope: without this, a pass that never ran and a pass that found nothing are the same zero. DURING: >0 naming which path could not run (torn_down / metaclient_nil / list_error). Healthy: only initial_sync (once per GVR per informer lifetime) and undecorated_informer (once per undecorated registration, whose healthy baseline is the size of the non-streaming class, not 0) tick. Read the BREAKDOWN, never this total: it deliberately spans expected and unexpected reasons, so the total alone is two regimes in one number."`
@@ -257,6 +264,7 @@ func storeVerificationGauges() (unverified, unverifiable, undecorated int64, max
 
 	deadline := maxVerificationAge()
 	now := time.Now()
+	noPosition := positionUnavailable() == 1
 	for gvr, row := range rows {
 		if !row.decorated {
 			undecorated++
@@ -281,6 +289,12 @@ func storeVerificationGauges() (unverified, unverifiable, undecorated int64, max
 		case !row.decorated && !haveMetaClient:
 			unverifiable++
 			byReason[unverifiableUnreachable]++
+			continue
+		case noPosition:
+			// The deadline's own mechanism cannot run: say "I did not
+			// look", never let the GVR read as verified (#923 review N1).
+			unverifiable++
+			byReason[unverifiablePositionUnavailable]++
 			continue
 		}
 		// Reachable and servable: it is in the set the deadline governs, so

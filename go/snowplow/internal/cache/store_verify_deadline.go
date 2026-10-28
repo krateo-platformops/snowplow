@@ -91,16 +91,20 @@ func StartStoreVerification(ctx context.Context) {
 			"within max_verification_age; snapshots do it for free, this walker is the backstop "+
 			"for GVRs whose watch only ever recycles"))
 	if positionUnavailable() == 1 {
-		// #923 review L2 — loud, once: with AtomicFIFO off the store's applied
-		// position is always empty, so no forced-pass candidate behind its read
-		// can ever be decided a loss. Nothing changes the gate here; the
-		// store_position_unavailable gauge says the same on every scrape.
-		slog.Warn("cache.store_verification.position_unavailable",
+		// #923 review L2 / N1 — loud, once: with AtomicFIFO off the store's
+		// applied position is always empty, so no forced-pass candidate
+		// behind its read can ever be decided a loss. The forced pass then
+		// does not run, every GVR reads as unverifiable with reason
+		// position_unavailable, and store_position_unavailable is 1. A
+		// disabled detector, so ERROR, as repair_ineffective is. Nothing
+		// changes the gate here.
+		slog.Error("cache.store_verification.position_unavailable",
 			slog.String("subsystem", "cache"),
 			slog.String("hint", "client-go's AtomicFIFO feature is off (KUBE_FEATURE_AtomicFIFO=false?), so "+
-				"Store.LastStoreSyncResourceVersion is always empty: the forced store verification holds every "+
-				"candidate behind its read as pending and never publishes a lost update. Snapshot detection "+
-				"is unaffected. Re-enable AtomicFIFO to restore forced-pass detection."))
+				"Store.LastStoreSyncResourceVersion is always empty and the forced store verification cannot "+
+				"decide a lost update: it does not run, and every GVR reads as unverifiable "+
+				"(store_gvrs_unverifiable, reason position_unavailable). Snapshot detection is unaffected. "+
+				"Re-enable AtomicFIFO to restore forced-pass detection."))
 	}
 	go runStoreVerificationWalker(ctx)
 	go runStoreRepairQueue(ctx)
@@ -296,6 +300,14 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	}
 	if idx == nil {
 		recordVerifySkipped(verifySkipTornDown)
+		return
+	}
+	if positionUnavailable() == 1 {
+		// #923 review N1 — no applied position, so nothing behind its read
+		// can be decided: a pass would hold keys pending forever and still
+		// mark the GVR verified, a zero that reads as health. It does not
+		// run; the GVR reads as unverifiable (storeVerificationGauges).
+		recordVerifySkipped(verifySkipPositionUnavailable)
 		return
 	}
 

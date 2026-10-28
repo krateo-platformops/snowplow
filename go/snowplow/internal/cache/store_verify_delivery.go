@@ -20,13 +20,15 @@
 //     the position has passed an entry, the entry has been applied — or
 //     dropped, in which case the store, not the record, is the truth
 //     (store_verify_judge.go). Our own handler removes an entry when it sees
-//     that very delivery applied.
-//   - APPLIED. The handler also keeps, per key, the {rv, uid} it last saw
-//     applied. A delivery identical to it is a relist re-delivering an object
-//     that did not change: the store already holds it, and a relist applies
-//     such an object without telling any handler (sharedIndexInformer.OnUpdate
-//     treats an unchanged resourceVersion as a sync), so the transform does not
-//     record it as received in the first place (#923 review L8).
+//     that very delivery applied. A relist re-delivering an object that did
+//     not change is applied without telling any handler
+//     (sharedIndexInformer.OnUpdate treats an unchanged resourceVersion as a
+//     sync), so its entry is released at the start of the next pass instead:
+//     every entry the store's position has passed, for a key the store holds,
+//     is dropped there (transient, and no per-key record of what was applied
+//     is kept for it). #870's per-informer `seen` record will hold the
+//     identity each delivery reached the store with; once it lands, the
+//     transform reads `seen` and records no unchanged re-delivery at all.
 //   - APPLIED DELETES. The handler is the first place the event TYPE is known:
 //     a TransformFunc receives the object only, and a watch DELETE's object is
 //     indistinguishable from an update by content. The handler (processDeltas
@@ -166,10 +168,9 @@ type deliveryLog struct {
 	mu sync.Mutex
 	// seq numbers the transform's deliveries.
 	seq uint64
-	// unapplied: key -> its latest delivery, until the handler sees it applied.
+	// unapplied: key -> its latest delivery, until the handler sees it applied
+	// or the next pass finds the store's position past it (beginPass).
 	unapplied map[string]received
-	// stored: key -> the {rv, uid} the handler last saw applied.
-	stored map[string]objIdentity
 	// deletes: key -> its latest applied delete, from this pass generation or
 	// the one before (beginPass prunes older ones: a LIST no older than the
 	// store then lacks the key).
@@ -195,7 +196,6 @@ func newDeliveryLog(gvr schema.GroupVersionResource) *deliveryLog {
 	return &deliveryLog{
 		gvr:       gvr,
 		unapplied: map[string]received{},
-		stored:    map[string]objIdentity{},
 		deletes:   map[string]appliedDelete{},
 		wake:      make(chan struct{}, 1),
 		stop:      make(chan struct{}),
@@ -246,9 +246,7 @@ func (l *deliveryLog) transform(next clientcache.TransformFunc) clientcache.Tran
 		if key, id, ok := identityOf(out); ok {
 			l.mu.Lock()
 			l.seq++
-			if l.stored[key] != id {
-				l.unapplied[key] = received{id: id, seq: l.seq}
-			}
+			l.unapplied[key] = received{id: id, seq: l.seq}
 			l.mu.Unlock()
 		}
 		return out, err
@@ -278,17 +276,13 @@ func (l *deliveryLog) handler() clientcache.ResourceEventHandler {
 func (l *deliveryLog) appliedEvent(obj any, deleted bool) {
 	l.mu.Lock()
 	if t, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
-		delete(l.stored, t.Key)
 		l.deletes[t.Key] = appliedDelete{tombstone: true, gen: l.gen}
 	} else if key, id, ok := identityOf(obj); ok {
 		if e, has := l.unapplied[key]; has && e.id == id {
 			delete(l.unapplied, key)
 		}
 		if deleted {
-			delete(l.stored, key)
 			l.deletes[key] = appliedDelete{rv: id.rv, gen: l.gen}
-		} else {
-			l.stored[key] = id
 		}
 	}
 	wake := len(l.pending) > 0
@@ -390,9 +384,18 @@ func (l *deliveryLog) judgePending() []divergenceCandidate {
 }
 
 // beginPass opens a forced pass: the pass generation advances, deletes older
-// than the previous pass are dropped, and the reflector's published position
-// is returned — the forced LIST is no older than it.
+// than the previous pass are dropped, received entries the store has already
+// applied are released, and the reflector's published position is returned —
+// the forced LIST is no older than it.
+//
+// An entry is released when the store's applied position has passed it AND
+// the store holds its key: the store then has that state or a newer one, which
+// is all the rule could learn from the entry. An entry for a key the store
+// lacks is kept until our handler sees it applied: it may be a DELETE the store
+// applied before the handler recorded it, which only the entry tells apart
+// from a lost add (store_verify_judge.go, #923 review H3).
 func (l *deliveryLog) beginPass() string {
+	pos := l.appliedPosition()
 	l.mu.Lock()
 	l.gen++
 	for key, d := range l.deletes {
@@ -400,7 +403,25 @@ func (l *deliveryLog) beginPass() string {
 			delete(l.deletes, key)
 		}
 	}
+	passed := map[string]objIdentity{}
+	if pos != "" {
+		for key, e := range l.unapplied {
+			if c, err := orderRV(e.id.rv, pos); err == nil && c <= 0 {
+				passed[key] = e.id
+			}
+		}
+	}
 	l.mu.Unlock()
+	for key, id := range passed {
+		if _, exists, err := l.indexer.GetByKey(key); err != nil || !exists {
+			continue
+		}
+		l.mu.Lock()
+		if e, ok := l.unapplied[key]; ok && e.id == id {
+			delete(l.unapplied, key)
+		}
+		l.mu.Unlock()
+	}
 	if l.published == nil {
 		return ""
 	}

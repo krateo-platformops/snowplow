@@ -741,6 +741,63 @@ func TestForcedPass918_PendingKeyAge_SurvivesTheSupersedingPass(t *testing.T) {
 	}
 }
 
+// TestForcedPass918_ReceivedPendingKey_KeptWhenTheNextPassCannotList — #923
+// review N3. A key is pending, its read's state is received and still queued
+// when the next pass begins, and that pass's LIST fails. judgePending must
+// keep it pending, for the resolver to settle when the apply lands: the pass
+// that would have superseded it never took its read.
+func TestForcedPass918_ReceivedPendingKey_KeptWhenTheNextPassCannotList(t *testing.T) {
+	rw, cli := j9Setup(t, repairGVR, true, ja1)
+	cli.answer("5002", ja2, jclock)
+	forcedVerify(context.Background(), repairGVR)
+	dl := j9Log(t, rw, repairGVR)
+	j9WaitFor(t, "the resolver's first judgement", func() bool { return dl.sweeps.Load() >= 1 })
+	if dl.pendingCount() != 1 {
+		t.Fatalf("precondition: nothing pending")
+	}
+	j9Transformed(t, rw, repairGVR, ja2) // received, still queued
+	cli.mu.Lock()
+	cli.listErr = errors.New("the apiserver is unavailable")
+	cli.mu.Unlock()
+	forcedVerify(context.Background(), repairGVR)
+	if got := dl.pendingCount(); got != 1 {
+		t.Fatalf("N3 RED: a received, still-queued pending key was settled by a pass that could not LIST (%d pending)", got)
+	}
+	if got := j9Published(); got != 0 {
+		t.Errorf("published %d divergence(s) for a received key", got)
+	}
+}
+
+// TestForcedPass918_PositionUnavailable_GVRIsUnverifiable — #923 review N1:
+// with client-go's AtomicFIFO off the store reports no position, so the
+// forced pass cannot decide a loss. With a REAL lost update on the GVR, the
+// pass must not run, must not mark the GVR verified, and the GVR must read as
+// unverifiable with reason position_unavailable — never "looked, found
+// nothing" — and it is not flagged.
+func TestForcedPass918_PositionUnavailable_GVRIsUnverifiable(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.AtomicFIFO, false)
+	rw, cli := j9Setup(t, repairGVR, true, ja1)
+	if pos := j9Position(t, rw, repairGVR); pos != "" {
+		t.Fatalf("precondition: the store reports position %q with AtomicFIFO off", pos)
+	}
+	j9Deliver(t, rw, repairGVR, jmod(j9Object{jclock.name, "5100", jclock.uid}))
+	cli.answer("5100", ja2, j9Object{jclock.name, "5100", jclock.uid}) // panel-a's 5002 was lost
+	skipped0 := VerifySkippedByReasonSnapshot()[verifySkipPositionUnavailable]
+	forcedVerify(context.Background(), repairGVR)
+	if got := VerifySkippedByReasonSnapshot()[verifySkipPositionUnavailable] - skipped0; got != 1 {
+		t.Errorf("store_verification_skipped{position_unavailable} advanced by %d, want 1", got)
+	}
+	if row, _ := verificationRowFor(repairGVR); row.verified || row.hasPending {
+		t.Fatalf("N1 RED: with no store position the GVR reads verified=%v flagged=%v; want neither", row.verified, row.hasPending)
+	}
+	if _, unverifiable, _, _, byReason := storeVerificationGauges(); unverifiable < 1 || byReason[unverifiablePositionUnavailable] < 1 {
+		t.Errorf("N1 RED: store_gvrs_unverifiable = %d, by reason %v; want the GVR counted under position_unavailable", unverifiable, byReason)
+	}
+	if got := j9Published(); got != 0 {
+		t.Errorf("published %d divergence(s) with no store position", got)
+	}
+}
+
 // TestForcedPass918_SkippedPass_KeepsTheKeysAndTheFlag — #923 review L4: a
 // pass that cannot take its read keeps what is pending, and the flag with it.
 func TestForcedPass918_SkippedPass_KeepsTheKeysAndTheFlag(t *testing.T) {
@@ -1096,21 +1153,27 @@ func TestDeliveryLog918_HandlerSeesAppliedDeliveries(t *testing.T) {
 	}
 }
 
-// TestDeliveryLog918_UnchangedRedeliveryIsNotRecorded — #923 review L8: a
-// relist re-delivers every object, and applies an unchanged one without
-// telling any handler. Such a delivery is identical to what the handler last
-// saw applied, so it is never recorded as received; a changed one is.
-func TestDeliveryLog918_UnchangedRedeliveryIsNotRecorded(t *testing.T) {
-	_, dl := j9Rule(t, "5002", ja1)
-	dl.handler().OnAdd(ja2.obj(repairGVR), false)
+// TestDeliveryLog918_AppliedEntriesReleasedByTheNextPass — #923 review L8 / N2:
+// a relist re-delivers every object and applies an unchanged one without
+// telling any handler, so its received entry is never removed by the handler.
+// The next pass releases every entry the store's position has passed for a key
+// the store holds — and KEEPS one for a key the store lacks: that may be a
+// DELETE the store applied before the handler recorded it, which only the
+// entry tells apart from a lost add (H3), so the rule must still read it.
+func TestDeliveryLog918_AppliedEntriesReleasedByTheNextPass(t *testing.T) {
+	idx, dl := j9Rule(t, "5006", ja2)
 	tf := dl.transform(nil)
-	_, _ = tf(ja2.obj(repairGVR))
-	if _, ok := dl.receivedFor(ja1.key()); ok {
-		t.Errorf("L8 RED: an unchanged re-delivery is recorded as received and not yet applied")
+	_, _ = tf(ja2.obj(repairGVR))    // an unchanged re-delivery: the store holds it
+	_, _ = tf(jb1del.obj(repairGVR)) // panel-b's delete, applied, handler not yet run
+	dl.beginPass()
+	if _, ok := dl.receivedFor(ja2.key()); ok {
+		t.Errorf("L8 RED: a received entry the store has applied is held past the next pass")
 	}
-	_, _ = tf(ja3.obj(repairGVR))
-	if r, ok := dl.receivedFor(ja1.key()); !ok || r.id != ja3.id() {
-		t.Errorf("a changed delivery is not recorded (%+v, %v)", r, ok)
+	if _, ok := dl.receivedFor(jb1.key()); !ok {
+		t.Fatalf("H3 RED: the next pass released the entry of a key the store lacks")
+	}
+	if v := judgeKey(idx, dl, positionOf("5006"), jb1.key(), j9Present(jb1)); v.outcome != outcomeStoreAhead {
+		t.Errorf("H3 RED: a delete applied before the handler, after the pass opened, judged %+v, want store ahead", v)
 	}
 }
 
