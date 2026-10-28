@@ -354,6 +354,9 @@ def test_http_client_round_trip_with_gzip():
             self.send_response(200)
             self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(z)))
+            if self.path.endswith("ra"):      # a RESTAction /call carries its stage outcomes (#904)
+                # snowplow's own value (dispatchers/issue904_stored_outcomes_test.go:52)
+                self.send_header("X-Snowplow-Stage-Outcomes", '[{"name":"sa","ok":false,"reason":"Forbidden"}]')
             self.end_headers()
             self.wfile.write(z)
 
@@ -367,6 +370,8 @@ def test_http_client_round_trip_with_gzip():
         c = load606.HttpClient(f"http://127.0.0.1:{srv.server_address[1]}")
         r = c.get("/call?root", "tok")
         assert r.status == 200 and json.loads(r.body) == json.loads(body)
+        assert r.stage_outcomes is None
+        assert c.get("/call?ra", "tok").stage_outcomes == '[{"name":"sa","ok":false,"reason":"Forbidden"}]'
         assert c.get("/call?root", None).status == 401
     finally:
         srv.shutdown()

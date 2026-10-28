@@ -321,6 +321,9 @@ def test_stale_roots_fail_in_seconds_before_stamping(harness):
     assert p.returncode != 0
     assert "PREFLIGHT REFUSED" in out
     assert "[preflight] REFUSED /dashboard -> 500: no matches for" in out
+    # the run log names WHAT was refused, not a fixed "unserved type / 404" (run 17)
+    assert "PREFLIGHT REFUSED: /dashboard -> 500: no matches for" in out
+    assert "unserved type / 404" not in out
     assert "=== step data ===" not in p.stderr                  # nothing stamped
     assert not (tmp / "out" / "data-proof.json").exists()
     assert not any("scaleuser-0001" in json.dumps(c) for c in _calls(state))  # no logins/users

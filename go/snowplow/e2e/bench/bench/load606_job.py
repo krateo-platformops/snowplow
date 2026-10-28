@@ -21,6 +21,10 @@ from pathlib import Path
 __all__ = ["main", "render", "shard_ranges"]
 
 LOAD606_SRC = Path(__file__).with_name("load606.py")
+# The bench's one identity redaction, shipped beside load606.py: the preflight
+# Job redacts its record with it (mounted at bench/identity.py, so the same
+# `from bench import identity` resolves on the host and in the Job)
+IDENTITY_SRC = Path(__file__).with_name("identity.py")
 IMAGE = "python:3.12-slim"
 # Result files on the pods' /out emptyDir (#817): never stdout, whose container
 # log the kubelet rotates under the reader.
@@ -61,6 +65,8 @@ metadata:
 data:
   load606.py: |
 {_indent(src, 4)}
+  identity.py: |
+{_indent(IDENTITY_SRC.read_text(), 4)}
 """
 
 
@@ -173,9 +179,11 @@ def render_preflight(*, snowplow_url: str, authn_url: str, user: str,
                      password: str, init: str, frontend_ns: str,
                      builders_ns: str, src: str | None = None) -> str:
     """Namespace + ConfigMap + the preflight606 Job: one user, seconds-scale
-    (`load606 preflight --full-walk`). Exit 2 = refused (config error: an
-    unserved type or a 404 on INIT or a menu route); product 5xx are recorded
-    in its JSON line, never a refusal."""
+    (`load606 preflight --full-walk`). Exit 2 = refused (an unserved type or
+    a 404 on INIT or a menu route, no sidebar route, a sidebar that changed
+    between two reads); product 5xx are recorded in its JSON line, never a
+    refusal. The ConfigMap ships bench/identity.py beside load606.py, mounted
+    as bench/identity.py: the record is redacted with it."""
     src = LOAD606_SRC.read_text() if src is None else src
     script = f"""set -eu
 exec python3 -u /opt/load606/load606.py preflight \\
@@ -200,6 +208,8 @@ metadata:
 data:
   load606.py: |
 {_indent(src, 4)}
+  identity.py: |
+{_indent(IDENTITY_SRC.read_text(), 4)}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -235,6 +245,11 @@ spec:
       - name: src
         configMap:
           name: load606
+          items:
+          - key: load606.py
+            path: load606.py
+          - key: identity.py
+            path: bench/identity.py
 """
 
 

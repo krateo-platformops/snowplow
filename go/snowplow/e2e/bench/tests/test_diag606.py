@@ -80,9 +80,12 @@ def test_wait_installer_polls_until_ready_and_logs_each_poll():
 
         def items(self, kind, *a):
             ok = self._ok
-            return [{"kind": "X", "metadata": {"name": kind.split(".")[0]},
-                     "status": {"conditions": [{"type": "Ready",
-                                                "status": "True" if ok else "False"}]}}]
+            o = {"kind": "X", "metadata": {"name": kind.split(".")[0]},
+                 "status": {"conditions": [{"type": "Ready",
+                                            "status": "True" if ok else "False"}]}}
+            if kind.startswith("installers."):     # it declares the one component CR
+                o["spec"] = {"components": [{"name": "authns", "kind": "X"}]}
+            return [o]
 
     k = K()
 
@@ -94,9 +97,9 @@ def test_wait_installer_polls_until_ready_and_logs_each_poll():
 
     orig = diag606._leaf_summaries
 
-    def leaf(kk):
+    def leaf(kk, **kw):
         kk._ok = next(states)
-        return orig(kk)
+        return orig(kk, **kw)
     diag606._leaf_summaries = leaf
     try:
         assert diag606.wait_installer(k, timeout_s=100, interval_s=0, log=log,

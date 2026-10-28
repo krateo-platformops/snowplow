@@ -34,6 +34,14 @@ def _sid(resource, name, ready=True, msg=""):
         resource)
 
 
+def _inst(ready=True, msg="", declares=diag606.REQUIRED_READY):
+    """The Installer CR's summary with its `declares` (diag606._leaf_summaries
+    attaches it from spec.components): the component CRs it will create."""
+    s = _sid("installers", "installer", ready, msg)
+    s["declares"] = [{"kind": "K", "name": n, "deps": []} for n in declares]
+    return s
+
+
 def test_parse_installer_message_children():
     msg = (f"2 of 41 managed children are not ready: {KOG}, "
            "krateoobservabilities/krateo-system/krateo-observability")
@@ -43,8 +51,7 @@ def test_parse_installer_message_children():
 
 
 def test_platform_state_allows_only_the_exact_child_with_the_exact_reason():
-    inst = [_sid("installers", "installer", False,
-                 f"1 of 41 managed children are not ready: {KOG}")]
+    inst = [_inst(False, f"1 of 41 managed children are not ready: {KOG}")]
     leaves = [_sid("x", n) for n in diag606.REQUIRED_READY]
     kog401 = _sid("compositiondefinitions", "github-provider-kog", False, RUN3_KOG_MSG)
     st = diag606.platform_state(inst, leaves, [kog401])
@@ -56,9 +63,8 @@ def test_platform_state_allows_only_the_exact_child_with_the_exact_reason():
     assert not st["ok"] and st["unexpected_not_ready"][0]["id"] == KOG
 
     # any OTHER not-ready child, even one named ONLY by the Installer message
-    inst2 = [_sid("installers", "installer", False,
-                  f"2 of 41 managed children are not ready: {KOG}, "
-                  "compositiondefinitions/krateo-system/oasgen-provider")]
+    inst2 = [_inst(False, f"2 of 41 managed children are not ready: {KOG}, "
+                          "compositiondefinitions/krateo-system/oasgen-provider")]
     st = diag606.platform_state(inst2, leaves, [kog401])
     assert not st["ok"]
     assert [u["id"] for u in st["unexpected_not_ready"]] == [
@@ -66,7 +72,7 @@ def test_platform_state_allows_only_the_exact_child_with_the_exact_reason():
 
     # a required component not Ready -> not ok even with nothing unexpected
     leaves2 = [_sid("x", "snowplow", False)] + leaves[1:]
-    st = diag606.platform_state([_sid("installers", "installer")], leaves2, [])
+    st = diag606.platform_state([_inst()], leaves2, [])
     assert not st["ok"] and st["required_ready"]["snowplow"] is False
 
 
@@ -84,13 +90,13 @@ def test_evaluate483_item1_is_observability_only_and_item6_gates_others():
     obs["Synced"] = {"status": "True"}
     kog = _sid("compositiondefinitions", "github-provider-kog", False, RUN3_KOG_MSG)
     cds = [_sid("compositiondefinitions", "alert-provider-crd"), kog]
-    r = diag606.evaluate483([_sid("installers", "installer", False,
-                                  f"1 of 41 managed children are not ready: {KOG}")],
+    r = diag606.evaluate483([_inst(False, f"1 of 41 managed children are not ready: {KOG}",
+                                   declares=("krateo-observability",))],
                             [obs], cds, True, [])
     assert r["verdict"] == "PASS", r["checks"]
     assert [a["id"] for a in r["known_unrelated_allowed"]] == [KOG]
     cds.append(_sid("compositiondefinitions", "oasgen-provider", False, "timeout"))
-    r = diag606.evaluate483([_sid("installers", "installer")], [obs], cds, True, [])
+    r = diag606.evaluate483([_inst(declares=("krateo-observability",))], [obs], cds, True, [])
     assert r["verdict"] == "FAIL"
     assert [c["item"] for c in r["checks"] if not c["pass"]] == [6]
 
@@ -108,6 +114,9 @@ def test_bundle_shape_is_queryable_both_ways():
     ({"FAKE_KOG": "1", "FAKE_KOG_REASON": "500 internal error"}, KOG),
     ({"FAKE_KOG": "1", "FAKE_EXTRA_NOT_READY": "1"},
      "compositiondefinitions/krateo-system/oasgen-provider"),
+    # run 17: the Installer CR is Ready and every CR that exists is Ready, but
+    # it declares a page (deps: [portal]) it has not created yet
+    ({"FAKE_DECLARED_LATER": "1"}, "declared/DashboardPage/dashboard-page"),
 ])
 def test_platform_fails_on_any_child_outside_the_allow_list(harness, envkv, needle):
     env, state, ambient, tmp = harness
