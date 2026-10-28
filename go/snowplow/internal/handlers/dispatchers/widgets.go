@@ -561,6 +561,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// external widget whose RA also reads K8s is dirty-marked through its
 			// inner-call edge, so a post-mark re-Put must end KNOWN-STALE — in the
 			// write's own critical section (#734).
+			// stage-outcomes-waiver: a widgets cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 			cacheHandle.PutEndingKnownStale(ctx, cacheKey, &cache.ResolvedEntry{
 				RawJSON:     encoded,
 				Inputs:      cacheInputs,
@@ -661,6 +662,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			cacheInputs.HasUAF = true
 		}
 		noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
+		// stage-outcomes-waiver: a widgets cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 		if cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
 			RawJSON:      encoded,
 			Inputs:       cacheInputs,

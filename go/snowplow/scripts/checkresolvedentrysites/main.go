@@ -213,6 +213,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "       is intentional, consciously lower bootScopeStampFloor in this checker with a note.\n")
 	}
 
+	// Site-class 5 (#911 re-review): every dispatcher Put site of a resolve
+	// output keeps the stage outcomes, or says why its class never answers a
+	// RESTAction /call.
+	for _, root := range os.Args[1:] {
+		findings, sites, err := checkStageOutcomesTree(root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: stage outcomes: %v\n", err)
+			os.Exit(2)
+		}
+		if len(findings) > 0 {
+			failed = true
+			reportStageOutcomesFindings(findings)
+		} else if sites > 0 {
+			fmt.Printf("OK: %d dispatcher ResolvedEntry Put site(s) keep %s or carry a waiver.\n", sites, stageOutcomesField)
+		}
+	}
+
 	// Site-class 3 (#643): the resolve path's L1 body reads, typed. Runs when a
 	// scanned root is the production `internal` tree.
 	serveProbes, serveScoped := 0, false

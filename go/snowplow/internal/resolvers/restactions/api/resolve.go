@@ -244,9 +244,10 @@ type resolveRun struct {
 	apistageEnabled bool                      // F1 content-keyed api-stage L1 gate (read once)
 	apistageStore   *cache.ResolvedCacheStore // nil when apistage disabled / store unavailable
 	stageErrSink    *cache.StageErrorSink     // nil on the request path (refresher-only)
-	// outcomes (#443 part 2) collects per-stage outcomes for the
-	// X-Snowplow-Stage-Outcomes header; non-nil only for the top-level
-	// caller-supplied (inline) resolve.
+	// outcomes (#443 part 2, #904) collects this resolve's per-stage outcomes:
+	// the #904 dependent-write rule reads them between stages, and the
+	// top-level resolve's are the X-Snowplow-Stage-Outcomes header. Never nil
+	// once ResolveWithFailure has started the run (claimStageOutcomes).
 	outcomes      *StageOutcomes
 	pipTimingSink *cache.PIPStageTimingSink // nil on the request path (PIP-seed-only)
 	// failure (#709) is the first stage, in topological order, that failed
@@ -450,11 +451,12 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 			// #760 — that empty is a stage FAILURE (typically a transient
 			// token-file read), not "no resources": the sink bump every L1 Put
 			// gate declines on. A fixed class, never the acquire error's text.
-			// (No stage outcome: outcomes are recorded only for a
-			// caller-supplied resolve, whose UAF stage dials the caller's
-			// endpoint above and never reaches this branch.)
+			// #904 — and the stage FAILED: a write stage depending on it is
+			// not sent. (A caller-supplied resolve's UAF stage dials the
+			// caller's endpoint above and never reaches this branch.)
 			r.taintNarrow() // #603 PR-2 — a failed stage narrows nothing
 			r.stageErrSink.Bump(id, uafSAEndpointUnavailableMsg)
+			r.outcomes.fail(id, StageReasonError)
 			return endpoints.Endpoint{}, false, false, stageContinue
 		}
 		// The UAF stage dials the SA endpoint → isSAEndpoint=true (provenance): the
@@ -813,8 +815,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// #651 — a served-but-failed stage (an unresolved userAccessFilter
 		// resource set) takes the same sink bump + Error outcome as every other
 		// stage failure (recordItemError), against THIS resolve's own stage:
-		// r.outcomes is nil for a nested stored resolve, so it never marks a
-		// caller's stage by name.
+		// a nested resolve records into its own private outcomes
+		// (claimStageOutcomes), so it never marks a caller's stage by name.
 		stageFailed: func(msg string) {
 			r.taintNarrow() // #603 PR-2 — a served-but-failed stage narrows nothing
 			r.stageErrSink.Bump(id, msg)
@@ -2002,7 +2004,7 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 		var err error
 		opts.RC, err = inClusterConfigFn()
 		if err != nil {
-			return map[string]any{}, nil
+			return abortedResolve(ctx, opts.Items)
 		}
 	}
 
@@ -2021,14 +2023,14 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		log.Error("unable to fetch user info from context", slog.Any("err", err))
-		return map[string]any{}, nil
+		return abortedResolve(ctx, opts.Items)
 	}
 
 	// Sort API by Depends
 	names, err := topologicalSort(opts.Items)
 	if err != nil {
 		log.Error("unable to sorted api by deps", slog.Any("error", err))
-		return map[string]any{}, nil
+		return abortedResolve(ctx, opts.Items)
 	}
 	log.Debug("sorted api by deps", slog.Any("names", names))
 
@@ -2052,16 +2054,21 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	// recorded, on every return below (narrow.go).
 	r.narrow = newNarrowRun(r)
 	defer r.commitNarrow()
-	if opts.Provenance == ProvenanceCallerSupplied {
-		r.outcomes = stageOutcomesFrom(ctx)
-		r.outcomes.register(names)
-	}
+	r.outcomes = claimStageOutcomes(ctx)
+	r.outcomes.register(names)
 	// Each api stage runs through runStage in topological order. runStage
 	// returns stop=true on a truncating exit (R-1 caller-cancel, R-2 endpoint
 	// err, R-3 g.Wait hard error) — the orchestrator then returns the
 	// (truncated) dict; stop=false advances to the next stage. runStage owns
 	// the recordStageTiming()-before-every-exit invariant internally.
 	for _, id := range names {
+		// #904 — a write stage whose dependsOn stage did not succeed is not
+		// sent (dependent_write.go). Decided here, between stages, so no item
+		// of it is ever dispatched.
+		if dep, skip := r.dependentWriteBlocked(apiMap[id]); skip {
+			r.skipDependentWrite(id, dep)
+			continue
+		}
 		r.outcomes.ran(id)
 		if r.runStage(id, apiMap) {
 			// A truncating exit: this stage failed (its own item errors, if

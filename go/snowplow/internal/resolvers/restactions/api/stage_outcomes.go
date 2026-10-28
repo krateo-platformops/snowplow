@@ -4,21 +4,40 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
+
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
-// Per-stage outcome reporting for an INLINE (caller-supplied, #443 part 2)
-// resolve. The builder gate needs to know which stages failed even when the
-// RESTAction's own filter drops the error keys from the body, and the body
-// must stay byte-identical to a stored resolve. So the outcomes travel in a
-// response header instead (X-Snowplow-Stage-Outcomes), as a compact JSON
-// array of {"name","ok","reason"}.
+// Per-stage outcomes of one resolve.
 //
-// The header carries REASON CODES ONLY, from the closed set below: never an
-// error message, a path or any response data (error text can carry data, and
-// headers have size limits). Stage names are the caller's own draft's names.
-// It is recorded only for the top-level caller-supplied resolve: a nested
-// stored resolve builds its own ResolveOptions (ProvenanceStored) and records
-// nothing.
+// Every resolve tracks them: the #904 rule (a write stage is not sent when the
+// stage it depends on did not succeed) reads them between stages. A /call of a
+// RESTAction also REPORTS them in a response header (X-Snowplow-Stage-Outcomes),
+// so a caller can tell a half-done write sequence from a done one without
+// parsing the body, which the RESTAction's own filter may have reshaped. #443
+// part 2 introduced the header for inline drafts; #904 sets it on every
+// RESTAction /call. It is a compact JSON array, in topological order, of every
+// stage that did NOT succeed: {"name","ok":false,"reason"} plus, for a skipped
+// stage, "dependsOn" (the stage that did not succeed). [] means every stage
+// succeeded.
+//
+// Each stage ends in exactly one outcome (#904):
+//   - succeeded: it ran and every item it dialed succeeded. An iterator stage
+//     that yields zero items succeeded (it had nothing to do);
+//   - failed: at least one item failed, or the stage could not be built (its
+//     iterator errored, its endpoint could not be resolved). Reason: a code;
+//   - skipped: a write stage that was not dialed because the stage it depends
+//     on failed or was skipped (reason Skipped).
+//
+// The header carries STAGE NAMES AND REASON CODES ONLY, from the closed set
+// below: never an error message, a path, an identity or any response data
+// (error text can carry data, and headers have size limits).
+//
+// Only the TOP-LEVEL resolve reports into the collector a caller installs
+// (WithStageOutcomes): the first resolve that finds it claims it. A nested
+// resolve runs inside one of the top-level's stages, so always after the claim,
+// and tracks its own stages privately.
 
 // Stage outcome reason codes (closed set).
 const (
@@ -28,6 +47,15 @@ const (
 	StageReasonUnauthorized = "Unauthorized"
 	StageReasonNotRun       = "NotRun" // the resolve was truncated before this stage ran
 	StageReasonError        = "Error"  // any other failure
+	// StageReasonSkipped (#904) — a write stage not dialed because the stage it
+	// depends on failed or was skipped. Recorded only by skip(), never by fail().
+	StageReasonSkipped = "Skipped"
+	// StageReasonAborted (#904 review F3) — the RESOLVE-level row (name "")
+	// of a resolve that stopped before running any stage: its stage graph
+	// cannot be ordered (a dependsOn naming no stage, a cycle) or it has no
+	// identity or no client config. Every declared stage is then NotRun, so
+	// the header can never read "all succeeded" ([]) for it.
+	StageReasonAborted = "Aborted"
 )
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
@@ -46,33 +74,46 @@ var reasonRank = map[string]int{
 }
 
 type stageOutcome struct {
-	ran    bool
-	reason string // "" = ok
+	ran       bool
+	reason    string // "" = ok
+	skippedBy string // #904: the dependsOn stage that did not succeed; "" = not skipped
 }
 
-// StageOutcomes collects per-stage outcomes for one inline resolve. Safe for
-// the concurrent iterator workers of a stage.
+// StageOutcomes collects per-stage outcomes for one resolve. Safe for the
+// concurrent iterator workers of a stage.
 type StageOutcomes struct {
-	mu    sync.Mutex
-	order []string
-	by    map[string]*stageOutcome
+	claimed atomic.Bool // a top-level resolve took this collector (claimStageOutcomes)
+	mu      sync.Mutex
+	aborted bool // the resolve stopped before running any stage (F3)
+	order   []string
+	by      map[string]*stageOutcome
+}
+
+func newStageOutcomes() *StageOutcomes {
+	return &StageOutcomes{by: map[string]*stageOutcome{}}
 }
 
 type stageOutcomesKey struct{}
 
-// WithStageOutcomes installs a fresh collector on ctx. The RESTAction handler
-// installs it only for an inline (caller-supplied) resolve.
+// WithStageOutcomes installs a fresh collector on ctx. A caller that reports a
+// RESTAction's outcomes (the /call dispatcher, a Put site that stores them with
+// the cell) installs it before the resolve; the top-level resolve claims it.
 func WithStageOutcomes(ctx context.Context) (context.Context, *StageOutcomes) {
-	s := &StageOutcomes{by: map[string]*stageOutcome{}}
+	s := newStageOutcomes()
 	return context.WithValue(ctx, stageOutcomesKey{}, s), s
 }
 
-func stageOutcomesFrom(ctx context.Context) *StageOutcomes {
-	if ctx == nil {
-		return nil
+// claimStageOutcomes returns the collector this resolve records into: the
+// ctx's, when no earlier resolve on this ctx claimed it (this one is then the
+// top-level resolve), else a private one. Never nil, so the #904 rule always
+// has the outcomes it reads.
+func claimStageOutcomes(ctx context.Context) *StageOutcomes {
+	if ctx != nil {
+		if s, _ := ctx.Value(stageOutcomesKey{}).(*StageOutcomes); s != nil && s.claimed.CompareAndSwap(false, true) {
+			return s
+		}
 	}
-	s, _ := ctx.Value(stageOutcomesKey{}).(*StageOutcomes)
-	return s
+	return newStageOutcomes()
 }
 
 func (s *StageOutcomes) register(names []string) {
@@ -119,37 +160,86 @@ func (s *StageOutcomes) fail(name, reason string) {
 	}
 }
 
-type stageOutcomeJSON struct {
-	Name   string `json:"name"`
-	OK     bool   `json:"ok"`
-	Reason string `json:"reason,omitempty"`
+// abortedResolve (#904 review F3) is ResolveWithFailure's answer when it stops
+// before running any stage: an empty dict, and — on the collector this resolve
+// claims — a resolve-level Aborted row plus every declared stage as NotRun, so
+// a controller reading the header never reads "all succeeded".
+func abortedResolve(ctx context.Context, items []*templates.API) (map[string]any, *StageFailure) {
+	o := claimStageOutcomes(ctx)
+	names := make([]string, 0, len(items))
+	for _, it := range items {
+		if it != nil {
+			names = append(names, it.Name)
+		}
+	}
+	o.register(names)
+	o.mu.Lock()
+	o.aborted = true
+	o.mu.Unlock()
+	return map[string]any{}, nil
 }
 
-// HeaderValue renders the X-Snowplow-Stage-Outcomes value: the per-stage
-// array in topological order, or {"truncated":true,"failed":N} when that would
-// exceed StageOutcomesMaxHeaderBytes. A stage that never ran (the resolve was
-// truncated) reports NotRun.
+// skip records that a stage was not dialed because dependsOn did not succeed
+// (#904). Called by the orchestrator between stages, never by a worker.
+func (s *StageOutcomes) skip(name, dependsOn string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if o := s.by[name]; o != nil {
+		o.reason, o.skippedBy = StageReasonSkipped, dependsOn
+	}
+}
+
+// blocksDependentWrite reports whether a write stage that depends on name must
+// not be sent (#904): name failed or was skipped. A dry-run refusal
+// (StageNotExecuted, #443 k) does not block. It is not an outcome of the
+// stage's own call (a real run would have sent it), and the dry run refuses the
+// dependent write for the same reason, so the preview reports what a real run
+// would do. A name that is not a stage of this resolve never blocks.
+func (s *StageOutcomes) blocksDependentWrite(name string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o := s.by[name]
+	return o != nil && o.reason != "" && o.reason != StageReasonNotExecuted
+}
+
+type stageOutcomeJSON struct {
+	Name      string `json:"name"`
+	OK        bool   `json:"ok"`
+	Reason    string `json:"reason,omitempty"`
+	DependsOn string `json:"dependsOn,omitempty"`
+}
+
+// HeaderValue renders the X-Snowplow-Stage-Outcomes value: every stage that
+// did not succeed, in topological order ([] when all succeeded), or
+// {"truncated":true,"failed":N} when that would exceed
+// StageOutcomesMaxHeaderBytes (N counts every listed stage). A stage that
+// never ran because the resolve was truncated reports NotRun; a skipped one
+// reports Skipped and the stage it depended on.
 func (s *StageOutcomes) HeaderValue() string {
 	if s == nil {
 		return ""
 	}
 	s.mu.Lock()
-	out := make([]stageOutcomeJSON, 0, len(s.order))
-	failed := 0
+	out := make([]stageOutcomeJSON, 0, len(s.order)+1)
+	if s.aborted {
+		out = append(out, stageOutcomeJSON{Name: "", Reason: StageReasonAborted})
+	}
 	for _, n := range s.order {
 		o := s.by[n]
-		row := stageOutcomeJSON{Name: n, OK: true}
 		switch {
 		case o.reason != "":
-			row.OK, row.Reason = false, o.reason
+			out = append(out, stageOutcomeJSON{Name: n, Reason: o.reason, DependsOn: o.skippedBy})
 		case !o.ran:
-			row.OK, row.Reason = false, StageReasonNotRun
+			out = append(out, stageOutcomeJSON{Name: n, Reason: StageReasonNotRun})
 		}
-		if !row.OK {
-			failed++
-		}
-		out = append(out, row)
 	}
+	failed := len(out)
 	s.mu.Unlock()
 	b, err := json.Marshal(out)
 	if err != nil || len(b) > StageOutcomesMaxHeaderBytes {

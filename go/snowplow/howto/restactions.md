@@ -69,7 +69,7 @@ Defines a single HTTP request and its dependencies.
 | `filter` | `string` | Optional filter to process or extract data from the response. | ❌ |
 | `errorKey` | `string` | Key to identify error fields in the response. | ❌ |
 | `exportJwt` | `boolean` | If `true`, exports a JWT token from this request for later use. | ❌ |
-| `continueOnError` | `boolean` | If `true`, continues execution even if this call fails. | ❌ |
+| `continueOnError` | `boolean` | Changes the answer when this stage fails (see [When a stage fails](#when-a-stage-fails)). On a write stage it also means "send me even if the stage I depend on did not succeed". | ❌ |
 | `endpointRef` | `object` | Reference (`name` + `namespace`) to a Kubernetes [`Endpoint`](endpoints.md) object defining the target service. | ❌ |
 | `dependsOn` | `object` | Declares a dependency on another API call defined in this spec. | ❌ |
 | `resolve` | `boolean` | When this stage's `path` is a **direct apiserver path to a `RESTAction` or `Widget` CR**, controls whether snowplow runs the fetched CR through the resolver in-process. **Opt-in — defaults to `false`** (the raw stored CR is returned). See [resolving a referenced RESTAction/Widget in-process](#resolving-a-referenced-restactionwidget-in-process). | ❌ |
@@ -207,10 +207,78 @@ the stage's value is `null`, and it is not an error.
 
 ## When a stage fails
 
-A failing stage never stops the stages after it. Its error is recorded under
-its `errorKey` (default `error`): the upstream's `Status` (`code`, `reason`,
-`message`) when it answered one, otherwise a message. A non-2xx answer always
-keeps its HTTP code, even with an empty body or a body that is not a `Status`.
+A failing **read** stage never stops the stages after it. Its error is
+recorded under its `errorKey` (default `error`): the upstream's `Status`
+(`code`, `reason`, `message`) when it answered one, otherwise a message. A
+non-2xx answer always keeps its HTTP code, even with an empty body or a body
+that is not a `Status`.
+
+### A write stage waits for the stage it depends on
+
+A **write** stage (any verb but `GET`, `HEAD`, `OPTIONS`, `TRACE`) whose
+`dependsOn` stage **failed or was skipped** is **not sent**, unless the write
+stage itself sets `continueOnError: true` ("send me even if what I depend on
+did not succeed"). `continueOnError` on the stage it depends on does not
+change this.
+
+Each stage ends in exactly one outcome:
+
+- **succeeded**: it ran, and every item it sent succeeded. An `iterator` that
+  yields **zero items** succeeded: it had nothing to do;
+- **failed**: at least one item failed, or the stage could not be built (its
+  iterator errored, its endpoint could not be resolved);
+- **skipped**: a write stage not sent because of this rule. A skipped stage
+  leaves no value in the result and blocks its own dependent writes, so a
+  chain `read → detach → delete` stops at the first failure.
+
+Example: a delete lifecycle where `delete.dependsOn` is `detachVolumes`
+(an iterator over the server's data volumes), and `delete` has no
+`continueOnError`:
+
+- a detach fails → `delete` is skipped;
+- the server has no data volumes (empty iterator) → `detachVolumes` succeeded
+  → `delete` is sent.
+
+### The stage-outcome header
+
+Every `/call` answer of a RESTAction carries `X-Snowplow-Stage-Outcomes`: a
+compact JSON array, in dependency order, of every stage that did **not**
+succeed. `[]` means every stage succeeded.
+
+The header has exactly two shapes:
+
+- a JSON **array** of rows (above); `[]` is the only "all succeeded";
+- the object `{"truncated":true,"failed":N}` when the array would exceed
+  4 KiB: N stages did not succeed, and which ones cannot be told.
+
+A reader must treat anything else — a header it cannot parse, a JSON value
+that is neither, a missing header — as **not** succeeded, never as `[]`.
+
+```
+[{"name":"detachVolumes","ok":false,"reason":"Error"},
+ {"name":"delete","ok":false,"reason":"Skipped","dependsOn":"detachVolumes"}]
+```
+
+- `reason` is a code: `Forbidden`, `NotFound`, `Unauthorized`, `Error`,
+  `Skipped`, `NotRun` (the resolve stopped before this stage),
+  `StageNotExecuted` (a dry run). `dependsOn` is set on a `Skipped` row.
+- A resolve that runs no stage at all (its `dependsOn` graph names a stage
+  that does not exist or has a cycle) answers a resolve-level row
+  `{"name":"","ok":false,"reason":"Aborted"}` followed by every stage as
+  `NotRun`, never `[]`.
+- It carries stage names and codes only: no error text, path, identity or
+  data.
+- The HTTP status is unchanged (see below), so a controller that drives a
+  write lifecycle through `/call` reads this header to tell a half-done
+  sequence from a done one, even when the RESTAction's `filter` hides the
+  error keys. A cached answer carries the header of the resolve that stored
+  it. Most cached answers carry `[]`; two kinds of resolve are stored with
+  a non-`[]` header: one whose only failures are per-identity forbiddens
+  (#681), and one that ran no stage (`Aborted`) — it is stored with its
+  `Aborted` / `NotRun` header and answered with it until the RESTAction is
+  edited (an edit evicts the cell).
+
+### The HTTP status
 
 What `continueOnError` changes is what happens when the top-level `filter`
 **cannot produce a value**: it yields nothing (jq `empty`), or it fails because
