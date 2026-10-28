@@ -143,6 +143,41 @@ func SetDirtyToFreshRecorder(fn func(ms int64)) {
 	dirtyToFreshRecorder.Store(&fn)
 }
 
+// dirtyWindowClock (#930) is the clock of the invalidation→fresh window: a
+// mark's t0 and every age measured from it (the dirty→fresh sample, the stale-
+// served age) are read from it, so a window's length is the difference of two
+// readings of ONE clock. nil reads time.Now, which is all production ever uses.
+// A test installs a virtual clock (SetDirtyWindowClockForTest) to place the
+// mark, a remark and the clean Put at exact instants, so an arm about WHICH mark
+// starts the window asserts the exact length instead of a wall-clock bound.
+var dirtyWindowClock atomic.Pointer[func() time.Time]
+
+// windowNow reads dirtyWindowClock.
+func windowNow() time.Time {
+	if f := dirtyWindowClock.Load(); f != nil {
+		return (*f)()
+	}
+	return time.Now()
+}
+
+// DirtyWindowNow reads the dirty-window clock. Every age measured from a
+// window's t0 (KnownStale / KnownStaleMark) outside this package — the D2
+// stale-serve age — is DirtyWindowNow() minus that t0, never another clock.
+func DirtyWindowNow() time.Time { return windowNow() }
+
+// SetDirtyWindowClockForTest installs now as the dirty-window clock and returns
+// the restore. TEST-ONLY: production never calls it, so the window reads
+// time.Now.
+func SetDirtyWindowClockForTest(now func() time.Time) (restore func()) {
+	prev := dirtyWindowClock.Load()
+	if now == nil {
+		dirtyWindowClock.Store(nil)
+	} else {
+		dirtyWindowClock.Store(&now)
+	}
+	return func() { dirtyWindowClock.Store(prev) }
+}
+
 // DirtyToFreshBoundsMS are the explicit histogram bounds: they bracket the 1 s
 // north-star and the 10 s AC-98.12 convergence SLA.
 var DirtyToFreshBoundsMS = []float64{50, 100, 250, 500, 750, 1000, 2000, 5000, 10000, 30000, 60000}
@@ -261,7 +296,7 @@ func (r *refresher) windowFresh(key string, t0 time.Time) {
 
 // sampleFresh records one dirty→fresh sample of now − t0.
 func (r *refresher) sampleFresh(t0 time.Time) {
-	ms := time.Since(t0).Milliseconds()
+	ms := windowNow().Sub(t0).Milliseconds()
 	if ms < 0 {
 		ms = 0
 	}

@@ -70,7 +70,7 @@ func (c *ResolvedCacheStore) CellPutSeq(key string) (uint64, bool) {
 		return 0, false
 	}
 	item := el.Value.(*lruItem)
-	if pastTTL, pastMaxAge := c.itemExpiredLocked(item, time.Now()); pastTTL || pastMaxAge {
+	if pastTTL, pastMaxAge := c.itemExpiredLocked(item, c.now()); pastTTL || pastMaxAge {
 		return 0, false
 	}
 	return item.putSeq, true
@@ -91,7 +91,7 @@ func (c *ResolvedCacheStore) CellServeIdentity(key string) (putSeq, bodySeq uint
 		return 0, 0, false
 	}
 	item := el.Value.(*lruItem)
-	if pastTTL, pastMaxAge := c.itemExpiredLocked(item, time.Now()); pastTTL || pastMaxAge {
+	if pastTTL, pastMaxAge := c.itemExpiredLocked(item, c.now()); pastTTL || pastMaxAge {
 		return 0, 0, false
 	}
 	return item.putSeq, item.entry.listBodySeq(), true

@@ -288,7 +288,9 @@ func serveStaleWithDebt(ctx context.Context, sink *cache.StaleServeSink, store *
 	}
 	sink.NoteServedAt(now)
 	staleServeTotal.Add(1)
-	staleServeAgeHist.record(now.Sub(t0).Milliseconds())
+	// #930 — t0 is the known-stale window's mark, stamped on the dirty-window
+	// clock: its age is read on that clock, not on the debt clock (staleNow).
+	staleServeAgeHist.record(cache.DirtyWindowNow().Sub(t0).Milliseconds())
 	ensureStaleOverdueScanner()
 	return entry, true
 }

@@ -81,10 +81,10 @@ func (w *wakingQueue) Add(item string) {
 
 // newViewedQueue builds the viewed tier over rl; wake (refresher.wakeViewed)
 // wakes an idle worker through the normal queue.
-func newViewedQueue(rl workqueue.TypedRateLimiter[string], wake func()) workqueue.TypedRateLimitingInterface[string] {
-	wq := &wakingQueue{TypedInterface: workqueue.NewTyped[string](), wake: wake}
-	return workqueue.NewTypedRateLimitingQueueWithConfig(rl, workqueue.TypedRateLimitingQueueConfig[string]{
-		DelayingQueue: workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Queue: wq}),
+// #930 — the tier counts its outstanding work into w with the other tiers.
+func newViewedQueue(rl workqueue.TypedRateLimiter[string], wake func(), w *refresherWorkCount) workqueue.TypedRateLimitingInterface[string] {
+	return newRefresherTierQueue("refresher_viewed", rl, w, func(q workqueue.TypedInterface[string]) workqueue.TypedInterface[string] {
+		return &wakingQueue{TypedInterface: q, wake: wake}
 	})
 }
 

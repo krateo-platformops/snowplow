@@ -349,23 +349,64 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	}
 }
 
+// r378Clock is a virtual store clock (ResolvedCacheStore.clock): it reads the
+// instant the arm last set, and nothing else moves it.
+type r378Clock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (k *r378Clock) now() time.Time { k.mu.Lock(); defer k.mu.Unlock(); return k.at }
+func (k *r378Clock) set(at time.Time) {
+	k.mu.Lock()
+	k.at = at
+	k.mu.Unlock()
+}
+
+// r378F4aTicks are the arm's reaper ticks, as offsets from the cells' birth: one
+// per second like the 1 s summary ticker the arm used to sleep through, at the
+// half second so no tick sits on a whole-second edge of the truncated
+// TTLRemainingSeconds / LifetimeSeconds. Ticks 6.5 … 11.5 s are the six inside
+// the lead window [6 s, 12 s); the last stops before the earliest possible
+// SECOND window entry of a re-minted cell (6.5 s + 6 s).
+func r378F4aTicks() []time.Duration {
+	var out []time.Duration
+	for s := 1; s <= 11; s++ {
+		out = append(out, time.Duration(s)*time.Second+500*time.Millisecond)
+	}
+	return out
+}
+
 // r378RunF4aArm runs one F4a harness: 2,000 boot-born cells × 3 classes through
-// the REAL refresher pool and the REAL reaper tick (#316 proactive enqueue), for
-// ≥ 4 ticks across the lead window. write is the refresher terminal under test.
-// Returns real resolves (Δcompleted − Δskipped_no_entry) and BornAt resets per key.
-func r378RunF4aArm(t *testing.T, writeFor func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool) (real int64, resets map[string]int, cells int) {
+// the REAL refresher pool and the REAL reaper pass (#316 proactive enqueue,
+// reapPastMaxEntryAge — the body of the summary tick), across the lead window.
+// write is the refresher terminal under test.
+//
+// #930 — DETERMINISTIC. The store reads a virtual clock the arm sets to each
+// tick's instant; the arm runs the reaper pass itself at that instant, then
+// waits for the refresher to have NO key queued or in a worker's hands
+// (WaitRefresherQuiescentForTest) before the next tick. So every tick sees every
+// refresh the previous one caused, and no count depends on how fast this host
+// runs: a reaper tick can no longer drift across the window edge, and the
+// control can no longer fall short of the cells because the real window closed
+// first (the two failure types of #930).
+//
+// Returns real resolves (Δcompleted − Δskipped_no_entry), BornAt resets per key,
+// the cell count, and the handler calls made by each tick's pass.
+func r378RunF4aArm(t *testing.T, writeFor func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool) (real int64, resets map[string]int, cells int, perTick []int64) {
 	t.Helper()
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
 	t.Setenv(envResolvedCacheTTLSeconds, "8")          // refresh enqueued past 3/4·TTL = 6s
 	t.Setenv(envResolvedCacheMaxEntryAgeSeconds, "12") // L = min(8, 6) = 6 → window [6s, 12s)
-	t.Setenv(envResolvedCacheSummaryEvery, "1")        // the reaper tick
 	c := ResolvedCache()
+	clk := &r378Clock{at: time.Now()}
+	c.SetClockForTest(clk.now) // the store is reset with the refresher on cleanup
 	write := writeFor(c)
 
 	const perClass = 2000
 	classes := []string{"restactions", "widgets", CacheEntryClassWidgetContent}
-	born := time.Now()
+	born := clk.now()
 	var keys []string
 	for _, class := range classes {
 		for i := 0; i < perClass; i++ {
@@ -400,9 +441,17 @@ func r378RunF4aArm(t *testing.T, writeFor func(c *ResolvedCacheStore) func(conte
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	StartRefresher(ctx)
-	// Run past the window start, across ≥ 4 reaper ticks inside [6s, 12s), and
-	// stop before the earliest possible SECOND window entry of a re-minted cell.
-	r378SleepUntil(born.Add(11500 * time.Millisecond))
+	base := RefresherWorkSnapshot()
+	for _, at := range r378F4aTicks() {
+		before := calls.Load()
+		clk.set(born.Add(at))
+		c.reapPastMaxEntryAge()
+		if w, err := WaitRefresherQuiescentForTest(base, time.Minute); err != nil {
+			t.Fatalf("SETUP: after the reaper tick at +%v: %v (outstanding=%d floored Δ=%d retried Δ=%d)",
+				at, err, w.Outstanding, w.Floored-base.Floored, w.Retried-base.Retried)
+		}
+		perTick = append(perTick, calls.Load()-before)
+	}
 	r1 := RefresherStatsByStat()
 	real = (r1["completed"] - r0["completed"]) - (r1["skipped_no_entry"] - r0["skipped_no_entry"])
 	resets = map[string]int{}
@@ -411,9 +460,9 @@ func r378RunF4aArm(t *testing.T, writeFor func(c *ResolvedCacheStore) func(conte
 		resets[k] = len(births[k]) - 1
 	}
 	mu.Unlock()
-	t.Logf("F4a arm: cells=%d handler calls=%d real resolves=%d (completed Δ=%d skipped_no_entry Δ=%d)",
-		len(keys), calls.Load(), real, r1["completed"]-r0["completed"], r1["skipped_no_entry"]-r0["skipped_no_entry"])
-	return real, resets, len(keys)
+	t.Logf("F4a arm: cells=%d handler calls=%d per tick %v real resolves=%d (completed Δ=%d skipped_no_entry Δ=%d)",
+		len(keys), calls.Load(), perTick, real, r1["completed"]-r0["completed"], r1["skipped_no_entry"]-r0["skipped_no_entry"])
+	return real, resets, len(keys), perTick
 }
 
 func itoa378(i int) string {
@@ -451,17 +500,20 @@ func itoa378(i int) string {
 // 300s pass — rests on two mechanisms measured here all the same: a successful
 // re-mint moves BornAt out of the window, and the refresher re-Put drops
 // SeededAtBoot while a seeded insert never stamped lastRead, so the cell goes
-// COLD and the warm gate excludes it from every later pass. Measured on the #506
-// item 2 tree: 6,000 cells, 6,000 handler calls, 6,000 real resolves in both
-// arms.
+// COLD and the warm gate excludes it from every later pass.
+//
+// #930 — COUNTS, NOT A REAL-TIME WINDOW. The arm used to sleep through the
+// window and require every cell to refresh before it closed in real time; on a
+// loaded host the control fell short (5,507 < 6,000) or a tick drifted across
+// the window edge and the arms differed by one or two. Both arms now run the
+// same 11 reaper ticks at exact virtual instants, each settled before the next
+// (r378RunF4aArm), so the counts are exact: every cell is refreshed exactly once,
+// at the window-entry tick (+6.5 s), in BOTH arms, tick for tick.
 func TestIssue378_F4a_NoAmplification_MultiTick(t *testing.T) {
-	if testing.Short() {
-		t.Skip("F4a runs two ~12s real-elapse arms")
-	}
 	// Control: the window predicate forced false — the same terminal write minus
 	// the re-mint is exactly ReplaceIfGen (test-only seam: chosen here, never in
 	// production code).
-	ctlReal, ctlResets, n := r378RunF4aArm(t, func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
+	ctlReal, ctlResets, n, ctlTicks := r378RunF4aArm(t, func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
 		return c.replaceIfGen
 	})
 	for k, r := range ctlResets {
@@ -469,17 +521,18 @@ func TestIssue378_F4a_NoAmplification_MultiTick(t *testing.T) {
 			t.Fatalf("CONTROL: the window-false twin reset BornAt of %s %d times", k, r)
 		}
 	}
-	gotReal, resets, _ := r378RunF4aArm(t, func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
+	if ctlReal != int64(n) {
+		t.Fatalf("SETUP: the control ran %d real resolves over %d cells, want exactly one each — the ticks must "+
+			"carry every cell through the window entry once (per tick %v)", ctlReal, n, ctlTicks)
+	}
+	gotReal, resets, _, gotTicks := r378RunF4aArm(t, func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
 		return r378RefreshPut(t, c)
 	})
-	if ctlReal < int64(n) {
-		t.Fatalf("SETUP: the control refreshed %d < %d cells — the arm never reached the window", ctlReal, n)
-	}
-	if gotReal != ctlReal {
-		t.Fatalf("#378 F4a RED: the re-mint arm ran %d real resolves vs %d with the window predicate forced false — "+
-			"the re-mint WRITE must ride refreshes that happen anyway, never add one (0.30.185 amplification). "+
-			"Note this compares the write, not the #506 deadline TRIGGER, which runs in both arms and "+
-			"deliberately does add refreshes", gotReal, ctlReal)
+	if gotReal != ctlReal || !reflect.DeepEqual(gotTicks, ctlTicks) {
+		t.Fatalf("#378 F4a RED: the re-mint arm ran %d real resolves (per tick %v) vs %d (per tick %v) with the window "+
+			"predicate forced false — the re-mint WRITE must ride refreshes that happen anyway, never add one "+
+			"(0.30.185 amplification). Note this compares the write, not the #506 deadline TRIGGER, which runs in "+
+			"both arms and deliberately does add refreshes", gotReal, gotTicks, ctlReal, ctlTicks)
 	}
 	bad := 0
 	for _, r := range resets {

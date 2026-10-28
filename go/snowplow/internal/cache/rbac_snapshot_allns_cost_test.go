@@ -12,18 +12,22 @@
 //   - Memory within the ~4 MB envelope — measured on the flat index ALONE
 //     (replicating the production append logic so the per-ns maps are not in
 //     the delta) and reported as the actual number.
-//   - Rebuild stays well within the ≤100 ms envelope (reported; a generous
-//     assertion catches an accidental O(n²)).
+//   - #930 — the cost is asserted as WORK, not time: the bytes and the
+//     allocations the rebuild makes grow LINEARLY with the subjects (doubling
+//     the snapshot doubles them; an accidental O(n²) copy quadruples them). The
+//     rebuild's wall time is BenchmarkV7Step2A_FC2_RebuildSubjectIndexes: a
+//     2 s pass/fail limit read 3.8–5.3 s at load ~40 on the shared host with
+//     the same code (it normally takes 100–500 ms under -race).
 //
 // White-box (package cache) so it can call rebuildSubjectIndexes and read the
 // unexported build. Hermetic: no cluster, no watcher, no globals touched.
 package cache
 
 import (
+	"math"
 	"runtime"
 	"strconv"
 	"testing"
-	"time"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 )
@@ -35,7 +39,12 @@ import (
 // (narrow-RBAC shape), and a 1% unrecognised-Kind tail (catch-all). Exactly
 // one subject per RB, so Σ|subjects| == RB count.
 func buildAllNSCostSnapshot(t testing.TB) (snap *RBACSnapshot, rbCount, subjectCount int) {
-	const target = 63316
+	return buildAllNSCostSnapshotN(63316)
+}
+
+// buildAllNSCostSnapshotN is buildAllNSCostSnapshot with target RoleBindings of
+// the same shape.
+func buildAllNSCostSnapshotN(target int) (snap *RBACSnapshot, rbCount, subjectCount int) {
 	const nsCount = 1000
 	snap = &RBACSnapshot{
 		RoleBindingsByNS:   make(map[string][]*rbacv1.RoleBinding, nsCount),
@@ -83,13 +92,26 @@ func TestV7Step2A_FC2_AllNSIndexCost(t *testing.T) {
 	t.Logf("F-C2 fixture: %d RoleBindings across %d namespaces, %d subjects total",
 		rbCount, len(snap.RoleBindingsByNS), subjectCount)
 
-	// ── Time the production rebuild (builds per-ns AND flat indexes). ──
-	start := time.Now()
-	rebuildSubjectIndexes(snap)
-	elapsed := time.Since(start)
-	t.Logf("F-C2 rebuildSubjectIndexes(%d RBs) = %v (design envelope ≤100ms)", rbCount, elapsed)
-	if elapsed > 2*time.Second {
-		t.Errorf("F-C2 FAIL: rebuild took %v — far outside envelope, suspect O(n²)", elapsed)
+	// ── #930 — the production rebuild's WORK (per-ns AND flat indexes), at
+	// this size and at twice it. Linear work doubles; the growth exponent
+	// log2(work(2n)/work(n)) is ~1 for a linear rebuild and ~2 for an O(n²) one
+	// (a slice copied on every append), and 1.5 — the midpoint — tells them
+	// apart. Measured on this tree under -race: bytes 1.04–1.07, allocations
+	// 0.97. The counts are a property of the code, not of the host's load. ──
+	bytes1, allocs1 := fc2RebuildWork(snap)
+	snap2, _, subjects2 := buildAllNSCostSnapshotN(2 * rbCount)
+	bytes2, allocs2 := fc2RebuildWork(snap2)
+	snap2 = nil
+	expBytes := math.Log2(float64(bytes2) / float64(bytes1))
+	expAllocs := math.Log2(float64(allocs2) / float64(allocs1))
+	t.Logf("F-C2 rebuildSubjectIndexes work: %d subjects → %d B in %d allocs (%.0f B, %.2f allocs per subject); "+
+		"%d subjects → %d B in %d allocs; growth exponent bytes %.2f allocs %.2f",
+		subjectCount, bytes1, allocs1, float64(bytes1)/float64(subjectCount), float64(allocs1)/float64(subjectCount),
+		subjects2, bytes2, allocs2, expBytes, expAllocs)
+	if expBytes >= 1.5 || expAllocs >= 1.5 {
+		t.Errorf("F-C2 FAIL: doubling the subjects multiplied the rebuild's bytes by %.2f and its allocations by %.2f "+
+			"(growth exponents %.2f / %.2f, want < 1.5) — the index build is not linear, suspect O(n²)",
+			float64(bytes2)/float64(bytes1), float64(allocs2)/float64(allocs1), expBytes, expAllocs)
 	}
 
 	// ── LINEAR: one flat entry per subject landing. ──
@@ -195,5 +217,28 @@ func TestV7Step2A_FC2_AllNSIndexCost(t *testing.T) {
 	if perNSBytes > 0 && float64(flatBytes) > 2.5*float64(perNSBytes) {
 		t.Errorf("F-C2 FAIL: flat all-ns index %.2f MB is %.2fx the per-ns index %.2f MB (>2.5x) — suspect struct copy or superlinear growth",
 			flatMB, float64(flatBytes)/float64(perNSBytes), perNSMB)
+	}
+}
+
+// fc2RebuildWork runs rebuildSubjectIndexes(snap) once and returns the bytes
+// and the allocations it made (runtime.MemStats TotalAlloc / Mallocs deltas).
+func fc2RebuildWork(snap *RBACSnapshot) (bytes, allocs uint64) {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	rebuildSubjectIndexes(snap)
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc, after.Mallocs - before.Mallocs
+}
+
+// BenchmarkV7Step2A_FC2_RebuildSubjectIndexes times the F-C2 rebuild over the
+// ~63,316-RB snapshot (design envelope ≤ 100 ms). #930: time is a benchmark's
+// reading, never a unit arm's pass/fail.
+func BenchmarkV7Step2A_FC2_RebuildSubjectIndexes(b *testing.B) {
+	snap, _, _ := buildAllNSCostSnapshot(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rebuildSubjectIndexes(snap)
 	}
 }

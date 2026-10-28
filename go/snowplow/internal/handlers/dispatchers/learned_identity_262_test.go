@@ -263,7 +263,12 @@ func TestF4_262_BoundHolds_EngineBindsFirst(t *testing.T) {
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "1")
 	users, secrets := l262ManyUsers(t, 5)
 	env := l262Setup(t, l262Opts{extraUsers: users, secrets: secrets, widgets: 2, ras: 2})
-	l262Stubs(t, l262StubOpts{widgetSleep: 40 * time.Millisecond, raSleep: 60 * time.Millisecond})
+	// #930 — the costs are VIRTUAL: each resolve advances the injected seedClock
+	// by its kind's cost instead of sleeping, so the bound's inputs (t_widget,
+	// t_ra) and the keepwarm cycle are sums of the resolves the engine actually
+	// ran, not readings of a loaded host's wall clock.
+	clk := l262VirtualClock(t)
+	l262Stubs(t, l262StubOpts{widgetSleep: 40 * time.Millisecond, raSleep: 60 * time.Millisecond, clock: clk})
 	l262WaitLearned(t, 5)
 	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR, l262TargetGVR) // #841: the base cohort's group-only member is a known requester
 	phases := l262ObservePhases(t)
@@ -331,13 +336,30 @@ func TestF4_262_BoundHolds_EngineBindsFirst(t *testing.T) {
 	// THE CYCLE FITS THE INTERVAL: once every cell is past the keepwarm
 	// age-skip threshold, one keepwarm pass re-resolves the base cohort and the
 	// admitted classes — inside one sweep interval.
+	//
+	// #930 — the cycle is read on the VIRTUAL clock: it is exactly the sum of the
+	// costs of the resolves the pass ran (2 widgets + 2 RESTActions per base
+	// cohort and per admitted class). Before #930 it was real elapsed time and a
+	// loaded host read 799.6 ms and 935.6 ms against the 750 ms interval with the
+	// same work. The sleep below only AGES the cells past the store's age-skip
+	// threshold (the store's clock is real here); a longer sleep can only age them
+	// more, so it cannot change which resolves the pass runs.
 	time.Sleep(keepwarmAgeSkipThreshold() + 50*time.Millisecond)
-	start := time.Now()
+	start := clk.now()
 	l262Boot(t, env, seedModeKeepwarm)
-	cycle := time.Since(start)
-	t.Logf("F4 keepwarm cycle: %v (interval %v) over %d admitted classes", cycle, interval, len(phases.get("keepwarm")))
+	cycle := clk.now().Sub(start)
+	kw := phases.get("keepwarm")
+	wantCycle := time.Duration(baseW)*tW + time.Duration(baseR)*tR + time.Duration(len(kw))*classCost
+	t.Logf("F4 keepwarm cycle: %v (interval %v, base %d+%d units + %d admitted classes × %v = %v)",
+		cycle, interval, baseW, baseR, len(kw), classCost, wantCycle)
+	if cycle != wantCycle {
+		t.Fatalf("F4 RED: the keepwarm cycle cost %v, want exactly the base cohort plus the %d classes it ran = %v", cycle, len(kw), wantCycle)
+	}
 	if cycle > interval {
 		t.Fatalf("F4 RED: a keepwarm cycle over the admitted set took %v, longer than the %v sweep interval", cycle, interval)
+	}
+	if !l262SameKeys(kw, ra) {
+		t.Fatalf("F4 RED: the keepwarm pass ran %d classes, want exactly the %d RA-phase admitted classes", len(kw), len(ra))
 	}
 }
 

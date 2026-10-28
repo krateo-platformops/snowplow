@@ -61,8 +61,8 @@ const (
 	// Task #321 (#318-R1a) — per-key re-resolve RATE-FLOOR. The minimum
 	// interval, in seconds, between SUCCESSFUL re-resolves of any one L1
 	// key on the refresher dequeue path. When an entry is younger than
-	// this floor (time.Since(entry.CreatedAt) < floor — CreatedAt is the
-	// wall-clock of the last successful Put, resolved.go:767-768), the
+	// this floor (store.Now() − entry.CreatedAt < floor — CreatedAt is the
+	// store-clock instant of the last successful Put, #930), the
 	// dequeued key is NOT re-resolved now: it is Forgotten (reset backoff,
 	// we are NOT failing) and re-scheduled via AddAfter(remaining) onto the
 	// SAME tier queue it was drawn from, then the worker returns. The
@@ -269,6 +269,10 @@ type refresher struct {
 	inFlightMu   sync.Mutex
 	inFlightKeys map[string]bool
 
+	// work (#930) counts the keys queued or in a worker's hands across every
+	// tier (refresher_quiescence.go).
+	work *refresherWorkCount
+
 	handlersMu sync.RWMutex
 	handlers   map[string]RefreshFunc
 
@@ -440,16 +444,20 @@ func refresherSingleton() *refresher {
 			time.Duration(baseMS)*time.Millisecond,
 			time.Duration(maxMS)*time.Millisecond,
 		)
+		// #930 — every tier counts its outstanding work into one total
+		// (refresher_quiescence.go).
+		work := newRefresherWorkCount()
 		r := &refresher{
 			parallelism:      parallelism,
-			queue:            workqueue.NewTypedRateLimitingQueue[string](rl),
-			clusterListQueue: workqueue.NewTypedRateLimitingQueue[string](clRL),
+			work:             work,
+			queue:            newRefresherTierQueue("refresher_normal", rl, work, nil),
+			clusterListQueue: newRefresherTierQueue("refresher_cluster_list", clRL, work, nil),
 			inFlightKeys:     map[string]bool{},
 			handlers:         map[string]RefreshFunc{},
 			resolveLatency:   newP2Quantile(0.95),
 			dirtyStats:       newDirtyWindowStats(),
 		}
-		r.viewedQueue = newViewedQueue(vRL, r.wakeViewed)
+		r.viewedQueue = newViewedQueue(vRL, r.wakeViewed, work)
 		refresherInstance.Store(r)
 	})
 	return refresherInstance.Load()
@@ -645,7 +653,7 @@ func (r *refresher) onDirtyMark(l1Key string, triggerGVR schema.GroupVersionReso
 	// #354 P3 — open the key's invalidation→fresh window (first mark wins). A
 	// #375 remark reaches here through enqueueRemark, so it is a mark too. Not
 	// on the drop branch above: a non-resident key has no cell to be stale.
-	r.markDirty(l1Key, time.Now())
+	r.markDirty(l1Key, windowNow())
 	// Path 3.2 / 0.30.218 — two-tier dispatch. If the key is a
 	// registered cluster_list cell, route it to the
 	// HIGH-PRIORITY tier; otherwise the normal tier. The
@@ -1107,7 +1115,8 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		return true
 	}
 	if floor := r.rateFloor(); floor > 0 && ok && entry != nil {
-		if elapsed := time.Since(entry.CreatedAt); elapsed < floor {
+		// #930 — the entry's age on the STORE clock, the one that stamped CreatedAt.
+		if elapsed := c.now().Sub(entry.CreatedAt); elapsed < floor {
 			// Floored: the entry's content is younger than the floor, so a
 			// re-resolve now is redundant. Do NOT drop the mark — defer it.
 			// Forget clears any backoff (we are NOT failing); AddAfter

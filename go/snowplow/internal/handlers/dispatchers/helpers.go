@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/env"
@@ -688,6 +689,10 @@ func inlineParentIdentityForKey(ctx context.Context, cr map[string]any) map[stri
 // so it never leaks beyond dispatchers.
 type cacheHandle interface {
 	Get(key string) (*cache.ResolvedEntry, bool)
+	// #930 — Now is the store clock: a cell's age (the keep-warm age-skip) is
+	// Now() minus the CreatedAt the store stamped on that clock, never
+	// time.Since, so the decision and the store's own TTL agree on one clock.
+	Now() time.Time
 	// #376 — GetNoTouch is Get minus the three customer-warmth stamps (MoveToFront,
 	// lastRead, hit_total) and the miss accounting; it KEEPS the lazy TTL/maxAge
 	// evicts. Internal seed-sweep reads (phase1_pip_seed seedSkipDecision) use it so

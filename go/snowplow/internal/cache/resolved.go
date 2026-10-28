@@ -749,6 +749,17 @@ type ResolvedCacheStore struct {
 	// #603 PR-0). nil until DepTracker.SetStore installs it.
 	entryClassNote atomic.Pointer[entryClassFn]
 
+	// clock (#930) is the store's time source: every instant the store stamps on
+	// a cell (CreatedAt, BornAt, lastRead) and every age it compares against a
+	// bound (TTL, maxEntryAge, the #378 re-mint window, the #316 refresh lead)
+	// is read from it, so ONE clock decides a cell's whole lifetime. nil reads
+	// time.Now, which is all production ever uses. A test installs a virtual
+	// clock to drive the reaper and the lazy bounds through exact instants
+	// instead of sleeping through real ones (issue378_remint_test.go F4a).
+	// Pure work-duration measurements (the batch hold timers) stay on the real
+	// clock: they time this process, not a cell.
+	clock atomic.Pointer[func() time.Time]
+
 	// LRU eviction order: front = most-recently-used.
 	order *list.List
 	// layers — #406: the raKey <-> widget consumer index (ra_full_list_layers.go).
@@ -1242,6 +1253,37 @@ func ResolvedCache() *ResolvedCacheStore {
 
 // newResolvedCache constructs a fresh cache. Exported for tests; in
 // production the singleton path goes through ResolvedCache().
+// now is the store clock (see ResolvedCacheStore.clock).
+func (c *ResolvedCacheStore) now() time.Time {
+	if f := c.clock.Load(); f != nil {
+		return (*f)()
+	}
+	return time.Now()
+}
+
+// Now reads the store clock. Every age of a stamp this store made on a cell
+// (CreatedAt, BornAt) is Now() minus that stamp, wherever it is decided — the
+// keep-warm age-skip and the /debug views read it here, never time.Now, so one
+// clock decides a cell's age in and out of the store (#930). Nil-safe.
+func (c *ResolvedCacheStore) Now() time.Time {
+	if c == nil {
+		return time.Now()
+	}
+	return c.now()
+}
+
+// SetClockForTest installs now as the store clock (nil: time.Now) and returns
+// the restore. TEST-ONLY: production never calls it.
+func (c *ResolvedCacheStore) SetClockForTest(now func() time.Time) (restore func()) {
+	prev := c.clock.Load()
+	if now == nil {
+		c.clock.Store(nil)
+	} else {
+		c.clock.Store(&now)
+	}
+	return func() { c.clock.Store(prev) }
+}
+
 func newResolvedCache(maxEntries int, maxBytes int64, ttl time.Duration) *ResolvedCacheStore {
 	if maxEntries <= 0 {
 		maxEntries = defaultResolvedCacheMaxEntries
@@ -1475,7 +1517,7 @@ func (c *ResolvedCacheStore) noteServeWhileDirty(key string) {
 		return
 	}
 	c.staleServedTotal.Add(1)
-	c.staleServedAge.observe(float64(time.Since(s.t0).Milliseconds()))
+	c.staleServedAge.observe(float64(windowNow().Sub(s.t0).Milliseconds()))
 	noteKnownStaleServe(s)
 }
 
@@ -1516,7 +1558,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 	// #315/#316 — one time reference for both bound checks AND the lastRead
 	// stamp below, so the read-recency signal is exactly the instant the two
 	// lazy bounds are evaluated against (no second time.Now, no new lock).
-	now := time.Now()
+	now := c.now()
 	// R1 Layer 2 (#36): a per-entry TTLOverride (the short
 	// CATALOG_UNSERVABLE_TTL_SECONDS set on entries stored while their GVR
 	// was not servable) takes precedence over the store's standard ttl, so a
@@ -1929,7 +1971,7 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 		c.mu.Unlock()
 		return false
 	}
-	now := time.Now()
+	now := c.now()
 	freshMint := c.inRemintWindowLocked(el.Value.(*lruItem), now)
 	if freshMint {
 		// A fresh birth NOW (not the caller's CreatedAt, which may have been
@@ -2179,13 +2221,13 @@ func (c *ResolvedCacheStore) bumpGenTombstoneLocked(key string, gen uint64) {
 	if c.tombstones == nil {
 		c.tombstones = map[string]tombstone{}
 	}
-	c.tombstones[key] = tombstone{gen: gen + 1, expireAt: time.Now().Add(c.tombstoneTTL)}
+	c.tombstones[key] = tombstone{gen: gen + 1, expireAt: c.now().Add(c.tombstoneTTL)}
 	c.maybeSweepTombstonesLocked()
 }
 
 // tombstoneExpiredLocked reports whether t is past its window. Callers hold c.mu.
 func (c *ResolvedCacheStore) tombstoneExpiredLocked(t tombstone) bool {
-	return !t.expireAt.IsZero() && time.Now().After(t.expireAt)
+	return !t.expireAt.IsZero() && c.now().After(t.expireAt)
 }
 
 // maybeSweepTombstonesLocked amortises expired-tombstone reclamation to at most
@@ -2197,7 +2239,7 @@ func (c *ResolvedCacheStore) maybeSweepTombstonesLocked() {
 	if c.tombstoneTTL <= 0 || len(c.tombstones) == 0 {
 		return
 	}
-	now := time.Now()
+	now := c.now()
 	if !c.tombstoneSweepAt.IsZero() && now.Sub(c.tombstoneSweepAt) < c.tombstoneTTL {
 		return
 	}
@@ -2227,7 +2269,7 @@ func (c *ResolvedCacheStore) SetTombstoneTTL(d time.Duration) {
 // (both marshal/hash work that does not need the store lock).
 func (c *ResolvedCacheStore) putPreamble(entry *ResolvedEntry) (bytes int64, extrasHash string) {
 	if entry.CreatedAt.IsZero() {
-		entry.CreatedAt = time.Now()
+		entry.CreatedAt = c.now()
 	}
 	// 1.12.6 C5 — a first Put is the entry's birth; a replace-in-place Put
 	// INHERITS the prior entry's BornAt in putCoreLocked, so a refresh re-Put
@@ -2990,7 +3032,7 @@ func (c *ResolvedCacheStore) RangeMetadata(fn func(ResolvedEntryMeta) bool) {
 	if c == nil {
 		return
 	}
-	now := time.Now()
+	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for el := c.order.Front(); el != nil; el = el.Next() {
@@ -3044,7 +3086,7 @@ func (c *ResolvedCacheStore) rangeMetadataBatched(batch int, fn func(metas []Res
 		keys = keys[n:]
 		metas := make([]ResolvedEntryMeta, 0, n)
 		warms := make([]bool, 0, n)
-		now := time.Now()
+		now := c.now()
 		t1 := time.Now()
 		c.mu.Lock()
 		for _, k := range chunk {
@@ -3082,7 +3124,7 @@ func (c *ResolvedCacheStore) RangeMetadataSample(n int, fn func(ResolvedEntryMet
 	if c == nil || n <= 0 {
 		return
 	}
-	now := time.Now()
+	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	seen := 0
@@ -3200,7 +3242,7 @@ func (c *ResolvedCacheStore) MetadataForKey(key string) (ResolvedEntryMeta, bool
 	if c == nil || key == "" {
 		return out, false
 	}
-	now := time.Now()
+	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for el := c.order.Front(); el != nil; el = el.Next() {
@@ -3974,7 +4016,7 @@ func (c *ResolvedCacheStore) reapOneMaxAgeSuppressed(key string) bool {
 		return false // un-suppressed since the walk (e.g. a customer re-Put) — R2 leaves it
 	}
 	item := el.Value.(*lruItem)
-	if item.entry == nil || item.entry.BornAt.IsZero() || time.Since(item.entry.BornAt) <= c.maxEntryAge {
+	if item.entry == nil || item.entry.BornAt.IsZero() || c.now().Sub(item.entry.BornAt) <= c.maxEntryAge {
 		return false // read/re-validated young — never over-evict a within-cap cell
 	}
 	if item.entry.incremental() {
@@ -4012,14 +4054,14 @@ func (c *ResolvedCacheStore) reapOneMaxAgeCold(key string) bool {
 		return false // became suppressed since the walk — the #248 path owns it next tick
 	}
 	item := el.Value.(*lruItem)
-	if item.entry == nil || item.entry.BornAt.IsZero() || time.Since(item.entry.BornAt) <= c.maxEntryAge {
+	if item.entry == nil || item.entry.BornAt.IsZero() || c.now().Sub(item.entry.BornAt) <= c.maxEntryAge {
 		return false // young / re-validated within cap
 	}
 	if item.entry.incremental() {
 		return false // #882 F1 — no max entry age applies to an incremental cell
 	}
 	// C3 re-validation: a Get between the walk and now stamps lastRead=now → warm.
-	if c.warmLocked(item, time.Now()) {
+	if c.warmLocked(item, c.now()) {
 		return false // served/seeded since the walk — NEVER evict a warm cell (C3)
 	}
 	c.removeElementLocked(el)
