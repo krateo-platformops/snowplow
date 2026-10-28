@@ -571,6 +571,10 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if what.startswith("portals."):
             items([cr("Portal", "portal", True)])
         if what.startswith("restdefinitions."):
+            if os.environ.get("FAKE_RDS_FORBIDDEN") == "1":
+                sys.stderr.write('Error from server (Forbidden): restdefinitions.ogen.krateo.io is forbidden: '
+                                 'User "scaleuser-0001" cannot list resource "restdefinitions"\\n')
+                sys.exit(1)
             items(json.loads(os.environ.get("FAKE_RDS", "[]")))
         if what.startswith("compositiondefinitions."):
             cds = [cr("CompositionDefinition", "authn", True)]

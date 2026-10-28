@@ -5332,13 +5332,18 @@ def _cmd_evaluate(a) -> int:
     result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]
     # the platform's create handshakes (diag606 definitions): WEDGED expected 0, said when not
     from bench import diag606
-    plat = diag606.platform_report([r for r in recs if r.get("kind") == "platform_definitions"])
+    plat = diag606.platform_report([r for r in recs if r.get("kind") == "platform_definitions"],
+                                   [r for r in recs if r.get("kind") == "platform_definitions_cap"])
     result["report"]["platform"] = plat
-    if plat.get("wedged"):
-        result["report"].setdefault("report_warnings", []).append(
-            f"platform: {plat['wedged']} WEDGED create(s) (a pending marker older than "
-            f"{plat['wedge_after_s']:g} s, expected 0): " + ", ".join(
-                w["id"] for s in plat["snapshots"] for w in s["wedged"]))
+    warn = result["report"].setdefault("report_warnings", [])
+    for state, n in (("WEDGED", plat.get("wedged")), ("UNKNOWN", plat.get("unknown"))):
+        if n:
+            warn.append(f"platform: {n} {state} create(s) (expected 0 WEDGED; UNKNOWN = no window to judge "
+                        f"by): " + ", ".join(sorted({f["id"] for s in plat["snapshots"] for f in s["flagged"]
+                                                     if f["state"] == state})))
+    for c in plat.get("cap_hits") or []:
+        warn.append(f"platform: the definitions snapshot at {c.get('at')} hit its {c.get('cap_s')} s cap: "
+                    f"incomplete")
     from bench import custlat
     _cluster_sample_reports(result["report"], recs, a.apf, custlat.calls((k6 or {}).get("k6")),
                             (k6 or {}).get("browser"))

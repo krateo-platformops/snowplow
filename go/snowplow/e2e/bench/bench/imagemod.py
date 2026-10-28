@@ -18,7 +18,6 @@ module asked for.
 
 from __future__ import annotations
 
-import gzip
 import io
 import json
 import re
@@ -74,6 +73,53 @@ def resolve(path: str, links: dict[str, str]) -> str:
         else:
             out = cur
     return out
+
+
+class Oversize(RuntimeError):
+    """A blob that sends more bytes than its manifest declared: refused, never read further."""
+
+
+class _Bounded(io.RawIOBase):
+    """A blob stream that refuses to yield more than the manifest's declared
+    size: memory stays bounded by the chunk being read, and a registry (or a
+    proxy) sending more than it declared is refused loudly."""
+
+    def __init__(self, resp, limit: int, what: str):
+        self.resp, self.limit, self.what, self.n = resp, limit, what, 0
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        k = self.resp.readinto(b) if hasattr(self.resp, "readinto") else None
+        if k is None:
+            chunk = self.resp.read(len(b))
+            k = len(chunk)
+            b[:k] = chunk
+        self.n += k
+        if self.n > self.limit:
+            raise Oversize(f"{self.what}: more than its declared {self.limit} bytes; refused")
+        return k
+
+
+_CHUNK = 1 << 20
+# a Go build-info `dep` line is a module path, a version and a sum: far shorter than this, so
+# a line cut by a chunk boundary is whole in the overlap
+_OVERLAP = 1 << 13
+
+
+def _scan_deps(fh) -> dict[str, dict]:
+    """build_deps over a member read in chunks (bounded memory), each chunk
+    with the previous chunk's tail, so no line is lost at a boundary."""
+    deps: dict[str, dict] = {}
+    tail = b""
+    while True:
+        chunk = fh.read(_CHUNK)
+        if not chunk:
+            return deps
+        data = tail + chunk
+        deps.update(build_deps(data))
+        tail = data[-_OVERLAP:]
 
 
 class Registry:
@@ -140,8 +186,14 @@ def image_deps(ref: str, modules: tuple[str, ...], *, command: list[str] | None 
     reg, repo, ref_ = parse_ref(ref)
     r = Registry(reg, repo, opener=opener, scheme=_scheme(reg))
     man = r.manifest(ref_)
+
+    def declared(d: dict, what: str) -> int:
+        if not isinstance(d.get("size"), int):
+            raise Oversize(f"{what} {d.get('digest')}: the manifest declares no size; refused")
+        return d["size"]
     with r.blob(man["config"]["digest"]) as resp:
-        cfg = (json.loads(resp.read()).get("config") or {})
+        cfg = (json.loads(_Bounded(resp, declared(man["config"], "config"), "config").read()
+                          or b"{}").get("config") or {})
     argv = list(command or cfg.get("Entrypoint") or cfg.get("Cmd") or [])
     entry = argv[0] if argv else None
     binaries: dict[str, dict] = {}
@@ -149,10 +201,13 @@ def image_deps(ref: str, modules: tuple[str, ...], *, command: list[str] | None 
     seen: set[str] = set()
     layers = man.get("layers") or []
     for layer in reversed(layers):                       # top layer first: an upper file hides a lower one
-        with r.blob(layer["digest"]) as resp:
-            raw = resp.read()
-        data = gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
+        mt = layer.get("mediaType") or ""
+        if "zstd" in mt:
+            raise Oversize(f"layer {layer.get('digest')}: {mt} is not a compression this reader streams; refused")
+        limit = declared(layer, "layer")
+        with r.blob(layer["digest"]) as resp, tarfile.open(
+                fileobj=io.BufferedReader(_Bounded(resp, limit, f"layer {layer['digest']}"), _CHUNK),
+                mode="r|*") as tar:                      # a stream: gzip or plain, never all in memory
             for mem in tar:
                 path = "/" + mem.name.lstrip("./").rstrip("/")
                 if path in seen:
@@ -166,7 +221,7 @@ def image_deps(ref: str, modules: tuple[str, ...], *, command: list[str] | None 
                 fh = tar.extractfile(mem)
                 if fh is None or fh.read(4) != b"\x7fELF":
                     continue
-                deps = build_deps(fh.read())
+                deps = _scan_deps(fh)
                 hit = next((m for m in modules if m in deps), None)
                 if hit:
                     binaries[path] = {"module": hit, **deps[hit]}
