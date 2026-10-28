@@ -83,6 +83,8 @@ type getRecordingHandle struct {
 	noTouchKeys []string // #376 — internal no-stamp GetNoTouch() calls
 }
 
+func (h *getRecordingHandle) Now() time.Time { return time.Now() }
+
 func (h *getRecordingHandle) Get(key string) (*cache.ResolvedEntry, bool) {
 	h.mu.Lock()
 	h.getKeys = append(h.getKeys, key)

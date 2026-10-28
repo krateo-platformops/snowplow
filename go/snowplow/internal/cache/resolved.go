@@ -1261,6 +1261,17 @@ func (c *ResolvedCacheStore) now() time.Time {
 	return time.Now()
 }
 
+// Now reads the store clock. Every age of a stamp this store made on a cell
+// (CreatedAt, BornAt) is Now() minus that stamp, wherever it is decided — the
+// keep-warm age-skip and the /debug views read it here, never time.Now, so one
+// clock decides a cell's age in and out of the store (#930). Nil-safe.
+func (c *ResolvedCacheStore) Now() time.Time {
+	if c == nil {
+		return time.Now()
+	}
+	return c.now()
+}
+
 // SetClockForTest installs now as the store clock (nil: time.Now) and returns
 // the restore. TEST-ONLY: production never calls it.
 func (c *ResolvedCacheStore) SetClockForTest(now func() time.Time) (restore func()) {

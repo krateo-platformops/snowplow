@@ -359,9 +359,18 @@ func TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow(t *testing.T) {
 	f0 := p3RefStat("floored")
 	c := p3PutCell(t, store, "f6c-floor", `{"v":"old"}`)
 	cache.Deps().OnUpdate(p3GVR, p3NS, c.name)
-	p3Wait(t, 5*time.Second, "the floored dequeue", func() bool { return p3RefStat("floored") > f0 })
+	// The deferred re-dequeue fires after the floor in REAL time (the delaying
+	// queue's clock), but the store clock has not moved: the cell is still 0 s
+	// old on the clock that stamped it, so that dequeue is floored again and
+	// nothing resolves. A floor that read the entry's age on the wall clock would
+	// resolve here instead. Wait for whichever comes first.
+	p3Wait(t, 10*time.Second, "a second floored dequeue or a resolve", func() bool {
+		return p3RefStat("floored") >= f0+2 || calls.Load() > 0
+	})
 	if calls.Load() != 0 {
-		t.Fatalf("PRE: a dequeue resolved before the floor expired on the clock (calls=%d)", calls.Load())
+		t.Fatalf("F6c RED: a dequeue resolved while the cell was 0 s old on the store clock (calls=%d floored Δ=%d) — "+
+			"the rate floor reads the entry's age on a clock other than the one that stamped CreatedAt",
+			calls.Load(), p3RefStat("floored")-f0)
 	}
 	clk.advance(deferral)
 	close(advanced)

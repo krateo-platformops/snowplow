@@ -884,14 +884,16 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 		// at or beyond the threshold is re-resolved (return false). Strict `<`
 		// mirrors the store's strict `>` expiry so a cell AT the threshold is
 		// re-resolved, never left to race the expiry edge.
-		if time.Since(entry.CreatedAt) < keepwarmAgeSkipThreshold() {
+		// #930 — the age on the STORE clock, the one that stamped CreatedAt.
+		age := handle.Now().Sub(entry.CreatedAt)
+		if age < keepwarmAgeSkipThreshold() {
 			keepwarmAgeSkipTotal.Add(1)
 			slog.Default().Debug("phase1.seed.keepwarm_age_skip",
 				slog.String("subsystem", "cache"),
 				slog.String("class", class),
 				slog.String("target", target),
 				slog.String("cohort", cohortLabel.String()),
-				slog.Int64("age_ms", time.Since(entry.CreatedAt).Milliseconds()),
+				slog.Int64("age_ms", age.Milliseconds()),
 				slog.Int64("threshold_ms", keepwarmAgeSkipThreshold().Milliseconds()),
 				slog.String("effect", "keepwarm age-skip: live cell younger than TTL/4; resolve+Put "+
 					"skipped (cell survives to next sweep at age<TTL; refresher/customer-Put dedup)"),

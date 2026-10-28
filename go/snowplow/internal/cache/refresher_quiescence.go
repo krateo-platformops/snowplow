@@ -98,8 +98,10 @@ func newRefresherTierQueue(name string, rl workqueue.TypedRateLimiter[string], w
 }
 
 // RefresherWork is one reading of the refresher's work: Outstanding keys queued
-// or in a worker's hands across every tier, and the deferred re-adds scheduled
-// so far (Floored rate-floor deferrals, Retried error backoffs).
+// or in a worker's hands across every tier (normal, viewed, cluster_list), and
+// the deferred re-adds SCHEDULED so far (Floored rate-floor deferrals, Retried
+// error backoffs — counted when scheduled, not when they fire). It is the
+// refresher's queues only: the scope WaitRefresherQuiescentForTest states.
 type RefresherWork struct {
 	Outstanding      int64
 	Floored, Retried uint64
@@ -120,6 +122,23 @@ func RefresherWorkSnapshot() RefresherWork {
 // backoff) was scheduled since base: that one is still to run, so the refresher
 // is not quiescent however empty its tiers read. It wakes on the count reaching
 // zero; timeout bounds a stuck worker only and is never the settle. TEST-ONLY.
+//
+// WHAT A RETURN MEANS. Every key added to any refresher tier (normal, viewed,
+// cluster_list) before or during the wait has been processed to its Done —
+// including re-adds made while a key was processing and keys one tier handed to
+// another — and no rate-floor or error-backoff re-add was scheduled since base.
+//
+// WHAT IT DOES NOT COVER. A caller that needs any of these settled must settle
+// or exclude them itself, and say which (F6 asserts its own scope):
+//   - a deferred re-add scheduled BEFORE base that fires after it: the floored
+//     and retried counters move only when a deferral is scheduled, and client-go
+//     gives no hook for its expiry, so take base before any work can defer;
+//   - work upstream of the queues, which reaches a tier only later or never:
+//     dep events not yet delivered to the dirty-mark hook, the stale-retry
+//     chains' timers (stale_retry.go), detached demand revalidations
+//     (dispatchers/demand_revalidate.go) and D2 debt refills and pushes
+//     (restactions/api/apistage_stale_debt.go). Each of those writes cells or
+//     ends windows without passing through a refresher tier.
 func WaitRefresherQuiescentForTest(base RefresherWork, timeout time.Duration) (RefresherWork, error) {
 	r := refresherPeek()
 	if r == nil {

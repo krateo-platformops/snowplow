@@ -160,6 +160,11 @@ func windowNow() time.Time {
 	return time.Now()
 }
 
+// DirtyWindowNow reads the dirty-window clock. Every age measured from a
+// window's t0 (KnownStale / KnownStaleMark) outside this package — the D2
+// stale-serve age — is DirtyWindowNow() minus that t0, never another clock.
+func DirtyWindowNow() time.Time { return windowNow() }
+
 // SetDirtyWindowClockForTest installs now as the dirty-window clock and returns
 // the restore. TEST-ONLY: production never calls it, so the window reads
 // time.Now.

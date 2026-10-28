@@ -61,8 +61,8 @@ const (
 	// Task #321 (#318-R1a) — per-key re-resolve RATE-FLOOR. The minimum
 	// interval, in seconds, between SUCCESSFUL re-resolves of any one L1
 	// key on the refresher dequeue path. When an entry is younger than
-	// this floor (time.Since(entry.CreatedAt) < floor — CreatedAt is the
-	// wall-clock of the last successful Put, resolved.go:767-768), the
+	// this floor (store.Now() − entry.CreatedAt < floor — CreatedAt is the
+	// store-clock instant of the last successful Put, #930), the
 	// dequeued key is NOT re-resolved now: it is Forgotten (reset backoff,
 	// we are NOT failing) and re-scheduled via AddAfter(remaining) onto the
 	// SAME tier queue it was drawn from, then the worker returns. The
