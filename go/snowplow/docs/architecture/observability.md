@@ -534,8 +534,9 @@ arms from one struct tag each.
 
 `snowplow_informer_confirm_retracted_by_reason` is the `{reason}` breakdown, a map keyed by the
 code path that retracted: `discovery_refresh` / `scoped_confirm` / `walk_confirm` (a **definite-absent**
-successful discovery) and `schema_relist` / `stale_version_pruned` / `crd_deleted` (the informer
-was torn down). It rides alongside rather than inside the tagged family because the C7 tag system
+successful discovery) and `stale_version_pruned` / `crd_deleted` (the informer
+was torn down; #870 deleted `schema_relist` and `store_repair` — a schema change and a repair no
+longer tear it down). It rides alongside rather than inside the tagged family because the C7 tag system
 has no label facility — a `stat` tag yields exactly one scalar.
 
 `snowplow_informer_confirm_retained_unknown_by_reason` is the matching `{reason}` breakdown for the
@@ -664,25 +665,62 @@ signal it exists for with it.
 | `store_repair_ineffective_total` | repairs after which the NEXT verification still reported divergence | **0, and ALARMABLE.** The only stat here whose non-zero means the **detector** is wrong rather than the store: a full relist that does not clear a divergence does not indicate a lost event |
 | `store_repair_unsupported_total` | divergences whose GVR cannot be repaired by a relist at all, because its informer comes from the **shared dynamic factory** — which caches by GVR with no eviction API, so a teardown plus re-register hands back the **stopped** informer and kills the cache for that GVR instead of repairing it | **0** in production, where the streaming path owns the informer for the overwhelming majority of GVRs. Non-zero is the honest statement that this GVR is **detected and never repaired** — a state that would otherwise be indistinguishable from a divergence nobody acted on, and one the permanence bound below does NOT cover. The refused set is a CLASS — *a GVR whose informer is factory-built rather than owned* — determined by construction and recorded at registration, never inferred from the GVR's group. Naming today's members here would make this row wrong the next time informer routing changes |
 | `store_repair_suppressed_total` | GVRs the circuit breaker has latched | **0**. Non-zero means the staleness bound no longer holds for that GVR — it is **unbounded** and the alarm is the only mitigation. Detection continues; the breaker never produces silence |
-| `store_repairs_pending` | GVRs waiting in the serialised repair queue | **0**. Repairs run ONE AT A TIME across all GVRs, so a correlated divergence cannot take the cache non-servable everywhere at once; the price is queue wait, and this is where it shows |
-| `store_repair_queue_age_seconds` | age of the oldest queued repair, measured from detection | **0**. Rising without bound means the serialised queue is not draining — the regime in which the staleness bound (`maxVerificationAge` + **queue wait** + one relist) stops being minutes and becomes hours |
+| ~~`store_repairs_pending`~~, ~~`store_repair_queue_age_seconds`~~ | **Deleted in #870 (1.12.60)** with the serialised repair queue they measured. A build's open window is `store_swap_known_stale_window_open_seconds_max` (below) | — |
 
-A repair **retracts the GVR's confirmation for the whole rebuild window** — minutes at 50K — so
-every resolve for it falls through to the apiserver until the replacement informer syncs. That is
-the deliberate trade of *fast-but-wrong* for *slow-but-correct*, it is the largest single cost in
-this deliverable, and it is why repairs are globally serialised (one in flight across all GVRs,
-waiting for the replacement informer to sync — serialising only the teardown *calls* would leave
-the rebuild *windows* overlapping, and the window is what makes a GVR non-servable) and
-circuit-broken. The log lines are `cache.store.divergent` and `cache.store.repair` at **WARN**, and
+**Since #870 (1.12.60) a repair BUILDS the replacement beside the live informer and swaps it in.**
+The GVR stays servable for the whole build (it keeps its confirmation, and the servability epoch
+does not move), the only apiserver LIST per repair is the new copy's own, and the swap delivers
+exactly the keys whose bytes changed (M) to every handler, as ordinary per-key events. There is no
+queue, no serialisation and no timer: a build ends on an event (its sync installs it; a terminal
+LIST refusal, a GVR teardown or a clean verification pass that leaves it without a reason aborts
+it). The keys the build will change stay **known-stale** until the swap — served from the live
+copy, counted, and pushed at the swap — under the `store_swap_known_stale_*` family below. The log
+lines are `cache.store.divergent` at **WARN**, `cache.store.swap.requested` /
+`cache.store.swap.installed` / `cache.store.swap.build` at INFO (metadata only), and
 `cache.store.repair_ineffective` at **ERROR**.
 
 **What this does and does not close.** Invisibility is closed for every loss class **except a stale
 apiserver watch cache** — see the scope limit above; that qualifier travels with every claim made
-about this deliverable. Staleness is bounded by `maxVerificationAge` + repair-queue wait + one
-relist for a GVR that is repairable and unsuppressed. It is **unbounded** for two classes: a GVR the
+about this deliverable. Staleness is bounded by `maxVerificationAge` + one build (the new
+copy's LIST) for a GVR that is repairable and unsuppressed — the known-stale window, measured by
+`store_swap_known_stale_window_seconds_total`. It is **unbounded** for two classes: a GVR the
 circuit breaker has latched, and **a GVR whose informer is factory-built rather than owned**, which
 is detected, refused out loud, and never repaired. Neither is a bound and neither may be described
 as one.
+
+#### `snowplow_store_swap` and `snowplow_store_swap_known_stale` (#870)
+
+A store repair (reason `divergence`) and a CRD schema change (reason `schema`) build the
+replacement informer beside the live one and swap it in (`store_swap.go`). The scalar counters are
+a tagged family (`snowplow_store_swap`, OTLP `snowplow_store_swap{stat=...}`); the known-stale
+family carries labels and is hand-wired on OTLP (`internal/metrics/store_swap_metrics.go`) and
+published on expvar as `snowplow_store_swap_known_stale` (`<reason>|<outcome>` / `<reason>|<close>`
+keys). Every instant reads the dirty-window clock (#930). No key, body or identity reaches any series.
+
+| stat | meaning | healthy range |
+|---|---|---|
+| `store_swaps_total` | builds installed (swapped in) | tracks repairs + schema changes |
+| `store_swap_superseded_total` | installs superseded by a later install during their retiring wait; the later swap delivered for both | 0; small on bursts of schema changes |
+| `store_swap_m_keys_total` | Σ\|M\|: keys whose bytes differed between the new copy and what the consumers last acted on | small: the changed keys only |
+| `store_swap_deliveries_total` | swap deliveries the dep handler acted on (≤ \|M\|: a key a live event delivered first is skipped, v5.1 C1) | ≤ `store_swap_m_keys_total` |
+| `store_swap_reused_objects_total` | objects a new copy shared with the live copy (equal bytes) | ≈ the store size per swap |
+| `store_swap_regressed_keys` | swap deliveries that pushed a body older than the consumer had (the new copy synced behind); each converges on the new copy's next watch event | 0; rare |
+
+| OTLP instrument (expvar key under `snowplow_store_swap_known_stale`) | labels | meaning |
+|---|---|---|
+| `snowplow_store_swap_known_stale_keys_total` | `reason`, `outcome` | known-stale coordinates per build (`divergence`: the confirmed keys; `schema`: M) |
+| `snowplow_store_swap_known_stale_builds_total` | `reason`, `outcome` | builds with ≥ 1 known-stale coordinate |
+| `snowplow_store_swap_known_stale_window_seconds_total` | `reason`, `outcome` | detection (or the CRD event) → no observed viewer still owed a frame |
+| `snowplow_store_swap_ledger_closes_total` | `reason`, `close` | push-ledger entries closed: `pushed`, `pushed_on_arm`, `pushed_resync` (a frame WRITTEN), `known_stale`, `evicted`, `live_event` |
+| `snowplow_store_swap_detect_to_push_ms` (histogram) | `reason`, `close` | per entry, detection → close |
+| `snowplow_store_swap_install_to_push_ms` (histogram) | `reason`, `close` | per entry, install → close (the shape of `snowplow_apistage_stale_to_push_ms`) |
+| `snowplow_store_swap_known_stale_keys_open` (gauge) | `reason` | known-stale coordinates in open windows |
+| `snowplow_store_swap_known_stale_window_open_seconds_max` (gauge) | `reason` | age of the oldest open window — a window that never ends is visible here |
+| `snowplow_store_swap_ledger_owed` (gauge) | `reason` | entries refreshed with no subscriber now — an expected outcome, not a detector |
+
+`outcome` ∈ `swap`, `abort_clean`, `abort_refused`, `abort_teardown`. The window and the ledger
+are defined in `store_swap_ledger.go`; #710's 10 s bar is exceeded by design for a real loss at
+50K (the window is at least the new copy's LIST), and these counters are that evidence.
 
 #### `snowplow_crd_discovery` stats
 
@@ -706,12 +744,7 @@ as one.
 | `list_refused_still_served_total` | **#807.** refusals declined because the CRD still serves the version (apiserver catching up, or an unsynced informer) | informational; such an informer is never pruned |
 | `refused_version_pruned_total` | **#807.** informers stopped and blocked because their LIST was refused with 404 AND the CRD no longer serves the version | non-zero means a resolver touched a retired version (e.g. a RESTAction that hard-codes it); read with `unserved_version_registrations_refused_total` |
 | `unserved_version_registrations_refused_total` | **#807.** registrations refused because the version is blocked (pruned by #219 or on a refusal, and not served again since) | climbs with every resolver touch of a retired path — each one is a read that falls through to the apiserver instead of a reflector 404-looping forever |
-| `relist_dirtymark_postsync_total` | **1.12.5.** post-sync re-fires of the relist dirty-mark (the containment for the teardown window; stays until the bridge below has soaked) | tracks `schema_relists_fired`; lagging it = relisted informers are not syncing |
-| `relist_postsync_timeout_total` | **1.12.5.** relisted GVRs whose new informer did not sync in time (the re-fire could not run) | **0** |
-| `relist_bridge_runs_total` | **1.12.6 C2.** relist delta bridges spawned (one per relisted GVR with a registered indexer): the old indexer's key set is snapshotted before teardown and diffed against the fresh LIST | tracks `schema_relists_fired` |
-| `relist_bridge_enqueued_total` | **1.12.6 C2.** coordinates the bridge synthesised (old keys the fresh LIST omits) and handed to the dep-event worker, which probes ABSENT and evicts — the DELETEs a fresh informer never emits | moves only when objects vanish inside a teardown window |
-| `relist_bridge_timeout_total` | **1.12.6 C2 — the SOAK SIGNAL.** bridges that gave up because the fresh informer never synced (`RELIST_BRIDGE_TIMEOUT_SECONDS`). The 1.12.5 re-fire is retired only after this has stayed at **0** across real CRD schema changes on a healthy cluster; > 0 means the bridge is not covering the window and the re-fire must stay | **0** |
-| `relist_bridge_aborted_total` | **1.12.6 C2.** bridges with nothing to diff (no sync channel / GVR removed while waiting) | 0; small on CRD deletions |
+| ~~`relist_dirtymark_postsync_total`~~, ~~`relist_postsync_timeout_total`~~, ~~`relist_bridge_{runs,enqueued,timeout,aborted}_total`~~ | **Deleted in #870 (1.12.60)** with the 1.12.5 post-sync re-fire and the 1.12.6 C2 relist bridge: a schema change no longer tears the informer down, so there is no teardown window to contain or bridge. See `snowplow_store_swap` above | — |
 
 ### Dependency tracker + DELETE eviction bridge — "is invalidation actually happening?" (1.12.5)
 Defined in `internal/cache/deps_expvar.go`; counters in `deps.go` (`DepStats`) and
@@ -738,7 +771,6 @@ The stats that answer an invalidation question:
 | `remove_l1_total` | L1 keys whose dep records were removed (entry evicted or re-Put with a new edge set) | tracks evictions |
 | `evict_delete_total` | L1 entries evicted by an **informer DELETE** (`OnDelete` bucket 1). Deliberately does NOT include the refresher's self-404 evictions — one counter, one meaning | moves whenever a CR with a live L1 entry is deleted. **Frozen across a known deletion = DELETE handling is not reaching the store** — the strongest single test, and it only works because this counter is not folded |
 | `evict_self_gone_total` | L1 entries evicted because the refresher's re-fetch of their own object returned a confirmed **404** across the **whole** requeue budget — 404 ONLY (a non-404 drop evicts nothing since #547: the cell stays KNOWN-STALE), so this counter keeps meaning "the object is confirmed gone" even during an apiserver outage | non-zero is **normal** on a cluster that deletes CRs |
-| `relist_dirtymark_postsync_total` | CRD schema relists that re-fired the dependent dirty-mark after the new informer synced | tracks CRD schema churn; 0 on a stable cluster |
 | `delete_worker_panics_total` | DELETE events whose `OnDelete` panicked. Each one is exactly one LOST eviction; the worker survives and drains the next event | **0**. Non-zero means at least one object's L1 entry is stale until TTL, and the `deps.delete_worker.panic` WARN names which |
 | `dep_event_queue_depth` | coordinates pending on the dep-event workqueue (1.12.6 C1; typed, dedup'd, unbounded — the 1.12.5 `delete_queue_depth`/`_cap`/`_full_total` surface is retired, there is no overflow case) | near 0. Persistently high = the drain is behind |
 | `events_submitted_total` | coordinates enqueued by the three informer handlers | tracks cluster churn |

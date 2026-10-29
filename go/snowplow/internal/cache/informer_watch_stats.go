@@ -86,17 +86,12 @@ const (
 	confirmRetractWalkConfirm      = "walk_confirm"      // the walk-registered set
 
 	// The informer itself was torn down, taking its confirmation with it.
-	confirmRetractSchemaRelist       = "schema_relist"        // CRD schema widened; remove + re-ensure
+	// (#870 deleted "schema_relist" and "store_repair": a schema widen and a
+	// store repair no longer tear the informer down — the replacement is built
+	// beside it and swapped in, and the GVR keeps its confirmation.)
 	confirmRetractStaleVersionPruned = "stale_version_pruned" // #219: CRD stopped serving this version
 	confirmRetractCRDDeleted         = "crd_deleted"          // the CRD itself was deleted
 	confirmRetractUnspecified        = "unspecified"          // a bare RemoveResourceType (tests)
-	// #237 B: the store was found to disagree with the apiserver and the GVR
-	// was relisted to repair it. It shares the relist machinery with
-	// schema_relist and MUST NOT share its bucket — a store repair folded into
-	// schema_relist would read as a CRD schema widen, which is the
-	// wrong-cause misattribution #237 exists to stop.
-	confirmRetractStoreRepair = "store_repair"
-
 	// #807: the informer's LIST/WATCH was refused with 404 and the CRD no
 	// longer serves its version (unserved_version_block.go).
 	confirmRetractRefusedVersionPruned = "refused_version_pruned"

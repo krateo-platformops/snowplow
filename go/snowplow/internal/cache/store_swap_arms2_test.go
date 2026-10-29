@@ -200,16 +200,20 @@ func TestStoreSwap_K11e_ChainedSwaps(t *testing.T) {
 		return len(f.rec.forKey(swapKey("o01"))) > 1 && len(f.rec.forKey(swapKey("o02"))) > 1
 	})
 	time.Sleep(50 * time.Millisecond)
-	for _, k := range []string{"o01", "o02"} {
-		n := 0
-		for _, e := range f.rec.since(evs0) {
-			if e.key == swapKey(k) {
-				n++
-			}
+	// Exactly once each: B0's held write to o00 (delivered by B0 itself once
+	// released), and the two repaired keys (through B2). Nothing else.
+	counts := map[string]int{}
+	for _, e := range f.rec.since(evs0) {
+		counts[e.key]++
+	}
+	for _, k := range []string{"o00", "o01", "o02"} {
+		if counts[swapKey(k)] != 1 {
+			t.Fatalf("K11e RED (X33/X38): %s reached the consumer %d time(s) after the chain, want exactly once (%v)",
+				k, counts[swapKey(k)], f.rec.since(evs0))
 		}
-		if n != 1 {
-			t.Fatalf("K11e RED (X33/X38): %s reached the consumer %d time(s) after the chain, want exactly once (%v)", k, n, f.rec.since(evs0))
-		}
+	}
+	if len(counts) != 3 {
+		t.Fatalf("K11e RED (X33): keys that did not change reached the consumer: %v", f.rec.since(evs0))
 	}
 	if s := StoreSwapStatsSnapshot(); s.Superseded != 1 {
 		t.Fatalf("K11e: superseded = %d, want 1", s.Superseded)
@@ -231,12 +235,29 @@ func TestStoreSwap_K11e_ChainedSwaps(t *testing.T) {
 func TestStoreSwap_K11e1_InstallBetweenStep3AndUnmute(t *testing.T) {
 	gvr := swapGVR(t)
 	f := newSwapFix(t, gvr, objs(gvr, 4))
-	var c1 atomic.Pointer[storeInstance]
+	var c1, c2 atomic.Pointer[storeInstance]
 	gate := make(chan struct{})
-	var once sync.Once
+	var once, once2 sync.Once
 	setSwapStepHook(t, func(c *storeInstance, step string) {
 		if c.gvr == gvr && step == "after_step3" && c == c1.Load() {
 			once.Do(func() { <-gate })
+		}
+		// A write lands on B2's copy DURING its retiring wait (muted: seen
+		// only). M computed after the wait holds it; one computed before the
+		// wait would drop it for good (X42).
+		if c.gvr == gvr && step == "before_close_retiring" && c == c2.Load() {
+			once2.Do(func() {
+				o := swapObj(gvr, "o03", "5", "during-wait")
+				f.clusterSet(o)
+				f.watcher(2).Modify(o)
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					if v, ok, _ := c.depAdpt.seenObject(swapKey("o03")); ok && rvOf(v) == "5" {
+						return
+					}
+					time.Sleep(time.Millisecond)
+				}
+			})
 		}
 	})
 	f.clusterSet(swapObj(gvr, "o01", "2", "b1"))
@@ -250,12 +271,14 @@ func TestStoreSwap_K11e1_InstallBetweenStep3AndUnmute(t *testing.T) {
 	// B2 installs while B1 is parked between its step-3 check and its unmute.
 	f.clusterSet(swapObj(gvr, "o02", "2", "b2"))
 	f.request(reasonDivergence, swapKey("o02"))
+	c2.Store(f.rw.storeBuildForTest(gvr))
 	f.waitFor("B2's install", func() bool { return StoreSwapStatsSnapshot().Swaps == 2 })
 	go func() { time.Sleep(20 * time.Millisecond); close(gate) }()
 	f.awaitSwaps(2)
-	f.waitFor("both keys at the consumer", func() bool {
-		a, b := f.rec.forKey(swapKey("o01")), f.rec.forKey(swapKey("o02"))
-		return len(a) > 1 && a[len(a)-1].v == "b1" && len(b) > 1 && b[len(b)-1].v == "b2"
+	f.waitFor("every changed key at the consumer", func() bool {
+		a, b, c := f.rec.forKey(swapKey("o01")), f.rec.forKey(swapKey("o02")), f.rec.forKey(swapKey("o03"))
+		return len(a) > 1 && a[len(a)-1].v == "b1" && len(b) > 1 && b[len(b)-1].v == "b2" &&
+			len(c) > 1 && c[len(c)-1].v == "during-wait"
 	})
 	// B1 passed its step-3 check, so it keeps its own coordinates (Q6) and
 	// counts them when it resumes; each coordinate is counted exactly once.

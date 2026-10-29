@@ -503,21 +503,14 @@ handler run) and builds a **fresh** informer. A fresh informer has an empty `kno
 object that vanished before the new LIST. An object deleted inside that window therefore leaves
 its self entry stranded with no future informer trigger.
 
-`OnResourceTypeSchemaRelisted` dirty-marks every dependent entry from the **forward dep index**,
-not from the indexer, so it covers entries whose objects are absent. But it ran **once**, at the
-start of the window: an entry dirty-marked at that instant re-resolves successfully while its
-object still exists, and is then stranded when the delete lands a moment later. That is the
-#187 burst shape — relist at ~09:21, deletes 09:21–09:24.
-
-Since 1.12.5 the relist **re-fires the same dirty-mark after the new informer has synced**,
-in the goroutine that already waits on the sync channel. Every stranded entry is then handed to
-the self-404 eviction above. The pre-sync fire is kept as well; both run. Counted as
-`relist_dirtymark_postsync_total` under `snowplow_deps`.
-
-This is containment, not the precise form: it evicts by re-resolving and observing a 404, so it
-costs the requeue budget and depends on the refresh path being healthy. Since 1.12.6 C2 the
-relist delta bridge re-derives the missing DELETEs from the indexer (`relist_bridge.go`), and
-the C3 **sampled reconcile audit** (`deps_reconcile.go`) is the safety net under the whole
+Before #870 a CRD schema relist tore the informer down and registered a fresh one, so a delete
+landing inside that window produced no DELETE; 1.12.5 contained it with a post-sync dirty-mark
+re-fire and 1.12.6 C2 with a relist delta bridge. **#870 (1.12.60) removed the window itself:** a
+schema change (and a store repair) builds the replacement beside the live informer and swaps it in
+(`store_swap.go`). The live copy keeps watching, so a delete during the build is delivered by it;
+and the swap delivers every key whose bytes changed against what the handlers last acted on —
+including a delete the live copy missed — as an ordinary per-key event. The re-fire, the bridge and
+their counters are deleted. the C3 **sampled reconcile audit** (`deps_reconcile.go`) is the safety net under the whole
 pipeline: every `DEPS_RECONCILE_PERIOD_SECONDS` (30) it probes `DEPS_RECONCILE_SAMPLE` (512)
 resident entries against the indexer and hands ABSENT ones to the dep-event worker.
 
