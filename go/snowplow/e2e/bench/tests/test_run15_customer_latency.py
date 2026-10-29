@@ -887,6 +887,14 @@ def test_pair_dry_run_with_the_real_run606(tmp_path):
     env = {k: v for k, v in os.environ.items()
            if k not in ("RUN_NAME", "SNOWPLOW_TAG", "EXPECTED_IMAGE_DIGEST", "BENCH_606_GO", "OUT",
                         "DRIVE_S", "K6_SPAN", "LOAD_DRIVER")}
+    # #985: the pair's dry pass reads the region's quotas and GKE's cluster limit: never the real cloud
+    fbin = tmp_path / "fakebin"
+    fbin.mkdir()
+    (fbin / "gcloud").write_text(FAKE_QUOTA_GCLOUD)
+    (fbin / "gcloud").chmod(0o755)
+    from tests import fake_cloudquotas
+    quotas_url, quotas_stop = fake_cloudquotas.serve(tmp_path / "cluster_limit")
+    env.update(PATH=f"{fbin}{os.pathsep}{env['PATH']}", CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDQUOTAS=quotas_url)
     env.update(PYTHONPATH=str(repo), HOME=str(tmp_path), PAIR_OUT=str(tmp_path / "pair"),
                OUT_A=str(tmp_path / "A"), OUT_B=str(tmp_path / "B"), BENCH_606_DRY_RUN="1",
                INSTALLER_VERSION="0.3.422", RUN_NAME_A=NA, RUN_NAME_B=NB,
@@ -894,6 +902,7 @@ def test_pair_dry_run_with_the_real_run606(tmp_path):
                EXPECTED_IMAGE_DIGEST_A=DIG_A, EXPECTED_IMAGE_DIGEST_B=DIG_B)
     p = subprocess.run(["bash", str(repo / "run606_pair.sh")], env=env, capture_output=True, text=True,
                        timeout=300, check=False)
+    quotas_stop()
     assert p.returncode == 0, p.stderr[-3000:]
     for x in ("A", "B"):
         log = (tmp_path / "pair" / f"dry-{x}" / "run.log").read_text()

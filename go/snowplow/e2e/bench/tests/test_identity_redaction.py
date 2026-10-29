@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from bench import diag606, identity, load606, logscrub, sampler
+from bench import diag606, gke, identity, load606, logscrub, sampler
 from tests.test_run606_real_sequence import BENCH_DIR
 
 D256 = "sha256:" + "0123456789abcdef" * 4
@@ -90,6 +90,8 @@ SITES = {
     "load606._redact_strings (the preflight record)": lambda s: json.dumps(
         load606._redact_strings({"menu": {"error": s}}, identity.redact_identity)),
     "sampler._first_line (a failed sample's error line)": lambda s: sampler._first_line(s.encode()),
+    # #985: gke-up's failed create, its gcloud ERROR lines (recorded by run606's up step)
+    "gke.gcloud_error_lines (a failed create's reason)": lambda s: gke.gcloud_error_lines("ERROR: " + s),
 }
 
 
@@ -109,7 +111,7 @@ def test_the_call_sites_are_the_ones_swept():
     """A new place that redacts is added to SITES, not left out of the sweep."""
     src = {p.name: p.read_text() for p in (BENCH_DIR / "bench").glob("*.py")}
     users = sorted(n for n, t in src.items() if "redact_identity" in t and n != "identity.py")
-    assert users == ["diag606.py", "load606.py", "logscrub.py", "sampler.py"]
+    assert users == ["diag606.py", "gke.py", "load606.py", "logscrub.py", "sampler.py"]
     assert "bench/identity.py" in (BENCH_DIR / "run606.sh").read_text()
 
 
