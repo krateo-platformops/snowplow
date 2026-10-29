@@ -8,12 +8,15 @@
 // fully and reaches it). This file covers the dispatchers-side pieces of
 // the 0.30.127 fix that the api-package falsifier cannot:
 //
-//   - the SLICE fix: the walk extracts page/perPage from a child's
-//     `/call` Path (util.ParseCallPathPagination) and threads the
-//     declared slice — never the unbounded -1 — into widgets.Resolve;
-//   - (#966) the unpaginated pagination for a child whose Path carries no
-//     slice — the bounded PREWARM_PAGE_LIMIT default it replaced stored a
-//     perPage=5 body under the unpaginated key;
+//   - the SLICE fix: the walk derives a child's pagination from its
+//     `/call` Path with prewarmPaginationFor — the same query parser
+//     (paginationFromQuery) the dispatcher applies to the browser's request
+//     of that URL — so a declared slice reaches widgets.Resolve AND the cell
+//     key;
+//   - (#966) a child whose Path carries no slice is walked UNPAGINATED, as
+//     the browser requests it. The bounded PREWARM_PAGE_LIMIT default that
+//     0.30.127 applied here stored a perPage=5 body under the unpaginated
+//     key; it is retired;
 //   - the harvester collecting an apiRef (compositions-list) once the
 //     walk descends to the widget that declares it.
 //
@@ -26,7 +29,6 @@ package dispatchers
 import (
 	"testing"
 
-	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -38,25 +40,25 @@ import (
 const dashboardTablePath = "/call?resource=tables&apiVersion=widgets.templates.krateo.io/v1beta1" +
 	"&name=dashboard-compositions-panel-row-table&namespace=krateo-system&page=1&perPage=5"
 
-// noSlicePath is a `/call` Path with no page/perPage — a widget that
-// declares no slice. The walk must fall back to the bounded
-// PREWARM_PAGE_LIMIT default.
+// noSlicePath is a `/call` Path with no page/perPage — a widget whose ref
+// declares no slice. The browser requests it unpaginated, so the walk
+// resolves and keys it unpaginated (#966).
 const noSlicePath = "/call?resource=panels&apiVersion=widgets.templates.krateo.io/v1beta1" +
 	"&name=dashboard-compositions-panel&namespace=krateo-system"
 
 // TestFAL127_SliceExtractedFromChildPath proves the SLICE fix: the walk
-// reads the page/perPage a child `/call` Path carries, so it honours the
-// widget's DECLARED pagination instead of the old hardcoded -1/-1 (which,
-// with the iterator cap removed, is the 49K-row storm).
+// reads the page/perPage a child `/call` Path carries (prewarmPaginationFor,
+// the derivation every walk writer uses), so it honours the widget's DECLARED
+// pagination.
 func TestFAL127_SliceExtractedFromChildPath(t *testing.T) {
-	page, perPage, ok := util.ParseCallPathPagination(dashboardTablePath)
-	if !ok {
-		t.Fatalf("FAL-127: the Dashboard table's /call Path declares page=1&perPage=5 — " +
-			"ParseCallPathPagination must extract it, got ok=false")
+	pg := prewarmPaginationFor(dashboardTablePath)
+	if !pg.paginated() {
+		t.Fatalf("FAL-127: the Dashboard table's /call Path declares page=1&perPage=5 — "+
+			"prewarmPaginationFor must extract it, got the unpaginated %+v", pg)
 	}
-	if page != 1 || perPage != 5 {
+	if pg.Page != 1 || pg.PerPage != 5 {
 		t.Fatalf("FAL-127: extracted page/perPage = %d/%d, want 1/5 (the declared slice)",
-			page, perPage)
+			pg.Page, pg.PerPage)
 	}
 }
 

@@ -6,9 +6,10 @@
 // (phase1PerGVRSampleLimit / phase1Walker.gvrSamples) was DELETED — that
 // count-cap heuristic pruned distinct navigation widgets by a
 // sibling-count guess and silently starved the Dashboard branch. The
-// data-fan-out bound is now the DECLARED per-widget pagination (each
-// widget resolves under its `slice` or the bounded PREWARM_PAGE_LIMIT
-// default — see phase1_walk.go's page/perPage threading). The former
+// data-fan-out bound is now the DECLARED per-ref pagination (each widget
+// resolves under the `slice` its ref declares, or unpaginated as the browser
+// requests it — #966 retired the bounded PREWARM_PAGE_LIMIT default; see
+// walk()'s pg). The former
 // TestPhase1Walk_PerGVRSampleBound, which pinned that removed heuristic,
 // was removed with it.
 //
