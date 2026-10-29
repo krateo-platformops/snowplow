@@ -272,14 +272,20 @@ func storeSwapKnownStaleExpvar() any {
 
 var storeSwapExpvarOnce sync.Once
 
-func init() {
-	if Disabled() {
-		return
-	}
+// registerStoreSwapExpvar publishes the tagged family and the labelled
+// known-stale family. Once-guarded; RegisterExpvarForTest calls it too.
+func registerStoreSwapExpvar() {
 	storeSwapExpvarOnce.Do(func() {
 		expvar.Publish("snowplow_store_swap", expvar.Func(func() any { return StoreSwapStatsByStat() }))
 		expvar.Publish("snowplow_store_swap_known_stale", expvar.Func(storeSwapKnownStaleExpvar))
 	})
+}
+
+func init() {
+	if Disabled() {
+		return
+	}
+	registerStoreSwapExpvar()
 }
 
 // resetStoreSwapStatsForTest zeroes every #870 instrument and the ledger, in

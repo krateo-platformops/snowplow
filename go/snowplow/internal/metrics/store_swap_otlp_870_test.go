@@ -8,9 +8,11 @@ package metrics
 // (not mirrored to OTLP) and X30 (no reason label).
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -74,5 +76,94 @@ func TestStoreSwap870_KnownStaleIsMirroredOnOTLP(t *testing.T) {
 	// reading, not an absence).
 	if want := len(cache.StoreSwapReasons) * len(cache.StoreSwapOutcomes); len(keys) != want {
 		t.Fatalf("OTLP keys_total carries %d series, want the closed set of %d", len(keys), want)
+	}
+}
+
+// TestStoreSwap870_LabelValuesAreClosedSets pins the VALUES of the #870
+// attribute keys (F8 allowlists the keys only): on every data point of every
+// labelled snowplow_store_swap_* instrument (the tagged snowplow_store_swap{stat} family is C7's), of every data type, reason ∈
+// cache.StoreSwapReasons, outcome ∈ cache.StoreSwapOutcomes, close ∈
+// cache.StoreSwapCloses, and no other key appears. This is the pin the
+// `close` entry in closedAttributeKeys cites.
+func TestStoreSwap870_LabelValuesAreClosedSets(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	cache.ResetStoreSwapForTest()
+	t.Cleanup(cache.ResetStoreSwapForTest)
+	gvr := schema.GroupVersionResource{Group: "otlp870.krateo.io", Version: "v1", Resource: "panels"}
+	cache.RunStoreSwapAbortForTest(gvr, "divergence", []string{"ns/a"}, time.Second)
+
+	closed := map[string]map[string]bool{"reason": {}, "outcome": {}, "close": {}}
+	for _, v := range cache.StoreSwapReasons {
+		closed["reason"][v] = true
+	}
+	for _, v := range cache.StoreSwapOutcomes {
+		closed["outcome"][v] = true
+	}
+	for _, v := range cache.StoreSwapCloses {
+		closed["close"][v] = true
+	}
+	check := func(name string, attrs []attribute.KeyValue) {
+		for _, kv := range attrs {
+			set, ok := closed[string(kv.Key)]
+			if !ok {
+				t.Errorf("%s: attribute key %q is outside {reason, outcome, close}", name, kv.Key)
+				continue
+			}
+			if !set[kv.Value.Emit()] {
+				t.Errorf("%s: %s=%q is outside its closed set", name, kv.Key, kv.Value.Emit())
+			}
+		}
+	}
+	seen := map[string]int{}
+	rm := collectViaRealCallback(t, "test")
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if !strings.HasPrefix(m.Name, "snowplow_store_swap_") {
+				continue
+			}
+			switch d := m.Data.(type) {
+			case metricdata.Sum[int64]:
+				for _, dp := range d.DataPoints {
+					check(m.Name, dp.Attributes.ToSlice())
+					seen[m.Name]++
+				}
+			case metricdata.Sum[float64]:
+				for _, dp := range d.DataPoints {
+					check(m.Name, dp.Attributes.ToSlice())
+					seen[m.Name]++
+				}
+			case metricdata.Gauge[int64]:
+				for _, dp := range d.DataPoints {
+					check(m.Name, dp.Attributes.ToSlice())
+					seen[m.Name]++
+				}
+			case metricdata.Gauge[float64]:
+				for _, dp := range d.DataPoints {
+					check(m.Name, dp.Attributes.ToSlice())
+					seen[m.Name]++
+				}
+			case metricdata.Histogram[int64]:
+				for _, dp := range d.DataPoints {
+					check(m.Name, dp.Attributes.ToSlice())
+					seen[m.Name]++
+				}
+			default:
+				t.Errorf("%s: unhandled data type %T — this pin would skip it", m.Name, m.Data)
+			}
+		}
+	}
+	// Not vacuous: every observable instrument reports its whole closed set.
+	for name, want := range map[string]int{
+		"snowplow_store_swap_known_stale_keys_total":              len(cache.StoreSwapReasons) * len(cache.StoreSwapOutcomes),
+		"snowplow_store_swap_known_stale_builds_total":            len(cache.StoreSwapReasons) * len(cache.StoreSwapOutcomes),
+		"snowplow_store_swap_known_stale_window_seconds_total":    len(cache.StoreSwapReasons) * len(cache.StoreSwapOutcomes),
+		"snowplow_store_swap_ledger_closes_total":                 len(cache.StoreSwapReasons) * len(cache.StoreSwapCloses),
+		"snowplow_store_swap_known_stale_keys_open":               len(cache.StoreSwapReasons),
+		"snowplow_store_swap_known_stale_window_open_seconds_max": len(cache.StoreSwapReasons),
+		"snowplow_store_swap_ledger_owed":                         len(cache.StoreSwapReasons),
+	} {
+		if seen[name] != want {
+			t.Errorf("%s: %d data points, want its closed set of %d", name, seen[name], want)
+		}
 	}
 }

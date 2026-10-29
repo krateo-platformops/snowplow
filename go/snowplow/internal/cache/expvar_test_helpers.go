@@ -38,4 +38,5 @@ func RegisterExpvarForTest() {
 	registerInformerWatchExpvar()
 	registerReflectorPathExpvar()
 	registerStoreVerificationExpvar()
+	registerStoreSwapExpvar()
 }
