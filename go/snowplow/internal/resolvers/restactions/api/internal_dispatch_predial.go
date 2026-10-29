@@ -82,7 +82,22 @@ func newRegateForbidden(gvr schema.GroupVersionResource, namespace, name string)
 // one body.
 func newRegateForbiddenVerb(gvr schema.GroupVersionResource, namespace, name, verb string) error {
 	return &regateDeniedError{status: apierrors.NewForbidden(gvr.GroupResource(), name,
-		fmt.Errorf("user not authorized to %s %s/%s", verb, namespace, name))}
+		errors.New(forbiddenReason(verb, namespace, name)))}
+}
+
+// forbiddenReason is the identity-free reason of a deny. A named object keeps
+// the "<ns>/<name>" form the GET deny has always carried (objects.Get shares
+// it); a collection names its scope the way the apiserver does — "at the
+// cluster scope" or "in the namespace "<ns>"" — never a dangling "/".
+func forbiddenReason(verb, namespace, name string) string {
+	switch {
+	case name != "":
+		return fmt.Sprintf("user not authorized to %s %s/%s", verb, namespace, name)
+	case namespace == "":
+		return fmt.Sprintf("user not authorized to %s at the cluster scope", verb)
+	default:
+		return fmt.Sprintf("user not authorized to %s in the namespace %q", verb, namespace)
+	}
 }
 
 // isRegateDenied reports whether err is a per-identity deny snowplow decided

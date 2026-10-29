@@ -120,7 +120,7 @@ func e6Table(t *testing.T) []e6Row {
 	av, lk := apiVersionForGVR(f1WidgetsGVR), listKindForResource(f1WidgetsGVR.Resource)
 	stored := e6StoredEnvelope(t, items)
 	ctx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: f1NarrowUser}))
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: f1BroadUser})) // #961: the gated rows LIST cluster-wide, which needs a cluster grant
 	decode := func(t *testing.T, b []byte, err error) any {
 		t.Helper()
 		if err != nil {

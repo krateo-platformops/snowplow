@@ -74,13 +74,15 @@ func newWatcher375(t *testing.T) dynamic.Interface {
 	for _, ns := range []string{"team-a", "team-b"} {
 		seed = append(seed, obj375(f1WidgetsGVR, "Widget", ns, "widget-"+ns))
 		seed = append(seed, obj375(g375Gadgets, "Gadget", ns, "gadget-"+ns))
-		seed = append(seed, &rbacv1.RoleBinding{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
-			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "c375-" + u375},
-			Subjects:   []rbacv1.Subject{{Kind: rbacv1.UserKind, APIGroup: "rbac.authorization.k8s.io", Name: u375}},
-			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "c375-lister"},
-		})
 	}
+	// The stages LIST cluster-wide: since #961 that needs a cluster grant, as on
+	// the apiserver.
+	seed = append(seed, &rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: "c375-" + u375},
+		Subjects:   []rbacv1.Subject{{Kind: rbacv1.UserKind, APIGroup: "rbac.authorization.k8s.io", Name: u375}},
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "c375-lister"},
+	})
 	seed = append(seed, &rbacv1.ClusterRole{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
 		ObjectMeta: metav1.ObjectMeta{Name: "c375-lister"},

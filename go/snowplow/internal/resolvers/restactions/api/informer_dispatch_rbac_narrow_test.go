@@ -208,7 +208,9 @@ func sortedKeys(m map[string]bool) []string {
 }
 
 // TestDispatchViaInformer_RBACNarrowing_ListIsUserScoped is the headline
-// falsifier. A cluster-wide LIST by a narrow-RBAC user MUST return
+// falsifier. A narrow-RBAC user never receives an item outside its grant:
+// its cluster-wide LIST is refused (#961: a cluster-wide list needs a
+// cluster grant, as on the apiserver) and its namespaced LISTs return
 // exactly the user's authorized subset.
 //
 // NEGATIVE CONTROL: built with `-tags rbac_narrow_baseline` this test
@@ -225,13 +227,10 @@ func TestDispatchViaInformer_RBACNarrowing_ListIsUserScoped(t *testing.T) {
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")
 	ctx := ctxWithUser(narrowUser)
 
-	raw, served, _, _ := dispatchViaInformer(ctx, call)
-	if !served {
-		t.Fatalf("cluster-wide LIST: expected served=true; got served=false")
-	}
-	got := servedItemNames(t, raw)
+	raw, served, _, denied := dispatchViaInformer(ctx, call)
 
 	if rbacNarrowBaseline {
+		got := servedItemNames(t, raw)
 		// NEGATIVE CONTROL (pre-Tag-A behaviour). The pivot LIST branch
 		// returns the raw partition unfiltered → all seeded items.
 		if len(got) != totalSeeded {
@@ -243,7 +242,25 @@ func TestDispatchViaInformer_RBACNarrowing_ListIsUserScoped(t *testing.T) {
 		return
 	}
 
-	// Tag-A behaviour: served result == exactly the authorized subset.
+	// #961 (match Kubernetes): the narrow user holds only namespace grants, so
+	// the CLUSTER-WIDE list is refused with the apiserver's per-identity 403 —
+	// nothing is served. Its view is the union of its namespaced lists, each
+	// exactly its namespace's items.
+	if served || raw != nil || !isRegateDenied(denied) {
+		t.Fatalf("cluster-wide LIST by a namespace-only user: served=%v bytes=%d err=%v, want the per-identity Forbidden",
+			served, len(raw), denied)
+	}
+	got := map[string]bool{}
+	for _, ns := range authorizedNamespaces {
+		nsRaw, nsServed, _, nsDenied := dispatchViaInformer(ctx,
+			buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/"+ns+"/restactions"))
+		if !nsServed || nsDenied != nil {
+			t.Fatalf("authorized namespace %s: served=%v err=%v", ns, nsServed, nsDenied)
+		}
+		for name := range servedItemNames(t, nsRaw) {
+			got[name] = true
+		}
+	}
 	if len(got) != len(authorized) {
 		t.Fatalf("RBAC-narrowed LIST: want %d items (authorized subset); got %d\n want: %v\n got:  %v",
 			len(authorized), len(got), sortedKeys(authorized), sortedKeys(got))
@@ -388,8 +405,13 @@ func TestDispatchViaInformer_RBACNarrowing_GroupGrant(t *testing.T) {
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 
-	// User "alice" is in group "devs".
-	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")
+	// User "alice" is in group "devs". Its grant is a RoleBinding in team-a,
+	// so (#961) the cluster-wide LIST is refused and team-a's LIST serves.
+	if _, served, _, denied := dispatchViaInformer(ctxWithUser("alice", "devs"),
+		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")); served || !isRegateDenied(denied) {
+		t.Fatalf("group-grant cluster-wide LIST: served=%v err=%v, want the per-identity Forbidden", served, denied)
+	}
+	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/team-a/restactions")
 	raw, served, _, _ := dispatchViaInformer(ctxWithUser("alice", "devs"), call)
 	if !served {
 		t.Fatalf("group-grant LIST: expected served=true")

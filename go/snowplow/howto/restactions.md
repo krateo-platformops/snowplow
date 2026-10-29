@@ -220,27 +220,28 @@ either from its own copy of the data (the cache) or by asking the Kubernetes
 API server, depending on what it holds at that moment. A `GET` of a list gets
 the same answer either way:
 
-- **The caller may not list that resource anywhere the request covers.** The
-  stage fails with `Forbidden`: `errorKey` holds the `Status`
-  `{"reason":"Forbidden","code":403}` with a message that names the resource
-  and the namespace but never the caller, and the stage-outcome header lists
-  the stage as `Forbidden`. A namespaced list (`.../namespaces/team-a/...`)
-  needs a grant in that namespace. A cluster-wide list needs a cluster-wide
-  grant or, for a namespaced resource, a grant in at least one namespace; a
-  `RoleBinding` grants nothing on a cluster-scoped resource. A `RESTAction`
-  that branches on a 403 sees it on every path, not only when the cache is
-  cold.
-- **The caller may list it.** The stage gets `200` with the items the caller
-  may see. An empty collection is `200` with `items: []`, not a 403.
-- **The caller may list only some namespaces of a cluster-wide list.** When
-  the cache answers, the stage gets `200` with the items of those namespaces.
-  The API server itself refuses a cluster-wide list without a cluster-wide
-  grant, so when snowplow has to ask it (cache cold) the same request is
-  `Forbidden`. To get one answer on every path, list each namespace the
-  caller may read.
+Snowplow authorizes the list the way Kubernetes does:
+
+- A **namespaced** list (`.../namespaces/team-a/...`) needs a `list` grant in
+  that namespace: a `ClusterRoleBinding`, or a `RoleBinding` in `team-a`.
+- A **cluster-wide** list needs a `ClusterRoleBinding`. `RoleBinding`s in some
+  (or all) namespaces do not authorize it, whatever the resource.
+
+If the caller may not make the list, the stage fails with `Forbidden`:
+`errorKey` holds the `Status` `{"reason":"Forbidden","code":403}`, and the
+stage-outcome header lists the stage as `Forbidden`. The message names the
+resource and the scope ("at the cluster scope", or "in the namespace
+"team-a""), never the caller. A `RESTAction` that branches on a 403 sees it on
+every path, not only when the cache is cold.
+
+If the caller may make the list, the stage gets `200` with the items. An empty
+collection is `200` with `items: []`, not a 403.
 
 The decision comes from the caller's RBAC rules, never from how many items
-happen to be visible.
+happen to be visible. To show a caller "everything I may see across
+namespaces", list as snowplow's ServiceAccount with a
+[`userAccessFilter`](#specapiuseraccessfilter). A cluster-wide list made as
+the caller is refused when the caller holds only namespace grants.
 
 ### A write stage waits for the stage it depends on
 

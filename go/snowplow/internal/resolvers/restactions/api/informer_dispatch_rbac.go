@@ -96,14 +96,19 @@ func newListForbidden(gvr schema.GroupVersionResource, namespace string) error {
 // It answers in two steps, both from the requester's RBAC rules through the
 // in-process evaluator, never from the items:
 //
-//  1. Scope (#961, listScopeAllowed): does the requester hold `list` on ANY
-//     scope the request covers? If not, the apiserver would refuse the request
-//     with 403, and so does this gate: it returns newListForbidden, whatever
-//     the items. An allowed request whose collection is empty is served empty.
-//  2. Items: of an allowed request, the subset of items the requester may
-//     `list` in each item's own namespace (cluster-scoped items, namespace "",
-//     against the cluster scope). A cluster-wide list by a requester granted
-//     only some namespaces keeps those namespaces' items.
+//  1. Scope (#961, listScopeAllowed): may the requester `list` at the scope
+//     of the request, exactly as the apiserver authorizes it? If not, the
+//     apiserver refuses the request with 403, and so does this gate: it
+//     returns newListForbidden, whatever the items. An allowed request whose
+//     collection is empty is served empty.
+//  2. Items (defence in depth): of an allowed request, the items the
+//     requester may `list` in each item's own namespace (cluster-scoped items,
+//     namespace "", against the cluster scope). An allowed scope already
+//     covers every item a correct copy holds — a cluster grant covers every
+//     namespace, a namespace grant covers that namespace's partition — so this
+//     step only drops an item that does not belong to the request's scope.
+//     "What this requester may see across namespaces" is userAccessFilter's
+//     job, never a cluster-wide list's.
 //
 // Return contract:
 //   - (subset, nil) — serve the subset (possibly empty).
@@ -176,6 +181,10 @@ func filterListByRBAC(
 	// discarded at return: no persistence, no invalidation, no staleness.
 	// A subsequent LIST builds a fresh memo against the live RBAC store.
 	rbacMemo := make(map[string]bool, len(items))
+	// The scope step already evaluated (user, list, gvr, namespace) and
+	// allowed it: an item of the request's own namespace needs no second
+	// evaluation (for a cluster-wide list that is the cluster-scoped items).
+	rbacMemo[namespace] = true
 
 	kept := make([]*unstructured.Unstructured, 0, len(items))
 	dropped := 0
@@ -246,31 +255,21 @@ func filterListByRBAC(
 	return kept, nil
 }
 
-// listScopeAllowed reports whether the requester holds `list` on gvr on at
-// least one scope a LIST of namespace covers (#961), as the apiserver
-// authorizes the same request:
+// listScopeAllowed reports whether the requester may `list` gvr at the scope
+// of a LIST of namespace (#961), exactly as the apiserver authorizes the same
+// request — one EvaluateRBAC at the request's own scope:
 //
-//   - a namespaced LIST (namespace != ""): a grant in that namespace, i.e.
-//     EvaluateRBAC for that namespace (ClusterRoleBindings, then the
-//     namespace's RoleBindings).
-//   - a cluster-wide LIST (namespace == ""): a cluster grant (EvaluateRBAC at
-//     the cluster scope), or, for a NAMESPACED resource, a grant in some
-//     namespace (EvaluateRBACInSomeNamespace): that namespace's part of the
-//     list is the requester's to see. A cluster-scoped resource has no
-//     namespace part, so a RoleBinding grants none of it, exactly as the
-//     apiserver ignores RoleBindings for cluster-scoped objects. The scope
-//     comes from discovery (preDialScopeFn), a property of the resource, never
-//     a per-resource rule; it is consulted only when the answer depends on it.
-//     A scope discovery cannot resolve is not a deny: the request is allowed
-//     on to the item filter, which keeps only items the requester may list in
-//     their own namespace (none, for a cluster-scoped resource), so the answer
-//     is the pre-#961 one — never a leak, never a guessed 403.
+//   - a namespaced LIST (namespace != ""): a ClusterRoleBinding, or a
+//     RoleBinding in that namespace;
+//   - a cluster-wide LIST (namespace == ""): a ClusterRoleBinding, full stop.
+//     A RoleBinding grants nothing at the cluster scope, whatever the resource;
+//     a requester holding only namespace grants gets the apiserver's 403, and a
+//     view across the namespaces it may read is what userAccessFilter is for.
 //
 // decided is false when the evaluator errors: the gate then falls through to
 // the apiserver rather than guess.
 func listScopeAllowed(ctx context.Context, username string, groups []string, gvr schema.GroupVersionResource, namespace string) (allowed, decided bool) {
-	log := xcontext.Logger(ctx)
-	opts := rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
 		Username:       username,
 		Groups:         groups,
 		Verb:           "list",
@@ -278,44 +277,19 @@ func listScopeAllowed(ctx context.Context, username string, groups []string, gvr
 		Resource:       gvr.Resource,
 		Namespace:      namespace,
 		SkipBindingUID: true,
-	}
-	undecided := func(step string, err error) (bool, bool) {
-		log.Warn("informer_dispatch.rbac_filter.scope_undecided",
+	})
+	if err != nil {
+		xcontext.Logger(ctx).Warn("informer_dispatch.rbac_filter.scope_undecided",
 			slog.String("subsystem", "cache"),
 			slog.String("user", redact.User(username)),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),
-			slog.String("step", step),
 			slog.Any("err", err),
 			slog.String("action", "fallthrough_to_apiserver"),
 		)
 		return false, false
 	}
-	ok, _, err := rbac.EvaluateRBAC(ctx, opts)
-	if err != nil {
-		return undecided("evaluate", err)
-	}
-	if ok || namespace != "" {
-		return ok, true
-	}
-	inSome, err := rbac.EvaluateRBACInSomeNamespace(ctx, opts)
-	if err != nil {
-		return undecided("evaluate_some_namespace", err)
-	}
-	if !inSome {
-		return false, true
-	}
-	namespaced, err := preDialScopeFn(gvr)
-	if err != nil {
-		log.Warn("informer_dispatch.rbac_filter.scope_unresolved",
-			slog.String("subsystem", "cache"),
-			slog.String("gvr", gvr.String()),
-			slog.Any("err", err),
-			slog.String("action", "item_filter_only"),
-		)
-		return true, true
-	}
-	return namespaced, true
+	return ok, true
 }
 
 // filterGetByRBAC reports whether the context's user is authorized to

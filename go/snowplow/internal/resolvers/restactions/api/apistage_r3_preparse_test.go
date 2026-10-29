@@ -67,7 +67,7 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 	// Path A — the unmarshal-inside-gate fallback path. Ship 0.30.128
 	// P-CORE-2: the gate now returns the DECODED envelope value, not
 	// []byte.
-	gatedA, gateErrA := gateListEnvelope(ctx, f1WidgetsGVR, "", raw)
+	gatedA, gateErrA := gateListEnvelope(ctx, f1WidgetsGVR, "team-a", raw)
 	if gateErrA != nil {
 		t.Fatalf("path A (gateListEnvelope) returned served=false; want a gated envelope")
 	}
@@ -78,7 +78,7 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 	if !parseOK {
 		t.Fatalf("path B: parseListEnvelope failed on a well-formed envelope")
 	}
-	gatedB, gateErrB := gateListItems(ctx, f1WidgetsGVR, "", parsed)
+	gatedB, gateErrB := gateListItems(ctx, f1WidgetsGVR, "team-a", parsed)
 	if gateErrB != nil {
 		t.Fatalf("path B (gateListItems) returned served=false; want a gated envelope")
 	}

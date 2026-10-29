@@ -51,7 +51,7 @@ func memoItem(ns, name string) *unstructured.Unstructured {
 //
 // FAILS on the unfixed code: per-item evaluation → N*M calls.
 func TestFalsifierF1_RBACMemoIsNamespaceKeyed(t *testing.T) {
-	_, _ = newRBACNarrowWatcher(t) // wires a cache=on watcher + RBAC store
+	newDispatchWatcher(t) // cache=on watcher; dispatchAdminUser holds a cluster-wide grant
 
 	const itemsPerNS = 3
 	namespaces := []string{"team-a", "team-b", "bench-ns-1", "bench-ns-2", "kube-system"}
@@ -66,10 +66,10 @@ func TestFalsifierF1_RBACMemoIsNamespaceKeyed(t *testing.T) {
 		}
 	}
 
-	ctx := ctxWithUser(narrowUser)
+	ctx := dispatchCtx() // #961: a cluster-wide list needs a cluster grant
 	rbac.ResetEvaluateRBACCallCount()
 
-	// A cluster-wide LIST (namespace ""): narrowUser holds team-a and team-b.
+	// A cluster-wide LIST (namespace "") by a cluster-granted identity.
 	_, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "", items)
 	if gateErr != nil {
 		t.Fatalf("F1: filterListByRBAC = %v (expected an identity-present pass)", gateErr)
@@ -99,14 +99,14 @@ func TestFalsifierF1_RBACMemoNameIndependence(t *testing.T) {
 	ctx := ctxWithUser(narrowUser)
 	rbac.ResetEvaluateRBACCallCount()
 
-	// A LIST of team-a: the scope evaluation (team-a) plus ONE per-item one.
+	// A LIST of team-a: the scope evaluation (team-a) covers both items.
 	kept, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "team-a", items)
 	if gateErr != nil {
 		t.Fatalf("F1-name: filterListByRBAC = %v", gateErr)
 	}
-	if got := rbac.EvaluateRBACCallCount(); got != 2 {
-		t.Fatalf("F1-name: two same-namespace items made %d EvaluateRBAC calls; want 2 "+
-			"(the scope + verb:list is name-independent — one namespace, one evaluation)", got)
+	if got := rbac.EvaluateRBACCallCount(); got != 1 {
+		t.Fatalf("F1-name: two same-namespace items made %d EvaluateRBAC calls; want 1 "+
+			"(the scope evaluation of team-a covers its items: verb:list is name-independent)", got)
 	}
 	if len(kept) != 2 {
 		t.Fatalf("F1-name: name-independence broken — %d/2 items kept; the verdict must be "+

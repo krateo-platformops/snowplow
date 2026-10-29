@@ -32,24 +32,25 @@ package api
 //   P6  namespace grant, its EMPTY namespace → 200 `items: []` (allowed-empty)
 //   P7  cluster grant, empty cluster-scoped  → 200 `items: []`
 //   P8  namespace grant, cluster-scoped list → 403 (a RoleBinding grants nothing
-//       on a cluster-scoped resource) — on an EMPTY collection: decided from
-//       the rules, never from the items
+//       at the cluster scope) — on an EMPTY collection: decided from the
+//       rules, never from the items
 //   P9  continueOnError=false: the stage failure is the same on every path
-//   I1  namespace grant, cluster-wide list (informer only) → 200, filtered to
-//       the granted namespace: the legitimate partial result is kept
-//   I2  unresolved scope (discovery fails) → never a guessed deny: the item
-//       filter's answer stands
-//   C1  branch C (the SA read re-gated for the caller): a no-grant LIST is the
-//       typed re-gate Forbidden with the canonical text, a granted one serves
-//   E1  EvaluateRBACInSomeNamespace equals the OR over namespaces of
-//       EvaluateRBAC's namespace verdict, for every identity
+//   P10 namespace grant, cluster-wide list   → 403 on every path (Diego's
+//       ruling: match Kubernetes; a cross-namespace view is userAccessFilter's)
+//   P11 kind=Role RoleBinding, its namespace → 200: the Role is looked up in the
+//       binding's own namespace
+//   P12 kind=Role RoleBinding, cluster-wide  → 403
+//   P13 20 non-permitting RoleBindings ahead of the permitting one, in the
+//       listed namespace → 200: no candidate's "no" ends the walk
+//   C1  branch C (the SA read re-gated for the caller): a LIST without a grant
+//       at its scope is the typed re-gate Forbidden with the canonical text, a
+//       granted one serves
 //
 // Mutations (logic-only; each turns the named arms RED) are tabled in the PR.
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,7 +66,6 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/rbac"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -82,19 +82,32 @@ const (
 	u961None    = "u961-none"    // no grant at all
 	u961Cluster = "u961-cluster" // list restactions + kubernetestargets cluster-wide
 	u961NS      = "u961-ns"      // list both, via RoleBindings in team-a and team-c only
+	u961Role    = "u961-role"    // list restactions in team-r, via a RoleBinding to a namespaced Role
+	u961Many    = "u961-many"    // 20 non-permitting RoleBindings in team-a, then a permitting one
 	g961        = "g961-cohort"
+	g961Many    = "g961-many" // the permitting binding's subject: routed after the user's own bindings
 )
+
+// groups961 is the group set each synthetic identity presents.
+func groups961(user string) []string {
+	if user == u961Many {
+		return []string{g961, g961Many}
+	}
+	return []string{g961}
+}
 
 const (
 	p961Cluster = "/apis/templates.krateo.io/v1/restactions"
 	p961TeamA   = "/apis/templates.krateo.io/v1/namespaces/team-a/restactions"
 	p961TeamB   = "/apis/templates.krateo.io/v1/namespaces/team-b/restactions"
 	p961TeamC   = "/apis/templates.krateo.io/v1/namespaces/team-c/restactions" // granted, no objects
-	p961KT      = "/apis/core.krateo.io/v1alpha1/kubernetestargets"            // cluster-scoped, no objects
+	p961TeamR   = "/apis/templates.krateo.io/v1/namespaces/team-r/restactions"
+	p961KT      = "/apis/core.krateo.io/v1alpha1/kubernetestargets" // cluster-scoped, no objects
 )
 
-// seed961Items is the restactions collection: two in team-a, two in team-b.
-var seed961Items = [][2]string{{"team-a", "a-1"}, {"team-a", "a-2"}, {"team-b", "b-1"}, {"team-b", "b-2"}}
+// seed961Items is the restactions collection: two in team-a, two in team-b,
+// one in team-r.
+var seed961Items = [][2]string{{"team-a", "a-1"}, {"team-a", "a-2"}, {"team-b", "b-1"}, {"team-b", "b-2"}, {"team-r", "r-1"}}
 
 func rbac961Seed() []runtime.Object {
 	tm := func(kind string) metav1.TypeMeta {
@@ -119,6 +132,26 @@ func rbac961Seed() []runtime.Object {
 		out = append(out, &rbacv1.RoleBinding{TypeMeta: tm("RoleBinding"),
 			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "rb-961"}, Subjects: user(u961NS), RoleRef: ref})
 	}
+	// kind=Role: a namespaced Role in team-r, bound in team-r (reviewer M11).
+	out = append(out,
+		&rbacv1.Role{TypeMeta: tm("Role"), ObjectMeta: metav1.ObjectMeta{Namespace: "team-r", Name: "role-lister-961"},
+			Rules: []rbacv1.PolicyRule{{APIGroups: []string{dispatchTestGVR.Group}, Resources: []string{dispatchTestGVR.Resource}, Verbs: []string{"list"}}}},
+		&rbacv1.RoleBinding{TypeMeta: tm("RoleBinding"), ObjectMeta: metav1.ObjectMeta{Namespace: "team-r", Name: "rb-role-961"},
+			Subjects: user(u961Role), RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "role-lister-961"}})
+	// Many non-permitting candidates first (reviewer M17): 20 RoleBindings in
+	// team-a bind u961Many directly to a role on ANOTHER resource; the one that
+	// permits binds its group. User-subject candidates are walked before group
+	// ones, so a walk that stops at the first candidate's "no" denies.
+	out = append(out, &rbacv1.ClusterRole{TypeMeta: tm("ClusterRole"), ObjectMeta: metav1.ObjectMeta{Name: "other-961"},
+		Rules: []rbacv1.PolicyRule{{APIGroups: []string{"other.example"}, Resources: []string{"things"}, Verbs: []string{"list"}}}})
+	for i := 0; i < 20; i++ {
+		out = append(out, &rbacv1.RoleBinding{TypeMeta: tm("RoleBinding"),
+			ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: fmt.Sprintf("rb-other-961-%02d", i)},
+			Subjects:   user(u961Many), RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "other-961"}})
+	}
+	out = append(out, &rbacv1.RoleBinding{TypeMeta: tm("RoleBinding"),
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "rb-many-961"},
+		Subjects:   []rbacv1.Subject{{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: g961Many}}, RoleRef: ref})
 	return out
 }
 
@@ -160,23 +193,6 @@ func watcher961(t *testing.T) *cache.ResourceWatcher {
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 	return rw
-}
-
-// scope961 answers discovery for the test resources: restactions namespaced,
-// kubernetestargets cluster-scoped.
-func scope961(t *testing.T) {
-	t.Helper()
-	prev := preDialScopeFn
-	preDialScopeFn = func(gvr schema.GroupVersionResource) (bool, error) {
-		switch gvr {
-		case dispatchTestGVR:
-			return true, nil
-		case ktGVR677:
-			return false, nil
-		}
-		return false, errors.New("scope961: unknown gvr")
-	}
-	t.Cleanup(func() { preDialScopeFn = prev })
 }
 
 // apiAnswer961 is what the Kubernetes apiserver answers one caller for one
@@ -272,7 +288,7 @@ func resolve961(t *testing.T, rw *cache.ResourceWatcher, arm arm961, user, path 
 	cache.ForceSecretsCacheReadyForTest("krateo-system")
 	defer func() { cache.ResetSecretsSnapshotForTest(); cache.ResetSecretsInformerForTest() }()
 
-	ctx, s := withSinks681(ctxWithUser(user, g961))
+	ctx, s := withSinks681(ctxWithUser(user, groups961(user)...))
 	ctx, outcomes := WithStageOutcomes(ctx)
 	stage := &templates.API{Name: "ra", Path: path, Verb: ptr.To(http.MethodGet),
 		ContinueOnError: ptr.To(coe), ErrorKey: ptr.To("raErr")}
@@ -290,7 +306,7 @@ func resolve961(t *testing.T, rw *cache.ResourceWatcher, arm arm961, user, path 
 		out.failure = fmt.Sprintf("%s/%d/%s/%s", failure.Stage, failure.Code, failure.Reason, failure.Message)
 	}
 	whole, _ := json.Marshal(dict)
-	if strings.Contains(string(whole), user) || strings.Contains(string(whole), g961) {
+	if strings.Contains(string(whole), user) || strings.Contains(string(whole), "g961") {
 		t.Fatalf("%s: identity text reached the result: %s", arm, whole)
 	}
 	return out
@@ -369,7 +385,6 @@ func raList961(items ...[2]string) apiAnswer961 {
 
 func TestIssue961_PairedInformerVersusDirect(t *testing.T) {
 	rw := watcher961(t)
-	scope961(t)
 	ktEmpty := apiAnswer961{kind: "KubernetesTargetList", apiVer: "core.krateo.io/v1alpha1"}
 	forbid := apiAnswer961{forbidden: true}
 	cases := []pair961{
@@ -378,7 +393,7 @@ func TestIssue961_PairedInformerVersusDirect(t *testing.T) {
 		{name: "P2/no-grant/namespaced", user: u961None, path: p961TeamA, coe: true, answer: forbid,
 			forbidden: true, gvr: dispatchTestGVR, ns: "team-a"},
 		{name: "P3/cluster-grant/cluster-wide", user: u961Cluster, path: p961Cluster, coe: true,
-			answer: raList961(seed961Items...), items: []string{"team-a/a-1", "team-a/a-2", "team-b/b-1", "team-b/b-2"}},
+			answer: raList961(seed961Items...), items: []string{"team-a/a-1", "team-a/a-2", "team-b/b-1", "team-b/b-2", "team-r/r-1"}},
 		{name: "P4/ns-grant/allowed-namespace", user: u961NS, path: p961TeamA, coe: true,
 			answer: raList961(seed961Items[0], seed961Items[1]), items: []string{"team-a/a-1", "team-a/a-2"}},
 		{name: "P5/ns-grant/denied-namespace", user: u961NS, path: p961TeamB, coe: true, answer: forbid,
@@ -391,6 +406,14 @@ func TestIssue961_PairedInformerVersusDirect(t *testing.T) {
 			forbidden: true, gvr: ktGVR677, ns: ""},
 		{name: "P9/no-grant/without-continueOnError", user: u961None, path: p961TeamB, coe: false, answer: forbid,
 			forbidden: true, gvr: dispatchTestGVR, ns: "team-b"},
+		{name: "P10/ns-grant/cluster-wide-is-denied", user: u961NS, path: p961Cluster, coe: true, answer: forbid,
+			forbidden: true, gvr: dispatchTestGVR, ns: ""},
+		{name: "P11/kind-Role-grant/its-namespace", user: u961Role, path: p961TeamR, coe: true,
+			answer: raList961(seed961Items[4]), items: []string{"team-r/r-1"}},
+		{name: "P12/kind-Role-grant/cluster-wide-is-denied", user: u961Role, path: p961Cluster, coe: true, answer: forbid,
+			forbidden: true, gvr: dispatchTestGVR, ns: ""},
+		{name: "P13/non-permitting-candidates-first/its-namespace", user: u961Many, path: p961TeamA, coe: true,
+			answer: raList961(seed961Items[0], seed961Items[1]), items: []string{"team-a/a-1", "team-a/a-2"}},
 	}
 	for _, c := range cases {
 		c := c
@@ -441,42 +464,6 @@ func TestIssue961_PairedInformerVersusDirect(t *testing.T) {
 	}
 }
 
-// I1 — a namespaced grant on a cluster-wide list keeps its legitimate partial
-// result when snowplow's copy answers it. (The apiserver itself refuses a
-// cluster-wide list without a cluster grant; howto/restactions.md says so.)
-func TestIssue961_NamespacedGrantOnClusterWideList_Filtered(t *testing.T) {
-	rw := watcher961(t)
-	scope961(t)
-	for _, arm := range []arm961{armContent, armInline} {
-		s := resolve961(t, rw, arm, u961NS, p961Cluster, true, apiAnswer961{forbidden: true})
-		if s.errKey != "" || s.header != "[]" || s.dials != 0 {
-			t.Fatalf("%s: a partially granted list was not served: errKey=%s header=%s dials=%d", arm, s.errKey, s.header, s.dials)
-		}
-		if got := itemNames961(t, s.value); strings.Join(got, ",") != "team-a/a-1,team-a/a-2" {
-			t.Fatalf("%s: items %v, want exactly team-a's", arm, got)
-		}
-	}
-}
-
-// I2 — a scope discovery cannot resolve is never a guessed deny: a requester
-// holding a namespace grant keeps the item filter's answer (its namespace's
-// items) — never a 403, never an item outside its grant.
-func TestIssue961_UnresolvedScope_IsNotADeny(t *testing.T) {
-	rw := watcher961(t)
-	prev := preDialScopeFn
-	preDialScopeFn = func(schema.GroupVersionResource) (bool, error) { return false, errors.New("discovery down") }
-	t.Cleanup(func() { preDialScopeFn = prev })
-	for _, arm := range []arm961{armContent, armInline} {
-		s := resolve961(t, rw, arm, u961NS, p961Cluster, true, apiAnswer961{forbidden: true})
-		if s.errKey != "" || s.dials != 0 {
-			t.Fatalf("%s: an unresolved scope was not served from the item filter: errKey=%s dials=%d", arm, s.errKey, s.dials)
-		}
-		if got := itemNames961(t, s.value); strings.Join(got, ",") != "team-a/a-1,team-a/a-2" {
-			t.Fatalf("%s: items %v, want exactly team-a's", arm, got)
-		}
-	}
-}
-
 // C1 — branch C (snowplow's SA read, re-gated for the caller) answers a
 // no-grant LIST with the typed re-gate Forbidden whose text is the canonical
 // message the direct path records; resolve.go records both with one body
@@ -500,7 +487,6 @@ func TestIssue961_BranchC_NoGrantList_IsTheCanonicalForbidden(t *testing.T) {
 	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
-	scope961(t)
 
 	var items []fakeRAItem
 	for _, it := range seed961Items {
@@ -514,8 +500,9 @@ func TestIssue961_BranchC_NoGrantList_IsTheCanonicalForbidden(t *testing.T) {
 	}{
 		{u961None, p961Cluster, "", true, nil},
 		{u961NS, p961TeamB, "team-b", true, nil},
-		{u961NS, p961Cluster, "", false, []string{"team-a"}},
-		{u961Cluster, p961Cluster, "", false, []string{"team-a", "team-b"}},
+		{u961NS, p961Cluster, "", true, nil},
+		{u961NS, p961TeamA, "team-a", false, []string{"team-a"}},
+		{u961Cluster, p961Cluster, "", false, []string{"team-a", "team-b", "team-r"}},
 	} {
 		raw, served, err := dispatchViaInternalRESTConfig(cache.WithInternalRESTConfig(ctxWithUser(c.user), rc),
 			buildCall(http.MethodGet, c.path))
@@ -537,38 +524,17 @@ func TestIssue961_BranchC_NoGrantList_IsTheCanonicalForbidden(t *testing.T) {
 	}
 }
 
-// E1 — EvaluateRBACInSomeNamespace is exactly "some namespace's RoleBindings
-// permit it": for every identity it equals the OR, over every namespace that
-// holds a binding, of EvaluateRBAC(namespace) where the cluster scope does not
-// already permit. A requester's binding never grants another requester.
-func TestIssue961_EvaluateRBACInSomeNamespace_EqualsPerNamespaceOR(t *testing.T) {
-	watcher961(t)
-	ctx := context.Background()
-	for _, user := range []string{u961None, u961Cluster, u961NS} {
-		for _, gvr := range []schema.GroupVersionResource{dispatchTestGVR, ktGVR677, {Group: "other.example", Version: "v1", Resource: "things"}} {
-			opts := rbac.EvaluateOptions{Username: user, Groups: []string{g961}, Verb: "list", Group: gvr.Group, Resource: gvr.Resource}
-			got, err := rbac.EvaluateRBACInSomeNamespace(ctx, opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := false
-			for _, ns := range []string{"team-a", "team-b", "team-c"} {
-				o := opts
-				o.Namespace = ns
-				inNS, _, err := rbac.EvaluateRBAC(ctx, o)
-				if err != nil {
-					t.Fatal(err)
-				}
-				clusterOnly := opts
-				atCluster, _, _ := rbac.EvaluateRBAC(ctx, clusterOnly)
-				want = want || (inNS && !atCluster)
-			}
-			if user == u961Cluster {
-				want = false // its grant is a ClusterRoleBinding: no RoleBinding permits it
-			}
-			if got != want {
-				t.Fatalf("%s %s: EvaluateRBACInSomeNamespace=%v, want %v", user, gvr.Resource, got, want)
-			}
+// M1 — the deny names its scope the way the apiserver does: "at the cluster
+// scope" or "in the namespace "<ns>"", never a dangling "/" (reviewer nit). A
+// named object keeps the "<ns>/<name>" form objects.Get shares.
+func TestIssue961_CanonicalMessage_NamesTheScope(t *testing.T) {
+	for _, c := range []struct{ ns, name, verb, want string }{
+		{"", "", "list", `restactions.templates.krateo.io is forbidden: user not authorized to list at the cluster scope`},
+		{"team-b", "", "list", `restactions.templates.krateo.io is forbidden: user not authorized to list in the namespace "team-b"`},
+		{"team-b", "catalog", "get", `restactions.templates.krateo.io "catalog" is forbidden: user not authorized to get team-b/catalog`},
+	} {
+		if got := canonicalForbiddenMessage(dispatchTestGVR, c.ns, c.name, c.verb); got != c.want {
+			t.Fatalf("(%q,%q,%q):\n got %s\nwant %s", c.ns, c.name, c.verb, got, c.want)
 		}
 	}
 }

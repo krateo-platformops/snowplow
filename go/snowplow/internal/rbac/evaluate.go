@@ -403,59 +403,6 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 	return allowed, matchedBindingUID, nil
 }
 
-// EvaluateRBACInSomeNamespace reports whether a RoleBinding in at least one
-// namespace permits the request opts describes (#961).
-//
-// EvaluateRBAC answers ONE scope: opts.Namespace "" is the cluster scope
-// (ClusterRoleBindings only, as the apiserver authorizes a cluster-wide
-// request), a namespace is that namespace (ClusterRoleBindings, then that
-// namespace's RoleBindings). Neither answers "may the requester do this in ANY
-// namespace", which a cluster-wide LIST needs: a requester with no cluster grant
-// but a grant in some namespace is allowed part of a cluster-wide list (the
-// served-LIST filter keeps that namespace's items), while a requester with no
-// grant anywhere is allowed none of it.
-//
-// opts.Namespace is ignored and ClusterRoleBindings are not consulted (ask
-// EvaluateRBAC with Namespace "" for the cluster scope). Every RoleBinding the
-// requester's subjects route to (selectRBCandidatesAllNS, the union over every
-// namespace of what EvaluateRBAC's RoleBinding phase walks) is evaluated in its
-// OWN namespace through the evaluator's own anySubjectMatches and
-// roleRefPermits, so a binding in namespace ns permits here exactly when it
-// permits EvaluateRBAC(opts with Namespace=ns). No second matcher.
-//
-// It reads the in-process snapshot only. cache=off, an unwired watcher and an
-// unpublished snapshot are errors: there is no SubjectAccessReview form of "in
-// some namespace", and a caller must not decide what it cannot evaluate.
-func EvaluateRBACInSomeNamespace(ctx context.Context, opts EvaluateOptions) (bool, error) {
-	log := xcontext.Logger(ctx)
-	if cache.Disabled() {
-		return false, fmt.Errorf("rbac: no in-process snapshot with cache=off")
-	}
-	rw := cache.Global()
-	if rw == nil {
-		return false, fmt.Errorf("rbac: cache=on but ResourceWatcher not wired")
-	}
-	snap := rw.Snapshot()
-	if snap == nil {
-		return false, fmt.Errorf("rbac: snapshot not yet built")
-	}
-	for _, rb := range selectRBCandidatesAllNS(snap, opts) {
-		if !anySubjectMatches(rb.Subjects, opts) {
-			continue
-		}
-		in := opts
-		in.Namespace = rb.Namespace
-		permits, err := roleRefPermits(snap, rb.Namespace, rb.RoleRef, in, log)
-		if err != nil {
-			return false, err
-		}
-		if permits {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 // evaluateAgainstInformerFirstMatch walks every ClusterRoleBinding and
 // (when namespace is non-empty) RoleBinding in opts.Namespace looking
 // for a Subject that matches opts.Username / opts.Groups /
@@ -809,10 +756,10 @@ func selectRBCandidates(snap *cache.RBACSnapshot, ns string, opts EvaluateOption
 // requester-profile builder) can bucket the candidates by namespace after an
 // anySubjectMatches gate.
 //
-// Consumers: the Step B requester profile (dark) and, on the serving path,
-// EvaluateRBACInSomeNamespace (#961). F-C1 (via
-// SelectRBCandidatesAllNSForTest) proves it equals the union over every
-// namespace of selectRBCandidates.
+// DARK in Step 2A: no serving path calls this. Its first consumer is the
+// Step B requester profile; it is exercised now only by F-C1 (via
+// SelectRBCandidatesAllNSForTest), which proves it equals the union over
+// every namespace of selectRBCandidates.
 func selectRBCandidatesAllNS(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbacv1.RoleBinding {
 	if snap == nil {
 		return nil

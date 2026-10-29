@@ -98,12 +98,28 @@ func TestFalsifier58_ByteParity_NarrowTenant_OnlyGrantedNamespacesInBytes(t *tes
 		Path: "/apis/widgets.krateo.io/v1/widgets", Verb: ptr.To(http.MethodGet),
 	}}
 
-	v, served, ok, _, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
-	if !ok || !served {
-		t.Fatalf("byte-parity: expected a served (gated) LIST; ok=%v served=%v", ok, served)
+	// #961 (match Kubernetes): the narrow tenant holds namespace grants only, so
+	// its CLUSTER-WIDE LIST is refused outright — zero bytes of the SA-maximal
+	// cell reach it.
+	if v, served, ok, _, err := apistageContentServe(ctx, store, call, false /*no-UAF*/); !ok || served || v != nil || !isRegateDenied(err) {
+		t.Fatalf("byte-parity: cluster-wide LIST by a namespace-only tenant: ok=%v served=%v value=%v err=%v, want the per-identity Forbidden",
+			ok, served, v != nil, err)
 	}
 
-	gotNss := namespacesInServedBytes(t, v)
+	// Its namespaced LISTs over the same cell family carry only their own
+	// namespace's items in their bytes.
+	var gotNss []string
+	for _, ns := range f1NarrowNamespaces {
+		nsCall := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
+			Path: "/apis/widgets.krateo.io/v1/namespaces/" + ns + "/widgets", Verb: ptr.To(http.MethodGet),
+		}}
+		v, served, ok, _, err := apistageContentServe(ctx, store, nsCall, false /*no-UAF*/)
+		if !ok || !served || err != nil {
+			t.Fatalf("byte-parity: namespaced LIST of %s: ok=%v served=%v err=%v", ns, ok, served, err)
+		}
+		gotNss = append(gotNss, namespacesInServedBytes(t, v)...)
+	}
+	sort.Strings(gotNss)
 	want := append([]string{}, f1NarrowNamespaces...) // team-a, team-b
 	sort.Strings(want)
 	if !equalStrs(gotNss, want) {
