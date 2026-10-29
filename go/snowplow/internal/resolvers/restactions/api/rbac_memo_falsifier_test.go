@@ -13,8 +13,10 @@
 //        (passing Name: it.GetName()), so the count is N_items, not N.
 //
 // Plus the AC-6 name-independence leg: two items in the SAME namespace
-// with DIFFERENT names yield ONE EvaluateRBAC call and an identical
-// verdict.
+// with DIFFERENT names yield ONE per-item EvaluateRBAC call and an
+// identical verdict. With #961's scope step and #963 F1 (the per-item memo
+// is never seeded from the scope verdict), a LIST of that namespace makes
+// TWO calls in all: the scope evaluation plus that one per-item evaluation.
 
 package api
 
@@ -46,8 +48,8 @@ func memoItem(ns, name string) *unstructured.Unstructured {
 }
 
 // TestFalsifierF1_RBACMemoIsNamespaceKeyed asserts a filterListByRBAC
-// pass over N distinct namespaces × M items each makes exactly N
-// EvaluateRBAC calls.
+// pass over N distinct namespaces × M items each makes exactly N per-item
+// EvaluateRBAC calls — N+1 with #961's scope evaluation of the request.
 //
 // FAILS on the unfixed code: per-item evaluation → N*M calls.
 func TestFalsifierF1_RBACMemoIsNamespaceKeyed(t *testing.T) {
