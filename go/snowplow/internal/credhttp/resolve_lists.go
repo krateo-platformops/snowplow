@@ -17,7 +17,11 @@ package credhttp
 // gives the same WrapTransport) and Client (the endpoint clients the resolver
 // dials a held credential with, and credhttp.Do). Both install
 // CountResolveCollectionLists beside RefuseRedirectHops, inside it, so a refused
-// redirect hop never reaches the counter.
+// redirect hop never reaches the counter. The resolver's endpoint client for a
+// named endpointRef (a third party's own credential, so no redirect policy)
+// gets the counter alone, through CountResolveListsOn: every resolve LIST is
+// counted whatever credential it is sent with. A followed redirect hop of such
+// a client is a request on the wire and is counted as one.
 //
 // WHAT. A request is counted when it is a collection GET that opens a
 // collection — a LIST's first page or a watch-list start, by the path-shape
@@ -103,6 +107,17 @@ func CountResolveCollectionLists(rt http.RoundTripper) http.RoundTripper {
 		return rt
 	}
 	return &resolveListCounter{next: rt}
+}
+
+// CountResolveListsOn installs CountResolveCollectionLists on c's transport,
+// in place, and returns c — and nothing else: no redirect policy, no
+// credential handling. It is for an endpoint client that carries a third
+// party's own credential (a named endpointRef), which keeps its redirect
+// behaviour, yet whose collection LISTs a resolve sends like any other's.
+// A chain that already counts (a Client-hardened one) is left unchanged.
+func CountResolveListsOn(c *http.Client) *http.Client {
+	c.Transport = CountResolveCollectionLists(c.Transport)
+	return c
 }
 
 // chainCountsResolveLists walks rt's wrapper chain (client-go's wrappers and
