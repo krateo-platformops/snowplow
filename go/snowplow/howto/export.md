@@ -38,7 +38,7 @@ re-dispatched through `/call`.
 | Parameter  | Default | Description |
 |------------|---------|-------------|
 | `format`   | `csv`   | `csv`, `json` or `pdf`. |
-| `path`     | auto    | Optional **jq expression** selecting the row array inside the resolved envelope, e.g. `.status.services`. |
+| `path`     | auto    | Optional **jq expression** returning the row array from the resolved envelope, e.g. `.status.services` (see [What `path` must return](#what-path-must-return)). |
 | `fields`   | all     | Comma-separated list of column **dot-paths** selecting and ordering the CSV and PDF columns, e.g. `name,health,usage.cpu`. |
 | `header`   | dot-paths | Optional column **label**, one `header` parameter per field, repeated in `fields` order (below). |
 | `title`    | resource name | `pdf` only: the report title. |
@@ -67,7 +67,37 @@ row is the dot-paths, and the JSON export is the extracted rows as resolved.
 
 Labels are generic: snowplow has no widget-kind logic. To export a `Table`
 widget's typed cells, select and shape them with your own `path` jq, then
-name the columns with `fields` and `header`.
+name the columns with `fields` (the columns' `valueKey`s, in display order)
+and `header` (their `title`s). For example, a `path` that turns each
+`dataSource` row into one object keyed by `valueKey`:
+
+```
+[ .status.widgetData.dataSource[]? | map({ (.valueKey): (.stringValue // .decimalValue
+  // (.numberValue | select(. != null) | tostring)
+  // (.booleanValue | select(. != null) | tostring)
+  // ((.arrayValue // []) | join(", "))) }) | add ]
+```
+
+(`null | tostring` is the string `"null"`, which ends a `//` chain: guard
+each typed value with `select(. != null)` or boolean, array and empty cells
+all export as `null`.)
+
+### What `path` must return
+
+`path` is evaluated once over the resolved envelope, and its result is the
+row set:
+
+- one **array**: each element is a row (the shape to use);
+- one object or scalar: a single row; `null`: no rows.
+
+A `path` that produces a **jq stream** — several outputs rather than one
+array, such as `.items[]` — is **not** collected into rows today. The
+outputs are concatenated as JSON text with no separator, and that text is
+exported as **one row** with a single `value` column: `.items[]` over two
+objects exports the one cell `{"a":1}{"a":2}`, a stream of the numbers `1`
+and `2` exports the single number `12`, and a stream of no outputs
+(`empty`) exports one empty row. Wrap a stream in `[...]` (`[.items[]]`) to
+export its outputs as rows.
 
 ### Full-list pagination and the truncation cap
 

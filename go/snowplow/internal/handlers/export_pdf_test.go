@@ -315,7 +315,7 @@ func TestExport970_TitleParam(t *testing.T) {
 // auto-detected shapes, and fields dot-path flattening give the same cells.
 func TestExport970_SameRowsAsCSV(t *testing.T) {
 	cases := []struct{ name, body, query string }{
-		{"jq path + fields", `{"status":{"svc":[{"n":"a","m":{"x":1}},{"n":"b","m":{"x":2.5}}]}}`, "path=.status.svc&fields=m.x,n"},
+		{"jq path + fields", `{"status":{"svc":[{"n":"a","m":{"x":1}},{"n":"b","m":{"x":2.5}}]}}`, "path=.status.svc&fields=n,m.x"},
 		{"auto-detect widgetData", `{"status":{"widgetData":{"rows":[{"k":"v1","t":true},{"k":"v2","t":false}]}}}`, ""},
 		{"auto-detect items, nested", `{"items":[{"a":{"b":{"c":"deep"}},"arr":[1,2],"nul":null}]}`, ""},
 	}
@@ -587,6 +587,32 @@ func TestExport970_NeverLogsTheUsername(t *testing.T) {
 	for _, needle := range []string{pdfUser, "jürgen", "User: "} {
 		if bytes.Contains(all.Bytes(), []byte(needle)) {
 			t.Errorf("a log line carries the caller identity (%q):\n%s", needle, all.String())
+		}
+	}
+}
+
+// TestExportPathStreamToday pins what howto/export.md states about a `path`
+// that yields a jq STREAM (several outputs) rather than one array: the
+// outputs are concatenated as JSON text with no separator and that text is
+// exported as ONE row in a single `value` column (a stream of numbers merges
+// into one number); zero outputs export one empty row. #970 does not change
+// this (csv/json stay byte-identical); fixing it is its own issue, and that
+// fix flips this test deliberately. Wrapping the stream in [...] exports its
+// outputs as rows.
+func TestExportPathStreamToday(t *testing.T) {
+	body := `{"items":[{"a":1},{"a":2}],"n":[1,2]}`
+	cases := []struct{ path, want string }{
+		{".items[]", "value\n\"{\"\"a\"\":1}{\"\"a\"\":2}\"\n"},
+		{".n[]", "value\n12\n"},
+		{"empty", "value\n\n"},
+		{"[.items[]]", "a\n1\n2\n"},
+		{"null", "\n"},
+	}
+	for _, c := range cases {
+		var queries []url.Values
+		rec, _ := exportAs(t, recordingCall(body, &queries), "/export?resource=restactions&name=demo&format=csv&path="+url.QueryEscape(c.path))
+		if rec.Code != http.StatusOK || rec.Body.String() != c.want {
+			t.Errorf("path %s: %d %q, want %q", c.path, rec.Code, rec.Body.String(), c.want)
 		}
 	}
 }
